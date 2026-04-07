@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/scaleapi/core-infrastructure/tools/repo-manager/schemas/git.schema.json",
+  "title": "Git Repository Manifest",
+  "description": "Defines git repositories to clone and bundle at specific refs.",
+  "type": "object",
+  "required": ["config_version", "entries"],
+  "properties": {
+    "config_version": {
+      "type": "integer",
+      "description": "Schema version. Current: 1.",
+      "const": 1
+    },
+    "entries": {
+      "type": "array",
+      "description": "List of git repositories to manage.",
+      "items": {
+        "type": "object",
+        "required": ["name", "url", "ref"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Logical repo name. Used as the S3 key prefix and bundle filename."
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Remote git URL to clone."
+          },
+          "ref": {
+            "type": "string",
+            "description": "Git ref (tag, branch, or commit SHA) to bundle."
+          },
+          "frozen": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, the entry cannot be built, edited, or deleted."
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

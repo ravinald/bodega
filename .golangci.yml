@@ -1,0 +1,36 @@
+# golangci-lint v2 configuration for repo-manager.
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - errcheck
+    - govet
+    - gosec
+    - staticcheck
+    - unused
+  settings:
+    gosec:
+      excludes:
+        # G204/G702: Subprocess launched with / command injection via variable —
+        # intentional. This is a build runner that wraps git, gpg, apt-get, pip,
+        # and reprepro. All command arguments come from operator-controlled
+        # manifest files, not external user input.
+        - G204
+        - G702
+        # G301: Directory permissions 0755 — standard for build output
+        # directories that must be readable by other processes.
+        - G301
+        # G304: File inclusion via variable — intentional. All file paths come
+        # from operator-controlled config and manifest files.
+        - G304
+        # G306: WriteFile permissions 0644 — build artifacts and manifest files
+        # are public by design; 0644 is the correct mode.
+        - G306
+        # G703: Path traversal via taint analysis — false positive on
+        # os.TempFile().Name() which is controlled by the OS temp directory.
+        - G703
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

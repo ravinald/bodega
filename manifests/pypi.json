@@ -1,0 +1,20 @@
+{
+  "config_version": 1,
+  "version": "v4.5.5",
+  "base_requirements": {
+    "netbox": "v4.5.5"
+  },
+  "packages": [
+    {"name": "boto3", "required_by": ["netbox"]},
+    {"name": "netbox-plugin-dns", "required_by": ["netbox"]},
+    {"name": "netbox-floorplan-plugin", "required_by": ["netbox"]},
+    {"name": "netbox-data-flows", "required_by": ["netbox"]},
+    {"name": "netbox-documents", "required_by": ["netbox"]},
+    {"name": "netbox-inventory", "required_by": ["netbox"]},
+    {"name": "netbox_lists", "required_by": ["netbox"]},
+    {"name": "netbox_routing", "required_by": ["netbox"]},
+    {"name": "netbox-topology-views", "required_by": ["netbox"]},
+    {"name": "netbox-sqlquery", "required_by": ["netbox"]},
+    {"name": "social-auth-core[openidconnect]", "required_by": ["netbox"]}
+  ]
+}

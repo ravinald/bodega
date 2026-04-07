@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/scaleapi/core-infrastructure/tools/repo-manager/schemas/npm.schema.json",
+  "title": "npm Package Manifest",
+  "description": "Defines npm packages to mirror or proxy from upstream registries.",
+  "type": "object",
+  "required": ["config_version", "entries"],
+  "properties": {
+    "config_version": {
+      "type": "integer",
+      "description": "Schema version. Current: 1.",
+      "const": 1
+    },
+    "entries": {
+      "type": "array",
+      "description": "List of npm packages to manage.",
+      "items": {
+        "type": "object",
+        "required": ["name", "version"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Package name (e.g. lodash or @scope/pkg)."
+          },
+          "version": {
+            "type": "string",
+            "description": "Semver version."
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Upstream registry URL. Defaults to registry.npmjs.org when omitted."
+          },
+          "frozen": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, the entry cannot be built, edited, or deleted."
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

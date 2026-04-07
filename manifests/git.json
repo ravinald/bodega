@@ -1,0 +1,10 @@
+{
+  "config_version": 1,
+  "entries": [
+    {
+      "name": "netbox",
+      "url": "https://github.com/netbox-community/netbox.git",
+      "ref": "v4.5.5"
+    }
+  ]
+}
