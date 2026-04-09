@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -38,8 +40,10 @@ Frozen entries cannot be deleted; unfreeze them first with 'bodega freeze'.`,
 				return fmt.Errorf("load manifests: %w", err)
 			}
 
+			ctx := context.Background()
+
 			// Check frozen status before deletion.
-			if frozen, err := isFrozen(store, t, name); err != nil {
+			if frozen, err := isFrozen(store, ctx, t, name); err != nil {
 				return err
 			} else if frozen {
 				return fmt.Errorf("entry %s/%s is frozen — unfreeze it first with 'bodega freeze %s %s'", t, name, t, name)
@@ -50,12 +54,11 @@ Frozen entries cannot be deleted; unfreeze them first with 'bodega freeze'.`,
 				if err := requireBucket(cfg); err != nil {
 					return err
 				}
-				ctx := backgroundCtx()
 				client, err := bos3.NewClient(ctx, cfg.Bucket, cfg.Region)
 				if err != nil {
 					return fmt.Errorf("connect to AWS: %w", err)
 				}
-				key := s3KeyFor(store, t, name)
+				key := s3KeyFor(store, ctx, t, name)
 				if key != "" {
 					fmt.Printf("Deleting s3://%s/%s ...\n", cfg.Bucket, key)
 					if err := client.DeleteObject(ctx, key); err != nil {
@@ -66,35 +69,11 @@ Frozen entries cannot be deleted; unfreeze them first with 'bodega freeze'.`,
 			}
 
 			// Remove from manifest.
-			switch t {
-			case manifest.TypeApt:
-				if err := store.RemoveApt(name); err != nil {
-					return err
-				}
-			case manifest.TypeGit:
-				if err := store.RemoveGit(name); err != nil {
-					return err
-				}
-			case manifest.TypeBinary:
-				if err := store.RemoveBinary(name); err != nil {
-					return err
-				}
-			case manifest.TypeGomod:
-				if err := store.RemoveGomod(name); err != nil {
-					return err
-				}
-			case manifest.TypeHelm:
-				if err := store.RemoveHelm(name); err != nil {
-					return err
-				}
-			case manifest.TypeNpm:
-				if err := store.RemoveNpm(name); err != nil {
-					return err
-				}
-			case manifest.TypePypi:
-				if err := store.RemovePypiPackage(name); err != nil {
-					return err
-				}
+			if err := store.DeletePackage(ctx, t, name); err != nil {
+				return err
+			}
+			if err := store.SaveIndex(ctx); err != nil {
+				return fmt.Errorf("save index: %w", err)
 			}
 
 			fmt.Printf("Removed %s/%s from manifest.\n", t, name)
@@ -106,25 +85,23 @@ Frozen entries cannot be deleted; unfreeze them first with 'bodega freeze'.`,
 	return cmd
 }
 
-// s3KeyFor returns the primary S3 key for a named entry.
-func s3KeyFor(store *manifest.Store, t, name string) string {
+// s3KeyFor returns the primary S3 key for a named entry (first version).
+func s3KeyFor(store *manifest.Store, ctx context.Context, t, name string) string {
+	pm, err := store.GetPackage(ctx, t, name)
+	if err != nil || pm == nil || len(pm.Versions) == 0 {
+		return ""
+	}
+	ve := pm.Versions[0]
 	switch t {
 	case manifest.TypeBinary:
-		e := store.FindBinary(name)
-		if e == nil {
-			return ""
-		}
-		filename := e.Filename
+		filename := ve.Filename
 		if filename == "" {
-			filename = lastS3Segment(e.URL)
+			filename = lastS3Segment(ve.URL)
 		}
 		return "binaries/" + filename
 	case manifest.TypeGit:
-		e := store.FindGit(name)
-		if e == nil {
-			return ""
-		}
-		return fmt.Sprintf("repos/%s/%s-%s.bundle", e.Name, e.Name, e.Ref)
+		sn := strings.ReplaceAll(pm.Name, "/", "--")
+		return fmt.Sprintf("repos/%s/%s-%s.bundle", sn, sn, ve.Ref)
 	}
 	return ""
 }
@@ -139,47 +116,22 @@ func lastS3Segment(s string) string {
 	return s
 }
 
-// isFrozen returns whether the named entry is frozen, or an error if not found.
-func isFrozen(store *manifest.Store, t, name string) (bool, error) {
-	switch t {
-	case manifest.TypeApt:
-		e := store.FindApt(name)
-		if e == nil {
-			return false, fmt.Errorf("apt entry %q not found", name)
-		}
-		return e.Frozen, nil
-	case manifest.TypeGit:
-		e := store.FindGit(name)
-		if e == nil {
-			return false, fmt.Errorf("git entry %q not found", name)
-		}
-		return e.Frozen, nil
-	case manifest.TypeBinary:
-		e := store.FindBinary(name)
-		if e == nil {
-			return false, fmt.Errorf("binary entry %q not found", name)
-		}
-		return e.Frozen, nil
-	case manifest.TypeGomod:
-		e := store.FindGomod(name)
-		if e == nil {
-			return false, fmt.Errorf("gomod entry %q not found", name)
-		}
-		return e.Frozen, nil
-	case manifest.TypeHelm:
-		e := store.FindHelm(name)
-		if e == nil {
-			return false, fmt.Errorf("helm entry %q not found", name)
-		}
-		return e.Frozen, nil
-	case manifest.TypeNpm:
-		e := store.FindNpm(name)
-		if e == nil {
-			return false, fmt.Errorf("npm entry %q not found", name)
-		}
-		return e.Frozen, nil
-	case manifest.TypePypi:
-		return store.Pypi.Frozen, nil
+// isFrozen returns whether all versions of the named entry are frozen, or an error if not found.
+func isFrozen(store *manifest.Store, ctx context.Context, t, name string) (bool, error) {
+	pm, err := store.GetPackage(ctx, t, name)
+	if err != nil {
+		return false, fmt.Errorf("get %s/%s: %w", t, name, err)
 	}
-	return false, fmt.Errorf("unknown type %q", t)
+	if pm == nil {
+		return false, fmt.Errorf("%s entry %q not found", t, name)
+	}
+	if len(pm.Versions) == 0 {
+		return false, nil
+	}
+	for _, ve := range pm.Versions {
+		if !ve.Frozen {
+			return false, nil
+		}
+	}
+	return true, nil
 }

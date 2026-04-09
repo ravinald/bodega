@@ -1,275 +1,16 @@
-// Package manifest defines the data types for all four source types.
-// Each manifest is a JSON object with a config_version key and type-specific fields.
+// Package manifest defines the unified type system for all package manifests.
+// Each package is stored as a per-package JSON file (PackageManifest) containing
+// a slice of VersionEntry values, allowing multiple versions to coexist. An
+// Index provides fast name-based lookups without loading every manifest, and a
+// DependencyGraph tracks inter-package relationships.
 package manifest
 
-// Checksum records an expected digest for integrity verification.
-// Algorithm is one of "md5", "sha1", "sha256", or "sha512".
-// Value is the lowercase hex-encoded digest string.
-type Checksum struct {
-	Algorithm string `json:"algorithm"` // "md5", "sha1", "sha256", "sha512"
-	Value     string `json:"value"`
-}
-
-// BuildEnv captures the build server's environment at the time an artifact
-// was produced. Populated automatically -- the operator does not set this.
-type BuildEnv struct {
-	Platform  string `json:"platform"`              // "linux/amd64"
-	OSRelease string `json:"os_release,omitempty"`   // "Ubuntu 24.04.2 LTS"
-	Python    string `json:"python,omitempty"`       // "3.12.3"
-	Go        string `json:"go,omitempty"`           // "1.24.2"
-	Rust      string `json:"rust,omitempty"`         // "1.78.0"
-	Bodega    string `json:"bodega,omitempty"`        // build version
-	BuiltAt   string `json:"built_at,omitempty"`     // RFC3339 timestamp
-}
+import "strings"
 
 // CurrentConfigVersion is the schema version written to all manifests.
-const CurrentConfigVersion = 1
+const CurrentConfigVersion = 2
 
-// AptManifest is the top-level envelope for apt.json.
-type AptManifest struct {
-	ConfigVersion int        `json:"config_version"`
-	Entries       []AptEntry `json:"entries"`
-}
-
-// GitManifest is the top-level envelope for git.json.
-type GitManifest struct {
-	ConfigVersion int        `json:"config_version"`
-	Entries       []GitEntry `json:"entries"`
-}
-
-// BinaryManifest is the top-level envelope for binary.json.
-type BinaryManifest struct {
-	ConfigVersion int           `json:"config_version"`
-	Entries       []BinaryEntry `json:"entries"`
-}
-
-// AptEntry describes a single Debian package to build or download.
-type AptEntry struct {
-	// Name is the logical name used everywhere in bootstrap (e.g. "amazon-efs-utils").
-	Name string `json:"name"`
-
-	// Version pins the package version. Used in S3 paths and build directories
-	// to allow multiple versions to coexist.
-	Version string `json:"version,omitempty"`
-
-	// SourceName is the upstream package / directory name, defaults to Name when absent.
-	SourceName string `json:"source_name,omitempty"`
-
-	// URL is the git repository to clone for a source build. When omitted the
-	// package is fetched from the system apt repository.
-	URL string `json:"url,omitempty"`
-
-	// BuildCmd is the shell command executed inside the cloned source directory
-	// to produce a .deb file.
-	BuildCmd string `json:"build_cmd,omitempty"`
-
-	// DebGlob is a path glob (relative to the source dir) used to locate the
-	// produced .deb file after building.
-	DebGlob string `json:"deb_glob,omitempty"`
-
-	// Checksum is the optional expected digest for the produced artifact.
-	// When nil, no verification is performed.
-	Checksum *Checksum `json:"checksum,omitempty"`
-
-	// ChecksumVerified is true when the checksum was confirmed against a source-published digest.
-	ChecksumVerified bool `json:"checksum_verified,omitempty"`
-
-	// VersionConstraint qualifies how Version is matched: "exact" (default), "any", or "gte".
-	VersionConstraint string `json:"version_constraint,omitempty"`
-
-	// Description is a short summary of the package, auto-discovered from upstream.
-	Description string `json:"description,omitempty"`
-	Platform string `json:"platform,omitempty"`
-	BuildEnv *BuildEnv `json:"build_env,omitempty"`
-
-	// Hidden excludes this version from being served to clients.
-	Hidden bool `json:"hidden,omitempty"`
-
-	// Frozen prevents this entry from being built, edited, or deleted.
-	Frozen bool `json:"frozen,omitempty"`
-}
-
-// VersionedName returns "name@version" or just "name" if no version is set.
-func (e AptEntry) VersionedName() string { return versionedName(e.Name, e.Version) }
-
-// GitEntry describes a git repository to fetch (via release tarball or clone).
-type GitEntry struct {
-	// Name is the logical name (e.g. "netbox").
-	Name string `json:"name"`
-
-	// URL is the remote repository URL.
-	URL string `json:"url"`
-
-	// Ref is the git ref (tag, branch, or commit SHA).
-	// This also serves as the version identifier.
-	Ref string `json:"ref"`
-
-	// Source controls how the repo is obtained:
-	//   "release" (default) — download the release tarball (smaller, faster)
-	//   "clone"             — git clone --bare + bundle (full history)
-	Source string `json:"source,omitempty"`
-
-	// Checksum is the computed digest of the downloaded artifact (tar.gz or bundle).
-	Checksum *Checksum `json:"checksum,omitempty"`
-
-	// ChecksumVerified is true when the computed checksum was confirmed against
-	// a checksum published by the source (e.g. GitHub release asset).
-	ChecksumVerified bool `json:"checksum_verified,omitempty"`
-
-	// Description is a short summary of the package, auto-discovered from upstream.
-	Description string `json:"description,omitempty"`
-	Platform string `json:"platform,omitempty"`
-	BuildEnv *BuildEnv `json:"build_env,omitempty"`
-
-	// Hidden excludes this version from being served to clients.
-	Hidden bool `json:"hidden,omitempty"`
-
-	// Frozen prevents this entry from being built, edited, or deleted.
-	Frozen bool `json:"frozen,omitempty"`
-}
-
-// IsRelease returns true when the entry should be fetched as a release tarball.
-// When Source is explicitly set, that value is used. Otherwise it auto-detects
-// from Ref: version-like refs (e.g. v4.5.7, 1.0.0) use release mode, while
-// branch-like refs (e.g. main, develop) use clone mode.
-func (e GitEntry) IsRelease() bool {
-	switch e.Source {
-	case "release":
-		return true
-	case "clone":
-		return false
-	default:
-		return looksLikeVersionTag(e.Ref)
-	}
-}
-
-// looksLikeVersionTag returns true if ref appears to be a version tag
-// rather than a branch name. Matches patterns like "v1.2.3", "1.0.0",
-// "v4.5.7-rc1", etc.
-func looksLikeVersionTag(ref string) bool {
-	if ref == "" {
-		return false
-	}
-	s := ref
-	if s[0] == 'v' || s[0] == 'V' {
-		s = s[1:]
-	}
-	// Must start with a digit after optional 'v' prefix.
-	return len(s) > 0 && s[0] >= '0' && s[0] <= '9'
-}
-
-// VersionedName returns "name@ref".
-func (e GitEntry) VersionedName() string { return versionedName(e.Name, e.Ref) }
-
-// PypiManifest is the top-level object in pypi.json.
-// The schema differs from the other manifest types — it holds a map of
-// "base requirements" references to git repos plus a flat list of extra
-// packages.
-// PypiPackage describes a single Python package in the pypi manifest.
-type PypiPackage struct {
-	// Name is the pip package specifier (e.g., "boto3", "social-auth-core[openidconnect]").
-	Name string `json:"name"`
-
-	// Version pins the package version. When empty, pip resolves the latest.
-	Version string `json:"version,omitempty"`
-
-	// RequiredBy lists what this package is for (e.g., ["netbox"], ["standalone"]).
-	// Empty means the package is a general-purpose dependency.
-	RequiredBy []string `json:"required_by,omitempty"`
-
-	// Mode controls how this package is served: "hosted" (default) or "proxy".
-	// Hosted: wheels are built locally and uploaded to S3.
-	// Proxy: on cache miss, fetch from upstream PyPI and cache in S3.
-	Mode string `json:"mode,omitempty"`
-
-	// VersionConstraint qualifies how Version is matched: "exact" (default), "any", or "gte".
-	VersionConstraint string `json:"version_constraint,omitempty"`
-
-	// Checksum is the optional expected digest for the wheel archive.
-	// When nil, no verification is performed.
-	Checksum *Checksum `json:"checksum,omitempty"`
-
-	// ChecksumVerified is true when the checksum was confirmed against a source-published digest.
-	ChecksumVerified bool `json:"checksum_verified,omitempty"`
-
-	// Description is a short summary of the package, auto-discovered from upstream.
-	Description string `json:"description,omitempty"`
-	Platform string `json:"platform,omitempty"`
-	BuildEnv *BuildEnv `json:"build_env,omitempty"`
-
-	// Hidden excludes this version from being served to clients.
-	Hidden bool `json:"hidden,omitempty"`
-
-	// Frozen prevents this individual package from being edited or deleted.
-	Frozen bool `json:"frozen,omitempty"`
-}
-
-// PypiManifest is the top-level object in pypi.json.
-type PypiManifest struct {
-	// ConfigVersion is the schema version.
-	ConfigVersion int `json:"config_version"`
-
-	// Version labels this wheel set (e.g., "v4.5.5" matching the netbox version).
-	Version string `json:"version,omitempty"`
-
-	// BaseRequirements maps a git repo name to the ref whose requirements.txt
-	// should be included in the wheel build (e.g. {"netbox": "v4.5.5"}).
-	BaseRequirements map[string]string `json:"base_requirements"`
-
-	// Packages is the list of Python packages to build as wheels.
-	Packages []PypiPackage `json:"packages"`
-
-	// Hidden excludes this version from being served to clients.
-	Hidden bool `json:"hidden,omitempty"`
-
-	// Frozen prevents the entire pypi manifest from being edited.
-	Frozen bool `json:"frozen,omitempty"`
-}
-
-// BinaryEntry describes a file to download directly from a URL.
-type BinaryEntry struct {
-	// Name is the logical name (e.g. "awscli-v2").
-	Name string `json:"name"`
-
-	// Version pins the binary version. Used in S3 paths to allow multiple
-	// versions to coexist.
-	Version string `json:"version,omitempty"`
-
-	// URL is the download URL.
-	URL string `json:"url"`
-
-	// SHA256 is the expected hex digest; nil means no verification.
-	SHA256 *string `json:"sha256"`
-
-	// Checksum is the optional expected digest using an explicit algorithm.
-	// When nil, no additional verification is performed beyond SHA256.
-	Checksum *Checksum `json:"checksum,omitempty"`
-
-	// ChecksumVerified is true when the checksum was confirmed against a source-published digest.
-	ChecksumVerified bool `json:"checksum_verified,omitempty"`
-
-	// Filename overrides the basename of URL when set.
-	Filename string `json:"filename,omitempty"`
-
-	// VersionConstraint qualifies how Version is matched: "exact" (default), "any", or "gte".
-	VersionConstraint string `json:"version_constraint,omitempty"`
-
-	// Description is a short summary of the package, auto-discovered from upstream.
-	Description string `json:"description,omitempty"`
-	Platform string `json:"platform,omitempty"`
-	BuildEnv *BuildEnv `json:"build_env,omitempty"`
-
-	// Hidden excludes this version from being served to clients.
-	Hidden bool `json:"hidden,omitempty"`
-
-	// Frozen prevents this entry from being built, edited, or deleted.
-	Frozen bool `json:"frozen,omitempty"`
-}
-
-// VersionedName returns "name@version" or just "name" if no version is set.
-func (e BinaryEntry) VersionedName() string { return versionedName(e.Name, e.Version) }
-
-// Type constants used throughout the codebase.
+// Type constants identify the package ecosystem for a manifest.
 const (
 	TypeApt    = "apt"
 	TypeGit    = "git"
@@ -294,174 +35,230 @@ const (
 	ConstraintAny        = "any"        // * : all versions
 )
 
-// AllTypes is the canonical build order.
+// AllTypes is the canonical build order across all supported ecosystems.
 var AllTypes = []string{TypeBinary, TypeGit, TypeApt, TypePypi, TypeGomod, TypeHelm, TypeNpm}
 
-// GomodManifest is the top-level envelope for gomod.json.
-type GomodManifest struct {
-	ConfigVersion int          `json:"config_version"`
-	Entries       []GomodEntry `json:"entries"`
+// Checksum records an expected digest for integrity verification.
+// Algorithm is one of "md5", "sha1", "sha256", or "sha512".
+// Value is the lowercase hex-encoded digest string.
+type Checksum struct {
+	Algorithm string `json:"algorithm"` // "md5", "sha1", "sha256", "sha512"
+	Value     string `json:"value"`
 }
 
-// GomodEntry describes a Go module to mirror or proxy.
-type GomodEntry struct {
-	// Name is the module path (e.g. "github.com/aws/aws-sdk-go-v2").
+// BuildEnv captures the build server's environment at the time an artifact
+// was produced. Populated automatically — the operator does not set this.
+type BuildEnv struct {
+	Platform  string `json:"platform"`            // "linux/amd64"
+	OSRelease string `json:"os_release,omitempty"` // "Ubuntu 24.04.2 LTS"
+	Python    string `json:"python,omitempty"`     // "3.12.3"
+	Go        string `json:"go,omitempty"`         // "1.24.2"
+	Rust      string `json:"rust,omitempty"`       // "1.78.0"
+	Bodega    string `json:"bodega,omitempty"`     // build version
+	BuiltAt   string `json:"built_at,omitempty"`  // RFC3339 timestamp
+}
+
+// PackageManifest is the on-disk representation of a single package.
+// One JSON file is stored per package at {type}/{safeName}/manifest.json.
+type PackageManifest struct {
+	// ConfigVersion is the schema version; always CurrentConfigVersion on write.
+	ConfigVersion int `json:"config_version"`
+
+	// Name is the canonical package name (e.g. "netbox", "lodash").
 	Name string `json:"name"`
 
-	// Version is the module version (e.g. "v1.30.0").
-	Version string `json:"version"`
+	// Type is the package ecosystem (e.g. TypeGit, TypeNpm).
+	Type string `json:"type"`
 
-	// URL is the upstream GOPROXY URL. When empty, proxy.golang.org is used.
+	// Description is a short human-readable summary of what the package does.
+	Description string `json:"description,omitempty"`
+
+	// Versions is the ordered list of version entries for this package.
+	// Multiple versions may coexist; callers select by VersionEntry.Version.
+	Versions []VersionEntry `json:"versions"`
+}
+
+// VersionEntry is the unified per-version record used across all package types.
+// Fields that are irrelevant to a given ecosystem are left at their zero value
+// and omitted from JSON output.
+type VersionEntry struct {
+	// Version is the version identifier (semver, git ref, chart version, etc.).
+	Version string `json:"version,omitempty"`
+
+	// URL is the download, repository, or registry URL.
 	URL string `json:"url,omitempty"`
 
-	// Mode controls how this entry is served: "hosted" (default) or "proxy".
+	// Mode controls how the entry is served: ModeHosted (default) or ModeProxy.
 	Mode string `json:"mode,omitempty"`
 
-	// VersionConstraint qualifies how Version is matched: "exact" (default), "any", or "gte".
+	// VersionConstraint qualifies how Version is matched.
+	// One of ConstraintExact (default), ConstraintCompatible, ConstraintPatch, ConstraintAny.
 	VersionConstraint string `json:"version_constraint,omitempty"`
 
-	// Checksum is the expected digest for the module zip archive.
-	// Auto-populated on first fetch if nil.
-	Checksum *Checksum `json:"checksum,omitempty"`
+	// --- git-specific fields ---
 
-	// ChecksumVerified is true when the checksum was confirmed against a source-published digest.
-	ChecksumVerified bool `json:"checksum_verified,omitempty"`
+	// Ref is the git ref (tag, branch, or commit SHA). Used as the version identifier
+	// for git packages when Version is not explicitly set.
+	Ref string `json:"ref,omitempty"`
 
-	// Description is a short summary of the package, auto-discovered from upstream.
-	Description string `json:"description,omitempty"`
-	Platform string `json:"platform,omitempty"`
-	BuildEnv *BuildEnv `json:"build_env,omitempty"`
+	// Source controls how a git repository is obtained:
+	//   "release" — download the release tarball (smaller, faster)
+	//   "clone"   — git clone --bare + bundle (full history)
+	Source string `json:"source,omitempty"`
 
-	// Hidden excludes this version from being served to clients.
-	Hidden bool `json:"hidden,omitempty"`
+	// --- apt-specific fields ---
 
-	// Frozen prevents this entry from being built, edited, or deleted.
-	Frozen bool `json:"frozen,omitempty"`
-}
+	// SourceName is the upstream Debian package / source directory name.
+	// Defaults to the package Name when absent.
+	SourceName string `json:"source_name,omitempty"`
 
-// VersionedName returns "name@version".
-func (e GomodEntry) VersionedName() string { return versionedName(e.Name, e.Version) }
+	// BuildCmd is the shell command executed inside the cloned source directory
+	// to produce a .deb file.
+	BuildCmd string `json:"build_cmd,omitempty"`
 
-// EffectiveMode returns the entry's mode, defaulting to ModeHosted.
-func (e GomodEntry) EffectiveMode() string {
-	if e.Mode == "" {
-		return ModeHosted
-	}
-	return e.Mode
-}
+	// DebGlob is a path glob (relative to the source dir) that locates the
+	// produced .deb file after building.
+	DebGlob string `json:"deb_glob,omitempty"`
 
-// HelmManifest is the top-level envelope for helm.json.
-type HelmManifest struct {
-	ConfigVersion int         `json:"config_version"`
-	Entries       []HelmEntry `json:"entries"`
-}
+	// --- binary-specific fields ---
 
-// HelmEntry describes a Helm chart to mirror.
-type HelmEntry struct {
-	// Name is the chart name (e.g. "ingress-nginx").
-	Name string `json:"name"`
+	// Filename overrides the basename derived from URL when set.
+	Filename string `json:"filename,omitempty"`
 
-	// Version is the chart version.
-	Version string `json:"version"`
+	// SHA256 is the expected hex digest for binary artifacts.
+	SHA256 string `json:"sha256,omitempty"`
 
-	// URL is the chart repository URL or direct .tgz download URL.
-	URL string `json:"url"`
+	// --- helm-specific fields ---
 
 	// AppVersion is the application version the chart deploys.
 	AppVersion string `json:"app_version,omitempty"`
 
-	// Mode controls how this entry is served: "hosted" (default) or "proxy".
-	Mode string `json:"mode,omitempty"`
+	// --- pypi / cross-type dependency tracking ---
 
-	// VersionConstraint qualifies how Version is matched: "exact" (default), "any", or "gte".
-	VersionConstraint string `json:"version_constraint,omitempty"`
+	// RequiredBy lists the packages that depend on this version
+	// (e.g. ["netbox"] for a pypi wheel pulled in by netbox).
+	RequiredBy []string `json:"required_by,omitempty"`
 
-	// Checksum is the expected digest for the chart .tgz archive.
-	// Auto-populated on first fetch if nil.
+	// --- integrity ---
+
+	// Checksum is the optional expected digest for the artifact.
+	// When nil, no digest verification is performed.
 	Checksum *Checksum `json:"checksum,omitempty"`
 
-	// ChecksumVerified is true when the checksum was confirmed against a source-published digest.
+	// ChecksumVerified is true when the checksum was confirmed against a
+	// digest published by the upstream source.
 	ChecksumVerified bool `json:"checksum_verified,omitempty"`
 
-	// Description is a short summary of the package, auto-discovered from upstream.
-	Description string `json:"description,omitempty"`
+	// --- build provenance ---
+
+	// Platform records the target platform for this artifact (e.g. "linux/amd64").
 	Platform string `json:"platform,omitempty"`
+
+	// BuildEnv captures the build server's environment at artifact creation time.
 	BuildEnv *BuildEnv `json:"build_env,omitempty"`
+
+	// --- lifecycle flags ---
 
 	// Hidden excludes this version from being served to clients.
 	Hidden bool `json:"hidden,omitempty"`
 
-	// Frozen prevents this entry from being built, edited, or deleted.
+	// Frozen prevents this version from being built, edited, or deleted.
 	Frozen bool `json:"frozen,omitempty"`
-}
 
-// VersionedName returns "name@version".
-func (e HelmEntry) VersionedName() string { return versionedName(e.Name, e.Version) }
+	// --- optional per-version documentation ---
 
-// EffectiveMode returns the entry's mode, defaulting to ModeHosted.
-func (e HelmEntry) EffectiveMode() string {
-	if e.Mode == "" {
-		return ModeHosted
-	}
-	return e.Mode
-}
-
-// NpmManifest is the top-level envelope for npm.json.
-type NpmManifest struct {
-	ConfigVersion int        `json:"config_version"`
-	Entries       []NpmEntry `json:"entries"`
-}
-
-// NpmEntry describes an npm package to mirror or proxy.
-type NpmEntry struct {
-	// Name is the package name (e.g. "lodash" or "@scope/pkg").
-	Name string `json:"name"`
-
-	// Version is the semver version.
-	Version string `json:"version"`
-
-	// URL is the upstream registry URL. When empty, registry.npmjs.org is used.
-	URL string `json:"url,omitempty"`
-
-	// Mode controls how this entry is served: "hosted" (default) or "proxy".
-	Mode string `json:"mode,omitempty"`
-
-	// VersionConstraint qualifies how Version is matched: "exact" (default), "any", or "gte".
-	VersionConstraint string `json:"version_constraint,omitempty"`
-
-	// Checksum is the expected digest for the npm tarball.
-	// Auto-populated on first fetch if nil.
-	Checksum *Checksum `json:"checksum,omitempty"`
-
-	// ChecksumVerified is true when the checksum was confirmed against a source-published digest.
-	ChecksumVerified bool `json:"checksum_verified,omitempty"`
-
-	// Description is a short summary of the package, auto-discovered from upstream.
+	// Description overrides the package-level description for this specific version.
 	Description string `json:"description,omitempty"`
-	Platform string `json:"platform,omitempty"`
-	BuildEnv *BuildEnv `json:"build_env,omitempty"`
-
-	// Hidden excludes this version from being served to clients.
-	Hidden bool `json:"hidden,omitempty"`
-
-	// Frozen prevents this entry from being built, edited, or deleted.
-	Frozen bool `json:"frozen,omitempty"`
 }
 
-// VersionedName returns "name@version".
-func (e NpmEntry) VersionedName() string { return versionedName(e.Name, e.Version) }
+// VersionedName returns "name@version" using whichever of Version or Ref is set,
+// or just "name" when neither is set.
+func (ve VersionEntry) VersionedName(name string) string {
+	ver := ve.Version
+	if ver == "" {
+		ver = ve.Ref
+	}
+	return versionedName(name, ver)
+}
 
-// EffectiveMode returns the entry's mode, defaulting to ModeHosted.
-func (e NpmEntry) EffectiveMode() string {
-	if e.Mode == "" {
+// IsRelease returns true when a git entry should be fetched as a release tarball.
+// When Source is explicitly set that value wins. Otherwise the method auto-detects
+// from Ref: version-like refs (e.g. v4.5.7, 1.0.0) use release mode, while
+// branch-like refs (e.g. main, develop) use clone mode.
+func (ve VersionEntry) IsRelease() bool {
+	switch ve.Source {
+	case "release":
+		return true
+	case "clone":
+		return false
+	default:
+		return looksLikeVersionTag(ve.Ref)
+	}
+}
+
+// EffectiveMode returns the entry's mode, defaulting to ModeHosted when unset.
+func (ve VersionEntry) EffectiveMode() string {
+	if ve.Mode == "" {
 		return ModeHosted
 	}
-	return e.Mode
+	return ve.Mode
 }
 
+// DepEdge represents a directed dependency from a parent package to a child package.
+// Names are formatted as "type/name" (e.g. "git/netbox").
+type DepEdge struct {
+	// Parent is the package that depends on Child (e.g. "git/netbox@v4.5.7").
+	Parent string `json:"parent"`
+	// Child is the package being depended upon (e.g. "pypi/django@5.2.12").
+	Child string `json:"child"`
+	// Constraint is the version constraint type (e.g. "exact", "patch", "compatible", "any").
+	Constraint string `json:"constraint,omitempty"`
+	// RawSpec is the original dependency specifier (e.g. "Django==5.2.12").
+	RawSpec string `json:"raw_spec,omitempty"`
+}
+
+// DependencyGraph is the in-memory representation of the dependency graph
+// stored in graph.json on the backend.
+type DependencyGraph struct {
+	// Edges is the full list of directed dependency relationships.
+	Edges []DepEdge `json:"edges"`
+}
+
+// Index is the lightweight catalog stored in index.json on the backend.
+// It maps each package type to the list of safe names registered under it,
+// enabling cheap existence checks and listings without loading every manifest.
+type Index struct {
+	// ConfigVersion is the schema version of this index file.
+	ConfigVersion int `json:"config_version"`
+
+	// Packages maps package type (e.g. "git") to a slice of safe names.
+	Packages map[string][]string `json:"packages"`
+}
+
+// SafeName converts a package name to a filesystem-safe path component by
+// replacing "/" with "--". This is the inverse of unsafeName.
+func SafeName(name string) string {
+	return strings.ReplaceAll(name, "/", "--")
+}
+
+// versionedName returns "name@version" or just "name" when version is empty.
 func versionedName(name, version string) string {
 	if version == "" {
 		return name
 	}
 	return name + "@" + version
+}
+
+// looksLikeVersionTag returns true when ref appears to be a semantic version tag
+// rather than a branch name. Matches patterns like "v1.2.3", "1.0.0", "v4.5.7-rc1".
+func looksLikeVersionTag(ref string) bool {
+	if ref == "" {
+		return false
+	}
+	s := ref
+	if s[0] == 'v' || s[0] == 'V' {
+		s = s[1:]
+	}
+	// Must start with a digit after the optional 'v' prefix.
+	return len(s) > 0 && s[0] >= '0' && s[0] <= '9'
 }

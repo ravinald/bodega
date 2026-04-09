@@ -1,5 +1,102 @@
 # Changelog — 2026-04-07
 
+## Full migration to new Store API (internal/builder, internal/server, internal/tui, cmd/bodega)
+
+Completed the codebase-wide migration to the new unified `manifest.PackageManifest` + `manifest.VersionEntry` API. All packages now use `store.ListPackages`, `store.GetPackage`, `store.SavePackage`, `store.AddVersion`, `store.DeletePackage`, and `store.SaveIndex`. The old per-type structs and Store field/method accessors are gone everywhere.
+
+### Packages modified
+
+**`internal/builder/`** (`apt.go`, `binary.go`, `git.go`, `gomod.go`, `helm.go`, `npm.go`, `pypi.go`, `pypi_deps.go`, `buildenv.go`, `checksum.go`, `discover.go`, `describe.go`, `stage_test.go`): All functions now accept `(name string, ve manifest.VersionEntry)`. Iteration pattern: `store.ListPackages(typ)` → `store.GetPackage(ctx, typ, name)` → `pm.Versions`. SHA256 field changed from `*string` to `string`.
+
+**`internal/server/server_test.go`**: `newTestServer` builds store via `manifest.NewLocalStore(t.TempDir())` + `store.AddVersion` instead of old struct literal.
+
+**`internal/tui/sources.go`**: `BuildTree` uses `store.ListPackages` + `store.GetPackage` via a shared `collectEntries` helper. Requires `context` import.
+
+**`internal/tui/details.go`**: `discoverGitDeps` takes `(name, ref string)`. `dependentsOf` queries `VersionEntry.RequiredBy`. All `store.FindXxx` calls replaced with `store.GetPackage`. `s3Path`/`clientURL`/`rawJSON`/`packageDescription` rewritten. `SHA256` access updated to `string` field.
+
+**`internal/tui/app.go`**: Store reload blocks use `manifest.NewLocalStore`/`manifest.NewStore` + `store.LoadIndex`. `buildEditFields`, `saveCreateEntry`, `makeJSONApplyFn`, `toggleHidden` rewritten. `buildCreatePopup.validate` uses `store.GetPackage`.
+
+**`internal/tui/executor.go`**: `runDelete`/`runFreeze`/`isFrozenEntry`/`s3KeyForEntry` rewritten. `runVerify` simplified.
+
+**`internal/tui/tui_test.go`**: All `manifest.Store{Apt: ...}` struct literals replaced with `manifest.NewLocalStore(t.TempDir())` + `store.AddVersion`.
+
+**`cmd/bodega/main.go`**: `loadStore` uses `manifest.NewLocalStore`/`manifest.NewStore` + `store.LoadIndex`.
+
+**`cmd/bodega/cmd_create.go`**: `collectXxxEntry` helpers return `(name string, ve manifest.VersionEntry)`. Creates entries via `store.AddVersion` + `store.SaveIndex`.
+
+**`cmd/bodega/cmd_delete.go`**: `isFrozen`/`s3KeyFor` take `context.Context`. Deletion via `store.DeletePackage` + `store.SaveIndex`.
+
+**`cmd/bodega/cmd_freeze.go`**: Toggle frozen state on all VersionEntry items via `store.GetPackage` → mutate → `store.SavePackage`.
+
+**`cmd/bodega/cmd_refresh.go`**: Iteration uses `store.ListPackages` + `store.GetPackage`. New versions via `store.AddVersion` + `store.SaveIndex`. Old `pypiVersionExists`/`gomodVersionExists` etc. helpers replaced with `store.FindVersion` checks.
+
+**`cmd/bodega/cmd_remove.go`**: `s3KeyFor` call updated to pass `context.Context`.
+
+**`cmd/bodega/pipeline.go`**: All `ensureFetchedXxx`/`ensureBuiltXxx`/`ensurePackagedXxx` helpers rewritten to iterate `store.ListPackages` + `store.GetPackage`.
+
+### Result
+
+`go build ./...` — clean.
+`go test ./...` — all packages pass (builder, manifest, server, tui, audit, config, logging).
+
+---
+
+
+## manifest package rebuild (internal/manifest/)
+
+Replaced the flat per-type manifest architecture with a per-package file layout
+and a unified VersionEntry type. The manifest package now has no internal
+dependencies beyond the Go standard library.
+
+### Files replaced / deleted
+
+| File | Action |
+|------|--------|
+| `internal/manifest/types.go` | Replaced — old per-type structs removed; unified PackageManifest + VersionEntry added |
+| `internal/manifest/backend.go` | Replaced — Backend interface extended with Delete and List; ReadMD5 removed from interface |
+| `internal/manifest/loader.go` | Deleted — superseded by store.go |
+| `internal/manifest/loader_test.go` | Rewritten for new Store API |
+
+### Files added
+
+| File | Purpose |
+|------|---------|
+| `internal/manifest/store.go` | New Store with lazy per-package loading, index management, mutex safety |
+| `internal/manifest/graph.go` | Internal helpers for DependencyGraph load/save/query |
+
+### Key type changes
+
+- `CurrentConfigVersion` bumped from 1 to 2.
+- Removed all per-type structs (AptManifest, GitEntry, BinaryEntry, etc.).
+- Added `PackageManifest` (one JSON per package at `{type}/{safeName}/manifest.json`).
+- Added `VersionEntry` — unified across all 7 ecosystems.
+- Added `Index` (index.json), `DependencyGraph` / `DepEdge` (graph.json).
+- `SafeName()` replaces `/` with `--` for filesystem-safe path components.
+
+### Backend changes
+
+- `Delete(ctx, name string) error` added to Backend interface.
+- `List(ctx, prefix string) ([]string, error)` added to Backend interface.
+- `S3Backend`: new `DeleteFn` and `ListFn` fields; `List` strips backend Prefix from returned keys.
+- `LocalBackend`: `Delete` via `os.Remove`; `List` via `filepath.WalkDir`; `Write` creates intermediate dirs.
+- `ReadMD5` removed from Backend interface (MD5 remains a local filesystem concern in integrity.go).
+
+### Store API
+
+- `NewStore(backend Backend) *Store` / `NewLocalStore(dir string) *Store`
+- `LoadIndex` / `SaveIndex` — manage index.json
+- `GetPackage` — lazy-load with in-memory cache; `SavePackage` / `DeletePackage`
+- `FindVersion` / `AddVersion` / `RemoveVersion`
+- `ListPackages(typ)` / `AllPackages()`
+- `LoadGraph` / `SaveGraph` / `AddEdge` / `RemoveEdge` / `ParentsOf` / `ChildrenOf` / `Orphans`
+
+### Test results
+
+24 tests pass (5 integrity + 19 store/graph tests), 0 failures.
+
+---
+
+
 ## bodega HTTP server (`tools/bodega/internal/server/`)
 
 Added an HTTP package server that proxies S3-backed artifacts to standard

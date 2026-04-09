@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -64,6 +65,8 @@ type flatRow struct {
 // S3 statuses. Entries with the same name are grouped under an intermediate
 // package node so the tree has three levels: type > package > version.
 func BuildTree(store *manifest.Store, statuses []s3.EntryStatus) []TreeNode {
+	ctx := context.Background()
+
 	s3map := make(map[string]bool, len(statuses))
 	for _, st := range statuses {
 		s3map[st.Type+"/"+st.Name] = st.InS3
@@ -128,25 +131,44 @@ func BuildTree(store *manifest.Store, statuses []s3.EntryStatus) []TreeNode {
 		return group
 	}
 
-	// apt
-	var aptEntries []entryInfo
-	for _, e := range store.Apt {
-		aptEntries = append(aptEntries, entryInfo{
-			label: e.Version, name: e.Name, versioned: e.VersionedName(), platform: e.Platform, frozen: e.Frozen,
-		})
+	// Helper: collect entryInfo for all versions of all packages of a given type.
+	collectEntries := func(typeName string, labelFn func(ve manifest.VersionEntry) string) []entryInfo {
+		var entries []entryInfo
+		for _, safeName := range store.ListPackages(typeName) {
+			pm, err := store.GetPackage(ctx, typeName, safeName)
+			if err != nil || pm == nil {
+				continue
+			}
+			for _, ve := range pm.Versions {
+				label := labelFn(ve)
+				if label == "" {
+					label = ve.Version
+				}
+				if label == "" {
+					label = ve.Ref
+				}
+				allFrozen := ve.Frozen
+				entries = append(entries, entryInfo{
+					label:     label,
+					name:      pm.Name,
+					versioned: ve.VersionedName(pm.Name),
+					platform:  ve.Platform,
+					frozen:    allFrozen,
+				})
+			}
+		}
+		return entries
 	}
+
+	// apt
+	aptEntries := collectEntries(manifest.TypeApt, func(ve manifest.VersionEntry) string { return ve.Version })
 	roots = append(roots, buildGroup(manifest.TypeApt, aptEntries))
 
 	// git
-	var gitEntries []entryInfo
-	for _, e := range store.Git {
-		gitEntries = append(gitEntries, entryInfo{
-			label: e.Ref, name: e.Name, versioned: e.VersionedName(), platform: e.Platform, frozen: e.Frozen,
-		})
-	}
+	gitEntries := collectEntries(manifest.TypeGit, func(ve manifest.VersionEntry) string { return ve.Ref })
 	roots = append(roots, buildGroup(manifest.TypeGit, gitEntries))
 
-	// pypi
+	// pypi — special grouping by base package name
 	pypiGroup := TreeNode{
 		Label:     "pypi/",
 		EntryType: manifest.TypePypi,
@@ -154,16 +176,21 @@ func BuildTree(store *manifest.Store, statuses []s3.EntryStatus) []TreeNode {
 		Expanded:  false,
 	}
 	var pypiEntries []entryInfo
-	for _, pkg := range store.Pypi.Packages {
-		ver := pkg.Version
-		if ver == "" {
-			ver = pkg.Name
+	for _, safeName := range store.ListPackages(manifest.TypePypi) {
+		pm, err := store.GetPackage(ctx, manifest.TypePypi, safeName)
+		if err != nil || pm == nil {
+			continue
 		}
-		pypiEntries = append(pypiEntries, entryInfo{
-			label: ver, name: pkg.Name, versioned: pkg.Name, frozen: pkg.Frozen || store.Pypi.Frozen,
-		})
+		for _, ve := range pm.Versions {
+			ver := ve.Version
+			if ver == "" {
+				ver = pm.Name
+			}
+			pypiEntries = append(pypiEntries, entryInfo{
+				label: ver, name: pm.Name, versioned: pm.Name, frozen: ve.Frozen,
+			})
+		}
 	}
-	// Pypi: group by base package name (strip version specifiers for grouping).
 	nameOrder := []string{}
 	byName := make(map[string][]entryInfo)
 	for _, e := range pypiEntries {
@@ -188,46 +215,26 @@ func BuildTree(store *manifest.Store, statuses []s3.EntryStatus) []TreeNode {
 				Name:      v.name,
 				InS3:      s3map[manifest.TypePypi+"/wheels"],
 				Frozen:    v.frozen,
-				})
-			}
+			})
+		}
 		pypiGroup.Children = append(pypiGroup.Children, pkgNode)
 	}
 	roots = append(roots, pypiGroup)
 
 	// binary
-	var binEntries []entryInfo
-	for _, e := range store.Binary {
-		binEntries = append(binEntries, entryInfo{
-			label: e.Version, name: e.Name, versioned: e.VersionedName(), platform: e.Platform, frozen: e.Frozen,
-		})
-	}
+	binEntries := collectEntries(manifest.TypeBinary, func(ve manifest.VersionEntry) string { return ve.Version })
 	roots = append(roots, buildGroup(manifest.TypeBinary, binEntries))
 
 	// gomod
-	var gomodEntries []entryInfo
-	for _, e := range store.Gomod {
-		gomodEntries = append(gomodEntries, entryInfo{
-			label: e.Version, name: e.Name, versioned: e.VersionedName(), platform: e.Platform, frozen: e.Frozen,
-		})
-	}
+	gomodEntries := collectEntries(manifest.TypeGomod, func(ve manifest.VersionEntry) string { return ve.Version })
 	roots = append(roots, buildGroup(manifest.TypeGomod, gomodEntries))
 
 	// helm
-	var helmEntries []entryInfo
-	for _, e := range store.Helm {
-		helmEntries = append(helmEntries, entryInfo{
-			label: e.Version, name: e.Name, versioned: e.VersionedName(), platform: e.Platform, frozen: e.Frozen,
-		})
-	}
+	helmEntries := collectEntries(manifest.TypeHelm, func(ve manifest.VersionEntry) string { return ve.Version })
 	roots = append(roots, buildGroup(manifest.TypeHelm, helmEntries))
 
 	// npm
-	var npmEntries []entryInfo
-	for _, e := range store.Npm {
-		npmEntries = append(npmEntries, entryInfo{
-			label: e.Version, name: e.Name, versioned: e.VersionedName(), platform: e.Platform, frozen: e.Frozen,
-		})
-	}
+	npmEntries := collectEntries(manifest.TypeNpm, func(ve manifest.VersionEntry) string { return ve.Version })
 	roots = append(roots, buildGroup(manifest.TypeNpm, npmEntries))
 
 	return roots

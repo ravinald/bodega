@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"strings"
 
 	"github.com/scaleapi/bodega/internal/manifest"
 )
@@ -26,37 +25,27 @@ func CheckStatus(ctx context.Context, client *Client, store *manifest.Store, typ
 	var statuses []EntryStatus
 
 	for _, t := range types {
-		var err error
+		var (
+			s   []EntryStatus
+			err error
+		)
 		switch t {
 		case manifest.TypeBinary:
-			s, e := checkBinaryStatus(ctx, client, store)
-			statuses = append(statuses, s...)
-			err = e
+			s, err = checkBinaryStatus(ctx, client, store)
 		case manifest.TypeGit:
-			s, e := checkGitStatus(ctx, client, store)
-			statuses = append(statuses, s...)
-			err = e
+			s, err = checkGitStatus(ctx, client, store)
 		case manifest.TypeApt:
-			s, e := checkAptStatus(ctx, client, store)
-			statuses = append(statuses, s...)
-			err = e
+			s, err = checkAptStatus(ctx, client, store)
 		case manifest.TypePypi:
-			s, e := checkPypiStatus(ctx, client, store)
-			statuses = append(statuses, s...)
-			err = e
+			s, err = checkPypiStatus(ctx, client, store)
 		case manifest.TypeGomod:
-			s, e := checkGomodStatus(ctx, client, store)
-			statuses = append(statuses, s...)
-			err = e
+			s, err = checkGomodStatus(ctx, client, store)
 		case manifest.TypeHelm:
-			s, e := checkHelmStatus(ctx, client, store)
-			statuses = append(statuses, s...)
-			err = e
+			s, err = checkHelmStatus(ctx, client, store)
 		case manifest.TypeNpm:
-			s, e := checkNpmStatus(ctx, client, store)
-			statuses = append(statuses, s...)
-			err = e
+			s, err = checkNpmStatus(ctx, client, store)
 		}
+		statuses = append(statuses, s...)
 		if err != nil {
 			return statuses, err
 		}
@@ -67,76 +56,136 @@ func CheckStatus(ctx context.Context, client *Client, store *manifest.Store, typ
 
 func checkBinaryStatus(ctx context.Context, client *Client, store *manifest.Store) ([]EntryStatus, error) {
 	var out []EntryStatus
-	for _, e := range store.Binary {
-		filename := e.Filename
-		if filename == "" {
-			filename = lastSegment(e.URL)
-		}
-		// Path: binaries/<name>/<version>/<filename> or binaries/<name>/<filename>
-		var key string
-		if e.Version != "" {
-			key = fmt.Sprintf("binaries/%s/%s/%s", e.Name, e.Version, filename)
-		} else {
-			key = fmt.Sprintf("binaries/%s/%s", e.Name, filename)
-		}
-		s3stat, err := client.HeadObject(ctx, key)
+	for _, name := range store.ListPackages(manifest.TypeBinary) {
+		pm, err := store.GetPackage(ctx, manifest.TypeBinary, name)
 		if err != nil {
 			return out, err
 		}
-		out = append(out, EntryStatus{
-			Type:   manifest.TypeBinary,
-			Name:   e.VersionedName(),
-			S3Key:  key,
-			InS3:   s3stat.Exists,
-			Frozen: e.Frozen,
-			ETag:   s3stat.ETag,
-			SizeS3: s3stat.Size,
-		})
+		if pm == nil {
+			continue
+		}
+		safeName := manifest.SafeName(pm.Name)
+		for _, ve := range pm.Versions {
+			filename := ve.Filename
+			if filename == "" {
+				filename = lastSegment(ve.URL)
+			}
+			var key string
+			if ve.Version != "" {
+				key = fmt.Sprintf("binaries/%s/%s/%s", safeName, ve.Version, filename)
+			} else {
+				key = fmt.Sprintf("binaries/%s/%s", safeName, filename)
+			}
+			s3stat, err := client.HeadObject(ctx, key)
+			if err != nil {
+				return out, err
+			}
+			out = append(out, EntryStatus{
+				Type:   manifest.TypeBinary,
+				Name:   ve.VersionedName(pm.Name),
+				S3Key:  key,
+				InS3:   s3stat.Exists,
+				Frozen: ve.Frozen,
+				ETag:   s3stat.ETag,
+				SizeS3: s3stat.Size,
+			})
+		}
 	}
 	return out, nil
 }
 
 func checkGitStatus(ctx context.Context, client *Client, store *manifest.Store) ([]EntryStatus, error) {
 	var out []EntryStatus
-	for _, e := range store.Git {
-		ext := ".bundle"
-		if e.IsRelease() {
-			ext = ".tar.gz"
-		}
-		sn := strings.ReplaceAll(e.Name, "/", "--")
-		key := fmt.Sprintf("repos/%s/%s-%s%s", sn, sn, e.Ref, ext)
-		s3stat, err := client.HeadObject(ctx, key)
+	for _, name := range store.ListPackages(manifest.TypeGit) {
+		pm, err := store.GetPackage(ctx, manifest.TypeGit, name)
 		if err != nil {
 			return out, err
 		}
-		out = append(out, EntryStatus{
-			Type:   manifest.TypeGit,
-			Name:   e.VersionedName(),
-			S3Key:  key,
-			InS3:   s3stat.Exists,
-			Frozen: e.Frozen,
-			ETag:   s3stat.ETag,
-			SizeS3: s3stat.Size,
-		})
+		if pm == nil {
+			continue
+		}
+		sn := manifest.SafeName(pm.Name)
+		for _, ve := range pm.Versions {
+			ext := ".bundle"
+			if ve.IsRelease() {
+				ext = ".tar.gz"
+			}
+			ref := ve.Ref
+			if ref == "" {
+				ref = ve.Version
+			}
+			key := fmt.Sprintf("repos/%s/%s-%s%s", sn, sn, ref, ext)
+			s3stat, err := client.HeadObject(ctx, key)
+			if err != nil {
+				return out, err
+			}
+			out = append(out, EntryStatus{
+				Type:   manifest.TypeGit,
+				Name:   ve.VersionedName(pm.Name),
+				S3Key:  key,
+				InS3:   s3stat.Exists,
+				Frozen: ve.Frozen,
+				ETag:   s3stat.ETag,
+				SizeS3: s3stat.Size,
+			})
+		}
 	}
 	return out, nil
 }
 
 func checkAptStatus(ctx context.Context, client *Client, store *manifest.Store) ([]EntryStatus, error) {
 	// The apt repository is uploaded as a directory; check for the Release file.
+	// One S3 HEAD is sufficient — all apt packages share the same repo structure.
 	key := "packages/apt/dists/noble/Release"
 	s3stat, err := client.HeadObject(ctx, key)
 	if err != nil {
 		return nil, err
 	}
 	var out []EntryStatus
-	for _, e := range store.Apt {
+	for _, name := range store.ListPackages(manifest.TypeApt) {
+		pm, err := store.GetPackage(ctx, manifest.TypeApt, name)
+		if err != nil {
+			return out, err
+		}
+		if pm == nil {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			out = append(out, EntryStatus{
+				Type:   manifest.TypeApt,
+				Name:   ve.VersionedName(pm.Name),
+				S3Key:  key,
+				InS3:   s3stat.Exists,
+				Frozen: ve.Frozen,
+				ETag:   s3stat.ETag,
+				SizeS3: s3stat.Size,
+			})
+		}
+	}
+	return out, nil
+}
+
+func checkPypiStatus(ctx context.Context, client *Client, store *manifest.Store) ([]EntryStatus, error) {
+	// One status entry per package: check for the wheel MANIFEST.sha256 sentinel.
+	const key = "pypi/wheels/MANIFEST.sha256"
+	s3stat, err := client.HeadObject(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	var out []EntryStatus
+	for _, name := range store.ListPackages(manifest.TypePypi) {
+		pm, err := store.GetPackage(ctx, manifest.TypePypi, name)
+		if err != nil {
+			return out, err
+		}
+		if pm == nil {
+			continue
+		}
 		out = append(out, EntryStatus{
-			Type:   manifest.TypeApt,
-			Name:   e.VersionedName(),
+			Type:   manifest.TypePypi,
+			Name:   pm.Name,
 			S3Key:  key,
 			InS3:   s3stat.Exists,
-			Frozen: e.Frozen,
 			ETag:   s3stat.ETag,
 			SizeS3: s3stat.Size,
 		})
@@ -144,95 +193,94 @@ func checkAptStatus(ctx context.Context, client *Client, store *manifest.Store) 
 	return out, nil
 }
 
-func checkPypiStatus(ctx context.Context, client *Client, store *manifest.Store) ([]EntryStatus, error) {
-	// Versioned path: pypi/wheels/<version>/MANIFEST.sha256
-	// Unversioned fallback: pypi/wheels/MANIFEST.sha256
-	var key string
-	if store.Pypi.Version != "" {
-		key = fmt.Sprintf("pypi/wheels/%s/MANIFEST.sha256", store.Pypi.Version)
-	} else {
-		key = "pypi/wheels/MANIFEST.sha256"
-	}
-	s3stat, err := client.HeadObject(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-	name := "wheels"
-	if store.Pypi.Version != "" {
-		name = "wheels@" + store.Pypi.Version
-	}
-	return []EntryStatus{
-		{
-			Type:   manifest.TypePypi,
-			Name:   name,
-			S3Key:  key,
-			InS3:   s3stat.Exists,
-			Frozen: store.Pypi.Frozen,
-			ETag:   s3stat.ETag,
-			SizeS3: s3stat.Size,
-		},
-	}, nil
-}
-
 func checkGomodStatus(ctx context.Context, client *Client, store *manifest.Store) ([]EntryStatus, error) {
 	var out []EntryStatus
-	for _, e := range store.Gomod {
-		key := fmt.Sprintf("gomod/%s/@v/%s.zip", e.Name, e.Version)
-		s3stat, err := client.HeadObject(ctx, key)
+	for _, name := range store.ListPackages(manifest.TypeGomod) {
+		pm, err := store.GetPackage(ctx, manifest.TypeGomod, name)
 		if err != nil {
 			return out, err
 		}
-		out = append(out, EntryStatus{
-			Type:   manifest.TypeGomod,
-			Name:   e.VersionedName(),
-			S3Key:  key,
-			InS3:   s3stat.Exists,
-			Frozen: e.Frozen,
-			ETag:   s3stat.ETag,
-			SizeS3: s3stat.Size,
-		})
+		if pm == nil {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			key := fmt.Sprintf("gomod/%s/@v/%s.zip", pm.Name, ve.Version)
+			s3stat, err := client.HeadObject(ctx, key)
+			if err != nil {
+				return out, err
+			}
+			out = append(out, EntryStatus{
+				Type:   manifest.TypeGomod,
+				Name:   ve.VersionedName(pm.Name),
+				S3Key:  key,
+				InS3:   s3stat.Exists,
+				Frozen: ve.Frozen,
+				ETag:   s3stat.ETag,
+				SizeS3: s3stat.Size,
+			})
+		}
 	}
 	return out, nil
 }
 
 func checkHelmStatus(ctx context.Context, client *Client, store *manifest.Store) ([]EntryStatus, error) {
 	var out []EntryStatus
-	for _, e := range store.Helm {
-		key := fmt.Sprintf("charts/%s-%s.tgz", e.Name, e.Version)
-		s3stat, err := client.HeadObject(ctx, key)
+	for _, name := range store.ListPackages(manifest.TypeHelm) {
+		pm, err := store.GetPackage(ctx, manifest.TypeHelm, name)
 		if err != nil {
 			return out, err
 		}
-		out = append(out, EntryStatus{
-			Type:   manifest.TypeHelm,
-			Name:   e.VersionedName(),
-			S3Key:  key,
-			InS3:   s3stat.Exists,
-			Frozen: e.Frozen,
-			ETag:   s3stat.ETag,
-			SizeS3: s3stat.Size,
-		})
+		if pm == nil {
+			continue
+		}
+		safeName := manifest.SafeName(pm.Name)
+		for _, ve := range pm.Versions {
+			key := fmt.Sprintf("charts/%s/%s/%s-%s.tgz", safeName, ve.Version, pm.Name, ve.Version)
+			s3stat, err := client.HeadObject(ctx, key)
+			if err != nil {
+				return out, err
+			}
+			out = append(out, EntryStatus{
+				Type:   manifest.TypeHelm,
+				Name:   ve.VersionedName(pm.Name),
+				S3Key:  key,
+				InS3:   s3stat.Exists,
+				Frozen: ve.Frozen,
+				ETag:   s3stat.ETag,
+				SizeS3: s3stat.Size,
+			})
+		}
 	}
 	return out, nil
 }
 
 func checkNpmStatus(ctx context.Context, client *Client, store *manifest.Store) ([]EntryStatus, error) {
 	var out []EntryStatus
-	for _, e := range store.Npm {
-		key := fmt.Sprintf("npm/%s/%s-%s.tgz", e.Name, e.Name, e.Version)
-		s3stat, err := client.HeadObject(ctx, key)
+	for _, name := range store.ListPackages(manifest.TypeNpm) {
+		pm, err := store.GetPackage(ctx, manifest.TypeNpm, name)
 		if err != nil {
 			return out, err
 		}
-		out = append(out, EntryStatus{
-			Type:   manifest.TypeNpm,
-			Name:   e.VersionedName(),
-			S3Key:  key,
-			InS3:   s3stat.Exists,
-			Frozen: e.Frozen,
-			ETag:   s3stat.ETag,
-			SizeS3: s3stat.Size,
-		})
+		if pm == nil {
+			continue
+		}
+		safeName := manifest.SafeName(pm.Name)
+		for _, ve := range pm.Versions {
+			key := fmt.Sprintf("npm/%s/%s/%s-%s.tgz", safeName, ve.Version, pm.Name, ve.Version)
+			s3stat, err := client.HeadObject(ctx, key)
+			if err != nil {
+				return out, err
+			}
+			out = append(out, EntryStatus{
+				Type:   manifest.TypeNpm,
+				Name:   ve.VersionedName(pm.Name),
+				S3Key:  key,
+				InS3:   s3stat.Exists,
+				Frozen: ve.Frozen,
+				ETag:   s3stat.ETag,
+				SizeS3: s3stat.Size,
+			})
+		}
 	}
 	return out, nil
 }

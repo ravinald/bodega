@@ -34,8 +34,8 @@ func mkDir(t *testing.T, path string) {
 func TestCheckBinaryStage_NotFetched(t *testing.T) {
 	root := t.TempDir()
 	cfg := &Config{BuildRoot: root}
-	entry := manifest.BinaryEntry{Name: "awscli", URL: "https://example.com/awscli.zip"}
-	s := CheckBinaryStage(cfg, entry)
+	ve := manifest.VersionEntry{URL: "https://example.com/awscli.zip"}
+	s := CheckBinaryStage(cfg, "awscli", ve)
 	if s.Fetched || s.Built || s.Packaged {
 		t.Errorf("expected all false when file absent, got %+v", s)
 	}
@@ -44,11 +44,11 @@ func TestCheckBinaryStage_NotFetched(t *testing.T) {
 func TestCheckBinaryStage_Fetched(t *testing.T) {
 	root := t.TempDir()
 	cfg := &Config{BuildRoot: root}
-	entry := manifest.BinaryEntry{Name: "awscli", URL: "https://example.com/awscli.zip"}
+	ve := manifest.VersionEntry{URL: "https://example.com/awscli.zip"}
 	d := buildDirs(root)
 	touchFile(t, filepath.Join(d.binaries, "awscli", "awscli.zip"))
 
-	s := CheckBinaryStage(cfg, entry)
+	s := CheckBinaryStage(cfg, "awscli", ve)
 	if !s.Fetched || !s.Built || !s.Packaged {
 		t.Errorf("expected all true when file present, got %+v", s)
 	}
@@ -57,19 +57,19 @@ func TestCheckBinaryStage_Fetched(t *testing.T) {
 func TestCheckBinaryStage_Versioned(t *testing.T) {
 	root := t.TempDir()
 	cfg := &Config{BuildRoot: root}
-	entry := manifest.BinaryEntry{Name: "awscli", Version: "2.13.0", URL: "https://example.com/awscli.zip"}
+	ve := manifest.VersionEntry{Version: "2.13.0", URL: "https://example.com/awscli.zip"}
 	d := buildDirs(root)
 
 	// File NOT at versioned path → not fetched.
 	touchFile(t, filepath.Join(d.binaries, "awscli", "awscli.zip"))
-	s := CheckBinaryStage(cfg, entry)
+	s := CheckBinaryStage(cfg, "awscli", ve)
 	if s.Fetched {
 		t.Error("expected Fetched=false when file at unversioned path but version is set")
 	}
 
 	// File at versioned path → fetched.
 	touchFile(t, filepath.Join(d.binaries, "awscli", "2.13.0", "awscli.zip"))
-	s = CheckBinaryStage(cfg, entry)
+	s = CheckBinaryStage(cfg, "awscli", ve)
 	if !s.Fetched {
 		t.Error("expected Fetched=true when file at versioned path")
 	}
@@ -82,8 +82,8 @@ func TestCheckBinaryStage_Versioned(t *testing.T) {
 func TestBinaryDestPath_NoVersion(t *testing.T) {
 	root := t.TempDir()
 	d := buildDirs(root)
-	entry := manifest.BinaryEntry{Name: "tool", URL: "https://example.com/tool.tar.gz"}
-	got := binaryDestPath(d, entry)
+	ve := manifest.VersionEntry{URL: "https://example.com/tool.tar.gz"}
+	got := binaryDestPath(d, "tool", ve)
 	want := filepath.Join(d.binaries, "tool", "tool.tar.gz")
 	if got != want {
 		t.Errorf("binaryDestPath (no version) = %q, want %q", got, want)
@@ -93,8 +93,8 @@ func TestBinaryDestPath_NoVersion(t *testing.T) {
 func TestBinaryDestPath_WithVersion(t *testing.T) {
 	root := t.TempDir()
 	d := buildDirs(root)
-	entry := manifest.BinaryEntry{Name: "tool", Version: "v1.2", URL: "https://example.com/tool.tar.gz"}
-	got := binaryDestPath(d, entry)
+	ve := manifest.VersionEntry{Version: "v1.2", URL: "https://example.com/tool.tar.gz"}
+	got := binaryDestPath(d, "tool", ve)
 	want := filepath.Join(d.binaries, "tool", "v1.2", "tool.tar.gz")
 	if got != want {
 		t.Errorf("binaryDestPath (versioned) = %q, want %q", got, want)
@@ -104,8 +104,8 @@ func TestBinaryDestPath_WithVersion(t *testing.T) {
 func TestBinaryDestPath_FilenameOverride(t *testing.T) {
 	root := t.TempDir()
 	d := buildDirs(root)
-	entry := manifest.BinaryEntry{Name: "tool", Filename: "custom-name.bin", URL: "https://example.com/original.bin"}
-	got := binaryDestPath(d, entry)
+	ve := manifest.VersionEntry{Filename: "custom-name.bin", URL: "https://example.com/original.bin"}
+	got := binaryDestPath(d, "tool", ve)
 	want := filepath.Join(d.binaries, "tool", "custom-name.bin")
 	if got != want {
 		t.Errorf("binaryDestPath (filename override) = %q, want %q", got, want)
@@ -113,8 +113,8 @@ func TestBinaryDestPath_FilenameOverride(t *testing.T) {
 }
 
 func TestBinaryS3Key_NoVersion(t *testing.T) {
-	entry := manifest.BinaryEntry{Name: "tool", URL: "https://example.com/tool.tar.gz"}
-	got := binaryS3Key(entry)
+	ve := manifest.VersionEntry{URL: "https://example.com/tool.tar.gz"}
+	got := binaryS3Key("tool", ve)
 	want := "binaries/tool/tool.tar.gz"
 	if got != want {
 		t.Errorf("binaryS3Key (no version) = %q, want %q", got, want)
@@ -122,8 +122,8 @@ func TestBinaryS3Key_NoVersion(t *testing.T) {
 }
 
 func TestBinaryS3Key_WithVersion(t *testing.T) {
-	entry := manifest.BinaryEntry{Name: "tool", Version: "v1.2", URL: "https://example.com/tool.tar.gz"}
-	got := binaryS3Key(entry)
+	ve := manifest.VersionEntry{Version: "v1.2", URL: "https://example.com/tool.tar.gz"}
+	got := binaryS3Key("tool", ve)
 	want := "binaries/tool/v1.2/tool.tar.gz"
 	if got != want {
 		t.Errorf("binaryS3Key (versioned) = %q, want %q", got, want)
@@ -137,8 +137,8 @@ func TestBinaryS3Key_WithVersion(t *testing.T) {
 func TestCheckGitStage_Empty(t *testing.T) {
 	root := t.TempDir()
 	cfg := &Config{BuildRoot: root}
-	entry := manifest.GitEntry{Name: "netbox", URL: "https://github.com/netbox/netbox", Ref: "v4.0.0", Source: "clone"}
-	s := CheckGitStage(cfg, entry)
+	ve := manifest.VersionEntry{URL: "https://github.com/netbox/netbox", Ref: "v4.0.0", Source: "clone"}
+	s := CheckGitStage(cfg, "netbox", ve)
 	if s.Fetched || s.Packaged {
 		t.Errorf("expected all false when nothing on disk, got %+v", s)
 	}
@@ -147,11 +147,11 @@ func TestCheckGitStage_Empty(t *testing.T) {
 func TestCheckGitStage_Fetched(t *testing.T) {
 	root := t.TempDir()
 	cfg := &Config{BuildRoot: root}
-	entry := manifest.GitEntry{Name: "netbox", URL: "https://github.com/netbox/netbox", Ref: "v4.0.0", Source: "clone"}
+	ve := manifest.VersionEntry{URL: "https://github.com/netbox/netbox", Ref: "v4.0.0", Source: "clone"}
 	d := buildDirs(root)
 
-	mkDir(t, gitBareDir(d, entry))
-	s := CheckGitStage(cfg, entry)
+	mkDir(t, gitBareDir(d, "netbox", ve))
+	s := CheckGitStage(cfg, "netbox", ve)
 	if !s.Fetched {
 		t.Error("expected Fetched=true when bare repo dir exists")
 	}
@@ -163,14 +163,14 @@ func TestCheckGitStage_Fetched(t *testing.T) {
 func TestCheckGitStage_Packaged(t *testing.T) {
 	root := t.TempDir()
 	cfg := &Config{BuildRoot: root}
-	entry := manifest.GitEntry{Name: "netbox", URL: "https://github.com/netbox/netbox", Ref: "v4.0.0", Source: "clone"}
+	ve := manifest.VersionEntry{URL: "https://github.com/netbox/netbox", Ref: "v4.0.0", Source: "clone"}
 	d := buildDirs(root)
 
-	mkDir(t, gitBareDir(d, entry))
-	bundlePath := filepath.Join(d.bundles, entry.Name, entry.Name+"-"+entry.Ref+".bundle")
+	mkDir(t, gitBareDir(d, "netbox", ve))
+	bundlePath := filepath.Join(d.bundles, "netbox", "netbox-"+ve.Ref+".bundle")
 	touchFile(t, bundlePath)
 
-	s := CheckGitStage(cfg, entry)
+	s := CheckGitStage(cfg, "netbox", ve)
 	if !s.Fetched {
 		t.Error("expected Fetched=true")
 	}
@@ -182,8 +182,8 @@ func TestCheckGitStage_Packaged(t *testing.T) {
 func TestGitBareDir(t *testing.T) {
 	root := t.TempDir()
 	d := buildDirs(root)
-	entry := manifest.GitEntry{Name: "netbox", Ref: "v4.0.0", Source: "clone"}
-	got := gitBareDir(d, entry)
+	ve := manifest.VersionEntry{Ref: "v4.0.0", Source: "clone"}
+	got := gitBareDir(d, "netbox", ve)
 	want := filepath.Join(d.repos, "netbox", "netbox-v4.0.0.git") // single-segment name: no "--" replacement needed
 	if got != want {
 		t.Errorf("gitBareDir = %q, want %q", got, want)
@@ -197,8 +197,8 @@ func TestGitBareDir(t *testing.T) {
 func TestAptSourceDir_NoVersion(t *testing.T) {
 	root := t.TempDir()
 	d := buildDirs(root)
-	entry := manifest.AptEntry{Name: "efs-utils", URL: "https://github.com/aws/efs-utils"}
-	got := aptSourceDir(d, entry)
+	ve := manifest.VersionEntry{URL: "https://github.com/aws/efs-utils"}
+	got := aptSourceDir(d, "efs-utils", ve)
 	want := filepath.Join(d.sources, "efs-utils")
 	if got != want {
 		t.Errorf("aptSourceDir (no version) = %q, want %q", got, want)
@@ -208,8 +208,8 @@ func TestAptSourceDir_NoVersion(t *testing.T) {
 func TestAptSourceDir_WithVersion(t *testing.T) {
 	root := t.TempDir()
 	d := buildDirs(root)
-	entry := manifest.AptEntry{Name: "efs-utils", Version: "2.0.1", URL: "https://github.com/aws/efs-utils"}
-	got := aptSourceDir(d, entry)
+	ve := manifest.VersionEntry{Version: "2.0.1", URL: "https://github.com/aws/efs-utils"}
+	got := aptSourceDir(d, "efs-utils", ve)
 	want := filepath.Join(d.sources, "efs-utils-2.0.1")
 	if got != want {
 		t.Errorf("aptSourceDir (versioned) = %q, want %q", got, want)
@@ -219,8 +219,8 @@ func TestAptSourceDir_WithVersion(t *testing.T) {
 func TestAptSourceDir_SourceNameOverride(t *testing.T) {
 	root := t.TempDir()
 	d := buildDirs(root)
-	entry := manifest.AptEntry{Name: "efs-utils", SourceName: "amazon-efs-utils", Version: "2.0.1", URL: "https://github.com/aws/efs-utils"}
-	got := aptSourceDir(d, entry)
+	ve := manifest.VersionEntry{SourceName: "amazon-efs-utils", Version: "2.0.1", URL: "https://github.com/aws/efs-utils"}
+	got := aptSourceDir(d, "efs-utils", ve)
 	want := filepath.Join(d.sources, "amazon-efs-utils-2.0.1")
 	if got != want {
 		t.Errorf("aptSourceDir (source_name + version) = %q, want %q", got, want)
@@ -230,8 +230,8 @@ func TestAptSourceDir_SourceNameOverride(t *testing.T) {
 func TestCheckAptStage_Empty(t *testing.T) {
 	root := t.TempDir()
 	cfg := &Config{BuildRoot: root}
-	entry := manifest.AptEntry{Name: "efs-utils", URL: "https://github.com/aws/efs-utils"}
-	s := CheckAptStage(cfg, entry)
+	ve := manifest.VersionEntry{URL: "https://github.com/aws/efs-utils"}
+	s := CheckAptStage(cfg, "efs-utils", ve)
 	if s.Fetched || s.Built || s.Packaged {
 		t.Errorf("expected all false when nothing on disk, got %+v", s)
 	}
@@ -240,11 +240,11 @@ func TestCheckAptStage_Empty(t *testing.T) {
 func TestCheckAptStage_SourceBuildFetched(t *testing.T) {
 	root := t.TempDir()
 	cfg := &Config{BuildRoot: root}
-	entry := manifest.AptEntry{Name: "efs-utils", URL: "https://github.com/aws/efs-utils"}
+	ve := manifest.VersionEntry{URL: "https://github.com/aws/efs-utils"}
 	d := buildDirs(root)
 
-	mkDir(t, aptSourceDir(d, entry))
-	s := CheckAptStage(cfg, entry)
+	mkDir(t, aptSourceDir(d, "efs-utils", ve))
+	s := CheckAptStage(cfg, "efs-utils", ve)
 	if !s.Fetched {
 		t.Error("expected Fetched=true when clone dir exists")
 	}
@@ -256,14 +256,14 @@ func TestCheckAptStage_SourceBuildFetched(t *testing.T) {
 func TestCheckAptStage_SourceBuildBuilt(t *testing.T) {
 	root := t.TempDir()
 	cfg := &Config{BuildRoot: root}
-	entry := manifest.AptEntry{Name: "efs-utils", URL: "https://github.com/aws/efs-utils"}
+	ve := manifest.VersionEntry{URL: "https://github.com/aws/efs-utils"}
 	d := buildDirs(root)
 
-	cloneDir := aptSourceDir(d, entry)
+	cloneDir := aptSourceDir(d, "efs-utils", ve)
 	mkDir(t, cloneDir)
 	touchFile(t, filepath.Join(cloneDir, "efs-utils_2.0.deb"))
 
-	s := CheckAptStage(cfg, entry)
+	s := CheckAptStage(cfg, "efs-utils", ve)
 	if !s.Fetched || !s.Built {
 		t.Errorf("expected Fetched+Built=true when .deb present, got %+v", s)
 	}
@@ -273,11 +273,11 @@ func TestCheckAptStage_AptGetFetched(t *testing.T) {
 	root := t.TempDir()
 	cfg := &Config{BuildRoot: root}
 	// No URL → apt-get download entry.
-	entry := manifest.AptEntry{Name: "curl"}
+	ve := manifest.VersionEntry{}
 	d := buildDirs(root)
 
 	touchFile(t, filepath.Join(d.sources, "curl_7.0_amd64.deb"))
-	s := CheckAptStage(cfg, entry)
+	s := CheckAptStage(cfg, "curl", ve)
 	if !s.Fetched || !s.Built {
 		t.Errorf("expected Fetched+Built=true for apt-get entry with .deb present, got %+v", s)
 	}
@@ -290,8 +290,7 @@ func TestCheckAptStage_AptGetFetched(t *testing.T) {
 func TestPypiWheelsDir_NoVersion(t *testing.T) {
 	root := t.TempDir()
 	d := buildDirs(root)
-	pypi := manifest.PypiManifest{}
-	got := pypiWheelsDir(d, pypi)
+	got := pypiWheelsDir(d, "")
 	if got != d.wheels {
 		t.Errorf("pypiWheelsDir (no version) = %q, want %q", got, d.wheels)
 	}
@@ -300,8 +299,7 @@ func TestPypiWheelsDir_NoVersion(t *testing.T) {
 func TestPypiWheelsDir_WithVersion(t *testing.T) {
 	root := t.TempDir()
 	d := buildDirs(root)
-	pypi := manifest.PypiManifest{Version: "v4.5.5"}
-	got := pypiWheelsDir(d, pypi)
+	got := pypiWheelsDir(d, "v4.5.5")
 	want := filepath.Join(d.wheels, "v4.5.5")
 	if got != want {
 		t.Errorf("pypiWheelsDir (versioned) = %q, want %q", got, want)
@@ -309,8 +307,7 @@ func TestPypiWheelsDir_WithVersion(t *testing.T) {
 }
 
 func TestPypiS3Prefix_NoVersion(t *testing.T) {
-	pypi := manifest.PypiManifest{}
-	got := pypiS3Prefix(pypi)
+	got := pypiS3Prefix("")
 	want := "pypi/wheels/"
 	if got != want {
 		t.Errorf("pypiS3Prefix (no version) = %q, want %q", got, want)
@@ -318,8 +315,7 @@ func TestPypiS3Prefix_NoVersion(t *testing.T) {
 }
 
 func TestPypiS3Prefix_WithVersion(t *testing.T) {
-	pypi := manifest.PypiManifest{Version: "v4.5.5"}
-	got := pypiS3Prefix(pypi)
+	got := pypiS3Prefix("v4.5.5")
 	want := "pypi/wheels/v4.5.5/"
 	if got != want {
 		t.Errorf("pypiS3Prefix (versioned) = %q, want %q", got, want)
@@ -329,7 +325,7 @@ func TestPypiS3Prefix_WithVersion(t *testing.T) {
 func TestCheckPypiStage_Empty(t *testing.T) {
 	root := t.TempDir()
 	cfg := &Config{BuildRoot: root}
-	store := &manifest.Store{Pypi: manifest.PypiManifest{}}
+	store := manifest.NewLocalStore(root)
 	s := CheckPypiStage(cfg, store)
 	if s.Fetched || s.Built || s.Packaged {
 		t.Errorf("expected all false when nothing on disk, got %+v", s)
@@ -339,7 +335,7 @@ func TestCheckPypiStage_Empty(t *testing.T) {
 func TestCheckPypiStage_Fetched(t *testing.T) {
 	root := t.TempDir()
 	cfg := &Config{BuildRoot: root}
-	store := &manifest.Store{Pypi: manifest.PypiManifest{}}
+	store := manifest.NewLocalStore(root)
 
 	touchFile(t, filepath.Join(root, "combined-requirements.txt"))
 	s := CheckPypiStage(cfg, store)
@@ -354,11 +350,11 @@ func TestCheckPypiStage_Fetched(t *testing.T) {
 func TestCheckPypiStage_Built(t *testing.T) {
 	root := t.TempDir()
 	cfg := &Config{BuildRoot: root}
-	store := &manifest.Store{Pypi: manifest.PypiManifest{Version: "v4.5.5"}}
+	store := manifest.NewLocalStore(root)
 	d := buildDirs(root)
 
 	touchFile(t, filepath.Join(root, "combined-requirements.txt"))
-	wheelsDir := pypiWheelsDir(d, store.Pypi)
+	wheelsDir := pypiWheelsDir(d, "")
 	touchFile(t, filepath.Join(wheelsDir, "somepackage-1.0-py3-none-any.whl"))
 
 	s := CheckPypiStage(cfg, store)
@@ -373,11 +369,11 @@ func TestCheckPypiStage_Built(t *testing.T) {
 func TestCheckPypiStage_Packaged(t *testing.T) {
 	root := t.TempDir()
 	cfg := &Config{BuildRoot: root}
-	store := &manifest.Store{Pypi: manifest.PypiManifest{Version: "v4.5.5"}}
+	store := manifest.NewLocalStore(root)
 	d := buildDirs(root)
 
 	touchFile(t, filepath.Join(root, "combined-requirements.txt"))
-	wheelsDir := pypiWheelsDir(d, store.Pypi)
+	wheelsDir := pypiWheelsDir(d, "")
 	touchFile(t, filepath.Join(wheelsDir, "somepackage-1.0-py3-none-any.whl"))
 	touchFile(t, filepath.Join(wheelsDir, "MANIFEST.sha256"))
 
@@ -416,12 +412,30 @@ func TestBinaryArtifactPaths(t *testing.T) {
 	cfg := &Config{BuildRoot: root}
 	d := buildDirs(root)
 
-	entries := []manifest.BinaryEntry{
-		{Name: "tool-a", URL: "https://example.com/tool-a.zip"},
-		{Name: "tool-b", Version: "v2.0", URL: "https://example.com/tool-b.tar.gz"},
-		{Name: "tool-c", URL: "https://example.com/tool-c.bin"}, // not downloaded
+	// Set up the store with packages.
+	store := manifest.NewLocalStore(root)
+
+	// Seed the store with binary packages.
+	ctx := t.Context()
+	if err := store.AddVersion(ctx, manifest.TypeBinary, "tool-a", manifest.VersionEntry{
+		URL: "https://example.com/tool-a.zip",
+	}); err != nil {
+		t.Fatalf("AddVersion tool-a: %v", err)
 	}
-	store := &manifest.Store{Binary: entries}
+	if err := store.AddVersion(ctx, manifest.TypeBinary, "tool-b", manifest.VersionEntry{
+		Version: "v2.0",
+		URL:     "https://example.com/tool-b.tar.gz",
+	}); err != nil {
+		t.Fatalf("AddVersion tool-b: %v", err)
+	}
+	if err := store.AddVersion(ctx, manifest.TypeBinary, "tool-c", manifest.VersionEntry{
+		URL: "https://example.com/tool-c.bin",
+	}); err != nil {
+		t.Fatalf("AddVersion tool-c: %v", err)
+	}
+	if err := store.SaveIndex(ctx); err != nil {
+		t.Fatalf("SaveIndex: %v", err)
+	}
 
 	// Put tool-a and tool-b on disk.
 	touchFile(t, filepath.Join(d.binaries, "tool-a", "tool-a.zip"))

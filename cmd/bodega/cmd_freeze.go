@@ -1,11 +1,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/spf13/cobra"
-
-	"github.com/scaleapi/bodega/internal/manifest"
 )
 
 func newFreezeCmd(gf *globalFlags) *cobra.Command {
@@ -30,40 +29,31 @@ already-frozen entry unfreezes it.`,
 				return fmt.Errorf("load manifests: %w", err)
 			}
 
-			switch t {
-			case manifest.TypeApt:
-				e := store.FindApt(name)
-				if e == nil {
-					return fmt.Errorf("apt entry %q not found", name)
-				}
-				e.Frozen = !e.Frozen
-				printFreezeStatus(t, name, e.Frozen)
-				return store.SaveApt()
-
-			case manifest.TypeGit:
-				e := store.FindGit(name)
-				if e == nil {
-					return fmt.Errorf("git entry %q not found", name)
-				}
-				e.Frozen = !e.Frozen
-				printFreezeStatus(t, name, e.Frozen)
-				return store.SaveGit()
-
-			case manifest.TypeBinary:
-				e := store.FindBinary(name)
-				if e == nil {
-					return fmt.Errorf("binary entry %q not found", name)
-				}
-				e.Frozen = !e.Frozen
-				printFreezeStatus(t, name, e.Frozen)
-				return store.SaveBinary()
-
-			case manifest.TypePypi:
-				store.Pypi.Frozen = !store.Pypi.Frozen
-				printFreezeStatus(t, "pypi", store.Pypi.Frozen)
-				return store.SavePypi()
+			ctx := context.Background()
+			pm, err := store.GetPackage(ctx, t, name)
+			if err != nil {
+				return fmt.Errorf("get %s/%s: %w", t, name, err)
+			}
+			if pm == nil {
+				return fmt.Errorf("%s entry %q not found", t, name)
 			}
 
+			// Toggle: if all versions are frozen, unfreeze; otherwise freeze all.
+			allFrozen := len(pm.Versions) > 0
+			for _, ve := range pm.Versions {
+				if !ve.Frozen {
+					allFrozen = false
+					break
+				}
+			}
+			newState := !allFrozen
+			for i := range pm.Versions {
+				pm.Versions[i].Frozen = newState
+			}
+			if err := store.SavePackage(ctx, pm); err != nil {
+				return err
+			}
+			printFreezeStatus(t, name, newState)
 			return nil
 		},
 	}

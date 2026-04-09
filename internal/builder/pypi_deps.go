@@ -2,6 +2,7 @@ package builder
 
 import (
 	"archive/zip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -24,7 +25,7 @@ type PypiDepGraph struct {
 }
 
 // PypiPackageInfo holds per-package metadata extracted from wheel metadata and
-// the pypi.json manifest.
+// the pypi manifests.
 type PypiPackageInfo struct {
 	// Name is the canonical (non-normalised) distribution name from METADATA.
 	Name string `json:"name"`
@@ -36,20 +37,22 @@ type PypiPackageInfo struct {
 	// UsedBy lists the names of packages whose Requires-Dist references this
 	// package. Populated during graph construction.
 	UsedBy []string `json:"used_by,omitempty"`
-	// Explicit is true when the package appears in store.Pypi.Packages.
+	// Explicit is true when the package appears in the store's pypi manifest list.
 	Explicit bool `json:"explicit,omitempty"`
-	// BaseApp is true when the package is a key in store.Pypi.BaseRequirements.
+	// BaseApp is true when the package is referenced as a base app via RequiredBy.
 	BaseApp bool `json:"base_app,omitempty"`
 }
 
 // ScanWheelMetadata opens every .whl file in wheelDir, reads its METADATA
 // file, and constructs a PypiDepGraph. Packages are cross-referenced with
-// store.Pypi to tag explicit and base-app entries.
+// the store's pypi manifest to tag explicit and base-app entries.
 //
 // .whl files are standard ZIP archives whose dist-info directory contains a
 // METADATA file in RFC 2822 format. Only the Name, Version, and Requires-Dist
 // headers are extracted.
 func ScanWheelMetadata(wheelDir string, store *manifest.Store) (*PypiDepGraph, error) {
+	ctx := context.Background()
+
 	matches, err := filepath.Glob(filepath.Join(wheelDir, "*.whl"))
 	if err != nil {
 		return nil, fmt.Errorf("glob wheels in %s: %w", wheelDir, err)
@@ -70,21 +73,30 @@ func ScanWheelMetadata(wheelDir string, store *manifest.Store) (*PypiDepGraph, e
 		graph.Packages[key] = info
 	}
 
-	// Tag explicit and base-app packages from the manifest.
-	for _, pkg := range store.Pypi.Packages {
-		// pkg.Name may include version specifiers (e.g. "requests>=2.0"); strip them.
-		name := pkgBaseName(pkg.Name)
+	// Tag explicit packages (those with their own pypi manifest entry) and
+	// base-app packages (those referenced via RequiredBy on a pypi version).
+	baseApps := make(map[string]bool)
+	for _, name := range store.ListPackages(manifest.TypePypi) {
 		key := normalisePkgName(name)
 		if p, ok := graph.Packages[key]; ok {
 			p.Explicit = true
 			graph.Packages[key] = p
 		}
+
+		pm, err := store.GetPackage(ctx, manifest.TypePypi, name)
+		if err != nil || pm == nil {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			for _, requiredBy := range ve.RequiredBy {
+				baseApps[normalisePkgName(requiredBy)] = true
+			}
+		}
 	}
-	for repoName := range store.Pypi.BaseRequirements {
-		key := normalisePkgName(repoName)
-		if p, ok := graph.Packages[key]; ok {
+	for baseKey := range baseApps {
+		if p, ok := graph.Packages[baseKey]; ok {
 			p.BaseApp = true
-			graph.Packages[key] = p
+			graph.Packages[baseKey] = p
 		}
 	}
 

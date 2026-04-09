@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -25,7 +26,7 @@ func computeFileSHA256(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// computeBytesSHA256 returns the lowercase hex SHA-256 digest of a byte slice.
+// ComputeBytesSHA256 returns the lowercase hex SHA-256 digest of a byte slice.
 func ComputeBytesSHA256(data []byte) string {
 	h := sha256.Sum256(data)
 	return hex.EncodeToString(h[:])
@@ -54,57 +55,64 @@ func newSHA256Checksum(hexDigest string) *manifest.Checksum {
 	}
 }
 
-// findAndUpdateGitChecksum updates the Checksum and ChecksumVerified fields on a GitEntry and saves.
-func (c *Config) findAndUpdateGitChecksum(store *manifest.Store, name string, cs *manifest.Checksum, verified bool) error {
-	e := store.FindGit(name)
-	if e == nil {
-		return fmt.Errorf("git entry %q not found", name)
+// updateVersionChecksum finds the VersionEntry in pm that matches targetVE
+// (by Version or Ref), updates its Checksum and ChecksumVerified fields,
+// and saves the manifest.
+func updateVersionChecksum(ctx context.Context, store *manifest.Store, typ, name string, targetVE manifest.VersionEntry, cs *manifest.Checksum, verified bool) error {
+	pm, err := store.GetPackage(ctx, typ, name)
+	if err != nil {
+		return fmt.Errorf("get package %s/%s: %w", typ, name, err)
 	}
-	e.Checksum = cs
-	e.ChecksumVerified = verified
-	return store.SaveGit()
+	if pm == nil {
+		return fmt.Errorf("%s entry %q not found", typ, name)
+	}
+
+	targetKey := targetVE.Version
+	if targetKey == "" {
+		targetKey = targetVE.Ref
+	}
+
+	found := false
+	for i := range pm.Versions {
+		ve := &pm.Versions[i]
+		veKey := ve.Version
+		if veKey == "" {
+			veKey = ve.Ref
+		}
+		if veKey == targetKey {
+			ve.Checksum = cs
+			ve.ChecksumVerified = verified
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("version %q not found in %s/%s", targetKey, typ, name)
+	}
+	return store.SavePackage(ctx, pm)
 }
 
-// findAndUpdateGomodChecksum updates the Checksum and ChecksumVerified fields on a GomodEntry and saves.
-func (c *Config) findAndUpdateGomodChecksum(store *manifest.Store, name string, cs *manifest.Checksum, verified bool) error {
-	e := store.FindGomod(name)
-	if e == nil {
-		return fmt.Errorf("gomod entry %q not found", name)
-	}
-	e.Checksum = cs
-	e.ChecksumVerified = verified
-	return store.SaveGomod()
+// findAndUpdateGitChecksum updates Checksum and ChecksumVerified on a git VersionEntry and saves.
+func (c *Config) findAndUpdateGitChecksum(store *manifest.Store, name string, ve manifest.VersionEntry, cs *manifest.Checksum, verified bool) error {
+	return updateVersionChecksum(context.Background(), store, manifest.TypeGit, name, ve, cs, verified)
 }
 
-// findAndUpdateHelmChecksum updates the Checksum and ChecksumVerified fields on a HelmEntry and saves.
-func (c *Config) findAndUpdateHelmChecksum(store *manifest.Store, name string, cs *manifest.Checksum, verified bool) error {
-	e := store.FindHelm(name)
-	if e == nil {
-		return fmt.Errorf("helm entry %q not found", name)
-	}
-	e.Checksum = cs
-	e.ChecksumVerified = verified
-	return store.SaveHelm()
+// findAndUpdateGomodChecksum updates Checksum and ChecksumVerified on a gomod VersionEntry and saves.
+func (c *Config) findAndUpdateGomodChecksum(store *manifest.Store, name string, ve manifest.VersionEntry, cs *manifest.Checksum, verified bool) error {
+	return updateVersionChecksum(context.Background(), store, manifest.TypeGomod, name, ve, cs, verified)
 }
 
-// findAndUpdateNpmChecksum updates the Checksum and ChecksumVerified fields on an NpmEntry and saves.
-func (c *Config) findAndUpdateNpmChecksum(store *manifest.Store, name string, cs *manifest.Checksum, verified bool) error {
-	e := store.FindNpm(name)
-	if e == nil {
-		return fmt.Errorf("npm entry %q not found", name)
-	}
-	e.Checksum = cs
-	e.ChecksumVerified = verified
-	return store.SaveNpm()
+// findAndUpdateHelmChecksum updates Checksum and ChecksumVerified on a helm VersionEntry and saves.
+func (c *Config) findAndUpdateHelmChecksum(store *manifest.Store, name string, ve manifest.VersionEntry, cs *manifest.Checksum, verified bool) error {
+	return updateVersionChecksum(context.Background(), store, manifest.TypeHelm, name, ve, cs, verified)
 }
 
-// findAndUpdateBinaryChecksum updates the Checksum and ChecksumVerified fields on a BinaryEntry and saves.
-func (c *Config) findAndUpdateBinaryChecksum(store *manifest.Store, name string, cs *manifest.Checksum, verified bool) error {
-	e := store.FindBinary(name)
-	if e == nil {
-		return fmt.Errorf("binary entry %q not found", name)
-	}
-	e.Checksum = cs
-	e.ChecksumVerified = verified
-	return store.SaveBinary()
+// findAndUpdateNpmChecksum updates Checksum and ChecksumVerified on an npm VersionEntry and saves.
+func (c *Config) findAndUpdateNpmChecksum(store *manifest.Store, name string, ve manifest.VersionEntry, cs *manifest.Checksum, verified bool) error {
+	return updateVersionChecksum(context.Background(), store, manifest.TypeNpm, name, ve, cs, verified)
+}
+
+// findAndUpdateBinaryChecksum updates Checksum and ChecksumVerified on a binary VersionEntry and saves.
+func (c *Config) findAndUpdateBinaryChecksum(store *manifest.Store, name string, ve manifest.VersionEntry, cs *manifest.Checksum, verified bool) error {
+	return updateVersionChecksum(context.Background(), store, manifest.TypeBinary, name, ve, cs, verified)
 }

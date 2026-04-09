@@ -101,21 +101,12 @@ func TestResolveTypesInvalid(t *testing.T) {
 // --- BuildTree ---
 
 func TestBuildTree(t *testing.T) {
-	store := &manifest.Store{
-		Apt: []manifest.AptEntry{
-			{Name: "pkg-a", Version: "1.0"},
-		},
-		Git: []manifest.GitEntry{
-			{Name: "repo-b", URL: "https://example.com/b.git", Ref: "v2.0"},
-		},
-		Pypi: manifest.PypiManifest{
-			Version:  "v1",
-			Packages: []manifest.PypiPackage{{Name: "requests"}},
-		},
-		Binary: []manifest.BinaryEntry{
-			{Name: "tool-c", URL: "https://example.com/tool-c"},
-		},
-	}
+	store := manifest.NewLocalStore(t.TempDir())
+	ctx := t.Context()
+	_ = store.AddVersion(ctx, manifest.TypeApt, "pkg-a", manifest.VersionEntry{Version: "1.0"})
+	_ = store.AddVersion(ctx, manifest.TypeGit, "repo-b", manifest.VersionEntry{Ref: "v2.0", URL: "https://example.com/b.git"})
+	_ = store.AddVersion(ctx, manifest.TypePypi, "requests", manifest.VersionEntry{Version: "2.28.0"})
+	_ = store.AddVersion(ctx, manifest.TypeBinary, "tool-c", manifest.VersionEntry{URL: "https://example.com/tool-c"})
 
 	statuses := []s3.EntryStatus{
 		{Type: manifest.TypeApt, Name: "pkg-a@1.0", InS3: true},
@@ -179,12 +170,10 @@ func TestBuildTree(t *testing.T) {
 // --- sourcesModel navigation ---
 
 func TestSourcesModelNavigation(t *testing.T) {
-	store := &manifest.Store{
-		Apt: []manifest.AptEntry{
-			{Name: "pkg-a"},
-			{Name: "pkg-b"},
-		},
-	}
+	store := manifest.NewLocalStore(t.TempDir())
+	ctx := t.Context()
+	_ = store.AddVersion(ctx, manifest.TypeApt, "pkg-a", manifest.VersionEntry{Version: "1.0"})
+	_ = store.AddVersion(ctx, manifest.TypeApt, "pkg-b", manifest.VersionEntry{Version: "1.0"})
 	roots := BuildTree(store, nil)
 	m := newSourcesModel(roots)
 
@@ -214,9 +203,9 @@ func TestSourcesModelNavigation(t *testing.T) {
 // --- ToggleExpand ---
 
 func TestToggleExpand(t *testing.T) {
-	store := &manifest.Store{
-		Apt: []manifest.AptEntry{{Name: "pkg-a"}},
-	}
+	store := manifest.NewLocalStore(t.TempDir())
+	ctx := t.Context()
+	_ = store.AddVersion(ctx, manifest.TypeApt, "pkg-a", manifest.VersionEntry{Version: "1.0"})
 	roots := BuildTree(store, nil)
 	m := newSourcesModel(roots)
 
@@ -275,7 +264,7 @@ func TestPopupConfirm(t *testing.T) {
 // --- details rendering smoke test ---
 
 func TestDetailsViewNoNode(t *testing.T) {
-	store := &manifest.Store{}
+	store := manifest.NewLocalStore(t.TempDir())
 	d := newDetailsModel(store, &config.Config{})
 	v := d.View()
 	if v == "" {
@@ -284,11 +273,9 @@ func TestDetailsViewNoNode(t *testing.T) {
 }
 
 func TestDetailsViewAptEntry(t *testing.T) {
-	store := &manifest.Store{
-		Apt: []manifest.AptEntry{
-			{Name: "pkg-a", Version: "1.0", URL: "https://example.com/pkg-a"},
-		},
-	}
+	store := manifest.NewLocalStore(t.TempDir())
+	ctx := t.Context()
+	_ = store.AddVersion(ctx, manifest.TypeApt, "pkg-a", manifest.VersionEntry{Version: "1.0", URL: "https://example.com/pkg-a"})
 	d := newDetailsModel(store, &config.Config{})
 	d.width = 80
 	d.SetNode(&TreeNode{

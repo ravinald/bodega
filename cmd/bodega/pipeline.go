@@ -8,6 +8,8 @@ package main
 // value of --entry). An empty filter means "all entries in the store."
 
 import (
+	"context"
+
 	"github.com/scaleapi/bodega/internal/builder"
 	"github.com/scaleapi/bodega/internal/manifest"
 )
@@ -15,16 +17,24 @@ import (
 // ensureFetchedBinaries fetches any binary entries that have not yet been
 // downloaded. Returns the combined summary of any fetch runs performed.
 func ensureFetchedBinaries(bcfg *builder.Config, store *manifest.Store, entryFilter string) *builder.Summary {
+	ctx := context.Background()
 	var ss []*builder.Summary
-	for _, entry := range store.Binary {
-		if entryFilter != "" && entry.Name != entryFilter {
+	for _, safeName := range store.ListPackages(manifest.TypeBinary) {
+		pm, err := store.GetPackage(ctx, manifest.TypeBinary, safeName)
+		if err != nil || pm == nil {
 			continue
 		}
-		if entry.Frozen {
+		if entryFilter != "" && pm.Name != entryFilter {
 			continue
 		}
-		if !builder.CheckBinaryStage(bcfg, entry).Fetched {
-			ss = append(ss, builder.FetchBinaries(bcfg, store, entry.Name))
+		for _, ve := range pm.Versions {
+			if ve.Frozen {
+				continue
+			}
+			if !builder.CheckBinaryStage(bcfg, pm.Name, ve).Fetched {
+				ss = append(ss, builder.FetchBinaries(bcfg, store, pm.Name))
+				break
+			}
 		}
 	}
 	return builder.MergeSummaries(ss...)
@@ -32,16 +42,24 @@ func ensureFetchedBinaries(bcfg *builder.Config, store *manifest.Store, entryFil
 
 // ensureFetchedGit fetches any git entries whose bare repository is absent.
 func ensureFetchedGit(bcfg *builder.Config, store *manifest.Store, entryFilter string) *builder.Summary {
+	ctx := context.Background()
 	var ss []*builder.Summary
-	for _, entry := range store.Git {
-		if entryFilter != "" && entry.Name != entryFilter {
+	for _, safeName := range store.ListPackages(manifest.TypeGit) {
+		pm, err := store.GetPackage(ctx, manifest.TypeGit, safeName)
+		if err != nil || pm == nil {
 			continue
 		}
-		if entry.Frozen {
+		if entryFilter != "" && pm.Name != entryFilter {
 			continue
 		}
-		if !builder.CheckGitStage(bcfg, entry).Fetched {
-			ss = append(ss, builder.FetchGit(bcfg, store, entry.Name))
+		for _, ve := range pm.Versions {
+			if ve.Frozen {
+				continue
+			}
+			if !builder.CheckGitStage(bcfg, pm.Name, ve).Fetched {
+				ss = append(ss, builder.FetchGit(bcfg, store, pm.Name))
+				break
+			}
 		}
 	}
 	return builder.MergeSummaries(ss...)
@@ -50,16 +68,24 @@ func ensureFetchedGit(bcfg *builder.Config, store *manifest.Store, entryFilter s
 // ensureFetchedApt fetches any apt entries whose source directory (or .deb) is
 // absent.
 func ensureFetchedApt(bcfg *builder.Config, store *manifest.Store, entryFilter string) *builder.Summary {
+	ctx := context.Background()
 	var ss []*builder.Summary
-	for _, entry := range store.Apt {
-		if entryFilter != "" && entry.Name != entryFilter {
+	for _, safeName := range store.ListPackages(manifest.TypeApt) {
+		pm, err := store.GetPackage(ctx, manifest.TypeApt, safeName)
+		if err != nil || pm == nil {
 			continue
 		}
-		if entry.Frozen {
+		if entryFilter != "" && pm.Name != entryFilter {
 			continue
 		}
-		if !builder.CheckAptStage(bcfg, entry).Fetched {
-			ss = append(ss, builder.FetchApt(bcfg, store, entry.Name))
+		for _, ve := range pm.Versions {
+			if ve.Frozen {
+				continue
+			}
+			if !builder.CheckAptStage(bcfg, pm.Name, ve).Fetched {
+				ss = append(ss, builder.FetchApt(bcfg, store, pm.Name))
+				break
+			}
 		}
 	}
 	return builder.MergeSummaries(ss...)
@@ -76,20 +102,27 @@ func ensureFetchedPypi(bcfg *builder.Config, store *manifest.Store) *builder.Sum
 // ensureBuiltApt cascades: fetch first if needed, then build.
 // Returns the combined summary of any stages run.
 func ensureBuiltApt(bcfg *builder.Config, store *manifest.Store, entryFilter string) *builder.Summary {
+	ctx := context.Background()
 	var ss []*builder.Summary
-	for _, entry := range store.Apt {
-		if entryFilter != "" && entry.Name != entryFilter {
+	for _, safeName := range store.ListPackages(manifest.TypeApt) {
+		pm, err := store.GetPackage(ctx, manifest.TypeApt, safeName)
+		if err != nil || pm == nil {
 			continue
 		}
-		if entry.Frozen {
+		if entryFilter != "" && pm.Name != entryFilter {
 			continue
 		}
-		status := builder.CheckAptStage(bcfg, entry)
-		if !status.Fetched {
-			ss = append(ss, builder.FetchApt(bcfg, store, entry.Name))
-		}
-		if !status.Built {
-			ss = append(ss, builder.BuildApt(bcfg, store, entry.Name))
+		for _, ve := range pm.Versions {
+			if ve.Frozen {
+				continue
+			}
+			status := builder.CheckAptStage(bcfg, pm.Name, ve)
+			if !status.Fetched {
+				ss = append(ss, builder.FetchApt(bcfg, store, pm.Name))
+			}
+			if !status.Built {
+				ss = append(ss, builder.BuildApt(bcfg, store, pm.Name))
+			}
 		}
 	}
 	return builder.MergeSummaries(ss...)
@@ -114,20 +147,27 @@ func ensureBuiltPypi(bcfg *builder.Config, store *manifest.Store) *builder.Summa
 
 // ensurePackagedGit cascades fetch if needed, then packages.
 func ensurePackagedGit(bcfg *builder.Config, store *manifest.Store, entryFilter string) *builder.Summary {
+	ctx := context.Background()
 	var ss []*builder.Summary
-	for _, entry := range store.Git {
-		if entryFilter != "" && entry.Name != entryFilter {
+	for _, safeName := range store.ListPackages(manifest.TypeGit) {
+		pm, err := store.GetPackage(ctx, manifest.TypeGit, safeName)
+		if err != nil || pm == nil {
 			continue
 		}
-		if entry.Frozen {
+		if entryFilter != "" && pm.Name != entryFilter {
 			continue
 		}
-		status := builder.CheckGitStage(bcfg, entry)
-		if !status.Fetched {
-			ss = append(ss, builder.FetchGit(bcfg, store, entry.Name))
-		}
-		if !status.Packaged {
-			ss = append(ss, builder.PackageGit(bcfg, store, entry.Name))
+		for _, ve := range pm.Versions {
+			if ve.Frozen {
+				continue
+			}
+			status := builder.CheckGitStage(bcfg, pm.Name, ve)
+			if !status.Fetched {
+				ss = append(ss, builder.FetchGit(bcfg, store, pm.Name))
+			}
+			if !status.Packaged {
+				ss = append(ss, builder.PackageGit(bcfg, store, pm.Name))
+			}
 		}
 	}
 	return builder.MergeSummaries(ss...)
@@ -135,31 +175,38 @@ func ensurePackagedGit(bcfg *builder.Config, store *manifest.Store, entryFilter 
 
 // ensurePackagedApt cascades fetch → build → package as needed.
 func ensurePackagedApt(bcfg *builder.Config, store *manifest.Store, entryFilter string) *builder.Summary {
+	ctx := context.Background()
 	var ss []*builder.Summary
-	for _, entry := range store.Apt {
-		if entryFilter != "" && entry.Name != entryFilter {
+	for _, safeName := range store.ListPackages(manifest.TypeApt) {
+		pm, err := store.GetPackage(ctx, manifest.TypeApt, safeName)
+		if err != nil || pm == nil {
 			continue
 		}
-		if entry.Frozen {
+		if entryFilter != "" && pm.Name != entryFilter {
 			continue
 		}
-		status := builder.CheckAptStage(bcfg, entry)
-		if !status.Fetched {
-			s := builder.FetchApt(bcfg, store, entry.Name)
-			ss = append(ss, s)
-			if s.HasFailures() {
+		for _, ve := range pm.Versions {
+			if ve.Frozen {
 				continue
 			}
-		}
-		if !status.Built {
-			s := builder.BuildApt(bcfg, store, entry.Name)
-			ss = append(ss, s)
-			if s.HasFailures() {
-				continue
+			status := builder.CheckAptStage(bcfg, pm.Name, ve)
+			if !status.Fetched {
+				s := builder.FetchApt(bcfg, store, pm.Name)
+				ss = append(ss, s)
+				if s.HasFailures() {
+					continue
+				}
 			}
-		}
-		if !status.Packaged {
-			ss = append(ss, builder.PackageApt(bcfg, store, entry.Name))
+			if !status.Built {
+				s := builder.BuildApt(bcfg, store, pm.Name)
+				ss = append(ss, s)
+				if s.HasFailures() {
+					continue
+				}
+			}
+			if !status.Packaged {
+				ss = append(ss, builder.PackageApt(bcfg, store, pm.Name))
+			}
 		}
 	}
 	return builder.MergeSummaries(ss...)

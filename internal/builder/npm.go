@@ -3,6 +3,7 @@ package builder
 import (
 	"archive/tar"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,150 +18,171 @@ import (
 const defaultNpmRegistry = "https://registry.npmjs.org"
 
 // npmTarballFilename returns the conventional npm tarball name.
-func npmTarballFilename(entry manifest.NpmEntry) string {
-	name := entry.Name
+func npmTarballFilename(name string, ve manifest.VersionEntry) string {
 	// Scoped packages: @scope/pkg → pkg-version.tgz
-	if idx := strings.LastIndex(name, "/"); idx >= 0 {
-		name = name[idx+1:]
+	n := name
+	if idx := strings.LastIndex(n, "/"); idx >= 0 {
+		n = n[idx+1:]
 	}
-	return name + "-" + entry.Version + ".tgz"
+	return n + "-" + ve.Version + ".tgz"
 }
 
-// npmLocalDir returns the local directory for an npm package.
-func npmLocalDir(d dirs, entry manifest.NpmEntry) string {
-	return filepath.Join(d.npm, entry.Name, entry.Version)
+// npmLocalDir returns the local directory for an npm package version.
+func npmLocalDir(d dirs, name string, ve manifest.VersionEntry) string {
+	return filepath.Join(d.npm, name, ve.Version)
 }
 
 // npmTarballPath returns the local path for an npm tarball.
-func npmTarballPath(d dirs, entry manifest.NpmEntry) string {
-	return filepath.Join(npmLocalDir(d, entry), npmTarballFilename(entry))
+func npmTarballPath(d dirs, name string, ve manifest.VersionEntry) string {
+	return filepath.Join(npmLocalDir(d, name, ve), npmTarballFilename(name, ve))
 }
 
 // npmS3Prefix returns the S3 key prefix for an npm package.
-func npmS3Prefix(entry manifest.NpmEntry) string {
-	return "npm/" + entry.Name + "/"
+func npmS3Prefix(name string) string {
+	return "npm/" + name + "/"
 }
 
 // CheckNpmStage inspects the local filesystem for a fetched npm tarball.
-func CheckNpmStage(cfg *Config, entry manifest.NpmEntry) StageStatus {
+func CheckNpmStage(cfg *Config, name string, ve manifest.VersionEntry) StageStatus {
 	d := buildDirs(cfg.rootFor(manifest.TypeNpm))
-	path := npmTarballPath(d, entry)
+	path := npmTarballPath(d, name, ve)
 	if fileExists(path) {
 		return StageStatus{Fetched: true, Built: true, Packaged: true}
 	}
 	return StageStatus{}
 }
 
-// FetchNpm downloads npm tarballs for each NpmEntry.
+// FetchNpm downloads npm tarballs for each npm package version.
 func FetchNpm(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
+	ctx := context.Background()
 	summary := &Summary{}
 	d := buildDirs(cfg.rootFor(manifest.TypeNpm))
 
-	for _, entry := range store.Npm {
-		if entryFilter != "" && entry.Name != entryFilter {
+	for _, name := range store.ListPackages(manifest.TypeNpm) {
+		if entryFilter != "" && name != entryFilter {
 			continue
 		}
-		if entry.Frozen {
-			cfg.logf("  [npm] %s: SKIPPED (frozen)", entry.Name)
+
+		pm, err := store.GetPackage(ctx, manifest.TypeNpm, name)
+		if err != nil || pm == nil {
+			cfg.logf("  [npm] %s: ERROR loading package: %v", name, err)
 			continue
 		}
-		if !cfg.Force {
-			stage := CheckNpmStage(cfg, entry)
-			if stage.Fetched {
-				cfg.logf("  [npm] %s: already fetched, skipping", entry.Name)
+
+		for _, ve := range pm.Versions {
+			if ve.Frozen {
+				cfg.logf("  [npm] %s: SKIPPED (frozen)", name)
 				continue
 			}
-		}
+			if !cfg.Force {
+				stage := CheckNpmStage(cfg, name, ve)
+				if stage.Fetched {
+					cfg.logf("  [npm] %s: already fetched, skipping", name)
+					continue
+				}
+			}
 
-		result := Result{Type: manifest.TypeNpm, Name: entry.Name}
-		start := time.Now()
-		out := cfg.entryWriter(manifest.TypeNpm, entry.Name)
+			result := Result{Type: manifest.TypeNpm, Name: name}
+			start := time.Now()
+			out := cfg.entryWriter(manifest.TypeNpm, name)
 
-		dir := npmLocalDir(d, entry)
-		if err := mkdirAll(dir); err != nil {
-			result.Err = err
+			dir := npmLocalDir(d, name, ve)
+			if err := mkdirAll(dir); err != nil {
+				result.Err = err
+				result.Elapsed = time.Since(start)
+				summary.Results = append(summary.Results, result)
+				summary.Total++
+				summary.Failures++
+				continue
+			}
+
+			registry := ve.URL
+			if registry == "" {
+				registry = defaultNpmRegistry
+			}
+
+			// npm tarball URL format: {registry}/{name}/-/{tarball}
+			tarballName := npmTarballFilename(name, ve)
+			url := registry + "/" + name + "/-/" + tarballName
+			dest := npmTarballPath(d, name, ve)
+
+			_, _ = fmt.Fprintf(out, "  [npm] %s@%s: fetching %s\n", name, ve.Version, url)
+
+			if err := downloadURL(dest, url); err != nil {
+				_, _ = fmt.Fprintf(out, "  [npm] %s: ERROR: %v\n", name, err)
+				result.Err = err
+			} else {
+				result.Artifacts = append(result.Artifacts, dest)
+
+				// Checksum verification.
+				computed, err := computeFileSHA256(dest)
+				if err != nil {
+					_, _ = fmt.Fprintf(out, "  [npm] %s: WARNING: could not compute checksum: %v\n", name, err)
+				} else if ve.Checksum != nil {
+					if err := verifyChecksum(ve.Checksum, computed); err != nil {
+						_, _ = fmt.Fprintf(out, "  [npm] %s: CHECKSUM MISMATCH: %v\n", name, err)
+						result.Err = fmt.Errorf("checksum verification failed: %w", err)
+					} else {
+						_, _ = fmt.Fprintf(out, "  [npm] %s@%s: checksum verified\n", name, ve.Version)
+						if !ve.ChecksumVerified {
+							if e := cfg.findAndUpdateNpmChecksum(store, name, ve, ve.Checksum, true); e != nil {
+								_, _ = fmt.Fprintf(out, "  [npm] %s: WARNING: could not save verified status: %v\n", name, e)
+							}
+						}
+					}
+				} else if computed != "" {
+					cs := newSHA256Checksum(computed)
+					_, _ = fmt.Fprintf(out, "  [npm] %s@%s: checksum recorded (sha256:%s...)\n", name, ve.Version, computed[:12])
+					if e := cfg.findAndUpdateNpmChecksum(store, name, ve, cs, false); e != nil {
+						_, _ = fmt.Fprintf(out, "  [npm] %s: WARNING: could not save checksum: %v\n", name, e)
+					}
+				}
+
+				if result.Err == nil {
+					_, _ = fmt.Fprintf(out, "  [npm] %s@%s: ok\n", name, ve.Version)
+					cfg.StampNpmEntry(store, name, ve)
+				}
+			}
+
 			result.Elapsed = time.Since(start)
 			summary.Results = append(summary.Results, result)
 			summary.Total++
-			summary.Failures++
-			continue
-		}
-
-		registry := entry.URL
-		if registry == "" {
-			registry = defaultNpmRegistry
-		}
-
-		// npm tarball URL format: {registry}/{name}/-/{tarball}
-		tarballName := npmTarballFilename(entry)
-		url := registry + "/" + entry.Name + "/-/" + tarballName
-		dest := npmTarballPath(d, entry)
-
-		_, _ = fmt.Fprintf(out, "  [npm] %s@%s: fetching %s\n", entry.Name, entry.Version, url)
-
-		if err := downloadURL(dest, url); err != nil {
-			_, _ = fmt.Fprintf(out, "  [npm] %s: ERROR: %v\n", entry.Name, err)
-			result.Err = err
-		} else {
-			result.Artifacts = append(result.Artifacts, dest)
-
-			// Checksum verification.
-			computed, err := computeFileSHA256(dest)
-			if err != nil {
-				_, _ = fmt.Fprintf(out, "  [npm] %s: WARNING: could not compute checksum: %v\n", entry.Name, err)
-			} else if entry.Checksum != nil {
-				if err := verifyChecksum(entry.Checksum, computed); err != nil {
-					_, _ = fmt.Fprintf(out, "  [npm] %s: CHECKSUM MISMATCH: %v\n", entry.Name, err)
-					result.Err = fmt.Errorf("checksum verification failed: %w", err)
-				} else {
-					_, _ = fmt.Fprintf(out, "  [npm] %s@%s: checksum verified\n", entry.Name, entry.Version)
-					if !entry.ChecksumVerified {
-						if e := cfg.findAndUpdateNpmChecksum(store, entry.Name, entry.Checksum, true); e != nil {
-							_, _ = fmt.Fprintf(out, "  [npm] %s: WARNING: could not save verified status: %v\n", entry.Name, e)
-						}
-					}
-				}
-			} else if computed != "" {
-				cs := newSHA256Checksum(computed)
-				_, _ = fmt.Fprintf(out, "  [npm] %s@%s: checksum recorded (sha256:%s...)\n", entry.Name, entry.Version, computed[:12])
-				if e := cfg.findAndUpdateNpmChecksum(store, entry.Name, cs, false); e != nil {
-					_, _ = fmt.Fprintf(out, "  [npm] %s: WARNING: could not save checksum: %v\n", entry.Name, e)
-				}
+			if result.Err != nil {
+				summary.Failures++
 			}
-
-			if result.Err == nil {
-				_, _ = fmt.Fprintf(out, "  [npm] %s@%s: ok\n", entry.Name, entry.Version)
-				cfg.StampNpmEntry(store, entry.Name)
-			}
-		}
-
-		result.Elapsed = time.Since(start)
-		summary.Results = append(summary.Results, result)
-		summary.Total++
-		if result.Err != nil {
-			summary.Failures++
 		}
 	}
 
 	return summary
 }
 
+// npmVersionEntry pairs a package name with its VersionEntry for packument building.
+type npmVersionEntry struct {
+	name string
+	ve   manifest.VersionEntry
+}
+
 // PackageNpm generates packument JSON files for each npm package by reading
 // package.json from the tarballs. The packument is pre-computed and cached
 // in S3 so the server can serve it without per-request tarball extraction.
 func PackageNpm(cfg *Config, store *manifest.Store) *Summary {
+	ctx := context.Background()
 	summary := &Summary{}
 	d := buildDirs(cfg.rootFor(manifest.TypeNpm))
 	out := cfg.stdout()
 
-	// Group entries by package name.
-	byName := make(map[string][]manifest.NpmEntry)
-	for _, entry := range store.Npm {
-		byName[entry.Name] = append(byName[entry.Name], entry)
-	}
+	for _, name := range store.ListPackages(manifest.TypeNpm) {
+		pm, err := store.GetPackage(ctx, manifest.TypeNpm, name)
+		if err != nil || pm == nil {
+			continue
+		}
 
-	for name, entries := range byName {
 		_, _ = fmt.Fprintf(out, "  [npm] %s: generating packument\n", name)
+
+		var entries []npmVersionEntry
+		for _, ve := range pm.Versions {
+			entries = append(entries, npmVersionEntry{name: name, ve: ve})
+		}
 
 		packument := buildPackument(name, entries, d)
 
@@ -196,33 +218,41 @@ func PackageNpm(cfg *Config, store *manifest.Store) *Summary {
 
 // NpmArtifactPaths returns local/S3 path pairs for upload.
 func NpmArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) []ArtifactPath {
+	ctx := context.Background()
 	d := buildDirs(cfg.rootFor(manifest.TypeNpm))
 	var paths []ArtifactPath
 
 	seen := make(map[string]bool)
-	for _, entry := range store.Npm {
-		if entryFilter != "" && entry.Name != entryFilter {
+	for _, name := range store.ListPackages(manifest.TypeNpm) {
+		if entryFilter != "" && name != entryFilter {
 			continue
 		}
 
-		// Tarball.
-		local := npmTarballPath(d, entry)
-		if fileExists(local) {
-			paths = append(paths, ArtifactPath{
-				Local: local,
-				S3Key: npmS3Prefix(entry) + npmTarballFilename(entry),
-			})
+		pm, err := store.GetPackage(ctx, manifest.TypeNpm, name)
+		if err != nil || pm == nil {
+			continue
 		}
 
-		// Packument (once per package name).
-		if !seen[entry.Name] {
-			seen[entry.Name] = true
-			packumentPath := filepath.Join(npmLocalDir(d, entry), "packument.json")
-			if fileExists(packumentPath) {
+		for _, ve := range pm.Versions {
+			// Tarball.
+			local := npmTarballPath(d, name, ve)
+			if fileExists(local) {
 				paths = append(paths, ArtifactPath{
-					Local: packumentPath,
-					S3Key: npmS3Prefix(entry) + "packument.json",
+					Local: local,
+					S3Key: npmS3Prefix(name) + npmTarballFilename(name, ve),
 				})
+			}
+
+			// Packument (once per package name).
+			if !seen[name] {
+				seen[name] = true
+				packumentPath := filepath.Join(npmLocalDir(d, name, ve), "packument.json")
+				if fileExists(packumentPath) {
+					paths = append(paths, ArtifactPath{
+						Local: packumentPath,
+						S3Key: npmS3Prefix(name) + "packument.json",
+					})
+				}
 			}
 		}
 	}
@@ -249,8 +279,8 @@ type packumentDist struct {
 	Tarball string `json:"tarball"`
 }
 
-// buildPackument creates a packument from manifest entries and local tarballs.
-func buildPackument(name string, entries []manifest.NpmEntry, d dirs) packument {
+// buildPackument creates a packument from version entries and local tarballs.
+func buildPackument(name string, entries []npmVersionEntry, d dirs) packument {
 	p := packument{
 		Name:     name,
 		DistTags: make(map[string]string),
@@ -258,16 +288,16 @@ func buildPackument(name string, entries []manifest.NpmEntry, d dirs) packument 
 	}
 
 	var latestVersion string
-	for _, entry := range entries {
-		tarballName := npmTarballFilename(entry)
-		tarballPath := filepath.Join(d.npm, entry.Name, tarballName)
+	for _, nve := range entries {
+		tarballName := npmTarballFilename(nve.name, nve.ve)
+		tarballPath := filepath.Join(d.npm, nve.name, tarballName)
 
 		pe := packumentEntry{
-			Name:    entry.Name,
-			Version: entry.Version,
+			Name:    nve.name,
+			Version: nve.ve.Version,
 			Dist: packumentDist{
 				// Relative URL — the server's base URL is prepended by clients.
-				Tarball: entry.Name + "/-/" + tarballName,
+				Tarball: nve.name + "/-/" + tarballName,
 			},
 		}
 
@@ -278,8 +308,8 @@ func buildPackument(name string, entries []manifest.NpmEntry, d dirs) packument 
 			}
 		}
 
-		p.Versions[entry.Version] = pe
-		latestVersion = entry.Version
+		p.Versions[nve.ve.Version] = pe
+		latestVersion = nve.ve.Version
 	}
 
 	if latestVersion != "" {

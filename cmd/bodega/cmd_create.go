@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -46,109 +47,64 @@ Examples:
 				return fmt.Errorf("load manifests: %w", err)
 			}
 
+			ctx := context.Background()
 			r := bufio.NewReader(os.Stdin)
+
+			var name string
+			var ve manifest.VersionEntry
 
 			switch t {
 			case manifest.TypeGit:
-				entry, err := collectGitEntry(r, flagName, flagURL, flagRef)
+				name, ve, err = collectGitVersion(r, flagName, flagURL, flagRef)
 				if err != nil {
 					return err
 				}
-				if store.FindGit(entry.Name) != nil {
-					return fmt.Errorf("git entry %q already exists", entry.Name)
-				}
-				store.Git = append(store.Git, entry)
-				if err := store.SaveGit(); err != nil {
-					return err
-				}
-				fmt.Printf("Added git entry: %s\n", entry.Name)
 
 			case manifest.TypeBinary:
-				entry, err := collectBinaryEntry(r, flagName, flagURL, flagSHA256, flagFilename)
+				name, ve, err = collectBinaryVersion(r, flagName, flagURL, flagSHA256, flagFilename)
 				if err != nil {
 					return err
 				}
-				if store.FindBinary(entry.Name) != nil {
-					return fmt.Errorf("binary entry %q already exists", entry.Name)
-				}
-				store.Binary = append(store.Binary, entry)
-				if err := store.SaveBinary(); err != nil {
-					return err
-				}
-				fmt.Printf("Added binary entry: %s\n", entry.Name)
 
 			case manifest.TypeApt:
-				entry, err := collectAptEntry(r, flagName, flagURL, flagSrcName, flagBuildCmd, flagDebGlob)
+				name, ve, err = collectAptVersion(r, flagName, flagURL, flagSrcName, flagBuildCmd, flagDebGlob)
 				if err != nil {
 					return err
 				}
-				if store.FindApt(entry.Name) != nil {
-					return fmt.Errorf("apt entry %q already exists", entry.Name)
-				}
-				store.Apt = append(store.Apt, entry)
-				if err := store.SaveApt(); err != nil {
-					return err
-				}
-				fmt.Printf("Added apt entry: %s\n", entry.Name)
 
 			case manifest.TypeGomod:
-				entry, err := collectGomodEntry(r, flagName, flagURL, flagRef)
+				name, ve, err = collectGomodVersion(r, flagName, flagURL, flagRef)
 				if err != nil {
 					return err
 				}
-				if store.FindGomod(entry.Name) != nil {
-					return fmt.Errorf("gomod entry %q already exists", entry.Name)
-				}
-				store.Gomod = append(store.Gomod, entry)
-				if err := store.SaveGomod(); err != nil {
-					return err
-				}
-				fmt.Printf("Added gomod entry: %s\n", entry.Name)
 
 			case manifest.TypeHelm:
-				entry, err := collectHelmEntry(r, flagName, flagURL, flagRef)
+				name, ve, err = collectHelmVersion(r, flagName, flagURL, flagRef)
 				if err != nil {
 					return err
 				}
-				if store.FindHelm(entry.Name) != nil {
-					return fmt.Errorf("helm entry %q already exists", entry.Name)
-				}
-				store.Helm = append(store.Helm, entry)
-				if err := store.SaveHelm(); err != nil {
-					return err
-				}
-				fmt.Printf("Added helm entry: %s\n", entry.Name)
 
 			case manifest.TypeNpm:
-				entry, err := collectNpmEntry(r, flagName, flagURL, flagRef)
+				name, ve, err = collectNpmVersion(r, flagName, flagURL, flagRef)
 				if err != nil {
 					return err
 				}
-				if store.FindNpm(entry.Name) != nil {
-					return fmt.Errorf("npm entry %q already exists", entry.Name)
-				}
-				store.Npm = append(store.Npm, entry)
-				if err := store.SaveNpm(); err != nil {
-					return err
-				}
-				fmt.Printf("Added npm entry: %s\n", entry.Name)
 
 			case manifest.TypePypi:
-				pkgName := flagName
-				if pkgName == "" {
+				if flagName == "" {
 					return fmt.Errorf("--name is required for pypi entries")
 				}
-				if store.FindPypiPackage(pkgName) != nil {
-					return fmt.Errorf("pypi package %q already exists", pkgName)
-				}
-				pkg := manifest.PypiPackage{Name: pkgName}
-				store.Pypi.Packages = append(store.Pypi.Packages, pkg)
-				if err := store.SavePypi(); err != nil {
-					return err
-				}
-				fmt.Printf("Added pypi package: %s\n", pkgName)
+				name = flagName
+				ve = manifest.VersionEntry{}
 			}
 
+			if err := store.AddVersion(ctx, t, name, ve); err != nil {
+				return fmt.Errorf("add version: %w", err)
+			}
+			if err := store.SaveIndex(ctx); err != nil {
+				return fmt.Errorf("save index: %w", err)
+			}
+			fmt.Printf("Added %s entry: %s\n", t, name)
 			return nil
 		},
 	}
@@ -156,7 +112,7 @@ Examples:
 	f := cmd.Flags()
 	f.StringVar(&flagName, "name", "", "Entry name")
 	f.StringVar(&flagURL, "url", "", "URL (git remote or download URL)")
-	f.StringVar(&flagRef, "ref", "", "Git ref (tag, branch, or commit SHA)")
+	f.StringVar(&flagRef, "ref", "", "Git ref (tag, branch, or commit SHA) / version for other types")
 	f.StringVar(&flagSHA256, "sha256", "", "Expected SHA-256 of downloaded file")
 	f.StringVar(&flagFilename, "filename", "", "Filename override for binary downloads")
 	f.StringVar(&flagBuildCmd, "build-cmd", "", "Shell command to build the .deb")
@@ -184,145 +140,141 @@ func prompt(r *bufio.Reader, question, defVal string) (string, error) {
 	return line, nil
 }
 
-func collectGitEntry(r *bufio.Reader, name, url, ref string) (manifest.GitEntry, error) {
+func collectGitVersion(r *bufio.Reader, name, url, ref string) (string, manifest.VersionEntry, error) {
 	var err error
 	if name, err = prompt(r, "Name", name); err != nil {
-		return manifest.GitEntry{}, err
+		return "", manifest.VersionEntry{}, err
 	}
 	if name == "" {
-		return manifest.GitEntry{}, fmt.Errorf("name is required")
+		return "", manifest.VersionEntry{}, fmt.Errorf("name is required")
 	}
 	if url, err = prompt(r, "URL", url); err != nil {
-		return manifest.GitEntry{}, err
+		return "", manifest.VersionEntry{}, err
 	}
 	if url == "" {
-		return manifest.GitEntry{}, fmt.Errorf("url is required")
+		return "", manifest.VersionEntry{}, fmt.Errorf("url is required")
 	}
 	if ref, err = prompt(r, "Ref (tag/branch/SHA)", ref); err != nil {
-		return manifest.GitEntry{}, err
+		return "", manifest.VersionEntry{}, err
 	}
 	if ref == "" {
-		return manifest.GitEntry{}, fmt.Errorf("ref is required")
+		return "", manifest.VersionEntry{}, fmt.Errorf("ref is required")
 	}
-	return manifest.GitEntry{Name: name, URL: url, Ref: ref}, nil
+	return name, manifest.VersionEntry{URL: url, Ref: ref}, nil
 }
 
-func collectBinaryEntry(r *bufio.Reader, name, url, sha256, filename string) (manifest.BinaryEntry, error) {
+func collectBinaryVersion(r *bufio.Reader, name, url, sha256, filename string) (string, manifest.VersionEntry, error) {
 	var err error
 	if name, err = prompt(r, "Name", name); err != nil {
-		return manifest.BinaryEntry{}, err
+		return "", manifest.VersionEntry{}, err
 	}
 	if name == "" {
-		return manifest.BinaryEntry{}, fmt.Errorf("name is required")
+		return "", manifest.VersionEntry{}, fmt.Errorf("name is required")
 	}
 	if url, err = prompt(r, "URL", url); err != nil {
-		return manifest.BinaryEntry{}, err
+		return "", manifest.VersionEntry{}, err
 	}
 	if url == "" {
-		return manifest.BinaryEntry{}, fmt.Errorf("url is required")
+		return "", manifest.VersionEntry{}, fmt.Errorf("url is required")
 	}
 	sha256, err = prompt(r, "SHA-256 (leave blank to skip verification)", sha256)
 	if err != nil {
-		return manifest.BinaryEntry{}, err
+		return "", manifest.VersionEntry{}, err
 	}
 	filename, err = prompt(r, "Filename override (leave blank to use URL basename)", filename)
 	if err != nil {
-		return manifest.BinaryEntry{}, err
+		return "", manifest.VersionEntry{}, err
 	}
-
-	entry := manifest.BinaryEntry{Name: name, URL: url, Filename: filename}
-	if sha256 != "" {
-		entry.SHA256 = &sha256
-	}
-	return entry, nil
+	ve := manifest.VersionEntry{URL: url, Filename: filename, SHA256: sha256}
+	return name, ve, nil
 }
 
-func collectAptEntry(r *bufio.Reader, name, url, srcName, buildCmd, debGlob string) (manifest.AptEntry, error) {
+func collectAptVersion(r *bufio.Reader, name, url, srcName, buildCmd, debGlob string) (string, manifest.VersionEntry, error) {
 	var err error
 	if name, err = prompt(r, "Name", name); err != nil {
-		return manifest.AptEntry{}, err
+		return "", manifest.VersionEntry{}, err
 	}
 	if name == "" {
-		return manifest.AptEntry{}, fmt.Errorf("name is required")
+		return "", manifest.VersionEntry{}, fmt.Errorf("name is required")
 	}
 	if url, err = prompt(r, "Git URL (leave blank for apt-get download)", url); err != nil {
-		return manifest.AptEntry{}, err
+		return "", manifest.VersionEntry{}, err
 	}
 	if url != "" {
 		if srcName, err = prompt(r, "Source directory name", srcName); err != nil {
-			return manifest.AptEntry{}, err
+			return "", manifest.VersionEntry{}, err
 		}
 		if buildCmd, err = prompt(r, "Build command", buildCmd); err != nil {
-			return manifest.AptEntry{}, err
+			return "", manifest.VersionEntry{}, err
 		}
 		if debGlob, err = prompt(r, "Deb glob pattern", debGlob); err != nil {
-			return manifest.AptEntry{}, err
+			return "", manifest.VersionEntry{}, err
 		}
 	}
-	return manifest.AptEntry{
-		Name:       name,
-		SourceName: srcName,
+	ve := manifest.VersionEntry{
 		URL:        url,
+		SourceName: srcName,
 		BuildCmd:   buildCmd,
 		DebGlob:    debGlob,
-	}, nil
+	}
+	return name, ve, nil
 }
 
-func collectGomodEntry(r *bufio.Reader, name, url, version string) (manifest.GomodEntry, error) {
+func collectGomodVersion(r *bufio.Reader, name, url, version string) (string, manifest.VersionEntry, error) {
 	var err error
 	if name, err = prompt(r, "Module path (e.g. github.com/aws/aws-sdk-go-v2)", name); err != nil {
-		return manifest.GomodEntry{}, err
+		return "", manifest.VersionEntry{}, err
 	}
 	if name == "" {
-		return manifest.GomodEntry{}, fmt.Errorf("name is required")
+		return "", manifest.VersionEntry{}, fmt.Errorf("name is required")
 	}
 	if version, err = prompt(r, "Version (e.g. v1.30.0)", version); err != nil {
-		return manifest.GomodEntry{}, err
+		return "", manifest.VersionEntry{}, err
 	}
 	if version == "" {
-		return manifest.GomodEntry{}, fmt.Errorf("version is required")
+		return "", manifest.VersionEntry{}, fmt.Errorf("version is required")
 	}
 	url, _ = prompt(r, "Upstream GOPROXY URL (leave blank for proxy.golang.org)", url)
-	return manifest.GomodEntry{Name: name, Version: version, URL: url}, nil
+	return name, manifest.VersionEntry{Version: version, URL: url}, nil
 }
 
-func collectHelmEntry(r *bufio.Reader, name, url, version string) (manifest.HelmEntry, error) {
+func collectHelmVersion(r *bufio.Reader, name, url, version string) (string, manifest.VersionEntry, error) {
 	var err error
 	if name, err = prompt(r, "Chart name", name); err != nil {
-		return manifest.HelmEntry{}, err
+		return "", manifest.VersionEntry{}, err
 	}
 	if name == "" {
-		return manifest.HelmEntry{}, fmt.Errorf("name is required")
+		return "", manifest.VersionEntry{}, fmt.Errorf("name is required")
 	}
 	if version, err = prompt(r, "Chart version", version); err != nil {
-		return manifest.HelmEntry{}, err
+		return "", manifest.VersionEntry{}, err
 	}
 	if version == "" {
-		return manifest.HelmEntry{}, fmt.Errorf("version is required")
+		return "", manifest.VersionEntry{}, fmt.Errorf("version is required")
 	}
 	if url, err = prompt(r, "Chart repo or .tgz URL", url); err != nil {
-		return manifest.HelmEntry{}, err
+		return "", manifest.VersionEntry{}, err
 	}
 	if url == "" {
-		return manifest.HelmEntry{}, fmt.Errorf("url is required")
+		return "", manifest.VersionEntry{}, fmt.Errorf("url is required")
 	}
-	return manifest.HelmEntry{Name: name, Version: version, URL: url}, nil
+	return name, manifest.VersionEntry{Version: version, URL: url}, nil
 }
 
-func collectNpmEntry(r *bufio.Reader, name, url, version string) (manifest.NpmEntry, error) {
+func collectNpmVersion(r *bufio.Reader, name, url, version string) (string, manifest.VersionEntry, error) {
 	var err error
 	if name, err = prompt(r, "Package name (e.g. lodash or @scope/pkg)", name); err != nil {
-		return manifest.NpmEntry{}, err
+		return "", manifest.VersionEntry{}, err
 	}
 	if name == "" {
-		return manifest.NpmEntry{}, fmt.Errorf("name is required")
+		return "", manifest.VersionEntry{}, fmt.Errorf("name is required")
 	}
 	if version, err = prompt(r, "Version", version); err != nil {
-		return manifest.NpmEntry{}, err
+		return "", manifest.VersionEntry{}, err
 	}
 	if version == "" {
-		return manifest.NpmEntry{}, fmt.Errorf("version is required")
+		return "", manifest.VersionEntry{}, fmt.Errorf("version is required")
 	}
 	url, _ = prompt(r, "Registry URL (leave blank for registry.npmjs.org)", url)
-	return manifest.NpmEntry{Name: name, Version: version, URL: url}, nil
+	return name, manifest.VersionEntry{Version: version, URL: url}, nil
 }

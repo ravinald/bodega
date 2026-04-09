@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,28 +16,28 @@ import (
 const defaultGoProxy = "https://proxy.golang.org"
 
 // gomodDir returns the local directory for a Go module's version artifacts.
-func gomodDir(d dirs, entry manifest.GomodEntry) string {
+func gomodDir(d dirs, name string) string {
 	// Module paths use slashes (github.com/aws/...) which map to nested dirs.
-	return filepath.Join(d.gomod, entry.Name, "@v")
+	return filepath.Join(d.gomod, name, "@v")
 }
 
 // gomodS3Prefix returns the S3 key prefix for a Go module.
-func gomodS3Prefix(entry manifest.GomodEntry) string {
-	return "gomod/" + entry.Name + "/@v/"
+func gomodS3Prefix(name string) string {
+	return "gomod/" + name + "/@v/"
 }
 
 // CheckGomodStage inspects the local filesystem for fetched Go module artifacts.
-func CheckGomodStage(cfg *Config, entry manifest.GomodEntry) StageStatus {
+func CheckGomodStage(cfg *Config, name string, ve manifest.VersionEntry) StageStatus {
 	d := buildDirs(cfg.rootFor(manifest.TypeGomod))
-	dir := gomodDir(d, entry)
+	dir := gomodDir(d, name)
 
-	infoPath := filepath.Join(dir, entry.Version+".info")
+	infoPath := filepath.Join(dir, ve.Version+".info")
 	if _, err := os.Stat(infoPath); err != nil {
 		return StageStatus{}
 	}
 
-	modPath := filepath.Join(dir, entry.Version+".mod")
-	zipPath := filepath.Join(dir, entry.Version+".zip")
+	modPath := filepath.Join(dir, ve.Version+".mod")
+	zipPath := filepath.Join(dir, ve.Version+".zip")
 	modExists := fileExists(modPath)
 	zipExists := fileExists(zipPath)
 
@@ -48,103 +49,113 @@ func CheckGomodStage(cfg *Config, entry manifest.GomodEntry) StageStatus {
 }
 
 // FetchGomod downloads Go module artifacts (.info, .mod, .zip) from an upstream
-// GOPROXY for each GomodEntry in the manifest.
+// GOPROXY for each gomod package version in the manifest.
 func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
+	ctx := context.Background()
 	summary := &Summary{}
 	d := buildDirs(cfg.rootFor(manifest.TypeGomod))
 
-	for _, entry := range store.Gomod {
-		if entryFilter != "" && entry.Name != entryFilter {
+	for _, name := range store.ListPackages(manifest.TypeGomod) {
+		if entryFilter != "" && name != entryFilter {
 			continue
 		}
-		if entry.Frozen {
-			cfg.logf("  [gomod] %s: SKIPPED (frozen)", entry.Name)
+
+		pm, err := store.GetPackage(ctx, manifest.TypeGomod, name)
+		if err != nil || pm == nil {
+			cfg.logf("  [gomod] %s: ERROR loading package: %v", name, err)
 			continue
 		}
-		if !cfg.Force {
-			stage := CheckGomodStage(cfg, entry)
-			if stage.Fetched {
-				cfg.logf("  [gomod] %s: already fetched, skipping", entry.Name)
+
+		for _, ve := range pm.Versions {
+			if ve.Frozen {
+				cfg.logf("  [gomod] %s: SKIPPED (frozen)", name)
 				continue
 			}
-		}
-
-		result := Result{Type: manifest.TypeGomod, Name: entry.Name}
-		start := time.Now()
-		out := cfg.entryWriter(manifest.TypeGomod, entry.Name)
-
-		dir := gomodDir(d, entry)
-		if err := mkdirAll(dir); err != nil {
-			result.Err = err
-			result.Elapsed = time.Since(start)
-			summary.Results = append(summary.Results, result)
-			summary.Total++
-			summary.Failures++
-			continue
-		}
-
-		proxy := entry.URL
-		if proxy == "" {
-			proxy = defaultGoProxy
-		}
-
-		base := proxy + "/" + entry.Name + "/@v/" + entry.Version
-
-		var fetchErr error
-		for _, ext := range []string{".info", ".mod", ".zip"} {
-			url := base + ext
-			dest := filepath.Join(dir, entry.Version+ext)
-			_, _ = fmt.Fprintf(out, "  [gomod] %s: fetching %s\n", entry.Name, url)
-			if err := downloadURL(dest, url); err != nil {
-				_, _ = fmt.Fprintf(out, "  [gomod] %s: ERROR fetching %s: %v\n", entry.Name, ext, err)
-				fetchErr = err
-				break
+			if !cfg.Force {
+				stage := CheckGomodStage(cfg, name, ve)
+				if stage.Fetched {
+					cfg.logf("  [gomod] %s: already fetched, skipping", name)
+					continue
+				}
 			}
-			result.Artifacts = append(result.Artifacts, dest)
 
-			// Verify checksum for the .zip (primary artifact).
-			if ext == ".zip" {
-				computed, err := computeFileSHA256(dest)
-				if err != nil {
-					_, _ = fmt.Fprintf(out, "  [gomod] %s: WARNING: could not compute checksum: %v\n", entry.Name, err)
-				} else if entry.Checksum != nil {
-					if err := verifyChecksum(entry.Checksum, computed); err != nil {
-						_, _ = fmt.Fprintf(out, "  [gomod] %s: CHECKSUM MISMATCH: %v\n", entry.Name, err)
-						fetchErr = fmt.Errorf("checksum verification failed for %s: %w", entry.Name, err)
-						break
-					}
-					_, _ = fmt.Fprintf(out, "  [gomod] %s: checksum verified (%s)\n", entry.Name, entry.Checksum.Algorithm)
-					if !entry.ChecksumVerified {
-						if e := cfg.findAndUpdateGomodChecksum(store, entry.Name, entry.Checksum, true); e != nil {
-							_, _ = fmt.Fprintf(out, "  [gomod] %s: WARNING: could not save verified status: %v\n", entry.Name, e)
+			result := Result{Type: manifest.TypeGomod, Name: name}
+			start := time.Now()
+			out := cfg.entryWriter(manifest.TypeGomod, name)
+
+			dir := gomodDir(d, name)
+			if err := mkdirAll(dir); err != nil {
+				result.Err = err
+				result.Elapsed = time.Since(start)
+				summary.Results = append(summary.Results, result)
+				summary.Total++
+				summary.Failures++
+				continue
+			}
+
+			proxy := ve.URL
+			if proxy == "" {
+				proxy = defaultGoProxy
+			}
+
+			base := proxy + "/" + name + "/@v/" + ve.Version
+
+			var fetchErr error
+			for _, ext := range []string{".info", ".mod", ".zip"} {
+				url := base + ext
+				dest := filepath.Join(dir, ve.Version+ext)
+				_, _ = fmt.Fprintf(out, "  [gomod] %s: fetching %s\n", name, url)
+				if err := downloadURL(dest, url); err != nil {
+					_, _ = fmt.Fprintf(out, "  [gomod] %s: ERROR fetching %s: %v\n", name, ext, err)
+					fetchErr = err
+					break
+				}
+				result.Artifacts = append(result.Artifacts, dest)
+
+				// Verify checksum for the .zip (primary artifact).
+				if ext == ".zip" {
+					computed, err := computeFileSHA256(dest)
+					if err != nil {
+						_, _ = fmt.Fprintf(out, "  [gomod] %s: WARNING: could not compute checksum: %v\n", name, err)
+					} else if ve.Checksum != nil {
+						if err := verifyChecksum(ve.Checksum, computed); err != nil {
+							_, _ = fmt.Fprintf(out, "  [gomod] %s: CHECKSUM MISMATCH: %v\n", name, err)
+							fetchErr = fmt.Errorf("checksum verification failed for %s: %w", name, err)
+							break
 						}
-					}
-				} else if computed != "" {
-					// Auto-populate checksum on first fetch.
-					cs := newSHA256Checksum(computed)
-					_, _ = fmt.Fprintf(out, "  [gomod] %s: checksum recorded (sha256:%s...)\n", entry.Name, computed[:12])
-					if e := cfg.findAndUpdateGomodChecksum(store, entry.Name, cs, false); e != nil {
-						_, _ = fmt.Fprintf(out, "  [gomod] %s: WARNING: could not save checksum: %v\n", entry.Name, e)
+						_, _ = fmt.Fprintf(out, "  [gomod] %s: checksum verified (%s)\n", name, ve.Checksum.Algorithm)
+						if !ve.ChecksumVerified {
+							if e := cfg.findAndUpdateGomodChecksum(store, name, ve, ve.Checksum, true); e != nil {
+								_, _ = fmt.Fprintf(out, "  [gomod] %s: WARNING: could not save verified status: %v\n", name, e)
+							}
+						}
+					} else if computed != "" {
+						// Auto-populate checksum on first fetch.
+						cs := newSHA256Checksum(computed)
+						_, _ = fmt.Fprintf(out, "  [gomod] %s: checksum recorded (sha256:%s...)\n", name, computed[:12])
+						if e := cfg.findAndUpdateGomodChecksum(store, name, ve, cs, false); e != nil {
+							_, _ = fmt.Fprintf(out, "  [gomod] %s: WARNING: could not save checksum: %v\n", name, e)
+						}
 					}
 				}
 			}
-		}
 
-		// Update the @v/list file with this version.
-		if fetchErr == nil {
-			listPath := filepath.Join(dir, "list")
-			if err := appendVersionToList(listPath, entry.Version); err != nil {
-				_, _ = fmt.Fprintf(out, "  [gomod] %s: WARNING: could not update list: %v\n", entry.Name, err)
+			// Update the @v/list file with this version.
+			if fetchErr == nil {
+				listPath := filepath.Join(dir, "list")
+				if err := appendVersionToList(listPath, ve.Version); err != nil {
+					_, _ = fmt.Fprintf(out, "  [gomod] %s: WARNING: could not update list: %v\n", name, err)
+				}
+				cfg.StampGomodEntry(store, name, ve)
 			}
-			cfg.StampGomodEntry(store, entry.Name)
-		}
 
-		result.Err = fetchErr
-		result.Elapsed = time.Since(start)
-		summary.Results = append(summary.Results, result)
-		summary.Total++
-		if result.Err != nil {
-			summary.Failures++
+			result.Err = fetchErr
+			result.Elapsed = time.Since(start)
+			summary.Results = append(summary.Results, result)
+			summary.Total++
+			if result.Err != nil {
+				summary.Failures++
+			}
 		}
 	}
 
@@ -153,33 +164,42 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 
 // GomodArtifactPaths returns local/S3 path pairs for upload.
 func GomodArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) []ArtifactPath {
+	ctx := context.Background()
 	d := buildDirs(cfg.rootFor(manifest.TypeGomod))
 	var paths []ArtifactPath
 
-	for _, entry := range store.Gomod {
-		if entryFilter != "" && entry.Name != entryFilter {
+	for _, name := range store.ListPackages(manifest.TypeGomod) {
+		if entryFilter != "" && name != entryFilter {
 			continue
 		}
-		dir := gomodDir(d, entry)
-		prefix := gomodS3Prefix(entry)
 
-		for _, ext := range []string{".info", ".mod", ".zip"} {
-			local := filepath.Join(dir, entry.Version+ext)
-			if fileExists(local) {
-				paths = append(paths, ArtifactPath{
-					Local: local,
-					S3Key: prefix + entry.Version + ext,
-				})
-			}
+		pm, err := store.GetPackage(ctx, manifest.TypeGomod, name)
+		if err != nil || pm == nil {
+			continue
 		}
 
-		// Include @v/list if it exists.
-		listPath := filepath.Join(dir, "list")
-		if fileExists(listPath) {
-			paths = append(paths, ArtifactPath{
-				Local: listPath,
-				S3Key: prefix + "list",
-			})
+		for _, ve := range pm.Versions {
+			dir := gomodDir(d, name)
+			prefix := gomodS3Prefix(name)
+
+			for _, ext := range []string{".info", ".mod", ".zip"} {
+				local := filepath.Join(dir, ve.Version+ext)
+				if fileExists(local) {
+					paths = append(paths, ArtifactPath{
+						Local: local,
+						S3Key: prefix + ve.Version + ext,
+					})
+				}
+			}
+
+			// Include @v/list if it exists.
+			listPath := filepath.Join(dir, "list")
+			if fileExists(listPath) {
+				paths = append(paths, ArtifactPath{
+					Local: listPath,
+					S3Key: prefix + "list",
+				})
+			}
 		}
 	}
 

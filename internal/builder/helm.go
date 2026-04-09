@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,32 +11,33 @@ import (
 )
 
 // helmChartFilename returns the conventional Helm chart archive name.
-func helmChartFilename(entry manifest.HelmEntry) string {
-	return entry.Name + "-" + entry.Version + ".tgz"
+func helmChartFilename(name string, ve manifest.VersionEntry) string {
+	return name + "-" + ve.Version + ".tgz"
 }
 
 // helmLocalPath returns the local path for a chart archive.
-func helmLocalPath(d dirs, entry manifest.HelmEntry) string {
-	return filepath.Join(d.charts, entry.Name, entry.Version, helmChartFilename(entry))
+func helmLocalPath(d dirs, name string, ve manifest.VersionEntry) string {
+	return filepath.Join(d.charts, name, ve.Version, helmChartFilename(name, ve))
 }
 
 // helmS3Key returns the S3 key for a chart archive.
-func helmS3Key(entry manifest.HelmEntry) string {
-	return "charts/" + helmChartFilename(entry)
+func helmS3Key(name string, ve manifest.VersionEntry) string {
+	return "charts/" + helmChartFilename(name, ve)
 }
 
 // CheckHelmStage inspects the local filesystem for a fetched Helm chart.
-func CheckHelmStage(cfg *Config, entry manifest.HelmEntry) StageStatus {
+func CheckHelmStage(cfg *Config, name string, ve manifest.VersionEntry) StageStatus {
 	d := buildDirs(cfg.rootFor(manifest.TypeHelm))
-	path := helmLocalPath(d, entry)
+	path := helmLocalPath(d, name, ve)
 	if fileExists(path) {
 		return StageStatus{Fetched: true, Built: true, Packaged: true}
 	}
 	return StageStatus{}
 }
 
-// FetchHelm downloads Helm chart .tgz archives for each HelmEntry.
+// FetchHelm downloads Helm chart .tgz archives for each helm package version.
 func FetchHelm(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
+	ctx := context.Background()
 	summary := &Summary{}
 	d := buildDirs(cfg.rootFor(manifest.TypeHelm))
 
@@ -44,78 +46,87 @@ func FetchHelm(cfg *Config, store *manifest.Store, entryFilter string) *Summary 
 		return summary
 	}
 
-	for _, entry := range store.Helm {
-		if entryFilter != "" && entry.Name != entryFilter {
+	for _, name := range store.ListPackages(manifest.TypeHelm) {
+		if entryFilter != "" && name != entryFilter {
 			continue
 		}
-		if entry.Frozen {
-			cfg.logf("  [helm] %s: SKIPPED (frozen)", entry.Name)
+
+		pm, err := store.GetPackage(ctx, manifest.TypeHelm, name)
+		if err != nil || pm == nil {
+			cfg.logf("  [helm] %s: ERROR loading package: %v", name, err)
 			continue
 		}
-		if !cfg.Force {
-			stage := CheckHelmStage(cfg, entry)
-			if stage.Fetched {
-				cfg.logf("  [helm] %s: already fetched, skipping", entry.Name)
+
+		for _, ve := range pm.Versions {
+			if ve.Frozen {
+				cfg.logf("  [helm] %s: SKIPPED (frozen)", name)
 				continue
 			}
-		}
+			if !cfg.Force {
+				stage := CheckHelmStage(cfg, name, ve)
+				if stage.Fetched {
+					cfg.logf("  [helm] %s: already fetched, skipping", name)
+					continue
+				}
+			}
 
-		result := Result{Type: manifest.TypeHelm, Name: entry.Name}
-		start := time.Now()
-		out := cfg.entryWriter(manifest.TypeHelm, entry.Name)
+			result := Result{Type: manifest.TypeHelm, Name: name}
+			start := time.Now()
+			out := cfg.entryWriter(manifest.TypeHelm, name)
 
-		dest := helmLocalPath(d, entry)
-		if err := mkdirAll(filepath.Dir(dest)); err != nil {
-			result.Err = fmt.Errorf("create chart dir: %w", err)
-			summary.Failures++
+			dest := helmLocalPath(d, name, ve)
+			if err := mkdirAll(filepath.Dir(dest)); err != nil {
+				result.Err = fmt.Errorf("create chart dir: %w", err)
+				summary.Failures++
+				result.Elapsed = time.Since(start)
+				summary.Results = append(summary.Results, result)
+				summary.Total++
+				continue
+			}
+			_, _ = fmt.Fprintf(out, "  [helm] %s: fetching %s\n", name, ve.URL)
+
+			if err := downloadURL(dest, ve.URL); err != nil {
+				_, _ = fmt.Fprintf(out, "  [helm] %s: ERROR: %v\n", name, err)
+				result.Err = err
+			} else {
+				result.Artifacts = append(result.Artifacts, dest)
+
+				// Checksum verification.
+				computed, err := computeFileSHA256(dest)
+				if err != nil {
+					_, _ = fmt.Fprintf(out, "  [helm] %s: WARNING: could not compute checksum: %v\n", name, err)
+				} else if ve.Checksum != nil {
+					if err := verifyChecksum(ve.Checksum, computed); err != nil {
+						_, _ = fmt.Fprintf(out, "  [helm] %s: CHECKSUM MISMATCH: %v\n", name, err)
+						result.Err = fmt.Errorf("checksum verification failed: %w", err)
+					} else {
+						_, _ = fmt.Fprintf(out, "  [helm] %s: checksum verified\n", name)
+						if !ve.ChecksumVerified {
+							if e := cfg.findAndUpdateHelmChecksum(store, name, ve, ve.Checksum, true); e != nil {
+								_, _ = fmt.Fprintf(out, "  [helm] %s: WARNING: could not save verified status: %v\n", name, e)
+							}
+						}
+					}
+				} else if computed != "" {
+					cs := newSHA256Checksum(computed)
+					_, _ = fmt.Fprintf(out, "  [helm] %s: checksum recorded (sha256:%s...)\n", name, computed[:12])
+					if e := cfg.findAndUpdateHelmChecksum(store, name, ve, cs, false); e != nil {
+						_, _ = fmt.Fprintf(out, "  [helm] %s: WARNING: could not save checksum: %v\n", name, e)
+					}
+				}
+
+				if result.Err == nil {
+					_, _ = fmt.Fprintf(out, "  [helm] %s: ok\n", name)
+					cfg.StampHelmEntry(store, name, ve)
+				}
+			}
+
 			result.Elapsed = time.Since(start)
 			summary.Results = append(summary.Results, result)
 			summary.Total++
-			continue
-		}
-		_, _ = fmt.Fprintf(out, "  [helm] %s: fetching %s\n", entry.Name, entry.URL)
-
-		if err := downloadURL(dest, entry.URL); err != nil {
-			_, _ = fmt.Fprintf(out, "  [helm] %s: ERROR: %v\n", entry.Name, err)
-			result.Err = err
-		} else {
-			result.Artifacts = append(result.Artifacts, dest)
-
-			// Checksum verification.
-			computed, err := computeFileSHA256(dest)
-			if err != nil {
-				_, _ = fmt.Fprintf(out, "  [helm] %s: WARNING: could not compute checksum: %v\n", entry.Name, err)
-			} else if entry.Checksum != nil {
-				if err := verifyChecksum(entry.Checksum, computed); err != nil {
-					_, _ = fmt.Fprintf(out, "  [helm] %s: CHECKSUM MISMATCH: %v\n", entry.Name, err)
-					result.Err = fmt.Errorf("checksum verification failed: %w", err)
-				} else {
-					_, _ = fmt.Fprintf(out, "  [helm] %s: checksum verified\n", entry.Name)
-					if !entry.ChecksumVerified {
-						if e := cfg.findAndUpdateHelmChecksum(store, entry.Name, entry.Checksum, true); e != nil {
-							_, _ = fmt.Fprintf(out, "  [helm] %s: WARNING: could not save verified status: %v\n", entry.Name, e)
-						}
-					}
-				}
-			} else if computed != "" {
-				cs := newSHA256Checksum(computed)
-				_, _ = fmt.Fprintf(out, "  [helm] %s: checksum recorded (sha256:%s...)\n", entry.Name, computed[:12])
-				if e := cfg.findAndUpdateHelmChecksum(store, entry.Name, cs, false); e != nil {
-					_, _ = fmt.Fprintf(out, "  [helm] %s: WARNING: could not save checksum: %v\n", entry.Name, e)
-				}
+			if result.Err != nil {
+				summary.Failures++
 			}
-
-			if result.Err == nil {
-				_, _ = fmt.Fprintf(out, "  [helm] %s: ok\n", entry.Name)
-				cfg.StampHelmEntry(store, entry.Name)
-			}
-		}
-
-		result.Elapsed = time.Since(start)
-		summary.Results = append(summary.Results, result)
-		summary.Total++
-		if result.Err != nil {
-			summary.Failures++
 		}
 	}
 
@@ -126,6 +137,7 @@ func FetchHelm(cfg *Config, store *manifest.Store, entryFilter string) *Summary 
 // This is a simplified implementation that creates entries based on manifest
 // data rather than parsing Chart.yaml from each tarball.
 func PackageHelm(cfg *Config, store *manifest.Store) *Summary {
+	ctx := context.Background()
 	summary := &Summary{}
 	d := buildDirs(cfg.rootFor(manifest.TypeHelm))
 	out := cfg.stdout()
@@ -142,23 +154,30 @@ func PackageHelm(cfg *Config, store *manifest.Store) *Summary {
 
 	_, _ = fmt.Fprintf(f, "apiVersion: v1\nentries:\n")
 
-	for _, entry := range store.Helm {
-		filename := helmChartFilename(entry)
-		if !fileExists(helmLocalPath(d, entry)) {
+	for _, name := range store.ListPackages(manifest.TypeHelm) {
+		pm, err := store.GetPackage(ctx, manifest.TypeHelm, name)
+		if err != nil || pm == nil {
 			continue
 		}
 
-		_, _ = fmt.Fprintf(f, "  %s:\n", entry.Name)
-		_, _ = fmt.Fprintf(f, "  - name: %s\n", entry.Name)
-		_, _ = fmt.Fprintf(f, "    version: %s\n", entry.Version)
-		if entry.AppVersion != "" {
-			_, _ = fmt.Fprintf(f, "    appVersion: %q\n", entry.AppVersion)
-		}
-		_, _ = fmt.Fprintf(f, "    urls:\n")
-		_, _ = fmt.Fprintf(f, "    - charts/%s\n", filename)
-		_, _ = fmt.Fprintf(f, "    created: %s\n", time.Now().UTC().Format(time.RFC3339))
+		for _, ve := range pm.Versions {
+			filename := helmChartFilename(name, ve)
+			if !fileExists(helmLocalPath(d, name, ve)) {
+				continue
+			}
 
-		summary.Total++
+			_, _ = fmt.Fprintf(f, "  %s:\n", name)
+			_, _ = fmt.Fprintf(f, "  - name: %s\n", name)
+			_, _ = fmt.Fprintf(f, "    version: %s\n", ve.Version)
+			if ve.AppVersion != "" {
+				_, _ = fmt.Fprintf(f, "    appVersion: %q\n", ve.AppVersion)
+			}
+			_, _ = fmt.Fprintf(f, "    urls:\n")
+			_, _ = fmt.Fprintf(f, "    - charts/%s\n", filename)
+			_, _ = fmt.Fprintf(f, "    created: %s\n", time.Now().UTC().Format(time.RFC3339))
+
+			summary.Total++
+		}
 	}
 
 	if err := f.Close(); err != nil {
@@ -172,19 +191,28 @@ func PackageHelm(cfg *Config, store *manifest.Store) *Summary {
 
 // HelmArtifactPaths returns local/S3 path pairs for upload.
 func HelmArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) []ArtifactPath {
+	ctx := context.Background()
 	d := buildDirs(cfg.rootFor(manifest.TypeHelm))
 	var paths []ArtifactPath
 
-	for _, entry := range store.Helm {
-		if entryFilter != "" && entry.Name != entryFilter {
+	for _, name := range store.ListPackages(manifest.TypeHelm) {
+		if entryFilter != "" && name != entryFilter {
 			continue
 		}
-		local := helmLocalPath(d, entry)
-		if fileExists(local) {
-			paths = append(paths, ArtifactPath{
-				Local: local,
-				S3Key: helmS3Key(entry),
-			})
+
+		pm, err := store.GetPackage(ctx, manifest.TypeHelm, name)
+		if err != nil || pm == nil {
+			continue
+		}
+
+		for _, ve := range pm.Versions {
+			local := helmLocalPath(d, name, ve)
+			if fileExists(local) {
+				paths = append(paths, ArtifactPath{
+					Local: local,
+					S3Key: helmS3Key(name, ve),
+				})
+			}
 		}
 	}
 

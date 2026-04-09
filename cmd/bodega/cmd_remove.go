@@ -36,12 +36,11 @@ file is not modified.`,
 				return fmt.Errorf("load manifests: %w", err)
 			}
 
-			key := s3KeyFor(store, t, name)
+			ctx := backgroundCtx()
+			key := s3KeyFor(store, ctx, t, name)
 			if key == "" {
 				return fmt.Errorf("could not determine S3 key for %s/%s", t, name)
 			}
-
-			ctx := backgroundCtx()
 			client, err := bos3.NewClient(ctx, cfg.Bucket, cfg.Region)
 			if err != nil {
 				return fmt.Errorf("connect to AWS: %w", err)

@@ -2,6 +2,7 @@ package builder
 
 import (
 	"bufio"
+	"context"
 	"os"
 	"os/exec"
 	"runtime"
@@ -48,69 +49,60 @@ func readOSRelease() string {
 	return ""
 }
 
-// StampGitEntry sets BuildEnv and auto-detects Platform on a git entry.
-func (c *Config) StampGitEntry(store *manifest.Store, name string) {
-	e := store.FindGit(name)
-	if e == nil {
+// stampVersion updates BuildEnv and Platform on a specific VersionEntry within
+// a PackageManifest and saves the manifest. It matches the entry by Version or
+// Ref field.
+func stampVersion(ctx context.Context, store *manifest.Store, typ, name string, targetVE manifest.VersionEntry, env *manifest.BuildEnv, defaultPlatform string) {
+	pm, err := store.GetPackage(ctx, typ, name)
+	if err != nil || pm == nil {
 		return
 	}
-	e.BuildEnv = c.GetBuildEnv()
-	if e.Platform == "" {
-		e.Platform = e.BuildEnv.Platform
+
+	targetKey := targetVE.Version
+	if targetKey == "" {
+		targetKey = targetVE.Ref
 	}
-	_ = store.SaveGit()
+
+	for i := range pm.Versions {
+		ve := &pm.Versions[i]
+		veKey := ve.Version
+		if veKey == "" {
+			veKey = ve.Ref
+		}
+		if veKey == targetKey {
+			ve.BuildEnv = env
+			if ve.Platform == "" {
+				ve.Platform = defaultPlatform
+			}
+			break
+		}
+	}
+	_ = store.SavePackage(ctx, pm)
+}
+
+// StampGitEntry sets BuildEnv and auto-detects Platform on a git entry.
+func (c *Config) StampGitEntry(store *manifest.Store, name string, ve manifest.VersionEntry) {
+	stampVersion(context.Background(), store, manifest.TypeGit, name, ve, c.GetBuildEnv(), c.GetBuildEnv().Platform)
 }
 
 // StampBinaryEntry sets BuildEnv and auto-detects Platform on a binary entry.
-func (c *Config) StampBinaryEntry(store *manifest.Store, name string) {
-	e := store.FindBinary(name)
-	if e == nil {
-		return
-	}
-	e.BuildEnv = c.GetBuildEnv()
-	if e.Platform == "" {
-		e.Platform = e.BuildEnv.Platform
-	}
-	_ = store.SaveBinary()
+func (c *Config) StampBinaryEntry(store *manifest.Store, name string, ve manifest.VersionEntry) {
+	stampVersion(context.Background(), store, manifest.TypeBinary, name, ve, c.GetBuildEnv(), c.GetBuildEnv().Platform)
 }
 
 // StampGomodEntry sets BuildEnv on a gomod entry (platform is always "any").
-func (c *Config) StampGomodEntry(store *manifest.Store, name string) {
-	e := store.FindGomod(name)
-	if e == nil {
-		return
-	}
-	e.BuildEnv = c.GetBuildEnv()
-	if e.Platform == "" {
-		e.Platform = "any"
-	}
-	_ = store.SaveGomod()
+func (c *Config) StampGomodEntry(store *manifest.Store, name string, ve manifest.VersionEntry) {
+	stampVersion(context.Background(), store, manifest.TypeGomod, name, ve, c.GetBuildEnv(), "any")
 }
 
 // StampHelmEntry sets BuildEnv on a helm entry (platform is always "any").
-func (c *Config) StampHelmEntry(store *manifest.Store, name string) {
-	e := store.FindHelm(name)
-	if e == nil {
-		return
-	}
-	e.BuildEnv = c.GetBuildEnv()
-	if e.Platform == "" {
-		e.Platform = "any"
-	}
-	_ = store.SaveHelm()
+func (c *Config) StampHelmEntry(store *manifest.Store, name string, ve manifest.VersionEntry) {
+	stampVersion(context.Background(), store, manifest.TypeHelm, name, ve, c.GetBuildEnv(), "any")
 }
 
 // StampNpmEntry sets BuildEnv on an npm entry (platform is always "any").
-func (c *Config) StampNpmEntry(store *manifest.Store, name string) {
-	e := store.FindNpm(name)
-	if e == nil {
-		return
-	}
-	e.BuildEnv = c.GetBuildEnv()
-	if e.Platform == "" {
-		e.Platform = "any"
-	}
-	_ = store.SaveNpm()
+func (c *Config) StampNpmEntry(store *manifest.Store, name string, ve manifest.VersionEntry) {
+	stampVersion(context.Background(), store, manifest.TypeNpm, name, ve, c.GetBuildEnv(), "any")
 }
 
 // cmdVersion runs a command and returns its first line of output, trimmed.

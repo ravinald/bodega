@@ -58,26 +58,20 @@ func (m *mockS3) HeadObject(_ context.Context, key string) (*bos3.ObjectStatus, 
 func newTestServer(t *testing.T) (*httptest.Server, *mockS3) {
 	t.Helper()
 
-	store := &manifest.Store{
-		Apt: []manifest.AptEntry{
-			{Name: "amazon-efs-utils", Version: "1.36.0"},
-			{Name: "linux-headers", Version: "5.15.0"},
-		},
-		Git: []manifest.GitEntry{
-			{Name: "netbox", URL: "https://github.com/netbox-community/netbox", Ref: "v4.5.5"},
-		},
-		Pypi: manifest.PypiManifest{
-			ConfigVersion: 1,
-			Version:       "v4.5.5",
-			Packages: []manifest.PypiPackage{
-				{Name: "boto3"},
-				{Name: "django"},
-			},
-		},
-		Binary: []manifest.BinaryEntry{
-			{Name: "awscli-v2", Version: "2.0.0", URL: "https://example.com/awscli.zip"},
-		},
-	}
+	store := manifest.NewLocalStore(t.TempDir())
+	ctx := t.Context()
+	_ = store.AddVersion(ctx, manifest.TypeApt, "amazon-efs-utils", manifest.VersionEntry{Version: "1.36.0"})
+	_ = store.AddVersion(ctx, manifest.TypeApt, "linux-headers", manifest.VersionEntry{Version: "5.15.0"})
+	_ = store.AddVersion(ctx, manifest.TypeGit, "netbox", manifest.VersionEntry{
+		URL: "https://github.com/netbox-community/netbox",
+		Ref: "v4.5.5",
+	})
+	_ = store.AddVersion(ctx, manifest.TypePypi, "boto3", manifest.VersionEntry{})
+	_ = store.AddVersion(ctx, manifest.TypePypi, "django", manifest.VersionEntry{})
+	_ = store.AddVersion(ctx, manifest.TypeBinary, "awscli-v2", manifest.VersionEntry{
+		Version: "2.0.0",
+		URL:     "https://example.com/awscli.zip",
+	})
 
 	mock := &mockS3{
 		objects: map[string]string{

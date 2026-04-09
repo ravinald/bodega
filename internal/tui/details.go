@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -114,11 +115,11 @@ func (m detailsModel) s3AndClientFields(n *TreeNode) string {
 
 // discoverGitDeps checks the extracted source for known dependency files
 // and returns a summary string for the details pane.
-func (m detailsModel) discoverGitDeps(e *manifest.GitEntry) string {
+func (m detailsModel) discoverGitDeps(name, ref string) string {
 	if m.buildRoot == "" {
 		return ""
 	}
-	worktree, err := builder.GitWorktreePath(m.buildRoot, e.Name, e.Ref)
+	worktree, err := builder.GitWorktreePath(m.buildRoot, name, ref)
 	if err != nil || worktree == "" {
 		return ""
 	}
@@ -149,16 +150,28 @@ func (m detailsModel) discoverGitDeps(e *manifest.GitEntry) string {
 	return field("Deps", strings.Join(found, ", "))
 }
 
-// dependentsOf returns a formatted list of packages across all manifest types
-// that list the given name in their required_by field.
+// dependentsOf returns a formatted list of pypi packages that have the given
+// git entry name in their RequiredBy field.
 func (m detailsModel) dependentsOf(name string) string {
+	ctx := context.Background()
 	var deps []string
-	for _, pkg := range m.store.Pypi.Packages {
-		for _, rb := range pkg.RequiredBy {
-			if rb == name {
-				label := pkg.Name
-				if pkg.Version != "" {
-					label += "==" + pkg.Version
+	for _, safeName := range m.store.ListPackages(manifest.TypePypi) {
+		pm, err := m.store.GetPackage(ctx, manifest.TypePypi, safeName)
+		if err != nil || pm == nil {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			matched := false
+			for _, rb := range ve.RequiredBy {
+				if rb == name {
+					matched = true
+					break
+				}
+			}
+			if matched {
+				label := pm.Name
+				if ve.Version != "" {
+					label += "==" + ve.Version
 				}
 				deps = append(deps, label)
 				break
@@ -233,86 +246,80 @@ func s3StatusField(inS3 bool) string {
 	return k + " " + v
 }
 
-// s3Path returns the S3 object key for the given entry.
+// s3Path returns the S3 object key for the given entry (first version).
 func s3Path(cfg *config.Config, store *manifest.Store, entryType, name string) string {
+	ctx := context.Background()
+	pm, err := store.GetPackage(ctx, entryType, name)
+	if err != nil || pm == nil || len(pm.Versions) == 0 {
+		switch entryType {
+		case manifest.TypeApt:
+			return "packages/apt/"
+		case manifest.TypePypi:
+			return "pypi/wheels/"
+		}
+		return ""
+	}
+	ve := pm.Versions[0]
 	switch entryType {
 	case manifest.TypeGit:
-		e := store.FindGit(name)
-		if e == nil {
-			return ""
-		}
 		ext := ".bundle"
-		if e.IsRelease() {
+		if ve.IsRelease() {
 			ext = ".tar.gz"
 		}
-		sn := strings.ReplaceAll(e.Name, "/", "--")
-		return fmt.Sprintf("repos/%s/%s-%s%s", sn, sn, e.Ref, ext)
+		sn := strings.ReplaceAll(pm.Name, "/", "--")
+		return fmt.Sprintf("repos/%s/%s-%s%s", sn, sn, ve.Ref, ext)
 	case manifest.TypeBinary:
-		e := store.FindBinary(name)
-		if e == nil {
-			return ""
-		}
-		fn := e.Filename
-		if fn == "" && e.URL != "" {
-			parts := strings.Split(e.URL, "/")
+		fn := ve.Filename
+		if fn == "" && ve.URL != "" {
+			parts := strings.Split(ve.URL, "/")
 			fn = parts[len(parts)-1]
 		}
-		if e.Version != "" {
-			return fmt.Sprintf("binaries/%s/%s/%s", e.Name, e.Version, fn)
+		if ve.Version != "" {
+			return fmt.Sprintf("binaries/%s/%s/%s", pm.Name, ve.Version, fn)
 		}
-		return fmt.Sprintf("binaries/%s/%s", e.Name, fn)
+		return fmt.Sprintf("binaries/%s/%s", pm.Name, fn)
 	case manifest.TypeApt:
 		return "packages/apt/"
 	case manifest.TypePypi:
 		return "pypi/wheels/"
 	case manifest.TypeGomod:
-		e := store.FindGomod(name)
-		if e == nil {
-			return ""
-		}
-		return fmt.Sprintf("gomod/%s/@v/%s.zip", e.Name, e.Version)
+		return fmt.Sprintf("gomod/%s/@v/%s.zip", pm.Name, ve.Version)
 	case manifest.TypeHelm:
-		e := store.FindHelm(name)
-		if e == nil {
-			return ""
-		}
-		return fmt.Sprintf("charts/%s-%s.tgz", e.Name, e.Version)
+		return fmt.Sprintf("charts/%s-%s.tgz", pm.Name, ve.Version)
 	case manifest.TypeNpm:
-		e := store.FindNpm(name)
-		if e == nil {
-			return ""
-		}
-		return fmt.Sprintf("npm/%s/%s-%s.tgz", e.Name, e.Name, e.Version)
+		return fmt.Sprintf("npm/%s/%s-%s.tgz", pm.Name, pm.Name, ve.Version)
 	}
 	return ""
 }
 
 // clientURL returns the URL a client would use to fetch the artifact from the bodega server.
 func clientURL(store *manifest.Store, entryType, name string) string {
+	ctx := context.Background()
 	host := "<bodega-host>:8080"
+	pm, err := store.GetPackage(ctx, entryType, name)
 	switch entryType {
 	case manifest.TypeGit:
-		e := store.FindGit(name)
-		if e == nil {
+		if err != nil || pm == nil || len(pm.Versions) == 0 {
 			return ""
 		}
+		ve := pm.Versions[0]
 		ext := ".bundle"
-		if e.IsRelease() {
+		if ve.IsRelease() {
 			ext = ".tar.gz"
 		}
-		sn := strings.ReplaceAll(e.Name, "/", "--")
-		return fmt.Sprintf("http://%s/git/%s/%s-%s%s", host, sn, sn, e.Ref, ext)
+		sn := strings.ReplaceAll(pm.Name, "/", "--")
+		return fmt.Sprintf("http://%s/git/%s/%s-%s%s", host, sn, sn, ve.Ref, ext)
 	case manifest.TypeBinary:
-		e := store.FindBinary(name)
-		if e == nil {
+		if err != nil || pm == nil || len(pm.Versions) == 0 {
 			return ""
 		}
-		fn := e.Filename
-		if fn == "" && e.URL != "" {
-			parts := strings.Split(e.URL, "/")
+		ve := pm.Versions[0]
+		fn := ve.Filename
+		if fn == "" && ve.URL != "" {
+			parts := strings.Split(ve.URL, "/")
 			fn = parts[len(parts)-1]
 		}
-		return fmt.Sprintf("http://%s/binaries/%s/%s/%s", host, e.Name, e.Version, fn)
+		return fmt.Sprintf("http://%s/binaries/%s/%s/%s", host, pm.Name, ve.Version, fn)
 	case manifest.TypeApt:
 		return fmt.Sprintf("deb [trusted=yes] http://%s/apt/ noble main", host)
 	case manifest.TypePypi:
@@ -320,11 +327,11 @@ func clientURL(store *manifest.Store, entryType, name string) string {
 	case manifest.TypeGomod:
 		return fmt.Sprintf("GOPROXY=http://%s/go,direct go get %s", host, name)
 	case manifest.TypeHelm:
-		e := store.FindHelm(name)
-		if e == nil {
+		if err != nil || pm == nil || len(pm.Versions) == 0 {
 			return ""
 		}
-		return fmt.Sprintf("http://%s/helm/charts/%s-%s.tgz", host, e.Name, e.Version)
+		ve := pm.Versions[0]
+		return fmt.Sprintf("http://%s/helm/charts/%s-%s.tgz", host, pm.Name, ve.Version)
 	case manifest.TypeNpm:
 		return fmt.Sprintf("npm install --registry http://%s/npm/ %s", host, name)
 	}
@@ -334,6 +341,7 @@ func clientURL(store *manifest.Store, entryType, name string) string {
 func (m detailsModel) renderGroupDetails() string {
 	var sb strings.Builder
 	n := m.node
+	ctx := context.Background()
 
 	// Package sub-group (depth > 0): show package name, version count, description.
 	if !strings.HasSuffix(n.Label, "/") {
@@ -367,72 +375,25 @@ func (m detailsModel) renderGroupDetails() string {
 	// Top-level type group.
 	sb.WriteString(field("Type", n.EntryType+"/"))
 	sb.WriteByte('\n')
-
-	switch n.EntryType {
-	case manifest.TypeApt:
-		sb.WriteString(field("Packages", fmt.Sprintf("%d", len(m.store.Apt))))
-	case manifest.TypeGit:
-		sb.WriteString(field("Packages", fmt.Sprintf("%d", len(m.store.Git))))
-	case manifest.TypePypi:
-		if m.store.Pypi.Version != "" {
-			sb.WriteString(field("Version", m.store.Pypi.Version))
-			sb.WriteByte('\n')
-		}
-		sb.WriteString(field("Packages", fmt.Sprintf("%d", len(m.store.Pypi.Packages))))
-	case manifest.TypeBinary:
-		sb.WriteString(field("Packages", fmt.Sprintf("%d", len(m.store.Binary))))
-	case manifest.TypeGomod:
-		sb.WriteString(field("Packages", fmt.Sprintf("%d", len(m.store.Gomod))))
-	case manifest.TypeHelm:
-		sb.WriteString(field("Packages", fmt.Sprintf("%d", len(m.store.Helm))))
-	case manifest.TypeNpm:
-		sb.WriteString(field("Packages", fmt.Sprintf("%d", len(m.store.Npm))))
-	}
+	count := len(store_ListPackages(m.store, ctx, n.EntryType))
+	sb.WriteString(field("Packages", fmt.Sprintf("%d", count)))
 
 	return sb.String()
 }
 
+// store_ListPackages is a helper to list packages for a type.
+func store_ListPackages(store *manifest.Store, _ context.Context, typ string) []string {
+	return store.ListPackages(typ)
+}
+
 // packageDescription returns a cached description for a package, or empty string.
-// Descriptions are stored on manifest entries via the Description field.
 func (m detailsModel) packageDescription(entryType, name string) string {
-	switch entryType {
-	case manifest.TypeGit:
-		e := m.store.FindGit(name)
-		if e != nil {
-			return e.Description
-		}
-	case manifest.TypePypi:
-		p := m.store.FindPypiPackage(name)
-		if p != nil {
-			return p.Description
-		}
-	case manifest.TypeBinary:
-		e := m.store.FindBinary(name)
-		if e != nil {
-			return e.Description
-		}
-	case manifest.TypeGomod:
-		e := m.store.FindGomod(name)
-		if e != nil {
-			return e.Description
-		}
-	case manifest.TypeHelm:
-		e := m.store.FindHelm(name)
-		if e != nil {
-			return e.Description
-		}
-	case manifest.TypeNpm:
-		e := m.store.FindNpm(name)
-		if e != nil {
-			return e.Description
-		}
-	case manifest.TypeApt:
-		e := m.store.FindApt(name)
-		if e != nil {
-			return e.Description
-		}
+	ctx := context.Background()
+	pm, err := m.store.GetPackage(ctx, entryType, name)
+	if err != nil || pm == nil {
+		return ""
 	}
-	return ""
+	return pm.Description
 }
 
 func (m detailsModel) renderEntryDetails() string {
@@ -440,84 +401,74 @@ func (m detailsModel) renderEntryDetails() string {
 	if n == nil {
 		return ""
 	}
+	ctx := context.Background()
 
 	var sb strings.Builder
 
+	pm, err := m.store.GetPackage(ctx, n.EntryType, n.Name)
+	if err != nil || pm == nil || len(pm.Versions) == 0 {
+		return errorStyle.Render("entry not found")
+	}
+	ve := pm.Versions[0]
+
 	switch n.EntryType {
 	case manifest.TypeApt:
-		e := m.store.FindApt(n.Name)
-		if e == nil {
-			return errorStyle.Render("entry not found")
-		}
-		sb.WriteString(field("Name", e.Name))
+		sb.WriteString(field("Name", pm.Name))
 		sb.WriteByte('\n')
-		if e.Version != "" {
-			sb.WriteString(field("Version", e.Version))
+		if ve.Version != "" {
+			sb.WriteString(field("Version", ve.Version))
 			sb.WriteByte('\n')
 		}
-		if e.SourceName != "" {
-			sb.WriteString(field("SourceName", e.SourceName))
+		if ve.SourceName != "" {
+			sb.WriteString(field("SourceName", ve.SourceName))
 			sb.WriteByte('\n')
 		}
-		if e.URL != "" {
-			sb.WriteString(field("URL", wrap(e.URL, m.width-16)))
+		if ve.URL != "" {
+			sb.WriteString(field("URL", wrap(ve.URL, m.width-16)))
 			sb.WriteByte('\n')
 		}
-		if e.BuildCmd != "" {
-			sb.WriteString(field("BuildCmd", e.BuildCmd))
+		if ve.BuildCmd != "" {
+			sb.WriteString(field("BuildCmd", ve.BuildCmd))
 			sb.WriteByte('\n')
 		}
-		if e.DebGlob != "" {
-			sb.WriteString(field("DebGlob", e.DebGlob))
+		if ve.DebGlob != "" {
+			sb.WriteString(field("DebGlob", ve.DebGlob))
 			sb.WriteByte('\n')
 		}
-		sb.WriteString(boolField("Frozen", e.Frozen))
+		sb.WriteString(boolField("Frozen", ve.Frozen))
 		sb.WriteByte('\n')
 		sb.WriteString(m.s3AndClientFields(n))
-		sb.WriteString(platformAndBuildEnv(e.Platform, e.BuildEnv))
+		sb.WriteString(platformAndBuildEnv(ve.Platform, ve.BuildEnv))
 
 	case manifest.TypeGit:
-		e := m.store.FindGit(n.Name)
-		if e == nil {
-			return errorStyle.Render("entry not found")
-		}
-		sb.WriteString(field("Name", e.Name))
+		sb.WriteString(field("Name", pm.Name))
 		sb.WriteByte('\n')
-		sb.WriteString(field("Ref", e.Ref))
+		sb.WriteString(field("Ref", ve.Ref))
 		sb.WriteByte('\n')
-		sb.WriteString(field("URL", wrap(e.URL, m.width-16)))
+		sb.WriteString(field("URL", wrap(ve.URL, m.width-16)))
 		sb.WriteByte('\n')
-		sb.WriteString(checksumFields(e.Checksum, e.ChecksumVerified))
-		sb.WriteString(boolField("Frozen", e.Frozen))
+		sb.WriteString(checksumFields(ve.Checksum, ve.ChecksumVerified))
+		sb.WriteString(boolField("Frozen", ve.Frozen))
 		sb.WriteByte('\n')
 		sb.WriteString(m.s3AndClientFields(n))
-		sb.WriteString(platformAndBuildEnv(e.Platform, e.BuildEnv))
+		sb.WriteString(platformAndBuildEnv(ve.Platform, ve.BuildEnv))
 		// Show discovered dependency files.
-		if deps := m.discoverGitDeps(e); deps != "" {
+		if deps := m.discoverGitDeps(pm.Name, ve.Ref); deps != "" {
 			sb.WriteByte('\n')
 			sb.WriteString(deps)
 		}
 		// Show packages that depend on this git entry.
-		if depList := m.dependentsOf(e.Name); depList != "" {
+		if depList := m.dependentsOf(pm.Name); depList != "" {
 			sb.WriteByte('\n')
 			sb.WriteString(depList)
 		}
 
 	case manifest.TypePypi:
-		sb.WriteString(field("Name", n.Name))
+		sb.WriteString(field("Name", pm.Name))
 		sb.WriteByte('\n')
 
-		// Find the package entry to get required_by.
-		var pkg *manifest.PypiPackage
-		for i := range m.store.Pypi.Packages {
-			if m.store.Pypi.Packages[i].Name == n.Name {
-				pkg = &m.store.Pypi.Packages[i]
-				break
-			}
-		}
-
-		if pkg != nil && len(pkg.RequiredBy) > 0 {
-			sb.WriteString(field("Required by", strings.Join(pkg.RequiredBy, ", ")))
+		if len(ve.RequiredBy) > 0 {
+			sb.WriteString(field("Required by", strings.Join(ve.RequiredBy, ", ")))
 			sb.WriteByte('\n')
 		}
 
@@ -525,15 +476,15 @@ func (m detailsModel) renderEntryDetails() string {
 		var depGraph *builder.PypiDepGraph
 		if m.buildRoot != "" {
 			wheelsDir := filepath.Join(m.buildRoot, "wheels")
-			if m.store.Pypi.Version != "" {
-				wheelsDir = filepath.Join(wheelsDir, m.store.Pypi.Version)
+			if ve.Version != "" {
+				wheelsDir = filepath.Join(wheelsDir, ve.Version)
 			}
 			depGraph, _ = builder.LoadDepGraph(filepath.Join(wheelsDir, "dep-graph.json"))
 		}
 
 		if depGraph != nil {
 			for _, pkg := range depGraph.Packages {
-				if strings.EqualFold(pkg.Name, n.Name) {
+				if strings.EqualFold(pkg.Name, pm.Name) {
 					if pkg.Version != "" {
 						sb.WriteString(field("Version", pkg.Version))
 						sb.WriteByte('\n')
@@ -554,98 +505,80 @@ func (m detailsModel) renderEntryDetails() string {
 			sb.WriteByte('\n')
 		}
 
-		sb.WriteString(boolField("Frozen", m.store.Pypi.Frozen))
+		sb.WriteString(boolField("Frozen", ve.Frozen))
 		sb.WriteByte('\n')
 		sb.WriteString(m.s3AndClientFields(n))
-		if pkg != nil {
-			sb.WriteString(platformAndBuildEnv(pkg.Platform, pkg.BuildEnv))
-		}
+		sb.WriteString(platformAndBuildEnv(ve.Platform, ve.BuildEnv))
 
 	case manifest.TypeBinary:
-		e := m.store.FindBinary(n.Name)
-		if e == nil {
-			return errorStyle.Render("entry not found")
-		}
-		sb.WriteString(field("Name", e.Name))
+		sb.WriteString(field("Name", pm.Name))
 		sb.WriteByte('\n')
-		if e.Version != "" {
-			sb.WriteString(field("Version", e.Version))
+		if ve.Version != "" {
+			sb.WriteString(field("Version", ve.Version))
 			sb.WriteByte('\n')
 		}
-		sb.WriteString(field("URL", wrap(e.URL, m.width-16)))
+		sb.WriteString(field("URL", wrap(ve.URL, m.width-16)))
 		sb.WriteByte('\n')
-		if e.Filename != "" {
-			sb.WriteString(field("Filename", e.Filename))
+		if ve.Filename != "" {
+			sb.WriteString(field("Filename", ve.Filename))
 			sb.WriteByte('\n')
 		}
-		if e.SHA256 != nil && *e.SHA256 != "" {
-			sb.WriteString(field("SHA256", *e.SHA256))
+		if ve.SHA256 != "" {
+			sb.WriteString(field("SHA256", ve.SHA256))
 			sb.WriteByte('\n')
 		}
-		sb.WriteString(checksumFields(e.Checksum, e.ChecksumVerified))
-		sb.WriteString(boolField("Frozen", e.Frozen))
+		sb.WriteString(checksumFields(ve.Checksum, ve.ChecksumVerified))
+		sb.WriteString(boolField("Frozen", ve.Frozen))
 		sb.WriteByte('\n')
 		sb.WriteString(m.s3AndClientFields(n))
-		sb.WriteString(platformAndBuildEnv(e.Platform, e.BuildEnv))
+		sb.WriteString(platformAndBuildEnv(ve.Platform, ve.BuildEnv))
 
 	case manifest.TypeGomod:
-		e := m.store.FindGomod(n.Name)
-		if e == nil {
-			return errorStyle.Render("entry not found")
-		}
-		sb.WriteString(field("Module", e.Name))
+		sb.WriteString(field("Module", pm.Name))
 		sb.WriteByte('\n')
-		sb.WriteString(field("Version", e.Version))
+		sb.WriteString(field("Version", ve.Version))
 		sb.WriteByte('\n')
-		if e.URL != "" {
-			sb.WriteString(field("Upstream", e.URL))
+		if ve.URL != "" {
+			sb.WriteString(field("Upstream", ve.URL))
 			sb.WriteByte('\n')
 		}
-		sb.WriteString(checksumFields(e.Checksum, e.ChecksumVerified))
-		sb.WriteString(boolField("Frozen", e.Frozen))
+		sb.WriteString(checksumFields(ve.Checksum, ve.ChecksumVerified))
+		sb.WriteString(boolField("Frozen", ve.Frozen))
 		sb.WriteByte('\n')
 		sb.WriteString(m.s3AndClientFields(n))
-		sb.WriteString(platformAndBuildEnv(e.Platform, e.BuildEnv))
+		sb.WriteString(platformAndBuildEnv(ve.Platform, ve.BuildEnv))
 
 	case manifest.TypeHelm:
-		e := m.store.FindHelm(n.Name)
-		if e == nil {
-			return errorStyle.Render("entry not found")
-		}
-		sb.WriteString(field("Chart", e.Name))
+		sb.WriteString(field("Chart", pm.Name))
 		sb.WriteByte('\n')
-		sb.WriteString(field("Version", e.Version))
+		sb.WriteString(field("Version", ve.Version))
 		sb.WriteByte('\n')
-		sb.WriteString(field("URL", wrap(e.URL, m.width-16)))
+		sb.WriteString(field("URL", wrap(ve.URL, m.width-16)))
 		sb.WriteByte('\n')
-		if e.AppVersion != "" {
-			sb.WriteString(field("App Version", e.AppVersion))
+		if ve.AppVersion != "" {
+			sb.WriteString(field("App Version", ve.AppVersion))
 			sb.WriteByte('\n')
 		}
-		sb.WriteString(checksumFields(e.Checksum, e.ChecksumVerified))
-		sb.WriteString(boolField("Frozen", e.Frozen))
+		sb.WriteString(checksumFields(ve.Checksum, ve.ChecksumVerified))
+		sb.WriteString(boolField("Frozen", ve.Frozen))
 		sb.WriteByte('\n')
 		sb.WriteString(m.s3AndClientFields(n))
-		sb.WriteString(platformAndBuildEnv(e.Platform, e.BuildEnv))
+		sb.WriteString(platformAndBuildEnv(ve.Platform, ve.BuildEnv))
 
 	case manifest.TypeNpm:
-		e := m.store.FindNpm(n.Name)
-		if e == nil {
-			return errorStyle.Render("entry not found")
-		}
-		sb.WriteString(field("Package", e.Name))
+		sb.WriteString(field("Package", pm.Name))
 		sb.WriteByte('\n')
-		sb.WriteString(field("Version", e.Version))
+		sb.WriteString(field("Version", ve.Version))
 		sb.WriteByte('\n')
-		if e.URL != "" {
-			sb.WriteString(field("Registry", e.URL))
+		if ve.URL != "" {
+			sb.WriteString(field("Registry", ve.URL))
 			sb.WriteByte('\n')
 		}
-		sb.WriteString(checksumFields(e.Checksum, e.ChecksumVerified))
-		sb.WriteString(boolField("Frozen", e.Frozen))
+		sb.WriteString(checksumFields(ve.Checksum, ve.ChecksumVerified))
+		sb.WriteString(boolField("Frozen", ve.Frozen))
 		sb.WriteByte('\n')
 		sb.WriteString(m.s3AndClientFields(n))
-		sb.WriteString(platformAndBuildEnv(e.Platform, e.BuildEnv))
+		sb.WriteString(platformAndBuildEnv(ve.Platform, ve.BuildEnv))
 	}
 
 	// Append raw JSON below the parsed fields.
@@ -659,35 +592,14 @@ func (m detailsModel) renderEntryDetails() string {
 	return sb.String()
 }
 
-// rawJSON returns the pretty-printed JSON for the entry matching the given node.
+// rawJSON returns the pretty-printed JSON for the package manifest matching the given node.
 func (m detailsModel) rawJSON(n *TreeNode) string {
-	var v interface{}
-	switch n.EntryType {
-	case manifest.TypeApt:
-		v = m.store.FindApt(n.Name)
-	case manifest.TypeGit:
-		v = m.store.FindGit(n.Name)
-	case manifest.TypeBinary:
-		v = m.store.FindBinary(n.Name)
-	case manifest.TypePypi:
-		// Show only the individual package, not the full manifest.
-		for i := range m.store.Pypi.Packages {
-			if m.store.Pypi.Packages[i].Name == n.Name {
-				v = m.store.Pypi.Packages[i]
-				break
-			}
-		}
-	case manifest.TypeGomod:
-		v = m.store.FindGomod(n.Name)
-	case manifest.TypeHelm:
-		v = m.store.FindHelm(n.Name)
-	case manifest.TypeNpm:
-		v = m.store.FindNpm(n.Name)
-	}
-	if v == nil {
+	ctx := context.Background()
+	pm, err := m.store.GetPackage(ctx, n.EntryType, n.Name)
+	if err != nil || pm == nil {
 		return ""
 	}
-	data, err := json.MarshalIndent(v, "", "  ")
+	data, err := json.MarshalIndent(pm, "", "  ")
 	if err != nil {
 		return ""
 	}

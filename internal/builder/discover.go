@@ -2,6 +2,7 @@ package builder
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,8 +18,9 @@ type DiscoveredDep struct {
 	Ecosystem  string // "pypi", "gomod", "npm"
 	Name       string // package/module name (no version specifier)
 	Version    string // extracted version (may be empty)
+	Constraint string // bodega constraint: "exact", "compatible", "patch", "any"
 	RawSpec    string // original specifier as found in the file (e.g. "mkdocs==1.6.1")
-	RequiredBy string // git entry that requires this
+	RequiredBy string // "type/name@version" of the parent that requires this
 	Exists     bool   // true if already in the manifest
 }
 
@@ -30,21 +32,42 @@ type DiscoveryResult struct {
 
 // ScanDeps scans an extracted git source for dependency files and returns
 // structured results. It does NOT modify the store. Use ImportDeps to apply.
-func ScanDeps(cfg *Config, store *manifest.Store, entry manifest.GitEntry, out io.Writer) DiscoveryResult {
+func ScanDeps(cfg *Config, store *manifest.Store, name string, ve manifest.VersionEntry, out io.Writer) DiscoveryResult {
+	ctx := context.Background()
 	result := DiscoveryResult{}
 
 	buildRoot := cfg.rootFor(manifest.TypeGit)
-	worktree, err := GitWorktreePath(buildRoot, entry.Name, entry.Ref)
+	worktree, err := GitWorktreePath(buildRoot, name, ve.Ref)
 	if err != nil || worktree == "" {
-		_, _ = fmt.Fprintf(out, "    [discover] could not locate source for %s@%s\n", entry.Name, entry.Ref)
+		_, _ = fmt.Fprintf(out, "    [discover] could not locate source for %s@%s\n", name, ve.Ref)
 		return result
 	}
 
-	_, _ = fmt.Fprintf(out, "\n>>> [discover] scanning %s@%s\n", entry.Name, entry.Ref)
+	_, _ = fmt.Fprintf(out, "\n>>> [discover] scanning %s@%s\n", name, ve.Ref)
 	_, _ = fmt.Fprintf(out, "    Source: %s\n", worktree)
 
-	// --- requirements.txt (Python/pip) ---
+	// --- Python requirements ---
+	// Parse both requirements.txt (pinned) and base_requirements.txt (flexible).
+	// The pinned file provides exact versions; the base file provides constraints.
+	parentRef := fmt.Sprintf("git/%s@%s", name, ve.Ref)
+
 	reqPath := filepath.Join(worktree, "requirements.txt")
+	baseReqPath := filepath.Join(worktree, "base_requirements.txt")
+
+	// Build a constraint map from base_requirements.txt (if present).
+	baseConstraints := make(map[string]string) // normalized name -> constraint
+	baseRawSpecs := make(map[string]string)    // normalized name -> raw spec
+	if _, err := os.Stat(baseReqPath); err == nil {
+		baseDeps := parseRequirementsTxt(baseReqPath, worktree)
+		result.FilesFound = append(result.FilesFound, fmt.Sprintf("base_requirements.txt (%d packages)", len(baseDeps)))
+		_, _ = fmt.Fprintf(out, "    Found: base_requirements.txt (%d packages)\n", len(baseDeps))
+		for _, dep := range baseDeps {
+			key := strings.ToLower(dep.Name)
+			baseConstraints[key] = pipOperatorToConstraint(dep.RawSpec)
+			baseRawSpecs[key] = dep.RawSpec
+		}
+	}
+
 	if _, err := os.Stat(reqPath); err == nil {
 		pkgs := parseRequirementsTxt(reqPath, worktree)
 		result.FilesFound = append(result.FilesFound, fmt.Sprintf("requirements.txt (%d packages)", len(pkgs)))
@@ -52,18 +75,24 @@ func ScanDeps(cfg *Config, store *manifest.Store, entry manifest.GitEntry, out i
 
 		for _, dep := range pkgs {
 			exists := false
-			for _, existing := range store.Pypi.Packages {
-				if strings.EqualFold(pkgBaseName(existing.Name), dep.Name) {
+			for _, pkgName := range store.ListPackages(manifest.TypePypi) {
+				if strings.EqualFold(pkgBaseName(pkgName), dep.Name) {
 					exists = true
 					break
 				}
+			}
+			// Determine constraint: from base_requirements if available, else from the pinned spec.
+			constraint := pipOperatorToConstraint(dep.RawSpec)
+			if bc, ok := baseConstraints[strings.ToLower(dep.Name)]; ok {
+				constraint = bc
 			}
 			result.Deps = append(result.Deps, DiscoveredDep{
 				Ecosystem:  manifest.TypePypi,
 				Name:       dep.Name,
 				Version:    dep.Version,
+				Constraint: constraint,
 				RawSpec:    dep.RawSpec,
-				RequiredBy: entry.Name,
+				RequiredBy: parentRef,
 				Exists:     exists,
 			})
 		}
@@ -77,13 +106,15 @@ func ScanDeps(cfg *Config, store *manifest.Store, entry manifest.GitEntry, out i
 		_, _ = fmt.Fprintf(out, "    Found: go.mod (%d modules)\n", len(mods))
 
 		for _, mod := range mods {
-			exists := store.FindGomod(mod.Name) != nil
+			pm, _ := store.GetPackage(ctx, manifest.TypeGomod, mod.Name)
+			exists := pm != nil
 			result.Deps = append(result.Deps, DiscoveredDep{
 				Ecosystem:  manifest.TypeGomod,
 				Name:       mod.Name,
 				Version:    mod.Version,
+				Constraint: manifest.ConstraintExact,
 				RawSpec:    mod.Name + " " + mod.Version,
-				RequiredBy: entry.Name,
+				RequiredBy: parentRef,
 				Exists:     exists,
 			})
 		}
@@ -97,23 +128,25 @@ func ScanDeps(cfg *Config, store *manifest.Store, entry manifest.GitEntry, out i
 		_, _ = fmt.Fprintf(out, "    Found: package.json (%d dependencies)\n", len(deps))
 
 		for _, dep := range deps {
-			exists := store.FindNpm(dep.Name) != nil
+			pm, _ := store.GetPackage(ctx, manifest.TypeNpm, dep.Name)
+			exists := pm != nil
 			result.Deps = append(result.Deps, DiscoveredDep{
 				Ecosystem:  manifest.TypeNpm,
 				Name:       dep.Name,
 				Version:    dep.Version,
+				Constraint: manifest.ConstraintExact,
 				RawSpec:    dep.Name + "@" + dep.Version,
-				RequiredBy: entry.Name,
+				RequiredBy: parentRef,
 				Exists:     exists,
 			})
 		}
 	}
 
 	// --- Log-only: unsupported ecosystems ---
-	for _, name := range []string{"Gemfile", "pom.xml", "build.gradle", "Cargo.toml"} {
-		if _, err := os.Stat(filepath.Join(worktree, name)); err == nil {
-			result.FilesFound = append(result.FilesFound, name+" (unsupported)")
-			_, _ = fmt.Fprintf(out, "    Found: %s (unsupported ecosystem -- manual entry needed)\n", name)
+	for _, fname := range []string{"Gemfile", "pom.xml", "build.gradle", "Cargo.toml"} {
+		if _, err := os.Stat(filepath.Join(worktree, fname)); err == nil {
+			result.FilesFound = append(result.FilesFound, fname+" (unsupported)")
+			_, _ = fmt.Fprintf(out, "    Found: %s (unsupported ecosystem -- manual entry needed)\n", fname)
 		}
 	}
 
@@ -126,70 +159,72 @@ func ScanDeps(cfg *Config, store *manifest.Store, entry manifest.GitEntry, out i
 
 // ImportDeps adds the given discovered dependencies to the store and saves.
 // Only imports deps where Exists is false. Returns counts of added per ecosystem.
-func ImportDeps(store *manifest.Store, entry manifest.GitEntry, deps []DiscoveredDep, out io.Writer) (pypiAdded, gomodAdded, npmAdded int) {
-	// Auto-populate base_requirements for pypi.
-	hasPypi := false
-	for _, d := range deps {
-		if d.Ecosystem == manifest.TypePypi && !d.Exists {
-			hasPypi = true
-			break
-		}
-	}
-	if hasPypi {
-		if store.Pypi.BaseRequirements == nil {
-			store.Pypi.BaseRequirements = make(map[string]string)
-		}
-		store.Pypi.BaseRequirements[entry.Name] = entry.Ref
-		_, _ = fmt.Fprintf(out, "    pypi: set base_requirements[%q] = %q\n", entry.Name, entry.Ref)
-	}
-
+func ImportDeps(ctx context.Context, store *manifest.Store, parentName string, parentVE manifest.VersionEntry, deps []DiscoveredDep, out io.Writer) (pypiAdded, gomodAdded, npmAdded int) {
 	for _, d := range deps {
 		if d.Exists {
 			continue
 		}
+		ve := manifest.VersionEntry{
+			Version:           d.Version,
+			VersionConstraint: d.Constraint,
+			RequiredBy:        []string{d.RequiredBy},
+		}
 		switch d.Ecosystem {
 		case manifest.TypePypi:
-			store.Pypi.Packages = append(store.Pypi.Packages, manifest.PypiPackage{
-				Name:       d.Name,
-				Version:    d.Version,
-				RequiredBy: []string{d.RequiredBy},
-			})
-			pypiAdded++
+			if err := store.AddVersion(ctx, manifest.TypePypi, d.Name, ve); err != nil {
+				_, _ = fmt.Fprintf(out, "    pypi: WARNING: could not add %s: %v\n", d.Name, err)
+			} else {
+				pypiAdded++
+			}
 		case manifest.TypeGomod:
-			store.Gomod = append(store.Gomod, manifest.GomodEntry{
-				Name:    d.Name,
-				Version: d.Version,
-				Mode:    manifest.ModeProxy,
-			})
-			gomodAdded++
+			ve.Mode = manifest.ModeProxy
+			if err := store.AddVersion(ctx, manifest.TypeGomod, d.Name, ve); err != nil {
+				_, _ = fmt.Fprintf(out, "    gomod: WARNING: could not add %s: %v\n", d.Name, err)
+			} else {
+				gomodAdded++
+			}
 		case manifest.TypeNpm:
-			store.Npm = append(store.Npm, manifest.NpmEntry{
-				Name:    d.Name,
-				Version: d.Version,
-				Mode:    manifest.ModeProxy,
-			})
-			npmAdded++
+			ve.Mode = manifest.ModeProxy
+			if err := store.AddVersion(ctx, manifest.TypeNpm, d.Name, ve); err != nil {
+				_, _ = fmt.Fprintf(out, "    npm: WARNING: could not add %s: %v\n", d.Name, err)
+			} else {
+				npmAdded++
+			}
+		}
+		// Add dependency graph edge.
+		childRef := fmt.Sprintf("%s/%s@%s", d.Ecosystem, d.Name, d.Version)
+		store.AddEdge(manifest.DepEdge{
+			Parent:     d.RequiredBy,
+			Child:      childRef,
+			Constraint: d.Constraint,
+			RawSpec:    d.RawSpec,
+		})
+	}
+
+	if pypiAdded > 0 {
+		_, _ = fmt.Fprintf(out, "    pypi: added %d new packages\n", pypiAdded)
+		if err := store.SaveIndex(ctx); err != nil {
+			_, _ = fmt.Fprintf(out, "    pypi: WARNING: could not save index: %v\n", err)
+		}
+	}
+	if gomodAdded > 0 {
+		_, _ = fmt.Fprintf(out, "    gomod: added %d new modules\n", gomodAdded)
+		if err := store.SaveIndex(ctx); err != nil {
+			_, _ = fmt.Fprintf(out, "    gomod: WARNING: could not save index: %v\n", err)
+		}
+	}
+	if npmAdded > 0 {
+		_, _ = fmt.Fprintf(out, "    npm: added %d new packages\n", npmAdded)
+		if err := store.SaveIndex(ctx); err != nil {
+			_, _ = fmt.Fprintf(out, "    npm: WARNING: could not save index: %v\n", err)
 		}
 	}
 
-	// Save modified manifests.
-	if pypiAdded > 0 {
-		if err := store.SavePypi(); err != nil {
-			_, _ = fmt.Fprintf(out, "    pypi: WARNING: could not save: %v\n", err)
+	// Save the dependency graph.
+	if pypiAdded+gomodAdded+npmAdded > 0 {
+		if err := store.SaveGraph(ctx); err != nil {
+			_, _ = fmt.Fprintf(out, "    WARNING: could not save dependency graph: %v\n", err)
 		}
-		_, _ = fmt.Fprintf(out, "    pypi: added %d new packages\n", pypiAdded)
-	}
-	if gomodAdded > 0 {
-		if err := store.SaveGomod(); err != nil {
-			_, _ = fmt.Fprintf(out, "    gomod: WARNING: could not save: %v\n", err)
-		}
-		_, _ = fmt.Fprintf(out, "    gomod: added %d new modules\n", gomodAdded)
-	}
-	if npmAdded > 0 {
-		if err := store.SaveNpm(); err != nil {
-			_, _ = fmt.Fprintf(out, "    npm: WARNING: could not save: %v\n", err)
-		}
-		_, _ = fmt.Fprintf(out, "    npm: added %d new packages\n", npmAdded)
 	}
 
 	return
@@ -197,12 +232,57 @@ func ImportDeps(store *manifest.Store, entry manifest.GitEntry, deps []Discovere
 
 // DiscoverDeps is a convenience wrapper that scans and auto-imports all deps.
 // Used by the CLI/pipeline when interactive review is not available.
-func DiscoverDeps(cfg *Config, store *manifest.Store, entry manifest.GitEntry, out io.Writer) DiscoveryResult {
-	result := ScanDeps(cfg, store, entry, out)
+func DiscoverDeps(cfg *Config, store *manifest.Store, name string, ve manifest.VersionEntry, out io.Writer) DiscoveryResult {
+	ctx := context.Background()
+	result := ScanDeps(cfg, store, name, ve, out)
 	if len(result.Deps) > 0 {
-		ImportDeps(store, entry, result.Deps, out)
+		ImportDeps(ctx, store, name, ve, result.Deps, out)
 	}
 	return result
+}
+
+// pipOperatorToConstraint maps a pip version operator to a bodega constraint.
+func pipOperatorToConstraint(rawSpec string) string {
+	spec := strings.TrimSpace(rawSpec)
+	// Strip environment markers.
+	if i := strings.IndexByte(spec, ';'); i >= 0 {
+		spec = strings.TrimSpace(spec[:i])
+	}
+	// Find the operator.
+	for i, r := range spec {
+		if r == '>' || r == '<' || r == '=' || r == '!' || r == '~' {
+			op := spec[i:]
+			// Extract just the operator portion.
+			opEnd := 0
+			for j, c := range op {
+				if c != '>' && c != '<' && c != '=' && c != '!' && c != '~' {
+					opEnd = j
+					break
+				}
+			}
+			if opEnd == 0 {
+				opEnd = len(op)
+			}
+			operator := op[:opEnd]
+			// Check for wildcard: ==X.Y.*
+			if operator == "==" && strings.Contains(op[opEnd:], "*") {
+				return manifest.ConstraintCompatible
+			}
+			switch operator {
+			case "==":
+				return manifest.ConstraintExact
+			case "~=":
+				return manifest.ConstraintPatch
+			case ">=":
+				return manifest.ConstraintCompatible
+			case "<", "<=", "!=":
+				return manifest.ConstraintExact // conservative
+			}
+			return manifest.ConstraintExact
+		}
+	}
+	// No operator = unpinned.
+	return manifest.ConstraintAny
 }
 
 // parsedPipDep holds the parsed name and version from a pip specifier.

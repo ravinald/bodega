@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,40 +10,41 @@ import (
 	"github.com/scaleapi/bodega/internal/manifest"
 )
 
-// aptSourceDir returns the source directory path for an AptEntry. When the
-// entry has a Version set, the directory is named "<sourceName>-<version>" to
-// allow multiple versions to coexist. Falls back to "<sourceName>" when empty.
-func aptSourceDir(d dirs, entry manifest.AptEntry) string {
-	sourceName := entry.SourceName
+// aptSourceDir returns the source directory path for an apt package version.
+// When the VersionEntry has a Version set, the directory is named
+// "<sourceName>-<version>" to allow multiple versions to coexist.
+// Falls back to "<sourceName>" when empty.
+func aptSourceDir(d dirs, name string, ve manifest.VersionEntry) string {
+	sourceName := ve.SourceName
 	if sourceName == "" {
-		sourceName = entry.Name
+		sourceName = name
 	}
-	if entry.Version != "" {
-		return filepath.Join(d.sources, sourceName+"-"+entry.Version)
+	if ve.Version != "" {
+		return filepath.Join(d.sources, sourceName+"-"+ve.Version)
 	}
 	return filepath.Join(d.sources, sourceName)
 }
 
 // CheckAptStage inspects the filesystem to determine which pipeline stages have
-// completed for the given AptEntry. It does not run any commands.
-func CheckAptStage(cfg *Config, entry manifest.AptEntry) StageStatus {
+// completed for the given apt package version. It does not run any commands.
+func CheckAptStage(cfg *Config, name string, ve manifest.VersionEntry) StageStatus {
 	d := buildDirs(cfg.rootFor(manifest.TypeApt))
 	var s StageStatus
 
-	sourceName := entry.SourceName
+	sourceName := ve.SourceName
 	if sourceName == "" {
-		sourceName = entry.Name
+		sourceName = name
 	}
 
-	if entry.URL != "" {
+	if ve.URL != "" {
 		// Source-build entry: fetch = clone dir exists.
-		cloneDir := aptSourceDir(d, entry)
+		cloneDir := aptSourceDir(d, name, ve)
 		if fi, err := os.Stat(cloneDir); err == nil && fi.IsDir() {
 			s.Fetched = true
 		}
 		if s.Fetched {
 			// Build = .deb file present inside the clone dir.
-			glob := entry.DebGlob
+			glob := ve.DebGlob
 			if glob == "" {
 				glob = "*.deb"
 			}
@@ -65,11 +67,12 @@ func CheckAptStage(cfg *Config, entry manifest.AptEntry) StageStatus {
 	return s
 }
 
-// FetchApt fetches the source for each AptEntry. For entries with a URL the
-// source is git-cloned into <build-root>/sources/<source_name[-version]>/. For
-// entries without a URL the .deb is downloaded via apt-get download into
+// FetchApt fetches the source for each apt package version. For versions with
+// a URL the source is git-cloned into <build-root>/sources/<source_name[-version]>/.
+// For versions without a URL the .deb is downloaded via apt-get download into
 // <build-root>/sources/.
 func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
+	ctx := context.Background()
 	summary := &Summary{}
 	d := buildDirs(cfg.rootFor(manifest.TypeApt))
 
@@ -79,81 +82,90 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 		return summary
 	}
 
-	for _, entry := range store.Apt {
-		if entryFilter != "" && entry.Name != entryFilter {
+	for _, name := range store.ListPackages(manifest.TypeApt) {
+		if entryFilter != "" && name != entryFilter {
 			continue
 		}
-		if entry.Frozen {
-			cfg.logf("  [apt] %s: SKIPPED (frozen)", entry.Name)
+
+		pm, err := store.GetPackage(ctx, manifest.TypeApt, name)
+		if err != nil || pm == nil {
+			cfg.logf("  [apt] %s: ERROR loading package: %v", name, err)
 			continue
 		}
-		if !cfg.Force {
-			stage := CheckAptStage(cfg, entry)
-			if stage.Fetched {
-				cfg.logf("  [apt] %s: already fetched, skipping", entry.Name)
+
+		for _, ve := range pm.Versions {
+			if ve.Frozen {
+				cfg.logf("  [apt] %s: SKIPPED (frozen)", name)
 				continue
 			}
-		}
-
-		start := time.Now()
-		result := Result{Type: manifest.TypeApt, Name: entry.Name}
-		out := cfg.entryWriter(manifest.TypeApt, entry.Name)
-
-		_, _ = fmt.Fprintf(out, "\n>>> [apt] fetch %s\n", entry.Name)
-
-		var artifactPath string
-		var fetchErr error
-
-		if entry.URL != "" {
-			cloneDir := aptSourceDir(d, entry)
-			if err := os.RemoveAll(cloneDir); err != nil {
-				fetchErr = fmt.Errorf("remove old source %s: %w", cloneDir, err)
-			} else {
-				_, _ = fmt.Fprintf(out, "    Cloning %s...\n", entry.URL)
-				if err := runCmd(out, "", "git", "clone", "--depth", "1", entry.URL, cloneDir); err != nil {
-					fetchErr = fmt.Errorf("git clone: %w", err)
-				} else {
-					artifactPath = cloneDir
-					_, _ = fmt.Fprintf(out, "    Source: %s\n", cloneDir)
+			if !cfg.Force {
+				stage := CheckAptStage(cfg, name, ve)
+				if stage.Fetched {
+					cfg.logf("  [apt] %s: already fetched, skipping", name)
+					continue
 				}
 			}
-		} else {
-			sourceName := entry.SourceName
-			if sourceName == "" {
-				sourceName = entry.Name
-			}
-			_, _ = fmt.Fprintf(out, "    Downloading %s via apt-get download...\n", sourceName)
-			if err := runCmd(out, srcDir, "apt-get", "download", sourceName); err != nil {
-				fetchErr = fmt.Errorf("apt-get download %s: %w", sourceName, err)
-			} else {
-				matches, err := filepath.Glob(filepath.Join(srcDir, sourceName+"*.deb"))
-				if err != nil || len(matches) == 0 {
-					fetchErr = fmt.Errorf("no .deb found for %s in %s", sourceName, srcDir)
+
+			start := time.Now()
+			result := Result{Type: manifest.TypeApt, Name: name}
+			out := cfg.entryWriter(manifest.TypeApt, name)
+
+			_, _ = fmt.Fprintf(out, "\n>>> [apt] fetch %s\n", name)
+
+			var artifactPath string
+			var fetchErr error
+
+			if ve.URL != "" {
+				cloneDir := aptSourceDir(d, name, ve)
+				if err := os.RemoveAll(cloneDir); err != nil {
+					fetchErr = fmt.Errorf("remove old source %s: %w", cloneDir, err)
 				} else {
-					artifactPath = matches[0]
-					_, _ = fmt.Fprintf(out, "    Downloaded: %s\n", filepath.Base(artifactPath))
+					_, _ = fmt.Fprintf(out, "    Cloning %s...\n", ve.URL)
+					if err := runCmd(out, "", "git", "clone", "--depth", "1", ve.URL, cloneDir); err != nil {
+						fetchErr = fmt.Errorf("git clone: %w", err)
+					} else {
+						artifactPath = cloneDir
+						_, _ = fmt.Fprintf(out, "    Source: %s\n", cloneDir)
+					}
+				}
+			} else {
+				sourceName := ve.SourceName
+				if sourceName == "" {
+					sourceName = name
+				}
+				_, _ = fmt.Fprintf(out, "    Downloading %s via apt-get download...\n", sourceName)
+				if err := runCmd(out, srcDir, "apt-get", "download", sourceName); err != nil {
+					fetchErr = fmt.Errorf("apt-get download %s: %w", sourceName, err)
+				} else {
+					matches, err := filepath.Glob(filepath.Join(srcDir, sourceName+"*.deb"))
+					if err != nil || len(matches) == 0 {
+						fetchErr = fmt.Errorf("no .deb found for %s in %s", sourceName, srcDir)
+					} else {
+						artifactPath = matches[0]
+						_, _ = fmt.Fprintf(out, "    Downloaded: %s\n", filepath.Base(artifactPath))
+					}
 				}
 			}
-		}
 
-		if fetchErr != nil {
-			result.Err = fetchErr
-			_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
-			summary.Failures++
-		} else {
-			result.Artifacts = []string{artifactPath}
-		}
-
-		result.Elapsed = time.Since(start)
-		summary.Results = append(summary.Results, result)
-		summary.Total++
-		_, _ = fmt.Fprintf(out, "    Done (%s)\n", result.Elapsed.Round(time.Millisecond))
-
-		if cfg.Logger != nil {
-			if result.Err != nil {
-				cfg.Logger.Audit("FAILED  apt/fetch/%s  (%s)  %v", entry.Name, result.Elapsed.Round(time.Millisecond), result.Err)
+			if fetchErr != nil {
+				result.Err = fetchErr
+				_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
+				summary.Failures++
 			} else {
-				cfg.Logger.Audit("OK      apt/fetch/%s  (%s)", entry.Name, result.Elapsed.Round(time.Millisecond))
+				result.Artifacts = []string{artifactPath}
+			}
+
+			result.Elapsed = time.Since(start)
+			summary.Results = append(summary.Results, result)
+			summary.Total++
+			_, _ = fmt.Fprintf(out, "    Done (%s)\n", result.Elapsed.Round(time.Millisecond))
+
+			if cfg.Logger != nil {
+				if result.Err != nil {
+					cfg.Logger.Audit("FAILED  apt/fetch/%s  (%s)  %v", name, result.Elapsed.Round(time.Millisecond), result.Err)
+				} else {
+					cfg.Logger.Audit("OK      apt/fetch/%s  (%s)", name, result.Elapsed.Round(time.Millisecond))
+				}
 			}
 		}
 	}
@@ -161,49 +173,45 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 	return summary
 }
 
-// BuildApt runs the build_cmd for each AptEntry that was fetched from a git
-// source. Entries without a URL (downloaded via apt-get) have no build step
-// and are skipped silently. BuildApt verifies that the source directory exists
-// before attempting the build.
+// BuildApt runs the build_cmd for each apt package version that was fetched
+// from a git source. Versions without a URL (downloaded via apt-get) have no
+// build step and are skipped silently.
 func BuildApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
+	ctx := context.Background()
 	summary := &Summary{}
 	d := buildDirs(cfg.rootFor(manifest.TypeApt))
 
-	for _, entry := range store.Apt {
-		if entryFilter != "" && entry.Name != entryFilter {
-			continue
-		}
-		if entry.Frozen {
-			cfg.logf("  [apt] %s: SKIPPED (frozen)", entry.Name)
+	for _, name := range store.ListPackages(manifest.TypeApt) {
+		if entryFilter != "" && name != entryFilter {
 			continue
 		}
 
-		// Only source-build entries have a build step.
-		if entry.URL == "" {
+		pm, err := store.GetPackage(ctx, manifest.TypeApt, name)
+		if err != nil || pm == nil {
+			cfg.logf("  [apt] %s: ERROR loading package: %v", name, err)
 			continue
 		}
 
-		start := time.Now()
-		result := Result{Type: manifest.TypeApt, Name: entry.Name}
-		out := cfg.entryWriter(manifest.TypeApt, entry.Name)
+		for _, ve := range pm.Versions {
+			if ve.Frozen {
+				cfg.logf("  [apt] %s: SKIPPED (frozen)", name)
+				continue
+			}
 
-		_, _ = fmt.Fprintf(out, "\n>>> [apt] build %s\n", entry.Name)
+			// Only source-build entries have a build step.
+			if ve.URL == "" {
+				continue
+			}
 
-		cloneDir := aptSourceDir(d, entry)
-		if _, err := os.Stat(cloneDir); os.IsNotExist(err) {
-			result.Err = fmt.Errorf("source directory not found at %s — run 'fetch apt' first", cloneDir)
-			_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
-			summary.Failures++
-			result.Elapsed = time.Since(start)
-			summary.Results = append(summary.Results, result)
-			summary.Total++
-			continue
-		}
+			start := time.Now()
+			result := Result{Type: manifest.TypeApt, Name: name}
+			out := cfg.entryWriter(manifest.TypeApt, name)
 
-		if entry.BuildCmd != "" {
-			_, _ = fmt.Fprintf(out, "    Running: %s\n", entry.BuildCmd)
-			if err := runCmd(out, cloneDir, "sh", "-c", entry.BuildCmd); err != nil {
-				result.Err = fmt.Errorf("build_cmd %q: %w", entry.BuildCmd, err)
+			_, _ = fmt.Fprintf(out, "\n>>> [apt] build %s\n", name)
+
+			cloneDir := aptSourceDir(d, name, ve)
+			if _, err := os.Stat(cloneDir); os.IsNotExist(err) {
+				result.Err = fmt.Errorf("source directory not found at %s — run 'fetch apt' first", cloneDir)
 				_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
 				summary.Failures++
 				result.Elapsed = time.Since(start)
@@ -211,38 +219,51 @@ func BuildApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 				summary.Total++
 				continue
 			}
-		} else {
-			_, _ = fmt.Fprintf(out, "    No build_cmd configured; skipping compilation step.\n")
-		}
 
-		// Locate the produced .deb to confirm the build succeeded.
-		glob := entry.DebGlob
-		if glob == "" {
-			glob = "*.deb"
-		}
-		matches, err := filepath.Glob(filepath.Join(cloneDir, glob))
-		if err != nil || len(matches) == 0 {
-			result.Err = fmt.Errorf("no .deb found matching %s in %s after build", glob, cloneDir)
-			_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
-			summary.Failures++
-		} else {
-			result.Artifacts = []string{matches[0]}
-			fi, _ := os.Stat(matches[0])
-			if fi != nil {
-				_, _ = fmt.Fprintf(out, "    Built: %s (%s)\n", filepath.Base(matches[0]), humanBytes(fi.Size()))
-			}
-		}
-
-		result.Elapsed = time.Since(start)
-		summary.Results = append(summary.Results, result)
-		summary.Total++
-		_, _ = fmt.Fprintf(out, "    Done (%s)\n", result.Elapsed.Round(time.Millisecond))
-
-		if cfg.Logger != nil {
-			if result.Err != nil {
-				cfg.Logger.Audit("FAILED  apt/build/%s  (%s)  %v", entry.Name, result.Elapsed.Round(time.Millisecond), result.Err)
+			if ve.BuildCmd != "" {
+				_, _ = fmt.Fprintf(out, "    Running: %s\n", ve.BuildCmd)
+				if err := runCmd(out, cloneDir, "sh", "-c", ve.BuildCmd); err != nil {
+					result.Err = fmt.Errorf("build_cmd %q: %w", ve.BuildCmd, err)
+					_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
+					summary.Failures++
+					result.Elapsed = time.Since(start)
+					summary.Results = append(summary.Results, result)
+					summary.Total++
+					continue
+				}
 			} else {
-				cfg.Logger.Audit("OK      apt/build/%s  (%s)", entry.Name, result.Elapsed.Round(time.Millisecond))
+				_, _ = fmt.Fprintf(out, "    No build_cmd configured; skipping compilation step.\n")
+			}
+
+			// Locate the produced .deb to confirm the build succeeded.
+			glob := ve.DebGlob
+			if glob == "" {
+				glob = "*.deb"
+			}
+			matches, err := filepath.Glob(filepath.Join(cloneDir, glob))
+			if err != nil || len(matches) == 0 {
+				result.Err = fmt.Errorf("no .deb found matching %s in %s after build", glob, cloneDir)
+				_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
+				summary.Failures++
+			} else {
+				result.Artifacts = []string{matches[0]}
+				fi, _ := os.Stat(matches[0])
+				if fi != nil {
+					_, _ = fmt.Fprintf(out, "    Built: %s (%s)\n", filepath.Base(matches[0]), humanBytes(fi.Size()))
+				}
+			}
+
+			result.Elapsed = time.Since(start)
+			summary.Results = append(summary.Results, result)
+			summary.Total++
+			_, _ = fmt.Fprintf(out, "    Done (%s)\n", result.Elapsed.Round(time.Millisecond))
+
+			if cfg.Logger != nil {
+				if result.Err != nil {
+					cfg.Logger.Audit("FAILED  apt/build/%s  (%s)  %v", name, result.Elapsed.Round(time.Millisecond), result.Err)
+				} else {
+					cfg.Logger.Audit("OK      apt/build/%s  (%s)", name, result.Elapsed.Round(time.Millisecond))
+				}
 			}
 		}
 	}
@@ -254,6 +275,7 @@ func BuildApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 // <build-root>/apt-repo/. The .deb must already exist (produced by FetchApt
 // for apt-get entries, or by BuildApt for source-build entries).
 func PackageApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
+	ctx := context.Background()
 	summary := &Summary{}
 	d := buildDirs(cfg.rootFor(manifest.TypeApt))
 
@@ -267,63 +289,72 @@ func PackageApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 		return summary
 	}
 
-	for _, entry := range store.Apt {
-		if entryFilter != "" && entry.Name != entryFilter {
-			continue
-		}
-		if entry.Frozen {
-			cfg.logf("  [apt] %s: SKIPPED (frozen)", entry.Name)
+	for _, name := range store.ListPackages(manifest.TypeApt) {
+		if entryFilter != "" && name != entryFilter {
 			continue
 		}
 
-		start := time.Now()
-		result := Result{Type: manifest.TypeApt, Name: entry.Name}
-		out := cfg.entryWriter(manifest.TypeApt, entry.Name)
-
-		_, _ = fmt.Fprintf(out, "\n>>> [apt] package %s\n", entry.Name)
-
-		debFile, err := locateDebFile(d, entry)
-		if err != nil {
-			result.Err = err
-			_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
-			summary.Failures++
-			result.Elapsed = time.Since(start)
-			summary.Results = append(summary.Results, result)
-			summary.Total++
+		pm, err := store.GetPackage(ctx, manifest.TypeApt, name)
+		if err != nil || pm == nil {
+			cfg.logf("  [apt] %s: ERROR loading package: %v", name, err)
 			continue
 		}
 
-		fi, err := os.Stat(debFile)
-		if err != nil {
-			result.Err = fmt.Errorf("stat deb file: %w", err)
-			_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
-			summary.Failures++
-			result.Elapsed = time.Since(start)
-			summary.Results = append(summary.Results, result)
-			summary.Total++
-			continue
-		}
-		_, _ = fmt.Fprintf(out, "    Package: %s (%s)\n", filepath.Base(debFile), humanBytes(fi.Size()))
+		for _, ve := range pm.Versions {
+			if ve.Frozen {
+				cfg.logf("  [apt] %s: SKIPPED (frozen)", name)
+				continue
+			}
 
-		_, _ = fmt.Fprintf(out, "    Adding to APT repository...\n")
-		if err := runCmd(out, "", "reprepro", "-b", d.aptRepo, "includedeb", "noble", debFile); err != nil {
-			result.Err = fmt.Errorf("reprepro includedeb: %w", err)
-			_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
-			summary.Failures++
-		} else {
-			result.Artifacts = []string{debFile}
-		}
+			start := time.Now()
+			result := Result{Type: manifest.TypeApt, Name: name}
+			out := cfg.entryWriter(manifest.TypeApt, name)
 
-		result.Elapsed = time.Since(start)
-		summary.Results = append(summary.Results, result)
-		summary.Total++
-		_, _ = fmt.Fprintf(out, "    Done (%s)\n", result.Elapsed.Round(time.Millisecond))
+			_, _ = fmt.Fprintf(out, "\n>>> [apt] package %s\n", name)
 
-		if cfg.Logger != nil {
-			if result.Err != nil {
-				cfg.Logger.Audit("FAILED  apt/package/%s  (%s)  %v", entry.Name, result.Elapsed.Round(time.Millisecond), result.Err)
+			debFile, err := locateDebFile(d, name, ve)
+			if err != nil {
+				result.Err = err
+				_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
+				summary.Failures++
+				result.Elapsed = time.Since(start)
+				summary.Results = append(summary.Results, result)
+				summary.Total++
+				continue
+			}
+
+			fi, err := os.Stat(debFile)
+			if err != nil {
+				result.Err = fmt.Errorf("stat deb file: %w", err)
+				_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
+				summary.Failures++
+				result.Elapsed = time.Since(start)
+				summary.Results = append(summary.Results, result)
+				summary.Total++
+				continue
+			}
+			_, _ = fmt.Fprintf(out, "    Package: %s (%s)\n", filepath.Base(debFile), humanBytes(fi.Size()))
+
+			_, _ = fmt.Fprintf(out, "    Adding to APT repository...\n")
+			if err := runCmd(out, "", "reprepro", "-b", d.aptRepo, "includedeb", "noble", debFile); err != nil {
+				result.Err = fmt.Errorf("reprepro includedeb: %w", err)
+				_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
+				summary.Failures++
 			} else {
-				cfg.Logger.Audit("OK      apt/package/%s  (%s)", entry.Name, result.Elapsed.Round(time.Millisecond))
+				result.Artifacts = []string{debFile}
+			}
+
+			result.Elapsed = time.Since(start)
+			summary.Results = append(summary.Results, result)
+			summary.Total++
+			_, _ = fmt.Fprintf(out, "    Done (%s)\n", result.Elapsed.Round(time.Millisecond))
+
+			if cfg.Logger != nil {
+				if result.Err != nil {
+					cfg.Logger.Audit("FAILED  apt/package/%s  (%s)  %v", name, result.Elapsed.Round(time.Millisecond), result.Err)
+				} else {
+					cfg.Logger.Audit("OK      apt/package/%s  (%s)", name, result.Elapsed.Round(time.Millisecond))
+				}
 			}
 		}
 	}
@@ -347,22 +378,22 @@ func RunApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 	return mergeSummaries(mergeSummaries(fetchSummary, buildSummary), pkgSummary)
 }
 
-// locateDebFile returns the path of the .deb for an entry. For source-build
-// entries (entry.URL set) it looks inside the versioned clone directory using
-// deb_glob. For apt-get download entries it looks in the sources root directory
-// for <sourceName>*.deb.
-func locateDebFile(d dirs, entry manifest.AptEntry) (string, error) {
-	sourceName := entry.SourceName
+// locateDebFile returns the path of the .deb for a package version.
+// For source-build versions (ve.URL set) it looks inside the versioned clone
+// directory using deb_glob. For apt-get download versions it looks in the
+// sources root directory for <sourceName>*.deb.
+func locateDebFile(d dirs, name string, ve manifest.VersionEntry) (string, error) {
+	sourceName := ve.SourceName
 	if sourceName == "" {
-		sourceName = entry.Name
+		sourceName = name
 	}
 
-	if entry.URL != "" {
-		cloneDir := aptSourceDir(d, entry)
+	if ve.URL != "" {
+		cloneDir := aptSourceDir(d, name, ve)
 		if _, err := os.Stat(cloneDir); os.IsNotExist(err) {
 			return "", fmt.Errorf("source directory not found at %s — run 'fetch apt' and 'build apt' first", cloneDir)
 		}
-		glob := entry.DebGlob
+		glob := ve.DebGlob
 		if glob == "" {
 			glob = "*.deb"
 		}

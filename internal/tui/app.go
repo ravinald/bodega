@@ -160,18 +160,21 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cfg := m.cfg
 			s3c := m.s3client
 			return m, func() tea.Msg {
+				ctx := context.Background()
 				var store *manifest.Store
 				var err error
 				if cfg.LocalConfig || s3c == nil {
-					store, err = manifest.LoadAll(cfg.ManifestDir)
+					store = manifest.NewLocalStore(cfg.ManifestDir)
+					err = store.LoadIndex(ctx)
 				} else {
 					backend := &manifest.S3Backend{
-						Prefix: "manifests/",
-						GetFn:  s3c.GetObject,
-						PutFn:  s3c.PutBytes,
-						Label_: fmt.Sprintf("s3://%s/manifests/", cfg.Bucket),
+						Prefix:   "manifests/",
+						GetFn:    s3c.GetObject,
+						PutFn:    s3c.PutBytes,
+						Label_:   fmt.Sprintf("s3://%s/manifests/", cfg.Bucket),
 					}
-					store, err = manifest.LoadAllFromBackend(context.Background(), backend)
+					store = manifest.NewStore(backend)
+					err = store.LoadIndex(ctx)
 				}
 				if err != nil {
 					return cmdOutputMsg{err: fmt.Errorf("reload manifests: %w", err)}
@@ -207,18 +210,21 @@ func (m appModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		cfg := m.cfg
 		s3c := m.s3client
 		return m, func() tea.Msg {
+			ctx := context.Background()
 			var store *manifest.Store
 			var err error
 			if cfg.LocalConfig || s3c == nil {
-				store, err = manifest.LoadAll(cfg.ManifestDir)
+				store = manifest.NewLocalStore(cfg.ManifestDir)
+				err = store.LoadIndex(ctx)
 			} else {
 				backend := &manifest.S3Backend{
-					Prefix: "manifests/",
-					GetFn:  s3c.GetObject,
-					PutFn:  s3c.PutBytes,
-					Label_: fmt.Sprintf("s3://%s/manifests/", cfg.Bucket),
+					Prefix:   "manifests/",
+					GetFn:    s3c.GetObject,
+					PutFn:    s3c.PutBytes,
+					Label_:   fmt.Sprintf("s3://%s/manifests/", cfg.Bucket),
 				}
-				store, err = manifest.LoadAllFromBackend(context.Background(), backend)
+				store = manifest.NewStore(backend)
+				err = store.LoadIndex(ctx)
 			}
 			if err != nil {
 				return cmdOutputMsg{err: fmt.Errorf("reload manifests: %w", err)}
@@ -875,48 +881,42 @@ func fieldValue(fields []formField, key string) string {
 
 // buildEditFields constructs a pre-populated form field slice from a tree node.
 func buildEditFields(store *manifest.Store, node *TreeNode) []formField {
+	ctx := context.Background()
+	pm, err := store.GetPackage(ctx, node.EntryType, node.Name)
+	if err != nil || pm == nil || len(pm.Versions) == 0 {
+		return []formField{{Label: "Name", Value: node.Name}}
+	}
+	ve := pm.Versions[0]
 	switch node.EntryType {
 	case manifest.TypeApt:
-		e := store.FindApt(node.Name)
-		if e == nil {
-			return []formField{{Label: "Name", Value: node.Name}}
-		}
 		return []formField{
-			{Label: "Name", Value: e.Name},
-			{Label: "Version", Value: e.Version},
-			{Label: "URL", Value: e.URL},
-			{Label: "BuildCmd", Value: e.BuildCmd},
+			{Label: "Name", Value: pm.Name},
+			{Label: "Version", Value: ve.Version},
+			{Label: "URL", Value: ve.URL},
+			{Label: "BuildCmd", Value: ve.BuildCmd},
 			{Label: "Validate source", Checkbox: true, Value: "yes"},
 		}
 	case manifest.TypeGit:
-		e := store.FindGit(node.Name)
-		if e == nil {
-			return []formField{{Label: "Name", Value: node.Name}}
-		}
 		return []formField{
-			{Label: "Name", Value: e.Name},
-			{Label: "Ref", Value: e.Ref},
-			{Label: "URL", Value: e.URL},
+			{Label: "Name", Value: pm.Name},
+			{Label: "Ref", Value: ve.Ref},
+			{Label: "URL", Value: ve.URL},
 			{Label: "Validate source", Checkbox: true, Value: "yes"},
 		}
 	case manifest.TypeBinary:
-		e := store.FindBinary(node.Name)
-		if e == nil {
-			return []formField{{Label: "Name", Value: node.Name}}
-		}
 		fields := []formField{
-			{Label: "Name", Value: e.Name},
-			{Label: "Version", Value: e.Version},
-			{Label: "URL", Value: e.URL},
+			{Label: "Name", Value: pm.Name},
+			{Label: "Version", Value: ve.Version},
+			{Label: "URL", Value: ve.URL},
 		}
-		if e.Filename != "" {
-			fields = append(fields, formField{Label: "Filename", Value: e.Filename})
+		if ve.Filename != "" {
+			fields = append(fields, formField{Label: "Filename", Value: ve.Filename})
 		}
 		fields = append(fields, formField{Label: "Validate source", Checkbox: true, Value: "yes"})
 		return fields
 	case manifest.TypePypi:
 		return []formField{
-			{Label: "Version", Value: store.Pypi.Version},
+			{Label: "Name", Value: pm.Name},
 			{Label: "Validate source", Checkbox: true, Value: "yes"},
 		}
 	}
@@ -993,24 +993,9 @@ func (m *appModel) buildCreatePopup() popupModel {
 		}
 		entryType := fieldValueFromSlice(fields, "Type")
 		name := fieldValueFromSlice(fields, "Name")
-		var exists bool
-		switch entryType {
-		case manifest.TypeApt:
-			exists = store.FindApt(name) != nil
-		case manifest.TypeGit:
-			exists = store.FindGit(name) != nil
-		case manifest.TypeBinary:
-			exists = store.FindBinary(name) != nil
-		case manifest.TypeGomod:
-			exists = store.FindGomod(name) != nil
-		case manifest.TypeHelm:
-			exists = store.FindHelm(name) != nil
-		case manifest.TypeNpm:
-			exists = store.FindNpm(name) != nil
-		case manifest.TypePypi:
-			exists = store.FindPypiPackage(name) != nil
-		}
-		if exists {
+		ctx := context.Background()
+		pm, _ := store.GetPackage(ctx, entryType, name)
+		if pm != nil {
 			return fmt.Sprintf("%s/%s already exists", entryType, name)
 		}
 		return ""
@@ -1480,45 +1465,26 @@ func validateURLReachable(url string) string {
 	return ""
 }
 
-// toggleHidden flips the Hidden flag on a manifest entry and saves.
+// toggleHidden flips the Hidden flag on all versions of a manifest entry and saves.
 func toggleHidden(store *manifest.Store, entryType, name string) {
-	switch entryType {
-	case manifest.TypeApt:
-		if e := store.FindApt(name); e != nil {
-			e.Hidden = !e.Hidden
-			_ = store.SaveApt()
-		}
-	case manifest.TypeGit:
-		if e := store.FindGit(name); e != nil {
-			e.Hidden = !e.Hidden
-			_ = store.SaveGit()
-		}
-	case manifest.TypePypi:
-		if e := store.FindPypiPackage(name); e != nil {
-			e.Hidden = !e.Hidden
-			_ = store.SavePypi()
-		}
-	case manifest.TypeBinary:
-		if e := store.FindBinary(name); e != nil {
-			e.Hidden = !e.Hidden
-			_ = store.SaveBinary()
-		}
-	case manifest.TypeGomod:
-		if e := store.FindGomod(name); e != nil {
-			e.Hidden = !e.Hidden
-			_ = store.SaveGomod()
-		}
-	case manifest.TypeHelm:
-		if e := store.FindHelm(name); e != nil {
-			e.Hidden = !e.Hidden
-			_ = store.SaveHelm()
-		}
-	case manifest.TypeNpm:
-		if e := store.FindNpm(name); e != nil {
-			e.Hidden = !e.Hidden
-			_ = store.SaveNpm()
+	ctx := context.Background()
+	pm, err := store.GetPackage(ctx, entryType, name)
+	if err != nil || pm == nil {
+		return
+	}
+	// Determine new state: if all hidden, unhide; otherwise hide all.
+	allHidden := len(pm.Versions) > 0
+	for _, ve := range pm.Versions {
+		if !ve.Hidden {
+			allHidden = false
+			break
 		}
 	}
+	newState := !allHidden
+	for i := range pm.Versions {
+		pm.Versions[i].Hidden = newState
+	}
+	_ = store.SavePackage(ctx, pm)
 }
 
 // constraintToManifest maps the form dropdown value to a manifest constant.
@@ -1536,9 +1502,10 @@ func constraintToManifest(formVal string) string {
 	}
 }
 
-// saveCreateEntry builds the appropriate manifest entry from fields and appends
-// it to the store, then persists the manifest to disk.
+// saveCreateEntry builds the appropriate manifest VersionEntry from fields and
+// adds it to the store via AddVersion, then persists the index.
 func saveCreateEntry(store *manifest.Store, fields []formField) error {
+	ctx := context.Background()
 	entryType := fieldValueFromSlice(fields, "Type")
 	name := fieldValueFromSlice(fields, "Name")
 	if name == "" {
@@ -1553,7 +1520,6 @@ func saveCreateEntry(store *manifest.Store, fields []formField) error {
 		}
 	}
 
-	frozen := false // set post-creation via F key
 	version := fieldValueFromSlice(fields, "Version")
 	constraint := constraintToManifest(labelSelectValue(fields, "Version"))
 	mode := fieldValueFromSlice(fields, "Mode")
@@ -1561,31 +1527,24 @@ func saveCreateEntry(store *manifest.Store, fields []formField) error {
 		mode = "" // omit default
 	}
 
+	ve := manifest.VersionEntry{
+		Version:           version,
+		URL:               fieldValueFromSlice(fields, "URL"),
+		Mode:              mode,
+		VersionConstraint: constraint,
+		Checksum:          chksum,
+	}
+
 	switch entryType {
 	case manifest.TypeApt:
-		entry := manifest.AptEntry{
-			Name:              name,
-			Version:           version,
-			URL:               fieldValueFromSlice(fields, "URL"),
-			SourceName:        fieldValueFromSlice(fields, "Source Name"),
-			BuildCmd:          fieldValueFromSlice(fields, "Build Cmd"),
-			DebGlob:           fieldValueFromSlice(fields, "Deb Glob"),
-			Checksum:          chksum,
-			VersionConstraint: constraint,
-			Frozen:            frozen,
-		}
-		store.Apt = append(store.Apt, entry)
-		return store.SaveApt()
+		ve.SourceName = fieldValueFromSlice(fields, "Source Name")
+		ve.BuildCmd = fieldValueFromSlice(fields, "Build Cmd")
+		ve.DebGlob = fieldValueFromSlice(fields, "Deb Glob")
 
 	case manifest.TypeGit:
-		entry := manifest.GitEntry{
-			Name:   name,
-			URL:    fieldValueFromSlice(fields, "URL"),
-			Ref:    fieldValueFromSlice(fields, "Ref"),
-			Frozen: frozen,
-		}
-		store.Git = append(store.Git, entry)
-		return store.SaveGit()
+		ve.Ref = fieldValueFromSlice(fields, "Ref")
+		ve.URL = fieldValueFromSlice(fields, "URL")
+		ve.Version = "" // git uses Ref not Version
 
 	case manifest.TypePypi:
 		var requiredBy []string
@@ -1597,155 +1556,70 @@ func saveCreateEntry(store *manifest.Store, fields []formField) error {
 				}
 			}
 		}
-		pypiMode := mode
-		if pypiMode == manifest.ModeHosted {
-			pypiMode = "" // omit default
-		}
-		entry := manifest.PypiPackage{
-			Name:              name,
-			Version:           version,
-			RequiredBy:        requiredBy,
-			Mode:              pypiMode,
-			VersionConstraint: constraint,
-			Checksum:          chksum,
-			Frozen:            frozen,
-		}
-		store.Pypi.Packages = append(store.Pypi.Packages, entry)
-		return store.SavePypi()
+		ve.RequiredBy = requiredBy
 
 	case manifest.TypeBinary:
-		entry := manifest.BinaryEntry{
-			Name:              name,
-			Version:           version,
-			URL:               fieldValueFromSlice(fields, "URL"),
-			Filename:          fieldValueFromSlice(fields, "Filename"),
-			Checksum:          chksum,
-			VersionConstraint: constraint,
-			Frozen:            frozen,
-		}
-		store.Binary = append(store.Binary, entry)
-		return store.SaveBinary()
-
-	case manifest.TypeGomod:
-		entry := manifest.GomodEntry{
-			Name:              name,
-			Version:           version,
-			URL:               fieldValueFromSlice(fields, "URL"),
-			Mode:              mode,
-			VersionConstraint: constraint,
-			Checksum:          chksum,
-			Frozen:            frozen,
-		}
-		store.Gomod = append(store.Gomod, entry)
-		return store.SaveGomod()
+		ve.Filename = fieldValueFromSlice(fields, "Filename")
 
 	case manifest.TypeHelm:
-		entry := manifest.HelmEntry{
-			Name:              name,
-			Version:           version,
-			URL:               fieldValueFromSlice(fields, "URL"),
-			AppVersion:        fieldValueFromSlice(fields, "App Version"),
-			Mode:              mode,
-			VersionConstraint: constraint,
-			Checksum:          chksum,
-			Frozen:            frozen,
-		}
-		store.Helm = append(store.Helm, entry)
-		return store.SaveHelm()
+		ve.AppVersion = fieldValueFromSlice(fields, "App Version")
 
-	case manifest.TypeNpm:
-		entry := manifest.NpmEntry{
-			Name:              name,
-			Version:           version,
-			URL:               fieldValueFromSlice(fields, "URL"),
-			Mode:              mode,
-			VersionConstraint: constraint,
-			Checksum:          chksum,
-			Frozen:            frozen,
-		}
-		store.Npm = append(store.Npm, entry)
-		return store.SaveNpm()
+	case manifest.TypeGomod, manifest.TypeNpm:
+		// nothing extra
 
 	default:
 		return fmt.Errorf("unknown entry type %q", entryType)
 	}
+
+	if err := store.AddVersion(ctx, entryType, name, ve); err != nil {
+		return err
+	}
+	return store.SaveIndex(ctx)
 }
 
 // makeJSONApplyFn returns the function passed to HandleJSONOverlayKey that
-// parses the JSON buffer and populates the form fields from it.
+// parses the JSON buffer (as a PackageManifest) and populates the form fields from it.
 func (m *appModel) makeJSONApplyFn() func(buf string) string {
 	p := &m.popup
 	return func(buf string) string {
 		entryType := fieldValueFromSlice(p.formFields, "Type")
-		switch entryType {
-		case manifest.TypeApt:
-			var e manifest.AptEntry
-			if err := json.Unmarshal([]byte(buf), &e); err != nil {
-				return "invalid JSON: " + err.Error()
+		// Parse as a PackageManifest and extract first VersionEntry.
+		var pm manifest.PackageManifest
+		if err := json.Unmarshal([]byte(buf), &pm); err != nil {
+			// Also try parsing as a plain VersionEntry map for convenience.
+			return "invalid JSON: " + err.Error()
+		}
+		p.formFields = rebuildCreateFields(entryType, p.formFields)
+		setFieldValue(p.formFields, "Name", pm.Name)
+
+		if len(pm.Versions) > 0 {
+			ve := pm.Versions[0]
+			setFieldValue(p.formFields, "Version", ve.Version)
+			setFieldValue(p.formFields, "URL", ve.URL)
+			if ve.Ref != "" {
+				setFieldValue(p.formFields, "Ref", ve.Ref)
 			}
-			p.formFields = rebuildCreateFields(entryType, p.formFields)
-			setFieldValue(p.formFields, "Name", e.Name)
-			setFieldValue(p.formFields, "Version", e.Version)
-			setFieldValue(p.formFields, "URL", e.URL)
-			setFieldValue(p.formFields, "Source Name", e.SourceName)
-			setFieldValue(p.formFields, "Build Cmd", e.BuildCmd)
-			setFieldValue(p.formFields, "Deb Glob", e.DebGlob)
-			if e.Checksum != nil {
-				setFieldValue(p.formFields, "Checksum", e.Checksum.Value)
+			if ve.Filename != "" {
+				setFieldValue(p.formFields, "Filename", ve.Filename)
 			}
-			if e.Frozen {
+			if ve.SourceName != "" {
+				setFieldValue(p.formFields, "Source Name", ve.SourceName)
+			}
+			if ve.BuildCmd != "" {
+				setFieldValue(p.formFields, "Build Cmd", ve.BuildCmd)
+			}
+			if ve.DebGlob != "" {
+				setFieldValue(p.formFields, "Deb Glob", ve.DebGlob)
+			}
+			if len(ve.RequiredBy) > 0 {
+				setFieldValue(p.formFields, "Required By", strings.Join(ve.RequiredBy, ", "))
+			}
+			if ve.Checksum != nil {
+				setFieldValue(p.formFields, "Checksum", ve.Checksum.Value)
+			}
+			if ve.Frozen {
 				setFieldValue(p.formFields, "Frozen", "yes")
 			}
-
-		case manifest.TypeGit:
-			var e manifest.GitEntry
-			if err := json.Unmarshal([]byte(buf), &e); err != nil {
-				return "invalid JSON: " + err.Error()
-			}
-			p.formFields = rebuildCreateFields(entryType, p.formFields)
-			setFieldValue(p.formFields, "Name", e.Name)
-			setFieldValue(p.formFields, "URL", e.URL)
-			setFieldValue(p.formFields, "Ref", e.Ref)
-			if e.Frozen {
-				setFieldValue(p.formFields, "Frozen", "yes")
-			}
-
-		case manifest.TypePypi:
-			var e manifest.PypiPackage
-			if err := json.Unmarshal([]byte(buf), &e); err != nil {
-				return "invalid JSON: " + err.Error()
-			}
-			p.formFields = rebuildCreateFields(entryType, p.formFields)
-			setFieldValue(p.formFields, "Name", e.Name)
-			if len(e.RequiredBy) > 0 {
-				setFieldValue(p.formFields, "Required By", strings.Join(e.RequiredBy, ", "))
-			}
-			if e.Checksum != nil {
-				setFieldValue(p.formFields, "Checksum", e.Checksum.Value)
-			}
-			if e.Frozen {
-				setFieldValue(p.formFields, "Frozen", "yes")
-			}
-
-		case manifest.TypeBinary:
-			var e manifest.BinaryEntry
-			if err := json.Unmarshal([]byte(buf), &e); err != nil {
-				return "invalid JSON: " + err.Error()
-			}
-			p.formFields = rebuildCreateFields(entryType, p.formFields)
-			setFieldValue(p.formFields, "Name", e.Name)
-			setFieldValue(p.formFields, "Version", e.Version)
-			setFieldValue(p.formFields, "URL", e.URL)
-			setFieldValue(p.formFields, "Filename", e.Filename)
-			if e.Checksum != nil {
-				setFieldValue(p.formFields, "Checksum", e.Checksum.Value)
-			}
-			if e.Frozen {
-				setFieldValue(p.formFields, "Frozen", "yes")
-			}
-
-		default:
-			return fmt.Sprintf("unknown entry type %q — set Type field first", entryType)
 		}
 		updateChecksumHint(p.formFields)
 		return ""

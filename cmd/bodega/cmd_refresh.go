@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -59,83 +60,108 @@ New versions are created as manifest records but not fetched until you run
 }
 
 func refreshEntries(store *manifest.Store, typeFilter, nameFilter string, force bool) error {
+	ctx := context.Background()
 	total := 0
 	created := 0
 
 	// PyPI
 	if typeFilter == "" || typeFilter == manifest.TypePypi {
-		for _, pkg := range store.Pypi.Packages {
-			if nameFilter != "" && !strings.EqualFold(pkg.Name, nameFilter) {
+		pypiCreated := 0
+		for _, safeName := range store.ListPackages(manifest.TypePypi) {
+			pm, err := store.GetPackage(ctx, manifest.TypePypi, safeName)
+			if err != nil || pm == nil {
 				continue
 			}
-			if pkg.VersionConstraint == "" || pkg.VersionConstraint == manifest.ConstraintExact {
-				continue // exact constraint: nothing to discover
-			}
-			fmt.Printf("  [pypi] %s: querying upstream...\n", pkg.Name)
-			versions, err := builder.DiscoverPyPIVersions(pkg.Name)
-			if err != nil {
-				fmt.Printf("  [pypi] %s: ERROR: %v\n", pkg.Name, err)
+			if nameFilter != "" && !strings.EqualFold(pm.Name, nameFilter) {
 				continue
 			}
-			filtered := builder.FilterVersions(versions, pkg.VersionConstraint, pkg.Version)
-			for _, v := range filtered {
-				if !force && pypiVersionExists(store, pkg.Name, v) {
+			for _, ve := range pm.Versions {
+				if ve.VersionConstraint == "" || ve.VersionConstraint == manifest.ConstraintExact {
 					continue
 				}
-				store.Pypi.Packages = append(store.Pypi.Packages, manifest.PypiPackage{
-					Name:              pkg.Name,
-					Version:           v,
-					Mode:              pkg.Mode,
-					VersionConstraint: manifest.ConstraintExact,
-					RequiredBy:        pkg.RequiredBy,
-				})
-				fmt.Printf("  [pypi] %s: added version %s\n", pkg.Name, v)
-				created++
+				fmt.Printf("  [pypi] %s: querying upstream...\n", pm.Name)
+				versions, err := builder.DiscoverPyPIVersions(pm.Name)
+				if err != nil {
+					fmt.Printf("  [pypi] %s: ERROR: %v\n", pm.Name, err)
+					continue
+				}
+				filtered := builder.FilterVersions(versions, ve.VersionConstraint, ve.Version)
+				for _, v := range filtered {
+					newVE := manifest.VersionEntry{
+						Version:           v,
+						Mode:              ve.Mode,
+						VersionConstraint: manifest.ConstraintExact,
+						RequiredBy:        ve.RequiredBy,
+					}
+					if !force {
+						existing, _ := store.FindVersion(ctx, manifest.TypePypi, pm.Name, v)
+						if existing != nil {
+							continue
+						}
+					}
+					if err := store.AddVersion(ctx, manifest.TypePypi, pm.Name, newVE); err != nil {
+						continue
+					}
+					fmt.Printf("  [pypi] %s: added version %s\n", pm.Name, v)
+					pypiCreated++
+				}
+				total += len(filtered)
 			}
-			total += len(filtered)
 		}
-		if created > 0 {
-			if err := store.SavePypi(); err != nil {
+		if pypiCreated > 0 {
+			if err := store.SaveIndex(ctx); err != nil {
 				return fmt.Errorf("save pypi: %w", err)
 			}
 		}
+		created += pypiCreated
 	}
 
 	// Gomod
-	gomodCreated := 0
 	if typeFilter == "" || typeFilter == manifest.TypeGomod {
-		for _, entry := range store.Gomod {
-			if nameFilter != "" && entry.Name != nameFilter {
+		gomodCreated := 0
+		for _, safeName := range store.ListPackages(manifest.TypeGomod) {
+			pm, err := store.GetPackage(ctx, manifest.TypeGomod, safeName)
+			if err != nil || pm == nil {
 				continue
 			}
-			if entry.VersionConstraint == "" || entry.VersionConstraint == manifest.ConstraintExact {
+			if nameFilter != "" && pm.Name != nameFilter {
 				continue
 			}
-			fmt.Printf("  [gomod] %s: querying upstream...\n", entry.Name)
-			versions, err := builder.DiscoverGomodVersions(entry.Name)
-			if err != nil {
-				fmt.Printf("  [gomod] %s: ERROR: %v\n", entry.Name, err)
-				continue
-			}
-			filtered := builder.FilterVersions(versions, entry.VersionConstraint, entry.Version)
-			for _, v := range filtered {
-				if !force && gomodVersionExists(store, entry.Name, v) {
+			for _, ve := range pm.Versions {
+				if ve.VersionConstraint == "" || ve.VersionConstraint == manifest.ConstraintExact {
 					continue
 				}
-				store.Gomod = append(store.Gomod, manifest.GomodEntry{
-					Name:              entry.Name,
-					Version:           v,
-					URL:               entry.URL,
-					Mode:              entry.Mode,
-					VersionConstraint: manifest.ConstraintExact,
-				})
-				fmt.Printf("  [gomod] %s: added version %s\n", entry.Name, v)
-				gomodCreated++
+				fmt.Printf("  [gomod] %s: querying upstream...\n", pm.Name)
+				versions, err := builder.DiscoverGomodVersions(pm.Name)
+				if err != nil {
+					fmt.Printf("  [gomod] %s: ERROR: %v\n", pm.Name, err)
+					continue
+				}
+				filtered := builder.FilterVersions(versions, ve.VersionConstraint, ve.Version)
+				for _, v := range filtered {
+					newVE := manifest.VersionEntry{
+						Version:           v,
+						URL:               ve.URL,
+						Mode:              ve.Mode,
+						VersionConstraint: manifest.ConstraintExact,
+					}
+					if !force {
+						existing, _ := store.FindVersion(ctx, manifest.TypeGomod, pm.Name, v)
+						if existing != nil {
+							continue
+						}
+					}
+					if err := store.AddVersion(ctx, manifest.TypeGomod, pm.Name, newVE); err != nil {
+						continue
+					}
+					fmt.Printf("  [gomod] %s: added version %s\n", pm.Name, v)
+					gomodCreated++
+				}
+				total += len(filtered)
 			}
-			total += len(filtered)
 		}
 		if gomodCreated > 0 {
-			if err := store.SaveGomod(); err != nil {
+			if err := store.SaveIndex(ctx); err != nil {
 				return fmt.Errorf("save gomod: %w", err)
 			}
 		}
@@ -143,40 +169,51 @@ func refreshEntries(store *manifest.Store, typeFilter, nameFilter string, force 
 	}
 
 	// Npm
-	npmCreated := 0
 	if typeFilter == "" || typeFilter == manifest.TypeNpm {
-		for _, entry := range store.Npm {
-			if nameFilter != "" && entry.Name != nameFilter {
+		npmCreated := 0
+		for _, safeName := range store.ListPackages(manifest.TypeNpm) {
+			pm, err := store.GetPackage(ctx, manifest.TypeNpm, safeName)
+			if err != nil || pm == nil {
 				continue
 			}
-			if entry.VersionConstraint == "" || entry.VersionConstraint == manifest.ConstraintExact {
+			if nameFilter != "" && pm.Name != nameFilter {
 				continue
 			}
-			fmt.Printf("  [npm] %s: querying upstream...\n", entry.Name)
-			versions, err := builder.DiscoverNpmVersions(entry.Name)
-			if err != nil {
-				fmt.Printf("  [npm] %s: ERROR: %v\n", entry.Name, err)
-				continue
-			}
-			filtered := builder.FilterVersions(versions, entry.VersionConstraint, entry.Version)
-			for _, v := range filtered {
-				if !force && npmVersionExists(store, entry.Name, v) {
+			for _, ve := range pm.Versions {
+				if ve.VersionConstraint == "" || ve.VersionConstraint == manifest.ConstraintExact {
 					continue
 				}
-				store.Npm = append(store.Npm, manifest.NpmEntry{
-					Name:              entry.Name,
-					Version:           v,
-					URL:               entry.URL,
-					Mode:              entry.Mode,
-					VersionConstraint: manifest.ConstraintExact,
-				})
-				fmt.Printf("  [npm] %s: added version %s\n", entry.Name, v)
-				npmCreated++
+				fmt.Printf("  [npm] %s: querying upstream...\n", pm.Name)
+				versions, err := builder.DiscoverNpmVersions(pm.Name)
+				if err != nil {
+					fmt.Printf("  [npm] %s: ERROR: %v\n", pm.Name, err)
+					continue
+				}
+				filtered := builder.FilterVersions(versions, ve.VersionConstraint, ve.Version)
+				for _, v := range filtered {
+					newVE := manifest.VersionEntry{
+						Version:           v,
+						URL:               ve.URL,
+						Mode:              ve.Mode,
+						VersionConstraint: manifest.ConstraintExact,
+					}
+					if !force {
+						existing, _ := store.FindVersion(ctx, manifest.TypeNpm, pm.Name, v)
+						if existing != nil {
+							continue
+						}
+					}
+					if err := store.AddVersion(ctx, manifest.TypeNpm, pm.Name, newVE); err != nil {
+						continue
+					}
+					fmt.Printf("  [npm] %s: added version %s\n", pm.Name, v)
+					npmCreated++
+				}
+				total += len(filtered)
 			}
-			total += len(filtered)
 		}
 		if npmCreated > 0 {
-			if err := store.SaveNpm(); err != nil {
+			if err := store.SaveIndex(ctx); err != nil {
 				return fmt.Errorf("save npm: %w", err)
 			}
 		}
@@ -184,107 +221,60 @@ func refreshEntries(store *manifest.Store, typeFilter, nameFilter string, force 
 	}
 
 	// Helm
-	helmCreated := 0
 	if typeFilter == "" || typeFilter == manifest.TypeHelm {
-		for _, entry := range store.Helm {
-			if nameFilter != "" && entry.Name != nameFilter {
+		helmCreated := 0
+		for _, safeName := range store.ListPackages(manifest.TypeHelm) {
+			pm, err := store.GetPackage(ctx, manifest.TypeHelm, safeName)
+			if err != nil || pm == nil {
 				continue
 			}
-			if entry.VersionConstraint == "" || entry.VersionConstraint == manifest.ConstraintExact {
+			if nameFilter != "" && pm.Name != nameFilter {
 				continue
 			}
-			if entry.URL == "" {
-				continue
-			}
-			fmt.Printf("  [helm] %s: querying upstream...\n", entry.Name)
-			versions, err := builder.DiscoverHelmVersions(entry.Name, entry.URL)
-			if err != nil {
-				fmt.Printf("  [helm] %s: ERROR: %v\n", entry.Name, err)
-				continue
-			}
-			filtered := builder.FilterVersions(versions, entry.VersionConstraint, entry.Version)
-			for _, v := range filtered {
-				if !force && helmVersionExists(store, entry.Name, v) {
+			for _, ve := range pm.Versions {
+				if ve.VersionConstraint == "" || ve.VersionConstraint == manifest.ConstraintExact {
 					continue
 				}
-				store.Helm = append(store.Helm, manifest.HelmEntry{
-					Name:              entry.Name,
-					Version:           v,
-					URL:               entry.URL,
-					Mode:              entry.Mode,
-					VersionConstraint: manifest.ConstraintExact,
-				})
-				fmt.Printf("  [helm] %s: added version %s\n", entry.Name, v)
-				helmCreated++
+				if ve.URL == "" {
+					continue
+				}
+				fmt.Printf("  [helm] %s: querying upstream...\n", pm.Name)
+				versions, err := builder.DiscoverHelmVersions(pm.Name, ve.URL)
+				if err != nil {
+					fmt.Printf("  [helm] %s: ERROR: %v\n", pm.Name, err)
+					continue
+				}
+				filtered := builder.FilterVersions(versions, ve.VersionConstraint, ve.Version)
+				for _, v := range filtered {
+					newVE := manifest.VersionEntry{
+						Version:           v,
+						URL:               ve.URL,
+						Mode:              ve.Mode,
+						VersionConstraint: manifest.ConstraintExact,
+					}
+					if !force {
+						existing, _ := store.FindVersion(ctx, manifest.TypeHelm, pm.Name, v)
+						if existing != nil {
+							continue
+						}
+					}
+					if err := store.AddVersion(ctx, manifest.TypeHelm, pm.Name, newVE); err != nil {
+						continue
+					}
+					fmt.Printf("  [helm] %s: added version %s\n", pm.Name, v)
+					helmCreated++
+				}
+				total += len(filtered)
 			}
-			total += len(filtered)
 		}
 		if helmCreated > 0 {
-			if err := store.SaveHelm(); err != nil {
+			if err := store.SaveIndex(ctx); err != nil {
 				return fmt.Errorf("save helm: %w", err)
 			}
 		}
 		created += helmCreated
 	}
 
-	// Git
-	gitCreated := 0
-	if typeFilter == "" || typeFilter == manifest.TypeGit {
-		for _, entry := range store.Git {
-			if nameFilter != "" && entry.Name != nameFilter {
-				continue
-			}
-			// Git entries with a branch ref (clone mode) don't need version discovery.
-			// Only discover for release-mode entries with non-exact constraints.
-			if !entry.IsRelease() {
-				continue
-			}
-			// For git, VersionConstraint is on the entry too (reusing the field).
-			// Skip exact-only entries.
-			constraint := entry.Ref // base ref for filtering
-			_ = constraint
-			// Git doesn't have VersionConstraint field, so skip for now.
-			// Future: could discover tags matching a pattern.
-		}
-		_ = gitCreated
-	}
-
 	fmt.Printf("\nRefresh complete: %d versions discovered, %d new records created.\n", total, created)
 	return nil
-}
-
-func pypiVersionExists(store *manifest.Store, name, version string) bool {
-	for _, p := range store.Pypi.Packages {
-		if strings.EqualFold(p.Name, name) && p.Version == version {
-			return true
-		}
-	}
-	return false
-}
-
-func gomodVersionExists(store *manifest.Store, name, version string) bool {
-	for _, e := range store.Gomod {
-		if e.Name == name && e.Version == version {
-			return true
-		}
-	}
-	return false
-}
-
-func npmVersionExists(store *manifest.Store, name, version string) bool {
-	for _, e := range store.Npm {
-		if e.Name == name && e.Version == version {
-			return true
-		}
-	}
-	return false
-}
-
-func helmVersionExists(store *manifest.Store, name, version string) bool {
-	for _, e := range store.Helm {
-		if e.Name == name && e.Version == version {
-			return true
-		}
-	}
-	return false
 }

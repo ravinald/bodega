@@ -166,28 +166,31 @@ func loadStore(gf *globalFlags) (*manifest.Store, error) {
 
 	ctx := backgroundCtx()
 
+	var store *manifest.Store
 	if cfg.LocalConfig {
-		backend := &manifest.LocalBackend{Dir: cfg.ManifestDir}
-		return manifest.LoadAllFromBackend(ctx, backend)
+		store = manifest.NewLocalStore(cfg.ManifestDir)
+	} else {
+		// S3 backend — need bucket
+		if err := requireBucket(cfg); err != nil {
+			return nil, err
+		}
+		s3client, err := newS3Client(cfg)
+		if err != nil {
+			return nil, err
+		}
+		backend := &manifest.S3Backend{
+			Prefix: "manifests/",
+			GetFn:  s3client.GetObject,
+			PutFn:  s3client.PutBytes,
+			Label_: fmt.Sprintf("s3://%s/manifests/", cfg.Bucket),
+		}
+		store = manifest.NewStore(backend)
 	}
 
-	// S3 backend — need bucket
-	if err := requireBucket(cfg); err != nil {
-		return nil, err
+	if err := store.LoadIndex(ctx); err != nil {
+		return nil, fmt.Errorf("load index: %w", err)
 	}
-
-	s3client, err := newS3Client(cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	backend := &manifest.S3Backend{
-		Prefix: "manifests/",
-		GetFn:  s3client.GetObject,
-		PutFn:  s3client.PutBytes,
-		Label_: fmt.Sprintf("s3://%s/manifests/", cfg.Bucket),
-	}
-	return manifest.LoadAllFromBackend(ctx, backend)
+	return store, nil
 }
 
 // requireBucket returns an error when cfg.Bucket is empty.

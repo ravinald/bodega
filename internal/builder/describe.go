@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -129,72 +130,34 @@ func fetchHelmDescription(name, url string) string {
 	return ""
 }
 
-// DiscoverDescriptions fetches descriptions for all entries that don't have one yet.
-// Called after fetch or on demand. Logs progress to out.
+// DiscoverDescriptions fetches descriptions for all packages that don't have
+// one yet. Called after fetch or on demand.
 func DiscoverDescriptions(store *manifest.Store, out io.Writer) {
-	for i := range store.Git {
-		e := &store.Git[i]
-		if e.Description == "" {
-			if desc := FetchDescription(manifest.TypeGit, e.Name, e.URL); desc != "" {
-				e.Description = desc
-				fmt.Fprintf(out, "  [describe] git/%s: %s\n", e.Name, desc)
-			}
-		}
-	}
-	_ = store.SaveGit()
+	ctx := context.Background()
 
-	for i := range store.Pypi.Packages {
-		p := &store.Pypi.Packages[i]
-		if p.Description == "" {
-			if desc := FetchDescription(manifest.TypePypi, p.Name, ""); desc != "" {
-				p.Description = desc
-				fmt.Fprintf(out, "  [describe] pypi/%s: %s\n", p.Name, desc)
+	for _, typ := range manifest.AllTypes {
+		for _, name := range store.ListPackages(typ) {
+			pm, err := store.GetPackage(ctx, typ, name)
+			if err != nil || pm == nil || pm.Description != "" {
+				continue
 			}
-		}
-	}
-	_ = store.SavePypi()
 
-	for i := range store.Binary {
-		e := &store.Binary[i]
-		if e.Description == "" {
-			if desc := FetchDescription(manifest.TypeBinary, e.Name, e.URL); desc != "" {
-				e.Description = desc
-				fmt.Fprintf(out, "  [describe] binary/%s: %s\n", e.Name, desc)
+			// Find a URL from the first version entry to pass to FetchDescription.
+			url := ""
+			for _, ve := range pm.Versions {
+				if ve.URL != "" {
+					url = ve.URL
+					break
+				}
 			}
-		}
-	}
-	_ = store.SaveBinary()
 
-	for i := range store.Gomod {
-		e := &store.Gomod[i]
-		if e.Description == "" {
-			if desc := FetchDescription(manifest.TypeGomod, e.Name, e.URL); desc != "" {
-				e.Description = desc
-				fmt.Fprintf(out, "  [describe] gomod/%s: %s\n", e.Name, desc)
+			desc := FetchDescription(typ, name, url)
+			if desc != "" {
+				pm.Description = desc
+				if err := store.SavePackage(ctx, pm); err == nil {
+					fmt.Fprintf(out, "  [describe] %s/%s: %s\n", typ, name, desc)
+				}
 			}
 		}
 	}
-	_ = store.SaveGomod()
-
-	for i := range store.Helm {
-		e := &store.Helm[i]
-		if e.Description == "" {
-			if desc := FetchDescription(manifest.TypeHelm, e.Name, e.URL); desc != "" {
-				e.Description = desc
-				fmt.Fprintf(out, "  [describe] helm/%s: %s\n", e.Name, desc)
-			}
-		}
-	}
-	_ = store.SaveHelm()
-
-	for i := range store.Npm {
-		e := &store.Npm[i]
-		if e.Description == "" {
-			if desc := FetchDescription(manifest.TypeNpm, e.Name, e.URL); desc != "" {
-				e.Description = desc
-				fmt.Fprintf(out, "  [describe] npm/%s: %s\n", e.Name, desc)
-			}
-		}
-	}
-	_ = store.SaveNpm()
 }

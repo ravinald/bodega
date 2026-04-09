@@ -285,8 +285,8 @@ func (s *Server) handlePypiIndex(w http.ResponseWriter, r *http.Request) {
 	// Filter out hidden packages.
 	var visible []string
 	for _, n := range names {
-		pkg := s.store.FindPypiPackage(n)
-		if pkg != nil && pkg.Hidden {
+		pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, n)
+		if pkg != nil && isPackageHidden(pkg) {
 			continue
 		}
 		visible = append(visible, n)
@@ -307,7 +307,7 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 	}
 	pkgName := r.PathValue("package")
 	// Check if package is hidden.
-	if pkg := s.store.FindPypiPackage(pkgName); pkg != nil && pkg.Hidden {
+	if pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, pkgName); pkg != nil && isPackageHidden(pkg) {
 		http.NotFound(w, r)
 		return
 	}
@@ -336,8 +336,8 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 
 	if len(wheels) == 0 {
 		// Check if this package is in proxy mode.
-		pkg := s.store.FindPypiPackage(pkgName)
-		if pkg != nil && pkg.Mode == manifest.ModeProxy {
+		pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, pkgName)
+		if pkg != nil && packageMode(pkg) == manifest.ModeProxy {
 			// Proxy the simple index from upstream PyPI.
 			upstream := "https://pypi.org/simple/" + normalized + "/"
 			s.proxyOrCache(w, r, "pypi/simple/"+normalized+"/index.html", upstream, false, true)
@@ -366,8 +366,8 @@ func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
 	// Extract package name from wheel filename (e.g. "boto3-1.26.0-py3-none-any.whl" → "boto3").
 	dist := wheelDistName(file)
 	if dist != "" {
-		pkg := s.store.FindPypiPackage(dist)
-		if pkg != nil && pkg.Mode == manifest.ModeProxy {
+		pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, dist)
+		if pkg != nil && packageMode(pkg) == manifest.ModeProxy {
 			upstream := "https://pypi.org/packages/" + file
 			s.proxyOrCache(w, r, key, upstream, true, true)
 			return
@@ -400,106 +400,61 @@ func (s *Server) handleBinary(w http.ResponseWriter, r *http.Request) {
 
 // packagesResponse is the JSON envelope for /api/v1/packages.
 type packagesResponse struct {
-	Apt    []manifest.AptEntry    `json:"apt"`
-	Git    []manifest.GitEntry    `json:"git"`
-	Pypi   manifest.PypiManifest  `json:"pypi"`
-	Binary []manifest.BinaryEntry `json:"binary"`
-	Gomod  []manifest.GomodEntry  `json:"gomod"`
-	Helm   []manifest.HelmEntry   `json:"helm"`
-	Npm    []manifest.NpmEntry    `json:"npm"`
+	Apt    []*manifest.PackageManifest `json:"apt"`
+	Git    []*manifest.PackageManifest `json:"git"`
+	Pypi   []*manifest.PackageManifest `json:"pypi"`
+	Binary []*manifest.PackageManifest `json:"binary"`
+	Gomod  []*manifest.PackageManifest `json:"gomod"`
+	Helm   []*manifest.PackageManifest `json:"helm"`
+	Npm    []*manifest.PackageManifest `json:"npm"`
 }
 
 func (s *Server) handleAPIPackages(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	resp := packagesResponse{
-		Apt:    s.store.Apt,
-		Git:    s.store.Git,
-		Pypi:   s.store.Pypi,
-		Binary: s.store.Binary,
-		Gomod:  s.store.Gomod,
-		Helm:   s.store.Helm,
-		Npm:    s.store.Npm,
+		Apt:    loadAllPackages(ctx, s.store, manifest.TypeApt),
+		Git:    loadAllPackages(ctx, s.store, manifest.TypeGit),
+		Pypi:   loadAllPackages(ctx, s.store, manifest.TypePypi),
+		Binary: loadAllPackages(ctx, s.store, manifest.TypeBinary),
+		Gomod:  loadAllPackages(ctx, s.store, manifest.TypeGomod),
+		Helm:   loadAllPackages(ctx, s.store, manifest.TypeHelm),
+		Npm:    loadAllPackages(ctx, s.store, manifest.TypeNpm),
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleAPIPackagesByType(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	t := r.PathValue("type")
 	switch t {
-	case manifest.TypeApt:
-		writeJSON(w, http.StatusOK, s.store.Apt)
-	case manifest.TypeGit:
-		writeJSON(w, http.StatusOK, s.store.Git)
-	case manifest.TypePypi:
-		writeJSON(w, http.StatusOK, s.store.Pypi)
-	case manifest.TypeBinary:
-		writeJSON(w, http.StatusOK, s.store.Binary)
-	case manifest.TypeGomod:
-		writeJSON(w, http.StatusOK, s.store.Gomod)
-	case manifest.TypeHelm:
-		writeJSON(w, http.StatusOK, s.store.Helm)
-	case manifest.TypeNpm:
-		writeJSON(w, http.StatusOK, s.store.Npm)
+	case manifest.TypeApt, manifest.TypeGit, manifest.TypePypi, manifest.TypeBinary,
+		manifest.TypeGomod, manifest.TypeHelm, manifest.TypeNpm:
+		writeJSON(w, http.StatusOK, loadAllPackages(ctx, s.store, t))
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{
-			"error": fmt.Sprintf("unknown type %q — must be one of: apt, git, pypi, binary", t),
+			"error": fmt.Sprintf("unknown type %q — must be one of: apt, git, pypi, binary, gomod, helm, npm", t),
 		})
 	}
 }
 
 func (s *Server) handleAPIPackage(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	t := r.PathValue("type")
 	name := r.PathValue("name")
 
 	switch t {
-	case manifest.TypeApt:
-		e := s.store.FindApt(name)
-		if e == nil {
+	case manifest.TypeApt, manifest.TypeGit, manifest.TypePypi, manifest.TypeBinary,
+		manifest.TypeGomod, manifest.TypeHelm, manifest.TypeNpm:
+		pm, err := s.store.GetPackage(ctx, t, name)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		if pm == nil {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 			return
 		}
-		writeJSON(w, http.StatusOK, e)
-	case manifest.TypeGit:
-		e := s.store.FindGit(name)
-		if e == nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
-			return
-		}
-		writeJSON(w, http.StatusOK, e)
-	case manifest.TypeBinary:
-		e := s.store.FindBinary(name)
-		if e == nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
-			return
-		}
-		writeJSON(w, http.StatusOK, e)
-	case manifest.TypeGomod:
-		e := s.store.FindGomod(name)
-		if e == nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
-			return
-		}
-		writeJSON(w, http.StatusOK, e)
-	case manifest.TypeHelm:
-		e := s.store.FindHelm(name)
-		if e == nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
-			return
-		}
-		writeJSON(w, http.StatusOK, e)
-	case manifest.TypeNpm:
-		e := s.store.FindNpm(name)
-		if e == nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
-			return
-		}
-		writeJSON(w, http.StatusOK, e)
-	case manifest.TypePypi:
-		// Pypi is a single manifest; return it when name matches "pypi" or the version.
-		if name == "pypi" || name == s.store.Pypi.Version {
-			writeJSON(w, http.StatusOK, s.store.Pypi)
-			return
-		}
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		writeJSON(w, http.StatusOK, pm)
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{
 			"error": fmt.Sprintf("unknown type %q", t),
@@ -509,10 +464,10 @@ func (s *Server) handleAPIPackage(w http.ResponseWriter, r *http.Request) {
 
 // statusResponse is the JSON shape for /api/v1/status.
 type statusResponse struct {
-	Healthy    bool             `json:"healthy"`
-	EntryCount map[string]int   `json:"entry_count"`
-	S3Entries  []s3EntryStatus  `json:"s3_entries,omitempty"`
-	Error      string           `json:"error,omitempty"`
+	Healthy    bool            `json:"healthy"`
+	EntryCount map[string]int  `json:"entry_count"`
+	S3Entries  []s3EntryStatus `json:"s3_entries,omitempty"`
+	Error      string          `json:"error,omitempty"`
 }
 
 type s3EntryStatus struct {
@@ -527,13 +482,13 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 	resp := statusResponse{
 		Healthy: true,
 		EntryCount: map[string]int{
-			manifest.TypeApt:    len(s.store.Apt),
-			manifest.TypeGit:    len(s.store.Git),
-			manifest.TypePypi:   len(s.store.Pypi.Packages),
-			manifest.TypeBinary: len(s.store.Binary),
-			manifest.TypeGomod:  len(s.store.Gomod),
-			manifest.TypeHelm:   len(s.store.Helm),
-			manifest.TypeNpm:    len(s.store.Npm),
+			manifest.TypeApt:    len(s.store.ListPackages(manifest.TypeApt)),
+			manifest.TypeGit:    len(s.store.ListPackages(manifest.TypeGit)),
+			manifest.TypePypi:   len(s.store.ListPackages(manifest.TypePypi)),
+			manifest.TypeBinary: len(s.store.ListPackages(manifest.TypeBinary)),
+			manifest.TypeGomod:  len(s.store.ListPackages(manifest.TypeGomod)),
+			manifest.TypeHelm:   len(s.store.ListPackages(manifest.TypeHelm)),
+			manifest.TypeNpm:    len(s.store.ListPackages(manifest.TypeNpm)),
 		},
 	}
 
@@ -584,6 +539,7 @@ func (s *Server) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 // ---- Go module proxy -------------------------------------------------------
 
 func (s *Server) handleGomod(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	fullPath := r.PathValue("path")
 	idx := strings.Index(fullPath, "/@v/")
 	if idx < 0 {
@@ -597,22 +553,25 @@ func (s *Server) handleGomod(w http.ResponseWriter, r *http.Request) {
 	upstream := s.cfg.GomodUpstream + "/" + module + "/@v/" + file
 	immutable := file != "list" && !strings.HasSuffix(file, "latest")
 
-	entry := s.store.FindGomod(module)
-	if entry != nil && entry.Hidden {
+	pm, _ := s.store.GetPackage(ctx, manifest.TypeGomod, module)
+	if pm != nil && isPackageHidden(pm) {
 		http.NotFound(w, r)
 		return
 	}
-	forceProxy := entry != nil && entry.EffectiveMode() == manifest.ModeProxy
-	if forceProxy {
+
+	if pm != nil && packageMode(pm) == manifest.ModeProxy {
 		// Version constraint enforcement: check if the requested version is allowed.
-		if immutable && entry.VersionConstraint != "" && entry.VersionConstraint != manifest.ConstraintAny {
-			reqVersion := file
-			if dot := strings.LastIndex(file, "."); dot > 0 {
-				reqVersion = file[:dot] // "v1.30.0.info" → "v1.30.0"
-			}
-			if !versionAllowed(entry.Version, reqVersion, entry.VersionConstraint) {
-				http.Error(w, "version not allowed by constraint", http.StatusForbidden)
-				return
+		if immutable {
+			vc, ver := packageVersionConstraint(pm)
+			if vc != "" && vc != manifest.ConstraintAny {
+				reqVersion := file
+				if dot := strings.LastIndex(file, "."); dot > 0 {
+					reqVersion = file[:dot] // "v1.30.0.info" → "v1.30.0"
+				}
+				if !versionAllowed(ver, reqVersion, vc) {
+					http.Error(w, "version not allowed by constraint", http.StatusForbidden)
+					return
+				}
 			}
 		}
 		s.proxyOrCache(w, r, s3Key, upstream, immutable, true)
@@ -645,6 +604,7 @@ func (s *Server) handleHelmIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHelmChart(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	file := r.PathValue("file")
 	key := "charts/" + file
 	setCacheImmutable(w, file)
@@ -655,11 +615,16 @@ func (s *Server) handleHelmChart(w http.ResponseWriter, r *http.Request) {
 	if idx := strings.LastIndex(chartName, "-"); idx > 0 {
 		chartName = chartName[:idx]
 	}
-	entry := s.store.FindHelm(chartName)
-	if entry != nil && entry.EffectiveMode() == manifest.ModeProxy && entry.URL != "" {
-		upstream := strings.TrimSuffix(entry.URL, "/") + "/" + file
-		s.proxyOrCache(w, r, key, upstream, true, true)
-		return
+	pm, _ := s.store.GetPackage(ctx, manifest.TypeHelm, chartName)
+	if pm != nil && packageMode(pm) == manifest.ModeProxy {
+		// Use the URL from the first version that has one.
+		for _, ve := range pm.Versions {
+			if ve.URL != "" {
+				upstream := strings.TrimSuffix(ve.URL, "/") + "/" + file
+				s.proxyOrCache(w, r, key, upstream, true, true)
+				return
+			}
+		}
 	}
 	s.proxyS3(w, r, key)
 }
@@ -667,6 +632,7 @@ func (s *Server) handleHelmChart(w http.ResponseWriter, r *http.Request) {
 // ---- npm registry ----------------------------------------------------------
 
 func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	fullPath := r.PathValue("path")
 
 	// Tarball request: path contains "/-/"
@@ -676,8 +642,8 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 		key := "npm/" + pkgName + "/" + tarball
 		setCacheImmutable(w, tarball)
 
-		entry := s.store.FindNpm(pkgName)
-		if entry != nil && entry.EffectiveMode() == manifest.ModeProxy {
+		pm, _ := s.store.GetPackage(ctx, manifest.TypeNpm, pkgName)
+		if pm != nil && packageMode(pm) == manifest.ModeProxy {
 			upstream := s.cfg.NpmUpstream + "/" + pkgName + "/-/" + tarball
 			s.proxyOrCache(w, r, key, upstream, true, true)
 			return
@@ -691,161 +657,62 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 	s3Key := "npm/" + fullPath + "/packument.json"
 	w.Header().Set("Content-Type", "application/json")
 
-	entry := s.store.FindNpm(fullPath)
-	forceProxy := entry != nil && entry.EffectiveMode() == manifest.ModeProxy
+	pm, _ := s.store.GetPackage(ctx, manifest.TypeNpm, fullPath)
+	forceProxy := pm != nil && packageMode(pm) == manifest.ModeProxy
 	s.proxyOrCache(w, r, s3Key, upstream, false, forceProxy)
 }
 
 // ---- Mutation API ----------------------------------------------------------
 
 func (s *Server) handleCreateEntry(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	t := r.PathValue("type")
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// All types accept a PackageManifest with at least one VersionEntry.
 	switch t {
-	case manifest.TypeApt:
-		var entry manifest.AptEntry
-		if err := json.NewDecoder(r.Body).Decode(&entry); err != nil {
+	case manifest.TypeApt, manifest.TypeGit, manifest.TypeBinary, manifest.TypeGomod,
+		manifest.TypeHelm, manifest.TypeNpm, manifest.TypePypi:
+		var pm manifest.PackageManifest
+		if err := json.NewDecoder(r.Body).Decode(&pm); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		if entry.Name == "" {
+		if pm.Name == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
 			return
 		}
-		if s.store.FindApt(entry.Name) != nil {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "entry already exists"})
+		// Check for conflict.
+		existing, _ := s.store.GetPackage(ctx, t, pm.Name)
+		if existing != nil {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "package already exists"})
 			return
 		}
-		s.store.Apt = append(s.store.Apt, entry)
-		if err := s.store.SaveApt(); err != nil {
+		pm.Type = t
+		if err := s.store.SavePackage(ctx, &pm); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusCreated, entry)
-
-	case manifest.TypeGit:
-		var entry manifest.GitEntry
-		if err := json.NewDecoder(r.Body).Decode(&entry); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
-		}
-		if entry.Name == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
-			return
-		}
-		if s.store.FindGit(entry.Name) != nil {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "entry already exists"})
-			return
-		}
-		s.store.Git = append(s.store.Git, entry)
-		if err := s.store.SaveGit(); err != nil {
+		if err := s.store.SaveIndex(ctx); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusCreated, entry)
-
-	case manifest.TypeBinary:
-		var entry manifest.BinaryEntry
-		if err := json.NewDecoder(r.Body).Decode(&entry); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
-		}
-		if entry.Name == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
-			return
-		}
-		if s.store.FindBinary(entry.Name) != nil {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "entry already exists"})
-			return
-		}
-		s.store.Binary = append(s.store.Binary, entry)
-		if err := s.store.SaveBinary(); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-			return
-		}
-		writeJSON(w, http.StatusCreated, entry)
-
-	case manifest.TypeGomod:
-		var entry manifest.GomodEntry
-		if err := json.NewDecoder(r.Body).Decode(&entry); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
-		}
-		if entry.Name == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
-			return
-		}
-		if s.store.FindGomod(entry.Name) != nil {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "entry already exists"})
-			return
-		}
-		s.store.Gomod = append(s.store.Gomod, entry)
-		if err := s.store.SaveGomod(); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-			return
-		}
-		writeJSON(w, http.StatusCreated, entry)
-
-	case manifest.TypeHelm:
-		var entry manifest.HelmEntry
-		if err := json.NewDecoder(r.Body).Decode(&entry); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
-		}
-		if entry.Name == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
-			return
-		}
-		if s.store.FindHelm(entry.Name) != nil {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "entry already exists"})
-			return
-		}
-		s.store.Helm = append(s.store.Helm, entry)
-		if err := s.store.SaveHelm(); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-			return
-		}
-		writeJSON(w, http.StatusCreated, entry)
-
-	case manifest.TypeNpm:
-		var entry manifest.NpmEntry
-		if err := json.NewDecoder(r.Body).Decode(&entry); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
-		}
-		if entry.Name == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
-			return
-		}
-		if s.store.FindNpm(entry.Name) != nil {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "entry already exists"})
-			return
-		}
-		s.store.Npm = append(s.store.Npm, entry)
-		if err := s.store.SaveNpm(); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-			return
-		}
-		writeJSON(w, http.StatusCreated, entry)
-
-	case manifest.TypePypi:
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "pypi manifest must be edited directly"})
-
+		writeJSON(w, http.StatusCreated, &pm)
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": fmt.Sprintf("unknown type %q", t)})
 	}
 }
 
 func (s *Server) handleDeleteEntry(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	t := r.PathValue("type")
 	name := r.PathValue("name")
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	// Check frozen status.
-	frozen, findErr := s.isFrozen(t, name)
+	frozen, findErr := s.isFrozen(ctx, t, name)
 	if findErr != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": findErr.Error()})
 		return
@@ -855,29 +722,11 @@ func (s *Server) handleDeleteEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var err error
-	switch t {
-	case manifest.TypeApt:
-		err = s.store.RemoveApt(name)
-	case manifest.TypeGit:
-		err = s.store.RemoveGit(name)
-	case manifest.TypeBinary:
-		err = s.store.RemoveBinary(name)
-	case manifest.TypeGomod:
-		err = s.store.RemoveGomod(name)
-	case manifest.TypeHelm:
-		err = s.store.RemoveHelm(name)
-	case manifest.TypeNpm:
-		err = s.store.RemoveNpm(name)
-	case manifest.TypePypi:
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "pypi manifest must be edited directly"})
-		return
-	default:
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": fmt.Sprintf("unknown type %q", t)})
+	if err := s.store.DeletePackage(ctx, t, name); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-
-	if err != nil {
+	if err := s.store.SaveIndex(ctx); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -885,49 +734,25 @@ func (s *Server) handleDeleteEntry(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "type": t, "name": name})
 }
 
-// isFrozen returns whether a named entry is frozen, or an error if not found.
-func (s *Server) isFrozen(t, name string) (bool, error) {
-	switch t {
-	case manifest.TypeApt:
-		e := s.store.FindApt(name)
-		if e == nil {
-			return false, fmt.Errorf("apt entry %q not found", name)
-		}
-		return e.Frozen, nil
-	case manifest.TypeGit:
-		e := s.store.FindGit(name)
-		if e == nil {
-			return false, fmt.Errorf("git entry %q not found", name)
-		}
-		return e.Frozen, nil
-	case manifest.TypeBinary:
-		e := s.store.FindBinary(name)
-		if e == nil {
-			return false, fmt.Errorf("binary entry %q not found", name)
-		}
-		return e.Frozen, nil
-	case manifest.TypeGomod:
-		e := s.store.FindGomod(name)
-		if e == nil {
-			return false, fmt.Errorf("gomod entry %q not found", name)
-		}
-		return e.Frozen, nil
-	case manifest.TypeHelm:
-		e := s.store.FindHelm(name)
-		if e == nil {
-			return false, fmt.Errorf("helm entry %q not found", name)
-		}
-		return e.Frozen, nil
-	case manifest.TypeNpm:
-		e := s.store.FindNpm(name)
-		if e == nil {
-			return false, fmt.Errorf("npm entry %q not found", name)
-		}
-		return e.Frozen, nil
-	case manifest.TypePypi:
-		return s.store.Pypi.Frozen, nil
+// isFrozen returns whether all versions of a named package are frozen, or an error if not found.
+func (s *Server) isFrozen(ctx context.Context, t, name string) (bool, error) {
+	pm, err := s.store.GetPackage(ctx, t, name)
+	if err != nil {
+		return false, err
 	}
-	return false, fmt.Errorf("unknown type %q", t)
+	if pm == nil {
+		return false, fmt.Errorf("%s package %q not found", t, name)
+	}
+	// Consider the package frozen when all versions are frozen.
+	if len(pm.Versions) == 0 {
+		return false, nil
+	}
+	for _, ve := range pm.Versions {
+		if !ve.Frozen {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // ---- S3 proxy core ---------------------------------------------------------
@@ -1053,4 +878,52 @@ func sortStrings(ss []string) {
 		}
 		ss[j+1] = key
 	}
+}
+
+// ---- PackageManifest helpers -----------------------------------------------
+
+// loadAllPackages loads all PackageManifest entries for a given type from the store.
+func loadAllPackages(ctx context.Context, store *manifest.Store, typ string) []*manifest.PackageManifest {
+	names := store.ListPackages(typ)
+	out := make([]*manifest.PackageManifest, 0, len(names))
+	for _, name := range names {
+		pm, err := store.GetPackage(ctx, typ, name)
+		if err != nil || pm == nil {
+			continue
+		}
+		out = append(out, pm)
+	}
+	return out
+}
+
+// isPackageHidden returns true when any version of the package is marked hidden,
+// or when all versions are hidden. Uses first-version semantics for single-version packages.
+func isPackageHidden(pm *manifest.PackageManifest) bool {
+	if len(pm.Versions) == 0 {
+		return false
+	}
+	// For multi-version packages, treat as hidden only when ALL versions are hidden.
+	for _, ve := range pm.Versions {
+		if !ve.Hidden {
+			return false
+		}
+	}
+	return true
+}
+
+// packageMode returns the effective mode for a package, derived from the first version entry.
+// Defaults to ModeHosted when no versions are set.
+func packageMode(pm *manifest.PackageManifest) string {
+	for _, ve := range pm.Versions {
+		return ve.EffectiveMode()
+	}
+	return manifest.ModeHosted
+}
+
+// packageVersionConstraint returns the VersionConstraint and Version from the first version entry.
+func packageVersionConstraint(pm *manifest.PackageManifest) (constraint, version string) {
+	for _, ve := range pm.Versions {
+		return ve.VersionConstraint, ve.Version
+	}
+	return "", ""
 }
