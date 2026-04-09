@@ -19,6 +19,7 @@ import (
 	"github.com/scaleapi/bodega/internal/config"
 	"github.com/scaleapi/bodega/internal/manifest"
 	bos3 "github.com/scaleapi/bodega/internal/s3"
+	"github.com/scaleapi/bodega/internal/server"
 )
 
 // version is set at build time via -ldflags "-X main.version=..."
@@ -155,6 +156,7 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 		pkgParent,
 		auditParent,
 		newShowCmd(gf),
+		newDashboardCmd(gf),
 		newInitCmd(gf),
 		newShellCmd(gf),
 		newServeCmd(gf),
@@ -225,6 +227,18 @@ func loadStore(gf *globalFlags) (*manifest.Store, error) {
 		return nil, fmt.Errorf("load index: %w", err)
 	}
 	return store, nil
+}
+
+// notifyServer sends SIGHUP to the running bodega serve process (if any)
+// so it reloads manifests after CLI changes.
+func notifyServer(gf *globalFlags) {
+	cfg, err := loadConfig(gf)
+	if err != nil {
+		return
+	}
+	if err := server.NotifyReload(cfg.LogDir); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not notify server: %v\n", err)
+	}
 }
 
 // requireBucket returns an error when cfg.Bucket is empty.

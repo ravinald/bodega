@@ -49,6 +49,8 @@ TLS can be enabled in two ways:
 			if err != nil {
 				return err
 			}
+			// Clean up stale PID file from a previous server instance.
+			server.CleanStalePID(cfg.LogDir)
 			store, err := loadStore(gf)
 			if err != nil {
 				return fmt.Errorf("load manifests: %w", err)

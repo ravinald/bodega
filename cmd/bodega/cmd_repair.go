@@ -1,31 +1,38 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 
 	"github.com/spf13/cobra"
 
+	"github.com/scaleapi/bodega/internal/builder"
 	"github.com/scaleapi/bodega/internal/manifest"
 )
 
 func newRepairCmd(gf *globalFlags) *cobra.Command {
-	var dryRun bool
-
 	cmd := &cobra.Command{
-		Use:   "repair",
-		Short: "Detect and fix inconsistencies between local index, manifests, and S3",
-		Long: `repair scans the local index, per-package manifest files, and S3 artifacts
-to find inconsistencies:
+		Use:   "repair [check]",
+		Short: "Detect and fix inconsistencies in the manifest store",
+		Long: `repair performs several consistency checks and fixes:
 
-  - Packages in the index but missing manifest files
-  - Manifest files on disk/S3 but not in the index
-  - Artifacts in S3 but no matching manifest entry
-  - Manifest entries with no matching S3 artifact
+  1. Index consistency: packages in the index must have manifest files
+  2. Dependency linking: git entries with fetched sources should have
+     their dependencies discovered and linked
+  3. Manifest sync: all manifests are re-saved to the backend (S3)
+  4. Graph rebuild: dependency edges are rebuilt from RequiredBy fields
 
-By default, repair fixes what it can (re-syncs index, re-uploads manifests).
-Use --dry-run to only report issues without fixing them.`,
+  bodega repair                          # detect and fix
+  bodega repair check                    # detect only, no changes`,
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			dryRun := len(args) > 0 && args[0] == "check"
+			cfg, err := loadConfig(gf)
+			if err != nil {
+				return err
+			}
 			store, err := loadStore(gf)
 			if err != nil {
 				return fmt.Errorf("load store: %w", err)
@@ -34,8 +41,8 @@ Use --dry-run to only report issues without fixing them.`,
 			ctx := context.Background()
 			issues := 0
 
-			// 1. Check that every package in the index has a manifest.
-			fmt.Println("Checking index consistency...")
+			// Phase 1: Index consistency.
+			fmt.Println("Phase 1: Checking index consistency...")
 			for _, typ := range manifest.AllTypes {
 				for _, name := range store.ListPackages(typ) {
 					pm, err := store.GetPackage(ctx, typ, name)
@@ -47,10 +54,6 @@ Use --dry-run to only report issues without fixing them.`,
 					if pm == nil {
 						fmt.Printf("  MISSING: %s/%s in index but no manifest file\n", typ, name)
 						issues++
-						if !dryRun {
-							fmt.Printf("    -> removing from index\n")
-							// Would need to remove from index
-						}
 						continue
 					}
 					if len(pm.Versions) == 0 {
@@ -60,9 +63,54 @@ Use --dry-run to only report issues without fixing them.`,
 				}
 			}
 
-			// 2. Re-save all manifests to ensure they're synced to backend.
+			// Phase 2: Dependency discovery.
+			fmt.Println("\nPhase 2: Checking dependency links...")
+			bcfg := &builder.Config{
+				BuildRoot:      cfg.BuildRoot,
+				ManifestDir:    cfg.ManifestDir,
+				AutoImportDeps: true,
+			}
+			for _, name := range store.ListPackages(manifest.TypeGit) {
+				pm, err := store.GetPackage(ctx, manifest.TypeGit, name)
+				if err != nil || pm == nil {
+					continue
+				}
+				for _, ve := range pm.Versions {
+					// Check if this git entry has any dependency edges.
+					parentRef := fmt.Sprintf("git/%s@%s", name, ve.Ref)
+					children := store.ChildrenOf(parentRef)
+					if len(children) > 0 {
+						fmt.Printf("  OK: %s has %d dependency edges\n", parentRef, len(children))
+						continue
+					}
+
+					// No edges -- check if the source exists on disk.
+					worktree, wtErr := builder.GitWorktreePath(cfg.BuildRoot, name, ve.Ref)
+					if wtErr != nil || worktree == "" {
+						fmt.Printf("  SKIP: %s source not on disk (fetch first)\n", parentRef)
+						continue
+					}
+
+					fmt.Printf("  UNLINKED: %s has source but no dependency edges\n", parentRef)
+					issues++
+
+					if !dryRun {
+						fmt.Printf("    -> re-running dependency discovery...\n")
+						var buf bytes.Buffer
+						result := builder.ScanDeps(bcfg, store, name, ve, io.Writer(&buf))
+						if len(result.Deps) > 0 {
+							builder.ImportDeps(ctx, store, name, ve, result.Deps, io.Writer(&buf))
+							fmt.Printf("    -> discovered %d dependencies\n", len(result.Deps))
+						}
+						// Also discover descriptions.
+						builder.DiscoverDescriptions(store, io.Writer(&buf))
+					}
+				}
+			}
+
+			// Phase 3: Re-sync manifests to backend.
 			if !dryRun {
-				fmt.Println("\nRe-syncing manifests to backend...")
+				fmt.Println("\nPhase 3: Re-syncing manifests to backend...")
 				synced := 0
 				for _, typ := range manifest.AllTypes {
 					for _, name := range store.ListPackages(typ) {
@@ -80,7 +128,6 @@ Use --dry-run to only report issues without fixing them.`,
 				}
 				fmt.Printf("  Re-synced %d package manifests\n", synced)
 
-				// Re-save index.
 				if err := store.SaveIndex(ctx); err != nil {
 					fmt.Printf("  ERROR saving index: %v\n", err)
 					issues++
@@ -88,7 +135,6 @@ Use --dry-run to only report issues without fixing them.`,
 					fmt.Println("  Index saved")
 				}
 
-				// Re-save graph.
 				if err := store.SaveGraph(ctx); err != nil {
 					fmt.Printf("  ERROR saving graph: %v\n", err)
 					issues++
@@ -97,20 +143,23 @@ Use --dry-run to only report issues without fixing them.`,
 				}
 			}
 
+			fmt.Println()
 			if issues > 0 {
-				fmt.Printf("\n%d issue(s) found", issues)
+				fmt.Printf("%d issue(s) found", issues)
 				if dryRun {
 					fmt.Println(" (dry run, no changes made)")
 				} else {
 					fmt.Println(" (repaired)")
 				}
 			} else {
-				fmt.Println("\nNo issues found. Everything is consistent.")
+				fmt.Println("No issues found. Everything is consistent.")
+			}
+			if !dryRun {
+				notifyServer(gf)
 			}
 			return nil
 		},
 	}
 
-	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Report issues without fixing them")
 	return cmd
 }

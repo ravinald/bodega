@@ -93,6 +93,10 @@ func (s *Store) LoadIndex(ctx context.Context) error {
 	}
 	s.mu.Lock()
 	s.index = &idx
+	// Clear the package cache so stale data isn't served after index reload.
+	for k := range s.packages {
+		delete(s.packages, k)
+	}
 	s.mu.Unlock()
 	return nil
 }
@@ -447,6 +451,16 @@ func (s *Store) ChildrenOf(parent string) []DepEdge {
 		return nil
 	}
 	return childrenOf(s.graph, parent)
+}
+
+// AllEdges returns every edge in the dependency graph.
+func (s *Store) AllEdges() []DepEdge {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.graph == nil {
+		return nil
+	}
+	return s.graph.Edges
 }
 
 // Orphans returns the set of packages (as "type/name" strings) that appear as

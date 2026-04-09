@@ -105,6 +105,7 @@ Examples:
 				return fmt.Errorf("save index: %w", err)
 			}
 			fmt.Printf("Added %s entry: %s\n", t, name)
+			notifyServer(gf)
 			return nil
 		},
 	}

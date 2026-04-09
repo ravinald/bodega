@@ -78,35 +78,33 @@ What is preserved:
 
 			fmt.Println()
 
-			// Delete manifest files.
-			manifests := []string{"apt.json", "git.json", "pypi.json", "binary.json",
-				"gomod.json", "helm.json", "npm.json"}
-			for _, name := range manifests {
-				for _, ext := range []string{"", ".md5"} {
-					path := filepath.Join(cfg.ManifestDir, name+ext)
-					if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-						fmt.Fprintf(os.Stderr, "  warning: could not remove %s: %v\n", path, err)
-					}
-				}
+			// Delete local manifest directory.
+			if err := os.RemoveAll(cfg.ManifestDir); err != nil {
+				fmt.Fprintf(os.Stderr, "  warning: could not remove %s: %v\n", cfg.ManifestDir, err)
 			}
 			fmt.Println("  Local manifests cleared.")
 
-			// Clear S3 manifests if bucket is configured.
+			// Clear S3 manifests -- delete everything under manifests/ prefix.
 			if cfg.Bucket != "" {
 				ctx := context.Background()
 				s3client, err := bos3.NewClient(ctx, cfg.Bucket, cfg.Region)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "  warning: could not connect to S3: %v\n", err)
 				} else {
-					for _, name := range manifests {
-						for _, ext := range []string{"", ".md5"} {
-							key := "manifests/" + name + ext
+					keys, err := s3client.ListPrefix(ctx, "manifests/")
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "  warning: could not list S3 manifests: %v\n", err)
+					} else {
+						deleted := 0
+						for _, key := range keys {
 							if err := s3client.DeleteObject(ctx, key); err != nil {
 								fmt.Fprintf(os.Stderr, "  warning: could not delete s3://%s/%s: %v\n", cfg.Bucket, key, err)
+							} else {
+								deleted++
 							}
 						}
+						fmt.Printf("  S3 manifests cleared: %d objects deleted from s3://%s/manifests/\n", deleted, cfg.Bucket)
 					}
-					fmt.Printf("  S3 manifests cleared (s3://%s/manifests/).\n", cfg.Bucket)
 				}
 			}
 

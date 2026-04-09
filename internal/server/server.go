@@ -15,7 +15,11 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"os"
+	"os/signal"
+	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/scaleapi/bodega/internal/audit"
@@ -157,6 +161,15 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}
 
+	// Write PID file so CLI commands can signal us to reload.
+	pidPath := filepath.Join(s.cfg.LogDir, "bodega.pid")
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err == nil {
+		if err := os.WriteFile(pidPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644); err == nil {
+			s.logger.Info("PID file written", "path", pidPath)
+			defer func() { _ = os.Remove(pidPath) }()
+		}
+	}
+
 	// Start listener in a goroutine.
 	errCh := make(chan error, 1)
 	go func() {
@@ -166,6 +179,20 @@ func (s *Server) Start(ctx context.Context) error {
 		} else {
 			s.logger.Info("bodega server listening", "addr", s.addr)
 			errCh <- srv.ListenAndServe()
+		}
+	}()
+
+	// SIGHUP reloads the manifest index and clears the package cache.
+	sighupCh := make(chan os.Signal, 1)
+	signal.Notify(sighupCh, syscall.SIGHUP)
+	go func() {
+		for range sighupCh {
+			s.logger.Info("SIGHUP received, reloading manifests...")
+			if err := s.store.LoadIndex(context.Background()); err != nil {
+				s.logger.Error("reload failed", "error", err)
+			} else {
+				s.logger.Info("manifests reloaded")
+			}
 		}
 	}()
 
@@ -232,6 +259,7 @@ func (s *Server) registerRoutes() {
 	m.HandleFunc("GET /api/v1/packages/{type}/{name}", s.handleAPIPackage)
 	m.HandleFunc("GET /api/v1/status", s.handleAPIStatus)
 	m.HandleFunc("GET /api/v1/config", s.handleAPIConfig)
+	m.HandleFunc("GET /api/v1/metrics", s.handleAPIMetrics)
 
 	// Mutation API
 	m.HandleFunc("POST /api/v1/packages/{type}", s.handleCreateEntry)
@@ -533,6 +561,70 @@ func (s *Server) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 		Region:      s.cfg.Region,
 		ManifestDir: s.cfg.ManifestDir,
 	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+type metricsResponse struct {
+	Global    metricsGlobal            `json:"global"`
+	ByType    map[string]metricsType   `json:"by_type"`
+}
+
+type metricsGlobal struct {
+	Packages   int `json:"packages"`
+	Versions   int `json:"versions"`
+	S3Uploaded int `json:"s3_uploaded"`
+	S3Missing  int `json:"s3_missing"`
+	Frozen     int `json:"frozen"`
+	Hidden     int `json:"hidden"`
+	DepEdges   int `json:"dep_edges"`
+	Orphans    int `json:"orphans"`
+}
+
+type metricsType struct {
+	Packages   int `json:"packages"`
+	Versions   int `json:"versions"`
+	S3Uploaded int `json:"s3_uploaded"`
+	S3Missing  int `json:"s3_missing"`
+	Frozen     int `json:"frozen"`
+	Hidden     int `json:"hidden"`
+}
+
+func (s *Server) handleAPIMetrics(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_ = s.store.LoadIndex(ctx) // refresh
+
+	resp := metricsResponse{
+		ByType: make(map[string]metricsType),
+	}
+
+	for _, typ := range manifest.AllTypes {
+		mt := metricsType{}
+		for _, name := range s.store.ListPackages(typ) {
+			pm, err := s.store.GetPackage(ctx, typ, name)
+			if err != nil || pm == nil {
+				continue
+			}
+			mt.Packages++
+			for _, ve := range pm.Versions {
+				mt.Versions++
+				if ve.Frozen {
+					mt.Frozen++
+				}
+				if ve.Hidden {
+					mt.Hidden++
+				}
+			}
+		}
+		resp.ByType[typ] = mt
+		resp.Global.Packages += mt.Packages
+		resp.Global.Versions += mt.Versions
+		resp.Global.Frozen += mt.Frozen
+		resp.Global.Hidden += mt.Hidden
+	}
+
+	resp.Global.DepEdges = len(s.store.AllEdges())
+	resp.Global.Orphans = len(s.store.Orphans())
+
 	writeJSON(w, http.StatusOK, resp)
 }
 

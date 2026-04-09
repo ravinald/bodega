@@ -77,6 +77,7 @@ Frozen entries cannot be deleted; unfreeze them first with 'bodega freeze'.`,
 			}
 
 			fmt.Printf("Removed %s/%s from manifest.\n", t, name)
+			notifyServer(gf)
 			return nil
 		},
 	}

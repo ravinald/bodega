@@ -253,10 +253,57 @@ body {
 .copy-link:hover { color: var(--accent); background: var(--bg); }
 .copy-link.copied { color: var(--green); }
 
+/* Dashboard */
+.dash-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.dash-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  text-align: center;
+}
+.dash-card .value {
+  font-size: 24px;
+  font-weight: bold;
+  color: var(--accent);
+}
+.dash-card .label {
+  font-size: 11px;
+  color: var(--fg-dim);
+  margin-top: 4px;
+}
+.dash-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
+.dash-bar-label { width: 60px; text-align: right; color: var(--fg-dim); font-size: 12px; }
+.dash-bar-track {
+  flex: 1;
+  height: 16px;
+  background: var(--bg);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.dash-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.3s;
+}
+.dash-bar-count { width: 30px; font-size: 12px; color: var(--fg-dim); }
+.dash-section { margin-top: 16px; }
+.dash-section h3 { color: var(--fg-dim); font-size: 12px; margin-bottom: 8px; }
+
 /* Type colors */
 .type-apt { color: #ffaf00; }
 .type-git { color: #8787ff; }
-.type-pypi { color: #ffff00; }
+.type-pypi { color: #b8860b; }
 .type-binary { color: #00d787; }
 .type-gomod { color: #5fd7ff; }
 .type-helm { color: #0087ff; }
@@ -272,7 +319,7 @@ body {
 </div>
 
 <div class="tree-panel">
-  <div class="header">bodega <span id="status-text"></span></div>
+  <div class="header"><a href="#" onclick="showDashboard(); return false;" style="color:inherit;text-decoration:none">bodega</a> <span id="status-text"></span></div>
   <div class="filter-bar"><input type="text" id="filter" placeholder="/ filter..."></div>
   <div class="tree-actions">
     <button class="tree-action-btn" onclick="expandAll()" title="Expand all">&#9660; all</button>
@@ -282,7 +329,7 @@ body {
 </div>
 
 <div class="detail-panel">
-  <div id="detail" class="detail-empty">Select a package from the tree.</div>
+  <div id="detail" class="detail-empty">Loading...</div>
 </div>
 
 <script>
@@ -515,6 +562,58 @@ function getClientUrl(type, entry) {
   return '';
 }
 
+async function showDashboard() {
+  selectedKey = null;
+  render();
+  var d = document.getElementById('detail');
+  d.innerHTML = '<div class="detail-title">Dashboard</div><div class="detail-empty">Loading metrics...</div>';
+
+  try {
+    var resp = await fetch('/api/v1/metrics');
+    var m = resp.ok ? await resp.json() : null;
+    if (!m) { d.innerHTML = '<div class="detail-empty">Could not load metrics.</div>'; return; }
+
+    var g = m.global;
+    var total = g.s3_uploaded + g.s3_missing;
+    var pct = total > 0 ? Math.round(g.s3_uploaded * 100 / total) : 0;
+
+    var html = '<div class="detail-title">Dashboard</div>';
+    html += '<div class="dash-cards">';
+    html += dashCard(g.packages, 'Packages');
+    html += dashCard(g.versions, 'Versions');
+    html += dashCard(g.s3_uploaded + '/' + total, 'S3 (' + pct + '%)');
+    html += dashCard(g.frozen, 'Frozen');
+    html += dashCard(g.hidden, 'Hidden');
+    html += dashCard(g.dep_edges, 'Dependencies');
+    html += dashCard(g.orphans, 'Orphans');
+    html += '</div>';
+
+    // Per-type bar chart.
+    html += '<div class="dash-section"><h3>Packages by Type</h3>';
+    var maxPkg = 0;
+    for (var t in m.by_type) { if (m.by_type[t].packages > maxPkg) maxPkg = m.by_type[t].packages; }
+    var barColors = {apt:'#ffaf00', git:'#8787ff', pypi:'#b8860b', binary:'#00d787', gomod:'#5fd7ff', helm:'#0087ff', npm:'#ff005f'};
+    for (var t of typeOrder) {
+      var bt = m.by_type[t] || {packages:0};
+      var w = maxPkg > 0 ? Math.round(bt.packages * 100 / maxPkg) : 0;
+      html += '<div class="dash-bar-row">';
+      html += '<span class="dash-bar-label">' + t + '</span>';
+      html += '<div class="dash-bar-track"><div class="dash-bar-fill" style="width:' + w + '%;background:' + (barColors[t]||'var(--accent)') + '"></div></div>';
+      html += '<span class="dash-bar-count">' + bt.packages + '</span>';
+      html += '</div>';
+    }
+    html += '</div>';
+
+    d.innerHTML = html;
+  } catch(e) {
+    d.innerHTML = '<div class="detail-empty">Error loading metrics.</div>';
+  }
+}
+
+function dashCard(value, label) {
+  return '<div class="dash-card"><div class="value">' + value + '</div><div class="label">' + label + '</div></div>';
+}
+
 function expandAll() {
   for (var t of typeOrder) expandedGroups.add(t);
   if (!allData) { render(); return; }
@@ -564,8 +663,10 @@ document.getElementById('filter').addEventListener('input', render);
 
 async function init() {
   await load();
-  // Navigate to hash permalink if present.
-  if (location.hash) {
+  // Show dashboard by default, or navigate to hash permalink.
+  if (!location.hash) {
+    showDashboard();
+  } else if (location.hash) {
     var path = decodeURIComponent(location.hash.slice(1));
     var parts = path.split('/');
     if (parts.length >= 2 && allData) {
