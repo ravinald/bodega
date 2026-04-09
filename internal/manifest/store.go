@@ -125,6 +125,8 @@ func (s *Store) SaveIndex(ctx context.Context) error {
 	if err := b.Write(ctx, indexFile, data); err != nil {
 		return fmt.Errorf("write %s to %s: %w", indexFile, b.Label(), err)
 	}
+	// Also update cached metrics.
+	_ = s.SaveMetrics(ctx)
 	return nil
 }
 

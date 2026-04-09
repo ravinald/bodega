@@ -372,11 +372,64 @@ func (m detailsModel) renderGroupDetails() string {
 		return sb.String()
 	}
 
-	// Top-level type group.
+	// Top-level type group: show repo-level metrics.
 	sb.WriteString(field("Type", n.EntryType+"/"))
 	sb.WriteByte('\n')
-	count := len(store_ListPackages(m.store, ctx, n.EntryType))
-	sb.WriteString(field("Packages", fmt.Sprintf("%d", count)))
+
+	names := m.store.ListPackages(n.EntryType)
+	totalVersions := 0
+	frozenCount := 0
+	hiddenCount := 0
+	for _, name := range names {
+		pm, err := m.store.GetPackage(ctx, n.EntryType, name)
+		if err != nil || pm == nil {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			totalVersions++
+			if ve.Frozen {
+				frozenCount++
+			}
+			if ve.Hidden {
+				hiddenCount++
+			}
+		}
+	}
+
+	sb.WriteString(field("Packages", fmt.Sprintf("%d", len(names))))
+	sb.WriteByte('\n')
+	sb.WriteString(field("Versions", fmt.Sprintf("%d", totalVersions)))
+	sb.WriteByte('\n')
+	if frozenCount > 0 {
+		sb.WriteString(field("Frozen", fmt.Sprintf("%d", frozenCount)))
+		sb.WriteByte('\n')
+	}
+	if hiddenCount > 0 {
+		sb.WriteString(field("Hidden", fmt.Sprintf("%d", hiddenCount)))
+		sb.WriteByte('\n')
+	}
+
+	// List packages with version counts.
+	if len(names) > 0 {
+		sb.WriteByte('\n')
+		sb.WriteString(dimStyle.Render("── Packages ──"))
+		sb.WriteByte('\n')
+		for _, name := range names {
+			pm, err := m.store.GetPackage(ctx, n.EntryType, name)
+			if err != nil || pm == nil {
+				continue
+			}
+			desc := ""
+			if pm.Description != "" {
+				desc = " - " + pm.Description
+				if len(desc) > 50 {
+					desc = desc[:47] + "..."
+				}
+			}
+			sb.WriteString(fmt.Sprintf("  %s (%d ver)%s", pm.Name, len(pm.Versions), desc))
+			sb.WriteByte('\n')
+		}
+	}
 
 	return sb.String()
 }

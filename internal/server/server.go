@@ -564,68 +564,15 @@ func (s *Server) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-type metricsResponse struct {
-	Global    metricsGlobal            `json:"global"`
-	ByType    map[string]metricsType   `json:"by_type"`
-}
-
-type metricsGlobal struct {
-	Packages   int `json:"packages"`
-	Versions   int `json:"versions"`
-	S3Uploaded int `json:"s3_uploaded"`
-	S3Missing  int `json:"s3_missing"`
-	Frozen     int `json:"frozen"`
-	Hidden     int `json:"hidden"`
-	DepEdges   int `json:"dep_edges"`
-	Orphans    int `json:"orphans"`
-}
-
-type metricsType struct {
-	Packages   int `json:"packages"`
-	Versions   int `json:"versions"`
-	S3Uploaded int `json:"s3_uploaded"`
-	S3Missing  int `json:"s3_missing"`
-	Frozen     int `json:"frozen"`
-	Hidden     int `json:"hidden"`
-}
-
 func (s *Server) handleAPIMetrics(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	_ = s.store.LoadIndex(ctx) // refresh
-
-	resp := metricsResponse{
-		ByType: make(map[string]metricsType),
+	// Try cached metrics first (fast path).
+	m, err := s.store.LoadMetrics(ctx)
+	if err != nil || m == nil {
+		// Fallback: compute on demand.
+		m = s.store.ComputeMetrics(ctx)
 	}
-
-	for _, typ := range manifest.AllTypes {
-		mt := metricsType{}
-		for _, name := range s.store.ListPackages(typ) {
-			pm, err := s.store.GetPackage(ctx, typ, name)
-			if err != nil || pm == nil {
-				continue
-			}
-			mt.Packages++
-			for _, ve := range pm.Versions {
-				mt.Versions++
-				if ve.Frozen {
-					mt.Frozen++
-				}
-				if ve.Hidden {
-					mt.Hidden++
-				}
-			}
-		}
-		resp.ByType[typ] = mt
-		resp.Global.Packages += mt.Packages
-		resp.Global.Versions += mt.Versions
-		resp.Global.Frozen += mt.Frozen
-		resp.Global.Hidden += mt.Hidden
-	}
-
-	resp.Global.DepEdges = len(s.store.AllEdges())
-	resp.Global.Orphans = len(s.store.Orphans())
-
-	writeJSON(w, http.StatusOK, resp)
+	writeJSON(w, http.StatusOK, m)
 }
 
 // ---- Go module proxy -------------------------------------------------------

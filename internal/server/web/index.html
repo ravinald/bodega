@@ -361,8 +361,21 @@ async function load() {
 
 function entriesForType(type) {
   if (!allData) return [];
-  if (type === 'pypi') return (allData.pypi && allData.pypi.packages) || [];
-  return allData[type] || [];
+  var manifests = allData[type] || [];
+  // Flatten PackageManifests into individual version entries.
+  // Each entry gets the package name from the manifest and version fields from the VersionEntry.
+  var entries = [];
+  for (var pm of manifests) {
+    if (!pm.versions || pm.versions.length === 0) {
+      // Package with no versions -- show as a placeholder.
+      entries.push(Object.assign({name: pm.name, description: pm.description}, {}));
+      continue;
+    }
+    for (var ve of pm.versions) {
+      entries.push(Object.assign({name: pm.name, description: pm.description}, ve));
+    }
+  }
+  return entries;
 }
 
 function entryVersion(type, e) {
@@ -432,7 +445,9 @@ function render() {
     header.onclick = () => {
       if (expandedGroups.has(type)) expandedGroups.delete(type);
       else expandedGroups.add(type);
+      selectedKey = null;
       render();
+      showTypeMetrics(type);
     };
     group.appendChild(header);
 
@@ -608,6 +623,44 @@ async function showDashboard() {
   } catch(e) {
     d.innerHTML = '<div class="detail-empty">Error loading metrics.</div>';
   }
+}
+
+async function showTypeMetrics(type) {
+  var d = document.getElementById('detail');
+  var entries = entriesForType(type);
+  var html = '<div class="detail-title"><span class="type-badge">' + type + '</span> Repository</div>';
+
+  // Summary cards.
+  var versions = 0, frozen = 0, hidden = 0;
+  for (var e of entries) {
+    versions++;
+    if (e.frozen) frozen++;
+    if (e.hidden) hidden++;
+  }
+
+  var { order } = groupByName(type, entries);
+
+  html += '<div class="dash-cards">';
+  html += dashCard(order.length, 'Packages');
+  html += dashCard(versions, 'Versions');
+  html += dashCard(frozen, 'Frozen');
+  html += dashCard(hidden, 'Hidden');
+  html += '</div>';
+
+  // Package list.
+  html += '<div class="dash-section"><h3>Packages</h3>';
+  for (var name of order) {
+    var pkgEntries = entries.filter(function(e) { return e.name === name; });
+    var latest = pkgEntries.length > 0 ? entryVersion(type, pkgEntries[pkgEntries.length - 1]) : '';
+    html += '<div class="dash-bar-row">';
+    html += '<span class="dash-bar-label" style="width:auto;min-width:120px">' + name + '</span>';
+    html += '<span class="dash-bar-count">' + pkgEntries.length + ' ver</span>';
+    if (latest) html += '<span class="dash-bar-count" style="color:var(--fg)">' + latest + '</span>';
+    html += '</div>';
+  }
+  html += '</div>';
+
+  d.innerHTML = html;
 }
 
 function dashCard(value, label) {
