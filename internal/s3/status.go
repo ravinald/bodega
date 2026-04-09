@@ -4,8 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/manifest"
+	"github.com/scaleapi/bodega/internal/manifest"
 )
 
 // EntryStatus describes one manifest entry compared against S3.
@@ -43,6 +44,18 @@ func CheckStatus(ctx context.Context, client *Client, store *manifest.Store, typ
 			s, e := checkPypiStatus(ctx, client, store)
 			statuses = append(statuses, s...)
 			err = e
+		case manifest.TypeGomod:
+			s, e := checkGomodStatus(ctx, client, store)
+			statuses = append(statuses, s...)
+			err = e
+		case manifest.TypeHelm:
+			s, e := checkHelmStatus(ctx, client, store)
+			statuses = append(statuses, s...)
+			err = e
+		case manifest.TypeNpm:
+			s, e := checkNpmStatus(ctx, client, store)
+			statuses = append(statuses, s...)
+			err = e
 		}
 		if err != nil {
 			return statuses, err
@@ -59,13 +72,12 @@ func checkBinaryStatus(ctx context.Context, client *Client, store *manifest.Stor
 		if filename == "" {
 			filename = lastSegment(e.URL)
 		}
-		// Versioned path: binaries/<name>/<version>/<filename>
-		// Unversioned fallback: binaries/<filename>
+		// Path: binaries/<name>/<version>/<filename> or binaries/<name>/<filename>
 		var key string
 		if e.Version != "" {
 			key = fmt.Sprintf("binaries/%s/%s/%s", e.Name, e.Version, filename)
 		} else {
-			key = "binaries/" + filename
+			key = fmt.Sprintf("binaries/%s/%s", e.Name, filename)
 		}
 		s3stat, err := client.HeadObject(ctx, key)
 		if err != nil {
@@ -87,7 +99,12 @@ func checkBinaryStatus(ctx context.Context, client *Client, store *manifest.Stor
 func checkGitStatus(ctx context.Context, client *Client, store *manifest.Store) ([]EntryStatus, error) {
 	var out []EntryStatus
 	for _, e := range store.Git {
-		key := fmt.Sprintf("repos/%s/%s-%s.bundle", e.Name, e.Name, e.Ref)
+		ext := ".bundle"
+		if e.IsRelease() {
+			ext = ".tar.gz"
+		}
+		sn := strings.ReplaceAll(e.Name, "/", "--")
+		key := fmt.Sprintf("repos/%s/%s-%s%s", sn, sn, e.Ref, ext)
 		s3stat, err := client.HeadObject(ctx, key)
 		if err != nil {
 			return out, err
@@ -155,6 +172,69 @@ func checkPypiStatus(ctx context.Context, client *Client, store *manifest.Store)
 			SizeS3: s3stat.Size,
 		},
 	}, nil
+}
+
+func checkGomodStatus(ctx context.Context, client *Client, store *manifest.Store) ([]EntryStatus, error) {
+	var out []EntryStatus
+	for _, e := range store.Gomod {
+		key := fmt.Sprintf("gomod/%s/@v/%s.zip", e.Name, e.Version)
+		s3stat, err := client.HeadObject(ctx, key)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, EntryStatus{
+			Type:   manifest.TypeGomod,
+			Name:   e.VersionedName(),
+			S3Key:  key,
+			InS3:   s3stat.Exists,
+			Frozen: e.Frozen,
+			ETag:   s3stat.ETag,
+			SizeS3: s3stat.Size,
+		})
+	}
+	return out, nil
+}
+
+func checkHelmStatus(ctx context.Context, client *Client, store *manifest.Store) ([]EntryStatus, error) {
+	var out []EntryStatus
+	for _, e := range store.Helm {
+		key := fmt.Sprintf("charts/%s-%s.tgz", e.Name, e.Version)
+		s3stat, err := client.HeadObject(ctx, key)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, EntryStatus{
+			Type:   manifest.TypeHelm,
+			Name:   e.VersionedName(),
+			S3Key:  key,
+			InS3:   s3stat.Exists,
+			Frozen: e.Frozen,
+			ETag:   s3stat.ETag,
+			SizeS3: s3stat.Size,
+		})
+	}
+	return out, nil
+}
+
+func checkNpmStatus(ctx context.Context, client *Client, store *manifest.Store) ([]EntryStatus, error) {
+	var out []EntryStatus
+	for _, e := range store.Npm {
+		key := fmt.Sprintf("npm/%s/%s-%s.tgz", e.Name, e.Name, e.Version)
+		s3stat, err := client.HeadObject(ctx, key)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, EntryStatus{
+			Type:   manifest.TypeNpm,
+			Name:   e.VersionedName(),
+			S3Key:  key,
+			InS3:   s3stat.Exists,
+			Frozen: e.Frozen,
+			ETag:   s3stat.ETag,
+			SizeS3: s3stat.Size,
+		})
+	}
+	return out, nil
 }
 
 // PrintStatus writes a formatted status table to out.

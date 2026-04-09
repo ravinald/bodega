@@ -3,19 +3,26 @@ package builder
 import (
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/manifest"
+	"github.com/scaleapi/bodega/internal/manifest"
 )
 
-// gitBareDir returns the path of the bare repository for a GitEntry. The
-// directory is always named "<name>-<ref>.git" because the Ref field is the
-// version identifier for git entries and is always non-empty.
+// safeName replaces forward slashes with "--" so names like
+// "netbox-community/netbox" become "netbox-community--netbox",
+// safe for filesystem paths, S3 keys, and URLs.
+func safeName(name string) string {
+	return strings.ReplaceAll(name, "/", "--")
+}
+
+// gitBareDir returns the path of the bare repository for a GitEntry.
 func gitBareDir(d dirs, entry manifest.GitEntry) string {
-	return filepath.Join(d.repos, entry.Name+"-"+entry.Ref+".git")
+	sn := safeName(entry.Name)
+	return filepath.Join(d.repos, sn, sn+"-"+entry.Ref+".git")
 }
 
 // CheckGitStage inspects the filesystem to determine which pipeline stages have
@@ -25,12 +32,15 @@ func CheckGitStage(cfg *Config, entry manifest.GitEntry) StageStatus {
 	var s StageStatus
 
 	if entry.IsRelease() {
-		// Release mode: fetched = extracted directory exists.
+		// Release mode: fetched = extracted directory exists,
+		// packaged = archive exists in bundles for upload.
 		releaseDir := gitReleaseDir(d, entry)
 		if fi, err := os.Stat(releaseDir); err == nil && fi.IsDir() {
 			s.Fetched = true
-			// For release mode, the tarball IS the artifact — no separate build/package.
 			s.Built = true
+		}
+		archive := gitReleaseArchive(d, entry)
+		if fi, err := os.Stat(archive); err == nil && !fi.IsDir() {
 			s.Packaged = true
 		}
 	} else {
@@ -39,8 +49,8 @@ func CheckGitStage(cfg *Config, entry manifest.GitEntry) StageStatus {
 		if fi, err := os.Stat(bareDir); err == nil && fi.IsDir() {
 			s.Fetched = true
 		}
-		bundleDir := filepath.Join(d.bundles, entry.Name)
-		bundlePath := filepath.Join(bundleDir, entry.Name+"-"+entry.Ref+".bundle")
+		bundleDir := filepath.Join(d.bundles, safeName(entry.Name))
+		bundlePath := filepath.Join(bundleDir, safeName(entry.Name)+"-"+entry.Ref+".bundle")
 		if fi, err := os.Stat(bundlePath); err == nil && !fi.IsDir() {
 			s.Built = true
 			s.Packaged = true
@@ -74,6 +84,13 @@ func FetchGit(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 			cfg.logf("  [git] %s: SKIPPED (frozen)", entry.Name)
 			continue
 		}
+		if !cfg.Force {
+			stage := CheckGitStage(cfg, entry)
+			if stage.Fetched {
+				cfg.logf("  [git] %s: already fetched, skipping (use --force to re-fetch)", entry.Name)
+				continue
+			}
+		}
 
 		start := time.Now()
 		result := Result{Type: manifest.TypeGit, Name: entry.Name}
@@ -86,13 +103,59 @@ func FetchGit(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 			// Release mode: download tarball and extract.
 			_, _ = fmt.Fprintf(out, "    Mode: release tarball\n")
 			extractDir := gitReleaseDir(d, entry)
-			if err := fetchGitRelease(out, entry, extractDir); err != nil {
+			if err := fetchGitRelease(out, d, entry, extractDir); err != nil {
 				result.Err = err
 				_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
 				summary.Failures++
 			} else {
 				result.Artifacts = []string{extractDir}
 				_, _ = fmt.Fprintf(out, "    Extracted: %s\n", extractDir)
+
+				// Compute checksum of the archive.
+				archivePath := gitReleaseArchive(d, entry)
+				computed, hashErr := computeFileSHA256(archivePath)
+				if hashErr != nil {
+					_, _ = fmt.Fprintf(out, "    WARNING: could not compute checksum: %v\n", hashErr)
+				} else {
+					_, _ = fmt.Fprintf(out, "    SHA256: %s\n", computed)
+
+					// Try to verify against existing entry checksum.
+					verified := false
+					checksumOK := true
+					if entry.Checksum != nil {
+						if err := verifyChecksum(entry.Checksum, computed); err != nil {
+							_, _ = fmt.Fprintf(out, "    WARNING: %v\n", err)
+							result.Err = fmt.Errorf("checksum mismatch for %s: %v", entry.Name, err)
+							summary.Failures++
+							checksumOK = false
+						} else {
+							verified = true
+							_, _ = fmt.Fprintf(out, "    Checksum verified against manifest\n")
+						}
+					} else {
+						// Try to fetch source checksum from GitHub.
+						sourceHash := fetchGitHubSHA256(out, entry)
+						if sourceHash != "" {
+							if sourceHash == computed {
+								verified = true
+								_, _ = fmt.Fprintf(out, "    Checksum verified against source\n")
+							} else {
+								_, _ = fmt.Fprintf(out, "    WARNING: source checksum mismatch: expected %s, got %s\n", sourceHash, computed)
+								result.Err = fmt.Errorf("source checksum mismatch for %s", entry.Name)
+								summary.Failures++
+								checksumOK = false
+							}
+						}
+					}
+
+					// Save computed checksum to manifest only if verification passed.
+					if checksumOK {
+						cs := newSHA256Checksum(computed)
+						if err := cfg.findAndUpdateGitChecksum(store, entry.Name, cs, verified); err != nil {
+							_, _ = fmt.Fprintf(out, "    WARNING: could not save checksum: %v\n", err)
+						}
+					}
+				}
 			}
 		} else {
 			// Clone mode: bare clone.
@@ -112,6 +175,43 @@ func FetchGit(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 		summary.Results = append(summary.Results, result)
 		summary.Total++
 		_, _ = fmt.Fprintf(out, "    Done (%s)\n", result.Elapsed.Round(time.Millisecond))
+
+		// Stamp build environment on the entry.
+		if result.Err == nil {
+			cfg.StampGitEntry(store, entry.Name)
+		}
+
+		// Auto-discover descriptions and dependencies in the fetched source.
+		if result.Err == nil {
+			// Fetch description for this git entry.
+			if entry.Description == "" {
+				if desc := FetchDescription(manifest.TypeGit, entry.Name, entry.URL); desc != "" {
+					if e := store.FindGit(entry.Name); e != nil {
+						e.Description = desc
+						_ = store.SaveGit()
+						_, _ = fmt.Fprintf(out, "    Description: %s\n", desc)
+					}
+				}
+			}
+
+			discovery := ScanDeps(cfg, store, entry, out)
+			cfg.LastDiscovery = &discovery
+			if cfg.AutoImportDeps {
+				ImportDeps(store, entry, discovery.Deps, out)
+				// Fetch descriptions for newly imported deps.
+				DiscoverDescriptions(store, out)
+			} else if len(discovery.Deps) > 0 {
+				newCount := 0
+				for _, d := range discovery.Deps {
+					if !d.Exists {
+						newCount++
+					}
+				}
+				if newCount > 0 {
+					_, _ = fmt.Fprintf(out, "    %d new dependencies discovered (auto-import disabled, review pending)\n", newCount)
+				}
+			}
+		}
 
 		if cfg.Logger != nil {
 			if result.Err != nil {
@@ -144,6 +244,12 @@ func PackageGit(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 		}
 		if entry.Frozen {
 			cfg.logf("  [git] %s: SKIPPED (frozen)", entry.Name)
+			continue
+		}
+
+		// Release mode: the extracted tarball IS the artifact — no bundle needed.
+		if entry.IsRelease() {
+			cfg.logf("  [git] %s: release mode — no packaging needed", entry.Name)
 			continue
 		}
 
@@ -225,11 +331,11 @@ func fetchGitRepo(out interface{ Write([]byte) (int, error) }, bareDir, url stri
 func packageGitBundle(out interface{ Write([]byte) (int, error) }, d dirs, entry manifest.GitEntry) (string, error) {
 	bareDir := gitBareDir(d, entry)
 
-	bundleDir := filepath.Join(d.bundles, entry.Name)
+	bundleDir := filepath.Join(d.bundles, safeName(entry.Name))
 	if err := mkdirAll(bundleDir); err != nil {
 		return "", err
 	}
-	bundlePath := filepath.Join(bundleDir, entry.Name+"-"+entry.Ref+".bundle")
+	bundlePath := filepath.Join(bundleDir, safeName(entry.Name)+"-"+entry.Ref+".bundle")
 
 	// Remove stale lock files from previous failed runs.
 	lockFile := bundlePath + ".lock"
@@ -281,7 +387,7 @@ func GitWorktreePath(buildRoot, name, ref string) (string, error) {
 		return "", nil
 	}
 
-	workDir := filepath.Join(d.repos, name+"-"+ref+"-worktree")
+	workDir := filepath.Join(d.repos, safeName(name)+"-"+ref+"-worktree")
 	if _, err := os.Stat(workDir); os.IsNotExist(err) {
 		out, err := runCmdCapture(bareDir, "git", "worktree", "add", workDir, ref)
 		if err != nil {
@@ -295,9 +401,55 @@ func GitWorktreePath(buildRoot, name, ref string) (string, error) {
 	return workDir, nil
 }
 
+// fetchGitHubSHA256 attempts to download a SHA256 checksum from the source.
+// GitHub release archives don't have built-in checksums, but some projects
+// publish them as release assets (e.g. SHA256SUMS or <ref>.sha256). This
+// function tries common patterns and returns the hex digest, or empty string
+// if no source checksum is available.
+func fetchGitHubSHA256(out io.Writer, entry manifest.GitEntry) string {
+	base := strings.TrimSuffix(entry.URL, ".git")
+	// Try: <repo>/releases/download/<ref>/SHA256SUMS
+	candidates := []string{
+		base + "/releases/download/" + entry.Ref + "/SHA256SUMS",
+		base + "/releases/download/" + entry.Ref + "/sha256sums.txt",
+	}
+	for _, url := range candidates {
+		data, err := httpGetBody(url)
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		// Parse SHA256SUMS format: "<hash>  <filename>" or "<hash> <filename>"
+		for _, line := range strings.Split(string(data), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 && len(fields[0]) == 64 {
+				// Look for a line matching the tarball filename.
+				tarName := entry.Ref + ".tar.gz"
+				if strings.Contains(fields[1], tarName) || strings.HasSuffix(fields[1], ".tar.gz") {
+					_, _ = fmt.Fprintf(out, "    Found source checksum at %s\n", url)
+					return strings.ToLower(fields[0])
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// httpGetBody fetches a URL and returns the body, or an error.
+func httpGetBody(url string) ([]byte, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+}
+
 // gitReleaseDir returns the extraction directory for a release tarball.
 func gitReleaseDir(d dirs, entry manifest.GitEntry) string {
-	return filepath.Join(d.sources, entry.Name+"-"+entry.Ref)
+	return filepath.Join(d.sources, safeName(entry.Name), safeName(entry.Name)+"-"+entry.Ref)
 }
 
 // releaseURL constructs the GitHub release tarball URL from the repo URL and ref.
@@ -309,23 +461,32 @@ func releaseURL(repoURL, ref string) string {
 	return base + "/archive/refs/tags/" + ref + ".tar.gz"
 }
 
-// fetchGitRelease downloads a release tarball, extracts it, and renames the
-// extracted directory to the expected path.
-func fetchGitRelease(out io.Writer, entry manifest.GitEntry, extractDir string) error {
+// gitReleaseArchive returns the path where the release tarball is stored for upload.
+func gitReleaseArchive(d dirs, entry manifest.GitEntry) string {
+	return filepath.Join(d.bundles, safeName(entry.Name), safeName(entry.Name)+"-"+entry.Ref+".tar.gz")
+}
+
+// fetchGitRelease downloads a release tarball, saves it for S3 upload, and
+// extracts it for local use by other builders (e.g. pypi reads requirements.txt).
+func fetchGitRelease(out io.Writer, d dirs, entry manifest.GitEntry, extractDir string) error {
 	url := releaseURL(entry.URL, entry.Ref)
 	_, _ = fmt.Fprintf(out, "    Downloading %s\n", url)
 
-	// Ensure parent directory exists.
+	// Ensure directories exist.
 	if err := os.MkdirAll(filepath.Dir(extractDir), 0o755); err != nil {
 		return fmt.Errorf("create parent dir: %w", err)
 	}
+	archivePath := gitReleaseArchive(d, entry)
+	if err := os.MkdirAll(filepath.Dir(archivePath), 0o755); err != nil {
+		return fmt.Errorf("create bundles dir: %w", err)
+	}
 
-	// Download to a temp file.
-	tarball := extractDir + ".tar.gz"
+	// Download to the bundles directory (kept for S3 upload).
+	tarball := archivePath
 	if err := downloadFile(out, url, tarball); err != nil {
 		return fmt.Errorf("download release tarball: %w", err)
 	}
-	defer func() { _ = os.Remove(tarball) }()
+	_, _ = fmt.Fprintf(out, "    Archive: %s\n", tarball)
 
 	// Remove any previous extraction.
 	if err := os.RemoveAll(extractDir); err != nil {

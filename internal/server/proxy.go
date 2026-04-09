@@ -11,8 +11,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/audit"
-	bos3 "github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/s3"
+	"github.com/scaleapi/bodega/internal/audit"
+	bos3 "github.com/scaleapi/bodega/internal/s3"
 )
 
 // s3Writer extends s3Getter with write capability for caching.
@@ -45,7 +45,7 @@ type CacheConfig struct {
 //
 // If proxy/cache is disabled or upstreamURL is empty, falls back to direct
 // S3 proxy.
-func (s *Server) proxyOrCache(w http.ResponseWriter, r *http.Request, s3Key, upstreamURL string, immutable bool) {
+func (s *Server) proxyOrCache(w http.ResponseWriter, r *http.Request, s3Key, upstreamURL string, immutable, forceProxy bool) {
 	if !s.requireS3(w) {
 		return
 	}
@@ -72,7 +72,7 @@ func (s *Server) proxyOrCache(w http.ResponseWriter, r *http.Request, s3Key, ups
 	}
 
 	// Cache miss or stale — fetch from upstream if proxy is enabled.
-	if !s.cacheEnabled() || upstreamURL == "" {
+	if (!s.cacheEnabled() && !forceProxy) || upstreamURL == "" {
 		if status != nil && status.Exists {
 			// Stale but no upstream — serve what we have.
 			s.proxyS3(w, r, s3Key)

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/manifest"
+	"github.com/scaleapi/bodega/internal/manifest"
 )
 
 // PypiDepGraph is the serialised dependency graph produced after a successful

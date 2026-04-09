@@ -1,4 +1,4 @@
-// Package server implements the reman HTTP package server.
+// Package server implements the bodega HTTP package server.
 //
 // The server proxies S3-backed package artifacts to standard package manager
 // clients (apt, pip) and exposes a REST API for manifest inspection.
@@ -11,16 +11,17 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"path"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/audit"
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/config"
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/manifest"
-	bos3 "github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/s3"
+	"github.com/scaleapi/bodega/internal/audit"
+	"github.com/scaleapi/bodega/internal/config"
+	"github.com/scaleapi/bodega/internal/manifest"
+	bos3 "github.com/scaleapi/bodega/internal/s3"
 )
 
 // contentTypes maps file extensions to MIME types for proxied responses.
@@ -51,17 +52,18 @@ type s3Getter interface {
 	HeadObject(ctx context.Context, key string) (*bos3.ObjectStatus, error)
 }
 
-// Server is the reman HTTP package server.
+// Server is the bodega HTTP package server.
 type Server struct {
-	cfg    *config.Config
-	store  *manifest.Store
-	s3     s3Getter
-	mux    *http.ServeMux
-	addr   string
-	logger  *slog.Logger
-	cache   CacheConfig
-	auditDB *audit.DB
-	mu      sync.Mutex // protects store mutations (CRUD API)
+	cfg      *config.Config
+	store    *manifest.Store
+	s3       s3Getter
+	mux      *http.ServeMux
+	addr     string
+	logger   *slog.Logger
+	cache    CacheConfig
+	auditDB  *audit.DB
+	denyNets []*net.IPNet
+	mu       sync.Mutex // protects store mutations (CRUD API)
 }
 
 // New constructs a Server and registers all routes.
@@ -93,6 +95,24 @@ func newServer(cfg *config.Config, store *manifest.Store, s3 s3Getter, addr stri
 		addr:   addr,
 		logger: logger,
 	}
+	// Wire proxy/cache config.
+	ttl, _ := time.ParseDuration(cfg.MetadataTTL)
+	if ttl == 0 {
+		ttl = time.Hour
+	}
+	s.cache = CacheConfig{
+		Enabled:     cfg.ProxyCacheEnabled,
+		MetadataTTL: ttl,
+	}
+	if len(cfg.DenyList) > 0 {
+		nets, err := ParseDenyList(cfg.DenyList)
+		if err != nil {
+			logger.Error("invalid deny list entry", "error", err)
+		} else {
+			s.denyNets = nets
+			logger.Info("deny list loaded", "entries", len(nets))
+		}
+	}
 	s.registerRoutes()
 	return s
 }
@@ -107,6 +127,7 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) handler() http.Handler {
 	var h http.Handler = s.mux
 	h = AuditMiddleware(s.auditDB)(h)
+	h = DenyListMiddleware(s.denyNets)(h)
 	h = RequestLogger(s.logger)(h)
 	h = RealIPMiddleware(nil)(h)
 	return h
@@ -140,10 +161,10 @@ func (s *Server) Start(ctx context.Context) error {
 	errCh := make(chan error, 1)
 	go func() {
 		if srv.TLSConfig != nil {
-			s.logger.Info("reman server listening (TLS)", "addr", s.addr)
+			s.logger.Info("bodega server listening (TLS)", "addr", s.addr)
 			errCh <- srv.ListenAndServeTLS("", "") // certs already in TLSConfig
 		} else {
-			s.logger.Info("reman server listening", "addr", s.addr)
+			s.logger.Info("bodega server listening", "addr", s.addr)
 			errCh <- srv.ListenAndServe()
 		}
 	}()
@@ -170,6 +191,9 @@ func (s *Server) Start(ctx context.Context) error {
 // Requires Go 1.22+ enhanced ServeMux patterns.
 func (s *Server) registerRoutes() {
 	m := s.mux
+
+	// Web UI
+	s.registerWebUI()
 
 	// Health probe
 	m.HandleFunc("GET /healthz", s.handleHealthz)
@@ -258,9 +282,19 @@ func (s *Server) handlePypiIndex(w http.ResponseWriter, r *http.Request) {
 
 	names := uniquePackageNames(keys)
 
+	// Filter out hidden packages.
+	var visible []string
+	for _, n := range names {
+		pkg := s.store.FindPypiPackage(n)
+		if pkg != nil && pkg.Hidden {
+			continue
+		}
+		visible = append(visible, n)
+	}
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = fmt.Fprintf(w, "<!DOCTYPE html>\n<html>\n  <head><title>Simple Index</title></head>\n  <body>\n")
-	for _, n := range names {
+	for _, n := range visible {
 		_, _ = fmt.Fprintf(w, "    <a href=\"/pypi/simple/%s/\">%s</a>\n", n, n)
 	}
 	_, _ = fmt.Fprintf(w, "  </body>\n</html>\n")
@@ -272,6 +306,11 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pkgName := r.PathValue("package")
+	// Check if package is hidden.
+	if pkg := s.store.FindPypiPackage(pkgName); pkg != nil && pkg.Hidden {
+		http.NotFound(w, r)
+		return
+	}
 	normalized := normalizePkgName(pkgName)
 
 	keys, err := s.s3.ListPrefix(r.Context(), "pypi/wheels/")
@@ -296,6 +335,14 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(wheels) == 0 {
+		// Check if this package is in proxy mode.
+		pkg := s.store.FindPypiPackage(pkgName)
+		if pkg != nil && pkg.Mode == manifest.ModeProxy {
+			// Proxy the simple index from upstream PyPI.
+			upstream := "https://pypi.org/simple/" + normalized + "/"
+			s.proxyOrCache(w, r, "pypi/simple/"+normalized+"/index.html", upstream, false, true)
+			return
+		}
 		http.NotFound(w, r)
 		return
 	}
@@ -310,10 +357,22 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 }
 
 // handlePypiWheel proxies /pypi/wheels/{file} → S3 pypi/wheels/{file}
+// For proxy-mode packages, falls back to fetching from upstream PyPI.
 func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
 	file := r.PathValue("file")
 	key := "pypi/wheels/" + file
 	setCacheImmutable(w, file)
+
+	// Extract package name from wheel filename (e.g. "boto3-1.26.0-py3-none-any.whl" → "boto3").
+	dist := wheelDistName(file)
+	if dist != "" {
+		pkg := s.store.FindPypiPackage(dist)
+		if pkg != nil && pkg.Mode == manifest.ModeProxy {
+			upstream := "https://pypi.org/packages/" + file
+			s.proxyOrCache(w, r, key, upstream, true, true)
+			return
+		}
+	}
 	s.proxyS3(w, r, key)
 }
 
@@ -538,7 +597,45 @@ func (s *Server) handleGomod(w http.ResponseWriter, r *http.Request) {
 	upstream := s.cfg.GomodUpstream + "/" + module + "/@v/" + file
 	immutable := file != "list" && !strings.HasSuffix(file, "latest")
 
-	s.proxyOrCache(w, r, s3Key, upstream, immutable)
+	entry := s.store.FindGomod(module)
+	if entry != nil && entry.Hidden {
+		http.NotFound(w, r)
+		return
+	}
+	forceProxy := entry != nil && entry.EffectiveMode() == manifest.ModeProxy
+	if forceProxy {
+		// Version constraint enforcement: check if the requested version is allowed.
+		if immutable && entry.VersionConstraint != "" && entry.VersionConstraint != manifest.ConstraintAny {
+			reqVersion := file
+			if dot := strings.LastIndex(file, "."); dot > 0 {
+				reqVersion = file[:dot] // "v1.30.0.info" → "v1.30.0"
+			}
+			if !versionAllowed(entry.Version, reqVersion, entry.VersionConstraint) {
+				http.Error(w, "version not allowed by constraint", http.StatusForbidden)
+				return
+			}
+		}
+		s.proxyOrCache(w, r, s3Key, upstream, immutable, true)
+		return
+	}
+	s.proxyS3(w, r, s3Key)
+}
+
+// versionAllowed checks whether reqVersion satisfies the constraint relative to entryVersion.
+func versionAllowed(entryVersion, reqVersion, constraint string) bool {
+	switch constraint {
+	case manifest.ConstraintExact, "":
+		return reqVersion == entryVersion
+	case manifest.ConstraintAny:
+		return true
+	case manifest.ConstraintCompatible:
+		// Same major version, any minor/patch.
+		return reqVersion >= entryVersion
+	case manifest.ConstraintPatch:
+		// Same major.minor, any patch.
+		return reqVersion >= entryVersion
+	}
+	return false
 }
 
 // ---- Helm chart repository -------------------------------------------------
@@ -551,6 +648,19 @@ func (s *Server) handleHelmChart(w http.ResponseWriter, r *http.Request) {
 	file := r.PathValue("file")
 	key := "charts/" + file
 	setCacheImmutable(w, file)
+
+	// Check if any helm entry is in proxy mode with a URL we can use.
+	// Parse chart name from filename: "ingress-nginx-4.0.0.tgz" → "ingress-nginx"
+	chartName := strings.TrimSuffix(file, ".tgz")
+	if idx := strings.LastIndex(chartName, "-"); idx > 0 {
+		chartName = chartName[:idx]
+	}
+	entry := s.store.FindHelm(chartName)
+	if entry != nil && entry.EffectiveMode() == manifest.ModeProxy && entry.URL != "" {
+		upstream := strings.TrimSuffix(entry.URL, "/") + "/" + file
+		s.proxyOrCache(w, r, key, upstream, true, true)
+		return
+	}
 	s.proxyS3(w, r, key)
 }
 
@@ -565,6 +675,13 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 		tarball := fullPath[idx+3:]
 		key := "npm/" + pkgName + "/" + tarball
 		setCacheImmutable(w, tarball)
+
+		entry := s.store.FindNpm(pkgName)
+		if entry != nil && entry.EffectiveMode() == manifest.ModeProxy {
+			upstream := s.cfg.NpmUpstream + "/" + pkgName + "/-/" + tarball
+			s.proxyOrCache(w, r, key, upstream, true, true)
+			return
+		}
 		s.proxyS3(w, r, key)
 		return
 	}
@@ -573,7 +690,10 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 	upstream := s.cfg.NpmUpstream + "/" + fullPath
 	s3Key := "npm/" + fullPath + "/packument.json"
 	w.Header().Set("Content-Type", "application/json")
-	s.proxyOrCache(w, r, s3Key, upstream, false)
+
+	entry := s.store.FindNpm(fullPath)
+	forceProxy := entry != nil && entry.EffectiveMode() == manifest.ModeProxy
+	s.proxyOrCache(w, r, s3Key, upstream, false, forceProxy)
 }
 
 // ---- Mutation API ----------------------------------------------------------

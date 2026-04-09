@@ -1,0 +1,11 @@
+{% extends 'generic/object_list.html' %}
+{% load helpers %}
+{% load i18n %}
+
+{% block extra_controls %}
+    <button class="btn btn-outline-secondary toggle-depth" type="button">
+        {% trans "Hide Depth Indicators" %}
+    </button>
+    {% include 'ipam/inc/max_depth.html' %}
+    {% include 'ipam/inc/max_length.html' %}
+{% endblock %}

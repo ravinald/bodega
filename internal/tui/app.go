@@ -1,4 +1,4 @@
-// Package tui provides the three-pane terminal UI for the reman shell command.
+// Package tui provides the three-pane terminal UI for the bodega shell command.
 //
 // Layout:
 //
@@ -13,14 +13,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"os/exec"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/config"
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/manifest"
-	bos3 "github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/s3"
+	"github.com/scaleapi/bodega/internal/audit"
+	"github.com/scaleapi/bodega/internal/config"
+	"github.com/scaleapi/bodega/internal/manifest"
+	bos3 "github.com/scaleapi/bodega/internal/s3"
+	"github.com/scaleapi/bodega/internal/server"
 )
 
 // focusTarget identifies which pane currently has keyboard focus.
@@ -28,6 +33,7 @@ type focusTarget int
 
 const (
 	focusSources focusTarget = iota
+	focusDetails
 	focusLog
 )
 
@@ -58,11 +64,16 @@ type appModel struct {
 
 	width     int
 	height    int
-	logHeight int // configurable log pane height
+	logHeight int    // configurable log pane height
+	logPath   string // session log file path for display
 
 	// filterMode is true when the user has pressed / in the Sources pane.
 	filterMode  bool
 	filterInput string
+
+	// lastCreated tracks the most recently created entry for post-save focus.
+	lastCreatedType string
+	lastCreatedName string
 
 	quitting bool
 }
@@ -82,14 +93,15 @@ func newAppModel(cfg *config.Config, store *manifest.Store, s3client *bos3.Clien
 	}
 	m.sources = newSourcesModel(nil) // populated after S3 status arrives
 	m.sources.focused = true
-	m.details = newDetailsModel(store, cfg.BuildRoot)
+	m.details = newDetailsModel(store, cfg)
 	m.log = newLogPane()
+	m.logPath = cfg.LogDir
 	return m
 }
 
 // Init is the bubbletea Init method. It fires the initial S3 status check.
 func (m appModel) Init() tea.Cmd {
-	return m.fetchS3Status()
+	return tea.Batch(m.fetchS3Status(), tea.EnableBracketedPaste)
 }
 
 // fetchS3Status returns a command that checks S3 status for all types.
@@ -189,15 +201,66 @@ func (m appModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+c":
 		m.quitting = true
 		return m, tea.Quit
+	case "ctrl+r":
+		// Reload manifests from backend (S3 or disk).
+		m.log.appendLog(dimStyle.Render("Reloading manifests..."))
+		cfg := m.cfg
+		s3c := m.s3client
+		return m, func() tea.Msg {
+			var store *manifest.Store
+			var err error
+			if cfg.LocalConfig || s3c == nil {
+				store, err = manifest.LoadAll(cfg.ManifestDir)
+			} else {
+				backend := &manifest.S3Backend{
+					Prefix: "manifests/",
+					GetFn:  s3c.GetObject,
+					PutFn:  s3c.PutBytes,
+					Label_: fmt.Sprintf("s3://%s/manifests/", cfg.Bucket),
+				}
+				store, err = manifest.LoadAllFromBackend(context.Background(), backend)
+			}
+			if err != nil {
+				return cmdOutputMsg{err: fmt.Errorf("reload manifests: %w", err)}
+			}
+			return storeRefreshMsg{store: store}
+		}
 	case "tab":
 		m = m.toggleFocus()
 		return m, nil
 	}
 
-	if m.focus == focusSources {
+	switch m.focus {
+	case focusSources:
 		return m.handleSourcesKey(msg)
+	case focusDetails:
+		return m.handleDetailsKey(msg)
+	default:
+		return m.handleLogKey(msg)
 	}
-	return m.handleLogKey(msg)
+}
+
+// handleDetailsKey handles keypresses when Details pane has focus.
+func (m appModel) handleDetailsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "up", "k":
+		m.details.ScrollUp()
+	case "down", "j":
+		m.details.ScrollDown()
+	case "tab", "esc":
+		m = m.toggleFocus()
+	case "q":
+		m.popup = popupModel{
+			kind:    popupConfirm,
+			message: "Quit bodega?",
+			onYes: func() {
+				m.quitting = true
+			},
+			pendingAsyncCmd: tea.Quit,
+		}
+		return m, nil
+	}
+	return m, nil
 }
 
 // handlePopupKey dispatches key events to the appropriate popup handler.
@@ -273,14 +336,22 @@ func (m appModel) handlePopupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// Bracketed paste: insert all runes at once.
+		if msg.Paste && len(msg.Runes) > 0 {
+			for _, r := range msg.Runes {
+				m.popup.HandleFormRune(r)
+			}
+			return m, nil
+		}
+
 		// Printable runes (not control keys) go to the active field.
 		if len(msg.Runes) == 1 {
 			isControl := key == "enter" || key == "tab" || key == "shift+tab" || key == "backspace" || key == "esc" ||
 				key == "up" || key == "down" || key == "left" || key == "right" || key == "home" || key == "end"
-			// Space is a control key on checkbox fields and Select fields.
+			// Space is a control key on checkbox, Select, and LabelSelect fields.
 			if key == " " && m.popup.formCursor < len(m.popup.formFields) {
 				f := m.popup.formFields[m.popup.formCursor]
-				if f.Checkbox || f.Select {
+				if f.Checkbox || f.Select || f.LabelSelect {
 					isControl = true
 				}
 			}
@@ -291,6 +362,16 @@ func (m appModel) handlePopupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		dismissed := m.popup.HandleFormKey(key)
 		if dismissed {
+			// Refresh the sources tree in case the form modified the store
+			// (create, edit). Harmless no-op if nothing changed.
+			m.sources.Refresh(m.store, m.statuses)
+			// Navigate to the newly created entry if one was just saved.
+			if m.lastCreatedName != "" {
+				m.sources.CursorToEntry(m.lastCreatedType, m.lastCreatedName)
+				m.lastCreatedType = ""
+				m.lastCreatedName = ""
+			}
+			m.syncDetails()
 			return m, nil
 		}
 		return m, nil
@@ -321,7 +402,7 @@ func (m appModel) handleFilterKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.sources.SetFilter(m.filterInput)
 	default:
-		if len(msg.Runes) == 1 {
+		if len(msg.Runes) > 0 {
 			m.filterInput += string(msg.Runes)
 			m.sources.SetFilter(m.filterInput)
 		}
@@ -347,10 +428,18 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.sources.ToggleExpand()
 		m.syncDetails()
 
+	case "right", "l":
+		m.sources.CursorToFirstChild()
+		m.syncDetails()
+
+	case "left", "h":
+		m.sources.CursorToParent()
+		m.syncDetails()
+
 	case "q":
 		m.popup = popupModel{
 			kind:    popupConfirm,
-			message: "Quit reman?",
+			message: "Quit bodega?",
 			onYes: func() {
 				m.quitting = true
 			},
@@ -381,11 +470,13 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			formField{Label: "Manifest dir", Value: m.cfg.ManifestDir},
 			formField{Label: "Log dir", Value: m.cfg.LogDir},
 			formField{Label: "Log window height", Value: fmt.Sprintf("%d", m.cfg.LogWindowHeight)},
+			formField{Label: "Deny list", Value: strings.Join(m.cfg.DenyList, ", "),
+				Hint: "Comma-separated CIDRs (e.g. 10.0.0.5, 192.168.1.0/24, fd00::/8)"},
 		)
 		cfgRef := m.cfg // capture for closures
 		p := popupModel{
 			kind:       popupForm,
-			formTitle:  "Configure reman (" + config.ConfigPath() + ")",
+			formTitle:  "Configure bodega (" + config.ConfigPath() + ")",
 			formFields: fields,
 			onChange: func(p *popupModel) {
 				// When Custom paths is toggled, show/hide per-type fields.
@@ -418,6 +509,20 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 				}
 			},
+			validate: func(fields []formField) string {
+				if dl := fieldValue(fields, "Deny list"); dl != "" {
+					var entries []string
+					for _, s := range strings.Split(dl, ",") {
+						if s = strings.TrimSpace(s); s != "" {
+							entries = append(entries, s)
+						}
+					}
+					if _, err := server.ParseDenyList(entries); err != nil {
+						return err.Error()
+					}
+				}
+				return ""
+			},
 			onFormSave: func(fields []formField) {
 				cfgRef.Bucket = fieldValue(fields, "Bucket")
 				cfgRef.Region = fieldValue(fields, "Region")
@@ -435,6 +540,17 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				cfgRef.GitRoot = fieldValue(fields, "Git root")
 				cfgRef.PypiRoot = fieldValue(fields, "PyPI root")
 				cfgRef.BinaryRoot = fieldValue(fields, "Binary root")
+				if dl := fieldValue(fields, "Deny list"); dl != "" {
+					var entries []string
+					for _, s := range strings.Split(dl, ",") {
+						if s = strings.TrimSpace(s); s != "" {
+							entries = append(entries, s)
+						}
+					}
+					cfgRef.DenyList = entries
+				} else {
+					cfgRef.DenyList = nil
+				}
 				if err := cfgRef.Save(); err != nil {
 					m.log.appendLog(errorStyle.Render("Failed to save config: " + err.Error()))
 				} else {
@@ -453,13 +569,8 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.filterInput = ""
 		m.sources.SetFilter("")
 
-	case " ":
-		// Expand/collapse group (same as Enter).
-		m.sources.ToggleExpand()
-		m.syncDetails()
-
-	case "m":
-		// Toggle mark on current entry (or group children).
+	case " ", "m":
+		// Toggle selection on current entry (and all children recursively).
 		m.sources.ToggleMark()
 
 	case "ctrl+a":
@@ -495,11 +606,11 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			kind:       popupBuildMenu,
 			buildTitle: title,
 		}
-		p.onBuildSelect = func(stage BuildStage) tea.Cmd {
+		p.onBuildSelect = func(stage BuildStage, force bool) tea.Cmd {
 			// Run entries sequentially to prevent log interleaving.
 			var cmds []tea.Cmd
 			for _, be := range buildEntries {
-				cmds = append(cmds, executeStage(stage, be.typ, be.name, cfg, store, s3client))
+				cmds = append(cmds, executeStage(stage, be.typ, be.name, cfg, store, s3client, force))
 			}
 			m.sources.ClearMarks()
 			return tea.Sequence(cmds...)
@@ -527,6 +638,10 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case "L":
+		m.popup = m.buildAuditPopup()
+		return m, nil
+
 	case "v":
 		m.log.appendLog(dimStyle.Render("Verifying manifests..."))
 		return m, executeVerify(m.cfg, m.store)
@@ -549,31 +664,75 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			},
 		}
 
-	case "D":
-		if node == nil || node.IsGroup {
+	case "H":
+		entries := m.sources.MarkedEntries()
+		if len(entries) == 0 {
 			return m, nil
+		}
+		for _, e := range entries {
+			toggleHidden(m.store, e.EntryType, e.Name)
+		}
+		m.sources.Refresh(m.store, m.statuses)
+		m.syncDetails()
+		count := len(entries)
+		if count == 1 {
+			m.log.appendLog(dimStyle.Render(fmt.Sprintf("Toggled hidden on %s/%s", entries[0].EntryType, entries[0].Name)))
+		} else {
+			m.log.appendLog(dimStyle.Render(fmt.Sprintf("Toggled hidden on %d entries", count)))
+		}
+
+	case "d", "D":
+		entries := m.sources.MarkedEntries()
+		if len(entries) == 0 {
+			return m, nil
+		}
+		var msg string
+		if len(entries) == 1 {
+			msg = fmt.Sprintf("Delete %s/%s from manifest?", entries[0].EntryType, entries[0].Name)
+		} else {
+			msg = fmt.Sprintf("Delete %d selected entries from manifests?", len(entries))
+		}
+		var cmds []tea.Cmd
+		for _, e := range entries {
+			cmds = append(cmds, executeDelete(e.EntryType, e.Name, m.store, m.s3client, m.cfg))
 		}
 		m.popup = popupModel{
 			kind:            popupConfirm,
-			message:         fmt.Sprintf("Delete %s/%s from manifest — are you sure?", node.EntryType, node.Name),
-			pendingAsyncCmd: executeDelete(node.EntryType, node.Name, m.store, m.s3client, m.cfg),
+			message:         msg,
+			pendingAsyncCmd: tea.Sequence(cmds...),
 		}
 
 	case "R":
-		if node == nil || node.IsGroup {
+		entries := m.sources.MarkedEntries()
+		if len(entries) == 0 {
 			return m, nil
+		}
+		var msg string
+		if len(entries) == 1 {
+			msg = fmt.Sprintf("Remove %s/%s artifact from S3?", entries[0].EntryType, entries[0].Name)
+		} else {
+			msg = fmt.Sprintf("Remove %d selected artifacts from S3?", len(entries))
+		}
+		var cmds []tea.Cmd
+		for _, e := range entries {
+			cmds = append(cmds, executeRemoveFromS3(e.EntryType, e.Name, m.store, m.s3client, m.cfg))
 		}
 		m.popup = popupModel{
 			kind:            popupConfirm,
-			message:         fmt.Sprintf("Remove %s/%s artifact from S3 — are you sure?", node.EntryType, node.Name),
-			pendingAsyncCmd: executeRemoveFromS3(node.EntryType, node.Name, m.store, m.s3client, m.cfg),
+			message:         msg,
+			pendingAsyncCmd: tea.Sequence(cmds...),
 		}
 
 	case "F":
-		if node == nil || node.IsGroup {
+		entries := m.sources.MarkedEntries()
+		if len(entries) == 0 {
 			return m, nil
 		}
-		return m, executeFreeze(node.EntryType, node.Name, m.store)
+		var cmds []tea.Cmd
+		for _, e := range entries {
+			cmds = append(cmds, executeFreeze(e.EntryType, e.Name, m.store))
+		}
+		return m, tea.Sequence(cmds...)
 	}
 
 	return m, nil
@@ -591,7 +750,7 @@ func (m appModel) handleLogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q":
 		m.popup = popupModel{
 			kind:    popupConfirm,
-			message: "Quit reman?",
+			message: "Quit bodega?",
 			onYes: func() {
 				m.quitting = true
 			},
@@ -604,14 +763,20 @@ func (m appModel) handleLogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // toggleFocus switches keyboard focus between Sources and Log panes.
 func (m appModel) toggleFocus() appModel {
-	if m.focus == focusSources {
+	m.sources.focused = false
+	m.details.focused = false
+	m.log.Blur()
+
+	switch m.focus {
+	case focusSources:
+		m.focus = focusDetails
+		m.details.focused = true
+	case focusDetails:
 		m.focus = focusLog
-		m.sources.focused = false
 		m.log.Focus()
-	} else {
+	default:
 		m.focus = focusSources
 		m.sources.focused = true
-		m.log.Blur()
 	}
 	return m
 }
@@ -623,6 +788,82 @@ func (m *appModel) syncDetails() {
 
 // fieldValue returns the Value for the first form field whose Label matches key,
 // or an empty string if not found.
+// buildAuditPopup constructs a form popup for querying the audit trail.
+func (m *appModel) buildAuditPopup() popupModel {
+	logPane := &m.log
+	cfg := m.cfg
+
+	p := popupModel{
+		kind:      popupForm,
+		formTitle: "Audit Log Query",
+		formFields: []formField{
+			{Label: "Event type", Value: "", Select: true,
+				Options: []string{"", "fetch", "build", "create", "delete", "cache"}},
+			{Label: "Pkg type", Value: "", Select: true,
+				Options: []string{"", "apt", "git", "pypi", "binary", "gomod", "helm", "npm"}},
+			{Label: "Pkg name", Value: ""},
+			{Label: "Client IP", Value: ""},
+			{Label: "Limit", Value: "50"},
+		},
+	}
+
+	p.onFormSave = func(fields []formField) {
+		db, err := audit.Open(cfg.AuditDB)
+		if err != nil {
+			logPane.appendLog(errorStyle.Render("Could not open audit db: " + err.Error()))
+			return
+		}
+		defer db.Close()
+
+		limit := 50
+		if l := fieldValue(fields, "Limit"); l != "" {
+			if v, err := fmt.Sscanf(l, "%d", &limit); v != 1 || err != nil {
+				limit = 50
+			}
+		}
+
+		f := audit.Filter{
+			EventType: audit.EventType(fieldValue(fields, "Event type")),
+			PkgType:   fieldValue(fields, "Pkg type"),
+			PkgName:   fieldValue(fields, "Pkg name"),
+			ClientIP:  fieldValue(fields, "Client IP"),
+			Limit:     limit,
+		}
+
+		ctx := context.Background()
+		events, err := db.Query(ctx, f)
+		if err != nil {
+			logPane.appendLog(errorStyle.Render("Audit query failed: " + err.Error()))
+			return
+		}
+
+		if len(events) == 0 {
+			logPane.appendLog(dimStyle.Render("No matching audit events."))
+			return
+		}
+
+		logPane.appendLog(dimStyle.Render(fmt.Sprintf("── Audit Log (%d events) ──", len(events))))
+		logPane.appendLog(fmt.Sprintf("%-20s %-8s %-8s %-30s %-10s %-15s %s",
+			"TIMESTAMP", "EVENT", "TYPE", "NAME", "STATUS", "CLIENT", "DURATION"))
+
+		for _, ev := range events {
+			dur := ""
+			if ev.DurationMs > 0 {
+				dur = fmt.Sprintf("%dms", ev.DurationMs)
+			}
+			ts := ev.Timestamp.Format("2006-01-02 15:04:05")
+			name := ev.PkgName
+			if ev.PkgVersion != "" {
+				name += "@" + ev.PkgVersion
+			}
+			logPane.appendLog(fmt.Sprintf("%-20s %-8s %-8s %-30s %-10s %-15s %s",
+				ts, ev.EventType, ev.PkgType, name, ev.Status, ev.ClientIP, dur))
+		}
+	}
+
+	return p
+}
+
 func fieldValue(fields []formField, key string) string {
 	for _, f := range fields {
 		if f.Label == key {
@@ -684,6 +925,19 @@ func buildEditFields(store *manifest.Store, node *TreeNode) []formField {
 
 // --- Create form helpers ---
 
+// createTypeOptions is the alphabetically sorted list of types for the create form,
+// with a placeholder prompt as the first entry.
+var createTypeOptions = []string{
+	"Select...",
+	manifest.TypeApt,
+	manifest.TypeBinary,
+	manifest.TypeGit,
+	manifest.TypeGomod,
+	manifest.TypeHelm,
+	manifest.TypeNpm,
+	manifest.TypePypi,
+}
+
 // buildCreatePopup constructs the initial popupModel for the "c" create flow.
 // It starts with only the Type Select field; the onChange hook rebuilds the
 // remaining fields when the user confirms a type selection.
@@ -697,26 +951,69 @@ func (m *appModel) buildCreatePopup() popupModel {
 		formFields: []formField{
 			{
 				Label:   "Type",
-				Value:   manifest.TypeApt,
+				Value:   "Select...",
 				Select:  true,
-				Options: []string{manifest.TypeApt, manifest.TypeGit, manifest.TypePypi, manifest.TypeBinary},
+				Options: createTypeOptions,
 			},
 		},
 	}
 
-	// Expand to full field set for the default type immediately so the form is
-	// useful without requiring the user to first open the submenu.
-	p.formFields = rebuildCreateFields(manifest.TypeApt, p.formFields)
+	// Don't expand fields yet -- user must select a type first.
 
 	p.onChange = func(pp *popupModel) {
 		entryType := fieldValueFromSlice(pp.formFields, "Type")
 		pp.formFields = rebuildCreateFields(entryType, pp.formFields)
 		// Update checksum hint on every change.
 		updateChecksumHint(pp.formFields)
+
+		// Auto-fill Name from URL when navigating away from the URL field.
+		if pp.prevCursor != pp.formCursor &&
+			pp.prevCursor < len(pp.formFields) &&
+			pp.formFields[pp.prevCursor].Label == "URL" {
+			urlVal := fieldValueFromSlice(pp.formFields, "URL")
+			if urlVal != "" && strings.Contains(urlVal, "://") {
+				nameVal := fieldValueFromSlice(pp.formFields, "Name")
+				if nameVal == "" {
+					derived := extractNameFromURL(urlVal, entryType)
+					for i := range pp.formFields {
+						if pp.formFields[i].Label == "Name" {
+							pp.formFields[i].Value = derived
+							pp.formFields[i].cursor = len([]rune(derived))
+							break
+						}
+					}
+				}
+			}
+		}
 	}
 
 	p.validate = func(fields []formField) string {
-		return validateCreateFields(fields)
+		if msg := validateCreateFields(fields); msg != "" {
+			return msg
+		}
+		entryType := fieldValueFromSlice(fields, "Type")
+		name := fieldValueFromSlice(fields, "Name")
+		var exists bool
+		switch entryType {
+		case manifest.TypeApt:
+			exists = store.FindApt(name) != nil
+		case manifest.TypeGit:
+			exists = store.FindGit(name) != nil
+		case manifest.TypeBinary:
+			exists = store.FindBinary(name) != nil
+		case manifest.TypeGomod:
+			exists = store.FindGomod(name) != nil
+		case manifest.TypeHelm:
+			exists = store.FindHelm(name) != nil
+		case manifest.TypeNpm:
+			exists = store.FindNpm(name) != nil
+		case manifest.TypePypi:
+			exists = store.FindPypiPackage(name) != nil
+		}
+		if exists {
+			return fmt.Sprintf("%s/%s already exists", entryType, name)
+		}
+		return ""
 	}
 
 	p.onFormSave = func(fields []formField) {
@@ -725,6 +1022,11 @@ func (m *appModel) buildCreatePopup() popupModel {
 		} else {
 			entryType := fieldValueFromSlice(fields, "Type")
 			name := fieldValueFromSlice(fields, "Name")
+			if name == "" {
+				name = extractNameFromURL(fieldValueFromSlice(fields, "URL"), entryType)
+			}
+			m.lastCreatedType = entryType
+			m.lastCreatedName = name
 			logPane.appendLog(successStyle.Render(
 				fmt.Sprintf("Created %s/%s", entryType, name),
 			))
@@ -739,15 +1041,26 @@ func (m *appModel) buildCreatePopup() popupModel {
 // The Type field (index 0) is always preserved as the first element.
 func rebuildCreateFields(entryType string, prev []formField) []formField {
 	prevValues := make(map[string]string, len(prev))
+	prevCursors := make(map[string]int, len(prev))
+	prevLabelSelect := make(map[string]string, len(prev))
 	for _, f := range prev {
 		prevValues[f.Label] = f.Value
+		prevCursors[f.Label] = f.cursor
+		if f.LabelSelect {
+			prevLabelSelect[f.Label] = f.LabelSelectValue
+		}
 	}
 
 	typeField := formField{
 		Label:   "Type",
 		Value:   entryType,
 		Select:  true,
-		Options: []string{manifest.TypeApt, manifest.TypeGit, manifest.TypePypi, manifest.TypeBinary},
+		Options: createTypeOptions,
+	}
+
+	// If no type selected yet, just return the type field alone.
+	if entryType == "Select..." || entryType == "" {
+		return []formField{typeField}
 	}
 
 	restore := func(label, defaultVal string) string {
@@ -757,53 +1070,198 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 		return defaultVal
 	}
 
+	restoreCursors := func(fields []formField) []formField {
+		for i := range fields {
+			if c, ok := prevCursors[fields[i].Label]; ok {
+				fields[i].cursor = c
+			}
+		}
+		return fields
+	}
+
 	switch entryType {
 	case manifest.TypeGit:
-		return []formField{
-			typeField,
-			{Label: "Name", Value: restore("Name", "")},
-			{Label: "URL", Value: restore("URL", "")},
-			{Label: "Ref", Value: restore("Ref", "")},
-			{Label: "Frozen", Value: restore("Frozen", "no"), Checkbox: true},
-		}
-
-	case manifest.TypePypi:
-		return []formField{
+		return restoreCursors([]formField{
 			typeField,
 			{Label: "Name", Value: restore("Name", ""),
+				Hint: "leave blank to derive from URL"},
+			{Label: "URL", Value: restore("URL", "")},
+			{Label: "Ref", Value: restore("Ref", "")},
+			{Label: "Skip validation", Value: restore("Skip validation", "no"), Checkbox: true,
+				Hint: "skip URL/ref reachability check"},
+			{Label: "Auto-import deps", Value: restore("Auto-import deps", "yes"), Checkbox: true,
+				Hint: "auto-import discovered dependencies; disable for interactive review"},
+		})
+
+	case manifest.TypePypi:
+		modeVal := restore("Mode", "hosted")
+		isProxy := modeVal == "proxy"
+		constraintVal := prevLabelSelect["Version"]
+		if constraintVal == "" {
+			constraintVal = "exact (=)"
+		}
+		if !isProxy {
+			constraintVal = "exact (=)"
+		}
+		versionDisabled := constraintVal == "latest (*)"
+		versionVal := restore("Version", "")
+		if versionDisabled {
+			versionVal = "*"
+		}
+		return restoreCursors([]formField{
+			typeField,
+			{Label: "Mode", Value: modeVal, Select: true,
+				Options: []string{"hosted", "proxy"},
+				Hint: "hosted = build wheels locally; proxy = fetch from upstream PyPI on demand"},
+			{Label: "Name", Value: restore("Name", ""),
 				Hint: "pip package specifier, e.g. boto3 or social-auth-core[openidconnect]"},
+			{Label: "Version", Value: versionVal, Disabled: versionDisabled,
+				LabelSelect: true, LabelSelectValue: constraintVal,
+				LabelSelectOptions: []string{"exact (=)", "compatible (^)", "patch (~)", "latest (*)"},
+				Hint: "e.g. 1.6.1 (leave blank for latest)"},
 			{Label: "Required By", Value: restore("Required By", ""),
 				Hint: "comma-separated, e.g. netbox,standalone"},
-			{Label: "Frozen", Value: restore("Frozen", "no"), Checkbox: true},
-		}
+		})
 
 	case manifest.TypeBinary:
 		latestVal := restore("Latest", "no")
 		versionDisabled := latestVal == "yes"
 		versionVal := restore("Version", "")
-		if versionDisabled {
+		if latestVal == "yes" {
 			versionVal = "latest"
 		}
 		checksumVal := restore("Checksum", "")
-		return []formField{
+		return restoreCursors([]formField{
 			typeField,
-			{Label: "Name", Value: restore("Name", "")},
-			{Label: "Version", Value: versionVal, Disabled: versionDisabled},
+			{Label: "Name", Value: restore("Name", ""),
+				Hint: "leave blank to derive from URL"},
+			{Label: "Version", Value: versionVal, Disabled: versionDisabled,
+				LabelSelect: true, LabelSelectValue: "exact (=)",
+				LabelSelectOptions: []string{"exact (=)", "compatible (^)", "patch (~)", "latest (*)"}},
 			{Label: "URL", Value: restore("URL", "")},
 			{Label: "Filename", Value: restore("Filename", ""),
 				Hint: "leave empty to derive from URL"},
 			{Label: "Checksum", Value: checksumVal,
 				Hint: checksumHint(checksumVal)},
 			{Label: "Latest", Value: latestVal, Checkbox: true},
-			{Label: "Frozen", Value: restore("Frozen", "no"), Checkbox: true},
+			{Label: "Skip validation", Value: restore("Skip validation", "no"), Checkbox: true,
+				Hint: "skip URL reachability check"},
+		})
+
+	case manifest.TypeGomod:
+		modeVal := restore("Mode", "hosted")
+		isProxy := modeVal == "proxy"
+		constraintVal := prevLabelSelect["Version"]
+		if constraintVal == "" {
+			constraintVal = "exact (=)"
 		}
+		if !isProxy {
+			constraintVal = "exact (=)"
+		}
+		versionDisabled := constraintVal == "latest (*)"
+		versionVal := restore("Version", "")
+		if versionDisabled {
+			versionVal = "*"
+		}
+		checksumVal := restore("Checksum", "")
+		return restoreCursors([]formField{
+			typeField,
+			{Label: "Mode", Value: modeVal, Select: true,
+				Options: []string{"hosted", "proxy"},
+				Hint: "hosted = S3 only; proxy = fetch from upstream on cache miss"},
+			{Label: "Name", Value: restore("Name", ""),
+				Hint: "module path, e.g. github.com/aws/aws-sdk-go-v2"},
+			{Label: "Version", Value: versionVal, Disabled: versionDisabled,
+				LabelSelect: true, LabelSelectValue: constraintVal,
+				LabelSelectOptions: []string{"exact (=)", "compatible (^)", "patch (~)", "latest (*)"},
+				Hint: "e.g. v1.30.0"},
+			{Label: "URL", Value: restore("URL", ""),
+				Hint: "upstream GOPROXY URL; leave empty for proxy.golang.org"},
+			{Label: "Checksum", Value: checksumVal,
+				Hint: checksumHint(checksumVal)},
+			{Label: "Skip validation", Value: restore("Skip validation", "no"), Checkbox: true,
+				Hint: "skip URL reachability check"},
+		})
+
+	case manifest.TypeHelm:
+		modeVal := restore("Mode", "hosted")
+		isProxy := modeVal == "proxy"
+		constraintVal := prevLabelSelect["Version"]
+		if constraintVal == "" {
+			constraintVal = "exact (=)"
+		}
+		if !isProxy {
+			constraintVal = "exact (=)"
+		}
+		versionDisabled := constraintVal == "latest (*)"
+		versionVal := restore("Version", "")
+		if versionDisabled {
+			versionVal = "*"
+		}
+		checksumVal := restore("Checksum", "")
+		return restoreCursors([]formField{
+			typeField,
+			{Label: "Mode", Value: modeVal, Select: true,
+				Options: []string{"hosted", "proxy"},
+				Hint: "hosted = S3 only; proxy = fetch from upstream on cache miss"},
+			{Label: "Name", Value: restore("Name", ""),
+				Hint: "chart name, e.g. ingress-nginx"},
+			{Label: "Version", Value: versionVal, Disabled: versionDisabled,
+				LabelSelect: true, LabelSelectValue: constraintVal,
+				LabelSelectOptions: []string{"exact (=)", "compatible (^)", "patch (~)", "latest (*)"}},
+			{Label: "URL", Value: restore("URL", ""),
+				Hint: "chart repo URL or direct .tgz download URL"},
+			{Label: "App Version", Value: restore("App Version", "")},
+			{Label: "Checksum", Value: checksumVal,
+				Hint: checksumHint(checksumVal)},
+			{Label: "Skip validation", Value: restore("Skip validation", "no"), Checkbox: true,
+				Hint: "skip URL reachability check"},
+		})
+
+	case manifest.TypeNpm:
+		modeVal := restore("Mode", "hosted")
+		isProxy := modeVal == "proxy"
+		constraintVal := prevLabelSelect["Version"]
+		if constraintVal == "" {
+			constraintVal = "exact (=)"
+		}
+		if !isProxy {
+			constraintVal = "exact (=)"
+		}
+		versionDisabled := constraintVal == "latest (*)"
+		versionVal := restore("Version", "")
+		if versionDisabled {
+			versionVal = "*"
+		}
+		checksumVal := restore("Checksum", "")
+		return restoreCursors([]formField{
+			typeField,
+			{Label: "Mode", Value: modeVal, Select: true,
+				Options: []string{"hosted", "proxy"},
+				Hint: "hosted = S3 only; proxy = fetch from upstream on cache miss"},
+			{Label: "Name", Value: restore("Name", ""),
+				Hint: "package name, e.g. lodash or @scope/pkg"},
+			{Label: "Version", Value: versionVal, Disabled: versionDisabled,
+				LabelSelect: true, LabelSelectValue: constraintVal,
+				LabelSelectOptions: []string{"exact (=)", "compatible (^)", "patch (~)", "latest (*)"}},
+			{Label: "URL", Value: restore("URL", ""),
+				Hint: "upstream registry URL; leave empty for registry.npmjs.org"},
+			{Label: "Checksum", Value: checksumVal,
+				Hint: checksumHint(checksumVal)},
+			{Label: "Skip validation", Value: restore("Skip validation", "no"), Checkbox: true,
+				Hint: "skip URL reachability check"},
+		})
 
 	default: // manifest.TypeApt
+		versionVal := restore("Version", "")
 		checksumVal := restore("Checksum", "")
-		return []formField{
+		return restoreCursors([]formField{
 			typeField,
-			{Label: "Name", Value: restore("Name", "")},
-			{Label: "Version", Value: restore("Version", "")},
+			{Label: "Name", Value: restore("Name", ""),
+				Hint: "leave blank to derive from URL"},
+			{Label: "Version", Value: versionVal,
+				LabelSelect: true, LabelSelectValue: "exact (=)",
+				LabelSelectOptions: []string{"exact (=)", "compatible (^)", "patch (~)", "latest (*)"}},
 			{Label: "URL", Value: restore("URL", ""),
 				Hint: "git repo URL for source build; leave empty for apt repo"},
 			{Label: "Source Name", Value: restore("Source Name", ""),
@@ -812,8 +1270,9 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 			{Label: "Deb Glob", Value: restore("Deb Glob", "")},
 			{Label: "Checksum", Value: checksumVal,
 				Hint: checksumHint(checksumVal)},
-			{Label: "Frozen", Value: restore("Frozen", "no"), Checkbox: true},
-		}
+			{Label: "Skip validation", Value: restore("Skip validation", "no"), Checkbox: true,
+				Hint: "skip URL reachability check"},
+		})
 	}
 }
 
@@ -827,7 +1286,7 @@ func updateChecksumHint(fields []formField) {
 		if fields[i].Label == "Latest" {
 			latestOn := fields[i].Value == "yes"
 			for j := range fields {
-				if fields[j].Label == "Version" {
+				if fields[j].Label == "Version" && fields[j].LabelSelect {
 					fields[j].Disabled = latestOn
 					if latestOn {
 						fields[j].Value = "latest"
@@ -837,19 +1296,54 @@ func updateChecksumHint(fields []formField) {
 				}
 			}
 		}
-		// Auto-fill Name from URL when cursor moved away from URL.
-		if fields[i].Label == "URL" {
-			urlVal := fields[i].Value
-			if urlVal != "" {
-				for j := range fields {
-					if fields[j].Label == "Name" && fields[j].Value == "" {
-						entryType := fieldValueFromSlice(fields, "Type")
-						fields[j].Value = extractNameFromURL(urlVal, entryType)
-						fields[j].cursor = len([]rune(fields[j].Value))
+		// Handle Mode ↔ Constraint coupling: constraint only active in proxy mode.
+		if fields[i].Label == "Mode" && fields[i].Select {
+			isProxy := fields[i].Value == "proxy"
+			for j := range fields {
+				if fields[j].Label == "Version" && fields[j].LabelSelect {
+					if !isProxy {
+						fields[j].LabelSelectValue = "equals"
+						fields[j].Disabled = false
+						if fields[j].Value == "*" {
+							fields[j].Value = ""
+						}
 					}
 				}
 			}
 		}
+		// Handle Constraint ↔ Version coupling and dynamic hint.
+		if fields[i].Label == "Version" && fields[i].LabelSelect {
+			anyOn := fields[i].LabelSelectValue == "latest (*)"
+			// Don't override if Latest is also active.
+			latestOn := false
+			for _, f := range fields {
+				if f.Label == "Latest" && f.Value == "yes" {
+					latestOn = true
+					break
+				}
+			}
+			if !latestOn {
+				fields[i].Disabled = anyOn
+				if anyOn {
+					fields[i].Value = "*"
+				} else if fields[i].Value == "*" {
+					fields[i].Value = ""
+				}
+			}
+			// Update hint based on selected constraint.
+			switch fields[i].LabelSelectValue {
+			case "exact (=)":
+				fields[i].Hint = "only this exact version"
+			case "compatible (^)":
+				fields[i].Hint = "same major, any minor/patch (^5.2 = 5.2.0 to 5.x.x)"
+			case "patch (~)":
+				fields[i].Hint = "same major.minor, any patch (~5.2 = 5.2.0 to 5.2.x)"
+			case "latest (*)":
+				fields[i].Hint = "all available versions"
+			}
+		}
+		// Note: Name auto-fill from URL is handled in the onChange callback
+		// of buildCreatePopup, triggered only when navigating away from the URL field.
 	}
 }
 
@@ -858,11 +1352,18 @@ func updateChecksumHint(fields []formField) {
 func validateCreateFields(fields []formField) string {
 	entryType := fieldValueFromSlice(fields, "Type")
 	if !isValidType(entryType) {
-		return "select a valid type (apt/git/pypi/binary)"
+		return "select a valid type"
 	}
 	name := fieldValueFromSlice(fields, "Name")
 	if name == "" {
-		return "Name is required"
+		// Allow blank if we can derive from URL.
+		url := fieldValueFromSlice(fields, "URL")
+		if url != "" {
+			name = extractNameFromURL(url, entryType)
+		}
+		if name == "" {
+			return "Name is required"
+		}
 	}
 	switch entryType {
 	case manifest.TypeGit:
@@ -876,13 +1377,163 @@ func validateCreateFields(fields []formField) string {
 		if fieldValueFromSlice(fields, "URL") == "" {
 			return "URL is required for binary entries"
 		}
+	case manifest.TypeGomod:
+		if fieldValueFromSlice(fields, "Version") == "" {
+			return "Version is required for gomod entries"
+		}
+	case manifest.TypeHelm:
+		if fieldValueFromSlice(fields, "Version") == "" {
+			return "Version is required for helm entries"
+		}
+		if fieldValueFromSlice(fields, "URL") == "" {
+			return "URL is required for helm entries"
+		}
+	case manifest.TypeNpm:
+		if fieldValueFromSlice(fields, "Version") == "" {
+			return "Version is required for npm entries"
+		}
 	}
 	// Block save if checksum is present but invalid.
 	chk := fieldValueFromSlice(fields, "Checksum")
 	if chk != "" && detectChecksumAlgorithm(chk) == "" {
 		return "invalid checksum value"
 	}
+
+	// Remote reachability checks (skipped when "Skip validation" is toggled).
+	if fieldValueFromSlice(fields, "Skip validation") != "yes" {
+		if msg := validateRemote(entryType, fields); msg != "" {
+			return msg
+		}
+	}
 	return ""
+}
+
+// validateRemote checks that remote resources (URLs, git refs) are reachable.
+func validateRemote(entryType string, fields []formField) string {
+	switch entryType {
+	case manifest.TypeGit:
+		url := fieldValueFromSlice(fields, "URL")
+		ref := fieldValueFromSlice(fields, "Ref")
+		return validateGitRef(url, ref)
+	case manifest.TypeBinary:
+		url := fieldValueFromSlice(fields, "URL")
+		return validateURLReachable(url)
+	case manifest.TypeApt:
+		url := fieldValueFromSlice(fields, "URL")
+		if url != "" {
+			return validateURLReachable(url)
+		}
+	case manifest.TypeHelm:
+		url := fieldValueFromSlice(fields, "URL")
+		return validateURLReachable(url)
+	case manifest.TypeGomod:
+		url := fieldValueFromSlice(fields, "URL")
+		if url != "" {
+			return validateURLReachable(url)
+		}
+	case manifest.TypeNpm:
+		url := fieldValueFromSlice(fields, "URL")
+		if url != "" {
+			return validateURLReachable(url)
+		}
+	}
+	return ""
+}
+
+// validateGitRef uses git ls-remote to verify the URL is reachable and the ref
+// exists. Returns an error message or empty string on success.
+func validateGitRef(url, ref string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "git", "ls-remote", "--refs", url).CombinedOutput()
+	if err != nil {
+		return fmt.Sprintf("cannot reach %s: %v", url, err)
+	}
+	// ls-remote output: "<sha>\t<refname>\n" per line.
+	// Match ref against tag refs, branch refs, or exact ref names.
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			continue
+		}
+		remoteName := parts[1]
+		// Match tags: refs/tags/v1.0.0
+		if remoteName == "refs/tags/"+ref || remoteName == "refs/heads/"+ref || remoteName == ref {
+			return ""
+		}
+	}
+	return fmt.Sprintf("ref %q not found in %s", ref, url)
+}
+
+// validateURLReachable sends an HTTP HEAD request to verify the URL is reachable.
+func validateURLReachable(url string) string {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Head(url)
+	if err != nil {
+		return fmt.Sprintf("cannot reach %s: %v", url, err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Sprintf("URL returned %d: %s", resp.StatusCode, url)
+	}
+	return ""
+}
+
+// toggleHidden flips the Hidden flag on a manifest entry and saves.
+func toggleHidden(store *manifest.Store, entryType, name string) {
+	switch entryType {
+	case manifest.TypeApt:
+		if e := store.FindApt(name); e != nil {
+			e.Hidden = !e.Hidden
+			_ = store.SaveApt()
+		}
+	case manifest.TypeGit:
+		if e := store.FindGit(name); e != nil {
+			e.Hidden = !e.Hidden
+			_ = store.SaveGit()
+		}
+	case manifest.TypePypi:
+		if e := store.FindPypiPackage(name); e != nil {
+			e.Hidden = !e.Hidden
+			_ = store.SavePypi()
+		}
+	case manifest.TypeBinary:
+		if e := store.FindBinary(name); e != nil {
+			e.Hidden = !e.Hidden
+			_ = store.SaveBinary()
+		}
+	case manifest.TypeGomod:
+		if e := store.FindGomod(name); e != nil {
+			e.Hidden = !e.Hidden
+			_ = store.SaveGomod()
+		}
+	case manifest.TypeHelm:
+		if e := store.FindHelm(name); e != nil {
+			e.Hidden = !e.Hidden
+			_ = store.SaveHelm()
+		}
+	case manifest.TypeNpm:
+		if e := store.FindNpm(name); e != nil {
+			e.Hidden = !e.Hidden
+			_ = store.SaveNpm()
+		}
+	}
+}
+
+// constraintToManifest maps the form dropdown value to a manifest constant.
+// Returns "" for "equals" (the default, omitted from JSON).
+func constraintToManifest(formVal string) string {
+	switch formVal {
+	case "latest (*)":
+		return manifest.ConstraintAny
+	case "compatible (^)":
+		return manifest.ConstraintCompatible
+	case "patch (~)":
+		return manifest.ConstraintPatch
+	default:
+		return "" // "exact (=)" → omit
+	}
 }
 
 // saveCreateEntry builds the appropriate manifest entry from fields and appends
@@ -890,6 +1541,9 @@ func validateCreateFields(fields []formField) string {
 func saveCreateEntry(store *manifest.Store, fields []formField) error {
 	entryType := fieldValueFromSlice(fields, "Type")
 	name := fieldValueFromSlice(fields, "Name")
+	if name == "" {
+		name = extractNameFromURL(fieldValueFromSlice(fields, "URL"), entryType)
+	}
 
 	var chksum *manifest.Checksum
 	if chkVal := fieldValueFromSlice(fields, "Checksum"); chkVal != "" {
@@ -899,19 +1553,26 @@ func saveCreateEntry(store *manifest.Store, fields []formField) error {
 		}
 	}
 
-	frozen := fieldValueFromSlice(fields, "Frozen") == "yes"
+	frozen := false // set post-creation via F key
+	version := fieldValueFromSlice(fields, "Version")
+	constraint := constraintToManifest(labelSelectValue(fields, "Version"))
+	mode := fieldValueFromSlice(fields, "Mode")
+	if mode == manifest.ModeHosted {
+		mode = "" // omit default
+	}
 
 	switch entryType {
 	case manifest.TypeApt:
 		entry := manifest.AptEntry{
-			Name:       name,
-			Version:    fieldValueFromSlice(fields, "Version"),
-			URL:        fieldValueFromSlice(fields, "URL"),
-			SourceName: fieldValueFromSlice(fields, "Source Name"),
-			BuildCmd:   fieldValueFromSlice(fields, "Build Cmd"),
-			DebGlob:    fieldValueFromSlice(fields, "Deb Glob"),
-			Checksum:   chksum,
-			Frozen:     frozen,
+			Name:              name,
+			Version:           version,
+			URL:               fieldValueFromSlice(fields, "URL"),
+			SourceName:        fieldValueFromSlice(fields, "Source Name"),
+			BuildCmd:          fieldValueFromSlice(fields, "Build Cmd"),
+			DebGlob:           fieldValueFromSlice(fields, "Deb Glob"),
+			Checksum:          chksum,
+			VersionConstraint: constraint,
+			Frozen:            frozen,
 		}
 		store.Apt = append(store.Apt, entry)
 		return store.SaveApt()
@@ -936,26 +1597,74 @@ func saveCreateEntry(store *manifest.Store, fields []formField) error {
 				}
 			}
 		}
+		pypiMode := mode
+		if pypiMode == manifest.ModeHosted {
+			pypiMode = "" // omit default
+		}
 		entry := manifest.PypiPackage{
-			Name:       name,
-			RequiredBy: requiredBy,
-			Checksum:   chksum,
-			Frozen:     frozen,
+			Name:              name,
+			Version:           version,
+			RequiredBy:        requiredBy,
+			Mode:              pypiMode,
+			VersionConstraint: constraint,
+			Checksum:          chksum,
+			Frozen:            frozen,
 		}
 		store.Pypi.Packages = append(store.Pypi.Packages, entry)
 		return store.SavePypi()
 
 	case manifest.TypeBinary:
 		entry := manifest.BinaryEntry{
-			Name:     name,
-			Version:  fieldValueFromSlice(fields, "Version"),
-			URL:      fieldValueFromSlice(fields, "URL"),
-			Filename: fieldValueFromSlice(fields, "Filename"),
-			Checksum: chksum,
-			Frozen:   frozen,
+			Name:              name,
+			Version:           version,
+			URL:               fieldValueFromSlice(fields, "URL"),
+			Filename:          fieldValueFromSlice(fields, "Filename"),
+			Checksum:          chksum,
+			VersionConstraint: constraint,
+			Frozen:            frozen,
 		}
 		store.Binary = append(store.Binary, entry)
 		return store.SaveBinary()
+
+	case manifest.TypeGomod:
+		entry := manifest.GomodEntry{
+			Name:              name,
+			Version:           version,
+			URL:               fieldValueFromSlice(fields, "URL"),
+			Mode:              mode,
+			VersionConstraint: constraint,
+			Checksum:          chksum,
+			Frozen:            frozen,
+		}
+		store.Gomod = append(store.Gomod, entry)
+		return store.SaveGomod()
+
+	case manifest.TypeHelm:
+		entry := manifest.HelmEntry{
+			Name:              name,
+			Version:           version,
+			URL:               fieldValueFromSlice(fields, "URL"),
+			AppVersion:        fieldValueFromSlice(fields, "App Version"),
+			Mode:              mode,
+			VersionConstraint: constraint,
+			Checksum:          chksum,
+			Frozen:            frozen,
+		}
+		store.Helm = append(store.Helm, entry)
+		return store.SaveHelm()
+
+	case manifest.TypeNpm:
+		entry := manifest.NpmEntry{
+			Name:              name,
+			Version:           version,
+			URL:               fieldValueFromSlice(fields, "URL"),
+			Mode:              mode,
+			VersionConstraint: constraint,
+			Checksum:          chksum,
+			Frozen:            frozen,
+		}
+		store.Npm = append(store.Npm, entry)
+		return store.SaveNpm()
 
 	default:
 		return fmt.Errorf("unknown entry type %q", entryType)
@@ -1086,22 +1795,40 @@ func checksumHint(val string) string {
 // For binary URLs it strips common archive suffixes.
 // Returns an empty string when no sensible name can be derived.
 func extractNameFromURL(rawURL, entryType string) string {
-	seg := lastURLSegment(rawURL)
-	if seg == "" {
-		return ""
-	}
 	switch entryType {
 	case manifest.TypeGit:
-		seg = strings.TrimSuffix(seg, ".git")
-	case manifest.TypeBinary, manifest.TypeApt:
+		// For git URLs, extract org/repo: https://github.com/org/repo.git -> org/repo
+		rawURL = strings.TrimSuffix(rawURL, ".git")
+		rawURL = strings.TrimSuffix(rawURL, "/")
+		parts := strings.Split(rawURL, "/")
+		if len(parts) >= 2 {
+			return parts[len(parts)-2] + "/" + parts[len(parts)-1]
+		}
+		if len(parts) >= 1 {
+			return parts[len(parts)-1]
+		}
+		return ""
+	case manifest.TypeGomod:
+		// Go module paths are already the name: github.com/aws/aws-sdk-go-v2
+		return rawURL
+	case manifest.TypeNpm:
+		// npm: last segment or @scope/name
+		seg := lastURLSegment(rawURL)
+		return seg
+	default:
+		seg := lastURLSegment(rawURL)
+		if seg == "" {
+			return ""
+		}
+		// Strip common archive extensions for binary/apt.
 		for _, ext := range []string{".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".zip", ".deb", ".rpm"} {
 			if strings.HasSuffix(seg, ext) {
 				seg = seg[:len(seg)-len(ext)]
 				break
 			}
 		}
+		return seg
 	}
-	return seg
 }
 
 // fieldValueFromSlice is like fieldValue but operates on a plain slice (not the
@@ -1110,6 +1837,16 @@ func fieldValueFromSlice(fields []formField, key string) string {
 	for _, f := range fields {
 		if f.Label == key {
 			return f.Value
+		}
+	}
+	return ""
+}
+
+// labelSelectValue returns the LabelSelectValue of the first LabelSelect field with the given label.
+func labelSelectValue(fields []formField, label string) string {
+	for _, f := range fields {
+		if f.Label == label && f.LabelSelect {
+			return f.LabelSelectValue
 		}
 	}
 	return ""
@@ -1183,7 +1920,7 @@ func (m *appModel) relayout() {
 	}
 	topContentH := topTotalH - frameH
 
-	sourcesTotalW := m.width * 40 / 100
+	sourcesTotalW := m.width * 30 / 100
 	if sourcesTotalW < 20+frameW {
 		sourcesTotalW = 20 + frameW
 	}
@@ -1195,8 +1932,7 @@ func (m *appModel) relayout() {
 
 	m.sources.width = sourcesContentW
 	m.sources.height = topContentH
-	m.details.width = detailsContentW
-	m.details.height = topContentH
+	m.details.SetSize(detailsContentW, topContentH)
 	m.log.SetSize(logContentW, logContentH)
 }
 
@@ -1223,7 +1959,7 @@ func (m appModel) View() string {
 	}
 
 	detailsInner := m.details.View()
-	detailsPane := paneStyle(false).
+	detailsPane := paneStyle(m.focus == focusDetails).
 		Width(m.details.width).
 		Height(m.details.height).
 		Render(detailsInner)
@@ -1237,7 +1973,11 @@ func (m appModel) View() string {
 		Width(m.log.width).
 		Height(m.log.height).
 		Render(logInner)
-	logTitle := titleStyle(m.focus == focusLog).Render(" Log ")
+	logLabel := " Log "
+	if m.logPath != "" {
+		logLabel = " Log - " + m.logPath + " "
+	}
+	logTitle := titleStyle(m.focus == focusLog).Render(logLabel)
 	logPane = overlayTitle(logPane, logTitle)
 
 	screen := lipgloss.JoinVertical(lipgloss.Left, topRow, logPane)

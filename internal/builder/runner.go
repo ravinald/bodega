@@ -11,7 +11,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/logging"
+	"github.com/scaleapi/bodega/internal/logging"
+	"github.com/scaleapi/bodega/internal/manifest"
 )
 
 // Config holds the parameters shared by all builders.
@@ -31,6 +32,19 @@ type Config struct {
 	NpmRoot    string
 	// Stdout is where builder output is written; defaults to os.Stdout.
 	Stdout io.Writer
+	// Force re-fetches even if artifacts already exist on disk.
+	Force bool
+	// BodegaVersion is passed from main.version for build environment stamping.
+	BodegaVersion string
+	// BuildEnvInfo is the detected build environment, auto-populated if nil.
+	BuildEnvInfo *manifest.BuildEnv
+	// AutoImportDeps controls whether discovered dependencies are automatically
+	// added to manifests after git fetch. When false, ScanDeps runs but ImportDeps
+	// is skipped, allowing the caller to review deps interactively.
+	AutoImportDeps bool
+	// LastDiscovery holds the result of the most recent ScanDeps call.
+	// Used by the TUI to present interactive review when AutoImportDeps is false.
+	LastDiscovery *DiscoveryResult
 	// Logger is an optional structured build logger. When set, each per-entry
 	// stage writes to a dedicated package log in addition to Stdout.
 	Logger *logging.BuildLogger
@@ -176,6 +190,14 @@ func buildDirs(root string) dirs {
 		charts:   filepath.Join(root, "charts"),
 		npm:      filepath.Join(root, "npm"),
 	}
+}
+
+// GetBuildEnv returns the build environment info, detecting it on first call.
+func (c *Config) GetBuildEnv() *manifest.BuildEnv {
+	if c.BuildEnvInfo == nil {
+		c.BuildEnvInfo = DetectBuildEnv(c.BodegaVersion)
+	}
+	return c.BuildEnvInfo
 }
 
 // mkdirAll creates a directory and all parents, returning an error on failure.

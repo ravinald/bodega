@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/manifest"
+	"github.com/scaleapi/bodega/internal/manifest"
 )
 
 const defaultGoProxy = "https://proxy.golang.org"
@@ -61,6 +61,13 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 			cfg.logf("  [gomod] %s: SKIPPED (frozen)", entry.Name)
 			continue
 		}
+		if !cfg.Force {
+			stage := CheckGomodStage(cfg, entry)
+			if stage.Fetched {
+				cfg.logf("  [gomod] %s: already fetched, skipping", entry.Name)
+				continue
+			}
+		}
 
 		result := Result{Type: manifest.TypeGomod, Name: entry.Name}
 		start := time.Now()
@@ -107,12 +114,16 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 						break
 					}
 					_, _ = fmt.Fprintf(out, "  [gomod] %s: checksum verified (%s)\n", entry.Name, entry.Checksum.Algorithm)
+					if !entry.ChecksumVerified {
+						if e := cfg.findAndUpdateGomodChecksum(store, entry.Name, entry.Checksum, true); e != nil {
+							_, _ = fmt.Fprintf(out, "  [gomod] %s: WARNING: could not save verified status: %v\n", entry.Name, e)
+						}
+					}
 				} else if computed != "" {
 					// Auto-populate checksum on first fetch.
-					entry.Checksum = newSHA256Checksum(computed)
+					cs := newSHA256Checksum(computed)
 					_, _ = fmt.Fprintf(out, "  [gomod] %s: checksum recorded (sha256:%s...)\n", entry.Name, computed[:12])
-					// Update the store entry.
-					if e := cfg.findAndUpdateGomodChecksum(store, entry.Name, entry.Checksum); e != nil {
+					if e := cfg.findAndUpdateGomodChecksum(store, entry.Name, cs, false); e != nil {
 						_, _ = fmt.Fprintf(out, "  [gomod] %s: WARNING: could not save checksum: %v\n", entry.Name, e)
 					}
 				}
@@ -125,6 +136,7 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 			if err := appendVersionToList(listPath, entry.Version); err != nil {
 				_, _ = fmt.Fprintf(out, "  [gomod] %s: WARNING: could not update list: %v\n", entry.Name, err)
 			}
+			cfg.StampGomodEntry(store, entry.Name)
 		}
 
 		result.Err = fetchErr

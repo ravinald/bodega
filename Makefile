@@ -1,5 +1,5 @@
-BINARY     := reman
-CMD_PKG    := ./cmd/reman
+BINARY     := bodega
+CMD_PKG    := ./cmd/bodega
 BUILD_DIR  := ./dist
 VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || date -u '+%Y%m%d-%H%M%S')
 LDFLAGS    := -ldflags "-X main.version=$(VERSION)"
@@ -52,7 +52,7 @@ depend:
 		echo ""; \
 	fi
 
-## build: Compile the reman binary to ./dist/reman
+## build: Compile the bodega binary to ./dist/bodega
 build:
 	@mkdir -p $(BUILD_DIR)
 	go build $(GOFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY) $(CMD_PKG)
@@ -64,7 +64,7 @@ cross:
 	GOOS=linux GOARCH=amd64 go build $(GOFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY)-linux-amd64 $(CMD_PKG)
 	@echo "Built: $(BUILD_DIR)/$(BINARY)-linux-amd64 (version: $(VERSION))"
 
-## install: Install reman to /usr/local/bin (builds first if needed)
+## install: Install bodega to /usr/local/bin (builds first if needed)
 install:
 	@if [ -f $(BUILD_DIR)/$(BINARY) ]; then \
 		echo "Installing pre-built binary..."; \

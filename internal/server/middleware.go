@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/audit"
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/logging"
+	"github.com/scaleapi/bodega/internal/audit"
+	"github.com/scaleapi/bodega/internal/logging"
 )
 
 // contextKey is an unexported type for context keys in this package.
@@ -109,6 +109,61 @@ func defaultTrustedNets() []*net.IPNet {
 		}
 	}
 	return nets
+}
+
+// ParseDenyList parses a list of CIDR strings into []*net.IPNet.
+// Bare addresses without a prefix length are treated as /32 (IPv4) or /128 (IPv6).
+func ParseDenyList(entries []string) ([]*net.IPNet, error) {
+	var nets []*net.IPNet
+	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		// If there's no slash, append the appropriate prefix length.
+		if !strings.Contains(entry, "/") {
+			ip := net.ParseIP(entry)
+			if ip == nil {
+				return nil, fmt.Errorf("invalid deny list entry: %q", entry)
+			}
+			if ip.To4() != nil {
+				entry += "/32"
+			} else {
+				entry += "/128"
+			}
+		}
+		_, cidr, err := net.ParseCIDR(entry)
+		if err != nil {
+			return nil, fmt.Errorf("invalid deny list entry: %q: %w", entry, err)
+		}
+		nets = append(nets, cidr)
+	}
+	return nets, nil
+}
+
+// DenyListMiddleware rejects requests from clients whose IP falls within any
+// of the provided CIDR ranges, returning 403 Forbidden. It relies on
+// RealIPMiddleware having already resolved the client IP into the request
+// context. If denyNets is nil or empty the middleware is a no-op.
+func DenyListMiddleware(denyNets []*net.IPNet) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		if len(denyNets) == 0 {
+			return next
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			clientIP := ClientIP(r)
+			ip := net.ParseIP(clientIP)
+			if ip != nil {
+				for _, cidr := range denyNets {
+					if cidr.Contains(ip) {
+						http.Error(w, "Forbidden", http.StatusForbidden)
+						return
+					}
+				}
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // maxBodyCapture is the maximum number of bytes captured from request/response

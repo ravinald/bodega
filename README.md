@@ -1,4 +1,4 @@
-# reman
+# bodega
 
 A manifest-driven package repository manager with an S3 backend. Builds, caches,
 and serves seven artifact types to standard package manager clients.
@@ -30,12 +30,12 @@ make build
 export REPO_BUCKET=my-bucket
 export AWS_REGION=us-west-2
 
-./dist/reman init          # create S3 bucket
-./dist/reman create git    # add a git entry (interactive)
-./dist/reman fetch         # download sources
-./dist/reman upload        # build + upload to S3
-./dist/reman serve         # start HTTP server on :8080
-./dist/reman shell         # launch TUI
+./dist/bodega init          # create S3 bucket
+./dist/bodega create git    # add a git entry (interactive)
+./dist/bodega fetch         # download sources
+./dist/bodega upload        # build + upload to S3
+./dist/bodega serve         # start HTTP server on :8080
+./dist/bodega shell         # launch TUI
 ```
 
 See [docs/QUICKSTART.md](docs/QUICKSTART.md) for a guided walkthrough and
@@ -55,10 +55,10 @@ make tidy       # go mod tidy + verify
 
 Resolved in priority order: CLI flags → environment variables → config file → defaults.
 
-Config files: `/etc/reman/config.json` or `~/.config/reman/config.json`.
+Config files: `/etc/bodega/config.json` or `~/.config/bodega/config.json`.
 
 | Environment variable | Purpose |
 |---------------------|---------|
 | `REPO_BUCKET` | S3 bucket name |
 | `AWS_REGION` | AWS region (default: us-west-2) |
-| `REMAN_LOG_LEVEL` | Logging verbosity 0–4 |
+| `BODEGA_LOG_LEVEL` | Logging verbosity 0–4 |

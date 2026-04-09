@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/manifest"
+	"github.com/scaleapi/bodega/internal/manifest"
 )
 
 const defaultNpmRegistry = "https://registry.npmjs.org"
@@ -28,7 +28,7 @@ func npmTarballFilename(entry manifest.NpmEntry) string {
 
 // npmLocalDir returns the local directory for an npm package.
 func npmLocalDir(d dirs, entry manifest.NpmEntry) string {
-	return filepath.Join(d.npm, entry.Name)
+	return filepath.Join(d.npm, entry.Name, entry.Version)
 }
 
 // npmTarballPath returns the local path for an npm tarball.
@@ -63,6 +63,13 @@ func FetchNpm(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 		if entry.Frozen {
 			cfg.logf("  [npm] %s: SKIPPED (frozen)", entry.Name)
 			continue
+		}
+		if !cfg.Force {
+			stage := CheckNpmStage(cfg, entry)
+			if stage.Fetched {
+				cfg.logf("  [npm] %s: already fetched, skipping", entry.Name)
+				continue
+			}
 		}
 
 		result := Result{Type: manifest.TypeNpm, Name: entry.Name}
@@ -107,17 +114,23 @@ func FetchNpm(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 					result.Err = fmt.Errorf("checksum verification failed: %w", err)
 				} else {
 					_, _ = fmt.Fprintf(out, "  [npm] %s@%s: checksum verified\n", entry.Name, entry.Version)
+					if !entry.ChecksumVerified {
+						if e := cfg.findAndUpdateNpmChecksum(store, entry.Name, entry.Checksum, true); e != nil {
+							_, _ = fmt.Fprintf(out, "  [npm] %s: WARNING: could not save verified status: %v\n", entry.Name, e)
+						}
+					}
 				}
 			} else if computed != "" {
-				entry.Checksum = newSHA256Checksum(computed)
+				cs := newSHA256Checksum(computed)
 				_, _ = fmt.Fprintf(out, "  [npm] %s@%s: checksum recorded (sha256:%s...)\n", entry.Name, entry.Version, computed[:12])
-				if e := cfg.findAndUpdateNpmChecksum(store, entry.Name, entry.Checksum); e != nil {
+				if e := cfg.findAndUpdateNpmChecksum(store, entry.Name, cs, false); e != nil {
 					_, _ = fmt.Fprintf(out, "  [npm] %s: WARNING: could not save checksum: %v\n", entry.Name, e)
 				}
 			}
 
 			if result.Err == nil {
 				_, _ = fmt.Fprintf(out, "  [npm] %s@%s: ok\n", entry.Name, entry.Version)
+				cfg.StampNpmEntry(store, entry.Name)
 			}
 		}
 

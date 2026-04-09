@@ -7,7 +7,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/manifest"
+	"github.com/scaleapi/bodega/internal/manifest"
 )
 
 // computeFileSHA256 returns the lowercase hex SHA-256 digest of a file.
@@ -54,32 +54,57 @@ func newSHA256Checksum(hexDigest string) *manifest.Checksum {
 	}
 }
 
-// findAndUpdateGomodChecksum updates the Checksum field on a GomodEntry in the store and saves.
-func (c *Config) findAndUpdateGomodChecksum(store *manifest.Store, name string, cs *manifest.Checksum) error {
+// findAndUpdateGitChecksum updates the Checksum and ChecksumVerified fields on a GitEntry and saves.
+func (c *Config) findAndUpdateGitChecksum(store *manifest.Store, name string, cs *manifest.Checksum, verified bool) error {
+	e := store.FindGit(name)
+	if e == nil {
+		return fmt.Errorf("git entry %q not found", name)
+	}
+	e.Checksum = cs
+	e.ChecksumVerified = verified
+	return store.SaveGit()
+}
+
+// findAndUpdateGomodChecksum updates the Checksum and ChecksumVerified fields on a GomodEntry and saves.
+func (c *Config) findAndUpdateGomodChecksum(store *manifest.Store, name string, cs *manifest.Checksum, verified bool) error {
 	e := store.FindGomod(name)
 	if e == nil {
 		return fmt.Errorf("gomod entry %q not found", name)
 	}
 	e.Checksum = cs
+	e.ChecksumVerified = verified
 	return store.SaveGomod()
 }
 
-// findAndUpdateHelmChecksum updates the Checksum field on a HelmEntry in the store and saves.
-func (c *Config) findAndUpdateHelmChecksum(store *manifest.Store, name string, cs *manifest.Checksum) error {
+// findAndUpdateHelmChecksum updates the Checksum and ChecksumVerified fields on a HelmEntry and saves.
+func (c *Config) findAndUpdateHelmChecksum(store *manifest.Store, name string, cs *manifest.Checksum, verified bool) error {
 	e := store.FindHelm(name)
 	if e == nil {
 		return fmt.Errorf("helm entry %q not found", name)
 	}
 	e.Checksum = cs
+	e.ChecksumVerified = verified
 	return store.SaveHelm()
 }
 
-// findAndUpdateNpmChecksum updates the Checksum field on an NpmEntry in the store and saves.
-func (c *Config) findAndUpdateNpmChecksum(store *manifest.Store, name string, cs *manifest.Checksum) error {
+// findAndUpdateNpmChecksum updates the Checksum and ChecksumVerified fields on an NpmEntry and saves.
+func (c *Config) findAndUpdateNpmChecksum(store *manifest.Store, name string, cs *manifest.Checksum, verified bool) error {
 	e := store.FindNpm(name)
 	if e == nil {
 		return fmt.Errorf("npm entry %q not found", name)
 	}
 	e.Checksum = cs
+	e.ChecksumVerified = verified
 	return store.SaveNpm()
+}
+
+// findAndUpdateBinaryChecksum updates the Checksum and ChecksumVerified fields on a BinaryEntry and saves.
+func (c *Config) findAndUpdateBinaryChecksum(store *manifest.Store, name string, cs *manifest.Checksum, verified bool) error {
+	e := store.FindBinary(name)
+	if e == nil {
+		return fmt.Errorf("binary entry %q not found", name)
+	}
+	e.Checksum = cs
+	e.ChecksumVerified = verified
+	return store.SaveBinary()
 }

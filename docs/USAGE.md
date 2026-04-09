@@ -1,6 +1,6 @@
-# reman Usage Guide
+# bodega Usage Guide
 
-Comprehensive documentation for the reman package repository manager.
+Comprehensive documentation for the bodega package repository manager.
 
 ## Table of Contents
 
@@ -24,24 +24,24 @@ Comprehensive documentation for the reman package repository manager.
 
 ## Commands
 
-### `reman init`
+### `bodega init`
 
 Creates the S3 bucket with server-side encryption (AES-256), versioning enabled,
 and all public access blocked. Idempotent.
 
-### `reman fetch [TYPE...] [--entry NAME]`
+### `bodega fetch [TYPE...] [--entry NAME]`
 
 Downloads raw sources without building or packaging. If no types are given, all
 types are fetched in dependency order: `binary → git → apt → pypi → gomod → helm → npm`.
 
 The `--entry` flag restricts the operation to a single named entry.
 
-### `reman build [TYPE...] [--entry NAME]`
+### `bodega build [TYPE...] [--entry NAME]`
 
 Compiles or prepares sources. Auto-fetches if sources are not already present
 (stage cascading). Types without a build stage (binary, gomod) are skipped.
 
-### `reman package [TYPE...] [--entry NAME]`
+### `bodega package [TYPE...] [--entry NAME]`
 
 Creates final distributable artifacts. Cascades through fetch and build as
 needed.
@@ -54,37 +54,37 @@ needed.
 | helm | `index.yaml` |
 | npm | `packument.json` |
 
-### `reman upload [TYPE...]`
+### `bodega upload [TYPE...]`
 
 Runs the full pipeline (fetch → build → package) then uploads artifacts to S3.
 This is the most common command for end-to-end operation.
 
-### `reman sync [TYPE...]`
+### `bodega sync [TYPE...]`
 
 Pushes whatever local artifacts exist to S3 **without** running any pipeline
 stages. Useful when artifacts were built on a different machine.
 
-### `reman status [TYPE...]`
+### `bodega status [TYPE...]`
 
 Compares each manifest entry against S3 and prints a table showing whether each
 artifact is present.
 
-### `reman verify`
+### `bodega verify`
 
 Checks that every `.md5` companion file matches its manifest. Use this to detect
 out-of-band modifications.
 
-### `reman create <type>`
+### `bodega create <type>`
 
 Adds a new entry to a manifest. Missing flags are prompted interactively.
 
 ```bash
-reman create git --name myrepo --url https://github.com/org/repo.git --ref v1.0.0
-reman create binary --name tool --url https://example.com/tool.tar.gz
-reman create gomod --name github.com/aws/sdk --ref v1.30.0
-reman create helm --name nginx --url https://charts.example.com/nginx-1.0.tgz --ref 1.0.0
-reman create npm --name lodash --ref 4.17.21
-reman create apt   # interactive prompts
+bodega create git --name myrepo --url https://github.com/org/repo.git --ref v1.0.0
+bodega create binary --name tool --url https://example.com/tool.tar.gz
+bodega create gomod --name github.com/aws/sdk --ref v1.30.0
+bodega create helm --name nginx --url https://charts.example.com/nginx-1.0.tgz --ref 1.0.0
+bodega create npm --name lodash --ref 4.17.21
+bodega create apt   # interactive prompts
 ```
 
 **Create flags:**
@@ -100,21 +100,21 @@ reman create apt   # interactive prompts
 | `--deb-glob` | Glob to locate produced .deb (apt only) |
 | `--source-name` | Source package name (apt only) |
 
-### `reman delete <type> <name> [--remove-from-s3]`
+### `bodega delete <type> <name> [--remove-from-s3]`
 
 Removes an entry from the manifest. Pass `--remove-from-s3` to also delete the
 artifact from S3. Frozen entries cannot be deleted.
 
-### `reman remove <type> <name>`
+### `bodega remove <type> <name>`
 
 Removes an artifact from S3 without touching the manifest.
 
-### `reman freeze <type> <name>`
+### `bodega freeze <type> <name>`
 
 Toggles the `frozen` flag. Frozen entries cannot be built, edited, or deleted.
 Running `freeze` on a frozen entry unfreezes it.
 
-### `reman serve [flags]`
+### `bodega serve [flags]`
 
 Starts the HTTP(S) package server.
 
@@ -129,11 +129,11 @@ Starts the HTTP(S) package server.
 The server handles graceful shutdown on SIGTERM/SIGINT, giving in-flight
 requests up to 30 seconds to complete.
 
-### `reman shell`
+### `bodega shell`
 
 Launches the interactive TUI. See [TUI](#tui) section for keybindings.
 
-### `reman audit [flags]`
+### `bodega audit [flags]`
 
 Queries the SQLite audit database.
 
@@ -147,22 +147,22 @@ Queries the SQLite audit database.
 | `--limit` | `20` | Max events to show |
 
 ```bash
-reman audit                                    # last 20 events
-reman audit --type fetch --limit 50            # last 50 fetches
-reman audit --pkg-type gomod --since 2026-04-07
-reman audit --client 10.0.0.5
+bodega audit                                    # last 20 events
+bodega audit --type fetch --limit 50            # last 50 fetches
+bodega audit --pkg-type gomod --since 2026-04-07
+bodega audit --client 10.0.0.5
 ```
 
-### `reman checksum list [--type TYPE] [--name NAME]`
+### `bodega checksum list [--type TYPE] [--name NAME]`
 
 Lists cached SHA-256 checksums stored in the audit database.
 
-### `reman checksum clear <type> <name> [--version VER]`
+### `bodega checksum clear <type> <name> [--version VER]`
 
 Clears cached checksums for a package. The next fetch will recompute and store
 a fresh checksum. Use `--version` to clear only a specific version.
 
-### `reman --break-glass-update-md5 <type>`
+### `bodega --break-glass-update-md5 <type>`
 
 Recomputes the MD5 digest for a manifest that was edited outside of the tool.
 
@@ -174,11 +174,11 @@ Recomputes the MD5 digest for a manifest that was edited outside of the tool.
 |------|---------|---------|---------|
 | `--bucket` | `REPO_BUCKET` | | S3 bucket name |
 | `--region` | `AWS_REGION` | `us-west-2` | AWS region |
-| `--build-root` | `BOOTSTRAP_BUILD_ROOT` | `/opt/repo-manager` | Local build directory |
+| `--build-root` | `BOOTSTRAP_BUILD_ROOT` | `/opt/bodega` | Local build directory |
 | `--manifest-dir` | | auto-detected | Path to manifests/ directory |
 | `--local-config` | | `false` | Use local filesystem instead of S3 for manifests |
 | `-v, --verbose` | | `false` | Verbose output (equivalent to `--log-level 2`) |
-| `--log-level` | `REMAN_LOG_LEVEL` | `0` | Logging verbosity: 0=errors, 1=warn, 2=info, 3=debug, 4=trace |
+| `--log-level` | `BODEGA_LOG_LEVEL` | `0` | Logging verbosity: 0=errors, 1=warn, 2=info, 3=debug, 4=trace |
 | `-V, --version` | | | Print version and exit |
 
 ---
@@ -187,18 +187,18 @@ Recomputes the MD5 digest for a manifest that was edited outside of the tool.
 
 Config files are loaded from (first found wins):
 
-1. `/etc/reman/config.json` (system-wide)
-2. `~/.config/reman/config.json` (per-user)
+1. `/etc/bodega/config.json` (system-wide)
+2. `~/.config/bodega/config.json` (per-user)
 
 A default config is created on first run. All fields are optional.
 
 ```json
 {
-  "bucket": "repo-manager-864617344058",
+  "bucket": "bodega-864617344058",
   "region": "us-west-2",
-  "build_root": "/opt/repo-manager",
+  "build_root": "/opt/bodega",
   "manifest_dir": "manifests",
-  "log_dir": "/var/log/reman",
+  "log_dir": "/var/log/bodega",
   "logwindow_height": 12,
   "log_level": 0,
   "custom_paths": false,
@@ -393,7 +393,7 @@ fetch → build → package → upload
 ```
 
 **Stage cascading:** Each stage automatically runs its prerequisites if outputs
-are missing. Running `reman upload` on a fresh system will cascade through all
+are missing. Running `bodega upload` on a fresh system will cascade through all
 four stages.
 
 **Build order:** `binary → git → apt → pypi → gomod → helm → npm`. This order
@@ -407,51 +407,51 @@ is returned if any entry failed.
 
 ## HTTP Server
 
-`reman serve` starts a package server that clients use directly.
+`bodega serve` starts a package server that clients use directly.
 
 ### Client configuration
 
-**APT** (`/etc/apt/sources.list.d/reman.list`):
+**APT** (`/etc/apt/sources.list.d/bodega.list`):
 ```
-deb [trusted=yes] http://reman-host:8080/apt/ noble main
+deb [trusted=yes] http://bodega-host:8080/apt/ noble main
 ```
 
 **pip** (per-command or `pip.conf`):
 ```bash
-pip install --index-url http://reman-host:8080/pypi/simple/ <package>
+pip install --index-url http://bodega-host:8080/pypi/simple/ <package>
 ```
 
 **Go modules**:
 ```bash
-export GOPROXY=http://reman-host:8080/go
+export GOPROXY=http://bodega-host:8080/go
 go get github.com/aws/aws-sdk-go-v2@v1.30.0
 ```
 
 **Helm**:
 ```bash
-helm repo add reman http://reman-host:8080/helm
+helm repo add bodega http://bodega-host:8080/helm
 ```
 
 **npm** (per-command or `.npmrc`):
 ```bash
-npm install --registry http://reman-host:8080/npm <package>
+npm install --registry http://bodega-host:8080/npm <package>
 ```
 
 ### TLS
 
 Manual certificates:
 ```bash
-reman serve --tls-cert cert.pem --tls-key key.pem
+bodega serve --tls-cert cert.pem --tls-key key.pem
 ```
 
 Or set in config:
 ```json
-{ "tls_cert": "/etc/reman/cert.pem", "tls_key": "/etc/reman/key.pem" }
+{ "tls_cert": "/etc/bodega/cert.pem", "tls_key": "/etc/bodega/key.pem" }
 ```
 
 ### Behind nginx
 
-reman is designed to work behind nginx. The server extracts real client IPs from
+bodega is designed to work behind nginx. The server extracts real client IPs from
 `X-Real-IP` and `X-Forwarded-For` headers when the request comes from a trusted
 private network (RFC 1918 + loopback).
 
@@ -459,10 +459,10 @@ Minimal nginx config:
 ```nginx
 server {
     listen 443 ssl;
-    server_name reman.example.com;
+    server_name bodega.example.com;
 
-    ssl_certificate /etc/ssl/certs/reman.pem;
-    ssl_certificate_key /etc/ssl/private/reman.key;
+    ssl_certificate /etc/ssl/certs/bodega.pem;
+    ssl_certificate_key /etc/ssl/private/bodega.key;
 
     location / {
         proxy_pass http://127.0.0.1:8080;
@@ -543,7 +543,7 @@ Configure the TTL:
 Checksums protect against upstream tampering and bit-rot.
 
 **Builder path** (hosted entries):
-- First `reman fetch`: computes SHA-256, stores on the manifest entry
+- First `bodega fetch`: computes SHA-256, stores on the manifest entry
 - Subsequent fetches: verifies against stored checksum; fails on mismatch
 
 **Proxy path** (cached entries):
@@ -552,9 +552,9 @@ Checksums protect against upstream tampering and bit-rot.
 
 **Management:**
 ```bash
-reman checksum list                        # view all cached checksums
-reman checksum list --type gomod           # filter by type
-reman checksum clear gomod github.com/foo  # clear, next fetch recomputes
+bodega checksum list                        # view all cached checksums
+bodega checksum list --type gomod           # filter by type
+bodega checksum clear gomod github.com/foo  # clear, next fetch recomputes
 ```
 
 ---
@@ -576,9 +576,9 @@ SQLite database at `{log_dir}/audit.db`.
 
 **Query examples:**
 ```bash
-reman audit --type fetch --limit 50
-reman audit --name lodash --since 2026-04-07
-reman audit --client 10.0.0.5
+bodega audit --type fetch --limit 50
+bodega audit --name lodash --since 2026-04-07
+bodega audit --client 10.0.0.5
 ```
 
 The audit middleware records: timestamp, event type, package type/name/version,
@@ -588,7 +588,7 @@ client IP, user agent, HTTP status, and request duration.
 
 ## TUI
 
-`reman shell` launches a three-pane terminal interface.
+`bodega shell` launches a three-pane terminal interface.
 
 ```
 ┌─ Sources ──────────┬─ Details ──────────────────┐
@@ -639,20 +639,20 @@ manifests/
 ```
 
 The tool verifies MD5 on every manifest read and writes a fresh MD5 after every
-modification. Use `reman verify` to check integrity, and
-`reman --break-glass-update-md5 <type>` to recompute after a manual edit.
+modification. Use `bodega verify` to check integrity, and
+`bodega --break-glass-update-md5 <type>` to recompute after a manual edit.
 
 ---
 
 ## Frozen Entries
 
-Set `"frozen": true` on any entry (or use `reman freeze`) to prevent it from
+Set `"frozen": true` on any entry (or use `bodega freeze`) to prevent it from
 being built, edited, or deleted. The toggle is audit-friendly — use it to pin a
 known-good artifact.
 
 ```bash
-reman freeze git netbox     # freeze
-reman freeze git netbox     # unfreeze (toggle)
+bodega freeze git netbox     # freeze
+bodega freeze git netbox     # unfreeze (toggle)
 ```
 
 ---
@@ -677,7 +677,7 @@ reman freeze git netbox     # unfreeze (toggle)
 ### Build targets
 
 ```bash
-make build          # compile to ./dist/reman
+make build          # compile to ./dist/bodega
 make cross          # cross-compile for linux/amd64
 make test           # run tests with race detector
 make test-verbose   # verbose test output
@@ -693,7 +693,7 @@ make depend         # install Go + golangci-lint
 ### Project structure
 
 ```
-cmd/reman/              Cobra commands + pipeline helpers
+cmd/bodega/              Cobra commands + pipeline helpers
 internal/
   audit/                SQLite audit trail + checksum storage
   builder/              Build orchestration per type
@@ -716,6 +716,6 @@ docs-internal/          Development documentation + changelogs
 3. Add Store methods in `internal/manifest/loader.go` (Find, Remove, Save)
 4. Create builder in `internal/builder/<type>.go` (Fetch, Check, ArtifactPaths)
 5. Add HTTP routes in `internal/server/server.go`
-6. Add CLI cases in `cmd/reman/cmd_create.go`, `cmd_delete.go`, `cmd_fetch.go`
+6. Add CLI cases in `cmd/bodega/cmd_create.go`, `cmd_delete.go`, `cmd_fetch.go`
 7. Add TUI rendering in `internal/tui/sources.go` and `details.go`
 8. Create JSON schema in `schemas/<type>.schema.json`

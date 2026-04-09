@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/manifest"
+	"github.com/scaleapi/bodega/internal/manifest"
 )
 
 // aptSourceDir returns the source directory path for an AptEntry. When the
@@ -86,6 +86,13 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 		if entry.Frozen {
 			cfg.logf("  [apt] %s: SKIPPED (frozen)", entry.Name)
 			continue
+		}
+		if !cfg.Force {
+			stage := CheckAptStage(cfg, entry)
+			if stage.Fetched {
+				cfg.logf("  [apt] %s: already fetched, skipping", entry.Name)
+				continue
+			}
 		}
 
 		start := time.Now()

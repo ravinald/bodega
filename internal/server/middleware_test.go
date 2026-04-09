@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/logging"
+	"github.com/scaleapi/bodega/internal/logging"
 )
 
 // testHandler returns a simple 200 OK handler with a fixed body.
@@ -248,6 +248,140 @@ func TestRealIPCustomTrustedNets(t *testing.T) {
 
 	if gotIP != "1.2.3.4" {
 		t.Errorf("ClientIP = %q, want 1.2.3.4", gotIP)
+	}
+}
+
+// ---- DenyListMiddleware tests -----------------------------------------------
+
+func TestDenyListBlocksIPv4(t *testing.T) {
+	nets, err := ParseDenyList([]string{"192.168.1.0/24"})
+	if err != nil {
+		t.Fatalf("ParseDenyList: %v", err)
+	}
+
+	handler := DenyListMiddleware(nets)(testHandler("ok"))
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.RemoteAddr = "192.168.1.50:12345"
+	rec := httptest.NewRecorder()
+
+	// Need RealIPMiddleware to populate context.
+	chain := RealIPMiddleware(nil)(handler)
+	chain.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", rec.Code)
+	}
+}
+
+func TestDenyListBlocksBareIPv4(t *testing.T) {
+	nets, err := ParseDenyList([]string{"10.0.0.99"})
+	if err != nil {
+		t.Fatalf("ParseDenyList: %v", err)
+	}
+
+	handler := DenyListMiddleware(nets)(testHandler("ok"))
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.RemoteAddr = "10.0.0.99:9999"
+	rec := httptest.NewRecorder()
+
+	chain := RealIPMiddleware(nil)(handler)
+	chain.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", rec.Code)
+	}
+}
+
+func TestDenyListBlocksIPv6(t *testing.T) {
+	nets, err := ParseDenyList([]string{"fd00::/8"})
+	if err != nil {
+		t.Fatalf("ParseDenyList: %v", err)
+	}
+
+	handler := DenyListMiddleware(nets)(testHandler("ok"))
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.RemoteAddr = "[fd12::1]:8080"
+	rec := httptest.NewRecorder()
+
+	chain := RealIPMiddleware(nil)(handler)
+	chain.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", rec.Code)
+	}
+}
+
+func TestDenyListBlocksBareIPv6(t *testing.T) {
+	nets, err := ParseDenyList([]string{"::1"})
+	if err != nil {
+		t.Fatalf("ParseDenyList: %v", err)
+	}
+
+	handler := DenyListMiddleware(nets)(testHandler("ok"))
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.RemoteAddr = "[::1]:8080"
+	rec := httptest.NewRecorder()
+
+	chain := RealIPMiddleware(nil)(handler)
+	chain.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", rec.Code)
+	}
+}
+
+func TestDenyListAllowsNonMatchingIP(t *testing.T) {
+	nets, err := ParseDenyList([]string{"192.168.1.0/24"})
+	if err != nil {
+		t.Fatalf("ParseDenyList: %v", err)
+	}
+
+	handler := DenyListMiddleware(nets)(testHandler("ok"))
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.RemoteAddr = "10.0.0.5:8080"
+	rec := httptest.NewRecorder()
+
+	chain := RealIPMiddleware(nil)(handler)
+	chain.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+}
+
+func TestDenyListEmptyIsNoOp(t *testing.T) {
+	handler := DenyListMiddleware(nil)(testHandler("ok"))
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.RemoteAddr = "1.2.3.4:8080"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+}
+
+func TestParseDenyListInvalidEntry(t *testing.T) {
+	_, err := ParseDenyList([]string{"not-an-ip"})
+	if err == nil {
+		t.Error("expected error for invalid entry")
+	}
+}
+
+func TestParseDenyListInvalidCIDR(t *testing.T) {
+	_, err := ParseDenyList([]string{"10.0.0.1/999"})
+	if err == nil {
+		t.Error("expected error for invalid CIDR")
+	}
+}
+
+func TestParseDenyListSkipsEmpty(t *testing.T) {
+	nets, err := ParseDenyList([]string{"", "  ", "10.0.0.1"})
+	if err != nil {
+		t.Fatalf("ParseDenyList: %v", err)
+	}
+	if len(nets) != 1 {
+		t.Errorf("got %d nets, want 1", len(nets))
 	}
 }
 

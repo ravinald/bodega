@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Store is the in-memory representation of all loaded manifests.
@@ -244,13 +245,20 @@ func (s *Store) SaveNpm() error {
 	return s.saveManifest(TypeNpm, NpmManifest{ConfigVersion: CurrentConfigVersion, Entries: s.Npm})
 }
 
-// saveManifest marshals v to JSON and writes it, then updates the MD5 file.
+// saveManifest marshals v to JSON and writes it via the backend (S3 or local).
+// When a backend is set, it writes to the backend. Otherwise it writes to the
+// local filesystem and updates the MD5 companion file.
 func (s *Store) saveManifest(manifestType string, v interface{}) error {
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal %s manifest: %w", manifestType, err)
 	}
 	data = append(data, '\n')
+
+	// Write to backend (S3) when available.
+	if s.backend != nil {
+		return s.backend.Write(context.Background(), manifestType+".json", data)
+	}
 
 	path := filepath.Join(s.dir, manifestType+".json")
 	if err := os.WriteFile(path, data, 0o644); err != nil {
@@ -323,6 +331,32 @@ func (s *Store) FindNpm(name string) *NpmEntry {
 		}
 	}
 	return nil
+}
+
+// FindPypiPackage returns the PypiPackage with the given name, or nil.
+func (s *Store) FindPypiPackage(name string) *PypiPackage {
+	for i := range s.Pypi.Packages {
+		if strings.EqualFold(s.Pypi.Packages[i].Name, name) {
+			return &s.Pypi.Packages[i]
+		}
+	}
+	return nil
+}
+
+// RemovePypiPackage deletes the package with the given name and saves.
+func (s *Store) RemovePypiPackage(name string) error {
+	orig := len(s.Pypi.Packages)
+	filtered := s.Pypi.Packages[:0]
+	for _, p := range s.Pypi.Packages {
+		if !strings.EqualFold(p.Name, name) {
+			filtered = append(filtered, p)
+		}
+	}
+	if len(filtered) == orig {
+		return fmt.Errorf("pypi package %q not found", name)
+	}
+	s.Pypi.Packages = filtered
+	return s.SavePypi()
 }
 
 // RemoveApt deletes the entry with the given name and saves.

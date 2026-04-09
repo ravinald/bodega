@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/scaleapi/core-infrastructure/tools/repo-manager/schemas/helm.schema.json",
+  "$id": "https://github.com/scaleapi/core-infrastructure/tools/bodega/schemas/helm.schema.json",
   "title": "Helm Chart Manifest",
   "description": "Defines Helm charts to mirror from upstream chart repositories.",
   "type": "object",

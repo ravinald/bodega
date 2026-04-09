@@ -1,6 +1,6 @@
 // Package config loads tool configuration from flags, environment variables,
-// and config files. Priority (highest first): flags → env vars → /etc/reman/config.json
-// → ~/.config/reman/config.json → built-in defaults.
+// and config files. Priority (highest first): flags → env vars → /etc/bodega/config.json
+// → ~/.config/bodega/config.json → built-in defaults.
 package config
 
 import (
@@ -12,18 +12,18 @@ import (
 
 const (
 	DefaultRegion          = "us-west-2"
-	DefaultBuildRoot       = "/opt/repo-manager"
-	DefaultLogDir          = "/var/log/reman"
+	DefaultBuildRoot       = "/opt/bodega"
+	DefaultLogDir          = "/var/log/bodega"
 	DefaultLogWindowHeight = 12
 	DefaultLogLevel        = 0
 
 	EnvBucket    = "REPO_BUCKET"
 	EnvRegion    = "AWS_REGION"
 	EnvBuildRoot = "BOOTSTRAP_BUILD_ROOT"
-	EnvLogLevel  = "REMAN_LOG_LEVEL"
+	EnvLogLevel  = "BODEGA_LOG_LEVEL"
 
-	SystemConfigDir  = "/etc/reman"
-	SystemConfigFile = "/etc/reman/config.json"
+	SystemConfigDir  = "/etc/bodega"
+	SystemConfigFile = "/etc/bodega/config.json"
 )
 
 // Config holds resolved runtime configuration.
@@ -51,9 +51,10 @@ type Config struct {
 	GomodRoot         string `json:"gomod_root,omitempty"`
 	HelmRoot          string `json:"helm_root,omitempty"`
 	NpmRoot           string `json:"npm_root,omitempty"`
-	AuditDB           string `json:"audit_db,omitempty"`
-	LocalConfig       bool   `json:"-"`
-	Verbose           bool   `json:"-"`
+	AuditDB           string   `json:"audit_db,omitempty"`
+	DenyList          []string `json:"deny_list,omitempty"`
+	LocalConfig       bool     `json:"-"`
+	Verbose           bool     `json:"-"`
 }
 
 // RootForType returns the effective build root for a given source type.
@@ -119,7 +120,8 @@ type fileConfig struct {
 	GomodRoot         string `json:"gomod_root,omitempty"`
 	HelmRoot          string `json:"helm_root,omitempty"`
 	NpmRoot           string `json:"npm_root,omitempty"`
-	AuditDB           string `json:"audit_db,omitempty"`
+	AuditDB           string   `json:"audit_db,omitempty"`
+	DenyList          []string `json:"deny_list,omitempty"`
 
 	// Legacy field — read but not written.
 	ShellHeight int `json:"shell_height,omitempty"`
@@ -179,6 +181,9 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	// Audit.
 	cfg.AuditDB = firstNonEmpty(fc.AuditDB, filepath.Join(cfg.LogDir, "audit.db"))
 
+	// Deny list.
+	cfg.DenyList = fc.DenyList
+
 	return cfg, nil
 }
 
@@ -209,6 +214,7 @@ func (c *Config) Save() error {
 		HelmRoot:          c.HelmRoot,
 		NpmRoot:           c.NpmRoot,
 		AuditDB:           c.AuditDB,
+		DenyList:          c.DenyList,
 	}
 
 	data, err := json.MarshalIndent(fc, "", "  ")
@@ -281,14 +287,14 @@ func EnsureConfigFile() (string, error) {
 
 func defaultConfigContent() []byte {
 	content := `{
-  "_comment": "reman configuration — all fields are optional, shown here with defaults",
+  "_comment": "bodega configuration — all fields are optional, shown here with defaults",
   "_comment_priority": "flags > env vars > this file > built-in defaults",
 
   "bucket": "",
   "region": "us-west-2",
-  "build_root": "/opt/repo-manager",
+  "build_root": "/opt/bodega",
   "manifest_dir": "manifests",
-  "log_dir": "/var/log/reman",
+  "log_dir": "/var/log/bodega",
   "logwindow_height": 12,
   "log_level": 0,
   "custom_paths": false,
@@ -313,7 +319,10 @@ func defaultConfigContent() []byte {
   "helm_root": "",
   "npm_root": "",
 
-  "audit_db": ""
+  "audit_db": "",
+
+  "_comment_deny": "deny_list: CIDR entries (e.g. 10.0.0.5, 192.168.1.0/24, fd00::/8) — bare IPs imply /32 or /128",
+  "deny_list": []
 }
 `
 	return []byte(content)
@@ -331,7 +340,7 @@ func createDefaultConfig() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("cannot determine home directory: %w", err)
 	}
-	dir := filepath.Join(home, ".config", "reman")
+	dir := filepath.Join(home, ".config", "bodega")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("create config dir %s: %w", dir, err)
 	}
@@ -345,7 +354,7 @@ func createDefaultConfig() (string, error) {
 func configSearchPaths() []string {
 	paths := []string{SystemConfigFile}
 	if home, err := os.UserHomeDir(); err == nil {
-		paths = append(paths, filepath.Join(home, ".config", "reman", "config.json"))
+		paths = append(paths, filepath.Join(home, ".config", "bodega", "config.json"))
 	}
 	return paths
 }

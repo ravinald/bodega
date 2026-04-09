@@ -1,4 +1,4 @@
-# golangci-lint v2 configuration for repo-manager.
+# golangci-lint v2 configuration for bodega.
 version: "2"
 
 linters:

@@ -9,10 +9,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/config"
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/manifest"
-	bos3 "github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/s3"
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/server"
+	"github.com/scaleapi/bodega/internal/config"
+	"github.com/scaleapi/bodega/internal/manifest"
+	bos3 "github.com/scaleapi/bodega/internal/s3"
+	"github.com/scaleapi/bodega/internal/server"
 )
 
 // mockS3 is a test double for the s3Getter interface.

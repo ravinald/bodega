@@ -7,14 +7,15 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/builder"
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/config"
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/logging"
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/manifest"
-	bos3 "github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/s3"
+	"github.com/scaleapi/bodega/internal/builder"
+	"github.com/scaleapi/bodega/internal/config"
+	"github.com/scaleapi/bodega/internal/logging"
+	"github.com/scaleapi/bodega/internal/manifest"
+	bos3 "github.com/scaleapi/bodega/internal/s3"
 )
 
 // cmdOutputMsg carries the text result of an executed command back to the
@@ -51,16 +52,17 @@ const (
 // lands in both the TUI log pane and the on-disk session log.
 func builderCfg(buf *bytes.Buffer, cfg *config.Config) *builder.Config {
 	bc := &builder.Config{
-		BuildRoot:   cfg.BuildRoot,
-		ManifestDir: cfg.ManifestDir,
-		Bucket:      cfg.Bucket,
-		Region:      cfg.Region,
-		Verbose:     cfg.Verbose,
-		AptRoot:     cfg.AptRoot,
-		GitRoot:     cfg.GitRoot,
-		PypiRoot:    cfg.PypiRoot,
-		BinaryRoot:  cfg.BinaryRoot,
-		Stdout:      buf,
+		BuildRoot:      cfg.BuildRoot,
+		ManifestDir:    cfg.ManifestDir,
+		Bucket:         cfg.Bucket,
+		Region:         cfg.Region,
+		Verbose:        cfg.Verbose,
+		AptRoot:        cfg.AptRoot,
+		GitRoot:        cfg.GitRoot,
+		PypiRoot:       cfg.PypiRoot,
+		BinaryRoot:     cfg.BinaryRoot,
+		AutoImportDeps: true, // default: auto-import discovered deps
+		Stdout:         buf,
 	}
 
 	if cfg.LogDir != "" {
@@ -70,6 +72,8 @@ func builderCfg(buf *bytes.Buffer, cfg *config.Config) *builder.Config {
 			// pane) and the on-disk session log.
 			bc.Stdout = io.MultiWriter(buf, logger.SessionWriter())
 			bc.Logger = logger
+			// Log the session file path so the viewport shows which file output goes to.
+			fmt.Fprintf(buf, "--- log: %s ---\n", logger.SessionLogPath())
 		}
 	}
 
@@ -78,13 +82,16 @@ func builderCfg(buf *bytes.Buffer, cfg *config.Config) *builder.Config {
 
 // executeStage runs a specific build pipeline stage for a single entry and
 // returns a tea.Cmd that delivers the result as a cmdOutputMsg.
-func executeStage(stage BuildStage, entryType, entryName string, cfg *config.Config, store *manifest.Store, s3client *bos3.Client) tea.Cmd {
+func executeStage(stage BuildStage, entryType, entryName string, cfg *config.Config, store *manifest.Store, s3client *bos3.Client, force ...bool) tea.Cmd {
 	return func() tea.Msg {
 		var buf bytes.Buffer
 		var err error
 		refresh := false
 
 		bc := builderCfg(&buf, cfg)
+		if len(force) > 0 && force[0] {
+			bc.Force = true
+		}
 
 		switch stage {
 		case StageFetch:
@@ -387,7 +394,9 @@ func runDelete(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, s3c
 			return err
 		}
 	case manifest.TypePypi:
-		return fmt.Errorf("pypi uses a single manifest — edit manifests/pypi.json directly")
+		if err := store.RemovePypiPackage(name); err != nil {
+			return err
+		}
 	}
 	fmt.Fprintf(buf, "Removed %s/%s from manifest.\n", entryType, name)
 	return nil
@@ -502,7 +511,11 @@ func s3KeyForEntry(store *manifest.Store, t, name string) string {
 		if e == nil {
 			return ""
 		}
-		return fmt.Sprintf("repos/%s/%s-%s.bundle", e.Name, e.Name, e.Ref)
+		sn := strings.ReplaceAll(e.Name, "/", "--")
+		if e.IsRelease() {
+			return fmt.Sprintf("repos/%s/%s-%s.tar.gz", sn, sn, e.Ref)
+		}
+		return fmt.Sprintf("repos/%s/%s-%s.bundle", sn, sn, e.Ref)
 	}
 	return ""
 }

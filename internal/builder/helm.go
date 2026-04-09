@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/manifest"
+	"github.com/scaleapi/bodega/internal/manifest"
 )
 
 // helmChartFilename returns the conventional Helm chart archive name.
@@ -16,7 +16,7 @@ func helmChartFilename(entry manifest.HelmEntry) string {
 
 // helmLocalPath returns the local path for a chart archive.
 func helmLocalPath(d dirs, entry manifest.HelmEntry) string {
-	return filepath.Join(d.charts, helmChartFilename(entry))
+	return filepath.Join(d.charts, entry.Name, entry.Version, helmChartFilename(entry))
 }
 
 // helmS3Key returns the S3 key for a chart archive.
@@ -52,12 +52,27 @@ func FetchHelm(cfg *Config, store *manifest.Store, entryFilter string) *Summary 
 			cfg.logf("  [helm] %s: SKIPPED (frozen)", entry.Name)
 			continue
 		}
+		if !cfg.Force {
+			stage := CheckHelmStage(cfg, entry)
+			if stage.Fetched {
+				cfg.logf("  [helm] %s: already fetched, skipping", entry.Name)
+				continue
+			}
+		}
 
 		result := Result{Type: manifest.TypeHelm, Name: entry.Name}
 		start := time.Now()
 		out := cfg.entryWriter(manifest.TypeHelm, entry.Name)
 
 		dest := helmLocalPath(d, entry)
+		if err := mkdirAll(filepath.Dir(dest)); err != nil {
+			result.Err = fmt.Errorf("create chart dir: %w", err)
+			summary.Failures++
+			result.Elapsed = time.Since(start)
+			summary.Results = append(summary.Results, result)
+			summary.Total++
+			continue
+		}
 		_, _ = fmt.Fprintf(out, "  [helm] %s: fetching %s\n", entry.Name, entry.URL)
 
 		if err := downloadURL(dest, entry.URL); err != nil {
@@ -76,17 +91,23 @@ func FetchHelm(cfg *Config, store *manifest.Store, entryFilter string) *Summary 
 					result.Err = fmt.Errorf("checksum verification failed: %w", err)
 				} else {
 					_, _ = fmt.Fprintf(out, "  [helm] %s: checksum verified\n", entry.Name)
+					if !entry.ChecksumVerified {
+						if e := cfg.findAndUpdateHelmChecksum(store, entry.Name, entry.Checksum, true); e != nil {
+							_, _ = fmt.Fprintf(out, "  [helm] %s: WARNING: could not save verified status: %v\n", entry.Name, e)
+						}
+					}
 				}
 			} else if computed != "" {
-				entry.Checksum = newSHA256Checksum(computed)
+				cs := newSHA256Checksum(computed)
 				_, _ = fmt.Fprintf(out, "  [helm] %s: checksum recorded (sha256:%s...)\n", entry.Name, computed[:12])
-				if e := cfg.findAndUpdateHelmChecksum(store, entry.Name, entry.Checksum); e != nil {
+				if e := cfg.findAndUpdateHelmChecksum(store, entry.Name, cs, false); e != nil {
 					_, _ = fmt.Fprintf(out, "  [helm] %s: WARNING: could not save checksum: %v\n", entry.Name, e)
 				}
 			}
 
 			if result.Err == nil {
 				_, _ = fmt.Fprintf(out, "  [helm] %s: ok\n", entry.Name)
+				cfg.StampHelmEntry(store, entry.Name)
 			}
 		}
 

@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/config"
+	"github.com/scaleapi/bodega/internal/config"
 )
 
 func TestLoad_Defaults(t *testing.T) {

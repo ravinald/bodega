@@ -1,4 +1,4 @@
-module github.com/scaleapi/core-infrastructure/tools/repo-manager
+module github.com/scaleapi/bodega
 
 go 1.25.0
 

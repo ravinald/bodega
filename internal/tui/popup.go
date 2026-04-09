@@ -34,10 +34,11 @@ type popupModel struct {
 	buildTitle     string
 	buildEntryType string
 	buildEntryName string
+	buildForce     bool // force re-fetch even if already fetched
 	// onBuildSelect is called with the chosen BuildStage when the user selects
 	// an option from the build menu. It returns the tea.Cmd to execute;
 	// HandleBuildMenuKey assigns the result to pendingAsyncCmd on the receiver.
-	onBuildSelect func(stage BuildStage) tea.Cmd
+	onBuildSelect func(stage BuildStage, force bool) tea.Cmd
 
 	// --- form popup ---
 	formTitle  string
@@ -69,14 +70,18 @@ type popupModel struct {
 
 // formField represents a single labelled field in the form popup.
 type formField struct {
-	Label    string
-	Value    string
-	Checkbox bool     // if true, this is a toggle field (Value is "yes" or "no")
-	Select   bool     // if true, Enter/Space opens inline submenu
-	Options  []string // choices for Select fields
-	Disabled bool     // greyed out, not editable
-	Hint     string   // displayed below the field in dim text (not a separate field)
-	cursor   int      // cursor position within Value (for text editing)
+	Label              string
+	Value              string
+	Checkbox           bool     // if true, this is a toggle field (Value is "yes" or "no")
+	Select             bool     // if true, Enter/Space opens inline submenu
+	Options            []string // choices for Select fields
+	Disabled           bool     // greyed out, not editable
+	Hint               string   // displayed below the field in dim text (not a separate field)
+	LabelSelect        bool     // embed a dropdown in the label: "Label [value]▾:"
+	LabelSelectValue   string   // current value of the label-embedded dropdown
+	LabelSelectOptions []string // options for the label-embedded dropdown
+	LabelSelectOpen    bool     // is the label dropdown currently showing
+	cursor             int      // cursor position within Value (for text editing)
 }
 
 // Active returns true when a popup is displayed.
@@ -99,21 +104,25 @@ func (p *popupModel) confirm() {
 
 // helpText is the content rendered inside the help popup.
 const helpText = `Navigation:
-  /          Filter / search
-  ?          Toggle this help
-  Ctrl+A     Select / deselect all packages
-  Enter/Space Expand/collapse type group
-  m          Mark / unmark package (or group)
-  Tab        Switch focus: Sources <-> Log
-  Up/Down    Navigate entries
-  q          Quit
+  Up/Down/j/k  Move cursor
+  Right/l      Expand group / enter children
+  Left/h       Collapse group / go to parent
+  Enter        Toggle expand/collapse
+  Space/m      Select / deselect (recursive)
+  Ctrl+A       Select / deselect all
+  /            Filter / search
+  Ctrl+R       Reload manifests from backend
+  Tab          Switch focus: Sources <-> Log
+  ?            Toggle this help
+  q            Quit
 
 Entry management:
   c          Create new entry (form)
   C          Configure application settings
-  D          Delete entry (with confirmation)
+  d/D        Delete selected entries
   E          Edit selected entry (form)
-  F          Toggle freeze on entry
+  F          Toggle freeze on selected entries
+  H          Toggle hidden on selected entries
 
 Build pipeline:
   B          Open build menu for marked package(s)
@@ -125,6 +134,9 @@ S3 bucket operations:
   R          Remove artifact from S3 (with confirmation)
   S          Sync all local artifacts to S3
   v          Verify manifest checksums
+
+Audit:
+  L          Query audit log (with filters)
 
 Log pane (Tab to focus):
   Tab / Esc  Return to Sources
@@ -221,6 +233,12 @@ func (p *popupModel) renderBuildMenu() string {
 		sb.WriteString("  " + keyPart + " " + item.label + "\n")
 	}
 	sb.WriteString("\n")
+	forceState := "[ ]"
+	if p.buildForce {
+		forceState = "[x]"
+	}
+	sb.WriteString("  " + buildMenuKeyStyle.Render("[!]") + " Force re-fetch " + forceState + "\n")
+	sb.WriteString("\n")
 	sb.WriteString(dimStyle.Render("  Esc to cancel"))
 	return sb.String()
 }
@@ -234,22 +252,55 @@ func (p *popupModel) renderForm() string {
 	sb.WriteString("\n\n")
 
 	// Find the longest label to align colons.
+	// For LabelSelect fields, include the " [value]▾" suffix in the display width.
 	maxLabel := 0
 	for _, f := range p.formFields {
-		if len(f.Label) > maxLabel {
-			maxLabel = len(f.Label)
+		w := len(f.Label)
+		if f.LabelSelect {
+			// " [value]▾" — space + bracket + value + bracket + indicator (1 cell).
+			w += 1 + 1 + len(f.LabelSelectValue) + 1 + 1
+		}
+		if w > maxLabel {
+			maxLabel = w
 		}
 	}
 
 	for i, f := range p.formFields {
-		padded := f.Label + strings.Repeat(" ", maxLabel-len(f.Label))
-		label := formLabelStyle.UnsetWidth().Render(padded + ":")
-
-		if f.Disabled {
-			// Dim label and value for disabled fields.
-			label = dimStyle.Render(padded + ":")
+		// Build label portion.
+		var label string
+		labelTextLen := len(f.Label)
+		if f.LabelSelect {
+			// Display width of " [value]▾": space + bracket + value + bracket + 1 cell for ▾.
+			selectDisplayLen := 1 + 1 + len(f.LabelSelectValue) + 1 + 1
+			labelTextLen += selectDisplayLen
+			pad := ""
+			if labelTextLen < maxLabel {
+				pad = strings.Repeat(" ", maxLabel-labelTextLen)
+			}
+			selectPart := "[" + f.LabelSelectValue + "]▾"
+			if f.Disabled {
+				label = dimStyle.Render(f.Label+" "+selectPart+pad) + dimStyle.Render(":")
+			} else if i == p.formCursor && f.LabelSelectOpen {
+				label = formLabelStyle.UnsetWidth().Render(f.Label+" ") +
+					formActiveValueStyle.Render(selectPart) +
+					formLabelStyle.UnsetWidth().Render(pad+":")
+			} else if i == p.formCursor {
+				label = formLabelStyle.UnsetWidth().Render(f.Label+" ") +
+					formValueStyle.Render(selectPart) +
+					formLabelStyle.UnsetWidth().Render(pad+":")
+			} else {
+				label = formLabelStyle.UnsetWidth().Render(f.Label+" "+selectPart+pad+":")
+			}
+		} else {
+			padded := f.Label + strings.Repeat(" ", maxLabel-labelTextLen)
+			if f.Disabled {
+				label = dimStyle.Render(padded + ":")
+			} else {
+				label = formLabelStyle.UnsetWidth().Render(padded + ":")
+			}
 		}
 
+		// Build value portion.
 		var value string
 		switch {
 		case f.Checkbox:
@@ -307,9 +358,12 @@ func (p *popupModel) renderForm() string {
 			sb.WriteString(hintPad + dimStyle.Render(f.Hint) + "\n")
 		}
 
-		// Render inline submenu when this select field is focused and open.
+		// Render inline submenu for Select fields or LabelSelect dropdown.
 		if f.Select && i == p.formCursor && p.selectOpen {
 			sb.WriteString(p.renderSelectMenu(f, maxLabel))
+		}
+		if f.LabelSelect && i == p.formCursor && f.LabelSelectOpen {
+			sb.WriteString(p.renderLabelSelectMenu(f, maxLabel))
 		}
 	}
 
@@ -318,6 +372,27 @@ func (p *popupModel) renderForm() string {
 		sb.WriteString(errorStyle.Render("  "+p.validationError) + "\n")
 	}
 	sb.WriteString(dimStyle.Render("  Tab=next  Space=toggle  Enter=save  Esc=cancel  j=JSON  ^T=defaults  ^R=reset"))
+	return sb.String()
+}
+
+// renderLabelSelectMenu renders the inline submenu for a LabelSelect dropdown.
+// The menu is indented to align under the label's "[value]▾" portion.
+func (p *popupModel) renderLabelSelectMenu(f formField, labelWidth int) string {
+	// Indent to align under the label select: "  " + label + " [".
+	indent := strings.Repeat(" ", len(f.Label)+4)
+	var sb strings.Builder
+	border := dimStyle.Render(strings.Repeat("─", 12))
+	sb.WriteString(indent + border + "\n")
+	for i, opt := range f.LabelSelectOptions {
+		var rendered string
+		if i == p.selectCursor {
+			rendered = formActiveValueStyle.Render("> " + opt)
+		} else {
+			rendered = formValueStyle.Render("  " + opt)
+		}
+		sb.WriteString(indent + rendered + "\n")
+	}
+	sb.WriteString(indent + border + "\n")
 	return sb.String()
 }
 
@@ -429,6 +504,11 @@ func (p *popupModel) HandleFormKey(key string) (dismiss bool) {
 		return p.handleSelectMenuKey(key)
 	}
 
+	// While a LabelSelect dropdown is open, route navigation to it.
+	if p.formCursor < len(p.formFields) && p.formFields[p.formCursor].LabelSelectOpen {
+		return p.handleLabelSelectMenuKey(key)
+	}
+
 	switch key {
 	case "esc":
 		p.dismiss()
@@ -517,6 +597,8 @@ func (p *popupModel) HandleFormKey(key string) (dismiss bool) {
 			}
 		} else if f.Select {
 			p.openSelectMenu()
+		} else if f.LabelSelect {
+			p.openLabelSelectMenu()
 		}
 
 	case "backspace":
@@ -531,6 +613,55 @@ func (p *popupModel) HandleFormKey(key string) (dismiss bool) {
 				p.onChange(p)
 			}
 		}
+	}
+	return false
+}
+
+// openLabelSelectMenu opens the dropdown embedded in the field's label.
+func (p *popupModel) openLabelSelectMenu() {
+	if p.formCursor >= len(p.formFields) {
+		return
+	}
+	f := &p.formFields[p.formCursor]
+	if !f.LabelSelect || f.Disabled {
+		return
+	}
+	f.LabelSelectOpen = true
+	p.selectCursor = 0
+	for i, opt := range f.LabelSelectOptions {
+		if opt == f.LabelSelectValue {
+			p.selectCursor = i
+			break
+		}
+	}
+}
+
+// handleLabelSelectMenuKey handles navigation within an open label select dropdown.
+func (p *popupModel) handleLabelSelectMenuKey(key string) (dismiss bool) {
+	if p.formCursor >= len(p.formFields) {
+		return false
+	}
+	f := &p.formFields[p.formCursor]
+
+	switch key {
+	case "up", "k":
+		if p.selectCursor > 0 {
+			p.selectCursor--
+		}
+	case "down", "j":
+		if p.selectCursor < len(f.LabelSelectOptions)-1 {
+			p.selectCursor++
+		}
+	case "enter", " ":
+		if p.selectCursor < len(f.LabelSelectOptions) {
+			f.LabelSelectValue = f.LabelSelectOptions[p.selectCursor]
+		}
+		f.LabelSelectOpen = false
+		if p.onChange != nil {
+			p.onChange(p)
+		}
+	case "esc":
+		f.LabelSelectOpen = false
 	}
 	return false
 }
@@ -706,6 +837,9 @@ func (p *popupModel) HandleBuildMenuKey(key string) (dismiss bool) {
 		stage = StageDeploy
 	case "a", "A":
 		stage = StageAll
+	case "!":
+		p.buildForce = !p.buildForce
+		return false
 	case "esc":
 		p.dismiss()
 		return true
@@ -714,7 +848,7 @@ func (p *popupModel) HandleBuildMenuKey(key string) (dismiss bool) {
 	}
 	if p.onBuildSelect != nil {
 		// Store the returned command before dismiss() zeroes the struct.
-		cmd := p.onBuildSelect(stage)
+		cmd := p.onBuildSelect(stage, p.buildForce)
 		p.pendingAsyncCmd = cmd
 	}
 	// Mark as dismissed by zeroing kind; pendingAsyncCmd is preserved so the

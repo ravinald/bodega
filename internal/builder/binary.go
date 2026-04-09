@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/manifest"
+	"github.com/scaleapi/bodega/internal/manifest"
 )
 
 // binaryFilename returns the local filename for a BinaryEntry, using
@@ -28,9 +28,9 @@ func binaryFilename(entry manifest.BinaryEntry) string {
 func binaryDestPath(d dirs, entry manifest.BinaryEntry) string {
 	filename := binaryFilename(entry)
 	if entry.Version != "" {
-		return filepath.Join(d.binaries, entry.Version, filename)
+		return filepath.Join(d.binaries, entry.Name, entry.Version, filename)
 	}
-	return filepath.Join(d.binaries, filename)
+	return filepath.Join(d.binaries, entry.Name, filename)
 }
 
 // binaryS3Key returns the S3 object key for a BinaryEntry.
@@ -41,7 +41,7 @@ func binaryS3Key(entry manifest.BinaryEntry) string {
 	if entry.Version != "" {
 		return "binaries/" + entry.Name + "/" + entry.Version + "/" + filename
 	}
-	return "binaries/" + filename
+	return "binaries/" + entry.Name + "/" + filename
 }
 
 // CheckBinaryStage inspects the filesystem to determine which pipeline stages
@@ -79,6 +79,13 @@ func FetchBinaries(cfg *Config, store *manifest.Store, entryFilter string) *Summ
 			cfg.logf("  [binary] %s: SKIPPED (frozen)", entry.Name)
 			continue
 		}
+		if !cfg.Force {
+			stage := CheckBinaryStage(cfg, entry)
+			if stage.Fetched {
+				cfg.logf("  [binary] %s: already fetched, skipping (use --force to re-fetch)", entry.Name)
+				continue
+			}
+		}
 
 		start := time.Now()
 		result := Result{Type: manifest.TypeBinary, Name: entry.Name}
@@ -102,15 +109,41 @@ func FetchBinaries(cfg *Config, store *manifest.Store, entryFilter string) *Summ
 
 		if err := downloadFile(out, entry.URL, destPath); err != nil {
 			result.Err = fmt.Errorf("download %s: %w", entry.URL, err)
-		} else if entry.SHA256 != nil && *entry.SHA256 != "" {
-			if err := verifySHA256(destPath, *entry.SHA256); err != nil {
-				result.Err = err
-			} else {
-				_, _ = fmt.Fprintf(out, "    SHA-256: verified\n")
-			}
 		} else {
-			actual, _ := fileSHA256(destPath)
-			_, _ = fmt.Fprintf(out, "    SHA-256: %s (not pinned — consider adding to manifest)\n", actual)
+			actual, hashErr := fileSHA256(destPath)
+			if hashErr != nil {
+				_, _ = fmt.Fprintf(out, "    WARNING: could not compute checksum: %v\n", hashErr)
+			} else {
+				_, _ = fmt.Fprintf(out, "    SHA-256: %s\n", actual)
+				verified := false
+				checksumOK := true
+
+				// Verify against legacy SHA256 field or Checksum struct.
+				if entry.SHA256 != nil && *entry.SHA256 != "" {
+					if err := verifySHA256(destPath, *entry.SHA256); err != nil {
+						result.Err = err
+						checksumOK = false
+					} else {
+						verified = true
+						_, _ = fmt.Fprintf(out, "    Checksum verified against manifest (SHA256 field)\n")
+					}
+				} else if entry.Checksum != nil {
+					if err := verifyChecksum(entry.Checksum, actual); err != nil {
+						result.Err = fmt.Errorf("checksum verification failed: %w", err)
+						checksumOK = false
+					} else {
+						verified = true
+						_, _ = fmt.Fprintf(out, "    Checksum verified against manifest\n")
+					}
+				}
+
+				if checksumOK {
+					cs := newSHA256Checksum(actual)
+					if err := cfg.findAndUpdateBinaryChecksum(store, entry.Name, cs, verified); err != nil {
+						_, _ = fmt.Fprintf(out, "    WARNING: could not save checksum: %v\n", err)
+					}
+				}
+			}
 		}
 
 		if result.Err == nil {
@@ -119,6 +152,7 @@ func FetchBinaries(cfg *Config, store *manifest.Store, entryFilter string) *Summ
 			if fi != nil {
 				_, _ = fmt.Fprintf(out, "    Size: %s\n", humanBytes(fi.Size()))
 			}
+			cfg.StampBinaryEntry(store, entry.Name)
 		} else {
 			_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
 			summary.Failures++

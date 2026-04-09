@@ -1,4 +1,4 @@
-// Package logging provides structured build logging for repo-manager.
+// Package logging provides structured build logging for bodega.
 //
 // Each build session writes to a dated session log. Individual package builds
 // write to their own per-package log file and simultaneously to the session
@@ -27,6 +27,14 @@ type BuildLogger struct {
 	errorLog   *os.File
 	timestamp  string
 	mu         sync.Mutex
+}
+
+// SessionLogPath returns the path to the current session log file.
+func (bl *BuildLogger) SessionLogPath() string {
+	if bl.sessionLog != nil {
+		return bl.sessionLog.Name()
+	}
+	return ""
 }
 
 // NewBuildLogger creates a new BuildLogger rooted at logDir.
@@ -159,7 +167,7 @@ func (bl *BuildLogger) Audit(format string, args ...interface{}) {
 //	Operation:  fetch
 //	Entry:      git/netbox@v4.5.5
 //	Error:      git worktree add: exit status 128
-//	Build root: /opt/repo-manager
+//	Build root: /opt/bodega
 //
 //	Output:
 //	    fatal: invalid reference: v4.5.5

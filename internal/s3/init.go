@@ -19,6 +19,10 @@ var expectedPrefixes = []string{
 	"pypi/wheels/",
 	"repos/",
 	"binaries/",
+	"gomod/",
+	"charts/",
+	"npm/",
+	"manifests/",
 	"services/",
 }
 

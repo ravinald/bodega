@@ -5,8 +5,9 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/manifest"
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/s3"
+	"github.com/scaleapi/bodega/internal/config"
+	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/scaleapi/bodega/internal/s3"
 )
 
 // --- splitArgs ---
@@ -117,8 +118,8 @@ func TestBuildTree(t *testing.T) {
 	}
 
 	statuses := []s3.EntryStatus{
-		{Type: manifest.TypeApt, Name: "pkg-a", InS3: true},
-		{Type: manifest.TypeGit, Name: "repo-b", InS3: false},
+		{Type: manifest.TypeApt, Name: "pkg-a@1.0", InS3: true},
+		{Type: manifest.TypeGit, Name: "repo-b@main", InS3: false},
 		{Type: manifest.TypePypi, Name: "wheels", InS3: true},
 		{Type: manifest.TypeBinary, Name: "tool-c", InS3: false},
 	}
@@ -129,37 +130,49 @@ func TestBuildTree(t *testing.T) {
 		t.Fatalf("expected 7 root groups, got %d", len(roots))
 	}
 
-	// apt group
+	// apt group — children are now package sub-groups
 	aptGroup := roots[0]
 	if !aptGroup.IsGroup || aptGroup.EntryType != manifest.TypeApt {
 		t.Errorf("roots[0] not apt group: %+v", aptGroup)
 	}
 	if len(aptGroup.Children) != 1 {
-		t.Fatalf("apt children count = %d, want 1", len(aptGroup.Children))
+		t.Fatalf("apt package groups = %d, want 1", len(aptGroup.Children))
 	}
-	if !aptGroup.Children[0].InS3 {
-		t.Error("pkg-a: InS3 should be true")
+	aptPkg := aptGroup.Children[0]
+	if !aptPkg.IsGroup || aptPkg.Label != "pkg-a" {
+		t.Errorf("apt pkg group label = %q, want pkg-a", aptPkg.Label)
 	}
-	if aptGroup.Children[0].Label != "pkg-a@1.0" {
-		t.Errorf("apt label = %q, want pkg-a@1.0", aptGroup.Children[0].Label)
+	if len(aptPkg.Children) != 1 {
+		t.Fatalf("apt pkg-a versions = %d, want 1", len(aptPkg.Children))
+	}
+	if !aptPkg.Children[0].InS3 {
+		t.Error("pkg-a@1.0: InS3 should be true")
 	}
 
 	// git group
 	gitGroup := roots[1]
 	if len(gitGroup.Children) != 1 {
-		t.Fatalf("git children count = %d, want 1", len(gitGroup.Children))
+		t.Fatalf("git package groups = %d, want 1", len(gitGroup.Children))
 	}
-	if gitGroup.Children[0].InS3 {
-		t.Error("repo-b: InS3 should be false")
+	gitPkg := gitGroup.Children[0]
+	if len(gitPkg.Children) != 1 {
+		t.Fatalf("git repo-b versions = %d, want 1", len(gitPkg.Children))
+	}
+	if gitPkg.Children[0].InS3 {
+		t.Error("repo-b@main: InS3 should be false")
 	}
 
-	// pypi group — always has exactly one child
+	// pypi group
 	pypiGroup := roots[2]
 	if len(pypiGroup.Children) != 1 {
-		t.Fatalf("pypi children count = %d, want 1", len(pypiGroup.Children))
+		t.Fatalf("pypi package groups = %d, want 1", len(pypiGroup.Children))
 	}
-	if !pypiGroup.Children[0].InS3 {
-		t.Error("pypi wheels: InS3 should be true")
+	pypiPkg := pypiGroup.Children[0]
+	if len(pypiPkg.Children) != 1 {
+		t.Fatalf("pypi pkg versions = %d, want 1", len(pypiPkg.Children))
+	}
+	if !pypiPkg.Children[0].InS3 {
+		t.Error("pypi pkg: InS3 should be true")
 	}
 }
 
@@ -207,24 +220,27 @@ func TestToggleExpand(t *testing.T) {
 	roots := BuildTree(store, nil)
 	m := newSourcesModel(roots)
 
-	// Initially the apt group is expanded (Expanded: true from BuildTree).
-	// Row 0 = apt/ group, Row 1 = pkg-a entry.
-	initialLen := len(m.flatList)
-	if initialLen < 2 {
-		t.Fatalf("expected at least 2 flat rows, got %d", initialLen)
-	}
-
-	// Collapse the apt group.
+	// Initially all groups are collapsed. Row 0 = apt/ group.
+	collapsedLen := len(m.flatList)
 	m.cursor = 0
+
+	// Expand the apt group.
 	m.ToggleExpand()
-	if len(m.flatList) >= initialLen {
-		t.Errorf("after collapse flatList len = %d, expected less than %d", len(m.flatList), initialLen)
+	expandedLen := len(m.flatList)
+	if expandedLen <= collapsedLen {
+		t.Fatalf("after expand flatList len = %d, expected more than %d", expandedLen, collapsedLen)
 	}
 
-	// Re-expand.
+	// Collapse it again.
 	m.ToggleExpand()
-	if len(m.flatList) != initialLen {
-		t.Errorf("after re-expand flatList len = %d, want %d", len(m.flatList), initialLen)
+	if len(m.flatList) != collapsedLen {
+		t.Errorf("after re-collapse flatList len = %d, expected %d", len(m.flatList), collapsedLen)
+	}
+
+	// Re-expand to verify round-trip.
+	m.ToggleExpand()
+	if len(m.flatList) != expandedLen {
+		t.Errorf("after re-expand flatList len = %d, want %d", len(m.flatList), expandedLen)
 	}
 }
 
@@ -260,7 +276,7 @@ func TestPopupConfirm(t *testing.T) {
 
 func TestDetailsViewNoNode(t *testing.T) {
 	store := &manifest.Store{}
-	d := newDetailsModel(store, "")
+	d := newDetailsModel(store, &config.Config{})
 	v := d.View()
 	if v == "" {
 		t.Error("details view returned empty string when no node selected")
@@ -273,7 +289,7 @@ func TestDetailsViewAptEntry(t *testing.T) {
 			{Name: "pkg-a", Version: "1.0", URL: "https://example.com/pkg-a"},
 		},
 	}
-	d := newDetailsModel(store, "")
+	d := newDetailsModel(store, &config.Config{})
 	d.width = 80
 	d.SetNode(&TreeNode{
 		EntryType: manifest.TypeApt,
@@ -419,7 +435,7 @@ func TestBuildMenuSelectStage(t *testing.T) {
 			kind:           popupBuildMenu,
 			buildEntryType: "git",
 			buildEntryName: "repo-x",
-			onBuildSelect: func(s BuildStage) tea.Cmd {
+			onBuildSelect: func(s BuildStage, force bool) tea.Cmd {
 				gotStage = s
 				return nil
 			},
@@ -629,8 +645,8 @@ func TestExtractNameFromURL(t *testing.T) {
 		entryType string
 		want      string
 	}{
-		{"https://github.com/org/netbox.git", manifest.TypeGit, "netbox"},
-		{"https://github.com/org/repo", manifest.TypeGit, "repo"},
+		{"https://github.com/org/netbox.git", manifest.TypeGit, "org/netbox"},
+		{"https://github.com/org/repo", manifest.TypeGit, "org/repo"},
 		{"https://example.com/downloads/awscli-2.0.tar.gz", manifest.TypeBinary, "awscli-2.0"},
 		{"https://example.com/pkg.deb", manifest.TypeApt, "pkg"},
 		{"https://example.com/tool.zip", manifest.TypeBinary, "tool"},
@@ -665,7 +681,7 @@ func TestRebuildCreateFieldsGit(t *testing.T) {
 	for i, f := range fields {
 		labels[i] = f.Label
 	}
-	for _, required := range []string{"Type", "Name", "URL", "Ref", "Frozen"} {
+	for _, required := range []string{"Type", "Name", "URL", "Ref"} {
 		found := false
 		for _, l := range labels {
 			if l == required {
@@ -685,7 +701,7 @@ func TestRebuildCreateFieldsBinary(t *testing.T) {
 	for i, f := range fields {
 		labels[i] = f.Label
 	}
-	for _, required := range []string{"Type", "Name", "Version", "URL", "Checksum", "Latest", "Frozen"} {
+	for _, required := range []string{"Type", "Name", "Version", "URL", "Checksum", "Latest"} {
 		found := false
 		for _, l := range labels {
 			if l == required {
@@ -760,6 +776,7 @@ func TestValidateCreateFields(t *testing.T) {
 				{Label: "Name", Value: "tool"},
 				{Label: "URL", Value: "https://example.com/tool"},
 				{Label: "Checksum", Value: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+				{Label: "Skip validation", Value: "yes", Checkbox: true},
 			},
 			wantErr: false,
 		},
@@ -885,14 +902,14 @@ func TestUpdateChecksumHintLatestCoupling(t *testing.T) {
 	setFieldValue(fields, "Latest", "yes")
 	updateChecksumHint(fields)
 
-	// Version should be forced to "latest" and disabled.
+	// Version text (NoLabel field) should be forced to "latest" and disabled.
 	for _, f := range fields {
-		if f.Label == "Version" {
+		if f.Label == "Version" && f.LabelSelect {
 			if !f.Disabled {
-				t.Error("Version should be disabled when Latest=yes")
+				t.Error("Version text should be disabled when Latest=yes")
 			}
 			if f.Value != "latest" {
-				t.Errorf("Version value = %q, want latest", f.Value)
+				t.Errorf("Version text value = %q, want latest", f.Value)
 			}
 		}
 	}
@@ -906,12 +923,12 @@ func TestUpdateChecksumHintLatestOff(t *testing.T) {
 	updateChecksumHint(fields)
 
 	for _, f := range fields {
-		if f.Label == "Version" {
+		if f.Label == "Version" && f.LabelSelect {
 			if f.Disabled {
-				t.Error("Version should be enabled when Latest=no")
+				t.Error("Version text should be enabled when Latest=no")
 			}
 			if f.Value == "latest" {
-				t.Error("Version should be cleared when Latest toggled off")
+				t.Error("Version text should be cleared when Latest toggled off")
 			}
 		}
 	}

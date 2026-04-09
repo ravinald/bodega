@@ -1,4 +1,4 @@
-// Package tui implements the three-pane terminal UI for reman shell.
+// Package tui implements the three-pane terminal UI for bodega shell.
 // Pane layout: Sources (top-left, 40%) | Details (top-right, 60%)
 //              Shell output + input (bottom, full width)
 package tui
@@ -69,8 +69,10 @@ var errorStyle = lipgloss.NewStyle().Foreground(colorRed)
 var successStyle = lipgloss.NewStyle().Foreground(colorGreen)
 
 // statusIcon returns the icon for a tree-node status.
-func statusIcon(inS3, frozen bool) string {
+func statusIcon(inS3, frozen, hidden bool) string {
 	switch {
+	case hidden:
+		return dimStyle.Render("~")
 	case frozen:
 		return lipgloss.NewStyle().Foreground(colorYellow).Render("*")
 	case inS3:
@@ -91,6 +93,12 @@ func typeIcon(t string) string {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("226")).Render("P")
 	case "binary":
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("41")).Render("B")
+	case "gomod":
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("81")).Render("M")
+	case "helm":
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("33")).Render("H")
+	case "npm":
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render("N")
 	default:
 		return " "
 	}

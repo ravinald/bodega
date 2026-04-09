@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/scaleapi/core-infrastructure/tools/repo-manager/internal/manifest"
+	"github.com/scaleapi/bodega/internal/manifest"
 )
 
 // helper: create a regular file (and parent dirs) with dummy content.
@@ -46,7 +46,7 @@ func TestCheckBinaryStage_Fetched(t *testing.T) {
 	cfg := &Config{BuildRoot: root}
 	entry := manifest.BinaryEntry{Name: "awscli", URL: "https://example.com/awscli.zip"}
 	d := buildDirs(root)
-	touchFile(t, filepath.Join(d.binaries, "awscli.zip"))
+	touchFile(t, filepath.Join(d.binaries, "awscli", "awscli.zip"))
 
 	s := CheckBinaryStage(cfg, entry)
 	if !s.Fetched || !s.Built || !s.Packaged {
@@ -61,14 +61,14 @@ func TestCheckBinaryStage_Versioned(t *testing.T) {
 	d := buildDirs(root)
 
 	// File NOT at versioned path → not fetched.
-	touchFile(t, filepath.Join(d.binaries, "awscli.zip"))
+	touchFile(t, filepath.Join(d.binaries, "awscli", "awscli.zip"))
 	s := CheckBinaryStage(cfg, entry)
 	if s.Fetched {
 		t.Error("expected Fetched=false when file at unversioned path but version is set")
 	}
 
 	// File at versioned path → fetched.
-	touchFile(t, filepath.Join(d.binaries, "2.13.0", "awscli.zip"))
+	touchFile(t, filepath.Join(d.binaries, "awscli", "2.13.0", "awscli.zip"))
 	s = CheckBinaryStage(cfg, entry)
 	if !s.Fetched {
 		t.Error("expected Fetched=true when file at versioned path")
@@ -84,7 +84,7 @@ func TestBinaryDestPath_NoVersion(t *testing.T) {
 	d := buildDirs(root)
 	entry := manifest.BinaryEntry{Name: "tool", URL: "https://example.com/tool.tar.gz"}
 	got := binaryDestPath(d, entry)
-	want := filepath.Join(d.binaries, "tool.tar.gz")
+	want := filepath.Join(d.binaries, "tool", "tool.tar.gz")
 	if got != want {
 		t.Errorf("binaryDestPath (no version) = %q, want %q", got, want)
 	}
@@ -95,7 +95,7 @@ func TestBinaryDestPath_WithVersion(t *testing.T) {
 	d := buildDirs(root)
 	entry := manifest.BinaryEntry{Name: "tool", Version: "v1.2", URL: "https://example.com/tool.tar.gz"}
 	got := binaryDestPath(d, entry)
-	want := filepath.Join(d.binaries, "v1.2", "tool.tar.gz")
+	want := filepath.Join(d.binaries, "tool", "v1.2", "tool.tar.gz")
 	if got != want {
 		t.Errorf("binaryDestPath (versioned) = %q, want %q", got, want)
 	}
@@ -106,7 +106,7 @@ func TestBinaryDestPath_FilenameOverride(t *testing.T) {
 	d := buildDirs(root)
 	entry := manifest.BinaryEntry{Name: "tool", Filename: "custom-name.bin", URL: "https://example.com/original.bin"}
 	got := binaryDestPath(d, entry)
-	want := filepath.Join(d.binaries, "custom-name.bin")
+	want := filepath.Join(d.binaries, "tool", "custom-name.bin")
 	if got != want {
 		t.Errorf("binaryDestPath (filename override) = %q, want %q", got, want)
 	}
@@ -115,7 +115,7 @@ func TestBinaryDestPath_FilenameOverride(t *testing.T) {
 func TestBinaryS3Key_NoVersion(t *testing.T) {
 	entry := manifest.BinaryEntry{Name: "tool", URL: "https://example.com/tool.tar.gz"}
 	got := binaryS3Key(entry)
-	want := "binaries/tool.tar.gz"
+	want := "binaries/tool/tool.tar.gz"
 	if got != want {
 		t.Errorf("binaryS3Key (no version) = %q, want %q", got, want)
 	}
@@ -184,7 +184,7 @@ func TestGitBareDir(t *testing.T) {
 	d := buildDirs(root)
 	entry := manifest.GitEntry{Name: "netbox", Ref: "v4.0.0", Source: "clone"}
 	got := gitBareDir(d, entry)
-	want := filepath.Join(d.repos, "netbox-v4.0.0.git")
+	want := filepath.Join(d.repos, "netbox", "netbox-v4.0.0.git") // single-segment name: no "--" replacement needed
 	if got != want {
 		t.Errorf("gitBareDir = %q, want %q", got, want)
 	}
@@ -424,8 +424,8 @@ func TestBinaryArtifactPaths(t *testing.T) {
 	store := &manifest.Store{Binary: entries}
 
 	// Put tool-a and tool-b on disk.
-	touchFile(t, filepath.Join(d.binaries, "tool-a.zip"))
-	touchFile(t, filepath.Join(d.binaries, "v2.0", "tool-b.tar.gz"))
+	touchFile(t, filepath.Join(d.binaries, "tool-a", "tool-a.zip"))
+	touchFile(t, filepath.Join(d.binaries, "tool-b", "v2.0", "tool-b.tar.gz"))
 
 	paths := BinaryArtifactPaths(cfg, store, "")
 	if len(paths) != 2 {
@@ -437,8 +437,8 @@ func TestBinaryArtifactPaths(t *testing.T) {
 	for _, p := range paths {
 		keyMap[p.S3Key] = p.Local
 	}
-	if _, ok := keyMap["binaries/tool-a.zip"]; !ok {
-		t.Error("missing S3 key binaries/tool-a.zip")
+	if _, ok := keyMap["binaries/tool-a/tool-a.zip"]; !ok {
+		t.Error("missing S3 key binaries/tool-a/tool-a.zip")
 	}
 	if _, ok := keyMap["binaries/tool-b/v2.0/tool-b.tar.gz"]; !ok {
 		t.Error("missing S3 key binaries/tool-b/v2.0/tool-b.tar.gz")
