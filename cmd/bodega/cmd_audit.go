@@ -9,7 +9,7 @@ import (
 	"github.com/scaleapi/bodega/internal/audit"
 )
 
-func newAuditCmd(gf *globalFlags) *cobra.Command {
+func newAuditEventsCmd(gf *globalFlags) *cobra.Command {
 	var (
 		eventType string
 		pkgType   string
@@ -20,8 +20,8 @@ func newAuditCmd(gf *globalFlags) *cobra.Command {
 	)
 
 	cmd := &cobra.Command{
-		Use:   "audit",
-		Short: "Query the audit trail",
+		Use:   "events",
+		Short: "Query the audit event trail",
 		Long: `audit queries the SQLite audit database and prints matching events.
 
 Examples:

@@ -108,26 +108,58 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 		return manifest.ForceUpdateMD5(cfg.ManifestDir, breakGlassType)
 	}
 
-	// Register sub-commands.
-	root.AddCommand(
-		newInitCmd(gf),
+	// Build pipeline commands: bodega build {fetch,run,upload,sync,status}
+	buildParent := &cobra.Command{
+		Use:   "build",
+		Short: "Build pipeline operations (fetch, run, upload, sync, status)",
+	}
+	buildParent.AddCommand(
 		newFetchCmd(gf),
-		newBuildCmd(gf),
-		newPackageCmd(gf),
+		newBuildRunCmd(gf),
 		newUploadCmd(gf),
 		newSyncCmd(gf),
 		newStatusCmd(gf),
-		newVerifyCmd(gf),
+		newPackageCmd(gf),
+	)
+
+	// Package management commands: bodega pkg {create,delete,freeze,hide,refresh,verify,checksum}
+	pkgParent := &cobra.Command{
+		Use:     "pkg",
+		Aliases: []string{"package"},
+		Short:   "Package management (create, delete, freeze, hide, refresh, verify)",
+	}
+	pkgParent.AddCommand(
 		newCreateCmd(gf),
 		newDeleteCmd(gf),
 		newRemoveCmd(gf),
 		newFreezeCmd(gf),
+		newHideCmd(gf),
+		newRefreshCmd(gf),
+		newVerifyCmd(gf),
+		newChecksumCmd(gf),
+	)
+
+	// Audit commands: bodega audit {events,check}
+	auditParent := &cobra.Command{
+		Use:   "audit",
+		Short: "Audit trail and dependency checking",
+	}
+	auditParent.AddCommand(
+		newAuditEventsCmd(gf),
+		newAuditCheckCmd(gf),
+	)
+
+	// Top-level commands.
+	root.AddCommand(
+		buildParent,
+		pkgParent,
+		auditParent,
+		newShowCmd(gf),
+		newInitCmd(gf),
 		newShellCmd(gf),
 		newServeCmd(gf),
-		newAuditCmd(gf),
-		newChecksumCmd(gf),
+		newRepairCmd(gf),
 		newResetCmd(gf),
-		newRefreshCmd(gf),
 	)
 
 	return root
@@ -179,10 +211,12 @@ func loadStore(gf *globalFlags) (*manifest.Store, error) {
 			return nil, err
 		}
 		backend := &manifest.S3Backend{
-			Prefix: "manifests/",
-			GetFn:  s3client.GetObject,
-			PutFn:  s3client.PutBytes,
-			Label_: fmt.Sprintf("s3://%s/manifests/", cfg.Bucket),
+			Prefix:   "manifests/",
+			GetFn:    s3client.GetObject,
+			PutFn:    s3client.PutBytes,
+			DeleteFn: s3client.DeleteObject,
+			ListFn:   s3client.ListPrefix,
+			Label_:   fmt.Sprintf("s3://%s/manifests/", cfg.Bucket),
 		}
 		store = manifest.NewStore(backend)
 	}

@@ -12,12 +12,12 @@ import (
 	"github.com/scaleapi/bodega/internal/manifest"
 )
 
-func newBuildCmd(gf *globalFlags) *cobra.Command {
+func newBuildRunCmd(gf *globalFlags) *cobra.Command {
 	var entryFilter string
 
 	cmd := &cobra.Command{
-		Use:   "build [TYPE...]",
-		Short: "Build artifacts for one or more manifest types",
+		Use:   "run [TYPE...]",
+		Short: "Compile/transform sources for one or more manifest types",
 		Long: `build compiles or prepares sources for the specified types. It automatically
 fetches sources first if they have not already been fetched.
 
