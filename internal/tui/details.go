@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/viewport"
@@ -440,7 +441,23 @@ func (m detailsModel) renderEntryDetails() string {
 	if err != nil || pm == nil || len(pm.Versions) == 0 {
 		return errorStyle.Render("entry not found")
 	}
+
+	// Find the version entry matching the selected tree node.
 	ve := pm.Versions[0]
+	for _, candidate := range pm.Versions {
+		vn := candidate.VersionedName(pm.Name)
+		if vn == n.Label || candidate.Version == n.Label || candidate.Ref == n.Label {
+			ve = candidate
+			break
+		}
+		// Handle policy entry labels like "python3@*".
+		if candidate.Version == "*" && n.Label == pm.Name+"@*" {
+			ve = candidate
+			break
+		}
+	}
+
+	isPolicyEntry := ve.Version == "*"
 
 	switch n.EntryType {
 	case manifest.TypeApt:
@@ -454,22 +471,35 @@ func (m detailsModel) renderEntryDetails() string {
 			sb.WriteString(field("Package Name", ve.SourceName))
 			sb.WriteByte('\n')
 		}
-		if ve.URL != "" {
-			sb.WriteString(field("Source URL", wrap(ve.URL, m.width-16)))
+		if isPolicyEntry {
+			if pm.DepPolicy != "" {
+				sb.WriteString(field("Dep Policy", pm.DepPolicy))
+				sb.WriteByte('\n')
+			}
+			if ve.VersionConstraint != "" {
+				sb.WriteString(field("Constraint", ve.VersionConstraint))
+				sb.WriteByte('\n')
+			}
+			sb.WriteString(boolField("Frozen", ve.Frozen))
 			sb.WriteByte('\n')
-		}
-		if ve.BuildCmd != "" {
-			sb.WriteString(field("BuildCmd", ve.BuildCmd))
+		} else {
+			if ve.URL != "" {
+				sb.WriteString(field("Source URL", wrap(ve.URL, m.width-16)))
+				sb.WriteByte('\n')
+			}
+			if ve.BuildCmd != "" {
+				sb.WriteString(field("BuildCmd", ve.BuildCmd))
+				sb.WriteByte('\n')
+			}
+			if ve.DebGlob != "" {
+				sb.WriteString(field("DebGlob", ve.DebGlob))
+				sb.WriteByte('\n')
+			}
+			sb.WriteString(boolField("Frozen", ve.Frozen))
 			sb.WriteByte('\n')
+			sb.WriteString(m.s3AndClientFields(n))
+			sb.WriteString(platformAndBuildEnv(ve.Platform, ve.BuildEnv))
 		}
-		if ve.DebGlob != "" {
-			sb.WriteString(field("DebGlob", ve.DebGlob))
-			sb.WriteByte('\n')
-		}
-		sb.WriteString(boolField("Frozen", ve.Frozen))
-		sb.WriteByte('\n')
-		sb.WriteString(m.s3AndClientFields(n))
-		sb.WriteString(platformAndBuildEnv(ve.Platform, ve.BuildEnv))
 
 	case manifest.TypeGit:
 		sb.WriteString(field("Name", pm.Name))
@@ -610,6 +640,28 @@ func (m detailsModel) renderEntryDetails() string {
 		sb.WriteByte('\n')
 		sb.WriteString(m.s3AndClientFields(n))
 		sb.WriteString(platformAndBuildEnv(ve.Platform, ve.BuildEnv))
+	}
+
+	// Render metadata map if present.
+	if len(ve.Metadata) > 0 {
+		sb.WriteString("\n")
+		metaHeader := "Metadata"
+		if n.EntryType == manifest.TypeApt {
+			metaHeader = "Apt Metadata"
+		}
+		sb.WriteString(dimStyle.Render("── " + metaHeader + " ──"))
+		sb.WriteByte('\n')
+		keys := make([]string, 0, len(ve.Metadata))
+		for k := range ve.Metadata {
+			if k != "Description-Full" {
+				keys = append(keys, k)
+			}
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			sb.WriteString(field(k, ve.Metadata[k]))
+			sb.WriteByte('\n')
+		}
 	}
 
 	// Append raw JSON below the parsed fields.

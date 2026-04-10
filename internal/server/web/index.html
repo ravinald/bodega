@@ -479,7 +479,7 @@ function render() {
             row.innerHTML =
               '<span class="status ' + (e.frozen ? 'frozen' : '') + '">' +
               (e.frozen ? '*' : '') + '</span>' +
-              '<span>' + (entryVersion(type, e) || e.name) + '</span>';
+              '<span>' + (entryVersion(type, e) === '*' ? e.name + '@*' : (entryVersion(type, e) || e.name)) + '</span>';
             row.onclick = () => { selectedKey = key; render(); showDetail(type, e); };
             group.appendChild(row);
           }
@@ -503,6 +503,8 @@ function showDetail(type, entry) {
     escapeHtml(permalink) + '">\u{1F517}</span>' +
     '</div>';
 
+  const isPolicyEntry = entry.version === '*';
+
   const fields = [];
   if (type === 'git') {
     fields.push(['Ref', entry.ref]);
@@ -515,8 +517,21 @@ function showDetail(type, entry) {
     if (entry.mode) fields.push(['Mode', entry.mode]);
   } else {
     if (entry.version) fields.push(['Version', entry.version]);
-    if (entry.url) fields.push(['Source URL', entry.url, 'url']);
+    if (entry.url && !isPolicyEntry) fields.push(['Source URL', entry.url, 'url']);
     if (entry.mode) fields.push(['Mode', entry.mode]);
+  }
+
+  // Show apt-specific fields for policy entries.
+  if (isPolicyEntry) {
+    if (entry.source_name) fields.push(['Package Name', entry.source_name]);
+    // Look up dep_policy from the manifest.
+    var manifests = allData[type] || [];
+    for (var pm of manifests) {
+      if (pm.name === entry.name && pm.dep_policy) {
+        fields.push(['Dep Policy', pm.dep_policy]);
+        break;
+      }
+    }
   }
 
   if (entry.checksum) {
@@ -527,9 +542,24 @@ function showDetail(type, entry) {
   if (entry.version_constraint)
     fields.push(['Constraint', entry.version_constraint]);
   fields.push(['Frozen', entry.frozen ? 'yes' : 'no', entry.frozen ? 'yes' : 'no']);
-  if (clientUrl) fields.push(['Package URL', clientUrl, 'url']);
+  if (clientUrl && !isPolicyEntry) fields.push(['Package URL', clientUrl, 'url']);
+
+  // Render metadata map if present, with a section header.
+  if (entry.metadata && typeof entry.metadata === 'object') {
+    fields.push(['__section__', 'Apt Metadata']);
+    for (const [mk, mv] of Object.entries(entry.metadata)) {
+      if (mk !== 'Description-Full') {
+        fields.push([mk, mv]);
+      }
+    }
+  }
 
   for (const [k, v, cls] of fields) {
+    // Section headers.
+    if (k === '__section__') {
+      html += '<div style="margin-top:12px;margin-bottom:4px;color:var(--fg);font-size:12px;font-weight:bold;text-align:left">' + escapeHtml(v) + '</div>';
+      continue;
+    }
     var valHtml = escapeHtml(v || '');
     if (cls === 'url' && v && v.startsWith('http')) {
       valHtml = '<a href="' + escapeHtml(v) + '" target="_blank" style="color:var(--cyan)">' + escapeHtml(v) + '</a>';
@@ -542,16 +572,23 @@ function showDetail(type, entry) {
       '<span class="val' + (cls ? ' ' + cls : '') + '">' + valHtml + '</span>' + copyIcon + '</div>';
   }
 
-  var jsonStr = JSON.stringify(entry, null, 2);
   html += '<div class="json-section"><h3>Package JSON Config ' +
     '<span class="copy-link copy-json" title="Copy JSON">\u{1F517}</span>' +
-    '</h3><pre>' + escapeHtml(jsonStr) + '</pre></div>';
+    '</h3><pre class="json-pre">Loading...</pre></div>';
 
   d.innerHTML = html;
 
-  // Attach the JSON string to the copy-json element via JS (avoids attribute escaping issues).
-  var jsonCopyEl = d.querySelector('.copy-json');
-  if (jsonCopyEl) jsonCopyEl._jsonData = jsonStr;
+  // Fetch full PackageManifest for JSON display (matches TUI).
+  fetch('/api/v1/packages/' + type + '/' + encodeURIComponent(entry.name))
+    .then(function(r) { return r.ok ? r.json() : entry; })
+    .catch(function() { return entry; })
+    .then(function(manifest) {
+      var jsonStr = JSON.stringify(manifest, null, 2);
+      var pre = d.querySelector('.json-pre');
+      if (pre) pre.textContent = jsonStr;
+      var jsonCopyEl = d.querySelector('.copy-json');
+      if (jsonCopyEl) jsonCopyEl._jsonData = jsonStr;
+    });
 }
 
 function escapeHtml(s) {

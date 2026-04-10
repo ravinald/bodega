@@ -209,3 +209,184 @@ func ValidateAptSource(pkgName string) string {
 	}
 	return ""
 }
+
+// ResolveAptVersion queries the local apt cache for the candidate version of
+// a package (what would be installed by `apt-get install`). Returns empty
+// string if apt-cache is unavailable or the package is not found.
+func ResolveAptVersion(pkgName string) string {
+	if _, err := exec.LookPath("apt-cache"); err != nil {
+		return ""
+	}
+	cmd := exec.Command("apt-cache", "policy", pkgName)
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	// Parse "Candidate: 3.12.3-0ubuntu2.1" from apt-cache policy output.
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Candidate:") {
+			ver := strings.TrimSpace(strings.TrimPrefix(line, "Candidate:"))
+			if ver != "(none)" {
+				return ver
+			}
+		}
+	}
+	return ""
+}
+
+// FetchAptMetadata runs `apt-cache show <pkgName>` and parses the output into
+// a VersionEntry populated with Description, Platform, and Metadata map.
+// Returns nil if apt-cache is unavailable or the package is not found.
+func FetchAptMetadata(pkgName string) *manifest.VersionEntry {
+	if _, err := exec.LookPath("apt-cache"); err != nil {
+		return nil
+	}
+	cmd := exec.Command("apt-cache", "show", pkgName)
+	out, err := cmd.Output()
+	if err != nil || len(out) == 0 {
+		return nil
+	}
+	return parseAptShowOutput(string(out), pkgName)
+}
+
+// parseAptShowOutput parses the output of `apt-cache show` into a VersionEntry.
+// Extracts Version, Description, Architecture, and all other fields into Metadata.
+//
+// Sample output:
+//
+//	Package: python3
+//	Version: 3.12.3-0ubuntu2.1
+//	Architecture: amd64
+//	Maintainer: Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>
+//	Installed-Size: 92
+//	Section: python
+//	Priority: important
+//	Description: interactive high-level object-oriented language (default version)
+//	 Python, the high-level, interactive object oriented language,
+//	 includes an extensive class library with lots of goodies.
+func parseAptShowOutput(output, pkgName string) *manifest.VersionEntry {
+	ve := &manifest.VersionEntry{
+		SourceName: pkgName,
+		Metadata:   make(map[string]string),
+	}
+
+	// Fields we promote to VersionEntry fields rather than Metadata.
+	promoted := map[string]bool{
+		"Package": true, "Version": true, "Description": true,
+		"Architecture": true,
+	}
+
+	lines := strings.Split(output, "\n")
+	var currentKey string
+	var descLines []string
+	inDescription := false
+
+	for _, line := range lines {
+		// Continuation lines start with a space (part of multi-line Description).
+		if strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t") {
+			if inDescription {
+				descLines = append(descLines, strings.TrimSpace(line))
+			}
+			continue
+		}
+
+		// End of previous multi-line field.
+		inDescription = false
+
+		// Empty line or new package stanza — stop at first stanza.
+		if line == "" {
+			if ve.Version != "" {
+				break // we have a complete stanza
+			}
+			continue
+		}
+
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		val := strings.TrimSpace(parts[1])
+		currentKey = key
+
+		switch key {
+		case "Version":
+			ve.Version = val
+		case "Architecture":
+			ve.Platform = "linux/" + val
+			ve.Metadata[key] = val
+		case "Description":
+			// First line of description.
+			descLines = []string{val}
+			inDescription = true
+		default:
+			if !promoted[key] {
+				ve.Metadata[key] = val
+			}
+		}
+		_ = currentKey // used implicitly by continuation handling
+	}
+
+	// Set description from collected lines.
+	if len(descLines) > 0 {
+		ve.Description = descLines[0] // short description (first line)
+		// Store full description in metadata if multi-line.
+		if len(descLines) > 1 {
+			ve.Metadata["Description-Full"] = strings.Join(descLines, "\n")
+		}
+	}
+
+	if ve.Version == "" {
+		return nil
+	}
+	return ve
+}
+
+// ResolveAndCreateConcreteVersion queries apt for the concrete version of a
+// package and creates a fully-populated VersionEntry. Called after creating
+// a * (any) policy entry to auto-create the resolved version alongside it.
+func ResolveAndCreateConcreteVersion(ctx context.Context, store *manifest.Store, pkgName string, out io.Writer) {
+	version := ResolveAptVersion(pkgName)
+	if version == "" {
+		_, _ = fmt.Fprintf(out, "  [apt] could not resolve version for %s\n", pkgName)
+		return
+	}
+
+	// Check if this concrete version already exists.
+	if pm, err := store.GetPackage(ctx, manifest.TypeApt, pkgName); err == nil && pm != nil {
+		for _, ve := range pm.Versions {
+			if ve.Version == version {
+				_, _ = fmt.Fprintf(out, "  [apt] %s@%s already exists\n", pkgName, version)
+				return
+			}
+		}
+	}
+
+	// Fetch full metadata.
+	ve := FetchAptMetadata(pkgName)
+	if ve == nil {
+		// Fallback: create with just the version.
+		ve = &manifest.VersionEntry{
+			Version:    version,
+			SourceName: pkgName,
+		}
+	}
+
+	if err := store.AddVersion(ctx, manifest.TypeApt, pkgName, *ve); err != nil {
+		_, _ = fmt.Fprintf(out, "  [apt] WARNING: could not add %s@%s: %v\n", pkgName, version, err)
+		return
+	}
+
+	_, _ = fmt.Fprintf(out, "  [apt] resolved %s → %s\n", pkgName, version)
+
+	// Also set the package-level description if not already set.
+	if ve.Description != "" {
+		if pm, err := store.GetPackage(ctx, manifest.TypeApt, pkgName); err == nil && pm != nil {
+			if pm.Description == "" {
+				pm.Description = ve.Description
+				_ = store.SavePackage(ctx, pm)
+			}
+		}
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -424,6 +425,19 @@ func printVersionDetail(pm *manifest.PackageManifest, ve manifest.VersionEntry, 
 	}
 	if ve.AppVersion != "" {
 		fmt.Printf("App Version: %s\n", ve.AppVersion)
+	}
+	if len(ve.Metadata) > 0 {
+		fmt.Println("Metadata:")
+		keys := make([]string, 0, len(ve.Metadata))
+		for k := range ve.Metadata {
+			if k != "Description-Full" {
+				keys = append(keys, k)
+			}
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			fmt.Printf("  %-16s %s\n", k+":", ve.Metadata[k])
+		}
 	}
 	fmt.Println()
 }

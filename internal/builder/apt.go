@@ -124,6 +124,45 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 				cfg.logf("  [apt] %s: SKIPPED (frozen)", name)
 				continue
 			}
+
+			// Policy entries (version=*) are not fetchable artifacts.
+			// Auto-resolve the concrete version and discover deps as needed.
+			if ve.Version == "*" && ve.VersionConstraint == manifest.ConstraintAny {
+				sourceName := ve.SourceName
+				if sourceName == "" {
+					sourceName = name
+				}
+				out := cfg.entryWriter(manifest.TypeApt, name)
+
+				// 1. Resolve concrete version if none exists yet.
+				hasConcreteVersion := false
+				for _, other := range pm.Versions {
+					if other.Version != "" && other.Version != "*" {
+						hasConcreteVersion = true
+						break
+					}
+				}
+				if !hasConcreteVersion {
+					_, _ = fmt.Fprintf(out, "  [apt] %s: resolving concrete version for policy entry\n", name)
+					ResolveAndCreateConcreteVersion(ctx, store, sourceName, out)
+					pm, _ = store.GetPackage(ctx, manifest.TypeApt, name)
+				}
+
+				// 2. Discover deps if policy is set and none exist yet.
+				if pm.DepPolicy != "" && pm.DepPolicy != "none" {
+					children := store.ChildrenOf("apt/" + name)
+					if len(children) == 0 {
+						_, _ = fmt.Fprintf(out, "  [apt] %s: discovering %s dependencies\n", name, pm.DepPolicy)
+						deps := DiscoverAptDeps(store, sourceName, pm.DepPolicy, out)
+						if len(deps) > 0 {
+							ImportAptDeps(ctx, store, name, deps, out)
+						}
+					}
+				}
+
+				continue
+			}
+
 			if !cfg.Force {
 				stage := CheckAptStage(cfg, name, ve)
 				if stage.Fetched {

@@ -111,6 +111,67 @@ libssl3
 	}
 }
 
+func TestParseAptShowOutput(t *testing.T) {
+	output := `Package: python3
+Version: 3.12.3-0ubuntu2.1
+Architecture: amd64
+Maintainer: Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>
+Installed-Size: 92
+Pre-Depends: python3-minimal (= 3.12.3-0ubuntu2.1)
+Depends: python3.12 (>= 3.12.3-1~), libpython3-stdlib (= 3.12.3-0ubuntu2.1)
+Section: python
+Priority: important
+Description: interactive high-level object-oriented language (default version)
+ Python, the high-level, interactive object oriented language,
+ includes an extensive class library with lots of goodies.
+ .
+ This package is a dependency package.
+
+`
+	ve := parseAptShowOutput(output, "python3")
+	if ve == nil {
+		t.Fatal("expected non-nil VersionEntry")
+	}
+	if ve.Version != "3.12.3-0ubuntu2.1" {
+		t.Errorf("Version = %q, want %q", ve.Version, "3.12.3-0ubuntu2.1")
+	}
+	if ve.Platform != "linux/amd64" {
+		t.Errorf("Platform = %q, want %q", ve.Platform, "linux/amd64")
+	}
+	if ve.Description != "interactive high-level object-oriented language (default version)" {
+		t.Errorf("Description = %q", ve.Description)
+	}
+	if ve.SourceName != "python3" {
+		t.Errorf("SourceName = %q, want %q", ve.SourceName, "python3")
+	}
+	// Check metadata fields.
+	if ve.Metadata["Maintainer"] == "" {
+		t.Error("expected Maintainer in Metadata")
+	}
+	if ve.Metadata["Installed-Size"] != "92" {
+		t.Errorf("Installed-Size = %q, want %q", ve.Metadata["Installed-Size"], "92")
+	}
+	if ve.Metadata["Section"] != "python" {
+		t.Errorf("Section = %q, want %q", ve.Metadata["Section"], "python")
+	}
+	if ve.Metadata["Priority"] != "important" {
+		t.Errorf("Priority = %q, want %q", ve.Metadata["Priority"], "important")
+	}
+	if ve.Metadata["Architecture"] != "amd64" {
+		t.Errorf("Architecture in Metadata = %q, want %q", ve.Metadata["Architecture"], "amd64")
+	}
+	if _, ok := ve.Metadata["Description-Full"]; !ok {
+		t.Error("expected Description-Full in Metadata for multi-line description")
+	}
+}
+
+func TestParseAptShowOutput_Empty(t *testing.T) {
+	ve := parseAptShowOutput("", "pkg")
+	if ve != nil {
+		t.Errorf("expected nil for empty input, got %+v", ve)
+	}
+}
+
 func TestIsVirtualPkg(t *testing.T) {
 	tests := []struct {
 		name string

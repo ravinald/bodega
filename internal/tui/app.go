@@ -665,8 +665,51 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			formTitle:  "Edit: " + node.EntryType + "/" + node.Name,
 			formFields: buildEditFields(m.store, node),
 			onFormSave: func(fields []formField) {
-				m.log.appendLog(dimStyle.Render(
-					"Edit saved in form — direct manifest editing not yet wired. Use the CLI to apply changes.",
+				ctx := context.Background()
+				pm, err := m.store.GetPackage(ctx, node.EntryType, node.Name)
+				if err != nil || pm == nil || len(pm.Versions) == 0 {
+					m.log.appendLog(errorStyle.Render("Edit failed: could not load package"))
+					return
+				}
+				ve := &pm.Versions[0]
+
+				// Update fields common to all types.
+				if v := fieldValueFromSlice(fields, "Version"); v != "" {
+					ve.Version = v
+				}
+				if u := fieldValueFromSlice(fields, "Source URL"); u != "" {
+					ve.URL = u
+				} else if !fieldDisabled(fields, "Source URL") {
+					ve.URL = ""
+				}
+
+				// Type-specific updates.
+				switch node.EntryType {
+				case manifest.TypeApt:
+					ve.SourceName = fieldValueFromSlice(fields, "Package Name")
+					ve.BuildCmd = fieldValueFromSlice(fields, "Build Cmd")
+					ve.DebGlob = fieldValueFromSlice(fields, "Deb Glob")
+					depPolicy := strings.ToLower(fieldValueFromSlice(fields, "Include Deps"))
+					if depPolicy == "none" {
+						depPolicy = ""
+					}
+					pm.DepPolicy = depPolicy
+				case manifest.TypeGit:
+					ve.Ref = fieldValueFromSlice(fields, "Ref")
+				case manifest.TypeBinary:
+					ve.Filename = fieldValueFromSlice(fields, "Filename")
+				}
+
+				if err := m.store.SavePackage(ctx, pm); err != nil {
+					m.log.appendLog(errorStyle.Render("Edit failed: " + err.Error()))
+					return
+				}
+				if err := m.store.SaveIndex(ctx); err != nil {
+					m.log.appendLog(errorStyle.Render("Save index failed: " + err.Error()))
+					return
+				}
+				m.log.appendLog(successStyle.Render(
+					fmt.Sprintf("Updated %s/%s", node.EntryType, node.Name),
 				))
 			},
 		}
@@ -890,12 +933,52 @@ func buildEditFields(store *manifest.Store, node *TreeNode) []formField {
 	ve := pm.Versions[0]
 	switch node.EntryType {
 	case manifest.TypeApt:
+		// Determine mode from existing data.
+		aptMode := "Package Name"
+		buildFrom := "Git repo"
+		if ve.URL != "" && ve.BuildCmd != "" {
+			aptMode = "Source Build"
+			buildFrom = "Git repo"
+		} else if ve.URL != "" {
+			aptMode = "Direct URL"
+		} else if ve.BuildCmd != "" {
+			aptMode = "Source Build"
+			buildFrom = "apt-get source"
+		}
+
+		isPkgName := aptMode == "Package Name"
+		isDirectURL := aptMode == "Direct URL"
+		isSourceBuild := aptMode == "Source Build"
+		isBuildFromGit := isSourceBuild && buildFrom == "Git repo"
+		isBuildFromAptSrc := isSourceBuild && buildFrom == "apt-get source"
+
+		depPolicy := "None"
+		if pm.DepPolicy == "direct" {
+			depPolicy = "Direct"
+		} else if pm.DepPolicy == "transitive" {
+			depPolicy = "Transitive"
+		}
+
 		return []formField{
+			{Label: "Apt Mode", Value: aptMode, Select: true,
+				Options: []string{"Package Name", "Direct URL", "Source Build"}},
+			{Label: "Build From", Value: buildFrom, Select: true,
+				Options:  []string{"Git repo", "apt-get source"},
+				Disabled: !isSourceBuild},
 			{Label: "Name", Value: pm.Name},
+			{Label: "Package Name", Value: ve.SourceName,
+				Disabled: isDirectURL || isBuildFromGit},
 			{Label: "Version", Value: ve.Version},
-			{Label: "Source URL", Value: ve.URL},
-			{Label: "BuildCmd", Value: ve.BuildCmd},
-			{Label: "Validate source", Checkbox: true, Value: "yes"},
+			{Label: "Source URL", Value: ve.URL,
+				Disabled: isPkgName || isBuildFromAptSrc},
+			{Label: "Build Cmd", Value: ve.BuildCmd,
+				Disabled: !isBuildFromGit},
+			{Label: "Deb Glob", Value: ve.DebGlob,
+				Disabled: !isSourceBuild},
+			{Label: "Include Deps", Value: depPolicy, Select: true,
+				Disabled: !isPkgName,
+				Options:  []string{"None", "Direct", "Transitive"}},
+			{Label: "Skip validation", Checkbox: true, Value: "no"},
 		}
 	case manifest.TypeGit:
 		return []formField{
@@ -1041,12 +1124,27 @@ func (m *appModel) buildCreatePopup() popupModel {
 				fmt.Sprintf("Created %s/%s", entryType, name),
 			))
 
-			// Apt dependency discovery after create.
+			// Apt post-create: resolve concrete version + dependency discovery.
 			if entryType == manifest.TypeApt {
 				aptMode := fieldValueFromSlice(fields, "Apt Mode")
+				pkgName := fieldValueFromSlice(fields, "Package Name")
+
+				// Auto-resolve concrete version when * (any) is used.
+				if aptMode == "Package Name" && pkgName != "" {
+					version := fieldValueFromSlice(fields, "Version")
+					if version == "*" || version == "" {
+						ctx := context.Background()
+						var resolveBuf strings.Builder
+						builder.ResolveAndCreateConcreteVersion(ctx, store, pkgName, &resolveBuf)
+						if resolveBuf.Len() > 0 {
+							logPane.appendLog(dimStyle.Render(strings.TrimSpace(resolveBuf.String())))
+						}
+					}
+				}
+
+				// Dependency discovery.
 				includeDeps := fieldValueFromSlice(fields, "Include Deps")
 				if aptMode == "Package Name" && includeDeps != "None" {
-					pkgName := fieldValueFromSlice(fields, "Package Name")
 					depth := "direct"
 					if includeDeps == "Transitive" {
 						depth = "transitive"
@@ -1739,6 +1837,18 @@ func saveCreateEntry(store *manifest.Store, fields []formField) error {
 	if err := store.AddVersion(ctx, entryType, name, ve); err != nil {
 		return err
 	}
+
+	// Save dep policy on the package manifest if set.
+	if entryType == manifest.TypeApt {
+		depPolicy := strings.ToLower(fieldValueFromSlice(fields, "Include Deps"))
+		if depPolicy != "" && depPolicy != "none" {
+			if pm, err := store.GetPackage(ctx, entryType, name); err == nil && pm != nil {
+				pm.DepPolicy = depPolicy
+				_ = store.SavePackage(ctx, pm)
+			}
+		}
+	}
+
 	return store.SaveIndex(ctx)
 }
 
@@ -1879,6 +1989,16 @@ func fieldValueFromSlice(fields []formField, key string) string {
 		}
 	}
 	return ""
+}
+
+// fieldDisabled returns true if the named field exists and is disabled.
+func fieldDisabled(fields []formField, key string) bool {
+	for _, f := range fields {
+		if f.Label == key {
+			return f.Disabled
+		}
+	}
+	return false
 }
 
 // labelSelectValue returns the LabelSelectValue of the first LabelSelect field with the given label.

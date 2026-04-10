@@ -18,6 +18,8 @@ var descClient = &http.Client{Timeout: 10 * time.Second}
 // from its upstream registry. Returns empty string on failure.
 func FetchDescription(entryType, name, url string) string {
 	switch entryType {
+	case manifest.TypeApt:
+		return fetchAptDescription(name)
 	case manifest.TypeGit:
 		return fetchGitHubDescription(name, url)
 	case manifest.TypePypi:
@@ -160,4 +162,13 @@ func DiscoverDescriptions(store *manifest.Store, out io.Writer) {
 			}
 		}
 	}
+}
+
+// fetchAptDescription extracts the short description from `apt-cache show`.
+func fetchAptDescription(name string) string {
+	ve := FetchAptMetadata(name)
+	if ve == nil {
+		return ""
+	}
+	return ve.Description
 }

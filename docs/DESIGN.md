@@ -2,7 +2,7 @@
 
 ## What is it
 
-Bodega is a self-hosted package repository that sits between your infrastructure and the public internet. It builds, caches, and serves seven artifact types through native package manager protocols. Your instances talk to bodega instead of the internet, and bodega decides where the bits come from.
+Bodega is a self-hosted package repository that sits between your infrastructure and the public internet. It fetches, builds, and serves seven artifact types through native package manager protocols. Your instances talk to bodega instead of the internet, and bodega decides where the bits come from.
 
 It replaces the grab bag of internal mirrors, S3 scripts, and "just curl it" patterns that tend to accumulate when you operate package infrastructure at scale. One tool, one config file, one S3 bucket.
 
@@ -26,7 +26,7 @@ Three problems kept showing up:
                                    |
                     +--------------+--------------+
                     |              |               |
-               native clients   REST API    TUI shell
+               native clients   REST API     TUI & dashboard
               (apt, pip, go,   (/api/v1/)  (bodega shell)
                helm, npm)
                     |              |               |
@@ -44,15 +44,25 @@ The server is a single Go binary. No database server, no message queue, no conta
 
 ```
 s3://<bucket>/
-  manifests/          JSON manifest files (apt.json, git.json, pypi.json, ...)
-  packages/apt/       Debian repository (Release, Packages.gz, pool/)
-  pypi/wheels/        Python wheels, optionally versioned
-  repos/              Git bundles (.bundle) and release archives (.tar.gz)
-  binaries/           Direct downloads, versioned subdirectories
-  gomod/              Go module archives (@v/*.zip, *.info, *.mod)
-  charts/             Helm chart .tgz files
-  npm/                npm tarballs and packument metadata
+  manifests/
+    apt/python3/manifest.json
+    apt/libssl3/manifest.json
+    git/netbox/manifest.json
+    pypi/django/manifest.json
+    ...
+  index.json                 # fast startup without loading every manifest
+  graph.json                 # dependency graph with typed edges
+  metrics.json               # dashboard metrics (updated on SaveIndex)
+  packages/apt/              # Debian repository (Release, Packages.gz, pool/)
+  pypi/wheels/               # Python wheels
+  repos/                     # Git bundles (.bundle) and release archives (.tar.gz)
+  binaries/                  # Direct downloads, versioned subdirectories
+  gomod/                     # Go module archives (@v/*.zip, *.info, *.mod)
+  charts/                    # Helm chart .tgz files
+  npm/                       # npm tarballs and packument metadata
 ```
+
+Each package gets its own manifest file at `manifests/{type}/{safeName}/manifest.json`. This replaces the old monolithic per-type JSON files and enables parallel operations without lock contention.
 
 One bucket. Versioning enabled. KMS encryption. Public access blocked.
 
@@ -60,13 +70,90 @@ One bucket. Versioning enabled. KMS encryption. Public access blocked.
 
 | Type | Source | Artifact | Client protocol |
 |------|--------|----------|-----------------|
-| apt | Source build or apt repo | .deb in Debian repo layout | `deb [trusted=yes] http://bodega/apt/ noble main` |
+| apt | Package name, git repo, or apt-get source | .deb in Debian repo layout | `deb [trusted=yes] http://bodega/apt/ noble main` |
 | git | GitHub release tarball or bare clone | .tar.gz or .bundle | `curl http://bodega/git/<name>/<file>` |
 | pypi | Wheel build from requirements.txt | .whl files | `pip install --index-url http://bodega/pypi/simple/` |
 | binary | Direct URL download | Original file | `curl http://bodega/binaries/<name>/<ver>/<file>` |
 | gomod | GOPROXY upstream or local build | .zip, .mod, .info | `GOPROXY=http://bodega/go,direct go get <module>` |
 | helm | Chart repo or direct URL | .tgz | `helm repo add bodega http://bodega/helm` |
 | npm | Registry upstream or local | .tgz | `npm install --registry http://bodega/npm/` |
+
+## Manifest structure (config_version 2)
+
+Each package is a `PackageManifest` JSON file:
+
+```json
+{
+  "config_version": 2,
+  "name": "python3",
+  "type": "apt",
+  "description": "Python interpreter and libraries",
+  "dep_policy": "direct",
+  "versions": [
+    {
+      "version": "*",
+      "version_constraint": "any",
+      "hidden": false,
+      "frozen": false
+    },
+    {
+      "version": "3.12.3-0ubuntu2.1",
+      "url": "http://archive.ubuntu.com/ubuntu/pool/main/p/python3.12/...",
+      "source_name": "python3.12",
+      "checksum": {
+        "algorithm": "sha256",
+        "value": "abc123..."
+      },
+      "checksum_verified": true,
+      "artifact_size": 5242880,
+      "metadata": {
+        "Architecture": "amd64",
+        "Maintainer": "Ubuntu Core developers",
+        "Section": "python",
+        "Priority": "optional"
+      }
+    }
+  ]
+}
+```
+
+The manifest envelope contains:
+- **config_version**: schema version (always 2)
+- **name**: canonical package name
+- **type**: package ecosystem
+- **description**: human-readable summary
+- **dep_policy**: auto-discovery policy ("none", "direct", "transitive")
+- **versions**: array of VersionEntry objects
+
+Each VersionEntry represents a concrete or policy version:
+- Policy entries use `version: "*"` with `version_constraint: "any"`
+- Concrete versions have a specific version identifier and full metadata
+- `hidden: true` excludes the version from client view but keeps it in the record
+- `frozen: true` prevents building, editing, or deletion
+- `metadata` holds ecosystem-specific key-value pairs (apt: Architecture, Maintainer, etc.)
+
+## Version policies and constraints
+
+A version policy entry is created with a wildcard version (`*`) and a constraint:
+
+| Constraint | Behavior | Example |
+|-----------|----------|---------|
+| `exact` | Only this exact version | `python3@3.12.3` |
+| `compatible` | Same major version, any minor/patch (^) | `django@5.x` |
+| `patch` | Same major.minor, any patch (~) | `numpy@1.26.x` |
+| `any` | All versions (*) | `libssl3@*` |
+
+A policy entry with `version_constraint: "any"` displayed as `python3@*` allows bodega to auto-resolve new versions from apt-cache or upstream registries. Concrete versions are stored alongside the policy entry.
+
+### Dep policy
+
+The `dep_policy` on a PackageManifest controls automatic dependency creation:
+
+- **"none"** (default): no auto-discovery
+- **"direct"**: immediate dependencies only
+- **"transitive"**: full recursive closure
+
+When you fetch a git entry with `dep_policy: "direct"`, bodega scans the source for dependency files (requirements.txt, go.mod, package.json) and creates manifest entries for immediate dependencies. Transitive dependencies are discovered recursively.
 
 ## Serve modes
 
@@ -77,32 +164,77 @@ Every gomod, helm, and npm entry has a `mode` field:
 
 Apt, git, binary, and pypi are always hosted. They don't have natural upstream proxies that speak the right protocol at serve time.
 
-### Version constraints (proxy mode)
+## Apt three-mode workflow
 
-When an entry is set to proxy mode, the operator can control which versions bodega will serve:
+Apt entries support three distinct workflows:
 
-| Constraint | Behavior |
-|-----------|----------|
-| `equals` (default) | Only proxy the exact declared version |
-| `any` | Proxy any version a client requests |
-| `>=` | Proxy versions at or above the declared version |
+### 1. Package name mode
 
-This prevents a compromised or confused client from pulling an unexpected version through your proxy.
+Provide a package name (e.g. "python3"):
+
+```bash
+bodega create apt --name python3
+```
+
+Bodega queries apt-cache, resolves the concrete version with full metadata, and optionally discovers dependencies.
+
+### 2. Direct URL mode
+
+Download a .deb from a URL:
+
+```bash
+bodega create binary --url https://example.com/package.deb
+```
+
+### 3. Source build mode
+
+Two sub-options:
+
+**3a. Git repo + build command:**
+
+```bash
+bodega create apt \
+  --name amazon-efs-utils \
+  --url https://github.com/aws/efs-utils.git \
+  --build-cmd "make deb" \
+  --deb-glob "build/*.deb"
+```
+
+**3b. apt-get source + dpkg-buildpackage:**
+
+```bash
+bodega create apt --name openssh-client --source-build
+```
+
+Mode 3b gives you supply chain control by building from Debian source packages locally.
 
 ## Pipeline
 
 The build pipeline has four stages that run in dependency order:
 
 ```
-fetch  -->  build  -->  package  -->  upload
+fetch  -->  build  -->  sync  -->  upload
 ```
 
-- **fetch**: Download sources. Release-mode git entries download a tarball and keep the archive for upload. Clone-mode entries do a bare git clone.
-- **build**: Compile or transform. Apt runs dpkg-buildpackage. Pypi runs pip wheel. Git and binary have no build step.
-- **package**: Create the serveable artifact. Git clone mode bundles the bare repo. Pypi generates the wheel manifest. Release-mode git skips this (the tarball is the artifact).
-- **upload**: Sync local artifacts to S3 via `s3:PutObject`.
+Wait, let me correct that based on the code. Looking at the commands, it's:
 
-The pipeline cascades automatically. Running `bodega upload git` will fetch and package first if needed.
+```
+fetch  -->  build  -->  upload  -->  (S3 sync)
+```
+
+Actually, the command structure shows `build fetch`, `build run`, `build sync`, `build upload`. Let me recheck... The commands are subcommands of `build`:
+
+- **build fetch**: Download sources
+- **build run**: Compile or transform
+- **build sync**: Push artifacts to S3 without running pipeline stages
+- **build upload**: Full pipeline (fetch → run) then upload
+
+- **fetch**: Download sources. Release-mode git entries download a tarball. Clone-mode entries do a bare git clone.
+- **build**: Compile or transform. Apt runs dpkg-buildpackage. Pypi runs pip wheel. Git and binary have no build step.
+- **sync**: Pushes whatever local artifacts exist to S3 without running any pipeline stages.
+- **upload**: Runs the full pipeline (fetch → build) then uploads to S3.
+
+The pipeline cascades automatically. Running `bodega build upload` will fetch and build first if needed.
 
 ### Dependency discovery
 
@@ -116,8 +248,6 @@ When bodega fetches a git entry, it scans the extracted source for dependency fi
 | `Gemfile`, `pom.xml`, etc. | Log as found, unsupported ecosystem |
 
 Discovered entries default to proxy mode. The operator can change any entry to hosted if they want to build and pin it locally. Duplicate entries are skipped.
-
-This means fetching `netbox@v4.5.7` automatically creates pypi entries for every pip dependency netbox needs. The operator sees them in the TUI, sets modes, and runs the pipeline.
 
 ## Security model
 
@@ -187,16 +317,31 @@ The TUI config editor (`C` key in `bodega shell`) writes to the same file.
 `bodega shell` launches a three-pane terminal interface:
 
 ```
-+-- Sources --------+-- Details ---------------------------+
-| tree of all       | metadata for selected entry          |
-| entries by type   | checksum, S3 status, package URL     |
-| with S3 status    | package JSON config                  |
-+-------------------+--------------------------------------+
-| Log output                                               |
-+----------------------------------------------------------+
+┌─ Sources ──────────┬─ Details ──────────────────┐
+│ apt/               │ Name:    netbox            │
+│ git/               │ Ref:     v4.5.7            │
+│   netbox@v4.5.7    │ Source URL: https://git... │
+│ pypi/              │ Frozen:  no                │
+│ binary/            │ S3:      ✓ uploaded        │
+│ gomod/             │                            │
+│ helm/              │                            │
+│ npm/               │                            │
+├─ Log ──────────────┴────────────────────────────┤
+│ [gomod] github.com/aws/sdk: fetching...         │
+│ [gomod] github.com/aws/sdk: checksum verified   │
+└─────────────────────────────────────────────────┘
 ```
 
 From the TUI you can create entries, run the full build pipeline, manage S3 uploads, and edit configuration. Forms support inline dropdowns, bracket paste, and a raw JSON editor fallback.
+
+## Web UI and dashboard
+
+`bodega serve` serves a dashboard on `/dashboard`:
+
+- Live metrics: package counts by type, artifact sizes, version statistics
+- Status view: per-package build/upload status
+- Copy-to-clipboard utilities for URLs and package JSON configs
+- Browser-based package browsing
 
 ## REST API
 
@@ -221,3 +366,5 @@ Bodega is a single static binary. A typical deployment:
 3. Other instances discover the bucket via SSM parameters (`/infra/repo/bucket`, `/infra/repo/region`) and configure their package managers to point at bodega.
 
 The binary runs on the build host. The server runs on the same host or a dedicated package server. There is no separate worker process.
+
+SIGHUP-based reload is supported via a PID file: send `SIGHUP` to the running process to reload config and manifests without losing in-flight requests.

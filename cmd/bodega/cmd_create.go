@@ -107,8 +107,13 @@ Examples:
 			}
 			fmt.Printf("Added %s entry: %s\n", t, name)
 
-			// Apt dependency discovery.
+			// Apt post-create: resolve concrete version + dependency discovery.
 			if t == manifest.TypeApt && ve.URL == "" && ve.BuildCmd == "" && ve.SourceName != "" {
+				// Auto-resolve concrete version when * (any) is used.
+				if ve.Version == "*" || ve.Version == "" {
+					builder.ResolveAndCreateConcreteVersion(ctx, store, ve.SourceName, os.Stdout)
+				}
+
 				depChoice, err := prompt(r, "Include dependencies? (none / direct / transitive)", "none")
 				if err == nil && depChoice != "none" && depChoice != "" {
 					depth := "direct"

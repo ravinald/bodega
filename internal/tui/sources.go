@@ -147,6 +147,10 @@ func BuildTree(store *manifest.Store, statuses []s3.EntryStatus) []TreeNode {
 				if label == "" {
 					label = ve.Ref
 				}
+				// Policy entries (e.g. "*") get prefixed with name@ for clarity.
+				if label == "*" {
+					label = pm.Name + "@*"
+				}
 				allFrozen := ve.Frozen
 				entries = append(entries, entryInfo{
 					label:     label,

@@ -1,7 +1,6 @@
 # bodega
 
-A manifest-driven package repository manager with an S3 backend. Builds, caches,
-and serves seven artifact types to standard package manager clients.
+A self-hosted package repository manager with an S3 backend. Fetches, builds, and serves seven package types to standard clients without leaving your network.
 
 | Type | Client | Protocol |
 |------|--------|----------|
@@ -15,13 +14,15 @@ and serves seven artifact types to standard package manager clients.
 
 ## Features
 
-- **Pipeline**: fetch → build → package → upload with automatic stage cascading
+- **Pipeline**: fetch → build → upload with automatic stage cascading
 - **HTTP(S) server**: serves all 7 types to native clients, REST API, TLS support
-- **Proxy/cache**: fetches from upstream on cache miss, caches in S3, verifies checksums
-- **TUI**: three-pane interactive terminal UI (sources tree, details, log)
-- **Audit trail**: SQLite database tracking every fetch, build, and mutation
-- **Checksum verification**: auto-computed on first fetch, enforced on subsequent fetches
-- **Manifest integrity**: MD5 companion files verified on every read
+- **Proxy/cache**: optional upstream caching for gomod, helm, npm
+- **TUI**: three-pane interactive terminal interface (sources, details, log)
+- **Web dashboard**: live metrics, status view, copy-to-clipboard utilities
+- **Audit trail**: SQLite database recording every fetch, build, and mutation
+- **Checksum verification**: computed on first fetch, enforced on subsequent fetches
+- **Manifest integrity**: MD5 verification on every read/write
+- **Supply chain control**: hide bad versions, freeze known-good artifacts
 
 ## Quick start
 
@@ -30,16 +31,15 @@ make build
 export REPO_BUCKET=my-bucket
 export AWS_REGION=us-west-2
 
-./dist/bodega init          # create S3 bucket
-./dist/bodega create git    # add a git entry (interactive)
-./dist/bodega fetch         # download sources
-./dist/bodega upload        # build + upload to S3
-./dist/bodega serve         # start HTTP server on :8080
-./dist/bodega shell         # launch TUI
+./dist/bodega init                         # create S3 bucket
+./dist/bodega create git                   # add a git entry (interactive)
+./dist/bodega build fetch                  # download sources
+./dist/bodega build upload                 # build + upload to S3
+./dist/bodega serve                        # start HTTP server on :8080
+./dist/bodega shell                        # launch TUI
 ```
 
-See [docs/QUICKSTART.md](docs/QUICKSTART.md) for a guided walkthrough and
-[docs/USAGE.md](docs/USAGE.md) for comprehensive documentation.
+For a guided walkthrough, see [docs/QUICKSTART.md](docs/QUICKSTART.md). For comprehensive documentation, see [docs/USAGE.md](docs/USAGE.md).
 
 ## Development
 

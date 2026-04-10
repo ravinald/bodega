@@ -73,6 +73,11 @@ type PackageManifest struct {
 	// Description is a short human-readable summary of what the package does.
 	Description string `json:"description,omitempty"`
 
+	// DepPolicy controls automatic dependency creation for this package.
+	// "none" (default/empty): no auto-discovery. "direct": immediate deps only.
+	// "transitive": full recursive closure.
+	DepPolicy string `json:"dep_policy,omitempty"`
+
 	// Versions is the ordered list of version entries for this package.
 	// Multiple versions may coexist; callers select by VersionEntry.Version.
 	Versions []VersionEntry `json:"versions"`
@@ -170,6 +175,10 @@ type VersionEntry struct {
 
 	// Description overrides the package-level description for this specific version.
 	Description string `json:"description,omitempty"`
+
+	// Metadata holds ecosystem-specific key-value pairs (e.g. apt: Architecture,
+	// Maintainer, Section, Priority, Installed-Size; npm: license, engines).
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // VersionedName returns "name@version" using whichever of Version or Ref is set,
