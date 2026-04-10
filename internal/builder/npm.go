@@ -141,6 +141,7 @@ func FetchNpm(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 				if result.Err == nil {
 					_, _ = fmt.Fprintf(out, "  [npm] %s@%s: ok\n", name, ve.Version)
 					cfg.StampNpmEntry(store, name, ve)
+					stampArtifactSize(context.Background(), store, manifest.TypeNpm, name, ve, dest)
 				}
 			}
 

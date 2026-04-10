@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/scaleapi/bodega/internal/builder"
 	"github.com/scaleapi/bodega/internal/manifest"
 )
 
@@ -105,6 +106,25 @@ Examples:
 				return fmt.Errorf("save index: %w", err)
 			}
 			fmt.Printf("Added %s entry: %s\n", t, name)
+
+			// Apt dependency discovery.
+			if t == manifest.TypeApt && ve.URL == "" && ve.BuildCmd == "" && ve.SourceName != "" {
+				depChoice, err := prompt(r, "Include dependencies? (none / direct / transitive)", "none")
+				if err == nil && depChoice != "none" && depChoice != "" {
+					depth := "direct"
+					if depChoice == "transitive" {
+						depth = "transitive"
+					}
+					deps := builder.DiscoverAptDeps(store, ve.SourceName, depth, os.Stdout)
+					if len(deps) > 0 {
+						added := builder.ImportAptDeps(ctx, store, name, deps, os.Stdout)
+						fmt.Printf("Discovered %d deps, added %d new entries\n", len(deps), added)
+					} else {
+						fmt.Println("No dependencies found")
+					}
+				}
+			}
+
 			notifyServer(gf)
 			return nil
 		},
@@ -149,7 +169,7 @@ func collectGitVersion(r *bufio.Reader, name, url, ref string) (string, manifest
 	if name == "" {
 		return "", manifest.VersionEntry{}, fmt.Errorf("name is required")
 	}
-	if url, err = prompt(r, "URL", url); err != nil {
+	if url, err = prompt(r, "Source URL", url); err != nil {
 		return "", manifest.VersionEntry{}, err
 	}
 	if url == "" {
@@ -172,7 +192,7 @@ func collectBinaryVersion(r *bufio.Reader, name, url, sha256, filename string) (
 	if name == "" {
 		return "", manifest.VersionEntry{}, fmt.Errorf("name is required")
 	}
-	if url, err = prompt(r, "URL", url); err != nil {
+	if url, err = prompt(r, "Source URL", url); err != nil {
 		return "", manifest.VersionEntry{}, err
 	}
 	if url == "" {
@@ -192,32 +212,99 @@ func collectBinaryVersion(r *bufio.Reader, name, url, sha256, filename string) (
 
 func collectAptVersion(r *bufio.Reader, name, url, srcName, buildCmd, debGlob string) (string, manifest.VersionEntry, error) {
 	var err error
-	if name, err = prompt(r, "Name", name); err != nil {
+
+	mode, err := prompt(r, "Mode (package-name / direct-url / source-build)", "package-name")
+	if err != nil {
 		return "", manifest.VersionEntry{}, err
 	}
-	if name == "" {
-		return "", manifest.VersionEntry{}, fmt.Errorf("name is required")
-	}
-	if url, err = prompt(r, "Git URL (leave blank for apt-get download)", url); err != nil {
-		return "", manifest.VersionEntry{}, err
-	}
-	if url != "" {
-		if srcName, err = prompt(r, "Source directory name", srcName); err != nil {
+
+	ve := manifest.VersionEntry{}
+
+	switch mode {
+	case "package-name", "":
+		if srcName, err = prompt(r, "Package Name (e.g. nginx)", srcName); err != nil {
 			return "", manifest.VersionEntry{}, err
 		}
-		if buildCmd, err = prompt(r, "Build command", buildCmd); err != nil {
+		if srcName == "" {
+			return "", manifest.VersionEntry{}, fmt.Errorf("package name is required")
+		}
+		if name == "" {
+			name = srcName
+		}
+		if name, err = prompt(r, "Name", name); err != nil {
 			return "", manifest.VersionEntry{}, err
 		}
-		if debGlob, err = prompt(r, "Deb glob pattern", debGlob); err != nil {
+		ve.SourceName = srcName
+
+	case "direct-url":
+		if url, err = prompt(r, "Source URL (.deb URL)", url); err != nil {
 			return "", manifest.VersionEntry{}, err
 		}
+		if url == "" {
+			return "", manifest.VersionEntry{}, fmt.Errorf("URL is required")
+		}
+		if name, err = prompt(r, "Name", name); err != nil {
+			return "", manifest.VersionEntry{}, err
+		}
+		if name == "" {
+			return "", manifest.VersionEntry{}, fmt.Errorf("name is required")
+		}
+		ve.URL = url
+
+	case "source-build":
+		buildFrom, err := prompt(r, "Build from (git / apt-source)", "git")
+		if err != nil {
+			return "", manifest.VersionEntry{}, err
+		}
+
+		switch buildFrom {
+		case "git":
+			if url, err = prompt(r, "Git Source URL", url); err != nil {
+				return "", manifest.VersionEntry{}, err
+			}
+			if url == "" {
+				return "", manifest.VersionEntry{}, fmt.Errorf("git URL is required")
+			}
+			if name, err = prompt(r, "Name", name); err != nil {
+				return "", manifest.VersionEntry{}, err
+			}
+			if name == "" {
+				return "", manifest.VersionEntry{}, fmt.Errorf("name is required")
+			}
+			if buildCmd, err = prompt(r, "Build command", buildCmd); err != nil {
+				return "", manifest.VersionEntry{}, err
+			}
+			if debGlob, err = prompt(r, "Deb glob pattern", debGlob); err != nil {
+				return "", manifest.VersionEntry{}, err
+			}
+			ve.URL = url
+			ve.BuildCmd = buildCmd
+			ve.DebGlob = debGlob
+
+		case "apt-source":
+			if srcName, err = prompt(r, "Package Name", srcName); err != nil {
+				return "", manifest.VersionEntry{}, err
+			}
+			if srcName == "" {
+				return "", manifest.VersionEntry{}, fmt.Errorf("package name is required")
+			}
+			if name == "" {
+				name = srcName
+			}
+			if name, err = prompt(r, "Name", name); err != nil {
+				return "", manifest.VersionEntry{}, err
+			}
+			ve.SourceName = srcName
+			ve.BuildCmd = "dpkg-buildpackage -us -uc"
+
+		default:
+			return "", manifest.VersionEntry{}, fmt.Errorf("unknown build source: %s (expected git or apt-source)", buildFrom)
+		}
+
+	default:
+		return "", manifest.VersionEntry{}, fmt.Errorf("unknown mode: %s (expected package-name, direct-url, or source-build)", mode)
 	}
-	ve := manifest.VersionEntry{
-		URL:        url,
-		SourceName: srcName,
-		BuildCmd:   buildCmd,
-		DebGlob:    debGlob,
-	}
+
 	return name, ve, nil
 }
 

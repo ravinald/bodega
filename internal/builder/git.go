@@ -186,9 +186,12 @@ func FetchGit(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 			summary.Total++
 			_, _ = fmt.Fprintf(out, "    Done (%s)\n", result.Elapsed.Round(time.Millisecond))
 
-			// Stamp build environment on the entry.
+			// Stamp build environment and artifact size on the entry.
 			if result.Err == nil {
 				cfg.StampGitEntry(store, name, ve)
+				if len(result.Artifacts) > 0 {
+					stampArtifactSize(context.Background(), store, manifest.TypeGit, name, ve, result.Artifacts[0])
+				}
 			}
 
 			// Auto-discover descriptions and dependencies in the fetched source.

@@ -356,7 +356,7 @@ func printVersionDetail(pm *manifest.PackageManifest, ve manifest.VersionEntry, 
 	fmt.Printf("Type:        %s\n", pm.Type)
 	fmt.Printf("Version:     %s\n", v)
 	if ve.URL != "" {
-		fmt.Printf("URL:         %s\n", ve.URL)
+		fmt.Printf("Source URL:  %s\n", ve.URL)
 	}
 	if ve.Ref != "" && ve.Ref != v {
 		fmt.Printf("Ref:         %s\n", ve.Ref)
@@ -414,7 +414,7 @@ func printVersionDetail(pm *manifest.PackageManifest, ve manifest.VersionEntry, 
 
 	// Type-specific fields.
 	if ve.SourceName != "" {
-		fmt.Printf("Source Name: %s\n", ve.SourceName)
+		fmt.Printf("Package Name: %s\n", ve.SourceName)
 	}
 	if ve.BuildCmd != "" {
 		fmt.Printf("Build Cmd:   %s\n", ve.BuildCmd)

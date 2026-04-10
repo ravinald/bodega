@@ -22,6 +22,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/scaleapi/bodega/internal/audit"
+	"github.com/scaleapi/bodega/internal/builder"
 	"github.com/scaleapi/bodega/internal/config"
 	"github.com/scaleapi/bodega/internal/manifest"
 	bos3 "github.com/scaleapi/bodega/internal/s3"
@@ -892,7 +893,7 @@ func buildEditFields(store *manifest.Store, node *TreeNode) []formField {
 		return []formField{
 			{Label: "Name", Value: pm.Name},
 			{Label: "Version", Value: ve.Version},
-			{Label: "URL", Value: ve.URL},
+			{Label: "Source URL", Value: ve.URL},
 			{Label: "BuildCmd", Value: ve.BuildCmd},
 			{Label: "Validate source", Checkbox: true, Value: "yes"},
 		}
@@ -900,14 +901,14 @@ func buildEditFields(store *manifest.Store, node *TreeNode) []formField {
 		return []formField{
 			{Label: "Name", Value: pm.Name},
 			{Label: "Ref", Value: ve.Ref},
-			{Label: "URL", Value: ve.URL},
+			{Label: "Source URL", Value: ve.URL},
 			{Label: "Validate source", Checkbox: true, Value: "yes"},
 		}
 	case manifest.TypeBinary:
 		fields := []formField{
 			{Label: "Name", Value: pm.Name},
 			{Label: "Version", Value: ve.Version},
-			{Label: "URL", Value: ve.URL},
+			{Label: "Source URL", Value: ve.URL},
 		}
 		if ve.Filename != "" {
 			fields = append(fields, formField{Label: "Filename", Value: ve.Filename})
@@ -966,11 +967,11 @@ func (m *appModel) buildCreatePopup() popupModel {
 		// Update checksum hint on every change.
 		updateChecksumHint(pp.formFields)
 
-		// Auto-fill Name from URL when navigating away from the URL field.
+		// Auto-fill Name from Source URL when navigating away from it.
 		if pp.prevCursor != pp.formCursor &&
 			pp.prevCursor < len(pp.formFields) &&
-			pp.formFields[pp.prevCursor].Label == "URL" {
-			urlVal := fieldValueFromSlice(pp.formFields, "URL")
+			pp.formFields[pp.prevCursor].Label == "Source URL" {
+			urlVal := fieldValueFromSlice(pp.formFields, "Source URL")
 			if urlVal != "" && strings.Contains(urlVal, "://") {
 				nameVal := fieldValueFromSlice(pp.formFields, "Name")
 				if nameVal == "" {
@@ -979,6 +980,25 @@ func (m *appModel) buildCreatePopup() popupModel {
 						if pp.formFields[i].Label == "Name" {
 							pp.formFields[i].Value = derived
 							pp.formFields[i].cursor = len([]rune(derived))
+							break
+						}
+					}
+				}
+			}
+		}
+
+		// Auto-fill Name from Package Name when navigating away from it.
+		if pp.prevCursor != pp.formCursor &&
+			pp.prevCursor < len(pp.formFields) &&
+			pp.formFields[pp.prevCursor].Label == "Package Name" {
+			pkgName := fieldValueFromSlice(pp.formFields, "Package Name")
+			if pkgName != "" {
+				nameVal := fieldValueFromSlice(pp.formFields, "Name")
+				if nameVal == "" {
+					for i := range pp.formFields {
+						if pp.formFields[i].Label == "Name" {
+							pp.formFields[i].Value = pkgName
+							pp.formFields[i].cursor = len([]rune(pkgName))
 							break
 						}
 					}
@@ -1008,13 +1028,49 @@ func (m *appModel) buildCreatePopup() popupModel {
 			entryType := fieldValueFromSlice(fields, "Type")
 			name := fieldValueFromSlice(fields, "Name")
 			if name == "" {
-				name = extractNameFromURL(fieldValueFromSlice(fields, "URL"), entryType)
+				name = extractNameFromURL(fieldValueFromSlice(fields, "Source URL"), entryType)
+			}
+			if name == "" {
+				if pkgName := fieldValueFromSlice(fields, "Package Name"); pkgName != "" {
+					name = pkgName
+				}
 			}
 			m.lastCreatedType = entryType
 			m.lastCreatedName = name
 			logPane.appendLog(successStyle.Render(
 				fmt.Sprintf("Created %s/%s", entryType, name),
 			))
+
+			// Apt dependency discovery after create.
+			if entryType == manifest.TypeApt {
+				aptMode := fieldValueFromSlice(fields, "Apt Mode")
+				includeDeps := fieldValueFromSlice(fields, "Include Deps")
+				if aptMode == "Package Name" && includeDeps != "None" {
+					pkgName := fieldValueFromSlice(fields, "Package Name")
+					depth := "direct"
+					if includeDeps == "Transitive" {
+						depth = "transitive"
+					}
+					var buf strings.Builder
+					deps := builder.DiscoverAptDeps(store, pkgName, depth, &buf)
+					if buf.Len() > 0 {
+						logPane.appendLog(dimStyle.Render(strings.TrimSpace(buf.String())))
+					}
+					if len(deps) > 0 {
+						ctx := context.Background()
+						var importBuf strings.Builder
+						added := builder.ImportAptDeps(ctx, store, name, deps, &importBuf)
+						if importBuf.Len() > 0 {
+							logPane.appendLog(dimStyle.Render(strings.TrimSpace(importBuf.String())))
+						}
+						logPane.appendLog(successStyle.Render(
+							fmt.Sprintf("Discovered %d deps for %s, added %d new entries", len(deps), pkgName, added),
+						))
+					} else {
+						logPane.appendLog(dimStyle.Render("No dependencies found for " + pkgName))
+					}
+				}
+			}
 		}
 	}
 
@@ -1069,8 +1125,8 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 		return restoreCursors([]formField{
 			typeField,
 			{Label: "Name", Value: restore("Name", ""),
-				Hint: "leave blank to derive from URL"},
-			{Label: "URL", Value: restore("URL", "")},
+				Hint: "leave blank to derive from Source URL"},
+			{Label: "Source URL", Value: restore("Source URL", "")},
 			{Label: "Ref", Value: restore("Ref", "")},
 			{Label: "Skip validation", Value: restore("Skip validation", "no"), Checkbox: true,
 				Hint: "skip URL/ref reachability check"},
@@ -1119,13 +1175,13 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 		return restoreCursors([]formField{
 			typeField,
 			{Label: "Name", Value: restore("Name", ""),
-				Hint: "leave blank to derive from URL"},
+				Hint: "leave blank to derive from Source URL"},
 			{Label: "Version", Value: versionVal, Disabled: versionDisabled,
 				LabelSelect: true, LabelSelectValue: "exact (=)",
 				LabelSelectOptions: []string{"exact (=)", "compatible (^)", "patch (~)", "latest (*)"}},
-			{Label: "URL", Value: restore("URL", "")},
+			{Label: "Source URL", Value: restore("Source URL", "")},
 			{Label: "Filename", Value: restore("Filename", ""),
-				Hint: "leave empty to derive from URL"},
+				Hint: "leave empty to derive from Source URL"},
 			{Label: "Checksum", Value: checksumVal,
 				Hint: checksumHint(checksumVal)},
 			{Label: "Latest", Value: latestVal, Checkbox: true},
@@ -1160,7 +1216,7 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 				LabelSelect: true, LabelSelectValue: constraintVal,
 				LabelSelectOptions: []string{"exact (=)", "compatible (^)", "patch (~)", "latest (*)"},
 				Hint: "e.g. v1.30.0"},
-			{Label: "URL", Value: restore("URL", ""),
+			{Label: "Source URL", Value: restore("Source URL", ""),
 				Hint: "upstream GOPROXY URL; leave empty for proxy.golang.org"},
 			{Label: "Checksum", Value: checksumVal,
 				Hint: checksumHint(checksumVal)},
@@ -1194,7 +1250,7 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 			{Label: "Version", Value: versionVal, Disabled: versionDisabled,
 				LabelSelect: true, LabelSelectValue: constraintVal,
 				LabelSelectOptions: []string{"exact (=)", "compatible (^)", "patch (~)", "latest (*)"}},
-			{Label: "URL", Value: restore("URL", ""),
+			{Label: "Source URL", Value: restore("Source URL", ""),
 				Hint: "chart repo URL or direct .tgz download URL"},
 			{Label: "App Version", Value: restore("App Version", "")},
 			{Label: "Checksum", Value: checksumVal,
@@ -1229,7 +1285,7 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 			{Label: "Version", Value: versionVal, Disabled: versionDisabled,
 				LabelSelect: true, LabelSelectValue: constraintVal,
 				LabelSelectOptions: []string{"exact (=)", "compatible (^)", "patch (~)", "latest (*)"}},
-			{Label: "URL", Value: restore("URL", ""),
+			{Label: "Source URL", Value: restore("Source URL", ""),
 				Hint: "upstream registry URL; leave empty for registry.npmjs.org"},
 			{Label: "Checksum", Value: checksumVal,
 				Hint: checksumHint(checksumVal)},
@@ -1238,25 +1294,66 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 		})
 
 	default: // manifest.TypeApt
+		aptMode := restore("Apt Mode", "Package Name")
+		buildFrom := restore("Build From", "Git repo")
 		versionVal := restore("Version", "")
 		checksumVal := restore("Checksum", "")
+		constraintVal := prevLabelSelect["Version"]
+		if constraintVal == "" {
+			constraintVal = "exact (=)"
+		}
+
+		isPkgName := aptMode == "Package Name"
+		isDirectURL := aptMode == "Direct URL"
+		isSourceBuild := aptMode == "Source Build"
+		isBuildFromGit := isSourceBuild && buildFrom == "Git repo"
+		isBuildFromAptSrc := isSourceBuild && buildFrom == "apt-get source"
+
+		var nameHint string
+		switch {
+		case isPkgName:
+			nameHint = "leave blank to derive from Package Name"
+		case isDirectURL, isBuildFromGit:
+			nameHint = "leave blank to derive from Source URL"
+		case isBuildFromAptSrc:
+			nameHint = "leave blank to derive from Package Name"
+		}
+
 		return restoreCursors([]formField{
 			typeField,
+			{Label: "Apt Mode", Value: aptMode, Select: true,
+				Options: []string{"Package Name", "Direct URL", "Source Build"},
+				Hint: "how to acquire the .deb package"},
+			{Label: "Build From", Value: buildFrom, Select: true,
+				Options:  []string{"Git repo", "apt-get source"},
+				Disabled: !isSourceBuild,
+				Hint:     "clone a git repo or rebuild official source package"},
 			{Label: "Name", Value: restore("Name", ""),
-				Hint: "leave blank to derive from URL"},
+				Hint: nameHint},
+			{Label: "Package Name", Value: restore("Package Name", ""),
+				Disabled: isDirectURL || isBuildFromGit,
+				Hint:     "upstream apt package name, e.g. nginx"},
 			{Label: "Version", Value: versionVal,
-				LabelSelect: true, LabelSelectValue: "exact (=)",
+				LabelSelect: true, LabelSelectValue: constraintVal,
 				LabelSelectOptions: []string{"exact (=)", "compatible (^)", "patch (~)", "latest (*)"}},
-			{Label: "URL", Value: restore("URL", ""),
-				Hint: "git repo URL for source build; leave empty for apt repo"},
-			{Label: "Source Name", Value: restore("Source Name", ""),
-				Hint: "upstream package name; defaults to Name"},
-			{Label: "Build Cmd", Value: restore("Build Cmd", "")},
-			{Label: "Deb Glob", Value: restore("Deb Glob", "")},
+			{Label: "Source URL", Value: restore("Source URL", ""),
+				Disabled: isPkgName || isBuildFromAptSrc,
+				Hint:     "URL to .deb file or git repo"},
+			{Label: "Build Cmd", Value: restore("Build Cmd", ""),
+				Disabled: !isBuildFromGit,
+				Hint:     "shell command to produce a .deb"},
+			{Label: "Deb Glob", Value: restore("Deb Glob", ""),
+				Disabled: !isSourceBuild,
+				Hint:     "glob pattern to find .deb after build"},
+			{Label: "Include Deps", Value: restore("Include Deps", "None"), Select: true,
+				Disabled: !isPkgName,
+				Options:  []string{"None", "Direct", "Transitive"},
+				Hint:     "auto-discover and add apt dependencies"},
 			{Label: "Checksum", Value: checksumVal,
-				Hint: checksumHint(checksumVal)},
+				Disabled: isPkgName,
+				Hint:     checksumHint(checksumVal)},
 			{Label: "Skip validation", Value: restore("Skip validation", "no"), Checkbox: true,
-				Hint: "skip URL reachability check"},
+				Hint: "skip reachability/existence checks"},
 		})
 	}
 }
@@ -1341,26 +1438,52 @@ func validateCreateFields(fields []formField) string {
 	}
 	name := fieldValueFromSlice(fields, "Name")
 	if name == "" {
-		// Allow blank if we can derive from URL.
-		url := fieldValueFromSlice(fields, "URL")
+		// Allow blank if we can derive from URL or Package Name.
+		url := fieldValueFromSlice(fields, "Source URL")
 		if url != "" {
 			name = extractNameFromURL(url, entryType)
+		}
+		if name == "" {
+			pkgName := fieldValueFromSlice(fields, "Package Name")
+			if pkgName != "" {
+				name = pkgName
+			}
 		}
 		if name == "" {
 			return "Name is required"
 		}
 	}
 	switch entryType {
+	case manifest.TypeApt:
+		aptMode := fieldValueFromSlice(fields, "Apt Mode")
+		switch aptMode {
+		case "Package Name":
+			if fieldValueFromSlice(fields, "Package Name") == "" {
+				return "Package Name is required"
+			}
+		case "Direct URL":
+			if fieldValueFromSlice(fields, "Source URL") == "" {
+				return "Source URL is required for direct URL mode"
+			}
+		case "Source Build":
+			buildFrom := fieldValueFromSlice(fields, "Build From")
+			if buildFrom == "Git repo" && fieldValueFromSlice(fields, "Source URL") == "" {
+				return "Source URL is required for git source build"
+			}
+			if buildFrom == "apt-get source" && fieldValueFromSlice(fields, "Package Name") == "" {
+				return "Package Name is required for apt-get source build"
+			}
+		}
 	case manifest.TypeGit:
-		if fieldValueFromSlice(fields, "URL") == "" {
-			return "URL is required for git entries"
+		if fieldValueFromSlice(fields, "Source URL") == "" {
+			return "Source URL is required for git entries"
 		}
 		if fieldValueFromSlice(fields, "Ref") == "" {
 			return "Ref is required for git entries"
 		}
 	case manifest.TypeBinary:
-		if fieldValueFromSlice(fields, "URL") == "" {
-			return "URL is required for binary entries"
+		if fieldValueFromSlice(fields, "Source URL") == "" {
+			return "Source URL is required for binary entries"
 		}
 	case manifest.TypeGomod:
 		if fieldValueFromSlice(fields, "Version") == "" {
@@ -1370,8 +1493,8 @@ func validateCreateFields(fields []formField) string {
 		if fieldValueFromSlice(fields, "Version") == "" {
 			return "Version is required for helm entries"
 		}
-		if fieldValueFromSlice(fields, "URL") == "" {
-			return "URL is required for helm entries"
+		if fieldValueFromSlice(fields, "Source URL") == "" {
+			return "Source URL is required for helm entries"
 		}
 	case manifest.TypeNpm:
 		if fieldValueFromSlice(fields, "Version") == "" {
@@ -1397,27 +1520,43 @@ func validateCreateFields(fields []formField) string {
 func validateRemote(entryType string, fields []formField) string {
 	switch entryType {
 	case manifest.TypeGit:
-		url := fieldValueFromSlice(fields, "URL")
+		url := fieldValueFromSlice(fields, "Source URL")
 		ref := fieldValueFromSlice(fields, "Ref")
 		return validateGitRef(url, ref)
 	case manifest.TypeBinary:
-		url := fieldValueFromSlice(fields, "URL")
+		url := fieldValueFromSlice(fields, "Source URL")
 		return validateURLReachable(url)
 	case manifest.TypeApt:
-		url := fieldValueFromSlice(fields, "URL")
-		if url != "" {
-			return validateURLReachable(url)
+		aptMode := fieldValueFromSlice(fields, "Apt Mode")
+		switch aptMode {
+		case "Direct URL":
+			return validateURLReachable(fieldValueFromSlice(fields, "Source URL"))
+		case "Source Build":
+			buildFrom := fieldValueFromSlice(fields, "Build From")
+			if buildFrom == "Git repo" {
+				return validateURLReachable(fieldValueFromSlice(fields, "Source URL"))
+			}
+			// apt-get source: validate source package exists.
+			pkgName := fieldValueFromSlice(fields, "Package Name")
+			if pkgName != "" {
+				return builder.ValidateAptSource(pkgName)
+			}
+		case "Package Name":
+			pkgName := fieldValueFromSlice(fields, "Package Name")
+			if pkgName != "" {
+				return builder.ValidateAptPackage(pkgName)
+			}
 		}
 	case manifest.TypeHelm:
-		url := fieldValueFromSlice(fields, "URL")
+		url := fieldValueFromSlice(fields, "Source URL")
 		return validateURLReachable(url)
 	case manifest.TypeGomod:
-		url := fieldValueFromSlice(fields, "URL")
+		url := fieldValueFromSlice(fields, "Source URL")
 		if url != "" {
 			return validateURLReachable(url)
 		}
 	case manifest.TypeNpm:
-		url := fieldValueFromSlice(fields, "URL")
+		url := fieldValueFromSlice(fields, "Source URL")
 		if url != "" {
 			return validateURLReachable(url)
 		}
@@ -1460,7 +1599,7 @@ func validateURLReachable(url string) string {
 	}
 	resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		return fmt.Sprintf("URL returned %d: %s", resp.StatusCode, url)
+		return fmt.Sprintf("Source URL returned %d: %s", resp.StatusCode, url)
 	}
 	return ""
 }
@@ -1509,7 +1648,12 @@ func saveCreateEntry(store *manifest.Store, fields []formField) error {
 	entryType := fieldValueFromSlice(fields, "Type")
 	name := fieldValueFromSlice(fields, "Name")
 	if name == "" {
-		name = extractNameFromURL(fieldValueFromSlice(fields, "URL"), entryType)
+		name = extractNameFromURL(fieldValueFromSlice(fields, "Source URL"), entryType)
+	}
+	if name == "" {
+		if pkgName := fieldValueFromSlice(fields, "Package Name"); pkgName != "" {
+			name = pkgName
+		}
 	}
 
 	var chksum *manifest.Checksum
@@ -1529,7 +1673,7 @@ func saveCreateEntry(store *manifest.Store, fields []formField) error {
 
 	ve := manifest.VersionEntry{
 		Version:           version,
-		URL:               fieldValueFromSlice(fields, "URL"),
+		URL:               fieldValueFromSlice(fields, "Source URL"),
 		Mode:              mode,
 		VersionConstraint: constraint,
 		Checksum:          chksum,
@@ -1537,13 +1681,34 @@ func saveCreateEntry(store *manifest.Store, fields []formField) error {
 
 	switch entryType {
 	case manifest.TypeApt:
-		ve.SourceName = fieldValueFromSlice(fields, "Source Name")
-		ve.BuildCmd = fieldValueFromSlice(fields, "Build Cmd")
-		ve.DebGlob = fieldValueFromSlice(fields, "Deb Glob")
+		aptMode := fieldValueFromSlice(fields, "Apt Mode")
+		switch aptMode {
+		case "Package Name":
+			ve.URL = ""
+			ve.SourceName = fieldValueFromSlice(fields, "Package Name")
+			ve.BuildCmd = ""
+			ve.DebGlob = ""
+		case "Direct URL":
+			ve.SourceName = ""
+			ve.BuildCmd = ""
+			ve.DebGlob = ""
+		case "Source Build":
+			buildFrom := fieldValueFromSlice(fields, "Build From")
+			if buildFrom == "Git repo" {
+				ve.SourceName = ""
+				ve.BuildCmd = fieldValueFromSlice(fields, "Build Cmd")
+			} else {
+				// apt-get source
+				ve.URL = ""
+				ve.SourceName = fieldValueFromSlice(fields, "Package Name")
+				ve.BuildCmd = "dpkg-buildpackage -us -uc"
+			}
+			ve.DebGlob = fieldValueFromSlice(fields, "Deb Glob")
+		}
 
 	case manifest.TypeGit:
 		ve.Ref = fieldValueFromSlice(fields, "Ref")
-		ve.URL = fieldValueFromSlice(fields, "URL")
+		ve.URL = fieldValueFromSlice(fields, "Source URL")
 		ve.Version = "" // git uses Ref not Version
 
 	case manifest.TypePypi:
@@ -1595,7 +1760,7 @@ func (m *appModel) makeJSONApplyFn() func(buf string) string {
 		if len(pm.Versions) > 0 {
 			ve := pm.Versions[0]
 			setFieldValue(p.formFields, "Version", ve.Version)
-			setFieldValue(p.formFields, "URL", ve.URL)
+			setFieldValue(p.formFields, "Source URL", ve.URL)
 			if ve.Ref != "" {
 				setFieldValue(p.formFields, "Ref", ve.Ref)
 			}

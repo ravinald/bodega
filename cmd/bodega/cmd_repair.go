@@ -21,8 +21,9 @@ func newRepairCmd(gf *globalFlags) *cobra.Command {
   1. Index consistency: packages in the index must have manifest files
   2. Dependency linking: git entries with fetched sources should have
      their dependencies discovered and linked
-  3. Manifest sync: all manifests are re-saved to the backend (S3)
-  4. Graph rebuild: dependency edges are rebuilt from RequiredBy fields
+  3. Artifact sizes: backfill ArtifactSize from local files
+  4. Manifest sync: all manifests are re-saved to the backend (S3)
+  5. Graph rebuild: dependency edges are rebuilt from RequiredBy fields
 
   bodega repair                          # detect and fix
   bodega repair check                    # detect only, no changes`,
@@ -108,9 +109,27 @@ func newRepairCmd(gf *globalFlags) *cobra.Command {
 				}
 			}
 
-			// Phase 3: Re-sync manifests to backend.
+			// Phase 3: Backfill artifact sizes.
+			fmt.Println("\nPhase 3: Backfilling artifact sizes...")
 			if !dryRun {
-				fmt.Println("\nPhase 3: Re-syncing manifests to backend...")
+				bcfgSizes := &builder.Config{
+					BuildRoot:   cfg.BuildRoot,
+					ManifestDir: cfg.ManifestDir,
+					BinaryRoot:  cfg.BinaryRoot,
+					GitRoot:     cfg.GitRoot,
+					GomodRoot:   cfg.GomodRoot,
+					HelmRoot:    cfg.HelmRoot,
+					NpmRoot:     cfg.NpmRoot,
+				}
+				n := builder.BackfillArtifactSizes(bcfgSizes, store, cmd.OutOrStdout())
+				fmt.Printf("  Backfilled %d package(s)\n", n)
+			} else {
+				fmt.Println("  (skipped in check mode)")
+			}
+
+			// Phase 4: Re-sync manifests to backend.
+			if !dryRun {
+				fmt.Println("\nPhase 4: Re-syncing manifests to backend...")
 				synced := 0
 				for _, typ := range manifest.AllTypes {
 					for _, name := range store.ListPackages(typ) {

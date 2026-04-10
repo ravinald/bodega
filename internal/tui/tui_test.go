@@ -668,7 +668,7 @@ func TestRebuildCreateFieldsGit(t *testing.T) {
 	for i, f := range fields {
 		labels[i] = f.Label
 	}
-	for _, required := range []string{"Type", "Name", "URL", "Ref"} {
+	for _, required := range []string{"Type", "Name", "Source URL", "Ref"} {
 		found := false
 		for _, l := range labels {
 			if l == required {
@@ -688,7 +688,7 @@ func TestRebuildCreateFieldsBinary(t *testing.T) {
 	for i, f := range fields {
 		labels[i] = f.Label
 	}
-	for _, required := range []string{"Type", "Name", "Version", "URL", "Checksum", "Latest"} {
+	for _, required := range []string{"Type", "Name", "Version", "Source URL", "Checksum", "Latest"} {
 		found := false
 		for _, l := range labels {
 			if l == required {
@@ -731,7 +731,7 @@ func TestValidateCreateFields(t *testing.T) {
 			fields: []formField{
 				{Label: "Type", Value: "git"},
 				{Label: "Name", Value: "repo"},
-				{Label: "URL", Value: ""},
+				{Label: "Source URL", Value: ""},
 				{Label: "Ref", Value: "main"},
 			},
 			wantErr: true,
@@ -741,7 +741,7 @@ func TestValidateCreateFields(t *testing.T) {
 			fields: []formField{
 				{Label: "Type", Value: "git"},
 				{Label: "Name", Value: "repo"},
-				{Label: "URL", Value: "https://example.com/repo.git"},
+				{Label: "Source URL", Value: "https://example.com/repo.git"},
 				{Label: "Ref", Value: ""},
 			},
 			wantErr: true,
@@ -751,7 +751,7 @@ func TestValidateCreateFields(t *testing.T) {
 			fields: []formField{
 				{Label: "Type", Value: "binary"},
 				{Label: "Name", Value: "tool"},
-				{Label: "URL", Value: "https://example.com/tool"},
+				{Label: "Source URL", Value: "https://example.com/tool"},
 				{Label: "Checksum", Value: "notahex!!!"},
 			},
 			wantErr: true,
@@ -761,7 +761,7 @@ func TestValidateCreateFields(t *testing.T) {
 			fields: []formField{
 				{Label: "Type", Value: "binary"},
 				{Label: "Name", Value: "tool"},
-				{Label: "URL", Value: "https://example.com/tool"},
+				{Label: "Source URL", Value: "https://example.com/tool"},
 				{Label: "Checksum", Value: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
 				{Label: "Skip validation", Value: "yes", Checkbox: true},
 			},

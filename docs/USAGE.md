@@ -98,7 +98,7 @@ bodega create apt   # interactive prompts
 | `--filename` | Filename override (binary only) |
 | `--build-cmd` | Shell command to build .deb (apt only) |
 | `--deb-glob` | Glob to locate produced .deb (apt only) |
-| `--source-name` | Source package name (apt only) |
+| `--source-name` | Upstream apt package name (apt only) |
 
 ### `bodega delete <type> <name> [--remove-from-s3]`
 
@@ -594,7 +594,7 @@ client IP, user agent, HTTP status, and request duration.
 ┌─ Sources ──────────┬─ Details ──────────────────┐
 │ apt/               │ Name:    netbox            │
 │ git/               │ Ref:     v4.5.5            │
-│   netbox@v4.5.5    │ URL:     https://github... │
+│   netbox@v4.5.5    │ Source URL: https://git... │
 │ pypi/              │ Frozen:  no                │
 │ binary/            │ S3:      ✓ uploaded        │
 │ gomod/             │                            │

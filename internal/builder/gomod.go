@@ -147,6 +147,9 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 					_, _ = fmt.Fprintf(out, "  [gomod] %s: WARNING: could not update list: %v\n", name, err)
 				}
 				cfg.StampGomodEntry(store, name, ve)
+				// Stamp artifact size from the .zip file.
+				zipPath := filepath.Join(dir, ve.Version+".zip")
+				stampArtifactSize(context.Background(), store, manifest.TypeGomod, name, ve, zipPath)
 			}
 
 			result.Err = fetchErr

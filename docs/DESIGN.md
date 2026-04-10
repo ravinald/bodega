@@ -189,8 +189,8 @@ The TUI config editor (`C` key in `bodega shell`) writes to the same file.
 ```
 +-- Sources --------+-- Details ---------------------------+
 | tree of all       | metadata for selected entry          |
-| entries by type   | checksum, S3 status, client URL      |
-| with S3 status    | raw JSON                             |
+| entries by type   | checksum, S3 status, package URL     |
+| with S3 status    | package JSON config                  |
 +-------------------+--------------------------------------+
 | Log output                                               |
 +----------------------------------------------------------+

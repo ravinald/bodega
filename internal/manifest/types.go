@@ -160,7 +160,8 @@ type VersionEntry struct {
 	// --- lifecycle flags ---
 
 	// Hidden excludes this version from being served to clients.
-	Hidden bool `json:"hidden,omitempty"`
+	Hidden       bool  `json:"hidden,omitempty"`
+	ArtifactSize int64 `json:"artifact_size,omitempty"` // bytes, set at fetch time
 
 	// Frozen prevents this version from being built, edited, or deleted.
 	Frozen bool `json:"frozen,omitempty"`

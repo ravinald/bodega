@@ -105,6 +105,34 @@ func (c *Config) StampNpmEntry(store *manifest.Store, name string, ve manifest.V
 	stampVersion(context.Background(), store, manifest.TypeNpm, name, ve, c.GetBuildEnv(), "any")
 }
 
+// stampArtifactSize records the file size on the version entry and saves.
+func stampArtifactSize(ctx context.Context, store *manifest.Store, typ, name string, targetVE manifest.VersionEntry, artifactPath string) {
+	fi, err := os.Stat(artifactPath)
+	if err != nil {
+		return
+	}
+	pm, err := store.GetPackage(ctx, typ, name)
+	if err != nil || pm == nil {
+		return
+	}
+	targetKey := targetVE.Version
+	if targetKey == "" {
+		targetKey = targetVE.Ref
+	}
+	for i := range pm.Versions {
+		ve := &pm.Versions[i]
+		veKey := ve.Version
+		if veKey == "" {
+			veKey = ve.Ref
+		}
+		if veKey == targetKey {
+			ve.ArtifactSize = fi.Size()
+			break
+		}
+	}
+	_ = store.SavePackage(ctx, pm)
+}
+
 // cmdVersion runs a command and returns its first line of output, trimmed.
 // Returns empty string if the command is not found or fails.
 func cmdVersion(name string, args ...string) string {

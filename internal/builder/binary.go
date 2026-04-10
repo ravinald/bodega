@@ -163,6 +163,7 @@ func FetchBinaries(cfg *Config, store *manifest.Store, entryFilter string) *Summ
 					_, _ = fmt.Fprintf(out, "    Size: %s\n", humanBytes(fi.Size()))
 				}
 				cfg.StampBinaryEntry(store, name, ve)
+				stampArtifactSize(context.Background(), store, manifest.TypeBinary, name, ve, destPath)
 			} else {
 				_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
 				summary.Failures++

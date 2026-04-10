@@ -139,6 +139,13 @@ use 'upload' instead.`,
 			}
 
 			fmt.Printf("\nSync complete. Total files uploaded: %d\n", totalUploaded)
+
+			// Update metrics after sync.
+			if err := store.SaveIndex(ctx); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not update metrics: %v\n", err)
+			}
+			notifyServer(gf)
+
 			return nil
 		},
 	}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -123,6 +124,14 @@ through all stages and push to S3.`,
 			}
 
 			fmt.Fprintf(buildOut, "\nTotal entries: %d  Failures: %d\n", total, failures)
+
+			// Update metrics after build.
+			ctx := context.Background()
+			if err := store.SaveIndex(ctx); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not update metrics: %v\n", err)
+			}
+			notifyServer(gf)
+
 			if failures > 0 {
 				return fmt.Errorf("%d build(s) failed", failures)
 			}

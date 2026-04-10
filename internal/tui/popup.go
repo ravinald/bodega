@@ -436,7 +436,7 @@ func (p *popupModel) OpenJSONOverlay(width, height int, initialValue string, tit
 
 // renderJSONOverlay renders the raw JSON input overlay using the textarea component.
 func (p *popupModel) renderJSONOverlay(screenWidth, screenHeight int) string {
-	titleText := "Raw JSON"
+	titleText := "Package JSON Config"
 	if p.jsonTitle != "" {
 		titleText = p.jsonTitle
 	}

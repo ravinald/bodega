@@ -36,14 +36,14 @@ func CheckAptStage(cfg *Config, name string, ve manifest.VersionEntry) StageStat
 		sourceName = name
 	}
 
-	if ve.URL != "" {
-		// Source-build entry: fetch = clone dir exists.
+	switch {
+	case ve.URL != "" && ve.BuildCmd != "":
+		// Source build from git: fetch = clone dir exists.
 		cloneDir := aptSourceDir(d, name, ve)
 		if fi, err := os.Stat(cloneDir); err == nil && fi.IsDir() {
 			s.Fetched = true
 		}
 		if s.Fetched {
-			// Build = .deb file present inside the clone dir.
 			glob := ve.DebGlob
 			if glob == "" {
 				glob = "*.deb"
@@ -51,11 +51,37 @@ func CheckAptStage(cfg *Config, name string, ve manifest.VersionEntry) StageStat
 			matches, _ := filepath.Glob(filepath.Join(cloneDir, glob))
 			s.Built = len(matches) > 0
 		}
-	} else {
-		// apt-get download entry: fetch = .deb file present in sources dir.
+
+	case ve.URL != "":
+		// Direct URL download: fetch = .deb file present.
+		destDir := filepath.Join(d.sources, sourceName)
+		filename := filepath.Base(ve.URL)
+		dest := filepath.Join(destDir, filename)
+		if fileExists(dest) {
+			s.Fetched = true
+			s.Built = true // no build step
+		}
+
+	case ve.BuildCmd != "":
+		// apt-get source build: fetch = source dir exists.
+		sourceDir := aptSourceDir(d, name, ve)
+		if fi, err := os.Stat(sourceDir); err == nil && fi.IsDir() {
+			s.Fetched = true
+		}
+		if s.Fetched {
+			glob := ve.DebGlob
+			if glob == "" {
+				glob = "../*.deb"
+			}
+			matches, _ := filepath.Glob(filepath.Join(sourceDir, glob))
+			s.Built = len(matches) > 0
+		}
+
+	default:
+		// apt-get download: fetch = .deb file present in sources dir.
 		matches, _ := filepath.Glob(filepath.Join(d.sources, sourceName+"*.deb"))
 		s.Fetched = len(matches) > 0
-		s.Built = s.Fetched // no separate build step for apt-get entries
+		s.Built = s.Fetched // no separate build step
 	}
 
 	// Packaged = at least one .deb in the reprepro pool for this package.
@@ -115,7 +141,14 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 			var artifactPath string
 			var fetchErr error
 
-			if ve.URL != "" {
+			sourceName := ve.SourceName
+			if sourceName == "" {
+				sourceName = name
+			}
+
+			switch {
+			case ve.URL != "" && ve.BuildCmd != "":
+				// Source build from git: clone and build later.
 				cloneDir := aptSourceDir(d, name, ve)
 				if err := os.RemoveAll(cloneDir); err != nil {
 					fetchErr = fmt.Errorf("remove old source %s: %w", cloneDir, err)
@@ -128,11 +161,55 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 						_, _ = fmt.Fprintf(out, "    Source: %s\n", cloneDir)
 					}
 				}
-			} else {
-				sourceName := ve.SourceName
-				if sourceName == "" {
-					sourceName = name
+
+			case ve.URL != "":
+				// Direct URL: download a .deb file.
+				destDir := filepath.Join(srcDir, sourceName)
+				if err := mkdirAll(destDir); err != nil {
+					fetchErr = fmt.Errorf("create dir %s: %w", destDir, err)
+				} else {
+					filename := filepath.Base(ve.URL)
+					dest := filepath.Join(destDir, filename)
+					_, _ = fmt.Fprintf(out, "    Downloading %s...\n", ve.URL)
+					if err := downloadURL(dest, ve.URL); err != nil {
+						fetchErr = fmt.Errorf("download %s: %w", ve.URL, err)
+					} else {
+						artifactPath = dest
+						_, _ = fmt.Fprintf(out, "    Downloaded: %s\n", filename)
+					}
 				}
+
+			case ve.BuildCmd != "":
+				// apt-get source: fetch official source package for local compilation.
+				sourceDir := aptSourceDir(d, name, ve)
+				parentDir := filepath.Dir(sourceDir)
+				if err := mkdirAll(parentDir); err != nil {
+					fetchErr = fmt.Errorf("create dir %s: %w", parentDir, err)
+				} else {
+					_, _ = fmt.Fprintf(out, "    Fetching source for %s via apt-get source...\n", sourceName)
+					if err := runCmd(out, parentDir, "apt-get", "source", "--download-only", sourceName); err != nil {
+						fetchErr = fmt.Errorf("apt-get source %s: %w", sourceName, err)
+					} else {
+						// Extract the source.
+						if err := runCmd(out, parentDir, "dpkg-source", "-x", sourceName+"*.dsc", sourceDir); err != nil {
+							// Try glob match for the .dsc file.
+							dscMatches, _ := filepath.Glob(filepath.Join(parentDir, sourceName+"*.dsc"))
+							if len(dscMatches) > 0 {
+								err = runCmd(out, parentDir, "dpkg-source", "-x", dscMatches[0], sourceDir)
+							}
+							if err != nil {
+								fetchErr = fmt.Errorf("extract source: %w", err)
+							}
+						}
+						if fetchErr == nil {
+							artifactPath = sourceDir
+							_, _ = fmt.Fprintf(out, "    Source: %s\n", sourceDir)
+						}
+					}
+				}
+
+			default:
+				// Package name download: apt-get download.
 				_, _ = fmt.Fprintf(out, "    Downloading %s via apt-get download...\n", sourceName)
 				if err := runCmd(out, srcDir, "apt-get", "download", sourceName); err != nil {
 					fetchErr = fmt.Errorf("apt-get download %s: %w", sourceName, err)
@@ -173,9 +250,9 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 	return summary
 }
 
-// BuildApt runs the build_cmd for each apt package version that was fetched
-// from a git source. Versions without a URL (downloaded via apt-get) have no
-// build step and are skipped silently.
+// BuildApt runs the build_cmd for each apt package version that has one.
+// This covers both git source builds (URL set + BuildCmd) and apt-get source
+// builds (URL empty + BuildCmd set). Entries without a BuildCmd are skipped.
 func BuildApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 	ctx := context.Background()
 	summary := &Summary{}
@@ -198,8 +275,8 @@ func BuildApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 				continue
 			}
 
-			// Only source-build entries have a build step.
-			if ve.URL == "" {
+			// Only entries with a build command have a build step.
+			if ve.BuildCmd == "" {
 				continue
 			}
 
@@ -379,16 +456,17 @@ func RunApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 }
 
 // locateDebFile returns the path of the .deb for a package version.
-// For source-build versions (ve.URL set) it looks inside the versioned clone
-// directory using deb_glob. For apt-get download versions it looks in the
-// sources root directory for <sourceName>*.deb.
+// Handles all four fetch modes: git source build, direct URL, apt-get source
+// build, and apt-get download.
 func locateDebFile(d dirs, name string, ve manifest.VersionEntry) (string, error) {
 	sourceName := ve.SourceName
 	if sourceName == "" {
 		sourceName = name
 	}
 
-	if ve.URL != "" {
+	switch {
+	case ve.URL != "" && ve.BuildCmd != "":
+		// Git source build: .deb inside clone dir.
 		cloneDir := aptSourceDir(d, name, ve)
 		if _, err := os.Stat(cloneDir); os.IsNotExist(err) {
 			return "", fmt.Errorf("source directory not found at %s — run 'fetch apt' and 'build apt' first", cloneDir)
@@ -402,14 +480,38 @@ func locateDebFile(d dirs, name string, ve manifest.VersionEntry) (string, error
 			return "", fmt.Errorf("no .deb found matching %s in %s — run 'build apt' first", glob, cloneDir)
 		}
 		return matches[0], nil
-	}
 
-	// apt-get download path: .deb lands directly in sources root.
-	matches, err := filepath.Glob(filepath.Join(d.sources, sourceName+"*.deb"))
-	if err != nil || len(matches) == 0 {
-		return "", fmt.Errorf("no .deb found for %s in %s — run 'fetch apt' first", sourceName, d.sources)
+	case ve.URL != "":
+		// Direct URL download: .deb at sources/<sourceName>/<filename>.
+		destDir := filepath.Join(d.sources, sourceName)
+		filename := filepath.Base(ve.URL)
+		dest := filepath.Join(destDir, filename)
+		if fileExists(dest) {
+			return dest, nil
+		}
+		return "", fmt.Errorf("no .deb found at %s — run 'fetch apt' first", dest)
+
+	case ve.BuildCmd != "":
+		// apt-get source build: .deb produced by dpkg-buildpackage.
+		sourceDir := aptSourceDir(d, name, ve)
+		glob := ve.DebGlob
+		if glob == "" {
+			glob = "../*.deb"
+		}
+		matches, err := filepath.Glob(filepath.Join(sourceDir, glob))
+		if err != nil || len(matches) == 0 {
+			return "", fmt.Errorf("no .deb found matching %s for %s — run 'build apt' first", glob, sourceName)
+		}
+		return matches[0], nil
+
+	default:
+		// apt-get download: .deb in sources root.
+		matches, err := filepath.Glob(filepath.Join(d.sources, sourceName+"*.deb"))
+		if err != nil || len(matches) == 0 {
+			return "", fmt.Errorf("no .deb found for %s in %s — run 'fetch apt' first", sourceName, d.sources)
+		}
+		return matches[0], nil
 	}
-	return matches[0], nil
 }
 
 // setupAptRepo creates the reprepro configuration directory and a GPG signing

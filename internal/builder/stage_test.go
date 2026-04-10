@@ -230,7 +230,7 @@ func TestAptSourceDir_SourceNameOverride(t *testing.T) {
 func TestCheckAptStage_Empty(t *testing.T) {
 	root := t.TempDir()
 	cfg := &Config{BuildRoot: root}
-	ve := manifest.VersionEntry{URL: "https://github.com/aws/efs-utils"}
+	ve := manifest.VersionEntry{URL: "https://github.com/aws/efs-utils", BuildCmd: "make deb"}
 	s := CheckAptStage(cfg, "efs-utils", ve)
 	if s.Fetched || s.Built || s.Packaged {
 		t.Errorf("expected all false when nothing on disk, got %+v", s)
@@ -240,7 +240,7 @@ func TestCheckAptStage_Empty(t *testing.T) {
 func TestCheckAptStage_SourceBuildFetched(t *testing.T) {
 	root := t.TempDir()
 	cfg := &Config{BuildRoot: root}
-	ve := manifest.VersionEntry{URL: "https://github.com/aws/efs-utils"}
+	ve := manifest.VersionEntry{URL: "https://github.com/aws/efs-utils", BuildCmd: "make deb"}
 	d := buildDirs(root)
 
 	mkDir(t, aptSourceDir(d, "efs-utils", ve))
@@ -256,7 +256,7 @@ func TestCheckAptStage_SourceBuildFetched(t *testing.T) {
 func TestCheckAptStage_SourceBuildBuilt(t *testing.T) {
 	root := t.TempDir()
 	cfg := &Config{BuildRoot: root}
-	ve := manifest.VersionEntry{URL: "https://github.com/aws/efs-utils"}
+	ve := manifest.VersionEntry{URL: "https://github.com/aws/efs-utils", BuildCmd: "make deb"}
 	d := buildDirs(root)
 
 	cloneDir := aptSourceDir(d, "efs-utils", ve)

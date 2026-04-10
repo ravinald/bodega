@@ -19,20 +19,22 @@ type Metrics struct {
 
 // GlobalMetrics holds aggregate stats across all types.
 type GlobalMetrics struct {
-	Packages   int `json:"packages"`
-	Versions   int `json:"versions"`
-	Frozen     int `json:"frozen"`
-	Hidden     int `json:"hidden"`
-	DepEdges   int `json:"dep_edges"`
-	Orphans    int `json:"orphans"`
+	Packages   int   `json:"packages"`
+	Versions   int   `json:"versions"`
+	Frozen     int   `json:"frozen"`
+	Hidden     int   `json:"hidden"`
+	DepEdges   int   `json:"dep_edges"`
+	Orphans    int   `json:"orphans"`
+	StorageB   int64 `json:"storage_bytes,omitempty"`
 }
 
 // TypeMetrics holds stats for a single package type.
 type TypeMetrics struct {
-	Packages int `json:"packages"`
-	Versions int `json:"versions"`
-	Frozen   int `json:"frozen"`
-	Hidden   int `json:"hidden"`
+	Packages   int   `json:"packages"`
+	Versions   int   `json:"versions"`
+	Frozen     int   `json:"frozen"`
+	Hidden     int   `json:"hidden"`
+	StorageB   int64 `json:"storage_bytes,omitempty"`
 }
 
 // ComputeMetrics builds fresh metrics from the current store state.
@@ -58,6 +60,7 @@ func (s *Store) ComputeMetrics(ctx context.Context) *Metrics {
 				if ve.Hidden {
 					tm.Hidden++
 				}
+				tm.StorageB += ve.ArtifactSize
 			}
 		}
 		m.ByType[typ] = tm
@@ -65,6 +68,7 @@ func (s *Store) ComputeMetrics(ctx context.Context) *Metrics {
 		m.Global.Versions += tm.Versions
 		m.Global.Frozen += tm.Frozen
 		m.Global.Hidden += tm.Hidden
+		m.Global.StorageB += tm.StorageB
 	}
 
 	m.Global.DepEdges = len(s.AllEdges())

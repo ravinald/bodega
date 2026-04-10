@@ -118,6 +118,7 @@ func FetchHelm(cfg *Config, store *manifest.Store, entryFilter string) *Summary 
 				if result.Err == nil {
 					_, _ = fmt.Fprintf(out, "  [helm] %s: ok\n", name)
 					cfg.StampHelmEntry(store, name, ve)
+					stampArtifactSize(context.Background(), store, manifest.TypeHelm, name, ve, dest)
 				}
 			}
 

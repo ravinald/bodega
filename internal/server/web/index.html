@@ -506,7 +506,7 @@ function showDetail(type, entry) {
   const fields = [];
   if (type === 'git') {
     fields.push(['Ref', entry.ref]);
-    fields.push(['URL', entry.url, 'url']);
+    fields.push(['Source URL', entry.url, 'url']);
     if (entry.source) fields.push(['Source', entry.source]);
   } else if (type === 'pypi') {
     if (entry.version) fields.push(['Version', entry.version]);
@@ -515,7 +515,7 @@ function showDetail(type, entry) {
     if (entry.mode) fields.push(['Mode', entry.mode]);
   } else {
     if (entry.version) fields.push(['Version', entry.version]);
-    if (entry.url) fields.push(['URL', entry.url, 'url']);
+    if (entry.url) fields.push(['Source URL', entry.url, 'url']);
     if (entry.mode) fields.push(['Mode', entry.mode]);
   }
 
@@ -527,21 +527,31 @@ function showDetail(type, entry) {
   if (entry.version_constraint)
     fields.push(['Constraint', entry.version_constraint]);
   fields.push(['Frozen', entry.frozen ? 'yes' : 'no', entry.frozen ? 'yes' : 'no']);
-  if (clientUrl) fields.push(['Client', clientUrl, 'url']);
+  if (clientUrl) fields.push(['Package URL', clientUrl, 'url']);
 
   for (const [k, v, cls] of fields) {
     var valHtml = escapeHtml(v || '');
     if (cls === 'url' && v && v.startsWith('http')) {
       valHtml = '<a href="' + escapeHtml(v) + '" target="_blank" style="color:var(--cyan)">' + escapeHtml(v) + '</a>';
     }
+    var copyIcon = '';
+    if (cls === 'url' && v) {
+      copyIcon = ' <span class="copy-link" title="Copy ' + escapeHtml(k) + '" data-url="' + escapeHtml(v).replace(/"/g,'&quot;') + '">\u{1F517}</span>';
+    }
     html += '<div class="field"><span class="key">' + k + ':</span>' +
-      '<span class="val' + (cls ? ' ' + cls : '') + '">' + valHtml + '</span></div>';
+      '<span class="val' + (cls ? ' ' + cls : '') + '">' + valHtml + '</span>' + copyIcon + '</div>';
   }
 
-  html += '<div class="json-section"><h3>Raw JSON</h3><pre>' +
-    escapeHtml(JSON.stringify(entry, null, 2)) + '</pre></div>';
+  var jsonStr = JSON.stringify(entry, null, 2);
+  html += '<div class="json-section"><h3>Package JSON Config ' +
+    '<span class="copy-link copy-json" title="Copy JSON">\u{1F517}</span>' +
+    '</h3><pre>' + escapeHtml(jsonStr) + '</pre></div>';
 
   d.innerHTML = html;
+
+  // Attach the JSON string to the copy-json element via JS (avoids attribute escaping issues).
+  var jsonCopyEl = d.querySelector('.copy-json');
+  if (jsonCopyEl) jsonCopyEl._jsonData = jsonStr;
 }
 
 function escapeHtml(s) {
@@ -589,19 +599,20 @@ async function showDashboard() {
     if (!m) { d.innerHTML = '<div class="detail-empty">Could not load metrics.</div>'; return; }
 
     var g = m.global;
-    var total = g.s3_uploaded + g.s3_missing;
-    var pct = total > 0 ? Math.round(g.s3_uploaded * 100 / total) : 0;
 
     var html = '<div class="detail-title">Dashboard</div>';
     html += '<div class="dash-cards">';
     html += dashCard(g.packages, 'Packages');
     html += dashCard(g.versions, 'Versions');
-    html += dashCard(g.s3_uploaded + '/' + total, 'S3 (' + pct + '%)');
+    if (g.storage_bytes > 0) html += dashCard(humanBytes(g.storage_bytes), 'Storage');
     html += dashCard(g.frozen, 'Frozen');
     html += dashCard(g.hidden, 'Hidden');
     html += dashCard(g.dep_edges, 'Dependencies');
     html += dashCard(g.orphans, 'Orphans');
     html += '</div>';
+    if (m.updated_at) {
+      html += '<div style="color:var(--fg-dim);font-size:11px;margin-bottom:12px">Updated: ' + m.updated_at + '</div>';
+    }
 
     // Per-type bar chart.
     html += '<div class="dash-section"><h3>Packages by Type</h3>';
@@ -640,27 +651,35 @@ async function showTypeMetrics(type) {
 
   var { order } = groupByName(type, entries);
 
+  // Try to get storage from cached metrics.
+  var storageLabel = '';
+  try {
+    var mResp = await fetch('/api/v1/metrics');
+    if (mResp.ok) {
+      var metrics = await mResp.json();
+      var tm = metrics.by_type[type];
+      if (tm && tm.storage_bytes > 0) {
+        storageLabel = humanBytes(tm.storage_bytes);
+      }
+    }
+  } catch(e) {}
+
   html += '<div class="dash-cards">';
   html += dashCard(order.length, 'Packages');
   html += dashCard(versions, 'Versions');
+  if (storageLabel) html += dashCard(storageLabel, 'Storage');
   html += dashCard(frozen, 'Frozen');
   html += dashCard(hidden, 'Hidden');
   html += '</div>';
 
-  // Package list.
-  html += '<div class="dash-section"><h3>Packages</h3>';
-  for (var name of order) {
-    var pkgEntries = entries.filter(function(e) { return e.name === name; });
-    var latest = pkgEntries.length > 0 ? entryVersion(type, pkgEntries[pkgEntries.length - 1]) : '';
-    html += '<div class="dash-bar-row">';
-    html += '<span class="dash-bar-label" style="width:auto;min-width:120px">' + name + '</span>';
-    html += '<span class="dash-bar-count">' + pkgEntries.length + ' ver</span>';
-    if (latest) html += '<span class="dash-bar-count" style="color:var(--fg)">' + latest + '</span>';
-    html += '</div>';
-  }
-  html += '</div>';
-
   d.innerHTML = html;
+}
+
+function humanBytes(b) {
+  if (b >= 1073741824) return (b / 1073741824).toFixed(1) + ' GiB';
+  if (b >= 1048576) return (b / 1048576).toFixed(1) + ' MiB';
+  if (b >= 1024) return (b / 1024).toFixed(1) + ' KiB';
+  return b + ' B';
 }
 
 function dashCard(value, label) {
@@ -688,13 +707,32 @@ function collapseAll() {
 document.addEventListener('click', function(e) {
   var el = e.target.closest('.copy-link');
   if (!el) return;
-  var url = el.getAttribute('data-url');
-  if (!url) return;
-  navigator.clipboard.writeText(url).then(function() {
+  e.preventDefault();
+  e.stopPropagation();
+  var text = el._jsonData || el.getAttribute('data-url');
+  if (!text) return;
+  function onCopied() {
     el.classList.add('copied');
+    var origTitle = el.title;
     el.title = 'Copied!';
-    setTimeout(function() { el.classList.remove('copied'); el.title = 'Copy client URL'; }, 1500);
-  });
+    setTimeout(function() { el.classList.remove('copied'); el.title = origTitle; }, 1500);
+  }
+  function fallbackCopy() {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    onCopied();
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(onCopied).catch(fallbackCopy);
+  } else {
+    fallbackCopy();
+  }
 });
 
 function setTheme(theme) {

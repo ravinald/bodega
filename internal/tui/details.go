@@ -107,7 +107,7 @@ func (m detailsModel) s3AndClientFields(n *TreeNode) string {
 		sb.WriteByte('\n')
 	}
 	if url := clientURL(m.store, n.EntryType, n.Name); url != "" {
-		sb.WriteString(field("Client", url))
+		sb.WriteString(field("Package URL", url))
 		sb.WriteByte('\n')
 	}
 	return sb.String()
@@ -409,28 +409,6 @@ func (m detailsModel) renderGroupDetails() string {
 		sb.WriteByte('\n')
 	}
 
-	// List packages with version counts.
-	if len(names) > 0 {
-		sb.WriteByte('\n')
-		sb.WriteString(dimStyle.Render("── Packages ──"))
-		sb.WriteByte('\n')
-		for _, name := range names {
-			pm, err := m.store.GetPackage(ctx, n.EntryType, name)
-			if err != nil || pm == nil {
-				continue
-			}
-			desc := ""
-			if pm.Description != "" {
-				desc = " - " + pm.Description
-				if len(desc) > 50 {
-					desc = desc[:47] + "..."
-				}
-			}
-			sb.WriteString(fmt.Sprintf("  %s (%d ver)%s", pm.Name, len(pm.Versions), desc))
-			sb.WriteByte('\n')
-		}
-	}
-
 	return sb.String()
 }
 
@@ -473,11 +451,11 @@ func (m detailsModel) renderEntryDetails() string {
 			sb.WriteByte('\n')
 		}
 		if ve.SourceName != "" {
-			sb.WriteString(field("SourceName", ve.SourceName))
+			sb.WriteString(field("Package Name", ve.SourceName))
 			sb.WriteByte('\n')
 		}
 		if ve.URL != "" {
-			sb.WriteString(field("URL", wrap(ve.URL, m.width-16)))
+			sb.WriteString(field("Source URL", wrap(ve.URL, m.width-16)))
 			sb.WriteByte('\n')
 		}
 		if ve.BuildCmd != "" {
@@ -498,7 +476,7 @@ func (m detailsModel) renderEntryDetails() string {
 		sb.WriteByte('\n')
 		sb.WriteString(field("Ref", ve.Ref))
 		sb.WriteByte('\n')
-		sb.WriteString(field("URL", wrap(ve.URL, m.width-16)))
+		sb.WriteString(field("Source URL", wrap(ve.URL, m.width-16)))
 		sb.WriteByte('\n')
 		sb.WriteString(checksumFields(ve.Checksum, ve.ChecksumVerified))
 		sb.WriteString(boolField("Frozen", ve.Frozen))
@@ -570,7 +548,7 @@ func (m detailsModel) renderEntryDetails() string {
 			sb.WriteString(field("Version", ve.Version))
 			sb.WriteByte('\n')
 		}
-		sb.WriteString(field("URL", wrap(ve.URL, m.width-16)))
+		sb.WriteString(field("Source URL", wrap(ve.URL, m.width-16)))
 		sb.WriteByte('\n')
 		if ve.Filename != "" {
 			sb.WriteString(field("Filename", ve.Filename))
@@ -592,7 +570,7 @@ func (m detailsModel) renderEntryDetails() string {
 		sb.WriteString(field("Version", ve.Version))
 		sb.WriteByte('\n')
 		if ve.URL != "" {
-			sb.WriteString(field("Upstream", ve.URL))
+			sb.WriteString(field("Source URL", ve.URL))
 			sb.WriteByte('\n')
 		}
 		sb.WriteString(checksumFields(ve.Checksum, ve.ChecksumVerified))
@@ -606,7 +584,7 @@ func (m detailsModel) renderEntryDetails() string {
 		sb.WriteByte('\n')
 		sb.WriteString(field("Version", ve.Version))
 		sb.WriteByte('\n')
-		sb.WriteString(field("URL", wrap(ve.URL, m.width-16)))
+		sb.WriteString(field("Source URL", wrap(ve.URL, m.width-16)))
 		sb.WriteByte('\n')
 		if ve.AppVersion != "" {
 			sb.WriteString(field("App Version", ve.AppVersion))
@@ -624,7 +602,7 @@ func (m detailsModel) renderEntryDetails() string {
 		sb.WriteString(field("Version", ve.Version))
 		sb.WriteByte('\n')
 		if ve.URL != "" {
-			sb.WriteString(field("Registry", ve.URL))
+			sb.WriteString(field("Source URL", ve.URL))
 			sb.WriteByte('\n')
 		}
 		sb.WriteString(checksumFields(ve.Checksum, ve.ChecksumVerified))
@@ -636,7 +614,7 @@ func (m detailsModel) renderEntryDetails() string {
 
 	// Append raw JSON below the parsed fields.
 	sb.WriteString("\n\n")
-	sb.WriteString(dimStyle.Render("── Raw JSON ──"))
+	sb.WriteString(dimStyle.Render("── Package JSON Config ──"))
 	sb.WriteByte('\n')
 	if raw := m.rawJSON(n); raw != "" {
 		sb.WriteString(dimStyle.Render(raw))

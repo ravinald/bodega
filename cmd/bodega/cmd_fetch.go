@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -100,6 +101,14 @@ The --entry flag restricts the operation to a single named entry.`,
 			}
 
 			fmt.Printf("\nTotal entries: %d  Failures: %d\n", total, failures)
+
+			// Update metrics after fetch.
+			ctx := context.Background()
+			if err := store.SaveIndex(ctx); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not update metrics: %v\n", err)
+			}
+			notifyServer(gf)
+
 			if failures > 0 {
 				return fmt.Errorf("%d fetch(es) failed", failures)
 			}
