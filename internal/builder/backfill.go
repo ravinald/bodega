@@ -6,8 +6,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 
-	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // BackfillArtifactSizes scans all package versions and sets ArtifactSize from
@@ -32,19 +33,27 @@ func BackfillArtifactSizes(cfg *Config, store *manifest.Store, out io.Writer) in
 					continue // already set
 				}
 
+				// Try local artifact file first.
 				path := artifactPathForVersion(cfg, typ, name, *ve)
-				if path == "" {
-					continue
+				if path != "" {
+					if fi, err := os.Stat(path); err == nil && !fi.IsDir() {
+						ve.ArtifactSize = fi.Size()
+						dirty = true
+						_, _ = fmt.Fprintf(out, "  [%s] %s: backfilled %s\n", typ, name, humanBytes(fi.Size()))
+						continue
+					}
 				}
 
-				fi, err := os.Stat(path)
-				if err != nil || fi.IsDir() {
-					continue
+				// For apt entries, try the Size field from metadata.
+				if typ == manifest.TypeApt && ve.Metadata != nil {
+					if sizeStr, ok := ve.Metadata["Size"]; ok {
+						if n, err := strconv.ParseInt(sizeStr, 10, 64); err == nil && n > 0 {
+							ve.ArtifactSize = n
+							dirty = true
+							_, _ = fmt.Fprintf(out, "  [%s] %s: backfilled %s from metadata\n", typ, name, humanBytes(n))
+						}
+					}
 				}
-
-				ve.ArtifactSize = fi.Size()
-				dirty = true
-				_, _ = fmt.Fprintf(out, "  [%s] %s: backfilled %s\n", typ, name, humanBytes(fi.Size()))
 			}
 
 			if dirty {

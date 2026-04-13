@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // DetectBuildEnv captures the current build server's environment.

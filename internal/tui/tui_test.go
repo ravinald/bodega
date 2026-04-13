@@ -5,9 +5,9 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/scaleapi/bodega/internal/config"
-	"github.com/scaleapi/bodega/internal/manifest"
-	"github.com/scaleapi/bodega/internal/s3"
+	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/s3"
 )
 
 // --- splitArgs ---

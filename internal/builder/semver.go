@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // SemVer represents a parsed semantic version.

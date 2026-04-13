@@ -10,9 +10,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/scaleapi/bodega/internal/logging"
-	bos3 "github.com/scaleapi/bodega/internal/s3"
-	"github.com/scaleapi/bodega/internal/server"
+	"github.com/ravinald/bodega/internal/logging"
+	"github.com/ravinald/bodega/internal/server"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 func newServeCmd(gf *globalFlags) *cobra.Command {
@@ -75,22 +75,18 @@ TLS can be enabled in two ways:
 				cfg.TLSDomain = tlsDomain
 			}
 
-			// S3 client is optional. Without it, API endpoints still work
+			// Object storage is optional. Without it, API endpoints still work
 			// but package proxying returns 503.
-			var s3client *bos3.Client
-			if cfg.Bucket != "" {
-				ctx := backgroundCtx()
-				c, err := bos3.NewClient(ctx, cfg.Bucket, cfg.Region)
-				if err != nil {
-					logger.Warn("S3 not available — package serving disabled", "error", err)
-				} else {
-					s3client = c
-				}
+			var objects storage.ObjectStore
+			ctx := backgroundCtx()
+			obj, err := storage.New(ctx, cfg)
+			if err != nil {
+				logger.Warn("storage backend not available — package serving disabled", "error", err)
 			} else {
-				logger.Warn("no bucket configured — package serving disabled, API only")
+				objects = obj
 			}
 
-			srv := server.New(cfg, store, s3client, addr, logger)
+			srv := server.New(cfg, store, objects, addr, logger)
 
 			// Graceful shutdown on SIGTERM/SIGINT.
 			ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)

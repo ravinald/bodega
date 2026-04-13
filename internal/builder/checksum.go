@@ -8,7 +8,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // computeFileSHA256 returns the lowercase hex SHA-256 digest of a file.

@@ -1,0 +1,701 @@
+openapi: "3.0.3"
+info:
+  title: bodega API
+  description: REST API for the bodega package repository manager.
+  version: 0.1.0
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+
+tags:
+  - name: packages
+    description: Package manifest operations
+  - name: status
+    description: Server health and status
+  - name: config
+    description: Server configuration
+  - name: metrics
+    description: Package metrics
+
+paths:
+  /healthz:
+    get:
+      summary: Health probe
+      description: Returns "ok" when the server is running.
+      operationId: healthz
+      tags: [status]
+      responses:
+        "200":
+          description: Server is healthy
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "ok"
+
+  /api/v1/packages:
+    get:
+      summary: List all packages
+      description: Returns all package manifests grouped by type.
+      operationId: listPackages
+      tags: [packages]
+      responses:
+        "200":
+          description: All packages by type
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PackagesResponse"
+
+  /api/v1/packages/{type}:
+    get:
+      summary: List packages by type
+      operationId: listPackagesByType
+      tags: [packages]
+      parameters:
+        - $ref: "#/components/parameters/PackageType"
+      responses:
+        "200":
+          description: Packages of the specified type
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PackageManifest"
+        "404":
+          description: Unknown type
+    post:
+      summary: Create a new package entry
+      description: |
+        Creates a new package manifest entry. Restricted to IPs in
+        `admin_permit_cidr`. When the allow-list extends beyond localhost,
+        a valid Bearer token is required.
+      operationId: createPackage
+      tags: [packages]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PackageType"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PackageManifest"
+      responses:
+        "201":
+          description: Package created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PackageManifest"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: Package already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          description: Request body too large (max 1 MiB)
+
+  /api/v1/packages/{type}/{name}:
+    get:
+      summary: Get a single package
+      operationId: getPackage
+      tags: [packages]
+      parameters:
+        - $ref: "#/components/parameters/PackageType"
+        - $ref: "#/components/parameters/PackageName"
+      responses:
+        "200":
+          description: Package manifest
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PackageManifest"
+        "404":
+          description: Package not found
+    delete:
+      summary: Delete a package entry
+      description: |
+        Deletes a package manifest entry. Frozen packages cannot be deleted.
+        Same access control as POST.
+      operationId: deletePackage
+      tags: [packages]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PackageType"
+        - $ref: "#/components/parameters/PackageName"
+      responses:
+        "200":
+          description: Package deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: deleted
+                  type:
+                    type: string
+                  name:
+                    type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: Package not found
+
+  /api/v1/packages/{type}/{name}/hide:
+    patch:
+      summary: Toggle hidden flag
+      description: Toggles the hidden flag on all versions of a package.
+      operationId: toggleHidden
+      tags: [packages]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PackageType"
+        - $ref: "#/components/parameters/PackageName"
+      responses:
+        "200":
+          description: Updated package manifest
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PackageManifest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: Package not found
+
+  /api/v1/packages/{type}/{name}/hide/{version}:
+    patch:
+      summary: Toggle hidden flag on a specific version
+      operationId: toggleHiddenVersion
+      tags: [packages]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PackageType"
+        - $ref: "#/components/parameters/PackageName"
+        - name: version
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Updated package manifest
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PackageManifest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Package not found
+
+  /api/v1/packages/{type}/{name}/freeze:
+    patch:
+      summary: Toggle frozen flag
+      description: Toggles the frozen flag on all versions of a package.
+      operationId: toggleFreeze
+      tags: [packages]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PackageType"
+        - $ref: "#/components/parameters/PackageName"
+      responses:
+        "200":
+          description: Updated package manifest
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PackageManifest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Package not found
+
+  /api/v1/packages/{type}/{name}/freeze/{version}:
+    patch:
+      summary: Toggle frozen flag on a specific version
+      operationId: toggleFreezeVersion
+      tags: [packages]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/PackageType"
+        - $ref: "#/components/parameters/PackageName"
+        - name: version
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Updated package manifest
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PackageManifest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Package not found
+
+  /api/v1/audit:
+    get:
+      summary: Query audit events
+      description: Returns audit events matching the given filters.
+      operationId: queryAudit
+      tags: [status]
+      parameters:
+        - name: type
+          in: query
+          schema:
+            type: string
+          description: "Event type filter (e.g. fetch, build, create, delete, cache)"
+        - name: pkg_type
+          in: query
+          schema:
+            type: string
+        - name: name
+          in: query
+          schema:
+            type: string
+        - name: client
+          in: query
+          schema:
+            type: string
+          description: Client IP filter
+        - name: since
+          in: query
+          schema:
+            type: string
+          description: "ISO date or RFC3339 timestamp"
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        "200":
+          description: Audit events
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AuditEvent"
+
+  /api/v1/tokens:
+    get:
+      summary: List API tokens
+      description: Returns metadata for all tokens. Hashes are never exposed.
+      operationId: listTokens
+      tags: [status]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Token list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TokenInfo"
+    post:
+      summary: Create a new API token
+      description: |
+        Generates a new token. The raw token is included in the response
+        and cannot be retrieved later.
+      operationId: createToken
+      tags: [status]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [label]
+              properties:
+                label:
+                  type: string
+                expiry:
+                  type: string
+                  description: "Duration (30d, 1y), date (2027-01-01), or 'never'. Default: 365d"
+                comment:
+                  type: string
+      responses:
+        "201":
+          description: Token created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                    description: Raw token (only shown once)
+                  id:
+                    type: string
+                  label:
+                    type: string
+                  expires_at:
+                    type: string
+                    format: date-time
+
+  /api/v1/tokens/{id}:
+    delete:
+      summary: Revoke a token
+      operationId: revokeToken
+      tags: [status]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Token revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: revoked
+                  id:
+                    type: string
+
+  /api/v1/status:
+    get:
+      summary: Server status
+      description: Returns health status, entry counts per type, and an S3 probe result.
+      operationId: getStatus
+      tags: [status]
+      responses:
+        "200":
+          description: Server status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+
+  /api/v1/config:
+    get:
+      summary: Non-sensitive configuration
+      description: Returns the bucket, region, and manifest directory. No secrets are exposed.
+      operationId: getConfig
+      tags: [config]
+      responses:
+        "200":
+          description: Configuration subset
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConfigResponse"
+
+  /api/v1/metrics:
+    get:
+      summary: Package metrics
+      description: Returns global and per-type package count and size metrics.
+      operationId: getMetrics
+      tags: [metrics]
+      responses:
+        "200":
+          description: Metrics data
+          content:
+            application/json:
+              schema:
+                type: object
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        API token generated with `bodega token generate`. Required for
+        POST and DELETE when the server accepts connections from non-localhost IPs.
+
+  parameters:
+    PackageType:
+      name: type
+      in: path
+      required: true
+      schema:
+        type: string
+        enum: [apt, git, pypi, binary, gomod, helm, npm]
+    PackageName:
+      name: name
+      in: path
+      required: true
+      schema:
+        type: string
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing or invalid Bearer token
+      content:
+        text/plain:
+          schema:
+            type: string
+    Forbidden:
+      description: IP not in admin_permit_cidr or entry is frozen
+      content:
+        text/plain:
+          schema:
+            type: string
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+      required: [error]
+
+    PackagesResponse:
+      type: object
+      properties:
+        apt:
+          type: array
+          items:
+            $ref: "#/components/schemas/PackageManifest"
+        git:
+          type: array
+          items:
+            $ref: "#/components/schemas/PackageManifest"
+        pypi:
+          type: array
+          items:
+            $ref: "#/components/schemas/PackageManifest"
+        binary:
+          type: array
+          items:
+            $ref: "#/components/schemas/PackageManifest"
+        gomod:
+          type: array
+          items:
+            $ref: "#/components/schemas/PackageManifest"
+        helm:
+          type: array
+          items:
+            $ref: "#/components/schemas/PackageManifest"
+        npm:
+          type: array
+          items:
+            $ref: "#/components/schemas/PackageManifest"
+
+    PackageManifest:
+      type: object
+      required: [name, type]
+      properties:
+        config_version:
+          type: integer
+          description: Schema version
+        name:
+          type: string
+          description: Package name
+        type:
+          type: string
+          enum: [apt, git, pypi, binary, gomod, helm, npm]
+        description:
+          type: string
+        dep_policy:
+          type: string
+          enum: [none, direct, transitive]
+        versions:
+          type: array
+          items:
+            $ref: "#/components/schemas/VersionEntry"
+
+    VersionEntry:
+      type: object
+      properties:
+        version:
+          type: string
+        url:
+          type: string
+        mode:
+          type: string
+          enum: [hosted, proxy]
+        version_constraint:
+          type: string
+          enum: [exact, compatible, patch, any]
+        ref:
+          type: string
+          description: Git ref (tag, branch, SHA)
+        source:
+          type: string
+          enum: [release, clone]
+          description: Git source mode
+        source_name:
+          type: string
+          description: Upstream apt package name
+        build_cmd:
+          type: string
+        deb_glob:
+          type: string
+        filename:
+          type: string
+          description: Binary filename override
+        sha256:
+          type: string
+          description: Expected SHA-256 for binary downloads
+        app_version:
+          type: string
+          description: Helm app version
+        required_by:
+          type: array
+          items:
+            type: string
+        checksum:
+          $ref: "#/components/schemas/Checksum"
+        checksum_verified:
+          type: boolean
+        platform:
+          type: string
+          description: Target platform (e.g. linux/amd64)
+        artifact_size:
+          type: integer
+          format: int64
+          description: Size in bytes
+        hidden:
+          type: boolean
+        frozen:
+          type: boolean
+        description:
+          type: string
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+
+    Checksum:
+      type: object
+      properties:
+        algorithm:
+          type: string
+          enum: [sha256, sha1, md5]
+        value:
+          type: string
+          description: Hex-encoded digest
+
+    StatusResponse:
+      type: object
+      properties:
+        healthy:
+          type: boolean
+        entry_count:
+          type: object
+          additionalProperties:
+            type: integer
+        s3_entries:
+          type: array
+          items:
+            type: object
+            properties:
+              type:
+                type: string
+              name:
+                type: string
+              s3_key:
+                type: string
+              in_s3:
+                type: boolean
+              frozen:
+                type: boolean
+        error:
+          type: string
+
+    ConfigResponse:
+      type: object
+      properties:
+        bucket:
+          type: string
+        region:
+          type: string
+        manifest_dir:
+          type: string
+
+    AuditEvent:
+      type: object
+      properties:
+        id:
+          type: integer
+        timestamp:
+          type: string
+          format: date-time
+        event_type:
+          type: string
+        pkg_type:
+          type: string
+        pkg_name:
+          type: string
+        pkg_version:
+          type: string
+        client_ip:
+          type: string
+        user_agent:
+          type: string
+        status:
+          type: string
+        duration_ms:
+          type: integer
+        details:
+          type: string
+
+    TokenInfo:
+      type: object
+      properties:
+        id:
+          type: string
+        label:
+          type: string
+        comment:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+        last_used:
+          type: string
+          format: date-time
+          nullable: true

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/scaleapi/core-infrastructure/tools/bodega/schemas/binary.schema.json",
+  "$id": "https://github.com/ravinald/bodega/schemas/binary.schema.json",
   "title": "Binary Download Manifest",
   "description": "Defines files to download directly from URLs and upload to S3.",
   "type": "object",

@@ -2,13 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
 	"github.com/spf13/cobra"
 
-	"github.com/scaleapi/bodega/internal/manifest"
-	bos3 "github.com/scaleapi/bodega/internal/s3"
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 func newDeleteCmd(gf *globalFlags) *cobra.Command {
@@ -49,23 +51,29 @@ Frozen entries cannot be deleted; unfreeze them first with 'bodega freeze'.`,
 				return fmt.Errorf("entry %s/%s is frozen — unfreeze it first with 'bodega freeze %s %s'", t, name, t, name)
 			}
 
-			// Remove from S3 first if requested.
+			// Remove from object store first if requested.
 			if removeFromS3 {
 				if err := requireBucket(cfg); err != nil {
 					return err
 				}
-				client, err := bos3.NewClient(ctx, cfg.Bucket, cfg.Region)
+				objStore, err := storage.New(ctx, cfg)
 				if err != nil {
-					return fmt.Errorf("connect to AWS: %w", err)
+					return fmt.Errorf("connect to storage: %w", err)
 				}
 				key := s3KeyFor(store, ctx, t, name)
 				if key != "" {
 					fmt.Printf("Deleting s3://%s/%s ...\n", cfg.Bucket, key)
-					if err := client.DeleteObject(ctx, key); err != nil {
+					if err := objStore.Delete(ctx, key); err != nil {
 						return err
 					}
 					fmt.Println("  Deleted from S3.")
 				}
+			}
+
+			// Capture before state for audit.
+			var beforeJSON []byte
+			if pm, err := store.GetPackage(ctx, t, name); err == nil && pm != nil {
+				beforeJSON, _ = json.MarshalIndent(pm, "", "  ")
 			}
 
 			// Remove from manifest.
@@ -77,6 +85,18 @@ Frozen entries cannot be deleted; unfreeze them first with 'bodega freeze'.`,
 			}
 
 			fmt.Printf("Removed %s/%s from manifest.\n", t, name)
+
+			if adb := openAuditDB(gf); adb != nil {
+				_ = adb.Record(ctx, audit.Event{
+					EventType: audit.EventDelete,
+					PkgType:   t,
+					PkgName:   name,
+					Status:    "success",
+					Details:   audit.FormatDiff(beforeJSON, nil),
+				})
+				adb.Close()
+			}
+
 			notifyServer(gf)
 			return nil
 		},

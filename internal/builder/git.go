@@ -10,7 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // safeName replaces forward slashes with "--" so names like
@@ -97,7 +98,7 @@ func FetchGit(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 			if !cfg.Force {
 				stage := CheckGitStage(cfg, name, ve)
 				if stage.Fetched {
-					cfg.logf("  [git] %s: already fetched, skipping (use --force to re-fetch)", name)
+					cfg.logf("  [git] %s: already fetched, skipping (use 'force' to re-fetch)", name)
 					continue
 				}
 			}
@@ -231,6 +232,11 @@ func FetchGit(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 					cfg.Logger.Audit("OK      git/fetch/%s  (%s)", name, result.Elapsed.Round(time.Millisecond))
 				}
 			}
+			gfStatus := "success"
+			if result.Err != nil {
+				gfStatus = "failure"
+			}
+			cfg.RecordAudit(audit.EventFetch, manifest.TypeGit, name, ve.Ref, gfStatus, result.Elapsed, result.Err)
 		}
 	}
 
@@ -291,6 +297,7 @@ func PackageGit(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 				if cfg.Logger != nil {
 					cfg.Logger.Audit("FAILED  git/package/%s  (%s)  %v", name, result.Elapsed.Round(time.Millisecond), result.Err)
 				}
+				cfg.RecordAudit(audit.EventPackage, manifest.TypeGit, name, ve.Ref, "failure", result.Elapsed, result.Err)
 				continue
 			}
 
@@ -319,6 +326,11 @@ func PackageGit(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 					cfg.Logger.Audit("OK      git/package/%s  (%s)", name, result.Elapsed.Round(time.Millisecond))
 				}
 			}
+			gpStatus := "success"
+			if result.Err != nil {
+				gpStatus = "failure"
+			}
+			cfg.RecordAudit(audit.EventPackage, manifest.TypeGit, name, ve.Ref, gpStatus, result.Elapsed, result.Err)
 		}
 	}
 

@@ -3,8 +3,8 @@ package tui
 import (
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/bubbles/textarea"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -12,11 +12,12 @@ import (
 type popupKind int
 
 const (
-	popupNone      popupKind = iota
-	popupHelp                // ? key
-	popupConfirm             // destructive action confirmation
-	popupBuildMenu           // B key — per-entry build stage picker
-	popupForm                // c/E key — create or edit entry fields
+	popupNone         popupKind = iota
+	popupHelp                   // ? key
+	popupConfirm                // destructive action confirmation
+	popupBuildMenu              // B key — per-entry build stage picker
+	popupForm                   // c/E key — create or edit entry fields
+	popupTokenManager           // T key — API token management
 )
 
 // popupModel holds the state for the overlay popup.
@@ -66,6 +67,23 @@ type popupModel struct {
 	jsonTitle    string         // title shown at the top of the JSON overlay
 	jsonTextarea textarea.Model // bubbles textarea for JSON editing
 	jsonError    string         // validation error shown at the bottom of the overlay
+
+	// --- token manager popup ---
+	tokenList     []tokenDisplayRow // rows rendered in the token table
+	tokenCursor   int               // selected row index
+	tokenCreating bool              // showing the create sub-form
+	tokenCreated  string            // raw token to display after creation (ephemeral)
+	tokenError    string            // error message
+}
+
+// tokenDisplayRow holds one row for the token manager table.
+type tokenDisplayRow struct {
+	ID       string
+	Label    string
+	Expires  string
+	LastUsed string
+	Comment  string
+	Expired  bool
 }
 
 // formField represents a single labelled field in the form popup.
@@ -175,6 +193,9 @@ func (p *popupModel) View(screenWidth, screenHeight int) string {
 
 	case popupForm:
 		content = p.renderForm()
+
+	case popupTokenManager:
+		content = p.renderTokenManager()
 	}
 
 	box := popupStyle.Render(content)
@@ -289,7 +310,7 @@ func (p *popupModel) renderForm() string {
 					formValueStyle.Render(selectPart) +
 					formLabelStyle.UnsetWidth().Render(pad+":")
 			} else {
-				label = formLabelStyle.UnsetWidth().Render(f.Label+" "+selectPart+pad+":")
+				label = formLabelStyle.UnsetWidth().Render(f.Label + " " + selectPart + pad + ":")
 			}
 		} else {
 			padded := f.Label + strings.Repeat(" ", maxLabel-labelTextLen)
@@ -856,4 +877,95 @@ func (p *popupModel) HandleBuildMenuKey(key string) (dismiss bool) {
 	p.kind = popupNone
 	p.onBuildSelect = nil
 	return true
+}
+
+// ---- Token Manager Popup ---------------------------------------------------
+
+// renderTokenManager renders the token management table and controls.
+func (p *popupModel) renderTokenManager() string {
+	var sb strings.Builder
+	sb.WriteString("API Token Manager\n")
+	sb.WriteString(strings.Repeat("─", 60) + "\n\n")
+
+	if p.tokenCreated != "" {
+		sb.WriteString("Token created. Save this now — it cannot be retrieved later.\n\n")
+		sb.WriteString("  " + p.tokenCreated + "\n\n")
+		sb.WriteString("[Enter] dismiss\n")
+		return sb.String()
+	}
+
+	if p.tokenCreating {
+		sb.WriteString("Create new token:\n\n")
+		sb.WriteString(p.renderForm())
+		return sb.String()
+	}
+
+	if len(p.tokenList) == 0 {
+		sb.WriteString("  No tokens configured.\n\n")
+	} else {
+		// Header.
+		sb.WriteString("  ID        Label                Expires       Last Used       Comment\n")
+		sb.WriteString("  " + strings.Repeat("─", 56) + "\n")
+		for i, row := range p.tokenList {
+			cursor := "  "
+			if i == p.tokenCursor {
+				cursor = "> "
+			}
+			expires := row.Expires
+			if row.Expired {
+				expires += " !"
+			}
+			comment := row.Comment
+			if len(comment) > 20 {
+				comment = comment[:17] + "..."
+			}
+			sb.WriteString(cursor)
+			sb.WriteString(padRight(row.ID, 10))
+			sb.WriteString(padRight(row.Label, 21))
+			sb.WriteString(padRight(expires, 14))
+			sb.WriteString(padRight(row.LastUsed, 16))
+			sb.WriteString(comment)
+			sb.WriteByte('\n')
+		}
+		sb.WriteByte('\n')
+	}
+
+	if p.tokenError != "" {
+		sb.WriteString("  Error: " + p.tokenError + "\n\n")
+	}
+
+	sb.WriteString("[c] create   [d] revoke   [Esc] close")
+	return sb.String()
+}
+
+// HandleTokenManagerKey handles key events in the token manager popup.
+// Returns true if the popup should be dismissed.
+func (p *popupModel) HandleTokenManagerKey(key string) (dismiss bool) {
+	// If we just created a token, any key dismisses the display.
+	if p.tokenCreated != "" {
+		p.tokenCreated = ""
+		return false // stay in the manager, don't dismiss
+	}
+
+	switch key {
+	case "esc", "q":
+		p.kind = popupNone
+		return true
+	case "up", "k":
+		if p.tokenCursor > 0 {
+			p.tokenCursor--
+		}
+	case "down", "j":
+		if p.tokenCursor < len(p.tokenList)-1 {
+			p.tokenCursor++
+		}
+	}
+	return false
+}
+
+func padRight(s string, width int) string {
+	if len(s) >= width {
+		return s[:width]
+	}
+	return s + strings.Repeat(" ", width-len(s))
 }

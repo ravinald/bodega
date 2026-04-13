@@ -12,29 +12,29 @@ const metricsFile = "metrics.json"
 // Metrics holds precomputed repository statistics.
 // Updated by build/create/delete operations and cached in metrics.json.
 type Metrics struct {
-	Global    GlobalMetrics            `json:"global"`
-	ByType    map[string]TypeMetrics   `json:"by_type"`
-	UpdatedAt string                   `json:"updated_at"`
+	Global    GlobalMetrics          `json:"global"`
+	ByType    map[string]TypeMetrics `json:"by_type"`
+	UpdatedAt string                 `json:"updated_at"`
 }
 
 // GlobalMetrics holds aggregate stats across all types.
 type GlobalMetrics struct {
-	Packages   int   `json:"packages"`
-	Versions   int   `json:"versions"`
-	Frozen     int   `json:"frozen"`
-	Hidden     int   `json:"hidden"`
-	DepEdges   int   `json:"dep_edges"`
-	Orphans    int   `json:"orphans"`
-	StorageB   int64 `json:"storage_bytes,omitempty"`
+	Packages int   `json:"packages"`
+	Versions int   `json:"versions"`
+	Frozen   int   `json:"frozen"`
+	Hidden   int   `json:"hidden"`
+	DepEdges int   `json:"dep_edges"`
+	Orphans  int   `json:"orphans"`
+	StorageB int64 `json:"storage_bytes,omitempty"`
 }
 
 // TypeMetrics holds stats for a single package type.
 type TypeMetrics struct {
-	Packages   int   `json:"packages"`
-	Versions   int   `json:"versions"`
-	Frozen     int   `json:"frozen"`
-	Hidden     int   `json:"hidden"`
-	StorageB   int64 `json:"storage_bytes,omitempty"`
+	Packages int   `json:"packages"`
+	Versions int   `json:"versions"`
+	Frozen   int   `json:"frozen"`
+	Hidden   int   `json:"hidden"`
+	StorageB int64 `json:"storage_bytes,omitempty"`
 }
 
 // ComputeMetrics builds fresh metrics from the current store state.

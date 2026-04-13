@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -465,13 +466,35 @@ func (s *Store) AllEdges() []DepEdge {
 	return s.graph.Edges
 }
 
-// Orphans returns the set of packages (as "type/name" strings) that appear as
-// children in the graph but have no parent edges.
+// Orphans returns the set of packages (as "type/name" strings) that appear in
+// dependency graph edges but don't have a corresponding manifest in the store.
+// These are broken references that should be repaired.
 func (s *Store) Orphans() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.graph == nil {
 		return nil
 	}
-	return orphans(s.graph)
+	candidates := orphans(s.graph)
+	// Build a lookup set from the index for fast membership checks.
+	known := make(map[string]bool)
+	for typ, names := range s.index.Packages {
+		for _, safeName := range names {
+			known[typ+"/"+safeName] = true
+		}
+	}
+	var result []string
+	for _, ref := range candidates {
+		// Split "type/name" into type and name, then check with SafeName.
+		parts := strings.SplitN(ref, "/", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		typ, name := parts[0], parts[1]
+		key := typ + "/" + SafeName(name)
+		if !known[key] {
+			result = append(result, ref)
+		}
+	}
+	return result
 }

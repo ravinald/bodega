@@ -7,16 +7,13 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/scaleapi/bodega/internal/builder"
-	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/builder"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 func newFetchCmd(gf *globalFlags) *cobra.Command {
-	var entryFilter string
-	var force bool
-
 	cmd := &cobra.Command{
-		Use:   "fetch [TYPE...]",
+		Use:   "fetch [TYPE] [NAME] [force]",
 		Short: "Download source artifacts for one or more manifest types",
 		Long: `fetch downloads raw sources without compiling or packaging them:
 
@@ -25,15 +22,29 @@ func newFetchCmd(gf *globalFlags) *cobra.Command {
   apt     Clone source repo (or apt-get download .deb) to sources/
   pypi    Resolve requirements from cloned git repos, write combined-requirements.txt
 
-If no types are given, all four are fetched in dependency order:
-  binary → git → apt → pypi
+If no types are given, all seven are fetched in dependency order:
+  binary → git → apt → pypi → gomod → helm → npm
 
-The --entry flag restricts the operation to a single named entry.`,
-		Example: `  bodega fetch
-  bodega fetch git
-  bodega fetch apt --entry amazon-efs-utils`,
+Append 'force' to re-fetch even if artifacts already exist.
+When a name is given after the type, only that entry is fetched.`,
+		Example: `  bodega build fetch
+  bodega build fetch git
+  bodega build fetch apt python3
+  bodega build fetch force`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			types, err := resolveTypes(args)
+			force := false
+			var typeArgs []string
+			var entryFilter string
+			for _, a := range args {
+				if a == "force" {
+					force = true
+				} else if isValidType(a) {
+					typeArgs = append(typeArgs, a)
+				} else {
+					entryFilter = a
+				}
+			}
+			types, err := resolveTypes(typeArgs)
 			if err != nil {
 				return err
 			}
@@ -48,14 +59,20 @@ The --entry flag restricts the operation to a single named entry.`,
 				return fmt.Errorf("load manifests: %w", err)
 			}
 
+			auditDB := openAuditDB(gf)
+			if auditDB != nil {
+				defer auditDB.Close()
+			}
+
 			bcfg := &builder.Config{
 				AutoImportDeps: true,
-				Force:       force,
-				BuildRoot:   cfg.BuildRoot,
-				ManifestDir: cfg.ManifestDir,
-				Bucket:      cfg.Bucket,
-				Region:      cfg.Region,
-				Verbose:     cfg.Verbose,
+				Force:          force,
+				AuditDB:        auditDB,
+				BuildRoot:      cfg.BuildRoot,
+				ManifestDir:    cfg.ManifestDir,
+				Bucket:         cfg.Bucket,
+				Region:         cfg.Region,
+				Verbose:        cfg.Verbose,
 			}
 
 			var allSummaries []*builder.Summary
@@ -116,7 +133,5 @@ The --entry flag restricts the operation to a single named entry.`,
 		},
 	}
 
-	cmd.Flags().StringVar(&entryFilter, "entry", "", "Fetch only the named entry")
-	cmd.Flags().BoolVar(&force, "force", false, "Re-fetch even if artifacts already exist")
 	return cmd
 }

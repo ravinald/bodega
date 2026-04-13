@@ -7,52 +7,23 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
-// pypiWheelsDir returns the local wheels directory. When version is non-empty
-// wheels land in wheels/<version>/ so that multiple wheel sets can coexist.
-// Falls back to wheels/ when empty.
-func pypiWheelsDir(d dirs, version string) string {
-	if version != "" {
-		return filepath.Join(d.wheels, version)
-	}
+// pypiWheelsDir returns the local wheels directory.
+func pypiWheelsDir(d dirs) string {
 	return d.wheels
 }
 
 // pypiS3Prefix returns the S3 key prefix for pypi wheels.
-// When version is non-empty, the prefix includes the version: pypi/wheels/<version>/.
-// Falls back to pypi/wheels/ when empty.
-func pypiS3Prefix(version string) string {
-	if version != "" {
-		return "pypi/wheels/" + version + "/"
-	}
+func pypiS3Prefix() string {
 	return "pypi/wheels/"
-}
-
-// pypiVersion returns the version string to use for the wheels directory. It is
-// derived from the first non-frozen pypi package that carries a Version field,
-// or empty when none is found. This preserves backward compatibility with the
-// old PypiManifest.Version field which allowed a single shared version label.
-func pypiVersion(ctx context.Context, store *manifest.Store) string {
-	for _, name := range store.ListPackages(manifest.TypePypi) {
-		pm, err := store.GetPackage(ctx, manifest.TypePypi, name)
-		if err != nil || pm == nil {
-			continue
-		}
-		for _, ve := range pm.Versions {
-			if ve.Version != "" {
-				return ve.Version
-			}
-		}
-	}
-	return ""
 }
 
 // CheckPypiStage inspects the filesystem to determine which pipeline stages
 // have completed for the pypi packages.
 func CheckPypiStage(cfg *Config, store *manifest.Store) StageStatus {
-	ctx := context.Background()
 	d := buildDirs(cfg.rootFor(manifest.TypePypi))
 	var s StageStatus
 
@@ -63,9 +34,8 @@ func CheckPypiStage(cfg *Config, store *manifest.Store) StageStatus {
 	}
 
 	if s.Fetched {
-		version := pypiVersion(ctx, store)
-		// Built = at least one .whl file in the versioned wheels dir.
-		wheelsDir := pypiWheelsDir(d, version)
+		// Built = at least one .whl file in the wheels dir.
+		wheelsDir := pypiWheelsDir(d)
 		whlFiles, _ := filepath.Glob(filepath.Join(wheelsDir, "*.whl"))
 		s.Built = len(whlFiles) > 0
 
@@ -84,10 +54,8 @@ func CheckPypiStage(cfg *Config, store *manifest.Store) StageStatus {
 // PypiArtifactDir returns the local wheels directory and S3 prefix for the
 // pypi packages. Used by the upload and sync commands.
 func PypiArtifactDir(cfg *Config, store *manifest.Store) (localDir, s3Prefix string) {
-	ctx := context.Background()
 	d := buildDirs(cfg.rootFor(manifest.TypePypi))
-	version := pypiVersion(ctx, store)
-	return pypiWheelsDir(d, version), pypiS3Prefix(version)
+	return pypiWheelsDir(d), pypiS3Prefix()
 }
 
 // FetchPypi resolves requirements from previously-cloned git repos and from
@@ -201,6 +169,7 @@ func FetchPypi(cfg *Config, store *manifest.Store) *Summary {
 	if cfg.Logger != nil {
 		cfg.Logger.Audit("OK      pypi/requirements  (%s)", result.Elapsed.Round(time.Millisecond))
 	}
+	cfg.RecordAudit(audit.EventFetch, manifest.TypePypi, "requirements", "", "success", result.Elapsed, nil)
 
 	return summary
 }
@@ -209,7 +178,6 @@ func FetchPypi(cfg *Config, store *manifest.Store) *Summary {
 // directory of wheels under <build-root>/wheels[/<version>]/.
 // combined-requirements.txt must already exist (produced by FetchPypi).
 func BuildPypi(cfg *Config, store *manifest.Store) *Summary {
-	ctx := context.Background()
 	out := cfg.stdout()
 	summary := &Summary{}
 	d := buildDirs(cfg.rootFor(manifest.TypePypi))
@@ -226,8 +194,7 @@ func BuildPypi(cfg *Config, store *manifest.Store) *Summary {
 		return summary
 	}
 
-	version := pypiVersion(ctx, store)
-	wheelsDir := pypiWheelsDir(d, version)
+	wheelsDir := pypiWheelsDir(d)
 	if err := mkdirAll(wheelsDir); err != nil {
 		cfg.logf("ERROR: %v", err)
 		return summary
@@ -308,7 +275,6 @@ func BuildPypi(cfg *Config, store *manifest.Store) *Summary {
 // PackagePypi generates MANIFEST.sha256 in the wheels directory. The wheels
 // must already exist (produced by BuildPypi).
 func PackagePypi(cfg *Config, store *manifest.Store) *Summary {
-	ctx := context.Background()
 	out := cfg.stdout()
 	summary := &Summary{}
 	d := buildDirs(cfg.rootFor(manifest.TypePypi))
@@ -316,8 +282,7 @@ func PackagePypi(cfg *Config, store *manifest.Store) *Summary {
 	start := time.Now()
 	result := Result{Type: manifest.TypePypi, Name: "manifest"}
 
-	version := pypiVersion(ctx, store)
-	wheelsDir := pypiWheelsDir(d, version)
+	wheelsDir := pypiWheelsDir(d)
 	whlFiles, _ := filepath.Glob(filepath.Join(wheelsDir, "*.whl"))
 	if len(whlFiles) == 0 {
 		result.Err = fmt.Errorf("no .whl files found in %s — run 'build pypi' first", wheelsDir)
@@ -362,6 +327,11 @@ func PackagePypi(cfg *Config, store *manifest.Store) *Summary {
 			cfg.Logger.Audit("OK      pypi/manifest  (%s)", result.Elapsed.Round(time.Millisecond))
 		}
 	}
+	pyStatus := "success"
+	if result.Err != nil {
+		pyStatus = "failure"
+	}
+	cfg.RecordAudit(audit.EventPackage, manifest.TypePypi, "manifest", "", pyStatus, result.Elapsed, result.Err)
 
 	return summary
 }

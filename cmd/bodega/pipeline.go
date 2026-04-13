@@ -10,8 +10,8 @@ package main
 import (
 	"context"
 
-	"github.com/scaleapi/bodega/internal/builder"
-	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/builder"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // ensureFetchedBinaries fetches any binary entries that have not yet been

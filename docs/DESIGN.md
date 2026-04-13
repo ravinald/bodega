@@ -78,13 +78,13 @@ One bucket. Versioning enabled. KMS encryption. Public access blocked.
 | helm | Chart repo or direct URL | .tgz | `helm repo add bodega http://bodega/helm` |
 | npm | Registry upstream or local | .tgz | `npm install --registry http://bodega/npm/` |
 
-## Manifest structure (config_version 2)
+## Manifest structure (config_version 1)
 
 Each package is a `PackageManifest` JSON file:
 
 ```json
 {
-  "config_version": 2,
+  "config_version": 1,
   "name": "python3",
   "type": "apt",
   "description": "Python interpreter and libraries",
@@ -118,7 +118,7 @@ Each package is a `PackageManifest` JSON file:
 ```
 
 The manifest envelope contains:
-- **config_version**: schema version (always 2)
+- **config_version**: schema version (always 1)
 - **name**: canonical package name
 - **type**: package ecosystem
 - **description**: human-readable summary
@@ -173,7 +173,7 @@ Apt entries support three distinct workflows:
 Provide a package name (e.g. "python3"):
 
 ```bash
-bodega create apt --name python3
+bodega pkg create apt python3
 ```
 
 Bodega queries apt-cache, resolves the concrete version with full metadata, and optionally discovers dependencies.
@@ -183,7 +183,7 @@ Bodega queries apt-cache, resolves the concrete version with full metadata, and 
 Download a .deb from a URL:
 
 ```bash
-bodega create binary --url https://example.com/package.deb
+bodega pkg create binary mypackage --url https://example.com/package.deb
 ```
 
 ### 3. Source build mode
@@ -193,8 +193,7 @@ Two sub-options:
 **3a. Git repo + build command:**
 
 ```bash
-bodega create apt \
-  --name amazon-efs-utils \
+bodega pkg create apt amazon-efs-utils \
   --url https://github.com/aws/efs-utils.git \
   --build-cmd "make deb" \
   --deb-glob "build/*.deb"
@@ -203,7 +202,7 @@ bodega create apt \
 **3b. apt-get source + dpkg-buildpackage:**
 
 ```bash
-bodega create apt --name openssh-client --source-build
+bodega pkg create apt openssh-client --source-build
 ```
 
 Mode 3b gives you supply chain control by building from Debian source packages locally.
@@ -273,9 +272,25 @@ The config file accepts a `deny_list` of CIDR entries. Bare IPs are treated as /
 
 The `RealIPMiddleware` extracts the client IP from `X-Real-IP` or `X-Forwarded-For` headers, but only when the direct peer is in a trusted network (RFC 1918 + loopback by default). Untrusted peers can't spoof their IP via headers.
 
+### Mutation access control
+
+The mutation API (POST and DELETE on `/api/v1/packages/...`) is gated by two layers:
+
+1. **IP allow-list** (`admin_permit_cidr`): Only requests from permitted CIDRs can reach mutation endpoints. Defaults to `["127.0.0.0/8", "::1/128"]`, so out of the box only localhost can create or delete entries.
+
+2. **Bearer token** (`api_token`): When `admin_permit_cidr` extends beyond localhost, a valid `Authorization: Bearer <token>` header is required on mutation requests. Generate tokens with `bodega token generate`.
+
+Read endpoints remain unauthenticated. Package manager clients (apt, pip, go, npm, helm) use standard protocols that don't support auth headers, so read paths stay open by design.
+
+### Response hardening
+
+All HTTP responses include security headers: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Content-Security-Policy`, and `Referrer-Policy`. When TLS is active, `Strict-Transport-Security` is also set.
+
+Upstream proxy fetches validate that target URLs use HTTPS and don't resolve to private or loopback addresses, preventing SSRF through manifest-controlled URLs.
+
 ### TLS
 
-Two options: provide a cert/key pair, or enable Let's Encrypt autocert with a domain name. Minimum TLS 1.2.
+Two options: provide a cert/key pair, or enable Let's Encrypt autocert with a domain name. Minimum TLS 1.3.
 
 ### Manifest integrity
 
@@ -306,6 +321,8 @@ Key fields:
 | `proxy_cache_enabled` | false | Global proxy/cache toggle |
 | `metadata_ttl` | 1h | How long mutable proxy resources are cached |
 | `deny_list` | [] | CIDR entries to block |
+| `admin_permit_cidr` | [127.0.0.0/8, ::1/128] | CIDRs allowed to hit mutation API |
+| `api_token` | (none) | Bearer token for mutation API |
 | `tls_cert` / `tls_key` | (none) | Manual TLS |
 | `tls_autocert` / `tls_domain` | (none) | Let's Encrypt |
 | `audit_db` | {log_dir}/audit.db | Audit database path |

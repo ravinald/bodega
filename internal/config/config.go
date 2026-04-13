@@ -28,31 +28,39 @@ const (
 
 // Config holds resolved runtime configuration.
 type Config struct {
-	Bucket          string `json:"bucket"`
-	Region          string `json:"region"`
-	BuildRoot       string `json:"build_root"`
-	ManifestDir     string `json:"manifest_dir"`
-	LogDir          string `json:"log_dir"`
-	LogWindowHeight int    `json:"logwindow_height"`
-	LogLevel        int    `json:"log_level"`
-	CustomPaths     bool   `json:"custom_paths"`
-	AptRoot         string `json:"apt_root,omitempty"`
-	GitRoot         string `json:"git_root,omitempty"`
-	PypiRoot        string `json:"pypi_root,omitempty"`
-	BinaryRoot      string `json:"binary_root,omitempty"`
-	TLSCert           string `json:"tls_cert,omitempty"`
-	TLSKey            string `json:"tls_key,omitempty"`
-	TLSAutocert       bool   `json:"tls_autocert,omitempty"`
-	TLSDomain         string `json:"tls_domain,omitempty"`
-	ProxyCacheEnabled bool   `json:"proxy_cache_enabled"`
-	MetadataTTL       string `json:"metadata_ttl,omitempty"`
-	GomodUpstream     string `json:"gomod_upstream,omitempty"`
-	NpmUpstream       string `json:"npm_upstream,omitempty"`
-	GomodRoot         string `json:"gomod_root,omitempty"`
-	HelmRoot          string `json:"helm_root,omitempty"`
-	NpmRoot           string `json:"npm_root,omitempty"`
+	Bucket            string   `json:"bucket"`
+	Region            string   `json:"region"`
+	BuildRoot         string   `json:"build_root"`
+	ManifestDir       string   `json:"manifest_dir"`
+	LogDir            string   `json:"log_dir"`
+	LogWindowHeight   int      `json:"logwindow_height"`
+	LogLevel          int      `json:"log_level"`
+	CustomPaths       bool     `json:"custom_paths"`
+	AptRoot           string   `json:"apt_root,omitempty"`
+	GitRoot           string   `json:"git_root,omitempty"`
+	PypiRoot          string   `json:"pypi_root,omitempty"`
+	BinaryRoot        string   `json:"binary_root,omitempty"`
+	TLSCert           string   `json:"tls_cert,omitempty"`
+	TLSKey            string   `json:"tls_key,omitempty"`
+	TLSAutocert       bool     `json:"tls_autocert,omitempty"`
+	TLSDomain         string   `json:"tls_domain,omitempty"`
+	ProxyCacheEnabled bool     `json:"proxy_cache_enabled"`
+	MetadataTTL       string   `json:"metadata_ttl,omitempty"`
+	GomodUpstream     string   `json:"gomod_upstream,omitempty"`
+	NpmUpstream       string   `json:"npm_upstream,omitempty"`
+	GomodRoot         string   `json:"gomod_root,omitempty"`
+	HelmRoot          string   `json:"helm_root,omitempty"`
+	NpmRoot           string   `json:"npm_root,omitempty"`
 	AuditDB           string   `json:"audit_db,omitempty"`
 	DenyList          []string `json:"deny_list,omitempty"`
+	Timezone          string   `json:"timezone,omitempty"`          // display timezone, e.g. "America/Los_Angeles"; default UTC
+	AuditEvents       []string `json:"audit_events,omitempty"`      // event types to record; empty = all
+	StorageBackend    string   `json:"storage_backend,omitempty"`   // "local" (default), "s3"
+	StoragePath       string   `json:"storage_path,omitempty"`      // root directory for local backend
+	GpgEmail          string   `json:"gpg_email,omitempty"`         // GPG signing email for apt repo (default "bodega@localhost")
+	GpgName           string   `json:"gpg_name,omitempty"`          // GPG signing name (default "Bodega Package Signing")
+	AptCodename       string   `json:"apt_codename,omitempty"`      // codename for generated apt repo (default "noble")
+	AdminPermitCIDR   []string `json:"admin_permit_cidr,omitempty"` // CIDRs allowed to hit mutation API; default ["127.0.0.0/8","::1/128"]
 	LocalConfig       bool     `json:"-"`
 	Verbose           bool     `json:"-"`
 }
@@ -97,31 +105,35 @@ func (c *Config) RootForType(typ string) string {
 
 // fileConfig is the on-disk shape of config.json.
 type fileConfig struct {
-	Bucket          string `json:"bucket"`
-	Region          string `json:"region"`
-	BuildRoot       string `json:"build_root"`
-	ManifestDir     string `json:"manifest_dir"`
-	LogDir          string `json:"log_dir"`
-	LogWindowHeight int    `json:"logwindow_height"`
-	LogLevel        int    `json:"log_level"`
-	CustomPaths     bool   `json:"custom_paths"`
-	AptRoot         string `json:"apt_root,omitempty"`
-	GitRoot         string `json:"git_root,omitempty"`
-	PypiRoot        string `json:"pypi_root,omitempty"`
-	BinaryRoot      string `json:"binary_root,omitempty"`
-	TLSCert           string `json:"tls_cert,omitempty"`
-	TLSKey            string `json:"tls_key,omitempty"`
-	TLSAutocert       bool   `json:"tls_autocert,omitempty"`
-	TLSDomain         string `json:"tls_domain,omitempty"`
-	ProxyCacheEnabled bool   `json:"proxy_cache_enabled"`
-	MetadataTTL       string `json:"metadata_ttl,omitempty"`
-	GomodUpstream     string `json:"gomod_upstream,omitempty"`
-	NpmUpstream       string `json:"npm_upstream,omitempty"`
-	GomodRoot         string `json:"gomod_root,omitempty"`
-	HelmRoot          string `json:"helm_root,omitempty"`
-	NpmRoot           string `json:"npm_root,omitempty"`
+	Bucket            string   `json:"bucket"`
+	Region            string   `json:"region"`
+	BuildRoot         string   `json:"build_root"`
+	ManifestDir       string   `json:"manifest_dir"`
+	LogDir            string   `json:"log_dir"`
+	LogWindowHeight   int      `json:"logwindow_height"`
+	LogLevel          int      `json:"log_level"`
+	CustomPaths       bool     `json:"custom_paths"`
+	AptRoot           string   `json:"apt_root,omitempty"`
+	GitRoot           string   `json:"git_root,omitempty"`
+	PypiRoot          string   `json:"pypi_root,omitempty"`
+	BinaryRoot        string   `json:"binary_root,omitempty"`
+	TLSCert           string   `json:"tls_cert,omitempty"`
+	TLSKey            string   `json:"tls_key,omitempty"`
+	TLSAutocert       bool     `json:"tls_autocert,omitempty"`
+	TLSDomain         string   `json:"tls_domain,omitempty"`
+	ProxyCacheEnabled bool     `json:"proxy_cache_enabled"`
+	MetadataTTL       string   `json:"metadata_ttl,omitempty"`
+	GomodUpstream     string   `json:"gomod_upstream,omitempty"`
+	NpmUpstream       string   `json:"npm_upstream,omitempty"`
+	GomodRoot         string   `json:"gomod_root,omitempty"`
+	HelmRoot          string   `json:"helm_root,omitempty"`
+	NpmRoot           string   `json:"npm_root,omitempty"`
 	AuditDB           string   `json:"audit_db,omitempty"`
 	DenyList          []string `json:"deny_list,omitempty"`
+	StorageBackend    string   `json:"storage_backend,omitempty"`
+	StoragePath       string   `json:"storage_path,omitempty"`
+	AptCodename       string   `json:"apt_codename,omitempty"`
+	AdminPermitCIDR   []string `json:"admin_permit_cidr,omitempty"`
 
 	// Legacy field — read but not written.
 	ShellHeight int `json:"shell_height,omitempty"`
@@ -184,24 +196,37 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	// Deny list.
 	cfg.DenyList = fc.DenyList
 
+	// Storage backend.
+	cfg.StorageBackend = firstNonEmpty(fc.StorageBackend, "local")
+	cfg.StoragePath = fc.StoragePath
+
+	// APT codename.
+	cfg.AptCodename = firstNonEmpty(fc.AptCodename, "noble")
+
+	// Mutation allow-list: default to localhost only.
+	cfg.AdminPermitCIDR = fc.AdminPermitCIDR
+	if len(cfg.AdminPermitCIDR) == 0 {
+		cfg.AdminPermitCIDR = []string{"127.0.0.0/8", "::1/128"}
+	}
+
 	return cfg, nil
 }
 
 // Save writes the current config to the first writable config path.
 func (c *Config) Save() error {
 	fc := fileConfig{
-		Bucket:          c.Bucket,
-		Region:          c.Region,
-		BuildRoot:       c.BuildRoot,
-		ManifestDir:     c.ManifestDir,
-		LogDir:          c.LogDir,
-		LogWindowHeight: c.LogWindowHeight,
-		LogLevel:        c.LogLevel,
-		CustomPaths:     c.CustomPaths,
-		AptRoot:         c.AptRoot,
-		GitRoot:         c.GitRoot,
-		PypiRoot:        c.PypiRoot,
-		BinaryRoot:      c.BinaryRoot,
+		Bucket:            c.Bucket,
+		Region:            c.Region,
+		BuildRoot:         c.BuildRoot,
+		ManifestDir:       c.ManifestDir,
+		LogDir:            c.LogDir,
+		LogWindowHeight:   c.LogWindowHeight,
+		LogLevel:          c.LogLevel,
+		CustomPaths:       c.CustomPaths,
+		AptRoot:           c.AptRoot,
+		GitRoot:           c.GitRoot,
+		PypiRoot:          c.PypiRoot,
+		BinaryRoot:        c.BinaryRoot,
 		TLSCert:           c.TLSCert,
 		TLSKey:            c.TLSKey,
 		TLSAutocert:       c.TLSAutocert,
@@ -215,6 +240,10 @@ func (c *Config) Save() error {
 		NpmRoot:           c.NpmRoot,
 		AuditDB:           c.AuditDB,
 		DenyList:          c.DenyList,
+		StorageBackend:    c.StorageBackend,
+		StoragePath:       c.StoragePath,
+		AptCodename:       c.AptCodename,
+		AdminPermitCIDR:   c.AdminPermitCIDR,
 	}
 
 	data, err := json.MarshalIndent(fc, "", "  ")
@@ -229,7 +258,7 @@ func (c *Config) Save() error {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			continue
 		}
-		if err := os.WriteFile(path, data, 0o644); err != nil {
+		if err := os.WriteFile(path, data, 0o600); err != nil {
 			continue
 		}
 		return nil
@@ -331,7 +360,7 @@ func defaultConfigContent() []byte {
 func createDefaultConfig() (string, error) {
 	if err := os.MkdirAll(SystemConfigDir, 0o755); err == nil {
 		path := SystemConfigFile
-		if err := os.WriteFile(path, defaultConfigContent(), 0o644); err == nil {
+		if err := os.WriteFile(path, defaultConfigContent(), 0o600); err == nil {
 			return path, nil
 		}
 	}
@@ -345,7 +374,7 @@ func createDefaultConfig() (string, error) {
 		return "", fmt.Errorf("create config dir %s: %w", dir, err)
 	}
 	path := filepath.Join(dir, "config.json")
-	if err := os.WriteFile(path, defaultConfigContent(), 0o644); err != nil {
+	if err := os.WriteFile(path, defaultConfigContent(), 0o600); err != nil {
 		return "", fmt.Errorf("write config %s: %w", path, err)
 	}
 	return path, nil

@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // helper: create a regular file (and parent dirs) with dummy content.
@@ -276,7 +276,10 @@ func TestCheckAptStage_AptGetFetched(t *testing.T) {
 	ve := manifest.VersionEntry{}
 	d := buildDirs(root)
 
-	touchFile(t, filepath.Join(d.sources, "curl_7.0_amd64.deb"))
+	// .deb goes in per-package subdirectory.
+	pkgDir := filepath.Join(d.sources, "curl")
+	mkDir(t, pkgDir)
+	touchFile(t, filepath.Join(pkgDir, "curl_7.0_amd64.deb"))
 	s := CheckAptStage(cfg, "curl", ve)
 	if !s.Fetched || !s.Built {
 		t.Errorf("expected Fetched+Built=true for apt-get entry with .deb present, got %+v", s)
@@ -287,38 +290,20 @@ func TestCheckAptStage_AptGetFetched(t *testing.T) {
 // PyPI stage check and path helpers
 // ---------------------------------------------------------------------------
 
-func TestPypiWheelsDir_NoVersion(t *testing.T) {
+func TestPypiWheelsDir(t *testing.T) {
 	root := t.TempDir()
 	d := buildDirs(root)
-	got := pypiWheelsDir(d, "")
+	got := pypiWheelsDir(d)
 	if got != d.wheels {
-		t.Errorf("pypiWheelsDir (no version) = %q, want %q", got, d.wheels)
+		t.Errorf("pypiWheelsDir = %q, want %q", got, d.wheels)
 	}
 }
 
-func TestPypiWheelsDir_WithVersion(t *testing.T) {
-	root := t.TempDir()
-	d := buildDirs(root)
-	got := pypiWheelsDir(d, "v4.5.5")
-	want := filepath.Join(d.wheels, "v4.5.5")
-	if got != want {
-		t.Errorf("pypiWheelsDir (versioned) = %q, want %q", got, want)
-	}
-}
-
-func TestPypiS3Prefix_NoVersion(t *testing.T) {
-	got := pypiS3Prefix("")
+func TestPypiS3Prefix(t *testing.T) {
+	got := pypiS3Prefix()
 	want := "pypi/wheels/"
 	if got != want {
-		t.Errorf("pypiS3Prefix (no version) = %q, want %q", got, want)
-	}
-}
-
-func TestPypiS3Prefix_WithVersion(t *testing.T) {
-	got := pypiS3Prefix("v4.5.5")
-	want := "pypi/wheels/v4.5.5/"
-	if got != want {
-		t.Errorf("pypiS3Prefix (versioned) = %q, want %q", got, want)
+		t.Errorf("pypiS3Prefix = %q, want %q", got, want)
 	}
 }
 
@@ -354,7 +339,7 @@ func TestCheckPypiStage_Built(t *testing.T) {
 	d := buildDirs(root)
 
 	touchFile(t, filepath.Join(root, "combined-requirements.txt"))
-	wheelsDir := pypiWheelsDir(d, "")
+	wheelsDir := pypiWheelsDir(d)
 	touchFile(t, filepath.Join(wheelsDir, "somepackage-1.0-py3-none-any.whl"))
 
 	s := CheckPypiStage(cfg, store)
@@ -373,7 +358,7 @@ func TestCheckPypiStage_Packaged(t *testing.T) {
 	d := buildDirs(root)
 
 	touchFile(t, filepath.Join(root, "combined-requirements.txt"))
-	wheelsDir := pypiWheelsDir(d, "")
+	wheelsDir := pypiWheelsDir(d)
 	touchFile(t, filepath.Join(wheelsDir, "somepackage-1.0-py3-none-any.whl"))
 	touchFile(t, filepath.Join(wheelsDir, "MANIFEST.sha256"))
 

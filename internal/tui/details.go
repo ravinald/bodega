@@ -10,9 +10,9 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/bubbles/viewport"
-	"github.com/scaleapi/bodega/internal/builder"
-	"github.com/scaleapi/bodega/internal/config"
-	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/builder"
+	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // detailsModel is the bubbletea model for the top-right Details pane.

@@ -5,7 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/scaleapi/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/audit"
 )
 
 func newChecksumCmd(gf *globalFlags) *cobra.Command {

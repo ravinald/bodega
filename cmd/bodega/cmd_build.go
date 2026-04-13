@@ -8,16 +8,14 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/scaleapi/bodega/internal/builder"
-	"github.com/scaleapi/bodega/internal/logging"
-	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/builder"
+	"github.com/ravinald/bodega/internal/logging"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 func newBuildRunCmd(gf *globalFlags) *cobra.Command {
-	var entryFilter string
-
 	cmd := &cobra.Command{
-		Use:   "run [TYPE...]",
+		Use:   "run [TYPE] [NAME]",
 		Short: "Compile/transform sources for one or more manifest types",
 		Long: `build compiles or prepares sources for the specified types. It automatically
 fetches sources first if they have not already been fetched.
@@ -30,16 +28,21 @@ fetches sources first if they have not already been fetched.
 If no types are given, all four are processed in dependency order:
   binary → git → apt → pypi
 
-The --entry flag restricts the operation to a single named entry.
-
-To package the produced artifacts run 'package', or run 'upload' to cascade
-through all stages and push to S3.`,
-		Example: `  bodega build
-  bodega build apt
-  bodega build git pypi
-  bodega build binary --entry awscli-v2`,
+When a name is given after the type, only that entry is built.`,
+		Example: `  bodega build run
+  bodega build run apt
+  bodega build run apt python3`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			types, err := resolveTypes(args)
+			var typeArgs []string
+			var entryFilter string
+			for _, a := range args {
+				if isValidType(a) {
+					typeArgs = append(typeArgs, a)
+				} else {
+					entryFilter = a
+				}
+			}
+			types, err := resolveTypes(typeArgs)
 			if err != nil {
 				return err
 			}
@@ -66,19 +69,25 @@ through all stages and push to S3.`,
 				}
 			}
 
+			auditDB := openAuditDB(gf)
+			if auditDB != nil {
+				defer auditDB.Close()
+			}
+
 			bcfg := &builder.Config{
 				AutoImportDeps: true,
-				BuildRoot:   cfg.BuildRoot,
-				ManifestDir: cfg.ManifestDir,
-				Bucket:      cfg.Bucket,
-				Region:      cfg.Region,
-				Verbose:     cfg.Verbose,
-				AptRoot:     cfg.AptRoot,
-				GitRoot:     cfg.GitRoot,
-				PypiRoot:    cfg.PypiRoot,
-				BinaryRoot:  cfg.BinaryRoot,
-				Stdout:      buildOut,
-				Logger:      buildLogger,
+				BuildRoot:      cfg.BuildRoot,
+				ManifestDir:    cfg.ManifestDir,
+				Bucket:         cfg.Bucket,
+				Region:         cfg.Region,
+				Verbose:        cfg.Verbose,
+				AptRoot:        cfg.AptRoot,
+				GitRoot:        cfg.GitRoot,
+				PypiRoot:       cfg.PypiRoot,
+				BinaryRoot:     cfg.BinaryRoot,
+				Stdout:         buildOut,
+				Logger:         buildLogger,
+				AuditDB:        auditDB,
 			}
 
 			var allSummaries []*builder.Summary
@@ -139,6 +148,5 @@ through all stages and push to S3.`,
 		},
 	}
 
-	cmd.Flags().StringVar(&entryFilter, "entry", "", "Build only the named entry")
 	return cmd
 }

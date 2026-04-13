@@ -1,0 +1,24 @@
+# Build artifacts
+dist/
+bodega
+*.exe
+
+# Fetched/built artifacts (created by bodega build)
+manifests/
+netbox-*/
+*.db
+/apt-repo/
+/sources/
+/wheels/
+/combined-requirements.txt
+
+# Local config (may contain tokens, bucket names)
+docs-internal/
+
+# OS
+.DS_Store
+*.swp
+
+# IDE
+.idea/
+.vscode/

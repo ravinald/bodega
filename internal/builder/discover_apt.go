@@ -6,9 +6,10 @@ import (
 	"io"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 
-	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // DiscoverAptDeps queries the local apt cache to find dependencies of pkgName.
@@ -152,15 +153,22 @@ func ImportAptDeps(ctx context.Context, store *manifest.Store, parentName string
 			_, _ = fmt.Fprintf(out, "  [apt] %s: already in store, skipping\n", d.Name)
 			continue
 		}
+
+		// Create a * policy entry for the dependency.
 		ve := manifest.VersionEntry{
-			SourceName: d.Name,
-			RequiredBy: []string{d.RequiredBy},
+			Version:           "*",
+			VersionConstraint: manifest.ConstraintAny,
+			SourceName:        d.Name,
+			RequiredBy:        []string{d.RequiredBy},
 		}
 		if err := store.AddVersion(ctx, manifest.TypeApt, d.Name, ve); err != nil {
 			_, _ = fmt.Fprintf(out, "  [apt] WARNING: could not add %s: %v\n", d.Name, err)
 			continue
 		}
 		added++
+
+		// Resolve the concrete version with full metadata.
+		ResolveAndCreateConcreteVersion(ctx, store, d.Name, out)
 
 		// Add dependency graph edge.
 		store.AddEdge(manifest.DepEdge{
@@ -274,7 +282,7 @@ func parseAptShowOutput(output, pkgName string) *manifest.VersionEntry {
 	// Fields we promote to VersionEntry fields rather than Metadata.
 	promoted := map[string]bool{
 		"Package": true, "Version": true, "Description": true,
-		"Architecture": true,
+		"Architecture": true, "Size": true,
 	}
 
 	lines := strings.Split(output, "\n")
@@ -316,6 +324,11 @@ func parseAptShowOutput(output, pkgName string) *manifest.VersionEntry {
 		case "Architecture":
 			ve.Platform = "linux/" + val
 			ve.Metadata[key] = val
+		case "Size":
+			if n, err := strconv.ParseInt(val, 10, 64); err == nil {
+				ve.ArtifactSize = n
+			}
+			ve.Metadata[key] = val
 		case "Description":
 			// First line of description.
 			descLines = []string{val}
@@ -355,9 +368,30 @@ func ResolveAndCreateConcreteVersion(ctx context.Context, store *manifest.Store,
 
 	// Check if this concrete version already exists.
 	if pm, err := store.GetPackage(ctx, manifest.TypeApt, pkgName); err == nil && pm != nil {
-		for _, ve := range pm.Versions {
-			if ve.Version == version {
-				_, _ = fmt.Fprintf(out, "  [apt] %s@%s already exists\n", pkgName, version)
+		for i, existing := range pm.Versions {
+			if existing.Version == version {
+				// Backfill ArtifactSize and Metadata if missing.
+				if existing.ArtifactSize == 0 || len(existing.Metadata) == 0 {
+					fresh := FetchAptMetadata(pkgName)
+					if fresh != nil {
+						if existing.ArtifactSize == 0 && fresh.ArtifactSize > 0 {
+							pm.Versions[i].ArtifactSize = fresh.ArtifactSize
+						}
+						if len(existing.Metadata) == 0 && len(fresh.Metadata) > 0 {
+							pm.Versions[i].Metadata = fresh.Metadata
+						}
+						if existing.Description == "" && fresh.Description != "" {
+							pm.Versions[i].Description = fresh.Description
+						}
+						if existing.Platform == "" && fresh.Platform != "" {
+							pm.Versions[i].Platform = fresh.Platform
+						}
+						_ = store.SavePackage(ctx, pm)
+						_, _ = fmt.Fprintf(out, "  [apt] %s@%s: backfilled metadata\n", pkgName, version)
+					}
+				} else {
+					_, _ = fmt.Fprintf(out, "  [apt] %s@%s already exists\n", pkgName, version)
+				}
 				return
 			}
 		}

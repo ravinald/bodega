@@ -8,8 +8,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/scaleapi/bodega/internal/builder"
-	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/builder"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 func newRepairCmd(gf *globalFlags) *cobra.Command {
@@ -40,6 +40,12 @@ func newRepairCmd(gf *globalFlags) *cobra.Command {
 			}
 
 			ctx := context.Background()
+
+			// Load the dependency graph so ChildrenOf checks work.
+			if err := store.LoadGraph(ctx); err != nil {
+				fmt.Printf("  WARNING: could not load dependency graph: %v\n", err)
+			}
+
 			issues := 0
 
 			// Phase 1: Index consistency.

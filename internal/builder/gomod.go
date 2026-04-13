@@ -10,7 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 const defaultGoProxy = "https://proxy.golang.org"
@@ -98,7 +99,9 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 				proxy = defaultGoProxy
 			}
 
-			base := proxy + "/" + name + "/@v/" + ve.Version
+			// Use pm.Name (original module path with slashes) for the upstream URL,
+			// not the safe name from the index which has slashes replaced with --.
+			base := proxy + "/" + pm.Name + "/@v/" + ve.Version
 
 			var fetchErr error
 			for _, ext := range []string{".info", ".mod", ".zip"} {
@@ -159,6 +162,11 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 			if result.Err != nil {
 				summary.Failures++
 			}
+			goStatus := "success"
+			if result.Err != nil {
+				goStatus = "failure"
+			}
+			cfg.RecordAudit(audit.EventFetch, manifest.TypeGomod, name, ve.Version, goStatus, result.Elapsed, result.Err)
 		}
 	}
 

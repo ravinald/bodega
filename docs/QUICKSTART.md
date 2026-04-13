@@ -4,14 +4,11 @@ This guide walks you through setting up bodega, adding your first packages, and 
 
 ## Prerequisites
 
-- Go 1.24+ (or run `make depend` to install it)
-- AWS credentials configured (via `aws-sso`, IAM role, or environment variables)
-- An S3 bucket for package storage
+- Go 1.22+ (or run `make depend` to install it)
 
 ## 1. Build and install
 
 ```bash
-cd tools/bodega
 make build                    # builds to ./dist/bodega
 sudo make install             # installs to /usr/local/bin/bodega
 ```
@@ -24,110 +21,53 @@ make cross                    # builds ./dist/bodega-linux-amd64
 
 ## 2. Configure
 
-Set your bucket and region:
+bodega works out of the box with local filesystem storage. A config file is created automatically on first run at `~/.config/bodega/config.json`.
 
-```bash
-export REPO_BUCKET=bodega-864617344058
-export AWS_REGION=us-west-2
-```
-
-Or edit the config file (created automatically on first run):
-
-```bash
-sudo vim /etc/bodega/config.json
-```
+For S3-backed storage, set the backend and bucket:
 
 ```json
 {
-  "bucket": "bodega-864617344058",
+  "storage_backend": "s3",
+  "bucket": "my-bodega-bucket",
   "region": "us-west-2"
 }
 ```
 
-## 3. Initialize the S3 bucket
+Then initialize the bucket:
 
 ```bash
 bodega init
 ```
 
-Creates the bucket with encryption, versioning, and public access blocked. Idempotent — safe to run multiple times.
+For local storage, no initialization is needed. Artifacts are stored at `/var/lib/bodega` by default (configurable via `storage_path`).
 
 ## 4. Add packages
 
 ### Git repository
 
 ```bash
-bodega create git \
-  --name netbox \
-  --url https://github.com/netbox-community/netbox \
-  --ref v4.5.7
+bodega pkg create git netbox
+# Prompts for: Source URL, Ref (tag/branch/SHA)
 ```
 
 ### Apt package by name
 
-Bodega discovers and resolves apt packages from your system's apt-cache:
-
 ```bash
-bodega create apt \
-  --name python3
+bodega pkg create apt python3
 ```
 
 Bodega queries apt-cache, resolves the concrete version (e.g. `3.12.3-0ubuntu2.1`), and optionally auto-discovers dependencies.
 
-### Apt package from source (git + build)
+### Other types
 
 ```bash
-bodega create apt \
-  --name amazon-efs-utils \
-  --url https://github.com/aws/efs-utils.git \
-  --build-cmd "make deb" \
-  --deb-glob "build/*.deb"
+bodega pkg create binary awscli-v2       # prompts for URL, SHA256
+bodega pkg create gomod github.com/aws/aws-sdk-go-v2   # prompts for version
+bodega pkg create helm ingress-nginx     # prompts for URL, version
+bodega pkg create npm lodash             # prompts for version
 ```
 
-### Apt package from source (apt-get source)
-
-```bash
-bodega create apt \
-  --name openssh-client \
-  --source-build
-```
-
-Bodega runs `apt-get source` and `dpkg-buildpackage` for supply chain control.
-
-### Binary download
-
-```bash
-bodega create binary \
-  --name awscli-v2 \
-  --url https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
-```
-
-### Go module
-
-```bash
-bodega create gomod \
-  --name github.com/aws/aws-sdk-go-v2 \
-  --ref v1.30.0
-```
-
-### Helm chart
-
-```bash
-bodega create helm \
-  --name ingress-nginx \
-  --url https://kubernetes.github.io/ingress-nginx/charts/ingress-nginx-4.11.0.tgz \
-  --ref 4.11.0
-```
-
-### npm package
-
-```bash
-bodega create npm \
-  --name lodash \
-  --ref 4.17.21
-```
-
-Or run `bodega create <type>` without flags for interactive prompts.
+All fields are prompted interactively. For automation, use `bodega pkg import` with a JSON manifest file. See [USAGE.md](USAGE.md#bodega-pkg-import-file-file) for details.
 
 ## 5. Fetch and upload
 
@@ -142,7 +82,7 @@ Or run individual stages:
 ```bash
 bodega build fetch                       # download sources only
 bodega build fetch git                   # download git sources only
-bodega build fetch git --entry netbox    # download only the netbox entry
+bodega build fetch git netbox            # download only the netbox entry
 bodega build run                         # compile/prepare (cascades fetch if needed)
 bodega build sync                        # push to S3 (cascades all stages)
 ```
@@ -206,7 +146,7 @@ When a dependency like `libssl3` has a security issue or checksum mismatch:
 
 ```bash
 # Hide the bad version from clients (stays in manifest as a record)
-bodega hide apt libssl3
+bodega pkg hide apt libssl3
 
 # Fetch again — bodega skips the hidden version
 bodega build fetch apt
@@ -220,9 +160,9 @@ See [docs/USAGE.md](docs/USAGE.md) for the full supply chain section.
 
 ```bash
 bodega status                  # compare all entries against S3
-bodega verify                  # verify manifest MD5 integrity
-bodega audit --limit 10        # view recent audit events
-bodega checksum list           # view cached checksums
+bodega pkg verify                  # verify manifest MD5 integrity
+bodega audit events --limit 10        # view recent audit events
+bodega pkg checksum list           # view cached checksums
 ```
 
 ## 10. Enable HTTPS
@@ -245,10 +185,27 @@ Edit config to enable upstream proxy caching for gomod, helm, and npm:
 
 With proxy enabled, when a client requests a package not in S3, bodega fetches it from upstream (proxy.golang.org, registry.npmjs.org, etc.), caches it in S3, and serves it. Subsequent requests are served from cache. Checksums are verified automatically.
 
+## 12. Mutation API access
+
+The REST API's create and delete endpoints are restricted to localhost by default. If you need to create or delete entries from another host (e.g., CI), widen the allow-list and generate a token:
+
+```json
+{
+  "admin_permit_cidr": ["127.0.0.0/8", "::1/128", "10.0.0.0/8"]
+}
+```
+
+```bash
+bodega token generate ci-pipeline expiry 90d "CI deploy token"
+# Displays the token once — save it. A hashed copy is stored in the audit DB.
+```
+
+Manage tokens with `bodega token list` and `bodega token revoke`. In the TUI, press `T` to open the token manager. See [USAGE.md](USAGE.md#rest-api) for full details.
+
 ## Next steps
 
 - Set up a systemd service for `bodega serve`
 - Put nginx in front for TLS termination and caching at scale
 - Use the REST API for CI/CD integration (`POST /api/v1/packages/{type}`)
-- Query the audit trail to track package usage (`bodega audit --type fetch`)
+- Query the audit trail to track package usage (`bodega audit events --type fetch`)
 - Read [docs/DESIGN.md](docs/DESIGN.md) for architecture details

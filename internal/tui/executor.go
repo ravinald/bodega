@@ -11,11 +11,14 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/scaleapi/bodega/internal/builder"
-	"github.com/scaleapi/bodega/internal/config"
-	"github.com/scaleapi/bodega/internal/logging"
-	"github.com/scaleapi/bodega/internal/manifest"
-	bos3 "github.com/scaleapi/bodega/internal/s3"
+	"encoding/json"
+
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/builder"
+	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/logging"
+	"github.com/ravinald/bodega/internal/manifest"
+	bos3 "github.com/ravinald/bodega/internal/s3"
 )
 
 // cmdOutputMsg carries the text result of an executed command back to the
@@ -218,20 +221,20 @@ func executeVerify(cfg *config.Config, store *manifest.Store) tea.Cmd {
 
 // executeFreeze toggles the frozen flag for the given entry and returns a
 // tea.Cmd. The store is mutated and saved; refresh=true so the tree rebuilds.
-func executeFreeze(entryType, entryName string, store *manifest.Store) tea.Cmd {
+func executeFreeze(entryType, entryName string, store *manifest.Store, auditDB *audit.DB) tea.Cmd {
 	return func() tea.Msg {
 		var buf bytes.Buffer
-		err := runFreeze(&buf, store, entryType, entryName)
+		err := runFreeze(&buf, store, entryType, entryName, auditDB)
 		return cmdOutputMsg{output: buf.String(), refresh: err == nil, err: err}
 	}
 }
 
 // executeDelete removes the named entry from the manifest and returns a
 // tea.Cmd. refresh=true causes the sources tree to rebuild.
-func executeDelete(entryType, entryName string, store *manifest.Store, s3client *bos3.Client, cfg *config.Config) tea.Cmd {
+func executeDelete(entryType, entryName string, store *manifest.Store, s3client *bos3.Client, cfg *config.Config, auditDB *audit.DB) tea.Cmd {
 	return func() tea.Msg {
 		var buf bytes.Buffer
-		err := runDelete(&buf, cfg, store, s3client, entryType, entryName)
+		err := runDelete(&buf, cfg, store, s3client, entryType, entryName, auditDB)
 		return cmdOutputMsg{output: buf.String(), refresh: err == nil, err: err}
 	}
 }
@@ -332,7 +335,7 @@ func runInit(buf *bytes.Buffer, cfg *config.Config, s3client *bos3.Client) error
 	return bos3.InitBucket(context.Background(), s3client.S3Client(), cfg.Bucket, cfg.Region)
 }
 
-func runDelete(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, s3client *bos3.Client, entryType, name string) error {
+func runDelete(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, s3client *bos3.Client, entryType, name string, auditDB *audit.DB) error {
 	_ = cfg
 	if !isValidType(entryType) {
 		return fmt.Errorf("unknown type %q", entryType)
@@ -345,6 +348,15 @@ func runDelete(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, s3c
 	if frozen {
 		return fmt.Errorf("entry %s/%s is frozen — unfreeze first", entryType, name)
 	}
+
+	// Capture before state for audit.
+	var beforeJSON []byte
+	if auditDB != nil {
+		if pm, err := store.GetPackage(ctx, entryType, name); err == nil && pm != nil {
+			beforeJSON, _ = json.MarshalIndent(pm, "", "  ")
+		}
+	}
+
 	if err := store.DeletePackage(ctx, entryType, name); err != nil {
 		return err
 	}
@@ -352,6 +364,16 @@ func runDelete(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, s3c
 		fmt.Fprintf(buf, "WARNING: could not save index: %v\n", err)
 	}
 	fmt.Fprintf(buf, "Removed %s/%s from manifest.\n", entryType, name)
+
+	if auditDB != nil {
+		_ = auditDB.Record(ctx, audit.Event{
+			EventType: audit.EventDelete,
+			PkgType:   entryType,
+			PkgName:   name,
+			Status:    "success",
+			Details:   audit.FormatDiff(beforeJSON, nil),
+		})
+	}
 	return nil
 }
 
@@ -374,7 +396,7 @@ func runRemove(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, s3c
 	return nil
 }
 
-func runFreeze(buf *bytes.Buffer, store *manifest.Store, entryType, name string) error {
+func runFreeze(buf *bytes.Buffer, store *manifest.Store, entryType, name string, auditDB *audit.DB) error {
 	if !isValidType(entryType) {
 		return fmt.Errorf("unknown type %q", entryType)
 	}
@@ -386,8 +408,10 @@ func runFreeze(buf *bytes.Buffer, store *manifest.Store, entryType, name string)
 	if pm == nil {
 		return fmt.Errorf("%s entry %q not found", entryType, name)
 	}
+
+	beforeJSON, _ := json.MarshalIndent(pm, "", "  ")
+
 	// Toggle Frozen on all versions.
-	// Determine new state: if all frozen, unfreeze; otherwise freeze all.
 	allFrozen := true
 	for _, ve := range pm.Versions {
 		if !ve.Frozen {
@@ -403,6 +427,17 @@ func runFreeze(buf *bytes.Buffer, store *manifest.Store, entryType, name string)
 		return err
 	}
 	printFreezeResult(buf, entryType, name, newState)
+
+	if auditDB != nil {
+		afterJSON, _ := json.MarshalIndent(pm, "", "  ")
+		_ = auditDB.Record(ctx, audit.Event{
+			EventType: audit.EventFreeze,
+			PkgType:   entryType,
+			PkgName:   name,
+			Status:    "success",
+			Details:   audit.FormatDiff(beforeJSON, afterJSON),
+		})
+	}
 	return nil
 }
 

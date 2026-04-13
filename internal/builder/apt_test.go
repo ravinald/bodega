@@ -8,7 +8,7 @@ func TestExtractGPGKeyID(t *testing.T) {
 	// Sample output from gpg --list-keys --keyid-format long
 	sample := `pub   rsa4096/ABCDEF1234567890 2025-01-01 [SC]
       DEADBEEFDEADBEEFDEADBEEFDEADBEEF12345678
-uid           [ultimate] Scale Bootstrap Repo <infra@scale.com>
+uid           [ultimate] Bodega Package Signing <bodega@localhost>
 `
 	got := extractGPGKeyID(sample)
 	if got != "ABCDEF1234567890" {

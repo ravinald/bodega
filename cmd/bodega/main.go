@@ -12,14 +12,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 
 	"github.com/spf13/cobra"
 
-	"github.com/scaleapi/bodega/internal/config"
-	"github.com/scaleapi/bodega/internal/manifest"
-	bos3 "github.com/scaleapi/bodega/internal/s3"
-	"github.com/scaleapi/bodega/internal/server"
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/manifest"
+	bos3 "github.com/ravinald/bodega/internal/s3"
+	"github.com/ravinald/bodega/internal/server"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 // version is set at build time via -ldflags "-X main.version=..."
@@ -44,7 +47,9 @@ func main() {
 	} else if path != "" {
 		fc, _ := os.ReadFile(path)
 		if len(fc) > 0 {
-			var check struct{ Bucket string `json:"bucket"` }
+			var check struct {
+				Bucket string `json:"bucket"`
+			}
 			if json.Unmarshal(fc, &check) == nil && check.Bucket == "" {
 				_, _ = fmt.Fprintf(os.Stderr, "Config file created: %s\n", path)
 				_, _ = fmt.Fprintf(os.Stderr, "Edit it to set your bucket and region.\n\n")
@@ -131,6 +136,8 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 	}
 	pkgParent.AddCommand(
 		newCreateCmd(gf),
+		newImportCmd(gf),
+		newExportCmd(gf),
 		newDeleteCmd(gf),
 		newRemoveCmd(gf),
 		newFreezeCmd(gf),
@@ -155,6 +162,7 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 		buildParent,
 		pkgParent,
 		auditParent,
+		newTokenCmd(gf),
 		newShowCmd(gf),
 		newDashboardCmd(gf),
 		newInitCmd(gf),
@@ -204,20 +212,20 @@ func loadStore(gf *globalFlags) (*manifest.Store, error) {
 	if cfg.LocalConfig {
 		store = manifest.NewLocalStore(cfg.ManifestDir)
 	} else {
-		// S3 backend — need bucket
+		// Object storage backend — need bucket for S3
 		if err := requireBucket(cfg); err != nil {
 			return nil, err
 		}
-		s3client, err := newS3Client(cfg)
+		objStore, err := newObjStore(cfg)
 		if err != nil {
 			return nil, err
 		}
 		backend := &manifest.S3Backend{
 			Prefix:   "manifests/",
-			GetFn:    s3client.GetObject,
-			PutFn:    s3client.PutBytes,
-			DeleteFn: s3client.DeleteObject,
-			ListFn:   s3client.ListPrefix,
+			GetFn:    objStore.Get,
+			PutFn:    objStore.Put,
+			DeleteFn: objStore.Delete,
+			ListFn:   objStore.List,
 			Label_:   fmt.Sprintf("s3://%s/manifests/", cfg.Bucket),
 		}
 		store = manifest.NewStore(backend)
@@ -227,6 +235,36 @@ func loadStore(gf *globalFlags) (*manifest.Store, error) {
 		return nil, fmt.Errorf("load index: %w", err)
 	}
 	return store, nil
+}
+
+// openAuditDB opens the audit database from config, configures timezone and
+// event filtering, and returns it. Returns nil (not an error) if the audit DB
+// path is empty or the DB cannot be opened -- audit is best-effort.
+func openAuditDB(gf *globalFlags) *audit.DB {
+	cfg, err := loadConfig(gf)
+	if err != nil {
+		return nil
+	}
+	dbPath := cfg.AuditDB
+	if dbPath == "" {
+		if cfg.LogDir != "" {
+			dbPath = filepath.Join(cfg.LogDir, "audit.db")
+		} else {
+			return nil
+		}
+	}
+	db, err := audit.Open(dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not open audit db: %v\n", err)
+		return nil
+	}
+	if cfg.Timezone != "" {
+		db.SetTimezone(cfg.Timezone)
+	}
+	if len(cfg.AuditEvents) > 0 {
+		db.SetEventFilter(cfg.AuditEvents)
+	}
+	return db
 }
 
 // notifyServer sends SIGHUP to the running bodega serve process (if any)
@@ -302,7 +340,19 @@ func backgroundCtx() context.Context {
 	return context.Background()
 }
 
-// newS3Client creates an S3 client from the resolved config.
+// newObjStore creates an ObjectStore from the resolved config.
+func newObjStore(cfg *config.Config) (storage.ObjectStore, error) {
+	ctx := backgroundCtx()
+	objStore, err := storage.New(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("connect to storage: %w", err)
+	}
+	return objStore, nil
+}
+
+// newS3Client creates a direct S3 client from the resolved config. This is
+// retained for callers that require the concrete *bos3.Client type (e.g.
+// the TUI, which has not yet been migrated to the storage abstraction).
 func newS3Client(cfg *config.Config) (*bos3.Client, error) {
 	ctx := backgroundCtx()
 	client, err := bos3.NewClient(ctx, cfg.Bucket, cfg.Region)

@@ -5,27 +5,34 @@
 package server
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	cryptoRand "crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
-	"path"
-	"strings"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/scaleapi/bodega/internal/audit"
-	"github.com/scaleapi/bodega/internal/config"
-	"github.com/scaleapi/bodega/internal/manifest"
-	bos3 "github.com/scaleapi/bodega/internal/s3"
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 // contentTypes maps file extensions to MIME types for proxied responses.
@@ -48,56 +55,40 @@ var contentTypes = map[string]string{
 	".info":   "application/json",
 }
 
-// s3Getter is the subset of S3 operations the server requires.
-// The concrete *bos3.Client satisfies this interface.
-type s3Getter interface {
-	GetObjectStream(ctx context.Context, key string) (*bos3.StreamResult, error)
-	ListPrefix(ctx context.Context, prefix string) ([]string, error)
-	HeadObject(ctx context.Context, key string) (*bos3.ObjectStatus, error)
-}
-
 // Server is the bodega HTTP package server.
 type Server struct {
-	cfg      *config.Config
-	store    *manifest.Store
-	s3       s3Getter
-	mux      *http.ServeMux
-	addr     string
-	logger   *slog.Logger
-	cache    CacheConfig
-	auditDB  *audit.DB
-	denyNets []*net.IPNet
-	mu       sync.Mutex // protects store mutations (CRUD API)
+	cfg       *config.Config
+	store     *manifest.Store
+	objects   storage.ObjectStore
+	mux       *http.ServeMux
+	addr      string
+	logger    *slog.Logger
+	cache     CacheConfig
+	auditDB   *audit.DB
+	denyNets  []*net.IPNet
+	adminNets []*net.IPNet // CIDRs allowed to hit mutation API (admin_permit_cidr)
+	pepper    string       // pepper for token hash verification
+	mu        sync.Mutex   // protects store mutations (CRUD API)
 }
 
 // New constructs a Server and registers all routes.
 // s3client may be nil — S3-backed endpoints return 503 in that case.
 // logger may be nil — a no-op logger is used in that case.
-func New(cfg *config.Config, store *manifest.Store, s3client *bos3.Client, addr string, logger *slog.Logger) *Server {
-	var s3g s3Getter
-	if s3client != nil {
-		s3g = s3client
-	}
-	return newServer(cfg, store, s3g, addr, logger)
+func New(cfg *config.Config, store *manifest.Store, objects storage.ObjectStore, addr string, logger *slog.Logger) *Server {
+	return newServer(cfg, store, objects, addr, logger)
 }
 
-// NewWithS3Getter is like New but accepts the s3Getter interface directly.
-// Used by tests that provide a mock S3 implementation.
-func NewWithS3Getter(cfg *config.Config, store *manifest.Store, s3 s3Getter, addr string, logger *slog.Logger) *Server {
-	return newServer(cfg, store, s3, addr, logger)
-}
-
-func newServer(cfg *config.Config, store *manifest.Store, s3 s3Getter, addr string, logger *slog.Logger) *Server {
+func newServer(cfg *config.Config, store *manifest.Store, objects storage.ObjectStore, addr string, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	s := &Server{
-		cfg:    cfg,
-		store:  store,
-		s3:     s3,
-		mux:    http.NewServeMux(),
-		addr:   addr,
-		logger: logger,
+		cfg:     cfg,
+		store:   store,
+		objects: objects,
+		mux:     http.NewServeMux(),
+		addr:    addr,
+		logger:  logger,
 	}
 	// Wire proxy/cache config.
 	ttl, _ := time.ParseDuration(cfg.MetadataTTL)
@@ -117,6 +108,29 @@ func newServer(cfg *config.Config, store *manifest.Store, s3 s3Getter, addr stri
 			logger.Info("deny list loaded", "entries", len(nets))
 		}
 	}
+	// Parse admin permit CIDRs for mutation API access control.
+	if len(cfg.AdminPermitCIDR) > 0 {
+		nets, err := ParseDenyList(cfg.AdminPermitCIDR)
+		if err != nil {
+			logger.Error("invalid admin_permit_cidr entry", "error", err)
+		} else {
+			s.adminNets = nets
+			logger.Info("admin permit CIDRs loaded", "entries", len(nets))
+		}
+	}
+	// Load or create pepper for token auth.
+	pepperExisted := false
+	if _, err := audit.LoadPepper(audit.DefaultPepperPaths); err == nil {
+		pepperExisted = true
+	}
+	if pepper, err := audit.LoadOrCreatePepper(audit.DefaultPepperPaths); err == nil {
+		s.pepper = pepper
+		if !pepperExisted {
+			logger.Info("pepper file created (first run)")
+		}
+	} else {
+		logger.Error("could not load or create pepper file — token auth will not work", "error", err)
+	}
 	s.registerRoutes()
 	return s
 }
@@ -131,9 +145,11 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) handler() http.Handler {
 	var h http.Handler = s.mux
 	h = AuditMiddleware(s.auditDB)(h)
+	h = MutationAuthMiddleware(s.adminNets, s.auditDB, s.pepper, s.logger)(h)
 	h = DenyListMiddleware(s.denyNets)(h)
 	h = RequestLogger(s.logger)(h)
 	h = RealIPMiddleware(nil)(h)
+	h = SecurityHeadersMiddleware(h)
 	return h
 }
 
@@ -142,11 +158,18 @@ func (s *Server) handler() http.Handler {
 // seconds to complete.
 func (s *Server) Start(ctx context.Context) error {
 	srv := &http.Server{
-		Addr:         s.addr,
-		Handler:      s.handler(),
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 5 * time.Minute, // generous for large file transfers
-		IdleTimeout:  120 * time.Second,
+		Addr:              s.addr,
+		Handler:           s.handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      5 * time.Minute, // generous for large file transfers
+		IdleTimeout:       120 * time.Second,
+	}
+
+	// Reject misconfigured autocert — the flag is accepted but not yet
+	// implemented, so starting silently in plain HTTP would be a security hazard.
+	if s.cfg.TLSAutocert && s.cfg.TLSCert == "" && s.cfg.TLSKey == "" {
+		return fmt.Errorf("tls_autocert is enabled but not yet implemented; provide tls_cert and tls_key instead")
 	}
 
 	// Configure TLS if cert/key are provided.
@@ -157,7 +180,7 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 		srv.TLSConfig = &tls.Config{
 			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
+			MinVersion:   tls.VersionTLS13,
 		}
 	}
 
@@ -225,17 +248,17 @@ func (s *Server) registerRoutes() {
 	// Health probe
 	m.HandleFunc("GET /healthz", s.handleHealthz)
 
-	// APT repository
-	m.HandleFunc("GET /apt/gpg-key.asc", s.handleAptProxy)
-	m.HandleFunc("GET /apt/dists/{path...}", s.handleAptProxy)
-	m.HandleFunc("GET /apt/pool/{path...}", s.handleAptProxy)
+	// APT repository — dynamic index generation
+	m.HandleFunc("GET /apt/gpg-key.asc", s.handleAptGPGKey)
+	m.HandleFunc("GET /apt/dists/{distpath...}", s.handleAptDists)
+	m.HandleFunc("GET /apt/pool/{path...}", s.handleAptPool)
 
 	// PyPI simple index (PEP 503)
 	m.HandleFunc("GET /pypi/simple/", s.handlePypiIndex)
 	m.HandleFunc("GET /pypi/simple/{package}/", s.handlePypiPackage)
 
-	// PyPI wheels
-	m.HandleFunc("GET /pypi/wheels/{file}", s.handlePypiWheel)
+	// PyPI wheels (path... to support versioned subdirs like pypi/wheels/0.4.6/foo.whl)
+	m.HandleFunc("GET /pypi/wheels/{path...}", s.handlePypiWheel)
 
 	// Git bundles
 	m.HandleFunc("GET /git/{name}/{file}", s.handleGitBundle)
@@ -264,6 +287,38 @@ func (s *Server) registerRoutes() {
 	// Mutation API
 	m.HandleFunc("POST /api/v1/packages/{type}", s.handleCreateEntry)
 	m.HandleFunc("DELETE /api/v1/packages/{type}/{name}", s.handleDeleteEntry)
+	m.HandleFunc("PATCH /api/v1/packages/{type}/{name}/hide", s.handleToggleHidden)
+	m.HandleFunc("PATCH /api/v1/packages/{type}/{name}/hide/{version}", s.handleToggleHidden)
+	m.HandleFunc("PATCH /api/v1/packages/{type}/{name}/freeze", s.handleToggleFreeze)
+	m.HandleFunc("PATCH /api/v1/packages/{type}/{name}/freeze/{version}", s.handleToggleFreeze)
+
+	// Audit query
+	m.HandleFunc("GET /api/v1/audit", s.handleAPIAudit)
+
+	// Token management (mutation-gated)
+	m.HandleFunc("GET /api/v1/tokens", s.handleListTokens)
+	m.HandleFunc("POST /api/v1/tokens", s.handleCreateToken)
+	m.HandleFunc("DELETE /api/v1/tokens/{id}", s.handleRevokeToken)
+}
+
+// isAdminRequest checks whether the request originates from an IP in
+// admin_permit_cidr. Used to gate sensitive read endpoints (audit, tokens,
+// config) that don't go through the mutation middleware.
+func (s *Server) isAdminRequest(r *http.Request) bool {
+	// If no admin CIDRs are configured, allow all (no restriction).
+	if len(s.adminNets) == 0 {
+		return true
+	}
+	clientIP := net.ParseIP(ClientIP(r))
+	if clientIP == nil {
+		return false
+	}
+	for _, n := range s.adminNets {
+		if n.Contains(clientIP) {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- Health ----------------------------------------------------------------
@@ -274,20 +329,366 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.WriteString(w, "ok\n")
 }
 
-// ---- APT proxy -------------------------------------------------------------
+// ---- APT repository (dynamic index generation) ----------------------------
 
-// handleAptProxy proxies /apt/... to S3 packages/apt/...
-// e.g. /apt/dists/noble/Release → s3://bucket/packages/apt/dists/noble/Release
-func (s *Server) handleAptProxy(w http.ResponseWriter, r *http.Request) {
-	// r.URL.Path is e.g. "/apt/dists/noble/Release"
-	// Strip leading "/" and prepend "packages" to get "packages/apt/dists/noble/Release"
-	key := "packages" + r.URL.Path
+// handleAptGPGKey proxies the GPG public key from S3.
+func (s *Server) handleAptGPGKey(w http.ResponseWriter, r *http.Request) {
+	s.proxyS3(w, r, "packages/apt/gpg-key.asc")
+}
+
+// handleAptPool proxies .deb files from S3 pool/main/...
+func (s *Server) handleAptPool(w http.ResponseWriter, r *http.Request) {
+	p := r.PathValue("path")
+	if !isSafePath(p) {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+	key := "packages/apt/pool/" + p
+	setCacheImmutable(w, path.Base(p))
 	s.proxyS3(w, r, key)
+}
+
+// handleAptDists routes /apt/dists/{distpath...} to the appropriate handler
+// based on the path structure. Go's ServeMux doesn't support mid-segment
+// wildcards like "binary-{arch}", so we parse the path here.
+func (s *Server) handleAptDists(w http.ResponseWriter, r *http.Request) {
+	distpath := r.PathValue("distpath")
+	parts := strings.Split(distpath, "/")
+
+	// <codename>/Release or <codename>/InRelease
+	if len(parts) == 2 && (parts[1] == "Release" || parts[1] == "InRelease") {
+		s.handleAptRelease(w, r, parts[0])
+		return
+	}
+
+	// <codename>/<component>/binary-<arch>/Packages[.gz]
+	if len(parts) == 4 && strings.HasPrefix(parts[2], "binary-") {
+		codename := parts[0]
+		component := parts[1]
+		arch := strings.TrimPrefix(parts[2], "binary-")
+		file := parts[3]
+		switch file {
+		case "Packages":
+			s.handleAptPackages(w, r, codename, component, arch)
+			return
+		case "Packages.gz":
+			s.handleAptPackagesGz(w, r, codename, component, arch)
+			return
+		}
+	}
+
+	http.NotFound(w, r)
+}
+
+// handleAptRelease generates a Debian Release file from the manifest store.
+func (s *Server) handleAptRelease(w http.ResponseWriter, r *http.Request, codename string) {
+	if codename != s.cfg.AptCodename {
+		http.NotFound(w, r)
+		return
+	}
+
+	ctx := r.Context()
+	debKeys, err := s.aptPoolKeys(ctx)
+	if err != nil {
+		s.logger.Error("apt release: list pool keys", "error", err)
+		http.Error(w, "upstream error", http.StatusBadGateway)
+		return
+	}
+
+	// Collect unique architectures from manifest metadata.
+	arches := s.aptArchitectures(ctx)
+	if len(arches) == 0 {
+		arches = []string{"amd64"}
+	}
+
+	// Generate Packages content for each arch to compute checksums.
+	type indexEntry struct {
+		path string
+		data []byte
+	}
+	var entries []indexEntry
+	for _, arch := range arches {
+		pkgData := s.generateAptPackages(ctx, arch, debKeys)
+		entries = append(entries, indexEntry{
+			path: "main/binary-" + arch + "/Packages",
+			data: pkgData,
+		})
+		// Gzip variant.
+		var gz bytes.Buffer
+		gw := gzip.NewWriter(&gz)
+		_, _ = gw.Write(pkgData)
+		_ = gw.Close()
+		entries = append(entries, indexEntry{
+			path: "main/binary-" + arch + "/Packages.gz",
+			data: gz.Bytes(),
+		})
+	}
+
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "Origin: bodega\n")
+	fmt.Fprintf(&buf, "Label: bodega\n")
+	fmt.Fprintf(&buf, "Codename: %s\n", codename)
+	fmt.Fprintf(&buf, "Components: main\n")
+	fmt.Fprintf(&buf, "Architectures: %s\n", strings.Join(arches, " "))
+	now := time.Now().UTC().Add(-24 * time.Hour) // backdate to tolerate client clock skew
+	fmt.Fprintf(&buf, "Date: %s\n", now.Format(time.RFC1123Z))
+	fmt.Fprintf(&buf, "Valid-Until: %s\n", now.Add(7*24*time.Hour).Format(time.RFC1123Z))
+	fmt.Fprintf(&buf, "SHA256:\n")
+	for _, e := range entries {
+		h := sha256.Sum256(e.data)
+		fmt.Fprintf(&buf, " %s %d %s\n", hex.EncodeToString(h[:]), len(e.data), e.path)
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(buf.Bytes())
+}
+
+// handleAptPackages generates a Debian Packages index for a specific architecture.
+func (s *Server) handleAptPackages(w http.ResponseWriter, r *http.Request, codename, component, arch string) {
+	if codename != s.cfg.AptCodename || component != "main" {
+		http.NotFound(w, r)
+		return
+	}
+
+	ctx := r.Context()
+	debKeys, err := s.aptPoolKeys(ctx)
+	if err != nil {
+		s.logger.Error("apt packages: list pool keys", "error", err)
+		http.Error(w, "upstream error", http.StatusBadGateway)
+		return
+	}
+
+	data := s.generateAptPackages(ctx, arch, debKeys)
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+// handleAptPackagesGz serves the gzip-compressed Packages index.
+func (s *Server) handleAptPackagesGz(w http.ResponseWriter, r *http.Request, codename, component, arch string) {
+	if codename != s.cfg.AptCodename || component != "main" {
+		http.NotFound(w, r)
+		return
+	}
+
+	ctx := r.Context()
+	debKeys, err := s.aptPoolKeys(ctx)
+	if err != nil {
+		s.logger.Error("apt packages.gz: list pool keys", "error", err)
+		http.Error(w, "upstream error", http.StatusBadGateway)
+		return
+	}
+
+	data := s.generateAptPackages(ctx, arch, debKeys)
+	var gz bytes.Buffer
+	gw := gzip.NewWriter(&gz)
+	_, _ = gw.Write(data)
+	_ = gw.Close()
+
+	w.Header().Set("Content-Type", "application/gzip")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(gz.Bytes())
+}
+
+// aptPoolKeys returns all S3 keys under the apt pool prefix.
+func (s *Server) aptPoolKeys(ctx context.Context) ([]string, error) {
+	if s.objects == nil {
+		return nil, nil
+	}
+	return s.objects.List(ctx, "packages/apt/pool/")
+}
+
+// aptArchitectures returns sorted unique architectures from all apt manifest entries.
+func (s *Server) aptArchitectures(ctx context.Context) []string {
+	seen := map[string]bool{}
+	for _, name := range s.store.ListPackages(manifest.TypeApt) {
+		pm, _ := s.store.GetPackage(ctx, manifest.TypeApt, name)
+		if pm == nil {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			if ve.Hidden || ve.Version == "*" {
+				continue
+			}
+			if arch := ve.Metadata["Architecture"]; arch != "" && arch != "all" {
+				seen[arch] = true
+			}
+		}
+	}
+	var arches []string
+	for a := range seen {
+		arches = append(arches, a)
+	}
+	sort.Strings(arches)
+	return arches
+}
+
+// generateAptPackages builds a Debian Packages file for the given architecture
+// from manifest metadata and the S3 pool key listing.
+func (s *Server) generateAptPackages(ctx context.Context, arch string, debKeys []string) []byte {
+	// Build a map of source-name+version → S3 pool key for Filename lookup.
+	poolMap := make(map[string]string) // "pkgname_version" → relative pool path
+	for _, key := range debKeys {
+		filename := path.Base(key)
+		if !strings.HasSuffix(filename, ".deb") {
+			continue
+		}
+		// Key is like "packages/apt/pool/main/a/amazon-efs-utils/amazon-efs-utils_2.4.2_amd64.deb"
+		// We want the relative path after "packages/apt/" for the Filename field.
+		relPath := strings.TrimPrefix(key, "packages/apt/")
+		// Index by base filename for matching.
+		poolMap[filename] = relPath
+	}
+
+	var buf bytes.Buffer
+	for _, name := range s.store.ListPackages(manifest.TypeApt) {
+		pm, _ := s.store.GetPackage(ctx, manifest.TypeApt, name)
+		if pm == nil || isPackageHidden(pm) {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			if ve.Hidden || ve.Version == "*" {
+				continue
+			}
+			veArch := ve.Metadata["Architecture"]
+			if veArch == "" {
+				continue
+			}
+			// Include if arch matches request or package is arch "all".
+			if veArch != arch && veArch != "all" {
+				continue
+			}
+
+			pkgName := ve.SourceName
+			if pkgName == "" {
+				pkgName = pm.Name
+			}
+
+			// Determine the pool path: prefer stored _pool_path, fall back to S3 lookup.
+			poolPath := ve.Metadata["_pool_path"]
+			if poolPath == "" {
+				poolPath = s.findDebInPool(poolMap, pkgName, ve.Version, veArch)
+			}
+			if poolPath == "" {
+				continue // no .deb uploaded yet
+			}
+
+			// If we have the raw control data extracted from the .deb, emit it
+			// verbatim with Filename/Size/hashes appended. This produces output
+			// identical to a real repository.
+			if control := ve.Metadata["_control"]; control != "" {
+				buf.WriteString(control)
+				buf.WriteString("\n")
+				fmt.Fprintf(&buf, "Filename: %s\n", poolPath)
+				if ve.ArtifactSize > 0 {
+					fmt.Fprintf(&buf, "Size: %d\n", ve.ArtifactSize)
+				}
+				if md5 := ve.Metadata["_md5"]; md5 != "" {
+					fmt.Fprintf(&buf, "MD5sum: %s\n", md5)
+				}
+				if sha1 := ve.Metadata["_sha1"]; sha1 != "" {
+					fmt.Fprintf(&buf, "SHA1: %s\n", sha1)
+				}
+				if sha256 := ve.Metadata["_sha256"]; sha256 != "" {
+					fmt.Fprintf(&buf, "SHA256: %s\n", sha256)
+				}
+				buf.WriteString("\n")
+				continue
+			}
+
+			// Fallback: build stanza from manifest metadata fields.
+			writeDebField(&buf, "Package", pkgName)
+			writeDebField(&buf, "Version", ve.Version)
+			writeDebField(&buf, "Architecture", veArch)
+			writeDebField(&buf, "Maintainer", ve.Metadata["Maintainer"])
+			writeDebField(&buf, "Installed-Size", ve.Metadata["Installed-Size"])
+			if dep := ve.Metadata["Pre-Depends"]; dep != "" {
+				writeDebField(&buf, "Pre-Depends", dep)
+			}
+			if dep := ve.Metadata["Depends"]; dep != "" {
+				writeDebField(&buf, "Depends", dep)
+			}
+			writeDebField(&buf, "Section", ve.Metadata["Section"])
+			writeDebField(&buf, "Priority", ve.Metadata["Priority"])
+			writeDebField(&buf, "Filename", poolPath)
+			if ve.ArtifactSize > 0 {
+				fmt.Fprintf(&buf, "Size: %d\n", ve.ArtifactSize)
+			}
+			if ve.Checksum != nil && ve.Checksum.Algorithm == "sha256" {
+				writeDebField(&buf, "SHA256", ve.Checksum.Value)
+			}
+			desc := ve.Description
+			if desc == "" {
+				desc = pm.Description
+			}
+			if desc != "" {
+				writeDebField(&buf, "Description", desc)
+				if full := ve.Metadata["Description-Full"]; full != "" {
+					for _, line := range strings.Split(full, "\n") {
+						line = strings.TrimRight(line, "\r")
+						if line == "" {
+							buf.WriteString(" .\n")
+						} else {
+							buf.WriteString(" " + line + "\n")
+						}
+					}
+				}
+			}
+			buf.WriteString("\n")
+		}
+	}
+	return buf.Bytes()
+}
+
+// findDebInPool searches the pool map for a .deb matching the given package name,
+// version, and architecture.
+func (s *Server) findDebInPool(poolMap map[string]string, pkgName, version, arch string) string {
+	// Try the standard Debian naming convention first.
+	candidate := pkgName + "_" + version + "_" + arch + ".deb"
+	if rel, ok := poolMap[candidate]; ok {
+		return rel
+	}
+	// Fallback: scan all pool entries for a match containing name and version.
+	prefix := pkgName + "_" + version
+	for filename, rel := range poolMap {
+		if strings.HasPrefix(filename, prefix) {
+			return rel
+		}
+	}
+	return ""
+}
+
+// writeDebField writes a single "Key: Value" line to buf, sanitizing val to
+// prevent field injection via embedded newlines.
+func writeDebField(buf *bytes.Buffer, key, val string) {
+	if val == "" {
+		return
+	}
+	// Strip newlines and carriage returns to prevent field injection.
+	val = strings.ReplaceAll(val, "\n", " ")
+	val = strings.ReplaceAll(val, "\r", "")
+	fmt.Fprintf(buf, "%s: %s\n", key, val)
+}
+
+// isSafePath rejects path values that contain traversal sequences or encoded
+// traversal attempts. Use on any {path...} wildcard before constructing S3 keys.
+func isSafePath(p string) bool {
+	if strings.Contains(p, "..") {
+		return false
+	}
+	if strings.Contains(p, "%2e") || strings.Contains(p, "%2E") {
+		return false
+	}
+	return p != ""
 }
 
 // requireS3 returns true if S3 is available. If not, it writes a 503 and returns false.
 func (s *Server) requireS3(w http.ResponseWriter) bool {
-	if s.s3 == nil {
+	if s.objects == nil {
 		http.Error(w, "S3 backend not configured — package serving unavailable", http.StatusServiceUnavailable)
 		return false
 	}
@@ -302,9 +703,10 @@ func (s *Server) handlePypiIndex(w http.ResponseWriter, r *http.Request) {
 	if !s.requireS3(w) {
 		return
 	}
-	keys, err := s.s3.ListPrefix(r.Context(), "pypi/wheels/")
+	keys, err := s.objects.List(r.Context(), "pypi/wheels/")
 	if err != nil {
-		http.Error(w, fmt.Sprintf("list wheels: %v", err), http.StatusBadGateway)
+		s.logger.Error("list wheels failed", "error", err)
+		http.Error(w, "upstream error", http.StatusBadGateway)
 		return
 	}
 
@@ -323,7 +725,7 @@ func (s *Server) handlePypiIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = fmt.Fprintf(w, "<!DOCTYPE html>\n<html>\n  <head><title>Simple Index</title></head>\n  <body>\n")
 	for _, n := range visible {
-		_, _ = fmt.Fprintf(w, "    <a href=\"/pypi/simple/%s/\">%s</a>\n", n, n)
+		_, _ = fmt.Fprintf(w, "    <a href=\"/pypi/simple/%s/\">%s</a>\n", html.EscapeString(n), html.EscapeString(n))
 	}
 	_, _ = fmt.Fprintf(w, "  </body>\n</html>\n")
 }
@@ -341,15 +743,20 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 	}
 	normalized := normalizePkgName(pkgName)
 
-	keys, err := s.s3.ListPrefix(r.Context(), "pypi/wheels/")
+	keys, err := s.objects.List(r.Context(), "pypi/wheels/")
 	if err != nil {
-		http.Error(w, fmt.Sprintf("list wheels: %v", err), http.StatusBadGateway)
+		s.logger.Error("list wheels failed", "error", err)
+		http.Error(w, "upstream error", http.StatusBadGateway)
 		return
 	}
 
-	// Collect matching wheel filenames before writing any output so we can
-	// return a 404 if the package is unknown (PEP 503 requirement).
-	var wheels []string
+	// Collect matching wheel paths. We keep the path relative to "pypi/wheels/"
+	// so links work with versioned subdirs (e.g. "0.4.6/boto3-1.35.0-py3-none-any.whl").
+	type wheelEntry struct {
+		relPath  string // relative to pypi/wheels/, e.g. "0.4.6/boto3-1.35.0.whl"
+		filename string // base filename for display
+	}
+	var wheels []wheelEntry
 	for _, key := range keys {
 		filename := path.Base(key)
 		if !strings.HasSuffix(filename, ".whl") {
@@ -359,7 +766,8 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 		if normalizePkgName(dist) != normalized {
 			continue
 		}
-		wheels = append(wheels, filename)
+		relPath := strings.TrimPrefix(key, "pypi/wheels/")
+		wheels = append(wheels, wheelEntry{relPath: relPath, filename: filename})
 	}
 
 	if len(wheels) == 0 {
@@ -376,19 +784,26 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = fmt.Fprintf(w, "<!DOCTYPE html>\n<html>\n  <head><title>Links for %s</title></head>\n  <body>\n", pkgName)
-	_, _ = fmt.Fprintf(w, "    <h1>Links for %s</h1>\n", pkgName)
-	for _, filename := range wheels {
-		_, _ = fmt.Fprintf(w, "    <a href=\"/pypi/wheels/%s\">%s</a>\n", filename, filename)
+	escapedName := html.EscapeString(pkgName)
+	_, _ = fmt.Fprintf(w, "<!DOCTYPE html>\n<html>\n  <head><title>Links for %s</title></head>\n  <body>\n", escapedName)
+	_, _ = fmt.Fprintf(w, "    <h1>Links for %s</h1>\n", escapedName)
+	for _, whl := range wheels {
+		_, _ = fmt.Fprintf(w, "    <a href=\"/pypi/wheels/%s\">%s</a>\n", html.EscapeString(whl.relPath), html.EscapeString(whl.filename))
 	}
 	_, _ = fmt.Fprintf(w, "  </body>\n</html>\n")
 }
 
-// handlePypiWheel proxies /pypi/wheels/{file} → S3 pypi/wheels/{file}
+// handlePypiWheel proxies /pypi/wheels/{path...} → S3 pypi/wheels/{path...}
+// Supports versioned subdirs (e.g. pypi/wheels/0.4.6/boto3-1.26.0-py3-none-any.whl).
 // For proxy-mode packages, falls back to fetching from upstream PyPI.
 func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
-	file := r.PathValue("file")
-	key := "pypi/wheels/" + file
+	p := r.PathValue("path")
+	if !isSafePath(p) {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+	key := "pypi/wheels/" + p
+	file := path.Base(p)
 	setCacheImmutable(w, file)
 
 	// Extract package name from wheel filename (e.g. "boto3-1.26.0-py3-none-any.whl" → "boto3").
@@ -410,6 +825,10 @@ func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGitBundle(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	file := r.PathValue("file")
+	if !isSafePath(name) || !isSafePath(file) {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
 	key := "repos/" + name + "/" + file
 	setCacheImmutable(w, file)
 	s.proxyS3(w, r, key)
@@ -420,6 +839,10 @@ func (s *Server) handleGitBundle(w http.ResponseWriter, r *http.Request) {
 // handleBinary proxies /binaries/{path...} → S3 binaries/{path}
 func (s *Server) handleBinary(w http.ResponseWriter, r *http.Request) {
 	p := r.PathValue("path")
+	if !isSafePath(p) {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
 	key := "binaries/" + p
 	s.proxyS3(w, r, key)
 }
@@ -475,7 +898,8 @@ func (s *Server) handleAPIPackage(w http.ResponseWriter, r *http.Request) {
 		manifest.TypeGomod, manifest.TypeHelm, manifest.TypeNpm:
 		pm, err := s.store.GetPackage(ctx, t, name)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			s.logger.Error("get package failed", "type", t, "name", name, "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 			return
 		}
 		if pm == nil {
@@ -520,7 +944,7 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	if s.s3 == nil {
+	if s.objects == nil {
 		resp.Healthy = false
 		resp.Error = "s3 client not configured"
 		writeJSON(w, http.StatusServiceUnavailable, resp)
@@ -528,10 +952,11 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Probe the apt Release file as a lightweight S3 health check.
-	status, err := s.s3.HeadObject(r.Context(), "packages/apt/dists/noble/Release")
+	status, err := s.objects.Head(r.Context(), "packages/apt/dists/noble/Release")
 	if err != nil {
 		resp.Healthy = false
-		resp.Error = fmt.Sprintf("s3 probe failed: %v", err)
+		resp.Error = "s3 probe failed"
+		s.logger.Error("s3 probe failed", "error", err)
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
@@ -556,6 +981,10 @@ type configResponse struct {
 }
 
 func (s *Server) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.isAdminRequest(r) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
 	resp := configResponse{
 		Bucket:      s.cfg.Bucket,
 		Region:      s.cfg.Region,
@@ -713,9 +1142,14 @@ func (s *Server) handleCreateEntry(w http.ResponseWriter, r *http.Request) {
 	switch t {
 	case manifest.TypeApt, manifest.TypeGit, manifest.TypeBinary, manifest.TypeGomod,
 		manifest.TypeHelm, manifest.TypeNpm, manifest.TypePypi:
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MiB ceiling
 		var pm manifest.PackageManifest
 		if err := json.NewDecoder(r.Body).Decode(&pm); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			if err.Error() == "http: request body too large" {
+				writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request body too large"})
+				return
+			}
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 			return
 		}
 		if pm.Name == "" {
@@ -730,11 +1164,13 @@ func (s *Server) handleCreateEntry(w http.ResponseWriter, r *http.Request) {
 		}
 		pm.Type = t
 		if err := s.store.SavePackage(ctx, &pm); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			s.logger.Error("save package failed", "type", t, "name", pm.Name, "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 			return
 		}
 		if err := s.store.SaveIndex(ctx); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			s.logger.Error("save index failed", "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 			return
 		}
 		writeJSON(w, http.StatusCreated, &pm)
@@ -762,11 +1198,13 @@ func (s *Server) handleDeleteEntry(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.store.DeletePackage(ctx, t, name); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		s.logger.Error("delete package failed", "type", t, "name", name, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}
 	if err := s.store.SaveIndex(ctx); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		s.logger.Error("save index failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}
 
@@ -794,6 +1232,242 @@ func (s *Server) isFrozen(ctx context.Context, t, name string) (bool, error) {
 	return true, nil
 }
 
+// ---- Hide / Freeze API -----------------------------------------------------
+
+func (s *Server) handleToggleHidden(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	t := r.PathValue("type")
+	name := r.PathValue("name")
+	version := r.PathValue("version") // empty if not in URL
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	pm, err := s.store.GetPackage(ctx, t, name)
+	if err != nil || pm == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	for i := range pm.Versions {
+		if version != "" && pm.Versions[i].Version != version {
+			continue
+		}
+		pm.Versions[i].Hidden = !pm.Versions[i].Hidden
+	}
+	if err := s.store.SavePackage(ctx, pm); err != nil {
+		s.logger.Error("save package failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	_ = s.store.SaveIndex(ctx)
+	writeJSON(w, http.StatusOK, pm)
+}
+
+func (s *Server) handleToggleFreeze(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	t := r.PathValue("type")
+	name := r.PathValue("name")
+	version := r.PathValue("version")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	pm, err := s.store.GetPackage(ctx, t, name)
+	if err != nil || pm == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	for i := range pm.Versions {
+		if version != "" && pm.Versions[i].Version != version {
+			continue
+		}
+		pm.Versions[i].Frozen = !pm.Versions[i].Frozen
+	}
+	if err := s.store.SavePackage(ctx, pm); err != nil {
+		s.logger.Error("save package failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	_ = s.store.SaveIndex(ctx)
+	writeJSON(w, http.StatusOK, pm)
+}
+
+// ---- Audit API -------------------------------------------------------------
+
+func (s *Server) handleAPIAudit(w http.ResponseWriter, r *http.Request) {
+	if !s.isAdminRequest(r) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+	if s.auditDB == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit database not configured"})
+		return
+	}
+	q := r.URL.Query()
+	f := audit.Filter{
+		EventType: audit.EventType(q.Get("type")),
+		PkgType:   q.Get("pkg_type"),
+		PkgName:   q.Get("name"),
+		ClientIP:  q.Get("client"),
+		Limit:     50,
+	}
+	if since := q.Get("since"); since != "" {
+		if t, err := time.Parse("2006-01-02", since); err == nil {
+			f.Since = t
+		} else if t, err := time.Parse(time.RFC3339, since); err == nil {
+			f.Since = t
+		}
+	}
+	if limit := q.Get("limit"); limit != "" {
+		if n, err := fmt.Sscanf(limit, "%d", &f.Limit); n == 1 && err == nil && f.Limit > 0 {
+			// parsed
+		}
+	}
+	const maxAuditLimit = 5000
+	if f.Limit > maxAuditLimit {
+		f.Limit = maxAuditLimit
+	}
+	events, err := s.auditDB.Query(r.Context(), f)
+	if err != nil {
+		s.logger.Error("audit query failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	writeJSON(w, http.StatusOK, events)
+}
+
+// ---- Token API -------------------------------------------------------------
+
+func (s *Server) handleListTokens(w http.ResponseWriter, r *http.Request) {
+	if !s.isAdminRequest(r) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+	if s.auditDB == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit database not configured"})
+		return
+	}
+	tokens, err := s.auditDB.ListTokens(r.Context())
+	if err != nil {
+		s.logger.Error("list tokens failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	writeJSON(w, http.StatusOK, tokens)
+}
+
+func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
+	if s.auditDB == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit database not configured"})
+		return
+	}
+	if s.pepper == "" {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "pepper not configured"})
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req struct {
+		Label   string `json:"label"`
+		Expiry  string `json:"expiry"`
+		Comment string `json:"comment"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if req.Label == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "label is required"})
+		return
+	}
+
+	// Generate token.
+	b := make([]byte, 32)
+	if _, err := cryptoRand.Read(b); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	token := "bodega_ak_" + hex.EncodeToString(b)
+
+	// Hash with pepper.
+	hash := audit.HashToken(token, s.pepper)
+
+	// Generate short ID.
+	idBytes := make([]byte, 16)
+	_, _ = cryptoRand.Read(idBytes)
+	id := hex.EncodeToString(idBytes)
+
+	// Parse expiry.
+	var expiresAt *time.Time
+	expiry := req.Expiry
+	if expiry == "" {
+		expiry = "365d"
+	}
+	if expiry != "never" {
+		t, err := parseTokenExpiry(expiry)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid expiry: " + err.Error()})
+			return
+		}
+		expiresAt = &t
+	}
+
+	ctx := r.Context()
+	if err := s.auditDB.InsertToken(ctx, id, req.Label, hash, req.Comment, expiresAt); err != nil {
+		s.logger.Error("insert token failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	resp := map[string]interface{}{
+		"token": token,
+		"id":    id,
+		"label": req.Label,
+	}
+	if expiresAt != nil {
+		resp["expires_at"] = expiresAt.Format(time.RFC3339)
+	}
+	writeJSON(w, http.StatusCreated, resp)
+}
+
+func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
+	if s.auditDB == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit database not configured"})
+		return
+	}
+	id := r.PathValue("id")
+	found, err := s.auditDB.DeleteToken(r.Context(), id)
+	if err != nil {
+		s.logger.Error("revoke token failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if !found {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "token not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked", "id": id})
+}
+
+// parseTokenExpiry converts an expiry string to a time. Accepts "30d", "1y", "2027-01-01".
+func parseTokenExpiry(s string) (time.Time, error) {
+	now := time.Now().UTC()
+	if strings.HasSuffix(s, "d") {
+		var days int
+		if _, err := fmt.Sscanf(s, "%dd", &days); err == nil && days > 0 {
+			return now.AddDate(0, 0, days), nil
+		}
+	}
+	if strings.HasSuffix(s, "y") {
+		var years int
+		if _, err := fmt.Sscanf(s, "%dy", &years); err == nil && years > 0 {
+			return now.AddDate(years, 0, 0), nil
+		}
+	}
+	if t, err := time.Parse("2006-01-02", s); err == nil {
+		return t, nil
+	}
+	return time.Time{}, fmt.Errorf("expected duration (30d, 1y), date (2027-01-01), or 'never'")
+}
+
 // ---- S3 proxy core ---------------------------------------------------------
 
 // proxyS3 streams an S3 object to the HTTP response.
@@ -803,7 +1477,7 @@ func (s *Server) proxyS3(w http.ResponseWriter, r *http.Request, s3Key string) {
 	if !s.requireS3(w) {
 		return
 	}
-	result, err := s.s3.GetObjectStream(r.Context(), s3Key)
+	result, err := s.objects.GetStream(r.Context(), s3Key)
 	if err != nil {
 		s.logger.Error("s3 proxy error", "key", s3Key, "error", err)
 		http.Error(w, "upstream error", http.StatusBadGateway)

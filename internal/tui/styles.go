@@ -1,6 +1,7 @@
 // Package tui implements the three-pane terminal UI for bodega shell.
 // Pane layout: Sources (top-left, 40%) | Details (top-right, 60%)
-//              Shell output + input (bottom, full width)
+//
+//	Shell output + input (bottom, full width)
 package tui
 
 import "github.com/charmbracelet/lipgloss"

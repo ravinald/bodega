@@ -12,7 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 const defaultNpmRegistry = "https://registry.npmjs.org"
@@ -151,6 +152,11 @@ func FetchNpm(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 			if result.Err != nil {
 				summary.Failures++
 			}
+			nStatus := "success"
+			if result.Err != nil {
+				nStatus = "failure"
+			}
+			cfg.RecordAudit(audit.EventFetch, manifest.TypeNpm, name, ve.Version, nStatus, result.Elapsed, result.Err)
 		}
 	}
 

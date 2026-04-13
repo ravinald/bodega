@@ -8,24 +8,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"time"
 
-	"github.com/scaleapi/bodega/internal/audit"
-	bos3 "github.com/scaleapi/bodega/internal/s3"
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/storage"
 )
-
-// s3Writer extends s3Getter with write capability for caching.
-type s3Writer interface {
-	PutBytes(ctx context.Context, key string, data []byte) error
-}
-
-// s3Full combines read and write S3 operations. The concrete *bos3.Client
-// satisfies this interface.
-type s3Full interface {
-	s3Getter
-	s3Writer
-}
 
 // CacheConfig holds proxy/cache settings.
 type CacheConfig struct {
@@ -53,7 +43,7 @@ func (s *Server) proxyOrCache(w http.ResponseWriter, r *http.Request, s3Key, ups
 	ctx := r.Context()
 
 	// Check if object exists in S3.
-	status, err := s.s3.HeadObject(ctx, s3Key)
+	status, err := s.objects.Head(ctx, s3Key)
 	if err != nil {
 		s.logger.Error("s3 head check failed", "key", s3Key, "error", err)
 		// Fall through to upstream fetch if proxy enabled.
@@ -103,12 +93,12 @@ func (s *Server) proxyOrCache(w http.ResponseWriter, r *http.Request, s3Key, ups
 		return
 	}
 
-	// Cache to S3 (best-effort — don't fail the response if caching fails).
-	if s3w, ok := s.s3.(s3Writer); ok {
-		if err := s3w.PutBytes(ctx, s3Key, data); err != nil {
-			s.logger.Warn("failed to cache in S3", "key", s3Key, "error", err)
+	// Cache to storage (best-effort — don't fail the response if caching fails).
+	if s.objects != nil {
+		if err := s.objects.Put(ctx, s3Key, data); err != nil {
+			s.logger.Warn("failed to cache object", "key", s3Key, "error", err)
 		} else {
-			s.logger.Debug("cached in S3", "key", s3Key, "bytes", len(data))
+			s.logger.Debug("cached object", "key", s3Key, "bytes", len(data))
 		}
 	}
 
@@ -131,31 +121,68 @@ func (s *Server) cacheEnabled() bool {
 }
 
 // isCacheStale checks if a cached S3 object has exceeded the metadata TTL.
-func (s *Server) isCacheStale(status *bos3.ObjectStatus) bool {
+func (s *Server) isCacheStale(status *storage.ObjectInfo) bool {
 	if s.cache.MetadataTTL <= 0 {
 		return false
 	}
 	return time.Since(status.LastModified) > s.cache.MetadataTTL
 }
 
+// upstreamClient is a dedicated HTTP client for upstream fetches with an
+// explicit timeout so that slow or unresponsive upstreams cannot hold
+// goroutines open indefinitely.
+var upstreamClient = &http.Client{
+	Timeout: 90 * time.Second,
+}
+
+// validateUpstreamURL rejects URLs that use non-HTTPS schemes or resolve to
+// private/loopback addresses, mitigating SSRF attacks via upstream proxying.
+func validateUpstreamURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid upstream URL: %w", err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("upstream URL must use https, got %q", u.Scheme)
+	}
+	host := u.Hostname()
+	ips, err := net.LookupHost(host)
+	if err != nil {
+		return fmt.Errorf("cannot resolve upstream host %q: %w", host, err)
+	}
+	for _, ipStr := range ips {
+		ip := net.ParseIP(ipStr)
+		if ip == nil {
+			continue
+		}
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			return fmt.Errorf("upstream resolves to non-routable IP %s", ipStr)
+		}
+	}
+	return nil
+}
+
 // fetchUpstream downloads a URL and returns the body bytes and content type.
-func fetchUpstream(ctx context.Context, url string) ([]byte, string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func fetchUpstream(ctx context.Context, rawURL string) ([]byte, string, error) {
+	if err := validateUpstreamURL(rawURL); err != nil {
+		return nil, "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, "", err
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := upstreamClient.Do(req)
 	if err != nil {
 		return nil, "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, "", fmt.Errorf("upstream 404: %s", url)
+		return nil, "", fmt.Errorf("upstream 404: %s", rawURL)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, "", fmt.Errorf("upstream returned %d: %s", resp.StatusCode, url)
+		return nil, "", fmt.Errorf("upstream returned %d: %s", resp.StatusCode, rawURL)
 	}
 
 	// Cap at 256MB to prevent unbounded memory use.
@@ -191,8 +218,8 @@ func (s *Server) verifyProxyChecksum(ctx context.Context, s3Key string, data []b
 	// Look up stored checksum.
 	stored, err := s.auditDB.GetChecksum(ctx, s3Key)
 	if err != nil {
-		s.logger.Warn("checksum lookup failed", "key", s3Key, "error", err)
-		return nil // fail open on DB errors
+		s.logger.Error("checksum DB unavailable, refusing to serve immutable resource", "key", s3Key, "error", err)
+		return fmt.Errorf("checksum lookup unavailable: %w", err)
 	}
 
 	if stored == nil {

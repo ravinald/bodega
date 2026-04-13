@@ -6,7 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	bos3 "github.com/scaleapi/bodega/internal/s3"
+	bos3 "github.com/ravinald/bodega/internal/s3"
 )
 
 func newStatusCmd(gf *globalFlags) *cobra.Command {

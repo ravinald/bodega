@@ -7,8 +7,8 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/scaleapi/bodega/internal/manifest"
-	"github.com/scaleapi/bodega/internal/s3"
+	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/s3"
 )
 
 // TreeNode represents one row in the Sources pane tree.
@@ -684,7 +684,12 @@ func (m sourcesModel) View() string {
 			if row.node.Marked {
 				mark = "*"
 			}
-			line = indent + mark + icon + " " + row.node.Label
+			label := row.node.Label
+			// Policy/meta entries (e.g. "python3@*") render dimmed.
+			if strings.HasSuffix(label, "@*") {
+				label = dimStyle.Render(label)
+			}
+			line = indent + mark + icon + " " + label
 		}
 
 		// Trim to available width.

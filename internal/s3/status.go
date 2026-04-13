@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // EntryStatus describes one manifest entry compared against S3.

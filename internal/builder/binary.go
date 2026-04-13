@@ -10,7 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // binaryFilename returns the local filename for a binary version entry, using
@@ -92,7 +93,7 @@ func FetchBinaries(cfg *Config, store *manifest.Store, entryFilter string) *Summ
 			if !cfg.Force {
 				stage := CheckBinaryStage(cfg, name, ve)
 				if stage.Fetched {
-					cfg.logf("  [binary] %s: already fetched, skipping (use --force to re-fetch)", name)
+					cfg.logf("  [binary] %s: already fetched, skipping (use 'force' to re-fetch)", name)
 					continue
 				}
 			}
@@ -181,6 +182,11 @@ func FetchBinaries(cfg *Config, store *manifest.Store, entryFilter string) *Summ
 					cfg.Logger.Audit("OK      binary/fetch/%s  (%s)", name, result.Elapsed.Round(time.Millisecond))
 				}
 			}
+			bfStatus := "success"
+			if result.Err != nil {
+				bfStatus = "failure"
+			}
+			cfg.RecordAudit(audit.EventFetch, manifest.TypeBinary, name, ve.Version, bfStatus, result.Elapsed, result.Err)
 		}
 	}
 

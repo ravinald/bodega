@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/scaleapi/core-infrastructure/tools/bodega/schemas/pypi.schema.json",
+  "$id": "https://github.com/ravinald/bodega/schemas/pypi.schema.json",
   "title": "PyPI Wheel Manifest",
   "description": "Defines Python packages to build as wheels. Combines base requirements from git repos with explicit extra packages.",
   "type": "object",

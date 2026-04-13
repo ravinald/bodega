@@ -5,7 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	bos3 "github.com/scaleapi/bodega/internal/s3"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 func newRemoveCmd(gf *globalFlags) *cobra.Command {
@@ -41,13 +41,13 @@ file is not modified.`,
 			if key == "" {
 				return fmt.Errorf("could not determine S3 key for %s/%s", t, name)
 			}
-			client, err := bos3.NewClient(ctx, cfg.Bucket, cfg.Region)
+			objStore, err := storage.New(ctx, cfg)
 			if err != nil {
-				return fmt.Errorf("connect to AWS: %w", err)
+				return fmt.Errorf("connect to storage: %w", err)
 			}
 
 			fmt.Printf("Deleting s3://%s/%s ...\n", cfg.Bucket, key)
-			if err := client.DeleteObject(ctx, key); err != nil {
+			if err := objStore.Delete(ctx, key); err != nil {
 				return err
 			}
 			fmt.Println("Deleted.")

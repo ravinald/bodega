@@ -2,15 +2,19 @@ package server
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/scaleapi/bodega/internal/logging"
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/logging"
 )
 
 // testHandler returns a simple 200 OK handler with a fixed body.
@@ -478,5 +482,176 @@ func TestIsBinaryContentType(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("isBinaryContentType(%q) = %v, want %v", tc.ct, got, tc.want)
 		}
+	}
+}
+
+// ---- SecurityHeadersMiddleware tests ----------------------------------------
+
+func TestSecurityHeadersPresent(t *testing.T) {
+	handler := SecurityHeadersMiddleware(testHandler("ok"))
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	expected := map[string]string{
+		"X-Content-Type-Options": "nosniff",
+		"X-Frame-Options":        "DENY",
+		"Referrer-Policy":        "strict-origin-when-cross-origin",
+	}
+	for header, want := range expected {
+		got := rec.Header().Get(header)
+		if got != want {
+			t.Errorf("%s = %q, want %q", header, got, want)
+		}
+	}
+	csp := rec.Header().Get("Content-Security-Policy")
+	if csp == "" {
+		t.Error("Content-Security-Policy header is missing")
+	}
+	// HSTS should NOT be set for plain HTTP requests.
+	if hsts := rec.Header().Get("Strict-Transport-Security"); hsts != "" {
+		t.Errorf("Strict-Transport-Security should not be set for HTTP, got %q", hsts)
+	}
+}
+
+func TestSecurityHeadersHSTSOnTLS(t *testing.T) {
+	handler := SecurityHeadersMiddleware(testHandler("ok"))
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	// Simulate a TLS connection by setting TLS state on the request.
+	req.TLS = &tls.ConnectionState{}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	hsts := rec.Header().Get("Strict-Transport-Security")
+	if hsts == "" {
+		t.Error("Strict-Transport-Security header should be set for TLS requests")
+	}
+	if !strings.Contains(hsts, "max-age=") {
+		t.Errorf("HSTS missing max-age directive: %q", hsts)
+	}
+}
+
+// ---- MutationAuthMiddleware tests -------------------------------------------
+
+func mustParseCIDR(cidr string) *net.IPNet {
+	_, n, err := net.ParseCIDR(cidr)
+	if err != nil {
+		panic(err)
+	}
+	return n
+}
+
+func TestMutationAuthGETPassesThrough(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	nets := []*net.IPNet{mustParseCIDR("192.168.0.0/16")}
+	handler := MutationAuthMiddleware(nets, nil, "", logger)(testHandler("ok"))
+
+	// GET from a non-permitted IP should still pass — only POST/DELETE are gated.
+	req := httptest.NewRequest("GET", "/api/v1/packages", nil)
+	req.RemoteAddr = "10.0.0.1:12345"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("GET status = %d, want 200", rec.Code)
+	}
+}
+
+func TestMutationAuthBlocksNonPermittedIP(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	nets := []*net.IPNet{mustParseCIDR("192.168.1.0/24")}
+	handler := MutationAuthMiddleware(nets, nil, "", logger)(testHandler("ok"))
+
+	req := httptest.NewRequest("POST", "/api/v1/packages/apt", nil)
+	req.RemoteAddr = "10.0.0.1:12345"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("POST from non-permitted IP: status = %d, want 403", rec.Code)
+	}
+}
+
+func TestMutationAuthLocalhostNoTokenRequired(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	nets := []*net.IPNet{mustParseCIDR("127.0.0.0/8")}
+	handler := MutationAuthMiddleware(nets, nil, "", logger)(testHandler("ok"))
+
+	// POST from localhost should pass without any token.
+	req := httptest.NewRequest("POST", "/api/v1/packages/apt", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("POST from localhost: status = %d, want 200", rec.Code)
+	}
+}
+
+func TestMutationAuthRemoteRequiresToken(t *testing.T) {
+	// Set up a temp audit DB with a hashed token.
+	dbPath := filepath.Join(t.TempDir(), "test-auth.db")
+	adb, err := audit.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open audit DB: %v", err)
+	}
+	defer adb.Close()
+
+	pepper := "test-pepper"
+	token := "bodega_ak_abc123"
+	hash := audit.HashToken(token, pepper)
+	if err := adb.InsertToken(context.Background(), "tok1", "test", hash, "", nil); err != nil {
+		t.Fatalf("insert token: %v", err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	nets := []*net.IPNet{mustParseCIDR("10.0.0.0/8")}
+	handler := MutationAuthMiddleware(nets, adb, pepper, logger)(testHandler("ok"))
+
+	// POST from permitted IP but no token — should be rejected.
+	req := httptest.NewRequest("POST", "/api/v1/packages/apt", nil)
+	req.RemoteAddr = "10.0.0.5:12345"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("POST without token: status = %d, want 401", rec.Code)
+	}
+
+	// POST with correct token — should pass.
+	req2 := httptest.NewRequest("POST", "/api/v1/packages/apt", nil)
+	req2.RemoteAddr = "10.0.0.5:12345"
+	req2.Header.Set("Authorization", "Bearer "+token)
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusOK {
+		t.Errorf("POST with valid token: status = %d, want 200", rec2.Code)
+	}
+
+	// POST with wrong token — should be rejected.
+	req3 := httptest.NewRequest("POST", "/api/v1/packages/apt", nil)
+	req3.RemoteAddr = "10.0.0.5:12345"
+	req3.Header.Set("Authorization", "Bearer wrong_token")
+	rec3 := httptest.NewRecorder()
+	handler.ServeHTTP(rec3, req3)
+
+	if rec3.Code != http.StatusUnauthorized {
+		t.Errorf("POST with wrong token: status = %d, want 401", rec3.Code)
+	}
+}
+
+func TestMutationAuthDELETEAlsoGated(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	nets := []*net.IPNet{mustParseCIDR("192.168.1.0/24")}
+	handler := MutationAuthMiddleware(nets, nil, "", logger)(testHandler("ok"))
+
+	req := httptest.NewRequest("DELETE", "/api/v1/packages/apt/test", nil)
+	req.RemoteAddr = "10.0.0.1:12345"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("DELETE from non-permitted IP: status = %d, want 403", rec.Code)
 	}
 }

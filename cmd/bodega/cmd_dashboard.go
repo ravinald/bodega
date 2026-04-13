@@ -8,9 +8,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/scaleapi/bodega/internal/audit"
-	"github.com/scaleapi/bodega/internal/manifest"
-	bos3 "github.com/scaleapi/bodega/internal/s3"
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/manifest"
+	bos3 "github.com/ravinald/bodega/internal/s3"
 )
 
 type typeMetrics struct {
@@ -71,10 +71,11 @@ S3 coverage, storage usage, and recent activity.
 				if err == nil {
 					defer db.Close()
 					since := time.Now().Add(-24 * time.Hour)
-					f, _ := db.Count(ctx, audit.Filter{EventType: audit.EventFetch, Since: since})
+					f1, _ := db.Count(ctx, audit.Filter{EventType: audit.EventFetch, Since: since})
+					f2, _ := db.Count(ctx, audit.Filter{EventType: audit.EventServeFetch, Since: since})
 					b, _ := db.Count(ctx, audit.Filter{EventType: audit.EventBuild, Since: since})
 					c, _ := db.Count(ctx, audit.Filter{EventType: audit.EventCreate, Since: since})
-					fetches24h, builds24h, creates24h = int(f), int(b), int(c)
+					fetches24h, builds24h, creates24h = int(f1)+int(f2), int(b), int(c)
 				}
 			}
 

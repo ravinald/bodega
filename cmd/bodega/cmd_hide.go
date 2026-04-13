@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/spf13/cobra"
+
+	"github.com/ravinald/bodega/internal/audit"
 )
 
 func newHideCmd(gf *globalFlags) *cobra.Command {
@@ -41,6 +44,8 @@ Without VERSION, all versions of the package are toggled.`,
 				return fmt.Errorf("%s/%s not found", t, name)
 			}
 
+			beforeJSON, _ := json.MarshalIndent(pm, "", "  ")
+
 			toggled := 0
 			for i := range pm.Versions {
 				ve := &pm.Versions[i]
@@ -66,6 +71,18 @@ Without VERSION, all versions of the package are toggled.`,
 
 			if err := store.SavePackage(ctx, pm); err != nil {
 				return fmt.Errorf("save: %w", err)
+			}
+
+			if adb := openAuditDB(gf); adb != nil {
+				afterJSON, _ := json.MarshalIndent(pm, "", "  ")
+				_ = adb.Record(ctx, audit.Event{
+					EventType: audit.EventHide,
+					PkgType:   t,
+					PkgName:   name,
+					Status:    "success",
+					Details:   audit.FormatDiff(beforeJSON, afterJSON),
+				})
+				adb.Close()
 			}
 			return nil
 		},

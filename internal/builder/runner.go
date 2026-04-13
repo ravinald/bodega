@@ -4,6 +4,7 @@
 package builder
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -11,8 +12,9 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/scaleapi/bodega/internal/logging"
-	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/logging"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // Config holds the parameters shared by all builders.
@@ -48,6 +50,15 @@ type Config struct {
 	// Logger is an optional structured build logger. When set, each per-entry
 	// stage writes to a dedicated package log in addition to Stdout.
 	Logger *logging.BuildLogger
+	// AuditDB is an optional audit database. When set, build operations
+	// record events to the SQLite audit trail.
+	AuditDB *audit.DB
+	// GpgEmail is the email for the GPG signing key used by the apt repo.
+	// Defaults to "bodega@localhost" when empty.
+	GpgEmail string
+	// GpgName is the real name for the GPG signing key.
+	// Defaults to "Bodega Package Signing" when empty.
+	GpgName string
 }
 
 // rootFor returns the effective build root for the given source type.
@@ -91,6 +102,27 @@ func (c *Config) stdout() io.Writer {
 		return c.Stdout
 	}
 	return os.Stdout
+}
+
+// RecordAudit writes an event to the audit database if one is configured.
+// Called by builders after each fetch/build/package operation completes.
+func (c *Config) RecordAudit(evType audit.EventType, pkgType, name, version, status string, elapsed time.Duration, errVal error) {
+	if c.AuditDB == nil {
+		return
+	}
+	details := ""
+	if errVal != nil {
+		details = errVal.Error()
+	}
+	_ = c.AuditDB.Record(context.Background(), audit.Event{
+		EventType:  evType,
+		PkgType:    pkgType,
+		PkgName:    name,
+		PkgVersion: version,
+		Status:     status,
+		DurationMs: elapsed.Milliseconds(),
+		Details:    details,
+	})
 }
 
 // entryWriter returns an io.Writer scoped to a single manifest entry. When a

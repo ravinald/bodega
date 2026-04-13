@@ -8,6 +8,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 )
 
 const graphFile = "graph.json"
@@ -85,20 +87,31 @@ func childrenOf(g *DependencyGraph, parent string) []DepEdge {
 	return out
 }
 
-// orphans returns the set of packages (as "type/name" strings) that appear as
-// children in the graph but have no parent edges — i.e. nothing depends on them.
+// orphans returns the set of packages (as "type/name" strings) that appear in
+// graph edges but don't exist in the store. These are broken references --
+// a dependency was recorded but the package was deleted or never created.
 func orphans(g *DependencyGraph) []string {
-	parents := make(map[string]bool)
-	children := make(map[string]bool)
+	// Collect all unique node references from edges.
+	nodes := make(map[string]bool)
 	for _, e := range g.Edges {
-		parents[e.Parent] = true
-		children[e.Child] = true
+		// Edge parents/children use "type/name" or "type/name@version" format.
+		// Extract the "type/name" portion for store lookup.
+		nodes[edgeBaseName(e.Parent)] = true
+		nodes[edgeBaseName(e.Child)] = true
 	}
+	// The caller (Store.Orphans) filters against the store.
 	var out []string
-	for child := range children {
-		if !parents[child] {
-			out = append(out, child)
-		}
+	for node := range nodes {
+		out = append(out, node)
 	}
+	sort.Strings(out)
 	return out
+}
+
+// edgeBaseName extracts "type/name" from edge references like "type/name@version".
+func edgeBaseName(ref string) string {
+	if idx := strings.Index(ref, "@"); idx >= 0 {
+		return ref[:idx]
+	}
+	return ref
 }

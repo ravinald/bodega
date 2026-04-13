@@ -6,15 +6,13 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/scaleapi/bodega/internal/builder"
-	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/builder"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 func newPackageCmd(gf *globalFlags) *cobra.Command {
-	var entryFilter string
-
 	cmd := &cobra.Command{
-		Use:   "package [TYPE...]",
+		Use:   "package [TYPE] [NAME]",
 		Short: "Package built artifacts into distributable form",
 		Long: `package creates the final distributable artifacts from built sources.
 It automatically cascades through fetch and build if those stages have not
@@ -22,20 +20,28 @@ been completed yet.
 
   binary  No-op (the downloaded file is already the artifact)
   git     Create and verify a git bundle from the bare repo (fetches if needed)
-  apt     Run reprepro includedeb to add the .deb to the APT repository
-          (fetches and builds if needed)
+  apt     Copy .deb into pool directory structure (fetches and builds if needed)
   pypi    Generate MANIFEST.sha256 for the wheels directory
           (fetches and builds if needed)
 
 If no types are given, all four are packaged in dependency order:
   binary → git → apt → pypi
 
-The --entry flag restricts the operation to a single named entry.`,
-		Example: `  bodega package
-  bodega package git
-  bodega package apt --entry amazon-efs-utils`,
+When a name is given after the type, only that entry is packaged.`,
+		Example: `  bodega build package
+  bodega build package git
+  bodega build package apt python3`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			types, err := resolveTypes(args)
+			var typeArgs []string
+			var entryFilter string
+			for _, a := range args {
+				if isValidType(a) {
+					typeArgs = append(typeArgs, a)
+				} else {
+					entryFilter = a
+				}
+			}
+			types, err := resolveTypes(typeArgs)
 			if err != nil {
 				return err
 			}
@@ -52,11 +58,11 @@ The --entry flag restricts the operation to a single named entry.`,
 
 			bcfg := &builder.Config{
 				AutoImportDeps: true,
-				BuildRoot:   cfg.BuildRoot,
-				ManifestDir: cfg.ManifestDir,
-				Bucket:      cfg.Bucket,
-				Region:      cfg.Region,
-				Verbose:     cfg.Verbose,
+				BuildRoot:      cfg.BuildRoot,
+				ManifestDir:    cfg.ManifestDir,
+				Bucket:         cfg.Bucket,
+				Region:         cfg.Region,
+				Verbose:        cfg.Verbose,
 			}
 
 			var allSummaries []*builder.Summary
@@ -103,6 +109,5 @@ The --entry flag restricts the operation to a single named entry.`,
 		},
 	}
 
-	cmd.Flags().StringVar(&entryFilter, "entry", "", "Package only the named entry")
 	return cmd
 }

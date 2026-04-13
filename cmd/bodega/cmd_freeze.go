@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/spf13/cobra"
+
+	"github.com/ravinald/bodega/internal/audit"
 )
 
 func newFreezeCmd(gf *globalFlags) *cobra.Command {
@@ -38,6 +41,8 @@ already-frozen entry unfreezes it.`,
 				return fmt.Errorf("%s entry %q not found", t, name)
 			}
 
+			beforeJSON, _ := json.MarshalIndent(pm, "", "  ")
+
 			// Toggle: if all versions are frozen, unfreeze; otherwise freeze all.
 			allFrozen := len(pm.Versions) > 0
 			for _, ve := range pm.Versions {
@@ -54,6 +59,18 @@ already-frozen entry unfreezes it.`,
 				return err
 			}
 			printFreezeStatus(t, name, newState)
+
+			if adb := openAuditDB(gf); adb != nil {
+				afterJSON, _ := json.MarshalIndent(pm, "", "  ")
+				_ = adb.Record(ctx, audit.Event{
+					EventType: audit.EventFreeze,
+					PkgType:   t,
+					PkgName:   name,
+					Status:    "success",
+					Details:   audit.FormatDiff(beforeJSON, afterJSON),
+				})
+				adb.Close()
+			}
 			return nil
 		},
 	}

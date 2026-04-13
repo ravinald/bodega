@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/scaleapi/core-infrastructure/tools/bodega/schemas/git.schema.json",
+  "$id": "https://github.com/ravinald/bodega/schemas/git.schema.json",
   "title": "Git Repository Manifest",
   "description": "Defines git repositories to clone and bundle at specific refs.",
   "type": "object",

@@ -7,7 +7,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // helmChartFilename returns the conventional Helm chart archive name.
@@ -128,6 +129,11 @@ func FetchHelm(cfg *Config, store *manifest.Store, entryFilter string) *Summary 
 			if result.Err != nil {
 				summary.Failures++
 			}
+			hStatus := "success"
+			if result.Err != nil {
+				hStatus = "failure"
+			}
+			cfg.RecordAudit(audit.EventFetch, manifest.TypeHelm, name, ve.Version, hStatus, result.Elapsed, result.Err)
 		}
 	}
 

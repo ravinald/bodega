@@ -3,42 +3,39 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
 
-	"github.com/scaleapi/bodega/internal/builder"
-	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/builder"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 func newCreateCmd(gf *globalFlags) *cobra.Command {
-	var (
-		flagName     string
-		flagURL      string
-		flagRef      string
-		flagSHA256   string
-		flagFilename string
-		flagBuildCmd string
-		flagDebGlob  string
-		flagSrcName  string
-	)
-
 	cmd := &cobra.Command{
-		Use:   "create <type>",
+		Use:   "create <type> [name]",
 		Short: "Add a new entry to a manifest",
 		Long: `create adds a new entry to the specified manifest type.
 
-If flags are omitted, missing values are prompted interactively.
+The name can be passed as a positional argument or prompted interactively.
+All other fields are prompted. For automation, use 'bodega pkg import'.
 
 Examples:
-  bodega create git --name myrepo --url https://github.com/org/repo.git --ref v1.0.0
-  bodega create binary
-  bodega create apt`,
-		Args: cobra.ExactArgs(1),
+  bodega pkg create git netbox
+  bodega pkg create apt python3
+  bodega pkg create gomod github.com/aws/aws-sdk-go-v2
+  bodega pkg create binary                              # fully interactive`,
+		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			t := args[0]
+			var name string
+			if len(args) > 1 {
+				name = args[1]
+			}
 			if !isValidType(t) {
 				return fmt.Errorf("unknown type %q — must be one of: %s", t, strings.Join(manifest.AllTypes, ", "))
 			}
@@ -51,51 +48,54 @@ Examples:
 			ctx := context.Background()
 			r := bufio.NewReader(os.Stdin)
 
-			var name string
 			var ve manifest.VersionEntry
 
 			switch t {
 			case manifest.TypeGit:
-				name, ve, err = collectGitVersion(r, flagName, flagURL, flagRef)
+				name, ve, err = collectGitVersion(r, name, "", "")
 				if err != nil {
 					return err
 				}
 
 			case manifest.TypeBinary:
-				name, ve, err = collectBinaryVersion(r, flagName, flagURL, flagSHA256, flagFilename)
+				name, ve, err = collectBinaryVersion(r, name, "", "", "")
 				if err != nil {
 					return err
 				}
 
 			case manifest.TypeApt:
-				name, ve, err = collectAptVersion(r, flagName, flagURL, flagSrcName, flagBuildCmd, flagDebGlob)
+				name, ve, err = collectAptVersion(r, name, "", "", "", "")
 				if err != nil {
 					return err
 				}
 
 			case manifest.TypeGomod:
-				name, ve, err = collectGomodVersion(r, flagName, flagURL, flagRef)
+				name, ve, err = collectGomodVersion(r, name, "", "")
 				if err != nil {
 					return err
 				}
 
 			case manifest.TypeHelm:
-				name, ve, err = collectHelmVersion(r, flagName, flagURL, flagRef)
+				name, ve, err = collectHelmVersion(r, name, "", "")
 				if err != nil {
 					return err
 				}
 
 			case manifest.TypeNpm:
-				name, ve, err = collectNpmVersion(r, flagName, flagURL, flagRef)
+				name, ve, err = collectNpmVersion(r, name, "", "")
 				if err != nil {
 					return err
 				}
 
 			case manifest.TypePypi:
-				if flagName == "" {
-					return fmt.Errorf("--name is required for pypi entries")
+				if name == "" {
+					if name, err = prompt(r, "Package name", ""); err != nil {
+						return err
+					}
 				}
-				name = flagName
+				if name == "" {
+					return fmt.Errorf("name is required for pypi entries")
+				}
 				ve = manifest.VersionEntry{}
 			}
 
@@ -130,20 +130,25 @@ Examples:
 				}
 			}
 
+			// Record create audit event with full manifest.
+			if adb := openAuditDB(gf); adb != nil {
+				if pm, err := store.GetPackage(ctx, t, name); err == nil && pm != nil {
+					afterJSON, _ := json.MarshalIndent(pm, "", "  ")
+					_ = adb.Record(ctx, audit.Event{
+						EventType: audit.EventCreate,
+						PkgType:   t,
+						PkgName:   name,
+						Status:    "success",
+						Details:   audit.FormatDiff(nil, afterJSON),
+					})
+				}
+				adb.Close()
+			}
+
 			notifyServer(gf)
 			return nil
 		},
 	}
-
-	f := cmd.Flags()
-	f.StringVar(&flagName, "name", "", "Entry name")
-	f.StringVar(&flagURL, "url", "", "URL (git remote or download URL)")
-	f.StringVar(&flagRef, "ref", "", "Git ref (tag, branch, or commit SHA) / version for other types")
-	f.StringVar(&flagSHA256, "sha256", "", "Expected SHA-256 of downloaded file")
-	f.StringVar(&flagFilename, "filename", "", "Filename override for binary downloads")
-	f.StringVar(&flagBuildCmd, "build-cmd", "", "Shell command to build the .deb")
-	f.StringVar(&flagDebGlob, "deb-glob", "", "Glob pattern to locate the produced .deb")
-	f.StringVar(&flagSrcName, "source-name", "", "Source package / directory name (apt)")
 
 	return cmd
 }

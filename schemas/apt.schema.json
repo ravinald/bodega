@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/scaleapi/core-infrastructure/tools/bodega/schemas/apt.schema.json",
+  "$id": "https://github.com/ravinald/bodega/schemas/apt.schema.json",
   "title": "APT Package Manifest",
   "description": "Defines Debian packages to build from source or download from system repositories.",
   "type": "object",

@@ -5,13 +5,17 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"log/syslog"
 	"math/big"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
-	bos3 "github.com/scaleapi/bodega/internal/s3"
+
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 func newResetCmd(gf *globalFlags) *cobra.Command {
@@ -84,20 +88,20 @@ What is preserved:
 			}
 			fmt.Println("  Local manifests cleared.")
 
-			// Clear S3 manifests -- delete everything under manifests/ prefix.
+			// Clear remote manifests -- delete everything under manifests/ prefix.
 			if cfg.Bucket != "" {
 				ctx := context.Background()
-				s3client, err := bos3.NewClient(ctx, cfg.Bucket, cfg.Region)
+				objStore, err := storage.New(ctx, cfg)
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "  warning: could not connect to S3: %v\n", err)
+					fmt.Fprintf(os.Stderr, "  warning: could not connect to storage: %v\n", err)
 				} else {
-					keys, err := s3client.ListPrefix(ctx, "manifests/")
+					keys, err := objStore.List(ctx, "manifests/")
 					if err != nil {
-						fmt.Fprintf(os.Stderr, "  warning: could not list S3 manifests: %v\n", err)
+						fmt.Fprintf(os.Stderr, "  warning: could not list remote manifests: %v\n", err)
 					} else {
 						deleted := 0
 						for _, key := range keys {
-							if err := s3client.DeleteObject(ctx, key); err != nil {
+							if err := objStore.Delete(ctx, key); err != nil {
 								fmt.Fprintf(os.Stderr, "  warning: could not delete s3://%s/%s: %v\n", cfg.Bucket, key, err)
 							} else {
 								deleted++
@@ -123,6 +127,9 @@ What is preserved:
 
 			// Remove audit database if user opted in.
 			if resetAudit {
+				// Fail-safe: write to syslog before wiping the audit trail.
+				auditFailsafe("audit database reset", auditPath)
+
 				for _, ext := range []string{"", "-shm", "-wal"} {
 					_ = os.Remove(auditPath + ext)
 				}
@@ -155,4 +162,33 @@ func randomWord() (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("%s-%d", words[idx.Int64()], num.Int64()+100), nil
+}
+
+// auditFailsafe writes a record to syslog (or a fallback file) before the
+// audit database is wiped. This creates an immutable record outside the DB
+// that the audit trail was intentionally cleared.
+func auditFailsafe(action, dbPath string) {
+	username := "unknown"
+	if u, err := user.Current(); err == nil {
+		username = u.Username
+	}
+	msg := fmt.Sprintf("bodega: %s by %s at %s (db: %s)",
+		action, username, time.Now().UTC().Format(time.RFC3339), dbPath)
+
+	// Try syslog first.
+	if w, err := syslog.New(syslog.LOG_WARNING|syslog.LOG_AUTH, "bodega"); err == nil {
+		_ = w.Warning(msg)
+		_ = w.Close()
+		return
+	}
+
+	// Fallback: append to a file next to the audit DB.
+	fallbackPath := filepath.Join(filepath.Dir(dbPath), "audit-failsafe.log")
+	f, err := os.OpenFile(fallbackPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  warning: could not write audit failsafe: %v\n", err)
+		return
+	}
+	defer f.Close()
+	fmt.Fprintln(f, msg)
 }

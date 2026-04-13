@@ -7,9 +7,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/scaleapi/bodega/internal/builder"
-	"github.com/scaleapi/bodega/internal/manifest"
-	bos3 "github.com/scaleapi/bodega/internal/s3"
+	"github.com/ravinald/bodega/internal/builder"
+	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 func newUploadCmd(gf *globalFlags) *cobra.Command {
@@ -51,17 +51,17 @@ If no types are given all four are uploaded.`,
 
 			bcfg := &builder.Config{
 				AutoImportDeps: true,
-				BuildRoot:   cfg.BuildRoot,
-				ManifestDir: cfg.ManifestDir,
-				Bucket:      cfg.Bucket,
-				Region:      cfg.Region,
-				Verbose:     cfg.Verbose,
+				BuildRoot:      cfg.BuildRoot,
+				ManifestDir:    cfg.ManifestDir,
+				Bucket:         cfg.Bucket,
+				Region:         cfg.Region,
+				Verbose:        cfg.Verbose,
 			}
 
 			ctx := backgroundCtx()
-			client, err := bos3.NewClient(ctx, cfg.Bucket, cfg.Region)
+			objStore, err := storage.New(ctx, cfg)
 			if err != nil {
-				return fmt.Errorf("connect to AWS: %w", err)
+				return fmt.Errorf("connect to storage: %w", err)
 			}
 
 			buildRoot := cfg.BuildRoot
@@ -80,7 +80,7 @@ If no types are given all four are uploaded.`,
 					paths := builder.BinaryArtifactPaths(bcfg, store, "")
 					for _, ap := range paths {
 						fmt.Printf("    upload: s3://%s/%s\n", cfg.Bucket, ap.S3Key)
-						if err := client.UploadFile(ctx, ap.Local, ap.S3Key); err != nil {
+						if err := objStore.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
 							return fmt.Errorf("upload binary %s: %w", ap.Local, err)
 						}
 						totalUploaded++
@@ -96,7 +96,7 @@ If no types are given all four are uploaded.`,
 						fmt.Printf("    No bundles directory at %s — skipping\n", localDir)
 						continue
 					}
-					n, err := client.SyncDir(ctx, os.Stdout, localDir, "repos/")
+					n, err := objStore.SyncDir(ctx, os.Stdout, localDir, "repos/")
 					if err != nil {
 						return fmt.Errorf("upload git: %w", err)
 					}
@@ -113,7 +113,7 @@ If no types are given all four are uploaded.`,
 						fmt.Printf("    No apt-repo directory at %s — skipping\n", localDir)
 						continue
 					}
-					n, err := client.SyncDir(ctx, os.Stdout, localDir, "packages/apt/")
+					n, err := objStore.SyncDir(ctx, os.Stdout, localDir, "packages/apt/")
 					if err != nil {
 						return fmt.Errorf("upload apt: %w", err)
 					}
@@ -130,7 +130,7 @@ If no types are given all four are uploaded.`,
 						fmt.Printf("    No wheels directory at %s — skipping\n", localDir)
 						continue
 					}
-					n, err := client.SyncDir(ctx, os.Stdout, localDir, s3Prefix)
+					n, err := objStore.SyncDir(ctx, os.Stdout, localDir, s3Prefix)
 					if err != nil {
 						return fmt.Errorf("upload pypi: %w", err)
 					}

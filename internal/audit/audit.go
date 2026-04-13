@@ -16,11 +16,30 @@ import (
 type EventType string
 
 const (
-	EventFetch  EventType = "fetch"  // client downloaded a package
-	EventBuild  EventType = "build"  // build pipeline completed
-	EventCreate EventType = "create" // manifest entry created
-	EventDelete EventType = "delete" // manifest entry deleted
-	EventCache  EventType = "cache"  // proxy cache miss → upstream fetch
+	// Admin/operator events (CLI commands).
+	EventInit    EventType = "init"    // bodega init
+	EventReset   EventType = "reset"   // bodega reset
+	EventStatus  EventType = "status"  // bodega status
+	EventFetch   EventType = "fetch"   // bodega build fetch (per entry)
+	EventBuild   EventType = "build"   // bodega build run (per entry)
+	EventPackage EventType = "package" // bodega build package (per entry)
+	EventUpload  EventType = "upload"  // bodega build upload (per entry)
+	EventSync    EventType = "sync"    // bodega build sync (per entry)
+	EventCreate  EventType = "create"  // bodega create
+	EventDelete  EventType = "delete"  // bodega delete
+	EventRepair  EventType = "repair"  // bodega repair
+	EventRefresh EventType = "refresh" // bodega refresh
+	EventHide    EventType = "hide"    // bodega hide
+	EventFreeze  EventType = "freeze"  // bodega freeze
+	EventShow    EventType = "show"    // bodega show
+
+	// Server lifecycle events.
+	EventServeStart EventType = "serve_start" // bodega serve started
+	EventServeStop  EventType = "serve_stop"  // bodega serve shut down
+
+	// Client events (HTTP server).
+	EventServeFetch EventType = "serve_fetch" // client downloaded a package via HTTP
+	EventCache      EventType = "cache"       // proxy cache miss
 )
 
 // Event is a single audit record.
@@ -45,18 +64,64 @@ type StoredEvent struct {
 
 // Filter controls which events are returned by Query.
 type Filter struct {
-	EventType  EventType // empty = all
-	PkgType    string    // empty = all
-	PkgName    string    // empty = all
-	ClientIP   string    // empty = all
-	Since      time.Time // zero = no lower bound
-	Until      time.Time // zero = no upper bound
-	Limit      int       // 0 = default (1000)
+	EventType EventType // empty = all
+	PkgType   string    // empty = all
+	PkgName   string    // empty = all
+	ClientIP  string    // empty = all
+	Since     time.Time // zero = no lower bound
+	Until     time.Time // zero = no upper bound
+	Limit     int       // 0 = default (1000)
 }
 
 // DB is a SQLite audit database.
 type DB struct {
-	db *sql.DB
+	db       *sql.DB
+	filter   map[string]bool // nil = record all; otherwise only listed types
+	location *time.Location  // display timezone (storage is always UTC)
+}
+
+// SetEventFilter restricts which event types are recorded. Pass nil or empty
+// to record all events. Events not in the filter are silently dropped.
+func (a *DB) SetEventFilter(allowed []string) {
+	if len(allowed) == 0 {
+		a.filter = nil
+		return
+	}
+	a.filter = make(map[string]bool, len(allowed))
+	for _, t := range allowed {
+		a.filter[t] = true
+	}
+}
+
+// ShouldRecord returns true if the given event type passes the filter.
+func (a *DB) ShouldRecord(evType EventType) bool {
+	if a.filter == nil {
+		return true
+	}
+	return a.filter[string(evType)]
+}
+
+// SetTimezone sets the display timezone for query results. Stored timestamps
+// are always UTC; this only affects how they're presented.
+func (a *DB) SetTimezone(tz string) {
+	if tz == "" {
+		a.location = time.UTC
+		return
+	}
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		a.location = time.UTC
+		return
+	}
+	a.location = loc
+}
+
+// DisplayLocation returns the configured display timezone, defaulting to UTC.
+func (a *DB) DisplayLocation() *time.Location {
+	if a.location == nil {
+		return time.UTC
+	}
+	return a.location
 }
 
 const schema = `
@@ -93,6 +158,16 @@ CREATE TABLE IF NOT EXISTS checksums (
 );
 
 CREATE INDEX IF NOT EXISTS idx_checksums_pkg ON checksums(pkg_type, pkg_name);
+
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id         TEXT PRIMARY KEY,
+    label      TEXT NOT NULL,
+    hash       TEXT NOT NULL,
+    comment    TEXT DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    expires_at TEXT,
+    last_used  TEXT
+);
 `
 
 // Open opens (or creates) the audit database at path and runs migrations.
@@ -121,8 +196,12 @@ func (a *DB) Close() error {
 	return a.db.Close()
 }
 
-// Record inserts an audit event.
+// Record inserts an audit event. Events that don't pass the configured
+// filter are silently dropped.
 func (a *DB) Record(ctx context.Context, ev Event) error {
+	if !a.ShouldRecord(ev.EventType) {
+		return nil
+	}
 	_, err := a.db.ExecContext(ctx,
 		`INSERT INTO events (event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -194,6 +273,9 @@ func (a *DB) Query(ctx context.Context, f Filter) ([]StoredEvent, error) {
 		}
 		se.EventType = EventType(et)
 		se.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
+		if a.location != nil {
+			se.Timestamp = se.Timestamp.In(a.location)
+		}
 		events = append(events, se)
 	}
 	return events, rows.Err()
@@ -333,4 +415,141 @@ func (a *DB) ClearChecksumsByPackage(ctx context.Context, pkgType, pkgName strin
 		pkgType, pkgName,
 	)
 	return err
+}
+
+// ---- API Token Management ---------------------------------------------------
+
+// TokenInfo holds non-sensitive metadata about an API token.
+type TokenInfo struct {
+	ID        string
+	Label     string
+	Comment   string
+	CreatedAt time.Time
+	ExpiresAt *time.Time // nil = never expires
+	LastUsed  *time.Time // nil = never used
+}
+
+// TokenHash holds the hash and expiry for auth verification.
+type TokenHash struct {
+	ID        string
+	Hash      string
+	ExpiresAt *time.Time
+}
+
+// InsertToken stores a new hashed API token.
+func (a *DB) InsertToken(ctx context.Context, id, label, hash, comment string, expiresAt *time.Time) error {
+	var exp sql.NullString
+	if expiresAt != nil {
+		exp = sql.NullString{String: expiresAt.UTC().Format(time.RFC3339), Valid: true}
+	}
+	_, err := a.db.ExecContext(ctx,
+		"INSERT INTO api_tokens (id, label, hash, comment, expires_at) VALUES (?, ?, ?, ?, ?)",
+		id, label, hash, comment, exp,
+	)
+	return err
+}
+
+// ListTokens returns metadata for all tokens (never the hash).
+func (a *DB) ListTokens(ctx context.Context) ([]TokenInfo, error) {
+	rows, err := a.db.QueryContext(ctx,
+		"SELECT id, label, comment, created_at, expires_at, last_used FROM api_tokens ORDER BY created_at DESC",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tokens []TokenInfo
+	for rows.Next() {
+		var t TokenInfo
+		var created, expires, lastUsed sql.NullString
+		if err := rows.Scan(&t.ID, &t.Label, &t.Comment, &created, &expires, &lastUsed); err != nil {
+			return nil, err
+		}
+		if created.Valid {
+			if parsed, err := time.Parse(time.RFC3339Nano, created.String); err == nil {
+				t.CreatedAt = parsed
+			}
+		}
+		if expires.Valid {
+			if parsed, err := time.Parse(time.RFC3339, expires.String); err == nil {
+				t.ExpiresAt = &parsed
+			}
+		}
+		if lastUsed.Valid {
+			if parsed, err := time.Parse(time.RFC3339, lastUsed.String); err == nil {
+				t.LastUsed = &parsed
+			}
+		}
+		tokens = append(tokens, t)
+	}
+	return tokens, rows.Err()
+}
+
+// GetTokenHashes returns all token hashes for auth verification.
+func (a *DB) GetTokenHashes(ctx context.Context) ([]TokenHash, error) {
+	rows, err := a.db.QueryContext(ctx,
+		"SELECT id, hash, expires_at FROM api_tokens",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var hashes []TokenHash
+	for rows.Next() {
+		var h TokenHash
+		var expires sql.NullString
+		if err := rows.Scan(&h.ID, &h.Hash, &expires); err != nil {
+			return nil, err
+		}
+		if expires.Valid {
+			if parsed, err := time.Parse(time.RFC3339, expires.String); err == nil {
+				h.ExpiresAt = &parsed
+			}
+		}
+		hashes = append(hashes, h)
+	}
+	return hashes, rows.Err()
+}
+
+// UpdateTokenLastUsed sets the last_used timestamp for a token.
+func (a *DB) UpdateTokenLastUsed(ctx context.Context, id string) error {
+	_, err := a.db.ExecContext(ctx,
+		"UPDATE api_tokens SET last_used = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+		id,
+	)
+	return err
+}
+
+// DeleteToken removes a token by ID.
+// DeleteToken removes a token by ID. Returns an error if the token does not exist.
+func (a *DB) DeleteToken(ctx context.Context, id string) (bool, error) {
+	result, err := a.db.ExecContext(ctx,
+		"DELETE FROM api_tokens WHERE id = ?",
+		id,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, _ := result.RowsAffected()
+	return n > 0, nil
+}
+
+// DeleteTokenByLabel removes a token by label.
+func (a *DB) DeleteTokenByLabel(ctx context.Context, label string) error {
+	_, err := a.db.ExecContext(ctx,
+		"DELETE FROM api_tokens WHERE label = ?",
+		label,
+	)
+	return err
+}
+
+// TokenCount returns the number of active (non-expired) tokens.
+func (a *DB) TokenCount(ctx context.Context) (int, error) {
+	var count int
+	err := a.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM api_tokens WHERE expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+	).Scan(&count)
+	return count, err
 }

@@ -5,7 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/scaleapi/bodega/internal/tui"
+	"github.com/ravinald/bodega/internal/tui"
 )
 
 // newShellCmd constructs the "shell" sub-command which launches the TUI.
@@ -37,15 +37,20 @@ Press ? for keybinding help, q to quit.`,
 			// commands (build, fetch, package, verify, freeze, delete) still work;
 			// only S3-touching commands (status, upload, sync, remove, init) will
 			// report an error when executed from the shell pane.
+			auditDB := openAuditDB(gf)
+			if auditDB != nil {
+				defer auditDB.Close()
+			}
+
 			if cfg.Bucket == "" {
-				return tui.Run(cfg, store, nil)
+				return tui.Run(cfg, store, nil, auditDB)
 			}
 
 			s3client, err := newS3Client(cfg)
 			if err != nil {
 				return fmt.Errorf("connect to AWS: %w", err)
 			}
-			return tui.Run(cfg, store, s3client)
+			return tui.Run(cfg, store, s3client, auditDB)
 		},
 	}
 }

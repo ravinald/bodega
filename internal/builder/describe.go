@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 var descClient = &http.Client{Timeout: 10 * time.Second}

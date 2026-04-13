@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/scaleapi/bodega/internal/audit"
-	"github.com/scaleapi/bodega/internal/logging"
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/logging"
 )
 
 // contextKey is an unexported type for context keys in this package.
@@ -343,7 +344,7 @@ func AuditMiddleware(db *audit.DB) func(http.Handler) http.Handler {
 			}
 
 			_ = db.Record(r.Context(), audit.Event{
-				EventType:  audit.EventFetch,
+				EventType:  audit.EventServeFetch,
 				PkgType:    pkgType,
 				PkgName:    pkgName,
 				PkgVersion: pkgVersion,
@@ -417,6 +418,148 @@ func parsePackagePath(path string) (pkgType, pkgName, pkgVersion string) {
 		return "npm", full, ""
 	}
 	return "", "", ""
+}
+
+// isLocalhostOnly returns true if every entry in nets is a loopback range.
+func isLocalhostOnly(nets []*net.IPNet) bool {
+	for _, n := range nets {
+		if !n.IP.IsLoopback() {
+			return false
+		}
+	}
+	return true
+}
+
+// MutationAuthMiddleware restricts POST and DELETE requests to clients in
+// adminNets. When the allow-list extends beyond localhost, a valid Bearer
+// token is required, verified via SHA-256(token + pepper) against the
+// hashes stored in the audit DB.
+//
+// GET/HEAD/OPTIONS requests pass through unconditionally — package manager
+// clients (apt, pip, go, npm) cannot send auth headers over standard protocols.
+func MutationAuthMiddleware(adminNets []*net.IPNet, auditDB *audit.DB, pepper string, logger *slog.Logger) func(http.Handler) http.Handler {
+	localhostOnly := isLocalhostOnly(adminNets)
+
+	// Cache token hashes to avoid per-request DB queries.
+	var cachedHashes []audit.TokenHash
+	var cacheTime time.Time
+	const cacheTTL = 30 * time.Second
+
+	loadHashes := func() []audit.TokenHash {
+		if time.Since(cacheTime) < cacheTTL && cachedHashes != nil {
+			return cachedHashes
+		}
+		if auditDB == nil {
+			return nil
+		}
+		hashes, err := auditDB.GetTokenHashes(context.Background())
+		if err != nil {
+			logger.Error("failed to load token hashes", "error", err)
+			return cachedHashes // return stale cache on error
+		}
+		cachedHashes = hashes
+		cacheTime = time.Now()
+		return hashes
+	}
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost && r.Method != http.MethodDelete && r.Method != http.MethodPatch {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// Check IP against admin_permit_cidr.
+			clientIP := net.ParseIP(ClientIP(r))
+			if clientIP == nil {
+				logger.Warn("mutation blocked: unparseable client IP", "remote", r.RemoteAddr)
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+			allowed := false
+			for _, n := range adminNets {
+				if n.Contains(clientIP) {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				logger.Warn("mutation blocked: IP not in admin_permit_cidr",
+					"client_ip", clientIP.String(), "method", r.Method, "path", r.URL.Path)
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+
+			// If the allow-list goes beyond localhost, require a valid Bearer token.
+			if !localhostOnly {
+				hashes := loadHashes()
+				if len(hashes) == 0 {
+					logger.Warn("mutation blocked: no tokens configured for remote access",
+						"client_ip", clientIP.String())
+					http.Error(w, "Unauthorized — no tokens configured", http.StatusUnauthorized)
+					return
+				}
+
+				auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+				if auth == "" || auth == r.Header.Get("Authorization") {
+					// No Bearer prefix or empty token.
+					http.Error(w, "Unauthorized", http.StatusUnauthorized)
+					return
+				}
+
+				// Hash the incoming token with pepper and compare.
+				incoming := audit.HashToken(auth, pepper)
+
+				var matched *audit.TokenHash
+				for i := range hashes {
+					if subtle.ConstantTimeCompare([]byte(incoming), []byte(hashes[i].Hash)) == 1 {
+						matched = &hashes[i]
+						break
+					}
+				}
+
+				if matched == nil {
+					logger.Warn("mutation blocked: invalid token",
+						"client_ip", clientIP.String(), "method", r.Method, "path", r.URL.Path)
+					http.Error(w, "Unauthorized", http.StatusUnauthorized)
+					return
+				}
+
+				// Check expiry.
+				if matched.ExpiresAt != nil && matched.ExpiresAt.Before(time.Now()) {
+					logger.Warn("mutation blocked: token expired",
+						"token_id", matched.ID, "client_ip", clientIP.String())
+					http.Error(w, "Unauthorized — token expired", http.StatusUnauthorized)
+					return
+				}
+
+				// Update last_used asynchronously.
+				if auditDB != nil {
+					go func(id string) {
+						_ = auditDB.UpdateTokenLastUsed(context.Background(), id)
+					}(matched.ID)
+				}
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// SecurityHeadersMiddleware adds standard security headers to every response.
+func SecurityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		h.Set("Content-Security-Policy",
+			"default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'")
+		if r.TLS != nil {
+			h.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func isBinaryContentType(ct string) bool {

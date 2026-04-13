@@ -8,7 +8,7 @@ package manifest
 import "strings"
 
 // CurrentConfigVersion is the schema version written to all manifests.
-const CurrentConfigVersion = 2
+const CurrentConfigVersion = 1
 
 // Type constants identify the package ecosystem for a manifest.
 const (
@@ -49,13 +49,13 @@ type Checksum struct {
 // BuildEnv captures the build server's environment at the time an artifact
 // was produced. Populated automatically — the operator does not set this.
 type BuildEnv struct {
-	Platform  string `json:"platform"`            // "linux/amd64"
+	Platform  string `json:"platform"`             // "linux/amd64"
 	OSRelease string `json:"os_release,omitempty"` // "Ubuntu 24.04.2 LTS"
 	Python    string `json:"python,omitempty"`     // "3.12.3"
 	Go        string `json:"go,omitempty"`         // "1.24.2"
 	Rust      string `json:"rust,omitempty"`       // "1.78.0"
 	Bodega    string `json:"bodega,omitempty"`     // build version
-	BuiltAt   string `json:"built_at,omitempty"`  // RFC3339 timestamp
+	BuiltAt   string `json:"built_at,omitempty"`   // RFC3339 timestamp
 }
 
 // PackageManifest is the on-disk representation of a single package.

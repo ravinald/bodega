@@ -27,28 +27,28 @@ Comprehensive documentation for the bodega package repository manager.
 
 ### `bodega init`
 
-Creates the S3 bucket with server-side encryption (AES-256), versioning enabled, and all public access blocked. Idempotent.
+Creates the S3 bucket with server-side encryption (AES-256), versioning enabled, and all public access blocked. Idempotent. Only needed when `storage_backend` is `"s3"`. Local storage requires no initialization.
 
-### `bodega build fetch [TYPE...] [--entry NAME]`
+### `bodega build fetch [TYPE...] [NAME]`
 
 Downloads raw sources without building or packaging. If no types are given, all types are fetched in dependency order: `binary → git → apt → pypi → gomod → helm → npm`.
 
-The `--entry` flag restricts the operation to a single named entry.
+When a name is given after the type, only that entry is fetched.
 
 ```bash
 bodega build fetch                 # fetch all types
 bodega build fetch git             # fetch git sources only
-bodega build fetch git --entry netbox  # fetch only netbox
+bodega build fetch git netbox      # fetch only netbox
 ```
 
-### `bodega build run [TYPE...] [--entry NAME]`
+### `bodega build run [TYPE...] [NAME]`
 
 Compiles or prepares sources. Auto-fetches if sources are not already present (stage cascading). Types without a build step (binary, gomod, helm, npm) are skipped for the build phase.
 
 ```bash
 bodega build run                   # build all types
 bodega build run apt               # build apt sources only
-bodega build run apt --entry python3
+bodega build run apt python3
 ```
 
 ### `bodega build sync [TYPE...]`
@@ -60,14 +60,14 @@ bodega build sync                  # push all local artifacts
 bodega build sync pypi helm        # push pypi and helm only
 ```
 
-### `bodega build upload [TYPE...] [--entry NAME]`
+### `bodega build upload [TYPE...] [NAME]`
 
 Runs the full pipeline (fetch → build) then uploads artifacts to S3. This is the most common command for end-to-end operation.
 
 ```bash
 bodega build upload                # fetch, build, and upload all types
 bodega build upload git            # fetch, build, and upload git only
-bodega build upload git --entry netbox
+bodega build upload git netbox
 ```
 
 ### `bodega status [TYPE...]`
@@ -79,24 +79,24 @@ bodega status                      # check all types
 bodega status apt pypi             # check apt and pypi only
 ```
 
-### `bodega verify`
+### `bodega pkg verify`
 
 Checks that every `.md5` companion file matches its manifest. Use this to detect out-of-band modifications.
 
-### `bodega refresh [TYPE] [NAME] [--force]`
+### `bodega pkg refresh [TYPE] [NAME] [--force]`
 
 Discovers available versions from upstream registries for entries with `version_constraint: "any"` or `version_constraint: "compatible"`. Creates manifest records for new versions without fetching them.
 
 For proxy-mode entries, versions are served on demand when a client requests them.
 
 ```bash
-bodega refresh                     # refresh all entries
-bodega refresh pypi                # refresh all pypi packages
-bodega refresh pypi django         # refresh only django
-bodega refresh --force             # re-discover even if versions exist
+bodega pkg refresh                     # refresh all entries
+bodega pkg refresh pypi                # refresh all pypi packages
+bodega pkg refresh pypi django         # refresh only django
+bodega pkg refresh --force             # re-discover even if versions exist
 ```
 
-### `bodega repair [check]`
+### `bodega pkg repair [check]`
 
 Detects and fixes inconsistencies in the manifest store:
 
@@ -107,8 +107,8 @@ Detects and fixes inconsistencies in the manifest store:
 5. **Graph rebuild**: dependency edges are rebuilt from RequiredBy fields
 
 ```bash
-bodega repair                      # detect and fix
-bodega repair check                # detect only, no changes
+bodega pkg repair                      # detect and fix
+bodega pkg repair check                # detect only, no changes
 ```
 
 ### `bodega show repo [TYPE] [PACKAGE] [VERSION]`
@@ -136,68 +136,88 @@ bodega show pkg pypi django 5.2.12    # specific version detail
 bodega show pkg pypi django json      # JSON output
 ```
 
-### `bodega hide TYPE NAME [VERSION]`
+### `bodega pkg hide TYPE NAME [VERSION]`
 
 Toggle the hidden flag on a package or version. Hidden packages are not served to clients but remain in the manifest for record-keeping.
 
 When VERSION is given, only that specific version is toggled. Without VERSION, all versions of the package are toggled.
 
 ```bash
-bodega hide apt libssl3                # hide all versions
-bodega hide apt libssl3 3.0.0-ubuntu2  # hide specific version
-bodega hide apt libssl3                # unhide (toggle)
+bodega pkg hide apt libssl3                # hide all versions
+bodega pkg hide apt libssl3 3.0.0-ubuntu2  # hide specific version
+bodega pkg hide apt libssl3                # unhide (toggle)
 ```
 
-### `bodega freeze TYPE NAME [VERSION]`
+### `bodega pkg freeze TYPE NAME [VERSION]`
 
 Toggle the `frozen` flag on a package or version. Frozen entries cannot be built, edited, or deleted. Running `freeze` on a frozen entry unfreezes it.
 
 ```bash
-bodega freeze git netbox       # freeze
-bodega freeze git netbox       # unfreeze (toggle)
+bodega pkg freeze git netbox       # freeze
+bodega pkg freeze git netbox       # unfreeze (toggle)
 ```
 
-### `bodega create <type>`
+### `bodega pkg create <type> [name]`
 
-Adds a new entry to a manifest. Missing flags are prompted interactively.
+Adds a new entry to a manifest interactively. The name can be given as a positional argument or prompted. All other fields (URL, version, etc.) are prompted.
 
-**Common flags:**
-
-| Flag | Purpose |
-|------|---------|
-| `--name` | Entry name |
-| `--url` | URL (git remote, download URL, registry URL) |
-| `--ref` | Version / git ref |
-
-**Type-specific flags:**
-
-| Flag | Type | Purpose |
-|------|------|---------|
-| `--sha256` | binary | Expected SHA-256 |
-| `--filename` | binary | Filename override |
-| `--build-cmd` | apt | Shell command to build .deb |
-| `--deb-glob` | apt | Glob to locate produced .deb |
-| `--source-name` | apt | Upstream apt package name |
-| `--source-build` | apt | Use apt-get source + dpkg-buildpackage |
-
-**Examples:**
+For automation, use `bodega pkg import` with a JSON manifest file instead.
 
 ```bash
-bodega create git --name netbox --url https://github.com/netbox-community/netbox --ref v4.5.7
-bodega create apt --name python3
-bodega create binary --name awscli-v2 --url https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
-bodega create gomod --name github.com/aws/aws-sdk-go-v2 --ref v1.30.0
-bodega create helm --name nginx --url https://charts.example.com/nginx-1.0.tgz --ref 1.0.0
-bodega create npm --name lodash --ref 4.17.21
+bodega pkg create git netbox                  # prompts for url and ref
+bodega pkg create apt python3                 # prompts for apt-specific fields
+bodega pkg create gomod github.com/aws/aws-sdk-go-v2   # prompts for version
+bodega pkg create apt                         # fully interactive (prompts for name too)
 ```
 
-### `bodega delete <type> <name> [--remove-from-s3]`
+### `bodega pkg delete <type> <name> [--remove-from-s3]`
 
 Removes an entry from the manifest. Pass `--remove-from-s3` to also delete the artifact from S3. Frozen entries cannot be deleted.
 
-### `bodega remove <type> <name>`
+### `bodega pkg remove <type> <name>`
 
 Removes an artifact from S3 without touching the manifest.
+
+### `bodega pkg import <file> [file...]`
+
+Imports package manifests from JSON files. Use `-` to read from stdin. This is the preferred method for automation and CI/CD pipelines.
+
+```bash
+bodega pkg import nginx.json                       # import from file
+bodega pkg import packages/*.json                  # import multiple files
+cat manifest.json | bodega pkg import -            # import from stdin
+bodega pkg import --merge updated.json             # add versions to existing package
+```
+
+The JSON format is the same `PackageManifest` used internally:
+
+```json
+{
+  "name": "nginx",
+  "type": "helm",
+  "versions": [
+    {
+      "version": "4.11.0",
+      "url": "https://kubernetes.github.io/ingress-nginx/charts/ingress-nginx-4.11.0.tgz"
+    }
+  ]
+}
+```
+
+Without `--merge`, importing a package that already exists is an error. With `--merge`, new versions are added to the existing package.
+
+### `bodega pkg export [type] [name]`
+
+Exports package manifests as JSON to stdout. Useful for backups, migrations, and inspecting manifest state.
+
+```bash
+bodega pkg export                          # all packages, all types
+bodega pkg export apt                      # all apt packages
+bodega pkg export apt python3              # single package
+bodega pkg export apt python3 > python3.json   # save to file
+```
+
+A single package is output as a JSON object. Multiple packages are output as a JSON array.
 
 ### `bodega serve [flags]`
 
@@ -217,7 +237,7 @@ The server handles graceful shutdown on SIGTERM/SIGINT, giving in-flight request
 
 Launches the interactive TUI. See [TUI](#tui) section for keybindings.
 
-### `bodega audit [flags]`
+### `bodega audit events [flags]`
 
 Queries the SQLite audit database.
 
@@ -231,19 +251,42 @@ Queries the SQLite audit database.
 | `--limit` | `20` | Max events to show |
 
 ```bash
-bodega audit                                    # last 20 events
-bodega audit --type fetch --limit 50            # last 50 fetches
-bodega audit --pkg-type gomod --since 2026-04-07
-bodega audit --client 10.0.0.5
+bodega audit events                                    # last 20 events
+bodega audit events --type fetch --limit 50            # last 50 fetches
+bodega audit events --pkg-type gomod --since 2026-04-07
+bodega audit events --client 10.0.0.5
 ```
 
-### `bodega checksum list [--type TYPE] [--name NAME]`
+### `bodega pkg checksum list [--type TYPE] [--name NAME]`
 
 Lists cached SHA-256 checksums stored in the audit database.
 
-### `bodega checksum clear <type> <name> [--version VER]`
+### `bodega pkg checksum clear <type> <name> [--version VER]`
 
 Clears cached checksums for a package. The next fetch will recompute and store a fresh checksum. Use `--version` to clear only a specific version.
+
+### `bodega token generate <label> [expiry <duration|date|never>] [comment]`
+
+Generates a cryptographically random API token. The raw token is displayed once and cannot be retrieved later. A SHA-256 hash (with a server-side pepper) is stored in the audit database.
+
+```bash
+bodega token generate ci-pipeline                        # expires in 365 days (default)
+bodega token generate ci-pipeline expiry 90d             # expires in 90 days
+bodega token generate ci-pipeline expiry 2027-06-01      # expires on a specific date
+bodega token generate ci-pipeline expiry never            # no expiry
+bodega token generate ci-pipeline "Jenkins deploy key"    # with a comment
+bodega token generate ci-pipeline expiry 90d "CI token"   # expiry + comment
+```
+
+On first run, a pepper file is auto-generated at `/etc/bodega/pepper` (or `~/.config/bodega/pepper`) with `0600` permissions. This pepper is combined with the token before hashing, so the stored hash alone cannot be used to forge tokens.
+
+### `bodega token list`
+
+Lists all API tokens with their ID, label, creation date, expiry, last use, and comment. Expired tokens are marked.
+
+### `bodega token revoke <id|label>`
+
+Revokes a token by its short ID or label, removing it from the database.
 
 ### `bodega --break-glass-update-md5 <type>`
 
@@ -277,7 +320,9 @@ A default config is created on first run. All fields are optional.
 
 ```json
 {
-  "bucket": "bodega-864617344058",
+  "storage_backend": "local",
+  "storage_path": "/var/lib/bodega/data",
+  "bucket": "my-bodega-bucket",
   "region": "us-west-2",
   "build_root": "/opt/bodega",
   "manifest_dir": "manifests",
@@ -300,11 +345,22 @@ A default config is created on first run. All fields are optional.
   "metadata_ttl": "1h",
   "gomod_upstream": "https://proxy.golang.org",
   "npm_upstream": "https://registry.npmjs.org",
-  "audit_db": ""
+  "audit_db": "",
+  "deny_list": [],
+  "admin_permit_cidr": ["127.0.0.0/8", "::1/128"]
 }
 ```
 
+Config files are written with mode `0600` (owner read/write only).
+
 **Resolution priority:** CLI flags > environment variables > config file > built-in defaults.
+
+### Storage backends
+
+bodega supports two storage backends:
+
+- **`local`** (default): Stores artifacts on the local filesystem. Set `storage_path` to change the root directory (default: `/var/lib/bodega`). No initialization needed.
+- **`s3`**: Stores artifacts in an S3 bucket. Set `bucket` and `region`, then run `bodega init` to create the bucket with encryption and versioning.
 
 ### Per-type build roots
 
@@ -322,7 +378,7 @@ Each package is stored as a JSON file at `s3://{bucket}/manifests/{type}/{safeNa
 
 ```json
 {
-  "config_version": 2,
+  "config_version": 1,
   "name": "python3",
   "type": "apt",
   "description": "Python interpreter and libraries",
@@ -498,7 +554,7 @@ npm install --registry http://bodega-host:8080/npm <package>
 
 ### TLS
 
-Manual certificates:
+Manual certificates (minimum TLS 1.3):
 ```bash
 bodega serve --tls-cert cert.pem --tls-key key.pem
 ```
@@ -507,6 +563,17 @@ Or set in config:
 ```json
 { "tls_cert": "/etc/bodega/cert.pem", "tls_key": "/etc/bodega/key.pem" }
 ```
+
+When TLS is active, responses include `Strict-Transport-Security` (HSTS).
+
+### Security headers
+
+All responses include the following headers regardless of TLS:
+
+- `X-Content-Type-Options: nosniff`
+- `X-Frame-Options: DENY`
+- `Content-Security-Policy: default-src 'self'; ...`
+- `Referrer-Policy: strict-origin-when-cross-origin`
 
 ### Behind nginx
 
@@ -535,7 +602,7 @@ server {
 
 ## REST API
 
-All API responses are JSON.
+All API responses are JSON. The full API is documented in [OpenAPI 3.0 format](../api/openapi.yaml).
 
 ### Read endpoints
 
@@ -546,6 +613,7 @@ All API responses are JSON.
 | GET | `/api/v1/packages/{type}/{name}` | Single entry details |
 | GET | `/api/v1/status` | Health check with entry counts and S3 probe |
 | GET | `/api/v1/config` | Non-sensitive config (bucket, region, manifest_dir) |
+| GET | `/api/v1/audit` | Query audit events (supports filters) |
 | GET | `/healthz` | Health probe (returns `ok`) |
 
 ### Mutation endpoints
@@ -554,19 +622,45 @@ All API responses are JSON.
 |--------|------|-------------|
 | POST | `/api/v1/packages/{type}` | Create a new entry (JSON body) |
 | DELETE | `/api/v1/packages/{type}/{name}` | Delete an entry |
+| PATCH | `/api/v1/packages/{type}/{name}/hide` | Toggle hidden (all versions) |
+| PATCH | `/api/v1/packages/{type}/{name}/hide/{version}` | Toggle hidden (specific version) |
+| PATCH | `/api/v1/packages/{type}/{name}/freeze` | Toggle frozen (all versions) |
+| PATCH | `/api/v1/packages/{type}/{name}/freeze/{version}` | Toggle frozen (specific version) |
 
-**Create example:**
+### Token endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/v1/tokens` | List all tokens |
+| POST | `/api/v1/tokens` | Create a new token (JSON body: `{label, expiry, comment}`) |
+| DELETE | `/api/v1/tokens/{id}` | Revoke a token |
+
+Mutation endpoints are restricted by `admin_permit_cidr`, which defaults to localhost only (`127.0.0.0/8`, `::1/128`). Requests from IPs outside the permit list get a 403.
+
+When `admin_permit_cidr` includes non-localhost addresses, a Bearer token is also required. Generate tokens with `bodega token generate` and pass them in the `Authorization` header.
+
+**Create example (from localhost):**
 ```bash
 curl -X POST http://localhost:8080/api/v1/packages/gomod \
   -H 'Content-Type: application/json' \
   -d '{"name": "github.com/aws/aws-sdk-go-v2", "version": "v1.30.0"}'
 ```
 
+**Create example (from a remote host):**
+```bash
+curl -X POST http://bodega-host:8080/api/v1/packages/gomod \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer bodega_ak_7f3a...' \
+  -d '{"name": "github.com/aws/aws-sdk-go-v2", "version": "v1.30.0"}'
+```
+
 **Response codes:**
 - `201 Created` — entry added
 - `400 Bad Request` — missing required fields or invalid type
+- `401 Unauthorized` — missing or invalid Bearer token
+- `403 Forbidden` — IP not in `admin_permit_cidr`, or entry is frozen (delete)
 - `409 Conflict` — entry already exists
-- `403 Forbidden` — entry is frozen (delete only)
+- `413 Request Entity Too Large` — request body exceeds 1 MiB
 
 ---
 
@@ -580,7 +674,7 @@ A vulnerability is discovered in `libssl3` version `3.0.0-ubuntu1`:
 
 ```bash
 # 1. Hide the bad version from clients (stays in manifest as a record)
-bodega hide apt libssl3 3.0.0-ubuntu1
+bodega pkg hide apt libssl3 3.0.0-ubuntu1
 
 # 2. Fetch again — bodega skips the hidden version
 bodega build fetch apt
@@ -600,13 +694,13 @@ If you want to temporarily freeze version auto-discovery for a package:
 bodega show pkg apt libssl3
 
 # Freeze the wildcard policy entry to prevent new version resolution
-bodega freeze apt libssl3 "*"
+bodega pkg freeze apt libssl3 "*"
 
 # Later, when safe, unfreeze to allow new versions
-bodega freeze apt libssl3 "*"
+bodega pkg freeze apt libssl3 "*"
 ```
 
-When the policy entry is frozen, `bodega refresh` will not create new version records. When unfrozen, it will again discover versions.
+When the policy entry is frozen, `bodega pkg refresh` will not create new version records. When unfrozen, it will again discover versions.
 
 ### Scenario: Supply chain audit
 
@@ -620,7 +714,7 @@ bodega show pkg apt
 bodega show pkg apt libssl3
 
 # Rebuild dependency graph to verify links
-bodega repair check
+bodega pkg repair check
 ```
 
 ---
@@ -663,9 +757,9 @@ Checksums protect against upstream tampering and bit-rot.
 
 **Management:**
 ```bash
-bodega checksum list                        # view all cached checksums
-bodega checksum list --type gomod           # filter by type
-bodega checksum clear gomod github.com/foo  # clear, next fetch recomputes
+bodega pkg checksum list                        # view all cached checksums
+bodega pkg checksum list --type gomod           # filter by type
+bodega pkg checksum clear gomod github.com/foo  # clear, next fetch recomputes
 ```
 
 ---
@@ -686,9 +780,9 @@ Every package fetch, build, CRUD mutation, and cache event is recorded in a SQLi
 
 **Query examples:**
 ```bash
-bodega audit --type fetch --limit 50
-bodega audit --name lodash --since 2026-04-07
-bodega audit --client 10.0.0.5
+bodega audit events --type fetch --limit 50
+bodega audit events --name lodash --since 2026-04-07
+bodega audit events --client 10.0.0.5
 ```
 
 The audit middleware records: timestamp, event type, package type/name/version, client IP, user agent, HTTP status, and request duration.
@@ -726,6 +820,7 @@ The audit middleware records: timestamp, event type, package type/name/version, 
 | `?` | Show help |
 | `q` | Quit |
 | `C` | Open config editor |
+| `T` | Open token manager |
 
 ### Config editor
 
@@ -735,7 +830,7 @@ Press `C` to open the config form. `Ctrl+S` saves, `Ctrl+T` loads defaults, `Ctr
 
 ## Web Dashboard
 
-Access the dashboard at `http://bodega-host:8080/dashboard` when the server is running.
+Access the dashboard at `http://bodega-host:8080/` when the server is running.
 
 **Features:**
 - **Live metrics**: package counts by type, total artifact size, version statistics
@@ -760,11 +855,13 @@ manifests/
   ...
 ```
 
-The tool verifies MD5 on every manifest read and writes a fresh MD5 after every modification. Use `bodega verify` to check integrity, and `bodega --break-glass-update-md5 <type>` to recompute after a manual edit.
+The tool verifies MD5 on every manifest read and writes a fresh MD5 after every modification. Use `bodega pkg verify` to check integrity, and `bodega --break-glass-update-md5 <type>` to recompute after a manual edit.
 
 ---
 
-## S3 Layout
+## Storage Layout
+
+The key layout is the same regardless of backend (local filesystem or S3):
 
 | Type | S3 prefix | Example key |
 |------|-----------|-------------|
@@ -810,13 +907,12 @@ internal/
   config/               Configuration resolution
   logging/              Structured leveled logging (slog)
   manifest/             Manifest types, loader, MD5 integrity
-  s3/                   AWS S3 client
+  s3/                   AWS S3 client (used by storage/s3 adapter)
   server/               HTTP server, proxy/cache, middleware
+  storage/              Pluggable object storage (local, S3)
   tui/                  Bubbletea three-pane TUI
-manifests/              JSON manifest files (source of truth)
 schemas/                JSON Schema validation files
 docs/                   Public documentation
-docs-internal/          Development documentation + changelogs
 ```
 
 ### Adding a new source type

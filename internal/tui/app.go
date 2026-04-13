@@ -21,12 +21,12 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/scaleapi/bodega/internal/audit"
-	"github.com/scaleapi/bodega/internal/builder"
-	"github.com/scaleapi/bodega/internal/config"
-	"github.com/scaleapi/bodega/internal/manifest"
-	bos3 "github.com/scaleapi/bodega/internal/s3"
-	"github.com/scaleapi/bodega/internal/server"
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/builder"
+	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/manifest"
+	bos3 "github.com/ravinald/bodega/internal/s3"
+	"github.com/ravinald/bodega/internal/server"
 )
 
 // focusTarget identifies which pane currently has keyboard focus.
@@ -62,6 +62,7 @@ type appModel struct {
 	cfg      *config.Config
 	store    *manifest.Store
 	s3client *bos3.Client
+	auditDB  *audit.DB
 
 	width     int
 	height    int
@@ -80,7 +81,7 @@ type appModel struct {
 }
 
 // newAppModel constructs the initial application model.
-func newAppModel(cfg *config.Config, store *manifest.Store, s3client *bos3.Client) appModel {
+func newAppModel(cfg *config.Config, store *manifest.Store, s3client *bos3.Client, auditDB *audit.DB) appModel {
 	logH := cfg.LogWindowHeight
 	if logH <= 0 {
 		logH = DefaultLogHeight
@@ -89,6 +90,7 @@ func newAppModel(cfg *config.Config, store *manifest.Store, s3client *bos3.Clien
 		cfg:       cfg,
 		store:     store,
 		s3client:  s3client,
+		auditDB:   auditDB,
 		focus:     focusSources,
 		logHeight: logH,
 	}
@@ -172,6 +174,8 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						Prefix:   "manifests/",
 						GetFn:    s3c.GetObject,
 						PutFn:    s3c.PutBytes,
+						DeleteFn: s3c.DeleteObject,
+						ListFn:   s3c.ListPrefix,
 						Label_:   fmt.Sprintf("s3://%s/manifests/", cfg.Bucket),
 					}
 					store = manifest.NewStore(backend)
@@ -219,10 +223,10 @@ func (m appModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				err = store.LoadIndex(ctx)
 			} else {
 				backend := &manifest.S3Backend{
-					Prefix:   "manifests/",
-					GetFn:    s3c.GetObject,
-					PutFn:    s3c.PutBytes,
-					Label_:   fmt.Sprintf("s3://%s/manifests/", cfg.Bucket),
+					Prefix: "manifests/",
+					GetFn:  s3c.GetObject,
+					PutFn:  s3c.PutBytes,
+					Label_: fmt.Sprintf("s3://%s/manifests/", cfg.Bucket),
 				}
 				store = manifest.NewStore(backend)
 				err = store.LoadIndex(ctx)
@@ -379,6 +383,13 @@ func (m appModel) handlePopupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.lastCreatedName = ""
 			}
 			m.syncDetails()
+			return m, nil
+		}
+		return m, nil
+
+	case popupTokenManager:
+		dismissed := m.popup.HandleTokenManagerKey(key)
+		if dismissed {
 			return m, nil
 		}
 		return m, nil
@@ -571,6 +582,35 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "?":
 		m.popup.kind = popupHelp
 
+	case "T":
+		// Open token manager popup.
+		m.popup = popupModel{kind: popupTokenManager}
+		if m.auditDB != nil {
+			tokens, err := m.auditDB.ListTokens(context.Background())
+			if err == nil {
+				for _, t := range tokens {
+					row := tokenDisplayRow{
+						ID:      t.ID,
+						Label:   t.Label,
+						Comment: t.Comment,
+					}
+					if t.ExpiresAt != nil {
+						row.Expires = t.ExpiresAt.Format("2006-01-02")
+						row.Expired = t.ExpiresAt.Before(time.Now())
+					} else {
+						row.Expires = "never"
+					}
+					if t.LastUsed != nil {
+						row.LastUsed = t.LastUsed.Format("2006-01-02 15:04")
+					} else {
+						row.LastUsed = "-"
+					}
+					m.popup.tokenList = append(m.popup.tokenList, row)
+				}
+			}
+		}
+		return m, nil
+
 	case "/":
 		m.filterMode = true
 		m.filterInput = ""
@@ -671,6 +711,10 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.log.appendLog(errorStyle.Render("Edit failed: could not load package"))
 					return
 				}
+
+				// Capture before state for audit diff.
+				beforeJSON, _ := json.MarshalIndent(pm, "", "  ")
+
 				ve := &pm.Versions[0]
 
 				// Update fields common to all types.
@@ -711,6 +755,18 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.log.appendLog(successStyle.Render(
 					fmt.Sprintf("Updated %s/%s", node.EntryType, node.Name),
 				))
+
+				// Record audit event with diff.
+				if m.auditDB != nil {
+					afterJSON, _ := json.MarshalIndent(pm, "", "  ")
+					_ = m.auditDB.Record(ctx, audit.Event{
+						EventType: audit.EventBuild,
+						PkgType:   node.EntryType,
+						PkgName:   node.Name,
+						Status:    "success",
+						Details:   audit.FormatDiff(beforeJSON, afterJSON),
+					})
+				}
 			},
 		}
 
@@ -720,7 +776,7 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		for _, e := range entries {
-			toggleHidden(m.store, e.EntryType, e.Name)
+			toggleHidden(m.store, e.EntryType, e.Name, m.auditDB)
 		}
 		m.sources.Refresh(m.store, m.statuses)
 		m.syncDetails()
@@ -744,7 +800,7 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		var cmds []tea.Cmd
 		for _, e := range entries {
-			cmds = append(cmds, executeDelete(e.EntryType, e.Name, m.store, m.s3client, m.cfg))
+			cmds = append(cmds, executeDelete(e.EntryType, e.Name, m.store, m.s3client, m.cfg, m.auditDB))
 		}
 		m.popup = popupModel{
 			kind:            popupConfirm,
@@ -780,7 +836,7 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		var cmds []tea.Cmd
 		for _, e := range entries {
-			cmds = append(cmds, executeFreeze(e.EntryType, e.Name, m.store))
+			cmds = append(cmds, executeFreeze(e.EntryType, e.Name, m.store, m.auditDB))
 		}
 		return m, tea.Sequence(cmds...)
 	}
@@ -1169,6 +1225,21 @@ func (m *appModel) buildCreatePopup() popupModel {
 					}
 				}
 			}
+
+			// Record create audit event with the full new manifest.
+			if m.auditDB != nil {
+				ctx := context.Background()
+				if pm, err := store.GetPackage(ctx, entryType, name); err == nil && pm != nil {
+					afterJSON, _ := json.MarshalIndent(pm, "", "  ")
+					_ = m.auditDB.Record(ctx, audit.Event{
+						EventType: audit.EventCreate,
+						PkgType:   entryType,
+						PkgName:   name,
+						Status:    "success",
+						Details:   audit.FormatDiff(nil, afterJSON),
+					})
+				}
+			}
 		}
 	}
 
@@ -1251,13 +1322,13 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 			typeField,
 			{Label: "Mode", Value: modeVal, Select: true,
 				Options: []string{"hosted", "proxy"},
-				Hint: "hosted = build wheels locally; proxy = fetch from upstream PyPI on demand"},
+				Hint:    "hosted = build wheels locally; proxy = fetch from upstream PyPI on demand"},
 			{Label: "Name", Value: restore("Name", ""),
 				Hint: "pip package specifier, e.g. boto3 or social-auth-core[openidconnect]"},
 			{Label: "Version", Value: versionVal, Disabled: versionDisabled,
 				LabelSelect: true, LabelSelectValue: constraintVal,
 				LabelSelectOptions: []string{"exact (=)", "compatible (^)", "patch (~)", "latest (*)"},
-				Hint: "e.g. 1.6.1 (leave blank for latest)"},
+				Hint:               "e.g. 1.6.1 (leave blank for latest)"},
 			{Label: "Required By", Value: restore("Required By", ""),
 				Hint: "comma-separated, e.g. netbox,standalone"},
 		})
@@ -1307,13 +1378,13 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 			typeField,
 			{Label: "Mode", Value: modeVal, Select: true,
 				Options: []string{"hosted", "proxy"},
-				Hint: "hosted = S3 only; proxy = fetch from upstream on cache miss"},
+				Hint:    "hosted = S3 only; proxy = fetch from upstream on cache miss"},
 			{Label: "Name", Value: restore("Name", ""),
 				Hint: "module path, e.g. github.com/aws/aws-sdk-go-v2"},
 			{Label: "Version", Value: versionVal, Disabled: versionDisabled,
 				LabelSelect: true, LabelSelectValue: constraintVal,
 				LabelSelectOptions: []string{"exact (=)", "compatible (^)", "patch (~)", "latest (*)"},
-				Hint: "e.g. v1.30.0"},
+				Hint:               "e.g. v1.30.0"},
 			{Label: "Source URL", Value: restore("Source URL", ""),
 				Hint: "upstream GOPROXY URL; leave empty for proxy.golang.org"},
 			{Label: "Checksum", Value: checksumVal,
@@ -1342,7 +1413,7 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 			typeField,
 			{Label: "Mode", Value: modeVal, Select: true,
 				Options: []string{"hosted", "proxy"},
-				Hint: "hosted = S3 only; proxy = fetch from upstream on cache miss"},
+				Hint:    "hosted = S3 only; proxy = fetch from upstream on cache miss"},
 			{Label: "Name", Value: restore("Name", ""),
 				Hint: "chart name, e.g. ingress-nginx"},
 			{Label: "Version", Value: versionVal, Disabled: versionDisabled,
@@ -1377,7 +1448,7 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 			typeField,
 			{Label: "Mode", Value: modeVal, Select: true,
 				Options: []string{"hosted", "proxy"},
-				Hint: "hosted = S3 only; proxy = fetch from upstream on cache miss"},
+				Hint:    "hosted = S3 only; proxy = fetch from upstream on cache miss"},
 			{Label: "Name", Value: restore("Name", ""),
 				Hint: "package name, e.g. lodash or @scope/pkg"},
 			{Label: "Version", Value: versionVal, Disabled: versionDisabled,
@@ -1421,7 +1492,7 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 			typeField,
 			{Label: "Apt Mode", Value: aptMode, Select: true,
 				Options: []string{"Package Name", "Direct URL", "Source Build"},
-				Hint: "how to acquire the .deb package"},
+				Hint:    "how to acquire the .deb package"},
 			{Label: "Build From", Value: buildFrom, Select: true,
 				Options:  []string{"Git repo", "apt-get source"},
 				Disabled: !isSourceBuild,
@@ -1703,12 +1774,15 @@ func validateURLReachable(url string) string {
 }
 
 // toggleHidden flips the Hidden flag on all versions of a manifest entry and saves.
-func toggleHidden(store *manifest.Store, entryType, name string) {
+func toggleHidden(store *manifest.Store, entryType, name string, auditDB *audit.DB) {
 	ctx := context.Background()
 	pm, err := store.GetPackage(ctx, entryType, name)
 	if err != nil || pm == nil {
 		return
 	}
+
+	beforeJSON, _ := json.MarshalIndent(pm, "", "  ")
+
 	// Determine new state: if all hidden, unhide; otherwise hide all.
 	allHidden := len(pm.Versions) > 0
 	for _, ve := range pm.Versions {
@@ -1722,6 +1796,17 @@ func toggleHidden(store *manifest.Store, entryType, name string) {
 		pm.Versions[i].Hidden = newState
 	}
 	_ = store.SavePackage(ctx, pm)
+
+	if auditDB != nil {
+		afterJSON, _ := json.MarshalIndent(pm, "", "  ")
+		_ = auditDB.Record(ctx, audit.Event{
+			EventType: audit.EventHide,
+			PkgType:   entryType,
+			PkgName:   name,
+			Status:    "success",
+			Details:   audit.FormatDiff(beforeJSON, afterJSON),
+		})
+	}
 }
 
 // constraintToManifest maps the form dropdown value to a manifest constant.
@@ -2180,8 +2265,8 @@ func overlayPopup(screen, popup string, _, _ int) string {
 }
 
 // Run starts the bubbletea program with the given configuration.
-func Run(cfg *config.Config, store *manifest.Store, s3client *bos3.Client) error {
-	m := newAppModel(cfg, store, s3client)
+func Run(cfg *config.Config, store *manifest.Store, s3client *bos3.Client, auditDB *audit.DB) error {
+	m := newAppModel(cfg, store, s3client, auditDB)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, err := p.Run()
 	return err

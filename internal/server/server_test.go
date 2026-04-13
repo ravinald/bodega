@@ -1,6 +1,7 @@
 package server_test
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"io"
@@ -9,37 +10,47 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/scaleapi/bodega/internal/config"
-	"github.com/scaleapi/bodega/internal/manifest"
-	bos3 "github.com/scaleapi/bodega/internal/s3"
-	"github.com/scaleapi/bodega/internal/server"
+	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/server"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
-// mockS3 is a test double for the s3Getter interface.
-type mockS3 struct {
-	// objects maps S3 keys to their raw content.
-	objects map[string]string
-	// prefixKeys maps a prefix to the list of keys returned by ListPrefix.
+// mockStore implements storage.ObjectStore for testing.
+type mockStore struct {
+	objects    map[string]string
 	prefixKeys map[string][]string
 }
 
-func (m *mockS3) GetObjectStream(_ context.Context, key string) (*bos3.StreamResult, error) {
+func (m *mockStore) Get(_ context.Context, key string) ([]byte, error) {
 	data, ok := m.objects[key]
 	if !ok {
-		return nil, nil // not found
+		return nil, nil
 	}
-	return &bos3.StreamResult{
+	return []byte(data), nil
+}
+
+func (m *mockStore) GetStream(_ context.Context, key string) (*storage.StreamResult, error) {
+	data, ok := m.objects[key]
+	if !ok {
+		return nil, nil
+	}
+	return &storage.StreamResult{
 		Body:          io.NopCloser(strings.NewReader(data)),
 		ContentLength: int64(len(data)),
 		ETag:          "abc123",
 	}, nil
 }
 
-func (m *mockS3) ListPrefix(_ context.Context, prefix string) ([]string, error) {
+func (m *mockStore) Head(_ context.Context, key string) (*storage.ObjectInfo, error) {
+	data, ok := m.objects[key]
+	return &storage.ObjectInfo{Key: key, Exists: ok, Size: int64(len(data))}, nil
+}
+
+func (m *mockStore) List(_ context.Context, prefix string) ([]string, error) {
 	if keys, ok := m.prefixKeys[prefix]; ok {
 		return keys, nil
 	}
-	// Fall back to scanning the objects map.
 	var result []string
 	for k := range m.objects {
 		if strings.HasPrefix(k, prefix) {
@@ -49,19 +60,58 @@ func (m *mockS3) ListPrefix(_ context.Context, prefix string) ([]string, error) 
 	return result, nil
 }
 
-func (m *mockS3) HeadObject(_ context.Context, key string) (*bos3.ObjectStatus, error) {
-	_, ok := m.objects[key]
-	return &bos3.ObjectStatus{Key: key, Exists: ok}, nil
+func (m *mockStore) Put(_ context.Context, key string, data []byte) error {
+	m.objects[key] = string(data)
+	return nil
 }
 
+func (m *mockStore) PutFile(_ context.Context, _, key string) error {
+	m.objects[key] = ""
+	return nil
+}
+
+func (m *mockStore) Delete(_ context.Context, key string) error {
+	delete(m.objects, key)
+	return nil
+}
+
+func (m *mockStore) SyncDir(_ context.Context, _ io.Writer, _, _ string) (int, error) {
+	return 0, nil
+}
+
+func (m *mockStore) Label() string { return "mock://" }
+
 // newTestServer builds a Server with canned manifests and a mock S3 client.
-func newTestServer(t *testing.T) (*httptest.Server, *mockS3) {
+func newTestServer(t *testing.T) (*httptest.Server, *mockStore) {
 	t.Helper()
 
 	store := manifest.NewLocalStore(t.TempDir())
 	ctx := t.Context()
-	_ = store.AddVersion(ctx, manifest.TypeApt, "amazon-efs-utils", manifest.VersionEntry{Version: "1.36.0"})
-	_ = store.AddVersion(ctx, manifest.TypeApt, "linux-headers", manifest.VersionEntry{Version: "5.15.0"})
+	_ = store.AddVersion(ctx, manifest.TypeApt, "amazon-efs-utils", manifest.VersionEntry{
+		Version:      "2.4.2",
+		SourceName:   "amazon-efs-utils",
+		ArtifactSize: 12345,
+		Checksum:     &manifest.Checksum{Algorithm: "sha256", Value: "deadbeef0123456789abcdef"},
+		Metadata: map[string]string{
+			"Architecture":   "amd64",
+			"Maintainer":     "Amazon.com, Inc.",
+			"Installed-Size": "200",
+			"Section":        "utils",
+			"Priority":       "optional",
+			"Depends":        "nfs-common",
+		},
+		Description: "Amazon EFS mount helper",
+	})
+	_ = store.AddVersion(ctx, manifest.TypeApt, "linux-headers", manifest.VersionEntry{
+		Version:    "5.15.0",
+		SourceName: "linux-headers",
+		Metadata: map[string]string{
+			"Architecture": "arm64",
+			"Section":      "kernel",
+			"Priority":     "optional",
+		},
+		Description: "Linux kernel headers",
+	})
 	_ = store.AddVersion(ctx, manifest.TypeGit, "netbox", manifest.VersionEntry{
 		URL: "https://github.com/netbox-community/netbox",
 		Ref: "v4.5.5",
@@ -73,15 +123,15 @@ func newTestServer(t *testing.T) (*httptest.Server, *mockS3) {
 		URL:     "https://example.com/awscli.zip",
 	})
 
-	mock := &mockS3{
+	mock := &mockStore{
 		objects: map[string]string{
-			"packages/apt/dists/noble/Release":   "Archive: ubuntu\nVersion: 22.04\n",
-			"packages/apt/gpg-key.asc":           "-----BEGIN PGP PUBLIC KEY BLOCK-----\ntest\n",
-			"packages/apt/pool/main/a/foo/foo.deb": "\x00deb-content",
-			"pypi/wheels/boto3-1.35.0-py3-none-any.whl":  "fake-wheel-boto3",
-			"pypi/wheels/django-5.0.0-py3-none-any.whl":  "fake-wheel-django",
-			"repos/netbox/netbox-v4.5.5.bundle":          "fake-bundle",
-			"binaries/awscli-v2/2.0.0/awscli.zip":       "fake-binary",
+			"packages/apt/gpg-key.asc": "-----BEGIN PGP PUBLIC KEY BLOCK-----\ntest\n",
+			"packages/apt/pool/main/a/amazon-efs-utils/amazon-efs-utils_2.4.2_amd64.deb": "\x00deb-content-efs",
+			"packages/apt/pool/main/l/linux-headers/linux-headers_5.15.0_arm64.deb":      "\x00deb-content-linux",
+			"pypi/wheels/boto3-1.35.0-py3-none-any.whl":                                  "fake-wheel-boto3",
+			"pypi/wheels/django-5.0.0-py3-none-any.whl":                                  "fake-wheel-django",
+			"repos/netbox/netbox-v4.5.5.bundle":                                          "fake-bundle",
+			"binaries/awscli-v2/2.0.0/awscli.zip":                                        "fake-binary",
 		},
 	}
 
@@ -89,9 +139,10 @@ func newTestServer(t *testing.T) (*httptest.Server, *mockS3) {
 		Bucket:      "test-bucket",
 		Region:      "us-west-2",
 		ManifestDir: "manifests",
+		AptCodename: "noble",
 	}
 
-	srv := server.NewWithS3Getter(cfg, store, mock, ":0", nil)
+	srv := server.New(cfg, store, mock, ":0", nil)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, mock
@@ -128,8 +179,23 @@ func TestAptRelease(t *testing.T) {
 		t.Errorf("status = %d, want 200", resp.StatusCode)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "Archive: ubuntu") {
-		t.Errorf("body does not contain Release data: %q", string(body))
+	s := string(body)
+	for _, want := range []string{"Codename: noble", "Components: main", "SHA256:", "Architectures:"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("Release missing %q:\n%s", want, s)
+		}
+	}
+}
+
+func TestAptReleaseWrongCodename(t *testing.T) {
+	ts, _ := newTestServer(t)
+	resp, err := http.Get(ts.URL + "/apt/dists/jammy/Release")
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 for wrong codename", resp.StatusCode)
 	}
 }
 
@@ -158,6 +224,118 @@ func TestAptNotFound(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestAptPackages(t *testing.T) {
+	ts, _ := newTestServer(t)
+	resp, err := http.Get(ts.URL + "/apt/dists/noble/main/binary-amd64/Packages")
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	s := string(body)
+	// Should contain the amazon-efs-utils entry (amd64).
+	for _, want := range []string{
+		"Package: amazon-efs-utils",
+		"Version: 2.4.2",
+		"Architecture: amd64",
+		"Maintainer: Amazon.com, Inc.",
+		"Section: utils",
+		"SHA256: deadbeef0123456789abcdef",
+		"Filename: pool/main/a/amazon-efs-utils/amazon-efs-utils_2.4.2_amd64.deb",
+		"Description: Amazon EFS mount helper",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("Packages missing %q:\n%s", want, s)
+		}
+	}
+	// Should NOT contain the arm64 linux-headers entry.
+	if strings.Contains(s, "linux-headers") {
+		t.Error("Packages for amd64 should not contain arm64-only linux-headers")
+	}
+}
+
+func TestAptPackagesGz(t *testing.T) {
+	ts, _ := newTestServer(t)
+	resp, err := http.Get(ts.URL + "/apt/dists/noble/main/binary-amd64/Packages.gz")
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	ct := resp.Header.Get("Content-Type")
+	if ct != "application/gzip" {
+		t.Errorf("Content-Type = %q, want application/gzip", ct)
+	}
+	gr, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		t.Fatalf("gzip reader: %v", err)
+	}
+	body, _ := io.ReadAll(gr)
+	if !strings.Contains(string(body), "Package: amazon-efs-utils") {
+		t.Errorf("decompressed Packages.gz missing expected content:\n%s", string(body))
+	}
+}
+
+func TestAptPackagesArchFilter(t *testing.T) {
+	ts, _ := newTestServer(t)
+	resp, err := http.Get(ts.URL + "/apt/dists/noble/main/binary-arm64/Packages")
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	s := string(body)
+	if !strings.Contains(s, "linux-headers") {
+		t.Error("arm64 Packages should contain linux-headers")
+	}
+	if strings.Contains(s, "amazon-efs-utils") {
+		t.Error("arm64 Packages should not contain amd64-only amazon-efs-utils")
+	}
+}
+
+func TestAptPackagesFieldInjection(t *testing.T) {
+	// Ensure metadata with embedded newlines cannot inject extra fields.
+	store := manifest.NewLocalStore(t.TempDir())
+	ctx := context.Background()
+	_ = store.AddVersion(ctx, manifest.TypeApt, "evil-pkg", manifest.VersionEntry{
+		Version: "1.0",
+		Metadata: map[string]string{
+			"Architecture": "amd64",
+			"Maintainer":   "attacker\nEvil-Field: injected",
+			"Section":      "utils",
+			"Priority":     "optional",
+		},
+		Description: "test package",
+	})
+	mock := &mockStore{
+		objects: map[string]string{
+			"packages/apt/pool/main/e/evil-pkg/evil-pkg_1.0_amd64.deb": "fake",
+		},
+	}
+	cfg := &config.Config{Bucket: "test", Region: "us-west-2", ManifestDir: "manifests"}
+	srv := server.New(cfg, store, mock, ":0", nil)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/apt/dists/noble/main/binary-amd64/Packages")
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(body), "Evil-Field") {
+		t.Errorf("field injection succeeded — newlines in metadata were not sanitized:\n%s", string(body))
 	}
 }
 
@@ -443,9 +621,9 @@ func TestS3ProxyStreamsLargeBody(t *testing.T) {
 	// Verify the proxy streams rather than buffers by serving a non-trivial body.
 	ts, mock := newTestServer(t)
 	large := strings.Repeat("x", 1<<20) // 1 MiB
-	mock.objects["packages/apt/dists/noble/Packages.gz"] = large
+	mock.objects["packages/apt/pool/main/t/test-large/test-large_1.0_amd64.deb"] = large
 
-	resp, err := http.Get(ts.URL + "/apt/dists/noble/Packages.gz")
+	resp, err := http.Get(ts.URL + "/apt/pool/main/t/test-large/test-large_1.0_amd64.deb")
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -462,7 +640,7 @@ func TestS3ProxyStreamsLargeBody(t *testing.T) {
 
 func TestS3ProxyContentLength(t *testing.T) {
 	ts, _ := newTestServer(t)
-	resp, err := http.Get(ts.URL + "/apt/dists/noble/Release")
+	resp, err := http.Get(ts.URL + "/apt/pool/main/a/amazon-efs-utils/amazon-efs-utils_2.4.2_amd64.deb")
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}

@@ -2,12 +2,19 @@ package builder
 
 import (
 	"context"
+	"crypto/md5"
+	"crypto/sha1"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
-	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // aptSourceDir returns the source directory path for an apt package version.
@@ -78,8 +85,9 @@ func CheckAptStage(cfg *Config, name string, ve manifest.VersionEntry) StageStat
 		}
 
 	default:
-		// apt-get download: fetch = .deb file present in sources dir.
-		matches, _ := filepath.Glob(filepath.Join(d.sources, sourceName+"*.deb"))
+		// apt-get download: fetch = .deb file present in per-package subdir.
+		pkgDir := filepath.Join(d.sources, sourceName)
+		matches, _ := filepath.Glob(filepath.Join(pkgDir, sourceName+"*.deb"))
 		s.Fetched = len(matches) > 0
 		s.Built = s.Fetched // no separate build step
 	}
@@ -248,17 +256,22 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 				}
 
 			default:
-				// Package name download: apt-get download.
-				_, _ = fmt.Fprintf(out, "    Downloading %s via apt-get download...\n", sourceName)
-				if err := runCmd(out, srcDir, "apt-get", "download", sourceName); err != nil {
-					fetchErr = fmt.Errorf("apt-get download %s: %w", sourceName, err)
+				// Package name download: apt-get download into per-package subdirectory.
+				pkgDir := filepath.Join(srcDir, sourceName)
+				if err := mkdirAll(pkgDir); err != nil {
+					fetchErr = fmt.Errorf("create dir %s: %w", pkgDir, err)
 				} else {
-					matches, err := filepath.Glob(filepath.Join(srcDir, sourceName+"*.deb"))
-					if err != nil || len(matches) == 0 {
-						fetchErr = fmt.Errorf("no .deb found for %s in %s", sourceName, srcDir)
+					_, _ = fmt.Fprintf(out, "    Downloading %s via apt-get download...\n", sourceName)
+					if err := runCmd(out, pkgDir, "apt-get", "download", sourceName); err != nil {
+						fetchErr = fmt.Errorf("apt-get download %s: %w", sourceName, err)
 					} else {
-						artifactPath = matches[0]
-						_, _ = fmt.Fprintf(out, "    Downloaded: %s\n", filepath.Base(artifactPath))
+						matches, err := filepath.Glob(filepath.Join(pkgDir, sourceName+"*.deb"))
+						if err != nil || len(matches) == 0 {
+							fetchErr = fmt.Errorf("no .deb found for %s in %s", sourceName, pkgDir)
+						} else {
+							artifactPath = matches[0]
+							_, _ = fmt.Fprintf(out, "    Downloaded: %s\n", filepath.Base(artifactPath))
+						}
 					}
 				}
 			}
@@ -269,6 +282,7 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 				summary.Failures++
 			} else {
 				result.Artifacts = []string{artifactPath}
+				stampArtifactSize(ctx, store, manifest.TypeApt, name, ve, artifactPath)
 			}
 
 			result.Elapsed = time.Since(start)
@@ -283,6 +297,11 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 					cfg.Logger.Audit("OK      apt/fetch/%s  (%s)", name, result.Elapsed.Round(time.Millisecond))
 				}
 			}
+			status := "success"
+			if result.Err != nil {
+				status = "failure"
+			}
+			cfg.RecordAudit(audit.EventFetch, manifest.TypeApt, name, ve.Version, status, result.Elapsed, result.Err)
 		}
 	}
 
@@ -381,15 +400,20 @@ func BuildApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 					cfg.Logger.Audit("OK      apt/build/%s  (%s)", name, result.Elapsed.Round(time.Millisecond))
 				}
 			}
+			bStatus := "success"
+			if result.Err != nil {
+				bStatus = "failure"
+			}
+			cfg.RecordAudit(audit.EventBuild, manifest.TypeApt, name, ve.Version, bStatus, result.Elapsed, result.Err)
 		}
 	}
 
 	return summary
 }
 
-// PackageApt adds each built .deb into a reprepro APT repository under
-// <build-root>/apt-repo/. The .deb must already exist (produced by FetchApt
-// for apt-get entries, or by BuildApt for source-build entries).
+// PackageApt copies each built .deb into the pool directory structure under
+// <build-root>/apt-repo/pool/main/<letter>/<name>/. The server generates
+// Packages and Release files dynamically, so reprepro is not required.
 func PackageApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 	ctx := context.Background()
 	summary := &Summary{}
@@ -397,11 +421,6 @@ func PackageApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 
 	if err := mkdirAll(d.aptRepo); err != nil {
 		cfg.logf("ERROR: %v", err)
-		return summary
-	}
-
-	if err := setupAptRepo(cfg, d.aptRepo); err != nil {
-		cfg.logf("ERROR setting up APT repo: %v", err)
 		return summary
 	}
 
@@ -449,15 +468,70 @@ func PackageApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 				summary.Total++
 				continue
 			}
-			_, _ = fmt.Fprintf(out, "    Package: %s (%s)\n", filepath.Base(debFile), humanBytes(fi.Size()))
 
-			_, _ = fmt.Fprintf(out, "    Adding to APT repository...\n")
-			if err := runCmd(out, "", "reprepro", "-b", d.aptRepo, "includedeb", "noble", debFile); err != nil {
-				result.Err = fmt.Errorf("reprepro includedeb: %w", err)
+			debName := filepath.Base(debFile)
+			_, _ = fmt.Fprintf(out, "    Package: %s (%s)\n", debName, humanBytes(fi.Size()))
+
+			// Copy .deb into pool/main/<letter>/<name>/ layout.
+			sourceName := ve.SourceName
+			if sourceName == "" {
+				sourceName = name
+			}
+			letter := string(sourceName[0])
+			poolDir := filepath.Join(d.aptRepo, "pool", "main", letter, sourceName)
+			if err := mkdirAll(poolDir); err != nil {
+				result.Err = fmt.Errorf("create pool dir: %w", err)
+				_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
+				summary.Failures++
+				result.Elapsed = time.Since(start)
+				summary.Results = append(summary.Results, result)
+				summary.Total++
+				continue
+			}
+
+			dest := filepath.Join(poolDir, debName)
+			if err := copyFile(debFile, dest); err != nil {
+				result.Err = fmt.Errorf("copy to pool: %w", err)
 				_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
 				summary.Failures++
 			} else {
-				result.Artifacts = []string{debFile}
+				poolRelPath := "pool/main/" + letter + "/" + sourceName + "/" + debName
+				_, _ = fmt.Fprintf(out, "    Copied to %s\n", poolRelPath)
+				result.Artifacts = []string{dest}
+
+				// Extract control data and compute hashes for the dynamic Packages index.
+				if control, err := extractDebControl(dest); err != nil {
+					_, _ = fmt.Fprintf(out, "    WARNING: could not extract control data: %v\n", err)
+				} else {
+					if ve.Metadata == nil {
+						ve.Metadata = make(map[string]string)
+					}
+					ve.Metadata["_control"] = control
+					ve.Metadata["_pool_path"] = poolRelPath
+				}
+				if md5, sha1, sha256, err := computeDebHashes(dest); err != nil {
+					_, _ = fmt.Fprintf(out, "    WARNING: could not compute hashes: %v\n", err)
+				} else {
+					if ve.Metadata == nil {
+						ve.Metadata = make(map[string]string)
+					}
+					ve.Metadata["_md5"] = md5
+					ve.Metadata["_sha1"] = sha1
+					ve.Metadata["_sha256"] = sha256
+				}
+				ve.ArtifactSize = fi.Size()
+				// Persist the updated metadata back to the store.
+				if updated, err := store.GetPackage(ctx, manifest.TypeApt, name); err == nil && updated != nil {
+					for i := range updated.Versions {
+						if updated.Versions[i].Version == ve.Version {
+							updated.Versions[i] = ve
+							break
+						}
+					}
+					if err := store.SavePackage(ctx, updated); err != nil {
+						_, _ = fmt.Fprintf(out, "    WARNING: could not save metadata: %v\n", err)
+					}
+				}
 			}
 
 			result.Elapsed = time.Since(start)
@@ -472,10 +546,64 @@ func PackageApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 					cfg.Logger.Audit("OK      apt/package/%s  (%s)", name, result.Elapsed.Round(time.Millisecond))
 				}
 			}
+			pStatus := "success"
+			if result.Err != nil {
+				pStatus = "failure"
+			}
+			cfg.RecordAudit(audit.EventPackage, manifest.TypeApt, name, ve.Version, pStatus, result.Elapsed, result.Err)
 		}
 	}
 
 	return summary
+}
+
+// extractDebControl runs dpkg-deb -f on a .deb file and returns the raw
+// control fields as a string. If dpkg-deb is not available, returns an error.
+func extractDebControl(debPath string) (string, error) {
+	out, err := runCmdCapture("", "dpkg-deb", "-f", debPath)
+	if err != nil {
+		return "", fmt.Errorf("dpkg-deb -f: %w", err)
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// computeDebHashes computes MD5, SHA1, and SHA256 of a file, returning
+// lowercase hex strings.
+func computeDebHashes(path string) (md5hex, sha1hex, sha256hex string, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", "", "", err
+	}
+	defer f.Close()
+
+	md5w := md5.New()
+	sha1w := sha1.New()
+	sha256w := sha256.New()
+	w := io.MultiWriter(md5w, sha1w, sha256w)
+	if _, err := io.Copy(w, f); err != nil {
+		return "", "", "", err
+	}
+	return hex.EncodeToString(md5w.Sum(nil)),
+		hex.EncodeToString(sha1w.Sum(nil)),
+		hex.EncodeToString(sha256w.Sum(nil)), nil
+}
+
+// copyFile copies src to dst, creating dst if it doesn't exist.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Close()
 }
 
 // RunApt runs the full apt pipeline (FetchApt → BuildApt → PackageApt) for
@@ -544,10 +672,11 @@ func locateDebFile(d dirs, name string, ve manifest.VersionEntry) (string, error
 		return matches[0], nil
 
 	default:
-		// apt-get download: .deb in sources root.
-		matches, err := filepath.Glob(filepath.Join(d.sources, sourceName+"*.deb"))
+		// apt-get download: .deb in per-package subdir.
+		pkgDir := filepath.Join(d.sources, sourceName)
+		matches, err := filepath.Glob(filepath.Join(pkgDir, sourceName+"*.deb"))
 		if err != nil || len(matches) == 0 {
-			return "", fmt.Errorf("no .deb found for %s in %s — run 'fetch apt' first", sourceName, d.sources)
+			return "", fmt.Errorf("no .deb found for %s in %s — run 'fetch apt' first", sourceName, pkgDir)
 		}
 		return matches[0], nil
 	}
@@ -562,12 +691,19 @@ func setupAptRepo(cfg *Config, aptRepoDir string) error {
 		return err
 	}
 
-	const gpgEmail = "infra@scale.com"
-	const gpgName = "Scale Bootstrap Repo"
+	gpgEmail := cfg.GpgEmail
+	if gpgEmail == "" {
+		gpgEmail = "bodega@localhost"
+	}
+	gpgName := cfg.GpgName
+	if gpgName == "" {
+		gpgName = "Bodega Package Signing"
+	}
 
-	// Generate GPG key if absent.
-	checkOut, _ := runCmdCapture("", "gpg", "--list-keys", gpgEmail)
-	if checkOut == "" {
+	// Generate GPG key if absent. Check the exit code, not the output —
+	// gpg writes error text to stderr even when the key is missing.
+	_, checkErr := runCmdCapture("", "gpg", "--list-keys", gpgEmail)
+	if checkErr != nil {
 		_, _ = fmt.Fprintf(out, "    Generating GPG signing key for %s...\n", gpgEmail)
 		batchInput := fmt.Sprintf(
 			"Key-Type: RSA\nKey-Length: 4096\nName-Real: %s\nName-Email: %s\nExpire-Date: 0\n%%no-protection\n",

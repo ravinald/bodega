@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/scaleapi/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // writePackageManifest writes a PackageManifest as JSON to the expected backend
@@ -348,17 +348,26 @@ func TestStore_Graph_SaveAndLoad(t *testing.T) {
 	}
 }
 
-
 func TestStore_Graph_Orphans(t *testing.T) {
 	dir := t.TempDir()
+	ctx := context.Background()
 
 	store := manifest.NewLocalStore(dir)
-	// "pypi/boto3" is a child but never a parent — it is an orphan.
+	// Create "git/myapp" in the store but NOT "pypi/boto3".
+	// boto3 is referenced in the graph but has no manifest — it's an orphan.
+	_ = store.AddVersion(ctx, "git", "myapp", manifest.VersionEntry{Ref: "main"})
 	store.AddEdge(manifest.DepEdge{Parent: "git/myapp", Child: "pypi/boto3"})
 
 	orphans := store.Orphans()
 	if len(orphans) != 1 || orphans[0] != "pypi/boto3" {
 		t.Errorf("expected [pypi/boto3] as orphan, got %v", orphans)
+	}
+
+	// Now add boto3 to the store — no more orphans.
+	_ = store.AddVersion(ctx, "pypi", "boto3", manifest.VersionEntry{Version: "1.0"})
+	orphans = store.Orphans()
+	if len(orphans) != 0 {
+		t.Errorf("expected no orphans after adding boto3, got %v", orphans)
 	}
 }
 

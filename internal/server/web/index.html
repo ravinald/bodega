@@ -462,7 +462,7 @@ function render() {
         pkgHeader.style.paddingLeft = '24px';
         pkgHeader.innerHTML =
           '<span class="arrow">' + (pkgExpanded ? '\u25BC' : '\u25B6') + '</span>' +
-          '<span>' + name + '</span>' +
+          '<span>' + escapeHtml(name) + '</span>' +
           '<span class="count">(' + versions.length + ')</span>';
         pkgHeader.onclick = () => {
           if (expandedPkgs.has(pkgKey)) expandedPkgs.delete(pkgKey);
@@ -479,7 +479,9 @@ function render() {
             row.innerHTML =
               '<span class="status ' + (e.frozen ? 'frozen' : '') + '">' +
               (e.frozen ? '*' : '') + '</span>' +
-              '<span>' + (entryVersion(type, e) === '*' ? e.name + '@*' : (entryVersion(type, e) || e.name)) + '</span>';
+              (entryVersion(type, e) === '*'
+                ? '<span style="color:var(--fg-dim)">' + escapeHtml(e.name) + '@*</span>'
+                : '<span>' + escapeHtml(entryVersion(type, e) || e.name) + '</span>');
             row.onclick = () => { selectedKey = key; render(); showDetail(type, e); };
             group.appendChild(row);
           }
@@ -497,8 +499,8 @@ function showDetail(type, entry) {
   const clientUrl = getClientUrl(type, entry);
   const permalink = location.origin + '/#' + encodeURIComponent(type + '/' + entry.name + (ver ? '/' + ver : ''));
   let html = '<div class="detail-title">' +
-    '<span class="type-badge">' + type + '</span> ' +
-    entry.name +
+    '<span class="type-badge">' + escapeHtml(type) + '</span> ' +
+    escapeHtml(entry.name) +
     ' <span class="copy-link" title="Copy link to this package" data-url="' +
     escapeHtml(permalink) + '">\u{1F517}</span>' +
     '</div>';
@@ -568,7 +570,7 @@ function showDetail(type, entry) {
     if (cls === 'url' && v) {
       copyIcon = ' <span class="copy-link" title="Copy ' + escapeHtml(k) + '" data-url="' + escapeHtml(v).replace(/"/g,'&quot;') + '">\u{1F517}</span>';
     }
-    html += '<div class="field"><span class="key">' + k + ':</span>' +
+    html += '<div class="field"><span class="key">' + escapeHtml(k) + ':</span>' +
       '<span class="val' + (cls ? ' ' + cls : '') + '">' + valHtml + '</span>' + copyIcon + '</div>';
   }
 
@@ -592,7 +594,8 @@ function showDetail(type, entry) {
 }
 
 function escapeHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  if (s == null) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
 function getClientUrl(type, entry) {

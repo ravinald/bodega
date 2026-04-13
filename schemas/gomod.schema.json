@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/scaleapi/core-infrastructure/tools/bodega/schemas/gomod.schema.json",
+  "$id": "https://github.com/ravinald/bodega/schemas/gomod.schema.json",
   "title": "Go Module Manifest",
   "description": "Defines Go modules to mirror or proxy via GOPROXY protocol.",
   "type": "object",
