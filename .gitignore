@@ -1,6 +1,6 @@
 # Build artifacts
 dist/
-bodega
+/bodega
 *.exe
 
 # Fetched/built artifacts (created by bodega build)
