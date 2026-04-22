@@ -11,6 +11,7 @@ import (
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/logging"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 )
 
 func newBuildRunCmd(gf *globalFlags) *cobra.Command {
@@ -74,6 +75,11 @@ When a name is given after the type, only that entry is built.`,
 				defer auditDB.Close()
 			}
 
+			var policyChecker *policy.Checker
+			if auditDB != nil {
+				policyChecker = policy.NewChecker(auditDB)
+			}
+
 			bcfg := &builder.Config{
 				AutoImportDeps: true,
 				BuildRoot:      cfg.BuildRoot,
@@ -88,6 +94,7 @@ When a name is given after the type, only that entry is built.`,
 				Stdout:         buildOut,
 				Logger:         buildLogger,
 				AuditDB:        auditDB,
+				Policy:         policyChecker,
 			}
 
 			var allSummaries []*builder.Summary

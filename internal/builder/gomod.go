@@ -72,6 +72,12 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 				cfg.logf("  [gomod] %s: SKIPPED (frozen)", name)
 				continue
 			}
+			if err := cfg.EnforcePolicy(ctx, manifest.TypeGomod, name, ve.Version, ve.URL); err != nil {
+				cfg.logf("  [gomod] %s: BLOCKED by policy: %v", name, err)
+				summary.Failures++
+				summary.Results = append(summary.Results, Result{Type: manifest.TypeGomod, Name: name, Err: err})
+				continue
+			}
 			if !cfg.Force {
 				stage := CheckGomodStage(cfg, name, ve)
 				if stage.Fetched {

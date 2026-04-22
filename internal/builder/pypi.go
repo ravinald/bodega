@@ -142,6 +142,11 @@ func FetchPypi(cfg *Config, store *manifest.Store) *Summary {
 	_, _ = fmt.Fprintf(out, "    Extra packages: %d\n", len(pkgNames))
 	reqLines = append(reqLines, "\n# Extra packages from manifest\n")
 	for _, name := range pkgNames {
+		if err := cfg.EnforcePolicy(ctx, manifest.TypePypi, name, "", ""); err != nil {
+			_, _ = fmt.Fprintf(out, "      %s — SKIPPED: %v\n", name, err)
+			summary.Failures++
+			continue
+		}
 		_, _ = fmt.Fprintf(out, "      %s\n", name)
 		reqLines = append(reqLines, name+"\n")
 	}

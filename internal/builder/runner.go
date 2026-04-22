@@ -15,6 +15,7 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/logging"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 )
 
 // Config holds the parameters shared by all builders.
@@ -53,12 +54,48 @@ type Config struct {
 	// AuditDB is an optional audit database. When set, build operations
 	// record events to the SQLite audit trail.
 	AuditDB *audit.DB
+	// Policy is an optional upstream allow-list checker. When set, each
+	// Fetch* function validates candidate URLs/packages before network I/O.
+	// When nil, the allow-list is not enforced.
+	Policy *policy.Checker
 	// GpgEmail is the email for the GPG signing key used by the apt repo.
 	// Defaults to "bodega@localhost" when empty.
 	GpgEmail string
 	// GpgName is the real name for the GPG signing key.
 	// Defaults to "Bodega Package Signing" when empty.
 	GpgName string
+}
+
+// checkPolicy runs the upstream allow-list for (regType, candidate). Returns
+// nil if policy is disabled or the candidate is allowed; otherwise returns
+// the ViolationError (or a storage error wrapping it).
+func (c *Config) checkPolicy(ctx context.Context, regType, candidate string) error {
+	if c.Policy == nil || candidate == "" {
+		return nil
+	}
+	return c.Policy.Check(ctx, regType, candidate)
+}
+
+// EnforcePolicy validates a single manifest entry's upstream against the
+// allow-list. On violation it records an audit event and returns the error so
+// the calling Fetch* function can log, bump Summary.Failures, and continue to
+// the next entry. Returns nil when policy is disabled or the entry is allowed.
+func (c *Config) EnforcePolicy(ctx context.Context, regType, name, version, url string) error {
+	candidate := policy.CandidateFor(regType, name, url)
+	if err := c.checkPolicy(ctx, regType, candidate); err != nil {
+		if c.AuditDB != nil {
+			_ = c.AuditDB.Record(ctx, audit.Event{
+				EventType:  audit.EventFetch,
+				PkgType:    regType,
+				PkgName:    name,
+				PkgVersion: version,
+				Status:     "policy_violation",
+				Details:    fmt.Sprintf("candidate=%s", candidate),
+			})
+		}
+		return err
+	}
+	return nil
 }
 
 // rootFor returns the effective build root for the given source type.

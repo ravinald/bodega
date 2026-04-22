@@ -9,6 +9,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 )
 
 func newFetchCmd(gf *globalFlags) *cobra.Command {
@@ -64,10 +65,16 @@ When a name is given after the type, only that entry is fetched.`,
 				defer auditDB.Close()
 			}
 
+			var policyChecker *policy.Checker
+			if auditDB != nil {
+				policyChecker = policy.NewChecker(auditDB)
+			}
+
 			bcfg := &builder.Config{
 				AutoImportDeps: true,
 				Force:          force,
 				AuditDB:        auditDB,
+				Policy:         policyChecker,
 				BuildRoot:      cfg.BuildRoot,
 				ManifestDir:    cfg.ManifestDir,
 				Bucket:         cfg.Bucket,

@@ -12,6 +12,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 )
 
 func newImportCmd(gf *globalFlags) *cobra.Command {
@@ -38,6 +39,16 @@ Examples:
 			}
 			ctx := context.Background()
 
+			// Open the audit DB once for both policy enforcement and audit logging.
+			adb := openAuditDB(gf)
+			if adb != nil {
+				defer adb.Close()
+			}
+			var checker *policy.Checker
+			if adb != nil {
+				checker = policy.NewChecker(adb)
+			}
+
 			var imported int
 			for _, path := range args {
 				data, err := readInput(path)
@@ -52,6 +63,9 @@ Examples:
 
 				if err := validateManifest(&pm); err != nil {
 					return fmt.Errorf("validate %s: %w", path, err)
+				}
+				if err := enforceImportPolicy(ctx, checker, adb, &pm); err != nil {
+					return fmt.Errorf("%s: %w", path, err)
 				}
 
 				existing, _ := store.GetPackage(ctx, pm.Type, pm.Name)
@@ -91,7 +105,7 @@ Examples:
 				imported++
 
 				// Audit.
-				if adb := openAuditDB(gf); adb != nil {
+				if adb != nil {
 					afterJSON, _ := json.MarshalIndent(&pm, "", "  ")
 					_ = adb.Record(ctx, audit.Event{
 						EventType: audit.EventCreate,
@@ -100,7 +114,6 @@ Examples:
 						Status:    "success",
 						Details:   audit.FormatDiff(nil, afterJSON),
 					})
-					adb.Close()
 				}
 			}
 
@@ -121,6 +134,35 @@ func readInput(path string) ([]byte, error) {
 		return io.ReadAll(os.Stdin)
 	}
 	return os.ReadFile(path)
+}
+
+// enforceImportPolicy walks every version in pm and rejects the import if any
+// upstream candidate is outside the configured allow-list. Nil checker means
+// policy is disabled.
+func enforceImportPolicy(ctx context.Context, checker *policy.Checker, adb *audit.DB, pm *manifest.PackageManifest) error {
+	if checker == nil {
+		return nil
+	}
+	for _, ve := range pm.Versions {
+		candidate := policy.CandidateFor(pm.Type, pm.Name, ve.URL)
+		if candidate == "" {
+			continue
+		}
+		if err := checker.Check(ctx, pm.Type, candidate); err != nil {
+			if adb != nil {
+				_ = adb.Record(ctx, audit.Event{
+					EventType:  audit.EventCreate,
+					PkgType:    pm.Type,
+					PkgName:    pm.Name,
+					PkgVersion: ve.Version,
+					Status:     "policy_violation",
+					Details:    fmt.Sprintf("candidate=%s", candidate),
+				})
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 func validateManifest(pm *manifest.PackageManifest) error {

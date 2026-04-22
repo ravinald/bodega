@@ -163,6 +163,7 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 		pkgParent,
 		auditParent,
 		newTokenCmd(gf),
+		newPolicyCmd(gf),
 		newShowCmd(gf),
 		newDashboardCmd(gf),
 		newInitCmd(gf),
