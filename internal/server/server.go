@@ -1137,10 +1137,15 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 
 	// Tarball request: path contains "/-/"
 	if idx := strings.Index(fullPath, "/-/"); idx >= 0 {
-		pkgName := fullPath[:idx]
-		tarball := fullPath[idx+3:]
-		key := "npm/" + pkgName + "/" + tarball
+		pkgName := fullPath[:idx]   // canonical, e.g. "@bitwarden/cli"
+		tarball := fullPath[idx+3:] // URL form, e.g. "cli-2026.3.0.tgz"
 		setCacheImmutable(w, tarball)
+
+		// S3 and local disk both use the safe-encoded form throughout: the
+		// directory is "npm/@bitwarden--cli/" and the tarball file is
+		// "@bitwarden--cli-2026.3.0.tgz". Translate here so proxyS3 and
+		// proxyOrCache look at the right place.
+		storageKey := npmStorageKeyForTarball(pkgName, tarball)
 
 		pm, _ := s.store.GetPackage(ctx, manifest.TypeNpm, pkgName)
 		if pm != nil {
@@ -1159,11 +1164,12 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if pm != nil && packageMode(pm) == manifest.ModeProxy {
+			// Upstream still wants the canonical URL form with "/-/".
 			upstream := s.cfg.NpmUpstream + "/" + pkgName + "/-/" + tarball
-			s.proxyOrCache(w, r, key, upstream, manifest.TypeNpm, pkgName, true, true)
+			s.proxyOrCache(w, r, storageKey, upstream, manifest.TypeNpm, pkgName, true, true)
 			return
 		}
-		s.proxyS3(w, r, key)
+		s.proxyS3(w, r, storageKey)
 		return
 	}
 
@@ -1190,9 +1196,41 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 	}
 
 	upstream := s.cfg.NpmUpstream + "/" + pkgName
-	s3Key := "npm/" + pkgName + "/packument.json"
+	s3Key := "npm/" + npmSafeName(pkgName) + "/packument.json"
 	forceProxy := pm != nil && packageMode(pm) == manifest.ModeProxy
 	s.proxyOrCache(w, r, s3Key, upstream, manifest.TypeNpm, pkgName, false, forceProxy)
+}
+
+// npmSafeName converts a canonical npm package name to the safe-encoded form
+// used throughout bodega storage (S3 keys, local manifest dirs, local
+// artifact dirs). Scoped packages "@scope/pkg" become "@scope--pkg";
+// unscoped names pass through unchanged. The same helper lives in
+// internal/builder as `safeName`; duplicated here to avoid pulling the
+// builder package into the server's dependency graph.
+func npmSafeName(pkgName string) string {
+	return strings.ReplaceAll(pkgName, "/", "--")
+}
+
+// npmStorageKeyForTarball builds the S3 key for an npm tarball from the
+// canonical URL form. The uploader writes tarballs to
+// "npm/@scope--pkg/@scope--pkg-<version>.tgz"; this recreates that layout
+// from the pieces the handler receives on the wire.
+//
+// The URL-form tarball filename is "pkg-<version>.tgz" (the npm standard).
+// On disk/S3 it becomes "@scope--pkg-<version>.tgz" when scoped. For
+// unscoped packages the two forms are identical.
+func npmStorageKeyForTarball(pkgName, urlTarball string) string {
+	safe := npmSafeName(pkgName)
+	if pkgName == safe {
+		return "npm/" + safe + "/" + urlTarball
+	}
+	ver := npmVersionFromTarball(pkgName, urlTarball)
+	if ver == "" {
+		// Shape we don't recognize; fall back to the URL form so we still
+		// 404 cleanly instead of building a bogus key.
+		return "npm/" + safe + "/" + urlTarball
+	}
+	return "npm/" + safe + "/" + safe + "-" + ver + ".tgz"
 }
 
 // npmVersionFromTarball extracts the version from an npm tarball filename

@@ -7,6 +7,41 @@ import (
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
+func TestNpmSafeName(t *testing.T) {
+	cases := map[string]string{
+		"@bitwarden/cli": "@bitwarden--cli",
+		"@aws-sdk/s3":    "@aws-sdk--s3",
+		"lodash":         "lodash",
+		"":               "",
+	}
+	for in, want := range cases {
+		if got := npmSafeName(in); got != want {
+			t.Errorf("npmSafeName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestNpmStorageKeyForTarball(t *testing.T) {
+	cases := []struct {
+		pkg, tarball, want string
+	}{
+		// Scoped: URL form → safe-encoded path + safe-encoded filename.
+		{"@bitwarden/cli", "cli-2026.3.0.tgz", "npm/@bitwarden--cli/@bitwarden--cli-2026.3.0.tgz"},
+		{"@aws-sdk/client-s3", "client-s3-3.500.0.tgz", "npm/@aws-sdk--client-s3/@aws-sdk--client-s3-3.500.0.tgz"},
+		// Unscoped: URL and storage forms identical.
+		{"lodash", "lodash-4.17.21.tgz", "npm/lodash/lodash-4.17.21.tgz"},
+		// Unparseable URL-form tarball: fall through to the URL filename so
+		// we still 404 cleanly rather than constructing a garbage key.
+		{"@bitwarden/cli", "not-matching-prefix.tgz", "npm/@bitwarden--cli/not-matching-prefix.tgz"},
+	}
+	for _, c := range cases {
+		if got := npmStorageKeyForTarball(c.pkg, c.tarball); got != c.want {
+			t.Errorf("npmStorageKeyForTarball(%q, %q) = %q, want %q",
+				c.pkg, c.tarball, got, c.want)
+		}
+	}
+}
+
 func TestNpmVersionFromTarball(t *testing.T) {
 	cases := []struct {
 		pkg, tarball, want string
