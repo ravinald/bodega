@@ -17,10 +17,11 @@ const (
 	DefaultLogWindowHeight = 12
 	DefaultLogLevel        = 0
 
-	EnvBucket    = "REPO_BUCKET"
-	EnvRegion    = "AWS_REGION"
-	EnvBuildRoot = "BOOTSTRAP_BUILD_ROOT"
-	EnvLogLevel  = "BODEGA_LOG_LEVEL"
+	EnvBucket     = "REPO_BUCKET"
+	EnvRegion     = "AWS_REGION"
+	EnvBuildRoot  = "BOOTSTRAP_BUILD_ROOT"
+	EnvLogLevel   = "BODEGA_LOG_LEVEL"
+	EnvConfigFile = "BODEGA_CONFIG_FILE"
 
 	SystemConfigDir  = "/etc/bodega"
 	SystemConfigFile = "/etc/bodega/config.json"
@@ -380,7 +381,14 @@ func createDefaultConfig() (string, error) {
 	return path, nil
 }
 
+// configSearchPaths returns the ordered list of paths loadFileConfig tries.
+// When BODEGA_CONFIG_FILE is set, only that path is consulted — callers can
+// point at a non-standard location, and tests can point at a path that does
+// not exist to guarantee a defaults-only load.
 func configSearchPaths() []string {
+	if override := os.Getenv(EnvConfigFile); override != "" {
+		return []string{override}
+	}
 	paths := []string{SystemConfigFile}
 	if home, err := os.UserHomeDir(); err == nil {
 		paths = append(paths, filepath.Join(home, ".config", "bodega", "config.json"))

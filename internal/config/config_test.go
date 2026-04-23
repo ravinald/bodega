@@ -2,22 +2,24 @@ package config_test
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/ravinald/bodega/internal/config"
 )
 
+// isolateConfig points loadFileConfig at a path in t.TempDir() that does not
+// exist, so a host-level /etc/bodega/config.json cannot leak into the test.
+func isolateConfig(t *testing.T) {
+	t.Helper()
+	t.Setenv(config.EnvConfigFile, filepath.Join(t.TempDir(), "no-such-config.json"))
+	t.Setenv(config.EnvBucket, "")
+	t.Setenv(config.EnvRegion, "")
+	t.Setenv(config.EnvBuildRoot, "")
+}
+
 func TestLoad_Defaults(t *testing.T) {
-	// Clear env vars that might be set in the environment.
-	if err := os.Unsetenv(config.EnvBucket); err != nil {
-		t.Fatalf("unsetenv %s: %v", config.EnvBucket, err)
-	}
-	if err := os.Unsetenv(config.EnvRegion); err != nil {
-		t.Fatalf("unsetenv %s: %v", config.EnvRegion, err)
-	}
-	if err := os.Unsetenv(config.EnvBuildRoot); err != nil {
-		t.Fatalf("unsetenv %s: %v", config.EnvBuildRoot, err)
-	}
+	isolateConfig(t)
 
 	cfg, err := config.Load(t.TempDir(), "", "", "", false, false)
 	if err != nil {
@@ -35,14 +37,8 @@ func TestLoad_Defaults(t *testing.T) {
 }
 
 func TestLoad_FlagOverridesEnv(t *testing.T) {
-	if err := os.Setenv(config.EnvBucket, "env-bucket"); err != nil {
-		t.Fatalf("setenv %s: %v", config.EnvBucket, err)
-	}
-	defer func() {
-		if err := os.Unsetenv(config.EnvBucket); err != nil {
-			t.Errorf("unsetenv %s: %v", config.EnvBucket, err)
-		}
-	}()
+	isolateConfig(t)
+	t.Setenv(config.EnvBucket, "env-bucket")
 
 	cfg, err := config.Load(t.TempDir(), "flag-bucket", "", "", false, false)
 	if err != nil {
@@ -54,14 +50,8 @@ func TestLoad_FlagOverridesEnv(t *testing.T) {
 }
 
 func TestLoad_EnvOverridesDefault(t *testing.T) {
-	if err := os.Setenv(config.EnvRegion, "eu-west-1"); err != nil {
-		t.Fatalf("setenv %s: %v", config.EnvRegion, err)
-	}
-	defer func() {
-		if err := os.Unsetenv(config.EnvRegion); err != nil {
-			t.Errorf("unsetenv %s: %v", config.EnvRegion, err)
-		}
-	}()
+	isolateConfig(t)
+	t.Setenv(config.EnvRegion, "eu-west-1")
 
 	cfg, err := config.Load(t.TempDir(), "", "", "", false, false)
 	if err != nil {
@@ -69,5 +59,31 @@ func TestLoad_EnvOverridesDefault(t *testing.T) {
 	}
 	if cfg.Region != "eu-west-1" {
 		t.Errorf("Region = %q, want eu-west-1", cfg.Region)
+	}
+}
+
+// TestLoad_ConfigFileOverride verifies that BODEGA_CONFIG_FILE points the
+// loader at a specific file, bypassing /etc/bodega/config.json.
+func TestLoad_ConfigFileOverride(t *testing.T) {
+	t.Setenv(config.EnvBucket, "")
+	t.Setenv(config.EnvRegion, "")
+	t.Setenv(config.EnvBuildRoot, "")
+
+	path := filepath.Join(t.TempDir(), "bodega.json")
+	body := []byte(`{"bucket": "override-bucket", "region": "ap-southeast-2"}`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatalf("write override config: %v", err)
+	}
+	t.Setenv(config.EnvConfigFile, path)
+
+	cfg, err := config.Load(t.TempDir(), "", "", "", false, false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Bucket != "override-bucket" {
+		t.Errorf("Bucket = %q, want override-bucket (from %s)", cfg.Bucket, path)
+	}
+	if cfg.Region != "ap-southeast-2" {
+		t.Errorf("Region = %q, want ap-southeast-2", cfg.Region)
 	}
 }
