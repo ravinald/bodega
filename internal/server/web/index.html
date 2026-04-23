@@ -580,8 +580,17 @@ function showDetail(type, entry) {
 
   d.innerHTML = html;
 
-  // Fetch full PackageManifest for JSON display (matches TUI).
-  fetch('/api/v1/packages/' + type + '/' + encodeURIComponent(entry.name))
+  // Fetch the PackageManifest for JSON display. When a specific version is
+  // selected, fetch the version-scoped endpoint — the response is still a
+  // valid PackageManifest (config_version, name, type, description, plus a
+  // single-entry versions array), so it's copy-paste ready for re-import.
+  // Package-header selection (no version) keeps the full-manifest fetch.
+  var url = '/api/v1/packages/' + type + '/' + encodeURIComponent(entry.name);
+  var scopedVer = entryVersion(type, entry);
+  if (scopedVer && scopedVer !== '*') {
+    url += '/' + encodeURIComponent(scopedVer);
+  }
+  fetch(url)
     .then(function(r) { return r.ok ? r.json() : entry; })
     .catch(function() { return entry; })
     .then(function(manifest) {
