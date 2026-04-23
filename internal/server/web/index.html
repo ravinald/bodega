@@ -458,16 +458,21 @@ function render() {
         const pkgKey = type + '/' + name;
         const pkgExpanded = expandedPkgs.has(pkgKey);
         const pkgHeader = document.createElement('div');
-        pkgHeader.className = 'group-header';
+        pkgHeader.className = 'group-header' + (selectedKey === pkgKey ? ' selected' : '');
         pkgHeader.style.paddingLeft = '24px';
         pkgHeader.innerHTML =
           '<span class="arrow">' + (pkgExpanded ? '\u25BC' : '\u25B6') + '</span>' +
           '<span>' + escapeHtml(name) + '</span>' +
           '<span class="count">(' + versions.length + ')</span>';
         pkgHeader.onclick = () => {
+          // Toggle expansion and show the full PackageManifest in the
+          // detail pane — complements the per-version view from clicking
+          // a version row. Same shape as `bodega pkg export <type> <name>`.
           if (expandedPkgs.has(pkgKey)) expandedPkgs.delete(pkgKey);
           else expandedPkgs.add(pkgKey);
+          selectedKey = pkgKey;
           render();
+          showDetail(type, { name: name, type: type });
         };
         group.appendChild(pkgHeader);
         if (pkgExpanded) {
