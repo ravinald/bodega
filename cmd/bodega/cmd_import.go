@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -22,13 +23,16 @@ func newImportCmd(gf *globalFlags) *cobra.Command {
 		Use:   "import <file> [file...]",
 		Short: "Import package manifests from JSON files",
 		Long: `import reads one or more JSON files (or stdin with "-") and adds them to
-the manifest store. The JSON format is the same PackageManifest used internally.
+the manifest store. Each file may contain either a single PackageManifest
+object or a JSON array of PackageManifest objects (e.g. the output of
+'bodega pkg export').
 
 Use this for automation instead of the interactive 'create' command.
 
 Examples:
   bodega pkg import nginx.json
   bodega pkg import packages/*.json
+  bodega pkg import bundle.json             # array of many packages
   cat manifest.json | bodega pkg import -
   bodega pkg import --merge updated.json    # add versions to existing package`,
 		Args: cobra.MinimumNArgs(1),
@@ -56,64 +60,67 @@ Examples:
 					return fmt.Errorf("read %s: %w", path, err)
 				}
 
-				var pm manifest.PackageManifest
-				if err := json.Unmarshal(data, &pm); err != nil {
+				pms, err := decodeManifests(data)
+				if err != nil {
 					return fmt.Errorf("parse %s: %w", path, err)
 				}
 
-				if err := validateManifest(&pm); err != nil {
-					return fmt.Errorf("validate %s: %w", path, err)
-				}
-				if err := enforceImportPolicy(ctx, checker, adb, &pm); err != nil {
-					return fmt.Errorf("%s: %w", path, err)
-				}
+				for i := range pms {
+					pm := &pms[i]
+					if err := validateManifest(pm); err != nil {
+						return fmt.Errorf("validate %s [%s/%s]: %w", path, pm.Type, pm.Name, err)
+					}
+					if err := enforceImportPolicy(ctx, checker, adb, pm); err != nil {
+						return fmt.Errorf("%s [%s/%s]: %w", path, pm.Type, pm.Name, err)
+					}
 
-				existing, _ := store.GetPackage(ctx, pm.Type, pm.Name)
-				if existing != nil && !merge {
-					return fmt.Errorf("%s/%s already exists (use --merge to add versions)", pm.Type, pm.Name)
-				}
+					existing, _ := store.GetPackage(ctx, pm.Type, pm.Name)
+					if existing != nil && !merge {
+						return fmt.Errorf("%s/%s already exists (use --merge to add versions)", pm.Type, pm.Name)
+					}
 
-				if existing != nil && merge {
-					// Merge new versions into existing package.
-					for _, ve := range pm.Versions {
-						found := false
-						for _, ev := range existing.Versions {
-							if ev.Version == ve.Version {
-								found = true
-								break
+					if existing != nil && merge {
+						// Merge new versions into existing package.
+						for _, ve := range pm.Versions {
+							found := false
+							for _, ev := range existing.Versions {
+								if ev.Version == ve.Version {
+									found = true
+									break
+								}
+							}
+							if !found {
+								existing.Versions = append(existing.Versions, ve)
 							}
 						}
-						if !found {
-							existing.Versions = append(existing.Versions, ve)
+						if err := store.SavePackage(ctx, existing); err != nil {
+							return fmt.Errorf("save %s/%s: %w", pm.Type, pm.Name, err)
 						}
+						fmt.Printf("Merged %d version(s) into %s/%s\n", len(pm.Versions), pm.Type, pm.Name)
+					} else {
+						pm.ConfigVersion = manifest.CurrentConfigVersion
+						if err := store.SavePackage(ctx, pm); err != nil {
+							return fmt.Errorf("save %s/%s: %w", pm.Type, pm.Name, err)
+						}
+						fmt.Printf("Imported %s/%s (%d version(s))\n", pm.Type, pm.Name, len(pm.Versions))
 					}
-					if err := store.SavePackage(ctx, existing); err != nil {
-						return fmt.Errorf("save %s/%s: %w", pm.Type, pm.Name, err)
-					}
-					fmt.Printf("Merged %d version(s) into %s/%s\n", len(pm.Versions), pm.Type, pm.Name)
-				} else {
-					pm.ConfigVersion = manifest.CurrentConfigVersion
-					if err := store.SavePackage(ctx, &pm); err != nil {
-						return fmt.Errorf("save %s/%s: %w", pm.Type, pm.Name, err)
-					}
-					fmt.Printf("Imported %s/%s (%d version(s))\n", pm.Type, pm.Name, len(pm.Versions))
-				}
 
-				if err := store.SaveIndex(ctx); err != nil {
-					return fmt.Errorf("save index: %w", err)
-				}
-				imported++
+					if err := store.SaveIndex(ctx); err != nil {
+						return fmt.Errorf("save index: %w", err)
+					}
+					imported++
 
-				// Audit.
-				if adb != nil {
-					afterJSON, _ := json.MarshalIndent(&pm, "", "  ")
-					_ = adb.Record(ctx, audit.Event{
-						EventType: audit.EventCreate,
-						PkgType:   pm.Type,
-						PkgName:   pm.Name,
-						Status:    "success",
-						Details:   audit.FormatDiff(nil, afterJSON),
-					})
+					// Audit.
+					if adb != nil {
+						afterJSON, _ := json.MarshalIndent(pm, "", "  ")
+						_ = adb.Record(ctx, audit.Event{
+							EventType: audit.EventCreate,
+							PkgType:   pm.Type,
+							PkgName:   pm.Name,
+							Status:    "success",
+							Details:   audit.FormatDiff(nil, afterJSON),
+						})
+					}
 				}
 			}
 
@@ -134,6 +141,24 @@ func readInput(path string) ([]byte, error) {
 		return io.ReadAll(os.Stdin)
 	}
 	return os.ReadFile(path)
+}
+
+// decodeManifests accepts either a single PackageManifest object or a JSON
+// array of them. The array form lets one file import many packages at once.
+func decodeManifests(data []byte) ([]manifest.PackageManifest, error) {
+	trimmed := bytes.TrimLeft(data, " \t\r\n")
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var pms []manifest.PackageManifest
+		if err := json.Unmarshal(data, &pms); err != nil {
+			return nil, err
+		}
+		return pms, nil
+	}
+	var pm manifest.PackageManifest
+	if err := json.Unmarshal(data, &pm); err != nil {
+		return nil, err
+	}
+	return []manifest.PackageManifest{pm}, nil
 }
 
 // enforceImportPolicy walks every version in pm and rejects the import if any
