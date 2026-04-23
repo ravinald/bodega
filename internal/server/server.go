@@ -1143,6 +1143,21 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 		setCacheImmutable(w, tarball)
 
 		pm, _ := s.store.GetPackage(ctx, manifest.TypeNpm, pkgName)
+		if pm != nil {
+			// Whole-package hidden → 404 the tarball outright.
+			if isPackageHidden(pm) {
+				http.NotFound(w, r)
+				return
+			}
+			// Per-version hidden → 404 just this version's tarball. Other
+			// versions of the same package remain reachable. This is the
+			// quarantine path for a single compromised release.
+			if ver := npmVersionFromTarball(pkgName, tarball); ver != "" && isVersionHidden(pm, ver) {
+				http.NotFound(w, r)
+				return
+			}
+		}
+
 		if pm != nil && packageMode(pm) == manifest.ModeProxy {
 			upstream := s.cfg.NpmUpstream + "/" + pkgName + "/-/" + tarball
 			s.proxyOrCache(w, r, key, upstream, manifest.TypeNpm, pkgName, true, true)
@@ -1153,13 +1168,143 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Packument request: path is just the package name (possibly scoped).
-	upstream := s.cfg.NpmUpstream + "/" + fullPath
-	s3Key := "npm/" + fullPath + "/packument.json"
+	pkgName := fullPath
+	pm, _ := s.store.GetPackage(ctx, manifest.TypeNpm, pkgName)
+
+	// Whole-package hidden → 404 the packument too; clients see the package
+	// as if it does not exist here.
+	if pm != nil && isPackageHidden(pm) {
+		http.NotFound(w, r)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 
-	pm, _ := s.store.GetPackage(ctx, manifest.TypeNpm, fullPath)
+	// Per-version hidden → rewrite the packument on the fly so clients never
+	// see the hidden version in `versions` or `dist-tags`. Filtered
+	// packuments are not cached to S3 — cache keyed by pkgName would collide
+	// with the unfiltered upstream copy.
+	if pm != nil && hasHiddenVersion(pm) {
+		s.serveFilteredPackument(w, r, pkgName, pm)
+		return
+	}
+
+	upstream := s.cfg.NpmUpstream + "/" + pkgName
+	s3Key := "npm/" + pkgName + "/packument.json"
 	forceProxy := pm != nil && packageMode(pm) == manifest.ModeProxy
-	s.proxyOrCache(w, r, s3Key, upstream, manifest.TypeNpm, fullPath, false, forceProxy)
+	s.proxyOrCache(w, r, s3Key, upstream, manifest.TypeNpm, pkgName, false, forceProxy)
+}
+
+// npmVersionFromTarball extracts the version from an npm tarball filename
+// given the owning package name. For `@bitwarden/cli` → `cli-2026.4.0.tgz`,
+// returns `2026.4.0`. Returns "" when the filename doesn't match the
+// expected shape.
+func npmVersionFromTarball(pkgName, tarball string) string {
+	basename := pkgName
+	if idx := strings.LastIndex(basename, "/"); idx >= 0 {
+		basename = basename[idx+1:]
+	}
+	prefix := basename + "-"
+	if !strings.HasPrefix(tarball, prefix) {
+		return ""
+	}
+	v := strings.TrimPrefix(tarball, prefix)
+	v = strings.TrimSuffix(v, ".tgz")
+	return v
+}
+
+// isVersionHidden reports whether a specific version of a package is marked
+// Hidden in the manifest. A non-matching version returns false — the
+// manifest's silence about a version is not a hide.
+func isVersionHidden(pm *manifest.PackageManifest, version string) bool {
+	for _, ve := range pm.Versions {
+		if ve.Version == version || ve.Ref == version {
+			return ve.Hidden
+		}
+	}
+	return false
+}
+
+// hasHiddenVersion reports whether at least one VersionEntry is Hidden. Used
+// to decide whether the packument needs on-the-fly filtering.
+func hasHiddenVersion(pm *manifest.PackageManifest) bool {
+	for _, ve := range pm.Versions {
+		if ve.Hidden {
+			return true
+		}
+	}
+	return false
+}
+
+// serveFilteredPackument fetches the upstream packument and strips every
+// hidden version from `versions`, `time`, and `dist-tags` before writing it
+// to w. Filtered bodies are not written back to the S3 cache — doing so
+// would pollute it with a hidden-version-dependent artifact.
+func (s *Server) serveFilteredPackument(w http.ResponseWriter, r *http.Request, pkgName string, pm *manifest.PackageManifest) {
+	upstream := s.cfg.NpmUpstream + "/" + pkgName
+	data, ct, err := fetchUpstream(r.Context(), upstream)
+	if err != nil {
+		s.logger.Error("packument fetch failed", "url", upstream, "error", err)
+		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
+		return
+	}
+
+	filtered, err := filterHiddenFromPackument(data, pm)
+	if err != nil {
+		s.logger.Error("packument filter failed", "pkg", pkgName, "error", err)
+		http.Error(w, "packument filter failed", http.StatusInternalServerError)
+		return
+	}
+
+	if ct == "" {
+		ct = "application/json"
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(filtered)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(filtered)
+}
+
+// filterHiddenFromPackument removes hidden versions from a raw npm packument
+// JSON body. Any `dist-tags` entry pointing at a hidden version is dropped,
+// including `latest` — callers that relied on `latest` will start seeing the
+// next-highest visible version, which is the correct behavior for a
+// quarantined release.
+func filterHiddenFromPackument(body []byte, pm *manifest.PackageManifest) ([]byte, error) {
+	hidden := make(map[string]bool)
+	for _, ve := range pm.Versions {
+		if ve.Hidden && ve.Version != "" {
+			hidden[ve.Version] = true
+		}
+	}
+	if len(hidden) == 0 {
+		return body, nil
+	}
+
+	var doc map[string]any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, err
+	}
+
+	if versions, ok := doc["versions"].(map[string]any); ok {
+		for v := range hidden {
+			delete(versions, v)
+		}
+	}
+	if times, ok := doc["time"].(map[string]any); ok {
+		for v := range hidden {
+			delete(times, v)
+		}
+	}
+	if tags, ok := doc["dist-tags"].(map[string]any); ok {
+		for tag, v := range tags {
+			if s, ok := v.(string); ok && hidden[s] {
+				delete(tags, tag)
+			}
+		}
+	}
+
+	return json.Marshal(doc)
 }
 
 // ---- Mutation API ----------------------------------------------------------

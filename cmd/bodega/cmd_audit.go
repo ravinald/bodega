@@ -15,6 +15,7 @@ func newAuditEventsCmd(gf *globalFlags) *cobra.Command {
 		pkgType   string
 		pkgName   string
 		clientIP  string
+		actor     string
 		since     string
 		limit     int
 	)
@@ -46,6 +47,7 @@ Examples:
 				PkgType:   pkgType,
 				PkgName:   pkgName,
 				ClientIP:  clientIP,
+				Actor:     actor,
 				Limit:     limit,
 			}
 
@@ -72,9 +74,10 @@ Examples:
 				return nil
 			}
 
-			// Print table header.
-			fmt.Printf("%-20s %-8s %-8s %-40s %-12s %-15s %s\n",
-				"TIMESTAMP", "EVENT", "TYPE", "NAME", "STATUS", "CLIENT", "DURATION")
+			// Print table header. CLIENT is the HTTP client IP; ACTOR is the
+			// CLI/TUI user. They're mutually exclusive per event in practice.
+			fmt.Printf("%-20s %-8s %-8s %-40s %-12s %-15s %-12s %s\n",
+				"TIMESTAMP", "EVENT", "TYPE", "NAME", "STATUS", "CLIENT", "ACTOR", "DURATION")
 			fmt.Println("---")
 
 			for _, ev := range events {
@@ -82,13 +85,14 @@ Examples:
 				if ev.DurationMs > 0 {
 					dur = fmt.Sprintf("%dms", ev.DurationMs)
 				}
-				fmt.Printf("%-20s %-8s %-8s %-40s %-12s %-15s %s\n",
+				fmt.Printf("%-20s %-8s %-8s %-40s %-12s %-15s %-12s %s\n",
 					ev.Timestamp.Format("2006-01-02 15:04:05"),
 					ev.EventType,
 					ev.PkgType,
 					truncate(ev.PkgName, 40),
 					ev.Status,
 					ev.ClientIP,
+					ev.Actor,
 					dur,
 				)
 			}
@@ -101,7 +105,8 @@ Examples:
 	cmd.Flags().StringVar(&eventType, "type", "", "Event type filter (fetch, build, create, delete, cache)")
 	cmd.Flags().StringVar(&pkgType, "pkg-type", "", "Package type filter (apt, git, pypi, binary, gomod, helm, npm)")
 	cmd.Flags().StringVar(&pkgName, "name", "", "Package name filter")
-	cmd.Flags().StringVar(&clientIP, "client", "", "Client IP filter")
+	cmd.Flags().StringVar(&clientIP, "client", "", "Client IP filter (HTTP events)")
+	cmd.Flags().StringVar(&actor, "actor", "", "Actor filter (CLI/TUI events — matches the OS user)")
 	cmd.Flags().StringVar(&since, "since", "", "Show events after this time (RFC3339 or YYYY-MM-DD)")
 	cmd.Flags().IntVar(&limit, "limit", 20, "Maximum number of events to show")
 

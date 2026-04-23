@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -81,6 +82,7 @@ type DB struct {
 	db       *sql.DB
 	filter   map[string]bool // nil = record all; otherwise only listed types
 	location *time.Location  // display timezone (storage is always UTC)
+	readOnly bool            // true when the backing file is not writable; Record becomes a no-op
 }
 
 // SetEventFilter restricts which event types are recorded. Pass nil or empty
@@ -128,25 +130,50 @@ func (a *DB) DisplayLocation() *time.Location {
 }
 
 // Open opens (or creates) the audit database at path and runs migrations.
+//
+// If the backing file exists but isn't writable by this process (typical when
+// bodega is installed as a system service and a non-root user is running a
+// read-only command like `bodega audit events`), Open still returns a usable
+// handle: migrations are skipped, and Record becomes a silent no-op. Query
+// keeps working. This is the graceful path for "I'm logged in as ravi but
+// /var/log/bodega/audit.db is root:root 644."
 func Open(path string) (*DB, error) {
+	readOnly := false
+	if path != "" {
+		if _, statErr := os.Stat(path); statErr == nil {
+			if f, err := os.OpenFile(path, os.O_WRONLY, 0); err != nil {
+				readOnly = true
+			} else {
+				_ = f.Close()
+			}
+		}
+	}
+
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("open audit db %s: %w", path, err)
 	}
 
-	// Enable WAL mode for better concurrent read/write performance.
-	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("set WAL mode: %w", err)
+	// WAL mode needs write access; skip on read-only handles (journal_mode
+	// returns the existing mode silently when write is denied, but we'd rather
+	// not even attempt the PRAGMA).
+	if !readOnly {
+		if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("set WAL mode: %w", err)
+		}
+		if err := runMigrations(db); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate audit db: %w", err)
+		}
 	}
 
-	if err := runMigrations(db); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("migrate audit db: %w", err)
-	}
-
-	return &DB{db: db}, nil
+	return &DB{db: db, readOnly: readOnly}, nil
 }
+
+// ReadOnly returns true when the backing file is not writable. Record silently
+// no-ops on a read-only handle; Query keeps working.
+func (a *DB) ReadOnly() bool { return a.readOnly }
 
 // Close closes the database.
 func (a *DB) Close() error {
@@ -154,8 +181,13 @@ func (a *DB) Close() error {
 }
 
 // Record inserts an audit event. Events that don't pass the configured
-// filter are silently dropped.
+// filter are silently dropped. Records are also silently dropped when the
+// backing DB was opened read-only — callers that need hard failure should
+// check ReadOnly() explicitly.
 func (a *DB) Record(ctx context.Context, ev Event) error {
+	if a.readOnly {
+		return nil
+	}
 	if !a.ShouldRecord(ev.EventType) {
 		return nil
 	}

@@ -77,6 +77,55 @@ func TestRecordAndQuery(t *testing.T) {
 	}
 }
 
+func TestOpenReadOnlyDB(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.db")
+
+	// Seed the DB normally, write one row.
+	seed, err := Open(path)
+	if err != nil {
+		t.Fatalf("seed Open: %v", err)
+	}
+	if err := seed.Record(context.Background(), Event{
+		EventType: EventCreate, PkgType: "npm", PkgName: "lodash", Actor: "ravi",
+	}); err != nil {
+		t.Fatalf("seed Record: %v", err)
+	}
+	_ = seed.Close()
+
+	// Flip the file to read-only and re-open.
+	if err := os.Chmod(path, 0o444); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+
+	ro, err := Open(path)
+	if err != nil {
+		t.Fatalf("read-only Open: %v (expected graceful)", err)
+	}
+	defer ro.Close()
+
+	if !ro.ReadOnly() {
+		t.Error("ReadOnly() = false on a 0444 file; want true")
+	}
+
+	// Record must silently no-op.
+	if err := ro.Record(context.Background(), Event{
+		EventType: EventCreate, PkgType: "npm", PkgName: "chalk", Actor: "ravi",
+	}); err != nil {
+		t.Errorf("Record on RO should be nil, got %v", err)
+	}
+
+	// Query still works.
+	events, err := ro.Query(context.Background(), Filter{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(events) != 1 {
+		t.Errorf("got %d rows, want 1 (Record should not have added to RO DB)", len(events))
+	}
+}
+
 func TestRecordAndQueryActor(t *testing.T) {
 	db := tempDB(t)
 	ctx := context.Background()

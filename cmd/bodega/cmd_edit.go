@@ -53,6 +53,17 @@ re-run with --editor cat to inspect, or copy and retry.`,
 				return fmt.Errorf("unknown type %q — must be one of: %s", t, strings.Join(manifest.AllTypes, ", "))
 			}
 
+			// Preflight write access — refuse to launch $EDITOR if the
+			// eventual SavePackage would fail on permissions. Nothing worse
+			// than a 20-line JSON edit that gets rejected at the finish line.
+			cfg, err := loadConfig(gf)
+			if err != nil {
+				return fmt.Errorf("load config: %w", err)
+			}
+			if err := ensureMutable(cfg); err != nil {
+				return fmt.Errorf("cannot edit: %w", err)
+			}
+
 			store, err := loadStore(gf)
 			if err != nil {
 				return fmt.Errorf("load manifests: %w", err)
