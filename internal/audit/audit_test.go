@@ -77,6 +77,58 @@ func TestRecordAndQuery(t *testing.T) {
 	}
 }
 
+func TestRecordAndQueryActor(t *testing.T) {
+	db := tempDB(t)
+	ctx := context.Background()
+
+	if err := db.Record(ctx, Event{
+		EventType: EventEdit,
+		PkgType:   "npm",
+		PkgName:   "@bitwarden/cli",
+		Actor:     "ravi",
+		Status:    "success",
+	}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if err := db.Record(ctx, Event{
+		EventType: EventCreate,
+		PkgType:   "npm",
+		PkgName:   "lodash",
+		Actor:     "ops-bot",
+	}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+
+	// Round-trip: Actor is both persisted and returned.
+	all, err := db.Query(ctx, Filter{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	var seen []string
+	for _, e := range all {
+		seen = append(seen, e.Actor)
+	}
+	if len(all) != 2 || seen[0] == "" || seen[1] == "" {
+		t.Fatalf("expected both events to have non-empty Actor, got %+v", seen)
+	}
+
+	// Filtering by actor.
+	byActor, err := db.Query(ctx, Filter{Actor: "ravi"})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(byActor) != 1 || byActor[0].PkgName != "@bitwarden/cli" {
+		t.Fatalf("filter by actor ravi → %+v, want single edit event", byActor)
+	}
+}
+
+func TestCurrentActorFallbacks(t *testing.T) {
+	// Can't reliably unset os/user on all platforms, so just assert non-empty.
+	if got := CurrentActor(); got == "" {
+		t.Error("CurrentActor returned empty string")
+	}
+}
+
 func TestQueryByEventType(t *testing.T) {
 	db := tempDB(t)
 	ctx := context.Background()

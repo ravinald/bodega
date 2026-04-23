@@ -128,14 +128,15 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 		newPackageCmd(gf),
 	)
 
-	// Package management commands: bodega pkg {create,delete,freeze,hide,refresh,verify,checksum}
+	// Package management commands: bodega pkg {create,edit,delete,freeze,hide,refresh,verify,checksum}
 	pkgParent := &cobra.Command{
 		Use:     "pkg",
 		Aliases: []string{"package"},
-		Short:   "Package management (create, delete, freeze, hide, refresh, verify)",
+		Short:   "Package management (create, edit, delete, freeze, hide, refresh, verify)",
 	}
 	pkgParent.AddCommand(
 		newCreateCmd(gf),
+		newEditCmd(gf),
 		newImportCmd(gf),
 		newExportCmd(gf),
 		newDeleteCmd(gf),

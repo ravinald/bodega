@@ -31,6 +31,7 @@ const (
 	EventRefresh EventType = "refresh" // bodega refresh
 	EventHide    EventType = "hide"    // bodega hide
 	EventFreeze  EventType = "freeze"  // bodega freeze
+	EventEdit    EventType = "edit"    // bodega pkg edit / TUI edit — free-form manifest change
 	EventShow    EventType = "show"    // bodega show
 
 	// Server lifecycle events.
@@ -53,6 +54,7 @@ type Event struct {
 	Status     string // "success", "failure", "cache_hit", "cache_miss"
 	DurationMs int64
 	Details    string // JSON blob for extra context
+	Actor      string // OS user for CLI/TUI events; empty for HTTP events (use ClientIP instead)
 }
 
 // StoredEvent is an Event with its database ID and timestamp.
@@ -68,6 +70,7 @@ type Filter struct {
 	PkgType   string    // empty = all
 	PkgName   string    // empty = all
 	ClientIP  string    // empty = all
+	Actor     string    // empty = all
 	Since     time.Time // zero = no lower bound
 	Until     time.Time // zero = no upper bound
 	Limit     int       // 0 = default (1000)
@@ -157,10 +160,10 @@ func (a *DB) Record(ctx context.Context, ev Event) error {
 		return nil
 	}
 	_, err := a.db.ExecContext(ctx,
-		`INSERT INTO events (event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO events (event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details, actor)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		string(ev.EventType), ev.PkgType, ev.PkgName, ev.PkgVersion,
-		ev.ClientIP, ev.UserAgent, ev.Status, ev.DurationMs, ev.Details,
+		ev.ClientIP, ev.UserAgent, ev.Status, ev.DurationMs, ev.Details, ev.Actor,
 	)
 	return err
 }
@@ -186,6 +189,10 @@ func (a *DB) Query(ctx context.Context, f Filter) ([]StoredEvent, error) {
 		where = append(where, "client_ip = ?")
 		args = append(args, f.ClientIP)
 	}
+	if f.Actor != "" {
+		where = append(where, "actor = ?")
+		args = append(args, f.Actor)
+	}
 	if !f.Since.IsZero() {
 		where = append(where, "timestamp >= ?")
 		args = append(args, f.Since.UTC().Format(time.RFC3339Nano))
@@ -195,7 +202,7 @@ func (a *DB) Query(ctx context.Context, f Filter) ([]StoredEvent, error) {
 		args = append(args, f.Until.UTC().Format(time.RFC3339Nano))
 	}
 
-	query := "SELECT id, timestamp, event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details FROM events"
+	query := "SELECT id, timestamp, event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details, actor FROM events"
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
@@ -221,7 +228,7 @@ func (a *DB) Query(ctx context.Context, f Filter) ([]StoredEvent, error) {
 		err := rows.Scan(&se.ID, &ts, &et,
 			&se.PkgType, &se.PkgName, &se.PkgVersion,
 			&se.ClientIP, &se.UserAgent, &se.Status,
-			&se.DurationMs, &se.Details)
+			&se.DurationMs, &se.Details, &se.Actor)
 		if err != nil {
 			return nil, err
 		}

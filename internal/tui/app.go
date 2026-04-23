@@ -760,9 +760,10 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				if m.auditDB != nil {
 					afterJSON, _ := json.MarshalIndent(pm, "", "  ")
 					_ = m.auditDB.Record(ctx, audit.Event{
-						EventType: audit.EventBuild,
+						EventType: audit.EventEdit,
 						PkgType:   node.EntryType,
 						PkgName:   node.Name,
+						Actor:     audit.CurrentActor(),
 						Status:    "success",
 						Details:   audit.FormatDiff(beforeJSON, afterJSON),
 					})
