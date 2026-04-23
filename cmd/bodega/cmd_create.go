@@ -13,6 +13,7 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 )
 
 func newCreateCmd(gf *globalFlags) *cobra.Command {
@@ -99,6 +100,10 @@ Examples:
 				ve = manifest.VersionEntry{}
 			}
 
+			if err := confirmPolicyOverride(ctx, r, gf, t, name, ve); err != nil {
+				return err
+			}
+
 			if err := store.AddVersion(ctx, t, name, ve); err != nil {
 				return fmt.Errorf("add version: %w", err)
 			}
@@ -151,6 +156,57 @@ Examples:
 	}
 
 	return cmd
+}
+
+// confirmPolicyOverride runs the upstream allow-list on the entry that was just
+// collected interactively. If a violation is found, the operator is warned and
+// given a y/N prompt to proceed anyway. Confirmation writes a policy_override
+// audit event. This is the ONLY policy enforcement path that allows override —
+// the server API, builder fetches, and bodega pkg import all hard-reject.
+func confirmPolicyOverride(ctx context.Context, r *bufio.Reader, gf *globalFlags, t, name string, ve manifest.VersionEntry) error {
+	adb := openAuditDB(gf)
+	if adb == nil {
+		return nil
+	}
+	defer adb.Close()
+
+	checker := policy.NewChecker(adb)
+	candidate := policy.CandidateFor(t, name, ve.URL)
+	if candidate == "" {
+		return nil
+	}
+	err := checker.Check(ctx, t, candidate)
+	if err == nil {
+		return nil
+	}
+	if !policy.IsViolation(err) {
+		return fmt.Errorf("policy check: %w", err)
+	}
+
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintf(os.Stderr, "  WARNING: upstream not in allow-list\n")
+	fmt.Fprintf(os.Stderr, "    type:      %s\n", t)
+	fmt.Fprintf(os.Stderr, "    candidate: %s\n", candidate)
+	fmt.Fprintf(os.Stderr, "    fix:       bodega policy add %s %s\n", t, candidate)
+	fmt.Fprintln(os.Stderr)
+
+	answer, pErr := prompt(r, "Proceed anyway? [y/N]", "N")
+	if pErr != nil {
+		return pErr
+	}
+	if !strings.EqualFold(answer, "y") && !strings.EqualFold(answer, "yes") {
+		return fmt.Errorf("aborted: upstream violates policy")
+	}
+
+	_ = adb.Record(ctx, audit.Event{
+		EventType:  audit.EventCreate,
+		PkgType:    t,
+		PkgName:    name,
+		PkgVersion: ve.Version,
+		Status:     "policy_override",
+		Details:    fmt.Sprintf("candidate=%s", candidate),
+	})
+	return nil
 }
 
 // prompt asks the user for a value, using defVal as the default.

@@ -32,6 +32,69 @@ func aptSourceDir(d dirs, name string, ve manifest.VersionEntry) string {
 	return filepath.Join(d.sources, sourceName)
 }
 
+// aptGetDownloadViaTemp runs `apt-get download` from a world-writable tempdir
+// (so the _apt sandbox user can write there) and then moves the resulting .deb
+// into pkgDir. Falls back to copy+remove if the tempdir and pkgDir are on
+// different filesystems (os.Rename returns EXDEV in that case).
+func aptGetDownloadViaTemp(out io.Writer, sourceName, pkgDir string) (string, error) {
+	tmpDir, err := os.MkdirTemp("", "bodega-apt-*")
+	if err != nil {
+		return "", fmt.Errorf("create tempdir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	_, _ = fmt.Fprintf(out, "    Downloading %s via apt-get download...\n", sourceName)
+	if err := runCmd(out, tmpDir, "apt-get", "download", sourceName); err != nil {
+		return "", fmt.Errorf("apt-get download %s: %w", sourceName, err)
+	}
+
+	matches, err := filepath.Glob(filepath.Join(tmpDir, sourceName+"*.deb"))
+	if err != nil || len(matches) == 0 {
+		return "", fmt.Errorf("no .deb found for %s in %s", sourceName, tmpDir)
+	}
+
+	src := matches[0]
+	dest := filepath.Join(pkgDir, filepath.Base(src))
+	if err := moveFile(src, dest); err != nil {
+		return "", fmt.Errorf("move .deb to %s: %w", dest, err)
+	}
+	_, _ = fmt.Fprintf(out, "    Downloaded: %s\n", filepath.Base(dest))
+	return dest, nil
+}
+
+// moveFile renames src to dst, falling back to copy+remove when the two paths
+// live on different filesystems (cross-device rename is not supported).
+func moveFile(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	fi, err := in.Stat()
+	if err != nil {
+		return err
+	}
+
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, fi.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(dst)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(dst)
+		return err
+	}
+	return os.Remove(src)
+}
+
 // CheckAptStage inspects the filesystem to determine which pipeline stages have
 // completed for the given apt package version. It does not run any commands.
 func CheckAptStage(cfg *Config, name string, ve manifest.VersionEntry) StageStatus {
@@ -130,6 +193,12 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 		for _, ve := range pm.Versions {
 			if ve.Frozen {
 				cfg.logf("  [apt] %s: SKIPPED (frozen)", name)
+				continue
+			}
+			if err := cfg.EnforcePolicy(ctx, manifest.TypeApt, name, ve.Version, ve.URL); err != nil {
+				cfg.logf("  [apt] %s: BLOCKED by policy: %v", name, err)
+				summary.Failures++
+				summary.Results = append(summary.Results, Result{Type: manifest.TypeApt, Name: name, Err: err})
 				continue
 			}
 
@@ -257,22 +326,18 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 
 			default:
 				// Package name download: apt-get download into per-package subdirectory.
+				//
+				// apt-get drops privileges to the `_apt` user to sandbox the download.
+				// When the destination is under /opt/bodega (root:root 0755), _apt
+				// can't write there, so apt emits a noisy "Download is performed
+				// unsandboxed as root" warning and proceeds. We run the download in
+				// a world-writable tempdir (_apt can sandbox normally) and move the
+				// .deb into the per-package dir afterwards.
 				pkgDir := filepath.Join(srcDir, sourceName)
 				if err := mkdirAll(pkgDir); err != nil {
 					fetchErr = fmt.Errorf("create dir %s: %w", pkgDir, err)
 				} else {
-					_, _ = fmt.Fprintf(out, "    Downloading %s via apt-get download...\n", sourceName)
-					if err := runCmd(out, pkgDir, "apt-get", "download", sourceName); err != nil {
-						fetchErr = fmt.Errorf("apt-get download %s: %w", sourceName, err)
-					} else {
-						matches, err := filepath.Glob(filepath.Join(pkgDir, sourceName+"*.deb"))
-						if err != nil || len(matches) == 0 {
-							fetchErr = fmt.Errorf("no .deb found for %s in %s", sourceName, pkgDir)
-						} else {
-							artifactPath = matches[0]
-							_, _ = fmt.Fprintf(out, "    Downloaded: %s\n", filepath.Base(artifactPath))
-						}
-					}
+					artifactPath, fetchErr = aptGetDownloadViaTemp(out, sourceName, pkgDir)
 				}
 			}
 

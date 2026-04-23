@@ -136,6 +136,60 @@ If no types are given all four are uploaded.`,
 					}
 					fmt.Printf("    Uploaded %d file(s) to s3://%s/%s\n", n, cfg.Bucket, s3Prefix)
 					totalUploaded += n
+
+				case manifest.TypeGomod:
+					// Cascade: ensure every gomod entry has its .info/.mod/.zip triplet.
+					if s := ensureFetchedGomod(bcfg, store, ""); s.HasFailures() {
+						return fmt.Errorf("cascade fetch for gomod failed")
+					}
+					paths := builder.GomodArtifactPaths(bcfg, store, "")
+					if len(paths) == 0 {
+						fmt.Println("    No gomod artifacts to upload — skipping")
+						continue
+					}
+					for _, ap := range paths {
+						fmt.Printf("    upload: s3://%s/%s\n", cfg.Bucket, ap.S3Key)
+						if err := objStore.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
+							return fmt.Errorf("upload gomod %s: %w", ap.Local, err)
+						}
+						totalUploaded++
+					}
+
+				case manifest.TypeHelm:
+					// Cascade: ensure charts are fetched and index.yaml is regenerated.
+					if s := ensurePackagedHelm(bcfg, store, ""); s.HasFailures() {
+						return fmt.Errorf("cascade package for helm failed")
+					}
+					paths := builder.HelmArtifactPaths(bcfg, store, "")
+					if len(paths) == 0 {
+						fmt.Println("    No helm artifacts to upload — skipping")
+						continue
+					}
+					for _, ap := range paths {
+						fmt.Printf("    upload: s3://%s/%s\n", cfg.Bucket, ap.S3Key)
+						if err := objStore.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
+							return fmt.Errorf("upload helm %s: %w", ap.Local, err)
+						}
+						totalUploaded++
+					}
+
+				case manifest.TypeNpm:
+					// Cascade: ensure tarballs are fetched and packuments regenerated.
+					if s := ensurePackagedNpm(bcfg, store, ""); s.HasFailures() {
+						return fmt.Errorf("cascade package for npm failed")
+					}
+					paths := builder.NpmArtifactPaths(bcfg, store, "")
+					if len(paths) == 0 {
+						fmt.Println("    No npm artifacts to upload — skipping")
+						continue
+					}
+					for _, ap := range paths {
+						fmt.Printf("    upload: s3://%s/%s\n", cfg.Bucket, ap.S3Key)
+						if err := objStore.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
+							return fmt.Errorf("upload npm %s: %w", ap.Local, err)
+						}
+						totalUploaded++
+					}
 				}
 			}
 

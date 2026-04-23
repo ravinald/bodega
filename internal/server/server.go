@@ -32,6 +32,7 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 	"github.com/ravinald/bodega/internal/storage"
 )
 
@@ -65,6 +66,7 @@ type Server struct {
 	logger    *slog.Logger
 	cache     CacheConfig
 	auditDB   *audit.DB
+	policy    *policy.Checker
 	denyNets  []*net.IPNet
 	adminNets []*net.IPNet // CIDRs allowed to hit mutation API (admin_permit_cidr)
 	pepper    string       // pepper for token hash verification
@@ -131,8 +133,33 @@ func newServer(cfg *config.Config, store *manifest.Store, objects storage.Object
 	} else {
 		logger.Error("could not load or create pepper file — token auth will not work", "error", err)
 	}
+	// Open the audit DB if configured. Best-effort — server keeps serving
+	// even if this fails, but token auth and upstream-policy enforcement
+	// both depend on it.
+	if dbPath := resolveAuditDBPath(cfg); dbPath != "" {
+		if db, err := audit.Open(dbPath); err != nil {
+			logger.Warn("could not open audit db; token auth and policy enforcement disabled",
+				"path", dbPath, "error", err)
+		} else {
+			s.auditDB = db
+			s.policy = policy.NewChecker(db)
+			logger.Info("audit db opened", "path", dbPath)
+		}
+	}
 	s.registerRoutes()
 	return s
+}
+
+// resolveAuditDBPath returns the audit database path from config, falling
+// back to <log_dir>/audit.db when AuditDB is unset.
+func resolveAuditDBPath(cfg *config.Config) string {
+	if cfg.AuditDB != "" {
+		return cfg.AuditDB
+	}
+	if cfg.LogDir != "" {
+		return filepath.Join(cfg.LogDir, "audit.db")
+	}
+	return ""
 }
 
 // Handler returns the root http.Handler (with middleware applied).
@@ -299,6 +326,11 @@ func (s *Server) registerRoutes() {
 	m.HandleFunc("GET /api/v1/tokens", s.handleListTokens)
 	m.HandleFunc("POST /api/v1/tokens", s.handleCreateToken)
 	m.HandleFunc("DELETE /api/v1/tokens/{id}", s.handleRevokeToken)
+
+	// Upstream allow-list policies (mutation-gated)
+	m.HandleFunc("GET /api/v1/policies", s.handleListPolicies)
+	m.HandleFunc("POST /api/v1/policies", s.handleCreatePolicy)
+	m.HandleFunc("DELETE /api/v1/policies/{id}", s.handleRevokePolicy)
 }
 
 // isAdminRequest checks whether the request originates from an IP in
@@ -776,7 +808,7 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 		if pkg != nil && packageMode(pkg) == manifest.ModeProxy {
 			// Proxy the simple index from upstream PyPI.
 			upstream := "https://pypi.org/simple/" + normalized + "/"
-			s.proxyOrCache(w, r, "pypi/simple/"+normalized+"/index.html", upstream, false, true)
+			s.proxyOrCache(w, r, "pypi/simple/"+normalized+"/index.html", upstream, manifest.TypePypi, pkgName, false, true)
 			return
 		}
 		http.NotFound(w, r)
@@ -812,7 +844,7 @@ func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
 		pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, dist)
 		if pkg != nil && packageMode(pkg) == manifest.ModeProxy {
 			upstream := "https://pypi.org/packages/" + file
-			s.proxyOrCache(w, r, key, upstream, true, true)
+			s.proxyOrCache(w, r, key, upstream, manifest.TypePypi, dist, true, true)
 			return
 		}
 	}
@@ -1042,7 +1074,7 @@ func (s *Server) handleGomod(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		s.proxyOrCache(w, r, s3Key, upstream, immutable, true)
+		s.proxyOrCache(w, r, s3Key, upstream, manifest.TypeGomod, module, immutable, true)
 		return
 	}
 	s.proxyS3(w, r, s3Key)
@@ -1089,7 +1121,7 @@ func (s *Server) handleHelmChart(w http.ResponseWriter, r *http.Request) {
 		for _, ve := range pm.Versions {
 			if ve.URL != "" {
 				upstream := strings.TrimSuffix(ve.URL, "/") + "/" + file
-				s.proxyOrCache(w, r, key, upstream, true, true)
+				s.proxyOrCache(w, r, key, upstream, manifest.TypeHelm, upstream, true, true)
 				return
 			}
 		}
@@ -1113,7 +1145,7 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 		pm, _ := s.store.GetPackage(ctx, manifest.TypeNpm, pkgName)
 		if pm != nil && packageMode(pm) == manifest.ModeProxy {
 			upstream := s.cfg.NpmUpstream + "/" + pkgName + "/-/" + tarball
-			s.proxyOrCache(w, r, key, upstream, true, true)
+			s.proxyOrCache(w, r, key, upstream, manifest.TypeNpm, pkgName, true, true)
 			return
 		}
 		s.proxyS3(w, r, key)
@@ -1127,7 +1159,7 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 
 	pm, _ := s.store.GetPackage(ctx, manifest.TypeNpm, fullPath)
 	forceProxy := pm != nil && packageMode(pm) == manifest.ModeProxy
-	s.proxyOrCache(w, r, s3Key, upstream, false, forceProxy)
+	s.proxyOrCache(w, r, s3Key, upstream, manifest.TypeNpm, fullPath, false, forceProxy)
 }
 
 // ---- Mutation API ----------------------------------------------------------
@@ -1161,6 +1193,36 @@ func (s *Server) handleCreateEntry(w http.ResponseWriter, r *http.Request) {
 		if existing != nil {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "package already exists"})
 			return
+		}
+		// Allow-list enforcement: reject upstream URLs/names that aren't in policy.
+		if s.policy != nil {
+			for _, ve := range pm.Versions {
+				candidate := policy.CandidateFor(t, pm.Name, ve.URL)
+				if candidate == "" {
+					continue
+				}
+				if err := s.policy.Check(ctx, t, candidate); err != nil {
+					if policy.IsViolation(err) {
+						s.logger.Warn("create rejected by policy",
+							"type", t, "name", pm.Name, "version", ve.Version, "candidate", candidate)
+						if s.auditDB != nil {
+							_ = s.auditDB.Record(ctx, audit.Event{
+								EventType:  audit.EventCreate,
+								PkgType:    t,
+								PkgName:    pm.Name,
+								PkgVersion: ve.Version,
+								Status:     "policy_violation",
+								Details:    fmt.Sprintf("candidate=%s", candidate),
+							})
+						}
+						writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+						return
+					}
+					s.logger.Error("policy check failed", "error", err)
+					writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "policy check failed"})
+					return
+				}
+			}
 		}
 		pm.Type = t
 		if err := s.store.SavePackage(ctx, &pm); err != nil {
@@ -1444,6 +1506,123 @@ func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "token not found"})
 		return
 	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked", "id": id})
+}
+
+// ---- Policy API ------------------------------------------------------------
+
+func (s *Server) handleListPolicies(w http.ResponseWriter, r *http.Request) {
+	if !s.isAdminRequest(r) {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+	if s.auditDB == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit database not configured"})
+		return
+	}
+	typeFilter := r.URL.Query().Get("type")
+	var rules []audit.PolicyInfo
+	var err error
+	if typeFilter != "" {
+		rules, err = s.auditDB.GetPoliciesByType(r.Context(), typeFilter)
+	} else {
+		rules, err = s.auditDB.ListPolicies(r.Context())
+	}
+	if err != nil {
+		s.logger.Error("list policies failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	writeJSON(w, http.StatusOK, rules)
+}
+
+func (s *Server) handleCreatePolicy(w http.ResponseWriter, r *http.Request) {
+	if s.auditDB == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit database not configured"})
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req struct {
+		RegistryType string `json:"registry_type"`
+		Pattern      string `json:"pattern"`
+		Comment      string `json:"comment"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if err := policy.ValidateType(req.RegistryType); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if req.Pattern == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "pattern is required"})
+		return
+	}
+	kind := policy.RuleKindForType(req.RegistryType)
+
+	idBytes := make([]byte, 16)
+	if _, err := cryptoRand.Read(idBytes); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	id := hex.EncodeToString(idBytes)
+
+	rule := audit.PolicyInfo{
+		ID:           id,
+		RegistryType: req.RegistryType,
+		RuleKind:     kind,
+		Pattern:      req.Pattern,
+		Comment:      req.Comment,
+		CreatedBy:    "api",
+	}
+	ctx := r.Context()
+	if err := s.auditDB.InsertPolicy(ctx, rule); err != nil {
+		s.logger.Error("insert policy failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if s.policy != nil {
+		s.policy.Invalidate()
+	}
+	_ = s.auditDB.Record(ctx, audit.Event{
+		EventType: audit.EventCreate,
+		PkgType:   "policy",
+		PkgName:   req.RegistryType + ":" + req.Pattern,
+		ClientIP:  ClientIP(r),
+		Status:    "success",
+		Details:   fmt.Sprintf("id=%s kind=%s", id, kind),
+	})
+	writeJSON(w, http.StatusCreated, rule)
+}
+
+func (s *Server) handleRevokePolicy(w http.ResponseWriter, r *http.Request) {
+	if s.auditDB == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit database not configured"})
+		return
+	}
+	id := r.PathValue("id")
+	found, err := s.auditDB.DeletePolicyByID(r.Context(), id)
+	if err != nil {
+		s.logger.Error("revoke policy failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if !found {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "policy not found"})
+		return
+	}
+	if s.policy != nil {
+		s.policy.Invalidate()
+	}
+	_ = s.auditDB.Record(r.Context(), audit.Event{
+		EventType: audit.EventDelete,
+		PkgType:   "policy",
+		PkgName:   id,
+		ClientIP:  ClientIP(r),
+		Status:    "success",
+	})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked", "id": id})
 }
 

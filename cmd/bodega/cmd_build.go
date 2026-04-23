@@ -11,6 +11,7 @@ import (
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/logging"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 )
 
 func newBuildRunCmd(gf *globalFlags) *cobra.Command {
@@ -74,6 +75,11 @@ When a name is given after the type, only that entry is built.`,
 				defer auditDB.Close()
 			}
 
+			var policyChecker *policy.Checker
+			if auditDB != nil {
+				policyChecker = policy.NewChecker(auditDB)
+			}
+
 			bcfg := &builder.Config{
 				AutoImportDeps: true,
 				BuildRoot:      cfg.BuildRoot,
@@ -88,6 +94,7 @@ When a name is given after the type, only that entry is built.`,
 				Stdout:         buildOut,
 				Logger:         buildLogger,
 				AuditDB:        auditDB,
+				Policy:         policyChecker,
 			}
 
 			var allSummaries []*builder.Summary
@@ -121,6 +128,25 @@ When a name is given after the type, only that entry is built.`,
 					)
 					s := builder.BuildPypi(bcfg, store)
 					allSummaries = append(allSummaries, s)
+
+				case manifest.TypeGomod:
+					// gomod has no build step; fetch is the only action.
+					// FetchGomod skips already-fetched entries per-item.
+					allSummaries = append(allSummaries,
+						builder.FetchGomod(bcfg, store, entryFilter),
+					)
+
+				case manifest.TypeHelm:
+					// helm has no build step; FetchHelm skips already-fetched.
+					allSummaries = append(allSummaries,
+						builder.FetchHelm(bcfg, store, entryFilter),
+					)
+
+				case manifest.TypeNpm:
+					// npm has no build step; FetchNpm skips already-fetched.
+					allSummaries = append(allSummaries,
+						builder.FetchNpm(bcfg, store, entryFilter),
+					)
 				}
 			}
 

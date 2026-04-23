@@ -288,6 +288,40 @@ Lists all API tokens with their ID, label, creation date, expiry, last use, and 
 
 Revokes a token by its short ID or label, removing it from the database.
 
+### `bodega policy list [--type TYPE]`
+
+Lists configured upstream allow-list rules. Without `--type`, shows every rule grouped by registry type.
+
+### `bodega policy add <type> <pattern> [comment]`
+
+Adds an allow-list rule. The rule kind is determined by type:
+
+| Type | Kind | Pattern example |
+|------|------|-----------------|
+| apt | host | `archive.ubuntu.com` |
+| git | org (prefix) | `github.com/netbox-community/` |
+| pypi | package | `django` |
+| npm | package | `lodash` or `@aws-sdk/*` |
+| gomod | prefix | `github.com/aws/` |
+| helm | prefix | `https://kubernetes.github.io/ingress-nginx/` |
+| binary | prefix | `https://releases.hashicorp.com/` |
+
+```bash
+bodega policy add pypi django
+bodega policy add git github.com/netbox-community/ "NetBox maintainers"
+bodega policy add npm @aws-sdk/*
+```
+
+An empty allow-list means enforcement is off for that registry type — everything is accepted. Add at least one rule to switch it on. PyPI names are normalized per PEP 503 (lowercased, `_` and `-` unified).
+
+### `bodega policy remove <id|pattern> [--type TYPE]`
+
+Removes a rule. Tries by ID first; falls back to deleting by pattern, scoped to `--type` when provided.
+
+### `bodega policy check`
+
+Walks every manifest in the store and reports any entry whose upstream URL or package name would be rejected by the current policy. Exits with code 1 on any violation — suitable for CI.
+
 ### `bodega --break-glass-update-md5 <type>`
 
 Recomputes the MD5 digest for a manifest that was edited outside of the tool.
@@ -635,6 +669,16 @@ All API responses are JSON. The full API is documented in [OpenAPI 3.0 format](.
 | POST | `/api/v1/tokens` | Create a new token (JSON body: `{label, expiry, comment}`) |
 | DELETE | `/api/v1/tokens/{id}` | Revoke a token |
 
+### Policy endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/v1/policies[?type=TYPE]` | List allow-list rules (optionally scoped to one registry type) |
+| POST | `/api/v1/policies` | Add a rule (JSON body: `{registry_type, pattern, comment}`) |
+| DELETE | `/api/v1/policies/{id}` | Remove a rule by ID |
+
+Policy mutations invalidate the in-memory cache, so changes take effect on the next request without a restart.
+
 Mutation endpoints are restricted by `admin_permit_cidr`, which defaults to localhost only (`127.0.0.0/8`, `::1/128`). Requests from IPs outside the permit list get a 403.
 
 When `admin_permit_cidr` includes non-localhost addresses, a Bearer token is also required. Generate tokens with `bodega token generate` and pass them in the `Authorization` header.
@@ -667,6 +711,34 @@ curl -X POST http://bodega-host:8080/api/v1/packages/gomod \
 ## Supply Chain Management
 
 When a dependency has a security issue, fails checksum verification, or is otherwise compromised, bodega provides tools to manage it without losing the historical record.
+
+### Upstream allow-list
+
+The allow-list declares which upstream sources bodega is permitted to fetch from, at the granularity that matters for each ecosystem. It's opt-in: add a rule for a registry type and enforcement switches on for that type. Leave it empty and everything is accepted (pre-v0.2.0 behavior).
+
+Enforcement happens in four places, so there's no way around it:
+
+- **Server proxy** (`bodega serve`) — cache-miss fetches check policy before leaving the box. Blocked fetches return 403.
+- **Builder** (`bodega build fetch`) — each fetch stage validates entries before any network I/O.
+- **Create API + import** (`POST /api/v1/packages/...`, `bodega pkg import`) — manifests referencing blocked upstreams are rejected at creation time. Fail early, not at first fetch.
+- **Interactive create** (`bodega pkg create`) — warns the operator and asks y/N to proceed. The only path that allows override, and the override writes a `policy_override` audit event.
+
+Every mutation (`policy add`, `policy remove`) and every violation (fetch, import, server) writes an event to the audit trail with `pkg_type="policy"` or `status="policy_violation"`.
+
+```bash
+# Turn on enforcement for git by pinning allowed orgs
+bodega policy add git github.com/netbox-community/
+bodega policy add git github.com/aws/
+
+# Scope pypi to a curated list
+bodega policy add pypi django
+bodega policy add pypi requests
+
+# Audit existing manifests for any violations
+bodega policy check
+```
+
+The allow-list is stored in SQLite (`upstream_policies` table in the audit DB) and is hot-mutable — server changes are picked up within 30 seconds, and policy mutations invalidate the cache immediately.
 
 ### Scenario: Bad version of libssl3
 

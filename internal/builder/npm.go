@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,45 @@ import (
 )
 
 const defaultNpmRegistry = "https://registry.npmjs.org"
+
+// npmPackumentMaxBytes caps packument downloads. Popular packages like
+// react-native or @types/node have packuments in the multi-MB range.
+const npmPackumentMaxBytes = 32 * 1024 * 1024
+
+// isNpmDistTag reports whether v is a dist-tag rather than a concrete version.
+// We treat empty as "latest" by convention.
+func isNpmDistTag(v string) bool {
+	return v == "" || v == "latest"
+}
+
+// resolveNpmDistTag fetches the packument for pkgName from registry and
+// returns the concrete version that the named dist-tag points at.
+func resolveNpmDistTag(registry, pkgName, tag string) (string, error) {
+	url := registry + "/" + pkgName
+	resp, err := http.Get(url) //nolint:gosec
+	if err != nil {
+		return "", fmt.Errorf("fetch packument %s: %w", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("fetch packument %s: HTTP %d", url, resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, npmPackumentMaxBytes))
+	if err != nil {
+		return "", fmt.Errorf("read packument %s: %w", url, err)
+	}
+	var doc struct {
+		DistTags map[string]string `json:"dist-tags"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return "", fmt.Errorf("parse packument: %w", err)
+	}
+	v, ok := doc.DistTags[tag]
+	if !ok || v == "" {
+		return "", fmt.Errorf("dist-tag %q not present in packument", tag)
+	}
+	return v, nil
+}
 
 // npmTarballFilename returns the conventional npm tarball name.
 func npmTarballFilename(name string, ve manifest.VersionEntry) string {
@@ -75,6 +115,12 @@ func FetchNpm(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 				cfg.logf("  [npm] %s: SKIPPED (frozen)", name)
 				continue
 			}
+			if err := cfg.EnforcePolicy(ctx, manifest.TypeNpm, name, ve.Version, ve.URL); err != nil {
+				cfg.logf("  [npm] %s: BLOCKED by policy: %v", name, err)
+				summary.Failures++
+				summary.Results = append(summary.Results, Result{Type: manifest.TypeNpm, Name: name, Err: err})
+				continue
+			}
 			if !cfg.Force {
 				stage := CheckNpmStage(cfg, name, ve)
 				if stage.Fetched {
@@ -87,7 +133,38 @@ func FetchNpm(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 			start := time.Now()
 			out := cfg.entryWriter(manifest.TypeNpm, name)
 
-			dir := npmLocalDir(d, name, ve)
+			registry := ve.URL
+			if registry == "" {
+				registry = defaultNpmRegistry
+			}
+
+			// Resolve dist-tags (e.g. "latest") to a concrete version via the
+			// packument. fetchVe is the version we actually download; ve is the
+			// manifest entry, which we leave alone so the dist-tag stays as a
+			// floating ref for future fetches.
+			fetchVe := ve
+			distTag := ""
+			if isNpmDistTag(ve.Version) {
+				distTag = ve.Version
+				if distTag == "" {
+					distTag = "latest"
+				}
+				resolved, err := resolveNpmDistTag(registry, pm.Name, distTag)
+				if err != nil {
+					_, _ = fmt.Fprintf(out, "  [npm] %s: ERROR resolving dist-tag %q: %v\n", pm.Name, distTag, err)
+					result.Err = err
+					result.Elapsed = time.Since(start)
+					summary.Results = append(summary.Results, result)
+					summary.Total++
+					summary.Failures++
+					cfg.RecordAudit(audit.EventFetch, manifest.TypeNpm, name, ve.Version, "failure", result.Elapsed, result.Err)
+					continue
+				}
+				_, _ = fmt.Fprintf(out, "  [npm] %s: dist-tag %q → %s\n", pm.Name, distTag, resolved)
+				fetchVe.Version = resolved
+			}
+
+			dir := npmLocalDir(d, name, fetchVe)
 			if err := mkdirAll(dir); err != nil {
 				result.Err = err
 				result.Elapsed = time.Since(start)
@@ -97,17 +174,15 @@ func FetchNpm(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 				continue
 			}
 
-			registry := ve.URL
-			if registry == "" {
-				registry = defaultNpmRegistry
-			}
+			// Use pm.Name (canonical, with slashes for scoped packages) for the
+			// upstream URL. The `name` from ListPackages is safe-encoded
+			// (@scope/pkg → @scope--pkg) and is only valid as a local path/key.
+			upstreamName := pm.Name
+			tarballName := npmTarballFilename(upstreamName, fetchVe)
+			url := registry + "/" + upstreamName + "/-/" + tarballName
+			dest := npmTarballPath(d, name, fetchVe)
 
-			// npm tarball URL format: {registry}/{name}/-/{tarball}
-			tarballName := npmTarballFilename(name, ve)
-			url := registry + "/" + name + "/-/" + tarballName
-			dest := npmTarballPath(d, name, ve)
-
-			_, _ = fmt.Fprintf(out, "  [npm] %s@%s: fetching %s\n", name, ve.Version, url)
+			_, _ = fmt.Fprintf(out, "  [npm] %s@%s: fetching %s\n", pm.Name, fetchVe.Version, url)
 
 			if err := downloadURL(dest, url); err != nil {
 				_, _ = fmt.Fprintf(out, "  [npm] %s: ERROR: %v\n", name, err)
@@ -115,16 +190,19 @@ func FetchNpm(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 			} else {
 				result.Artifacts = append(result.Artifacts, dest)
 
-				// Checksum verification.
+				// Checksum verification — skipped for floating dist-tags since the
+				// resolved version (and therefore the hash) changes upstream over time.
 				computed, err := computeFileSHA256(dest)
 				if err != nil {
 					_, _ = fmt.Fprintf(out, "  [npm] %s: WARNING: could not compute checksum: %v\n", name, err)
+				} else if distTag != "" {
+					_, _ = fmt.Fprintf(out, "  [npm] %s@%s: checksum recorded for this fetch only (dist-tag %q is floating, sha256:%s...)\n", pm.Name, fetchVe.Version, distTag, computed[:12])
 				} else if ve.Checksum != nil {
 					if err := verifyChecksum(ve.Checksum, computed); err != nil {
 						_, _ = fmt.Fprintf(out, "  [npm] %s: CHECKSUM MISMATCH: %v\n", name, err)
 						result.Err = fmt.Errorf("checksum verification failed: %w", err)
 					} else {
-						_, _ = fmt.Fprintf(out, "  [npm] %s@%s: checksum verified\n", name, ve.Version)
+						_, _ = fmt.Fprintf(out, "  [npm] %s@%s: checksum verified\n", pm.Name, fetchVe.Version)
 						if !ve.ChecksumVerified {
 							if e := cfg.findAndUpdateNpmChecksum(store, name, ve, ve.Checksum, true); e != nil {
 								_, _ = fmt.Fprintf(out, "  [npm] %s: WARNING: could not save verified status: %v\n", name, e)
@@ -133,14 +211,14 @@ func FetchNpm(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 					}
 				} else if computed != "" {
 					cs := newSHA256Checksum(computed)
-					_, _ = fmt.Fprintf(out, "  [npm] %s@%s: checksum recorded (sha256:%s...)\n", name, ve.Version, computed[:12])
+					_, _ = fmt.Fprintf(out, "  [npm] %s@%s: checksum recorded (sha256:%s...)\n", pm.Name, fetchVe.Version, computed[:12])
 					if e := cfg.findAndUpdateNpmChecksum(store, name, ve, cs, false); e != nil {
 						_, _ = fmt.Fprintf(out, "  [npm] %s: WARNING: could not save checksum: %v\n", name, e)
 					}
 				}
 
 				if result.Err == nil {
-					_, _ = fmt.Fprintf(out, "  [npm] %s@%s: ok\n", name, ve.Version)
+					_, _ = fmt.Fprintf(out, "  [npm] %s@%s: ok\n", pm.Name, fetchVe.Version)
 					cfg.StampNpmEntry(store, name, ve)
 					stampArtifactSize(context.Background(), store, manifest.TypeNpm, name, ve, dest)
 				}
@@ -184,14 +262,17 @@ func PackageNpm(cfg *Config, store *manifest.Store) *Summary {
 			continue
 		}
 
-		_, _ = fmt.Fprintf(out, "  [npm] %s: generating packument\n", name)
+		_, _ = fmt.Fprintf(out, "  [npm] %s: generating packument\n", pm.Name)
 
+		// pm.Name is the canonical name (e.g. "@bitwarden/cli"); `name` from the
+		// index is safe-encoded (e.g. "@bitwarden--cli") and unfit for the
+		// packument that clients consume.
 		var entries []npmVersionEntry
 		for _, ve := range pm.Versions {
-			entries = append(entries, npmVersionEntry{name: name, ve: ve})
+			entries = append(entries, npmVersionEntry{name: pm.Name, ve: ve})
 		}
 
-		packument := buildPackument(name, entries, d)
+		packument := buildPackument(pm.Name, entries, d)
 
 		dir := filepath.Join(d.npm, name)
 		if err := mkdirAll(dir); err != nil {

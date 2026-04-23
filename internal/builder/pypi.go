@@ -1,15 +1,39 @@
 package builder
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 )
+
+// hasInstallableRequirements reports whether a pip requirements file contains
+// any line that pip would treat as an install target. Blank lines and comment
+// lines (leading #) are ignored. An `-r other.txt` reference counts as
+// installable (pip will recurse into it at wheel time).
+func hasInstallableRequirements(path string) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = f.Close() }()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		return true, nil
+	}
+	return false, scanner.Err()
+}
 
 // pypiWheelsDir returns the local wheels directory.
 func pypiWheelsDir(d dirs) string {
@@ -142,6 +166,11 @@ func FetchPypi(cfg *Config, store *manifest.Store) *Summary {
 	_, _ = fmt.Fprintf(out, "    Extra packages: %d\n", len(pkgNames))
 	reqLines = append(reqLines, "\n# Extra packages from manifest\n")
 	for _, name := range pkgNames {
+		if err := cfg.EnforcePolicy(ctx, manifest.TypePypi, name, "", ""); err != nil {
+			_, _ = fmt.Fprintf(out, "      %s — SKIPPED: %v\n", name, err)
+			summary.Failures++
+			continue
+		}
 		_, _ = fmt.Fprintf(out, "      %s\n", name)
 		reqLines = append(reqLines, name+"\n")
 	}
@@ -191,6 +220,23 @@ func BuildPypi(cfg *Config, store *manifest.Store) *Summary {
 		summary.Failures++
 		summary.Results = append(summary.Results, result)
 		summary.Total++
+		return summary
+	}
+
+	// Skip the whole venv + pip-wheel dance when the requirements file has
+	// no installable lines. Saves ~8s per run when pypi entries resolve to
+	// nothing (e.g. a git repo whose requirements.txt only references other
+	// git repos). PackagePypi will see zero wheels and skip cleanly.
+	hasReqs, err := hasInstallableRequirements(combinedReq)
+	if err != nil {
+		result.Err = fmt.Errorf("read combined-requirements.txt: %w", err)
+		summary.Failures++
+		summary.Results = append(summary.Results, result)
+		summary.Total++
+		return summary
+	}
+	if !hasReqs {
+		_, _ = fmt.Fprintf(out, "\n>>> [pypi] build — combined-requirements.txt has no installable packages, skipping\n")
 		return summary
 	}
 
@@ -285,10 +331,20 @@ func PackagePypi(cfg *Config, store *manifest.Store) *Summary {
 	wheelsDir := pypiWheelsDir(d)
 	whlFiles, _ := filepath.Glob(filepath.Join(wheelsDir, "*.whl"))
 	if len(whlFiles) == 0 {
-		result.Err = fmt.Errorf("no .whl files found in %s — run 'build pypi' first", wheelsDir)
-		summary.Failures++
-		summary.Results = append(summary.Results, result)
-		summary.Total++
+		// Two distinct states: build hasn't run at all vs. build ran but
+		// produced nothing. Only the former is an error — the latter happens
+		// when combined-requirements.txt resolves to zero installable packages
+		// (common with pypi entries auto-imported from a git repo that has no
+		// direct requirements of its own). Treat it as a skip so the caller
+		// doesn't abort the whole upload run.
+		if _, err := os.Stat(wheelsDir); os.IsNotExist(err) {
+			result.Err = fmt.Errorf("no wheels directory at %s — run 'build pypi' first", wheelsDir)
+			summary.Failures++
+			summary.Results = append(summary.Results, result)
+			summary.Total++
+			return summary
+		}
+		_, _ = fmt.Fprintf(out, "\n>>> [pypi] package — no wheels produced, skipping\n")
 		return summary
 	}
 

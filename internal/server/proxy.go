@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/policy"
 	"github.com/ravinald/bodega/internal/storage"
 )
 
@@ -33,9 +34,15 @@ type CacheConfig struct {
 // re-fetched. For mutable resources (list files, indexes), the object is
 // refreshed after the configured TTL based on S3 LastModified.
 //
+// regType is the manifest type (apt/git/pypi/npm/gomod/helm/binary) used for
+// upstream allow-list enforcement; pass "" to skip the policy check. policyCandidate
+// is the string checked against the allow-list for regType — callers pass the
+// upstream URL for URL-scoped types (apt/git/helm/binary) and the package name
+// or module path for name-scoped types (pypi/npm/gomod).
+//
 // If proxy/cache is disabled or upstreamURL is empty, falls back to direct
 // S3 proxy.
-func (s *Server) proxyOrCache(w http.ResponseWriter, r *http.Request, s3Key, upstreamURL string, immutable, forceProxy bool) {
+func (s *Server) proxyOrCache(w http.ResponseWriter, r *http.Request, s3Key, upstreamURL, regType, policyCandidate string, immutable, forceProxy bool) {
 	if !s.requireS3(w) {
 		return
 	}
@@ -70,6 +77,32 @@ func (s *Server) proxyOrCache(w http.ResponseWriter, r *http.Request, s3Key, ups
 		}
 		http.NotFound(w, r)
 		return
+	}
+
+	// Upstream allow-list enforcement. Runs before fetchUpstream so a blocked
+	// candidate never hits the network. A nil checker or empty regType means
+	// policy is disabled (opt-in feature).
+	if s.policy != nil && regType != "" && policyCandidate != "" {
+		if err := s.policy.Check(ctx, regType, policyCandidate); err != nil {
+			if policy.IsViolation(err) {
+				s.logger.Warn("upstream blocked by policy",
+					"type", regType, "candidate", policyCandidate, "url", upstreamURL)
+				if s.auditDB != nil {
+					_ = s.auditDB.Record(ctx, audit.Event{
+						EventType: audit.EventCache,
+						PkgType:   regType,
+						PkgName:   policyCandidate,
+						Status:    "policy_violation",
+						Details:   fmt.Sprintf("url=%s", upstreamURL),
+					})
+				}
+				http.Error(w, "upstream blocked by allow-list", http.StatusForbidden)
+				return
+			}
+			s.logger.Error("policy check failed", "error", err)
+			http.Error(w, "policy check failed", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	s.logger.Info("cache miss, fetching upstream", "key", s3Key, "upstream", upstreamURL)

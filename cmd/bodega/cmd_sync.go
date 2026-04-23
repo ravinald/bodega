@@ -135,6 +135,48 @@ use 'upload' instead.`,
 					}
 					fmt.Printf("    Uploaded %d file(s) to s3://%s/%s\n", n, cfg.Bucket, s3Prefix)
 					totalUploaded += n
+
+				case manifest.TypeGomod:
+					paths := builder.GomodArtifactPaths(bcfg, store, "")
+					if len(paths) == 0 {
+						fmt.Println("    No local gomod artifacts found — skipping")
+						continue
+					}
+					for _, ap := range paths {
+						fmt.Printf("    upload: s3://%s/%s\n", cfg.Bucket, ap.S3Key)
+						if err := objStore.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
+							return fmt.Errorf("sync gomod %s: %w", ap.Local, err)
+						}
+						totalUploaded++
+					}
+
+				case manifest.TypeHelm:
+					paths := builder.HelmArtifactPaths(bcfg, store, "")
+					if len(paths) == 0 {
+						fmt.Println("    No local helm artifacts found — skipping")
+						continue
+					}
+					for _, ap := range paths {
+						fmt.Printf("    upload: s3://%s/%s\n", cfg.Bucket, ap.S3Key)
+						if err := objStore.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
+							return fmt.Errorf("sync helm %s: %w", ap.Local, err)
+						}
+						totalUploaded++
+					}
+
+				case manifest.TypeNpm:
+					paths := builder.NpmArtifactPaths(bcfg, store, "")
+					if len(paths) == 0 {
+						fmt.Println("    No local npm artifacts found — skipping")
+						continue
+					}
+					for _, ap := range paths {
+						fmt.Printf("    upload: s3://%s/%s\n", cfg.Bucket, ap.S3Key)
+						if err := objStore.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
+							return fmt.Errorf("sync npm %s: %w", ap.Local, err)
+						}
+						totalUploaded++
+					}
 				}
 			}
 
