@@ -91,6 +91,22 @@ When a name is given after the type, only that entry is packaged.`,
 					allSummaries = append(allSummaries,
 						ensurePackagedPypi(bcfg, store),
 					)
+
+				case manifest.TypeGomod:
+					// gomod has no package stage: fetched artifacts are what ships.
+					allSummaries = append(allSummaries, &builder.Summary{})
+
+				case manifest.TypeHelm:
+					// Cascade: fetch any missing charts, then regenerate index.yaml.
+					allSummaries = append(allSummaries,
+						ensurePackagedHelm(bcfg, store, entryFilter),
+					)
+
+				case manifest.TypeNpm:
+					// Cascade: fetch any missing tarballs, then regenerate packuments.
+					allSummaries = append(allSummaries,
+						ensurePackagedNpm(bcfg, store, entryFilter),
+					)
 				}
 			}
 

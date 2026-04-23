@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -212,8 +213,114 @@ func ensurePackagedApt(bcfg *builder.Config, store *manifest.Store, entryFilter 
 	return builder.MergeSummaries(ss...)
 }
 
-// ensurePackagedPypi cascades fetch → build → package as needed.
+// ensureFetchedGomod fetches any gomod entries whose .info/.mod/.zip triplet
+// is absent. gomod has no build or package step — the raw proxy artifacts are
+// what clients consume.
+func ensureFetchedGomod(bcfg *builder.Config, store *manifest.Store, entryFilter string) *builder.Summary {
+	ctx := context.Background()
+	var ss []*builder.Summary
+	for _, safeName := range store.ListPackages(manifest.TypeGomod) {
+		pm, err := store.GetPackage(ctx, manifest.TypeGomod, safeName)
+		if err != nil || pm == nil {
+			continue
+		}
+		if entryFilter != "" && pm.Name != entryFilter {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			if ve.Frozen {
+				continue
+			}
+			if !builder.CheckGomodStage(bcfg, pm.Name, ve).Fetched {
+				ss = append(ss, builder.FetchGomod(bcfg, store, pm.Name))
+				break
+			}
+		}
+	}
+	return builder.MergeSummaries(ss...)
+}
+
+// ensurePackagedHelm cascades fetch → package (the Helm index.yaml). When no
+// helm entries are configured, skip the whole pipeline — PackageHelm writes an
+// empty index.yaml which the caller doesn't need.
+func ensurePackagedHelm(bcfg *builder.Config, store *manifest.Store, entryFilter string) *builder.Summary {
+	if len(store.ListPackages(manifest.TypeHelm)) == 0 {
+		fmt.Println("    No helm entries in manifest — skipping")
+		return &builder.Summary{}
+	}
+	ctx := context.Background()
+	var ss []*builder.Summary
+	// Fetch missing charts.
+	for _, safeName := range store.ListPackages(manifest.TypeHelm) {
+		pm, err := store.GetPackage(ctx, manifest.TypeHelm, safeName)
+		if err != nil || pm == nil {
+			continue
+		}
+		if entryFilter != "" && pm.Name != entryFilter {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			if ve.Frozen {
+				continue
+			}
+			if !builder.CheckHelmStage(bcfg, pm.Name, ve).Fetched {
+				ss = append(ss, builder.FetchHelm(bcfg, store, pm.Name))
+				break
+			}
+		}
+	}
+	fetchSummary := builder.MergeSummaries(ss...)
+	if fetchSummary.HasFailures() {
+		return fetchSummary
+	}
+	// Always (re)generate the index after fetches.
+	pkgSummary := builder.PackageHelm(bcfg, store)
+	return builder.MergeSummaries(fetchSummary, pkgSummary)
+}
+
+// ensurePackagedNpm cascades fetch → package (per-package packument.json).
+// Short-circuits when no npm entries are configured.
+func ensurePackagedNpm(bcfg *builder.Config, store *manifest.Store, entryFilter string) *builder.Summary {
+	if len(store.ListPackages(manifest.TypeNpm)) == 0 {
+		fmt.Println("    No npm entries in manifest — skipping")
+		return &builder.Summary{}
+	}
+	ctx := context.Background()
+	var ss []*builder.Summary
+	for _, safeName := range store.ListPackages(manifest.TypeNpm) {
+		pm, err := store.GetPackage(ctx, manifest.TypeNpm, safeName)
+		if err != nil || pm == nil {
+			continue
+		}
+		if entryFilter != "" && pm.Name != entryFilter {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			if ve.Frozen {
+				continue
+			}
+			if !builder.CheckNpmStage(bcfg, pm.Name, ve).Fetched {
+				ss = append(ss, builder.FetchNpm(bcfg, store, pm.Name))
+				break
+			}
+		}
+	}
+	fetchSummary := builder.MergeSummaries(ss...)
+	if fetchSummary.HasFailures() {
+		return fetchSummary
+	}
+	pkgSummary := builder.PackageNpm(bcfg, store)
+	return builder.MergeSummaries(fetchSummary, pkgSummary)
+}
+
+// ensurePackagedPypi cascades fetch → build → package as needed. When no pypi
+// entries are configured, the whole pipeline is a no-op — otherwise PackagePypi
+// would fail on "no .whl files" and abort the enclosing upload run.
 func ensurePackagedPypi(bcfg *builder.Config, store *manifest.Store) *builder.Summary {
+	if len(store.ListPackages(manifest.TypePypi)) == 0 {
+		fmt.Println("    No pypi entries in manifest — skipping")
+		return &builder.Summary{}
+	}
 	status := builder.CheckPypiStage(bcfg, store)
 	var ss []*builder.Summary
 	if !status.Fetched {

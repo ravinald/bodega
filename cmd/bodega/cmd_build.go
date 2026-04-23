@@ -128,6 +128,25 @@ When a name is given after the type, only that entry is built.`,
 					)
 					s := builder.BuildPypi(bcfg, store)
 					allSummaries = append(allSummaries, s)
+
+				case manifest.TypeGomod:
+					// gomod has no build step; fetch is the only action.
+					// FetchGomod skips already-fetched entries per-item.
+					allSummaries = append(allSummaries,
+						builder.FetchGomod(bcfg, store, entryFilter),
+					)
+
+				case manifest.TypeHelm:
+					// helm has no build step; FetchHelm skips already-fetched.
+					allSummaries = append(allSummaries,
+						builder.FetchHelm(bcfg, store, entryFilter),
+					)
+
+				case manifest.TypeNpm:
+					// npm has no build step; FetchNpm skips already-fetched.
+					allSummaries = append(allSummaries,
+						builder.FetchNpm(bcfg, store, entryFilter),
+					)
 				}
 			}
 
