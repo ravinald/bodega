@@ -65,5 +65,6 @@ Config files: `/etc/bodega/config.json` or `~/.config/bodega/config.json`.
 | `REPO_BUCKET` | S3 bucket name (when using S3 backend) |
 | `AWS_REGION` | AWS region (default: us-west-2) |
 | `BODEGA_LOG_LEVEL` | Logging verbosity 0-4 |
+| `BODEGA_CONFIG_FILE` | Load this config file instead of walking the default search path. Missing file → pure defaults. |
 
 The default storage backend is `local` (filesystem at `/var/lib/bodega`). Set `storage_backend` to `"s3"` in your config file for S3-backed storage.
