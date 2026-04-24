@@ -36,6 +36,9 @@ Frozen entries cannot be deleted; unfreeze them first with 'bodega freeze'.`,
 			if err != nil {
 				return err
 			}
+			if err := ensureMutable(cfg); err != nil {
+				return fmt.Errorf("cannot delete: %w", err)
+			}
 
 			store, err := loadStore(gf)
 			if err != nil {
@@ -91,6 +94,7 @@ Frozen entries cannot be deleted; unfreeze them first with 'bodega freeze'.`,
 					EventType: audit.EventDelete,
 					PkgType:   t,
 					PkgName:   name,
+					Actor:     audit.CurrentActor(),
 					Status:    "success",
 					Details:   audit.FormatDiff(beforeJSON, nil),
 				})

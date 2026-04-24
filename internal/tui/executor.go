@@ -370,6 +370,7 @@ func runDelete(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, s3c
 			EventType: audit.EventDelete,
 			PkgType:   entryType,
 			PkgName:   name,
+			Actor:     audit.CurrentActor(),
 			Status:    "success",
 			Details:   audit.FormatDiff(beforeJSON, nil),
 		})
@@ -434,6 +435,7 @@ func runFreeze(buf *bytes.Buffer, store *manifest.Store, entryType, name string,
 			EventType: audit.EventFreeze,
 			PkgType:   entryType,
 			PkgName:   name,
+			Actor:     audit.CurrentActor(),
 			Status:    "success",
 			Details:   audit.FormatDiff(beforeJSON, afterJSON),
 		})

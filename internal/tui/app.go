@@ -1236,6 +1236,7 @@ func (m *appModel) buildCreatePopup() popupModel {
 						EventType: audit.EventCreate,
 						PkgType:   entryType,
 						PkgName:   name,
+						Actor:     audit.CurrentActor(),
 						Status:    "success",
 						Details:   audit.FormatDiff(nil, afterJSON),
 					})
@@ -1804,6 +1805,7 @@ func toggleHidden(store *manifest.Store, entryType, name string, auditDB *audit.
 			EventType: audit.EventHide,
 			PkgType:   entryType,
 			PkgName:   name,
+			Actor:     audit.CurrentActor(),
 			Status:    "success",
 			Details:   audit.FormatDiff(beforeJSON, afterJSON),
 		})

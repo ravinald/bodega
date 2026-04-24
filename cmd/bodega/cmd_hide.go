@@ -30,6 +30,14 @@ Without VERSION, all versions of the package are toggled.`,
 				version = args[2]
 			}
 
+			cfg, err := loadConfig(gf)
+			if err != nil {
+				return fmt.Errorf("load config: %w", err)
+			}
+			if err := ensureMutable(cfg); err != nil {
+				return fmt.Errorf("cannot hide: %w", err)
+			}
+
 			store, err := loadStore(gf)
 			if err != nil {
 				return fmt.Errorf("load manifests: %w", err)
@@ -79,6 +87,7 @@ Without VERSION, all versions of the package are toggled.`,
 					EventType: audit.EventHide,
 					PkgType:   t,
 					PkgName:   name,
+					Actor:     audit.CurrentActor(),
 					Status:    "success",
 					Details:   audit.FormatDiff(beforeJSON, afterJSON),
 				})

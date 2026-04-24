@@ -41,6 +41,14 @@ Examples:
 				return fmt.Errorf("unknown type %q — must be one of: %s", t, strings.Join(manifest.AllTypes, ", "))
 			}
 
+			cfg, err := loadConfig(gf)
+			if err != nil {
+				return fmt.Errorf("load config: %w", err)
+			}
+			if err := ensureMutable(cfg); err != nil {
+				return fmt.Errorf("cannot create: %w", err)
+			}
+
 			store, err := loadStore(gf)
 			if err != nil {
 				return fmt.Errorf("load manifests: %w", err)
@@ -143,6 +151,7 @@ Examples:
 						EventType: audit.EventCreate,
 						PkgType:   t,
 						PkgName:   name,
+						Actor:     audit.CurrentActor(),
 						Status:    "success",
 						Details:   audit.FormatDiff(nil, afterJSON),
 					})
@@ -203,6 +212,7 @@ func confirmPolicyOverride(ctx context.Context, r *bufio.Reader, gf *globalFlags
 		PkgType:    t,
 		PkgName:    name,
 		PkgVersion: ve.Version,
+		Actor:      audit.CurrentActor(),
 		Status:     "policy_override",
 		Details:    fmt.Sprintf("candidate=%s", candidate),
 	})

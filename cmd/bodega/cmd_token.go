@@ -51,6 +51,14 @@ Examples:
 			label := args[0]
 			expiry, comment := parseExpiryAndComment(args[1:])
 
+			cfg, err := loadConfig(gf)
+			if err != nil {
+				return fmt.Errorf("load config: %w", err)
+			}
+			if err := ensureMutable(cfg); err != nil {
+				return fmt.Errorf("cannot create token: %w", err)
+			}
+
 			// Open audit DB.
 			adb := openAuditDB(gf)
 			if adb == nil {
@@ -102,6 +110,7 @@ Examples:
 				EventType: audit.EventCreate,
 				PkgType:   "token",
 				PkgName:   label,
+				Actor:     audit.CurrentActor(),
 				Status:    "success",
 				Details:   fmt.Sprintf("id=%s", id),
 			})
@@ -183,6 +192,14 @@ func newTokenRevokeCmd(gf *globalFlags) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			target := args[0]
 
+			cfg, err := loadConfig(gf)
+			if err != nil {
+				return fmt.Errorf("load config: %w", err)
+			}
+			if err := ensureMutable(cfg); err != nil {
+				return fmt.Errorf("cannot revoke token: %w", err)
+			}
+
 			adb := openAuditDB(gf)
 			if adb == nil {
 				return fmt.Errorf("could not open audit database")
@@ -207,6 +224,7 @@ func newTokenRevokeCmd(gf *globalFlags) *cobra.Command {
 				EventType: audit.EventDelete,
 				PkgType:   "token",
 				PkgName:   target,
+				Actor:     audit.CurrentActor(),
 				Status:    "success",
 			})
 
