@@ -77,3 +77,7 @@ Reload manifests without a restart via `sudo systemctl reload bodega` (fires SIG
 For interactive background runs without systemd, `nohup bodega serve > /tmp/bodega.log 2>&1 &` is fine. Bodega intentionally does not self-daemonize — modern process supervision (systemd, launchd, supervisord) wants the server in the foreground.
 
 The default storage backend is `local` (filesystem at `/var/lib/bodega`). Set `storage_backend` to `"s3"` in your config file for S3-backed storage.
+
+## Case studies
+
+- [The @bitwarden/cli supply-chain compromise](docs/case-study/bitwarden-supply-chain.md) — how to quarantine a compromised version, pin a known-good replacement, and relax back to normal tracking while keeping a tombstone. Three walkthroughs for the same incident ([CLI](docs/case-study/bitwarden-cli.md), [TUI](docs/case-study/bitwarden-tui.md), [API](docs/case-study/bitwarden-api.md)) so you can pick the surface that fits your moment.
