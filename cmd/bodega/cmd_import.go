@@ -37,6 +37,14 @@ Examples:
   bodega pkg import --merge updated.json    # add versions to existing package`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig(gf)
+			if err != nil {
+				return fmt.Errorf("load config: %w", err)
+			}
+			if err := ensureMutable(cfg); err != nil {
+				return fmt.Errorf("cannot import: %w", err)
+			}
+
 			store, err := loadStore(gf)
 			if err != nil {
 				return fmt.Errorf("load manifests: %w", err)
@@ -117,6 +125,7 @@ Examples:
 							EventType: audit.EventCreate,
 							PkgType:   pm.Type,
 							PkgName:   pm.Name,
+							Actor:     audit.CurrentActor(),
 							Status:    "success",
 							Details:   audit.FormatDiff(nil, afterJSON),
 						})
@@ -180,6 +189,7 @@ func enforceImportPolicy(ctx context.Context, checker *policy.Checker, adb *audi
 					PkgType:    pm.Type,
 					PkgName:    pm.Name,
 					PkgVersion: ve.Version,
+					Actor:      audit.CurrentActor(),
 					Status:     "policy_violation",
 					Details:    fmt.Sprintf("candidate=%s", candidate),
 				})

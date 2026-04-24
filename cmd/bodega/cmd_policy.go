@@ -120,6 +120,14 @@ Examples:
 				return fmt.Errorf("no rule kind registered for type %q", regType)
 			}
 
+			cfg, err := loadConfig(gf)
+			if err != nil {
+				return fmt.Errorf("load config: %w", err)
+			}
+			if err := ensureMutable(cfg); err != nil {
+				return fmt.Errorf("cannot add policy: %w", err)
+			}
+
 			adb := openAuditDB(gf)
 			if adb == nil {
 				return fmt.Errorf("could not open audit database")
@@ -149,6 +157,7 @@ Examples:
 				EventType: audit.EventCreate,
 				PkgType:   "policy",
 				PkgName:   regType + ":" + pattern,
+				Actor:     audit.CurrentActor(),
 				Status:    "success",
 				Details:   fmt.Sprintf("id=%s kind=%s", id, kind),
 			})
@@ -176,6 +185,14 @@ Examples:
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			target := args[0]
+
+			cfg, err := loadConfig(gf)
+			if err != nil {
+				return fmt.Errorf("load config: %w", err)
+			}
+			if err := ensureMutable(cfg); err != nil {
+				return fmt.Errorf("cannot remove policy: %w", err)
+			}
 
 			adb := openAuditDB(gf)
 			if adb == nil {
@@ -206,6 +223,7 @@ Examples:
 				EventType: audit.EventDelete,
 				PkgType:   "policy",
 				PkgName:   target,
+				Actor:     audit.CurrentActor(),
 				Status:    "success",
 			})
 			return nil

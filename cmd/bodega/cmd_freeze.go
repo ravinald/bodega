@@ -27,6 +27,14 @@ already-frozen entry unfreezes it.`,
 				return fmt.Errorf("unknown type %q", t)
 			}
 
+			cfg, err := loadConfig(gf)
+			if err != nil {
+				return fmt.Errorf("load config: %w", err)
+			}
+			if err := ensureMutable(cfg); err != nil {
+				return fmt.Errorf("cannot freeze: %w", err)
+			}
+
 			store, err := loadStore(gf)
 			if err != nil {
 				return fmt.Errorf("load manifests: %w", err)
@@ -66,6 +74,7 @@ already-frozen entry unfreezes it.`,
 					EventType: audit.EventFreeze,
 					PkgType:   t,
 					PkgName:   name,
+					Actor:     audit.CurrentActor(),
 					Status:    "success",
 					Details:   audit.FormatDiff(beforeJSON, afterJSON),
 				})
