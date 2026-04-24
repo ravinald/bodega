@@ -130,7 +130,7 @@ func TestFilterHiddenFromPackument(t *testing.T) {
 		},
 	}
 
-	out, err := filterHiddenFromPackument(raw, pm)
+	out, err := filterPackumentByManifest(raw, pm)
 	if err != nil {
 		t.Fatalf("filter: %v", err)
 	}
@@ -182,11 +182,121 @@ func TestFilterHiddenFromPackument_NoOp(t *testing.T) {
 	pm := &manifest.PackageManifest{
 		Versions: []manifest.VersionEntry{{Version: "4.17.21"}},
 	}
-	out, err := filterHiddenFromPackument(raw, pm)
+	out, err := filterPackumentByManifest(raw, pm)
 	if err != nil {
 		t.Fatalf("filter: %v", err)
 	}
 	if string(out) != string(raw) {
 		t.Errorf("expected passthrough; got rewritten bytes")
+	}
+}
+
+// TestHasVersionConstraint exercises the detection helper used to decide
+// whether the handler needs to run the packument through the filter.
+func TestHasVersionConstraint(t *testing.T) {
+	cases := []struct {
+		name string
+		pm   *manifest.PackageManifest
+		want bool
+	}{
+		{"no versions", &manifest.PackageManifest{}, false},
+		{"no constraint", &manifest.PackageManifest{Versions: []manifest.VersionEntry{{Version: "1.0.0"}}}, false},
+		{"any constraint is trivial",
+			&manifest.PackageManifest{Versions: []manifest.VersionEntry{{Version: "1.0.0", VersionConstraint: manifest.ConstraintAny}}},
+			false},
+		{"compatible is non-trivial",
+			&manifest.PackageManifest{Versions: []manifest.VersionEntry{{Version: "2026.4.1", VersionConstraint: manifest.ConstraintCompatible}}},
+			true},
+		{"exact is non-trivial",
+			&manifest.PackageManifest{Versions: []manifest.VersionEntry{{Version: "2026.4.1", VersionConstraint: manifest.ConstraintExact}}},
+			true},
+	}
+	for _, c := range cases {
+		if got := hasVersionConstraint(c.pm); got != c.want {
+			t.Errorf("%s: hasVersionConstraint = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestFilterPackumentByManifest_Constraint verifies the packument filter
+// drops upstream versions that would fail the version_constraint check.
+// This is the scenario from the Bitwarden supply-chain case study: pin to
+// 2026.4.1 with a compatible constraint, keep a hidden tombstone for
+// 2026.4.0, and expect everything below 2026.4.1 to disappear from the
+// packument a client sees.
+func TestFilterPackumentByManifest_Constraint(t *testing.T) {
+	raw := []byte(`{
+		"name": "@bitwarden/cli",
+		"dist-tags": {"latest": "2026.4.1", "legacy": "2026.3.0"},
+		"versions": {
+			"2026.3.0": {"name": "@bitwarden/cli", "version": "2026.3.0"},
+			"2026.4.0": {"name": "@bitwarden/cli", "version": "2026.4.0"},
+			"2026.4.1": {"name": "@bitwarden/cli", "version": "2026.4.1"},
+			"2026.5.0": {"name": "@bitwarden/cli", "version": "2026.5.0"}
+		},
+		"time": {
+			"created": "2026-04-02T00:00:00Z",
+			"2026.3.0": "2026-04-02T00:00:00Z",
+			"2026.4.0": "2026-04-22T21:22:59Z",
+			"2026.4.1": "2026-04-23T15:54:37Z",
+			"2026.5.0": "2026-05-03T00:00:00Z"
+		}
+	}`)
+
+	pm := &manifest.PackageManifest{
+		Name: "@bitwarden/cli",
+		Type: manifest.TypeNpm,
+		Versions: []manifest.VersionEntry{
+			{Version: "2026.4.1", VersionConstraint: manifest.ConstraintCompatible},
+			{Version: "2026.4.0", Hidden: true, Frozen: true},
+		},
+	}
+
+	out, err := filterPackumentByManifest(raw, pm)
+	if err != nil {
+		t.Fatalf("filter: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("unmarshal filtered: %v", err)
+	}
+
+	versions := doc["versions"].(map[string]any)
+	// Below constraint: stripped.
+	if _, has := versions["2026.3.0"]; has {
+		t.Error("2026.3.0 should be stripped (below 2026.4.1 constraint)")
+	}
+	// Hidden: stripped (tombstone; also below constraint, so doubly stripped).
+	if _, has := versions["2026.4.0"]; has {
+		t.Error("2026.4.0 should be stripped (hidden)")
+	}
+	// At or above constraint, not hidden: kept.
+	if _, has := versions["2026.4.1"]; !has {
+		t.Error("2026.4.1 should be kept (at constraint boundary)")
+	}
+	if _, has := versions["2026.5.0"]; !has {
+		t.Error("2026.5.0 should be kept (above constraint)")
+	}
+
+	tags := doc["dist-tags"].(map[string]any)
+	if _, has := tags["latest"]; !has {
+		t.Error("dist-tag latest → 2026.4.1 should survive")
+	}
+	if _, has := tags["legacy"]; has {
+		t.Error(`dist-tag "legacy" pointed at 2026.3.0 (out-of-constraint) and should be stripped`)
+	}
+
+	times := doc["time"].(map[string]any)
+	if _, has := times["created"]; !has {
+		t.Error(`"created" is metadata, not a version; it should survive`)
+	}
+	if _, has := times["2026.3.0"]; has {
+		t.Error("time entry for 2026.3.0 should be stripped")
+	}
+	if _, has := times["2026.4.0"]; has {
+		t.Error("time entry for hidden 2026.4.0 should be stripped")
+	}
+	if _, has := times["2026.4.1"]; !has {
+		t.Error("time entry for in-constraint 2026.4.1 should survive")
 	}
 }

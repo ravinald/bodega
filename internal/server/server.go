@@ -1234,9 +1234,23 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 			// Per-version hidden → 404 just this version's tarball. Other
 			// versions of the same package remain reachable. This is the
 			// quarantine path for a single compromised release.
-			if ver := npmVersionFromTarball(pkgName, tarball); ver != "" && isVersionHidden(pm, ver) {
+			reqVersion := npmVersionFromTarball(pkgName, tarball)
+			if reqVersion != "" && isVersionHidden(pm, reqVersion) {
 				http.NotFound(w, r)
 				return
+			}
+			// Version-constraint enforcement. Mirrors the gomod path at
+			// versionAllowed — the first VersionEntry's constraint governs
+			// the whole package. 403 (not 404) because the version exists
+			// upstream; we're declining to serve it by policy.
+			if reqVersion != "" {
+				vc, baseVer := packageVersionConstraint(pm)
+				if vc != "" && vc != manifest.ConstraintAny && baseVer != "" {
+					if !versionAllowed(baseVer, reqVersion, vc) {
+						http.Error(w, "version not allowed by constraint", http.StatusForbidden)
+						return
+					}
+				}
 			}
 		}
 
@@ -1263,11 +1277,11 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 
-	// Per-version hidden → rewrite the packument on the fly so clients never
-	// see the hidden version in `versions` or `dist-tags`. Filtered
-	// packuments are not cached to S3 — cache keyed by pkgName would collide
-	// with the unfiltered upstream copy.
-	if pm != nil && hasHiddenVersion(pm) {
+	// Per-version hidden OR a non-trivial version_constraint → rewrite the
+	// packument on the fly so clients never see a version we'd refuse to
+	// serve anyway. Filtered packuments are not cached to S3 — cache keyed
+	// by pkgName would collide with the unfiltered upstream copy.
+	if pm != nil && (hasHiddenVersion(pm) || hasVersionConstraint(pm)) {
 		s.serveFilteredPackument(w, r, pkgName, pm)
 		return
 	}
@@ -1351,6 +1365,15 @@ func hasHiddenVersion(pm *manifest.PackageManifest) bool {
 	return false
 }
 
+// hasVersionConstraint reports whether the package has a non-trivial
+// version_constraint on its first entry (the "package-level" constraint,
+// matching the gomod convention at packageVersionConstraint). A constraint
+// of "" or "any" is trivial and does not require filtering.
+func hasVersionConstraint(pm *manifest.PackageManifest) bool {
+	vc, baseVer := packageVersionConstraint(pm)
+	return vc != "" && vc != manifest.ConstraintAny && baseVer != ""
+}
+
 // serveFilteredPackument fetches the upstream packument and strips every
 // hidden version from `versions`, `time`, and `dist-tags` before writing it
 // to w. Filtered bodies are not written back to the S3 cache — doing so
@@ -1364,7 +1387,7 @@ func (s *Server) serveFilteredPackument(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	filtered, err := filterHiddenFromPackument(data, pm)
+	filtered, err := filterPackumentByManifest(data, pm)
 	if err != nil {
 		s.logger.Error("packument filter failed", "pkg", pkgName, "error", err)
 		http.Error(w, "packument filter failed", http.StatusInternalServerError)
@@ -1380,19 +1403,25 @@ func (s *Server) serveFilteredPackument(w http.ResponseWriter, r *http.Request, 
 	_, _ = w.Write(filtered)
 }
 
-// filterHiddenFromPackument removes hidden versions from a raw npm packument
-// JSON body. Any `dist-tags` entry pointing at a hidden version is dropped,
-// including `latest` — callers that relied on `latest` will start seeing the
-// next-highest visible version, which is the correct behavior for a
-// quarantined release.
-func filterHiddenFromPackument(body []byte, pm *manifest.PackageManifest) ([]byte, error) {
+// filterPackumentByManifest trims a raw npm packument JSON body to match the
+// local PackageManifest policy: Hidden versions are removed outright, and
+// any version that violates the package-level version_constraint is dropped
+// too. Any `dist-tags` entry (including `latest`) that points at a removed
+// version is also stripped — callers that relied on `latest` will start
+// seeing the next-highest visible version, which is the correct behavior
+// for a quarantined or out-of-constraint release.
+func filterPackumentByManifest(body []byte, pm *manifest.PackageManifest) ([]byte, error) {
 	hidden := make(map[string]bool)
 	for _, ve := range pm.Versions {
 		if ve.Hidden && ve.Version != "" {
 			hidden[ve.Version] = true
 		}
 	}
-	if len(hidden) == 0 {
+
+	vc, baseVer := packageVersionConstraint(pm)
+	hasConstraint := vc != "" && vc != manifest.ConstraintAny && baseVer != ""
+
+	if len(hidden) == 0 && !hasConstraint {
 		return body, nil
 	}
 
@@ -1401,19 +1430,43 @@ func filterHiddenFromPackument(body []byte, pm *manifest.PackageManifest) ([]byt
 		return nil, err
 	}
 
+	// rejected reports whether a specific upstream version should be stripped
+	// from the packument: hidden beats constraint (both paths return true),
+	// but the two rules are otherwise independent.
+	rejected := func(v string) bool {
+		if hidden[v] {
+			return true
+		}
+		if hasConstraint && !versionAllowed(baseVer, v, vc) {
+			return true
+		}
+		return false
+	}
+
 	if versions, ok := doc["versions"].(map[string]any); ok {
-		for v := range hidden {
-			delete(versions, v)
+		for v := range versions {
+			if rejected(v) {
+				delete(versions, v)
+			}
 		}
 	}
 	if times, ok := doc["time"].(map[string]any); ok {
-		for v := range hidden {
-			delete(times, v)
+		for v := range times {
+			if v == "created" || v == "modified" {
+				continue
+			}
+			if rejected(v) {
+				delete(times, v)
+			}
 		}
 	}
 	if tags, ok := doc["dist-tags"].(map[string]any); ok {
 		for tag, v := range tags {
-			if s, ok := v.(string); ok && hidden[s] {
+			s, ok := v.(string)
+			if !ok {
+				continue
+			}
+			if rejected(s) {
 				delete(tags, tag)
 			}
 		}
