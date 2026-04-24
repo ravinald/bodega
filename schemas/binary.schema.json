@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ravinald/bodega/schemas/binary.schema.json",
+  "title": "Binary Download Manifest",
+  "description": "Defines files to download directly from URLs and upload to S3.",
+  "type": "object",
+  "required": ["config_version", "entries"],
+  "properties": {
+    "config_version": {
+      "type": "integer",
+      "description": "Schema version. Current: 1.",
+      "const": 1
+    },
+    "entries": {
+      "type": "array",
+      "description": "List of binary artifacts to manage.",
+      "items": {
+        "type": "object",
+        "required": ["name", "url"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Logical artifact name."
+          },
+          "version": {
+            "type": "string",
+            "description": "Artifact version. Used in S3 paths to allow multiple versions."
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Download URL."
+          },
+          "sha256": {
+            "type": ["string", "null"],
+            "description": "Expected SHA-256 hex digest. Null skips verification."
+          },
+          "filename": {
+            "type": "string",
+            "description": "Override the filename in S3. Defaults to the basename of the URL."
+          },
+          "frozen": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, the entry cannot be built, edited, or deleted."
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

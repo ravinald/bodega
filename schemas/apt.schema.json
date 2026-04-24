@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ravinald/bodega/schemas/apt.schema.json",
+  "title": "APT Package Manifest",
+  "description": "Defines Debian packages to build from source or download from system repositories.",
+  "type": "object",
+  "required": ["config_version", "entries"],
+  "properties": {
+    "config_version": {
+      "type": "integer",
+      "description": "Schema version. Current: 1.",
+      "const": 1
+    },
+    "entries": {
+      "type": "array",
+      "description": "List of APT packages to manage.",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Logical package name used in logs and the TUI."
+          },
+          "version": {
+            "type": "string",
+            "description": "Package version. Used in build paths and S3 keys to allow multiple versions."
+          },
+          "source_name": {
+            "type": "string",
+            "description": "Upstream package or directory name. Defaults to name when absent."
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Git URL to clone for a source build. When omitted, the package is fetched via apt-get download."
+          },
+          "build_cmd": {
+            "type": "string",
+            "description": "Shell command to run from the package root (cloned source directory). The working directory is the repo root, so 'build-deb.sh' is sufficient — no './' prefix needed."
+          },
+          "deb_glob": {
+            "type": "string",
+            "description": "Glob pattern (relative to source dir) to locate the built .deb file."
+          },
+          "frozen": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, the entry cannot be built, edited, or deleted."
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ravinald/bodega/schemas/pypi.schema.json",
+  "title": "PyPI Wheel Manifest",
+  "description": "Defines Python packages to build as wheels. Combines base requirements from git repos with explicit extra packages.",
+  "type": "object",
+  "required": ["config_version"],
+  "properties": {
+    "config_version": {
+      "type": "integer",
+      "description": "Schema version. Current: 1.",
+      "const": 1
+    },
+    "version": {
+      "type": "string",
+      "description": "Label for this wheel set (e.g., the primary application version). Used in S3 paths."
+    },
+    "base_requirements": {
+      "type": "object",
+      "description": "Map of git repo name to ref. The repo's requirements.txt at that ref is included in the wheel build.",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "packages": {
+      "type": "array",
+      "description": "Python packages to build as wheels.",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Package specifier as accepted by pip (e.g., 'boto3', 'social-auth-core[openidconnect]')."
+          },
+          "required_by": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "What this package is for (e.g., ['netbox']). Empty means general-purpose."
+          },
+          "frozen": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, this package cannot be edited or deleted."
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "frozen": {
+      "type": "boolean",
+      "default": false,
+      "description": "When true, the entire manifest cannot be edited."
+    }
+  },
+  "additionalProperties": false
+}

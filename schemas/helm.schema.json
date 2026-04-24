@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ravinald/bodega/schemas/helm.schema.json",
+  "title": "Helm Chart Manifest",
+  "description": "Defines Helm charts to mirror from upstream chart repositories.",
+  "type": "object",
+  "required": ["config_version", "entries"],
+  "properties": {
+    "config_version": {
+      "type": "integer",
+      "description": "Schema version. Current: 1.",
+      "const": 1
+    },
+    "entries": {
+      "type": "array",
+      "description": "List of Helm charts to manage.",
+      "items": {
+        "type": "object",
+        "required": ["name", "version", "url"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Chart name (e.g. ingress-nginx)."
+          },
+          "version": {
+            "type": "string",
+            "description": "Chart version."
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Chart repository URL or direct .tgz download URL."
+          },
+          "app_version": {
+            "type": "string",
+            "description": "Application version the chart deploys."
+          },
+          "frozen": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, the entry cannot be built, edited, or deleted."
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

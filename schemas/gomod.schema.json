@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ravinald/bodega/schemas/gomod.schema.json",
+  "title": "Go Module Manifest",
+  "description": "Defines Go modules to mirror or proxy via GOPROXY protocol.",
+  "type": "object",
+  "required": ["config_version", "entries"],
+  "properties": {
+    "config_version": {
+      "type": "integer",
+      "description": "Schema version. Current: 1.",
+      "const": 1
+    },
+    "entries": {
+      "type": "array",
+      "description": "List of Go modules to manage.",
+      "items": {
+        "type": "object",
+        "required": ["name", "version"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Go module path (e.g. github.com/aws/aws-sdk-go-v2)."
+          },
+          "version": {
+            "type": "string",
+            "description": "Module version (e.g. v1.30.0)."
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Upstream GOPROXY URL. Defaults to proxy.golang.org when omitted."
+          },
+          "frozen": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, the entry cannot be built, edited, or deleted."
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}
