@@ -458,16 +458,21 @@ function render() {
         const pkgKey = type + '/' + name;
         const pkgExpanded = expandedPkgs.has(pkgKey);
         const pkgHeader = document.createElement('div');
-        pkgHeader.className = 'group-header';
+        pkgHeader.className = 'group-header' + (selectedKey === pkgKey ? ' selected' : '');
         pkgHeader.style.paddingLeft = '24px';
         pkgHeader.innerHTML =
           '<span class="arrow">' + (pkgExpanded ? '\u25BC' : '\u25B6') + '</span>' +
           '<span>' + escapeHtml(name) + '</span>' +
           '<span class="count">(' + versions.length + ')</span>';
         pkgHeader.onclick = () => {
+          // Toggle expansion and show the full PackageManifest in the
+          // detail pane — complements the per-version view from clicking
+          // a version row. Same shape as `bodega pkg export <type> <name>`.
           if (expandedPkgs.has(pkgKey)) expandedPkgs.delete(pkgKey);
           else expandedPkgs.add(pkgKey);
+          selectedKey = pkgKey;
           render();
+          showDetail(type, { name: name, type: type });
         };
         group.appendChild(pkgHeader);
         if (pkgExpanded) {
@@ -580,8 +585,17 @@ function showDetail(type, entry) {
 
   d.innerHTML = html;
 
-  // Fetch full PackageManifest for JSON display (matches TUI).
-  fetch('/api/v1/packages/' + type + '/' + encodeURIComponent(entry.name))
+  // Fetch the PackageManifest for JSON display. When a specific version is
+  // selected, fetch the version-scoped endpoint — the response is still a
+  // valid PackageManifest (config_version, name, type, description, plus a
+  // single-entry versions array), so it's copy-paste ready for re-import.
+  // Package-header selection (no version) keeps the full-manifest fetch.
+  var url = '/api/v1/packages/' + type + '/' + encodeURIComponent(entry.name);
+  var scopedVer = entryVersion(type, entry);
+  if (scopedVer && scopedVer !== '*') {
+    url += '/' + encodeURIComponent(scopedVer);
+  }
+  fetch(url)
     .then(function(r) { return r.ok ? r.json() : entry; })
     .catch(function() { return entry; })
     .then(function(manifest) {

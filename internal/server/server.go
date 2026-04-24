@@ -307,6 +307,7 @@ func (s *Server) registerRoutes() {
 	m.HandleFunc("GET /api/v1/packages", s.handleAPIPackages)
 	m.HandleFunc("GET /api/v1/packages/{type}", s.handleAPIPackagesByType)
 	m.HandleFunc("GET /api/v1/packages/{type}/{name}", s.handleAPIPackage)
+	m.HandleFunc("GET /api/v1/packages/{type}/{name}/{version}", s.handleAPIPackageVersion)
 	m.HandleFunc("GET /api/v1/status", s.handleAPIStatus)
 	m.HandleFunc("GET /api/v1/config", s.handleAPIConfig)
 	m.HandleFunc("GET /api/v1/metrics", s.handleAPIMetrics)
@@ -939,6 +940,45 @@ func (s *Server) handleAPIPackage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, pm)
+	default:
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"error": fmt.Sprintf("unknown type %q", t),
+		})
+	}
+}
+
+// handleAPIPackageVersion returns a PackageManifest scoped to a single
+// version — all top-level fields intact, Versions containing only the
+// matching entry. The payload remains a valid PackageManifest so clients
+// can round-trip it through `pkg import` or the editor. 404s when the
+// package or the version is not found.
+func (s *Server) handleAPIPackageVersion(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	t := r.PathValue("type")
+	name := r.PathValue("name")
+	version := r.PathValue("version")
+
+	switch t {
+	case manifest.TypeApt, manifest.TypeGit, manifest.TypePypi, manifest.TypeBinary,
+		manifest.TypeGomod, manifest.TypeHelm, manifest.TypeNpm:
+		pm, err := s.store.GetPackage(ctx, t, name)
+		if err != nil {
+			s.logger.Error("get package failed", "type", t, "name", name, "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+			return
+		}
+		if pm == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "package not found"})
+			return
+		}
+		scoped := pm.ScopeToVersion(version)
+		if scoped == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{
+				"error": fmt.Sprintf("version %q not found in %s/%s", version, t, name),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, scoped)
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{
 			"error": fmt.Sprintf("unknown type %q", t),

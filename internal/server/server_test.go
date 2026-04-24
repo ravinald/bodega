@@ -565,6 +565,57 @@ func TestAPIPackageSingle(t *testing.T) {
 	}
 }
 
+// TestAPIPackageVersion exercises the new scoped endpoint. The scoped
+// response must be a valid PackageManifest (top-level fields intact, single
+// matching version).
+func TestAPIPackageVersion(t *testing.T) {
+	ts, _ := newTestServer(t)
+	tests := []struct {
+		name     string
+		path     string
+		wantCode int
+		wantVer  string
+	}{
+		{"known version by Version field", "/api/v1/packages/apt/amazon-efs-utils/2.4.2", http.StatusOK, "2.4.2"},
+		{"known version by Ref field", "/api/v1/packages/git/netbox/v4.5.5", http.StatusOK, ""},
+		{"unknown version on real package", "/api/v1/packages/apt/amazon-efs-utils/99.99", http.StatusNotFound, ""},
+		{"unknown package", "/api/v1/packages/apt/does-not-exist/1.0.0", http.StatusNotFound, ""},
+		{"unknown type", "/api/v1/packages/bogus/foo/1.0.0", http.StatusNotFound, ""},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := http.Get(ts.URL + tc.path)
+			if err != nil {
+				t.Fatalf("request failed: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.wantCode {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tc.wantCode)
+			}
+			if tc.wantCode != http.StatusOK {
+				return
+			}
+			var pm manifest.PackageManifest
+			if err := json.NewDecoder(resp.Body).Decode(&pm); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if pm.Name == "" {
+				t.Error("scoped response missing top-level name")
+			}
+			if pm.Type == "" {
+				t.Error("scoped response missing top-level type")
+			}
+			if len(pm.Versions) != 1 {
+				t.Fatalf("scoped response has %d versions, want 1", len(pm.Versions))
+			}
+			if tc.wantVer != "" && pm.Versions[0].Version != tc.wantVer {
+				t.Errorf("version = %q, want %q", pm.Versions[0].Version, tc.wantVer)
+			}
+		})
+	}
+}
+
 func TestAPIStatus(t *testing.T) {
 	ts, _ := newTestServer(t)
 	resp, err := http.Get(ts.URL + "/api/v1/status")

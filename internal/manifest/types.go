@@ -181,6 +181,28 @@ type VersionEntry struct {
 	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
+// ScopeToVersion returns a new PackageManifest that contains only the version
+// whose Version or Ref matches v. Top-level fields (ConfigVersion, Name,
+// Type, Description, DepPolicy) are preserved so the result is itself a
+// valid PackageManifest — safe to write as JSON, re-import, export, or hand
+// to any API that expects the full shape.
+//
+// Returns nil when no version matches. An empty v never matches; callers
+// that want the full manifest should hold onto the original pointer.
+func (pm *PackageManifest) ScopeToVersion(v string) *PackageManifest {
+	if pm == nil || v == "" {
+		return nil
+	}
+	for _, ve := range pm.Versions {
+		if ve.Version == v || ve.Ref == v {
+			scoped := *pm
+			scoped.Versions = []VersionEntry{ve}
+			return &scoped
+		}
+	}
+	return nil
+}
+
 // VersionedName returns "name@version" using whichever of Version or Ref is set,
 // or just "name" when neither is set.
 func (ve VersionEntry) VersionedName(name string) string {
