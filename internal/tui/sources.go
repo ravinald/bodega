@@ -19,6 +19,12 @@ type TreeNode struct {
 	EntryType string
 	// Name is the entry name; empty for type-group nodes.
 	Name string
+	// Version identifies a specific VersionEntry on leaf (per-version) nodes.
+	// Matches either VersionEntry.Version or VersionEntry.Ref — whichever
+	// the manifest uses to key that version. Empty on package headers and
+	// type-group nodes. Consumed by the edit flow to scope JSON via
+	// manifest.PackageManifest.ScopeToVersion.
+	Version string
 	// IsGroup is true for type-level headers.
 	IsGroup bool
 	// Expanded controls whether child nodes are shown (group nodes only).
@@ -77,10 +83,12 @@ func BuildTree(store *manifest.Store, statuses []s3.EntryStatus) []TreeNode {
 	// Helper: group entries by name, producing intermediate package nodes
 	// when there are multiple versions, or a direct entry when there's only one.
 	type entryInfo struct {
-		label     string // version label (ref, version, or full name)
+		label     string // display-only version label (ref, version, name@*); may include suffix/decoration
+		version   string // raw version identifier — VersionEntry.Version, or Ref when Version is empty; keyed by ScopeToVersion
 		name      string // entry name for lookups
 		versioned string // VersionedName for s3map
 		platform  string // "linux/amd64", "any", or ""
+		hidden    bool
 		frozen    bool
 	}
 
@@ -114,6 +122,7 @@ func BuildTree(store *manifest.Store, statuses []s3.EntryStatus) []TreeNode {
 			pkgNode := TreeNode{
 				Label:     name,
 				EntryType: typeName,
+				Name:      name,
 				IsGroup:   true,
 				Expanded:  false,
 			}
@@ -122,7 +131,9 @@ func BuildTree(store *manifest.Store, statuses []s3.EntryStatus) []TreeNode {
 					Label:     v.label + platformSuffix(v.platform),
 					EntryType: typeName,
 					Name:      v.name,
+					Version:   v.version,
 					InS3:      s3map[typeName+"/"+v.versioned],
+					Hidden:    v.hidden,
 					Frozen:    v.frozen,
 				})
 			}
@@ -151,13 +162,20 @@ func BuildTree(store *manifest.Store, statuses []s3.EntryStatus) []TreeNode {
 				if label == "*" {
 					label = pm.Name + "@*"
 				}
-				allFrozen := ve.Frozen
+				// Raw version key that ScopeToVersion expects: prefer
+				// Version, fall back to Ref (git-style entries).
+				rawVersion := ve.Version
+				if rawVersion == "" {
+					rawVersion = ve.Ref
+				}
 				entries = append(entries, entryInfo{
 					label:     label,
+					version:   rawVersion,
 					name:      pm.Name,
 					versioned: ve.VersionedName(pm.Name),
 					platform:  ve.Platform,
-					frozen:    allFrozen,
+					hidden:    ve.Hidden,
+					frozen:    ve.Frozen,
 				})
 			}
 		}
@@ -190,8 +208,17 @@ func BuildTree(store *manifest.Store, statuses []s3.EntryStatus) []TreeNode {
 			if ver == "" {
 				ver = pm.Name
 			}
+			rawVersion := ve.Version
+			if rawVersion == "" {
+				rawVersion = ve.Ref
+			}
 			pypiEntries = append(pypiEntries, entryInfo{
-				label: ver, name: pm.Name, versioned: pm.Name, frozen: ve.Frozen,
+				label:     ver,
+				version:   rawVersion,
+				name:      pm.Name,
+				versioned: pm.Name,
+				hidden:    ve.Hidden,
+				frozen:    ve.Frozen,
 			})
 		}
 	}
@@ -209,6 +236,7 @@ func BuildTree(store *manifest.Store, statuses []s3.EntryStatus) []TreeNode {
 		pkgNode := TreeNode{
 			Label:     baseName,
 			EntryType: manifest.TypePypi,
+			Name:      baseName,
 			IsGroup:   true,
 			Expanded:  false,
 		}
@@ -217,7 +245,9 @@ func BuildTree(store *manifest.Store, statuses []s3.EntryStatus) []TreeNode {
 				Label:     v.label,
 				EntryType: manifest.TypePypi,
 				Name:      v.name,
+				Version:   v.version,
 				InS3:      s3map[manifest.TypePypi+"/wheels"],
+				Hidden:    v.hidden,
 				Frozen:    v.frozen,
 			})
 		}

@@ -25,6 +25,7 @@ import (
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 	bos3 "github.com/ravinald/bodega/internal/s3"
 	"github.com/ravinald/bodega/internal/server"
 )
@@ -387,6 +388,27 @@ func (m appModel) handlePopupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case popupJSONEdit:
+		// The raw-JSON edit popup is the textarea overlay for its entire
+		// lifecycle — always route keys to the JSON overlay handler. On
+		// Ctrl+S, applyFn invokes onEditSave; a non-nil error keeps the
+		// popup open with the error message shown at the bottom.
+		applyFn := func(buf string) string {
+			if m.popup.onEditSave == nil {
+				return "no save handler configured"
+			}
+			if err := m.popup.onEditSave([]byte(buf)); err != nil {
+				return err.Error()
+			}
+			return ""
+		}
+		dismissed, cmd := m.popup.HandleJSONOverlayKey(msg, applyFn)
+		if dismissed {
+			m.sources.Refresh(m.store, m.statuses)
+			m.syncDetails()
+		}
+		return m, cmd
+
 	case popupTokenManager:
 		dismissed := m.popup.HandleTokenManagerKey(key)
 		if dismissed {
@@ -697,79 +719,19 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.popup = m.buildCreatePopup()
 
 	case "E":
-		if node == nil || node.IsGroup {
+		// E opens the raw-JSON editor. A version row edits a single scoped
+		// VersionEntry; a package header edits the full PackageManifest. A
+		// type-group header (no Name) has nothing concrete to edit and is
+		// silently ignored.
+		if node == nil || node.Name == "" {
 			return m, nil
 		}
-		m.popup = popupModel{
-			kind:       popupForm,
-			formTitle:  "Edit: " + node.EntryType + "/" + node.Name,
-			formFields: buildEditFields(m.store, node),
-			onFormSave: func(fields []formField) {
-				ctx := context.Background()
-				pm, err := m.store.GetPackage(ctx, node.EntryType, node.Name)
-				if err != nil || pm == nil || len(pm.Versions) == 0 {
-					m.log.appendLog(errorStyle.Render("Edit failed: could not load package"))
-					return
-				}
-
-				// Capture before state for audit diff.
-				beforeJSON, _ := json.MarshalIndent(pm, "", "  ")
-
-				ve := &pm.Versions[0]
-
-				// Update fields common to all types.
-				if v := fieldValueFromSlice(fields, "Version"); v != "" {
-					ve.Version = v
-				}
-				if u := fieldValueFromSlice(fields, "Source URL"); u != "" {
-					ve.URL = u
-				} else if !fieldDisabled(fields, "Source URL") {
-					ve.URL = ""
-				}
-
-				// Type-specific updates.
-				switch node.EntryType {
-				case manifest.TypeApt:
-					ve.SourceName = fieldValueFromSlice(fields, "Package Name")
-					ve.BuildCmd = fieldValueFromSlice(fields, "Build Cmd")
-					ve.DebGlob = fieldValueFromSlice(fields, "Deb Glob")
-					depPolicy := strings.ToLower(fieldValueFromSlice(fields, "Include Deps"))
-					if depPolicy == "none" {
-						depPolicy = ""
-					}
-					pm.DepPolicy = depPolicy
-				case manifest.TypeGit:
-					ve.Ref = fieldValueFromSlice(fields, "Ref")
-				case manifest.TypeBinary:
-					ve.Filename = fieldValueFromSlice(fields, "Filename")
-				}
-
-				if err := m.store.SavePackage(ctx, pm); err != nil {
-					m.log.appendLog(errorStyle.Render("Edit failed: " + err.Error()))
-					return
-				}
-				if err := m.store.SaveIndex(ctx); err != nil {
-					m.log.appendLog(errorStyle.Render("Save index failed: " + err.Error()))
-					return
-				}
-				m.log.appendLog(successStyle.Render(
-					fmt.Sprintf("Updated %s/%s", node.EntryType, node.Name),
-				))
-
-				// Record audit event with diff.
-				if m.auditDB != nil {
-					afterJSON, _ := json.MarshalIndent(pm, "", "  ")
-					_ = m.auditDB.Record(ctx, audit.Event{
-						EventType: audit.EventEdit,
-						PkgType:   node.EntryType,
-						PkgName:   node.Name,
-						Actor:     audit.CurrentActor(),
-						Status:    "success",
-						Details:   audit.FormatDiff(beforeJSON, afterJSON),
-					})
-				}
-			},
+		p, err := m.openEditPopup(node)
+		if err != nil {
+			m.log.appendLog(errorStyle.Render("Edit failed: " + err.Error()))
+			return m, nil
 		}
+		m.popup = p
 
 	case "H":
 		entries := m.sources.MarkedEntries()
@@ -980,88 +942,161 @@ func fieldValue(fields []formField, key string) string {
 	return ""
 }
 
-// buildEditFields constructs a pre-populated form field slice from a tree node.
-func buildEditFields(store *manifest.Store, node *TreeNode) []formField {
+// openEditPopup constructs the raw-JSON edit popup for a tree node. When the
+// node carries a Version (a leaf version row), the buffer shown to the user
+// is a PackageManifest scoped to that single VersionEntry via
+// manifest.PackageManifest.ScopeToVersion — same shape the API returns at
+// /api/v1/packages/{type}/{name}/{version} and the CLI emits from
+// `bodega pkg export <type> <name> <version>`. When the node is a package
+// header (IsGroup=true, Name set, Version=""), the buffer is the full
+// PackageManifest. Either blob round-trips cleanly through `pkg import` or
+// the same popup on save.
+//
+// onEditSave runs the same validate + enforce-policy + SavePackage +
+// audit pipeline as `bodega pkg edit`, so the three edit surfaces (CLI,
+// web API, TUI) produce identical side effects from an identical payload.
+func (m *appModel) openEditPopup(node *TreeNode) (popupModel, error) {
 	ctx := context.Background()
-	pm, err := store.GetPackage(ctx, node.EntryType, node.Name)
-	if err != nil || pm == nil || len(pm.Versions) == 0 {
-		return []formField{{Label: "Name", Value: node.Name}}
+	pm, err := m.store.GetPackage(ctx, node.EntryType, node.Name)
+	if err != nil {
+		return popupModel{}, fmt.Errorf("load %s/%s: %w", node.EntryType, node.Name, err)
 	}
-	ve := pm.Versions[0]
-	switch node.EntryType {
-	case manifest.TypeApt:
-		// Determine mode from existing data.
-		aptMode := "Package Name"
-		buildFrom := "Git repo"
-		if ve.URL != "" && ve.BuildCmd != "" {
-			aptMode = "Source Build"
-			buildFrom = "Git repo"
-		} else if ve.URL != "" {
-			aptMode = "Direct URL"
-		} else if ve.BuildCmd != "" {
-			aptMode = "Source Build"
-			buildFrom = "apt-get source"
-		}
-
-		isPkgName := aptMode == "Package Name"
-		isDirectURL := aptMode == "Direct URL"
-		isSourceBuild := aptMode == "Source Build"
-		isBuildFromGit := isSourceBuild && buildFrom == "Git repo"
-		isBuildFromAptSrc := isSourceBuild && buildFrom == "apt-get source"
-
-		depPolicy := "None"
-		if pm.DepPolicy == "direct" {
-			depPolicy = "Direct"
-		} else if pm.DepPolicy == "transitive" {
-			depPolicy = "Transitive"
-		}
-
-		return []formField{
-			{Label: "Apt Mode", Value: aptMode, Select: true,
-				Options: []string{"Package Name", "Direct URL", "Source Build"}},
-			{Label: "Build From", Value: buildFrom, Select: true,
-				Options:  []string{"Git repo", "apt-get source"},
-				Disabled: !isSourceBuild},
-			{Label: "Name", Value: pm.Name},
-			{Label: "Package Name", Value: ve.SourceName,
-				Disabled: isDirectURL || isBuildFromGit},
-			{Label: "Version", Value: ve.Version},
-			{Label: "Source URL", Value: ve.URL,
-				Disabled: isPkgName || isBuildFromAptSrc},
-			{Label: "Build Cmd", Value: ve.BuildCmd,
-				Disabled: !isBuildFromGit},
-			{Label: "Deb Glob", Value: ve.DebGlob,
-				Disabled: !isSourceBuild},
-			{Label: "Include Deps", Value: depPolicy, Select: true,
-				Disabled: !isPkgName,
-				Options:  []string{"None", "Direct", "Transitive"}},
-			{Label: "Skip validation", Checkbox: true, Value: "no"},
-		}
-	case manifest.TypeGit:
-		return []formField{
-			{Label: "Name", Value: pm.Name},
-			{Label: "Ref", Value: ve.Ref},
-			{Label: "Source URL", Value: ve.URL},
-			{Label: "Validate source", Checkbox: true, Value: "yes"},
-		}
-	case manifest.TypeBinary:
-		fields := []formField{
-			{Label: "Name", Value: pm.Name},
-			{Label: "Version", Value: ve.Version},
-			{Label: "Source URL", Value: ve.URL},
-		}
-		if ve.Filename != "" {
-			fields = append(fields, formField{Label: "Filename", Value: ve.Filename})
-		}
-		fields = append(fields, formField{Label: "Validate source", Checkbox: true, Value: "yes"})
-		return fields
-	case manifest.TypePypi:
-		return []formField{
-			{Label: "Name", Value: pm.Name},
-			{Label: "Validate source", Checkbox: true, Value: "yes"},
-		}
+	if pm == nil {
+		return popupModel{}, fmt.Errorf("%s/%s not found", node.EntryType, node.Name)
 	}
-	return []formField{{Label: "Name", Value: node.Name}}
+
+	// Target: full manifest for package header, single version for leaf.
+	var target any
+	editVersion := ""
+	if node.Version != "" {
+		scoped := pm.ScopeToVersion(node.Version)
+		if scoped == nil {
+			return popupModel{}, fmt.Errorf("version %q not found in %s/%s", node.Version, node.EntryType, node.Name)
+		}
+		target = scoped
+		editVersion = node.Version
+	} else {
+		target = pm
+	}
+	payload, err := json.MarshalIndent(target, "", "  ")
+	if err != nil {
+		return popupModel{}, fmt.Errorf("marshal edit target: %w", err)
+	}
+
+	title := "Edit: " + node.EntryType + "/" + node.Name
+	if editVersion != "" {
+		title += "@" + editVersion
+	}
+
+	p := popupModel{
+		kind:        popupJSONEdit,
+		editType:    node.EntryType,
+		editName:    node.Name,
+		editVersion: editVersion,
+	}
+	p.OpenJSONOverlay(m.width, m.height, string(payload), title)
+	p.onEditSave = m.makeEditSave(node.EntryType, node.Name, editVersion)
+	return p, nil
+}
+
+// makeEditSave returns the closure that parses the edited JSON, validates it,
+// runs the upstream-allow-list policy check per version, merges back into
+// storage, and records an edit audit event. Errors returned here are shown
+// at the bottom of the popup so the user can correct and retry — the popup
+// stays open until the save succeeds or the user presses Esc.
+func (m *appModel) makeEditSave(entryType, entryName, editVersion string) func(buf []byte) error {
+	return func(buf []byte) error {
+		ctx := context.Background()
+		pm, err := m.store.GetPackage(ctx, entryType, entryName)
+		if err != nil {
+			return fmt.Errorf("reload %s/%s: %w", entryType, entryName, err)
+		}
+		if pm == nil {
+			return fmt.Errorf("%s/%s disappeared during edit", entryType, entryName)
+		}
+		beforeJSON, _ := json.MarshalIndent(pm, "", "  ")
+
+		if editVersion == "" {
+			// Full-manifest edit. The edited payload is itself a
+			// PackageManifest; Name and Type must not change — rename
+			// goes through create/delete, not edit.
+			var edited manifest.PackageManifest
+			if err := json.Unmarshal(buf, &edited); err != nil {
+				return fmt.Errorf("parse JSON: %w", err)
+			}
+			if edited.Name != pm.Name || edited.Type != pm.Type {
+				return fmt.Errorf("cannot change Name or Type via edit (was %s/%s, got %s/%s)",
+					pm.Type, pm.Name, edited.Type, edited.Name)
+			}
+			edited.ConfigVersion = manifest.CurrentConfigVersion
+			*pm = edited
+		} else {
+			// Version-scoped edit. The payload is still a full-shape
+			// PackageManifest (top-level fields + one-entry versions array)
+			// — merge just that single VersionEntry back in place.
+			var scoped manifest.PackageManifest
+			if err := json.Unmarshal(buf, &scoped); err != nil {
+				return fmt.Errorf("parse JSON: %w", err)
+			}
+			if len(scoped.Versions) != 1 {
+				return fmt.Errorf("expected exactly one entry in versions[], got %d", len(scoped.Versions))
+			}
+			newVE := scoped.Versions[0]
+			idx := -1
+			for i, ve := range pm.Versions {
+				if ve.Version == editVersion || ve.Ref == editVersion {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				return fmt.Errorf("version %q no longer present in %s/%s", editVersion, entryType, entryName)
+			}
+			pm.Versions[idx] = newVE
+		}
+
+		// Policy enforcement — same check `pkg import` runs. A violation
+		// blocks the save and is echoed back to the popup.
+		if m.auditDB != nil {
+			checker := policy.NewChecker(m.auditDB)
+			for _, ve := range pm.Versions {
+				candidate := policy.CandidateFor(pm.Type, pm.Name, ve.URL)
+				if candidate == "" {
+					continue
+				}
+				if err := checker.Check(ctx, pm.Type, candidate); err != nil {
+					return fmt.Errorf("policy check: %w", err)
+				}
+			}
+		}
+
+		if err := m.store.SavePackage(ctx, pm); err != nil {
+			return fmt.Errorf("save package: %w", err)
+		}
+		if err := m.store.SaveIndex(ctx); err != nil {
+			return fmt.Errorf("save index: %w", err)
+		}
+
+		if m.auditDB != nil {
+			afterJSON, _ := json.MarshalIndent(pm, "", "  ")
+			_ = m.auditDB.Record(ctx, audit.Event{
+				EventType:  audit.EventEdit,
+				PkgType:    entryType,
+				PkgName:    entryName,
+				PkgVersion: editVersion,
+				Actor:      audit.CurrentActor(),
+				Status:     "success",
+				Details:    audit.FormatDiff(beforeJSON, afterJSON),
+			})
+		}
+
+		target := entryName
+		if editVersion != "" {
+			target += "@" + editVersion
+		}
+		m.log.appendLog(successStyle.Render("Updated " + entryType + "/" + target))
+		return nil
+	}
 }
 
 // --- Create form helpers ---
