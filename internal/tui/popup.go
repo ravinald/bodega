@@ -16,8 +16,9 @@ const (
 	popupHelp                   // ? key
 	popupConfirm                // destructive action confirmation
 	popupBuildMenu              // B key — per-entry build stage picker
-	popupForm                   // c/E key — create or edit entry fields
+	popupForm                   // c key — per-type create form
 	popupTokenManager           // T key — API token management
+	popupJSONEdit               // E key — raw-JSON editor for a package or a single version
 )
 
 // popupModel holds the state for the overlay popup.
@@ -67,6 +68,19 @@ type popupModel struct {
 	jsonTitle    string         // title shown at the top of the JSON overlay
 	jsonTextarea textarea.Model // bubbles textarea for JSON editing
 	jsonError    string         // validation error shown at the bottom of the overlay
+
+	// --- raw-JSON edit popup (popupJSONEdit) ---
+	// editType, editName, editVersion identify the target being edited.
+	// editVersion is "" when editing the full PackageManifest; otherwise it's
+	// the version key the user picked from the tree, scoped via ScopeToVersion.
+	editType    string
+	editName    string
+	editVersion string
+	// onEditSave receives the buffer bytes when the user presses Ctrl+S. It
+	// parses, validates, persists, and returns a non-nil error (with a
+	// human-readable message) if any step fails; the popup stays open and the
+	// error shows at the bottom so the user can correct and retry.
+	onEditSave func(buf []byte) error
 
 	// --- token manager popup ---
 	tokenList     []tokenDisplayRow // rows rendered in the token table
@@ -176,7 +190,7 @@ func (p *popupModel) View(screenWidth, screenHeight int) string {
 	}
 
 	// JSON overlay takes priority when active.
-	if p.kind == popupForm && p.jsonInput {
+	if (p.kind == popupForm || p.kind == popupJSONEdit) && p.jsonInput {
 		return p.renderJSONOverlay(screenWidth, screenHeight)
 	}
 
@@ -461,7 +475,12 @@ func (p *popupModel) renderJSONOverlay(screenWidth, screenHeight int) string {
 	if p.jsonTitle != "" {
 		titleText = p.jsonTitle
 	}
-	title := buildMenuTitleStyle.Render(titleText + " — Ctrl+S to apply, Ctrl+T for template, Esc to discard")
+	// Ctrl+T loads a type-specific template; only makes sense during Create.
+	hintSuffix := " — Ctrl+S to apply, Esc to discard"
+	if p.kind == popupForm {
+		hintSuffix = " — Ctrl+S to apply, Ctrl+T for template, Esc to discard"
+	}
+	title := buildMenuTitleStyle.Render(titleText + hintSuffix)
 
 	var sb strings.Builder
 	sb.WriteString(title)
@@ -778,6 +797,12 @@ func (p *popupModel) HandleJSONOverlayKey(msg tea.KeyMsg, applyFn func(buf strin
 		p.jsonError = ""
 		return true, nil
 	case "ctrl+t":
+		// Template loading is a create-time affordance. In edit mode the
+		// buffer is already seeded from the persisted manifest; blowing it
+		// away with a stub template would be destructive.
+		if p.kind == popupJSONEdit {
+			return false, nil
+		}
 		// Insert a JSON template with all keys and empty values.
 		entryType := ""
 		for _, f := range p.formFields {

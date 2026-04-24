@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -164,6 +166,245 @@ func TestBuildTree(t *testing.T) {
 	}
 	if !pypiPkg.Children[0].InS3 {
 		t.Error("pypi pkg: InS3 should be true")
+	}
+}
+
+// TestBuildTreePopulatesVersionField guards the invariant the edit flow
+// depends on: leaf nodes carry a raw Version identifier that
+// ScopeToVersion recognises, and package-header nodes carry a Name
+// (so the E-key handler can distinguish them from type-group headers).
+func TestBuildTreePopulatesVersionField(t *testing.T) {
+	store := manifest.NewLocalStore(t.TempDir())
+	ctx := t.Context()
+	_ = store.AddVersion(ctx, manifest.TypeNpm, "@scope/pkg", manifest.VersionEntry{Version: "1.0.0"})
+	_ = store.AddVersion(ctx, manifest.TypeNpm, "@scope/pkg", manifest.VersionEntry{Version: "2.0.0", Hidden: true})
+	_ = store.AddVersion(ctx, manifest.TypeGit, "repo", manifest.VersionEntry{Ref: "main", URL: "https://example.com/r.git"})
+
+	roots := BuildTree(store, nil)
+
+	// Find npm group, then @scope/pkg package header.
+	var npmPkg *TreeNode
+	for i, g := range roots {
+		if g.EntryType != manifest.TypeNpm {
+			continue
+		}
+		for j := range roots[i].Children {
+			child := &roots[i].Children[j]
+			if child.Name == "@scope/pkg" {
+				npmPkg = child
+				break
+			}
+		}
+	}
+	if npmPkg == nil {
+		t.Fatal("@scope/pkg package header not found under npm")
+	}
+	if !npmPkg.IsGroup || npmPkg.Name == "" {
+		t.Errorf("package header should be IsGroup=true and Name set, got %+v", npmPkg)
+	}
+	if npmPkg.Version != "" {
+		t.Errorf("package header should have empty Version, got %q", npmPkg.Version)
+	}
+	if len(npmPkg.Children) != 2 {
+		t.Fatalf("@scope/pkg should have 2 version children, got %d", len(npmPkg.Children))
+	}
+	var gotVersions []string
+	for _, c := range npmPkg.Children {
+		gotVersions = append(gotVersions, c.Version)
+		if c.Name != "@scope/pkg" {
+			t.Errorf("version leaf Name = %q, want @scope/pkg", c.Name)
+		}
+		if c.IsGroup {
+			t.Errorf("version leaf should not be IsGroup: %+v", c)
+		}
+	}
+	// Exact version strings must match what ScopeToVersion compares against.
+	if !contains(gotVersions, "1.0.0") || !contains(gotVersions, "2.0.0") {
+		t.Errorf("version leaves = %v, want both 1.0.0 and 2.0.0", gotVersions)
+	}
+
+	// Verify the hidden flag made it onto the leaf.
+	for _, c := range npmPkg.Children {
+		if c.Version == "2.0.0" && !c.Hidden {
+			t.Error("2.0.0 leaf should have Hidden=true")
+		}
+		if c.Version == "1.0.0" && c.Hidden {
+			t.Error("1.0.0 leaf should have Hidden=false")
+		}
+	}
+
+	// Git: Ref is what ScopeToVersion matches against. Leaf Version must be the Ref.
+	var gitLeaf *TreeNode
+	for i, g := range roots {
+		if g.EntryType != manifest.TypeGit {
+			continue
+		}
+		for j := range roots[i].Children {
+			pkg := &roots[i].Children[j]
+			if pkg.Name == "repo" && len(pkg.Children) > 0 {
+				gitLeaf = &pkg.Children[0]
+			}
+		}
+	}
+	if gitLeaf == nil {
+		t.Fatal("git repo leaf not found")
+	}
+	if gitLeaf.Version != "main" {
+		t.Errorf("git leaf Version = %q, want main (Ref fallback)", gitLeaf.Version)
+	}
+}
+
+func contains(ss []string, s string) bool {
+	for _, v := range ss {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// TestMakeEditSave_FullManifest covers the happy path for editing the full
+// PackageManifest via the TUI save closure. The closure should parse the
+// buffer, replace the stored manifest, and persist.
+func TestMakeEditSave_FullManifest(t *testing.T) {
+	store := manifest.NewLocalStore(t.TempDir())
+	ctx := t.Context()
+	_ = store.AddVersion(ctx, manifest.TypeNpm, "lodash", manifest.VersionEntry{Version: "4.17.20"})
+
+	m := &appModel{store: store}
+	save := m.makeEditSave(manifest.TypeNpm, "lodash", "") // full-manifest edit
+
+	edited := `{
+		"config_version": 1,
+		"name": "lodash",
+		"type": "npm",
+		"description": "edited via TUI",
+		"versions": [
+			{"version": "4.17.20"},
+			{"version": "4.17.21", "frozen": true}
+		]
+	}`
+	if err := save([]byte(edited)); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	pm, _ := store.GetPackage(context.Background(), manifest.TypeNpm, "lodash")
+	if pm == nil {
+		t.Fatal("lodash disappeared after save")
+	}
+	if pm.Description != "edited via TUI" {
+		t.Errorf("description = %q, want 'edited via TUI'", pm.Description)
+	}
+	if len(pm.Versions) != 2 {
+		t.Errorf("versions count = %d, want 2", len(pm.Versions))
+	}
+}
+
+// TestMakeEditSave_VersionScoped covers the version-scoped edit path: buffer
+// is a one-entry PackageManifest, save merges that entry back into the
+// existing pm in place, preserving other versions.
+func TestMakeEditSave_VersionScoped(t *testing.T) {
+	store := manifest.NewLocalStore(t.TempDir())
+	ctx := t.Context()
+	_ = store.AddVersion(ctx, manifest.TypeNpm, "@scope/pkg", manifest.VersionEntry{Version: "1.0.0"})
+	_ = store.AddVersion(ctx, manifest.TypeNpm, "@scope/pkg", manifest.VersionEntry{Version: "2.0.0"})
+
+	m := &appModel{store: store}
+	save := m.makeEditSave(manifest.TypeNpm, "@scope/pkg", "2.0.0")
+
+	edited := `{
+		"config_version": 1,
+		"name": "@scope/pkg",
+		"type": "npm",
+		"versions": [
+			{"version": "2.0.0", "hidden": true, "frozen": true, "description": "quarantined"}
+		]
+	}`
+	if err := save([]byte(edited)); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	pm, _ := store.GetPackage(context.Background(), manifest.TypeNpm, "@scope/pkg")
+	if pm == nil || len(pm.Versions) != 2 {
+		t.Fatalf("expected 2 versions after scoped edit, got pm=%+v", pm)
+	}
+	// 1.0.0 must remain untouched; 2.0.0 must have the new flags.
+	var v1, v2 *manifest.VersionEntry
+	for i := range pm.Versions {
+		if pm.Versions[i].Version == "1.0.0" {
+			v1 = &pm.Versions[i]
+		}
+		if pm.Versions[i].Version == "2.0.0" {
+			v2 = &pm.Versions[i]
+		}
+	}
+	if v1 == nil || v1.Hidden || v1.Frozen {
+		t.Errorf("1.0.0 should be unchanged, got %+v", v1)
+	}
+	if v2 == nil || !v2.Hidden || !v2.Frozen || v2.Description != "quarantined" {
+		t.Errorf("2.0.0 should be hidden+frozen with description, got %+v", v2)
+	}
+}
+
+// TestMakeEditSave_RejectsRename: full-manifest edits must not change Name
+// or Type — renames are a different operation.
+func TestMakeEditSave_RejectsRename(t *testing.T) {
+	store := manifest.NewLocalStore(t.TempDir())
+	ctx := t.Context()
+	_ = store.AddVersion(ctx, manifest.TypeNpm, "lodash", manifest.VersionEntry{Version: "4.17.20"})
+
+	m := &appModel{store: store}
+	save := m.makeEditSave(manifest.TypeNpm, "lodash", "")
+
+	rename := `{"config_version": 1, "name": "lodash-renamed", "type": "npm", "versions":[{"version":"4.17.20"}]}`
+	err := save([]byte(rename))
+	if err == nil {
+		t.Fatal("expected error on rename, got nil")
+	}
+	if !strings.Contains(err.Error(), "cannot change Name") {
+		t.Errorf("error = %q, want message about Name change", err.Error())
+	}
+}
+
+// TestMakeEditSave_RejectsUnknownVersion: if the user points the TUI at a
+// version that's been deleted out from under them (race), the scoped save
+// reports a clean error instead of blindly mutating an unrelated slot.
+func TestMakeEditSave_RejectsUnknownVersion(t *testing.T) {
+	store := manifest.NewLocalStore(t.TempDir())
+	ctx := t.Context()
+	_ = store.AddVersion(ctx, manifest.TypeNpm, "pkg", manifest.VersionEntry{Version: "1.0.0"})
+
+	m := &appModel{store: store}
+	save := m.makeEditSave(manifest.TypeNpm, "pkg", "9.9.9") // not in store
+
+	edited := `{"config_version":1,"name":"pkg","type":"npm","versions":[{"version":"9.9.9"}]}`
+	err := save([]byte(edited))
+	if err == nil {
+		t.Fatal("expected error on unknown version, got nil")
+	}
+	if !strings.Contains(err.Error(), "no longer present") {
+		t.Errorf("error = %q, want 'no longer present'", err.Error())
+	}
+}
+
+// TestMakeEditSave_RejectsInvalidJSON: malformed buffer surfaces a parse
+// error without persisting anything.
+func TestMakeEditSave_RejectsInvalidJSON(t *testing.T) {
+	store := manifest.NewLocalStore(t.TempDir())
+	ctx := t.Context()
+	_ = store.AddVersion(ctx, manifest.TypeNpm, "pkg", manifest.VersionEntry{Version: "1.0.0"})
+
+	m := &appModel{store: store}
+	save := m.makeEditSave(manifest.TypeNpm, "pkg", "")
+
+	if err := save([]byte("{not json")); err == nil {
+		t.Error("expected parse error")
+	}
+	// Original manifest must not have been mutated.
+	pm, _ := store.GetPackage(context.Background(), manifest.TypeNpm, "pkg")
+	if pm == nil || len(pm.Versions) != 1 || pm.Versions[0].Version != "1.0.0" {
+		b, _ := json.MarshalIndent(pm, "", "  ")
+		t.Errorf("manifest should be untouched after parse failure; got %s", b)
 	}
 }
 
