@@ -66,5 +66,14 @@ Config files: `/etc/bodega/config.json` or `~/.config/bodega/config.json`.
 | `AWS_REGION` | AWS region (default: us-west-2) |
 | `BODEGA_LOG_LEVEL` | Logging verbosity 0-4 |
 | `BODEGA_CONFIG_FILE` | Load this config file instead of walking the default search path. Missing file → pure defaults. |
+| `BODEGA_LISTEN_ADDR` | HTTP listen address for `bodega serve` (default `:8080`). Overridden by `--addr`. |
+
+## Running under systemd
+
+A sample unit file is shipped at [docs/bodega.service](docs/bodega.service). It's `Type=notify` and takes advantage of bodega's built-in sd_notify support to accurately signal readiness. Copy to `/etc/systemd/system/`, edit `User`/paths to match your install, then `sudo systemctl daemon-reload && sudo systemctl enable --now bodega`.
+
+Reload manifests without a restart via `sudo systemctl reload bodega` (fires SIGHUP to the process). Logs land in the journal — `journalctl -u bodega -f`.
+
+For interactive background runs without systemd, `nohup bodega serve > /tmp/bodega.log 2>&1 &` is fine. Bodega intentionally does not self-daemonize — modern process supervision (systemd, launchd, supervisord) wants the server in the foreground.
 
 The default storage backend is `local` (filesystem at `/var/lib/bodega`). Set `storage_backend` to `"s3"` in your config file for S3-backed storage.

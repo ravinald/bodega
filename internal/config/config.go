@@ -16,12 +16,14 @@ const (
 	DefaultLogDir          = "/var/log/bodega"
 	DefaultLogWindowHeight = 12
 	DefaultLogLevel        = 0
+	DefaultListenAddr      = ":8080"
 
 	EnvBucket     = "REPO_BUCKET"
 	EnvRegion     = "AWS_REGION"
 	EnvBuildRoot  = "BOOTSTRAP_BUILD_ROOT"
 	EnvLogLevel   = "BODEGA_LOG_LEVEL"
 	EnvConfigFile = "BODEGA_CONFIG_FILE"
+	EnvListenAddr = "BODEGA_LISTEN_ADDR"
 
 	SystemConfigDir  = "/etc/bodega"
 	SystemConfigFile = "/etc/bodega/config.json"
@@ -45,6 +47,7 @@ type Config struct {
 	TLSKey            string   `json:"tls_key,omitempty"`
 	TLSAutocert       bool     `json:"tls_autocert,omitempty"`
 	TLSDomain         string   `json:"tls_domain,omitempty"`
+	ListenAddr        string   `json:"listen_addr,omitempty"`
 	ProxyCacheEnabled bool     `json:"proxy_cache_enabled"`
 	MetadataTTL       string   `json:"metadata_ttl,omitempty"`
 	GomodUpstream     string   `json:"gomod_upstream,omitempty"`
@@ -122,6 +125,7 @@ type fileConfig struct {
 	TLSKey            string   `json:"tls_key,omitempty"`
 	TLSAutocert       bool     `json:"tls_autocert,omitempty"`
 	TLSDomain         string   `json:"tls_domain,omitempty"`
+	ListenAddr        string   `json:"listen_addr,omitempty"`
 	ProxyCacheEnabled bool     `json:"proxy_cache_enabled"`
 	MetadataTTL       string   `json:"metadata_ttl,omitempty"`
 	GomodUpstream     string   `json:"gomod_upstream,omitempty"`
@@ -180,6 +184,10 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	cfg.TLSAutocert = fc.TLSAutocert
 	cfg.TLSDomain = fc.TLSDomain
 
+	// HTTP listen address: file config here; the serve command layers on
+	// flag → env before reading this value. See cmd_serve.go's ResolveAddr.
+	cfg.ListenAddr = fc.ListenAddr
+
 	// Proxy/cache.
 	cfg.ProxyCacheEnabled = fc.ProxyCacheEnabled
 	cfg.MetadataTTL = firstNonEmpty(fc.MetadataTTL, "1h")
@@ -232,6 +240,7 @@ func (c *Config) Save() error {
 		TLSKey:            c.TLSKey,
 		TLSAutocert:       c.TLSAutocert,
 		TLSDomain:         c.TLSDomain,
+		ListenAddr:        c.ListenAddr,
 		ProxyCacheEnabled: c.ProxyCacheEnabled,
 		MetadataTTL:       c.MetadataTTL,
 		GomodUpstream:     c.GomodUpstream,
@@ -385,6 +394,16 @@ func createDefaultConfig() (string, error) {
 // When BODEGA_CONFIG_FILE is set, only that path is consulted — callers can
 // point at a non-standard location, and tests can point at a path that does
 // not exist to guarantee a defaults-only load.
+// ResolveListenAddr applies the listen-address precedence chain:
+//   flag → env ($BODEGA_LISTEN_ADDR) → config file → DefaultListenAddr
+//
+// Lives here so cmd/bodega/cmd_serve.go stays small and so the precedence
+// order is the same bodega uses for every other knob (see EnvBucket,
+// EnvRegion, EnvBuildRoot handling in Load).
+func (c *Config) ResolveListenAddr(flagAddr string) string {
+	return firstNonEmpty(flagAddr, os.Getenv(EnvListenAddr), c.ListenAddr, DefaultListenAddr)
+}
+
 func configSearchPaths() []string {
 	if override := os.Getenv(EnvConfigFile); override != "" {
 		return []string{override}

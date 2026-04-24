@@ -70,8 +70,13 @@ type Server struct {
 	denyNets  []*net.IPNet
 	adminNets []*net.IPNet // CIDRs allowed to hit mutation API (admin_permit_cidr)
 	pepper    string       // pepper for token hash verification
+	quiet     bool         // suppress stderr startup banner (slog output unaffected)
 	mu        sync.Mutex   // protects store mutations (CRUD API)
 }
+
+// SetQuiet suppresses the human-facing stderr startup banner. Log-level
+// routed events are unaffected. Default is false.
+func (s *Server) SetQuiet(q bool) { s.quiet = q }
 
 // New constructs a Server and registers all routes.
 // s3client may be nil — S3-backed endpoints return 503 in that case.
@@ -220,16 +225,45 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}
 
-	// Start listener in a goroutine.
+	// Bind the listener synchronously so we can surface bind failures
+	// (port in use, privilege denied, bad address) before spawning the
+	// serve goroutine — and so the startup banner + sd_notify only fire
+	// once the socket is actually accepting.
+	ln, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", s.addr, err)
+	}
+	boundAddr := ln.Addr().String()
+
+	tlsMode := srv.TLSConfig != nil
+	if tlsMode {
+		ln = tls.NewListener(ln, srv.TLSConfig)
+	}
+
+	// User-facing startup banner on stderr. Bypasses log-level so a
+	// default-configured bodega serve gives immediate visual confirmation
+	// that binding succeeded. --quiet (see SetQuiet) silences it for
+	// scripting use; slog output is separately controlled by log_level.
+	if !s.quiet {
+		scheme := "http"
+		if tlsMode {
+			scheme = "https"
+		}
+		_, _ = fmt.Fprintf(os.Stderr, "bodega listening on %s://%s\n", scheme, boundAddr)
+	}
+	if tlsMode {
+		s.logger.Info("bodega server listening (TLS)", "addr", boundAddr)
+	} else {
+		s.logger.Info("bodega server listening", "addr", boundAddr)
+	}
+
+	// Notify systemd we're ready. No-op outside systemd (NOTIFY_SOCKET unset).
+	sdNotifyReady()
+
+	// Start the serve loop.
 	errCh := make(chan error, 1)
 	go func() {
-		if srv.TLSConfig != nil {
-			s.logger.Info("bodega server listening (TLS)", "addr", s.addr)
-			errCh <- srv.ListenAndServeTLS("", "") // certs already in TLSConfig
-		} else {
-			s.logger.Info("bodega server listening", "addr", s.addr)
-			errCh <- srv.ListenAndServe()
-		}
+		errCh <- srv.Serve(ln)
 	}()
 
 	// SIGHUP reloads the manifest index and clears the package cache.
@@ -252,6 +286,9 @@ func (s *Server) Start(ctx context.Context) error {
 		return err
 	case <-ctx.Done():
 		s.logger.Info("shutting down server...")
+		// Tell systemd we're intentionally stopping so it can distinguish
+		// a graceful shutdown from a crash.
+		sdNotifyStopping()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
