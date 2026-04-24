@@ -1,0 +1,57 @@
+# Systemd unit for bodega
+#
+# Copy to /etc/systemd/system/bodega.service and edit User, paths,
+# and environment to match your install. Then:
+#
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now bodega
+#   journalctl -u bodega -f
+#
+# Recommended config.json additions when running under systemd:
+#
+#   "log_level": 1   (Warn: quiet by default, noisy on trouble;
+#                     raise to 2 for access logs when debugging)
+#   "listen_addr": ":8080"
+#
+# Override either with --addr on ExecStart or BODEGA_LISTEN_ADDR= below.
+
+[Unit]
+Description=bodega package repository server
+Documentation=https://github.com/ravinald/bodega
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Type=notify requires the bodega binary to send READY=1 on the
+# $NOTIFY_SOCKET once the listener is up; the built-in sd_notify
+# support does this automatically.
+Type=notify
+
+User=bodega
+Group=bodega
+
+ExecStart=/usr/local/bin/bodega serve
+# SIGHUP reloads manifests without restarting the server.
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Point bodega at the system config. Listen address and log level live
+# inside that file so this unit doesn't need to know about them.
+Environment=BODEGA_CONFIG_FILE=/etc/bodega/config.json
+
+Restart=on-failure
+RestartSec=5s
+
+# Generous start timeout: storage backend probing (S3 head on the
+# bucket) happens before READY=1, and a cold IAM/KMS path can take
+# a minute on occasion. Adjust down if you're running locally.
+TimeoutStartSec=180
+
+# Hardening. Safe defaults; relax only if your install has a reason.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/bodega /var/log/bodega
+
+[Install]
+WantedBy=multi-user.target

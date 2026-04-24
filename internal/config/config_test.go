@@ -16,6 +16,7 @@ func isolateConfig(t *testing.T) {
 	t.Setenv(config.EnvBucket, "")
 	t.Setenv(config.EnvRegion, "")
 	t.Setenv(config.EnvBuildRoot, "")
+	t.Setenv(config.EnvListenAddr, "")
 }
 
 func TestLoad_Defaults(t *testing.T) {
@@ -59,6 +60,46 @@ func TestLoad_EnvOverridesDefault(t *testing.T) {
 	}
 	if cfg.Region != "eu-west-1" {
 		t.Errorf("Region = %q, want eu-west-1", cfg.Region)
+	}
+}
+
+// TestResolveListenAddr walks the full precedence chain: flag > env >
+// config-file > built-in default.
+func TestResolveListenAddr(t *testing.T) {
+	isolateConfig(t)
+
+	// 1. Built-in default when nothing is set.
+	cfg, err := config.Load(t.TempDir(), "", "", "", false, false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.ResolveListenAddr(""); got != config.DefaultListenAddr {
+		t.Errorf("no overrides: got %q, want %q", got, config.DefaultListenAddr)
+	}
+
+	// 2. Config file wins over default.
+	cfgFile := filepath.Join(t.TempDir(), "bodega.json")
+	if err := os.WriteFile(cfgFile, []byte(`{"listen_addr": ":9090"}`), 0o600); err != nil {
+		t.Fatalf("write cfg: %v", err)
+	}
+	t.Setenv(config.EnvConfigFile, cfgFile)
+	cfg, err = config.Load(t.TempDir(), "", "", "", false, false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.ResolveListenAddr(""); got != ":9090" {
+		t.Errorf("config-file only: got %q, want :9090", got)
+	}
+
+	// 3. Env var wins over config file.
+	t.Setenv(config.EnvListenAddr, ":9091")
+	if got := cfg.ResolveListenAddr(""); got != ":9091" {
+		t.Errorf("env over config: got %q, want :9091", got)
+	}
+
+	// 4. Flag wins over env.
+	if got := cfg.ResolveListenAddr("127.0.0.1:9092"); got != "127.0.0.1:9092" {
+		t.Errorf("flag over env: got %q, want 127.0.0.1:9092", got)
 	}
 }
 
