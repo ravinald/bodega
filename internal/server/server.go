@@ -53,20 +53,22 @@ var contentTypes = map[string]string{
 
 // Server is the bodega HTTP package server.
 type Server struct {
-	cfg       *config.Config
-	store     *manifest.Store
-	objects   storage.ObjectStore
-	mux       *http.ServeMux
-	addr      string
-	logger    *slog.Logger
-	cache     CacheConfig
-	auditDB   *audit.DB
-	policy    *policy.Checker
-	denyNets  []*net.IPNet
-	adminNets []*net.IPNet // CIDRs allowed to hit mutation API (admin_permit_cidr)
-	pepper    string       // pepper for token hash verification
-	quiet     bool         // suppress stderr startup banner (slog output unaffected)
-	mu        sync.Mutex   // protects store mutations (CRUD API)
+	cfg          *config.Config
+	store        *manifest.Store
+	objects      storage.ObjectStore
+	mux          *http.ServeMux
+	addr         string
+	logger       *slog.Logger
+	cache        CacheConfig
+	auditDB      *audit.DB
+	policy       *policy.Checker
+	discoverMode string             // "", "observe", "learn" — see internal/server/discovery.go
+	discovery    *DiscoveryRecorder // nil when discover_mode == "" or auditDB == nil
+	denyNets     []*net.IPNet
+	adminNets    []*net.IPNet // CIDRs allowed to hit mutation API (admin_permit_cidr)
+	pepper       string       // pepper for token hash verification
+	quiet        bool         // suppress stderr startup banner (slog output unaffected)
+	mu           sync.Mutex   // protects store mutations (CRUD API)
 }
 
 // SetQuiet suppresses the human-facing stderr startup banner. Log-level
@@ -145,6 +147,13 @@ func newServer(cfg *config.Config, store *manifest.Store, objects storage.Object
 			s.policy = policy.NewChecker(db)
 			logger.Info("audit db opened", "path", dbPath)
 		}
+	}
+	// Discover mode: only meaningful with both an audit DB (to write rows)
+	// and a non-empty mode. Validation of the mode value happens at config
+	// load time, so we trust cfg.DiscoverMode here.
+	s.discoverMode = cfg.DiscoverMode
+	if s.discoverMode != "" && s.auditDB != nil {
+		s.discovery = NewDiscoveryRecorder(s.auditDB, logger)
 	}
 	s.registerRoutes()
 	return s
@@ -254,6 +263,18 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Notify systemd we're ready. No-op outside systemd (NOTIFY_SOCKET unset).
 	sdNotifyReady()
+
+	// Discovery worker — drains the recorder's queue until ctx is cancelled.
+	if s.discovery != nil {
+		go s.discovery.Start(ctx)
+		s.logger.Info("upstream discovery enabled", "mode", s.discoverMode)
+		if s.discoverMode == "learn" {
+			s.logger.Warn("discover_mode=learn — upstream policy enforcement is BYPASSED. " +
+				"All upstream requests will succeed and be logged for promotion. " +
+				"Run `bodega discover promote-all <type>` and switch back to \"observe\" once captured.")
+			go s.discoverLearnWarner(ctx)
+		}
+	}
 
 	// Start the serve loop.
 	errCh := make(chan error, 1)

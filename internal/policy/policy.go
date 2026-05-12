@@ -192,3 +192,76 @@ func matchNpm(candidate, pattern string) bool {
 	}
 	return false
 }
+
+// HasRules reports whether any allow-list rules exist for registryType. The
+// discovery hook calls this to distinguish "allowed by an explicit rule" from
+// "no rules configured for this type" — both of which make Check return nil.
+// Result respects the same TTL cache as Check.
+func (c *Checker) HasRules(ctx context.Context, registryType string) (bool, error) {
+	if c == nil {
+		return false, nil
+	}
+	rules, err := c.rulesFor(ctx, registryType)
+	if err != nil {
+		return false, err
+	}
+	return len(rules) > 0, nil
+}
+
+// SuggestPattern returns the pattern a `policy add` call would use if an
+// operator wanted to allow the given observation. The shape matches the rule
+// kind for the type (see RuleKindForType): a hostname for apt, an org prefix
+// for git, a package name for pypi/npm, a path prefix for gomod, and a full
+// URL prefix for helm/binary.
+//
+// Inputs:
+//   - host     : URL hostname (may be empty for name-scoped types)
+//   - fullPath : URL path including the leading slash (may be empty)
+//   - pkgName  : the package/module name; for gomod this is the module path
+//
+// The returned string is safe to feed directly into audit.InsertPolicy with
+// RuleKindForType(regType).
+func SuggestPattern(regType, host, fullPath, pkgName string) string {
+	switch regType {
+	case manifest.TypeApt:
+		return host
+	case manifest.TypeGit:
+		return host + "/" + firstSegment(fullPath) + "/"
+	case manifest.TypePypi:
+		return normalizePyPI(pkgName)
+	case manifest.TypeNpm:
+		if strings.HasPrefix(pkgName, "@") {
+			if idx := strings.IndexByte(pkgName, '/'); idx > 0 {
+				return pkgName[:idx] + "/*"
+			}
+		}
+		return pkgName
+	case manifest.TypeGomod:
+		// Module paths look like host/org/repo... — propose host+org/.
+		parts := strings.SplitN(pkgName, "/", 3)
+		if len(parts) >= 2 {
+			return parts[0] + "/" + parts[1] + "/"
+		}
+		return pkgName
+	case manifest.TypeHelm, manifest.TypeBinary:
+		seg := firstSegment(fullPath)
+		if seg == "" {
+			return "https://" + host + "/"
+		}
+		return "https://" + host + "/" + seg + "/"
+	}
+	return ""
+}
+
+// firstSegment returns the first non-empty `/`-separated segment of p. Returns
+// "" for an empty path or "/".
+func firstSegment(p string) string {
+	p = strings.TrimPrefix(p, "/")
+	if p == "" {
+		return ""
+	}
+	if idx := strings.IndexByte(p, '/'); idx >= 0 {
+		return p[:idx]
+	}
+	return p
+}

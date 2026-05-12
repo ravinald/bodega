@@ -91,7 +91,7 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 		if pkg != nil && packageMode(pkg) == manifest.ModeProxy {
 			// Proxy the simple index from upstream PyPI.
 			upstream := "https://pypi.org/simple/" + normalized + "/"
-			s.proxyOrCache(w, r, "pypi/simple/"+normalized+"/index.html", upstream, manifest.TypePypi, pkgName, false, true)
+			s.proxyOrCache(w, r, "pypi/simple/"+normalized+"/index.html", upstream, manifest.TypePypi, pkgName, pkgName, false, true)
 			return
 		}
 		http.NotFound(w, r)
@@ -127,7 +127,7 @@ func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
 		pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, dist)
 		if pkg != nil && packageMode(pkg) == manifest.ModeProxy {
 			upstream := "https://pypi.org/packages/" + file
-			s.proxyOrCache(w, r, key, upstream, manifest.TypePypi, dist, true, true)
+			s.proxyOrCache(w, r, key, upstream, manifest.TypePypi, dist, dist, true, true)
 			return
 		}
 	}
