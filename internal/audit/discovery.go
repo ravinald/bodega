@@ -18,6 +18,7 @@ type DiscoveryRow struct {
 	PkgName      string
 	PkgVersion   string
 	Decision     string // allowed | denied | would_deny | no_policy
+	UpstreamURL  string // full upstream URL bodega fetched (or would have); empty on rows recorded before migration 007
 	FirstSeen    time.Time
 	LastSeen     time.Time
 	LastClient   string
@@ -41,15 +42,16 @@ func (a *DB) RecordDiscovery(ctx context.Context, r DiscoveryRow) error {
 	}
 	_, err := a.db.ExecContext(ctx,
 		`INSERT INTO upstream_discovery
-		   (registry_type, host, pattern_hint, pkg_name, pkg_version, decision, last_client)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		   (registry_type, host, pattern_hint, pkg_name, pkg_version, decision, last_client, upstream_url)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(registry_type, pattern_hint, pkg_name, pkg_version, decision)
 		 DO UPDATE SET
 		   request_count = request_count + 1,
 		   last_seen     = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
 		   last_client   = excluded.last_client,
-		   host          = excluded.host`,
-		r.RegistryType, r.Host, r.PatternHint, r.PkgName, r.PkgVersion, r.Decision, r.LastClient,
+		   host          = excluded.host,
+		   upstream_url  = CASE WHEN excluded.upstream_url = '' THEN upstream_discovery.upstream_url ELSE excluded.upstream_url END`,
+		r.RegistryType, r.Host, r.PatternHint, r.PkgName, r.PkgVersion, r.Decision, r.LastClient, r.UpstreamURL,
 	)
 	return err
 }
@@ -78,7 +80,7 @@ func (a *DB) ListDiscovery(ctx context.Context, f DiscoveryFilter) ([]DiscoveryR
 	}
 
 	q := `SELECT registry_type, host, pattern_hint, pkg_name, pkg_version, decision,
-	             first_seen, last_seen, last_client, request_count
+	             upstream_url, first_seen, last_seen, last_client, request_count
 	      FROM upstream_discovery`
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
@@ -101,7 +103,7 @@ func (a *DB) ListDiscovery(ctx context.Context, f DiscoveryFilter) ([]DiscoveryR
 		var r DiscoveryRow
 		var firstSeen, lastSeen string
 		if err := rows.Scan(&r.RegistryType, &r.Host, &r.PatternHint, &r.PkgName, &r.PkgVersion,
-			&r.Decision, &firstSeen, &lastSeen, &r.LastClient, &r.RequestCount); err != nil {
+			&r.Decision, &r.UpstreamURL, &firstSeen, &lastSeen, &r.LastClient, &r.RequestCount); err != nil {
 			return nil, err
 		}
 		r.FirstSeen, _ = time.Parse(time.RFC3339Nano, firstSeen)
@@ -118,13 +120,14 @@ func (a *DB) ListDiscovery(ctx context.Context, f DiscoveryFilter) ([]DiscoveryR
 // every (pkg_name, pkg_version, decision) row that matched it. Used by
 // `bodega discover list` — the bucket key is what `promote` will use.
 type DiscoveryAggregate struct {
-	RegistryType string
-	PatternHint  string
-	Host         string
-	RequestCount int64
-	FirstSeen    time.Time
-	LastSeen     time.Time
-	Decisions    string // comma-joined distinct decisions, e.g. "allowed,denied"
+	RegistryType   string
+	PatternHint    string
+	Host           string
+	RequestCount   int64
+	FirstSeen      time.Time
+	LastSeen       time.Time
+	Decisions      string // comma-joined distinct decisions, e.g. "allowed,denied"
+	SampleUpstream string // an example upstream URL from the bucket; empty if all rows pre-date migration 007
 }
 
 // AggregateDiscovery rolls observations into one row per (type, pattern_hint).
@@ -135,11 +138,12 @@ func (a *DB) AggregateDiscovery(ctx context.Context, registryType string) ([]Dis
 		err  error
 	)
 	q := `SELECT registry_type, pattern_hint,
-	             MAX(host)            AS host,
-	             SUM(request_count)   AS total,
-	             MIN(first_seen)      AS first_seen,
-	             MAX(last_seen)       AS last_seen,
-	             GROUP_CONCAT(DISTINCT decision) AS decisions
+	             MAX(host)                       AS host,
+	             SUM(request_count)              AS total,
+	             MIN(first_seen)                 AS first_seen,
+	             MAX(last_seen)                  AS last_seen,
+	             GROUP_CONCAT(DISTINCT decision) AS decisions,
+	             MAX(upstream_url)               AS sample_upstream
 	      FROM upstream_discovery`
 	if registryType != "" {
 		q += " WHERE registry_type = ?"
@@ -158,15 +162,18 @@ func (a *DB) AggregateDiscovery(ctx context.Context, registryType string) ([]Dis
 	for rows.Next() {
 		var a DiscoveryAggregate
 		var firstSeen, lastSeen string
-		var decisions sql.NullString
+		var decisions, sampleUpstream sql.NullString
 		if err := rows.Scan(&a.RegistryType, &a.PatternHint, &a.Host, &a.RequestCount,
-			&firstSeen, &lastSeen, &decisions); err != nil {
+			&firstSeen, &lastSeen, &decisions, &sampleUpstream); err != nil {
 			return nil, err
 		}
 		a.FirstSeen, _ = time.Parse(time.RFC3339Nano, firstSeen)
 		a.LastSeen, _ = time.Parse(time.RFC3339Nano, lastSeen)
 		if decisions.Valid {
 			a.Decisions = decisions.String
+		}
+		if sampleUpstream.Valid {
+			a.SampleUpstream = sampleUpstream.String
 		}
 		out = append(out, a)
 	}

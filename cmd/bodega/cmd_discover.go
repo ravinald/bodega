@@ -126,11 +126,12 @@ func newDiscoverShowCmd(gf *globalFlags) *cobra.Command {
 			}
 
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-			fmt.Fprintln(w, "PACKAGE\tVERSION\tDECISION\tCOUNT\tLAST CLIENT\tLAST SEEN")
+			fmt.Fprintln(w, "PACKAGE\tVERSION\tDECISION\tCOUNT\tLAST CLIENT\tLAST SEEN\tUPSTREAM URL")
 			for _, r := range rows {
-				fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\t%s\n",
+				fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\t%s\t%s\n",
 					r.PkgName, r.PkgVersion, r.Decision, r.RequestCount,
-					r.LastClient, r.LastSeen.Format("2006-01-02 15:04"))
+					r.LastClient, r.LastSeen.Format("2006-01-02 15:04"),
+					r.UpstreamURL)
 			}
 			return w.Flush()
 		},
@@ -302,12 +303,12 @@ func newDiscoverExportCmd(gf *globalFlags) *cobra.Command {
 			defer cw.Flush()
 			_ = cw.Write([]string{
 				"registry_type", "host", "pattern_hint", "pkg_name", "pkg_version",
-				"decision", "first_seen", "last_seen", "last_client", "request_count",
+				"decision", "upstream_url", "first_seen", "last_seen", "last_client", "request_count",
 			})
 			for _, r := range rows {
 				_ = cw.Write([]string{
 					r.RegistryType, r.Host, r.PatternHint, r.PkgName, r.PkgVersion,
-					r.Decision,
+					r.Decision, r.UpstreamURL,
 					r.FirstSeen.Format("2006-01-02T15:04:05Z07:00"),
 					r.LastSeen.Format("2006-01-02T15:04:05Z07:00"),
 					r.LastClient,
