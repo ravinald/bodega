@@ -52,6 +52,7 @@ type Config struct {
 	MetadataTTL       string   `json:"metadata_ttl,omitempty"`
 	GomodUpstream     string   `json:"gomod_upstream,omitempty"`
 	NpmUpstream       string   `json:"npm_upstream,omitempty"`
+	DiscoverMode      string   `json:"discover_mode,omitempty"` // "", "observe", "learn" — see internal/server/discovery.go
 	GomodRoot         string   `json:"gomod_root,omitempty"`
 	HelmRoot          string   `json:"helm_root,omitempty"`
 	NpmRoot           string   `json:"npm_root,omitempty"`
@@ -130,6 +131,7 @@ type fileConfig struct {
 	MetadataTTL       string   `json:"metadata_ttl,omitempty"`
 	GomodUpstream     string   `json:"gomod_upstream,omitempty"`
 	NpmUpstream       string   `json:"npm_upstream,omitempty"`
+	DiscoverMode      string   `json:"discover_mode,omitempty"`
 	GomodRoot         string   `json:"gomod_root,omitempty"`
 	HelmRoot          string   `json:"helm_root,omitempty"`
 	NpmRoot           string   `json:"npm_root,omitempty"`
@@ -194,6 +196,15 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	cfg.GomodUpstream = firstNonEmpty(fc.GomodUpstream, "https://proxy.golang.org")
 	cfg.NpmUpstream = firstNonEmpty(fc.NpmUpstream, "https://registry.npmjs.org")
 
+	// Discover mode: "", "observe", or "learn" — typo'd values fail loudly so
+	// operators don't silently lose observability.
+	cfg.DiscoverMode = fc.DiscoverMode
+	switch cfg.DiscoverMode {
+	case "", "observe", "learn":
+	default:
+		return nil, fmt.Errorf("invalid discover_mode %q (want \"\", \"observe\", or \"learn\")", cfg.DiscoverMode)
+	}
+
 	// Extra type roots.
 	cfg.GomodRoot = fc.GomodRoot
 	cfg.HelmRoot = fc.HelmRoot
@@ -245,6 +256,7 @@ func (c *Config) Save() error {
 		MetadataTTL:       c.MetadataTTL,
 		GomodUpstream:     c.GomodUpstream,
 		NpmUpstream:       c.NpmUpstream,
+		DiscoverMode:      c.DiscoverMode,
 		GomodRoot:         c.GomodRoot,
 		HelmRoot:          c.HelmRoot,
 		NpmRoot:           c.NpmRoot,
@@ -295,11 +307,14 @@ func EnsureConfigAndLogDir() (string, error) {
 		return "", err
 	}
 
-	// Log directory.
+	// Log directory. Tolerate a Load failure (e.g. a misconfigured
+	// discover_mode) — best-effort directory creation should not block the
+	// rest of startup; the actual `bodega` command path will surface the
+	// validation error to the user.
 	cfg, _ := Load("", "", "", "", false, false)
-	logDir := cfg.LogDir
-	if logDir == "" {
-		logDir = DefaultLogDir
+	logDir := DefaultLogDir
+	if cfg != nil && cfg.LogDir != "" {
+		logDir = cfg.LogDir
 	}
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		// Non-fatal: log dir creation may fail without root.
@@ -353,6 +368,9 @@ func defaultConfigContent() []byte {
   "metadata_ttl": "1h",
   "gomod_upstream": "https://proxy.golang.org",
   "npm_upstream": "https://registry.npmjs.org",
+
+  "_comment_discover": "Discover mode: \"\" off, \"observe\" log + still enforce policy, \"learn\" log + bypass policy (loud WARN). See bodega discover --help.",
+  "discover_mode": "",
 
   "gomod_root": "",
   "helm_root": "",

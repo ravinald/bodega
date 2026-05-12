@@ -46,7 +46,7 @@ func (s *Server) handleGomod(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		s.proxyOrCache(w, r, s3Key, upstream, manifest.TypeGomod, module, immutable, true)
+		s.proxyOrCache(w, r, s3Key, upstream, manifest.TypeGomod, module, module, immutable, true)
 		return
 	}
 	s.proxyS3(w, r, s3Key)

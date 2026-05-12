@@ -32,7 +32,7 @@ func (s *Server) handleHelmChart(w http.ResponseWriter, r *http.Request) {
 		for _, ve := range pm.Versions {
 			if ve.URL != "" {
 				upstream := strings.TrimSuffix(ve.URL, "/") + "/" + file
-				s.proxyOrCache(w, r, key, upstream, manifest.TypeHelm, upstream, true, true)
+				s.proxyOrCache(w, r, key, upstream, manifest.TypeHelm, upstream, chartName, true, true)
 				return
 			}
 		}

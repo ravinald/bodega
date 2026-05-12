@@ -165,6 +165,7 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 		auditParent,
 		newTokenCmd(gf),
 		newPolicyCmd(gf),
+		newDiscoverCmd(gf),
 		newShowCmd(gf),
 		newDashboardCmd(gf),
 		newInitCmd(gf),
@@ -245,6 +246,7 @@ func loadStore(gf *globalFlags) (*manifest.Store, error) {
 func openAuditDB(gf *globalFlags) *audit.DB {
 	cfg, err := loadConfig(gf)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not load config: %v\n", err)
 		return nil
 	}
 	dbPath := cfg.AuditDB
