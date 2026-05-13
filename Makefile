@@ -149,9 +149,13 @@ bench:
 vet:
 	go vet ./...
 
-## fmt: Format all Go source files
+## fmt: Format all Go source files (goimports if available, else gofmt)
 fmt:
-	goimports -w ./... 2>/dev/null || gofmt -w ./...
+	@if command -v goimports >/dev/null 2>&1; then \
+		goimports -w .; \
+	else \
+		gofmt -w .; \
+	fi
 
 ## lint: Run golangci-lint (requires golangci-lint in PATH)
 lint:
