@@ -93,8 +93,8 @@ func (c *AgeChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 		Reason: fmt.Sprintf("%s@%s is %s old, policy requires %s",
 			pm.Name, version, shortDuration(age), shortDuration(minAge)),
 		Details: map[string]any{
-			"published_at":   publishedAt.UTC().Format(time.RFC3339),
-			"age_seconds":    int64(age.Seconds()),
+			"published_at":    publishedAt.UTC().Format(time.RFC3339),
+			"age_seconds":     int64(age.Seconds()),
 			"min_age_seconds": policy.MinAgeSeconds,
 		},
 	}
