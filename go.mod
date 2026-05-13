@@ -2,6 +2,8 @@ module github.com/ravinald/bodega
 
 go 1.25.0
 
+toolchain go1.26.3
+
 require (
 	github.com/aws/aws-sdk-go-v2 v1.41.5
 	github.com/aws/aws-sdk-go-v2/config v1.32.14
