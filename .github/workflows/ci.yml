@@ -39,7 +39,10 @@ jobs:
           check-latest: true
       - uses: golangci/golangci-lint-action@v6
         with:
-          version: latest
+          # Pin to a v2 release; `latest` resolves to v1.x which can't read our
+          # v2-format .golangci.yml and refuses to lint a toolchain newer than
+          # itself was built with.
+          version: v2.12.2
           args: --timeout=5m
 
   fmt:
