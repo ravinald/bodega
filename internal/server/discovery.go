@@ -182,6 +182,7 @@ func (s *Server) recordDiscovery(_ context.Context, r *http.Request, regType, up
 		PkgName:      pkgName,
 		PkgVersion:   pkgVersionFromKey(s3Key),
 		Decision:     decision,
+		UpstreamURL:  upstreamURL,
 		LastClient:   ClientIP(r),
 	})
 }
