@@ -12,10 +12,10 @@ import (
 // newer than min_age_seconds ago. One row per ecosystem; absence means no
 // gate for that ecosystem.
 type AgePolicy struct {
-	Ecosystem      string
-	MinAgeSeconds  int64
-	Action         string // warn | block | ignore
-	UpdatedAt      time.Time
+	Ecosystem     string
+	MinAgeSeconds int64
+	Action        string // warn | block | ignore
+	UpdatedAt     time.Time
 }
 
 // ErrAgePolicyNotFound is returned by GetAgePolicy when no row exists.

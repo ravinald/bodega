@@ -413,7 +413,8 @@ func createDefaultConfig() (string, error) {
 // point at a non-standard location, and tests can point at a path that does
 // not exist to guarantee a defaults-only load.
 // ResolveListenAddr applies the listen-address precedence chain:
-//   flag → env ($BODEGA_LISTEN_ADDR) → config file → DefaultListenAddr
+//
+//	flag → env ($BODEGA_LISTEN_ADDR) → config file → DefaultListenAddr
 //
 // Lives here so cmd/bodega/cmd_serve.go stays small and so the precedence
 // order is the same bodega uses for every other knob (see EnvBucket,

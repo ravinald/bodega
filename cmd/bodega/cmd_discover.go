@@ -369,4 +369,3 @@ func insertPolicyRule(ctx context.Context, adb *audit.DB, regType, pattern, comm
 		CreatedBy:    "discover",
 	})
 }
-
