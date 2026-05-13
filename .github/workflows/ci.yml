@@ -37,11 +37,9 @@ jobs:
         with:
           go-version-file: go.mod
           check-latest: true
-      - uses: golangci/golangci-lint-action@v6
+      - uses: golangci/golangci-lint-action@v7
         with:
-          # Pin to a v2 release; `latest` resolves to v1.x which can't read our
-          # v2-format .golangci.yml and refuses to lint a toolchain newer than
-          # itself was built with.
+          # Action v7 is required for golangci-lint v2.x (our .golangci.yml is v2 format).
           version: v2.12.2
           args: --timeout=5m
 
