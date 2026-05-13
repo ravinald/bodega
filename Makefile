@@ -8,7 +8,38 @@ GOFLAGS    :=
 GO_VERSION := 1.24.2
 GO_INSTALL := /usr/local/go/bin/go
 
-.PHONY: all depend build install test lint vet fmt clean tidy cross help
+# ---- Install paths ---------------------------------------------------------
+# `make install` writes to $(DESTDIR)$(BINDIR). Defaults are auto-detected
+# from the host OS so `make install` does the right thing without flags:
+#
+#   macOS Apple Silicon (Homebrew present)  -> /opt/homebrew/bin
+#   macOS Intel / Linux / *BSD              -> /usr/local/bin
+#
+# Override either knob to install elsewhere:
+#
+#   make install PREFIX=$$(go env GOPATH)   # -> $$GOPATH/bin (no sudo)
+#   make install PREFIX=$$HOME/.local        # -> ~/.local/bin (no sudo)
+#   make install BINDIR=/opt/bodega/bin      # -> /opt/bodega/bin
+#   make install DESTDIR=/tmp/stage          # -> /tmp/stage$(BINDIR) (packagers)
+#
+# sudo is invoked only when the target directory isn't writable by the
+# current user — least-privilege by default.
+UNAME_S := $(shell uname -s 2>/dev/null || echo unknown)
+ifeq ($(UNAME_S),Darwin)
+  ifneq ($(wildcard /opt/homebrew/bin),)
+    DEFAULT_PREFIX := /opt/homebrew
+  else
+    DEFAULT_PREFIX := /usr/local
+  endif
+else
+  DEFAULT_PREFIX := /usr/local
+endif
+
+PREFIX  ?= $(DEFAULT_PREFIX)
+BINDIR  ?= $(PREFIX)/bin
+DESTDIR ?=
+
+.PHONY: all depend build install uninstall test lint vet fmt clean tidy cross help
 
 all: build
 
@@ -64,16 +95,43 @@ cross:
 	GOOS=linux GOARCH=amd64 go build $(GOFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY)-linux-amd64 $(CMD_PKG)
 	@echo "Built: $(BUILD_DIR)/$(BINARY)-linux-amd64 (version: $(VERSION))"
 
-## install: Install bodega to /usr/local/bin (builds first if needed)
-install:
-	@if [ -f $(BUILD_DIR)/$(BINARY) ]; then \
-		echo "Installing pre-built binary..."; \
+## install: Install bodega to $(BINDIR) (sudo only if needed; override PREFIX/BINDIR)
+install: build
+	@target_dir="$(DESTDIR)$(BINDIR)"; \
+	target="$$target_dir/$(BINARY)"; \
+	if [ ! -d "$$target_dir" ]; then \
+		if mkdir -p "$$target_dir" 2>/dev/null; then :; \
+		else \
+			echo "Creating $$target_dir requires elevated privileges; using sudo..."; \
+			sudo mkdir -p "$$target_dir"; \
+		fi; \
+	fi; \
+	if [ -w "$$target_dir" ]; then \
+		install -m 0755 "$(BUILD_DIR)/$(BINARY)" "$$target"; \
 	else \
-		mkdir -p $(BUILD_DIR); \
-		go build $(GOFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY) $(CMD_PKG); \
-	fi
-	sudo cp $(BUILD_DIR)/$(BINARY) /usr/local/bin/$(BINARY)
-	@echo "Installed: /usr/local/bin/$(BINARY)"
+		echo "Writing to $$target_dir requires elevated privileges; using sudo..."; \
+		sudo install -m 0755 "$(BUILD_DIR)/$(BINARY)" "$$target"; \
+	fi; \
+	echo "Installed: $$target (version: $(VERSION))"; \
+	case ":$$PATH:" in \
+		*":$(BINDIR):"*) ;; \
+		*) printf '\nNOTE: %s is not on your $$PATH.\n  Add to your shell profile:\n    export PATH="%s:$$PATH"\n\n' "$(BINDIR)" "$(BINDIR)" ;; \
+	esac
+
+## uninstall: Remove bodega from $(BINDIR)
+uninstall:
+	@target="$(DESTDIR)$(BINDIR)/$(BINARY)"; \
+	if [ ! -e "$$target" ]; then \
+		echo "Not installed at $$target"; \
+		exit 0; \
+	fi; \
+	if [ -w "$$(dirname "$$target")" ]; then \
+		rm -f "$$target"; \
+	else \
+		echo "Removing $$target requires elevated privileges; using sudo..."; \
+		sudo rm -f "$$target"; \
+	fi; \
+	echo "Removed: $$target"
 
 ## test: Run all tests with race detector
 test:
