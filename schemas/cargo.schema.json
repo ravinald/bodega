@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ravinald/bodega/schemas/cargo.schema.json",
+  "title": "Cargo Package Manifest",
+  "description": "Defines Rust crates to mirror or proxy from upstream sparse registries (e.g. crates.io).",
+  "type": "object",
+  "required": ["config_version", "entries"],
+  "properties": {
+    "config_version": {
+      "type": "integer",
+      "description": "Schema version. Current: 1.",
+      "const": 1
+    },
+    "entries": {
+      "type": "array",
+      "description": "List of crates to manage.",
+      "items": {
+        "type": "object",
+        "required": ["name", "version"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Crate name (e.g. serde, tokio). Cargo crate names are case-insensitive and have no scoping syntax."
+          },
+          "version": {
+            "type": "string",
+            "description": "Semver version."
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Upstream sparse-registry base URL. Defaults to index.crates.io when omitted."
+          },
+          "frozen": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, the entry cannot be built, edited, or deleted."
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}
