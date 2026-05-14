@@ -107,6 +107,12 @@ When a name is given after the type, only that entry is packaged.`,
 					allSummaries = append(allSummaries,
 						ensurePackagedNpm(bcfg, store, entryFilter),
 					)
+
+				case manifest.TypeCargo:
+					// Cargo has no package stage — proxied sparse index is the metadata.
+					allSummaries = append(allSummaries,
+						ensureFetchedCargo(bcfg, store, entryFilter),
+					)
 				}
 			}
 

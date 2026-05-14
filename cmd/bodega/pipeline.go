@@ -232,6 +232,38 @@ func ensurePackagedHelm(bcfg *builder.Config, store *manifest.Store, entryFilter
 	return builder.MergeSummaries(fetchSummary, pkgSummary)
 }
 
+// ensureFetchedCargo runs FetchCargo for any unfetched entries. Cargo has
+// no per-package packaging step — clients consume the upstream sparse index
+// proxied through bodega, and individual `.crate` tarballs are
+// content-addressed by version.
+func ensureFetchedCargo(bcfg *builder.Config, store *manifest.Store, entryFilter string) *builder.Summary {
+	if len(store.ListPackages(manifest.TypeCargo)) == 0 {
+		fmt.Println("    No cargo entries in manifest — skipping")
+		return &builder.Summary{}
+	}
+	ctx := context.Background()
+	var ss []*builder.Summary
+	for _, safeName := range store.ListPackages(manifest.TypeCargo) {
+		pm, err := store.GetPackage(ctx, manifest.TypeCargo, safeName)
+		if err != nil || pm == nil {
+			continue
+		}
+		if entryFilter != "" && pm.Name != entryFilter {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			if ve.Frozen {
+				continue
+			}
+			if !builder.CheckCargoStage(bcfg, pm.Name, ve).Fetched {
+				ss = append(ss, builder.FetchCargo(bcfg, store, pm.Name))
+				break
+			}
+		}
+	}
+	return builder.MergeSummaries(ss...)
+}
+
 // ensurePackagedNpm cascades fetch → package (per-package packument.json).
 // Short-circuits when no npm entries are configured.
 func ensurePackagedNpm(bcfg *builder.Config, store *manifest.Store, entryFilter string) *builder.Summary {

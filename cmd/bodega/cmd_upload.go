@@ -190,6 +190,26 @@ If no types are given all four are uploaded.`,
 						}
 						totalUploaded++
 					}
+
+				case manifest.TypeCargo:
+					// Cascade: ensure .crate tarballs are fetched. Cargo has no
+					// per-package packument equivalent — clients consume the
+					// upstream sparse index proxied through bodega.
+					if s := ensureFetchedCargo(bcfg, store, ""); s.HasFailures() {
+						return fmt.Errorf("cascade fetch for cargo failed")
+					}
+					paths := builder.CargoArtifactPaths(bcfg, store, "")
+					if len(paths) == 0 {
+						fmt.Println("    No cargo artifacts to upload — skipping")
+						continue
+					}
+					for _, ap := range paths {
+						fmt.Printf("    upload: s3://%s/%s\n", cfg.Bucket, ap.S3Key)
+						if err := objStore.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
+							return fmt.Errorf("upload cargo %s: %w", ap.Local, err)
+						}
+						totalUploaded++
+					}
 				}
 			}
 

@@ -114,6 +114,10 @@ When a name is given after the type, only that entry is fetched.`,
 					allSummaries = append(allSummaries,
 						builder.FetchNpm(bcfg, store, entryFilter),
 					)
+				case manifest.TypeCargo:
+					allSummaries = append(allSummaries,
+						builder.FetchCargo(bcfg, store, entryFilter),
+					)
 				}
 			}
 

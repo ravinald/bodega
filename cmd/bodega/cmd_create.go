@@ -96,6 +96,12 @@ Examples:
 					return err
 				}
 
+			case manifest.TypeCargo:
+				name, ve, err = collectCargoVersion(r, name, "", "")
+				if err != nil {
+					return err
+				}
+
 			case manifest.TypePypi:
 				if name == "" {
 					if name, err = prompt(r, "Package name", ""); err != nil {
@@ -440,5 +446,23 @@ func collectNpmVersion(r *bufio.Reader, name, url, version string) (string, mani
 		return "", manifest.VersionEntry{}, fmt.Errorf("version is required")
 	}
 	url, _ = prompt(r, "Registry URL (leave blank for registry.npmjs.org)", url)
+	return name, manifest.VersionEntry{Version: version, URL: url}, nil
+}
+
+func collectCargoVersion(r *bufio.Reader, name, url, version string) (string, manifest.VersionEntry, error) {
+	var err error
+	if name, err = prompt(r, "Crate name (e.g. serde, tokio)", name); err != nil {
+		return "", manifest.VersionEntry{}, err
+	}
+	if name == "" {
+		return "", manifest.VersionEntry{}, fmt.Errorf("name is required")
+	}
+	if version, err = prompt(r, "Version", version); err != nil {
+		return "", manifest.VersionEntry{}, err
+	}
+	if version == "" {
+		return "", manifest.VersionEntry{}, fmt.Errorf("version is required")
+	}
+	url, _ = prompt(r, "Sparse registry URL (leave blank for index.crates.io)", url)
 	return name, manifest.VersionEntry{Version: version, URL: url}, nil
 }
