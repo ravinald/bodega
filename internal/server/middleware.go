@@ -416,6 +416,18 @@ func parsePackagePath(path string) (pkgType, pkgName, pkgVersion string) {
 			return "npm", pkgName, ""
 		}
 		return "npm", full, ""
+	case strings.HasPrefix(path, "/cargo/"):
+		full := strings.TrimPrefix(path, "/cargo/")
+		// Crate download: <crate>/<version>/download
+		if strings.HasSuffix(full, "/download") {
+			parts := strings.SplitN(strings.TrimSuffix(full, "/download"), "/", 2)
+			if len(parts) == 2 {
+				return "cargo", parts[0], parts[1]
+			}
+		}
+		// Sparse index lookup: trailing path segment is the crate name.
+		parts := strings.Split(full, "/")
+		return "cargo", parts[len(parts)-1], ""
 	}
 	return "", "", ""
 }
