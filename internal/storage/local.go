@@ -218,6 +218,7 @@ func (l *Local) SyncDir(_ context.Context, out io.Writer, localDir, keyPrefix st
 			return err
 		}
 
+		//nolint:gosec // G122: walk root is the operator-owned storage directory; no untrusted symlink injection vector.
 		src, err := os.Open(path)
 		if err != nil {
 			return err
