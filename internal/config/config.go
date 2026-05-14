@@ -52,10 +52,12 @@ type Config struct {
 	MetadataTTL       string   `json:"metadata_ttl,omitempty"`
 	GomodUpstream     string   `json:"gomod_upstream,omitempty"`
 	NpmUpstream       string   `json:"npm_upstream,omitempty"`
+	CargoUpstream     string   `json:"cargo_upstream,omitempty"`
 	DiscoverMode      string   `json:"discover_mode,omitempty"` // "", "observe", "learn" — see internal/server/discovery.go
 	GomodRoot         string   `json:"gomod_root,omitempty"`
 	HelmRoot          string   `json:"helm_root,omitempty"`
 	NpmRoot           string   `json:"npm_root,omitempty"`
+	CargoRoot         string   `json:"cargo_root,omitempty"`
 	AuditDB           string   `json:"audit_db,omitempty"`
 	DenyList          []string `json:"deny_list,omitempty"`
 	Timezone          string   `json:"timezone,omitempty"`          // display timezone, e.g. "America/Los_Angeles"; default UTC
@@ -104,6 +106,10 @@ func (c *Config) RootForType(typ string) string {
 		if c.NpmRoot != "" {
 			return c.NpmRoot
 		}
+	case "cargo":
+		if c.CargoRoot != "" {
+			return c.CargoRoot
+		}
 	}
 	return c.BuildRoot
 }
@@ -131,10 +137,12 @@ type fileConfig struct {
 	MetadataTTL       string   `json:"metadata_ttl,omitempty"`
 	GomodUpstream     string   `json:"gomod_upstream,omitempty"`
 	NpmUpstream       string   `json:"npm_upstream,omitempty"`
+	CargoUpstream     string   `json:"cargo_upstream,omitempty"`
 	DiscoverMode      string   `json:"discover_mode,omitempty"`
 	GomodRoot         string   `json:"gomod_root,omitempty"`
 	HelmRoot          string   `json:"helm_root,omitempty"`
 	NpmRoot           string   `json:"npm_root,omitempty"`
+	CargoRoot         string   `json:"cargo_root,omitempty"`
 	AuditDB           string   `json:"audit_db,omitempty"`
 	DenyList          []string `json:"deny_list,omitempty"`
 	StorageBackend    string   `json:"storage_backend,omitempty"`
@@ -195,6 +203,7 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	cfg.MetadataTTL = firstNonEmpty(fc.MetadataTTL, "1h")
 	cfg.GomodUpstream = firstNonEmpty(fc.GomodUpstream, "https://proxy.golang.org")
 	cfg.NpmUpstream = firstNonEmpty(fc.NpmUpstream, "https://registry.npmjs.org")
+	cfg.CargoUpstream = firstNonEmpty(fc.CargoUpstream, "https://index.crates.io")
 
 	// Discover mode: "", "observe", or "learn" — typo'd values fail loudly so
 	// operators don't silently lose observability.
@@ -209,6 +218,7 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	cfg.GomodRoot = fc.GomodRoot
 	cfg.HelmRoot = fc.HelmRoot
 	cfg.NpmRoot = fc.NpmRoot
+	cfg.CargoRoot = fc.CargoRoot
 
 	// Audit.
 	cfg.AuditDB = firstNonEmpty(fc.AuditDB, filepath.Join(cfg.LogDir, "audit.db"))
@@ -256,10 +266,12 @@ func (c *Config) Save() error {
 		MetadataTTL:       c.MetadataTTL,
 		GomodUpstream:     c.GomodUpstream,
 		NpmUpstream:       c.NpmUpstream,
+		CargoUpstream:     c.CargoUpstream,
 		DiscoverMode:      c.DiscoverMode,
 		GomodRoot:         c.GomodRoot,
 		HelmRoot:          c.HelmRoot,
 		NpmRoot:           c.NpmRoot,
+		CargoRoot:         c.CargoRoot,
 		AuditDB:           c.AuditDB,
 		DenyList:          c.DenyList,
 		StorageBackend:    c.StorageBackend,
@@ -368,6 +380,7 @@ func defaultConfigContent() []byte {
   "metadata_ttl": "1h",
   "gomod_upstream": "https://proxy.golang.org",
   "npm_upstream": "https://registry.npmjs.org",
+  "cargo_upstream": "https://index.crates.io",
 
   "_comment_discover": "Discover mode: \"\" off, \"observe\" log + still enforce policy, \"learn\" log + bypass policy (loud WARN). See bodega discover --help.",
   "discover_mode": "",
@@ -375,6 +388,7 @@ func defaultConfigContent() []byte {
   "gomod_root": "",
   "helm_root": "",
   "npm_root": "",
+  "cargo_root": "",
 
   "audit_db": "",
 
