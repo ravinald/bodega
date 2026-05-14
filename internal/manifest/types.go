@@ -19,6 +19,7 @@ const (
 	TypeGomod  = "gomod"
 	TypeHelm   = "helm"
 	TypeNpm    = "npm"
+	TypeCargo  = "cargo"
 )
 
 // Mode constants control how an entry is served.
@@ -36,7 +37,7 @@ const (
 )
 
 // AllTypes is the canonical build order across all supported ecosystems.
-var AllTypes = []string{TypeBinary, TypeGit, TypeApt, TypePypi, TypeGomod, TypeHelm, TypeNpm}
+var AllTypes = []string{TypeBinary, TypeGit, TypeApt, TypePypi, TypeGomod, TypeHelm, TypeNpm, TypeCargo}
 
 // Checksum records an expected digest for integrity verification.
 // Algorithm is one of "md5", "sha1", "sha256", or "sha512".

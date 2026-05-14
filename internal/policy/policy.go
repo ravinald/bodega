@@ -36,7 +36,7 @@ func RuleKindForType(registryType string) string {
 		return KindHost
 	case manifest.TypeGit:
 		return KindOrg
-	case manifest.TypePypi, manifest.TypeNpm:
+	case manifest.TypePypi, manifest.TypeNpm, manifest.TypeCargo:
 		return KindPackage
 	case manifest.TypeGomod, manifest.TypeHelm, manifest.TypeBinary:
 		return KindPrefix
@@ -164,6 +164,8 @@ func matchRule(registryType string, r Rule, candidate string) bool {
 		return normalizePyPI(candidate) == normalizePyPI(r.Pattern)
 	case manifest.TypeNpm:
 		return matchNpm(candidate, r.Pattern)
+	case manifest.TypeCargo:
+		return candidate == r.Pattern
 	case manifest.TypeGomod, manifest.TypeHelm, manifest.TypeBinary:
 		return strings.HasPrefix(candidate, r.Pattern)
 	}
@@ -176,7 +178,7 @@ func matchRule(registryType string, r Rule, candidate string) bool {
 // upstream URL is checked directly.
 func CandidateFor(registryType, packageName, entryURL string) string {
 	switch registryType {
-	case manifest.TypePypi, manifest.TypeNpm, manifest.TypeGomod:
+	case manifest.TypePypi, manifest.TypeNpm, manifest.TypeGomod, manifest.TypeCargo:
 		return packageName
 	}
 	return entryURL
@@ -235,6 +237,8 @@ func SuggestPattern(regType, host, fullPath, pkgName string) string {
 				return pkgName[:idx] + "/*"
 			}
 		}
+		return pkgName
+	case manifest.TypeCargo:
 		return pkgName
 	case manifest.TypeGomod:
 		// Module paths look like host/org/repo... — propose host+org/.
