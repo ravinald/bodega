@@ -189,6 +189,6 @@ func auditFailsafe(action, dbPath string) {
 		fmt.Fprintf(os.Stderr, "  warning: could not write audit failsafe: %v\n", err)
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	fmt.Fprintln(f, msg)
 }
