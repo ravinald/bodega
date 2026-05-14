@@ -2,10 +2,15 @@ BINARY     := bodega
 CMD_PKG    := ./cmd/bodega
 BUILD_DIR  := ./dist
 VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || date -u '+%Y%m%d-%H%M%S')
-LDFLAGS    := -ldflags "-X main.version=$(VERSION)"
-GOFLAGS    :=
+COMMIT     ?= $(shell git rev-parse HEAD 2>/dev/null || echo none)
+BUILD_DATE ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
+LDFLAGS    := -ldflags "-s -w \
+                -X main.version=$(VERSION) \
+                -X main.commit=$(COMMIT) \
+                -X main.buildDate=$(BUILD_DATE)"
+GOFLAGS    := -trimpath
 
-GO_VERSION := 1.24.2
+GO_VERSION := $(shell awk '/^go / {print $$2; exit}' go.mod)
 GO_INSTALL := /usr/local/go/bin/go
 
 # ---- Install paths ---------------------------------------------------------
