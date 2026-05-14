@@ -105,6 +105,11 @@ func (c *Config) StampNpmEntry(store *manifest.Store, name string, ve manifest.V
 	stampVersion(context.Background(), store, manifest.TypeNpm, name, ve, c.GetBuildEnv(), "any")
 }
 
+// StampCargoEntry sets BuildEnv on a cargo entry (platform is always "any").
+func (c *Config) StampCargoEntry(store *manifest.Store, name string, ve manifest.VersionEntry) {
+	stampVersion(context.Background(), store, manifest.TypeCargo, name, ve, c.GetBuildEnv(), "any")
+}
+
 // stampArtifactSize records the file size on the version entry and saves.
 func stampArtifactSize(ctx context.Context, store *manifest.Store, typ, name string, targetVE manifest.VersionEntry, artifactPath string) {
 	fi, err := os.Stat(artifactPath)
