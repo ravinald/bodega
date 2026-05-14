@@ -285,6 +285,7 @@ func (s *Server) Start(ctx context.Context) error {
 	// SIGHUP reloads the manifest index and clears the package cache.
 	sighupCh := make(chan os.Signal, 1)
 	signal.Notify(sighupCh, syscall.SIGHUP)
+	//nolint:gosec // G118: signal handler is server-lifecycle, intentionally decoupled from any request context.
 	go func() {
 		for range sighupCh {
 			s.logger.Info("SIGHUP received, reloading manifests...")
@@ -885,8 +886,9 @@ func (s *Server) handleAPIAudit(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if limit := q.Get("limit"); limit != "" {
-		if n, err := fmt.Sscanf(limit, "%d", &f.Limit); n == 1 && err == nil && f.Limit > 0 {
-			// parsed
+		var n int
+		if _, err := fmt.Sscanf(limit, "%d", &n); err == nil && n > 0 {
+			f.Limit = n
 		}
 	}
 	const maxAuditLimit = 5000

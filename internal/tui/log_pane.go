@@ -42,9 +42,7 @@ func (m *logPaneModel) Blur() {
 // appendLog adds a line (or multiple newline-separated lines) to the log
 // viewport and auto-scrolls to the bottom.
 func (m *logPaneModel) appendLog(msg string) {
-	for _, line := range strings.Split(msg, "\n") {
-		m.outputLines = append(m.outputLines, line)
-	}
+	m.outputLines = append(m.outputLines, strings.Split(msg, "\n")...)
 	m.syncViewport()
 }
 
