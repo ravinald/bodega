@@ -5,40 +5,33 @@ on:
     tags: ['v*']
 
 permissions:
-  contents: write
+  contents: write       # create releases
+  id-token: write       # cosign keyless signing via OIDC
+  attestations: write   # SLSA provenance via actions/attest-build-provenance
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # GoReleaser needs full history for changelog
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version-file: go.mod
+          check-latest: true
 
-      - name: Build binaries
-        run: |
-          mkdir -p dist
-          for pair in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
-            GOOS=${pair%/*}
-            GOARCH=${pair#*/}
-            output="dist/bodega-${GOOS}-${GOARCH}"
-            echo "Building ${output}..."
-            GOOS=$GOOS GOARCH=$GOARCH go build \
-              -ldflags "-X main.version=${{ github.ref_name }}" \
-              -o "$output" ./cmd/bodega
-          done
+      - uses: anchore/sbom-action/download-syft@v0
+      - uses: sigstore/cosign-installer@v3
 
-      - name: Generate checksums
-        run: |
-          cd dist
-          sha256sum bodega-* > checksums-sha256.txt
-          cat checksums-sha256.txt
-
-      - name: Create release
-        uses: softprops/action-gh-release@v2
+      - uses: goreleaser/goreleaser-action@v6
         with:
-          files: |
-            dist/bodega-*
-            dist/checksums-sha256.txt
-          generate_release_notes: true
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attest binaries
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: 'dist/bodega_*'

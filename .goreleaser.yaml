@@ -1,0 +1,94 @@
+version: 2
+
+project_name: bodega
+
+before:
+  hooks:
+    - go mod tidy
+    - go mod verify
+
+builds:
+  - id: bodega
+    main: ./cmd/bodega
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.FullCommit}}
+      - -X main.buildDate={{.Date}}
+    # Windows is intentionally omitted: cmd/bodega/cmd_reset.go imports
+    # log/syslog (Unix-only). Add windows/amd64 once that usage is guarded
+    # behind build tags.
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - LICENSE
+      - README.md
+      - docs/QUICKSTART.md
+      - docs/USAGE.md
+      - docs/bodega.service
+
+nfpms:
+  - id: linux-packages
+    package_name: bodega
+    vendor: bodega
+    homepage: https://github.com/ravinald/bodega
+    maintainer: Ravi Pina <ravi@cow.org>
+    description: Self-hosted package repository manager
+    license: Apache-2.0
+    formats: [deb, rpm]
+    bindir: /usr/local/bin
+    contents:
+      - src: docs/bodega.service
+        dst: /usr/lib/systemd/system/bodega.service
+      - src: LICENSE
+        dst: /usr/share/doc/bodega/LICENSE
+
+checksum:
+  name_template: 'checksums-sha256.txt'
+  algorithm: sha256
+
+sboms:
+  - id: binary
+    artifacts: binary
+
+signs:
+  - cmd: cosign
+    signature: '${artifact}.sig'
+    certificate: '${artifact}.pem'
+    args:
+      - sign-blob
+      - '--oidc-issuer=https://token.actions.githubusercontent.com'
+      - '--output-certificate=${certificate}'
+      - '--output-signature=${signature}'
+      - '${artifact}'
+      - '--yes'
+    artifacts: checksum
+    output: true
+
+release:
+  github:
+    owner: ravinald
+    name: bodega
+  prerelease: auto
+  draft: false
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - 'Merge pull request'
+      - 'Merge branch'

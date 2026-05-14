@@ -25,8 +25,13 @@ import (
 	"github.com/ravinald/bodega/internal/storage"
 )
 
-// version is set at build time via -ldflags "-X main.version=..."
-var version = "dev"
+// Build metadata baked in via -ldflags by both `make build` and GoReleaser.
+// Tag-driven version, full git SHA, and an RFC-3339 build timestamp.
+var (
+	version   = "dev"
+	commit    = "none"
+	buildDate = "unknown"
+)
 
 // globalFlags holds values bound to the persistent root flags.
 type globalFlags struct {
@@ -98,7 +103,7 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 	root.Flags().StringVar(&breakGlassType, "break-glass-update-md5", "", "Recompute MD5 for the named manifest type and exit")
 	root.RunE = func(cmd *cobra.Command, args []string) error {
 		if showVersion {
-			fmt.Printf("bodega %s\n", version)
+			fmt.Printf("bodega %s (commit %s, built %s)\n", version, commit, buildDate)
 			return nil
 		}
 		if breakGlassType == "" {
