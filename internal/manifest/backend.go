@@ -102,21 +102,51 @@ type LocalBackend struct {
 	Dir string
 }
 
+// safePath joins name onto b.Dir and refuses any input that escapes the root.
+// Defense in depth: SafeName at the call site already strips "/", but a future
+// caller (or a malformed manifest name reaching the mutation API) could carry
+// "..", an absolute path, or a NUL byte. Reject those here so no Backend
+// method ever opens a file outside Dir.
+func (b *LocalBackend) safePath(name string) (string, error) {
+	if name == "" {
+		return "", fmt.Errorf("backend: empty name")
+	}
+	if strings.ContainsRune(name, 0) {
+		return "", fmt.Errorf("backend: name contains NUL byte")
+	}
+	if filepath.IsAbs(name) {
+		return "", fmt.Errorf("backend: refusing absolute path %q", name)
+	}
+	full := filepath.Join(b.Dir, name)
+	rel, err := filepath.Rel(b.Dir, full)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("backend: refusing path %q (escapes root)", name)
+	}
+	return full, nil
+}
+
 // Read returns the contents of Dir/name. Returns (nil, nil) when the file does not exist.
 func (b *LocalBackend) Read(_ context.Context, name string) ([]byte, error) {
-	data, err := os.ReadFile(filepath.Join(b.Dir, name))
+	path, err := b.safePath(name)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", filepath.Join(b.Dir, name), err)
+		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
 	return data, nil
 }
 
 // Write stores data at Dir/name, creating any intermediate directories as needed.
 func (b *LocalBackend) Write(_ context.Context, name string, data []byte) error {
-	path := filepath.Join(b.Dir, name)
+	path, err := b.safePath(name)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
 	}
@@ -128,12 +158,15 @@ func (b *LocalBackend) Write(_ context.Context, name string, data []byte) error 
 
 // Delete removes Dir/name. Returns nil when the file does not exist.
 func (b *LocalBackend) Delete(_ context.Context, name string) error {
-	err := os.Remove(filepath.Join(b.Dir, name))
-	if os.IsNotExist(err) {
-		return nil
-	}
+	path, err := b.safePath(name)
 	if err != nil {
-		return fmt.Errorf("delete %s: %w", filepath.Join(b.Dir, name), err)
+		return err
+	}
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("delete %s: %w", path, err)
 	}
 	return nil
 }
