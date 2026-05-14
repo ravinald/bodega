@@ -2,8 +2,8 @@ package builder
 
 import (
 	"context"
-	"crypto/md5"
-	"crypto/sha1"
+	"crypto/md5"  //nolint:gosec // G501: Debian repository spec requires MD5 in Packages/Release for legacy client compat.
+	"crypto/sha1" //nolint:gosec // G505: Debian repository spec requires SHA1 in Packages/Release for legacy client compat.
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -655,8 +655,8 @@ func computeDebHashes(path string) (md5hex, sha1hex, sha256hex string, err error
 	}
 	defer f.Close()
 
-	md5w := md5.New()
-	sha1w := sha1.New()
+	md5w := md5.New()   //nolint:gosec // G401: MD5 required by Debian Packages/Release format.
+	sha1w := sha1.New() //nolint:gosec // G401: SHA1 required by Debian Packages/Release format.
 	sha256w := sha256.New()
 	w := io.MultiWriter(md5w, sha1w, sha256w)
 	if _, err := io.Copy(w, f); err != nil {
@@ -759,85 +759,6 @@ func locateDebFile(d dirs, name string, ve manifest.VersionEntry) (string, error
 		}
 		return matches[0], nil
 	}
-}
-
-// setupAptRepo creates the reprepro configuration directory and a GPG signing
-// key if one does not already exist for the bootstrap email.
-func setupAptRepo(cfg *Config, aptRepoDir string) error {
-	out := cfg.stdout()
-	confDir := filepath.Join(aptRepoDir, "conf")
-	if err := mkdirAll(confDir); err != nil {
-		return err
-	}
-
-	gpgEmail := cfg.GpgEmail
-	if gpgEmail == "" {
-		gpgEmail = "bodega@localhost"
-	}
-	gpgName := cfg.GpgName
-	if gpgName == "" {
-		gpgName = "Bodega Package Signing"
-	}
-
-	// Generate GPG key if absent. Check the exit code, not the output —
-	// gpg writes error text to stderr even when the key is missing.
-	_, checkErr := runCmdCapture("", "gpg", "--list-keys", gpgEmail)
-	if checkErr != nil {
-		_, _ = fmt.Fprintf(out, "    Generating GPG signing key for %s...\n", gpgEmail)
-		batchInput := fmt.Sprintf(
-			"Key-Type: RSA\nKey-Length: 4096\nName-Real: %s\nName-Email: %s\nExpire-Date: 0\n%%no-protection\n",
-			gpgName, gpgEmail,
-		)
-		tmpFile, err := os.CreateTemp("", "gpg-batch-*.txt")
-		if err != nil {
-			return fmt.Errorf("create gpg batch file: %w", err)
-		}
-		defer func() { _ = os.Remove(tmpFile.Name()) }()
-		if _, err := tmpFile.WriteString(batchInput); err != nil {
-			return fmt.Errorf("write gpg batch file: %w", err)
-		}
-		if err := tmpFile.Close(); err != nil {
-			return fmt.Errorf("close gpg batch file: %w", err)
-		}
-		if err := runCmd(out, "", "gpg", "--batch", "--gen-key", tmpFile.Name()); err != nil {
-			return fmt.Errorf("gpg key generation: %w", err)
-		}
-	} else {
-		_, _ = fmt.Fprintf(out, "    GPG key for %s already exists.\n", gpgEmail)
-	}
-
-	// Retrieve key ID.
-	keyOut, err := runCmdCapture("", "gpg", "--list-keys", "--keyid-format", "long", gpgEmail)
-	if err != nil {
-		return fmt.Errorf("gpg list-keys: %w", err)
-	}
-	keyID := extractGPGKeyID(keyOut)
-	if keyID == "" {
-		return fmt.Errorf("could not parse GPG key ID from: %s", keyOut)
-	}
-	_, _ = fmt.Fprintf(out, "    GPG Key ID: %s\n", keyID)
-
-	// Export public key.
-	keyExportPath := filepath.Join(aptRepoDir, "gpg-key.asc")
-	keyASC, err := runCmdCapture("", "gpg", "--export", "--armor", keyID)
-	if err != nil {
-		return fmt.Errorf("gpg export: %w", err)
-	}
-	if err := os.WriteFile(keyExportPath, []byte(keyASC), 0o644); err != nil {
-		return fmt.Errorf("write gpg-key.asc: %w", err)
-	}
-
-	// Write reprepro distributions file.
-	distPath := filepath.Join(confDir, "distributions")
-	distContent := fmt.Sprintf(
-		"Codename: noble\nComponents: main\nArchitectures: amd64\nSignWith: %s\nDescription: Scale internal bootstrap packages for Ubuntu 24.04 (Noble)\n",
-		keyID,
-	)
-	if err := os.WriteFile(distPath, []byte(distContent), 0o644); err != nil {
-		return fmt.Errorf("write reprepro distributions: %w", err)
-	}
-
-	return nil
 }
 
 // extractGPGKeyID parses the key ID from gpg --list-keys output.

@@ -83,6 +83,7 @@ func (a *DB) ListDiscovery(ctx context.Context, f DiscoveryFilter) ([]DiscoveryR
 	             upstream_url, first_seen, last_seen, last_client, request_count
 	      FROM upstream_discovery`
 	if len(where) > 0 {
+		//nolint:gosec // G202: WHERE clause assembled from a fixed slice of internal predicates; values are bound via ? parameters in `args`.
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
 	q += " ORDER BY last_seen DESC"
@@ -90,6 +91,7 @@ func (a *DB) ListDiscovery(ctx context.Context, f DiscoveryFilter) ([]DiscoveryR
 	if limit <= 0 {
 		limit = 1000
 	}
+	//nolint:gosec // G202: LIMIT clause built from a clamped int literal, no user-controlled string interpolation.
 	q += fmt.Sprintf(" LIMIT %d", limit)
 
 	rows, err := a.db.QueryContext(ctx, q, args...)

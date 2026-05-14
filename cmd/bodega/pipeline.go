@@ -100,52 +100,6 @@ func ensureFetchedPypi(bcfg *builder.Config, store *manifest.Store) *builder.Sum
 	return builder.FetchPypi(bcfg, store)
 }
 
-// ensureBuiltApt cascades: fetch first if needed, then build.
-// Returns the combined summary of any stages run.
-func ensureBuiltApt(bcfg *builder.Config, store *manifest.Store, entryFilter string) *builder.Summary {
-	ctx := context.Background()
-	var ss []*builder.Summary
-	for _, safeName := range store.ListPackages(manifest.TypeApt) {
-		pm, err := store.GetPackage(ctx, manifest.TypeApt, safeName)
-		if err != nil || pm == nil {
-			continue
-		}
-		if entryFilter != "" && pm.Name != entryFilter {
-			continue
-		}
-		for _, ve := range pm.Versions {
-			if ve.Frozen {
-				continue
-			}
-			status := builder.CheckAptStage(bcfg, pm.Name, ve)
-			if !status.Fetched {
-				ss = append(ss, builder.FetchApt(bcfg, store, pm.Name))
-			}
-			if !status.Built {
-				ss = append(ss, builder.BuildApt(bcfg, store, pm.Name))
-			}
-		}
-	}
-	return builder.MergeSummaries(ss...)
-}
-
-// ensureBuiltPypi cascades: fetch if needed, then build.
-func ensureBuiltPypi(bcfg *builder.Config, store *manifest.Store) *builder.Summary {
-	status := builder.CheckPypiStage(bcfg, store)
-	var ss []*builder.Summary
-	if !status.Fetched {
-		s := builder.FetchPypi(bcfg, store)
-		ss = append(ss, s)
-		if s.HasFailures() {
-			return builder.MergeSummaries(ss...)
-		}
-	}
-	if !status.Built {
-		ss = append(ss, builder.BuildPypi(bcfg, store))
-	}
-	return builder.MergeSummaries(ss...)
-}
-
 // ensurePackagedGit cascades fetch if needed, then packages.
 func ensurePackagedGit(bcfg *builder.Config, store *manifest.Store, entryFilter string) *builder.Summary {
 	ctx := context.Background()

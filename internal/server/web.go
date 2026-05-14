@@ -22,6 +22,6 @@ func (s *Server) registerWebUI() {
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
-		w.Write(data)
+		_, _ = w.Write(data)
 	})
 }

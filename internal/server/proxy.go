@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -174,6 +173,7 @@ func (s *Server) proxyOrCache(w http.ResponseWriter, r *http.Request, s3Key, ups
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
 	w.WriteHeader(http.StatusOK)
+	//nolint:gosec // G705: response body is the upstream artifact bytes; Content-Type is set above.
 	_, _ = w.Write(data)
 }
 
@@ -208,6 +208,7 @@ func validateUpstreamURL(rawURL string) error {
 		return fmt.Errorf("upstream URL must use https, got %q", u.Scheme)
 	}
 	host := u.Hostname()
+	//nolint:gosec // G704: this lookup IS the SSRF defense — we resolve the host to inspect IPs and reject loopback / private / link-local before returning.
 	ips, err := net.LookupHost(host)
 	if err != nil {
 		return fmt.Errorf("cannot resolve upstream host %q: %w", host, err)
@@ -229,11 +230,13 @@ func fetchUpstream(ctx context.Context, rawURL string) ([]byte, string, error) {
 	if err := validateUpstreamURL(rawURL); err != nil {
 		return nil, "", err
 	}
+	//nolint:gosec // G704: rawURL was just validated by validateUpstreamURL above (https-only, non-loopback, non-private).
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, "", err
 	}
 
+	//nolint:gosec // G704: see comment on NewRequestWithContext above; URL is validated.
 	resp, err := upstreamClient.Do(req)
 	if err != nil {
 		return nil, "", err
@@ -318,15 +321,4 @@ func (s *Server) verifyProxyChecksum(ctx context.Context, s3Key string, data []b
 
 	s.logger.Debug("checksum verified", "key", s3Key)
 	return nil
-}
-
-// logCacheEvent records an audit event for a proxy/cache operation.
-func (s *Server) logCacheEvent(r *http.Request, pkgType, pkgName, pkgVersion, status string, logger *slog.Logger) {
-	logger.Info("proxy cache event",
-		"pkg_type", pkgType,
-		"pkg_name", pkgName,
-		"pkg_version", pkgVersion,
-		"status", status,
-		"client", ClientIP(r),
-	)
 }

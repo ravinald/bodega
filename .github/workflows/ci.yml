@@ -26,11 +26,6 @@ jobs:
 
   lint:
     runs-on: ubuntu-latest
-    # TODO: flip to required after lint-cleanup PR lands (~87 known findings to
-    # triage: unused code in cmd/tui/builder, false-positive SSRF/XSS/SQL warnings
-    # that need //nolint annotations, and required-weak-crypto MD5/SHA1 in
-    # builder/apt.go for Debian spec compliance).
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -119,7 +114,7 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
-    needs: [vet, fmt, tidy, test]
+    needs: [vet, lint, fmt, tidy, test]
     strategy:
       fail-fast: false
       matrix:

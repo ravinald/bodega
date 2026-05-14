@@ -3,7 +3,6 @@ package tui
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -62,9 +61,8 @@ type sourcesModel struct {
 
 // flatRow pairs a display string with the underlying node it represents.
 type flatRow struct {
-	display string // rendered line (unstyled)
-	node    *TreeNode
-	depth   int // 0 = type group, 1 = entry
+	node  *TreeNode
+	depth int // 0 = type group, 1 = entry
 }
 
 // BuildTree constructs the root-level tree nodes from the manifest store and
@@ -742,16 +740,6 @@ func (m sourcesModel) View() string {
 	}
 
 	return sb.String()
-}
-
-// sortedStringKeys returns the keys of m in sorted order.
-func sortedStringKeys(m map[string]string) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
 }
 
 // stripAnsi removes ANSI escape sequences from s, returning plain text.

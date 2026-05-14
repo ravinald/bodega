@@ -56,7 +56,6 @@ type appModel struct {
 	details  detailsModel
 	log      logPaneModel
 	popup    popupModel
-	roots    []TreeNode
 	focus    focusTarget
 	statuses []bos3.EntryStatus
 
@@ -2089,16 +2088,6 @@ func fieldValueFromSlice(fields []formField, key string) string {
 		}
 	}
 	return ""
-}
-
-// fieldDisabled returns true if the named field exists and is disabled.
-func fieldDisabled(fields []formField, key string) bool {
-	for _, f := range fields {
-		if f.Label == key {
-			return f.Disabled
-		}
-	}
-	return false
 }
 
 // labelSelectValue returns the LabelSelectValue of the first LabelSelect field with the given label.

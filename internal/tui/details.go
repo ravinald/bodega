@@ -430,11 +430,6 @@ func (m detailsModel) renderGroupDetails() string {
 	return sb.String()
 }
 
-// store_ListPackages is a helper to list packages for a type.
-func store_ListPackages(store *manifest.Store, _ context.Context, typ string) []string {
-	return store.ListPackages(typ)
-}
-
 // packageDescription returns a cached description for a package, or empty string.
 func (m detailsModel) packageDescription(entryType, name string) string {
 	ctx := context.Background()

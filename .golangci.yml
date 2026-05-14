@@ -20,6 +20,9 @@ linters:
         - (*database/sql.Rows).Close
         - (*os.File).Close
         - (*net/http.Response).Body.Close
+        # Project-specific: audit.DB.Close — defer-close pattern across every
+        # CLI subcommand. Underlying SQL handle close errors are non-actionable.
+        - (*github.com/ravinald/bodega/internal/audit.DB).Close
         # Writes to stdout / stderr where a closed pipe is the only failure.
         - fmt.Fprint
         - fmt.Fprintf
@@ -27,8 +30,26 @@ linters:
         # Best-effort cleanup paths.
         - os.Remove
         - os.RemoveAll
+    staticcheck:
+      # Match golangci-lint v2's default exclusions (ST1000-series style
+      # suggestions are too noisy as gates), plus disable QF1001 (De Morgan's
+      # law restatement; the explicit form is more readable than the
+      # distributed one).
+      checks:
+        - all
+        - -ST1000
+        - -ST1003
+        - -ST1016
+        - -ST1020
+        - -ST1021
+        - -ST1022
+        - -QF1001
     gosec:
       excludes:
+        # G104: Errors unhandled — duplicates errcheck. Keep the dedicated
+        # linter (with project-specific exclude-functions) as the source of
+        # truth so we don't maintain two parallel exclude lists.
+        - G104
         # G204/G702: Subprocess launched with / command injection via variable —
         # intentional. This is a build runner that wraps git, gpg, apt-get, pip,
         # and reprepro. All command arguments come from operator-controlled

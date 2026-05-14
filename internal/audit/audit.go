@@ -262,6 +262,7 @@ func (a *DB) Query(ctx context.Context, f Filter) ([]StoredEvent, error) {
 	if limit <= 0 {
 		limit = 1000
 	}
+	//nolint:gosec // G202: LIMIT clause built from a clamped int literal, no user-controlled string interpolation.
 	query += fmt.Sprintf(" LIMIT %d", limit)
 
 	rows, err := a.db.QueryContext(ctx, query, args...)
@@ -381,6 +382,7 @@ func (a *DB) ListChecksums(ctx context.Context, pkgType, pkgName string) ([]Stor
 
 	query := "SELECT id, pkg_type, pkg_name, pkg_version, s3_key, algorithm, value, source, created_at, updated_at FROM checksums"
 	if len(where) > 0 {
+		//nolint:gosec // G202: WHERE clause assembled from a fixed slice of internal predicates; values are bound via ? parameters in `args`.
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
 	query += " ORDER BY pkg_type, pkg_name, pkg_version"

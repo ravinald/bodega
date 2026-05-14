@@ -10,14 +10,12 @@ import "github.com/charmbracelet/lipgloss"
 var (
 	colorFocusedBorder   = lipgloss.Color("33")  // bright blue
 	colorUnfocusedBorder = lipgloss.Color("240") // dim gray
-	colorSelected        = lipgloss.Color("33")
-	colorSelectedBg      = lipgloss.Color("17") // dark blue bg
+	colorSelectedBg      = lipgloss.Color("17")  // dark blue bg
 	colorGreen           = lipgloss.Color("42")
 	colorRed             = lipgloss.Color("196")
 	colorYellow          = lipgloss.Color("220")
 	colorDim             = lipgloss.Color("240")
 	colorBright          = lipgloss.Color("252")
-	colorPrompt          = lipgloss.Color("33")
 	colorTypeLabel       = lipgloss.Color("75")
 )
 
@@ -57,11 +55,6 @@ var keyStyle = lipgloss.NewStyle().
 
 // valueStyle renders a detail-pane field value.
 var valueStyle = lipgloss.NewStyle().Foreground(colorBright)
-
-// promptStyle renders the shell prompt.
-var promptStyle = lipgloss.NewStyle().
-	Foreground(colorPrompt).
-	Bold(true)
 
 // errorStyle renders error output in red.
 var errorStyle = lipgloss.NewStyle().Foreground(colorRed)

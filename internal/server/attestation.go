@@ -53,6 +53,7 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case strings.HasPrefix(uri, "http://"), strings.HasPrefix(uri, "https://"):
+		//nolint:gosec // G710: uri comes from operator-controlled manifest, not from request input.
 		http.Redirect(w, r, uri, http.StatusFound)
 	case strings.HasPrefix(uri, "s3://"):
 		// Strip scheme + bucket to derive the key. Expected shape: s3://bucket/key...

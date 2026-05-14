@@ -160,6 +160,7 @@ func (s *Server) serveFilteredPackument(w http.ResponseWriter, r *http.Request, 
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(filtered)))
 	w.WriteHeader(http.StatusOK)
+	//nolint:gosec // G705: filtered is the JSON packument body; Content-Type set to application/json above.
 	_, _ = w.Write(filtered)
 }
 
