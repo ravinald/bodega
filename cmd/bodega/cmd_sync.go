@@ -177,6 +177,20 @@ use 'upload' instead.`,
 						}
 						totalUploaded++
 					}
+
+				case manifest.TypeCargo:
+					paths := builder.CargoArtifactPaths(bcfg, store, "")
+					if len(paths) == 0 {
+						fmt.Println("    No local cargo artifacts found — skipping")
+						continue
+					}
+					for _, ap := range paths {
+						fmt.Printf("    upload: s3://%s/%s\n", cfg.Bucket, ap.S3Key)
+						if err := objStore.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
+							return fmt.Errorf("sync cargo %s: %w", ap.Local, err)
+						}
+						totalUploaded++
+					}
 				}
 			}
 

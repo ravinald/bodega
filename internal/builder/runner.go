@@ -245,6 +245,7 @@ type dirs struct {
 	gomod    string
 	charts   string
 	npm      string
+	cargo    string
 }
 
 func buildDirs(root string) dirs {
@@ -258,6 +259,7 @@ func buildDirs(root string) dirs {
 		gomod:    filepath.Join(root, "gomod"),
 		charts:   filepath.Join(root, "charts"),
 		npm:      filepath.Join(root, "npm"),
+		cargo:    filepath.Join(root, "cargo"),
 	}
 }
 

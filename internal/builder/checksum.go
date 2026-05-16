@@ -116,3 +116,8 @@ func (c *Config) findAndUpdateNpmChecksum(store *manifest.Store, name string, ve
 func (c *Config) findAndUpdateBinaryChecksum(store *manifest.Store, name string, ve manifest.VersionEntry, cs *manifest.Checksum, verified bool) error {
 	return updateVersionChecksum(context.Background(), store, manifest.TypeBinary, name, ve, cs, verified)
 }
+
+// findAndUpdateCargoChecksum updates Checksum and ChecksumVerified on a cargo VersionEntry and saves.
+func (c *Config) findAndUpdateCargoChecksum(store *manifest.Store, name string, ve manifest.VersionEntry, cs *manifest.Checksum, verified bool) error {
+	return updateVersionChecksum(context.Background(), store, manifest.TypeCargo, name, ve, cs, verified)
+}

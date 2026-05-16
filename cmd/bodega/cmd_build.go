@@ -147,6 +147,12 @@ When a name is given after the type, only that entry is built.`,
 					allSummaries = append(allSummaries,
 						builder.FetchNpm(bcfg, store, entryFilter),
 					)
+
+				case manifest.TypeCargo:
+					// cargo has no build step; FetchCargo skips already-fetched.
+					allSummaries = append(allSummaries,
+						builder.FetchCargo(bcfg, store, entryFilter),
+					)
 				}
 			}
 
