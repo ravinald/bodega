@@ -23,3 +23,8 @@ CLAUDE.md
 # IDE
 .idea/
 .vscode/
+# BEGIN attic — managed by `attic`, do not edit between markers
+.drover.toml
+AGENTS.md
+docs-internal
+# END attic
