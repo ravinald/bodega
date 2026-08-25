@@ -97,33 +97,35 @@ The server listens on `:8080` by default. Clients configure their package manage
 
 **APT** — add to `/etc/apt/sources.list.d/bodega.list`:
 ```
-deb [trusted=yes] http://bodega-host:8080/apt/ noble main
+deb [trusted=yes] https://bodega-host:8080/apt/ noble main
 ```
+
+`[trusted=yes]` turns off apt's signature verification for this source and nothing else re-enables it. The apt repository is unsigned, so the line is required until signing lands; TLS is what authenticates the packages in the meantime, which is why the URL is `https://`.
 
 **pip**:
 ```bash
-pip install --index-url http://bodega-host:8080/pypi/simple/ boto3
+pip install --index-url https://bodega-host:8080/pypi/simple/ boto3
 ```
 
 **Go modules**:
 ```bash
-GOPROXY=http://bodega-host:8080/go go get github.com/aws/aws-sdk-go-v2@v1.30.0
+GOPROXY=https://bodega-host:8080/go go get github.com/aws/aws-sdk-go-v2@v1.30.0
 ```
 
 **Helm**:
 ```bash
-helm repo add bodega http://bodega-host:8080/helm
+helm repo add bodega https://bodega-host:8080/helm
 helm install my-release bodega/ingress-nginx
 ```
 
 **npm**:
 ```bash
-npm install --registry http://bodega-host:8080/npm lodash
+npm install --registry https://bodega-host:8080/npm lodash
 ```
 
 **Git bundles**:
 ```bash
-curl http://bodega-host:8080/git/netbox/netbox-v4.5.7.bundle -o netbox.bundle
+curl https://bodega-host:8080/git/netbox/netbox-v4.5.7.bundle -o netbox.bundle
 git clone netbox.bundle netbox
 ```
 

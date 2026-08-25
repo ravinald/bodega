@@ -562,28 +562,30 @@ Actually, the operations are more granular: fetch, build/run, sync, upload.
 
 **APT** (`/etc/apt/sources.list.d/bodega.list`):
 ```
-deb [trusted=yes] http://bodega-host:8080/apt/ noble main
+deb [trusted=yes] https://bodega-host:8080/apt/ noble main
 ```
+
+`[trusted=yes]` turns off apt's signature verification for this source and nothing else re-enables it. The apt repository is unsigned, so the line is required until signing lands; TLS is what authenticates the packages in the meantime, which is why the URL is `https://`.
 
 **pip** (per-command or `pip.conf`):
 ```bash
-pip install --index-url http://bodega-host:8080/pypi/simple/ <package>
+pip install --index-url https://bodega-host:8080/pypi/simple/ <package>
 ```
 
 **Go modules**:
 ```bash
-export GOPROXY=http://bodega-host:8080/go
+export GOPROXY=https://bodega-host:8080/go
 go get github.com/aws/aws-sdk-go-v2@v1.30.0
 ```
 
 **Helm**:
 ```bash
-helm repo add bodega http://bodega-host:8080/helm
+helm repo add bodega https://bodega-host:8080/helm
 ```
 
 **npm** (per-command or `.npmrc`):
 ```bash
-npm install --registry http://bodega-host:8080/npm <package>
+npm install --registry https://bodega-host:8080/npm <package>
 ```
 
 ### TLS
@@ -692,7 +694,7 @@ curl -X POST http://localhost:8080/api/v1/packages/gomod \
 
 **Create example (from a remote host):**
 ```bash
-curl -X POST http://bodega-host:8080/api/v1/packages/gomod \
+curl -X POST https://bodega-host:8080/api/v1/packages/gomod \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer bodega_ak_7f3a...' \
   -d '{"name": "github.com/aws/aws-sdk-go-v2", "version": "v1.30.0"}'
@@ -902,7 +904,7 @@ Press `C` to open the config form. `Ctrl+S` saves, `Ctrl+T` loads defaults, `Ctr
 
 ## Web Dashboard
 
-Access the dashboard at `http://bodega-host:8080/` when the server is running.
+Access the dashboard at `https://bodega-host:8080/` when the server is running.
 
 **Features:**
 - **Live metrics**: package counts by type, total artifact size, version statistics

@@ -107,7 +107,7 @@ func (m detailsModel) s3AndClientFields(n *TreeNode) string {
 		sb.WriteString(field("S3 path", s3URI))
 		sb.WriteByte('\n')
 	}
-	if url := clientURL(m.store, n.EntryType, n.Name); url != "" {
+	if url := clientURL(m.cfg, m.store, n.EntryType, n.Name); url != "" {
 		sb.WriteString(field("Package URL", url))
 		sb.WriteByte('\n')
 	}
@@ -310,10 +310,21 @@ func s3Path(cfg *config.Config, store *manifest.Store, entryType, name, version 
 	return ""
 }
 
+// clientScheme returns the scheme the server will actually answer on. Start
+// enables TLS only when both a cert and a key resolve; tls_autocert is
+// rejected as unimplemented, so it is not a signal here.
+func clientScheme(cfg *config.Config) string {
+	if cfg != nil && cfg.TLSCert != "" && cfg.TLSKey != "" {
+		return "https"
+	}
+	return "http"
+}
+
 // clientURL returns the URL a client would use to fetch the artifact from the bodega server.
-func clientURL(store *manifest.Store, entryType, name string) string {
+func clientURL(cfg *config.Config, store *manifest.Store, entryType, name string) string {
 	ctx := context.Background()
 	host := "<bodega-host>:8080"
+	scheme := clientScheme(cfg)
 	pm, err := store.GetPackage(ctx, entryType, name)
 	switch entryType {
 	case manifest.TypeGit:
@@ -326,7 +337,7 @@ func clientURL(store *manifest.Store, entryType, name string) string {
 			ext = ".tar.gz"
 		}
 		sn := strings.ReplaceAll(pm.Name, "/", "--")
-		return fmt.Sprintf("http://%s/git/%s/%s-%s%s", host, sn, sn, ve.Ref, ext)
+		return fmt.Sprintf("%s://%s/git/%s/%s-%s%s", scheme, host, sn, sn, ve.Ref, ext)
 	case manifest.TypeBinary:
 		if err != nil || pm == nil || len(pm.Versions) == 0 {
 			return ""
@@ -337,21 +348,21 @@ func clientURL(store *manifest.Store, entryType, name string) string {
 			parts := strings.Split(ve.URL, "/")
 			fn = parts[len(parts)-1]
 		}
-		return fmt.Sprintf("http://%s/binaries/%s/%s/%s", host, pm.Name, ve.Version, fn)
+		return fmt.Sprintf("%s://%s/binaries/%s/%s/%s", scheme, host, pm.Name, ve.Version, fn)
 	case manifest.TypeApt:
-		return fmt.Sprintf("deb [trusted=yes] http://%s/apt/ noble main", host)
+		return fmt.Sprintf("deb [trusted=yes] %s://%s/apt/ noble main", scheme, host)
 	case manifest.TypePypi:
-		return fmt.Sprintf("pip install --index-url http://%s/pypi/simple/ %s", host, name)
+		return fmt.Sprintf("pip install --index-url %s://%s/pypi/simple/ %s", scheme, host, name)
 	case manifest.TypeGomod:
-		return fmt.Sprintf("GOPROXY=http://%s/go,direct go get %s", host, name)
+		return fmt.Sprintf("GOPROXY=%s://%s/go,direct go get %s", scheme, host, name)
 	case manifest.TypeHelm:
 		if err != nil || pm == nil || len(pm.Versions) == 0 {
 			return ""
 		}
 		ve := pm.Versions[0]
-		return fmt.Sprintf("http://%s/helm/charts/%s-%s.tgz", host, pm.Name, ve.Version)
+		return fmt.Sprintf("%s://%s/helm/charts/%s-%s.tgz", scheme, host, pm.Name, ve.Version)
 	case manifest.TypeNpm:
-		return fmt.Sprintf("npm install --registry http://%s/npm/ %s", host, name)
+		return fmt.Sprintf("npm install --registry %s://%s/npm/ %s", scheme, host, name)
 	}
 	return ""
 }

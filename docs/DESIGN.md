@@ -70,13 +70,15 @@ One bucket. Versioning enabled. KMS encryption. Public access blocked.
 
 | Type | Source | Artifact | Client protocol |
 |------|--------|----------|-----------------|
-| apt | Package name, git repo, or apt-get source | .deb in Debian repo layout | `deb [trusted=yes] http://bodega/apt/ noble main` |
-| git | GitHub release tarball or bare clone | .tar.gz or .bundle | `curl http://bodega/git/<name>/<file>` |
-| pypi | Wheel build from requirements.txt | .whl files | `pip install --index-url http://bodega/pypi/simple/` |
-| binary | Direct URL download | Original file | `curl http://bodega/binaries/<name>/<ver>/<file>` |
-| gomod | GOPROXY upstream or local build | .zip, .mod, .info | `GOPROXY=http://bodega/go,direct go get <module>` |
-| helm | Chart repo or direct URL | .tgz | `helm repo add bodega http://bodega/helm` |
-| npm | Registry upstream or local | .tgz | `npm install --registry http://bodega/npm/` |
+| apt | Package name, git repo, or apt-get source | .deb in Debian repo layout | `deb [trusted=yes] https://bodega/apt/ noble main` |
+| git | GitHub release tarball or bare clone | .tar.gz or .bundle | `curl https://bodega/git/<name>/<file>` |
+| pypi | Wheel build from requirements.txt | .whl files | `pip install --index-url https://bodega/pypi/simple/` |
+| binary | Direct URL download | Original file | `curl https://bodega/binaries/<name>/<ver>/<file>` |
+| gomod | GOPROXY upstream or local build | .zip, .mod, .info | `GOPROXY=https://bodega/go,direct go get <module>` |
+| helm | Chart repo or direct URL | .tgz | `helm repo add bodega https://bodega/helm` |
+| npm | Registry upstream or local | .tgz | `npm install --registry https://bodega/npm/` |
+
+`[trusted=yes]` turns off apt's signature verification for that source. The apt repository is unsigned (`internal/server/apt.go` serves `Release` and `InRelease` from the same unsigned generator), so the flag is required until signing lands. TLS authenticates the packages in the meantime, which is why every client line above is `https://`.
 
 ## Manifest structure (config_version 1)
 
