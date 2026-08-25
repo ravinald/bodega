@@ -1,5 +1,9 @@
 version: 2
 updates:
+  # Dependabot does not touch the `toolchain` directive in go.mod, and
+  # actions/setup-go reads that directive via go-version-file. A stale pin
+  # therefore holds CI on an old Go patch no matter what check-latest says,
+  # and govulncheck starts failing on standard-library CVEs. Bump it by hand.
   - package-ecosystem: gomod
     directory: /
     schedule:
