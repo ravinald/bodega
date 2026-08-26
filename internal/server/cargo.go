@@ -96,7 +96,7 @@ func (s *Server) handleCargoIndex(w http.ResponseWriter, r *http.Request, p stri
 	upstream := strings.TrimRight(s.cfg.CargoUpstream, "/") + "/" + p
 	s3Key := "cargo/index/" + p
 	forceProxy := pm != nil && packageMode(pm) == manifest.ModeProxy
-	s.proxyOrCache(w, r, s3Key, upstream, manifest.TypeCargo, crate, crate, false, forceProxy)
+	s.proxyOrCache(w, r, s.typeStore(manifest.TypeCargo), s3Key, upstream, manifest.TypeCargo, crate, crate, false, forceProxy)
 }
 
 func (s *Server) handleCargoDownload(w http.ResponseWriter, r *http.Request, p string) {
@@ -129,7 +129,7 @@ func (s *Server) handleCargoDownload(w http.ResponseWriter, r *http.Request, p s
 	upstream := strings.TrimRight(s.cfg.CargoUpstream, "/") + "/" + crate + "/" + version + "/download"
 	s3Key := "cargo/crates/" + crate + "-" + version + ".crate"
 	forceProxy := pm == nil || packageMode(pm) == manifest.ModeProxy
-	s.proxyOrCache(w, r, s3Key, upstream, manifest.TypeCargo, crate, crate, true, forceProxy)
+	s.proxyOrCache(w, r, s.typeStore(manifest.TypeCargo), s3Key, upstream, manifest.TypeCargo, crate, crate, true, forceProxy)
 }
 
 // cargoCrateFromIndexPath validates the sparse-index path shape and returns

@@ -10,6 +10,7 @@ import (
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/server"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 func TestAttestation_HTTPSRedirect(t *testing.T) {
@@ -71,9 +72,9 @@ func attestationServer(t *testing.T, ve manifest.VersionEntry) *httptest.Server 
 	if err := store.AddVersion(context.Background(), manifest.TypeNpm, "sample", ve); err != nil {
 		t.Fatalf("AddVersion: %v", err)
 	}
-	mock := &mockStore{objects: map[string]string{}}
+	mock := memStore(map[string]string{})
 	cfg := &config.Config{Bucket: "test-bucket", Region: "us-west-2", ManifestDir: "manifests", AptCodename: "noble"}
-	srv := server.New(cfg, store, mock, ":0", nil)
+	srv := server.New(cfg, store, storage.NewSingle(mock), ":0", nil)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts

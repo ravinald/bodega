@@ -45,16 +45,20 @@ type CacheConfig struct {
 // the parsed package name separately because the candidate URL on its own
 // isn't a useful aggregation key.
 //
+// store is the backend both the cache read and the cache write use. One
+// parameter, not two lookups: that is what guarantees a miss written here is
+// found by the next request's Head.
+//
 // If proxy/cache is disabled or upstreamURL is empty, falls back to direct
 // S3 proxy.
-func (s *Server) proxyOrCache(w http.ResponseWriter, r *http.Request, s3Key, upstreamURL, regType, policyCandidate, discoveryPkgName string, immutable, forceProxy bool) {
-	if !s.requireS3(w) {
+func (s *Server) proxyOrCache(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, s3Key, upstreamURL, regType, policyCandidate, discoveryPkgName string, immutable, forceProxy bool) {
+	if !s.requireStorage(w, store) {
 		return
 	}
 
 	ctx := r.Context()
 
-	status, err := s.objects.Head(ctx, s3Key)
+	status, err := store.Head(ctx, s3Key)
 	if err != nil {
 		s.logger.Error("s3 head check failed", "key", s3Key, "error", err)
 		// Fall through to upstream fetch if proxy enabled.
@@ -66,7 +70,7 @@ func (s *Server) proxyOrCache(w http.ResponseWriter, r *http.Request, s3Key, ups
 	if status != nil && status.Exists {
 		if immutable || !s.isCacheStale(status) {
 			s.logger.Debug("cache hit", "key", s3Key, "immutable", immutable)
-			s.proxyS3(w, r, s3Key)
+			s.proxyS3(w, r, store, s3Key)
 			return
 		}
 		s.logger.Debug("cache stale", "key", s3Key)
@@ -76,7 +80,7 @@ func (s *Server) proxyOrCache(w http.ResponseWriter, r *http.Request, s3Key, ups
 	if (!s.cacheEnabled() && !forceProxy) || upstreamURL == "" {
 		if status != nil && status.Exists {
 			// Stale but no upstream — serve what we have.
-			s.proxyS3(w, r, s3Key)
+			s.proxyS3(w, r, store, s3Key)
 			return
 		}
 		http.NotFound(w, r)
@@ -140,7 +144,7 @@ func (s *Server) proxyOrCache(w http.ResponseWriter, r *http.Request, s3Key, ups
 		s.logger.Error("upstream fetch failed", "url", upstreamURL, "error", err)
 		// If we have a stale copy, serve it.
 		if status != nil && status.Exists {
-			s.proxyS3(w, r, s3Key)
+			s.proxyS3(w, r, store, s3Key)
 			return
 		}
 		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
@@ -155,8 +159,11 @@ func (s *Server) proxyOrCache(w http.ResponseWriter, r *http.Request, s3Key, ups
 	}
 
 	// Cache to storage (best-effort — don't fail the response if caching fails).
-	if s.objects != nil {
-		if err := s.objects.Put(ctx, s3Key, data); err != nil {
+	// The read above and this write take the same store parameter: resolving
+	// them separately is how a cache entry lands in a backend the next Head
+	// never looks at.
+	if store != nil {
+		if err := store.Put(ctx, s3Key, data); err != nil {
 			s.logger.Warn("failed to cache object", "key", s3Key, "error", err)
 		} else {
 			s.logger.Debug("cached object", "key", s3Key, "bytes", len(data))

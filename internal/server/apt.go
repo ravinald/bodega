@@ -15,6 +15,7 @@ import (
 	"net/http"
 
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 // ---- APT repository (dynamic index generation) ----------------------------
@@ -26,9 +27,9 @@ func (s *Server) handleAptPool(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
 	}
-	key := "packages/apt/pool/" + p
+	key := aptPoolPrefix + p
 	setCacheImmutable(w, path.Base(p))
-	s.proxyS3(w, r, key)
+	s.proxyS3(w, r, s.typeStore(manifest.TypeApt), key)
 }
 
 // handleAptDists routes /apt/dists/{distpath...} to the appropriate handler
@@ -373,12 +374,38 @@ func capForLog(items []string) string {
 	return strings.Join(items, " ")
 }
 
-// aptPoolKeys returns all S3 keys under the apt pool prefix.
+// aptPoolPrefix is where uploads write .deb files. dists/ is generated per
+// request and never stored, so the pool is the only apt prefix with objects.
+const aptPoolPrefix = "packages/apt/pool/"
+
+// aptPoolListing is one cached pool listing and the moment it was taken.
+type aptPoolListing struct {
+	keys []string
+	at   time.Time
+}
+
+// aptPoolKeys returns every pooled key, cached for metadata_ttl.
+//
+// The listing is unbounded and the whole pool is walked, so without a cache
+// every apt-touching API write pays for a full listing and every configured
+// backend multiplies it. Staleness is bounded and cheap: entries carry
+// _pool_path, so this listing only resolves entries written before that
+// existed, whose objects were uploaded long before the window opened. SIGHUP
+// clears the cache for the operator who needs it gone sooner.
 func (s *Server) aptPoolKeys(ctx context.Context) ([]string, error) {
-	if s.objects == nil {
+	if s.stores == nil {
 		return nil, nil
 	}
-	return s.objects.List(ctx, "packages/apt/pool/")
+	ttl := s.cache.MetadataTTL
+	if cached := s.aptPool.Load(); cached != nil && ttl > 0 && time.Since(cached.at) < ttl {
+		return cached.keys, nil
+	}
+	keys, err := s.listFanout(ctx, manifest.TypeApt, aptPoolPrefix)
+	if err != nil {
+		return nil, err
+	}
+	s.aptPool.Store(&aptPoolListing{keys: keys, at: time.Now()})
+	return keys, nil
 }
 
 // aptArchitectures returns sorted unique architectures from the apt manifest
@@ -616,10 +643,17 @@ func isSafePath(p string) bool {
 	return p != ""
 }
 
-// requireS3 returns true if S3 is available. If not, it writes a 503 and returns false.
-func (s *Server) requireS3(w http.ResponseWriter) bool {
-	if s.objects == nil {
-		http.Error(w, "S3 backend not configured — package serving unavailable", http.StatusServiceUnavailable)
+// requireStorage returns true when a backend is available to serve from. If
+// not, it writes a 503 and returns false.
+//
+// The message names no driver on purpose: the old wording claimed S3 on a
+// local install whose storage_path simply could not be created, which sent
+// operators looking for a bucket the config never asked for. The reason the
+// backend is missing is known where it was constructed, so the message points
+// at the startup log rather than guessing.
+func (s *Server) requireStorage(w http.ResponseWriter, store storage.ObjectStore) bool {
+	if s.stores == nil || store == nil {
+		http.Error(w, "storage backend unavailable — package serving disabled; see the server startup log for the backend error", http.StatusServiceUnavailable)
 		return false
 	}
 	return true

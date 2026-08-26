@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,7 +57,7 @@ var contentTypes = map[string]string{
 type Server struct {
 	cfg          *config.Config
 	store        *manifest.Store
-	objects      storage.ObjectStore
+	stores       storage.Resolver
 	mux          *http.ServeMux
 	addr         string
 	logger       *slog.Logger
@@ -74,6 +75,12 @@ type Server struct {
 	// aptSnap is the generated apt index. Held whole so Release and the
 	// Packages bodies it digests are always served from one generation.
 	aptSnap atomic.Pointer[aptSnapshot]
+
+	// aptPool caches the pool listing behind metadata_ttl. Every apt-touching
+	// API write rebuilds the snapshot and the rebuild lists the whole pool, so
+	// a burst of writes paid for a full listing each — multiplied by the
+	// number of backends once the listing fans out.
+	aptPool atomic.Pointer[aptPoolListing]
 }
 
 // SetQuiet suppresses the human-facing stderr startup banner. Log-level
@@ -81,23 +88,23 @@ type Server struct {
 func (s *Server) SetQuiet(q bool) { s.quiet = q }
 
 // New constructs a Server and registers all routes.
-// s3client may be nil — S3-backed endpoints return 503 in that case.
+// stores may be nil — package-serving endpoints return 503 in that case.
 // logger may be nil — a no-op logger is used in that case.
-func New(cfg *config.Config, store *manifest.Store, objects storage.ObjectStore, addr string, logger *slog.Logger) *Server {
-	return newServer(cfg, store, objects, addr, logger)
+func New(cfg *config.Config, store *manifest.Store, stores storage.Resolver, addr string, logger *slog.Logger) *Server {
+	return newServer(cfg, store, stores, addr, logger)
 }
 
-func newServer(cfg *config.Config, store *manifest.Store, objects storage.ObjectStore, addr string, logger *slog.Logger) *Server {
+func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolver, addr string, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	s := &Server{
-		cfg:     cfg,
-		store:   store,
-		objects: objects,
-		mux:     http.NewServeMux(),
-		addr:    addr,
-		logger:  logger,
+		cfg:    cfg,
+		store:  store,
+		stores: stores,
+		mux:    http.NewServeMux(),
+		addr:   addr,
+		logger: logger,
 	}
 	// Wire proxy/cache config.
 	ttl, _ := time.ParseDuration(cfg.MetadataTTL)
@@ -307,6 +314,10 @@ func (s *Server) Start(ctx context.Context) error {
 			if err := s.store.LoadIndex(context.Background()); err != nil {
 				s.logger.Error("reload failed", "error", err)
 			} else {
+				// SIGHUP is the operator's "I changed things underneath you"
+				// lever, so it has to clear the pool cache too; otherwise a
+				// reload that looks successful still serves the old listing.
+				s.aptPool.Store(nil)
 				s.rebuildAptSnapshot(context.Background())
 				s.logger.Info("manifests reloaded")
 			}
@@ -596,9 +607,9 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	if s.objects == nil {
+	if s.stores == nil {
 		resp.Healthy = false
-		resp.Error = "s3 client not configured"
+		resp.Error = "storage backend not configured"
 		writeJSON(w, http.StatusServiceUnavailable, resp)
 		return
 	}
@@ -606,8 +617,7 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 	// Probe the apt pool. dists/ is generated per request and never stored,
 	// so it cannot answer whether the object store holds anything; the pool is
 	// what upload writes, and its prefix names no codename.
-	const aptPoolPrefix = "packages/apt/pool/"
-	keys, err := s.objects.List(r.Context(), aptPoolPrefix)
+	keys, err := s.listFanout(r.Context(), manifest.TypeApt, aptPoolPrefix)
 	if err != nil {
 		resp.Healthy = false
 		resp.Error = "object store probe failed"
@@ -1196,16 +1206,67 @@ func parseTokenExpiry(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("expected duration (30d, 1y), date (2027-01-01), or 'never'")
 }
 
+// ---- Storage resolution ----------------------------------------------------
+
+// typeStore returns the backend for regenerable, type-scoped objects:
+// generated indexes, proxy-cache entries, attestation blobs and artifacts
+// whose handler holds no manifest entry. Returns nil when no storage backend
+// was configured, which every caller reports as 503 via requireStorage.
+func (s *Server) typeStore(typ string) storage.ObjectStore {
+	if s.stores == nil {
+		return nil
+	}
+	return s.stores.ForType(typ)
+}
+
+// listFanout unions List across every backend a read of typ may reach.
+//
+// One backend failing fails the whole call. A partial index is worse than an
+// error: a client cannot tell a short PEP 503 or Packages list from packages
+// having been withdrawn, and acts on the difference.
+//
+// The union is sorted because each backend returns lexical order and the merge
+// of two sorted lists is not sorted. Packages.gz is gzipped per request, so an
+// unstable order changes the bytes and every client refetches.
+func (s *Server) listFanout(ctx context.Context, typ, prefix string) ([]string, error) {
+	if s.stores == nil {
+		return nil, nil
+	}
+	seen := map[string]struct{}{}
+	var keys []string
+	for _, ns := range s.stores.Fanout(ctx, typ) {
+		got, err := ns.Store.List(ctx, prefix)
+		if err != nil {
+			return nil, fmt.Errorf("list %q on storage backend %q: %w", prefix, ns.Name, err)
+		}
+		for _, k := range got {
+			if _, dup := seen[k]; dup {
+				continue
+			}
+			seen[k] = struct{}{}
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	return keys, nil
+}
+
 // ---- S3 proxy core ---------------------------------------------------------
 
-// proxyS3 streams an S3 object to the HTTP response.
-// It sets Content-Type from the file extension and Content-Length from S3 metadata.
-// Returns 404 when the key does not exist in S3.
-func (s *Server) proxyS3(w http.ResponseWriter, r *http.Request, s3Key string) {
-	if !s.requireS3(w) {
+// proxyS3 streams an object to the HTTP response from the given backend.
+// It sets Content-Type from the file extension and Content-Length from the
+// store's metadata. Returns 404 when the key does not exist.
+//
+// The backend is a parameter rather than something resolved in here from
+// s3Key: a key carries the artifact's type but not its package or version, and
+// placement is recorded per version, so the key cannot answer which backend
+// holds it. Callers that hold a manifest entry resolve by its recorded name;
+// callers serving regenerable, type-scoped objects pass typeStore.
+func (s *Server) proxyS3(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, s3Key string) {
+	if !s.requireStorage(w, store) {
 		return
 	}
-	result, err := s.objects.GetStream(r.Context(), s3Key)
+	result, err := store.GetStream(r.Context(), s3Key)
 	if err != nil {
 		s.logger.Error("s3 proxy error", "key", s3Key, "error", err)
 		http.Error(w, "upstream error", http.StatusBadGateway)

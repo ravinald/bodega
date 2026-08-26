@@ -5,19 +5,18 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/ravinald/bodega/internal/config"
 	bos3 "github.com/ravinald/bodega/internal/s3"
 )
 
 func init() {
-	Register("s3", newS3FromConfig)
+	Register("s3", newS3FromSpec)
 }
 
-func newS3FromConfig(ctx context.Context, cfg *config.Config) (ObjectStore, error) {
-	if cfg.Bucket == "" {
+func newS3FromSpec(ctx context.Context, spec Spec) (ObjectStore, error) {
+	if spec.Bucket == "" {
 		return nil, fmt.Errorf("s3 backend requires a bucket (set bucket in config or REPO_BUCKET env)")
 	}
-	client, err := bos3.NewClient(ctx, cfg.Bucket, cfg.Region)
+	client, err := bos3.NewClient(ctx, spec.Bucket, spec.Region)
 	if err != nil {
 		return nil, fmt.Errorf("create S3 client: %w", err)
 	}
