@@ -70,13 +70,13 @@ bodega build upload git            # fetch, build, and upload git only
 bodega build upload git netbox
 ```
 
-### `bodega status [TYPE...]`
+### `bodega build status [TYPE...]`
 
-Compares each manifest entry against S3 and prints a table showing whether each artifact is present.
+Compares each manifest entry against S3 and prints a table showing whether each artifact is present. S3-only: it walks the bucket with a direct S3 client, and refuses on the `local` backend rather than asking for a bucket the config never set. `bodega status` is a different command — the repository dashboard.
 
 ```bash
-bodega status                      # check all types
-bodega status apt pypi             # check apt and pypi only
+bodega build status                # check all types
+bodega build status apt pypi       # check apt and pypi only
 ```
 
 ### `bodega pkg verify`
@@ -393,8 +393,10 @@ Config files are written with mode `0600` (owner read/write only).
 
 bodega supports two storage backends:
 
-- **`local`** (default): Stores artifacts on the local filesystem. Set `storage_path` to change the root directory (default: `/var/lib/bodega`). No initialization needed.
+- **`local`** (default): Stores artifacts on the local filesystem. Set `storage_path` to change the root directory (default: `/var/lib/bodega`). No initialization needed, and no bucket: every command that touches storage runs without one.
 - **`s3`**: Stores artifacts in an S3 bucket. Set `bucket` and `region`, then run `bodega init` to create the bucket with encryption and versioning.
+
+Manifests follow the backend. On `s3` they live under the `manifests/` prefix in the bucket; on `local` they live in `manifest_dir` on disk, which is also what `--local-config` selects against any backend.
 
 ### Per-type build roots
 
@@ -408,7 +410,7 @@ The audit DB path defaults to `{log_dir}/audit.db`. The database is created auto
 
 ## Manifest Structure
 
-Each package is stored as a JSON file at `s3://{bucket}/manifests/{type}/{safeName}/manifest.json` with a `PackageManifest` wrapper:
+Each package is stored as a JSON file at `{manifest_dir}/{type}/{safeName}/manifest.json` on the `local` backend, or `s3://{bucket}/manifests/{type}/{safeName}/manifest.json` on `s3`, with a `PackageManifest` wrapper:
 
 ```json
 {

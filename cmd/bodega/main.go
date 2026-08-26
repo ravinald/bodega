@@ -52,10 +52,14 @@ func main() {
 	} else if path != "" {
 		fc, _ := os.ReadFile(path)
 		if len(fc) > 0 {
+			// A bucket is only missing when the config asked for S3. On the
+			// default local backend this nagged every command to configure
+			// storage it will never use.
 			var check struct {
-				Bucket string `json:"bucket"`
+				Bucket         string `json:"bucket"`
+				StorageBackend string `json:"storage_backend"`
 			}
-			if json.Unmarshal(fc, &check) == nil && check.Bucket == "" {
+			if json.Unmarshal(fc, &check) == nil && check.Bucket == "" && check.StorageBackend == "s3" {
 				_, _ = fmt.Fprintf(os.Stderr, "Config file created: %s\n", path)
 				_, _ = fmt.Fprintf(os.Stderr, "Edit it to set your bucket and region.\n\n")
 			}
@@ -206,8 +210,28 @@ func loadConfig(gf *globalFlags) (*config.Config, error) {
 	return cfg, nil
 }
 
+// usesLocalManifests reports whether manifests are read and written straight
+// from the filesystem rather than through the object store. Both the mutation
+// preflight and the store loader must answer this the same way: when they
+// disagree, a local install passes preflight and then fails asking for a
+// bucket it never configured. --local-config forces it on whatever the
+// configured backend is.
+func usesLocalManifests(cfg *config.Config) bool {
+	return cfg.LocalConfig || cfg.StorageBackend == "" || cfg.StorageBackend == "local"
+}
+
+// storageBackendName returns the effective backend name, applying the same
+// empty-means-local default that storage.New applies.
+func storageBackendName(cfg *config.Config) string {
+	if cfg.StorageBackend == "" {
+		return "local"
+	}
+	return cfg.StorageBackend
+}
+
 // loadStore returns a manifest Store loaded from the appropriate backend
-// (S3 by default, local filesystem with --local-config).
+// (the local filesystem on a local install or with --local-config, the
+// configured object store otherwise).
 func loadStore(gf *globalFlags) (*manifest.Store, error) {
 	cfg, err := loadConfig(gf)
 	if err != nil {
@@ -217,13 +241,9 @@ func loadStore(gf *globalFlags) (*manifest.Store, error) {
 	ctx := backgroundCtx()
 
 	var store *manifest.Store
-	if cfg.LocalConfig {
+	if usesLocalManifests(cfg) {
 		store = manifest.NewLocalStore(cfg.ManifestDir)
 	} else {
-		// Object storage backend — need bucket for S3
-		if err := requireBucket(cfg); err != nil {
-			return nil, err
-		}
 		objStore, err := newObjStore(cfg)
 		if err != nil {
 			return nil, err
@@ -234,7 +254,7 @@ func loadStore(gf *globalFlags) (*manifest.Store, error) {
 			PutFn:    objStore.Put,
 			DeleteFn: objStore.Delete,
 			ListFn:   objStore.List,
-			Label_:   fmt.Sprintf("s3://%s/manifests/", cfg.Bucket),
+			Label_:   objStore.Label() + "/manifests/",
 		}
 		store = manifest.NewStore(backend)
 	}
@@ -292,7 +312,7 @@ func notifyServer(gf *globalFlags) {
 func requireBucket(cfg *config.Config) error {
 	if cfg.Bucket == "" {
 		return fmt.Errorf(
-			"S3 bucket is required: set --bucket, the BOOTSTRAP_BUCKET env var, or add \"bucket\" to config.json",
+			"S3 bucket is required: set --bucket, the REPO_BUCKET env var, or add \"bucket\" to config.json",
 		)
 	}
 	return nil

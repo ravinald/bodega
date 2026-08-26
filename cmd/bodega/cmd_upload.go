@@ -40,9 +40,6 @@ If no types are given all four are uploaded.`,
 			if err != nil {
 				return err
 			}
-			if err := requireBucket(cfg); err != nil {
-				return err
-			}
 
 			store, err := loadStore(gf)
 			if err != nil {
@@ -79,7 +76,7 @@ If no types are given all four are uploaded.`,
 					// Upload per-entry to the versioned S3 path.
 					paths := builder.BinaryArtifactPaths(bcfg, store, "")
 					for _, ap := range paths {
-						fmt.Printf("    upload: s3://%s/%s\n", cfg.Bucket, ap.S3Key)
+						fmt.Printf("    upload: %s/%s\n", objStore.Label(), ap.S3Key)
 						if err := objStore.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
 							return fmt.Errorf("upload binary %s: %w", ap.Local, err)
 						}
@@ -100,7 +97,7 @@ If no types are given all four are uploaded.`,
 					if err != nil {
 						return fmt.Errorf("upload git: %w", err)
 					}
-					fmt.Printf("    Uploaded %d file(s) to s3://%s/repos/\n", n, cfg.Bucket)
+					fmt.Printf("    Uploaded %d file(s) to %s/repos/\n", n, objStore.Label())
 					totalUploaded += n
 
 				case manifest.TypeApt:
@@ -117,7 +114,7 @@ If no types are given all four are uploaded.`,
 					if err != nil {
 						return fmt.Errorf("upload apt: %w", err)
 					}
-					fmt.Printf("    Uploaded %d file(s) to s3://%s/packages/apt/\n", n, cfg.Bucket)
+					fmt.Printf("    Uploaded %d file(s) to %s/packages/apt/\n", n, objStore.Label())
 					totalUploaded += n
 
 				case manifest.TypePypi:
@@ -134,7 +131,7 @@ If no types are given all four are uploaded.`,
 					if err != nil {
 						return fmt.Errorf("upload pypi: %w", err)
 					}
-					fmt.Printf("    Uploaded %d file(s) to s3://%s/%s\n", n, cfg.Bucket, s3Prefix)
+					fmt.Printf("    Uploaded %d file(s) to %s/%s\n", n, objStore.Label(), s3Prefix)
 					totalUploaded += n
 
 				case manifest.TypeGomod:
@@ -148,7 +145,7 @@ If no types are given all four are uploaded.`,
 						continue
 					}
 					for _, ap := range paths {
-						fmt.Printf("    upload: s3://%s/%s\n", cfg.Bucket, ap.S3Key)
+						fmt.Printf("    upload: %s/%s\n", objStore.Label(), ap.S3Key)
 						if err := objStore.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
 							return fmt.Errorf("upload gomod %s: %w", ap.Local, err)
 						}
@@ -166,7 +163,7 @@ If no types are given all four are uploaded.`,
 						continue
 					}
 					for _, ap := range paths {
-						fmt.Printf("    upload: s3://%s/%s\n", cfg.Bucket, ap.S3Key)
+						fmt.Printf("    upload: %s/%s\n", objStore.Label(), ap.S3Key)
 						if err := objStore.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
 							return fmt.Errorf("upload helm %s: %w", ap.Local, err)
 						}
@@ -184,7 +181,7 @@ If no types are given all four are uploaded.`,
 						continue
 					}
 					for _, ap := range paths {
-						fmt.Printf("    upload: s3://%s/%s\n", cfg.Bucket, ap.S3Key)
+						fmt.Printf("    upload: %s/%s\n", objStore.Label(), ap.S3Key)
 						if err := objStore.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
 							return fmt.Errorf("upload npm %s: %w", ap.Local, err)
 						}
@@ -204,7 +201,7 @@ If no types are given all four are uploaded.`,
 						continue
 					}
 					for _, ap := range paths {
-						fmt.Printf("    upload: s3://%s/%s\n", cfg.Bucket, ap.S3Key)
+						fmt.Printf("    upload: %s/%s\n", objStore.Label(), ap.S3Key)
 						if err := objStore.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
 							return fmt.Errorf("upload cargo %s: %w", ap.Local, err)
 						}

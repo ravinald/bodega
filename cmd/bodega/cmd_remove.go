@@ -27,9 +27,6 @@ file is not modified.`,
 			if err != nil {
 				return err
 			}
-			if err := requireBucket(cfg); err != nil {
-				return err
-			}
 
 			store, err := loadStore(gf)
 			if err != nil {
@@ -46,7 +43,7 @@ file is not modified.`,
 				return fmt.Errorf("connect to storage: %w", err)
 			}
 
-			fmt.Printf("Deleting s3://%s/%s ...\n", cfg.Bucket, key)
+			fmt.Printf("Deleting %s/%s ...\n", objStore.Label(), key)
 			if err := objStore.Delete(ctx, key); err != nil {
 				return err
 			}

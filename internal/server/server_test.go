@@ -781,3 +781,103 @@ func TestS3ProxyContentLength(t *testing.T) {
 		t.Errorf("Content-Length = %d, want > 0", resp.ContentLength)
 	}
 }
+
+// ---- Real local backend ----------------------------------------------------
+
+// newLocalBackedServer builds a Server over storage.Local on a temp dir. The
+// rest of the suite runs against mockStore; this one exercises the backend
+// that actually ships as the default, so the filesystem's own semantics
+// (prefix listing, streamed reads, missing-key handling) are in the path.
+func newLocalBackedServer(t *testing.T) *httptest.Server {
+	t.Helper()
+
+	store := manifest.NewLocalStore(t.TempDir())
+	ctx := t.Context()
+	_ = store.AddVersion(ctx, manifest.TypeApt, "amazon-efs-utils", manifest.VersionEntry{
+		Version:      "2.4.2",
+		SourceName:   "amazon-efs-utils",
+		ArtifactSize: 16,
+		Metadata: map[string]string{
+			"Architecture": "amd64",
+			"Section":      "utils",
+			"Priority":     "optional",
+		},
+		Description: "Amazon EFS mount helper",
+	})
+	_ = store.AddVersion(ctx, manifest.TypePypi, "boto3", manifest.VersionEntry{})
+
+	objects := storage.NewLocal(t.TempDir())
+	seed := map[string]string{
+		"packages/apt/gpg-key.asc": "-----BEGIN PGP PUBLIC KEY BLOCK-----\ntest\n",
+		"packages/apt/pool/main/a/amazon-efs-utils/amazon-efs-utils_2.4.2_amd64.deb": "\x00deb-content-efs",
+		"pypi/wheels/boto3-1.35.0-py3-none-any.whl":                                  "fake-wheel-boto3",
+	}
+	for key, body := range seed {
+		if err := objects.Put(ctx, key, []byte(body)); err != nil {
+			t.Fatalf("seed %s: %v", key, err)
+		}
+	}
+
+	cfg := &config.Config{
+		StorageBackend: "local",
+		ManifestDir:    "manifests",
+		AptCodename:    "noble",
+	}
+	srv := server.New(cfg, store, objects, ":0", nil)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+func TestServeOverLocalBackend(t *testing.T) {
+	ts := newLocalBackedServer(t)
+
+	get := func(path string) (*http.Response, string) {
+		t.Helper()
+		resp, err := http.Get(ts.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp, string(body)
+	}
+
+	// Streamed read straight off the filesystem.
+	deb := "/apt/pool/main/a/amazon-efs-utils/amazon-efs-utils_2.4.2_amd64.deb"
+	resp, body := get(deb)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("GET %s status = %d, want 200", deb, resp.StatusCode)
+	}
+	if body != "\x00deb-content-efs" {
+		t.Errorf("deb body = %q, want the seeded bytes", body)
+	}
+	if got, want := resp.Header.Get("Content-Length"), "16"; got != want {
+		t.Errorf("Content-Length = %q, want %q", got, want)
+	}
+
+	// A missing key is a 404, not a 502 — Local returns (nil, nil).
+	if resp, _ := get("/apt/pool/main/a/amazon-efs-utils/nope_9.9.9_amd64.deb"); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("missing deb status = %d, want 404", resp.StatusCode)
+	}
+
+	// Index generation walks the pool prefix on disk.
+	resp, packages := get("/apt/dists/noble/main/binary-amd64/Packages")
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("GET Packages status = %d, want 200", resp.StatusCode)
+	}
+	for _, want := range []string{"Package: amazon-efs-utils", "Version: 2.4.2", "Filename: pool/main/a/amazon-efs-utils/amazon-efs-utils_2.4.2_amd64.deb"} {
+		if !strings.Contains(packages, want) {
+			t.Errorf("Packages missing %q:\n%s", want, packages)
+		}
+	}
+
+	// PEP 503 index derives package names from a prefix list.
+	resp, index := get("/pypi/simple/")
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("GET /pypi/simple/ status = %d, want 200", resp.StatusCode)
+	}
+	if !strings.Contains(index, ">boto3<") {
+		t.Errorf("pypi index missing boto3:\n%s", index)
+	}
+}
