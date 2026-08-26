@@ -20,73 +20,22 @@ import (
 	"github.com/ravinald/bodega/internal/storage"
 )
 
-// mockStore implements storage.ObjectStore for testing.
-type mockStore struct {
-	objects    map[string]string
-	prefixKeys map[string][]string
-}
-
-func (m *mockStore) Get(_ context.Context, key string) ([]byte, error) {
-	data, ok := m.objects[key]
-	if !ok {
-		return nil, nil
+// memStore returns an in-memory ObjectStore seeded with the given objects.
+// storage.Memory is the real implementation the storage conformance suite
+// runs against, so a defect it papers over would fail there first — which the
+// hand-rolled mock this replaced did not: its Head reported a non-nil
+// ObjectInfo on every path and its PutFile stored an empty string, so any
+// assertion on uploaded bytes passed without reading them.
+func memStore(objects map[string]string) *storage.Memory {
+	m := storage.NewMemory()
+	for k, v := range objects {
+		m.Seed(k, v)
 	}
-	return []byte(data), nil
+	return m
 }
 
-func (m *mockStore) GetStream(_ context.Context, key string) (*storage.StreamResult, error) {
-	data, ok := m.objects[key]
-	if !ok {
-		return nil, nil
-	}
-	return &storage.StreamResult{
-		Body:          io.NopCloser(strings.NewReader(data)),
-		ContentLength: int64(len(data)),
-		ETag:          "abc123",
-	}, nil
-}
-
-func (m *mockStore) Head(_ context.Context, key string) (*storage.ObjectInfo, error) {
-	data, ok := m.objects[key]
-	return &storage.ObjectInfo{Key: key, Exists: ok, Size: int64(len(data))}, nil
-}
-
-func (m *mockStore) List(_ context.Context, prefix string) ([]string, error) {
-	if keys, ok := m.prefixKeys[prefix]; ok {
-		return keys, nil
-	}
-	var result []string
-	for k := range m.objects {
-		if strings.HasPrefix(k, prefix) {
-			result = append(result, k)
-		}
-	}
-	return result, nil
-}
-
-func (m *mockStore) Put(_ context.Context, key string, data []byte) error {
-	m.objects[key] = string(data)
-	return nil
-}
-
-func (m *mockStore) PutFile(_ context.Context, _, key string) error {
-	m.objects[key] = ""
-	return nil
-}
-
-func (m *mockStore) Delete(_ context.Context, key string) error {
-	delete(m.objects, key)
-	return nil
-}
-
-func (m *mockStore) SyncDir(_ context.Context, _ io.Writer, _, _ string) (int, error) {
-	return 0, nil
-}
-
-func (m *mockStore) Label() string { return "mock://" }
-
-// newTestServer builds a Server with canned manifests and a mock S3 client.
-func newTestServer(t *testing.T) (*httptest.Server, *mockStore) {
+// newTestServer builds a Server with canned manifests and an in-memory store.
+func newTestServer(t *testing.T) (*httptest.Server, *storage.Memory) {
 	t.Helper()
 
 	store := manifest.NewLocalStore(t.TempDir())
@@ -127,16 +76,14 @@ func newTestServer(t *testing.T) (*httptest.Server, *mockStore) {
 		URL:     "https://example.com/awscli.zip",
 	})
 
-	mock := &mockStore{
-		objects: map[string]string{
-			"packages/apt/pool/main/a/amazon-efs-utils/amazon-efs-utils_2.4.2_amd64.deb": "\x00deb-content-efs",
-			"packages/apt/pool/main/l/linux-headers/linux-headers_5.15.0_arm64.deb":      "\x00deb-content-linux",
-			"pypi/wheels/boto3-1.35.0-py3-none-any.whl":                                  "fake-wheel-boto3",
-			"pypi/wheels/django-5.0.0-py3-none-any.whl":                                  "fake-wheel-django",
-			"repos/netbox/netbox-v4.5.5.bundle":                                          "fake-bundle",
-			"binaries/awscli-v2/2.0.0/awscli.zip":                                        "fake-binary",
-		},
-	}
+	mock := memStore(map[string]string{
+		"packages/apt/pool/main/a/amazon-efs-utils/amazon-efs-utils_2.4.2_amd64.deb": "\x00deb-content-efs",
+		"packages/apt/pool/main/l/linux-headers/linux-headers_5.15.0_arm64.deb":      "\x00deb-content-linux",
+		"pypi/wheels/boto3-1.35.0-py3-none-any.whl":                                  "fake-wheel-boto3",
+		"pypi/wheels/django-5.0.0-py3-none-any.whl":                                  "fake-wheel-django",
+		"repos/netbox/netbox-v4.5.5.bundle":                                          "fake-bundle",
+		"binaries/awscli-v2/2.0.0/awscli.zip":                                        "fake-binary",
+	})
 
 	cfg := &config.Config{
 		Bucket:      "test-bucket",
@@ -145,7 +92,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *mockStore) {
 		AptCodename: "noble",
 	}
 
-	srv := server.New(cfg, store, mock, ":0", nil)
+	srv := server.New(cfg, store, storage.NewSingle(mock), ":0", nil)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, mock
@@ -328,13 +275,11 @@ func TestAptPackagesMultiLineDescription(t *testing.T) {
 			"Description":  "GNU Bourne Again SHell\nLong paragraph one.\n\nLong paragraph two.",
 		},
 	})
-	mock := &mockStore{
-		objects: map[string]string{
-			"packages/apt/pool/main/b/bash/bash_5.2.21_amd64.deb": "fake",
-		},
-	}
+	mock := memStore(map[string]string{
+		"packages/apt/pool/main/b/bash/bash_5.2.21_amd64.deb": "fake",
+	})
 	cfg := &config.Config{Bucket: "test", Region: "us-west-2", ManifestDir: "manifests", AptCodename: "noble"}
-	srv := server.New(cfg, store, mock, ":0", nil)
+	srv := server.New(cfg, store, storage.NewSingle(mock), ":0", nil)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
@@ -367,13 +312,11 @@ func TestAptPackagesCanonicalFieldExtras(t *testing.T) {
 			"Python-Version": ">= 3.10",
 		},
 	})
-	mock := &mockStore{
-		objects: map[string]string{
-			"packages/apt/pool/main/o/odd-pkg/odd-pkg_1.0_amd64.deb": "fake",
-		},
-	}
+	mock := memStore(map[string]string{
+		"packages/apt/pool/main/o/odd-pkg/odd-pkg_1.0_amd64.deb": "fake",
+	})
 	cfg := &config.Config{Bucket: "test", Region: "us-west-2", ManifestDir: "manifests", AptCodename: "noble"}
-	srv := server.New(cfg, store, mock, ":0", nil)
+	srv := server.New(cfg, store, storage.NewSingle(mock), ":0", nil)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
@@ -405,13 +348,11 @@ func TestAptPackagesFieldInjection(t *testing.T) {
 		},
 		Description: "test package",
 	})
-	mock := &mockStore{
-		objects: map[string]string{
-			"packages/apt/pool/main/e/evil-pkg/evil-pkg_1.0_amd64.deb": "fake",
-		},
-	}
+	mock := memStore(map[string]string{
+		"packages/apt/pool/main/e/evil-pkg/evil-pkg_1.0_amd64.deb": "fake",
+	})
 	cfg := &config.Config{Bucket: "test", Region: "us-west-2", ManifestDir: "manifests", AptCodename: "noble"}
-	srv := server.New(cfg, store, mock, ":0", nil)
+	srv := server.New(cfg, store, storage.NewSingle(mock), ":0", nil)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
@@ -776,7 +717,7 @@ func TestS3ProxyStreamsLargeBody(t *testing.T) {
 	// Verify the proxy streams rather than buffers by serving a non-trivial body.
 	ts, mock := newTestServer(t)
 	large := strings.Repeat("x", 1<<20) // 1 MiB
-	mock.objects["packages/apt/pool/main/t/test-large/test-large_1.0_amd64.deb"] = large
+	mock.Seed("packages/apt/pool/main/t/test-large/test-large_1.0_amd64.deb", large)
 
 	resp, err := http.Get(ts.URL + "/apt/pool/main/t/test-large/test-large_1.0_amd64.deb")
 	if err != nil {
@@ -808,7 +749,7 @@ func TestS3ProxyContentLength(t *testing.T) {
 // ---- Real local backend ----------------------------------------------------
 
 // newLocalBackedServer builds a Server over storage.Local on a temp dir. The
-// rest of the suite runs against mockStore; this one exercises the backend
+// rest of the suite runs against storage.Memory; this one exercises the backend
 // that actually ships as the default, so the filesystem's own semantics
 // (prefix listing, streamed reads, missing-key handling) are in the path.
 func newLocalBackedServer(t *testing.T) *httptest.Server {
@@ -845,7 +786,7 @@ func newLocalBackedServer(t *testing.T) *httptest.Server {
 		ManifestDir:    "manifests",
 		AptCodename:    "noble",
 	}
-	srv := server.New(cfg, store, objects, ":0", nil)
+	srv := server.New(cfg, store, storage.NewSingle(objects), ":0", nil)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts
@@ -947,13 +888,13 @@ func newMultiSuiteServer(t *testing.T) *httptest.Server {
 		Metadata: map[string]string{"Architecture": "riscv64"},
 	})
 
-	mock := &mockStore{objects: map[string]string{
+	mock := memStore(map[string]string{
 		"packages/apt/pool/main/h/hello/hello_2.10-noble1_amd64.deb":                 "\x00deb",
 		"packages/apt/pool/main/h/hello/hello_2.10-jammy1_amd64.deb":                 "\x00deb",
 		"packages/apt/pool/main/b/bodega-config/bodega-config_1.0.0_all.deb":         "\x00deb",
 		"packages/apt/pool/main/l/legacy-tool/legacy-tool_0.9.0_amd64.deb":           "\x00deb",
 		"packages/apt/pool/main/n/noble-only-kmod/noble-only-kmod_1.2.3_riscv64.deb": "\x00deb",
-	}}
+	})
 
 	cfg := &config.Config{
 		Bucket:      "test-bucket",
@@ -962,7 +903,7 @@ func newMultiSuiteServer(t *testing.T) *httptest.Server {
 		AptCodename: "noble",
 		AptSuites:   []string{"noble", "jammy"},
 	}
-	ts := httptest.NewServer(server.New(cfg, store, mock, ":0", nil).Handler())
+	ts := httptest.NewServer(server.New(cfg, store, storage.NewSingle(mock), ":0", nil).Handler())
 	t.Cleanup(ts.Close)
 	return ts
 }
@@ -1096,9 +1037,9 @@ func newSnapshotServer(t *testing.T) (*httptest.Server, *manifest.Store) {
 		t.Fatalf("AddVersion hello: %v", err)
 	}
 
-	mock := &mockStore{objects: map[string]string{
+	mock := memStore(map[string]string{
 		"packages/apt/pool/main/h/hello/hello_2.10-3build1_amd64.deb": "\x00deb",
-	}}
+	})
 	cfg := &config.Config{
 		Bucket:          "test-bucket",
 		Region:          "us-west-2",
@@ -1106,7 +1047,7 @@ func newSnapshotServer(t *testing.T) (*httptest.Server, *manifest.Store) {
 		AptCodename:     "noble",
 		AdminPermitCIDR: []string{"127.0.0.0/8", "::1/128"},
 	}
-	ts := httptest.NewServer(server.New(cfg, store, mock, ":0", nil).Handler())
+	ts := httptest.NewServer(server.New(cfg, store, storage.NewSingle(mock), ":0", nil).Handler())
 	t.Cleanup(ts.Close)
 	return ts, store
 }
@@ -1271,8 +1212,8 @@ func TestAptVersionlessEntryNotPublished(t *testing.T) {
 	}
 
 	cfg := &config.Config{Bucket: "b", Region: "r", ManifestDir: "manifests", AptCodename: "noble"}
-	mock := &mockStore{objects: map[string]string{}}
-	ts := httptest.NewServer(server.New(cfg, store, mock, ":0", nil).Handler())
+	mock := memStore(map[string]string{})
+	ts := httptest.NewServer(server.New(cfg, store, storage.NewSingle(mock), ":0", nil).Handler())
 	t.Cleanup(ts.Close)
 
 	_, packages := aptGet(t, ts, "/apt/dists/noble/main/binary-amd64/Packages")
@@ -1309,7 +1250,7 @@ func TestAptStanzaFieldsAreNotDuplicated(t *testing.T) {
 	}
 
 	cfg := &config.Config{Bucket: "b", Region: "r", ManifestDir: "manifests", AptCodename: "noble"}
-	ts := httptest.NewServer(server.New(cfg, store, &mockStore{objects: map[string]string{}}, ":0", nil).Handler())
+	ts := httptest.NewServer(server.New(cfg, store, storage.NewSingle(memStore(map[string]string{})), ":0", nil).Handler())
 	t.Cleanup(ts.Close)
 
 	_, packages := aptGet(t, ts, "/apt/dists/noble/main/binary-amd64/Packages")

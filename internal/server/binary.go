@@ -2,6 +2,8 @@ package server
 
 import (
 	"net/http"
+
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // ---- Binaries --------------------------------------------------------------
@@ -14,5 +16,5 @@ func (s *Server) handleBinary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := "binaries/" + p
-	s.proxyS3(w, r, key)
+	s.proxyS3(w, r, s.typeStore(manifest.TypeBinary), key)
 }

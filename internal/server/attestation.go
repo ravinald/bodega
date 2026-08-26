@@ -66,7 +66,7 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 		// We don't cross-bucket-fetch; the bodega host's configured bucket is
 		// the only storage we know how to read. Ignore the bucket prefix and
 		// serve from our own objects using the key remainder.
-		s.proxyS3(w, r, rest[slash+1:])
+		s.proxyS3(w, r, s.typeStore(t), rest[slash+1:])
 	default:
 		http.Error(w, "unsupported attestation_uri scheme", http.StatusBadGateway)
 	}

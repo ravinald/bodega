@@ -11,16 +11,14 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-
-	"github.com/ravinald/bodega/internal/config"
 )
 
 func init() {
-	Register("local", newLocalFromConfig)
+	Register("local", newLocalFromSpec)
 }
 
-func newLocalFromConfig(_ context.Context, cfg *config.Config) (ObjectStore, error) {
-	root := cfg.StoragePath
+func newLocalFromSpec(_ context.Context, spec Spec) (ObjectStore, error) {
+	root := spec.Path
 	if root == "" {
 		root = "/var/lib/bodega"
 	}
@@ -123,13 +121,16 @@ func (l *Local) List(_ context.Context, prefix string) ([]string, error) {
 	}
 	var keys []string
 
-	// If the prefix path doesn't exist, return empty.
-	if _, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) {
-		// The prefix might be a partial directory name. Walk the parent.
+	// A prefix that does not end in a separator is a string prefix, not a
+	// directory: "packages/ap" has to match "packages/apt/..." even when
+	// "packages/ap/" also exists as a directory of its own. Walking the parent
+	// and filtering is a superset of the correct answer in every case, since
+	// any key starting with the prefix lives under the prefix's parent.
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		dir = filepath.Dir(dir)
-		if _, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) {
-			return nil, nil
-		}
+	}
+	if _, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
 	}
 
 	err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {

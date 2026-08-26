@@ -11,7 +11,7 @@ import (
 // ---- Helm chart repository -------------------------------------------------
 
 func (s *Server) handleHelmIndex(w http.ResponseWriter, r *http.Request) {
-	s.proxyS3(w, r, "charts/index.yaml")
+	s.proxyS3(w, r, s.typeStore(manifest.TypeHelm), "charts/index.yaml")
 }
 
 func (s *Server) handleHelmChart(w http.ResponseWriter, r *http.Request) {
@@ -32,10 +32,10 @@ func (s *Server) handleHelmChart(w http.ResponseWriter, r *http.Request) {
 		for _, ve := range pm.Versions {
 			if ve.URL != "" {
 				upstream := strings.TrimSuffix(ve.URL, "/") + "/" + file
-				s.proxyOrCache(w, r, key, upstream, manifest.TypeHelm, upstream, chartName, true, true)
+				s.proxyOrCache(w, r, s.typeStore(manifest.TypeHelm), key, upstream, manifest.TypeHelm, upstream, chartName, true, true)
 				return
 			}
 		}
 	}
-	s.proxyS3(w, r, key)
+	s.proxyS3(w, r, s.typeStore(manifest.TypeHelm), key)
 }

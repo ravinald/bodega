@@ -48,10 +48,10 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 
 		if pm != nil && packageMode(pm) == manifest.ModeProxy {
 			upstream := s.cfg.NpmUpstream + "/" + pkgName + "/-/" + tarball
-			s.proxyOrCache(w, r, storageKey, upstream, manifest.TypeNpm, pkgName, pkgName, true, true)
+			s.proxyOrCache(w, r, s.typeStore(manifest.TypeNpm), storageKey, upstream, manifest.TypeNpm, pkgName, pkgName, true, true)
 			return
 		}
-		s.proxyS3(w, r, storageKey)
+		s.proxyS3(w, r, s.typeStore(manifest.TypeNpm), storageKey)
 		return
 	}
 
@@ -76,7 +76,7 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 	upstream := s.cfg.NpmUpstream + "/" + pkgName
 	s3Key := "npm/" + npmSafeName(pkgName) + "/packument.json"
 	forceProxy := pm != nil && packageMode(pm) == manifest.ModeProxy
-	s.proxyOrCache(w, r, s3Key, upstream, manifest.TypeNpm, pkgName, pkgName, false, forceProxy)
+	s.proxyOrCache(w, r, s.typeStore(manifest.TypeNpm), s3Key, upstream, manifest.TypeNpm, pkgName, pkgName, false, forceProxy)
 }
 
 // npmSafeName: "@scope/pkg" → "@scope--pkg". Matches internal/builder.safeName

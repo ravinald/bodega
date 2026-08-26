@@ -93,19 +93,24 @@ output continues to respect log_level in the config.`,
 
 			// Object storage is optional. Without it, API endpoints still work
 			// but package proxying returns 503.
-			var objects storage.ObjectStore
+			//
+			// Logged at Error, not Warn: the shipped default log_level maps to
+			// slog.LevelError, so a Warn here printed nothing and the whole
+			// observable symptom was "server is up, apt gets 503, logs empty".
+			var stores storage.Resolver
 			ctx := backgroundCtx()
 			obj, err := storage.New(ctx, cfg)
 			if err != nil {
-				logger.Warn("storage backend not available — package serving disabled", "error", err)
+				logger.Error("storage backend unavailable — package routes will answer 503; the API and /healthz still serve",
+					"backend", storageBackendName(cfg), "config", config.ConfigPath(), "error", err)
 			} else {
-				objects = obj
+				stores = storage.NewSingle(obj)
 			}
 
 			// Resolve listen address: flag → env → config file → default.
 			resolvedAddr := cfg.ResolveListenAddr(addr)
 
-			srv := server.New(cfg, store, objects, resolvedAddr, logger)
+			srv := server.New(cfg, store, stores, resolvedAddr, logger)
 			srv.SetQuiet(quiet)
 
 			// Graceful shutdown on SIGTERM/SIGINT.

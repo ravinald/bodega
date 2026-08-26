@@ -1,12 +1,17 @@
 // Package storage defines the ObjectStore interface for pluggable object
 // storage backends. The default backend is the local filesystem; S3 is
 // available when configured. GCS and Azure can be added via build tags.
+//
+// This package must never import internal/manifest. Placement is recorded in
+// the manifest and resolved by internal/server, which owns both imports; see
+// Resolver in resolver.go for the split.
 package storage
 
 import (
 	"context"
 	"fmt"
 	"io"
+	"sort"
 	"time"
 
 	"github.com/ravinald/bodega/internal/config"
@@ -67,31 +72,60 @@ type ObjectInfo struct {
 	ETag         string
 }
 
-// Constructor is a function that creates an ObjectStore from config.
-type Constructor func(ctx context.Context, cfg *config.Config) (ObjectStore, error)
-
-// backends is the registry of available storage backends.
-var backends = map[string]Constructor{}
-
-// Register adds a named backend constructor. Called from init() in each
-// backend implementation file.
-func Register(name string, fn Constructor) {
-	backends[name] = fn
+// Spec is the resolved parameter set for one backend. Each backend reads only
+// the fields its driver uses; a backend that reached into the global config
+// could not be instantiated twice with different parameters, which is what
+// naming backends requires.
+type Spec struct {
+	Driver string // "local" | "s3"
+	Path   string // local: filesystem root
+	Bucket string // s3
+	Region string // s3
 }
 
-// New creates an ObjectStore based on the configured storage backend.
-func New(ctx context.Context, cfg *config.Config) (ObjectStore, error) {
-	name := cfg.StorageBackend
-	if name == "" {
-		name = "local"
+// Constructor creates an ObjectStore from one backend's Spec.
+type Constructor func(ctx context.Context, spec Spec) (ObjectStore, error)
+
+// backends is the registry of available storage backends, keyed by driver.
+var backends = map[string]Constructor{}
+
+// Register adds a driver constructor. Called from init() in each backend
+// implementation file.
+func Register(driver string, fn Constructor) {
+	backends[driver] = fn
+}
+
+// NewFromSpec creates an ObjectStore for the driver named in spec.
+func NewFromSpec(ctx context.Context, spec Spec) (ObjectStore, error) {
+	driver := spec.Driver
+	if driver == "" {
+		driver = "local"
 	}
-	fn, ok := backends[name]
+	fn, ok := backends[driver]
 	if !ok {
 		available := make([]string, 0, len(backends))
 		for k := range backends {
 			available = append(available, k)
 		}
-		return nil, fmt.Errorf("unknown storage backend %q (available: %v)", name, available)
+		sort.Strings(available)
+		return nil, fmt.Errorf("unknown storage backend %q (available: %v)", driver, available)
 	}
-	return fn(ctx, cfg)
+	return fn(ctx, spec)
+}
+
+// SpecFromConfig derives the default backend's Spec from the global config.
+// The global storage_backend / storage_path / bucket / region keys describe
+// exactly one backend, whose reserved name is DefaultName.
+func SpecFromConfig(cfg *config.Config) Spec {
+	return Spec{
+		Driver: cfg.StorageBackend,
+		Path:   cfg.StoragePath,
+		Bucket: cfg.Bucket,
+		Region: cfg.Region,
+	}
+}
+
+// New creates the default ObjectStore described by the global config.
+func New(ctx context.Context, cfg *config.Config) (ObjectStore, error) {
+	return NewFromSpec(ctx, SpecFromConfig(cfg))
 }

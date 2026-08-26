@@ -2,6 +2,8 @@ package server
 
 import (
 	"net/http"
+
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // ---- Git bundles -----------------------------------------------------------
@@ -16,5 +18,5 @@ func (s *Server) handleGitBundle(w http.ResponseWriter, r *http.Request) {
 	}
 	key := "repos/" + name + "/" + file
 	setCacheImmutable(w, file)
-	s.proxyS3(w, r, key)
+	s.proxyS3(w, r, s.typeStore(manifest.TypeGit), key)
 }
