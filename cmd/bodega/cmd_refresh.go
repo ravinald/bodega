@@ -51,7 +51,14 @@ New versions are created as manifest records but not fetched until you run
 
 			_ = cfg // for future use
 
-			return refreshEntries(store, typeFilter, nameFilter, force)
+			created, err := refreshEntries(store, typeFilter, nameFilter, force)
+			if err != nil {
+				return err
+			}
+			if created > 0 {
+				notifyServer(gf)
+			}
+			return nil
 		},
 	}
 
@@ -59,7 +66,9 @@ New versions are created as manifest records but not fetched until you run
 	return cmd
 }
 
-func refreshEntries(store *manifest.Store, typeFilter, nameFilter string, force bool) error {
+// refreshEntries returns how many version records it created, so the caller
+// can decide whether the running server has anything to reload.
+func refreshEntries(store *manifest.Store, typeFilter, nameFilter string, force bool) (int, error) {
 	ctx := context.Background()
 	total := 0
 	created := 0
@@ -110,7 +119,7 @@ func refreshEntries(store *manifest.Store, typeFilter, nameFilter string, force 
 		}
 		if pypiCreated > 0 {
 			if err := store.SaveIndex(ctx); err != nil {
-				return fmt.Errorf("save pypi: %w", err)
+				return created, fmt.Errorf("save pypi: %w", err)
 			}
 		}
 		created += pypiCreated
@@ -162,7 +171,7 @@ func refreshEntries(store *manifest.Store, typeFilter, nameFilter string, force 
 		}
 		if gomodCreated > 0 {
 			if err := store.SaveIndex(ctx); err != nil {
-				return fmt.Errorf("save gomod: %w", err)
+				return created, fmt.Errorf("save gomod: %w", err)
 			}
 		}
 		created += gomodCreated
@@ -214,7 +223,7 @@ func refreshEntries(store *manifest.Store, typeFilter, nameFilter string, force 
 		}
 		if npmCreated > 0 {
 			if err := store.SaveIndex(ctx); err != nil {
-				return fmt.Errorf("save npm: %w", err)
+				return created, fmt.Errorf("save npm: %w", err)
 			}
 		}
 		created += npmCreated
@@ -269,12 +278,12 @@ func refreshEntries(store *manifest.Store, typeFilter, nameFilter string, force 
 		}
 		if helmCreated > 0 {
 			if err := store.SaveIndex(ctx); err != nil {
-				return fmt.Errorf("save helm: %w", err)
+				return created, fmt.Errorf("save helm: %w", err)
 			}
 		}
 		created += helmCreated
 	}
 
 	fmt.Printf("\nRefresh complete: %d versions discovered, %d new records created.\n", total, created)
-	return nil
+	return created, nil
 }

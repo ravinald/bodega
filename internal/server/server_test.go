@@ -149,27 +149,6 @@ func TestAptReleaseWrongCodename(t *testing.T) {
 	}
 }
 
-// TestAptSignedDocumentsAbsent pins the unsigned contract. apt fetches
-// InRelease first and falls back to Release on 404, so 404 is what lets an
-// unsigned repository work; a 200 carrying unsigned bytes is a malformed
-// document at a well-known URL. gpg-key.asc went with them; there is no key.
-func TestAptSignedDocumentsAbsent(t *testing.T) {
-	ts, _ := newTestServer(t)
-	for _, path := range []string{
-		"/apt/dists/noble/InRelease",
-		"/apt/dists/noble/Release.gpg",
-		"/apt/gpg-key.asc",
-	} {
-		if status, _ := aptGet(t, ts, path); status != http.StatusNotFound {
-			t.Errorf("GET %s status = %d, want 404 while the repository is unsigned", path, status)
-		}
-	}
-	// The fallback only helps if Release itself is there.
-	if status, _ := aptGet(t, ts, "/apt/dists/noble/Release"); status != http.StatusOK {
-		t.Errorf("GET /apt/dists/noble/Release status = %d, want 200", status)
-	}
-}
-
 func TestAptNotFound(t *testing.T) {
 	ts, _ := newTestServer(t)
 	resp, err := http.Get(ts.URL + "/apt/dists/noble/nonexistent")

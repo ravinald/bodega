@@ -104,7 +104,7 @@ type Resolver interface {
 	Placement(typ, policy string) Decision
 
 	// ForType returns the backend for objects that carry no recorded name:
-	// generated indexes, the GPG key, proxy-cache entries and attestation
+	// generated indexes, proxy-cache entries and attestation
 	// blobs. Safe only because every one of them is regenerable.
 	ForType(typ string) ObjectStore
 

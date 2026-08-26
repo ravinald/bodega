@@ -26,6 +26,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ravinald/bodega/internal/aptsign"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -71,6 +72,18 @@ type Server struct {
 	pepper       string       // pepper for token hash verification
 	quiet        bool         // suppress stderr startup banner (slog output unaffected)
 	mu           sync.Mutex   // protects store mutations (CRUD API)
+
+	// signer signs the apt index on every rebuild. nil when no key is
+	// installed, which is a supported configuration: signed and unsigned
+	// coexist at the same URLs, and the signature is metadata a client opts
+	// into checking.
+	signer aptsign.Signer
+	// aptPubArmored and aptKeyring are the served forms of the loaded public
+	// key, rendered once at startup. Serving them from memory rather than
+	// from storage means the key clients fetch is by construction the key
+	// the running process signs with.
+	aptPubArmored []byte
+	aptKeyring    []byte
 
 	// aptSnap is the generated apt index. Held whole so Release and the
 	// Packages bodies it digests are always served from one generation.
@@ -167,6 +180,7 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 	if s.discoverMode != "" && s.auditDB != nil {
 		s.discovery = NewDiscoveryRecorder(s.auditDB, logger)
 	}
+	s.loadAptSigner()
 	s.registerRoutes()
 
 	// Build the first apt index here rather than in Start, so a Server can
@@ -380,10 +394,13 @@ func (s *Server) registerRoutes() {
 	// APT repository: generated index, served from a snapshot.
 	// dists/{distpath...} carries Release, InRelease and Release.gpg;
 	// handleAptDists splits them, since ServeMux has no mid-segment wildcard
-	// for binary-{arch}. No gpg-key.asc route: the repository is unsigned and
-	// there is no key to serve.
+	// for binary-{arch}. The keyring routes serve the loaded signing key and
+	// 404 when there is none; .gpg is the dearmored form signed-by= wants, so
+	// a client needs no gpg binary to consume it.
 	m.HandleFunc("GET /apt/dists/{distpath...}", s.handleAptDists)
 	m.HandleFunc("GET /apt/pool/{path...}", s.handleAptPool)
+	m.HandleFunc("GET /apt/bodega-archive-keyring.gpg", s.handleAptKeyring)
+	m.HandleFunc("GET /apt/bodega-archive-keyring.asc", s.handleAptPublicKey)
 
 	// PyPI simple index (PEP 503)
 	m.HandleFunc("GET /pypi/simple/", s.handlePypiIndex)
@@ -833,10 +850,18 @@ func (s *Server) handleDeleteEntry(w http.ResponseWriter, r *http.Request) {
 // which is the same stale-index defect the snapshot was introduced to fix,
 // only slower. Other package types have no generated index to go stale, and
 // the rebuild lists the pool, so it is not free.
-func (s *Server) rebuildAptIndexAfterWrite(ctx context.Context, t string) {
+//
+// The request context is deliberately dropped. The write has already
+// committed by this point, so a client that hangs up mid-response would
+// otherwise cancel the pool listing and leave the index describing the state
+// before its own write — a 201 that is honest about the write and silent
+// about the index. The startup and SIGHUP paths detach for the same reason.
+func (s *Server) rebuildAptIndexAfterWrite(_ context.Context, t string) {
 	if t != manifest.TypeApt {
 		return
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), aptRebuildTimeout)
+	defer cancel()
 	s.rebuildAptSnapshot(ctx)
 }
 
@@ -1239,8 +1264,8 @@ func (s *Server) typeStore(typ string) storage.ObjectStore {
 // see the contract on manifest.VersionEntry.Storage.
 //
 // A request whose manifest entry does not exist is not an error. Generated
-// indexes, the GPG key, proxy-cache entries and attestation blobs carry no
-// version to record a name against, and every one of them is regenerable, so
+// indexes, proxy-cache entries and attestation blobs carry no version to
+// record a name against, and every one of them is regenerable, so
 // the type rule is safe for them at both read and write.
 func (s *Server) versionStore(ctx context.Context, typ, pkg, version string) (storage.ObjectStore, error) {
 	if s.stores == nil {

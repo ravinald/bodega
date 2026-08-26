@@ -33,17 +33,30 @@ func newServeCmd(gf *globalFlags) *cobra.Command {
 
 Clients can use the server as follows:
 
-  apt:  deb [trusted=yes] https://bodega-host:8080/apt/ <suite> main
+  apt:  /etc/apt/sources.list.d/bodega.sources, deb822 form:
+          Types: deb
+          URIs: https://bodega-host:8080/apt/
+          Suites: <suite>
+          Components: main
+          Signed-By: /etc/apt/keyrings/bodega-archive-keyring.gpg
   pip:  pip install --index-url https://bodega-host:8080/pypi/simple/ <package>
   git:  curl https://bodega-host:8080/git/<name>/<name>-<ref>.bundle -o <name>.bundle
 
 <suite> is any entry in the config's apt_suites list (default: the single value
-of apt_codename, "noble"). One sources line per suite; the pool is shared.
+of apt_codename, "noble"). Several suites go on one Suites: line; the pool is
+shared.
 
-[trusted=yes] turns off apt's signature verification for that source, which the
-apt repository requires because it is unsigned. TLS is what authenticates the
-packages until the repository is signed, so serve over https and keep the
-sources line on https.
+Fetch the keyring from /apt/bodega-archive-keyring.gpg, which serves the
+dearmored form Signed-By takes directly. That first fetch is authenticated by
+TLS alone, so compare the fingerprint against "bodega apt key show".
+
+With no signing key installed the repository is served unsigned and a client
+needs "deb [trusted=yes] https://bodega-host:8080/apt/ <suite> main" instead,
+which turns off verification for that source permanently. TLS is then the only
+thing authenticating the packages, so serve over https either way.
+
+Run "bodega apt key generate" to sign. Signed and unsigned coexist at the same
+URLs, so adding a key breaks no existing client.
 
 The server also exposes a REST API at /api/v1/ for manifest inspection and
 health checking.

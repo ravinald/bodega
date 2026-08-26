@@ -46,6 +46,7 @@ file is not modified.`,
 				return err
 			}
 			fmt.Println("Deleted.")
+			notifyServer(gf)
 			return nil
 		},
 	}
