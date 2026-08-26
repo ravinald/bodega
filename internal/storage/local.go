@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/ravinald/bodega/internal/config"
 )
 
 func init() {
@@ -21,7 +23,7 @@ func init() {
 func newLocalFromSpec(_ context.Context, spec Spec) (ObjectStore, error) {
 	root := spec.Path
 	if root == "" {
-		root = "/var/lib/bodega"
+		root = config.DefaultStoragePath
 	}
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, fmt.Errorf("create storage root %s: %w", root, err)

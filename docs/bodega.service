@@ -31,8 +31,8 @@ User=bodega
 Group=bodega
 
 # Without this, relative paths resolve against / — which ProtectSystem=strict
-# makes read-only. A relative manifests/ directory then reads as empty and the
-# server publishes a valid index over no packages, with nothing in the journal.
+# makes read-only. bodega's own manifest_dir default is absolute, so this only
+# guards a relative path an operator writes into config.json by hand.
 WorkingDirectory=/var/lib/bodega
 
 ExecStart=/usr/local/bin/bodega serve

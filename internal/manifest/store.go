@@ -74,6 +74,11 @@ func (s *Store) resolveBackend() Backend {
 	return &LocalBackend{Dir: s.baseDir}
 }
 
+// Label names the place this store reads and writes: a directory on the local
+// backend, a bucket prefix on S3. Callers use it to name the source in an
+// error or a startup log rather than reconstructing it from config.
+func (s *Store) Label() string { return s.resolveBackend().Label() }
+
 // ---- Index ---------------------------------------------------------------
 
 // LoadIndex fetches and deserialises index.json from the backend.
