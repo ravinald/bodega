@@ -17,6 +17,8 @@ import (
 )
 
 func newCreateCmd(gf *globalFlags) *cobra.Command {
+	var storagePolicy string
+
 	cmd := &cobra.Command{
 		Use:   "create <type> [name]",
 		Short: "Add a new entry to a manifest",
@@ -29,7 +31,8 @@ Examples:
   bodega pkg create git netbox
   bodega pkg create apt python3
   bodega pkg create gomod github.com/aws/aws-sdk-go-v2
-  bodega pkg create binary                              # fully interactive`,
+  bodega pkg create binary                              # fully interactive
+  bodega pkg create git netbox --storage archive        # pin this package's writes`,
 		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			t := args[0]
@@ -47,6 +50,11 @@ Examples:
 			}
 			if err := ensureMutable(cfg); err != nil {
 				return err
+			}
+			// Before any prompt: a bad backend name discovered after eight
+			// interactive answers costs the operator all eight.
+			if err := checkBackendName(cfg, storagePolicy); err != nil {
+				return fmt.Errorf("--storage: %w", err)
 			}
 
 			store, err := loadStore(gf)
@@ -121,6 +129,9 @@ Examples:
 			if err := store.AddVersion(ctx, t, name, ve); err != nil {
 				return fmt.Errorf("add version: %w", err)
 			}
+			if err := setStoragePolicy(ctx, store, t, name, storagePolicy); err != nil {
+				return err
+			}
 			if err := store.SaveIndex(ctx); err != nil {
 				return fmt.Errorf("save index: %w", err)
 			}
@@ -170,7 +181,33 @@ Examples:
 		},
 	}
 
+	cmd.Flags().StringVar(&storagePolicy, "storage", "",
+		"Advanced: name the backend this package's future versions are written to, overriding storage_by_type")
 	return cmd
+}
+
+// setStoragePolicy records a --storage name on the package just created.
+//
+// It is a flag and never a prompt. create already walks an eight-branch switch
+// of ecosystem questions, and this one is answered "whatever the type rule
+// says" by all but a handful of packages. 'bodega pkg edit' opens the whole
+// manifest, so the field is reachable interactively without a ninth question.
+func setStoragePolicy(ctx context.Context, store *manifest.Store, t, name, policy string) error {
+	if policy == "" {
+		return nil
+	}
+	pm, err := store.GetPackage(ctx, t, name)
+	if err != nil {
+		return fmt.Errorf("record storage policy for %s/%s: %w", t, name, err)
+	}
+	if pm == nil {
+		return fmt.Errorf("record storage policy for %s/%s: entry vanished after create", t, name)
+	}
+	pm.StoragePolicy = policy
+	if err := store.SavePackage(ctx, pm); err != nil {
+		return fmt.Errorf("record storage policy for %s/%s: %w", t, name, err)
+	}
+	return nil
 }
 
 // confirmPolicyOverride runs the upstream allow-list on the entry that was just

@@ -67,7 +67,7 @@ func (p *placer) forVersion(ctx context.Context, typ, pkg, version, key string) 
 	// that predates it. The manifest is written before the bytes either way,
 	// so the record and the newest copy always agree.
 	recorded := pm.Versions[i].Storage
-	name := p.stores.Placement(typ, pkg)
+	name := p.stores.Placement(typ, pm.StoragePolicy).Name
 	if recorded != "" && !p.replace {
 		name = recorded
 	}
@@ -84,8 +84,14 @@ func (p *placer) forVersion(ctx context.Context, typ, pkg, version, key string) 
 // fan out over, so a rule changed between two runs would strand half a tree in
 // the old backend with nothing to find it again. Refuse instead, naming the
 // versions that would need moving.
+//
+// A per-package storage_policy is deliberately not consulted here. SyncDir
+// uploads one directory to one prefix, so honoring a policy for some packages
+// of the type and not others would split the tree exactly the way the refusal
+// below exists to prevent. Packages of these types that must live elsewhere
+// are moved with 'bodega pkg move'.
 func (p *placer) forType(ctx context.Context, typ string) (storage.ObjectStore, error) {
-	name := p.stores.Placement(typ, "")
+	name := p.stores.Placement(typ, "").Name
 
 	var stranded []string
 	for _, pkg := range p.store.ListPackages(typ) {

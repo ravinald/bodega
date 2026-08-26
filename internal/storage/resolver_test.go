@@ -44,13 +44,9 @@ func TestSingleResolverUnknownNameErrors(t *testing.T) {
 
 func TestSingleResolverPlacementIsAlwaysDefault(t *testing.T) {
 	r := NewSingle(NewMemory())
-	for _, tc := range []struct{ typ, pkg string }{
-		{"apt", "acme"},
-		{"pypi", "boto3"},
-		{"", ""},
-	} {
-		if got := r.Placement(tc.typ, tc.pkg); got != DefaultName {
-			t.Fatalf("Placement(%q, %q) = %q, want %q", tc.typ, tc.pkg, got, DefaultName)
+	for _, typ := range []string{"apt", "pypi", ""} {
+		if got := r.Placement(typ, ""); got.Name != DefaultName || got.Level != LevelDefault {
+			t.Fatalf("Placement(%q) = %+v, want %q at LevelDefault", typ, got, DefaultName)
 		}
 	}
 }
@@ -63,7 +59,7 @@ func TestSingleResolverFanoutAndAll(t *testing.T) {
 		name string
 		got  []NamedStore
 	}{
-		{"Fanout", r.Fanout(t.Context(), "apt")},
+		{"Fanout", r.Fanout(t.Context(), "apt", nil)},
 		{"All", r.All()},
 	} {
 		if len(tc.got) != 1 {

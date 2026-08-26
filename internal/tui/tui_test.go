@@ -8,8 +8,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/inventory"
 	"github.com/ravinald/bodega/internal/manifest"
-	"github.com/ravinald/bodega/internal/s3"
 )
 
 // --- splitArgs ---
@@ -110,11 +110,11 @@ func TestBuildTree(t *testing.T) {
 	_ = store.AddVersion(ctx, manifest.TypePypi, "requests", manifest.VersionEntry{Version: "2.28.0"})
 	_ = store.AddVersion(ctx, manifest.TypeBinary, "tool-c", manifest.VersionEntry{URL: "https://example.com/tool-c"})
 
-	statuses := []s3.EntryStatus{
-		{Type: manifest.TypeApt, Name: "pkg-a@1.0", InS3: true},
-		{Type: manifest.TypeGit, Name: "repo-b@main", InS3: false},
-		{Type: manifest.TypePypi, Name: "wheels", InS3: true},
-		{Type: manifest.TypeBinary, Name: "tool-c", InS3: false},
+	statuses := []inventory.EntryStatus{
+		{Type: manifest.TypeApt, Name: "pkg-a@1.0", Present: true},
+		{Type: manifest.TypeGit, Name: "repo-b@main", Present: false},
+		{Type: manifest.TypePypi, Name: "wheels", Present: true},
+		{Type: manifest.TypeBinary, Name: "tool-c", Present: false},
 	}
 
 	roots := BuildTree(store, statuses)

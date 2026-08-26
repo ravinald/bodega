@@ -5,6 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/ravinald/bodega/internal/storage"
 	"github.com/ravinald/bodega/internal/tui"
 )
 
@@ -42,15 +43,23 @@ Press ? for keybinding help, q to quit.`,
 				defer auditDB.Close()
 			}
 
+			// The status pane resolves each entry to the backend its manifest
+			// records, so it works on a local-only install; the S3 client above
+			// stays for the commands that genuinely need a bucket.
+			stores, err := storage.NewResolver(backgroundCtx(), cfg)
+			if err != nil {
+				return fmt.Errorf("connect to storage: %w", err)
+			}
+
 			if cfg.Bucket == "" {
-				return tui.Run(cfg, store, nil, auditDB)
+				return tui.Run(cfg, store, nil, stores, auditDB)
 			}
 
 			s3client, err := newS3Client(cfg)
 			if err != nil {
 				return fmt.Errorf("connect to AWS: %w", err)
 			}
-			return tui.Run(cfg, store, s3client, auditDB)
+			return tui.Run(cfg, store, s3client, stores, auditDB)
 		},
 	}
 }

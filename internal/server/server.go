@@ -1293,7 +1293,7 @@ func (s *Server) listFanout(ctx context.Context, typ, prefix string) ([]string, 
 	}
 	seen := map[string]struct{}{}
 	var keys []string
-	for _, ns := range s.stores.Fanout(ctx, typ) {
+	for _, ns := range s.stores.Fanout(ctx, typ, s.recordedBackends(ctx, typ)) {
 		got, err := ns.Store.List(ctx, prefix)
 		if err != nil {
 			return nil, fmt.Errorf("list %q on storage backend %q: %w", prefix, ns.Name, err)
@@ -1308,6 +1308,40 @@ func (s *Server) listFanout(ctx context.Context, typ, prefix string) ([]string, 
 	}
 	sort.Strings(keys)
 	return keys, nil
+}
+
+// recordedBackends returns every backend name the manifests hold for this
+// type: the name on each version entry, plus each package's storage_policy for
+// the versions it has not been applied to yet.
+//
+// The fan-out needs this because config cannot answer it. A package moved with
+// 'bodega pkg move', or placed by its own policy, sits on a backend no
+// storage_by_type key for its type names, and an index built without it would
+// be short by exactly that package.
+func (s *Server) recordedBackends(ctx context.Context, typ string) []string {
+	seen := map[string]struct{}{}
+	var names []string
+	add := func(name string) {
+		if name == "" {
+			return
+		}
+		if _, dup := seen[name]; dup {
+			return
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	for _, pkg := range s.store.ListPackages(typ) {
+		pm, err := s.store.GetPackage(ctx, typ, pkg)
+		if err != nil || pm == nil {
+			continue
+		}
+		add(pm.StoragePolicy)
+		for _, ve := range pm.Versions {
+			add(ve.Storage)
+		}
+	}
+	return names
 }
 
 // ---- S3 proxy core ---------------------------------------------------------

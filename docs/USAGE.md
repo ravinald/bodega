@@ -72,7 +72,11 @@ bodega build upload git netbox
 
 ### `bodega build status [TYPE...]`
 
-Compares each manifest entry against S3 and prints a table showing whether each artifact is present. S3-only: it walks the bucket with a direct S3 client, and refuses on the `local` backend rather than asking for a bucket the config never set. `bodega status` is a different command — the repository dashboard.
+Probes each manifest entry against the backend its version entry records, and prints a table showing whether each artifact is present. Every configured backend is reachable, `local` and `s3` alike, and the `BACKEND` column names the one each row was probed on.
+
+A backend that fails to answer marks its own rows `ERROR`, prints the failure under them, and exits non-zero; rows belonging to backends that did answer still print. That is the opposite of the package indexes, deliberately: an index fails the whole request because a short index is indistinguishable from packages having been withdrawn, while a diagnostic exists to say which backend is broken.
+
+`bodega status` is a different command — the repository dashboard.
 
 ```bash
 bodega build status                # check all types
@@ -168,7 +172,10 @@ bodega pkg create git netbox                  # prompts for url and ref
 bodega pkg create apt python3                 # prompts for apt-specific fields
 bodega pkg create gomod github.com/aws/aws-sdk-go-v2   # prompts for version
 bodega pkg create apt                         # fully interactive (prompts for name too)
+bodega pkg create git netbox --storage archive   # pin this package's writes
 ```
+
+`--storage` sets `storage_policy` on the new package and is never prompted for. Almost every package answers it "whatever the type rule says", and `bodega pkg edit` opens the whole manifest, so the field is reachable interactively without a ninth question in an already-long form. An unknown backend name is rejected before the first prompt.
 
 ### `bodega pkg delete <type> <name> [--remove-from-s3]`
 
@@ -218,6 +225,44 @@ bodega pkg export apt python3 > python3.json   # save to file
 ```
 
 A single package is output as a JSON object. Multiple packages are output as a JSON array.
+
+### `bodega pkg storage <type> <name>`
+
+Resolves the placement hierarchy for one package and names the level that decided it.
+
+```bash
+$ bodega pkg storage git linux
+git/linux  -> bulk     (package policy)
+$ bodega pkg storage apt nginx
+apt/nginx  -> bulk     (type rule: storage_by_type.apt)
+$ bodega pkg storage git netbox
+git/netbox -> default  (global default; no type or package rule)
+```
+
+This is the write side. It says where the _next_ version goes and nothing about where versions already uploaded live; each of those records its own backend in `storage`.
+
+### `bodega pkg move <type> <name>[@<version>] --to <backend>`
+
+Copies the objects backing a package's versions to another named backend and repoints the manifest at the copy.
+
+```bash
+bodega pkg move binary awscli-v2 --to bulk
+bodega pkg move npm @bitwarden/cli@2026.4.0 --to archive
+bodega pkg move git netbox --to bulk --delete-source
+```
+
+Order is the design:
+
+1. Resolve the source from the recorded `storage`, refusing a version already on the destination.
+2. Refuse the whole command if any selected version is frozen, mirroring `pkg delete`.
+3. Copy each object through a temp file under `build_root`, never through RAM: a bundle can be larger than the host has.
+4. Verify at the destination with `Head` against `artifact_size`, and stream the bytes back to check `checksum` when one is recorded.
+5. Write the manifest.
+6. Only then consider the source.
+
+Deletion is behind `--delete-source` and defaults to off. A delete that fails prints a warning and leaves the manifest pointing at the copy: a stranded object costs space, while a manifest rolled back after the bytes were removed costs the artifact. Both backends answer a missing object with "not found" rather than an error, so an artifact lost mid-move is indistinguishable from one that was never uploaded.
+
+Without a version, every version of the package moves; versions already on the destination are skipped, so an interrupted move can be re-run. `pypi` is not movable: wheels upload as a directory with no per-version object key, so repoint `storage_by_type.pypi` and re-upload instead.
 
 ### `bodega serve [flags]`
 
@@ -451,6 +496,26 @@ The two namespaces never mix, and `Load` enforces it. `storage_backend` is a **d
 storage_by_type["apt"] names undefined storage backend "archive" (defined: default, bulk)
 ```
 
+#### The placement hierarchy
+
+Three levels decide where the next write goes, most specific first:
+
+| Level | Where it lives | Reason |
+|-------|----------------|--------|
+| Package | `storage_policy` on the package manifest | One package whose bytes must live in a specific bucket, under a specific KMS key, while its type is shared with packages that must not |
+| Type | `storage_by_type.<type>` in the config | A whole ecosystem on a separate volume |
+| Global | `storage_backend`/`storage_path`/`bucket`/`region` | Everything else |
+
+The most specific rule wins. A package policy that lost to a type rule would be a trap: it is set precisely for the package that must not go where the rest of its type goes, and adding a type rule later would silently move it.
+
+`bodega pkg storage <type> <name>` prints the resolved backend and which level decided it. Naming the winning level is what makes a three-level hierarchy debuggable — `bulk` on its own does not say whether a package policy took effect or a forgotten type rule did.
+
+`apt`, `pypi` and `git` upload whole directories with `SyncDir`, so the package level is not consulted for them: honoring it for some packages of the type and not others would split the tree across backends with no listing to reunite it. Use `bodega pkg move` on those.
+
+#### `storage_policy` and `storage` are different fields on purpose
+
+`PackageManifest.storage_policy` is future tense: put new versions here. `VersionEntry.storage` is past tense: this version's bytes are here. Setting a policy moves nothing; `bodega pkg move` does that. One name for both would mislead every future reader of a manifest.
+
 #### Placement is recorded, not recomputed
 
 Each version records the backend it was written to, in `storage` on its manifest entry. Reads use that recorded name and never the config. Change a rule and everything already uploaded stays exactly where it is and stays readable; only the next write moves.
@@ -463,7 +528,7 @@ A name no backend answers to is an error rather than a search of the others. Ser
 
 `upload` and `sync` honor a name a version already records. Change `storage_by_type` and they keep writing where the manifest says, so two runs either side of the change cannot produce divergent copies.
 
-`--replace-placement` is the deliberate move. It applies the current rule to versions already placed elsewhere, repoints the manifest, and warns for every object it leaves behind — nothing copies the old bytes.
+`--replace-placement` is the deliberate move. It applies the current rule to versions already placed elsewhere, repoints the manifest, and warns for every object it leaves behind — nothing copies the old bytes. `bodega pkg move` is the one that copies.
 
 `apt`, `pypi` and `git` upload whole directories with no per-version granularity, so a changed rule refuses outright rather than splitting a tree across backends:
 
@@ -483,7 +548,11 @@ Generated indexes, the GPG key, proxy-cache entries and attestation blobs have n
 
 The PEP 503 indexes and the apt pool listing union every backend and fail the whole request with 502 if any one of them errors. A short index is indistinguishable from packages having been withdrawn, and apt acts on the difference.
 
-`/api/v1/status` does the opposite: one row per backend, the failing one carrying its error, `healthy: false`. A diagnostic exists to say which backend is broken.
+`/api/v1/status` does the opposite: one row per backend, the failing one carrying its error, `healthy: false`. A diagnostic exists to say which backend is broken. `bodega build status` and the `bodega status` dashboard follow the same policy — the dashboard's `By Backend` table exists because one volume filling up is invisible in a combined byte count.
+
+#### Object size
+
+S3 uploads go through the multipart uploader, so an artifact larger than 5 GB reaches an S3 backend. The part size is 16 MiB against S3's 10,000-part cap, which puts the ceiling at 160 GiB.
 
 ### Per-type build roots
 
@@ -533,6 +602,16 @@ Each package is stored as a JSON file at `{manifest_dir}/{type}/{safeName}/manif
   ]
 }
 ```
+
+### Package-level fields
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `name` | string | Canonical package name |
+| `type` | string | Package ecosystem |
+| `description` | string | Short human-readable summary |
+| `dep_policy` | string | `none`, `direct`, or `transitive` |
+| `storage_policy` | string | Backend this package's _next_ version is written to, overriding `storage_by_type`. Absent means the type rule decides; see [the placement hierarchy](#the-placement-hierarchy) |
 
 ### Common fields on VersionEntry
 

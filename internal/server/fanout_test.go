@@ -38,10 +38,12 @@ func (r *multiResolver) ByName(name string) (storage.ObjectStore, error) {
 	return nil, errors.New("unknown storage backend " + name)
 }
 
-func (r *multiResolver) Placement(_, _ string) string         { return storage.DefaultName }
+func (r *multiResolver) Placement(_, _ string) storage.Decision {
+	return storage.Decision{Name: storage.DefaultName}
+}
 func (r *multiResolver) ForType(_ string) storage.ObjectStore { return r.stores[0].Store }
 func (r *multiResolver) All() []storage.NamedStore            { return r.stores }
-func (r *multiResolver) Fanout(context.Context, string) []storage.NamedStore {
+func (r *multiResolver) Fanout(context.Context, string, []string) []storage.NamedStore {
 	return r.stores
 }
 

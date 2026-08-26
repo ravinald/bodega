@@ -79,6 +79,16 @@ type PackageManifest struct {
 	// "transitive": full recursive closure.
 	DepPolicy string `json:"dep_policy,omitempty"`
 
+	// StoragePolicy names the backend this package's NEXT version should be
+	// written to, overriding storage_by_type for this package alone.
+	//
+	// Future tense, and deliberately not spelled the same as
+	// VersionEntry.Storage, which is past tense: this says where new bytes go,
+	// that says where existing bytes already are. Setting this moves nothing —
+	// 'bodega pkg move' does that. Empty means "no package-level rule", so the
+	// type rule decides.
+	StoragePolicy string `json:"storage_policy,omitempty"`
+
 	// Versions is the ordered list of version entries for this package.
 	// Multiple versions may coexist; callers select by VersionEntry.Version.
 	Versions []VersionEntry `json:"versions"`
