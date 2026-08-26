@@ -30,6 +30,11 @@ Type=notify
 User=bodega
 Group=bodega
 
+# Without this, relative paths resolve against / — which ProtectSystem=strict
+# makes read-only. A relative manifests/ directory then reads as empty and the
+# server publishes a valid index over no packages, with nothing in the journal.
+WorkingDirectory=/var/lib/bodega
+
 ExecStart=/usr/local/bin/bodega serve
 # SIGHUP reloads manifests without restarting the server.
 ExecReload=/bin/kill -HUP $MAINPID
