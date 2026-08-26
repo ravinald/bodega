@@ -49,7 +49,19 @@ func (s *Server) handleGomod(w http.ResponseWriter, r *http.Request) {
 		s.proxyOrCache(w, r, s.typeStore(manifest.TypeGomod), s3Key, upstream, manifest.TypeGomod, module, module, immutable, true)
 		return
 	}
-	s.proxyS3(w, r, s.typeStore(manifest.TypeGomod), s3Key)
+	s.proxyVersion(w, r, manifest.TypeGomod, module, gomodVersionFromFile(file), s3Key)
+}
+
+// gomodVersionFromFile recovers the manifest version from a proxy filename.
+// "list" and "@latest" name no version and return "", which routes them by
+// type — correct, because both are regenerable listings rather than artifacts.
+func gomodVersionFromFile(file string) string {
+	for _, ext := range []string{".zip", ".info", ".mod"} {
+		if strings.HasSuffix(file, ext) {
+			return strings.TrimSuffix(file, ext)
+		}
+	}
+	return ""
 }
 
 // versionAllowed checks whether reqVersion satisfies the constraint relative to entryVersion.

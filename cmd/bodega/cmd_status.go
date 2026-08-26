@@ -6,18 +6,25 @@ import (
 
 	"github.com/spf13/cobra"
 
-	bos3 "github.com/ravinald/bodega/internal/s3"
+	"github.com/ravinald/bodega/internal/inventory"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 func newStatusCmd(gf *globalFlags) *cobra.Command {
 	return &cobra.Command{
 		Use:   "status [TYPE...]",
-		Short: "Compare local manifests against S3",
-		Long: `status checks each manifest entry against S3 and reports what is present,
-missing, or uploaded. If no types are given, all four are checked.
+		Short: "Compare local manifests against the backends holding their artifacts",
+		Long: `status probes each manifest entry against the storage backend its version
+entry records, and reports what is present or missing. If no types are given,
+every type is checked.
 
-status is S3-only: it walks the bucket with a direct S3 client. Installs on the
-local backend have no equivalent yet.`,
+Every configured backend is reachable, local and s3 alike, and the BACKEND
+column names the one each row was probed on. A backend that fails to answer
+marks its own rows ERROR and the command exits non-zero; the rows belonging to
+backends that did answer are still printed, because a diagnostic exists to say
+which backend is broken.`,
+		Example: `  bodega build status
+  bodega build status apt git`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			types, err := resolveTypes(args)
 			if err != nil {
@@ -28,15 +35,6 @@ local backend have no equivalent yet.`,
 			if err != nil {
 				return err
 			}
-			// CheckStatus wants a concrete *s3.Client, so there is nothing to
-			// run against a filesystem backend. Refusing by name beats the old
-			// behavior of demanding a bucket the config never asked for.
-			if backend := storageBackendName(cfg); backend != "s3" {
-				return fmt.Errorf("status is S3-only and the configured storage backend is %q", backend)
-			}
-			if err := requireBucket(cfg); err != nil {
-				return err
-			}
 
 			store, err := loadStore(gf)
 			if err != nil {
@@ -44,18 +42,23 @@ local backend have no equivalent yet.`,
 			}
 
 			ctx := backgroundCtx()
-			client, err := bos3.NewClient(ctx, cfg.Bucket, cfg.Region)
+			stores, err := storage.NewResolver(ctx, cfg)
 			if err != nil {
-				return fmt.Errorf("connect to AWS: %w", err)
+				return fmt.Errorf("connect to storage: %w", err)
 			}
 
-			fmt.Printf("Checking s3://%s ...\n", cfg.Bucket)
-			statuses, err := bos3.CheckStatus(ctx, client, store, types)
+			for _, ns := range stores.All() {
+				fmt.Printf("Checking %s (%s) ...\n", ns.Name, ns.Store.Label())
+			}
+			statuses, err := inventory.CheckStatus(ctx, stores, store, types)
 			if err != nil {
 				return fmt.Errorf("status check: %w", err)
 			}
 
-			bos3.PrintStatus(os.Stdout, statuses)
+			inventory.PrintStatus(os.Stdout, statuses)
+			if n := inventory.Failures(statuses); n > 0 {
+				return fmt.Errorf("%d entr(ies) could not be probed", n)
+			}
 			return nil
 		},
 	}

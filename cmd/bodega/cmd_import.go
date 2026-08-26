@@ -254,17 +254,31 @@ func validateManifest(pm *manifest.PackageManifest, cfg *config.Config) error {
 	if !valid {
 		return fmt.Errorf("unknown type %q — must be one of: %s", pm.Type, strings.Join(manifest.AllTypes, ", "))
 	}
+	// A storage_policy naming nothing fails at the next upload, long after the
+	// edit that introduced it and with no obvious connection back to it.
+	if err := checkBackendName(cfg, pm.StoragePolicy); err != nil {
+		return fmt.Errorf("storage_policy: %w", err)
+	}
 	// A hand-edited storage name that matches no configured backend makes the
 	// artifact unreadable: resolution never falls back to another backend, so
 	// the entry would 502 rather than serve from somewhere plausible.
 	for _, ve := range pm.Versions {
-		if ve.Storage == "" || ve.Storage == config.DefaultStorageName {
-			continue
+		if err := checkBackendName(cfg, ve.Storage); err != nil {
+			return fmt.Errorf("version %s: %w", versionLabel(ve), err)
 		}
-		if _, ok := cfg.StorageBackends[ve.Storage]; !ok {
-			return fmt.Errorf("version %s: unknown storage backend %q (defined: %s)",
-				versionLabel(ve), ve.Storage, definedBackendNames(cfg))
-		}
+	}
+	return nil
+}
+
+// checkBackendName rejects a name no configured backend answers to. The empty
+// string and the reserved default always pass: an entry with no name recorded
+// is on the default backend, which every install has.
+func checkBackendName(cfg *config.Config, name string) error {
+	if name == "" || name == config.DefaultStorageName {
+		return nil
+	}
+	if _, ok := cfg.StorageBackends[name]; !ok {
+		return fmt.Errorf("unknown storage backend %q (defined: %s)", name, definedBackendNames(cfg))
 	}
 	return nil
 }

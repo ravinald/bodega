@@ -24,10 +24,12 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/inventory"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 	bos3 "github.com/ravinald/bodega/internal/s3"
 	"github.com/ravinald/bodega/internal/server"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 // focusTarget identifies which pane currently has keyboard focus.
@@ -41,7 +43,7 @@ const (
 
 // s3StatusMsg carries async S3 status results back into the event loop.
 type s3StatusMsg struct {
-	statuses []bos3.EntryStatus
+	statuses []inventory.EntryStatus
 	err      error
 }
 
@@ -57,11 +59,12 @@ type appModel struct {
 	log      logPaneModel
 	popup    popupModel
 	focus    focusTarget
-	statuses []bos3.EntryStatus
+	statuses []inventory.EntryStatus
 
 	cfg      *config.Config
 	store    *manifest.Store
 	s3client *bos3.Client
+	stores   storage.Resolver
 	auditDB  *audit.DB
 
 	width     int
@@ -81,7 +84,7 @@ type appModel struct {
 }
 
 // newAppModel constructs the initial application model.
-func newAppModel(cfg *config.Config, store *manifest.Store, s3client *bos3.Client, auditDB *audit.DB) appModel {
+func newAppModel(cfg *config.Config, store *manifest.Store, s3client *bos3.Client, stores storage.Resolver, auditDB *audit.DB) appModel {
 	logH := cfg.LogWindowHeight
 	if logH <= 0 {
 		logH = DefaultLogHeight
@@ -90,6 +93,7 @@ func newAppModel(cfg *config.Config, store *manifest.Store, s3client *bos3.Clien
 		cfg:       cfg,
 		store:     store,
 		s3client:  s3client,
+		stores:    stores,
 		auditDB:   auditDB,
 		focus:     focusSources,
 		logHeight: logH,
@@ -109,13 +113,13 @@ func (m appModel) Init() tea.Cmd {
 
 // fetchS3Status returns a command that checks S3 status for all types.
 func (m appModel) fetchS3Status() tea.Cmd {
-	if m.s3client == nil {
+	if m.stores == nil {
 		return nil
 	}
 	store := m.store
-	client := m.s3client
+	stores := m.stores
 	return func() tea.Msg {
-		statuses, err := bos3.CheckStatus(context.Background(), client, store, manifest.AllTypes)
+		statuses, err := inventory.CheckStatus(context.Background(), stores, store, manifest.AllTypes)
 		return s3StatusMsg{statuses: statuses, err: err}
 	}
 }
@@ -2269,8 +2273,8 @@ func overlayPopup(screen, popup string, _, _ int) string {
 }
 
 // Run starts the bubbletea program with the given configuration.
-func Run(cfg *config.Config, store *manifest.Store, s3client *bos3.Client, auditDB *audit.DB) error {
-	m := newAppModel(cfg, store, s3client, auditDB)
+func Run(cfg *config.Config, store *manifest.Store, s3client *bos3.Client, stores storage.Resolver, auditDB *audit.DB) error {
+	m := newAppModel(cfg, store, s3client, stores, auditDB)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, err := p.Run()
 	return err

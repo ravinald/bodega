@@ -129,7 +129,16 @@ func (s *Server) handleCargoDownload(w http.ResponseWriter, r *http.Request, p s
 	upstream := strings.TrimRight(s.cfg.CargoUpstream, "/") + "/" + crate + "/" + version + "/download"
 	s3Key := "cargo/crates/" + crate + "-" + version + ".crate"
 	forceProxy := pm == nil || packageMode(pm) == manifest.ModeProxy
-	s.proxyOrCache(w, r, s.typeStore(manifest.TypeCargo), s3Key, upstream, manifest.TypeCargo, crate, crate, true, forceProxy)
+	// A hosted crate reads from the backend its entry records; a proxied one
+	// has no entry to record anything, so it caches under the type rule.
+	store, err := s.versionStore(ctx, manifest.TypeCargo, crate, version)
+	if err != nil {
+		s.logger.Error("storage backend recorded for artifact is not configured",
+			"type", manifest.TypeCargo, "package", crate, "version", version, "error", err)
+		http.Error(w, "storage backend error", http.StatusBadGateway)
+		return
+	}
+	s.proxyOrCache(w, r, store, s3Key, upstream, manifest.TypeCargo, crate, crate, true, forceProxy)
 }
 
 // cargoCrateFromIndexPath validates the sparse-index path shape and returns

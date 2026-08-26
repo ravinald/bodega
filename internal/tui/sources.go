@@ -6,8 +6,8 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/ravinald/bodega/internal/inventory"
 	"github.com/ravinald/bodega/internal/manifest"
-	"github.com/ravinald/bodega/internal/s3"
 )
 
 // TreeNode represents one row in the Sources pane tree.
@@ -68,12 +68,12 @@ type flatRow struct {
 // BuildTree constructs the root-level tree nodes from the manifest store and
 // S3 statuses. Entries with the same name are grouped under an intermediate
 // package node so the tree has three levels: type > package > version.
-func BuildTree(store *manifest.Store, statuses []s3.EntryStatus) []TreeNode {
+func BuildTree(store *manifest.Store, statuses []inventory.EntryStatus) []TreeNode {
 	ctx := context.Background()
 
 	s3map := make(map[string]bool, len(statuses))
 	for _, st := range statuses {
-		s3map[st.Type+"/"+st.Name] = st.InS3
+		s3map[st.Type+"/"+st.Name] = st.Present
 	}
 
 	var roots []TreeNode
@@ -295,7 +295,7 @@ func newSourcesModel(roots []TreeNode) sourcesModel {
 }
 
 // Refresh rebuilds the tree from a fresh store and status list.
-func (m *sourcesModel) Refresh(store *manifest.Store, statuses []s3.EntryStatus) {
+func (m *sourcesModel) Refresh(store *manifest.Store, statuses []inventory.EntryStatus) {
 	roots := BuildTree(store, statuses)
 	m.flatList = flatten(roots, m.filter)
 	if m.cursor >= len(m.flatList) && len(m.flatList) > 0 {

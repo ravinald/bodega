@@ -11,6 +11,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
@@ -87,7 +88,20 @@ func (c *Client) HeadObject(ctx context.Context, key string) (*ObjectStatus, err
 	return status, nil
 }
 
+// uploadPartSize is the multipart chunk. S3 caps an upload at 10,000 parts, so
+// 16 MiB puts the object ceiling at 160 GiB while holding at most
+// uploadPartSize × uploadConcurrency in memory at once.
+const (
+	uploadPartSize    = 16 * 1024 * 1024
+	uploadConcurrency = 4
+)
+
 // UploadFile uploads a local file to S3 at the given key.
+//
+// It goes through the multipart uploader rather than a single PutObject, which
+// caps at 5 GB. Per-package placement exists so one enormous artifact can live
+// on separate storage, and that artifact could not reach an S3 backend at all
+// under the single-part path.
 func (c *Client) UploadFile(ctx context.Context, localPath, key string) error {
 	f, err := os.Open(localPath)
 	if err != nil {
@@ -95,18 +109,19 @@ func (c *Client) UploadFile(ctx context.Context, localPath, key string) error {
 	}
 	defer func() { _ = f.Close() }()
 
-	fi, err := f.Stat()
-	if err != nil {
-		return fmt.Errorf("stat %s: %w", localPath, err)
-	}
-
-	_, err = c.s3.PutObject(ctx, &awss3.PutObjectInput{
-		Bucket:        aws.String(c.bucket),
-		Key:           aws.String(key),
-		Body:          f,
-		ContentLength: aws.Int64(fi.Size()),
+	// feature/s3/manager is marked deprecated in favor of
+	// feature/s3/transfermanager, which is still v0.3.x. A pre-1.0 module on
+	// the upload path buys a breaking change for no behavior we need, so this
+	// stays on the v1 API until the replacement tags v1.
+	uploader := manager.NewUploader(c.s3, func(u *manager.Uploader) { //nolint:staticcheck // see above
+		u.PartSize = uploadPartSize
+		u.Concurrency = uploadConcurrency
 	})
-	if err != nil {
+	if _, err := uploader.Upload(ctx, &awss3.PutObjectInput{ //nolint:staticcheck // see above
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(key),
+		Body:   f,
+	}); err != nil {
 		return fmt.Errorf("put object s3://%s/%s: %w", c.bucket, key, err)
 	}
 	return nil

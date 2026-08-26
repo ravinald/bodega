@@ -3,29 +3,44 @@ package main
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/inventory"
 	"github.com/ravinald/bodega/internal/manifest"
-	bos3 "github.com/ravinald/bodega/internal/s3"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 type typeMetrics struct {
-	Type       string
-	Packages   int
-	Versions   int
-	S3Uploaded int
-	S3Missing  int
-	StorageB   int64
-	Frozen     int
-	Hidden     int
+	Type     string
+	Packages int
+	Versions int
+	Present  int
+	Missing  int
+	StorageB int64
+	Frozen   int
+	Hidden   int
+}
+
+// backendMetrics is one storage backend's share of the inventory. Reported
+// separately from the per-type table because a full /mnt/bulk is invisible in
+// a combined byte count: the aggregate keeps growing while the volume holding
+// half of it has no room left.
+type backendMetrics struct {
+	Name     string
+	Present  int
+	Missing  int
+	StorageB int64
+	Errors   int
 }
 
 type globalMetrics struct {
 	Types      []typeMetrics
+	Backends   []backendMetrics
 	DepEdges   int
 	Orphans    int
 	Fetches24h int
@@ -55,13 +70,11 @@ S3 coverage, storage usage, and recent activity.
 			}
 			ctx := context.Background()
 
-			// Collect S3 statuses if bucket is configured.
-			var statuses []bos3.EntryStatus
-			if cfg.Bucket != "" {
-				client, err := bos3.NewClient(ctx, cfg.Bucket, cfg.Region)
-				if err == nil {
-					statuses, _ = bos3.CheckStatus(ctx, client, store, manifest.AllTypes)
-				}
+			// Probe every configured backend, not just an S3 bucket: a
+			// local-only install had no coverage numbers at all before.
+			var statuses []inventory.EntryStatus
+			if stores, err := storage.NewResolver(ctx, cfg); err == nil {
+				statuses, _ = inventory.CheckStatus(ctx, stores, store, manifest.AllTypes)
 			}
 
 			// Collect audit activity.
@@ -81,20 +94,41 @@ S3 coverage, storage usage, and recent activity.
 
 			s3map := make(map[string]bool)
 			sizeMap := make(map[string]int64)
+			byBackend := make(map[string]*backendMetrics)
+			var backendOrder []string
 			for _, st := range statuses {
-				s3map[st.Type+"/"+st.Name] = st.InS3
-				if st.InS3 {
-					sizeMap[st.Type] += st.SizeS3
+				s3map[st.Type+"/"+st.Name] = st.Present
+				if st.Present {
+					sizeMap[st.Type] += st.Size
+				}
+				b, ok := byBackend[st.Backend]
+				if !ok {
+					b = &backendMetrics{Name: st.Backend}
+					byBackend[st.Backend] = b
+					backendOrder = append(backendOrder, st.Backend)
+				}
+				switch {
+				case st.Error != "":
+					b.Errors++
+				case st.Present:
+					b.Present++
+					b.StorageB += st.Size
+				default:
+					b.Missing++
 				}
 			}
 
 			// Collect per-type metrics.
+			sort.Strings(backendOrder)
 			metrics := globalMetrics{
 				DepEdges:   len(store.AllEdges()),
 				Orphans:    len(store.Orphans()),
 				Fetches24h: fetches24h,
 				Builds24h:  builds24h,
 				Creates24h: creates24h,
+			}
+			for _, name := range backendOrder {
+				metrics.Backends = append(metrics.Backends, *byBackend[name])
 			}
 
 			filterType := ""
@@ -123,9 +157,9 @@ S3 coverage, storage usage, and recent activity.
 						}
 						key := typ + "/" + ve.VersionedName(pm.Name)
 						if s3map[key] {
-							tm.S3Uploaded++
+							tm.Present++
 						} else {
-							tm.S3Missing++
+							tm.Missing++
 						}
 					}
 				}
@@ -145,28 +179,28 @@ S3 coverage, storage usage, and recent activity.
 }
 
 func printGlobalDashboard(m globalMetrics) {
-	totalPkg, totalVer, totalS3, totalMissing, totalFrozen, totalHidden := 0, 0, 0, 0, 0, 0
+	totalPkg, totalVer, totalPresent, totalMissing, totalFrozen, totalHidden := 0, 0, 0, 0, 0, 0
 	var totalStorage int64
 	for _, t := range m.Types {
 		totalPkg += t.Packages
 		totalVer += t.Versions
-		totalS3 += t.S3Uploaded
-		totalMissing += t.S3Missing
+		totalPresent += t.Present
+		totalMissing += t.Missing
 		totalFrozen += t.Frozen
 		totalHidden += t.Hidden
 		totalStorage += t.StorageB
 	}
 
-	total := totalS3 + totalMissing
+	total := totalPresent + totalMissing
 	pct := 0
 	if total > 0 {
-		pct = totalS3 * 100 / total
+		pct = totalPresent * 100 / total
 	}
 
 	w := 52
 	fmt.Println(boxTop("bodega status", w))
 	fmt.Println(boxEmpty(w))
-	fmt.Println(boxRow(w, fmt.Sprintf("  Packages   %-10d S3 Coverage  %d/%d (%d%%)", totalPkg, totalS3, total, pct)))
+	fmt.Println(boxRow(w, fmt.Sprintf("  Packages   %-10d Uploaded     %d/%d (%d%%)", totalPkg, totalPresent, total, pct)))
 	fmt.Println(boxRow(w, fmt.Sprintf("  Versions   %-10d Storage      %s", totalVer, humanSize(totalStorage))))
 	fmt.Println(boxRow(w, fmt.Sprintf("  Frozen     %-10d Hidden       %d", totalFrozen, totalHidden)))
 	fmt.Println(boxRow(w, fmt.Sprintf("  Dep Edges  %-10d Orphans      %d", m.DepEdges, m.Orphans)))
@@ -174,12 +208,25 @@ func printGlobalDashboard(m globalMetrics) {
 
 	// Per-type table.
 	fmt.Println(boxRow(w, "  "+innerTop("By Type", 46)))
-	fmt.Println(boxRow(w, fmt.Sprintf("  │ %-9s %4s %4s %4s %-14s │", "TYPE", "PKG", "VER", "S3", "STORAGE")))
+	fmt.Println(boxRow(w, fmt.Sprintf("  │ %-9s %4s %4s %4s %-14s │", "TYPE", "PKG", "VER", "UP", "STORAGE")))
 	for _, t := range m.Types {
-		fmt.Println(boxRow(w, fmt.Sprintf("  │ %-9s %4d %4d %4d %-14s │", t.Type, t.Packages, t.Versions, t.S3Uploaded, humanSize(t.StorageB))))
+		fmt.Println(boxRow(w, fmt.Sprintf("  │ %-9s %4d %4d %4d %-14s │", t.Type, t.Packages, t.Versions, t.Present, humanSize(t.StorageB))))
 	}
 	fmt.Println(boxRow(w, "  "+innerBottom(46)))
 	fmt.Println(boxEmpty(w))
+
+	// Per-backend table. One volume filling up is the failure a combined
+	// storage number cannot show.
+	if len(m.Backends) > 0 {
+		fmt.Println(boxRow(w, "  "+innerTop("By Backend", 46)))
+		fmt.Println(boxRow(w, fmt.Sprintf("  │ %-11s %4s %4s %4s %-13s │", "BACKEND", "UP", "MISS", "ERR", "STORAGE")))
+		for _, b := range m.Backends {
+			fmt.Println(boxRow(w, fmt.Sprintf("  │ %-11s %4d %4d %4d %-13s │",
+				b.Name, b.Present, b.Missing, b.Errors, humanSize(b.StorageB))))
+		}
+		fmt.Println(boxRow(w, "  "+innerBottom(46)))
+		fmt.Println(boxEmpty(w))
+	}
 
 	fmt.Println(boxRow(w, fmt.Sprintf("  Activity (24h): %d fetch, %d build, %d create", m.Fetches24h, m.Builds24h, m.Creates24h)))
 	fmt.Println(boxEmpty(w))
@@ -188,17 +235,17 @@ func printGlobalDashboard(m globalMetrics) {
 
 func printTypeMetrics(m globalMetrics) {
 	for _, t := range m.Types {
-		total := t.S3Uploaded + t.S3Missing
+		total := t.Present + t.Missing
 		pct := 0
 		if total > 0 {
-			pct = t.S3Uploaded * 100 / total
+			pct = t.Present * 100 / total
 		}
 		w := 44
 		fmt.Println(boxTop(t.Type+" repo", w))
 		fmt.Println(boxEmpty(w))
 		fmt.Println(boxRow(w, fmt.Sprintf("  Packages   %d", t.Packages)))
 		fmt.Println(boxRow(w, fmt.Sprintf("  Versions   %d", t.Versions)))
-		fmt.Println(boxRow(w, fmt.Sprintf("  S3         %d/%d (%d%%)", t.S3Uploaded, total, pct)))
+		fmt.Println(boxRow(w, fmt.Sprintf("  Uploaded   %d/%d (%d%%)", t.Present, total, pct)))
 		fmt.Println(boxRow(w, fmt.Sprintf("  Storage    %s", humanSize(t.StorageB))))
 		fmt.Println(boxRow(w, fmt.Sprintf("  Frozen     %d", t.Frozen)))
 		fmt.Println(boxRow(w, fmt.Sprintf("  Hidden     %d", t.Hidden)))

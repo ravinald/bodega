@@ -21,6 +21,7 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 
 		// Storage uses the safe-encoded form everywhere; URL doesn't.
 		storageKey := npmStorageKeyForTarball(pkgName, tarball)
+		reqVersion := npmVersionFromTarball(pkgName, tarball)
 
 		pm, _ := s.store.GetPackage(ctx, manifest.TypeNpm, pkgName)
 		if pm != nil {
@@ -28,7 +29,6 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 				http.NotFound(w, r)
 				return
 			}
-			reqVersion := npmVersionFromTarball(pkgName, tarball)
 			if reqVersion != "" && isVersionHidden(pm, reqVersion) {
 				http.NotFound(w, r)
 				return
@@ -51,7 +51,7 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 			s.proxyOrCache(w, r, s.typeStore(manifest.TypeNpm), storageKey, upstream, manifest.TypeNpm, pkgName, pkgName, true, true)
 			return
 		}
-		s.proxyS3(w, r, s.typeStore(manifest.TypeNpm), storageKey)
+		s.proxyVersion(w, r, manifest.TypeNpm, pkgName, reqVersion, storageKey)
 		return
 	}
 

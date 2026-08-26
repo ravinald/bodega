@@ -23,6 +23,40 @@ type NamedStore struct {
 	Store ObjectStore
 }
 
+// Level names which rule of the placement hierarchy chose a backend. Printing
+// it is what makes a three-level hierarchy debuggable: "bulk" alone does not
+// say whether an operator's package policy took effect or a type rule they
+// forgot about did.
+type Level int
+
+const (
+	// LevelDefault: neither a package policy nor a type rule applied.
+	LevelDefault Level = iota
+	// LevelType: storage_by_type[typ] decided.
+	LevelType
+	// LevelPackage: the package manifest's storage_policy decided.
+	LevelPackage
+)
+
+// Decision is a placement answer: the backend name, and the rule that chose it.
+type Decision struct {
+	Name  string
+	Level Level
+}
+
+// Reason renders the deciding rule for an operator, naming the config key the
+// type level reads so it can be found and changed.
+func (d Decision) Reason(typ string) string {
+	switch d.Level {
+	case LevelPackage:
+		return "package policy"
+	case LevelType:
+		return "type rule: storage_by_type." + typ
+	default:
+		return "global default; no type or package rule"
+	}
+}
+
 // Resolver answers two different questions with two different methods, and
 // keeping them apart is the whole point of the type.
 //
@@ -53,21 +87,42 @@ type Resolver interface {
 	// bytes under a digest recorded against another backend.
 	ByName(name string) (ObjectStore, error)
 
-	// Placement returns the *name* of the backend the next write for this
-	// type and package should target. Callers record the returned name
-	// alongside the artifact.
-	Placement(typ, pkg string) string
+	// Placement returns the backend the next write for this type should
+	// target, and the level that decided it. Callers record the returned
+	// name alongside the artifact.
+	//
+	// policy is the package's PackageManifest.StoragePolicy. It arrives as a
+	// string rather than being looked up here because storage must never
+	// import manifest, and every caller already holds the manifest it came
+	// from. Empty means the package has no rule; pass "" for a write that
+	// belongs to no package.
+	//
+	// The most specific rule wins: package policy, then type rule, then the
+	// default backend. A package policy that lost to a type rule would be a
+	// trap — it is set precisely for the package whose bytes must not go
+	// where the rest of its type goes.
+	Placement(typ, policy string) Decision
 
 	// ForType returns the backend for objects that carry no recorded name:
 	// generated indexes, the GPG key, proxy-cache entries and attestation
 	// blobs. Safe only because every one of them is regenerable.
 	ForType(typ string) ObjectStore
 
-	// Fanout returns every backend a read of this type may have to consult.
-	// Listing endpoints union the results; a per-backend error fails the
-	// request rather than serving a partial index, which a client cannot
-	// distinguish from packages having been removed.
-	Fanout(ctx context.Context, typ string) []NamedStore
+	// Fanout returns every backend a read of this type may have to consult:
+	// the default, the type rule's target, and every name in recorded.
+	//
+	// recorded is the set of names the manifests hold for this type — both
+	// VersionEntry.Storage and PackageManifest.StoragePolicy. It is a
+	// parameter because storage must never import manifest, and because
+	// config alone cannot answer the question: a package moved to another
+	// backend, or placed there by its own policy, is on a backend no config
+	// key for this type names.
+	//
+	// Narrowing matters. Returning every configured backend means one
+	// unrelated backend's outage fails every type's index, since a
+	// per-backend error fails the request rather than serving a partial one
+	// a client cannot distinguish from packages having been removed.
+	Fanout(ctx context.Context, typ string, recorded []string) []NamedStore
 
 	// All returns every configured backend, for diagnostics that report per
 	// backend rather than aggregating.
@@ -94,11 +149,20 @@ func (r *single) ByName(name string) (ObjectStore, error) {
 	return nil, fmt.Errorf("unknown storage backend %q (configured: %s)", name, DefaultName)
 }
 
-func (r *single) Placement(_, _ string) string { return DefaultName }
+// Placement here returns a package policy verbatim rather than flattening it
+// to DefaultName. A policy naming a backend this install does not define is an
+// operator error, and ByName reporting it beats writing the bytes somewhere
+// the manifest did not ask for.
+func (r *single) Placement(_, policy string) Decision {
+	if policy != "" {
+		return Decision{Name: policy, Level: LevelPackage}
+	}
+	return Decision{Name: DefaultName, Level: LevelDefault}
+}
 
 func (r *single) ForType(_ string) ObjectStore { return r.store }
 
-func (r *single) Fanout(_ context.Context, _ string) []NamedStore { return r.All() }
+func (r *single) Fanout(_ context.Context, _ string, _ []string) []NamedStore { return r.All() }
 
 func (r *single) All() []NamedStore {
 	return []NamedStore{{Name: DefaultName, Store: r.store}}
@@ -168,26 +232,48 @@ func (r *multi) ByName(name string) (ObjectStore, error) {
 	return store, nil
 }
 
-// Placement consults storage_by_type only. pkg is the level below it and has
-// no config key yet; it stays in the signature because the caller that would
-// use it — the upload write-back — already passes the package name, so adding
-// the rule later changes one function rather than every call site.
-func (r *multi) Placement(typ, _ string) string {
-	if name := r.byType[typ]; name != "" {
-		return name
+func (r *multi) Placement(typ, policy string) Decision {
+	if policy != "" {
+		return Decision{Name: policy, Level: LevelPackage}
 	}
-	return DefaultName
+	if name := r.byType[typ]; name != "" {
+		return Decision{Name: name, Level: LevelType}
+	}
+	return Decision{Name: DefaultName, Level: LevelDefault}
 }
 
 func (r *multi) ForType(typ string) ObjectStore {
-	store, err := r.ByName(r.Placement(typ, ""))
+	store, err := r.ByName(r.Placement(typ, "").Name)
 	if err != nil {
 		return r.Default()
 	}
 	return store
 }
 
-func (r *multi) Fanout(_ context.Context, _ string) []NamedStore { return dedupByLabel(r.All()) }
+func (r *multi) Fanout(_ context.Context, typ string, recorded []string) []NamedStore {
+	want := map[string]struct{}{DefaultName: {}}
+	if name := r.byType[typ]; name != "" {
+		want[name] = struct{}{}
+	}
+	for _, name := range recorded {
+		if name == "" {
+			name = DefaultName
+		}
+		want[name] = struct{}{}
+	}
+
+	out := make([]NamedStore, 0, len(want))
+	for _, name := range r.names {
+		if _, ok := want[name]; !ok {
+			continue
+		}
+		out = append(out, NamedStore{Name: name, Store: r.stores[name]})
+	}
+	// A recorded name no backend answers to is skipped rather than fatal.
+	// Its artifacts are unreachable either way, and listing them would
+	// advertise keys every fetch answers with 502.
+	return dedupByLabel(out)
+}
 
 func (r *multi) All() []NamedStore {
 	out := make([]NamedStore, 0, len(r.names))

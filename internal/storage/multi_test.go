@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"testing"
 
@@ -35,19 +36,58 @@ func TestNewResolverWithoutNamedBackendsIsSingle(t *testing.T) {
 		t.Fatalf("All() = %v, want one backend named %q", all, DefaultName)
 	}
 	for _, typ := range []string{"apt", "pypi", "binary", "git"} {
-		if got := r.Placement(typ, "anything"); got != DefaultName {
-			t.Errorf("Placement(%q) = %q, want %q", typ, got, DefaultName)
+		if got := r.Placement(typ, ""); got.Name != DefaultName {
+			t.Errorf("Placement(%q) = %q, want %q", typ, got.Name, DefaultName)
 		}
 	}
 }
 
 func TestPlacementFollowsStorageByType(t *testing.T) {
 	r := twoBackendResolver(t, t.TempDir(), t.TempDir(), map[string]string{"apt": "bulk"})
-	if got := r.Placement("apt", "nginx"); got != "bulk" {
-		t.Errorf("Placement(apt) = %q, want bulk", got)
+	if got := r.Placement("apt", ""); got.Name != "bulk" || got.Level != LevelType {
+		t.Errorf("Placement(apt) = %+v, want bulk at LevelType", got)
 	}
-	if got := r.Placement("pypi", "boto3"); got != DefaultName {
-		t.Errorf("Placement(pypi) = %q, want %q", got, DefaultName)
+	if got := r.Placement("pypi", ""); got.Name != DefaultName || got.Level != LevelDefault {
+		t.Errorf("Placement(pypi) = %+v, want %q at LevelDefault", got, DefaultName)
+	}
+}
+
+// TestPackagePolicyBeatsTheTypeRule is the whole reason the package level
+// exists. The motivating case is a package whose bytes must live in a specific
+// bucket under a specific KMS key while its type is shared with packages that
+// must not; a package policy that lost to the type rule could not express it,
+// and would silently move that package the day someone added a type rule.
+func TestPackagePolicyBeatsTheTypeRule(t *testing.T) {
+	r := twoBackendResolver(t, t.TempDir(), t.TempDir(), map[string]string{"git": "bulk"})
+
+	// git's type rule says bulk. This one package says otherwise and must win.
+	if got := r.Placement("git", DefaultName); got.Name != DefaultName || got.Level != LevelPackage {
+		t.Errorf("Placement(git, %q) = %+v, want %q at LevelPackage", DefaultName, got, DefaultName)
+	}
+	if got := r.Placement("git", ""); got.Name != "bulk" || got.Level != LevelType {
+		t.Errorf("Placement(git, no policy) = %+v, want bulk at LevelType", got)
+	}
+	// A type with no rule of its own still honors the package policy.
+	if got := r.Placement("npm", "bulk"); got.Name != "bulk" || got.Level != LevelPackage {
+		t.Errorf("Placement(npm, bulk) = %+v, want bulk at LevelPackage", got)
+	}
+}
+
+// TestDecisionReasonNamesTheDecidingRule: printing the winning level is what
+// makes a three-level hierarchy debuggable, and the type level names the config
+// key so an operator can find and change it.
+func TestDecisionReasonNamesTheDecidingRule(t *testing.T) {
+	for _, tc := range []struct {
+		d    Decision
+		want string
+	}{
+		{Decision{Name: "bulk", Level: LevelPackage}, "package policy"},
+		{Decision{Name: "bulk", Level: LevelType}, "type rule: storage_by_type.apt"},
+		{Decision{Name: DefaultName, Level: LevelDefault}, "global default; no type or package rule"},
+	} {
+		if got := tc.d.Reason("apt"); got != tc.want {
+			t.Errorf("Reason() = %q, want %q", got, tc.want)
+		}
 	}
 }
 
@@ -76,12 +116,44 @@ func TestFanoutDedupsBackendsAtOneLocation(t *testing.T) {
 	if all := r.All(); len(all) != 2 {
 		t.Fatalf("All() = %d backends, want 2 — dedup belongs to Fanout, not All", len(all))
 	}
-	fan := r.Fanout(context.Background(), "apt")
+	fan := r.Fanout(context.Background(), "apt", []string{"bulk"})
 	if len(fan) != 1 {
 		t.Fatalf("Fanout() = %d backends, want 1: %v", len(fan), fan)
 	}
 	if fan[0].Name != DefaultName {
 		t.Errorf("Fanout kept %q, want the default to win the tie", fan[0].Name)
+	}
+}
+
+// TestFanoutNarrowsToWhatAReadCanReach: a backend that holds nothing for this
+// type must not join its fan-out. A per-backend error fails the whole index,
+// so an unrelated backend being down would otherwise 502 every type.
+func TestFanoutNarrowsToWhatAReadCanReach(t *testing.T) {
+	r := twoBackendResolver(t, t.TempDir(), t.TempDir(), map[string]string{"apt": "bulk"})
+
+	names := func(in []NamedStore) []string {
+		out := make([]string, 0, len(in))
+		for _, ns := range in {
+			out = append(out, ns.Name)
+		}
+		sort.Strings(out)
+		return out
+	}
+
+	if got := names(r.Fanout(context.Background(), "pypi", nil)); len(got) != 1 || got[0] != DefaultName {
+		t.Errorf("Fanout(pypi) = %v, want only %q — bulk holds no pypi", got, DefaultName)
+	}
+	if got := names(r.Fanout(context.Background(), "apt", nil)); len(got) != 2 {
+		t.Errorf("Fanout(apt) = %v, want both — storage_by_type sends apt to bulk", got)
+	}
+	// A pypi package moved to bulk puts bulk back in pypi's fan-out, which
+	// config alone cannot say.
+	if got := names(r.Fanout(context.Background(), "pypi", []string{"bulk"})); len(got) != 2 {
+		t.Errorf("Fanout(pypi, [bulk]) = %v, want both — a moved artifact was dropped from the index", got)
+	}
+	// An empty recorded name is the default, not a third backend.
+	if got := names(r.Fanout(context.Background(), "pypi", []string{""})); len(got) != 1 {
+		t.Errorf("Fanout(pypi, [\"\"]) = %v, want only the default", got)
 	}
 }
 
