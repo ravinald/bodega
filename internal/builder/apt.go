@@ -478,8 +478,10 @@ func BuildApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 }
 
 // PackageApt copies each built .deb into the pool directory structure under
-// <build-root>/apt-repo/pool/main/<letter>/<name>/. The server generates
-// Packages and Release files dynamically, so reprepro is not required.
+// <build-root>/apt-repo/pool/main/<letter>/<name>/. dists/ is never written:
+// the server generates every suite's Packages and Release into one snapshot
+// and signs it there, so reprepro is not required and a pre-built index would
+// be a second, contradictory source of truth.
 func PackageApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 	ctx := context.Background()
 	summary := &Summary{}
@@ -761,27 +763,6 @@ func locateDebFile(d dirs, name string, ve manifest.VersionEntry) (string, error
 	}
 }
 
-// extractGPGKeyID parses the key ID from gpg --list-keys output.
-// It looks for lines like "      rsa4096/ABCDEF1234567890 2025-..."
-func extractGPGKeyID(output string) string {
-	for _, line := range splitLines(output) {
-		// Look for a line containing "rsa4096/" which indicates the key line.
-		const marker = "rsa4096/"
-		if idx := indexOf(line, marker); idx >= 0 {
-			rest := line[idx+len(marker):]
-			// Key ID ends at a space or end of string.
-			end := indexOf(rest, " ")
-			if end < 0 {
-				end = len(rest)
-			}
-			if end > 0 {
-				return rest[:end]
-			}
-		}
-	}
-	return ""
-}
-
 // splitLines splits a string into individual lines.
 func splitLines(s string) []string {
 	var lines []string
@@ -796,17 +777,4 @@ func splitLines(s string) []string {
 		lines = append(lines, s[start:])
 	}
 	return lines
-}
-
-// indexOf returns the index of substr in s, or -1 if not found.
-func indexOf(s, substr string) int {
-	if len(substr) == 0 {
-		return 0
-	}
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return i
-		}
-	}
-	return -1
 }

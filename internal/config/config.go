@@ -71,6 +71,8 @@ type Config struct {
 	StoragePath       string   `json:"storage_path,omitempty"`      // root directory for local backend
 	AptCodename       string   `json:"apt_codename,omitempty"`      // default suite for apt entries that name none (default "noble")
 	AptSuites         []string `json:"apt_suites,omitempty"`        // suites served under /apt/dists/; always includes AptCodename
+	AptSigningName    string   `json:"apt_signing_name,omitempty"`  // UID name on a key made by `bodega apt key generate`
+	AptSigningEmail   string   `json:"apt_signing_email,omitempty"` // UID email on a key made by `bodega apt key generate`
 	AdminPermitCIDR   []string `json:"admin_permit_cidr,omitempty"` // CIDRs allowed to hit mutation API; default ["127.0.0.0/8","::1/128"]
 
 	// StorageBackends maps a backend *name* to its parameters. The name is
@@ -228,6 +230,7 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	// name would misroute in handleAptDists, which splits the dists path on
 	// "/" and counts segments, so reject it at load like discover_mode.
 	cfg.AptCodename = firstNonEmpty(cfg.AptCodename, "noble")
+	cfg.AptSigningName = firstNonEmpty(cfg.AptSigningName, "bodega archive signing key")
 	suites := make([]string, 0, len(cfg.AptSuites)+1)
 	seen := map[string]bool{}
 	for _, s := range append([]string{cfg.AptCodename}, cfg.AptSuites...) {
@@ -444,6 +447,10 @@ func defaultConfigContent() []byte {
   "_comment_apt": "apt_codename: default suite for apt entries that name none. apt_suites: every suite served under /apt/dists/; apt_codename is always included.",
   "apt_codename": "noble",
   "apt_suites": ["noble"],
+
+  "_comment_apt_signing": "apt_signing_name / apt_signing_email: the UID stamped on a key made by 'bodega apt key generate'. They name the key, nothing more — the server loads whatever key it finds and never generates one.",
+  "apt_signing_name": "",
+  "apt_signing_email": "",
 
   "_comment_audit": "audit_db defaults to {log_dir}/audit.db. timezone is the display timezone for audit queries (default UTC); audit_events limits which event types are recorded, empty records all.",
   "audit_db": "",

@@ -93,6 +93,7 @@ Without VERSION, all versions of the package are toggled.`,
 				})
 				adb.Close()
 			}
+			notifyServer(gf)
 			return nil
 		},
 	}

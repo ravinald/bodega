@@ -78,7 +78,7 @@ Placement and resolution are separate questions and share no code path. The conf
 
 An absent `storage` is `default`, not "recompute from config" — that is the answer for every artifact uploaded before named backends existed. A name nothing answers to fails the read rather than searching the other backends: serving bytes from one store under a digest recorded against another is the signature the checksum machinery exists to catch.
 
-Objects with no version entry — generated indexes, the GPG key, proxy-cache entries, attestation blobs — follow the type rule at both ends, which is safe because every one of them is regenerable. Manifests stay on `default`: they are what records placement.
+Objects with no version entry — generated indexes, proxy-cache entries, attestation blobs — follow the type rule at both ends, which is safe because every one of them is regenerable. Manifests stay on `default`: they are what records placement.
 
 Moving an artifact between backends is `bodega pkg move`, which copies, verifies at the destination, writes the manifest, and only then considers the source. Deleting first would be unrecoverable: both backends answer a missing object with "not found" rather than an error, so an artifact lost mid-move is indistinguishable from one that was never uploaded.
 
@@ -86,7 +86,7 @@ Moving an artifact between backends is `bodega pkg move`, which copies, verifies
 
 | Type | Source | Artifact | Client protocol |
 |------|--------|----------|-----------------|
-| apt | Package name, git repo, or apt-get source | .deb in Debian repo layout | `deb [trusted=yes] https://bodega/apt/ noble main` |
+| apt | Package name, git repo, or apt-get source | .deb in Debian repo layout | deb822 `.sources` with `Signed-By:`; see below |
 | git | GitHub release tarball or bare clone | .tar.gz or .bundle | `curl https://bodega/git/<name>/<file>` |
 | pypi | Wheel build from requirements.txt | .whl files | `pip install --index-url https://bodega/pypi/simple/` |
 | binary | Direct URL download | Original file | `curl https://bodega/binaries/<name>/<ver>/<file>` |
@@ -94,7 +94,11 @@ Moving an artifact between backends is `bodega pkg move`, which copies, verifies
 | helm | Chart repo or direct URL | .tgz | `helm repo add bodega https://bodega/helm` |
 | npm | Registry upstream or local | .tgz | `npm install --registry https://bodega/npm/` |
 
-`[trusted=yes]` turns off apt's signature verification for that source. The apt repository is unsigned: `internal/server/apt.go` generates `Release` and the `Packages` bodies it digests as one snapshot, and 404s `InRelease` and `Release.gpg` rather than serving unsigned bytes under a name that means signed. The flag is required until signing lands. TLS authenticates the packages in the meantime, which is why every client line above is `https://`.
+`internal/server/apt.go` generates `Release` and the `Packages` bodies it digests as one snapshot, and signs it there with a key `internal/aptsign` loaded at startup. `InRelease` is the clearsigned `Release`; `Release.gpg` is the armored detached signature; `/apt/bodega-archive-keyring.{asc,gpg}` serve the public key from memory. With no key installed all four 404 and the unsigned `Release` still serves, which is the ordinary fallback apt has always taken. Signed and unsigned coexist at the same URLs indefinitely.
+
+An unsigned source needs `deb [trusted=yes] https://bodega/apt/ noble main`, which turns off verification for that source permanently. TLS authenticates the packages in that case, which is why every client line above is `https://`.
+
+The signature seals the last hop only: it proves the bytes are the ones this bodega asserted. It carries no claim about upstream, because bodega records no upstream verification result and a source-built `.deb` never had an upstream signature. `docs/USAGE.md` states the full scope.
 
 ## Manifest structure (config_version 1)
 

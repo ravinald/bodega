@@ -542,7 +542,7 @@ Move those objects, or pass --replace-placement to repoint the manifest and leav
 
 #### What is not placed
 
-Generated indexes, the GPG key, proxy-cache entries and attestation blobs have no version to record a name against. They follow the type rule at both read and write, which is safe because every one of them is regenerable.
+Generated indexes, proxy-cache entries and attestation blobs have no version to record a name against. They follow the type rule at both read and write, which is safe because every one of them is regenerable.
 
 #### Listing and diagnostics disagree on purpose
 
@@ -731,42 +731,28 @@ Actually, the operations are more granular: fetch, build/run, sync, upload.
 
 ### Client configuration
 
-**APT** (`/etc/apt/sources.list.d/bodega.list`):
+**APT** (`/etc/apt/sources.list.d/bodega.sources`), against a signed repository:
 ```
-deb [trusted=yes] https://bodega-host:8080/apt/ noble main
+Types: deb
+URIs: https://bodega-host:8080/apt/
+Suites: noble
+Components: main
+Signed-By: /etc/apt/keyrings/bodega-archive-keyring.gpg
 ```
 
-The suite (`noble` above) is any entry in `apt_suites`. One instance serves several: give each suite its own sources line, since apt's one-line format takes a single suite. A `.deb` listed in two suites is stored once in the shared `pool/` and appears in both `Packages` indexes with the same `Filename:`.
+Install the keyring first. The `.gpg` route serves the dearmored form `Signed-By:` takes directly, so the client needs no `gpg` binary:
 
-`[trusted=yes]` turns off apt's signature verification for this source and nothing else re-enables it. The apt repository is unsigned, so the line is required until signing lands; TLS is what authenticates the packages in the meantime, which is why the URL is `https://`.
+```bash
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo curl -fsSL https://bodega-host:8080/apt/bodega-archive-keyring.gpg \
+  -o /etc/apt/keyrings/bodega-archive-keyring.gpg
+```
 
-`dists/<suite>/InRelease` and `dists/<suite>/Release.gpg` return 404, and so does `/apt/gpg-key.asc`. All three are signature-bearing and there is no key. apt fetches `InRelease` first and falls back to `Release` on 404, which is the ordinary path for an archive predating `InRelease`, so `apt update` logs `Ign:` for both and proceeds.
+The deb822 `.sources` form is preferred over the one-line `.list` form because `Signed-By:` there is a path rather than a bracket option, and one stanza can carry several suites. The one-line equivalent is `deb [signed-by=/etc/apt/keyrings/bodega-archive-keyring.gpg] https://bodega-host:8080/apt/ noble main`.
 
-### APT index generation
+The suite (`noble` above) is any entry in `apt_suites`. One instance serves several: list them on the `Suites:` line, or give each its own sources line in the one-line format. A `.deb` listed in two suites is stored once in the shared `pool/` and appears in both `Packages` indexes with the same `Filename:`.
 
-`dists/<suite>/Release` and the `Packages` bodies under it are generated together into one snapshot and served from memory until the next rebuild. Nothing is written to storage: the only stored part of the apt repository is `pool/`.
-
-They are generated together because `Release` records the SHA256 and byte length of each `Packages` body, and apt fetches the two in separate requests. Regenerating per request lets a write land between them, and the client rejects the result as `Hash Sum mismatch`.
-
-A rebuild happens on:
-
-| Trigger | Notes |
-|---------|-------|
-| Server start | Before the listener binds, so no request ever sees an empty index |
-| `SIGHUP` | After the manifest reload. Every `bodega pkg` command sends one |
-| A mutation-API write to an apt entry | `POST`, `DELETE`, and the hide and freeze toggles |
-| An hourly ticker | Keeps `Valid-Until` moving; see below |
-
-**A manifest edited by hand is not picked up until one of those fires.** Before the snapshot, the index reflected the manifest store on every request. Now an edit made directly to a `manifest.json` needs a `SIGHUP` (`kill -HUP $(cat <log_dir>/bodega.pid)`) or an hour's wait. Every CLI mutation already signals, so the normal workflow is unaffected.
-
-`Release` carries `Date` backdated 24 hours to tolerate client clock skew, and `Valid-Until` 14 days after that. The expiry is stamped when the snapshot is built and does not move on its own, which is why the refresh ticker is not an optimization: a server whose refresh loop stops eventually serves an expired `Release`, and every client fails `apt update` at once — including with `[trusted=yes]`, since `Acquire::Check-Valid-Until` is independent of trust. Within 24 hours of expiry the server logs at `WARN` on every `Release` fetch.
-
-Two cases drop an entry from the index silently, so both are logged at `WARN` once per rebuild:
-
-- The entry names suites, none of which is in `apt_suites`.
-- The entry has no `version`. No CLI verb can address a versionless entry, so publishing one hands clients a package nobody can withdraw.
-
-An architecture is served only if some entry published to that suite declares it. `Release` advertises exactly those architectures in `Architectures:`, and `binary-<arch>/Packages` 404s for any other, since `Release` records no digest for it. With no architecture-specific entry at all the suite falls back to `amd64`.
+See [Signing the apt repository](#signing-the-apt-repository) below for creating the key, rotating it, what the signature does and does not prove, and the `[trusted=yes]` fallback for a repository with no key.
 
 **pip** (per-command or `pip.conf`):
 ```bash
@@ -788,6 +774,113 @@ helm repo add bodega https://bodega-host:8080/helm
 ```bash
 npm install --registry https://bodega-host:8080/npm <package>
 ```
+
+### Signing the apt repository
+
+The server only ever **loads** a key. Generation is a CLI operation, so a compromised server process cannot mint a key clients would then be asked to trust.
+
+The search order, first hit wins:
+
+| Order | Path | Notes |
+|-------|------|-------|
+| 1 | `$CREDENTIALS_DIRECTORY/apt-signing.key` | systemd `LoadCredential=`; a per-service tmpfs, mode 0400 |
+| 2 | `/etc/bodega/apt-signing.key` | packaged location |
+| 3 | `<storage_path>/apt-signing.key` | beside the artifacts |
+
+A key file readable beyond its owner is **refused**, not warned about, and the error names the `chmod`. A key that is present and unparsable is logged at `ERROR` and the repository stays unsigned: apt reports nothing in that case, since a missing `InRelease` is indistinguishable from an archive that never had one, so the journal is the only place it can surface.
+
+The key carries **no passphrase**, deliberately. On an unattended service the passphrase has to be readable from somewhere with the same permissions as the key, so it adds a failure mode and protects nothing. File permissions are the boundary.
+
+```bash
+bodega apt key generate              # Ed25519, mode 0600, at the first writable path above
+bodega apt key generate --rsa        # RSA-4096, for gnupg older than 2.1
+bodega apt key show                  # fingerprints, algorithms, UIDs, and the file they came from
+bodega apt key export                # armored public key
+bodega apt key export --keyring      # dearmored, for /etc/apt/keyrings/
+```
+
+`apt_signing_name` and `apt_signing_email` in `config.json` supply the UID; `--name` and `--email` override them. The server must be restarted or sent `SIGHUP` before a new key takes effect.
+
+Signing happens once per snapshot rebuild, not per request. `InRelease` is the clearsigned form of `Release`, and `Release.gpg` is the armored detached signature. The clearsigned body is byte-identical to `Release`, so a verifying client and a `[trusted=yes]` client read the same index. Both use SHA-512: apt's `gpgv` rejects SHA-1 on current releases.
+
+#### Rotation
+
+apt does not refresh keyrings on its own, so replacing a key outright breaks every client that has not updated. Rotate across a transition window instead: both keys sign, both public keys are published, and apt accepts an `InRelease` when any one signature verifies.
+
+```bash
+bodega apt key generate --rotate     # the new key joins the old one
+systemctl reload bodega              # both now sign
+# ... clients re-fetch bodega-archive-keyring.gpg, which now carries both ...
+bodega apt key retire <old-fingerprint>
+systemctl reload bodega
+```
+
+`retire` refuses to remove the last key: a file with no keys loads as an error and takes the repository unsigned, which apt reports as nothing at all.
+
+#### Unsigned fallback
+
+With no signing key installed, `dists/<suite>/InRelease`, `dists/<suite>/Release.gpg` and both keyring routes return 404. apt fetches `InRelease` first and falls back to `Release` on 404, the ordinary path for an archive predating `InRelease`, so `apt update` logs `Ign:` for both and proceeds — but only for a source that does not ask for verification:
+
+```
+deb [trusted=yes] https://bodega-host:8080/apt/ noble main
+```
+
+`[trusted=yes]` turns off signature verification for this source, permanently and silently, and nothing else re-enables it. It propagates into Ansible templates and cloud-init files, where it outlives whatever made it necessary. Signed and unsigned coexist at the same URLs indefinitely, so a client using it keeps working after a key is installed and can move to `Signed-By:` on its own schedule.
+
+TLS is what authenticates an unsigned source, which is why every URL here is `https://`. `http://` plus `[trusted=yes]` is unauthenticated code delivery to a root-privileged installer.
+
+#### What a signature proves, and what it does not
+
+It seals the last hop: the bytes are the ones **this bodega** asserted, and the hash chain from `Release` to `Packages` to each `.deb` holds under a key the client pinned.
+
+It carries no claim about upstream. `apt-get download` does verify against the distro's own keyring on the build host, but that result is recorded nowhere and does not reach the client; a source-built `.deb` never had an upstream signature at all. For mirrored packages, forwarding the upstream signature unchanged is the better answer and is a separate piece of work.
+
+It does not catch a tampered `.deb` that manifests were not also edited; the client already catches that. `_sha256` is computed once at package time and served from the manifest, never recomputed from disk, so swapping a pooled file fails the client's own hash check whether or not the repository is signed. What signing adds is coverage of an attacker who can write manifests too.
+
+It does not survive a compromised host. The key is loaded into the serving process, so an attacker who owns the process owns the signature.
+
+#### Bootstrap
+
+The first fetch of the keyring over `https://` is authenticated by TLS, and by nothing else. That is a claim about your certificate, not about the key.
+
+To make it a claim about the key, publish the fingerprint somewhere that is not the server — a README in a configuration-management repository, a wiki, an onboarding doc — and check it after fetching:
+
+```bash
+bodega apt key show                                                              # on the server
+gpg --show-keys --with-fingerprint /etc/apt/keyrings/bodega-archive-keyring.gpg  # on the client
+```
+
+Or skip the network entirely: `bodega apt key export --keyring` writes the same bytes to stdout for delivery through whatever channel you already trust with the rest of the host's configuration.
+
+### APT index generation
+
+`dists/<suite>/Release` and the `Packages` bodies under it are generated together into one snapshot and served from memory until the next rebuild. Nothing is written to storage: the only stored part of the apt repository is `pool/`.
+
+They are generated together because `Release` records the SHA256 and byte length of each `Packages` body, and apt fetches the two in separate requests. Regenerating per request lets a write land between them, and the client rejects the result as `Hash Sum mismatch`.
+
+A rebuild happens on:
+
+| Trigger | Notes |
+|---------|-------|
+| Server start | Before the listener binds, so no request ever sees an empty index |
+| `SIGHUP` | After the manifest reload. Every mutating `bodega pkg` verb sends one |
+| A mutation-API write to an apt entry | `POST`, `DELETE`, and the hide and freeze toggles |
+| A ticker | Hourly once an index exists, every 15 seconds until one does |
+
+**A manifest edited by hand is picked up on the next tick, or at once on `SIGHUP`** (`kill -HUP $(cat <log_dir>/bodega.pid)`). The tick re-reads the manifest index from the backend before rebuilding, so an edit made outside the process reaches the index without a signal; the wait is up to an hour. Every mutating CLI verb signals, so the normal workflow never waits.
+
+The retry interval matters because a snapshot that never built is a 503 on every apt request, and the ordinary way to land there is transient: expired credentials, or a network that was not up when systemd started the unit.
+
+A mutation-API rebuild runs on a background context rather than the request's. The write commits before the rebuild starts, so a client that hangs up in between would otherwise get its change persisted and the index left describing the state before it.
+
+`Release` carries `Date` backdated 24 hours to tolerate client clock skew, and `Valid-Until` 14 days after that. The expiry is stamped when the snapshot is built and does not move on its own, which is why the refresh ticker is not an optimization: a server whose refresh loop stops eventually serves an expired `Release`, and every client fails `apt update` at once — including with `[trusted=yes]`, since `Acquire::Check-Valid-Until` is independent of trust. Within 24 hours of expiry the server logs at `WARN` on every `Release` fetch.
+
+Two cases drop an entry from the index silently, so both are logged at `WARN` once per rebuild:
+
+- The entry names suites, none of which is in `apt_suites`.
+- The entry has no `version`. No CLI verb can address a versionless entry, so publishing one hands clients a package nobody can withdraw.
+
+An architecture is served only if some entry published to that suite declares it. `Release` advertises exactly those architectures in `Architectures:`, and `binary-<arch>/Packages` 404s for any other, since `Release` records no digest for it. With no architecture-specific entry at all the suite falls back to `amd64`.
 
 ### TLS
 

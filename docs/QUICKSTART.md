@@ -95,12 +95,31 @@ bodega serve
 
 The server listens on `:8080` by default. Clients configure their package managers:
 
-**APT** — add to `/etc/apt/sources.list.d/bodega.list`:
-```
-deb [trusted=yes] https://bodega-host:8080/apt/ noble main
+**APT**: sign the repository, then point a client at the key:
+
+```bash
+bodega apt key generate          # on the server; restart or SIGHUP bodega afterwards
 ```
 
-`[trusted=yes]` turns off apt's signature verification for this source and nothing else re-enables it. The apt repository is unsigned, so the line is required until signing lands; TLS is what authenticates the packages in the meantime, which is why the URL is `https://`.
+```bash
+# on the client
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo curl -fsSL https://bodega-host:8080/apt/bodega-archive-keyring.gpg \
+  -o /etc/apt/keyrings/bodega-archive-keyring.gpg
+```
+
+`/etc/apt/sources.list.d/bodega.sources`:
+```
+Types: deb
+URIs: https://bodega-host:8080/apt/
+Suites: noble
+Components: main
+Signed-By: /etc/apt/keyrings/bodega-archive-keyring.gpg
+```
+
+That first keyring fetch is authenticated by TLS and nothing else. Compare `bodega apt key show` against `gpg --show-keys --with-fingerprint /etc/apt/keyrings/bodega-archive-keyring.gpg`, and publish the fingerprint somewhere that is not the server.
+
+Without a signing key the repository is served unsigned and the client needs `deb [trusted=yes] https://bodega-host:8080/apt/ noble main` instead, which turns off signature verification for that source permanently. TLS is then the only thing authenticating the packages, which is why the URL is `https://` either way. See `docs/USAGE.md` for what the signature does and does not prove.
 
 **pip**:
 ```bash

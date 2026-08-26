@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"path"
 	"sort"
@@ -14,6 +15,7 @@ import (
 	"compress/gzip"
 	"net/http"
 
+	"github.com/ravinald/bodega/internal/aptsign"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/storage"
 )
@@ -69,13 +71,11 @@ func (s *Server) handleAptDists(w http.ResponseWriter, r *http.Request) {
 		case "Release":
 			s.handleAptRelease(w, r, parts[0])
 			return
-		case "InRelease", "Release.gpg":
-			// Both are signature-bearing documents by definition, and this
-			// repository is unsigned. apt fetches InRelease first and falls
-			// back to Release on 404, the ordinary path for every archive
-			// predating InRelease. Serving unsigned bytes here instead would
-			// put a malformed document at a well-known URL.
-			http.NotFound(w, r)
+		case "InRelease":
+			s.handleAptSigned(w, r, parts[0], "InRelease")
+			return
+		case "Release.gpg":
+			s.handleAptSigned(w, r, parts[0], "Release.gpg")
 			return
 		}
 	}
@@ -122,6 +122,58 @@ func (s *Server) handleAptRelease(w http.ResponseWriter, r *http.Request, suite 
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(idx.release)
+}
+
+// handleAptSigned serves InRelease or Release.gpg from the snapshot, and 404s
+// when the repository is unsigned.
+//
+// A 404 is the correct answer, not a placeholder: apt fetches InRelease first
+// and falls back to Release on 404, the ordinary path for every archive
+// predating InRelease. Serving unsigned bytes under a name that means signed
+// would put a malformed document at a well-known URL.
+func (s *Server) handleAptSigned(w http.ResponseWriter, r *http.Request, suite, file string) {
+	idx, _, ok := s.aptIndex(w, r, suite)
+	if !ok {
+		return
+	}
+	body := idx.inRelease
+	if file == "Release.gpg" {
+		body = idx.releaseGPG
+	}
+	if body == nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+// handleAptPublicKey serves the armored signing key for a human to read and
+// for `gpg --dearmor` to consume.
+func (s *Server) handleAptPublicKey(w http.ResponseWriter, r *http.Request) {
+	s.serveAptKey(w, r, s.aptPubArmored)
+}
+
+// handleAptKeyring serves the dearmored keyring, which is what
+// /etc/apt/keyrings/ and signed-by= take directly.
+func (s *Server) handleAptKeyring(w http.ResponseWriter, r *http.Request) {
+	s.serveAptKey(w, r, s.aptKeyring)
+}
+
+// serveAptKey writes one rendering of the loaded public key. The first fetch
+// of this file is authenticated by TLS alone, which is why the fingerprint is
+// published out of band — see docs/USAGE.md.
+func (s *Server) serveAptKey(w http.ResponseWriter, r *http.Request, body []byte) {
+	if len(body) == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/pgp-keys")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }
 
 // handleAptPackages serves the snapshot's Packages index for one architecture.
@@ -198,6 +250,17 @@ const (
 	// nothing.
 	aptRefreshInterval = time.Hour
 
+	// aptRetryInterval is the interval used while no snapshot exists at all.
+	// Until one does every apt request is a 503, and the ordinary way to land
+	// there is transient: expired credentials, or a network that was not up
+	// when systemd started the unit. An hour of 503s is the wrong price for a
+	// backend that recovers in seconds.
+	aptRetryInterval = 15 * time.Second
+
+	// aptRebuildTimeout bounds a rebuild that no request is waiting on, so a
+	// wedged backend cannot pin the goroutine forever.
+	aptRebuildTimeout = 5 * time.Minute
+
 	// aptExpiryWarn is how long before Valid-Until the server starts logging
 	// at Warn, so a dead refresh loop surfaces while apt update still works.
 	aptExpiryWarn = 24 * time.Hour
@@ -209,6 +272,8 @@ const (
 // aptSuiteIndex is one suite's generated dists/<suite>/ tree.
 type aptSuiteIndex struct {
 	release    []byte
+	inRelease  []byte            // nil when unsigned
+	releaseGPG []byte            // nil when unsigned
 	packages   map[string][]byte // arch -> Packages
 	packagesGz map[string][]byte // arch -> Packages.gz
 }
@@ -247,19 +312,57 @@ func (s *Server) rebuildAptSnapshot(ctx context.Context) {
 		"suites", len(snap.suites), "valid_until", snap.validUntil.Format(time.RFC1123Z))
 }
 
-// aptRefreshLoop rebuilds on a ticker until ctx is cancelled. Valid-Until is
+// aptRefreshLoop rebuilds on a ticker until ctx is canceled. Valid-Until is
 // fixed when a snapshot is built, so without this the index expires in place.
+//
+// The interval is short until the first snapshot exists and settles to hourly
+// afterwards: with no snapshot every apt request is a 503, and the failures
+// that put it there are usually over in seconds.
 func (s *Server) aptRefreshLoop(ctx context.Context) {
-	t := time.NewTicker(aptRefreshInterval)
+	interval := s.aptTickInterval()
+	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			s.reloadManifests(ctx)
 			s.rebuildAptSnapshot(ctx)
+			if want := s.aptTickInterval(); want != interval {
+				interval = want
+				t.Reset(interval)
+				s.logger.Info("apt index refresh interval changed", "interval", interval.String())
+			}
 		}
 	}
+}
+
+// aptTickInterval is the retry interval until a snapshot exists and the
+// refresh interval afterwards.
+func (s *Server) aptTickInterval() time.Duration {
+	if s.aptSnap.Load() == nil {
+		return aptRetryInterval
+	}
+	return aptRefreshInterval
+}
+
+// reloadManifests re-reads the manifest index from the backend so the tick
+// sees edits made outside the process.
+//
+// Without it the loop re-stamps Valid-Until from an unchanged in-memory cache
+// forever: GetPackage answers from that cache and only LoadIndex clears it, so
+// a package withdrawn on disk would stay published until someone sent SIGHUP.
+// A failure here is not fatal — the previous index is still coherent, and
+// refusing to re-stamp Valid-Until over it would eventually expire the whole
+// repository over a transient read error.
+func (s *Server) reloadManifests(ctx context.Context) {
+	if err := s.store.LoadIndex(ctx); err != nil {
+		s.logger.Error("apt index refresh could not reload manifests; rebuilding from the cached copy",
+			"error", err)
+		return
+	}
+	s.aptPool.Store(nil)
 }
 
 // buildAptSnapshot generates every served suite's index from current manifest
@@ -373,7 +476,78 @@ func (s *Server) buildAptSuiteIndex(ctx context.Context, suite string, debKeys [
 		fmt.Fprintf(&buf, " %s %d %s\n", hex.EncodeToString(h[:]), len(e.data), e.path)
 	}
 	idx.release = buf.Bytes()
+	s.signAptRelease(idx, suite)
 	return idx
+}
+
+// loadAptSigner installs the signing key, if one is present, and renders the
+// two public forms the keyring routes serve.
+//
+// Absent key: unsigned, and that is a configuration rather than a fault, so it
+// logs at Info. Present but unusable: loud, because the operator installed a
+// key and would otherwise have no way to learn the repository is still
+// unsigned — apt reports nothing, since a missing InRelease is indistinguishable
+// from an archive that never had one.
+func (s *Server) loadAptSigner() {
+	paths := aptsign.DefaultKeyPaths(s.cfg.StoragePath)
+	kr, err := aptsign.Load(paths)
+	if errors.Is(err, aptsign.ErrNoKey) {
+		s.logger.Info("no apt signing key installed; the apt repository is served unsigned",
+			"searched", strings.Join(paths, ", "))
+		return
+	}
+	if err != nil {
+		s.logger.Error("apt signing key present but unusable; the apt repository stays unsigned",
+			"error", err)
+		return
+	}
+	pub, err := kr.PublicKey()
+	if err != nil {
+		s.logger.Error("apt signing key loaded but its public half will not render; the apt repository stays unsigned",
+			"path", kr.Path(), "error", err)
+		return
+	}
+	ring, err := kr.Keyring()
+	if err != nil {
+		s.logger.Error("apt signing key loaded but its keyring will not render; the apt repository stays unsigned",
+			"path", kr.Path(), "error", err)
+		return
+	}
+	s.signer = kr
+	s.aptPubArmored = pub
+	s.aptKeyring = ring
+	s.logger.Info("apt signing key loaded",
+		"path", kr.Path(), "keys", kr.Len(),
+		"fingerprints", strings.Join(kr.Fingerprints(), " "))
+}
+
+// signAptRelease attaches InRelease and Release.gpg to a freshly generated
+// suite index. Signing happens here, once per rebuild, rather than per
+// request: Release is what carries the digests of the Packages bodies beside
+// it, so a per-request signature would seal a different document every time
+// and re-sign on every apt update.
+//
+// A signing failure leaves both nil and logs. The suite keeps serving its
+// unsigned Release, which is the same shape a client sees before a key is
+// installed, rather than taking the repository down.
+func (s *Server) signAptRelease(idx *aptSuiteIndex, suite string) {
+	if s.signer == nil {
+		return
+	}
+	inRelease, err := s.signer.ClearSign(idx.release)
+	if err != nil {
+		s.logger.Error("apt InRelease signing failed; suite serves unsigned Release only",
+			"suite", suite, "error", err)
+		return
+	}
+	releaseGPG, err := s.signer.DetachSign(idx.release)
+	if err != nil {
+		s.logger.Error("apt Release.gpg signing failed; suite serves unsigned Release only",
+			"suite", suite, "error", err)
+		return
+	}
+	idx.inRelease = inRelease
+	idx.releaseGPG = releaseGPG
 }
 
 // auditAptEntries reports manifest entries the generator dropped. Both cases
