@@ -4,9 +4,19 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"path"
+	"strings"
 
 	"github.com/ravinald/bodega/internal/manifest"
 )
+
+// ObjectProber is the object-store surface the status check needs. *Client
+// satisfies it; tests substitute a fake so the per-type key derivation can be
+// exercised without an S3 endpoint.
+type ObjectProber interface {
+	HeadObject(ctx context.Context, key string) (*ObjectStatus, error)
+	ListPrefix(ctx context.Context, prefix string) ([]string, error)
+}
 
 // EntryStatus describes one manifest entry compared against S3.
 type EntryStatus struct {
@@ -21,7 +31,7 @@ type EntryStatus struct {
 
 // CheckStatus compares the local manifests against S3 and returns a per-entry
 // status report. Missing entries are marked InS3=false.
-func CheckStatus(ctx context.Context, client *Client, store *manifest.Store, types []string) ([]EntryStatus, error) {
+func CheckStatus(ctx context.Context, client ObjectProber, store *manifest.Store, types []string) ([]EntryStatus, error) {
 	var statuses []EntryStatus
 
 	for _, t := range types {
@@ -54,7 +64,7 @@ func CheckStatus(ctx context.Context, client *Client, store *manifest.Store, typ
 	return statuses, nil
 }
 
-func checkBinaryStatus(ctx context.Context, client *Client, store *manifest.Store) ([]EntryStatus, error) {
+func checkBinaryStatus(ctx context.Context, client ObjectProber, store *manifest.Store) ([]EntryStatus, error) {
 	var out []EntryStatus
 	for _, name := range store.ListPackages(manifest.TypeBinary) {
 		pm, err := store.GetPackage(ctx, manifest.TypeBinary, name)
@@ -94,7 +104,7 @@ func checkBinaryStatus(ctx context.Context, client *Client, store *manifest.Stor
 	return out, nil
 }
 
-func checkGitStatus(ctx context.Context, client *Client, store *manifest.Store) ([]EntryStatus, error) {
+func checkGitStatus(ctx context.Context, client ObjectProber, store *manifest.Store) ([]EntryStatus, error) {
 	var out []EntryStatus
 	for _, name := range store.ListPackages(manifest.TypeGit) {
 		pm, err := store.GetPackage(ctx, manifest.TypeGit, name)
@@ -133,15 +143,21 @@ func checkGitStatus(ctx context.Context, client *Client, store *manifest.Store) 
 	return out, nil
 }
 
-func checkAptStatus(ctx context.Context, client *Client, store *manifest.Store) ([]EntryStatus, error) {
-	// The apt repository is uploaded as a directory; check for the Release file.
-	// One S3 HEAD is sufficient — all apt packages share the same repo structure.
-	key := "packages/apt/dists/noble/Release"
-	s3stat, err := client.HeadObject(ctx, key)
-	if err != nil {
-		return nil, err
-	}
+const (
+	aptPrefix     = "packages/apt/"
+	aptPoolPrefix = aptPrefix + "pool/"
+)
+
+// checkAptStatus probes the pool object each manifest entry resolves to.
+// dists/ holds no stored objects: the server generates Release and Packages
+// per request, so there is nothing repository-wide to HEAD and probing one
+// reported every entry missing on every install.
+func checkAptStatus(ctx context.Context, client ObjectProber, store *manifest.Store) ([]EntryStatus, error) {
 	var out []EntryStatus
+	// Listing the pool is only needed for entries predating _pool_path, so
+	// defer it until one turns up.
+	var poolMap map[string]string
+
 	for _, name := range store.ListPackages(manifest.TypeApt) {
 		pm, err := store.GetPackage(ctx, manifest.TypeApt, name)
 		if err != nil {
@@ -151,21 +167,80 @@ func checkAptStatus(ctx context.Context, client *Client, store *manifest.Store) 
 			continue
 		}
 		for _, ve := range pm.Versions {
-			out = append(out, EntryStatus{
+			rel := ve.Metadata["_pool_path"]
+			if rel == "" {
+				if poolMap == nil {
+					poolMap, err = listAptPool(ctx, client)
+					if err != nil {
+						return out, err
+					}
+				}
+				srcName := ve.SourceName
+				if srcName == "" {
+					srcName = pm.Name
+				}
+				rel = findDebInPool(poolMap, srcName, ve.Version, ve.Metadata["Architecture"])
+			}
+
+			status := EntryStatus{
 				Type:   manifest.TypeApt,
 				Name:   ve.VersionedName(pm.Name),
-				S3Key:  key,
-				InS3:   s3stat.Exists,
 				Frozen: ve.Frozen,
-				ETag:   s3stat.ETag,
-				SizeS3: s3stat.Size,
-			})
+			}
+			if rel == "" {
+				// No pool object resolves for this entry; nothing to HEAD.
+				out = append(out, status)
+				continue
+			}
+			status.S3Key = aptPrefix + rel
+			s3stat, err := client.HeadObject(ctx, status.S3Key)
+			if err != nil {
+				return out, err
+			}
+			status.InS3 = s3stat.Exists
+			status.ETag = s3stat.ETag
+			status.SizeS3 = s3stat.Size
+			out = append(out, status)
 		}
 	}
 	return out, nil
 }
 
-func checkPypiStatus(ctx context.Context, client *Client, store *manifest.Store) ([]EntryStatus, error) {
+// listAptPool maps each pooled .deb basename to its path relative to
+// packages/apt/, matching the Filename form the server emits into Packages.
+func listAptPool(ctx context.Context, client ObjectProber) (map[string]string, error) {
+	keys, err := client.ListPrefix(ctx, aptPoolPrefix)
+	if err != nil {
+		return nil, err
+	}
+	poolMap := make(map[string]string, len(keys))
+	for _, key := range keys {
+		base := path.Base(key)
+		if !strings.HasSuffix(base, ".deb") {
+			continue
+		}
+		poolMap[base] = strings.TrimPrefix(key, aptPrefix)
+	}
+	return poolMap, nil
+}
+
+// findDebInPool resolves a pooled .deb for entries whose manifest predates
+// _pool_path. Mirrors the server's lookup so status and the served Packages
+// index agree on which object backs an entry.
+func findDebInPool(poolMap map[string]string, pkgName, version, arch string) string {
+	if rel, ok := poolMap[pkgName+"_"+version+"_"+arch+".deb"]; ok {
+		return rel
+	}
+	prefix := pkgName + "_" + version
+	for base, rel := range poolMap {
+		if strings.HasPrefix(base, prefix) {
+			return rel
+		}
+	}
+	return ""
+}
+
+func checkPypiStatus(ctx context.Context, client ObjectProber, store *manifest.Store) ([]EntryStatus, error) {
 	// One status entry per package: check for the wheel MANIFEST.sha256 sentinel.
 	const key = "pypi/wheels/MANIFEST.sha256"
 	s3stat, err := client.HeadObject(ctx, key)
@@ -193,7 +268,7 @@ func checkPypiStatus(ctx context.Context, client *Client, store *manifest.Store)
 	return out, nil
 }
 
-func checkGomodStatus(ctx context.Context, client *Client, store *manifest.Store) ([]EntryStatus, error) {
+func checkGomodStatus(ctx context.Context, client ObjectProber, store *manifest.Store) ([]EntryStatus, error) {
 	var out []EntryStatus
 	for _, name := range store.ListPackages(manifest.TypeGomod) {
 		pm, err := store.GetPackage(ctx, manifest.TypeGomod, name)
@@ -223,7 +298,7 @@ func checkGomodStatus(ctx context.Context, client *Client, store *manifest.Store
 	return out, nil
 }
 
-func checkHelmStatus(ctx context.Context, client *Client, store *manifest.Store) ([]EntryStatus, error) {
+func checkHelmStatus(ctx context.Context, client ObjectProber, store *manifest.Store) ([]EntryStatus, error) {
 	var out []EntryStatus
 	for _, name := range store.ListPackages(manifest.TypeHelm) {
 		pm, err := store.GetPackage(ctx, manifest.TypeHelm, name)
@@ -254,7 +329,7 @@ func checkHelmStatus(ctx context.Context, client *Client, store *manifest.Store)
 	return out, nil
 }
 
-func checkNpmStatus(ctx context.Context, client *Client, store *manifest.Store) ([]EntryStatus, error) {
+func checkNpmStatus(ctx context.Context, client ObjectProber, store *manifest.Store) ([]EntryStatus, error) {
 	var out []EntryStatus
 	for _, name := range store.ListPackages(manifest.TypeNpm) {
 		pm, err := store.GetPackage(ctx, manifest.TypeNpm, name)

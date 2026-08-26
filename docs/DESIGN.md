@@ -53,7 +53,9 @@ s3://<bucket>/
   index.json                 # fast startup without loading every manifest
   graph.json                 # dependency graph with typed edges
   metrics.json               # dashboard metrics (updated on SaveIndex)
-  packages/apt/              # Debian repository (Release, Packages.gz, pool/)
+  packages/apt/pool/         # Debian .deb pool, the only stored part of the apt repo
+                             #   dists/ (Release, Packages, Packages.gz) is generated
+                             #   per request from the manifests and never stored
   pypi/wheels/               # Python wheels
   repos/                     # Git bundles (.bundle) and release archives (.tar.gz)
   binaries/                  # Direct downloads, versioned subdirectories
