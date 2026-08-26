@@ -407,12 +407,19 @@ func ResolveAndCreateConcreteVersion(ctx context.Context, store *manifest.Store,
 		}
 	}
 
-	if err := store.AddVersion(ctx, manifest.TypeApt, pkgName, *ve); err != nil {
+	// A version-less entry is the placeholder cmd_create wrote before the
+	// version was known, not a second package. Fill it in place: adding
+	// beside it publishes two stanzas for one package, and no CLI verb can
+	// reach the placeholder afterwards because every one of them addresses a
+	// version by name.
+	if placeholder := fillResolvedVersion(ctx, store, pkgName, ve); placeholder {
+		_, _ = fmt.Fprintf(out, "  [apt] resolved %s > %s\n", pkgName, version)
+	} else if err := store.AddVersion(ctx, manifest.TypeApt, pkgName, *ve); err != nil {
 		_, _ = fmt.Fprintf(out, "  [apt] WARNING: could not add %s@%s: %v\n", pkgName, version, err)
 		return
+	} else {
+		_, _ = fmt.Fprintf(out, "  [apt] resolved %s > %s\n", pkgName, version)
 	}
-
-	_, _ = fmt.Fprintf(out, "  [apt] resolved %s → %s\n", pkgName, version)
 
 	// Also set the package-level description if not already set.
 	if ve.Description != "" {
@@ -423,4 +430,42 @@ func ResolveAndCreateConcreteVersion(ctx context.Context, store *manifest.Store,
 			}
 		}
 	}
+}
+
+// fillResolvedVersion writes resolved onto the first version-less entry for
+// pkgName, preserving anything the operator set that the upstream fetch does
+// not carry. Reports whether such an entry existed.
+func fillResolvedVersion(ctx context.Context, store *manifest.Store, pkgName string, resolved *manifest.VersionEntry) bool {
+	pm, err := store.GetPackage(ctx, manifest.TypeApt, pkgName)
+	if err != nil || pm == nil {
+		return false
+	}
+	for i, existing := range pm.Versions {
+		if existing.Version != "" {
+			continue
+		}
+		merged := existing
+		merged.Version = resolved.Version
+		if resolved.SourceName != "" {
+			merged.SourceName = resolved.SourceName
+		}
+		if resolved.ArtifactSize > 0 {
+			merged.ArtifactSize = resolved.ArtifactSize
+		}
+		if len(resolved.Metadata) > 0 {
+			merged.Metadata = resolved.Metadata
+		}
+		if resolved.Description != "" {
+			merged.Description = resolved.Description
+		}
+		if resolved.Platform != "" {
+			merged.Platform = resolved.Platform
+		}
+		pm.Versions[i] = merged
+		if err := store.SavePackage(ctx, pm); err != nil {
+			return false
+		}
+		return true
+	}
+	return false
 }
