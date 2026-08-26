@@ -584,12 +584,15 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Probe the apt Release file as a lightweight S3 health check.
-	status, err := s.objects.Head(r.Context(), "packages/apt/dists/noble/Release")
+	// Probe the apt pool. dists/ is generated per request and never stored,
+	// so it cannot answer whether the object store holds anything; the pool is
+	// what upload writes, and its prefix names no codename.
+	const aptPoolPrefix = "packages/apt/pool/"
+	keys, err := s.objects.List(r.Context(), aptPoolPrefix)
 	if err != nil {
 		resp.Healthy = false
-		resp.Error = "s3 probe failed"
-		s.logger.Error("s3 probe failed", "error", err)
+		resp.Error = "object store probe failed"
+		s.logger.Error("object store probe failed", "error", err, "prefix", aptPoolPrefix)
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
@@ -597,9 +600,9 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 	resp.S3Entries = []s3EntryStatus{
 		{
 			Type:  manifest.TypeApt,
-			Name:  "apt-release",
-			S3Key: "packages/apt/dists/noble/Release",
-			InS3:  status.Exists,
+			Name:  "apt-pool",
+			S3Key: aptPoolPrefix,
+			InS3:  len(keys) > 0,
 		},
 	}
 

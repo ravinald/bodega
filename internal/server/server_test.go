@@ -718,6 +718,21 @@ func TestAPIStatus(t *testing.T) {
 	if _, ok := result["entry_count"]; !ok {
 		t.Error("response missing 'entry_count' field")
 	}
+
+	// The probe must resolve against objects that exist. The mock store holds
+	// pool objects and no dists/ tree, which is what a healthy install looks
+	// like.
+	entries, ok := result["s3_entries"].([]interface{})
+	if !ok || len(entries) != 1 {
+		t.Fatalf("s3_entries = %v, want one probe row", result["s3_entries"])
+	}
+	probe, _ := entries[0].(map[string]interface{})
+	if got := probe["s3_key"]; got != "packages/apt/pool/" {
+		t.Errorf("s3_key = %v, want packages/apt/pool/", got)
+	}
+	if probe["in_s3"] != true {
+		t.Errorf("in_s3 = %v, want true", probe["in_s3"])
+	}
 }
 
 func TestAPIConfig(t *testing.T) {
