@@ -68,6 +68,16 @@ Each package gets its own manifest file at `manifests/{type}/{safeName}/manifest
 
 One bucket. Versioning enabled. KMS encryption. Public access blocked.
 
+### Storage placement
+
+That layout describes one backend. `storage_backend`/`storage_path`/`bucket`/`region` define it, and its reserved name is `default`. `storage_backends` adds more by name, and `storage_by_type` sends a type's next write to one of them; each backend carries the same key layout, optionally under a `prefix`.
+
+Placement and resolution are separate questions and share no code path. The config decides where the **next** write goes. Where an artifact **already written** lives is the name recorded in `storage` on its version entry, and reads consult only that. So a rule change moves nothing and breaks nothing: everything already uploaded stays where it is and stays readable.
+
+An absent `storage` is `default`, not "recompute from config" — that is the answer for every artifact uploaded before named backends existed. A name nothing answers to fails the read rather than searching the other backends: serving bytes from one store under a digest recorded against another is the signature the checksum machinery exists to catch.
+
+Objects with no version entry — generated indexes, the GPG key, proxy-cache entries, attestation blobs — follow the type rule at both ends, which is safe because every one of them is regenerable. Manifests stay on `default`: they are what records placement.
+
 ## Package types
 
 | Type | Source | Artifact | Client protocol |
@@ -134,6 +144,7 @@ Each VersionEntry represents a concrete or policy version:
 - Concrete versions have a specific version identifier and full metadata
 - `hidden: true` excludes the version from client view but keeps it in the record
 - `frozen: true` prevents building, editing, or deletion
+- `storage` names the backend holding this version's bytes; absent means `default`
 - `metadata` holds ecosystem-specific key-value pairs (apt: Architecture, Maintainer, etc.)
 
 ## Version policies and constraints
@@ -320,6 +331,8 @@ Key fields:
 | Field | Default | Purpose |
 |-------|---------|---------|
 | `bucket` | (required) | S3 bucket name |
+| `storage_backends` | {} | Additional backends, by name |
+| `storage_by_type` | {} | Which named backend each type's next write targets |
 | `region` | us-west-2 | AWS region |
 | `build_root` | /opt/bodega | Where artifacts are built locally |
 | `proxy_cache_enabled` | false | Global proxy/cache toggle |

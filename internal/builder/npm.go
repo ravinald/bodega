@@ -326,8 +326,10 @@ func NpmArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) []
 			local := npmTarballPath(d, name, ve)
 			if fileExists(local) {
 				paths = append(paths, ArtifactPath{
-					Local: local,
-					S3Key: npmS3Prefix(name) + npmTarballFilename(name, ve),
+					Local:   local,
+					S3Key:   npmS3Prefix(name) + npmTarballFilename(name, ve),
+					Package: name,
+					Version: ve.Version,
 				})
 			}
 

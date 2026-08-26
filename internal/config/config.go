@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -66,14 +67,48 @@ type Config struct {
 	DenyList          []string `json:"deny_list,omitempty"`
 	Timezone          string   `json:"timezone,omitempty"`          // display timezone, e.g. "America/Los_Angeles"; default UTC
 	AuditEvents       []string `json:"audit_events,omitempty"`      // event types to record; empty = all
-	StorageBackend    string   `json:"storage_backend,omitempty"`   // "local" (default), "s3"
+	StorageBackend    string   `json:"storage_backend,omitempty"`   // driver for the "default" backend: "local" (default), "s3"
 	StoragePath       string   `json:"storage_path,omitempty"`      // root directory for local backend
 	AptCodename       string   `json:"apt_codename,omitempty"`      // default suite for apt entries that name none (default "noble")
 	AptSuites         []string `json:"apt_suites,omitempty"`        // suites served under /apt/dists/; always includes AptCodename
 	AdminPermitCIDR   []string `json:"admin_permit_cidr,omitempty"` // CIDRs allowed to hit mutation API; default ["127.0.0.0/8","::1/128"]
-	LocalConfig       bool     `json:"-"`
-	Verbose           bool     `json:"-"`
+
+	// StorageBackends maps a backend *name* to its parameters. The name is
+	// what an artifact records in the manifest, so it has to be stable and
+	// distinguishable from a driver — see the reserved-word check in Load.
+	StorageBackends map[string]StorageSpec `json:"storage_backends,omitempty"`
+
+	// StorageByType maps a package type to a backend *name*. It decides where
+	// the next write for that type goes. It never decides where an artifact
+	// already written lives: that is the name recorded on the version entry.
+	StorageByType map[string]string `json:"storage_by_type,omitempty"`
+
+	LocalConfig bool `json:"-"`
+	Verbose     bool `json:"-"`
 }
+
+// DefaultStorageName is the reserved name of the backend defined by
+// storage_backend / storage_path / bucket / region. Every artifact uploaded
+// before named backends existed lives there.
+const DefaultStorageName = "default"
+
+// StorageSpec is one named backend's parameters. Driver is the same namespace
+// as storage_backend; every other field is read only by the driver that needs
+// it.
+type StorageSpec struct {
+	Driver string `json:"driver"`
+	Path   string `json:"path,omitempty"`   // local: filesystem root
+	Bucket string `json:"bucket,omitempty"` // s3
+	Region string `json:"region,omitempty"` // s3
+	Prefix string `json:"prefix,omitempty"` // key prefix within the backend
+}
+
+// StorageDrivers reports the storage driver names the binary has registered.
+// internal/storage installs the real lookup from its init; it imports this
+// package, so the dependency can only point that way. A binary that never
+// links internal/storage has no drivers for a backend name to collide with,
+// which makes the check below vacuous rather than wrong.
+var StorageDrivers = func() []string { return nil }
 
 // RootForType returns the effective build root for a given source type.
 func (c *Config) RootForType(typ string) string {
@@ -210,12 +245,73 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	}
 	cfg.AptSuites = suites
 
+	if err := cfg.validateStorage(); err != nil {
+		return nil, err
+	}
+
 	// Mutation allow-list: default to localhost only.
 	if len(cfg.AdminPermitCIDR) == 0 {
 		cfg.AdminPermitCIDR = []string{"127.0.0.0/8", "::1/128"}
 	}
 
 	return cfg, nil
+}
+
+// validateStorage rejects the two ways the driver and name namespaces can be
+// confused, and the one way a placement rule can point at nothing.
+//
+// A dangling storage_by_type value is fatal here rather than at the write that
+// would use it: discovered mid-upload it has already decided where an artifact
+// went, and a name recorded against a backend nobody defined cannot be read
+// back.
+func (c *Config) validateStorage() error {
+	drivers := StorageDrivers()
+	isDriver := make(map[string]bool, len(drivers))
+	for _, d := range drivers {
+		isDriver[d] = true
+	}
+	driverList := strings.Join(drivers, ", ")
+
+	for name, spec := range c.StorageBackends {
+		switch {
+		case name == "":
+			return fmt.Errorf("invalid storage_backends key: empty name")
+		case name == DefaultStorageName:
+			return fmt.Errorf("invalid storage_backends key %q: reserved for the backend defined by storage_backend/storage_path/bucket/region", name)
+		case isDriver[name]:
+			return fmt.Errorf("invalid storage_backends key %q: that is a storage driver, not a backend name (drivers: %s)", name, driverList)
+		}
+		if spec.Driver == "" {
+			return fmt.Errorf("storage_backends[%q]: driver is required (drivers: %s)", name, driverList)
+		}
+		if len(drivers) > 0 && !isDriver[spec.Driver] {
+			return fmt.Errorf("storage_backends[%q]: unknown driver %q (drivers: %s)", name, spec.Driver, driverList)
+		}
+	}
+
+	for typ, name := range c.StorageByType {
+		if name == "" {
+			return fmt.Errorf("storage_by_type[%q]: empty backend name", typ)
+		}
+		if name == DefaultStorageName {
+			continue
+		}
+		if _, ok := c.StorageBackends[name]; !ok {
+			return fmt.Errorf("storage_by_type[%q] names undefined storage backend %q (defined: %s)", typ, name, c.definedStorageNames())
+		}
+	}
+	return nil
+}
+
+// definedStorageNames lists every usable backend name, sorted, with the
+// reserved default first so an error message reads as the full menu.
+func (c *Config) definedStorageNames() string {
+	names := make([]string, 0, len(c.StorageBackends)+1)
+	for name := range c.StorageBackends {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return strings.Join(append([]string{DefaultStorageName}, names...), ", ")
 }
 
 // Save writes the current config to the first writable config path.
@@ -300,9 +396,13 @@ func defaultConfigContent() []byte {
   "_comment": "bodega configuration — all fields are optional, shown here with defaults",
   "_comment_priority": "flags > env vars > this file > built-in defaults",
 
-  "_comment_storage": "storage_backend: \"local\" (default) stores artifacts under storage_path; \"s3\" stores them in bucket + region",
+  "_comment_storage": "storage_backend: \"local\" (default) stores artifacts under storage_path; \"s3\" stores them in bucket + region. Together these define the backend named \"default\".",
   "storage_backend": "local",
   "storage_path": "/var/lib/bodega",
+
+  "_comment_storage_named": "storage_backends: additional backends by name; a name may not be \"default\" or a driver name. storage_by_type: which named backend the NEXT write of each package type goes to. Neither moves what is already uploaded — every version records the backend it was written to, and an unset value means \"default\".",
+  "storage_backends": {},
+  "storage_by_type": {},
 
   "bucket": "",
   "region": "us-west-2",

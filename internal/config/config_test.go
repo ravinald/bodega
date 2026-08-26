@@ -142,9 +142,16 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 	// discover_mode is validated by Load, so it cannot take a generated value.
 	// apt_suites is normalized by Load — apt_codename first, then the rest, no
 	// duplicates — so it has to be filled in the shape Load would produce.
+	// storage_backends keys and storage_by_type values are validated against
+	// each other, so a generated value would fail Load: the name has to exist
+	// and the driver has to be non-empty.
 	overrides := map[string]any{
 		"discover_mode": "observe",
 		"apt_suites":    []string{"value-apt_codename", "apt_suites-one"},
+		"storage_backends": map[string]config.StorageSpec{
+			"bulk": {Driver: "local", Path: "/mnt/bulk", Prefix: "cold/"},
+		},
+		"storage_by_type": map[string]string{"apt": "bulk"},
 	}
 
 	v := reflect.ValueOf(cfg).Elem()
@@ -171,6 +178,8 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 				t.Fatalf("fillConfig: unhandled slice element type %s for field %s — extend fillConfig", f.Type.Elem(), f.Name)
 			}
 			v.Field(i).Set(reflect.ValueOf([]string{tag + "-one", tag + "-two"}))
+		case reflect.Map:
+			t.Fatalf("fillConfig: map field %s has no override — a map's values are usually cross-validated, so give it an explicit one", f.Name)
 		default:
 			t.Fatalf("fillConfig: unhandled kind %s for field %s — extend fillConfig", f.Type.Kind(), f.Name)
 		}

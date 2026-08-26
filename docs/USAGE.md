@@ -356,6 +356,16 @@ A default config is created on first run. All fields are optional.
 {
   "storage_backend": "local",
   "storage_path": "/var/lib/bodega/data",
+  "storage_backends": {
+    "bulk": { "driver": "local", "path": "/mnt/bulk/bodega" },
+    "archive": {
+      "driver": "s3",
+      "bucket": "bodega-archive",
+      "region": "us-east-1",
+      "prefix": "cold/"
+    }
+  },
+  "storage_by_type": { "pypi": "bulk" },
   "bucket": "my-bodega-bucket",
   "region": "us-west-2",
   "build_root": "/opt/bodega",
@@ -413,6 +423,67 @@ A backend that fails to construct is not fatal for `bodega serve`. The server st
 ERROR storage backend unavailable — package routes will answer 503; the API and /healthz still serve
   backend=local config=/etc/bodega/config.json error=create storage root /dev/null/nope: mkdir /dev/null: not a directory
 ```
+
+### Named backends and per-type placement
+
+`storage_backend`, `storage_path`, `bucket` and `region` describe one backend, whose reserved name is `default`. `storage_backends` adds more, by name. `storage_by_type` says which name the _next_ write of each package type goes to.
+
+```json
+{
+  "storage_backends": {
+    "bulk": { "driver": "local", "path": "/mnt/bulk/bodega" },
+    "archive": {
+      "driver": "s3",
+      "bucket": "bodega-archive",
+      "region": "us-east-1",
+      "prefix": "cold/"
+    }
+  },
+  "storage_by_type": { "pypi": "bulk", "binary": "bulk" }
+}
+```
+
+Per backend: `driver` is required and is one of the same values `storage_backend` takes. `path` is read by `local`; `bucket` and `region` by `s3`; `prefix` roots every key under it, on either driver.
+
+The two namespaces never mix, and `Load` enforces it. `storage_backend` is a **driver**. `storage_backends` keys and `storage_by_type` values are **names**. A name equal to `default` or to a driver is rejected, as is a `storage_by_type` value naming a backend nothing defines:
+
+```text
+storage_by_type["apt"] names undefined storage backend "archive" (defined: default, bulk)
+```
+
+#### Placement is recorded, not recomputed
+
+Each version records the backend it was written to, in `storage` on its manifest entry. Reads use that recorded name and never the config. Change a rule and everything already uploaded stays exactly where it is and stays readable; only the next write moves.
+
+An entry with no `storage` key is on `default`. That is not "resolve it now" — it is the answer, and it is the correct one for every artifact uploaded before named backends existed.
+
+A name no backend answers to is an error rather than a search of the others. Serving bytes from a second backend under a digest recorded against the first is indistinguishable from tampering, which is what the checksum machinery exists to catch.
+
+#### Changing a rule
+
+`upload` and `sync` honor a name a version already records. Change `storage_by_type` and they keep writing where the manifest says, so two runs either side of the change cannot produce divergent copies.
+
+`--replace-placement` is the deliberate move. It applies the current rule to versions already placed elsewhere, repoints the manifest, and warns for every object it leaves behind — nothing copies the old bytes.
+
+`apt`, `pypi` and `git` upload whole directories with no per-version granularity, so a changed rule refuses outright rather than splitting a tree across backends:
+
+```text
+storage_by_type["apt"] now resolves to "bulk", but 2 apt version(s) are recorded elsewhere:
+  nginx@1.24.0 (on "default")
+  redis@7.2.4 (on "default")
+apt uploads whole directories, so proceeding would split the tree across backends with no listing to reunite it.
+Move those objects, or pass --replace-placement to repoint the manifest and leave the old copies stranded
+```
+
+#### What is not placed
+
+Generated indexes, the GPG key, proxy-cache entries and attestation blobs have no version to record a name against. They follow the type rule at both read and write, which is safe because every one of them is regenerable.
+
+#### Listing and diagnostics disagree on purpose
+
+The PEP 503 indexes and the apt pool listing union every backend and fail the whole request with 502 if any one of them errors. A short index is indistinguishable from packages having been withdrawn, and apt acts on the difference.
+
+`/api/v1/status` does the opposite: one row per backend, the failing one carrying its error, `healthy: false`. A diagnostic exists to say which backend is broken.
 
 ### Per-type build roots
 
@@ -477,6 +548,7 @@ All version entries support:
 | `artifact_size` | int64 | Size in bytes (set at fetch time) |
 | `hidden` | bool | Excludes from client view but keeps in manifest |
 | `frozen` | bool | Prevents building, editing, or deletion |
+| `storage` | string | Backend holding this version's bytes. Absent means `default`; see [Named backends](#named-backends-and-per-type-placement) |
 | `metadata` | object | Ecosystem-specific key-value pairs |
 | `build_env` | object | Build server's environment at artifact creation time |
 

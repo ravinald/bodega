@@ -10,7 +10,6 @@ import (
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
-	"github.com/ravinald/bodega/internal/storage"
 )
 
 func newDeleteCmd(gf *globalFlags) *cobra.Command {
@@ -56,9 +55,9 @@ Frozen entries cannot be deleted; unfreeze them first with 'bodega freeze'.`,
 
 			// Remove from object store first if requested.
 			if removeFromS3 {
-				objStore, err := storage.New(ctx, cfg)
+				objStore, err := storeForEntry(ctx, cfg, store, t, name)
 				if err != nil {
-					return fmt.Errorf("connect to storage: %w", err)
+					return err
 				}
 				key := s3KeyFor(store, ctx, t, name)
 				if key != "" {

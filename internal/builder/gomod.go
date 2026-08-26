@@ -203,8 +203,10 @@ func GomodArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) 
 				local := filepath.Join(dir, ve.Version+ext)
 				if fileExists(local) {
 					paths = append(paths, ArtifactPath{
-						Local: local,
-						S3Key: prefix + ve.Version + ext,
+						Local:   local,
+						S3Key:   prefix + ve.Version + ext,
+						Package: name,
+						Version: ve.Version,
 					})
 				}
 			}

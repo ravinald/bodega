@@ -4,8 +4,6 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
-
-	"github.com/ravinald/bodega/internal/storage"
 )
 
 func newRemoveCmd(gf *globalFlags) *cobra.Command {
@@ -38,9 +36,9 @@ file is not modified.`,
 			if key == "" {
 				return fmt.Errorf("could not determine S3 key for %s/%s", t, name)
 			}
-			objStore, err := storage.New(ctx, cfg)
+			objStore, err := storeForEntry(ctx, cfg, store, t, name)
 			if err != nil {
-				return fmt.Errorf("connect to storage: %w", err)
+				return err
 			}
 
 			fmt.Printf("Deleting %s/%s ...\n", objStore.Label(), key)

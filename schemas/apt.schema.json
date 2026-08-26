@@ -55,6 +55,10 @@
             "type": "boolean",
             "default": false,
             "description": "When true, the entry cannot be built, edited, or deleted."
+          },
+          "storage": {
+            "type": "string",
+            "description": "Name of the storage backend holding this version's artifact bytes. Absent means \"default\" — the backend defined by storage_backend/storage_path/bucket/region — and is correct for every artifact uploaded before named backends existed. It is not a placement rule: storage_by_type decides where the next write goes, this records where an already-written artifact is."
           }
         },
         "additionalProperties": false

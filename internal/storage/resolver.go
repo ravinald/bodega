@@ -3,6 +3,10 @@ package storage
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/ravinald/bodega/internal/config"
 )
 
 // DefaultName is the reserved name of the backend described by the global
@@ -98,4 +102,116 @@ func (r *single) Fanout(_ context.Context, _ string) []NamedStore { return r.All
 
 func (r *single) All() []NamedStore {
 	return []NamedStore{{Name: DefaultName, Store: r.store}}
+}
+
+// multi is a Resolver over the default backend plus every entry in
+// storage_backends, with placement decided by storage_by_type.
+type multi struct {
+	stores map[string]ObjectStore
+	byType map[string]string
+	names  []string // DefaultName first, then the rest sorted
+}
+
+// NewResolver builds the resolver described by the whole config: the default
+// backend from the global keys, plus one per storage_backends entry.
+//
+// config.Load has already rejected a name that collides with the reserved
+// default or with a driver, and a storage_by_type value naming nothing, so
+// every lookup here can treat its input as valid.
+func NewResolver(ctx context.Context, cfg *config.Config) (Resolver, error) {
+	def, err := New(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if len(cfg.StorageBackends) == 0 && len(cfg.StorageByType) == 0 {
+		return NewSingle(def), nil
+	}
+
+	m := &multi{
+		stores: map[string]ObjectStore{DefaultName: def},
+		byType: cfg.StorageByType,
+		names:  []string{DefaultName},
+	}
+	named := make([]string, 0, len(cfg.StorageBackends))
+	for name := range cfg.StorageBackends {
+		named = append(named, name)
+	}
+	sort.Strings(named)
+	for _, name := range named {
+		spec := cfg.StorageBackends[name]
+		store, err := NewFromSpec(ctx, Spec{
+			Driver: spec.Driver,
+			Path:   spec.Path,
+			Bucket: spec.Bucket,
+			Region: spec.Region,
+			Prefix: spec.Prefix,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("storage backend %q: %w", name, err)
+		}
+		m.stores[name] = store
+		m.names = append(m.names, name)
+	}
+	return m, nil
+}
+
+func (r *multi) Default() ObjectStore { return r.stores[DefaultName] }
+
+func (r *multi) ByName(name string) (ObjectStore, error) {
+	if name == "" {
+		name = DefaultName
+	}
+	store, ok := r.stores[name]
+	if !ok {
+		return nil, fmt.Errorf("unknown storage backend %q (configured: %s)", name, strings.Join(r.names, ", "))
+	}
+	return store, nil
+}
+
+// Placement consults storage_by_type only. pkg is the level below it and has
+// no config key yet; it stays in the signature because the caller that would
+// use it — the upload write-back — already passes the package name, so adding
+// the rule later changes one function rather than every call site.
+func (r *multi) Placement(typ, _ string) string {
+	if name := r.byType[typ]; name != "" {
+		return name
+	}
+	return DefaultName
+}
+
+func (r *multi) ForType(typ string) ObjectStore {
+	store, err := r.ByName(r.Placement(typ, ""))
+	if err != nil {
+		return r.Default()
+	}
+	return store
+}
+
+func (r *multi) Fanout(_ context.Context, _ string) []NamedStore { return dedupByLabel(r.All()) }
+
+func (r *multi) All() []NamedStore {
+	out := make([]NamedStore, 0, len(r.names))
+	for _, name := range r.names {
+		out = append(out, NamedStore{Name: name, Store: r.stores[name]})
+	}
+	return out
+}
+
+// dedupByLabel drops backends that resolve to the same physical location.
+// Two names pointing at one bucket or one directory is a normal way to stage a
+// migration, and listing it twice would double every fan-out and hand the
+// union a duplicate of every key. Label is the identity because it is the only
+// thing an ObjectStore exposes about where it writes.
+func dedupByLabel(in []NamedStore) []NamedStore {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]NamedStore, 0, len(in))
+	for _, ns := range in {
+		label := ns.Store.Label()
+		if _, dup := seen[label]; dup {
+			continue
+		}
+		seen[label] = struct{}{}
+		out = append(out, ns)
+	}
+	return out
 }

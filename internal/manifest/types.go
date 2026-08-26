@@ -178,6 +178,16 @@ type VersionEntry struct {
 	// Frozen prevents this version from being built, edited, or deleted.
 	Frozen bool `json:"frozen,omitempty"`
 
+	// Storage names the backend holding this version's artifact bytes.
+	//
+	// EMPTY MEANS "default" — NOT "resolve via the config hierarchy". Every
+	// artifact uploaded before multi-backend existed lives in the one store now
+	// called "default", so the zero value is already correct for everything in
+	// the field. If empty meant "resolve now", the moment an operator set
+	// storage_by_type.apt = "bulk" every already-uploaded .deb would become
+	// unreadable.
+	Storage string `json:"storage,omitempty"`
+
 	// --- optional per-version documentation ---
 
 	// Description overrides the package-level description for this specific version.
