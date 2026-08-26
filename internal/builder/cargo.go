@@ -176,8 +176,10 @@ func CargoArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) 
 				continue
 			}
 			paths = append(paths, ArtifactPath{
-				Local: local,
-				S3Key: cargoS3Prefix(name) + cargoCrateFilename(pm.Name, ve),
+				Local:   local,
+				S3Key:   cargoS3Prefix(name) + cargoCrateFilename(pm.Name, ve),
+				Package: name,
+				Version: ve.Version,
 			})
 		}
 	}

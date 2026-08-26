@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/ravinald/bodega/internal/config"
@@ -81,6 +82,7 @@ type Spec struct {
 	Path   string // local: filesystem root
 	Bucket string // s3
 	Region string // s3
+	Prefix string // key prefix within the backend
 }
 
 // Constructor creates an ObjectStore from one backend's Spec.
@@ -103,14 +105,86 @@ func NewFromSpec(ctx context.Context, spec Spec) (ObjectStore, error) {
 	}
 	fn, ok := backends[driver]
 	if !ok {
-		available := make([]string, 0, len(backends))
-		for k := range backends {
-			available = append(available, k)
-		}
-		sort.Strings(available)
-		return nil, fmt.Errorf("unknown storage backend %q (available: %v)", driver, available)
+		return nil, fmt.Errorf("unknown storage backend %q (available: %v)", driver, Drivers())
 	}
-	return fn(ctx, spec)
+	store, err := fn(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
+	return withPrefix(store, spec.Prefix), nil
+}
+
+// withPrefix returns store with every key rooted under prefix. Keys coming
+// back out of List have the prefix stripped, so a caller comparing keys across
+// backends — the listing fan-out does exactly that — sees one namespace rather
+// than one per backend.
+func withPrefix(store ObjectStore, prefix string) ObjectStore {
+	prefix = strings.TrimPrefix(prefix, "/")
+	if prefix == "" {
+		return store
+	}
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	return &prefixed{inner: store, prefix: prefix}
+}
+
+// prefixed roots one backend under a key prefix.
+type prefixed struct {
+	inner  ObjectStore
+	prefix string
+}
+
+func (p *prefixed) key(k string) string { return p.prefix + k }
+
+func (p *prefixed) Get(ctx context.Context, key string) ([]byte, error) {
+	return p.inner.Get(ctx, p.key(key))
+}
+
+func (p *prefixed) GetStream(ctx context.Context, key string) (*StreamResult, error) {
+	return p.inner.GetStream(ctx, p.key(key))
+}
+
+func (p *prefixed) Head(ctx context.Context, key string) (*ObjectInfo, error) {
+	info, err := p.inner.Head(ctx, p.key(key))
+	if info != nil {
+		info.Key = key
+	}
+	return info, err
+}
+
+func (p *prefixed) List(ctx context.Context, prefix string) ([]string, error) {
+	keys, err := p.inner.List(ctx, p.key(prefix))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, strings.TrimPrefix(k, p.prefix))
+	}
+	return out, nil
+}
+
+func (p *prefixed) Put(ctx context.Context, key string, data []byte) error {
+	return p.inner.Put(ctx, p.key(key), data)
+}
+
+func (p *prefixed) PutFile(ctx context.Context, localPath, key string) error {
+	return p.inner.PutFile(ctx, localPath, p.key(key))
+}
+
+func (p *prefixed) Delete(ctx context.Context, key string) error {
+	return p.inner.Delete(ctx, p.key(key))
+}
+
+func (p *prefixed) SyncDir(ctx context.Context, out io.Writer, localDir, keyPrefix string) (int, error) {
+	return p.inner.SyncDir(ctx, out, localDir, p.key(keyPrefix))
+}
+
+// Label carries the prefix so two names rooted at different prefixes of one
+// bucket are distinguishable, which is what the fan-out dedup compares.
+func (p *prefixed) Label() string {
+	return strings.TrimSuffix(p.inner.Label(), "/") + "/" + strings.TrimSuffix(p.prefix, "/")
 }
 
 // SpecFromConfig derives the default backend's Spec from the global config.
@@ -129,3 +203,19 @@ func SpecFromConfig(cfg *config.Config) Spec {
 func New(ctx context.Context, cfg *config.Config) (ObjectStore, error) {
 	return NewFromSpec(ctx, SpecFromConfig(cfg))
 }
+
+// Drivers returns every registered driver name, sorted.
+func Drivers() []string {
+	names := make([]string, 0, len(backends))
+	for k := range backends {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// config.Load rejects a backend name that reads as a driver, and asks the
+// registry rather than a hardcoded list so a driver added under a build tag is
+// covered without a second edit. The wiring lives here because storage imports
+// config and not the other way round.
+func init() { config.StorageDrivers = Drivers }

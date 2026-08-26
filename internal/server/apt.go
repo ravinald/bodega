@@ -29,7 +29,32 @@ func (s *Server) handleAptPool(w http.ResponseWriter, r *http.Request) {
 	}
 	key := aptPoolPrefix + p
 	setCacheImmutable(w, path.Base(p))
-	s.proxyS3(w, r, s.typeStore(manifest.TypeApt), key)
+	store, err := s.aptPoolStore("pool/" + p)
+	if err != nil {
+		s.logger.Error("storage backend recorded for pooled .deb is not configured",
+			"pool_path", p, "error", err)
+		http.Error(w, "storage backend error", http.StatusBadGateway)
+		return
+	}
+	s.proxyS3(w, r, store, key)
+}
+
+// aptPoolStore resolves a pooled .deb to the backend recorded for its version.
+//
+// A .deb is addressed by pool path, so unlike every other artifact route there
+// is no package and version in the request to look the entry up by. The
+// snapshot carries the reverse mapping instead, built from the same
+// _pool_path metadata the Packages generator reads.
+func (s *Server) aptPoolStore(poolPath string) (storage.ObjectStore, error) {
+	if s.stores == nil {
+		return nil, nil
+	}
+	if snap := s.aptSnap.Load(); snap != nil {
+		if name := snap.poolStorage[poolPath]; name != "" {
+			return s.stores.ByName(name)
+		}
+	}
+	return s.stores.ForType(manifest.TypeApt), nil
 }
 
 // handleAptDists routes /apt/dists/{distpath...} to the appropriate handler
@@ -197,6 +222,13 @@ type aptSnapshot struct {
 	suites     map[string]*aptSuiteIndex
 	builtAt    time.Time
 	validUntil time.Time
+
+	// poolStorage maps a pool path to the backend name its version entry
+	// records, with an empty record stored as the default. A present entry
+	// and an absent one have to be distinguishable: present-but-empty means
+	// "default", while absent means there is no entry to have recorded
+	// anything and the type rule applies.
+	poolStorage map[string]string
 }
 
 // rebuildAptSnapshot regenerates the index and publishes it to every
@@ -244,12 +276,47 @@ func (s *Server) buildAptSnapshot(ctx context.Context) (*aptSnapshot, error) {
 		builtAt:    time.Now().UTC(),
 		validUntil: date.Add(aptValidity),
 	}
+	snap.poolStorage = s.aptPoolStorage(ctx)
 	served := s.cfg.ServedAptSuites()
 	for _, suite := range served {
 		snap.suites[suite] = s.buildAptSuiteIndex(ctx, suite, debKeys, date, snap.validUntil)
 	}
 	s.auditAptEntries(ctx, served)
 	return snap, nil
+}
+
+// aptPoolStorage maps each pooled path to the backend its version entry names,
+// resolving an unrecorded name to the default rather than omitting it. Omitting
+// it would send a pre-existing .deb down the type rule, which is precisely the
+// hierarchy consultation the empty-means-default rule forbids.
+//
+// Built over every apt entry rather than inside the per-suite generator: a
+// hidden entry and an entry in an unserved suite are both absent from the
+// index and both still served from /apt/pool/, so filtering here would send
+// their reads to the wrong backend.
+func (s *Server) aptPoolStorage(ctx context.Context) map[string]string {
+	var out map[string]string
+	for _, name := range s.store.ListPackages(manifest.TypeApt) {
+		pm, _ := s.store.GetPackage(ctx, manifest.TypeApt, name)
+		if pm == nil {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			poolPath := ve.Metadata["_pool_path"]
+			if poolPath == "" {
+				continue
+			}
+			if out == nil {
+				out = make(map[string]string)
+			}
+			if ve.Storage == "" {
+				out[poolPath] = storage.DefaultName
+			} else {
+				out[poolPath] = ve.Storage
+			}
+		}
+	}
+	return out
 }
 
 // buildAptSuiteIndex generates one suite's Packages bodies and the Release

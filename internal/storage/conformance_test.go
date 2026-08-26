@@ -15,9 +15,27 @@ import (
 // backend joins by adding one line here.
 func conformanceBackends() map[string]func(t *testing.T) ObjectStore {
 	return map[string]func(t *testing.T) ObjectStore{
-		"local":  func(t *testing.T) ObjectStore { return NewLocal(t.TempDir()) },
+		"local":  func(t *testing.T) ObjectStore { return NewLocal(rootWithDecoySibling(t)) },
 		"memory": func(t *testing.T) ObjectStore { return NewMemory() },
 	}
+}
+
+// rootWithDecoySibling returns a storage root whose parent directory holds a
+// file the store does not own. The local backend resolves keys against a real
+// tree, so this is what gives list_never_escapes_the_store something to catch:
+// without a decoy outside the root, a walk that stepped up a level would find
+// nothing and the case would pass on a broken backend.
+func rootWithDecoySibling(t *testing.T) string {
+	t.Helper()
+	parent := t.TempDir()
+	if err := os.WriteFile(filepath.Join(parent, "not-ours.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("write decoy: %v", err)
+	}
+	root := filepath.Join(parent, "root")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+	return root
 }
 
 func TestObjectStoreConformance(t *testing.T) {
@@ -165,8 +183,16 @@ func testObjectStore(t *testing.T, mk func() ObjectStore) {
 			}
 		}},
 
+		// Sorted by key, across directory levels. A tree walk orders directory
+		// entries, not keys: "b" sorts before "b-1", so the walk emits
+		// "x/b/z" before "x/b-1" while "/" (0x2f) sorts after "-" (0x2d) and
+		// the keys run the other way.
+		// The listing fan-out merges two of these and sorts the union, which
+		// is only a merge if each input is already ordered, and Packages.gz is
+		// generated per request — an unstable order changes the bytes and
+		// every client refetches.
 		{"list_is_sorted", func(t *testing.T, ctx context.Context, s ObjectStore) {
-			for _, k := range []string{"x/c", "x/a", "x/b"} {
+			for _, k := range []string{"x/c", "x/a", "x/b/z", "x/b-1"} {
 				if err := s.Put(ctx, k, []byte(k)); err != nil {
 					t.Fatalf("Put %s: %v", k, err)
 				}
@@ -175,7 +201,7 @@ func testObjectStore(t *testing.T, mk func() ObjectStore) {
 			if err != nil {
 				t.Fatalf("List: %v", err)
 			}
-			want := []string{"x/a", "x/b", "x/c"}
+			want := []string{"x/a", "x/b-1", "x/b/z", "x/c"}
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("List = %v, want %v", got, want)
 			}
@@ -262,6 +288,26 @@ func testObjectStore(t *testing.T, mk func() ObjectStore) {
 			got, err := s.Get(ctx, "sync/nested/deep.txt")
 			if err != nil || string(got) != "deep" {
 				t.Fatalf("Get sync/nested/deep.txt = %q, %v; want %q", got, err, "deep")
+			}
+		}},
+
+		// A prefix that normalizes to the store root must not reach outside
+		// it. The local backend walks a real directory tree, so this is the
+		// one place a key can be manufactured from a file nobody stored.
+		{"list_never_escapes_the_store", func(t *testing.T, ctx context.Context, s ObjectStore) {
+			if err := s.Put(ctx, "inside.txt", []byte("x")); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+			for _, prefix := range []string{"", ".", "./"} {
+				keys, err := s.List(ctx, prefix)
+				if err != nil {
+					continue // rejecting the prefix outright is also correct
+				}
+				for _, k := range keys {
+					if strings.HasPrefix(k, "../") || strings.HasPrefix(k, "/") || strings.Contains(k, "not-ours") {
+						t.Fatalf("List(%q) returned %q, which is outside the store", prefix, k)
+					}
+				}
 			}
 		}},
 

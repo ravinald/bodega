@@ -222,8 +222,10 @@ func HelmArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) [
 			local := helmLocalPath(d, name, ve)
 			if fileExists(local) {
 				paths = append(paths, ArtifactPath{
-					Local: local,
-					S3Key: helmS3Key(name, ve),
+					Local:   local,
+					S3Key:   helmS3Key(name, ve),
+					Package: name,
+					Version: ve.Version,
 				})
 			}
 		}

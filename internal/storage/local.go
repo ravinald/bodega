@@ -9,6 +9,7 @@ import (
 	"mime"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -126,7 +127,11 @@ func (l *Local) List(_ context.Context, prefix string) ([]string, error) {
 	// "packages/ap/" also exists as a directory of its own. Walking the parent
 	// and filtering is a superset of the correct answer in every case, since
 	// any key starting with the prefix lives under the prefix's parent.
-	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+	// The root has no parent to walk: a prefix that normalizes to it (".",
+	// "./") would otherwise send the walk one level up, where every relative
+	// path starts "../" and satisfies a "." prefix filter — keys outside the
+	// store, returned as if they were in it.
+	if prefix != "" && !strings.HasSuffix(prefix, "/") && dir != l.root {
 		dir = filepath.Dir(dir)
 	}
 	if _, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) {
@@ -153,6 +158,10 @@ func (l *Local) List(_ context.Context, prefix string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	// WalkDir orders per directory, which is not key order: it descends into
+	// "x/b/" before reaching the sibling file "x/b". The fan-out merges these
+	// lists and a merge needs each input sorted.
+	sort.Strings(keys)
 	return keys, nil
 }
 

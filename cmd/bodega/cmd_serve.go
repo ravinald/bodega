@@ -99,12 +99,12 @@ output continues to respect log_level in the config.`,
 			// observable symptom was "server is up, apt gets 503, logs empty".
 			var stores storage.Resolver
 			ctx := backgroundCtx()
-			obj, err := storage.New(ctx, cfg)
+			resolved, err := storage.NewResolver(ctx, cfg)
 			if err != nil {
 				logger.Error("storage backend unavailable — package routes will answer 503; the API and /healthz still serve",
 					"backend", storageBackendName(cfg), "config", config.ConfigPath(), "error", err)
 			} else {
-				stores = storage.NewSingle(obj)
+				stores = resolved
 			}
 
 			// Resolve listen address: flag → env → config file → default.

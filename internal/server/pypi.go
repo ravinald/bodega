@@ -125,8 +125,9 @@ func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
 	file := path.Base(p)
 	setCacheImmutable(w, file)
 
-	// Extract package name from wheel filename (e.g. "boto3-1.26.0-py3-none-any.whl" → "boto3").
-	dist := wheelDistName(file)
+	// Extract package name and version from the wheel filename
+	// (e.g. "boto3-1.26.0-py3-none-any.whl" → "boto3", "1.26.0").
+	dist, distVersion := wheelIdentity(file)
 	if dist != "" {
 		pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, dist)
 		if pkg != nil && packageMode(pkg) == manifest.ModeProxy {
@@ -135,5 +136,18 @@ func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	s.proxyS3(w, r, s.typeStore(manifest.TypePypi), key)
+	s.proxyVersion(w, r, manifest.TypePypi, dist, distVersion, key)
+}
+
+// wheelIdentity splits a wheel filename into its distribution and version.
+// PEP 427 fixes the first two hyphen-separated fields, so this is exact for a
+// conforming name and yields an empty version for anything else, which routes
+// by type instead of guessing.
+func wheelIdentity(filename string) (dist, version string) {
+	base := strings.TrimSuffix(filename, ".whl")
+	parts := strings.Split(base, "-")
+	if len(parts) < 2 {
+		return wheelDistName(filename), ""
+	}
+	return parts[0], parts[1]
 }

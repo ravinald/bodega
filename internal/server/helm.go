@@ -23,7 +23,9 @@ func (s *Server) handleHelmChart(w http.ResponseWriter, r *http.Request) {
 	// Check if any helm entry is in proxy mode with a URL we can use.
 	// Parse chart name from filename: "ingress-nginx-4.0.0.tgz" → "ingress-nginx"
 	chartName := strings.TrimSuffix(file, ".tgz")
+	chartVersion := ""
 	if idx := strings.LastIndex(chartName, "-"); idx > 0 {
+		chartVersion = chartName[idx+1:]
 		chartName = chartName[:idx]
 	}
 	pm, _ := s.store.GetPackage(ctx, manifest.TypeHelm, chartName)
@@ -37,5 +39,5 @@ func (s *Server) handleHelmChart(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	s.proxyS3(w, r, s.typeStore(manifest.TypeHelm), key)
+	s.proxyVersion(w, r, manifest.TypeHelm, chartName, chartVersion, key)
 }

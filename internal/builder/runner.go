@@ -313,6 +313,12 @@ type ArtifactPath struct {
 	Local string
 	// S3Key is the key within the bucket (no leading slash).
 	S3Key string
+	// Package and Version name the manifest entry this artifact belongs to.
+	// The uploader records placement against that entry, so an artifact with
+	// no entry — a generated index, a packument — leaves both empty and is
+	// routed by its type instead.
+	Package string
+	Version string
 }
 
 // MergeSummaries merges an arbitrary slice of Summary pointers into one.

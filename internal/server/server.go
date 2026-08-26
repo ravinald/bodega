@@ -586,11 +586,13 @@ type statusResponse struct {
 }
 
 type s3EntryStatus struct {
-	Type   string `json:"type"`
-	Name   string `json:"name"`
-	S3Key  string `json:"s3_key"`
-	InS3   bool   `json:"in_s3"`
-	Frozen bool   `json:"frozen,omitempty"`
+	Type    string `json:"type"`
+	Name    string `json:"name"`
+	S3Key   string `json:"s3_key"`
+	InS3    bool   `json:"in_s3"`
+	Frozen  bool   `json:"frozen,omitempty"`
+	Backend string `json:"backend,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
@@ -614,25 +616,34 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Probe the apt pool. dists/ is generated per request and never stored,
-	// so it cannot answer whether the object store holds anything; the pool is
-	// what upload writes, and its prefix names no codename.
-	keys, err := s.listFanout(r.Context(), manifest.TypeApt, aptPoolPrefix)
-	if err != nil {
-		resp.Healthy = false
-		resp.Error = "object store probe failed"
-		s.logger.Error("object store probe failed", "error", err, "prefix", aptPoolPrefix)
-		writeJSON(w, http.StatusOK, resp)
-		return
-	}
-
-	resp.S3Entries = []s3EntryStatus{
-		{
-			Type:  manifest.TypeApt,
-			Name:  "apt-pool",
-			S3Key: aptPoolPrefix,
-			InS3:  len(keys) > 0,
-		},
+	// Probe the apt pool on every backend, one row each. dists/ is generated
+	// per request and never stored, so it cannot answer whether the object
+	// store holds anything; the pool is what upload writes, and its prefix
+	// names no codename.
+	//
+	// This is the inverse of the listing fan-out's policy, and deliberately.
+	// A package index fails the whole request on a backend error, because a
+	// short index is indistinguishable from packages having been withdrawn and
+	// apt acts on the difference. A diagnostic exists to say which backend is
+	// broken, so it reports every backend it could reach, marks the one it
+	// could not, and calls the server unhealthy.
+	for _, ns := range s.stores.All() {
+		row := s3EntryStatus{
+			Type:    manifest.TypeApt,
+			Name:    "apt-pool",
+			S3Key:   aptPoolPrefix,
+			Backend: ns.Name,
+		}
+		keys, err := ns.Store.List(r.Context(), aptPoolPrefix)
+		if err != nil {
+			resp.Healthy = false
+			resp.Error = "one or more storage backends failed to respond"
+			row.Error = err.Error()
+			s.logger.Error("object store probe failed", "backend", ns.Name, "prefix", aptPoolPrefix, "error", err)
+		} else {
+			row.InS3 = len(keys) > 0
+		}
+		resp.S3Entries = append(resp.S3Entries, row)
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -1217,6 +1228,54 @@ func (s *Server) typeStore(typ string) storage.ObjectStore {
 		return nil
 	}
 	return s.stores.ForType(typ)
+}
+
+// versionStore returns the backend recorded for one artifact.
+//
+// It reads the name on the version entry and never the config hierarchy. The
+// hierarchy decides where the next write goes; an artifact already written is
+// wherever it was written, so consulting it here would 404 everything placed
+// under the previous rule. An empty recorded name is the default backend —
+// see the contract on manifest.VersionEntry.Storage.
+//
+// A request whose manifest entry does not exist is not an error. Generated
+// indexes, the GPG key, proxy-cache entries and attestation blobs carry no
+// version to record a name against, and every one of them is regenerable, so
+// the type rule is safe for them at both read and write.
+func (s *Server) versionStore(ctx context.Context, typ, pkg, version string) (storage.ObjectStore, error) {
+	if s.stores == nil {
+		return nil, nil
+	}
+	if pkg == "" {
+		return s.stores.ForType(typ), nil
+	}
+	pm, err := s.store.GetPackage(ctx, typ, pkg)
+	if err != nil || pm == nil {
+		return s.stores.ForType(typ), nil
+	}
+	for _, ve := range pm.Versions {
+		if ve.Version == version || (version != "" && ve.Ref == version) {
+			return s.stores.ByName(ve.Storage)
+		}
+	}
+	return s.stores.ForType(typ), nil
+}
+
+// proxyVersion serves an artifact from the backend its manifest entry names.
+//
+// An unresolvable name is 502, not a fallback to another backend: the digest
+// generateAptPackages publishes is recorded against one specific backend, so
+// serving bytes from a different one is the signature the checksum machinery
+// exists to flag.
+func (s *Server) proxyVersion(w http.ResponseWriter, r *http.Request, typ, pkg, version, key string) {
+	store, err := s.versionStore(r.Context(), typ, pkg, version)
+	if err != nil {
+		s.logger.Error("storage backend recorded for artifact is not configured",
+			"type", typ, "package", pkg, "version", version, "key", key, "error", err)
+		http.Error(w, "storage backend error", http.StatusBadGateway)
+		return
+	}
+	s.proxyS3(w, r, store, key)
 }
 
 // listFanout unions List across every backend a read of typ may reach.

@@ -16,10 +16,10 @@ import (
 	"github.com/ravinald/bodega/internal/storage"
 )
 
-// multiResolver is a Resolver over more than one backend, which
-// storage.NewSingle cannot produce. It exists so the listing fan-out can be
-// exercised before any config surface names a second backend — the point of
-// landing fan-out where it cannot yet change behavior.
+// multiResolver is a Resolver whose backends are supplied directly, which
+// storage.NewResolver cannot do: it builds from config, and a config-built
+// backend cannot be wrapped to fail on demand. Tests that only need two real
+// backends use storage.NewResolver instead — see placement_test.go.
 type multiResolver struct {
 	stores []storage.NamedStore
 }

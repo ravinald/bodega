@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
@@ -75,7 +77,7 @@ Examples:
 
 				for i := range pms {
 					pm := &pms[i]
-					if err := validateManifest(pm); err != nil {
+					if err := validateManifest(pm, cfg); err != nil {
 						return fmt.Errorf("validate %s [%s/%s]: %w", path, pm.Type, pm.Name, err)
 					}
 					if err := enforceImportPolicy(ctx, checker, adb, pm); err != nil {
@@ -235,7 +237,7 @@ func enforceImportPolicy(ctx context.Context, checker *policy.Checker, adb *audi
 	return nil
 }
 
-func validateManifest(pm *manifest.PackageManifest) error {
+func validateManifest(pm *manifest.PackageManifest, cfg *config.Config) error {
 	if pm.Name == "" {
 		return fmt.Errorf("name is required")
 	}
@@ -252,5 +254,28 @@ func validateManifest(pm *manifest.PackageManifest) error {
 	if !valid {
 		return fmt.Errorf("unknown type %q — must be one of: %s", pm.Type, strings.Join(manifest.AllTypes, ", "))
 	}
+	// A hand-edited storage name that matches no configured backend makes the
+	// artifact unreadable: resolution never falls back to another backend, so
+	// the entry would 502 rather than serve from somewhere plausible.
+	for _, ve := range pm.Versions {
+		if ve.Storage == "" || ve.Storage == config.DefaultStorageName {
+			continue
+		}
+		if _, ok := cfg.StorageBackends[ve.Storage]; !ok {
+			return fmt.Errorf("version %s: unknown storage backend %q (defined: %s)",
+				versionLabel(ve), ve.Storage, definedBackendNames(cfg))
+		}
+	}
 	return nil
+}
+
+// definedBackendNames lists the usable backend names for an error message,
+// reserved default first.
+func definedBackendNames(cfg *config.Config) string {
+	names := make([]string, 0, len(cfg.StorageBackends)+1)
+	for name := range cfg.StorageBackends {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return strings.Join(append([]string{config.DefaultStorageName}, names...), ", ")
 }

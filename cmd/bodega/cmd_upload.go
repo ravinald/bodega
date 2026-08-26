@@ -9,11 +9,11 @@ import (
 
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/manifest"
-	"github.com/ravinald/bodega/internal/storage"
 )
 
 func newUploadCmd(gf *globalFlags) *cobra.Command {
-	return &cobra.Command{
+	var replacePlacement bool
+	cmd := &cobra.Command{
 		Use:   "upload [TYPE...]",
 		Short: "Upload built artifacts to S3 (cascades through full pipeline if needed)",
 		Long: `upload ensures all pipeline stages are complete and then syncs the local
@@ -56,9 +56,9 @@ If no types are given all four are uploaded.`,
 			}
 
 			ctx := backgroundCtx()
-			objStore, err := storage.New(ctx, cfg)
+			pl, err := newPlacer(ctx, cfg, store, os.Stdout, replacePlacement)
 			if err != nil {
-				return fmt.Errorf("connect to storage: %w", err)
+				return err
 			}
 
 			buildRoot := cfg.BuildRoot
@@ -76,8 +76,12 @@ If no types are given all four are uploaded.`,
 					// Upload per-entry to the versioned S3 path.
 					paths := builder.BinaryArtifactPaths(bcfg, store, "")
 					for _, ap := range paths {
-						fmt.Printf("    upload: %s/%s\n", objStore.Label(), ap.S3Key)
-						if err := objStore.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
+						st, err := pl.forVersion(ctx, t, ap.Package, ap.Version, ap.S3Key)
+						if err != nil {
+							return err
+						}
+						fmt.Printf("    upload: %s/%s\n", st.Label(), ap.S3Key)
+						if err := st.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
 							return fmt.Errorf("upload binary %s: %w", ap.Local, err)
 						}
 						totalUploaded++
@@ -93,11 +97,15 @@ If no types are given all four are uploaded.`,
 						fmt.Printf("    No bundles directory at %s — skipping\n", localDir)
 						continue
 					}
-					n, err := objStore.SyncDir(ctx, os.Stdout, localDir, "repos/")
+					st, err := pl.forType(ctx, t)
+					if err != nil {
+						return err
+					}
+					n, err := st.SyncDir(ctx, os.Stdout, localDir, "repos/")
 					if err != nil {
 						return fmt.Errorf("upload git: %w", err)
 					}
-					fmt.Printf("    Uploaded %d file(s) to %s/repos/\n", n, objStore.Label())
+					fmt.Printf("    Uploaded %d file(s) to %s/repos/\n", n, st.Label())
 					totalUploaded += n
 
 				case manifest.TypeApt:
@@ -110,11 +118,15 @@ If no types are given all four are uploaded.`,
 						fmt.Printf("    No apt-repo directory at %s — skipping\n", localDir)
 						continue
 					}
-					n, err := objStore.SyncDir(ctx, os.Stdout, localDir, "packages/apt/")
+					st, err := pl.forType(ctx, t)
+					if err != nil {
+						return err
+					}
+					n, err := st.SyncDir(ctx, os.Stdout, localDir, "packages/apt/")
 					if err != nil {
 						return fmt.Errorf("upload apt: %w", err)
 					}
-					fmt.Printf("    Uploaded %d file(s) to %s/packages/apt/\n", n, objStore.Label())
+					fmt.Printf("    Uploaded %d file(s) to %s/packages/apt/\n", n, st.Label())
 					totalUploaded += n
 
 				case manifest.TypePypi:
@@ -127,11 +139,15 @@ If no types are given all four are uploaded.`,
 						fmt.Printf("    No wheels directory at %s — skipping\n", localDir)
 						continue
 					}
-					n, err := objStore.SyncDir(ctx, os.Stdout, localDir, s3Prefix)
+					st, err := pl.forType(ctx, t)
+					if err != nil {
+						return err
+					}
+					n, err := st.SyncDir(ctx, os.Stdout, localDir, s3Prefix)
 					if err != nil {
 						return fmt.Errorf("upload pypi: %w", err)
 					}
-					fmt.Printf("    Uploaded %d file(s) to %s/%s\n", n, objStore.Label(), s3Prefix)
+					fmt.Printf("    Uploaded %d file(s) to %s/%s\n", n, st.Label(), s3Prefix)
 					totalUploaded += n
 
 				case manifest.TypeGomod:
@@ -145,8 +161,12 @@ If no types are given all four are uploaded.`,
 						continue
 					}
 					for _, ap := range paths {
-						fmt.Printf("    upload: %s/%s\n", objStore.Label(), ap.S3Key)
-						if err := objStore.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
+						st, err := pl.forVersion(ctx, t, ap.Package, ap.Version, ap.S3Key)
+						if err != nil {
+							return err
+						}
+						fmt.Printf("    upload: %s/%s\n", st.Label(), ap.S3Key)
+						if err := st.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
 							return fmt.Errorf("upload gomod %s: %w", ap.Local, err)
 						}
 						totalUploaded++
@@ -163,8 +183,12 @@ If no types are given all four are uploaded.`,
 						continue
 					}
 					for _, ap := range paths {
-						fmt.Printf("    upload: %s/%s\n", objStore.Label(), ap.S3Key)
-						if err := objStore.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
+						st, err := pl.forVersion(ctx, t, ap.Package, ap.Version, ap.S3Key)
+						if err != nil {
+							return err
+						}
+						fmt.Printf("    upload: %s/%s\n", st.Label(), ap.S3Key)
+						if err := st.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
 							return fmt.Errorf("upload helm %s: %w", ap.Local, err)
 						}
 						totalUploaded++
@@ -181,8 +205,12 @@ If no types are given all four are uploaded.`,
 						continue
 					}
 					for _, ap := range paths {
-						fmt.Printf("    upload: %s/%s\n", objStore.Label(), ap.S3Key)
-						if err := objStore.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
+						st, err := pl.forVersion(ctx, t, ap.Package, ap.Version, ap.S3Key)
+						if err != nil {
+							return err
+						}
+						fmt.Printf("    upload: %s/%s\n", st.Label(), ap.S3Key)
+						if err := st.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
 							return fmt.Errorf("upload npm %s: %w", ap.Local, err)
 						}
 						totalUploaded++
@@ -201,8 +229,12 @@ If no types are given all four are uploaded.`,
 						continue
 					}
 					for _, ap := range paths {
-						fmt.Printf("    upload: %s/%s\n", objStore.Label(), ap.S3Key)
-						if err := objStore.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
+						st, err := pl.forVersion(ctx, t, ap.Package, ap.Version, ap.S3Key)
+						if err != nil {
+							return err
+						}
+						fmt.Printf("    upload: %s/%s\n", st.Label(), ap.S3Key)
+						if err := st.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
 							return fmt.Errorf("upload cargo %s: %w", ap.Local, err)
 						}
 						totalUploaded++
@@ -221,4 +253,7 @@ If no types are given all four are uploaded.`,
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&replacePlacement, "replace-placement", false,
+		"Apply the current storage_by_type rule to versions already recorded on another backend (leaves the old objects behind)")
+	return cmd
 }
