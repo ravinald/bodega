@@ -33,9 +33,14 @@ func newServeCmd(gf *globalFlags) *cobra.Command {
 
 Clients can use the server as follows:
 
-  apt:  deb [trusted=yes] http://bodega-host:8080/apt/ noble main
-  pip:  pip install --index-url http://bodega-host:8080/pypi/simple/ <package>
-  git:  curl http://bodega-host:8080/git/<name>/<name>-<ref>.bundle -o <name>.bundle
+  apt:  deb [trusted=yes] https://bodega-host:8080/apt/ noble main
+  pip:  pip install --index-url https://bodega-host:8080/pypi/simple/ <package>
+  git:  curl https://bodega-host:8080/git/<name>/<name>-<ref>.bundle -o <name>.bundle
+
+[trusted=yes] turns off apt's signature verification for that source, which the
+apt repository requires because it is unsigned. TLS is what authenticates the
+packages until the repository is signed, so serve over https and keep the
+sources line on https.
 
 The server also exposes a REST API at /api/v1/ for manifest inspection and
 health checking.

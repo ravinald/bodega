@@ -1320,3 +1320,58 @@ func TestFieldValueFromSlice(t *testing.T) {
 		t.Errorf("absent key: got %q, want empty", got)
 	}
 }
+
+// Guards that the client snippets the details pane emits follow the scheme the
+// server is configured to answer on. An http:// snippet for a TLS server is
+// unauthenticated delivery to a root-privileged installer, since apt needs
+// [trusted=yes] against an unsigned repository.
+func TestClientURLSchemeFollowsTLSConfig(t *testing.T) {
+	store := manifest.NewLocalStore(t.TempDir())
+	ctx := t.Context()
+	_ = store.AddVersion(ctx, manifest.TypeApt, "pkg-a", manifest.VersionEntry{Version: "1.0"})
+	_ = store.AddVersion(ctx, manifest.TypePypi, "pkg-b", manifest.VersionEntry{Version: "1.0"})
+	_ = store.AddVersion(ctx, manifest.TypeGomod, "example.com/m", manifest.VersionEntry{Version: "v1.0.0"})
+	_ = store.AddVersion(ctx, manifest.TypeNpm, "pkg-c", manifest.VersionEntry{Version: "1.0.0"})
+	_ = store.AddVersion(ctx, manifest.TypeHelm, "chart", manifest.VersionEntry{Version: "1.0.0"})
+	_ = store.AddVersion(ctx, manifest.TypeGit, "org/repo", manifest.VersionEntry{Ref: "v1.0.0"})
+	_ = store.AddVersion(ctx, manifest.TypeBinary, "tool", manifest.VersionEntry{Version: "1.0.0", Filename: "tool"})
+
+	entries := []struct{ typ, name string }{
+		{manifest.TypeApt, "pkg-a"},
+		{manifest.TypePypi, "pkg-b"},
+		{manifest.TypeGomod, "example.com/m"},
+		{manifest.TypeNpm, "pkg-c"},
+		{manifest.TypeHelm, "chart"},
+		{manifest.TypeGit, "org/repo"},
+		{manifest.TypeBinary, "tool"},
+	}
+
+	tlsCfg := &config.Config{TLSCert: "/etc/bodega/cert.pem", TLSKey: "/etc/bodega/key.pem"}
+	for _, e := range entries {
+		got := clientURL(tlsCfg, store, e.typ, e.name)
+		if got == "" {
+			t.Fatalf("%s: empty client URL", e.typ)
+		}
+		if !strings.Contains(got, "https://") {
+			t.Errorf("%s with TLS configured: want https://, got %q", e.typ, got)
+		}
+		if strings.Contains(got, "http://") {
+			t.Errorf("%s with TLS configured: leaked http://, got %q", e.typ, got)
+		}
+	}
+
+	plainCfg := &config.Config{}
+	for _, e := range entries {
+		got := clientURL(plainCfg, store, e.typ, e.name)
+		if !strings.Contains(got, "http://") {
+			t.Errorf("%s without TLS: want http://, got %q", e.typ, got)
+		}
+	}
+
+	// A cert with no key does not start a TLS listener, so it must not
+	// advertise one.
+	halfCfg := &config.Config{TLSCert: "/etc/bodega/cert.pem"}
+	if got := clientURL(halfCfg, store, manifest.TypeApt, "pkg-a"); !strings.Contains(got, "http://") {
+		t.Errorf("cert without key: want http://, got %q", got)
+	}
+}

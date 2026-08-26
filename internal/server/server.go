@@ -378,7 +378,7 @@ func (s *Server) registerRoutes() {
 	// npm registry
 	m.HandleFunc("GET /npm/{path...}", s.handleNpm)
 
-	// cargo sparse registry (sparse+http://bodega/cargo/)
+	// cargo sparse registry (sparse+https://bodega/cargo/)
 	m.HandleFunc("GET /cargo/{path...}", s.handleCargo)
 
 	// REST API

@@ -54,7 +54,7 @@ All examples below assume the mutating caller is either on localhost or has `$BO
 A single entry pinned to the `latest` dist-tag:
 
 ```bash
-curl -s http://bodega.internal:8080/api/v1/packages/npm/%40bitwarden%2Fcli
+curl -s https://bodega.internal:8080/api/v1/packages/npm/%40bitwarden%2Fcli
 ```
 
 ```json
@@ -74,14 +74,14 @@ Full-manifest edit. DELETE + POST.
 
 ```bash
 # 1. Snapshot the current state (rollback insurance).
-curl -s http://bodega.internal:8080/api/v1/packages/npm/%40bitwarden%2Fcli \
+curl -s https://bodega.internal:8080/api/v1/packages/npm/%40bitwarden%2Fcli \
   > /tmp/bitwarden-pre.json
 
 # 2. Delete the existing entry.
-curl -X DELETE http://bodega.internal:8080/api/v1/packages/npm/%40bitwarden%2Fcli
+curl -X DELETE https://bodega.internal:8080/api/v1/packages/npm/%40bitwarden%2Fcli
 
 # 3. Create the new entry.
-curl -X POST http://bodega.internal:8080/api/v1/packages/npm \
+curl -X POST https://bodega.internal:8080/api/v1/packages/npm \
   -H "Content-Type: application/json" \
   -d '{
     "config_version": 1,
@@ -105,10 +105,10 @@ Verify:
 
 ```bash
 # Full manifest round-trip.
-curl -s http://bodega.internal:8080/api/v1/packages/npm/%40bitwarden%2Fcli | jq .
+curl -s https://bodega.internal:8080/api/v1/packages/npm/%40bitwarden%2Fcli | jq .
 
 # Version-scoped read — confirms the tombstone flags.
-curl -s http://bodega.internal:8080/api/v1/packages/npm/%40bitwarden%2Fcli/2026.4.0 | jq '.versions[0]'
+curl -s https://bodega.internal:8080/api/v1/packages/npm/%40bitwarden%2Fcli/2026.4.0 | jq '.versions[0]'
 # Expected: {"version": "2026.4.0", "mode": "hosted", "hidden": true, "frozen": true, "description": "..."}
 ```
 
@@ -116,13 +116,13 @@ Client-side enforcement kicks in immediately on the npm routes (no need to resta
 
 ```bash
 # 2026.3.0 tarball: 200 (assuming it's been fetched + uploaded).
-curl -I http://bodega.internal:8080/npm/@bitwarden/cli/-/cli-2026.3.0.tgz
+curl -I https://bodega.internal:8080/npm/@bitwarden/cli/-/cli-2026.3.0.tgz
 
 # 2026.4.0 tarball: 404 (tombstone).
-curl -I http://bodega.internal:8080/npm/@bitwarden/cli/-/cli-2026.4.0.tgz
+curl -I https://bodega.internal:8080/npm/@bitwarden/cli/-/cli-2026.4.0.tgz
 
 # Packument: 2026.4.0 stripped from versions[] and dist-tags.
-curl -s http://bodega.internal:8080/npm/@bitwarden/cli | jq '.versions | keys'
+curl -s https://bodega.internal:8080/npm/@bitwarden/cli | jq '.versions | keys'
 ```
 
 Fetch the known-good tarball into storage if you haven't already. That's a builder operation, not API:
@@ -139,10 +139,10 @@ If the only change you need is "hide version X" — say, you've already created 
 
 ```bash
 # Toggle hidden on a specific version.
-curl -X PATCH http://bodega.internal:8080/api/v1/packages/npm/%40bitwarden%2Fcli/hide/2026.4.0
+curl -X PATCH https://bodega.internal:8080/api/v1/packages/npm/%40bitwarden%2Fcli/hide/2026.4.0
 
 # Toggle frozen on the whole package.
-curl -X PATCH http://bodega.internal:8080/api/v1/packages/npm/%40bitwarden%2Fcli/freeze
+curl -X PATCH https://bodega.internal:8080/api/v1/packages/npm/%40bitwarden%2Fcli/freeze
 ```
 
 These are toggles, not sets — the endpoint flips whatever state the flag was in. The response body contains the updated manifest. For idempotent set-or-leave semantics, fetch the current state first and only PATCH if the flag doesn't match what you want.
@@ -152,9 +152,9 @@ These are toggles, not sets — the endpoint flips whatever state the flag was i
 Same DELETE + POST pattern with a different body:
 
 ```bash
-curl -X DELETE http://bodega.internal:8080/api/v1/packages/npm/%40bitwarden%2Fcli
+curl -X DELETE https://bodega.internal:8080/api/v1/packages/npm/%40bitwarden%2Fcli
 
-curl -X POST http://bodega.internal:8080/api/v1/packages/npm \
+curl -X POST https://bodega.internal:8080/api/v1/packages/npm \
   -H "Content-Type: application/json" \
   -d '{
     "config_version": 1,
@@ -179,9 +179,9 @@ The `latest` dist-tag resolves on the next `bodega build fetch`. The tombstone c
 ## Scenario 3: constrain to `>= 2026.4.1`
 
 ```bash
-curl -X DELETE http://bodega.internal:8080/api/v1/packages/npm/%40bitwarden%2Fcli
+curl -X DELETE https://bodega.internal:8080/api/v1/packages/npm/%40bitwarden%2Fcli
 
-curl -X POST http://bodega.internal:8080/api/v1/packages/npm \
+curl -X POST https://bodega.internal:8080/api/v1/packages/npm \
   -H "Content-Type: application/json" \
   -d '{
     "config_version": 1,
@@ -209,16 +209,16 @@ After this POST, client-side behavior:
 
 ```bash
 # 2026.4.1 (at constraint): 200.
-curl -I http://bodega.internal:8080/npm/@bitwarden/cli/-/cli-2026.4.1.tgz
+curl -I https://bodega.internal:8080/npm/@bitwarden/cli/-/cli-2026.4.1.tgz
 
 # 2026.4.0 (hidden): 404.
-curl -I http://bodega.internal:8080/npm/@bitwarden/cli/-/cli-2026.4.0.tgz
+curl -I https://bodega.internal:8080/npm/@bitwarden/cli/-/cli-2026.4.0.tgz
 
 # 2026.3.0 (below constraint): 403.
-curl -I http://bodega.internal:8080/npm/@bitwarden/cli/-/cli-2026.3.0.tgz
+curl -I https://bodega.internal:8080/npm/@bitwarden/cli/-/cli-2026.3.0.tgz
 
 # Packument: everything below 2026.4.1 and the 2026.4.0 tombstone are stripped.
-curl -s http://bodega.internal:8080/npm/@bitwarden/cli \
+curl -s https://bodega.internal:8080/npm/@bitwarden/cli \
   | jq '{dist_tags: ."dist-tags", versions: (.versions | keys)}'
 ```
 
@@ -228,10 +228,10 @@ The 403 vs 404 distinction is deliberate. 404 says "this version doesn't exist h
 
 ```bash
 # Everything the API did today.
-curl -s "http://bodega.internal:8080/api/v1/audit?since=$(date +%F)&limit=200" | jq .
+curl -s "https://bodega.internal:8080/api/v1/audit?since=$(date +%F)&limit=200" | jq .
 
 # Events tied to @bitwarden/cli only.
-curl -s "http://bodega.internal:8080/api/v1/audit?name=%40bitwarden%2Fcli" | jq .
+curl -s "https://bodega.internal:8080/api/v1/audit?name=%40bitwarden%2Fcli" | jq .
 ```
 
 Mutations through the API are attributed by `client_ip` rather than `actor` — `actor` is reserved for OS-user attribution on CLI/TUI operations. If you need human-level attribution for API calls, put it in the request path: issue a dedicated token per automation identity (`bodega token create ticketing`, `bodega token create gitops-reconciler`) and query the audit log by the client IP those tokens are used from.
@@ -241,8 +241,8 @@ Mutations through the API are attributed by `client_ip` rather than `actor` — 
 The snapshot from Scenario 1 step 1 is your escape hatch:
 
 ```bash
-curl -X DELETE http://bodega.internal:8080/api/v1/packages/npm/%40bitwarden%2Fcli
-curl -X POST http://bodega.internal:8080/api/v1/packages/npm \
+curl -X DELETE https://bodega.internal:8080/api/v1/packages/npm/%40bitwarden%2Fcli
+curl -X POST https://bodega.internal:8080/api/v1/packages/npm \
   -H "Content-Type: application/json" \
   --data-binary @/tmp/bitwarden-pre.json
 ```
