@@ -80,7 +80,7 @@ One bucket. Versioning enabled. KMS encryption. Public access blocked.
 | helm | Chart repo or direct URL | .tgz | `helm repo add bodega https://bodega/helm` |
 | npm | Registry upstream or local | .tgz | `npm install --registry https://bodega/npm/` |
 
-`[trusted=yes]` turns off apt's signature verification for that source. The apt repository is unsigned (`internal/server/apt.go` serves `Release` and `InRelease` from the same unsigned generator), so the flag is required until signing lands. TLS authenticates the packages in the meantime, which is why every client line above is `https://`.
+`[trusted=yes]` turns off apt's signature verification for that source. The apt repository is unsigned: `internal/server/apt.go` generates `Release` and the `Packages` bodies it digests as one snapshot, and 404s `InRelease` and `Release.gpg` rather than serving unsigned bytes under a name that means signed. The flag is required until signing lands. TLS authenticates the packages in the meantime, which is why every client line above is `https://`.
 
 ## Manifest structure (config_version 1)
 

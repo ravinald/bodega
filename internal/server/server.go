@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -69,6 +70,10 @@ type Server struct {
 	pepper       string       // pepper for token hash verification
 	quiet        bool         // suppress stderr startup banner (slog output unaffected)
 	mu           sync.Mutex   // protects store mutations (CRUD API)
+
+	// aptSnap is the generated apt index. Held whole so Release and the
+	// Packages bodies it digests are always served from one generation.
+	aptSnap atomic.Pointer[aptSnapshot]
 }
 
 // SetQuiet suppresses the human-facing stderr startup banner. Log-level
@@ -156,6 +161,11 @@ func newServer(cfg *config.Config, store *manifest.Store, objects storage.Object
 		s.discovery = NewDiscoveryRecorder(s.auditDB, logger)
 	}
 	s.registerRoutes()
+
+	// Build the first apt index here rather than in Start, so a Server can
+	// never answer an apt request from an empty snapshot. loadStore has
+	// already run LoadIndex by this point, so the manifests are current.
+	s.rebuildAptSnapshot(context.Background())
 	return s
 }
 
@@ -264,6 +274,11 @@ func (s *Server) Start(ctx context.Context) error {
 	// Notify systemd we're ready. No-op outside systemd (NOTIFY_SOCKET unset).
 	sdNotifyReady()
 
+	// Apt index refresh. Valid-Until is stamped when a snapshot is built and
+	// does not move, so without this loop a long-running server eventually
+	// serves an expired Release and every client fails apt update at once.
+	go s.aptRefreshLoop(ctx)
+
 	// Discovery worker — drains the recorder's queue until ctx is cancelled.
 	if s.discovery != nil {
 		go s.discovery.Start(ctx)
@@ -292,6 +307,7 @@ func (s *Server) Start(ctx context.Context) error {
 			if err := s.store.LoadIndex(context.Background()); err != nil {
 				s.logger.Error("reload failed", "error", err)
 			} else {
+				s.rebuildAptSnapshot(context.Background())
 				s.logger.Info("manifests reloaded")
 			}
 		}
@@ -350,8 +366,11 @@ func (s *Server) registerRoutes() {
 	// Health probe
 	m.HandleFunc("GET /healthz", s.handleHealthz)
 
-	// APT repository — dynamic index generation
-	m.HandleFunc("GET /apt/gpg-key.asc", s.handleAptGPGKey)
+	// APT repository: generated index, served from a snapshot.
+	// dists/{distpath...} carries Release, InRelease and Release.gpg;
+	// handleAptDists splits them, since ServeMux has no mid-segment wildcard
+	// for binary-{arch}. No gpg-key.asc route: the repository is unsigned and
+	// there is no key to serve.
 	m.HandleFunc("GET /apt/dists/{distpath...}", s.handleAptDists)
 	m.HandleFunc("GET /apt/pool/{path...}", s.handleAptPool)
 
@@ -748,6 +767,7 @@ func (s *Server) handleCreateEntry(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 			return
 		}
+		s.rebuildAptIndexAfterWrite(ctx, t)
 		writeJSON(w, http.StatusCreated, &pm)
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": fmt.Sprintf("unknown type %q", t)})
@@ -782,8 +802,21 @@ func (s *Server) handleDeleteEntry(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}
+	s.rebuildAptIndexAfterWrite(ctx, t)
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "type": t, "name": name})
+}
+
+// rebuildAptIndexAfterWrite regenerates the apt snapshot when a mutation
+// touched apt. Without it the snapshot outlives the write that invalidated it,
+// which is the same stale-index defect the snapshot was introduced to fix,
+// only slower. Other package types have no generated index to go stale, and
+// the rebuild lists the pool, so it is not free.
+func (s *Server) rebuildAptIndexAfterWrite(ctx context.Context, t string) {
+	if t != manifest.TypeApt {
+		return
+	}
+	s.rebuildAptSnapshot(ctx)
 }
 
 // isFrozen returns whether all versions of a named package are frozen, or an error if not found.
@@ -834,6 +867,7 @@ func (s *Server) handleToggleHidden(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = s.store.SaveIndex(ctx)
+	s.rebuildAptIndexAfterWrite(ctx, t)
 	writeJSON(w, http.StatusOK, pm)
 }
 
@@ -862,6 +896,7 @@ func (s *Server) handleToggleFreeze(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = s.store.SaveIndex(ctx)
+	s.rebuildAptIndexAfterWrite(ctx, t)
 	writeJSON(w, http.StatusOK, pm)
 }
 

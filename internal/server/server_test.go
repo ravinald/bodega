@@ -3,12 +3,16 @@ package server_test
 import (
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -125,7 +129,6 @@ func newTestServer(t *testing.T) (*httptest.Server, *mockStore) {
 
 	mock := &mockStore{
 		objects: map[string]string{
-			"packages/apt/gpg-key.asc": "-----BEGIN PGP PUBLIC KEY BLOCK-----\ntest\n",
 			"packages/apt/pool/main/a/amazon-efs-utils/amazon-efs-utils_2.4.2_amd64.deb": "\x00deb-content-efs",
 			"packages/apt/pool/main/l/linux-headers/linux-headers_5.15.0_arm64.deb":      "\x00deb-content-linux",
 			"pypi/wheels/boto3-1.35.0-py3-none-any.whl":                                  "fake-wheel-boto3",
@@ -199,19 +202,24 @@ func TestAptReleaseWrongCodename(t *testing.T) {
 	}
 }
 
-func TestAptGPGKey(t *testing.T) {
+// TestAptSignedDocumentsAbsent pins the unsigned contract. apt fetches
+// InRelease first and falls back to Release on 404, so 404 is what lets an
+// unsigned repository work; a 200 carrying unsigned bytes is a malformed
+// document at a well-known URL. gpg-key.asc went with them; there is no key.
+func TestAptSignedDocumentsAbsent(t *testing.T) {
 	ts, _ := newTestServer(t)
-	resp, err := http.Get(ts.URL + "/apt/gpg-key.asc")
-	if err != nil {
-		t.Fatalf("GET /apt/gpg-key.asc: %v", err)
+	for _, path := range []string{
+		"/apt/dists/noble/InRelease",
+		"/apt/dists/noble/Release.gpg",
+		"/apt/gpg-key.asc",
+	} {
+		if status, _ := aptGet(t, ts, path); status != http.StatusNotFound {
+			t.Errorf("GET %s status = %d, want 404 while the repository is unsigned", path, status)
+		}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("status = %d, want 200", resp.StatusCode)
-	}
-	ct := resp.Header.Get("Content-Type")
-	if !strings.HasPrefix(ct, "text/plain") {
-		t.Errorf("Content-Type = %q, want text/plain", ct)
+	// The fallback only helps if Release itself is there.
+	if status, _ := aptGet(t, ts, "/apt/dists/noble/Release"); status != http.StatusOK {
+		t.Errorf("GET /apt/dists/noble/Release status = %d, want 200", status)
 	}
 }
 
@@ -823,7 +831,6 @@ func newLocalBackedServer(t *testing.T) *httptest.Server {
 
 	objects := storage.NewLocal(t.TempDir())
 	seed := map[string]string{
-		"packages/apt/gpg-key.asc": "-----BEGIN PGP PUBLIC KEY BLOCK-----\ntest\n",
 		"packages/apt/pool/main/a/amazon-efs-utils/amazon-efs-utils_2.4.2_amd64.deb": "\x00deb-content-efs",
 		"pypi/wheels/boto3-1.35.0-py3-none-any.whl":                                  "fake-wheel-boto3",
 	}
@@ -1067,5 +1074,258 @@ func TestAptUnservedSuite404s(t *testing.T) {
 		if status, _ := aptGet(t, ts, path); status != http.StatusNotFound {
 			t.Errorf("GET %s status = %d, want 404 for an unserved suite", path, status)
 		}
+	}
+}
+
+// ---- APT index snapshot ----------------------------------------------------
+
+// newSnapshotServer serves one suite and permits mutations from localhost, so
+// a test can drive both the direct-store write (a hand-edited manifest) and
+// the mutation-API write (which rebuilds).
+func newSnapshotServer(t *testing.T) (*httptest.Server, *manifest.Store) {
+	t.Helper()
+
+	store := manifest.NewLocalStore(t.TempDir())
+	if err := store.AddVersion(t.Context(), manifest.TypeApt, "hello", manifest.VersionEntry{
+		Version: "2.10-3build1",
+		Metadata: map[string]string{
+			"Architecture": "amd64",
+			"_pool_path":   "pool/main/h/hello/hello_2.10-3build1_amd64.deb",
+		},
+	}); err != nil {
+		t.Fatalf("AddVersion hello: %v", err)
+	}
+
+	mock := &mockStore{objects: map[string]string{
+		"packages/apt/pool/main/h/hello/hello_2.10-3build1_amd64.deb": "\x00deb",
+	}}
+	cfg := &config.Config{
+		Bucket:          "test-bucket",
+		Region:          "us-west-2",
+		ManifestDir:     "manifests",
+		AptCodename:     "noble",
+		AdminPermitCIDR: []string{"127.0.0.0/8", "::1/128"},
+	}
+	ts := httptest.NewServer(server.New(cfg, store, mock, ":0", nil).Handler())
+	t.Cleanup(ts.Close)
+	return ts, store
+}
+
+// releaseDigest returns the SHA256 and size Release records for an index path.
+func releaseDigest(t *testing.T, release, indexPath string) (string, int) {
+	t.Helper()
+	for _, line := range strings.Split(release, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 3 || fields[2] != indexPath {
+			continue
+		}
+		size, err := strconv.Atoi(fields[1])
+		if err != nil {
+			t.Fatalf("Release size for %s is not a number: %q", indexPath, fields[1])
+		}
+		return fields[0], size
+	}
+	t.Fatalf("Release records no SHA256 for %s:\n%s", indexPath, release)
+	return "", 0
+}
+
+// TestAptReleaseDigestsSurviveAMutation is the regression test for the Hash
+// Sum mismatch race. apt fetches Release and Packages in two requests and
+// checks the second against the digest in the first, so a write landing
+// between them used to hand the client bytes Release never vouched for.
+func TestAptReleaseDigestsSurviveAMutation(t *testing.T) {
+	ts, store := newSnapshotServer(t)
+
+	status, release := aptGet(t, ts, "/apt/dists/noble/Release")
+	if status != http.StatusOK {
+		t.Fatalf("Release status = %d, want 200", status)
+	}
+	wantHash, wantSize := releaseDigest(t, release, "main/binary-amd64/Packages")
+
+	// The write apt cannot see coming: a manifest edit with no SIGHUP, which
+	// is what a mutation landing between the two fetches looks like.
+	if err := store.AddVersion(t.Context(), manifest.TypeApt, "latecomer", manifest.VersionEntry{
+		Version: "1.0.0",
+		Metadata: map[string]string{
+			"Architecture": "amd64",
+			"_pool_path":   "pool/main/l/latecomer/latecomer_1.0.0_amd64.deb",
+		},
+	}); err != nil {
+		t.Fatalf("AddVersion latecomer: %v", err)
+	}
+
+	status, packages := aptGet(t, ts, "/apt/dists/noble/main/binary-amd64/Packages")
+	if status != http.StatusOK {
+		t.Fatalf("Packages status = %d, want 200", status)
+	}
+	sum := sha256.Sum256([]byte(packages))
+	if got := hex.EncodeToString(sum[:]); got != wantHash {
+		t.Errorf("Packages SHA256 = %s, Release recorded %s; a client reports this as Hash Sum mismatch", got, wantHash)
+	}
+	if len(packages) != wantSize {
+		t.Errorf("Packages size = %d, Release recorded %d", len(packages), wantSize)
+	}
+	if strings.Contains(packages, "latecomer") {
+		t.Error("Packages served a generation newer than the Release that digests it")
+	}
+
+	// Same contract for the gzip variant, which Release digests separately.
+	wantGzHash, wantGzSize := releaseDigest(t, release, "main/binary-amd64/Packages.gz")
+	status, gzBody := aptGet(t, ts, "/apt/dists/noble/main/binary-amd64/Packages.gz")
+	if status != http.StatusOK {
+		t.Fatalf("Packages.gz status = %d, want 200", status)
+	}
+	gzSum := sha256.Sum256([]byte(gzBody))
+	if got := hex.EncodeToString(gzSum[:]); got != wantGzHash {
+		t.Errorf("Packages.gz SHA256 = %s, Release recorded %s", got, wantGzHash)
+	}
+	if len(gzBody) != wantGzSize {
+		t.Errorf("Packages.gz size = %d, Release recorded %d", len(gzBody), wantGzSize)
+	}
+}
+
+// TestAptMutationAPIRebuildsIndex covers the other half: a snapshot that never
+// refreshes is the same stale-index defect, only slower.
+func TestAptMutationAPIRebuildsIndex(t *testing.T) {
+	ts, _ := newSnapshotServer(t)
+
+	body := `{"name":"newcomer","type":"apt","versions":[{"version":"3.0.0","metadata":{"Architecture":"amd64","_pool_path":"pool/main/n/newcomer/newcomer_3.0.0_amd64.deb"}}]}`
+	resp, err := http.Post(ts.URL+"/api/v1/packages/apt", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /api/v1/packages/apt: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		got, _ := io.ReadAll(resp.Body)
+		t.Fatalf("POST status = %d, want 201: %s", resp.StatusCode, got)
+	}
+
+	status, packages := aptGet(t, ts, "/apt/dists/noble/main/binary-amd64/Packages")
+	if status != http.StatusOK {
+		t.Fatalf("Packages status = %d, want 200", status)
+	}
+	if !strings.Contains(packages, "Package: newcomer\n") {
+		t.Errorf("Packages does not carry the entry the mutation API just created:\n%s", packages)
+	}
+
+	// And Release still vouches for exactly those bytes.
+	_, release := aptGet(t, ts, "/apt/dists/noble/Release")
+	wantHash, _ := releaseDigest(t, release, "main/binary-amd64/Packages")
+	sum := sha256.Sum256([]byte(packages))
+	if got := hex.EncodeToString(sum[:]); got != wantHash {
+		t.Errorf("after rebuild, Packages SHA256 = %s, Release recorded %s", got, wantHash)
+	}
+}
+
+// TestAptReleaseValidUntil pins the widened window. A cached Release expires
+// in place, and past Valid-Until every client fails apt update at once,
+// including with [trusted=yes], since Acquire::Check-Valid-Until is
+// independent of trust.
+func TestAptReleaseValidUntil(t *testing.T) {
+	ts, _ := newSnapshotServer(t)
+	_, release := aptGet(t, ts, "/apt/dists/noble/Release")
+
+	field := func(name string) time.Time {
+		t.Helper()
+		for _, line := range strings.Split(release, "\n") {
+			v, ok := strings.CutPrefix(line, name+": ")
+			if !ok {
+				continue
+			}
+			parsed, err := time.Parse(time.RFC1123Z, v)
+			if err != nil {
+				t.Fatalf("%s is not RFC1123Z: %q", name, v)
+			}
+			return parsed
+		}
+		t.Fatalf("Release has no %s:\n%s", name, release)
+		return time.Time{}
+	}
+
+	if window := field("Valid-Until").Sub(field("Date")); window != 14*24*time.Hour {
+		t.Errorf("Valid-Until - Date = %v, want 336h0m0s", window)
+	}
+	if remaining := time.Until(field("Valid-Until")); remaining < 12*24*time.Hour {
+		t.Errorf("Release is valid for only %v from now", remaining)
+	}
+}
+
+// TestAptVersionlessEntryNotPublished pins caveat #44's server half: an entry
+// with no version reaches no index, because no CLI verb can address it to
+// hide, freeze or remove it afterwards.
+func TestAptVersionlessEntryNotPublished(t *testing.T) {
+	store := manifest.NewLocalStore(t.TempDir())
+	ctx := t.Context()
+	for _, ve := range []manifest.VersionEntry{
+		{SourceName: "hello", Metadata: map[string]string{
+			"Architecture": "amd64", "Package": "hello", "Version": "2.10-3build1",
+			"_pool_path": "pool/main/h/hello/hello_2.10-3build1_amd64.deb",
+		}},
+		{Version: "2.10-3build1", SourceName: "hello", Metadata: map[string]string{
+			"Architecture": "amd64", "_pool_path": "pool/main/h/hello/hello_2.10-3build1_amd64.deb",
+		}},
+	} {
+		if err := store.AddVersion(ctx, manifest.TypeApt, "hello", ve); err != nil {
+			t.Fatalf("AddVersion: %v", err)
+		}
+	}
+
+	cfg := &config.Config{Bucket: "b", Region: "r", ManifestDir: "manifests", AptCodename: "noble"}
+	mock := &mockStore{objects: map[string]string{}}
+	ts := httptest.NewServer(server.New(cfg, store, mock, ":0", nil).Handler())
+	t.Cleanup(ts.Close)
+
+	_, packages := aptGet(t, ts, "/apt/dists/noble/main/binary-amd64/Packages")
+	if got := strings.Count(packages, "Package: hello\n"); got != 1 {
+		t.Errorf("hello appears in %d stanzas, want 1:\n%s", got, packages)
+	}
+}
+
+// TestAptStanzaFieldsAreNotDuplicated pins caveat #43. deb822 does not define
+// a repeated field, so a metadata copy scraped from upstream landing beside
+// bodega's own value leaves which one wins to a parser's choice, and in
+// direct-url and source-build modes the two disagree.
+func TestAptStanzaFieldsAreNotDuplicated(t *testing.T) {
+	store := manifest.NewLocalStore(t.TempDir())
+	if err := store.AddVersion(t.Context(), manifest.TypeApt, "hello", manifest.VersionEntry{
+		Version:      "2.10-3build1",
+		ArtifactSize: 26006,
+		Metadata: map[string]string{
+			"Architecture": "amd64",
+			"_pool_path":   "pool/main/h/hello/hello_2.10-3build1_amd64.deb",
+			"_md5":         "aaaa",
+			"_sha1":        "bbbb",
+			"_sha256":      "cccc",
+			// The upstream scrape, naming upstream's pool path and digests.
+			"Filename": "pool/main/h/hello/upstream_2.10-3build1_amd64.deb",
+			"Size":     "999",
+			"MD5sum":   "dddd",
+			"SHA1":     "eeee",
+			"SHA256":   "ffff",
+			"Origin":   "Ubuntu",
+		},
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+
+	cfg := &config.Config{Bucket: "b", Region: "r", ManifestDir: "manifests", AptCodename: "noble"}
+	ts := httptest.NewServer(server.New(cfg, store, &mockStore{objects: map[string]string{}}, ":0", nil).Handler())
+	t.Cleanup(ts.Close)
+
+	_, packages := aptGet(t, ts, "/apt/dists/noble/main/binary-amd64/Packages")
+	for _, field := range []string{"Filename", "Size", "MD5sum", "SHA1", "SHA256"} {
+		if got := strings.Count(packages, "\n"+field+": "); got != 1 {
+			t.Errorf("%s appears %d times in the stanza, want 1:\n%s", field, got, packages)
+		}
+	}
+	if strings.Contains(packages, "Origin: ") {
+		t.Errorf("Origin belongs to Release and names the wrong repository in a stanza:\n%s", packages)
+	}
+	// bodega's own values are the ones that survive.
+	if !strings.Contains(packages, "Filename: pool/main/h/hello/hello_2.10-3build1_amd64.deb\n") {
+		t.Errorf("Filename is not bodega's pool path:\n%s", packages)
+	}
+	if !strings.Contains(packages, "SHA256: cccc\n") {
+		t.Errorf("SHA256 is not bodega's recorded digest:\n%s", packages)
 	}
 }

@@ -582,6 +582,34 @@ The suite (`noble` above) is any entry in `apt_suites`. One instance serves seve
 
 `[trusted=yes]` turns off apt's signature verification for this source and nothing else re-enables it. The apt repository is unsigned, so the line is required until signing lands; TLS is what authenticates the packages in the meantime, which is why the URL is `https://`.
 
+`dists/<suite>/InRelease` and `dists/<suite>/Release.gpg` return 404, and so does `/apt/gpg-key.asc`. All three are signature-bearing and there is no key. apt fetches `InRelease` first and falls back to `Release` on 404, which is the ordinary path for an archive predating `InRelease`, so `apt update` logs `Ign:` for both and proceeds.
+
+### APT index generation
+
+`dists/<suite>/Release` and the `Packages` bodies under it are generated together into one snapshot and served from memory until the next rebuild. Nothing is written to storage: the only stored part of the apt repository is `pool/`.
+
+They are generated together because `Release` records the SHA256 and byte length of each `Packages` body, and apt fetches the two in separate requests. Regenerating per request lets a write land between them, and the client rejects the result as `Hash Sum mismatch`.
+
+A rebuild happens on:
+
+| Trigger | Notes |
+|---------|-------|
+| Server start | Before the listener binds, so no request ever sees an empty index |
+| `SIGHUP` | After the manifest reload. Every `bodega pkg` command sends one |
+| A mutation-API write to an apt entry | `POST`, `DELETE`, and the hide and freeze toggles |
+| An hourly ticker | Keeps `Valid-Until` moving; see below |
+
+**A manifest edited by hand is not picked up until one of those fires.** Before the snapshot, the index reflected the manifest store on every request. Now an edit made directly to a `manifest.json` needs a `SIGHUP` (`kill -HUP $(cat <log_dir>/bodega.pid)`) or an hour's wait. Every CLI mutation already signals, so the normal workflow is unaffected.
+
+`Release` carries `Date` backdated 24 hours to tolerate client clock skew, and `Valid-Until` 14 days after that. The expiry is stamped when the snapshot is built and does not move on its own, which is why the refresh ticker is not an optimization: a server whose refresh loop stops eventually serves an expired `Release`, and every client fails `apt update` at once — including with `[trusted=yes]`, since `Acquire::Check-Valid-Until` is independent of trust. Within 24 hours of expiry the server logs at `WARN` on every `Release` fetch.
+
+Two cases drop an entry from the index silently, so both are logged at `WARN` once per rebuild:
+
+- The entry names suites, none of which is in `apt_suites`.
+- The entry has no `version`. No CLI verb can address a versionless entry, so publishing one hands clients a package nobody can withdraw.
+
+An architecture is served only if some entry published to that suite declares it. `Release` advertises exactly those architectures in `Architectures:`, and `binary-<arch>/Packages` 404s for any other, since `Release` records no digest for it. With no architecture-specific entry at all the suite falls back to `amd64`.
+
 **pip** (per-command or `pip.conf`):
 ```bash
 pip install --index-url https://bodega-host:8080/pypi/simple/ <package>
