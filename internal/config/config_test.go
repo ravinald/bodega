@@ -140,7 +140,12 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 	t.Helper()
 
 	// discover_mode is validated by Load, so it cannot take a generated value.
-	overrides := map[string]any{"discover_mode": "observe"}
+	// apt_suites is normalized by Load — apt_codename first, then the rest, no
+	// duplicates — so it has to be filled in the shape Load would produce.
+	overrides := map[string]any{
+		"discover_mode": "observe",
+		"apt_suites":    []string{"value-apt_codename", "apt_suites-one"},
+	}
 
 	v := reflect.ValueOf(cfg).Elem()
 	typ := v.Type()
@@ -251,6 +256,75 @@ func TestSave_OmitsRuntimeAndUnsetFields(t *testing.T) {
 		if _, ok := keys[k]; !ok {
 			t.Errorf("saved config is missing non-omitempty key %q", k)
 		}
+	}
+}
+
+func TestLoad_AptSuites(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want []string
+		err  string
+	}{
+		{name: "default", body: `{}`, want: []string{"noble"}},
+		{
+			name: "codename is prepended when apt_suites omits it",
+			body: `{"apt_codename": "noble", "apt_suites": ["jammy"]}`,
+			want: []string{"noble", "jammy"},
+		},
+		{
+			name: "codename listed twice is served once",
+			body: `{"apt_codename": "jammy", "apt_suites": ["jammy", "noble"]}`,
+			want: []string{"jammy", "noble"},
+		},
+		{
+			name: "slash in a suite name is rejected",
+			body: `{"apt_suites": ["stable/updates"]}`,
+			err:  "stable/updates",
+		},
+		{
+			name: "slash in the default suite is rejected",
+			body: `{"apt_codename": "a/b"}`,
+			err:  "a/b",
+		},
+		{
+			name: "empty suite name is rejected",
+			body: `{"apt_suites": [""]}`,
+			err:  "empty name",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateConfig(t)
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			t.Setenv(config.EnvConfigFile, path)
+
+			cfg, err := config.Load(t.TempDir(), "", "", "", false, false)
+			if tc.err != "" {
+				if err == nil {
+					t.Fatalf("Load succeeded, want error mentioning %q", tc.err)
+				}
+				if !strings.Contains(err.Error(), tc.err) {
+					t.Errorf("Load error = %v, want mention of %q", err, tc.err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if !reflect.DeepEqual(cfg.AptSuites, tc.want) {
+				t.Errorf("AptSuites = %v, want %v", cfg.AptSuites, tc.want)
+			}
+			if !cfg.ServesAptSuite(cfg.AptCodename) {
+				t.Errorf("ServesAptSuite(%q) = false — the default suite must always be served", cfg.AptCodename)
+			}
+			if cfg.ServesAptSuite("not-a-suite") {
+				t.Error("ServesAptSuite(\"not-a-suite\") = true")
+			}
+		})
 	}
 }
 

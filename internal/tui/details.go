@@ -320,6 +320,30 @@ func clientScheme(cfg *config.Config) string {
 	return "http"
 }
 
+// aptSourcesSuite picks the suite for a sources line: the first suite the
+// package is actually published to, falling back to the server's default. A
+// package in several suites needs one line per suite, and the pane shows one.
+func aptSourcesSuite(cfg *config.Config, pm *manifest.PackageManifest) string {
+	def := ""
+	if cfg != nil {
+		def = cfg.AptCodename
+	}
+	if pm != nil {
+		for _, ve := range pm.Versions {
+			if ve.Hidden {
+				continue
+			}
+			if suites := ve.EffectiveSuites(def); len(suites) > 0 {
+				return suites[0]
+			}
+		}
+	}
+	if def != "" {
+		return def
+	}
+	return "<suite>"
+}
+
 // clientURL returns the URL a client would use to fetch the artifact from the bodega server.
 func clientURL(cfg *config.Config, store *manifest.Store, entryType, name string) string {
 	ctx := context.Background()
@@ -350,7 +374,7 @@ func clientURL(cfg *config.Config, store *manifest.Store, entryType, name string
 		}
 		return fmt.Sprintf("%s://%s/binaries/%s/%s/%s", scheme, host, pm.Name, ve.Version, fn)
 	case manifest.TypeApt:
-		return fmt.Sprintf("deb [trusted=yes] %s://%s/apt/ noble main", scheme, host)
+		return fmt.Sprintf("deb [trusted=yes] %s://%s/apt/ %s main", scheme, host, aptSourcesSuite(cfg, pm))
 	case manifest.TypePypi:
 		return fmt.Sprintf("pip install --index-url %s://%s/pypi/simple/ %s", scheme, host, name)
 	case manifest.TypeGomod:

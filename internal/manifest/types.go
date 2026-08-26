@@ -126,6 +126,12 @@ type VersionEntry struct {
 	// produced .deb file after building.
 	DebGlob string `json:"deb_glob,omitempty"`
 
+	// Suites lists the apt suites (dists/<suite>/) this .deb is published to.
+	// Empty means the server's default suite, so manifests written before the
+	// field existed keep serving unchanged. The pool object is shared across
+	// every listed suite: a flat pool/ is correct Debian layout.
+	Suites []string `json:"suites,omitempty"`
+
 	// --- binary-specific fields ---
 
 	// Filename overrides the basename derived from URL when set.
@@ -230,6 +236,29 @@ func (ve VersionEntry) EffectiveMode() string {
 		return ModeHosted
 	}
 	return ve.Mode
+}
+
+// EffectiveSuites returns the apt suites this entry is published to, falling
+// back to def when the entry names none.
+func (ve VersionEntry) EffectiveSuites(def string) []string {
+	if len(ve.Suites) > 0 {
+		return ve.Suites
+	}
+	if def == "" {
+		return nil
+	}
+	return []string{def}
+}
+
+// InSuite reports whether this entry is published to suite s, treating an
+// entry with no suites as belonging to def.
+func (ve VersionEntry) InSuite(s, def string) bool {
+	for _, x := range ve.EffectiveSuites(def) {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }
 
 // DepEdge represents a directed dependency from a parent package to a child package.

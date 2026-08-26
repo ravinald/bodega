@@ -70,7 +70,7 @@ func (s *Server) handleAptDists(w http.ResponseWriter, r *http.Request) {
 
 // handleAptRelease generates a Debian Release file from the manifest store.
 func (s *Server) handleAptRelease(w http.ResponseWriter, r *http.Request, codename string) {
-	if codename != s.cfg.AptCodename {
+	if !s.cfg.ServesAptSuite(codename) {
 		http.NotFound(w, r)
 		return
 	}
@@ -84,7 +84,7 @@ func (s *Server) handleAptRelease(w http.ResponseWriter, r *http.Request, codena
 	}
 
 	// Collect unique architectures from manifest metadata.
-	arches := s.aptArchitectures(ctx)
+	arches := s.aptArchitectures(ctx, codename)
 	if len(arches) == 0 {
 		arches = []string{"amd64"}
 	}
@@ -96,7 +96,7 @@ func (s *Server) handleAptRelease(w http.ResponseWriter, r *http.Request, codena
 	}
 	var entries []indexEntry
 	for _, arch := range arches {
-		pkgData := s.generateAptPackages(ctx, arch, debKeys)
+		pkgData := s.generateAptPackages(ctx, codename, arch, debKeys)
 		entries = append(entries, indexEntry{
 			path: "main/binary-" + arch + "/Packages",
 			data: pkgData,
@@ -115,6 +115,7 @@ func (s *Server) handleAptRelease(w http.ResponseWriter, r *http.Request, codena
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "Origin: bodega\n")
 	fmt.Fprintf(&buf, "Label: bodega\n")
+	fmt.Fprintf(&buf, "Suite: %s\n", codename)
 	fmt.Fprintf(&buf, "Codename: %s\n", codename)
 	fmt.Fprintf(&buf, "Components: main\n")
 	fmt.Fprintf(&buf, "Architectures: %s\n", strings.Join(arches, " "))
@@ -135,7 +136,7 @@ func (s *Server) handleAptRelease(w http.ResponseWriter, r *http.Request, codena
 
 // handleAptPackages generates a Debian Packages index for a specific architecture.
 func (s *Server) handleAptPackages(w http.ResponseWriter, r *http.Request, codename, component, arch string) {
-	if codename != s.cfg.AptCodename || component != "main" {
+	if !s.cfg.ServesAptSuite(codename) || component != "main" {
 		http.NotFound(w, r)
 		return
 	}
@@ -148,7 +149,7 @@ func (s *Server) handleAptPackages(w http.ResponseWriter, r *http.Request, coden
 		return
 	}
 
-	data := s.generateAptPackages(ctx, arch, debKeys)
+	data := s.generateAptPackages(ctx, codename, arch, debKeys)
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 	w.WriteHeader(http.StatusOK)
@@ -157,7 +158,7 @@ func (s *Server) handleAptPackages(w http.ResponseWriter, r *http.Request, coden
 
 // handleAptPackagesGz serves the gzip-compressed Packages index.
 func (s *Server) handleAptPackagesGz(w http.ResponseWriter, r *http.Request, codename, component, arch string) {
-	if codename != s.cfg.AptCodename || component != "main" {
+	if !s.cfg.ServesAptSuite(codename) || component != "main" {
 		http.NotFound(w, r)
 		return
 	}
@@ -170,7 +171,7 @@ func (s *Server) handleAptPackagesGz(w http.ResponseWriter, r *http.Request, cod
 		return
 	}
 
-	data := s.generateAptPackages(ctx, arch, debKeys)
+	data := s.generateAptPackages(ctx, codename, arch, debKeys)
 	var gz bytes.Buffer
 	gw := gzip.NewWriter(&gz)
 	_, _ = gw.Write(data)
@@ -190,8 +191,9 @@ func (s *Server) aptPoolKeys(ctx context.Context) ([]string, error) {
 	return s.objects.List(ctx, "packages/apt/pool/")
 }
 
-// aptArchitectures returns sorted unique architectures from all apt manifest entries.
-func (s *Server) aptArchitectures(ctx context.Context) []string {
+// aptArchitectures returns sorted unique architectures from the apt manifest
+// entries published to suite.
+func (s *Server) aptArchitectures(ctx context.Context, suite string) []string {
 	seen := map[string]bool{}
 	for _, name := range s.store.ListPackages(manifest.TypeApt) {
 		pm, _ := s.store.GetPackage(ctx, manifest.TypeApt, name)
@@ -199,7 +201,7 @@ func (s *Server) aptArchitectures(ctx context.Context) []string {
 			continue
 		}
 		for _, ve := range pm.Versions {
-			if ve.Hidden || ve.Version == "*" {
+			if ve.Hidden || ve.Version == "*" || !ve.InSuite(suite, s.cfg.AptCodename) {
 				continue
 			}
 			if arch := ve.Metadata["Architecture"]; arch != "" && arch != "all" {
@@ -215,9 +217,9 @@ func (s *Server) aptArchitectures(ctx context.Context) []string {
 	return arches
 }
 
-// generateAptPackages builds a Debian Packages file for the given architecture
-// from manifest metadata and the S3 pool key listing.
-func (s *Server) generateAptPackages(ctx context.Context, arch string, debKeys []string) []byte {
+// generateAptPackages builds a Debian Packages file for the given suite and
+// architecture from manifest metadata and the S3 pool key listing.
+func (s *Server) generateAptPackages(ctx context.Context, suite, arch string, debKeys []string) []byte {
 	// Build a map of source-name+version → S3 pool key for Filename lookup.
 	poolMap := make(map[string]string) // "pkgname_version" → relative pool path
 	for _, key := range debKeys {
@@ -239,7 +241,7 @@ func (s *Server) generateAptPackages(ctx context.Context, arch string, debKeys [
 			continue
 		}
 		for _, ve := range pm.Versions {
-			if ve.Hidden || ve.Version == "*" {
+			if ve.Hidden || ve.Version == "*" || !ve.InSuite(suite, s.cfg.AptCodename) {
 				continue
 			}
 			veArch := ve.Metadata["Architecture"]

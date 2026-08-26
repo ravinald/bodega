@@ -21,6 +21,7 @@ func TestDefaultConfigContent(t *testing.T) {
 		"storage_path":      "/var/lib/bodega",
 		"listen_addr":       DefaultListenAddr,
 		"apt_codename":      "noble",
+		"apt_suites":        []any{"noble"},
 		"region":            DefaultRegion,
 		"build_root":        DefaultBuildRoot,
 		"log_dir":           DefaultLogDir,

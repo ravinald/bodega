@@ -33,9 +33,12 @@ func newServeCmd(gf *globalFlags) *cobra.Command {
 
 Clients can use the server as follows:
 
-  apt:  deb [trusted=yes] https://bodega-host:8080/apt/ noble main
+  apt:  deb [trusted=yes] https://bodega-host:8080/apt/ <suite> main
   pip:  pip install --index-url https://bodega-host:8080/pypi/simple/ <package>
   git:  curl https://bodega-host:8080/git/<name>/<name>-<ref>.bundle -o <name>.bundle
+
+<suite> is any entry in the config's apt_suites list (default: the single value
+of apt_codename, "noble"). One sources line per suite; the pool is shared.
 
 [trusted=yes] turns off apt's signature verification for that source, which the
 apt repository requires because it is unsigned. TLS is what authenticates the

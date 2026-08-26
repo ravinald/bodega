@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 const (
@@ -67,7 +68,8 @@ type Config struct {
 	AuditEvents       []string `json:"audit_events,omitempty"`      // event types to record; empty = all
 	StorageBackend    string   `json:"storage_backend,omitempty"`   // "local" (default), "s3"
 	StoragePath       string   `json:"storage_path,omitempty"`      // root directory for local backend
-	AptCodename       string   `json:"apt_codename,omitempty"`      // codename for generated apt repo (default "noble")
+	AptCodename       string   `json:"apt_codename,omitempty"`      // default suite for apt entries that name none (default "noble")
+	AptSuites         []string `json:"apt_suites,omitempty"`        // suites served under /apt/dists/; always includes AptCodename
 	AdminPermitCIDR   []string `json:"admin_permit_cidr,omitempty"` // CIDRs allowed to hit mutation API; default ["127.0.0.0/8","::1/128"]
 	LocalConfig       bool     `json:"-"`
 	Verbose           bool     `json:"-"`
@@ -113,6 +115,28 @@ func (c *Config) RootForType(typ string) string {
 		}
 	}
 	return c.BuildRoot
+}
+
+// ServedAptSuites returns the apt suites the server answers for. Load
+// normalizes AptSuites, so this only has to cover a Config built by hand.
+func (c *Config) ServedAptSuites() []string {
+	if len(c.AptSuites) > 0 {
+		return c.AptSuites
+	}
+	if c.AptCodename == "" {
+		return nil
+	}
+	return []string{c.AptCodename}
+}
+
+// ServesAptSuite reports whether suite is one of the served apt suites.
+func (c *Config) ServesAptSuite(suite string) bool {
+	for _, s := range c.ServedAptSuites() {
+		if s == suite {
+			return true
+		}
+	}
+	return false
 }
 
 // legacyConfig holds config.json keys under names that predate the current
@@ -163,8 +187,28 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	// Storage backend.
 	cfg.StorageBackend = firstNonEmpty(cfg.StorageBackend, "local")
 
-	// APT codename.
+	// APT suites. apt_codename is the default suite for entries that name
+	// none; apt_suites is the served set and always contains it, so an entry
+	// written before suites existed can never be orphaned. A "/" in a suite
+	// name would misroute in handleAptDists, which splits the dists path on
+	// "/" and counts segments, so reject it at load like discover_mode.
 	cfg.AptCodename = firstNonEmpty(cfg.AptCodename, "noble")
+	suites := make([]string, 0, len(cfg.AptSuites)+1)
+	seen := map[string]bool{}
+	for _, s := range append([]string{cfg.AptCodename}, cfg.AptSuites...) {
+		if s == "" {
+			return nil, fmt.Errorf("invalid apt suite: empty name")
+		}
+		if strings.Contains(s, "/") {
+			return nil, fmt.Errorf("invalid apt suite %q (must not contain \"/\")", s)
+		}
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		suites = append(suites, s)
+	}
+	cfg.AptSuites = suites
 
 	// Mutation allow-list: default to localhost only.
 	if len(cfg.AdminPermitCIDR) == 0 {
@@ -297,8 +341,9 @@ func defaultConfigContent() []byte {
   "npm_root": "",
   "cargo_root": "",
 
-  "_comment_apt": "apt_codename: suite name of the generated apt repository",
+  "_comment_apt": "apt_codename: default suite for apt entries that name none. apt_suites: every suite served under /apt/dists/; apt_codename is always included.",
   "apt_codename": "noble",
+  "apt_suites": ["noble"],
 
   "_comment_audit": "audit_db defaults to {log_dir}/audit.db. timezone is the display timezone for audit queries (default UTC); audit_events limits which event types are recorded, empty records all.",
   "audit_db": "",

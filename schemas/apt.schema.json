@@ -43,6 +43,14 @@
             "type": "string",
             "description": "Glob pattern (relative to source dir) to locate the built .deb file."
           },
+          "suites": {
+            "type": "array",
+            "description": "APT suites (dists/<suite>/) this package is published to. Absent means the server's default suite (config apt_codename). Suite names must not contain \"/\".",
+            "items": {
+              "type": "string",
+              "pattern": "^[^/]+$"
+            }
+          },
           "frozen": {
             "type": "boolean",
             "default": false,
