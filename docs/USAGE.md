@@ -381,6 +381,7 @@ A default config is created on first run. All fields are optional.
   "gomod_upstream": "https://proxy.golang.org",
   "npm_upstream": "https://registry.npmjs.org",
   "apt_codename": "noble",
+  "apt_suites": ["noble"],
   "audit_db": "",
   "timezone": "",
   "audit_events": [],
@@ -388,6 +389,8 @@ A default config is created on first run. All fields are optional.
   "admin_permit_cidr": ["127.0.0.0/8", "::1/128"]
 }
 ```
+
+`apt_codename` is the default suite for apt manifest entries that name no `suites`; `apt_suites` is the full set served under `/apt/dists/`, and `apt_codename` is always included in it whether listed or not. A suite name containing `/` is rejected at load.
 
 `timezone` sets the display timezone for audit queries (default UTC) and `audit_events` limits which event types are recorded (empty records all).
 
@@ -497,13 +500,15 @@ All version entries support:
   "source_name": "amazon-efs-utils",
   "url": "https://github.com/aws/efs-utils.git",
   "build_cmd": "make deb",
-  "deb_glob": "build/*.deb"
+  "deb_glob": "build/*.deb",
+  "suites": ["noble", "jammy"]
 }
 ```
 
 - **source_name**: upstream Debian package / source directory name
 - **build_cmd**: shell command to produce .deb
 - **deb_glob**: path glob to locate produced .deb
+- **suites**: apt suites this .deb is published to. Absent means the server's default suite (`apt_codename`). A suite name may not contain `/`. The pool is flat and shared, so one entry listed in two suites is one `.deb` served under both `dists/` trees.
 
 ### Binary-specific fields
 
@@ -572,6 +577,8 @@ Actually, the operations are more granular: fetch, build/run, sync, upload.
 ```
 deb [trusted=yes] https://bodega-host:8080/apt/ noble main
 ```
+
+The suite (`noble` above) is any entry in `apt_suites`. One instance serves several: give each suite its own sources line, since apt's one-line format takes a single suite. A `.deb` listed in two suites is stored once in the shared `pool/` and appears in both `Packages` indexes with the same `Filename:`.
 
 `[trusted=yes]` turns off apt's signature verification for this source and nothing else re-enables it. The apt repository is unsigned, so the line is required until signing lands; TLS is what authenticates the packages in the meantime, which is why the URL is `https://`.
 
@@ -947,7 +954,7 @@ The key layout is the same regardless of backend (local filesystem or S3):
 
 | Type | S3 prefix | Example key |
 |------|-----------|-------------|
-| apt | `packages/apt/` | `packages/apt/dists/noble/Release` |
+| apt | `packages/apt/` | `packages/apt/pool/main/h/hello/hello_2.10-3build1_amd64.deb` |
 | git | `repos/` | `repos/netbox/netbox-v4.5.7.bundle` |
 | pypi | `pypi/wheels/` | `pypi/wheels/boto3-1.35.0-py3-none-any.whl` |
 | binary | `binaries/` | `binaries/awscli-v2/2.34.24/awscli-exe-linux-x86_64.zip` |

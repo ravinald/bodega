@@ -896,3 +896,176 @@ func TestServeOverLocalBackend(t *testing.T) {
 		t.Errorf("pypi index missing boto3:\n%s", index)
 	}
 }
+
+// ---- APT multi-suite -------------------------------------------------------
+
+// newMultiSuiteServer serves noble and jammy from one flat pool. The fixture
+// covers the four cases that distinguish a per-suite index from a global one:
+// the same package at a different version in each suite, an arch-all package
+// in both, an entry naming no suites at all, and an architecture present in
+// noble only.
+func newMultiSuiteServer(t *testing.T) *httptest.Server {
+	t.Helper()
+
+	store := manifest.NewLocalStore(t.TempDir())
+	ctx := t.Context()
+	add := func(name string, ve manifest.VersionEntry) {
+		t.Helper()
+		if err := store.AddVersion(ctx, manifest.TypeApt, name, ve); err != nil {
+			t.Fatalf("AddVersion %s@%s: %v", name, ve.Version, err)
+		}
+	}
+	add("hello", manifest.VersionEntry{
+		Version:  "2.10-noble1",
+		Suites:   []string{"noble"},
+		Metadata: map[string]string{"Architecture": "amd64"},
+	})
+	add("hello", manifest.VersionEntry{
+		Version:  "2.10-jammy1",
+		Suites:   []string{"jammy"},
+		Metadata: map[string]string{"Architecture": "amd64"},
+	})
+	add("bodega-config", manifest.VersionEntry{
+		Version:  "1.0.0",
+		Suites:   []string{"noble", "jammy"},
+		Metadata: map[string]string{"Architecture": "all"},
+	})
+	add("legacy-tool", manifest.VersionEntry{
+		Version:  "0.9.0",
+		Metadata: map[string]string{"Architecture": "amd64"},
+	})
+	add("noble-only-kmod", manifest.VersionEntry{
+		Version:  "1.2.3",
+		Suites:   []string{"noble"},
+		Metadata: map[string]string{"Architecture": "riscv64"},
+	})
+
+	mock := &mockStore{objects: map[string]string{
+		"packages/apt/pool/main/h/hello/hello_2.10-noble1_amd64.deb":                 "\x00deb",
+		"packages/apt/pool/main/h/hello/hello_2.10-jammy1_amd64.deb":                 "\x00deb",
+		"packages/apt/pool/main/b/bodega-config/bodega-config_1.0.0_all.deb":         "\x00deb",
+		"packages/apt/pool/main/l/legacy-tool/legacy-tool_0.9.0_amd64.deb":           "\x00deb",
+		"packages/apt/pool/main/n/noble-only-kmod/noble-only-kmod_1.2.3_riscv64.deb": "\x00deb",
+	}}
+
+	cfg := &config.Config{
+		Bucket:      "test-bucket",
+		Region:      "us-west-2",
+		ManifestDir: "manifests",
+		AptCodename: "noble",
+		AptSuites:   []string{"noble", "jammy"},
+	}
+	ts := httptest.NewServer(server.New(cfg, store, mock, ":0", nil).Handler())
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+// aptGet fetches path and returns the status code and body.
+func aptGet(t *testing.T, ts *httptest.Server, path string) (int, string) {
+	t.Helper()
+	resp, err := http.Get(ts.URL + path)
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(body)
+}
+
+// debField returns the value of field in the Packages stanza for pkg.
+func debField(packages, pkg, field string) string {
+	for _, stanza := range strings.Split(packages, "\n\n") {
+		if !strings.Contains(stanza, "Package: "+pkg+"\n") {
+			continue
+		}
+		for _, line := range strings.Split(stanza, "\n") {
+			if v, ok := strings.CutPrefix(line, field+": "); ok {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+func TestAptSuitesPartitionPackages(t *testing.T) {
+	ts := newMultiSuiteServer(t)
+
+	status, noble := aptGet(t, ts, "/apt/dists/noble/main/binary-amd64/Packages")
+	if status != http.StatusOK {
+		t.Fatalf("noble Packages status = %d, want 200", status)
+	}
+	status, jammy := aptGet(t, ts, "/apt/dists/jammy/main/binary-amd64/Packages")
+	if status != http.StatusOK {
+		t.Fatalf("jammy Packages status = %d, want 200", status)
+	}
+
+	if v := debField(noble, "hello", "Version"); v != "2.10-noble1" {
+		t.Errorf("noble hello Version = %q, want 2.10-noble1", v)
+	}
+	if v := debField(jammy, "hello", "Version"); v != "2.10-jammy1" {
+		t.Errorf("jammy hello Version = %q, want 2.10-jammy1", v)
+	}
+	if strings.Contains(noble, "2.10-jammy1") {
+		t.Errorf("noble Packages leaked the jammy version:\n%s", noble)
+	}
+	if strings.Contains(jammy, "2.10-noble1") {
+		t.Errorf("jammy Packages leaked the noble version:\n%s", jammy)
+	}
+
+	// An entry naming no suites belongs to the default suite and nowhere else.
+	if debField(noble, "legacy-tool", "Version") != "0.9.0" {
+		t.Errorf("legacy-tool missing from the default suite:\n%s", noble)
+	}
+	if strings.Contains(jammy, "legacy-tool") {
+		t.Errorf("legacy-tool with no suites must not appear in jammy:\n%s", jammy)
+	}
+
+	// One pool object, two suites: the Filename must be identical.
+	nf := debField(noble, "bodega-config", "Filename")
+	jf := debField(jammy, "bodega-config", "Filename")
+	if nf == "" || jf == "" {
+		t.Fatalf("bodega-config missing from a suite: noble=%q jammy=%q", nf, jf)
+	}
+	if nf != jf {
+		t.Errorf("shared package Filename differs: noble=%q jammy=%q", nf, jf)
+	}
+	if want := "pool/main/b/bodega-config/bodega-config_1.0.0_all.deb"; nf != want {
+		t.Errorf("bodega-config Filename = %q, want %q", nf, want)
+	}
+}
+
+func TestAptSuiteArchitectures(t *testing.T) {
+	ts := newMultiSuiteServer(t)
+
+	for _, tc := range []struct{ suite, want string }{
+		{"noble", "Architectures: amd64 riscv64"},
+		{"jammy", "Architectures: amd64"},
+	} {
+		status, body := aptGet(t, ts, "/apt/dists/"+tc.suite+"/Release")
+		if status != http.StatusOK {
+			t.Fatalf("%s Release status = %d, want 200", tc.suite, status)
+		}
+		if !strings.Contains(body, tc.want+"\n") {
+			t.Errorf("%s Release missing %q:\n%s", tc.suite, tc.want, body)
+		}
+		for _, want := range []string{"Suite: " + tc.suite, "Codename: " + tc.suite} {
+			if !strings.Contains(body, want+"\n") {
+				t.Errorf("%s Release missing %q:\n%s", tc.suite, want, body)
+			}
+		}
+	}
+}
+
+func TestAptUnservedSuite404s(t *testing.T) {
+	ts := newMultiSuiteServer(t)
+	for _, path := range []string{
+		"/apt/dists/bookworm/Release",
+		"/apt/dists/bookworm/InRelease",
+		"/apt/dists/bookworm/main/binary-amd64/Packages",
+		"/apt/dists/bookworm/main/binary-amd64/Packages.gz",
+	} {
+		if status, _ := aptGet(t, ts, path); status != http.StatusNotFound {
+			t.Errorf("GET %s status = %d, want 404 for an unserved suite", path, status)
+		}
+	}
+}
