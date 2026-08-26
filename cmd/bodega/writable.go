@@ -14,7 +14,7 @@ import (
 func ensureMutable(cfg *config.Config) error {
 	var probes []string
 
-	if cfg.LocalConfig || cfg.StorageBackend == "" || cfg.StorageBackend == "local" {
+	if usesLocalManifests(cfg) {
 		if cfg.ManifestDir != "" {
 			probes = append(probes, cfg.ManifestDir)
 		}

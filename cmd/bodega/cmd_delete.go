@@ -56,16 +56,13 @@ Frozen entries cannot be deleted; unfreeze them first with 'bodega freeze'.`,
 
 			// Remove from object store first if requested.
 			if removeFromS3 {
-				if err := requireBucket(cfg); err != nil {
-					return err
-				}
 				objStore, err := storage.New(ctx, cfg)
 				if err != nil {
 					return fmt.Errorf("connect to storage: %w", err)
 				}
 				key := s3KeyFor(store, ctx, t, name)
 				if key != "" {
-					fmt.Printf("Deleting s3://%s/%s ...\n", cfg.Bucket, key)
+					fmt.Printf("Deleting %s/%s ...\n", objStore.Label(), key)
 					if err := objStore.Delete(ctx, key); err != nil {
 						return err
 					}

@@ -14,7 +14,10 @@ func newStatusCmd(gf *globalFlags) *cobra.Command {
 		Use:   "status [TYPE...]",
 		Short: "Compare local manifests against S3",
 		Long: `status checks each manifest entry against S3 and reports what is present,
-missing, or uploaded. If no types are given, all four are checked.`,
+missing, or uploaded. If no types are given, all four are checked.
+
+status is S3-only: it walks the bucket with a direct S3 client. Installs on the
+local backend have no equivalent yet.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			types, err := resolveTypes(args)
 			if err != nil {
@@ -24,6 +27,12 @@ missing, or uploaded. If no types are given, all four are checked.`,
 			cfg, err := loadConfig(gf)
 			if err != nil {
 				return err
+			}
+			// CheckStatus wants a concrete *s3.Client, so there is nothing to
+			// run against a filesystem backend. Refusing by name beats the old
+			// behavior of demanding a bucket the config never asked for.
+			if backend := storageBackendName(cfg); backend != "s3" {
+				return fmt.Errorf("status is S3-only and the configured storage backend is %q", backend)
 			}
 			if err := requireBucket(cfg); err != nil {
 				return err

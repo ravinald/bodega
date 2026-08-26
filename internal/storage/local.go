@@ -42,6 +42,12 @@ func NewLocal(root string) *Local {
 }
 
 func (l *Local) path(key string) (string, error) {
+	// A NUL truncates the path at the syscall boundary, so "a\x00/../../etc"
+	// reaches the kernel as "a" — the traversal check below would pass on a
+	// string the filesystem never sees. Reject it before Join normalizes it.
+	if strings.ContainsRune(key, 0) {
+		return "", fmt.Errorf("key %q contains a NUL byte", key)
+	}
 	p := filepath.Join(l.root, filepath.FromSlash(key))
 	// Prevent path traversal out of the storage root.
 	if !strings.HasPrefix(p, l.root+string(filepath.Separator)) && p != l.root {
