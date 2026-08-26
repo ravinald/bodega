@@ -58,12 +58,6 @@ type Config struct {
 	// Fetch* function validates candidate URLs/packages before network I/O.
 	// When nil, the allow-list is not enforced.
 	Policy *policy.Checker
-	// GpgEmail is the email for the GPG signing key used by the apt repo.
-	// Defaults to "bodega@localhost" when empty.
-	GpgEmail string
-	// GpgName is the real name for the GPG signing key.
-	// Defaults to "Bodega Package Signing" when empty.
-	GpgName string
 }
 
 // checkPolicy runs the upstream allow-list for (regType, candidate). Returns

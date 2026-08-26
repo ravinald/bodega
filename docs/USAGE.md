@@ -375,15 +375,21 @@ A default config is created on first run. All fields are optional.
   "tls_key": "",
   "tls_autocert": false,
   "tls_domain": "",
+  "listen_addr": ":8080",
   "proxy_cache_enabled": false,
   "metadata_ttl": "1h",
   "gomod_upstream": "https://proxy.golang.org",
   "npm_upstream": "https://registry.npmjs.org",
+  "apt_codename": "noble",
   "audit_db": "",
+  "timezone": "",
+  "audit_events": [],
   "deny_list": [],
   "admin_permit_cidr": ["127.0.0.0/8", "::1/128"]
 }
 ```
+
+`timezone` sets the display timezone for audit queries (default UTC) and `audit_events` limits which event types are recorded (empty records all).
 
 Config files are written with mode `0600` (owner read/write only).
 

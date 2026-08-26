@@ -29,7 +29,10 @@ const (
 	SystemConfigFile = "/etc/bodega/config.json"
 )
 
-// Config holds resolved runtime configuration.
+// Config holds resolved runtime configuration and is the on-disk shape of
+// config.json. There is deliberately no second struct for the file: a field
+// added here is read, resolved and written back with no other edit, and the
+// two runtime-only fields opt out with `json:"-"`.
 type Config struct {
 	Bucket            string   `json:"bucket"`
 	Region            string   `json:"region"`
@@ -37,7 +40,7 @@ type Config struct {
 	ManifestDir       string   `json:"manifest_dir"`
 	LogDir            string   `json:"log_dir"`
 	LogWindowHeight   int      `json:"logwindow_height"`
-	LogLevel          int      `json:"log_level"`
+	LogLevel          int      `json:"log_level"` // --log-level and $BODEGA_LOG_LEVEL are resolved by the caller, not by Load
 	CustomPaths       bool     `json:"custom_paths"`
 	AptRoot           string   `json:"apt_root,omitempty"`
 	GitRoot           string   `json:"git_root,omitempty"`
@@ -47,7 +50,7 @@ type Config struct {
 	TLSKey            string   `json:"tls_key,omitempty"`
 	TLSAutocert       bool     `json:"tls_autocert,omitempty"`
 	TLSDomain         string   `json:"tls_domain,omitempty"`
-	ListenAddr        string   `json:"listen_addr,omitempty"`
+	ListenAddr        string   `json:"listen_addr,omitempty"` // see ResolveListenAddr for the full precedence chain
 	ProxyCacheEnabled bool     `json:"proxy_cache_enabled"`
 	MetadataTTL       string   `json:"metadata_ttl,omitempty"`
 	GomodUpstream     string   `json:"gomod_upstream,omitempty"`
@@ -64,8 +67,6 @@ type Config struct {
 	AuditEvents       []string `json:"audit_events,omitempty"`      // event types to record; empty = all
 	StorageBackend    string   `json:"storage_backend,omitempty"`   // "local" (default), "s3"
 	StoragePath       string   `json:"storage_path,omitempty"`      // root directory for local backend
-	GpgEmail          string   `json:"gpg_email,omitempty"`         // GPG signing email for apt repo (default "bodega@localhost")
-	GpgName           string   `json:"gpg_name,omitempty"`          // GPG signing name (default "Bodega Package Signing")
 	AptCodename       string   `json:"apt_codename,omitempty"`      // codename for generated apt repo (default "noble")
 	AdminPermitCIDR   []string `json:"admin_permit_cidr,omitempty"` // CIDRs allowed to hit mutation API; default ["127.0.0.0/8","::1/128"]
 	LocalConfig       bool     `json:"-"`
@@ -114,127 +115,58 @@ func (c *Config) RootForType(typ string) string {
 	return c.BuildRoot
 }
 
-// fileConfig is the on-disk shape of config.json.
-type fileConfig struct {
-	Bucket            string   `json:"bucket"`
-	Region            string   `json:"region"`
-	BuildRoot         string   `json:"build_root"`
-	ManifestDir       string   `json:"manifest_dir"`
-	LogDir            string   `json:"log_dir"`
-	LogWindowHeight   int      `json:"logwindow_height"`
-	LogLevel          int      `json:"log_level"`
-	CustomPaths       bool     `json:"custom_paths"`
-	AptRoot           string   `json:"apt_root,omitempty"`
-	GitRoot           string   `json:"git_root,omitempty"`
-	PypiRoot          string   `json:"pypi_root,omitempty"`
-	BinaryRoot        string   `json:"binary_root,omitempty"`
-	TLSCert           string   `json:"tls_cert,omitempty"`
-	TLSKey            string   `json:"tls_key,omitempty"`
-	TLSAutocert       bool     `json:"tls_autocert,omitempty"`
-	TLSDomain         string   `json:"tls_domain,omitempty"`
-	ListenAddr        string   `json:"listen_addr,omitempty"`
-	ProxyCacheEnabled bool     `json:"proxy_cache_enabled"`
-	MetadataTTL       string   `json:"metadata_ttl,omitempty"`
-	GomodUpstream     string   `json:"gomod_upstream,omitempty"`
-	NpmUpstream       string   `json:"npm_upstream,omitempty"`
-	CargoUpstream     string   `json:"cargo_upstream,omitempty"`
-	DiscoverMode      string   `json:"discover_mode,omitempty"`
-	GomodRoot         string   `json:"gomod_root,omitempty"`
-	HelmRoot          string   `json:"helm_root,omitempty"`
-	NpmRoot           string   `json:"npm_root,omitempty"`
-	CargoRoot         string   `json:"cargo_root,omitempty"`
-	AuditDB           string   `json:"audit_db,omitempty"`
-	DenyList          []string `json:"deny_list,omitempty"`
-	StorageBackend    string   `json:"storage_backend,omitempty"`
-	StoragePath       string   `json:"storage_path,omitempty"`
-	AptCodename       string   `json:"apt_codename,omitempty"`
-	AdminPermitCIDR   []string `json:"admin_permit_cidr,omitempty"`
-
+// legacyConfig holds config.json keys under names that predate the current
+// ones. It is unmarshalled from the same bytes as Config so an alias can be
+// read without ever appearing in what Save writes back.
+type legacyConfig struct {
 	// Legacy field — read but not written.
 	ShellHeight int `json:"shell_height,omitempty"`
 }
 
 // Load builds a Config by merging sources in priority order.
 func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig, verbose bool) (*Config, error) {
-	fc := loadFileConfig()
+	cfg, legacy := loadFileConfig()
+	cfg.LocalConfig = localConfig
+	cfg.Verbose = verbose
 
-	cfg := &Config{
-		LocalConfig: localConfig,
-		Verbose:     verbose,
-	}
-
-	cfg.Bucket = firstNonEmpty(flagBucket, os.Getenv(EnvBucket), fc.Bucket)
-	cfg.Region = firstNonEmpty(flagRegion, os.Getenv(EnvRegion), fc.Region, DefaultRegion)
-	cfg.BuildRoot = firstNonEmpty(flagBuildRoot, os.Getenv(EnvBuildRoot), fc.BuildRoot, DefaultBuildRoot)
-	cfg.ManifestDir = firstNonEmpty(manifestDir, fc.ManifestDir, "manifests")
-	cfg.LogDir = firstNonEmpty(fc.LogDir, DefaultLogDir)
+	cfg.Bucket = firstNonEmpty(flagBucket, os.Getenv(EnvBucket), cfg.Bucket)
+	cfg.Region = firstNonEmpty(flagRegion, os.Getenv(EnvRegion), cfg.Region, DefaultRegion)
+	cfg.BuildRoot = firstNonEmpty(flagBuildRoot, os.Getenv(EnvBuildRoot), cfg.BuildRoot, DefaultBuildRoot)
+	cfg.ManifestDir = firstNonEmpty(manifestDir, cfg.ManifestDir, "manifests")
+	cfg.LogDir = firstNonEmpty(cfg.LogDir, DefaultLogDir)
 
 	// Log window height: new field, fall back to legacy shell_height.
-	cfg.LogWindowHeight = fc.LogWindowHeight
 	if cfg.LogWindowHeight <= 0 {
-		cfg.LogWindowHeight = fc.ShellHeight
+		cfg.LogWindowHeight = legacy.ShellHeight
 	}
 	if cfg.LogWindowHeight <= 0 {
 		cfg.LogWindowHeight = DefaultLogWindowHeight
 	}
 
-	// Log level: file config only (flags and env resolved by caller).
-	cfg.LogLevel = fc.LogLevel
-
-	// Per-type build roots.
-	cfg.CustomPaths = fc.CustomPaths
-	cfg.AptRoot = fc.AptRoot
-	cfg.GitRoot = fc.GitRoot
-	cfg.PypiRoot = fc.PypiRoot
-	cfg.BinaryRoot = fc.BinaryRoot
-
-	// TLS.
-	cfg.TLSCert = fc.TLSCert
-	cfg.TLSKey = fc.TLSKey
-	cfg.TLSAutocert = fc.TLSAutocert
-	cfg.TLSDomain = fc.TLSDomain
-
-	// HTTP listen address: file config here; the serve command layers on
-	// flag → env before reading this value. See cmd_serve.go's ResolveAddr.
-	cfg.ListenAddr = fc.ListenAddr
-
 	// Proxy/cache.
-	cfg.ProxyCacheEnabled = fc.ProxyCacheEnabled
-	cfg.MetadataTTL = firstNonEmpty(fc.MetadataTTL, "1h")
-	cfg.GomodUpstream = firstNonEmpty(fc.GomodUpstream, "https://proxy.golang.org")
-	cfg.NpmUpstream = firstNonEmpty(fc.NpmUpstream, "https://registry.npmjs.org")
-	cfg.CargoUpstream = firstNonEmpty(fc.CargoUpstream, "https://index.crates.io")
+	cfg.MetadataTTL = firstNonEmpty(cfg.MetadataTTL, "1h")
+	cfg.GomodUpstream = firstNonEmpty(cfg.GomodUpstream, "https://proxy.golang.org")
+	cfg.NpmUpstream = firstNonEmpty(cfg.NpmUpstream, "https://registry.npmjs.org")
+	cfg.CargoUpstream = firstNonEmpty(cfg.CargoUpstream, "https://index.crates.io")
 
 	// Discover mode: "", "observe", or "learn" — typo'd values fail loudly so
 	// operators don't silently lose observability.
-	cfg.DiscoverMode = fc.DiscoverMode
 	switch cfg.DiscoverMode {
 	case "", "observe", "learn":
 	default:
 		return nil, fmt.Errorf("invalid discover_mode %q (want \"\", \"observe\", or \"learn\")", cfg.DiscoverMode)
 	}
 
-	// Extra type roots.
-	cfg.GomodRoot = fc.GomodRoot
-	cfg.HelmRoot = fc.HelmRoot
-	cfg.NpmRoot = fc.NpmRoot
-	cfg.CargoRoot = fc.CargoRoot
-
 	// Audit.
-	cfg.AuditDB = firstNonEmpty(fc.AuditDB, filepath.Join(cfg.LogDir, "audit.db"))
-
-	// Deny list.
-	cfg.DenyList = fc.DenyList
+	cfg.AuditDB = firstNonEmpty(cfg.AuditDB, filepath.Join(cfg.LogDir, "audit.db"))
 
 	// Storage backend.
-	cfg.StorageBackend = firstNonEmpty(fc.StorageBackend, "local")
-	cfg.StoragePath = fc.StoragePath
+	cfg.StorageBackend = firstNonEmpty(cfg.StorageBackend, "local")
 
 	// APT codename.
-	cfg.AptCodename = firstNonEmpty(fc.AptCodename, "noble")
+	cfg.AptCodename = firstNonEmpty(cfg.AptCodename, "noble")
 
 	// Mutation allow-list: default to localhost only.
-	cfg.AdminPermitCIDR = fc.AdminPermitCIDR
 	if len(cfg.AdminPermitCIDR) == 0 {
 		cfg.AdminPermitCIDR = []string{"127.0.0.0/8", "::1/128"}
 	}
@@ -243,44 +175,12 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 }
 
 // Save writes the current config to the first writable config path.
+//
+// It marshals the Config itself, so every JSON-tagged field survives a
+// load/save cycle. LocalConfig and Verbose stay out of the file via
+// `json:"-"`, and omitempty keeps unset optional keys absent.
 func (c *Config) Save() error {
-	fc := fileConfig{
-		Bucket:            c.Bucket,
-		Region:            c.Region,
-		BuildRoot:         c.BuildRoot,
-		ManifestDir:       c.ManifestDir,
-		LogDir:            c.LogDir,
-		LogWindowHeight:   c.LogWindowHeight,
-		LogLevel:          c.LogLevel,
-		CustomPaths:       c.CustomPaths,
-		AptRoot:           c.AptRoot,
-		GitRoot:           c.GitRoot,
-		PypiRoot:          c.PypiRoot,
-		BinaryRoot:        c.BinaryRoot,
-		TLSCert:           c.TLSCert,
-		TLSKey:            c.TLSKey,
-		TLSAutocert:       c.TLSAutocert,
-		TLSDomain:         c.TLSDomain,
-		ListenAddr:        c.ListenAddr,
-		ProxyCacheEnabled: c.ProxyCacheEnabled,
-		MetadataTTL:       c.MetadataTTL,
-		GomodUpstream:     c.GomodUpstream,
-		NpmUpstream:       c.NpmUpstream,
-		CargoUpstream:     c.CargoUpstream,
-		DiscoverMode:      c.DiscoverMode,
-		GomodRoot:         c.GomodRoot,
-		HelmRoot:          c.HelmRoot,
-		NpmRoot:           c.NpmRoot,
-		CargoRoot:         c.CargoRoot,
-		AuditDB:           c.AuditDB,
-		DenyList:          c.DenyList,
-		StorageBackend:    c.StorageBackend,
-		StoragePath:       c.StoragePath,
-		AptCodename:       c.AptCodename,
-		AdminPermitCIDR:   c.AdminPermitCIDR,
-	}
-
-	data, err := json.MarshalIndent(fc, "", "  ")
+	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
@@ -356,6 +256,10 @@ func defaultConfigContent() []byte {
   "_comment": "bodega configuration — all fields are optional, shown here with defaults",
   "_comment_priority": "flags > env vars > this file > built-in defaults",
 
+  "_comment_storage": "storage_backend: \"local\" (default) stores artifacts under storage_path; \"s3\" stores them in bucket + region",
+  "storage_backend": "local",
+  "storage_path": "/var/lib/bodega",
+
   "bucket": "",
   "region": "us-west-2",
   "build_root": "/opt/bodega",
@@ -375,6 +279,9 @@ func defaultConfigContent() []byte {
   "tls_autocert": false,
   "tls_domain": "",
 
+  "_comment_listen": "listen_addr: address bodega serve binds; --listen and $BODEGA_LISTEN_ADDR override it",
+  "listen_addr": ":8080",
+
   "_comment_proxy": "Proxy/cache: when enabled, the server fetches from upstream on cache miss",
   "proxy_cache_enabled": false,
   "metadata_ttl": "1h",
@@ -390,10 +297,19 @@ func defaultConfigContent() []byte {
   "npm_root": "",
   "cargo_root": "",
 
+  "_comment_apt": "apt_codename: suite name of the generated apt repository",
+  "apt_codename": "noble",
+
+  "_comment_audit": "audit_db defaults to {log_dir}/audit.db. timezone is the display timezone for audit queries (default UTC); audit_events limits which event types are recorded, empty records all.",
   "audit_db": "",
+  "timezone": "",
+  "audit_events": [],
 
   "_comment_deny": "deny_list: CIDR entries (e.g. 10.0.0.5, 192.168.1.0/24, fd00::/8) — bare IPs imply /32 or /128",
-  "deny_list": []
+  "deny_list": [],
+
+  "_comment_admin": "admin_permit_cidr: CIDRs allowed to reach the mutation API; any entry beyond localhost also requires a bearer token",
+  "admin_permit_cidr": ["127.0.0.0/8", "::1/128"]
 }
 `
 	return []byte(content)
@@ -448,19 +364,24 @@ func configSearchPaths() []string {
 	return paths
 }
 
-func loadFileConfig() fileConfig {
+// loadFileConfig reads the first readable config file into a Config, plus the
+// legacy aliases parsed from the same bytes. A missing or unparsable file
+// yields zero values for Load's precedence chain to fill.
+func loadFileConfig() (*Config, legacyConfig) {
 	for _, path := range configSearchPaths() {
 		data, err := os.ReadFile(path)
 		if err != nil {
 			continue
 		}
-		var fc fileConfig
-		if err := json.Unmarshal(data, &fc); err != nil {
+		var cfg Config
+		if err := json.Unmarshal(data, &cfg); err != nil {
 			continue
 		}
-		return fc
+		var legacy legacyConfig
+		_ = json.Unmarshal(data, &legacy)
+		return &cfg, legacy
 	}
-	return fileConfig{}
+	return &Config{}, legacyConfig{}
 }
 
 func firstNonEmpty(vals ...string) string {
