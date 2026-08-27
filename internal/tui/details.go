@@ -247,21 +247,19 @@ func s3StatusField(inS3 bool) string {
 	return k + " " + v
 }
 
-// s3Path renders the expected S3 key for a tree node. version selects a
-// specific VersionEntry; empty version falls back to the first (package-
-// header behavior). Ecosystems with a package-level key (apt, pypi)
-// ignore version entirely.
+// s3Path renders the object key backing a tree node, derived the same way the
+// uploader and the server derive it. version selects a specific VersionEntry;
+// empty version falls back to the first, which is the package-header behavior.
+//
+// A key shown here that nothing writes is the same defect as a key probed that
+// nothing writes, so this resolves through manifest.ArtifactKeys rather than
+// spelling the layouts out again.
 func s3Path(cfg *config.Config, store *manifest.Store, entryType, name, version string) string {
+	_ = cfg
 	ctx := context.Background()
 	pm, err := store.GetPackage(ctx, entryType, name)
 	if err != nil || pm == nil || len(pm.Versions) == 0 {
-		switch entryType {
-		case manifest.TypeApt:
-			return "packages/apt/"
-		case manifest.TypePypi:
-			return "pypi/wheels/"
-		}
-		return ""
+		return typeTreePrefix(entryType)
 	}
 	ve := pm.Versions[0]
 	if version != "" {
@@ -272,40 +270,22 @@ func s3Path(cfg *config.Config, store *manifest.Store, entryType, name, version 
 			}
 		}
 	}
+	keys, err := manifest.ArtifactKeys(pm, ve)
+	if err != nil || len(keys) == 0 {
+		return typeTreePrefix(entryType)
+	}
+	return keys[0]
+}
+
+// typeTreePrefix names the tree an entry lives under when no single object
+// backs it: pypi uploads as a directory, and an apt entry that predates the
+// _pool_path metadata key needs a pool listing the details pane will not do.
+func typeTreePrefix(entryType string) string {
 	switch entryType {
-	case manifest.TypeGit:
-		ext := ".bundle"
-		if ve.IsRelease() {
-			ext = ".tar.gz"
-		}
-		sn := strings.ReplaceAll(pm.Name, "/", "--")
-		return fmt.Sprintf("repos/%s/%s-%s%s", sn, sn, ve.Ref, ext)
-	case manifest.TypeBinary:
-		fn := ve.Filename
-		if fn == "" && ve.URL != "" {
-			parts := strings.Split(ve.URL, "/")
-			fn = parts[len(parts)-1]
-		}
-		if ve.Version != "" {
-			return fmt.Sprintf("binaries/%s/%s/%s", pm.Name, ve.Version, fn)
-		}
-		return fmt.Sprintf("binaries/%s/%s", pm.Name, fn)
 	case manifest.TypeApt:
-		return "packages/apt/"
+		return manifest.AptPrefix
 	case manifest.TypePypi:
-		return "pypi/wheels/"
-	case manifest.TypeGomod:
-		// Uploader writes module paths with '/' → '--' so the key doesn't
-		// create accidental S3 subdirectories. Match it.
-		sn := strings.ReplaceAll(pm.Name, "/", "--")
-		return fmt.Sprintf("gomod/%s/@v/%s.zip", sn, ve.Version)
-	case manifest.TypeHelm:
-		return fmt.Sprintf("charts/%s-%s.tgz", pm.Name, ve.Version)
-	case manifest.TypeNpm:
-		// npm scoped packages are uploaded safe-encoded in both the path
-		// segment AND the filename (see npmStorageKeyForTarball).
-		sn := strings.ReplaceAll(pm.Name, "/", "--")
-		return fmt.Sprintf("npm/%s/%s-%s.tgz", sn, sn, ve.Version)
+		return manifest.PypiWheelPrefix
 	}
 	return ""
 }

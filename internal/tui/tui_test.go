@@ -556,9 +556,9 @@ func TestDetailsRawJSONScoping(t *testing.T) {
 	}
 }
 
-// Guards that the displayed S3 path matches where the uploader actually
-// writes: safe-encoded (/ → --) for scoped npm, gomod module paths with
-// slashes, and already-verified git.
+// Guards that the displayed object key matches where the uploader actually
+// writes: safe-encoded (/ → --) for scoped npm and git, and the module path
+// with its slashes intact for gomod, which is the form a Go client requests.
 func TestS3PathSafeEncoding(t *testing.T) {
 	store := manifest.NewLocalStore(t.TempDir())
 	ctx := t.Context()
@@ -571,7 +571,7 @@ func TestS3PathSafeEncoding(t *testing.T) {
 		label, typ, name, want string
 	}{
 		{"npm scoped", manifest.TypeNpm, "@bitwarden/cli", "npm/@bitwarden--cli/@bitwarden--cli-2026.3.0.tgz"},
-		{"gomod with slashes", manifest.TypeGomod, "github.com/aws/aws-sdk-go", "gomod/github.com--aws--aws-sdk-go/@v/v1.2.3.zip"},
+		{"gomod keeps its slashes", manifest.TypeGomod, "github.com/aws/aws-sdk-go", "gomod/github.com/aws/aws-sdk-go/@v/v1.2.3.zip"},
 	}
 	for _, c := range cases {
 		got := s3Path(cfg, store, c.typ, c.name, "")

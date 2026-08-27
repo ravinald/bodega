@@ -280,92 +280,101 @@ func (m *mover) moveVersion(ctx context.Context, pm *manifest.PackageManifest, i
 	return nil
 }
 
-// copyObject streams one object through a temp file and uploads it, returning
-// the spooled size.
+func (m *mover) copyObject(ctx context.Context, src storage.ObjectStore, key string) (int64, error) {
+	return copyObject(ctx, src, m.dst, key, key, m.spool)
+}
+
+func (m *mover) verify(ctx context.Context, key string, spooled int64, ve manifest.VersionEntry, primary bool) error {
+	return verifyCopy(ctx, m.dst, m.dstName, key, spooled, ve, primary)
+}
+
+// copyObject streams one object from src to dst through a temp file and
+// returns the spooled size. srcKey and dstKey differ when the copy repairs a
+// key rather than moving a backend.
 //
 // The spool lives under build_root rather than $TMPDIR because build_root is
 // the volume sized for artifacts; a multi-gigabyte bundle through a tmpfs /tmp
 // fills RAM instead. ObjectStore has no streaming Put — only Put([]byte) and
 // PutFile — and adding a tenth interface method would mean touching both
 // implementations and every mock, so the file on disk is what bridges them.
-func (m *mover) copyObject(ctx context.Context, src storage.ObjectStore, key string) (int64, error) {
-	if err := os.MkdirAll(m.spool, 0o755); err != nil {
-		return 0, fmt.Errorf("create spool dir %s: %w", m.spool, err)
+func copyObject(ctx context.Context, src, dst storage.ObjectStore, srcKey, dstKey, spool string) (int64, error) {
+	if err := os.MkdirAll(spool, 0o755); err != nil {
+		return 0, fmt.Errorf("create spool dir %s: %w", spool, err)
 	}
-	f, err := os.CreateTemp(m.spool, "move-*.part")
+	f, err := os.CreateTemp(spool, "move-*.part")
 	if err != nil {
 		return 0, fmt.Errorf("create spool file: %w", err)
 	}
 	spoolPath := f.Name()
 	defer func() { _ = os.Remove(spoolPath) }()
 
-	stream, err := src.GetStream(ctx, key)
+	stream, err := src.GetStream(ctx, srcKey)
 	if err != nil {
 		_ = f.Close()
-		return 0, fmt.Errorf("read %s from source: %w", key, err)
+		return 0, fmt.Errorf("read %s from source: %w", srcKey, err)
 	}
 	if stream == nil {
 		_ = f.Close()
-		return 0, fmt.Errorf("read %s from source: object vanished between head and get", key)
+		return 0, fmt.Errorf("read %s from source: object vanished between head and get", srcKey)
 	}
 	size, copyErr := io.Copy(f, stream.Body)
 	_ = stream.Body.Close()
 	closeErr := f.Close()
 	if copyErr != nil {
-		return 0, fmt.Errorf("spool %s: %w", key, copyErr)
+		return 0, fmt.Errorf("spool %s: %w", srcKey, copyErr)
 	}
 	if closeErr != nil {
-		return 0, fmt.Errorf("close spool for %s: %w", key, closeErr)
+		return 0, fmt.Errorf("close spool for %s: %w", srcKey, closeErr)
 	}
 
-	if err := m.dst.PutFile(ctx, spoolPath, key); err != nil {
-		return 0, fmt.Errorf("write %s to %q: %w", key, m.dstName, err)
+	if err := dst.PutFile(ctx, spoolPath, dstKey); err != nil {
+		return 0, fmt.Errorf("write %s to %q: %w", dstKey, dst.Label(), err)
 	}
 	return size, nil
 }
 
-// verify re-reads the object at the destination. Checking the spooled bytes
-// would only prove the download worked; the question is whether the write
-// landed, so the destination is what gets asked.
-func (m *mover) verify(ctx context.Context, key string, spooled int64, ve manifest.VersionEntry, primary bool) error {
-	info, err := m.dst.Head(ctx, key)
+// verifyCopy re-reads the object at the destination. Checking the spooled
+// bytes would only prove the download worked; the question is whether the
+// write landed, so the destination is what gets asked.
+func verifyCopy(ctx context.Context, dst storage.ObjectStore, dstName, key string, spooled int64, ve manifest.VersionEntry, primary bool) error {
+	info, err := dst.Head(ctx, key)
 	if err != nil {
-		return fmt.Errorf("verify %s on %q: %w", key, m.dstName, err)
+		return fmt.Errorf("verify %s on %q: %w", key, dstName, err)
 	}
 	if !info.Exists {
-		return fmt.Errorf("verify %s on %q: not there after the write reported success", key, m.dstName)
+		return fmt.Errorf("verify %s on %q: not there after the write reported success", key, dstName)
 	}
 	if info.Size != spooled {
-		return fmt.Errorf("verify %s on %q: %d bytes at the destination, %d copied", key, m.dstName, info.Size, spooled)
+		return fmt.Errorf("verify %s on %q: %d bytes at the destination, %d copied", key, dstName, info.Size, spooled)
 	}
 	if !primary {
 		return nil
 	}
 	if ve.ArtifactSize > 0 && info.Size != ve.ArtifactSize {
 		return fmt.Errorf("verify %s on %q: %d bytes at the destination, manifest records %d",
-			key, m.dstName, info.Size, ve.ArtifactSize)
+			key, dstName, info.Size, ve.ArtifactSize)
 	}
 	if ve.Checksum == nil || ve.Checksum.Value == "" {
 		return nil
 	}
-	got, err := m.digest(ctx, key, ve.Checksum.Algorithm)
+	got, err := digestObject(ctx, dst, key, ve.Checksum.Algorithm)
 	if err != nil {
-		return fmt.Errorf("verify %s on %q: %w", key, m.dstName, err)
+		return fmt.Errorf("verify %s on %q: %w", key, dstName, err)
 	}
 	if !strings.EqualFold(got, ve.Checksum.Value) {
 		return fmt.Errorf("verify %s on %q: %s is %s, manifest records %s",
-			key, m.dstName, ve.Checksum.Algorithm, got, ve.Checksum.Value)
+			key, dstName, ve.Checksum.Algorithm, got, ve.Checksum.Value)
 	}
 	return nil
 }
 
-// digest streams the object back out of the destination and hashes it.
-func (m *mover) digest(ctx context.Context, key, algorithm string) (string, error) {
+// digestObject streams the object back out of store and hashes it.
+func digestObject(ctx context.Context, store storage.ObjectStore, key, algorithm string) (string, error) {
 	h, err := hasherFor(algorithm)
 	if err != nil {
 		return "", err
 	}
-	stream, err := m.dst.GetStream(ctx, key)
+	stream, err := store.GetStream(ctx, key)
 	if err != nil {
 		return "", err
 	}

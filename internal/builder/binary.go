@@ -35,17 +35,6 @@ func binaryDestPath(d dirs, name string, ve manifest.VersionEntry) string {
 	return filepath.Join(d.binaries, name, filename)
 }
 
-// binaryS3Key returns the S3 object key for a binary version entry.
-// When the entry has a Version, the key is binaries/<name>/<version>/<filename>.
-// Falls back to binaries/<name>/<filename> for unversioned entries.
-func binaryS3Key(name string, ve manifest.VersionEntry) string {
-	filename := binaryFilename(ve)
-	if ve.Version != "" {
-		return "binaries/" + name + "/" + ve.Version + "/" + filename
-	}
-	return "binaries/" + name + "/" + filename
-}
-
 // CheckBinaryStage inspects the filesystem to determine which pipeline stages
 // have completed for the given binary package version. For binary entries the
 // download IS the final artifact; Fetched, Built, and Packaged are all set together.
@@ -226,7 +215,7 @@ func BinaryArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string)
 			}
 			paths = append(paths, ArtifactPath{
 				Local:   local,
-				S3Key:   binaryS3Key(name, ve),
+				S3Key:   manifest.BinaryKey(pm.Name, ve.Version, binaryFilename(ve)),
 				Package: name,
 				Version: ve.Version,
 			})

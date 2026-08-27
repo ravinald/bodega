@@ -21,11 +21,6 @@ func helmLocalPath(d dirs, name string, ve manifest.VersionEntry) string {
 	return filepath.Join(d.charts, name, ve.Version, helmChartFilename(name, ve))
 }
 
-// helmS3Key returns the S3 key for a chart archive.
-func helmS3Key(name string, ve manifest.VersionEntry) string {
-	return "charts/" + helmChartFilename(name, ve)
-}
-
 // CheckHelmStage inspects the local filesystem for a fetched Helm chart.
 func CheckHelmStage(cfg *Config, name string, ve manifest.VersionEntry) StageStatus {
 	d := buildDirs(cfg.rootFor(manifest.TypeHelm))
@@ -223,7 +218,7 @@ func HelmArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) [
 			if fileExists(local) {
 				paths = append(paths, ArtifactPath{
 					Local:   local,
-					S3Key:   helmS3Key(name, ve),
+					S3Key:   manifest.HelmChartKey(pm.Name, ve.Version),
 					Package: name,
 					Version: ve.Version,
 				})
@@ -236,7 +231,7 @@ func HelmArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) [
 	if fileExists(indexPath) {
 		paths = append(paths, ArtifactPath{
 			Local: indexPath,
-			S3Key: "charts/index.yaml",
+			S3Key: manifest.HelmIndexKey,
 		})
 	}
 

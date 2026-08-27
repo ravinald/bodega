@@ -104,24 +104,6 @@ func TestBinaryDestPath_FilenameOverride(t *testing.T) {
 	}
 }
 
-func TestBinaryS3Key_NoVersion(t *testing.T) {
-	ve := manifest.VersionEntry{URL: "https://example.com/tool.tar.gz"}
-	got := binaryS3Key("tool", ve)
-	want := "binaries/tool/tool.tar.gz"
-	if got != want {
-		t.Errorf("binaryS3Key (no version) = %q, want %q", got, want)
-	}
-}
-
-func TestBinaryS3Key_WithVersion(t *testing.T) {
-	ve := manifest.VersionEntry{Version: "v1.2", URL: "https://example.com/tool.tar.gz"}
-	got := binaryS3Key("tool", ve)
-	want := "binaries/tool/v1.2/tool.tar.gz"
-	if got != want {
-		t.Errorf("binaryS3Key (versioned) = %q, want %q", got, want)
-	}
-}
-
 func TestCheckGitStage_Empty(t *testing.T) {
 	root := t.TempDir()
 	cfg := &Config{BuildRoot: root}
@@ -276,14 +258,6 @@ func TestPypiWheelsDir(t *testing.T) {
 	got := pypiWheelsDir(d)
 	if got != d.wheels {
 		t.Errorf("pypiWheelsDir = %q, want %q", got, d.wheels)
-	}
-}
-
-func TestPypiS3Prefix(t *testing.T) {
-	got := pypiS3Prefix()
-	want := "pypi/wheels/"
-	if got != want {
-		t.Errorf("pypiS3Prefix = %q, want %q", got, want)
 	}
 }
 

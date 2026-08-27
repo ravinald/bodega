@@ -40,11 +40,6 @@ func pypiWheelsDir(d dirs) string {
 	return d.wheels
 }
 
-// pypiS3Prefix returns the S3 key prefix for pypi wheels.
-func pypiS3Prefix() string {
-	return "pypi/wheels/"
-}
-
 // CheckPypiStage inspects the filesystem to determine which pipeline stages
 // have completed for the pypi packages.
 func CheckPypiStage(cfg *Config, store *manifest.Store) StageStatus {
@@ -79,7 +74,7 @@ func CheckPypiStage(cfg *Config, store *manifest.Store) StageStatus {
 // pypi packages. Used by the upload and sync commands.
 func PypiArtifactDir(cfg *Config, store *manifest.Store) (localDir, s3Prefix string) {
 	d := buildDirs(cfg.rootFor(manifest.TypePypi))
-	return pypiWheelsDir(d), pypiS3Prefix()
+	return pypiWheelsDir(d), manifest.PypiWheelPrefix
 }
 
 // FetchPypi resolves requirements from previously-cloned git repos and from

@@ -13,17 +13,13 @@ import (
 
 // ---- PyPI ------------------------------------------------------------------
 
-// pypiWheelPrefix is where uploads write wheels; the PEP 503 indexes are
-// generated from a listing of it rather than from the manifest.
-const pypiWheelPrefix = "pypi/wheels/"
-
 // handlePypiIndex generates a PEP 503 root index listing all packages found
 // under the pypi/wheels/ S3 prefix.
 func (s *Server) handlePypiIndex(w http.ResponseWriter, r *http.Request) {
 	if !s.requireStorage(w, s.typeStore(manifest.TypePypi)) {
 		return
 	}
-	keys, err := s.listFanout(r.Context(), manifest.TypePypi, pypiWheelPrefix)
+	keys, err := s.listFanout(r.Context(), manifest.TypePypi, manifest.PypiWheelPrefix)
 	if err != nil {
 		s.logger.Error("list wheels failed", "error", err)
 		http.Error(w, "upstream error", http.StatusBadGateway)
@@ -62,7 +58,7 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 	}
 	normalized := normalizePkgName(pkgName)
 
-	keys, err := s.listFanout(r.Context(), manifest.TypePypi, pypiWheelPrefix)
+	keys, err := s.listFanout(r.Context(), manifest.TypePypi, manifest.PypiWheelPrefix)
 	if err != nil {
 		s.logger.Error("list wheels failed", "error", err)
 		http.Error(w, "upstream error", http.StatusBadGateway)
@@ -85,7 +81,7 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 		if normalizePkgName(dist) != normalized {
 			continue
 		}
-		relPath := strings.TrimPrefix(key, pypiWheelPrefix)
+		relPath := strings.TrimPrefix(key, manifest.PypiWheelPrefix)
 		wheels = append(wheels, wheelEntry{relPath: relPath, filename: filename})
 	}
 
@@ -121,7 +117,7 @@ func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
 	}
-	key := pypiWheelPrefix + p
+	key := manifest.PypiWheelPrefix + p
 	file := path.Base(p)
 	setCacheImmutable(w, file)
 

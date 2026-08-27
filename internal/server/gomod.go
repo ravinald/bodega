@@ -21,7 +21,7 @@ func (s *Server) handleGomod(w http.ResponseWriter, r *http.Request) {
 	module := fullPath[:idx]
 	file := fullPath[idx+4:] // "list", "v1.30.0.info", etc.
 
-	s3Key := "gomod/" + module + "/@v/" + file
+	s3Key := manifest.GomodFileKey(module, file)
 	upstream := s.cfg.GomodUpstream + "/" + module + "/@v/" + file
 	immutable := file != "list" && !strings.HasSuffix(file, "latest")
 

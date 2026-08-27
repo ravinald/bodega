@@ -100,7 +100,7 @@ bodega pkg refresh pypi django         # refresh only django
 bodega pkg refresh --force             # re-discover even if versions exist
 ```
 
-### `bodega pkg repair [check]`
+### `bodega repair [check]`
 
 Detects and fixes inconsistencies in the manifest store:
 
@@ -111,8 +111,22 @@ Detects and fixes inconsistencies in the manifest store:
 5. **Graph rebuild**: dependency edges are rebuilt from RequiredBy fields
 
 ```bash
-bodega pkg repair                      # detect and fix
-bodega pkg repair check                # detect only, no changes
+bodega repair                          # detect and fix
+bodega repair check                    # detect only, no changes
+```
+
+### `bodega repair keys [--dry-run] [--delete-source] [--type TYPE]`
+
+Moves artifacts sitting at an object key no current code path reads to the key the uploader and the server now agree on. Each object is copied, verified at its destination, and only then is the source considered — the ordering `bodega pkg move` uses, for the same reason: a backend answers a missing object with "not found" rather than an error, so an artifact lost mid-repair would look exactly like one that was never uploaded.
+
+Source and destination are the same backend. Nothing in the manifest changes, because the key is derived rather than recorded, and re-running after an interruption is safe.
+
+One superseded layout exists. Go modules were uploaded under the filesystem-safe name (`gomod/github.com--aws--aws-sdk-go-v2/@v/...`) while a Go client asks for the module path with its slashes intact, so **no module uploaded before this release could be served**. Any install that ever uploaded a gomod artifact has data at the old key and needs one run of this command.
+
+```bash
+bodega repair keys --dry-run                  # report, write nothing
+bodega repair keys                            # copy and verify; leave the old copies
+bodega repair keys --type gomod --delete-source
 ```
 
 ### `bodega show repo [TYPE] [PACKAGE] [VERSION]`
@@ -179,11 +193,13 @@ bodega pkg create git netbox --storage archive   # pin this package's writes
 
 ### `bodega pkg delete <type> <name> [--remove-from-s3]`
 
-Removes an entry from the manifest. Pass `--remove-from-s3` to also delete the artifact from S3. Frozen entries cannot be deleted.
+Removes an entry from the manifest. Pass `--remove-from-s3` to also delete the artifacts first. Frozen entries cannot be deleted.
+
+Every version is removed, each from the backend its own entry records, and each key is checked with a `Head` before the delete so the output distinguishes "removed" from "was already gone". An entry no key resolves for (pypi, or an apt entry with no recorded pool path) fails the command with the manifest entry intact: the entry is the only record of which bytes to clean up, so dropping it after a delete that looked nowhere would orphan them.
 
 ### `bodega pkg remove <type> <name>`
 
-Removes an artifact from S3 without touching the manifest.
+Removes an entry's artifacts from the object store without touching the manifest. Resolution, per-version backends and the no-key refusal are the same as `pkg delete --remove-from-s3`.
 
 ### `bodega pkg import <file> [file...]`
 
@@ -1113,7 +1129,7 @@ bodega show pkg apt
 bodega show pkg apt libssl3
 
 # Rebuild dependency graph to verify links
-bodega pkg repair check
+bodega repair check
 ```
 
 ---
@@ -1260,7 +1276,9 @@ The tool verifies MD5 on every manifest read and writes a fresh MD5 after every 
 
 ## Storage Layout
 
-The key layout is the same regardless of backend (local filesystem or S3):
+The key layout is the same regardless of backend (local filesystem or S3). Every key is derived in one place, `manifest.ArtifactKeys` and its per-type helpers, which the uploader, every server handler, `bodega build status`, `bodega pkg move` and the delete path all resolve through.
+
+A name containing a slash is encoded to `--` for every type **except gomod**, which keeps its slashes: a Go client requests `GET /<module>/@v/<version>.zip` with the module path verbatim, and nothing on the wire can rewrite it back. So `@bitwarden/cli` stores as `npm/@bitwarden--cli/@bitwarden--cli-2026.4.0.tgz` while `github.com/aws/sdk` stores as `gomod/github.com/aws/sdk/@v/...`.
 
 | Type | S3 prefix | Example key |
 |------|-----------|-------------|
@@ -1271,6 +1289,7 @@ The key layout is the same regardless of backend (local filesystem or S3):
 | gomod | `gomod/` | `gomod/github.com/aws/sdk/@v/v1.30.0.zip` |
 | helm | `charts/` | `charts/ingress-nginx-4.11.0.tgz` |
 | npm | `npm/` | `npm/lodash/lodash-4.17.21.tgz` |
+| cargo | `cargo/crates/` | `cargo/crates/serde-1.0.200.crate` |
 | manifests | `manifests/` | `manifests/apt/python3/manifest.json` |
 | index | `index.json` | Fast startup without loading every manifest |
 | graph | `graph.json` | Dependency graph with typed edges |

@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
+	"io"
+	"os"
 
 	"github.com/spf13/cobra"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/inventory"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 func newDeleteCmd(gf *globalFlags) *cobra.Command {
@@ -53,20 +56,21 @@ Frozen entries cannot be deleted; unfreeze them first with 'bodega freeze'.`,
 				return fmt.Errorf("entry %s/%s is frozen — unfreeze it first with 'bodega freeze %s %s'", t, name, t, name)
 			}
 
-			// Remove from object store first if requested.
+			// Remove the objects before the manifest entry. A failure here
+			// stops the command with the entry intact: the entry is the only
+			// record of which bytes to clean up, so dropping it after a delete
+			// that resolved nothing would orphan them with nothing left to
+			// name them.
 			if removeFromS3 {
-				objStore, err := storeForEntry(ctx, cfg, store, t, name)
+				stores, err := storage.NewResolver(ctx, cfg)
+				if err != nil {
+					return fmt.Errorf("connect to storage: %w", err)
+				}
+				removed, err := deleteEntryObjects(ctx, stores, store, t, name, os.Stdout)
 				if err != nil {
 					return err
 				}
-				key := s3KeyFor(store, ctx, t, name)
-				if key != "" {
-					fmt.Printf("Deleting %s/%s ...\n", objStore.Label(), key)
-					if err := objStore.Delete(ctx, key); err != nil {
-						return err
-					}
-					fmt.Println("  Deleted from S3.")
-				}
+				fmt.Printf("Deleted %d object(s).\n", len(removed))
 			}
 
 			// Capture before state for audit.
@@ -106,35 +110,62 @@ Frozen entries cannot be deleted; unfreeze them first with 'bodega freeze'.`,
 	return cmd
 }
 
-// s3KeyFor returns the primary S3 key for a named entry (first version).
-func s3KeyFor(store *manifest.Store, ctx context.Context, t, name string) string {
+// deleteEntryObjects removes every object backing a named entry and returns
+// the keys it actually removed.
+//
+// Every version is walked, not just the first: 'pkg delete' drops the whole
+// entry, so a key left behind is a key nothing will ever name again. Each
+// version resolves on the backend its own record names, because a version
+// moved with 'pkg move' does not live where its siblings do.
+//
+// Resolving no key at all is an error. Local.Get and the S3 client both answer
+// a missing object with (nil, nil) and both Deletes are idempotent, so a delete
+// aimed at the wrong key reports the same success as one that worked; the only
+// place that difference can still be caught is here, before the delete runs.
+func deleteEntryObjects(ctx context.Context, stores storage.Resolver, store *manifest.Store, t, name string, out io.Writer) ([]string, error) {
 	pm, err := store.GetPackage(ctx, t, name)
-	if err != nil || pm == nil || len(pm.Versions) == 0 {
-		return ""
+	if err != nil {
+		return nil, fmt.Errorf("get %s/%s: %w", t, name, err)
 	}
-	ve := pm.Versions[0]
-	switch t {
-	case manifest.TypeBinary:
-		filename := ve.Filename
-		if filename == "" {
-			filename = lastS3Segment(ve.URL)
-		}
-		return "binaries/" + filename
-	case manifest.TypeGit:
-		sn := strings.ReplaceAll(pm.Name, "/", "--")
-		return fmt.Sprintf("repos/%s/%s-%s.bundle", sn, sn, ve.Ref)
+	if pm == nil {
+		return nil, fmt.Errorf("%s entry %q not found", t, name)
 	}
-	return ""
-}
+	if len(pm.Versions) == 0 {
+		return nil, fmt.Errorf("%s/%s has no versions, so no artifact key resolves for it", t, name)
+	}
 
-// lastS3Segment returns the basename portion of a URL path.
-func lastS3Segment(s string) string {
-	for i := len(s) - 1; i >= 0; i-- {
-		if s[i] == '/' {
-			return s[i+1:]
+	var removed []string
+	for _, ve := range pm.Versions {
+		label := pm.Name + "@" + versionLabel(ve)
+		objStore, err := stores.ByName(ve.Storage)
+		if err != nil {
+			return removed, fmt.Errorf("%s: %w", label, err)
+		}
+		keys, err := inventory.ArtifactKeys(ctx, objStore, pm, ve)
+		if err != nil {
+			return removed, fmt.Errorf("%s: %w", label, err)
+		}
+		if len(keys) == 0 {
+			return removed, fmt.Errorf("%s: no object key resolves on %q; refusing to report a delete that looked nowhere",
+				label, effectiveStorage(ve.Storage))
+		}
+		for _, key := range keys {
+			info, err := objStore.Head(ctx, key)
+			if err != nil {
+				return removed, fmt.Errorf("%s: head %s on %q: %w", label, key, effectiveStorage(ve.Storage), err)
+			}
+			if !info.Exists {
+				fmt.Fprintf(out, "  %s: %s/%s already absent\n", label, objStore.Label(), key)
+				continue
+			}
+			if err := objStore.Delete(ctx, key); err != nil {
+				return removed, fmt.Errorf("%s: delete %s from %q: %w", label, key, effectiveStorage(ve.Storage), err)
+			}
+			fmt.Fprintf(out, "  %s: deleted %s/%s\n", label, objStore.Label(), key)
+			removed = append(removed, key)
 		}
 	}
-	return s
+	return removed, nil
 }
 
 // isFrozen returns whether all versions of the named entry are frozen, or an error if not found.
