@@ -42,6 +42,12 @@ type globalFlags struct {
 	localConfig bool
 	verbose     bool
 	logLevel    int
+
+	// logLevelGiven answers "did the operator type --log-level". Every string
+	// flag here uses "" as its not-given sentinel, but 0 is a valid log level,
+	// so without this "--log-level 0" could not turn a config file's log_level
+	// of 3 back down.
+	logLevelGiven func() bool
 }
 
 func main() {
@@ -93,10 +99,15 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 	pf.StringVar(&gf.bucket, "bucket", "", "S3 bucket name (env: REPO_BUCKET)")
 	pf.StringVar(&gf.region, "region", "", "AWS region (env: AWS_REGION)")
 	pf.StringVar(&gf.buildRoot, "build-root", "", "Local build directory (default: /opt/bodega)")
-	pf.StringVar(&gf.manifestDir, "manifest-dir", defaultManifestDir(), "Path to manifests/ directory")
+	// Empty default, like --build-root: a non-empty one wins firstNonEmpty
+	// outright, so the flag would shadow $BODEGA_MANIFEST_DIR and the config's
+	// manifest_dir with a value nobody typed. The built-in lives at the tail of
+	// the chain in config.Load.
+	pf.StringVar(&gf.manifestDir, "manifest-dir", "", "Path to manifests/ directory (env: BODEGA_MANIFEST_DIR)")
 	pf.BoolVar(&gf.localConfig, "local-config", false, "Read/write manifests from local filesystem instead of S3")
 	pf.BoolVarP(&gf.verbose, "verbose", "v", false, "Show verbose output")
 	pf.IntVar(&gf.logLevel, "log-level", 0, "Logging verbosity: 0=errors, 1=warn, 2=info, 3=debug, 4=trace")
+	gf.logLevelGiven = func() bool { return pf.Changed("log-level") }
 
 	// -V / --version prints the version and exits.
 	var showVersion bool
@@ -198,7 +209,8 @@ func loadConfig(gf *globalFlags) (*config.Config, error) {
 	}
 
 	// Resolve log level: flag > env > config file.
-	if gf.logLevel > 0 {
+	levelGiven := gf.logLevelGiven != nil && gf.logLevelGiven()
+	if levelGiven {
 		cfg.LogLevel = gf.logLevel
 	} else if env := os.Getenv(config.EnvLogLevel); env != "" {
 		if v, err := strconv.Atoi(env); err == nil {
@@ -206,7 +218,7 @@ func loadConfig(gf *globalFlags) (*config.Config, error) {
 		}
 	}
 	// --verbose is equivalent to --log-level 2 when log-level is not set.
-	if cfg.Verbose && cfg.LogLevel == 0 {
+	if cfg.Verbose && cfg.LogLevel == 0 && !levelGiven {
 		cfg.LogLevel = 2
 	}
 
@@ -319,29 +331,6 @@ func requireBucket(cfg *config.Config) error {
 		)
 	}
 	return nil
-}
-
-// defaultManifestDir returns the manifests/ directory relative to the
-// binary's location, falling back to ./manifests.
-func defaultManifestDir() string {
-	exe, err := os.Executable()
-	if err != nil {
-		return "manifests"
-	}
-	// Walk up from the executable to find manifests/.
-	// In development, the binary lives in tools/bodega/ after
-	// go build, so check the parent directories.
-	candidates := []string{
-		exe + "/../manifests",
-		exe + "/../../manifests",
-		"manifests",
-	}
-	for _, c := range candidates {
-		if fi, err := os.Stat(c); err == nil && fi.IsDir() {
-			return c
-		}
-	}
-	return "manifests"
 }
 
 // isValidType returns true when t is one of the four known manifest types.

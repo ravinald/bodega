@@ -380,7 +380,7 @@ Recomputes the MD5 digest for a manifest that was edited outside of the tool.
 | `--bucket` | `REPO_BUCKET` | | S3 bucket name |
 | `--region` | `AWS_REGION` | `us-west-2` | AWS region |
 | `--build-root` | `BOOTSTRAP_BUILD_ROOT` | `/opt/bodega` | Local build directory |
-| `--manifest-dir` | | auto-detected | Path to manifests/ directory |
+| `--manifest-dir` | `BODEGA_MANIFEST_DIR` | `{storage_path}/manifests` | Path to manifests/ directory |
 | `--local-config` | | `false` | Use local filesystem instead of S3 for manifests |
 | `-v, --verbose` | | `false` | Verbose output (equivalent to `--log-level 2`) |
 | `--log-level` | `BODEGA_LOG_LEVEL` | `0` | Logging verbosity: 0=errors, 1=warn, 2=info, 3=debug, 4=trace |
@@ -390,10 +390,32 @@ Recomputes the MD5 digest for a manifest that was edited outside of the tool.
 
 ## Configuration
 
-Config files are loaded from (first found wins):
+### Which file is the config
 
-1. `/etc/bodega/config.json` (system-wide)
-2. `~/.config/bodega/config.json` (per-user)
+Exactly one file is in force. The same rule answers for reading, writing, creating and reporting, so an edit lands in the file the process reads:
+
+1. `$BODEGA_CONFIG_FILE`, when set: that exact path, whether or not it exists. Pointing the override at a scratch path means the generated default is written there too, and nothing touches `/etc` or `~/.config`.
+2. The first of `/etc/bodega/config.json` and `~/.config/bodega/config.json` that **exists**. Existence decides, not readability and not whether it parses. A file you can see is the file you will edit; one bodega cannot read is an error it reports, never a reason to read a different file.
+3. Neither exists: the system path when running as root, the user path otherwise.
+
+There is no writability probe. A config bodega cannot write fails loudly, naming the path, rather than quietly writing a second copy somewhere `Load` will not read it:
+
+```text
+Failed to save config: write config /etc/bodega/config.json: permission denied
+```
+
+`bodega serve` prints the file it read in every startup diagnostic (`config=…`), and the TUI's save confirmation names the file `Save` wrote, not a guess at it.
+
+### Unreadable or unparsable
+
+Both are fatal. Falling back to built-in defaults means `tls_cert`/`tls_key` empty, so a server that served TLS yesterday binds plaintext today, and `deny_list` empty, so nothing is denied. The error names the file and, where the JSON decoder can say it, the key:
+
+```console
+$ bodega show repo
+Error: parse config /etc/bodega/config.json: key "audit_events": cannot use string as []string
+```
+
+That one is the common typo: a single-value list written as a bare string. Write `["upload"]`.
 
 A default config is created on first run. All fields are optional.
 
@@ -414,7 +436,7 @@ A default config is created on first run. All fields are optional.
   "bucket": "my-bodega-bucket",
   "region": "us-west-2",
   "build_root": "/opt/bodega",
-  "manifest_dir": "manifests",
+  "manifest_dir": "",
   "log_dir": "/var/log/bodega",
   "logwindow_height": 12,
   "log_level": 0,
@@ -451,7 +473,16 @@ A default config is created on first run. All fields are optional.
 
 Config files are written with mode `0600` (owner read/write only).
 
-**Resolution priority:** CLI flags > environment variables > config file > built-in defaults.
+**Resolution priority:** CLI flags > environment variables > config file > built-in defaults. Every flag in the table above is registered with an empty default so it cannot shadow the env var and config key beneath it; `--log-level` is the one exception, where `0` is both a valid level and the zero value, so bodega asks whether the flag was typed rather than reading its value.
+
+`manifest_dir` is where manifests live on the `local` backend. The built-in is `{storage_path}/manifests` and is always absolute: a relative path resolves against the process working directory, which under a systemd unit with no `WorkingDirectory=` is `/`. When the binary runs from a source tree with a `manifests/` directory beside it, that directory wins instead: a development convenience, never reached on an installed host.
+
+A server that loads zero packages says so at `ERROR`, naming the directory it read, because from the outside an empty repository is indistinguishable from a healthy one: the unit reaches `active (running)`, `/healthz` answers 200, and `dists/<suite>/Release` lists `e3b0c44298fc…` (the SHA-256 of the empty string) for `Packages`.
+
+```text
+ERROR no packages loaded — every repository index will publish as empty
+  manifests=/var/lib/bodega/manifests config=/etc/bodega/config.json
+```
 
 ### Storage backends
 

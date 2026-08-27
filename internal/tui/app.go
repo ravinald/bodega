@@ -332,7 +332,7 @@ func (m appModel) handlePopupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.cfg.Bucket = ""
 					m.cfg.Region = config.DefaultRegion
 					m.cfg.BuildRoot = config.DefaultBuildRoot
-					m.cfg.ManifestDir = "manifests"
+					m.cfg.ManifestDir = ""
 					m.cfg.LogDir = config.DefaultLogDir
 					m.cfg.LogWindowHeight = config.DefaultLogWindowHeight
 					m.cfg.CustomPaths = false
@@ -340,10 +340,11 @@ func (m appModel) handlePopupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.cfg.GitRoot = ""
 					m.cfg.PypiRoot = ""
 					m.cfg.BinaryRoot = ""
-					if err := m.cfg.Save(); err != nil {
+					path, err := m.cfg.Save()
+					if err != nil {
 						m.log.appendLog(errorStyle.Render("Failed to save: " + err.Error()))
 					} else {
-						m.log.appendLog(successStyle.Render("Config reset to defaults and saved to " + config.ConfigPath()))
+						m.log.appendLog(successStyle.Render("Config reset to defaults and saved to " + path))
 					}
 				},
 				pendingAsyncCmd: nil,
@@ -594,10 +595,11 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				} else {
 					cfgRef.DenyList = nil
 				}
-				if err := cfgRef.Save(); err != nil {
+				path, err := cfgRef.Save()
+				if err != nil {
 					m.log.appendLog(errorStyle.Render("Failed to save config: " + err.Error()))
 				} else {
-					m.log.appendLog(successStyle.Render("Config saved to " + config.ConfigPath()))
+					m.log.appendLog(successStyle.Render("Config saved to " + path))
 				}
 			},
 		}

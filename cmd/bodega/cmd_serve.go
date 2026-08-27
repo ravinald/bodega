@@ -12,6 +12,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/logging"
+	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/server"
 	"github.com/ravinald/bodega/internal/storage"
 )
@@ -90,6 +91,16 @@ output continues to respect log_level in the config.`,
 			handler := logging.NewHandler(os.Stderr, level)
 			logger := slog.New(handler)
 
+			// An empty index is indistinguishable from a healthy repository
+			// from the outside: the unit reaches active (running), /healthz
+			// answers 200, and dists/<suite>/Release lists the SHA-256 of the
+			// empty string for Packages. Error, not Warn, because the shipped
+			// default log_level prints only Error.
+			if totalPackages(store) == 0 {
+				logger.Error("no packages loaded — every repository index will publish as empty",
+					"manifests", store.Label(), "config", config.ConfigPath())
+			}
+
 			// Resolve TLS config: flags override config file.
 			if tlsCert != "" {
 				cfg.TLSCert = tlsCert
@@ -144,4 +155,13 @@ output continues to respect log_level in the config.`,
 	cmd.Flags().StringVar(&tlsDomain, "tls-domain", "", "Domain name for autocert (e.g. bodega.example.com)")
 	cmd.Flags().BoolVar(&quiet, "quiet", false, "Suppress the stderr startup banner (log_level output is unaffected)")
 	return cmd
+}
+
+// totalPackages counts every package name in the loaded index, across types.
+func totalPackages(store *manifest.Store) int {
+	n := 0
+	for _, names := range store.AllPackages() {
+		n += len(names)
+	}
+	return n
 }

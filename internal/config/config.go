@@ -1,11 +1,16 @@
 // Package config loads tool configuration from flags, environment variables,
-// and config files. Priority (highest first): flags → env vars → /etc/bodega/config.json
-// → ~/.config/bodega/config.json → built-in defaults.
+// and one config file. Priority (highest first): flags > env vars > config
+// file > built-in defaults.
+//
+// Exactly one file is ever in force, and ConfigPath is the only thing that
+// decides which. Load reads it, Save writes it, EnsureConfigFile creates it.
 package config
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -20,15 +25,30 @@ const (
 	DefaultLogLevel        = 0
 	DefaultListenAddr      = ":8080"
 
-	EnvBucket     = "REPO_BUCKET"
-	EnvRegion     = "AWS_REGION"
-	EnvBuildRoot  = "BOOTSTRAP_BUILD_ROOT"
-	EnvLogLevel   = "BODEGA_LOG_LEVEL"
-	EnvConfigFile = "BODEGA_CONFIG_FILE"
-	EnvListenAddr = "BODEGA_LISTEN_ADDR"
+	// DefaultStoragePath is the local backend's root when storage_path is
+	// unset. internal/storage applies the same value; the built-in manifest
+	// directory is derived from it, so the two must not drift.
+	DefaultStoragePath = "/var/lib/bodega"
+
+	EnvBucket      = "REPO_BUCKET"
+	EnvRegion      = "AWS_REGION"
+	EnvBuildRoot   = "BOOTSTRAP_BUILD_ROOT"
+	EnvManifestDir = "BODEGA_MANIFEST_DIR"
+	EnvLogLevel    = "BODEGA_LOG_LEVEL"
+	EnvConfigFile  = "BODEGA_CONFIG_FILE"
+	EnvListenAddr  = "BODEGA_LISTEN_ADDR"
 
 	SystemConfigDir  = "/etc/bodega"
 	SystemConfigFile = "/etc/bodega/config.json"
+)
+
+// Test seams for the two standard locations and the root check. Nothing
+// outside internal/config's own tests reassigns them; the resolution matrix
+// cannot be exercised against real /etc.
+var (
+	systemConfigFile = SystemConfigFile
+	userConfigFile   = defaultUserConfigFile
+	runningAsRoot    = func() bool { return os.Geteuid() == 0 }
 )
 
 // Config holds resolved runtime configuration and is the on-disk shape of
@@ -186,14 +206,17 @@ type legacyConfig struct {
 
 // Load builds a Config by merging sources in priority order.
 func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig, verbose bool) (*Config, error) {
-	cfg, legacy := loadFileConfig()
+	cfg, legacy, err := loadFileConfig()
+	if err != nil {
+		return nil, err
+	}
 	cfg.LocalConfig = localConfig
 	cfg.Verbose = verbose
 
 	cfg.Bucket = firstNonEmpty(flagBucket, os.Getenv(EnvBucket), cfg.Bucket)
 	cfg.Region = firstNonEmpty(flagRegion, os.Getenv(EnvRegion), cfg.Region, DefaultRegion)
 	cfg.BuildRoot = firstNonEmpty(flagBuildRoot, os.Getenv(EnvBuildRoot), cfg.BuildRoot, DefaultBuildRoot)
-	cfg.ManifestDir = firstNonEmpty(manifestDir, cfg.ManifestDir, "manifests")
+	cfg.ManifestDir = firstNonEmpty(manifestDir, os.Getenv(EnvManifestDir), cfg.ManifestDir, defaultManifestDir(cfg.StoragePath))
 	cfg.LogDir = firstNonEmpty(cfg.LogDir, DefaultLogDir)
 
 	// Log window height: new field, fall back to legacy shell_height.
@@ -317,40 +340,80 @@ func (c *Config) definedStorageNames() string {
 	return strings.Join(append([]string{DefaultStorageName}, names...), ", ")
 }
 
-// Save writes the current config to the first writable config path.
+// Save writes the current config to the file in force and returns the path it
+// wrote. It never falls back to a second path: an edit that lands somewhere
+// Load will not read is worse than a failure, because it reports success.
 //
 // It marshals the Config itself, so every JSON-tagged field survives a
 // load/save cycle. LocalConfig and Verbose stay out of the file via
 // `json:"-"`, and omitempty keeps unset optional keys absent.
-func (c *Config) Save() error {
+func (c *Config) Save() (string, error) {
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
-		return fmt.Errorf("marshal config: %w", err)
+		return "", fmt.Errorf("marshal config: %w", err)
 	}
 	data = append(data, '\n')
 
-	// Try system path first, fall back to user path.
-	for _, path := range configSearchPaths() {
-		dir := filepath.Dir(path)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			continue
-		}
-		if err := os.WriteFile(path, data, 0o600); err != nil {
-			continue
-		}
-		return nil
+	path := ConfigPath()
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("create config dir %s: %w", dir, err)
 	}
-	return fmt.Errorf("could not write config to any path")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return "", fmt.Errorf("write config %s: %w", path, err)
+	}
+	return path, nil
 }
 
-// ConfigPath returns the path of the config file that is currently in use.
+// ConfigPath returns the config file in force. It is the single answer to
+// "which file is the config": loadFileConfig reads it, Save writes it and
+// EnsureConfigFile creates it, so all four agree for the same host state.
+//
+// The rule, in order:
+//
+//  1. $BODEGA_CONFIG_FILE when set, whether or not that path exists. A caller
+//     pointing the override at a scratch path gets the scratch path for every
+//     one of the four operations, including creation.
+//  2. The first of /etc/bodega/config.json and ~/.config/bodega/config.json
+//     that exists. Existence decides — not readability, not parseability. A
+//     file the operator can see is the file they will edit, and one the
+//     process cannot read is an error to report, never a reason to silently
+//     read a different file.
+//  3. Neither exists: the system path when running as root, the user path
+//     otherwise.
+//
+// There is deliberately no writability probe. Probing is what let the four
+// callers disagree: Save took the first path it could write while Load took
+// the first it could parse, so an edit landed in ~/.config while the process
+// went on reading /etc and the setting never took effect.
 func ConfigPath() string {
-	for _, path := range configSearchPaths() {
+	if override := os.Getenv(EnvConfigFile); override != "" {
+		return override
+	}
+	user := userConfigFile()
+	candidates := []string{systemConfigFile}
+	if user != "" {
+		candidates = append(candidates, user)
+	}
+	for _, path := range candidates {
 		if _, err := os.Stat(path); err == nil {
 			return path
 		}
 	}
-	return SystemConfigFile
+	if user == "" || runningAsRoot() {
+		return systemConfigFile
+	}
+	return user
+}
+
+// defaultUserConfigFile returns the per-user config path, or "" when the home
+// directory cannot be determined.
+func defaultUserConfigFile() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".config", "bodega", "config.json")
 }
 
 // EnsureConfigAndLogDir creates the config file (if needed) and the log directory.
@@ -380,16 +443,22 @@ func EnsureConfigAndLogDir() (string, error) {
 	return configPath, nil
 }
 
-// EnsureConfigFile creates a config file with documented defaults if none exists.
+// EnsureConfigFile creates a config file with documented defaults at the path
+// in force, and returns that path. It writes where ConfigPath says, including
+// under $BODEGA_CONFIG_FILE: a client pointing the override at a scratch path
+// used to get a file written into the location it was avoiding and then read
+// built-in defaults.
 func EnsureConfigFile() (string, error) {
-	for _, path := range configSearchPaths() {
-		if _, err := os.Stat(path); err == nil {
-			return path, nil
-		}
+	path := ConfigPath()
+	if _, err := os.Stat(path); err == nil {
+		return path, nil
 	}
-	path, err := createDefaultConfig()
-	if err != nil {
-		return "", err
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("create config dir %s: %w", dir, err)
+	}
+	if err := os.WriteFile(path, defaultConfigContent(), 0o600); err != nil {
+		return "", fmt.Errorf("write config %s: %w", path, err)
 	}
 	return path, nil
 }
@@ -410,7 +479,9 @@ func defaultConfigContent() []byte {
   "bucket": "",
   "region": "us-west-2",
   "build_root": "/opt/bodega",
-  "manifest_dir": "manifests",
+
+  "_comment_manifest_dir": "manifest_dir: where manifests live on the local backend. Empty means {storage_path}/manifests. Set an absolute path; a relative one resolves against the process working directory, which under systemd is /.",
+  "manifest_dir": "",
   "log_dir": "/var/log/bodega",
   "logwindow_height": 12,
   "log_level": 0,
@@ -467,33 +538,6 @@ func defaultConfigContent() []byte {
 	return []byte(content)
 }
 
-func createDefaultConfig() (string, error) {
-	if err := os.MkdirAll(SystemConfigDir, 0o755); err == nil {
-		path := SystemConfigFile
-		if err := os.WriteFile(path, defaultConfigContent(), 0o600); err == nil {
-			return path, nil
-		}
-	}
-
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("cannot determine home directory: %w", err)
-	}
-	dir := filepath.Join(home, ".config", "bodega")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", fmt.Errorf("create config dir %s: %w", dir, err)
-	}
-	path := filepath.Join(dir, "config.json")
-	if err := os.WriteFile(path, defaultConfigContent(), 0o600); err != nil {
-		return "", fmt.Errorf("write config %s: %w", path, err)
-	}
-	return path, nil
-}
-
-// configSearchPaths returns the ordered list of paths loadFileConfig tries.
-// When BODEGA_CONFIG_FILE is set, only that path is consulted — callers can
-// point at a non-standard location, and tests can point at a path that does
-// not exist to guarantee a defaults-only load.
 // ResolveListenAddr applies the listen-address precedence chain:
 //
 //	flag → env ($BODEGA_LISTEN_ADDR) → config file → DefaultListenAddr
@@ -505,35 +549,75 @@ func (c *Config) ResolveListenAddr(flagAddr string) string {
 	return firstNonEmpty(flagAddr, os.Getenv(EnvListenAddr), c.ListenAddr, DefaultListenAddr)
 }
 
-func configSearchPaths() []string {
-	if override := os.Getenv(EnvConfigFile); override != "" {
-		return []string{override}
+// loadFileConfig reads the config file in force into a Config, plus the legacy
+// aliases parsed from the same bytes. A file that is absent yields zero values
+// for Load's precedence chain to fill; one that is present and cannot be read
+// or parsed is an error.
+//
+// Skipping a broken file used to look harmless and was not: falling back to
+// built-in defaults means tls_cert/tls_key empty, so a server that served TLS
+// yesterday binds plaintext today, and deny_list empty, so nothing is denied.
+func loadFileConfig() (*Config, legacyConfig, error) {
+	path := ConfigPath()
+	data, err := os.ReadFile(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return &Config{}, legacyConfig{}, nil
+	case err != nil:
+		return nil, legacyConfig{}, fmt.Errorf("read config %s: %w", path, err)
 	}
-	paths := []string{SystemConfigFile}
-	if home, err := os.UserHomeDir(); err == nil {
-		paths = append(paths, filepath.Join(home, ".config", "bodega", "config.json"))
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, legacyConfig{}, parseConfigError(path, err)
 	}
-	return paths
+	var legacy legacyConfig
+	_ = json.Unmarshal(data, &legacy)
+	return &cfg, legacy, nil
 }
 
-// loadFileConfig reads the first readable config file into a Config, plus the
-// legacy aliases parsed from the same bytes. A missing or unparsable file
-// yields zero values for Load's precedence chain to fill.
-func loadFileConfig() (*Config, legacyConfig) {
-	for _, path := range configSearchPaths() {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		var cfg Config
-		if err := json.Unmarshal(data, &cfg); err != nil {
-			continue
-		}
-		var legacy legacyConfig
-		_ = json.Unmarshal(data, &legacy)
-		return &cfg, legacy
+// parseConfigError names the file and, when encoding/json can say it, the key
+// and the type it wanted. The common shape is an operator writing a
+// single-value list as a bare string ("audit_events": "upload"), and "cannot
+// unmarshal string into Go value of type []string" alone does not say which
+// of the eight list-valued keys they typed.
+func parseConfigError(path string, err error) error {
+	var typeErr *json.UnmarshalTypeError
+	if errors.As(err, &typeErr) && typeErr.Field != "" {
+		return fmt.Errorf("parse config %s: key %q: cannot use %s as %s", path, typeErr.Field, typeErr.Value, typeErr.Type)
 	}
-	return &Config{}, legacyConfig{}
+	var syntaxErr *json.SyntaxError
+	if errors.As(err, &syntaxErr) {
+		return fmt.Errorf("parse config %s: %v (byte offset %d)", path, err, syntaxErr.Offset)
+	}
+	return fmt.Errorf("parse config %s: %w", path, err)
+}
+
+// defaultManifestDir returns the built-in manifest directory, always absolute.
+//
+// A bare relative "manifests" under a unit with no WorkingDirectory= resolves
+// to /manifests, which ProtectSystem=strict makes unreadable; the server then
+// loads zero packages, answers /healthz 200, and publishes a Release whose
+// Packages digest is the SHA-256 of the empty string.
+//
+// The executable-relative probes are the development case, where the binary is
+// built beside the source tree's manifests/. Off a source tree the answer is
+// derived from storage_path, so the manifests sit inside the tree the operator
+// already told bodega to own.
+func defaultManifestDir(storagePath string) string {
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		for _, c := range []string{
+			filepath.Join(exeDir, "manifests"),
+			filepath.Join(exeDir, "..", "manifests"),
+		} {
+			if fi, err := os.Stat(c); err == nil && fi.IsDir() {
+				if abs, err := filepath.Abs(c); err == nil {
+					return abs
+				}
+			}
+		}
+	}
+	return filepath.Join(firstNonEmpty(storagePath, DefaultStoragePath), "manifests")
 }
 
 func firstNonEmpty(vals ...string) string {

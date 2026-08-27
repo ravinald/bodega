@@ -201,7 +201,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	want.LocalConfig = true
 	want.Verbose = true
 
-	if err := want.Save(); err != nil {
+	if _, err := want.Save(); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
@@ -238,7 +238,7 @@ func TestSave_OmitsRuntimeAndUnsetFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if err := cfg.Save(); err != nil {
+	if _, err := cfg.Save(); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
@@ -379,7 +379,7 @@ func TestLoad_LegacyShellHeight(t *testing.T) {
 	if cfg.LogWindowHeight != 27 {
 		t.Errorf("LogWindowHeight = %d, want 27 (from legacy shell_height)", cfg.LogWindowHeight)
 	}
-	if err := cfg.Save(); err != nil {
+	if _, err := cfg.Save(); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 	data, err := os.ReadFile(path)
