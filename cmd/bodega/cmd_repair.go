@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/spf13/cobra"
 
@@ -22,8 +23,9 @@ func newRepairCmd(gf *globalFlags) *cobra.Command {
   2. Dependency linking: git entries with fetched sources should have
      their dependencies discovered and linked
   3. Artifact sizes: backfill ArtifactSize from local files
-  4. Manifest sync: all manifests are re-saved to the backend (S3)
-  5. Graph rebuild: dependency edges are rebuilt from RequiredBy fields
+  4. Apt placeholders: version-less apt entries left beside a resolved one
+  5. Manifest sync: all manifests are re-saved to the backend (S3)
+  6. Graph rebuild: dependency edges are rebuilt from RequiredBy fields
 
   bodega repair                          # detect and fix
   bodega repair check                    # detect only, no changes`,
@@ -132,9 +134,13 @@ func newRepairCmd(gf *globalFlags) *cobra.Command {
 				fmt.Println("  (skipped in check mode)")
 			}
 
-			// Phase 4: Re-sync manifests to backend.
+			// Phase 4: Version-less apt entries.
+			fmt.Println("\nPhase 4: Checking apt entries for version-less placeholders...")
+			issues += repairAptPlaceholders(ctx, store, dryRun, os.Stdout)
+
+			// Phase 5: Re-sync manifests to backend.
 			if !dryRun {
-				fmt.Println("\nPhase 4: Re-syncing manifests to backend...")
+				fmt.Println("\nPhase 5: Re-syncing manifests to backend...")
 				synced := 0
 				for _, typ := range manifest.AllTypes {
 					for _, name := range store.ListPackages(typ) {
@@ -187,4 +193,50 @@ func newRepairCmd(gf *globalFlags) *cobra.Command {
 
 	cmd.AddCommand(newRepairKeysCmd(gf))
 	return cmd
+}
+
+// repairAptPlaceholders drops version-less apt entries that sit beside a
+// resolved one, and reports how many it found. 'pkg create apt' in
+// package-name mode stages one before the upstream version is known and the
+// resolve that follows fills it; one left over is reachable from nowhere
+// else, because every other verb addresses a version by name. A sweep is the
+// only thing that can clear it, which is why it lives in repair.
+//
+// A package whose entries are all version-less is reported and left alone:
+// that one is still a staging record its operator can resolve.
+func repairAptPlaceholders(ctx context.Context, store *manifest.Store, dryRun bool, out io.Writer) int {
+	issues := 0
+	for _, name := range store.ListPackages(manifest.TypeApt) {
+		pm, err := store.GetPackage(ctx, manifest.TypeApt, name)
+		if err != nil || pm == nil {
+			continue
+		}
+		blank, resolved := 0, 0
+		for _, ve := range pm.Versions {
+			if ve.Version == "" {
+				blank++
+			} else {
+				resolved++
+			}
+		}
+		if blank == 0 {
+			continue
+		}
+		issues += blank
+		if resolved == 0 {
+			fmt.Fprintf(out, "  UNRESOLVED: apt/%s has only version-less entries; resolve or delete the package\n", name)
+			continue
+		}
+		fmt.Fprintf(out, "  PLACEHOLDER: apt/%s has %d version-less entry(s) beside %d resolved\n", name, blank, resolved)
+		if dryRun {
+			continue
+		}
+		dropped, err := builder.DropVersionlessAptEntries(ctx, store, name)
+		if err != nil {
+			fmt.Fprintf(out, "    ERROR: could not drop them: %v\n", err)
+			continue
+		}
+		fmt.Fprintf(out, "    -> dropped %d\n", dropped)
+	}
+	return issues
 }

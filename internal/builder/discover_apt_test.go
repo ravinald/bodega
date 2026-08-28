@@ -2,6 +2,8 @@ package builder
 
 import (
 	"testing"
+
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 func TestParseAptCacheDepends_Direct(t *testing.T) {
@@ -189,5 +191,61 @@ func TestIsVirtualPkg(t *testing.T) {
 		if got := isVirtualPkg(tt.name); got != tt.want {
 			t.Errorf("isVirtualPkg(%q) = %v, want %v", tt.name, got, tt.want)
 		}
+	}
+}
+
+// TestDropVersionlessAptEntries covers what a resolve leaves behind. Filling
+// consumes one placeholder, and a resolve that finds its version already
+// present fills none, so the sweep has to take every version-less entry rather
+// than the first.
+func TestDropVersionlessAptEntries(t *testing.T) {
+	store := manifest.NewLocalStore(t.TempDir())
+	ctx := t.Context()
+	for _, ve := range []manifest.VersionEntry{
+		{SourceName: "hello"},
+		{SourceName: "hello"},
+		{Version: "1.0.0", SourceName: "hello"},
+	} {
+		if err := store.AddVersion(ctx, manifest.TypeApt, "hello", ve); err != nil {
+			t.Fatalf("AddVersion: %v", err)
+		}
+	}
+
+	n, err := DropVersionlessAptEntries(ctx, store, "hello")
+	if err != nil {
+		t.Fatalf("DropVersionlessAptEntries: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("dropped %d, want 2", n)
+	}
+	pm, err := store.GetPackage(ctx, manifest.TypeApt, "hello")
+	if err != nil || pm == nil {
+		t.Fatalf("GetPackage: %v", err)
+	}
+	if len(pm.Versions) != 1 || pm.Versions[0].Version != "1.0.0" {
+		t.Errorf("versions = %+v, want only 1.0.0", pm.Versions)
+	}
+}
+
+// TestDropVersionlessAptEntriesKeepsAStagedPackage pins the exception: a
+// package with nothing resolved is a record its operator can still complete,
+// and emptying it would discard their work with nothing to replace it.
+func TestDropVersionlessAptEntriesKeepsAStagedPackage(t *testing.T) {
+	store := manifest.NewLocalStore(t.TempDir())
+	ctx := t.Context()
+	if err := store.AddVersion(ctx, manifest.TypeApt, "staged", manifest.VersionEntry{SourceName: "staged"}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+
+	n, err := DropVersionlessAptEntries(ctx, store, "staged")
+	if err != nil {
+		t.Fatalf("DropVersionlessAptEntries: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("dropped %d entries from a package with nothing resolved, want 0", n)
+	}
+	pm, _ := store.GetPackage(ctx, manifest.TypeApt, "staged")
+	if pm == nil || len(pm.Versions) != 1 {
+		t.Error("the staged entry did not survive")
 	}
 }

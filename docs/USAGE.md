@@ -107,13 +107,16 @@ Detects and fixes inconsistencies in the manifest store:
 1. **Index consistency**: packages in the index must have manifest files
 2. **Dependency linking**: git entries with fetched sources should have their dependencies discovered and linked
 3. **Artifact sizes**: backfill ArtifactSize from local files
-4. **Manifest sync**: all manifests are re-saved to the backend (S3)
-5. **Graph rebuild**: dependency edges are rebuilt from RequiredBy fields
+4. **Apt placeholders**: version-less apt entries sitting beside a resolved one are removed
+5. **Manifest sync**: all manifests are re-saved to the backend (S3)
+6. **Graph rebuild**: dependency edges are rebuilt from RequiredBy fields
 
 ```bash
 bodega repair                          # detect and fix
 bodega repair check                    # detect only, no changes
 ```
+
+Phase 4 is the only way to clear a version-less apt entry. `bodega pkg create apt` in package-name mode stages one before the upstream version is known and fills it once the lookup returns; one left over is addressable by nothing, because `pkg remove`, `pkg delete`, `hide` and `freeze` all name a version. A package whose entries are *all* version-less is reported and left alone — that is a staging record, not a leftover.
 
 ### `bodega repair keys [--dry-run] [--delete-source] [--type TYPE]`
 
@@ -963,20 +966,23 @@ A rebuild happens on:
 | Server start | Before the listener binds, so no request ever sees an empty index |
 | `SIGHUP` | After the manifest reload and the signing-key reload. Every mutating `bodega pkg` verb sends one |
 | A mutation-API write to an apt entry | `POST`, `DELETE`, and the hide and freeze toggles |
-| A ticker | Hourly once an index exists, every 15 seconds until one does |
+| A ticker | Hourly once an index exists; 15s, 30s, 60s and on up to hourly until one does |
 
 **A manifest edited by hand is picked up on the next tick, or at once on `SIGHUP`** (`kill -HUP $(cat <log_dir>/bodega.pid)`). The tick re-reads the manifest index from the backend before rebuilding, so an edit made outside the process reaches the index without a signal; the wait is up to an hour. Every mutating CLI verb signals, so the normal workflow never waits.
 
-The retry interval matters because a snapshot that never built is a 503 on every apt request, and the ordinary way to land there is transient: expired credentials, or a network that was not up when systemd started the unit.
+The retry interval matters because a snapshot that never built is a 503 on every apt request, and the ordinary way to land there is transient: expired credentials, or a network that was not up when systemd started the unit. Those clear in seconds and the first few attempts catch them. A wrong bucket, revoked credentials or a role that lost `s3:ListBucket` never clears at all, so the interval doubles up to the hourly one: 7 attempts in the first hour rather than 240, each of which is a manifest reload, a pool listing and an `ERROR` line against a dependency already failing. The first snapshot puts the loop straight back on the hourly interval however far the retry had walked.
 
 A mutation-API rebuild runs on a background context rather than the request's. The write commits before the rebuild starts, so a client that hangs up in between would otherwise get its change persisted and the index left describing the state before it.
 
 `Release` carries `Date` backdated 24 hours to tolerate client clock skew, and `Valid-Until` 14 days after that. The expiry is stamped when the snapshot is built and does not move on its own, which is why the refresh ticker is not an optimization: a server whose refresh loop stops eventually serves an expired `Release`, and every client fails `apt update` at once — including with `[trusted=yes]`, since `Acquire::Check-Valid-Until` is independent of trust. Within 24 hours of expiry the server logs at `WARN` on every `Release` fetch.
 
-Two cases drop an entry from the index silently, so both are logged at `WARN` once per rebuild:
+Three cases drop an entry from the index silently, and the client sees `Unable to locate package` for all three, which is also what a typo produces. Each is logged at `WARN` once per rebuild:
 
 - The entry names suites, none of which is in `apt_suites`.
-- The entry has no `version`. No CLI verb can address a versionless entry, so publishing one hands clients a package nobody can withdraw.
+- The entry has no `version`. No CLI verb can address a versionless entry, so publishing one hands clients a package nobody can withdraw. `POST /api/v1/packages/apt`, `bodega pkg import` and `bodega pkg edit` refuse to write one; `bodega repair` clears the ones already in a manifest.
+- The entry has no `_pool_path` and no `.deb` in the pool matches its name, version and architecture. Ordinarily this is the gap between `bodega pkg create` and the upload that follows.
+
+An entry that records `_pool_path` addresses its pool object directly, so an index whose entries all carry one is built without listing the pool at all. A listing is taken only for the entries that need the filename match, and is re-taken when the cached one leaves any of them unresolved: a `.deb` uploaded out of band would otherwise stay out of the index for the whole `metadata_ttl`, and stay out silently.
 
 An architecture is served only if some entry published to that suite declares it. `Release` advertises exactly those architectures in `Architectures:`, and `binary-<arch>/Packages` 404s for any other, since `Release` records no digest for it. With no architecture-specific entry at all the suite falls back to `amd64`.
 

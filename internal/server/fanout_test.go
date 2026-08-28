@@ -164,15 +164,27 @@ func TestListFanoutFailsRequestOnBackendError(t *testing.T) {
 // Every apt-touching API write rebuilds the snapshot and the rebuild lists the
 // whole pool, so without this each write paid for a full unbounded listing,
 // multiplied by the number of backends once the listing fans out.
+//
+// The fixture turns on the one entry with no _pool_path: an index whose
+// entries all carry one never lists at all, which is the cheaper path
+// TestNoListingWhenEveryEntryCarriesPoolPath covers. This is the case where
+// the listing is genuinely needed and the cache is what bounds it.
 func TestAptPoolListingIsCached(t *testing.T) {
 	mem := storage.NewMemory()
 	mem.Seed("packages/apt/pool/main/h/hello/hello_1.0_amd64.deb", "\x00deb")
+	mem.Seed("packages/apt/pool/main/o/older/older_0.9_amd64.deb", "\x00deb")
 	counting := &countingStore{ObjectStore: mem}
 
 	store := manifest.NewLocalStore(t.TempDir())
 	if err := store.AddVersion(t.Context(), manifest.TypeApt, "hello", manifest.VersionEntry{
 		Version:  "1.0",
 		Metadata: map[string]string{"Architecture": "amd64", "_pool_path": "pool/main/h/hello/hello_1.0_amd64.deb"},
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+	if err := store.AddVersion(t.Context(), manifest.TypeApt, "older", manifest.VersionEntry{
+		Version:  "0.9",
+		Metadata: map[string]string{"Architecture": "amd64"},
 	}); err != nil {
 		t.Fatalf("AddVersion: %v", err)
 	}

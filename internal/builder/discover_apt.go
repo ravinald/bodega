@@ -392,6 +392,7 @@ func ResolveAndCreateConcreteVersion(ctx context.Context, store *manifest.Store,
 				} else {
 					_, _ = fmt.Fprintf(out, "  [apt] %s@%s already exists\n", pkgName, version)
 				}
+				dropAptPlaceholders(ctx, store, pkgName, out)
 				return
 			}
 		}
@@ -420,6 +421,7 @@ func ResolveAndCreateConcreteVersion(ctx context.Context, store *manifest.Store,
 	} else {
 		_, _ = fmt.Fprintf(out, "  [apt] resolved %s > %s\n", pkgName, version)
 	}
+	dropAptPlaceholders(ctx, store, pkgName, out)
 
 	// Also set the package-level description if not already set.
 	if ve.Description != "" {
@@ -468,4 +470,59 @@ func fillResolvedVersion(ctx context.Context, store *manifest.Store, pkgName str
 		return true
 	}
 	return false
+}
+
+// dropAptPlaceholders discards placeholders this resolve left behind and
+// reports what it removed. Two paths reach it: a second create for a package
+// whose resolved version already exists returns before filling anything, and
+// a fill only consumes the first placeholder of however many accumulated.
+func dropAptPlaceholders(ctx context.Context, store *manifest.Store, pkgName string, out io.Writer) {
+	n, err := DropVersionlessAptEntries(ctx, store, pkgName)
+	if err != nil {
+		_, _ = fmt.Fprintf(out, "  [apt] WARNING: could not drop version-less entries for %s: %v\n", pkgName, err)
+		return
+	}
+	if n > 0 {
+		_, _ = fmt.Fprintf(out, "  [apt] dropped %d version-less entry(s) for %s\n", n, pkgName)
+	}
+}
+
+// DropVersionlessAptEntries removes version-less entries from an apt package
+// that also carries at least one resolved version, and reports how many it
+// removed.
+//
+// A version-less entry is the placeholder 'pkg create apt' writes before the
+// upstream version is known. Once a resolved entry exists beside it nothing
+// can address it: pkg remove, pkg delete, hide and freeze all name a version,
+// and the index generator refuses to publish it. Only a sweep can reach it,
+// which is why 'bodega repair' calls this too.
+//
+// A package whose only entry is version-less is left alone. That one is still
+// a staging record an operator can resolve; removing it would discard their
+// work with nothing to put in its place.
+func DropVersionlessAptEntries(ctx context.Context, store *manifest.Store, pkgName string) (int, error) {
+	pm, err := store.GetPackage(ctx, manifest.TypeApt, pkgName)
+	if err != nil {
+		return 0, err
+	}
+	if pm == nil {
+		return 0, nil
+	}
+	kept := make([]manifest.VersionEntry, 0, len(pm.Versions))
+	blank := 0
+	for _, ve := range pm.Versions {
+		if ve.Version == "" {
+			blank++
+			continue
+		}
+		kept = append(kept, ve)
+	}
+	if blank == 0 || len(kept) == 0 {
+		return 0, nil
+	}
+	pm.Versions = kept
+	if err := store.SavePackage(ctx, pm); err != nil {
+		return 0, err
+	}
+	return blank, nil
 }
