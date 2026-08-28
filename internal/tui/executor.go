@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -378,6 +377,13 @@ func runDelete(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, s3c
 	return nil
 }
 
+// runRemove deletes every object backing an entry, keyed through
+// manifest.ArtifactKeys so the TUI removes what the uploader wrote.
+//
+// The TUI holds a bare S3 client rather than a storage.Resolver, so it can only
+// reach the default backend. A version recorded elsewhere is refused outright
+// instead of deleted from the wrong bucket, which both stores would report as
+// success.
 func runRemove(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, s3client *bos3.Client, entryType, name string) error {
 	if s3client == nil {
 		return fmt.Errorf("remove requires a configured S3 bucket")
@@ -385,16 +391,58 @@ func runRemove(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, s3c
 	if !isValidType(entryType) {
 		return fmt.Errorf("unknown type %q", entryType)
 	}
-	key := s3KeyForEntry(store, entryType, name)
-	if key == "" {
-		return fmt.Errorf("could not determine S3 key for %s/%s", entryType, name)
+	ctx := context.Background()
+	pm, err := store.GetPackage(ctx, entryType, name)
+	if err != nil {
+		return fmt.Errorf("get %s/%s: %w", entryType, name, err)
 	}
-	fmt.Fprintf(buf, "Deleting s3://%s/%s ...\n", cfg.Bucket, key)
-	if err := s3client.DeleteObject(context.Background(), key); err != nil {
-		return err
+	if pm == nil {
+		return fmt.Errorf("%s entry %q not found", entryType, name)
 	}
-	fmt.Fprintf(buf, "Deleted.\n")
+	if len(pm.Versions) == 0 {
+		return fmt.Errorf("%s/%s has no versions, so no artifact key resolves for it", entryType, name)
+	}
+
+	removed := 0
+	for _, ve := range pm.Versions {
+		label := pm.Name + "@" + versionLabel(ve)
+		if ve.Storage != "" {
+			return fmt.Errorf("%s is recorded on storage backend %q, which the TUI cannot reach; "+
+				"use 'bodega pkg remove %s %s'", label, ve.Storage, entryType, name)
+		}
+		keys, err := manifest.ArtifactKeys(pm, ve)
+		if err != nil {
+			return fmt.Errorf("%s: %w", label, err)
+		}
+		for _, key := range keys {
+			status, err := s3client.HeadObject(ctx, key)
+			if err != nil {
+				return fmt.Errorf("%s: head s3://%s/%s: %w", label, cfg.Bucket, key, err)
+			}
+			if !status.Exists {
+				fmt.Fprintf(buf, "  %s: s3://%s/%s already absent\n", label, cfg.Bucket, key)
+				continue
+			}
+			if err := s3client.DeleteObject(ctx, key); err != nil {
+				return err
+			}
+			fmt.Fprintf(buf, "  %s: deleted s3://%s/%s\n", label, cfg.Bucket, key)
+			removed++
+		}
+	}
+	fmt.Fprintf(buf, "Deleted %d object(s).\n", removed)
 	return nil
+}
+
+// versionLabel names an entry for an operator: Version, else Ref, else "?".
+func versionLabel(ve manifest.VersionEntry) string {
+	if ve.Version != "" {
+		return ve.Version
+	}
+	if ve.Ref != "" {
+		return ve.Ref
+	}
+	return "?"
 }
 
 func runFreeze(buf *bytes.Buffer, store *manifest.Store, entryType, name string, auditDB *audit.DB) error {
@@ -469,31 +517,6 @@ func isFrozenEntry(store *manifest.Store, ctx context.Context, t, name string) (
 		}
 	}
 	return true, nil
-}
-
-// s3KeyForEntry returns the primary S3 object key for a named entry (first version).
-func s3KeyForEntry(store *manifest.Store, t, name string) string {
-	ctx := context.Background()
-	pm, err := store.GetPackage(ctx, t, name)
-	if err != nil || pm == nil || len(pm.Versions) == 0 {
-		return ""
-	}
-	ve := pm.Versions[0]
-	switch t {
-	case manifest.TypeBinary:
-		filename := ve.Filename
-		if filename == "" {
-			filename = lastURLSegment(ve.URL)
-		}
-		return "binaries/" + filename
-	case manifest.TypeGit:
-		sn := strings.ReplaceAll(pm.Name, "/", "--")
-		if ve.IsRelease() {
-			return fmt.Sprintf("repos/%s/%s-%s.tar.gz", sn, sn, ve.Ref)
-		}
-		return fmt.Sprintf("repos/%s/%s-%s.bundle", sn, sn, ve.Ref)
-	}
-	return ""
 }
 
 // lastURLSegment returns the portion of a URL after the final '/'.

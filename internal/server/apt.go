@@ -29,7 +29,7 @@ func (s *Server) handleAptPool(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
 	}
-	key := aptPoolPrefix + p
+	key := manifest.AptKey("pool/" + p)
 	setCacheImmutable(w, path.Base(p))
 	store, err := s.aptPoolStore("pool/" + p)
 	if err != nil {
@@ -615,10 +615,6 @@ func capForLog(items []string) string {
 	return strings.Join(items, " ")
 }
 
-// aptPoolPrefix is where uploads write .deb files. dists/ is generated per
-// request and never stored, so the pool is the only apt prefix with objects.
-const aptPoolPrefix = "packages/apt/pool/"
-
 // aptPoolListing is one cached pool listing and the moment it was taken.
 type aptPoolListing struct {
 	keys []string
@@ -641,7 +637,7 @@ func (s *Server) aptPoolKeys(ctx context.Context) ([]string, error) {
 	if cached := s.aptPool.Load(); cached != nil && ttl > 0 && time.Since(cached.at) < ttl {
 		return cached.keys, nil
 	}
-	keys, err := s.listFanout(ctx, manifest.TypeApt, aptPoolPrefix)
+	keys, err := s.listFanout(ctx, manifest.TypeApt, manifest.AptPoolPrefix)
 	if err != nil {
 		return nil, err
 	}
@@ -687,7 +683,7 @@ func (s *Server) generateAptPackages(ctx context.Context, suite, arch string, de
 		}
 		// Key is like "packages/apt/pool/main/a/amazon-efs-utils/amazon-efs-utils_2.4.2_amd64.deb"
 		// We want the relative path after "packages/apt/" for the Filename field.
-		relPath := strings.TrimPrefix(key, "packages/apt/")
+		relPath := strings.TrimPrefix(key, manifest.AptPrefix)
 		// Index by base filename for matching.
 		poolMap[filename] = relPath
 	}

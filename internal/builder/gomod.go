@@ -22,11 +22,6 @@ func gomodDir(d dirs, name string) string {
 	return filepath.Join(d.gomod, name, "@v")
 }
 
-// gomodS3Prefix returns the S3 key prefix for a Go module.
-func gomodS3Prefix(name string) string {
-	return "gomod/" + name + "/@v/"
-}
-
 // CheckGomodStage inspects the local filesystem for fetched Go module artifacts.
 func CheckGomodStage(cfg *Config, name string, ve manifest.VersionEntry) StageStatus {
 	d := buildDirs(cfg.rootFor(manifest.TypeGomod))
@@ -195,16 +190,19 @@ func GomodArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) 
 			continue
 		}
 
+		// Keys are derived from pm.Name, not the safe name this loop iterates.
+		// A Go client requests the module path with its slashes intact and the
+		// server has no way to re-encode it, so the uploader is the side that
+		// has to write the wire form.
 		for _, ve := range pm.Versions {
 			dir := gomodDir(d, name)
-			prefix := gomodS3Prefix(name)
 
 			for _, ext := range []string{".info", ".mod", ".zip"} {
 				local := filepath.Join(dir, ve.Version+ext)
 				if fileExists(local) {
 					paths = append(paths, ArtifactPath{
 						Local:   local,
-						S3Key:   prefix + ve.Version + ext,
+						S3Key:   manifest.GomodKey(pm.Name, ve.Version, ext),
 						Package: name,
 						Version: ve.Version,
 					})
@@ -216,7 +214,7 @@ func GomodArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) 
 			if fileExists(listPath) {
 				paths = append(paths, ArtifactPath{
 					Local: listPath,
-					S3Key: prefix + "list",
+					S3Key: manifest.GomodListKey(pm.Name),
 				})
 			}
 		}

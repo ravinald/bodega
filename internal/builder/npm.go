@@ -78,11 +78,6 @@ func npmTarballPath(d dirs, name string, ve manifest.VersionEntry) string {
 	return filepath.Join(npmLocalDir(d, name, ve), npmTarballFilename(name, ve))
 }
 
-// npmS3Prefix returns the S3 key prefix for an npm package.
-func npmS3Prefix(name string) string {
-	return "npm/" + name + "/"
-}
-
 // CheckNpmStage inspects the local filesystem for a fetched npm tarball.
 func CheckNpmStage(cfg *Config, name string, ve manifest.VersionEntry) StageStatus {
 	d := buildDirs(cfg.rootFor(manifest.TypeNpm))
@@ -327,7 +322,7 @@ func NpmArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) []
 			if fileExists(local) {
 				paths = append(paths, ArtifactPath{
 					Local:   local,
-					S3Key:   npmS3Prefix(name) + npmTarballFilename(name, ve),
+					S3Key:   manifest.NpmTarballKey(pm.Name, ve.Version),
 					Package: name,
 					Version: ve.Version,
 				})
@@ -340,7 +335,7 @@ func NpmArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) []
 				if fileExists(packumentPath) {
 					paths = append(paths, ArtifactPath{
 						Local: packumentPath,
-						S3Key: npmS3Prefix(name) + "packument.json",
+						S3Key: manifest.NpmPackumentKey(pm.Name),
 					})
 				}
 			}

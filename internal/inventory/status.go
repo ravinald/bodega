@@ -1,11 +1,14 @@
 // Package inventory answers "which object backs this manifest entry, and is it
 // there?" for every package type.
 //
-// It lives outside internal/s3 because the answer is not S3-specific: the key
-// derivations here are shared by the local backend, by every named backend, and
-// by 'bodega pkg move', which needs the same keys to copy. Taking a concrete S3
+// It lives outside internal/s3 because the answer is not S3-specific: it holds
+// for the local backend and for every named backend alike. Taking a concrete S3
 // client was the reason 'bodega build status' could not see a local install at
 // all.
+//
+// The keys come from manifest.ArtifactKeys. What is added here is the probe and
+// the one lookup that needs a backend to answer: locating an apt entry that
+// predates the _pool_path metadata key.
 //
 // Placement is read from the manifest, never from the config hierarchy. An
 // entry records the backend holding its bytes; probing anywhere else reports a
@@ -14,6 +17,7 @@ package inventory
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -23,15 +27,10 @@ import (
 	"github.com/ravinald/bodega/internal/storage"
 )
 
-const (
-	aptPrefix     = "packages/apt/"
-	aptPoolPrefix = aptPrefix + "pool/"
-
-	// pypiSentinel is the one object a pypi upload always writes. Wheels are
-	// synced as a directory with no per-version key, so this stands in for the
-	// whole tree.
-	pypiSentinel = "pypi/wheels/MANIFEST.sha256"
-)
+// pypiSentinel is the one object a pypi upload always writes. Wheels are
+// synced as a directory with no per-version key, so this stands in for the
+// whole tree.
+const pypiSentinel = manifest.PypiWheelPrefix + "MANIFEST.sha256"
 
 // EntryStatus describes one manifest entry compared against the backend that
 // records it.
@@ -191,76 +190,30 @@ func EffectiveBackend(recorded string) string {
 // ArtifactKeys returns every object key holding this version's bytes, primary
 // first. Empty (with no error) means the entry resolves to no object yet.
 //
-// store is consulted only by apt, and only for entries predating the
-// _pool_path metadata key, which need a pool listing to find their .deb.
-//
-// This is the one derivation of these keys. 'bodega build status' probes them
-// and 'bodega pkg move' copies them; a second copy would let the two disagree
-// about which object backs an entry, which is how a move silently leaves bytes
-// behind.
+// The keys themselves come from manifest.ArtifactKeys, which is the one
+// derivation the uploader and the server handlers also use. What this adds is
+// the single lookup that needs a backend: an apt entry written before the
+// _pool_path metadata key existed can only be located by listing the pool, and
+// manifest cannot import storage to do it.
 func ArtifactKeys(ctx context.Context, store storage.ObjectStore, pm *manifest.PackageManifest, ve manifest.VersionEntry) ([]string, error) {
-	// Every key below is the one the uploader writes, derived from the safe
-	// name because that is what builder's *ArtifactPaths are handed —
-	// Store.ListPackages returns safe names. Deriving from pm.Name instead
-	// silently misses every package whose name contains a slash.
-	safe := manifest.SafeName(pm.Name)
-	switch pm.Type {
-	case manifest.TypeBinary:
-		filename := ve.Filename
-		if filename == "" {
-			filename = lastSegment(ve.URL)
-		}
-		if ve.Version != "" {
-			return []string{fmt.Sprintf("binaries/%s/%s/%s", safe, ve.Version, filename)}, nil
-		}
-		return []string{fmt.Sprintf("binaries/%s/%s", safe, filename)}, nil
-
-	case manifest.TypeGit:
-		ext := ".bundle"
-		if ve.IsRelease() {
-			ext = ".tar.gz"
-		}
-		ref := ve.Ref
-		if ref == "" {
-			ref = ve.Version
-		}
-		return []string{fmt.Sprintf("repos/%s/%s-%s%s", safe, safe, ref, ext)}, nil
-
-	case manifest.TypeApt:
-		rel, err := aptPoolPath(ctx, store, pm, ve)
-		if err != nil || rel == "" {
-			return nil, err
-		}
-		return []string{aptPrefix + rel}, nil
-
-	case manifest.TypeGomod:
-		// The .zip is the artifact; .info and .mod are small siblings that
-		// must travel with it or the module is unresolvable once moved.
-		prefix := fmt.Sprintf("gomod/%s/@v/%s", safe, ve.Version)
-		return []string{prefix + ".zip", prefix + ".info", prefix + ".mod"}, nil
-
-	case manifest.TypeHelm:
-		return []string{fmt.Sprintf("charts/%s-%s.tgz", safe, ve.Version)}, nil
-
-	case manifest.TypeNpm:
-		return []string{fmt.Sprintf("npm/%s/%s-%s.tgz", safe, safe, ve.Version)}, nil
-
-	case manifest.TypeCargo:
-		return []string{fmt.Sprintf("cargo/crates/%s-%s.crate", safe, ve.Version)}, nil
-
-	case manifest.TypePypi:
-		return nil, fmt.Errorf("pypi wheels are uploaded as a directory and have no per-version object key")
+	keys, err := manifest.ArtifactKeys(pm, ve)
+	if err == nil {
+		return keys, nil
 	}
-	return nil, fmt.Errorf("unknown package type %q", pm.Type)
+	if !errors.Is(err, manifest.ErrAptPoolPathUnknown) {
+		return nil, err
+	}
+	rel, err := aptPoolPathFromListing(ctx, store, pm, ve)
+	if err != nil || rel == "" {
+		return nil, err
+	}
+	return []string{manifest.AptKey(rel)}, nil
 }
 
-// aptPoolPath resolves a version's path relative to packages/apt/, preferring
-// the recorded _pool_path and falling back to a listing for entries that
-// predate it.
-func aptPoolPath(ctx context.Context, store storage.ObjectStore, pm *manifest.PackageManifest, ve manifest.VersionEntry) (string, error) {
-	if rel := ve.Metadata["_pool_path"]; rel != "" {
-		return rel, nil
-	}
+// aptPoolPathFromListing finds a version's path relative to manifest.AptPrefix
+// by listing the pool. Only entries predating the _pool_path metadata key
+// reach here; everything else is answered without a round trip.
+func aptPoolPathFromListing(ctx context.Context, store storage.ObjectStore, pm *manifest.PackageManifest, ve manifest.VersionEntry) (string, error) {
 	srcName := ve.SourceName
 	if srcName == "" {
 		srcName = pm.Name
@@ -273,9 +226,9 @@ func aptPoolPath(ctx context.Context, store storage.ObjectStore, pm *manifest.Pa
 }
 
 // listAptPool maps each pooled .deb basename to its path relative to
-// packages/apt/, matching the Filename form the server emits into Packages.
+// manifest.AptPrefix, matching the Filename form the server emits into Packages.
 func listAptPool(ctx context.Context, store storage.ObjectStore) (map[string]string, error) {
-	keys, err := store.List(ctx, aptPoolPrefix)
+	keys, err := store.List(ctx, manifest.AptPoolPrefix)
 	if err != nil {
 		return nil, err
 	}
@@ -285,7 +238,7 @@ func listAptPool(ctx context.Context, store storage.ObjectStore) (map[string]str
 		if !strings.HasSuffix(base, ".deb") {
 			continue
 		}
-		pool[base] = strings.TrimPrefix(key, aptPrefix)
+		pool[base] = strings.TrimPrefix(key, manifest.AptPrefix)
 	}
 	return pool, nil
 }
@@ -328,13 +281,4 @@ func PrintStatus(out io.Writer, statuses []EntryStatus) {
 			_, _ = fmt.Fprintf(out, "%-8s %-30s %s\n", "", "", s.Error)
 		}
 	}
-}
-
-func lastSegment(s string) string {
-	for i := len(s) - 1; i >= 0; i-- {
-		if s[i] == '/' {
-			return s[i+1:]
-		}
-	}
-	return s
 }

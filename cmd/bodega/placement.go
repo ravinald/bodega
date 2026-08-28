@@ -214,19 +214,3 @@ func versionLabel(ve manifest.VersionEntry) string {
 	}
 	return "?"
 }
-
-// storeForEntry returns the backend holding a named entry's artifact, by the
-// name recorded on its first version. Deleting from the default backend when
-// the manifest names another leaves the artifact behind and the operator with
-// a success message, so this resolves the same way a read does.
-func storeForEntry(ctx context.Context, cfg *config.Config, store *manifest.Store, typ, name string) (storage.ObjectStore, error) {
-	stores, err := storage.NewResolver(ctx, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("connect to storage: %w", err)
-	}
-	pm, err := store.GetPackage(ctx, typ, name)
-	if err != nil || pm == nil || len(pm.Versions) == 0 {
-		return stores.ForType(typ), nil
-	}
-	return stores.ByName(pm.Versions[0].Storage)
-}

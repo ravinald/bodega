@@ -648,15 +648,15 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 		row := s3EntryStatus{
 			Type:    manifest.TypeApt,
 			Name:    "apt-pool",
-			S3Key:   aptPoolPrefix,
+			S3Key:   manifest.AptPoolPrefix,
 			Backend: ns.Name,
 		}
-		keys, err := ns.Store.List(r.Context(), aptPoolPrefix)
+		keys, err := ns.Store.List(r.Context(), manifest.AptPoolPrefix)
 		if err != nil {
 			resp.Healthy = false
 			resp.Error = "one or more storage backends failed to respond"
 			row.Error = err.Error()
-			s.logger.Error("object store probe failed", "backend", ns.Name, "prefix", aptPoolPrefix, "error", err)
+			s.logger.Error("object store probe failed", "backend", ns.Name, "prefix", manifest.AptPoolPrefix, "error", err)
 		} else {
 			row.InS3 = len(keys) > 0
 		}

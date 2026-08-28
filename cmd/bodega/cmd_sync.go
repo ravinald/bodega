@@ -108,11 +108,11 @@ use 'upload' instead.`,
 					if err != nil {
 						return err
 					}
-					n, err := st.SyncDir(ctx, os.Stdout, localDir, "repos/")
+					n, err := st.SyncDir(ctx, os.Stdout, localDir, manifest.GitPrefix)
 					if err != nil {
 						return fmt.Errorf("sync git: %w", err)
 					}
-					fmt.Printf("    Uploaded %d file(s) to %s/repos/\n", n, st.Label())
+					fmt.Printf("    Uploaded %d file(s) to %s/%s\n", n, st.Label(), manifest.GitPrefix)
 					totalUploaded += n
 
 				case manifest.TypeApt:
@@ -125,11 +125,11 @@ use 'upload' instead.`,
 					if err != nil {
 						return err
 					}
-					n, err := st.SyncDir(ctx, os.Stdout, localDir, "packages/apt/")
+					n, err := st.SyncDir(ctx, os.Stdout, localDir, manifest.AptPrefix)
 					if err != nil {
 						return fmt.Errorf("sync apt: %w", err)
 					}
-					fmt.Printf("    Uploaded %d file(s) to %s/packages/apt/\n", n, st.Label())
+					fmt.Printf("    Uploaded %d file(s) to %s/%s\n", n, st.Label(), manifest.AptPrefix)
 					totalUploaded += n
 
 				case manifest.TypePypi:

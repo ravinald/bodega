@@ -185,5 +185,6 @@ func newRepairCmd(gf *globalFlags) *cobra.Command {
 		},
 	}
 
+	cmd.AddCommand(newRepairKeysCmd(gf))
 	return cmd
 }

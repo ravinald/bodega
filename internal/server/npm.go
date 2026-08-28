@@ -19,9 +19,15 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 		tarball := fullPath[idx+3:] // URL form, e.g. "cli-2026.3.0.tgz"
 		setCacheImmutable(w, tarball)
 
-		// Storage uses the safe-encoded form everywhere; URL doesn't.
-		storageKey := npmStorageKeyForTarball(pkgName, tarball)
+		// Storage uses the safe-encoded form everywhere; the URL does not, so
+		// the version has to come back out of the wire filename before a key
+		// can be derived. An unparseable filename names no artifact.
 		reqVersion := npmVersionFromTarball(pkgName, tarball)
+		if reqVersion == "" {
+			http.NotFound(w, r)
+			return
+		}
+		storageKey := manifest.NpmTarballKey(pkgName, reqVersion)
 
 		pm, _ := s.store.GetPackage(ctx, manifest.TypeNpm, pkgName)
 		if pm != nil {
@@ -29,19 +35,17 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 				http.NotFound(w, r)
 				return
 			}
-			if reqVersion != "" && isVersionHidden(pm, reqVersion) {
+			if isVersionHidden(pm, reqVersion) {
 				http.NotFound(w, r)
 				return
 			}
 			// 403 (not 404) below — the version exists upstream, we're
 			// refusing by policy. Mirrors the gomod path in versionAllowed.
-			if reqVersion != "" {
-				vc, baseVer := packageVersionConstraint(pm)
-				if vc != "" && vc != manifest.ConstraintAny && baseVer != "" {
-					if !versionAllowed(baseVer, reqVersion, vc) {
-						http.Error(w, "version not allowed by constraint", http.StatusForbidden)
-						return
-					}
+			vc, baseVer := packageVersionConstraint(pm)
+			if vc != "" && vc != manifest.ConstraintAny && baseVer != "" {
+				if !versionAllowed(baseVer, reqVersion, vc) {
+					http.Error(w, "version not allowed by constraint", http.StatusForbidden)
+					return
 				}
 			}
 		}
@@ -74,29 +78,9 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 	}
 
 	upstream := s.cfg.NpmUpstream + "/" + pkgName
-	s3Key := "npm/" + npmSafeName(pkgName) + "/packument.json"
+	s3Key := manifest.NpmPackumentKey(pkgName)
 	forceProxy := pm != nil && packageMode(pm) == manifest.ModeProxy
 	s.proxyOrCache(w, r, s.typeStore(manifest.TypeNpm), s3Key, upstream, manifest.TypeNpm, pkgName, pkgName, false, forceProxy)
-}
-
-// npmSafeName: "@scope/pkg" → "@scope--pkg". Matches internal/builder.safeName
-// (duplicated to avoid pulling builder into server's deps).
-func npmSafeName(pkgName string) string {
-	return strings.ReplaceAll(pkgName, "/", "--")
-}
-
-// Uploader writes tarballs to npm/@scope--pkg/@scope--pkg-<ver>.tgz;
-// rebuild that key from what the handler sees on the wire ("pkg-<ver>.tgz").
-func npmStorageKeyForTarball(pkgName, urlTarball string) string {
-	safe := npmSafeName(pkgName)
-	if pkgName == safe {
-		return "npm/" + safe + "/" + urlTarball
-	}
-	ver := npmVersionFromTarball(pkgName, urlTarball)
-	if ver == "" {
-		return "npm/" + safe + "/" + urlTarball
-	}
-	return "npm/" + safe + "/" + safe + "-" + ver + ".tgz"
 }
 
 // @bitwarden/cli + cli-2026.4.0.tgz → 2026.4.0. "" on unexpected shape.

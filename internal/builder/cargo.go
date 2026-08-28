@@ -28,11 +28,6 @@ func cargoCratePath(d dirs, name string, ve manifest.VersionEntry) string {
 	return filepath.Join(cargoLocalDir(d, name, ve), cargoCrateFilename(name, ve))
 }
 
-// cargoS3Prefix returns the S3 key prefix for a cargo crate.
-func cargoS3Prefix(name string) string {
-	return "cargo/crates/"
-}
-
 // CheckCargoStage inspects the local filesystem for a fetched crate tarball.
 func CheckCargoStage(cfg *Config, name string, ve manifest.VersionEntry) StageStatus {
 	d := buildDirs(cfg.rootFor(manifest.TypeCargo))
@@ -177,7 +172,7 @@ func CargoArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) 
 			}
 			paths = append(paths, ArtifactPath{
 				Local:   local,
-				S3Key:   cargoS3Prefix(name) + cargoCrateFilename(pm.Name, ve),
+				S3Key:   manifest.CargoCrateKey(pm.Name, ve.Version),
 				Package: name,
 				Version: ve.Version,
 			})

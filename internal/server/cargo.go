@@ -94,7 +94,7 @@ func (s *Server) handleCargoIndex(w http.ResponseWriter, r *http.Request, p stri
 	}
 
 	upstream := strings.TrimRight(s.cfg.CargoUpstream, "/") + "/" + p
-	s3Key := "cargo/index/" + p
+	s3Key := manifest.CargoIndexKey(p)
 	forceProxy := pm != nil && packageMode(pm) == manifest.ModeProxy
 	s.proxyOrCache(w, r, s.typeStore(manifest.TypeCargo), s3Key, upstream, manifest.TypeCargo, crate, crate, false, forceProxy)
 }
@@ -127,7 +127,7 @@ func (s *Server) handleCargoDownload(w http.ResponseWriter, r *http.Request, p s
 
 	setCacheImmutable(w, path.Base(p))
 	upstream := strings.TrimRight(s.cfg.CargoUpstream, "/") + "/" + crate + "/" + version + "/download"
-	s3Key := "cargo/crates/" + crate + "-" + version + ".crate"
+	s3Key := manifest.CargoCrateKey(crate, version)
 	forceProxy := pm == nil || packageMode(pm) == manifest.ModeProxy
 	// A hosted crate reads from the backend its entry records; a proxied one
 	// has no entry to record anything, so it caches under the type rule.
