@@ -588,3 +588,40 @@ func isBinaryContentType(ct string) bool {
 		strings.HasPrefix(ct, "video/") ||
 		strings.Contains(ct, "debian")
 }
+
+// requestScheme reports the scheme the client used, which is not always the
+// one this listener answered on. Behind a TLS-terminating proxy r.TLS is nil
+// on every request, so reading it alone prints http:// for a deployment that
+// is https everywhere a client can see.
+//
+// X-Forwarded-Proto is honored only from a trusted peer, on the same rule
+// resolveClientIP applies to X-Real-IP: a header any client can set decides
+// nothing by itself. An untrusted peer gets the listener's own answer.
+func requestScheme(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+	proto := r.Header.Get("X-Forwarded-Proto")
+	if proto == "" || !peerIsTrusted(r, defaultTrustedNets()) {
+		return "http"
+	}
+	if i := strings.Index(proto, ","); i >= 0 {
+		proto = proto[:i]
+	}
+	switch p := strings.ToLower(strings.TrimSpace(proto)); p {
+	case "http", "https":
+		return p
+	}
+	return "http"
+}
+
+// peerIsTrusted reports whether the direct peer is one of nets, ignoring every
+// forwarded header. It answers "may this connection speak for another".
+func peerIsTrusted(r *http.Request, nets []*net.IPNet) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && isTrusted(ip, nets)
+}

@@ -310,6 +310,47 @@ func TestDefaultManifestDirIsAbsolute(t *testing.T) {
 	}
 }
 
+// public_url lands on the same chain as every other key: flag, then env, then
+// file. There is no built-in tail, and the empty answer is the point — a
+// server behind a proxy sees a loopback listener and cannot derive the URL an
+// operator copies, so anything it invented would be wrong on exactly the
+// deployment public_url exists for.
+func TestResolvePublicURL(t *testing.T) {
+	cases := []struct {
+		name      string
+		flag, env string
+		file      string
+		want      string
+	}{
+		{name: "nothing set"},
+		{name: "file only", file: "https://file.example.com", want: "https://file.example.com"},
+		{name: "env beats file", env: "https://env.example.com", file: "https://file.example.com", want: "https://env.example.com"},
+		{name: "flag beats env", flag: "https://flag.example.com", env: "https://env.example.com", file: "https://file.example.com", want: "https://flag.example.com"},
+		{name: "trailing slash trimmed", file: "https://file.example.com/", want: "https://file.example.com"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(EnvPublicURL, tc.env)
+			cfg := &Config{PublicURL: tc.file}
+			if got := cfg.ResolvePublicURL(tc.flag); got != tc.want {
+				t.Errorf("ResolvePublicURL(%q) = %q, want %q", tc.flag, got, tc.want)
+			}
+		})
+	}
+}
+
+// Resolution must not write itself back. Save marshals the Config, so a
+// resolved value stored on the struct becomes a file key the operator never
+// typed and cannot unset from the environment afterwards.
+func TestResolvePublicURLDoesNotMutate(t *testing.T) {
+	t.Setenv(EnvPublicURL, "https://env.example.com")
+	cfg := &Config{}
+	_ = cfg.ResolvePublicURL("https://flag.example.com")
+	if cfg.PublicURL != "" {
+		t.Errorf("PublicURL = %q after resolution, want it untouched", cfg.PublicURL)
+	}
+}
+
 func swap(t *testing.T, target *string, val string) {
 	t.Helper()
 	prev := *target

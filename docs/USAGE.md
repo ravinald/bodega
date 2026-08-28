@@ -499,6 +499,7 @@ A default config is created on first run. All fields are optional.
   "tls_autocert": false,
   "tls_domain": "",
   "listen_addr": ":8080",
+  "public_url": "",
   "proxy_cache_enabled": false,
   "metadata_ttl": "1h",
   "gomod_upstream": "https://proxy.golang.org",
@@ -514,6 +515,10 @@ A default config is created on first run. All fields are optional.
 ```
 
 `apt_codename` is the default suite for apt manifest entries that name no `suites`; `apt_suites` is the full set served under `/apt/dists/`, and `apt_codename` is always included in it whether listed or not. A suite name containing `/` is rejected at load.
+
+`public_url` is the base URL clients reach the server at, and it decides the scheme and host of every client snippet bodega emits: the `bodega serve` startup banner, the TUI details pane, the web UI, and `GET /api/v1/status`. Resolution is `--public-url` > `$BODEGA_PUBLIC_URL` > `public_url`, with no built-in default.
+
+Set it whenever a reverse proxy terminates TLS or publishes a different hostname. bodega then sees a loopback listener with both TLS keys empty, so `tls_cert`/`tls_key` describe the proxy's back end and nothing describes the URL an operator would copy. Deriving the scheme from that pair is what printed `http://` on the sources line of a deployment that is `https://` everywhere a client can see. With `public_url` unset, callers holding a request answer from the request (honoring `X-Forwarded-Proto` from a trusted peer), and callers with none print `<bodega-host>:8080` as a placeholder and say that it is one.
 
 `timezone` sets the display timezone for audit queries (default UTC) and `audit_events` limits which event types are recorded (empty records all).
 
@@ -821,6 +826,8 @@ Components: main
 Signed-By: /etc/apt/keyrings/bodega-archive-keyring.gpg
 ```
 
+The stanza above is the shape, not the values. Your instance prints its own on the `bodega serve` startup banner and serves it on `GET /api/v1/status`, filled in from what the running process holds: the suites it answers for, the URL from `public_url`, and `Signed-By:` or the `[trusted=yes]` fallback according to whether a signing key is loaded. Copy that one. The TUI details pane and the web UI render the same block from the same source, so the three cannot disagree.
+
 Install the keyring first. The `.gpg` route serves the dearmored form `Signed-By:` takes directly, so the client needs no `gpg` binary:
 
 ```bash
@@ -996,9 +1003,15 @@ All responses include the following headers regardless of TLS:
 - `Content-Security-Policy: default-src 'self'; ...`
 - `Referrer-Policy: strict-origin-when-cross-origin`
 
-### Behind nginx
+### Behind a reverse proxy
 
-bodega is designed to work behind nginx. The server extracts real client IPs from `X-Real-IP` and `X-Forwarded-For` headers when the request comes from a trusted private network (RFC 1918 + loopback).
+bodega is designed to run behind nginx or Apache. The server extracts real client IPs from `X-Real-IP` and `X-Forwarded-For` headers when the request comes from a trusted private network (RFC 1918 + loopback).
+
+**Set `public_url` on the bodega side of every one of these deployments.** The proxy terminates TLS and bodega listens on loopback with no certificate, so every client-facing URL bodega emits — the startup banner, the TUI pane, the web UI, `/api/v1/status` — is derived from a listener that answers `http://127.0.0.1:8080`. `X-Forwarded-Proto` fixes the requests bodega can see; `public_url` fixes the ones it cannot, and it is the only thing that knows the hostname the proxy publishes.
+
+```json
+{ "public_url": "https://bodega.example.com" }
+```
 
 Minimal nginx config:
 ```nginx
@@ -1019,6 +1032,26 @@ server {
 }
 ```
 
+Minimal Apache config. The two `RequestHeader unset` lines are a security control rather than boilerplate: bodega returns `X-Real-IP` verbatim from any loopback peer, Apache proxies from `127.0.0.1`, and `admin_permit_cidr` defaults to loopback only — so without them a remote client setting `X-Real-IP: 127.0.0.1` reaches the mutation API with no token.
+
+```apache
+<VirtualHost *:443>
+    ServerName bodega.example.com
+
+    SSLEngine on
+    SSLCertificateFile /etc/letsencrypt/live/bodega.example.com/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/bodega.example.com/privkey.pem
+
+    RequestHeader unset X-Real-IP
+    RequestHeader unset X-Forwarded-For
+    RequestHeader set X-Forwarded-Proto "https"
+
+    ProxyPreserveHost On
+    ProxyPass        / http://127.0.0.1:8080/
+    ProxyPassReverse / http://127.0.0.1:8080/
+</VirtualHost>
+```
+
 ---
 
 ## REST API
@@ -1032,10 +1065,39 @@ All API responses are JSON. The full API is documented in [OpenAPI 3.0 format](.
 | GET | `/api/v1/packages` | All entries across all types |
 | GET | `/api/v1/packages/{type}` | Entries for one type |
 | GET | `/api/v1/packages/{type}/{name}` | Single entry details |
-| GET | `/api/v1/status` | Health check with entry counts and S3 probe |
+| GET | `/api/v1/status` | Health check with entry counts, S3 probe, and the apt client state |
 | GET | `/api/v1/config` | Non-sensitive config (bucket, region, manifest_dir) |
 | GET | `/api/v1/audit` | Query audit events (supports filters) |
 | GET | `/healthz` | Health probe (returns `ok`) |
+
+#### The `apt` block on `/api/v1/status`
+
+`/api/v1/status` carries an `apt` object reporting how apt clients reach this server. It is the answer to what an emitter would otherwise guess at, and the reason the banner, the TUI and the web UI agree.
+
+```json
+"apt": {
+  "signed": true,
+  "fingerprints": ["133A3F2CFEA9512985C769DEC88A9A63077198DA"],
+  "keyring_url": "/apt/bodega-archive-keyring.gpg",
+  "suites": ["jammy", "noble"],
+  "public_url": "https://bodega.example.com",
+  "sources": [
+    {
+      "signed": true,
+      "suite": "jammy",
+      "uri": "https://bodega.example.com/apt/",
+      "deb822": "Types: deb\nURIs: https://bodega.example.com/apt/\nSuites: jammy\nComponents: main\nSigned-By: /etc/apt/keyrings/bodega-archive-keyring.gpg",
+      "one_line": "deb [signed-by=/etc/apt/keyrings/bodega-archive-keyring.gpg] https://bodega.example.com/apt/ jammy main",
+      "notes": ["Install the keyring from /apt/bodega-archive-keyring.gpg first. …"]
+    }
+  ]
+}
+```
+
+- `signed`, `fingerprints` and `keyring_url` come from the key the process has **loaded**, not from a file on disk. A key installed but not yet reloaded reports as absent, which is what clients see.
+- `sources` carries one rendered block per served suite, so a caller holding a package selects the block for that package's suite rather than composing a line.
+- `public_url` is the configured value when there is one. With none set it is the origin of the request that asked, resolved through `X-Forwarded-Proto` when the peer is trusted.
+- `notes` are the consequences of the form above them: the permanence of `[trusted=yes]`, or the fact that the first keyring fetch is authenticated by TLS alone.
 
 ### Mutation endpoints
 
