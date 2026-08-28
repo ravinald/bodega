@@ -55,7 +55,13 @@ const KeyFileName = "apt-signing.key"
 
 // SystemKeyPath is the packaged location for a key not delivered as a
 // systemd credential.
-const SystemKeyPath = "/etc/bodega/" + KeyFileName
+//
+// A var rather than a const so a test can determine the whole search order.
+// Position 1 is an environment variable and position 3 derives from config, so
+// this was the one entry a test could not steer, and a test that could not
+// steer it passed or failed on whether the host running it had bodega
+// installed. Nothing outside a test ever assigns it.
+var SystemKeyPath = "/etc/bodega/" + KeyFileName
 
 // CredentialsEnv is the directory systemd's LoadCredential= populates. It is a
 // per-service tmpfs the unit itself cannot write and other services cannot

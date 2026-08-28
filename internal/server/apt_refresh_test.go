@@ -1,7 +1,9 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +13,10 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
+
+	"github.com/ravinald/bodega/internal/aptsign"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/storage"
@@ -171,5 +177,156 @@ func TestPoolListFailureStillLeavesAnErrorPath(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "no snapshot has been built") {
 		t.Errorf("503 body does not say what failed: %q", w.Body.String())
+	}
+}
+
+// TestReloadWalksTheRotationRunbook executes docs/USAGE.md's rotation
+// procedure against a live server: rotate, reload, retire, reload. Each reload
+// stands in for the systemctl reload the runbook calls, and the assertions are
+// what a client sees at each step.
+//
+// The failure this guards is deferred and arrives all at once. A reload that
+// did not re-read the key would leave the served keyring carrying the outgoing
+// key alone through the whole window, so every client that re-fetched during it
+// would install old-only — and then fail apt update together at the next
+// restart, when the incoming key alone starts signing.
+func TestReloadWalksTheRotationRunbook(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(aptsign.CredentialsEnv, dir)
+	keyPath := filepath.Join(dir, aptsign.KeyFileName)
+
+	outgoing := writeTestKey(t, keyPath)
+	s, _, _ := refreshTestServer(t)
+
+	if got := servedFingerprints(t, s); len(got) != 1 || got[0] != outgoing.Fingerprints()[0] {
+		t.Fatalf("served keyring at startup = %v, want the outgoing key alone", got)
+	}
+	assertInReleaseVerifies(t, s, outgoing)
+
+	// bodega apt key generate --rotate
+	incoming, err := aptsign.Generate("bodega test incoming", "test@example.invalid", aptsign.KeyEd25519)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	outgoing.Add(incoming)
+	if err := outgoing.WritePrivate(keyPath); err != nil {
+		t.Fatalf("WritePrivate: %v", err)
+	}
+
+	// systemctl reload bodega
+	s.reload(t.Context())
+
+	if got := servedFingerprints(t, s); len(got) != 2 {
+		t.Fatalf("served keyring after the rotate reload = %v, want both keys", got)
+	}
+	// Either key alone verifies, which is what carries a client that has
+	// fetched only one of them.
+	assertInReleaseVerifies(t, s, incoming)
+
+	// bodega apt key retire <outgoing>, then reload again.
+	if err := incoming.WritePrivate(keyPath); err != nil {
+		t.Fatalf("WritePrivate: %v", err)
+	}
+	s.reload(t.Context())
+
+	got := servedFingerprints(t, s)
+	if len(got) != 1 || got[0] != incoming.Fingerprints()[0] {
+		t.Fatalf("served keyring after the retire reload = %v, want the incoming key alone", got)
+	}
+	assertInReleaseVerifies(t, s, incoming)
+}
+
+// TestReloadKeepsSigningWhenTheKeyGoesBad covers the operator error mid-window.
+// A client configured with Signed-By: has no unsigned fallback, so a reload
+// that cannot read a key must leave the loaded one signing rather than take the
+// whole archive unsigned on a transient fault.
+func TestReloadKeepsSigningWhenTheKeyGoesBad(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(aptsign.CredentialsEnv, dir)
+	keyPath := filepath.Join(dir, aptsign.KeyFileName)
+
+	kr := writeTestKey(t, keyPath)
+	s, _, _ := refreshTestServer(t)
+
+	if err := os.WriteFile(keyPath, []byte("not a key\n"), 0o600); err != nil {
+		t.Fatalf("corrupt key: %v", err)
+	}
+	s.reload(t.Context())
+	if got := servedFingerprints(t, s); len(got) != 1 || got[0] != kr.Fingerprints()[0] {
+		t.Fatalf("served keyring after an unreadable key = %v, want the loaded key still installed", got)
+	}
+	assertInReleaseVerifies(t, s, kr)
+
+	if err := os.Remove(keyPath); err != nil {
+		t.Fatalf("remove key: %v", err)
+	}
+	s.reload(t.Context())
+	if got := servedFingerprints(t, s); len(got) != 1 {
+		t.Errorf("served keyring after the key was deleted = %v; going unsigned is a restart, not a reload", got)
+	}
+}
+
+func writeTestKey(t *testing.T, path string) *aptsign.KeyRing {
+	t.Helper()
+	kr, err := aptsign.Generate("bodega test archive", "test@example.invalid", aptsign.KeyEd25519)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if err := kr.WritePrivate(path); err != nil {
+		t.Fatalf("WritePrivate: %v", err)
+	}
+	return kr
+}
+
+// servedFingerprints reads the keyring route rather than the Server field, so
+// the assertion is what a client fetches.
+func servedFingerprints(t *testing.T, s *Server) []string {
+	t.Helper()
+	w := httptest.NewRecorder()
+	s.handleAptKeyring(w, httptest.NewRequest(http.MethodGet, "/apt/bodega-archive-keyring.gpg", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET bodega-archive-keyring.gpg = %d, want 200", w.Code)
+	}
+	el, err := openpgp.ReadKeyRing(bytes.NewReader(w.Body.Bytes()))
+	if err != nil {
+		t.Fatalf("served keyring does not parse: %v", err)
+	}
+	out := make([]string, 0, len(el))
+	for _, e := range el {
+		out = append(out, strings.ToUpper(hex.EncodeToString(e.PrimaryKey.Fingerprint)))
+	}
+	return out
+}
+
+// assertInReleaseVerifies checks the served InRelease against one key alone,
+// which is the client that holds only that half of a rotation window.
+func assertInReleaseVerifies(t *testing.T, s *Server, kr *aptsign.KeyRing) {
+	t.Helper()
+	snap := s.aptSnap.Load()
+	if snap == nil || snap.suites["noble"] == nil {
+		t.Fatal("no snapshot")
+	}
+	signed := snap.suites["noble"].inRelease
+	if len(signed) == 0 {
+		t.Fatal("InRelease is empty; the suite is serving unsigned")
+	}
+	block, _ := clearsign.Decode(signed)
+	if block == nil {
+		t.Fatal("InRelease is not a clearsigned document")
+	}
+	pub, err := kr.PublicKey()
+	if err != nil {
+		t.Fatalf("PublicKey: %v", err)
+	}
+	el, err := openpgp.ReadArmoredKeyRing(bytes.NewReader(pub))
+	if err != nil {
+		t.Fatalf("ReadArmoredKeyRing: %v", err)
+	}
+	var sigs bytes.Buffer
+	if _, err := sigs.ReadFrom(block.ArmoredSignature.Body); err != nil {
+		t.Fatalf("read signature: %v", err)
+	}
+	if _, err := openpgp.CheckDetachedSignature(el, bytes.NewReader(block.Bytes), bytes.NewReader(sigs.Bytes()), nil); err != nil {
+		t.Errorf("InRelease does not verify under %s alone: %v", kr.Fingerprints()[0], err)
 	}
 }

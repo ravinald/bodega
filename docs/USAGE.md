@@ -868,7 +868,9 @@ The search order, first hit wins:
 | 2 | `/etc/bodega/apt-signing.key` | packaged location |
 | 3 | `<storage_path>/apt-signing.key` | beside the artifacts |
 
-A key file readable beyond its owner is **refused**, not warned about, and the error names the `chmod`. A key that is present and unparsable is logged at `ERROR` and the repository stays unsigned: apt reports nothing in that case, since a missing `InRelease` is indistinguishable from an archive that never had one, so the journal is the only place it can surface.
+A key file readable beyond its owner is **refused**, not warned about, and the error names the `chmod`. A key that is present and unusable is logged at `ERROR` and the repository stays unsigned: apt reports nothing in that case, since a missing `InRelease` is indistinguishable from an archive that never had one, so the journal is the only place it can surface.
+
+"Unusable" includes a key the service cannot read. The search stops at the first path that **exists**, not the first it can open, so a root-owned `/etc/bodega/apt-signing.key` left in place while the service runs as `bodega` produces that `ERROR` on every start. To serve unsigned deliberately, move the key aside rather than only removing whatever pointed at it.
 
 The key carries **no passphrase**, deliberately. On an unattended service the passphrase has to be readable from somewhere with the same permissions as the key, so it adds a failure mode and protects nothing. File permissions are the boundary.
 
@@ -880,13 +882,15 @@ bodega apt key export                # armored public key
 bodega apt key export --keyring      # dearmored, for /etc/apt/keyrings/
 ```
 
-`apt_signing_name` and `apt_signing_email` in `config.json` supply the UID; `--name` and `--email` override them. The server must be restarted or sent `SIGHUP` before a new key takes effect.
+`apt_signing_name` and `apt_signing_email` in `config.json` supply the UID; `--name` and `--email` override them. A new key takes effect on `systemctl reload bodega` (`SIGHUP`), which re-reads the key file, re-renders the served keyring and re-signs the index in one step. The rotation runbook below depends on that.
+
+One asymmetry: a reload never takes signing **away**. If the key has become unreadable or has gone missing, the previously loaded key keeps signing and the fault goes to the journal, because a client configured with `Signed-By:` has no unsigned fallback and would fail `apt update` outright. Going unsigned is a restart.
 
 Signing happens once per snapshot rebuild, not per request. `InRelease` is the clearsigned form of `Release`, and `Release.gpg` is the armored detached signature. The clearsigned body is byte-identical to `Release`, so a verifying client and a `[trusted=yes]` client read the same index. Both use SHA-512: apt's `gpgv` rejects SHA-1 on current releases.
 
 #### Rotation
 
-apt does not refresh keyrings on its own, so replacing a key outright breaks every client that has not updated. Rotate across a transition window instead: both keys sign, both public keys are published, and apt accepts an `InRelease` when any one signature verifies.
+apt does not refresh keyrings on its own, so replacing a key outright breaks every client that has not updated. Rotate across a transition window instead: both keys sign, and both public keys are published.
 
 ```bash
 bodega apt key generate --rotate     # the new key joins the old one
@@ -896,7 +900,13 @@ bodega apt key retire <old-fingerprint>
 systemctl reload bodega
 ```
 
-`retire` refuses to remove the last key: a file with no keys loads as an error and takes the repository unsigned, which apt reports as nothing at all.
+`retire` takes the full 40-character fingerprint or a prefix of at least 16 characters, and refuses a prefix matching more than one key. It also refuses to remove the last key: a file with no keys loads as an error and takes the repository unsigned, which apt reports as nothing at all.
+
+**"apt accepts an `InRelease` when any one signature verifies" holds only for the signature it reaches first.** Measured against a dual-signed `InRelease`, gpgv 2.4.4 (ubuntu:24.04) walks the whole set and reports `Good signature`, while gpgv 2.5.21 stops at the first `NO_PUBKEY` and exits 2 without evaluating the second signature. It is ordering, not algorithm: RSA-4096 and Ed25519 behave the same way in either position.
+
+So signature order decides who the window covers, and bodega signs **oldest key first**: `--rotate` appends, so the incoming key always signs last. That is the correct order, because the window exists for clients that have **not** updated — they hold the outgoing key, reach its signature first, and verify on both gpgv versions.
+
+The client it does not cover is one holding the incoming key and not the outgoing one, on gpgv 2.5 or later. That client must fetch the **full served keyring**, `/apt/bodega-archive-keyring.gpg`, which carries both keys for as long as the window is open — not the incoming key on its own. Delivering a single key out of band during a rotation is the one thing that breaks here.
 
 #### Unsigned fallback
 
@@ -944,7 +954,7 @@ A rebuild happens on:
 | Trigger | Notes |
 |---------|-------|
 | Server start | Before the listener binds, so no request ever sees an empty index |
-| `SIGHUP` | After the manifest reload. Every mutating `bodega pkg` verb sends one |
+| `SIGHUP` | After the manifest reload and the signing-key reload. Every mutating `bodega pkg` verb sends one |
 | A mutation-API write to an apt entry | `POST`, `DELETE`, and the hide and freeze toggles |
 | A ticker | Hourly once an index exists, every 15 seconds until one does |
 

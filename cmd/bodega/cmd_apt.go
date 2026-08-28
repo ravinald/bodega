@@ -62,15 +62,25 @@ writable path the server searches.
 --rsa produces RSA-4096 instead, for clients whose gnupg predates 2.1 and
 cannot parse an EdDSA key at all.
 
---rotate appends the new key to the existing file rather than replacing it.
-Both keys then sign every rebuild, and both public keys are published: apt
-accepts an InRelease when any one signature verifies, so clients holding either
-keyring keep working. Once every client has fetched the new key, close the
-window with 'bodega apt key retire <old-fingerprint>'. A switch without the
-window breaks every client that has not updated its keyring, and apt does not
-refresh keyrings on its own.
+--rotate appends the new key to the existing file rather than replacing it, so
+the outgoing key stays first and the incoming one signs last. Both keys sign
+every rebuild and both public keys are published, which is what carries clients
+that have not updated their keyring across the window. Close it with
+'bodega apt key retire <old-fingerprint>' once they have. A switch without the
+window breaks every client that has not updated, and apt does not refresh
+keyrings on its own.
 
-The server must be restarted or sent SIGHUP for a new key to take effect.`,
+The order is deliberate. Signature order is what decides whether a client with
+only one of the two keys can verify: gpgv 2.4 walks the whole signature set,
+but gpgv 2.5 stops at the first key it does not hold and exits without looking
+at the rest. Oldest-first is therefore the correct order, because the window
+exists for clients that have not updated. A client holding only the incoming
+key must fetch the full served keyring at /apt/bodega-archive-keyring.gpg,
+which carries both for as long as the window is open, rather than the incoming
+key on its own.
+
+Reload the server (systemctl reload bodega, or SIGHUP) for a new key to take
+effect; the reload re-reads the key file and re-signs the index with it.`,
 		Example: `  bodega apt key generate
   bodega apt key generate --rsa --name "acme archive" --email ops@acme.example
   bodega apt key generate --rotate`,
@@ -124,7 +134,7 @@ The server must be restarted or sent SIGHUP for a new key to take effect.`,
 			fmt.Println("\nPublish this fingerprint out of band. A client's first fetch of the")
 			fmt.Println("public key is authenticated by TLS alone; the fingerprint is what")
 			fmt.Println("turns that into a check somebody can actually make.")
-			fmt.Println("\nRestart bodega (or send SIGHUP) to sign with it.")
+			fmt.Println("\nReload bodega (systemctl reload bodega, or SIGHUP) to sign with it.")
 			return nil
 		},
 	}
@@ -233,12 +243,21 @@ func newAptKeyRetireCmd(gf *globalFlags) *cobra.Command {
 		Long: `retire drops one key from the signing file. Use it to close a rotation window
 after every client has fetched the new keyring.
 
+<fingerprint> is the full 40-character fingerprint or a prefix of at least 16
+characters, and a prefix matching more than one key is refused rather than
+resolved. Retiring the wrong key closes the window early and breaks every
+client that has not fetched the incoming key yet, so a short argument is not
+worth what it costs. 'bodega apt key show' prints the fingerprints.
+
 It refuses to remove the last key: a file with no keys loads as an error and
 takes the repository unsigned, which apt reports as nothing at all.
 
-The server must be restarted or sent SIGHUP for the change to take effect.`,
-		Example: `  bodega apt key retire 5E4A2C0F9D1B7A3E6C8F0B2D4A6E8C0F1A3B5D7E`,
-		Args:    cobra.ExactArgs(1),
+Reload the server (systemctl reload bodega, or SIGHUP) for the change to take
+effect. The reload re-reads the key file, so the process stops signing with the
+retired key and the served keyring drops it in the same step.`,
+		Example: `  bodega apt key retire 5E4A2C0F9D1B7A3E6C8F0B2D4A6E8C0F1A3B5D7E
+  bodega apt key retire 5E4A2C0F9D1B7A3E`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig(gf)
 			if err != nil {
@@ -248,14 +267,15 @@ The server must be restarted or sent SIGHUP for the change to take effect.`,
 			if err != nil {
 				return err
 			}
-			if err := kr.Retire(args[0]); err != nil {
+			retired, err := kr.Retire(args[0])
+			if err != nil {
 				return err
 			}
 			if err := kr.WritePrivate(kr.Path()); err != nil {
 				return err
 			}
-			fmt.Printf("Retired %s from %s. Remaining: %v\n", args[0], kr.Path(), kr.Fingerprints())
-			fmt.Println("Restart bodega (or send SIGHUP) to stop signing with the retired key.")
+			fmt.Printf("Retired %s from %s. Remaining: %v\n", retired, kr.Path(), kr.Fingerprints())
+			fmt.Println("Reload bodega (systemctl reload bodega, or SIGHUP) to stop signing with it.")
 			return nil
 		},
 	}

@@ -36,7 +36,9 @@ Group=bodega
 WorkingDirectory=/var/lib/bodega
 
 ExecStart=/usr/local/bin/bodega serve
-# SIGHUP reloads manifests without restarting the server.
+# SIGHUP reloads the manifests and re-reads the apt signing key without
+# restarting the server. The key rotation runbook in docs/USAGE.md calls this
+# twice and depends on both halves.
 ExecReload=/bin/kill -HUP $MAINPID
 
 # Point bodega at the system config. Listen address and log level live
@@ -50,11 +52,19 @@ Environment=BODEGA_CONFIG_FILE=/etc/bodega/config.json
 # /etc/bodega/apt-signing.key with no config change.
 #
 # The source file must be mode 0600 or tighter — bodega refuses to load a key
-# readable beyond its owner. Comment this out to serve the repository
-# unsigned, which is supported: signed and unsigned coexist at the same URLs.
+# readable beyond its owner.
 #
 #   sudo bodega apt key generate
 #   sudo chown root:root /etc/bodega/apt-signing.key
+#
+# Serving the repository unsigned is supported — signed and unsigned coexist at
+# the same URLs — but it takes two steps, not one. Commenting out LoadCredential=
+# only drops the key out of the search order's first position; /etc/bodega is
+# the second, and a root-owned 0600 key this service cannot open is an error
+# rather than an absence, logged as "apt signing key present but unusable" on
+# every start. Move the key aside as well:
+#
+#   sudo mv /etc/bodega/apt-signing.key /etc/bodega/apt-signing.key.disabled
 #
 LoadCredential=apt-signing.key:/etc/bodega/apt-signing.key
 
