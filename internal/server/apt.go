@@ -16,6 +16,7 @@ import (
 	"net/http"
 
 	"github.com/ravinald/bodega/internal/aptsign"
+	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/storage"
 )
@@ -509,6 +510,82 @@ func (a *aptSigning) ring() []byte {
 	return a.keyring
 }
 
+// aptStatus is what the running server knows about how apt clients reach it,
+// and nothing else in the tree can derive: whether an index signature exists,
+// which suites answer, and the URL in force. Every wrong sources line this
+// repository has shipped was an emitter guessing at one of those three.
+type aptStatus struct {
+	Signed       bool                 `json:"signed"`
+	Fingerprints []string             `json:"fingerprints,omitempty"`
+	KeyringURL   string               `json:"keyring_url,omitempty"`
+	Suites       []string             `json:"suites"`
+	PublicURL    string               `json:"public_url"`
+	Sources      []aptsources.Sources `json:"sources"`
+}
+
+// aptSourcesState reports the client-facing apt state, with the public URL
+// resolved for the request that asked.
+//
+// public_url wins when the operator set one: only they know the name a proxy
+// publishes this server under. With none set the request answers for itself,
+// which is right for the web UI running in a browser and honors
+// X-Forwarded-Proto, so it stays right behind a proxy that terminates TLS on
+// a different hostname. r may be nil for a caller with no request in hand,
+// such as the startup banner; the renderer then emits a placeholder host.
+func (s *Server) aptSourcesState(r *http.Request) aptsources.State {
+	st := aptsources.State{
+		PublicURL:   s.cfg.ResolvePublicURL(""),
+		LocalScheme: s.localScheme(),
+		Suites:      s.cfg.ServedAptSuites(),
+	}
+	if st.PublicURL == "" && r != nil {
+		st.PublicURL = requestScheme(r) + "://" + r.Host
+	}
+	if sign := s.aptSign.Load(); sign != nil {
+		st.Signed = true
+		st.Fingerprints = sign.signer.Fingerprints()
+	}
+	return st
+}
+
+// aptStatusFor renders one sources block per served suite, so a caller holding
+// a package picks the block for that package's suite instead of composing a
+// line of its own.
+func (s *Server) aptStatusFor(r *http.Request) aptStatus {
+	st := s.aptSourcesState(r)
+	out := aptStatus{
+		Signed:       st.Signed,
+		Fingerprints: st.Fingerprints,
+		Suites:       st.Suites,
+		PublicURL:    st.PublicURL,
+		Sources:      make([]aptsources.Sources, 0, len(st.Suites)),
+	}
+	if st.Signed {
+		out.KeyringURL = aptsources.KeyringRoute
+	}
+	if len(st.Suites) == 0 {
+		return aptStatus{Signed: out.Signed, Fingerprints: out.Fingerprints, KeyringURL: out.KeyringURL,
+			Suites: []string{}, PublicURL: out.PublicURL, Sources: []aptsources.Sources{aptsources.Render(st)}}
+	}
+	for _, suite := range st.Suites {
+		one := st
+		one.Suites = []string{suite}
+		out.Sources = append(out.Sources, aptsources.Render(one))
+	}
+	return out
+}
+
+// localScheme is the scheme this process's own listener answers on. It is a
+// fallback for a caller with no request and no public_url, never a description
+// of how a client reaches the server: behind a proxy both TLS keys are empty
+// here and every client still speaks https.
+func (s *Server) localScheme() string {
+	if s.cfg.TLSCert != "" && s.cfg.TLSKey != "" {
+		return "https"
+	}
+	return "http"
+}
+
 // loadAptSigner installs the signing key, if one is present, and renders the
 // two public forms the keyring routes serve. It runs at startup and again on
 // every SIGHUP, which is what makes the published rotation runbook work.
@@ -934,4 +1011,25 @@ func (s *Server) requireStorage(w http.ResponseWriter, store storage.ObjectStore
 		return false
 	}
 	return true
+}
+
+// aptSourcesBanner renders the apt client stanza for the startup banner. It
+// runs after the signing key is loaded and the suites are resolved, so it
+// prints what this process will actually serve rather than the example the
+// command's help text used to carry.
+//
+// No request is in hand here, so a server with no public_url set prints a
+// placeholder host and the note that says so.
+func (s *Server) aptSourcesBanner() string {
+	src := aptsources.Render(s.aptSourcesState(nil))
+	var b strings.Builder
+	b.WriteString("\n/etc/apt/sources.list.d/bodega.sources:\n")
+	for _, line := range strings.Split(src.Deb822, "\n") {
+		b.WriteString("  " + line + "\n")
+	}
+	for _, note := range src.Notes {
+		b.WriteString("  # " + note + "\n")
+	}
+	b.WriteString("\n")
+	return b.String()
 }

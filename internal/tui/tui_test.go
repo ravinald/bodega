@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/inventory"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -1334,8 +1335,10 @@ func TestClientURLSchemeFollowsTLSConfig(t *testing.T) {
 	_ = store.AddVersion(ctx, manifest.TypeGit, "org/repo", manifest.VersionEntry{Ref: "v1.0.0"})
 	_ = store.AddVersion(ctx, manifest.TypeBinary, "tool", manifest.VersionEntry{Version: "1.0.0", Filename: "tool"})
 
+	// apt is absent on purpose: a sources line is not a URL, and it needs the
+	// served suites and the signing state as well as the base. See
+	// TestAptSourcesFollowsServerState.
 	entries := []struct{ typ, name string }{
-		{manifest.TypeApt, "pkg-a"},
 		{manifest.TypePypi, "pkg-b"},
 		{manifest.TypeGomod, "example.com/m"},
 		{manifest.TypeNpm, "pkg-c"},
@@ -1369,7 +1372,70 @@ func TestClientURLSchemeFollowsTLSConfig(t *testing.T) {
 	// A cert with no key does not start a TLS listener, so it must not
 	// advertise one.
 	halfCfg := &config.Config{TLSCert: "/etc/bodega/cert.pem"}
-	if got := clientURL(halfCfg, store, manifest.TypeApt, "pkg-a"); !strings.Contains(got, "http://") {
+	if got := clientURL(halfCfg, store, manifest.TypePypi, "pkg-b"); !strings.Contains(got, "http://") {
 		t.Errorf("cert without key: want http://, got %q", got)
+	}
+
+	// public_url outranks the TLS pair everywhere, not only on the apt line.
+	// The pair describes this host's listener; behind a proxy both keys are
+	// empty here and every client still speaks https.
+	proxiedCfg := &config.Config{PublicURL: "https://bodega.example.com"}
+	for _, e := range entries {
+		got := clientURL(proxiedCfg, store, e.typ, e.name)
+		if !strings.Contains(got, "https://bodega.example.com/") {
+			t.Errorf("%s behind a proxy: want the public URL, got %q", e.typ, got)
+		}
+	}
+}
+
+// The apt pane emits what the server serves: the package's own suite, the
+// public URL in force, and the form the signing state calls for. Each of the
+// three was guessed at once, and each guess shipped as a caveat.
+func TestAptSourcesFollowsServerState(t *testing.T) {
+	pm := &manifest.PackageManifest{
+		Name: "pkg-a",
+		Versions: []manifest.VersionEntry{
+			{Version: "1.0", Suites: []string{"jammy"}},
+		},
+	}
+	cfg := &config.Config{
+		AptCodename: "noble",
+		AptSuites:   []string{"noble", "jammy"},
+		PublicURL:   "https://bodega.example.com",
+	}
+
+	signed := aptSources(cfg, pm, true)
+	if !strings.Contains(signed.OneLine, " jammy main") {
+		t.Errorf("suite comes from the package, not the default: %q", signed.OneLine)
+	}
+	if !strings.Contains(signed.OneLine, "https://bodega.example.com/apt/") {
+		t.Errorf("URL comes from public_url: %q", signed.OneLine)
+	}
+	if strings.Contains(signed.OneLine, "trusted=yes") {
+		t.Errorf("signed instance told the operator to turn verification off: %q", signed.OneLine)
+	}
+	if !strings.Contains(signed.Deb822, "Signed-By: ") {
+		t.Errorf("signed instance emits no Signed-By:\n%s", signed.Deb822)
+	}
+
+	unsigned := aptSources(cfg, pm, false)
+	if !strings.Contains(unsigned.OneLine, "[trusted=yes]") {
+		t.Errorf("unsigned instance emits no fallback: %q", unsigned.OneLine)
+	}
+	if unsigned.Note() == "" {
+		t.Error("unsigned instance emits [trusted=yes] with no consequence beside it")
+	}
+
+	// No public_url and no local TLS: the host is a placeholder, and the pane
+	// has to say so rather than let it read as an address.
+	bare := aptSources(&config.Config{AptCodename: "noble"}, nil, false)
+	if !strings.Contains(bare.OneLine, aptsources.PlaceholderHost) {
+		t.Errorf("no public_url: want a placeholder host, got %q", bare.OneLine)
+	}
+	if !strings.Contains(bare.Note(), "public_url") {
+		t.Errorf("placeholder host with no note: %q", bare.Note())
+	}
+	if !strings.Contains(bare.OneLine, " noble main") {
+		t.Errorf("no package in hand: want the server default suite, got %q", bare.OneLine)
 	}
 }

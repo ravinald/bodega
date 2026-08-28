@@ -395,7 +395,7 @@ The server exposes a mutation API at `/api/v1/`:
 - `GET /api/v1/packages/{type}/{name}` - Single entry
 - `POST /api/v1/packages/{type}` - Create entry
 - `DELETE /api/v1/packages/{type}/{name}` - Delete entry
-- `GET /api/v1/status` - Health and entry counts
+- `GET /api/v1/status` - Health, entry counts, and the apt client state (signing, served suites, public URL, rendered sources)
 - `GET /api/v1/config` - Non-sensitive configuration
 
 Frozen entries cannot be deleted through the API.

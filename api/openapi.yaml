@@ -397,7 +397,11 @@ paths:
   /api/v1/status:
     get:
       summary: Server status
-      description: Returns health status, entry counts per type, and an S3 probe result.
+      description: >-
+        Returns health status, entry counts per type, an S3 probe result, and
+        the apt client state: whether a signing key is loaded, the served
+        suites, the public URL in force, and one rendered sources block per
+        suite.
       operationId: getStatus
       tags: [status]
       responses:
@@ -624,6 +628,8 @@ components:
           type: object
           additionalProperties:
             type: integer
+        apt:
+          $ref: "#/components/schemas/AptStatus"
         s3_entries:
           type: array
           items:
@@ -641,6 +647,62 @@ components:
                 type: boolean
         error:
           type: string
+
+    AptStatus:
+      type: object
+      description: >-
+        How apt clients reach this server. Every field is state the running
+        process holds; an emitter that derived any of it instead produced a
+        sources line that was wrong on that axis.
+      properties:
+        signed:
+          type: boolean
+          description: A signing key is loaded, so the index carries InRelease and Release.gpg.
+        fingerprints:
+          type: array
+          description: Primary key fingerprints, uppercase hex, in load order.
+          items:
+            type: string
+        keyring_url:
+          type: string
+          description: Route serving the dearmored keyring Signed-By takes directly. Absent when unsigned.
+        suites:
+          type: array
+          description: Suites served under /apt/dists/.
+          items:
+            type: string
+        public_url:
+          type: string
+          description: >-
+            Base URL clients reach the server at. The configured public_url
+            when set, otherwise the origin of this request with
+            X-Forwarded-Proto honored from a trusted peer.
+        sources:
+          type: array
+          description: One rendered client configuration per served suite.
+          items:
+            $ref: "#/components/schemas/AptSources"
+
+    AptSources:
+      type: object
+      properties:
+        signed:
+          type: boolean
+        suite:
+          type: string
+        uri:
+          type: string
+        deb822:
+          type: string
+          description: The .sources stanza, newline separated.
+        one_line:
+          type: string
+          description: The .list equivalent, carrying the single suite above.
+        notes:
+          type: array
+          description: Consequences of the form rendered, for display beside it.
+          items:
+            type: string
 
     ConfigResponse:
       type: object

@@ -37,6 +37,7 @@ const (
 	EnvLogLevel    = "BODEGA_LOG_LEVEL"
 	EnvConfigFile  = "BODEGA_CONFIG_FILE"
 	EnvListenAddr  = "BODEGA_LISTEN_ADDR"
+	EnvPublicURL   = "BODEGA_PUBLIC_URL"
 
 	SystemConfigDir  = "/etc/bodega"
 	SystemConfigFile = "/etc/bodega/config.json"
@@ -73,6 +74,7 @@ type Config struct {
 	TLSAutocert       bool     `json:"tls_autocert,omitempty"`
 	TLSDomain         string   `json:"tls_domain,omitempty"`
 	ListenAddr        string   `json:"listen_addr,omitempty"` // see ResolveListenAddr for the full precedence chain
+	PublicURL         string   `json:"public_url,omitempty"`  // external base URL clients reach the server at; see ResolvePublicURL
 	ProxyCacheEnabled bool     `json:"proxy_cache_enabled"`
 	MetadataTTL       string   `json:"metadata_ttl,omitempty"`
 	GomodUpstream     string   `json:"gomod_upstream,omitempty"`
@@ -547,6 +549,21 @@ func defaultConfigContent() []byte {
 // EnvRegion, EnvBuildRoot handling in Load).
 func (c *Config) ResolveListenAddr(flagAddr string) string {
 	return firstNonEmpty(flagAddr, os.Getenv(EnvListenAddr), c.ListenAddr, DefaultListenAddr)
+}
+
+// ResolvePublicURL returns the base URL clients reach this server at, with no
+// trailing slash: --public-url, then $BODEGA_PUBLIC_URL, then public_url in
+// the config file.
+//
+// There is no built-in default, and the empty return is the point. Behind a
+// reverse proxy the server sees a loopback listener with no TLS and no
+// hostname, so anything it derives from tls_cert/tls_key or the listen address
+// describes the proxy's back end rather than the URL an operator would copy.
+// Deriving it anyway is what printed "http://" on the sources line of a
+// deployment that terminates TLS at Apache. Callers with a request in hand
+// answer from the request; callers without one render a placeholder.
+func (c *Config) ResolvePublicURL(flagURL string) string {
+	return strings.TrimRight(firstNonEmpty(flagURL, os.Getenv(EnvPublicURL), c.PublicURL), "/")
 }
 
 // loadFileConfig reads the config file in force into a Config, plus the legacy

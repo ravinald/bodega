@@ -283,6 +283,7 @@ func (s *Server) Start(ctx context.Context) error {
 			scheme = "https"
 		}
 		_, _ = fmt.Fprintf(os.Stderr, "bodega listening on %s://%s\n", scheme, boundAddr)
+		_, _ = fmt.Fprint(os.Stderr, s.aptSourcesBanner())
 	}
 	if tlsMode {
 		s.logger.Info("bodega server listening (TLS)", "addr", boundAddr)
@@ -610,6 +611,7 @@ func (s *Server) handleAPIPackageVersion(w http.ResponseWriter, r *http.Request)
 type statusResponse struct {
 	Healthy    bool            `json:"healthy"`
 	EntryCount map[string]int  `json:"entry_count"`
+	Apt        aptStatus       `json:"apt"`
 	S3Entries  []s3EntryStatus `json:"s3_entries,omitempty"`
 	Error      string          `json:"error,omitempty"`
 }
@@ -627,6 +629,7 @@ type s3EntryStatus struct {
 func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 	resp := statusResponse{
 		Healthy: true,
+		Apt:     s.aptStatusFor(r),
 		EntryCount: map[string]int{
 			manifest.TypeApt:    len(s.store.ListPackages(manifest.TypeApt)),
 			manifest.TypeGit:    len(s.store.ListPackages(manifest.TypeGit)),

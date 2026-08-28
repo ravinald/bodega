@@ -24,6 +24,7 @@ func newServeCmd(gf *globalFlags) *cobra.Command {
 		tlsKey      string
 		tlsAutocert bool
 		tlsDomain   string
+		publicURL   string
 		quiet       bool
 	)
 
@@ -34,27 +35,13 @@ func newServeCmd(gf *globalFlags) *cobra.Command {
 
 Clients can use the server as follows:
 
-  apt:  /etc/apt/sources.list.d/bodega.sources, deb822 form:
-          Types: deb
-          URIs: https://bodega-host:8080/apt/
-          Suites: <suite>
-          Components: main
-          Signed-By: /etc/apt/keyrings/bodega-archive-keyring.gpg
+  apt:  the startup banner prints the stanza for
+        /etc/apt/sources.list.d/bodega.sources, carrying the suites this
+        instance serves, the URL from public_url, and Signed-By: or the
+        [trusted=yes] fallback according to whether a signing key is loaded.
+        The same block is on GET /api/v1/status.
   pip:  pip install --index-url https://bodega-host:8080/pypi/simple/ <package>
   git:  curl https://bodega-host:8080/git/<name>/<name>-<ref>.bundle -o <name>.bundle
-
-<suite> is any entry in the config's apt_suites list (default: the single value
-of apt_codename, "noble"). Several suites go on one Suites: line; the pool is
-shared.
-
-Fetch the keyring from /apt/bodega-archive-keyring.gpg, which serves the
-dearmored form Signed-By takes directly. That first fetch is authenticated by
-TLS alone, so compare the fingerprint against "bodega apt key show".
-
-With no signing key installed the repository is served unsigned and a client
-needs "deb [trusted=yes] https://bodega-host:8080/apt/ <suite> main" instead,
-which turns off verification for that source permanently. TLS is then the only
-thing authenticating the packages, so serve over https either way.
 
 Run "bodega apt key generate" to sign. Signed and unsigned coexist at the same
 URLs, so adding a key breaks no existing client.
@@ -70,7 +57,13 @@ TLS can be enabled in two ways:
   --tls-autocert --tls-domain  Automatic Let's Encrypt certificates
 
 Listen address resolution (highest priority first):
-  --addr flag → $BODEGA_LISTEN_ADDR → config.json "listen_addr" → :8080
+  --addr flag > $BODEGA_LISTEN_ADDR > config.json "listen_addr" > :8080
+
+public_url is the base URL clients reach this server at. Set it whenever a
+reverse proxy terminates TLS or publishes a different hostname: bodega then
+sees a loopback listener with no TLS and cannot derive the URL an operator
+would copy, so it prints a placeholder instead of guessing.
+  --public-url flag > $BODEGA_PUBLIC_URL > config.json "public_url"
 
 Use --quiet to suppress the startup banner for scripted use; log-level
 output continues to respect log_level in the config.`,
@@ -114,6 +107,10 @@ output continues to respect log_level in the config.`,
 			if tlsDomain != "" {
 				cfg.TLSDomain = tlsDomain
 			}
+			// Resolved into the Config rather than passed alongside it: every
+			// client-facing URL this process emits reads it back off cfg, and
+			// serve never writes the config file.
+			cfg.PublicURL = cfg.ResolvePublicURL(publicURL)
 
 			// Object storage is optional. Without it, API endpoints still work
 			// but package proxying returns 503.
@@ -153,6 +150,7 @@ output continues to respect log_level in the config.`,
 	cmd.Flags().StringVar(&tlsKey, "tls-key", "", "Path to TLS private key PEM file")
 	cmd.Flags().BoolVar(&tlsAutocert, "tls-autocert", false, "Enable automatic TLS via Let's Encrypt (requires --tls-domain)")
 	cmd.Flags().StringVar(&tlsDomain, "tls-domain", "", "Domain name for autocert (e.g. bodega.example.com)")
+	cmd.Flags().StringVar(&publicURL, "public-url", "", fmt.Sprintf("Base URL clients reach this server at, e.g. https://bodega.example.com (env: %s)", config.EnvPublicURL))
 	cmd.Flags().BoolVar(&quiet, "quiet", false, "Suppress the stderr startup banner (log_level output is unaffected)")
 	return cmd
 }

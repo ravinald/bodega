@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/bubbles/viewport"
+	"github.com/ravinald/bodega/internal/aptsign"
+	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -25,12 +27,16 @@ type detailsModel struct {
 	width     int
 	height    int
 	focused   bool
+
+	// aptSigned is whether this host holds a usable apt signing key, read
+	// once here rather than in the render path.
+	aptSigned bool
 }
 
 // newDetailsModel creates the details pane.
 func newDetailsModel(store *manifest.Store, cfg *config.Config) detailsModel {
 	vp := viewport.New(80, 20)
-	return detailsModel{store: store, cfg: cfg, buildRoot: cfg.BuildRoot, viewport: vp}
+	return detailsModel{store: store, cfg: cfg, buildRoot: cfg.BuildRoot, viewport: vp, aptSigned: aptKeyLoaded(cfg)}
 }
 
 // SetNode updates the node whose metadata is displayed.
@@ -106,6 +112,17 @@ func (m detailsModel) s3AndClientFields(n *TreeNode) string {
 		}
 		sb.WriteString(field("S3 path", s3URI))
 		sb.WriteByte('\n')
+	}
+	if n.EntryType == manifest.TypeApt {
+		pm, _ := m.store.GetPackage(context.Background(), manifest.TypeApt, n.Name)
+		src := aptSources(m.cfg, pm, m.aptSigned)
+		sb.WriteString(field("Sources line", src.OneLine))
+		sb.WriteByte('\n')
+		for _, note := range src.Notes {
+			sb.WriteString(field("Note", wrap(note, m.width-16)))
+			sb.WriteByte('\n')
+		}
+		return sb.String()
 	}
 	if url := clientURL(m.cfg, m.store, n.EntryType, n.Name); url != "" {
 		sb.WriteString(field("Package URL", url))
@@ -289,14 +306,62 @@ func typeTreePrefix(entryType string) string {
 	return ""
 }
 
-// clientScheme returns the scheme the server will actually answer on. Start
+// clientScheme returns the scheme this host's own listener answers on. Start
 // enables TLS only when both a cert and a key resolve; tls_autocert is
 // rejected as unimplemented, so it is not a signal here.
+//
+// It describes the local listener and nothing else. Behind a reverse proxy
+// both TLS keys are empty here while every client speaks https, which is why
+// it only ever fills a placeholder that public_url overrides.
 func clientScheme(cfg *config.Config) string {
 	if cfg != nil && cfg.TLSCert != "" && cfg.TLSKey != "" {
 		return "https"
 	}
 	return "http"
+}
+
+// clientBase returns the base URL a client reaches this server at: public_url
+// when the operator set one, a placeholder host otherwise. Every client-facing
+// URL the pane emits is built from it, so the sources line and the pip line
+// cannot disagree about where the server is.
+func clientBase(cfg *config.Config) string {
+	st := aptsources.State{LocalScheme: clientScheme(cfg)}
+	if cfg != nil {
+		st.PublicURL = cfg.ResolvePublicURL("")
+	}
+	return st.BaseURL()
+}
+
+// aptSources renders the apt client configuration for a package through the
+// one renderer the server and web UI also use.
+//
+// Signing comes from the same key search the server performs. The TUI holds no
+// connection to the running process, so it agrees with what is served except
+// in the window between a key changing on disk and the SIGHUP that loads it —
+// and the alternative, assuming unsigned, is what told operators to paste
+// [trusted=yes] into a signed instance.
+func aptSources(cfg *config.Config, pm *manifest.PackageManifest, signed bool) aptsources.Sources {
+	st := aptsources.State{
+		LocalScheme: clientScheme(cfg),
+		Suites:      []string{aptSourcesSuite(cfg, pm)},
+		Signed:      signed,
+	}
+	if cfg != nil {
+		st.PublicURL = cfg.ResolvePublicURL("")
+	}
+	return aptsources.Render(st)
+}
+
+// aptKeyLoaded reports whether the server on this host would find a usable
+// signing key, using aptsign's own search order. Read once when the pane is
+// built: it does file I/O and a key parse, and a render path runs on every
+// terminal resize.
+func aptKeyLoaded(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	_, err := aptsign.Load(aptsign.DefaultKeyPaths(cfg.StoragePath))
+	return err == nil
 }
 
 // aptSourcesSuite picks the suite for a sources line: the first suite the
@@ -323,11 +388,15 @@ func aptSourcesSuite(cfg *config.Config, pm *manifest.PackageManifest) string {
 	return "<suite>"
 }
 
-// clientURL returns the URL a client would use to fetch the artifact from the bodega server.
+// clientURL returns the URL a client would use to fetch the artifact from the
+// bodega server.
+//
+// apt has no case here on purpose: a sources line is a configuration stanza
+// rather than a URL, and it needs the served suites and the signing state as
+// well as the base URL. aptSources renders it.
 func clientURL(cfg *config.Config, store *manifest.Store, entryType, name string) string {
 	ctx := context.Background()
-	host := "<bodega-host>:8080"
-	scheme := clientScheme(cfg)
+	base := clientBase(cfg)
 	pm, err := store.GetPackage(ctx, entryType, name)
 	switch entryType {
 	case manifest.TypeGit:
@@ -340,7 +409,7 @@ func clientURL(cfg *config.Config, store *manifest.Store, entryType, name string
 			ext = ".tar.gz"
 		}
 		sn := strings.ReplaceAll(pm.Name, "/", "--")
-		return fmt.Sprintf("%s://%s/git/%s/%s-%s%s", scheme, host, sn, sn, ve.Ref, ext)
+		return fmt.Sprintf("%s/git/%s/%s-%s%s", base, sn, sn, ve.Ref, ext)
 	case manifest.TypeBinary:
 		if err != nil || pm == nil || len(pm.Versions) == 0 {
 			return ""
@@ -351,21 +420,19 @@ func clientURL(cfg *config.Config, store *manifest.Store, entryType, name string
 			parts := strings.Split(ve.URL, "/")
 			fn = parts[len(parts)-1]
 		}
-		return fmt.Sprintf("%s://%s/binaries/%s/%s/%s", scheme, host, pm.Name, ve.Version, fn)
-	case manifest.TypeApt:
-		return fmt.Sprintf("deb [trusted=yes] %s://%s/apt/ %s main", scheme, host, aptSourcesSuite(cfg, pm))
+		return fmt.Sprintf("%s/binaries/%s/%s/%s", base, pm.Name, ve.Version, fn)
 	case manifest.TypePypi:
-		return fmt.Sprintf("pip install --index-url %s://%s/pypi/simple/ %s", scheme, host, name)
+		return fmt.Sprintf("pip install --index-url %s/pypi/simple/ %s", base, name)
 	case manifest.TypeGomod:
-		return fmt.Sprintf("GOPROXY=%s://%s/go,direct go get %s", scheme, host, name)
+		return fmt.Sprintf("GOPROXY=%s/go,direct go get %s", base, name)
 	case manifest.TypeHelm:
 		if err != nil || pm == nil || len(pm.Versions) == 0 {
 			return ""
 		}
 		ve := pm.Versions[0]
-		return fmt.Sprintf("%s://%s/helm/charts/%s-%s.tgz", scheme, host, pm.Name, ve.Version)
+		return fmt.Sprintf("%s/helm/charts/%s-%s.tgz", base, pm.Name, ve.Version)
 	case manifest.TypeNpm:
-		return fmt.Sprintf("npm install --registry %s://%s/npm/ %s", scheme, host, name)
+		return fmt.Sprintf("npm install --registry %s/npm/ %s", base, name)
 	}
 	return ""
 }

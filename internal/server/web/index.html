@@ -342,6 +342,11 @@ body {
 const typeIcons = {apt:'A', git:'G', pypi:'P', binary:'B', gomod:'M', helm:'H', npm:'N'};
 const typeOrder = ['apt','git','pypi','binary','gomod','helm','npm'];
 let allData = null;
+// serverApt is the apt block of /api/v1/status: the sources line rendered by
+// the server, one per served suite, plus the URL in force. The page composes
+// no sources line of its own — reading location.protocol and a literal "noble"
+// is what handed operators a suite this instance 404s.
+let serverApt = null;
 let selectedKey = null;
 let expandedGroups = new Set();
 let expandedPkgs = new Set();
@@ -357,6 +362,7 @@ async function load() {
     ]);
     allData = await pkgRes.json();
     const status = await statusRes.json();
+    serverApt = status.apt || null;
     document.getElementById('status-text').textContent =
       Object.values(status.entry_count || {}).reduce((a,b) => a+b, 0) + ' packages';
   } catch(e) {
@@ -555,7 +561,13 @@ function showDetail(type, entry) {
   if (entry.version_constraint)
     fields.push(['Constraint', entry.version_constraint]);
   fields.push(['Frozen', entry.frozen ? 'yes' : 'no', entry.frozen ? 'yes' : 'no']);
-  if (clientUrl && !isPolicyEntry) fields.push(['Package URL', clientUrl, 'url']);
+  if (clientUrl && !isPolicyEntry) {
+    fields.push([type === 'apt' ? 'Sources line' : 'Package URL', clientUrl, 'url']);
+    if (type === 'apt') {
+      const src = aptSourcesFor(entry);
+      for (const note of (src && src.notes) || []) fields.push(['Note', note]);
+    }
+  }
 
   // Render metadata map if present, with a section header.
   if (entry.metadata && typeof entry.metadata === 'object') {
@@ -618,31 +630,55 @@ function escapeHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
+// clientBase is the base URL a client reaches this server at. The server
+// resolves it: public_url when the operator set one, otherwise the origin of
+// this request with X-Forwarded-Proto honored. location.origin is the fallback
+// for a page whose status fetch failed — it is the browser's own view, which
+// is right only while nothing terminates on a different hostname.
+function clientBase() {
+  return (serverApt && serverApt.public_url) || location.origin;
+}
+
+// aptSourcesFor picks the server-rendered block for the suite this entry is
+// actually published to. An entry naming no suites is in the server's default,
+// which is the first block.
+function aptSourcesFor(entry) {
+  if (!serverApt || !serverApt.sources || !serverApt.sources.length) return null;
+  const want = (entry && entry.suites) || [];
+  for (const suite of want) {
+    for (const src of serverApt.sources) {
+      if (src.suite === suite) return src;
+    }
+  }
+  return serverApt.sources[0];
+}
+
 function getClientUrl(type, entry) {
-  const host = location.host;
-  const proto = location.protocol;
+  const base = clientBase();
   switch (type) {
     case 'git': {
       const ext = entry.source === 'clone' ? '.bundle' : '.tar.gz';
       const ref = entry.ref || '';
       const sn = entry.name.replace(/\//g, '--');
-      return proto + '//' + host + '/git/' + sn + '/' + sn + '-' + ref + ext;
+      return base + '/git/' + sn + '/' + sn + '-' + ref + ext;
     }
     case 'binary': {
       const fn = entry.filename || (entry.url ? entry.url.split('/').pop() : entry.name);
-      if (entry.version) return proto + '//' + host + '/binaries/' + entry.name + '/' + entry.version + '/' + fn;
-      return proto + '//' + host + '/binaries/' + entry.name + '/' + fn;
+      if (entry.version) return base + '/binaries/' + entry.name + '/' + entry.version + '/' + fn;
+      return base + '/binaries/' + entry.name + '/' + fn;
     }
-    case 'apt':
-      return 'deb [trusted=yes] ' + proto + '//' + host + '/apt/ noble main';
+    case 'apt': {
+      const src = aptSourcesFor(entry);
+      return src ? src.one_line : '';
+    }
     case 'pypi':
-      return 'pip install --index-url ' + proto + '//' + host + '/pypi/simple/ ' + entry.name;
+      return 'pip install --index-url ' + base + '/pypi/simple/ ' + entry.name;
     case 'gomod':
-      return 'GOPROXY=' + proto + '//' + host + '/go,direct go get ' + entry.name;
+      return 'GOPROXY=' + base + '/go,direct go get ' + entry.name;
     case 'helm':
-      return proto + '//' + host + '/helm/charts/' + entry.name + '-' + (entry.version || '') + '.tgz';
+      return base + '/helm/charts/' + entry.name + '-' + (entry.version || '') + '.tgz';
     case 'npm':
-      return 'npm install --registry ' + proto + '//' + host + '/npm/ ' + entry.name;
+      return 'npm install --registry ' + base + '/npm/ ' + entry.name;
   }
   return '';
 }
