@@ -153,13 +153,13 @@ func (s *Server) handleAptSigned(w http.ResponseWriter, r *http.Request, suite, 
 // handleAptPublicKey serves the armored signing key for a human to read and
 // for `gpg --dearmor` to consume.
 func (s *Server) handleAptPublicKey(w http.ResponseWriter, r *http.Request) {
-	s.serveAptKey(w, r, s.aptPubArmored)
+	s.serveAptKey(w, r, s.aptSign.Load().pub())
 }
 
 // handleAptKeyring serves the dearmored keyring, which is what
 // /etc/apt/keyrings/ and signed-by= take directly.
 func (s *Server) handleAptKeyring(w http.ResponseWriter, r *http.Request) {
-	s.serveAptKey(w, r, s.aptKeyring)
+	s.serveAptKey(w, r, s.aptSign.Load().ring())
 }
 
 // serveAptKey writes one rendering of the loaded public key. The first fetch
@@ -358,7 +358,7 @@ func (s *Server) aptTickInterval() time.Duration {
 // repository over a transient read error.
 func (s *Server) reloadManifests(ctx context.Context) {
 	if err := s.store.LoadIndex(ctx); err != nil {
-		s.logger.Error("apt index refresh could not reload manifests; rebuilding from the cached copy",
+		s.logger.Error("could not reload manifests; rebuilding the apt index from the cached copy",
 			"error", err)
 		return
 	}
@@ -480,42 +480,81 @@ func (s *Server) buildAptSuiteIndex(ctx context.Context, suite string, debKeys [
 	return idx
 }
 
-// loadAptSigner installs the signing key, if one is present, and renders the
-// two public forms the keyring routes serve.
+// aptSigning is the loaded signing key and the two renderings of its public
+// half the keyring routes serve. The three are swapped as one value: a client
+// that fetched a keyring from one generation and an InRelease from another
+// reads a good archive as a forged one.
 //
-// Absent key: unsigned, and that is a configuration rather than a fault, so it
-// logs at Info. Present but unusable: loud, because the operator installed a
-// key and would otherwise have no way to learn the repository is still
-// unsigned — apt reports nothing, since a missing InRelease is indistinguishable
-// from an archive that never had one.
+// The public forms are rendered at load rather than per request, so the key
+// clients fetch is by construction the key the running process signs with.
+type aptSigning struct {
+	signer     aptsign.Signer
+	pubArmored []byte
+	keyring    []byte
+}
+
+// pub and ring read through a nil *aptSigning, which is the unsigned
+// configuration, so the routes need no separate nil check.
+func (a *aptSigning) pub() []byte {
+	if a == nil {
+		return nil
+	}
+	return a.pubArmored
+}
+
+func (a *aptSigning) ring() []byte {
+	if a == nil {
+		return nil
+	}
+	return a.keyring
+}
+
+// loadAptSigner installs the signing key, if one is present, and renders the
+// two public forms the keyring routes serve. It runs at startup and again on
+// every SIGHUP, which is what makes the published rotation runbook work.
+//
+// Absent key at startup: unsigned, and that is a configuration rather than a
+// fault, so it logs at Info. Present but unusable: loud, because the operator
+// installed a key and would otherwise have no way to learn the repository is
+// still unsigned — apt reports nothing, since a missing InRelease is
+// indistinguishable from an archive that never had one.
+//
+// A reload never takes signing away. Whatever went wrong — the key unreadable,
+// the mount gone, the file deleted — the previously loaded key keeps signing
+// and the fault goes to the journal, because a client configured with
+// Signed-By: has no unsigned fallback and would fail apt update outright.
+// Serving unsigned is a deliberate act and needs a restart.
 func (s *Server) loadAptSigner() {
+	loaded := s.aptSign.Load() != nil
 	paths := aptsign.DefaultKeyPaths(s.cfg.StoragePath)
 	kr, err := aptsign.Load(paths)
-	if errors.Is(err, aptsign.ErrNoKey) {
+	switch {
+	case errors.Is(err, aptsign.ErrNoKey) && loaded:
+		s.logger.Warn("apt signing key is gone from every search path; the loaded key keeps signing until a restart",
+			"searched", strings.Join(paths, ", "))
+		return
+	case errors.Is(err, aptsign.ErrNoKey):
 		s.logger.Info("no apt signing key installed; the apt repository is served unsigned",
 			"searched", strings.Join(paths, ", "))
 		return
-	}
-	if err != nil {
-		s.logger.Error("apt signing key present but unusable; the apt repository stays unsigned",
-			"error", err)
+	case err != nil:
+		s.logger.Error("apt signing key present but unusable; the apt repository is signed with the previously loaded key, or not at all",
+			"error", err, "previously_loaded", loaded)
 		return
 	}
 	pub, err := kr.PublicKey()
 	if err != nil {
-		s.logger.Error("apt signing key loaded but its public half will not render; the apt repository stays unsigned",
-			"path", kr.Path(), "error", err)
+		s.logger.Error("apt signing key loaded but its public half will not render; the key is not installed",
+			"path", kr.Path(), "error", err, "previously_loaded", loaded)
 		return
 	}
 	ring, err := kr.Keyring()
 	if err != nil {
-		s.logger.Error("apt signing key loaded but its keyring will not render; the apt repository stays unsigned",
-			"path", kr.Path(), "error", err)
+		s.logger.Error("apt signing key loaded but its keyring will not render; the key is not installed",
+			"path", kr.Path(), "error", err, "previously_loaded", loaded)
 		return
 	}
-	s.signer = kr
-	s.aptPubArmored = pub
-	s.aptKeyring = ring
+	s.aptSign.Store(&aptSigning{signer: kr, pubArmored: pub, keyring: ring})
 	s.logger.Info("apt signing key loaded",
 		"path", kr.Path(), "keys", kr.Len(),
 		"fingerprints", strings.Join(kr.Fingerprints(), " "))
@@ -531,16 +570,17 @@ func (s *Server) loadAptSigner() {
 // unsigned Release, which is the same shape a client sees before a key is
 // installed, rather than taking the repository down.
 func (s *Server) signAptRelease(idx *aptSuiteIndex, suite string) {
-	if s.signer == nil {
+	sign := s.aptSign.Load()
+	if sign == nil {
 		return
 	}
-	inRelease, err := s.signer.ClearSign(idx.release)
+	inRelease, err := sign.signer.ClearSign(idx.release)
 	if err != nil {
 		s.logger.Error("apt InRelease signing failed; suite serves unsigned Release only",
 			"suite", suite, "error", err)
 		return
 	}
-	releaseGPG, err := s.signer.DetachSign(idx.release)
+	releaseGPG, err := sign.signer.DetachSign(idx.release)
 	if err != nil {
 		s.logger.Error("apt Release.gpg signing failed; suite serves unsigned Release only",
 			"suite", suite, "error", err)

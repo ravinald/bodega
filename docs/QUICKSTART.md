@@ -98,7 +98,7 @@ The server listens on `:8080` by default. Clients configure their package manage
 **APT**: sign the repository, then point a client at the key:
 
 ```bash
-bodega apt key generate          # on the server; restart or SIGHUP bodega afterwards
+bodega apt key generate          # on the server; systemctl reload bodega afterwards
 ```
 
 ```bash

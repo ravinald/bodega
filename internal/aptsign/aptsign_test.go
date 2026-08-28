@@ -135,17 +135,80 @@ func TestDualSignVerifiesUnderEitherKey(t *testing.T) {
 
 func TestRetireRefusesTheLastKey(t *testing.T) {
 	kr := testKey(t)
-	if err := kr.Retire(kr.Fingerprints()[0]); err == nil {
+	if _, err := kr.Retire(kr.Fingerprints()[0]); err == nil {
 		t.Fatal("Retire removed the only key; the repository would go unsigned with no warning")
 	}
 	incoming := testKey(t)
 	fp := kr.Fingerprints()[0]
 	kr.Add(incoming)
-	if err := kr.Retire(fp); err != nil {
+	retired, err := kr.Retire(fp)
+	if err != nil {
 		t.Fatalf("Retire: %v", err)
+	}
+	if retired != fp {
+		t.Errorf("Retire reported %q, want the fingerprint it removed (%s)", retired, fp)
 	}
 	if got := kr.Fingerprints(); len(got) != 1 || got[0] != incoming.Fingerprints()[0] {
 		t.Errorf("after Retire: %v, want only the incoming key", got)
+	}
+}
+
+// TestRetireDemandsAnUnambiguousIdentifier is the whole point of the length
+// floor: `retire 2` used to match by suffix and close a rotation window, and
+// the only refusal was the one covering the last key.
+func TestRetireDemandsAnUnambiguousIdentifier(t *testing.T) {
+	kr := testKey(t)
+	kr.Add(testKey(t))
+	fp := kr.Fingerprints()[0]
+
+	for _, short := range []string{"", " ", fp[39:], fp[:MinRetirePrefix-1]} {
+		if _, err := kr.Retire(short); err == nil {
+			t.Fatalf("Retire(%q) succeeded; an identifier shorter than %d characters must be refused", short, MinRetirePrefix)
+		}
+	}
+	if got := kr.Fingerprints(); len(got) != 2 {
+		t.Fatalf("a refused Retire changed the key ring: %v", got)
+	}
+
+	retired, err := kr.Retire(fp[:MinRetirePrefix])
+	if err != nil {
+		t.Fatalf("Retire with a %d-character prefix: %v", MinRetirePrefix, err)
+	}
+	if retired != fp {
+		t.Errorf("Retire reported %q, want %s", retired, fp)
+	}
+}
+
+// TestRetireRefusesAnAmbiguousPrefix pins the refusal rather than the
+// resolution: picking one of two matches would retire a key the operator did
+// not name, which is a rotation window closed on the wrong side.
+func TestRetireRefusesAnAmbiguousPrefix(t *testing.T) {
+	kr := testKey(t)
+	kr.Add(testKey(t))
+	// Two generated keys never share 16 hex characters, so the ambiguity is
+	// built rather than found: a file holding one key twice has to be refused
+	// rather than resolved to whichever copy is reached first.
+	kr.entities = append(kr.entities, kr.entities[0])
+	fp := kr.Fingerprints()[0]
+	if _, err := kr.Retire(fp); err == nil {
+		t.Fatal("Retire resolved a fingerprint matching two entities instead of refusing")
+	}
+	if len(kr.Fingerprints()) != 3 {
+		t.Errorf("a refused Retire changed the key ring: %v", kr.Fingerprints())
+	}
+}
+
+// TestAddKeepsTheIncomingKeyLast fixes signature order. gpgv 2.5 stops at the
+// first signature whose key it does not hold, so the outgoing key has to sign
+// first: the rotation window exists for clients that have not updated.
+func TestAddKeepsTheIncomingKeyLast(t *testing.T) {
+	outgoing := testKey(t)
+	outgoingFP := outgoing.Fingerprints()[0]
+	incoming := testKey(t)
+	outgoing.Add(incoming)
+	got := outgoing.Fingerprints()
+	if len(got) != 2 || got[0] != outgoingFP || got[1] != incoming.Fingerprints()[0] {
+		t.Errorf("after Add: %v, want the outgoing key first and the incoming key last", got)
 	}
 }
 

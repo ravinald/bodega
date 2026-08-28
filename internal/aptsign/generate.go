@@ -57,32 +57,58 @@ func (k *KeyRing) Add(other *KeyRing) {
 	k.entities = append(k.entities, other.entities...)
 }
 
-// Retire drops the key with the given fingerprint, closing a rotation window.
+// MinRetirePrefix is the shortest identifier Retire accepts short of a full
+// fingerprint. Retiring a key closes a rotation window, and a window closed
+// early breaks every client that has not fetched the incoming key yet, so the
+// identifier has to be one an operator cannot arrive at by typing part of
+// something else.
+const MinRetirePrefix = 16
+
+// Retire drops the key identified by fp and reports the fingerprint it
+// removed, closing a rotation window.
+//
+// fp is the full 40-character fingerprint or a prefix of at least
+// MinRetirePrefix characters, and a prefix matching more than one key is
+// refused rather than resolved. Spaces are ignored, so the grouped form gpg
+// prints pastes as-is.
+//
 // It refuses to remove the last key, because a key file with no keys is
 // indistinguishable at load from a corrupt one and takes the repository
 // unsigned without saying so.
-func (k *KeyRing) Retire(fp string) error {
-	want := strings.ToUpper(strings.ReplaceAll(fp, " ", ""))
+func (k *KeyRing) Retire(fp string) (string, error) {
+	want := strings.ToUpper(strings.Join(strings.Fields(fp), ""))
 	if want == "" {
-		return fmt.Errorf("no fingerprint given")
+		return "", fmt.Errorf("no fingerprint given; pass one of: %s", strings.Join(k.Fingerprints(), ", "))
+	}
+	if len(want) < MinRetirePrefix {
+		return "", fmt.Errorf("%q is shorter than the %d characters retire requires; pass the full 40-character fingerprint or a prefix of at least %d, so a mistyped argument cannot close a rotation window (have: %s)",
+			fp, MinRetirePrefix, MinRetirePrefix, strings.Join(k.Fingerprints(), ", "))
+	}
+	var matched []string
+	for _, e := range k.entities {
+		if strings.HasPrefix(fingerprint(e), want) {
+			matched = append(matched, fingerprint(e))
+		}
+	}
+	switch len(matched) {
+	case 0:
+		return "", fmt.Errorf("no key whose fingerprint starts with %q in %s (have: %s)", want, k.path, strings.Join(k.Fingerprints(), ", "))
+	case 1:
+	default:
+		return "", fmt.Errorf("%q matches %d keys in %s (%s); pass the full fingerprint", want, len(matched), k.path, strings.Join(matched, ", "))
+	}
+	if len(k.entities) == 1 {
+		return "", fmt.Errorf("refusing to retire the only key in %s; generate the replacement with --rotate first, then retire this one", k.path)
 	}
 	var kept openpgp.EntityList
-	found := false
 	for _, e := range k.entities {
-		if strings.HasSuffix(fingerprint(e), want) {
-			found = true
+		if fingerprint(e) == matched[0] {
 			continue
 		}
 		kept = append(kept, e)
 	}
-	if !found {
-		return fmt.Errorf("no key matching %q in %s (have: %s)", fp, k.path, strings.Join(k.Fingerprints(), ", "))
-	}
-	if len(kept) == 0 {
-		return fmt.Errorf("refusing to retire the only key in %s; generate the replacement with --rotate first, then retire this one", k.path)
-	}
 	k.entities = kept
-	return nil
+	return matched[0], nil
 }
 
 // WritePrivate writes every key's secret half to path as concatenated armored

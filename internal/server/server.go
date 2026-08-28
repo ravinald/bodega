@@ -26,7 +26,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ravinald/bodega/internal/aptsign"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -73,17 +72,16 @@ type Server struct {
 	quiet        bool         // suppress stderr startup banner (slog output unaffected)
 	mu           sync.Mutex   // protects store mutations (CRUD API)
 
-	// signer signs the apt index on every rebuild. nil when no key is
-	// installed, which is a supported configuration: signed and unsigned
-	// coexist at the same URLs, and the signature is metadata a client opts
-	// into checking.
-	signer aptsign.Signer
-	// aptPubArmored and aptKeyring are the served forms of the loaded public
-	// key, rendered once at startup. Serving them from memory rather than
-	// from storage means the key clients fetch is by construction the key
-	// the running process signs with.
-	aptPubArmored []byte
-	aptKeyring    []byte
+	// aptSign is the signing key and the two served renderings of its public
+	// half. nil when no key is installed, which is a supported configuration:
+	// signed and unsigned coexist at the same URLs, and the signature is
+	// metadata a client opts into checking.
+	//
+	// Atomic and swapped whole because SIGHUP re-reads the key while request
+	// handlers are reading it. Whole matters as much as atomic: a keyring
+	// route answering from the incoming key while InRelease still carried the
+	// outgoing signature is a client being told the archive is forged.
+	aptSign atomic.Pointer[aptSigning]
 
 	// aptSnap is the generated apt index. Held whole so Release and the
 	// Packages bodies it digests are always served from one generation.
@@ -318,23 +316,14 @@ func (s *Server) Start(ctx context.Context) error {
 		errCh <- srv.Serve(ln)
 	}()
 
-	// SIGHUP reloads the manifest index and clears the package cache.
+	// SIGHUP reloads the manifest index, the signing key, and the caches
+	// built from them.
 	sighupCh := make(chan os.Signal, 1)
 	signal.Notify(sighupCh, syscall.SIGHUP)
 	//nolint:gosec // G118: signal handler is server-lifecycle, intentionally decoupled from any request context.
 	go func() {
 		for range sighupCh {
-			s.logger.Info("SIGHUP received, reloading manifests...")
-			if err := s.store.LoadIndex(context.Background()); err != nil {
-				s.logger.Error("reload failed", "error", err)
-			} else {
-				// SIGHUP is the operator's "I changed things underneath you"
-				// lever, so it has to clear the pool cache too; otherwise a
-				// reload that looks successful still serves the old listing.
-				s.aptPool.Store(nil)
-				s.rebuildAptSnapshot(context.Background())
-				s.logger.Info("manifests reloaded")
-			}
+			s.reload(context.Background())
 		}
 	}()
 
@@ -357,6 +346,29 @@ func (s *Server) Start(ctx context.Context) error {
 		s.logger.Info("server stopped")
 		return nil
 	}
+}
+
+// reload is what SIGHUP does: re-read everything the server holds from disk
+// and rebuild what is derived from it.
+//
+// The signing key is re-read here rather than only at startup because the
+// published rotation runbook has the operator write a key and reload. With
+// only a restart honoring it, `generate --rotate` would leave the served
+// keyring carrying the outgoing key alone while clients were being told to
+// re-fetch, and `retire` would leave the process signing with a key no longer
+// on disk until something restarted it and broke every client at once.
+//
+// Order matters twice. The key is installed before the rebuild, because the
+// rebuild is what signs. And a manifest read that fails does not abandon the
+// rest: the key half of a reload staying inert because the backend hiccuped is
+// the same trap in a rarer shape, and the hourly tick already treats a failed
+// manifest read as non-fatal and rebuilds anyway.
+func (s *Server) reload(ctx context.Context) {
+	s.logger.Info("reload requested, re-reading manifests and the apt signing key")
+	s.reloadManifests(ctx)
+	s.loadAptSigner()
+	s.rebuildAptSnapshot(ctx)
+	s.logger.Info("reload complete")
 }
 
 // sd_notify: hand-rolled so bodega stays single-binary. No-op when
