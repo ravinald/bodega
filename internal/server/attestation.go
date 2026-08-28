@@ -66,6 +66,13 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 		// We don't cross-bucket-fetch; the bodega host's configured bucket is
 		// the only storage we know how to read. Ignore the bucket prefix and
 		// serve from our own objects using the key remainder.
+		//
+		// The type rule, not ve.Storage, even though the entry is in hand.
+		// Nothing in bodega writes this blob — an external sync service puts
+		// it there — and 'pkg move' does not carry it, so the recorded name
+		// describes where the artifact went and says nothing about where the
+		// envelope stayed. Resolving by record would 404 an envelope sitting
+		// exactly where it was left.
 		s.proxyS3(w, r, s.typeStore(t), rest[slash+1:])
 	default:
 		http.Error(w, "unsupported attestation_uri scheme", http.StatusBadGateway)

@@ -189,7 +189,7 @@ bodega pkg create apt                         # fully interactive (prompts for n
 bodega pkg create git netbox --storage archive   # pin this package's writes
 ```
 
-`--storage` sets `storage_policy` on the new package and is never prompted for. Almost every package answers it "whatever the type rule says", and `bodega pkg edit` opens the whole manifest, so the field is reachable interactively without a ninth question in an already-long form. An unknown backend name is rejected before the first prompt.
+`--storage` sets `storage_policy` on the new package and is never prompted for. Almost every package answers it "whatever the type rule says", and `bodega pkg edit` opens the whole manifest, so the field is reachable interactively without a ninth question in an already-long form. An unknown backend name is rejected before the first prompt, and a name on an `apt`, `git` or `pypi` entry warns that the write path will not consult it.
 
 ### `bodega pkg delete <type> <name> [--remove-from-s3]`
 
@@ -247,13 +247,23 @@ A single package is output as a JSON object. Multiple packages are output as a J
 Resolves the placement hierarchy for one package and names the level that decided it.
 
 ```bash
-$ bodega pkg storage git linux
-git/linux  -> bulk     (package policy)
+$ bodega pkg storage binary awscli-v2
+binary/awscli-v2 -> bulk     (package policy)
 $ bodega pkg storage apt nginx
 apt/nginx  -> bulk     (type rule: storage_by_type.apt)
 $ bodega pkg storage git netbox
 git/netbox -> default  (global default; no type or package rule)
 ```
+
+`apt`, `git` and `pypi` upload a whole directory at a time, so the package level is never consulted for them. A `storage_policy` on one of their packages is reported as skipped rather than as the level that won:
+
+```bash
+$ bodega pkg storage git netbox
+git/netbox -> default  (global default; no type or package rule; storage_policy "bulk" is not consulted for git)
+  warning: storage_policy "bulk" has no effect for git: git uploads whole directories with SyncDir, so one package cannot be placed apart from the rest of its type. Set storage_by_type.git to place the whole type; 'bodega pkg move' refuses git for the same reason.
+```
+
+An operator reads this command to find out why a package landed where it did, so a level the write path will not use is worse than no level at all.
 
 This is the write side. It says where the _next_ version goes and nothing about where versions already uploaded live; each of those records its own backend in `storage`.
 
@@ -264,8 +274,10 @@ Copies the objects backing a package's versions to another named backend and rep
 ```bash
 bodega pkg move binary awscli-v2 --to bulk
 bodega pkg move npm @bitwarden/cli@2026.4.0 --to archive
-bodega pkg move git netbox --to bulk --delete-source
+bodega pkg move gomod github.com/aws/aws-sdk-go-v2@v1.30.0 --to archive --delete-source
 ```
+
+Movable types: `binary`, `npm`, `cargo`, `gomod`, `helm`. See [Whole-directory types are not movable](#whole-directory-types-are-not-movable) for the other three.
 
 Order is the design:
 
@@ -278,7 +290,25 @@ Order is the design:
 
 Deletion is behind `--delete-source` and defaults to off. A delete that fails prints a warning and leaves the manifest pointing at the copy: a stranded object costs space, while a manifest rolled back after the bytes were removed costs the artifact. Both backends answer a missing object with "not found" rather than an error, so an artifact lost mid-move is indistinguishable from one that was never uploaded.
 
-Without a version, every version of the package moves; versions already on the destination are skipped, so an interrupted move can be re-run. `pypi` is not movable: wheels upload as a directory with no per-version object key, so repoint `storage_by_type.pypi` and re-upload instead.
+Without a version, every version of the package moves; versions already on the destination are skipped, so an interrupted move can be re-run.
+
+Two backend names resolving to one directory or bucket is refused before anything is copied:
+
+```text
+binary/awscli-v2: backends "default" and "mirror" are the same location (file:///mnt/bulk/bodega) — every object would be copied onto itself, and --delete-source would then remove the only copy. Name a different --to, or drop the duplicate entry from storage_backends
+```
+
+Two names for one place is a documented way to stage a migration, and `Load` rejects a colliding name but not a colliding path. Each object would be read and written at the same key, the verify would re-read what it had just overwritten and pass, and `--delete-source` would then remove the artifact the manifest points at. Both backends answer a missing object with "not found", so nothing afterwards could tell it had ever existed.
+
+#### Whole-directory types are not movable
+
+`apt`, `git` and `pypi` upload with `SyncDir`: one local directory to one key prefix, with no per-version granularity at either end. Moving one package of those types splits a tree that nothing can reunite — `git` and `apt` are served with no listing to fan out over, and `pypi` has no per-version object key at all — and `bodega build sync` then refuses for the whole type. All three are refused:
+
+```text
+git is not movable: git uploads whole directories with SyncDir, so one package cannot be placed apart from the rest of its type; repoint storage_by_type.git and re-upload instead
+```
+
+Point `storage_by_type.<type>` at the backend you want and re-upload. Per-package placement for these three types needs per-package upload, which does not exist yet ([#87](https://github.com/ravinald/bodega/issues/87)).
 
 ### `bodega serve [flags]`
 
@@ -557,11 +587,13 @@ The most specific rule wins. A package policy that lost to a type rule would be 
 
 `bodega pkg storage <type> <name>` prints the resolved backend and which level decided it. Naming the winning level is what makes a three-level hierarchy debuggable — `bulk` on its own does not say whether a package policy took effect or a forgotten type rule did.
 
-`apt`, `pypi` and `git` upload whole directories with `SyncDir`, so the package level is not consulted for them: honoring it for some packages of the type and not others would split the tree across backends with no listing to reunite it. Use `bodega pkg move` on those.
+`apt`, `pypi` and `git` upload whole directories with `SyncDir`, so the package level is not consulted for them: honoring it for some packages of the type and not others would split the tree across backends with no listing to reunite it. There is no per-package placement for these three — `bodega pkg move` refuses them for the same reason, and setting `storage_policy` on one warns rather than taking effect. Set `storage_by_type.<type>` to place the whole type.
 
 #### `storage_policy` and `storage` are different fields on purpose
 
 `PackageManifest.storage_policy` is future tense: put new versions here. `VersionEntry.storage` is past tense: this version's bytes are here. Setting a policy moves nothing; `bodega pkg move` does that. One name for both would mislead every future reader of a manifest.
+
+`bodega pkg create --storage`, `bodega pkg edit` and `bodega pkg import` all record a `storage_policy` on a whole-directory type and warn that it will not be read. The field is recorded rather than rejected so that an existing manifest stays importable and the value survives a round trip through `pkg edit`.
 
 #### Placement is recorded, not recomputed
 
@@ -584,8 +616,10 @@ storage_by_type["apt"] now resolves to "bulk", but 2 apt version(s) are recorded
   nginx@1.24.0 (on "default")
   redis@7.2.4 (on "default")
 apt uploads whole directories, so proceeding would split the tree across backends with no listing to reunite it.
-Move those objects, or pass --replace-placement to repoint the manifest and leave the old copies stranded
+Pass --replace-placement to repoint the manifest at "bulk" and re-upload; the old copies stay where they are and nothing copies them
 ```
+
+`--replace-placement` is the only remedy offered, because `bodega pkg move` refuses these three types. It repoints the manifest and copies nothing, so the objects in the previous backend stay there and must be removed by hand once the re-upload has landed.
 
 #### What is not placed
 

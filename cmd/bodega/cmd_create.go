@@ -56,6 +56,13 @@ Examples:
 			if err := checkBackendName(cfg, storagePolicy); err != nil {
 				return fmt.Errorf("--storage: %w", err)
 			}
+			// A name that resolves but will never be read is worse than one
+			// that does not resolve: nothing fails, and the operator believes
+			// the package is placed. Recorded either way, so 'pkg edit' shows
+			// what was asked for rather than silently dropping it.
+			if w := storagePolicyWarning(t, storagePolicy); w != "" {
+				fmt.Fprintln(os.Stderr, w)
+			}
 
 			store, err := loadStore(gf)
 			if err != nil {

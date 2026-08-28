@@ -42,11 +42,18 @@ Without a version, every version of the package moves. Versions already on the
 destination are skipped, so an interrupted move can be re-run. A frozen version
 refuses the whole command, mirroring delete.
 
-pypi is not movable: wheels upload as a directory with no per-version object
-key. Point storage_by_type at the backend you want and re-upload instead.`,
+apt, git and pypi are not movable. All three upload as a whole directory with
+no per-version granularity, so placing one package of the type away from the
+rest splits a tree nothing can reunite, and 'bodega build sync' would refuse
+for the whole type afterwards. Point storage_by_type at the backend you want
+and re-upload instead.
+
+Two backend names resolving to one directory or bucket is refused too, before
+anything is copied. Each object would land on the one it was read from, and
+--delete-source would then remove the only copy there is.`,
 		Example: `  bodega pkg move binary awscli-v2 --to bulk
   bodega pkg move npm @bitwarden/cli@2026.4.0 --to archive
-  bodega pkg move git netbox --to bulk --delete-source`,
+  bodega pkg move gomod github.com/aws/aws-sdk-go-v2@v1.30.0 --to archive --delete-source`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			t := args[0]
@@ -92,7 +99,7 @@ key. Point storage_by_type at the backend you want and re-upload instead.`,
 				return fmt.Errorf("%s entry %q not found", t, name)
 			}
 
-			targets, err := selectForMove(pm, version, toBackend)
+			targets, err := selectForMove(stores, dst, pm, version, toBackend)
 			if err != nil {
 				return err
 			}
@@ -139,10 +146,20 @@ func splitVersionArg(arg string) (name, version string) {
 // of it goes. "Already on the destination" only skips, because refusing it
 // would make a re-run after an interrupted move impossible, which is exactly
 // when a migration command is needed most.
-func selectForMove(pm *manifest.PackageManifest, version, dst string) ([]int, error) {
-	if pm.Type == manifest.TypePypi {
-		return nil, fmt.Errorf("pypi wheels upload as a directory with no per-version object key; " +
-			"repoint storage_by_type.pypi and re-upload instead")
+//
+// Two names for one physical location is a refusal, and it covers the whole
+// command rather than only --delete-source. The copy reads and writes one
+// object, so the verify that follows re-reads what it just overwrote and
+// passes; --delete-source then removes the artifact the manifest points at,
+// and both backends answer a missing object with "not found", so nothing
+// afterwards can tell it ever existed. Label is the identity because it is the
+// only thing an ObjectStore exposes about where it writes, and it is what
+// dedupByLabel already compares.
+func selectForMove(stores storage.Resolver, dst storage.ObjectStore, pm *manifest.PackageManifest, version, dstName string) ([]int, error) {
+	if directoryPlaced(pm.Type) {
+		return nil, fmt.Errorf("%s is not movable: %s; "+
+			"repoint storage_by_type.%s and re-upload instead",
+			pm.Type, noPerPackagePlacement(pm.Type), pm.Type)
 	}
 
 	var candidates []int
@@ -164,13 +181,20 @@ func selectForMove(pm *manifest.PackageManifest, version, dst string) ([]int, er
 
 	var frozen, already []string
 	var out []int
+	var collision string
 	for _, i := range candidates {
 		ve := pm.Versions[i]
+		src, err := stores.ByName(ve.Storage)
+		if err != nil {
+			return nil, fmt.Errorf("%s/%s@%s: %w", pm.Type, pm.Name, versionLabel(ve), err)
+		}
 		switch {
 		case ve.Frozen:
 			frozen = append(frozen, versionLabel(ve))
-		case effectiveStorage(ve.Storage) == dst:
+		case effectiveStorage(ve.Storage) == dstName:
 			already = append(already, versionLabel(ve))
+		case src.Label() == dst.Label():
+			collision = effectiveStorage(ve.Storage)
 		default:
 			out = append(out, i)
 		}
@@ -179,12 +203,18 @@ func selectForMove(pm *manifest.PackageManifest, version, dst string) ([]int, er
 		return nil, fmt.Errorf("%s/%s: version(s) %s are frozen — unfreeze first with 'bodega pkg freeze %s %s'",
 			pm.Type, pm.Name, strings.Join(frozen, ", "), pm.Type, pm.Name)
 	}
+	if collision != "" {
+		return nil, fmt.Errorf("%s/%s: backends %q and %q are the same location (%s) — "+
+			"every object would be copied onto itself, and --delete-source would then remove the only copy. "+
+			"Name a different --to, or drop the duplicate entry from storage_backends",
+			pm.Type, pm.Name, collision, dstName, dst.Label())
+	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("%s/%s: version(s) %s are already recorded on %q — nothing to move",
-			pm.Type, pm.Name, strings.Join(already, ", "), dst)
+			pm.Type, pm.Name, strings.Join(already, ", "), dstName)
 	}
 	for _, v := range already {
-		fmt.Printf("  %s@%s: already on %q, skipping\n", pm.Name, v, dst)
+		fmt.Printf("  %s@%s: already on %q, skipping\n", pm.Name, v, dstName)
 	}
 	return out, nil
 }

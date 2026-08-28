@@ -99,7 +99,7 @@ func (m detailsModel) s3AndClientFields(n *TreeNode) string {
 	var sb strings.Builder
 	sb.WriteString(s3StatusField(n.InS3))
 	sb.WriteByte('\n')
-	if key := s3Path(m.cfg, m.store, n.EntryType, n.Name, n.Version); key != "" {
+	if key := s3Path(m.store, n.EntryType, n.Name, n.Version); key != "" {
 		s3URI := key
 		if m.cfg.Bucket != "" {
 			s3URI = "s3://" + m.cfg.Bucket + "/" + key
@@ -254,8 +254,7 @@ func s3StatusField(inS3 bool) string {
 // A key shown here that nothing writes is the same defect as a key probed that
 // nothing writes, so this resolves through manifest.ArtifactKeys rather than
 // spelling the layouts out again.
-func s3Path(cfg *config.Config, store *manifest.Store, entryType, name, version string) string {
-	_ = cfg
+func s3Path(store *manifest.Store, entryType, name, version string) string {
 	ctx := context.Background()
 	pm, err := store.GetPackage(ctx, entryType, name)
 	if err != nil || pm == nil || len(pm.Versions) == 0 {

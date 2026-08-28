@@ -39,11 +39,22 @@ func (s *S3) Client() *bos3.Client {
 	return s.client
 }
 
+// S3 enforces ValidateKey on the same methods Local and Memory do. S3 itself
+// would happily store a key with ".." in it; the contract is uniform on
+// purpose, because a key is derived once and handed to whichever backend the
+// version records, and a driver that accepted more than its siblings would
+// make placement decide whether an artifact is reachable.
 func (s *S3) Get(ctx context.Context, key string) ([]byte, error) {
+	if err := ValidateKey(key); err != nil {
+		return nil, err
+	}
 	return s.client.GetObject(ctx, key)
 }
 
 func (s *S3) GetStream(ctx context.Context, key string) (*StreamResult, error) {
+	if err := ValidateKey(key); err != nil {
+		return nil, err
+	}
 	r, err := s.client.GetObjectStream(ctx, key)
 	if err != nil || r == nil {
 		return nil, err
@@ -57,6 +68,9 @@ func (s *S3) GetStream(ctx context.Context, key string) (*StreamResult, error) {
 }
 
 func (s *S3) Head(ctx context.Context, key string) (*ObjectInfo, error) {
+	if err := ValidateKey(key); err != nil {
+		return nil, err
+	}
 	st, err := s.client.HeadObject(ctx, key)
 	if err != nil {
 		return nil, err
@@ -71,18 +85,30 @@ func (s *S3) Head(ctx context.Context, key string) (*ObjectInfo, error) {
 }
 
 func (s *S3) List(ctx context.Context, prefix string) ([]string, error) {
+	if err := ValidateKey(prefix); err != nil {
+		return nil, err
+	}
 	return s.client.ListPrefix(ctx, prefix)
 }
 
 func (s *S3) Put(ctx context.Context, key string, data []byte) error {
+	if err := ValidateKey(key); err != nil {
+		return err
+	}
 	return s.client.PutBytes(ctx, key, data)
 }
 
 func (s *S3) PutFile(ctx context.Context, localPath, key string) error {
+	if err := ValidateKey(key); err != nil {
+		return err
+	}
 	return s.client.UploadFile(ctx, localPath, key)
 }
 
 func (s *S3) Delete(ctx context.Context, key string) error {
+	if err := ValidateKey(key); err != nil {
+		return err
+	}
 	return s.client.DeleteObject(ctx, key)
 }
 

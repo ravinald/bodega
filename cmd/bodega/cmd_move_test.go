@@ -231,6 +231,16 @@ func TestSelectForMoveGuards(t *testing.T) {
 			want: "no per-version object key",
 		},
 		{
+			name: "git uploads a whole directory, so one package cannot leave it",
+			pm:   &manifest.PackageManifest{Type: manifest.TypeGit, Name: "netbox", Versions: []manifest.VersionEntry{{Ref: "v4.5.5"}}},
+			want: "git is not movable",
+		},
+		{
+			name: "apt uploads a whole directory too",
+			pm:   &manifest.PackageManifest{Type: manifest.TypeApt, Name: "nginx", Versions: []manifest.VersionEntry{{Version: "1.24.0"}}},
+			want: "apt is not movable",
+		},
+		{
 			name:    "an unknown version names the ones that exist",
 			pm:      base(manifest.VersionEntry{Version: "2.1.0"}),
 			version: "9.9.9",
@@ -238,7 +248,12 @@ func TestSelectForMoveGuards(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := selectForMove(tc.pm, tc.version, "bulk")
+			r := &testResolver{def: storage.NewMemory(), bulk: storage.NewMemory()}
+			dst, err := r.ByName("bulk")
+			if err != nil {
+				t.Fatalf("ByName: %v", err)
+			}
+			_, err = selectForMove(r, dst, tc.pm, tc.version, "bulk")
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("selectForMove = %v, want an error containing %q", err, tc.want)
 			}
@@ -257,7 +272,12 @@ func TestSelectForMoveSkipsWhatIsAlreadyThere(t *testing.T) {
 			{Version: "2.1.0"},
 		},
 	}
-	got, err := selectForMove(pm, "", "bulk")
+	r := &testResolver{def: storage.NewMemory(), bulk: storage.NewMemory()}
+	dst, err := r.ByName("bulk")
+	if err != nil {
+		t.Fatalf("ByName: %v", err)
+	}
+	got, err := selectForMove(r, dst, pm, "", "bulk")
 	if err != nil {
 		t.Fatalf("selectForMove: %v", err)
 	}
@@ -277,5 +297,62 @@ func TestSplitVersionArg(t *testing.T) {
 		if name != tc.name || version != tc.version {
 			t.Errorf("splitVersionArg(%q) = (%q, %q), want (%q, %q)", tc.in, name, version, tc.name, tc.version)
 		}
+	}
+}
+
+// TestSelectForMoveRefusesOneLocationUnderTwoNames is the artifact-destroying
+// case, and the reason the check sits in selectForMove rather than in
+// moveVersion.
+//
+// Two names for one bucket is documented as a normal way to stage a migration,
+// and config.Load rejects a colliding name but not a colliding path. Copying
+// then reads and writes one object: the verify re-reads what it overwrote and
+// passes, the manifest is repointed at a backend it was already on, and
+// --delete-source removes the only copy. Exit 0, three lines of success, no
+// artifact.
+func TestSelectForMoveRefusesOneLocationUnderTwoNames(t *testing.T) {
+	one := storage.NewMemory()
+	one.Seed(awscliKey, "the only copy")
+	r := &testResolver{def: one, bulk: one}
+	dst, err := r.ByName("bulk")
+	if err != nil {
+		t.Fatalf("ByName: %v", err)
+	}
+	pm := &manifest.PackageManifest{
+		Type: manifest.TypeBinary, Name: "awscli",
+		Versions: []manifest.VersionEntry{{Version: "2.1.0"}},
+	}
+
+	_, err = selectForMove(r, dst, pm, "", "bulk")
+	if err == nil {
+		t.Fatal("selectForMove accepted a move whose source and destination are one location")
+	}
+	if !strings.Contains(err.Error(), "same location") {
+		t.Fatalf("error %q does not name the collision", err)
+	}
+	// The refusal is the whole command, not only --delete-source: a move that
+	// copied every object onto itself and reported success would teach the
+	// operator that the placement changed.
+	if !strings.Contains(err.Error(), "--delete-source") {
+		t.Errorf("error %q does not say what --delete-source would have cost", err)
+	}
+}
+
+// TestSelectForMoveReportsAnUnresolvableSource pins that a recorded backend no
+// config defines fails at selection, beside the other preconditions, rather
+// than after the first version has already travelled.
+func TestSelectForMoveReportsAnUnresolvableSource(t *testing.T) {
+	r := &testResolver{def: storage.NewMemory(), bulk: storage.NewMemory()}
+	dst, err := r.ByName("bulk")
+	if err != nil {
+		t.Fatalf("ByName: %v", err)
+	}
+	pm := &manifest.PackageManifest{
+		Type: manifest.TypeBinary, Name: "awscli",
+		Versions: []manifest.VersionEntry{{Version: "2.1.0", Storage: "ghost"}},
+	}
+	if _, err := selectForMove(r, dst, pm, "", "bulk"); err == nil ||
+		!strings.Contains(err.Error(), "unknown storage backend") {
+		t.Fatalf("selectForMove = %v, want an unknown-backend error", err)
 	}
 }
