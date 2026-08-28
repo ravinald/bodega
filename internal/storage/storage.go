@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -20,6 +21,12 @@ import (
 
 // ObjectStore is the unified interface for all object storage operations.
 // Implementations must be safe for concurrent use.
+//
+// Every method that takes a key rejects one ValidateKey rejects, on every
+// backend. Uniformity is the point: a key is derived once in internal/manifest
+// and handed to whichever backend a version records, so a key one driver
+// stores and another refuses would make placement decide whether an artifact
+// is reachable.
 type ObjectStore interface {
 	// Get returns the raw bytes stored at key. Returns (nil, nil) when the
 	// object does not exist.
@@ -54,6 +61,32 @@ type ObjectStore interface {
 	// Label returns a human-readable description of the storage location,
 	// e.g. "s3://bucket-name", "file:///var/lib/bodega/data".
 	Label() string
+}
+
+// keyRoot is the virtual root ValidateKey resolves a key against. It never
+// touches a filesystem; it exists so the traversal rule can be stated once, in
+// terms every backend shares, rather than once per driver.
+const keyRoot = "/store"
+
+// ValidateKey rejects a key no backend may store, whatever its namespace.
+//
+// A NUL truncates the path at the syscall boundary, so "a\x00/../../etc"
+// reaches the kernel as "a" and any traversal check that ran on the Go string
+// passed on something the filesystem never saw. A key that normalizes above
+// the root addresses an object outside the store.
+//
+// Flat backends enforce it too. A test double that accepted keys the
+// filesystem backend rejects lets a server test pass on a key that errors in
+// production, which is the one failure a shared contract exists to prevent.
+func ValidateKey(key string) error {
+	if strings.ContainsRune(key, 0) {
+		return fmt.Errorf("key %q contains a NUL byte", key)
+	}
+	p := path.Join(keyRoot, key)
+	if p != keyRoot && !strings.HasPrefix(p, keyRoot+"/") {
+		return fmt.Errorf("key %q escapes storage root", key)
+	}
+	return nil
 }
 
 // StreamResult holds the response from a streaming read.

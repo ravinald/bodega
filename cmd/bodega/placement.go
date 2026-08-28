@@ -67,7 +67,7 @@ func (p *placer) forVersion(ctx context.Context, typ, pkg, version, key string) 
 	// that predates it. The manifest is written before the bytes either way,
 	// so the record and the newest copy always agree.
 	recorded := pm.Versions[i].Storage
-	name := p.stores.Placement(typ, pm.StoragePolicy).Name
+	name := writePlacement(p.stores, typ, pm.StoragePolicy).Name
 	if recorded != "" && !p.replace {
 		name = recorded
 	}
@@ -88,10 +88,10 @@ func (p *placer) forVersion(ctx context.Context, typ, pkg, version, key string) 
 // A per-package storage_policy is deliberately not consulted here. SyncDir
 // uploads one directory to one prefix, so honoring a policy for some packages
 // of the type and not others would split the tree exactly the way the refusal
-// below exists to prevent. Packages of these types that must live elsewhere
-// are moved with 'bodega pkg move'.
+// below exists to prevent. See directoryPlaced: 'bodega pkg move' refuses
+// these types for the same reason, so a whole type moves or none of it does.
 func (p *placer) forType(ctx context.Context, typ string) (storage.ObjectStore, error) {
-	name := p.stores.Placement(typ, "").Name
+	name := writePlacement(p.stores, typ, "").Name
 
 	var stranded []string
 	for _, pkg := range p.store.ListPackages(typ) {
@@ -110,11 +110,15 @@ func (p *placer) forType(ctx context.Context, typ string) (storage.ObjectStore, 
 	sort.Strings(stranded)
 
 	if len(stranded) > 0 && !p.replace {
+		// The remedy names --replace-placement and nothing else. "Move those
+		// objects" was the other branch until 'pkg move' started refusing
+		// these types outright, and offering an operator a command that
+		// refuses is worse than offering them one option.
 		return nil, fmt.Errorf(
 			"storage_by_type[%q] now resolves to %q, but %d %s version(s) are recorded elsewhere:\n  %s\n"+
 				"%s uploads whole directories, so proceeding would split the tree across backends with no listing to reunite it.\n"+
-				"Move those objects, or pass --replace-placement to repoint the manifest and leave the old copies stranded",
-			typ, name, len(stranded), typ, strings.Join(stranded, "\n  "), typ)
+				"Pass --replace-placement to repoint the manifest at %q and re-upload; the old copies stay where they are and nothing copies them",
+			typ, name, len(stranded), typ, strings.Join(stranded, "\n  "), typ, name)
 	}
 
 	for _, pkg := range p.store.ListPackages(typ) {
@@ -182,6 +186,60 @@ func (p *placer) strandedAt(ctx context.Context, recorded, key string) (bool, er
 		return false, err
 	}
 	return info.Exists, nil
+}
+
+// directoryPlaced reports whether a type's artifacts reach storage as a whole
+// directory rather than one object per version.
+//
+// SyncDir uploads one tree to one prefix, so these three have no per-version
+// granularity at either end. Two rules follow: the package level of the
+// placement hierarchy is not consulted for them, and 'bodega pkg move' refuses
+// them. A package placed apart from the rest of its type splits a tree with
+// nothing to reunite it — git and apt are served with no listing to fan out
+// over, and pypi has no per-version object key at all.
+func directoryPlaced(typ string) bool {
+	switch typ {
+	case manifest.TypeApt, manifest.TypeGit, manifest.TypePypi:
+		return true
+	}
+	return false
+}
+
+// noPerPackagePlacement says why one type cannot carry a per-package
+// placement, in whichever terms that type's operator will recognize.
+func noPerPackagePlacement(typ string) string {
+	if typ == manifest.TypePypi {
+		return "pypi wheels upload as a directory with no per-version object key"
+	}
+	return typ + " uploads whole directories with SyncDir, so one package cannot be placed apart from the rest of its type"
+}
+
+// writePlacement resolves the backend the write path will actually target.
+//
+// Resolver.Placement answers the three-level hierarchy in the abstract.
+// Whole-directory types never reach the package level, so asking it with a
+// policy it will not honor produces an answer no upload would ever act on —
+// which is what 'bodega pkg storage' was printing. The skipped policy travels
+// on the Decision so a caller can name it instead of quietly dropping it.
+func writePlacement(stores storage.Resolver, typ, policy string) storage.Decision {
+	if !directoryPlaced(typ) {
+		return stores.Placement(typ, policy)
+	}
+	d := stores.Placement(typ, "")
+	d.IgnoredPolicy = policy
+	return d
+}
+
+// storagePolicyWarning reports a storage_policy the write path will never
+// consult. Recording an inert field without comment is how an operator comes
+// to believe a package has been placed when nothing about it moved.
+func storagePolicyWarning(typ, policy string) string {
+	if policy == "" || !directoryPlaced(typ) {
+		return ""
+	}
+	return fmt.Sprintf("warning: storage_policy %q has no effect for %s: %s. "+
+		"Set storage_by_type.%s to place the whole type; 'bodega pkg move' refuses %s for the same reason.",
+		policy, typ, noPerPackagePlacement(typ), typ, typ)
 }
 
 // effectiveStorage applies the empty-means-default rule. It is the only place

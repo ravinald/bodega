@@ -122,3 +122,76 @@ func seed(t *testing.T, root, key, content string) {
 		t.Fatalf("write %s: %v", path, err)
 	}
 }
+
+// gitPlacementServer mirrors placementServer for the git route: the same
+// bundle key in both backends with different bytes, and one git entry whose
+// recorded storage the test varies.
+//
+// storage_by_type has no git key here, so the type rule resolves to the
+// default backend. That is the configuration issue #61 exempted git from and
+// item 10 then made reachable: a bundle moved to "bulk" is served from
+// wherever the read path looks, and only one of those answers is right.
+func gitPlacementServer(t *testing.T, recordedStorage string) *httptest.Server {
+	t.Helper()
+	defaultRoot, bulkRoot := t.TempDir(), t.TempDir()
+	key := manifest.GitKey("netbox", "v4.5.5", false)
+	seed(t, defaultRoot, key, "from-default")
+	seed(t, bulkRoot, key, "from-bulk")
+
+	cfg := &config.Config{
+		ManifestDir:    "manifests",
+		AptCodename:    "noble",
+		MetadataTTL:    "1h",
+		StorageBackend: "local",
+		StoragePath:    defaultRoot,
+		StorageBackends: map[string]config.StorageSpec{
+			"bulk": {Driver: "local", Path: bulkRoot},
+		},
+	}
+
+	store := manifest.NewLocalStore(t.TempDir())
+	if err := store.AddVersion(t.Context(), manifest.TypeGit, "netbox", manifest.VersionEntry{
+		Ref:     "v4.5.5",
+		URL:     "https://github.com/netbox-community/netbox",
+		Storage: recordedStorage,
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+
+	stores, err := storage.NewResolver(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	ts := httptest.NewServer(server.New(cfg, store, stores, ":0", nil).Handler())
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+// TestGitBundleReadsTheRecordedBackend is the 404 'bodega pkg move git netbox
+// --to bulk' used to produce. The bundle is on "bulk" and nothing else is, so
+// a handler resolving through the type rule finds nothing.
+func TestGitBundleReadsTheRecordedBackend(t *testing.T) {
+	ts := gitPlacementServer(t, "bulk")
+
+	code, body := getBody(t, ts, "/git/netbox/netbox-v4.5.5.bundle")
+	if code != http.StatusOK {
+		t.Fatalf("GET bundle = %d (%q), want 200", code, body)
+	}
+	if body != "from-bulk" {
+		t.Fatalf("served %q, want %q — the git handler resolved through the type rule, not the recorded backend", body, "from-bulk")
+	}
+}
+
+// TestGitBundleEmptyStorageMeansDefault is the same "" == default rule the apt
+// route pins, on the route that was reading by type until now.
+func TestGitBundleEmptyStorageMeansDefault(t *testing.T) {
+	ts := gitPlacementServer(t, "")
+
+	code, body := getBody(t, ts, "/git/netbox/netbox-v4.5.5.bundle")
+	if code != http.StatusOK {
+		t.Fatalf("GET bundle = %d (%q), want 200", code, body)
+	}
+	if body != "from-default" {
+		t.Fatalf("served %q, want %q", body, "from-default")
+	}
+}

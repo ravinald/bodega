@@ -12,6 +12,12 @@ import (
 // handleGitBundle serves a bundle or release archive from the key the uploader
 // wrote, rebuilt from the ref parsed out of the request rather than pasted
 // from it.
+//
+// The ref recovered here is also the manifest entry's identity, which is what
+// lets the read resolve through the backend the version records rather than
+// through the type rule. Resolving by type was safe only while nothing could
+// place one git package away from the rest of its type, and 'bodega pkg move'
+// writes VersionEntry.Storage directly.
 func (s *Server) handleGitBundle(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	file := r.PathValue("file")
@@ -30,7 +36,7 @@ func (s *Server) handleGitBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	setCacheImmutable(w, file)
-	s.proxyS3(w, r, s.typeStore(manifest.TypeGit), manifest.GitKey(name, ref, release))
+	s.proxyVersion(w, r, manifest.TypeGit, name, ref, manifest.GitKey(name, ref, release))
 }
 
 // gitRefFromFile recovers the ref from a bundle or release-archive filename.

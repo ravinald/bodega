@@ -566,7 +566,6 @@ func TestS3PathSafeEncoding(t *testing.T) {
 	_ = store.AddVersion(ctx, manifest.TypeGomod, "github.com/aws/aws-sdk-go", manifest.VersionEntry{Version: "v1.2.3"})
 	_ = store.AddVersion(ctx, manifest.TypeGit, "netbox-community/netbox", manifest.VersionEntry{Ref: "v4.5.7"})
 
-	cfg := &config.Config{}
 	cases := []struct {
 		label, typ, name, want string
 	}{
@@ -574,13 +573,13 @@ func TestS3PathSafeEncoding(t *testing.T) {
 		{"gomod keeps its slashes", manifest.TypeGomod, "github.com/aws/aws-sdk-go", "gomod/github.com/aws/aws-sdk-go/@v/v1.2.3.zip"},
 	}
 	for _, c := range cases {
-		got := s3Path(cfg, store, c.typ, c.name, "")
+		got := s3Path(store, c.typ, c.name, "")
 		if got != c.want {
 			t.Errorf("%s:\n  got:  %s\n  want: %s", c.label, got, c.want)
 		}
 	}
 	// git is already safe-encoded; just assert the result doesn't leak a raw '/'.
-	gitPath := s3Path(cfg, store, manifest.TypeGit, "netbox-community/netbox", "")
+	gitPath := s3Path(store, manifest.TypeGit, "netbox-community/netbox", "")
 	if strings.Contains(gitPath, "netbox-community/netbox") {
 		t.Errorf("git path leaked the canonical slash form: %s", gitPath)
 	}
@@ -594,15 +593,14 @@ func TestS3PathUsesSelectedVersion(t *testing.T) {
 	_ = store.AddVersion(ctx, manifest.TypeNpm, "pkg", manifest.VersionEntry{Version: "1.0.0"})
 	_ = store.AddVersion(ctx, manifest.TypeNpm, "pkg", manifest.VersionEntry{Version: "2.0.0"})
 
-	cfg := &config.Config{}
-	if got := s3Path(cfg, store, manifest.TypeNpm, "pkg", "2.0.0"); !strings.Contains(got, "2.0.0") || strings.Contains(got, "1.0.0") {
+	if got := s3Path(store, manifest.TypeNpm, "pkg", "2.0.0"); !strings.Contains(got, "2.0.0") || strings.Contains(got, "1.0.0") {
 		t.Errorf("want path for 2.0.0, got %q", got)
 	}
-	if got := s3Path(cfg, store, manifest.TypeNpm, "pkg", "1.0.0"); !strings.Contains(got, "1.0.0") || strings.Contains(got, "2.0.0") {
+	if got := s3Path(store, manifest.TypeNpm, "pkg", "1.0.0"); !strings.Contains(got, "1.0.0") || strings.Contains(got, "2.0.0") {
 		t.Errorf("want path for 1.0.0, got %q", got)
 	}
 	// Empty version falls back to Versions[0].
-	first := s3Path(cfg, store, manifest.TypeNpm, "pkg", "")
+	first := s3Path(store, manifest.TypeNpm, "pkg", "")
 	if !strings.Contains(first, "1.0.0") {
 		t.Errorf("empty version should fall back to first entry, got %q", first)
 	}

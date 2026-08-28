@@ -157,7 +157,7 @@ re-run with --editor cat to inspect, or copy and retry.`,
 				pm.Versions[targetIdx] = ve
 			}
 
-			if err := validateManifest(pm, cfg); err != nil {
+			if err := validateManifest(pm, cfg, os.Stderr); err != nil {
 				return keep("validation: %v", err)
 			}
 

@@ -43,14 +43,14 @@ func NewLocal(root string) *Local {
 }
 
 func (l *Local) path(key string) (string, error) {
-	// A NUL truncates the path at the syscall boundary, so "a\x00/../../etc"
-	// reaches the kernel as "a" — the traversal check below would pass on a
-	// string the filesystem never sees. Reject it before Join normalizes it.
-	if strings.ContainsRune(key, 0) {
-		return "", fmt.Errorf("key %q contains a NUL byte", key)
+	if err := ValidateKey(key); err != nil {
+		return "", err
 	}
 	p := filepath.Join(l.root, filepath.FromSlash(key))
-	// Prevent path traversal out of the storage root.
+	// ValidateKey answers the same question against a virtual root. This
+	// repeats it against the real one, because l.root is operator-supplied and
+	// a root that is not already clean would not resolve the way the virtual
+	// check assumed.
 	if !strings.HasPrefix(p, l.root+string(filepath.Separator)) && p != l.root {
 		return "", fmt.Errorf("key %q escapes storage root", key)
 	}
@@ -206,6 +206,13 @@ func (l *Local) Delete(_ context.Context, key string) error {
 	p, err := l.path(key)
 	if err != nil {
 		return err
+	}
+	// A key naming a directory names no object. os.Remove would fail on a
+	// populated one and succeed on an empty one, so the same call either
+	// errors on a key that was never stored or removes a tree node no caller
+	// asked about; every other backend answers "not there" and returns nil.
+	if fi, err := os.Lstat(p); err == nil && fi.IsDir() {
+		return nil
 	}
 	err = os.Remove(p)
 	if errors.Is(err, fs.ErrNotExist) {

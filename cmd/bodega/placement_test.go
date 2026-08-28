@@ -248,7 +248,8 @@ func TestValidateManifestRejectsAnUnknownStoragePolicy(t *testing.T) {
 	}
 	pm := &manifest.PackageManifest{Name: "netbox", Type: manifest.TypeGit, StoragePolicy: "archive"}
 
-	err := validateManifest(pm, cfg)
+	var warnings bytes.Buffer
+	err := validateManifest(pm, cfg, &warnings)
 	if err == nil {
 		t.Fatal("validateManifest accepted a storage_policy naming no configured backend")
 	}
@@ -259,7 +260,100 @@ func TestValidateManifestRejectsAnUnknownStoragePolicy(t *testing.T) {
 	}
 
 	pm.StoragePolicy = "bulk"
-	if err := validateManifest(pm, cfg); err != nil {
+	if err := validateManifest(pm, cfg, &warnings); err != nil {
 		t.Errorf("validateManifest rejected a configured backend: %v", err)
+	}
+}
+
+// TestValidateManifestWarnsOnAnInertStoragePolicy: git uploads a whole
+// directory, so its package level is never consulted and this policy will
+// change nothing. Recording an inert field without comment is how an operator
+// comes to believe a package has been placed.
+//
+// A warning rather than a refusal, because manifests already in the field
+// carry these and failing would make 'pkg edit' refuse a file that was legal
+// when it was written.
+func TestValidateManifestWarnsOnAnInertStoragePolicy(t *testing.T) {
+	cfg := &config.Config{
+		StorageBackend:  "local",
+		StoragePath:     t.TempDir(),
+		StorageBackends: map[string]config.StorageSpec{"bulk": {Driver: "local", Path: t.TempDir()}},
+	}
+
+	var warnings bytes.Buffer
+	pm := &manifest.PackageManifest{Name: "netbox", Type: manifest.TypeGit, StoragePolicy: "bulk"}
+	if err := validateManifest(pm, cfg, &warnings); err != nil {
+		t.Fatalf("validateManifest: %v", err)
+	}
+	for _, want := range []string{"no effect", "storage_by_type.git"} {
+		if !strings.Contains(warnings.String(), want) {
+			t.Errorf("warning %q does not mention %q", warnings.String(), want)
+		}
+	}
+
+	// A type placed per version gets no warning: the policy is honored there.
+	warnings.Reset()
+	npm := &manifest.PackageManifest{Name: "cli", Type: manifest.TypeNpm, StoragePolicy: "bulk"}
+	if err := validateManifest(npm, cfg, &warnings); err != nil {
+		t.Fatalf("validateManifest: %v", err)
+	}
+	if warnings.Len() != 0 {
+		t.Errorf("warned about a storage_policy the npm write path honors: %q", warnings.String())
+	}
+}
+
+// TestWritePlacementReportsWhatTheWritePathDoes is requirement 4's guard.
+//
+// 'bodega pkg storage' exists to answer "why did this package land there", and
+// an operator reads it after the fact. Resolver.Placement honors a package
+// policy for every type; the write path does not, because forType uploads the
+// whole directory to one prefix and passes "". Printing the hierarchy's answer
+// for git or apt reports a level no upload will ever use, which is worse than
+// printing nothing.
+func TestWritePlacementReportsWhatTheWritePathDoes(t *testing.T) {
+	cfg := &config.Config{
+		StorageBackend:  "local",
+		StoragePath:     t.TempDir(),
+		StorageBackends: map[string]config.StorageSpec{"bulk": {Driver: "local", Path: t.TempDir()}},
+	}
+	stores, err := storage.NewResolver(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+
+	for _, typ := range []string{manifest.TypeApt, manifest.TypeGit, manifest.TypePypi} {
+		d := writePlacement(stores, typ, "bulk")
+		if d.Name != storage.DefaultName {
+			t.Errorf("%s: writePlacement named %q, but forType writes to %q", typ, d.Name, storage.DefaultName)
+		}
+		if d.Level != storage.LevelDefault {
+			t.Errorf("%s: level %v, want LevelDefault — no rule applied", typ, d.Level)
+		}
+		if d.IgnoredPolicy != "bulk" {
+			t.Errorf("%s: the skipped policy was dropped rather than reported", typ)
+		}
+		if !strings.Contains(d.Reason(typ), "not consulted") {
+			t.Errorf("%s: Reason %q does not say the policy was skipped", typ, d.Reason(typ))
+		}
+		if w := storagePolicyWarning(typ, "bulk"); !strings.Contains(w, "storage_by_type."+typ) {
+			t.Errorf("%s: warning %q does not name the config key that would work", typ, w)
+		}
+	}
+
+	// The five per-version types are unchanged: the policy decides and wins.
+	for _, typ := range []string{
+		manifest.TypeBinary, manifest.TypeNpm, manifest.TypeCargo,
+		manifest.TypeGomod, manifest.TypeHelm,
+	} {
+		d := writePlacement(stores, typ, "bulk")
+		if d.Name != "bulk" || d.Level != storage.LevelPackage {
+			t.Errorf("%s: writePlacement = %+v, want bulk at the package level", typ, d)
+		}
+		if d.IgnoredPolicy != "" {
+			t.Errorf("%s: reported a policy as skipped that the write path honors", typ)
+		}
+		if storagePolicyWarning(typ, "bulk") != "" {
+			t.Errorf("%s: warned about a policy the write path honors", typ)
+		}
 	}
 }

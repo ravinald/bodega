@@ -39,22 +39,35 @@ const (
 )
 
 // Decision is a placement answer: the backend name, and the rule that chose it.
+//
+// IgnoredPolicy carries a package storage_policy the write path will not
+// consult, for the types that upload a whole directory at a time. It is set by
+// the caller, which knows how the type reaches storage; storage does not, and
+// giving it that knowledge would make a second place answer the question.
+// Dropping the policy silently is what made 'bodega pkg storage' print a level
+// no upload would ever act on.
 type Decision struct {
-	Name  string
-	Level Level
+	Name          string
+	Level         Level
+	IgnoredPolicy string
 }
 
 // Reason renders the deciding rule for an operator, naming the config key the
 // type level reads so it can be found and changed.
 func (d Decision) Reason(typ string) string {
+	var reason string
 	switch d.Level {
 	case LevelPackage:
-		return "package policy"
+		reason = "package policy"
 	case LevelType:
-		return "type rule: storage_by_type." + typ
+		reason = "type rule: storage_by_type." + typ
 	default:
-		return "global default; no type or package rule"
+		reason = "global default; no type or package rule"
 	}
+	if d.IgnoredPolicy != "" {
+		reason += fmt.Sprintf("; storage_policy %q is not consulted for %s", d.IgnoredPolicy, typ)
+	}
+	return reason
 }
 
 // Resolver answers two different questions with two different methods, and

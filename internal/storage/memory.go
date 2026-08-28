@@ -8,8 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -31,9 +33,20 @@ type memObject struct {
 	modified time.Time
 }
 
+// memSeq numbers Memory instances so each one has its own Label.
+//
+// Label is the identity dedupByLabel compares to decide whether two backend
+// names are one physical location, and 'pkg move' refuses a move between two
+// names that share one. Every Memory answering "mem://" would make a fixture
+// of two independent stores look like a single place to both.
+var memSeq atomic.Uint64
+
 // NewMemory returns an empty in-memory store.
 func NewMemory() *Memory {
-	return &Memory{objects: map[string]memObject{}, label: "mem://"}
+	return &Memory{
+		objects: map[string]memObject{},
+		label:   "mem://" + strconv.FormatUint(memSeq.Add(1), 10),
+	}
 }
 
 // Seed stores data at key without a context or an error return, for test
@@ -55,16 +68,28 @@ func (m *Memory) Keys() []string {
 }
 
 func (m *Memory) Get(_ context.Context, key string) ([]byte, error) {
+	if err := ValidateKey(key); err != nil {
+		return nil, err
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	obj, ok := m.objects[key]
 	if !ok {
 		return nil, nil
 	}
-	return append([]byte(nil), obj.data...), nil
+	// nil is the answer to "no such object" and nothing else, so a stored
+	// zero-length object comes back as a non-nil empty slice. append to a nil
+	// slice would return nil for one, making an empty artifact
+	// indistinguishable from a missing one.
+	out := make([]byte, len(obj.data))
+	copy(out, obj.data)
+	return out, nil
 }
 
 func (m *Memory) GetStream(_ context.Context, key string) (*StreamResult, error) {
+	if err := ValidateKey(key); err != nil {
+		return nil, err
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	obj, ok := m.objects[key]
@@ -80,6 +105,9 @@ func (m *Memory) GetStream(_ context.Context, key string) (*StreamResult, error)
 }
 
 func (m *Memory) Head(_ context.Context, key string) (*ObjectInfo, error) {
+	if err := ValidateKey(key); err != nil {
+		return nil, err
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	obj, ok := m.objects[key]
@@ -95,6 +123,9 @@ func (m *Memory) Head(_ context.Context, key string) (*ObjectInfo, error) {
 }
 
 func (m *Memory) List(_ context.Context, prefix string) ([]string, error) {
+	if err := ValidateKey(prefix); err != nil {
+		return nil, err
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	var keys []string
@@ -108,6 +139,9 @@ func (m *Memory) List(_ context.Context, prefix string) ([]string, error) {
 }
 
 func (m *Memory) Put(_ context.Context, key string, data []byte) error {
+	if err := ValidateKey(key); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.objects[key] = memObject{data: append([]byte(nil), data...), modified: time.Now()}
@@ -115,6 +149,9 @@ func (m *Memory) Put(_ context.Context, key string, data []byte) error {
 }
 
 func (m *Memory) PutFile(ctx context.Context, localPath, key string) error {
+	if err := ValidateKey(key); err != nil {
+		return err
+	}
 	data, err := os.ReadFile(localPath)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", localPath, err)
@@ -123,6 +160,9 @@ func (m *Memory) PutFile(ctx context.Context, localPath, key string) error {
 }
 
 func (m *Memory) Delete(_ context.Context, key string) error {
+	if err := ValidateKey(key); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.objects, key)
@@ -147,7 +187,7 @@ func (m *Memory) SyncDir(ctx context.Context, out io.Writer, localDir, keyPrefix
 			return err
 		}
 		if out != nil {
-			fmt.Fprintf(out, "    upload: mem://%s\n", key)
+			fmt.Fprintf(out, "    upload: %s%s\n", m.label, key)
 		}
 		count++
 		return nil

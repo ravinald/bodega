@@ -77,7 +77,7 @@ Examples:
 
 				for i := range pms {
 					pm := &pms[i]
-					if err := validateManifest(pm, cfg); err != nil {
+					if err := validateManifest(pm, cfg, os.Stderr); err != nil {
 						return fmt.Errorf("validate %s [%s/%s]: %w", path, pm.Type, pm.Name, err)
 					}
 					if err := enforceImportPolicy(ctx, checker, adb, pm); err != nil {
@@ -237,7 +237,15 @@ func enforceImportPolicy(ctx context.Context, checker *policy.Checker, adb *audi
 	return nil
 }
 
-func validateManifest(pm *manifest.PackageManifest, cfg *config.Config) error {
+// validateManifest rejects a manifest the rest of bodega cannot act on, and
+// warns to out about one it can act on but will not honor.
+//
+// The split matters. A backend name nothing defines makes the artifact
+// unreadable, so it fails. A storage_policy on a whole-directory type is inert
+// rather than wrong, and manifests already in the field carry them; failing
+// would make 'pkg edit' and 'pkg import' refuse a file that was legal when it
+// was written.
+func validateManifest(pm *manifest.PackageManifest, cfg *config.Config, out io.Writer) error {
 	if pm.Name == "" {
 		return fmt.Errorf("name is required")
 	}
@@ -258,6 +266,9 @@ func validateManifest(pm *manifest.PackageManifest, cfg *config.Config) error {
 	// edit that introduced it and with no obvious connection back to it.
 	if err := checkBackendName(cfg, pm.StoragePolicy); err != nil {
 		return fmt.Errorf("storage_policy: %w", err)
+	}
+	if w := storagePolicyWarning(pm.Type, pm.StoragePolicy); w != "" {
+		fmt.Fprintf(out, "%s/%s: %s\n", pm.Type, pm.Name, w)
 	}
 	// A hand-edited storage name that matches no configured backend makes the
 	// artifact unreadable: resolution never falls back to another backend, so

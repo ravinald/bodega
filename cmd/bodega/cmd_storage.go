@@ -23,6 +23,10 @@ storage_policy, then storage_by_type for its type, then the default backend.
 Naming the winning level is the point — "bulk" on its own does not say whether
 a package policy took effect or a forgotten type rule did.
 
+apt, git and pypi upload a whole directory at a time, so the package level is
+not consulted for them and a storage_policy on one of their packages changes
+nothing. This says so rather than reporting a level the upload will not use.
+
 This is the WRITE side. It says nothing about where versions already uploaded
 live; each of those records its own backend, and 'bodega show pkg' prints it.`,
 		Example: `  bodega pkg storage git netbox
@@ -56,9 +60,15 @@ live; each of those records its own backend, and 'bodega show pkg' prints it.`,
 			if err != nil {
 				return fmt.Errorf("connect to storage: %w", err)
 			}
-			d := stores.Placement(t, pm.StoragePolicy)
+			// writePlacement, not Placement: this command exists to report
+			// what an upload will do, and the two answers differ for a type
+			// whose package level is never consulted.
+			d := writePlacement(stores, t, pm.StoragePolicy)
 
 			fmt.Printf("%s -> %-8s (%s)\n", t+"/"+name, d.Name, d.Reason(t))
+			if w := storagePolicyWarning(t, pm.StoragePolicy); w != "" {
+				fmt.Println("  " + w)
+			}
 			return nil
 		},
 	}
