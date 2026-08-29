@@ -7,6 +7,7 @@
 package config
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +25,12 @@ const (
 	DefaultLogWindowHeight = 12
 	DefaultLogLevel        = 0
 	DefaultListenAddr      = ":8080"
+
+	// DefaultTLSMinVersion is the floor bodega's own listener negotiates down
+	// to. 1.3 rather than the Go default of 1.2: a deployment that must serve
+	// an older client is expected to put a terminator in front rather than
+	// lower the floor for every other client at the same time.
+	DefaultTLSMinVersion = "1.3"
 
 	// DefaultStoragePath is the local backend's root when storage_path is
 	// unset. internal/storage applies the same value; the built-in manifest
@@ -96,6 +103,24 @@ type Config struct {
 	AptSigningName    string   `json:"apt_signing_name,omitempty"`  // UID name on a key made by `bodega apt key generate`
 	AptSigningEmail   string   `json:"apt_signing_email,omitempty"` // UID email on a key made by `bodega apt key generate`
 	AdminPermitCIDR   []string `json:"admin_permit_cidr,omitempty"` // CIDRs allowed to hit mutation API; default ["127.0.0.0/8","::1/128"]
+
+	// TrustedProxies names the peers whose X-Real-IP, X-Forwarded-For and
+	// X-Forwarded-Proto bodega will believe. It is deliberately tri-state and
+	// carries no omitempty, so the distinction survives a Save:
+	//
+	//	absent   (nil)            built-in default: loopback + RFC 1918
+	//	[]       (empty non-nil)  trust nobody; every request is its peer
+	//	["..."]  (populated)      trust exactly these
+	//
+	// Never collapse the first two with len() == 0. An operator who writes an
+	// empty list is disabling header trust on purpose, and reading that as
+	// "unset" hands the default back to a deployment that asked to have none.
+	TrustedProxies []string `json:"trusted_proxies"`
+
+	// TLSMinVersion is the floor for bodega's own listener, "1.2" or "1.3",
+	// defaulting to 1.3. It governs nothing when a proxy terminates TLS, which
+	// is the supported way to serve a client that cannot reach the floor.
+	TLSMinVersion string `json:"tls_min_version,omitempty"`
 
 	// StorageBackends maps a backend *name* to its parameters. The name is
 	// what an artifact records in the manifest, so it has to be stable and
@@ -280,6 +305,13 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	// Mutation allow-list: default to localhost only.
 	if len(cfg.AdminPermitCIDR) == 0 {
 		cfg.AdminPermitCIDR = []string{"127.0.0.0/8", "::1/128"}
+	}
+
+	if cfg.TLSMinVersion == "" {
+		cfg.TLSMinVersion = DefaultTLSMinVersion
+	}
+	if _, err := cfg.ResolveTLSMinVersion(); err != nil {
+		return nil, err
 	}
 
 	return cfg, nil
@@ -534,10 +566,36 @@ func defaultConfigContent() []byte {
   "deny_list": [],
 
   "_comment_admin": "admin_permit_cidr: CIDRs allowed to reach the mutation API; any entry beyond localhost also requires a bearer token",
-  "admin_permit_cidr": ["127.0.0.0/8", "::1/128"]
+  "admin_permit_cidr": ["127.0.0.0/8", "::1/128"],
+
+  "_comment_trusted": "trusted_proxies: peers whose X-Real-IP/X-Forwarded-For/X-Forwarded-Proto are believed. null uses the built-in loopback+RFC1918 default; [] trusts no header from anyone; a list trusts exactly those. Name your proxy here when bodega sits behind one on a shared network.",
+  "trusted_proxies": null,
+
+  "_comment_tls_min": "tls_min_version: floor for bodega's own listener, \"1.2\" or \"1.3\" (default 1.3). Irrelevant when a proxy terminates TLS.",
+  "tls_min_version": "1.3"
 }
 `
 	return []byte(content)
+}
+
+// ResolveTLSMinVersion maps tls_min_version onto a crypto/tls constant.
+//
+// Only 1.2 and 1.3 are accepted. TLS 1.0 and 1.1 are refused by name rather
+// than ignored, because an operator who wrote "1.0" believes the server now
+// answers a client it must never answer, and a silently-raised floor would let
+// that belief survive until the client on the other end fails for a reason
+// nobody connects back to this key.
+func (c *Config) ResolveTLSMinVersion() (uint16, error) {
+	switch v := strings.TrimSpace(c.TLSMinVersion); v {
+	case "", DefaultTLSMinVersion:
+		return tls.VersionTLS13, nil
+	case "1.2":
+		return tls.VersionTLS12, nil
+	case "1.0", "1.1":
+		return 0, fmt.Errorf("tls_min_version %q: TLS below 1.2 is not supported", v)
+	default:
+		return 0, fmt.Errorf("tls_min_version %q: want \"1.2\" or \"1.3\"", v)
+	}
 }
 
 // ResolveListenAddr applies the listen-address precedence chain:

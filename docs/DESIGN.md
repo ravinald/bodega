@@ -293,7 +293,17 @@ The config file accepts a `deny_list` of CIDR entries. Bare IPs are treated as /
 
 ### IP resolution
 
-The `RealIPMiddleware` extracts the client IP from `X-Real-IP` or `X-Forwarded-For` headers, but only when the direct peer is in a trusted network (RFC 1918 + loopback by default). Untrusted peers can't spoof their IP via headers.
+The `RealIPMiddleware` extracts the client IP from `X-Real-IP` or `X-Forwarded-For` headers, but only when the direct peer is in a trusted network. Untrusted peers can't spoof their IP via headers.
+
+`trusted_proxies` names that set, and it is tri-state:
+
+| Value | Meaning |
+|-------|---------|
+| absent / `null` | Built-in default: loopback plus RFC 1918 |
+| `[]` | Trust no forwarded header from any peer |
+| `["10.9.0.0/16", ...]` | Trust exactly these |
+
+The default is wide on purpose, because the common deployment puts a proxy on the same host. It is the wrong default anywhere the private network has other tenants: a Linode with private networking, a Docker bridge, a pod network. Every peer in RFC 1918 is then believed, `admin_permit_cidr` defaults to loopback, and `X-Real-IP: 127.0.0.1` from any of them reaches the mutation API with no token. Name your proxy on those networks, or write `[]` and let bodega answer to the peer address alone.
 
 ### Mutation access control
 
@@ -302,6 +312,8 @@ The mutation API (POST and DELETE on `/api/v1/packages/...`) is gated by two lay
 1. **IP allow-list** (`admin_permit_cidr`): Only requests from permitted CIDRs can reach mutation endpoints. Defaults to `["127.0.0.0/8", "::1/128"]`, so out of the box only localhost can create or delete entries.
 
 2. **Bearer token** (`api_token`): When `admin_permit_cidr` extends beyond localhost, a valid `Authorization: Bearer <token>` header is required on mutation requests. Generate tokens with `bodega token generate`.
+
+Both layers read the client IP that `trusted_proxies` resolved, so a permissive trusted set widens the first layer no matter how narrow `admin_permit_cidr` looks.
 
 Read endpoints remain unauthenticated. Package manager clients (apt, pip, go, npm, helm) use standard protocols that don't support auth headers, so read paths stay open by design.
 
@@ -348,6 +360,8 @@ Key fields:
 | `metadata_ttl` | 1h | How long mutable proxy resources are cached |
 | `deny_list` | [] | CIDR entries to block |
 | `admin_permit_cidr` | [127.0.0.0/8, ::1/128] | CIDRs allowed to hit mutation API |
+| `trusted_proxies` | null (loopback + RFC 1918) | Peers whose forwarded headers are believed; `[]` trusts none |
+| `tls_min_version` | 1.3 | Floor for bodega's own listener; `1.2` or `1.3` |
 | `api_token` | (none) | Bearer token for mutation API |
 | `tls_cert` / `tls_key` | (none) | Manual TLS |
 | `tls_autocert` / `tls_domain` | (none) | Let's Encrypt |

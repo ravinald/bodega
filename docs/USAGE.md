@@ -513,7 +513,9 @@ A default config is created on first run. All fields are optional.
   "timezone": "",
   "audit_events": [],
   "deny_list": [],
-  "admin_permit_cidr": ["127.0.0.0/8", "::1/128"]
+  "admin_permit_cidr": ["127.0.0.0/8", "::1/128"],
+  "trusted_proxies": null,
+  "tls_min_version": "1.3"
 }
 ```
 
@@ -1038,7 +1040,15 @@ server {
 }
 ```
 
-Minimal Apache config. The two `RequestHeader unset` lines are a security control rather than boilerplate: bodega returns `X-Real-IP` verbatim from any loopback peer, Apache proxies from `127.0.0.1`, and `admin_permit_cidr` defaults to loopback only — so without them a remote client setting `X-Real-IP: 127.0.0.1` reaches the mutation API with no token.
+Minimal Apache config. The two `RequestHeader unset` lines are a security control rather than boilerplate: bodega returns `X-Real-IP` verbatim from any peer inside `trusted_proxies`, Apache proxies from `127.0.0.1`, and `admin_permit_cidr` defaults to loopback only, so without them a remote client setting `X-Real-IP: 127.0.0.1` reaches the mutation API with no token.
+
+Stripping at the proxy is still the right belt, but it is no longer the only one. Set `trusted_proxies` to the address your proxy actually connects from, and a header arriving from anywhere else is ignored whether or not the vhost remembered to unset it:
+
+```json
+"trusted_proxies": ["127.0.0.1/32"]
+```
+
+That matters most when bodega and its proxy do not share a host. The default trusts every RFC 1918 address, so on a private network with other tenants the proxy is not the only peer bodega believes.
 
 ```apache
 <VirtualHost *:443>
@@ -1135,6 +1145,8 @@ All API responses are JSON. The full API is documented in [OpenAPI 3.0 format](.
 Policy mutations invalidate the in-memory cache, so changes take effect on the next request without a restart.
 
 Mutation endpoints are restricted by `admin_permit_cidr`, which defaults to localhost only (`127.0.0.0/8`, `::1/128`). Requests from IPs outside the permit list get a 403.
+
+The address compared against that list is the one `trusted_proxies` resolved, not the TCP peer. Behind a proxy the two differ by design; on a shared private network with the default trusted set they differ because a stranger said so.
 
 When `admin_permit_cidr` includes non-localhost addresses, a Bearer token is also required. Generate tokens with `bodega token generate` and pass them in the `Authorization` header.
 

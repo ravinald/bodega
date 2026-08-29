@@ -27,6 +27,11 @@ func TestDefaultConfigContent(t *testing.T) {
 		"log_dir":           DefaultLogDir,
 		"metadata_ttl":      "1h",
 		"admin_permit_cidr": []any{"127.0.0.0/8", "::1/128"},
+		// null rather than a list: the generated file has to teach the
+		// tri-state, and an empty list here would ship every new install
+		// trusting no proxy at all.
+		"trusted_proxies": nil,
+		"tls_min_version": DefaultTLSMinVersion,
 	}
 	for k, v := range want {
 		if _, ok := got[k]; !ok {

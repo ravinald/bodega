@@ -147,7 +147,12 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 	// and the driver has to be non-empty.
 	overrides := map[string]any{
 		"discover_mode": "observe",
-		"apt_suites":    []string{"value-apt_codename", "apt_suites-one"},
+		// Load validates this one, so the reflective "value-<tag>" filler
+		// cannot reach it. 1.2 rather than the 1.3 default, so the round trip
+		// would still catch a Save that dropped the key and let the default
+		// stand in for a persisted value.
+		"tls_min_version": "1.2",
+		"apt_suites":      []string{"value-apt_codename", "apt_suites-one"},
 		"storage_backends": map[string]config.StorageSpec{
 			"bulk": {Driver: "local", Path: "/mnt/bulk", Prefix: "cold/"},
 		},

@@ -68,9 +68,16 @@ type Server struct {
 	discovery    *DiscoveryRecorder // nil when discover_mode == "" or auditDB == nil
 	denyNets     []*net.IPNet
 	adminNets    []*net.IPNet // CIDRs allowed to hit mutation API (admin_permit_cidr)
-	pepper       string       // pepper for token hash verification
-	quiet        bool         // suppress stderr startup banner (slog output unaffected)
-	mu           sync.Mutex   // protects store mutations (CRUD API)
+	// trustedNets are the proxies whose forwarded headers are believed.
+	// trustedNetsSet distinguishes "operator wrote an empty list" from
+	// "operator wrote nothing": the first trusts no header from anyone, the
+	// second takes the built-in loopback + RFC1918 default. Collapsing them
+	// would silently restore header trust to a deployment that removed it.
+	trustedNets    []*net.IPNet
+	trustedNetsSet bool
+	pepper         string     // pepper for token hash verification
+	quiet          bool       // suppress stderr startup banner (slog output unaffected)
+	mu             sync.Mutex // protects store mutations (CRUD API)
 
 	// aptSign is the signing key and the two served renderings of its public
 	// half. nil when no key is installed, which is a supported configuration:
@@ -145,6 +152,20 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 			logger.Info("admin permit CIDRs loaded", "entries", len(nets))
 		}
 	}
+	// trusted_proxies. A non-nil slice, empty included, is an explicit answer.
+	if cfg.TrustedProxies != nil {
+		nets, err := ParseDenyList(cfg.TrustedProxies)
+		if err != nil {
+			logger.Error("invalid trusted_proxies entry", "error", err)
+		} else {
+			if nets == nil {
+				nets = []*net.IPNet{}
+			}
+			s.trustedNets = nets
+			s.trustedNetsSet = true
+			logger.Info("trusted proxies loaded", "entries", len(nets))
+		}
+	}
 	// Load or create pepper for token auth.
 	pepperExisted := false
 	if _, err := audit.LoadPepper(audit.DefaultPepperPaths); err == nil {
@@ -200,6 +221,16 @@ func resolveAuditDBPath(cfg *config.Config) string {
 	return ""
 }
 
+// resolvedTrustedNets hands RealIPMiddleware the set it should honor. nil asks
+// for the built-in default; a non-nil empty slice means trust nobody, and the
+// middleware must not read it as "unset".
+func (s *Server) resolvedTrustedNets() []*net.IPNet {
+	if !s.trustedNetsSet {
+		return nil
+	}
+	return s.trustedNets
+}
+
 // Handler returns the root http.Handler (with middleware applied).
 // Useful for testing without starting a real TCP listener.
 func (s *Server) Handler() http.Handler {
@@ -213,7 +244,7 @@ func (s *Server) handler() http.Handler {
 	h = MutationAuthMiddleware(s.adminNets, s.auditDB, s.pepper, s.logger)(h)
 	h = DenyListMiddleware(s.denyNets, s.auditDB)(h)
 	h = RequestLogger(s.logger)(h)
-	h = RealIPMiddleware(nil)(h)
+	h = RealIPMiddleware(s.resolvedTrustedNets())(h)
 	h = SecurityHeadersMiddleware(h)
 	return h
 }
@@ -243,9 +274,13 @@ func (s *Server) Start(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("load TLS certificate: %w", err)
 		}
+		minVer, err := s.cfg.ResolveTLSMinVersion()
+		if err != nil {
+			return err
+		}
 		srv.TLSConfig = &tls.Config{
 			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS13,
+			MinVersion:   minVer,
 		}
 	}
 
