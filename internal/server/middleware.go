@@ -19,7 +19,10 @@ import (
 // contextKey is an unexported type for context keys in this package.
 type contextKey int
 
-const clientIPKey contextKey = iota
+const (
+	clientIPKey contextKey = iota
+	trustedNetsKey
+)
 
 // ClientIP returns the resolved client IP from the request context, falling
 // back to r.RemoteAddr if not set by RealIPMiddleware.
@@ -46,9 +49,25 @@ func RealIPMiddleware(trustedNets []*net.IPNet) func(http.Handler) http.Handler 
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ip := resolveClientIP(r, trustedNets)
 			ctx := context.WithValue(r.Context(), clientIPKey, ip)
+			// Carried so every later reader of a forwarded header answers to
+			// the same trusted set this middleware resolved against. Without
+			// it requestScheme falls back to the built-in default and an
+			// operator who narrowed trusted_proxies still has X-Forwarded-Proto
+			// believed from a peer they excluded.
+			ctx = context.WithValue(ctx, trustedNetsKey, trustedNets)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
+}
+
+// trustedNetsFor returns the trusted set RealIPMiddleware resolved for this
+// request. It falls back to the built-in default only when the middleware
+// never ran, which is the case in tests that exercise a handler directly.
+func trustedNetsFor(r *http.Request) []*net.IPNet {
+	if nets, ok := r.Context().Value(trustedNetsKey).([]*net.IPNet); ok {
+		return nets
+	}
+	return defaultTrustedNets()
 }
 
 func resolveClientIP(r *http.Request, trusted []*net.IPNet) string {
@@ -699,7 +718,7 @@ func requestScheme(r *http.Request) string {
 		return "https"
 	}
 	proto := r.Header.Get("X-Forwarded-Proto")
-	if proto == "" || !peerIsTrusted(r, defaultTrustedNets()) {
+	if proto == "" || !peerIsTrusted(r, trustedNetsFor(r)) {
 		return "http"
 	}
 	if i := strings.Index(proto, ","); i >= 0 {
