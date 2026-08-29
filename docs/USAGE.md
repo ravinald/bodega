@@ -523,7 +523,7 @@ A default config is created on first run. All fields are optional.
 
 Set it whenever a reverse proxy terminates TLS or publishes a different hostname. bodega then sees a loopback listener with both TLS keys empty, so `tls_cert`/`tls_key` describe the proxy's back end and nothing describes the URL an operator would copy. Deriving the scheme from that pair is what printed `http://` on the sources line of a deployment that is `https://` everywhere a client can see. With `public_url` unset, callers holding a request answer from the request (honoring `X-Forwarded-Proto` from a trusted peer), and callers with none print `<bodega-host>:8080` as a placeholder and say that it is one.
 
-`timezone` sets the display timezone for audit queries (default UTC) and `audit_events` limits which event types are recorded (empty records all).
+`timezone` sets the display timezone for audit queries (default UTC) and `audit_events` limits which event types the CLI records (empty records all; `bodega serve` records every type regardless — see [Audit Trail](#audit-trail)).
 
 Config files are written with mode `0600` (owner read/write only).
 
@@ -649,7 +649,7 @@ When `custom_paths` is `true`, each type can use a separate build directory. Thi
 
 ### Audit database
 
-The audit DB path defaults to `{log_dir}/audit.db`. The database is created automatically on first use.
+The audit DB path defaults to `{log_dir}/audit.db`. The database is created automatically on first use. It holds the served fetches, the mutations, the cache events, every refused request and the server's own start and stop; see [Audit Trail](#audit-trail) for the event types and what is deliberately left out.
 
 ---
 
@@ -1244,6 +1244,15 @@ bodega show pkg apt libssl3
 bodega repair check
 ```
 
+The manifests say what is in the repository. The audit database says who put it there and who was turned away trying:
+
+```bash
+bodega audit events --type create --limit 50   # who added entries
+bodega audit events --type denied --limit 50   # who the server refused, and at which gate
+```
+
+On a publicly reachable instance the database is the only queryable record of a refusal. The journal has the same lines, but it rotates on size and time, it is not served on `/api/v1/audit`, and the shipped `log_level: 1` prints none of it.
+
 ---
 
 ## Proxy/Cache
@@ -1293,26 +1302,56 @@ bodega pkg checksum clear gomod github.com/foo  # clear, next fetch recomputes
 
 ## Audit Trail
 
-Every package fetch, build, CRUD mutation, and cache event is recorded in a SQLite database at `{log_dir}/audit.db`.
+The SQLite database at `{log_dir}/audit.db` records every package fetch served, every build-pipeline stage, every CRUD mutation, every proxy cache event, every request the server refused, and the server's own start and stop.
 
 **Event types:**
 
 | Type | Trigger |
 |------|---------|
-| `fetch` | Client downloads a package via HTTP |
-| `build` | Build pipeline completes for an entry |
-| `create` | Manifest entry created (CLI or API) |
-| `delete` | Manifest entry deleted |
-| `cache` | Proxy cache miss → upstream fetch |
+| `serve_fetch` | Client downloaded a package over HTTP |
+| `fetch`, `build`, `package`, `upload`, `sync` | Build pipeline stage completed for an entry |
+| `create`, `delete`, `hide`, `freeze`, `edit`, `refresh`, `repair` | Manifest mutation (CLI, TUI or API) |
+| `init`, `reset`, `status`, `show` | Operator command |
+| `cache` | Proxy cache miss > upstream fetch, and upstream policy violations (`status=policy_violation`) |
+| `denied` | A request the server refused before any handler ran |
+| `serve_start`, `serve_stop` | `bodega serve` bound its listener / shut down |
+
+**Denials.** A `denied` row's `status` column names the gate that turned the request away, so an address that was never permitted reads differently from a token that simply aged out:
+
+| Status | Gate |
+|--------|------|
+| `deny_list` | Client IP matched `deny_list` |
+| `client_ip_unparsable` | Mutation whose resolved client IP is not an address |
+| `ip_not_permitted` | Mutation from outside `admin_permit_cidr` |
+| `no_tokens_configured` | Remote mutation while no API token exists |
+| `token_missing` | Mutation with no Bearer credential |
+| `token_invalid` | Bearer presented, matched no stored hash |
+| `token_expired` | Bearer matched a token past its `expires_at` |
+| `admin_only` | Admin-gated read (`/api/v1/config`, `/api/v1/audit`, tokens, policies) from outside `admin_permit_cidr` |
+
+The row carries the client IP, the User-Agent, and a `details` JSON blob with the method and path. It carries **no credential**: `token_expired` records the token id, `token_invalid` records the first 12 hex of the peppered hash — enough to tell two rejected callers apart, useless without the pepper — and no header is ever copied in. Client-controlled strings are capped at 256 bytes each, so an unauthenticated stranger does not choose how much disk a 403 costs.
+
+The lifecycle rows bracket everything else. Without them a quiet database is ambiguous: nobody was turned away, or the server was not running.
 
 **Query examples:**
 ```bash
-bodega audit events --type fetch --limit 50
+bodega audit events --type serve_fetch --limit 50
+bodega audit events --type denied --limit 50      # who was turned away, and when
+bodega audit events --type denied --client 203.0.113.9
 bodega audit events --name lodash --since 2026-04-07
-bodega audit events --client 10.0.0.5
 ```
 
-The audit middleware records: timestamp, event type, package type/name/version, client IP, user agent, HTTP status, and request duration.
+Fields on every row: timestamp, event type, package type/name/version, client IP, user agent, status, duration, actor (the OS user, on CLI and TUI events), and the `details` blob.
+
+**Not recorded**, deliberately:
+
+- **404s on package routes.** `apt update` probes several optional index paths on every run, so recording absences would bury the fetches. A miss that reached upstream is a `cache` event; a miss against an unknown name is in the journal only.
+- **Request and response headers or bodies.** Those are a `log_level: 4` (trace) concern in the journal, not an audit record, and a header dump would carry the very credentials the denial rows are careful not to hold.
+- **Successful admin reads.** Only the refusals are rows; a permitted `GET /api/v1/audit` is journal-only.
+
+Denials record at every gate in the middleware chain and at the admin-read gate.
+
+`audit_events` in `config.json` limits which types the **CLI** writes. `bodega serve` opens its own handle and does not apply the filter, so the server records every type regardless of that key. Leave it empty to keep the two in agreement.
 
 ---
 
