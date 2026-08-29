@@ -251,12 +251,21 @@ const (
 	// nothing.
 	aptRefreshInterval = time.Hour
 
-	// aptRetryInterval is the interval used while no snapshot exists at all.
-	// Until one does every apt request is a 503, and the ordinary way to land
-	// there is transient: expired credentials, or a network that was not up
-	// when systemd started the unit. An hour of 503s is the wrong price for a
-	// backend that recovers in seconds.
+	// aptRetryInterval is the first interval used while no snapshot exists at
+	// all. Until one does every apt request is a 503, and the ordinary way to
+	// land there is transient: expired credentials, or a network that was not
+	// up when systemd started the unit. An hour of 503s is the wrong price for
+	// a backend that recovers in seconds.
 	aptRetryInterval = 15 * time.Second
+
+	// aptRetryFactor lengthens each failed retry, up to aptRefreshInterval.
+	// The transient failures aptRetryInterval is short for clear in seconds
+	// and are caught by the first few attempts; a wrong bucket, revoked
+	// credentials or a role that lost s3:ListBucket never clear at all, and
+	// each attempt costs a full manifest reload plus a pool listing against
+	// the dependency already returning errors. Flat, that is 240 of each an
+	// hour with 240 ERROR lines; doubling makes it 7.
+	aptRetryFactor = 2
 
 	// aptRebuildTimeout bounds a rebuild that no request is waiting on, so a
 	// wedged backend cannot pin the goroutine forever.
@@ -320,30 +329,43 @@ func (s *Server) rebuildAptSnapshot(ctx context.Context) {
 // afterwards: with no snapshot every apt request is a 503, and the failures
 // that put it there are usually over in seconds.
 func (s *Server) aptRefreshLoop(ctx context.Context) {
-	interval := s.aptTickInterval()
-	t := time.NewTicker(interval)
-	defer t.Stop()
+	s.aptRefreshLoopClock(ctx, time.After)
+}
+
+// aptRefreshLoopClock is aptRefreshLoop with the wait injected, so a test can
+// drive an hour of retries without spending one.
+func (s *Server) aptRefreshLoopClock(ctx context.Context, after func(time.Duration) <-chan time.Time) {
+	interval := s.aptNextInterval(0)
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-after(interval):
 			s.reloadManifests(ctx)
 			s.rebuildAptSnapshot(ctx)
-			if want := s.aptTickInterval(); want != interval {
+			if want := s.aptNextInterval(interval); want != interval {
 				interval = want
-				t.Reset(interval)
 				s.logger.Info("apt index refresh interval changed", "interval", interval.String())
 			}
 		}
 	}
 }
 
-// aptTickInterval is the retry interval until a snapshot exists and the
-// refresh interval afterwards.
-func (s *Server) aptTickInterval() time.Duration {
-	if s.aptSnap.Load() == nil {
+// aptNextInterval is the wait before the next rebuild: the refresh interval
+// once a snapshot exists, and aptRetryInterval doubling up to it while none
+// does. prev is the interval just served, or zero for the first wait.
+//
+// The first snapshot resets it, so a backend that arrives late is served at
+// the same cadence as one that was there from the start.
+func (s *Server) aptNextInterval(prev time.Duration) time.Duration {
+	if s.aptSnap.Load() != nil {
+		return aptRefreshInterval
+	}
+	if prev < aptRetryInterval {
 		return aptRetryInterval
+	}
+	if next := prev * aptRetryFactor; next < aptRefreshInterval {
+		return next
 	}
 	return aptRefreshInterval
 }
@@ -369,7 +391,8 @@ func (s *Server) reloadManifests(ctx context.Context) {
 // buildAptSnapshot generates every served suite's index from current manifest
 // and pool state.
 func (s *Server) buildAptSnapshot(ctx context.Context) (*aptSnapshot, error) {
-	debKeys, err := s.aptPoolKeys(ctx)
+	served := s.cfg.ServedAptSuites()
+	poolMap, err := s.aptPoolMapForIndex(ctx, served)
 	if err != nil {
 		return nil, fmt.Errorf("list apt pool keys: %w", err)
 	}
@@ -381,12 +404,121 @@ func (s *Server) buildAptSnapshot(ctx context.Context) (*aptSnapshot, error) {
 		validUntil: date.Add(aptValidity),
 	}
 	snap.poolStorage = s.aptPoolStorage(ctx)
-	served := s.cfg.ServedAptSuites()
 	for _, suite := range served {
-		snap.suites[suite] = s.buildAptSuiteIndex(ctx, suite, debKeys, date, snap.validUntil)
+		snap.suites[suite] = s.buildAptSuiteIndex(ctx, suite, poolMap, date, snap.validUntil)
 	}
-	s.auditAptEntries(ctx, served)
+	s.auditAptEntries(ctx, served, poolMap)
 	return snap, nil
+}
+
+// aptFallback is one index entry with no _pool_path recorded, and the three
+// fields findDebInPool matches a pool object by.
+type aptFallback struct {
+	source  string
+	version string
+	arch    string
+}
+
+// aptFallbacks lists the entries a rebuild would have to resolve against a
+// pool listing. Everything PackageApt wrote carries _pool_path and addresses
+// its object directly; what lands here is what 'pkg create' and the mutation
+// API accept without one, plus manifests written before the field existed.
+//
+// The filters match the generator's, because an entry the generator drops for
+// some other reason is one a listing could not rescue.
+func (s *Server) aptFallbacks(ctx context.Context, served []string) []aptFallback {
+	var out []aptFallback
+	for _, name := range s.store.ListPackages(manifest.TypeApt) {
+		pm, _ := s.store.GetPackage(ctx, manifest.TypeApt, name)
+		if pm == nil || isPackageHidden(pm) {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			if ve.Hidden || ve.Version == "" || ve.Version == "*" {
+				continue
+			}
+			if ve.Metadata["_pool_path"] != "" || ve.Metadata["Architecture"] == "" {
+				continue
+			}
+			inServed := false
+			for _, suite := range served {
+				if ve.InSuite(suite, s.cfg.AptCodename) {
+					inServed = true
+					break
+				}
+			}
+			if !inServed {
+				continue
+			}
+			source := ve.SourceName
+			if source == "" {
+				source = pm.Name
+			}
+			out = append(out, aptFallback{
+				source: source, version: ve.Version, arch: ve.Metadata["Architecture"],
+			})
+		}
+	}
+	return out
+}
+
+// aptPoolMapForIndex resolves the pool listing a rebuild needs, and no more.
+//
+// No fallback entry means no listing at all: the whole pool is walked on every
+// rebuild otherwise, once per configured backend, and an index built entirely
+// from _pool_path never reads a byte of it. That bounds the per-write cost the
+// cache was added to bound, and bounds it at zero.
+//
+// With a fallback entry the cached listing answers first, and is re-taken once
+// when it leaves any of them unresolved. A .deb that reached the pool after
+// the cached listing was taken (uploaded out of band, or written by a route
+// other than PackageApt) would otherwise stay out of the index for the whole
+// metadata_ttl, and stay out silently. The price is a listing per rebuild
+// while a manifest names an object that is genuinely absent, which is a state
+// auditAptEntries now names in the log.
+func (s *Server) aptPoolMapForIndex(ctx context.Context, served []string) (map[string]string, error) {
+	fallbacks := s.aptFallbacks(ctx, served)
+	if len(fallbacks) == 0 {
+		return nil, nil
+	}
+	keys, err := s.aptPoolKeys(ctx)
+	if err != nil {
+		return nil, err
+	}
+	poolMap := aptPoolMap(keys)
+	if s.aptAllResolve(poolMap, fallbacks) {
+		return poolMap, nil
+	}
+	fresh, err := s.aptPoolKeysFresh(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return aptPoolMap(fresh), nil
+}
+
+// aptAllResolve reports whether every fallback entry finds an object in
+// poolMap.
+func (s *Server) aptAllResolve(poolMap map[string]string, fallbacks []aptFallback) bool {
+	for _, f := range fallbacks {
+		if s.findDebInPool(poolMap, f.source, f.version, f.arch) == "" {
+			return false
+		}
+	}
+	return true
+}
+
+// aptPoolMap indexes a pool listing by base filename, which is what
+// findDebInPool matches on, and carries the path a Filename field needs.
+func aptPoolMap(keys []string) map[string]string {
+	poolMap := make(map[string]string, len(keys))
+	for _, key := range keys {
+		filename := path.Base(key)
+		if !strings.HasSuffix(filename, ".deb") {
+			continue
+		}
+		poolMap[filename] = strings.TrimPrefix(key, manifest.AptPrefix)
+	}
+	return poolMap
 }
 
 // aptPoolStorage maps each pooled path to the backend its version entry names,
@@ -425,7 +557,7 @@ func (s *Server) aptPoolStorage(ctx context.Context) map[string]string {
 
 // buildAptSuiteIndex generates one suite's Packages bodies and the Release
 // that vouches for them.
-func (s *Server) buildAptSuiteIndex(ctx context.Context, suite string, debKeys []string, date, validUntil time.Time) *aptSuiteIndex {
+func (s *Server) buildAptSuiteIndex(ctx context.Context, suite string, poolMap map[string]string, date, validUntil time.Time) *aptSuiteIndex {
 	// Collect unique architectures from manifest metadata.
 	arches := s.aptArchitectures(ctx, suite)
 	if len(arches) == 0 {
@@ -444,7 +576,7 @@ func (s *Server) buildAptSuiteIndex(ctx context.Context, suite string, debKeys [
 	}
 	var entries []indexEntry
 	for _, arch := range arches {
-		pkgData := s.generateAptPackages(ctx, suite, arch, debKeys)
+		pkgData := s.generateAptPackages(ctx, suite, arch, poolMap)
 		entries = append(entries, indexEntry{
 			path: "main/binary-" + arch + "/Packages",
 			data: pkgData,
@@ -667,25 +799,26 @@ func (s *Server) signAptRelease(idx *aptSuiteIndex, suite string) {
 	idx.releaseGPG = releaseGPG
 }
 
-// auditAptEntries reports manifest entries the generator dropped. Both cases
-// are silent to the client and produce "Unable to locate package", the same
+// auditAptEntries reports manifest entries the generator dropped. Every case
+// is silent to the client and produces "Unable to locate package", the same
 // message a typo in the package name produces, so without a log line the
-// operator has nothing to work from. Neither is an error: staging an entry
-// before adding its suite to apt_suites is a legitimate order, and an
-// unresolved entry is a normal intermediate state.
+// operator has nothing to work from. None is an error: staging an entry
+// before adding its suite to apt_suites is a legitimate order, an unresolved
+// entry is a normal intermediate state, and an entry whose .deb has not been
+// uploaded yet is the ordinary gap between 'pkg create' and 'pkg build'.
 //
 // Runs once per rebuild rather than inside the per-suite, per-arch generator
 // loop, which would repeat every line N times.
-func (s *Server) auditAptEntries(ctx context.Context, served []string) {
+func (s *Server) auditAptEntries(ctx context.Context, served []string, poolMap map[string]string) {
 	servedSet := make(map[string]bool, len(served))
 	for _, suite := range served {
 		servedSet[suite] = true
 	}
 
-	var unserved, unresolved []string
+	var unserved, unresolved, unpooled []string
 	for _, name := range s.store.ListPackages(manifest.TypeApt) {
 		pm, _ := s.store.GetPackage(ctx, manifest.TypeApt, name)
-		if pm == nil {
+		if pm == nil || isPackageHidden(pm) {
 			continue
 		}
 		for _, ve := range pm.Versions {
@@ -696,18 +829,36 @@ func (s *Server) auditAptEntries(ctx context.Context, served []string) {
 				unresolved = append(unresolved, name)
 				continue
 			}
-			if len(ve.Suites) == 0 {
-				continue // the default suite, which is always served
-			}
+			// An entry naming no suites belongs to apt_codename, which
+			// apt_suites can leave out. Testing the effective suites rather
+			// than the recorded ones is what keeps that entry from being
+			// counted as served and then reported for the wrong reason.
+			suites := ve.EffectiveSuites(s.cfg.AptCodename)
 			matched := false
-			for _, suite := range ve.EffectiveSuites(s.cfg.AptCodename) {
+			for _, suite := range suites {
 				if servedSet[suite] {
 					matched = true
 					break
 				}
 			}
 			if !matched {
-				unserved = append(unserved, name+"@"+ve.Version+" ["+strings.Join(ve.Suites, ",")+"]")
+				unserved = append(unserved, name+"@"+ve.Version+" ["+strings.Join(suites, ",")+"]")
+				continue
+			}
+			// Reached a served suite, so the only thing left between it and
+			// the index is a pool object. An entry with _pool_path names one
+			// directly and the generator emits it either way; one without is
+			// matched by filename against the listing, and finding nothing
+			// drops it.
+			if ve.Metadata["_pool_path"] != "" || ve.Metadata["Architecture"] == "" {
+				continue
+			}
+			source := ve.SourceName
+			if source == "" {
+				source = pm.Name
+			}
+			if s.findDebInPool(poolMap, source, ve.Version, ve.Metadata["Architecture"]) == "" {
+				unpooled = append(unpooled, name+"@"+ve.Version+" ["+ve.Metadata["Architecture"]+"]")
 			}
 		}
 	}
@@ -717,8 +868,12 @@ func (s *Server) auditAptEntries(ctx context.Context, served []string) {
 			"count", len(unserved), "served", strings.Join(served, ","), "entries", capForLog(unserved))
 	}
 	if len(unresolved) > 0 {
-		s.logger.Warn("apt entries have no version and reach no index; no CLI verb can address a versionless entry, so resolve or remove them",
+		s.logger.Warn("apt entries have no version and reach no index; no CLI verb can address a versionless entry, so run 'bodega repair' to clear them",
 			"count", len(unresolved), "packages", capForLog(unresolved))
+	}
+	if len(unpooled) > 0 {
+		s.logger.Warn("apt entries match no .deb in the pool and reach no index; upload the artifact or record its _pool_path",
+			"count", len(unpooled), "entries", capForLog(unpooled))
 	}
 }
 
@@ -753,6 +908,16 @@ func (s *Server) aptPoolKeys(ctx context.Context) ([]string, error) {
 	ttl := s.cache.MetadataTTL
 	if cached := s.aptPool.Load(); cached != nil && ttl > 0 && time.Since(cached.at) < ttl {
 		return cached.keys, nil
+	}
+	return s.aptPoolKeysFresh(ctx)
+}
+
+// aptPoolKeysFresh lists the pool and replaces the cache, skipping the cached
+// answer on the way in. It is for the caller that has already established the
+// cached listing cannot answer its question.
+func (s *Server) aptPoolKeysFresh(ctx context.Context) ([]string, error) {
+	if s.stores == nil {
+		return nil, nil
 	}
 	keys, err := s.listFanout(ctx, manifest.TypeApt, manifest.AptPoolPrefix)
 	if err != nil {
@@ -789,22 +954,9 @@ func (s *Server) aptArchitectures(ctx context.Context, suite string) []string {
 }
 
 // generateAptPackages builds a Debian Packages file for the given suite and
-// architecture from manifest metadata and the S3 pool key listing.
-func (s *Server) generateAptPackages(ctx context.Context, suite, arch string, debKeys []string) []byte {
-	// Build a map of source-name+version → S3 pool key for Filename lookup.
-	poolMap := make(map[string]string) // "pkgname_version" → relative pool path
-	for _, key := range debKeys {
-		filename := path.Base(key)
-		if !strings.HasSuffix(filename, ".deb") {
-			continue
-		}
-		// Key is like "packages/apt/pool/main/a/amazon-efs-utils/amazon-efs-utils_2.4.2_amd64.deb"
-		// We want the relative path after "packages/apt/" for the Filename field.
-		relPath := strings.TrimPrefix(key, manifest.AptPrefix)
-		// Index by base filename for matching.
-		poolMap[filename] = relPath
-	}
-
+// architecture from manifest metadata, resolving entries that carry no
+// _pool_path against poolMap. poolMap is nil when no entry needed one.
+func (s *Server) generateAptPackages(ctx context.Context, suite, arch string, poolMap map[string]string) []byte {
 	var buf bytes.Buffer
 	for _, name := range s.store.ListPackages(manifest.TypeApt) {
 		pm, _ := s.store.GetPackage(ctx, manifest.TypeApt, name)

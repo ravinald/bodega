@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
@@ -28,13 +31,19 @@ type ctxStore struct {
 	*storage.Memory
 	lastListErr atomic.Value // error or nil
 	honorCtx    atomic.Bool
+	failList    atomic.Bool
+	listCalls   atomic.Int64
 }
 
 func (c *ctxStore) List(ctx context.Context, prefix string) ([]string, error) {
+	c.listCalls.Add(1)
 	err := ctx.Err()
 	c.lastListErr.Store(errBox{err})
 	if c.honorCtx.Load() && err != nil {
 		return nil, err
+	}
+	if c.failList.Load() {
+		return nil, errors.New("AccessDenied: user is not authorized to perform s3:ListBucket")
 	}
 	return c.Memory.List(ctx, prefix)
 }
@@ -148,16 +157,155 @@ func TestRefreshReloadsManifestsFromDisk(t *testing.T) {
 // TestTickIntervalShortensWithoutASnapshot covers the 503 window: with no
 // snapshot every apt request fails, and the failures that put it there
 // (credentials, a network that was not up at unit start) are usually over in
-// seconds rather than in an hour.
+// seconds rather than in an hour. It also pins the two ends of the backoff:
+// the first retry stays short, and a snapshot puts the loop straight back on
+// the refresh interval however far the retry had walked.
 func TestTickIntervalShortensWithoutASnapshot(t *testing.T) {
 	s, _, _ := refreshTestServer(t)
 
-	if got := s.aptTickInterval(); got != aptRefreshInterval {
+	if got := s.aptNextInterval(aptRetryInterval); got != aptRefreshInterval {
 		t.Errorf("interval with a snapshot = %v, want %v", got, aptRefreshInterval)
 	}
 	s.aptSnap.Store(nil)
-	if got := s.aptTickInterval(); got != aptRetryInterval {
-		t.Errorf("interval with no snapshot = %v, want %v", got, aptRetryInterval)
+	if got := s.aptNextInterval(0); got != aptRetryInterval {
+		t.Errorf("first interval with no snapshot = %v, want %v", got, aptRetryInterval)
+	}
+	if got := s.aptNextInterval(aptRetryInterval); got != aptRetryInterval*aptRetryFactor {
+		t.Errorf("second interval = %v, want %v", got, aptRetryInterval*aptRetryFactor)
+	}
+	if got := s.aptNextInterval(aptRefreshInterval); got != aptRefreshInterval {
+		t.Errorf("interval is not capped at the refresh interval: %v", got)
+	}
+}
+
+// TestRetryIsCappedAgainstAPermanentFailure drives a simulated hour of the
+// refresh loop over an object store whose List never succeeds — a wrong
+// bucket, revoked credentials, a role without s3:ListBucket. Each attempt
+// costs a full manifest reload, a pool listing and an ERROR line, so the
+// assertion is on how many the backend was made to serve, not on the interval
+// the loop happens to be holding.
+func TestRetryIsCappedAgainstAPermanentFailure(t *testing.T) {
+	s, cs, _ := refreshTestServer(t)
+	seedFallbackEntry(t, s) // an entry with no _pool_path, so the listing runs
+	s.aptSnap.Store(nil)
+	s.aptPool.Store(nil)
+	cs.failList.Store(true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// A virtual clock: every wait the loop takes advances it, and the hour
+	// mark cancels. Called only from the loop, which this test runs inline,
+	// so the counters need no synchronization.
+	var elapsed time.Duration
+	after := func(d time.Duration) <-chan time.Time {
+		if elapsed+d > time.Hour {
+			cancel()
+			return make(chan time.Time) // never fires; ctx.Done wins the select
+		}
+		elapsed += d
+		ch := make(chan time.Time, 1)
+		ch <- time.Now()
+		return ch
+	}
+	s.aptRefreshLoopClock(ctx, after)
+
+	attempts := cs.listCalls.Load()
+	flat := int64(time.Hour / aptRetryInterval)
+	if attempts >= flat {
+		t.Fatalf("%d listings in a simulated hour; a flat %v retry is %d, so nothing is capping it",
+			attempts, aptRetryInterval, flat)
+	}
+	if attempts > 10 {
+		t.Errorf("%d listings in a simulated hour against a permanently failing backend, want no more than 10", attempts)
+	}
+	if attempts < 3 {
+		t.Errorf("%d listings in a simulated hour; the first retries have to stay quick enough to catch a transient failure", attempts)
+	}
+}
+
+// TestRetryReturnsToRefreshIntervalOnRecovery is the other half: the backoff
+// exists to stop a storm, not to punish a backend that arrives late. Once a
+// snapshot builds, the loop is back on the hourly interval.
+func TestRetryReturnsToRefreshIntervalOnRecovery(t *testing.T) {
+	s, cs, _ := refreshTestServer(t)
+	s.aptSnap.Store(nil)
+	s.aptPool.Store(nil)
+	cs.failList.Store(true)
+
+	ctx := t.Context()
+	interval := s.aptNextInterval(0)
+	for range 4 {
+		s.rebuildAptSnapshot(ctx)
+		interval = s.aptNextInterval(interval)
+	}
+	if interval <= aptRetryInterval {
+		t.Fatalf("interval after four failures = %v, want more than %v", interval, aptRetryInterval)
+	}
+
+	cs.failList.Store(false)
+	s.rebuildAptSnapshot(ctx)
+	if got := s.aptNextInterval(interval); got != aptRefreshInterval {
+		t.Errorf("interval after recovery = %v, want %v", got, aptRefreshInterval)
+	}
+}
+
+// seedFallbackEntry adds an apt entry with no _pool_path, the shape 'pkg
+// create' and the mutation API both accept and the only one that makes the
+// index depend on a pool listing.
+func seedFallbackEntry(t *testing.T, s *Server) {
+	t.Helper()
+	if err := s.store.AddVersion(t.Context(), manifest.TypeApt, "late", manifest.VersionEntry{
+		Version:    "2.0.0",
+		SourceName: "late",
+		Metadata:   map[string]string{"Architecture": "amd64"},
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+	if err := s.store.SaveIndex(t.Context()); err != nil {
+		t.Fatalf("SaveIndex: %v", err)
+	}
+}
+
+// TestNoListingWhenEveryEntryCarriesPoolPath is the cost bound. An index built
+// entirely from _pool_path never reads the listing, so walking the whole pool
+// on every rebuild, once per configured backend, buys nothing.
+func TestNoListingWhenEveryEntryCarriesPoolPath(t *testing.T) {
+	s, cs, _ := refreshTestServer(t)
+	s.aptPool.Store(nil)
+	cs.listCalls.Store(0)
+
+	s.rebuildAptSnapshot(t.Context())
+
+	if n := cs.listCalls.Load(); n != 0 {
+		t.Errorf("%d pool listings for an index every entry addresses directly, want 0", n)
+	}
+	snap := s.aptSnap.Load()
+	if snap == nil || !strings.Contains(string(snap.suites["noble"].packages["amd64"]), "Package: hello") {
+		t.Error("the entry with _pool_path did not reach the index")
+	}
+}
+
+// TestLateDebIsNotHiddenByTheCachedListing is the freshness half. A .deb that
+// reached the pool after the cached listing was taken used to stay out of the
+// index for the whole metadata_ttl, and stay out silently.
+func TestLateDebIsNotHiddenByTheCachedListing(t *testing.T) {
+	s, cs, _ := refreshTestServer(t)
+	seedFallbackEntry(t, s)
+
+	// A listing taken before the .deb landed, still well inside the TTL.
+	s.aptPool.Store(&aptPoolListing{keys: []string{}, at: time.Now()})
+	cs.Seed("packages/apt/pool/main/l/late/late_2.0.0_amd64.deb", "\x00deb")
+
+	s.rebuildAptSnapshot(t.Context())
+
+	snap := s.aptSnap.Load()
+	if snap == nil {
+		t.Fatal("no snapshot")
+	}
+	packages := string(snap.suites["noble"].packages["amd64"])
+	if !strings.Contains(packages, "Package: late") {
+		t.Errorf("a .deb uploaded after the cached listing stayed out of the index:\n%s", packages)
 	}
 }
 
@@ -328,5 +476,48 @@ func assertInReleaseVerifies(t *testing.T, s *Server, kr *aptsign.KeyRing) {
 	}
 	if _, err := openpgp.CheckDetachedSignature(el, bytes.NewReader(block.Bytes), bytes.NewReader(sigs.Bytes()), nil); err != nil {
 		t.Errorf("InRelease does not verify under %s alone: %v", kr.Fingerprints()[0], err)
+	}
+}
+
+// TestUnpooledEntryIsLogged covers the third silent drop. An entry that
+// reaches a served suite but matches no .deb in the pool is absent from
+// Packages, and absence reads on the client as "Unable to locate package",
+// which is also what a typo produces. Without a log line the operator has the
+// client's word for it and nothing else.
+func TestUnpooledEntryIsLogged(t *testing.T) {
+	s, _, _ := refreshTestServer(t)
+	var buf bytes.Buffer
+	s.logger = newTestLogger(&buf, slog.LevelInfo)
+	seedFallbackEntry(t, s) // no _pool_path, and no object seeded for it
+
+	s.rebuildAptSnapshot(t.Context())
+
+	logged := buf.String()
+	if !strings.Contains(logged, "match no .deb in the pool") {
+		t.Errorf("an entry that resolved to no pool object was dropped silently:\n%s", logged)
+	}
+	if !strings.Contains(logged, "late@2.0.0") {
+		t.Errorf("the warning does not name the entry:\n%s", logged)
+	}
+}
+
+// TestMutationAPIRefusesAVersionlessAptEntry is the guard at the write rather
+// than at render time. A persisted version-less entry is addressable by no
+// verb: remove, delete, hide and freeze all name a version, so its only exit
+// is a 'bodega repair' run.
+func TestMutationAPIRefusesAVersionlessAptEntry(t *testing.T) {
+	s, _, _ := refreshTestServer(t)
+	body := `{"name":"blank","type":"apt","versions":[{"metadata":{"Architecture":"amd64"}}]}`
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/packages/apt", strings.NewReader(body))
+	r.SetPathValue("type", manifest.TypeApt)
+	w := httptest.NewRecorder()
+
+	s.handleCreateEntry(w, r)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for an apt entry with no version", w.Code)
+	}
+	if pm, _ := s.store.GetPackage(t.Context(), manifest.TypeApt, "blank"); pm != nil {
+		t.Error("the refused entry was persisted anyway")
 	}
 }

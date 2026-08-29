@@ -738,6 +738,19 @@ func (s *Server) handleCreateEntry(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
 			return
 		}
+		// An apt entry with no version reaches no index and no verb: the
+		// index generator refuses to publish it, and delete, hide and freeze
+		// all address a version by name. Refuse the write rather than
+		// persisting something whose only exit is 'bodega repair'.
+		if t == manifest.TypeApt {
+			for _, ve := range pm.Versions {
+				if ve.Version == "" {
+					writeJSON(w, http.StatusBadRequest, map[string]string{
+						"error": `apt versions require a version; use "*" to resolve the current upstream`})
+					return
+				}
+			}
+		}
 		// Check for conflict.
 		existing, _ := s.store.GetPackage(ctx, t, pm.Name)
 		if existing != nil {

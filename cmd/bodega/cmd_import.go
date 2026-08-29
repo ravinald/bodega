@@ -278,6 +278,17 @@ func validateManifest(pm *manifest.PackageManifest, cfg *config.Config, out io.W
 			return fmt.Errorf("version %s: %w", versionLabel(ve), err)
 		}
 	}
+	// An apt entry with no version reaches no index and no verb: the
+	// generator refuses to publish it, and remove, delete, hide and freeze
+	// all address a version by name. Persisting one leaves 'bodega repair'
+	// as its only exit.
+	if pm.Type == manifest.TypeApt {
+		for _, ve := range pm.Versions {
+			if ve.Version == "" {
+				return fmt.Errorf("apt/%s has a version entry with no version; give one, or \"*\" to resolve the current upstream", pm.Name)
+			}
+		}
+	}
 	return nil
 }
 
