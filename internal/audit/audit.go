@@ -1,5 +1,6 @@
 // Package audit provides a SQLite-backed audit trail for package operations.
-// It records builds, client fetches, CRUD mutations, and proxy cache events.
+// It records builds, client fetches, CRUD mutations, proxy cache events, the
+// server's own start and stop, and every request the server refused.
 package audit
 
 import (
@@ -62,6 +63,29 @@ const (
 	// Client events (HTTP server).
 	EventServeFetch EventType = "serve_fetch" // client downloaded a package via HTTP
 	EventCache      EventType = "cache"       // proxy cache miss
+
+	// EventDenied is a request the server refused before the handler ran:
+	// deny-listed IP, mutation auth, or an admin-only read endpoint. One type
+	// for the whole class because Filter has no OR and no status predicate, so
+	// splitting it per gate would make "who was turned away" three queries
+	// instead of one. Which gate refused is in Status; see the Denial*
+	// constants.
+	EventDenied EventType = "denied"
+)
+
+// Status values for EventDenied. They name the gate that refused, so an
+// operator can tell an address that was never permitted from a token that
+// simply aged out without reading the journal.
+const (
+	DenialDenyList       = "deny_list"            // client IP matched deny_list
+	DenialUnparseableIP  = "client_ip_unparsable" // ClientIP did not parse as an address
+	DenialIPNotPermitted = "ip_not_permitted"     // client IP outside admin_permit_cidr
+	//nolint:gosec // G101: an event status naming a gate, not a credential.
+	DenialNoTokens     = "no_tokens_configured" // remote mutation with no tokens in the DB
+	DenialTokenMissing = "token_missing"        // no Bearer credential presented
+	DenialTokenInvalid = "token_invalid"        // Bearer presented, matched no stored hash
+	DenialTokenExpired = "token_expired"        // Bearer matched a token past expires_at
+	DenialAdminOnly    = "admin_only"           // admin-gated read endpoint, IP not permitted
 )
 
 // Event is a single audit record.
@@ -72,7 +96,7 @@ type Event struct {
 	PkgVersion string
 	ClientIP   string
 	UserAgent  string
-	Status     string // "success", "failure", "cache_hit", "cache_miss"
+	Status     string // "success", "failure", "cache_hit", "cache_miss"; a Denial* reason on EventDenied
 	DurationMs int64
 	Details    string // JSON blob for extra context
 	Actor      string // OS user for CLI/TUI events; empty for HTTP events (use ClientIP instead)

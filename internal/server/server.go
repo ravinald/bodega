@@ -211,7 +211,7 @@ func (s *Server) handler() http.Handler {
 	var h http.Handler = s.mux
 	h = AuditMiddleware(s.auditDB)(h)
 	h = MutationAuthMiddleware(s.adminNets, s.auditDB, s.pepper, s.logger)(h)
-	h = DenyListMiddleware(s.denyNets)(h)
+	h = DenyListMiddleware(s.denyNets, s.auditDB)(h)
 	h = RequestLogger(s.logger)(h)
 	h = RealIPMiddleware(nil)(h)
 	h = SecurityHeadersMiddleware(h)
@@ -294,6 +294,14 @@ func (s *Server) Start(ctx context.Context) error {
 	// Notify systemd we're ready. No-op outside systemd (NOTIFY_SOCKET unset).
 	sdNotifyReady()
 
+	// Lifecycle rows bracket every other row in the database, so a reader can
+	// tell "nothing happened" from "the server was not running". Recorded here
+	// rather than at the top of Start because a bind that failed never served
+	// anything; the deferred stop pairs with this one on every exit path,
+	// including the one where Serve returns an error.
+	s.recordLifecycle(audit.EventServeStart, boundAddr, tlsMode)
+	defer s.recordLifecycle(audit.EventServeStop, boundAddr, tlsMode)
+
 	// Apt index refresh. Valid-Until is stamped when a snapshot is built and
 	// does not move, so without this loop a long-running server eventually
 	// serves an expired Release and every client fails apt update at once.
@@ -346,6 +354,35 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 		s.logger.Info("server stopped")
 		return nil
+	}
+}
+
+// recordLifecycle writes a serve_start or serve_stop row. The context is
+// deliberately not the caller's: a stop is recorded while the shutdown context
+// is already cancelled, and a lifecycle row that vanishes precisely when the
+// server goes down is the one nobody can afford to lose.
+func (s *Server) recordLifecycle(ev audit.EventType, addr string, tlsMode bool) {
+	if s.auditDB == nil {
+		return
+	}
+	details, err := json.Marshal(map[string]any{
+		"addr": addr,
+		"tls":  tlsMode,
+		"pid":  os.Getpid(),
+	})
+	if err != nil {
+		details = []byte("{}")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.auditDB.Record(ctx, audit.Event{
+		EventType: ev,
+		Status:    "success",
+		Details:   string(details),
+		Actor:     audit.CurrentActor(),
+	}); err != nil {
+		s.logger.Error("could not record server lifecycle event",
+			"event", string(ev), "error", err)
 	}
 }
 
@@ -471,6 +508,24 @@ func (s *Server) registerRoutes() {
 	m.HandleFunc("GET /api/v1/policies", s.handleListPolicies)
 	m.HandleFunc("POST /api/v1/policies", s.handleCreatePolicy)
 	m.HandleFunc("DELETE /api/v1/policies/{id}", s.handleRevokePolicy)
+}
+
+// requireAdmin gates the sensitive read endpoints, writing the 403 and the
+// audit row when the caller is not permitted. It exists so that refusing a
+// read of the audit trail is itself in the audit trail: these handlers sit
+// behind the mutation middleware, not inside it, so nothing else would record
+// them.
+//
+// Returns true when the request may proceed.
+func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
+	if s.isAdminRequest(r) {
+		return true
+	}
+	s.logger.Warn("admin endpoint blocked: IP not in admin_permit_cidr",
+		"client_ip", ClientIP(r), "method", r.Method, "path", r.URL.Path)
+	recordDenial(s.auditDB, r, audit.DenialAdminOnly, nil)
+	http.Error(w, "Forbidden", http.StatusForbidden)
+	return false
 }
 
 // isAdminRequest checks whether the request originates from an IP in
@@ -689,8 +744,7 @@ type configResponse struct {
 }
 
 func (s *Server) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
-	if !s.isAdminRequest(r) {
-		http.Error(w, "Forbidden", http.StatusForbidden)
+	if !s.requireAdmin(w, r) {
 		return
 	}
 	resp := configResponse{
@@ -977,8 +1031,7 @@ func (s *Server) handleToggleFreeze(w http.ResponseWriter, r *http.Request) {
 // ---- Audit API -------------------------------------------------------------
 
 func (s *Server) handleAPIAudit(w http.ResponseWriter, r *http.Request) {
-	if !s.isAdminRequest(r) {
-		http.Error(w, "Forbidden", http.StatusForbidden)
+	if !s.requireAdmin(w, r) {
 		return
 	}
 	if s.auditDB == nil {
@@ -1022,8 +1075,7 @@ func (s *Server) handleAPIAudit(w http.ResponseWriter, r *http.Request) {
 // ---- Token API -------------------------------------------------------------
 
 func (s *Server) handleListTokens(w http.ResponseWriter, r *http.Request) {
-	if !s.isAdminRequest(r) {
-		http.Error(w, "Forbidden", http.StatusForbidden)
+	if !s.requireAdmin(w, r) {
 		return
 	}
 	if s.auditDB == nil {
@@ -1135,8 +1187,7 @@ func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
 // ---- Policy API ------------------------------------------------------------
 
 func (s *Server) handleListPolicies(w http.ResponseWriter, r *http.Request) {
-	if !s.isAdminRequest(r) {
-		http.Error(w, "Forbidden", http.StatusForbidden)
+	if !s.requireAdmin(w, r) {
 		return
 	}
 	if s.auditDB == nil {

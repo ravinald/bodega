@@ -263,7 +263,7 @@ func TestDenyListBlocksIPv4(t *testing.T) {
 		t.Fatalf("ParseDenyList: %v", err)
 	}
 
-	handler := DenyListMiddleware(nets)(testHandler("ok"))
+	handler := DenyListMiddleware(nets, nil)(testHandler("ok"))
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.RemoteAddr = "192.168.1.50:12345"
 	rec := httptest.NewRecorder()
@@ -283,7 +283,7 @@ func TestDenyListBlocksBareIPv4(t *testing.T) {
 		t.Fatalf("ParseDenyList: %v", err)
 	}
 
-	handler := DenyListMiddleware(nets)(testHandler("ok"))
+	handler := DenyListMiddleware(nets, nil)(testHandler("ok"))
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.RemoteAddr = "10.0.0.99:9999"
 	rec := httptest.NewRecorder()
@@ -302,7 +302,7 @@ func TestDenyListBlocksIPv6(t *testing.T) {
 		t.Fatalf("ParseDenyList: %v", err)
 	}
 
-	handler := DenyListMiddleware(nets)(testHandler("ok"))
+	handler := DenyListMiddleware(nets, nil)(testHandler("ok"))
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.RemoteAddr = "[fd12::1]:8080"
 	rec := httptest.NewRecorder()
@@ -321,7 +321,7 @@ func TestDenyListBlocksBareIPv6(t *testing.T) {
 		t.Fatalf("ParseDenyList: %v", err)
 	}
 
-	handler := DenyListMiddleware(nets)(testHandler("ok"))
+	handler := DenyListMiddleware(nets, nil)(testHandler("ok"))
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.RemoteAddr = "[::1]:8080"
 	rec := httptest.NewRecorder()
@@ -340,7 +340,7 @@ func TestDenyListAllowsNonMatchingIP(t *testing.T) {
 		t.Fatalf("ParseDenyList: %v", err)
 	}
 
-	handler := DenyListMiddleware(nets)(testHandler("ok"))
+	handler := DenyListMiddleware(nets, nil)(testHandler("ok"))
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.RemoteAddr = "10.0.0.5:8080"
 	rec := httptest.NewRecorder()
@@ -354,7 +354,7 @@ func TestDenyListAllowsNonMatchingIP(t *testing.T) {
 }
 
 func TestDenyListEmptyIsNoOp(t *testing.T) {
-	handler := DenyListMiddleware(nil)(testHandler("ok"))
+	handler := DenyListMiddleware(nil, nil)(testHandler("ok"))
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.RemoteAddr = "1.2.3.4:8080"
 	rec := httptest.NewRecorder()

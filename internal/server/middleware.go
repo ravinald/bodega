@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -146,7 +147,9 @@ func ParseDenyList(entries []string) ([]*net.IPNet, error) {
 // of the provided CIDR ranges, returning 403 Forbidden. It relies on
 // RealIPMiddleware having already resolved the client IP into the request
 // context. If denyNets is nil or empty the middleware is a no-op.
-func DenyListMiddleware(denyNets []*net.IPNet) func(http.Handler) http.Handler {
+//
+// auditDB may be nil; refusals are then logged nowhere but the journal.
+func DenyListMiddleware(denyNets []*net.IPNet, auditDB *audit.DB) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		if len(denyNets) == 0 {
 			return next
@@ -157,6 +160,7 @@ func DenyListMiddleware(denyNets []*net.IPNet) func(http.Handler) http.Handler {
 			if ip != nil {
 				for _, cidr := range denyNets {
 					if cidr.Contains(ip) {
+						recordDenial(auditDB, r, audit.DenialDenyList, nil)
 						http.Error(w, "Forbidden", http.StatusForbidden)
 						return
 					}
@@ -165,6 +169,84 @@ func DenyListMiddleware(denyNets []*net.IPNet) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// recordDenial writes one audit row for a request the server refused, so the
+// only queryable record of who was turned away does not live in a journal that
+// rotates. reason is one of the audit.Denial* constants and lands in the
+// status column; extra carries gate-specific context.
+//
+// It records no credential. A caller identifies a token by its id or by a
+// prefix of its peppered hash, never by the token itself, and no header is
+// copied into the row.
+//
+// A nil db is a no-op: the server keeps serving when the audit DB could not be
+// opened, and a denial must not become the thing that panics it.
+func recordDenial(db *audit.DB, r *http.Request, reason string, extra map[string]string) {
+	if db == nil {
+		return
+	}
+	pkgType, pkgName := parseAPIPackagePath(r.URL.Path)
+	details := map[string]string{
+		"method": r.Method,
+		"path":   truncateField(r.URL.Path, maxDetailField),
+	}
+	for k, v := range extra {
+		details[k] = truncateField(v, maxDetailField)
+	}
+	blob, err := json.Marshal(details)
+	if err != nil {
+		blob = []byte("{}")
+	}
+	_ = db.Record(r.Context(), audit.Event{
+		EventType: audit.EventDenied,
+		PkgType:   pkgType,
+		PkgName:   pkgName,
+		ClientIP:  ClientIP(r),
+		UserAgent: truncateField(r.UserAgent(), maxDetailField),
+		Status:    reason,
+		Details:   string(blob),
+	})
+}
+
+// hashPrefix is the leading bytes of a peppered token hash, enough to tell two
+// rejected credentials apart in the audit trail and far too little to attack
+// the hash with.
+func hashPrefix(hash string) string {
+	const n = 12
+	if len(hash) <= n {
+		return hash
+	}
+	return hash[:n]
+}
+
+// maxDetailField caps every client-controlled string copied into an audit row.
+// A denial is written before any handler has validated the request, so path,
+// User-Agent and package name here are whatever the caller sent: unbounded,
+// they let an unauthenticated stranger choose how much disk each 403 costs.
+const maxDetailField = 256
+
+func truncateField(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
+}
+
+// parseAPIPackagePath pulls the type and name out of /api/v1/packages/{type}
+// and /api/v1/packages/{type}/{name}. The mutation gate runs before the mux,
+// so r.PathValue is empty there and a denial would otherwise carry no subject.
+func parseAPIPackagePath(path string) (pkgType, pkgName string) {
+	rest, ok := strings.CutPrefix(path, "/api/v1/packages/")
+	if !ok {
+		return "", ""
+	}
+	parts := strings.Split(rest, "/")
+	pkgType = truncateField(parts[0], maxDetailField)
+	if len(parts) > 1 {
+		pkgName = truncateField(parts[1], maxDetailField)
+	}
+	return pkgType, pkgName
 }
 
 // maxBodyCapture is the maximum number of bytes captured from request/response
@@ -338,11 +420,10 @@ func AuditMiddleware(db *audit.DB) func(http.Handler) http.Handler {
 				return
 			}
 
-			status := "success"
-			if rec.statusCode == http.StatusNotFound {
-				status = "not_found"
-			}
-
+			// 404s on package routes are deliberately not recorded: the
+			// guard above has already discarded them, and apt probes several
+			// optional index paths on every update, so recording them would
+			// bury the fetches under noise no operator asked about.
 			_ = db.Record(r.Context(), audit.Event{
 				EventType:  audit.EventServeFetch,
 				PkgType:    pkgType,
@@ -350,7 +431,7 @@ func AuditMiddleware(db *audit.DB) func(http.Handler) http.Handler {
 				PkgVersion: pkgVersion,
 				ClientIP:   ClientIP(r),
 				UserAgent:  r.UserAgent(),
-				Status:     status,
+				Status:     "success",
 				DurationMs: duration.Milliseconds(),
 			})
 		})
@@ -485,6 +566,7 @@ func MutationAuthMiddleware(adminNets []*net.IPNet, auditDB *audit.DB, pepper st
 			clientIP := net.ParseIP(ClientIP(r))
 			if clientIP == nil {
 				logger.Warn("mutation blocked: unparseable client IP", "remote", r.RemoteAddr)
+				recordDenial(auditDB, r, audit.DenialUnparseableIP, nil)
 				http.Error(w, "Forbidden", http.StatusForbidden)
 				return
 			}
@@ -498,6 +580,7 @@ func MutationAuthMiddleware(adminNets []*net.IPNet, auditDB *audit.DB, pepper st
 			if !allowed {
 				logger.Warn("mutation blocked: IP not in admin_permit_cidr",
 					"client_ip", clientIP.String(), "method", r.Method, "path", r.URL.Path)
+				recordDenial(auditDB, r, audit.DenialIPNotPermitted, nil)
 				http.Error(w, "Forbidden", http.StatusForbidden)
 				return
 			}
@@ -508,6 +591,7 @@ func MutationAuthMiddleware(adminNets []*net.IPNet, auditDB *audit.DB, pepper st
 				if len(hashes) == 0 {
 					logger.Warn("mutation blocked: no tokens configured for remote access",
 						"client_ip", clientIP.String())
+					recordDenial(auditDB, r, audit.DenialNoTokens, nil)
 					http.Error(w, "Unauthorized — no tokens configured", http.StatusUnauthorized)
 					return
 				}
@@ -515,6 +599,9 @@ func MutationAuthMiddleware(adminNets []*net.IPNet, auditDB *audit.DB, pepper st
 				auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 				if auth == "" || auth == r.Header.Get("Authorization") {
 					// No Bearer prefix or empty token.
+					logger.Warn("mutation blocked: no bearer credential",
+						"client_ip", clientIP.String(), "method", r.Method, "path", r.URL.Path)
+					recordDenial(auditDB, r, audit.DenialTokenMissing, nil)
 					http.Error(w, "Unauthorized", http.StatusUnauthorized)
 					return
 				}
@@ -533,6 +620,11 @@ func MutationAuthMiddleware(adminNets []*net.IPNet, auditDB *audit.DB, pepper st
 				if matched == nil {
 					logger.Warn("mutation blocked: invalid token",
 						"client_ip", clientIP.String(), "method", r.Method, "path", r.URL.Path)
+					// A prefix of the peppered hash, never the credential: it
+					// correlates a repeat caller across rows and is not
+					// replayable without the pepper.
+					recordDenial(auditDB, r, audit.DenialTokenInvalid,
+						map[string]string{"hash_prefix": hashPrefix(incoming)})
 					http.Error(w, "Unauthorized", http.StatusUnauthorized)
 					return
 				}
@@ -541,6 +633,11 @@ func MutationAuthMiddleware(adminNets []*net.IPNet, auditDB *audit.DB, pepper st
 				if matched.ExpiresAt != nil && matched.ExpiresAt.Before(time.Now()) {
 					logger.Warn("mutation blocked: token expired",
 						"token_id", matched.ID, "client_ip", clientIP.String())
+					recordDenial(auditDB, r, audit.DenialTokenExpired,
+						map[string]string{
+							"token_id":   matched.ID,
+							"expired_at": matched.ExpiresAt.UTC().Format(time.RFC3339),
+						})
 					http.Error(w, "Unauthorized — token expired", http.StatusUnauthorized)
 					return
 				}

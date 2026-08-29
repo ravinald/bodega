@@ -29,7 +29,12 @@ Examples:
   bodega audit                                    # last 20 events
   bodega audit --type fetch --limit 50            # last 50 fetch events
   bodega audit --pkg-type gomod --name github.com/aws/aws-sdk-go-v2
-  bodega audit --client 10.0.0.5 --since 2026-04-07`,
+  bodega audit --client 10.0.0.5 --since 2026-04-07
+  bodega audit --type denied --limit 50            # requests the server refused
+
+A "denied" event carries the gate that refused it in the STATUS column:
+deny_list, client_ip_unparsable, ip_not_permitted, no_tokens_configured,
+token_missing, token_invalid, token_expired, admin_only.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig(gf)
 			if err != nil {
@@ -76,7 +81,7 @@ Examples:
 
 			// Print table header. CLIENT is the HTTP client IP; ACTOR is the
 			// CLI/TUI user. They're mutually exclusive per event in practice.
-			fmt.Printf("%-20s %-8s %-8s %-40s %-12s %-15s %-12s %s\n",
+			fmt.Printf("%-20s %-12s %-8s %-40s %-20s %-15s %-12s %s\n",
 				"TIMESTAMP", "EVENT", "TYPE", "NAME", "STATUS", "CLIENT", "ACTOR", "DURATION")
 			fmt.Println("---")
 
@@ -85,7 +90,7 @@ Examples:
 				if ev.DurationMs > 0 {
 					dur = fmt.Sprintf("%dms", ev.DurationMs)
 				}
-				fmt.Printf("%-20s %-8s %-8s %-40s %-12s %-15s %-12s %s\n",
+				fmt.Printf("%-20s %-12s %-8s %-40s %-20s %-15s %-12s %s\n",
 					ev.Timestamp.Format("2006-01-02 15:04:05"),
 					ev.EventType,
 					ev.PkgType,
@@ -102,7 +107,7 @@ Examples:
 		},
 	}
 
-	cmd.Flags().StringVar(&eventType, "type", "", "Event type filter (fetch, build, create, delete, cache)")
+	cmd.Flags().StringVar(&eventType, "type", "", "Event type filter (serve_fetch, denied, build, create, delete, cache, serve_start, serve_stop, ...)")
 	cmd.Flags().StringVar(&pkgType, "pkg-type", "", "Package type filter (apt, git, pypi, binary, gomod, helm, npm)")
 	cmd.Flags().StringVar(&pkgName, "name", "", "Package name filter")
 	cmd.Flags().StringVar(&clientIP, "client", "", "Client IP filter (HTTP events)")
