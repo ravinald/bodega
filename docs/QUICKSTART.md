@@ -208,18 +208,18 @@ With proxy enabled, when a client requests a package not in S3, bodega fetches i
 
 ## 12. Mutation API access
 
-The REST API's create and delete endpoints are restricted to localhost by default. If you need to create or delete entries from another host (e.g., CI), widen the allow-list and generate a token:
-
-```json
-{
-  "admin_permit_cidr": ["127.0.0.0/8", "::1/128", "10.0.0.0/8"]
-}
-```
+The REST API's create and delete endpoints are restricted to localhost by default. If you need to create or delete entries from another host (e.g., CI), generate a token and then widen the allow-list, in that order:
 
 ```bash
 bodega token generate ci-pipeline expiry 90d "CI deploy token"
 # Displays the token once — save it. A hashed copy is stored in the audit DB.
+
+bodega acl admin add 10.0.0.0/8
 ```
+
+Widening past localhost is what turns the Bearer requirement on, so `bodega acl admin add` refuses to do it while no token exists: the next mutation would answer 401 with nothing naming the cause. Both live in the audit database, so neither needs a restart.
+
+The `admin_permit_cidr` key in `config.json` seeds the list on first start and is ignored afterwards. Editing it on a running install changes nothing.
 
 Manage tokens with `bodega token list` and `bodega token revoke`. In the TUI, press `T` to open the token manager. See [USAGE.md](USAGE.md#rest-api) for full details.
 

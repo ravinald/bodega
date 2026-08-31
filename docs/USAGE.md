@@ -382,6 +382,38 @@ Lists all API tokens with their ID, label, creation date, expiry, last use, and 
 
 Revokes a token by its short ID or label, removing it from the database.
 
+### `bodega acl <admin|deny|proxies> <add|remove|list> [cidr]`
+
+Manages the three CIDR access lists. They live in the audit database, not in `config.json`, so a change lands on a running server with no restart: within 30 seconds on its own, or at once on `systemctl reload bodega`.
+
+The list names are the config keys they replace:
+
+| Name      | Config key          | What it holds                              |
+| --------- | ------------------- | ------------------------------------------ |
+| `admin`   | `admin_permit_cidr` | CIDRs allowed to reach the mutation API    |
+| `deny`    | `deny_list`         | CIDRs refused on every route               |
+| `proxies` | `trusted_proxies`   | Peers whose forwarded headers are believed |
+
+There are three lists, so the caller has to name one. `bodega acl add 10.0.0.0/8` is refused and prints the three names.
+
+```bash
+bodega acl admin add 10.0.0.0/8 --comment "ops jump host"
+bodega acl admin remove 10.0.0.0/8
+bodega acl deny add 203.0.113.0/24
+bodega acl proxies list
+```
+
+A bare address is taken as `/32` or `/128`, and an entry is stored masked: `10.0.0.1/8` added is `10.0.0.0/8` listed and removed.
+
+Two changes are refused because they fail silently otherwise. Both take `--force`, and both errors name the next step:
+
+- **An `admin add` that takes the list past localhost while no token exists.** Widening the list is what turns the Bearer requirement on, so the next mutation (including one from localhost that worked a moment earlier) answers 401 with nothing pointing at the cause. Run `bodega token generate <label>` first.
+- **An `admin remove` that empties the list.** An empty `admin_permit_cidr` refuses every mutation, and nothing could put an entry back over HTTP.
+
+Every add and remove writes an audit row: a `create` or `delete` event with `pkg_type=acl`, the list name, the CIDR and the OS user who ran the command. `bodega audit events` shows the list in its `NAME` column; the CIDR is in the record's version field, which `GET /api/v1/audit` returns and the table view does not.
+
+The first write to a list copies the config file's value in and says so. After that the database owns the list and the file's entry is inert; see **Configuration** below.
+
 ### `bodega policy list [--type TYPE]`
 
 Lists configured upstream allow-list rules. Without `--type`, shows every rule grouped by registry type.
@@ -518,6 +550,12 @@ A default config is created on first run. All fields are optional.
   "tls_min_version": "1.3"
 }
 ```
+
+`deny_list`, `admin_permit_cidr` and `trusted_proxies` are bootstrap values. bodega copies each one into the audit database the first time it starts against a database that does not hold it, logging `acl source list=<name> source=database detail="copied from config file on this start"`. From then on the database decides and the file's entry is inert; a start where the two disagree logs a `WARN` naming both values and the `bodega acl` command that shows the live one. Edit them with `bodega acl`, not with the file.
+
+The copy happens once rather than the file being read as a fallback on every start. A fallback would make `bodega acl admin remove` unable to remove anything the file still named, which is the lockout guard wearing the opposite sign.
+
+`trusted_proxies` keeps its tri-state across the move. The database records "this list is mine" separately from its entries, so an operator's `[]` still means trust nobody and an absent key still means the built-in loopback + RFC 1918 default.
 
 `apt_codename` is the default suite for apt manifest entries that name no `suites`; `apt_suites` is the full set served under `/apt/dists/`, and `apt_codename` is always included in it whether listed or not. A suite name containing `/` is rejected at load.
 
@@ -966,7 +1004,7 @@ A rebuild happens on:
 | Trigger | Notes |
 |---------|-------|
 | Server start | Before the listener binds, so no request ever sees an empty index |
-| `SIGHUP` | After the manifest reload and the signing-key reload. Every mutating `bodega pkg` verb sends one |
+| `SIGHUP` | After the manifest reload and the signing-key reload. Every mutating `bodega pkg` verb sends one. The same signal re-reads the CIDR access lists |
 | A mutation-API write to an apt entry | `POST`, `DELETE`, and the hide and freeze toggles |
 | A ticker | Hourly once an index exists; 15s, 30s, 60s and on up to hourly until one does |
 
@@ -1146,9 +1184,11 @@ Policy mutations invalidate the in-memory cache, so changes take effect on the n
 
 Mutation endpoints are restricted by `admin_permit_cidr`, which defaults to localhost only (`127.0.0.0/8`, `::1/128`). Requests from IPs outside the permit list get a 403.
 
+That list lives in the audit database and is read per request, so `bodega acl admin add|remove` takes effect on a running server without a restart. `config.json` seeds it on first start and is ignored afterwards; see **Configuration**.
+
 The address compared against that list is the one `trusted_proxies` resolved, not the TCP peer. Behind a proxy the two differ by design; on a shared private network with the default trusted set they differ because a stranger said so.
 
-When `admin_permit_cidr` includes non-localhost addresses, a Bearer token is also required. Generate tokens with `bodega token generate` and pass them in the `Authorization` header.
+When `admin_permit_cidr` includes non-localhost addresses, a Bearer token is also required. Generate tokens with `bodega token generate` and pass them in the `Authorization` header. Widening the list is what turns that requirement on, which is why `bodega acl admin add` refuses to widen past localhost while no token exists.
 
 **Create example (from localhost):**
 ```bash
@@ -1403,6 +1443,8 @@ Denials record at every gate in the middleware chain and at the admin-read gate.
 ### Config editor
 
 Press `C` to open the config form. `Ctrl+S` saves, `Ctrl+T` loads defaults, `Ctrl+R` resets. Changes take effect immediately.
+
+Its **Deny list** field still writes `deny_list` to `config.json`, which a server that has already copied the list into its audit database ignores. Use `bodega acl deny` instead until the editor is moved over.
 
 ---
 

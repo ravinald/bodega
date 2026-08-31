@@ -36,9 +36,15 @@ Group=bodega
 WorkingDirectory=/var/lib/bodega
 
 ExecStart=/usr/local/bin/bodega serve
-# SIGHUP reloads the manifests and re-reads the apt signing key without
-# restarting the server. The key rotation runbook in docs/USAGE.md calls this
-# twice and depends on both halves.
+# SIGHUP reloads the manifests, re-reads the apt signing key, and re-reads the
+# CIDR access lists (admin_permit_cidr, deny_list, trusted_proxies) from the
+# audit database. The key rotation runbook in docs/USAGE.md calls this twice and
+# depends on both of the first two.
+#
+# It does NOT re-read this file or config.json. Nothing else in config.json is
+# reloadable, so a change to one of those keys still needs a restart. The access
+# lists reach a running server on their own within 30 seconds; this signal is
+# how you get them there at once.
 ExecReload=/bin/kill -HUP $MAINPID
 
 # Point bodega at the system config. Listen address and log level live

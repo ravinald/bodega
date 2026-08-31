@@ -25,7 +25,7 @@ func TestRealIPEmptyTrustedSetTrustsNoHeader(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	handler := RealIPMiddleware([]*net.IPNet{})(inner)
+	handler := RealIPMiddleware(StaticNets([]*net.IPNet{}))(inner)
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.RemoteAddr = "10.4.5.6:1234"
 	req.Header.Set("X-Real-IP", "127.0.0.1")
@@ -63,7 +63,7 @@ func TestRequestSchemeHonorsConfiguredTrustedSet(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			scheme = ""
-			handler := RealIPMiddleware(tc.nets)(inner)
+			handler := RealIPMiddleware(StaticNets(tc.nets))(inner)
 			req := httptest.NewRequest("GET", "/test", nil)
 			req.RemoteAddr = tc.peer
 			req.Header.Set("X-Forwarded-Proto", "https")

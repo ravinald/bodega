@@ -283,25 +283,40 @@ The `checksum_verified` field tracks whether the checksum was confirmed against 
 
 For proxy mode, the server verifies checksums on immutable resources (versioned archives) and records mismatches in the audit trail.
 
+### Where the CIDR lists live
+
+`admin_permit_cidr`, `deny_list` and `trusted_proxies` live in the audit database, in `acl_lists` and `acl_entries` (migration `008`). They are the only runtime values that have moved out of `config.json` so far; `docs-internal/CONFIG_TO_DB_MIGRATION.md` scopes the rest.
+
+The move buys two things. A change lands on a running server, within 30 seconds on its own or at once on `systemctl reload bodega`, so widening the admin list no longer means a restart. And the write path is `bodega acl`, which touches one row, rather than `Config.Save()`, which rewrites the whole file including keys the caller never named.
+
+**The config file is copied once, not read as a fallback.** On the first start against a database that does not own a list, bodega copies the file's value in and logs `acl source list=<name> source=database detail="copied from config file on this start"`. From then on the database answers alone and the file's entry is inert; a start where the two disagree logs a `WARN` naming both. The alternative — reading the file as a fallback forever — would make `bodega acl admin remove` unable to remove anything the file still names.
+
+`acl_lists` carries one marker row per list because "no rows in `acl_entries`" is two different answers for `trusted_proxies`. A list with a marker is answered from the table even when empty; a list without one is still answered from the file. See **IP resolution** below for why collapsing those matters.
+
+A list bodega cannot read, or one holding a CIDR it cannot parse, keeps its config file value rather than emptying. An empty admin list refuses every mutation and an empty deny list refuses none, so both directions of failure are worse than the last good answer.
+
 ### Deny list
 
-The config file accepts a `deny_list` of CIDR entries. Bare IPs are treated as /32 (IPv4) or /128 (IPv6). Requests from denied addresses get a 403. The deny list is parsed at startup and applies to all routes.
+`deny_list` holds CIDR entries. Bare IPs are treated as /32 (IPv4) or /128 (IPv6). Requests from denied addresses get a 403, on all routes.
 
-```json
-"deny_list": ["10.99.0.0/16", "fd00::bad:1"]
+```bash
+bodega acl deny add 10.99.0.0/16
+bodega acl deny list
 ```
 
 ### IP resolution
 
 The `RealIPMiddleware` extracts the client IP from `X-Real-IP` or `X-Forwarded-For` headers, but only when the direct peer is in a trusted network. Untrusted peers can't spoof their IP via headers.
 
-`trusted_proxies` names that set, and it is tri-state:
+`trusted_proxies` names that set, and it is tri-state. The three answers survive the move to the database, which is what the `acl_lists` marker row is for:
 
-| Value | Meaning |
-|-------|---------|
-| absent / `null` | Built-in default: loopback plus RFC 1918 |
-| `[]` | Trust no forwarded header from any peer |
-| `["10.9.0.0/16", ...]` | Trust exactly these |
+| Value | In the database | Meaning |
+|-------|-----------------|---------|
+| absent / `null` | no marker row | Built-in default: loopback plus RFC 1918 |
+| `[]` | marker row, no entries | Trust no forwarded header from any peer |
+| `["10.9.0.0/16", ...]` | marker row plus entries | Trust exactly these |
+
+An operator who wrote `[]` disabled header trust on purpose. Handing the RFC 1918 default back because a table came up empty would restore it to a deployment that asked to have none, so `bodega acl proxies add` on a list that was never set says out loud that the built-in default has just ended.
 
 The default is wide on purpose, because the common deployment puts a proxy on the same host. It is the wrong default anywhere the private network has other tenants: a Linode with private networking, a Docker bridge, a pod network. Every peer in RFC 1918 is then believed, `admin_permit_cidr` defaults to loopback, and `X-Real-IP: 127.0.0.1` from any of them reaches the mutation API with no token. Name your proxy on those networks, or write `[]` and let bodega answer to the peer address alone.
 
@@ -309,11 +324,20 @@ The default is wide on purpose, because the common deployment puts a proxy on th
 
 The mutation API (POST and DELETE on `/api/v1/packages/...`) is gated by two layers:
 
-1. **IP allow-list** (`admin_permit_cidr`): Only requests from permitted CIDRs can reach mutation endpoints. Defaults to `["127.0.0.0/8", "::1/128"]`, so out of the box only localhost can create or delete entries.
+1. **IP allow-list** (`admin_permit_cidr`): Only requests from permitted CIDRs can reach mutation endpoints. Defaults to `["127.0.0.0/8", "::1/128"]`, so out of the box only localhost can create or delete entries. Change it with `bodega acl admin add|remove`.
 
 2. **Bearer token** (`api_token`): When `admin_permit_cidr` extends beyond localhost, a valid `Authorization: Bearer <token>` header is required on mutation requests. Generate tokens with `bodega token generate`.
 
 Both layers read the client IP that `trusted_proxies` resolved, so a permissive trusted set widens the first layer no matter how narrow `admin_permit_cidr` looks.
+
+Both are re-read per request rather than captured when the handler chain is built, because widening the list is exactly what turns layer 2 on. A set frozen at startup would leave a widened server admitting unauthenticated mutations until something restarted it.
+
+`bodega acl admin` refuses two changes that fail silently otherwise, each with a `--force` escape:
+
+- **An add that takes the list past localhost while no token exists.** It turns on the Bearer requirement, and the next mutation (including one from localhost that worked a moment earlier) answers 401 with nothing naming the cause.
+- **A remove that empties the list.** An empty `admin_permit_cidr` refuses every mutation, so nothing could put an entry back over HTTP.
+
+Every add and remove is recorded in the audit database as a `create` or `delete` event with `pkg_type=acl`, the list in `pkg_name`, the CIDR in `pkg_version` and the OS user in `actor`. Who changed the rule sits beside the record of who the rule turned away.
 
 Read endpoints remain unauthenticated. Package manager clients (apt, pip, go, npm, helm) use standard protocols that don't support auth headers, so read paths stay open by design.
 
@@ -358,9 +382,9 @@ Key fields:
 | `build_root` | /opt/bodega | Where artifacts are built locally |
 | `proxy_cache_enabled` | false | Global proxy/cache toggle |
 | `metadata_ttl` | 1h | How long mutable proxy resources are cached |
-| `deny_list` | [] | CIDR entries to block |
-| `admin_permit_cidr` | [127.0.0.0/8, ::1/128] | CIDRs allowed to hit mutation API |
-| `trusted_proxies` | null (loopback + RFC 1918) | Peers whose forwarded headers are believed; `[]` trusts none |
+| `deny_list` | [] | CIDR entries to block. **Bootstrap only**: copied into the audit DB on first start, then owned by `bodega acl deny` |
+| `admin_permit_cidr` | [127.0.0.0/8, ::1/128] | CIDRs allowed to hit mutation API. **Bootstrap only**: owned by `bodega acl admin` after the first start |
+| `trusted_proxies` | null (loopback + RFC 1918) | Peers whose forwarded headers are believed; `[]` trusts none. **Bootstrap only**: owned by `bodega acl proxies` after the first start |
 | `tls_min_version` | 1.3 | Floor for bodega's own listener; `1.2` or `1.3` |
 | `api_token` | (none) | Bearer token for mutation API |
 | `tls_cert` / `tls_key` | (none) | Manual TLS |
@@ -424,4 +448,4 @@ Bodega is a single static binary. A typical deployment:
 
 The binary runs on the build host. The server runs on the same host or a dedicated package server. There is no separate worker process.
 
-SIGHUP-based reload is supported via a PID file: send `SIGHUP` to the running process to reload config and manifests without losing in-flight requests.
+SIGHUP-based reload is supported via a PID file: send `SIGHUP` to the running process to reload the manifests, the apt signing key and the CIDR access lists without losing in-flight requests. It does not re-read `config.json`; nothing else in that file is reloadable, and a change to one still takes a restart.
