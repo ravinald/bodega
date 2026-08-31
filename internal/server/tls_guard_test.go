@@ -124,8 +124,8 @@ func newGuardServer(t *testing.T, cfg *config.Config, addr string) *Server {
 }
 
 // startAndProbe runs Start, waits for the port to answer, and reports the
-// scheme the listener spoke: "https" if a TLS handshake completes, "http" if a
-// plaintext request gets a status line.
+// scheme the listener spoke: "https" if /healthz answers 200 over a TLS
+// handshake, "http" if it answers 200 in the clear.
 func startAndProbe(t *testing.T, s *Server, addr string) string {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -146,6 +146,10 @@ func startAndProbe(t *testing.T, s *Server, addr string) string {
 	// Probed by scheme rather than by a bare TCP dial: a connect that opens
 	// and closes without a ClientHello is a handshake error on a TLS listener,
 	// which buries the real failure under log noise on every run.
+	//
+	// Neither arm answering means the listener is not up yet, so waitFor
+	// retries. Start binds a few statements after the goroutine begins, and
+	// the first iteration can land in that window.
 	var scheme string
 	waitFor(t, func() bool {
 		switch {
@@ -159,6 +163,12 @@ func startAndProbe(t *testing.T, s *Server, addr string) string {
 	return scheme
 }
 
+// Both probes require a 200 rather than any response at all. A TLS listener
+// answers a plaintext request with a plaintext "400 Bad Request: client sent
+// an HTTP request to an HTTPS server", so a returned status line is evidence
+// that something is on the port, not evidence of which scheme it speaks.
+// /healthz is an unconditional 200 that reaches neither storage nor the admin
+// gate, which makes it the one route whose status carries no other meaning.
 func probeTLS(addr string) bool {
 	client := &http.Client{
 		Timeout:   5 * time.Second,
@@ -169,7 +179,7 @@ func probeTLS(addr string) bool {
 		return false
 	}
 	_ = resp.Body.Close()
-	return true
+	return resp.StatusCode == http.StatusOK
 }
 
 func probePlain(addr string) bool {
@@ -179,7 +189,7 @@ func probePlain(addr string) bool {
 		return false
 	}
 	_ = resp.Body.Close()
-	return true
+	return resp.StatusCode == http.StatusOK
 }
 
 func assertNothingListening(t *testing.T, addr string) {
