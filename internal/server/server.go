@@ -79,6 +79,15 @@ type Server struct {
 	quiet          bool       // suppress stderr startup banner (slog output unaffected)
 	mu             sync.Mutex // protects store mutations (CRUD API)
 
+	// acl is the live answer for all three CIDR lists, resolved from the audit
+	// database over the three fields above. Held behind an atomic pointer and
+	// a TTL rather than rebuilt on the handler chain, because the chain is
+	// built once at Start and an operator changing a list on a running server
+	// has nothing to rebuild it. See internal/server/acl.go.
+	acl   atomic.Pointer[aclSet]
+	aclAt atomic.Int64 // UnixNano the cached set was resolved
+	aclMu sync.Mutex   // serializes refreshes so a stale cache costs one query
+
 	// aptSign is the signing key and the two served renderings of its public
 	// half. nil when no key is installed, which is a supported configuration:
 	// signed and unsigned coexist at the same URLs, and the signature is
@@ -199,6 +208,11 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 	if s.discoverMode != "" && s.auditDB != nil {
 		s.discovery = NewDiscoveryRecorder(s.auditDB, logger)
 	}
+	// Access control lists: copy the config file's values into the audit DB on
+	// first sight, then resolve the live set the middleware chain reads.
+	s.seedACLs(context.Background())
+	s.refreshACLs(context.Background())
+
 	s.loadAptSigner()
 	s.registerRoutes()
 
@@ -221,16 +235,6 @@ func resolveAuditDBPath(cfg *config.Config) string {
 	return ""
 }
 
-// resolvedTrustedNets hands RealIPMiddleware the set it should honor. nil asks
-// for the built-in default; a non-nil empty slice means trust nobody, and the
-// middleware must not read it as "unset".
-func (s *Server) resolvedTrustedNets() []*net.IPNet {
-	if !s.trustedNetsSet {
-		return nil
-	}
-	return s.trustedNets
-}
-
 // Handler returns the root http.Handler (with middleware applied).
 // Useful for testing without starting a real TCP listener.
 func (s *Server) Handler() http.Handler {
@@ -241,10 +245,10 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) handler() http.Handler {
 	var h http.Handler = s.mux
 	h = AuditMiddleware(s.auditDB)(h)
-	h = MutationAuthMiddleware(s.adminNets, s.auditDB, s.pepper, s.logger)(h)
-	h = DenyListMiddleware(s.denyNets, s.auditDB)(h)
+	h = MutationAuthMiddleware(s.adminNetsFunc(), s.auditDB, s.pepper, s.logger)(h)
+	h = DenyListMiddleware(s.denyNetsFunc(), s.auditDB)(h)
 	h = RequestLogger(s.logger)(h)
-	h = RealIPMiddleware(s.resolvedTrustedNets())(h)
+	h = RealIPMiddleware(s.trustedNetsFunc())(h)
 	h = SecurityHeadersMiddleware(h)
 	return h
 }
@@ -421,8 +425,14 @@ func (s *Server) recordLifecycle(ev audit.EventType, addr string, tlsMode bool) 
 	}
 }
 
-// reload is what SIGHUP does: re-read everything the server holds from disk
-// and rebuild what is derived from it.
+// reload is what SIGHUP does: re-read everything the server holds outside its
+// own memory and rebuild what is derived from it.
+//
+// The CIDR access lists are re-read here as well as behind their own cache
+// TTL. The cache is what makes `bodega acl` land on a running server at all;
+// the call here is what keeps `systemctl reload bodega` honest, because a
+// reload that silently skipped the list an operator had just edited would be
+// worse than having no reload.
 //
 // The signing key is re-read here rather than only at startup because the
 // published rotation runbook has the operator write a key and reload. With
@@ -437,10 +447,11 @@ func (s *Server) recordLifecycle(ev audit.EventType, addr string, tlsMode bool) 
 // the same trap in a rarer shape, and the hourly tick already treats a failed
 // manifest read as non-fatal and rebuilds anyway.
 func (s *Server) reload(ctx context.Context) {
-	s.logger.Info("reload requested, re-reading manifests and the apt signing key")
+	s.logger.Info("reload requested, re-reading manifests, the apt signing key and the CIDR access lists")
 	s.reloadManifests(ctx)
 	s.loadAptSigner()
 	s.rebuildAptSnapshot(ctx)
+	s.refreshACLs(ctx)
 	s.logger.Info("reload complete")
 }
 
@@ -567,15 +578,16 @@ func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
 // admin_permit_cidr. Used to gate sensitive read endpoints (audit, tokens,
 // config) that don't go through the mutation middleware.
 func (s *Server) isAdminRequest(r *http.Request) bool {
+	adminNets := s.aclNow().admin
 	// If no admin CIDRs are configured, allow all (no restriction).
-	if len(s.adminNets) == 0 {
+	if len(adminNets) == 0 {
 		return true
 	}
 	clientIP := net.ParseIP(ClientIP(r))
 	if clientIP == nil {
 		return false
 	}
-	for _, n := range s.adminNets {
+	for _, n := range adminNets {
 		if n.Contains(clientIP) {
 			return true
 		}

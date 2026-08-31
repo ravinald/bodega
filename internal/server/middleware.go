@@ -37,16 +37,38 @@ func ClientIP(r *http.Request) string {
 	return host
 }
 
+// NetsFunc supplies a CIDR set. It is called once per request rather than once
+// per chain build, so a list changed on a running server takes effect without
+// the handler chain being rebuilt. A nil NetsFunc yields no set at all.
+type NetsFunc func() []*net.IPNet
+
+// StaticNets wraps a fixed set for a caller with nothing to reload.
+func StaticNets(nets []*net.IPNet) NetsFunc {
+	return func() []*net.IPNet { return nets }
+}
+
+// nets calls f, tolerating a nil f.
+func (f NetsFunc) nets() []*net.IPNet {
+	if f == nil {
+		return nil
+	}
+	return f()
+}
+
 // RealIPMiddleware extracts the real client IP from reverse proxy headers
 // (X-Real-IP, X-Forwarded-For) and stores it in the request context.
-// Only trusts forwarded headers when the direct peer is in trustedNets.
-// If trustedNets is nil, RFC 1918 + loopback ranges are used.
-func RealIPMiddleware(trustedNets []*net.IPNet) func(http.Handler) http.Handler {
-	if trustedNets == nil {
-		trustedNets = defaultTrustedNets()
-	}
+// Only trusts forwarded headers when the direct peer is in the trusted set.
+// A nil set, from a nil NetsFunc or one returning nil, means RFC 1918 +
+// loopback. A non-nil empty set means trust nobody, and the two must not be
+// collapsed: the second is an operator's answer, the first is the absence of
+// one.
+func RealIPMiddleware(trusted NetsFunc) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			trustedNets := trusted.nets()
+			if trustedNets == nil {
+				trustedNets = defaultTrustedNets()
+			}
 			ip := resolveClientIP(r, trustedNets)
 			ctx := context.WithValue(r.Context(), clientIPKey, ip)
 			// Carried so every later reader of a forwarded header answers to
@@ -165,19 +187,23 @@ func ParseDenyList(entries []string) ([]*net.IPNet, error) {
 // DenyListMiddleware rejects requests from clients whose IP falls within any
 // of the provided CIDR ranges, returning 403 Forbidden. It relies on
 // RealIPMiddleware having already resolved the client IP into the request
-// context. If denyNets is nil or empty the middleware is a no-op.
+// context. An empty set makes the middleware a pass-through, re-evaluated per
+// request rather than at chain build time so a first entry added to an empty
+// list is honored.
 //
 // auditDB may be nil; refusals are then logged nowhere but the journal.
-func DenyListMiddleware(denyNets []*net.IPNet, auditDB *audit.DB) func(http.Handler) http.Handler {
+func DenyListMiddleware(denyNets NetsFunc, auditDB *audit.DB) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
-		if len(denyNets) == 0 {
-			return next
-		}
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			nets := denyNets.nets()
+			if len(nets) == 0 {
+				next.ServeHTTP(w, r)
+				return
+			}
 			clientIP := ClientIP(r)
 			ip := net.ParseIP(clientIP)
 			if ip != nil {
-				for _, cidr := range denyNets {
+				for _, cidr := range nets {
 					if cidr.Contains(ip) {
 						recordDenial(auditDB, r, audit.DenialDenyList, nil)
 						http.Error(w, "Forbidden", http.StatusForbidden)
@@ -532,8 +558,11 @@ func parsePackagePath(path string) (pkgType, pkgName, pkgVersion string) {
 	return "", "", ""
 }
 
-// isLocalhostOnly returns true if every entry in nets is a loopback range.
-func isLocalhostOnly(nets []*net.IPNet) bool {
+// LocalhostOnly returns true if every entry in nets is a loopback range. It is
+// the test that decides whether the mutation API requires a Bearer token, so
+// `bodega acl` answers it the same way the middleware does rather than
+// re-deriving it.
+func LocalhostOnly(nets []*net.IPNet) bool {
 	for _, n := range nets {
 		if !n.IP.IsLoopback() {
 			return false
@@ -542,16 +571,19 @@ func isLocalhostOnly(nets []*net.IPNet) bool {
 	return true
 }
 
-// MutationAuthMiddleware restricts POST and DELETE requests to clients in
-// adminNets. When the allow-list extends beyond localhost, a valid Bearer
+// MutationAuthMiddleware restricts POST and DELETE requests to clients in the
+// admin allow-list. When that list extends beyond localhost, a valid Bearer
 // token is required, verified via SHA-256(token + pepper) against the
 // hashes stored in the audit DB.
 //
+// Both the allow-list and the localhost-only test are evaluated per request:
+// widening the list is exactly what turns the token requirement on, so a set
+// captured at chain build time would leave a widened server still admitting
+// unauthenticated mutations until it restarted.
+//
 // GET/HEAD/OPTIONS requests pass through unconditionally — package manager
 // clients (apt, pip, go, npm) cannot send auth headers over standard protocols.
-func MutationAuthMiddleware(adminNets []*net.IPNet, auditDB *audit.DB, pepper string, logger *slog.Logger) func(http.Handler) http.Handler {
-	localhostOnly := isLocalhostOnly(adminNets)
-
+func MutationAuthMiddleware(admin NetsFunc, auditDB *audit.DB, pepper string, logger *slog.Logger) func(http.Handler) http.Handler {
 	// Cache token hashes to avoid per-request DB queries.
 	var cachedHashes []audit.TokenHash
 	var cacheTime time.Time
@@ -589,6 +621,7 @@ func MutationAuthMiddleware(adminNets []*net.IPNet, auditDB *audit.DB, pepper st
 				http.Error(w, "Forbidden", http.StatusForbidden)
 				return
 			}
+			adminNets := admin.nets()
 			allowed := false
 			for _, n := range adminNets {
 				if n.Contains(clientIP) {
@@ -605,7 +638,7 @@ func MutationAuthMiddleware(adminNets []*net.IPNet, auditDB *audit.DB, pepper st
 			}
 
 			// If the allow-list goes beyond localhost, require a valid Bearer token.
-			if !localhostOnly {
+			if !LocalhostOnly(adminNets) {
 				hashes := loadHashes()
 				if len(hashes) == 0 {
 					logger.Warn("mutation blocked: no tokens configured for remote access",

@@ -243,7 +243,7 @@ func TestRealIPCustomTrustedNets(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	handler := RealIPMiddleware([]*net.IPNet{custom})(inner)
+	handler := RealIPMiddleware(StaticNets([]*net.IPNet{custom}))(inner)
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.RemoteAddr = "172.20.1.5:1234"
 	req.Header.Set("X-Real-IP", "1.2.3.4")
@@ -263,7 +263,7 @@ func TestDenyListBlocksIPv4(t *testing.T) {
 		t.Fatalf("ParseDenyList: %v", err)
 	}
 
-	handler := DenyListMiddleware(nets, nil)(testHandler("ok"))
+	handler := DenyListMiddleware(StaticNets(nets), nil)(testHandler("ok"))
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.RemoteAddr = "192.168.1.50:12345"
 	rec := httptest.NewRecorder()
@@ -283,7 +283,7 @@ func TestDenyListBlocksBareIPv4(t *testing.T) {
 		t.Fatalf("ParseDenyList: %v", err)
 	}
 
-	handler := DenyListMiddleware(nets, nil)(testHandler("ok"))
+	handler := DenyListMiddleware(StaticNets(nets), nil)(testHandler("ok"))
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.RemoteAddr = "10.0.0.99:9999"
 	rec := httptest.NewRecorder()
@@ -302,7 +302,7 @@ func TestDenyListBlocksIPv6(t *testing.T) {
 		t.Fatalf("ParseDenyList: %v", err)
 	}
 
-	handler := DenyListMiddleware(nets, nil)(testHandler("ok"))
+	handler := DenyListMiddleware(StaticNets(nets), nil)(testHandler("ok"))
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.RemoteAddr = "[fd12::1]:8080"
 	rec := httptest.NewRecorder()
@@ -321,7 +321,7 @@ func TestDenyListBlocksBareIPv6(t *testing.T) {
 		t.Fatalf("ParseDenyList: %v", err)
 	}
 
-	handler := DenyListMiddleware(nets, nil)(testHandler("ok"))
+	handler := DenyListMiddleware(StaticNets(nets), nil)(testHandler("ok"))
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.RemoteAddr = "[::1]:8080"
 	rec := httptest.NewRecorder()
@@ -340,7 +340,7 @@ func TestDenyListAllowsNonMatchingIP(t *testing.T) {
 		t.Fatalf("ParseDenyList: %v", err)
 	}
 
-	handler := DenyListMiddleware(nets, nil)(testHandler("ok"))
+	handler := DenyListMiddleware(StaticNets(nets), nil)(testHandler("ok"))
 	req := httptest.NewRequest("GET", "/test", nil)
 	req.RemoteAddr = "10.0.0.5:8080"
 	rec := httptest.NewRecorder()
@@ -544,7 +544,7 @@ func mustParseCIDR(cidr string) *net.IPNet {
 func TestMutationAuthGETPassesThrough(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	nets := []*net.IPNet{mustParseCIDR("192.168.0.0/16")}
-	handler := MutationAuthMiddleware(nets, nil, "", logger)(testHandler("ok"))
+	handler := MutationAuthMiddleware(StaticNets(nets), nil, "", logger)(testHandler("ok"))
 
 	// GET from a non-permitted IP should still pass — only POST/DELETE are gated.
 	req := httptest.NewRequest("GET", "/api/v1/packages", nil)
@@ -560,7 +560,7 @@ func TestMutationAuthGETPassesThrough(t *testing.T) {
 func TestMutationAuthBlocksNonPermittedIP(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	nets := []*net.IPNet{mustParseCIDR("192.168.1.0/24")}
-	handler := MutationAuthMiddleware(nets, nil, "", logger)(testHandler("ok"))
+	handler := MutationAuthMiddleware(StaticNets(nets), nil, "", logger)(testHandler("ok"))
 
 	req := httptest.NewRequest("POST", "/api/v1/packages/apt", nil)
 	req.RemoteAddr = "10.0.0.1:12345"
@@ -575,7 +575,7 @@ func TestMutationAuthBlocksNonPermittedIP(t *testing.T) {
 func TestMutationAuthLocalhostNoTokenRequired(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	nets := []*net.IPNet{mustParseCIDR("127.0.0.0/8")}
-	handler := MutationAuthMiddleware(nets, nil, "", logger)(testHandler("ok"))
+	handler := MutationAuthMiddleware(StaticNets(nets), nil, "", logger)(testHandler("ok"))
 
 	// POST from localhost should pass without any token.
 	req := httptest.NewRequest("POST", "/api/v1/packages/apt", nil)
@@ -606,7 +606,7 @@ func TestMutationAuthRemoteRequiresToken(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	nets := []*net.IPNet{mustParseCIDR("10.0.0.0/8")}
-	handler := MutationAuthMiddleware(nets, adb, pepper, logger)(testHandler("ok"))
+	handler := MutationAuthMiddleware(StaticNets(nets), adb, pepper, logger)(testHandler("ok"))
 
 	// POST from permitted IP but no token — should be rejected.
 	req := httptest.NewRequest("POST", "/api/v1/packages/apt", nil)
@@ -644,7 +644,7 @@ func TestMutationAuthRemoteRequiresToken(t *testing.T) {
 func TestMutationAuthDELETEAlsoGated(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	nets := []*net.IPNet{mustParseCIDR("192.168.1.0/24")}
-	handler := MutationAuthMiddleware(nets, nil, "", logger)(testHandler("ok"))
+	handler := MutationAuthMiddleware(StaticNets(nets), nil, "", logger)(testHandler("ok"))
 
 	req := httptest.NewRequest("DELETE", "/api/v1/packages/apt/test", nil)
 	req.RemoteAddr = "10.0.0.1:12345"
