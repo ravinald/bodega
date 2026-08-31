@@ -144,8 +144,8 @@ func TestACLChangeIsAudited(t *testing.T) {
 	}
 }
 
-// Removing the last admin entry locks out every mutation, including the
-// command that would undo it.
+// Removing the last admin entry locks out both halves of the admin surface,
+// including the command that would undo it.
 func TestCheckAdminLockout(t *testing.T) {
 	if err := checkAdminLockout([]string{"127.0.0.0/8", "::1/128"}, "::1/128"); err != nil {
 		t.Errorf("removing one of two entries was refused: %v", err)
@@ -154,7 +154,7 @@ func TestCheckAdminLockout(t *testing.T) {
 	if err == nil {
 		t.Fatal("removing the last admin entry was accepted; every mutation would 403")
 	}
-	for _, want := range []string{"last entry", "bodega acl admin add", "--force"} {
+	for _, want := range []string{"last entry", "/api/v1/audit", "bodega acl admin add", "--force"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error does not name %q:\n%s", want, err)
 		}

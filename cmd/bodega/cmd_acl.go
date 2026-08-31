@@ -407,8 +407,9 @@ func checkAdminWidening(ctx context.Context, adb *audit.DB, current []string, ad
 }
 
 // checkAdminLockout refuses a removal that would empty the admin list. An empty
-// admin_permit_cidr refuses every mutation, localhost included, so the command
-// that would put an entry back is the one the removal just disabled over HTTP.
+// admin_permit_cidr permits nobody on either half of the admin surface: the
+// mutation verbs and the four admin reads. The command that would put an entry
+// back is the one the removal just disabled over HTTP.
 func checkAdminLockout(current []string, removing string) error {
 	remaining := 0
 	for _, e := range current {
@@ -421,8 +422,9 @@ func checkAdminLockout(current []string, removing string) error {
 	}
 	return fmt.Errorf(
 		"refusing to remove %s from the admin list: it is the last entry, and an empty\n"+
-			"admin_permit_cidr refuses every mutation, from localhost included. The API would be\n"+
-			"unreachable and nothing could put an entry back over HTTP.\n"+
+			"admin_permit_cidr permits nobody. Every mutation is refused, from localhost\n"+
+			"included, and so are the four admin reads: /api/v1/audit, /api/v1/tokens,\n"+
+			"/api/v1/policies and /api/v1/config. Nothing could put an entry back over HTTP.\n"+
 			"  Add the replacement first:  bodega acl admin add <cidr>\n"+
 			"  Or accept the lockout:      bodega acl admin remove %s --force",
 		removing, removing)

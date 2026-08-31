@@ -390,7 +390,7 @@ The list names are the config keys they replace:
 
 | Name      | Config key          | What it holds                              |
 | --------- | ------------------- | ------------------------------------------ |
-| `admin`   | `admin_permit_cidr` | CIDRs allowed to reach the mutation API    |
+| `admin`   | `admin_permit_cidr` | CIDRs allowed to reach the admin surface  |
 | `deny`    | `deny_list`         | CIDRs refused on every route               |
 | `proxies` | `trusted_proxies`   | Peers whose forwarded headers are believed |
 
@@ -408,7 +408,7 @@ A bare address is taken as `/32` or `/128`, and an entry is stored masked: `10.0
 Two changes are refused because they fail silently otherwise. Both take `--force`, and both errors name the next step:
 
 - **An `admin add` that takes the list past localhost while no token exists.** Widening the list is what turns the Bearer requirement on, so the next mutation (including one from localhost that worked a moment earlier) answers 401 with nothing pointing at the cause. Run `bodega token generate <label>` first.
-- **An `admin remove` that empties the list.** An empty `admin_permit_cidr` refuses every mutation, and nothing could put an entry back over HTTP.
+- **An `admin remove` that empties the list.** An empty `admin_permit_cidr` permits nobody: every mutation is refused, and so are the `/api/v1/audit`, `/api/v1/tokens`, `/api/v1/policies` and `/api/v1/config` reads. Nothing could put an entry back over HTTP.
 
 Every add and remove writes an audit row: a `create` or `delete` event with `pkg_type=acl`, the list name, the CIDR and the OS user who ran the command. `bodega audit events` shows the list in its `NAME` column; the CIDR is in the record's version field, which `GET /api/v1/audit` returns and the table view does not.
 
@@ -1182,7 +1182,7 @@ All API responses are JSON. The full API is documented in [OpenAPI 3.0 format](.
 
 Policy mutations invalidate the in-memory cache, so changes take effect on the next request without a restart.
 
-Mutation endpoints are restricted by `admin_permit_cidr`, which defaults to localhost only (`127.0.0.0/8`, `::1/128`). Requests from IPs outside the permit list get a 403.
+Mutation endpoints and the four admin reads (`/api/v1/audit`, `/api/v1/tokens`, `/api/v1/policies`, `/api/v1/config`) are restricted by `admin_permit_cidr`, which defaults to localhost only (`127.0.0.0/8`, `::1/128`). Requests from IPs outside the permit list get a 403, and an empty list permits nobody.
 
 That list lives in the audit database and is read per request, so `bodega acl admin add|remove` takes effect on a running server without a restart. `config.json` seeds it on first start and is ignored afterwards; see **Configuration**.
 

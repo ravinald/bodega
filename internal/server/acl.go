@@ -2,11 +2,13 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"strings"
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
 )
 
 // aclCacheTTL bounds how long a running server serves a stale access list.
@@ -122,6 +124,59 @@ func (s *Server) resolveACLs(ctx context.Context) *aclSet {
 		}
 	}
 	return set
+}
+
+// AdminPermits answers the one question both halves of the admin gate ask:
+// may this address reach the admin surface. MutationAuthMiddleware gates the
+// mutation verbs with it and isAdminRequest gates the four admin read
+// endpoints, so the two cannot drift apart on the same list again.
+//
+// An empty list permits nobody. It is an access control list an operator can
+// empty (`bodega acl admin remove <last> --force`), never a statement that
+// there is nothing to control: reading it as "no restriction" left /api/v1/audit
+// and /api/v1/tokens open to every source address while every mutation was
+// refused. A nil address is a client IP that would not parse, which is not a
+// member of any network.
+func AdminPermits(nets []*net.IPNet, ip net.IP) bool {
+	if len(nets) == 0 || ip == nil {
+		return false
+	}
+	for _, n := range nets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseAdminPermitCIDR parses the config file's admin list, and rejects one
+// the operator wrote that bodega cannot use. Since AdminPermits reads an empty
+// list as "permit nobody", discarding an unparseable list no longer opens the
+// admin surface: it closes it, with the typo that did it named nowhere.
+// Refusing to start says which entry, and where the live list is.
+//
+// Only a non-empty list is rejected. An absent one is answered by the localhost
+// default in config.Load, and a list emptied through `bodega acl admin` is a
+// deliberate act recorded in the audit database.
+func parseAdminPermitCIDR(entries []string) ([]*net.IPNet, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	nets, err := ParseDenyList(entries)
+	if err == nil && len(nets) > 0 {
+		return nets, nil
+	}
+	why := "every entry is blank"
+	if err != nil {
+		why = err.Error()
+	}
+	return nil, fmt.Errorf(
+		"admin_permit_cidr parses to nothing: %s\n"+
+			"  An empty admin list permits nobody: every mutation and the /api/v1/audit,\n"+
+			"  /api/v1/tokens, /api/v1/policies and /api/v1/config reads would answer 403.\n"+
+			"  Fix the entry in %s, then start again.\n"+
+			"  The live list:  bodega acl admin list",
+		why, config.ConfigPath())
 }
 
 // adminNetsFunc, denyNetsFunc and trustedNetsFunc hand the middleware chain a

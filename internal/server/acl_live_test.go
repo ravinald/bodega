@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ravinald/bodega/internal/audit"
@@ -206,5 +207,98 @@ func TestDatabaseWinsOverConfigFileAfterSeed(t *testing.T) {
 	s.refreshACLs(ctx)
 	if got := s.aclNow().deny; len(got) != 0 {
 		t.Fatalf("deny list = %v after a restart, want empty: the config file was re-applied over an operator's removal", got)
+	}
+}
+
+// adminReadPaths are the endpoints requireAdmin gates. They sit outside the
+// mutation middleware, which is how the two readers of admin_permit_cidr came
+// to disagree about what an empty list means.
+var adminReadPaths = []string{
+	"/api/v1/audit",
+	"/api/v1/tokens",
+	"/api/v1/policies",
+	"/api/v1/config",
+}
+
+func getPath(t *testing.T, h http.Handler, path, remote string) int {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.RemoteAddr = remote
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec.Code
+}
+
+// Emptying the admin list must close the admin reads, not open them. Driven
+// through the chain s.handler() builds because the defect was invisible to a
+// unit test on the predicate: the mutation middleware refused the same empty
+// list correctly while these four endpoints answered 200 to every address.
+func TestEmptyAdminListRefusesAdminReads(t *testing.T) {
+	ctx := context.Background()
+	s := newACLServer(t, &config.Config{AdminPermitCIDR: []string{"127.0.0.0/8", "::1/128"}})
+	h := s.handler()
+
+	const outside = "203.0.113.5:1234"
+	for _, p := range adminReadPaths {
+		if got := getPath(t, h, p, outside); got != http.StatusForbidden {
+			t.Errorf("with the list populated, GET %s from %s = %d, want 403", p, outside, got)
+		}
+	}
+	// Without this the run below proves nothing: a chain that refused every
+	// address for an unrelated reason would pass the assertions either way.
+	if got := getPath(t, h, "/api/v1/config", "127.0.0.1:1234"); got == http.StatusForbidden {
+		t.Fatal("a permitted address was refused before the list was emptied; the test asserts nothing")
+	}
+
+	for _, cidr := range []string{"127.0.0.0/8", "::1/128"} {
+		if _, err := s.auditDB.RemoveACL(ctx, audit.ACLAdmin, cidr); err != nil {
+			t.Fatalf("remove %s: %v", cidr, err)
+		}
+	}
+	s.refreshACLs(ctx)
+	if got := s.aclNow().admin; len(got) != 0 {
+		t.Fatalf("admin list = %v after removing both entries, want empty", got)
+	}
+
+	for _, p := range adminReadPaths {
+		if got := getPath(t, h, p, outside); got != http.StatusForbidden {
+			t.Errorf("with the list empty, GET %s from %s = %d, want 403: an empty admin list permits nobody", p, outside, got)
+		}
+	}
+	// The mutation half already refused an empty list. Asserted here so the
+	// two stay pinned to one answer.
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/packages/apt", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("with the list empty, POST from localhost = %d, want 403", rec.Code)
+	}
+}
+
+// An admin_permit_cidr that parses to nothing is a startup failure. Fail-closed
+// makes it a server that refuses every admin request with the typo named
+// nowhere, which is safer than the open state it replaces and still wrong.
+func TestUnparseableAdminPermitCIDRRefusesToStart(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		entries []string
+		want    string
+	}{
+		{"typo", []string{"127.0.0.0/8x"}, `"127.0.0.0/8x"`},
+		{"blank", []string{"  "}, "every entry is blank"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newACLServer(t, &config.Config{AdminPermitCIDR: tc.entries})
+			err := s.Start(context.Background())
+			if err == nil {
+				t.Fatal("Start accepted an admin_permit_cidr that parses to nothing")
+			}
+			for _, want := range []string{tc.want, "bodega acl admin list"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not name %q", err, want)
+				}
+			}
+		})
 	}
 }

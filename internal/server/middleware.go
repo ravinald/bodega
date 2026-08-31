@@ -167,7 +167,7 @@ func ParseDenyList(entries []string) ([]*net.IPNet, error) {
 		if !strings.Contains(entry, "/") {
 			ip := net.ParseIP(entry)
 			if ip == nil {
-				return nil, fmt.Errorf("invalid deny list entry: %q", entry)
+				return nil, fmt.Errorf("invalid CIDR entry: %q", entry)
 			}
 			if ip.To4() != nil {
 				entry += "/32"
@@ -177,7 +177,7 @@ func ParseDenyList(entries []string) ([]*net.IPNet, error) {
 		}
 		_, cidr, err := net.ParseCIDR(entry)
 		if err != nil {
-			return nil, fmt.Errorf("invalid deny list entry: %q: %w", entry, err)
+			return nil, fmt.Errorf("invalid CIDR entry: %q: %w", entry, err)
 		}
 		nets = append(nets, cidr)
 	}
@@ -583,6 +583,8 @@ func LocalhostOnly(nets []*net.IPNet) bool {
 //
 // GET/HEAD/OPTIONS requests pass through unconditionally — package manager
 // clients (apt, pip, go, npm) cannot send auth headers over standard protocols.
+// The exceptions are the four admin reads, which Server.requireAdmin gates
+// with the same AdminPermits predicate this uses.
 func MutationAuthMiddleware(admin NetsFunc, auditDB *audit.DB, pepper string, logger *slog.Logger) func(http.Handler) http.Handler {
 	// Cache token hashes to avoid per-request DB queries.
 	var cachedHashes []audit.TokenHash
@@ -622,14 +624,7 @@ func MutationAuthMiddleware(admin NetsFunc, auditDB *audit.DB, pepper string, lo
 				return
 			}
 			adminNets := admin.nets()
-			allowed := false
-			for _, n := range adminNets {
-				if n.Contains(clientIP) {
-					allowed = true
-					break
-				}
-			}
-			if !allowed {
+			if !AdminPermits(adminNets, clientIP) {
 				logger.Warn("mutation blocked: IP not in admin_permit_cidr",
 					"client_ip", clientIP.String(), "method", r.Method, "path", r.URL.Path)
 				recordDenial(auditDB, r, audit.DenialIPNotPermitted, nil)

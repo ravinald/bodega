@@ -293,7 +293,7 @@ The move buys two things. A change lands on a running server, within 30 seconds 
 
 `acl_lists` carries one marker row per list because "no rows in `acl_entries`" is two different answers for `trusted_proxies`. A list with a marker is answered from the table even when empty; a list without one is still answered from the file. See **IP resolution** below for why collapsing those matters.
 
-A list bodega cannot read, or one holding a CIDR it cannot parse, keeps its config file value rather than emptying. An empty admin list refuses every mutation and an empty deny list refuses none, so both directions of failure are worse than the last good answer.
+A list bodega cannot read from the database, or one holding a CIDR it cannot parse there, keeps its config file value rather than emptying. An empty admin list permits nobody and an empty deny list refuses nobody, so both directions of failure are worse than the last good answer. The config file itself has no such fallback: an `admin_permit_cidr` that parses to nothing stops the start, because there is no earlier answer to keep.
 
 ### Deny list
 
@@ -320,26 +320,47 @@ An operator who wrote `[]` disabled header trust on purpose. Handing the RFC 191
 
 The default is wide on purpose, because the common deployment puts a proxy on the same host. It is the wrong default anywhere the private network has other tenants: a Linode with private networking, a Docker bridge, a pod network. Every peer in RFC 1918 is then believed, `admin_permit_cidr` defaults to loopback, and `X-Real-IP: 127.0.0.1` from any of them reaches the mutation API with no token. Name your proxy on those networks, or write `[]` and let bodega answer to the peer address alone.
 
-### Mutation access control
+### Admin access control
 
-The mutation API (POST and DELETE on `/api/v1/packages/...`) is gated by two layers:
+`admin_permit_cidr` gates the whole admin surface, which is two sets of endpoints:
 
-1. **IP allow-list** (`admin_permit_cidr`): Only requests from permitted CIDRs can reach mutation endpoints. Defaults to `["127.0.0.0/8", "::1/128"]`, so out of the box only localhost can create or delete entries. Change it with `bodega acl admin add|remove`.
+- **The mutation API**: POST, DELETE and PATCH on `/api/v1/...`, gated by `MutationAuthMiddleware`.
+- **The four admin reads**: `GET /api/v1/audit`, `/api/v1/tokens`, `/api/v1/policies` and `/api/v1/config`, gated by `requireAdmin` inside each handler. They sit outside the mutation middleware, which passes GET through so apt, pip, go and npm can fetch packages with no credential.
 
-2. **Bearer token** (`api_token`): When `admin_permit_cidr` extends beyond localhost, a valid `Authorization: Bearer <token>` header is required on mutation requests. Generate tokens with `bodega token generate`.
+Two callers, one predicate: `server.AdminPermits`. They read the same list and used to answer separately, which is how they came to disagree about what an empty list means.
+
+The mutation half carries a second layer:
+
+1. **IP allow-list** (`admin_permit_cidr`): Only requests from permitted CIDRs reach the admin surface. Defaults to `["127.0.0.0/8", "::1/128"]`, so out of the box only localhost can create or delete entries, or read the audit trail. Change it with `bodega acl admin add|remove`.
+
+2. **Bearer token** (`api_token`): When `admin_permit_cidr` extends beyond localhost, a valid `Authorization: Bearer <token>` header is required on mutation requests. Generate tokens with `bodega token generate`. The admin reads take the IP layer alone.
 
 Both layers read the client IP that `trusted_proxies` resolved, so a permissive trusted set widens the first layer no matter how narrow `admin_permit_cidr` looks.
+
+#### An empty admin list permits nobody
+
+An empty `admin_permit_cidr` refuses every mutation **and** all four admin reads, from localhost included. It is a list an operator can empty, never a statement that there is nothing to control: reading it as "no restriction" left `/api/v1/audit` and `/api/v1/tokens` open to every source address that could reach the listener, while every mutation from the same address was refused.
+
+Three ways the list can end up empty, and what each gets:
+
+| Route | Result |
+| --------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| Key absent from `config.json` on a fresh install | `config.Load` substitutes `["127.0.0.0/8", "::1/128"]`. The empty state is unreachable through the file. |
+| Key present but parsing to nothing (a typo, or blank entries) | `Start` refuses, naming the entry and pointing at `bodega acl admin list`. |
+| `bodega acl admin remove <last> --force` | Accepted, and it locks the operator out of both halves. That is what `--force` is for; the refusal text says so. |
+
+The localhost default stays the first line and the startup refusal is the second, because they cover different cases. The default answers an absent key; it never sees a key the operator wrote. The startup refusal answers a key that is present and unusable, which is the one case where falling back to a default would substitute bodega's access control list for the operator's.
 
 Both are re-read per request rather than captured when the handler chain is built, because widening the list is exactly what turns layer 2 on. A set frozen at startup would leave a widened server admitting unauthenticated mutations until something restarted it.
 
 `bodega acl admin` refuses two changes that fail silently otherwise, each with a `--force` escape:
 
 - **An add that takes the list past localhost while no token exists.** It turns on the Bearer requirement, and the next mutation (including one from localhost that worked a moment earlier) answers 401 with nothing naming the cause.
-- **A remove that empties the list.** An empty `admin_permit_cidr` refuses every mutation, so nothing could put an entry back over HTTP.
+- **A remove that empties the list.** An empty `admin_permit_cidr` permits nobody, mutations and admin reads alike, so nothing could put an entry back over HTTP.
 
 Every add and remove is recorded in the audit database as a `create` or `delete` event with `pkg_type=acl`, the list in `pkg_name`, the CIDR in `pkg_version` and the OS user in `actor`. Who changed the rule sits beside the record of who the rule turned away.
 
-Read endpoints remain unauthenticated. Package manager clients (apt, pip, go, npm, helm) use standard protocols that don't support auth headers, so read paths stay open by design.
+Package-serving read endpoints remain unauthenticated. Package manager clients (apt, pip, go, npm, helm) use standard protocols that don't support auth headers, so those read paths stay open by design. The four admin reads above are the exception, and a refusal on one is itself recorded in the audit database.
 
 ### Response hardening
 
@@ -383,7 +404,7 @@ Key fields:
 | `proxy_cache_enabled` | false | Global proxy/cache toggle |
 | `metadata_ttl` | 1h | How long mutable proxy resources are cached |
 | `deny_list` | [] | CIDR entries to block. **Bootstrap only**: copied into the audit DB on first start, then owned by `bodega acl deny` |
-| `admin_permit_cidr` | [127.0.0.0/8, ::1/128] | CIDRs allowed to hit mutation API. **Bootstrap only**: owned by `bodega acl admin` after the first start |
+| `admin_permit_cidr` | [127.0.0.0/8, ::1/128] | CIDRs allowed to reach the admin surface: mutations and the four admin reads. Empty permits nobody; a value that parses to nothing stops the start. **Bootstrap only**: owned by `bodega acl admin` after the first start |
 | `trusted_proxies` | null (loopback + RFC 1918) | Peers whose forwarded headers are believed; `[]` trusts none. **Bootstrap only**: owned by `bodega acl proxies` after the first start |
 | `tls_min_version` | 1.3 | Floor for bodega's own listener; `1.2` or `1.3` |
 | `api_token` | (none) | Bearer token for mutation API |
