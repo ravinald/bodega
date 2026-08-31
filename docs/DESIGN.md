@@ -59,10 +59,17 @@ s3://<bucket>/
   pypi/wheels/               # Python wheels
   repos/                     # Git bundles (.bundle) and release archives (.tar.gz)
   binaries/                  # Direct downloads, versioned subdirectories
-  gomod/                     # Go module archives (@v/*.zip, *.info, *.mod)
+  gomod/                     # Go module archives, module path verbatim:
+                             #   gomod/github.com/aws/sdk/@v/v1.30.0.{zip,info,mod}
   charts/                    # Helm chart .tgz files
   npm/                       # npm tarballs and packument metadata
+  cargo/crates/              # Rust .crate tarballs
+  cargo/index/               # cached sparse-index entries
 ```
+
+Every key is derived in one place: `manifest.ArtifactKeys` and its per-type helpers in `internal/manifest/keys.go`. The uploader, every server handler, `bodega build status`, `bodega pkg move` and the delete path all resolve through it. Three independent derivations existed before, and they disagreed.
+
+A name containing a slash encodes to `--` for every type except gomod, which keeps its slashes. A Go client requests `GET /<module>/@v/<version>.zip` with the module path verbatim and nothing on the wire can re-encode it, so the uploader is the side that has to write the wire form. Any install that uploaded a Go module before that landed has bytes at the old encoded key; `bodega repair keys` moves them.
 
 Each package gets its own manifest file at `manifests/{type}/{safeName}/manifest.json`. This replaces the old monolithic per-type JSON files and enables parallel operations without lock contention.
 

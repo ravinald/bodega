@@ -49,7 +49,11 @@ const (
 	// the prefix is named separately from the per-version key.
 	GitPrefix = "repos/"
 
-	binaryPrefix     = "binaries/"
+	// BinaryPrefix roots the direct-download tree. The TUI uploads it as a
+	// whole-directory sync, so the prefix is named separately from the
+	// per-version key BinaryKey builds.
+	BinaryPrefix = "binaries/"
+
 	gomodPrefix      = "gomod/"
 	helmPrefix       = "charts/"
 	npmPrefix        = "npm/"
@@ -73,9 +77,9 @@ var ErrAptPoolPathUnknown = errors.New("apt entry records no _pool_path")
 // the two-segment layout it was uploaded under.
 func BinaryKey(name, version, filename string) string {
 	if version == "" {
-		return binaryPrefix + SafeName(name) + "/" + filename
+		return BinaryPrefix + SafeName(name) + "/" + filename
 	}
-	return binaryPrefix + SafeName(name) + "/" + version + "/" + filename
+	return BinaryPrefix + SafeName(name) + "/" + version + "/" + filename
 }
 
 // GitKey returns the key for a git bundle or release archive. release selects
