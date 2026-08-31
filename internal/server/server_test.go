@@ -90,6 +90,11 @@ func newTestServer(t *testing.T) (*httptest.Server, *storage.Memory) {
 		Region:      "us-west-2",
 		ManifestDir: "manifests",
 		AptCodename: "noble",
+		// What config.Load substitutes for an absent key. This struct is built
+		// directly, so without it the admin list is empty, and an empty list
+		// permits nobody: the admin reads would answer 403 to httptest's own
+		// 127.0.0.1.
+		AdminPermitCIDR: []string{"127.0.0.0/8", "::1/128"},
 	}
 
 	srv := server.New(cfg, store, storage.NewSingle(mock), ":0", nil)

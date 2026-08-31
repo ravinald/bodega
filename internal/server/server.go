@@ -67,7 +67,8 @@ type Server struct {
 	discoverMode string             // "", "observe", "learn" — see internal/server/discovery.go
 	discovery    *DiscoveryRecorder // nil when discover_mode == "" or auditDB == nil
 	denyNets     []*net.IPNet
-	adminNets    []*net.IPNet // CIDRs allowed to hit mutation API (admin_permit_cidr)
+	adminNets    []*net.IPNet // CIDRs allowed to reach the admin surface (admin_permit_cidr)
+	adminErr     error        // set when admin_permit_cidr parses to nothing; Start refuses on it
 	// trustedNets are the proxies whose forwarded headers are believed.
 	// trustedNetsSet distinguishes "operator wrote an empty list" from
 	// "operator wrote nothing": the first trusts no header from anyone, the
@@ -151,15 +152,15 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 			logger.Info("deny list loaded", "entries", len(nets))
 		}
 	}
-	// Parse admin permit CIDRs for mutation API access control.
-	if len(cfg.AdminPermitCIDR) > 0 {
-		nets, err := ParseDenyList(cfg.AdminPermitCIDR)
-		if err != nil {
-			logger.Error("invalid admin_permit_cidr entry", "error", err)
-		} else {
-			s.adminNets = nets
-			logger.Info("admin permit CIDRs loaded", "entries", len(nets))
-		}
+	// Parse admin permit CIDRs for the admin surface: the mutation verbs and
+	// the four admin read endpoints. Held for Start to refuse on rather than
+	// logged and discarded, because an admin list bodega cannot read is not a
+	// list it may substitute a default for.
+	if nets, err := parseAdminPermitCIDR(cfg.AdminPermitCIDR); err != nil {
+		s.adminErr = err
+	} else if len(nets) > 0 {
+		s.adminNets = nets
+		logger.Info("admin permit CIDRs loaded", "entries", len(nets))
 	}
 	// trusted_proxies. A non-nil slice, empty included, is an explicit answer.
 	if cfg.TrustedProxies != nil {
@@ -264,6 +265,10 @@ func (s *Server) Start(ctx context.Context) error {
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      5 * time.Minute, // generous for large file transfers
 		IdleTimeout:       120 * time.Second,
+	}
+
+	if s.adminErr != nil {
+		return s.adminErr
 	}
 
 	// Reject misconfigured autocert — the flag is accepted but not yet
@@ -576,23 +581,10 @@ func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
 
 // isAdminRequest checks whether the request originates from an IP in
 // admin_permit_cidr. Used to gate sensitive read endpoints (audit, tokens,
-// config) that don't go through the mutation middleware.
+// policies, config) that don't go through the mutation middleware, and it
+// answers with the same predicate that middleware uses.
 func (s *Server) isAdminRequest(r *http.Request) bool {
-	adminNets := s.aclNow().admin
-	// If no admin CIDRs are configured, allow all (no restriction).
-	if len(adminNets) == 0 {
-		return true
-	}
-	clientIP := net.ParseIP(ClientIP(r))
-	if clientIP == nil {
-		return false
-	}
-	for _, n := range adminNets {
-		if n.Contains(clientIP) {
-			return true
-		}
-	}
-	return false
+	return AdminPermits(s.aclNow().admin, net.ParseIP(ClientIP(r)))
 }
 
 // ---- Health ----------------------------------------------------------------
