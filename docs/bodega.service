@@ -14,6 +14,19 @@
 #   "listen_addr": ":8080"
 #
 # Override either with --addr on ExecStart or BODEGA_LISTEN_ADDR= below.
+#
+# TLS is not optional by omission. With "tls_cert" and "tls_key" both empty,
+# bodega refuses to bind and the unit fails on start rather than answering in
+# the clear on whatever "listen_addr" names. Pick one:
+#
+#   "tls_cert": "/etc/bodega/cert.pem", "tls_key": "/etc/bodega/key.pem"
+#   "allow_plaintext": true    (loopback behind a proxy that terminates TLS —
+#                               set "public_url" too, or every client snippet
+#                               bodega emits describes the back end)
+#
+# Setting one of tls_cert/tls_key without the other is an error either way.
+# Append --allow-plaintext=false to ExecStart to pin this host to TLS
+# regardless of what the config file says.
 
 [Unit]
 Description=bodega package repository server

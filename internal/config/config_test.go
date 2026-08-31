@@ -273,6 +273,47 @@ func TestSave_OmitsRuntimeAndUnsetFields(t *testing.T) {
 	}
 }
 
+// TestLoad_TLSPair covers the half-configured pair. Load refuses it rather
+// than handing the server a Config whose only distinguishable state is "no
+// TLS", which is the same state as an operator who wanted none.
+func TestLoad_TLSPair(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		err  string
+	}{
+		{name: "neither", body: `{}`},
+		{name: "both", body: `{"tls_cert": "/c.pem", "tls_key": "/k.pem"}`},
+		{name: "cert alone", body: `{"tls_cert": "/c.pem"}`, err: "tls_key is empty"},
+		{name: "key alone", body: `{"tls_key": "/k.pem"}`, err: "tls_cert is empty"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateConfig(t)
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			t.Setenv(config.EnvConfigFile, path)
+
+			_, err := config.Load(t.TempDir(), "", "", "", false, false)
+			if tc.err == "" {
+				if err != nil {
+					t.Fatalf("Load: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Load accepted half a certificate pair, want error mentioning %q", tc.err)
+			}
+			for _, want := range []string{tc.err, "allow_plaintext"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("Load error = %v, want mention of %q", err, want)
+				}
+			}
+		})
+	}
+}
+
 func TestLoad_AptSuites(t *testing.T) {
 	cases := []struct {
 		name string

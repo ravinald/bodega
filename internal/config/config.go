@@ -117,6 +117,16 @@ type Config struct {
 	// "unset" hands the default back to a deployment that asked to have none.
 	TrustedProxies []string `json:"trusted_proxies"`
 
+	// AllowPlaintext authorizes an unencrypted listener. Without it, empty
+	// tls_cert/tls_key mean "nothing was configured" and bodega refuses to
+	// start rather than binding in the clear on whatever listen_addr names.
+	//
+	// The path to an accidental empty pair is a config write, not a hand
+	// edit: Save marshals the whole resolved Config back over the file, so a
+	// cert path cleared in the TUI reaches the listener with nothing between.
+	// Set this on a loopback listener behind a proxy that terminates TLS.
+	AllowPlaintext bool `json:"allow_plaintext,omitempty"`
+
 	// TLSMinVersion is the floor for bodega's own listener, "1.2" or "1.3",
 	// defaulting to 1.3. It governs nothing when a proxy terminates TLS, which
 	// is the supported way to serve a client that cannot reach the floor.
@@ -313,8 +323,30 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	if _, err := cfg.ResolveTLSMinVersion(); err != nil {
 		return nil, err
 	}
+	if err := cfg.ValidateTLSPair(); err != nil {
+		return nil, err
+	}
 
 	return cfg, nil
+}
+
+// ValidateTLSPair rejects half a certificate pair. One path set with the other
+// empty is a typo or a truncated edit, never a request for plaintext, and the
+// listener cannot tell the difference: it skips TLS on both empty and one
+// empty alike.
+//
+// Load calls it so a broken file fails before any command runs.
+// internal/server calls it again from Start, because --tls-cert and --tls-key
+// are written into the Config after Load returns and can create the same
+// half pair from a clean file.
+func (c *Config) ValidateTLSPair() error {
+	switch {
+	case c.TLSCert != "" && c.TLSKey == "":
+		return fmt.Errorf("tls_cert is set (%s) but tls_key is empty: set tls_key to the matching private key PEM, or clear tls_cert and set allow_plaintext to serve without TLS", c.TLSCert)
+	case c.TLSKey != "" && c.TLSCert == "":
+		return fmt.Errorf("tls_key is set (%s) but tls_cert is empty: set tls_cert to the matching certificate PEM, or clear tls_key and set allow_plaintext to serve without TLS", c.TLSKey)
+	}
+	return nil
 }
 
 // validateStorage rejects the two ways the driver and name namespaces can be
@@ -525,11 +557,14 @@ func defaultConfigContent() []byte {
   "pypi_root": "",
   "binary_root": "",
 
-  "_comment_tls": "TLS: set tls_cert + tls_key for manual certs, or tls_autocert + tls_domain for Let's Encrypt",
+  "_comment_tls": "TLS: set tls_cert + tls_key for manual certs, or tls_autocert + tls_domain for Let's Encrypt. Setting one of tls_cert/tls_key without the other is an error.",
   "tls_cert": "",
   "tls_key": "",
   "tls_autocert": false,
   "tls_domain": "",
+
+  "_comment_allow_plaintext": "allow_plaintext: authorize an unencrypted listener. With no cert pair bodega refuses to start unless this is true — set it for local use, or on a loopback listener behind a proxy that terminates TLS. --allow-plaintext=false overrides it back off.",
+  "allow_plaintext": false,
 
   "_comment_listen": "listen_addr: address bodega serve binds; --listen and $BODEGA_LISTEN_ADDR override it",
   "listen_addr": ":8080",
@@ -631,7 +666,10 @@ func (c *Config) ResolvePublicURL(flagURL string) string {
 //
 // Skipping a broken file used to look harmless and was not: falling back to
 // built-in defaults means tls_cert/tls_key empty, so a server that served TLS
-// yesterday binds plaintext today, and deny_list empty, so nothing is denied.
+// yesterday serves the same URLs with no certificate, and deny_list empty, so
+// nothing is denied. The plaintext half now refuses to start rather than
+// binding in the clear (see (*Server).guardPlaintext), which turns a silent
+// downgrade into a loud one; the deny_list half still fails open.
 func loadFileConfig() (*Config, legacyConfig, error) {
 	path := ConfigPath()
 	data, err := os.ReadFile(path)

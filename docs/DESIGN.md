@@ -415,8 +415,9 @@ Key fields:
 | `trusted_proxies` | null (loopback + RFC 1918) | Peers whose forwarded headers are believed; `[]` trusts none. **Bootstrap only**: owned by `bodega acl proxies` after the first start |
 | `tls_min_version` | 1.3 | Floor for bodega's own listener; `1.2` or `1.3` |
 | `api_token` | (none) | Bearer token for mutation API |
-| `tls_cert` / `tls_key` | (none) | Manual TLS |
-| `tls_autocert` / `tls_domain` | (none) | Let's Encrypt |
+| `tls_cert` / `tls_key` | (none) | Manual TLS. Setting one without the other is fatal at load, not a request for plaintext |
+| `tls_autocert` / `tls_domain` | (none) | Let's Encrypt. Accepted and refused at startup; see [#113](https://github.com/ravinald/bodega/issues/113) |
+| `allow_plaintext` | false | Authorizes an unencrypted listener. With no cert pair `bodega serve` refuses to bind without it, and refuses on `:443` naming the port |
 | `audit_db` | {log_dir}/audit.db | Audit database path |
 
 The TUI config editor (`C` key in `bodega shell`) writes to the same file.

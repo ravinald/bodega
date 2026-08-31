@@ -254,6 +254,55 @@ func (s *Server) handler() http.Handler {
 	return h
 }
 
+// guardPlaintext refuses to bind an unencrypted listener nobody requested.
+//
+// Four states arrive at the same hazard — autocert accepted but unimplemented,
+// half a certificate pair, an empty pair, and an empty pair on the port every
+// client reads as TLS — and all four refuse through this one function.
+// Starting silently in plain HTTP is the security hazard the autocert case
+// already named; two refusals for one hazard, worded differently, is how an
+// operator learns to route around the second.
+//
+// allow_plaintext is the request. An empty tls_cert is not one: Save marshals
+// the whole resolved Config back over the file, so a cert path cleared in the
+// TUI reaches this function with nothing else having noticed.
+func (s *Server) guardPlaintext() error {
+	// Re-checked after config.Load has already run it: --tls-cert and
+	// --tls-key are written into the Config afterwards, so a clean file plus
+	// one flag reaches here as a half pair.
+	if err := s.cfg.ValidateTLSPair(); err != nil {
+		return err
+	}
+	if s.cfg.TLSCert != "" && s.cfg.TLSKey != "" {
+		return nil
+	}
+	if s.cfg.TLSAutocert {
+		return fmt.Errorf("tls_autocert is enabled but not yet implemented; provide tls_cert and tls_key instead, or set allow_plaintext to serve without TLS")
+	}
+	if s.cfg.AllowPlaintext {
+		if tlsPort(s.addr) {
+			s.logger.Warn("serving plaintext HTTP on the port clients read as TLS; every request and response is in the clear",
+				"addr", s.addr, "authorized_by", "allow_plaintext")
+		}
+		return nil
+	}
+	if tlsPort(s.addr) {
+		return fmt.Errorf("refusing to serve plaintext HTTP on %s: tls_cert and tls_key are empty and clients reach that port expecting TLS; set both, or set allow_plaintext (--allow-plaintext) if something in front terminates TLS", s.addr)
+	}
+	return fmt.Errorf("refusing to serve plaintext HTTP on %s: tls_cert and tls_key are empty, which means nothing was configured rather than serve in the clear; set both, or set allow_plaintext (--allow-plaintext) to serve unencrypted on purpose", s.addr)
+}
+
+// tlsPort reports whether addr names the port clients read as TLS. A port is
+// not authorization, but it is the strongest evidence available that whoever
+// wrote listen_addr expected a certificate to be in play.
+func tlsPort(addr string) bool {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	return port == "443" || port == "https"
+}
+
 // Start binds to s.addr and blocks until ctx is cancelled. When the context is
 // done it initiates a graceful shutdown, giving in-flight requests up to 30
 // seconds to complete.
@@ -271,10 +320,8 @@ func (s *Server) Start(ctx context.Context) error {
 		return s.adminErr
 	}
 
-	// Reject misconfigured autocert — the flag is accepted but not yet
-	// implemented, so starting silently in plain HTTP would be a security hazard.
-	if s.cfg.TLSAutocert && s.cfg.TLSCert == "" && s.cfg.TLSKey == "" {
-		return fmt.Errorf("tls_autocert is enabled but not yet implemented; provide tls_cert and tls_key instead")
+	if err := s.guardPlaintext(); err != nil {
+		return err
 	}
 
 	// Configure TLS if cert/key are provided.
