@@ -296,16 +296,16 @@ func runUpload(buf *bytes.Buffer, cfg *config.Config, s3client *bos3.Client, arg
 		switch t {
 		case manifest.TypeBinary:
 			localDir = filepath.Join(cfg.BuildRoot, "binaries")
-			s3Prefix = "binaries/"
+			s3Prefix = manifest.BinaryPrefix
 		case manifest.TypeGit:
 			localDir = filepath.Join(cfg.BuildRoot, "bundles")
-			s3Prefix = "repos/"
+			s3Prefix = manifest.GitPrefix
 		case manifest.TypeApt:
 			localDir = filepath.Join(cfg.BuildRoot, "apt-repo")
-			s3Prefix = "packages/apt/"
+			s3Prefix = manifest.AptPrefix
 		case manifest.TypePypi:
 			localDir = filepath.Join(cfg.BuildRoot, "wheels")
-			s3Prefix = "pypi/wheels/"
+			s3Prefix = manifest.PypiWheelPrefix
 		}
 		if _, err := os.Stat(localDir); os.IsNotExist(err) {
 			fmt.Fprintf(buf, "    No artifacts at %s — skipping\n", localDir)
