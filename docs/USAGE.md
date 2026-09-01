@@ -675,6 +675,10 @@ Pass --replace-placement to repoint the manifest at "bulk" and re-upload; the ol
 
 Generated indexes, proxy-cache entries and attestation blobs have no version to record a name against. They follow the type rule at both read and write, which is safe because every one of them is regenerable.
 
+Every route that does hold a version entry for an uploaded artifact resolves by record: `binary`, `helm`, `npm`, `cargo`, `gomod`, `pypi` and `git` read the recorded name, and the apt pool reads the reverse `pool/` mapping the snapshot carries, because a `.deb` is addressed by path with no package and version in the request to look an entry up by. Nothing serving an uploaded artifact is left on the type rule.
+
+Two reads hold an entry and stay on it anyway. A package in `proxy` mode is served from cache, and a cache entry is regenerable whatever its manifest records. An attestation envelope is written by an external sync service rather than by bodega, so the recorded name says where the artifact went and nothing about where the envelope stayed — resolving it by record would 404 an envelope sitting exactly where it was left.
+
 #### Listing and diagnostics disagree on purpose
 
 The PEP 503 indexes and the apt pool listing union every backend and fail the whole request with 502 if any one of them errors. A short index is indistinguishable from packages having been withdrawn, and apt acts on the difference.
