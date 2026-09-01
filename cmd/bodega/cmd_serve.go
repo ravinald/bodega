@@ -24,6 +24,7 @@ func newServeCmd(gf *globalFlags) *cobra.Command {
 		tlsKey      string
 		tlsAutocert bool
 		tlsDomain   string
+		allowPlain  bool
 		publicURL   string
 		quiet       bool
 	)
@@ -55,6 +56,11 @@ artifacts in memory.
 TLS can be enabled in two ways:
   --tls-cert and --tls-key     Manual PEM certificate files
   --tls-autocert --tls-domain  Automatic Let's Encrypt certificates
+
+Serving in the clear is an explicit request, not the absence of one. With no
+certificate pair, serve refuses to bind unless --allow-plaintext (config key
+allow_plaintext) is set. Setting only one of --tls-cert/--tls-key is an error
+either way: bodega will not read half a pair as a request for plaintext.
 
 Listen address resolution (highest priority first):
   --addr flag > $BODEGA_LISTEN_ADDR > config.json "listen_addr" > :8080
@@ -107,6 +113,12 @@ output continues to respect log_level in the config.`,
 			if tlsDomain != "" {
 				cfg.TLSDomain = tlsDomain
 			}
+			// Gated on Changed rather than on the value, so --allow-plaintext=false
+			// turns off a config file that set it true. The other three flags here
+			// cannot (issue #81); a new one need not inherit that.
+			if cmd.Flags().Changed("allow-plaintext") {
+				cfg.AllowPlaintext = allowPlain
+			}
 			// Resolved into the Config rather than passed alongside it: every
 			// client-facing URL this process emits reads it back off cfg, and
 			// serve never writes the config file.
@@ -150,6 +162,7 @@ output continues to respect log_level in the config.`,
 	cmd.Flags().StringVar(&tlsKey, "tls-key", "", "Path to TLS private key PEM file")
 	cmd.Flags().BoolVar(&tlsAutocert, "tls-autocert", false, "Enable automatic TLS via Let's Encrypt (requires --tls-domain)")
 	cmd.Flags().StringVar(&tlsDomain, "tls-domain", "", "Domain name for autocert (e.g. bodega.example.com)")
+	cmd.Flags().BoolVar(&allowPlain, "allow-plaintext", false, "Serve without TLS; required when tls_cert/tls_key are unset (config: allow_plaintext)")
 	cmd.Flags().StringVar(&publicURL, "public-url", "", fmt.Sprintf("Base URL clients reach this server at, e.g. https://bodega.example.com (env: %s)", config.EnvPublicURL))
 	cmd.Flags().BoolVar(&quiet, "quiet", false, "Suppress the stderr startup banner (log_level output is unaffected)")
 	return cmd

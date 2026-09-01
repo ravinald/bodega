@@ -30,6 +30,9 @@ func newDenialServer(t *testing.T, adminCIDR, denyList []string) *Server {
 		AuditDB:         filepath.Join(dir, "audit.db"),
 		AdminPermitCIDR: adminCIDR,
 		DenyList:        denyList,
+		// Start refuses an unencrypted listener nobody requested; these tests
+		// are about audit rows, so they make the request. See guardPlaintext.
+		AllowPlaintext: true,
 	}
 	s := newServer(cfg, manifest.NewLocalStore(t.TempDir()), nil, "127.0.0.1:0",
 		slog.New(slog.NewTextHandler(io.Discard, nil)))

@@ -324,6 +324,7 @@ Starts the HTTP(S) package server.
 | `--tls-key` | | Path to TLS private key PEM file |
 | `--tls-autocert` | `false` | Enable automatic TLS via Let's Encrypt |
 | `--tls-domain` | | Domain name for autocert |
+| `--allow-plaintext` | `false` | Serve without TLS; required when `tls_cert`/`tls_key` are unset |
 
 The server handles graceful shutdown on SIGTERM/SIGINT, giving in-flight requests up to 30 seconds to complete.
 
@@ -489,7 +490,7 @@ Failed to save config: write config /etc/bodega/config.json: permission denied
 
 ### Unreadable or unparsable
 
-Both are fatal. Falling back to built-in defaults means `tls_cert`/`tls_key` empty, so a server that served TLS yesterday binds plaintext today, and `deny_list` empty, so nothing is denied. The error names the file and, where the JSON decoder can say it, the key:
+Both are fatal. Falling back to built-in defaults means `tls_cert`/`tls_key` empty, so a server that served TLS yesterday now refuses to start rather than answering unencrypted (see [Serving without TLS](#serving-without-tls)), and `deny_list` empty, so nothing is denied. The error names the file and, where the JSON decoder can say it, the key:
 
 ```console
 $ bodega show repo
@@ -533,6 +534,7 @@ A default config is created on first run. All fields are optional.
   "tls_key": "",
   "tls_autocert": false,
   "tls_domain": "",
+  "allow_plaintext": false,
   "listen_addr": ":8080",
   "public_url": "",
   "proxy_cache_enabled": false,
@@ -1040,6 +1042,34 @@ Or set in config:
 
 When TLS is active, responses include `Strict-Transport-Security` (HSTS).
 
+#### Serving without TLS
+
+Plaintext is a request, not the absence of one. With `tls_cert` and `tls_key` both empty, `bodega serve` refuses to bind:
+
+```
+refusing to serve plaintext HTTP on :8080: tls_cert and tls_key are empty, which
+means nothing was configured rather than serve in the clear; set both, or set
+allow_plaintext (--allow-plaintext) to serve unencrypted on purpose
+```
+
+Authorize it with the flag or the key:
+
+```bash
+bodega serve --allow-plaintext
+```
+```json
+{ "allow_plaintext": true }
+```
+
+`--allow-plaintext=false` overrides a config file that set it true, so a host can be pinned to TLS from the unit file without editing `config.json`.
+
+Two refusals sit behind the same guard:
+
+- **Half a pair.** `tls_cert` set with `tls_key` empty, or the reverse, is fatal — at load for the config file, and at startup for `--tls-cert`/`--tls-key`, which are applied after the file is read. `allow_plaintext` does not excuse it: half a pair is a truncated edit, and reading it as a request for plaintext is how a server that served TLS yesterday answers in the clear today. `Config.Save()` marshals the whole resolved config back over the file, so a cert path cleared in the TUI reaches the listener with nothing else in the way.
+- **Port 443.** An empty pair on `:443` refuses even though the message differs, naming the port. A port is not authorization, but it is the strongest evidence available that whoever wrote `listen_addr` expected a certificate. `allow_plaintext` still starts it, with a `WARN` on every start.
+
+Behind a TLS-terminating proxy, set `allow_plaintext` together with `public_url` — see [Behind a reverse proxy](#behind-a-reverse-proxy).
+
 ### Security headers
 
 All responses include the following headers regardless of TLS:
@@ -1056,8 +1086,10 @@ bodega is designed to run behind nginx or Apache. The server extracts real clien
 **Set `public_url` on the bodega side of every one of these deployments.** The proxy terminates TLS and bodega listens on loopback with no certificate, so every client-facing URL bodega emits — the startup banner, the TUI pane, the web UI, `/api/v1/status` — is derived from a listener that answers `http://127.0.0.1:8080`. `X-Forwarded-Proto` fixes the requests bodega can see; `public_url` fixes the ones it cannot, and it is the only thing that knows the hostname the proxy publishes.
 
 ```json
-{ "public_url": "https://bodega.example.com" }
+{ "public_url": "https://bodega.example.com", "allow_plaintext": true }
 ```
+
+`allow_plaintext` belongs in that same object. The back-end listener carries no certificate by design, and without the key `bodega serve` refuses to start.
 
 Minimal nginx config:
 ```nginx

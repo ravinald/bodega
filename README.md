@@ -37,7 +37,7 @@ make build
 ./dist/bodega pkg create git netbox        # add a git entry (interactive prompts)
 ./dist/bodega build fetch                  # download sources
 ./dist/bodega build upload                 # build + upload to storage
-./dist/bodega serve                        # start HTTP server on :8080
+./dist/bodega serve --allow-plaintext      # start HTTP server on :8080
 ```
 
 bodega uses local filesystem storage by default. For S3, set `storage_backend` to `"s3"` in your config and run `bodega init` to create the bucket.
