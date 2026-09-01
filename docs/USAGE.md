@@ -298,10 +298,10 @@ Without a version, every version of the package moves; versions already on the d
 Two backend names resolving to one directory or bucket is refused before anything is copied:
 
 ```text
-binary/awscli-v2: backends "default" and "mirror" are the same location (file:///mnt/bulk/bodega) — every object would be copied onto itself, and --delete-source would then remove the only copy. Name a different --to, or drop the duplicate entry from storage_backends
+binary/awscli-v2: backends "default" and "mirror" are the same location (file:///mnt/bulk/bodega) — every object would be copied onto itself, and --delete-source would then remove the only copy. Name a different --to, or point one of the two at another path or bucket
 ```
 
-Two names for one place is a documented way to stage a migration, and `Load` rejects a colliding name but not a colliding path. Each object would be read and written at the same key, the verify would re-read what it had just overwritten and pass, and `--delete-source` would then remove the artifact the manifest points at. Both backends answer a missing object with "not found", so nothing afterwards could tell it had ever existed.
+Both names are in the message because the configuration is deliberate: two names for one place is a documented way to stage a migration, so the operator needs to know which half to repoint. `Load` rejects a colliding name but not a colliding path, and does not warn about one either — see [Named backends](#named-backends-and-per-type-placement). Each object would be read and written at the same key, the verify would re-read what it had just overwritten and pass, and `--delete-source` would then remove the artifact the manifest points at. Both backends answer a missing object with "not found", so nothing afterwards could tell it had ever existed.
 
 #### Whole-directory types are not movable
 
@@ -622,6 +622,8 @@ The two namespaces never mix, and `Load` enforces it. `storage_backend` is a **d
 ```text
 storage_by_type["apt"] names undefined storage backend "archive" (defined: default, bulk)
 ```
+
+Two entries resolving to one bucket or directory is neither rejected nor warned about. It is a supported way to stage a migration, and the identity that decides sameness is the backend's resolved label, which exists only after a driver has normalized its spec — comparing the configured strings at load would miss a symlink, a trailing slash or a relative path, and fire on a `path` two different drivers happen to share. `bodega pkg move` is the one command the collision can destroy anything through, and it refuses by label before the first copy.
 
 #### The placement hierarchy
 

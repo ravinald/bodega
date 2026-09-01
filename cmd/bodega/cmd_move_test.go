@@ -3,11 +3,16 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/storage"
 )
@@ -354,5 +359,72 @@ func TestSelectForMoveReportsAnUnresolvableSource(t *testing.T) {
 	if _, err := selectForMove(r, dst, pm, "", "bulk"); err == nil ||
 		!strings.Contains(err.Error(), "unknown storage backend") {
 		t.Fatalf("selectForMove = %v, want an unknown-backend error", err)
+	}
+}
+
+// TestMoveRefusesOneDirectoryUnderTwoNamesEndToEnd runs the whole command
+// against the configuration that destroyed an artifact: storage_path and
+// storage_backends.mirror.path are one directory, so the two names resolve to
+// one place and every copy lands on the object it was read from.
+//
+// The file is the assertion, not the exit status. The reported failure exited
+// 0 with three lines of success, so the exit code is the thing that lied; only
+// an artifact still on disk separates a refusal from a move that deleted the
+// only copy and reported that it had moved it.
+func TestMoveRefusesOneDirectoryUnderTwoNamesEndToEnd(t *testing.T) {
+	shared := t.TempDir()
+	manifestDir := t.TempDir()
+
+	store := manifest.NewLocalStore(manifestDir)
+	if err := store.AddVersion(t.Context(), manifest.TypeBinary, "awscli", manifest.VersionEntry{
+		Version: "2.1.0",
+		URL:     "https://example.com/awscli.zip",
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+
+	artifact := filepath.Join(shared, filepath.FromSlash(awscliKey))
+	if err := os.MkdirAll(filepath.Dir(artifact), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(artifact, []byte("the only copy"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	blob, err := json.Marshal(map[string]any{
+		"storage_backend": "local",
+		"storage_path":    shared,
+		"manifest_dir":    manifestDir,
+		"build_root":      t.TempDir(),
+		"log_dir":         t.TempDir(),
+		"storage_backends": map[string]config.StorageSpec{
+			"mirror": {Driver: "local", Path: shared},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(cfgFile, blob, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv(config.EnvConfigFile, cfgFile)
+
+	root := newRootCmd()
+	root.SetArgs([]string{"pkg", "move", "binary", "awscli", "--to", "mirror", "--delete-source"})
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+
+	err = root.Execute()
+	if err == nil {
+		t.Fatal("move across two names for one directory succeeded; main() would exit 0")
+	}
+	for _, want := range []string{`"default"`, `"mirror"`, shared} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %s", err, want)
+		}
+	}
+	if _, statErr := os.Stat(artifact); statErr != nil {
+		t.Fatalf("artifact is gone after the refusal: %v", statErr)
 	}
 }
