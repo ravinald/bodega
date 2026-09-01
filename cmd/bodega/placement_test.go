@@ -3,11 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/server"
 	"github.com/ravinald/bodega/internal/storage"
 )
 
@@ -356,4 +360,67 @@ func TestWritePlacementReportsWhatTheWritePathDoes(t *testing.T) {
 			t.Errorf("%s: warned about a policy the write path honors", typ)
 		}
 	}
+}
+
+// TestGitPlacementSurvivesTheHandoffToTheServer walks the chain the 404 in #67
+// came out of, in one process: the placement writer repoints a git entry, the
+// bytes end up on the named backend and nowhere else, and a server built from
+// the same manifest serves them.
+//
+// 'bodega pkg move' refuses git, so 'build sync --replace-placement' is the
+// only thing that writes VersionEntry.Storage for the type. It copies nothing,
+// leaving the operator to re-upload and remove the originals; that is the same
+// state --delete-source produces for a movable type, and it is what the
+// seeding below reproduces.
+//
+// The type rule is dropped before the server starts. A rule still naming
+// "bulk" would let a read resolving by type answer 200 as well, and the
+// assertion would hold against the tree this test exists to fail on.
+func TestGitPlacementSurvivesTheHandoffToTheServer(t *testing.T) {
+	ctx := t.Context()
+	defaultRoot, bulkRoot := t.TempDir(), t.TempDir()
+	cfg := &config.Config{
+		ManifestDir:     "manifests",
+		AptCodename:     "noble",
+		StorageBackend:  "local",
+		StoragePath:     defaultRoot,
+		StorageBackends: map[string]config.StorageSpec{"bulk": {Driver: "local", Path: bulkRoot}},
+		StorageByType:   map[string]string{manifest.TypeGit: "bulk"},
+	}
+
+	store := manifest.NewLocalStore(t.TempDir())
+	if err := store.AddVersion(ctx, manifest.TypeGit, "netbox", manifest.VersionEntry{
+		Ref: "v4.5.5",
+		URL: "https://github.com/netbox-community/netbox",
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+	key := manifest.GitKey("netbox", "v4.5.5", false)
+	writeFile(t, defaultRoot, key, "from-default")
+
+	pl, err := newPlacer(ctx, cfg, store, &bytes.Buffer{}, true)
+	if err != nil {
+		t.Fatalf("newPlacer: %v", err)
+	}
+	if _, err := pl.forType(ctx, manifest.TypeGit); err != nil {
+		t.Fatalf("forType(git): %v", err)
+	}
+	if got := recordedStorage(t, store, manifest.TypeGit, "netbox", "v4.5.5"); got != "bulk" {
+		t.Fatalf("recorded storage = %q, want %q after --replace-placement", got, "bulk")
+	}
+
+	writeFile(t, bulkRoot, key, "from-bulk")
+	if err := os.Remove(filepath.Join(defaultRoot, filepath.FromSlash(key))); err != nil {
+		t.Fatalf("remove the source object: %v", err)
+	}
+
+	delete(cfg.StorageByType, manifest.TypeGit)
+	stores, err := storage.NewResolver(ctx, cfg)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	ts := httptest.NewServer(server.New(cfg, store, stores, ":0", nil).Handler())
+	t.Cleanup(ts.Close)
+
+	assertServes(t, ts.URL+"/git/netbox/netbox-v4.5.5.bundle", "from-bulk")
 }
