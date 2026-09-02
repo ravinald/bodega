@@ -124,12 +124,15 @@ func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
 	// Extract package name and version from the wheel filename
 	// (e.g. "boto3-1.26.0-py3-none-any.whl" → "boto3", "1.26.0").
 	dist, distVersion := wheelIdentity(file)
+	upstream := "https://pypi.org/packages/" + file
 	if dist != "" {
 		pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, dist)
 		if pkg != nil && packageMode(pkg) == manifest.ModeProxy {
-			upstream := "https://pypi.org/packages/" + file
 			s.proxyOrCache(w, r, s.typeStore(manifest.TypePypi), key, upstream, manifest.TypePypi, dist, dist, true, true)
 			return
+		}
+		if pkg == nil {
+			s.recordNoManifest(r.Context(), r, manifest.TypePypi, dist, distVersion, upstream)
 		}
 	}
 	s.proxyVersion(w, r, manifest.TypePypi, dist, distVersion, key)

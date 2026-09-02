@@ -48,5 +48,12 @@ func (s *Server) handleHelmChart(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if pm == nil {
+		// No manifest entry means no chart repo URL either — helm upstreams are
+		// recorded per version entry, not in config. The row is written with an
+		// empty upstream_url, which `discover promote --as manifest` reports as
+		// needing an operator-supplied URL.
+		s.recordNoManifest(ctx, r, manifest.TypeHelm, chartName, chartVersion, "")
+	}
 	s.proxyVersion(w, r, manifest.TypeHelm, chartName, chartVersion, key)
 }

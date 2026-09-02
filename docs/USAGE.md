@@ -449,6 +449,98 @@ Removes a rule. Tries by ID first; falls back to deleting by pattern, scoped to 
 
 Walks every manifest in the store and reports any entry whose upstream URL or package name would be rejected by the current policy. Exits with code 1 on any violation — suitable for CI.
 
+### `bodega discover ...`
+
+Discovery records what clients reached for that bodega could not serve from its own manifests, so an operator can turn a real installation run into allow-list rules or manifest entries instead of writing them from memory.
+
+The mode is server-side. Set `discover_mode` in config.json and restart:
+
+| Value | Enforcement | What gets logged |
+|-------|-------------|------------------|
+| `""` (default) | allow-list enforced | nothing; the hook is off |
+| `"observe"` | allow-list enforced | every observation, including the fetches the allow-list blocked (`denied`) |
+| `"learn"` | allow-list **bypassed** | every observation, with blocked fetches marked `would_deny` and allowed through |
+
+`learn` is for bootstrapping a fresh install: point a clean host at bodega, let it install, and read back what it asked for. It logs a WARN every 60 seconds naming how many requests it let past the allow-list, because a `learn` server left running is an open proxy. Switch back to `observe` once you have captured what you need.
+
+Each observation is one row keyed by `(type, pattern, package, version, decision)`, with a request count, the last client IP, and the upstream URL bodega fetched or would have fetched. The `decision` column carries one of:
+
+| Decision | Meaning |
+|----------|---------|
+| `allowed` | an allow-list rule matched the upstream |
+| `denied` | the allow-list rejected it; the client got a 403 |
+| `would_deny` | the allow-list rejected it and `learn` mode let it through anyway |
+| `no_policy` | no allow-list rules exist for the type, so nothing was checked |
+| `no_manifest` | the request named a package with no manifest entry; the client got a 404 |
+| `no_namespace` | the request named a namespace no upstream is configured for |
+
+#### What is observed
+
+| Type | Route | Recorded |
+|------|-------|----------|
+| cargo | sparse index, crate download | every upstream fetch |
+| npm | packument, tarball | every upstream fetch; `no_manifest` on a tarball for an unknown package |
+| pypi | simple index, wheel | every upstream fetch; `no_manifest` on a wheel for an unknown distribution |
+| gomod | `/go/...` | every upstream fetch; `no_manifest` on a module with no entry |
+| helm | `/helm/charts/*.tgz` | every upstream fetch; `no_manifest` on a chart with no entry, with an empty upstream URL (a chart repo is named per version entry, so with no entry there is no URL to record) |
+
+#### Gaps
+
+These are not observed yet. A quiet discovery log for one of them means the hook does not reach it, not that no client asked:
+
+- **apt**: `/apt/pool/...` reads storage directly and has no upstream path at all, so neither a hit nor a miss is recorded.
+- **git bundles**: `/git/{name}/{file}` serves an uploaded bundle or release archive from storage. Nothing upstream, nothing logged. Smart-HTTP git, which would have an upstream, is not implemented.
+- **binary**: `/binaries/...` serves from storage on the same terms.
+- **helm `index.yaml`** and the generated apt indexes: regenerated locally, never fetched.
+- **cache hits of any type**: the log counts upstream fetches and pre-cache misses. A package already in the cache is served without a row, so `request_count` under-reports by however well the cache is working, and `last_client` names whoever caused the miss rather than the last host to ask.
+
+#### `bodega discover list [type]`
+
+One row per `(type, pattern)` bucket, with the total request count and the distinct decisions seen. The `PATTERN` column is what `promote` will write.
+
+#### `bodega discover show <type> <pattern>`
+
+The raw rows behind one bucket: package, version, decision, count, last client, upstream URL.
+
+#### `bodega discover promote <type> <pattern> [comment] [--as policy|manifest]`
+
+`--as policy` (the default) writes an allow-list rule for the pattern, through the same path as `bodega policy add`.
+
+`--as manifest` writes package manifest entries instead, through the same path as `bodega pkg create`. It reads only the `no_manifest` rows in the bucket and, for each one, adds a version entry in `proxy` mode carrying the upstream URL the handler would have fetched. A row with no version becomes one entry with `version_constraint: "any"`.
+
+The URL written is the one the manifest field means for the type, which is not always the one `discover show` prints. For gomod and npm the field is a registry root (`https://proxy.golang.org`, `https://registry.npmjs.org`) that the builder appends a module or package path to, so the recorded artifact URL is narrowed to it. Every other type records a URL that already means what the field means.
+
+It never rewrites what is already there. A version already in the manifest is skipped, so a `hosted` entry is never downgraded to `proxy` and re-running the command adds nothing. Rows with an empty upstream URL are named on stderr and skipped: a `proxy` entry with no URL would 404 as the miss it came from did, so those packages need a URL supplied by hand.
+
+#### `bodega discover promote-all <type> [--as policy|manifest]`
+
+The same two targets, applied to every bucket of the type at once. This is the command to run after a `learn` window.
+
+```bash
+# 1. Set "discover_mode": "learn" in config.json, restart bodega.
+# 2. Point a clean host at it and install what it needs.
+# 3. Read back what it reached for.
+bodega discover list
+
+TYPE   PATTERN           HOST                COUNT  DECISIONS    LAST SEEN
+gomod  github.com/aws/   proxy.golang.org    18     no_manifest  2026-09-01 14:22
+npm    lodash            registry.npmjs.org  4      no_policy    2026-09-01 14:21
+
+# 4. Turn the packages into manifest entries, and the patterns into rules.
+bodega discover promote-all gomod --as manifest
+bodega discover promote-all gomod
+
+# 5. Set "discover_mode" back to "observe" and restart.
+```
+
+#### `bodega discover clear [type]`
+
+Deletes discovery rows for one type, or all of them when the type is omitted.
+
+#### `bodega discover export <json|csv> [type]`
+
+Dumps the raw rows to stdout for offline analysis.
+
 ### `bodega --break-glass-update-md5 <type>`
 
 Recomputes the MD5 digest for a manifest that was edited outside of the tool.
@@ -541,6 +633,7 @@ A default config is created on first run. All fields are optional.
   "metadata_ttl": "1h",
   "gomod_upstream": "https://proxy.golang.org",
   "npm_upstream": "https://registry.npmjs.org",
+  "discover_mode": "",
   "apt_codename": "noble",
   "apt_suites": ["noble"],
   "audit_db": "",
@@ -564,6 +657,8 @@ The copy happens once rather than the file being read as a fallback on every sta
 `public_url` is the base URL clients reach the server at, and it decides the scheme and host of every client snippet bodega emits: the `bodega serve` startup banner, the TUI details pane, the web UI, and `GET /api/v1/status`. Resolution is `--public-url` > `$BODEGA_PUBLIC_URL` > `public_url`, with no built-in default.
 
 Set it whenever a reverse proxy terminates TLS or publishes a different hostname. bodega then sees a loopback listener with both TLS keys empty, so `tls_cert`/`tls_key` describe the proxy's back end and nothing describes the URL an operator would copy. Deriving the scheme from that pair is what printed `http://` on the sources line of a deployment that is `https://` everywhere a client can see. With `public_url` unset, callers holding a request answer from the request (honoring `X-Forwarded-Proto` from a trusted peer), and callers with none print `<bodega-host>:8080` as a placeholder and say that it is one.
+
+`discover_mode` turns the upstream-observation log on. Valid values are `""` (off), `"observe"` and `"learn"`; anything else is rejected at load. See [`bodega discover ...`](#bodega-discover-) for what each one records and what to do with the result.
 
 `timezone` sets the display timezone for audit queries (default UTC) and `audit_events` limits which event types the CLI records (empty records all; `bodega serve` records every type regardless — see [Audit Trail](#audit-trail)).
 

@@ -3,8 +3,13 @@ package audit
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
+
+	"github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/database/sqlite"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
 )
 
 func TestMigrationsFreshOpen(t *testing.T) {
@@ -158,4 +163,143 @@ func TestMigrationsAppliedToLegacyDB(t *testing.T) {
 	if len(rules) != 1 || rules[0].Pattern != "django" {
 		t.Errorf("ListPolicies = %+v", rules)
 	}
+}
+
+// Migration 009 widens the decision CHECK. A value the constraint rejects
+// fails at write time inside the recorder's worker goroutine, where the only
+// evidence is a warn line nobody reads, so the constraint is asserted here.
+func TestDiscoveryDecisionsSurviveTheCheckConstraint(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	for _, decision := range []string{
+		DecisionAllowed, DecisionDenied, DecisionWouldDeny, DecisionNoPolicy,
+		DecisionNoManifest, DecisionNoNamespace,
+	} {
+		row := DiscoveryRow{
+			RegistryType: "gomod",
+			PatternHint:  "github.com/aws/",
+			PkgName:      "github.com/aws/aws-sdk-go-v2",
+			PkgVersion:   "v1.30.0",
+			Decision:     decision,
+			UpstreamURL:  "https://proxy.golang.org/x",
+		}
+		if err := db.RecordDiscovery(ctx, row); err != nil {
+			t.Errorf("record decision %q: %v", decision, err)
+		}
+	}
+
+	rows, err := db.ListDiscovery(ctx, DiscoveryFilter{RegistryType: "gomod"})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 6 {
+		t.Errorf("rows = %d, want 6 — the decision column is part of the primary key, so each value is its own row", len(rows))
+	}
+}
+
+// The rename-copy-drop in 009 has to carry the pre-existing rows across and
+// rebuild both indexes. The test migrates to 008, writes a row through the
+// pre-009 schema, then steps up: a migration that silently emptied the table
+// would otherwise surface only as a discovery log that reset itself on
+// upgrade.
+func TestMigration009PreservesRowsAndIndexes(t *testing.T) {
+	raw, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer func() { _ = raw.Close() }()
+
+	m := migrator(t, raw)
+	if err := m.Migrate(8); err != nil {
+		t.Fatalf("migrate to 008: %v", err)
+	}
+	if _, err := raw.Exec(
+		`INSERT INTO upstream_discovery (registry_type, pattern_hint, pkg_name, pkg_version, decision, upstream_url)
+		 VALUES ('npm','lodash','lodash','4.17.21','no_policy','https://registry.npmjs.org/lodash')`,
+	); err != nil {
+		t.Fatalf("seed row at 008: %v", err)
+	}
+
+	if err := m.Migrate(9); err != nil {
+		t.Fatalf("migrate to 009: %v", err)
+	}
+
+	var upstream string
+	if err := raw.QueryRow(
+		`SELECT upstream_url FROM upstream_discovery WHERE pkg_name = 'lodash'`,
+	).Scan(&upstream); err != nil {
+		t.Fatalf("row did not survive 009: %v", err)
+	}
+	if upstream != "https://registry.npmjs.org/lodash" {
+		t.Errorf("upstream_url = %q after 009; the copy mismatched its columns", upstream)
+	}
+
+	for _, idx := range []string{"idx_discovery_type_pattern", "idx_discovery_last_seen"} {
+		var name string
+		if err := raw.QueryRow(
+			`SELECT name FROM sqlite_master WHERE type='index' AND name=?`, idx,
+		).Scan(&name); err != nil {
+			t.Errorf("index %s missing after 009: %v", idx, err)
+		}
+	}
+	var leftover string
+	err = raw.QueryRow(
+		`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'upstream_discovery!_%' ESCAPE '!'`,
+	).Scan(&leftover)
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("migration left a scratch table behind: %q (%v)", leftover, err)
+	}
+
+	// Rolling back drops what the narrower constraint cannot hold, and keeps
+	// everything it can. A down migration that aborted instead would strand
+	// the operator on a schema they cannot leave.
+	if _, err := raw.Exec(
+		`INSERT INTO upstream_discovery (registry_type, pattern_hint, pkg_name, pkg_version, decision)
+		 VALUES ('gomod','github.com/aws/','github.com/aws/aws-sdk-go-v2','v1.30.0','no_manifest')`,
+	); err != nil {
+		t.Fatalf("seed no_manifest row at 009: %v", err)
+	}
+	if err := m.Migrate(8); err != nil {
+		t.Fatalf("migrate down to 008: %v", err)
+	}
+	var kept, dropped int
+	if err := raw.QueryRow(`SELECT COUNT(*) FROM upstream_discovery`).Scan(&kept); err != nil {
+		t.Fatalf("count after down: %v", err)
+	}
+	if kept != 1 {
+		t.Errorf("rows after down = %d, want 1 (the no_policy row survives)", kept)
+	}
+	if err := raw.QueryRow(
+		`SELECT COUNT(*) FROM upstream_discovery WHERE decision = 'no_manifest'`,
+	).Scan(&dropped); err != nil {
+		t.Fatalf("count no_manifest after down: %v", err)
+	}
+	if dropped != 0 {
+		t.Errorf("no_manifest rows after down = %d, want 0", dropped)
+	}
+}
+
+// migrator builds a migrate instance over the embedded migrations, so a test
+// can step the schema one version at a time rather than only running Open's
+// all-the-way-up.
+func migrator(t *testing.T, raw *sql.DB) *migrate.Migrate {
+	t.Helper()
+	src, err := iofs.New(migrationsFS, "migrations")
+	if err != nil {
+		t.Fatalf("iofs source: %v", err)
+	}
+	driver, err := sqlite.WithInstance(raw, &sqlite.Config{})
+	if err != nil {
+		t.Fatalf("sqlite driver: %v", err)
+	}
+	m, err := migrate.NewWithInstance("iofs", src, "sqlite", driver)
+	if err != nil {
+		t.Fatalf("migrate instance: %v", err)
+	}
+	return m
 }
