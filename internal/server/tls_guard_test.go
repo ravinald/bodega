@@ -100,6 +100,10 @@ func TestStartRefusesPlaintextOn443(t *testing.T) {
 // TestStartRefusesUnimplementedAutocert keeps the autocert refusal inside the
 // one guard. It fires only when no cert pair is configured, which is the
 // unchanged behavior recorded on issue #113.
+//
+// AllowPlaintext is true here because the guard checks autocert first, so this
+// is the operator who already took the escape and got the same error back. The
+// refusal stands; the message has to name a step that works from there.
 func TestStartRefusesUnimplementedAutocert(t *testing.T) {
 	s := newGuardServer(t, &config.Config{TLSAutocert: true, AllowPlaintext: true, LogDir: t.TempDir()}, reservePort(t))
 	err := s.Start(context.Background())
@@ -108,6 +112,14 @@ func TestStartRefusesUnimplementedAutocert(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "not yet implemented") {
 		t.Fatalf("error %q does not name the unimplemented flag", err)
+	}
+	if !strings.Contains(err.Error(), `"tls_autocert": false`) {
+		t.Errorf("error %q does not name the config change that clears it", err)
+	}
+	// --tls-autocert=false cannot clear a config that set it true (#81), so a
+	// message that named the flag alone would be the same loop one level down.
+	if !strings.Contains(err.Error(), "--tls-autocert=false will not clear it") {
+		t.Errorf("error %q does not warn that the flag cannot turn autocert off", err)
 	}
 }
 

@@ -144,6 +144,14 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 		return manifest.ForceUpdateMD5(cfg.ManifestDir, breakGlassType)
 	}
 
+	// The root runs, so it is classified like any other verb. Quiet because
+	// ForceUpdateMD5 rewrites only the .md5 sidecar, and nothing the running
+	// server holds reads that — `bodega pkg verify` is its sole consumer. The
+	// classification covers this RunE alone, so it uses the self-only key: a
+	// root that spoke for its subtree would give every undeclared verb a
+	// default and the guard would pass on the next unclassified one.
+	noReloadSignalSelf(root)
+
 	// Build pipeline commands: bodega build {fetch,run,upload,sync,status}
 	buildParent := &cobra.Command{
 		Use:   "build",

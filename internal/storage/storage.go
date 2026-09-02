@@ -41,7 +41,22 @@ type ObjectStore interface {
 	// Returns ObjectInfo with Exists=false when the object does not exist.
 	Head(ctx context.Context, key string) (*ObjectInfo, error)
 
-	// List returns the keys of all objects whose key begins with prefix.
+	// List returns the keys of all objects whose key begins with prefix,
+	// sorted by key.
+	//
+	// Sorted by key, not by tree walk. The two differ: a walk orders
+	// directory entries, so it descends "x/b/" before reaching the sibling
+	// file "x/b-1", while "/" (0x2f) sorts after "-" (0x2d) and the keys
+	// run the other way. Local sorts for this reason; the flat backends get
+	// it for free.
+	//
+	// No caller depends on the order today — listFanout re-sorts its union
+	// and 'bodega reset' deletes what comes back regardless of sequence —
+	// so this is a guarantee stated before something needs it rather than
+	// after. Generated indexes (Packages.gz, the PEP 503 pages) are built
+	// per request from these keys and gzipped, so an unstable order changes
+	// the bytes and every client refetches; one backend answering in walk
+	// order would put that one refactor away.
 	List(ctx context.Context, prefix string) ([]string, error)
 
 	// Put stores data at key, overwriting any existing content.

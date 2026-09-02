@@ -1959,6 +1959,7 @@ Git smart-HTTP mirrors are the one tree that is not a storage key. They are bare
 ### Build targets
 
 ```bash
+make check          # every job CI blocks on, cheapest leg first
 make build          # compile to ./dist/bodega
 make cross          # cross-compile for linux/amd64
 make test           # run tests with race detector
@@ -1966,11 +1967,20 @@ make test-verbose   # verbose test output
 make bench          # run benchmarks
 make vet            # go vet
 make fmt            # goimports / gofmt
+make fmt-check      # fail on gofmt / goimports drift (CI's fmt job)
 make lint           # golangci-lint
 make tidy           # go mod tidy + verify
+make tidy-check     # fail on go.mod / go.sum drift (CI's tidy job)
+make ci-drift       # fail if the CI job list and this Makefile disagree
 make clean          # remove build artifacts
 make depend         # install Go + golangci-lint
 ```
+
+`make check` is the merge gate. CI's `vet`, `fmt` and `tidy` jobs call the same
+targets, so what passes locally is what the merge blocks on; `make ci-drift`
+fails when a job is added to `.github/workflows/ci.yml` without a leg here.
+`make fmt-check` requires `goimports` on `PATH` rather than skipping it, because
+a check that skips is weaker than the merge it stands in for.
 
 ### Project structure
 

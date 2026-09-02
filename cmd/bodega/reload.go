@@ -15,8 +15,14 @@ import "github.com/spf13/cobra"
 // fails the build when a new verb joins the tree undeclared.
 const (
 	reloadAnnotation = "bodega.reload"
-	reloadSignal     = "signal"
-	reloadQuiet      = "quiet"
+	// reloadSelfAnnotation classifies one command and not its subtree. The
+	// root needs it: it is runnable in its own right, since
+	// --break-glass-update-md5 writes through manifest.ForceUpdateMD5, and an
+	// inherited classification there would hand every undeclared verb in the
+	// tree a default. That is what the guard exists to refuse.
+	reloadSelfAnnotation = "bodega.reload.self"
+	reloadSignal         = "signal"
+	reloadQuiet          = "quiet"
 )
 
 // signalsReload marks a verb whose success changes what the server should be
@@ -44,6 +50,16 @@ func suppressReload(cmd *cobra.Command) {
 	classifyReload(cmd, reloadQuiet)
 }
 
+// noReloadSignalSelf marks one command quiet without speaking for anything
+// registered under it. Only the root uses it.
+func noReloadSignalSelf(cmd *cobra.Command) *cobra.Command {
+	if cmd.Annotations == nil {
+		cmd.Annotations = map[string]string{}
+	}
+	cmd.Annotations[reloadSelfAnnotation] = reloadQuiet
+	return cmd
+}
+
 func classifyReload(cmd *cobra.Command, intent string) *cobra.Command {
 	if cmd.Annotations == nil {
 		cmd.Annotations = map[string]string{}
@@ -58,6 +74,13 @@ func reloadIntent(cmd *cobra.Command) (string, bool) {
 	for c := cmd; c != nil; c = c.Parent() {
 		if intent, ok := c.Annotations[reloadAnnotation]; ok {
 			return intent, true
+		}
+		// Read on cmd itself and nowhere up the chain, which is the whole
+		// difference between the two keys.
+		if c == cmd {
+			if intent, ok := c.Annotations[reloadSelfAnnotation]; ok {
+				return intent, true
+			}
 		}
 	}
 	return "", false

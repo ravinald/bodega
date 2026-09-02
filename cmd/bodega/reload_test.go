@@ -32,18 +32,21 @@ import (
 func TestEveryRunnableCommandIsClassified(t *testing.T) {
 	var missing []string
 	var walk func(*cobra.Command)
-	walk = func(parent *cobra.Command) {
-		for _, cmd := range parent.Commands() {
-			switch cmd.Name() {
-			case "help", "completion": // cobra's own, added at Execute
-				continue
+	walk = func(cmd *cobra.Command) {
+		switch cmd.Name() {
+		case "help", "completion": // cobra's own, added at Execute
+			return
+		}
+		// The command it is handed, not only that command's children. Walking
+		// the children alone skipped the root, and the root is runnable:
+		// --break-glass-update-md5 writes through manifest.ForceUpdateMD5.
+		if cmd.Runnable() {
+			if _, ok := reloadIntent(cmd); !ok {
+				missing = append(missing, cmd.CommandPath())
 			}
-			if cmd.Runnable() {
-				if _, ok := reloadIntent(cmd); !ok {
-					missing = append(missing, cmd.CommandPath())
-				}
-			}
-			walk(cmd)
+		}
+		for _, child := range cmd.Commands() {
+			walk(child)
 		}
 	}
 	walk(newRootCmd())
@@ -52,6 +55,23 @@ func TestEveryRunnableCommandIsClassified(t *testing.T) {
 		t.Errorf("commands with no reload classification:\n  %s\n"+
 			"wrap each in signalsReload() or noReloadSignal() where it is registered",
 			strings.Join(missing, "\n  "))
+	}
+}
+
+// TestRootIsClassifiedAndDoesNotDescend pins both halves of the root's
+// classification. It has to have one, because --break-glass-update-md5 runs
+// from the root's own RunE. It must not lend it downward, or the next verb
+// registered without one inherits "quiet" and the guard above passes on it.
+func TestRootIsClassifiedAndDoesNotDescend(t *testing.T) {
+	root := newRootCmd()
+	if intent, ok := reloadIntent(root); !ok || intent != reloadQuiet {
+		t.Errorf("root = %q (found=%v), want %q", intent, ok, reloadQuiet)
+	}
+
+	orphan := &cobra.Command{Use: "orphan", Run: func(*cobra.Command, []string) {}}
+	root.AddCommand(orphan)
+	if intent, ok := reloadIntent(orphan); ok {
+		t.Errorf("an unclassified verb inherited %q from the root, so the guard would pass on it", intent)
 	}
 }
 

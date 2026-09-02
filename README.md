@@ -57,12 +57,18 @@ For a guided walkthrough, see [docs/QUICKSTART.md](docs/QUICKSTART.md). For comp
 ## Development
 
 ```bash
+make check      # every job CI blocks on: build, test, vet, lint, fmt, tidy
 make test       # run tests with race detector
 make vet        # go vet
 make lint       # golangci-lint
 make fmt        # goimports / gofmt
+make fmt-check  # fail on gofmt / goimports drift
 make tidy       # go mod tidy + verify
+make tidy-check # fail on go.mod / go.sum drift, restoring both either way
 ```
+
+`make check` is the one to run before opening a pull request. It runs a leg per
+CI job, and `make ci-drift` fails if the two lists stop agreeing.
 
 ## Configuration
 
