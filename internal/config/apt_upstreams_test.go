@@ -82,7 +82,7 @@ func TestAptUpstreamsRejected(t *testing.T) {
 			wantIn:    "query or fragment",
 		},
 		{
-			name:      "second entry is checked too",
+			name: "second entry is checked too",
 			upstreams: map[string]any{"noble": []any{
 				map[string]string{"url": "https://archive.ubuntu.com/ubuntu"},
 				map[string]string{"url": "ftp://security.ubuntu.com/ubuntu"},
