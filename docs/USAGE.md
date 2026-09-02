@@ -585,7 +585,9 @@ The raw rows behind one bucket: package, version, decision, count, last client, 
 
 `--as policy` (the default) writes an allow-list rule for the pattern, through the same path as `bodega policy add`.
 
-`--as manifest` writes package manifest entries instead, through the same path as `bodega pkg create`. It reads only the `no_manifest` rows in the bucket and, for each one, adds a version entry in `proxy` mode carrying the upstream URL the handler would have fetched. A row with no version becomes one entry with `version_constraint: "any"`.
+`--as manifest` writes package manifest entries instead, through the same path as `bodega pkg create`. It reads only the `no_manifest` rows in the bucket and, for each one, adds a version entry in `proxy` mode carrying the upstream URL the handler would have fetched.
+
+A row with no version becomes one entry with `version_constraint: "any"`, but only for `git` and `binary`, whose entries are fetched from the recorded URL as it stands. Every other type composes the version into the fetch path, so an open entry there resolves to a URL that 404s: `go` alone drives one versionless row per module through `/@v/list` and `/@v/@latest`. Those rows are named on stderr and skipped; the versioned rows for the same package are unaffected.
 
 The URL written is the one the manifest field means for the type, which is not always the one `discover show` prints. For gomod and npm the field is a registry root (`https://proxy.golang.org`, `https://registry.npmjs.org`) that the builder appends a module or package path to, so the recorded artifact URL is narrowed to it. Every other type records a URL that already means what the field means.
 
@@ -593,7 +595,7 @@ It never rewrites what is already there. A version already in the manifest is sk
 
 #### `bodega discover promote-all <type> [--as policy|manifest]`
 
-The same two targets, applied to every bucket of the type at once. This is the command to run against an `observe` window, once you have a catalog and want to close the gaps in it.
+The same two targets, applied to every bucket of the type at once. This is the command to run against an `observe` window, once you have a catalog and want to close the gaps in it. It writes as it goes; [`generate-manifests`](#bodega-discover-generate-manifests-type) is the same bulk work with a review step in the middle.
 
 ```bash
 # 1. Set "discover_mode": "observe" in config.json, restart bodega. Leave it on.
@@ -611,6 +613,64 @@ bodega discover promote-all gomod
 ```
 
 Nothing here needs enforcement relaxed, so nothing has to be switched back afterwards. The `denied` rows are the report worth reading twice: each one is a package a client wanted and the allow-list refused, which is either a rule to add or a client to fix.
+
+#### `bodega discover generate-manifests [type]`
+
+Reads the `no_manifest` rows and writes the package manifests they describe to stdout, as a JSON array. Nothing reaches the manifest store and no discovery row is touched: this command only reads.
+
+The output is the same shape [`bodega pkg convert`](#bodega-pkg-convert-type-file-) emits, so `bodega pkg import` takes it with no editing in between — the review step is what the format is for, not a conversion step.
+
+| Flag              | Effect                                                                                     |
+| ----------------- | ------------------------------------------------------------------------------------------ |
+| `--since`         | Only rows last seen within the window (`7d`, `72h`)                                        |
+| `--min-requests`  | Only packages with at least this many recorded requests                                    |
+| `--skip-existing` | Omit packages the manifest store already holds, which makes a re-run emit only what is new |
+| `-o, --output`    | Write the payload to a file instead of stdout                                              |
+
+`--min-requests` is the flag to reach for on a fleet: a discovery table fills with one-off CI probes, and without a signal filter they land in the catalog beside the packages that matter. Read the count for what it is: the log records upstream fetches, not client requests, so a warm cache under-reports it and a package everyone uses can rank below one nobody does.
+
+Every generated manifest passes the same validator `bodega pkg import` applies, before it is emitted. A package that fails is named on stderr and left out, rather than emitted for the import to reject halfway through a file and leave the store in a state you did not choose. Versions default to `mode: "proxy"`; flip an entry to `hosted` if you want `bodega build fetch` to pre-fetch the artifact.
+
+Identical rows produce identical bytes, so this week's generation diffs cleanly against last week's.
+
+The summary goes to stderr, one line per disposition, and stdout stays a payload a pipe can carry:
+
+```console
+$ bodega discover generate-manifests > catalog.json
+WARN skipped a versionless observation of (gomod, github.com/aws/aws-sdk-go): gomod composes the version into the fetch URL, so an open entry would 404 — the versioned rows for this package are unaffected
+
+Generated 3 package manifests (4 version entries) to stdout. Nothing was written to the manifest store; review the payload, then 'bodega pkg import' it.
+  1 versionless row(s) skipped for a type that needs a version
+  1 no_namespace row(s): a request named a namespace no upstream is configured for, which needs a git_upstreams or binary_upstreams entry rather than a manifest
+  1 row(s) record a decision other than no_manifest and are not catalog misses
+```
+
+##### Cataloging a fleet, end to end
+
+```bash
+# 1. Read each host's own inventory. This is the bulk of any catalog and it is
+#    complete on the first run — no waiting, no traffic required.
+dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\n' | bodega pkg convert apt > apt.json
+pip list --format=json | bodega pkg convert pypi > pypi.json
+bodega pkg import apt.json pypi.json
+
+# 2. Set "discover_mode": "observe" in config.json and restart. Leave it on.
+#    It logs; it relaxes nothing.
+
+# 3. Let the fleet run. Discovery accumulates what the catalog could not answer.
+bodega discover list
+
+# 4. Generate manifests for the misses, review them, import them.
+bodega discover generate-manifests --skip-existing --min-requests 2 > gaps.json
+$EDITOR gaps.json
+bodega pkg import gaps.json
+```
+
+No step in that sequence relaxes enforcement, and nothing has to be switched back afterwards. `observe` decides only whether a row is written; the allow-list, `catalog` mode and every other check behave the same at both values.
+
+Expect rows from **git and binary** above all. Those are the two types [`bodega pkg convert`](#bodega-pkg-convert-type-file-) has no importer for (nothing on a host records a `git clone` or a downloaded binary), so they arrive at bodega uncataloged and every request for one is a miss. The other types produce rows only for what their importer missed: a package installed after the convert run, a host that was never converted, or a version a client asked for and the catalog does not carry. Run this against a type you imported an hour ago and an empty array is the correct answer, not a failure.
+
+Two kinds of row this command cannot use, both counted in the summary. `no_namespace` rows name a first path segment with no `git_upstreams` or `binary_upstreams` entry: the fix is a config key, not a manifest. Rows with an empty `upstream_url` (every `no_manifest` row helm records, for one) carry nothing to fetch, so the entry has to be written by hand with `bodega pkg create`.
 
 #### `bodega discover clear [type]`
 

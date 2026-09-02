@@ -9,12 +9,15 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
@@ -46,6 +49,7 @@ into policy rules.`,
 		newDiscoverShowCmd(gf),
 		newDiscoverPromoteCmd(gf),
 		newDiscoverPromoteAllCmd(gf),
+		newDiscoverGenerateManifestsCmd(gf),
 		newDiscoverClearCmd(gf),
 		newDiscoverExportCmd(gf),
 	)
@@ -439,11 +443,13 @@ type manifestEntry struct {
 // function as the one that writes them — 'bodega discover generate-manifests'
 // is that caller.
 //
-// Rows with no upstream_url are returned in noURL rather than dropped. A
-// proxy-mode entry with no URL 404s exactly as the miss it came from did, so
-// the operator has to know which packages need a URL supplied by hand.
-func buildManifestEntries(rows []audit.DiscoveryRow) (entries []manifestEntry, noURL []string) {
+// Rows with no upstream_url are returned in noURL rather than dropped, and
+// versionless rows for a type that needs a version are returned in noVersion.
+// Either one would produce an entry that 404s exactly as the miss it came from
+// did, so the operator has to know which packages the promote passed over.
+func buildManifestEntries(rows []audit.DiscoveryRow) (entries []manifestEntry, noURL, noVersion []string) {
 	seenNoURL := map[string]bool{}
+	seenNoVersion := map[string]bool{}
 	for _, row := range rows {
 		if row.PkgName == "" {
 			continue
@@ -452,6 +458,13 @@ func buildManifestEntries(rows []audit.DiscoveryRow) (entries []manifestEntry, n
 			if !seenNoURL[row.PkgName] {
 				seenNoURL[row.PkgName] = true
 				noURL = append(noURL, row.PkgName)
+			}
+			continue
+		}
+		if row.PkgVersion == "" && !versionlessNamesArtifact(row.RegistryType) {
+			if !seenNoVersion[row.PkgName] {
+				seenNoVersion[row.PkgName] = true
+				noVersion = append(noVersion, row.PkgName)
 			}
 			continue
 		}
@@ -469,7 +482,24 @@ func buildManifestEntries(rows []audit.DiscoveryRow) (entries []manifestEntry, n
 		}
 		entries = append(entries, manifestEntry{PkgName: row.PkgName, Entry: ve})
 	}
-	return entries, noURL
+	return entries, noURL, noVersion
+}
+
+// versionlessNamesArtifact reports whether a row with no pkg_version still
+// names something a fetch can resolve.
+//
+// git and binary entries are fetched from VersionEntry.URL as recorded, so a
+// repository or a download URL is complete without a version. Every other type
+// composes the version into the fetch path (internal/builder gomod, npm, helm
+// and cargo all append it), and an open entry there resolves to a URL that
+// 404s. gomod produces these constantly: go resolves an unknown module through
+// /@v/list and /@v/@latest, and neither request carries a version.
+func versionlessNamesArtifact(regType string) bool {
+	switch regType {
+	case manifest.TypeGit, manifest.TypeBinary:
+		return true
+	}
+	return false
 }
 
 // manifestURL maps a discovery row's upstream URL onto the URL shape
@@ -617,14 +647,18 @@ func promoteManifest(gf *globalFlags, out io.Writer, regType, pattern string) er
 			audit.DecisionNoManifest, scope, total, next)
 	}
 
-	entries, noURL := buildManifestEntries(rows)
+	entries, noURL, noVersion := buildManifestEntries(rows)
 	for _, name := range noURL {
 		fmt.Fprintf(os.Stderr, "skipped (%s, %s): the observation carries no upstream_url, so a proxy entry built from it would 404 — re-drive a request for it with discover_mode set, or supply the URL with 'bodega pkg create %s %s'\n",
 			regType, name, regType, name)
 	}
+	for _, name := range noVersion {
+		fmt.Fprintf(os.Stderr, "skipped a versionless observation of (%s, %s): %s composes the version into the fetch URL, so an open entry would 404 — the versioned rows for this package are unaffected\n",
+			regType, name, regType)
+	}
 	if len(entries) == 0 {
-		return fmt.Errorf("every %s observation for %s lacks an upstream_url (see above); nothing was written",
-			audit.DecisionNoManifest, regType)
+		return fmt.Errorf("no %s observation for %s produced an entry: %d lacked an upstream_url and %d named no version (see above); nothing was written",
+			audit.DecisionNoManifest, regType, len(noURL), len(noVersion))
 	}
 
 	store, err := loadStore(gf)
@@ -640,7 +674,349 @@ func promoteManifest(gf *globalFlags, out io.Writer, regType, pattern string) er
 			store.Label(), err, added)
 	}
 
-	fmt.Fprintf(out, "\nPromoted %d manifest %s, skipped %d already present, %d without an upstream URL.\n",
-		added, plural(added, "entry", "entries"), present, len(noURL))
+	fmt.Fprintf(out, "\nPromoted %d manifest %s, skipped %d already present, %d without an upstream URL, %d without a version.\n",
+		added, plural(added, "entry", "entries"), present, len(noURL), len(noVersion))
 	return nil
+}
+
+// ---- Bulk manifest generation ---------------------------------------------
+
+// discoveryScanLimit bounds the rows one generate run reads, matching the
+// ceiling `discover export` and `promote --as manifest` already use.
+const discoveryScanLimit = 100000
+
+// generateOpts carries the read-side filters of `discover generate-manifests`.
+// A zero value generates from every row the discovery log holds.
+type generateOpts struct {
+	Since        time.Time
+	MinRequests  int64
+	SkipExisting bool
+	Output       string
+}
+
+// generateSummary counts what never reached the payload. An operator importing
+// the output is entitled to know the catalog it produces is partial, and why:
+// silence here reads as "this is everything".
+type generateSummary struct {
+	Packages     int
+	Versions     int
+	StaleRows    int // dropped by --since
+	QuietPkgs    int // dropped by --min-requests
+	ExistingPkgs int // dropped by --skip-existing
+	NoURLRows    int // rows carrying no upstream_url
+	NoVersionRow int // versionless rows for a type that composes the version into the fetch
+	UnnamedRows  int // rows carrying no pkg_name
+	InvalidPkgs  int // packages the manifest validator refused
+	NoNamespace  int // rows naming a namespace no upstream is configured for
+	OtherRows    int // rows from decisions that are not catalog misses
+}
+
+func newDiscoverGenerateManifestsCmd(gf *globalFlags) *cobra.Command {
+	var (
+		since        string
+		minRequests  int64
+		skipExisting bool
+		output       string
+	)
+	cmd := &cobra.Command{
+		Use:   "generate-manifests [type]",
+		Short: "Emit manifest entries for the observed packages the catalog has no entry for",
+		Long: `generate-manifests turns the no_manifest rows in the discovery log into the
+package manifests they describe and writes them to stdout as a JSON array —
+the same shape 'bodega pkg convert' emits, so the same import reads it with
+no editing in between.
+
+Nothing is written to the manifest store and no discovery row is touched.
+Review the output, edit it, then import it:
+
+  bodega discover generate-manifests git > git-catalog.json
+  $EDITOR git-catalog.json
+  bodega pkg import git-catalog.json
+
+Omitting the type generates for every type with rows. Rows come from
+catalog-mode misses, so the types that produce them are the ones no
+'bodega pkg convert' importer covers — git and binary — plus whatever an
+importer missed elsewhere. Versions default to proxy mode; flip an entry to
+hosted if you want 'bodega build fetch' to pre-fetch the artifact.
+
+Skipped packages are named on stderr so stdout stays a clean payload.
+
+Examples:
+  bodega discover generate-manifests
+  bodega discover generate-manifests git --since 30d
+  bodega discover generate-manifests --min-requests 5 -o catalog.json
+  bodega discover generate-manifests --skip-existing | bodega pkg import -`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var regType string
+			if len(args) > 0 {
+				regType = args[0]
+			}
+			opts := generateOpts{
+				MinRequests:  minRequests,
+				SkipExisting: skipExisting,
+				Output:       output,
+			}
+			if since != "" {
+				d, err := parseAgeDuration(since)
+				if err != nil {
+					return fmt.Errorf("--since: %w", err)
+				}
+				opts.Since = time.Now().Add(-d)
+			}
+			return generateManifests(gf, cmd.OutOrStdout(), cmd.ErrOrStderr(), regType, opts)
+		},
+	}
+	cmd.Flags().StringVar(&since, "since", "", "Only rows last seen within this window (e.g. 7d, 72h)")
+	cmd.Flags().Int64Var(&minRequests, "min-requests", 0,
+		"Only packages with at least this many recorded requests. The count is upstream fetches, not client requests, so a warm cache under-reports it")
+	cmd.Flags().BoolVar(&skipExisting, "skip-existing", false, "Omit packages the manifest store already holds")
+	cmd.Flags().StringVarP(&output, "output", "o", "", "Write the payload to this file instead of stdout")
+	return cmd
+}
+
+// generateManifests reads the discovery log and emits the manifests its
+// catalog misses describe. It opens the manifest store only for
+// --skip-existing, and only to read: the review step between this command and
+// 'pkg import' is the feature, not an obstacle to route around.
+func generateManifests(gf *globalFlags, out, errOut io.Writer, regType string, opts generateOpts) error {
+	if regType != "" {
+		if err := policy.ValidateType(regType); err != nil {
+			return err
+		}
+	}
+
+	cfg, err := loadConfig(gf)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+
+	adb := openAuditDB(gf)
+	if adb == nil {
+		return fmt.Errorf("could not open audit database")
+	}
+	defer adb.Close()
+
+	ctx := context.Background()
+	rows, err := adb.ListDiscovery(ctx, audit.DiscoveryFilter{
+		RegistryType: regType,
+		Limit:        discoveryScanLimit,
+	})
+	if err != nil {
+		return fmt.Errorf("list discovery rows: %w", err)
+	}
+
+	var store *manifest.Store
+	if opts.SkipExisting {
+		store, err = loadStore(gf)
+		if err != nil {
+			return fmt.Errorf("load manifests: %w — --skip-existing reads the store to see what is already cataloged; drop the flag to generate without consulting it", err)
+		}
+	}
+
+	pms, sum, err := buildGeneratedManifests(ctx, store, cfg, errOut, rows, opts)
+	if err != nil {
+		return err
+	}
+
+	blob, err := json.MarshalIndent(pms, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode manifests: %w", err)
+	}
+	blob = append(blob, '\n')
+
+	if opts.Output == "" || opts.Output == "-" {
+		if _, err := out.Write(blob); err != nil {
+			return err
+		}
+	} else if err := os.WriteFile(opts.Output, blob, 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", opts.Output, err)
+	}
+
+	writeGenerateSummary(errOut, sum, opts)
+	return nil
+}
+
+// generateKey is the unit this command emits: one manifest per observed
+// package of one type.
+type generateKey struct {
+	Type string
+	Name string
+}
+
+// buildGeneratedManifests groups the discovery rows into manifests and applies
+// every filter, counting what each one removed.
+//
+// The filters run here rather than in the SQL query so one read answers both
+// what to emit and what was dropped. A filter that silently narrows the result
+// set is how an operator ends up importing a partial catalog.
+func buildGeneratedManifests(
+	ctx context.Context,
+	store *manifest.Store,
+	cfg *config.Config,
+	errOut io.Writer,
+	rows []audit.DiscoveryRow,
+	opts generateOpts,
+) ([]manifest.PackageManifest, generateSummary, error) {
+	var sum generateSummary
+	groups := map[generateKey][]audit.DiscoveryRow{}
+	requests := map[generateKey]int64{}
+	var order []generateKey
+
+	for _, row := range rows {
+		switch row.Decision {
+		case audit.DecisionNoManifest:
+		case audit.DecisionNoNamespace:
+			sum.NoNamespace++
+			continue
+		default:
+			sum.OtherRows++
+			continue
+		}
+		if !opts.Since.IsZero() && row.LastSeen.Before(opts.Since) {
+			sum.StaleRows++
+			continue
+		}
+		if row.PkgName == "" {
+			sum.UnnamedRows++
+			continue
+		}
+		if row.UpstreamURL == "" {
+			sum.NoURLRows++
+		}
+		k := generateKey{Type: row.RegistryType, Name: row.PkgName}
+		if _, seen := groups[k]; !seen {
+			order = append(order, k)
+		}
+		groups[k] = append(groups[k], row)
+		requests[k] += row.RequestCount
+	}
+
+	sort.Slice(order, func(i, j int) bool {
+		if order[i].Type != order[j].Type {
+			return order[i].Type < order[j].Type
+		}
+		return order[i].Name < order[j].Name
+	})
+
+	pms := []manifest.PackageManifest{}
+	for _, k := range order {
+		if opts.MinRequests > 0 && requests[k] < opts.MinRequests {
+			sum.QuietPkgs++
+			continue
+		}
+		if store != nil {
+			existing, err := store.GetPackage(ctx, k.Type, k.Name)
+			if err != nil {
+				return nil, sum, fmt.Errorf("read manifest %s/%s from %s: %w — --skip-existing cannot tell what is already cataloged until this read works; fix it or drop the flag",
+					k.Type, k.Name, store.Label(), err)
+			}
+			if existing != nil {
+				sum.ExistingPkgs++
+				continue
+			}
+		}
+
+		entries, noURL, noVersion := buildManifestEntries(groups[k])
+		for _, name := range noURL {
+			fmt.Fprintf(errOut, "WARN skipped (%s, %s): the observation carries no upstream_url, so a proxy entry built from it would 404 — re-drive a request for it with discover_mode set, or write the entry with 'bodega pkg create %s %s'\n",
+				k.Type, name, k.Type, name)
+		}
+		for _, name := range noVersion {
+			sum.NoVersionRow++
+			fmt.Fprintf(errOut, "WARN skipped a versionless observation of (%s, %s): %s composes the version into the fetch URL, so an open entry would 404 — the versioned rows for this package are unaffected\n",
+				k.Type, name, k.Type)
+		}
+		if len(entries) == 0 {
+			continue
+		}
+
+		pm := manifest.PackageManifest{
+			ConfigVersion: manifest.CurrentConfigVersion,
+			Name:          k.Name,
+			Type:          k.Type,
+			Versions:      generatedVersions(entries),
+		}
+		// The import applies this same check and aborts the whole file on the
+		// first refusal, leaving the store half-written. Refusing the entry
+		// here costs the operator one package instead.
+		if err := validateManifest(&pm, cfg, errOut); err != nil {
+			sum.InvalidPkgs++
+			fmt.Fprintf(errOut, "WARN skipped (%s, %s): %v\n", k.Type, k.Name, err)
+			continue
+		}
+		pms = append(pms, pm)
+		sum.Packages++
+		sum.Versions += len(pm.Versions)
+	}
+
+	return pms, sum, nil
+}
+
+// generatedVersions collapses a package's entries to one per version and
+// orders them newest first.
+//
+// The order has to be total, not merely pleasant: an operator diffs a
+// generation against last week's, and a sort that leaves two entries
+// interchangeable makes every line downstream of them look changed.
+func generatedVersions(entries []manifestEntry) []manifest.VersionEntry {
+	seen := map[string]bool{}
+	out := make([]manifest.VersionEntry, 0, len(entries))
+	for _, e := range entries {
+		if seen[e.Entry.Version] {
+			continue
+		}
+		seen[e.Entry.Version] = true
+		out = append(out, e.Entry)
+	}
+	sort.Slice(out, func(i, j int) bool { return versionEntryNewer(out[i], out[j]) })
+	return out
+}
+
+// versionEntryNewer orders two generated entries, newest first. Semver order
+// where both parse, string order otherwise — which keeps the comparison total
+// for the tags and dates that reach a discovery row and never parse.
+func versionEntryNewer(a, b manifest.VersionEntry) bool {
+	av, aok := builder.ParseSemVer(a.Version)
+	bv, bok := builder.ParseSemVer(b.Version)
+	switch {
+	case aok && bok:
+		if !av.Equal(bv) {
+			return bv.Less(av)
+		}
+	case aok != bok:
+		return aok
+	}
+	return a.Version > b.Version
+}
+
+// writeGenerateSummary reports the run on stderr, one line per non-zero
+// disposition, so stdout stays a payload a pipe can carry.
+func writeGenerateSummary(w io.Writer, s generateSummary, opts generateOpts) {
+	dest := "stdout"
+	if opts.Output != "" && opts.Output != "-" {
+		dest = opts.Output
+	}
+	fmt.Fprintf(w, "\nGenerated %d package %s (%d version %s) to %s. Nothing was written to the manifest store; review the payload, then 'bodega pkg import' it.\n",
+		s.Packages, plural(s.Packages, "manifest", "manifests"),
+		s.Versions, plural(s.Versions, "entry", "entries"), dest)
+
+	for _, line := range []struct {
+		n    int
+		text string
+	}{
+		{s.StaleRows, fmt.Sprintf("%d row(s) dropped by --since", s.StaleRows)},
+		{s.QuietPkgs, fmt.Sprintf("%d package(s) dropped by --min-requests", s.QuietPkgs)},
+		{s.ExistingPkgs, fmt.Sprintf("%d package(s) dropped by --skip-existing (already in the store)", s.ExistingPkgs)},
+		{s.NoURLRows, fmt.Sprintf("%d row(s) carry no upstream_url", s.NoURLRows)},
+		{s.NoVersionRow, fmt.Sprintf("%d versionless row(s) skipped for a type that needs a version", s.NoVersionRow)},
+		{s.UnnamedRows, fmt.Sprintf("%d row(s) carry no pkg_name", s.UnnamedRows)},
+		{s.InvalidPkgs, fmt.Sprintf("%d package(s) failed manifest validation", s.InvalidPkgs)},
+		{s.NoNamespace, fmt.Sprintf("%d %s row(s): a request named a namespace no upstream is configured for, which needs a git_upstreams or binary_upstreams entry rather than a manifest", s.NoNamespace, audit.DecisionNoNamespace)},
+		{s.OtherRows, fmt.Sprintf("%d row(s) record a decision other than %s and are not catalog misses", s.OtherRows, audit.DecisionNoManifest)},
+	} {
+		if line.n > 0 {
+			fmt.Fprintf(w, "  %s\n", line.text)
+		}
+	}
 }

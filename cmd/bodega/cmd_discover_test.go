@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
@@ -404,5 +406,404 @@ func TestPromoteDefaultsToPolicy(t *testing.T) {
 	}
 	if len(rules) != 1 || rules[0].Pattern != "github.com/aws/" {
 		t.Errorf("policy rules = %+v, want one rule for github.com/aws/", rules)
+	}
+}
+
+// ---- generate-manifests ----------------------------------------------------
+
+// runDiscoverSplit keeps stdout and stderr apart: the payload is only pipeable
+// if the summary never lands in it, and a shared buffer cannot see that.
+func runDiscoverSplit(t *testing.T, args ...string) (string, string, error) {
+	t.Helper()
+	cmd := newDiscoverCmd(&globalFlags{})
+	cmd.SetArgs(args)
+	var out, errOut bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&errOut)
+	cmd.SilenceUsage = true
+	cmd.SilenceErrors = true
+	err := cmd.Execute()
+	return out.String(), errOut.String(), err
+}
+
+// backdate moves a package's rows back in time. RecordDiscovery stamps
+// last_seen with now(), so --since has nothing to exclude without this.
+func (e *discoverEnv) backdate(t *testing.T, pkgName string, d time.Duration) {
+	t.Helper()
+	db, err := sql.Open("sqlite", e.auditDB)
+	if err != nil {
+		t.Fatalf("open audit db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	stamp := time.Now().Add(-d).UTC().Format("2006-01-02T15:04:05.000Z")
+	res, err := db.Exec(`UPDATE upstream_discovery SET last_seen = ? WHERE pkg_name = ?`, stamp, pkgName)
+	if err != nil {
+		t.Fatalf("backdate %s: %v", pkgName, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		t.Fatalf("backdate %s: no rows matched", pkgName)
+	}
+}
+
+func (e *discoverEnv) discoveryRowCount(t *testing.T) int64 {
+	t.Helper()
+	db, err := audit.Open(e.auditDB)
+	if err != nil {
+		t.Fatalf("open audit db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	n, err := db.DiscoveryCount(context.Background(), "")
+	if err != nil {
+		t.Fatalf("count discovery rows: %v", err)
+	}
+	return n
+}
+
+func decodeGenerated(t *testing.T, payload string) []manifest.PackageManifest {
+	t.Helper()
+	pms, err := decodeManifests([]byte(payload))
+	if err != nil {
+		t.Fatalf("decode generated payload %q: %v", payload, err)
+	}
+	return pms
+}
+
+func npmMiss() audit.DiscoveryRow {
+	return audit.DiscoveryRow{
+		RegistryType: manifest.TypeNpm,
+		Host:         "registry.npmjs.org",
+		PatternHint:  "lodash",
+		PkgName:      "lodash",
+		PkgVersion:   "4.17.21",
+		Decision:     audit.DecisionNoManifest,
+		UpstreamURL:  "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+		LastClient:   "10.0.0.6",
+	}
+}
+
+func gitMiss() audit.DiscoveryRow {
+	return audit.DiscoveryRow{
+		RegistryType: manifest.TypeGit,
+		Host:         "github.com",
+		PatternHint:  "https://github.com/aws/",
+		PkgName:      "aws/aws-sdk-go-v2",
+		Decision:     audit.DecisionNoManifest,
+		UpstreamURL:  "https://github.com/aws/aws-sdk-go-v2",
+		LastClient:   "10.0.0.7",
+	}
+}
+
+func binaryMiss() audit.DiscoveryRow {
+	return audit.DiscoveryRow{
+		RegistryType: manifest.TypeBinary,
+		Host:         "releases.hashicorp.com",
+		PatternHint:  "https://releases.hashicorp.com/",
+		PkgName:      "hashicorp/terraform_1.9.8_linux_amd64.zip",
+		Decision:     audit.DecisionNoManifest,
+		UpstreamURL:  "https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_linux_amd64.zip",
+		LastClient:   "10.0.0.8",
+	}
+}
+
+// The assertion is on what the store holds after a real import, not on the
+// payload: a generator tested only against its own output passes while
+// producing something nothing can import.
+func TestGenerateManifestsRoundTripsThroughImport(t *testing.T) {
+	env := newDiscoverEnv(t)
+	env.seedDiscovery(t, gomodMiss(), npmMiss(), gitMiss(), binaryMiss())
+
+	path := filepath.Join(t.TempDir(), "catalog.json")
+	if _, _, err := runDiscoverSplit(t, "generate-manifests", "-o", path); err != nil {
+		t.Fatalf("generate-manifests: %v", err)
+	}
+
+	imp := newImportCmd(&globalFlags{})
+	imp.SetArgs([]string{path})
+	imp.SilenceUsage = true
+	imp.SilenceErrors = true
+	if err := imp.Execute(); err != nil {
+		t.Fatalf("pkg import %s: %v", path, err)
+	}
+
+	for _, want := range []struct {
+		typ, name, version, url string
+	}{
+		{manifest.TypeGomod, "github.com/aws/aws-sdk-go-v2", "v1.30.0", "https://proxy.golang.org"},
+		{manifest.TypeNpm, "lodash", "4.17.21", "https://registry.npmjs.org"},
+		{manifest.TypeGit, "aws/aws-sdk-go-v2", "", "https://github.com/aws/aws-sdk-go-v2"},
+		{manifest.TypeBinary, "hashicorp/terraform_1.9.8_linux_amd64.zip", "", "https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_linux_amd64.zip"},
+	} {
+		pm := env.readManifest(t, want.typ, want.name)
+		if pm == nil {
+			t.Fatalf("%s/%s: not in the store after import", want.typ, want.name)
+		}
+		if len(pm.Versions) != 1 {
+			t.Fatalf("%s/%s: got %d versions, want 1", want.typ, want.name, len(pm.Versions))
+		}
+		ve := pm.Versions[0]
+		if ve.Version != want.version || ve.URL != want.url {
+			t.Errorf("%s/%s: got version %q url %q, want %q / %q",
+				want.typ, want.name, ve.Version, ve.URL, want.version, want.url)
+		}
+		if ve.Mode != manifest.ModeProxy {
+			t.Errorf("%s/%s: got mode %q, want %q", want.typ, want.name, ve.Mode, manifest.ModeProxy)
+		}
+	}
+
+	// Everything is now cataloged, so the idempotent re-run has nothing left.
+	out, _, err := runDiscoverSplit(t, "generate-manifests", "--skip-existing")
+	if err != nil {
+		t.Fatalf("generate-manifests --skip-existing: %v", err)
+	}
+	if pms := decodeGenerated(t, out); len(pms) != 0 {
+		t.Fatalf("--skip-existing emitted %d package(s) after import, want 0", len(pms))
+	}
+}
+
+func TestGenerateManifestsIsByteIdentical(t *testing.T) {
+	env := newDiscoverEnv(t)
+	env.seedDiscovery(t,
+		gomodMiss(), npmMiss(), gitMiss(), binaryMiss(),
+		withVersion(gomodMiss(), "v1.9.0"),
+		withVersion(gomodMiss(), "v1.10.0"),
+		withVersion(gomodMiss(), "release-candidate"),
+	)
+
+	first, _, err := runDiscoverSplit(t, "generate-manifests")
+	if err != nil {
+		t.Fatalf("first generate: %v", err)
+	}
+	second, _, err := runDiscoverSplit(t, "generate-manifests")
+	if err != nil {
+		t.Fatalf("second generate: %v", err)
+	}
+	if first != second {
+		t.Fatalf("two runs over the same rows differ:\n--- first ---\n%s\n--- second ---\n%s", first, second)
+	}
+
+	pms := decodeGenerated(t, first)
+	var gomod *manifest.PackageManifest
+	for i := range pms {
+		if pms[i].Type == manifest.TypeGomod {
+			gomod = &pms[i]
+		}
+	}
+	if gomod == nil {
+		t.Fatal("no gomod manifest generated")
+	}
+	var got []string
+	for _, ve := range gomod.Versions {
+		got = append(got, ve.Version)
+	}
+	want := []string{"v1.30.0", "v1.10.0", "v1.9.0", "release-candidate"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("version order: got %v, want %v (newest first, unparseable last)", got, want)
+	}
+}
+
+func withVersion(row audit.DiscoveryRow, version string) audit.DiscoveryRow {
+	row.PkgVersion = version
+	row.UpstreamURL = "https://proxy.golang.org/" + row.PkgName + "/@v/" + version + ".info"
+	return row
+}
+
+func withRequests(t *testing.T, env *discoverEnv, row audit.DiscoveryRow, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		env.seedDiscovery(t, row)
+	}
+}
+
+func TestGenerateManifestsSinceFilter(t *testing.T) {
+	env := newDiscoverEnv(t)
+	env.seedDiscovery(t, gomodMiss(), npmMiss())
+	env.backdate(t, "lodash", 30*24*time.Hour)
+
+	out, errOut, err := runDiscoverSplit(t, "generate-manifests", "--since", "7d")
+	if err != nil {
+		t.Fatalf("generate-manifests --since: %v", err)
+	}
+	pms := decodeGenerated(t, out)
+	if len(pms) != 1 || pms[0].Type != manifest.TypeGomod {
+		t.Fatalf("--since 7d kept %d package(s), want only the gomod one: %s", len(pms), out)
+	}
+	if !strings.Contains(errOut, "dropped by --since") {
+		t.Errorf("summary does not report the --since drop: %s", errOut)
+	}
+
+	all, _, err := runDiscoverSplit(t, "generate-manifests", "--since", "90d")
+	if err != nil {
+		t.Fatalf("generate-manifests --since 90d: %v", err)
+	}
+	if len(decodeGenerated(t, all)) != 2 {
+		t.Errorf("--since 90d should keep both packages: %s", all)
+	}
+}
+
+func TestGenerateManifestsMinRequestsFilter(t *testing.T) {
+	env := newDiscoverEnv(t)
+	withRequests(t, env, gomodMiss(), 12)
+	env.seedDiscovery(t, npmMiss())
+
+	out, errOut, err := runDiscoverSplit(t, "generate-manifests", "--min-requests", "10")
+	if err != nil {
+		t.Fatalf("generate-manifests --min-requests: %v", err)
+	}
+	pms := decodeGenerated(t, out)
+	if len(pms) != 1 || pms[0].Type != manifest.TypeGomod {
+		t.Fatalf("--min-requests 10 kept %d package(s), want only the gomod one: %s", len(pms), out)
+	}
+	if !strings.Contains(errOut, "dropped by --min-requests") {
+		t.Errorf("summary does not report the --min-requests drop: %s", errOut)
+	}
+}
+
+func TestGenerateManifestsSkipExistingFilter(t *testing.T) {
+	env := newDiscoverEnv(t)
+	env.seedDiscovery(t, gomodMiss(), npmMiss())
+
+	store := manifest.NewLocalStore(env.manifestDir)
+	ctx := context.Background()
+	if err := store.AddVersion(ctx, manifest.TypeNpm, "lodash", manifest.VersionEntry{
+		Version: "1.0.0",
+		URL:     "https://registry.npmjs.org",
+		Mode:    manifest.ModeHosted,
+	}); err != nil {
+		t.Fatalf("seed existing manifest: %v", err)
+	}
+	if err := store.SaveIndex(ctx); err != nil {
+		t.Fatalf("save index: %v", err)
+	}
+
+	out, errOut, err := runDiscoverSplit(t, "generate-manifests", "--skip-existing")
+	if err != nil {
+		t.Fatalf("generate-manifests --skip-existing: %v", err)
+	}
+	pms := decodeGenerated(t, out)
+	if len(pms) != 1 || pms[0].Type != manifest.TypeGomod {
+		t.Fatalf("--skip-existing kept %d package(s), want only the uncataloged gomod one: %s", len(pms), out)
+	}
+	if !strings.Contains(errOut, "dropped by --skip-existing") {
+		t.Errorf("summary does not report the --skip-existing drop: %s", errOut)
+	}
+
+	// The flag filters, it does not touch what it found.
+	pm := env.readManifest(t, manifest.TypeNpm, "lodash")
+	if pm == nil || len(pm.Versions) != 1 || pm.Versions[0].Mode != manifest.ModeHosted {
+		t.Errorf("the existing manifest was rewritten: %+v", pm)
+	}
+}
+
+// An entry the import would reject is skipped here instead, so a half-written
+// store is never the operator's first sign of trouble. The row carries a type
+// no build of bodega serves, which is what a database written by a newer
+// version looks like to an older binary.
+func TestGenerateManifestsSkipsWhatTheValidatorRefuses(t *testing.T) {
+	env := newDiscoverEnv(t)
+	env.seedDiscovery(t, gomodMiss(), audit.DiscoveryRow{
+		RegistryType: "conda",
+		Host:         "conda.anaconda.org",
+		PatternHint:  "conda.anaconda.org",
+		PkgName:      "numpy",
+		PkgVersion:   "2.1.0",
+		Decision:     audit.DecisionNoManifest,
+		UpstreamURL:  "https://conda.anaconda.org/conda-forge/linux-64/numpy-2.1.0.conda",
+		LastClient:   "10.0.0.9",
+	})
+
+	out, errOut, err := runDiscoverSplit(t, "generate-manifests")
+	if err != nil {
+		t.Fatalf("generate-manifests: %v", err)
+	}
+	for _, pm := range decodeGenerated(t, out) {
+		if pm.Type == "conda" {
+			t.Fatalf("a manifest of an unknown type reached the payload: %s", out)
+		}
+	}
+	if !strings.Contains(errOut, "WARN skipped (conda, numpy)") {
+		t.Errorf("the skip does not name (type, pkg_name): %s", errOut)
+	}
+	if !strings.Contains(errOut, "failed manifest validation") {
+		t.Errorf("summary does not count the validation failure: %s", errOut)
+	}
+}
+
+// Reading is all this command does. A generator that also pruned would turn a
+// reviewable dump into an unrepeatable one.
+func TestGenerateManifestsLeavesDiscoveryRowsAlone(t *testing.T) {
+	env := newDiscoverEnv(t)
+	env.seedDiscovery(t, gomodMiss(), npmMiss(), gitMiss())
+	before := env.discoveryRowCount(t)
+
+	if _, _, err := runDiscoverSplit(t, "generate-manifests", "--min-requests", "99"); err != nil {
+		t.Fatalf("generate-manifests: %v", err)
+	}
+	if after := env.discoveryRowCount(t); after != before {
+		t.Fatalf("discovery rows changed from %d to %d", before, after)
+	}
+}
+
+// Issue #142: go resolves an unknown module through /@v/list and /@v/@latest,
+// neither of which carries a version, and gomod composes the version into the
+// fetch URL. The versioned rows for the same module still generate.
+func TestGenerateManifestsDropsVersionlessGomodRows(t *testing.T) {
+	env := newDiscoverEnv(t)
+	listRow := gomodMiss()
+	listRow.PkgVersion = ""
+	listRow.UpstreamURL = "https://proxy.golang.org/github.com/aws/aws-sdk-go-v2/@v/list"
+	env.seedDiscovery(t, listRow, gomodMiss())
+
+	out, errOut, err := runDiscoverSplit(t, "generate-manifests", "gomod")
+	if err != nil {
+		t.Fatalf("generate-manifests gomod: %v", err)
+	}
+	pms := decodeGenerated(t, out)
+	if len(pms) != 1 {
+		t.Fatalf("got %d manifest(s), want 1: %s", len(pms), out)
+	}
+	if len(pms[0].Versions) != 1 || pms[0].Versions[0].Version != "v1.30.0" {
+		t.Fatalf("versionless row reached the payload: %+v", pms[0].Versions)
+	}
+	if !strings.Contains(errOut, "versionless observation") {
+		t.Errorf("the dropped row is not reported: %s", errOut)
+	}
+}
+
+// no_namespace rows name a namespace nothing is configured for, which is a
+// config fix rather than a manifest. The operator gets told which, not an
+// empty file with no explanation.
+func TestGenerateManifestsReportsRowsItCannotUse(t *testing.T) {
+	env := newDiscoverEnv(t)
+	env.seedDiscovery(t,
+		audit.DiscoveryRow{
+			RegistryType: manifest.TypeGit,
+			PatternHint:  "internal",
+			PkgName:      "internal",
+			Decision:     audit.DecisionNoNamespace,
+			LastClient:   "10.0.0.5",
+		},
+		audit.DiscoveryRow{
+			RegistryType: manifest.TypeNpm,
+			Host:         "registry.npmjs.org",
+			PatternHint:  "lodash",
+			PkgName:      "lodash",
+			PkgVersion:   "4.17.21",
+			Decision:     audit.DecisionNoPolicy,
+			UpstreamURL:  "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+			LastClient:   "10.0.0.6",
+		},
+	)
+
+	out, errOut, err := runDiscoverSplit(t, "generate-manifests")
+	if err != nil {
+		t.Fatalf("generate-manifests: %v", err)
+	}
+	if pms := decodeGenerated(t, out); len(pms) != 0 {
+		t.Fatalf("got %d manifest(s) from rows that are not catalog misses: %s", len(pms), out)
+	}
+	for _, want := range []string{audit.DecisionNoNamespace, "not catalog misses"} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("summary does not mention %q: %s", want, errOut)
+		}
 	}
 }
