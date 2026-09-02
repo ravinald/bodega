@@ -33,8 +33,11 @@ func TestDefaultConfigContent(t *testing.T) {
 		"trusted_proxies": nil,
 		"tls_min_version": DefaultTLSMinVersion,
 		// Empty rather than a worked example: a namespace shipped in every
-		// generated config is a namespace every install serves.
-		"git_upstreams": map[string]any{},
+		// generated config is a namespace every install serves. For
+		// binary_upstreams an empty map is also what keeps the un-namespaced
+		// /binaries/ route serving from storage.
+		"git_upstreams":    map[string]any{},
+		"binary_upstreams": map[string]any{},
 	}
 	for k, v := range want {
 		if _, ok := got[k]; !ok {

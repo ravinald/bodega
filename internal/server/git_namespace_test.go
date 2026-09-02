@@ -69,7 +69,7 @@ func waitForNoNamespace(t *testing.T, s *Server) []audit.DiscoveryRow {
 func TestGitNamespaceRecordsNoNamespace(t *testing.T) {
 	s := newDiscoveryServer(t)
 	s.cfg.GitUpstreams = map[string]config.GitUpstream{
-		"corp": {URL: "https://git.corp.example/", Mode: config.GitModeCatalog},
+		"corp": {URL: "https://git.corp.example/", Mode: config.UpstreamModeCatalog},
 	}
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
@@ -102,7 +102,7 @@ func TestGitNamespaceRecordsNoNamespace(t *testing.T) {
 func TestGitNamespaceConfiguredRecordsNothing(t *testing.T) {
 	s := newDiscoveryServer(t)
 	s.cfg.GitUpstreams = map[string]config.GitUpstream{
-		"corp": {URL: "https://git.corp.example/", Mode: config.GitModeOpen},
+		"corp": {URL: "https://git.corp.example/", Mode: config.UpstreamModeOpen},
 	}
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)

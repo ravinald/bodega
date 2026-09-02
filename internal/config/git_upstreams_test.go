@@ -29,12 +29,12 @@ func TestLoad_GitUpstreamsDefaultsToCatalog(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 	for _, ns := range []string{"absent", "empty"} {
-		if got := cfg.GitUpstreams[ns].Mode; got != config.GitModeCatalog {
-			t.Errorf("git_upstreams[%q].Mode = %q, want %q — an unwritten mode must not resolve to the posture that fetches anything asked for", ns, got, config.GitModeCatalog)
+		if got := cfg.GitUpstreams[ns].Mode; got != config.UpstreamModeCatalog {
+			t.Errorf("git_upstreams[%q].Mode = %q, want %q — an unwritten mode must not resolve to the posture that fetches anything asked for", ns, got, config.UpstreamModeCatalog)
 		}
 	}
-	if got := cfg.GitUpstreams["explicit"].Mode; got != config.GitModeOpen {
-		t.Errorf("git_upstreams[\"explicit\"].Mode = %q, want %q", got, config.GitModeOpen)
+	if got := cfg.GitUpstreams["explicit"].Mode; got != config.UpstreamModeOpen {
+		t.Errorf("git_upstreams[\"explicit\"].Mode = %q, want %q", got, config.UpstreamModeOpen)
 	}
 	if got := cfg.GitUpstreams["explicit"].URL; got != "https://git.corp.example/" {
 		t.Errorf("git_upstreams[\"explicit\"].URL = %q, want the configured URL", got)
@@ -85,8 +85,8 @@ func TestGitUpstreamsRoundTrip(t *testing.T) {
 	t.Setenv(config.EnvConfigFile, path)
 
 	want := map[string]config.GitUpstream{
-		"corp":   {URL: "https://git.corp.example/", Mode: config.GitModeOpen},
-		"github": {URL: "https://github.com/", Mode: config.GitModeCatalog},
+		"corp":   {URL: "https://git.corp.example/", Mode: config.UpstreamModeOpen},
+		"github": {URL: "https://github.com/", Mode: config.UpstreamModeCatalog},
 	}
 	cfg := &config.Config{GitUpstreams: want}
 	if _, err := cfg.Save(); err != nil {
