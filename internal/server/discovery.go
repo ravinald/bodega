@@ -59,7 +59,7 @@ func (r *DiscoveryRecorder) Record(row audit.DiscoveryRow) {
 	if r == nil {
 		return
 	}
-	if row.Decision == "would_deny" {
+	if row.Decision == audit.DecisionWouldDeny {
 		r.bypassed.Add(1)
 	}
 	select {
@@ -140,20 +140,20 @@ func (r *DiscoveryRecorder) write(ctx context.Context, row audit.DiscoveryRow) {
 func classifyDecision(hasRules, violation bool, mode string) string {
 	switch {
 	case !hasRules:
-		return "no_policy"
+		return audit.DecisionNoPolicy
 	case !violation:
-		return "allowed"
+		return audit.DecisionAllowed
 	case mode == "learn":
-		return "would_deny"
+		return audit.DecisionWouldDeny
 	default:
-		return "denied"
+		return audit.DecisionDenied
 	}
 }
 
 // recordDiscovery composes a DiscoveryRow from the proxy hook's locals and
 // hands it to the recorder. No-op when discover_mode is off or the recorder
 // is nil. Synchronous-but-cheap: the recorder is channel-based.
-func (s *Server) recordDiscovery(_ context.Context, r *http.Request, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, decision string) {
+func (s *Server) recordDiscovery(ctx context.Context, r *http.Request, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, decision string) {
 	if s.discovery == nil || s.discoverMode == "" {
 		return
 	}
@@ -175,16 +175,57 @@ func (s *Server) recordDiscovery(_ context.Context, r *http.Request, regType, up
 		hint = policyCandidate
 	}
 
+	s.recordDiscoveryRaw(ctx, r, regType, host, hint, pkgName, pkgVersionFromKey(s3Key), decision, upstreamURL)
+}
+
+// recordDiscoveryRaw enqueues an observation from a caller that already knows
+// every column. Handlers that decide before proxyOrCache hold no s3Key and no
+// policy candidate, so they cannot reach recordDiscovery; routing them through
+// one constructor keeps the pre-cache and post-cache paths writing the same
+// row shape.
+//
+// It applies the same nil-recorder and empty-mode guard recordDiscovery does,
+// and hands off to the same channel: a synchronous SQLite write on the miss
+// path would put the request hot path behind the database.
+func (s *Server) recordDiscoveryRaw(_ context.Context, r *http.Request, regType, host, hint, pkgName, pkgVersion, decision, upstreamURL string) {
+	if s.discovery == nil || s.discoverMode == "" {
+		return
+	}
 	s.discovery.Record(audit.DiscoveryRow{
 		RegistryType: regType,
 		Host:         host,
 		PatternHint:  hint,
 		PkgName:      pkgName,
-		PkgVersion:   pkgVersionFromKey(s3Key),
+		PkgVersion:   pkgVersion,
 		Decision:     decision,
 		UpstreamURL:  upstreamURL,
 		LastClient:   ClientIP(r),
 	})
+}
+
+// recordNoManifest logs a request for a package with no manifest entry, from
+// the handler branch that 404s it. host and pattern_hint are derived from the
+// upstream URL the handler would have used, so the row a promote reads back
+// carries a fetchable URL rather than the request path.
+//
+// It fires only where the manifest lookup returned nothing. A package that has
+// an entry in some mode other than proxy reaches the same 404, but recording
+// it here would tell an operator to create an entry that already exists; the
+// fix for that package is to edit its mode, which is a different report and is
+// already answerable from `bodega show pkg`.
+func (s *Server) recordNoManifest(ctx context.Context, r *http.Request, regType, pkgName, pkgVersion, upstreamURL string) {
+	if s.discovery == nil || s.discoverMode == "" {
+		return
+	}
+	var host, fullPath string
+	hint := pkgName
+	if upstreamURL != "" {
+		host, fullPath = splitUpstreamURL(upstreamURL)
+		if suggested := policy.SuggestPattern(regType, host, fullPath, pkgName); suggested != "" {
+			hint = suggested
+		}
+	}
+	s.recordDiscoveryRaw(ctx, r, regType, host, hint, pkgName, pkgVersion, audit.DecisionNoManifest, upstreamURL)
 }
 
 // splitUpstreamURL returns (host, path) for an upstream URL, tolerating

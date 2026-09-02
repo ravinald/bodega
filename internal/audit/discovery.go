@@ -8,6 +8,21 @@ import (
 	"time"
 )
 
+// Decision values recorded on a DiscoveryRow. The first four come from the
+// policy check inside proxyOrCache; the last two come from handlers that
+// decide before it, where no upstream fetch was ever attempted.
+//
+// The set is constrained by a CHECK on upstream_discovery — a value added here
+// needs a migration widening that constraint or every write of it fails.
+const (
+	DecisionAllowed     = "allowed"
+	DecisionDenied      = "denied"
+	DecisionWouldDeny   = "would_deny"
+	DecisionNoPolicy    = "no_policy"
+	DecisionNoManifest  = "no_manifest"  // request named a package with no manifest entry
+	DecisionNoNamespace = "no_namespace" // request named a namespace no upstream is configured for
+)
+
 // DiscoveryRow is one upstream-fetch observation. Rows are deduplicated at
 // insert time on (registry_type, pattern_hint, pkg_name, pkg_version, decision)
 // — repeat requests bump request_count and update last_seen / last_client.
@@ -17,7 +32,7 @@ type DiscoveryRow struct {
 	PatternHint  string // suggested promotion pattern (policy.SuggestPattern)
 	PkgName      string
 	PkgVersion   string
-	Decision     string // allowed | denied | would_deny | no_policy
+	Decision     string // one of the Decision* constants above
 	UpstreamURL  string // full upstream URL bodega fetched (or would have); empty on rows recorded before migration 007
 	FirstSeen    time.Time
 	LastSeen     time.Time

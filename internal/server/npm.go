@@ -50,10 +50,13 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		upstream := s.cfg.NpmUpstream + "/" + pkgName + "/-/" + tarball
 		if pm != nil && packageMode(pm) == manifest.ModeProxy {
-			upstream := s.cfg.NpmUpstream + "/" + pkgName + "/-/" + tarball
 			s.proxyOrCache(w, r, s.typeStore(manifest.TypeNpm), storageKey, upstream, manifest.TypeNpm, pkgName, pkgName, true, true)
 			return
+		}
+		if pm == nil {
+			s.recordNoManifest(ctx, r, manifest.TypeNpm, pkgName, reqVersion, upstream)
 		}
 		s.proxyVersion(w, r, manifest.TypeNpm, pkgName, reqVersion, storageKey)
 		return

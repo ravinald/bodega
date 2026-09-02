@@ -49,6 +49,9 @@ func (s *Server) handleGomod(w http.ResponseWriter, r *http.Request) {
 		s.proxyOrCache(w, r, s.typeStore(manifest.TypeGomod), s3Key, upstream, manifest.TypeGomod, module, module, immutable, true)
 		return
 	}
+	if pm == nil {
+		s.recordNoManifest(ctx, r, manifest.TypeGomod, module, gomodVersionFromFile(file), upstream)
+	}
 	s.proxyVersion(w, r, manifest.TypeGomod, module, gomodVersionFromFile(file), s3Key)
 }
 
