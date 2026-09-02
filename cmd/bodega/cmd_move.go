@@ -204,10 +204,7 @@ func selectForMove(stores storage.Resolver, dst storage.ObjectStore, pm *manifes
 			pm.Type, pm.Name, strings.Join(frozen, ", "), pm.Type, pm.Name)
 	}
 	if collision != "" {
-		return nil, fmt.Errorf("%s/%s: backends %q and %q are the same location (%s) — "+
-			"every object would be copied onto itself, and --delete-source would then remove the only copy. "+
-			"Name a different --to, or drop the duplicate entry from storage_backends",
-			pm.Type, pm.Name, collision, dstName, dst.Label())
+		return nil, fmt.Errorf("%s/%s: %w", pm.Type, pm.Name, sameLocationError(collision, dstName, dst.Label()))
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("%s/%s: version(s) %s are already recorded on %q — nothing to move",
@@ -217,6 +214,21 @@ func selectForMove(stores storage.Resolver, dst storage.ObjectStore, pm *manifes
 		fmt.Printf("  %s@%s: already on %q, skipping\n", pm.Name, v, dstName)
 	}
 	return out, nil
+}
+
+// sameLocationError refuses a move whose two backend names are one place.
+//
+// Both names are in the message because the configuration is deliberate —
+// staging a migration through a second name for one bucket is documented — so
+// the operator needs to know which half to repoint, not to be told the setup
+// is wrong. The location is the Label both resolve to, which is what makes the
+// pair identifiable in a config file where the two entries need not be spelled
+// alike.
+func sameLocationError(srcName, dstName, location string) error {
+	return fmt.Errorf("backends %q and %q are the same location (%s) — "+
+		"every object would be copied onto itself, and --delete-source would then remove the only copy. "+
+		"Name a different --to, or point one of the two at another path or bucket",
+		srcName, dstName, location)
 }
 
 // mover carries the state one move needs. Split out of the cobra closure so
@@ -240,6 +252,14 @@ func (m *mover) moveVersion(ctx context.Context, pm *manifest.PackageManifest, i
 	src, err := m.stores.ByName(ve.Storage)
 	if err != nil {
 		return fmt.Errorf("%s: %w", label, err)
+	}
+	// selectForMove refuses this for the whole command before anything is
+	// copied. The check is repeated here because this is the function that
+	// destroys the artifact: a caller assembling a mover without going through
+	// selection would copy every object onto itself, verify what it overwrote,
+	// and then delete the only copy.
+	if src.Label() == m.dst.Label() {
+		return fmt.Errorf("%s: %w", label, sameLocationError(srcName, m.dstName, m.dst.Label()))
 	}
 
 	keys, err := inventory.ArtifactKeys(ctx, src, pm, ve)

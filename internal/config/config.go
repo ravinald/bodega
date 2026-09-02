@@ -356,6 +356,16 @@ func (c *Config) ValidateTLSPair() error {
 // would use it: discovered mid-upload it has already decided where an artifact
 // went, and a name recorded against a backend nobody defined cannot be read
 // back.
+//
+// Two entries resolving to one bucket or directory is deliberately neither
+// rejected nor warned about. It is a supported way to stage a migration, and
+// the identity that decides sameness is ObjectStore.Label(), which exists only
+// once a driver has normalized its spec: comparing the configured strings here
+// would miss a symlink, a trailing slash or a relative path, and fire on a path
+// two different drivers happen to share. A second, weaker definition of "same
+// location" that disagrees with the one the move path enforces is worse than
+// none, and 'bodega pkg move' is the only command the collision can destroy
+// anything through.
 func (c *Config) validateStorage() error {
 	drivers := StorageDrivers()
 	isDriver := make(map[string]bool, len(drivers))
