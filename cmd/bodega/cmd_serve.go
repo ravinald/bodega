@@ -71,11 +71,23 @@ sees a loopback listener with no TLS and cannot derive the URL an operator
 would copy, so it prints a placeholder instead of guessing.
   --public-url flag > $BODEGA_PUBLIC_URL > config.json "public_url"
 
+On a filesystem backend serve checks manifest_dir before binding. An absent
+directory is created, so a fresh install comes up with an empty repository and
+apt update succeeds. One that cannot be created or opened stops the start: a
+server that publishes an empty Release over a manifest root nothing can read is
+indistinguishable from a healthy one that holds no packages.
+
 Use --quiet to suppress the startup banner for scripted use; log-level
 output continues to respect log_level in the config.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig(gf)
 			if err != nil {
+				return err
+			}
+			// Before anything opens a socket: a server that starts over an
+			// unreadable manifest root publishes an empty repository and looks
+			// healthy doing it.
+			if err := ensureManifestRoot(cfg); err != nil {
 				return err
 			}
 			// Clean up stale PID file from a previous server instance.
@@ -90,11 +102,13 @@ output continues to respect log_level in the config.`,
 			handler := logging.NewHandler(os.Stderr, level)
 			logger := slog.New(handler)
 
-			// An empty index is indistinguishable from a healthy repository
-			// from the outside: the unit reaches active (running), /healthz
-			// answers 200, and dists/<suite>/Release lists the SHA-256 of the
-			// empty string for Packages. Error, not Warn, because the shipped
-			// default log_level prints only Error.
+			// A repository with no packages is legal and serves a valid
+			// Release whose Packages digest is the SHA-256 of the empty
+			// string. So does one whose manifest root is missing, and from
+			// the outside the two are the same bytes. ensureManifestRoot has
+			// already refused the second case, which leaves this log meaning
+			// only "nothing imported yet". Error, not Warn, because the
+			// shipped default log_level prints only Error.
 			if totalPackages(store) == 0 {
 				logger.Error("no packages loaded — every repository index will publish as empty",
 					"manifests", store.Label(), "config", config.ConfigPath())

@@ -427,6 +427,7 @@ Key fields:
 | `storage_policy` | (per package) | Manifest field overriding `storage_by_type` for one package |
 | `region` | us-west-2 | AWS region |
 | `build_root` | /opt/bodega | Where artifacts are built locally |
+| `manifest_dir` | {storage_path}/manifests | Where manifests live on a filesystem backend. Always absolute: a relative value under a unit with no `WorkingDirectory=` resolves against `/`. `bodega serve` creates it when absent and refuses to start when it cannot |
 | `proxy_cache_enabled` | false | Global proxy/cache toggle |
 | `metadata_ttl` | 1h | How long mutable proxy resources are cached |
 | `deny_list` | [] | CIDR entries to block. **Bootstrap only**: copied into the audit DB on first start, then owned by `bodega acl deny` |
@@ -442,6 +443,12 @@ Key fields:
 | `binary_upstreams` | {} | Namespaces under `/binaries/` mapped onto an upstream download host, each in `open` or `catalog` mode. While empty, `/binaries/` serves from storage as before |
 
 The TUI config editor (`C` key in `bodega shell`) writes to the same file.
+
+### The empty repository
+
+A repository with no packages is legal. `bodega serve` starts, `/healthz` answers 200, and `dists/<suite>/Release` carries `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 main/binary-amd64/Packages`, the SHA-256 of the empty string. That is the correct answer on a fresh install with nothing imported yet, and it lets `apt update` succeed before the first package lands.
+
+A broken install produces the same bytes: a `manifest_dir` nothing can read lists zero packages, which is indistinguishable from a repository that holds none. `bodega serve` separates the two before it opens a socket. An absent root is created; one that cannot be created, opened, or is a file rather than a directory refuses the start, naming the path and the config file it came from. So an empty `Release` means "nothing imported yet" and nothing else, and the `no packages loaded` line at `log_level` 0 marks it in the journal.
 
 ### Git upstreams
 
