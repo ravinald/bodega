@@ -419,8 +419,33 @@ Key fields:
 | `tls_autocert` / `tls_domain` | (none) | Let's Encrypt. Accepted and refused at startup; see [#113](https://github.com/ravinald/bodega/issues/113) |
 | `allow_plaintext` | false | Authorizes an unencrypted listener. With no cert pair `bodega serve` refuses to bind without it, and refuses on `:443` naming the port |
 | `audit_db` | {log_dir}/audit.db | Audit database path |
+| `git_upstreams` | {} | Namespaces under `/git/` mapped onto an upstream forge, each in `open` or `catalog` mode |
 
 The TUI config editor (`C` key in `bodega shell`) writes to the same file.
+
+### Git upstreams
+
+`git_upstreams` maps a namespace under `/git/` onto an upstream forge, because one flat key cannot express two forges at once and a corporate GitLab and github.com are the same protocol under different trust:
+
+```json
+"git_upstreams": {
+  "internal": { "url": "https://git.corp.example/", "mode": "open" },
+  "github":   { "url": "https://github.com/",       "mode": "catalog" }
+}
+```
+
+The key becomes a URL segment and a directory name, so it matches `^[a-zA-Z][a-zA-Z0-9_-]*$` and may not take a name bodega already serves or stores under (`api`, `apt`, `repos`, `pool` and the rest). The URL must be `https`, name a host, and end in `/`. A malformed entry stops the load and the error names the namespace; nothing is silently corrected to a default.
+
+Mode decides what happens when a client asks for something no manifest entry names:
+
+- `catalog`, the default when mode is absent or empty, resolves only paths an existing manifest entry covers. Everything else gets a 404 and a `no_manifest` discovery row to promote later. This is the posture for a public forge.
+- `open` composes the upstream URL for any path under the namespace and fetches it. On a public forge that means any client which can reach bodega can make bodega fetch arbitrary upstream repositories. Pick it for a forge whose publishing is already controlled, and read that sentence before you do.
+
+A request under `/git/` naming a namespace no entry covers gets a 404 and a `no_namespace` discovery row, which is how an operator finds the key they have not added yet.
+
+**Not implemented yet:** composing the upstream URL and fetching through it. A configured namespace currently answers 404 and records nothing, whichever mode it names. What is in place is the config shape, its validation, and the `no_namespace` row for a namespace nobody configured. The bundle route `/git/{name}/{file}` is unaffected and still serves uploaded bundles from storage.
+
+Only public, unauthenticated upstreams are supported. No credential is read from the config file or the environment, so a private forge answers bodega as an anonymous client: the operator sees a 404, not an auth error. Credential handling is a follow-on.
 
 ## TUI
 

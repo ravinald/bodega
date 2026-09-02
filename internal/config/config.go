@@ -12,8 +12,10 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -142,8 +144,122 @@ type Config struct {
 	// already written lives: that is the name recorded on the version entry.
 	StorageByType map[string]string `json:"storage_by_type,omitempty"`
 
+	// GitUpstreams maps a namespace under /git/ onto an upstream forge. It
+	// exists because one flat gomod_upstream-style key cannot express two
+	// forges at once, and a corporate GitLab and github.com are the same
+	// protocol under different trust: one is bounded by who can publish to
+	// it, the other is the whole public internet.
+	GitUpstreams map[string]GitUpstream `json:"git_upstreams,omitempty"`
+
 	LocalConfig bool `json:"-"`
 	Verbose     bool `json:"-"`
+}
+
+// Git upstream modes. An absent or empty mode loads as GitModeCatalog: an
+// operator who adds a namespace without reading the docs gets the posture that
+// cannot be induced into fetching upstream code nobody cataloged.
+const (
+	// GitModeOpen composes the upstream URL for any path under the namespace
+	// and fetches it. On a public forge that means any client which can reach
+	// bodega can make bodega fetch arbitrary upstream repositories. That is a
+	// deliberate posture for an internal forge, where publishing is already
+	// controlled, and a way to be used as an open proxy anywhere else.
+	GitModeOpen = "open"
+
+	// GitModeCatalog resolves only paths a manifest entry already names.
+	// Everything else 404s and is recorded for an operator to promote.
+	GitModeCatalog = "catalog"
+)
+
+// GitUpstream is one namespace's upstream and trust posture.
+//
+// Only public, unauthenticated upstreams are supported. Nothing here carries a
+// credential and nothing reads one from the environment, so a private forge
+// answers bodega the way it answers any anonymous client: the fetch fails and
+// the client sees a 404.
+type GitUpstream struct {
+	URL  string `json:"url"`            // upstream base, https, ends in "/"
+	Mode string `json:"mode,omitempty"` // GitModeOpen or GitModeCatalog; empty means catalog
+}
+
+// gitNamespacePattern is what a namespace key may look like. The key is both a
+// URL segment under /git/ and a directory name in the storage layout, so it
+// carries no slash, no dot and no leading digit.
+var gitNamespacePattern = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_-]*$`)
+
+// reservedPathElements are the names a namespace key may not take, each with
+// the reason it is spoken for. A key that shadows a route makes bodega answer
+// its own URL with an upstream fetch; one that shadows a storage element
+// writes into a tree something else owns.
+//
+// The route half is enumerated from (*Server).registerRoutes in
+// internal/server/server.go, the storage half from the key prefixes in
+// internal/manifest/keys.go. This package sits below both and cannot import
+// either, so the list is maintained by hand against those two files.
+var reservedPathElements = map[string]string{
+	"api":       "served route",
+	"apt":       "served route and apt storage element",
+	"binaries":  "served route and binary storage root",
+	"cargo":     "served route and cargo storage root",
+	"git":       "served route",
+	"go":        "served route",
+	"healthz":   "served route",
+	"helm":      "served route",
+	"npm":       "served route and npm storage root",
+	"pypi":      "served route and pypi storage root",
+	"charts":    "helm storage root",
+	"crates":    "cargo crate storage element",
+	"dists":     "generated apt index element",
+	"gomod":     "gomod storage root",
+	"index":     "cargo index storage element",
+	"manifests": "manifest directory",
+	"packages":  "apt storage root",
+	"pool":      "apt pool storage element",
+	"repos":     "git bundle storage root",
+	"wheels":    "pypi wheel storage element",
+}
+
+// validateGitUpstreams refuses a malformed git_upstreams block and fills in the
+// default mode on the loaded struct.
+//
+// The default lands here rather than in the handler that reads Mode, because
+// the handlers are plural: the git proxy, the binary proxy that lifts this
+// shape and anything that renders the config all have to agree on what an
+// empty mode means, and a default that lives in one `if` is a default the next
+// reader does not share.
+func (c *Config) validateGitUpstreams() error {
+	for ns, gu := range c.GitUpstreams {
+		switch {
+		case !gitNamespacePattern.MatchString(ns):
+			return fmt.Errorf("invalid git_upstreams key %q: must match %s — the key becomes a URL segment under /git/ and a directory name", ns, gitNamespacePattern)
+		case reservedPathElements[ns] != "":
+			return fmt.Errorf("invalid git_upstreams key %q: %s — pick a name bodega does not already serve or store under", ns, reservedPathElements[ns])
+		}
+
+		u, err := url.Parse(gu.URL)
+		switch {
+		case gu.URL == "":
+			return fmt.Errorf("git_upstreams[%q]: url is required (e.g. \"https://github.com/\")", ns)
+		case err != nil:
+			return fmt.Errorf("git_upstreams[%q]: url %q does not parse: %v", ns, gu.URL, err)
+		case u.Scheme != "https":
+			return fmt.Errorf("git_upstreams[%q]: url %q must use the https scheme", ns, gu.URL)
+		case u.Host == "":
+			return fmt.Errorf("git_upstreams[%q]: url %q names no host", ns, gu.URL)
+		case !strings.HasSuffix(gu.URL, "/"):
+			return fmt.Errorf("git_upstreams[%q]: url %q must end in \"/\" — the request path is appended to it", ns, gu.URL)
+		}
+
+		switch gu.Mode {
+		case "":
+			gu.Mode = GitModeCatalog
+			c.GitUpstreams[ns] = gu
+		case GitModeOpen, GitModeCatalog:
+		default:
+			return fmt.Errorf("git_upstreams[%q]: invalid mode %q (want %q or %q; empty means %q)", ns, gu.Mode, GitModeOpen, GitModeCatalog, GitModeCatalog)
+		}
+	}
+	return nil
 }
 
 // DefaultStorageName is the reserved name of the backend defined by
@@ -309,6 +425,10 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	cfg.AptSuites = suites
 
 	if err := cfg.validateStorage(); err != nil {
+		return nil, err
+	}
+
+	if err := cfg.validateGitUpstreams(); err != nil {
 		return nil, err
 	}
 
@@ -585,6 +705,11 @@ func defaultConfigContent() []byte {
   "gomod_upstream": "https://proxy.golang.org",
   "npm_upstream": "https://registry.npmjs.org",
   "cargo_upstream": "https://index.crates.io",
+
+  "_comment_git_upstreams": "git_upstreams: maps a namespace under /git/ onto an upstream forge, e.g. {\"internal\": {\"url\": \"https://git.corp.example/\", \"mode\": \"open\"}}. The key is a URL segment and a directory name: letters, digits, _ and -, starting with a letter. The url must be https and end in \"/\".",
+  "_comment_git_upstreams_mode": "mode is \"catalog\" (default when absent or empty) or \"open\". catalog resolves only paths an existing manifest entry names; anything else 404s and is recorded as no_manifest for 'bodega discover promote'. open composes the upstream URL for any path under the namespace and fetches it, so on a public forge any client that can reach bodega can make bodega fetch arbitrary upstream repositories. Pick open for a forge whose publishing is already controlled.",
+  "_comment_git_upstreams_auth": "Only public, unauthenticated upstreams are supported. No credential is read from this file or the environment, so a private forge answers bodega as an anonymous client and the request surfaces as a 404.",
+  "git_upstreams": {},
 
   "_comment_discover": "Discover mode: \"\" off, \"observe\" log + still enforce policy, \"learn\" log + bypass policy (loud WARN). See bodega discover --help.",
   "discover_mode": "",

@@ -32,6 +32,9 @@ func TestDefaultConfigContent(t *testing.T) {
 		// trusting no proxy at all.
 		"trusted_proxies": nil,
 		"tls_min_version": DefaultTLSMinVersion,
+		// Empty rather than a worked example: a namespace shipped in every
+		// generated config is a namespace every install serves.
+		"git_upstreams": map[string]any{},
 	}
 	for k, v := range want {
 		if _, ok := got[k]; !ok {

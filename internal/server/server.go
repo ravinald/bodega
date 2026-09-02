@@ -557,8 +557,11 @@ func (s *Server) registerRoutes() {
 	// PyPI wheels (path... to support versioned subdirs like pypi/wheels/0.4.6/foo.whl)
 	m.HandleFunc("GET /pypi/wheels/{path...}", s.handlePypiWheel)
 
-	// Git bundles
+	// Git bundles, and the namespaced upstream form. The bundle pattern is
+	// the more specific of the two, so it keeps every path it already served;
+	// {path...} takes the deeper paths a forge URL carries.
 	m.HandleFunc("GET /git/{name}/{file}", s.handleGitBundle)
+	m.HandleFunc("GET /git/{namespace}/{path...}", s.handleGitNamespace)
 
 	// Binary downloads
 	m.HandleFunc("GET /binaries/{path...}", s.handleBinary)
