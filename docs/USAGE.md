@@ -232,6 +232,80 @@ The JSON format is the same `PackageManifest` used internally:
 
 Without `--merge`, importing a package that already exists is an error. With `--merge`, new versions are added to the existing package.
 
+#### Importing to a remote server
+
+`--server` sends the manifests to a running bodega instead of writing the local manifest store. That is how a host catalogs itself: the package manager runs on the host and bodega usually does not, so the remote path opens no manifest directory, no bucket and no audit database.
+
+```bash
+bodega pkg import --server https://bodega.example catalog.json
+BODEGA_SERVER=https://bodega.example bodega pkg import catalog.json
+```
+
+The server URL resolves through the usual chain: `--server`, then `$BODEGA_SERVER`, then `server_url` in the config file. The bearer token comes from `$BODEGA_TOKEN`, then `token` in the config file, so a token never has to be written to disk on the host being cataloged.
+
+Plaintext `http` is refused. A bearer token on an unencrypted link is readable by anything on the path, so the combination fails rather than warning; `--allow-plaintext` is the deliberate override for a trusted link.
+
+A remote import lands package by package and reports each one. Anything already present, refused by policy, or malformed is named on stderr and the rest still land: one clashing package in a 635-package host catalog must not discard the other 634. The command fails only when nothing landed at all.
+
+### `bodega pkg convert <type> [file|-]`
+
+Converts a package manager's own report of what is installed into bodega manifests, on stdout.
+
+Run it on the host being cataloged. It reads stdin by default, writes JSON to stdout, and touches no manifest store, so the output can be read, diffed and edited before anything reaches bodega. Feed it to `bodega pkg import` when it looks right.
+
+```bash
+dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\n' | bodega pkg convert apt > catalog.json
+apt list --installed | bodega pkg convert apt -o catalog.json
+pip list --format=json | bodega pkg convert pypi | bodega pkg import -
+```
+
+| Type | Source command |
+|------|----------------|
+| `apt` | `dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\n'`, or `apt list --installed` |
+| `pypi` | `pip list --format=json` |
+| `npm` | `npm ls --global --json --depth=0` |
+| `gomod` | `go list -m all`, or `go version -m <binary>` |
+| `cargo` | `cargo install --list` |
+| `helm` | `helm list -o json` |
+
+**`git` and `binary` have no importer.** Nothing on a host records a `git clone` or a downloaded binary, so there is no inventory to read. Catalog those with `bodega pkg create`, or run the server with `discover_mode` set to `"observe"` and promote what clients reach for.
+
+Prefer `dpkg-query` to `apt list --installed`: it is machine readable, it carries the package status, and apt itself warns that its CLI has no stable interface. Both are accepted.
+
+#### What convert does and does not resolve
+
+- **apt** entries carry the name, the version and `source_name`, and no URL. The build pipeline resolves them with `apt-get download`, against the bodega server's own sources.
+- **pypi, npm, gomod and cargo** entries carry a name and a version and import as `proxy`. The registry is already known from `pypi_upstream` and its siblings, so nothing else is needed. Flip an entry to `hosted` and run the pipeline to pre-fetch the artifact.
+- **helm** entries import with **no URL**. A helm release records the chart it came from (`nginx-18.2.4`) but not the repository, and bodega resolves helm upstreams per version. Fill the URLs in before importing, or resolve them with `helm search repo <chart> -o json`. Guessing a repository would put an unverified URL into a supply-chain catalog.
+- **cargo** crates installed from a git or path source are skipped: the registry has no such version to serve.
+- **Removed packages are skipped.** `dpkg-query -W` reports a package removed without `--purge` as `deinstall ok config-files`, and it looks installed in every other column. On one Ubuntu 22.04 server that is 139 of 774 rows, mostly superseded kernel images.
+
+Every skip and every gap is reported on stderr, so stdout stays a clean payload that pipes into `pkg import`.
+
+#### Cataloging a host end to end
+
+```bash
+# On the host being cataloged. Neither step needs a manifest store here.
+dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\n' \
+  | bodega pkg convert apt > catalog.json
+
+# Read it. This is the review step, and it is the point of the two commands.
+$EDITOR catalog.json
+
+# Push it.
+BODEGA_TOKEN=bodega_ak_... bodega pkg import --server https://bodega.example catalog.json
+```
+
+Re-running later against the same host adds whatever moved on:
+
+```bash
+dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\n' \
+  | bodega pkg convert apt \
+  | bodega pkg import --server https://bodega.example --merge -
+```
+
+`--merge` never overwrites a recorded version, so an entry someone promoted to `hosted` stays hosted.
+
 ### `bodega pkg export [type] [name]`
 
 Exports package manifests as JSON to stdout. Useful for backups, migrations, and inspecting manifest state.
@@ -1349,11 +1423,38 @@ All API responses are JSON. The full API is documented in [OpenAPI 3.0 format](.
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/api/v1/packages/{type}` | Create a new entry (JSON body) |
+| POST | `/api/v1/packages/import[?merge=true]` | Import many entries across types (JSON array or NDJSON body) |
 | DELETE | `/api/v1/packages/{type}/{name}` | Delete an entry |
 | PATCH | `/api/v1/packages/{type}/{name}/hide` | Toggle hidden (all versions) |
 | PATCH | `/api/v1/packages/{type}/{name}/hide/{version}` | Toggle hidden (specific version) |
 | PATCH | `/api/v1/packages/{type}/{name}/freeze` | Toggle frozen (all versions) |
 | PATCH | `/api/v1/packages/{type}/{name}/freeze/{version}` | Toggle frozen (specific version) |
+
+#### `POST /api/v1/packages/import`
+
+Takes a whole host's catalog in one request. `bodega pkg import --server` is the client for it.
+
+It is a separate route from `POST /api/v1/packages/{type}` because the two want opposite semantics. A single create is all-or-nothing and answers 409 on a name clash; a bulk push is expected to land partially and has to say which packages did.
+
+- **Body**: a JSON array of `PackageManifest`, or one manifest per line (NDJSON). Both decode one manifest at a time, so a large catalog never lands in memory whole. Types may be mixed in one push.
+- **Size**: 64 MiB, against 1 MiB on the single-package route. A bare 2000-package catalog is only about 220 KB, but a `pkg export` of a populated store carries architecture, section, pool path and description per entry and clears 1 MiB well before it clears the package count.
+- **`?merge=true`**: adds versions to packages that already exist, matching `pkg import --merge`. A recorded version is never overwritten, which keeps a `hosted` entry from being downgraded to `proxy` by a re-import.
+- **Status**: `200` whenever the body parsed, including when every package was refused. `400` for a body that is not manifests, `413` over the size limit.
+
+```json
+{
+  "imported": 633,
+  "merged": 0,
+  "skipped": 2,
+  "results": [
+    {"type": "apt", "name": "curl", "outcome": "imported"},
+    {"type": "apt", "name": "bash", "outcome": "conflict", "reason": "package already exists (retry with merge=true to add versions)"},
+    {"type": "apt", "name": "blank", "outcome": "invalid", "reason": "apt/blank has a version entry with no version; give one, or \"*\" to resolve the current upstream"}
+  ]
+}
+```
+
+`outcome` is one of `imported`, `merged`, `conflict`, `invalid`, `policy_blocked` or `failed`. Every manifest passes the same allow-list, age and OSV checks as `bodega pkg import` and `POST /api/v1/packages/{type}`.
 
 ### Token endpoints
 

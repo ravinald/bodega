@@ -339,3 +339,15 @@ func looksLikeVersionTag(ref string) bool {
 	// Must start with a digit after the optional 'v' prefix.
 	return len(s) > 0 && s[0] >= '0' && s[0] <= '9'
 }
+
+// IsKnownType reports whether t names a package ecosystem bodega manages.
+// AllTypes is the single gate: a per-caller switch drifts, and the mutation
+// API's copy had already lost cargo.
+func IsKnownType(t string) bool {
+	for _, known := range AllTypes {
+		if t == known {
+			return true
+		}
+	}
+	return false
+}

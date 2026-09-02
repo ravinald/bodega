@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/storage"
@@ -198,20 +199,7 @@ func (p *placer) strandedAt(ctx context.Context, recorded, key string) (bool, er
 // nothing to reunite it — git and apt are served with no listing to fan out
 // over, and pypi has no per-version object key at all.
 func directoryPlaced(typ string) bool {
-	switch typ {
-	case manifest.TypeApt, manifest.TypeGit, manifest.TypePypi:
-		return true
-	}
-	return false
-}
-
-// noPerPackagePlacement says why one type cannot carry a per-package
-// placement, in whichever terms that type's operator will recognize.
-func noPerPackagePlacement(typ string) string {
-	if typ == manifest.TypePypi {
-		return "pypi wheels upload as a directory with no per-version object key"
-	}
-	return typ + " uploads whole directories with SyncDir, so one package cannot be placed apart from the rest of its type"
+	return admit.DirectoryPlaced(typ)
 }
 
 // writePlacement resolves the backend the write path will actually target.
@@ -234,12 +222,13 @@ func writePlacement(stores storage.Resolver, typ, policy string) storage.Decisio
 // consult. Recording an inert field without comment is how an operator comes
 // to believe a package has been placed when nothing about it moved.
 func storagePolicyWarning(typ, policy string) string {
-	if policy == "" || !directoryPlaced(typ) {
-		return ""
-	}
-	return fmt.Sprintf("warning: storage_policy %q has no effect for %s: %s. "+
-		"Set storage_by_type.%s to place the whole type; 'bodega pkg move' refuses %s for the same reason.",
-		policy, typ, noPerPackagePlacement(typ), typ, typ)
+	return admit.StoragePolicyWarning(typ, policy)
+}
+
+// noPerPackagePlacement says why one type cannot carry a per-package
+// placement, in whichever terms that type's operator will recognize.
+func noPerPackagePlacement(typ string) string {
+	return admit.NoPerPackagePlacement(typ)
 }
 
 // effectiveStorage applies the empty-means-default rule. It is the only place

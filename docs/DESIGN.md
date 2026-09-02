@@ -194,6 +194,25 @@ Every gomod, helm, and npm entry has a `mode` field:
 
 Apt, git, binary, and pypi are always hosted. They don't have natural upstream proxies that speak the right protocol at serve time.
 
+## Filling the catalog
+
+A manifest entry is what makes a package servable, so how entries get written is how a bodega install becomes useful. There are four ways, and they answer different questions.
+
+| Path | Answers | Use it when |
+|------|---------|-------------|
+| `bodega pkg create` | "add this one package" | You know what you want. Interactive, one entry at a time |
+| `bodega pkg convert` + `pkg import` | "what does this host already have" | Standing up a server for hosts that already exist |
+| `bodega discover promote` | "what did clients reach for that we could not serve" | A catalog is in place and something fell through it |
+| `POST /api/v1/packages...` | the same, from other tooling | Provisioning, CI, anything not a person at a terminal |
+
+`pkg convert` reads a package manager's own inventory on the host: `dpkg-query`, `pip list`, `npm ls`, `go list -m all`, `cargo install --list`, `helm list`. That answer is complete on the first run and needs no observation window, which is what distinguishes it from discovery. A host that has been stable for six months fetches nothing, so a proxy watching it learns nothing; the host's package database still knows everything it has.
+
+It also settles an ordering problem. Catalog mode returns 404 against an empty store, so a fleet pointed at a fresh bodega breaks until the catalog exists. Importing fills the catalog before any client is repointed.
+
+`git` and `binary` have no importer, because nothing on a host records a clone or a downloaded binary. Those two are what discovery still covers: run with `discover_mode` set to `"observe"`, let catalog mode record the misses as `no_manifest` and `no_namespace` rows, and promote them.
+
+Every path runs the same admission checks (`internal/admit`): structural validation, the upstream allow-list, then the age and OSV version checks. A manifest's fate does not depend on which surface it arrived through.
+
 ## Apt three-mode workflow
 
 Apt entries support three distinct workflows:

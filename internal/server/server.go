@@ -26,6 +26,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -610,6 +611,7 @@ func (s *Server) registerRoutes() {
 	m.HandleFunc("GET /api/v1/metrics", s.handleAPIMetrics)
 
 	// Mutation API
+	m.HandleFunc("POST /api/v1/packages/import", s.handleBulkImport)
 	m.HandleFunc("POST /api/v1/packages/{type}", s.handleCreateEntry)
 	m.HandleFunc("DELETE /api/v1/packages/{type}/{name}", s.handleDeleteEntry)
 	m.HandleFunc("PATCH /api/v1/packages/{type}/{name}/hide", s.handleToggleHidden)
@@ -883,124 +885,61 @@ func (s *Server) handleCreateEntry(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// All types accept a PackageManifest with at least one VersionEntry.
-	switch t {
-	case manifest.TypeApt, manifest.TypeGit, manifest.TypeBinary, manifest.TypeGomod,
-		manifest.TypeHelm, manifest.TypeNpm, manifest.TypePypi:
-		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MiB ceiling
-		var pm manifest.PackageManifest
-		if err := json.NewDecoder(r.Body).Decode(&pm); err != nil {
-			if err.Error() == "http: request body too large" {
-				writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request body too large"})
-				return
-			}
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
-			return
-		}
-		if pm.Name == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
-			return
-		}
-		// An apt entry with no version reaches no index and no verb: the
-		// index generator refuses to publish it, and delete, hide and freeze
-		// all address a version by name. Refuse the write rather than
-		// persisting something whose only exit is 'bodega repair'.
-		if t == manifest.TypeApt {
-			for _, ve := range pm.Versions {
-				if ve.Version == "" {
-					writeJSON(w, http.StatusBadRequest, map[string]string{
-						"error": `apt versions require a version; use "*" to resolve the current upstream`})
-					return
-				}
-			}
-		}
-		// Check for conflict.
-		existing, _ := s.store.GetPackage(ctx, t, pm.Name)
-		if existing != nil {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "package already exists"})
-			return
-		}
-		// Allow-list enforcement: reject upstream URLs/names that aren't in policy.
-		if s.policy != nil {
-			for _, ve := range pm.Versions {
-				candidate := policy.CandidateFor(t, pm.Name, ve.URL)
-				if candidate == "" {
-					continue
-				}
-				if err := s.policy.Check(ctx, t, candidate); err != nil {
-					if policy.IsViolation(err) {
-						s.logger.Warn("create rejected by policy",
-							"type", t, "name", pm.Name, "version", ve.Version, "candidate", candidate)
-						if s.auditDB != nil {
-							_ = s.auditDB.Record(ctx, audit.Event{
-								EventType:  audit.EventCreate,
-								PkgType:    t,
-								PkgName:    pm.Name,
-								PkgVersion: ve.Version,
-								Status:     "policy_violation",
-								Details:    fmt.Sprintf("candidate=%s", candidate),
-							})
-						}
-						writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
-						return
-					}
-					s.logger.Error("policy check failed", "error", err)
-					writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "policy check failed"})
-					return
-				}
-			}
-		}
-		// Version-level checks (age). Run separately from the URL allow-list
-		// above so a stale package is blocked even when its URL is on the
-		// allow-list.
-		if s.auditDB != nil {
-			checkers := []policy.VersionChecker{
-				policy.NewAgeChecker(s.auditDB),
-				policy.NewOSVChecker(s.auditDB),
-			}
-			for i := range pm.Versions {
-				ve := &pm.Versions[i]
-				combined := policy.RunChecks(ctx, &pm, ve, checkers...)
-				if details := combined.AuditDetails(); details != nil {
-					blob, _ := json.Marshal(details)
-					status := "policy_warn"
-					if combined.Blocked() {
-						status = "policy_violation"
-					}
-					_ = s.auditDB.Record(ctx, audit.Event{
-						EventType:  audit.EventCreate,
-						PkgType:    t,
-						PkgName:    pm.Name,
-						PkgVersion: ve.Version,
-						Status:     status,
-						Details:    string(blob),
-					})
-				}
-				if combined.Blocked() {
-					writeJSON(w, http.StatusForbidden, map[string]string{
-						"error": fmt.Sprintf("policy: %s", combined.Reasons()),
-					})
-					return
-				}
-			}
-		}
-
-		pm.Type = t
-		if err := s.store.SavePackage(ctx, &pm); err != nil {
-			s.logger.Error("save package failed", "type", t, "name", pm.Name, "error", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
-			return
-		}
-		if err := s.store.SaveIndex(ctx); err != nil {
-			s.logger.Error("save index failed", "error", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
-			return
-		}
-		s.rebuildAptIndexAfterWrite(ctx, t)
-		writeJSON(w, http.StatusCreated, &pm)
-	default:
+	if !manifest.IsKnownType(t) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": fmt.Sprintf("unknown type %q", t)})
+		return
 	}
+
+	// All types accept a PackageManifest with at least one VersionEntry.
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MiB ceiling
+	var pm manifest.PackageManifest
+	if err := json.NewDecoder(r.Body).Decode(&pm); err != nil {
+		if err.Error() == "http: request body too large" {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request body too large"})
+			return
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	pm.Type = t
+
+	// An HTTP caller is not the process owner, so the audit rows this writes
+	// carry no actor rather than the server's.
+	res := admit.Admit(ctx, s.policy, s.auditDB, s.cfg, &pm, "")
+	for _, warning := range res.Warnings {
+		s.logger.Warn("manifest accepted with a warning", "type", t, "name", pm.Name, "warning", warning)
+	}
+	switch res.Decision {
+	case admit.Invalid:
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": res.Reason})
+		return
+	case admit.PolicyBlocked:
+		s.logger.Warn("create rejected by policy", "type", t, "name", pm.Name, "reason", res.Reason)
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": res.Reason})
+		return
+	}
+
+	// Conflict is checked after admission so a manifest that is both refused
+	// and already present reports the refusal, which is the answer the caller
+	// can act on.
+	existing, _ := s.store.GetPackage(ctx, t, pm.Name)
+	if existing != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "package already exists"})
+		return
+	}
+
+	if err := s.store.SavePackage(ctx, &pm); err != nil {
+		s.logger.Error("save package failed", "type", t, "name", pm.Name, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if err := s.store.SaveIndex(ctx); err != nil {
+		s.logger.Error("save index failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	s.rebuildAptIndexAfterWrite(ctx, t)
+	writeJSON(w, http.StatusCreated, &pm)
 }
 
 func (s *Server) handleDeleteEntry(w http.ResponseWriter, r *http.Request) {

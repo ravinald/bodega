@@ -47,6 +47,8 @@ const (
 	EnvConfigFile  = "BODEGA_CONFIG_FILE"
 	EnvListenAddr  = "BODEGA_LISTEN_ADDR"
 	EnvPublicURL   = "BODEGA_PUBLIC_URL"
+	EnvServerURL   = "BODEGA_SERVER"
+	EnvToken       = "BODEGA_TOKEN"
 
 	SystemConfigDir  = "/etc/bodega"
 	SystemConfigFile = "/etc/bodega/config.json"
@@ -84,6 +86,8 @@ type Config struct {
 	TLSDomain         string   `json:"tls_domain,omitempty"`
 	ListenAddr        string   `json:"listen_addr,omitempty"` // see ResolveListenAddr for the full precedence chain
 	PublicURL         string   `json:"public_url,omitempty"`  // external base URL clients reach the server at; see ResolvePublicURL
+	ServerURL         string   `json:"server_url,omitempty"`  // bodega server this host pushes catalogs to; see ResolveServerURL
+	Token             string   `json:"token,omitempty"`       // bearer token for that server; $BODEGA_TOKEN wins
 	ProxyCacheEnabled bool     `json:"proxy_cache_enabled"`
 	MetadataTTL       string   `json:"metadata_ttl,omitempty"`
 	GomodUpstream     string   `json:"gomod_upstream,omitempty"`
@@ -911,4 +915,24 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// ResolveServerURL returns the bodega server a client pushes to, with no
+// trailing slash: --server, then $BODEGA_SERVER, then server_url in the config
+// file. Empty means no remote is configured and the caller works against the
+// local manifest store instead.
+//
+// It is separate from PublicURL because the two answer opposite questions.
+// PublicURL is what a server advertises about itself; this is what a host that
+// is not the server has been told to talk to, and on a host being cataloged
+// only the second one is set.
+func (c *Config) ResolveServerURL(flagURL string) string {
+	return strings.TrimRight(firstNonEmpty(flagURL, os.Getenv(EnvServerURL), c.ServerURL), "/")
+}
+
+// ResolveToken returns the bearer token a client authenticates with:
+// $BODEGA_TOKEN, then the config file. It is read from the environment first
+// so a token never has to be written to disk on a host being cataloged.
+func (c *Config) ResolveToken() string {
+	return firstNonEmpty(os.Getenv(EnvToken), c.Token)
 }

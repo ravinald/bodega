@@ -27,6 +27,7 @@ A self-hosted package repository manager backed by pluggable object storage. Fet
 - **Checksum verification**: computed on first fetch, enforced on subsequent fetches
 - **Manifest integrity**: MD5 verification on every read/write
 - **Access control**: IP-based mutation API gating with optional Bearer token auth
+- **Host import**: read a host's own installed set (`dpkg-query`, `pip`, `npm`, `go`, `cargo`, `helm`) and catalog it in one push
 - **Supply chain control**: hide bad versions, freeze known-good artifacts
 
 ## Quick start
@@ -38,6 +39,15 @@ make build
 ./dist/bodega build fetch                  # download sources
 ./dist/bodega build upload                 # build + upload to storage
 ./dist/bodega serve --allow-plaintext      # start HTTP server on :8080
+```
+
+To catalog a host that already exists rather than adding packages one at a time:
+
+```bash
+# On the host. Neither step needs a manifest store there.
+dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\n' \
+  | bodega pkg convert apt > catalog.json
+bodega pkg import --server https://bodega.example catalog.json
 ```
 
 bodega uses local filesystem storage by default. For S3, set `storage_backend` to `"s3"` in your config and run `bodega init` to create the bucket.
