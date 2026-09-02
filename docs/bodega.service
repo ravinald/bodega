@@ -46,6 +46,11 @@ Group=bodega
 # Without this, relative paths resolve against / — which ProtectSystem=strict
 # makes read-only. bodega's own manifest_dir default is absolute, so this only
 # guards a relative path an operator writes into config.json by hand.
+#
+# A hand-written relative manifest_dir with no WorkingDirectory= is a start
+# failure now, not a silent empty repository: serve creates the manifest root
+# when it can and refuses the start when it cannot, and /manifests under
+# ProtectSystem=strict is the second case.
 WorkingDirectory=/var/lib/bodega
 
 ExecStart=/usr/local/bin/bodega serve
