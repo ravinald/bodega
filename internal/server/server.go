@@ -120,6 +120,14 @@ type Server struct {
 	// a burst of writes paid for a full listing each — multiplied by the
 	// number of backends once the listing fans out.
 	aptPool atomic.Pointer[aptPoolListing]
+
+	// aptRoutes remembers which configured archive answered for each pool
+	// path, because a pool request carries no codename to resolve it by.
+	aptRoutes aptRouteCache
+	// aptMirror serializes concurrent misses for one mirrored object, so a
+	// fleet running `apt install` at the same minute makes one upstream fetch
+	// of a .deb rather than one per host.
+	aptMirror keyedMutex
 }
 
 // SetQuiet suppresses the human-facing stderr startup banner. Log-level

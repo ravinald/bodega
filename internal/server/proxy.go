@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -97,12 +98,22 @@ func (s *Server) proxyOrCache(w http.ResponseWriter, r *http.Request, store stor
 
 	data, ct, err := fetchUpstream(ctx, upstreamURL)
 	if err != nil {
-		s.logger.Error("upstream fetch failed", "url", upstreamURL, "error", err)
-		// If we have a stale copy, serve it.
+		// A stale copy beats both error paths below: the upstream said
+		// something went wrong, and what bodega already holds is the better
+		// answer than either status code.
 		if status != nil && status.Exists {
+			s.logger.Error("upstream fetch failed, serving the stale cached copy", "url", upstreamURL, "error", err)
 			s.proxyS3(w, r, store, s3Key)
 			return
 		}
+		// "the upstream does not publish this" is not a gateway failure, and
+		// conflating the two makes every unpublished path read as an outage.
+		if errors.Is(err, errUpstreamNotFound) {
+			s.logger.Debug("upstream has no such object", "url", upstreamURL)
+			http.NotFound(w, r)
+			return
+		}
+		s.logger.Error("upstream fetch failed", "url", upstreamURL, "error", err)
 		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
 		return
 	}
@@ -188,9 +199,44 @@ func validateUpstreamURL(rawURL string) error {
 	return nil
 }
 
+// errUpstreamNotFound reports that the upstream answered 404, which is a
+// different thing from the upstream being unreachable and has to reach the
+// client as a different status.
+//
+// apt makes the distinction load-bearing: an archive publishes no Packages for
+// an architecture or component it does not carry, and apt treats that 404 as
+// the ordinary "not published here" and moves on. A 502 in its place is a
+// server fault the operator has to chase, on every arch and component a mirror
+// legitimately lacks.
+var errUpstreamNotFound = errors.New("upstream returned 404")
+
+// maxUpstreamBody caps a buffered upstream body. proxyOrCache holds a whole
+// artifact in memory before responding, so without a ceiling a few concurrent
+// large fetches take the process out.
+//
+// Exceeding it is an error, never a truncation. io.LimitReader reports EOF at
+// its limit and io.ReadAll returns that as a complete body with a nil error,
+// which is indistinguishable downstream from a whole artifact: the short bytes
+// were checksummed as authoritative, cached under that digest, and served to
+// every client afterwards, and a later fetch of the real artifact then failed
+// verification against the digest of the truncated one.
+//
+// A variable rather than a constant so a test can drive the over-limit path
+// without moving a quarter of a gigabyte through it. Nothing in the shipped
+// binary assigns to it.
+var maxUpstreamBody int64 = 256 << 20
+
+// upstreamGuard is the check every upstream fetch clears before a request
+// leaves the process, held in a variable so a test can point a fixture archive
+// at a loopback listener — the case the real guard exists to refuse.
+//
+// Nothing in the shipped binary rebinds it: no config value reaches it, it is
+// unexported, and internal/server has no non-test caller that assigns to it.
+var upstreamGuard = validateUpstreamURL
+
 // fetchUpstream downloads a URL and returns the body bytes and content type.
 func fetchUpstream(ctx context.Context, rawURL string) ([]byte, string, error) {
-	if err := validateUpstreamURL(rawURL); err != nil {
+	if err := upstreamGuard(rawURL); err != nil {
 		return nil, "", err
 	}
 	//nolint:gosec // G704: rawURL was just validated by validateUpstreamURL above (https-only, non-loopback, non-private).
@@ -207,18 +253,35 @@ func fetchUpstream(ctx context.Context, rawURL string) ([]byte, string, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, "", fmt.Errorf("upstream 404: %s", rawURL)
+		return nil, "", fmt.Errorf("%w: %s", errUpstreamNotFound, rawURL)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, "", fmt.Errorf("upstream returned %d: %s", resp.StatusCode, rawURL)
 	}
 
-	// Cap at 256MB to prevent unbounded memory use.
-	const maxSize = 256 << 20
-	limited := io.LimitReader(resp.Body, maxSize)
-	data, err := io.ReadAll(limited)
+	// A declared length over the cap is refusable before a byte is read.
+	if resp.ContentLength > maxUpstreamBody {
+		return nil, "", fmt.Errorf("upstream declares %d bytes, over bodega's %d-byte buffer: %s — nothing was cached; the proxy path buffers a whole artifact before responding and cannot carry this one",
+			resp.ContentLength, maxUpstreamBody, rawURL)
+	}
+
+	// One byte past the cap. Anything read there means the body was longer
+	// than the buffer, which has to fail rather than return short bytes the
+	// checksum would then bless.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamBody+1))
 	if err != nil {
 		return nil, "", fmt.Errorf("read upstream body: %w", err)
+	}
+	if int64(len(data)) > maxUpstreamBody {
+		return nil, "", fmt.Errorf("upstream body exceeds bodega's %d-byte buffer: %s — nothing was cached; fetch this artifact out of band or serve it from storage",
+			maxUpstreamBody, rawURL)
+	}
+	// A body shorter than the length the upstream declared is a cut transfer.
+	// Chunked and transparently-decompressed responses report -1 and are
+	// exempt, so this only fires where the upstream stated a number.
+	if resp.ContentLength >= 0 && int64(len(data)) != resp.ContentLength {
+		return nil, "", fmt.Errorf("upstream sent %d bytes against a declared Content-Length of %d: %s — the transfer was cut and nothing was cached; retry, and check the upstream if it repeats",
+			len(data), resp.ContentLength, rawURL)
 	}
 
 	return data, resp.Header.Get("Content-Type"), nil
@@ -286,6 +349,31 @@ func (s *Server) verifyProxyChecksum(ctx context.Context, s3Key string, data []b
 	return nil
 }
 
+// upstreamPolicyVerdict is the allow-list decision for one candidate, with no
+// response written and no discovery row. Decisions are:
+//
+//	no_policy : no rules configured for this type, so nothing was checked
+//	allowed   : a rule matched
+//	denied    : a rule exists and none matched; the caller must refuse
+//
+// A non-nil error means the check itself could not run, which is a 500 rather
+// than a refusal — the caller decides. It is separate from
+// enforceUpstreamPolicy because the apt pool probe checks several candidates
+// to answer one request: recording a row per candidate would count one client
+// fetch as many, and the row is written once by the fetch that follows.
+func (s *Server) upstreamPolicyVerdict(ctx context.Context, regType, policyCandidate string) (string, bool, error) {
+	hasRules, hasRulesErr := s.policy.HasRules(ctx, regType)
+	if hasRulesErr != nil {
+		s.logger.Error("policy rules lookup failed", "error", hasRulesErr)
+	}
+	err := s.policy.Check(ctx, regType, policyCandidate)
+	violation := err != nil && policy.IsViolation(err)
+	if err != nil && !violation {
+		return "", false, err
+	}
+	return classifyDecision(hasRules, violation), violation, nil
+}
+
 // enforceUpstreamPolicy runs the allow-list check and writes the discovery row
 // for one upstream attempt, returning false when it has already written the
 // response and the caller must stop.
@@ -303,13 +391,8 @@ func (s *Server) enforceUpstreamPolicy(w http.ResponseWriter, r *http.Request, r
 		return true
 	}
 	ctx := r.Context()
-	hasRules, hasRulesErr := s.policy.HasRules(ctx, regType)
-	if hasRulesErr != nil {
-		s.logger.Error("policy rules lookup failed", "error", hasRulesErr)
-	}
-	err := s.policy.Check(ctx, regType, policyCandidate)
-	violation := err != nil && policy.IsViolation(err)
-	if err != nil && !violation {
+	decision, violation, err := s.upstreamPolicyVerdict(ctx, regType, policyCandidate)
+	if err != nil {
 		s.logger.Error("policy check failed", "error", err)
 		http.Error(w, "policy check failed", http.StatusInternalServerError)
 		return false
@@ -317,11 +400,7 @@ func (s *Server) enforceUpstreamPolicy(w http.ResponseWriter, r *http.Request, r
 
 	// Discovery log: record every upstream attempt with its decision so
 	// operators can review/forensically audit and later promote captured
-	// hosts/packages to allow-list rules. Decision classification:
-	//   no_policy  : no rules configured for this type (Check returns nil)
-	//   allowed    : a rule matched
-	//   denied     : violation; 403 returned
-	decision := classifyDecision(hasRules, violation)
+	// hosts/packages to allow-list rules.
 	s.recordDiscovery(ctx, r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, decision)
 
 	if violation {

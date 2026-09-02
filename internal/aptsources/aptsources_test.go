@@ -131,6 +131,37 @@ func TestNoSuitesRendersPlaceholder(t *testing.T) {
 	}
 }
 
+// A mirrored suite carries neither trust option. The upstream signature is
+// intact and the client already holds the distro key, so [trusted=yes] would
+// discard a working check and Signed-By: would point at a key that signed
+// nothing here. Both are wrong in a way that survives into an Ansible
+// template, which is why signing state does not reach this branch.
+func TestMirroredSuiteCarriesNeitherTrustOption(t *testing.T) {
+	for _, signed := range []bool{true, false} {
+		got := Render(State{
+			PublicURL: "https://bodega.example.com",
+			Suites:    []string{"noble"},
+			Signed:    signed,
+			Mirrored:  true,
+		})
+		if strings.Contains(got.Deb822, "Trusted") || strings.Contains(got.OneLine, "trusted") {
+			t.Errorf("signed=%v: mirrored suite emits a trust override:\n%s\n%s", signed, got.Deb822, got.OneLine)
+		}
+		if strings.Contains(got.Deb822, "Signed-By") || strings.Contains(got.OneLine, "signed-by") {
+			t.Errorf("signed=%v: mirrored suite names bodega's keyring:\n%s\n%s", signed, got.Deb822, got.OneLine)
+		}
+		if !got.Mirrored || !got.Signed {
+			t.Errorf("signed=%v: mirrored=%v signed=%v, want both true — upstream signs it", signed, got.Mirrored, got.Signed)
+		}
+		if !hasNote(got, MirroredNote) {
+			t.Errorf("signed=%v: no note explaining what verifies a mirrored suite: %v", signed, got.Notes)
+		}
+		if got.OneLine != "deb https://bodega.example.com/apt/ noble main" {
+			t.Errorf("one-line = %q, want a bare deb line", got.OneLine)
+		}
+	}
+}
+
 func hasNote(s Sources, want string) bool {
 	for _, n := range s.Notes {
 		if n == want {

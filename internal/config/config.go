@@ -162,6 +162,16 @@ type Config struct {
 	// gomod_upstream kind cannot name what an install actually pulls from.
 	BinaryUpstreams map[string]BinaryUpstream `json:"binary_upstreams,omitempty"`
 
+	// AptUpstreams maps an apt codename onto the upstream archives that serve
+	// it, mirroring their dists/ tree byte-for-byte under /apt/dists/<codename>/.
+	// A codename here is served entirely from upstream, signature included, and
+	// may not also appear in AptSuites: see MirroredAptCodenames.
+	//
+	// Several upstreams per codename because a real suite is split across
+	// archive, security and updates hosts, and a client fetching one Packages
+	// file has no way to say which of them a later pool request came from.
+	AptUpstreams map[string][]AptUpstream `json:"apt_upstreams,omitempty"`
+
 	LocalConfig bool `json:"-"`
 	Verbose     bool `json:"-"`
 }
@@ -291,6 +301,106 @@ func validateUpstreams(key, route string, ups map[string]Upstream) error {
 		}
 	}
 	return nil
+}
+
+// AptUpstream is one upstream archive serving a mirrored codename.
+//
+// There is no Mode field, and that is the decision rather than an omission.
+// catalog mode resolves only paths a manifest entry names, and apt clients
+// choose what to request by reading a Packages index: the first Depends: chain
+// reaching a package nobody cataloged would 404 mid-install with apt reporting
+// a broken dependency rather than a policy refusal. Constraint for apt is the
+// host-level allow-list ("bodega policy add apt archive.ubuntu.com"), which
+// bounds which archives bodega will talk to at all.
+type AptUpstream struct {
+	// URL is the archive root, the directory holding dists/ and pool/, e.g.
+	// "https://archive.ubuntu.com/ubuntu". Load trims any trailing slash so
+	// every composition site appends the same way.
+	URL string `json:"url"`
+}
+
+// aptCodenamePattern is what an apt_upstreams key may look like. It is
+// narrower than upstreamNamespacePattern because the key is a suite name apt
+// itself parses: lowercase, digits and hyphens, which covers every Debian and
+// Ubuntu suite including the "-updates" and "-security" forms.
+var aptCodenamePattern = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
+
+// validateAptUpstreams refuses a malformed apt_upstreams block and normalizes
+// each URL to a form with no trailing slash.
+//
+// It does not share validateUpstreams: that validator requires a trailing
+// slash because its callers concatenate a request path directly, while an apt
+// URL has "/dists/" or "/pool/" appended and an operator copies the archive
+// root from a mirror list with no slash on it. Two rules that look alike and
+// differ in one character are worse apart than a second short function.
+func validateAptUpstreams(ups map[string][]AptUpstream) error {
+	for codename, list := range ups {
+		if !aptCodenamePattern.MatchString(codename) {
+			return fmt.Errorf("invalid apt_upstreams key %q: must match %s — the key is the suite name apt requests under /apt/dists/", codename, aptCodenamePattern)
+		}
+		if len(list) == 0 {
+			return fmt.Errorf("apt_upstreams[%q]: names no upstream — remove the key or give it at least one {\"url\": ...}", codename)
+		}
+		for i, up := range list {
+			u, err := url.Parse(up.URL)
+			switch {
+			case up.URL == "":
+				return fmt.Errorf("apt_upstreams[%q][%d]: url is required (e.g. \"https://archive.ubuntu.com/ubuntu\")", codename, i)
+			case err != nil:
+				return fmt.Errorf("apt_upstreams[%q][%d]: url %q does not parse: %v", codename, i, up.URL, err)
+			case u.Scheme != "https":
+				return fmt.Errorf("apt_upstreams[%q][%d]: url %q must use the https scheme", codename, i, up.URL)
+			case u.Host == "":
+				return fmt.Errorf("apt_upstreams[%q][%d]: url %q names no host", codename, i, up.URL)
+			case u.RawQuery != "" || u.Fragment != "":
+				return fmt.Errorf("apt_upstreams[%q][%d]: url %q carries a query or fragment — bodega appends \"/dists/...\" and \"/pool/...\" to it, which would land after them", codename, i, up.URL)
+			}
+			list[i].URL = strings.TrimRight(up.URL, "/")
+		}
+	}
+	return nil
+}
+
+// MirrorsAptCodename reports whether a codename is served from upstream rather
+// than generated. Load guarantees the two sets are disjoint, so a true answer
+// here is also a guarantee that no generated suite answers for it.
+func (c *Config) MirrorsAptCodename(codename string) bool {
+	_, ok := c.AptUpstreams[codename]
+	return ok
+}
+
+// MirroredAptCodenames returns the mirrored codenames in sorted order, for the
+// emitters that list what an instance serves.
+func (c *Config) MirroredAptCodenames() []string {
+	out := make([]string, 0, len(c.AptUpstreams))
+	for codename := range c.AptUpstreams {
+		out = append(out, codename)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// AptPoolUpstreams returns every configured archive root once, sorted.
+//
+// A pool path carries no codename, so the archive a client's apt update
+// pinned is not recoverable from the request: the candidate set is the union
+// across codenames and the probe order has to come from somewhere stable.
+// Sorted, so two servers on the same config probe in the same order and an
+// operator reading the log can predict which host answered.
+func (c *Config) AptPoolUpstreams() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, list := range c.AptUpstreams {
+		for _, up := range list {
+			if up.URL == "" || seen[up.URL] {
+				continue
+			}
+			seen[up.URL] = true
+			out = append(out, up.URL)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // DefaultStorageName is the reserved name of the backend defined by
@@ -459,6 +569,22 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 		suites = append(suites, s)
 	}
 	cfg.AptSuites = suites
+
+	// apt_upstreams mirrors a codename from upstream, signature included.
+	// Generated and mirrored codenames are disjoint by construction: the two
+	// indexes describe different package sets, and one URL can serve only one
+	// of them, so a shared name would hand a client an InRelease whose digests
+	// do not cover the Packages it is served next. See
+	// docs-internal/DESIGN_apt-suites-and-signing_2026_08_25.md.
+	if err := validateAptUpstreams(cfg.AptUpstreams); err != nil {
+		return nil, err
+	}
+	for _, suite := range cfg.AptSuites {
+		if cfg.MirrorsAptCodename(suite) {
+			return nil, fmt.Errorf("apt codename %q is in both apt_suites and apt_upstreams: bodega generates and signs one, mirrors the other, and one URL can serve only one of them. "+
+				"Drop it from apt_suites to mirror it, or from apt_upstreams to keep serving your own .debs under that name — a mirrored suite needs a name of its own", suite)
+		}
+	}
 
 	if err := cfg.validateStorage(); err != nil {
 		return nil, err
@@ -767,6 +893,11 @@ func defaultConfigContent() []byte {
   "_comment_apt": "apt_codename: default suite for apt entries that name none. apt_suites: every suite served under /apt/dists/; apt_codename is always included.",
   "apt_codename": "noble",
   "apt_suites": ["noble"],
+
+  "_comment_apt_upstreams": "apt_upstreams: codenames mirrored from an upstream archive instead of generated, e.g. {\"noble\": [{\"url\": \"https://archive.ubuntu.com/ubuntu\"}, {\"url\": \"https://security.ubuntu.com/ubuntu\"}]}. bodega proxies the upstream dists/ tree unchanged, signature included, so clients verify against the distro keyring they already have and need no [trusted=yes]. Empty means every codename is generated, which is what every install without this key does.",
+  "_comment_apt_upstreams_disjoint": "A codename may not appear in both apt_suites and apt_upstreams — bodega signs one and forwards the other's signature, and a shared name would serve an index whose digests do not cover the packages beside it. Mirrored suites need names of their own.",
+  "_comment_apt_upstreams_pool": "/apt/pool/ carries no codename, so a .deb is resolved by probing every configured archive in sorted order and remembering which one answered. There is no per-package allow-list for apt: constrain it with 'bodega policy add apt <host>'.",
+  "apt_upstreams": {},
 
   "_comment_apt_signing": "apt_signing_name / apt_signing_email: the UID stamped on a key made by 'bodega apt key generate'. They name the key, nothing more — the server loads whatever key it finds and never generates one.",
   "apt_signing_name": "",
