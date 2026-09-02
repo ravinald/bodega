@@ -53,9 +53,13 @@ s3://<bucket>/
   index.json                 # fast startup without loading every manifest
   graph.json                 # dependency graph with typed edges
   metrics.json               # dashboard metrics (updated on SaveIndex)
-  packages/apt/pool/         # Debian .deb pool, the only stored part of the apt repo
-                             #   dists/ (Release, Packages, Packages.gz) is generated
-                             #   per request from the manifests and never stored
+  packages/apt/pool/         # Debian .deb pool: locally built .debs and, on a
+                             #   mirroring instance, cached upstream ones. One flat
+                             #   pool shared across suites is correct Debian layout.
+  packages/apt/dists/        # only for codenames in apt_upstreams — the cached
+                             #   proxy of the upstream index. A generated suite's
+                             #   dists/ is built from the manifests into an
+                             #   in-memory snapshot and never stored.
   pypi/wheels/               # Python wheels
   repos/                     # Git bundles (.bundle) and release archives (.tar.gz)
   binaries/                  # Direct downloads, versioned subdirectories
@@ -106,6 +110,14 @@ Moving an artifact between backends is `bodega pkg move`, which copies, verifies
 An unsigned source needs `deb [trusted=yes] https://bodega/apt/ noble main`, which turns off verification for that source permanently. TLS authenticates the packages in that case, which is why every client line above is `https://`.
 
 The signature seals the last hop only: it proves the bytes are the ones this bodega asserted. It carries no claim about upstream, because bodega records no upstream verification result and a source-built `.deb` never had an upstream signature. `docs/USAGE.md` states the full scope.
+
+### Mirrored codenames
+
+A codename in `apt_upstreams` is served from an upstream archive instead of generated. `internal/server/apt_mirror.go` proxies `dists/<codename>/...` through `proxyOrCache` — `by-hash/` paths immutable, everything else mutable under `metadata_ttl` — and the pool artifacts the index points at, immutable. bodega parses no upstream index: apt reads the proxied `Packages` and composes the next request itself, so every component and architecture the upstream publishes resolves without bodega knowing they exist.
+
+`InRelease` and `Release.gpg` are forwarded unchanged, so the archive's own signature reaches the client and verifies against the distro keyring already on the host. bodega's key signs generated suites and nothing else, and `config.Load` refuses a codename that appears in both `apt_suites` and `apt_upstreams`: a signature over a `Release` is a signature over the digests of the `Packages` beside it, one URL serves one `Packages` per component and architecture, so a shared codename would hand a client an index its signature does not describe. `docs-internal/DESIGN_apt-suites-and-signing_2026_08_25.md` records the two rejected alternatives.
+
+A pool request carries no codename, so bodega probes the configured archives in sorted order with a `HEAD` and remembers which one answered, positively or negatively, for an hour. A pool path a manifest entry owns is never probed: the entry's `Packages` stanza already published a `SHA256` computed at package time, and caching another archive's artifact there would serve bytes the client's own hash check rejects.
 
 ## Manifest structure (config_version 1)
 
@@ -192,7 +204,9 @@ Every gomod, helm, and npm entry has a `mode` field:
 - **hosted** (default): The artifact is built or fetched locally, uploaded to S3, served from S3. You control exactly what's there. Nothing reaches upstream at serve time.
 - **proxy**: On cache miss, bodega fetches from the upstream registry, caches in S3, and serves the response. Subsequent requests hit the cache. Mutable metadata (version lists, indexes) refreshes after a configurable TTL.
 
-Apt, git, binary, and pypi are always hosted. They don't have natural upstream proxies that speak the right protocol at serve time.
+pypi entries are always hosted. git and binary reach upstream through `git_upstreams` and `binary_upstreams`, which carry a per-namespace `mode` of the same two values.
+
+apt reaches upstream through `apt_upstreams`, and it has **no** `catalog` mode and no per-package allow-list. apt decides what to request by reading a `Packages` index, so the first `Depends:` chain reaching a package nobody cataloged would 404 mid-install and surface as a broken dependency rather than a policy refusal. `git_upstreams` and `binary_upstreams` can offer `catalog` because a client there asks for one artifact it already named. Constraint for apt is the host-level allow-list (`bodega policy add apt <host>`), checked before the fetch and before the pool probe.
 
 ## Filling the catalog
 

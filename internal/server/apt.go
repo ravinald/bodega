@@ -23,23 +23,34 @@ import (
 
 // ---- APT repository (dynamic index generation) ----------------------------
 
-// handleAptPool proxies .deb files from S3 pool/main/...
+// handleAptPool serves a .deb from the pool, from storage or from a mirrored
+// upstream.
+//
+// The pool tree is shared: a .deb bodega built from source and one cached from
+// an upstream archive land under the same key space, which is correct Debian
+// design and is why aptPoolIsLocal exists. A path a manifest entry owns is
+// never fetched — see that function for what caching over one would do to the
+// SHA256 the entry already published.
 func (s *Server) handleAptPool(w http.ResponseWriter, r *http.Request) {
 	p := r.PathValue("path")
 	if !isSafePath(p) {
 		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
 	}
-	key := manifest.AptKey("pool/" + p)
+	poolPath := "pool/" + p
 	setCacheImmutable(w, path.Base(p))
-	store, err := s.aptPoolStore("pool/" + p)
+	store, err := s.aptPoolStore(poolPath)
 	if err != nil {
 		s.logger.Error("storage backend recorded for pooled .deb is not configured",
 			"pool_path", p, "error", err)
 		http.Error(w, "storage backend error", http.StatusBadGateway)
 		return
 	}
-	s.proxyS3(w, r, store, key)
+	if len(s.cfg.AptUpstreams) == 0 || s.aptPoolIsLocal(poolPath) {
+		s.proxyS3(w, r, store, manifest.AptKey(poolPath))
+		return
+	}
+	s.handleAptMirrorPool(w, r, poolPath, store)
 }
 
 // aptPoolStore resolves a pooled .deb to the backend recorded for its version.
@@ -65,7 +76,19 @@ func (s *Server) aptPoolStore(poolPath string) (storage.ObjectStore, error) {
 // wildcards like "binary-{arch}", so we parse the path here.
 func (s *Server) handleAptDists(w http.ResponseWriter, r *http.Request) {
 	distpath := r.PathValue("distpath")
+	if !isSafePath(distpath) {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
 	parts := strings.Split(distpath, "/")
+
+	// A mirrored codename is served entirely from upstream and never reaches
+	// the generated snapshot below. config.Load refuses a codename in both
+	// sets, so this branch cannot shadow a suite bodega signs.
+	if len(parts) >= 2 && s.cfg.MirrorsAptCodename(parts[0]) {
+		s.handleAptMirrorDists(w, r, parts[0], strings.Join(parts[1:], "/"))
+		return
+	}
 
 	if len(parts) == 2 {
 		switch parts[1] {
@@ -651,6 +674,7 @@ type aptStatus struct {
 	Fingerprints []string             `json:"fingerprints,omitempty"`
 	KeyringURL   string               `json:"keyring_url,omitempty"`
 	Suites       []string             `json:"suites"`
+	Mirrored     []string             `json:"mirrored,omitempty"`
 	PublicURL    string               `json:"public_url"`
 	Sources      []aptsources.Sources `json:"sources"`
 }
@@ -685,23 +709,35 @@ func (s *Server) aptSourcesState(r *http.Request) aptsources.State {
 // line of its own.
 func (s *Server) aptStatusFor(r *http.Request) aptStatus {
 	st := s.aptSourcesState(r)
+	mirrored := s.cfg.MirroredAptCodenames()
 	out := aptStatus{
 		Signed:       st.Signed,
 		Fingerprints: st.Fingerprints,
 		Suites:       st.Suites,
+		Mirrored:     mirrored,
 		PublicURL:    st.PublicURL,
-		Sources:      make([]aptsources.Sources, 0, len(st.Suites)),
+		Sources:      make([]aptsources.Sources, 0, len(st.Suites)+len(mirrored)),
 	}
 	if st.Signed {
 		out.KeyringURL = aptsources.KeyringRoute
 	}
-	if len(st.Suites) == 0 {
+	if len(st.Suites) == 0 && len(mirrored) == 0 {
 		return aptStatus{Signed: out.Signed, Fingerprints: out.Fingerprints, KeyringURL: out.KeyringURL,
 			Suites: []string{}, PublicURL: out.PublicURL, Sources: []aptsources.Sources{aptsources.Render(st)}}
 	}
 	for _, suite := range st.Suites {
 		one := st
 		one.Suites = []string{suite}
+		out.Sources = append(out.Sources, aptsources.Render(one))
+	}
+	// A mirrored codename gets its own block. It cannot share the generated
+	// one's stanza: those carry Signed-By: or Trusted:, and a mirrored suite
+	// must carry neither, so folding them onto one Suites: line would apply
+	// the wrong trust to half of it.
+	for _, codename := range mirrored {
+		one := st
+		one.Suites = []string{codename}
+		one.Mirrored = true
 		out.Sources = append(out.Sources, aptsources.Render(one))
 	}
 	return out
@@ -1173,14 +1209,30 @@ func (s *Server) requireStorage(w http.ResponseWriter, store storage.ObjectStore
 // No request is in hand here, so a server with no public_url set prints a
 // placeholder host and the note that says so.
 func (s *Server) aptSourcesBanner() string {
-	src := aptsources.Render(s.aptSourcesState(nil))
+	st := s.aptSourcesState(nil)
+	blocks := []aptsources.Sources{aptsources.Render(st)}
+	// One stanza per mirrored codename, after the generated one. They differ
+	// in the only line that matters here — what authenticates the suite — so
+	// printing one and letting the operator infer the other is how the wrong
+	// trust option reaches a template.
+	for _, codename := range s.cfg.MirroredAptCodenames() {
+		one := st
+		one.Suites = []string{codename}
+		one.Mirrored = true
+		blocks = append(blocks, aptsources.Render(one))
+	}
 	var b strings.Builder
 	b.WriteString("\n/etc/apt/sources.list.d/bodega.sources:\n")
-	for _, line := range strings.Split(src.Deb822, "\n") {
-		b.WriteString("  " + line + "\n")
-	}
-	for _, note := range src.Notes {
-		b.WriteString("  # " + note + "\n")
+	for i, src := range blocks {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		for _, line := range strings.Split(src.Deb822, "\n") {
+			b.WriteString("  " + line + "\n")
+		}
+		for _, note := range src.Notes {
+			b.WriteString("  # " + note + "\n")
+		}
 	}
 	b.WriteString("\n")
 	return b.String()

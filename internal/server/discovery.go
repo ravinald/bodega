@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
 
@@ -242,6 +243,14 @@ func pkgVersionFromKey(key string) string {
 		if strings.HasSuffix(base, ".tgz") {
 			return strings.TrimSuffix(base, ".tgz")
 		}
+	case strings.HasPrefix(key, manifest.AptPoolPrefix):
+		// packages/apt/pool/<component>/<letter>/<source>/<pkg>_<version>_<arch>.deb
+		// The version lives inside the filename, not in a path segment, and
+		// these are the rows that record what a fleet's dependency closure
+		// actually pulled — a blank version there costs the aggregation the
+		// only thing that distinguishes one install from the next.
+		_, version := aptDebIdentity(path.Base(key))
+		return version
 	case strings.HasPrefix(key, "pypi/wheels/"):
 		// pypi/wheels/<version>/<dist>-<version>-<...>.whl
 		segs := strings.Split(key, "/")

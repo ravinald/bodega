@@ -167,6 +167,13 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		"binary_upstreams": map[string]config.BinaryUpstream{
 			"hashicorp": {URL: "https://releases.hashicorp.com/", Mode: config.UpstreamModeOpen},
 		},
+		// The codename is deliberately not one the slice filler produces for
+		// apt_suites: Load refuses a codename in both, so a collision here
+		// would fail the round trip for the right reason and the wrong test.
+		// The URL carries no trailing slash because Load trims one.
+		"apt_upstreams": map[string][]config.AptUpstream{
+			"mirrored-noble": {{URL: "https://archive.ubuntu.com/ubuntu"}},
+		},
 	}
 
 	v := reflect.ValueOf(cfg).Elem()

@@ -554,6 +554,7 @@ An audit database written under the retired `discover_mode: "learn"` also holds 
 
 | Type | Route | Recorded |
 |------|-------|----------|
+| apt | `/apt/dists/{codename}/...`, `/apt/pool/...` under a mirrored codename | every upstream fetch. Metadata rows carry `<codename>/<path>` as the package and no version; pool rows carry the package name and version parsed from the `.deb` filename, and together they are the dependency closure of what the fleet installed |
 | cargo | sparse index, crate download | every upstream fetch |
 | npm | packument, tarball | every upstream fetch; `no_manifest` on a tarball for an unknown package |
 | pypi | simple index, wheel | every upstream fetch; `no_manifest` on a wheel for an unknown distribution |
@@ -566,7 +567,8 @@ An audit database written under the retired `discover_mode: "learn"` also holds 
 
 These are not observed yet. A quiet discovery log for one of them means the hook does not reach it, not that no client asked:
 
-- **apt**: `/apt/pool/...` reads storage directly and has no upstream path at all, so neither a hit nor a miss is recorded.
+- **apt with no `apt_upstreams`**: `/apt/pool/...` reads storage directly with nothing upstream to fetch, so neither a hit nor a miss is recorded. A pool path a manifest entry owns behaves the same way even on a mirroring instance: it is served from storage and never proxied.
+- **generated apt suites**: `dists/` for a codename in `apt_suites` is built from bodega's own manifests, so there is no upstream request to observe. Only mirrored codenames produce rows.
 - **git bundles**: `/git/{name}/{file}` serves an uploaded bundle or release archive from storage. Nothing upstream, nothing logged.
 - **git mirror refreshes**: a smart-HTTP request records one row per request, but the periodic `git remote update` it triggers is not separately logged. The row says a client asked; it does not say whether that request also refreshed the mirror.
 - **binary outside a namespace**: with `binary_upstreams` empty, or on a path whose first segment names no entry in it, `/binaries/...` reads storage and records nothing. The `no_namespace` row above is the second case; the first is an install that has not opted in.
@@ -586,6 +588,8 @@ The raw rows behind one bucket: package, version, decision, count, last client, 
 `--as policy` (the default) writes an allow-list rule for the pattern, through the same path as `bodega policy add`.
 
 `--as manifest` writes package manifest entries instead, through the same path as `bodega pkg create`. It reads only the `no_manifest` rows in the bucket and, for each one, adds a version entry in `proxy` mode carrying the upstream URL the handler would have fetched.
+
+For apt, `--as policy` is the promotion that matters: `bodega discover promote apt archive.ubuntu.com` turns an observe window into the host rule that keeps the mirror reachable once enforcement is on. `--as manifest` also works — an apt pool row carries the package, the version and the upstream `.deb` URL, so it writes a staged entry that `bodega build fetch apt` resolves from that URL and `bodega build run apt` puts in the pool. That is how a package the fleet keeps pulling from upstream becomes one bodega hosts and signs in its own suite. The staged entry carries no architecture and no pool path, so it stays out of the generated index until those two steps run.
 
 A row with no version becomes one entry with `version_constraint: "any"`, but only for `git` and `binary`, whose entries are fetched from the recorded URL as it stands. Every other type composes the version into the fetch path, so an open entry there resolves to a URL that 404s: `go` alone drives one versionless row per module through `/@v/list` and `/@v/@latest`. Those rows are named on stderr and skipped; the versioned rows for the same package are unaffected.
 
@@ -792,6 +796,27 @@ The copy happens once rather than the file being read as a fallback on every sta
 `trusted_proxies` keeps its tri-state across the move. The database records "this list is mine" separately from its entries, so an operator's `[]` still means trust nobody and an absent key still means the built-in loopback + RFC 1918 default.
 
 `apt_codename` is the default suite for apt manifest entries that name no `suites`; `apt_suites` is the full set served under `/apt/dists/`, and `apt_codename` is always included in it whether listed or not. A suite name containing `/` is rejected at load.
+
+`apt_upstreams` maps a codename onto the upstream archives that serve it, and mirrors their `dists/` tree instead of generating one. Keys match `^[a-z][a-z0-9-]*$`; each `url` must be `https` with a host and no query or fragment, and a trailing slash is trimmed at load. An empty map is what an install without the key runs, and changes nothing.
+
+```json
+"apt_upstreams": {
+  "noble":          [{"url": "https://archive.ubuntu.com/ubuntu"}],
+  "noble-updates":  [{"url": "https://archive.ubuntu.com/ubuntu"}],
+  "noble-security": [{"url": "https://security.ubuntu.com/ubuntu"}],
+  "bookworm":       [{"url": "https://deb.debian.org/debian"}]
+}
+```
+
+**A codename may not appear in both `apt_suites` and `apt_upstreams`, and the load fails naming it.** bodega signs an index it generated and forwards the signature of one it mirrors; one URL serves one `Packages` per component and architecture, so a shared codename would hand a client an `InRelease` whose digests do not describe the index it gets next. Mirror under the upstream's real codename and name the generated suite something local:
+
+```json
+"apt_codename": "internal",
+"apt_suites": ["internal"],
+"apt_upstreams": {"noble": [{"url": "https://archive.ubuntu.com/ubuntu"}]}
+```
+
+Both suites are then served by one instance and apt resolves dependencies across the two, which is how a locally built package can depend on a distro one.
 
 `public_url` is the base URL clients reach the server at, and it decides the scheme and host of every client snippet bodega emits: the `bodega serve` startup banner, the TUI details pane, the web UI, and `GET /api/v1/status`. Resolution is `--public-url` > `$BODEGA_PUBLIC_URL` > `public_url`, with no built-in default.
 
@@ -1125,7 +1150,18 @@ The deb822 `.sources` form is preferred over the one-line `.list` form because `
 
 The suite (`noble` above) is any entry in `apt_suites`. One instance serves several: list them on the `Suites:` line, or give each its own sources line in the one-line format. A `.deb` listed in two suites is stored once in the shared `pool/` and appears in both `Packages` indexes with the same `Filename:`.
 
-See [Signing the apt repository](#signing-the-apt-repository) below for creating the key, rotating it, what the signature does and does not prove, and the `[trusted=yes]` fallback for a repository with no key.
+A **mirrored** suite is configured differently, because something else signs it:
+
+```
+Types: deb
+URIs: https://bodega-host:8080/apt/
+Suites: noble noble-updates noble-security
+Components: main restricted universe multiverse
+```
+
+No `Signed-By:`, no `Trusted: yes`. bodega proxies the upstream `dists/` tree unchanged, so the archive's own `InRelease` arrives with its signature intact and apt verifies it against the distro keyring already on the host. Adding `[trusted=yes]` there would replace a working check with none; adding `Signed-By:` would point apt at a key that signed nothing in that tree. See [Mirroring an upstream archive](#mirroring-an-upstream-archive).
+
+See [Signing the apt repository](#signing-the-apt-repository) below for creating the key, rotating it, what the signature does and does not prove, and the `[trusted=yes]` fallback for a repository with no key of its own.
 
 **pip** (per-command or `pip.conf`):
 ```bash
@@ -1269,7 +1305,7 @@ TLS is what authenticates an unsigned source, which is why every URL here is `ht
 
 It seals the last hop: the bytes are the ones **this bodega** asserted, and the hash chain from `Release` to `Packages` to each `.deb` holds under a key the client pinned.
 
-It carries no claim about upstream. `apt-get download` does verify against the distro's own keyring on the build host, but that result is recorded nowhere and does not reach the client; a source-built `.deb` never had an upstream signature at all. For mirrored packages, forwarding the upstream signature unchanged is the better answer and is a separate piece of work.
+It carries no claim about upstream. `apt-get download` does verify against the distro's own keyring on the build host, but that result is recorded nowhere and does not reach the client; a source-built `.deb` never had an upstream signature at all. For a mirrored suite the upstream signature is forwarded unchanged instead, which is a stronger claim than bodega could make about the same bytes — see [Mirroring an upstream archive](#mirroring-an-upstream-archive). bodega's key signs generated suites and nothing else.
 
 It does not catch a tampered `.deb` that manifests were not also edited; the client already catches that. `_sha256` is computed once at package time and served from the manifest, never recomputed from disk, so swapping a pooled file fails the client's own hash check whether or not the repository is signed. What signing adds is coverage of an attacker who can write manifests too.
 
@@ -1287,6 +1323,66 @@ gpg --show-keys --with-fingerprint /etc/apt/keyrings/bodega-archive-keyring.gpg 
 ```
 
 Or skip the network entirely: `bodega apt key export --keyring` writes the same bytes to stdout for delivery through whatever channel you already trust with the rest of the host's configuration.
+
+### Mirroring an upstream archive
+
+A codename listed in `apt_upstreams` is served from upstream rather than generated. bodega proxies `dists/<codename>/...` and the pool artifacts the index points at, caching each on the way through. This is what makes `apt update && apt install <anything>` work against bodega for packages nobody pre-built: apt reads the proxied `Packages`, resolves dependencies locally, then asks bodega for each `.deb` by its `Filename:`.
+
+```json
+"apt_upstreams": {
+  "noble":          [{"url": "https://archive.ubuntu.com/ubuntu"}],
+  "noble-updates":  [{"url": "https://archive.ubuntu.com/ubuntu"}],
+  "noble-security": [{"url": "https://security.ubuntu.com/ubuntu"}]
+}
+```
+
+```
+Types: deb
+URIs: https://bodega-host:8080/apt/
+Suites: noble noble-updates noble-security
+Components: main restricted universe multiverse
+```
+
+bodega parses no index. The upstream `Release` names the components, architectures and `by-hash` digests, apt reads them, and the next request arrives with the path already composed, so any component the upstream publishes resolves, not only `main`.
+
+#### `[trusted=yes]` is not needed, and is wrong here
+
+The upstream `InRelease` is forwarded byte-for-byte, signature intact, and apt verifies it against the distro keyring already installed on the host (`ubuntu-keyring`, `debian-archive-keyring`). Neither `[trusted=yes]` nor `Signed-By:` belongs on a mirrored source: the first discards a signature that is right there and valid, and the second points apt at bodega's key, which signed nothing in that tree. The startup banner, the TUI, the web UI and `GET /api/v1/status` all render a mirrored suite with neither option, and say why beside the line.
+
+#### Open mode only
+
+There is no `catalog` mode for apt, and no per-package allow-list. apt decides what to request by reading a `Packages` index, so the first `Depends:` chain reaching a package nobody cataloged would 404 mid-install — surfacing to the operator as a broken dependency rather than as a policy refusal, at the point where the transaction is already half planned. `git_upstreams` and `binary_upstreams` can offer `catalog` because a client there asks for one artifact it already named.
+
+Constraint for apt is the host-level allow-list:
+
+```bash
+bodega policy add apt archive.ubuntu.com
+bodega policy add apt security.ubuntu.com
+```
+
+With any apt rule present, an archive not on the list is never contacted: the check runs before the fetch and before the pool probe, and the client gets a 403 with the attempt recorded as `denied`. With no apt rule at all, enforcement for the type is off and every configured upstream is reachable, which is the same rule every other type follows.
+
+#### Resolving a pool path
+
+A pool request carries no codename. apt chose which archive to trust when it read a `Packages` file during `apt update`, and that decision is not recoverable from `GET /apt/pool/main/n/nginx/nginx_1.24.0-2ubuntu7_amd64.deb` — the request looks identical whichever suite produced it.
+
+So bodega probes. Every configured archive is tried in sorted order with a `HEAD`, the first that has the path wins, and the answer is remembered for an hour keyed on the pool path. A path no archive has is remembered as absent for the same hour, because apt retries a failed download and each retry would otherwise fan back out across every host.
+
+The consequence to know: **if two configured archives publish different bytes at one pool path, bodega serves whichever answered the probe first.** Real Debian and Ubuntu archives do not do this — a pool path names one version of one package, and security and updates hosts share the namespace deliberately — but a private mirror rebuilt from source can. Do not point `apt_upstreams` at two archives that disagree.
+
+#### Versions in the discovery log lose the epoch
+
+A pool row's package and version are parsed from the `.deb` filename, which is the only thing a pool request carries. Debian omits an epoch from that filename: `1:2.66-5ubuntu2.4` is published as `libpam-cap_2.66-5ubuntu2.4_arm64.deb`, so the row reads `2.66-5ubuntu2.4` while `apt policy` shows the epoch. The row still names the right artifact — the upstream URL beside it is exact — but a version copied out of `bodega discover show` into a manifest entry may need the epoch put back. Where an archive does encode it (`%3a`), bodega decodes it back to `:`.
+
+#### Sharing `pool/` with the build pipeline
+
+`bodega build fetch apt` builds `.deb`s into the same `pool/` tree that cached upstream artifacts land in. That is correct Debian layout, not a collision to design around: a real archive shares one flat pool across every suite.
+
+A pool path a manifest entry owns is never fetched from upstream. The check is on the entry, not on whether the object happens to be present, which matters in the window between `bodega pkg create` and `bodega pkg build`: the entry exists, storage is empty, and without the guard a miss would fetch some archive's artifact and cache it under bodega's own pool path. The `Packages` stanza already publishes a `SHA256` computed at package time, so the client would then reject bytes bodega handed it, against a package the operator built. Such a request 404s instead, which is the same answer it gave before upstreams were configured.
+
+#### Artifacts over 256 MB
+
+The proxy path buffers a whole artifact in memory before responding, so an artifact past 256 MB is **refused with a 502 naming the limit**, and neither the bytes nor a checksum for them is recorded. It is never truncated: a short body that reported success used to be checksummed as authoritative and cached under that digest. Serve an artifact that large from `pool/` directly, through the build pipeline or an out-of-band upload. Converting the proxy to a streaming path would remove the ceiling and is tracked separately.
 
 ### APT index generation
 
