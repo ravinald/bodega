@@ -65,7 +65,7 @@ type Server struct {
 	cache        CacheConfig
 	auditDB      *audit.DB
 	policy       *policy.Checker
-	discoverMode string             // "", "observe", "learn" — see internal/server/discovery.go
+	discoverMode string             // "" or "observe" — see internal/server/discovery.go
 	discovery    *DiscoveryRecorder // nil when discover_mode == "" or auditDB == nil
 	denyNets     []*net.IPNet
 	adminNets    []*net.IPNet // CIDRs allowed to reach the admin surface (admin_permit_cidr)
@@ -417,12 +417,6 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.discovery != nil {
 		go s.discovery.Start(ctx)
 		s.logger.Info("upstream discovery enabled", "mode", s.discoverMode)
-		if s.discoverMode == "learn" {
-			s.logger.Warn("discover_mode=learn — upstream policy enforcement is BYPASSED. " +
-				"All upstream requests will succeed and be logged for promotion. " +
-				"Run `bodega discover promote-all <type>` and switch back to \"observe\" once captured.")
-			go s.discoverLearnWarner(ctx)
-		}
 	}
 
 	// Start the serve loop.

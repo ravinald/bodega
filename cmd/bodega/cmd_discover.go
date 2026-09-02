@@ -30,8 +30,13 @@ func newDiscoverCmd(gf *globalFlags) *cobra.Command {
 		Long: `Auto-discover mode is configured server-side. Set "discover_mode" in
 config.json to one of:
 
-  "observe"  log every upstream fetch + still enforce the allow-list (safe to leave on)
-  "learn"    log + temporarily BYPASS the allow-list (loud WARN; for bootstrapping)
+  ""         off; nothing is recorded
+  "observe"  log every upstream fetch and every pre-fetch miss (safe to leave on)
+
+The mode decides whether a row is written and nothing else: the allow-list,
+catalog mode and every other check enforce the same either way. To bootstrap a
+catalog, read the host's own inventory with 'bodega pkg convert' rather than
+watching traffic; discovery answers what the catalog does not cover.
 
 Use these subcommands to review what's been captured and turn observations
 into policy rules.`,
@@ -80,7 +85,7 @@ Examples:
 			}
 			if len(rows) == 0 {
 				fmt.Println("No discovery observations yet.")
-				fmt.Println("(Set \"discover_mode\" to \"observe\" or \"learn\" in config.json and restart bodega.)")
+				fmt.Println("(Set \"discover_mode\" to \"observe\" in config.json and restart bodega.)")
 				return nil
 			}
 
@@ -203,8 +208,8 @@ func newDiscoverPromoteAllCmd(gf *globalFlags) *cobra.Command {
 		Short: "Bulk-promote every captured pattern for a type",
 		Long: `--as policy (the default) inserts an allow-list rule for every distinct
 pattern observed for the given type. Already-existing rules are skipped
-(duplicate-key on upstream_policies). Use this after a learn-mode window to
-bootstrap the allow-list from real client traffic.
+(duplicate-key on upstream_policies). Use this after an observe window to
+widen the allow-list to what clients actually reached for.
 
 --as manifest writes a package manifest entry for every no_manifest
 observation of the type instead, and is idempotent: a second run adds
@@ -589,7 +594,7 @@ func promoteManifest(gf *globalFlags, out io.Writer, regType, pattern string) er
 		return fmt.Errorf("count discovery rows for %s: %w", regType, err)
 	}
 	if total == 0 {
-		return fmt.Errorf("no discovery observations for %s at all: set \"discover_mode\" to \"observe\" or \"learn\" in %s, restart bodega, then re-drive the client traffic you want captured",
+		return fmt.Errorf("no discovery observations for %s at all: set \"discover_mode\" to \"observe\" in %s, restart bodega, then re-drive the client traffic you want captured",
 			regType, config.ConfigPath())
 	}
 

@@ -8,16 +8,20 @@ import (
 	"time"
 )
 
-// Decision values recorded on a DiscoveryRow. The first four come from the
+// Decision values recorded on a DiscoveryRow. The first three come from the
 // policy check inside proxyOrCache; the last two come from handlers that
 // decide before it, where no upstream fetch was ever attempted.
 //
 // The set is constrained by a CHECK on upstream_discovery — a value added here
 // needs a migration widening that constraint or every write of it fails.
+//
+// "would_deny" was a sixth value, written only under the retired
+// discover_mode=learn. Migration 010 rewrote those rows to denied and narrowed
+// the CHECK; a database rolled back below 010 can still hold the string, so a
+// reader must not assume the set here is exhaustive of what it will scan.
 const (
 	DecisionAllowed     = "allowed"
 	DecisionDenied      = "denied"
-	DecisionWouldDeny   = "would_deny"
 	DecisionNoPolicy    = "no_policy"
 	DecisionNoManifest  = "no_manifest"  // request named a package with no manifest entry
 	DecisionNoNamespace = "no_namespace" // request named a namespace no upstream is configured for

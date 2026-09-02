@@ -93,7 +93,7 @@ type Config struct {
 	GomodUpstream     string   `json:"gomod_upstream,omitempty"`
 	NpmUpstream       string   `json:"npm_upstream,omitempty"`
 	CargoUpstream     string   `json:"cargo_upstream,omitempty"`
-	DiscoverMode      string   `json:"discover_mode,omitempty"` // "", "observe", "learn" — see internal/server/discovery.go
+	DiscoverMode      string   `json:"discover_mode,omitempty"` // "" or "observe" — see internal/server/discovery.go
 	GomodRoot         string   `json:"gomod_root,omitempty"`
 	HelmRoot          string   `json:"helm_root,omitempty"`
 	NpmRoot           string   `json:"npm_root,omitempty"`
@@ -417,12 +417,17 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	cfg.NpmUpstream = firstNonEmpty(cfg.NpmUpstream, "https://registry.npmjs.org")
 	cfg.CargoUpstream = firstNonEmpty(cfg.CargoUpstream, "https://index.crates.io")
 
-	// Discover mode: "", "observe", or "learn" — typo'd values fail loudly so
-	// operators don't silently lose observability.
+	// Discover mode: "" or "observe" — typo'd values fail loudly so operators
+	// don't silently lose observability. "learn" is named separately because a
+	// config file carrying it worked on the previous release, and the operator
+	// needs to know where the capability went rather than that a value is bad.
 	switch cfg.DiscoverMode {
-	case "", "observe", "learn":
+	case "", "observe":
+	case "learn":
+		return nil, errors.New(`discover_mode "learn" was removed: it suppressed the upstream allow-list and recorded nothing "observe" does not. ` +
+			`Use "observe", which logs every upstream request with enforcement left on, and bootstrap the catalog with "bodega pkg convert <type> | bodega pkg import -" from a host that already has the packages installed`)
 	default:
-		return nil, fmt.Errorf("invalid discover_mode %q (want \"\", \"observe\", or \"learn\")", cfg.DiscoverMode)
+		return nil, fmt.Errorf("invalid discover_mode %q (want \"\" or \"observe\")", cfg.DiscoverMode)
 	}
 
 	// Audit.
@@ -751,7 +756,7 @@ func defaultConfigContent() []byte {
   "_comment_binary_upstreams_auth": "Only public, unauthenticated upstreams are supported. A namespace pointing at a private release endpoint fails as a 404 with no credential prompt, which looks identical to a typo in the path — check the upstream by hand before hunting the path.",
   "binary_upstreams": {},
 
-  "_comment_discover": "Discover mode: \"\" off, \"observe\" log + still enforce policy, \"learn\" log + bypass policy (loud WARN). See bodega discover --help.",
+  "_comment_discover": "Discover mode: \"\" off, \"observe\" record every upstream request bodega could not answer from its own manifests. It changes no decision: the allow-list, catalog mode, version constraints and the ACLs enforce the same either way. See bodega discover --help.",
   "discover_mode": "",
 
   "gomod_root": "",

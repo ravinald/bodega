@@ -38,8 +38,7 @@ type DiscoveryRecorder struct {
 	logger *slog.Logger
 	ch     chan audit.DiscoveryRow
 
-	dropped  atomic.Uint64 // rows lost to a full queue
-	bypassed atomic.Uint64 // cumulative would_deny in learn mode
+	dropped atomic.Uint64 // rows lost to a full queue
 }
 
 // NewDiscoveryRecorder constructs a recorder backed by db. The returned value
@@ -59,32 +58,11 @@ func (r *DiscoveryRecorder) Record(row audit.DiscoveryRow) {
 	if r == nil {
 		return
 	}
-	if row.Decision == audit.DecisionWouldDeny {
-		r.bypassed.Add(1)
-	}
 	select {
 	case r.ch <- row:
 	default:
 		r.dropped.Add(1)
 	}
-}
-
-// BypassedCount returns the running tally of would_deny observations (learn
-// mode). The warner goroutine reads + resets this via BypassedReset.
-func (r *DiscoveryRecorder) BypassedCount() uint64 {
-	if r == nil {
-		return 0
-	}
-	return r.bypassed.Load()
-}
-
-// BypassedReset returns the current bypass count and zeroes the counter
-// atomically. Called by the 60s warner so each tick reports rate, not total.
-func (r *DiscoveryRecorder) BypassedReset() uint64 {
-	if r == nil {
-		return 0
-	}
-	return r.bypassed.Swap(0)
 }
 
 // Start drains the queue until ctx is cancelled. Spawn it once from the server
@@ -135,16 +113,15 @@ func (r *DiscoveryRecorder) write(ctx context.Context, row audit.DiscoveryRow) {
 	}
 }
 
-// classifyDecision maps the policy check result + discover_mode onto the
-// discovery row's `decision` column. See proxy.go for the call site.
-func classifyDecision(hasRules, violation bool, mode string) string {
+// classifyDecision maps the policy check result onto the discovery row's
+// `decision` column. discover_mode is not an input: it decides whether a row
+// is written, never what the row says. See proxy.go for the call site.
+func classifyDecision(hasRules, violation bool) string {
 	switch {
 	case !hasRules:
 		return audit.DecisionNoPolicy
 	case !violation:
 		return audit.DecisionAllowed
-	case mode == "learn":
-		return audit.DecisionWouldDeny
 	default:
 		return audit.DecisionDenied
 	}
@@ -273,29 +250,4 @@ func pkgVersionFromKey(key string) string {
 		}
 	}
 	return ""
-}
-
-// learnModeWarnPeriod is how often the warner goroutine reminds operators that
-// learn mode is bypassing the allow-list. Loud is the point.
-const learnModeWarnPeriod = 60 * time.Second
-
-// discoverLearnWarner emits a periodic WARN while learn mode is active and
-// reports the rate of bypassed requests. Stops when ctx is cancelled.
-func (s *Server) discoverLearnWarner(ctx context.Context) {
-	if s.discovery == nil {
-		return
-	}
-	t := time.NewTicker(learnModeWarnPeriod)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			bypassed := s.discovery.BypassedReset()
-			s.logger.Warn("discover_mode=learn — policy enforcement is BYPASSED",
-				"bypassed_in_window", bypassed,
-				"window", learnModeWarnPeriod.String())
-		}
-	}
 }

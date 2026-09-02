@@ -283,6 +283,49 @@ func TestSave_OmitsRuntimeAndUnsetFields(t *testing.T) {
 	}
 }
 
+// discover_mode "learn" was accepted through the previous release, so an
+// operator meets this error on a config file they did not touch. The message
+// has to say where the capability went, not that a value is invalid: the test
+// pins both halves of the redirection, and that "observe" still loads.
+func TestDiscoverModeLearnIsRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode string
+		wants      []string
+	}{
+		{name: "observe still loads", mode: "observe"},
+		{name: "learn names its replacement", mode: "learn", wants: []string{"observe", "bodega pkg convert"}},
+		{name: "typo still fails", mode: "obsrve", wants: []string{`invalid discover_mode "obsrve"`}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateConfig(t)
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, []byte(`{"discover_mode": "`+tc.mode+`"}`), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			t.Setenv(config.EnvConfigFile, path)
+
+			cfg, err := config.Load(t.TempDir(), "", "", "", false, false)
+			if len(tc.wants) == 0 {
+				if err != nil {
+					t.Fatalf("Load: %v", err)
+				}
+				if cfg.DiscoverMode != tc.mode {
+					t.Errorf("DiscoverMode = %q, want %q", cfg.DiscoverMode, tc.mode)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Load accepted discover_mode %q", tc.mode)
+			}
+			for _, want := range tc.wants {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("Load error = %v, want mention of %q", err, want)
+				}
+			}
+		})
+	}
+}
+
 // TestLoad_TLSPair covers the half-configured pair. Load refuses it rather
 // than handing the server a Config whose only distinguishable state is "no
 // TLS", which is the same state as an operator who wanted none.

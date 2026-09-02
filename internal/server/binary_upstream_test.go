@@ -163,8 +163,8 @@ func TestBinaryOpenServesFromCache(t *testing.T) {
 // policy state and pins the decision recorded and the status returned.
 //
 // A miss reaches fetchUpstream, whose host does not resolve, so "the fetch was
-// attempted" reads as 502. That is the assertion separating learn from observe:
-// both record, only learn proceeds past the deny.
+// attempted" reads as 502. The deny rows are 403 at both modes: discover_mode
+// decides whether a row is written and nothing about the response.
 func TestBinaryOpenMatrix(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -178,8 +178,6 @@ func TestBinaryOpenMatrix(t *testing.T) {
 		{"observe, no rules", "observe", "", http.StatusBadGateway, audit.DecisionNoPolicy},
 		{"observe, allow", "observe", "https://releases.hashicorp.invalid/terraform/", http.StatusBadGateway, audit.DecisionAllowed},
 		{"observe, deny", "observe", "https://elsewhere.example/", http.StatusForbidden, audit.DecisionDenied},
-		{"learn, no rules", "learn", "", http.StatusBadGateway, audit.DecisionNoPolicy},
-		{"learn, deny bypassed", "learn", "https://elsewhere.example/", http.StatusBadGateway, audit.DecisionWouldDeny},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := binaryServer(t, tc.mode)
@@ -213,6 +211,70 @@ func TestBinaryOpenMatrix(t *testing.T) {
 	}
 }
 
+// The invariant that replaced the learn-versus-observe split: an upstream the
+// allow-list rejects is refused, at every discover_mode config.Load accepts.
+// The 403 is the assertion, not the recorded row — a mode that let the fetch
+// proceed would read as 502 here, which is what learn mode used to do.
+//
+// The mode list is the accepted set, so re-adding a value that suppresses
+// enforcement means either a row here fails or the list stops matching what
+// config.Load takes; TestDiscoverModeLearnIsRejected pins the other half.
+func TestUpstreamViolationRefusedAtEveryDiscoverMode(t *testing.T) {
+	for _, mode := range []string{"", "observe"} {
+		name := mode
+		if name == "" {
+			name = "off"
+		}
+		t.Run(name, func(t *testing.T) {
+			s := binaryServer(t, mode)
+			seedBinaryPolicy(t, s, "https://elsewhere.example/")
+
+			if got := getBinary(t, s, "/binaries/"+terraformPkg); got != http.StatusForbidden {
+				t.Errorf("status = %d, want 403 — discover_mode %q must not suppress the allow-list", got, mode)
+			}
+		})
+	}
+}
+
+// Retiring learn mode must not narrow observe. Every decision the discovery
+// log can carry is driven here, plus the 403 that proves the allow-list still
+// bites under the mode that records: an over-reaching removal that took the
+// recorder, the mode guard or a classification branch with it fails here
+// rather than in a fleet whose drift report quietly went empty.
+//
+// A server per row rather than one server for all five. The deny path writes a
+// policy_violation audit event from the request goroutine while the recorder's
+// worker writes the discovery row, and on a shared handle those two contend;
+// piling five requests onto one server makes the test measure SQLite locking
+// instead of what it claims to (#161).
+func TestObserveRecordsEveryDecisionAndStillEnforces(t *testing.T) {
+	for _, tc := range []struct {
+		name, rule, path string
+		wantStatus       int
+		wantDecision     string
+	}{
+		{"no_policy", "", "/binaries/" + terraformPkg, http.StatusBadGateway, audit.DecisionNoPolicy},
+		{"allowed", hashicorpURL + "terraform/", "/binaries/" + terraformPkg, http.StatusBadGateway, audit.DecisionAllowed},
+		// The 403 is the assertion, not the row: under learn mode this same
+		// request returned 502 because the fetch went ahead anyway.
+		{"denied", "https://elsewhere.example/", "/binaries/" + terraformPkg, http.StatusForbidden, audit.DecisionDenied},
+		{"no_manifest", "", "/binaries/vendor/tool/2.0/tool.tar.gz", http.StatusNotFound, audit.DecisionNoManifest},
+		{"no_namespace", "", "/binaries/mytool/1.0.0/mytool_linux_amd64", http.StatusNotFound, audit.DecisionNoNamespace},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := binaryServer(t, "observe")
+			if tc.rule != "" {
+				seedBinaryPolicy(t, s, tc.rule)
+			}
+
+			if got := getBinary(t, s, tc.path); got != tc.wantStatus {
+				t.Errorf("status = %d, want %d", got, tc.wantStatus)
+			}
+			waitForBinaryRows(t, s, tc.wantDecision, 1)
+		})
+	}
+}
+
 // The catalog half. A path no manifest entry names 404s without a fetch, at
 // every discover_mode; only the row differs.
 func TestBinaryCatalogMatrix(t *testing.T) {
@@ -221,7 +283,6 @@ func TestBinaryCatalogMatrix(t *testing.T) {
 	}{
 		{"off", "", ""},
 		{"observe", "observe", audit.DecisionNoManifest},
-		{"learn", "learn", audit.DecisionNoManifest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := binaryServer(t, tc.mode)
