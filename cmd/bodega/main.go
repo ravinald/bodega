@@ -94,6 +94,16 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 		SilenceUsage: true,
 	}
 
+	// The one place every verb passes through on its way out. Cobra runs the
+	// nearest PersistentPostRun after a RunE that returned nil, and no other
+	// command in the tree defines one, so this hook sees every successful
+	// invocation and signals for the ones classified in the trees below.
+	root.PersistentPostRun = func(cmd *cobra.Command, _ []string) {
+		if intent, ok := reloadIntent(cmd); ok && intent == reloadSignal {
+			notifyServer(gf)
+		}
+	}
+
 	// Persistent flags apply to every sub-command.
 	pf := root.PersistentFlags()
 	pf.StringVar(&gf.bucket, "bucket", "", "S3 bucket name (env: REPO_BUCKET)")
@@ -140,12 +150,12 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 		Short: "Build pipeline operations (fetch, run, upload, sync, status)",
 	}
 	buildParent.AddCommand(
-		newFetchCmd(gf),
-		newBuildRunCmd(gf),
-		newUploadCmd(gf),
-		newSyncCmd(gf),
-		newStatusCmd(gf),
-		newPackageCmd(gf),
+		signalsReload(newFetchCmd(gf)),
+		signalsReload(newBuildRunCmd(gf)),
+		signalsReload(newUploadCmd(gf)),
+		signalsReload(newSyncCmd(gf)),
+		noReloadSignal(newStatusCmd(gf)),
+		noReloadSignal(newPackageCmd(gf)),
 	)
 
 	// Package management commands: bodega pkg {create,edit,delete,freeze,hide,refresh,verify,checksum,storage,move}
@@ -155,19 +165,19 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 		Short:   "Package management (create, edit, delete, freeze, hide, refresh, verify, storage, move)",
 	}
 	pkgParent.AddCommand(
-		newCreateCmd(gf),
-		newEditCmd(gf),
-		newImportCmd(gf),
-		newExportCmd(gf),
-		newDeleteCmd(gf),
-		newRemoveCmd(gf),
-		newFreezeCmd(gf),
-		newHideCmd(gf),
-		newRefreshCmd(gf),
-		newVerifyCmd(gf),
-		newChecksumCmd(gf),
-		newStorageCmd(gf),
-		newMoveCmd(gf),
+		signalsReload(newCreateCmd(gf)),
+		signalsReload(newEditCmd(gf)),
+		signalsReload(newImportCmd(gf)),
+		noReloadSignal(newExportCmd(gf)),
+		signalsReload(newDeleteCmd(gf)),
+		signalsReload(newRemoveCmd(gf)),
+		signalsReload(newFreezeCmd(gf)),
+		signalsReload(newHideCmd(gf)),
+		signalsReload(newRefreshCmd(gf)),
+		noReloadSignal(newVerifyCmd(gf)),
+		noReloadSignal(newChecksumCmd(gf)),
+		noReloadSignal(newStorageCmd(gf)),
+		signalsReload(newMoveCmd(gf)),
 	)
 
 	// Audit commands: bodega audit {events,check}
@@ -180,23 +190,25 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 		newAuditCheckCmd(gf),
 	)
 
-	// Top-level commands.
+	// Top-level commands. A group classified here carries its whole subtree:
+	// apt, token, acl, policy and discover write state the server re-reads on
+	// its own cadence or on the reload their runbooks already name.
 	root.AddCommand(
 		buildParent,
 		pkgParent,
-		auditParent,
-		newAptCmd(gf),
-		newTokenCmd(gf),
-		newACLCmd(gf),
-		newPolicyCmd(gf),
-		newDiscoverCmd(gf),
-		newShowCmd(gf),
-		newDashboardCmd(gf),
-		newInitCmd(gf),
-		newShellCmd(gf),
-		newServeCmd(gf),
-		newRepairCmd(gf),
-		newResetCmd(gf),
+		noReloadSignal(auditParent),
+		noReloadSignal(newAptCmd(gf)),
+		noReloadSignal(newTokenCmd(gf)),
+		noReloadSignal(newACLCmd(gf)),
+		noReloadSignal(newPolicyCmd(gf)),
+		noReloadSignal(newDiscoverCmd(gf)),
+		noReloadSignal(newShowCmd(gf)),
+		noReloadSignal(newDashboardCmd(gf)),
+		noReloadSignal(newInitCmd(gf)),
+		noReloadSignal(newShellCmd(gf)),
+		noReloadSignal(newServeCmd(gf)),
+		signalsReload(newRepairCmd(gf)),
+		signalsReload(newResetCmd(gf)),
 	)
 
 	return root

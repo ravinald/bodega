@@ -135,7 +135,6 @@ When a name is given after the type, only that entry is fetched.`,
 			if err := store.SaveIndex(ctx); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: could not update metrics: %v\n", err)
 			}
-			notifyServer(gf)
 
 			if failures > 0 {
 				return fmt.Errorf("%d fetch(es) failed", failures)

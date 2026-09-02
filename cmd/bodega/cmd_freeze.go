@@ -80,7 +80,6 @@ already-frozen entry unfreezes it.`,
 				})
 				adb.Close()
 			}
-			notifyServer(gf)
 			return nil
 		},
 	}

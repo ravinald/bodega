@@ -183,7 +183,6 @@ Examples:
 				adb.Close()
 			}
 
-			notifyServer(gf)
 			return nil
 		},
 	}

@@ -248,7 +248,6 @@ If no types are given all four are uploaded.`,
 			if err := store.SaveIndex(ctx); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: could not update metrics: %v\n", err)
 			}
-			notifyServer(gf)
 
 			return nil
 		},

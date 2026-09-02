@@ -55,8 +55,8 @@ New versions are created as manifest records but not fetched until you run
 			if err != nil {
 				return err
 			}
-			if created > 0 {
-				notifyServer(gf)
+			if created == 0 {
+				suppressReload(cmd)
 			}
 			return nil
 		},

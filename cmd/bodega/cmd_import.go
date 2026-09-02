@@ -138,7 +138,6 @@ Examples:
 			if imported > 1 {
 				fmt.Printf("Imported %d packages\n", imported)
 			}
-			notifyServer(gf)
 			return nil
 		},
 	}

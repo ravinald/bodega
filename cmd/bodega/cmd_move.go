@@ -118,7 +118,6 @@ anything is copied. Each object would land on the one it was read from, and
 					return err
 				}
 			}
-			notifyServer(gf)
 			return nil
 		},
 	}
