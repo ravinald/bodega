@@ -101,7 +101,6 @@ Frozen entries cannot be deleted; unfreeze them first with 'bodega freeze'.`,
 				adb.Close()
 			}
 
-			notifyServer(gf)
 			return nil
 		},
 	}

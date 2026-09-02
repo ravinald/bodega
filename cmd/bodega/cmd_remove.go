@@ -49,7 +49,6 @@ as one that held the artifact.`,
 				return err
 			}
 			fmt.Printf("Deleted %d object(s).\n", len(removed))
-			notifyServer(gf)
 			return nil
 		},
 	}

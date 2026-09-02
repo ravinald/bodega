@@ -81,8 +81,8 @@ after an interruption is safe.`,
 			if err := r.run(ctx, types); err != nil {
 				return err
 			}
-			if !dryRun && r.copied > 0 {
-				notifyServer(gf)
+			if dryRun || r.copied == 0 {
+				suppressReload(cmd)
 			}
 			return nil
 		},

@@ -201,7 +201,6 @@ re-run with --editor cat to inspect, or copy and retry.`,
 			} else {
 				fmt.Printf("Updated %s/%s (%d version(s))\n", t, name, len(pm.Versions))
 			}
-			notifyServer(gf)
 			return nil
 		},
 	}

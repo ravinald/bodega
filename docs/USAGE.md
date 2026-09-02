@@ -1012,11 +1012,13 @@ A rebuild happens on:
 | Trigger | Notes |
 |---------|-------|
 | Server start | Before the listener binds, so no request ever sees an empty index |
-| `SIGHUP` | After the manifest reload and the signing-key reload. Every mutating `bodega pkg` verb sends one. The same signal re-reads the CIDR access lists |
+| `SIGHUP` | After the manifest reload and the signing-key reload. Sent by every CLI verb that changes what is served, from one hook on the root command rather than from each verb's own code. The same signal re-reads the CIDR access lists |
 | A mutation-API write to an apt entry | `POST`, `DELETE`, and the hide and freeze toggles |
 | A ticker | Hourly once an index exists; 15s, 30s, 60s and on up to hourly until one does |
 
-**A manifest edited by hand is picked up on the next tick, or at once on `SIGHUP`** (`kill -HUP $(cat <log_dir>/bodega.pid)`). The tick re-reads the manifest index from the backend before rebuilding, so an edit made outside the process reaches the index without a signal; the wait is up to an hour. Every mutating CLI verb signals, so the normal workflow never waits.
+**A manifest edited by hand is picked up on the next tick, or at once on `SIGHUP`** (`kill -HUP $(cat <log_dir>/bodega.pid)`). The tick re-reads the manifest index from the backend before rebuilding, so an edit made outside the process reaches the index without a signal; the wait is up to an hour. A verb that changes what is served signals, so the normal workflow never waits, and the tick is the floor under a signal that never arrived.
+
+Which verbs signal is declared once per command where it is registered in `cmd/bodega/main.go`, and a group answers for its subtree. `TestEveryRunnableCommandIsClassified` fails the build on a command that declares neither, because a verb missing its signal looks exactly like a verb that never needed one: `pkg hide`, `freeze`, `refresh` and `remove` each shipped without it, and a hidden package stayed published until someone restarted the server. `bodega apt key` and `bodega acl` are in the quiet group on purpose: the rotation runbook above signals with `systemctl reload`, and the access lists carry their own 30s cache.
 
 The retry interval matters because a snapshot that never built is a 503 on every apt request, and the ordinary way to land there is transient: expired credentials, or a network that was not up when systemd started the unit. Those clear in seconds and the first few attempts catch them. A wrong bucket, revoked credentials or a role that lost `s3:ListBucket` never clears at all, so the interval doubles up to the hourly one: 7 attempts in the first hour rather than 240, each of which is a manifest reload, a pool listing and an `ERROR` line against a dependency already failing. The first snapshot puts the loop straight back on the hourly interval however far the retry had walked.
 

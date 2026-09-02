@@ -184,8 +184,8 @@ func newRepairCmd(gf *globalFlags) *cobra.Command {
 			} else {
 				fmt.Println("No issues found. Everything is consistent.")
 			}
-			if !dryRun {
-				notifyServer(gf)
+			if dryRun {
+				suppressReload(cmd)
 			}
 			return nil
 		},
