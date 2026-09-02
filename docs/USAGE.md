@@ -529,24 +529,26 @@ Discovery records what clients reached for that bodega could not serve from its 
 
 The mode is server-side. Set `discover_mode` in config.json and restart:
 
-| Value | Enforcement | What gets logged |
-|-------|-------------|------------------|
-| `""` (default) | allow-list enforced | nothing; the hook is off |
-| `"observe"` | allow-list enforced | every observation, including the fetches the allow-list blocked (`denied`) |
-| `"learn"` | allow-list **bypassed** | every observation, with blocked fetches marked `would_deny` and allowed through |
+| Value          | What gets logged                                                            |
+| -------------- | --------------------------------------------------------------------------- |
+| `""` (default) | nothing; the hook is off                                                    |
+| `"observe"`    | every upstream attempt and every pre-fetch miss, with the decision each got |
 
-`learn` is for bootstrapping a fresh install: point a clean host at bodega, let it install, and read back what it asked for. It logs a WARN every 60 seconds naming how many requests it let past the allow-list, because a `learn` server left running is an open proxy. Switch back to `observe` once you have captured what you need.
+`discover_mode` decides whether a row is written. It decides nothing else. The allow-list, `catalog` mode on `git_upstreams` and `binary_upstreams`, hidden versions, version constraints, the CIDR access lists and the mutation gate all behave identically at both values, and a request the allow-list rejects gets its 403 either way. `observe` is safe to leave on permanently, and there is no mode that turns enforcement off.
+
+It is also not the way to bootstrap a catalog. Discovery only sees what clients ask for, so a host that has been stable for six months produces nothing, and `catalog` mode 404s a path before any policy check runs — so an empty store stays empty however long you watch it. Read the host's own inventory instead: [`bodega pkg convert`](#bodega-pkg-convert-type-file-) turns `dpkg-query`, `pip list`, `npm ls -g`, `go list -m all`, `cargo install --list` or `helm list` into a manifest set in one run. What discovery is for is the residue: once a catalog exists, `observe` names what the fleet reaches for that the catalog does not cover, including the two types `pkg convert` has no importer for (git and binary).
 
 Each observation is one row keyed by `(type, pattern, package, version, decision)`, with a request count, the last client IP, and the upstream URL bodega fetched or would have fetched. The `decision` column carries one of:
 
-| Decision | Meaning |
-|----------|---------|
-| `allowed` | an allow-list rule matched the upstream |
-| `denied` | the allow-list rejected it; the client got a 403 |
-| `would_deny` | the allow-list rejected it and `learn` mode let it through anyway |
-| `no_policy` | no allow-list rules exist for the type, so nothing was checked |
-| `no_manifest` | the request named a package with no manifest entry; the client got a 404 |
-| `no_namespace` | the request named a namespace no upstream is configured for |
+| Decision       | Meaning                                                                  |
+| -------------- | ------------------------------------------------------------------------ |
+| `allowed`      | an allow-list rule matched the upstream                                  |
+| `denied`       | the allow-list rejected it; the client got a 403                         |
+| `no_policy`    | no allow-list rules exist for the type, so nothing was checked           |
+| `no_manifest`  | the request named a package with no manifest entry; the client got a 404 |
+| `no_namespace` | the request named a namespace no upstream is configured for              |
+
+An audit database written under the retired `discover_mode: "learn"` also holds `would_deny` rows: an upstream the allow-list rejected while learn mode let the fetch proceed. Upgrading relabels them `denied`, merging counts where a `denied` row for the same package already existed. Nothing is deleted, and nothing writes `would_deny` again.
 
 #### What is observed
 
@@ -591,12 +593,12 @@ It never rewrites what is already there. A version already in the manifest is sk
 
 #### `bodega discover promote-all <type> [--as policy|manifest]`
 
-The same two targets, applied to every bucket of the type at once. This is the command to run after a `learn` window.
+The same two targets, applied to every bucket of the type at once. This is the command to run against an `observe` window, once you have a catalog and want to close the gaps in it.
 
 ```bash
-# 1. Set "discover_mode": "learn" in config.json, restart bodega.
-# 2. Point a clean host at it and install what it needs.
-# 3. Read back what it reached for.
+# 1. Set "discover_mode": "observe" in config.json, restart bodega. Leave it on.
+# 2. Let the fleet run against it for as long as you want to sample.
+# 3. Read back what it reached for that bodega could not answer.
 bodega discover list
 
 TYPE   PATTERN           HOST                COUNT  DECISIONS    LAST SEEN
@@ -606,9 +608,9 @@ npm    lodash            registry.npmjs.org  4      no_policy    2026-09-01 14:2
 # 4. Turn the packages into manifest entries, and the patterns into rules.
 bodega discover promote-all gomod --as manifest
 bodega discover promote-all gomod
-
-# 5. Set "discover_mode" back to "observe" and restart.
 ```
+
+Nothing here needs enforcement relaxed, so nothing has to be switched back afterwards. The `denied` rows are the report worth reading twice: each one is a package a client wanted and the allow-list refused, which is either a rule to add or a client to fix.
 
 #### `bodega discover clear [type]`
 
@@ -735,7 +737,7 @@ The copy happens once rather than the file being read as a fallback on every sta
 
 Set it whenever a reverse proxy terminates TLS or publishes a different hostname. bodega then sees a loopback listener with both TLS keys empty, so `tls_cert`/`tls_key` describe the proxy's back end and nothing describes the URL an operator would copy. Deriving the scheme from that pair is what printed `http://` on the sources line of a deployment that is `https://` everywhere a client can see. With `public_url` unset, callers holding a request answer from the request (honoring `X-Forwarded-Proto` from a trusted peer), and callers with none print `<bodega-host>:8080` as a placeholder and say that it is one.
 
-`discover_mode` turns the upstream-observation log on. Valid values are `""` (off), `"observe"` and `"learn"`; anything else is rejected at load. See [`bodega discover ...`](#bodega-discover-) for what each one records and what to do with the result.
+`discover_mode` turns the upstream-observation log on, and does nothing else: enforcement does not move with it. Valid values are `""` (off) and `"observe"`; anything else is rejected at load. `"learn"` was removed and is refused by name, with the error pointing at `observe` and `bodega pkg convert` — it suppressed the allow-list and recorded nothing `observe` does not. See [`bodega discover ...`](#bodega-discover-) for what gets logged and what to do with it.
 
 `timezone` sets the display timezone for audit queries (default UTC) and `audit_events` limits which event types the CLI records (empty records all; `bodega serve` records every type regardless — see [Audit Trail](#audit-trail)).
 

@@ -165,9 +165,10 @@ func TestMigrationsAppliedToLegacyDB(t *testing.T) {
 	}
 }
 
-// Migration 009 widens the decision CHECK. A value the constraint rejects
-// fails at write time inside the recorder's worker goroutine, where the only
-// evidence is a warn line nobody reads, so the constraint is asserted here.
+// Migrations 009 and 010 move the decision CHECK. A value the constraint
+// rejects fails at write time inside the recorder's worker goroutine, where
+// the only evidence is a warn line nobody reads, so the constraint is
+// asserted here.
 func TestDiscoveryDecisionsSurviveTheCheckConstraint(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "audit.db"))
 	if err != nil {
@@ -177,7 +178,7 @@ func TestDiscoveryDecisionsSurviveTheCheckConstraint(t *testing.T) {
 
 	ctx := context.Background()
 	for _, decision := range []string{
-		DecisionAllowed, DecisionDenied, DecisionWouldDeny, DecisionNoPolicy,
+		DecisionAllowed, DecisionDenied, DecisionNoPolicy,
 		DecisionNoManifest, DecisionNoNamespace,
 	} {
 		row := DiscoveryRow{
@@ -197,8 +198,22 @@ func TestDiscoveryDecisionsSurviveTheCheckConstraint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	if len(rows) != 6 {
-		t.Errorf("rows = %d, want 6 — the decision column is part of the primary key, so each value is its own row", len(rows))
+	if len(rows) != 5 {
+		t.Errorf("rows = %d, want 5 — the decision column is part of the primary key, so each value is its own row", len(rows))
+	}
+
+	// The retired value has to be refused rather than silently stored: a
+	// constraint that still accepted it would let a stale binary keep writing
+	// rows nothing reads back.
+	err = db.RecordDiscovery(ctx, DiscoveryRow{
+		RegistryType: "gomod",
+		PatternHint:  "github.com/aws/",
+		PkgName:      "github.com/aws/aws-sdk-go-v2",
+		PkgVersion:   "v1.31.0",
+		Decision:     "would_deny",
+	})
+	if err == nil {
+		t.Error("RecordDiscovery accepted would_deny; migration 010 did not narrow the CHECK")
 	}
 }
 
@@ -281,6 +296,98 @@ func TestMigration009PreservesRowsAndIndexes(t *testing.T) {
 	}
 	if dropped != 0 {
 		t.Errorf("no_manifest rows after down = %d, want 0", dropped)
+	}
+}
+
+// Migration 010 retires would_deny by relabeling, not by deleting. decision is
+// part of the primary key, so a would_deny row can collide with the denied row
+// for the same package; the merge is the half that a plain UPDATE would fail
+// on and a plain DELETE would hide. Both cases are seeded here.
+func TestMigration010RelabelsWouldDeny(t *testing.T) {
+	raw, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer func() { _ = raw.Close() }()
+
+	m := migrator(t, raw)
+	if err := m.Migrate(9); err != nil {
+		t.Fatalf("migrate to 009: %v", err)
+	}
+
+	// Explicit timestamps: the merge has to widen the window to cover both
+	// rows and carry the later row's client, which a defaulted `now` on every
+	// insert would make unobservable.
+	const seed = `INSERT INTO upstream_discovery
+	   (registry_type, pattern_hint, pkg_name, pkg_version, decision,
+	    first_seen, last_seen, last_client, request_count, upstream_url)
+	 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	for _, row := range [][]any{
+		{"gomod", "github.com/aws/", "github.com/aws/aws-sdk-go-v2", "v1.30.0", "denied",
+			"2026-01-02T00:00:00.000Z", "2026-01-02T00:00:00.000Z", "10.0.0.2", 3, "https://proxy.golang.org/x"},
+		{"gomod", "github.com/aws/", "github.com/aws/aws-sdk-go-v2", "v1.30.0", "would_deny",
+			"2026-01-01T00:00:00.000Z", "2026-01-03T00:00:00.000Z", "10.0.0.9", 4, "https://proxy.golang.org/x"},
+		{"npm", "lodash", "lodash", "4.17.21", "would_deny",
+			"2026-01-04T00:00:00.000Z", "2026-01-04T00:00:00.000Z", "10.0.0.7", 9, "https://registry.npmjs.org/lodash"},
+	} {
+		if _, err := raw.Exec(seed, row...); err != nil {
+			t.Fatalf("seed row at 009: %v", err)
+		}
+	}
+
+	if err := m.Migrate(10); err != nil {
+		t.Fatalf("migrate to 010: %v", err)
+	}
+
+	var stillThere int
+	if err := raw.QueryRow(
+		`SELECT COUNT(*) FROM upstream_discovery WHERE decision = 'would_deny'`,
+	).Scan(&stillThere); err != nil {
+		t.Fatalf("count would_deny: %v", err)
+	}
+	if stillThere != 0 {
+		t.Errorf("would_deny rows after 010 = %d, want 0", stillThere)
+	}
+
+	var count int64
+	var firstSeen, lastSeen, lastClient string
+	if err := raw.QueryRow(
+		`SELECT request_count, first_seen, last_seen, last_client FROM upstream_discovery
+		 WHERE registry_type = 'gomod' AND decision = 'denied'`,
+	).Scan(&count, &firstSeen, &lastSeen, &lastClient); err != nil {
+		t.Fatalf("merged row missing: %v", err)
+	}
+	if count != 7 {
+		t.Errorf("request_count = %d, want 7 — the collision must add, not overwrite", count)
+	}
+	if firstSeen != "2026-01-01T00:00:00.000Z" || lastSeen != "2026-01-03T00:00:00.000Z" {
+		t.Errorf("window = %s..%s, want 2026-01-01..2026-01-03", firstSeen, lastSeen)
+	}
+	if lastClient != "10.0.0.9" {
+		t.Errorf("last_client = %q, want 10.0.0.9 — the later of the two rows", lastClient)
+	}
+
+	// The uncontested case: relabeled in place, count untouched.
+	if err := raw.QueryRow(
+		`SELECT request_count FROM upstream_discovery WHERE pkg_name = 'lodash' AND decision = 'denied'`,
+	).Scan(&count); err != nil {
+		t.Fatalf("relabeled npm row missing: %v", err)
+	}
+	if count != 9 {
+		t.Errorf("request_count = %d, want 9", count)
+	}
+
+	// Rolling back widens the constraint and keeps every row. The labels do
+	// not come back, which is what the down migration says it cannot do.
+	if err := m.Migrate(9); err != nil {
+		t.Fatalf("migrate down to 009: %v", err)
+	}
+	var kept int
+	if err := raw.QueryRow(`SELECT COUNT(*) FROM upstream_discovery`).Scan(&kept); err != nil {
+		t.Fatalf("count after down: %v", err)
+	}
+	if kept != 2 {
+		t.Errorf("rows after down = %d, want 2", kept)
 	}
 }
 

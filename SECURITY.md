@@ -31,4 +31,4 @@ Out of scope:
 - Bugs in upstream package registries that bodega proxies
 - The host operating system or container runtime that bodega runs on
 - Misuse of operator-controlled config (e.g. an allow-list that's too broad,
-  a `discover_mode: "learn"` window left on indefinitely)
+  or an `open` upstream namespace pointed at a public forge)
