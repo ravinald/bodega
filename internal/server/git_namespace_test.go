@@ -96,13 +96,19 @@ func TestGitNamespaceRecordsNoNamespace(t *testing.T) {
 	}
 }
 
-// A configured namespace records nothing: the config already names it, so the
-// discovery log has nothing to tell the operator. It still 404s here — the
-// smart-HTTP proxy that would serve it is a separate change.
+// A configured namespace records no no_namespace row: the config already names
+// it, so the discovery log has nothing to tell the operator about the key.
+//
+// The upstream here does not resolve, so the request ends at the 502 a failed
+// mirror clone produces. That is the assertion that matters for this test —
+// the request reached the clone rather than the namespace miss.
 func TestGitNamespaceConfiguredRecordsNothing(t *testing.T) {
 	s := newDiscoveryServer(t)
+	if s.gitTool == nil {
+		t.Skip("git-http-backend not installed; smart-HTTP is unrouted")
+	}
 	s.cfg.GitUpstreams = map[string]config.GitUpstream{
-		"corp": {URL: "https://git.corp.example/", Mode: config.UpstreamModeOpen},
+		"corp": {URL: "https://git.corp.example.invalid/", Mode: config.UpstreamModeOpen},
 	}
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
@@ -112,8 +118,8 @@ func TestGitNamespaceConfiguredRecordsNothing(t *testing.T) {
 		t.Fatalf("GET: %v", err)
 	}
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("GET configured namespace = %d, want 404", resp.StatusCode)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("GET configured namespace = %d, want 502 from the failed mirror clone", resp.StatusCode)
 	}
 
 	time.Sleep(250 * time.Millisecond)

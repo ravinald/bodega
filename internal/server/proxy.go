@@ -88,53 +88,9 @@ func (s *Server) proxyOrCache(w http.ResponseWriter, r *http.Request, store stor
 	}
 
 	// Upstream allow-list enforcement. Runs before fetchUpstream so a blocked
-	// candidate never hits the network. A nil checker or empty regType means
-	// policy is disabled (opt-in feature). When discover_mode == "learn", a
-	// violation is logged but the fetch is allowed to proceed (the entire
-	// point of learn mode is to discover what would otherwise be blocked).
-	if s.policy != nil && regType != "" && policyCandidate != "" {
-		hasRules, hasRulesErr := s.policy.HasRules(ctx, regType)
-		if hasRulesErr != nil {
-			s.logger.Error("policy rules lookup failed", "error", hasRulesErr)
-		}
-		err := s.policy.Check(ctx, regType, policyCandidate)
-		violation := err != nil && policy.IsViolation(err)
-		if err != nil && !violation {
-			s.logger.Error("policy check failed", "error", err)
-			http.Error(w, "policy check failed", http.StatusInternalServerError)
-			return
-		}
-
-		// Discovery log: record every upstream attempt with its decision so
-		// operators can review/forensically audit and later promote captured
-		// hosts/packages to allow-list rules. Decision classification:
-		//   no_policy  : no rules configured for this type (Check returns nil)
-		//   allowed    : a rule matched
-		//   denied     : violation in observe mode (or off); 403 returned
-		//   would_deny : violation while learn mode is active (fetch proceeds)
-		decision := classifyDecision(hasRules, violation, s.discoverMode)
-		s.recordDiscovery(ctx, r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, decision)
-
-		if violation && s.discoverMode != "learn" {
-			s.logger.Warn("upstream blocked by policy",
-				"type", regType, "candidate", policyCandidate, "url", upstreamURL)
-			if s.auditDB != nil {
-				_ = s.auditDB.Record(ctx, audit.Event{
-					EventType: audit.EventCache,
-					PkgType:   regType,
-					PkgName:   policyCandidate,
-					Status:    "policy_violation",
-					Details:   fmt.Sprintf("url=%s", upstreamURL),
-				})
-			}
-			http.Error(w, "upstream blocked by allow-list", http.StatusForbidden)
-			return
-		}
-		if violation {
-			// learn mode: log loudly that we just bypassed an explicit deny.
-			s.logger.Warn("policy violation BYPASSED by discover_mode=learn",
-				"type", regType, "candidate", policyCandidate, "url", upstreamURL)
-		}
+	// candidate never hits the network.
+	if !s.enforceUpstreamPolicy(w, r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key) {
+		return
 	}
 
 	s.logger.Info("cache miss, fetching upstream", "key", s3Key, "upstream", upstreamURL)
@@ -328,4 +284,67 @@ func (s *Server) verifyProxyChecksum(ctx context.Context, s3Key string, data []b
 
 	s.logger.Debug("checksum verified", "key", s3Key)
 	return nil
+}
+
+// enforceUpstreamPolicy runs the allow-list check and writes the discovery row
+// for one upstream attempt, returning false when it has already written the
+// response and the caller must stop.
+//
+// A nil checker or an empty regType means policy is disabled (opt-in feature).
+// When discover_mode == "learn", a violation is logged but the fetch is allowed
+// to proceed — the point of learn mode is to discover what would otherwise be
+// blocked.
+//
+// It is a method rather than inline in proxyOrCache because the git smart-HTTP
+// handler never reaches proxyOrCache: it execs git-http-backend against a local
+// mirror instead of fetching an object. Two copies of an allow-list gate is one
+// copy that stops matching the other.
+func (s *Server) enforceUpstreamPolicy(w http.ResponseWriter, r *http.Request, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key string) bool {
+	if s.policy == nil || regType == "" || policyCandidate == "" {
+		return true
+	}
+	ctx := r.Context()
+	hasRules, hasRulesErr := s.policy.HasRules(ctx, regType)
+	if hasRulesErr != nil {
+		s.logger.Error("policy rules lookup failed", "error", hasRulesErr)
+	}
+	err := s.policy.Check(ctx, regType, policyCandidate)
+	violation := err != nil && policy.IsViolation(err)
+	if err != nil && !violation {
+		s.logger.Error("policy check failed", "error", err)
+		http.Error(w, "policy check failed", http.StatusInternalServerError)
+		return false
+	}
+
+	// Discovery log: record every upstream attempt with its decision so
+	// operators can review/forensically audit and later promote captured
+	// hosts/packages to allow-list rules. Decision classification:
+	//   no_policy  : no rules configured for this type (Check returns nil)
+	//   allowed    : a rule matched
+	//   denied     : violation in observe mode (or off); 403 returned
+	//   would_deny : violation while learn mode is active (fetch proceeds)
+	decision := classifyDecision(hasRules, violation, s.discoverMode)
+	s.recordDiscovery(ctx, r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, decision)
+
+	if violation && s.discoverMode != "learn" {
+		s.logger.Warn("upstream blocked by policy",
+			"type", regType, "candidate", policyCandidate, "url", upstreamURL)
+		if s.auditDB != nil {
+			_ = s.auditDB.Record(ctx, audit.Event{
+				EventType: audit.EventCache,
+				PkgType:   regType,
+				PkgName:   policyCandidate,
+				Status:    "policy_violation",
+				Details:   fmt.Sprintf("url=%s", upstreamURL),
+			})
+		}
+		http.Error(w, "upstream blocked by allow-list", http.StatusForbidden)
+		return false
+	}
+	if violation {
+		// learn mode: log loudly that we just bypassed an explicit deny.
+		s.logger.Warn("policy violation BYPASSED by discover_mode=learn",
+			"type", regType, "candidate", policyCandidate, "url", upstreamURL)
+	}
+	return true
 }

@@ -14,6 +14,11 @@ import (
 // wrote, rebuilt from the ref parsed out of the request rather than pasted
 // from it.
 //
+// This is the legacy git route. Smart-HTTP under /git/{namespace}/ is what a
+// git client speaks; /git/{name}/{file} predates it and stays because scripts
+// fetch those bundles by URL. The two do not collide: a bundle path is two
+// segments and a clone path is at least four.
+//
 // The ref recovered here is also the manifest entry's identity, which is what
 // lets the read resolve through the backend the version records rather than
 // through the type rule. Resolving by type was safe only while nothing could
@@ -43,29 +48,38 @@ func (s *Server) handleGitBundle(w http.ResponseWriter, r *http.Request) {
 // handleGitNamespace answers /git/<namespace>/<path...>, the namespaced form
 // that maps onto a configured upstream forge.
 //
-// It resolves the namespace and nothing else. The smart-HTTP proxy that
-// composes the upstream URL and fetches through it is not written yet, so a
-// namespace bodega knows about reaches the same 404 as one it does not — the
-// difference is the discovery row, which is the operator-facing half: a
-// request for a namespace no config names is a request for a key nobody
-// added, and that is the fact worth recording.
+// It resolves the namespace and hands the rest to the smart-HTTP handler. A
+// namespace no config names 404s and leaves a discovery row, which is the
+// operator-facing half: a request for a namespace no config names is a request
+// for a key nobody added, and that is the fact worth recording.
 //
-// The three-segment bundle route (/git/{name}/{file}) is more specific than
-// this pattern and keeps winning for the paths it already served.
+// A configured namespace still 404s when git-http-backend did not resolve at
+// startup. That is the same answer this handler gave before smart-HTTP existed,
+// and the startup WARN naming the search is where the operator learns why.
+//
+// The two-segment bundle route (/git/{name}/{file}) is more specific than this
+// pattern and keeps winning for the paths it already served.
 func (s *Server) handleGitNamespace(w http.ResponseWriter, r *http.Request) {
-	ns, _, ok := splitNamespace(strings.TrimPrefix(r.URL.Path, "/git/"))
+	ns, rest, ok := splitNamespace(strings.TrimPrefix(r.URL.Path, "/git/"))
 	if !ok {
 		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
 	}
-	if _, configured := s.cfg.GitUpstreams[ns]; !configured {
+	gu, configured := s.cfg.GitUpstreams[ns]
+	if !configured {
 		// pattern_hint and pkg_name are both the namespace: the actionable
 		// unit is the key an operator would add to git_upstreams, and keying
 		// the row on the full request path would let any client grow the
 		// table one row per URL it invents.
 		s.recordDiscoveryRaw(r.Context(), r, manifest.TypeGit, "", ns, ns, "", audit.DecisionNoNamespace, "")
+		http.NotFound(w, r)
+		return
 	}
-	http.NotFound(w, r)
+	if s.gitTool == nil {
+		http.NotFound(w, r)
+		return
+	}
+	s.handleGitSmart(w, r, ns, rest, gu)
 }
 
 // splitNamespace splits a namespaced upstream path into its first segment and

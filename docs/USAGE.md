@@ -483,7 +483,7 @@ Each observation is one row keyed by `(type, pattern, package, version, decision
 | pypi | simple index, wheel | every upstream fetch; `no_manifest` on a wheel for an unknown distribution |
 | gomod | `/go/...` | every upstream fetch; `no_manifest` on a module with no entry |
 | helm | `/helm/charts/*.tgz` | every upstream fetch; `no_manifest` on a chart with no entry, with an empty upstream URL (a chart repo is named per version entry, so with no entry there is no URL to record) |
-| git | `/git/{namespace}/...` | `no_namespace` on a request whose first segment names no `git_upstreams` entry, with the namespace as both the package and the pattern |
+| git | `/git/{namespace}/...` | every smart-HTTP request under an `open` namespace, with an empty version; `no_manifest` on an uncataloged repository under a `catalog` one; `no_namespace` on a first segment naming no `git_upstreams` entry, with the namespace as both the package and the pattern |
 | binary | `/binaries/{namespace}/...` | every upstream fetch under an `open` namespace; `no_manifest` on an uncataloged path under a `catalog` one; `no_namespace` on a first segment naming no `binary_upstreams` entry, once any entry exists |
 
 #### Gaps
@@ -492,7 +492,7 @@ These are not observed yet. A quiet discovery log for one of them means the hook
 
 - **apt**: `/apt/pool/...` reads storage directly and has no upstream path at all, so neither a hit nor a miss is recorded.
 - **git bundles**: `/git/{name}/{file}` serves an uploaded bundle or release archive from storage. Nothing upstream, nothing logged.
-- **git namespaces bodega does know**: under `/git/{namespace}/...` a namespace named in `git_upstreams` records nothing, because the smart-HTTP proxy that would fetch through it is not implemented. Only the unconfigured namespace leaves a row.
+- **git mirror refreshes**: a smart-HTTP request records one row per request, but the periodic `git remote update` it triggers is not separately logged. The row says a client asked; it does not say whether that request also refreshed the mirror.
 - **binary outside a namespace**: with `binary_upstreams` empty, or on a path whose first segment names no entry in it, `/binaries/...` reads storage and records nothing. The `no_namespace` row above is the second case; the first is an install that has not opted in.
 - **helm `index.yaml`** and the generated apt indexes: regenerated locally, never fetched.
 - **cache hits of any type**: the log counts upstream fetches and pre-cache misses. A package already in the cache is served without a row, so `request_count` under-reports by however well the cache is working, and `last_client` names whoever caused the miss rather than the last host to ask.
@@ -1011,6 +1011,59 @@ helm repo add bodega https://bodega-host:8080/helm
 ```bash
 npm install --registry https://bodega-host:8080/npm <package>
 ```
+
+**git** (a `git_upstreams` namespace, clone URL ending in `.git`):
+```bash
+git clone https://bodega-host:8080/git/github/octocat/Hello-World.git
+```
+
+See [Git smart-HTTP](#git-smart-http) for what bodega does with that request.
+
+### Git smart-HTTP
+
+`git clone` against bodega speaks the same protocol it speaks against a forge. A `git_upstreams` namespace (see [Git upstreams](DESIGN.md#git-upstreams) for the config shape) maps onto an upstream, and bodega keeps a bare mirror of every repository a client has asked for.
+
+```
+GET  /git/{namespace}/{org}/{repo}.git/info/refs?service=git-upload-pack
+POST /git/{namespace}/{org}/{repo}.git/git-upload-pack
+```
+
+Those two suffixes are the whole served surface. Every other path under a namespace is a 404, including `HEAD` and `objects/info/packs`: bodega does not serve the dumb-HTTP protocol. The clone URL must end in `.git`, which is what a client types anyway.
+
+On the first request bodega runs `git clone --mirror` into `{storage_path}/git/{namespace}/{org}/{repo}.git` and serves from that mirror afterwards. Concurrent first requests for one repository collapse into one clone. A clone that fails takes its directory with it — a partial mirror would answer later requests with a truncated history — and the client gets a 502 that names no path; the git error is in the server log.
+
+`open` and `catalog` behave here as they do everywhere: a `catalog` namespace never clones a repository no manifest entry names, and answers 404 with a `no_manifest` discovery row instead. `bodega discover promote git <pattern> --as manifest` turns that row into the entry, after which the same clone succeeds. The allow-list runs before the clone, so a denied upstream is a 403 with nothing written to disk.
+
+#### Refresh
+
+A mirror older than `metadata_ttl` (default `1h`, the same interval that governs a cached package index) re-fetches with `git remote update --prune` before answering `info/refs`. The refresh is best effort: a fetch that fails serves the history already on disk rather than failing the clone, and still marks the mirror fetched, so an upstream that has gone away costs one failed fetch per TTL rather than one per request.
+
+`bodega build fetch git` is a separate pipeline that reads git manifests; it does not walk the smart-HTTP mirrors.
+
+#### Pushes
+
+Refused twice. Every mirror bodega creates carries `http.receivepack=false`, and the handler rejects `git-receive-pack` — both the POST and the `info/refs?service=git-receive-pack` probe that precedes it — before any process is started. bodega is a read-only mirror; one layer would mean one config drift makes it writable.
+
+#### Operational requirements
+
+- **`git-http-backend` must be installed.** It ships with git, in `libexec` rather than on `PATH`. bodega resolves it once at startup, through `git --exec-path` and then a fixed list of distribution locations.
+- **When it is missing**, bodega logs a `WARN` at startup naming every path it searched, and does not register the smart-HTTP route. A clone then gets a 404 on `info/refs` and a 405 on `git-upload-pack`. The legacy bundle route keeps working; nothing else about the server changes.
+- **The bodega user must own `{storage_path}/git`.** The mirror clone, the periodic refresh and the CGI child all run as the server's user. Do not run bodega as root to work around a permission error on that tree; fix the ownership.
+- **Upstreams are public and unauthenticated only.** No credential is read from the config or the environment, and the child process is given neither. A private repository answers bodega as an anonymous client, so the operator sees a failed clone, not an auth prompt.
+- **The child process gets an explicit environment**: `GIT_PROJECT_ROOT`, `GIT_HTTP_EXPORT_ALL`, and the CGI variables for the request. No `PATH`, no `HOME`, no inherited `GIT_*`. It is bounded to five minutes and dies with the request.
+
+#### Legacy bundle route
+
+`/git/{name}/{file}` still serves the `.bundle` and `.tar.gz` artifacts an uploader wrote to storage, unchanged. It predates smart-HTTP and stays because scripts fetch those URLs directly. The two do not collide: a bundle path is two segments and a clone path is at least four, so a `git_upstreams` key and an uploaded package may share a name without shadowing each other.
+
+#### Not implemented
+
+Named here so the gap is visible rather than inferred from a failure:
+
+- **Authenticated upstream clones.** No SSH key, no PAT, no credential helper. A private upstream fails.
+- **`git://`.** bodega is HTTP(S) only; `git daemon` is not proxied.
+- **Repository deletion.** Removing a mirror is `rm -rf {storage_path}/git/{namespace}/{org}/{repo}.git` by hand. There is no `bodega pkg delete` flow for a smart-HTTP mirror.
+- **Shallow clones at the upstream layer.** A client may ask bodega for a shallow clone; bodega's own mirror of the upstream is always full.
 
 ### Signing the apt repository
 
@@ -1637,6 +1690,8 @@ A name containing a slash is encoded to `--` for every type **except gomod**, wh
 | index | `index.json` | Fast startup without loading every manifest |
 | graph | `graph.json` | Dependency graph with typed edges |
 | metrics | `metrics.json` | Dashboard metrics |
+
+Git smart-HTTP mirrors are the one tree that is not a storage key. They are bare repositories under `{storage_path}/git/{namespace}/{org}/{repo}.git` on the local filesystem, never in a named backend and never in S3: `git-http-backend` reads a real directory, and `bodega pkg move` has nothing to move. Placement rules do not reach them.
 
 ---
 

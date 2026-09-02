@@ -104,6 +104,16 @@ type Server struct {
 	// Packages bodies it digests are always served from one generation.
 	aptSnap atomic.Pointer[aptSnapshot]
 
+	// gitTool is the resolved git toolchain the smart-HTTP path executes,
+	// or nil when git-http-backend could not be found at startup. Nil is what
+	// leaves POST /git/{namespace}/{path...} unregistered, so a clone fails
+	// with a method the mux never answers rather than per-request inside a
+	// handler that cannot work.
+	gitTool *gitTool
+	// gitClone serializes the first clone of each mirror, so concurrent first
+	// requests for one repository produce one `git clone --mirror`.
+	gitClone keyedMutex
+
 	// aptPool caches the pool listing behind metadata_ttl. Every apt-touching
 	// API write rebuilds the snapshot and the rebuild lists the whole pool, so
 	// a burst of writes paid for a full listing each — multiplied by the
@@ -213,6 +223,10 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 	// first sight, then resolve the live set the middleware chain reads.
 	s.seedACLs(context.Background())
 	s.refreshACLs(context.Background())
+
+	// Resolve the git toolchain before routes are registered: whether
+	// git-http-backend exists decides which routes exist.
+	s.gitTool = resolveGitTool(cfg, logger)
 
 	s.loadAptSigner()
 	s.registerRoutes()
@@ -557,11 +571,17 @@ func (s *Server) registerRoutes() {
 	// PyPI wheels (path... to support versioned subdirs like pypi/wheels/0.4.6/foo.whl)
 	m.HandleFunc("GET /pypi/wheels/{path...}", s.handlePypiWheel)
 
-	// Git bundles, and the namespaced upstream form. The bundle pattern is
+	// Git bundles, and the namespaced smart-HTTP form. The bundle pattern is
 	// the more specific of the two, so it keeps every path it already served;
-	// {path...} takes the deeper paths a forge URL carries.
+	// {path...} takes the deeper paths a clone URL carries.
 	m.HandleFunc("GET /git/{name}/{file}", s.handleGitBundle)
 	m.HandleFunc("GET /git/{namespace}/{path...}", s.handleGitNamespace)
+	if s.gitTool != nil {
+		// The POST half of smart-HTTP exists only when the CGI that answers it
+		// does. Without it a clone gets a 405 from the mux instead of reaching
+		// a handler with no backend to exec.
+		m.HandleFunc("POST /git/{namespace}/{path...}", s.handleGitNamespace)
+	}
 
 	// Binary downloads
 	m.HandleFunc("GET /binaries/{path...}", s.handleBinary)
