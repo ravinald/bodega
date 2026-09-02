@@ -51,6 +51,72 @@ paths:
               schema:
                 $ref: "#/components/schemas/PackagesResponse"
 
+  /api/v1/packages/import:
+    post:
+      summary: Import many package entries at once
+      description: |
+        Imports a whole host's catalog in one request. `bodega pkg import --server`
+        is the client for it.
+
+        Separate from `POST /api/v1/packages/{type}` because the two want opposite
+        semantics: a single create is all-or-nothing and answers 409 on a name
+        clash, while a bulk push is expected to land partially and reports what
+        happened to each package.
+
+        The body is either a JSON array of PackageManifest or one manifest per
+        line (NDJSON). Both decode a manifest at a time, so a large catalog never
+        lands in memory whole. Types may be mixed in one push.
+
+        Every manifest passes the same admission checks as the single-package
+        route: structural validation, the upstream allow-list, then the age and
+        OSV version checks.
+
+        Restricted to IPs in `admin_permit_cidr`. When the allow-list extends
+        beyond localhost, a valid Bearer token is required.
+      operationId: importPackages
+      tags: [packages]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: merge
+          in: query
+          required: false
+          description: |
+            Add versions to packages that already exist instead of reporting a
+            conflict. A recorded version is never overwritten, which keeps a
+            hosted entry from being downgraded to proxy by a re-import.
+          schema:
+            type: boolean
+            default: false
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: "#/components/schemas/PackageManifest"
+          application/x-ndjson:
+            schema:
+              $ref: "#/components/schemas/PackageManifest"
+      responses:
+        "200":
+          description: |
+            The body parsed. Returned even when every package was refused; the
+            per-package results say what happened.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "413":
+          description: Request body too large (max 64 MiB)
+
   /api/v1/packages/{type}:
     get:
       summary: List packages by type
@@ -523,6 +589,48 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/PackageManifest"
+
+    ImportResult:
+      type: object
+      description: What happened to one manifest in a bulk import.
+      required: [type, name, outcome]
+      properties:
+        type:
+          type: string
+          example: apt
+        name:
+          type: string
+          example: curl
+        outcome:
+          type: string
+          enum: [imported, merged, conflict, invalid, policy_blocked, failed]
+        reason:
+          type: string
+          description: Why, when the outcome is not imported or merged.
+        warnings:
+          type: array
+          description: Non-fatal notes; present on a successful import too.
+          items:
+            type: string
+
+    ImportResponse:
+      type: object
+      description: The result of a bulk import, per package and in total.
+      required: [imported, merged, skipped, results]
+      properties:
+        imported:
+          type: integer
+          description: Packages written as new entries.
+        merged:
+          type: integer
+          description: Packages that gained versions on an existing entry.
+        skipped:
+          type: integer
+          description: Packages that did not land; results carries the reason for each.
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/ImportResult"
 
     PackageManifest:
       type: object
