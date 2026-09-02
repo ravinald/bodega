@@ -13,6 +13,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
@@ -157,11 +158,6 @@ re-run with --editor cat to inspect, or copy and retry.`,
 				pm.Versions[targetIdx] = ve
 			}
 
-			if err := validateManifest(pm, cfg, os.Stderr); err != nil {
-				return keep("validation: %v", err)
-			}
-
-			// Mirrors cmd_import; no override path on edit.
 			adb := openAuditDB(gf)
 			if adb != nil {
 				defer adb.Close()
@@ -170,8 +166,12 @@ re-run with --editor cat to inspect, or copy and retry.`,
 			if adb != nil {
 				checker = policy.NewChecker(adb)
 			}
-			if err := enforceImportPolicy(ctx, checker, adb, pm); err != nil {
-				return keep("policy: %v", err)
+			res := admit.Admit(ctx, checker, adb, cfg, pm, audit.CurrentActor())
+			for _, w := range res.Warnings {
+				fmt.Fprintf(os.Stderr, "%s/%s: %s\n", pm.Type, pm.Name, w)
+			}
+			if !res.OK() {
+				return keep("%s", res.Reason)
 			}
 
 			if err := store.SavePackage(ctx, pm); err != nil {

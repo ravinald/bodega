@@ -4,14 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
-	"sort"
-	"strings"
 
 	"github.com/spf13/cobra"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -77,11 +77,12 @@ Examples:
 
 				for i := range pms {
 					pm := &pms[i]
-					if err := validateManifest(pm, cfg, os.Stderr); err != nil {
-						return fmt.Errorf("validate %s [%s/%s]: %w", path, pm.Type, pm.Name, err)
+					res := admit.Admit(ctx, checker, adb, cfg, pm, audit.CurrentActor())
+					for _, w := range res.Warnings {
+						fmt.Fprintf(os.Stderr, "%s/%s: %s\n", pm.Type, pm.Name, w)
 					}
-					if err := enforceImportPolicy(ctx, checker, adb, pm); err != nil {
-						return fmt.Errorf("%s [%s/%s]: %w", path, pm.Type, pm.Name, err)
+					if !res.OK() {
+						return fmt.Errorf("%s [%s/%s]: %s", path, pm.Type, pm.Name, res.Reason)
 					}
 
 					existing, _ := store.GetPackage(ctx, pm.Type, pm.Name)
@@ -171,146 +172,21 @@ func decodeManifests(data []byte) ([]manifest.PackageManifest, error) {
 	return []manifest.PackageManifest{pm}, nil
 }
 
-// enforceImportPolicy runs the allow-list and any configured version-level
-// checks (age, etc.) against every version in pm. Allow-list violations fail
-// the import outright; version-level blocks collect into a single combined
-// error so the operator sees every failure in one pass. Warn-level version
-// results are recorded to audit but don't fail.
-func enforceImportPolicy(ctx context.Context, checker *policy.Checker, adb *audit.DB, pm *manifest.PackageManifest) error {
-	// Allow-list (URL-level) first: cheap and fails fast.
-	if checker != nil {
-		for _, ve := range pm.Versions {
-			candidate := policy.CandidateFor(pm.Type, pm.Name, ve.URL)
-			if candidate == "" {
-				continue
-			}
-			if err := checker.Check(ctx, pm.Type, candidate); err != nil {
-				if adb != nil {
-					_ = adb.Record(ctx, audit.Event{
-						EventType:  audit.EventCreate,
-						PkgType:    pm.Type,
-						PkgName:    pm.Name,
-						PkgVersion: ve.Version,
-						Actor:      audit.CurrentActor(),
-						Status:     "policy_violation",
-						Details:    fmt.Sprintf("candidate=%s", candidate),
-					})
-				}
-				return err
-			}
-		}
-	}
-
-	// Version-level checks (age). Only run when an audit DB is available,
-	// since the policy tables live there.
-	if adb == nil {
-		return nil
-	}
-	checkers := []policy.VersionChecker{
-		policy.NewAgeChecker(adb),
-		policy.NewOSVChecker(adb),
-	}
-	for i := range pm.Versions {
-		ve := &pm.Versions[i]
-		combined := policy.RunChecks(ctx, pm, ve, checkers...)
-		if details := combined.AuditDetails(); details != nil {
-			blob, _ := json.Marshal(details)
-			status := "policy_warn"
-			if combined.Blocked() {
-				status = "policy_violation"
-			}
-			_ = adb.Record(ctx, audit.Event{
-				EventType:  audit.EventCreate,
-				PkgType:    pm.Type,
-				PkgName:    pm.Name,
-				PkgVersion: ve.Version,
-				Actor:      audit.CurrentActor(),
-				Status:     status,
-				Details:    string(blob),
-			})
-		}
-		if combined.Blocked() {
-			return fmt.Errorf("policy blocked %s@%s: %s", pm.Name, ve.Version, combined.Reasons())
-		}
-	}
-	return nil
-}
-
-// validateManifest rejects a manifest the rest of bodega cannot act on, and
-// warns to out about one it can act on but will not honor.
-//
-// The split matters. A backend name nothing defines makes the artifact
-// unreadable, so it fails. A storage_policy on a whole-directory type is inert
-// rather than wrong, and manifests already in the field carry them; failing
-// would make 'pkg edit' and 'pkg import' refuse a file that was legal when it
-// was written.
+// validateManifest reports whether a manifest is structurally storable,
+// writing any non-fatal warning to out. It is the structure half of
+// admit.Admit, exposed for callers that have no policy checker to run.
 func validateManifest(pm *manifest.PackageManifest, cfg *config.Config, out io.Writer) error {
-	if pm.Name == "" {
-		return fmt.Errorf("name is required")
-	}
-	if pm.Type == "" {
-		return fmt.Errorf("type is required")
-	}
-	valid := false
-	for _, t := range manifest.AllTypes {
-		if pm.Type == t {
-			valid = true
-			break
-		}
-	}
-	if !valid {
-		return fmt.Errorf("unknown type %q — must be one of: %s", pm.Type, strings.Join(manifest.AllTypes, ", "))
-	}
-	// A storage_policy naming nothing fails at the next upload, long after the
-	// edit that introduced it and with no obvious connection back to it.
-	if err := checkBackendName(cfg, pm.StoragePolicy); err != nil {
-		return fmt.Errorf("storage_policy: %w", err)
-	}
-	if w := storagePolicyWarning(pm.Type, pm.StoragePolicy); w != "" {
+	res := admit.Admit(context.Background(), nil, nil, cfg, pm, "")
+	for _, w := range res.Warnings {
 		fmt.Fprintf(out, "%s/%s: %s\n", pm.Type, pm.Name, w)
 	}
-	// A hand-edited storage name that matches no configured backend makes the
-	// artifact unreadable: resolution never falls back to another backend, so
-	// the entry would 502 rather than serve from somewhere plausible.
-	for _, ve := range pm.Versions {
-		if err := checkBackendName(cfg, ve.Storage); err != nil {
-			return fmt.Errorf("version %s: %w", versionLabel(ve), err)
-		}
-	}
-	// An apt entry with no version reaches no index and no verb: the
-	// generator refuses to publish it, and remove, delete, hide and freeze
-	// all address a version by name. Persisting one leaves 'bodega repair'
-	// as its only exit.
-	if pm.Type == manifest.TypeApt {
-		for _, ve := range pm.Versions {
-			if ve.Version == "" {
-				return fmt.Errorf("apt/%s has a version entry with no version; give one, or \"*\" to resolve the current upstream", pm.Name)
-			}
-		}
+	if !res.OK() {
+		return errors.New(res.Reason)
 	}
 	return nil
 }
 
-// checkBackendName rejects a name no configured backend answers to. The empty
-// string and the reserved default always pass: an entry with no name recorded
-// is on the default backend, which every install has.
+// checkBackendName rejects a name no configured backend answers to.
 func checkBackendName(cfg *config.Config, name string) error {
-	if name == "" || name == config.DefaultStorageName {
-		return nil
-	}
-	if _, ok := cfg.StorageBackends[name]; !ok {
-		return fmt.Errorf("unknown storage backend %q (defined: %s)", name, definedBackendNames(cfg))
-	}
-	return nil
-}
-
-// definedBackendNames lists the usable backend names for an error message,
-// reserved default first.
-func definedBackendNames(cfg *config.Config) string {
-	names := make([]string, 0, len(cfg.StorageBackends)+1)
-	for name := range cfg.StorageBackends {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return strings.Join(append([]string{config.DefaultStorageName}, names...), ", ")
+	return admit.CheckBackendName(cfg, name)
 }

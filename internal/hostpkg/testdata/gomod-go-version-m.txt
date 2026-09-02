@@ -1,0 +1,17 @@
+/Users/ravi/go/bin/drover: go1.26.6
+	path	github.com/ravinald/drover/cmd/drover
+	mod	github.com/ravinald/drover	v0.5.0	
+	dep	github.com/BurntSushi/toml	v1.6.0	h1:dRaEfpa2VI55EwlIW72hMRHdWouJeRF7TPYhI+AUQjk=
+	dep	github.com/spf13/cobra	v1.10.2	h1:DMTTonx5m65Ic0GOoRY2c16WCbHxOOw6xxezuLaBpcU=
+	dep	github.com/spf13/pflag	v1.0.9	h1:9exaQaMOCwffKiiiYk6/BndUBv+iRViNW+4lEMi0PvY=
+	build	-buildmode=exe
+	build	-compiler=gc
+	build	-trimpath=true
+	build	CGO_ENABLED=1
+	build	GOARCH=arm64
+	build	GOOS=darwin
+	build	GOARM64=v8.0
+	build	vcs=git
+	build	vcs.revision=0f78c4e2098e70082ea6eeb420f8b41ac986f2a3
+	build	vcs.time=2026-08-28T18:29:28Z
+	build	vcs.modified=false
