@@ -611,6 +611,7 @@ func (s *Server) registerRoutes() {
 	m.HandleFunc("GET /api/v1/metrics", s.handleAPIMetrics)
 
 	// Mutation API
+	m.HandleFunc("POST /api/v1/packages/import", s.handleBulkImport)
 	m.HandleFunc("POST /api/v1/packages/{type}", s.handleCreateEntry)
 	m.HandleFunc("DELETE /api/v1/packages/{type}/{name}", s.handleDeleteEntry)
 	m.HandleFunc("PATCH /api/v1/packages/{type}/{name}/hide", s.handleToggleHidden)

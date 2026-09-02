@@ -205,18 +205,6 @@ func checkVersions(ctx context.Context, adb *audit.DB, pm *manifest.PackageManif
 	return nil
 }
 
-// knownType reports whether t is a type bodega manages. manifest.AllTypes is
-// the single gate: a per-caller list drifts, and the API's copy had already
-// lost cargo.
-func knownType(t string) bool {
-	for _, known := range manifest.AllTypes {
-		if t == known {
-			return true
-		}
-	}
-	return false
-}
-
 // CheckBackendName rejects a name no configured backend answers to. The empty
 // string and the reserved default always pass: an entry with no name recorded
 // is on the default backend, which every install has.
