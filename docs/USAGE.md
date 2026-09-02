@@ -573,7 +573,7 @@ These are not observed yet. A quiet discovery log for one of them means the hook
 - **git mirror refreshes**: a smart-HTTP request records one row per request, but the periodic `git remote update` it triggers is not separately logged. The row says a client asked; it does not say whether that request also refreshed the mirror.
 - **binary outside a namespace**: with `binary_upstreams` empty, or on a path whose first segment names no entry in it, `/binaries/...` reads storage and records nothing. The `no_namespace` row above is the second case; the first is an install that has not opted in.
 - **helm `index.yaml`** and the generated apt indexes: regenerated locally, never fetched.
-- **cache hits of any type**: the log counts upstream fetches and pre-cache misses. A package already in the cache is served without a row, so `request_count` under-reports by however well the cache is working, and `last_client` names whoever caused the miss rather than the last host to ask.
+- **cache hits of any type**: the log counts upstream fetches and pre-cache misses. A package already in the cache is served without a row, so `request_count` under-reports by however well the cache is working, and `last_client` names whoever caused the miss rather than the last host to ask. This bites apt hardest, because apt is the type where the cache does the most work: fifty hosts running the same `apt install` produce one row per `.deb` with `request_count: 1`, naming whichever host missed first. Read apt rows as the set of packages the fleet reached for, which is what they are, and not as how many hosts reached for them.
 
 #### `bodega discover list [type]`
 
