@@ -420,6 +420,7 @@ Key fields:
 | `allow_plaintext` | false | Authorizes an unencrypted listener. With no cert pair `bodega serve` refuses to bind without it, and refuses on `:443` naming the port |
 | `audit_db` | {log_dir}/audit.db | Audit database path |
 | `git_upstreams` | {} | Namespaces under `/git/` mapped onto an upstream forge, each in `open` or `catalog` mode |
+| `binary_upstreams` | {} | Namespaces under `/binaries/` mapped onto an upstream download host, each in `open` or `catalog` mode. While empty, `/binaries/` serves from storage as before |
 
 The TUI config editor (`C` key in `bodega shell`) writes to the same file.
 
@@ -446,6 +447,23 @@ A request under `/git/` naming a namespace no entry covers gets a 404 and a `no_
 **Not implemented yet:** composing the upstream URL and fetching through it. A configured namespace currently answers 404 and records nothing, whichever mode it names. What is in place is the config shape, its validation, and the `no_namespace` row for a namespace nobody configured. The bundle route `/git/{name}/{file}` is unaffected and still serves uploaded bundles from storage.
 
 Only public, unauthenticated upstreams are supported. No credential is read from the config file or the environment, so a private forge answers bodega as an anonymous client: the operator sees a 404, not an auth error. Credential handling is a follow-on.
+
+### Binary upstreams
+
+`binary_upstreams` is the same shape applied to `/binaries/`, and shares the validator, the modes and the defaults with `git_upstreams`. Binaries are the type most likely to come from many vendors at once — a releases host, a forge serving release assets, a vendor CDN — which is why a single flat key cannot name what an install pulls from:
+
+```json
+"binary_upstreams": {
+  "hashicorp": { "url": "https://releases.hashicorp.com/", "mode": "open" },
+  "github":    { "url": "https://github.com/",             "mode": "catalog" }
+}
+```
+
+`/binaries/<namespace>/<rest>` composes `<url><rest>` and caches the result under `binaries/<namespace>/<rest>`. `open` fetches on a miss and enforces the allow-list; `catalog` looks `<namespace>/<rest>` up in the manifest store first and 404s a miss with a `no_manifest` row, without contacting the upstream. `bodega discover promote binary <namespace>/<rest> --as manifest` is what turns that row into the entry catalog mode is waiting for.
+
+The empty map is the migration path and the default: while `binary_upstreams` has no entries, `/binaries/{path...}` reads storage exactly as it always has. Once any entry exists, a first segment naming no key 404s with a `no_namespace` row rather than falling through to a storage read — **including a path that resolved before**. The alternative, falling through, was rejected: the storage read misses too, so the 404 arrives either way and the discovery log ends up holding nothing that names the key the operator meant to type. An install that serves local binaries and namespaced ones at once needs a namespace for each tree it still serves locally.
+
+Authenticated upstreams are out of scope here as they are for git. A namespace pointing at a private release endpoint fails as a 404 with no credential prompt, which is indistinguishable from a typo in the path; check the upstream by hand before hunting the path.
 
 ## TUI
 

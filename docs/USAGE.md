@@ -484,6 +484,7 @@ Each observation is one row keyed by `(type, pattern, package, version, decision
 | gomod | `/go/...` | every upstream fetch; `no_manifest` on a module with no entry |
 | helm | `/helm/charts/*.tgz` | every upstream fetch; `no_manifest` on a chart with no entry, with an empty upstream URL (a chart repo is named per version entry, so with no entry there is no URL to record) |
 | git | `/git/{namespace}/...` | `no_namespace` on a request whose first segment names no `git_upstreams` entry, with the namespace as both the package and the pattern |
+| binary | `/binaries/{namespace}/...` | every upstream fetch under an `open` namespace; `no_manifest` on an uncataloged path under a `catalog` one; `no_namespace` on a first segment naming no `binary_upstreams` entry, once any entry exists |
 
 #### Gaps
 
@@ -492,7 +493,7 @@ These are not observed yet. A quiet discovery log for one of them means the hook
 - **apt**: `/apt/pool/...` reads storage directly and has no upstream path at all, so neither a hit nor a miss is recorded.
 - **git bundles**: `/git/{name}/{file}` serves an uploaded bundle or release archive from storage. Nothing upstream, nothing logged.
 - **git namespaces bodega does know**: under `/git/{namespace}/...` a namespace named in `git_upstreams` records nothing, because the smart-HTTP proxy that would fetch through it is not implemented. Only the unconfigured namespace leaves a row.
-- **binary**: `/binaries/...` serves from storage on the same terms.
+- **binary outside a namespace**: with `binary_upstreams` empty, or on a path whose first segment names no entry in it, `/binaries/...` reads storage and records nothing. The `no_namespace` row above is the second case; the first is an install that has not opted in.
 - **helm `index.yaml`** and the generated apt indexes: regenerated locally, never fetched.
 - **cache hits of any type**: the log counts upstream fetches and pre-cache misses. A package already in the cache is served without a row, so `request_count` under-reports by however well the cache is working, and `last_client` names whoever caused the miss rather than the last host to ask.
 
