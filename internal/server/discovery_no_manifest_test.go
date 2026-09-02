@@ -24,9 +24,13 @@ func newDiscoveryServer(t *testing.T) *Server {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := &config.Config{
-		AptCodename:    "noble",
-		LogDir:         dir,
-		AuditDB:        filepath.Join(dir, "audit.db"),
+		AptCodename: "noble",
+		LogDir:      dir,
+		AuditDB:     filepath.Join(dir, "audit.db"),
+		// The git smart-HTTP root hangs off storage_path. Left empty it
+		// resolves to /var/lib/bodega and a test that clones writes outside
+		// its own temp tree.
+		StoragePath:    dir,
 		DiscoverMode:   "observe",
 		GomodUpstream:  "https://proxy.golang.org",
 		NpmUpstream:    "https://registry.npmjs.org",

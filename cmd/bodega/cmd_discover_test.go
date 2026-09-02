@@ -241,6 +241,50 @@ func TestPromoteAsManifestVersionlessRowBecomesAnyConstraint(t *testing.T) {
 	}
 }
 
+// The row a git smart-HTTP miss actually writes, promoted.
+//
+// The name is namespace-prefixed and the version is empty, which is the shape
+// TestGitSmartCatalogModeNeverClones pins on the server side. Both halves have
+// to hold or promote does not unblock the 404 it came from: catalog mode looks
+// the manifest up under "<namespace>/<repo>" with no ".git", and a versionless
+// row that lost its "any" constraint would produce an entry no ref matches.
+func TestPromoteAsManifestFromAGitSmartHTTPMiss(t *testing.T) {
+	env := newDiscoverEnv(t)
+	env.seedDiscovery(t, audit.DiscoveryRow{
+		RegistryType: manifest.TypeGit,
+		Host:         "github.com",
+		PatternHint:  "github.com/octocat/",
+		PkgName:      "vetted/octocat/Hello-World",
+		Decision:     audit.DecisionNoManifest,
+		UpstreamURL:  "https://github.com/octocat/Hello-World.git",
+	})
+
+	if _, err := runDiscover(t, "promote", "git", "github.com/octocat/", "--as", "manifest"); err != nil {
+		t.Fatalf("promote --as manifest: %v", err)
+	}
+
+	pm := env.readManifest(t, manifest.TypeGit, "vetted/octocat/Hello-World")
+	if pm == nil {
+		t.Fatal("no manifest written under the name catalog mode looks up")
+	}
+	if pm.Name != "vetted/octocat/Hello-World" {
+		t.Errorf("Name = %q, want the namespaced name the handler recorded", pm.Name)
+	}
+	if len(pm.Versions) != 1 {
+		t.Fatalf("versions = %d, want 1 (%+v)", len(pm.Versions), pm.Versions)
+	}
+	ve := pm.Versions[0]
+	if ve.VersionConstraint != manifest.ConstraintAny {
+		t.Errorf("VersionConstraint = %q, want %q", ve.VersionConstraint, manifest.ConstraintAny)
+	}
+	if ve.Version != "" {
+		t.Errorf("Version = %q, want empty — a clone names no single ref", ve.Version)
+	}
+	if ve.URL != "https://github.com/octocat/Hello-World.git" {
+		t.Errorf("URL = %q, want the upstream the handler would have cloned", ve.URL)
+	}
+}
+
 // A row with no upstream_url would build a proxy entry that 404s exactly like
 // the miss it came from. It is named and skipped, never written.
 func TestPromoteAsManifestSkipsRowsWithNoUpstreamURL(t *testing.T) {

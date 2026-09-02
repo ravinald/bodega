@@ -614,6 +614,10 @@ func MutationAuthMiddleware(admin NetsFunc, auditDB *audit.DB, pepper string, lo
 				next.ServeHTTP(w, r)
 				return
 			}
+			if isGitUploadPack(r) {
+				next.ServeHTTP(w, r)
+				return
+			}
 
 			// Check IP against admin_permit_cidr.
 			clientIP := net.ParseIP(ClientIP(r))
@@ -768,4 +772,20 @@ func peerIsTrusted(r *http.Request, nets []*net.IPNet) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && isTrusted(ip, nets)
+}
+
+// isGitUploadPack reports whether a request is the read half of a git clone.
+//
+// The verb is the only thing this middleware can see, and git smart-HTTP puts
+// a read behind a POST: pack negotiation does not fit in a URL. Gating it as a
+// mutation would mean every `git clone` needs an admin token, which is not what
+// a read-only mirror is for.
+//
+// git-receive-pack is deliberately not exempt. A push arrives as a POST and
+// meets the admin gate here, ahead of the handler's own refusal and the
+// http.receivepack=false in every mirror.
+func isGitUploadPack(r *http.Request) bool {
+	return r.Method == http.MethodPost &&
+		strings.HasPrefix(r.URL.Path, "/git/") &&
+		strings.HasSuffix(r.URL.Path, "/git-upload-pack")
 }

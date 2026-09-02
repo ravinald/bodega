@@ -444,7 +444,7 @@ Mode decides what happens when a client asks for something no manifest entry nam
 
 A request under `/git/` naming a namespace no entry covers gets a 404 and a `no_namespace` discovery row, which is how an operator finds the key they have not added yet.
 
-**Not implemented yet:** composing the upstream URL and fetching through it. A configured namespace currently answers 404 and records nothing, whichever mode it names. What is in place is the config shape, its validation, and the `no_namespace` row for a namespace nobody configured. The bundle route `/git/{name}/{file}` is unaffected and still serves uploaded bundles from storage.
+A configured namespace is served by the git smart-HTTP proxy: `git clone https://bodega-host/git/<namespace>/<org>/<repo>.git` mirrors the upstream on the first request and answers from that mirror after. See [Git smart-HTTP](USAGE.md#git-smart-http) in the usage reference for the routes, the refresh interval, the operational requirements and what is out of scope. The bundle route `/git/{name}/{file}` is unaffected and still serves uploaded bundles from storage.
 
 Only public, unauthenticated upstreams are supported. No credential is read from the config file or the environment, so a private forge answers bodega as an anonymous client: the operator sees a 404, not an auth error. Credential handling is a follow-on.
 
