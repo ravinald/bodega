@@ -521,3 +521,51 @@ func TestMutationAPIRefusesAVersionlessAptEntry(t *testing.T) {
 		t.Error("the refused entry was persisted anyway")
 	}
 }
+
+// TestArchitectureLessEntryIsLogged covers the fourth silent drop, and the one
+// no bucket named. generateAptPackages skips an entry with no Architecture
+// before it looks at the pool, and auditAptEntries excluded the same entries
+// from its unserved and unpooled walks — correctly for what those walks do,
+// which is what left this the one case producing "Unable to locate package"
+// with nothing in the log at all (#100).
+func TestArchitectureLessEntryIsLogged(t *testing.T) {
+	for _, tc := range []struct{ name, poolPath string }{
+		{"without a pool path", ""},
+		{"with a pool path", "pool/main/b/blank/blank_3.0.0_amd64.deb"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, _ := refreshTestServer(t)
+			var buf bytes.Buffer
+			s.logger = newTestLogger(&buf, slog.LevelInfo)
+			md := map[string]string{}
+			if tc.poolPath != "" {
+				md["_pool_path"] = tc.poolPath
+			}
+			if err := s.store.AddVersion(t.Context(), manifest.TypeApt, "blank", manifest.VersionEntry{
+				Version:    "3.0.0",
+				SourceName: "blank",
+				Metadata:   md,
+			}); err != nil {
+				t.Fatalf("AddVersion: %v", err)
+			}
+			if err := s.store.SaveIndex(t.Context()); err != nil {
+				t.Fatalf("SaveIndex: %v", err)
+			}
+
+			s.rebuildAptSnapshot(t.Context())
+
+			logged := buf.String()
+			if !strings.Contains(logged, "carry no Architecture metadata") {
+				t.Errorf("an entry with no Architecture was dropped silently:\n%s", logged)
+			}
+			if !strings.Contains(logged, "blank@3.0.0") {
+				t.Errorf("the warning does not name the entry:\n%s", logged)
+			}
+			// It belongs to one bucket, not two: an operator chasing a missing
+			// package must not be sent to look for a .deb that is present.
+			if strings.Contains(logged, "match no .deb in the pool") {
+				t.Errorf("the entry was also reported as unpooled, which names the wrong fix:\n%s", logged)
+			}
+		})
+	}
+}

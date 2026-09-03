@@ -41,6 +41,7 @@ func (s *Server) handleGomod(w http.ResponseWriter, r *http.Request) {
 					reqVersion = file[:dot] // "v1.30.0.info" → "v1.30.0"
 				}
 				if !versionAllowed(ver, reqVersion, vc) {
+					s.recordVersionRefusal(r, manifest.TypeGomod, module, ver, reqVersion, vc)
 					http.Error(w, "version not allowed by constraint", http.StatusForbidden)
 					return
 				}

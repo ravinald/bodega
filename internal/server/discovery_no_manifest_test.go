@@ -20,7 +20,7 @@ import (
 // store and drives the recorder's worker, so a row a handler enqueues actually
 // reaches SQLite. Without the worker every assertion here would pass against a
 // tree whose handlers record nothing: the queue is buffered.
-func newDiscoveryServer(t *testing.T) *Server {
+func newDiscoveryServer(t testing.TB) *Server {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := &config.Config{

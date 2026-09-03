@@ -91,6 +91,32 @@ func waitForBinaryRows(t *testing.T, s *Server, decision string, want int) []aud
 	return nil
 }
 
+// waitForDiscoveryCount waits for one bucket's request_count to reach want. The
+// recorder is asynchronous, so the second request's upsert lands after the
+// response the test already read.
+func waitForDiscoveryCount(t *testing.T, s *Server, hint string, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	var got int64
+	for time.Now().Before(deadline) {
+		rows, err := s.auditDB.ListDiscovery(context.Background(), audit.DiscoveryFilter{PatternHint: hint})
+		if err != nil {
+			t.Fatalf("list discovery: %v", err)
+		}
+		if len(rows) > 1 {
+			t.Fatalf("pattern %q produced %d rows, want 1 — a hit must land on the miss's row, not beside it", hint, len(rows))
+		}
+		if len(rows) == 1 {
+			got = rows[0].RequestCount
+			if got >= want {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("request_count for %q = %d after 3s, want %d", hint, got, want)
+}
+
 // assertNoRows gives the asynchronous recorder a window and then asserts it
 // wrote nothing. Absence is only meaningful after that wait.
 func assertNoRows(t *testing.T, s *Server) {
@@ -145,8 +171,9 @@ func TestBinaryUnregisteredNamespaceRecordsNoNamespace(t *testing.T) {
 
 // An open namespace routes through proxyOrCache, which serves an already-cached
 // object without reaching upstream. Both halves matter: the 200 proves the
-// composed key is the one the cache write used, and the absent row proves a
-// hit records nothing (see #127).
+// composed key is the one the cache write used, and the row proves the hit is
+// counted. Discovery records requests, so a warm cache does not make a package
+// the fleet keeps pulling look like one nobody asked for (#127).
 func TestBinaryOpenServesFromCache(t *testing.T) {
 	s := binaryServer(t, "observe")
 	if err := s.typeStore(manifest.TypeBinary).Put(t.Context(), terraformKey, []byte("zip")); err != nil {
@@ -156,7 +183,16 @@ func TestBinaryOpenServesFromCache(t *testing.T) {
 	if got := getBinary(t, s, "/binaries/"+terraformPkg); got != http.StatusOK {
 		t.Errorf("GET cached open-mode binary = %d, want 200", got)
 	}
-	assertNoRows(t, s)
+	rows := waitForBinaryRows(t, s, audit.DecisionNoPolicy, 1)
+	if want := "https://releases.hashicorp.invalid/terraform/1.7.5/terraform_1.7.5_linux_amd64.zip"; rows[0].UpstreamURL != want {
+		t.Errorf("upstream_url = %q, want %q — a hit records the URL a miss would have fetched", rows[0].UpstreamURL, want)
+	}
+
+	// Second request, same row: the count is a count of requests.
+	if got := getBinary(t, s, "/binaries/"+terraformPkg); got != http.StatusOK {
+		t.Errorf("second GET = %d, want 200", got)
+	}
+	waitForDiscoveryCount(t, s, rows[0].PatternHint, 2)
 }
 
 // The open half of the behavior matrix. Each row crosses discover_mode with a
@@ -336,7 +372,10 @@ func TestBinaryCatalogHitProceeds(t *testing.T) {
 	if got := getBinary(t, s, "/binaries/"+pkg); got != http.StatusOK {
 		t.Errorf("GET cataloged binary = %d, want 200", got)
 	}
-	assertNoRows(t, s)
+	rows := waitForBinaryRows(t, s, audit.DecisionNoPolicy, 1)
+	if rows[0].PkgName != pkg {
+		t.Errorf("pkg_name = %q, want %q", rows[0].PkgName, pkg)
+	}
 }
 
 // TestBinaryCatalogSafeNameCollision is issue #151. GetPackage addresses a

@@ -126,7 +126,23 @@ func (s *Server) handleAptMirrorDists(w http.ResponseWriter, r *http.Request, co
 	key := manifest.AptKey("dists/" + codename + "/" + rest)
 	immutable := aptDistsImmutable(rest)
 
-	s.serveAptMirror(w, r, s.typeStore(manifest.TypeApt), key, upstream, codename+"/"+rest, immutable)
+	s.serveAptMirror(w, r, s.typeStore(manifest.TypeApt), key, upstream, aptMirrorPkgName(codename, rest), immutable)
+}
+
+// aptMirrorPkgName is the discovery row's package name for a path under a
+// mirrored dists/ tree.
+//
+// A by-hash path names its own digest and no package, so the raw path is ~100
+// characters of hex that `bodega discover show apt <host>` sizes the PACKAGE
+// column to — six by-hash rows from one `apt install` push UPSTREAM URL off the
+// terminal and make the pool rows beside them unreadable. The digest is already
+// in the upstream URL on the same row, so collapsing every by-hash entry under
+// one name loses nothing and keeps the column the width of a package name.
+func aptMirrorPkgName(codename, rest string) string {
+	if aptByHash(rest) {
+		return codename + "/by-hash"
+	}
+	return codename + "/" + rest
 }
 
 // handleAptMirrorPool proxies one pool artifact, resolving which archive has
@@ -138,6 +154,7 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, poo
 	// once a fleet is warm: the probe below is per pool path and the cache
 	// read is not.
 	if s.aptCached(r.Context(), store, key, true) {
+		s.recordAptPoolHit(r, poolPath, key)
 		s.proxyS3(w, r, store, key)
 		return
 	}
@@ -156,6 +173,45 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, poo
 	// a stored full URL would be a second parse of the same string.
 	name, _ := aptDebIdentity(path.Base(poolPath))
 	s.serveAptMirror(w, r, store, key, base+"/"+poolPath, name, true)
+}
+
+// recordAptPoolHit writes the discovery row for a .deb served out of the cache.
+//
+// The pool path names no archive — that is why aptRouteCache exists — and a
+// cached object is served without resolving one, so the archive has to be
+// recovered rather than probed: a HEAD per served .deb would undo the
+// short-circuit this sits inside. A fresh route entry answers first; failing
+// that, a single configured archive is unambiguous.
+//
+// With several archives configured and no fresh route, the row is skipped. The
+// alternative is a row whose pattern hint is not the host, which would split
+// one archive's traffic across two buckets in `bodega discover list` — a wrong
+// answer where this is a missing one. It resolves itself on the next miss,
+// which repopulates the route.
+func (s *Server) recordAptPoolHit(r *http.Request, poolPath, key string) {
+	if s.discovery == nil || s.discoverMode == "" {
+		return
+	}
+	upstream := s.aptPoolHitUpstream(poolPath)
+	if upstream == "" {
+		s.logger.Debug("apt pool cache hit not recorded: no archive resolved for this path",
+			"pool_path", poolPath)
+		return
+	}
+	name, _ := aptDebIdentity(path.Base(poolPath))
+	s.recordCacheHit(r.Context(), r, manifest.TypeApt, upstream, upstream, name, key)
+}
+
+// aptPoolHitUpstream names the archive a cached pool object came from, or ""
+// when nothing in memory can say without a network probe.
+func (s *Server) aptPoolHitUpstream(poolPath string) string {
+	if base, fresh := s.aptRoutes.get(poolPath); fresh && base != "" {
+		return base + "/" + poolPath
+	}
+	if candidates := s.cfg.AptPoolUpstreams(); len(candidates) == 1 {
+		return candidates[0] + "/" + poolPath
+	}
+	return ""
 }
 
 // serveAptMirror runs one mirrored fetch through proxyOrCache, coalescing
@@ -340,6 +396,13 @@ func (s *Server) aptPoolIsLocal(poolPath string) bool {
 // said the first time, and a mutable by-hash entry is every .deb re-downloaded
 // on every install.
 func aptDistsImmutable(rest string) bool {
+	return aptByHash(rest)
+}
+
+// aptByHash reports whether a path under dists/ is a by-hash entry. Two callers
+// want the same test for different reasons — caching policy and the discovery
+// row's package name — and one predicate keeps them from drifting apart.
+func aptByHash(rest string) bool {
 	return rest == "by-hash" ||
 		strings.HasPrefix(rest, "by-hash/") ||
 		strings.Contains(rest, "/by-hash/")

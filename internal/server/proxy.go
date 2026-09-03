@@ -60,7 +60,7 @@ func (s *Server) proxyOrCache(w http.ResponseWriter, r *http.Request, store stor
 	if upstreamURL != "" {
 		resolve = func(context.Context) (string, error) { return upstreamURL, nil }
 	}
-	s.proxyOrResolve(w, r, store, s3Key, resolve, regType, policyCandidate, discoveryPkgName, immutable, forceProxy)
+	s.proxyOrResolve(w, r, store, s3Key, resolve, upstreamURL, regType, policyCandidate, discoveryPkgName, immutable, forceProxy)
 }
 
 // upstreamResolver produces the URL a cache miss should fetch. It runs only
@@ -73,7 +73,12 @@ func (s *Server) proxyOrCache(w http.ResponseWriter, r *http.Request, store stor
 // failure to look.
 type upstreamResolver func(ctx context.Context) (string, error)
 
-func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, s3Key string, resolve upstreamResolver, regType, policyCandidate, discoveryPkgName string, immutable, forceProxy bool) {
+// knownUpstream is the URL a miss would fetch when the caller already holds it,
+// and "" when only the resolver can produce it. It exists for the cache-hit
+// path, which records a discovery row and must not pay for a resolution it will
+// never use: for pypi the row's pattern hint is the package name and the host
+// column is preserved by the upsert, so "" costs the row nothing.
+func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, s3Key string, resolve upstreamResolver, knownUpstream, regType, policyCandidate, discoveryPkgName string, immutable, forceProxy bool) {
 	if !s.requireStorage(w, store) {
 		return
 	}
@@ -92,6 +97,10 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	if status != nil && status.Exists {
 		if immutable || !s.isCacheStale(status) {
 			s.logger.Debug("cache hit", "key", s3Key, "immutable", immutable)
+			// Before the body, not after: a client that hangs up mid-transfer
+			// still asked for the artifact, and the row is the record of the
+			// request rather than of the delivery.
+			s.recordCacheHit(ctx, r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key)
 			s.proxyS3(w, r, store, s3Key)
 			return
 		}
@@ -566,7 +575,9 @@ func (s *Server) enforceUpstreamPolicy(w http.ResponseWriter, r *http.Request, r
 			// blocked upstream through. It is a reason to say so loudly,
 			// naming the event, so a reconstruction from the log is
 			// possible when the table is missing the row.
-			if err := s.auditDB.Record(ctx, audit.Event{
+			auditCtx, cancel := auditContext(r)
+			defer cancel()
+			if err := s.auditDB.Record(auditCtx, audit.Event{
 				EventType: audit.EventCache,
 				PkgType:   regType,
 				PkgName:   policyCandidate,

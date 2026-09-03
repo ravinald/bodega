@@ -226,6 +226,8 @@ Currently logged at `Error` under this rule:
 | A retired `tls_autocert: true` with no cert pair | The key that promised TLS promises nothing; the server binds in the clear or refuses | `reportRetiredTLSKeys`, `cmd/bodega/cmd_serve.go` |
 | Pepper file unreadable | Token auth does not work | `newServer`, `internal/server/server.go` |
 | Audit database will not open | Token auth, policy enforcement and every `/api/v1/audit` read are disabled | `newServer`, `internal/server/server.go` |
+| Audit database is not writable | `Record` no-ops and `Query` keeps answering, so `/api/v1/audit` responds and silently stops growing | `newServer`, `internal/server/server.go` |
+| `audit_events` omits `denied` | No refusal the server makes is recorded, and the journal is the only copy | `newServer`, `internal/server/server.go` |
 | `git` or `git-http-backend` absent | The smart-HTTP route is never registered, so `git clone` 404s; the bundle route is unaffected | `resolveGitTool`, `internal/server/githttp.go` |
 
 Left at `Warn` on purpose, because what gets served is what was asked for: an authorized plaintext listener off `:443` (the documented reverse-proxy deployment), a retired `tls_autocert: true` on a host whose `tls_cert`/`tls_key` are serving, and the ACL disagreement line, where the database is the documented owner and is doing what the operator told it — the config file's copy is inert by design, not degraded.
@@ -450,10 +452,18 @@ A SQLite database (WAL mode) records:
 - **build events**: Pipeline stage completions
 - **mutation events**: Entry creates and deletes
 - **cache events**: Proxy cache misses and upstream fetch results, including checksum verification outcomes
+- **denial events**: Every request the server refused, one `denied` row per refusal with the gate that refused it in `status` — a deny-listed IP, any of the five mutation-auth gates, an admin-only read, a `DELETE` on a frozen entry, or a version outside its constraint. No credential is recorded; an invalid Bearer is identified by a 12-character prefix of its peppered hash
+- **lifecycle events**: `serve_start` and `serve_stop`, so a reader can tell "nobody was turned away" from "the server was not running"
 
 Queryable via `bodega audit` with filters for event type, package type, client IP, and time range.
 
+**Refusal rows are written on a detached context.** `net/http` cancels the request context when the client closes the connection, and `ExecContext` refuses an insert on a cancelled one — so a caller that fires and hangs up got its 403 and left no row, which made the rows least reliable exactly where they matter most. `recordDenial` and the `policy_violation` write derive from `context.WithoutCancel` with a 10s bound, as `recordLifecycle` already did.
+
+**`audit_events` and `timezone` reach both handles**, the CLI's and the one `bodega serve` opens for itself. They did not always: only the CLI applied them, so the key limited nothing the server wrote and the display timezone never reached `GET /api/v1/audit`.
+
 **Concurrency.** `database/sql` pools connections, so several writers through one handle are several SQLite connections contending for the write lock. The DSN carries `busy_timeout=5000`, which makes the loser wait rather than take `SQLITE_BUSY` and lose its row. Serializing with `SetMaxOpenConns(1)` would also work and is not used: it takes the concurrent reads WAL exists to allow, so a dashboard query would queue behind every write. On an M1 Ultra with an internal NVMe SSD, eight concurrent writers sustain ~2,600 inserts/sec through one handle.
+
+**Discovery counts requests, not cache misses.** The row is written on the hit path as well as the miss path, so `request_count` ranks by demand and `last_client` names the last host to ask. Recording misses alone made both columns describe the cache: three requests for one artifact produced one row with count 1. `decision` still means "what the allow-list says about this candidate" rather than "what happened to this request" — a hit contacts no upstream, and recording the current verdict is what keeps it on the same row as the miss that filled the cache. The cost on the serving path is one policy verdict (a read-through cache, 30s TTL) plus a send on the recorder's buffered channel: ~10 µs per served request on an M1 Ultra, against ~113 µs for the request itself.
 
 **Discovery losses are counted in two places.** `DiscoveryRecorder` drops on a full queue and counts that as `dropped`; a row that reaches the writer and is then rejected by the database counts as `failed` and logs at Error. Backpressure and a broken database are different problems, so the summary log names them apart. A `policy_violation` event that fails to write does not change the refusal: the request is still denied, and the lost event is logged at Error with its fields so it can be reconstructed.
 
