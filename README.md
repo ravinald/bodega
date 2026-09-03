@@ -74,14 +74,15 @@ CI job, and `make ci-drift` fails if the two lists stop agreeing.
 
 Resolved in priority order: CLI flags → environment variables → config file → defaults.
 
-Config files: `/etc/bodega/config.json` or `~/.config/bodega/config.json`.
+Exactly one file is in force, and one rule answers for reading it, writing it and creating it: `$BODEGA_CONFIG_FILE` when set, otherwise the first of `/etc/bodega/config.json` and `~/.config/bodega/config.json` that exists, otherwise the system path as root and the user path as anyone else. A file bodega cannot read or parse is an error naming the path, never a quiet fall back to defaults. See [Which file is the config](docs/USAGE.md#which-file-is-the-config).
 
 | Environment variable | Purpose |
 |---------------------|---------|
 | `REPO_BUCKET` | S3 bucket name (when using S3 backend) |
 | `AWS_REGION` | AWS region (default: us-west-2) |
+| `BODEGA_MANIFEST_DIR` | Manifest directory (default: `{storage_path}/manifests`). Overridden by `--manifest-dir`. |
 | `BODEGA_LOG_LEVEL` | Logging verbosity 0-4 |
-| `BODEGA_CONFIG_FILE` | Load this config file instead of walking the default search path. Missing file → pure defaults. |
+| `BODEGA_CONFIG_FILE` | Use this exact path as the config file, whether or not it exists. A generated default is written there too, so nothing touches `/etc` or `~/.config`. |
 | `BODEGA_LISTEN_ADDR` | HTTP listen address for `bodega serve` (default `:8080`). Overridden by `--addr`. |
 
 ## Running under systemd

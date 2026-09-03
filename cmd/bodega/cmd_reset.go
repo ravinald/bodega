@@ -15,6 +15,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/storage"
 )
 
@@ -23,8 +24,8 @@ func newResetCmd(gf *globalFlags) *cobra.Command {
 		Use:   "reset",
 		Short: "Clear all manifests and local artifacts, keeping app config",
 		Long: `reset removes all manifest files and local build artifacts, giving you a
-clean slate. The application config (/etc/bodega/config.json or
-~/.config/bodega/config.json) is preserved.
+clean slate. The config file is preserved, and reset names it before asking for
+confirmation.
 
 This is a destructive operation. You will be asked to type a randomly
 generated confirmation word before anything is deleted.
@@ -59,6 +60,9 @@ What is preserved:
 			if cfg.Bucket != "" {
 				fmt.Printf("  S3 bucket:  s3://%s/manifests/\n", cfg.Bucket)
 			}
+			fmt.Println()
+			fmt.Println("The following is preserved:")
+			fmt.Printf("  Config:     %s\n", config.ConfigPath())
 			fmt.Println()
 
 			fmt.Printf("  Also reset the audit database (%s)? [y/N]: ", auditPath)

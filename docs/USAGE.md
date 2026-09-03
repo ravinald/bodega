@@ -734,6 +734,17 @@ Error: parse config /etc/bodega/config.json: key "audit_events": cannot use stri
 
 That one is the common typo: a single-value list written as a bare string. Write `["upload"]`.
 
+### What a save writes
+
+A save edits the config file rather than replacing it. `Load` keeps the bytes it read, so `Save` — the TUI's `C` editor and its reset-to-defaults — rewrites only the keys whose value differs from what `Load` resolved. Everything else survives as you wrote it, including every `_comment_` block bodega ships and any key written by a newer release than the binary doing the save.
+
+Two consequences worth knowing:
+
+- **A flag is not a setting.** `bodega --manifest-dir /tmp/x shell` followed by a config save leaves `manifest_dir` in the file exactly as it was. The same holds for `--build-root`, `--bucket`, `--region`, `--log-level` and `-v`, and for every built-in default `Load` filled in: `audit_db`, `metadata_ttl` and `apt_codename` stay empty in the file if that is how you left them, so a later release changing one of those defaults still reaches this host.
+- **Clearing a field clears the key.** Emptying the TUI's deny-list field removes `deny_list` from the file; it does not leave the previous value behind. Clearing `tls_cert` and `tls_key` removes both, and `bodega serve` then refuses to start unless `allow_plaintext` is set — see [Serving without TLS](#serving-without-tls).
+
+Editing the file by hand is still supported and is what the comments are there for. A save writes every untouched key back byte for byte, blank lines and all, so a save that changed one setting changes one line.
+
 A default config is created on first run. All fields are optional.
 
 ```json
@@ -831,6 +842,23 @@ Config files are written with mode `0600` (owner read/write only).
 **Resolution priority:** CLI flags > environment variables > config file > built-in defaults. Every flag in the table above is registered with an empty default so it cannot shadow the env var and config key beneath it; `--log-level` is the one exception, where `0` is both a valid level and the zero value, so bodega asks whether the flag was typed rather than reading its value.
 
 `manifest_dir` is where manifests live on the `local` backend. The built-in is `{storage_path}/manifests` and is always absolute: a relative path resolves against the process working directory, which under a systemd unit with no `WorkingDirectory=` is `/`. When the binary runs from a source tree with a `manifests/` directory beside it, that directory wins instead: a development convenience, never reached on an installed host.
+
+Manifests sit inside `storage_path` so that one directory holds the whole repository. Artifacts already lived there; a manifest tree outside it meant `tar` on `storage_path` produced a backup that restored every package's bytes and none of its metadata.
+
+**Upgrading an install created before that default.** `--manifest-dir` used to be registered with a non-empty default, which made `manifest_dir` in the config file unreachable and sent manifests to `./manifests` relative to whatever directory bodega was started from. Check where yours are, then either move them or name them:
+
+```bash
+ls /var/lib/bodega/manifests      # {storage_path}/manifests, the new default
+
+# Move them, if they are elsewhere:
+sudo mv /old/path/manifests /var/lib/bodega/manifests
+sudo chown -R bodega:bodega /var/lib/bodega/manifests
+
+# Or leave them where they are and set the key:
+#   "manifest_dir": "/old/path/manifests"
+```
+
+An install that skips this step looks healthy from the outside: bodega creates the empty directory and serves an empty repository.
 
 A server that loads zero packages says so at `ERROR`, naming the directory it read, because from the outside an empty repository is indistinguishable from a healthy one: the unit reaches `active (running)`, `/healthz` answers 200, and `dists/<suite>/Release` lists `e3b0c44298fc…` (the SHA-256 of the empty string) for `Packages`.
 
