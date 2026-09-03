@@ -243,6 +243,10 @@ func loadConfig(gf *globalFlags) (*config.Config, error) {
 	if cfg.Verbose && cfg.LogLevel == 0 && !levelGiven {
 		cfg.LogLevel = 2
 	}
+	// log_level is resolved here rather than in Load, so Load's baseline does
+	// not know about it. Without this, `bodega -v shell` plus one config save
+	// writes "log_level": 2 into the file as though the operator had set it.
+	cfg.MarkResolved()
 
 	return cfg, nil
 }

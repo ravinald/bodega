@@ -181,7 +181,7 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 	for i := 0; i < typ.NumField(); i++ {
 		f := typ.Field(i)
 		tag := strings.Split(f.Tag.Get("json"), ",")[0]
-		if tag == "-" {
+		if tag == "-" || f.PkgPath != "" {
 			continue
 		}
 		if over, ok := overrides[tag]; ok {
@@ -240,6 +240,9 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	wv, gv := reflect.ValueOf(want), reflect.ValueOf(*got)
 	typ := wv.Type()
 	for i := 0; i < typ.NumField(); i++ {
+		if typ.Field(i).PkgPath != "" {
+			continue
+		}
 		if !reflect.DeepEqual(wv.Field(i).Interface(), gv.Field(i).Interface()) {
 			t.Errorf("%s (json %q): saved %#v, loaded %#v",
 				typ.Field(i).Name, typ.Field(i).Tag.Get("json"),
@@ -248,10 +251,13 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 }
 
-// TestSave_OmitsRuntimeAndUnsetFields pins the two properties Save relies on
-// now that Config is itself the on-disk shape: json:"-" keeps runtime-only
-// fields out of the file, and omitempty keeps unset optional keys out.
-func TestSave_OmitsRuntimeAndUnsetFields(t *testing.T) {
+// TestSave_OmitsRuntimeAndResolvedValues pins what a save writes on a host
+// with no config file yet: the shipped default as its baseline, runtime-only
+// fields kept out by json:"-", and no key rewritten to the value Load resolved
+// for it. audit_db is the one to watch — the file says "", Load turns that
+// into {log_dir}/audit.db, and writing the resolved path back would pin one
+// host to a default a later release could no longer change.
+func TestSave_OmitsRuntimeAndResolvedValues(t *testing.T) {
 	isolateConfig(t)
 	path := filepath.Join(t.TempDir(), "config.json")
 	t.Setenv(config.EnvConfigFile, path)
@@ -278,15 +284,23 @@ func TestSave_OmitsRuntimeAndUnsetFields(t *testing.T) {
 			t.Errorf("saved config contains runtime-only key %q", k)
 		}
 	}
-	for _, k := range []string{"apt_root", "git_root", "tls_cert", "tls_domain", "timezone", "audit_events"} {
-		if _, ok := keys[k]; ok {
-			t.Errorf("saved config contains %q, which is unset and omitempty", k)
+	for k, want := range map[string]string{
+		"audit_db":     `""`,
+		"manifest_dir": `""`,
+		"apt_codename": `"noble"`,
+		"metadata_ttl": `"1h"`,
+	} {
+		if got := string(keys[k]); got != want {
+			t.Errorf("saved config %q = %s, want %s — Save wrote a resolved value as though the operator had set it", k, got, want)
 		}
 	}
 	for _, k := range []string{"bucket", "region", "build_root", "log_dir", "logwindow_height", "custom_paths", "proxy_cache_enabled"} {
 		if _, ok := keys[k]; !ok {
 			t.Errorf("saved config is missing non-omitempty key %q", k)
 		}
+	}
+	if _, ok := keys["_comment_allow_plaintext"]; !ok {
+		t.Error("saved config dropped the shipped comment blocks")
 	}
 }
 

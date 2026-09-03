@@ -7,6 +7,7 @@
 package config
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -50,7 +51,6 @@ const (
 	EnvServerURL   = "BODEGA_SERVER"
 	EnvToken       = "BODEGA_TOKEN"
 
-	SystemConfigDir  = "/etc/bodega"
 	SystemConfigFile = "/etc/bodega/config.json"
 )
 
@@ -128,8 +128,8 @@ type Config struct {
 	// start rather than binding in the clear on whatever listen_addr names.
 	//
 	// The path to an accidental empty pair is a config write, not a hand
-	// edit: Save marshals the whole resolved Config back over the file, so a
-	// cert path cleared in the TUI reaches the listener with nothing between.
+	// edit: a cert path cleared in the TUI is written back as cleared, and
+	// reaches the listener with nothing between.
 	// Set this on a loopback listener behind a proxy that terminates TLS.
 	AllowPlaintext bool `json:"allow_plaintext,omitempty"`
 
@@ -174,7 +174,32 @@ type Config struct {
 
 	LocalConfig bool `json:"-"`
 	Verbose     bool `json:"-"`
+
+	// snapshot is what Load read and what Load resolved. Save needs both to
+	// tell an operator's setting from a value a flag, an environment variable
+	// or a built-in default supplied. A Config built in code has none, and
+	// Save writes such a Config whole.
+	snapshot *fileSnapshot
 }
+
+// fileSnapshot is one config file as Load found it, beside the values Load
+// produced from it.
+//
+// raw carries every top-level key including the ones Config has no field for:
+// the _comment_ blocks that carry the guidance bodega ships, and any key
+// written by a newer release than the binary doing the save. order is their
+// position in the file, so a comment stays beside the key it describes.
+type fileSnapshot struct {
+	raw      map[string]json.RawMessage
+	order    []string
+	spaced   map[string]bool // keys the file separates from the one above with a blank line
+	resolved map[string]json.RawMessage
+}
+
+// legacyKeyAliases maps a retired config key onto the one that replaced it. A
+// file carrying an alias is migrated by the next Save rather than keeping the
+// old key alive forever, so the promotion Load already performs is recorded.
+var legacyKeyAliases = map[string]string{"shell_height": "logwindow_height"}
 
 // Namespaced-upstream modes. An absent or empty mode loads as
 // UpstreamModeCatalog: an operator who adds a namespace without reading the
@@ -500,7 +525,7 @@ type legacyConfig struct {
 
 // Load builds a Config by merging sources in priority order.
 func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig, verbose bool) (*Config, error) {
-	cfg, legacy, err := loadFileConfig()
+	cfg, legacy, snap, err := loadFileConfig()
 	if err != nil {
 		return nil, err
 	}
@@ -613,7 +638,25 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 		return nil, err
 	}
 
+	cfg.snapshot = snap
+	cfg.MarkResolved()
 	return cfg, nil
+}
+
+// MarkResolved records the current values as the resolved baseline, so Save
+// treats them as supplied rather than chosen. Load calls it; a caller that
+// finishes resolution afterwards — cmd/bodega resolves log_level from
+// --log-level, $BODEGA_LOG_LEVEL and --verbose — calls it again, or the next
+// TUI save pins its flag into the file for every later run.
+func (c *Config) MarkResolved() {
+	if c.snapshot == nil {
+		return
+	}
+	resolved, err := marshalKeys(c)
+	if err != nil {
+		return
+	}
+	c.snapshot.resolved = resolved
 }
 
 // ValidateTLSPair rejects half a certificate pair. One path set with the other
@@ -706,15 +749,12 @@ func (c *Config) definedStorageNames() string {
 // wrote. It never falls back to a second path: an edit that lands somewhere
 // Load will not read is worse than a failure, because it reports success.
 //
-// It marshals the Config itself, so every JSON-tagged field survives a
-// load/save cycle. LocalConfig and Verbose stay out of the file via
-// `json:"-"`, and omitempty keeps unset optional keys absent.
+// It rewrites the file rather than replacing it. See marshalForFile.
 func (c *Config) Save() (string, error) {
-	data, err := json.MarshalIndent(c, "", "  ")
+	data, err := c.marshalForFile()
 	if err != nil {
-		return "", fmt.Errorf("marshal config: %w", err)
+		return "", err
 	}
-	data = append(data, '\n')
 
 	path := ConfigPath()
 	dir := filepath.Dir(path)
@@ -725,6 +765,150 @@ func (c *Config) Save() (string, error) {
 		return "", fmt.Errorf("write config %s: %w", path, err)
 	}
 	return path, nil
+}
+
+// marshalForFile renders what belongs on disk.
+//
+// A Config that came from Load carries the file it came from, so Save edits
+// that file: every key the operator wrote stays as they wrote it, every key
+// Config has no field for survives (the _comment_ blocks that carry bodega's
+// shipped guidance, and any key a newer release wrote), and only the keys whose
+// value now differs from what Load resolved are rewritten.
+//
+// Writing the resolved Config instead is what made a save destructive twice
+// over. It deleted the comments, including the one saying that "mode": "open"
+// on a public forge lets any client make bodega fetch arbitrary upstream
+// repositories. And it recorded every flag and built-in default as though the
+// operator had typed it, so `bodega --manifest-dir /tmp/x shell` plus one save
+// pinned /tmp/x, log_dir, audit_db, metadata_ttl and apt_codename permanently:
+// a later change to any of those defaults could never reach that host again.
+//
+// A Config built in code has no such file and is written whole. LocalConfig and
+// Verbose stay out via `json:"-"`, and omitempty keeps unset optional keys
+// absent.
+func (c *Config) marshalForFile() ([]byte, error) {
+	if c.snapshot == nil {
+		data, err := json.MarshalIndent(c, "", "  ")
+		if err != nil {
+			return nil, fmt.Errorf("marshal config: %w", err)
+		}
+		return append(data, '\n'), nil
+	}
+
+	current, err := marshalKeys(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// Values from the file are re-emitted byte for byte, so a key an operator
+	// wrote on one line stays on one line. Only a rewritten key is re-indented.
+	out := make(map[string]json.RawMessage, len(c.snapshot.raw)+len(current))
+	for k, v := range c.snapshot.raw {
+		out[k] = v
+	}
+	for k, v := range current {
+		if prev, ok := c.snapshot.resolved[k]; !ok || !bytes.Equal(prev, v) {
+			indented, err := indentValue(v)
+			if err != nil {
+				return nil, fmt.Errorf("marshal config key %q: %w", k, err)
+			}
+			out[k] = indented
+		}
+	}
+	// A key the caller cleared drops out of current entirely, because every
+	// optional key is omitempty. Deleting it is the difference between the TUI
+	// emptying a deny list and the TUI leaving one alone.
+	for k := range c.snapshot.resolved {
+		if _, ok := current[k]; !ok {
+			delete(out, k)
+		}
+	}
+	order := append([]string(nil), c.snapshot.order...)
+	for old, replacement := range legacyKeyAliases {
+		if _, ok := c.snapshot.raw[old]; !ok {
+			continue
+		}
+		delete(out, old)
+		v, ok := current[replacement]
+		if !ok {
+			continue
+		}
+		indented, err := indentValue(v)
+		if err != nil {
+			return nil, fmt.Errorf("marshal config key %q: %w", replacement, err)
+		}
+		out[replacement] = indented
+		order = append(order, replacement)
+	}
+
+	return encodeOrdered(out, order, c.snapshot.spaced)
+}
+
+// indentValue re-indents one value to sit under a two-space top-level key.
+func indentValue(v json.RawMessage) (json.RawMessage, error) {
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, v, "  ", "  "); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// marshalKeys renders a Config as its top-level JSON keys, so two of them can
+// be compared key by key rather than as one blob.
+func marshalKeys(c *Config) (map[string]json.RawMessage, error) {
+	data, err := json.Marshal(c)
+	if err != nil {
+		return nil, fmt.Errorf("marshal config: %w", err)
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(data, &keys); err != nil {
+		return nil, fmt.Errorf("marshal config: %w", err)
+	}
+	return keys, nil
+}
+
+// encodeOrdered writes obj as a JSON object, emitting the keys named in order
+// first and anything left over sorted after them, with a blank line before each
+// key spaced names. Values are written as given, already indented.
+func encodeOrdered(obj map[string]json.RawMessage, order []string, spaced map[string]bool) ([]byte, error) {
+	seen := make(map[string]bool, len(obj))
+	keys := make([]string, 0, len(obj))
+	for _, k := range order {
+		if _, ok := obj[k]; ok && !seen[k] {
+			seen[k] = true
+			keys = append(keys, k)
+		}
+	}
+	rest := make([]string, 0, len(obj)-len(keys))
+	for k := range obj {
+		if !seen[k] {
+			rest = append(rest, k)
+		}
+	}
+	sort.Strings(rest)
+	keys = append(keys, rest...)
+
+	var buf bytes.Buffer
+	buf.WriteString("{\n")
+	for i, k := range keys {
+		name, err := json.Marshal(k)
+		if err != nil {
+			return nil, fmt.Errorf("marshal config key %q: %w", k, err)
+		}
+		if i > 0 && spaced[k] {
+			buf.WriteByte('\n')
+		}
+		buf.WriteString("  ")
+		buf.Write(name)
+		buf.WriteString(": ")
+		buf.Write(obj[k])
+		if i < len(keys)-1 {
+			buf.WriteByte(',')
+		}
+		buf.WriteByte('\n')
+	}
+	buf.WriteString("}\n")
+	return buf.Bytes(), nil
 }
 
 // ConfigPath returns the config file in force. It is the single answer to
@@ -842,7 +1026,7 @@ func defaultConfigContent() []byte {
   "region": "us-west-2",
   "build_root": "/opt/bodega",
 
-  "_comment_manifest_dir": "manifest_dir: where manifests live on the local backend. Empty means {storage_path}/manifests. Set an absolute path; a relative one resolves against the process working directory, which under systemd is /.",
+  "_comment_manifest_dir": "manifest_dir: where manifests live on the local backend. Empty means {storage_path}/manifests, so a backup of storage_path is a backup of the whole repository. Set an absolute path; a relative one resolves against the process working directory, which under systemd is /. Upgrading an install whose manifests were written relative to the directory bodega was started from: move that manifests/ directory into {storage_path}/manifests, or point this key at where it already is.",
   "manifest_dir": "",
   "log_dir": "/var/log/bodega",
   "logwindow_height": 12,
@@ -981,22 +1165,84 @@ func (c *Config) ResolvePublicURL(flagURL string) string {
 // nothing is denied. The plaintext half now refuses to start rather than
 // binding in the clear (see (*Server).guardPlaintext), which turns a silent
 // downgrade into a loud one; the deny_list half still fails open.
-func loadFileConfig() (*Config, legacyConfig, error) {
+func loadFileConfig() (*Config, legacyConfig, *fileSnapshot, error) {
 	path := ConfigPath()
 	data, err := os.ReadFile(path)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		return &Config{}, legacyConfig{}, nil
+		// Zero values for the precedence chain, but the shipped default as the
+		// baseline Save edits: a first save against a host with no file yet
+		// then produces the documented, commented config rather than the
+		// handful of keys that save happened to touch.
+		return &Config{}, legacyConfig{}, newFileSnapshot(defaultConfigContent()), nil
 	case err != nil:
-		return nil, legacyConfig{}, fmt.Errorf("read config %s: %w", path, err)
+		return nil, legacyConfig{}, nil, fmt.Errorf("read config %s: %w", path, err)
 	}
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, legacyConfig{}, parseConfigError(path, err)
+		return nil, legacyConfig{}, nil, parseConfigError(path, err)
 	}
 	var legacy legacyConfig
 	_ = json.Unmarshal(data, &legacy)
-	return &cfg, legacy, nil
+	return &cfg, legacy, newFileSnapshot(data), nil
+}
+
+// newFileSnapshot records a config file's keys and their order. data has
+// already been unmarshalled into a Config by every caller, so a second failure
+// here is not reachable and an unparsable blob yields an empty snapshot rather
+// than a second error path saying the same thing.
+func newFileSnapshot(data []byte) *fileSnapshot {
+	snap := &fileSnapshot{}
+	snap.order, snap.spaced = topLevelKeys(data)
+	if err := json.Unmarshal(data, &snap.raw); err != nil {
+		snap.raw = nil
+		snap.order = nil
+		snap.spaced = nil
+	}
+	return snap
+}
+
+// topLevelKeys returns the top-level object keys of a config file in the order
+// they appear, and which of them the file sets off with a blank line.
+//
+// Marshalling a map sorts the keys, which would move every _comment_ block away
+// from what it documents into one wall at the top, and JSON carries no blank
+// lines, so both have to be read off the original bytes or lost on the first
+// save. Twenty-six comment blocks run together is a file nobody reads.
+func topLevelKeys(data []byte) ([]string, map[string]bool) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, nil
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return nil, nil
+	}
+	var keys []string
+	spaced := map[string]bool{}
+	prevEnd := dec.InputOffset()
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return keys, spaced
+		}
+		key, ok := tok.(string)
+		if !ok {
+			return keys, spaced
+		}
+		// Everything between the previous value and this key: a comma, the
+		// line break, and a second one when the file leaves a gap.
+		if len(keys) > 0 && bytes.Count(data[prevEnd:dec.InputOffset()], []byte{'\n'}) > 1 {
+			spaced[key] = true
+		}
+		keys = append(keys, key)
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return keys, spaced
+		}
+		prevEnd = dec.InputOffset()
+	}
+	return keys, spaced
 }
 
 // parseConfigError names the file and, when encoding/json can say it, the key

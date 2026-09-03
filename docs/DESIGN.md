@@ -433,7 +433,7 @@ Queryable via `bodega audit` with filters for event type, package type, client I
 
 ## Configuration
 
-One JSON file at `/etc/bodega/config.json` or `~/.config/bodega/config.json`. Priority: CLI flags > environment variables > config file > defaults.
+One JSON file, named by `$BODEGA_CONFIG_FILE` when that is set and otherwise the first of `/etc/bodega/config.json` and `~/.config/bodega/config.json` that **exists** — falling back, when neither does, to the system path as root and the user path as anyone else. Existence decides, never writability: `Load`, `Save` and `EnsureConfigFile` share the one answer, so an edit lands in the file the process reads rather than in a second copy beside it. Priority: CLI flags > environment variables > config file > defaults.
 
 Key fields:
 
@@ -460,7 +460,11 @@ Key fields:
 | `git_upstreams` | {} | Namespaces under `/git/` mapped onto an upstream forge, each in `open` or `catalog` mode |
 | `binary_upstreams` | {} | Namespaces under `/binaries/` mapped onto an upstream download host, each in `open` or `catalog` mode. While empty, `/binaries/` serves from storage as before |
 
-The TUI config editor (`C` key in `bodega shell`) writes to the same file.
+The TUI config editor (`C` key in `bodega shell`) writes to the same file, and reports the path `Save` returned rather than a second guess at it.
+
+**A save edits the file; it does not replace it.** `Load` keeps the bytes it read, so `Save` rewrites only the keys whose value now differs from what `Load` resolved. Everything else survives as the operator wrote it: every `_comment_` block carrying the guidance bodega ships, and any key written by a release newer than the binary doing the save.
+
+Marshalling the resolved `Config` over the file instead was destructive twice over. It deleted the comments, one of which is the only place an operator is told that `"mode": "open"` on a public forge lets any client make bodega fetch arbitrary upstream repositories. And it recorded every flag and built-in default as though the operator had typed it, so `bodega --manifest-dir /tmp/x shell` plus one save pinned `/tmp/x`, `log_dir`, `audit_db`, `metadata_ttl` and `apt_codename` permanently, past the reach of any later change to those defaults. A `Config` built in code rather than by `Load` carries no such file and is still written whole.
 
 ### The empty repository
 
