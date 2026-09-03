@@ -427,6 +427,10 @@ A SQLite database (WAL mode) records:
 
 Queryable via `bodega audit` with filters for event type, package type, client IP, and time range.
 
+**Concurrency.** `database/sql` pools connections, so several writers through one handle are several SQLite connections contending for the write lock. The DSN carries `busy_timeout=5000`, which makes the loser wait rather than take `SQLITE_BUSY` and lose its row. Serializing with `SetMaxOpenConns(1)` would also work and is not used: it takes the concurrent reads WAL exists to allow, so a dashboard query would queue behind every write. On an M1 Ultra with an internal NVMe SSD, eight concurrent writers sustain ~2,600 inserts/sec through one handle.
+
+**Discovery losses are counted in two places.** `DiscoveryRecorder` drops on a full queue and counts that as `dropped`; a row that reaches the writer and is then rejected by the database counts as `failed` and logs at Error. Backpressure and a broken database are different problems, so the summary log names them apart. A `policy_violation` event that fails to write does not change the refusal: the request is still denied, and the lost event is logged at Error with its fields so it can be reconstructed.
+
 ## Configuration
 
 One JSON file at `/etc/bodega/config.json` or `~/.config/bodega/config.json`. Priority: CLI flags > environment variables > config file > defaults.

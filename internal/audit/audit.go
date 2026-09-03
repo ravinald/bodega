@@ -173,6 +173,28 @@ func (a *DB) DisplayLocation() *time.Location {
 	return a.location
 }
 
+// busyTimeout is how long a connection waits for the SQLite write lock before
+// giving up. database/sql pools connections, so two goroutines writing through
+// one *DB are two SQLite connections contending for that lock; with no timeout
+// the loser is refused immediately and the row is gone. Eight goroutines
+// writing fifty events each stored 30 of 400 without it.
+//
+// db.SetMaxOpenConns(1) would also stop the loss, by removing the contention:
+// one connection cannot race itself. It removes the concurrent reads too,
+// which is the thing WAL mode is turned on for — a dashboard query would then
+// queue behind every write. Waiting for the lock keeps both.
+const busyTimeout = 5 * time.Second
+
+// dsn attaches the busy_timeout pragma to a database path. An empty path is
+// left alone: the driver only strips a query string when it appears at index
+// 1 or later, so "?..." on its own would be taken as a filename.
+func dsn(path string) string {
+	if path == "" {
+		return path
+	}
+	return fmt.Sprintf("%s?_pragma=busy_timeout(%d)", path, busyTimeout.Milliseconds())
+}
+
 // Open opens (or creates) the audit database at path and runs migrations.
 //
 // If the backing file exists but isn't writable by this process (typical when
@@ -193,7 +215,7 @@ func Open(path string) (*DB, error) {
 		}
 	}
 
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", dsn(path))
 	if err != nil {
 		return nil, fmt.Errorf("open audit db %s: %w", path, err)
 	}

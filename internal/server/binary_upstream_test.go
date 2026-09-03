@@ -242,29 +242,37 @@ func TestUpstreamViolationRefusedAtEveryDiscoverMode(t *testing.T) {
 // recorder, the mode guard or a classification branch with it fails here
 // rather than in a fleet whose drift report quietly went empty.
 //
-// A server per row rather than one server for all five. The deny path writes a
-// policy_violation audit event from the request goroutine while the recorder's
-// worker writes the discovery row, and on a shared handle those two contend;
-// piling five requests onto one server makes the test measure SQLite locking
-// instead of what it claims to (#161).
+// One server for all five, five requests through a single audit handle: the
+// deny path writes a policy_violation event from the request goroutine while
+// the recorder's worker writes the discovery row, so this is also the
+// end-to-end check that the two no longer lose to each other under the write
+// lock.
+//
+// The rows are ordered and the seed is not a table column. no_policy is only
+// observable before any rule exists, and once the terraform prefix is allowed
+// the denial has to come from a package outside it — vault, on the same open
+// namespace. decision is part of the discovery upsert key, so the two
+// terraform requests leave two rows rather than overwriting each other.
 func TestObserveRecordsEveryDecisionAndStillEnforces(t *testing.T) {
+	const vaultPkg = "hashicorp/vault/1.16.0/vault_1.16.0_linux_amd64.zip"
+	s := binaryServer(t, "observe")
+
 	for _, tc := range []struct {
-		name, rule, path string
-		wantStatus       int
-		wantDecision     string
+		name, seedRule, path string
+		wantStatus           int
+		wantDecision         string
 	}{
 		{"no_policy", "", "/binaries/" + terraformPkg, http.StatusBadGateway, audit.DecisionNoPolicy},
 		{"allowed", hashicorpURL + "terraform/", "/binaries/" + terraformPkg, http.StatusBadGateway, audit.DecisionAllowed},
 		// The 403 is the assertion, not the row: under learn mode this same
 		// request returned 502 because the fetch went ahead anyway.
-		{"denied", "https://elsewhere.example/", "/binaries/" + terraformPkg, http.StatusForbidden, audit.DecisionDenied},
+		{"denied", "", "/binaries/" + vaultPkg, http.StatusForbidden, audit.DecisionDenied},
 		{"no_manifest", "", "/binaries/vendor/tool/2.0/tool.tar.gz", http.StatusNotFound, audit.DecisionNoManifest},
 		{"no_namespace", "", "/binaries/mytool/1.0.0/mytool_linux_amd64", http.StatusNotFound, audit.DecisionNoNamespace},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := binaryServer(t, "observe")
-			if tc.rule != "" {
-				seedBinaryPolicy(t, s, tc.rule)
+			if tc.seedRule != "" {
+				seedBinaryPolicy(t, s, tc.seedRule)
 			}
 
 			if got := getBinary(t, s, tc.path); got != tc.wantStatus {
