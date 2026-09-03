@@ -19,14 +19,12 @@ import (
 
 func newServeCmd(gf *globalFlags) *cobra.Command {
 	var (
-		addr        string
-		tlsCert     string
-		tlsKey      string
-		tlsAutocert bool
-		tlsDomain   string
-		allowPlain  bool
-		publicURL   string
-		quiet       bool
+		addr       string
+		tlsCert    string
+		tlsKey     string
+		allowPlain bool
+		publicURL  string
+		quiet      bool
 	)
 
 	cmd := &cobra.Command{
@@ -53,9 +51,9 @@ health checking.
 S3 objects are streamed directly to clients — the server does not buffer
 artifacts in memory.
 
-TLS can be enabled in two ways:
-  --tls-cert and --tls-key     Manual PEM certificate files
-  --tls-autocert --tls-domain  Automatic Let's Encrypt certificates
+TLS is enabled by --tls-cert and --tls-key, a PEM pair bodega reads at
+startup. bodega has no ACME client: obtain the pair from certbot or your CA,
+or terminate TLS at a proxy in front and set public_url.
 
 Serving in the clear is an explicit request, not the absence of one. With no
 certificate pair, serve refuses to bind unless --allow-plaintext (config key
@@ -121,15 +119,11 @@ output continues to respect log_level in the config.`,
 			if tlsKey != "" {
 				cfg.TLSKey = tlsKey
 			}
-			if tlsAutocert {
-				cfg.TLSAutocert = true
-			}
-			if tlsDomain != "" {
-				cfg.TLSDomain = tlsDomain
-			}
+			reportRetiredTLSKeys(cfg, logger)
 			// Gated on Changed rather than on the value, so --allow-plaintext=false
-			// turns off a config file that set it true. The other three flags here
-			// cannot (issue #81); a new one need not inherit that.
+			// turns off a config file that set it true. --tls-cert and --tls-key
+			// resolve on the value instead, which is harmless only because their
+			// zero value is the same "not configured" the guard already refuses.
 			if cmd.Flags().Changed("allow-plaintext") {
 				cfg.AllowPlaintext = allowPlain
 			}
@@ -138,21 +132,8 @@ output continues to respect log_level in the config.`,
 			// serve never writes the config file.
 			cfg.PublicURL = cfg.ResolvePublicURL(publicURL)
 
-			// Object storage is optional. Without it, API endpoints still work
-			// but package proxying returns 503.
-			//
-			// Logged at Error, not Warn: the shipped default log_level maps to
-			// slog.LevelError, so a Warn here printed nothing and the whole
-			// observable symptom was "server is up, apt gets 503, logs empty".
-			var stores storage.Resolver
 			ctx := backgroundCtx()
-			resolved, err := storage.NewResolver(ctx, cfg)
-			if err != nil {
-				logger.Error("storage backend unavailable — package routes will answer 503; the API and /healthz still serve",
-					"backend", storageBackendName(cfg), "config", config.ConfigPath(), "error", err)
-			} else {
-				stores = resolved
-			}
+			stores := startupStorage(ctx, cfg, logger)
 
 			// Resolve listen address: flag → env → config file → default.
 			resolvedAddr := cfg.ResolveListenAddr(addr)
@@ -174,12 +155,58 @@ output continues to respect log_level in the config.`,
 	cmd.Flags().StringVar(&addr, "addr", "", fmt.Sprintf("TCP address to listen on (default %s; env: %s)", config.DefaultListenAddr, config.EnvListenAddr))
 	cmd.Flags().StringVar(&tlsCert, "tls-cert", "", "Path to TLS certificate PEM file")
 	cmd.Flags().StringVar(&tlsKey, "tls-key", "", "Path to TLS private key PEM file")
-	cmd.Flags().BoolVar(&tlsAutocert, "tls-autocert", false, "Enable automatic TLS via Let's Encrypt (requires --tls-domain)")
-	cmd.Flags().StringVar(&tlsDomain, "tls-domain", "", "Domain name for autocert (e.g. bodega.example.com)")
 	cmd.Flags().BoolVar(&allowPlain, "allow-plaintext", false, "Serve without TLS; required when tls_cert/tls_key are unset (config: allow_plaintext)")
 	cmd.Flags().StringVar(&publicURL, "public-url", "", fmt.Sprintf("Base URL clients reach this server at, e.g. https://bodega.example.com (env: %s)", config.EnvPublicURL))
 	cmd.Flags().BoolVar(&quiet, "quiet", false, "Suppress the stderr startup banner (log_level output is unaffected)")
 	return cmd
+}
+
+// startupStorage builds the resolver serve reads artifacts through, and
+// returns nil when it cannot be built.
+//
+// Storage staying non-fatal is a decision, not an oversight. /healthz, the
+// REST API, the audit surface and the TUI are exactly what an operator needs
+// while a bucket or a directory is unreachable, and exiting takes them away at
+// the moment they are wanted. What was wrong was the silence: the failure was
+// logged below the shipped default log_level, so the whole observable symptom
+// was "server is up, apt gets 503, logs empty".
+//
+// Error, not Warn, because every package route answers 503 from here on. The
+// message names the configured backend and the underlying error, since the
+// 503 body deliberately names no driver — it cannot know one, and the old
+// wording guessed S3 on installs whose config never mentioned it.
+func startupStorage(ctx context.Context, cfg *config.Config, logger *slog.Logger) storage.Resolver {
+	stores, err := storage.NewResolver(ctx, cfg)
+	if err != nil {
+		logger.Error("storage backend unavailable — package routes will answer 503; the API and /healthz still serve",
+			"backend", storageBackendName(cfg), "config", config.ConfigPath(), "error", err)
+		return nil
+	}
+	return stores
+}
+
+// reportRetiredTLSKeys says that a config file still carrying tls_autocert is
+// carrying a key nothing reads.
+//
+// Save preserves keys it did not parse, so retiring the option left the value
+// sitting in the file looking like a setting in force. The level splits on
+// whether serving changes: with a certificate pair the listener does what the
+// operator wanted and only the key is dead, so Warn. Without one, the config
+// that used to say "get a certificate automatically" now says nothing, and
+// this server is about to refuse to bind or serve in the clear.
+func reportRetiredTLSKeys(cfg *config.Config, logger *slog.Logger) {
+	raw, ok := cfg.RawFileValue("tls_autocert")
+	if !ok || string(raw) != "true" {
+		return
+	}
+	const msg = "tls_autocert was removed and is ignored; bodega has no ACME client"
+	if cfg.TLSCert != "" && cfg.TLSKey != "" {
+		logger.Warn(msg+" — tls_cert and tls_key are serving this listener; delete the key",
+			"config", config.ConfigPath())
+		return
+	}
+	logger.Error(msg+" — no certificate pair is configured, so this server serves in the clear or refuses to bind; set tls_cert and tls_key, or terminate TLS in front and set allow_plaintext",
+		"config", config.ConfigPath())
 }
 
 // totalPackages counts every package name in the loaded index, across types.

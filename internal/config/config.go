@@ -82,8 +82,6 @@ type Config struct {
 	BinaryRoot        string   `json:"binary_root,omitempty"`
 	TLSCert           string   `json:"tls_cert,omitempty"`
 	TLSKey            string   `json:"tls_key,omitempty"`
-	TLSAutocert       bool     `json:"tls_autocert,omitempty"`
-	TLSDomain         string   `json:"tls_domain,omitempty"`
 	ListenAddr        string   `json:"listen_addr,omitempty"` // see ResolveListenAddr for the full precedence chain
 	PublicURL         string   `json:"public_url,omitempty"`  // external base URL clients reach the server at; see ResolvePublicURL
 	ServerURL         string   `json:"server_url,omitempty"`  // bodega server this host pushes catalogs to; see ResolveServerURL
@@ -659,6 +657,22 @@ func (c *Config) MarkResolved() {
 	c.snapshot.resolved = resolved
 }
 
+// RawFileValue returns a top-level key exactly as the config file carries it,
+// whatever Config does with it. Save preserves keys it did not parse, so a key
+// this release stopped reading survives in the file and goes on looking to the
+// operator like a setting that is in force. Reading it back is how startup can
+// say the value is being ignored instead of ignoring it silently.
+//
+// Reports false when no file was read, so a host with no config never learns
+// that the shipped template mentions something.
+func (c *Config) RawFileValue(key string) (json.RawMessage, bool) {
+	if c.snapshot == nil || c.snapshot.raw == nil {
+		return nil, false
+	}
+	v, ok := c.snapshot.raw[key]
+	return v, ok
+}
+
 // ValidateTLSPair rejects half a certificate pair. One path set with the other
 // empty is a typo or a truncated edit, never a request for plaintext, and the
 // listener cannot tell the difference: it skips TLS on both empty and one
@@ -1037,11 +1051,9 @@ func defaultConfigContent() []byte {
   "pypi_root": "",
   "binary_root": "",
 
-  "_comment_tls": "TLS: set tls_cert + tls_key for manual certs, or tls_autocert + tls_domain for Let's Encrypt. Setting one of tls_cert/tls_key without the other is an error.",
+  "_comment_tls": "TLS: set both tls_cert and tls_key to serve HTTPS. Setting one without the other is an error. bodega has no ACME client; get certificates from certbot or terminate TLS at a proxy in front.",
   "tls_cert": "",
   "tls_key": "",
-  "tls_autocert": false,
-  "tls_domain": "",
 
   "_comment_allow_plaintext": "allow_plaintext: authorize an unencrypted listener. With no cert pair bodega refuses to start unless this is true — set it for local use, or on a loopback listener behind a proxy that terminates TLS. --allow-plaintext=false overrides it back off.",
   "allow_plaintext": false,

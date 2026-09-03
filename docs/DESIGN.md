@@ -208,6 +208,28 @@ pypi entries are always hosted. git and binary reach upstream through `git_upstr
 
 apt reaches upstream through `apt_upstreams`, and it has **no** `catalog` mode and no per-package allow-list. apt decides what to request by reading a `Packages` index, so the first `Depends:` chain reaching a package nobody cataloged would 404 mid-install and surface as a broken dependency rather than a policy refusal. `git_upstreams` and `binary_upstreams` can offer `catalog` because a client there asks for one artifact it already named. Constraint for apt is the host-level allow-list (`bodega policy add apt <host>`), checked before the fetch and before the pool probe.
 
+### Startup conditions and log levels
+
+**A non-fatal startup condition that changes what bodega serves logs at `Error`. `Warn` is for conditions that do not.**
+
+The rule exists because `log_level` defaults to `0` and `internal/logging/level.go` maps `0` to `slog.LevelError`. Anything below that is invisible on a default install, so a `Warn` describing a degraded server is a line written for nobody: three states put bodega into `active (running)` with `/healthz` answering 200 while it served nothing an operator wanted, and all three were `Warn`. The level is not a severity opinion, it is the decision about whether the operator finds out.
+
+`Error` here does not mean the process failed. It means the running server is not doing what the config asked, which is the one thing a `journalctl -u bodega` with no arguments has to show. What is on the wrong side of the line stays on the wrong side for years, because nothing fails and no test catches it — a test that raises the verbosity passes against every one of these defects, so the tests assert on output captured at `log_level: 0`.
+
+Currently logged at `Error` under this rule:
+
+| Condition | What changes | Site |
+|-----------|--------------|------|
+| Storage backend fails to construct | Every package route answers 503; the API and `/healthz` still serve | `startupStorage`, `cmd/bodega/cmd_serve.go` |
+| No packages loaded | Every repository index publishes as empty | `cmd/bodega/cmd_serve.go` |
+| Plaintext authorized on `:443` | Every request and response is in the clear on the port clients read as TLS | `guardPlaintext`, `internal/server/server.go` |
+| A retired `tls_autocert: true` with no cert pair | The key that promised TLS promises nothing; the server binds in the clear or refuses | `reportRetiredTLSKeys`, `cmd/bodega/cmd_serve.go` |
+| Pepper file unreadable | Token auth does not work | `newServer`, `internal/server/server.go` |
+| Audit database will not open | Token auth, policy enforcement and every `/api/v1/audit` read are disabled | `newServer`, `internal/server/server.go` |
+| `git` or `git-http-backend` absent | The smart-HTTP route is never registered, so `git clone` 404s; the bundle route is unaffected | `resolveGitTool`, `internal/server/githttp.go` |
+
+Left at `Warn` on purpose, because what gets served is what was asked for: an authorized plaintext listener off `:443` (the documented reverse-proxy deployment), a retired `tls_autocert: true` on a host whose `tls_cert`/`tls_key` are serving, and the ACL disagreement line, where the database is the documented owner and is doing what the operator told it — the config file's copy is inert by design, not degraded.
+
 ## Filling the catalog
 
 A manifest entry is what makes a package servable, so how entries get written is how a bodega install becomes useful. There are four ways, and they answer different questions.
@@ -410,7 +432,11 @@ Upstream proxy fetches validate that target URLs use HTTPS and don't resolve to 
 
 ### TLS
 
-Two options: provide a cert/key pair, or enable Let's Encrypt autocert with a domain name. Minimum TLS 1.3.
+One option: a cert/key pair in `tls_cert` and `tls_key`. Minimum TLS 1.3.
+
+bodega has no ACME client and does not plan one. `tls_autocert` and `tls_domain` were accepted by the config and the flag set and then refused at startup, which is worse than absent: an operator configured TLS, got a start failure, and had no way to reach the feature the message implied existed. The refusal was right and the offer was not, so the offer is gone. The deployment that prompted the question runs behind a firewall whose 443 is allowlisted, and `autocert` validates over TLS-ALPN-01 on 443 or HTTP-01 on a port 80 open to the whole internet, so neither challenge was reachable there anyway. Use `certbot`, or terminate TLS at a proxy in front and set `public_url`.
+
+A config file that still carries `tls_autocert: true` logs it at startup rather than dropping it silently: `Save` preserves keys it did not parse, so the value survives and goes on looking like a setting in force.
 
 ### Manifest integrity
 
@@ -454,7 +480,6 @@ Key fields:
 | `tls_min_version` | 1.3 | Floor for bodega's own listener; `1.2` or `1.3` |
 | `api_token` | (none) | Bearer token for mutation API |
 | `tls_cert` / `tls_key` | (none) | Manual TLS. Setting one without the other is fatal at load, not a request for plaintext |
-| `tls_autocert` / `tls_domain` | (none) | Let's Encrypt. Accepted and refused at startup; see [#113](https://github.com/ravinald/bodega/issues/113) |
 | `allow_plaintext` | false | Authorizes an unencrypted listener. With no cert pair `bodega serve` refuses to bind without it, and refuses on `:443` naming the port |
 | `audit_db` | {log_dir}/audit.db | Audit database path |
 | `git_upstreams` | {} | Namespaces under `/git/` mapped onto an upstream forge, each in `open` or `catalog` mode |

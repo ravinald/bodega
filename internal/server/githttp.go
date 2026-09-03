@@ -111,10 +111,14 @@ var gitBackendCandidates = []string{
 // the smart-HTTP route and then fails per request tells an operator nothing
 // until a client complains; one that refuses the route at startup and names
 // the search says what to install before anyone clones.
+//
+// Both refusals log at Error because both unregister a route: the shipped
+// default log_level prints only Error, so a Warn saying "clone is disabled"
+// said it to nobody.
 func resolveGitTool(cfg *config.Config, logger *slog.Logger) *gitTool {
 	gitPath, err := exec.LookPath("git")
 	if err != nil {
-		logger.Warn("git not found on PATH — git smart-HTTP is disabled; the /git/{name}/{file} bundle route is unaffected",
+		logger.Error("git not found on PATH — git smart-HTTP is disabled; the /git/{name}/{file} bundle route is unaffected",
 			"searched", os.Getenv("PATH"), "error", err)
 		return nil
 	}
@@ -152,7 +156,7 @@ func resolveGitTool(cfg *config.Config, logger *slog.Logger) *gitTool {
 		}
 	}
 	if backend == "" {
-		logger.Warn("git-http-backend not found — git smart-HTTP is disabled; install git's libexec helpers to enable 'git clone' through bodega. The /git/{name}/{file} bundle route is unaffected",
+		logger.Error("git-http-backend not found — git smart-HTTP is disabled; install git's libexec helpers to enable 'git clone' through bodega. The /git/{name}/{file} bundle route is unaffected",
 			"searched", strings.Join(searched, ", "))
 		return nil
 	}

@@ -208,12 +208,14 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 	} else {
 		logger.Error("could not load or create pepper file — token auth will not work", "error", err)
 	}
-	// Open the audit DB if configured. Best-effort — server keeps serving
-	// even if this fails, but token auth and upstream-policy enforcement
-	// both depend on it.
+	// Open the audit DB if configured. Best-effort — the package routes keep
+	// serving even if this fails, but token auth, upstream-policy enforcement
+	// and every /api/v1/audit read go with it, so it logs at Error: what the
+	// server answers changed, and the shipped default log_level prints only
+	// Error.
 	if dbPath := resolveAuditDBPath(cfg); dbPath != "" {
 		if db, err := audit.Open(dbPath); err != nil {
-			logger.Warn("could not open audit db; token auth and policy enforcement disabled",
+			logger.Error("could not open audit db; token auth, policy enforcement and the audit API are disabled",
 				"path", dbPath, "error", err)
 		} else {
 			s.auditDB = db
@@ -279,12 +281,10 @@ func (s *Server) handler() http.Handler {
 
 // guardPlaintext refuses to bind an unencrypted listener nobody requested.
 //
-// Four states arrive at the same hazard — autocert accepted but unimplemented,
-// half a certificate pair, an empty pair, and an empty pair on the port every
-// client reads as TLS — and all four refuse through this one function.
-// Starting silently in plain HTTP is the security hazard the autocert case
-// already named; two refusals for one hazard, worded differently, is how an
-// operator learns to route around the second.
+// Three states arrive at the same hazard — half a certificate pair, an empty
+// pair, and an empty pair on the port every client reads as TLS — and all
+// three refuse through this one function. Two refusals for one hazard, worded
+// differently, is how an operator learns to route around the second.
 //
 // allow_plaintext is the request. An empty tls_cert is not one: Save marshals
 // the whole resolved Config back over the file, so a cert path cleared in the
@@ -299,17 +299,13 @@ func (s *Server) guardPlaintext() error {
 	if s.cfg.TLSCert != "" && s.cfg.TLSKey != "" {
 		return nil
 	}
-	// Named before AllowPlaintext on purpose: autocert plus plaintext is a
-	// contradictory pair and refusing it is the right answer. What the message
-	// may not do is offer allow_plaintext as the escape, because an operator
-	// who already set it arrives here anyway. It names the one change that
-	// clears the refusal, and names the flag that will not.
-	if s.cfg.TLSAutocert {
-		return fmt.Errorf(`tls_autocert is enabled but not yet implemented; set "tls_autocert": false in the config file, then either set tls_cert and tls_key or set allow_plaintext to serve without TLS. --tls-autocert=false will not clear it: the flag can only turn autocert on`)
-	}
 	if s.cfg.AllowPlaintext {
 		if tlsPort(s.addr) {
-			s.logger.Warn("serving plaintext HTTP on the port clients read as TLS; every request and response is in the clear",
+			// Error, not Warn: what this listener serves is unencrypted on the
+			// one port every client assumes is not, and the shipped default
+			// log_level maps to slog.LevelError, so a Warn here printed
+			// nothing on the installs it was written for.
+			s.logger.Error("serving plaintext HTTP on the port clients read as TLS; every request and response is in the clear",
 				"addr", s.addr, "authorized_by", "allow_plaintext")
 		}
 		return nil

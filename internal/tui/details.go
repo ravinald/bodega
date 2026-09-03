@@ -307,8 +307,8 @@ func typeTreePrefix(entryType string) string {
 }
 
 // clientScheme returns the scheme this host's own listener answers on. Start
-// enables TLS only when both a cert and a key resolve; tls_autocert is
-// rejected as unimplemented, so it is not a signal here.
+// enables TLS only when both a cert and a key resolve, and bodega has no
+// other way to obtain one, so the pair is the whole signal.
 //
 // It describes the local listener and nothing else. Behind a reverse proxy
 // both TLS keys are empty here while every client speaks https, which is why
