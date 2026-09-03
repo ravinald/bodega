@@ -906,7 +906,9 @@ The two namespaces never mix, and `Load` enforces it. `storage_backend` is a **d
 storage_by_type["apt"] names undefined storage backend "archive" (defined: default, bulk)
 ```
 
-Two entries resolving to one bucket or directory is neither rejected nor warned about. It is a supported way to stage a migration, and the identity that decides sameness is the backend's resolved label, which exists only after a driver has normalized its spec — comparing the configured strings at load would miss a symlink, a trailing slash or a relative path, and fire on a `path` two different drivers happen to share. `bodega pkg move` is the one command the collision can destroy anything through, and it refuses by label before the first copy.
+Two entries resolving to one bucket or directory is neither rejected nor warned about. It is a supported way to stage a migration, and the identity that decides sameness is the backend's resolved label: comparing the configured strings at load would miss a symlink, a trailing slash or a relative path, and fire on a `path` two different drivers happen to share. `bodega pkg move` is the one command the collision can destroy anything through, and it refuses by label before the first copy.
+
+The resolved label is resolved because the `local` driver is made to resolve it, not because a driver was ever guaranteed to. Until [#136](https://github.com/ravinald/bodega/issues/136), `storage_path` reached the label verbatim: a second backend pointing at a symlink of the first root produced two labels for one directory, the refusal did not fire, and `--delete-source` removed the only copy. `local` now resolves its root once at construction with `filepath.Abs` then `filepath.EvalSymlinks`, falling back to the absolute cleaned path for a root it is about to create. `s3://<bucket>` needs nothing: it is already one string per bucket.
 
 #### The placement hierarchy
 
@@ -1027,11 +1029,23 @@ Each package is stored as a JSON file at `{manifest_dir}/{type}/{safeName}/manif
 
 | Field | Type | Purpose |
 |-------|------|---------|
-| `name` | string | Canonical package name |
+| `name` | string | Canonical package name. `/` is written as `--` in the path, so a name always occupies exactly one directory level. `.` and `..` are refused: see [Package names](#package-names) |
 | `type` | string | Package ecosystem |
 | `description` | string | Short human-readable summary |
 | `dep_policy` | string | `none`, `direct`, or `transitive` |
 | `storage_policy` | string | Backend this package's _next_ version is written to, overriding `storage_by_type`. Absent means the type rule decides; see [the placement hierarchy](#the-placement-hierarchy) |
+
+#### Package names
+
+A name is stored as one path segment, with `/` written as `--`, so `@bitwarden/cli` becomes `@bitwarden--cli` and no name can add a directory level.
+
+`.` and `..` are refused, by `bodega pkg create`, `bodega pkg import`, `POST /api/v1/packages/{type}` and `POST /api/v1/packages/import` alike:
+
+```text
+invalid package name "..": it is path syntax, not a name — ".." resolves to a manifest path outside its own type directory
+```
+
+They are the two names the `/` rule does not neutralize, because they are resolved as path syntax rather than stored as text. `apt/../manifest.json` cleans to `manifest.json` at the manifest root, which is also where `npm/../manifest.json` lands, so two packages of different types would share one file and the second write would replace the first. `apt/./manifest.json` lands at `apt/manifest.json`, inside the type directory where no package belongs. Nothing escapes the manifest root in either case ([#160](https://github.com/ravinald/bodega/issues/160)).
 
 ### Common fields on VersionEntry
 

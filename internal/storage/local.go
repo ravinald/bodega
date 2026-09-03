@@ -20,6 +20,10 @@ func init() {
 	Register("local", newLocalFromSpec)
 }
 
+// newLocalFromSpec creates the root and then hands it to NewLocal rather than
+// building a Local itself. The driver registry is the only path a configured
+// backend takes, so an invariant that lived in NewLocal alone would hold for
+// every test and no deployment.
 func newLocalFromSpec(_ context.Context, spec Spec) (ObjectStore, error) {
 	root := spec.Path
 	if root == "" {
@@ -28,7 +32,7 @@ func newLocalFromSpec(_ context.Context, spec Spec) (ObjectStore, error) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, fmt.Errorf("create storage root %s: %w", root, err)
 	}
-	return &Local{root: root}, nil
+	return NewLocal(root), nil
 }
 
 // Local is a filesystem-backed ObjectStore. Objects are stored as files at
@@ -37,9 +41,35 @@ type Local struct {
 	root string
 }
 
-// NewLocal creates a Local backend rooted at the given directory.
+// NewLocal creates a Local backend rooted at the given directory, canonicalized
+// once so that every later comparison has one string to compare.
 func NewLocal(root string) *Local {
-	return &Local{root: root}
+	return &Local{root: canonicalRoot(root)}
+}
+
+// canonicalRoot reduces the spellings of one directory to one string.
+//
+// Label() is built from root, and 'bodega pkg move' compares two Labels to
+// decide whether a copy would land on top of its own source. A symlinked
+// second root, a trailing slash or an "/a/../b" spelling would each produce a
+// second label for one directory, the refusal would not fire, and
+// --delete-source would remove the only copy of the artifact. The trailing
+// slash also breaks path(): its prefix test is against root + "/", which
+// "/srv/store//key" fails, so every write on such a root is refused.
+//
+// EvalSymlinks needs the directory to exist. A root that does not yet keeps
+// the absolute cleaned form, which is what newLocalFromSpec creates a moment
+// later and what a second name for the same not-yet-created path also yields.
+func canonicalRoot(root string) string {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return filepath.Clean(root)
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return abs
+	}
+	return resolved
 }
 
 func (l *Local) path(key string) (string, error) {

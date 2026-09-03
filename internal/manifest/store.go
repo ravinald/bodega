@@ -227,6 +227,13 @@ func (s *Store) SavePackage(ctx context.Context, pm *PackageManifest) error {
 	if pm.Name == "" {
 		return errors.New("SavePackage: PackageManifest.Name must not be empty")
 	}
+	// The backstop for the name checks admit runs. 'bodega pkg create' writes
+	// through AddVersion without going through admit, so a rule that lived
+	// only there would hold for the API and the importers and not for the one
+	// command an operator types by hand.
+	if err := ValidatePackageName(pm.Name); err != nil {
+		return fmt.Errorf("SavePackage: %w", err)
+	}
 
 	pm.ConfigVersion = CurrentConfigVersion
 

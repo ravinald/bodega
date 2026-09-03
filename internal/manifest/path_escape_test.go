@@ -19,8 +19,10 @@ import (
 // guard is present or absent and proves nothing about either.
 func TestPackageNamesCannotTraverse(t *testing.T) {
 	// "." and ".." are absent on purpose: they are the one shape SafeName does
-	// not neutralize, and TestDotNamesLandOutsideTheirType below records what
-	// they do instead. Issue #160 carries the fix.
+	// not neutralize, and TestDotNamesAreRefusedBeforeTheyCollide below covers
+	// them instead. They are refused at admission rather than encoded here, so
+	// the keys they would derive are unchanged and this test's contract does
+	// not reach them.
 	hostile := []string{
 		"../../etc/passwd",
 		"/etc/passwd",
@@ -84,46 +86,39 @@ func TestSafePathRefusesWhatItClaimsTo(t *testing.T) {
 	}
 }
 
-// TestDotNamesLandOutsideTheirType records the gap TestPackageNamesCannotTraverse
-// is scoped around. A name of exactly "." or ".." survives SafeName, so it
-// stays a path segment that Clean then resolves: ".." reaches the manifest
-// root, where every type collides on one file.
+// TestDotNamesAreRefusedBeforeTheyCollide replaces the test that recorded issue
+// #160 as unfixed. The key derivation is deliberately unchanged — ".." still
+// cleans to the manifest root and still collides across types — so the guard
+// has to be that no write path accepts the name. SavePackage is the one every
+// writer reaches, including 'bodega pkg create', which does not go through
+// admit.
 //
-// The test asserts the current behavior rather than the desired behavior, so
-// it stays green until issue #160 lands and fails loudly when it does. It also
-// pins the boundary that keeps this a layout bug rather than a traversal:
-// nothing reaches above the manifest root.
-func TestDotNamesLandOutsideTheirType(t *testing.T) {
+// The containment boundary stays pinned too: this was never a traversal, and a
+// future encoding change must not make it one.
+func TestDotNamesAreRefusedBeforeTheyCollide(t *testing.T) {
+	for _, name := range []string{".", ".."} {
+		t.Run(name, func(t *testing.T) {
+			if err := ValidatePackageName(name); err == nil {
+				t.Errorf("ValidatePackageName(%q) allowed a name that resolves as path syntax", name)
+			}
+
+			store := NewLocalStore(t.TempDir())
+			pm := &PackageManifest{Name: name, Type: TypeApt, Versions: []VersionEntry{{Version: "1.0"}}}
+			if err := store.SavePackage(t.Context(), pm); err == nil {
+				t.Errorf("SavePackage wrote %s/%q, which cleans to %q", TypeApt, name, filepath.Clean(manifestPath(TypeApt, name)))
+			}
+		})
+	}
+
+	// Contained, not a traversal: the key a refused name would have produced
+	// still resolves under the manifest root.
 	root := t.TempDir()
 	b := &LocalBackend{Dir: root}
-
-	aptKey := manifestPath(TypeApt, "..")
-	npmKey := manifestPath(TypeNpm, "..")
-	if filepath.Clean(aptKey) != filepath.Clean(npmKey) {
-		t.Fatalf("issue #160 appears fixed: %q and %q no longer collide. "+
-			"Update this test and TestPackageNamesCannotTraverse's exclusion list.", aptKey, npmKey)
-	}
-
-	if err := b.Write(t.Context(), aptKey, []byte(`{"name":"apt"}`)); err != nil {
-		t.Fatalf("write apt: %v", err)
-	}
-	if err := b.Write(t.Context(), npmKey, []byte(`{"name":"npm"}`)); err != nil {
-		t.Fatalf("write npm: %v", err)
-	}
-	got, err := b.Read(t.Context(), aptKey)
-	if err != nil {
-		t.Fatalf("read apt: %v", err)
-	}
-	if string(got) != `{"name":"npm"}` {
-		t.Errorf("the collision changed shape: reading the apt key returned %s", got)
-	}
-
-	// The boundary that matters: contained, not a traversal.
-	resolved, err := b.safePath(aptKey)
+	resolved, err := b.safePath(manifestPath(TypeApt, ".."))
 	if err != nil {
 		t.Fatalf("safePath refused a key it currently allows: %v", err)
 	}
 	if rel, relErr := filepath.Rel(root, resolved); relErr != nil || strings.HasPrefix(rel, "..") {
-		t.Errorf("a dot name reached above the manifest root (%q), which would make this a traversal", resolved)
+		t.Fatalf("a dot name reached above the manifest root (%q), which would make this a traversal", resolved)
 	}
 }

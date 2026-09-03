@@ -305,6 +305,67 @@ func TestSplitVersionArg(t *testing.T) {
 	}
 }
 
+// TestSelectForMoveRefusesASymlinkedSecondRoot is the case
+// TestSelectForMoveRefusesOneLocationUnderTwoNames could not reach. That one
+// hands the same store to both names, so it passes whatever Label does; this
+// one builds two real local backends over one directory, reached by two
+// spellings, which is what config gives you when a migration is staged through
+// a symlink of the old root. Before storage.canonicalRoot the two labels
+// differed, the refusal did not fire, and --delete-source removed the only
+// copy (#136, #90).
+//
+// The second half is not optional: a refusal that also refuses a genuinely
+// distinct pair has traded one defect for another.
+func TestSelectForMoveRefusesASymlinkedSecondRoot(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "store")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	link := filepath.Join(parent, "staged")
+	if err := os.Symlink(root, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	pm := &manifest.PackageManifest{
+		Type: manifest.TypeBinary, Name: "awscli",
+		Versions: []manifest.VersionEntry{{Version: "2.1.0"}},
+	}
+
+	r := &testResolver{def: storage.NewLocal(root), bulk: storage.NewLocal(link)}
+	dst, err := r.ByName("bulk")
+	if err != nil {
+		t.Fatalf("ByName: %v", err)
+	}
+	if err := dst.Put(t.Context(), awscliKey, []byte("the only copy")); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	_, err = selectForMove(r, dst, pm, "", "bulk")
+	if err == nil {
+		t.Fatal("selectForMove accepted a move onto a symlink of the source root")
+	}
+	if !strings.Contains(err.Error(), "same location") {
+		t.Fatalf("error %q does not name the collision", err)
+	}
+
+	elsewhere := filepath.Join(parent, "other")
+	if err := os.MkdirAll(elsewhere, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	distinct := &testResolver{def: storage.NewLocal(root), bulk: storage.NewLocal(elsewhere)}
+	other, err := distinct.ByName("bulk")
+	if err != nil {
+		t.Fatalf("ByName: %v", err)
+	}
+	got, err := selectForMove(distinct, other, pm, "", "bulk")
+	if err != nil {
+		t.Fatalf("selectForMove refused a move between two distinct directories: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("selectForMove selected %d versions, want 1", len(got))
+	}
+}
+
 // TestSelectForMoveRefusesOneLocationUnderTwoNames is the artifact-destroying
 // case, and the reason the check sits in selectForMove rather than in
 // moveVersion.

@@ -702,13 +702,20 @@ func (c *Config) ValidateTLSPair() error {
 //
 // Two entries resolving to one bucket or directory is deliberately neither
 // rejected nor warned about. It is a supported way to stage a migration, and
-// the identity that decides sameness is ObjectStore.Label(), which exists only
-// once a driver has normalized its spec: comparing the configured strings here
-// would miss a symlink, a trailing slash or a relative path, and fire on a path
-// two different drivers happen to share. A second, weaker definition of "same
-// location" that disagrees with the one the move path enforces is worse than
-// none, and 'bodega pkg move' is the only command the collision can destroy
-// anything through.
+// the identity that decides sameness is ObjectStore.Label(): comparing the
+// configured strings here would miss a symlink, a trailing slash or a relative
+// path, and fire on a path two different drivers happen to share. A second,
+// weaker definition of "same location" that disagrees with the one the move
+// path enforces is worse than none, and 'bodega pkg move' is the only command
+// the collision can destroy anything through.
+//
+// That argument used to add "which exists only once a driver has normalized
+// its spec", and no driver did. newLocalFromSpec took storage_path verbatim,
+// so two spellings of one directory produced two labels, the move refusal did
+// not fire, and --delete-source removed the only copy of the artifact (#136).
+// The normalization is now a property the local driver has rather than one it
+// was assumed to have: storage.canonicalRoot, applied at construction. Deleting
+// it puts this check back on the table.
 func (c *Config) validateStorage() error {
 	drivers := StorageDrivers()
 	isDriver := make(map[string]bool, len(drivers))

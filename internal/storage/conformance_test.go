@@ -592,3 +592,72 @@ func TestLabelDistinguishesTwoStores(t *testing.T) {
 		})
 	}
 }
+
+// sameLocationSpellings returns, per backend, several stores that name one
+// location in different ways. Every backend in conformanceBackends needs an
+// entry, empty or not, so joining the suite forces an answer to "how else can
+// this location be spelled".
+func sameLocationSpellings(t *testing.T) map[string][]ObjectStore {
+	t.Helper()
+
+	// The three spellings a staged migration actually produces. A second
+	// storage_backends entry pointing at a symlink of the first root is the
+	// documented way to do it; the trailing slash and the "/a/../b" form are
+	// what an operator's config file carries after hand-editing a path.
+	parent := t.TempDir()
+	root := filepath.Join(parent, "root")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+	link := filepath.Join(parent, "link")
+	if err := os.Symlink(root, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	// EvalSymlinks walks components rather than cleaning lexically, so the
+	// "/a/../b" spelling needs "a" to exist for the resolution to succeed.
+	if err := os.MkdirAll(filepath.Join(parent, "sibling"), 0o755); err != nil {
+		t.Fatalf("mkdir sibling: %v", err)
+	}
+
+	return map[string][]ObjectStore{
+		"local": {
+			NewLocal(root),
+			NewLocal(link),
+			NewLocal(root + string(filepath.Separator)),
+			NewLocal(parent + "/sibling/../root"),
+		},
+		// Memory has no second spelling: its location is the instance, and
+		// two instances are two locations. TestLabelDistinguishesTwoStores
+		// covers that direction already.
+		"memory": nil,
+	}
+}
+
+// TestLabelIsOnePerLocation pins the direction pkg move depends on, and the one
+// TestLabelDistinguishesTwoStores does not reach. Distinct locations giving
+// distinct labels keeps a legitimate move working; one location giving one
+// label is what makes the same-location refusal fire at all. Without it,
+// 'pkg move --delete-source' between a root and a symlink of that root copies
+// every object onto itself, verifies what it overwrote, and deletes the only
+// copy.
+func TestLabelIsOnePerLocation(t *testing.T) {
+	spellings := sameLocationSpellings(t)
+	for name := range conformanceBackends() {
+		stores, ok := spellings[name]
+		if !ok {
+			t.Errorf("backend %q has no entry in sameLocationSpellings; add one, empty if the backend has no second spelling of a location", name)
+			continue
+		}
+		if len(stores) == 0 {
+			continue
+		}
+		t.Run(name, func(t *testing.T) {
+			want := stores[0].Label()
+			for _, s := range stores[1:] {
+				if got := s.Label(); got != want {
+					t.Errorf("Label() = %q, want %q — one location must produce one label", got, want)
+				}
+			}
+		})
+	}
+}
