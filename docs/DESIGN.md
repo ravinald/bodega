@@ -337,6 +337,15 @@ Discovered entries default to proxy mode. The operator can change any entry to h
 
 ## Security model
 
+The mechanisms described below — checksum verification, deny lists, mutation
+gating, response hardening, TLS, manifest integrity — operate inside the
+boundary defined by bodega's threat model. That model, including the
+distribution formats (snap, flatpak, AppImage auto-updaters, Homebrew casks)
+that are intentionally out of scope, lives in
+[docs/THREAT_MODEL.md](THREAT_MODEL.md). Operators standing up locked-down
+build hosts should read that document first and run `bodega doctor` to verify
+the host configuration aligns with it.
+
 ### Checksum verification
 
 Every downloaded artifact gets a SHA-256 computed at fetch time. The checksum is stored in the manifest.
