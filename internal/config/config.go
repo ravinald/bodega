@@ -802,7 +802,7 @@ func (c *Config) marshalForFile() ([]byte, error) {
 
 	// Values from the file are re-emitted byte for byte, so a key an operator
 	// wrote on one line stays on one line. Only a rewritten key is re-indented.
-	out := make(map[string]json.RawMessage, len(c.snapshot.raw)+len(current))
+	out := make(map[string]json.RawMessage, len(c.snapshot.raw))
 	for k, v := range c.snapshot.raw {
 		out[k] = v
 	}
