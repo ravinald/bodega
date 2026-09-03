@@ -155,11 +155,25 @@ func TestRotationWindowVerifiesUnderEitherKey(t *testing.T) {
 	}
 }
 
+// pinSystemKeyPath points the packaged key location at path for one test.
+//
+// Position 2 of the search order is a package variable, and a test that leaves
+// it alone is asserting something about the host it runs on: every box running
+// the service has a key at the real one, so "no key installed" quietly becomes
+// "no key installed here, today".
+func pinSystemKeyPath(t *testing.T, path string) {
+	t.Helper()
+	prev := aptsign.SystemKeyPath
+	aptsign.SystemKeyPath = path
+	t.Cleanup(func() { aptsign.SystemKeyPath = prev })
+}
+
 // TestSignedRoutesAbsentWithoutKey pins the non-breaking rule: with no key the
 // signature-bearing routes 404 and the unsigned Release still serves, which is
 // the ordinary fallback path apt has always taken.
 func TestSignedRoutesAbsentWithoutKey(t *testing.T) {
 	t.Setenv(aptsign.CredentialsEnv, t.TempDir())
+	pinSystemKeyPath(t, filepath.Join(t.TempDir(), aptsign.KeyFileName))
 	ts, _ := newTestServer(t)
 
 	for _, path := range []string{
@@ -175,6 +189,31 @@ func TestSignedRoutesAbsentWithoutKey(t *testing.T) {
 	}
 	if status, _ := aptGet(t, ts, "/apt/dists/noble/Release"); status != http.StatusOK {
 		t.Errorf("GET Release status = %d, want 200 — signing must not remove the unsigned document", status)
+	}
+}
+
+// TestSystemKeyPathIsSearched is the other half of the seam. docs/USAGE.md and
+// docs/bodega.service both tell an operator to install the key at
+// aptsign.SystemKeyPath, and every other signing test writes to the systemd
+// credential instead, so nothing drove that position of the search order.
+func TestSystemKeyPathIsSearched(t *testing.T) {
+	system := filepath.Join(t.TempDir(), aptsign.KeyFileName)
+	pinSystemKeyPath(t, system)
+	// An empty credential directory, so a hit here can only have come from the
+	// system path.
+	t.Setenv(aptsign.CredentialsEnv, t.TempDir())
+
+	kr, err := aptsign.Generate("bodega test archive", "test@example.invalid", aptsign.KeyEd25519)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if err := kr.WritePrivate(system); err != nil {
+		t.Fatalf("WritePrivate: %v", err)
+	}
+
+	ts, _ := newTestServer(t)
+	if status, _ := aptGet(t, ts, "/apt/dists/noble/InRelease"); status != http.StatusOK {
+		t.Errorf("GET InRelease status = %d, want 200 with a key at the packaged system path", status)
 	}
 }
 

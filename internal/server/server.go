@@ -299,8 +299,13 @@ func (s *Server) guardPlaintext() error {
 	if s.cfg.TLSCert != "" && s.cfg.TLSKey != "" {
 		return nil
 	}
+	// Named before AllowPlaintext on purpose: autocert plus plaintext is a
+	// contradictory pair and refusing it is the right answer. What the message
+	// may not do is offer allow_plaintext as the escape, because an operator
+	// who already set it arrives here anyway. It names the one change that
+	// clears the refusal, and names the flag that will not.
 	if s.cfg.TLSAutocert {
-		return fmt.Errorf("tls_autocert is enabled but not yet implemented; provide tls_cert and tls_key instead, or set allow_plaintext to serve without TLS")
+		return fmt.Errorf(`tls_autocert is enabled but not yet implemented; set "tls_autocert": false in the config file, then either set tls_cert and tls_key or set allow_plaintext to serve without TLS. --tls-autocert=false will not clear it: the flag can only turn autocert on`)
 	}
 	if s.cfg.AllowPlaintext {
 		if tlsPort(s.addr) {
@@ -1438,9 +1443,10 @@ func (s *Server) proxyVersion(w http.ResponseWriter, r *http.Request, typ, pkg, 
 // error: a client cannot tell a short PEP 503 or Packages list from packages
 // having been withdrawn, and acts on the difference.
 //
-// The union is sorted because each backend returns lexical order and the merge
-// of two sorted lists is not sorted. Packages.gz is gzipped per request, so an
-// unstable order changes the bytes and every client refetches.
+// The union is sorted here rather than merged: ObjectStore.List guarantees each
+// backend's own order, but concatenating two sorted lists is not sorted and
+// deduplication drops entries from either one. Packages.gz is gzipped per
+// request, so an unstable order changes the bytes and every client refetches.
 func (s *Server) listFanout(ctx context.Context, typ, prefix string) ([]string, error) {
 	if s.stores == nil {
 		return nil, nil

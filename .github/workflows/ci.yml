@@ -22,7 +22,11 @@ jobs:
         with:
           go-version-file: go.mod
           check-latest: true
-      - run: go vet ./...
+      - run: make vet
+      # The gate/CI drift guard runs here rather than in its own job: it is a
+      # sed and a grep, and a job of its own would be one more entry in the
+      # list it exists to keep honest.
+      - run: make ci-drift
 
   lint:
     runs-on: ubuntu-latest
@@ -46,23 +50,8 @@ jobs:
         with:
           go-version-file: go.mod
           check-latest: true
-      - name: gofmt
-        run: |
-          out=$(gofmt -l .)
-          if [ -n "$out" ]; then
-            echo "::error::gofmt drift in:"
-            echo "$out"
-            exit 1
-          fi
-      - name: goimports
-        run: |
-          go install golang.org/x/tools/cmd/goimports@latest
-          out=$(goimports -l .)
-          if [ -n "$out" ]; then
-            echo "::error::goimports drift in:"
-            echo "$out"
-            exit 1
-          fi
+      - run: go install golang.org/x/tools/cmd/goimports@latest
+      - run: make fmt-check
 
   tidy:
     runs-on: ubuntu-latest
@@ -72,15 +61,7 @@ jobs:
         with:
           go-version-file: go.mod
           check-latest: true
-      - name: go mod tidy (drift check)
-        run: |
-          go mod tidy
-          if [ -n "$(git status --porcelain go.mod go.sum)" ]; then
-            echo "::error::go.mod / go.sum out of sync — run 'go mod tidy'"
-            git --no-pager diff go.mod go.sum
-            exit 1
-          fi
-      - run: go mod verify
+      - run: make tidy-check
 
   test:
     runs-on: ubuntu-latest
