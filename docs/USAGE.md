@@ -60,6 +60,8 @@ bodega build sync                  # push all local artifacts
 bodega build sync pypi helm        # push pypi and helm only
 ```
 
+Every type but `pypi` uploads one object per manifest version, to the backend that version records: a git bundle to `repos/<name>/`, a `.deb` to the pool path its entry carries, a binary to `binaries/<name>/<version>/`. `pypi` wheels have no per-version object key, so they sync as a directory to `pypi/wheels/` on the backend `storage_by_type.pypi` names. A version whose artifact is not on disk is skipped, and so is a type with none.
+
 ### `bodega build upload [TYPE...] [NAME]`
 
 Runs the full pipeline (fetch → build) then uploads artifacts to S3. This is the most common command for end-to-end operation.
@@ -192,7 +194,7 @@ bodega pkg create apt                         # fully interactive (prompts for n
 bodega pkg create git netbox --storage archive   # pin this package's writes
 ```
 
-`--storage` sets `storage_policy` on the new package and is never prompted for. Almost every package answers it "whatever the type rule says", and `bodega pkg edit` opens the whole manifest, so the field is reachable interactively without a ninth question in an already-long form. An unknown backend name is rejected before the first prompt, and a name on an `apt`, `git` or `pypi` entry warns that the write path will not consult it.
+`--storage` sets `storage_policy` on the new package and is never prompted for. Almost every package answers it "whatever the type rule says", and `bodega pkg edit` opens the whole manifest, so the field is reachable interactively without a ninth question in an already-long form. An unknown backend name is rejected before the first prompt, and a name on a `pypi` entry warns that the write path will not consult it.
 
 ### `bodega pkg delete <type> <name> [--remove-from-s3]`
 
@@ -332,12 +334,12 @@ $ bodega pkg storage git netbox
 git/netbox -> default  (global default; no type or package rule)
 ```
 
-`apt`, `git` and `pypi` upload a whole directory at a time, so the package level is never consulted for them. A `storage_policy` on one of their packages is reported as skipped rather than as the level that won:
+`pypi` uploads a whole directory at a time, so the package level is never consulted for it. A `storage_policy` on a `pypi` package is reported as skipped rather than as the level that won:
 
 ```bash
-$ bodega pkg storage git netbox
-git/netbox -> default  (global default; no type or package rule; storage_policy "bulk" is not consulted for git)
-  warning: storage_policy "bulk" has no effect for git: git uploads whole directories with SyncDir, so one package cannot be placed apart from the rest of its type. Set storage_by_type.git to place the whole type; 'bodega pkg move' refuses git for the same reason.
+$ bodega pkg storage pypi boto3
+pypi/boto3 -> default  (global default; no type or package rule; storage_policy "bulk" is not consulted for pypi)
+  warning: storage_policy "bulk" has no effect for pypi: pypi wheels upload as a directory with no per-version object key, so one package cannot be placed apart from the rest of its type. Set storage_by_type.pypi to place the whole type; 'bodega pkg move' refuses pypi for the same reason.
 ```
 
 An operator reads this command to find out why a package landed where it did, so a level the write path will not use is worse than no level at all.
@@ -351,10 +353,11 @@ Copies the objects backing a package's versions to another named backend and rep
 ```bash
 bodega pkg move binary awscli-v2 --to bulk
 bodega pkg move npm @bitwarden/cli@2026.4.0 --to archive
+bodega pkg move git netbox@v4.5.5 --to bulk
 bodega pkg move gomod github.com/aws/aws-sdk-go-v2@v1.30.0 --to archive --delete-source
 ```
 
-Movable types: `binary`, `npm`, `cargo`, `gomod`, `helm`. See [Whole-directory types are not movable](#whole-directory-types-are-not-movable) for the other three.
+Movable types: `binary`, `npm`, `cargo`, `gomod`, `helm`, `apt`, `git`. See [pypi is not movable](#pypi-is-not-movable) for the one that is not.
 
 Order is the design:
 
@@ -377,15 +380,17 @@ binary/awscli-v2: backends "default" and "mirror" are the same location (file://
 
 Both names are in the message because the configuration is deliberate: two names for one place is a documented way to stage a migration, so the operator needs to know which half to repoint. `Load` rejects a colliding name but not a colliding path, and does not warn about one either — see [Named backends](#named-backends-and-per-type-placement). Each object would be read and written at the same key, the verify would re-read what it had just overwritten and pass, and `--delete-source` would then remove the artifact the manifest points at. Both backends answer a missing object with "not found", so nothing afterwards could tell it had ever existed.
 
-#### Whole-directory types are not movable
+#### pypi is not movable
 
-`apt`, `git` and `pypi` upload with `SyncDir`: one local directory to one key prefix, with no per-version granularity at either end. Moving one package of those types splits a tree that nothing can reunite — `git` and `apt` are served with no listing to fan out over, and `pypi` has no per-version object key at all — and `bodega build sync` then refuses for the whole type. All three are refused:
+`pypi` wheels upload as one local directory to one key prefix, and the PEP 503 index is generated from a listing over that whole tree. A package placed on another backend drops out of the index that finds it, so there is no per-version object to move:
 
 ```text
-git is not movable: git uploads whole directories with SyncDir, so one package cannot be placed apart from the rest of its type; repoint storage_by_type.git and re-upload instead
+pypi is not movable: pypi wheels upload as a directory with no per-version object key, so one package cannot be placed apart from the rest of its type; repoint storage_by_type.pypi and re-upload instead
 ```
 
-Point `storage_by_type.<type>` at the backend you want and re-upload. Per-package placement for these three types needs per-package upload, which does not exist yet ([#87](https://github.com/ravinald/bodega/issues/87)).
+Point `storage_by_type.pypi` at the backend you want and re-upload.
+
+`apt` and `git` were here until their uploaders learned to walk manifest entries. A `.deb` is addressed by the pool path its version entry records, a bundle by its ref, and both routes resolve a read through `storage` on the version entry, so either type moves one package at a time like the rest.
 
 ### `bodega serve [flags]`
 
@@ -924,13 +929,13 @@ The most specific rule wins. A package policy that lost to a type rule would be 
 
 `bodega pkg storage <type> <name>` prints the resolved backend and which level decided it. Naming the winning level is what makes a three-level hierarchy debuggable — `bulk` on its own does not say whether a package policy took effect or a forgotten type rule did.
 
-`apt`, `pypi` and `git` upload whole directories with `SyncDir`, so the package level is not consulted for them: honoring it for some packages of the type and not others would split the tree across backends with no listing to reunite it. There is no per-package placement for these three — `bodega pkg move` refuses them for the same reason, and setting `storage_policy` on one warns rather than taking effect. Set `storage_by_type.<type>` to place the whole type.
+`pypi` is the one type the package level is not consulted for. Its wheels upload as one directory to one prefix and the PEP 503 index is a listing over that tree, so honoring a policy for some packages and not others would split it with no listing to reunite it. `bodega pkg move` refuses `pypi` for the same reason, and setting `storage_policy` on a `pypi` package warns rather than taking effect. Set `storage_by_type.pypi` to place the whole type.
 
 #### `storage_policy` and `storage` are different fields on purpose
 
 `PackageManifest.storage_policy` is future tense: put new versions here. `VersionEntry.storage` is past tense: this version's bytes are here. Setting a policy moves nothing; `bodega pkg move` does that. One name for both would mislead every future reader of a manifest.
 
-`bodega pkg create --storage`, `bodega pkg edit` and `bodega pkg import` all record a `storage_policy` on a whole-directory type and warn that it will not be read. The field is recorded rather than rejected so that an existing manifest stays importable and the value survives a round trip through `pkg edit`.
+`bodega pkg create --storage`, `bodega pkg edit` and `bodega pkg import` all record a `storage_policy` on a `pypi` package and warn that it will not be read. The field is recorded rather than rejected so that an existing manifest stays importable and the value survives a round trip through `pkg edit`.
 
 #### Placement is recorded, not recomputed
 
@@ -956,7 +961,7 @@ apt uploads whole directories, so proceeding would split the tree across backend
 Pass --replace-placement to repoint the manifest at "bulk" and re-upload; the old copies stay where they are and nothing copies them
 ```
 
-`--replace-placement` is the only remedy offered, because `bodega pkg move` refuses these three types. It repoints the manifest and copies nothing, so the objects in the previous backend stay there and must be removed by hand once the re-upload has landed.
+`--replace-placement` is the only remedy offered, because `bodega pkg move` refuses `pypi`. It repoints the manifest and copies nothing, so the objects in the previous backend stay there and must be removed by hand once the re-upload has landed. Only `pypi` reaches this path; every other type places per version and never refuses.
 
 #### What is not placed
 
@@ -964,7 +969,15 @@ Generated indexes, proxy-cache entries and attestation blobs have no version to 
 
 Every route that does hold a version entry for an uploaded artifact resolves by record: `binary`, `helm`, `npm`, `cargo`, `gomod`, `pypi` and `git` read the recorded name, and the apt pool reads the reverse `pool/` mapping the snapshot carries, because a `.deb` is addressed by path with no package and version in the request to look an entry up by. Nothing serving an uploaded artifact is left on the type rule.
 
-Two reads hold an entry and stay on it anyway. A package in `proxy` mode is served from cache, and a cache entry is regenerable whatever its manifest records. An attestation envelope is written by an external sync service rather than by bodega, so the recorded name says where the artifact went and nothing about where the envelope stayed — resolving it by record would 404 an envelope sitting exactly where it was left.
+One read holds an entry and stays on the type rule anyway: a package in `proxy` mode is served from cache, and a cache entry is regenerable whatever its manifest records.
+
+#### Attestation envelopes resolve by the bucket in their URI
+
+An attestation envelope is written by an external sync service rather than by bodega, so `storage` on the version entry says where the artifact went and nothing about where the envelope stayed. `pkg move` does not carry it either, so after a move the two are on different backends by construction.
+
+An `s3://<bucket>/<key>` `attestation_uri` is therefore resolved by its own bucket. `handleAttestation` matches `<bucket>` against every configured backend's label — `s3://<bucket>`, or `s3://<bucket>/<prefix>` for a backend rooted at a key prefix, in which case the URI's key must sit under that prefix — and reads from the one that answers. The URI is already in the manifest, so this needs no new field and nothing has to be migrated.
+
+A bucket no configured backend answers to falls back to the type rule and logs a WARN naming the URI. That is the answer every install gave before backends were named, so an envelope in a bucket bodega does not configure keeps whatever chance of resolving it had, and the WARN is where an operator learns which of the two happened. An `http(s)://` URI is still a 302 to the client, and any other scheme is a 502.
 
 #### Listing and diagnostics disagree on purpose
 

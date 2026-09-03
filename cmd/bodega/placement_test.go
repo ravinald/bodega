@@ -64,7 +64,7 @@ func TestPlacementIsRecordedBeforeTheUpload(t *testing.T) {
 	pl, store, _ := twoBackendPlacer(t, map[string]string{manifest.TypeBinary: "bulk"}, false)
 	addBinary(t, store, "awscli", "2.0.0", "")
 
-	st, err := pl.forVersion(t.Context(), manifest.TypeBinary, "awscli", "2.0.0", "binaries/awscli/2.0.0/awscli.zip")
+	st, err := pl.ForVersion(t.Context(), manifest.TypeBinary, "awscli", "2.0.0", "binaries/awscli/2.0.0/awscli.zip")
 	if err != nil {
 		t.Fatalf("forVersion: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestDefaultPlacementStaysTheZeroValue(t *testing.T) {
 	pl, store, _ := twoBackendPlacer(t, nil, false)
 	addBinary(t, store, "awscli", "2.0.0", "")
 
-	if _, err := pl.forVersion(t.Context(), manifest.TypeBinary, "awscli", "2.0.0", "binaries/awscli/2.0.0/awscli.zip"); err != nil {
+	if _, err := pl.ForVersion(t.Context(), manifest.TypeBinary, "awscli", "2.0.0", "binaries/awscli/2.0.0/awscli.zip"); err != nil {
 		t.Fatalf("forVersion: %v", err)
 	}
 	if got := recordedStorage(t, store, manifest.TypeBinary, "awscli", "2.0.0"); got != "" {
@@ -96,7 +96,7 @@ func TestReUploadHonorsTheRecordedName(t *testing.T) {
 	pl, store, _ := twoBackendPlacer(t, map[string]string{manifest.TypeBinary: "default"}, false)
 	addBinary(t, store, "awscli", "2.0.0", "bulk")
 
-	if _, err := pl.forVersion(t.Context(), manifest.TypeBinary, "awscli", "2.0.0", "binaries/awscli/2.0.0/awscli.zip"); err != nil {
+	if _, err := pl.ForVersion(t.Context(), manifest.TypeBinary, "awscli", "2.0.0", "binaries/awscli/2.0.0/awscli.zip"); err != nil {
 		t.Fatalf("forVersion: %v", err)
 	}
 	if got := recordedStorage(t, store, manifest.TypeBinary, "awscli", "2.0.0"); got != "bulk" {
@@ -109,7 +109,7 @@ func TestReplacePlacementIsTheDeliberateCase(t *testing.T) {
 	pl, store, _ := twoBackendPlacer(t, map[string]string{manifest.TypeBinary: "default"}, true)
 	addBinary(t, store, "awscli", "2.0.0", "bulk")
 
-	if _, err := pl.forVersion(t.Context(), manifest.TypeBinary, "awscli", "2.0.0", "binaries/awscli/2.0.0/awscli.zip"); err != nil {
+	if _, err := pl.ForVersion(t.Context(), manifest.TypeBinary, "awscli", "2.0.0", "binaries/awscli/2.0.0/awscli.zip"); err != nil {
 		t.Fatalf("forVersion: %v", err)
 	}
 	if got := recordedStorage(t, store, manifest.TypeBinary, "awscli", "2.0.0"); got != "" {
@@ -126,7 +126,7 @@ func TestForTypeRefusesToSplitADirectory(t *testing.T) {
 		t.Fatalf("AddVersion: %v", err)
 	}
 
-	_, err := pl.forType(t.Context(), manifest.TypeApt)
+	_, err := pl.ForType(t.Context(), manifest.TypeApt)
 	if err == nil {
 		t.Fatal("forType proceeded with a changed type rule, splitting the tree")
 	}
@@ -147,7 +147,7 @@ func TestForTypeStampsEveryVersionWithTheFlag(t *testing.T) {
 		}
 	}
 
-	if _, err := pl.forType(t.Context(), manifest.TypeApt); err != nil {
+	if _, err := pl.ForType(t.Context(), manifest.TypeApt); err != nil {
 		t.Fatalf("forType: %v", err)
 	}
 	for _, v := range []string{"1.0", "2.0"} {
@@ -175,10 +175,10 @@ func TestNoNamedBackendsChangesNothing(t *testing.T) {
 		t.Fatalf("AddVersion: %v", err)
 	}
 
-	if _, err := pl.forVersion(t.Context(), manifest.TypeBinary, "awscli", "2.0.0", "binaries/awscli/2.0.0/awscli.zip"); err != nil {
+	if _, err := pl.ForVersion(t.Context(), manifest.TypeBinary, "awscli", "2.0.0", "binaries/awscli/2.0.0/awscli.zip"); err != nil {
 		t.Fatalf("forVersion: %v", err)
 	}
-	if _, err := pl.forType(t.Context(), manifest.TypeApt); err != nil {
+	if _, err := pl.ForType(t.Context(), manifest.TypeApt); err != nil {
 		t.Fatalf("forType: %v", err)
 	}
 	if got := recordedStorage(t, store, manifest.TypeBinary, "awscli", "2.0.0"); got != "" {
@@ -187,7 +187,7 @@ func TestNoNamedBackendsChangesNothing(t *testing.T) {
 	if got := recordedStorage(t, store, manifest.TypeApt, "nginx", "1.0"); got != "" {
 		t.Errorf("apt recorded %q, want the zero value", got)
 	}
-	if got := pl.stores.Placement(manifest.TypeApt, ""); got.Name != storage.DefaultName {
+	if got := pl.Stores().Placement(manifest.TypeApt, ""); got.Name != storage.DefaultName {
 		t.Errorf("Placement = %q, want %q", got.Name, storage.DefaultName)
 	}
 }
@@ -208,7 +208,7 @@ func TestPackagePolicyDecidesTheUploadTarget(t *testing.T) {
 		t.Fatalf("SavePackage: %v", err)
 	}
 
-	st, err := pl.forVersion(t.Context(), manifest.TypeBinary, "awscli", "2.0.0", "binaries/awscli/2.0.0/awscli.zip")
+	st, err := pl.ForVersion(t.Context(), manifest.TypeBinary, "awscli", "2.0.0", "binaries/awscli/2.0.0/awscli.zip")
 	if err != nil {
 		t.Fatalf("forVersion: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestPackagePolicyOverridesTheTypeRuleOnUpload(t *testing.T) {
 		t.Fatalf("SavePackage: %v", err)
 	}
 
-	if _, err := pl.forVersion(t.Context(), manifest.TypeBinary, "awscli", "2.0.0", "binaries/awscli/2.0.0/awscli.zip"); err != nil {
+	if _, err := pl.ForVersion(t.Context(), manifest.TypeBinary, "awscli", "2.0.0", "binaries/awscli/2.0.0/awscli.zip"); err != nil {
 		t.Fatalf("forVersion: %v", err)
 	}
 	if got := recordedStorage(t, store, manifest.TypeBinary, "awscli", "2.0.0"); got != "" {
@@ -269,7 +269,7 @@ func TestValidateManifestRejectsAnUnknownStoragePolicy(t *testing.T) {
 	}
 }
 
-// TestValidateManifestWarnsOnAnInertStoragePolicy: git uploads a whole
+// TestValidateManifestWarnsOnAnInertStoragePolicy: pypi uploads a whole
 // directory, so its package level is never consulted and this policy will
 // change nothing. Recording an inert field without comment is how an operator
 // comes to believe a package has been placed.
@@ -285,11 +285,11 @@ func TestValidateManifestWarnsOnAnInertStoragePolicy(t *testing.T) {
 	}
 
 	var warnings bytes.Buffer
-	pm := &manifest.PackageManifest{Name: "netbox", Type: manifest.TypeGit, StoragePolicy: "bulk"}
+	pm := &manifest.PackageManifest{Name: "requests", Type: manifest.TypePypi, StoragePolicy: "bulk"}
 	if err := validateManifest(pm, cfg, &warnings); err != nil {
 		t.Fatalf("validateManifest: %v", err)
 	}
-	for _, want := range []string{"no effect", "storage_by_type.git"} {
+	for _, want := range []string{"no effect", "storage_by_type.pypi"} {
 		if !strings.Contains(warnings.String(), want) {
 			t.Errorf("warning %q does not mention %q", warnings.String(), want)
 		}
@@ -310,10 +310,10 @@ func TestValidateManifestWarnsOnAnInertStoragePolicy(t *testing.T) {
 //
 // 'bodega pkg storage' exists to answer "why did this package land there", and
 // an operator reads it after the fact. Resolver.Placement honors a package
-// policy for every type; the write path does not, because forType uploads the
-// whole directory to one prefix and passes "". Printing the hierarchy's answer
-// for git or apt reports a level no upload will ever use, which is worse than
-// printing nothing.
+// policy for every type; the write path does not for pypi, because ForType
+// uploads the whole wheel tree to one prefix and passes "". Printing the
+// hierarchy's answer there reports a level no upload will ever use, which is
+// worse than printing nothing.
 func TestWritePlacementReportsWhatTheWritePathDoes(t *testing.T) {
 	cfg := &config.Config{
 		StorageBackend:  "local",
@@ -325,7 +325,7 @@ func TestWritePlacementReportsWhatTheWritePathDoes(t *testing.T) {
 		t.Fatalf("NewResolver: %v", err)
 	}
 
-	for _, typ := range []string{manifest.TypeApt, manifest.TypeGit, manifest.TypePypi} {
+	for _, typ := range []string{manifest.TypePypi} {
 		d := writePlacement(stores, typ, "bulk")
 		if d.Name != storage.DefaultName {
 			t.Errorf("%s: writePlacement named %q, but forType writes to %q", typ, d.Name, storage.DefaultName)
@@ -344,10 +344,11 @@ func TestWritePlacementReportsWhatTheWritePathDoes(t *testing.T) {
 		}
 	}
 
-	// The five per-version types are unchanged: the policy decides and wins.
+	// The seven per-version types: the policy decides and wins. apt and git
+	// joined them when their uploaders started walking manifest entries.
 	for _, typ := range []string{
 		manifest.TypeBinary, manifest.TypeNpm, manifest.TypeCargo,
-		manifest.TypeGomod, manifest.TypeHelm,
+		manifest.TypeGomod, manifest.TypeHelm, manifest.TypeApt, manifest.TypeGit,
 	} {
 		d := writePlacement(stores, typ, "bulk")
 		if d.Name != "bulk" || d.Level != storage.LevelPackage {
@@ -402,7 +403,7 @@ func TestGitPlacementSurvivesTheHandoffToTheServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newPlacer: %v", err)
 	}
-	if _, err := pl.forType(ctx, manifest.TypeGit); err != nil {
+	if _, err := pl.ForType(ctx, manifest.TypeGit); err != nil {
 		t.Fatalf("forType(git): %v", err)
 	}
 	if got := recordedStorage(t, store, manifest.TypeGit, "netbox", "v4.5.5"); got != "bulk" {

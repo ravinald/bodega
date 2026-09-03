@@ -7,12 +7,10 @@ package main
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/spf13/cobra"
 
 	"github.com/ravinald/bodega/internal/builder"
-	"github.com/ravinald/bodega/internal/manifest"
 )
 
 func newSyncCmd(gf *globalFlags) *cobra.Command {
@@ -26,15 +24,15 @@ exist on disk to S3 without fetching, building, or packaging anything.
 This is useful when artifacts have been built on a separate machine or in a
 prior session and you simply want to (re-)upload them.
 
-  binary  Upload per-entry to binaries/<name>/<version>/<filename> (or
-          binaries/<filename> when unversioned)
-  git     Sync bundles/ directory to repos/ in S3
-  apt     Sync apt-repo/ directory to packages/apt/ in S3
-  pypi    Sync wheels[/<version>]/ directory to pypi/wheels[/<version>]/ in S3
+Every type but pypi uploads one object per manifest version, to the backend
+that version records: a git bundle to repos/<name>/, a .deb to the pool path
+its entry carries, a binary to binaries/<name>/<version>/. pypi's wheels have
+no per-version object key, so they sync as a directory to pypi/wheels/ on the
+backend its type rule names.
 
-If a local artifact directory does not exist the type is silently skipped.
+A version whose artifact is not on disk is skipped, and so is a type with none.
 
-If no types are given all four are synced.
+If no types are given all of them are synced.
 
 For the smart variant that runs missing pipeline stages before uploading,
 use 'upload' instead.`,
@@ -72,154 +70,13 @@ use 'upload' instead.`,
 				return err
 			}
 
-			buildRoot := cfg.BuildRoot
 			totalUploaded := 0
-
 			for _, t := range types {
 				fmt.Printf("\n--- sync: %s ---\n", t)
-
-				switch t {
-				case manifest.TypeBinary:
-					// Upload per-entry to the correct versioned S3 key.
-					paths := builder.BinaryArtifactPaths(bcfg, store, "")
-					if len(paths) == 0 {
-						fmt.Printf("    No local binary artifacts found — skipping\n")
-						continue
-					}
-					for _, ap := range paths {
-						st, err := pl.forVersion(ctx, t, ap.Package, ap.Version, ap.S3Key)
-						if err != nil {
-							return err
-						}
-						fmt.Printf("    upload: %s/%s\n", st.Label(), ap.S3Key)
-						if err := st.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
-							return fmt.Errorf("sync binary %s: %w", ap.Local, err)
-						}
-						totalUploaded++
-					}
-
-				case manifest.TypeGit:
-					localDir := filepath.Join(buildRoot, "bundles")
-					if _, err := os.Stat(localDir); os.IsNotExist(err) {
-						fmt.Printf("    No bundles directory at %s — skipping\n", localDir)
-						continue
-					}
-					st, err := pl.forType(ctx, t)
-					if err != nil {
-						return err
-					}
-					n, err := st.SyncDir(ctx, os.Stdout, localDir, manifest.GitPrefix)
-					if err != nil {
-						return fmt.Errorf("sync git: %w", err)
-					}
-					fmt.Printf("    Uploaded %d file(s) to %s/%s\n", n, st.Label(), manifest.GitPrefix)
-					totalUploaded += n
-
-				case manifest.TypeApt:
-					localDir := filepath.Join(buildRoot, "apt-repo")
-					if _, err := os.Stat(localDir); os.IsNotExist(err) {
-						fmt.Printf("    No apt-repo directory at %s — skipping\n", localDir)
-						continue
-					}
-					st, err := pl.forType(ctx, t)
-					if err != nil {
-						return err
-					}
-					n, err := st.SyncDir(ctx, os.Stdout, localDir, manifest.AptPrefix)
-					if err != nil {
-						return fmt.Errorf("sync apt: %w", err)
-					}
-					fmt.Printf("    Uploaded %d file(s) to %s/%s\n", n, st.Label(), manifest.AptPrefix)
-					totalUploaded += n
-
-				case manifest.TypePypi:
-					localDir, s3Prefix := builder.PypiArtifactDir(bcfg, store)
-					if _, err := os.Stat(localDir); os.IsNotExist(err) {
-						fmt.Printf("    No wheels directory at %s — skipping\n", localDir)
-						continue
-					}
-					st, err := pl.forType(ctx, t)
-					if err != nil {
-						return err
-					}
-					n, err := st.SyncDir(ctx, os.Stdout, localDir, s3Prefix)
-					if err != nil {
-						return fmt.Errorf("sync pypi: %w", err)
-					}
-					fmt.Printf("    Uploaded %d file(s) to %s/%s\n", n, st.Label(), s3Prefix)
-					totalUploaded += n
-
-				case manifest.TypeGomod:
-					paths := builder.GomodArtifactPaths(bcfg, store, "")
-					if len(paths) == 0 {
-						fmt.Println("    No local gomod artifacts found — skipping")
-						continue
-					}
-					for _, ap := range paths {
-						st, err := pl.forVersion(ctx, t, ap.Package, ap.Version, ap.S3Key)
-						if err != nil {
-							return err
-						}
-						fmt.Printf("    upload: %s/%s\n", st.Label(), ap.S3Key)
-						if err := st.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
-							return fmt.Errorf("sync gomod %s: %w", ap.Local, err)
-						}
-						totalUploaded++
-					}
-
-				case manifest.TypeHelm:
-					paths := builder.HelmArtifactPaths(bcfg, store, "")
-					if len(paths) == 0 {
-						fmt.Println("    No local helm artifacts found — skipping")
-						continue
-					}
-					for _, ap := range paths {
-						st, err := pl.forVersion(ctx, t, ap.Package, ap.Version, ap.S3Key)
-						if err != nil {
-							return err
-						}
-						fmt.Printf("    upload: %s/%s\n", st.Label(), ap.S3Key)
-						if err := st.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
-							return fmt.Errorf("sync helm %s: %w", ap.Local, err)
-						}
-						totalUploaded++
-					}
-
-				case manifest.TypeNpm:
-					paths := builder.NpmArtifactPaths(bcfg, store, "")
-					if len(paths) == 0 {
-						fmt.Println("    No local npm artifacts found — skipping")
-						continue
-					}
-					for _, ap := range paths {
-						st, err := pl.forVersion(ctx, t, ap.Package, ap.Version, ap.S3Key)
-						if err != nil {
-							return err
-						}
-						fmt.Printf("    upload: %s/%s\n", st.Label(), ap.S3Key)
-						if err := st.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
-							return fmt.Errorf("sync npm %s: %w", ap.Local, err)
-						}
-						totalUploaded++
-					}
-
-				case manifest.TypeCargo:
-					paths := builder.CargoArtifactPaths(bcfg, store, "")
-					if len(paths) == 0 {
-						fmt.Println("    No local cargo artifacts found — skipping")
-						continue
-					}
-					for _, ap := range paths {
-						st, err := pl.forVersion(ctx, t, ap.Package, ap.Version, ap.S3Key)
-						if err != nil {
-							return err
-						}
-						fmt.Printf("    upload: %s/%s\n", st.Label(), ap.S3Key)
-						if err := st.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
-							return fmt.Errorf("sync cargo %s: %w", ap.Local, err)
-						}
-						totalUploaded++
-					}
+				n, err := pl.UploadType(ctx, bcfg, t)
+				totalUploaded += n
+				if err != nil {
+					return err
 				}
 			}
 

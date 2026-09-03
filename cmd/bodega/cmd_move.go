@@ -42,17 +42,17 @@ Without a version, every version of the package moves. Versions already on the
 destination are skipped, so an interrupted move can be re-run. A frozen version
 refuses the whole command, mirroring delete.
 
-apt, git and pypi are not movable. All three upload as a whole directory with
-no per-version granularity, so placing one package of the type away from the
-rest splits a tree nothing can reunite, and 'bodega build sync' would refuse
-for the whole type afterwards. Point storage_by_type at the backend you want
-and re-upload instead.
+pypi is not movable. Its wheels upload as a directory with no per-version
+object key and the PEP 503 index is a listing over the whole tree, so a package
+placed on another backend drops out of the index that finds it. Point
+storage_by_type.pypi at the backend you want and re-upload instead.
 
 Two backend names resolving to one directory or bucket is refused too, before
 anything is copied. Each object would land on the one it was read from, and
 --delete-source would then remove the only copy there is.`,
 		Example: `  bodega pkg move binary awscli-v2 --to bulk
   bodega pkg move npm @bitwarden/cli@2026.4.0 --to archive
+  bodega pkg move git netbox@v4.5.5 --to bulk
   bodega pkg move gomod github.com/aws/aws-sdk-go-v2@v1.30.0 --to archive --delete-source`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {

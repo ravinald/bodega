@@ -660,7 +660,7 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 		cfg := m.cfg
 		store := m.store
-		s3client := m.s3client
+		stores := m.stores
 
 		// Build a title showing what will be built.
 		var title string
@@ -684,7 +684,7 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// Run entries sequentially to prevent log interleaving.
 			var cmds []tea.Cmd
 			for _, be := range buildEntries {
-				cmds = append(cmds, executeStage(stage, be.typ, be.name, cfg, store, s3client, force))
+				cmds = append(cmds, executeStage(stage, be.typ, be.name, cfg, store, stores, force))
 			}
 			m.sources.ClearMarks()
 			return tea.Sequence(cmds...)
@@ -693,12 +693,12 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "S":
-		if m.s3client == nil {
-			m.log.appendLog(errorStyle.Render("sync requires a configured S3 bucket"))
+		if m.stores == nil {
+			m.log.appendLog(errorStyle.Render("sync requires a configured storage backend"))
 			return m, nil
 		}
-		m.log.appendLog(dimStyle.Render("Syncing all artifacts to S3..."))
-		return m, executeSyncAll(nil, m.cfg, m.store, m.s3client)
+		m.log.appendLog(dimStyle.Render("Syncing all artifacts to storage..."))
+		return m, executeSyncAll(nil, m.cfg, m.store, m.stores)
 
 	case "I":
 		if m.s3client == nil {
@@ -768,7 +768,7 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		var cmds []tea.Cmd
 		for _, e := range entries {
-			cmds = append(cmds, executeDelete(e.EntryType, e.Name, m.store, m.s3client, m.cfg, m.auditDB))
+			cmds = append(cmds, executeDelete(e.EntryType, e.Name, m.store, m.auditDB))
 		}
 		m.popup = popupModel{
 			kind:            popupConfirm,
@@ -789,7 +789,7 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		var cmds []tea.Cmd
 		for _, e := range entries {
-			cmds = append(cmds, executeRemoveFromS3(e.EntryType, e.Name, m.store, m.s3client, m.cfg))
+			cmds = append(cmds, executeRemoveFromS3(e.EntryType, e.Name, m.store, m.stores))
 		}
 		m.popup = popupModel{
 			kind:            popupConfirm,

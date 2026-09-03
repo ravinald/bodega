@@ -389,3 +389,82 @@ func TestBinaryArtifactPaths(t *testing.T) {
 		t.Error("missing S3 key binaries/tool-b/v2.0/tool-b.tar.gz")
 	}
 }
+
+// TestAptArtifactPathsResolveWithoutPoolPath covers the entry PackageApt could
+// not stamp: control extraction failed, or the entry predates _pool_path
+// entirely. It has to resolve to the key the server will look for, because a
+// silent skip here turns a package that used to upload into one that no longer
+// does, with nothing saying so.
+func TestAptArtifactPathsResolveWithoutPoolPath(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	d := buildDirs(root)
+	store := manifest.NewLocalStore(root)
+	ctx := t.Context()
+
+	if err := store.AddVersion(ctx, manifest.TypeApt, "stamped", manifest.VersionEntry{
+		Version:  "1.0",
+		Metadata: map[string]string{"_pool_path": "pool/main/s/stamped/stamped_1.0_amd64.deb"},
+	}); err != nil {
+		t.Fatalf("AddVersion stamped: %v", err)
+	}
+	if err := store.AddVersion(ctx, manifest.TypeApt, "bare", manifest.VersionEntry{
+		Version:  "2.0",
+		Metadata: map[string]string{"Architecture": "arm64"},
+	}); err != nil {
+		t.Fatalf("AddVersion bare: %v", err)
+	}
+	touchFile(t, filepath.Join(d.aptRepo, "pool", "main", "s", "stamped", "stamped_1.0_amd64.deb"))
+	touchFile(t, filepath.Join(d.aptRepo, "pool", "main", "b", "bare", "bare_2.0_arm64.deb"))
+
+	got := map[string]bool{}
+	for _, p := range AptArtifactPaths(cfg, store, "") {
+		got[p.S3Key] = true
+	}
+	for _, want := range []string{
+		"packages/apt/pool/main/s/stamped/stamped_1.0_amd64.deb",
+		"packages/apt/pool/main/b/bare/bare_2.0_arm64.deb",
+	} {
+		if !got[want] {
+			t.Errorf("no artifact path for %q; got %v", want, got)
+		}
+	}
+}
+
+// TestGitArtifactPathsCoverBundlesAndReleases pins that the local path and the
+// object key are derived from the same (name, ref, release) triple. A bundle
+// uploaded under a release's key, or the reverse, 404s on a route that already
+// recovered the ref correctly.
+func TestGitArtifactPathsCoverBundlesAndReleases(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	d := buildDirs(root)
+	store := manifest.NewLocalStore(root)
+	ctx := t.Context()
+
+	if err := store.AddVersion(ctx, manifest.TypeGit, "org/cloned", manifest.VersionEntry{
+		Ref: "main", Source: "clone", URL: "https://example.com/org/cloned",
+	}); err != nil {
+		t.Fatalf("AddVersion cloned: %v", err)
+	}
+	if err := store.AddVersion(ctx, manifest.TypeGit, "tagged", manifest.VersionEntry{
+		Ref: "v1.2.3", Source: "release", URL: "https://example.com/tagged",
+	}); err != nil {
+		t.Fatalf("AddVersion tagged: %v", err)
+	}
+	touchFile(t, filepath.Join(d.bundles, "org--cloned", "org--cloned-main.bundle"))
+	touchFile(t, filepath.Join(d.bundles, "tagged", "tagged-v1.2.3.tar.gz"))
+
+	got := map[string]bool{}
+	for _, p := range GitArtifactPaths(cfg, store, "") {
+		got[p.S3Key] = true
+	}
+	for _, want := range []string{
+		manifest.GitKey("org/cloned", "main", false),
+		manifest.GitKey("tagged", "v1.2.3", true),
+	} {
+		if !got[want] {
+			t.Errorf("no artifact path for %q; got %v", want, got)
+		}
+	}
+}
