@@ -407,13 +407,23 @@ func (s *Server) enforceUpstreamPolicy(w http.ResponseWriter, r *http.Request, r
 		s.logger.Warn("upstream blocked by policy",
 			"type", regType, "candidate", policyCandidate, "url", upstreamURL)
 		if s.auditDB != nil {
-			_ = s.auditDB.Record(ctx, audit.Event{
+			// The refusal stands whether or not the row lands: an audit
+			// database that cannot be written is not a reason to let a
+			// blocked upstream through. It is a reason to say so loudly,
+			// naming the event, so a reconstruction from the log is
+			// possible when the table is missing the row.
+			if err := s.auditDB.Record(ctx, audit.Event{
 				EventType: audit.EventCache,
 				PkgType:   regType,
 				PkgName:   policyCandidate,
 				Status:    "policy_violation",
 				Details:   fmt.Sprintf("url=%s", upstreamURL),
-			})
+			}); err != nil {
+				s.logger.Error("audit write failed, denial not recorded — still refusing",
+					"event_type", audit.EventCache, "status", "policy_violation",
+					"type", regType, "candidate", policyCandidate, "url", upstreamURL,
+					"error", err)
+			}
 		}
 		http.Error(w, "upstream blocked by allow-list", http.StatusForbidden)
 		return false

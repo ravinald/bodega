@@ -40,6 +40,7 @@ type DiscoveryRecorder struct {
 	ch     chan audit.DiscoveryRow
 
 	dropped atomic.Uint64 // rows lost to a full queue
+	failed  atomic.Uint64 // rows dequeued but rejected by the database
 }
 
 // NewDiscoveryRecorder constructs a recorder backed by db. The returned value
@@ -84,11 +85,22 @@ func (r *DiscoveryRecorder) Start(ctx context.Context) {
 		case row := <-r.ch:
 			r.write(ctx, row)
 		case <-tick.C:
-			if n := r.dropped.Swap(0); n > 0 {
-				r.logger.Warn("discovery rows dropped due to full queue — increase capacity or investigate request volume",
-					"dropped", n, "window", discoveryDropLogPeriod.String())
-			}
+			r.summarize()
 		}
+	}
+}
+
+// summarize reports both loss counters and resets them. Called on the tick and
+// once more at shutdown, so a server that stops inside one window still says
+// what it lost rather than taking the counts down with it.
+func (r *DiscoveryRecorder) summarize() {
+	if n := r.dropped.Swap(0); n > 0 {
+		r.logger.Warn("discovery rows dropped due to full queue — increase capacity or investigate request volume",
+			"dropped", n, "window", discoveryDropLogPeriod.String())
+	}
+	if n := r.failed.Swap(0); n > 0 {
+		r.logger.Error("discovery rows rejected by the database — this is not backpressure, check the audit db",
+			"failed", n, "window", discoveryDropLogPeriod.String())
 	}
 }
 
@@ -102,15 +114,23 @@ func (r *DiscoveryRecorder) drain() {
 		case row := <-r.ch:
 			r.write(drainCtx, row)
 		default:
+			r.summarize()
 			return
 		}
 	}
 }
 
+// write persists one dequeued row. A failure here is a different loss from a
+// full queue: backpressure means bodega is taking more traffic than the writer
+// drains, a rejected write means the database itself is not accepting rows.
+// They are counted apart so an operator reading the summary knows which one to
+// chase, and logged at Error because nothing downstream retries.
 func (r *DiscoveryRecorder) write(ctx context.Context, row audit.DiscoveryRow) {
 	if err := r.db.RecordDiscovery(ctx, row); err != nil {
-		r.logger.Warn("discovery write failed",
-			"type", row.RegistryType, "hint", row.PatternHint, "error", err)
+		r.failed.Add(1)
+		r.logger.Error("discovery write failed, observation lost",
+			"type", row.RegistryType, "hint", row.PatternHint,
+			"pkg", row.PkgName, "decision", row.Decision, "error", err)
 	}
 }
 

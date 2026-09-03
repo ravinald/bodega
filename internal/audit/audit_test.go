@@ -2,8 +2,10 @@ package audit
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -474,4 +476,60 @@ func TestMultipleEventTypes(t *testing.T) {
 	if len(events) != 5 {
 		t.Errorf("got %d events, want 5", len(events))
 	}
+}
+
+// Eight writers through one *DB, because that is the shape that lost rows:
+// database/sql hands each goroutine its own SQLite connection, and without a
+// busy_timeout the loser of the write lock is refused immediately rather than
+// made to wait. The assertion is the row count, not the error return — a
+// handle that reported no error and stored 30 of 400 is what this pins.
+//
+// It also reports sustained write throughput, which is the number E2 needs to
+// argue SQLite is or is not enough for a fleet.
+func TestConcurrentWritersKeepEveryRow(t *testing.T) {
+	const (
+		writers        = 8
+		eventsPerWrite = 50
+	)
+	db := tempDB(t)
+	ctx := context.Background()
+
+	start := time.Now()
+	var wg sync.WaitGroup
+	errs := make(chan error, writers*eventsPerWrite)
+	for w := range writers {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := range eventsPerWrite {
+				err := db.Record(ctx, Event{
+					EventType: EventFetch,
+					PkgType:   "gomod",
+					PkgName:   fmt.Sprintf("writer-%d/event-%d", w, i),
+					Status:    "cache_miss",
+				})
+				if err != nil {
+					errs <- err
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("Record: %v", err)
+	}
+
+	events, err := db.Query(ctx, Filter{Limit: writers * eventsPerWrite * 2})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if want := writers * eventsPerWrite; len(events) != want {
+		t.Fatalf("stored %d events, want %d — the handle dropped writes under contention", len(events), want)
+	}
+	t.Logf("%d events from %d concurrent writers in %s (%.0f writes/sec)",
+		len(events), writers, elapsed.Round(time.Millisecond),
+		float64(len(events))/elapsed.Seconds())
 }
