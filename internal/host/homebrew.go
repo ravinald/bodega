@@ -37,8 +37,8 @@ func CheckHomebrew() Finding {
 // string when no installation is detected.
 func homebrewPrefix() string {
 	for _, p := range []string{
-		"/opt/homebrew",          // Apple Silicon macOS
-		"/usr/local/Homebrew",    // Intel macOS
+		"/opt/homebrew",              // Apple Silicon macOS
+		"/usr/local/Homebrew",        // Intel macOS
 		"/home/linuxbrew/.linuxbrew", // Linux
 	} {
 		if exists(p) {

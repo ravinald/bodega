@@ -72,10 +72,10 @@ func TestFirstHit(t *testing.T) {
 // var manipulation is isolated via t.Setenv (auto-restored on cleanup).
 func TestCheckGoproxyEnv(t *testing.T) {
 	tests := []struct {
-		name   string
-		value  string
-		unset  bool
-		want   Status
+		name  string
+		value string
+		unset bool
+		want  Status
 	}{
 		{name: "unset", unset: true, want: StatusWarn},
 		{name: "direct fallthrough", value: "http://bodega/gomod,direct", want: StatusWarn},
