@@ -126,7 +126,10 @@ func (s *Server) handleCargoDownload(w http.ResponseWriter, r *http.Request, p s
 	}
 
 	setCacheImmutable(w, path.Base(p))
-	upstream := strings.TrimRight(s.cfg.CargoUpstream, "/") + "/" + crate + "/" + version + "/download"
+	// cargo_dl_upstream, not cargo_upstream: the sparse index host serves the
+	// index and nothing else, and crates.io names the download root separately
+	// in the index's own config.json.
+	upstream := strings.TrimRight(s.cfg.CargoDLUpstream, "/") + "/" + crate + "/" + version + "/download"
 	s3Key := manifest.CargoCrateKey(crate, version)
 	forceProxy := pm == nil || packageMode(pm) == manifest.ModeProxy
 	// A hosted crate reads from the backend its entry records; a proxied one

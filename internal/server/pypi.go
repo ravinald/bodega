@@ -1,9 +1,12 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"html"
+	"net/url"
 	"path"
+	"regexp"
 	"strings"
 
 	"net/http"
@@ -90,7 +93,7 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 		pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, pkgName)
 		if pkg != nil && packageMode(pkg) == manifest.ModeProxy {
 			// Proxy the simple index from upstream PyPI.
-			upstream := "https://pypi.org/simple/" + normalized + "/"
+			upstream := s.pypiSimpleURL(normalized)
 			s.proxyOrCache(w, r, s.typeStore(manifest.TypePypi), "pypi/simple/"+normalized+"/index.html", upstream, manifest.TypePypi, pkgName, pkgName, false, true)
 			return
 		}
@@ -124,18 +127,77 @@ func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
 	// Extract package name and version from the wheel filename
 	// (e.g. "boto3-1.26.0-py3-none-any.whl" → "boto3", "1.26.0").
 	dist, distVersion := wheelIdentity(file)
-	upstream := "https://pypi.org/packages/" + file
 	if dist != "" {
+		normalized := normalizePkgName(dist)
 		pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, dist)
 		if pkg != nil && packageMode(pkg) == manifest.ModeProxy {
-			s.proxyOrCache(w, r, s.typeStore(manifest.TypePypi), key, upstream, manifest.TypePypi, dist, dist, true, true)
+			resolve := func(ctx context.Context) (string, error) {
+				return s.resolvePypiWheel(ctx, normalized, file)
+			}
+			s.proxyOrResolve(w, r, s.typeStore(manifest.TypePypi), key, resolve, manifest.TypePypi, dist, dist, true, true)
 			return
 		}
 		if pkg == nil {
-			s.recordNoManifest(r.Context(), r, manifest.TypePypi, dist, distVersion, upstream)
+			// The simple index, not the artifact: a wheel URL cannot be
+			// composed without reading the index, so the index is the only
+			// fetchable URL this branch knows. `discover promote --as manifest`
+			// stores it, and manifestURL trims it back to the registry root.
+			s.recordNoManifest(r.Context(), r, manifest.TypePypi, dist, distVersion, s.pypiSimpleURL(normalized))
 		}
 	}
 	s.proxyVersion(w, r, manifest.TypePypi, dist, distVersion, key)
+}
+
+// pypiSimpleURL is the PEP 503 index URL for one distribution under the
+// configured index root.
+func (s *Server) pypiSimpleURL(normalized string) string {
+	return strings.TrimRight(s.cfg.PypiUpstream, "/") + "/simple/" + normalized + "/"
+}
+
+// pypiHrefPattern pulls the link targets out of a PEP 503 index. The document
+// is generated HTML with one anchor per file and no nesting, so a full parser
+// buys nothing over this; the match is only a candidate, and the filename
+// comparison below is what decides.
+var pypiHrefPattern = regexp.MustCompile(`href="([^"]*)"`)
+
+// resolvePypiWheel returns the upstream URL for one wheel by reading the
+// simple index for its distribution.
+//
+// PyPI serves artifacts from files.pythonhosted.org under a path derived from
+// the file's content hash, which is not recoverable from the filename. The
+// index is the only document that carries the mapping, so resolution is a
+// lookup rather than a concatenation, and a filename the index does not list
+// is refused here instead of becoming a fetch of a URL nobody can check.
+func (s *Server) resolvePypiWheel(ctx context.Context, normalized, filename string) (string, error) {
+	indexURL := s.pypiSimpleURL(normalized)
+	body, _, err := fetchUpstream(ctx, indexURL)
+	if err != nil {
+		return "", fmt.Errorf("read the pypi simple index %s: %w", indexURL, err)
+	}
+	base, err := url.Parse(indexURL)
+	if err != nil {
+		return "", fmt.Errorf("parse the pypi simple index URL %s: %w", indexURL, err)
+	}
+
+	listed := 0
+	for _, m := range pypiHrefPattern.FindAllSubmatch(body, -1) {
+		href := html.UnescapeString(string(m[1]))
+		u, err := base.Parse(href)
+		if err != nil {
+			continue
+		}
+		listed++
+		name, err := url.PathUnescape(path.Base(u.Path))
+		if err != nil || name != filename {
+			continue
+		}
+		// The #sha256= fragment is the publisher's checksum, not part of the
+		// object; dropping it keeps the logged URL the thing that was fetched.
+		u.Fragment = ""
+		return u.String(), nil
+	}
+	return "", fmt.Errorf("%w: %s lists %d file(s) and none of them is %s — the index is authoritative for what pypi publishes, so check the filename and the version against it",
+		errUpstreamNotFound, indexURL, listed, filename)
 }
 
 // wheelIdentity splits a wheel filename into its distribution and version.

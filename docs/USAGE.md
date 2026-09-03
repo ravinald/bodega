@@ -110,8 +110,9 @@ Detects and fixes inconsistencies in the manifest store:
 2. **Dependency linking**: git entries with fetched sources should have their dependencies discovered and linked
 3. **Artifact sizes**: backfill ArtifactSize from local files
 4. **Apt placeholders**: version-less apt entries sitting beside a resolved one are removed
-5. **Manifest sync**: all manifests are re-saved to the backend (S3)
-6. **Graph rebuild**: dependency edges are rebuilt from RequiredBy fields
+5. **Pypi URLs**: entries recording the retired `pypi.org/packages/<filename>` wheel URL are rewritten to the registry root
+6. **Manifest sync**: all manifests are re-saved to the backend (S3)
+7. **Graph rebuild**: dependency edges are rebuilt from RequiredBy fields
 
 ```bash
 bodega repair                          # detect and fix
@@ -119,6 +120,8 @@ bodega repair check                    # detect only, no changes
 ```
 
 Phase 4 is the only way to clear a version-less apt entry. `bodega pkg create apt` in package-name mode stages one before the upstream version is known and fills it once the lookup returns; one left over is addressable by nothing, because `pkg remove`, `pkg delete`, `hide` and `freeze` all name a version. A package whose entries are *all* version-less is reported and left alone — that is a staging record, not a leftover.
+
+Phase 5 corrects what `bodega discover promote --as manifest` wrote while the wheel handler composed `https://pypi.org/packages/<filename>`, a path pypi.org has never served. Nothing reads the field today, so the stored URL breaks no fetch; it is rewritten because promotion never revisits a version it already wrote, and the entry would otherwise carry a URL that 404s for as long as it exists. An entry pointing anywhere else, including an operator's own index, is left untouched. See [Upstream hosts](#upstream-hosts) for how a wheel is resolved now.
 
 ### `bodega repair keys [--dry-run] [--delete-source] [--type TYPE]`
 
@@ -788,6 +791,9 @@ A default config is created on first run. All fields are optional.
   "metadata_ttl": "1h",
   "gomod_upstream": "https://proxy.golang.org",
   "npm_upstream": "https://registry.npmjs.org",
+  "pypi_upstream": "https://pypi.org",
+  "cargo_upstream": "https://index.crates.io",
+  "cargo_dl_upstream": "https://static.crates.io/crates",
   "discover_mode": "",
   "apt_codename": "noble",
   "apt_suites": ["noble"],
@@ -1812,7 +1818,7 @@ On a publicly reachable instance the database is the only queryable record of a 
 
 ## Proxy/Cache
 
-When `proxy_cache_enabled` is `true`, the server fetches from upstream on cache miss for gomod, helm, and npm routes.
+When `proxy_cache_enabled` is `true`, the server fetches from upstream on cache miss. See [Upstream hosts](#upstream-hosts) for which registry each type reaches.
 
 **Flow:**
 1. Client requests a package (e.g., `GET /go/github.com/foo/@v/v1.0.0.zip`)
@@ -1831,6 +1837,22 @@ Configure the TTL:
 ```json
 { "metadata_ttl": "1h" }
 ```
+
+### Upstream hosts
+
+Five flat keys name the registries a proxying instance fetches from. They are not interchangeable, and two ecosystems need two keys each because the registry that answers "which versions exist" is not the one that serves the bytes.
+
+| Key | Default | What that host serves |
+|-----|---------|-----------------------|
+| `gomod_upstream` | `https://proxy.golang.org` | The whole module proxy protocol: `@v/list`, `@v/{version}.info`, `.mod` and `.zip`, all on one host |
+| `npm_upstream` | `https://registry.npmjs.org` | Packuments and tarballs, both on one host |
+| `pypi_upstream` | `https://pypi.org` | The PEP 503 index root. bodega reads `/simple/{dist}/` under it and fetches the artifact URL that page lists, which is on `files.pythonhosted.org` under a content-hash path. A wheel URL cannot be composed from a filename, so a request for a file the index does not list is a 404 naming the index that was read |
+| `cargo_upstream` | `https://index.crates.io` | The sparse index, and nothing else. A crate tarball request to this host is a 404 |
+| `cargo_dl_upstream` | `https://static.crates.io/crates` | Crate tarballs. bodega appends `/{crate}/{version}/download` |
+
+crates.io names its own download root in `https://index.crates.io/config.json`, and bodega does not read it. Fetching that document at startup would make `bodega serve` fail to bind because a registry was unreachable, and an operator mirroring the index is not thereby mirroring the tarballs: point the two keys wherever each actually lives.
+
+The allow-list checks the package name for `pypi`, `npm` and `gomod`, so `bodega policy add pypi <dist>` keeps working across the two pypi hosts. `cargo` is name-scoped the same way, and a rule constrains the crate rather than the host either key names.
 
 ---
 

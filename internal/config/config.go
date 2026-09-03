@@ -90,7 +90,9 @@ type Config struct {
 	MetadataTTL       string   `json:"metadata_ttl,omitempty"`
 	GomodUpstream     string   `json:"gomod_upstream,omitempty"`
 	NpmUpstream       string   `json:"npm_upstream,omitempty"`
-	CargoUpstream     string   `json:"cargo_upstream,omitempty"`
+	PypiUpstream      string   `json:"pypi_upstream,omitempty"`  // PEP 503 index root; the server reads /simple/{dist}/ under it to learn where a wheel lives
+	CargoUpstream     string   `json:"cargo_upstream,omitempty"` // sparse index host, which serves the index and nothing else
+	CargoDLUpstream   string   `json:"cargo_dl_upstream,omitempty"`
 	DiscoverMode      string   `json:"discover_mode,omitempty"` // "" or "observe" — see internal/server/discovery.go
 	GomodRoot         string   `json:"gomod_root,omitempty"`
 	HelmRoot          string   `json:"helm_root,omitempty"`
@@ -548,7 +550,16 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	cfg.MetadataTTL = firstNonEmpty(cfg.MetadataTTL, "1h")
 	cfg.GomodUpstream = firstNonEmpty(cfg.GomodUpstream, "https://proxy.golang.org")
 	cfg.NpmUpstream = firstNonEmpty(cfg.NpmUpstream, "https://registry.npmjs.org")
+	cfg.PypiUpstream = firstNonEmpty(cfg.PypiUpstream, "https://pypi.org")
 	cfg.CargoUpstream = firstNonEmpty(cfg.CargoUpstream, "https://index.crates.io")
+
+	// crates.io publishes the index and the tarballs on separate hosts, and
+	// the index's own config.json is where the download root is named. Reading
+	// it at startup would make `bodega serve` fail to bind because a registry
+	// was unreachable, so the value is configuration and the default is what
+	// that document says today. An operator mirroring the index is not thereby
+	// mirroring the downloads, and needs to name both.
+	cfg.CargoDLUpstream = firstNonEmpty(cfg.CargoDLUpstream, "https://static.crates.io/crates")
 
 	// Discover mode: "" or "observe" — typo'd values fail loudly so operators
 	// don't silently lose observability. "learn" is named separately because a
@@ -1073,7 +1084,11 @@ func defaultConfigContent() []byte {
   "metadata_ttl": "1h",
   "gomod_upstream": "https://proxy.golang.org",
   "npm_upstream": "https://registry.npmjs.org",
+  "pypi_upstream": "https://pypi.org",
+
+  "_comment_cargo_upstream": "cargo_upstream is the sparse index; cargo_dl_upstream is the separate host the crate tarballs come from. crates.io names the second in its own config.json — bodega does not fetch that at startup, so an instance mirroring the index must name both keys.",
   "cargo_upstream": "https://index.crates.io",
+  "cargo_dl_upstream": "https://static.crates.io/crates",
 
   "_comment_git_upstreams": "git_upstreams: maps a namespace under /git/ onto an upstream forge, e.g. {\"internal\": {\"url\": \"https://git.corp.example/\", \"mode\": \"open\"}}. The key is a URL segment and a directory name: letters, digits, _ and -, starting with a letter. The url must be https and end in \"/\".",
   "_comment_git_upstreams_mode": "mode is \"catalog\" (default when absent or empty) or \"open\". catalog resolves only paths an existing manifest entry names; anything else 404s and is recorded as no_manifest for 'bodega discover promote'. open composes the upstream URL for any path under the namespace and fetches it, so on a public forge any client that can reach bodega can make bodega fetch arbitrary upstream repositories. Pick open for a forge whose publishing is already controlled.",

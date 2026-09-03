@@ -505,23 +505,32 @@ func versionlessNamesArtifact(regType string) bool {
 // manifestURL maps a discovery row's upstream URL onto the URL shape
 // VersionEntry.URL means for that type.
 //
-// gomod and npm record the artifact URL the handler would have fetched, while
-// the manifest field for both is the registry root the builder appends a
-// module or package path to (internal/builder/gomod.go, internal/builder/npm.go).
-// Promoting the artifact URL verbatim produces an entry whose next
+// gomod, npm and pypi record the URL the handler would have fetched, while the
+// manifest field for all three is the registry root: gomod and npm append a
+// module or package path to it (internal/builder/gomod.go,
+// internal/builder/npm.go), and pypi resolves a wheel through /simple/ under
+// it. Promoting the artifact URL verbatim produces an entry whose next
 // 'bodega build fetch' requests that path twice and 404s. Every other type
 // records a URL that already means what the field means.
 func manifestURL(row audit.DiscoveryRow) string {
 	var artifact string
 	switch row.RegistryType {
 	case manifest.TypeGomod:
+		if row.PkgName == "" {
+			return row.UpstreamURL
+		}
 		artifact = "/" + row.PkgName + "/@v/"
 	case manifest.TypeNpm:
+		if row.PkgName == "" {
+			return row.UpstreamURL
+		}
 		artifact = "/" + row.PkgName + "/-/"
+	case manifest.TypePypi:
+		// The recorded URL is the simple index for one distribution; the
+		// distribution name in it is normalized, so trimming at the fixed
+		// segment is what works for a package whose name carries a "_" or ".".
+		artifact = "/simple/"
 	default:
-		return row.UpstreamURL
-	}
-	if row.PkgName == "" {
 		return row.UpstreamURL
 	}
 	if i := strings.Index(row.UpstreamURL, artifact); i > 0 {
