@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -14,13 +15,16 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/logging"
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
@@ -97,30 +101,103 @@ func TestStartRefusesPlaintextOn443(t *testing.T) {
 	}
 }
 
-// TestStartRefusesUnimplementedAutocert keeps the autocert refusal inside the
-// one guard. It fires only when no cert pair is configured, which is the
-// unchanged behavior recorded on issue #113.
+// TestPlaintextOn443AtDefaultLogLevel drives Start on the port every client
+// reads as TLS, with plaintext authorized, and asserts the hazard reaches an
+// operator running the shipped log_level.
 //
-// AllowPlaintext is true here because the guard checks autocert first, so this
-// is the operator who already took the escape and got the same error back. The
-// refusal stands; the message has to name a step that works from there.
-func TestStartRefusesUnimplementedAutocert(t *testing.T) {
-	s := newGuardServer(t, &config.Config{TLSAutocert: true, AllowPlaintext: true, LogDir: t.TempDir()}, reservePort(t))
-	err := s.Start(context.Background())
-	if err == nil {
-		t.Fatal("Start accepted tls_autocert")
+// The level is the whole test. The line was a Warn and logging.SlogLevel(0) is
+// slog.LevelError, so on a default install it printed nothing while USAGE.md
+// said it fired on every start (#131). Raising the verbosity in the test is
+// what let that survive, so the handler here is the real one at the real
+// default rather than a permissive one.
+func TestPlaintextOn443AtDefaultLogLevel(t *testing.T) {
+	var buf syncBuffer
+	s := newGuardServer(t, &config.Config{AllowPlaintext: true, LogDir: t.TempDir()}, "127.0.0.1:443")
+	s.logger = slog.New(logging.NewHandler(&buf, logging.SlogLevel(0)))
+
+	// Run rather than probe: :443 is privileged, so an unprivileged run fails
+	// at net.Listen and a run as root (CI's container) binds and serves. The
+	// guard logs before either, so both reach the assertion.
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Start(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			t.Error("server did not shut down")
+		}
+	})
+
+	waitFor(t, func() bool { return strings.Contains(buf.String(), "in the clear") })
+	out := buf.String()
+	for _, want := range []string{"ERROR", "in the clear", "allow_plaintext", "127.0.0.1:443"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log at the default level does not name %q:\n%s", want, out)
+		}
 	}
-	if !strings.Contains(err.Error(), "not yet implemented") {
-		t.Fatalf("error %q does not name the unimplemented flag", err)
+}
+
+// TestPlaintextOffTLSPortIsSilent keeps the rule from degrading into "log
+// everything at Error". A loopback listener behind a proxy that terminates TLS
+// is the documented deployment, and what it serves is what the operator asked
+// for, so it earns no startup line at all.
+func TestPlaintextOffTLSPortIsSilent(t *testing.T) {
+	var buf syncBuffer
+	addr := reservePort(t)
+	s := newGuardServer(t, &config.Config{AllowPlaintext: true, LogDir: t.TempDir()}, addr)
+	s.logger = slog.New(logging.NewHandler(&buf, logging.SlogLevel(0)))
+
+	if err := s.guardPlaintext(); err != nil {
+		t.Fatalf("guardPlaintext refused an authorized plaintext listener: %v", err)
 	}
-	if !strings.Contains(err.Error(), `"tls_autocert": false`) {
-		t.Errorf("error %q does not name the config change that clears it", err)
+	if got := buf.String(); got != "" {
+		t.Errorf("authorized plaintext off :443 logged at the default level:\n%s", got)
 	}
-	// --tls-autocert=false cannot clear a config that set it true (#81), so a
-	// message that named the flag alone would be the same loop one level down.
-	if !strings.Contains(err.Error(), "--tls-autocert=false will not clear it") {
-		t.Errorf("error %q does not warn that the flag cannot turn autocert off", err)
+}
+
+// TestStorage503NamesNoDriver pins the body every package route answers when
+// no backend could be built. It named S3 on installs whose config never
+// mentioned one, which sent operators looking for a bucket that did not exist
+// (#34); the handler cannot know the driver, so it points at the startup log,
+// which startupStorage writes at Error.
+func TestStorage503NamesNoDriver(t *testing.T) {
+	s := newGuardServer(t, &config.Config{AllowPlaintext: true, LogDir: t.TempDir()}, reservePort(t))
+	for _, path := range []string{"/pypi/simple/", "/binaries/x/y", "/git/x/y.bundle"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s answered %d, want 503", path, rec.Code)
+		}
+		body := rec.Body.String()
+		if strings.Contains(strings.ToLower(body), "s3") {
+			t.Errorf("%s names a driver the config may never have asked for: %q", path, body)
+		}
+		if !strings.Contains(body, "startup log") {
+			t.Errorf("%s does not point at where the reason is: %q", path, body)
+		}
 	}
+}
+
+// syncBuffer is a bytes.Buffer a slog handler on one goroutine can write while
+// the test reads it on another.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func newGuardServer(t *testing.T, cfg *config.Config, addr string) *Server {

@@ -396,8 +396,6 @@ Starts the HTTP(S) package server.
 | `--addr` | `:8080` | TCP address to listen on |
 | `--tls-cert` | | Path to TLS certificate PEM file |
 | `--tls-key` | | Path to TLS private key PEM file |
-| `--tls-autocert` | `false` | Enable automatic TLS via Let's Encrypt |
-| `--tls-domain` | | Domain name for autocert |
 | `--allow-plaintext` | `false` | Serve without TLS; required when `tls_cert`/`tls_key` are unset |
 
 The server handles graceful shutdown on SIGTERM/SIGINT, giving in-flight requests up to 30 seconds to complete.
@@ -778,8 +776,6 @@ A default config is created on first run. All fields are optional.
   "npm_root": "",
   "tls_cert": "",
   "tls_key": "",
-  "tls_autocert": false,
-  "tls_domain": "",
   "allow_plaintext": false,
   "listen_addr": ":8080",
   "public_url": "",
@@ -1247,7 +1243,7 @@ Refused twice. Every mirror bodega creates carries `http.receivepack=false`, and
 #### Operational requirements
 
 - **`git-http-backend` must be installed.** It ships with git, in `libexec` rather than on `PATH`. bodega resolves it once at startup, through `git --exec-path` and then a fixed list of distribution locations.
-- **When it is missing**, bodega logs a `WARN` at startup naming every path it searched, and does not register the smart-HTTP route. A clone then gets a 404 on `info/refs` and a 405 on `git-upload-pack`. The legacy bundle route keeps working; nothing else about the server changes.
+- **When it is missing**, bodega logs an `ERROR` at startup naming every path it searched, and does not register the smart-HTTP route. `ERROR` because the route is gone: the shipped `log_level` prints nothing below it, so a lower level would announce a disabled feature to nobody. A clone then gets a 404 on `info/refs` and a 405 on `git-upload-pack`. The legacy bundle route keeps working; nothing else about the server changes.
 - **The bodega user must own `{storage_path}/git`.** The mirror clone, the periodic refresh and the CGI child all run as the server's user. Do not run bodega as root to work around a permission error on that tree; fix the ownership.
 - **Upstreams are public and unauthenticated only.** No credential is read from the config or the environment, and the child process is given neither. A private repository answers bodega as an anonymous client, so the operator sees a failed clone, not an auth prompt.
 - **The child process gets an explicit environment**: `GIT_PROJECT_ROOT`, `GIT_HTTP_EXPORT_ALL`, and the CGI variables for the request. No `PATH`, no `HOME`, no inherited `GIT_*`. It is bounded to five minutes and dies with the request.
@@ -1485,7 +1481,9 @@ bodega serve --allow-plaintext
 Two refusals sit behind the same guard:
 
 - **Half a pair.** `tls_cert` set with `tls_key` empty, or the reverse, is fatal — at load for the config file, and at startup for `--tls-cert`/`--tls-key`, which are applied after the file is read. `allow_plaintext` does not excuse it: half a pair is a truncated edit, and reading it as a request for plaintext is how a server that served TLS yesterday answers in the clear today. `Config.Save()` marshals the whole resolved config back over the file, so a cert path cleared in the TUI reaches the listener with nothing else in the way.
-- **Port 443.** An empty pair on `:443` refuses even though the message differs, naming the port. A port is not authorization, but it is the strongest evidence available that whoever wrote `listen_addr` expected a certificate. `allow_plaintext` still starts it, with a `WARN` on every start.
+- **Port 443.** An empty pair on `:443` refuses even though the message differs, naming the port. A port is not authorization, but it is the strongest evidence available that whoever wrote `listen_addr` expected a certificate. `allow_plaintext` still starts it, with an `ERROR` on every start — the shipped `log_level` prints only `ERROR`, and a line the default install cannot see is not a warning. Off `:443` an authorized plaintext listener is silent: it serves what the operator asked for.
+
+bodega has no ACME client. `tls_autocert` and `tls_domain` were config keys that nothing implemented; they are gone, and a file that still carries `tls_autocert: true` logs at startup that it is being ignored. Get a certificate from `certbot` or your CA, or terminate TLS at a proxy in front and set `public_url`.
 
 Behind a TLS-terminating proxy, set `allow_plaintext` together with `public_url` — see [Behind a reverse proxy](#behind-a-reverse-proxy).
 

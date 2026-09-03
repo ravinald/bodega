@@ -19,6 +19,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/logging"
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
@@ -620,24 +621,26 @@ func hideGitBackend(t *testing.T) {
 	t.Cleanup(func() { gitBackendCandidates = saved })
 }
 
-// A host with no git-http-backend gets a WARN naming every path searched, and
-// no *gitTool. Failing per request instead would hand the operator a broken
-// clone with nothing in the startup log to explain it.
-func TestResolveGitToolWarnsAndNamesTheSearch(t *testing.T) {
+// A host with no git-http-backend gets an ERROR naming every path searched,
+// and no *gitTool. Failing per request instead would hand the operator a
+// broken clone with nothing in the startup log to explain it.
+//
+// The handler is the one serve builds at the shipped log_level, not one this
+// test raised. Unregistering a route is a startup condition that changes what
+// bodega serves, so it belongs above the default floor; asserting through a
+// permissive handler would pass either way.
+func TestResolveGitToolLogsTheSearchAtTheDefaultLevel(t *testing.T) {
 	hideGitBackend(t)
 
 	var buf bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	logger := slog.New(logging.NewHandler(&buf, logging.SlogLevel(0)))
 	if got := resolveGitTool(&config.Config{StoragePath: t.TempDir()}, logger); got != nil {
 		t.Fatalf("resolveGitTool = %+v, want nil when git-http-backend is absent", got)
 	}
 	log := buf.String()
-	if !strings.Contains(log, "level=WARN") {
-		t.Errorf("resolution failure was not logged at WARN: %s", log)
-	}
-	for _, want := range []string{"searched", "PATH=", "nowhere"} {
+	for _, want := range []string{"ERROR", "searched", "PATH=", "nowhere"} {
 		if !strings.Contains(log, want) {
-			t.Errorf("WARN does not name %q: %s", want, log)
+			t.Errorf("the startup log at the default level does not name %q: %s", want, log)
 		}
 	}
 }
