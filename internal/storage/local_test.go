@@ -247,9 +247,33 @@ func TestLocalAbsoluteKeyStaysInRoot(t *testing.T) {
 	}
 }
 
+// TestLocalLabel pins the resolved form rather than the configured one. On
+// macOS t.TempDir() hands back a /var/folders path whose first component is a
+// symlink to /private, so asserting the string that went in would assert the
+// absence of the canonicalization pkg move depends on.
 func TestLocalLabel(t *testing.T) {
 	root := t.TempDir()
-	if got, want := NewLocal(root).Label(), "file://"+root; got != want {
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatalf("resolve %s: %v", root, err)
+	}
+	if got, want := NewLocal(root).Label(), "file://"+resolved; got != want {
 		t.Errorf("Label() = %q, want %q", got, want)
+	}
+}
+
+// TestLocalTrailingSlashRootStillWrites covers the second defect the trailing
+// slash produced. path() tests its result against root + "/", so an
+// unnormalized "/srv/store/" root refused every key it was handed and the
+// artifact survived a move only by accident.
+func TestLocalTrailingSlashRootStillWrites(t *testing.T) {
+	root := t.TempDir()
+	l := NewLocal(root + string(filepath.Separator))
+	if err := l.Put(t.Context(), "a/b.txt", []byte("x")); err != nil {
+		t.Fatalf("Put on a root with a trailing slash: %v", err)
+	}
+	got, err := l.Get(t.Context(), "a/b.txt")
+	if err != nil || string(got) != "x" {
+		t.Fatalf("Get = %q, %v; want \"x\", nil", got, err)
 	}
 }

@@ -98,6 +98,12 @@ func TestAdmitRequiresTheBasics(t *testing.T) {
 		want string
 	}{
 		{"no name", &manifest.PackageManifest{Type: manifest.TypeNpm}, "name is required"},
+		// "." and ".." reach a manifest path outside their own type
+		// directory, where two types collide on one file. Every admitting
+		// surface refuses them, so a bulk import reports the entry beside
+		// its siblings rather than failing the whole request at the write.
+		{"dot name", &manifest.PackageManifest{Name: ".", Type: manifest.TypeNpm}, "path syntax"},
+		{"dotdot name", &manifest.PackageManifest{Name: "..", Type: manifest.TypeNpm}, "path syntax"},
 		{"no type", &manifest.PackageManifest{Name: "x"}, "type is required"},
 		{"unknown type", &manifest.PackageManifest{Name: "x", Type: "rpm"}, "unknown type"},
 	} {

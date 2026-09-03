@@ -104,6 +104,13 @@ func validate(cfg *config.Config, pm *manifest.PackageManifest, res *Result) err
 	if pm.Name == "" {
 		return fmt.Errorf("name is required")
 	}
+	// "." and ".." are the two names SafeName leaves as path syntax; see
+	// manifest.ValidatePackageName for what they collide with. Refused here so
+	// a bulk import reports the entry as invalid alongside its siblings rather
+	// than failing the request at the write.
+	if err := manifest.ValidatePackageName(pm.Name); err != nil {
+		return err
+	}
 	if pm.Type == "" {
 		return fmt.Errorf("type is required")
 	}

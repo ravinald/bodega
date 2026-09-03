@@ -5,7 +5,10 @@
 // DependencyGraph tracks inter-package relationships.
 package manifest
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // CurrentConfigVersion is the schema version written to all manifests.
 const CurrentConfigVersion = 1
@@ -316,6 +319,30 @@ type Index struct {
 // replacing "/" with "--". This is the inverse of unsafeName.
 func SafeName(name string) string {
 	return strings.ReplaceAll(name, "/", "--")
+}
+
+// ValidatePackageName rejects the two names SafeName cannot make into an
+// ordinary path segment.
+//
+// SafeName collapses "/" to "--", so a name contributes exactly one segment
+// and can never add a path level. "." and ".." survive that untouched and are
+// then resolved as path syntax: manifestPath("apt", "..") cleans to
+// manifest.json at the manifest root, the same file manifestPath("npm", "..")
+// cleans to, so two packages of different types share one manifest and the
+// second write replaces the first. "." lands at apt/manifest.json, inside the
+// type directory where no package belongs.
+//
+// The fix is a refusal here rather than an encoding in SafeName. SafeName is
+// half of a round trip — unsafeName reads a stored segment back into a name —
+// so a new encoding would need a matching decode, would not move the manifests
+// already written at the colliding path, and would change key derivation that
+// cmd/bodega/objectkeys_test.go and placement_test.go pin. Nothing legitimate
+// is named "." or "..", so refusing costs nothing and moves nothing.
+func ValidatePackageName(name string) error {
+	if name == "." || name == ".." {
+		return fmt.Errorf("invalid package name %q: it is path syntax, not a name — %q resolves to a manifest path outside its own type directory", name, name)
+	}
+	return nil
 }
 
 // versionedName returns "name@version" or just "name" when version is empty.
