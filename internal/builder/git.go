@@ -571,3 +571,53 @@ func fetchGitRelease(out io.Writer, d dirs, name string, ve manifest.VersionEntr
 	}
 	return nil
 }
+
+// gitArtifactLocal returns the on-disk path of the artifact one git version
+// uploads: the release tarball for a tagged release, the bundle for a clone.
+// It is the local twin of manifest.GitKey and has to stay in step with it, so
+// both take the same (name, ref, release) triple.
+func gitArtifactLocal(d dirs, name string, ve manifest.VersionEntry) string {
+	if ve.IsRelease() {
+		return gitReleaseArchive(d, name, ve)
+	}
+	return filepath.Join(d.bundles, safeName(name), safeName(name)+"-"+ve.Ref+".bundle")
+}
+
+// GitArtifactPaths returns the local path and object key for each git version
+// whose artifact exists on disk.
+//
+// One entry per version, not one sync of <build-root>/bundles. A whole-tree
+// sync has no per-version granularity, so it could not honor the backend a
+// version records and 'bodega pkg move' had to refuse the type outright. The
+// key is manifest.GitKey, the same derivation handleGitBundle reads through.
+func GitArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) []ArtifactPath {
+	ctx := context.Background()
+	d := buildDirs(cfg.rootFor(manifest.TypeGit))
+	var paths []ArtifactPath
+
+	for _, name := range store.ListPackages(manifest.TypeGit) {
+		if entryFilter != "" && name != entryFilter {
+			continue
+		}
+		pm, err := store.GetPackage(ctx, manifest.TypeGit, name)
+		if err != nil || pm == nil {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			if ve.Ref == "" {
+				continue
+			}
+			local := gitArtifactLocal(d, name, ve)
+			if fi, err := os.Stat(local); err != nil || fi.IsDir() {
+				continue
+			}
+			paths = append(paths, ArtifactPath{
+				Local:   local,
+				S3Key:   manifest.GitKey(pm.Name, ve.Ref, ve.IsRelease()),
+				Package: name,
+				Version: ve.Ref,
+			})
+		}
+	}
+	return paths
+}

@@ -231,19 +231,11 @@ func TestSelectForMoveGuards(t *testing.T) {
 			want: "already recorded",
 		},
 		{
+			// pypi is the last whole-directory type. apt and git left this
+			// list when their uploaders learned to walk manifest entries.
 			name: "pypi has no per-version object to move",
 			pm:   &manifest.PackageManifest{Type: manifest.TypePypi, Name: "requests"},
 			want: "no per-version object key",
-		},
-		{
-			name: "git uploads a whole directory, so one package cannot leave it",
-			pm:   &manifest.PackageManifest{Type: manifest.TypeGit, Name: "netbox", Versions: []manifest.VersionEntry{{Ref: "v4.5.5"}}},
-			want: "git is not movable",
-		},
-		{
-			name: "apt uploads a whole directory too",
-			pm:   &manifest.PackageManifest{Type: manifest.TypeApt, Name: "nginx", Versions: []manifest.VersionEntry{{Version: "1.24.0"}}},
-			want: "apt is not movable",
 		},
 		{
 			name:    "an unknown version names the ones that exist",

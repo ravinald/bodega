@@ -5,8 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -15,9 +13,12 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/inventory"
 	"github.com/ravinald/bodega/internal/logging"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/placement"
 	bos3 "github.com/ravinald/bodega/internal/s3"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 // cmdOutputMsg carries the text result of an executed command back to the
@@ -84,7 +85,7 @@ func builderCfg(buf *bytes.Buffer, cfg *config.Config) *builder.Config {
 
 // executeStage runs a specific build pipeline stage for a single entry and
 // returns a tea.Cmd that delivers the result as a cmdOutputMsg.
-func executeStage(stage BuildStage, entryType, entryName string, cfg *config.Config, store *manifest.Store, s3client *bos3.Client, force ...bool) tea.Cmd {
+func executeStage(stage BuildStage, entryType, entryName string, cfg *config.Config, store *manifest.Store, stores storage.Resolver, force ...bool) tea.Cmd {
 	return func() tea.Msg {
 		var buf bytes.Buffer
 		var err error
@@ -103,16 +104,16 @@ func executeStage(stage BuildStage, entryType, entryName string, cfg *config.Con
 		case StagePackage:
 			err = runPackageStage(&buf, bc, store, entryType, entryName)
 		case StageDeploy:
-			if s3client == nil {
-				err = fmt.Errorf("deploy requires a configured S3 bucket")
+			if stores == nil {
+				err = fmt.Errorf("deploy requires a configured storage backend")
 			} else {
-				err = runUpload(&buf, cfg, s3client, []string{entryType})
+				err = runUpload(&buf, cfg, store, stores, []string{entryType})
 				if err == nil {
 					refresh = true
 				}
 			}
 		case StageAll:
-			err = runFullPipeline(&buf, cfg, bc, store, s3client, entryType, entryName)
+			err = runFullPipeline(&buf, cfg, bc, store, stores, entryType, entryName)
 			if err == nil {
 				refresh = true
 			}
@@ -170,7 +171,7 @@ func runPackageStage(buf *bytes.Buffer, bc *builder.Config, store *manifest.Stor
 }
 
 // runFullPipeline runs fetch → build → package → upload for a single entry.
-func runFullPipeline(buf *bytes.Buffer, cfg *config.Config, bc *builder.Config, store *manifest.Store, s3client *bos3.Client, entryType, entryName string) error {
+func runFullPipeline(buf *bytes.Buffer, cfg *config.Config, bc *builder.Config, store *manifest.Store, stores storage.Resolver, entryType, entryName string) error {
 	// Fetch
 	if err := runFetch(buf, cfg, store, []string{entryType, "--entry", entryName}); err != nil {
 		return fmt.Errorf("fetch: %w", err)
@@ -184,18 +185,18 @@ func runFullPipeline(buf *bytes.Buffer, cfg *config.Config, bc *builder.Config, 
 		return fmt.Errorf("package: %w", err)
 	}
 	// Deploy
-	if s3client == nil {
-		fmt.Fprintf(buf, "Skipping deploy: no S3 bucket configured.\n")
+	if stores == nil {
+		fmt.Fprintf(buf, "Skipping deploy: no storage backend configured.\n")
 		return nil
 	}
-	return runUpload(buf, cfg, s3client, []string{entryType})
+	return runUpload(buf, cfg, store, stores, []string{entryType})
 }
 
 // executeSyncAll uploads all artifact types to S3 and returns a tea.Cmd.
-func executeSyncAll(types []string, cfg *config.Config, store *manifest.Store, s3client *bos3.Client) tea.Cmd {
+func executeSyncAll(types []string, cfg *config.Config, store *manifest.Store, stores storage.Resolver) tea.Cmd {
 	return func() tea.Msg {
 		var buf bytes.Buffer
-		err := runUpload(&buf, cfg, s3client, types)
+		err := runUpload(&buf, cfg, store, stores, types)
 		return cmdOutputMsg{output: buf.String(), refresh: err == nil, err: err}
 	}
 }
@@ -230,20 +231,20 @@ func executeFreeze(entryType, entryName string, store *manifest.Store, auditDB *
 
 // executeDelete removes the named entry from the manifest and returns a
 // tea.Cmd. refresh=true causes the sources tree to rebuild.
-func executeDelete(entryType, entryName string, store *manifest.Store, s3client *bos3.Client, cfg *config.Config, auditDB *audit.DB) tea.Cmd {
+func executeDelete(entryType, entryName string, store *manifest.Store, auditDB *audit.DB) tea.Cmd {
 	return func() tea.Msg {
 		var buf bytes.Buffer
-		err := runDelete(&buf, cfg, store, s3client, entryType, entryName, auditDB)
+		err := runDelete(&buf, store, entryType, entryName, auditDB)
 		return cmdOutputMsg{output: buf.String(), refresh: err == nil, err: err}
 	}
 }
 
 // executeRemoveFromS3 deletes the artifact from S3 without touching the
 // manifest and returns a tea.Cmd. refresh=true re-checks S3 status.
-func executeRemoveFromS3(entryType, entryName string, store *manifest.Store, s3client *bos3.Client, cfg *config.Config) tea.Cmd {
+func executeRemoveFromS3(entryType, entryName string, store *manifest.Store, stores storage.Resolver) tea.Cmd {
 	return func() tea.Msg {
 		var buf bytes.Buffer
-		err := runRemove(&buf, cfg, store, s3client, entryType, entryName)
+		err := runRemove(&buf, store, stores, entryType, entryName)
 		return cmdOutputMsg{output: buf.String(), refresh: err == nil, err: err}
 	}
 }
@@ -281,41 +282,30 @@ func runFetch(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, args
 	return nil
 }
 
-func runUpload(buf *bytes.Buffer, cfg *config.Config, s3client *bos3.Client, args []string) error {
-	if s3client == nil {
-		return fmt.Errorf("upload requires a configured S3 bucket")
+// runUpload writes each type's local artifacts through the placement hierarchy,
+// to the backend the manifest records for each version.
+//
+// It resolves through storage.Resolver rather than a bare S3 client, and
+// through internal/placement rather than its own switch. The switch it replaced
+// knew four of the eight types and reported the other four as "No artifacts",
+// carried its own copies of the key prefixes, and synced whole directories to
+// the default bucket whatever storage_by_type said.
+func runUpload(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, stores storage.Resolver, args []string) error {
+	if stores == nil {
+		return fmt.Errorf("upload requires a configured storage backend")
 	}
 	types, err := resolveTypes(args)
 	if err != nil {
 		return err
 	}
+	pl := placement.NewWith(stores, store, buf, false)
+	bc := builderCfg(buf, cfg)
 	ctx := context.Background()
 	for _, t := range types {
 		fmt.Fprintf(buf, "\n--- upload: %s ---\n", t)
-		var localDir, s3Prefix string
-		switch t {
-		case manifest.TypeBinary:
-			localDir = filepath.Join(cfg.BuildRoot, "binaries")
-			s3Prefix = manifest.BinaryPrefix
-		case manifest.TypeGit:
-			localDir = filepath.Join(cfg.BuildRoot, "bundles")
-			s3Prefix = manifest.GitPrefix
-		case manifest.TypeApt:
-			localDir = filepath.Join(cfg.BuildRoot, "apt-repo")
-			s3Prefix = manifest.AptPrefix
-		case manifest.TypePypi:
-			localDir = filepath.Join(cfg.BuildRoot, "wheels")
-			s3Prefix = manifest.PypiWheelPrefix
+		if _, err := pl.UploadType(ctx, bc, t); err != nil {
+			return err
 		}
-		if _, err := os.Stat(localDir); os.IsNotExist(err) {
-			fmt.Fprintf(buf, "    No artifacts at %s — skipping\n", localDir)
-			continue
-		}
-		n, err := s3client.SyncDir(ctx, buf, localDir, s3Prefix)
-		if err != nil {
-			return fmt.Errorf("upload %s: %w", t, err)
-		}
-		fmt.Fprintf(buf, "    Uploaded %d file(s)\n", n)
 	}
 	return nil
 }
@@ -334,8 +324,7 @@ func runInit(buf *bytes.Buffer, cfg *config.Config, s3client *bos3.Client) error
 	return bos3.InitBucket(context.Background(), s3client.S3Client(), cfg.Bucket, cfg.Region)
 }
 
-func runDelete(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, s3client *bos3.Client, entryType, name string, auditDB *audit.DB) error {
-	_ = cfg
+func runDelete(buf *bytes.Buffer, store *manifest.Store, entryType, name string, auditDB *audit.DB) error {
 	if !isValidType(entryType) {
 		return fmt.Errorf("unknown type %q", entryType)
 	}
@@ -378,15 +367,16 @@ func runDelete(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, s3c
 }
 
 // runRemove deletes every object backing an entry, keyed through
-// manifest.ArtifactKeys so the TUI removes what the uploader wrote.
+// inventory.ArtifactKeys so the TUI removes what the uploader wrote, on the
+// backend each version records.
 //
-// The TUI holds a bare S3 client rather than a storage.Resolver, so it can only
-// reach the default backend. A version recorded elsewhere is refused outright
-// instead of deleted from the wrong bucket, which both stores would report as
-// success.
-func runRemove(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, s3client *bos3.Client, entryType, name string) error {
-	if s3client == nil {
-		return fmt.Errorf("remove requires a configured S3 bucket")
+// Resolving no key is an error rather than a quiet success. Every Delete in
+// bodega is idempotent, so a delete aimed at a key nothing wrote reports the
+// same "Deleted." as one that worked, and this is the last place the two can
+// still be told apart.
+func runRemove(buf *bytes.Buffer, store *manifest.Store, stores storage.Resolver, entryType, name string) error {
+	if stores == nil {
+		return fmt.Errorf("remove requires a configured storage backend")
 	}
 	if !isValidType(entryType) {
 		return fmt.Errorf("unknown type %q", entryType)
@@ -406,27 +396,32 @@ func runRemove(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, s3c
 	removed := 0
 	for _, ve := range pm.Versions {
 		label := pm.Name + "@" + versionLabel(ve)
-		if ve.Storage != "" {
-			return fmt.Errorf("%s is recorded on storage backend %q, which the TUI cannot reach; "+
-				"use 'bodega pkg remove %s %s'", label, ve.Storage, entryType, name)
-		}
-		keys, err := manifest.ArtifactKeys(pm, ve)
+		backend := placement.EffectiveStorage(ve.Storage)
+		objStore, err := stores.ByName(ve.Storage)
 		if err != nil {
 			return fmt.Errorf("%s: %w", label, err)
 		}
+		keys, err := inventory.ArtifactKeys(ctx, objStore, pm, ve)
+		if err != nil {
+			return fmt.Errorf("%s: %w", label, err)
+		}
+		if len(keys) == 0 {
+			return fmt.Errorf("%s: no object key resolves on %q; refusing to report a delete that looked nowhere",
+				label, backend)
+		}
 		for _, key := range keys {
-			status, err := s3client.HeadObject(ctx, key)
+			status, err := objStore.Head(ctx, key)
 			if err != nil {
-				return fmt.Errorf("%s: head s3://%s/%s: %w", label, cfg.Bucket, key, err)
+				return fmt.Errorf("%s: head %s on %q: %w", label, key, backend, err)
 			}
 			if !status.Exists {
-				fmt.Fprintf(buf, "  %s: s3://%s/%s already absent\n", label, cfg.Bucket, key)
+				fmt.Fprintf(buf, "  %s: %s/%s already absent\n", label, objStore.Label(), key)
 				continue
 			}
-			if err := s3client.DeleteObject(ctx, key); err != nil {
-				return err
+			if err := objStore.Delete(ctx, key); err != nil {
+				return fmt.Errorf("%s: delete %s from %q: %w", label, key, backend, err)
 			}
-			fmt.Fprintf(buf, "  %s: deleted s3://%s/%s\n", label, cfg.Bucket, key)
+			fmt.Fprintf(buf, "  %s: deleted %s/%s\n", label, objStore.Label(), key)
 			removed++
 		}
 	}

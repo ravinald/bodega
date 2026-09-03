@@ -328,3 +328,32 @@ func ensurePackagedPypi(bcfg *builder.Config, store *manifest.Store) *builder.Su
 	}
 	return builder.MergeSummaries(ss...)
 }
+
+// ensureUploadable runs whatever cascade a type needs before its artifacts are
+// read off disk. One switch instead of one arm per type in each of the upload
+// commands, which is where the two drifted.
+func ensureUploadable(t string, bcfg *builder.Config, store *manifest.Store) error {
+	var s *builder.Summary
+	switch t {
+	case manifest.TypeBinary:
+		s = ensureFetchedBinaries(bcfg, store, "")
+	case manifest.TypeGit:
+		s = ensurePackagedGit(bcfg, store, "")
+	case manifest.TypeApt:
+		s = ensurePackagedApt(bcfg, store, "")
+	case manifest.TypePypi:
+		s = ensurePackagedPypi(bcfg, store)
+	case manifest.TypeGomod:
+		s = ensureFetchedGomod(bcfg, store, "")
+	case manifest.TypeHelm:
+		s = ensurePackagedHelm(bcfg, store, "")
+	case manifest.TypeNpm:
+		s = ensurePackagedNpm(bcfg, store, "")
+	case manifest.TypeCargo:
+		s = ensureFetchedCargo(bcfg, store, "")
+	}
+	if s.HasFailures() {
+		return fmt.Errorf("cascade for %s failed", t)
+	}
+	return nil
+}

@@ -8,8 +8,10 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -777,4 +779,103 @@ func splitLines(s string) []string {
 		lines = append(lines, s[start:])
 	}
 	return lines
+}
+
+// AptArtifactPaths returns the local path and object key for each apt version
+// whose .deb is in the local pool.
+//
+// One entry per version, not one sync of <build-root>/apt-repo. The pool is
+// walkable per package because PackageApt records each .deb's pool path on the
+// version entry, and manifest.AptKey turns that into the same key the Packages
+// index publishes as Filename. dists/ is not here and never was: the server
+// generates every suite's index per request, so there is nothing on disk to
+// upload and nothing type-scoped left in this path.
+//
+// An entry written before the _pool_path metadata key existed, or one whose
+// control extraction failed, is resolved against a listing of the local pool —
+// the same name_version_arch lookup the server and 'build status' use, so all
+// three agree on which object backs the entry.
+func AptArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) []ArtifactPath {
+	ctx := context.Background()
+	d := buildDirs(cfg.rootFor(manifest.TypeApt))
+	var paths []ArtifactPath
+	var pool map[string]string // basename -> path relative to the apt prefix
+
+	for _, name := range store.ListPackages(manifest.TypeApt) {
+		if entryFilter != "" && name != entryFilter {
+			continue
+		}
+		pm, err := store.GetPackage(ctx, manifest.TypeApt, name)
+		if err != nil || pm == nil {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			rel := ve.Metadata["_pool_path"]
+			if rel == "" {
+				if pool == nil {
+					pool = walkAptPool(d.aptRepo)
+				}
+				srcName := ve.SourceName
+				if srcName == "" {
+					srcName = pm.Name
+				}
+				rel = findDebInLocalPool(pool, srcName, ve.Version, ve.Metadata["Architecture"])
+			}
+			if rel == "" {
+				continue
+			}
+			local := filepath.Join(d.aptRepo, filepath.FromSlash(rel))
+			if fi, err := os.Stat(local); err != nil || fi.IsDir() {
+				continue
+			}
+			paths = append(paths, ArtifactPath{
+				Local:   local,
+				S3Key:   manifest.AptKey(rel),
+				Package: name,
+				Version: ve.Version,
+			})
+		}
+	}
+	return paths
+}
+
+// walkAptPool maps each pooled .deb basename to its path relative to the apt
+// prefix, which is the form _pool_path and the published Filename both take.
+func walkAptPool(aptRepo string) map[string]string {
+	pool := map[string]string{}
+	root := filepath.Join(aptRepo, "pool")
+	_ = filepath.WalkDir(root, func(p string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() || !strings.HasSuffix(entry.Name(), ".deb") {
+			return nil //nolint:nilerr // an unreadable subtree is a .deb this upload cannot see, not a reason to abort the rest
+		}
+		relFS, relErr := filepath.Rel(aptRepo, p)
+		if relErr != nil {
+			return nil
+		}
+		pool[entry.Name()] = filepath.ToSlash(relFS)
+		return nil
+	})
+	return pool
+}
+
+// findDebInLocalPool mirrors inventory.findDebInPool so an entry with no
+// _pool_path uploads to the key the server will look for. The prefix pass is
+// sorted rather than a map walk: an ambiguous name must resolve to the same
+// .deb on every run, or two uploads publish two different artifacts.
+func findDebInLocalPool(pool map[string]string, pkgName, version, arch string) string {
+	if rel, ok := pool[pkgName+"_"+version+"_"+arch+".deb"]; ok {
+		return rel
+	}
+	prefix := pkgName + "_" + version
+	bases := make([]string, 0, len(pool))
+	for base := range pool {
+		if strings.HasPrefix(base, prefix) {
+			bases = append(bases, base)
+		}
+	}
+	if len(bases) == 0 {
+		return ""
+	}
+	sort.Strings(bases)
+	return pool[bases[0]]
 }

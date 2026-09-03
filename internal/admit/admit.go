@@ -241,21 +241,21 @@ func versionLabel(ve manifest.VersionEntry) string {
 
 // DirectoryPlaced reports whether a type uploads as a whole directory, which
 // is what makes a per-package storage policy inert for it.
+//
+// pypi is the only one. apt and git were here until their uploaders learned to
+// walk manifest entries — a .deb has a per-version key through its pool path
+// and a bundle through its ref — and both are placed and moved per package
+// now. A pypi version has no object key at all: wheels land under one prefix
+// and the PEP 503 index is a listing over the whole tree, so a package placed
+// on another backend would drop out of the index that finds it.
 func DirectoryPlaced(typ string) bool {
-	switch typ {
-	case manifest.TypeApt, manifest.TypeGit, manifest.TypePypi:
-		return true
-	}
-	return false
+	return typ == manifest.TypePypi
 }
 
 // NoPerPackagePlacement says why one type cannot carry a per-package
 // placement, in whichever terms that type's operator will recognize.
 func NoPerPackagePlacement(typ string) string {
-	if typ == manifest.TypePypi {
-		return "pypi wheels upload as a directory with no per-version object key"
-	}
-	return typ + " uploads whole directories with SyncDir, so one package cannot be placed apart from the rest of its type"
+	return typ + " wheels upload as a directory with no per-version object key, so one package cannot be placed apart from the rest of its type"
 }
 
 // StoragePolicyWarning describes a storage_policy the write path will ignore.

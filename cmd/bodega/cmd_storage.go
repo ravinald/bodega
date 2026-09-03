@@ -23,9 +23,9 @@ storage_policy, then storage_by_type for its type, then the default backend.
 Naming the winning level is the point — "bulk" on its own does not say whether
 a package policy took effect or a forgotten type rule did.
 
-apt, git and pypi upload a whole directory at a time, so the package level is
-not consulted for them and a storage_policy on one of their packages changes
-nothing. This says so rather than reporting a level the upload will not use.
+pypi uploads a whole directory at a time, so the package level is not consulted
+for it and a storage_policy on a pypi package changes nothing. This says so
+rather than reporting a level the upload will not use.
 
 This is the WRITE side. It says nothing about where versions already uploaded
 live; each of those records its own backend, and 'bodega show pkg' prints it.`,

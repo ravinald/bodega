@@ -69,6 +69,9 @@ func artifactPathUpload(paths []builder.ArtifactPath, dst storage.ObjectStore, t
 	return keys
 }
 
+// syncDirUpload is pypi's uploader, and only pypi's. Every other type resolves
+// one key per version through its ArtifactPaths function; a whole-tree sync has
+// no per-version granularity, which is what kept apt and git unmovable.
 func syncDirUpload(t *testing.T, dst storage.ObjectStore, localDir, prefix string) []string {
 	t.Helper()
 	if _, err := dst.SyncDir(t.Context(), io.Discard, localDir, prefix); err != nil {
@@ -118,7 +121,7 @@ func objectKeyCases(t *testing.T) []keyCase {
 				"bundles/netbox-community--netbox/netbox-community--netbox-v4.5.7.bundle": "bundle-bytes",
 			},
 			upload: func(t *testing.T, bcfg *builder.Config, store *manifest.Store, dst storage.ObjectStore) []string {
-				return syncDirUpload(t, dst, filepath.Join(bcfg.BuildRoot, "bundles"), "repos/")
+				return artifactPathUpload(builder.GitArtifactPaths(bcfg, store, ""), dst, t)
 			},
 			url: "/git/netbox-community--netbox/netbox-community--netbox-v4.5.7.bundle",
 		},
@@ -138,7 +141,7 @@ func objectKeyCases(t *testing.T) []keyCase {
 				"apt-repo/pool/main/a/acme/acme_1.0_amd64.deb": "deb-bytes",
 			},
 			upload: func(t *testing.T, bcfg *builder.Config, store *manifest.Store, dst storage.ObjectStore) []string {
-				return syncDirUpload(t, dst, filepath.Join(bcfg.BuildRoot, "apt-repo"), manifest.AptPrefix)
+				return artifactPathUpload(builder.AptArtifactPaths(bcfg, store, ""), dst, t)
 			},
 			url: "/apt/pool/main/a/acme/acme_1.0_amd64.deb",
 		},

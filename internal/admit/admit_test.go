@@ -67,8 +67,10 @@ func TestAdmitRefusesAVersionlessAptEntry(t *testing.T) {
 // was legal when it was written.
 func TestAdmitWarnsWithoutRefusing(t *testing.T) {
 	cfg := &config.Config{StorageBackends: map[string]config.StorageSpec{"bulk": {Driver: "local"}}}
-	pm := aptPkg("hello", "2.10")
-	pm.StoragePolicy = "bulk"
+	pm := &manifest.PackageManifest{
+		Name: "requests", Type: manifest.TypePypi, StoragePolicy: "bulk",
+		Versions: []manifest.VersionEntry{{Version: "2.32.3"}},
+	}
 
 	res := Admit(t.Context(), nil, nil, cfg, pm, "")
 	if !res.OK() {
@@ -81,12 +83,16 @@ func TestAdmitWarnsWithoutRefusing(t *testing.T) {
 		t.Errorf("the warning does not name what would work: %q", res.Warnings[0])
 	}
 
-	npm := &manifest.PackageManifest{
-		Name: "lodash", Type: manifest.TypeNpm, StoragePolicy: "bulk",
-		Versions: []manifest.VersionEntry{{Version: "4.17.21"}},
-	}
-	if res := Admit(t.Context(), nil, nil, cfg, npm, ""); len(res.Warnings) != 0 {
-		t.Errorf("npm places per package, so its storage_policy is honored and needs no warning: %v", res.Warnings)
+	// Every other type places per package, apt and git included since their
+	// uploaders started walking manifest entries.
+	for _, typ := range []string{manifest.TypeNpm, manifest.TypeApt, manifest.TypeGit} {
+		per := &manifest.PackageManifest{
+			Name: "lodash", Type: typ, StoragePolicy: "bulk",
+			Versions: []manifest.VersionEntry{{Version: "4.17.21", Ref: "v4.17.21"}},
+		}
+		if res := Admit(t.Context(), nil, nil, cfg, per, ""); len(res.Warnings) != 0 {
+			t.Errorf("%s places per package, so its storage_policy is honored and needs no warning: %v", typ, res.Warnings)
+		}
 	}
 }
 
