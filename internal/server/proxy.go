@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
@@ -29,6 +30,8 @@ type CacheConfig struct {
 }
 
 // proxyOrCache serves an S3 object, optionally fetching from upstream on miss.
+// A miss is streamed: the upstream body goes to a spool file and out from
+// there, so per-request memory is a copy buffer rather than the artifact.
 //
 // For immutable resources (versioned artifacts), once cached they are never
 // re-fetched. For mutable resources (list files, indexes), the object is
@@ -131,18 +134,17 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 
 	s.logger.Info("cache miss, fetching upstream", "key", s3Key, "upstream", upstreamURL)
 
-	data, ct, err := fetchUpstream(ctx, upstreamURL)
-	if err != nil {
-		// A stale copy beats both error paths below: the upstream said
-		// something went wrong, and what bodega already holds is the better
-		// answer than either status code.
+	// A stale copy beats both error paths here: the upstream said something
+	// went wrong, and what bodega already holds is the better answer than
+	// either status code. "The upstream does not publish this" is not a
+	// gateway failure, and conflating the two makes every unpublished path
+	// read as an outage.
+	fail := func(err error) {
 		if status != nil && status.Exists {
 			s.logger.Error("upstream fetch failed, serving the stale cached copy", "url", upstreamURL, "error", err)
 			s.proxyS3(w, r, store, s3Key)
 			return
 		}
-		// "the upstream does not publish this" is not a gateway failure, and
-		// conflating the two makes every unpublished path read as an outage.
 		if errors.Is(err, errUpstreamNotFound) {
 			s.logger.Debug("upstream has no such object", "url", upstreamURL)
 			http.NotFound(w, r)
@@ -150,11 +152,27 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 		}
 		s.logger.Error("upstream fetch failed", "url", upstreamURL, "error", err)
 		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
-		return
 	}
 
-	// Checksum verification.
-	if err := s.verifyProxyChecksum(ctx, s3Key, data, immutable); err != nil {
+	up, err := openUpstream(ctx, upstreamURL)
+	if err != nil {
+		fail(err)
+		return
+	}
+	defer up.body.Close()
+
+	spool, err := spoolUpstream(up)
+	if err != nil {
+		fail(err)
+		return
+	}
+	defer spool.close()
+
+	// Verification comes off the digest computed during the copy, and it comes
+	// before a byte reaches the client. A tee straight to the response would
+	// have already handed the client an artifact by the time the mismatch is
+	// known, and a truncated response is not a refusal.
+	if err := s.verifyProxyChecksum(ctx, s3Key, spool.sha256, immutable); err != nil {
 		s.logger.Error("checksum verification failed", "key", s3Key, "error", err)
 		http.Error(w, "checksum verification failed — upstream content may be tampered", http.StatusBadGateway)
 		return
@@ -165,25 +183,34 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	// them separately is how a cache entry lands in a backend the next Head
 	// never looks at.
 	if store != nil {
-		if err := store.Put(ctx, s3Key, data); err != nil {
+		if err := store.PutFile(ctx, spool.path(), s3Key); err != nil {
 			s.logger.Warn("failed to cache object", "key", s3Key, "error", err)
 		} else {
-			s.logger.Debug("cached object", "key", s3Key, "bytes", len(data))
+			s.logger.Debug("cached object", "key", s3Key, "bytes", spool.size)
 		}
 	}
 
-	// Serve the fetched data directly.
+	ct := up.contentType
 	if ct == "" {
 		ct = contentTypeForKey(s3Key)
 	}
 	if ct == "" {
 		ct = "application/octet-stream"
 	}
+	if _, err := spool.file.Seek(0, io.SeekStart); err != nil {
+		s.logger.Error("could not rewind the spooled artifact", "key", s3Key, "error", err)
+		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
+		return
+	}
 	w.Header().Set("Content-Type", ct)
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", spool.size))
 	w.WriteHeader(http.StatusOK)
 	//nolint:gosec // G705: response body is the upstream artifact bytes; Content-Type is set above.
-	_, _ = w.Write(data)
+	if _, err := io.Copy(w, spool.file); err != nil {
+		// The status line is already out, so there is nothing to tell the
+		// client. The object is cached and the next request serves it.
+		s.logger.Warn("client read of a proxied artifact was cut short", "key", s3Key, "error", err)
+	}
 }
 
 // cacheEnabled returns true if the proxy/cache feature is active.
@@ -249,16 +276,16 @@ func validateUpstreamURL(rawURL string) error {
 // legitimately lacks.
 var errUpstreamNotFound = errors.New("the upstream does not publish this")
 
-// maxUpstreamBody caps a buffered upstream body. proxyOrCache holds a whole
-// artifact in memory before responding, so without a ceiling a few concurrent
-// large fetches take the process out.
+// maxUpstreamBody caps an upstream body a caller reads into memory whole.
+//
+// It covers the two metadata fetches that have to parse what they get — the
+// npm packument and the pypi simple index — and no longer covers artifacts:
+// proxyOrResolve spools those to disk and streams them, so their size is
+// bounded by the spool filesystem rather than by process memory.
 //
 // Exceeding it is an error, never a truncation. io.LimitReader reports EOF at
 // its limit and io.ReadAll returns that as a complete body with a nil error,
-// which is indistinguishable downstream from a whole artifact: the short bytes
-// were checksummed as authoritative, cached under that digest, and served to
-// every client afterwards, and a later fetch of the real artifact then failed
-// verification against the digest of the truncated one.
+// which is indistinguishable downstream from a whole body.
 //
 // A variable rather than a constant so a test can drive the over-limit path
 // without moving a quarter of a gigabyte through it. Nothing in the shipped
@@ -273,41 +300,130 @@ var maxUpstreamBody int64 = 256 << 20
 // unexported, and internal/server has no non-test caller that assigns to it.
 var upstreamGuard = validateUpstreamURL
 
-// fetchUpstream downloads a URL and returns the body bytes and content type.
-func fetchUpstream(ctx context.Context, rawURL string) ([]byte, string, error) {
+// upstreamStream is one upstream response whose body has not been read. The
+// caller closes body.
+type upstreamStream struct {
+	url           string
+	body          io.ReadCloser
+	contentType   string
+	contentLength int64 // -1 when the upstream declared none
+}
+
+// openUpstream performs the fetch and maps its status, leaving the body for
+// the caller to read or to stream. It is the one place the SSRF guard and the
+// 404-versus-outage distinction live.
+func openUpstream(ctx context.Context, rawURL string) (*upstreamStream, error) {
 	if err := upstreamGuard(rawURL); err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	//nolint:gosec // G704: rawURL was just validated by validateUpstreamURL above (https-only, non-loopback, non-private).
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 
 	//nolint:gosec // G704: see comment on NewRequestWithContext above; URL is validated.
 	resp, err := upstreamClient.Do(req)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, "", fmt.Errorf("%w: %s returned 404", errUpstreamNotFound, rawURL)
+		resp.Body.Close()
+		return nil, fmt.Errorf("%w: %s returned 404", errUpstreamNotFound, rawURL)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, "", fmt.Errorf("upstream returned %d: %s", resp.StatusCode, rawURL)
+		resp.Body.Close()
+		return nil, fmt.Errorf("upstream returned %d: %s", resp.StatusCode, rawURL)
 	}
 
+	return &upstreamStream{
+		url:           rawURL,
+		body:          resp.Body,
+		contentType:   resp.Header.Get("Content-Type"),
+		contentLength: resp.ContentLength,
+	}, nil
+}
+
+// spooledUpstream is an upstream body written to a temp file, with the digest
+// computed on the way through.
+//
+// Disk rather than memory is what removes the size ceiling: an artifact costs
+// one copy buffer of process memory whatever its length, so a handful of
+// concurrent large fetches no longer takes the process out. The spool lives in
+// os.TempDir(), so TMPDIR is what has to hold the largest artifact bodega
+// proxies — a small tmpfs there is the one place the old limit reappears.
+type spooledUpstream struct {
+	file   *os.File
+	size   int64
+	sha256 string
+}
+
+func (sp *spooledUpstream) path() string { return sp.file.Name() }
+
+// close removes the spool file. The name is read before the descriptor is
+// closed because that is the only handle on it: the file is not unlinked at
+// creation, since PutFile takes a path.
+func (sp *spooledUpstream) close() {
+	name := sp.file.Name()
+	_ = sp.file.Close()
+	_ = os.Remove(name)
+}
+
+// spoolUpstream copies an upstream body to a temp file, hashing as it goes,
+// and returns it positioned at EOF.
+//
+// A body shorter than the length the upstream declared is a cut transfer and
+// fails here rather than being cached: chunked and transparently-decompressed
+// responses report -1 and are exempt, so this only fires where the upstream
+// stated a number. Caching short bytes was the failure that made every later
+// fetch of the real artifact fail verification against the truncated digest.
+func spoolUpstream(up *upstreamStream) (*spooledUpstream, error) {
+	f, err := os.CreateTemp("", "bodega-upstream-*")
+	if err != nil {
+		return nil, fmt.Errorf("create spool file: %w", err)
+	}
+	sp := &spooledUpstream{file: f}
+
+	h := sha256.New()
+	n, err := io.Copy(io.MultiWriter(f, h), up.body)
+	sp.size = n
+	if err != nil {
+		// net/http reports a cut transfer as ErrUnexpectedEOF here, before the
+		// declared-length check below ever runs, so this message has to carry
+		// the same fact: the spool is removed and nothing was cached.
+		sp.close()
+		return nil, fmt.Errorf("read upstream body from %s after %d bytes: %w — nothing was cached; retry, and check the upstream if it repeats", up.url, n, err)
+	}
+	if up.contentLength >= 0 && n != up.contentLength {
+		sp.close()
+		return nil, fmt.Errorf("upstream sent %d bytes against a declared Content-Length of %d: %s — the transfer was cut and nothing was cached; retry, and check the upstream if it repeats",
+			n, up.contentLength, up.url)
+	}
+	sp.sha256 = hex.EncodeToString(h.Sum(nil))
+	return sp, nil
+}
+
+// fetchUpstream downloads a URL into memory and returns the body bytes and
+// content type. For a caller that has to parse what it gets; an artifact goes
+// through openUpstream and spoolUpstream instead.
+func fetchUpstream(ctx context.Context, rawURL string) ([]byte, string, error) {
+	up, err := openUpstream(ctx, rawURL)
+	if err != nil {
+		return nil, "", err
+	}
+	defer up.body.Close()
+
 	// A declared length over the cap is refusable before a byte is read.
-	if resp.ContentLength > maxUpstreamBody {
-		return nil, "", fmt.Errorf("upstream declares %d bytes, over bodega's %d-byte buffer: %s — nothing was cached; the proxy path buffers a whole artifact before responding and cannot carry this one",
-			resp.ContentLength, maxUpstreamBody, rawURL)
+	if up.contentLength > maxUpstreamBody {
+		return nil, "", fmt.Errorf("upstream declares %d bytes, over bodega's %d-byte buffer: %s — nothing was cached; this response has to be parsed in memory and cannot carry that much",
+			up.contentLength, maxUpstreamBody, rawURL)
 	}
 
 	// One byte past the cap. Anything read there means the body was longer
 	// than the buffer, which has to fail rather than return short bytes the
 	// checksum would then bless.
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamBody+1))
+	data, err := io.ReadAll(io.LimitReader(up.body, maxUpstreamBody+1))
 	if err != nil {
 		return nil, "", fmt.Errorf("read upstream body: %w", err)
 	}
@@ -318,32 +434,31 @@ func fetchUpstream(ctx context.Context, rawURL string) ([]byte, string, error) {
 	// A body shorter than the length the upstream declared is a cut transfer.
 	// Chunked and transparently-decompressed responses report -1 and are
 	// exempt, so this only fires where the upstream stated a number.
-	if resp.ContentLength >= 0 && int64(len(data)) != resp.ContentLength {
+	if up.contentLength >= 0 && int64(len(data)) != up.contentLength {
 		return nil, "", fmt.Errorf("upstream sent %d bytes against a declared Content-Length of %d: %s — the transfer was cut and nothing was cached; retry, and check the upstream if it repeats",
-			len(data), resp.ContentLength, rawURL)
+			len(data), up.contentLength, rawURL)
 	}
 
-	return data, resp.Header.Get("Content-Type"), nil
+	return data, up.contentType, nil
 }
 
-// verifyProxyChecksum verifies the SHA-256 of fetched data against the stored
+// verifyProxyChecksum verifies a fetched artifact's SHA-256 against the stored
 // checksum in the audit DB. On first fetch (no stored checksum), it stores the
-// computed digest. On mismatch, returns an error — the caller should NOT cache
-// or serve the data.
+// computed digest. On mismatch, returns an error — the caller must NOT cache
+// or serve the artifact.
+//
+// It takes the digest rather than the bytes: the artifact is streamed to a
+// spool file and hashed on the way, so nothing here ever holds it.
 //
 // Only runs for immutable resources (versioned artifacts). Mutable resources
 // (list files, indexes) change by design and are not checksummed.
-func (s *Server) verifyProxyChecksum(ctx context.Context, s3Key string, data []byte, immutable bool) error {
+func (s *Server) verifyProxyChecksum(ctx context.Context, s3Key, computed string, immutable bool) error {
 	if !immutable {
 		return nil // mutable resources are not checksummed
 	}
 	if s.auditDB == nil {
 		return nil // no audit DB, skip verification
 	}
-
-	// Compute SHA-256 of the fetched data.
-	h := sha256.Sum256(data)
-	computed := hex.EncodeToString(h[:])
 
 	// Look up stored checksum.
 	stored, err := s.auditDB.GetChecksum(ctx, s3Key)

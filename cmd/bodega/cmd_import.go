@@ -199,7 +199,18 @@ func decodeManifests(data []byte) ([]manifest.PackageManifest, error) {
 // writing any non-fatal warning to out. It is the structure half of
 // admit.Admit, exposed for callers that have no policy checker to run.
 func validateManifest(pm *manifest.PackageManifest, cfg *config.Config, out io.Writer) error {
-	res := admit.Admit(context.Background(), nil, nil, cfg, pm, "")
+	return admitManifest(context.Background(), nil, pm, cfg, out)
+}
+
+// admitManifest runs admit.Admit with the given allow-list checker and no
+// audit database, writing any non-fatal warning to out.
+//
+// The nil audit DB is what keeps a caller read-only: checkAllowList records a
+// policy_violation event only when it has one, and the age and OSV checks need
+// one to run at all. So a checker alone buys the URL allow-list and nothing
+// that writes.
+func admitManifest(ctx context.Context, checker *policy.Checker, pm *manifest.PackageManifest, cfg *config.Config, out io.Writer) error {
+	res := admit.Admit(ctx, checker, nil, cfg, pm, "")
 	for _, w := range res.Warnings {
 		fmt.Fprintf(out, "%s/%s: %s\n", pm.Type, pm.Name, w)
 	}

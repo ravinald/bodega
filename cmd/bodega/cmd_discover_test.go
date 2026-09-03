@@ -14,6 +14,7 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 )
 
 // discoverEnv is a scratch install: a config file the CLI resolves through
@@ -805,5 +806,78 @@ func TestGenerateManifestsReportsRowsItCannotUse(t *testing.T) {
 		if !strings.Contains(errOut, want) {
 			t.Errorf("summary does not mention %q: %s", want, errOut)
 		}
+	}
+}
+
+// seedPolicy inserts one allow-list rule directly, which is what
+// 'bodega policy add' writes.
+func (e *discoverEnv) seedPolicy(t *testing.T, regType, kind, pattern string) {
+	t.Helper()
+	db, err := audit.Open(e.auditDB)
+	if err != nil {
+		t.Fatalf("open audit db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := db.InsertPolicy(context.Background(), audit.PolicyInfo{
+		ID:           "test-" + pattern,
+		RegistryType: regType,
+		RuleKind:     kind,
+		Pattern:      pattern,
+	}); err != nil {
+		t.Fatalf("insert policy: %v", err)
+	}
+}
+
+// TestGenerateManifestsAppliesTheAllowList is issue #167. The generator called
+// admit.Admit with a nil checker, which disables checkAllowList outright, so a
+// package the allow-list refuses passed generation and then aborted 'bodega
+// pkg import' partway through the file with the packages ahead of it already
+// written.
+func TestGenerateManifestsAppliesTheAllowList(t *testing.T) {
+	env := newDiscoverEnv(t)
+	env.seedDiscovery(t, gomodMiss())
+	env.seedPolicy(t, manifest.TypeGomod, policy.KindPrefix, "github.com/hashicorp/")
+
+	out, errOut, err := runDiscoverSplit(t, "generate-manifests")
+	if err != nil {
+		t.Fatalf("generate-manifests: %v", err)
+	}
+	if pms := decodeGenerated(t, out); len(pms) != 0 {
+		t.Fatalf("a package the allow-list refuses reached the payload: %s", out)
+	}
+	if !strings.Contains(errOut, "WARN skipped (gomod, github.com/aws/aws-sdk-go-v2)") {
+		t.Errorf("the skip does not name the refused package: %s", errOut)
+	}
+
+	// Read-only is the other half of the contract: the allow-list check runs
+	// with no audit database behind it, so nothing records the refusal here.
+	db, err := audit.Open(env.auditDB)
+	if err != nil {
+		t.Fatalf("open audit db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	n, err := db.Count(context.Background(), audit.Filter{})
+	if err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("generate-manifests wrote %d audit event(s); the command reads", n)
+	}
+}
+
+// A package the allow-list permits is unaffected, which is what keeps the
+// check from reading as "generation stopped working".
+func TestGenerateManifestsEmitsWhatTheAllowListPermits(t *testing.T) {
+	env := newDiscoverEnv(t)
+	env.seedDiscovery(t, gomodMiss())
+	env.seedPolicy(t, manifest.TypeGomod, policy.KindPrefix, "github.com/aws/")
+
+	out, _, err := runDiscoverSplit(t, "generate-manifests")
+	if err != nil {
+		t.Fatalf("generate-manifests: %v", err)
+	}
+	pms := decodeGenerated(t, out)
+	if len(pms) != 1 || pms[0].Name != "github.com/aws/aws-sdk-go-v2" {
+		t.Fatalf("an allowed package did not reach the payload: %s", out)
 	}
 }

@@ -38,7 +38,10 @@ func (s *Server) handleAptPool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	poolPath := "pool/" + p
-	setCacheImmutable(w, path.Base(p))
+	// Wrapped rather than set: the outcome is not known here, and a refusal
+	// that ships a year-long "immutable" outlives the policy change that would
+	// have corrected it. Covers handleAptMirrorPool below, which inherits w.
+	w = cacheImmutableOn200(w, path.Base(p))
 	store, err := s.aptPoolStore(poolPath)
 	if err != nil {
 		s.logger.Error("storage backend recorded for pooled .deb is not configured",
@@ -504,11 +507,22 @@ func (s *Server) aptPoolMapForIndex(ctx context.Context, served []string) (map[s
 	if len(fallbacks) == 0 {
 		return nil, nil
 	}
+	mirrored, err := s.aptMirroredPoolKeys(ctx)
+	if err != nil {
+		// Fallback resolution stops; the rest of the index does not. Entries
+		// that carry _pool_path address their object directly and are
+		// unaffected, and failing the whole snapshot over this would take a
+		// mirroring instance's apt repository down for a reason unrelated to
+		// any of its packages. auditAptEntries reports each dropped entry.
+		s.logger.Warn("cannot tell a mirrored .deb from a built one, so no apt entry without _pool_path reaches the index",
+			"error", err)
+		return nil, nil
+	}
 	keys, err := s.aptPoolKeys(ctx)
 	if err != nil {
 		return nil, err
 	}
-	poolMap := aptPoolMap(keys)
+	poolMap := aptPoolMap(keys, mirrored)
 	if s.aptAllResolve(poolMap, fallbacks) {
 		return poolMap, nil
 	}
@@ -516,7 +530,48 @@ func (s *Server) aptPoolMapForIndex(ctx context.Context, served []string) (map[s
 	if err != nil {
 		return nil, err
 	}
-	return aptPoolMap(fresh), nil
+	return aptPoolMap(fresh, mirrored), nil
+}
+
+// aptMirroredPoolKeys returns the pool keys a mirrored fetch wrote. A manifest
+// entry resolved by filename must never land on one of them: the bytes are the
+// archive's, and publishing them under bodega's own signature tells a host
+// that trusts the archive key it is installing the operator's build.
+//
+// The audit checksum table is the record. proxyOrCache stores a row per cached
+// artifact with source "computed" on first fetch, and under the apt prefix
+// nothing else writes that source — an entry bodega built carries its digest
+// in the manifest and never reaches verifyProxyChecksum.
+//
+// Fail closed twice over. An instance with no upstreams configured holds
+// nothing in pool/ bodega did not put there, so the query is skipped and the
+// answer is nil. An instance that does mirror and cannot read the table has no
+// way to tell the two apart, so every pool object counts as mirrored: the
+// fallback entry drops out of the index, which auditAptEntries already reports
+// as unpooled.
+func (s *Server) aptMirroredPoolKeys(ctx context.Context) (map[string]bool, error) {
+	if len(s.cfg.AptUpstreams) == 0 {
+		return nil, nil
+	}
+	if s.auditDB == nil {
+		return nil, errors.New("apt upstreams are configured but no audit database is open, so a cached upstream .deb cannot be told from a built one; entries without _pool_path stay out of the index until the audit database is reachable")
+	}
+	// Listed untyped, then filtered on the key prefix. The pkg_type column
+	// cannot answer this: verifyProxyChecksum derives it with
+	// parsePackagePath, which reads a request path, and no case there matches
+	// the "packages/apt/" key prefix — so every mirrored .deb is recorded with
+	// an empty type. The key is the column that is right by construction.
+	rows, err := s.auditDB.ListChecksums(ctx, "", "")
+	if err != nil {
+		return nil, fmt.Errorf("list mirrored apt checksums: %w", err)
+	}
+	mirrored := make(map[string]bool)
+	for _, row := range rows {
+		if row.Source == "computed" && strings.HasPrefix(row.S3Key, manifest.AptPoolPrefix) {
+			mirrored[row.S3Key] = true
+		}
+	}
+	return mirrored, nil
 }
 
 // aptAllResolve reports whether every fallback entry finds an object in
@@ -531,12 +586,21 @@ func (s *Server) aptAllResolve(poolMap map[string]string, fallbacks []aptFallbac
 }
 
 // aptPoolMap indexes a pool listing by base filename, which is what
-// findDebInPool matches on, and carries the path a Filename field needs.
-func aptPoolMap(keys []string) map[string]string {
+// findDebInPool matches on, and carries the path a Filename field needs. Keys
+// in mirrored are left out; see aptMirroredPoolKeys for what they are.
+//
+// A nil map and an empty one are different answers here: nil means the caller
+// established there is nothing to exclude, empty means it established the
+// exclusion set is empty. Both leave every key in, which is why the caller
+// returns an error rather than an empty set when it cannot tell.
+func aptPoolMap(keys []string, mirrored map[string]bool) map[string]string {
 	poolMap := make(map[string]string, len(keys))
 	for _, key := range keys {
 		filename := path.Base(key)
 		if !strings.HasSuffix(filename, ".deb") {
+			continue
+		}
+		if mirrored[key] {
 			continue
 		}
 		poolMap[filename] = strings.TrimPrefix(key, manifest.AptPrefix)
@@ -1122,22 +1186,21 @@ func (s *Server) generateAptPackages(ctx context.Context, suite, arch string, po
 	return buf.Bytes()
 }
 
-// findDebInPool searches the pool map for a .deb matching the given package name,
-// version, and architecture.
+// findDebInPool resolves a manifest entry that carries no _pool_path to a pool
+// object, by the exact Debian binary package filename and nothing looser.
+//
+// There used to be a second pass matching on the "<pkg>_<version>" prefix. It
+// dropped the architecture, so an arm64 entry resolved to whatever amd64
+// object happened to sit in the pool, and it iterated a map, so which one it
+// picked changed between runs. Both mattered the moment pool/ started holding
+// artifacts bodega did not build: the resulting stanza carries no SHA256 —
+// that field comes from the same metadata _pool_path does — so a client has
+// nothing to check the substitution against.
+//
+// An entry whose object is named anything else now reaches no index, and
+// auditAptEntries names it as unpooled on every rebuild.
 func (s *Server) findDebInPool(poolMap map[string]string, pkgName, version, arch string) string {
-	// Try the standard Debian naming convention first.
-	candidate := pkgName + "_" + version + "_" + arch + ".deb"
-	if rel, ok := poolMap[candidate]; ok {
-		return rel
-	}
-	// Fallback: scan all pool entries for a match containing name and version.
-	prefix := pkgName + "_" + version
-	for filename, rel := range poolMap {
-		if strings.HasPrefix(filename, prefix) {
-			return rel
-		}
-	}
-	return ""
+	return poolMap[pkgName+"_"+version+"_"+arch+".deb"]
 }
 
 // writeDebField writes a single "Key: Value" line to buf, sanitizing val to

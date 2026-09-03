@@ -203,6 +203,21 @@ func waitForAptRows(t *testing.T, s *Server, decision string, want int) []audit.
 	return nil
 }
 
+// mirrorGetHeader is mirrorGet for a test that asserts on response headers
+// rather than on the body.
+func mirrorGetHeader(t *testing.T, s *Server, path string) (int, http.Header) {
+	t.Helper()
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+	resp, err := http.Get(ts.URL + path) //nolint:gosec,noctx // test-owned loopback URL
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode, resp.Header
+}
+
 func mirrorGet(t *testing.T, s *Server, path string) (int, []byte) {
 	t.Helper()
 	ts := httptest.NewServer(s.Handler())
@@ -666,5 +681,191 @@ func TestAptDistsImmutable(t *testing.T) {
 		if got := aptDistsImmutable(tc.path); got != tc.want {
 			t.Errorf("aptDistsImmutable(%q) = %v, want %v", tc.path, got, tc.want)
 		}
+	}
+}
+
+// TestAuditFallbackEntryAdoptsMirroredDeb is issue #170: a manifest entry with
+// no _pool_path resolves against the whole pool, which on a mirroring instance
+// holds artifacts bodega never built. The stanza that results carries no
+// SHA256 and no Size, so nothing client-side catches the substitution — the
+// host trusts bodega's archive key and installs an upstream binary believing
+// it is the operator's build.
+func TestAuditFallbackEntryAdoptsMirroredDeb(t *testing.T) {
+	upstreamBytes := "\x21<arch>\nbytes from ports.ubuntu.com, not from the build"
+	archive := newFixtureArchive(t, map[string]string{fixtureDeb: upstreamBytes})
+	s := mirrorServer(t, archive)
+
+	// A legacy entry: name, version, arch, published to the generated suite,
+	// no _pool_path and no _sha256.
+	if err := s.store.AddVersion(t.Context(), manifest.TypeApt, "nginx", manifest.VersionEntry{
+		Version:    "1.24.0-2ubuntu7.1",
+		SourceName: "nginx",
+		Suites:     []string{"local"},
+		Metadata:   map[string]string{"Architecture": "amd64"},
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+
+	// A client installs from the mirrored suite; bodega caches the upstream .deb.
+	if code, _ := mirrorGet(t, s, "/apt/"+fixtureDeb); code != http.StatusOK {
+		t.Fatalf("mirrored pool fetch failed")
+	}
+	s.rebuildAptSnapshot(t.Context())
+
+	code, body := mirrorGet(t, s, "/apt/dists/local/main/binary-amd64/Packages")
+	if code != http.StatusOK {
+		t.Fatalf("generated Packages = %d, want 200", code)
+	}
+	if strings.Contains(string(body), "Filename: "+fixtureDeb) {
+		t.Errorf("bodega's signed index publishes the cached upstream artifact:\n%s", body)
+	}
+}
+
+// TestAuditFallbackEntryCrossesArchitecture is the second half of #170: the
+// prefix pass in findDebInPool drops the architecture, so an arm64 entry
+// resolves to the amd64 artifact sitting in the pool.
+func TestAuditFallbackEntryCrossesArchitecture(t *testing.T) {
+	upstreamBytes := "\x21<arch>\nbytes from ports.ubuntu.com, not from the build"
+	archive := newFixtureArchive(t, map[string]string{fixtureDeb: upstreamBytes})
+	s := mirrorServer(t, archive)
+
+	if err := s.store.AddVersion(t.Context(), manifest.TypeApt, "nginx", manifest.VersionEntry{
+		Version:    "1.24.0-2ubuntu7.1",
+		SourceName: "nginx",
+		Suites:     []string{"local"},
+		Metadata:   map[string]string{"Architecture": "arm64"},
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+
+	if code, _ := mirrorGet(t, s, "/apt/"+fixtureDeb); code != http.StatusOK {
+		t.Fatalf("mirrored pool fetch failed")
+	}
+	s.rebuildAptSnapshot(t.Context())
+
+	code, body := mirrorGet(t, s, "/apt/dists/local/main/binary-arm64/Packages")
+	if code != http.StatusOK {
+		t.Fatalf("generated arm64 Packages = %d, want 200", code)
+	}
+	if strings.Contains(string(body), "Filename: "+fixtureDeb) {
+		t.Errorf("an arm64 entry published the amd64 artifact:\n%s", body)
+	}
+}
+
+// TestPoolCacheControlFollowsTheOutcome is issue #171. handleAptPool set
+// Cache-Control before it knew whether the request would succeed, and
+// http.Error does not clear the header map — so a refusal shipped
+// "public, max-age=31536000, immutable" and any caching proxy in front of the
+// client held it for a year, outliving the "bodega policy add apt <host>" that
+// was supposed to fix it.
+func TestPoolCacheControlFollowsTheOutcome(t *testing.T) {
+	const immutable = "public, max-age=31536000, immutable"
+
+	t.Run("denied", func(t *testing.T) {
+		archive := newFixtureArchive(t, map[string]string{fixtureDeb: fixtureDebBody})
+		s := mirrorServer(t, archive)
+		if err := s.auditDB.InsertPolicy(t.Context(), audit.PolicyInfo{
+			ID:           "apt-allow-elsewhere",
+			RegistryType: manifest.TypeApt,
+			RuleKind:     policy.KindHost,
+			Pattern:      "archive.ubuntu.com",
+		}); err != nil {
+			t.Fatalf("insert policy: %v", err)
+		}
+		s.policy.Invalidate()
+
+		code, hdr := mirrorGetHeader(t, s, "/apt/"+fixtureDeb)
+		if code != http.StatusForbidden {
+			t.Fatalf("pool fetch = %d, want 403", code)
+		}
+		if got := hdr.Get("Cache-Control"); got != "" {
+			t.Errorf("403 carries Cache-Control %q; a caching proxy would hold the refusal", got)
+		}
+	})
+
+	t.Run("no archive publishes it", func(t *testing.T) {
+		archive := newFixtureArchive(t, map[string]string{fixtureDeb: fixtureDebBody})
+		s := mirrorServer(t, archive)
+
+		code, hdr := mirrorGetHeader(t, s, "/apt/"+fallbackDeb)
+		if code != http.StatusNotFound {
+			t.Fatalf("pool fetch = %d, want 404", code)
+		}
+		if got := hdr.Get("Cache-Control"); got != "" {
+			t.Errorf("404 carries Cache-Control %q", got)
+		}
+	})
+
+	t.Run("served", func(t *testing.T) {
+		archive := newFixtureArchive(t, map[string]string{fixtureDeb: fixtureDebBody})
+		s := mirrorServer(t, archive)
+
+		code, hdr := mirrorGetHeader(t, s, "/apt/"+fixtureDeb)
+		if code != http.StatusOK {
+			t.Fatalf("pool fetch = %d, want 200", code)
+		}
+		if got := hdr.Get("Cache-Control"); got != immutable {
+			t.Errorf("Cache-Control = %q, want %q — a cached .deb is still immutable", got, immutable)
+		}
+
+		// The second request is the cache-hit path through proxyS3, which
+		// takes a different route to the same header.
+		code, hdr = mirrorGetHeader(t, s, "/apt/"+fixtureDeb)
+		if code != http.StatusOK {
+			t.Fatalf("cached pool fetch = %d, want 200", code)
+		}
+		if got := hdr.Get("Cache-Control"); got != immutable {
+			t.Errorf("cache hit Cache-Control = %q, want %q", got, immutable)
+		}
+	})
+}
+
+// A .deb uploaded out of band still resolves: the exclusion is on the objects
+// the mirror wrote, not on the fallback path itself. Without this the fix for
+// #170 would have retired the out-of-band upload route instead of protecting
+// it.
+func TestOutOfBandDebStillResolves(t *testing.T) {
+	archive := newFixtureArchive(t, map[string]string{fixtureDeb: fixtureDebBody})
+	s := mirrorServer(t, archive)
+
+	if err := s.store.AddVersion(t.Context(), manifest.TypeApt, "htop", manifest.VersionEntry{
+		Version:    "3.3.0-4build1",
+		SourceName: "htop",
+		Suites:     []string{"local"},
+		Metadata:   map[string]string{"Architecture": "amd64"},
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+	// Written straight to storage, which is what an out-of-band upload is: no
+	// _pool_path on the entry and no checksum row for the object.
+	if err := s.typeStore(manifest.TypeApt).Put(t.Context(), manifest.AptKey(fallbackDeb), []byte(fallbackDebBody)); err != nil {
+		t.Fatalf("seed pool object: %v", err)
+	}
+	s.rebuildAptSnapshot(t.Context())
+
+	code, body := mirrorGet(t, s, "/apt/dists/local/main/binary-amd64/Packages")
+	if code != http.StatusOK {
+		t.Fatalf("generated Packages = %d, want 200", code)
+	}
+	if !strings.Contains(string(body), "Filename: "+fallbackDeb) {
+		t.Errorf("an out-of-band .deb did not reach the index:\n%s", body)
+	}
+
+	// With no audit database there is no way to tell that object from one the
+	// mirror cached, so it drops out rather than being published on a guess.
+	// Restored on the way out: newDiscoveryServer's own cleanup closes this
+	// handle, and cleanups run last-registered-first.
+	saved := s.auditDB
+	t.Cleanup(func() { s.auditDB = saved })
+	s.auditDB = nil
+	s.aptPool.Store(nil)
+	s.rebuildAptSnapshot(t.Context())
+
+	code, body = mirrorGet(t, s, "/apt/dists/local/main/binary-amd64/Packages")
+	if code != http.StatusOK {
+		t.Fatalf("generated Packages = %d, want 200", code)
+	}
+	if strings.Contains(string(body), "Filename: "+fallbackDeb) {
+		t.Errorf("an unverifiable pool object was published anyway:\n%s", body)
 	}
 }

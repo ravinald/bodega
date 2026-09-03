@@ -93,9 +93,19 @@ func (s *Server) handleBinaryUpstream(w http.ResponseWriter, r *http.Request, ns
 	// applied at config load, but a Server built in code carries whatever mode
 	// it was handed, and the branch that fetches on demand is the one that has
 	// to be opted into by name.
+	//
+	// The verdict is the manifest's own recorded name, not the lookup
+	// succeeding. GetPackage addresses a manifest through SafeName, which maps
+	// "/" to "--" and is therefore not injective: "vendor/tool--2.0/tool.tar.gz"
+	// and "vendor/tool/2.0/tool.tar.gz" fold to one stored name, so cataloging
+	// either would authorize both — and the client controls every byte of
+	// <rest>. Comparing pm.Name is injective where the path is not, and needs
+	// no encoding change under the manifests already written. Refusing a
+	// "--" in <rest> was the alternative; it would also refuse the legitimate
+	// upstream paths that contain one.
 	if bu.Mode != config.UpstreamModeOpen {
 		pm, _ := s.store.GetPackage(ctx, manifest.TypeBinary, pkgName)
-		if pm == nil {
+		if pm == nil || pm.Name != pkgName {
 			s.recordNoManifest(ctx, r, manifest.TypeBinary, pkgName, "", upstream)
 			http.NotFound(w, r)
 			return

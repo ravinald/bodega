@@ -338,3 +338,35 @@ func TestBinaryCatalogHitProceeds(t *testing.T) {
 	}
 	assertNoRows(t, s)
 }
+
+// TestBinaryCatalogSafeNameCollision is issue #151. GetPackage addresses a
+// manifest through SafeName, which maps "/" to "--", so the client-controlled
+// path "vendor/tool--2.0/tool.tar.gz" folds to the same stored name as the
+// cataloged "vendor/tool/2.0/tool.tar.gz" and inherits its authorization.
+//
+// 404 rather than 502 is the assertion: .invalid resolves nowhere, so a fetch
+// that was attempted is visible as a gateway error.
+func TestBinaryCatalogSafeNameCollision(t *testing.T) {
+	s := binaryServer(t, "observe")
+	pkg := "vendor/tool/2.0/tool.tar.gz"
+	if err := s.store.AddVersion(t.Context(), manifest.TypeBinary, pkg, manifest.VersionEntry{
+		Version: "2.0",
+		URL:     "https://dl.vendor.invalid/tool/2.0/tool.tar.gz",
+		Mode:    manifest.ModeProxy,
+	}); err != nil {
+		t.Fatalf("seed manifest: %v", err)
+	}
+
+	collided := "vendor/tool--2.0/tool.tar.gz"
+	if manifest.SafeName(collided) != manifest.SafeName(pkg) {
+		t.Fatalf("fixture no longer collides: %q vs %q", manifest.SafeName(collided), manifest.SafeName(pkg))
+	}
+	if got := getBinary(t, s, "/binaries/"+collided); got != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 — a path that merely collides with a cataloged one must not reach upstream", got)
+	}
+
+	rows := waitForBinaryRows(t, s, audit.DecisionNoManifest, 1)
+	if rows[0].PkgName != collided {
+		t.Errorf("pkg_name = %q, want %q", rows[0].PkgName, collided)
+	}
+}
