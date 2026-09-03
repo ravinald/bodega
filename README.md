@@ -4,7 +4,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/ravinald/bodega.svg)](https://pkg.go.dev/github.com/ravinald/bodega)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-A self-hosted package repository manager backed by pluggable object storage. Fetches, builds, and serves seven package types to standard clients without leaving your network.
+A self-hosted package repository manager backed by pluggable object storage. Fetches, builds, and serves eight package types to standard clients without leaving your network.
 
 | Type | Client | Protocol |
 |------|--------|----------|
@@ -15,12 +15,13 @@ A self-hosted package repository manager backed by pluggable object storage. Fet
 | gomod | `go get` | GOPROXY |
 | helm | `helm install` | Chart repository |
 | npm | `npm install` | npm registry |
+| cargo | `cargo` | Sparse registry index |
 
 ## Features
 
 - **Pipeline**: fetch → build → upload with automatic stage cascading
-- **HTTP(S) server**: serves all 7 types to native clients, REST API, TLS support
-- **Proxy/cache**: optional upstream caching for gomod, helm, npm
+- **HTTP(S) server**: serves all 8 types to native clients, REST API, TLS support
+- **Proxy/cache**: optional upstream caching for gomod, helm, npm, cargo
 - **TUI**: three-pane interactive terminal interface (sources, details, log)
 - **Web dashboard**: live metrics, status view, copy-to-clipboard utilities
 - **Audit trail**: SQLite database recording every fetch, build, and mutation
@@ -28,7 +29,7 @@ A self-hosted package repository manager backed by pluggable object storage. Fet
 - **Manifest integrity**: MD5 verification on every read/write
 - **Access control**: IP-based mutation API gating with optional Bearer token auth
 - **Host import**: read a host's own installed set (`dpkg-query`, `pip`, `npm`, `go`, `cargo`, `helm`) and catalog it in one push
-- **Supply chain control**: hide bad versions, freeze known-good artifacts
+- **Supply chain control**: hide bad versions, freeze known-good artifacts. See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for what bodega protects against and the distribution formats (snap, flatpak, AppImage auto-updaters, Homebrew casks) that are intentionally out of scope.
 
 ## Quick start
 

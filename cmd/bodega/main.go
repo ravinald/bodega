@@ -218,6 +218,7 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 		noReloadSignal(newServeCmd(gf)),
 		signalsReload(newRepairCmd(gf)),
 		signalsReload(newResetCmd(gf)),
+		noReloadSignal(newDoctorCmd(gf)),
 	)
 
 	return root
