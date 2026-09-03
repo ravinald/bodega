@@ -34,6 +34,7 @@ func newDiscoveryServer(t *testing.T) *Server {
 		DiscoverMode:   "observe",
 		GomodUpstream:  "https://proxy.golang.org",
 		NpmUpstream:    "https://registry.npmjs.org",
+		PypiUpstream:   "https://pypi.org",
 		AllowPlaintext: true,
 	}
 	s := newServer(cfg, manifest.NewLocalStore(t.TempDir()), storage.NewSingle(storage.NewMemory()),
@@ -107,7 +108,10 @@ func TestUnknownPackageRecordsNoManifest(t *testing.T) {
 		typ, pkg, version, upstream string
 	}{
 		{manifest.TypeGomod, "github.com/aws/aws-sdk-go-v2", "v1.30.0", "https://proxy.golang.org/github.com/aws/aws-sdk-go-v2/@v/v1.30.0.info"},
-		{manifest.TypePypi, "boto3", "1.26.0", "https://pypi.org/packages/boto3-1.26.0-py3-none-any.whl"},
+		// The simple index, not the artifact: a wheel URL is read out of that
+		// index rather than composed, so it is the only URL this branch knows
+		// without a network fetch of its own.
+		{manifest.TypePypi, "boto3", "1.26.0", "https://pypi.org/simple/boto3/"},
 		{manifest.TypeNpm, "lodash", "4.17.21", "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz"},
 		// helm chart repos are named per version entry, so with no entry there
 		// is no URL to record. The empty column is what promote reports back.

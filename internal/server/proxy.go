@@ -53,6 +53,24 @@ type CacheConfig struct {
 // If proxy/cache is disabled or upstreamURL is empty, falls back to direct
 // S3 proxy.
 func (s *Server) proxyOrCache(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, s3Key, upstreamURL, regType, policyCandidate, discoveryPkgName string, immutable, forceProxy bool) {
+	var resolve upstreamResolver
+	if upstreamURL != "" {
+		resolve = func(context.Context) (string, error) { return upstreamURL, nil }
+	}
+	s.proxyOrResolve(w, r, store, s3Key, resolve, regType, policyCandidate, discoveryPkgName, immutable, forceProxy)
+}
+
+// upstreamResolver produces the URL a cache miss should fetch. It runs only
+// after the cache read has missed, because pypi has to read the simple index
+// to learn a wheel's content-hash path and a cache hit must not pay for a
+// network round trip to a URL it will never use.
+//
+// A resolver that returns errUpstreamNotFound is refusing on the upstream's
+// behalf: the object it was asked for is not published. Anything else is a
+// failure to look.
+type upstreamResolver func(ctx context.Context) (string, error)
+
+func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, s3Key string, resolve upstreamResolver, regType, policyCandidate, discoveryPkgName string, immutable, forceProxy bool) {
 	if !s.requireStorage(w, store) {
 		return
 	}
@@ -78,13 +96,30 @@ func (s *Server) proxyOrCache(w http.ResponseWriter, r *http.Request, store stor
 	}
 
 	// Cache miss or stale — fetch from upstream if proxy is enabled.
-	if (!s.cacheEnabled() && !forceProxy) || upstreamURL == "" {
+	if (!s.cacheEnabled() && !forceProxy) || resolve == nil {
 		if status != nil && status.Exists {
 			// Stale but no upstream — serve what we have.
 			s.proxyS3(w, r, store, s3Key)
 			return
 		}
 		http.NotFound(w, r)
+		return
+	}
+
+	upstreamURL, err := resolve(ctx)
+	if err != nil {
+		if status != nil && status.Exists {
+			s.logger.Error("upstream resolution failed, serving the stale cached copy", "key", s3Key, "error", err)
+			s.proxyS3(w, r, store, s3Key)
+			return
+		}
+		if errors.Is(err, errUpstreamNotFound) {
+			s.logger.Info("upstream publishes no such artifact", "key", s3Key, "error", err)
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		s.logger.Error("upstream resolution failed", "key", s3Key, "error", err)
+		http.Error(w, "upstream resolution failed", http.StatusBadGateway)
 		return
 	}
 
@@ -199,16 +234,20 @@ func validateUpstreamURL(rawURL string) error {
 	return nil
 }
 
-// errUpstreamNotFound reports that the upstream answered 404, which is a
-// different thing from the upstream being unreachable and has to reach the
-// client as a different status.
+// errUpstreamNotFound reports that the upstream does not publish the object,
+// which is a different thing from the upstream being unreachable and has to
+// reach the client as a different status.
+//
+// Two things produce it: a 404 from the fetch, and a pypi simple index that
+// answered 200 and listed no such file. The message states the shared fact
+// rather than the mechanism, because each wrapper names its own.
 //
 // apt makes the distinction load-bearing: an archive publishes no Packages for
 // an architecture or component it does not carry, and apt treats that 404 as
 // the ordinary "not published here" and moves on. A 502 in its place is a
 // server fault the operator has to chase, on every arch and component a mirror
 // legitimately lacks.
-var errUpstreamNotFound = errors.New("upstream returned 404")
+var errUpstreamNotFound = errors.New("the upstream does not publish this")
 
 // maxUpstreamBody caps a buffered upstream body. proxyOrCache holds a whole
 // artifact in memory before responding, so without a ceiling a few concurrent
@@ -253,7 +292,7 @@ func fetchUpstream(ctx context.Context, rawURL string) ([]byte, string, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, "", fmt.Errorf("%w: %s", errUpstreamNotFound, rawURL)
+		return nil, "", fmt.Errorf("%w: %s returned 404", errUpstreamNotFound, rawURL)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, "", fmt.Errorf("upstream returned %d: %s", resp.StatusCode, rawURL)

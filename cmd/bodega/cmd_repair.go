@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 
 	"github.com/spf13/cobra"
 
@@ -24,8 +25,9 @@ func newRepairCmd(gf *globalFlags) *cobra.Command {
      their dependencies discovered and linked
   3. Artifact sizes: backfill ArtifactSize from local files
   4. Apt placeholders: version-less apt entries left beside a resolved one
-  5. Manifest sync: all manifests are re-saved to the backend (S3)
-  6. Graph rebuild: dependency edges are rebuilt from RequiredBy fields
+  5. Pypi URLs: entries carrying the retired pypi.org/packages/ wheel URL
+  6. Manifest sync: all manifests are re-saved to the backend (S3)
+  7. Graph rebuild: dependency edges are rebuilt from RequiredBy fields
 
   bodega repair                          # detect and fix
   bodega repair check                    # detect only, no changes`,
@@ -138,9 +140,13 @@ func newRepairCmd(gf *globalFlags) *cobra.Command {
 			fmt.Println("\nPhase 4: Checking apt entries for version-less placeholders...")
 			issues += repairAptPlaceholders(ctx, store, dryRun, os.Stdout)
 
-			// Phase 5: Re-sync manifests to backend.
+			// Phase 5: Retired pypi wheel URLs.
+			fmt.Println("\nPhase 5: Checking pypi entries for the retired wheel URL...")
+			issues += repairPypiWheelURLs(ctx, store, dryRun, os.Stdout)
+
+			// Phase 6: Re-sync manifests to backend.
 			if !dryRun {
-				fmt.Println("\nPhase 5: Re-syncing manifests to backend...")
+				fmt.Println("\nPhase 6: Re-syncing manifests to backend...")
 				synced := 0
 				for _, typ := range manifest.AllTypes {
 					for _, name := range store.ListPackages(typ) {
@@ -193,6 +199,57 @@ func newRepairCmd(gf *globalFlags) *cobra.Command {
 
 	cmd.AddCommand(newRepairKeysCmd(gf))
 	return cmd
+}
+
+// pypiWheelURLPattern matches the wheel URL bodega composed before wheels were
+// resolved through the simple index.
+var pypiWheelURLPattern = regexp.MustCompile(`^(https?://[^/]+)/packages/[^/]+$`)
+
+// repairPypiWheelURLs rewrites a pypi entry's URL from the retired
+// <index>/packages/<filename> shape to the registry root, and reports how many
+// it found.
+//
+// pypi.org has never served /packages/, so every entry `discover promote --as
+// manifest` wrote under the old handler records a fetch that 404s. Nothing
+// reads the field today — internal/builder/pypi.go resolves wheels through pip
+// and the server resolves them through the simple index — so the stored value
+// is inert rather than dangerous, and that is exactly why it would otherwise
+// sit there uncorrected until someone taught the builder to trust it. The
+// registry root is what the field means for pypi now, matching gomod and npm.
+//
+// An entry whose URL points anywhere else is left alone: an operator who wrote
+// their own index URL by hand is not describing this defect.
+func repairPypiWheelURLs(ctx context.Context, store *manifest.Store, dryRun bool, out io.Writer) int {
+	issues := 0
+	for _, name := range store.ListPackages(manifest.TypePypi) {
+		pm, err := store.GetPackage(ctx, manifest.TypePypi, name)
+		if err != nil || pm == nil {
+			continue
+		}
+		changed := 0
+		for i, ve := range pm.Versions {
+			m := pypiWheelURLPattern.FindStringSubmatch(ve.URL)
+			if m == nil {
+				continue
+			}
+			issues++
+			fmt.Fprintf(out, "  DEAD URL: pypi/%s@%s records %s, which pypi does not serve\n", name, ve.Version, ve.URL)
+			if dryRun {
+				continue
+			}
+			pm.Versions[i].URL = m[1]
+			changed++
+		}
+		if changed == 0 {
+			continue
+		}
+		if err := store.SavePackage(ctx, pm); err != nil {
+			fmt.Fprintf(out, "    ERROR: could not rewrite them: %v\n", err)
+			continue
+		}
+		fmt.Fprintf(out, "    -> rewrote %d to the registry root\n", changed)
+	}
+	return issues
 }
 
 // repairAptPlaceholders drops version-less apt entries that sit beside a
