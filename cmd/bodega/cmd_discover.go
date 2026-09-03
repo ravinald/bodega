@@ -823,7 +823,12 @@ func generateManifests(gf *globalFlags, out, errOut io.Writer, regType string, o
 		}
 	}
 
-	pms, sum, err := buildGeneratedManifests(ctx, store, cfg, errOut, rows, opts)
+	// The allow-list half of the import's admission check, with no audit
+	// database behind it so the command stays read-only. Without a checker,
+	// admit.Admit skips checkAllowList entirely and generation emitted
+	// packages the import would refuse — which is the abort halfway through a
+	// file this command exists to spare the operator.
+	pms, sum, err := buildGeneratedManifests(ctx, store, policy.NewChecker(adb), cfg, errOut, rows, opts)
 	if err != nil {
 		return err
 	}
@@ -862,6 +867,7 @@ type generateKey struct {
 func buildGeneratedManifests(
 	ctx context.Context,
 	store *manifest.Store,
+	checker *policy.Checker,
 	cfg *config.Config,
 	errOut io.Writer,
 	rows []audit.DiscoveryRow,
@@ -946,10 +952,12 @@ func buildGeneratedManifests(
 			Type:          k.Type,
 			Versions:      generatedVersions(entries),
 		}
-		// The import applies this same check and aborts the whole file on the
-		// first refusal, leaving the store half-written. Refusing the entry
-		// here costs the operator one package instead.
-		if err := validateManifest(&pm, cfg, errOut); err != nil {
+		// The import applies these same checks and aborts the whole file on
+		// the first refusal, leaving the store half-written. Refusing the
+		// entry here costs the operator one package instead. The age and OSV
+		// checks are not among them: they record audit events, and this
+		// command reads.
+		if err := admitManifest(ctx, checker, &pm, cfg, errOut); err != nil {
 			sum.InvalidPkgs++
 			fmt.Fprintf(errOut, "WARN skipped (%s, %s): %v\n", k.Type, k.Name, err)
 			continue

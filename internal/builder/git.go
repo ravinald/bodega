@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -441,11 +442,20 @@ func GitWorktreePath(buildRoot, name, ref string) (string, error) {
 	return workDir, nil
 }
 
-// fetchGitHubSHA256 attempts to download a SHA256 checksum from the source.
-// GitHub release archives don't have built-in checksums, but some projects
-// publish them as release assets (e.g. SHA256SUMS or <ref>.sha256). This
-// function tries common patterns and returns the hex digest, or empty string
-// if no source checksum is available.
+// fetchGitHubSHA256 returns the digest a project published for the archive
+// this build downloaded, or "" when no published line names that file.
+//
+// GitHub release archives carry no built-in checksum; some projects publish
+// one as a release asset (SHA256SUMS, sha256sums.txt). The line has to name
+// the archive. Matching any line ending in ".tar.gz" compared the digest of
+// some other artifact against this one, and a release publishing more than one
+// tarball is the ordinary shape — so the caller either failed the build with
+// "source checksum mismatch" or wrote "verified" provenance into the manifest
+// on a comparison that established nothing.
+//
+// "No line names this file" is not a fallback to a looser match. It is the
+// absence of a source checksum, which the caller already handles by recording
+// the computed digest unverified.
 func fetchGitHubSHA256(out io.Writer, ve manifest.VersionEntry) string {
 	base := strings.TrimSuffix(ve.URL, ".git")
 	// Try: <repo>/releases/download/<ref>/SHA256SUMS
@@ -453,22 +463,37 @@ func fetchGitHubSHA256(out io.Writer, ve manifest.VersionEntry) string {
 		base + "/releases/download/" + ve.Ref + "/SHA256SUMS",
 		base + "/releases/download/" + ve.Ref + "/sha256sums.txt",
 	}
+	// The archive fetchGitRelease downloaded, by the name the upstream serves
+	// it under — which is what a published SHA256SUMS line names.
+	want := path.Base(releaseURL(ve.URL, ve.Ref))
 	for _, url := range candidates {
 		data, err := httpGetBody(url)
 		if err != nil || len(data) == 0 {
 			continue
 		}
-		// Parse SHA256SUMS format: "<hash>  <filename>" or "<hash> <filename>"
-		for _, line := range strings.Split(string(data), "\n") {
-			fields := strings.Fields(line)
-			if len(fields) >= 2 && len(fields[0]) == 64 {
-				// Look for a line matching the tarball filename.
-				tarName := ve.Ref + ".tar.gz"
-				if strings.Contains(fields[1], tarName) || strings.HasSuffix(fields[1], ".tar.gz") {
-					_, _ = fmt.Fprintf(out, "    Found source checksum at %s\n", url)
-					return strings.ToLower(fields[0])
-				}
-			}
+		if sum := sha256SumFor(string(data), want); sum != "" {
+			_, _ = fmt.Fprintf(out, "    Found source checksum for %s at %s\n", want, url)
+			return sum
+		}
+	}
+	return ""
+}
+
+// sha256SumFor reads a SHA256SUMS body and returns the digest recorded for
+// filename, or "" when no line names it.
+//
+// The format is "<hash>  <filename>", with a leading "*" on the name in
+// coreutils binary mode and a directory prefix where the sums were generated
+// from a subdirectory. Both are stripped before the comparison; nothing else
+// is.
+func sha256SumFor(body, filename string) string {
+	for _, line := range strings.Split(body, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || len(fields[0]) != 64 {
+			continue
+		}
+		if path.Base(strings.TrimPrefix(fields[1], "*")) == filename {
+			return strings.ToLower(fields[0])
 		}
 	}
 	return ""

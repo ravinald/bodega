@@ -1553,10 +1553,77 @@ func (s *Server) proxyS3(w http.ResponseWriter, r *http.Request, store storage.O
 // setCacheImmutable adds Cache-Control: public, max-age=31536000, immutable
 // for artifact types that are content-addressed and never overwritten.
 func setCacheImmutable(w http.ResponseWriter, filename string) {
-	ext := path.Ext(filename)
-	switch ext {
-	case ".whl", ".deb", ".bundle", ".tgz":
+	if isImmutableArtifact(filename) {
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	}
+}
+
+// isImmutableArtifact reports whether a filename names bytes that never change
+// under their own name.
+func isImmutableArtifact(filename string) bool {
+	switch path.Ext(filename) {
+	case ".whl", ".deb", ".bundle", ".tgz":
+		return true
+	}
+	return false
+}
+
+// cacheImmutableOn200 defers the Cache-Control header to a response that earns
+// it, returning w unchanged for a filename that was never going to get one.
+//
+// Setting it up front is wrong in a way nothing local reveals: http.Error does
+// not clear the header map, so a 403 from the allow-list and a 404 from an
+// archive that does not publish the path both shipped a year-long "immutable".
+// An operator who then runs "bodega policy add apt <host>" has fixed nothing
+// for any client behind a caching proxy that believed the first answer, and
+// has no way to reach into it.
+func cacheImmutableOn200(w http.ResponseWriter, filename string) http.ResponseWriter {
+	if !isImmutableArtifact(filename) {
+		return w
+	}
+	return &immutableWriter{ResponseWriter: w}
+}
+
+// immutableWriter sets Cache-Control on the way out, once, and only when the
+// status is 200.
+//
+// ReadFrom and Flush are forwarded explicitly. Embedding an interface promotes
+// only that interface's methods, so without them a wrapped writer loses the
+// sendfile path proxyS3's io.Copy takes and stops being an http.Flusher.
+type immutableWriter struct {
+	http.ResponseWriter
+	started bool
+}
+
+func (iw *immutableWriter) WriteHeader(code int) {
+	iw.begin(code)
+	iw.ResponseWriter.WriteHeader(code)
+}
+
+func (iw *immutableWriter) Write(b []byte) (int, error) {
+	iw.begin(http.StatusOK)
+	return iw.ResponseWriter.Write(b)
+}
+
+func (iw *immutableWriter) ReadFrom(r io.Reader) (int64, error) {
+	iw.begin(http.StatusOK)
+	return io.Copy(iw.ResponseWriter, r)
+}
+
+func (iw *immutableWriter) Flush() {
+	if f, ok := iw.ResponseWriter.(http.Flusher); ok {
+		iw.begin(http.StatusOK)
+		f.Flush()
+	}
+}
+
+func (iw *immutableWriter) begin(code int) {
+	if iw.started {
+		return
+	}
+	iw.started = true
+	if code == http.StatusOK {
+		iw.ResponseWriter.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	}
 }
 

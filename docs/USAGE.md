@@ -639,7 +639,7 @@ The output is the same shape [`bodega pkg convert`](#bodega-pkg-convert-type-fil
 
 `--min-requests` is the flag to reach for on a fleet: a discovery table fills with one-off CI probes, and without a signal filter they land in the catalog beside the packages that matter. Read the count for what it is: the log records upstream fetches, not client requests, so a warm cache under-reports it and a package everyone uses can rank below one nobody does.
 
-Every generated manifest passes the same validator `bodega pkg import` applies, before it is emitted. A package that fails is named on stderr and left out, rather than emitted for the import to reject halfway through a file and leave the store in a state you did not choose. Versions default to `mode: "proxy"`; flip an entry to `hosted` if you want `bodega build fetch` to pre-fetch the artifact.
+Every generated manifest passes the structural checks and the URL allow-list `bodega pkg import` applies, before it is emitted. A package that fails is named on stderr and left out, rather than emitted for the import to reject halfway through a file and leave the store in a state you did not choose. The age and OSV checks are **not** applied here: they record audit events, and this command reads. A package that clears generation can still be refused by the import on one of those. Versions default to `mode: "proxy"`; flip an entry to `hosted` if you want `bodega build fetch` to pre-fetch the artifact.
 
 Identical rows produce identical bytes, so this week's generation diffs cleanly against last week's.
 
@@ -1437,9 +1437,13 @@ A pool row's package and version are parsed from the `.deb` filename, which is t
 
 A pool path a manifest entry owns is never fetched from upstream. The check is on the entry, not on whether the object happens to be present, which matters in the window between `bodega pkg create` and `bodega pkg build`: the entry exists, storage is empty, and without the guard a miss would fetch some archive's artifact and cache it under bodega's own pool path. The `Packages` stanza already publishes a `SHA256` computed at package time, so the client would then reject bytes bodega handed it, against a package the operator built. Such a request 404s instead, which is the same answer it gave before upstreams were configured.
 
-#### Artifacts over 256 MB
+#### Large artifacts and the spool directory
 
-The proxy path buffers a whole artifact in memory before responding, so an artifact past 256 MB is **refused with a 502 naming the limit**, and neither the bytes nor a checksum for them is recorded. It is never truncated: a short body that reported success used to be checksummed as authoritative and cached under that digest. Serve an artifact that large from `pool/` directly, through the build pipeline or an out-of-band upload. Converting the proxy to a streaming path would remove the ceiling and is tracked separately.
+The proxy path streams: an upstream body is copied to a spool file under `TMPDIR`, checksummed on the way through, then cached and served from there. Per-request memory is one copy buffer whatever the artifact's size, so there is no size ceiling on a proxied artifact — but `TMPDIR` has to hold the largest one in flight, and a small `tmpfs` there is where the old limit reappears. Point `TMPDIR` at real disk on a host that proxies `nvidia-*`, `texlive` collections or game-data packages.
+
+A cut transfer is still refused rather than cached: a body shorter than the `Content-Length` the upstream declared fails, the spool file is removed, and no checksum is recorded. Caching short bytes as authoritative is what made every later fetch of the real artifact fail verification against the truncated digest.
+
+The npm packument and the PyPI simple index are the two responses bodega still reads whole, because it parses them. Those are capped at 256 MB.
 
 ### APT index generation
 
@@ -1473,6 +1477,8 @@ Three cases drop an entry from the index silently, and the client sees `Unable t
 - The entry has no `_pool_path` and no `.deb` in the pool matches its name, version and architecture. Ordinarily this is the gap between `bodega pkg create` and the upload that follows.
 
 An entry that records `_pool_path` addresses its pool object directly, so an index whose entries all carry one is built without listing the pool at all. A listing is taken only for the entries that need the filename match, and is re-taken when the cached one leaves any of them unresolved: a `.deb` uploaded out of band would otherwise stay out of the index for the whole `metadata_ttl`, and stay out silently.
+
+The filename match is exact — `<package>_<version>_<architecture>.deb` and nothing looser — and objects the mirror cached are excluded from it. Both matter only where `apt_upstreams` is set: `pool/` then holds `.deb`s bodega did not build, an entry without `_pool_path` publishes no `SHA256` (that field comes from the same metadata `_pool_path` does), and a client has nothing to check the substitution against. Bodega tells the two apart by the audit checksum table, which holds a row per mirrored fetch. On a mirroring instance whose audit database cannot be read, no entry without `_pool_path` reaches the index at all and the rebuild says so at `WARN`; entries that carry `_pool_path` are unaffected, so the repository keeps serving.
 
 An architecture is served only if some entry published to that suite declares it. `Release` advertises exactly those architectures in `Architectures:`, and `binary-<arch>/Packages` 404s for any other, since `Release` records no digest for it. With no architecture-specific entry at all the suite falls back to `amd64`.
 
