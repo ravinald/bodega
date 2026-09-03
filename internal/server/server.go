@@ -218,6 +218,26 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 			logger.Error("could not open audit db; token auth, policy enforcement and the audit API are disabled",
 				"path", dbPath, "error", err)
 		} else {
+			// The same two config keys the CLI applies to its own handle.
+			// Without them audit_events limited nothing the server wrote and
+			// timezone never reached GET /api/v1/audit, with no way for an
+			// operator to tell which handle they were configuring.
+			db.SetTimezone(cfg.Timezone)
+			if len(cfg.AuditEvents) > 0 {
+				db.SetEventFilter(cfg.AuditEvents)
+				if !db.ShouldRecord(audit.EventDenied) {
+					logger.Error("audit_events omits \"denied\", so no refusal this server makes will be recorded; add it or clear the key",
+						"audit_events", strings.Join(cfg.AuditEvents, ","))
+				}
+			}
+			if db.ReadOnly() {
+				// Record is a silent no-op on a read-only handle, so every
+				// denial, lifecycle and fetch row is discarded without an
+				// error anywhere. Query still works, which is what makes it
+				// invisible: /api/v1/audit answers, it just stops growing.
+				logger.Error("audit db is not writable by this process; every audit write will be silently dropped",
+					"path", dbPath)
+			}
 			s.auditDB = db
 			s.policy = policy.NewChecker(db)
 			logger.Info("audit db opened", "path", dbPath)
@@ -959,6 +979,12 @@ func (s *Server) handleDeleteEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if frozen {
+		// Freeze is a protection control, so this row answers "who tried to
+		// remove a pinned artifact". The middleware chain let the request
+		// through — the caller cleared the admin gate — which is what makes
+		// the attempt worth a record rather than noise.
+		recordDenial(s.auditDB, r, audit.DenialFrozenEntry,
+			map[string]string{"pkg_type": t, "pkg_name": name})
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "entry is frozen"})
 		return
 	}

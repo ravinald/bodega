@@ -336,3 +336,142 @@ func waitFor(t *testing.T, cond func() bool) {
 	}
 	t.Fatal("condition not met within 10s")
 }
+
+// TestDenialRecordedAfterClientHangsUp drives the context net/http cancels when
+// a client closes the connection before reading the response. Firing a request
+// and hanging up is ordinary scanner behavior, so a row written on the request
+// context is missing exactly for the callers it exists to name. Every other
+// test in this file drives a context that is never cancelled and passes either
+// way (#106).
+func TestDenialRecordedAfterClientHangsUp(t *testing.T) {
+	s := newDenialServer(t, []string{"127.0.0.0/8"}, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest("DELETE", "/api/v1/packages/apt/hello", nil).WithContext(ctx)
+	req.RemoteAddr = "127.0.0.1:33333"
+	req.Header.Set("X-Real-IP", "203.0.113.9")
+	rec := httptest.NewRecorder()
+	s.handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+	wantOneDenial(t, s, audit.DenialIPNotPermitted, "203.0.113.9")
+}
+
+// TestFrozenDeleteDenialRecorded covers the one refusal-class 403 that lives in
+// a handler rather than the middleware chain. Freeze is a protection control,
+// so the row answers "who tried to remove a pinned artifact" (#107).
+func TestFrozenDeleteDenialRecorded(t *testing.T) {
+	s := newDenialServer(t, []string{"127.0.0.0/8"}, nil)
+	if err := s.store.AddVersion(t.Context(), manifest.TypeApt, "hello", manifest.VersionEntry{
+		Version: "1.0",
+		Frozen:  true,
+	}); err != nil {
+		t.Fatalf("seed manifest: %v", err)
+	}
+
+	rec := doRequest(s, "DELETE", "/api/v1/packages/apt/hello", nil)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (%s)", rec.Code, rec.Body.String())
+	}
+
+	details := wantOneDenial(t, s, audit.DenialFrozenEntry, "127.0.0.1")
+	if details["pkg_name"] != "hello" || details["pkg_type"] != "apt" {
+		t.Errorf("details = %v, want the frozen entry named", details)
+	}
+	if row := denials(t, s)[0]; row.PkgType != "apt" || row.PkgName != "hello" {
+		t.Errorf("pkg = %q/%q, want apt/hello", row.PkgType, row.PkgName)
+	}
+}
+
+// TestVersionConstraintDenialsRecorded covers the two 403s a version constraint
+// produces. They read as a broken client until a row names the constraint that
+// refused (#104).
+func TestVersionConstraintDenialsRecorded(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		pkgType    string
+		pkgName    string
+		entryVer   string
+		path       string
+		wantReqVer string
+	}{
+		{
+			name: "gomod", pkgType: manifest.TypeGomod, pkgName: "example.com/mod",
+			entryVer: "v1.2.0", path: "/go/example.com/mod/@v/v9.9.9.info", wantReqVer: "v9.9.9",
+		},
+		{
+			name: "npm", pkgType: manifest.TypeNpm, pkgName: "leftpad",
+			entryVer: "1.2.0", path: "/npm/leftpad/-/leftpad-9.9.9.tgz", wantReqVer: "9.9.9",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newDenialServer(t, []string{"127.0.0.0/8"}, nil)
+			if err := s.store.AddVersion(t.Context(), tc.pkgType, tc.pkgName, manifest.VersionEntry{
+				Version:           tc.entryVer,
+				VersionConstraint: manifest.ConstraintExact,
+				Mode:              manifest.ModeProxy,
+			}); err != nil {
+				t.Fatalf("seed manifest: %v", err)
+			}
+
+			rec := doRequest(s, "GET", tc.path, nil)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403 (%s)", rec.Code, rec.Body.String())
+			}
+
+			details := wantOneDenial(t, s, audit.DenialVersionConstraint, "127.0.0.1")
+			if details["constraint"] != manifest.ConstraintExact || details["entry_version"] != tc.entryVer {
+				t.Errorf("details = %v, want the constraint and the entry version", details)
+			}
+			row := denials(t, s)[0]
+			if row.PkgType != tc.pkgType || row.PkgName != tc.pkgName {
+				t.Errorf("pkg = %q/%q, want %q/%q", row.PkgType, row.PkgName, tc.pkgType, tc.pkgName)
+			}
+			if row.PkgVersion != tc.wantReqVer {
+				t.Errorf("pkg_version = %q, want the refused version %q", row.PkgVersion, tc.wantReqVer)
+			}
+		})
+	}
+}
+
+// TestServerAppliesAuditConfigToItsOwnHandle covers the split nobody could see
+// from outside: newServer opened its *audit.DB and never called SetEventFilter
+// or SetTimezone, so audit_events limited nothing the server wrote and timezone
+// never reached GET /api/v1/audit. Only the CLI's handle was configured (#103).
+func TestServerAppliesAuditConfigToItsOwnHandle(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{
+		AptCodename:     "noble",
+		LogDir:          dir,
+		AuditDB:         filepath.Join(dir, "audit.db"),
+		AdminPermitCIDR: []string{"127.0.0.0/8"},
+		AllowPlaintext:  true,
+		Timezone:        "America/New_York",
+		AuditEvents:     []string{string(audit.EventServeFetch)},
+	}
+	s := newServer(cfg, manifest.NewLocalStore(t.TempDir()), nil, "127.0.0.1:0",
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if s.auditDB == nil {
+		t.Fatal("audit DB not opened; the test would assert nothing")
+	}
+	t.Cleanup(func() { _ = s.auditDB.Close() })
+
+	if loc := s.auditDB.DisplayLocation().String(); loc != "America/New_York" {
+		t.Errorf("display timezone = %q, want America/New_York", loc)
+	}
+	if s.auditDB.ShouldRecord(audit.EventDenied) {
+		t.Error("audit_events listing only serve_fetch still records denials")
+	}
+
+	// End to end: the filter has to reach the write, not just the handle.
+	rec := doRequest(s, "DELETE", "/api/v1/packages/apt/hello", map[string]string{"X-Real-IP": "203.0.113.9"})
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 — the filter must not change what the server answers", rec.Code)
+	}
+	if rows := denials(t, s); len(rows) != 0 {
+		t.Errorf("denial rows = %d, want 0 — audit_events excluded the type (%+v)", len(rows), rows)
+	}
+}

@@ -64,12 +64,12 @@ const (
 	EventServeFetch EventType = "serve_fetch" // client downloaded a package via HTTP
 	EventCache      EventType = "cache"       // proxy cache miss
 
-	// EventDenied is a request the server refused before the handler ran:
-	// deny-listed IP, mutation auth, or an admin-only read endpoint. One type
-	// for the whole class because Filter has no OR and no status predicate, so
-	// splitting it per gate would make "who was turned away" three queries
-	// instead of one. Which gate refused is in Status; see the Denial*
-	// constants.
+	// EventDenied is a request the server refused: a deny-listed IP, mutation
+	// auth, an admin-only read endpoint, a frozen entry, or a version outside
+	// its constraint. One type for the whole class because Filter has no OR
+	// and no status predicate, so splitting it per gate would make "who was
+	// turned away" five queries instead of one. Which gate refused is in
+	// Status; see the Denial* constants.
 	EventDenied EventType = "denied"
 )
 
@@ -86,6 +86,13 @@ const (
 	DenialTokenInvalid = "token_invalid"        // Bearer presented, matched no stored hash
 	DenialTokenExpired = "token_expired"        // Bearer matched a token past expires_at
 	DenialAdminOnly    = "admin_only"           // admin-gated read endpoint, IP not permitted
+
+	// Refusals decided inside a handler rather than by the middleware chain.
+	// They reach the same table because an operator asking "who was turned
+	// away" is asking one question, and a refusal that answers it only from
+	// the journal is a refusal that rotates away.
+	DenialFrozenEntry       = "entry_frozen"       // DELETE on a package whose every version is frozen
+	DenialVersionConstraint = "version_constraint" // requested version outside the entry's version_constraint
 )
 
 // Event is a single audit record.

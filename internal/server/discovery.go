@@ -176,6 +176,49 @@ func (s *Server) recordDiscovery(ctx context.Context, r *http.Request, regType, 
 	s.recordDiscoveryRaw(ctx, r, regType, host, hint, pkgName, pkgVersionFromKey(s3Key), decision, upstreamURL)
 }
 
+// recordCacheHit writes the discovery row for a request the cache answered.
+//
+// Discovery records requests, not cache misses. Recording only misses made
+// last_client name whoever caused the miss and nobody after it, and
+// request_count count how badly the cache was working rather than how much the
+// fleet asked for: three requests for one artifact produced one row with
+// count 1. The promote-to-policy flow never noticed, needing each pattern
+// once, but the shape the mode was built for — point a clean host at bodega,
+// let it install, read back what it reached for — reported almost nothing on
+// the second run.
+//
+// The decision column keeps meaning "what the allow-list says about this
+// candidate", not "what happened to this request": a hit contacts no upstream,
+// so there is no fetch to permit or refuse. Recording the current verdict is
+// what keeps a hit on the same row as the miss that filled the cache, which is
+// the whole point of counting requests. The check is a read-through cache with
+// a 30s TTL (policy.DefaultCacheTTL), so the hot path pays a mutex and a slice
+// scan, not a query.
+func (s *Server) recordCacheHit(ctx context.Context, r *http.Request, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key string) {
+	if s.discovery == nil || s.discoverMode == "" {
+		return
+	}
+	if regType == "" || policyCandidate == "" {
+		return
+	}
+	// Detached from the request: a client that hangs up mid-transfer still
+	// asked, and a cancelled context would fail the verdict and drop the row
+	// for the same callers recordDenial detaches for.
+	verdictCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), auditWriteTimeout)
+	defer cancel()
+	decision, _, err := s.upstreamPolicyVerdict(verdictCtx, regType, policyCandidate)
+	if err != nil {
+		// The request is already being served from the cache; a policy store
+		// that cannot answer is not a reason to fail it, only a reason to
+		// leave the observation unrecorded rather than record it as something
+		// it is not.
+		s.logger.Debug("cache hit not recorded: policy verdict unavailable",
+			"type", regType, "key", s3Key, "error", err)
+		return
+	}
+	s.recordDiscovery(ctx, r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, decision)
+}
+
 // recordDiscoveryRaw enqueues an observation from a caller that already knows
 // every column. Handlers that decide before proxyOrCache hold no s3Key and no
 // policy candidate, so they cannot reach recordDiscovery; routing them through

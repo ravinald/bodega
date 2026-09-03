@@ -27,9 +27,15 @@ const (
 	DecisionNoNamespace = "no_namespace" // request named a namespace no upstream is configured for
 )
 
-// DiscoveryRow is one upstream-fetch observation. Rows are deduplicated at
-// insert time on (registry_type, pattern_hint, pkg_name, pkg_version, decision)
-// — repeat requests bump request_count and update last_seen / last_client.
+// DiscoveryRow is one request observation, whether the cache answered it or an
+// upstream fetch did. Rows are deduplicated at insert time on
+// (registry_type, pattern_hint, pkg_name, pkg_version, decision) — repeat
+// requests bump request_count and update last_seen / last_client, so those two
+// columns describe the fleet rather than the cache.
+//
+// Host and UpstreamURL are preserved on an upsert that leaves them empty: a
+// cache hit records without resolving an upstream it will not fetch, and
+// blanking a column the miss filled in would trade one true value for none.
 type DiscoveryRow struct {
 	RegistryType string
 	Host         string
@@ -68,7 +74,7 @@ func (a *DB) RecordDiscovery(ctx context.Context, r DiscoveryRow) error {
 		   request_count = request_count + 1,
 		   last_seen     = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
 		   last_client   = excluded.last_client,
-		   host          = excluded.host,
+		   host          = CASE WHEN excluded.host = '' THEN upstream_discovery.host ELSE excluded.host END,
 		   upstream_url  = CASE WHEN excluded.upstream_url = '' THEN upstream_discovery.upstream_url ELSE excluded.upstream_url END`,
 		r.RegistryType, r.Host, r.PatternHint, r.PkgName, r.PkgVersion, r.Decision, r.LastClient, r.UpstreamURL,
 	)

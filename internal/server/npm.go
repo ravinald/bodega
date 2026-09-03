@@ -44,6 +44,7 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 			vc, baseVer := packageVersionConstraint(pm)
 			if vc != "" && vc != manifest.ConstraintAny && baseVer != "" {
 				if !versionAllowed(baseVer, reqVersion, vc) {
+					s.recordVersionRefusal(r, manifest.TypeNpm, pkgName, baseVer, reqVersion, vc)
 					http.Error(w, "version not allowed by constraint", http.StatusForbidden)
 					return
 				}

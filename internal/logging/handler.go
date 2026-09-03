@@ -47,8 +47,11 @@ func (h *Handler) Handle(_ context.Context, r slog.Record) error {
 	}
 	buf = append(buf, ' ')
 
-	// Message.
-	buf = append(buf, r.Message...)
+	// Message. Escaped rather than quoted: it is the human-readable head of
+	// the line and quoting every record would churn the format, but an
+	// unescaped newline in it ends the record and starts one the caller
+	// wrote. Attribute values below are escaped by their own path.
+	buf = appendEscaped(buf, r.Message)
 
 	// Pre-set attrs from WithAttrs.
 	for _, a := range h.attrs {
@@ -121,22 +124,54 @@ func appendAttr(buf []byte, groups []string, a slog.Attr) []byte {
 	buf = append(buf, '=')
 
 	switch a.Value.Kind() {
-	case slog.KindString:
-		val := a.Value.String()
-		if needsQuoting(val) {
-			buf = append(buf, fmt.Sprintf("%q", val)...)
-		} else {
-			buf = append(buf, val...)
-		}
 	case slog.KindGroup:
 		attrs := a.Value.Group()
 		for _, ga := range attrs {
 			buf = appendAttr(buf, append(groups, a.Key), ga)
 		}
 	default:
-		buf = append(buf, a.Value.String()...)
+		// Every kind goes through one quoting path. An error attr renders
+		// through KindAny, and "error", err is the most common attribute in
+		// the tree — quoting only KindString escaped the URL a caller passed
+		// as a string and left the identical URL unescaped where it arrived
+		// wrapped in an error. A caller cannot be relied on to remember %q;
+		// the handler is the one place that sees every value.
+		buf = appendValue(buf, a.Value.String())
 	}
 
+	return buf
+}
+
+// appendValue writes one attribute value, quoted when it carries anything that
+// would otherwise break the key=value framing.
+func appendValue(buf []byte, val string) []byte {
+	if needsQuoting(val) {
+		return append(buf, fmt.Sprintf("%q", val)...)
+	}
+	return append(buf, val...)
+}
+
+// appendEscaped writes s with control characters replaced by their Go escapes,
+// leaving printable bytes (spaces included) alone. Used where the output is not
+// quoted and so cannot rely on %q to do it.
+func appendEscaped(buf []byte, s string) []byte {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 0x20 && c != 0x7f {
+			buf = append(buf, c)
+			continue
+		}
+		switch c {
+		case '\n':
+			buf = append(buf, `\n`...)
+		case '\r':
+			buf = append(buf, `\r`...)
+		case '\t':
+			buf = append(buf, `\t`...)
+		default:
+			buf = append(buf, fmt.Sprintf(`\x%02x`, c)...)
+		}
+	}
 	return buf
 }
 

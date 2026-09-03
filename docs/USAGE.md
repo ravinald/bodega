@@ -544,7 +544,9 @@ The mode is server-side. Set `discover_mode` in config.json and restart:
 
 It is also not the way to bootstrap a catalog. Discovery only sees what clients ask for, so a host that has been stable for six months produces nothing, and `catalog` mode 404s a path before any policy check runs — so an empty store stays empty however long you watch it. Read the host's own inventory instead: [`bodega pkg convert`](#bodega-pkg-convert-type-file-) turns `dpkg-query`, `pip list`, `npm ls -g`, `go list -m all`, `cargo install --list` or `helm list` into a manifest set in one run. What discovery is for is the residue: once a catalog exists, `observe` names what the fleet reaches for that the catalog does not cover, including the two types `pkg convert` has no importer for (git and binary).
 
-Each observation is one row keyed by `(type, pattern, package, version, decision)`, with a request count, the last client IP, and the upstream URL bodega fetched or would have fetched. The `decision` column carries one of:
+Each observation is one row keyed by `(type, pattern, package, version, decision)`, with a request count, the last client IP, and the upstream URL bodega fetched or would have fetched. The count is a count of **requests**, not of cache misses: a request the cache answers bumps the same row the fetch that filled it wrote, so `request_count` ranks by demand and `last_client` names the last host to ask.
+
+`decision` describes the allow-list's verdict on the upstream candidate, not what happened to the request. A cache hit contacts no upstream, and it is recorded under the verdict that applies to the candidate now — which is what keeps it on the same row as the miss before it. The `decision` column carries one of:
 
 | Decision       | Meaning                                                                  |
 | -------------- | ------------------------------------------------------------------------ |
@@ -560,14 +562,14 @@ An audit database written under the retired `discover_mode: "learn"` also holds 
 
 | Type | Route | Recorded |
 |------|-------|----------|
-| apt | `/apt/dists/{codename}/...`, `/apt/pool/...` under a mirrored codename | every upstream fetch. Metadata rows carry `<codename>/<path>` as the package and no version; pool rows carry the package name and version parsed from the `.deb` filename, and together they are the dependency closure of what the fleet installed |
-| cargo | sparse index, crate download | every upstream fetch |
-| npm | packument, tarball | every upstream fetch; `no_manifest` on a tarball for an unknown package |
-| pypi | simple index, wheel | every upstream fetch; `no_manifest` on a wheel for an unknown distribution |
-| gomod | `/go/...` | every upstream fetch; `no_manifest` on a module with no entry |
-| helm | `/helm/charts/*.tgz` | every upstream fetch; `no_manifest` on a chart with no entry, with an empty upstream URL (a chart repo is named per version entry, so with no entry there is no URL to record) |
+| apt | `/apt/dists/{codename}/...`, `/apt/pool/...` under a mirrored codename | every request. Metadata rows carry `<codename>/<path>` as the package and no version, except by-hash entries, which collapse to `<codename>/by-hash` — the path is a digest naming no package, and left whole it sizes the `PACKAGE` column in `discover show` past the width of the terminal. The digest is still on the row, in the upstream URL; pool rows carry the package name and version parsed from the `.deb` filename, and together they are the dependency closure of what the fleet installed |
+| cargo | sparse index, crate download | every request |
+| npm | packument, tarball | every request; `no_manifest` on a tarball for an unknown package |
+| pypi | simple index, wheel | every request; `no_manifest` on a wheel for an unknown distribution |
+| gomod | `/go/...` | every request; `no_manifest` on a module with no entry |
+| helm | `/helm/charts/*.tgz` | every request; `no_manifest` on a chart with no entry, with an empty upstream URL (a chart repo is named per version entry, so with no entry there is no URL to record) |
 | git | `/git/{namespace}/...` | every smart-HTTP request under an `open` namespace, with an empty version; `no_manifest` on an uncataloged repository under a `catalog` one; `no_namespace` on a first segment naming no `git_upstreams` entry, with the namespace as both the package and the pattern |
-| binary | `/binaries/{namespace}/...` | every upstream fetch under an `open` namespace; `no_manifest` on an uncataloged path under a `catalog` one; `no_namespace` on a first segment naming no `binary_upstreams` entry, once any entry exists |
+| binary | `/binaries/{namespace}/...` | every request under an `open` namespace; `no_manifest` on an uncataloged path under a `catalog` one; `no_namespace` on a first segment naming no `binary_upstreams` entry, once any entry exists |
 
 #### Gaps
 
@@ -579,7 +581,7 @@ These are not observed yet. A quiet discovery log for one of them means the hook
 - **git mirror refreshes**: a smart-HTTP request records one row per request, but the periodic `git remote update` it triggers is not separately logged. The row says a client asked; it does not say whether that request also refreshed the mirror.
 - **binary outside a namespace**: with `binary_upstreams` empty, or on a path whose first segment names no entry in it, `/binaries/...` reads storage and records nothing. The `no_namespace` row above is the second case; the first is an install that has not opted in.
 - **helm `index.yaml`** and the generated apt indexes: regenerated locally, never fetched.
-- **cache hits of any type**: the log counts upstream fetches and pre-cache misses. A package already in the cache is served without a row, so `request_count` under-reports by however well the cache is working, and `last_client` names whoever caused the miss rather than the last host to ask. This bites apt hardest, because apt is the type where the cache does the most work: fifty hosts running the same `apt install` produce one row per `.deb` with `request_count: 1`, naming whichever host missed first. Read apt rows as the set of packages the fleet reached for, which is what they are, and not as how many hosts reached for them.
+- **apt pool hits with several archives configured**: a pool path names no archive, so bodega probes on the first miss and remembers the answer for an hour. A cached `.deb` is served without that probe. With one entry in `apt_upstreams` the archive is unambiguous and the hit is recorded; with several and no remembered route, the row is skipped rather than filed under a pattern that is not the host, which would split one archive's traffic across two buckets. The next miss for that path repopulates the route and hits start counting again.
 
 #### `bodega discover list [type]`
 
@@ -637,7 +639,7 @@ The output is the same shape [`bodega pkg convert`](#bodega-pkg-convert-type-fil
 | `--skip-existing` | Omit packages the manifest store already holds, which makes a re-run emit only what is new |
 | `-o, --output`    | Write the payload to a file instead of stdout                                              |
 
-`--min-requests` is the flag to reach for on a fleet: a discovery table fills with one-off CI probes, and without a signal filter they land in the catalog beside the packages that matter. Read the count for what it is: the log records upstream fetches, not client requests, so a warm cache under-reports it and a package everyone uses can rank below one nobody does.
+`--min-requests` is the flag to reach for on a fleet: a discovery table fills with one-off CI probes, and without a signal filter they land in the catalog beside the packages that matter. The count is a request count — cache hits included — so it ranks by demand rather than by how often the cache missed.
 
 Every generated manifest passes the structural checks and the URL allow-list `bodega pkg import` applies, before it is emitted. A package that fails is named on stderr and left out, rather than emitted for the import to reject halfway through a file and leave the store in a state you did not choose. The age and OSV checks are **not** applied here: they record audit events, and this command reads. A package that clears generation can still be refused by the import on one of those. Versions default to `mode: "proxy"`; flip an entry to `hosted` if you want `bodega build fetch` to pre-fetch the artifact.
 
@@ -842,7 +844,7 @@ Set it whenever a reverse proxy terminates TLS or publishes a different hostname
 
 `discover_mode` turns the upstream-observation log on, and does nothing else: enforcement does not move with it. Valid values are `""` (off) and `"observe"`; anything else is rejected at load. `"learn"` was removed and is refused by name, with the error pointing at `observe` and `bodega pkg convert` — it suppressed the allow-list and recorded nothing `observe` does not. See [`bodega discover ...`](#bodega-discover-) for what gets logged and what to do with it.
 
-`timezone` sets the display timezone for audit queries (default UTC) and `audit_events` limits which event types the CLI records (empty records all; `bodega serve` records every type regardless — see [Audit Trail](#audit-trail)).
+`timezone` sets the display timezone for audit queries (default UTC) and `audit_events` limits which event types are recorded (empty records all). Both apply to the CLI and to `bodega serve` alike — see [Audit Trail](#audit-trail) for what a filter that omits `denied` costs you.
 
 Config files are written with mode `0600` (owner read/write only).
 
@@ -1896,7 +1898,7 @@ The SQLite database at `{log_dir}/audit.db` records every package fetch served, 
 | `create`, `delete`, `hide`, `freeze`, `edit`, `refresh`, `repair` | Manifest mutation (CLI, TUI or API) |
 | `init`, `reset`, `status`, `show` | Operator command |
 | `cache` | Proxy cache miss > upstream fetch, and upstream policy violations (`status=policy_violation`) |
-| `denied` | A request the server refused before any handler ran |
+| `denied` | A request the server refused |
 | `serve_start`, `serve_stop` | `bodega serve` bound its listener / shut down |
 
 **Denials.** A `denied` row's `status` column names the gate that turned the request away, so an address that was never permitted reads differently from a token that simply aged out:
@@ -1911,6 +1913,12 @@ The SQLite database at `{log_dir}/audit.db` records every package fetch served, 
 | `token_invalid` | Bearer presented, matched no stored hash |
 | `token_expired` | Bearer matched a token past its `expires_at` |
 | `admin_only` | Admin-gated read (`/api/v1/config`, `/api/v1/audit`, tokens, policies) from outside `admin_permit_cidr` |
+| `entry_frozen` | `DELETE` on a package whose every version is frozen. The caller cleared the admin gate, which is what makes the attempt worth a row |
+| `version_constraint` | A gomod or npm request for a version outside the entry's `version_constraint`. `pkg_version` carries the version that was refused, `details` the constraint and the entry's own version |
+
+The first eight gates run in the middleware chain, before any handler; the last two are decided by the handler itself. Both write the same row, because an operator asking "who was turned away" is asking one question.
+
+The row is written on a context detached from the request. `net/http` cancels the request context the moment a client closes the connection, so a caller that fires a request and hangs up without reading the response — ordinary scanner behavior — got its 403 and left no row, which made the rows least reliable exactly where they matter most.
 
 The row carries the client IP, the User-Agent, and a `details` JSON blob with the method and path. It carries **no credential**: `token_expired` records the token id, `token_invalid` records the first 12 hex of the peppered hash — enough to tell two rejected callers apart, useless without the pepper — and no header is ever copied in. Client-controlled strings are capped at 256 bytes each, so an unauthenticated stranger does not choose how much disk a 403 costs.
 
@@ -1932,9 +1940,11 @@ Fields on every row: timestamp, event type, package type/name/version, client IP
 - **Request and response headers or bodies.** Those are a `log_level: 4` (trace) concern in the journal, not an audit record, and a header dump would carry the very credentials the denial rows are careful not to hold.
 - **Successful admin reads.** Only the refusals are rows; a permitted `GET /api/v1/audit` is journal-only.
 
-Denials record at every gate in the middleware chain and at the admin-read gate.
+Denials record at every gate in the middleware chain, at the admin-read gate, and at the two refusals a handler decides for itself: a `DELETE` on a frozen entry (`entry_frozen`) and a version outside an entry's `version_constraint` (`version_constraint`). The `status` column names which gate refused.
 
-`audit_events` in `config.json` limits which types the **CLI** writes. `bodega serve` opens its own handle and does not apply the filter, so the server records every type regardless of that key. Leave it empty to keep the two in agreement.
+`audit_events` and `timezone` in `config.json` apply to both handles: the CLI's and the one `bodega serve` opens for itself. A filter that leaves out `denied` therefore throws away the record of every refusal the server makes, which is the one record that has no other home — the journal rotates and is not reachable through `/api/v1/audit`. `bodega serve` logs an error naming the key when it starts with such a filter. Leave `audit_events` empty unless you have a reason.
+
+A read-only audit database is the quieter version of the same loss: `Record` no-ops, `Query` keeps answering, so `/api/v1/audit` responds and simply stops growing. `bodega serve` logs an error at startup when the file is not writable by its user.
 
 ---
 

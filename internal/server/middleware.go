@@ -228,10 +228,18 @@ func DenyListMiddleware(denyNets NetsFunc, auditDB *audit.DB) func(http.Handler)
 // A nil db is a no-op: the server keeps serving when the audit DB could not be
 // opened, and a denial must not become the thing that panics it.
 func recordDenial(db *audit.DB, r *http.Request, reason string, extra map[string]string) {
+	pkgType, pkgName := parseAPIPackagePath(r.URL.Path)
+	recordDenialFor(db, r, pkgType, pkgName, "", reason, extra)
+}
+
+// recordDenialFor is recordDenial for a handler that already knows which
+// package it refused. The package routes carry no /api/v1/packages/ prefix, so
+// parseAPIPackagePath would leave the subject columns empty on exactly the
+// refusals an operator would filter by package to find.
+func recordDenialFor(db *audit.DB, r *http.Request, pkgType, pkgName, pkgVersion, reason string, extra map[string]string) {
 	if db == nil {
 		return
 	}
-	pkgType, pkgName := parseAPIPackagePath(r.URL.Path)
 	details := map[string]string{
 		"method": r.Method,
 		"path":   truncateField(r.URL.Path, maxDetailField),
@@ -243,15 +251,49 @@ func recordDenial(db *audit.DB, r *http.Request, reason string, extra map[string
 	if err != nil {
 		blob = []byte("{}")
 	}
-	_ = db.Record(r.Context(), audit.Event{
-		EventType: audit.EventDenied,
-		PkgType:   pkgType,
-		PkgName:   pkgName,
-		ClientIP:  ClientIP(r),
-		UserAgent: truncateField(r.UserAgent(), maxDetailField),
-		Status:    reason,
-		Details:   string(blob),
+	ctx, cancel := auditContext(r)
+	defer cancel()
+	_ = db.Record(ctx, audit.Event{
+		EventType:  audit.EventDenied,
+		PkgType:    pkgType,
+		PkgName:    pkgName,
+		PkgVersion: pkgVersion,
+		ClientIP:   ClientIP(r),
+		UserAgent:  truncateField(r.UserAgent(), maxDetailField),
+		Status:     reason,
+		Details:    string(blob),
 	})
+}
+
+// recordVersionRefusal writes the row for a request refused by an entry's
+// version_constraint. The gomod and npm handlers answer 403 because the
+// version exists upstream and policy declines to serve it, which is a refusal
+// in the same sense the middleware gates are — and, unlike them, one an
+// operator will read as a broken client until the row names the constraint.
+func (s *Server) recordVersionRefusal(r *http.Request, pkgType, pkgName, entryVersion, reqVersion, constraint string) {
+	recordDenialFor(s.auditDB, r, pkgType, pkgName, reqVersion,
+		audit.DenialVersionConstraint, map[string]string{
+			"constraint":    constraint,
+			"entry_version": entryVersion,
+		})
+}
+
+// auditWriteTimeout bounds a detached audit write. Long enough to outlast the
+// SQLite busy timeout under contention, short enough that a wedged database
+// cannot pin goroutines indefinitely.
+const auditWriteTimeout = 10 * time.Second
+
+// auditContext returns a context that carries the request's values but not its
+// cancellation, bounded by auditWriteTimeout.
+//
+// net/http cancels r.Context() the moment the client closes the connection, and
+// ExecContext refuses an insert on a cancelled context. A scanner that fires a
+// request and hangs up without reading the response is ordinary behavior, so
+// writing a refusal on the request context loses the row precisely for the
+// callers the row exists to name. Server.recordLifecycle detaches for the same
+// reason.
+func auditContext(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(r.Context()), auditWriteTimeout)
 }
 
 // hashPrefix is the leading bytes of a peppered token hash, enough to tell two

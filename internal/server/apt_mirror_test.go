@@ -62,7 +62,7 @@ func (a *fixtureArchive) URL() string { return a.ts.URL + "/ubuntu" }
 
 // newFixtureArchive serves objects under /ubuntu/ and answers HEAD, which is
 // what the pool probe uses.
-func newFixtureArchive(t *testing.T, objects map[string]string) *fixtureArchive {
+func newFixtureArchive(t testing.TB, objects map[string]string) *fixtureArchive {
 	t.Helper()
 	a := &fixtureArchive{objects: objects}
 	a.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -155,7 +155,7 @@ func fixturePackages(poolPath, body string) string {
 
 // mirrorServer wires a discovery server to one or more fixture archives and
 // lifts the SSRF guard, which refuses a loopback listener by design.
-func mirrorServer(t *testing.T, archives ...*fixtureArchive) *Server {
+func mirrorServer(t testing.TB, archives ...*fixtureArchive) *Server {
 	t.Helper()
 	s := newDiscoveryServer(t)
 	s.cfg.AptCodename = "local"
@@ -867,5 +867,157 @@ func TestOutOfBandDebStillResolves(t *testing.T) {
 	}
 	if strings.Contains(string(body), "Filename: "+fallbackDeb) {
 		t.Errorf("an unverifiable pool object was published anyway:\n%s", body)
+	}
+}
+
+// TestPoolCacheHitCountsAsARequest is the deployment shape discovery was built
+// for: point a clean host at bodega, let it install, read back what it reached
+// for. Recording only misses made the second run report almost nothing —
+// request_count described how badly the cache was working and last_client named
+// whoever missed first, which is close to inverted for anything ranking by
+// demand (#127).
+func TestPoolCacheHitCountsAsARequest(t *testing.T) {
+	archive := newFixtureArchive(t, map[string]string{fixtureDeb: fixtureDebBody})
+	s := mirrorServer(t, archive)
+
+	if code, _ := mirrorGet(t, s, "/apt/"+fixtureDeb); code != http.StatusOK {
+		t.Fatal("pool fetch failed")
+	}
+	waitForAptRows(t, s, audit.DecisionNoPolicy, 1)
+
+	for range 2 {
+		if code, _ := mirrorGet(t, s, "/apt/"+fixtureDeb); code != http.StatusOK {
+			t.Fatal("cached pool fetch failed")
+		}
+	}
+	if got := archive.count(fixtureDeb); got != 1 {
+		t.Fatalf("upstream GETs = %d, want 1 — the second and third requests must be hits", got)
+	}
+
+	row := waitForPoolRow(t, s, "nginx", 3)
+	if row.PatternHint != "127.0.0.1" || row.Host != "127.0.0.1" {
+		t.Errorf("hint/host = %q/%q, want the archive host on the hit rows too — a hit must land on the miss's row, not beside it",
+			row.PatternHint, row.Host)
+	}
+	if row.UpstreamURL == "" {
+		t.Error("upstream_url was blanked by a hit; promote needs a fetchable URL")
+	}
+}
+
+// waitForPoolRow polls for one pool row's request_count to reach want, and
+// fails if the package ever occupies more than one row.
+func waitForPoolRow(t *testing.T, s *Server, pkgName string, want int64) audit.DiscoveryRow {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	var last audit.DiscoveryRow
+	for time.Now().Before(deadline) {
+		rows, err := s.auditDB.ListDiscovery(t.Context(), audit.DiscoveryFilter{})
+		if err != nil {
+			t.Fatalf("list discovery: %v", err)
+		}
+		var matched []audit.DiscoveryRow
+		for _, row := range rows {
+			if row.PkgName == pkgName {
+				matched = append(matched, row)
+			}
+		}
+		if len(matched) > 1 {
+			t.Fatalf("%q occupies %d rows, want 1 (%+v)", pkgName, len(matched), matched)
+		}
+		if len(matched) == 1 {
+			last = matched[0]
+			if last.RequestCount >= want {
+				return last
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("request_count for %q = %d after 3s, want %d", pkgName, last.RequestCount, want)
+	return last
+}
+
+// TestByHashRowNamesNoDigest bounds the discovery package name for a by-hash
+// entry. The raw path is ~100 characters naming no package, and
+// `bodega discover show apt <host>` sizes the PACKAGE column to the longest
+// value — so six by-hash rows from one `apt install` push UPSTREAM URL off the
+// terminal and make the pool rows beside them unreadable. The digest stays on
+// the row, in the URL (#173).
+func TestByHashRowNamesNoDigest(t *testing.T) {
+	kr, err := aptsign.Generate("fixture archive", "archive@fixture.invalid", aptsign.KeyEd25519)
+	if err != nil {
+		t.Fatalf("generate fixture key: %v", err)
+	}
+	packages := fixturePackages(fixtureDeb, fixtureDebBody)
+	objects := fixtureDists(t, kr, packages)
+	archive := newFixtureArchive(t, objects)
+	s := mirrorServer(t, archive)
+
+	sum := sha256.Sum256([]byte(packages))
+	digest := hex.EncodeToString(sum[:])
+	byHash := "main/binary-amd64/by-hash/SHA256/" + digest
+
+	if code, _ := mirrorGet(t, s, "/apt/dists/"+mirroredCodename+"/"+byHash); code != http.StatusOK {
+		t.Fatal("by-hash fetch failed")
+	}
+
+	rows := waitForAptRows(t, s, audit.DecisionNoPolicy, 1)
+	var found bool
+	for _, row := range rows {
+		if strings.Contains(row.PkgName, digest) {
+			t.Errorf("pkg_name = %q, want no digest — it is already in the upstream URL", row.PkgName)
+		}
+		if row.PkgName == mirroredCodename+"/by-hash" {
+			found = true
+			if !strings.Contains(row.UpstreamURL, digest) {
+				t.Errorf("upstream_url = %q, want the digest still recoverable", row.UpstreamURL)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("no row named %q: %+v", mirroredCodename+"/by-hash", rows)
+	}
+}
+
+// BenchmarkCachedPoolRequest measures what recording a hit costs the path that
+// serves every .deb in a warm fleet. Run it as:
+//
+//	go test ./internal/server -run '^$' -bench BenchmarkCachedPoolRequest -benchtime 2000x
+//
+// The write itself is a send on a buffered channel; the addition on top of it
+// is one policy verdict, which is a read-through cache with a 30s TTL, plus
+// SuggestPattern. The numbers are in the PR.
+func BenchmarkCachedPoolRequest(b *testing.B) {
+	for _, mode := range []string{"", "observe"} {
+		name := "discover_off"
+		if mode != "" {
+			name = "discover_" + mode
+		}
+		b.Run(name, func(b *testing.B) {
+			archive := newFixtureArchive(b, map[string]string{fixtureDeb: fixtureDebBody})
+			s := mirrorServer(b, archive)
+			s.discoverMode = mode
+			h := s.Handler()
+
+			// Warm the cache: the first request is the miss, everything the
+			// benchmark measures is a hit.
+			warm := httptest.NewRecorder()
+			h.ServeHTTP(warm, httptest.NewRequest(http.MethodGet, "/apt/"+fixtureDeb, nil))
+			if warm.Code != http.StatusOK {
+				b.Fatalf("warm request = %d, want 200", warm.Code)
+			}
+
+			b.ResetTimer()
+			for range b.N {
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/apt/"+fixtureDeb, nil))
+				if rec.Code != http.StatusOK {
+					b.Fatalf("request = %d, want 200", rec.Code)
+				}
+			}
+			b.StopTimer()
+			if dropped := s.discovery.dropped.Load(); dropped > 0 {
+				b.Logf("discovery rows dropped: %d of %d requests", dropped, b.N)
+			}
+		})
 	}
 }

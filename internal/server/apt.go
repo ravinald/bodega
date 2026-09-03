@@ -915,7 +915,7 @@ func (s *Server) auditAptEntries(ctx context.Context, served []string, poolMap m
 		servedSet[suite] = true
 	}
 
-	var unserved, unresolved, unpooled []string
+	var unserved, unresolved, unpooled, noarch []string
 	for _, name := range s.store.ListPackages(manifest.TypeApt) {
 		pm, _ := s.store.GetPackage(ctx, manifest.TypeApt, name)
 		if pm == nil || isPackageHidden(pm) {
@@ -950,7 +950,17 @@ func (s *Server) auditAptEntries(ctx context.Context, served []string, poolMap m
 			// directly and the generator emits it either way; one without is
 			// matched by filename against the listing, and finding nothing
 			// drops it.
-			if ve.Metadata["_pool_path"] != "" || ve.Metadata["Architecture"] == "" {
+			// The generator drops an entry with no Architecture before it
+			// looks at a pool path, so this test comes before the pool one:
+			// an entry carrying _pool_path and no Architecture still reaches
+			// no index, and counting it as pooled would leave it in no
+			// bucket at all. deb822 has no default architecture, so there is
+			// nothing to substitute — the field has to be filled in.
+			if ve.Metadata["Architecture"] == "" {
+				noarch = append(noarch, name+"@"+ve.Version)
+				continue
+			}
+			if ve.Metadata["_pool_path"] != "" {
 				continue
 			}
 			source := ve.SourceName
@@ -974,6 +984,10 @@ func (s *Server) auditAptEntries(ctx context.Context, served []string, poolMap m
 	if len(unpooled) > 0 {
 		s.logger.Warn("apt entries match no .deb in the pool and reach no index; upload the artifact or record its _pool_path",
 			"count", len(unpooled), "entries", capForLog(unpooled))
+	}
+	if len(noarch) > 0 {
+		s.logger.Warn("apt entries carry no Architecture metadata and reach no index; set it with 'bodega pkg edit' or re-run 'bodega build package'",
+			"count", len(noarch), "entries", capForLog(noarch))
 	}
 }
 
