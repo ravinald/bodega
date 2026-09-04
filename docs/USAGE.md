@@ -765,7 +765,7 @@ A save edits the config file rather than replacing it. `Load` keeps the bytes it
 Two consequences worth knowing:
 
 - **A flag is not a setting.** `bodega --manifest-dir /tmp/x shell` followed by a config save leaves `manifest_dir` in the file exactly as it was. The same holds for `--build-root`, `--bucket`, `--region`, `--log-level` and `-v`, and for every built-in default `Load` filled in: `audit_db`, `metadata_ttl` and `apt_codename` stay empty in the file if that is how you left them, so a later release changing one of those defaults still reaches this host.
-- **Clearing a field clears the key.** Emptying the TUI's deny-list field removes `deny_list` from the file; it does not leave the previous value behind. Clearing `tls_cert` and `tls_key` removes both, and `bodega serve` then refuses to start unless `allow_plaintext` is set — see [Serving without TLS](#serving-without-tls).
+- **Clearing a field clears the key.** Emptying a TUI field removes its key from the file; it does not leave the previous value behind. Clearing `tls_cert` and `tls_key` removes both, and `bodega serve` then refuses to start unless `allow_plaintext` is set — see [Serving without TLS](#serving-without-tls).
 
 Editing the file by hand is still supported and is what the comments are there for. A save writes every untouched key back byte for byte, blank lines and all, so a save that changed one setting changes one line.
 
@@ -1211,7 +1211,7 @@ Components: main
 Signed-By: /etc/apt/keyrings/bodega-archive-keyring.gpg
 ```
 
-The stanza above is the shape, not the values. Your instance prints its own on the `bodega serve` startup banner and serves it on `GET /api/v1/status`, filled in from what the running process holds: the suites it answers for, the URL from `public_url`, and `Signed-By:` or the `[trusted=yes]` fallback according to whether a signing key is loaded. Copy that one. The TUI details pane and the web UI render the same block from the same source, so the three cannot disagree.
+The stanza above is the shape, not the values. Your instance prints its own on the `bodega serve` startup banner and serves it on `GET /api/v1/status`, filled in from what the running process holds: the suites it answers for, the URL from `public_url`, and `Signed-By:` or the `[trusted=yes]` fallback according to whether a signing key is loaded. Copy that one. The web UI shows the block it read from this endpoint, so it cannot disagree with the server. The TUI renders through the same renderer but supplies the signing state from the key file rather than the process, which is the one axis where the two can differ — see [Details pane](#details-pane).
 
 Install the keyring first. The `.gpg` route serves the dearmored form `Signed-By:` takes directly, so the client needs no `gpg` binary:
 
@@ -2015,7 +2015,18 @@ A read-only audit database is the quieter version of the same loss: `Record` no-
 
 Press `C` to open the config form. `Ctrl+S` saves, `Ctrl+T` loads defaults, `Ctrl+R` resets. Changes take effect immediately.
 
-Its **Deny list** field still writes `deny_list` to `config.json`, which a server that has already copied the list into its audit database ignores. Use `bodega acl deny` instead until the editor is moved over.
+The form edits no ACL. `deny_list`, `admin_permit_cidr` and `trusted_proxies` are seeded from the config file on first start and inert afterwards, so a field writing them to `config.json` would accept a value, save it, report success and change nothing about who the server refuses. Edit them with `bodega acl deny`, `bodega acl admin` and `bodega acl proxies`; the form says so under its title.
+
+### Details pane
+
+The **Sources line** field for an apt entry is a command an operator pastes into `/etc/apt/sources.list.d/`, so it is rendered by the server-side renderer every other emitter uses ([Client configuration](#client-configuration)) rather than composed in the pane. Two things it does that are not obvious:
+
+- **The suite is intersected against the served set.** The pane names the first suite the entry is published to that `apt_suites` (or `apt_codename`) also answers for. An entry naming a suite outside that set reaches no index, and a line pointing at it 404s the whole `dists/` path, which apt reports as "Unable to locate package" — the message a misspelled name produces. The fallback is the first served suite. `GET /api/v1/status` lists such entries under `apt.unserved`.
+- **The signing state comes from the key file, not the running server.** The pane applies the same acceptance test `bodega serve` does — the key must load, and both its armored and dearmored public forms must render — but it reads the file. A server that already loaded a key keeps signing after the file is deleted, because a reload never takes signing away (see [Rotation](#rotation)), so the two disagree until a restart. A note beside the line says so and points at `GET /api/v1/status`, which reports what the server is actually doing.
+
+### Build stages
+
+The build menu dispatches all eight entry types. Only `apt` and `pypi` have a build step and only `apt`, `git`, `pypi`, `helm` and `npm` have a package step; the rest say which stage does not apply to them rather than reporting an empty success. `helm` and `npm` package across the whole type — `index.yaml` and the packuments are repository metadata, not per-entry archives — so those two stages ignore the selected entry and regenerate everything.
 
 ---
 
