@@ -892,6 +892,18 @@ ERROR no packages loaded — every repository index will publish as empty
   manifests=/var/lib/bodega/manifests config=/etc/bodega/config.json
 ```
 
+**A root `serve` cannot read stops the start.** On the `local` backend, and under `--local-config` against any backend, `bodega serve` checks `manifest_dir` before it binds anything. A server that publishes an empty `Release` over a root nothing can read is indistinguishable from a healthy one holding no packages, so three states exit 1 instead:
+
+| State | Message |
+| ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
+| A file where the directory belongs | `Error: manifest_dir /var/lib/bodega/manifests is not a directory (config: /etc/bodega/config.json)` |
+| Absent and uncreatable: `/manifests` under `ProtectSystem=strict`, a parent owned by another user | `Error: manifest_dir … does not exist and cannot be created: mkdir /nope: read-only file system (config: …)` |
+| Present but unopenable, which is what a root owned by another user does: it stats fine and reads back empty | `Error: manifest_dir … cannot be opened: permission denied (config: …)` |
+
+Each names the path and the config file the path came from, so the next move is `ls -ld` on the one and an edit to the other.
+
+**An absent root that can be created is created, and the start continues.** On a fresh host neither `storage_path` nor its `manifests/` exists yet, and `systemctl enable --now bodega` has to survive that. The empty repository that follows is the legitimate one, and the `no packages loaded` line above is what marks it in the journal. That carve-out is also why a typo in `manifest_dir` under a writable parent is not caught here: it is created, and the `ERROR` line naming the root it read is the only thing that separates it from a fresh install.
+
 ### Storage backends
 
 bodega supports two storage backends:
@@ -975,13 +987,13 @@ A name no backend answers to is an error rather than a search of the others. Ser
 
 `--replace-placement` is the deliberate move. It applies the current rule to versions already placed elsewhere, repoints the manifest, and warns for every object it leaves behind — nothing copies the old bytes. `bodega pkg move` is the one that copies.
 
-`apt`, `pypi` and `git` upload whole directories with no per-version granularity, so a changed rule refuses outright rather than splitting a tree across backends:
+`pypi` uploads a whole directory with no per-version granularity, so a changed rule refuses outright rather than splitting a tree across backends. `apt` and `git` used to refuse here too and no longer do: both resolve one key per version now, and a rule change repoints only what has not been written yet.
 
 ```text
-storage_by_type["apt"] now resolves to "bulk", but 2 apt version(s) are recorded elsewhere:
-  nginx@1.24.0 (on "default")
-  redis@7.2.4 (on "default")
-apt uploads whole directories, so proceeding would split the tree across backends with no listing to reunite it.
+storage_by_type["pypi"] now resolves to "bulk", but 2 pypi version(s) are recorded elsewhere:
+  boto3@1.35.0 (on "default")
+  django@5.0.6 (on "default")
+pypi uploads whole directories, so proceeding would split the tree across backends with no listing to reunite it.
 Pass --replace-placement to repoint the manifest at "bulk" and re-upload; the old copies stay where they are and nothing copies them
 ```
 

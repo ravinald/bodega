@@ -101,6 +101,13 @@ The server listens on `:8080` by default. Clients configure their package manage
 bodega apt key generate          # on the server; systemctl reload bodega afterwards
 ```
 
+Install the client's CA bundle first, and not as a formality. Both forms below are `https://`, and a minimal image (`ubuntu:24.04`, most container bases) ships no `ca-certificates`, so apt cannot complete the handshake with bodega. `apt-get update` still exits 0 having ignored the index, and the failure surfaces one command later as `E: Unable to locate package hello`, which points at the package rather than at the trust store. The bundle has to come from sources the image already has, so it is a step before bodega can be the only source, never after:
+
+```bash
+# on the client, still on the image's stock sources
+sudo apt-get update && sudo apt-get install -y ca-certificates
+```
+
 ```bash
 # on the client
 sudo install -d -m 0755 /etc/apt/keyrings

@@ -85,6 +85,14 @@ func TestRenderMatrix(t *testing.T) {
 					if publicURL != "" && hasNote(got, UnknownURLNote) {
 						t.Errorf("public_url is set but the placeholder note fired: %v", got.Notes)
 					}
+					// The trust-store note follows the scheme a client
+					// speaks, not the one this listener answers on, so
+					// a proxied http listener still carries it.
+					if want := strings.HasPrefix(wantURI, "https://"); hasNote(got, TrustStoreNote) != want {
+						t.Errorf("signed=%v public=%q local=%q: trust-store note = %v, want %v",
+							signed, publicURL, local, !want, want)
+					}
+
 					if publicURL != "" && strings.Contains(got.OneLine, PlaceholderHost) {
 						t.Errorf("public_url is set but the line names the placeholder: %q", got.OneLine)
 					}
