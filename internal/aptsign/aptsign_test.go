@@ -198,6 +198,41 @@ func TestRetireRefusesAnAmbiguousPrefix(t *testing.T) {
 	}
 }
 
+// TestRetireDuringAThreeKeyOverlap drives the case the length floor exists
+// for. Suffix matching dropped every entity it matched, so one mistyped
+// character during an overlapping rotation closed the window on all three keys
+// at once and the success line echoed the argument, not what left.
+func TestRetireDuringAThreeKeyOverlap(t *testing.T) {
+	kr := testKey(t)
+	kr.Add(testKey(t))
+	kr.Add(testKey(t))
+	before := kr.Fingerprints()
+	if len(before) != 3 {
+		t.Fatalf("setup: %v, want three keys", before)
+	}
+	oldest := before[0]
+
+	for _, short := range []string{"2", oldest[len(oldest)-1:], oldest[:MinRetirePrefix-1]} {
+		if _, err := kr.Retire(short); err == nil {
+			t.Fatalf("Retire(%q) succeeded against a three-key file", short)
+		}
+	}
+	if got := kr.Fingerprints(); strings.Join(got, ",") != strings.Join(before, ",") {
+		t.Fatalf("a refused Retire changed the key ring: %v, want %v", got, before)
+	}
+
+	retired, err := kr.Retire(oldest)
+	if err != nil {
+		t.Fatalf("Retire(%s): %v", oldest, err)
+	}
+	if retired != oldest {
+		t.Errorf("Retire reported %q; the caller echoes this, so it has to name the key that left (%s)", retired, oldest)
+	}
+	if got := kr.Fingerprints(); strings.Join(got, ",") != strings.Join(before[1:], ",") {
+		t.Errorf("after Retire: %v, want the two remaining keys %v", got, before[1:])
+	}
+}
+
 // TestAddKeepsTheIncomingKeyLast fixes signature order. gpgv 2.5 stops at the
 // first signature whose key it does not hold, so the outgoing key has to sign
 // first: the rotation window exists for clients that have not updated.
