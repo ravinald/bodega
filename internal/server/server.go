@@ -70,6 +70,7 @@ type Server struct {
 	denyNets     []*net.IPNet
 	adminNets    []*net.IPNet // CIDRs allowed to reach the admin surface (admin_permit_cidr)
 	adminErr     error        // set when admin_permit_cidr parses to nothing; Start refuses on it
+	auditErr     error        // set when the configured audit sink will not record; Start refuses on it
 	// trustedNets are the proxies whose forwarded headers are believed.
 	// trustedNetsSet distinguishes "operator wrote an empty list" from
 	// "operator wrote nothing": the first trusts no header from anyone, the
@@ -208,15 +209,25 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 	} else {
 		logger.Error("could not load or create pepper file — token auth will not work", "error", err)
 	}
-	// Open the audit DB if configured. Best-effort — the package routes keep
-	// serving even if this fails, but token auth, upstream-policy enforcement
-	// and every /api/v1/audit read go with it, so it logs at Error: what the
-	// server answers changed, and the shipped default log_level prints only
-	// Error.
+	// Open the audit store and attach the configured sink. Held for Start to
+	// refuse on, not logged and continued: a proxy that cannot record who it
+	// refused is a proxy whose refusals are unauditable, and an audit store
+	// that fails open silently is the defect this design exists to prevent.
+	// The same posture the plaintext listener already has — bodega would
+	// rather not start than serve something the operator did not ask for.
+	//
+	// An unset audit_db is not a failure. It is an install that asked for no
+	// audit trail, and it keeps serving with token auth and policy
+	// enforcement off, as it did before.
 	if dbPath := resolveAuditDBPath(cfg); dbPath != "" {
-		if db, err := audit.Open(dbPath); err != nil {
-			logger.Error("could not open audit db; token auth, policy enforcement and the audit API are disabled",
-				"path", dbPath, "error", err)
+		sc := audit.SinkConfig{Kind: cfg.AuditSink, DSN: cfg.AuditSinkDSN}
+		if db, err := audit.OpenWithSink(dbPath, sc); err != nil {
+			s.auditErr = fmt.Errorf("audit store unavailable: %w\n"+
+				"  audit_db:   %s\n"+
+				"  audit_sink: %s\n"+
+				"bodega refuses to serve without the store that records its refusals. "+
+				"Fix the destination, or clear audit_db to run with no audit trail at all",
+				err, dbPath, firstNonEmptySink(cfg.AuditSink))
 		} else {
 			// The same two config keys the CLI applies to its own handle.
 			// Without them audit_events limited nothing the server wrote and
@@ -230,17 +241,28 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 						"audit_events", strings.Join(cfg.AuditEvents, ","))
 				}
 			}
-			if db.ReadOnly() {
-				// Record is a silent no-op on a read-only handle, so every
-				// denial, lifecycle and fetch row is discarded without an
-				// error anywhere. Query still works, which is what makes it
-				// invisible: /api/v1/audit answers, it just stops growing.
-				logger.Error("audit db is not writable by this process; every audit write will be silently dropped",
-					"path", dbPath)
+			if db.ReadOnly() && cfg.AuditSink == audit.SinkSQLite {
+				// Record is a silent no-op on a read-only sqlite handle, so
+				// every denial, lifecycle and fetch row would be discarded
+				// without an error anywhere. Query still works, which is what
+				// made it invisible: /api/v1/audit answered, it just stopped
+				// growing. Same class as a sink that will not connect, so it
+				// gets the same refusal.
+				s.auditErr = fmt.Errorf("audit db %s is not writable by this process (uid %d): "+
+					"every denial, fetch and lifecycle row would be dropped with no error anywhere. "+
+					"Give the serving user write access, or point audit_db somewhere it has it",
+					dbPath, os.Getuid())
 			}
 			s.auditDB = db
 			s.policy = policy.NewChecker(db)
-			logger.Info("audit db opened", "path", dbPath)
+			logger.Info("audit store opened", "path", dbPath, "sink", db.SinkName(), "queryable", db.EventsQueryable())
+			if !db.EventsQueryable() {
+				// Not a failure: the operator chose a write-only sink. It
+				// changes what the server answers, so it goes at Error, which
+				// the shipped default log_level prints.
+				logger.Error("audit_sink is write-only: GET /api/v1/audit answers 501, and `bodega discover list` and `bodega discover promote` refuse, rather than returning an empty page",
+					"sink", db.SinkName())
+			}
 		}
 	}
 	// Discover mode: only meaningful with both an audit DB (to write rows)
@@ -267,6 +289,16 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 	// already run LoadIndex by this point, so the manifests are current.
 	s.rebuildAptSnapshot(context.Background())
 	return s
+}
+
+// firstNonEmptySink names the sink for an error message. config.Load defaults
+// the key, but newServer is also reachable from tests holding a hand-built
+// Config, and an error that says audit_sink is "" helps nobody.
+func firstNonEmptySink(sink string) string {
+	if sink == "" {
+		return audit.SinkSQLite
+	}
+	return sink
 }
 
 // resolveAuditDBPath returns the audit database path from config, falling
@@ -367,6 +399,10 @@ func (s *Server) Start(ctx context.Context) error {
 
 	if s.adminErr != nil {
 		return s.adminErr
+	}
+
+	if s.auditErr != nil {
+		return s.auditErr
 	}
 
 	if err := s.guardPlaintext(); err != nil {
@@ -1118,6 +1154,16 @@ func (s *Server) handleAPIAudit(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.auditDB == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit database not configured"})
+		return
+	}
+	// 501 rather than 503: a write-only sink is a configuration this server
+	// will keep having, so "try again later" would be a lie. An empty 200 on a
+	// server that is recording everything is the worst available answer.
+	if !s.auditDB.EventsQueryable() {
+		writeJSON(w, http.StatusNotImplemented, map[string]string{
+			"error": (&audit.UnqueryableSinkError{Sink: s.auditDB.SinkName(), Op: "the audit events this endpoint returns"}).Error(),
+			"sink":  s.auditDB.SinkName(),
+		})
 		return
 	}
 	q := r.URL.Query()

@@ -152,7 +152,13 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		// would still catch a Save that dropped the key and let the default
 		// stand in for a persisted value.
 		"tls_min_version": "1.2",
-		"apt_suites":      []string{"value-apt_codename", "apt_suites-one"},
+		// audit_sink and audit_sink_dsn are cross-validated: sqlite refuses a
+		// dsn, postgres and jsonl require one. jsonl with an absolute path is
+		// a real combination and is not the default, so a Save that dropped
+		// either key still fails here.
+		"audit_sink":     "jsonl",
+		"audit_sink_dsn": "/var/log/bodega/audit.jsonl",
+		"apt_suites":     []string{"value-apt_codename", "apt_suites-one"},
 		"storage_backends": map[string]config.StorageSpec{
 			"bulk": {Driver: "local", Path: "/mnt/bulk", Prefix: "cold/"},
 		},
@@ -515,5 +521,97 @@ func TestLoad_LegacyShellHeight(t *testing.T) {
 	}
 	if got := string(keys["logwindow_height"]); got != "27" {
 		t.Errorf("logwindow_height = %s, want 27 (legacy value promoted on save)", got)
+	}
+}
+
+// audit_sink is refused at load rather than at the first write. Half of these
+// cases are not the enum: a postgres with no DSN, a relative jsonl path and a
+// sqlite carrying a DSN each produce a running server whose audit trail goes
+// somewhere the operator did not intend, which is the failure the sink design
+// exists to prevent.
+func TestAuditSinkValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		wants      []string
+		wantSink   string
+	}{
+		{
+			name:     "unset defaults to sqlite",
+			body:     `{}`,
+			wantSink: "sqlite",
+		},
+		{
+			name:     "sqlite loads",
+			body:     `{"audit_sink": "sqlite"}`,
+			wantSink: "sqlite",
+		},
+		{
+			name:     "syslog with no dsn is the local daemon",
+			body:     `{"audit_sink": "syslog"}`,
+			wantSink: "syslog",
+		},
+		{
+			name:     "jsonl with an absolute path loads",
+			body:     `{"audit_sink": "jsonl", "audit_sink_dsn": "/var/log/bodega/audit.jsonl"}`,
+			wantSink: "jsonl",
+		},
+		{
+			name:  "unknown sink names the four",
+			body:  `{"audit_sink": "mysql"}`,
+			wants: []string{`invalid audit_sink "mysql"`, "sqlite, postgres, syslog, jsonl"},
+		},
+		{
+			name:  "postgres needs a dsn",
+			body:  `{"audit_sink": "postgres"}`,
+			wants: []string{"needs audit_sink_dsn", "postgres://"},
+		},
+		{
+			name:  "jsonl needs a dsn",
+			body:  `{"audit_sink": "jsonl"}`,
+			wants: []string{"needs audit_sink_dsn", ".jsonl"},
+		},
+		{
+			name:  "a relative jsonl path is refused",
+			body:  `{"audit_sink": "jsonl", "audit_sink_dsn": "audit.jsonl"}`,
+			wants: []string{"must be absolute", "working directory"},
+		},
+		{
+			name:  "sqlite refuses a dsn rather than ignoring it",
+			body:  `{"audit_sink": "sqlite", "audit_sink_dsn": "/tmp/x.jsonl"}`,
+			wants: []string{"takes no audit_sink_dsn", "audit_db"},
+		},
+		{
+			name:  "an unknown syslog network is refused",
+			body:  `{"audit_sink": "syslog", "audit_sink_dsn": "smtp://logs.internal:514"}`,
+			wants: []string{"unknown network", "tcp, udp, unix"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateConfig(t)
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			t.Setenv(config.EnvConfigFile, path)
+
+			cfg, err := config.Load(t.TempDir(), "", "", "", false, false)
+			if len(tc.wants) == 0 {
+				if err != nil {
+					t.Fatalf("Load: %v", err)
+				}
+				if cfg.AuditSink != tc.wantSink {
+					t.Errorf("AuditSink = %q, want %q", cfg.AuditSink, tc.wantSink)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Load accepted %s", tc.body)
+			}
+			for _, want := range tc.wants {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("Load error = %v, want mention of %q", err, want)
+				}
+			}
+		})
 	}
 }

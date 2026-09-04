@@ -307,27 +307,39 @@ func loadStore(gf *globalFlags) (*manifest.Store, error) {
 	return store, nil
 }
 
-// openAuditDB opens the audit database from config, configures timezone and
-// event filtering, and returns it. Returns nil (not an error) if the audit DB
-// path is empty or the DB cannot be opened -- audit is best-effort.
+// openAuditDB opens the audit store from config, attaches the configured event
+// sink, and applies timezone and event filtering. Returns nil (not an error)
+// if the path is empty or the store cannot be opened -- a one-shot CLI write
+// is best-effort and says so on stderr. `bodega serve` takes the opposite
+// answer and refuses to start; see internal/server.Server.auditErr.
 func openAuditDB(gf *globalFlags) *audit.DB {
+	db, err := openAuditDBErr(gf)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
+		return nil
+	}
+	return db
+}
+
+// openAuditDBErr is openAuditDB with the reason kept. Read commands use it so
+// "postgres refused the connection" does not arrive as "could not open audit
+// database". A nil *DB with a nil error means no audit store is configured.
+func openAuditDBErr(gf *globalFlags) (*audit.DB, error) {
 	cfg, err := loadConfig(gf)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not load config: %v\n", err)
-		return nil
+		return nil, fmt.Errorf("could not load config: %w", err)
 	}
 	dbPath := cfg.AuditDB
 	if dbPath == "" {
 		if cfg.LogDir != "" {
 			dbPath = filepath.Join(cfg.LogDir, "audit.db")
 		} else {
-			return nil
+			return nil, nil
 		}
 	}
-	db, err := audit.Open(dbPath)
+	db, err := audit.OpenWithSink(dbPath, audit.SinkConfig{Kind: cfg.AuditSink, DSN: cfg.AuditSinkDSN})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not open audit db: %v\n", err)
-		return nil
+		return nil, fmt.Errorf("could not open audit store at %s: %w", dbPath, err)
 	}
 	if cfg.Timezone != "" {
 		db.SetTimezone(cfg.Timezone)
@@ -335,7 +347,26 @@ func openAuditDB(gf *globalFlags) *audit.DB {
 	if len(cfg.AuditEvents) > 0 {
 		db.SetEventFilter(cfg.AuditEvents)
 	}
-	return db
+	return db, nil
+}
+
+// openQueryableAuditDB is the read path's opener: it refuses when the
+// configured sink keeps no table, so a discovery or event query says which
+// sink cannot answer instead of printing an empty result on a working server.
+// op names what was being read.
+func openQueryableAuditDB(gf *globalFlags, op string) (*audit.DB, error) {
+	db, err := openAuditDBErr(gf)
+	if err != nil {
+		return nil, err
+	}
+	if db == nil {
+		return nil, fmt.Errorf("no audit store is configured: set audit_db (or log_dir) in config.json")
+	}
+	if !db.EventsQueryable() {
+		defer func() { _ = db.Close() }()
+		return nil, &audit.UnqueryableSinkError{Sink: db.SinkName(), Op: op}
+	}
+	return db, nil
 }
 
 // notifyServer sends SIGHUP to the running bodega serve process (if any)

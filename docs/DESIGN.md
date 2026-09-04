@@ -38,7 +38,7 @@ Three problems kept showing up:
                           +------------------+
 ```
 
-The server is a single Go binary. No database server, no message queue, no container runtime. State lives in two places: manifest JSON files (what should exist) and an S3 bucket (what does exist). A SQLite file handles the audit trail.
+The server is a single Go binary. No database server, no message queue, no container runtime. State lives in two places: manifest JSON files (what should exist) and an S3 bucket (what does exist). A SQLite file handles the audit trail, and `audit_sink` can send the event half of it to postgres, syslog or a JSONL file instead.
 
 ### S3 bucket layout
 
@@ -225,10 +225,11 @@ Currently logged at `Error` under this rule:
 | Plaintext authorized on `:443` | Every request and response is in the clear on the port clients read as TLS | `guardPlaintext`, `internal/server/server.go` |
 | A retired `tls_autocert: true` with no cert pair | The key that promised TLS promises nothing; the server binds in the clear or refuses | `reportRetiredTLSKeys`, `cmd/bodega/cmd_serve.go` |
 | Pepper file unreadable | Token auth does not work | `newServer`, `internal/server/server.go` |
-| Audit database will not open | Token auth, policy enforcement and every `/api/v1/audit` read are disabled | `newServer`, `internal/server/server.go` |
-| Audit database is not writable | `Record` no-ops and `Query` keeps answering, so `/api/v1/audit` responds and silently stops growing | `newServer`, `internal/server/server.go` |
 | `audit_events` omits `denied` | No refusal the server makes is recorded, and the journal is the only copy | `newServer`, `internal/server/server.go` |
+| `audit_sink` is write-only | `GET /api/v1/audit` answers 501 and the discovery reads refuse, rather than returning an empty page | `newServer`, `internal/server/server.go` |
 | `git` or `git-http-backend` absent | The smart-HTTP route is never registered, so `git clone` 404s; the bundle route is unaffected | `resolveGitTool`, `internal/server/githttp.go` |
+
+Two audit conditions moved past this rule and are now **fatal for `serve`**: an audit store that will not open, and an `audit_db` the process cannot write. Both used to log at `Error` and continue, which left a server that answers `/healthz` while dropping the record of every request it refuses. Held on `Server.auditErr` and returned from `Start` before the listener binds, the same shape `adminErr` already had. An unset `audit_db` is not one of them: that is an install that asked for no audit trail.
 
 Left at `Warn` on purpose, because what gets served is what was asked for: an authorized plaintext listener off `:443` (the documented reverse-proxy deployment), a retired `tls_autocert: true` on a host whose `tls_cert`/`tls_key` are serving, and the ACL disagreement line, where the database is the documented owner and is doing what the operator told it — the config file's copy is inert by design, not degraded.
 
@@ -455,7 +456,17 @@ Every manifest JSON file has a companion `.md5` file. On load, the MD5 is verifi
 
 ## Audit trail
 
-A SQLite database (WAL mode) records:
+The trail has two halves that look alike and are not, and only one of them is pluggable.
+
+The **event stream** is append-only: written on the hot path, read for reporting, never read to make a decision. It is `EventSink`, two methods (`Record`, `RecordDiscovery`), selected by `audit_sink` from a closed set of four — `sqlite` (the default), `postgres`, `syslog`, `jsonl`. **Operational state** — ACL lists, API tokens, cached checksums, the age, OSV and upstream policies — stays in the embedded SQLite database at `audit_db` under every sink. The request path reads it to decide whether an address is permitted, whether a Bearer token is live and whether an upstream is allowed; those reads need a transactional read-modify-write and a queryable store, so a sink that can only append cannot hold them, and a remote one would put a network round trip inside every request bodega serves.
+
+`*audit.DB` is that embedded store and also the front door to the sink. Reads either delegate to a sink implementing `EventReader` or refuse with an `UnqueryableSinkError` naming the configured sink. They never fall back to the local tables: answering from a store the events are no longer going to is the lie this split exists to avoid. `internal/audit/conformance_test.go` holds all four sinks to one contract, B9'"'"'s eight-writers case included, the way `internal/storage/conformance_test.go` does for the object stores.
+
+**One sink, not a list.** Teeing a write-only sink alongside `sqlite` would keep `bodega discover promote` working while events reached the SIEM, and would also keep the write rate the operator switched away from, plus a second write per event on the hot path. `postgres` is the answer for "queryable at fleet rates"; choosing `syslog` or `jsonl` is choosing to give up the queries, and bodega refuses those reads by name rather than half-answering.
+
+**Postgres reuses none of the ten SQLite migrations.** `internal/audit/migrations_postgres/` is one file holding `events` and `upstream_discovery`, because a sink implements two tables and the other eight files describe operational state that never moves. The `decision` CHECK is copied verbatim so a sink swap cannot widen what the discovery table accepts, and the write-only sinks enforce the same set in code, having no constraint to lean on. The two migration sets are versioned independently, each with its own downgrade guardrail. An operator switching an existing install to `postgres` keeps the SQLite file — it still holds the ACLs and tokens — and its historical events stay there, invisible to a query answered by postgres. Nothing copies them across; see `docs/USAGE.md`.
+
+Under `sqlite`, a SQLite database (WAL mode) records:
 
 - **fetch events**: Which client IP downloaded which package, when, and how long it took
 - **build events**: Pipeline stage completions
@@ -500,7 +511,9 @@ Key fields:
 | `api_token` | (none) | Bearer token for mutation API |
 | `tls_cert` / `tls_key` | (none) | Manual TLS. Setting one without the other is fatal at load, not a request for plaintext |
 | `allow_plaintext` | false | Authorizes an unencrypted listener. With no cert pair `bodega serve` refuses to bind without it, and refuses on `:443` naming the port |
-| `audit_db` | {log_dir}/audit.db | Audit database path |
+| `audit_db` | {log_dir}/audit.db | Embedded store: the event stream under `audit_sink: sqlite`, and the ACLs, tokens, checksums and policies under every sink |
+| `audit_sink` | sqlite | Where the event stream goes: `sqlite`, `postgres`, `syslog` or `jsonl`. An unknown value is refused at load |
+| `audit_sink_dsn` | (none) | Destination for the sink: a libpq string, a syslog `scheme://address`, or an absolute JSONL path. Refused with `sqlite` rather than ignored |
 | `git_upstreams` | {} | Namespaces under `/git/` mapped onto an upstream forge, each in `open` or `catalog` mode |
 | `binary_upstreams` | {} | Namespaces under `/binaries/` mapped onto an upstream download host, each in `open` or `catalog` mode. While empty, `/binaries/` serves from storage as before |
 

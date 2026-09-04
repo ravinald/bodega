@@ -76,9 +76,9 @@ Examples:
 				}
 			}
 
-			adb := openAuditDB(gf)
-			if adb == nil {
-				return fmt.Errorf("could not open audit database")
+			adb, err := openQueryableAuditDB(gf, "the discovery buckets `discover list` aggregates")
+			if err != nil {
+				return err
 			}
 			defer adb.Close()
 
@@ -117,9 +117,9 @@ func newDiscoverShowCmd(gf *globalFlags) *cobra.Command {
 				return err
 			}
 
-			adb := openAuditDB(gf)
-			if adb == nil {
-				return fmt.Errorf("could not open audit database")
+			adb, err := openQueryableAuditDB(gf, "the discovery rows `discover show` prints")
+			if err != nil {
+				return err
 			}
 			defer adb.Close()
 
@@ -232,9 +232,9 @@ nothing.`,
 				return errUnknownPromoteTarget(as)
 			}
 
-			adb := openAuditDB(gf)
-			if adb == nil {
-				return fmt.Errorf("could not open audit database")
+			adb, err := openQueryableAuditDB(gf, "the discovery buckets `discover promote-all` walks")
+			if err != nil {
+				return err
 			}
 			defer adb.Close()
 
@@ -307,9 +307,9 @@ func newDiscoverClearCmd(gf *globalFlags) *cobra.Command {
 				}
 			}
 
-			adb := openAuditDB(gf)
-			if adb == nil {
-				return fmt.Errorf("could not open audit database")
+			adb, err := openQueryableAuditDB(gf, "the discovery rows `discover clear` deletes")
+			if err != nil {
+				return err
 			}
 			defer adb.Close()
 
@@ -345,9 +345,9 @@ func newDiscoverExportCmd(gf *globalFlags) *cobra.Command {
 				}
 			}
 
-			adb := openAuditDB(gf)
-			if adb == nil {
-				return fmt.Errorf("could not open audit database")
+			adb, err := openQueryableAuditDB(gf, "the discovery rows `discover export` writes out")
+			if err != nil {
+				return err
 			}
 			defer adb.Close()
 
@@ -402,9 +402,9 @@ func promoteOne(gf *globalFlags, regType, pattern, comment string) error {
 		return err
 	}
 
-	adb := openAuditDB(gf)
-	if adb == nil {
-		return fmt.Errorf("could not open audit database")
+	adb, err := openQueryableAuditDB(gf, "the discovery rows `discover promote` promotes from")
+	if err != nil {
+		return err
 	}
 	defer adb.Close()
 
@@ -675,9 +675,9 @@ func promoteManifest(gf *globalFlags, out io.Writer, regType, pattern string) er
 		return err
 	}
 
-	adb := openAuditDB(gf)
-	if adb == nil {
-		return fmt.Errorf("could not open audit database")
+	adb, err := openQueryableAuditDB(gf, "the discovery rows `discover promote` builds a manifest from")
+	if err != nil {
+		return err
 	}
 	defer adb.Close()
 
@@ -855,9 +855,9 @@ func generateManifests(gf *globalFlags, out, errOut io.Writer, regType string, o
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	adb := openAuditDB(gf)
-	if adb == nil {
-		return fmt.Errorf("could not open audit database")
+	adb, err := openQueryableAuditDB(gf, "the discovery rows `discover generate-manifests` reads")
+	if err != nil {
+		return err
 	}
 	defer adb.Close()
 

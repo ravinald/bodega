@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -80,8 +81,14 @@ S3 coverage, storage usage, and recent activity.
 			// Collect audit activity.
 			var fetches24h, builds24h, creates24h int
 			if cfg.AuditDB != "" {
-				db, err := audit.Open(cfg.AuditDB)
-				if err == nil {
+				db, err := audit.OpenWithSink(cfg.AuditDB, audit.SinkConfig{Kind: cfg.AuditSink, DSN: cfg.AuditSinkDSN})
+				if err == nil && !db.EventsQueryable() {
+					// Counting from the local tables under a write-only sink
+					// would print zeros for a fleet that is busy, which reads
+					// as "nothing happened" rather than "ask somewhere else".
+					fmt.Fprintf(os.Stderr, "note: audit_sink %q keeps no table, so 24h activity counts are unavailable\n", db.SinkName())
+					_ = db.Close()
+				} else if err == nil {
 					defer db.Close()
 					since := time.Now().Add(-24 * time.Hour)
 					f1, _ := db.Count(ctx, audit.Filter{EventType: audit.EventFetch, Since: since})

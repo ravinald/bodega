@@ -2,9 +2,6 @@ package audit
 
 import (
 	"context"
-	"database/sql"
-	"fmt"
-	"strings"
 	"time"
 )
 
@@ -26,6 +23,24 @@ const (
 	DecisionNoManifest  = "no_manifest"  // request named a package with no manifest entry
 	DecisionNoNamespace = "no_namespace" // request named a namespace no upstream is configured for
 )
+
+// Decisions returns the decision set in a stable order, for the error text a
+// sink prints when it refuses a value outside it.
+func Decisions() []string {
+	return []string{DecisionAllowed, DecisionDenied, DecisionNoPolicy, DecisionNoManifest, DecisionNoNamespace}
+}
+
+// ValidDecision reports whether d is in the set the upstream_discovery CHECK
+// allows. The queryable sinks get this from the constraint; the write-only
+// ones have nothing to enforce it, so they call this before encoding.
+func ValidDecision(d string) bool {
+	for _, v := range Decisions() {
+		if v == d {
+			return true
+		}
+	}
+	return false
+}
 
 // DiscoveryRow is one request observation, whether the cache answered it or an
 // upstream fetch did. Rows are deduplicated at insert time on
@@ -59,88 +74,23 @@ type DiscoveryFilter struct {
 	Limit        int       // 0 = default (1000)
 }
 
-// RecordDiscovery upserts an observation. Read-only handles are silently
-// dropped (matches the existing Record behavior).
+// RecordDiscovery upserts an observation into the configured sink. A
+// write-only sink cannot deduplicate, so it emits one record per call and the
+// rollup happens wherever the stream lands; see the DiscoveryRow comment for
+// what the queryable sinks collapse.
 func (a *DB) RecordDiscovery(ctx context.Context, r DiscoveryRow) error {
-	if a.readOnly {
-		return nil
-	}
-	_, err := a.db.ExecContext(ctx,
-		`INSERT INTO upstream_discovery
-		   (registry_type, host, pattern_hint, pkg_name, pkg_version, decision, last_client, upstream_url)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(registry_type, pattern_hint, pkg_name, pkg_version, decision)
-		 DO UPDATE SET
-		   request_count = request_count + 1,
-		   last_seen     = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-		   last_client   = excluded.last_client,
-		   host          = CASE WHEN excluded.host = '' THEN upstream_discovery.host ELSE excluded.host END,
-		   upstream_url  = CASE WHEN excluded.upstream_url = '' THEN upstream_discovery.upstream_url ELSE excluded.upstream_url END`,
-		r.RegistryType, r.Host, r.PatternHint, r.PkgName, r.PkgVersion, r.Decision, r.LastClient, r.UpstreamURL,
-	)
-	return err
+	return a.sink.RecordDiscovery(ctx, r)
 }
 
 // ListDiscovery returns observations matching the filter, newest last_seen
-// first. Default limit is 1000 when filter.Limit <= 0.
+// first. Default limit is 1000 when filter.Limit <= 0. Refuses when the
+// configured sink keeps no table.
 func (a *DB) ListDiscovery(ctx context.Context, f DiscoveryFilter) ([]DiscoveryRow, error) {
-	var where []string
-	var args []any
-
-	if f.RegistryType != "" {
-		where = append(where, "registry_type = ?")
-		args = append(args, f.RegistryType)
-	}
-	if f.PatternHint != "" {
-		where = append(where, "pattern_hint = ?")
-		args = append(args, f.PatternHint)
-	}
-	if f.Decision != "" {
-		where = append(where, "decision = ?")
-		args = append(args, f.Decision)
-	}
-	if !f.Since.IsZero() {
-		where = append(where, "last_seen >= ?")
-		args = append(args, f.Since.UTC().Format(time.RFC3339Nano))
-	}
-
-	q := `SELECT registry_type, host, pattern_hint, pkg_name, pkg_version, decision,
-	             upstream_url, first_seen, last_seen, last_client, request_count
-	      FROM upstream_discovery`
-	if len(where) > 0 {
-		//nolint:gosec // G202: WHERE clause assembled from a fixed slice of internal predicates; values are bound via ? parameters in `args`.
-		q += " WHERE " + strings.Join(where, " AND ")
-	}
-	q += " ORDER BY last_seen DESC"
-	limit := f.Limit
-	if limit <= 0 {
-		limit = 1000
-	}
-	//nolint:gosec // G202: LIMIT clause built from a clamped int literal, no user-controlled string interpolation.
-	q += fmt.Sprintf(" LIMIT %d", limit)
-
-	rows, err := a.db.QueryContext(ctx, q, args...)
+	r, err := a.reader("discovery rows")
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var out []DiscoveryRow
-	for rows.Next() {
-		var r DiscoveryRow
-		var firstSeen, lastSeen string
-		if err := rows.Scan(&r.RegistryType, &r.Host, &r.PatternHint, &r.PkgName, &r.PkgVersion,
-			&r.Decision, &r.UpstreamURL, &firstSeen, &lastSeen, &r.LastClient, &r.RequestCount); err != nil {
-			return nil, err
-		}
-		r.FirstSeen, _ = time.Parse(time.RFC3339Nano, firstSeen)
-		r.LastSeen, _ = time.Parse(time.RFC3339Nano, lastSeen)
-		out = append(out, r)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("scan discovery: %w", err)
-	}
-	return out, nil
+	return r.ListDiscovery(ctx, f)
 }
 
 // DiscoveryAggregate is one (registry_type, pattern_hint) bucket, summed over
@@ -158,89 +108,34 @@ type DiscoveryAggregate struct {
 }
 
 // AggregateDiscovery rolls observations into one row per (type, pattern_hint).
-// Optional registryType filter ("" = all).
+// Optional registryType filter ("" = all). Refuses when the configured sink
+// keeps no table.
 func (a *DB) AggregateDiscovery(ctx context.Context, registryType string) ([]DiscoveryAggregate, error) {
-	var (
-		rows *sql.Rows
-		err  error
-	)
-	q := `SELECT registry_type, pattern_hint,
-	             MAX(host)                       AS host,
-	             SUM(request_count)              AS total,
-	             MIN(first_seen)                 AS first_seen,
-	             MAX(last_seen)                  AS last_seen,
-	             GROUP_CONCAT(DISTINCT decision) AS decisions,
-	             MAX(upstream_url)               AS sample_upstream
-	      FROM upstream_discovery`
-	if registryType != "" {
-		q += " WHERE registry_type = ?"
-		q += " GROUP BY registry_type, pattern_hint ORDER BY last_seen DESC"
-		rows, err = a.db.QueryContext(ctx, q, registryType)
-	} else {
-		q += " GROUP BY registry_type, pattern_hint ORDER BY last_seen DESC"
-		rows, err = a.db.QueryContext(ctx, q)
-	}
+	r, err := a.reader("discovery rows")
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var out []DiscoveryAggregate
-	for rows.Next() {
-		var a DiscoveryAggregate
-		var firstSeen, lastSeen string
-		var decisions, sampleUpstream sql.NullString
-		if err := rows.Scan(&a.RegistryType, &a.PatternHint, &a.Host, &a.RequestCount,
-			&firstSeen, &lastSeen, &decisions, &sampleUpstream); err != nil {
-			return nil, err
-		}
-		a.FirstSeen, _ = time.Parse(time.RFC3339Nano, firstSeen)
-		a.LastSeen, _ = time.Parse(time.RFC3339Nano, lastSeen)
-		if decisions.Valid {
-			a.Decisions = decisions.String
-		}
-		if sampleUpstream.Valid {
-			a.SampleUpstream = sampleUpstream.String
-		}
-		out = append(out, a)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("scan discovery aggregate: %w", err)
-	}
-	return out, nil
+	return r.AggregateDiscovery(ctx, registryType)
 }
 
 // ClearDiscovery deletes rows for registryType. Empty = wipe table. Returns
-// rows deleted.
+// rows deleted. Refuses when the configured sink keeps no table: there is
+// nothing local to clear, and reporting 0 deleted would read as an empty table.
 func (a *DB) ClearDiscovery(ctx context.Context, registryType string) (int64, error) {
-	var (
-		res sql.Result
-		err error
-	)
-	if registryType == "" {
-		res, err = a.db.ExecContext(ctx, `DELETE FROM upstream_discovery`)
-	} else {
-		res, err = a.db.ExecContext(ctx,
-			`DELETE FROM upstream_discovery WHERE registry_type = ?`, registryType)
-	}
+	r, err := a.reader("discovery rows")
 	if err != nil {
 		return 0, err
 	}
-	n, _ := res.RowsAffected()
-	return n, nil
+	return r.ClearDiscovery(ctx, registryType)
 }
 
 // DiscoveryCount returns the row count for the given type ("" = all). Used by
-// CLI guards ("no observations yet — is discover_mode set?").
+// CLI guards ("no observations yet — is discover_mode set?"). Refuses when the
+// configured sink keeps no table.
 func (a *DB) DiscoveryCount(ctx context.Context, registryType string) (int64, error) {
-	var n int64
-	var err error
-	if registryType == "" {
-		err = a.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM upstream_discovery`).Scan(&n)
-	} else {
-		err = a.db.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM upstream_discovery WHERE registry_type = ?`,
-			registryType).Scan(&n)
+	r, err := a.reader("discovery rows")
+	if err != nil {
+		return 0, err
 	}
-	return n, err
+	return r.DiscoveryCount(ctx, registryType)
 }
