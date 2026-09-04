@@ -289,6 +289,12 @@ func TestNoListingWhenEveryEntryCarriesPoolPath(t *testing.T) {
 // TestLateDebIsNotHiddenByTheCachedListing is the freshness half. A .deb that
 // reached the pool after the cached listing was taken used to stay out of the
 // index for the whole metadata_ttl, and stay out silently.
+//
+// The window is now aptPoolRelistFloor rather than metadata_ttl, and the test
+// drives both sides of it. Retaking the listing for every unresolved entry
+// instead charged a full listing, per backend, to every apt write for as long
+// as one staged entry waited for its .deb — and a staged entry waits for as
+// long as the operator takes. Fifteen seconds is the price of that bound.
 func TestLateDebIsNotHiddenByTheCachedListing(t *testing.T) {
 	s, cs, _ := refreshTestServer(t)
 	seedFallbackEntry(t, s)
@@ -296,6 +302,17 @@ func TestLateDebIsNotHiddenByTheCachedListing(t *testing.T) {
 	// A listing taken before the .deb landed, still well inside the TTL.
 	s.aptPool.Store(&aptPoolListing{keys: []string{}, at: time.Now()})
 	cs.Seed("packages/apt/pool/main/l/late/late_2.0.0_amd64.deb", "\x00deb")
+	cs.listCalls.Store(0)
+
+	s.rebuildAptSnapshot(t.Context())
+	if n := cs.listCalls.Load(); n != 0 {
+		t.Errorf("%d pool listings inside the relist floor, want 0: an unresolved entry is the normal state between 'pkg create' and 'pkg build', and every apt write would pay for one", n)
+	}
+
+	// The same cached listing, now older than the floor. Nothing about the
+	// manifest changed; the entry being unresolved is the whole signal that
+	// an object may have landed since.
+	s.aptPool.Store(&aptPoolListing{keys: []string{}, at: time.Now().Add(-aptPoolRelistFloor - time.Second)})
 
 	s.rebuildAptSnapshot(t.Context())
 
@@ -306,6 +323,23 @@ func TestLateDebIsNotHiddenByTheCachedListing(t *testing.T) {
 	packages := string(snap.suites["noble"].packages["amd64"])
 	if !strings.Contains(packages, "Package: late") {
 		t.Errorf("a .deb uploaded after the cached listing stayed out of the index:\n%s", packages)
+	}
+}
+
+// TestColdPoolCacheListsOnce covers the startup path, which is always a cold
+// cache. Consulting the cache, missing, listing, and then failing the same
+// freshness check that listing was taken to answer cost two full walks of the
+// pool against every configured backend on every start.
+func TestColdPoolCacheListsOnce(t *testing.T) {
+	s, cs, _ := refreshTestServer(t)
+	seedFallbackEntry(t, s) // unresolved: no .deb for it in the pool
+	s.aptPool.Store(nil)
+	cs.listCalls.Store(0)
+
+	s.rebuildAptSnapshot(t.Context())
+
+	if n := cs.listCalls.Load(); n != 1 {
+		t.Errorf("%d pool listings on a cold cache, want 1", n)
 	}
 }
 

@@ -18,6 +18,7 @@ import (
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/placement"
 	bos3 "github.com/ravinald/bodega/internal/s3"
+	"github.com/ravinald/bodega/internal/server"
 	"github.com/ravinald/bodega/internal/storage"
 )
 
@@ -221,35 +222,57 @@ func executeVerify(cfg *config.Config, store *manifest.Store) tea.Cmd {
 
 // executeFreeze toggles the frozen flag for the given entry and returns a
 // tea.Cmd. The store is mutated and saved; refresh=true so the tree rebuilds.
-func executeFreeze(entryType, entryName string, store *manifest.Store, auditDB *audit.DB) tea.Cmd {
+func executeFreeze(entryType, entryName string, cfg *config.Config, store *manifest.Store, auditDB *audit.DB) tea.Cmd {
 	return func() tea.Msg {
 		var buf bytes.Buffer
-		err := runFreeze(&buf, store, entryType, entryName, auditDB)
+		err := runFreeze(&buf, cfg, store, entryType, entryName, auditDB)
 		return cmdOutputMsg{output: buf.String(), refresh: err == nil, err: err}
 	}
 }
 
 // executeDelete removes the named entry from the manifest and returns a
 // tea.Cmd. refresh=true causes the sources tree to rebuild.
-func executeDelete(entryType, entryName string, store *manifest.Store, auditDB *audit.DB) tea.Cmd {
+func executeDelete(entryType, entryName string, cfg *config.Config, store *manifest.Store, auditDB *audit.DB) tea.Cmd {
 	return func() tea.Msg {
 		var buf bytes.Buffer
-		err := runDelete(&buf, store, entryType, entryName, auditDB)
+		err := runDelete(&buf, cfg, store, entryType, entryName, auditDB)
 		return cmdOutputMsg{output: buf.String(), refresh: err == nil, err: err}
 	}
 }
 
 // executeRemoveFromS3 deletes the artifact from S3 without touching the
 // manifest and returns a tea.Cmd. refresh=true re-checks S3 status.
-func executeRemoveFromS3(entryType, entryName string, store *manifest.Store, stores storage.Resolver) tea.Cmd {
+func executeRemoveFromS3(entryType, entryName string, cfg *config.Config, store *manifest.Store, stores storage.Resolver) tea.Cmd {
 	return func() tea.Msg {
 		var buf bytes.Buffer
-		err := runRemove(&buf, store, stores, entryType, entryName)
+		err := runRemove(&buf, cfg, store, stores, entryType, entryName)
 		return cmdOutputMsg{output: buf.String(), refresh: err == nil, err: err}
 	}
 }
 
-// --- lower-level run helpers (shared with legacy shell_pane runCommand) ---
+// --- lower-level run helpers ---
+
+// signalServer tells a running bodega serve that what it publishes changed.
+//
+// The CLI classifies each verb where it is registered and one cobra hook sends
+// the signal; nothing in the TUI passes through cobra, so a freeze or a delete
+// here left the entry published until the hourly tick swept it up — the same
+// defect B6 fixed for the CLI, arriving by a second route. The signal lives in
+// these run helpers rather than in the tea.Cmd wrappers above them so a future
+// caller reaching a mutating verb directly gets it too, which is how the first
+// route came to be missed.
+//
+// A failure is reported and never fatal: the mutation has already committed by
+// the time this runs, and the tick is the floor under a signal that did not
+// land.
+func signalServer(buf *bytes.Buffer, cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	if err := server.NotifyReload(cfg.LogDir); err != nil {
+		fmt.Fprintf(buf, "warning: could not notify server: %v\n", err)
+	}
+}
 
 func runFetch(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, args []string) error {
 	entryFilter, remaining := extractFlag(args, "--entry")
@@ -324,7 +347,7 @@ func runInit(buf *bytes.Buffer, cfg *config.Config, s3client *bos3.Client) error
 	return bos3.InitBucket(context.Background(), s3client.S3Client(), cfg.Bucket, cfg.Region)
 }
 
-func runDelete(buf *bytes.Buffer, store *manifest.Store, entryType, name string, auditDB *audit.DB) error {
+func runDelete(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, entryType, name string, auditDB *audit.DB) error {
 	if !isValidType(entryType) {
 		return fmt.Errorf("unknown type %q", entryType)
 	}
@@ -363,6 +386,7 @@ func runDelete(buf *bytes.Buffer, store *manifest.Store, entryType, name string,
 			Details:   audit.FormatDiff(beforeJSON, nil),
 		})
 	}
+	signalServer(buf, cfg)
 	return nil
 }
 
@@ -374,7 +398,7 @@ func runDelete(buf *bytes.Buffer, store *manifest.Store, entryType, name string,
 // bodega is idempotent, so a delete aimed at a key nothing wrote reports the
 // same "Deleted." as one that worked, and this is the last place the two can
 // still be told apart.
-func runRemove(buf *bytes.Buffer, store *manifest.Store, stores storage.Resolver, entryType, name string) error {
+func runRemove(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, stores storage.Resolver, entryType, name string) error {
 	if stores == nil {
 		return fmt.Errorf("remove requires a configured storage backend")
 	}
@@ -426,6 +450,7 @@ func runRemove(buf *bytes.Buffer, store *manifest.Store, stores storage.Resolver
 		}
 	}
 	fmt.Fprintf(buf, "Deleted %d object(s).\n", removed)
+	signalServer(buf, cfg)
 	return nil
 }
 
@@ -440,7 +465,7 @@ func versionLabel(ve manifest.VersionEntry) string {
 	return "?"
 }
 
-func runFreeze(buf *bytes.Buffer, store *manifest.Store, entryType, name string, auditDB *audit.DB) error {
+func runFreeze(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, entryType, name string, auditDB *audit.DB) error {
 	if !isValidType(entryType) {
 		return fmt.Errorf("unknown type %q", entryType)
 	}
@@ -483,6 +508,7 @@ func runFreeze(buf *bytes.Buffer, store *manifest.Store, entryType, name string,
 			Details:   audit.FormatDiff(beforeJSON, afterJSON),
 		})
 	}
+	signalServer(buf, cfg)
 	return nil
 }
 

@@ -169,10 +169,15 @@ func TestListFanoutFailsRequestOnBackendError(t *testing.T) {
 // entries all carry one never lists at all, which is the cheaper path
 // TestNoListingWhenEveryEntryCarriesPoolPath covers. This is the case where
 // the listing is genuinely needed and the cache is what bounds it.
+//
+// That entry's .deb is deliberately absent from the pool. A fallback that
+// resolves proves nothing here: the re-list this bound was lost to only fires
+// when one does not, and staging an entry before uploading its .deb is the
+// ordinary way to hold one unresolved for hours. Seeding it made the test
+// green against a rebuild that listed the pool on every write.
 func TestAptPoolListingIsCached(t *testing.T) {
 	mem := storage.NewMemory()
 	mem.Seed("packages/apt/pool/main/h/hello/hello_1.0_amd64.deb", "\x00deb")
-	mem.Seed("packages/apt/pool/main/o/older/older_0.9_amd64.deb", "\x00deb")
 	counting := &countingStore{ObjectStore: mem}
 
 	store := manifest.NewLocalStore(t.TempDir())
@@ -201,7 +206,7 @@ func TestAptPoolListingIsCached(t *testing.T) {
 
 	after := counting.lists.Load()
 	if after != 1 {
-		t.Fatalf("startup listed the pool %d times, want 1", after)
+		t.Fatalf("startup listed the pool %d times, want 1; a listing taken on this call cannot be stale to it", after)
 	}
 
 	for i := 0; i < 3; i++ {

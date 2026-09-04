@@ -293,6 +293,16 @@ const (
 	// hour with 240 ERROR lines; doubling makes it 7.
 	aptRetryFactor = 2
 
+	// aptPoolRelistFloor is the shortest gap between two pool listings taken
+	// because a fallback entry resolved to nothing. The state that provokes
+	// them does not clear on its own — an entry staged before its .deb is
+	// uploaded stays unresolved for as long as the operator takes — so
+	// without a floor a bulk apt import pays a full listing per write, per
+	// backend, for the whole import. Seconds rather than minutes because the
+	// case on the other side is a .deb that has just landed and an operator
+	// waiting to see it in the index.
+	aptPoolRelistFloor = 15 * time.Second
+
 	// aptRebuildTimeout bounds a rebuild that no request is waiting on, so a
 	// wedged backend cannot pin the goroutine forever.
 	aptRebuildTimeout = 5 * time.Minute
@@ -495,13 +505,14 @@ func (s *Server) aptFallbacks(ctx context.Context, served []string) []aptFallbac
 // from _pool_path never reads a byte of it. That bounds the per-write cost the
 // cache was added to bound, and bounds it at zero.
 //
-// With a fallback entry the cached listing answers first, and is re-taken once
-// when it leaves any of them unresolved. A .deb that reached the pool after
-// the cached listing was taken (uploaded out of band, or written by a route
-// other than PackageApt) would otherwise stay out of the index for the whole
-// metadata_ttl, and stay out silently. The price is a listing per rebuild
-// while a manifest names an object that is genuinely absent, which is a state
-// auditAptEntries now names in the log.
+// With a fallback entry the cached listing answers, and one listing is taken
+// per call at most. An unresolved fallback is the one state where the cached
+// answer may be wrong in the direction that matters — a .deb reached the pool
+// after the listing was taken, uploaded out of band or written by a route
+// other than PackageApt — so the listing is retaken, but no more often than
+// aptPoolRelistFloor. Retaking on every unresolved entry instead charged a
+// full listing to every write for as long as one staged entry waited for its
+// .deb, which is the per-write bound the cache exists to hold.
 func (s *Server) aptPoolMapForIndex(ctx context.Context, served []string) (map[string]string, error) {
 	fallbacks := s.aptFallbacks(ctx, served)
 	if len(fallbacks) == 0 {
@@ -518,19 +529,39 @@ func (s *Server) aptPoolMapForIndex(ctx context.Context, served []string) (map[s
 			"error", err)
 		return nil, nil
 	}
-	keys, err := s.aptPoolKeys(ctx)
+	if cached := s.aptCachedPoolMap(mirrored, fallbacks); cached != nil {
+		return cached, nil
+	}
+	keys, err := s.aptPoolKeysFresh(ctx)
 	if err != nil {
 		return nil, err
 	}
-	poolMap := aptPoolMap(keys, mirrored)
-	if s.aptAllResolve(poolMap, fallbacks) {
-		return poolMap, nil
+	return aptPoolMap(keys, mirrored), nil
+}
+
+// aptCachedPoolMap returns the map the cached listing yields when that listing
+// can still answer for these fallbacks, and nil when the caller has to list.
+//
+// Two clocks, because the cached listing is wrong in two different ways. Past
+// metadata_ttl it is stale for everything and is dropped. Inside the TTL it is
+// authoritative for every entry it resolves, and suspect only for one it does
+// not: an entry can go from unresolved to resolved without any manifest write,
+// so an unresolved fallback is the only evidence available that an object may
+// have landed since. aptPoolRelistFloor is what keeps that evidence from
+// costing a listing per write, and it is also what stops a listing taken
+// microseconds ago from being retaken by the same call — the cold-cache path
+// stores its result here before anything reads it back.
+func (s *Server) aptCachedPoolMap(mirrored map[string]bool, fallbacks []aptFallback) map[string]string {
+	ttl := s.cache.MetadataTTL
+	cached := s.aptPool.Load()
+	if cached == nil || ttl <= 0 || time.Since(cached.at) >= ttl {
+		return nil
 	}
-	fresh, err := s.aptPoolKeysFresh(ctx)
-	if err != nil {
-		return nil, err
+	poolMap := aptPoolMap(cached.keys, mirrored)
+	if s.aptAllResolve(poolMap, fallbacks) || time.Since(cached.at) < aptPoolRelistFloor {
+		return poolMap
 	}
-	return aptPoolMap(fresh, mirrored), nil
+	return nil
 }
 
 // aptMirroredPoolKeys returns the pool keys a mirrored fetch wrote. A manifest
@@ -734,13 +765,73 @@ func (a *aptSigning) ring() []byte {
 // which suites answer, and the URL in force. Every wrong sources line this
 // repository has shipped was an emitter guessing at one of those three.
 type aptStatus struct {
-	Signed       bool                 `json:"signed"`
-	Fingerprints []string             `json:"fingerprints,omitempty"`
-	KeyringURL   string               `json:"keyring_url,omitempty"`
-	Suites       []string             `json:"suites"`
-	Mirrored     []string             `json:"mirrored,omitempty"`
-	PublicURL    string               `json:"public_url"`
-	Sources      []aptsources.Sources `json:"sources"`
+	Signed        bool                 `json:"signed"`
+	Fingerprints  []string             `json:"fingerprints,omitempty"`
+	KeyringURL    string               `json:"keyring_url,omitempty"`
+	Suites        []string             `json:"suites"`
+	Mirrored      []string             `json:"mirrored,omitempty"`
+	Unserved      []aptUnservedEntry   `json:"unserved,omitempty"`
+	UnservedCount int                  `json:"unserved_count,omitempty"`
+	PublicURL     string               `json:"public_url"`
+	Sources       []aptsources.Sources `json:"sources"`
+}
+
+// aptUnservedEntry is one manifest entry that names no suite this server
+// answers for, which is the one way an apt entry disappears without anything
+// refusing it: the generator drops it, handleAptDists 404s the suite, and the
+// client reports "Unable to locate package" — the message a typo produces.
+//
+// Reported rather than refused. Staging an entry before adding its suite to
+// apt_suites is a legitimate order, so the only thing missing was somewhere to
+// see it that is not the server's log.
+type aptUnservedEntry struct {
+	Name    string   `json:"name"`
+	Version string   `json:"version"`
+	Suites  []string `json:"suites"`
+}
+
+// aptUnservedEntries lists them, capped, with the true count returned beside
+// it: a truncated array and no count reads as "these are all of them".
+func (s *Server) aptUnservedEntries(ctx context.Context) ([]aptUnservedEntry, int) {
+	served := s.cfg.ServedAptSuites()
+	servedSet := make(map[string]bool, len(served))
+	for _, suite := range served {
+		servedSet[suite] = true
+	}
+	var out []aptUnservedEntry
+	count := 0
+	for _, name := range s.store.ListPackages(manifest.TypeApt) {
+		pm, _ := s.store.GetPackage(ctx, manifest.TypeApt, name)
+		if pm == nil || isPackageHidden(pm) {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			if ve.Hidden || ve.Version == "" || ve.Version == "*" {
+				continue
+			}
+			suites := ve.EffectiveSuites(s.cfg.AptCodename)
+			if aptMatchesServed(suites, servedSet) {
+				continue
+			}
+			count++
+			if len(out) < aptAuditLogLimit {
+				out = append(out, aptUnservedEntry{Name: pm.Name, Version: ve.Version, Suites: suites})
+			}
+		}
+	}
+	return out, count
+}
+
+// aptMatchesServed is the one rule for "this entry reaches an index", shared
+// by the status row and the log line so the two cannot drift into disagreeing
+// about which entries are missing.
+func aptMatchesServed(suites []string, servedSet map[string]bool) bool {
+	for _, suite := range suites {
+		if servedSet[suite] {
+			return true
+		}
+	}
+	return false
 }
 
 // aptSourcesState reports the client-facing apt state, with the public URL
@@ -774,20 +865,28 @@ func (s *Server) aptSourcesState(r *http.Request) aptsources.State {
 func (s *Server) aptStatusFor(r *http.Request) aptStatus {
 	st := s.aptSourcesState(r)
 	mirrored := s.cfg.MirroredAptCodenames()
+	ctx := context.Background()
+	if r != nil {
+		ctx = r.Context()
+	}
+	unserved, unservedCount := s.aptUnservedEntries(ctx)
 	out := aptStatus{
-		Signed:       st.Signed,
-		Fingerprints: st.Fingerprints,
-		Suites:       st.Suites,
-		Mirrored:     mirrored,
-		PublicURL:    st.PublicURL,
-		Sources:      make([]aptsources.Sources, 0, len(st.Suites)+len(mirrored)),
+		Signed:        st.Signed,
+		Fingerprints:  st.Fingerprints,
+		Suites:        st.Suites,
+		Mirrored:      mirrored,
+		Unserved:      unserved,
+		UnservedCount: unservedCount,
+		PublicURL:     st.PublicURL,
+		Sources:       make([]aptsources.Sources, 0, len(st.Suites)+len(mirrored)),
 	}
 	if st.Signed {
 		out.KeyringURL = aptsources.KeyringRoute
 	}
 	if len(st.Suites) == 0 && len(mirrored) == 0 {
 		return aptStatus{Signed: out.Signed, Fingerprints: out.Fingerprints, KeyringURL: out.KeyringURL,
-			Suites: []string{}, PublicURL: out.PublicURL, Sources: []aptsources.Sources{aptsources.Render(st)}}
+			Suites: []string{}, Unserved: out.Unserved, UnservedCount: out.UnservedCount,
+			PublicURL: out.PublicURL, Sources: []aptsources.Sources{aptsources.Render(st)}}
 	}
 	for _, suite := range st.Suites {
 		one := st
@@ -934,14 +1033,7 @@ func (s *Server) auditAptEntries(ctx context.Context, served []string, poolMap m
 			// than the recorded ones is what keeps that entry from being
 			// counted as served and then reported for the wrong reason.
 			suites := ve.EffectiveSuites(s.cfg.AptCodename)
-			matched := false
-			for _, suite := range suites {
-				if servedSet[suite] {
-					matched = true
-					break
-				}
-			}
-			if !matched {
+			if !aptMatchesServed(suites, servedSet) {
 				unserved = append(unserved, name+"@"+ve.Version+" ["+strings.Join(suites, ",")+"]")
 				continue
 			}
@@ -1007,28 +1099,14 @@ type aptPoolListing struct {
 	at   time.Time
 }
 
-// aptPoolKeys returns every pooled key, cached for metadata_ttl.
-//
-// The listing is unbounded and the whole pool is walked, so without a cache
-// every apt-touching API write pays for a full listing and every configured
-// backend multiplies it. Staleness is bounded and cheap: entries carry
-// _pool_path, so this listing only resolves entries written before that
-// existed, whose objects were uploaded long before the window opened. SIGHUP
-// clears the cache for the operator who needs it gone sooner.
-func (s *Server) aptPoolKeys(ctx context.Context) ([]string, error) {
-	if s.stores == nil {
-		return nil, nil
-	}
-	ttl := s.cache.MetadataTTL
-	if cached := s.aptPool.Load(); cached != nil && ttl > 0 && time.Since(cached.at) < ttl {
-		return cached.keys, nil
-	}
-	return s.aptPoolKeysFresh(ctx)
-}
-
 // aptPoolKeysFresh lists the pool and replaces the cache, skipping the cached
 // answer on the way in. It is for the caller that has already established the
 // cached listing cannot answer its question.
+//
+// The listing is unbounded and the whole pool is walked, once per configured
+// backend, so every call is a cost a write pays for. aptCachedPoolMap is what
+// bounds how often it is reached; reload clears the cache for the operator who
+// needs it gone sooner.
 func (s *Server) aptPoolKeysFresh(ctx context.Context) ([]string, error) {
 	if s.stores == nil {
 		return nil, nil

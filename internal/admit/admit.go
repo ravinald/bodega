@@ -141,6 +141,16 @@ func validate(cfg *config.Config, pm *manifest.PackageManifest, res *Result) err
 			if ve.Version == "" {
 				return fmt.Errorf("apt/%s has a version entry with no version; give one, or \"*\" to resolve the current upstream", pm.Name)
 			}
+			// A suite name config.Load refuses can never be served by any
+			// configuration, so the entry is unreachable however apt_suites
+			// is edited later. An unserved-but-legal suite is not refused:
+			// staging an entry before adding its suite is a normal order, and
+			// GET /api/v1/status reports what that leaves waiting.
+			for _, suite := range ve.Suites {
+				if err := config.ValidateAptSuite(suite); err != nil {
+					return fmt.Errorf("apt/%s version %s: %w", pm.Name, versionLabel(ve), err)
+				}
+			}
 		}
 	}
 	return nil
