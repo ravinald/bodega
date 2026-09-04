@@ -437,7 +437,7 @@ Package-serving read endpoints remain unauthenticated. Package manager clients (
 
 ### Response hardening
 
-All HTTP responses include security headers: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Content-Security-Policy`, and `Referrer-Policy`. When TLS is active, `Strict-Transport-Security` is also set.
+All HTTP responses include security headers: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Content-Security-Policy`, and `Referrer-Policy`. `Strict-Transport-Security` follows the scheme clients use rather than the one this listener answers on: `public_url` when set, otherwise the request, which honors `X-Forwarded-Proto` only from a peer inside `trusted_proxies`. Gating it on the local TLS state instead meant the recommended deployment, a loopback listener behind a terminating proxy, sent HSTS to nobody.
 
 Upstream proxy fetches validate that target URLs use HTTPS and don't resolve to private or loopback addresses, preventing SSRF through manifest-controlled URLs.
 

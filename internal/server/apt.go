@@ -845,12 +845,9 @@ func aptMatchesServed(suites []string, servedSet map[string]bool) bool {
 // such as the startup banner; the renderer then emits a placeholder host.
 func (s *Server) aptSourcesState(r *http.Request) aptsources.State {
 	st := aptsources.State{
-		PublicURL:   s.cfg.ResolvePublicURL(""),
+		PublicURL:   s.publicBase(r),
 		LocalScheme: s.localScheme(),
 		Suites:      s.cfg.ServedAptSuites(),
-	}
-	if st.PublicURL == "" && r != nil {
-		st.PublicURL = requestScheme(r) + "://" + r.Host
 	}
 	if sign := s.aptSign.Load(); sign != nil {
 		st.Signed = true
@@ -904,6 +901,34 @@ func (s *Server) aptStatusFor(r *http.Request) aptStatus {
 		out.Sources = append(out.Sources, aptsources.Render(one))
 	}
 	return out
+}
+
+// publicBase returns the base URL clients reach this server at, with no
+// trailing slash: public_url when the operator set one, the request's own
+// origin otherwise. r may be nil for a caller with no request in hand, such as
+// the startup banner, which then gets "" and renders a placeholder.
+//
+// Every client-facing URL the server emits goes through here. Deriving one
+// from r.TLS instead is what handed cargo plaintext download URLs on a
+// deployment that was https everywhere a client could see.
+func (s *Server) publicBase(r *http.Request) string {
+	if base := s.cfg.ResolvePublicURL(""); base != "" {
+		return base
+	}
+	if r == nil {
+		return ""
+	}
+	return requestScheme(r) + "://" + r.Host
+}
+
+// publicScheme is the scheme half of public_url, empty when none is set. The
+// middleware chain holds no config, so it asks through this.
+func (s *Server) publicScheme() string {
+	base := s.cfg.ResolvePublicURL("")
+	if i := strings.Index(base, "://"); i > 0 {
+		return strings.ToLower(base[:i])
+	}
+	return ""
 }
 
 // localScheme is the scheme this process's own listener answers on. It is a

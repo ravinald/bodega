@@ -488,7 +488,7 @@ func TestIsBinaryContentType(t *testing.T) {
 // ---- SecurityHeadersMiddleware tests ----------------------------------------
 
 func TestSecurityHeadersPresent(t *testing.T) {
-	handler := SecurityHeadersMiddleware(testHandler("ok"))
+	handler := SecurityHeadersMiddleware(nil)(testHandler("ok"))
 	req := httptest.NewRequest("GET", "/healthz", nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -515,7 +515,7 @@ func TestSecurityHeadersPresent(t *testing.T) {
 }
 
 func TestSecurityHeadersHSTSOnTLS(t *testing.T) {
-	handler := SecurityHeadersMiddleware(testHandler("ok"))
+	handler := SecurityHeadersMiddleware(nil)(testHandler("ok"))
 	req := httptest.NewRequest("GET", "/healthz", nil)
 	// Simulate a TLS connection by setting TLS state on the request.
 	req.TLS = &tls.ConnectionState{}

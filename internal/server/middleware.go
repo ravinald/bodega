@@ -749,19 +749,31 @@ func MutationAuthMiddleware(admin NetsFunc, auditDB *audit.DB, pepper string, lo
 }
 
 // SecurityHeadersMiddleware adds standard security headers to every response.
-func SecurityHeadersMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		h := w.Header()
-		h.Set("X-Content-Type-Options", "nosniff")
-		h.Set("X-Frame-Options", "DENY")
-		h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
-		h.Set("Content-Security-Policy",
-			"default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'")
-		if r.TLS != nil {
-			h.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
-		}
-		next.ServeHTTP(w, r)
-	})
+//
+// HSTS follows externalScheme rather than r.TLS. A deployment behind a
+// terminating proxy has r.TLS nil on every request while every client speaks
+// https, so gating on the listener sent the header nowhere it was needed and
+// left the documented https deployment with no HSTS at all. publicScheme may
+// be nil for a caller with no configuration in hand.
+func SecurityHeadersMiddleware(publicScheme func() string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			h := w.Header()
+			h.Set("X-Content-Type-Options", "nosniff")
+			h.Set("X-Frame-Options", "DENY")
+			h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+			h.Set("Content-Security-Policy",
+				"default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'")
+			configured := ""
+			if publicScheme != nil {
+				configured = publicScheme()
+			}
+			if externalScheme(r, configured) == "https" {
+				h.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 func isBinaryContentType(ct string) bool {
@@ -803,6 +815,19 @@ func requestScheme(r *http.Request) string {
 		return p
 	}
 	return "http"
+}
+
+// externalScheme reports the scheme clients use to reach this server.
+//
+// public_url outranks the request: only the operator knows the name a proxy
+// publishes, and a request answers for the listener it arrived on. With none
+// set the request answers for itself, which honors X-Forwarded-Proto from a
+// trusted peer and nothing from anyone else.
+func externalScheme(r *http.Request, configured string) string {
+	if configured != "" {
+		return configured
+	}
+	return requestScheme(r)
 }
 
 // peerIsTrusted reports whether the direct peer is one of nets, ignoring every

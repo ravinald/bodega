@@ -294,8 +294,13 @@ func (s *Server) handler() http.Handler {
 	h = MutationAuthMiddleware(s.adminNetsFunc(), s.auditDB, s.pepper, s.logger)(h)
 	h = DenyListMiddleware(s.denyNetsFunc(), s.auditDB)(h)
 	h = RequestLogger(s.logger)(h)
+	h = SecurityHeadersMiddleware(s.publicScheme)(h)
+	// RealIPMiddleware is outermost so the trusted set it stashes is in the
+	// context before SecurityHeadersMiddleware asks requestScheme whether the
+	// peer may speak for the client. Inside out, trustedNetsFor would fall
+	// back to the built-in default and honor X-Forwarded-Proto from an RFC
+	// 1918 peer on an install that narrowed trusted_proxies.
 	h = RealIPMiddleware(s.trustedNetsFunc())(h)
-	h = SecurityHeadersMiddleware(h)
 	return h
 }
 
