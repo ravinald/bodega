@@ -43,7 +43,11 @@ type popupModel struct {
 	onBuildSelect func(stage BuildStage, force bool) tea.Cmd
 
 	// --- form popup ---
-	formTitle  string
+	formTitle string
+	// formNote is standing prose under the title, for what the form
+	// deliberately does not edit. A field the server ignores is worse than no
+	// field: it accepts a value, saves it, and reports success.
+	formNote   string
 	formFields []formField
 	formCursor int // index of the focused field
 	prevCursor int // index of the previously focused field (before last navigation)
@@ -279,6 +283,10 @@ func (p *popupModel) renderForm() string {
 	var sb strings.Builder
 	sb.WriteString(title)
 	sb.WriteString("\n\n")
+	if p.formNote != "" {
+		sb.WriteString(dimStyle.Width(76).Render(p.formNote))
+		sb.WriteString("\n\n")
+	}
 
 	// Find the longest label to align colons.
 	// For LabelSelect fields, include the " [value]▾" suffix in the display width.

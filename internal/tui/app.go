@@ -28,7 +28,6 @@ import (
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 	bos3 "github.com/ravinald/bodega/internal/s3"
-	"github.com/ravinald/bodega/internal/server"
 	"github.com/ravinald/bodega/internal/storage"
 )
 
@@ -148,6 +147,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case storeRefreshMsg:
 		m.store = msg.store
 		m.details.store = msg.store
+		m.details.refreshAptSigning()
 		m.sources.Refresh(m.store, m.statuses)
 		m.syncDetails()
 		return m, m.fetchS3Status()
@@ -514,13 +514,12 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			formField{Label: "Manifest dir", Value: m.cfg.ManifestDir},
 			formField{Label: "Log dir", Value: m.cfg.LogDir},
 			formField{Label: "Log window height", Value: fmt.Sprintf("%d", m.cfg.LogWindowHeight)},
-			formField{Label: "Deny list", Value: strings.Join(m.cfg.DenyList, ", "),
-				Hint: "Comma-separated CIDRs (e.g. 10.0.0.5, 192.168.1.0/24, fd00::/8)"},
 		)
 		cfgRef := m.cfg // capture for closures
 		p := popupModel{
 			kind:       popupForm,
 			formTitle:  "Configure bodega (" + config.ConfigPath() + ")",
+			formNote:   "Deny list, admin CIDRs and trusted proxies are not here: the config file seeds them into the audit database on first start and is inert afterwards. Edit them with \"bodega acl deny\", \"bodega acl admin\" and \"bodega acl proxies\".",
 			formFields: fields,
 			onChange: func(p *popupModel) {
 				// When Custom paths is toggled, show/hide per-type fields.
@@ -553,20 +552,6 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 				}
 			},
-			validate: func(fields []formField) string {
-				if dl := fieldValue(fields, "Deny list"); dl != "" {
-					var entries []string
-					for _, s := range strings.Split(dl, ",") {
-						if s = strings.TrimSpace(s); s != "" {
-							entries = append(entries, s)
-						}
-					}
-					if _, err := server.ParseDenyList(entries); err != nil {
-						return err.Error()
-					}
-				}
-				return ""
-			},
 			onFormSave: func(fields []formField) {
 				cfgRef.Bucket = fieldValue(fields, "Bucket")
 				cfgRef.Region = fieldValue(fields, "Region")
@@ -584,17 +569,6 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				cfgRef.GitRoot = fieldValue(fields, "Git root")
 				cfgRef.PypiRoot = fieldValue(fields, "PyPI root")
 				cfgRef.BinaryRoot = fieldValue(fields, "Binary root")
-				if dl := fieldValue(fields, "Deny list"); dl != "" {
-					var entries []string
-					for _, s := range strings.Split(dl, ",") {
-						if s = strings.TrimSpace(s); s != "" {
-							entries = append(entries, s)
-						}
-					}
-					cfgRef.DenyList = entries
-				} else {
-					cfgRef.DenyList = nil
-				}
 				path, err := cfgRef.Save()
 				if err != nil {
 					m.log.appendLog(errorStyle.Render("Failed to save config: " + err.Error()))

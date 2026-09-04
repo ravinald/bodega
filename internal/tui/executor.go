@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -118,6 +119,8 @@ func executeStage(stage BuildStage, entryType, entryName string, cfg *config.Con
 			if err == nil {
 				refresh = true
 			}
+		default:
+			err = fmt.Errorf("no handler for build stage %d", stage)
 		}
 
 		return cmdOutputMsg{output: buf.String(), refresh: refresh, err: err}
@@ -126,6 +129,12 @@ func executeStage(stage BuildStage, entryType, entryName string, cfg *config.Con
 
 // runBuildStage runs only the build step (no fetch, no package) for a single
 // entry type/name pair.
+//
+// Only apt and pypi compile anything. The other six ship what fetch retrieved,
+// which the CLI expresses by running the fetcher under `bodega build`; here
+// fetch is its own key, so this stage says so instead of duplicating it. The
+// default arm names the type rather than falling through to nil, which is how
+// StageAll on a gomod entry reported success having done nothing.
 func runBuildStage(buf *bytes.Buffer, bc *builder.Config, store *manifest.Store, entryType, entryName string) error {
 	totalFail := 0
 	switch entryType {
@@ -137,8 +146,11 @@ func runBuildStage(buf *bytes.Buffer, bc *builder.Config, store *manifest.Store,
 		s := builder.BuildPypi(bc, store)
 		s.Print(buf)
 		totalFail += s.Failures
-	case manifest.TypeGit, manifest.TypeBinary:
-		fmt.Fprintf(buf, "No separate build step for %s — use fetch or package.\n", entryType)
+	case manifest.TypeGit, manifest.TypeBinary, manifest.TypeGomod,
+		manifest.TypeHelm, manifest.TypeNpm, manifest.TypeCargo:
+		fmt.Fprintf(buf, "No separate build step for %s — fetch retrieves what ships.\n", entryType)
+	default:
+		return fmt.Errorf("build: no build stage for entry type %q", entryType)
 	}
 	if totalFail > 0 {
 		return fmt.Errorf("%d build(s) failed", totalFail)
@@ -147,6 +159,12 @@ func runBuildStage(buf *bytes.Buffer, bc *builder.Config, store *manifest.Store,
 }
 
 // runPackageStage runs only the package step for a single entry type/name.
+//
+// helm and npm package into repository metadata rather than per-entry
+// archives: PackageHelm regenerates index.yaml and PackageNpm the packuments,
+// both across the whole type, so neither takes an entry filter. Skipping them
+// left the server serving an index that named no new chart while the stage
+// reported success.
 func runPackageStage(buf *bytes.Buffer, bc *builder.Config, store *manifest.Store, entryType, entryName string) error {
 	totalFail := 0
 	switch entryType {
@@ -162,8 +180,22 @@ func runPackageStage(buf *bytes.Buffer, bc *builder.Config, store *manifest.Stor
 		s := builder.PackagePypi(bc, store)
 		s.Print(buf)
 		totalFail += s.Failures
+	case manifest.TypeHelm:
+		s := builder.PackageHelm(bc, store)
+		s.Print(buf)
+		totalFail += s.Failures
+	case manifest.TypeNpm:
+		s := builder.PackageNpm(bc, store)
+		s.Print(buf)
+		totalFail += s.Failures
 	case manifest.TypeBinary:
 		fmt.Fprintf(buf, "No separate package step for binary — binaries are uploaded directly.\n")
+	case manifest.TypeGomod:
+		fmt.Fprintf(buf, "No separate package step for gomod — the fetched module zips are what ships.\n")
+	case manifest.TypeCargo:
+		fmt.Fprintf(buf, "No separate package step for cargo — clients read the proxied sparse index.\n")
+	default:
+		return fmt.Errorf("package: no package stage for entry type %q", entryType)
 	}
 	if totalFail > 0 {
 		return fmt.Errorf("%d package(s) failed", totalFail)
@@ -292,7 +324,19 @@ func runFetch(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, args
 		case manifest.TypeApt:
 			sum = builder.FetchApt(bc, store, entryFilter)
 		case manifest.TypePypi:
+			// FetchPypi resolves the whole type from the manifest and takes no
+			// entry filter, so a per-entry fetch here fetches every pypi entry.
 			sum = builder.FetchPypi(bc, store)
+		case manifest.TypeGomod:
+			sum = builder.FetchGomod(bc, store, entryFilter)
+		case manifest.TypeHelm:
+			sum = builder.FetchHelm(bc, store, entryFilter)
+		case manifest.TypeNpm:
+			sum = builder.FetchNpm(bc, store, entryFilter)
+		case manifest.TypeCargo:
+			sum = builder.FetchCargo(bc, store, entryFilter)
+		default:
+			return fmt.Errorf("fetch: no fetcher for entry type %q", t)
 		}
 		if sum != nil {
 			sum.Print(buf)
@@ -557,13 +601,13 @@ func resolveTypes(args []string) ([]string, error) {
 	}
 	for _, t := range args {
 		if !isValidType(t) {
-			return nil, fmt.Errorf("unknown type %q — must be one of: apt, git, pypi, binary", t)
+			return nil, fmt.Errorf("unknown type %q — must be one of: %s", t, strings.Join(manifest.AllTypes, ", "))
 		}
 	}
 	return args, nil
 }
 
-// isValidType returns true when t is one of the four known manifest types.
+// isValidType returns true when t is one of the known manifest types.
 func isValidType(t string) bool {
 	for _, known := range manifest.AllTypes {
 		if t == known {

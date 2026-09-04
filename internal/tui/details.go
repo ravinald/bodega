@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/bubbles/viewport"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/ravinald/bodega/internal/aptsign"
 	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/builder"
@@ -29,14 +30,29 @@ type detailsModel struct {
 	focused   bool
 
 	// aptSigned is whether this host holds a usable apt signing key, read
-	// once here rather than in the render path.
+	// outside the render path and refreshed by refreshAptSigning.
 	aptSigned bool
 }
+
+// aptDiskStateNote names whose signing state the pane is reporting. The TUI
+// reads the key file; the server holds a signer that outlives it, because a
+// reload never takes signing away — so a deleted key leaves the server signing
+// an index this pane would call unsigned. The two disagree until a restart,
+// and only the server knows which one a client will meet.
+const aptDiskStateNote = "This form comes from the signing key on this host's disk, not from the running server: a server that already loaded a key keeps signing until it restarts. GET /api/v1/status reports what the server is actually doing."
 
 // newDetailsModel creates the details pane.
 func newDetailsModel(store *manifest.Store, cfg *config.Config) detailsModel {
 	vp := viewport.New(80, 20)
 	return detailsModel{store: store, cfg: cfg, buildRoot: cfg.BuildRoot, viewport: vp, aptSigned: aptKeyLoaded(cfg)}
+}
+
+// refreshAptSigning re-reads the on-disk signing key. Reading once at
+// construction meant a key generated while the TUI was open stayed invisible
+// until restart, and the pane went on offering [trusted=yes] for a repository
+// that had started signing.
+func (m *detailsModel) refreshAptSigning() {
+	m.aptSigned = aptKeyLoaded(m.cfg)
 }
 
 // SetNode updates the node whose metadata is displayed.
@@ -84,6 +100,27 @@ func field(key, value string) string {
 	return k + " " + v
 }
 
+// noteField renders a value that runs past the pane onto continuation lines
+// aligned under the first. wrap truncates, which is right for a path and wrong
+// for a consequence: an operator who reads two thirds of why [trusted=yes] is
+// permanent and propagates has read none of it, and that paragraph is the
+// whole reason the fallback ships with prose attached.
+func noteField(key, value string, width int) string {
+	// keyStyle pads to 12; field writes one space after it.
+	const keyWidth = 13
+	body := width - keyWidth
+	if body < 24 {
+		body = 24
+	}
+	lines := strings.Split(lipgloss.NewStyle().Width(body).Render(value), "\n")
+	var sb strings.Builder
+	sb.WriteString(keyStyle.Render(key+":") + " " + valueStyle.Render(lines[0]))
+	for _, l := range lines[1:] {
+		sb.WriteString("\n" + strings.Repeat(" ", keyWidth) + valueStyle.Render(l))
+	}
+	return sb.String()
+}
+
 // boolField renders a boolean field with coloured yes/no.
 func boolField(key string, val bool) string {
 	k := keyStyle.Render(key + ":")
@@ -118,8 +155,8 @@ func (m detailsModel) s3AndClientFields(n *TreeNode) string {
 		src := aptSources(m.cfg, pm, m.aptSigned)
 		sb.WriteString(field("Sources line", src.OneLine))
 		sb.WriteByte('\n')
-		for _, note := range src.Notes {
-			sb.WriteString(field("Note", wrap(note, m.width-16)))
+		for _, note := range append(src.Notes, aptDiskStateNote) {
+			sb.WriteString(noteField("Note", note, m.width))
 			sb.WriteByte('\n')
 		}
 		return sb.String()
@@ -353,39 +390,66 @@ func aptSources(cfg *config.Config, pm *manifest.PackageManifest, signed bool) a
 }
 
 // aptKeyLoaded reports whether the server on this host would find a usable
-// signing key, using aptsign's own search order. Read once when the pane is
-// built: it does file I/O and a key parse, and a render path runs on every
-// terminal resize.
+// signing key, using aptsign's own search order and the same acceptance test
+// loadAptSigner applies. Stopping at Load is not enough: the server stores a
+// signer only once both public forms render, so a key that parses but will not
+// serialize leaves the repository unsigned while a pane that stopped at Load
+// prints Signed-By: — and a client configured that way fails apt update
+// outright rather than degrading to an unverified fetch.
+//
+// This describes the key file, not the running server; aptDiskStateNote says
+// so beside the line. Read when the pane is built and again on every store
+// refresh, rather than in the render path: it does file I/O and a key parse,
+// and a render runs on every terminal resize.
 func aptKeyLoaded(cfg *config.Config) bool {
 	if cfg == nil {
 		return false
 	}
-	_, err := aptsign.Load(aptsign.DefaultKeyPaths(cfg.StoragePath))
-	return err == nil
+	kr, err := aptsign.Load(aptsign.DefaultKeyPaths(cfg.StoragePath))
+	if err != nil {
+		return false
+	}
+	if _, err := kr.PublicKey(); err != nil {
+		return false
+	}
+	if _, err := kr.Keyring(); err != nil {
+		return false
+	}
+	return true
 }
 
 // aptSourcesSuite picks the suite for a sources line: the first suite the
-// package is actually published to, falling back to the server's default. A
-// package in several suites needs one line per suite, and the pane shows one.
+// package is published to that this server also answers for, falling back to
+// the first served suite. A package in several suites needs one line per
+// suite, and the pane shows one.
+//
+// The intersection is what keeps the line fetchable. An entry naming a suite
+// outside apt_suites never reaches an index, so a line pointing at it 404s and
+// the client reports "Unable to locate package" — the message a misspelled
+// package name produces. The web UI matches against the server-rendered blocks
+// and so can only ever name a served suite; this is the same rule.
 func aptSourcesSuite(cfg *config.Config, pm *manifest.PackageManifest) string {
-	def := ""
-	if cfg != nil {
-		def = cfg.AptCodename
+	if cfg == nil {
+		return ""
 	}
 	if pm != nil {
 		for _, ve := range pm.Versions {
 			if ve.Hidden {
 				continue
 			}
-			if suites := ve.EffectiveSuites(def); len(suites) > 0 {
-				return suites[0]
+			for _, suite := range ve.EffectiveSuites(cfg.AptCodename) {
+				if cfg.ServesAptSuite(suite) {
+					return suite
+				}
 			}
 		}
 	}
-	if def != "" {
-		return def
+	// Empty renders aptsources.PlaceholderSuite, which is the honest answer
+	// when apt_codename and apt_suites both resolved to nothing.
+	if served := cfg.ServedAptSuites(); len(served) > 0 {
+		return served[0]
 	}
-	return "<suite>"
+	return ""
 }
 
 // clientURL returns the URL a client would use to fetch the artifact from the
