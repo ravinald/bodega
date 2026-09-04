@@ -550,6 +550,19 @@ func (s *Server) upstreamPolicyVerdict(ctx context.Context, regType, policyCandi
 // mirror instead of fetching an object. Two copies of an allow-list gate is one
 // copy that stops matching the other.
 func (s *Server) enforceUpstreamPolicy(w http.ResponseWriter, r *http.Request, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key string) bool {
+	return s.enforceUpstreamPolicyRecording(w, r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, true)
+}
+
+// enforceUpstreamPolicyRecording is enforceUpstreamPolicy with the discovery
+// write made optional, for a protocol whose single client operation reaches
+// the gate more than once.
+//
+// One `git clone` is two requests, an info/refs GET and a git-upload-pack
+// POST, and both have to pass the allow-list. Recording both would make the
+// discovery table count protocol legs for git and requests for every other
+// type, so an operator comparing counts across types reads git as twice as
+// busy as it is. The refusal is unconditional; only the row is not.
+func (s *Server) enforceUpstreamPolicyRecording(w http.ResponseWriter, r *http.Request, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key string, record bool) bool {
 	if s.policy == nil || regType == "" || policyCandidate == "" {
 		return true
 	}
@@ -564,7 +577,9 @@ func (s *Server) enforceUpstreamPolicy(w http.ResponseWriter, r *http.Request, r
 	// Discovery log: record every upstream attempt with its decision so
 	// operators can review/forensically audit and later promote captured
 	// hosts/packages to allow-list rules.
-	s.recordDiscovery(ctx, r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, decision)
+	if record {
+		s.recordDiscovery(ctx, r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, decision)
+	}
 
 	if violation {
 		s.logger.Warn("upstream blocked by policy",

@@ -15,6 +15,7 @@ import (
 	"io/fs"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -298,8 +299,13 @@ func validateUpstreams(key, route string, ups map[string]Upstream) error {
 		switch {
 		case !upstreamNamespacePattern.MatchString(ns):
 			return fmt.Errorf("invalid %s key %q: must match %s — the key becomes a URL segment under %s and a directory name", key, ns, upstreamNamespacePattern, route)
-		case reservedPathElements[ns] != "":
-			return fmt.Errorf("invalid %s key %q: %s — pick a name bodega does not already serve or store under", key, ns, reservedPathElements[ns])
+		case reservedPathElements[strings.ToLower(ns)] != "":
+			// Folded before the lookup: the key becomes a directory name, and
+			// on a case-insensitive filesystem "Repos/" and the "repos/"
+			// bundle root are one directory. On Linux they are two, and an
+			// operator still reads the pair as shadowing.
+			folded := strings.ToLower(ns)
+			return fmt.Errorf("invalid %s key %q: %q is a %s — pick a name bodega does not already serve or store under", key, ns, folded, reservedPathElements[folded])
 		}
 
 		u, err := url.Parse(up.URL)
@@ -314,6 +320,17 @@ func validateUpstreams(key, route string, ups map[string]Upstream) error {
 			return fmt.Errorf("%s[%q]: url %q names no host", key, ns, up.URL)
 		case !strings.HasSuffix(up.URL, "/"):
 			return fmt.Errorf("%s[%q]: url %q must end in \"/\" — the request path is appended to it", key, ns, up.URL)
+		case u.User != nil:
+			// The credential would land in every upstream_url column, log line
+			// and error message that carries the composed URL, and bodega
+			// documents that it reads no credential from this file.
+			return fmt.Errorf("%s[%q]: url carries userinfo before the host — bodega reads no credential from this file and would copy it into discovery rows, logs and error messages. Remove everything between \"//\" and %q", key, ns, u.Host)
+		case u.RawQuery != "":
+			return fmt.Errorf("%s[%q]: url %q carries a query string — the request path is appended to it, which would land after the \"?\"", key, ns, up.URL)
+		case u.Fragment != "":
+			return fmt.Errorf("%s[%q]: url %q carries a fragment — the request path is appended to it, which would land after the \"#\"", key, ns, up.URL)
+		case u.Path != cleanUpstreamPath(u.Path):
+			return fmt.Errorf("%s[%q]: url path %q is not in cleaned form (%q) — a \"..\" here escapes the intended root, the same refusal the request half already gets", key, ns, u.Path, cleanUpstreamPath(u.Path))
 		}
 
 		switch up.Mode {
@@ -326,6 +343,17 @@ func validateUpstreams(key, route string, ups map[string]Upstream) error {
 		}
 	}
 	return nil
+}
+
+// cleanUpstreamPath is path.Clean with the trailing slash kept, which the
+// caller has already required: path.Clean("/a/b/") is "/a/b", so comparing
+// against it unmodified would refuse every legal upstream.
+func cleanUpstreamPath(p string) string {
+	cleaned := path.Clean(p)
+	if strings.HasSuffix(p, "/") && cleaned != "/" {
+		cleaned += "/"
+	}
+	return cleaned
 }
 
 // AptUpstream is one upstream archive serving a mirrored codename.
@@ -1101,12 +1129,12 @@ func defaultConfigContent() []byte {
   "cargo_upstream": "https://index.crates.io",
   "cargo_dl_upstream": "https://static.crates.io/crates",
 
-  "_comment_git_upstreams": "git_upstreams: maps a namespace under /git/ onto an upstream forge, e.g. {\"internal\": {\"url\": \"https://git.corp.example/\", \"mode\": \"open\"}}. The key is a URL segment and a directory name: letters, digits, _ and -, starting with a letter. The url must be https and end in \"/\".",
+  "_comment_git_upstreams": "git_upstreams: maps a namespace under /git/ onto an upstream forge, e.g. {\"internal\": {\"url\": \"https://git.corp.example/\", \"mode\": \"open\"}}. The key is a URL segment and a directory name: letters, digits, _ and -, starting with a letter, and folded to lower case before the reserved-name check so \"Repos\" is refused with \"repos\". The url must be https, end in \"/\", and carry no userinfo, no query, no fragment and no uncleaned path. A key may share a name with an uploaded git package: /git/{name}/{file} serves the bundle and /git/{ns}/{org}/{repo}.git/... resolves the upstream.",
   "_comment_git_upstreams_mode": "mode is \"catalog\" (default when absent or empty) or \"open\". catalog resolves only paths an existing manifest entry names; anything else 404s and is recorded as no_manifest for 'bodega discover promote'. open composes the upstream URL for any path under the namespace and fetches it, so on a public forge any client that can reach bodega can make bodega fetch arbitrary upstream repositories. Pick open for a forge whose publishing is already controlled.",
-  "_comment_git_upstreams_auth": "Only public, unauthenticated upstreams are supported. No credential is read from this file or the environment, so a private forge answers bodega as an anonymous client and the request surfaces as a 404.",
+  "_comment_git_upstreams_auth": "Only public, unauthenticated upstreams are supported. No credential is read from this file or the environment, so a private forge answers bodega as an anonymous client and the request surfaces as a 404. A url carrying userinfo is refused at load rather than quietly used: it would land in discovery rows, logs and error messages.",
   "git_upstreams": {},
 
-  "_comment_binary_upstreams": "binary_upstreams: maps a namespace under /binaries/ onto an upstream download host, e.g. {\"hashicorp\": {\"url\": \"https://releases.hashicorp.com/\", \"mode\": \"open\"}}. Same key, url and mode rules as git_upstreams. Binaries come from many vendors at once, which is why this is a map rather than one flat key.",
+  "_comment_binary_upstreams": "binary_upstreams: maps a namespace under /binaries/ onto an upstream download host, e.g. {\"hashicorp\": {\"url\": \"https://releases.hashicorp.com/\", \"mode\": \"open\"}}. Same key, url and mode rules as git_upstreams, enforced by the same validator. Binaries come from many vendors at once, which is why this is a map rather than one flat key.",
   "_comment_binary_upstreams_paths": "While this is empty, /binaries/{path...} serves from storage exactly as it always has. Once any entry exists, a request whose first segment names no key here 404s and is recorded as no_namespace instead of falling through to a storage read — including a path that used to resolve. Name a namespace for every tree you still serve locally, or leave the block empty.",
   "_comment_binary_upstreams_auth": "Only public, unauthenticated upstreams are supported. A namespace pointing at a private release endpoint fails as a 404 with no credential prompt, which looks identical to a typo in the path — check the upstream by hand before hunting the path.",
   "binary_upstreams": {},

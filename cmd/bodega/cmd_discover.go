@@ -256,8 +256,16 @@ nothing.`,
 				return err
 			}
 
-			added, skipped := 0, 0
+			added, skipped, unconfigured := 0, 0, 0
 			for _, a := range rows {
+				if noNamespaceOnly(a) {
+					// Same refusal as `promote`, reported per pattern rather
+					// than aborting the run: a bulk promote over a mixed type
+					// still has real rules to write.
+					unconfigured++
+					fmt.Printf("- %s %s (no_namespace only; add it to %s in config.json)\n", regType, a.PatternHint, noNamespaceConfigKey[regType])
+					continue
+				}
 				err := insertPolicyRule(ctx, adb, regType, a.PatternHint, "promoted from discovery")
 				switch {
 				case err == nil:
@@ -269,7 +277,7 @@ nothing.`,
 					return fmt.Errorf("insert %q: %w", a.PatternHint, err)
 				}
 			}
-			fmt.Printf("\nPromoted %d, skipped %d (already present).\n", added, skipped)
+			fmt.Printf("\nPromoted %d, skipped %d (already present), %d need a namespace key rather than a rule.\n", added, skipped, unconfigured)
 			return nil
 		},
 	}
@@ -401,11 +409,58 @@ func promoteOne(gf *globalFlags, regType, pattern, comment string) error {
 	defer adb.Close()
 
 	ctx := context.Background()
+	if err := refuseNoNamespacePromotion(ctx, adb, regType, pattern); err != nil {
+		return err
+	}
 	if err := insertPolicyRule(ctx, adb, regType, pattern, comment); err != nil {
 		return err
 	}
 	fmt.Printf("Promoted %s %q\n", regType, pattern)
 	return nil
+}
+
+// noNamespaceConfigKey names the config block that repairs a no_namespace row,
+// per type. Only the two namespaced types can produce one.
+var noNamespaceConfigKey = map[string]string{
+	manifest.TypeGit:    "git_upstreams",
+	manifest.TypeBinary: "binary_upstreams",
+}
+
+// refuseNoNamespacePromotion stops --as policy from writing a rule for a
+// pattern whose every observation is no_namespace.
+//
+// Such a row is neither policy-shaped nor manifest-shaped. It says a client
+// named a namespace no config declares, and the repair is a key in
+// git_upstreams or binary_upstreams — an allow-list rule bounds which
+// upstreams bodega may talk to and changes nothing about a namespace that has
+// none. Without this, 'bodega discover promote git gitlab' printed
+// 'Promoted git "gitlab"' and fixed nothing.
+func refuseNoNamespacePromotion(ctx context.Context, adb *audit.DB, regType, pattern string) error {
+	rows, err := adb.AggregateDiscovery(ctx, regType)
+	if err != nil {
+		return fmt.Errorf("read discovery observations for %s: %w", regType, err)
+	}
+	for _, a := range rows {
+		if a.PatternHint == pattern && noNamespaceOnly(a) {
+			return errNoNamespacePromotion(regType, pattern)
+		}
+	}
+	return nil
+}
+
+// noNamespaceOnly reports whether a bucket has only ever been observed as
+// no_namespace. Decisions is the distinct set for the bucket, so an exact
+// match means nothing else was ever seen for the pattern.
+func noNamespaceOnly(a audit.DiscoveryAggregate) bool {
+	return a.Decisions == audit.DecisionNoNamespace
+}
+
+func errNoNamespacePromotion(regType, pattern string) error {
+	key := noNamespaceConfigKey[regType]
+	if key == "" {
+		key = regType + "_upstreams"
+	}
+	return fmt.Errorf(`every observation of %s %q is no_namespace: a client asked for a namespace nothing is configured for, and an allow-list rule does not give it one. Add the key to %s in config.json instead — "%s": {%q: {"url": "https://forge.example/", "mode": "catalog"}} — then re-run the request. --as manifest does not help either; this pattern has no no_manifest row`, regType, pattern, key, key, pattern)
 }
 
 func insertPolicyRule(ctx context.Context, adb *audit.DB, regType, pattern, comment string) error {
