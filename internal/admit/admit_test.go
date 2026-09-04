@@ -138,3 +138,25 @@ func TestDecisionStringsAreStable(t *testing.T) {
 		}
 	}
 }
+
+// TestAdmitRefusesAnUnservableSuite covers the entry that can never be served
+// however apt_suites is edited later: config.Load refuses a suite name
+// carrying "/", so nothing can put it in the served set. A legal suite that
+// simply is not served yet is admitted — staging an entry before adding its
+// suite is a normal order, and GET /api/v1/status is where that one shows up.
+func TestAdmitRefusesAnUnservableSuite(t *testing.T) {
+	pm := aptPkg("hello", "2.10")
+	pm.Versions[0].Suites = []string{"a/b"}
+	res := Admit(t.Context(), nil, nil, &config.Config{}, pm, "")
+	if res.OK() {
+		t.Fatal(`admitted an apt entry in suite "a/b", which no configuration can serve`)
+	}
+	if !strings.Contains(res.Reason, "a/b") {
+		t.Errorf("the error does not name the suite it refused: %q", res.Reason)
+	}
+
+	pm.Versions[0].Suites = []string{"jammy"}
+	if res := Admit(t.Context(), nil, nil, &config.Config{}, pm, ""); !res.OK() {
+		t.Errorf("refused a legal suite this server does not serve yet: %s", res.Reason)
+	}
+}

@@ -493,6 +493,20 @@ func (c *Config) RootForType(typ string) string {
 	return c.BuildRoot
 }
 
+// ValidateAptSuite is the rule for a suite name this server can serve, applied
+// both to the configured set and to the suites a manifest entry names. An
+// entry naming a suite refused here reaches no index under any configuration,
+// because the name could never be added to apt_suites.
+func ValidateAptSuite(suite string) error {
+	if suite == "" {
+		return fmt.Errorf("invalid apt suite: empty name")
+	}
+	if strings.Contains(suite, "/") {
+		return fmt.Errorf("invalid apt suite %q (must not contain \"/\")", suite)
+	}
+	return nil
+}
+
 // ServedAptSuites returns the apt suites the server answers for. Load
 // normalizes AptSuites, so this only has to cover a Config built by hand.
 func (c *Config) ServedAptSuites() []string {
@@ -590,11 +604,8 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	suites := make([]string, 0, len(cfg.AptSuites)+1)
 	seen := map[string]bool{}
 	for _, s := range append([]string{cfg.AptCodename}, cfg.AptSuites...) {
-		if s == "" {
-			return nil, fmt.Errorf("invalid apt suite: empty name")
-		}
-		if strings.Contains(s, "/") {
-			return nil, fmt.Errorf("invalid apt suite %q (must not contain \"/\")", s)
+		if err := ValidateAptSuite(s); err != nil {
+			return nil, err
 		}
 		if seen[s] {
 			continue

@@ -768,7 +768,7 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		var cmds []tea.Cmd
 		for _, e := range entries {
-			cmds = append(cmds, executeDelete(e.EntryType, e.Name, m.store, m.auditDB))
+			cmds = append(cmds, executeDelete(e.EntryType, e.Name, m.cfg, m.store, m.auditDB))
 		}
 		m.popup = popupModel{
 			kind:            popupConfirm,
@@ -789,7 +789,7 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		var cmds []tea.Cmd
 		for _, e := range entries {
-			cmds = append(cmds, executeRemoveFromS3(e.EntryType, e.Name, m.store, m.stores))
+			cmds = append(cmds, executeRemoveFromS3(e.EntryType, e.Name, m.cfg, m.store, m.stores))
 		}
 		m.popup = popupModel{
 			kind:            popupConfirm,
@@ -804,7 +804,7 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		var cmds []tea.Cmd
 		for _, e := range entries {
-			cmds = append(cmds, executeFreeze(e.EntryType, e.Name, m.store, m.auditDB))
+			cmds = append(cmds, executeFreeze(e.EntryType, e.Name, m.cfg, m.store, m.auditDB))
 		}
 		return m, tea.Sequence(cmds...)
 	}

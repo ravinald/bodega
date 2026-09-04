@@ -3,9 +3,13 @@ package tui
 import (
 	"bytes"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -130,7 +134,7 @@ func TestTUIRemoveReachesTheRecordedBackend(t *testing.T) {
 	seedLocal(t, bulkRoot, key, "binary-bytes")
 
 	var buf bytes.Buffer
-	if err := runRemove(&buf, store, stores, manifest.TypeBinary, "awscli"); err != nil {
+	if err := runRemove(&buf, nil, store, stores, manifest.TypeBinary, "awscli"); err != nil {
 		t.Fatalf("runRemove: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(bulkRoot, filepath.FromSlash(key))); err == nil {
@@ -153,11 +157,71 @@ func TestTUIRemoveRefusesWhenNoKeyResolves(t *testing.T) {
 		t.Fatalf("AddVersion: %v", err)
 	}
 	var buf bytes.Buffer
-	err := runRemove(&buf, store, stores, manifest.TypePypi, "boto3")
+	err := runRemove(&buf, nil, store, stores, manifest.TypePypi, "boto3")
 	if err == nil {
 		t.Fatal("runRemove reported a delete for a version with no object key")
 	}
 	if !strings.Contains(err.Error(), "no per-version object key") {
 		t.Errorf("error %q does not say why nothing resolved", err)
+	}
+}
+
+// TestTUIMutationsSignalTheServer is #52 by its second route. The CLI
+// classifies each verb where it is registered and one cobra hook signals;
+// nothing in the TUI passes through cobra, so a freeze or a delete here left
+// the withdrawn entry published while the TUI reported success. The hourly
+// tick swept it up within an hour, which is what made it survivable and hard
+// to see.
+//
+// Driven through the run helpers rather than the tea.Cmd wrappers: they are
+// the level a future non-cobra caller lands on, and the level the signal now
+// lives at.
+func TestTUIMutationsSignalTheServer(t *testing.T) {
+	cfg, stores, store, _, bulkRoot := twoBackendTUI(t, nil)
+	cfg.LogDir = t.TempDir()
+	if err := os.WriteFile(filepath.Join(cfg.LogDir, "bodega.pid"),
+		[]byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		t.Fatalf("write pid file: %v", err)
+	}
+	if err := store.AddVersion(t.Context(), manifest.TypeBinary, "awscli", manifest.VersionEntry{
+		Version: "2.0.0", URL: "https://example.com/awscli.zip", Storage: "bulk",
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+	seedLocal(t, bulkRoot, manifest.BinaryKey("awscli", "2.0.0", "awscli.zip"), "binary-bytes")
+
+	sighup := make(chan os.Signal, 8)
+	signal.Notify(sighup, syscall.SIGHUP)
+	t.Cleanup(func() { signal.Stop(sighup) })
+
+	// Order matters: remove takes the object, freeze flips the flag and flips
+	// it back (delete refuses a frozen entry), delete takes what is left.
+	verbs := []struct {
+		name string
+		run  func(*bytes.Buffer) error
+	}{
+		{"remove", func(b *bytes.Buffer) error {
+			return runRemove(b, cfg, store, stores, manifest.TypeBinary, "awscli")
+		}},
+		{"freeze", func(b *bytes.Buffer) error {
+			return runFreeze(b, cfg, store, manifest.TypeBinary, "awscli", nil)
+		}},
+		{"unfreeze", func(b *bytes.Buffer) error {
+			return runFreeze(b, cfg, store, manifest.TypeBinary, "awscli", nil)
+		}},
+		{"delete", func(b *bytes.Buffer) error {
+			return runDelete(b, cfg, store, manifest.TypeBinary, "awscli", nil)
+		}},
+	}
+	for _, v := range verbs {
+		var buf bytes.Buffer
+		if err := v.run(&buf); err != nil {
+			t.Fatalf("%s: %v\n%s", v.name, err, buf.String())
+		}
+		select {
+		case <-sighup:
+		case <-time.After(5 * time.Second):
+			t.Errorf("%s reported success and sent no reload signal; the entry stays published until the hourly tick", v.name)
+		}
 	}
 }

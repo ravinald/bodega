@@ -190,3 +190,64 @@ func TestStatusFallsBackToForwardedProto(t *testing.T) {
 		t.Errorf("URI = %q, want https behind a terminating proxy", proxied.Sources[0].URI)
 	}
 }
+
+// TestStatusNamesEntriesNoSuiteServes gives the silent drop a place to be
+// seen. An entry naming an unserved suite is dropped by the generator and
+// 404s at handleAptDists, and the client reports "Unable to locate package" —
+// the message a typo produces. Nothing outside the server's own log said so,
+// so an operator holding the API had no way to tell a missing package from a
+// misspelled one.
+func TestStatusNamesEntriesNoSuiteServes(t *testing.T) {
+	store := manifest.NewLocalStore(t.TempDir())
+	if err := store.AddVersion(t.Context(), manifest.TypeApt, "stray", manifest.VersionEntry{
+		Version:  "1.0",
+		Suites:   []string{"jammy"},
+		Metadata: map[string]string{"Architecture": "amd64"},
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+	if err := store.AddVersion(t.Context(), manifest.TypeApt, "served", manifest.VersionEntry{
+		Version:  "2.0",
+		Suites:   []string{"noble"},
+		Metadata: map[string]string{"Architecture": "amd64"},
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+	cfg := &config.Config{ManifestDir: "manifests", AptCodename: "noble", AptSuites: []string{"noble"}}
+	ts := httptest.NewServer(server.New(cfg, store, storage.NewSingle(memStore(nil)), ":0", nil).Handler())
+	t.Cleanup(ts.Close)
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+"/api/v1/status", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /api/v1/status: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var body struct {
+		Apt struct {
+			Unserved []struct {
+				Name    string   `json:"name"`
+				Version string   `json:"version"`
+				Suites  []string `json:"suites"`
+			} `json:"unserved"`
+			UnservedCount int `json:"unserved_count"`
+		} `json:"apt"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Apt.UnservedCount != 1 {
+		t.Fatalf("unserved_count = %d, want 1 (one entry in jammy, one in noble)", body.Apt.UnservedCount)
+	}
+	got := body.Apt.Unserved
+	if len(got) != 1 || got[0].Name != "stray" || got[0].Version != "1.0" {
+		t.Fatalf("unserved = %+v, want the jammy entry alone", got)
+	}
+	if len(got[0].Suites) != 1 || got[0].Suites[0] != "jammy" {
+		t.Errorf("the row does not name the suite the entry asked for: %+v", got[0].Suites)
+	}
+}
