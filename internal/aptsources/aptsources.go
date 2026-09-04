@@ -65,6 +65,18 @@ const (
 	// there and valid.
 	MirroredNote = `This suite is mirrored from upstream, signature included, so apt verifies it against the distro keyring already on the host. Do not add [trusted=yes] or Signed-By: here — bodega does not sign a mirrored suite, and either one would replace a working check with a worse one.`
 
+	// TrustStoreNote fires on an https URI, which is every deployment that
+	// terminates TLS anywhere. It is a fact about the client rather than the
+	// server, and it belongs beside the stanza anyway: the operator pasting
+	// this line is the one who decides what the client's sources are, and the
+	// failure it prevents names the wrong subject. A minimal image ships no CA
+	// bundle, apt cannot complete the handshake, apt-get update exits 0 having
+	// ignored the index, and the install fails one command later at "Unable to
+	// locate package" — the same terminal line an architecture mismatch
+	// produces. The bundle comes from the image's own sources, so it is a step
+	// before this stanza and cannot be one after it.
+	TrustStoreNote = `Install ca-certificates on the client, from the sources it already has, before this line becomes its only one. A minimal image ships no CA bundle, so apt cannot complete the https handshake: "apt-get update" exits 0 having ignored the index and the install fails later as "Unable to locate package".`
+
 	// UnknownURLNote fires whenever nothing reported a public URL, so the
 	// host above is a placeholder rather than an address. Behind a reverse
 	// proxy the server sees a loopback listener with no TLS and no hostname:
@@ -178,6 +190,9 @@ func Render(st State) Sources {
 	}
 	if strings.TrimRight(st.PublicURL, "/") == "" {
 		out.Notes = append(out.Notes, UnknownURLNote)
+	}
+	if strings.HasPrefix(uri, "https://") {
+		out.Notes = append(out.Notes, TrustStoreNote)
 	}
 	out.Deb822 = strings.Join(stanza, "\n")
 	return out
