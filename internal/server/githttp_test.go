@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -63,13 +64,20 @@ func runGitCLI(t *testing.T, dir string, args ...string) string {
 // same way "https://github.com/" composes onto "octocat/Hello-World.git".
 func newGitUpstream(t *testing.T) string {
 	t.Helper()
+	return newGitUpstreamSubject(t, "first")
+}
+
+// newGitUpstreamSubject is newGitUpstream with the commit subject chosen, so a
+// test can tell two upstreams apart by what a clone of them contains.
+func newGitUpstreamSubject(t *testing.T, subject string) string {
+	t.Helper()
 	work := t.TempDir()
 	runGitCLI(t, work, "init", "-q", ".")
 	if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("bodega\n"), 0o600); err != nil {
 		t.Fatalf("write upstream file: %v", err)
 	}
 	runGitCLI(t, work, "add", "README.md")
-	runGitCLI(t, work, "commit", "-q", "-m", "first")
+	runGitCLI(t, work, "commit", "-q", "-m", subject)
 
 	root := t.TempDir()
 	bare := filepath.Join(root, filepath.FromSlash(gitTestRepo))
@@ -339,7 +347,9 @@ func TestGitCGIEnvIsExactAndInheritsNothing(t *testing.T) {
 		"GIT_PROJECT_ROOT=" + s.gitTool.root,
 		"GIT_HTTP_EXPORT_ALL=1",
 		"PATH_INFO=/corp/team/tool.git/git-upload-pack",
-		"QUERY_STRING=service=git-upload-pack",
+		// Empty on the POST leg: the child reads its service from PATH_INFO
+		// and ignores the query, and nothing from the request is forwarded.
+		"QUERY_STRING=",
 		"REQUEST_METHOD=POST",
 		"CONTENT_TYPE=application/x-git-upload-pack-request",
 		"HTTP_CONTENT_ENCODING=gzip",
@@ -347,7 +357,11 @@ func TestGitCGIEnvIsExactAndInheritsNothing(t *testing.T) {
 		"REMOTE_ADDR=203.0.113.7",
 		"REMOTE_USER=",
 	}
-	got := s.gitCGIEnv(r, "/corp/team/tool.git/git-upload-pack")
+	query, ok := gitQueryString(gitServiceUploadPack, r.URL.Query()["service"])
+	if !ok {
+		t.Fatal("gitQueryString refused a git-upload-pack POST")
+	}
+	got := s.gitCGIEnv(r, "/corp/team/tool.git/git-upload-pack", query)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("child environment mismatch\ngot:  %q\nwant: %q", got, want)
 	}
@@ -691,5 +705,259 @@ func TestNoGitBackendLeavesSmartHTTPUnrouted(t *testing.T) {
 	_ = bundleResp.Body.Close()
 	if bundleResp.StatusCode != http.StatusOK {
 		t.Errorf("GET legacy bundle with no git backend = %d, want 200", bundleResp.StatusCode)
+	}
+}
+
+// makePartialMirror reproduces what `git clone --mirror` leaves behind when it
+// is killed mid-transfer, measured against a real interrupted clone of
+// github.com/git/git: HEAD is present and reads "ref: refs/heads/.invalid",
+// refs/ is empty, and objects/pack holds a tmp_pack_ that never became a pack.
+// A check that took HEAD's presence for completeness would pass on this.
+func makePartialMirror(t *testing.T, dir string) {
+	t.Helper()
+	for _, sub := range []string{"hooks", "info", "refs", filepath.Join("objects", "pack")} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o750); err != nil {
+			t.Fatalf("mkdir %s: %v", sub, err)
+		}
+	}
+	files := map[string]string{
+		"config":      "[core]\n\tbare = true\n",
+		"description": "Unnamed repository\n",
+		"HEAD":        "ref: refs/heads/.invalid\n",
+		filepath.Join("objects", "pack", "tmp_pack_HMlYFb"): "not a pack\n",
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "HEAD")); err != nil {
+		t.Fatalf("the fixture wrote no HEAD; it would not reproduce an interrupted clone: %v", err)
+	}
+}
+
+// A directory a clone got partway through is not a mirror. os.Stat says it
+// exists, git says nothing is in it, and before this the handler served the
+// first answer forever: every later request 404d with nothing retrying.
+func TestGitSmartRepairsAnInterruptedClone(t *testing.T) {
+	upstream := newGitUpstream(t)
+	s := newGitServer(t, upstream)
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	dir := mirrorDir(s, "corp")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatalf("mkdir mirror: %v", err)
+	}
+	makePartialMirror(t, dir)
+
+	dest := filepath.Join(t.TempDir(), "clone")
+	runGitCLI(t, t.TempDir(), "clone", "-q", ts.URL+"/git/corp/"+gitTestRepo, dest)
+	if got := runGitCLI(t, dest, "log", "-1", "--format=%s"); got != "first" {
+		t.Errorf("cloned HEAD subject = %q, want %q", got, "first")
+	}
+	if !s.gitMirrorComplete(t.Context(), dir) {
+		t.Errorf("mirror at %s is still incomplete after a request", dir)
+	}
+}
+
+// The git-upload-pack POST is the leg with no refresh behind it: it arrives
+// while the info/refs clone is still running, and before this it walked past a
+// half-written directory into a 404 with an empty body. It has to block on the
+// same key and repair the same way.
+func TestGitUploadPackPostRepairsAnInterruptedClone(t *testing.T) {
+	upstream := newGitUpstream(t)
+	s := newGitServer(t, upstream)
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	dir := mirrorDir(s, "corp")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatalf("mkdir mirror: %v", err)
+	}
+	makePartialMirror(t, dir)
+
+	resp, err := http.Post(ts.URL+"/git/corp/"+gitTestRepo+"/git-upload-pack", //nolint:noctx // test-owned loopback URL
+		"application/x-git-upload-pack-request", strings.NewReader(""))
+	if err != nil {
+		t.Fatalf("POST git-upload-pack: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		t.Errorf("POST git-upload-pack over a partial mirror = 404; the leg skipped the repair")
+	}
+	if !s.gitMirrorComplete(t.Context(), dir) {
+		t.Errorf("mirror at %s is still incomplete after the POST leg", dir)
+	}
+}
+
+// Repointing git_upstreams[ns].url is a forge migration, a host swap or a typo
+// correction. Every already-mirrored repository under that namespace has the
+// old URL written into its own config, so without this check the mirror keeps
+// serving the old forge's history and keeps re-fetching from it.
+func TestGitMirrorReclonesWhenTheUpstreamIsRepointed(t *testing.T) {
+	first := newGitUpstreamSubject(t, "old forge")
+	s := newGitServer(t, first)
+	before := httptest.NewServer(s.Handler())
+
+	dest := filepath.Join(t.TempDir(), "before")
+	runGitCLI(t, t.TempDir(), "clone", "-q", before.URL+"/git/corp/"+gitTestRepo, dest)
+	if got := runGitCLI(t, dest, "log", "-1", "--format=%s"); got != "old forge" {
+		t.Fatalf("first clone subject = %q, want %q", got, "old forge")
+	}
+
+	// Shut the listener before repointing. The handler reads cfg.GitUpstreams
+	// per request and an operator repoints by editing config.json and
+	// restarting, so mutating it under a live server would be a race the
+	// server never runs.
+	before.Close()
+	second := newGitUpstreamSubject(t, "new forge")
+	s.cfg.GitUpstreams["corp"] = config.GitUpstream{URL: "file://" + second + "/", Mode: config.UpstreamModeOpen}
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	after := filepath.Join(t.TempDir(), "after")
+	runGitCLI(t, t.TempDir(), "clone", "-q", ts.URL+"/git/corp/"+gitTestRepo, after)
+	if got := runGitCLI(t, after, "log", "-1", "--format=%s"); got != "new forge" {
+		t.Errorf("clone after repointing = %q, want %q — the mirror still serves the old forge", got, "new forge")
+	}
+	if got := runGitCLI(t, mirrorDir(s, "corp"), "config", "--get", "remote.origin.url"); got != "file://"+second+"/"+gitTestRepo {
+		t.Errorf("mirror origin = %q, want the repointed upstream", got)
+	}
+}
+
+// net/url keeps the first value of a repeated key and git-http-backend's
+// string_list_insert keeps the last, so a duplicated parameter used to read as
+// a fetch here and a push in the child.
+func TestGitSmartRefusesADuplicatedServiceParameter(t *testing.T) {
+	upstream := newGitUpstream(t)
+	s := newGitServer(t, upstream)
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	resp, err := http.Get(ts.URL + "/git/corp/" + gitTestRepo + "/info/refs?service=git-upload-pack&service=git-receive-pack") //nolint:gosec,noctx // test-owned loopback URL
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("duplicated service parameter = %d, want 403", resp.StatusCode)
+	}
+	if _, err := os.Stat(mirrorDir(s, "corp")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a refused push probe created a mirror at %s", mirrorDir(s, "corp"))
+	}
+}
+
+// The child's QUERY_STRING is rebuilt from the one service the handler
+// validated, so there is no repeated key left for the two parsers to disagree
+// over.
+func TestGitQueryStringIsRebuiltNotForwarded(t *testing.T) {
+	for _, tc := range []struct {
+		name, service string
+		values        []string
+		want          string
+		ok            bool
+	}{
+		{"info/refs with the service", gitServiceInfoRefs, []string{gitServiceUploadPack}, "service=git-upload-pack", true},
+		{"info/refs with it repeated", gitServiceInfoRefs, []string{gitServiceUploadPack, gitServiceUploadPack}, "service=git-upload-pack", true},
+		{"info/refs with no service", gitServiceInfoRefs, nil, "", true},
+		{"info/refs naming a service bodega does not serve", gitServiceInfoRefs, []string{"git-archive"}, "", false},
+		{"the POST leg, which reads PATH_INFO", gitServiceUploadPack, []string{gitServiceUploadPack}, "", true},
+	} {
+		got, ok := gitQueryString(tc.service, tc.values)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("%s: gitQueryString(%q, %q) = (%q, %v), want (%q, %v)",
+				tc.name, tc.service, tc.values, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+// A namespace directory symlinked onto another volume resolves outside
+// GIT_PROJECT_ROOT while filepath.Rel still answers "corp/team/tool.git".
+// bodega creates its namespace directories with MkdirAll, so this is the
+// operator case, not a client-plantable one.
+func TestGitSmartRefusesASymlinkedNamespace(t *testing.T) {
+	upstream := newGitUpstream(t)
+	s := newGitServer(t, upstream)
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	elsewhere := t.TempDir()
+	if err := os.MkdirAll(s.gitTool.root, 0o750); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+	if err := os.Symlink(elsewhere, filepath.Join(s.gitTool.root, "corp")); err != nil {
+		t.Skipf("this filesystem refuses symlinks: %v", err)
+	}
+
+	resp, err := http.Get(ts.URL + "/git/corp/" + gitTestRepo + "/info/refs?service=git-upload-pack") //nolint:gosec,noctx // test-owned loopback URL
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("GET through a symlinked namespace = %d, want 404", resp.StatusCode)
+	}
+	if _, err := os.Stat(filepath.Join(elsewhere, filepath.FromSlash(gitTestRepo))); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the handler cloned through the symlink into %s", elsewhere)
+	}
+}
+
+// gitDirWithinRoot has to answer before the mirror exists, which is every
+// first clone, and it has to follow the link when it does.
+func TestGitDirWithinRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "git")
+	if err := os.MkdirAll(filepath.Join(root, "corp"), 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	inside := filepath.Join(root, "corp", "team", "tool.git")
+	if ok, err := gitDirWithinRoot(root, inside); err != nil || !ok {
+		t.Errorf("gitDirWithinRoot(%q) = (%v, %v), want (true, nil) for a path whose leaf does not exist yet", inside, ok, err)
+	}
+
+	elsewhere := t.TempDir()
+	if err := os.Symlink(elsewhere, filepath.Join(root, "linked")); err != nil {
+		t.Skipf("this filesystem refuses symlinks: %v", err)
+	}
+	linked := filepath.Join(root, "linked", "team", "tool.git")
+	if ok, err := gitDirWithinRoot(root, linked); err != nil || ok {
+		t.Errorf("gitDirWithinRoot(%q) = (%v, %v), want (false, nil) — it resolves outside the root", linked, ok, err)
+	}
+}
+
+// A git_upstreams key and an uploaded git package may carry the same name.
+// The decision is that this is legal: the two routes coexist by depth, a
+// bundle path being two segments under /git/ and a clone path at least four.
+// Nothing rejects the pair at startup, because manifest names are runtime data
+// and a startup check would refuse a config that was legal when written.
+func TestGitBundleAndNamespaceMayShareAName(t *testing.T) {
+	upstream := newGitUpstream(t)
+	s := newGitServer(t, upstream)
+	if err := s.store.AddVersion(t.Context(), manifest.TypeGit, "corp", manifest.VersionEntry{
+		URL: "https://forge.example/corp",
+		Ref: "v1.2.0",
+	}); err != nil {
+		t.Fatalf("seed manifest: %v", err)
+	}
+	if err := s.typeStore(manifest.TypeGit).Put(t.Context(), manifest.GitKey("corp", "v1.2.0", false), []byte("bundle bytes")); err != nil {
+		t.Fatalf("seed bundle: %v", err)
+	}
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	resp, err := http.Get(ts.URL + "/git/corp/corp-v1.2.0.bundle") //nolint:gosec,noctx // test-owned loopback URL
+	if err != nil {
+		t.Fatalf("GET bundle: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "bundle bytes" {
+		t.Errorf("bundle GET = %d %q, want 200 %q — the namespace shadowed the package", resp.StatusCode, body, "bundle bytes")
+	}
+
+	dest := filepath.Join(t.TempDir(), "clone")
+	runGitCLI(t, t.TempDir(), "clone", "-q", ts.URL+"/git/corp/"+gitTestRepo, dest)
+	if got := runGitCLI(t, dest, "log", "-1", "--format=%s"); got != "first" {
+		t.Errorf("clone under the shared name = %q, want %q — the package shadowed the namespace", got, "first")
 	}
 }

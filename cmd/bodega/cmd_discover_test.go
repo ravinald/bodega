@@ -881,3 +881,98 @@ func TestGenerateManifestsEmitsWhatTheAllowListPermits(t *testing.T) {
 		t.Fatalf("an allowed package did not reach the payload: %s", out)
 	}
 }
+
+// gitNoNamespaceRow is what a request under /git/ naming a namespace nothing
+// is configured for writes: the namespace is both the package and the pattern.
+func gitNoNamespaceRow() audit.DiscoveryRow {
+	return audit.DiscoveryRow{
+		RegistryType: manifest.TypeGit,
+		PatternHint:  "gitlab",
+		PkgName:      "gitlab",
+		Decision:     audit.DecisionNoNamespace,
+		LastClient:   "10.0.0.5",
+	}
+}
+
+// The repair for a no_namespace row is a git_upstreams key, and the row is the
+// one thing that names it. --as policy used to insert a rule for the pattern
+// and print "Promoted git \"gitlab\"", leaving the 404 exactly where it was.
+func TestPromotePolicyRefusesANoNamespaceRow(t *testing.T) {
+	env := newDiscoverEnv(t)
+	env.seedDiscovery(t, gitNoNamespaceRow())
+
+	out, err := runDiscover(t, "promote", "git", "gitlab")
+	if err == nil {
+		t.Fatalf("promote of a no_namespace pattern succeeded: %s", out)
+	}
+	for _, want := range []string{audit.DecisionNoNamespace, "git_upstreams", "gitlab"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error does not name %q: %v", want, err)
+		}
+	}
+
+	db, openErr := audit.Open(env.auditDB)
+	if openErr != nil {
+		t.Fatalf("open audit db: %v", openErr)
+	}
+	defer func() { _ = db.Close() }()
+	rules, listErr := db.ListPolicies(context.Background())
+	if listErr != nil {
+		t.Fatalf("list policies: %v", listErr)
+	}
+	if len(rules) != 0 {
+		t.Errorf("the refused promote wrote %d rule(s): %+v", len(rules), rules)
+	}
+}
+
+// A pattern that has ever been seen as anything else is a real observation and
+// still promotes: the refusal is on rows that are only no_namespace.
+func TestPromotePolicyAllowsAPatternSeenAsSomethingElse(t *testing.T) {
+	env := newDiscoverEnv(t)
+	env.seedDiscovery(t, gitNoNamespaceRow(), audit.DiscoveryRow{
+		RegistryType: manifest.TypeGit,
+		PatternHint:  "gitlab",
+		PkgName:      "gitlab/team/tool",
+		Decision:     audit.DecisionNoPolicy,
+		UpstreamURL:  "https://gitlab.example/team/tool.git",
+		LastClient:   "10.0.0.6",
+	})
+
+	if out, err := runDiscover(t, "promote", "git", "gitlab"); err != nil {
+		t.Fatalf("promote of a mixed pattern refused: %v\n%s", err, out)
+	}
+}
+
+// promote-all reports the unconfigured patterns per line and promotes the rest,
+// rather than aborting a bulk run over a mixed type.
+func TestPromoteAllPolicySkipsNoNamespacePatterns(t *testing.T) {
+	env := newDiscoverEnv(t)
+	env.seedDiscovery(t, gitNoNamespaceRow(), audit.DiscoveryRow{
+		RegistryType: manifest.TypeGit,
+		PatternHint:  "github.com/octocat/",
+		PkgName:      "github/octocat/Hello-World",
+		Decision:     audit.DecisionNoPolicy,
+		UpstreamURL:  "https://github.com/octocat/Hello-World.git",
+		LastClient:   "10.0.0.6",
+	})
+
+	// The per-pattern lines go to os.Stdout like every other promote-all
+	// report, so the assertion is on the rules written rather than the print.
+	out, err := runDiscover(t, "promote-all", "git")
+	if err != nil {
+		t.Fatalf("promote-all git: %v\n%s", err, out)
+	}
+
+	db, openErr := audit.Open(env.auditDB)
+	if openErr != nil {
+		t.Fatalf("open audit db: %v", openErr)
+	}
+	defer func() { _ = db.Close() }()
+	rules, listErr := db.ListPolicies(context.Background())
+	if listErr != nil {
+		t.Fatalf("list policies: %v", listErr)
+	}
+	if len(rules) != 1 || rules[0].Pattern != "github.com/octocat/" {
+		t.Errorf("promote-all wrote %+v, want only the github.com/octocat/ rule", rules)
+	}
+}

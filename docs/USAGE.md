@@ -568,7 +568,7 @@ An audit database written under the retired `discover_mode: "learn"` also holds 
 | pypi | simple index, wheel | every request; `no_manifest` on a wheel for an unknown distribution |
 | gomod | `/go/...` | every request; `no_manifest` on a module with no entry |
 | helm | `/helm/charts/*.tgz` | every request; `no_manifest` on a chart with no entry, with an empty upstream URL (a chart repo is named per version entry, so with no entry there is no URL to record) |
-| git | `/git/{namespace}/...` | every smart-HTTP request under an `open` namespace, with an empty version; `no_manifest` on an uncataloged repository under a `catalog` one; `no_namespace` on a first segment naming no `git_upstreams` entry, with the namespace as both the package and the pattern |
+| git | `/git/{namespace}/...` | one row per clone under an `open` namespace, with an empty version. A clone is two requests, an `info/refs` GET and a `git-upload-pack` POST, and both pass the allow-list; only the `info/refs` leg is recorded, so a git count means the same thing as every other type's. `no_manifest` on an uncataloged repository under a `catalog` one; `no_namespace` on a first segment naming no `git_upstreams` entry, with the namespace as both the package and the pattern |
 | binary | `/binaries/{namespace}/...` | every request under an `open` namespace; `no_manifest` on an uncataloged path under a `catalog` one; `no_namespace` on a first segment naming no `binary_upstreams` entry, once any entry exists |
 
 #### Gaps
@@ -579,7 +579,7 @@ These are not observed yet. A quiet discovery log for one of them means the hook
 - **generated apt suites**: `dists/` for a codename in `apt_suites` is built from bodega's own manifests, so there is no upstream request to observe. Only mirrored codenames produce rows.
 - **git bundles**: `/git/{name}/{file}` serves an uploaded bundle or release archive from storage. Nothing upstream, nothing logged.
 - **git mirror refreshes**: a smart-HTTP request records one row per request, but the periodic `git remote update` it triggers is not separately logged. The row says a client asked; it does not say whether that request also refreshed the mirror.
-- **binary outside a namespace**: with `binary_upstreams` empty, or on a path whose first segment names no entry in it, `/binaries/...` reads storage and records nothing. The `no_namespace` row above is the second case; the first is an install that has not opted in.
+- **binary outside a namespace, with `binary_upstreams` empty**: `/binaries/...` reads storage exactly as it did before the block existed, and records nothing — an install that has not opted in. Once any entry exists, a first segment naming no key is not this case: it 404s without touching storage and records a `no_namespace` row, which is in the table above.
 - **helm `index.yaml`** and the generated apt indexes: regenerated locally, never fetched.
 - **apt pool hits with several archives configured**: a pool path names no archive, so bodega probes on the first miss and remembers the answer for an hour. A cached `.deb` is served without that probe. With one entry in `apt_upstreams` the archive is unambiguous and the hit is recorded; with several and no remembered route, the row is skipped rather than filed under a pattern that is not the host, which would split one archive's traffic across two buckets. The next miss for that path repopulates the route and hits start counting again.
 
@@ -596,6 +596,8 @@ The raw rows behind one bucket: package, version, decision, count, last client, 
 `--as policy` (the default) writes an allow-list rule for the pattern, through the same path as `bodega policy add`.
 
 `--as manifest` writes package manifest entries instead, through the same path as `bodega pkg create`. It reads only the `no_manifest` rows in the bucket and, for each one, adds a version entry in `proxy` mode carrying the upstream URL the handler would have fetched.
+
+A pattern whose every row is `no_namespace` is refused by both targets, and the error names the config key to add. Such a row says a client asked for a namespace nothing is configured for: the repair is a key in `git_upstreams` or `binary_upstreams`, and an allow-list rule bounds which upstreams bodega may talk to without giving the namespace one. `promote-all` reports those patterns per line and promotes the rest.
 
 For apt, `--as policy` is the promotion that matters: `bodega discover promote apt archive.ubuntu.com` turns an observe window into the host rule that keeps the mirror reachable once enforcement is on. `--as manifest` also works — an apt pool row carries the package, the version and the upstream `.deb` URL, so it writes a staged entry that `bodega build fetch apt` resolves from that URL and `bodega build run apt` puts in the pool. That is how a package the fleet keeps pulling from upstream becomes one bodega hosts and signs in its own suite. The staged entry carries no architecture and no pool path, so it stays out of the generated index until those two steps run.
 
@@ -1263,6 +1265,10 @@ Those two suffixes are the whole served surface. Every other path under a namesp
 
 On the first request bodega runs `git clone --mirror` into `{storage_path}/git/{namespace}/{org}/{repo}.git` and serves from that mirror afterwards. Concurrent first requests for one repository collapse into one clone. A clone that fails takes its directory with it — a partial mirror would answer later requests with a truncated history — and the client gets a 502 that names no path; the git error is in the server log.
 
+What is on disk is inspected rather than counted. `git clone --mirror` creates the destination at the start of the transfer, so a restart, an OOM kill, or a removal that lost to a permission error leaves a directory holding `config`, `description`, `hooks/` and `info/` and nothing else. bodega treats a directory with neither `HEAD` nor its own `.bodega-fetched` stamp as an interrupted clone: it is removed and cloned again on the next request, and both legs of the protocol do it, so the `git-upload-pack` POST that arrives while the `info/refs` clone is still running blocks on the same lock rather than answering 404 with an empty body. A removal that fails is a 502 naming the reason in the log, not a mirror that 404s forever with nothing retrying.
+
+**Repointing `git_upstreams[ns].url` re-clones.** Every mirror records the URL its own clone used, and bodega compares it against the configured upstream before serving. A mismatch is a forge migration, a host swap or a typo correction, so the mirror is discarded and cloned from the new URL, with both URLs in a `WARN`. Budget for the transfer: repointing a namespace with fifty mirrors under it re-clones all fifty, one per first request after the change.
+
 `open` and `catalog` behave here as they do everywhere: a `catalog` namespace never clones a repository no manifest entry names, and answers 404 with a `no_manifest` discovery row instead. `bodega discover promote git <pattern> --as manifest` turns that row into the entry, after which the same clone succeeds. The allow-list runs before the clone, so a denied upstream is a 403 with nothing written to disk.
 
 #### Refresh
@@ -1275,6 +1281,8 @@ A mirror older than `metadata_ttl` (default `1h`, the same interval that governs
 
 Refused twice. Every mirror bodega creates carries `http.receivepack=false`, and the handler rejects `git-receive-pack` — both the POST and the `info/refs?service=git-receive-pack` probe that precedes it — before any process is started. bodega is a read-only mirror; one layer would mean one config drift makes it writable.
 
+The handler checks every occurrence of the `service` parameter, not the first. `net/url` returns the first value of a repeated key and `git-http-backend` parses `QUERY_STRING` with `string_list_insert`, where the last wins, so `?service=git-upload-pack&service=git-receive-pack` would otherwise read as a fetch here and a push in the child. The child never sees the client's query string at all: `QUERY_STRING` is rebuilt from the one service the handler validated, which leaves the two parsers nothing to disagree over. A `service` naming anything other than `git-upload-pack` is a 403.
+
 #### Operational requirements
 
 - **`git-http-backend` must be installed.** It ships with git, in `libexec` rather than on `PATH`. bodega resolves it once at startup, through `git --exec-path` and then a fixed list of distribution locations.
@@ -1285,7 +1293,9 @@ Refused twice. Every mirror bodega creates carries `http.receivepack=false`, and
 
 #### Legacy bundle route
 
-`/git/{name}/{file}` still serves the `.bundle` and `.tar.gz` artifacts an uploader wrote to storage, unchanged. It predates smart-HTTP and stays because scripts fetch those URLs directly. The two do not collide: a bundle path is two segments and a clone path is at least four, so a `git_upstreams` key and an uploaded package may share a name without shadowing each other.
+`/git/{name}/{file}` still serves the `.bundle` and `.tar.gz` artifacts an uploader wrote to storage, unchanged. It predates smart-HTTP and stays because scripts fetch those URLs directly.
+
+**A `git_upstreams` key and an uploaded git package may share a name. That is legal and neither shadows the other.** `GET /git/{name}/{file}` is the more specific ServeMux pattern, so it takes every two-segment path under `/git/`; a clone path is at least four, because the repository directory ends in `.git` and carries `info/refs` or `git-upload-pack` after it. The two coexist by depth. With `"tools"` in `git_upstreams` and a `tools` package in the manifest store, `/git/tools/tools-v1.2.0.bundle` serves the uploaded bundle and `/git/tools/org/repo.git/info/refs` resolves the upstream. Nothing rejects the pair at startup: manifest names are runtime data an operator adds and removes without restarting the server, so a startup check would refuse a config that was legal when it was written.
 
 #### Not implemented
 

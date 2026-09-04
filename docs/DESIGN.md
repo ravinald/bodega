@@ -527,7 +527,9 @@ A broken install produces the same bytes: a `manifest_dir` nothing can read list
 }
 ```
 
-The key becomes a URL segment and a directory name, so it matches `^[a-zA-Z][a-zA-Z0-9_-]*$` and may not take a name bodega already serves or stores under (`api`, `apt`, `repos`, `pool` and the rest). The URL must be `https`, name a host, and end in `/`. A malformed entry stops the load and the error names the namespace; nothing is silently corrected to a default.
+The key becomes a URL segment and a directory name, so it matches `^[a-zA-Z][a-zA-Z0-9_-]*$` and may not take a name bodega already serves or stores under (`api`, `apt`, `repos`, `pool` and the rest). The reserved check folds the key to lower case first: on a case-insensitive filesystem `Repos/` and the `repos/` bundle root are one directory, and on Linux they are two an operator still reads as shadowing.
+
+The URL must be `https`, name a host, and end in `/`. It may not carry userinfo, a query string, a fragment, or a path that is not already in cleaned form. Userinfo because the no-credential property below is otherwise unenforced and the token would land in every `upstream_url` column, log line and error message that carries the composed URL; a query or fragment because the request path is appended and would land after the `?` or the `#`, which surfaces as a 502 with nothing pointing at the config; a `..` because it escapes the intended root, which is the check the request half already gets. A malformed entry stops the load and the error names the namespace; nothing is silently corrected to a default.
 
 Mode decides what happens when a client asks for something no manifest entry names:
 
@@ -535,6 +537,8 @@ Mode decides what happens when a client asks for something no manifest entry nam
 - `open` composes the upstream URL for any path under the namespace and fetches it. On a public forge that means any client which can reach bodega can make bodega fetch arbitrary upstream repositories. Pick it for a forge whose publishing is already controlled, and read that sentence before you do.
 
 A request under `/git/` naming a namespace no entry covers gets a 404 and a `no_namespace` discovery row, which is how an operator finds the key they have not added yet.
+
+Repointing a namespace's URL — a forge migration, a host swap, a typo correction — re-clones every repository already mirrored under it. Each mirror records the URL its first clone used, and bodega compares that against the configured upstream on the way in: a mismatch is treated as a first clone, with the old directory removed and both URLs named in a `WARN`. Serving the old forge's history from a namespace an operator has repointed is the alternative, and it is silent.
 
 A configured namespace is served by the git smart-HTTP proxy: `git clone https://bodega-host/git/<namespace>/<org>/<repo>.git` mirrors the upstream on the first request and answers from that mirror after. See [Git smart-HTTP](USAGE.md#git-smart-http) in the usage reference for the routes, the refresh interval, the operational requirements and what is out of scope. The bundle route `/git/{name}/{file}` is unaffected and still serves uploaded bundles from storage.
 

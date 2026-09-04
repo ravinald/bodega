@@ -4,14 +4,17 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -56,6 +59,13 @@ const (
 	gitFetchTimeout = 5 * time.Minute
 )
 
+// gitConfigTimeout bounds the two local git invocations that inspect a mirror
+// before it is served: the rev-parse that separates a finished clone from an
+// interrupted one, and the config read that compares its recorded origin
+// against the configured upstream. Neither touches the network, and both run
+// on the request path, so a hung invocation is a wedged request.
+const gitConfigTimeout = 10 * time.Second
+
 // gitPathInfoPattern is the shape PATH_INFO must have before any exec. It
 // admits a namespace, a repository path ending in .git, and one of the two
 // smart-HTTP suffixes: no shell metacharacters, no query string smuggled
@@ -70,8 +80,9 @@ var gitPathInfoPattern = regexp.MustCompile(`^/[A-Za-z0-9._/-]+\.git/(info/refs|
 // here rather than left to the pattern or to git-http-backend's own hygiene.
 //
 // This is one of two checks, not the check. It sees only the string; the
-// filepath.Rel test in handleGitSmart sees where that string resolves, which is
-// what catches a symlinked namespace directory.
+// gitDirWithinRoot test in handleGitSmart follows symlinks on the path that
+// string produces, which is what catches a namespace directory an operator
+// linked onto another volume.
 func gitPathInfoOK(pathInfo string) bool {
 	return gitPathInfoPattern.MatchString(pathInfo) && !strings.Contains(pathInfo, "..")
 }
@@ -190,7 +201,13 @@ func (s *Server) handleGitSmart(w http.ResponseWriter, r *http.Request, ns, rest
 	// Layer two of the push refusal. Layer one is http.receivepack=false in
 	// every mirror bodega creates; this one holds when that config drifts, and
 	// catches the info/refs probe a client makes before it ever POSTs.
-	if strings.HasSuffix(rest, "/"+gitServiceReceivePack) || r.URL.Query().Get("service") == gitServiceReceivePack {
+	//
+	// Every occurrence of the parameter, not the first: Query().Get returns the
+	// first value while git-http-backend's own parser keeps the last, so
+	// "?service=git-upload-pack&service=git-receive-pack" reads as a fetch here
+	// and as a push in the child.
+	serviceParams := r.URL.Query()["service"]
+	if strings.HasSuffix(rest, "/"+gitServiceReceivePack) || slices.Contains(serviceParams, gitServiceReceivePack) {
 		http.Error(w, "bodega mirrors are read-only; pushes are refused", http.StatusForbidden)
 		return
 	}
@@ -205,6 +222,11 @@ func (s *Server) handleGitSmart(w http.ResponseWriter, r *http.Request, ns, rest
 	if (service == gitServiceInfoRefs) != (r.Method == http.MethodGet) {
 		w.Header().Set("Allow", methodForGitService(service))
 		http.Error(w, "method not allowed for this git endpoint", http.StatusMethodNotAllowed)
+		return
+	}
+	query, ok := gitQueryString(service, serviceParams)
+	if !ok {
+		http.Error(w, "bodega serves git-upload-pack only", http.StatusForbidden)
 		return
 	}
 
@@ -226,7 +248,10 @@ func (s *Server) handleGitSmart(w http.ResponseWriter, r *http.Request, ns, rest
 	// pkg_version is empty on every git row: a clone negotiates over many refs
 	// at once, so no single version names what was asked for. F1's promote
 	// turns the versionless row into one entry with version_constraint "any".
-	if !s.enforceUpstreamPolicy(w, r, manifest.TypeGit, upstream, upstream, pkgName, "") {
+	// Recorded on the info/refs leg only. Both legs of one clone pass through
+	// here and RecordDiscovery upserts, so recording both would file one clone
+	// as two requests against a table every other type fills per request.
+	if !s.enforceUpstreamPolicyRecording(w, r, manifest.TypeGit, upstream, upstream, pkgName, "", service == gitServiceInfoRefs) {
 		return
 	}
 
@@ -236,10 +261,10 @@ func (s *Server) handleGitSmart(w http.ResponseWriter, r *http.Request, ns, rest
 		return
 	}
 	dir := filepath.Join(s.gitTool.root, filepath.FromSlash(ns), filepath.FromSlash(repo))
-	rel, err := filepath.Rel(s.gitTool.root, dir)
-	if err != nil || strings.HasPrefix(rel, "..") {
-		// The pattern above catches shape; this catches cleaning surprises and
-		// a namespace or repository name that resolves out of the tree.
+	within, err := gitDirWithinRoot(s.gitTool.root, dir)
+	if err != nil || !within {
+		// The pattern above catches the shape of the string; this catches
+		// where that string lands once symlinks are followed.
 		s.logger.Warn("git smart-HTTP path resolved outside GIT_PROJECT_ROOT",
 			"namespace", ns, "repo", repo, "root", s.gitTool.root, "dir", dir, "error", err)
 		http.NotFound(w, r)
@@ -258,7 +283,77 @@ func (s *Server) handleGitSmart(w http.ResponseWriter, r *http.Request, ns, rest
 		s.refreshGitMirror(ns, repo, dir)
 	}
 
-	s.runGitBackend(w, r, ns, repo, pathInfo)
+	s.runGitBackend(w, r, ns, repo, pathInfo, query)
+}
+
+// gitQueryString is the QUERY_STRING the CGI child gets. It is rebuilt from
+// the one service this handler validated rather than forwarded from the
+// request, so the two parsers have nothing to disagree about: net/url keeps
+// the first value of a repeated key and git-http-backend's string_list_insert
+// keeps the last.
+//
+// A POST carries its service in PATH_INFO and the child ignores the query
+// entirely, so that leg gets an empty string. An info/refs GET with no service
+// parameter is a dumb-protocol probe and keeps getting the empty string it
+// always got.
+func gitQueryString(service string, values []string) (string, bool) {
+	if service != gitServiceInfoRefs || len(values) == 0 {
+		return "", true
+	}
+	for _, v := range values {
+		if v != gitServiceUploadPack {
+			return "", false
+		}
+	}
+	return "service=" + gitServiceUploadPack, true
+}
+
+// gitDirWithinRoot reports whether dir resolves inside root once symlinks are
+// followed.
+//
+// filepath.Rel is string arithmetic over cleaned paths and never reads the
+// filesystem, so on its own it answers "corp/team/tool.git" for a namespace
+// directory an operator symlinked onto another volume, and GIT_HTTP_EXPORT_ALL
+// then exports whatever is on the far end. A mirror path does not exist before
+// its first clone, so the resolution runs against the deepest ancestor of it
+// that does.
+func gitDirWithinRoot(root, dir string) (bool, error) {
+	realRoot, err := resolveExistingAncestor(root)
+	if err != nil {
+		return false, err
+	}
+	realDir, err := resolveExistingAncestor(dir)
+	if err != nil {
+		return false, err
+	}
+	rel, err := filepath.Rel(realRoot, realDir)
+	if err != nil {
+		return false, err
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)), nil
+}
+
+// resolveExistingAncestor evaluates symlinks on the deepest ancestor of p that
+// exists and re-joins the components that do not. filepath.EvalSymlinks fails
+// outright on a path whose leaf is missing, which every mirror path is until
+// its clone lands.
+func resolveExistingAncestor(p string) (string, error) {
+	missing := ""
+	for cur := filepath.Clean(p); ; {
+		resolved, err := filepath.EvalSymlinks(cur)
+		if err == nil {
+			return filepath.Join(resolved, missing), nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return "", err
+		}
+		missing = filepath.Join(filepath.Base(cur), missing)
+		cur = parent
+	}
 }
 
 // gitCataloged reports whether a manifest entry names exactly this path.
@@ -313,15 +408,32 @@ func gitSmartService(rest string) (repo, service string, ok bool) {
 // produce one `git clone --mirror`. It runs on its own deadline rather than
 // the request's: the clients queued behind the lock all lose the mirror if the
 // first one hangs up, and the next request would start the same clone over.
+//
+// What is on disk is inspected rather than counted. `git clone --mirror`
+// creates the destination at the start of the transfer, so a restart, an OOM
+// kill or a RemoveAll that lost to a permission error leaves a directory that
+// exists, holds no refs and answers every later request with a 404 forever.
 func (s *Server) ensureGitMirror(ctx context.Context, key, dir, upstream string) error {
-	if _, err := os.Stat(dir); err == nil {
+	if ok, _ := s.gitMirrorUsable(ctx, dir, upstream); ok {
 		return nil
 	}
 
 	unlock := s.gitClone.lock(key)
 	defer unlock()
-	if _, err := os.Stat(dir); err == nil {
+	// The second look is what covers the git-upload-pack POST that arrives
+	// while the info/refs clone is still running: it blocks here rather than
+	// racing past a half-written directory into a 404 with an empty body.
+	ok, why := s.gitMirrorUsable(ctx, dir, upstream)
+	if ok {
 		return nil
+	}
+	if why != "" {
+		s.logger.Warn("discarding the mirror on disk and cloning again", "dir", dir, "upstream", upstream, "reason", why)
+	}
+	// A failed removal is the error the operator needs. Left unreported it is
+	// the permanent 404 this whole function exists to prevent.
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("remove unusable mirror %s: %w", dir, err)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
@@ -347,6 +459,74 @@ func (s *Server) ensureGitMirror(ctx context.Context, key, dir, upstream string)
 	}
 	s.stampGitFetch(dir)
 	return nil
+}
+
+// gitMirrorUsable reports whether dir holds a mirror this request may serve
+// and, when it does not, why — the reason goes in the log line that precedes
+// the re-clone. An empty reason with a false verdict means nothing is there
+// yet: a first clone, not a repair.
+//
+// Two ways to fail. A directory git got partway through has neither HEAD nor
+// the fetch stamp, both of which a finished mirror has. And a mirror whose
+// recorded origin is no longer the configured upstream is the old forge's
+// history: after an operator repoints git_upstreams[ns].url for a migration,
+// a host swap or a typo correction, every already-mirrored repository under
+// that namespace would otherwise keep serving and keep re-fetching from the
+// URL the first clone wrote.
+func (s *Server) gitMirrorUsable(ctx context.Context, dir, upstream string) (bool, string) {
+	if _, err := os.Stat(dir); err != nil {
+		return false, ""
+	}
+	if !s.gitMirrorComplete(ctx, dir) {
+		return false, "HEAD resolves to nothing and there is no fetch stamp, so a clone was interrupted before it finished"
+	}
+	if origin := s.gitMirrorOrigin(ctx, dir); origin != "" && origin != upstream {
+		return false, fmt.Sprintf("the mirror records origin %s, which is not the configured upstream %s", origin, upstream)
+	}
+	return true, ""
+}
+
+// gitMirrorComplete reports whether dir holds a mirror git finished writing.
+//
+// The fetch stamp is the cheap answer and the usual one: bodega writes it after
+// every successful clone and refresh, so a stat settles it without an exec.
+//
+// Without a stamp, ask git. The presence of HEAD proves nothing — `git clone`
+// runs `git init` in the destination before it fetches anything, so an
+// interrupted clone leaves a HEAD reading "ref: refs/heads/.invalid" beside an
+// empty refs/ and a tmp_pack_* still in objects/. rev-parse resolves HEAD,
+// which needs the refs and the objects behind them, and that is the line
+// between a mirror and a directory git got partway through.
+//
+// It is also what keeps a mirror written before the stamp existed, or one
+// whose stamp write lost to a permission error, from being destroyed and
+// cloned again on the next request.
+func (s *Server) gitMirrorComplete(ctx context.Context, dir string) bool {
+	if _, err := os.Stat(filepath.Join(dir, gitFetchStamp)); err == nil {
+		return true
+	}
+	revCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), gitConfigTimeout)
+	defer cancel()
+	_, err := s.runGit(revCtx, dir, "rev-parse", "--verify", "--quiet", "HEAD")
+	return err == nil
+}
+
+// gitMirrorOrigin returns the upstream the mirror itself records, or "" when
+// it cannot be read.
+//
+// "" is deliberately indistinguishable from a match: a mirror whose config is
+// unreadable is served rather than destroyed, because re-cloning on a
+// transient read failure trades a stale answer for no answer at all.
+func (s *Server) gitMirrorOrigin(ctx context.Context, dir string) string {
+	cfgCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), gitConfigTimeout)
+	defer cancel()
+	out, err := s.runGit(cfgCtx, dir, "config", "--get", "remote.origin.url")
+	if err != nil {
+		s.logger.Warn("could not read the mirror's recorded origin; serving it without comparing against the configured upstream",
+			"dir", dir, "error", err, "git_output", out)
+		return ""
+	}
+	return out
 }
 
 // refreshGitMirror re-fetches a mirror that has gone stale, best effort.
@@ -431,12 +611,12 @@ func (s *Server) runGit(ctx context.Context, dir string, args ...string) (string
 // inherited GIT_DIR repoints the repository the child serves and an inherited
 // PATH decides which helpers it runs, neither of which shows up in a diff, so
 // gitCGIEnv builds the list rather than appending to os.Environ.
-func (s *Server) runGitBackend(w http.ResponseWriter, r *http.Request, ns, repo, pathInfo string) {
+func (s *Server) runGitBackend(w http.ResponseWriter, r *http.Request, ns, repo, pathInfo, query string) {
 	ctx, cancel := context.WithTimeout(r.Context(), gitBackendTimeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, s.gitTool.backend)
-	cmd.Env = s.gitCGIEnv(r, pathInfo)
+	cmd.Env = s.gitCGIEnv(r, pathInfo, query)
 	cmd.Dir = s.gitTool.root
 	cmd.Stdin = r.Body
 	var stderr bytes.Buffer
@@ -479,12 +659,12 @@ func (s *Server) runGitBackend(w http.ResponseWriter, r *http.Request, ns, repo,
 // gitCGIEnv is the complete environment of the git-http-backend child. Every
 // variable is listed here; nothing is inherited. Assert this list in a test,
 // not in a comment.
-func (s *Server) gitCGIEnv(r *http.Request, pathInfo string) []string {
+func (s *Server) gitCGIEnv(r *http.Request, pathInfo, query string) []string {
 	return []string{
 		"GIT_PROJECT_ROOT=" + s.gitTool.root,
 		"GIT_HTTP_EXPORT_ALL=1",
 		"PATH_INFO=" + pathInfo,
-		"QUERY_STRING=" + r.URL.RawQuery,
+		"QUERY_STRING=" + query,
 		"REQUEST_METHOD=" + r.Method,
 		"CONTENT_TYPE=" + r.Header.Get("Content-Type"),
 		"HTTP_CONTENT_ENCODING=" + r.Header.Get("Content-Encoding"),
