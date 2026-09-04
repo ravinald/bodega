@@ -37,12 +37,12 @@ var cargoVersionPattern = regexp.MustCompile(`^[A-Za-z0-9._+-]{1,64}$`)
 // handleCargoConfig synthesizes the registry config endpoint that cargo
 // fetches on first contact. We point both the download and api URLs at our
 // own /cargo prefix so cargo never reaches upstream directly.
+//
+// The base comes from publicBase, not from r.TLS. cargo consumes these URLs
+// rather than displaying them, so a plaintext dl behind a terminating proxy is
+// not a cosmetic error: every crate download leaves TLS.
 func (s *Server) handleCargoConfig(w http.ResponseWriter, r *http.Request) {
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	base := scheme + "://" + r.Host + "/cargo"
+	base := s.publicBase(r) + "/cargo"
 	resp := struct {
 		DL  string `json:"dl"`
 		API string `json:"api"`

@@ -105,11 +105,24 @@ func (s *Server) resolveACLs(ctx context.Context) *aclSet {
 				"list", list, "error", err)
 			continue
 		}
-		nets, err := ParseDenyList(cidrs)
-		if err != nil {
-			s.logger.Error("invalid CIDR in acl table; keeping the config file value",
-				"list", list, "error", err, "next_step", "bodega acl "+list+" list")
-			continue
+		nets, bad := parseACLEntries(cidrs)
+		if len(bad) > 0 {
+			// Serve what parses. Discarding the whole list fell back to the
+			// config file, which the database already owns and outranks, so
+			// every later `bodega acl` change was inert while reporting
+			// success: the admin list could be emptied in the table and the
+			// admin reads still answered from the address just removed.
+			s.logger.Error("unreadable entry in the acl table; it is skipped and the rest of the list is in force",
+				"list", list, "skipped", strings.Join(bad, ","), "in_force", len(nets),
+				"next_step", "bodega acl "+list+" remove --raw "+bad[0])
+			if len(nets) == 0 && list == audit.ACLAdmin {
+				// Every row was unreadable, so the admin list is now empty and
+				// permits nobody: no mutation and none of the four admin reads,
+				// from localhost included. `bodega acl` writes the database
+				// directly and is the way back.
+				s.logger.Error("every admin acl row is unreadable, so the admin list is empty and permits nobody",
+					"next_step", "bodega acl admin add <cidr>")
+			}
 		}
 		switch list {
 		case audit.ACLAdmin:
@@ -242,6 +255,17 @@ func (s *Server) seedACLs(ctx context.Context) {
 				}
 				continue
 			}
+			if _, bad := parseACLEntries(sd.entries); len(bad) > 0 {
+				// Copying it would mark the list database-owned with a row no
+				// parser can read, and the refusal Start raises next says
+				// nothing about the table. Leave the database unclaimed so
+				// fixing the config file is the whole repair.
+				s.logger.Error("not copying an unreadable acl list into the audit db; fix the config file and start again",
+					"list", sd.list, "config_key", audit.ACLConfigKey(sd.list),
+					"unreadable", strings.Join(bad, ","),
+					"next_step", "correct "+audit.ACLConfigKey(sd.list)+" in "+config.ConfigPath())
+				continue
+			}
 			if _, err := s.auditDB.SeedACL(ctx, sd.list, sd.entries, audit.CurrentActor()); err != nil {
 				s.logger.Error("could not copy acl list from config into the audit db; the config file value stays in force",
 					"list", sd.list, "error", err)
@@ -264,6 +288,24 @@ func (s *Server) seedACLs(ctx context.Context) {
 				"next_step", "bodega acl "+sd.list+" list")
 		}
 	}
+}
+
+// parseACLEntries splits a list into the entries that parse and the raw text
+// of the ones that do not. ParseDenyList answers all-or-nothing, which is the
+// right shape for a config file the operator can edit and the wrong one for a
+// table whose bad row can only be reached through the CLI.
+func parseACLEntries(entries []string) ([]*net.IPNet, []string) {
+	var nets []*net.IPNet
+	var bad []string
+	for _, e := range entries {
+		one, err := ParseDenyList([]string{e})
+		if err != nil {
+			bad = append(bad, e)
+			continue
+		}
+		nets = append(nets, one...)
+	}
+	return nets, bad
 }
 
 // sameCIDRs compares two lists as sets of parsed networks, so "10.0.0.1/8" in

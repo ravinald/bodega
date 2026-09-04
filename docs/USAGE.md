@@ -491,6 +491,20 @@ Two changes are refused because they fail silently otherwise. Both take `--force
 - **An `admin add` that takes the list past localhost while no token exists.** Widening the list is what turns the Bearer requirement on, so the next mutation (including one from localhost that worked a moment earlier) answers 401 with nothing pointing at the cause. Run `bodega token generate <label>` first.
 - **An `admin remove` that empties the list.** An empty `admin_permit_cidr` permits nobody: every mutation is refused, and so are the `/api/v1/audit`, `/api/v1/tokens`, `/api/v1/policies` and `/api/v1/config` reads. Nothing could put an entry back over HTTP.
 
+One change warns and proceeds. It needs no `--force`, because one proxy per network is a real deployment and only the operator knows what else is on that network:
+
+- **A `proxies add` that admits an RFC 1918 range while `admin_permit_cidr` is localhost-only.** bodega returns `X-Real-IP` verbatim from any peer in the trusted set, so a host inside the added range reaches the mutation API and the four admin reads by sending `X-Real-IP: 127.0.0.1`, with no token. A permissive trusted set widens the first layer no matter how narrow `admin_permit_cidr` looks. Add the proxy's own address as a `/32` instead.
+
+#### Repairing an unreadable row
+
+`remove` normalizes its argument before matching, which means it refuses an entry the CIDR parser cannot read: `bodega acl admin remove 10.0.0.0/833` answers `"10.0.0.0/833" is not a CIDR or an address`. Such a row can only have been written by a version that copied `admin_permit_cidr` into the table without parsing it first. `--raw` matches the stored text byte for byte and skips the validation:
+
+```bash
+bodega acl admin remove --raw 10.0.0.0/833
+```
+
+A server holding one skips it, serves the rest of the list, and names the entry and this command in an `ERROR` line at startup. Seeding now parses the config file's list first and refuses to copy one it cannot read, so a fresh install cannot reach this state.
+
 Every add and remove writes an audit row: a `create` or `delete` event with `pkg_type=acl`, the list name, the CIDR and the OS user who ran the command. `bodega audit events` shows the list in its `NAME` column; the CIDR is in the record's version field, which `GET /api/v1/audit` returns and the table view does not.
 
 The first write to a list copies the config file's value in and says so. After that the database owns the list and the file's entry is inert; see **Configuration** below.
@@ -1507,7 +1521,7 @@ Or set in config:
 { "tls_cert": "/etc/bodega/cert.pem", "tls_key": "/etc/bodega/key.pem" }
 ```
 
-When TLS is active, responses include `Strict-Transport-Security` (HSTS).
+Responses include `Strict-Transport-Security` (HSTS) whenever clients reach bodega over https, which is not the same question as whether this listener terminates TLS. The scheme comes from `public_url` when one is set, and from the request otherwise, honoring `X-Forwarded-Proto` only when the peer is inside `trusted_proxies`. So a loopback listener behind a terminating proxy sends HSTS, and a client on plain http that sets the header itself does not get one.
 
 #### Serving without TLS
 
@@ -1579,6 +1593,8 @@ server {
 }
 ```
 
+with `"public_url": "https://bodega.example.com"` in bodega's `config.json`. `X-Forwarded-Proto` covers the requests bodega can see; `public_url` covers the startup banner, the TUI and `/api/v1/status`, which have no request to read.
+
 Minimal Apache config. The two `RequestHeader unset` lines are a security control rather than boilerplate: bodega returns `X-Real-IP` verbatim from any peer inside `trusted_proxies`, Apache proxies from `127.0.0.1`, and `admin_permit_cidr` defaults to loopback only, so without them a remote client setting `X-Real-IP: 127.0.0.1` reaches the mutation API with no token.
 
 Stripping at the proxy is still the right belt, but it is no longer the only one. Set `trusted_proxies` to the address your proxy actually connects from, and a header arriving from anywhere else is ignored whether or not the vhost remembered to unset it:
@@ -1606,6 +1622,8 @@ That matters most when bodega and its proxy do not share a host. The default tru
     ProxyPassReverse / http://127.0.0.1:8080/
 </VirtualHost>
 ```
+
+with the same `"public_url": "https://bodega.example.com"` in `config.json`. Neither vhost sets `Strict-Transport-Security` itself: bodega sends it once the scheme resolves to https, and two sources for one header is how they drift.
 
 ---
 

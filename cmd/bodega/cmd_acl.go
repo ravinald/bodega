@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"text/tabwriter"
@@ -116,6 +117,15 @@ func newACLAddCmd(gf *globalFlags, list aclList) *cobra.Command {
 					return err
 				}
 			}
+			if list.name == audit.ACLProxies {
+				warn, err := warnProxyWidening(ctx, adb, cfg, cidr)
+				if err != nil {
+					return err
+				}
+				if warn != "" {
+					fmt.Fprint(cmd.ErrOrStderr(), warn)
+				}
+			}
 			if err := ensureACLSeeded(ctx, adb, cfg, list.name); err != nil {
 				return err
 			}
@@ -145,14 +155,32 @@ func newACLAddCmd(gf *globalFlags, list aclList) *cobra.Command {
 
 func newACLRemoveCmd(gf *globalFlags, list aclList) *cobra.Command {
 	var force bool
+	var raw bool
 	c := &cobra.Command{
 		Use:   "remove <cidr>",
 		Short: "Remove a CIDR from " + list.configKey,
-		Args:  cobra.ExactArgs(1),
+		Long: `Remove one entry from ` + list.configKey + `.
+
+The argument is normalized before matching, so "10.0.0.1/8" removes the
+"10.0.0.0/8" the table stores.
+
+--raw matches the stored text byte for byte and skips that validation. It is
+how a row the CIDR parser cannot read gets deleted: such a row is skipped at
+startup and named in the server's ERROR line, and without --raw the command
+that would remove it refuses its own argument.
+
+Examples:
+  bodega acl ` + list.name + ` remove 10.0.0.0/8
+  bodega acl ` + list.name + ` remove --raw 10.0.0.0/833`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cidr, err := normalizeCIDR(args[0])
-			if err != nil {
-				return err
+			cidr := args[0]
+			if !raw {
+				var err error
+				if cidr, err = normalizeCIDR(args[0]); err != nil {
+					return fmt.Errorf("%w\n"+
+						"  If the table holds it verbatim: bodega acl %s remove --raw %s", err, list.name, args[0])
+				}
 			}
 			ctx := context.Background()
 			cfg, adb, err := openACLStore(gf)
@@ -172,6 +200,21 @@ func newACLRemoveCmd(gf *globalFlags, list aclList) *cobra.Command {
 				return fmt.Errorf("%s is not in the %s list.\n  See what is: bodega acl %s list",
 					cidr, list.name, list.name)
 			}
+			if raw {
+				// The row does not parse, so neither guard can reason about
+				// what the list becomes. Removing it only ever narrows what
+				// the server already refused to read.
+				if err := ensureACLSeeded(ctx, adb, cfg, list.name); err != nil {
+					return err
+				}
+				if _, err := adb.RemoveACL(ctx, list.name, cidr); err != nil {
+					return fmt.Errorf("remove %s from the %s list: %w", cidr, list.name, err)
+				}
+				recordACLChange(ctx, adb, audit.EventDelete, list.name, cidr, "remove-raw", force)
+				fmt.Printf("Removed %s from the %s list (%s).\n", cidr, list.name, list.configKey)
+				fmt.Println(aclEffectNote)
+				return nil
+			}
 			if list.name == audit.ACLAdmin && !force {
 				if err := checkAdminLockout(current, cidr); err != nil {
 					return err
@@ -189,6 +232,8 @@ func newACLRemoveCmd(gf *globalFlags, list aclList) *cobra.Command {
 			return nil
 		},
 	}
+	c.Flags().BoolVar(&raw, "raw", false,
+		"match the stored text verbatim, for a row the CIDR parser cannot read")
 	if list.name == audit.ACLAdmin {
 		c.Flags().BoolVar(&force, "force", false,
 			"remove anyway when the result would be an empty admin list, locking out every mutation")
@@ -404,6 +449,59 @@ func checkAdminWidening(ctx context.Context, adb *audit.DB, current []string, ad
 			"  Issue a token first:  bodega token generate <label>\n"+
 			"  Or add it anyway:     bodega acl admin add %s --force",
 		adding, adding)
+}
+
+// rfc1918 are the private ranges a proxies entry can admit. A peer inside one
+// is on the same network as the proxy, not behind it.
+var rfc1918 = []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
+
+// warnProxyWidening reports an `acl proxies add` that admits a private range
+// while admin_permit_cidr is localhost-only, and names what it enables.
+//
+// trusted_proxies is the list whose widening defeats the other two: bodega
+// takes X-Real-IP verbatim from any peer in it, so a peer in the added range
+// asserts X-Real-IP: 127.0.0.1 and satisfies a localhost-only admin list with
+// no token. The narrowing direction already says out loud that the built-in
+// default has ended; this is the direction that costs something.
+//
+// A warning, not a refusal: one proxy per network is a real deployment, and
+// the operator adding it is the one who knows whether anything else is on it.
+func warnProxyWidening(ctx context.Context, adb *audit.DB, cfg *config.Config, adding string) (string, error) {
+	_, added, err := net.ParseCIDR(adding)
+	if err != nil || added.IP.IsLoopback() {
+		return "", nil
+	}
+	private := false
+	for _, r := range rfc1918 {
+		_, p, err := net.ParseCIDR(r)
+		if err != nil {
+			continue
+		}
+		if p.Contains(added.IP) || added.Contains(p.IP) {
+			private = true
+			break
+		}
+	}
+	if !private {
+		return "", nil
+	}
+	adminRaw, err := effectiveACL(ctx, adb, cfg, audit.ACLAdmin)
+	if err != nil {
+		return "", err
+	}
+	adminNets, parseErr := server.ParseDenyList(adminRaw)
+	if parseErr != nil || len(adminNets) == 0 || !server.LocalhostOnly(adminNets) {
+		return "", nil
+	}
+	return fmt.Sprintf(
+		"Warning: %s admits a private range to the trusted-proxy set while admin_permit_cidr\n"+
+			"is localhost-only. bodega returns X-Real-IP verbatim from any peer in that set, so a\n"+
+			"host in %s reaches the mutation API and the four admin reads by sending\n"+
+			"X-Real-IP: 127.0.0.1, with no token. A permissive trusted set widens the first layer\n"+
+			"no matter how narrow admin_permit_cidr looks.\n"+
+			"  Narrow it to the proxy:  bodega acl proxies add <proxy-address>/32\n"+
+			"  See what is trusted:     bodega acl proxies list\n",
+		adding, adding), nil
 }
 
 // checkAdminLockout refuses a removal that would empty the admin list. An empty
