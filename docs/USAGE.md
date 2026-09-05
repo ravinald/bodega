@@ -955,6 +955,14 @@ ERROR storage backend unavailable — package routes will answer 503; the API an
 
 Per backend: `driver` is required and is one of the same values `storage_backend` takes. `path` is read by `local`; `bucket` and `region` by `s3`; `prefix` roots every key under it, on either driver.
 
+A `prefix` must be spelled canonically. A leading and a trailing `/` are stripped, so `cold/x`, `/cold/x` and `cold/x/` are one prefix and all three load. An empty segment or a `.` segment is refused, because they are a second spelling of a directory rather than a second directory:
+
+```text
+storage_backends["b"]: prefix "cold//x" is not canonical; write it as "cold/x". Two spellings of one prefix are two backend identities, and 'bodega pkg move' between them deletes the only copy
+```
+
+A `..` segment is refused separately, and for a different reason: it names a location outside the backend, and every key through such a backend already fails the traversal check, so the backend is unusable rather than ambiguous.
+
 The two namespaces never mix, and `Load` enforces it. `storage_backend` is a **driver**. `storage_backends` keys and `storage_by_type` values are **names**. A name equal to `default` or to a driver is rejected, as is a `storage_by_type` value naming a backend nothing defines:
 
 ```text
@@ -964,6 +972,8 @@ storage_by_type["apt"] names undefined storage backend "archive" (defined: defau
 Two entries resolving to one bucket or directory is neither rejected nor warned about. It is a supported way to stage a migration, and the identity that decides sameness is the backend's resolved label: comparing the configured strings at load would miss a symlink, a trailing slash or a relative path, and fire on a `path` two different drivers happen to share. `bodega pkg move` is the one command the collision can destroy anything through, and it refuses by label before the first copy.
 
 The resolved label is resolved because the `local` driver is made to resolve it, not because a driver was ever guaranteed to. Until [#136](https://github.com/ravinald/bodega/issues/136), `storage_path` reached the label verbatim: a second backend pointing at a symlink of the first root produced two labels for one directory, the refusal did not fire, and `--delete-source` removed the only copy. `local` now resolves its root once at construction with `filepath.Abs` then `filepath.EvalSymlinks`, falling back to the absolute cleaned path for a root it is about to create. `s3://<bucket>` needs nothing: it is already one string per bucket.
+
+The prefix is the other half of that label, and it was still concatenated verbatim after #136 fixed the root. Until [#189](https://github.com/ravinald/bodega/issues/189), two backends over one `storage_path` with prefixes `cold/x` and `cold//x` carried two labels for one directory, and `bodega pkg move --to b --delete-source` between them exited 0 reporting a move and left nothing on disk. The label now cleans the prefix, which is truthful only because the spellings that would need cleaning are refused at load: `s3` stores the key it is handed, so `cold//x/k` and `cold/x/k` are two distinct objects in one bucket and a cleaned label over an s3 backend would claim an identity the bucket does not have.
 
 #### The placement hierarchy
 

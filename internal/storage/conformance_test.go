@@ -24,6 +24,12 @@ func conformanceBackends() map[string]func(t *testing.T) ObjectStore {
 	return map[string]func(t *testing.T) ObjectStore{
 		"local":  func(t *testing.T) ObjectStore { return NewLocal(rootWithDecoySibling(t)) },
 		"memory": func(t *testing.T) ObjectStore { return NewMemory() },
+		// prefixed is a wrapper rather than a driver, and it was absent long
+		// enough for Label() to grow a second spelling of one directory that
+		// TestLabelIsOnePerLocation would have caught (#189).
+		"prefixed": func(t *testing.T) ObjectStore {
+			return withPrefix(NewLocal(rootWithDecoySibling(t)), "cold/x")
+		},
 	}
 }
 
@@ -630,6 +636,18 @@ func sameLocationSpellings(t *testing.T) map[string][]ObjectStore {
 		// two instances are two locations. TestLabelDistinguishesTwoStores
 		// covers that direction already.
 		"memory": nil,
+		// A prefix multiplies the spellings: everything the inner root can be
+		// called, times everything the prefix can be called. The last two are
+		// the pair that reached #189 through a config file.
+		"prefixed": {
+			withPrefix(NewLocal(root), "cold/x"),
+			withPrefix(NewLocal(link), "cold/x"),
+			withPrefix(NewLocal(root), "/cold/x"),
+			withPrefix(NewLocal(root), "cold/x/"),
+			withPrefix(NewLocal(root), "cold//x"),
+			withPrefix(NewLocal(root), "./cold/x"),
+			withPrefix(NewLocal(root), "cold/y/../x"),
+		},
 	}
 }
 

@@ -3,6 +3,7 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -135,5 +136,57 @@ func TestLoadAcceptsDefaultAsAStorageByTypeValue(t *testing.T) {
 	}
 	if cfg.StorageByType["apt"] != "default" {
 		t.Errorf("storage_by_type[apt] = %q, want default", cfg.StorageByType["apt"])
+	}
+}
+
+// TestLoadRejectsNonCanonicalPrefix pins the admission half of #189. A prefix
+// is operator-facing and was unvalidated, so "cold/x" and "cold//x" over one
+// storage_path were two backend identities over one directory: the same-
+// location refusal in 'bodega pkg move' could not fire and --delete-source
+// removed the only copy. Label() now cleans the prefix, and cleaning is only
+// truthful because these spellings never reach it.
+func TestLoadRejectsNonCanonicalPrefix(t *testing.T) {
+	withDrivers(t, "local", "s3")
+	cases := []struct {
+		name   string
+		prefix string
+		want   string
+	}{
+		{"empty segment", "cold//x", `write it as "cold/x"`},
+		{"leading dot segment", "./cold/x", `write it as "cold/x"`},
+		{"interior traversal", "cold/y/../x", "leaves the backend root"},
+		{"leading traversal", "../cold/x", "leaves the backend root"},
+		{"bare dot", ".", "names no location"},
+		{"doubled leading slash", "//cold/x", `write it as "cold/x"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			writeConfig(t, `{"storage_backends":{"bulk":{"driver":"local","path":"/tmp/x","prefix":`+
+				strconv.Quote(tc.prefix)+`}}}`)
+			_, err := config.Load("", "", "", "", false, false)
+			if err == nil {
+				t.Fatalf("Load accepted prefix %q", tc.prefix)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %q, want it to contain %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoadAcceptsPrefixSpellingsWithPrefixStrips guards the other direction.
+// withPrefix strips a leading and a trailing "/" itself, so those are the same
+// prefix rather than a second spelling of it, and refusing them would break
+// configs that load today.
+func TestLoadAcceptsPrefixSpellingsWithPrefixStrips(t *testing.T) {
+	withDrivers(t, "local", "s3")
+	for _, prefix := range []string{"", "/", "cold/x", "/cold/x", "cold/x/", "/cold/x/"} {
+		t.Run(strconv.Quote(prefix), func(t *testing.T) {
+			writeConfig(t, `{"storage_backends":{"bulk":{"driver":"local","path":"/tmp/x","prefix":`+
+				strconv.Quote(prefix)+`}}}`)
+			if _, err := config.Load("", "", "", "", false, false); err != nil {
+				t.Fatalf("Load rejected prefix %q: %v", prefix, err)
+			}
+		})
 	}
 }

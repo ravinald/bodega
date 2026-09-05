@@ -863,6 +863,9 @@ func (c *Config) validateStorage() error {
 		if len(drivers) > 0 && !isDriver[spec.Driver] {
 			return fmt.Errorf("storage_backends[%q]: unknown driver %q (drivers: %s)", name, spec.Driver, driverList)
 		}
+		if err := validatePrefix(name, spec.Prefix); err != nil {
+			return err
+		}
 	}
 
 	for typ, name := range c.StorageByType {
@@ -877,6 +880,50 @@ func (c *Config) validateStorage() error {
 		}
 	}
 	return nil
+}
+
+// validatePrefix refuses a storage prefix that names one location in more than
+// one way, or that names a location outside the backend.
+//
+// Refused rather than normalized, and the two are separate decisions.
+//
+// Normalizing would be silent, and silence is wrong per driver: the local
+// backend resolves "cold//x/k" through filepath.Join and stores it at
+// "cold/x/k", but s3 stores the key it is handed, so "cold//x/k" and
+// "cold/x/k" are two distinct objects in one bucket. Rewriting the prefix
+// under an operator would move every object on one driver and orphan every
+// object on the other. Refusing makes the operator write the spelling they
+// meant, and it is what lets prefixed.Label() clean the prefix without
+// claiming an s3 identity the bucket does not have.
+//
+// A traversal segment is a different question and gets its own refusal. The
+// two spellings above are one directory under two names; "../x" is a prefix
+// that leaves storage_path entirely. Every key through such a backend already
+// fails storage.ValidateKey, so the backend is unusable rather than dangerous
+// — but it fails at the first upload rather than at startup, which is the
+// wrong end of the day to find out.
+//
+// A leading and a trailing "/" stay legal: withPrefix strips them, so they are
+// spellings of the same prefix rather than of a different one.
+func validatePrefix(name, prefix string) error {
+	trimmed := strings.TrimSuffix(strings.TrimPrefix(prefix, "/"), "/")
+	if trimmed == "" {
+		return nil
+	}
+	for _, seg := range strings.Split(trimmed, "/") {
+		if seg == ".." {
+			return fmt.Errorf("storage_backends[%q]: prefix %q leaves the backend root; write it relative to the backend, with no %q segment", name, prefix, "..")
+		}
+	}
+	cleaned := path.Clean("/" + trimmed)
+	if cleaned == "/"+trimmed {
+		return nil
+	}
+	want := strings.TrimPrefix(cleaned, "/")
+	if want == "" {
+		return fmt.Errorf("storage_backends[%q]: prefix %q names no location; remove it", name, prefix)
+	}
+	return fmt.Errorf("storage_backends[%q]: prefix %q is not canonical; write it as %q. Two spellings of one prefix are two backend identities, and 'bodega pkg move' between them deletes the only copy", name, prefix, want)
 }
 
 // definedStorageNames lists every usable backend name, sorted, with the

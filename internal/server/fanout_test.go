@@ -22,6 +22,7 @@ import (
 // backends use storage.NewResolver instead — see placement_test.go.
 type multiResolver struct {
 	stores []storage.NamedStore
+	byType map[string]string // storage_by_type, read the way the real resolver reads it
 }
 
 func (r *multiResolver) Default() storage.ObjectStore { return r.stores[0].Store }
@@ -38,13 +39,50 @@ func (r *multiResolver) ByName(name string) (storage.ObjectStore, error) {
 	return nil, errors.New("unknown storage backend " + name)
 }
 
-func (r *multiResolver) Placement(_, _ string) storage.Decision {
+func (r *multiResolver) Placement(typ, _ string) storage.Decision {
+	if name := r.byType[typ]; name != "" {
+		return storage.Decision{Name: name}
+	}
 	return storage.Decision{Name: storage.DefaultName}
 }
-func (r *multiResolver) ForType(_ string) storage.ObjectStore { return r.stores[0].Store }
-func (r *multiResolver) All() []storage.NamedStore            { return r.stores }
-func (r *multiResolver) Fanout(context.Context, string, []string) []storage.NamedStore {
-	return r.stores
+
+func (r *multiResolver) ForType(typ string) storage.ObjectStore {
+	store, err := r.ByName(r.Placement(typ, "").Name)
+	if err != nil {
+		return r.Default()
+	}
+	return store
+}
+
+func (r *multiResolver) All() []storage.NamedStore { return r.stores }
+
+// Fanout narrows the same way storage.multi does. It used to return every
+// backend whatever it was handed, so no server test could tell listFanout's
+// recorded set from a hardcoded one: the B4 regression — a package moved with
+// 'bodega pkg move' sits on a backend no storage_by_type key names, and drops
+// out of every index — passed straight through the double (#190).
+//
+// dedupByLabel is deliberately absent. That is storage's rule, pinned in
+// internal/storage/multi_test.go; repeating it here would let this double
+// stand in for a resolver that had lost it.
+func (r *multiResolver) Fanout(_ context.Context, typ string, recorded []string) []storage.NamedStore {
+	want := map[string]struct{}{storage.DefaultName: {}}
+	if name := r.byType[typ]; name != "" {
+		want[name] = struct{}{}
+	}
+	for _, name := range recorded {
+		if name == "" {
+			name = storage.DefaultName
+		}
+		want[name] = struct{}{}
+	}
+	out := make([]storage.NamedStore, 0, len(want))
+	for _, ns := range r.stores {
+		if _, ok := want[ns.Name]; ok {
+			out = append(out, ns)
+		}
+	}
+	return out
 }
 
 // countingStore records how many times List was called and can be made to fail.
@@ -64,12 +102,39 @@ func (c *countingStore) List(ctx context.Context, prefix string) ([]string, erro
 
 func fanoutServer(t *testing.T, stores ...storage.NamedStore) *httptest.Server {
 	t.Helper()
+	return fanoutServerRouted(t, nil, stores...)
+}
+
+// fanoutServerRouted serves one pypi package with a version on the first
+// backend and a version on the second, the second recording its own name.
+//
+// The seeding matters as much as the double. With one version and no Storage
+// only the default was ever recorded, so a Fanout that honored its arguments
+// and one that ignored them returned the same set, and nothing could tell them
+// apart. The second name is reachable only through recordedBackends — no
+// byType key points at it — which is the position 'bodega pkg move' leaves a
+// package in.
+//
+// A third backend is deliberately left unrecorded and unrouted. It is the one
+// nothing should reach, and a narrowing assertion needs one.
+func fanoutServerRouted(t *testing.T, byType map[string]string, stores ...storage.NamedStore) *httptest.Server {
+	t.Helper()
 	store := manifest.NewLocalStore(t.TempDir())
-	if err := store.AddVersion(t.Context(), manifest.TypePypi, "thing", manifest.VersionEntry{Version: "1.0"}); err != nil {
-		t.Fatalf("AddVersion: %v", err)
+	seed := func(version, recorded string) {
+		if err := store.AddVersion(t.Context(), manifest.TypePypi, "thing", manifest.VersionEntry{
+			Version: version,
+			Storage: recorded,
+		}); err != nil {
+			t.Fatalf("AddVersion: %v", err)
+		}
+	}
+	seed("1.0", "")
+	if len(stores) > 1 {
+		seed("2.0", stores[1].Name)
 	}
 	cfg := &config.Config{ManifestDir: "manifests", AptCodename: "noble", MetadataTTL: "1h"}
-	ts := httptest.NewServer(server.New(cfg, store, &multiResolver{stores: stores}, ":0", nil).Handler())
+	resolver := &multiResolver{stores: stores, byType: byType}
+	ts := httptest.NewServer(server.New(cfg, store, resolver, ":0", nil).Handler())
 	t.Cleanup(ts.Close)
 	return ts
 }
@@ -253,5 +318,45 @@ func TestPackageRouteWithoutStorageDoesNotBlameS3(t *testing.T) {
 		if !strings.Contains(body, "startup log") {
 			t.Errorf("GET %s 503 body does not point at the reason: %q", path, strings.TrimSpace(body))
 		}
+	}
+}
+
+// TestListFanoutNarrowsToWhatAReadCanReach pins both arguments listFanout
+// passes. The double returned every backend whatever it was handed, so this
+// could not have failed however listFanout was written (#190).
+//
+// "cold" holds a wheel and is named by nothing: not the default, not
+// storage_by_type, not a manifest entry. Serving its wheel means the fan-out
+// widened past what a read of pypi can reach, and a backend being down would
+// then 502 an index that never needed it.
+func TestListFanoutNarrowsToWhatAReadCanReach(t *testing.T) {
+	mk := func(wheel string) *storage.Memory {
+		s := storage.NewMemory()
+		s.Seed("pypi/wheels/thing-"+wheel+"-py3-none-any.whl", "x")
+		return s
+	}
+	named := []storage.NamedStore{
+		{Name: storage.DefaultName, Store: mk("1.0")},
+		{Name: "bulk", Store: mk("2.0")},
+		{Name: "cold", Store: mk("3.0")},
+	}
+
+	// recorded reaches "bulk": a version records it, which is all a moved
+	// package leaves behind.
+	_, body := getBody(t, fanoutServer(t, named...), "/pypi/simple/thing/")
+	for _, want := range []string{"thing-1.0", "thing-2.0"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("index is missing %s, so listFanout dropped its backend:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "thing-3.0") {
+		t.Errorf("index lists thing-3.0 from an unreachable backend:\n%s", body)
+	}
+
+	// typ reaches "cold": storage_by_type sends pypi there, and nothing else
+	// changed.
+	_, routed := getBody(t, fanoutServerRouted(t, map[string]string{"pypi": "cold"}, named...), "/pypi/simple/thing/")
+	if !strings.Contains(routed, "thing-3.0") {
+		t.Errorf("storage_by_type routes pypi to cold and its wheel is absent:\n%s", routed)
 	}
 }
