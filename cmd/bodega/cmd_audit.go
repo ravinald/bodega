@@ -23,7 +23,9 @@ func newAuditEventsCmd(gf *globalFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "events",
 		Short: "Query the audit event trail",
-		Long: `audit queries the SQLite audit database and prints matching events.
+		Long: `audit queries the configured audit sink and prints matching events.
+Under audit_sink "syslog" or "jsonl" it refuses: those sinks ship events out
+and keep nothing to read back.
 
 Examples:
   bodega audit                                    # last 20 events
@@ -36,14 +38,9 @@ A "denied" event carries the gate that refused it in the STATUS column:
 deny_list, client_ip_unparsable, ip_not_permitted, no_tokens_configured,
 token_missing, token_invalid, token_expired, admin_only.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := loadConfig(gf)
+			db, err := openQueryableAuditDB(gf, "the audit events `audit events` queries")
 			if err != nil {
 				return err
-			}
-
-			db, err := audit.Open(cfg.AuditDB)
-			if err != nil {
-				return fmt.Errorf("open audit db: %w", err)
 			}
 			defer db.Close()
 

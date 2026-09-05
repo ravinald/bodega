@@ -20,6 +20,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/ravinald/bodega/internal/audit"
 )
 
 const (
@@ -103,6 +105,8 @@ type Config struct {
 	DenyList          []string `json:"deny_list,omitempty"`
 	Timezone          string   `json:"timezone,omitempty"`          // display timezone, e.g. "America/Los_Angeles"; default UTC
 	AuditEvents       []string `json:"audit_events,omitempty"`      // event types to record; empty = all
+	AuditSink         string   `json:"audit_sink,omitempty"`        // where the event stream goes: "sqlite" (default), "postgres", "syslog", "jsonl"
+	AuditSinkDSN      string   `json:"audit_sink_dsn,omitempty"`    // destination for the sink; see validateAuditSink for the per-sink meaning
 	StorageBackend    string   `json:"storage_backend,omitempty"`   // driver for the "default" backend: "local" (default), "s3"
 	StoragePath       string   `json:"storage_path,omitempty"`      // root directory for local backend
 	AptCodename       string   `json:"apt_codename,omitempty"`      // default suite for apt entries that name none (default "noble")
@@ -618,6 +622,10 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 
 	// Audit.
 	cfg.AuditDB = firstNonEmpty(cfg.AuditDB, filepath.Join(cfg.LogDir, "audit.db"))
+	cfg.AuditSink = firstNonEmpty(cfg.AuditSink, audit.SinkSQLite)
+	if err := validateAuditSink(cfg.AuditSink, cfg.AuditSinkDSN); err != nil {
+		return nil, err
+	}
 
 	// Storage backend.
 	cfg.StorageBackend = firstNonEmpty(cfg.StorageBackend, "local")
@@ -738,6 +746,50 @@ func (c *Config) ValidateTLSPair() error {
 		return fmt.Errorf("tls_cert is set (%s) but tls_key is empty: set tls_key to the matching private key PEM, or clear tls_cert and set allow_plaintext to serve without TLS", c.TLSCert)
 	case c.TLSKey != "" && c.TLSCert == "":
 		return fmt.Errorf("tls_key is set (%s) but tls_cert is empty: set tls_cert to the matching certificate PEM, or clear tls_key and set allow_plaintext to serve without TLS", c.TLSKey)
+	}
+	return nil
+}
+
+// validateAuditSink refuses an audit_sink bodega cannot build, at load rather
+// than at the first write. Only the event stream is pluggable: ACLs, tokens,
+// checksums and the policy tables stay in audit_db under every sink, because
+// the request path reads them to decide and a sink that cannot answer a query
+// cannot hold them.
+//
+// audit_sink_dsn means something different per sink, so it is checked here
+// rather than left to fail inside the sink: a postgres URL with no host and a
+// jsonl path that is relative both produce a running server whose audit trail
+// goes nowhere, which is the state this whole design refuses.
+func validateAuditSink(sink, dsn string) error {
+	if !audit.ValidSink(sink) {
+		return fmt.Errorf("invalid audit_sink %q (want one of: %s). Only the event stream is pluggable — ACLs, tokens, checksums and policies stay in audit_db under every sink",
+			sink, strings.Join(audit.Sinks(), ", "))
+	}
+	switch sink {
+	case audit.SinkSQLite:
+		if dsn != "" {
+			return fmt.Errorf("audit_sink %q takes no audit_sink_dsn (got %q): it writes the event stream into audit_db, the same file the ACLs and tokens live in. Clear audit_sink_dsn, or set audit_sink to one of: %s",
+				audit.SinkSQLite, dsn, strings.Join(audit.Sinks()[1:], ", "))
+		}
+	case audit.SinkPostgres:
+		if dsn == "" {
+			return fmt.Errorf("audit_sink %q needs audit_sink_dsn: a libpq connection string, e.g. \"postgres://bodega@db.internal:5432/bodega?sslmode=verify-full\"", audit.SinkPostgres)
+		}
+	case audit.SinkJSONL:
+		if dsn == "" {
+			return fmt.Errorf("audit_sink %q needs audit_sink_dsn: the absolute path of the file to append to, e.g. \"/var/log/bodega/audit.jsonl\"", audit.SinkJSONL)
+		}
+		if !filepath.IsAbs(dsn) {
+			return fmt.Errorf("audit_sink_dsn %q for audit_sink %q must be absolute: bodega serve runs from whatever working directory the unit file chooses, so a relative path names a different file per invocation", dsn, audit.SinkJSONL)
+		}
+	case audit.SinkSyslog:
+		// An empty dsn is the local daemon, which is the common case. A
+		// non-empty one is scheme://address and the sink owns that grammar.
+		if dsn != "" {
+			if err := audit.ValidateSyslogDSN(dsn); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -1164,6 +1216,11 @@ func defaultConfigContent() []byte {
   "audit_db": "",
   "timezone": "",
   "audit_events": [],
+
+  "_comment_audit_sink": "audit_sink: where the append-only event stream goes — sqlite (default, same file as audit_db), postgres (a fleet writing at once, and reporting across instances), syslog or jsonl (write-only; they ship events out and keep nothing, so 'bodega audit events', 'bodega discover list' and GET /api/v1/audit refuse by name and 'bodega discover promote' is unavailable). One sink, not a list: teeing to two stores keeps the write rate you switched away from. ACLs, tokens, checksums and policies stay in audit_db under every sink — the request path reads them to decide.",
+  "_comment_audit_sink_dsn": "audit_sink_dsn: postgres connection string, syslog scheme://address (empty = the local daemon), or an absolute jsonl path. Unused by sqlite, which refuses it rather than ignoring it.",
+  "audit_sink": "sqlite",
+  "audit_sink_dsn": "",
 
   "_comment_deny": "deny_list: CIDR entries (e.g. 10.0.0.5, 192.168.1.0/24, fd00::/8) — bare IPs imply /32 or /128",
   "deny_list": [],

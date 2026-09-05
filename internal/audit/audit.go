@@ -1,6 +1,31 @@
-// Package audit provides a SQLite-backed audit trail for package operations.
-// It records builds, client fetches, CRUD mutations, proxy cache events, the
-// server's own start and stop, and every request the server refused.
+// Package audit provides the audit trail for package operations: builds,
+// client fetches, CRUD mutations, proxy cache events, the server's own start
+// and stop, and every request the server refused.
+//
+// The package holds two things that look alike and are not.
+//
+// The append-only event stream — Record and RecordDiscovery — is written on
+// the hot path, read for reporting, and never read to make a decision. That is
+// the pluggable half: EventSink, selected by audit_sink, with four
+// implementations (sqlite, postgres, syslog, jsonl).
+//
+// Operational state — ACL lists, API tokens, cached checksums and the
+// age/OSV/upstream policies — is not pluggable and is not a candidate for it.
+// The request path reads it to decide: whether an address is permitted,
+// whether a Bearer token is live, whether an upstream is allowed. Those reads
+// need a transactional read-modify-write and a queryable store, so a sink that
+// can only append (syslog, jsonl) cannot hold them, and moving them somewhere
+// remote would put a network round trip inside every request bodega serves. It
+// stays in the embedded SQLite database at audit_db, which every install has
+// regardless of which sink the events go to.
+//
+// *DB is that embedded store. It also fronts the sink: Record and
+// RecordDiscovery delegate, and the read surface (Query, ListDiscovery,
+// AggregateDiscovery and their neighbours) either delegates to a sink that
+// implements EventReader or refuses with an UnqueryableSinkError naming the
+// configured sink. It never falls back to the local tables, because answering
+// a query from a store the events are no longer going to is the lie this
+// design is built to avoid.
 package audit
 
 import (
@@ -9,6 +34,7 @@ import (
 	"fmt"
 	"os"
 	"os/user"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -128,12 +154,37 @@ type Filter struct {
 	Limit     int       // 0 = default (1000)
 }
 
-// DB is a SQLite audit database.
+// DB is the embedded SQLite store that holds operational state, and the front
+// door to the configured event sink. See the package comment for why only one
+// of those two halves is pluggable.
 type DB struct {
 	db       *sql.DB
+	sink     EventSink       // where events go; sqliteSink shares db when audit_sink is "sqlite"
 	filter   map[string]bool // nil = record all; otherwise only listed types
 	location *time.Location  // display timezone (storage is always UTC)
 	readOnly bool            // true when the backing file is not writable; Record becomes a no-op
+}
+
+// SinkName returns the configured sink kind, for error text and status output
+// that has to name where events are going.
+func (a *DB) SinkName() string { return a.sink.Name() }
+
+// EventsQueryable reports whether the configured sink can answer a read. False
+// for syslog and jsonl, which ship events out and keep no table.
+func (a *DB) EventsQueryable() bool {
+	_, ok := a.sink.(EventReader)
+	return ok
+}
+
+// reader returns the sink's read surface, or the refusal a write-only sink
+// owes the caller. op names what was being read so the message can say which
+// query went unanswered.
+func (a *DB) reader(op string) (EventReader, error) {
+	r, ok := a.sink.(EventReader)
+	if !ok {
+		return nil, &UnqueryableSinkError{Sink: a.sink.Name(), Op: op}
+	}
+	return r, nil
 }
 
 // SetEventFilter restricts which event types are recorded. Pass nil or empty
@@ -211,8 +262,27 @@ func dsn(path string) string {
 // keeps working. This is the graceful path for "I'm logged in as ravi but
 // /var/log/bodega/audit.db is root:root 644."
 func Open(path string) (*DB, error) {
+	return OpenWithSink(path, SinkConfig{})
+}
+
+// OpenWithSink opens the embedded store at path and attaches the configured
+// event sink. The embedded store is opened either way: it holds the ACLs,
+// tokens, checksums and policies the request path reads, which no sink
+// replaces. A sink that cannot be reached is an error here rather than a
+// warning, so `bodega serve` can refuse to start on it.
+func OpenWithSink(path string, sc SinkConfig) (*DB, error) {
 	readOnly := false
 	if path != "" {
+		// A first run has log_dir but not the directory under it. That is a
+		// fixable condition, not a missing store, and since `bodega serve`
+		// now refuses to start without the audit store, leaving it unfixed
+		// would turn every fresh install into a startup failure. 0o750: the
+		// trail names client addresses and package requests.
+		if dir := filepath.Dir(path); dir != "" && dir != "." {
+			if err := os.MkdirAll(dir, 0o750); err != nil {
+				return nil, fmt.Errorf("create audit db directory %s: %w", dir, err)
+			}
+		}
 		if _, statErr := os.Stat(path); statErr == nil {
 			if f, err := os.OpenFile(path, os.O_WRONLY, 0); err != nil {
 				readOnly = true
@@ -241,133 +311,66 @@ func Open(path string) (*DB, error) {
 		}
 	}
 
-	return &DB{db: db, readOnly: readOnly}, nil
+	sink, err := newSink(sc, db, readOnly)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return &DB{db: db, sink: sink, readOnly: readOnly}, nil
 }
 
 // ReadOnly returns true when the backing file is not writable. Record silently
 // no-ops on a read-only handle; Query keeps working.
 func (a *DB) ReadOnly() bool { return a.readOnly }
 
-// Close closes the database.
+// Close closes the sink and then the embedded database. The sqlite sink shares
+// the embedded handle and its Close is a no-op, so the file is closed once.
 func (a *DB) Close() error {
-	return a.db.Close()
+	sinkErr := a.sink.Close()
+	dbErr := a.db.Close()
+	if sinkErr != nil {
+		return sinkErr
+	}
+	return dbErr
 }
 
-// Record is silent on filtered events and on read-only handles. Callers
-// that need hard-fail semantics should check ReadOnly() themselves.
+// Record writes one event to the configured sink. It is silent on filtered
+// events and on a read-only sqlite handle. Callers that need hard-fail
+// semantics should check ReadOnly() themselves.
 func (a *DB) Record(ctx context.Context, ev Event) error {
-	if a.readOnly {
-		return nil
-	}
 	if !a.ShouldRecord(ev.EventType) {
 		return nil
 	}
-	_, err := a.db.ExecContext(ctx,
-		`INSERT INTO events (event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details, actor)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		string(ev.EventType), ev.PkgType, ev.PkgName, ev.PkgVersion,
-		ev.ClientIP, ev.UserAgent, ev.Status, ev.DurationMs, ev.Details, ev.Actor,
-	)
-	return err
+	return a.sink.Record(ctx, ev)
 }
 
-// Query returns events matching the filter, ordered by timestamp descending.
+// Query returns events matching the filter, ordered by timestamp descending,
+// with timestamps rendered in the display timezone. It refuses rather than
+// returning an empty page when the configured sink keeps no table.
 func (a *DB) Query(ctx context.Context, f Filter) ([]StoredEvent, error) {
-	var where []string
-	var args []interface{}
-
-	if f.EventType != "" {
-		where = append(where, "event_type = ?")
-		args = append(args, string(f.EventType))
-	}
-	if f.PkgType != "" {
-		where = append(where, "pkg_type = ?")
-		args = append(args, f.PkgType)
-	}
-	if f.PkgName != "" {
-		where = append(where, "pkg_name = ?")
-		args = append(args, f.PkgName)
-	}
-	if f.ClientIP != "" {
-		where = append(where, "client_ip = ?")
-		args = append(args, f.ClientIP)
-	}
-	if f.Actor != "" {
-		where = append(where, "actor = ?")
-		args = append(args, f.Actor)
-	}
-	if !f.Since.IsZero() {
-		where = append(where, "timestamp >= ?")
-		args = append(args, f.Since.UTC().Format(time.RFC3339Nano))
-	}
-	if !f.Until.IsZero() {
-		where = append(where, "timestamp <= ?")
-		args = append(args, f.Until.UTC().Format(time.RFC3339Nano))
-	}
-
-	query := "SELECT id, timestamp, event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details, actor FROM events"
-	if len(where) > 0 {
-		query += " WHERE " + strings.Join(where, " AND ")
-	}
-	query += " ORDER BY timestamp DESC"
-
-	limit := f.Limit
-	if limit <= 0 {
-		limit = 1000
-	}
-	//nolint:gosec // G202: LIMIT clause built from a clamped int literal, no user-controlled string interpolation.
-	query += fmt.Sprintf(" LIMIT %d", limit)
-
-	rows, err := a.db.QueryContext(ctx, query, args...)
+	r, err := a.reader("audit events")
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var events []StoredEvent
-	for rows.Next() {
-		var se StoredEvent
-		var ts string
-		var et string
-		err := rows.Scan(&se.ID, &ts, &et,
-			&se.PkgType, &se.PkgName, &se.PkgVersion,
-			&se.ClientIP, &se.UserAgent, &se.Status,
-			&se.DurationMs, &se.Details, &se.Actor)
-		if err != nil {
-			return nil, err
-		}
-		se.EventType = EventType(et)
-		se.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
-		if a.location != nil {
-			se.Timestamp = se.Timestamp.In(a.location)
-		}
-		events = append(events, se)
+	events, err := r.QueryEvents(ctx, f)
+	if err != nil {
+		return nil, err
 	}
-	return events, rows.Err()
+	if a.location != nil {
+		for i := range events {
+			events[i].Timestamp = events[i].Timestamp.In(a.location)
+		}
+	}
+	return events, nil
 }
 
 // Count returns the total number of events matching the filter.
 func (a *DB) Count(ctx context.Context, f Filter) (int64, error) {
-	var where []string
-	var args []interface{}
-
-	if f.EventType != "" {
-		where = append(where, "event_type = ?")
-		args = append(args, string(f.EventType))
+	r, err := a.reader("audit events")
+	if err != nil {
+		return 0, err
 	}
-	if f.PkgType != "" {
-		where = append(where, "pkg_type = ?")
-		args = append(args, f.PkgType)
-	}
-
-	query := "SELECT COUNT(*) FROM events"
-	if len(where) > 0 {
-		query += " WHERE " + strings.Join(where, " AND ")
-	}
-
-	var count int64
-	err := a.db.QueryRowContext(ctx, query, args...).Scan(&count)
-	return count, err
+	return r.CountEvents(ctx, f)
 }
 
 // StoredChecksum is a cached checksum record.

@@ -17,13 +17,15 @@ import (
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
-// maxMigrationVersion walks the embedded migrations directory and returns
-// the highest NNN prefix seen on a .up.sql file. Used to detect databases
-// that have been migrated by a newer binary than the running process.
-func maxMigrationVersion() (uint, error) {
-	entries, err := fs.ReadDir(migrationsFS, "migrations")
+// maxMigrationVersion walks an embedded migrations directory and returns the
+// highest NNN prefix seen on a .up.sql file. Used to detect databases that
+// have been migrated by a newer binary than the running process. It takes the
+// FS and directory because the embedded store and the postgres sink carry
+// separate sets, versioned independently.
+func maxMigrationVersion(fsys fs.FS, dir string) (uint, error) {
+	entries, err := fs.ReadDir(fsys, dir)
 	if err != nil {
-		return 0, fmt.Errorf("read embedded migrations: %w", err)
+		return 0, fmt.Errorf("read embedded migrations %s: %w", dir, err)
 	}
 	var max uint
 	for _, e := range entries {
@@ -44,7 +46,7 @@ func maxMigrationVersion() (uint, error) {
 		}
 	}
 	if max == 0 {
-		return 0, errors.New("no migrations found in embedded FS")
+		return 0, fmt.Errorf("no migrations found in embedded FS under %s", dir)
 	}
 	return max, nil
 }
@@ -68,7 +70,7 @@ func runMigrations(db *sql.DB) error {
 		return fmt.Errorf("migrate instance: %w", err)
 	}
 
-	codeMax, err := maxMigrationVersion()
+	codeMax, err := maxMigrationVersion(migrationsFS, "migrations")
 	if err != nil {
 		return err
 	}

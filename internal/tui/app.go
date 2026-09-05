@@ -856,12 +856,16 @@ func (m *appModel) buildAuditPopup() popupModel {
 	}
 
 	p.onFormSave = func(fields []formField) {
-		db, err := audit.Open(cfg.AuditDB)
+		db, err := audit.OpenWithSink(cfg.AuditDB, audit.SinkConfig{Kind: cfg.AuditSink, DSN: cfg.AuditSinkDSN})
 		if err != nil {
-			logPane.appendLog(errorStyle.Render("Could not open audit db: " + err.Error()))
+			logPane.appendLog(errorStyle.Render("Could not open audit store: " + err.Error()))
 			return
 		}
 		defer db.Close()
+		if !db.EventsQueryable() {
+			logPane.appendLog(errorStyle.Render((&audit.UnqueryableSinkError{Sink: db.SinkName(), Op: "the audit events this pane lists"}).Error()))
+			return
+		}
 
 		limit := 50
 		if l := fieldValue(fields, "Limit"); l != "" {

@@ -31,7 +31,7 @@ func TestMigrationsFreshOpen(t *testing.T) {
 	}
 
 	// schema_migrations version should reflect the highest migration in the FS.
-	maxV, err := maxMigrationVersion()
+	maxV, err := maxMigrationVersion(migrationsFS, "migrations")
 	if err != nil {
 		t.Fatalf("maxMigrationVersion: %v", err)
 	}

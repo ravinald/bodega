@@ -414,7 +414,7 @@ Launches the interactive TUI. See [TUI](#tui) section for keybindings.
 
 ### `bodega audit events [flags]`
 
-Queries the SQLite audit database.
+Queries the configured audit sink. Under `audit_sink: "syslog"` or `"jsonl"` it refuses by name: those sinks ship events out and keep nothing to read back. See [Audit Trail](#audit-trail).
 
 | Flag | Default | Purpose |
 |------|---------|---------|
@@ -816,6 +816,8 @@ A default config is created on first run. All fields are optional.
   "apt_codename": "noble",
   "apt_suites": ["noble"],
   "audit_db": "",
+  "audit_sink": "sqlite",
+  "audit_sink_dsn": "",
   "timezone": "",
   "audit_events": [],
   "deny_list": [],
@@ -860,7 +862,7 @@ Set it whenever a reverse proxy terminates TLS or publishes a different hostname
 
 `discover_mode` turns the upstream-observation log on, and does nothing else: enforcement does not move with it. Valid values are `""` (off) and `"observe"`; anything else is rejected at load. `"learn"` was removed and is refused by name, with the error pointing at `observe` and `bodega pkg convert` — it suppressed the allow-list and recorded nothing `observe` does not. See [`bodega discover ...`](#bodega-discover-) for what gets logged and what to do with it.
 
-`timezone` sets the display timezone for audit queries (default UTC) and `audit_events` limits which event types are recorded (empty records all). Both apply to the CLI and to `bodega serve` alike — see [Audit Trail](#audit-trail) for what a filter that omits `denied` costs you.
+`audit_sink` chooses where the event stream goes and `audit_sink_dsn` says how to reach it; see [Audit Trail](#audit-trail) for the four values, what each gives up, and what `bodega serve` does when the destination is unreachable. `timezone` sets the display timezone for audit queries (default UTC) and `audit_events` limits which event types are recorded (empty records all). Both apply to the CLI and to `bodega serve` alike — see [Audit Trail](#audit-trail) for what a filter that omits `denied` costs you.
 
 Config files are written with mode `0600` (owner read/write only).
 
@@ -1031,7 +1033,7 @@ When `custom_paths` is `true`, each type can use a separate build directory. Thi
 
 ### Audit database
 
-The audit DB path defaults to `{log_dir}/audit.db`. The database is created automatically on first use. It holds the served fetches, the mutations, the cache events, every refused request and the server's own start and stop; see [Audit Trail](#audit-trail) for the event types and what is deliberately left out.
+The audit DB path defaults to `{log_dir}/audit.db`, and its parent directory and the file are created on first use. It holds the served fetches, the mutations, the cache events, every refused request and the server's own start and stop — unless `audit_sink` sends that stream elsewhere, in which case the file still holds the ACLs, the API tokens, the cached checksums and the policy tables. See [Audit Trail](#audit-trail) for the sinks, the event types and what is deliberately left out.
 
 ---
 
@@ -1929,7 +1931,80 @@ bodega pkg checksum clear gomod github.com/foo  # clear, next fetch recomputes
 
 ## Audit Trail
 
-The SQLite database at `{log_dir}/audit.db` records every package fetch served, every build-pipeline stage, every CRUD mutation, every proxy cache event, every request the server refused, and the server's own start and stop.
+The audit trail records every package fetch served, every build-pipeline stage, every CRUD mutation, every proxy cache event, every request the server refused, and the server's own start and stop. Where those events go is `audit_sink`; the default writes them into the SQLite database at `{log_dir}/audit.db`.
+
+Two things live in that database and only one of them moves. The **event stream** is append-only, written on the hot path and read for reporting, and it is what a sink holds. **Operational state** — the ACL lists, the API tokens, the cached checksums and the age, OSV and upstream policies — stays in `audit_db` under every sink, because the request path reads it to decide whether an address is permitted, whether a token is live and whether an upstream is allowed. A sink that cannot answer a query cannot hold it, and a store one network round trip away would put that round trip inside every request bodega serves.
+
+### Audit sinks
+
+| `audit_sink` | For | `audit_sink_dsn` | Queryable |
+|---|---|---|---|
+| `sqlite` | One host. The default, and no new dependency | not accepted | yes |
+| `postgres` | A fleet writing at once, and reporting across instances | libpq connection string | yes |
+| `syslog` | Shipping into a SIEM you already run | `tcp://`, `udp://`, `unix://` address; empty = the local daemon | no |
+| `jsonl` | A file another collector tails; no daemon, no schema migration | absolute path | no |
+
+The default is `sqlite`, so an existing install upgrades with no config change and no migration.
+
+**One sink, not a list.** `audit_sink` takes a single value. Teeing to a write-only sink alongside `sqlite` would keep `bodega discover promote` working while events reached the SIEM, and it would also keep the SQLite write rate you switched away from, plus a second write per event on the hot path. If you need the trail queryable at fleet rates, that is what `postgres` is for; if you do not, choosing `syslog` or `jsonl` is choosing to give up the queries, and bodega says so rather than half-answering.
+
+**The write-only sinks refuse rather than lie.** Under `syslog` and `jsonl` there is no table to read back, so:
+
+- `GET /api/v1/audit` answers **501 Not Implemented** with the sink named in the body. Not 503: this is a configuration the server will keep having, and "try again later" would never come true.
+- `bodega audit events` exits non-zero naming the sink and pointing at `sqlite` or `postgres`.
+- `bodega discover list`, `show`, `export`, `clear`, `promote-all` and `generate-manifests` do the same.
+- **`bodega discover promote` is unavailable.** It reads the discovery table to build the policy rule or the manifest entries it writes, and a stream that has already left the process is not a table. Promote from an instance running `sqlite` or `postgres`, or read the observations where your collector puts them and write the entries with `bodega pkg create`.
+
+The events themselves are one JSON object per line under both sinks, with a `kind` of `event` or `discovery` and field names matching the SQL columns the queryable sinks use, so a SIEM rule and a `postgres` query name the same things. `json.Marshal` escapes control characters, so a User-Agent carrying a newline cannot forge a second record.
+
+**A write-only sink cannot deduplicate.** The queryable sinks collapse repeat observations on `(registry_type, pattern_hint, pkg_name, pkg_version, decision)` and bump `request_count`. `syslog` and `jsonl` emit one record per request and leave the rollup to whatever consumes the stream.
+
+**When the destination is unavailable.** The rule is one line: `bodega serve` refuses to start rather than serving while dropping the record of what it refuses.
+
+| Condition | `bodega serve` | CLI |
+|---|---|---|
+| `postgres` will not connect (5s ping timeout) | refuses to start, naming `audit_db` and `audit_sink` | read commands exit non-zero; a one-shot write warns on stderr and continues |
+| syslog socket is gone at startup | refuses to start | same |
+| jsonl path is unwritable | refuses to start | same |
+| `audit_db` file exists but is not writable | refuses to start | read commands keep working; this is the documented non-root `bodega audit events` path |
+| `audit_db` is unset | starts with no audit trail, token auth and policy enforcement off | unchanged |
+
+An unset `audit_db` is an install that asked for no audit trail, so it is not a failure. Everything else is: an audit store that fails open silently is what this design exists to prevent. The parent directory of `audit_db` (and of a `jsonl` path) is created on first use, so a fresh install is not a startup failure.
+
+A destination that goes away **after** startup does not stop the server. The write error is logged at `Error`, which the shipped default `log_level` prints, and bodega keeps serving packages: killing a package proxy because syslog restarted is the worse outcome.
+
+### Choosing a sink
+
+Measured on an Apple M1 Ultra (Mac13,2), macOS 26.7, internal NVMe over Apple Fabric, APFS; `postgres:17-alpine` in Docker Desktop on the same host over loopback. 64 concurrent writers, 10 s per run, at a fixed offered request rate. Each request is the post-B16 shape: one event row on the hot path plus one discovery observation through the recorder's queue.
+
+| Offered | Sink | Events/s landed | Discovery dropped | Hot-path write p99 |
+|---|---|---|---|---|
+| 500/s | `sqlite` | 925 | 0% | 1.36 s |
+| | `postgres` | 999 | 0% | 23 ms |
+| | `syslog` | 1,000 | 0% | 4.3 ms |
+| | `jsonl` | 1,000 | 0% | 1.9 ms |
+| 1,000/s | `sqlite` | 1,678 | 6.5% | 956 ms |
+| | `postgres` | 1,997 | 0% | 18 ms |
+| | `syslog` | 1,999 | 0% | 3.0 ms |
+| | `jsonl` | 1,999 | 0% | 2.0 ms |
+| 2,000/s | `sqlite` | 2,848 | 48.5% | 638 ms |
+| | `postgres` | 3,556 | 22.0% | 14 ms |
+| | `syslog` | 3,998 | 0% | 3.1 ms |
+| | `jsonl` | 3,998 | 0% | 2.2 ms |
+| 8,000/s | `sqlite` | 7,058 | 97.3% | 179 ms |
+| | `postgres` | 8,355 | 95.5% | 15 ms |
+| | `syslog` | 15,987 | 0% | 3.0 ms |
+| | `jsonl` | 15,996 | 0% | 1.9 ms |
+
+Unthrottled, the same harness sustains 8,837 hot-path writes/s on `sqlite` (10 of 92,815 lost to the 5 s busy timeout, p99 54 ms), 12,496/s on `postgres` (none lost, p99 20 ms), 133,618/s on `syslog` and 224,466/s on `jsonl`.
+
+Convert a fleet to a request rate with `hosts x updates-per-hour x requests-per-update / 3600`. A thousand hosts running `apt update` twice an hour over a dozen index paths is about 7 requests/s; a CI fleet installing packages per build is one to two orders of magnitude above that.
+
+- **Under ~500 requests/s: `sqlite`.** Nothing drops, and the store you already have needs no daemon. Its hot-path p99 is the worst of the four even here — over a second, because the request goroutine waits on the write lock the discovery worker holds — but that latency is off the response path.
+- **~500 to ~2,000 requests/s, or more than one bodega: `postgres`.** It is the only sink that keeps the trail queryable at that rate, and its hot-path p99 stays under 25 ms across the whole range with no writes lost to a timeout. It is also the only way to report across instances: each host keeps its own `audit_db` for ACLs and tokens, and their events land in one place.
+- **Above ~2,000 requests/s, or when the SIEM already exists: `syslog` or `jsonl`.** Neither dropped a row at any rate measured. You are trading `bodega discover promote` and `GET /api/v1/audit` for that; if you need them back, run one instance on `postgres`.
+
+**The drops in that table are not the sink.** `DiscoveryRecorder` drains its 1,024-deep queue with a single goroutine doing one synchronous write per row, so the discovery half is capped by one write's latency however wide the pool underneath is: about 2,700 rows/s on `sqlite` and about 900/s on `postgres`, where each upsert costs a network round trip. That is why `postgres` starts dropping observations at 2,000 requests/s despite absorbing 12,500 hot-path writes/s. The hot-path event rows, which are written concurrently, show what the sink can actually take. Batching that worker is filed as [#217](https://github.com/ravinald/bodega/issues/217).
 
 **Event types:**
 
@@ -1986,7 +2061,7 @@ Denials record at every gate in the middleware chain, at the admin-read gate, an
 
 `audit_events` and `timezone` in `config.json` apply to both handles: the CLI's and the one `bodega serve` opens for itself. A filter that leaves out `denied` therefore throws away the record of every refusal the server makes, which is the one record that has no other home — the journal rotates and is not reachable through `/api/v1/audit`. `bodega serve` logs an error naming the key when it starts with such a filter. Leave `audit_events` empty unless you have a reason.
 
-A read-only audit database is the quieter version of the same loss: `Record` no-ops, `Query` keeps answering, so `/api/v1/audit` responds and simply stops growing. `bodega serve` logs an error at startup when the file is not writable by its user.
+A read-only audit database used to be the quieter version of the same loss: `Record` no-oped, `Query` kept answering, so `/api/v1/audit` responded and simply stopped growing. `bodega serve` now refuses to start on it, naming the file and the uid. Read commands still work against a database they cannot write, which is what keeps `bodega audit events` usable as a non-root user against a root-owned file.
 
 ---
 

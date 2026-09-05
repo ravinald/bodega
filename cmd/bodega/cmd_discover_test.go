@@ -976,3 +976,59 @@ func TestPromoteAllPolicySkipsNoNamespacePatterns(t *testing.T) {
 		t.Errorf("promote-all wrote %+v, want only the github.com/octocat/ rule", rules)
 	}
 }
+
+// writeOnlySinkEnv is newDiscoverEnv's config with the event stream pointed at
+// a JSONL file. The embedded store still exists — it holds the ACLs and the
+// tokens — so a command that read it anyway would find a real, empty database
+// and print an empty table, which is the answer this refusal replaces.
+func writeOnlySinkEnv(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	body := fmt.Sprintf(`{
+  "storage_backend": "local",
+  "storage_path": %q,
+  "manifest_dir": %q,
+  "audit_db": %q,
+  "log_dir": %q,
+  "allow_plaintext": true,
+  "apt_codename": "noble",
+  "audit_sink": "jsonl",
+  "audit_sink_dsn": %q
+}`, filepath.Join(dir, "storage"), filepath.Join(dir, "manifests"),
+		filepath.Join(dir, "audit.db"), dir, filepath.Join(dir, "audit.jsonl"))
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv(config.EnvConfigFile, path)
+}
+
+// Every discovery read refuses by name under a write-only sink. promote is
+// named in docs/USAGE.md as unavailable, so it is in the table rather than
+// left to be inferred from list: it reads the discovery rows to build the
+// policy rule or the manifest entries it writes.
+func TestDiscoveryReadsRefuseUnderAWriteOnlySink(t *testing.T) {
+	for _, args := range [][]string{
+		{"list"},
+		{"show", "gomod", "github.com/aws/"},
+		{"promote", "gomod", "github.com/aws/"},
+		{"promote-all", "gomod"},
+		{"export", "json", "gomod"},
+		{"clear", "gomod"},
+		{"generate-manifests", "gomod"},
+	} {
+		t.Run(strings.Join(args, "_"), func(t *testing.T) {
+			writeOnlySinkEnv(t)
+			out, err := runDiscover(t, args...)
+			if err == nil {
+				t.Fatalf("discover %v succeeded under a write-only sink; output:\n%s", args, out)
+			}
+			msg := err.Error()
+			for _, want := range []string{"jsonl", "write-only", "postgres"} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("refusal does not mention %q: %s", want, msg)
+				}
+			}
+		})
+	}
+}
