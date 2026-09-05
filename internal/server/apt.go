@@ -578,7 +578,7 @@ func (s *Server) aptCachedPoolMap(mirrored map[string]bool, fallbacks []aptFallb
 // config. pool/ outlives apt_upstreams: retiring the key leaves every cached
 // upstream .deb where it is and every checksum row where it is, so a rebuild
 // that trusts the config to answer "did this instance ever mirror" republishes
-// the archive's bytes under bodega's signature on the next rebuild (#201). The
+// the archive's bytes under bodega's own signature (#201). The
 // query costs one indexed read per rebuild that has a fallback entry to
 // resolve, and returns nothing on an instance that never mirrored.
 //
