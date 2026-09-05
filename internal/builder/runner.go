@@ -39,7 +39,9 @@ type Config struct {
 	Stdout io.Writer
 	// Force re-fetches even if artifacts already exist on disk.
 	Force bool
-	// BodegaVersion is passed from main.version for build environment stamping.
+	// BodegaVersion is the bodega build stamped onto artifacts this Config
+	// produces. NewConfig fills it from Version; a Config built by hand leaves
+	// it empty, and BuildEnv.Bodega is omitempty, so the field simply vanishes.
 	BodegaVersion string
 	// BuildEnvInfo is the detected build environment, auto-populated if nil.
 	BuildEnvInfo *manifest.BuildEnv
@@ -133,6 +135,17 @@ func (c *Config) rootFor(typ string) string {
 	return c.BuildRoot
 }
 
+// Version is the bodega build every Config from NewConfig stamps onto the
+// artifacts it produces. -ldflags bakes the value into package main, which
+// nothing under internal/ may import, so main assigns this once at init. It is
+// a package variable for the same reason config.StorageDrivers is one: the
+// value crosses an import edge that only points the other way.
+//
+// "unknown" and "dev" are different facts and the default is deliberately not
+// "dev". A binary built without -ldflags stamps "dev", because main still ran;
+// "unknown" reaches a manifest only if nothing wired main to this at all.
+var Version = "unknown"
+
 // NewConfig builds the Config every command and the TUI run on from the
 // installed settings.
 //
@@ -158,6 +171,7 @@ func NewConfig(app *config.Config) *Config {
 		NpmRoot:        app.NpmRoot,
 		CargoRoot:      app.CargoRoot,
 		AutoImportDeps: true,
+		BodegaVersion:  Version,
 	}
 }
 

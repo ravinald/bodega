@@ -1160,6 +1160,20 @@ All version entries support:
 | `metadata` | object | Ecosystem-specific key-value pairs |
 | `build_env` | object | Build server's environment at artifact creation time |
 
+`build_env` is written by the build, never by the operator, and `bodega show pkg <type> <name> all` prints it:
+
+| Key | Meaning |
+|-----|---------|
+| `bodega` | The bodega build that wrote the entry. `dev` for a binary built without `-ldflags`, which is what `go build` and a source checkout produce; `unknown` means nothing handed the builder a version, which no shipped path does |
+| `platform` | `GOOS/GOARCH` of the build host, e.g. `linux/amd64` |
+| `os_release` | `PRETTY_NAME` from the host's `/etc/os-release` |
+| `python` | `python3 --version` on the build host |
+| `go` | `go version` on the build host |
+| `rust` | `rustc --version` on the build host |
+| `built_at` | RFC-3339 UTC timestamp |
+
+Every key but `platform` is omitted when empty, so an entry stamped on a host without a Go toolchain carries no `go` key rather than an empty one. The whole object is rewritten each time a fetch succeeds, so an entry built before `bodega` was wired carries no `bodega` key until something re-fetches it; nothing backfills it in place.
+
 ### Git-specific fields
 
 ```json
