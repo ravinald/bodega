@@ -1,12 +1,14 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"html"
 	"net/url"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"net/http"
@@ -55,11 +57,36 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pkgName := r.PathValue("package")
-	if pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, pkgName); pkg != nil && isPackageHidden(pkg) {
+	pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, pkgName)
+	if pkg != nil && isPackageHidden(pkg) {
 		http.NotFound(w, r)
 		return
 	}
 	normalized := normalizePkgName(pkgName)
+
+	// Proxy the simple index from upstream PyPI, republished onto bodega's own
+	// wheel route. Served verbatim it hands pip absolute
+	// files.pythonhosted.org links, so every client resolves through bodega and
+	// then downloads around it: nothing is cached, the allow-list never sees
+	// the artifact, and no row records the bytes that got installed. The cached
+	// object stays the upstream document; the rewrite happens on the way out,
+	// so a hit and a miss republish identically.
+	//
+	// Ahead of the cache listing rather than as its fallback: a listing built
+	// from stored keys carries only what somebody has already fetched, so the
+	// first wheel cached under a proxy-mode distribution would otherwise become
+	// the only version of it that exists for every later client. The cached
+	// copy is not lost by republishing upstream — every href lands on
+	// /pypi/wheels/, which answers from storage before it reaches the network.
+	if pkg != nil && packageMode(pkg) == manifest.ModeProxy {
+		upstream := s.pypiSimpleURL(normalized)
+		rw := &pypiIndexWriter{ResponseWriter: w, indexURL: upstream}
+		s.proxyOrCache(rw, r, s.typeStore(manifest.TypePypi), "pypi/simple/"+normalized+"/index.html", upstream, manifest.TypePypi, pkgName, pkgName, false, true)
+		if err := rw.flush(); err != nil {
+			s.logger.Warn("client read of a republished pypi index was cut short", "package", pkgName, "error", err)
+		}
+		return
+	}
 
 	keys, err := s.listFanout(r.Context(), manifest.TypePypi, manifest.PypiWheelPrefix)
 	if err != nil {
@@ -89,14 +116,6 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(wheels) == 0 {
-		// Check if this package is in proxy mode.
-		pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, pkgName)
-		if pkg != nil && packageMode(pkg) == manifest.ModeProxy {
-			// Proxy the simple index from upstream PyPI.
-			upstream := s.pypiSimpleURL(normalized)
-			s.proxyOrCache(w, r, s.typeStore(manifest.TypePypi), "pypi/simple/"+normalized+"/index.html", upstream, manifest.TypePypi, pkgName, pkgName, false, true)
-			return
-		}
 		http.NotFound(w, r)
 		return
 	}
@@ -154,6 +173,122 @@ func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
 // configured index root.
 func (s *Server) pypiSimpleURL(normalized string) string {
 	return strings.TrimRight(s.cfg.PypiUpstream, "/") + "/simple/" + normalized + "/"
+}
+
+// pypiIndexWriter buffers a proxied simple index so its links can be pointed
+// back at bodega before the client sees them.
+//
+// Buffering rather than streaming, deliberately: an anchor cannot be rewritten
+// from a chunk that may have split it in half. What is held is one simple
+// index, which runs from a few kilobytes to a couple of megabytes for the
+// oldest distributions on pypi, and proxyOrCache has already spooled the same
+// bytes to disk before the first Write lands here. Wrapping the writer rather
+// than teaching proxyOrCache a transform hook keeps the cached object the
+// document the upstream actually served, which is what makes it evidence.
+//
+// It is not an http.Flusher and has no ReadFrom. Both would defeat the buffer.
+type pypiIndexWriter struct {
+	http.ResponseWriter
+	indexURL string
+	status   int
+	body     bytes.Buffer
+}
+
+func (p *pypiIndexWriter) WriteHeader(code int) {
+	if p.status == 0 {
+		p.status = code
+	}
+}
+
+func (p *pypiIndexWriter) Write(b []byte) (int, error) {
+	if p.status == 0 {
+		p.status = http.StatusOK
+	}
+	return p.body.Write(b)
+}
+
+// flush rewrites a successful index and writes the buffered response through.
+// A refusal or an error passes untouched: those bodies carry no links, and a
+// 403 from the allow-list must reach the client as the handler wrote it.
+func (p *pypiIndexWriter) flush() error {
+	body := p.body.Bytes()
+	if p.status == 0 {
+		p.status = http.StatusOK
+	}
+	if p.status == http.StatusOK {
+		body = rewritePypiIndex(body, p.indexURL)
+		// proxyS3 sets ETag from the stored object, which is the upstream
+		// document rather than what is going out. Left on, it labels the
+		// republished body with a validator for different bytes.
+		p.Header().Del("ETag")
+	}
+	p.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	p.ResponseWriter.WriteHeader(p.status)
+	_, err := p.ResponseWriter.Write(body)
+	return err
+}
+
+// pypiAnchorPattern matches one opening anchor tag and its attributes. A PEP
+// 503 index is generated HTML with one anchor per file and nothing nested
+// inside the tag, so rewriting the tag is safe without a parser.
+var pypiAnchorPattern = regexp.MustCompile(`<a\s[^>]*>`)
+
+// pypiMetadataAttrPattern matches the PEP 658 metadata attribute under both
+// spellings: data-dist-info-metadata is the provisional name pip 22 shipped,
+// data-core-metadata the one PEP 714 settled on.
+var pypiMetadataAttrPattern = regexp.MustCompile(`\s+data-(?:dist-info|core)-metadata="[^"]*"`)
+
+// rewritePypiIndex republishes an upstream simple index with every href on
+// bodega's /pypi/wheels/ route, resolved against the index URL it came from so
+// a relative href (which PEP 503 permits) lands on the same file an absolute
+// one would.
+//
+// The #sha256= fragment survives the rewrite: it is pip's integrity check on
+// the artifact, and dropping it would have clients install bytes they cannot
+// verify.
+//
+// The PEP 658 metadata attribute does not. pip reads it as a promise that
+// "<href>.metadata" is fetchable, and only files.pythonhosted.org publishes
+// that file — bodega resolves a wheel by filename against the index, which
+// lists no ".whl.metadata" entry to match. Carried forward beside a rewritten
+// href it points pip at a bodega path that does not exist, and pip does not
+// fall back: 26.2.1 against a republished six index answers
+//
+//	ERROR: 404 Client Error: Not Found for url:
+//	http://127.0.0.1:8137/pypi/wheels/six-1.16.0-py2.py3-none-any.whl.metadata
+//
+// and installs nothing. Dropped, the same client downloads the wheel through
+// the proxy, which is the fetch that fills the cache and reaches the
+// allow-list. Republishing the metadata file itself would change how a wheel is
+// resolved and belongs with that work, not with a rewrite of what is served.
+//
+// An anchor whose href names no file is left as it stands: a rewrite that
+// cannot name a target is a guess, and the wheel route would 404 it anyway.
+func rewritePypiIndex(body []byte, indexURL string) []byte {
+	base, err := url.Parse(indexURL)
+	if err != nil {
+		return body
+	}
+	return pypiAnchorPattern.ReplaceAllFunc(body, func(tag []byte) []byte {
+		m := pypiHrefPattern.FindSubmatch(tag)
+		if m == nil {
+			return tag
+		}
+		u, err := base.Parse(html.UnescapeString(string(m[1])))
+		if err != nil {
+			return tag
+		}
+		name, err := url.PathUnescape(path.Base(u.Path))
+		if err != nil || name == "" || name == "." || name == "/" {
+			return tag
+		}
+		href := "/" + manifest.PypiWheelPrefix + url.PathEscape(name)
+		if u.Fragment != "" {
+			href += "#" + u.Fragment
+		}
+		out := pypiHrefPattern.ReplaceAll(tag, []byte(`href="`+html.EscapeString(href)+`"`))
+		return pypiMetadataAttrPattern.ReplaceAll(out, nil)
+	})
 }
 
 // pypiHrefPattern pulls the link targets out of a PEP 503 index. The document

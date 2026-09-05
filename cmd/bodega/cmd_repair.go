@@ -217,8 +217,12 @@ var pypiWheelURLPattern = regexp.MustCompile(`^(https?://[^/]+)/packages/[^/]+$`
 // sit there uncorrected until someone taught the builder to trust it. The
 // registry root is what the field means for pypi now, matching gomod and npm.
 //
-// An entry whose URL points anywhere else is left alone: an operator who wrote
-// their own index URL by hand is not describing this defect.
+// The pattern is host-agnostic and the report says only what it checked. An
+// operator's own index that serves /packages/<file> matches too, and the
+// rewrite is right for it as well: the field means a registry root whoever
+// wrote the entry. Naming pypi in the line would state a fact about a host the
+// sweep never looked at, leaving the operator unable to tell whether their own
+// mirror is broken.
 func repairPypiWheelURLs(ctx context.Context, store *manifest.Store, dryRun bool, out io.Writer) int {
 	issues := 0
 	for _, name := range store.ListPackages(manifest.TypePypi) {
@@ -233,7 +237,7 @@ func repairPypiWheelURLs(ctx context.Context, store *manifest.Store, dryRun bool
 				continue
 			}
 			issues++
-			fmt.Fprintf(out, "  DEAD URL: pypi/%s@%s records %s, which pypi does not serve\n", name, ve.Version, ve.URL)
+			fmt.Fprintf(out, "  WRONG SHAPE: pypi/%s@%s records %s, a wheel URL where the field means a registry root\n", name, ve.Version, ve.URL)
 			if dryRun {
 				continue
 			}

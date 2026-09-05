@@ -122,6 +122,30 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 		return
 	}
 
+	// The allow-list decides before the resolver runs, not after. For pypi the
+	// resolver is a read of <pypi_upstream>/simple/{dist}/, so a verdict that
+	// waits for a URL only that read can produce has already let a denied
+	// distribution's name reach the index host. Every other type composes its
+	// URL offline, which is why the old ordering held until pypi grew a
+	// resolver. The row is written below, once there is a resolved URL to put
+	// in it.
+	decision, ok := s.upstreamPolicyGate(w, r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key, true)
+	if !ok {
+		return
+	}
+
+	// Before the resolve rather than after it: the resolve is itself an
+	// upstream read for pypi, and a line printed after it describes the second
+	// fetch while leaving the first with no trace in the log at all. The URL is
+	// omitted rather than logged empty where only the resolver can produce it,
+	// so an operator reading the line is not told the destination is blank; the
+	// line below names it as soon as it exists.
+	miss := []any{"key", s3Key}
+	if knownUpstream != "" {
+		miss = append(miss, "upstream", knownUpstream)
+	}
+	s.logger.Info("cache miss, fetching upstream", miss...)
+
 	upstreamURL, err := resolve(ctx)
 	if err != nil {
 		if status != nil && status.Exists {
@@ -133,6 +157,10 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			s.proxyS3(w, r, store, s3Key)
 			return
 		}
+		// The resolution attempt is an upstream contact and gets its row. A
+		// wheel the index does not list 404s here, and without this write the
+		// request that named it would be absent from discovery entirely.
+		s.recordUpstreamAttempt(r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key, decision)
 		if errors.Is(err, errUpstreamNotFound) {
 			s.logger.Info("upstream publishes no such artifact", "key", s3Key, "error", err)
 			http.Error(w, err.Error(), http.StatusNotFound)
@@ -142,14 +170,11 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 		http.Error(w, "upstream resolution failed", http.StatusBadGateway)
 		return
 	}
+	s.recordUpstreamAttempt(r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, decision)
 
-	// Upstream allow-list enforcement. Runs before fetchUpstream so a blocked
-	// candidate never hits the network.
-	if !s.enforceUpstreamPolicy(w, r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key) {
-		return
+	if upstreamURL != knownUpstream {
+		s.logger.Info("resolved the upstream artifact URL", "key", s3Key, "upstream", upstreamURL)
 	}
-
-	s.logger.Info("cache miss, fetching upstream", "key", s3Key, "upstream", upstreamURL)
 
 	// A stale copy beats both error paths here: the upstream said something
 	// went wrong, and what bodega already holds is the better answer than
@@ -533,7 +558,7 @@ func (s *Server) verifyProxyChecksum(ctx context.Context, s3Key, computed string
 //
 // A non-nil error means the check itself could not run, which is a 500 rather
 // than a refusal — the caller decides. It is separate from
-// enforceUpstreamPolicy because the apt pool probe checks several candidates
+// enforceUpstreamPolicyRecording because the apt pool probe checks several candidates
 // to answer one request: recording a row per candidate would count one client
 // fetch as many, and the row is written once by the fetch that follows.
 func (s *Server) upstreamPolicyVerdict(ctx context.Context, regType, policyCandidate string) (string, bool, error) {
@@ -549,9 +574,9 @@ func (s *Server) upstreamPolicyVerdict(ctx context.Context, regType, policyCandi
 	return classifyDecision(hasRules, violation), violation, nil
 }
 
-// enforceUpstreamPolicy runs the allow-list check and writes the discovery row
-// for one upstream attempt, returning false when it has already written the
-// response and the caller must stop.
+// enforceUpstreamPolicyRecording runs the allow-list check and writes the
+// discovery row for one upstream attempt, returning false when it has already
+// written the response and the caller must stop.
 //
 // A nil checker or an empty regType means policy is disabled (opt-in feature).
 // discover_mode decides whether the attempt is recorded and nothing else: a
@@ -561,22 +586,42 @@ func (s *Server) upstreamPolicyVerdict(ctx context.Context, regType, policyCandi
 // handler never reaches proxyOrCache: it execs git-http-backend against a local
 // mirror instead of fetching an object. Two copies of an allow-list gate is one
 // copy that stops matching the other.
-func (s *Server) enforceUpstreamPolicy(w http.ResponseWriter, r *http.Request, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key string) bool {
-	return s.enforceUpstreamPolicyRecording(w, r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, true)
+//
+// record exists for a protocol whose single client operation reaches the gate
+// more than once. One `git clone` is two requests, an info/refs GET and a
+// git-upload-pack POST, and both have to pass the allow-list. Recording both
+// would make the discovery table count protocol legs for git and requests for
+// every other type, so an operator comparing counts across types reads git as
+// twice as busy as it is. The refusal is unconditional; only the row is not.
+//
+// proxyOrResolve does not call this. It cannot name its upstream URL until
+// after the gate has run, so it drives upstreamPolicyGate and
+// recordUpstreamAttempt directly.
+func (s *Server) enforceUpstreamPolicyRecording(w http.ResponseWriter, r *http.Request, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key string, record bool) bool {
+	decision, ok := s.upstreamPolicyGate(w, r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, record)
+	if !ok {
+		return false
+	}
+	if record {
+		s.recordUpstreamAttempt(r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, decision)
+	}
+	return true
 }
 
-// enforceUpstreamPolicyRecording is enforceUpstreamPolicy with the discovery
-// write made optional, for a protocol whose single client operation reaches
-// the gate more than once.
+// upstreamPolicyGate is the refusal half of enforceUpstreamPolicyRecording: the verdict,
+// the 403 and the denial row, with the allowed case's discovery row left to the
+// caller. It returns the decision the caller should record and false once it
+// has written the response.
 //
-// One `git clone` is two requests, an info/refs GET and a git-upload-pack
-// POST, and both have to pass the allow-list. Recording both would make the
-// discovery table count protocol legs for git and requests for every other
-// type, so an operator comparing counts across types reads git as twice as
-// busy as it is. The refusal is unconditional; only the row is not.
-func (s *Server) enforceUpstreamPolicyRecording(w http.ResponseWriter, r *http.Request, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key string, record bool) bool {
+// The split exists so a caller that cannot name its upstream URL yet can still
+// be refused before it goes looking for one. proxyOrResolve is that caller: for
+// pypi the URL comes back from a fetch of the simple index, so a gate that
+// needed the URL first would let the denied name reach the index host.
+// A refusal records what it knows, which on that path is no URL at all; the
+// allowed case records once the resolver has produced one.
+func (s *Server) upstreamPolicyGate(w http.ResponseWriter, r *http.Request, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key string, record bool) (string, bool) {
 	if s.policy == nil || regType == "" || policyCandidate == "" {
-		return true
+		return "", true
 	}
 	// Detached, for the reason recordCacheHit detaches: net/http cancels
 	// r.Context() the moment the client hangs up, and on a cold rule cache the
@@ -590,24 +635,42 @@ func (s *Server) enforceUpstreamPolicyRecording(w http.ResponseWriter, r *http.R
 	if err != nil {
 		s.logger.Error("policy check failed", "error", err)
 		http.Error(w, "policy check failed", http.StatusInternalServerError)
-		return false
+		return "", false
 	}
-
-	// Discovery log: record every upstream attempt with its decision so
-	// operators can review/forensically audit and later promote captured
-	// hosts/packages to allow-list rules.
-	if record {
-		s.recordDiscovery(ctx, r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, decision)
-	}
-
 	if violation {
-		s.logger.Warn("upstream blocked by policy",
-			"type", regType, "candidate", policyCandidate, "url", upstreamURL)
+		if record {
+			s.recordDiscovery(ctx, r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, decision)
+		}
+		// The URL is omitted rather than logged empty, for the reason the
+		// cache-miss line above omits it: on the pypi path only the resolver
+		// can produce one, and it is the refusal that stops it from running.
+		// url="" reads as a bug in the refusal to whoever is holding the log.
+		blocked := []any{"type", regType, "candidate", policyCandidate}
+		if upstreamURL != "" {
+			blocked = append(blocked, "url", upstreamURL)
+		}
+		s.logger.Warn("upstream blocked by policy", blocked...)
 		s.recordPolicyViolation(r, regType, policyCandidate, upstreamURL)
 		http.Error(w, "upstream blocked by allow-list", http.StatusForbidden)
-		return false
+		return decision, false
 	}
-	return true
+	return decision, true
+}
+
+// recordUpstreamAttempt writes the discovery row for one permitted upstream
+// attempt, so operators can review what the fleet reached for and later promote
+// a captured host or package to an allow-list rule.
+//
+// An empty decision means upstreamPolicyGate found policy disabled for this
+// caller and checked nothing; there is no verdict to put in the column, and a
+// row claiming one would be a fabrication.
+func (s *Server) recordUpstreamAttempt(r *http.Request, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, decision string) {
+	if decision == "" {
+		return
+	}
+	ctx, cancel := auditContext(r)
+	defer cancel()
+	s.recordDiscovery(ctx, r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, decision)
 }
 
 // recordPolicyViolation writes the audit row for one candidate the allow-list
