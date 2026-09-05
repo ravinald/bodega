@@ -858,8 +858,12 @@ func walkAptPool(aptRepo string) map[string]string {
 	return pool
 }
 
-// findDebInLocalPool mirrors inventory.findDebInPool so an entry with no
-// _pool_path uploads to the key the server will look for. The prefix pass is
+// findDebInLocalPool resolves an entry with no _pool_path to a .deb already in
+// the local pool, so the bytes upload to the path that file occupies.
+//
+// It keeps the "<pkg>_<version>" prefix pass that inventory and the server both
+// dropped, because refusing here would leave a built artifact unmirrored, where
+// refusing there only declines to report a key nothing serves. The pass is
 // sorted rather than a map walk: an ambiguous name must resolve to the same
 // .deb on every run, or two uploads publish two different artifacts.
 func findDebInLocalPool(pool map[string]string, pkgName, version, arch string) string {

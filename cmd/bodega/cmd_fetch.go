@@ -70,17 +70,10 @@ When a name is given after the type, only that entry is fetched.`,
 				policyChecker = policy.NewChecker(auditDB)
 			}
 
-			bcfg := &builder.Config{
-				AutoImportDeps: true,
-				Force:          force,
-				AuditDB:        auditDB,
-				Policy:         policyChecker,
-				BuildRoot:      cfg.BuildRoot,
-				ManifestDir:    cfg.ManifestDir,
-				Bucket:         cfg.Bucket,
-				Region:         cfg.Region,
-				Verbose:        cfg.Verbose,
-			}
+			bcfg := builder.NewConfig(cfg)
+			bcfg.Force = force
+			bcfg.AuditDB = auditDB
+			bcfg.Policy = policyChecker
 
 			var allSummaries []*builder.Summary
 

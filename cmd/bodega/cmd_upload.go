@@ -48,14 +48,7 @@ If no types are given all of them are uploaded.`,
 				return fmt.Errorf("load manifests: %w", err)
 			}
 
-			bcfg := &builder.Config{
-				AutoImportDeps: true,
-				BuildRoot:      cfg.BuildRoot,
-				ManifestDir:    cfg.ManifestDir,
-				Bucket:         cfg.Bucket,
-				Region:         cfg.Region,
-				Verbose:        cfg.Verbose,
-			}
+			bcfg := builder.NewConfig(cfg)
 
 			ctx := backgroundCtx()
 			pl, err := newPlacer(ctx, cfg, store, os.Stdout, replacePlacement)

@@ -80,6 +80,8 @@ A backend that fails to answer marks its own rows `ERROR`, prints the failure un
 
 `bodega status` is a different command — the repository dashboard.
 
+An apt entry written before the `_pool_path` metadata key existed is located by listing the pool for its exact Debian filename, `<source>_<version>_<arch>.deb`. An entry no such object is named for reports no key and `PRESENT: no`, matching what the server does with it: it publishes no `Packages` stanza for an entry it cannot name an object for, so a `KEY` here would be a key nothing serves.
+
 ```bash
 bodega build status                # check all types
 bodega build status apt pypi       # check apt and pypi only
@@ -809,6 +811,7 @@ A default config is created on first run. All fields are optional.
   "gomod_root": "",
   "helm_root": "",
   "npm_root": "",
+  "cargo_root": "",
   "tls_cert": "",
   "tls_key": "",
   "allow_plaintext": false,
@@ -1038,7 +1041,27 @@ S3 uploads go through the multipart uploader, so an artifact larger than 5 GB re
 
 ### Per-type build roots
 
-When `custom_paths` is `true`, each type can use a separate build directory. This is useful when types have different storage requirements (e.g., wheels on a large volume, binaries on fast SSD).
+Each type can build under its own directory instead of `build_root`, which is what puts wheels on a large volume and binaries on fast SSD. One key per type, empty meaning `build_root`:
+
+| Key | Type | Directory it roots |
+|-----|------|--------------------|
+| `apt_root` | apt | `<root>/apt-repo` |
+| `git_root` | git | `<root>/bundles` |
+| `pypi_root` | pypi | `<root>/wheels` |
+| `binary_root` | binary | `<root>/binaries` |
+| `gomod_root` | gomod | `<root>/gomod` |
+| `helm_root` | helm | `<root>/charts` |
+| `npm_root` | npm | `<root>/npm` |
+| `cargo_root` | cargo | `<root>/cargo` |
+
+Every command that reads or writes an artifact resolves through the same root: `bodega build run`, `fetch`, `package`, `upload`, `sync`, `repair` and the TUI. An upload that finds nothing names the directory it walked, so a root one command resolved differently from the build is visible in the skip line rather than reported as an empty build:
+
+```
+--- sync: apt ---
+    No local apt artifacts found under /opt/bodega/apt-repo — skipping
+```
+
+**Gap:** `custom_paths` gates none of this. The build path reads each root directly, so a root left in the config file stays in force after the flag is turned off. `config.RootForType` applies the gate and has no callers.
 
 ### Audit database
 

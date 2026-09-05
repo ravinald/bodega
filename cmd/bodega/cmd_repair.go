@@ -76,11 +76,7 @@ func newRepairCmd(gf *globalFlags) *cobra.Command {
 
 			// Phase 2: Dependency discovery.
 			fmt.Println("\nPhase 2: Checking dependency links...")
-			bcfg := &builder.Config{
-				BuildRoot:      cfg.BuildRoot,
-				ManifestDir:    cfg.ManifestDir,
-				AutoImportDeps: true,
-			}
+			bcfg := builder.NewConfig(cfg)
 			for _, name := range store.ListPackages(manifest.TypeGit) {
 				pm, err := store.GetPackage(ctx, manifest.TypeGit, name)
 				if err != nil || pm == nil {
@@ -121,16 +117,7 @@ func newRepairCmd(gf *globalFlags) *cobra.Command {
 			// Phase 3: Backfill artifact sizes.
 			fmt.Println("\nPhase 3: Backfilling artifact sizes...")
 			if !dryRun {
-				bcfgSizes := &builder.Config{
-					BuildRoot:   cfg.BuildRoot,
-					ManifestDir: cfg.ManifestDir,
-					BinaryRoot:  cfg.BinaryRoot,
-					GitRoot:     cfg.GitRoot,
-					GomodRoot:   cfg.GomodRoot,
-					HelmRoot:    cfg.HelmRoot,
-					NpmRoot:     cfg.NpmRoot,
-				}
-				n := builder.BackfillArtifactSizes(bcfgSizes, store, cmd.OutOrStdout())
+				n := builder.BackfillArtifactSizes(builder.NewConfig(cfg), store, cmd.OutOrStdout())
 				fmt.Printf("  Backfilled %d package(s)\n", n)
 			} else {
 				fmt.Println("  (skipped in check mode)")

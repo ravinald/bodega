@@ -244,18 +244,22 @@ func listAptPool(ctx context.Context, store storage.ObjectStore) (map[string]str
 }
 
 // findDebInPool mirrors the server's lookup so status and the served Packages
-// index agree on which object backs an entry.
+// index agree on which object backs an entry: the exact Debian binary package
+// filename and nothing looser.
+//
+// There used to be a second pass matching on the "<pkg>_<version>" prefix. It
+// dropped the architecture an amd64 and an arm64 build of one version differ
+// only by, and "1.0" is a prefix of "1.0.1", so an ambiguous entry resolved to
+// whichever of the candidates a map walk reached first — a different KEY in
+// the status table between two runs against the same store, with nothing
+// saying the lookup was a guess. The operator copying that column into
+// 'bodega pkg move' or a curl got handed another artifact's key.
+//
+// The server dropped the same pass and publishes no index entry for these, so
+// reporting them as resolved was reporting a key nothing serves. An entry the
+// exact name misses is unpooled, which is what 'build status' now shows.
 func findDebInPool(pool map[string]string, pkgName, version, arch string) string {
-	if rel, ok := pool[pkgName+"_"+version+"_"+arch+".deb"]; ok {
-		return rel
-	}
-	prefix := pkgName + "_" + version
-	for base, rel := range pool {
-		if strings.HasPrefix(base, prefix) {
-			return rel
-		}
-	}
-	return ""
+	return pool[pkgName+"_"+version+"_"+arch+".deb"]
 }
 
 // PrintStatus writes a formatted status table to out.
