@@ -65,11 +65,13 @@ make lint       # golangci-lint
 make fmt        # goimports / gofmt
 make fmt-check  # fail on gofmt / goimports drift
 make tidy       # go mod tidy + verify
-make tidy-check # fail on go.mod / go.sum drift, restoring both either way
+make tidy-check # fail on go.mod / go.sum drift or a checksum mismatch,
+                # restoring both either way
 ```
 
 `make check` is the one to run before opening a pull request. It runs a leg per
-CI job, and `make ci-drift` fails if the two lists stop agreeing.
+CI job, and `make ci-drift` fails if the CI job list, the leg each job maps to
+and `ci.yml` stop agreeing.
 
 ## Configuration
 

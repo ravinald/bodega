@@ -19,6 +19,19 @@ GO_INSTALL := /usr/local/go/bin/go
 # is how gofmt drift shipped through a green gate once already.
 CI_GATE_JOBS := vet lint fmt tidy test
 
+# Each CI job paired with the `check` leg that runs it. The names differ by
+# convention (fmt > fmt-check), so without the pairing a job sits in
+# CI_GATE_JOBS and in ci.yml with nothing running it and the gate still passes.
+#
+# Written out rather than derived: deriving `check`'s prerequisites from
+# CI_GATE_JOBS runs them in that list's order, which puts lint ahead of
+# fmt-check and costs the cheapest-first ordering CHECK_LEGS holds.
+CI_GATE_TARGETS := vet=vet lint=lint fmt=fmt-check tidy=tidy-check test=test
+
+# The legs `check` runs, in order. `check` has no prerequisites outside this
+# list, so it is what ran, and `ci-drift` reads CI_GATE_TARGETS against it.
+CHECK_LEGS := ci-drift fmt-check tidy-check vet build lint test
+
 # ---- Install paths ---------------------------------------------------------
 # `make install` writes to $(DESTDIR)$(BINDIR). Defaults are auto-detected
 # from the host OS so `make install` does the right thing without flags:
@@ -204,16 +217,21 @@ tidy:
 # a throwaway runner; a developer running the gate cannot.
 tidy-check:
 	@tmp=$$(mktemp -d); cp go.mod go.sum "$$tmp/"; \
-	go mod tidy; \
 	rc=0; \
-	if ! cmp -s go.mod "$$tmp/go.mod" || ! cmp -s go.sum "$$tmp/go.sum"; then \
+	if ! go mod tidy; then \
+		echo "go mod tidy failed; skipped the drift comparison, which reads clean whenever tidy did not run"; \
+		rc=1; \
+	elif ! cmp -s go.mod "$$tmp/go.mod" || ! cmp -s go.sum "$$tmp/go.sum"; then \
 		echo "go.mod / go.sum out of sync; run 'make tidy'"; \
 		diff -u "$$tmp/go.mod" go.mod || true; \
 		diff -u "$$tmp/go.sum" go.sum || true; \
 		rc=1; \
 	fi; \
 	cp "$$tmp/go.mod" "$$tmp/go.sum" .; rm -rf "$$tmp"; \
-	if [ $$rc -eq 0 ]; then go mod verify; fi; \
+	if [ $$rc -eq 0 ] && ! go mod verify; then \
+		echo "go mod verify failed; a module in the cache no longer matches go.sum"; \
+		rc=1; \
+	fi; \
 	exit $$rc
 
 ## ci-drift: Fail if the drover gate and ci.yml no longer gate on the same jobs
@@ -230,6 +248,29 @@ ci-drift:
 		echo "a job in one and not the other is a green gate that CI rejects; reconcile both"; \
 		exit 1; \
 	fi
+	@# CI_GATE_JOBS names CI jobs, `check` runs make targets, and the two name
+	@# sets are joined by CI_GATE_TARGETS alone. CHECK_LEGS is `check`'s own
+	@# prerequisite list, so checking the mapping against it is checking what
+	@# ran rather than what a second list claims ran.
+	@for job in $(CI_GATE_JOBS); do \
+		target=$$(printf '%s\n' $(CI_GATE_TARGETS) | sed -n "s/^$$job=//p"); \
+		if [ -z "$$target" ]; then \
+			echo "CI gate job '$$job' has no CI_GATE_TARGETS entry; add '$$job=<make target>'"; \
+			exit 1; \
+		fi; \
+		case " $(CHECK_LEGS) " in \
+			*" $$target "*) ;; \
+			*) echo "CI gate job '$$job' maps to '$$target', which is not a leg of 'check': $(CHECK_LEGS)"; \
+			   exit 1;; \
+		esac; \
+	done
+	@for pair in $(CI_GATE_TARGETS); do \
+		case " $(CI_GATE_JOBS) " in \
+			*" $${pair%%=*} "*) ;; \
+			*) echo "CI_GATE_TARGETS maps '$${pair%%=*}', which is not a CI gate job: $(CI_GATE_JOBS)"; \
+			   exit 1;; \
+		esac; \
+	done
 	@# The gate config is not in the repository, so this half runs only where
 	@# the gate does. Skipping it in CI costs nothing: CI is the side that
 	@# cannot silently under-report.
@@ -243,8 +284,8 @@ ci-drift:
 # Cheapest legs first: a gofmt slip should cost two seconds, not a full race
 # test run. The drover gate calls this and nothing else, so `[gates] default`
 # and the CI job list stay one edit apart.
-check: ci-drift fmt-check tidy-check vet build lint test
-	@echo "check: all $(words $(CI_GATE_JOBS)) CI gate jobs passed locally"
+check: $(CHECK_LEGS)
+	@echo "check: $(words $(CHECK_LEGS)) legs passed locally: $(CHECK_LEGS)"
 
 ## clean: Remove build artifacts
 clean:

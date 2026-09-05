@@ -2189,15 +2189,19 @@ make fmt            # goimports / gofmt
 make fmt-check      # fail on gofmt / goimports drift (CI's fmt job)
 make lint           # golangci-lint
 make tidy           # go mod tidy + verify
-make tidy-check     # fail on go.mod / go.sum drift (CI's tidy job)
+make tidy-check     # fail on go.mod / go.sum drift or a checksum mismatch (CI's tidy job)
 make ci-drift       # fail if the CI job list and this Makefile disagree
 make clean          # remove build artifacts
 make depend         # install Go + golangci-lint
 ```
 
 `make check` is the merge gate. CI's `vet`, `fmt` and `tidy` jobs call the same
-targets, so what passes locally is what the merge blocks on; `make ci-drift`
-fails when a job is added to `.github/workflows/ci.yml` without a leg here.
+targets, so what passes locally is what the merge blocks on. Three lists have to
+agree and `make ci-drift` reads all three: `needs:` in
+`.github/workflows/ci.yml`, `CI_GATE_JOBS`, and `CI_GATE_TARGETS`, which pairs
+each CI job with the make target that runs it. That target must appear in
+`CHECK_LEGS`, which is `check`'s own prerequisite list, so a job added to CI
+with no leg fails the gate rather than passing it.
 `make fmt-check` requires `goimports` on `PATH` rather than skipping it, because
 a check that skips is weaker than the merge it stands in for.
 
