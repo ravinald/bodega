@@ -14,6 +14,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/logging"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/storage"
 )
@@ -145,5 +146,70 @@ func TestUnreachableSinkIsFatalForServe(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "audit") {
 		t.Errorf("Start returned %v, want the audit refusal", err)
+	}
+}
+
+// An audit_db that will not open is the same refusal as a sink that will not
+// connect, and until this test nothing held it there: the sink case drives the
+// DSN, so narrowing the guard to DSN sinks left the embedded store free to
+// drift back to log-and-continue with the package still green.
+//
+// The condition is why it matters. With the store shut, token auth,
+// upstream-policy enforcement and every /api/v1/audit read are off while
+// /healthz answers 200 — a server that looks healthy and records nothing it
+// refuses.
+func TestUnopenableAuditDBIsFatalForServe(t *testing.T) {
+	// A regular file where the audit directory should be: MkdirAll fails with
+	// ENOTDIR, a real failure rather than a permission the test would have to
+	// run as another user to produce.
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(blocker, "audit", "audit.db")
+
+	dir := t.TempDir()
+	cfg := &config.Config{
+		AptCodename:     "noble",
+		LogDir:          dir,
+		AuditDB:         dbPath,
+		StoragePath:     dir,
+		AllowPlaintext:  true,
+		AdminPermitCIDR: []string{"127.0.0.0/8", "::1/128"},
+	}
+	// The handler serve builds, at the shipped default log_level: a line this
+	// level cannot print is a line written for nobody.
+	var buf strings.Builder
+	s := newServer(cfg, manifest.NewLocalStore(t.TempDir()), storage.NewSingle(storage.NewMemory()),
+		"127.0.0.1:0", slog.New(logging.NewHandler(&buf, logging.SlogLevel(0))))
+	t.Cleanup(func() {
+		if s.auditDB != nil {
+			_ = s.auditDB.Close()
+		}
+	})
+
+	if s.auditErr == nil {
+		t.Fatal("newServer accepted an audit_db it could not open; serve would start with token auth, policy enforcement and /api/v1/audit all off")
+	}
+	for _, want := range []string{dbPath, "audit store unavailable"} {
+		if !strings.Contains(s.auditErr.Error(), want) {
+			t.Errorf("auditErr does not name %q: %v", want, s.auditErr)
+		}
+	}
+	if s.auditDB != nil {
+		t.Error("newServer kept an audit handle over a store that would not open")
+	}
+
+	err := s.Start(context.Background())
+	if err == nil {
+		t.Fatal("Start bound a listener over an audit_db that would not open")
+	}
+	if !strings.Contains(err.Error(), dbPath) {
+		t.Errorf("Start returned %v, want the refusal naming %s", err, dbPath)
+	}
+	// Refused, not logged and continued. A line here instead of the error
+	// would mean the listener came up anyway.
+	if out := buf.String(); out != "" {
+		t.Errorf("newServer logged and continued over an unopenable audit_db:\n%s", out)
 	}
 }

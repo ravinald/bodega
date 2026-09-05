@@ -96,7 +96,7 @@ func TestRetiredAutocertReachesTheDefaultLevel(t *testing.T) {
 	t.Run("no certificate pair", func(t *testing.T) {
 		cfg := loadFrom(t, `{"tls_autocert":true,"allow_plaintext":true}`)
 		logger, buf := defaultLog(t)
-		reportRetiredTLSKeys(cfg, logger)
+		reportRetiredTLSKeys(cfg, nil, logger)
 
 		out := buf.String()
 		for _, want := range []string{"ERROR", "tls_autocert was removed", "no ACME client", "tls_cert"} {
@@ -110,7 +110,7 @@ func TestRetiredAutocertReachesTheDefaultLevel(t *testing.T) {
 		cfg := loadFrom(t, `{"tls_autocert":true}`)
 		cfg.TLSCert, cfg.TLSKey = "/etc/bodega/cert.pem", "/etc/bodega/key.pem"
 		logger, buf := defaultLog(t)
-		reportRetiredTLSKeys(cfg, logger)
+		reportRetiredTLSKeys(cfg, nil, logger)
 
 		if got := buf.String(); got != "" {
 			t.Errorf("a dead key over a working listener printed at the default level:\n%s", got)
@@ -120,7 +120,7 @@ func TestRetiredAutocertReachesTheDefaultLevel(t *testing.T) {
 	t.Run("key absent", func(t *testing.T) {
 		cfg := loadFrom(t, `{"allow_plaintext":true}`)
 		logger, buf := defaultLog(t)
-		reportRetiredTLSKeys(cfg, logger)
+		reportRetiredTLSKeys(cfg, nil, logger)
 
 		if got := buf.String(); got != "" {
 			t.Errorf("a config that never mentioned autocert printed:\n%s", got)
@@ -131,11 +131,24 @@ func TestRetiredAutocertReachesTheDefaultLevel(t *testing.T) {
 // TestAutocertIsNotAnOfferedFlag pins the retirement at the surface an
 // operator meets. #113 was not that autocert was missing but that three places
 // offered it and a fourth refused it.
+//
+// Offered is the test, not registered. Unregistering the flags met #113 and
+// cost an upgraded unit file its start: "unknown flag: --tls-autocert", exit 1,
+// and under Restart=always a crash loop naming nothing to set instead. Hidden
+// and deprecated offers nobody anything and still parses.
 func TestAutocertIsNotAnOfferedFlag(t *testing.T) {
 	cmd := newServeCmd(&globalFlags{})
-	for _, name := range []string{"tls-autocert", "tls-domain"} {
-		if cmd.Flags().Lookup(name) != nil {
-			t.Errorf("serve still offers --%s", name)
+	for _, name := range retiredTLSFlagNames {
+		f := cmd.Flags().Lookup(name)
+		if f == nil {
+			t.Errorf("serve no longer parses --%s; an upgraded unit file exits 1 with \"unknown flag\"", name)
+			continue
+		}
+		if !f.Hidden {
+			t.Errorf("--%s is on --help, which offers a feature bodega does not have", name)
+		}
+		if f.Deprecated == "" {
+			t.Errorf("--%s is not marked deprecated, so pflag says nothing at parse time", name)
 		}
 	}
 	if strings.Contains(cmd.Long, "autocert") {
@@ -158,3 +171,57 @@ func TestAutocertIsNotAnOfferedFlag(t *testing.T) {
 }
 
 func quote(s string) string { return `"` + s + `"` }
+
+// TestRetiredAutocertFlagsReachTheDefaultLevel covers the other half: a unit
+// file that still passes the flags. Unregistered they exited 1 with "unknown
+// flag: --tls-autocert" and nothing to set instead, which under
+// Restart=always is a crash loop whose only output names the flag.
+func TestRetiredAutocertFlagsReachTheDefaultLevel(t *testing.T) {
+	// The real serve flag set, so a rename of either flag fails here rather
+	// than silently reporting nothing.
+	givenFlags := func(t *testing.T, args ...string) []string {
+		t.Helper()
+		cmd := newServeCmd(&globalFlags{})
+		if err := cmd.Flags().Parse(args); err != nil {
+			t.Fatalf("serve refused %v: %v", args, err)
+		}
+		return retiredTLSFlags(cmd.Flags())
+	}
+
+	t.Run("both flags, no certificate pair", func(t *testing.T) {
+		cfg := loadFrom(t, `{"allow_plaintext":true}`)
+		logger, buf := defaultLog(t)
+		reportRetiredTLSKeys(cfg, givenFlags(t, "--tls-autocert", "--tls-domain", "x"), logger)
+
+		out := buf.String()
+		for _, want := range []string{"ERROR", "--tls-autocert and --tls-domain", "were removed", "no ACME client", "tls_cert", "tls_key", "allow_plaintext"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("log at the default level does not name %q:\n%s", want, out)
+			}
+		}
+	})
+
+	t.Run("one flag names only itself", func(t *testing.T) {
+		cfg := loadFrom(t, `{"allow_plaintext":true}`)
+		logger, buf := defaultLog(t)
+		reportRetiredTLSKeys(cfg, givenFlags(t, "--tls-domain", "x"), logger)
+
+		out := buf.String()
+		if !strings.Contains(out, "--tls-domain was removed") {
+			t.Errorf("log does not name the flag that was given:\n%s", out)
+		}
+		if strings.Contains(out, "--tls-autocert") {
+			t.Errorf("log names a flag nobody passed:\n%s", out)
+		}
+	})
+
+	t.Run("flags absent", func(t *testing.T) {
+		cfg := loadFrom(t, `{"allow_plaintext":true}`)
+		logger, buf := defaultLog(t)
+		reportRetiredTLSKeys(cfg, givenFlags(t), logger)
+
+		if got := buf.String(); got != "" {
+			t.Errorf("a command line that never mentioned autocert printed:\n%s", got)
+		}
+	})
+}
