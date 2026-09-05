@@ -270,7 +270,7 @@ func TestMakeEditSave_FullManifest(t *testing.T) {
 	ctx := t.Context()
 	_ = store.AddVersion(ctx, manifest.TypeNpm, "lodash", manifest.VersionEntry{Version: "4.17.20"})
 
-	m := &appModel{store: store}
+	m := &appModel{store: store, log: &logPaneModel{}}
 	save := m.makeEditSave(manifest.TypeNpm, "lodash", "") // full-manifest edit
 
 	edited := `{
@@ -308,7 +308,7 @@ func TestMakeEditSave_VersionScoped(t *testing.T) {
 	_ = store.AddVersion(ctx, manifest.TypeNpm, "@scope/pkg", manifest.VersionEntry{Version: "1.0.0"})
 	_ = store.AddVersion(ctx, manifest.TypeNpm, "@scope/pkg", manifest.VersionEntry{Version: "2.0.0"})
 
-	m := &appModel{store: store}
+	m := &appModel{store: store, log: &logPaneModel{}}
 	save := m.makeEditSave(manifest.TypeNpm, "@scope/pkg", "2.0.0")
 
 	edited := `{
@@ -352,7 +352,7 @@ func TestMakeEditSave_RejectsRename(t *testing.T) {
 	ctx := t.Context()
 	_ = store.AddVersion(ctx, manifest.TypeNpm, "lodash", manifest.VersionEntry{Version: "4.17.20"})
 
-	m := &appModel{store: store}
+	m := &appModel{store: store, log: &logPaneModel{}}
 	save := m.makeEditSave(manifest.TypeNpm, "lodash", "")
 
 	rename := `{"config_version": 1, "name": "lodash-renamed", "type": "npm", "versions":[{"version":"4.17.20"}]}`
@@ -373,7 +373,7 @@ func TestMakeEditSave_RejectsUnknownVersion(t *testing.T) {
 	ctx := t.Context()
 	_ = store.AddVersion(ctx, manifest.TypeNpm, "pkg", manifest.VersionEntry{Version: "1.0.0"})
 
-	m := &appModel{store: store}
+	m := &appModel{store: store, log: &logPaneModel{}}
 	save := m.makeEditSave(manifest.TypeNpm, "pkg", "9.9.9") // not in store
 
 	edited := `{"config_version":1,"name":"pkg","type":"npm","versions":[{"version":"9.9.9"}]}`
@@ -393,7 +393,7 @@ func TestMakeEditSave_RejectsInvalidJSON(t *testing.T) {
 	ctx := t.Context()
 	_ = store.AddVersion(ctx, manifest.TypeNpm, "pkg", manifest.VersionEntry{Version: "1.0.0"})
 
-	m := &appModel{store: store}
+	m := &appModel{store: store, log: &logPaneModel{}}
 	save := m.makeEditSave(manifest.TypeNpm, "pkg", "")
 
 	if err := save([]byte("{not json")); err == nil {

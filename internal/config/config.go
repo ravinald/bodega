@@ -199,6 +199,7 @@ type fileSnapshot struct {
 	order    []string
 	spaced   map[string]bool // keys the file separates from the one above with a blank line
 	resolved map[string]json.RawMessage
+	pinned   map[string]bool // keys Pin marked as chosen, written whether or not they differ
 }
 
 // legacyKeyAliases maps a retired config key onto the one that replaced it. A
@@ -715,6 +716,27 @@ func (c *Config) MarkResolved() {
 	c.snapshot.resolved = resolved
 }
 
+// Pin marks config keys as values the operator chose, so the next Save writes
+// them even when they match what Load resolved.
+//
+// Save's diff against the resolved baseline is what stops a flag from being
+// recorded as a setting, and it cannot tell "left alone" from "typed back in":
+// `bodega --manifest-dir /srv/m shell` prefills the form field with /srv/m, so
+// an operator who retypes it to make it stick produces a diff of zero. Pinning
+// is the caller saying which keys were chosen rather than inherited; a key
+// nobody touched is not pinned and stays out of the file.
+func (c *Config) Pin(keys ...string) {
+	if c.snapshot == nil {
+		return
+	}
+	if c.snapshot.pinned == nil {
+		c.snapshot.pinned = make(map[string]bool, len(keys))
+	}
+	for _, k := range keys {
+		c.snapshot.pinned[k] = true
+	}
+}
+
 // RawFileValue returns a top-level key exactly as the config file carries it,
 // whatever Config does with it. Save preserves keys it did not parse, so a key
 // this release stopped reading survives in the file and goes on looking to the
@@ -874,20 +896,32 @@ func (c *Config) definedStorageNames() string {
 //
 // It rewrites the file rather than replacing it. See marshalForFile.
 func (c *Config) Save() (string, error) {
-	data, err := c.marshalForFile()
+	path, _, err := c.SaveReport()
+	return path, err
+}
+
+// SaveReport is Save, and also names the config keys the write changed, sorted.
+//
+// Save rewrites only what differs from the resolved baseline, so "it returned
+// no error" and "your edit reached the file" are different facts, and a caller
+// that reports the first as the second tells an operator their setting is
+// pinned when the key was never touched. An empty list means the file on disk
+// already said what the Config says.
+func (c *Config) SaveReport() (string, []string, error) {
+	data, changed, err := c.marshalForFile()
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	path := ConfigPath()
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", fmt.Errorf("create config dir %s: %w", dir, err)
+		return "", nil, fmt.Errorf("create config dir %s: %w", dir, err)
 	}
 	if err := os.WriteFile(path, data, 0o600); err != nil {
-		return "", fmt.Errorf("write config %s: %w", path, err)
+		return "", nil, fmt.Errorf("write config %s: %w", path, err)
 	}
-	return path, nil
+	return path, changed, nil
 }
 
 // marshalForFile renders what belongs on disk.
@@ -909,18 +943,21 @@ func (c *Config) Save() (string, error) {
 // A Config built in code has no such file and is written whole. LocalConfig and
 // Verbose stay out via `json:"-"`, and omitempty keeps unset optional keys
 // absent.
-func (c *Config) marshalForFile() ([]byte, error) {
+//
+// The second return names the keys whose bytes in the file changed, so a caller
+// can report what it wrote rather than that it wrote.
+func (c *Config) marshalForFile() ([]byte, []string, error) {
 	if c.snapshot == nil {
 		data, err := json.MarshalIndent(c, "", "  ")
 		if err != nil {
-			return nil, fmt.Errorf("marshal config: %w", err)
+			return nil, nil, fmt.Errorf("marshal config: %w", err)
 		}
-		return append(data, '\n'), nil
+		return append(data, '\n'), nil, nil
 	}
 
 	current, err := marshalKeys(c)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Values from the file are re-emitted byte for byte, so a key an operator
@@ -930,13 +967,15 @@ func (c *Config) marshalForFile() ([]byte, error) {
 		out[k] = v
 	}
 	for k, v := range current {
-		if prev, ok := c.snapshot.resolved[k]; !ok || !bytes.Equal(prev, v) {
-			indented, err := indentValue(v)
-			if err != nil {
-				return nil, fmt.Errorf("marshal config key %q: %w", k, err)
-			}
-			out[k] = indented
+		prev, ok := c.snapshot.resolved[k]
+		if ok && bytes.Equal(prev, v) && !c.snapshot.pinned[k] {
+			continue
 		}
+		indented, err := indentValue(v)
+		if err != nil {
+			return nil, nil, fmt.Errorf("marshal config key %q: %w", k, err)
+		}
+		out[k] = indented
 	}
 	// A key the caller cleared drops out of current entirely, because every
 	// optional key is omitempty. Deleting it is the difference between the TUI
@@ -958,13 +997,48 @@ func (c *Config) marshalForFile() ([]byte, error) {
 		}
 		indented, err := indentValue(v)
 		if err != nil {
-			return nil, fmt.Errorf("marshal config key %q: %w", replacement, err)
+			return nil, nil, fmt.Errorf("marshal config key %q: %w", replacement, err)
 		}
 		out[replacement] = indented
 		order = append(order, replacement)
 	}
 
-	return encodeOrdered(out, order, c.snapshot.spaced)
+	data, err := encodeOrdered(out, order, c.snapshot.spaced)
+	if err != nil {
+		return nil, nil, err
+	}
+	return data, changedKeys(c.snapshot.raw, out), nil
+}
+
+// changedKeys names the top-level keys whose value the write altered, sorted.
+// A key is changed when it was added, removed, or re-emitted with different
+// bytes; re-indenting a value the operator wrote on one line counts, because
+// that is a change the file carries.
+func changedKeys(before, after map[string]json.RawMessage) []string {
+	var changed []string
+	for k, v := range after {
+		if prev, ok := before[k]; !ok || !bytes.Equal(compactJSON(prev), compactJSON(v)) {
+			changed = append(changed, k)
+		}
+	}
+	for k := range before {
+		if _, ok := after[k]; !ok {
+			changed = append(changed, k)
+		}
+	}
+	sort.Strings(changed)
+	return changed
+}
+
+// compactJSON strips insignificant whitespace so a re-indented value does not
+// read as an edit. It returns the input unchanged when it will not parse, which
+// leaves the comparison a byte one for anything malformed.
+func compactJSON(v json.RawMessage) []byte {
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, v); err != nil {
+		return v
+	}
+	return buf.Bytes()
 }
 
 // indentValue re-indents one value to sit under a two-space top-level key.
@@ -1149,7 +1223,7 @@ func defaultConfigContent() []byte {
   "region": "us-west-2",
   "build_root": "/opt/bodega",
 
-  "_comment_manifest_dir": "manifest_dir: where manifests live on the local backend. Empty means {storage_path}/manifests, so a backup of storage_path is a backup of the whole repository. Set an absolute path; a relative one resolves against the process working directory, which under systemd is /. Upgrading an install whose manifests were written relative to the directory bodega was started from: move that manifests/ directory into {storage_path}/manifests, or point this key at where it already is.",
+  "_comment_manifest_dir": "manifest_dir: where manifests live on the local backend. Empty means {storage_path}/manifests, so a backup of storage_path is a backup of the whole repository. Set an absolute path; a relative one resolves against the process working directory, which under systemd is /. Nothing else is probed: a manifests/ directory beside the binary, or one level above it, is read only when this key, $BODEGA_MANIFEST_DIR or --manifest-dir names it. Upgrading an install whose manifests were written relative to the directory bodega was started from, or found beside the binary: move that manifests/ directory into {storage_path}/manifests, or point this key at where it already is.",
   "manifest_dir": "",
   "log_dir": "/var/log/bodega",
   "logwindow_height": 12,
@@ -1399,24 +1473,18 @@ func parseConfigError(path string, err error) error {
 // loads zero packages, answers /healthz 200, and publishes a Release whose
 // Packages digest is the SHA-256 of the empty string.
 //
-// The executable-relative probes are the development case, where the binary is
-// built beside the source tree's manifests/. Off a source tree the answer is
-// derived from storage_path, so the manifests sit inside the tree the operator
-// already told bodega to own.
+// storage_path is the only input. Manifests sit inside the tree the operator
+// already told bodega to own, so a backup of storage_path is a backup of the
+// whole repository, and the shipped _comment_manifest_dir describes what the
+// binary does.
+//
+// It used to probe <exeDir>/manifests and <exeDir>/../manifests first, for a
+// binary built beside a source tree's manifests/. /opt/bodega/bin/bodega beside
+// /opt/bodega/manifests is that layout too, so an installed host silently read
+// a directory no config named while the file in front of the operator promised
+// another one. Either layout names its directory with manifest_dir,
+// $BODEGA_MANIFEST_DIR or --manifest-dir.
 func defaultManifestDir(storagePath string) string {
-	if exe, err := os.Executable(); err == nil {
-		exeDir := filepath.Dir(exe)
-		for _, c := range []string{
-			filepath.Join(exeDir, "manifests"),
-			filepath.Join(exeDir, "..", "manifests"),
-		} {
-			if fi, err := os.Stat(c); err == nil && fi.IsDir() {
-				if abs, err := filepath.Abs(c); err == nil {
-					return abs
-				}
-			}
-		}
-	}
 	return filepath.Join(firstNonEmpty(storagePath, DefaultStoragePath), "manifests")
 }
 

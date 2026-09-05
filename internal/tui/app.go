@@ -53,10 +53,16 @@ type storeRefreshMsg struct {
 
 // appModel is the root bubbletea model that composes the three panes.
 type appModel struct {
-	sources  sourcesModel
-	details  detailsModel
-	log      logPaneModel
-	popup    popupModel
+	sources sourcesModel
+	details detailsModel
+	popup   popupModel
+
+	// log is a pointer because Update, handleKey and handleSourcesKey all take
+	// appModel by value: a popup callback closes over the frame it was built
+	// in, and appending to that frame's pane writes to a copy bubbletea threw
+	// away when the keystroke returned. Sharing one pane across the copies is
+	// what puts a save's own report on screen.
+	log      *logPaneModel
 	focus    focusTarget
 	statuses []inventory.EntryStatus
 
@@ -100,7 +106,8 @@ func newAppModel(cfg *config.Config, store *manifest.Store, s3client *bos3.Clien
 	m.sources = newSourcesModel(nil) // populated after S3 status arrives
 	m.sources.focused = true
 	m.details = newDetailsModel(store, cfg)
-	m.log = newLogPane()
+	logPane := newLogPane()
+	m.log = &logPane
 	m.logPath = cfg.LogDir
 	return m
 }
@@ -569,11 +576,15 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				cfgRef.GitRoot = fieldValue(fields, "Git root")
 				cfgRef.PypiRoot = fieldValue(fields, "PyPI root")
 				cfgRef.BinaryRoot = fieldValue(fields, "Binary root")
-				path, err := cfgRef.Save()
-				if err != nil {
+				cfgRef.Pin(editedConfigKeys(fields)...)
+				path, written, err := cfgRef.SaveReport()
+				switch {
+				case err != nil:
 					m.log.appendLog(errorStyle.Render("Failed to save config: " + err.Error()))
-				} else {
-					m.log.appendLog(successStyle.Render("Config saved to " + path))
+				case len(written) == 0:
+					m.log.appendLog(dimStyle.Render("No changes to save; " + path + " is unchanged"))
+				default:
+					m.log.appendLog(successStyle.Render("Saved " + strings.Join(written, ", ") + " to " + path))
 				}
 			},
 		}
@@ -838,7 +849,7 @@ func (m *appModel) syncDetails() {
 // or an empty string if not found.
 // buildAuditPopup constructs a form popup for querying the audit trail.
 func (m *appModel) buildAuditPopup() popupModel {
-	logPane := &m.log
+	logPane := m.log
 	cfg := m.cfg
 
 	p := popupModel{
@@ -923,6 +934,40 @@ func fieldValue(fields []formField, key string) string {
 		}
 	}
 	return ""
+}
+
+// configFormKeys maps a config form label onto the config.json key it writes.
+var configFormKeys = map[string]string{
+	"Bucket":            "bucket",
+	"Region":            "region",
+	"Build root":        "build_root",
+	"Manifest dir":      "manifest_dir",
+	"Log dir":           "log_dir",
+	"Log window height": "logwindow_height",
+	"Custom paths":      "custom_paths",
+	"APT root":          "apt_root",
+	"Git root":          "git_root",
+	"PyPI root":         "pypi_root",
+	"Binary root":       "binary_root",
+}
+
+// editedConfigKeys names the config keys behind the fields the operator typed
+// in. Save writes only what differs from the resolved config, which is what
+// keeps `bodega --manifest-dir /srv/m shell` plus a save from pinning the flag;
+// the fields are prefilled from that same resolved config, so an operator who
+// does mean to pin it types a value the diff cannot see. These keys are pinned
+// so they are written either way.
+func editedConfigKeys(fields []formField) []string {
+	var keys []string
+	for _, f := range fields {
+		if !f.edited {
+			continue
+		}
+		if key, ok := configFormKeys[f.Label]; ok {
+			keys = append(keys, key)
+		}
+	}
+	return keys
 }
 
 // Edit popup: leaf nodes → scoped single-version blob; package header → full
@@ -1079,7 +1124,7 @@ var createTypeOptions = []string{
 // remaining fields when the user confirms a type selection.
 func (m *appModel) buildCreatePopup() popupModel {
 	store := m.store
-	logPane := &m.log
+	logPane := m.log
 
 	p := popupModel{
 		kind:      popupForm,
