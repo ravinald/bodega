@@ -18,6 +18,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	bos3 "github.com/ravinald/bodega/internal/s3"
@@ -32,6 +33,12 @@ var (
 	commit    = "none"
 	buildDate = "unknown"
 )
+
+// -ldflags can only reach package main, and nothing under internal/ may import
+// it, so the builder is handed the version here rather than at each call site.
+// init rather than main: a command stamps an artifact through cobra, and the
+// tests that drive those commands never run main.
+func init() { builder.Version = version }
 
 // globalFlags holds values bound to the persistent root flags.
 type globalFlags struct {

@@ -1,6 +1,11 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/ravinald/bodega/internal/builder"
+	"github.com/ravinald/bodega/internal/config"
+)
 
 // TestStringFlagsDoNotShadowConfig covers the class rather than the cell that
 // broke. Every string global flag is the head of a firstNonEmpty chain in
@@ -23,5 +28,21 @@ func TestStringFlagsDoNotShadowConfig(t *testing.T) {
 		if f.DefValue != "" {
 			t.Errorf("--%s is registered with default %q: it shadows its env var and config key, which no invocation can then reach", name, f.DefValue)
 		}
+	}
+}
+
+// TestBuildVersionReachesTheBuilder pins main's init, which is the whole wire.
+// -ldflags can only stamp package main and internal/builder cannot import it,
+// so a Config built anywhere else stamps builder's own default. The defaults
+// differ on purpose: delete the init and this reads "unknown" against main's
+// "dev", where two matching defaults would have let the assignment go missing
+// with every test still green.
+func TestBuildVersionReachesTheBuilder(t *testing.T) {
+	if builder.Version != version {
+		t.Errorf("builder.Version = %q, want main.version %q", builder.Version, version)
+	}
+	if builder.NewConfig(&config.Config{}).BodegaVersion != version {
+		t.Errorf("NewConfig stamps %q, want %q",
+			builder.NewConfig(&config.Config{}).BodegaVersion, version)
 	}
 }
