@@ -140,6 +140,36 @@ func assertArmorChecksum(t *testing.T, what string, armored []byte) {
 	}
 }
 
+// TestClearSignSurvivesAnArmorHeaderInTheBody guards the anchor
+// reArmorSignature splits on. clearsign dash-escapes a body line opening with
+// "-", so a Release carrying the literal armor header is still one document
+// with one signature block. Splitting on the bare marker lands inside the
+// escaped line and fails on the message text ("illegal base64 data at input
+// byte 0"), which takes the whole suite unsigned.
+func TestClearSignSurvivesAnArmorHeaderInTheBody(t *testing.T) {
+	kr := testKey(t)
+	body := "Origin: bodega\n-----BEGIN PGP SIGNATURE-----\nSuite: noble\n"
+	signed, err := kr.ClearSign([]byte(body))
+	if err != nil {
+		t.Fatalf("ClearSign: %v", err)
+	}
+	block, _ := clearsign.Decode(signed)
+	if block == nil {
+		t.Fatal("clearsign.Decode returned no block")
+	}
+	if string(block.Plaintext) != body {
+		t.Errorf("clearsigned body != Release\n got: %q\nwant: %q", block.Plaintext, body)
+	}
+	assertArmorChecksum(t, "InRelease with an armor header in the body", signed)
+	pub, err := kr.PublicKey()
+	if err != nil {
+		t.Fatalf("PublicKey: %v", err)
+	}
+	if _, err := openpgp.CheckDetachedSignature(readArmoredPublic(t, pub), bytes.NewReader(block.Bytes), block.ArmoredSignature.Body, nil); err != nil {
+		t.Errorf("signature does not verify: %v", err)
+	}
+}
+
 // TestDualSignVerifiesUnderEitherKey is the rotation window: apt accepts an
 // InRelease when any one signature verifies, so a client holding only the old
 // key and a client holding only the new one both pass.

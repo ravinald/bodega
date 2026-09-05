@@ -260,11 +260,7 @@ func (k *KeyRing) ClearSign(msg []byte) ([]byte, error) {
 	if err := w.Close(); err != nil {
 		return nil, fmt.Errorf("clearsign close: %w", err)
 	}
-	out, err := reArmorSignature(buf.Bytes())
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
+	return reArmorSignature(buf.Bytes())
 }
 
 // reArmorSignature replaces the signature block of a clearsigned document with
@@ -275,11 +271,17 @@ func (k *KeyRing) ClearSign(msg []byte) ([]byte, error) {
 // after reporting a good signature for every key (#214). The message body
 // ahead of the block is untouched, so the enclosed Release stays byte-identical
 // to the one the unsigned route serves.
+// The block is found by an unescaped armor header at the start of a line.
+// clearsign dash-escapes every body line opening with "-", so a Release
+// carrying the literal "-----BEGIN PGP SIGNATURE-----" reaches the document as
+// "- -----BEGIN…" and the anchor steps over it; matching the bare marker
+// anywhere would split the document on the message instead.
 func reArmorSignature(doc []byte) ([]byte, error) {
-	i := bytes.Index(doc, []byte("-----BEGIN PGP SIGNATURE-----"))
+	i := bytes.Index(doc, []byte("\n-----BEGIN PGP SIGNATURE-----"))
 	if i < 0 {
 		return nil, errors.New("clearsign produced no signature block")
 	}
+	i++
 	block, err := armor.Decode(bytes.NewReader(doc[i:]))
 	if err != nil {
 		return nil, fmt.Errorf("decode clearsign armor: %w", err)
