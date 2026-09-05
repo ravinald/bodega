@@ -122,7 +122,9 @@ func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
 	}
 	key := manifest.PypiWheelPrefix + p
 	file := path.Base(p)
-	setCacheImmutable(w, file)
+	// Wrapped rather than set: proxyOrResolve and proxyVersion below can both
+	// answer 403 or 404, and http.Error leaves the header map alone.
+	w = cacheImmutableOn200(w, file)
 
 	// Extract package name and version from the wheel filename
 	// (e.g. "boto3-1.26.0-py3-none-any.whl" → "boto3", "1.26.0").

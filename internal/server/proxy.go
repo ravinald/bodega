@@ -110,7 +110,10 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	// Cache miss or stale — fetch from upstream if proxy is enabled.
 	if (!s.cacheEnabled() && !forceProxy) || resolve == nil {
 		if status != nil && status.Exists {
-			// Stale but no upstream — serve what we have.
+			// Stale but no upstream — serve what we have. Recorded for the
+			// same reason the fresh hit is: the row counts requests, and a
+			// cache the request never left is still a request.
+			s.recordCacheHit(ctx, r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key)
 			s.proxyS3(w, r, store, s3Key)
 			return
 		}
@@ -122,6 +125,10 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	if err != nil {
 		if status != nil && status.Exists {
 			s.logger.Error("upstream resolution failed, serving the stale cached copy", "key", s3Key, "error", err)
+			// An outage is the window an operator reads these columns in.
+			// Left unrecorded, request_count and last_client go quiet exactly
+			// while the upstream is down and the cache is carrying the fleet.
+			s.recordCacheHit(ctx, r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key)
 			s.proxyS3(w, r, store, s3Key)
 			return
 		}
@@ -151,6 +158,10 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	fail := func(err error) {
 		if status != nil && status.Exists {
 			s.logger.Error("upstream fetch failed, serving the stale cached copy", "url", upstreamURL, "error", err)
+			// No row here. This branch is below the allow-list gate, which
+			// already recorded the attempt for this request; a second write
+			// would bump request_count twice for one client fetch, which is
+			// the counting error B16 fixed in the other direction.
 			s.proxyS3(w, r, store, s3Key)
 			return
 		}
@@ -566,7 +577,14 @@ func (s *Server) enforceUpstreamPolicyRecording(w http.ResponseWriter, r *http.R
 	if s.policy == nil || regType == "" || policyCandidate == "" {
 		return true
 	}
-	ctx := r.Context()
+	// Detached, for the reason recordCacheHit detaches: net/http cancels
+	// r.Context() the moment the client hangs up, and on a cold rule cache the
+	// verdict is a database read. Run on the request context it fails, the
+	// handler answers 500 and returns above the deny branch, so the 403 and
+	// its row are both lost for the scanner-shaped callers the row exists to
+	// name.
+	ctx, cancel := auditContext(r)
+	defer cancel()
 	decision, violation, err := s.upstreamPolicyVerdict(ctx, regType, policyCandidate)
 	if err != nil {
 		s.logger.Error("policy check failed", "error", err)
@@ -584,29 +602,38 @@ func (s *Server) enforceUpstreamPolicyRecording(w http.ResponseWriter, r *http.R
 	if violation {
 		s.logger.Warn("upstream blocked by policy",
 			"type", regType, "candidate", policyCandidate, "url", upstreamURL)
-		if s.auditDB != nil {
-			// The refusal stands whether or not the row lands: an audit
-			// database that cannot be written is not a reason to let a
-			// blocked upstream through. It is a reason to say so loudly,
-			// naming the event, so a reconstruction from the log is
-			// possible when the table is missing the row.
-			auditCtx, cancel := auditContext(r)
-			defer cancel()
-			if err := s.auditDB.Record(auditCtx, audit.Event{
-				EventType: audit.EventCache,
-				PkgType:   regType,
-				PkgName:   policyCandidate,
-				Status:    "policy_violation",
-				Details:   fmt.Sprintf("url=%s", upstreamURL),
-			}); err != nil {
-				s.logger.Error("audit write failed, denial not recorded — still refusing",
-					"event_type", audit.EventCache, "status", "policy_violation",
-					"type", regType, "candidate", policyCandidate, "url", upstreamURL,
-					"error", err)
-			}
-		}
+		s.recordPolicyViolation(r, regType, policyCandidate, upstreamURL)
 		http.Error(w, "upstream blocked by allow-list", http.StatusForbidden)
 		return false
 	}
 	return true
+}
+
+// recordPolicyViolation writes the audit row for one candidate the allow-list
+// refused. Separate from the discovery row: discovery answers "what did the
+// fleet reach for", the audit table answers "who was turned away", and an
+// operator asking the second question queries GET /api/v1/audit.
+//
+// The refusal stands whether or not the row lands: an audit database that
+// cannot be written is not a reason to let a blocked upstream through. It is a
+// reason to say so loudly, naming the event, so a reconstruction from the log
+// is possible when the table is missing the row.
+func (s *Server) recordPolicyViolation(r *http.Request, regType, policyCandidate, upstreamURL string) {
+	if s.auditDB == nil {
+		return
+	}
+	ctx, cancel := auditContext(r)
+	defer cancel()
+	if err := s.auditDB.Record(ctx, audit.Event{
+		EventType: audit.EventCache,
+		PkgType:   regType,
+		PkgName:   policyCandidate,
+		Status:    "policy_violation",
+		Details:   fmt.Sprintf("url=%s", upstreamURL),
+	}); err != nil {
+		s.logger.Error("audit write failed, denial not recorded — still refusing",
+			"event_type", audit.EventCache, "status", "policy_violation",
+			"type", regType, "candidate", policyCandidate, "url", upstreamURL,
+			"error", err)
+	}
 }

@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 )
@@ -208,6 +209,11 @@ func (s *Server) handleGitSmart(w http.ResponseWriter, r *http.Request, ns, rest
 	// and as a push in the child.
 	serviceParams := r.URL.Query()["service"]
 	if strings.HasSuffix(rest, "/"+gitServiceReceivePack) || slices.Contains(serviceParams, gitServiceReceivePack) {
+		// A write attempt by a caller who already passed the read gate, which
+		// is the same question "who was turned away" asks of every other
+		// refusal. The namespace is the subject; the repository is in the path
+		// the row's details carry.
+		recordDenialFor(s.auditDB, r, manifest.TypeGit, ns, "", audit.DenialPushRefused, nil)
 		http.Error(w, "bodega mirrors are read-only; pushes are refused", http.StatusForbidden)
 		return
 	}

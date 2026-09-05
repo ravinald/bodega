@@ -1627,14 +1627,6 @@ func (s *Server) proxyS3(w http.ResponseWriter, r *http.Request, store storage.O
 
 // ---- Helpers ---------------------------------------------------------------
 
-// setCacheImmutable adds Cache-Control: public, max-age=31536000, immutable
-// for artifact types that are content-addressed and never overwritten.
-func setCacheImmutable(w http.ResponseWriter, filename string) {
-	if isImmutableArtifact(filename) {
-		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-	}
-}
-
 // isImmutableArtifact reports whether a filename names bytes that never change
 // under their own name.
 func isImmutableArtifact(filename string) bool {

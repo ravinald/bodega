@@ -125,7 +125,7 @@ func (s *Server) handleCargoDownload(w http.ResponseWriter, r *http.Request, p s
 		}
 	}
 
-	setCacheImmutable(w, path.Base(p))
+	w = cacheImmutableOn200(w, path.Base(p))
 	// cargo_dl_upstream, not cargo_upstream: the sparse index host serves the
 	// index and nothing else, and crates.io names the download root separately
 	// in the index's own config.json.

@@ -265,6 +265,71 @@ func TestGitSmartRefusesPush(t *testing.T) {
 	if _, err := os.Stat(mirrorDir(s, "corp")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("a refused push created a mirror at %s", mirrorDir(s, "corp"))
 	}
+
+}
+
+// The refusal is a write attempt by a caller who already passed the read gate,
+// so it lands in the same table the middleware gates write to: an operator
+// asking "who was turned away" asks GET /api/v1/audit one question, not one
+// per gate.
+//
+// admin_permit_cidr covers loopback here because that is what it takes to
+// reach the handler at all with a POST: MutationAuthMiddleware refuses an
+// unpermitted one first, as ip_not_permitted, and never runs handleGitSmart.
+// The info/refs probe is a GET and reaches the handler either way.
+func TestGitPushRefusalRecordsADenialRow(t *testing.T) {
+	upstream := newGitUpstream(t)
+	s := newGitServer(t, upstream)
+	nets, err := parseAdminPermitCIDR([]string{"127.0.0.0/8"})
+	if err != nil {
+		t.Fatalf("parse admin permit cidr: %v", err)
+	}
+	s.adminNets = nets
+	s.refreshACLs(t.Context()) // the chain reads a cached set, populated at startup
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	probe, err := http.Get(ts.URL + "/git/corp/" + gitTestRepo + "/info/refs?service=git-receive-pack") //nolint:gosec,noctx // test-owned loopback URL
+	if err != nil {
+		t.Fatalf("GET info/refs: %v", err)
+	}
+	_ = probe.Body.Close()
+	post, err := http.Post(ts.URL+"/git/corp/"+gitTestRepo+"/git-receive-pack", //nolint:noctx // test-owned loopback URL
+		"application/x-git-receive-pack-request", strings.NewReader(""))
+	if err != nil {
+		t.Fatalf("POST git-receive-pack: %v", err)
+	}
+	_ = post.Body.Close()
+	for _, resp := range []*http.Response{probe, post} {
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("%s %s = %d, want 403", resp.Request.Method, resp.Request.URL.Path, resp.StatusCode)
+		}
+	}
+
+	rows, err := s.auditDB.Query(t.Context(), audit.Filter{EventType: audit.EventDenied})
+	if err != nil {
+		t.Fatalf("query audit db: %v", err)
+	}
+	var refusals []audit.StoredEvent
+	for _, row := range rows {
+		if row.Status == audit.DenialPushRefused {
+			refusals = append(refusals, row)
+		}
+	}
+	if len(refusals) != 2 {
+		t.Fatalf("push_refused rows = %d, want 2 (%+v)", len(refusals), rows)
+	}
+	for _, row := range refusals {
+		if row.PkgType != manifest.TypeGit || row.PkgName != "corp" {
+			t.Errorf("pkg = %q/%q, want %q/%q", row.PkgType, row.PkgName, manifest.TypeGit, "corp")
+		}
+		if !strings.Contains(row.Details, gitTestRepo) {
+			t.Errorf("details = %q, want the repository path", row.Details)
+		}
+		if row.ClientIP != "127.0.0.1" {
+			t.Errorf("client_ip = %q, want the caller that tried to push", row.ClientIP)
+		}
+	}
 }
 
 // Layer one of the push refusal: every mirror bodega creates carries

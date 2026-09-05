@@ -17,7 +17,7 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 	if idx := strings.Index(fullPath, "/-/"); idx >= 0 {
 		pkgName := fullPath[:idx]   // canonical, e.g. "@bitwarden/cli"
 		tarball := fullPath[idx+3:] // URL form, e.g. "cli-2026.3.0.tgz"
-		setCacheImmutable(w, tarball)
+		w = cacheImmutableOn200(w, tarball)
 
 		// Storage uses the safe-encoded form everywhere; the URL does not, so
 		// the version has to come back out of the wire filename before a key
