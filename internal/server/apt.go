@@ -574,17 +574,27 @@ func (s *Server) aptCachedPoolMap(mirrored map[string]bool, fallbacks []aptFallb
 // nothing else writes that source — an entry bodega built carries its digest
 // in the manifest and never reaches verifyProxyChecksum.
 //
-// Fail closed twice over. An instance with no upstreams configured holds
-// nothing in pool/ bodega did not put there, so the query is skipped and the
-// answer is nil. An instance that does mirror and cannot read the table has no
-// way to tell the two apart, so every pool object counts as mirrored: the
-// fallback entry drops out of the index, which auditAptEntries already reports
-// as unpooled.
+// The record is consulted whenever it can be read, never gated on the current
+// config. pool/ outlives apt_upstreams: retiring the key leaves every cached
+// upstream .deb where it is and every checksum row where it is, so a rebuild
+// that trusts the config to answer "did this instance ever mirror" republishes
+// the archive's bytes under bodega's signature on the next rebuild (#201). The
+// query costs one indexed read per rebuild that has a fallback entry to
+// resolve, and returns nothing on an instance that never mirrored.
+//
+// With no audit database there is no record to read, and the config is all
+// that is left to reason from. An instance with upstreams configured cannot
+// tell the two apart, so every pool object counts as mirrored: the fallback
+// entry drops out of the index, which auditAptEntries already reports as
+// unpooled. One with none is the ordinary non-mirroring instance and resolves
+// normally. That last case is the residual hole: an instance that mirrored
+// with no audit database wrote no row anywhere, so dropping apt_upstreams
+// leaves nothing behind to exclude on.
 func (s *Server) aptMirroredPoolKeys(ctx context.Context) (map[string]bool, error) {
-	if len(s.cfg.AptUpstreams) == 0 {
-		return nil, nil
-	}
 	if s.auditDB == nil {
+		if len(s.cfg.AptUpstreams) == 0 {
+			return nil, nil
+		}
 		return nil, errors.New("apt upstreams are configured but no audit database is open, so a cached upstream .deb cannot be told from a built one; entries without _pool_path stay out of the index until the audit database is reachable")
 	}
 	rows, err := s.auditDB.ListChecksums(ctx, manifest.TypeApt, "")

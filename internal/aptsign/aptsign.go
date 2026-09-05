@@ -16,6 +16,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -259,8 +260,39 @@ func (k *KeyRing) ClearSign(msg []byte) ([]byte, error) {
 	if err := w.Close(); err != nil {
 		return nil, fmt.Errorf("clearsign close: %w", err)
 	}
-	buf.WriteByte('\n')
-	return buf.Bytes(), nil
+	out, err := reArmorSignature(buf.Bytes())
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// reArmorSignature replaces the signature block of a clearsigned document with
+// the same packets armored by armor.Encode, whose blocks carry the CRC24
+// footer. clearsign asks for a block without one — RFC 9580 made the footer
+// optional and go-crypto hardcodes it off — and gpgv 2.4.4, which is what
+// Ubuntu 24.04 ships, reads the -----END dashes as base64 payload and exits 2
+// after reporting a good signature for every key (#214). The message body
+// ahead of the block is untouched, so the enclosed Release stays byte-identical
+// to the one the unsigned route serves.
+func reArmorSignature(doc []byte) ([]byte, error) {
+	i := bytes.Index(doc, []byte("-----BEGIN PGP SIGNATURE-----"))
+	if i < 0 {
+		return nil, errors.New("clearsign produced no signature block")
+	}
+	block, err := armor.Decode(bytes.NewReader(doc[i:]))
+	if err != nil {
+		return nil, fmt.Errorf("decode clearsign armor: %w", err)
+	}
+	sigs, err := io.ReadAll(block.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read clearsign armor: %w", err)
+	}
+	armored, err := armorBytes("PGP SIGNATURE", sigs)
+	if err != nil {
+		return nil, err
+	}
+	return append(doc[:i:i], armored...), nil
 }
 
 // DetachSign produces Release.gpg. Every key's signature goes into one armor

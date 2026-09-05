@@ -721,6 +721,45 @@ func TestAuditFallbackEntryAdoptsMirroredDeb(t *testing.T) {
 	}
 }
 
+// TestRetiringUpstreamsKeepsTheMirroredDebExcluded is #201. The exclusion used
+// to be gated on len(cfg.AptUpstreams), which asks the config a question only
+// the pool can answer. Mirror the .deb, drop apt_upstreams, and the cached
+// upstream artifact is still in pool/ under the exact filename the fallback
+// entry resolves by — so the stanza that reappears carries no SHA256 and the
+// host installs archive bytes as the operator's build, which is #170 again.
+func TestRetiringUpstreamsKeepsTheMirroredDebExcluded(t *testing.T) {
+	upstreamBytes := "\x21<arch>\nbytes from ports.ubuntu.com, not from the build"
+	archive := newFixtureArchive(t, map[string]string{fixtureDeb: upstreamBytes})
+	s := mirrorServer(t, archive)
+
+	if err := s.store.AddVersion(t.Context(), manifest.TypeApt, "nginx", manifest.VersionEntry{
+		Version:    "1.24.0-2ubuntu7.1",
+		SourceName: "nginx",
+		Suites:     []string{"local"},
+		Metadata:   map[string]string{"Architecture": "amd64"},
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+
+	if code, _ := mirrorGet(t, s, "/apt/"+fixtureDeb); code != http.StatusOK {
+		t.Fatalf("mirrored pool fetch failed")
+	}
+
+	// The operator retires mirroring. The pool listing is dropped with it, so
+	// the rebuild takes a fresh one and cannot inherit the earlier exclusion.
+	s.cfg.AptUpstreams = nil
+	s.aptPool.Store(nil)
+	s.rebuildAptSnapshot(t.Context())
+
+	code, body := mirrorGet(t, s, "/apt/dists/local/main/binary-amd64/Packages")
+	if code != http.StatusOK {
+		t.Fatalf("generated Packages = %d, want 200", code)
+	}
+	if strings.Contains(string(body), "Filename: "+fixtureDeb) {
+		t.Errorf("retiring apt_upstreams republished the cached upstream artifact:\n%s", body)
+	}
+}
+
 // TestAuditFallbackEntryCrossesArchitecture is the second half of #170: the
 // prefix pass in findDebInPool drops the architecture, so an arm64 entry
 // resolves to the amd64 artifact sitting in the pool.
