@@ -245,3 +245,75 @@ func (p *pair) All() []storage.NamedStore {
 		{Name: "bulk", Store: p.bulk},
 	}
 }
+
+// TestAmbiguousPoolPrefixResolvesTheSameWayEveryRun is #175. The lookup used to
+// fall back to a "<pkg>_<version>" prefix pass over a map, so a pool holding
+// both nginx_1.0_amd64.deb and nginx_1.0.1_amd64.deb answered with whichever
+// key Go's randomized iteration reached first — a different KEY column between
+// two runs of `bodega build status` against one store, for an operator about to
+// paste that column into `bodega pkg move`.
+func TestAmbiguousPoolPrefixResolvesTheSameWayEveryRun(t *testing.T) {
+	ctx := t.Context()
+	store := manifest.NewLocalStore(t.TempDir())
+
+	// Neither entry carries _pool_path: the pool listing is the only path that
+	// reached the prefix pass.
+	add := func(name, version, arch string) {
+		t.Helper()
+		if err := store.AddVersion(ctx, manifest.TypeApt, name, manifest.VersionEntry{
+			Version:    version,
+			SourceName: name,
+			Metadata:   map[string]string{"Architecture": arch},
+		}); err != nil {
+			t.Fatalf("add %s %s: %v", name, version, err)
+		}
+	}
+	add("nginx", "1.0", "amd64")
+	add("nginx-extras", "2.0", "arm64")
+
+	mem := storage.NewMemory()
+	// Two basenames share the prefix "nginx_1.0", one of which is the exact
+	// name the amd64 entry resolves to.
+	mem.Seed("packages/apt/pool/main/n/nginx/nginx_1.0_amd64.deb", "amd64 bytes")
+	mem.Seed("packages/apt/pool/main/n/nginx/nginx_1.0.1_amd64.deb", "a later version, same prefix")
+	// Two more share "nginx-extras_2.0", and neither is named for arm64.
+	mem.Seed("packages/apt/pool/main/n/nginx-extras/nginx-extras_2.0_amd64.deb", "wrong architecture")
+	mem.Seed("packages/apt/pool/main/n/nginx-extras/nginx-extras_2.0.1_amd64.deb", "wrong architecture, later")
+	stores := storage.NewSingle(mem)
+
+	keys := func() map[string]string {
+		t.Helper()
+		statuses, err := inventory.CheckStatus(ctx, stores, store, []string{manifest.TypeApt})
+		if err != nil {
+			t.Fatalf("CheckStatus: %v", err)
+		}
+		out := make(map[string]string, len(statuses))
+		for _, s := range statuses {
+			out[s.Name] = s.Key
+		}
+		return out
+	}
+
+	first := keys()
+	for i := 1; i < 20; i++ {
+		got := keys()
+		for name, key := range got {
+			if key != first[name] {
+				t.Fatalf("run %d: %s resolved to %q, run 0 said %q", i, name, key, first[name])
+			}
+		}
+	}
+
+	want := map[string]string{
+		"nginx@1.0": "packages/apt/pool/main/n/nginx/nginx_1.0_amd64.deb",
+		// The prefix pass used to hand this arm64 entry an amd64 artifact. The
+		// server publishes no index entry for it, so a key here would be a key
+		// nothing serves.
+		"nginx-extras@2.0": "",
+	}
+	for name, key := range want {
+		if first[name] != key {
+			t.Errorf("%s: Key = %q, want %q", name, first[name], key)
+		}
+	}
+}

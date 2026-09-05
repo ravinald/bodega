@@ -56,19 +56,8 @@ const (
 // created and its session writer is teed into the buffer so that all output
 // lands in both the TUI log pane and the on-disk session log.
 func builderCfg(buf *bytes.Buffer, cfg *config.Config) *builder.Config {
-	bc := &builder.Config{
-		BuildRoot:      cfg.BuildRoot,
-		ManifestDir:    cfg.ManifestDir,
-		Bucket:         cfg.Bucket,
-		Region:         cfg.Region,
-		Verbose:        cfg.Verbose,
-		AptRoot:        cfg.AptRoot,
-		GitRoot:        cfg.GitRoot,
-		PypiRoot:       cfg.PypiRoot,
-		BinaryRoot:     cfg.BinaryRoot,
-		AutoImportDeps: true, // default: auto-import discovered deps
-		Stdout:         buf,
-	}
+	bc := builder.NewConfig(cfg)
+	bc.Stdout = buf
 
 	if cfg.LogDir != "" {
 		logger, err := logging.NewBuildLogger(cfg.LogDir)

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/logging"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
@@ -33,6 +34,7 @@ type Config struct {
 	GomodRoot  string
 	HelmRoot   string
 	NpmRoot    string
+	CargoRoot  string
 	// Stdout is where builder output is written; defaults to os.Stdout.
 	Stdout io.Writer
 	// Force re-fetches even if artifacts already exist on disk.
@@ -123,8 +125,68 @@ func (c *Config) rootFor(typ string) string {
 		if c.NpmRoot != "" {
 			return c.NpmRoot
 		}
+	case "cargo":
+		if c.CargoRoot != "" {
+			return c.CargoRoot
+		}
 	}
 	return c.BuildRoot
+}
+
+// NewConfig builds the Config every command and the TUI run on from the
+// installed settings.
+//
+// It exists because the per-type roots were hand-copied into seven struct
+// literals and no two carried the same subset: sync and upload named none of
+// them, so an install setting apt_root uploaded from build_root, found nothing
+// and reported nothing to do. Fields a single caller owns — Stdout, Logger,
+// AuditDB, Policy, Force — stay the caller's to set; anything read off the
+// config file is set here or it reaches one command only.
+func NewConfig(app *config.Config) *Config {
+	return &Config{
+		BuildRoot:      app.BuildRoot,
+		ManifestDir:    app.ManifestDir,
+		Bucket:         app.Bucket,
+		Region:         app.Region,
+		Verbose:        app.Verbose,
+		AptRoot:        app.AptRoot,
+		GitRoot:        app.GitRoot,
+		PypiRoot:       app.PypiRoot,
+		BinaryRoot:     app.BinaryRoot,
+		GomodRoot:      app.GomodRoot,
+		HelmRoot:       app.HelmRoot,
+		NpmRoot:        app.NpmRoot,
+		CargoRoot:      app.CargoRoot,
+		AutoImportDeps: true,
+	}
+}
+
+// ArtifactDir returns the directory a type's artifacts are read from and
+// written to, resolved through the same per-type root the *ArtifactPaths
+// functions walk. An upload that finds nothing names this path, which is the
+// one thing that distinguishes an empty build from a build under a root the
+// command never read.
+func ArtifactDir(cfg *Config, typ string) string {
+	d := buildDirs(cfg.rootFor(typ))
+	switch typ {
+	case manifest.TypeBinary:
+		return d.binaries
+	case manifest.TypeGit:
+		return d.bundles
+	case manifest.TypeApt:
+		return d.aptRepo
+	case manifest.TypePypi:
+		return d.wheels
+	case manifest.TypeGomod:
+		return d.gomod
+	case manifest.TypeHelm:
+		return d.charts
+	case manifest.TypeNpm:
+		return d.npm
+	case manifest.TypeCargo:
+		return d.cargo
+	}
+	return cfg.rootFor(typ)
 }
 
 // stdout returns the configured output writer, falling back to os.Stdout.

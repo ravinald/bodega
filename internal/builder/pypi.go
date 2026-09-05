@@ -73,8 +73,7 @@ func CheckPypiStage(cfg *Config, store *manifest.Store) StageStatus {
 // PypiArtifactDir returns the local wheels directory and S3 prefix for the
 // pypi packages. Used by the upload and sync commands.
 func PypiArtifactDir(cfg *Config, store *manifest.Store) (localDir, s3Prefix string) {
-	d := buildDirs(cfg.rootFor(manifest.TypePypi))
-	return pypiWheelsDir(d), manifest.PypiWheelPrefix
+	return ArtifactDir(cfg, manifest.TypePypi), manifest.PypiWheelPrefix
 }
 
 // FetchPypi resolves requirements from previously-cloned git repos and from

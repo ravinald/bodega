@@ -351,6 +351,11 @@ func ensureUploadable(t string, bcfg *builder.Config, store *manifest.Store) err
 		s = ensurePackagedNpm(bcfg, store, "")
 	case manifest.TypeCargo:
 		s = ensureFetchedCargo(bcfg, store, "")
+	default:
+		// s stays nil and HasFailures has no nil guard, so a ninth type added
+		// to manifest.AllTypes without an arm here panics the upload rather
+		// than skipping it. Refuse by name instead.
+		return fmt.Errorf("no upload cascade for type %q", t)
 	}
 	if s.HasFailures() {
 		return fmt.Errorf("cascade for %s failed", t)

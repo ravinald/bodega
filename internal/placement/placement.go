@@ -331,7 +331,10 @@ func (p *Placer) UploadType(ctx context.Context, bcfg *builder.Config, typ strin
 
 	paths := ArtifactPaths(bcfg, p.store, typ, "")
 	if len(paths) == 0 {
-		fmt.Fprintf(p.out, "    No local %s artifacts found — skipping\n", typ)
+		// Naming the directory is what separates "nothing was built" from
+		// "this command resolved a different root than the build did".
+		fmt.Fprintf(p.out, "    No local %s artifacts found under %s — skipping\n",
+			typ, builder.ArtifactDir(bcfg, typ))
 		return 0, nil
 	}
 	return p.UploadPaths(ctx, typ, paths)

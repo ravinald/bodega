@@ -56,14 +56,7 @@ When a name is given after the type, only that entry is packaged.`,
 				return fmt.Errorf("load manifests: %w", err)
 			}
 
-			bcfg := &builder.Config{
-				AutoImportDeps: true,
-				BuildRoot:      cfg.BuildRoot,
-				ManifestDir:    cfg.ManifestDir,
-				Bucket:         cfg.Bucket,
-				Region:         cfg.Region,
-				Verbose:        cfg.Verbose,
-			}
+			bcfg := builder.NewConfig(cfg)
 
 			var allSummaries []*builder.Summary
 

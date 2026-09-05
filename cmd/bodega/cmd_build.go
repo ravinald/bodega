@@ -80,22 +80,11 @@ When a name is given after the type, only that entry is built.`,
 				policyChecker = policy.NewChecker(auditDB)
 			}
 
-			bcfg := &builder.Config{
-				AutoImportDeps: true,
-				BuildRoot:      cfg.BuildRoot,
-				ManifestDir:    cfg.ManifestDir,
-				Bucket:         cfg.Bucket,
-				Region:         cfg.Region,
-				Verbose:        cfg.Verbose,
-				AptRoot:        cfg.AptRoot,
-				GitRoot:        cfg.GitRoot,
-				PypiRoot:       cfg.PypiRoot,
-				BinaryRoot:     cfg.BinaryRoot,
-				Stdout:         buildOut,
-				Logger:         buildLogger,
-				AuditDB:        auditDB,
-				Policy:         policyChecker,
-			}
+			bcfg := builder.NewConfig(cfg)
+			bcfg.Stdout = buildOut
+			bcfg.Logger = buildLogger
+			bcfg.AuditDB = auditDB
+			bcfg.Policy = policyChecker
 
 			var allSummaries []*builder.Summary
 
