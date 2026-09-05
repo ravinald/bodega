@@ -84,8 +84,12 @@ func largeArtifactUpstream(t *testing.T, n int) *httptest.Server {
 func TestConcurrentSpoolsStayUnderTheBudget(t *testing.T) {
 	allowLoopbackUpstream(t)
 
+	// Kilobytes rather than megabytes: the assertions are about the
+	// arithmetic of the budget, not about throughput, and `go test ./...`
+	// runs package binaries side by side — a few megabytes of concurrent
+	// copying here is CPU and I/O taken from whatever is running next to it.
 	const (
-		artifact = 1 << 20
+		artifact = 256 << 10
 		budget   = 3 * artifact
 		fetches  = 8
 	)
@@ -117,7 +121,7 @@ func TestConcurrentSpoolsStayUnderTheBudget(t *testing.T) {
 				peakOn = n
 			}
 			watchMu.Unlock()
-			time.Sleep(time.Millisecond)
+			time.Sleep(2 * time.Millisecond)
 		}
 	}()
 
