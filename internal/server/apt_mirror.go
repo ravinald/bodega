@@ -261,13 +261,20 @@ func (s *Server) aptResolvePoolUpstream(w http.ResponseWriter, r *http.Request, 
 	}
 
 	ctx := r.Context()
+	// The verdict alone runs detached, for the reason
+	// enforceUpstreamPolicyRecording detaches: a cold rule cache makes it a
+	// database read, and a client that hung up would turn the refusal into a
+	// 500 with no row. The probe below keeps the request context, so a
+	// canceled client still stops the network work it was waiting on.
+	verdictCtx, cancel := auditContext(r)
+	defer cancel()
 	name, version := aptDebIdentity(path.Base(poolPath))
 	candidates := s.cfg.AptPoolUpstreams()
 	var refused []string
 	for _, base := range candidates {
 		candidate := base + "/" + poolPath
 		if s.policy != nil {
-			decision, violation, err := s.upstreamPolicyVerdict(ctx, manifest.TypeApt, candidate)
+			decision, violation, err := s.upstreamPolicyVerdict(verdictCtx, manifest.TypeApt, candidate)
 			if err != nil {
 				s.logger.Error("policy check failed", "error", err)
 				http.Error(w, "policy check failed", http.StatusInternalServerError)
@@ -276,8 +283,12 @@ func (s *Server) aptResolvePoolUpstream(w http.ResponseWriter, r *http.Request, 
 			if violation {
 				// Recorded here rather than left to the fetch, because for
 				// this candidate there is no fetch: this is the only place the
-				// refusal can be observed.
+				// refusal can be observed. Both rows, because the discovery
+				// table answers what the fleet reached for and the audit table
+				// answers who was turned away — the same pair
+				// enforceUpstreamPolicyRecording writes on the proxy path.
 				s.recordDiscovery(ctx, r, manifest.TypeApt, candidate, candidate, name, manifest.AptKey(poolPath), decision)
+				s.recordPolicyViolation(r, manifest.TypeApt, candidate, candidate)
 				refused = append(refused, base)
 				continue
 			}

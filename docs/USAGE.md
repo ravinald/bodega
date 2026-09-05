@@ -558,7 +558,7 @@ The mode is server-side. Set `discover_mode` in config.json and restart:
 
 It is also not the way to bootstrap a catalog. Discovery only sees what clients ask for, so a host that has been stable for six months produces nothing, and `catalog` mode 404s a path before any policy check runs — so an empty store stays empty however long you watch it. Read the host's own inventory instead: [`bodega pkg convert`](#bodega-pkg-convert-type-file-) turns `dpkg-query`, `pip list`, `npm ls -g`, `go list -m all`, `cargo install --list` or `helm list` into a manifest set in one run. What discovery is for is the residue: once a catalog exists, `observe` names what the fleet reaches for that the catalog does not cover, including the two types `pkg convert` has no importer for (git and binary).
 
-Each observation is one row keyed by `(type, pattern, package, version, decision)`, with a request count, the last client IP, and the upstream URL bodega fetched or would have fetched. The count is a count of **requests**, not of cache misses: a request the cache answers bumps the same row the fetch that filled it wrote, so `request_count` ranks by demand and `last_client` names the last host to ask.
+Each observation is one row keyed by `(type, pattern, package, version, decision)`, with a request count, the last client IP, and the upstream URL bodega fetched or would have fetched. The count is a count of **requests**, not of cache misses: a request the cache answers bumps the same row the fetch that filled it wrote, so `request_count` ranks by demand and `last_client` names the last host to ask. That holds for a stale copy served because no upstream is configured, and for one served because the upstream could not be reached — an outage is the window these columns are read in, and they keep moving through it.
 
 `decision` describes the allow-list's verdict on the upstream candidate, not what happened to the request. A cache hit contacts no upstream, and it is recorded under the verdict that applies to the candidate now — which is what keeps it on the same row as the miss before it. The `decision` column carries one of:
 
@@ -2032,8 +2032,9 @@ Convert a fleet to a request rate with `hosts x updates-per-hour x requests-per-
 | `admin_only` | Admin-gated read (`/api/v1/config`, `/api/v1/audit`, tokens, policies) from outside `admin_permit_cidr` |
 | `entry_frozen` | `DELETE` on a package whose every version is frozen. The caller cleared the admin gate, which is what makes the attempt worth a row |
 | `version_constraint` | A gomod or npm request for a version outside the entry's `version_constraint`. `pkg_version` carries the version that was refused, `details` the constraint and the entry's own version |
+| `push_refused` | A git smart-HTTP push against a read-only mirror, on the `info/refs?service=git-receive-pack` probe or the `git-receive-pack` POST. `pkg_name` is the namespace, `details` the repository path. The POST reaches this only from inside `admin_permit_cidr`; from anywhere else `ip_not_permitted` refuses it first |
 
-The first eight gates run in the middleware chain, before any handler; the last two are decided by the handler itself. Both write the same row, because an operator asking "who was turned away" is asking one question.
+The first eight gates run in the middleware chain, before any handler; the last three are decided by the handler itself. Both write the same row, because an operator asking "who was turned away" is asking one question.
 
 The row is written on a context detached from the request. `net/http` cancels the request context the moment a client closes the connection, so a caller that fires a request and hangs up without reading the response — ordinary scanner behavior — got its 403 and left no row, which made the rows least reliable exactly where they matter most.
 
@@ -2057,7 +2058,9 @@ Fields on every row: timestamp, event type, package type/name/version, client IP
 - **Request and response headers or bodies.** Those are a `log_level: 4` (trace) concern in the journal, not an audit record, and a header dump would carry the very credentials the denial rows are careful not to hold.
 - **Successful admin reads.** Only the refusals are rows; a permitted `GET /api/v1/audit` is journal-only.
 
-Denials record at every gate in the middleware chain, at the admin-read gate, and at the two refusals a handler decides for itself: a `DELETE` on a frozen entry (`entry_frozen`) and a version outside an entry's `version_constraint` (`version_constraint`). The `status` column names which gate refused.
+Denials record at every gate in the middleware chain, at the admin-read gate, and at the three refusals a handler decides for itself: a `DELETE` on a frozen entry (`entry_frozen`), a version outside an entry's `version_constraint` (`version_constraint`), and a git push against a read-only mirror (`push_refused`, on both the `info/refs?service=git-receive-pack` probe and the `git-receive-pack` POST). The `status` column names which gate refused.
+
+An allow-list refusal is a `cache` event with `status=policy_violation` rather than a `denied` row, and it is written wherever the refusal is decided: on the proxy path, and on the apt pool probe, which refuses a `.deb` before any fetch exists to record one.
 
 `audit_events` and `timezone` in `config.json` apply to both handles: the CLI's and the one `bodega serve` opens for itself. A filter that leaves out `denied` therefore throws away the record of every refusal the server makes, which is the one record that has no other home — the journal rotates and is not reachable through `/api/v1/audit`. `bodega serve` logs an error naming the key when it starts with such a filter. Leave `audit_events` empty unless you have a reason.
 

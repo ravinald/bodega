@@ -119,6 +119,7 @@ const (
 	// the journal is a refusal that rotates away.
 	DenialFrozenEntry       = "entry_frozen"       // DELETE on a package whose every version is frozen
 	DenialVersionConstraint = "version_constraint" // requested version outside the entry's version_constraint
+	DenialPushRefused       = "push_refused"       // git smart-HTTP push against a read-only mirror
 )
 
 // Event is a single audit record.

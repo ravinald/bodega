@@ -24,7 +24,7 @@ func (s *Server) handleHelmChart(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	setCacheImmutable(w, file)
+	w = cacheImmutableOn200(w, file)
 
 	// Parse chart name from filename: "ingress-nginx-4.0.0.tgz" → "ingress-nginx".
 	// Splitting on the last "-" and rejoining is lossless, so a prerelease

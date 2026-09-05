@@ -752,6 +752,51 @@ func TestAuditFallbackEntryCrossesArchitecture(t *testing.T) {
 	}
 }
 
+// The pool probe is the one place an allow-list refusal for a .deb can be
+// observed: there is no fetch behind it to write the row. Issue #206 — it
+// reached the discovery table and nothing else, so the same refusal was
+// answerable from GET /api/v1/audit on the proxy path and not on this one.
+func TestPoolAllowListRefusalRecordsAnAuditRow(t *testing.T) {
+	archive := newFixtureArchive(t, map[string]string{fixtureDeb: fixtureDebBody})
+	s := mirrorServer(t, archive)
+	if err := s.auditDB.InsertPolicy(t.Context(), audit.PolicyInfo{
+		ID:           "apt-allow-elsewhere",
+		RegistryType: manifest.TypeApt,
+		RuleKind:     policy.KindHost,
+		Pattern:      "archive.ubuntu.com",
+	}); err != nil {
+		t.Fatalf("insert policy: %v", err)
+	}
+	s.policy.Invalidate()
+
+	if code, _ := mirrorGetHeader(t, s, "/apt/"+fixtureDeb); code != http.StatusForbidden {
+		t.Fatalf("pool fetch = %d, want 403", code)
+	}
+
+	rows, err := s.auditDB.Query(t.Context(), audit.Filter{EventType: audit.EventCache})
+	if err != nil {
+		t.Fatalf("query audit db: %v", err)
+	}
+	var violations []audit.StoredEvent
+	for _, row := range rows {
+		if row.Status == "policy_violation" {
+			violations = append(violations, row)
+		}
+	}
+	if len(violations) != 1 {
+		t.Fatalf("policy_violation rows = %d, want 1 (%+v)", len(violations), rows)
+	}
+	if violations[0].PkgType != manifest.TypeApt {
+		t.Errorf("pkg_type = %q, want %q", violations[0].PkgType, manifest.TypeApt)
+	}
+	if !strings.Contains(violations[0].PkgName, fixtureDeb) {
+		t.Errorf("pkg_name = %q, want the refused candidate URL", violations[0].PkgName)
+	}
+	// The discovery row is still written: the two tables answer different
+	// questions and one is not a substitute for the other.
+	waitForAptRows(t, s, audit.DecisionDenied, 1)
+}
+
 // TestPoolCacheControlFollowsTheOutcome is issue #171. handleAptPool set
 // Cache-Control before it knew whether the request would succeed, and
 // http.Error does not clear the header map — so a refusal shipped

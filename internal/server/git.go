@@ -41,7 +41,7 @@ func (s *Server) handleGitBundle(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	setCacheImmutable(w, file)
+	w = cacheImmutableOn200(w, file)
 	s.proxyVersion(w, r, manifest.TypeGit, name, ref, manifest.GitKey(name, ref, release))
 }
 
