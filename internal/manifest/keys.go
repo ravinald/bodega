@@ -244,10 +244,10 @@ func lastSegment(s string) string {
 //
 // Two layouts are ambiguous by construction and resolve by a rule rather than
 // a guess. helm and cargo put name and version in one flat filename separated
-// by "-", so the split takes the last "-" whose remainder starts with a digit:
-// HelmChartKey("grafana-agent", "") and HelmChartKey("grafana", "agent") both
-// produce keys this reads as the former. apt's version lives inside the
-// filename, and a name bodega never built returns empty rather than a guess.
+// by "-", so the split takes the first "-" that opens a version; see
+// splitTrailingVersion for what qualifies and for the one case that stays
+// ambiguous. apt's version lives inside the filename, and a name bodega never
+// built returns empty rather than a guess.
 func ParseKey(key string) (typ, name, version string) {
 	switch {
 	case strings.HasPrefix(key, AptPrefix):
@@ -371,16 +371,42 @@ func AptDebIdentity(filename string) (name, version string) {
 	return "", ""
 }
 
-// splitTrailingVersion splits "<name>-<version>" at the last "-" whose
-// remainder begins with a digit. helm and cargo both flatten name and version
-// into one filename with no separator the name cannot contain, so a rule is
-// the most a reader of the key can do.
+// splitTrailingVersion splits "<name>-<version>" at the first "-" that opens a
+// version. helm and cargo both flatten name and version into one filename with
+// no separator the name cannot contain, so a rule is the most a reader of the
+// key can do.
+//
+// The anchor is the first such "-" and not the last because a prerelease
+// carries one of its own: "cert-manager-1.14.0-rc.1" split at the last "-"
+// yields the name "cert-manager-1.14.0", which is a package no operator will
+// ever type into `bodega pkg checksum clear`.
+//
+// A version opens with a digit run that ends its segment, at "." or at the end
+// of the string. Demanding the run end the segment is what leaves a name whose
+// own tail is numeric intact: "md-5-0.10.6" splits after "md-5", because "5-"
+// continues into another word while "0." does not. Neither ecosystem allows
+// "." in a package name, so a dotted digit run can only be the version.
+//
+// One case stays ambiguous: an unversioned chart whose name ends in a digit
+// segment ("md-5") splits, since a run ending the string reads the same as a
+// version. Charts are the only type that can omit a version at all.
 func splitTrailingVersion(base string) (name, version string) {
-	i := strings.LastIndex(base, "-")
-	if i <= 0 || i+1 >= len(base) || base[i+1] < '0' || base[i+1] > '9' {
-		return base, ""
+	for i := 1; i < len(base)-1; i++ {
+		if base[i] == '-' && opensVersion(base[i+1:]) {
+			return base[:i], base[i+1:]
+		}
 	}
-	return base[:i], base[i+1:]
+	return base, ""
+}
+
+// opensVersion reports whether s begins with a digit run terminated by "." or
+// by the end of s.
+func opensVersion(s string) bool {
+	i := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	return i > 0 && (i == len(s) || s[i] == '.')
 }
 
 // unsafeName reverses SafeName, restoring the slashes a stored path segment

@@ -123,8 +123,8 @@ func TestParseKeyRefusesAnUnknownPrefix(t *testing.T) {
 }
 
 // Both flat layouts put name and version in one filename with "-" between
-// them, and "-" is legal inside both names. The rule is the last "-" whose
-// remainder opens with a digit, which is what an unversioned chart depends on.
+// them, and "-" is legal inside both names and inside a prerelease version.
+// The rule is the first "-" that opens a digit run ending its segment.
 func TestParseKeySplitsFlatFilenamesOnTheVersionRule(t *testing.T) {
 	cases := []struct {
 		key           string
@@ -133,6 +133,14 @@ func TestParseKeySplitsFlatFilenamesOnTheVersionRule(t *testing.T) {
 		{HelmChartKey("grafana-agent", "0.42.0"), "grafana-agent", "0.42.0"},
 		{HelmChartKey("grafana-agent", ""), "grafana-agent", ""},
 		{CargoCrateKey("utf8-ranges", "1.0.5"), "utf8-ranges", "1.0.5"},
+		// A prerelease carries its own "-", so a rule anchored at the last one
+		// splits inside the version and files the row under a name no operator
+		// will type.
+		{HelmChartKey("cert-manager", "1.14.0-rc.1"), "cert-manager", "1.14.0-rc.1"},
+		{CargoCrateKey("serde", "1.0.0-beta.1"), "serde", "1.0.0-beta.1"},
+		// md-5 is a published crate. Its trailing digit is not a version
+		// because the run does not end the segment.
+		{CargoCrateKey("md-5", "0.10.6"), "md-5", "0.10.6"},
 	}
 	for _, tc := range cases {
 		_, name, version := ParseKey(tc.key)
