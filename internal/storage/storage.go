@@ -183,18 +183,42 @@ type prefixed struct {
 	prefix string
 }
 
-func (p *prefixed) key(k string) string { return p.prefix + k }
+// key roots k under the prefix, refusing anything that would leave the
+// namespace the prefix defines.
+//
+// The inner store validates the composed key against the backend root, which
+// is a weaker question: under prefix "cold/x/", the key "../escaped" composes
+// to "cold/escaped", lands inside the root and is accepted there. That reads
+// and writes another backend's keys through this one.
+func (p *prefixed) key(k string) (string, error) {
+	if err := ValidateKey(k); err != nil {
+		return "", err
+	}
+	return p.prefix + k, nil
+}
 
 func (p *prefixed) Get(ctx context.Context, key string) ([]byte, error) {
-	return p.inner.Get(ctx, p.key(key))
+	k, err := p.key(key)
+	if err != nil {
+		return nil, err
+	}
+	return p.inner.Get(ctx, k)
 }
 
 func (p *prefixed) GetStream(ctx context.Context, key string) (*StreamResult, error) {
-	return p.inner.GetStream(ctx, p.key(key))
+	k, err := p.key(key)
+	if err != nil {
+		return nil, err
+	}
+	return p.inner.GetStream(ctx, k)
 }
 
 func (p *prefixed) Head(ctx context.Context, key string) (*ObjectInfo, error) {
-	info, err := p.inner.Head(ctx, p.key(key))
+	k, err := p.key(key)
+	if err != nil {
+		return nil, err
+	}
+	info, err := p.inner.Head(ctx, k)
 	if info != nil {
 		info.Key = key
 	}
@@ -202,7 +226,11 @@ func (p *prefixed) Head(ctx context.Context, key string) (*ObjectInfo, error) {
 }
 
 func (p *prefixed) List(ctx context.Context, prefix string) ([]string, error) {
-	keys, err := p.inner.List(ctx, p.key(prefix))
+	k, err := p.key(prefix)
+	if err != nil {
+		return nil, err
+	}
+	keys, err := p.inner.List(ctx, k)
 	if err != nil {
 		return nil, err
 	}
@@ -214,25 +242,57 @@ func (p *prefixed) List(ctx context.Context, prefix string) ([]string, error) {
 }
 
 func (p *prefixed) Put(ctx context.Context, key string, data []byte) error {
-	return p.inner.Put(ctx, p.key(key), data)
+	k, err := p.key(key)
+	if err != nil {
+		return err
+	}
+	return p.inner.Put(ctx, k, data)
 }
 
 func (p *prefixed) PutFile(ctx context.Context, localPath, key string) error {
-	return p.inner.PutFile(ctx, localPath, p.key(key))
+	k, err := p.key(key)
+	if err != nil {
+		return err
+	}
+	return p.inner.PutFile(ctx, localPath, k)
 }
 
 func (p *prefixed) Delete(ctx context.Context, key string) error {
-	return p.inner.Delete(ctx, p.key(key))
+	k, err := p.key(key)
+	if err != nil {
+		return err
+	}
+	return p.inner.Delete(ctx, k)
 }
 
 func (p *prefixed) SyncDir(ctx context.Context, out io.Writer, localDir, keyPrefix string) (int, error) {
-	return p.inner.SyncDir(ctx, out, localDir, p.key(keyPrefix))
+	k, err := p.key(keyPrefix)
+	if err != nil {
+		return 0, err
+	}
+	return p.inner.SyncDir(ctx, out, localDir, k)
 }
 
 // Label carries the prefix so two names rooted at different prefixes of one
 // bucket are distinguishable, which is what the fan-out dedup compares.
+//
+// The prefix is cleaned rather than concatenated verbatim. "cold//x",
+// "./cold/x" and "cold/y/../x" all name the directory the local backend
+// resolves through filepath.Join, so a verbatim label gave one directory four
+// names: selectForMove's same-location refusal could not fire and
+// --delete-source removed the only copy (#189).
+//
+// Cleaning here is safe only because config.validateStorage refuses those
+// spellings at admission. s3 does not clean keys, so "cold//x/k" and
+// "cold/x/k" are two distinct objects in one bucket, and a cleaned label over
+// an s3 inner would claim an identity the bucket does not have.
 func (p *prefixed) Label() string {
-	return strings.TrimSuffix(p.inner.Label(), "/") + "/" + strings.TrimSuffix(p.prefix, "/")
+	cleaned := strings.TrimPrefix(path.Clean("/"+p.prefix), "/")
+	base := strings.TrimSuffix(p.inner.Label(), "/")
+	if cleaned == "" {
+		return base
+	}
+	return base + "/" + cleaned
 }
 
 // SpecFromConfig derives the default backend's Spec from the global config.
