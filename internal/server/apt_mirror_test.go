@@ -1069,7 +1069,7 @@ func BenchmarkCachedPoolRequest(b *testing.B) {
 
 // A mirrored .deb has to land in the checksum table under its own type and
 // name. Two things read that: aptMirroredPoolKeys, which asks the pkg_type
-// column which pool objects came from an upstream, and `bodega checksum clear
+// column which pool objects came from an upstream, and `bodega pkg checksum clear
 // apt <name>`, the only way out of a stale digest when an archive republishes
 // bytes under a version it already served. Both matched nothing while the row
 // was written by a parser that read request paths.

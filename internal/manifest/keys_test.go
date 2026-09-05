@@ -63,7 +63,7 @@ var keyRoundTrips = map[string]roundTrip{
 // TestParseKeyRoundTripsEveryType is the guard on the pair. A ninth type added
 // with a constructor and no ParseKey arm fails here rather than in production,
 // where it costs every artifact of that type its package identity and
-// `bodega checksum clear` its only filter.
+// `bodega pkg checksum clear` its only filter.
 func TestParseKeyRoundTripsEveryType(t *testing.T) {
 	for _, typ := range AllTypes {
 		want, ok := keyRoundTrips[typ]

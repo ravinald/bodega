@@ -233,7 +233,7 @@ func lastSegment(s string) string {
 // A key no constructor could have produced returns three empty strings. An
 // empty type is the caller's signal to record the key alone — a checksum row
 // with no package identity still verifies the bytes, while a name guessed from
-// an unrecognized prefix would hand `bodega checksum clear <type> <name>` rows
+// an unrecognized prefix would hand `bodega pkg checksum clear <type> <name>` rows
 // that belong to something else.
 //
 // The generated siblings each tree carries (charts/index.yaml,

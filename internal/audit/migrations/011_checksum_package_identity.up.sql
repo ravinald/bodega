@@ -4,7 +4,7 @@
 -- request-path parser over an object key. Five of the eight trees key their
 -- storage under a different string than their request prefix, so every cached
 -- apt, gomod, helm and git artifact was recorded with no type and no name, and
--- every crate was recorded as cargo/crates. `bodega checksum clear <type>
+-- every crate was recorded as cargo/crates. `bodega pkg checksum clear <type>
 -- <name>` matched none of them and reported success anyway.
 --
 -- The correction needs no fetch: s3_key was right the whole time, and
