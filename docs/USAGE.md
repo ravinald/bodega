@@ -877,11 +877,11 @@ Config files are written with mode `0600` (owner read/write only).
 
 **Resolution priority:** CLI flags > environment variables > config file > built-in defaults. Every flag in the table above is registered with an empty default so it cannot shadow the env var and config key beneath it; `--log-level` is the one exception, where `0` is both a valid level and the zero value, so bodega asks whether the flag was typed rather than reading its value.
 
-`manifest_dir` is where manifests live on the `local` backend. The built-in is `{storage_path}/manifests` and is always absolute: a relative path resolves against the process working directory, which under a systemd unit with no `WorkingDirectory=` is `/`. When the binary runs from a source tree with a `manifests/` directory beside it, that directory wins instead: a development convenience, never reached on an installed host.
+`manifest_dir` is where manifests live on the `local` backend. The built-in is `{storage_path}/manifests` and is always absolute: a relative path resolves against the process working directory, which under a systemd unit with no `WorkingDirectory=` is `/`. Nothing else is probed. A `manifests/` directory beside the binary or one level above it was reached first until an install at `/opt/bodega/bin/bodega` beside `/opt/bodega/manifests` turned that development convenience into a server reading a directory its config never named; either layout now names it with `manifest_dir`, `$BODEGA_MANIFEST_DIR` or `--manifest-dir`.
 
 Manifests sit inside `storage_path` so that one directory holds the whole repository. Artifacts already lived there; a manifest tree outside it meant `tar` on `storage_path` produced a backup that restored every package's bytes and none of its metadata.
 
-**Upgrading an install created before that default.** `--manifest-dir` used to be registered with a non-empty default, which made `manifest_dir` in the config file unreachable and sent manifests to `./manifests` relative to whatever directory bodega was started from. Check where yours are, then either move them or name them:
+**Upgrading an install created before that default.** `--manifest-dir` used to be registered with a non-empty default, which made `manifest_dir` in the config file unreachable and sent manifests to `./manifests` relative to whatever directory bodega was started from; the executable-relative probe then claimed installs whose binary sat beside a `manifests/` tree. Check where yours are, then either move them or name them:
 
 ```bash
 ls /var/lib/bodega/manifests      # {storage_path}/manifests, the new default
@@ -2130,6 +2130,8 @@ A read-only audit database used to be the quieter version of the same loss: `Rec
 ### Config editor
 
 Press `C` to open the config form. `Ctrl+S` saves, `Ctrl+T` loads defaults, `Ctrl+R` resets. Changes take effect immediately.
+
+A save writes the keys you edited, plus any key whose value differs from what the running process resolved. Fields are prefilled with that resolved config — what is in force, flags and environment included — so pressing save without touching a field records nothing, and the log line says the file is unchanged rather than claiming a save. Editing a field pins its key even when you type back the value already shown: `bodega --manifest-dir /srv/m shell` prefills `/srv/m`, and retyping it is how you make it stick. The log line names the keys that reached the file.
 
 The form edits no ACL. `deny_list`, `admin_permit_cidr` and `trusted_proxies` are seeded from the config file on first start and inert afterwards, so a field writing them to `config.json` would accept a value, save it, report success and change nothing about who the server refuses. Edit them with `bodega acl deny`, `bodega acl admin` and `bodega acl proxies`; the form says so under its title.
 

@@ -113,6 +113,13 @@ type formField struct {
 	LabelSelectOptions []string // options for the label-embedded dropdown
 	LabelSelectOpen    bool     // is the label dropdown currently showing
 	cursor             int      // cursor position within Value (for text editing)
+
+	// edited records that a keystroke changed this field, which is not the
+	// same as its value differing from the prefill. A form seeded with a
+	// resolved config value is how an operator is shown what is in force, and
+	// retyping that value is how they pin it; comparing strings cannot tell
+	// that from leaving the field alone.
+	edited bool
 }
 
 func (p *popupModel) Active() bool {
@@ -634,6 +641,7 @@ func (p *popupModel) HandleFormKey(key string) (dismiss bool) {
 			} else {
 				f.Value = "yes"
 			}
+			f.edited = true
 			if p.onChange != nil {
 				p.onChange(p)
 			}
@@ -650,6 +658,7 @@ func (p *popupModel) HandleFormKey(key string) (dismiss bool) {
 			if f.cursor > 0 && f.cursor <= len(runes) {
 				f.Value = string(runes[:f.cursor-1]) + string(runes[f.cursor:])
 				f.cursor--
+				f.edited = true
 			}
 			if p.onChange != nil {
 				p.onChange(p)
@@ -746,6 +755,7 @@ func (p *popupModel) handleSelectMenuKey(key string) (dismiss bool) {
 	case "enter", " ":
 		if p.selectCursor < len(f.Options) {
 			f.Value = f.Options[p.selectCursor]
+			f.edited = true
 		}
 		p.selectOpen = false
 		if p.onChange != nil {
@@ -774,6 +784,7 @@ func (p *popupModel) HandleFormRune(r rune) {
 		f.Value = string(runes[:f.cursor]) + string(r) + string(runes[f.cursor:])
 	}
 	f.cursor++
+	f.edited = true
 	if p.onChange != nil {
 		p.onChange(p)
 	}
