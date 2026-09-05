@@ -207,8 +207,26 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	}
 	defer up.body.Close()
 
-	spool, err := spoolUpstream(up)
+	spool, err := s.spoolUpstream(up)
 	if err != nil {
+		if reason := spoolDenialReason(err); reason != "" {
+			s.recordSpoolRefusal(r, regType, discoveryPkgName, s3Key, reason, err)
+			if status != nil && status.Exists {
+				// A cached copy beats a 503 the client has to come back for,
+				// and serving it costs no spool at all — which is the point
+				// when the spool is what ran out.
+				s.proxyS3(w, r, store, s3Key)
+				return
+			}
+			// 503 and Retry-After rather than the 502 fail() would give: this
+			// is a bound on this host, not a fault at the upstream, and an
+			// operator sent to check the upstream is being sent to the wrong
+			// place. See spoolLimiter for why the answer is a refusal and not
+			// a queue.
+			w.Header().Set("Retry-After", spoolRetryAfter)
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
 		fail(err)
 		return
 	}
@@ -396,45 +414,62 @@ func openUpstream(ctx context.Context, rawURL string) (*upstreamStream, error) {
 //
 // Disk rather than memory is what removes the size ceiling: an artifact costs
 // one copy buffer of process memory whatever its length, so a handful of
-// concurrent large fetches no longer takes the process out. The spool lives in
-// os.TempDir(), so TMPDIR is what has to hold the largest artifact bodega
-// proxies — a small tmpfs there is the one place the old limit reappears.
+// concurrent large fetches no longer takes the process out. What it costs
+// instead is disk under spool_dir, which spoolLimiter is the bound on.
 type spooledUpstream struct {
 	file   *os.File
 	size   int64
 	sha256 string
+	res    *spoolReservation
 }
 
 func (sp *spooledUpstream) path() string { return sp.file.Name() }
 
-// close removes the spool file. The name is read before the descriptor is
-// closed because that is the only handle on it: the file is not unlinked at
-// creation, since PutFile takes a path.
+// close removes the spool file and returns its bytes to the shared budget. The
+// name is read before the descriptor is closed because that is the only handle
+// on it: the file is not unlinked at creation, since PutFile takes a path.
 func (sp *spooledUpstream) close() {
 	name := sp.file.Name()
 	_ = sp.file.Close()
 	_ = os.Remove(name)
+	sp.res.release()
 }
 
-// spoolUpstream copies an upstream body to a temp file, hashing as it goes,
-// and returns it positioned at EOF.
+// spoolUpstream copies an upstream body to a file under spool_dir, hashing as
+// it goes, and returns it positioned at EOF. It is bounded on both axes by
+// s.spool: one artifact against spool_max_artifact_bytes, every fetch in
+// flight against the shared spool_max_total_bytes budget.
 //
 // A body shorter than the length the upstream declared is a cut transfer and
 // fails here rather than being cached: chunked and transparently-decompressed
 // responses report -1 and are exempt, so this only fires where the upstream
 // stated a number. Caching short bytes was the failure that made every later
 // fetch of the real artifact fail verification against the truncated digest.
-func spoolUpstream(up *upstreamStream) (*spooledUpstream, error) {
-	f, err := os.CreateTemp("", "bodega-upstream-*")
+func (s *Server) spoolUpstream(up *upstreamStream) (*spooledUpstream, error) {
+	res, err := s.spool.begin(up.contentLength)
 	if err != nil {
-		return nil, fmt.Errorf("create spool file: %w", err)
+		return nil, err
 	}
-	sp := &spooledUpstream{file: f}
+	f, err := os.CreateTemp(s.spool.dir, "bodega-upstream-*")
+	if err != nil {
+		res.release()
+		return nil, fmt.Errorf("create spool file in %s: %w", s.spool.dir, err)
+	}
+	sp := &spooledUpstream{file: f, res: res}
 
 	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(f, h), up.body)
+	sw := &spoolWriter{w: io.MultiWriter(f, h), res: res, max: s.spool.maxArtifact}
+	n, err := io.Copy(sw, up.body)
 	sp.size = n
 	if err != nil {
+		// A spool refusal is not a cut transfer and must not be reported as
+		// one: the message below tells an operator to go and check the
+		// upstream, which is the wrong place to look when the bound that
+		// fired is this host's.
+		if spoolDenialReason(err) != "" {
+			sp.close()
+			return nil, err
+		}
 		// net/http reports a cut transfer as ErrUnexpectedEOF here, before the
 		// declared-length check below ever runs, so this message has to carry
 		// the same fact: the spool is removed and nothing was cached.

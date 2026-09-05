@@ -121,6 +121,15 @@ const (
 	DenialFrozenEntry       = "entry_frozen"       // DELETE on a package whose every version is frozen
 	DenialVersionConstraint = "version_constraint" // requested version outside the entry's version_constraint
 	DenialPushRefused       = "push_refused"       // git smart-HTTP push against a read-only mirror
+
+	// Refusals that are about this host rather than about the client. They
+	// still belong in the denial table: the operator's question is "why did
+	// that fetch not happen", and an answer split across two channels is one
+	// nobody correlates. The two stay distinct because they call for opposite
+	// responses — one artifact is larger than the key allows, or the host is
+	// carrying more concurrent fetches than its spool volume was sized for.
+	DenialSpoolArtifactTooLarge = "spool_artifact_too_large" // artifact over spool_max_artifact_bytes
+	DenialSpoolBudget           = "spool_budget_exhausted"   // in-flight spools at spool_max_total_bytes
 )
 
 // Event is a single audit record.

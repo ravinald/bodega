@@ -235,6 +235,9 @@ func seedAptEntry(t *testing.T, manifestDir, storagePath string) {
 	}
 }
 
+// The spool directory is named rather than left to default under build_root,
+// which resolves to /opt/bodega for a config that sets no root: serve refuses
+// to start when it cannot create it, and an unprivileged test user cannot.
 func writeTestConfig(t *testing.T, dir, manifestDir, storagePath, logDir string, port int) {
 	t.Helper()
 	body := fmt.Sprintf(`{
@@ -244,8 +247,9 @@ func writeTestConfig(t *testing.T, dir, manifestDir, storagePath, logDir string,
   "log_dir": %q,
   "listen_addr": "127.0.0.1:%d",
   "allow_plaintext": true,
-  "apt_codename": "noble"
-}`, storagePath, manifestDir, logDir, port)
+  "apt_codename": "noble",
+  "spool_dir": %q
+}`, storagePath, manifestDir, logDir, port, filepath.Join(dir, "spool"))
 	path := filepath.Join(dir, "config.json")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)

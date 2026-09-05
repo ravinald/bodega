@@ -178,7 +178,7 @@ func TestCutTransferIsNeitherCachedNorChecksummed(t *testing.T) {
 	}
 	defer up.body.Close()
 
-	spool, err := spoolUpstream(up)
+	spool, err := spoolTestServer(t, 0, 0).spoolUpstream(up)
 	if err == nil {
 		spool.close()
 		t.Fatal("spoolUpstream accepted a body shorter than the declared Content-Length")
@@ -205,7 +205,8 @@ func TestSpoolFileIsRemoved(t *testing.T) {
 	}
 	defer up.body.Close()
 
-	spool, err := spoolUpstream(up)
+	s := spoolTestServer(t, 0, 0)
+	spool, err := s.spoolUpstream(up)
 	if err != nil {
 		t.Fatalf("spoolUpstream: %v", err)
 	}
@@ -213,5 +214,11 @@ func TestSpoolFileIsRemoved(t *testing.T) {
 	spool.close()
 	if _, err := os.Stat(name); !os.IsNotExist(err) {
 		t.Errorf("spool file %s survived close (stat err = %v)", name, err)
+	}
+	// close returns the bytes as well as the file. A spool that frees the
+	// inode and keeps its claim on the budget starves the next fetch of a
+	// resource nothing is using.
+	if st := s.spool.stats(); st.UsedBytes != 0 || st.InFlight != 0 {
+		t.Errorf("stats = %+v after close, want the budget returned", st)
 	}
 }

@@ -71,6 +71,8 @@ type Server struct {
 	adminNets    []*net.IPNet // CIDRs allowed to reach the admin surface (admin_permit_cidr)
 	adminErr     error        // set when admin_permit_cidr parses to nothing; Start refuses on it
 	auditErr     error        // set when the configured audit sink will not record; Start refuses on it
+	spool        *spoolLimiter
+	spoolErr     error // set when spool_dir cannot be created or written; Start refuses on it
 	// trustedNets are the proxies whose forwarded headers are believed.
 	// trustedNetsSet distinguishes "operator wrote an empty list" from
 	// "operator wrote nothing": the first trusts no header from anyone, the
@@ -163,6 +165,21 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 		Enabled:     cfg.ProxyCacheEnabled,
 		MetadataTTL: ttl,
 	}
+	// Proxy spool. Resolved and probed here, refused in Start: the spool is
+	// disk the server spends on behalf of every proxy client, and the default
+	// location shares a filesystem with the audit database and the local
+	// store, so an operator who is going to be surprised by where it lands
+	// should be surprised at startup rather than at the first large fetch.
+	spoolDir := cfg.ResolveSpoolDir()
+	s.spool = newSpoolLimiter(spoolDir, cfg.SpoolMaxArtifactBytes, cfg.SpoolMaxTotalBytes)
+	if err := ensureSpoolDir(spoolDir); err != nil {
+		s.spoolErr = err
+	} else {
+		logger.Info("proxy spool ready", "spool_dir", spoolDir,
+			"spool_max_artifact_bytes", cfg.SpoolMaxArtifactBytes,
+			"spool_max_total_bytes", cfg.SpoolMaxTotalBytes)
+	}
+
 	if len(cfg.DenyList) > 0 {
 		nets, err := ParseDenyList(cfg.DenyList)
 		if err != nil {
@@ -405,6 +422,10 @@ func (s *Server) Start(ctx context.Context) error {
 		return s.auditErr
 	}
 
+	if s.spoolErr != nil {
+		return s.spoolErr
+	}
+
 	if err := s.guardPlaintext(); err != nil {
 		return err
 	}
@@ -535,10 +556,17 @@ func (s *Server) recordLifecycle(ev audit.EventType, addr string, tlsMode bool) 
 	if s.auditDB == nil {
 		return
 	}
+	// The spool bounds ride on the lifecycle row so a reader of the denial
+	// table can tell a spool_budget_exhausted run from the one after someone
+	// raised the key, without a second channel to correlate against.
+	sp := s.spool.stats()
 	details, err := json.Marshal(map[string]any{
-		"addr": addr,
-		"tls":  tlsMode,
-		"pid":  os.Getpid(),
+		"addr":                     addr,
+		"tls":                      tlsMode,
+		"pid":                      os.Getpid(),
+		"spool_dir":                sp.Dir,
+		"spool_max_artifact_bytes": sp.MaxArtifactBytes,
+		"spool_max_total_bytes":    sp.BudgetBytes,
 	})
 	if err != nil {
 		details = []byte("{}")
@@ -842,6 +870,7 @@ type statusResponse struct {
 	Healthy    bool            `json:"healthy"`
 	EntryCount map[string]int  `json:"entry_count"`
 	Apt        aptStatus       `json:"apt"`
+	Spool      spoolStats      `json:"spool"`
 	S3Entries  []s3EntryStatus `json:"s3_entries,omitempty"`
 	Error      string          `json:"error,omitempty"`
 }
@@ -857,9 +886,14 @@ type s3EntryStatus struct {
 }
 
 func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
+	spool := s.spool.stats()
+	if !s.isAdminRequest(r) {
+		spool.Dir = ""
+	}
 	resp := statusResponse{
 		Healthy: true,
 		Apt:     s.aptStatusFor(r),
+		Spool:   spool,
 		EntryCount: map[string]int{
 			manifest.TypeApt:    len(s.store.ListPackages(manifest.TypeApt)),
 			manifest.TypeGit:    len(s.store.ListPackages(manifest.TypeGit)),

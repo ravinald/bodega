@@ -43,6 +43,21 @@ const (
 	// directory is derived from it, so the two must not drift.
 	DefaultStoragePath = "/var/lib/bodega"
 
+	// DefaultSpoolMaxArtifactBytes is the largest single upstream artifact the
+	// proxy will copy to disk. 8 GiB is roughly twice the biggest thing a real
+	// archive publishes as one file — a CUDA .deb or a torch wheel runs 2-4 GB
+	// — and it refuses the runaway case, which is bounded only by the 90s
+	// upstream timeout times upstream bandwidth: about 11 GB at 1 Gbps.
+	DefaultSpoolMaxArtifactBytes int64 = 8 << 30
+
+	// DefaultSpoolMaxTotalBytes is the byte budget shared by every in-flight
+	// spool. Bytes rather than a fetch count because bytes are what runs the
+	// filesystem out: eight concurrent fetches is 8 MB or 64 GB depending on
+	// what was requested, so a count tuned for one artifact size is the wrong
+	// bound for the next one. 32 GiB admits four artifacts at the per-artifact
+	// ceiling.
+	DefaultSpoolMaxTotalBytes int64 = 32 << 30
+
 	EnvBucket      = "REPO_BUCKET"
 	EnvRegion      = "AWS_REGION"
 	EnvBuildRoot   = "BOOTSTRAP_BUILD_ROOT"
@@ -114,6 +129,13 @@ type Config struct {
 	AptSigningName    string   `json:"apt_signing_name,omitempty"`  // UID name on a key made by `bodega apt key generate`
 	AptSigningEmail   string   `json:"apt_signing_email,omitempty"` // UID email on a key made by `bodega apt key generate`
 	AdminPermitCIDR   []string `json:"admin_permit_cidr,omitempty"` // CIDRs allowed to hit mutation API; default ["127.0.0.0/8","::1/128"]
+
+	// Proxy spool. spool_dir is where an upstream artifact is copied on its
+	// way to storage and the client; see ResolveSpoolDir for the default. The
+	// two ceilings are in bytes, and 0 in either means unbounded.
+	SpoolDir              string `json:"spool_dir,omitempty"`
+	SpoolMaxArtifactBytes int64  `json:"spool_max_artifact_bytes,omitempty"`
+	SpoolMaxTotalBytes    int64  `json:"spool_max_total_bytes,omitempty"`
 
 	// TrustedProxies names the peers whose X-Real-IP, X-Forwarded-For and
 	// X-Forwarded-Proto bodega will believe. It is deliberately tri-state and
@@ -526,6 +548,46 @@ func (c *Config) RootForType(typ string) string {
 	return c.BuildRoot
 }
 
+// ResolveSpoolDir names the directory the proxy copies an upstream artifact
+// through on its way to storage and the client: spool_dir, else
+// <build_root>/tmp, which is where cmd/bodega/cmd_repair_keys.go already
+// spools. Deriving it from the config rather than reading $TMPDIR is what
+// stops the artifact traffic landing on the filesystem that also holds the
+// audit database and the local store without anyone choosing it.
+//
+// os.TempDir is reachable only from a hand-built Config, since Load always
+// fills BuildRoot. It is probed and refused at startup like any other resolved
+// location, so the fallback cannot bring a server up over a spool it cannot
+// write.
+func (c *Config) ResolveSpoolDir() string {
+	if c.SpoolDir != "" {
+		return c.SpoolDir
+	}
+	if c.BuildRoot != "" {
+		return filepath.Join(c.BuildRoot, "tmp")
+	}
+	return os.TempDir()
+}
+
+// spoolCeiling resolves one of the two spool byte ceilings against the file
+// that was actually read. An absent key takes the built-in default; a key
+// written as 0 is an operator turning the ceiling off, and json.Unmarshal
+// cannot tell those two apart on an int64.
+func spoolCeiling(snap *fileSnapshot, key string, have, def int64) (int64, error) {
+	if have < 0 {
+		return 0, fmt.Errorf("%s must not be negative (got %d); write 0 to remove the ceiling", key, have)
+	}
+	if have == 0 {
+		if snap == nil {
+			return def, nil
+		}
+		if _, present := snap.raw[key]; !present {
+			return def, nil
+		}
+	}
+	return have, nil
+}
+
 // ValidateAptSuite is the rule for a suite name this server can serve, applied
 // both to the configured set and to the suites a manifest entry names. An
 // entry naming a suite refused here reaches no index under any configuration,
@@ -607,6 +669,18 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	// that document says today. An operator mirroring the index is not thereby
 	// mirroring the downloads, and needs to name both.
 	cfg.CargoDLUpstream = firstNonEmpty(cfg.CargoDLUpstream, "https://static.crates.io/crates")
+
+	// Proxy spool ceilings.
+	if cfg.SpoolMaxArtifactBytes, err = spoolCeiling(snap, "spool_max_artifact_bytes", cfg.SpoolMaxArtifactBytes, DefaultSpoolMaxArtifactBytes); err != nil {
+		return nil, err
+	}
+	if cfg.SpoolMaxTotalBytes, err = spoolCeiling(snap, "spool_max_total_bytes", cfg.SpoolMaxTotalBytes, DefaultSpoolMaxTotalBytes); err != nil {
+		return nil, err
+	}
+	if cfg.SpoolMaxTotalBytes > 0 && cfg.SpoolMaxArtifactBytes > cfg.SpoolMaxTotalBytes {
+		return nil, fmt.Errorf("spool_max_artifact_bytes (%d) is above spool_max_total_bytes (%d): no artifact that large could ever be admitted, so every fetch over the budget would be refused for a reason naming the wrong key",
+			cfg.SpoolMaxArtifactBytes, cfg.SpoolMaxTotalBytes)
+	}
 
 	// Discover mode: "" or "observe" — typo'd values fail loudly so operators
 	// don't silently lose observability. "learn" is named separately because a
@@ -1297,6 +1371,11 @@ func defaultConfigContent() []byte {
   "gomod_upstream": "https://proxy.golang.org",
   "npm_upstream": "https://registry.npmjs.org",
   "pypi_upstream": "https://pypi.org",
+
+  "_comment_spool": "spool_dir: where a proxied upstream artifact is copied on its way to storage and the client. Empty means {build_root}/tmp. bodega serve refuses to start if it cannot create the directory or write in it. spool_max_artifact_bytes caps one artifact; a declared Content-Length over it is refused before a byte moves, and an undeclared body is refused as it crosses. spool_max_total_bytes is the budget shared by every fetch in flight, and a request over it gets 503 with Retry-After rather than a queue. Write 0 in either to remove that ceiling.",
+  "spool_dir": "",
+  "spool_max_artifact_bytes": 8589934592,
+  "spool_max_total_bytes": 34359738368,
 
   "_comment_cargo_upstream": "cargo_upstream is the sparse index; cargo_dl_upstream is the separate host the crate tarballs come from. crates.io names the second in its own config.json — bodega does not fetch that at startup, so an instance mirroring the index must name both keys.",
   "cargo_upstream": "https://index.crates.io",
