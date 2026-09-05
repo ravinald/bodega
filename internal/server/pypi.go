@@ -57,11 +57,36 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pkgName := r.PathValue("package")
-	if pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, pkgName); pkg != nil && isPackageHidden(pkg) {
+	pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, pkgName)
+	if pkg != nil && isPackageHidden(pkg) {
 		http.NotFound(w, r)
 		return
 	}
 	normalized := normalizePkgName(pkgName)
+
+	// Proxy the simple index from upstream PyPI, republished onto bodega's own
+	// wheel route. Served verbatim it hands pip absolute
+	// files.pythonhosted.org links, so every client resolves through bodega and
+	// then downloads around it: nothing is cached, the allow-list never sees
+	// the artifact, and no row records the bytes that got installed. The cached
+	// object stays the upstream document; the rewrite happens on the way out,
+	// so a hit and a miss republish identically.
+	//
+	// Ahead of the cache listing rather than as its fallback: a listing built
+	// from stored keys carries only what somebody has already fetched, so the
+	// first wheel cached under a proxy-mode distribution would otherwise become
+	// the only version of it that exists for every later client. The cached
+	// copy is not lost by republishing upstream — every href lands on
+	// /pypi/wheels/, which answers from storage before it reaches the network.
+	if pkg != nil && packageMode(pkg) == manifest.ModeProxy {
+		upstream := s.pypiSimpleURL(normalized)
+		rw := &pypiIndexWriter{ResponseWriter: w, indexURL: upstream}
+		s.proxyOrCache(rw, r, s.typeStore(manifest.TypePypi), "pypi/simple/"+normalized+"/index.html", upstream, manifest.TypePypi, pkgName, pkgName, false, true)
+		if err := rw.flush(); err != nil {
+			s.logger.Warn("client read of a republished pypi index was cut short", "package", pkgName, "error", err)
+		}
+		return
+	}
 
 	keys, err := s.listFanout(r.Context(), manifest.TypePypi, manifest.PypiWheelPrefix)
 	if err != nil {
@@ -91,25 +116,6 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(wheels) == 0 {
-		// Check if this package is in proxy mode.
-		pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, pkgName)
-		if pkg != nil && packageMode(pkg) == manifest.ModeProxy {
-			// Proxy the simple index from upstream PyPI, republished onto
-			// bodega's own wheel route. Served verbatim it hands pip absolute
-			// files.pythonhosted.org links, so every client resolves through
-			// bodega and then downloads around it: nothing is cached, the
-			// allow-list never sees the artifact, and no row records the bytes
-			// that got installed. The cached object stays the upstream
-			// document; the rewrite happens on the way out, so a hit and a
-			// miss republish identically.
-			upstream := s.pypiSimpleURL(normalized)
-			rw := &pypiIndexWriter{ResponseWriter: w, indexURL: upstream}
-			s.proxyOrCache(rw, r, s.typeStore(manifest.TypePypi), "pypi/simple/"+normalized+"/index.html", upstream, manifest.TypePypi, pkgName, pkgName, false, true)
-			if err := rw.flush(); err != nil {
-				s.logger.Warn("client read of a republished pypi index was cut short", "package", pkgName, "error", err)
-			}
-			return
-		}
 		http.NotFound(w, r)
 		return
 	}

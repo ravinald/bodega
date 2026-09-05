@@ -1917,7 +1917,9 @@ crates.io names its own download root in `https://index.crates.io/config.json`, 
 
 A pypi simple index names its files by absolute URL, every one of them on `files.pythonhosted.org`. Relayed as it arrives, it points `pip` past bodega: the client resolves through the proxy and downloads around it, so nothing lands in the cache, the allow-list never sees the artifact request, no discovery or audit row records the bytes that got installed, and the checksum verification never runs.
 
-bodega rewrites each `href` onto its own `/pypi/wheels/{filename}` before serving. The cached object is still the upstream document byte for byte — the rewrite happens on the way out, so a cache hit and a cache miss republish identically and the stored copy remains evidence of what pypi published.
+bodega rewrites each `href` onto its own `/pypi/wheels/{filename}` before serving. The cached object is still the upstream document byte for byte: the rewrite happens on the way out, so a cache hit and a cache miss republish identically and the stored copy remains evidence of what pypi published.
+
+A proxy-mode distribution is republished on every request, whether or not the cache already holds one of its wheels. Only a hosted distribution gets the listing bodega generates from its own storage, which names the files it holds and nothing else. Serving that listing for a proxy-mode distribution would pin it to the first wheel anybody fetched, so `pip install six==1.16.0` would leave every other version of `six` invisible to the next client. Nothing is lost by republishing: `/pypi/wheels/` answers from storage before it resolves anything upstream, so a cached wheel still serves from the cache.
 
 Two attributes decide the client's behavior and are treated differently:
 

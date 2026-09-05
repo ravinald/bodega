@@ -158,3 +158,54 @@ func TestPypiIndexReadIsRecorded(t *testing.T) {
 		})
 	}
 }
+
+// A proxy-mode distribution republishes the upstream index for as long as it
+// stays proxy mode. Gated on an empty cache, the first wheel this item causes
+// to be stored flips the distribution onto bodega's own listing, which carries
+// only what has been fetched — so `six==1.16.0` installs, and every other
+// version of six upstream stops existing for that client.
+func TestRepublishedIndexSurvivesTheFirstCachedWheel(t *testing.T) {
+	const (
+		olderWheel = "six-1.15.0-py2.py3-none-any.whl"
+		olderRel   = "/files/aa/bb/cc/" + olderWheel
+	)
+	s := proxyingServer(t)
+	up := newRecordingUpstream(t)
+	up.route("/simple/six/", fmt.Sprintf(
+		`<!DOCTYPE html><html><body><a href="%s%s#sha256=deadbeef">%s</a><br/><a href="%s%s#sha256=feedface">%s</a><br/></body></html>`,
+		up.ts.URL, testWheelRel, testWheel, up.ts.URL, olderRel, olderWheel))
+	up.route(testWheelRel, wheelBytes)
+	up.route(olderRel, wheelBytes)
+	s.cfg.PypiUpstream = up.ts.URL
+	seedProxyPypi(t, s, "six", up.ts.URL)
+
+	if status, body := getStatusAndBody(t, s, "/pypi/wheels/"+testWheel); status != http.StatusOK {
+		t.Fatalf("caching fetch = %d, want 200 (body %q)", status, body)
+	}
+	if _, err := s.typeStore(manifest.TypePypi).Head(t.Context(), manifest.PypiWheelPrefix+testWheel); err != nil {
+		t.Fatalf("the first wheel did not cache, so this test proves nothing: %v", err)
+	}
+
+	status, body := getStatusAndBody(t, s, "/pypi/simple/six/")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %q)", status, body)
+	}
+	for _, want := range []string{
+		`href="/pypi/wheels/` + testWheel + `#sha256=deadbeef"`,
+		`href="/pypi/wheels/` + olderWheel + `#sha256=feedface"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body = %q, want %s: a cached wheel must not shrink the index to what the cache holds", body, want)
+		}
+	}
+
+	// Republishing upstream does not send the cached wheel back to the network:
+	// /pypi/wheels/ answers from storage before it resolves anything.
+	before := len(up.paths())
+	if status, got := getStatusAndBody(t, s, "/pypi/wheels/"+testWheel); status != http.StatusOK || got != wheelBytes {
+		t.Fatalf("second fetch = %d %q, want 200 and the wheel bytes", status, got)
+	}
+	if after := up.paths(); len(after) != before {
+		t.Errorf("upstream saw %v, want nothing after %d: the cached wheel must serve from storage", after[before:], before)
+	}
+}

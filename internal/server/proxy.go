@@ -641,8 +641,15 @@ func (s *Server) upstreamPolicyGate(w http.ResponseWriter, r *http.Request, regT
 		if record {
 			s.recordDiscovery(ctx, r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key, decision)
 		}
-		s.logger.Warn("upstream blocked by policy",
-			"type", regType, "candidate", policyCandidate, "url", upstreamURL)
+		// The URL is omitted rather than logged empty, for the reason the
+		// cache-miss line above omits it: on the pypi path only the resolver
+		// can produce one, and it is the refusal that stops it from running.
+		// url="" reads as a bug in the refusal to whoever is holding the log.
+		blocked := []any{"type", regType, "candidate", policyCandidate}
+		if upstreamURL != "" {
+			blocked = append(blocked, "url", upstreamURL)
+		}
+		s.logger.Warn("upstream blocked by policy", blocked...)
 		s.recordPolicyViolation(r, regType, policyCandidate, upstreamURL)
 		http.Error(w, "upstream blocked by allow-list", http.StatusForbidden)
 		return decision, false
