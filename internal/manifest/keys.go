@@ -224,3 +224,167 @@ func lastSegment(s string) string {
 	}
 	return s
 }
+
+// ParseKey inverts the constructors above: given an object key, it returns the
+// package type, name and version the key was built from. Names come back
+// canonical, slashes restored, so a name returned here is the string the
+// constructor was handed.
+//
+// A key no constructor could have produced returns three empty strings. An
+// empty type is the caller's signal to record the key alone — a checksum row
+// with no package identity still verifies the bytes, while a name guessed from
+// an unrecognized prefix would hand `bodega checksum clear <type> <name>` rows
+// that belong to something else.
+//
+// The generated siblings each tree carries (charts/index.yaml,
+// packument.json, a module's @v/list, the sparse index) come back as their
+// type with no version: they are regenerable and never checksummed, but the
+// type is still right and an untyped row costs the recovery command its
+// filter.
+//
+// Two layouts are ambiguous by construction and resolve by a rule rather than
+// a guess. helm and cargo put name and version in one flat filename separated
+// by "-", so the split takes the last "-" whose remainder starts with a digit:
+// HelmChartKey("grafana-agent", "") and HelmChartKey("grafana", "agent") both
+// produce keys this reads as the former. apt's version lives inside the
+// filename, and a name bodega never built returns empty rather than a guess.
+func ParseKey(key string) (typ, name, version string) {
+	switch {
+	case strings.HasPrefix(key, AptPrefix):
+		// dists/ is generated per request; only pool/ holds uploaded bytes.
+		if !strings.HasPrefix(key, AptPoolPrefix) {
+			return TypeApt, "", ""
+		}
+		n, v := AptDebIdentity(lastSegment(key))
+		return TypeApt, n, v
+
+	case strings.HasPrefix(key, PypiWheelPrefix):
+		// <dist>-<version>-<python>-<abi>-<platform>.whl, under an optional
+		// version directory the sync writes.
+		base := strings.TrimSuffix(lastSegment(key), ".whl")
+		if base == lastSegment(key) {
+			return TypePypi, "", ""
+		}
+		parts := strings.SplitN(base, "-", 3)
+		if len(parts) < 2 {
+			return TypePypi, base, ""
+		}
+		return TypePypi, parts[0], parts[1]
+
+	case strings.HasPrefix(key, GitPrefix):
+		dir, file, ok := strings.Cut(strings.TrimPrefix(key, GitPrefix), "/")
+		if !ok {
+			return TypeGit, "", ""
+		}
+		for _, ext := range []string{".bundle", ".tar.gz"} {
+			base, found := strings.CutSuffix(file, ext)
+			if !found {
+				continue
+			}
+			return TypeGit, unsafeName(dir), strings.TrimPrefix(base, dir+"-")
+		}
+		return TypeGit, unsafeName(dir), ""
+
+	case strings.HasPrefix(key, BinaryPrefix):
+		// <name>/<version>/<file> when versioned, <name>/<file> when not.
+		segs := strings.Split(strings.TrimPrefix(key, BinaryPrefix), "/")
+		switch len(segs) {
+		case 2:
+			return TypeBinary, unsafeName(segs[0]), ""
+		case 3:
+			return TypeBinary, unsafeName(segs[0]), segs[1]
+		}
+		return TypeBinary, "", ""
+
+	case strings.HasPrefix(key, gomodPrefix):
+		rest := strings.TrimPrefix(key, gomodPrefix)
+		idx := strings.Index(rest, "/@v/")
+		if idx < 0 {
+			return TypeGomod, "", ""
+		}
+		// The module path keeps its slashes, so it is not a safe name.
+		module, file := rest[:idx], rest[idx+len("/@v/"):]
+		for _, ext := range []string{".zip", ".info", ".mod"} {
+			if base, found := strings.CutSuffix(file, ext); found {
+				return TypeGomod, module, base
+			}
+		}
+		return TypeGomod, module, "" // list, @latest
+
+	case strings.HasPrefix(key, cargoCratePrefix):
+		base, found := strings.CutSuffix(strings.TrimPrefix(key, cargoCratePrefix), ".crate")
+		if !found {
+			return TypeCargo, "", ""
+		}
+		n, v := splitTrailingVersion(base)
+		return TypeCargo, unsafeName(n), v
+
+	case strings.HasPrefix(key, cargoIndexPrefix):
+		// Keyed by the registry path cargo requested. The trailing segment is
+		// the crate name by cargo's convention, not by anything constructed
+		// here, and config.json sits in the same place.
+		return TypeCargo, "", ""
+
+	case strings.HasPrefix(key, helmPrefix):
+		if key == HelmIndexKey {
+			return TypeHelm, "", ""
+		}
+		base, found := strings.CutSuffix(strings.TrimPrefix(key, helmPrefix), ".tgz")
+		if !found {
+			return TypeHelm, "", ""
+		}
+		n, v := splitTrailingVersion(base)
+		return TypeHelm, unsafeName(n), v
+
+	case strings.HasPrefix(key, npmPrefix):
+		dir, file, ok := strings.Cut(strings.TrimPrefix(key, npmPrefix), "/")
+		if !ok {
+			return TypeNpm, "", ""
+		}
+		base, found := strings.CutSuffix(file, ".tgz")
+		if !found {
+			return TypeNpm, unsafeName(dir), "" // packument.json
+		}
+		return TypeNpm, unsafeName(dir), strings.TrimPrefix(base, dir+"-")
+	}
+	return "", "", ""
+}
+
+// AptDebIdentity splits a pool filename into its package name and version.
+//
+// Debian names a binary package file <package>_<version>_<arch>.<ext>, with an
+// epoch's ":" percent-encoded as "%3a" because ":" is not portable in a
+// filename. Source artifacts drop the architecture field. Anything that fits
+// neither shape yields two empty strings rather than a guess: this feeds the
+// discovery rows an operator promotes from, and a wrong package name there
+// produces a manifest entry for a package that does not exist.
+func AptDebIdentity(filename string) (name, version string) {
+	for _, ext := range []string{".deb", ".udeb", ".ddeb", ".dsc"} {
+		if trimmed, found := strings.CutSuffix(filename, ext); found {
+			parts := strings.Split(trimmed, "_")
+			if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+				return "", ""
+			}
+			return parts[0], strings.ReplaceAll(strings.ReplaceAll(parts[1], "%3a", ":"), "%3A", ":")
+		}
+	}
+	return "", ""
+}
+
+// splitTrailingVersion splits "<name>-<version>" at the last "-" whose
+// remainder begins with a digit. helm and cargo both flatten name and version
+// into one filename with no separator the name cannot contain, so a rule is
+// the most a reader of the key can do.
+func splitTrailingVersion(base string) (name, version string) {
+	i := strings.LastIndex(base, "-")
+	if i <= 0 || i+1 >= len(base) || base[i+1] < '0' || base[i+1] > '9' {
+		return base, ""
+	}
+	return base[:i], base[i+1:]
+}
+
+// unsafeName reverses SafeName, restoring the slashes a stored path segment
+// collapsed to "--".
+func unsafeName(segment string) string {
+	return strings.ReplaceAll(segment, "--", "/")
+}

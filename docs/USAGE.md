@@ -440,6 +440,15 @@ Lists cached SHA-256 checksums stored in the audit database.
 
 Clears cached checksums for a package. The next fetch will recompute and store a fresh checksum. Use `--version` to clear only a specific version.
 
+The command prints how many rows it deleted, and says nothing matched when the filter found no rows. `<type>` and `<name>` are matched against the identity the proxy derived from the object key when it cached the artifact, which is what `bodega pkg checksum list` shows in its `TYPE` and `NAME` columns.
+
+```console
+$ bodega pkg checksum clear apt nginx
+Cleared 3 checksum(s) for apt/nginx
+$ bodega pkg checksum clear apt nginx
+No cached checksums matched apt/nginx; nothing was cleared.
+```
+
 ### `bodega token generate <label> [expiry <duration|date|never>] [comment]`
 
 Generates a cryptographically random API token. The raw token is displayed once and cannot be retrieved later. A SHA-256 hash (with a server-side pepper) is stored in the audit database.
@@ -1917,8 +1926,10 @@ Checksums protect against upstream tampering and bit-rot.
 - Subsequent fetches: verifies against stored checksum; fails on mismatch
 
 **Proxy path** (cached entries):
-- First proxy fetch: computes SHA-256, stores in audit DB
+- First proxy fetch: computes SHA-256, stores in audit DB under the artifact's type, name and version, all three read back out of the object key
 - Subsequent proxy fetches: verifies against stored; returns **502 Bad Gateway** on mismatch
+
+When an upstream republishes different bytes under a version it already served, every subsequent fetch answers 502 with `checksum verification failed — upstream content may be tampered`. Clearing the stored digest is the way out, and it is why the row carries package identity: `clear` deletes by type and name, and rows recorded without them could only be reached by editing the database. Stores mirrored before this release have their identity re-derived from `s3_key` once, on the first open after upgrade; the log line names the row count.
 
 **Management:**
 ```bash

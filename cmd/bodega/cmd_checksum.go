@@ -124,7 +124,7 @@ The next fetch will re-compute and store a fresh checksum.`,
 						if err := db.ClearChecksum(ctx, cs.S3Key); err != nil {
 							return err
 						}
-						fmt.Printf("Cleared checksum for %s/%s@%s\n", pkgType, pkgName, version)
+						fmt.Fprintf(cmd.OutOrStdout(), "Cleared checksum for %s/%s@%s\n", pkgType, pkgName, version)
 						found = true
 					}
 				}
@@ -133,10 +133,15 @@ The next fetch will re-compute and store a fresh checksum.`,
 				}
 			} else {
 				// Clear all versions.
-				if err := db.ClearChecksumsByPackage(ctx, pkgType, pkgName); err != nil {
+				n, err := db.ClearChecksumsByPackage(ctx, pkgType, pkgName)
+				if err != nil {
 					return err
 				}
-				fmt.Printf("Cleared all checksums for %s/%s\n", pkgType, pkgName)
+				if n == 0 {
+					fmt.Fprintf(cmd.OutOrStdout(), "No cached checksums matched %s/%s; nothing was cleared.\n", pkgType, pkgName)
+					return nil
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "Cleared %d checksum(s) for %s/%s\n", n, pkgType, pkgName)
 			}
 
 			return nil

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 	"github.com/ravinald/bodega/internal/storage"
 )
@@ -489,7 +490,7 @@ func (s *Server) verifyProxyChecksum(ctx context.Context, s3Key, computed string
 
 	if stored == nil {
 		// First fetch — store the computed checksum.
-		pkgType, pkgName, pkgVersion := parsePackagePath("/" + s3Key)
+		pkgType, pkgName, pkgVersion := manifest.ParseKey(s3Key)
 		if err := s.auditDB.StoreChecksum(ctx, s3Key, pkgType, pkgName, pkgVersion, "sha256", computed, "computed"); err != nil {
 			s.logger.Warn("failed to store checksum", "key", s3Key, "error", err)
 		} else {

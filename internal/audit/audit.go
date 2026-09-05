@@ -32,6 +32,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -306,9 +307,24 @@ func OpenWithSink(path string, sc SinkConfig) (*DB, error) {
 			_ = db.Close()
 			return nil, fmt.Errorf("set WAL mode: %w", err)
 		}
-		if err := runMigrations(db); err != nil {
+		from, err := runMigrations(db)
+		if err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("migrate audit db: %w", err)
+		}
+		// Migration 011 corrects identity the request-path parser got wrong on
+		// every cached artifact of seven of the eight ecosystems. It reads only
+		// s3_key, so it runs here on the upgrade that crosses it rather than
+		// costing every open a full scan of a table that grows with the cache.
+		if from < checksumIdentityVersion {
+			n, err := backfillChecksumIdentity(context.Background(), db)
+			if err != nil {
+				_ = db.Close()
+				return nil, fmt.Errorf("backfill checksum package identity: %w", err)
+			}
+			if n > 0 {
+				slog.Info("checksum rows re-derived from their object key", "rows", n, "migration", checksumIdentityVersion)
+			}
 		}
 	}
 
@@ -478,13 +494,24 @@ func (a *DB) ClearChecksum(ctx context.Context, s3Key string) error {
 	return nil
 }
 
-// ClearChecksumsByPackage removes all stored checksums for a package.
-func (a *DB) ClearChecksumsByPackage(ctx context.Context, pkgType, pkgName string) error {
-	_, err := a.db.ExecContext(ctx,
+// ClearChecksumsByPackage removes all stored checksums for a package and
+// returns how many rows it deleted. Zero is not an error here — the caller is
+// an operator escaping a checksum mismatch, and they need to be told the
+// filter matched nothing rather than read a success message over a table that
+// still holds the stale digest.
+func (a *DB) ClearChecksumsByPackage(ctx context.Context, pkgType, pkgName string) (int64, error) {
+	result, err := a.db.ExecContext(ctx,
 		"DELETE FROM checksums WHERE pkg_type = ? AND pkg_name = ?",
 		pkgType, pkgName,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // ---- API Token Management ---------------------------------------------------

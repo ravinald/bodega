@@ -656,9 +656,9 @@ func TestAptDebIdentity(t *testing.T) {
 		{"nginx.deb", "", ""},
 		{"_1.0_amd64.deb", "", ""},
 	} {
-		name, version := aptDebIdentity(tc.file)
+		name, version := manifest.AptDebIdentity(tc.file)
 		if name != tc.name || version != tc.version {
-			t.Errorf("aptDebIdentity(%q) = (%q, %q), want (%q, %q)", tc.file, name, version, tc.name, tc.version)
+			t.Errorf("manifest.AptDebIdentity(%q) = (%q, %q), want (%q, %q)", tc.file, name, version, tc.name, tc.version)
 		}
 	}
 }
@@ -1064,5 +1064,61 @@ func BenchmarkCachedPoolRequest(b *testing.B) {
 				b.Logf("discovery rows dropped: %d of %d requests", dropped, b.N)
 			}
 		})
+	}
+}
+
+// A mirrored .deb has to land in the checksum table under its own type and
+// name. Two things read that: aptMirroredPoolKeys, which asks the pkg_type
+// column which pool objects came from an upstream, and `bodega checksum clear
+// apt <name>`, the only way out of a stale digest when an archive republishes
+// bytes under a version it already served. Both matched nothing while the row
+// was written by a parser that read request paths.
+func TestMirroredPoolFetchIsCheckSummedUnderItsPackage(t *testing.T) {
+	kr, err := aptsign.Generate("fixture archive", "archive@fixture.invalid", aptsign.KeyEd25519)
+	if err != nil {
+		t.Fatalf("generate fixture key: %v", err)
+	}
+	objects := fixtureDists(t, kr, fixturePackages(fixtureDeb, fixtureDebBody))
+	objects[fixtureDeb] = fixtureDebBody
+	archive := newFixtureArchive(t, objects)
+	s := mirrorServer(t, archive)
+
+	if code, _ := mirrorGet(t, s, "/apt/"+fixtureDeb); code != http.StatusOK {
+		t.Fatalf("pool fetch = %d, want 200", code)
+	}
+
+	ctx := t.Context()
+	rows, err := s.auditDB.ListChecksums(ctx, manifest.TypeApt, "")
+	if err != nil {
+		t.Fatalf("list apt checksums: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("apt checksum rows = %d, want 1 — the mirrored .deb is not filed under its type (%+v)", len(rows), rows)
+	}
+	row := rows[0]
+	if row.S3Key != manifest.AptKey(fixtureDeb) {
+		t.Errorf("s3_key = %q, want %q", row.S3Key, manifest.AptKey(fixtureDeb))
+	}
+	if row.PkgName != "nginx" || row.PkgVersion != "1.24.0-2ubuntu7.1" {
+		t.Errorf("identity = %q/%q, want nginx/1.24.0-2ubuntu7.1", row.PkgName, row.PkgVersion)
+	}
+	if row.Source != "computed" {
+		t.Errorf("source = %q, want computed — aptMirroredPoolKeys filters on it", row.Source)
+	}
+
+	// The recovery command's query, against the row the fetch just wrote.
+	cleared, err := s.auditDB.ClearChecksumsByPackage(ctx, manifest.TypeApt, "nginx")
+	if err != nil {
+		t.Fatalf("clear apt/nginx: %v", err)
+	}
+	if cleared != 1 {
+		t.Errorf("cleared = %d, want 1 — clear reported success over a row it never matched", cleared)
+	}
+	left, err := s.auditDB.ListChecksums(ctx, manifest.TypeApt, "")
+	if err != nil {
+		t.Fatalf("re-list apt checksums: %v", err)
+	}
+	if len(left) != 0 {
+		t.Errorf("apt checksum rows after clear = %d, want 0", len(left))
 	}
 }

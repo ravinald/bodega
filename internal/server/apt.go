@@ -587,18 +587,13 @@ func (s *Server) aptMirroredPoolKeys(ctx context.Context) (map[string]bool, erro
 	if s.auditDB == nil {
 		return nil, errors.New("apt upstreams are configured but no audit database is open, so a cached upstream .deb cannot be told from a built one; entries without _pool_path stay out of the index until the audit database is reachable")
 	}
-	// Listed untyped, then filtered on the key prefix. The pkg_type column
-	// cannot answer this: verifyProxyChecksum derives it with
-	// parsePackagePath, which reads a request path, and no case there matches
-	// the "packages/apt/" key prefix — so every mirrored .deb is recorded with
-	// an empty type. The key is the column that is right by construction.
-	rows, err := s.auditDB.ListChecksums(ctx, "", "")
+	rows, err := s.auditDB.ListChecksums(ctx, manifest.TypeApt, "")
 	if err != nil {
 		return nil, fmt.Errorf("list mirrored apt checksums: %w", err)
 	}
 	mirrored := make(map[string]bool)
 	for _, row := range rows {
-		if row.Source == "computed" && strings.HasPrefix(row.S3Key, manifest.AptPoolPrefix) {
+		if row.Source == "computed" {
 			mirrored[row.S3Key] = true
 		}
 	}

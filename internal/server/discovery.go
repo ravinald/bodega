@@ -312,7 +312,7 @@ func pkgVersionFromKey(key string) string {
 		// these are the rows that record what a fleet's dependency closure
 		// actually pulled — a blank version there costs the aggregation the
 		// only thing that distinguishes one install from the next.
-		_, version := aptDebIdentity(path.Base(key))
+		_, version := manifest.AptDebIdentity(path.Base(key))
 		return version
 	case strings.HasPrefix(key, "pypi/wheels/"):
 		// pypi/wheels/<version>/<dist>-<version>-<...>.whl

@@ -171,7 +171,7 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, poo
 	// The resolver answers with the archive root, which is what the route
 	// cache keys on: the pool path is already in hand and re-deriving it from
 	// a stored full URL would be a second parse of the same string.
-	name, _ := aptDebIdentity(path.Base(poolPath))
+	name, _ := manifest.AptDebIdentity(path.Base(poolPath))
 	s.serveAptMirror(w, r, store, key, base+"/"+poolPath, name, true)
 }
 
@@ -198,7 +198,7 @@ func (s *Server) recordAptPoolHit(r *http.Request, poolPath, key string) {
 			"pool_path", poolPath)
 		return
 	}
-	name, _ := aptDebIdentity(path.Base(poolPath))
+	name, _ := manifest.AptDebIdentity(path.Base(poolPath))
 	s.recordCacheHit(r.Context(), r, manifest.TypeApt, upstream, upstream, name, key)
 }
 
@@ -268,7 +268,7 @@ func (s *Server) aptResolvePoolUpstream(w http.ResponseWriter, r *http.Request, 
 	// canceled client still stops the network work it was waiting on.
 	verdictCtx, cancel := auditContext(r)
 	defer cancel()
-	name, version := aptDebIdentity(path.Base(poolPath))
+	name, version := manifest.AptDebIdentity(path.Base(poolPath))
 	candidates := s.cfg.AptPoolUpstreams()
 	var refused []string
 	for _, base := range candidates {
@@ -417,26 +417,4 @@ func aptByHash(rest string) bool {
 	return rest == "by-hash" ||
 		strings.HasPrefix(rest, "by-hash/") ||
 		strings.Contains(rest, "/by-hash/")
-}
-
-// aptDebIdentity splits a pool filename into its package name and version.
-//
-// Debian names a binary package file <package>_<version>_<arch>.<ext>, with an
-// epoch's ":" percent-encoded as "%3a" because ":" is not portable in a
-// filename. Source artifacts drop the architecture field. Anything that fits
-// neither shape yields two empty strings rather than a guess: this feeds the
-// discovery rows an operator promotes from, and a wrong package name there
-// produces a manifest entry for a package that does not exist.
-func aptDebIdentity(filename string) (name, version string) {
-	for _, ext := range []string{".deb", ".udeb", ".ddeb", ".dsc"} {
-		if strings.HasSuffix(filename, ext) {
-			filename = strings.TrimSuffix(filename, ext)
-			parts := strings.Split(filename, "_")
-			if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
-				return "", ""
-			}
-			return parts[0], strings.ReplaceAll(strings.ReplaceAll(parts[1], "%3a", ":"), "%3A", ":")
-		}
-	}
-	return "", ""
 }
