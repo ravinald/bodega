@@ -218,22 +218,27 @@ The rule exists because `log_level` defaults to `0` and `internal/logging/level.
 
 `Error` here does not mean the process failed. It means the running server is not doing what the config asked, which is the one thing a `journalctl -u bodega` with no arguments has to show. What is on the wrong side of the line stays on the wrong side for years, because nothing fails and no test catches it — a test that raises the verbosity passes against every one of these defects, so the tests assert on output captured at `log_level: 0`.
 
-Currently logged at `Error` under this rule:
+Currently logged at `Error` under this rule, from `serve`, `newServer` and `Start` before the listener binds. Runtime `Error` lines on the request path are not startup conditions and are not listed:
 
 | Condition | What changes | Site |
 |-----------|--------------|------|
 | Storage backend fails to construct | Every package route answers 503; the API and `/healthz` still serve | `startupStorage`, `cmd/bodega/cmd_serve.go` |
+| `deny_list` has an unparseable entry | The whole deny list is dropped, so every address it named is served | `newServer`, `internal/server/server.go` |
+| `trusted_proxies` has an unparseable entry | The whole list is dropped, so `X-Forwarded-For` is ignored and every request is attributed to the proxy | `newServer`, `internal/server/server.go` |
 | No packages loaded | Every repository index publishes as empty | `cmd/bodega/cmd_serve.go` |
 | Plaintext authorized on `:443` | Every request and response is in the clear on the port clients read as TLS | `guardPlaintext`, `internal/server/server.go` |
-| A retired `tls_autocert: true` with no cert pair | The key that promised TLS promises nothing; the server binds in the clear or refuses | `reportRetiredTLSKeys`, `cmd/bodega/cmd_serve.go` |
+| A retired `tls_autocert: true`, or `--tls-autocert`/`--tls-domain`, with no cert pair | The option that promised TLS promises nothing; the server binds in the clear or refuses | `reportRetiredTLSKeys`, `cmd/bodega/cmd_serve.go` |
 | Pepper file unreadable | Token auth does not work | `newServer`, `internal/server/server.go` |
 | `audit_events` omits `denied` | No refusal the server makes is recorded, and the journal is the only copy | `newServer`, `internal/server/server.go` |
 | `audit_sink` is write-only | `GET /api/v1/audit` answers 501 and the discovery reads refuse, rather than returning an empty page | `newServer`, `internal/server/server.go` |
 | `git` or `git-http-backend` absent | The smart-HTTP route is never registered, so `git clone` 404s; the bundle route is unaffected | `resolveGitTool`, `internal/server/githttp.go` |
+| apt signing key present but unusable | The apt repository is signed with the previously loaded key, or not at all | `loadAptSigner`, `internal/server/apt.go` |
+| apt signing key loaded but its public half will not render | The key is never installed, so `Signed-By:` has nothing to point at and clients fall back to `[trusted=yes]` | `loadAptSigner`, `internal/server/apt.go` |
+| apt signing key loaded but its keyring will not render | The key is never installed, so the repository is served unsigned | `loadAptSigner`, `internal/server/apt.go` |
 
 Two audit conditions moved past this rule and are now **fatal for `serve`**: an audit store that will not open, and an `audit_db` the process cannot write. Both used to log at `Error` and continue, which left a server that answers `/healthz` while dropping the record of every request it refuses. Held on `Server.auditErr` and returned from `Start` before the listener binds, the same shape `adminErr` already had. An unset `audit_db` is not one of them: that is an install that asked for no audit trail.
 
-Left at `Warn` on purpose, because what gets served is what was asked for: an authorized plaintext listener off `:443` (the documented reverse-proxy deployment), a retired `tls_autocert: true` on a host whose `tls_cert`/`tls_key` are serving, and the ACL disagreement line, where the database is the documented owner and is doing what the operator told it — the config file's copy is inert by design, not degraded.
+Left below `Error` on purpose, because what gets served is what was asked for: an authorized plaintext listener off `:443` (the documented reverse-proxy deployment), a retired `tls_autocert: true` on a host whose `tls_cert`/`tls_key` are serving, and the ACL disagreement line, where the database is the documented owner and is doing what the operator told it — the config file's copy is inert by design, not degraded. Those three are `Warn`. `no apt signing key installed` is `Info`, one step lower again: an absent key is a configuration and not a fault, unsigned is a documented mode with a `[trusted=yes]` sources line the banner prints, and every install that never runs `bodega apt key generate` would otherwise open with a line about a key it does not want. The neighboring case where a key _was_ loaded and is now gone from every search path stays `Warn`: serving does not change until the restart that drops it.
 
 ## Filling the catalog
 
@@ -454,7 +459,7 @@ One option: a cert/key pair in `tls_cert` and `tls_key`. Minimum TLS 1.3.
 
 bodega has no ACME client and does not plan one. `tls_autocert` and `tls_domain` were accepted by the config and the flag set and then refused at startup, which is worse than absent: an operator configured TLS, got a start failure, and had no way to reach the feature the message implied existed. The refusal was right and the offer was not, so the offer is gone. The deployment that prompted the question runs behind a firewall whose 443 is allowlisted, and `autocert` validates over TLS-ALPN-01 on 443 or HTTP-01 on a port 80 open to the whole internet, so neither challenge was reachable there anyway. Use `certbot`, or terminate TLS at a proxy in front and set `public_url`.
 
-A config file that still carries `tls_autocert: true` logs it at startup rather than dropping it silently: `Save` preserves keys it did not parse, so the value survives and goes on looking like a setting in force.
+Both halves of the retirement report rather than vanish, and neither is silent. `Save` preserves keys it did not parse, so a config file that still carries `tls_autocert: true` goes on looking like a setting in force until startup says otherwise. `--tls-autocert` and `--tls-domain` stay registered hidden and deprecated for the same reason in reverse: unregistered they gave an upgraded unit file `unknown flag: --tls-autocert` and exit 1, and under `Restart=always` that is a crash loop whose only output names the flag and nothing to set instead. Hidden keeps them off `--help`, so nothing is offered; `MarkDeprecated` prints one line at parse time, and `reportRetiredTLSKeys` prints the same next step the config key gets. Nothing reads the values — only whether they were given.
 
 ### Manifest integrity
 

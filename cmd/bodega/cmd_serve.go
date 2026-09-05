@@ -6,9 +6,11 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/logging"
@@ -119,7 +121,7 @@ output continues to respect log_level in the config.`,
 			if tlsKey != "" {
 				cfg.TLSKey = tlsKey
 			}
-			reportRetiredTLSKeys(cfg, logger)
+			reportRetiredTLSKeys(cfg, retiredTLSFlags(cmd.Flags()), logger)
 			// Gated on Changed rather than on the value, so --allow-plaintext=false
 			// turns off a config file that set it true. --tls-cert and --tls-key
 			// resolve on the value instead, which is harmless only because their
@@ -158,6 +160,7 @@ output continues to respect log_level in the config.`,
 	cmd.Flags().BoolVar(&allowPlain, "allow-plaintext", false, "Serve without TLS; required when tls_cert/tls_key are unset (config: allow_plaintext)")
 	cmd.Flags().StringVar(&publicURL, "public-url", "", fmt.Sprintf("Base URL clients reach this server at, e.g. https://bodega.example.com (env: %s)", config.EnvPublicURL))
 	cmd.Flags().BoolVar(&quiet, "quiet", false, "Suppress the stderr startup banner (log_level output is unaffected)")
+	registerRetiredTLSFlags(cmd.Flags())
 	return cmd
 }
 
@@ -185,23 +188,70 @@ func startupStorage(ctx context.Context, cfg *config.Config, logger *slog.Logger
 	return stores
 }
 
-// reportRetiredTLSKeys says that a config file still carrying tls_autocert is
-// carrying a key nothing reads.
+// retiredTLSFlagNames are the serve flags the ACME retirement removed, in the
+// order an operator would read them off a unit file.
+var retiredTLSFlagNames = []string{"tls-autocert", "tls-domain"}
+
+// registerRetiredTLSFlags keeps the removed flags parseable.
+//
+// Unregistering them turned an upgraded unit file into "Error: unknown flag:
+// --tls-autocert" and exit 1, which under Restart=always is a crash loop whose
+// only output names the flag and nothing to set instead. Hidden and deprecated
+// keeps them off --help while reportRetiredTLSKeys answers the question the
+// operator actually has. Nothing reads the values.
+func registerRetiredTLSFlags(flags *pflag.FlagSet) {
+	flags.Bool("tls-autocert", false, "Retired; bodega has no ACME client")
+	flags.String("tls-domain", "", "Retired; bodega has no ACME client")
+	for _, name := range retiredTLSFlagNames {
+		if err := flags.MarkDeprecated(name, "bodega has no ACME client; see the startup log for what to set instead"); err != nil {
+			panic(err)
+		}
+	}
+}
+
+// retiredTLSFlags returns the retired flags this command line carried, spelled
+// the way they were typed.
+func retiredTLSFlags(flags *pflag.FlagSet) []string {
+	var given []string
+	for _, name := range retiredTLSFlagNames {
+		if flags.Changed(name) {
+			given = append(given, "--"+name)
+		}
+	}
+	return given
+}
+
+// reportRetiredTLSKeys says that a start still carrying the ACME options is
+// carrying options nothing reads, whether they arrived on the command line or
+// in the config file.
 //
 // Save preserves keys it did not parse, so retiring the option left the value
 // sitting in the file looking like a setting in force. The level splits on
 // whether serving changes: with a certificate pair the listener does what the
-// operator wanted and only the key is dead, so Warn. Without one, the config
-// that used to say "get a certificate automatically" now says nothing, and
-// this server is about to refuse to bind or serve in the clear.
-func reportRetiredTLSKeys(cfg *config.Config, logger *slog.Logger) {
-	raw, ok := cfg.RawFileValue("tls_autocert")
-	if !ok || string(raw) != "true" {
+// operator wanted and only the option is dead, so Warn. Without one, what used
+// to say "get a certificate automatically" now says nothing, and this server is
+// about to refuse to bind or serve in the clear.
+//
+// The command line wins the naming when both halves carry it: that is what the
+// operator just typed, and it is what the next start will carry again.
+func reportRetiredTLSKeys(cfg *config.Config, retiredFlags []string, logger *slog.Logger) {
+	given := retiredFlags
+	if len(given) == 0 {
+		if raw, ok := cfg.RawFileValue("tls_autocert"); ok && string(raw) == "true" {
+			given = []string{"tls_autocert"}
+		}
+	}
+	if len(given) == 0 {
 		return
 	}
-	const msg = "tls_autocert was removed and is ignored; bodega has no ACME client"
+	was, it := "was", "it"
+	if len(given) > 1 {
+		was, it = "were", "them"
+	}
+	msg := fmt.Sprintf("%s %s removed and nothing reads %s; bodega has no ACME client",
+		strings.Join(given, " and "), was, it)
 	if cfg.TLSCert != "" && cfg.TLSKey != "" {
-		logger.Warn(msg+" — tls_cert and tls_key are serving this listener; delete the key",
+		logger.Warn(msg+" — tls_cert and tls_key are serving this listener; drop "+it,
 			"config", config.ConfigPath())
 		return
 	}
