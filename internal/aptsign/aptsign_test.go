@@ -97,6 +97,79 @@ func TestSignaturesUseSHA512(t *testing.T) {
 	}
 }
 
+// TestArmorCarriesTheCRC24Checksum is #214. gpgv 2.4.4, current on Ubuntu
+// 24.04, reads the -----END dashes as base64 payload when the footer is
+// missing and exits 2 after reporting a good signature for every key. Both
+// counts are checked because the clearsign path armors one block whatever the
+// key count, so a single-key pass proves nothing about a rotation window.
+func TestArmorCarriesTheCRC24Checksum(t *testing.T) {
+	one := testKey(t)
+	two := &KeyRing{entities: append(append(openpgp.EntityList{}, one.entities...), testKey(t).entities...)}
+
+	for _, kr := range []struct {
+		name string
+		ring *KeyRing
+	}{{"one key", one}, {"two keys", two}} {
+		signed, err := kr.ring.ClearSign([]byte(release))
+		if err != nil {
+			t.Fatalf("%s: ClearSign: %v", kr.name, err)
+		}
+		assertArmorChecksum(t, kr.name+" InRelease", signed)
+
+		sig, err := kr.ring.DetachSign([]byte(release))
+		if err != nil {
+			t.Fatalf("%s: DetachSign: %v", kr.name, err)
+		}
+		assertArmorChecksum(t, kr.name+" Release.gpg", sig)
+	}
+}
+
+// assertArmorChecksum requires a "=<4 base64 chars>" line immediately before
+// the armor trailer, which is where RFC 4880 puts the CRC24 and where gpgv
+// looks for it.
+func assertArmorChecksum(t *testing.T, what string, armored []byte) {
+	t.Helper()
+	lines := strings.Split(strings.TrimRight(string(armored), "\n"), "\n")
+	end := len(lines) - 1
+	if lines[end] != "-----END PGP SIGNATURE-----" {
+		t.Fatalf("%s does not end on the armor trailer, got %q:\n%s", what, lines[end], armored)
+	}
+	crc := lines[end-1]
+	if !strings.HasPrefix(crc, "=") || len(crc) != 5 {
+		t.Errorf("%s carries no CRC24 checksum line before the trailer, got %q; gpgv 2.4.4 exits 2 on this:\n%s", what, crc, armored)
+	}
+}
+
+// TestClearSignSurvivesAnArmorHeaderInTheBody guards the anchor
+// reArmorSignature splits on. clearsign dash-escapes a body line opening with
+// "-", so a Release carrying the literal armor header is still one document
+// with one signature block. Splitting on the bare marker lands inside the
+// escaped line and fails on the message text ("illegal base64 data at input
+// byte 0"), which takes the whole suite unsigned.
+func TestClearSignSurvivesAnArmorHeaderInTheBody(t *testing.T) {
+	kr := testKey(t)
+	body := "Origin: bodega\n-----BEGIN PGP SIGNATURE-----\nSuite: noble\n"
+	signed, err := kr.ClearSign([]byte(body))
+	if err != nil {
+		t.Fatalf("ClearSign: %v", err)
+	}
+	block, _ := clearsign.Decode(signed)
+	if block == nil {
+		t.Fatal("clearsign.Decode returned no block")
+	}
+	if string(block.Plaintext) != body {
+		t.Errorf("clearsigned body != Release\n got: %q\nwant: %q", block.Plaintext, body)
+	}
+	assertArmorChecksum(t, "InRelease with an armor header in the body", signed)
+	pub, err := kr.PublicKey()
+	if err != nil {
+		t.Fatalf("PublicKey: %v", err)
+	}
+	if _, err := openpgp.CheckDetachedSignature(readArmoredPublic(t, pub), bytes.NewReader(block.Bytes), block.ArmoredSignature.Body, nil); err != nil {
+		t.Errorf("signature does not verify: %v", err)
+	}
+}
+
 // TestDualSignVerifiesUnderEitherKey is the rotation window: apt accepts an
 // InRelease when any one signature verifies, so a client holding only the old
 // key and a client holding only the new one both pass.
