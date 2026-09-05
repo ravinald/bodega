@@ -1061,6 +1061,18 @@ Every command that reads or writes an artifact resolves through the same root: `
     No local apt artifacts found under /opt/bodega/apt-repo — skipping
 ```
 
+**Upgrading an install that set one of the last four keys.** `gomod_root`, `helm_root` and `npm_root` used to reach `bodega build repair` alone, and `cargo_root` reached nothing at all, so the build wrote under `build_root` while the key said otherwise. All four now root the build, which points an install that set one at a directory holding none of the artifacts it already has. Nothing is lost: the files stay where they were written. `bodega build status` reports those entries absent, and `sync` and `upload` name the empty directory they walked. Move each tree once:
+
+```bash
+# Only for a key you actually set. /opt/bodega is the default build_root.
+sudo mv /opt/bodega/gomod  "$GOMOD_ROOT/gomod"
+sudo mv /opt/bodega/charts "$HELM_ROOT/charts"
+sudo mv /opt/bodega/npm    "$NPM_ROOT/npm"
+sudo mv /opt/bodega/cargo  "$CARGO_ROOT/cargo"
+```
+
+Or clear the key and keep everything under `build_root`. `apt_root`, `git_root`, `pypi_root` and `binary_root` need none of this: the build path already carried those four.
+
 **Gap:** `custom_paths` gates none of this. The build path reads each root directly, so a root left in the config file stays in force after the flag is turned off. `config.RootForType` applies the gate and has no callers.
 
 ### Audit database
