@@ -1,0 +1,15 @@
+-- Checksum rows carry package identity again, and the derivation moved.
+--
+-- verifyProxyChecksum used to fill pkg_type and pkg_name by running the
+-- request-path parser over an object key. Five of the eight trees key their
+-- storage under a different string than their request prefix, so every cached
+-- apt, gomod, helm and git artifact was recorded with no type and no name, and
+-- every crate was recorded as cargo/crates. `bodega pkg checksum clear <type>
+-- <name>` matched none of them and reported success anyway.
+--
+-- The correction needs no fetch: s3_key was right the whole time, and
+-- manifest.ParseKey inverts the constructors that wrote it. That inverse is
+-- Go, so this file carries no statements — backfillChecksumIdentity runs once
+-- against the same function the write path calls, rather than a second
+-- derivation in SQLite string expressions that would be free to disagree with
+-- it. The version bump here is what tells a store it has not run yet.

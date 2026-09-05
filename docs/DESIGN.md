@@ -357,6 +357,10 @@ The `checksum_verified` field tracks whether the checksum was confirmed against 
 
 For proxy mode, the server verifies checksums on immutable resources (versioned archives) and records mismatches in the audit trail.
 
+Each cached row is keyed by its object key and also carries the package type, name and version, so `bodega pkg checksum list --type` and `bodega pkg checksum clear <type> <name>` have something to filter on. That identity is derived by `manifest.ParseKey`, the inverse of the key constructors in the same file — not by the request-path parser in `internal/server/middleware.go`, which reads a different string. Seven of the eight trees key their storage under a string the request-path parser does not recognize: apt, gomod, helm, git and cargo reached the table with no type and no name at all, and npm and pypi with a name assembled out of the wrong path segments. Only binary came out right, and `checksum clear` matched nothing for the rest. `TestParseKeyRoundTripsEveryType` builds a key for every member of `manifest.AllTypes` with its constructor and reads it back, so a ninth ecosystem cannot ship a constructor without the arm that inverts it.
+
+helm and cargo are the two trees whose key flattens name and version into one filename, and `-` is legal inside both a chart name and a prerelease version. `ParseKey` splits at the first `-` that opens a digit run ending at `.` or at the end of the name, so `cert-manager-1.14.0-rc.1.tgz` reads as `cert-manager` at `1.14.0-rc.1` and the crate `md-5-0.10.6.crate` keeps its numeric tail. One shape has no answer from the key alone: an unversioned chart whose name ends in a digit segment reads that segment as a version. Charts are the only type that can omit a version, so nothing else is exposed to it.
+
 ### Where the CIDR lists live
 
 `admin_permit_cidr`, `deny_list` and `trusted_proxies` live in the audit database, in `acl_lists` and `acl_entries` (migration `008`). They are the only runtime values that have moved out of `config.json` so far; `docs-internal/CONFIG_TO_DB_MIGRATION.md` scopes the rest.

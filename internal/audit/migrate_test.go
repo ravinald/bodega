@@ -10,6 +10,8 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database/sqlite"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
+
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 func TestMigrationsFreshOpen(t *testing.T) {
@@ -409,4 +411,171 @@ func migrator(t *testing.T, raw *sql.DB) *migrate.Migrate {
 		t.Fatalf("migrate instance: %v", err)
 	}
 	return m
+}
+
+// preIdentityRows are checksum rows as the request-path parser wrote them,
+// measured against parsePackagePath rather than assumed: five types reached
+// the table with no identity at all, npm with the whole remainder of the key
+// as its name, and pypi with the wheel's version directory glued to the front
+// of the package name. Only binary came out right.
+var preIdentityRows = []struct {
+	key             string
+	typ, name, verz string
+}{
+	{"packages/apt/pool/main/n/nginx/nginx_1.24.0-2ubuntu7.1_amd64.deb", "", "", ""},
+	{"gomod/github.com/aws/aws-sdk-go-v2/@v/v1.30.0.zip", "", "", ""},
+	{"charts/ingress-nginx-4.11.2.tgz", "", "", ""},
+	{"repos/github.com--ravinald--bodega/github.com--ravinald--bodega-v1.2.0.bundle", "", "", ""},
+	{"cargo/crates/serde-1.0.210.crate", "cargo", "serde-1.0.210.crate", ""},
+	{"npm/lodash/lodash-4.17.21.tgz", "npm", "lodash/lodash-4.17.21.tgz", ""},
+	{"pypi/wheels/1.26.0/boto3-1.26.0-py3-none-any.whl", "pypi", "1.26.0/boto3", "1.26.0"},
+	{"binaries/aws-cli/2.15.0/awscliv2.zip", "binary", "aws-cli", "2.15.0"},
+}
+
+// seedPreIdentityChecksums writes preIdentityRows through raw SQL, which is
+// the only way to reproduce them: StoreChecksum takes the identity from its
+// caller, and every caller now derives it with manifest.ParseKey.
+func seedPreIdentityChecksums(t *testing.T, raw *sql.DB) {
+	t.Helper()
+	for _, row := range preIdentityRows {
+		if _, err := raw.Exec(
+			`INSERT INTO checksums (s3_key, pkg_type, pkg_name, pkg_version, algorithm, value, source)
+			 VALUES (?, ?, ?, ?, 'sha256', 'deadbeef', 'computed')`,
+			row.key, row.typ, row.name, row.verz,
+		); err != nil {
+			t.Fatalf("seed checksum %s: %v", row.key, err)
+		}
+	}
+}
+
+// TestBackfillDerivesWhatParseKeyDoes is the pin between the one-time
+// correction and the write path. The backfill is Go rather than SQL precisely
+// so both read manifest.ParseKey; this asserts every row it left behind
+// matches what the write path would store for the same key today, which is the
+// only property that keeps a re-fetch from rewriting what the migration just
+// fixed.
+func TestBackfillDerivesWhatParseKeyDoes(t *testing.T) {
+	raw, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer func() { _ = raw.Close() }()
+
+	m := migrator(t, raw)
+	if err := m.Migrate(checksumIdentityVersion - 1); err != nil {
+		t.Fatalf("migrate to %d: %v", checksumIdentityVersion-1, err)
+	}
+	seedPreIdentityChecksums(t, raw)
+
+	n, err := backfillChecksumIdentity(context.Background(), raw)
+	if err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+	// Seven of the eight seeds are wrong; binary was already right and a
+	// backfill that rewrote it would be touching rows it has no reason to.
+	if n != 7 {
+		t.Errorf("backfilled rows = %d, want 7", n)
+	}
+
+	rows, err := raw.Query(`SELECT s3_key, pkg_type, pkg_name, pkg_version FROM checksums`)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	defer rows.Close()
+	seen := 0
+	for rows.Next() {
+		var key, typ, name, verz string
+		if err := rows.Scan(&key, &typ, &name, &verz); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		seen++
+		wantType, wantName, wantVersion := manifest.ParseKey(key)
+		if typ != wantType || name != wantName || verz != wantVersion {
+			t.Errorf("row %s = (%q, %q, %q), want ParseKey's (%q, %q, %q)",
+				key, typ, name, verz, wantType, wantName, wantVersion)
+		}
+	}
+	if seen != len(preIdentityRows) {
+		t.Errorf("rows after backfill = %d, want %d — the correction dropped rows", seen, len(preIdentityRows))
+	}
+
+	// Idempotent: a second pass finds nothing left to correct, which is what
+	// makes the version gate an optimization rather than the only guard.
+	again, err := backfillChecksumIdentity(context.Background(), raw)
+	if err != nil {
+		t.Fatalf("second backfill: %v", err)
+	}
+	if again != 0 {
+		t.Errorf("second backfill touched %d rows, want 0", again)
+	}
+}
+
+// The correction has to reach a store on the upgrade that crosses 011 without
+// anyone running a command, because the operator who needs it is the one
+// staring at a checksum mismatch. Open is that path.
+func TestOpenBackfillsChecksumIdentityOnUpgrade(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	m := migrator(t, raw)
+	if err := m.Migrate(checksumIdentityVersion - 1); err != nil {
+		t.Fatalf("migrate to %d: %v", checksumIdentityVersion-1, err)
+	}
+	seedPreIdentityChecksums(t, raw)
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw handle: %v", err)
+	}
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("open at 011: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	// The apt row is the one B15's workaround existed for: it is what
+	// aptMirroredPoolKeys now asks the pkg_type column to answer.
+	apt, err := db.ListChecksums(ctx, manifest.TypeApt, "nginx")
+	if err != nil {
+		t.Fatalf("list apt checksums: %v", err)
+	}
+	if len(apt) != 1 {
+		t.Fatalf("apt/nginx rows = %d, want 1", len(apt))
+	}
+	if apt[0].PkgVersion != "1.24.0-2ubuntu7.1" {
+		t.Errorf("apt version = %q, want the one in the .deb filename", apt[0].PkgVersion)
+	}
+
+	for _, tc := range []struct{ typ, name, verz string }{
+		{manifest.TypeGomod, "github.com/aws/aws-sdk-go-v2", "v1.30.0"},
+		{manifest.TypeHelm, "ingress-nginx", "4.11.2"},
+		{manifest.TypeGit, "github.com/ravinald/bodega", "v1.2.0"},
+		{manifest.TypeCargo, "serde", "1.0.210"},
+		{manifest.TypeNpm, "lodash", "4.17.21"},
+		{manifest.TypePypi, "boto3", "1.26.0"},
+		{manifest.TypeBinary, "aws-cli", "2.15.0"},
+	} {
+		got, err := db.ListChecksums(ctx, tc.typ, tc.name)
+		if err != nil {
+			t.Fatalf("list %s/%s: %v", tc.typ, tc.name, err)
+		}
+		if len(got) != 1 {
+			t.Errorf("%s/%s rows = %d, want 1", tc.typ, tc.name, len(got))
+			continue
+		}
+		if got[0].PkgVersion != tc.verz {
+			t.Errorf("%s/%s version = %q, want %q", tc.typ, tc.name, got[0].PkgVersion, tc.verz)
+		}
+	}
+
+	// And the point of the whole item: the recovery command now matches.
+	cleared, err := db.ClearChecksumsByPackage(ctx, manifest.TypeApt, "nginx")
+	if err != nil {
+		t.Fatalf("clear apt/nginx: %v", err)
+	}
+	if cleared != 1 {
+		t.Errorf("cleared = %d, want 1", cleared)
+	}
 }

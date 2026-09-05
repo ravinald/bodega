@@ -443,8 +443,12 @@ func TestClearChecksumsByPackage(t *testing.T) {
 	_ = db.StoreChecksum(ctx, "npm/lodash/lodash-4.18.tgz", "npm", "lodash", "4.18.0", "sha256", "bbb", "computed")
 	_ = db.StoreChecksum(ctx, "npm/react/react-18.tgz", "npm", "react", "18.0.0", "sha256", "ccc", "computed")
 
-	if err := db.ClearChecksumsByPackage(ctx, "npm", "lodash"); err != nil {
+	n, err := db.ClearChecksumsByPackage(ctx, "npm", "lodash")
+	if err != nil {
 		t.Fatalf("ClearChecksumsByPackage: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("deleted = %d, want 2 — the count is what the operator is told", n)
 	}
 
 	lodash, _ := db.ListChecksums(ctx, "npm", "lodash")
@@ -455,6 +459,16 @@ func TestClearChecksumsByPackage(t *testing.T) {
 	react, _ := db.ListChecksums(ctx, "npm", "react")
 	if len(react) != 1 {
 		t.Errorf("react checksums = %d, want 1 (should not be affected)", len(react))
+	}
+
+	// A filter matching nothing is not an error, and the zero is the whole
+	// signal: an operator clearing a stale digest has to know it did not.
+	n, err = db.ClearChecksumsByPackage(ctx, "npm", "lodash")
+	if err != nil {
+		t.Fatalf("second ClearChecksumsByPackage: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("deleted = %d on an empty match, want 0", n)
 	}
 }
 

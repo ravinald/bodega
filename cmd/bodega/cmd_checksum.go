@@ -34,9 +34,9 @@ func newChecksumListCmd(gf *globalFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List cached checksums",
-		Example: `  bodega checksum list
-  bodega checksum list --type gomod
-  bodega checksum list --type npm --name lodash`,
+		Example: `  bodega pkg checksum list
+  bodega pkg checksum list --type gomod
+  bodega pkg checksum list --type npm --name lodash`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig(gf)
 			if err != nil {
@@ -93,8 +93,8 @@ func newChecksumClearCmd(gf *globalFlags) *cobra.Command {
 		Short: "Clear cached checksums for a package",
 		Long: `clear removes cached checksums for the specified package.
 The next fetch will re-compute and store a fresh checksum.`,
-		Example: `  bodega checksum clear gomod github.com/aws/aws-sdk-go-v2
-  bodega checksum clear npm lodash`,
+		Example: `  bodega pkg checksum clear gomod github.com/aws/aws-sdk-go-v2
+  bodega pkg checksum clear npm lodash`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pkgType, pkgName := args[0], args[1]
@@ -124,7 +124,7 @@ The next fetch will re-compute and store a fresh checksum.`,
 						if err := db.ClearChecksum(ctx, cs.S3Key); err != nil {
 							return err
 						}
-						fmt.Printf("Cleared checksum for %s/%s@%s\n", pkgType, pkgName, version)
+						fmt.Fprintf(cmd.OutOrStdout(), "Cleared checksum for %s/%s@%s\n", pkgType, pkgName, version)
 						found = true
 					}
 				}
@@ -133,10 +133,15 @@ The next fetch will re-compute and store a fresh checksum.`,
 				}
 			} else {
 				// Clear all versions.
-				if err := db.ClearChecksumsByPackage(ctx, pkgType, pkgName); err != nil {
+				n, err := db.ClearChecksumsByPackage(ctx, pkgType, pkgName)
+				if err != nil {
 					return err
 				}
-				fmt.Printf("Cleared all checksums for %s/%s\n", pkgType, pkgName)
+				if n == 0 {
+					fmt.Fprintf(cmd.OutOrStdout(), "No cached checksums matched %s/%s; nothing was cleared.\n", pkgType, pkgName)
+					return nil
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "Cleared %d checksum(s) for %s/%s\n", n, pkgType, pkgName)
 			}
 
 			return nil
