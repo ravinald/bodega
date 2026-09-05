@@ -121,7 +121,7 @@ bodega repair check                    # detect only, no changes
 
 Phase 4 is the only way to clear a version-less apt entry. `bodega pkg create apt` in package-name mode stages one before the upstream version is known and fills it once the lookup returns; one left over is addressable by nothing, because `pkg remove`, `pkg delete`, `hide` and `freeze` all name a version. A package whose entries are *all* version-less is reported and left alone — that is a staging record, not a leftover.
 
-Phase 5 corrects what `bodega discover promote --as manifest` wrote while the wheel handler composed `https://pypi.org/packages/<filename>`, a path pypi.org has never served. Nothing reads the field today, so the stored URL breaks no fetch; it is rewritten because promotion never revisits a version it already wrote, and the entry would otherwise carry a URL that 404s for as long as it exists. An entry pointing anywhere else, including an operator's own index, is left untouched. See [Upstream hosts](#upstream-hosts) for how a wheel is resolved now.
+Phase 5 corrects what `bodega discover promote --as manifest` wrote while the wheel handler composed `<index>/packages/<filename>`, a path pypi.org has never served. Nothing reads the field today, so the stored URL breaks no fetch; it is rewritten because promotion never revisits a version it already wrote, and the entry would otherwise carry a URL nothing can fetch for as long as it exists. The match is on the shape, `<scheme>://<host>/packages/<file>`, on any host — an operator's own index that serves that path is rewritten to its root too, which is what the field means there as well. Entries of any other shape are left untouched. See [Upstream hosts](#upstream-hosts) for how a wheel is resolved now.
 
 ### `bodega repair keys [--dry-run] [--delete-source] [--type TYPE]`
 
@@ -588,7 +588,7 @@ An audit database written under the retired `discover_mode: "learn"` also holds 
 | apt | `/apt/dists/{codename}/...`, `/apt/pool/...` under a mirrored codename | every request. Metadata rows carry `<codename>/<path>` as the package and no version, except by-hash entries, which collapse to `<codename>/by-hash` — the path is a digest naming no package, and left whole it sizes the `PACKAGE` column in `discover show` past the width of the terminal. The digest is still on the row, in the upstream URL; pool rows carry the package name and version parsed from the `.deb` filename, and together they are the dependency closure of what the fleet installed |
 | cargo | sparse index, crate download | every request |
 | npm | packument, tarball | every request; `no_manifest` on a tarball for an unknown package |
-| pypi | simple index, wheel | every request; `no_manifest` on a wheel for an unknown distribution |
+| pypi | simple index, wheel | every request, including the read of the upstream simple index a wheel is resolved through; `no_manifest` on a wheel for an unknown distribution |
 | gomod | `/go/...` | every request; `no_manifest` on a module with no entry |
 | helm | `/helm/charts/*.tgz` | every request; `no_manifest` on a chart with no entry, with an empty upstream URL (a chart repo is named per version entry, so with no entry there is no URL to record) |
 | git | `/git/{namespace}/...` | one row per clone under an `open` namespace, with an empty version. A clone is two requests, an `info/refs` GET and a `git-upload-pack` POST, and both pass the allow-list; only the `info/refs` leg is recorded, so a git count means the same thing as every other type's. `no_manifest` on an uncataloged repository under a `catalog` one; `no_namespace` on a first segment naming no `git_upstreams` entry, with the namespace as both the package and the pattern |
@@ -1907,11 +1907,24 @@ Five flat keys name the registries a proxying instance fetches from. They are no
 |-----|---------|-----------------------|
 | `gomod_upstream` | `https://proxy.golang.org` | The whole module proxy protocol: `@v/list`, `@v/{version}.info`, `.mod` and `.zip`, all on one host |
 | `npm_upstream` | `https://registry.npmjs.org` | Packuments and tarballs, both on one host |
-| `pypi_upstream` | `https://pypi.org` | The PEP 503 index root. bodega reads `/simple/{dist}/` under it and fetches the artifact URL that page lists, which is on `files.pythonhosted.org` under a content-hash path. A wheel URL cannot be composed from a filename, so a request for a file the index does not list is a 404 naming the index that was read |
+| `pypi_upstream` | `https://pypi.org` | The PEP 503 index root. bodega reads `/simple/{dist}/` under it and fetches the artifact URL that page lists, which is on `files.pythonhosted.org` under a content-hash path. A wheel URL cannot be composed from a filename, so a request for a file the index does not list is a 404 naming the index that was read. What bodega serves at its own `/pypi/simple/{dist}/` is that document republished, not relayed: see [Republishing a proxied index](#republishing-a-proxied-index) |
 | `cargo_upstream` | `https://index.crates.io` | The sparse index, and nothing else. A crate tarball request to this host is a 404 |
 | `cargo_dl_upstream` | `https://static.crates.io/crates` | Crate tarballs. bodega appends `/{crate}/{version}/download` |
 
 crates.io names its own download root in `https://index.crates.io/config.json`, and bodega does not read it. Fetching that document at startup would make `bodega serve` fail to bind because a registry was unreachable, and an operator mirroring the index is not thereby mirroring the tarballs: point the two keys wherever each actually lives.
+
+#### Republishing a proxied index
+
+A pypi simple index names its files by absolute URL, every one of them on `files.pythonhosted.org`. Relayed as it arrives, it points `pip` past bodega: the client resolves through the proxy and downloads around it, so nothing lands in the cache, the allow-list never sees the artifact request, no discovery or audit row records the bytes that got installed, and the checksum verification never runs.
+
+bodega rewrites each `href` onto its own `/pypi/wheels/{filename}` before serving. The cached object is still the upstream document byte for byte — the rewrite happens on the way out, so a cache hit and a cache miss republish identically and the stored copy remains evidence of what pypi published.
+
+Two attributes decide the client's behavior and are treated differently:
+
+- The `#sha256=` fragment survives. It is `pip`'s integrity check on the artifact, and dropping it would have clients install bytes they cannot verify.
+- `data-dist-info-metadata` and `data-core-metadata` (PEP 658, PEP 714) are dropped. Both promise that `<href>.metadata` is fetchable, and only `files.pythonhosted.org` publishes that file; bodega resolves a wheel by matching its filename against the index, which lists no `.whl.metadata` entry. Carried forward, `pip` 26.2.1 fails the install outright rather than falling back — `ERROR: 404 Client Error: Not Found for url: .../six-1.16.0-py2.py3-none-any.whl.metadata`. Dropped, the same client downloads the whole wheel through the proxy, which costs one metadata round trip per install and is the fetch that fills the cache and reaches the allow-list.
+
+Everything else on the anchor, `data-requires-python` included, passes through untouched.
 
 The allow-list checks the package name for `pypi`, `npm` and `gomod`, so `bodega policy add pypi <dist>` keeps working across the two pypi hosts. `cargo` is name-scoped the same way, and a rule constrains the crate rather than the host either key names.
 
