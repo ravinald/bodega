@@ -4,21 +4,37 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/policy"
 )
+
+// requireEcosystem refuses a policy row for an ecosystem the named gate cannot
+// evaluate. The two gates fail differently on an uncovered ecosystem, so the
+// caller supplies what actually happens: OSV short-circuits to pass and the
+// operator believes a gate is on that has never run, while age warns on every
+// version. consequence names which.
+func requireEcosystem(eco string, covered []string, gate, consequence string) error {
+	if slices.Contains(covered, eco) {
+		return nil
+	}
+	return fmt.Errorf("the %s does not cover ecosystem %q: %s; set one of %s instead",
+		gate, eco, consequence, strings.Join(covered, ", "))
+}
 
 func newPolicyOSVCmd(gf *globalFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "osv",
 		Short: "OSV vulnerability gate per ecosystem",
 		Long: `Query api.osv.dev for every imported (ecosystem, name, version)
-and flag or block based on the per-ecosystem policy. OSV coverage
-currently maps to npm, pypi, and gomod; other ecosystems pass through.
+and flag or block based on the per-ecosystem policy. OSV coverage maps
+npm, pypi, gomod and cargo. Any other ecosystem has no OSV identifier,
+so set refuses it rather than writing a row the gate never reads.
 
   bodega policy osv set npm block
   bodega policy osv set pypi warn
@@ -36,6 +52,10 @@ func newPolicyOSVSetCmd(gf *globalFlags) *cobra.Command {
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			eco, action := args[0], strings.ToLower(args[1])
+			if err := requireEcosystem(eco, policy.OSVEcosystems(), "OSV gate",
+				"the row would be stored and never read, leaving the gate silently off"); err != nil {
+				return err
+			}
 			if action != "warn" && action != "block" && action != "ignore" {
 				return fmt.Errorf("action must be warn|block|ignore, got %q", action)
 			}

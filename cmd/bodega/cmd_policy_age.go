@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/policy"
 )
 
 func newPolicyAgeCmd(gf *globalFlags) *cobra.Command {
@@ -20,8 +21,9 @@ func newPolicyAgeCmd(gf *globalFlags) *cobra.Command {
 		Long: `Configure a minimum-publish-age gate for each package ecosystem.
 
 A version is rejected (or flagged) when its upstream publish timestamp is
-newer than the ecosystem's minimum age. Ecosystems without a reliable
-upstream timestamp (apt, binary, git, helm) are unaffected.
+newer than the ecosystem's minimum age. Coverage is npm, pypi, gomod and
+cargo. Ecosystems without a reliable upstream timestamp (apt, binary, git,
+helm) have no source to date a version against, so set refuses them.
 
   bodega policy age set npm 7d warn
   bodega policy age set pypi 72h block
@@ -42,6 +44,10 @@ overwrites the existing row.`,
 		Args: cobra.ExactArgs(3),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			eco, rawDur, action := args[0], args[1], strings.ToLower(args[2])
+			if err := requireEcosystem(eco, policy.AgeEcosystems(), "age gate",
+				"there is no upstream publish timestamp to date a version against, so every version would warn"); err != nil {
+				return err
+			}
 			dur, err := parseAgeDuration(rawDur)
 			if err != nil {
 				return err

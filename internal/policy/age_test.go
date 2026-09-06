@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -154,4 +155,50 @@ func contains(haystack, needle string) bool {
 		}
 	}
 	return false
+}
+
+func TestAgePolicy_CargoDatedFromCratesIO(t *testing.T) {
+	published := time.Now().Add(-3 * time.Hour)
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		fmt.Fprintf(w, `{"version":{"num":"0.1.44","created_at":%q}}`,
+			published.UTC().Format(time.RFC3339Nano))
+	}))
+	defer srv.Close()
+
+	store := &fakeAgeStore{policies: map[string]audit.AgePolicy{
+		manifest.TypeCargo: {Ecosystem: manifest.TypeCargo, MinAgeSeconds: int64((7 * 24 * time.Hour).Seconds()), Action: ActionBlock},
+	}}
+	ck := NewAgeChecker(store)
+	ck.CratesBase = srv.URL
+
+	r := ck.Check(context.Background(),
+		&manifest.PackageManifest{Name: "time", Type: manifest.TypeCargo},
+		&manifest.VersionEntry{Version: "0.1.44"})
+	if r.Action != ActionBlock {
+		t.Fatalf("3h-old crate under a 7d policy blocks; got %+v", r)
+	}
+	if gotPath != "/api/v1/crates/time/0.1.44" {
+		t.Errorf("crates.io version endpoint, got %q", gotPath)
+	}
+}
+
+func TestAgeEcosystems_MatchesDispatch(t *testing.T) {
+	want := []string{manifest.TypeCargo, manifest.TypeGomod, manifest.TypeNpm, manifest.TypePypi}
+	got := AgeEcosystems()
+	if len(got) != len(want) {
+		t.Fatalf("AgeEcosystems() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("AgeEcosystems() = %v, want %v", got, want)
+		}
+	}
+	// An ecosystem `policy age set` refuses must also be one publishedAt
+	// cannot date, or the refusal and the gate disagree.
+	_, err := (&AgeChecker{}).publishedAt(context.Background(), manifest.TypeApt, "bash", "5.2")
+	if err == nil || !strings.Contains(err.Error(), "no upstream timestamp source") {
+		t.Errorf("apt has no timestamp source; got err=%v", err)
+	}
 }

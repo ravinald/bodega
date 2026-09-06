@@ -564,6 +564,81 @@ Removes a rule. Tries by ID first; falls back to deleting by pattern, scoped to 
 
 Walks every manifest in the store and reports any entry whose upstream URL or package name would be rejected by the current policy. Exits with code 1 on any violation — suitable for CI.
 
+### `bodega policy osv <set|list|remove>`
+
+Queries `api.osv.dev` for every `(ecosystem, name, version)` an import carries and warns or blocks on the per-ecosystem policy.
+
+```bash
+bodega policy osv set cargo block
+bodega policy osv set npm warn
+bodega policy osv list
+bodega policy osv remove npm
+```
+
+Coverage is the set of registry types with an OSV ecosystem identifier:
+
+| Type | OSV ecosystem |
+|------|---------------|
+| npm | `npm` |
+| pypi | `PyPI` |
+| gomod | `Go` |
+| cargo | `crates.io` |
+
+`apt`, `binary`, `git` and `helm` have no OSV identifier. `set` refuses them:
+
+```
+$ bodega policy osv set helm block
+Error: the OSV gate does not cover ecosystem "helm": the row would be stored and never read, leaving the gate silently off; set one of cargo, gomod, npm, pypi instead
+```
+
+Earlier versions wrote that row, printed `Set helm OSV policy: block`, and then passed every helm version, because the checker short-circuits on any type outside the table above. Nothing reported the gap. The refusal replaces a gate the operator believed was on.
+
+A version with OSV records is stamped on its `VersionEntry.Metadata`, so the finding follows the version into the manifest rather than living only in the audit event:
+
+| Key | Value |
+|-----|-------|
+| `vetting.osv.vulns` | comma-separated OSV ids, sorted |
+| `vetting.osv.severity` | JSON object keyed by OSV id, each value the record's `severity` array as OSV returned it |
+
+`vetting.osv.severity` is present only when at least one record carried a score, and ids OSV scored nothing for are absent from it; `vetting.osv.vulns` is the full list either way. A version matching several records at different severities keeps them apart by id, so a reader ranking findings parses the stamp instead of querying OSV a second time.
+
+```json
+{"GHSA-xxxx-yyyy-zzzz":[{"type":"CVSS_V3","score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}]}
+```
+
+### `bodega policy age <set|list|remove>`
+
+Rejects or flags a version whose upstream publish timestamp is newer than the ecosystem's minimum age, which is the cheapest defense against a freshly published malicious release.
+
+```bash
+bodega policy age set npm 7d warn
+bodega policy age set cargo 72h block
+bodega policy age list
+bodega policy age remove npm
+```
+
+`min-age` takes the Go duration shapes plus a plain `<N>d` for days. The action is `warn`, `block` or `ignore`. One rule per ecosystem; `set` overwrites.
+
+Coverage is the set of registry types with an upstream endpoint that carries a publish timestamp:
+
+| Type | Source |
+|------|--------|
+| npm | packument `time[<version>]` on `registry.npmjs.org` |
+| pypi | earliest `urls[].upload_time_iso_8601` on `pypi.org` |
+| gomod | `Time` in the proxy's `@v/<version>.info` |
+| cargo | `version.created_at` on `crates.io/api/v1/crates/<name>/<version>` |
+
+`apt`, `binary`, `git` and `helm` have no such source. `set` refuses them:
+
+```
+$ bodega policy age set apt 7d warn
+Error: the age gate does not cover ecosystem "apt": there is no upstream publish timestamp to date a version against, so every version would warn; set one of cargo, gomod, npm, pypi instead
+```
+
+The two gates failed differently before they refused. OSV passed silently. Age never did: a missing timestamp is a `warn` with the ecosystem named, so an apt policy made every apt version noisy rather than invisible. Refusing the row up front is a usability fix on that side and a security fix on the OSV side.
+
+An upstream that is reachable but has no timestamp for the version warns rather than blocking, on the same reasoning: a registry outage should not fail an import closed.
+
 ### `bodega discover ...`
 
 Discovery records what clients reached for that bodega could not serve from its own manifests, so an operator can turn a real installation run into allow-list rules or manifest entries instead of writing them from memory.
