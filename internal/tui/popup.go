@@ -209,6 +209,107 @@ Form editor:
   Up/Down    Move between fields
   j          Open raw JSON editor`
 
+// helpGutter separates two help columns.
+const helpGutter = 3
+
+// renderHelpColumns lays the help sections out in as few columns as fit the
+// screen height, so the popup grows sideways instead of running off the top and
+// bottom of a terminal that cannot scroll it. Sections are never split, and the
+// order down a column then across matches the single-column reading order.
+func renderHelpColumns(text string, screenWidth, screenHeight int) string {
+	blocks := strings.Split(strings.TrimRight(text, "\n"), "\n\n")
+
+	// The box costs 2 rows of border and 2 of padding; leave 2 more so the
+	// popup does not sit flush against the top and bottom of the screen.
+	availH := screenHeight - 6
+	if availH < 1 {
+		availH = 1
+	}
+	availW := screenWidth - 8
+	if availW < 1 {
+		availW = 1
+	}
+
+	for n := 1; n <= len(blocks); n++ {
+		cols := packHelpColumns(blocks, n)
+		if len(cols) < n && n > 1 {
+			break // no further split is possible
+		}
+		w, h := helpColumnsSize(cols)
+		if h <= availH && w <= availW {
+			return joinHelpColumns(cols)
+		}
+		if w > availW {
+			// Wider will not help; take the tallest layout that still fits
+			// across, which is the one before this.
+			if n == 1 {
+				return text
+			}
+			return joinHelpColumns(packHelpColumns(blocks, n-1))
+		}
+	}
+	return joinHelpColumns(packHelpColumns(blocks, len(blocks)))
+}
+
+// packHelpColumns fills n columns with whole blocks, aiming for equal heights.
+func packHelpColumns(blocks []string, n int) [][]string {
+	total := 0
+	for _, b := range blocks {
+		total += lipgloss.Height(b) + 1 // the blank line between blocks
+	}
+	target := (total + n - 1) / n
+
+	cols := make([][]string, 0, n)
+	cur := []string{}
+	curH := 0
+	for i, b := range blocks {
+		h := lipgloss.Height(b) + 1
+		remaining := len(blocks) - i
+		// Start a new column once this one has met its share, as long as
+		// there are enough blocks left to fill the columns still empty.
+		if curH > 0 && curH+h > target && len(cols) < n-1 && remaining >= n-len(cols) {
+			cols = append(cols, cur)
+			cur = []string{}
+			curH = 0
+		}
+		cur = append(cur, b)
+		curH += h
+	}
+	if len(cur) > 0 {
+		cols = append(cols, cur)
+	}
+	return cols
+}
+
+// helpColumnsSize returns the rendered width and height of a packed layout.
+func helpColumnsSize(cols [][]string) (int, int) {
+	width, height := 0, 0
+	for i, col := range cols {
+		text := strings.Join(col, "\n\n")
+		if h := lipgloss.Height(text); h > height {
+			height = h
+		}
+		width += lipgloss.Width(text)
+		if i < len(cols)-1 {
+			width += helpGutter
+		}
+	}
+	return width, height
+}
+
+// joinHelpColumns renders the packed columns side by side, tops aligned.
+func joinHelpColumns(cols [][]string) string {
+	rendered := make([]string, 0, len(cols))
+	for i, col := range cols {
+		text := strings.Join(col, "\n\n")
+		if i < len(cols)-1 {
+			text = lipgloss.NewStyle().PaddingRight(helpGutter).Render(text)
+		}
+		rendered = append(rendered, text)
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, rendered...)
+}
+
 // View renders the popup centered over the given screen dimensions.
 func (p *popupModel) View(screenWidth, screenHeight int) string {
 	if p.kind == popupNone {
@@ -227,7 +328,7 @@ func (p *popupModel) View(screenWidth, screenHeight int) string {
 	var content string
 	switch p.kind {
 	case popupHelp:
-		content = helpText
+		content = renderHelpColumns(helpText, screenWidth, screenHeight)
 
 	case popupConfirm:
 		content = p.message + "\n\n[Y] confirm   [N] cancel"

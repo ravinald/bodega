@@ -2257,6 +2257,8 @@ With the Log pane focused:
 
 Both queries are case-insensitive substring matches, applied on every keystroke, and they match the text a line prints rather than the escape sequences that color it. The pane title carries the query and the match position, `/apt (2/17)` for a find and `filter:apt (17)` for a filter. `n` and `N` wrap at the ends. The current match is highlighted, which is also how you spot a query with no hits: the count reads `(0/0)` and nothing is marked.
 
+The `?` help lays its sections into as many columns as the terminal is wide enough to hold, fewest first, because the full list is 55 rows and a popup cannot scroll. Sections are never split across a column break, and the reading order runs down a column then across. A terminal too narrow for two columns gets the single-column list back, taller than the screen.
+
 ### Config editor
 
 Press `C` to open the config form. `Ctrl+S` saves, `Ctrl+T` loads defaults, `Ctrl+R` resets. Changes take effect immediately.

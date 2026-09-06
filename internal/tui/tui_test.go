@@ -1666,3 +1666,83 @@ func TestElideHead(t *testing.T) {
 		}
 	}
 }
+
+// --- help layout ---
+
+// helpBlockTitles are the section headers of helpText, which the column layout
+// must keep intact and complete.
+func helpBlockTitles(t *testing.T) []string {
+	t.Helper()
+	var titles []string
+	for _, block := range strings.Split(strings.TrimRight(helpText, "\n"), "\n\n") {
+		titles = append(titles, strings.SplitN(block, "\n", 2)[0])
+	}
+	if len(titles) < 5 {
+		t.Fatalf("helpText split into %d blocks, expected the section list", len(titles))
+	}
+	return titles
+}
+
+func TestHelpFitsAWideScreen(t *testing.T) {
+	const w, h = 160, 40
+	p := popupModel{kind: popupHelp}
+	lines := strings.Split(strings.TrimRight(ansi.Strip(p.View(w, h)), "\n"), "\n")
+
+	if len(lines) > h {
+		t.Errorf("help renders %d rows on a %d-row screen", len(lines), h)
+	}
+	for i, line := range lines {
+		if got := lipgloss.Width(line); got > w {
+			t.Errorf("line %d is %d columns wide, screen is %d", i, got, w)
+		}
+	}
+
+	// Two headers on one line is the whole point: the layout went sideways.
+	titles := helpBlockTitles(t)
+	sideBySide := false
+	for _, line := range lines {
+		n := 0
+		for _, title := range titles {
+			if strings.Contains(line, title) {
+				n++
+			}
+		}
+		if n > 1 {
+			sideBySide = true
+		}
+	}
+	if !sideBySide {
+		t.Error("no two sections share a line; the help did not use the width")
+	}
+}
+
+func TestHelpKeepsEverySection(t *testing.T) {
+	p := popupModel{kind: popupHelp}
+	view := ansi.Strip(p.View(160, 40))
+	for _, title := range helpBlockTitles(t) {
+		if n := strings.Count(view, title); n != 1 {
+			t.Errorf("section %q appears %d times, want 1", title, n)
+		}
+	}
+	for _, line := range strings.Split(strings.TrimRight(helpText, "\n"), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if !strings.Contains(view, trimmed) {
+			t.Errorf("help line %q is missing from the rendered layout", trimmed)
+		}
+	}
+}
+
+func TestHelpStaysSingleColumnWhenNarrow(t *testing.T) {
+	cols := packHelpColumns(strings.Split(strings.TrimRight(helpText, "\n"), "\n\n"), 1)
+	single := joinHelpColumns(cols)
+
+	if got := renderHelpColumns(helpText, 80, 60); got != single {
+		t.Error("an 80-column screen has no room for a second column")
+	}
+	if got := renderHelpColumns(helpText, 160, 40); got == single {
+		t.Error("a 160x40 screen should split the help into columns")
+	}
+}
