@@ -17,8 +17,10 @@ import (
 
 // newDoctorCmd reports host-level configuration that would silently bypass
 // bodega's supply-chain controls, and the server's own policy posture where
-// this machine holds an install. The checks are read-only — doctor never
-// modifies the host, and never creates an audit database to report on.
+// this machine holds an install. The checks are read-only: doctor changes
+// nothing it inspects and never creates the audit database it reports on. The
+// one file a doctor run can leave behind is not a check's doing — main()
+// writes a default config file before any command runs.
 // Exit code is 0 when all checks are clean (OK or N/A) and 2 when at least
 // one check produced a finding (WARN or FAIL); this matches the convention
 // used by other CI-gating linters.
@@ -44,10 +46,15 @@ admits every upstream fetch, and one whose gates are all set to ignore is
 configured but enforcing nothing. Those checks read the audit database and
 report N/A on a client host that has none.
 
-Reports only. doctor never modifies the host. Exit code is 0 when clean
-and 2 when one or more findings are present, so this command can gate CI
-pipelines for build hosts that are supposed to route everything through
-bodega.
+Reports only: doctor changes nothing it inspects, and never creates the
+audit database it reports on. One caveat for a CI runner. Every bodega
+command bootstraps a config file on first run, doctor included, so a host
+with neither /etc/bodega/config.json nor ~/.config/bodega/config.json gains
+the second one (the first, as root) before the checks execute.
+
+Exit code is 0 when clean and 2 when one or more findings are present, so
+this command can gate CI pipelines for build hosts that are supposed to
+route everything through bodega.
 
 See docs/THREAT_MODEL.md for the rationale behind each check.`,
 		Args: cobra.NoArgs,
