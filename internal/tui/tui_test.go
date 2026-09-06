@@ -5,9 +5,13 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/ravinald/bodega/internal/aptsources"
+	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/inventory"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -1437,5 +1441,308 @@ func TestAptSourcesFollowsServerState(t *testing.T) {
 	}
 	if !strings.Contains(bare.OneLine, " noble main") {
 		t.Errorf("no package in hand: want the server default suite, got %q", bare.OneLine)
+	}
+}
+
+// --- audit results table ---
+
+// auditTestEvents mirror the rows that broke the old fixed-width format string:
+// serve_fetch overruns %-8s and the InRelease paths overrun %-30s.
+func auditTestEvents() []audit.StoredEvent {
+	ts := time.Date(2026, 9, 6, 10, 43, 27, 0, time.UTC)
+	names := []string{
+		"dists/jammy-auth-51/InRelease",
+		"dists/jammy-backports/InRelease",
+		"dists/jammy-security/InRelease",
+		"nginx",
+	}
+	events := make([]audit.StoredEvent, 0, len(names))
+	for _, n := range names {
+		events = append(events, audit.StoredEvent{
+			Timestamp: ts,
+			Event: audit.Event{
+				EventType: "serve_fetch",
+				PkgType:   "apt",
+				PkgName:   n,
+				Status:    "success",
+				ClientIP:  "172.233.223.16",
+			},
+		})
+	}
+	return events
+}
+
+func TestAuditTableColumnsAlign(t *testing.T) {
+	tbl := newAuditTable(auditTestEvents(), 200, 40)
+	lines := strings.Split(ansi.Strip(tbl.View()), "\n")
+	if len(lines) < 5 {
+		t.Fatalf("table rendered %d lines, want header plus 4 rows", len(lines))
+	}
+
+	header := lines[0]
+	statusCol := strings.Index(header, "STATUS")
+	if statusCol < 0 {
+		t.Fatalf("no STATUS column in header %q", header)
+	}
+	for i, line := range lines[1:] {
+		if got := strings.Index(line, "success"); got != statusCol {
+			t.Errorf("row %d: STATUS at column %d, want %d\nheader: %q\nrow:    %q",
+				i, got, statusCol, header, line)
+		}
+		if lipgloss.Width(line) != lipgloss.Width(header) {
+			t.Errorf("row %d width %d, header width %d", i, lipgloss.Width(line), lipgloss.Width(header))
+		}
+	}
+}
+
+func TestAuditTableNameTruncatesWithinBudget(t *testing.T) {
+	// A narrow screen has to come out of NAME, not out of the columns to its
+	// right: every row still ends at the same column.
+	tbl := newAuditTable(auditTestEvents(), 90, 40)
+	lines := strings.Split(ansi.Strip(tbl.View()), "\n")
+	header := lines[0]
+	for i, line := range lines[1:] {
+		if lipgloss.Width(line) != lipgloss.Width(header) {
+			t.Errorf("row %d width %d, header width %d", i, lipgloss.Width(line), lipgloss.Width(header))
+		}
+	}
+	if w := lipgloss.Width(header); w > 90 {
+		t.Errorf("table width %d exceeds the 90-column screen", w)
+	}
+}
+
+// --- log pane search ---
+
+func newTestLogPane(lines ...string) logPaneModel {
+	m := newLogPane()
+	m.outputLines = nil
+	m.SetSize(80, 3)
+	for _, l := range lines {
+		m.appendLog(l)
+	}
+	return m
+}
+
+func TestLogSearchJumpsToFirstMatch(t *testing.T) {
+	m := newTestLogPane("alpha", "beta", "gamma apt", "delta", "epsilon apt", "zeta")
+
+	m.SetSearch("apt", false)
+
+	if got := m.MatchCount(); got != 2 {
+		t.Fatalf("MatchCount = %d, want 2", got)
+	}
+	if got := m.MatchLine(); got != 2 {
+		t.Errorf("MatchLine = %d, want 2 (the first matching line)", got)
+	}
+	if got := m.viewport.YOffset; got != 2 {
+		t.Errorf("viewport YOffset = %d, want 2", got)
+	}
+
+	m.NextMatch()
+	if got := m.MatchLine(); got != 4 {
+		t.Errorf("after NextMatch, MatchLine = %d, want 4", got)
+	}
+	m.NextMatch()
+	if got := m.MatchLine(); got != 2 {
+		t.Errorf("NextMatch should wrap to 2, got %d", got)
+	}
+	m.PrevMatch()
+	if got := m.MatchLine(); got != 4 {
+		t.Errorf("PrevMatch should wrap to 4, got %d", got)
+	}
+}
+
+func TestLogSearchIsCaseInsensitive(t *testing.T) {
+	m := newTestLogPane("Fetching APT index", "done")
+	m.SetSearch("apt", false)
+	if got := m.MatchCount(); got != 1 {
+		t.Errorf("MatchCount = %d, want 1", got)
+	}
+}
+
+func TestLogSearchMatchesThroughStyling(t *testing.T) {
+	m := newTestLogPane(errorStyle.Render("Edit failed: bad json"), "quiet line")
+	m.SetSearch("bad json", false)
+	if got := m.MatchCount(); got != 1 {
+		t.Errorf("MatchCount = %d, want 1 — the query must match past the ANSI styling", got)
+	}
+}
+
+func TestLogFilterHidesNonMatchingLines(t *testing.T) {
+	m := newTestLogPane("alpha", "beta apt", "gamma", "delta apt")
+
+	m.SetSearch("apt", true)
+
+	if len(m.display) != 2 {
+		t.Fatalf("display holds %d lines, want 2", len(m.display))
+	}
+	view := ansi.Strip(m.View())
+	if strings.Contains(view, "alpha") || strings.Contains(view, "gamma") {
+		t.Errorf("filtered view still shows non-matching lines:\n%s", view)
+	}
+
+	m.ClearSearch()
+	if len(m.display) != 4 {
+		t.Errorf("after ClearSearch display holds %d lines, want all 4", len(m.display))
+	}
+	if m.Searching() {
+		t.Error("Searching() should be false after ClearSearch")
+	}
+}
+
+func TestLogSearchKeysDriveThePane(t *testing.T) {
+	m := newAppModel(&config.Config{}, nil, nil, nil, nil)
+	m.width, m.height = 120, 40
+	m.focus = focusLog
+	m.log.outputLines = nil
+	for _, l := range []string{"alpha", "beta apt", "gamma"} {
+		m.log.appendLog(l)
+	}
+
+	next, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	am := next.(appModel)
+	if !am.logSearchMode {
+		t.Fatal("/ should open the log query")
+	}
+	for _, r := range "apt" {
+		next, _ = am.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		am = next.(appModel)
+	}
+	if got := am.log.MatchCount(); got != 1 {
+		t.Errorf("MatchCount = %d, want 1", got)
+	}
+	if !strings.Contains(ansi.Strip(am.logSearchIndicator()), "/apt (1/1)") {
+		t.Errorf("title indicator = %q", ansi.Strip(am.logSearchIndicator()))
+	}
+
+	next, _ = am.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	am = next.(appModel)
+	if am.logSearchMode {
+		t.Error("enter should leave the query committed, not still editing")
+	}
+	if !am.log.Searching() {
+		t.Error("enter should keep the query active")
+	}
+
+	// Esc in the focused pane clears the query before it changes focus.
+	next, _ = am.handleKey(tea.KeyMsg{Type: tea.KeyEscape})
+	am = next.(appModel)
+	if am.log.Searching() {
+		t.Error("esc should clear the query")
+	}
+	if am.focus != focusLog {
+		t.Error("the first esc should keep focus on the log pane")
+	}
+}
+
+func TestAuditTableDropsEmptyColumns(t *testing.T) {
+	header := strings.Split(ansi.Strip(newAuditTable(auditTestEvents(), 200, 40).View()), "\n")[0]
+	if strings.Contains(header, "DURATION") {
+		t.Errorf("no event carried a duration, so DURATION should be dropped: %q", header)
+	}
+
+	withDur := auditTestEvents()
+	withDur[0].DurationMs = 12
+	header = strings.Split(ansi.Strip(newAuditTable(withDur, 200, 40).View()), "\n")[0]
+	if !strings.Contains(header, "DURATION") {
+		t.Errorf("DURATION should be kept once an event carries one: %q", header)
+	}
+}
+
+func TestElideHead(t *testing.T) {
+	tests := []struct {
+		in   string
+		w    int
+		want string
+	}{
+		{"dists/jammy-updates/InRelease", 15, "…ates/InRelease"},
+		{"nginx", 15, "nginx"},
+		{"nginx", 5, "nginx"},
+		{"nginx", 1, "nginx"},
+	}
+	for _, tc := range tests {
+		if got := elideHead(tc.in, tc.w); got != tc.want {
+			t.Errorf("elideHead(%q, %d) = %q, want %q", tc.in, tc.w, got, tc.want)
+		}
+	}
+}
+
+// --- help layout ---
+
+// helpBlockTitles are the section headers of helpText, which the column layout
+// must keep intact and complete.
+func helpBlockTitles(t *testing.T) []string {
+	t.Helper()
+	var titles []string
+	for _, block := range strings.Split(strings.TrimRight(helpText, "\n"), "\n\n") {
+		titles = append(titles, strings.SplitN(block, "\n", 2)[0])
+	}
+	if len(titles) < 5 {
+		t.Fatalf("helpText split into %d blocks, expected the section list", len(titles))
+	}
+	return titles
+}
+
+func TestHelpFitsAWideScreen(t *testing.T) {
+	const w, h = 160, 40
+	p := popupModel{kind: popupHelp}
+	lines := strings.Split(strings.TrimRight(ansi.Strip(p.View(w, h)), "\n"), "\n")
+
+	if len(lines) > h {
+		t.Errorf("help renders %d rows on a %d-row screen", len(lines), h)
+	}
+	for i, line := range lines {
+		if got := lipgloss.Width(line); got > w {
+			t.Errorf("line %d is %d columns wide, screen is %d", i, got, w)
+		}
+	}
+
+	// Two headers on one line is the whole point: the layout went sideways.
+	titles := helpBlockTitles(t)
+	sideBySide := false
+	for _, line := range lines {
+		n := 0
+		for _, title := range titles {
+			if strings.Contains(line, title) {
+				n++
+			}
+		}
+		if n > 1 {
+			sideBySide = true
+		}
+	}
+	if !sideBySide {
+		t.Error("no two sections share a line; the help did not use the width")
+	}
+}
+
+func TestHelpKeepsEverySection(t *testing.T) {
+	p := popupModel{kind: popupHelp}
+	view := ansi.Strip(p.View(160, 40))
+	for _, title := range helpBlockTitles(t) {
+		if n := strings.Count(view, title); n != 1 {
+			t.Errorf("section %q appears %d times, want 1", title, n)
+		}
+	}
+	for _, line := range strings.Split(strings.TrimRight(helpText, "\n"), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if !strings.Contains(view, trimmed) {
+			t.Errorf("help line %q is missing from the rendered layout", trimmed)
+		}
+	}
+}
+
+func TestHelpStaysSingleColumnWhenNarrow(t *testing.T) {
+	cols := packHelpColumns(strings.Split(strings.TrimRight(helpText, "\n"), "\n\n"), 1)
+	single := joinHelpColumns(cols)
+
+	if got := renderHelpColumns(helpText, 80, 60); got != single {
+		t.Error("an 80-column screen has no room for a second column")
+	}
+	if got := renderHelpColumns(helpText, 160, 40); got == single {
+		t.Error("a 160x40 screen should split the help into columns")
 	}
 }

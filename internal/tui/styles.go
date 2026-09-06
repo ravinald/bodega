@@ -131,3 +131,8 @@ var formActiveValueStyle = lipgloss.NewStyle().
 var formCursorStyle = lipgloss.NewStyle().
 	Foreground(lipgloss.Color("234")).
 	Background(lipgloss.Color("255"))
+
+// logMatchStyle marks the current find/filter hit in the Log pane.
+var logMatchStyle = lipgloss.NewStyle().
+	Foreground(lipgloss.Color("232")).
+	Background(colorYellow)
