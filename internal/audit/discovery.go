@@ -74,12 +74,14 @@ type DiscoveryFilter struct {
 	Limit        int       // 0 = default (1000)
 }
 
-// RecordDiscovery upserts an observation into the configured sink. A
-// write-only sink cannot deduplicate, so it emits one record per call and the
-// rollup happens wherever the stream lands; see the DiscoveryRow comment for
-// what the queryable sinks collapse.
-func (a *DB) RecordDiscovery(ctx context.Context, r DiscoveryRow) error {
-	return a.sink.RecordDiscovery(ctx, r)
+// RecordDiscovery upserts a batch of observations into the configured sink and
+// returns how many of them landed, so a caller that loses part of a batch
+// counts the part it lost rather than the whole. A write-only sink cannot
+// deduplicate, so it emits one record per observation and the rollup happens
+// wherever the stream lands; see the DiscoveryRow comment for what the
+// queryable sinks collapse.
+func (a *DB) RecordDiscovery(ctx context.Context, rows ...DiscoveryRow) (int, error) {
+	return a.sink.RecordDiscovery(ctx, rows...)
 }
 
 // ListDiscovery returns observations matching the filter, newest last_seen

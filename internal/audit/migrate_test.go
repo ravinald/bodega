@@ -191,7 +191,7 @@ func TestDiscoveryDecisionsSurviveTheCheckConstraint(t *testing.T) {
 			Decision:     decision,
 			UpstreamURL:  "https://proxy.golang.org/x",
 		}
-		if err := db.RecordDiscovery(ctx, row); err != nil {
+		if _, err := db.RecordDiscovery(ctx, row); err != nil {
 			t.Errorf("record decision %q: %v", decision, err)
 		}
 	}
@@ -207,7 +207,7 @@ func TestDiscoveryDecisionsSurviveTheCheckConstraint(t *testing.T) {
 	// The retired value has to be refused rather than silently stored: a
 	// constraint that still accepted it would let a stale binary keep writing
 	// rows nothing reads back.
-	err = db.RecordDiscovery(ctx, DiscoveryRow{
+	_, err = db.RecordDiscovery(ctx, DiscoveryRow{
 		RegistryType: "gomod",
 		PatternHint:  "github.com/aws/",
 		PkgName:      "github.com/aws/aws-sdk-go-v2",

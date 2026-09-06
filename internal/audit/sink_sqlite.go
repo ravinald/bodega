@@ -35,24 +35,26 @@ func (s *sqliteSink) Record(ctx context.Context, ev Event) error {
 	return err
 }
 
-func (s *sqliteSink) RecordDiscovery(ctx context.Context, r DiscoveryRow) error {
-	if s.readOnly {
-		return nil
+// RecordDiscovery upserts the batch. One multi-row INSERT is one implicit
+// transaction, so a chunk lands whole or not at all without an explicit BEGIN,
+// and the drain pays one write lock per batch instead of one per observation.
+func (s *sqliteSink) RecordDiscovery(ctx context.Context, rows ...DiscoveryRow) (int, error) {
+	if s.readOnly || len(rows) == 0 {
+		return len(rows), nil
 	}
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO upstream_discovery
-		   (registry_type, host, pattern_hint, pkg_name, pkg_version, decision, last_client, upstream_url)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(registry_type, pattern_hint, pkg_name, pkg_version, decision)
-		 DO UPDATE SET
-		   request_count = request_count + 1,
-		   last_seen     = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-		   last_client   = excluded.last_client,
-		   host          = CASE WHEN excluded.host = '' THEN upstream_discovery.host ELSE excluded.host END,
-		   upstream_url  = CASE WHEN excluded.upstream_url = '' THEN upstream_discovery.upstream_url ELSE excluded.upstream_url END`,
-		r.RegistryType, r.Host, r.PatternHint, r.PkgName, r.PkgVersion, r.Decision, r.LastClient, r.UpstreamURL,
-	)
-	return err
+	if err := validateDiscovery(rows); err != nil {
+		return 0, err
+	}
+	applied := 0
+	for _, chunk := range chunkDiscovery(rows) {
+		//nolint:gosec // G202: the statement is assembled from a generated placeholder list; every value is bound.
+		q, args := buildDiscoveryUpsert(coalesceDiscovery(chunk), false)
+		if _, err := s.db.ExecContext(ctx, q, args...); err != nil {
+			return applied, err
+		}
+		applied += len(chunk)
+	}
+	return applied, nil
 }
 
 func (s *sqliteSink) QueryEvents(ctx context.Context, f Filter) ([]StoredEvent, error) {
