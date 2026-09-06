@@ -335,6 +335,26 @@ func OpenWithSink(path string, sc SinkConfig) (*DB, error) {
 				slog.Info("checksum rows re-derived from their object key", "rows", n, "migration", checksumIdentityVersion)
 			}
 		}
+		// Default posture. policy_seeds decides, not the emptiness of
+		// age_policy: an operator who removed every row chose no gate, and a
+		// re-seed would overrule them on the next restart. An install crossing
+		// migration 012 claims the marker with nothing behind it, so an
+		// upgrade never changes what a running fleet enforces.
+		if from < policySeedVersion {
+			if err := claimPolicySeed(context.Background(), db, PolicySeedAge); err != nil {
+				_ = db.Close()
+				return nil, fmt.Errorf("claim age policy default: %w", err)
+			}
+		}
+		seeded, err := seedDefaultAgePolicy(context.Background(), db)
+		if err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("seed default age policy: %w", err)
+		}
+		if len(seeded) > 0 {
+			slog.Info("fresh install: minimum publish age seeded",
+				"ecosystems", seeded, "min_age_seconds", DefaultAgeMinSeconds, "action", DefaultAgeAction)
+		}
 	}
 
 	sink, err := newSink(sc, db, readOnly)

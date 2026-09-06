@@ -319,6 +319,33 @@ func firstNonEmptySink(sink string) string {
 	return sink
 }
 
+// agePolicyBanner names the minimum publish age this instance admits against.
+// A fresh install is seeded with one, and an operator who never reads
+// docs/USAGE.md still has to learn from somewhere that a gate is on and which
+// ecosystems it covers. An install with no gate says so for the same reason:
+// silence reads identically either way.
+func (s *Server) agePolicyBanner() string {
+	if s.auditDB == nil {
+		return ""
+	}
+	rows, err := s.auditDB.ListAgePolicies(context.Background())
+	if err != nil {
+		return ""
+	}
+	active := make([]string, 0, len(rows))
+	for _, p := range rows {
+		if p.Action == policy.ActionIgnore {
+			continue
+		}
+		active = append(active, fmt.Sprintf("%s %s (%s)",
+			p.Ecosystem, policy.ShortDuration(time.Duration(p.MinAgeSeconds)*time.Second), p.Action))
+	}
+	if len(active) == 0 {
+		return "minimum publish age: none enforced (bodega policy age set npm 7d warn)\n"
+	}
+	return "minimum publish age: " + strings.Join(active, ", ") + "\n"
+}
+
 // resolveAuditDBPath returns the audit database path from config, falling
 // back to <log_dir>/audit.db when AuditDB is unset.
 func resolveAuditDBPath(cfg *config.Config) string {
@@ -481,6 +508,7 @@ func (s *Server) Start(ctx context.Context) error {
 			scheme = "https"
 		}
 		_, _ = fmt.Fprintf(os.Stderr, "bodega listening on %s://%s\n", scheme, boundAddr)
+		_, _ = fmt.Fprint(os.Stderr, s.agePolicyBanner())
 		_, _ = fmt.Fprint(os.Stderr, s.aptSourcesBanner())
 	}
 	if tlsMode {

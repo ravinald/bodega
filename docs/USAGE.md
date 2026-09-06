@@ -591,7 +591,7 @@ $ bodega policy osv set helm block
 Error: the OSV gate does not cover ecosystem "helm": the row would be stored and never read, leaving the gate silently off; set one of cargo, gomod, npm, pypi instead
 ```
 
-Earlier versions wrote that row, printed `Set helm OSV policy: block`, and then passed every helm version, because the checker short-circuits on any type outside the table above. Nothing reported the gap. The refusal replaces a gate the operator believed was on.
+Earlier versions wrote that row, printed `Set helm OSV policy: block`, and then passed every helm version, because the checker short-circuits on any type outside the table above. Nothing reported the gap. The refusal replaces a gate the operator believed was on. It does not remove the rows already written: `bodega policy osv list` names them under the table and `bodega doctor` reports them, in the shape shown under [`bodega policy age`](#bodega-policy-age-setlistremove).
 
 A version with OSV records is stamped on its `VersionEntry.Metadata`, so the finding follows the version into the manifest rather than living only in the audit event:
 
@@ -609,6 +609,10 @@ A version with OSV records is stamped on its `VersionEntry.Metadata`, so the fin
 ### `bodega policy age <set|list|remove>`
 
 Rejects or flags a version whose upstream publish timestamp is newer than the ecosystem's minimum age, which is the cheapest defense against a freshly published malicious release.
+
+A fresh install is seeded with `npm` and `pypi` at `7d warn`, and the startup banner names it. It is the only policy bodega ships turned on; the allow-list and the OSV gate are empty until you add a rule. The week is the window the 2025-2026 npm and PyPI campaigns were caught in, and `warn` rather than `block` so a first install reports instead of breaking a build. Checksum pinning does not reach this case: it guarantees today's bytes match the first fetch, including a first fetch that was already malicious.
+
+The seed is a decision recorded once, in `policy_seeds` in the audit database, not a default re-applied at every start. So `bodega policy age remove npm` is permanent, an empty policy set stays empty across restarts, and an install created before this default gains nothing on upgrade. `bodega doctor` reports an install that enforces nothing.
 
 ```bash
 bodega policy age set npm 7d warn
@@ -636,6 +640,18 @@ Error: the age gate does not cover ecosystem "apt": there is no upstream publish
 ```
 
 The two gates failed differently before they refused. OSV passed silently. Age never did: a missing timestamp is a `warn` with the ecosystem named, so an apt policy made every apt version noisy rather than invisible. Refusing the row up front is a usability fix on that side and a security fix on the OSV side.
+
+`set` grew that refusal after the fact, so a row written before it is still stored and still read by nothing. Both `list` commands name those rows under the table, and `bodega doctor` reports them as `policy-ecosystem`:
+
+```
+$ bodega policy age list
+ECOSYSTEM  MIN AGE  ACTION  UPDATED
+helm       7d       block   2026-03-11
+npm        7d       warn    2026-09-06
+
+Not enforced: the age gate cannot evaluate helm, so that row is stored and never read.
+Remove with 'bodega policy age remove <ecosystem>'.
+```
 
 An upstream that is reachable but has no timestamp for the version warns rather than blocking, on the same reasoning: a registry outage should not fail an import closed.
 
