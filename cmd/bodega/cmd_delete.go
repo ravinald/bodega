@@ -16,17 +16,18 @@ import (
 )
 
 func newDeleteCmd(gf *globalFlags) *cobra.Command {
-	var removeFromS3 bool
+	var removeArtifacts bool
 
 	cmd := &cobra.Command{
 		Use:   "delete <type> <name>",
 		Short: "Remove an entry from the manifest",
 		Long: `delete removes the named entry from a manifest and writes the updated file.
 
-Use --remove-from-s3 to also delete the corresponding artifact from S3.
+Use --remove-artifacts to also delete the entry's artifact bytes from the
+storage backend each version's record names.
 Frozen entries cannot be deleted; unfreeze them first with 'bodega freeze'.`,
 		Example: `  bodega delete git netbox
-  bodega delete binary awscli-v2 --remove-from-s3`,
+  bodega delete binary awscli-v2 --remove-artifacts`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			t, name := args[0], args[1]
@@ -61,7 +62,7 @@ Frozen entries cannot be deleted; unfreeze them first with 'bodega freeze'.`,
 			// record of which bytes to clean up, so dropping it after a delete
 			// that resolved nothing would orphan them with nothing left to
 			// name them.
-			if removeFromS3 {
+			if removeArtifacts {
 				stores, err := storage.NewResolver(ctx, cfg)
 				if err != nil {
 					return fmt.Errorf("connect to storage: %w", err)
@@ -105,7 +106,7 @@ Frozen entries cannot be deleted; unfreeze them first with 'bodega freeze'.`,
 		},
 	}
 
-	cmd.Flags().BoolVar(&removeFromS3, "remove-from-s3", false, "Also delete the artifact bytes from the storage backend holding them, s3 or local")
+	cmd.Flags().BoolVar(&removeArtifacts, "remove-artifacts", false, "Also delete the artifact bytes from the storage backend holding them")
 	return cmd
 }
 
