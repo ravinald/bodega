@@ -11,7 +11,6 @@ import (
 	"hash"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -109,7 +108,7 @@ anything is copied. Each object would land on the one it was read from, and
 				dst:     dst,
 				dstName: toBackend,
 				store:   store,
-				spool:   filepath.Join(cfg.BuildRoot, "tmp"),
+				spool:   cfg.ResolveSpoolDir(),
 				out:     os.Stdout,
 				del:     deleteSource,
 			}
@@ -341,9 +340,11 @@ func (m *mover) verify(ctx context.Context, key string, spooled int64, ve manife
 // returns the spooled size. srcKey and dstKey differ when the copy repairs a
 // key rather than moving a backend.
 //
-// The spool lives under build_root rather than $TMPDIR because build_root is
-// the volume sized for artifacts; a multi-gigabyte bundle through a tmpfs /tmp
-// fills RAM instead. ObjectStore has no streaming Put — only Put([]byte) and
+// The spool is spool_dir, defaulting to {build_root}/tmp, rather than $TMPDIR:
+// build_root is the volume sized for artifacts, and a multi-gigabyte bundle
+// through a tmpfs /tmp fills RAM instead. One key answers where every bodega
+// copy spools, so an operator who moves the proxy's spool onto a bigger volume
+// moves this one with it. ObjectStore has no streaming Put — only Put([]byte) and
 // PutFile — and adding a tenth interface method would mean touching both
 // implementations and every mock, so the file on disk is what bridges them.
 func copyObject(ctx context.Context, src, dst storage.ObjectStore, srcKey, dstKey, spool string) (int64, error) {

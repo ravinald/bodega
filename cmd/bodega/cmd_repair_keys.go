@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"path/filepath"
 	"sort"
 	"strings"
 
@@ -69,7 +68,7 @@ after an interruption is safe.`,
 			r := &keyRepairer{
 				stores: stores,
 				store:  store,
-				spool:  filepath.Join(cfg.BuildRoot, "tmp"),
+				spool:  cfg.ResolveSpoolDir(),
 				out:    cmd.OutOrStdout(),
 				del:    deleteSource,
 				dry:    dryRun,

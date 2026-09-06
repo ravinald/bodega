@@ -74,13 +74,14 @@ func largeArtifactUpstream(t *testing.T, n int) *httptest.Server {
 	return ts
 }
 
-// Eight concurrent fetches of eight distinct 1 MiB artifacts against a 3 MiB
-// budget. Three are admitted, five are refused, and the spool directory never
-// holds more than the budget while that happens.
+// Eight concurrent fetches of eight distinct 256 KiB artifacts against a
+// 768 KiB budget. Three are admitted, five are refused, and the spool directory
+// never holds more than the budget while that happens.
 //
-// The stub serves one megabyte of a per-path filler byte with Content-Length
+// The stub serves the same filler byte at every path, with Content-Length
 // declared, which is what lets the budget be claimed whole before the copy
-// starts rather than discovered partway through it.
+// starts rather than discovered partway through it. The paths differ so that
+// nothing coalesces; the bytes need not.
 func TestConcurrentSpoolsStayUnderTheBudget(t *testing.T) {
 	allowLoopbackUpstream(t)
 

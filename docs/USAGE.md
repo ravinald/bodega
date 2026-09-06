@@ -1562,6 +1562,8 @@ The proxy path streams: an upstream body is copied to a spool file, checksummed 
 
 Write `0` in either ceiling to remove it. An absent key takes the default; `0` is an operator turning the bound off, which is not the same thing.
 
+A `spool_max_artifact_bytes` above a non-zero `spool_max_total_bytes` is refused at config load, by every bodega command and not just `serve`: no artifact that large could ever be admitted, so every fetch over the budget would be refused naming the wrong key. Lowering the budget alone is the way that bites. A host with a 4 GiB spool volume needs both keys moved, or the artifact ceiling set to `0`, which leaves the shared budget as the only bound.
+
 **`spool_dir` is a startup condition.** `bodega serve` creates the directory and writes a probe file in it before it binds, and refuses to start naming the path if either fails. Left to the first large fetch, a misplaced spool surfaces as an `ENOSPC` or a permission error inside one proxy request — on the filesystem that by default also holds `audit_db` and the local store, which means the next thing to fail is something unrelated to the proxy.
 
 **Upgrading:** the spool used to be `os.TempDir()`, so `$TMPDIR` was the only lever and it was a process environment variable. It is now `{build_root}/tmp`, matching where `bodega repair keys` already spools. An install whose `build_root` is the shipped `/opt/bodega` and whose serving user cannot create `/opt/bodega/tmp` will refuse to start rather than silently spool somewhere else: create the directory for that user, or set `spool_dir`.

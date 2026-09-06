@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -180,4 +182,67 @@ func TestSupersededKeysOnlyCoversGomod(t *testing.T) {
 	if got := supersededKeys(flat, ve); got != nil {
 		t.Errorf("a module path with no slash yielded %v, want none", got)
 	}
+}
+
+// TestRepairKeysSpoolsUnderTheConfiguredSpoolDir runs the command rather than
+// the repairer, because the spool location is chosen in RunE and nothing the
+// unit fixtures build reaches that line: they inject a spool directly.
+//
+// The assertion is which directory came into existence. copyObject creates the
+// spool with MkdirAll, so a run that honors spool_dir leaves {build_root}/tmp
+// absent, and a run that hard-codes it leaves spool_dir absent.
+func TestRepairKeysSpoolsUnderTheConfiguredSpoolDir(t *testing.T) {
+	manifestDir := t.TempDir()
+	store := manifest.NewLocalStore(manifestDir)
+	if err := store.AddVersion(t.Context(), manifest.TypeGomod, repairModule, manifest.VersionEntry{
+		Version: "v1.30.0",
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+	// The command walks ListPackages, which reads index.json; AddVersion
+	// updates the in-memory catalog and leaves the index to its caller.
+	if err := store.SaveIndex(t.Context()); err != nil {
+		t.Fatalf("SaveIndex: %v", err)
+	}
+
+	storagePath := t.TempDir()
+	safe := manifest.SafeName(repairModule)
+	seeded := map[string]string{manifest.GomodListKey(safe): "v1.30.0\n"}
+	for _, ext := range []string{".zip", ".info", ".mod"} {
+		seeded[manifest.GomodKey(safe, "v1.30.0", ext)] = "bytes" + ext
+	}
+	for key, body := range seeded {
+		path := filepath.Join(storagePath, filepath.FromSlash(key))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatalf("seed %s: %v", key, err)
+		}
+	}
+
+	buildRoot := t.TempDir()
+	spoolDir := filepath.Join(t.TempDir(), "configured-spool")
+	writeSpoolConfig(t, map[string]any{
+		"storage_backend": "local",
+		"storage_path":    storagePath,
+		"manifest_dir":    manifestDir,
+		"build_root":      buildRoot,
+		"log_dir":         t.TempDir(),
+		"spool_dir":       spoolDir,
+	})
+
+	var out bytes.Buffer
+	root := newRootCmd()
+	root.SetArgs([]string{"repair", "keys", "--type", "gomod"})
+	root.SetOut(&out)
+	root.SetErr(&out)
+	if err := root.Execute(); err != nil {
+		t.Fatalf("repair keys: %v (%s)", err, out.String())
+	}
+	if !strings.Contains(out.String(), "copied to their canonical key") {
+		t.Fatalf("nothing was copied, so nothing spooled:\n%s", out.String())
+	}
+
+	assertSpooledAt(t, spoolDir, buildRoot)
 }
