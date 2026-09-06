@@ -22,11 +22,23 @@ type OSVStore interface {
 }
 
 // osvEcosystemFor maps bodega's registry types to OSV's ecosystem identifiers.
-// Ecosystems without an OSV equivalent short-circuit to pass.
+// Ecosystems without an OSV equivalent short-circuit to pass, so `bodega
+// policy osv set` refuses to write a row for one; see OSVEcosystems.
 var osvEcosystemFor = map[string]string{
 	manifest.TypeNpm:   "npm",
 	manifest.TypePypi:  "PyPI",
 	manifest.TypeGomod: "Go",
+	manifest.TypeCargo: "crates.io",
+}
+
+// OSVEcosystems returns the registry types the OSV gate can query, sorted.
+func OSVEcosystems() []string {
+	out := make([]string, 0, len(osvEcosystemFor))
+	for eco := range osvEcosystemFor {
+		out = append(out, eco)
+	}
+	sort.Strings(out)
+	return out
 }
 
 type OSVChecker struct {
@@ -80,25 +92,34 @@ func (c *OSVChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 	}
 	ve.Metadata["vetting.osv.vulns"] = strings.Join(ids, ",")
 
+	details := map[string]any{
+		"vulns": ids,
+		"count": len(vulns),
+	}
+	if sev := vulnSeverities(vulns); len(sev) > 0 {
+		blob, _ := json.Marshal(sev)
+		ve.Metadata["vetting.osv.severity"] = string(blob)
+		details["severity"] = sev
+	}
+
 	return Result{
 		Check:  "osv",
 		Action: policy.Action,
 		Reason: fmt.Sprintf("%s@%s has %d OSV record(s): %s",
 			pm.Name, ve.Version, len(vulns), strings.Join(ids, ", ")),
-		Details: map[string]any{
-			"vulns": ids,
-			"count": len(vulns),
-		},
+		Details: details,
 	}
 }
 
+type osvSeverity struct {
+	Type  string `json:"type"`
+	Score string `json:"score"`
+}
+
 type osvVuln struct {
-	ID       string `json:"id"`
-	Summary  string `json:"summary"`
-	Severity []struct {
-		Type  string `json:"type"`
-		Score string `json:"score"`
-	} `json:"severity"`
+	ID       string        `json:"id"`
+	Summary  string        `json:"summary"`
+	Severity []osvSeverity `json:"severity"`
 }
 
 func (c *OSVChecker) query(ctx context.Context, ecosystem, name, version string) ([]osvVuln, error) {
@@ -130,6 +151,22 @@ func (c *OSVChecker) query(ctx context.Context, ecosystem, name, version string)
 		return nil, fmt.Errorf("parse osv response: %w", err)
 	}
 	return out.Vulns, nil
+}
+
+// vulnSeverities keys each record's severity entries by its OSV id. A version
+// carrying several records at different severities keeps them apart, and
+// json.Marshal sorts the keys, so the stamped value is stable across runs.
+// Records OSV scored no severity for are absent; vetting.osv.vulns is the
+// list of what was queried.
+func vulnSeverities(vs []osvVuln) map[string][]osvSeverity {
+	out := make(map[string][]osvSeverity, len(vs))
+	for _, v := range vs {
+		if v.ID == "" || len(v.Severity) == 0 {
+			continue
+		}
+		out[v.ID] = v.Severity
+	}
+	return out
 }
 
 func vulnIDs(vs []osvVuln) []string {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -20,10 +21,31 @@ type AgeStore interface {
 	GetAgePolicy(ctx context.Context, ecosystem string) (audit.AgePolicy, error)
 }
 
+// agePublishers maps a registry type to the call that retrieves its upstream
+// publish timestamp. It is the one source for both dispatch and the
+// `bodega policy age set` validation, so an ecosystem gains age coverage and
+// becomes settable in the same edit.
+var agePublishers = map[string]func(*AgeChecker, context.Context, string, string) (time.Time, error){
+	manifest.TypeNpm:   (*AgeChecker).npmPublishedAt,
+	manifest.TypePypi:  (*AgeChecker).pypiPublishedAt,
+	manifest.TypeGomod: (*AgeChecker).gomodPublishedAt,
+	manifest.TypeCargo: (*AgeChecker).cratesPublishedAt,
+}
+
+// AgeEcosystems returns the registry types the age gate can date, sorted.
+func AgeEcosystems() []string {
+	out := make([]string, 0, len(agePublishers))
+	for eco := range agePublishers {
+		out = append(out, eco)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // AgeChecker rejects (or warns on) versions whose upstream publish timestamp
 // is newer than the ecosystem's min-age policy. Ecosystems where an upstream
-// timestamp isn't reliably retrievable (apt/binary/git/helm) short-circuit
-// to pass; operators see this as a no-op there.
+// timestamp isn't reliably retrievable (apt/binary/git/helm) have no entry in
+// agePublishers, and `bodega policy age set` refuses one.
 type AgeChecker struct {
 	store AgeStore
 
@@ -31,6 +53,7 @@ type AgeChecker struct {
 	NpmRegistry string
 	PypiBase    string
 	GoProxy     string
+	CratesBase  string
 
 	// HTTP gets a conservative timeout so a slow upstream doesn't stall
 	// admission.
@@ -44,6 +67,7 @@ func NewAgeChecker(store AgeStore) *AgeChecker {
 		NpmRegistry: "https://registry.npmjs.org",
 		PypiBase:    "https://pypi.org",
 		GoProxy:     "https://proxy.golang.org",
+		CratesBase:  "https://crates.io",
 		HTTP:        &http.Client{Timeout: 10 * time.Second},
 		Now:         time.Now,
 	}
@@ -104,15 +128,11 @@ func (c *AgeChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 // package version. Returns an error for ecosystems without a known upstream
 // timestamp endpoint.
 func (c *AgeChecker) publishedAt(ctx context.Context, ecosystem, name, version string) (time.Time, error) {
-	switch ecosystem {
-	case manifest.TypeNpm:
-		return c.npmPublishedAt(ctx, name, version)
-	case manifest.TypePypi:
-		return c.pypiPublishedAt(ctx, name, version)
-	case manifest.TypeGomod:
-		return c.gomodPublishedAt(ctx, name, version)
+	fn, ok := agePublishers[ecosystem]
+	if !ok {
+		return time.Time{}, fmt.Errorf("ecosystem %q has no upstream timestamp source", ecosystem)
 	}
-	return time.Time{}, fmt.Errorf("ecosystem %q has no upstream timestamp source", ecosystem)
+	return fn(c, ctx, name, version)
 }
 
 func (c *AgeChecker) npmPublishedAt(ctx context.Context, name, version string) (time.Time, error) {
@@ -178,11 +198,29 @@ func (c *AgeChecker) gomodPublishedAt(ctx context.Context, module, version strin
 	return time.Parse(time.RFC3339Nano, doc.Time)
 }
 
+func (c *AgeChecker) cratesPublishedAt(ctx context.Context, name, version string) (time.Time, error) {
+	url := c.CratesBase + "/api/v1/crates/" + name + "/" + version
+	var doc struct {
+		Version struct {
+			CreatedAt string `json:"created_at"`
+		} `json:"version"`
+	}
+	if err := c.getJSON(ctx, url, &doc); err != nil {
+		return time.Time{}, err
+	}
+	if doc.Version.CreatedAt == "" {
+		return time.Time{}, fmt.Errorf("crates.io response has no version.created_at for %s@%s", name, version)
+	}
+	return time.Parse(time.RFC3339Nano, doc.Version.CreatedAt)
+}
+
 func (c *AgeChecker) getJSON(ctx context.Context, url string, into any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
+	// crates.io answers 403 to a request with no User-Agent.
+	req.Header.Set("User-Agent", "bodega")
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return err
