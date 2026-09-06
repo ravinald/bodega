@@ -105,7 +105,7 @@ Frozen entries cannot be deleted; unfreeze them first with 'bodega freeze'.`,
 		},
 	}
 
-	cmd.Flags().BoolVar(&removeFromS3, "remove-from-s3", false, "Also delete the artifact from S3")
+	cmd.Flags().BoolVar(&removeFromS3, "remove-from-s3", false, "Also delete the artifact bytes from the storage backend holding them, s3 or local")
 	return cmd
 }
 

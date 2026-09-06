@@ -620,3 +620,59 @@ func TestAuditSinkValidation(t *testing.T) {
 		})
 	}
 }
+
+// The default hangs off storage_path, not build_root. docs/bodega.service runs
+// ProtectSystem=strict with ReadWritePaths naming storage_path and log_dir
+// alone, and build_root defaults to /opt/bodega, which that unit makes
+// read-only: the old default meant `bodega serve` refused to start on the
+// deployment the shipped unit describes.
+func TestResolveSpoolDirDefault(t *testing.T) {
+	cases := []struct {
+		name        string
+		spoolDir    string
+		storagePath string
+		buildRoot   string
+		want        string
+	}{
+		{
+			name:     "spool_dir wins outright",
+			spoolDir: "/srv/spool",
+			// Both of the keys the default would otherwise consult, set to
+			// something else, so a resolver that consults either fails here.
+			storagePath: "/var/lib/elsewhere",
+			buildRoot:   "/opt/elsewhere",
+			want:        "/srv/spool",
+		},
+		{
+			name:        "under storage_path",
+			storagePath: "/srv/artifacts",
+			want:        "/srv/artifacts/tmp",
+		},
+		{
+			name:        "build_root does not win over storage_path",
+			storagePath: "/srv/artifacts",
+			buildRoot:   "/opt/bodega",
+			want:        "/srv/artifacts/tmp",
+		},
+		{
+			// An S3-only install leaves storage_path unset. It still lands
+			// inside the shipped unit's ReadWritePaths rather than under
+			// build_root, which is the regression #241 reported.
+			name:      "unset storage_path falls to the default root, not build_root",
+			buildRoot: "/opt/bodega",
+			want:      config.DefaultStoragePath + "/tmp",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &config.Config{
+				SpoolDir:    tc.spoolDir,
+				StoragePath: tc.storagePath,
+				BuildRoot:   tc.buildRoot,
+			}
+			if got := c.ResolveSpoolDir(); got != tc.want {
+				t.Errorf("ResolveSpoolDir() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

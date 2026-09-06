@@ -325,7 +325,7 @@ body {
 </div>
 
 <div class="tree-panel">
-  <div class="header"><a href="#" onclick="showDashboard(); return false;" style="color:inherit;text-decoration:none">bodega</a> <span id="status-text"></span></div>
+  <div class="header"><a href="#" id="wordmark" onclick="showDashboard(); return false;" style="color:inherit;text-decoration:none">bodega</a> <span id="status-text"></span></div>
   <div class="filter-bar"><input type="text" id="filter" placeholder="/ filter..."></div>
   <div class="tree-actions">
     <button class="tree-action-btn" onclick="expandAll()" title="Expand all">&#9660; all</button>
@@ -363,6 +363,12 @@ async function load() {
     allData = await pkgRes.json();
     const status = await statusRes.json();
     serverApt = status.apt || null;
+    // /api/v1/status omits version for a caller outside admin_permit_cidr, so
+    // the wordmark keeps whatever title it already had rather than announcing
+    // an empty one.
+    if (status.version) {
+      document.getElementById('wordmark').title = 'bodega ' + status.version;
+    }
     document.getElementById('status-text').textContent =
       Object.values(status.entry_count || {}).reduce((a,b) => a+b, 0) + ' packages';
   } catch(e) {

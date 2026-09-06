@@ -203,6 +203,13 @@ func (b *syncBuffer) String() string {
 func newGuardServer(t *testing.T, cfg *config.Config, addr string) *Server {
 	t.Helper()
 	cfg.AuditDB = filepath.Join(t.TempDir(), "audit.db")
+	// These cases are about which listener Start binds, so none of them names
+	// a storage path. Left unset it resolves to config.DefaultStoragePath,
+	// which no test user can create, and the spool refusal then fires before
+	// the TLS guard these tests are reading.
+	if cfg.StoragePath == "" {
+		cfg.StoragePath = t.TempDir()
+	}
 	s := newServer(cfg, manifest.NewLocalStore(t.TempDir()), nil, addr,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	s.SetQuiet(true)

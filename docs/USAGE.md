@@ -313,6 +313,16 @@ dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\n' \
 
 `--merge` never overwrites a recorded version, so an entry someone promoted to `hosted` stays hosted.
 
+**A catalog is an inventory, not a repository.** Importing one records what a host has; it does not make bodega able to serve those packages, and pointing the host's `sources.list` at bodega after this step gets an empty index. The two are separate on purpose — the catalog is what `bodega status`, `bodega policy` and the discovery residue read — but the order to do them in is the other way round from the way the request usually arrives. Serve first, catalog second:
+
+| You want                                                 | Read                                                                       |
+| -------------------------------------------------------- | -------------------------------------------------------------------------- |
+| the host to install from bodega                          | [Mirroring an upstream archive](#mirroring-an-upstream-archive)            |
+| bodega to serve `.deb`s you built or downloaded yourself | [APT index generation](#apt-index-generation) and `bodega build fetch apt` |
+| a record of what the host already has                    | this section                                                               |
+
+For apt specifically, `bodega build fetch apt` shells out to `apt-get download <name>` on the bodega host: it passes no version, so a catalog entry's version names the storage key and nothing else, and the host can only resolve releases its own apt sources carry. A bodega on noble cannot fetch a jammy catalog that way. Mirroring is what serves another release.
+
 ### `bodega pkg export [type] [name]`
 
 Exports package manifests as JSON to stdout. Useful for backups, migrations, and inspecting manifest state.

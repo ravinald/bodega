@@ -54,7 +54,7 @@ func newDashboardCmd(gf *globalFlags) *cobra.Command {
 		Use:   "status [TYPE]",
 		Short: "Show repository status dashboard",
 		Long: `Display a summary of the repository state including package inventory,
-S3 coverage, storage usage, and recent activity.
+how much of it the storage backend holds, storage usage, and recent activity.
 
   bodega status                    # global dashboard
   bodega status git                # git repo metrics

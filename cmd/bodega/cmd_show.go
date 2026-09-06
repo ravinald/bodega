@@ -264,7 +264,7 @@ func showVersionList(ctx context.Context, store *manifest.Store, typ, name strin
 	fmt.Println()
 
 	if admin {
-		fmt.Printf("%-12s %-15s %-6s %-8s %-8s %-10s\n", "VERSION", "PLATFORM", "S3", "FROZEN", "HIDDEN", "CONSTRAINT")
+		fmt.Printf("%-12s %-15s %-6s %-8s %-8s %-10s\n", "VERSION", "PLATFORM", "STORED", "FROZEN", "HIDDEN", "CONSTRAINT")
 	} else {
 		fmt.Printf("%-12s %-15s %-10s\n", "VERSION", "PLATFORM", "CONSTRAINT")
 	}

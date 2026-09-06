@@ -17,7 +17,7 @@ func newSyncCmd(gf *globalFlags) *cobra.Command {
 	var replacePlacement bool
 	cmd := &cobra.Command{
 		Use:   "sync [TYPE...]",
-		Short: "Push local artifacts to S3 without running any pipeline stages",
+		Short: "Push local artifacts to the storage backend without running any pipeline stages",
 		Long: `sync is the dumb push command. It uploads whatever build artifacts already
 exist on disk to S3 without fetching, building, or packaging anything.
 

@@ -1,5 +1,7 @@
-// Bootstrap is a CLI tool for managing a centralized S3 bodega package
-// repository. It supports four artifact types: apt, git, pypi, and binary.
+// Command bodega manages a centralized package repository. Artifact bytes live
+// in a storage backend named by the config ("local" or "s3"); the eight
+// artifact types are listed by `bodega --help` and enumerated in
+// manifest.AllTypes.
 //
 // Usage:
 //
@@ -14,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -90,12 +93,21 @@ func newRootCmd() *cobra.Command {
 
 	root := &cobra.Command{
 		Use:   "bodega",
-		Short: "Manage a centralized S3 package repository",
-		Long: `bodega manages a centralized S3 repository of package artifacts:
+		Short: "Manage a centralized package repository",
+		Long: `bodega manages a centralized repository of package artifacts:
   apt     Debian packages built from source or downloaded from apt
-  git     Git repositories bundled at a specific ref
-  pypi    Python wheels built from a requirements set
   binary  Files downloaded directly from a URL
+  cargo   Rust crates from a sparse index
+  git     Git repositories bundled at a specific ref, or mirrored for clone
+  gomod   Go modules from a module proxy
+  helm    Helm charts from a chart repository
+  npm     npm packages and their packuments
+  pypi    Python wheels built from a requirements set
+
+Artifact bytes live in a storage backend: "local" (a directory) or "s3".
+storage_backend picks the default and storage_by_type can send one type
+somewhere else, so the S3 flags below apply only where an s3 backend is
+configured.
 
 Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json > defaults.`,
 		SilenceUsage: true,
@@ -113,15 +125,15 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 
 	// Persistent flags apply to every sub-command.
 	pf := root.PersistentFlags()
-	pf.StringVar(&gf.bucket, "bucket", "", "S3 bucket name (env: REPO_BUCKET)")
-	pf.StringVar(&gf.region, "region", "", "AWS region (env: AWS_REGION)")
+	pf.StringVar(&gf.bucket, "bucket", "", "Bucket name for an s3 storage backend (env: REPO_BUCKET)")
+	pf.StringVar(&gf.region, "region", "", "AWS region for an s3 storage backend (env: AWS_REGION)")
 	pf.StringVar(&gf.buildRoot, "build-root", "", "Local build directory (default: /opt/bodega)")
 	// Empty default, like --build-root: a non-empty one wins firstNonEmpty
 	// outright, so the flag would shadow $BODEGA_MANIFEST_DIR and the config's
 	// manifest_dir with a value nobody typed. The built-in lives at the tail of
 	// the chain in config.Load.
 	pf.StringVar(&gf.manifestDir, "manifest-dir", "", "Path to manifests/ directory (env: BODEGA_MANIFEST_DIR)")
-	pf.BoolVar(&gf.localConfig, "local-config", false, "Read/write manifests from local filesystem instead of S3")
+	pf.BoolVar(&gf.localConfig, "local-config", false, "Read/write manifests on the local filesystem instead of the configured backend")
 	pf.BoolVarP(&gf.verbose, "verbose", "v", false, "Show verbose output")
 	pf.IntVar(&gf.logLevel, "log-level", 0, "Logging verbosity: 0=errors, 1=warn, 2=info, 3=debug, 4=trace")
 	gf.logLevelGiven = func() bool { return pf.Changed("log-level") }
@@ -142,7 +154,7 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 			return cmd.Help()
 		}
 		if !isValidType(breakGlassType) {
-			return fmt.Errorf("unknown type %q — must be one of: apt, git, pypi, binary", breakGlassType)
+			return fmt.Errorf("unknown type %q — must be one of: %s", breakGlassType, strings.Join(manifest.AllTypes, ", "))
 		}
 		cfg, err := loadConfig(gf)
 		if err != nil {

@@ -76,7 +76,11 @@ Environment=BODEGA_CONFIG_FILE=/etc/bodega/config.json
 # /etc/bodega/apt-signing.key with no config change.
 #
 # The source file must be mode 0600 or tighter — bodega refuses to load a key
-# readable beyond its owner.
+# readable beyond its owner. The copy under $CREDENTIALS_DIRECTORY is exempt
+# and has to be: systemd writes it 0440 root:root with an ACL, on a read-only
+# tmpfs, so 0600 is a mode nothing there can set. What systemd guarantees for
+# that directory is stronger anyway — per-service, mode 0700, root-owned, and
+# unreadable by any other unit.
 #
 #   sudo bodega apt key generate
 #   sudo chown root:root /etc/bodega/apt-signing.key

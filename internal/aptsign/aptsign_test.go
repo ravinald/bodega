@@ -412,3 +412,96 @@ func readArmoredPublic(t *testing.T, pub []byte) openpgp.EntityList {
 	}
 	return el
 }
+
+// systemd writes a LoadCredential= file 0440 root:root with an ACL for the
+// service user, on a read-only tmpfs. Refusing that mode made the delivery
+// docs/bodega.service ships unusable, and it failed soft: the server came up
+// serving an unsigned repository.
+func TestLoadAcceptsAGroupReadableSystemdCredential(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, KeyFileName)
+	kr := testKey(t)
+	if err := kr.WritePrivate(path); err != nil {
+		t.Fatalf("WritePrivate: %v", err)
+	}
+	if err := os.Chmod(path, 0o440); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	if _, err := LoadPath(path); err == nil {
+		t.Fatal("LoadPath accepted a 0440 key with CREDENTIALS_DIRECTORY unset; the exemption is not scoped")
+	}
+
+	t.Setenv(CredentialsEnv, dir)
+	loaded, err := LoadPath(path)
+	if err != nil {
+		t.Fatalf("LoadPath refused a systemd credential: %v", err)
+	}
+	if got, want := loaded.Fingerprints(), kr.Fingerprints(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("fingerprints = %v, want %v", got, want)
+	}
+}
+
+// The exemption is the group bit inside the credential directory, and nothing
+// wider. A world-readable key there is refused like any other: systemd never
+// writes 0004, so one carrying it was put there by something that is not
+// systemd, and the exemption is for the delivery rather than for the location.
+func TestLoadRefusesAWorldReadableKeyEvenInTheCredentialDir(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(CredentialsEnv, dir)
+	path := filepath.Join(dir, KeyFileName)
+	if err := testKey(t).WritePrivate(path); err != nil {
+		t.Fatalf("WritePrivate: %v", err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	if _, err := LoadPath(path); err == nil {
+		t.Fatal("LoadPath accepted a 0644 key inside CREDENTIALS_DIRECTORY")
+	}
+}
+
+// The exemption is the credential directory, not "any loose mode once systemd
+// is in the picture". A key outside it stays subject to the mode check even
+// while a credential directory exists.
+func TestLoadRefusesALooseKeyOutsideTheCredentialDir(t *testing.T) {
+	creds := t.TempDir()
+	t.Setenv(CredentialsEnv, creds)
+
+	elsewhere := filepath.Join(t.TempDir(), KeyFileName)
+	if err := testKey(t).WritePrivate(elsewhere); err != nil {
+		t.Fatalf("WritePrivate: %v", err)
+	}
+	if err := os.Chmod(elsewhere, 0o440); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	if _, err := LoadPath(elsewhere); err == nil {
+		t.Fatal("LoadPath accepted a 0440 key outside CREDENTIALS_DIRECTORY")
+	}
+}
+
+func TestInCredentialsDirBoundaries(t *testing.T) {
+	cases := []struct {
+		name string
+		dir  string
+		path string
+		want bool
+	}{
+		{"inside", "/run/credentials/bodega.service", "/run/credentials/bodega.service/apt-signing.key", true},
+		{"nested", "/run/credentials/bodega.service", "/run/credentials/bodega.service/sub/apt-signing.key", true},
+		{"the directory itself", "/run/credentials/bodega.service", "/run/credentials/bodega.service", false},
+		{"name-prefix sibling", "/run/credentials/a.service", "/run/credentials/a.service-backup/apt-signing.key", false},
+		{"walks out and back", "/run/credentials/a.service", "/run/credentials/a.service/../b.service/apt-signing.key", false},
+		{"unset", "", "/run/credentials/bodega.service/apt-signing.key", false},
+		{"relative", "run/credentials", "run/credentials/apt-signing.key", false},
+		{"root", "/", "/etc/bodega/apt-signing.key", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(CredentialsEnv, tc.dir)
+			if got := inCredentialsDir(tc.path); got != tc.want {
+				t.Errorf("inCredentialsDir(%q) with %s=%q = %v, want %v", tc.path, CredentialsEnv, tc.dir, got, tc.want)
+			}
+		})
+	}
+}

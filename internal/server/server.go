@@ -28,6 +28,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
@@ -867,7 +868,12 @@ func (s *Server) handleAPIPackageVersion(w http.ResponseWriter, r *http.Request)
 
 // statusResponse is the JSON shape for /api/v1/status.
 type statusResponse struct {
-	Healthy    bool            `json:"healthy"`
+	Healthy bool `json:"healthy"`
+	// Version is the build stamp, omitted for a non-admin caller. A package
+	// repository answers the whole fleet, so its build number is a public
+	// statement of which advisories apply to it unless the field is gated the
+	// way spool.Dir is.
+	Version    string          `json:"version,omitempty"`
 	EntryCount map[string]int  `json:"entry_count"`
 	Apt        aptStatus       `json:"apt"`
 	Spool      spoolStats      `json:"spool"`
@@ -887,11 +893,14 @@ type s3EntryStatus struct {
 
 func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 	spool := s.spool.stats()
+	version := builder.Version
 	if !s.isAdminRequest(r) {
 		spool.Dir = ""
+		version = ""
 	}
 	resp := statusResponse{
 		Healthy: true,
+		Version: version,
 		Apt:     s.aptStatusFor(r),
 		Spool:   spool,
 		EntryCount: map[string]int{
