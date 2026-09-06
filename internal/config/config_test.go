@@ -180,6 +180,11 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		"apt_upstreams": map[string][]config.AptUpstream{
 			"mirrored-noble": {{URL: "https://archive.ubuntu.com/ubuntu"}},
 		},
+		// Explicit rather than left to the numeric filler: Load refuses a
+		// per-artifact ceiling above the shared budget, so two values assigned
+		// by field position would pass or fail on the order of the struct.
+		"spool_max_artifact_bytes": int64(1 << 20),
+		"spool_max_total_bytes":    int64(4 << 20),
 	}
 
 	v := reflect.ValueOf(cfg).Elem()
@@ -197,7 +202,7 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		switch f.Type.Kind() {
 		case reflect.String:
 			v.Field(i).SetString("value-" + tag)
-		case reflect.Int:
+		case reflect.Int, reflect.Int64:
 			v.Field(i).SetInt(int64(i + 1))
 		case reflect.Bool:
 			v.Field(i).SetBool(true)

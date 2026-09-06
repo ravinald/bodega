@@ -481,3 +481,81 @@ func TestMoveRefusesOneDirectoryUnderTwoNamesEndToEnd(t *testing.T) {
 		t.Fatalf("artifact is gone after the refusal: %v", statErr)
 	}
 }
+
+// TestMoveSpoolsUnderTheConfiguredSpoolDir is the same claim as the repair-keys
+// case on the other command that calls copyObject: spool_dir names where every
+// bodega copy spools, not only the proxy's.
+func TestMoveSpoolsUnderTheConfiguredSpoolDir(t *testing.T) {
+	source := t.TempDir()
+	mirror := t.TempDir()
+	manifestDir := t.TempDir()
+
+	store := manifest.NewLocalStore(manifestDir)
+	if err := store.AddVersion(t.Context(), manifest.TypeBinary, "awscli", manifest.VersionEntry{
+		Version: "2.1.0",
+		URL:     "https://example.com/awscli.zip",
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+
+	artifact := filepath.Join(source, filepath.FromSlash(awscliKey))
+	if err := os.MkdirAll(filepath.Dir(artifact), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(artifact, []byte("the only copy"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	buildRoot := t.TempDir()
+	spoolDir := filepath.Join(t.TempDir(), "configured-spool")
+	writeSpoolConfig(t, map[string]any{
+		"storage_backend": "local",
+		"storage_path":    source,
+		"manifest_dir":    manifestDir,
+		"build_root":      buildRoot,
+		"log_dir":         t.TempDir(),
+		"spool_dir":       spoolDir,
+		"storage_backends": map[string]config.StorageSpec{
+			"mirror": {Driver: "local", Path: mirror},
+		},
+	})
+
+	root := newRootCmd()
+	root.SetArgs([]string{"pkg", "move", "binary", "awscli", "--to", "mirror"})
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	if err := root.Execute(); err != nil {
+		t.Fatalf("pkg move: %v", err)
+	}
+
+	assertSpooledAt(t, spoolDir, buildRoot)
+}
+
+// writeSpoolConfig writes a config file and points $BODEGA_CONFIG_FILE at it,
+// so a cobra-level run resolves the same keys a real invocation would.
+func writeSpoolConfig(t *testing.T, keys map[string]any) {
+	t.Helper()
+	blob, err := json.Marshal(keys)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, blob, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv(config.EnvConfigFile, path)
+}
+
+// assertSpooledAt reads the directory that came into existence. Asserting the
+// configured path alone would pass on a command that spooled to both, and
+// asserting the default's absence alone would pass on one that spooled nowhere.
+func assertSpooledAt(t *testing.T, spoolDir, buildRoot string) {
+	t.Helper()
+	if _, err := os.Stat(spoolDir); err != nil {
+		t.Errorf("spool_dir %s was never created: %v", spoolDir, err)
+	}
+	fallback := filepath.Join(buildRoot, "tmp")
+	if _, err := os.Stat(fallback); err == nil {
+		t.Errorf("the copy spooled under %s, ignoring the configured spool_dir", fallback)
+	}
+}

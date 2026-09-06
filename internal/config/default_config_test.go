@@ -17,16 +17,22 @@ func TestDefaultConfigContent(t *testing.T) {
 	}
 
 	want := map[string]any{
-		"storage_backend":   "local",
-		"storage_path":      "/var/lib/bodega",
-		"listen_addr":       DefaultListenAddr,
-		"apt_codename":      "noble",
-		"apt_suites":        []any{"noble"},
-		"region":            DefaultRegion,
-		"build_root":        DefaultBuildRoot,
-		"log_dir":           DefaultLogDir,
-		"metadata_ttl":      "1h",
-		"admin_permit_cidr": []any{"127.0.0.0/8", "::1/128"},
+		"storage_backend": "local",
+		"storage_path":    "/var/lib/bodega",
+		"listen_addr":     DefaultListenAddr,
+		"apt_codename":    "noble",
+		"apt_suites":      []any{"noble"},
+		"region":          DefaultRegion,
+		"build_root":      DefaultBuildRoot,
+		"log_dir":         DefaultLogDir,
+		"metadata_ttl":    "1h",
+		// Written out rather than left to the default: an operator sizing a
+		// spool volume needs the number in front of them, and 0 in the file
+		// means "no ceiling" rather than "use the default".
+		"spool_dir":                "",
+		"spool_max_artifact_bytes": float64(DefaultSpoolMaxArtifactBytes),
+		"spool_max_total_bytes":    float64(DefaultSpoolMaxTotalBytes),
+		"admin_permit_cidr":        []any{"127.0.0.0/8", "::1/128"},
 		// null rather than a list: the generated file has to teach the
 		// tri-state, and an empty list here would ship every new install
 		// trusting no proxy at all.

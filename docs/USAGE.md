@@ -824,6 +824,9 @@ A default config is created on first run. All fields are optional.
   "pypi_upstream": "https://pypi.org",
   "cargo_upstream": "https://index.crates.io",
   "cargo_dl_upstream": "https://static.crates.io/crates",
+  "spool_dir": "",
+  "spool_max_artifact_bytes": 8589934592,
+  "spool_max_total_bytes": 34359738368,
   "discover_mode": "",
   "apt_codename": "noble",
   "apt_suites": ["noble"],
@@ -873,6 +876,8 @@ Both suites are then served by one instance and apt resolves dependencies across
 Set it whenever a reverse proxy terminates TLS or publishes a different hostname. bodega then sees a loopback listener with both TLS keys empty, so `tls_cert`/`tls_key` describe the proxy's back end and nothing describes the URL an operator would copy. Deriving the scheme from that pair is what printed `http://` on the sources line of a deployment that is `https://` everywhere a client can see. With `public_url` unset, callers holding a request answer from the request (honoring `X-Forwarded-Proto` from a trusted peer), and callers with none print `<bodega-host>:8080` as a placeholder and say that it is one.
 
 `discover_mode` turns the upstream-observation log on, and does nothing else: enforcement does not move with it. Valid values are `""` (off) and `"observe"`; anything else is rejected at load. `"learn"` was removed and is refused by name, with the error pointing at `observe` and `bodega pkg convert` — it suppressed the allow-list and recorded nothing `observe` does not. See [`bodega discover ...`](#bodega-discover-) for what gets logged and what to do with it.
+
+`spool_dir`, `spool_max_artifact_bytes` and `spool_max_total_bytes` bound the disk the proxy spends copying upstream artifacts. An empty `spool_dir` means `{build_root}/tmp`, and `bodega serve` refuses to start when it cannot create that directory or write in it. See [Large artifacts and the spool directory](#large-artifacts-and-the-spool-directory) for the two ceilings, what a refused client is told, and where the pressure is reported.
 
 `audit_sink` chooses where the event stream goes and `audit_sink_dsn` says how to reach it; see [Audit Trail](#audit-trail) for the four values, what each gives up, and what `bodega serve` does when the destination is unreachable. `timezone` sets the display timezone for audit queries (default UTC) and `audit_events` limits which event types are recorded (empty records all). Both apply to the CLI and to `bodega serve` alike — see [Audit Trail](#audit-trail) for what a filter that omits `denied` costs you.
 
@@ -1547,11 +1552,50 @@ A pool path a manifest entry owns is never fetched from upstream. The check is o
 
 #### Large artifacts and the spool directory
 
-The proxy path streams: an upstream body is copied to a spool file under `TMPDIR`, checksummed on the way through, then cached and served from there. Per-request memory is one copy buffer whatever the artifact's size, so there is no size ceiling on a proxied artifact — but `TMPDIR` has to hold the largest one in flight, and a small `tmpfs` there is where the old limit reappears. Point `TMPDIR` at real disk on a host that proxies `nvidia-*`, `texlive` collections or game-data packages.
+The proxy path streams: an upstream body is copied to a spool file, checksummed on the way through, then cached and served from there. Per-request memory is one copy buffer whatever the artifact's size, so process memory is not what bounds a proxied artifact. Disk is, and three keys say how much of it:
+
+| Key | Default | What it bounds |
+|-----|---------|----------------|
+| `spool_dir` | `{build_root}/tmp` | Where the spool files are written |
+| `spool_max_artifact_bytes` | `8589934592` (8 GiB) | The largest single artifact the proxy will copy |
+| `spool_max_total_bytes` | `34359738368` (32 GiB) | The bytes every fetch in flight may hold between them |
+
+Write `0` in either ceiling to remove it. An absent key takes the default; `0` is an operator turning the bound off, which is not the same thing.
+
+A `spool_max_artifact_bytes` above a non-zero `spool_max_total_bytes` is refused at config load, by every bodega command and not just `serve`: no artifact that large could ever be admitted, so every fetch over the budget would be refused naming the wrong key. Lowering the budget alone is the way that bites. A host with a 4 GiB spool volume needs both keys moved, or the artifact ceiling set to `0`, which leaves the shared budget as the only bound.
+
+**`spool_dir` is a startup condition.** `bodega serve` creates the directory and writes a probe file in it before it binds, and refuses to start naming the path if either fails. Left to the first large fetch, a misplaced spool surfaces as an `ENOSPC` or a permission error inside one proxy request — on the filesystem that by default also holds `audit_db` and the local store, which means the next thing to fail is something unrelated to the proxy.
+
+**Upgrading:** the spool used to be `os.TempDir()`, so `$TMPDIR` was the only lever and it was a process environment variable. It is now `{build_root}/tmp`, matching where `bodega repair keys` already spools. An install whose `build_root` is the shipped `/opt/bodega` and whose serving user cannot create `/opt/bodega/tmp` will refuse to start rather than silently spool somewhere else: create the directory for that user, or set `spool_dir`.
+
+**The per-artifact ceiling.** A `Content-Length` over `spool_max_artifact_bytes` is refused before a byte is read, which is the only way a client learns the artifact is too large without waiting for the whole transfer. A chunked or transparently-decompressed response declares no length, so that case is refused as the copy crosses the ceiling instead. Either way the spool file is removed, nothing is cached, and the error names the key. 8 GiB is roughly twice the largest thing a real archive publishes as one file — a CUDA `.deb` or a torch wheel runs 2-4 GB — and it refuses the runaway, which is otherwise bounded only by the 90-second upstream timeout times upstream bandwidth: about 11 GB at 1 Gbps, times however many fetches arrive at once.
+
+**The shared budget.** `spool_max_total_bytes` is a byte budget rather than a count of concurrent fetches, because bytes are what runs the filesystem out: eight fetches in flight is 8 MB or 64 GB depending on what was requested, so a count tuned for one artifact size is the wrong bound for the next one. A fetch claims its declared length whole before the copy starts and is charged as it goes where the upstream declared none; the claim is returned when the response is served or the request fails.
+
+**A request over the budget is refused, not queued.** It gets `503` with `Retry-After: 5` — unless bodega already holds a cached copy of that key, in which case it serves that, since the cached copy costs no spool at all. Queuing would turn a disk bound into a latency bound: a fleet running `apt-get update` off one cron minute would hold a goroutine and a connection each behind the 90-second upstream timeout, and the clients would time out anyway with nothing recorded about why.
+
+**Reading the pressure.** Every refusal writes an `ERROR` log line naming the key, the bound and the bytes in flight, plus a `denied` audit row with `status` of `spool_artifact_too_large` or `spool_budget_exhausted` (see [Audit Trail](#audit-trail)). The `serve_start` and `serve_stop` rows carry `spool_dir` and both ceilings, so a run's refusals sit in the same table as the bounds that produced them. The live gauge is the `spool` block on `GET /api/v1/status`:
+
+```json
+"spool": {
+  "dir": "/opt/bodega/tmp",
+  "in_flight": 3,
+  "used_bytes": 3221225472,
+  "peak_bytes": 7516192768,
+  "budget_bytes": 34359738368,
+  "max_artifact_bytes": 8589934592,
+  "refused_too_large": 0,
+  "refused_budget": 12
+}
+```
+
+`dir` is present only for a caller inside `admin_permit_cidr`. `GET /api/v1/status` answers any client that can reach the server, and a server filesystem path is a fact about the host rather than about what it serves; the counters stay visible, because a client acting on a `503` has to be able to see why it got one.
+
+`peak_bytes` is the high-water mark since the process started, which is what sizes the volume: a `refused_budget` climbing while `peak_bytes` sits at the budget says the host is carrying more concurrent fetches than its spool was sized for, and a `refused_too_large` climbing says `spool_max_artifact_bytes` is below what this archive publishes. Those call for opposite fixes, which is why they are counted apart.
 
 A cut transfer is still refused rather than cached: a body shorter than the `Content-Length` the upstream declared fails, the spool file is removed, and no checksum is recorded. Caching short bytes as authoritative is what made every later fetch of the real artifact fail verification against the truncated digest.
 
-The npm packument and the PyPI simple index are the two responses bodega still reads whole, because it parses them. Those are capped at 256 MB.
+The npm packument and the PyPI simple index are the two responses bodega still reads whole, because it parses them. Those are capped at 256 MB and are not spooled, so neither ceiling applies to them.
 
 ### APT index generation
 
@@ -2118,14 +2162,18 @@ Convert a fleet to a request rate with `hosts x updates-per-hour x requests-per-
 | `entry_frozen` | `DELETE` on a package whose every version is frozen. The caller cleared the admin gate, which is what makes the attempt worth a row |
 | `version_constraint` | A gomod or npm request for a version outside the entry's `version_constraint`. `pkg_version` carries the version that was refused, `details` the constraint and the entry's own version |
 | `push_refused` | A git smart-HTTP push against a read-only mirror, on the `info/refs?service=git-receive-pack` probe or the `git-receive-pack` POST. `pkg_name` is the namespace, `details` the repository path. The POST reaches this only from inside `admin_permit_cidr`; from anywhere else `ip_not_permitted` refuses it first |
+| `spool_artifact_too_large` | A proxied artifact over `spool_max_artifact_bytes`. See [Large artifacts and the spool directory](#large-artifacts-and-the-spool-directory) |
+| `spool_budget_exhausted` | A proxy fetch arriving while `spool_max_total_bytes` is already held by the fetches in flight. `details` carries the bytes held and the number of fetches holding them |
 
-The first eight gates run in the middleware chain, before any handler; the last three are decided by the handler itself. Both write the same row, because an operator asking "who was turned away" is asking one question.
+The first eight gates run in the middleware chain, before any handler; the last five are decided by the handler itself. Both write the same row, because an operator asking "who was turned away" is asking one question.
+
+The two `spool_*` statuses are refusals about this host rather than about the client, and they are in the same table on purpose: the operator's question is "why did that fetch not happen", and an answer split across two channels is one nobody correlates.
 
 The row is written on a context detached from the request. `net/http` cancels the request context the moment a client closes the connection, so a caller that fires a request and hangs up without reading the response — ordinary scanner behavior — got its 403 and left no row, which made the rows least reliable exactly where they matter most.
 
 The row carries the client IP, the User-Agent, and a `details` JSON blob with the method and path. It carries **no credential**: `token_expired` records the token id, `token_invalid` records the first 12 hex of the peppered hash — enough to tell two rejected callers apart, useless without the pepper — and no header is ever copied in. Client-controlled strings are capped at 256 bytes each, so an unauthenticated stranger does not choose how much disk a 403 costs.
 
-The lifecycle rows bracket everything else. Without them a quiet database is ambiguous: nobody was turned away, or the server was not running.
+The lifecycle rows bracket everything else. Without them a quiet database is ambiguous: nobody was turned away, or the server was not running. Their `details` carry the bound address, the PID, and the proxy spool's directory and both ceilings, so a `spool_budget_exhausted` row can be read against the budget the run it happened in was configured with.
 
 **Query examples:**
 ```bash
@@ -2143,7 +2191,7 @@ Fields on every row: timestamp, event type, package type/name/version, client IP
 - **Request and response headers or bodies.** Those are a `log_level: 4` (trace) concern in the journal, not an audit record, and a header dump would carry the very credentials the denial rows are careful not to hold.
 - **Successful admin reads.** Only the refusals are rows; a permitted `GET /api/v1/audit` is journal-only.
 
-Denials record at every gate in the middleware chain, at the admin-read gate, and at the three refusals a handler decides for itself: a `DELETE` on a frozen entry (`entry_frozen`), a version outside an entry's `version_constraint` (`version_constraint`), and a git push against a read-only mirror (`push_refused`, on both the `info/refs?service=git-receive-pack` probe and the `git-receive-pack` POST). The `status` column names which gate refused.
+Denials record at every gate in the middleware chain, at the admin-read gate, and at the five refusals a handler decides for itself: a `DELETE` on a frozen entry (`entry_frozen`), a version outside an entry's `version_constraint` (`version_constraint`), a git push against a read-only mirror (`push_refused`, on both the `info/refs?service=git-receive-pack` probe and the `git-receive-pack` POST), and the two proxy spool bounds (`spool_artifact_too_large`, `spool_budget_exhausted`). The `status` column names which gate refused.
 
 An allow-list refusal is a `cache` event with `status=policy_violation` rather than a `denied` row, and it is written wherever the refusal is decided: on the proxy path, and on the apt pool probe, which refuses a `.deb` before any fetch exists to record one.
 
