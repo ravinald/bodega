@@ -26,17 +26,13 @@ func (s *Server) handleHelmChart(w http.ResponseWriter, r *http.Request) {
 	}
 	w = cacheImmutableOn200(w, file)
 
-	// Parse chart name from filename: "ingress-nginx-4.0.0.tgz" → "ingress-nginx".
-	// Splitting on the last "-" and rejoining is lossless, so a prerelease
-	// version ("4.0.0-rc1") lands on the same key it was uploaded under even
-	// though the split lands in the wrong place.
-	chartName := strings.TrimSuffix(file, ".tgz")
-	chartVersion := ""
-	if idx := strings.LastIndex(chartName, "-"); idx > 0 {
-		chartVersion = chartName[idx+1:]
-		chartName = chartName[:idx]
-	}
-	key := manifest.HelmChartKey(chartName, chartVersion)
+	// The whole basename as an unversioned chart yields the key the request
+	// names, which ParseKey then splits the way HelmChartKey built it. Reading
+	// the identity back out of the key rather than off the filename is what
+	// keeps a prerelease whole: "cert-manager-1.14.0-rc.1" is the chart
+	// cert-manager at 1.14.0-rc.1, not cert-manager-1.14.0 at rc.1.
+	key := manifest.HelmChartKey(strings.TrimSuffix(file, ".tgz"), "")
+	_, chartName, chartVersion := manifest.ParseKey(key)
 	pm, _ := s.store.GetPackage(ctx, manifest.TypeHelm, chartName)
 	if pm != nil && packageMode(pm) == manifest.ModeProxy {
 		// Use the URL from the first version that has one.

@@ -141,6 +141,16 @@ func TestParseKeySplitsFlatFilenamesOnTheVersionRule(t *testing.T) {
 		// md-5 is a published crate. Its trailing digit is not a version
 		// because the run does not end the segment.
 		{CargoCrateKey("md-5", "0.10.6"), "md-5", "0.10.6"},
+		// A "v" prefix is common on chart versions and builder.ParseSemVer
+		// keeps it, so a rule that only opens on a digit leaves the whole
+		// filename as the chart name and no version at all.
+		{HelmChartKey("mychart", "v1.2.3"), "mychart", "v1.2.3"},
+		{HelmChartKey("mychart", "V1.2.3"), "mychart", "V1.2.3"},
+		{HelmChartKey("mychart", "v1.2.3-rc.1"), "mychart", "v1.2.3-rc.1"},
+		// The prefix opens a version only when the digit run is dotted, so a
+		// name ending in one stays whole. serde-v8 is a published crate.
+		{HelmChartKey("my-v1", ""), "my-v1", ""},
+		{CargoCrateKey("serde-v8", "0.1.0"), "serde-v8", "0.1.0"},
 	}
 	for _, tc := range cases {
 		_, name, version := ParseKey(tc.key)

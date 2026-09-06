@@ -245,7 +245,7 @@ func lastSegment(s string) string {
 // Two layouts are ambiguous by construction and resolve by a rule rather than
 // a guess. helm and cargo put name and version in one flat filename separated
 // by "-", so the split takes the first "-" that opens a version; see
-// splitTrailingVersion for what qualifies and for the one case that stays
+// splitTrailingVersion for what qualifies and for the two shapes that stay
 // ambiguous. apt's version lives inside the filename, and a name bodega never
 // built returns empty rather than a guess.
 func ParseKey(key string) (typ, name, version string) {
@@ -382,14 +382,22 @@ func AptDebIdentity(filename string) (name, version string) {
 // ever type into `bodega pkg checksum clear`.
 //
 // A version opens with a digit run that ends its segment, at "." or at the end
-// of the string. Demanding the run end the segment is what leaves a name whose
-// own tail is numeric intact: "md-5-0.10.6" splits after "md-5", because "5-"
-// continues into another word while "0." does not. Neither ecosystem allows
-// "." in a package name, so a dotted digit run can only be the version.
+// of the string, optionally behind a "v" or "V": helm charts are published
+// under a prefixed version often enough that builder.ParseSemVer accepts both
+// letters and keeps the prefix, so bodega's own builder writes a chart nothing
+// here recognized, leaving "mychart-v1.2.3" whole as a package name. Demanding
+// the run end the segment is what leaves a name whose own tail is numeric
+// intact: "md-5-0.10.6" splits after "md-5", because "5-" continues into
+// another word while "0." does not. Neither ecosystem allows "." in a package
+// name, so a dotted digit run can only be the version.
 //
-// One case stays ambiguous: an unversioned chart whose name ends in a digit
-// segment ("md-5") splits, since a run ending the string reads the same as a
-// version. Charts are the only type that can omit a version at all.
+// Two shapes stay ambiguous, both of them a name that reads as a version. An
+// unversioned chart whose name ends in a digit segment ("md-5") splits, since
+// a run ending the string reads the same as a version; charts are the only
+// type that can omit a version at all. A name whose own tail is a dotted digit
+// run splits there rather than at the version ("foo-2.0-1.0" reads as "foo" at
+// "2.0-1.0"), because nothing in the key says which of the two runs the
+// uploader meant.
 func splitTrailingVersion(base string) (name, version string) {
 	for i := 1; i < len(base)-1; i++ {
 		if base[i] == '-' && opensVersion(base[i+1:]) {
@@ -399,14 +407,29 @@ func splitTrailingVersion(base string) (name, version string) {
 	return base, ""
 }
 
-// opensVersion reports whether s begins with a digit run terminated by "." or
-// by the end of s.
+// opensVersion reports whether s begins with a version: a digit run terminated
+// by "." or by the end of s, optionally behind a "v" or "V".
+//
+// The prefixed form must be dotted where the bare form need not be. Both
+// ecosystems version by SemVer, so no legal version is a single component, and
+// demanding the "." leaves an unversioned chart named "my-v1" whole instead of
+// reading its own tail as a version.
 func opensVersion(s string) bool {
+	dotted := false
+	if len(s) > 1 && (s[0] == 'v' || s[0] == 'V') {
+		s, dotted = s[1:], true
+	}
 	i := 0
 	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
 		i++
 	}
-	return i > 0 && (i == len(s) || s[i] == '.')
+	if i == 0 {
+		return false
+	}
+	if dotted {
+		return i < len(s) && s[i] == '.'
+	}
+	return i == len(s) || s[i] == '.'
 }
 
 // unsafeName reverses SafeName, restoring the slashes a stored path segment
