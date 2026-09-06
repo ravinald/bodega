@@ -653,6 +653,8 @@ Not enforced: the age gate cannot evaluate helm, so that row is stored and never
 Remove with 'bodega policy age remove <ecosystem>'.
 ```
 
+Nothing else counts such a row as enforcement. The `bodega serve` startup banner names only ecosystems the age gate can date, so an install carrying the `helm` row above with `npm` and `pypi` on `ignore` reports `minimum publish age: none enforced` rather than the block that never runs.
+
 An upstream that is reachable but has no timestamp for the version warns rather than blocking, on the same reasoning: a registry outage should not fail an import closed.
 
 ### `bodega discover ...`

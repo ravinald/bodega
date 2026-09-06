@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -324,6 +325,10 @@ func firstNonEmptySink(sink string) string {
 // docs/USAGE.md still has to learn from somewhere that a gate is on and which
 // ecosystems it covers. An install with no gate says so for the same reason:
 // silence reads identically either way.
+//
+// Only rows the age gate can date are counted. A row for an uncovered
+// ecosystem changes no admission decision, so printing it would claim
+// enforcement on an install where every gate that runs is off.
 func (s *Server) agePolicyBanner() string {
 	if s.auditDB == nil {
 		return ""
@@ -332,9 +337,10 @@ func (s *Server) agePolicyBanner() string {
 	if err != nil {
 		return ""
 	}
+	covered := policy.AgeEcosystems()
 	active := make([]string, 0, len(rows))
 	for _, p := range rows {
-		if p.Action == policy.ActionIgnore {
+		if p.Action == policy.ActionIgnore || !slices.Contains(covered, p.Ecosystem) {
 			continue
 		}
 		active = append(active, fmt.Sprintf("%s %s (%s)",
