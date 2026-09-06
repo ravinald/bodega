@@ -12,17 +12,18 @@ import (
 	"github.com/ravinald/bodega/internal/storage"
 )
 
-// helmPlacementServer mirrors placementServer for the chart route. Both chart
-// shapes are seeded in both backends under the key HelmChartKey writes, and
-// recordedStorage lands on the prerelease entry alone: the stable entry
-// records nothing, so it answers from the default and pins that the identity
-// it resolves to has not moved.
+// helmPlacementServer mirrors placementServer for the chart route. All three
+// chart shapes are seeded in both backends under the key HelmChartKey writes,
+// and recordedStorage lands on the prerelease and "v"-prefixed entries: the
+// stable entry records nothing, so it answers from the default and pins that
+// the identity it resolves to has not moved.
 func helmPlacementServer(t *testing.T, recordedStorage string) *httptest.Server {
 	t.Helper()
 	defaultRoot, bulkRoot := t.TempDir(), t.TempDir()
 	for _, key := range []string{
 		manifest.HelmChartKey("cert-manager", "1.14.0-rc.1"),
 		manifest.HelmChartKey("cert-manager", "1.14.0"),
+		manifest.HelmChartKey("mychart", "v1.2.3"),
 	} {
 		seed(t, defaultRoot, key, "from-default")
 		seed(t, bulkRoot, key, "from-bulk")
@@ -40,12 +41,14 @@ func helmPlacementServer(t *testing.T, recordedStorage string) *httptest.Server 
 	}
 
 	store := manifest.NewLocalStore(t.TempDir())
-	for _, ve := range []manifest.VersionEntry{
-		{Version: "1.14.0-rc.1", Storage: recordedStorage},
-		{Version: "1.14.0"},
+	for chart, entries := range map[string][]manifest.VersionEntry{
+		"cert-manager": {{Version: "1.14.0-rc.1", Storage: recordedStorage}, {Version: "1.14.0"}},
+		"mychart":      {{Version: "v1.2.3", Storage: recordedStorage}},
 	} {
-		if err := store.AddVersion(t.Context(), manifest.TypeHelm, "cert-manager", ve); err != nil {
-			t.Fatalf("AddVersion %s: %v", ve.Version, err)
+		for _, ve := range entries {
+			if err := store.AddVersion(t.Context(), manifest.TypeHelm, chart, ve); err != nil {
+				t.Fatalf("AddVersion %s/%s: %v", chart, ve.Version, err)
+			}
 		}
 	}
 
@@ -88,5 +91,22 @@ func TestHelmStableChartIdentityUnchanged(t *testing.T) {
 	}
 	if body != "from-default" {
 		t.Fatalf("served %q, want %q — a stable version records no backend and answers from the default", body, "from-default")
+	}
+}
+
+// TestHelmPrefixedVersionChartResolvesItsEntry covers the other stable shape.
+// helm publishes plenty of charts at "v1.2.3" and builder.ParseSemVer keeps
+// the prefix, so a splitting rule that opens only on a digit reads the whole
+// filename as the chart name at no version — an identity the last-"-" split
+// got right, and the one requirement 5 forbids moving.
+func TestHelmPrefixedVersionChartResolvesItsEntry(t *testing.T) {
+	ts := helmPlacementServer(t, "bulk")
+
+	code, body := getBody(t, ts, "/helm/charts/mychart-v1.2.3.tgz")
+	if code != http.StatusOK {
+		t.Fatalf("GET v-prefixed chart = %d (%q), want 200", code, body)
+	}
+	if body != "from-bulk" {
+		t.Fatalf("served %q, want %q — the chart resolved through the type rule, not the backend its version entry names", body, "from-bulk")
 	}
 }

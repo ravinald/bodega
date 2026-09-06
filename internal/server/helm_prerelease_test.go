@@ -16,6 +16,9 @@ import (
 const (
 	prereleaseChart = "cert-manager-1.14.0-rc.1.tgz"
 	stableChart     = "cert-manager-1.14.0.tgz"
+	// A "v" prefix is the other shape the old split read correctly, so the
+	// splitting rule has to open on one to keep it.
+	prefixedChart = "mychart-v1.2.3.tgz"
 )
 
 // seedProxyHelm puts one proxy-mode chart in the store. A helm upstream is
@@ -64,16 +67,17 @@ func TestHelmPrereleaseChartReachesProxyUpstream(t *testing.T) {
 func TestHelmChartNoManifestRowNamesTheChart(t *testing.T) {
 	s := newDiscoveryServer(t)
 
-	for _, file := range []string{prereleaseChart, stableChart} {
+	for _, file := range []string{prereleaseChart, stableChart, prefixedChart} {
 		if status, body := getStatusAndBody(t, s, "/helm/charts/"+file); status != http.StatusNotFound {
 			t.Fatalf("GET %s = %d (%q), want 404 — this branch records the miss, it does not serve it", file, status, body)
 		}
 	}
 
-	rows := waitForDiscovery(t, s, 2)
+	rows := waitForDiscovery(t, s, 3)
 	for _, want := range [][2]string{
 		{"cert-manager", "1.14.0-rc.1"},
 		{"cert-manager", "1.14.0"},
+		{"mychart", "v1.2.3"},
 	} {
 		found := false
 		for _, row := range rows {
