@@ -427,6 +427,10 @@ func (m appModel) handlePopupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if dismissed {
 			m.sources.Refresh(m.store, m.statuses)
 			m.syncDetails()
+			// Unlike popupForm, where the overlay is a sub-mode the form
+			// returns to, this popup has nothing behind the textarea. Leaving
+			// the kind set renders an empty box that swallows every key.
+			m.popup.dismiss()
 		}
 		return m, cmd
 
