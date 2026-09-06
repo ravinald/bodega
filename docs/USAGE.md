@@ -2108,32 +2108,32 @@ Measured on an Apple M1 Ultra (Mac13,2), macOS 26.7, internal NVMe over Apple Fa
 
 | Offered | Sink | Events/s landed | Discovery dropped | Hot-path write p99 |
 |---|---|---|---|---|
-| 500/s | `sqlite` | 925 | 0% | 1.36 s |
-| | `postgres` | 999 | 0% | 23 ms |
-| | `syslog` | 1,000 | 0% | 4.3 ms |
-| | `jsonl` | 1,000 | 0% | 1.9 ms |
-| 1,000/s | `sqlite` | 1,678 | 6.5% | 956 ms |
-| | `postgres` | 1,997 | 0% | 18 ms |
-| | `syslog` | 1,999 | 0% | 3.0 ms |
+| 500/s | `sqlite` | 803 | 0% | 1.27 s |
+| | `postgres` | 989 | 0% | 24 ms |
+| | `syslog` | 1,000 | 0% | 3.1 ms |
+| | `jsonl` | 1,000 | 0% | 2.2 ms |
+| 1,000/s | `sqlite` | 1,772 | 0% | 951 ms |
+| | `postgres` | 1,997 | 0% | 17 ms |
+| | `syslog` | 1,998 | 0% | 3.4 ms |
 | | `jsonl` | 1,999 | 0% | 2.0 ms |
-| 2,000/s | `sqlite` | 2,848 | 48.5% | 638 ms |
-| | `postgres` | 3,556 | 22.0% | 14 ms |
-| | `syslog` | 3,998 | 0% | 3.1 ms |
-| | `jsonl` | 3,998 | 0% | 2.2 ms |
-| 8,000/s | `sqlite` | 7,058 | 97.3% | 179 ms |
-| | `postgres` | 8,355 | 95.5% | 15 ms |
-| | `syslog` | 15,987 | 0% | 3.0 ms |
-| | `jsonl` | 15,996 | 0% | 1.9 ms |
+| 2,000/s | `sqlite` | 3,608 | 0% | 638 ms |
+| | `postgres` | 3,993 | 0% | 15 ms |
+| | `syslog` | 3,998 | 0% | 3.2 ms |
+| | `jsonl` | 3,997 | 0% | 2.6 ms |
+| 8,000/s | `sqlite` | 8,941 | 64.4% | 180 ms |
+| | `postgres` | 15,979 | 0% | 15 ms |
+| | `syslog` | 15,990 | 0% | 3.0 ms |
+| | `jsonl` | 15,992 | 0% | 2.6 ms |
 
-Unthrottled, the same harness sustains 8,837 hot-path writes/s on `sqlite` (10 of 92,815 lost to the 5 s busy timeout, p99 54 ms), 12,496/s on `postgres` (none lost, p99 20 ms), 133,618/s on `syslog` and 224,466/s on `jsonl`.
+Unthrottled, the same harness sustains 8,639 hot-path writes/s on `sqlite` (7 of 92,267 lost to the 5 s busy timeout, p99 57 ms), 11,720/s on `postgres` (none lost, p99 21 ms), 132,055/s on `syslog` and 199,655/s on `jsonl`.
 
 Convert a fleet to a request rate with `hosts x updates-per-hour x requests-per-update / 3600`. A thousand hosts running `apt update` twice an hour over a dozen index paths is about 7 requests/s; a CI fleet installing packages per build is one to two orders of magnitude above that.
 
-- **Under ~500 requests/s: `sqlite`.** Nothing drops, and the store you already have needs no daemon. Its hot-path p99 is the worst of the four even here — over a second, because the request goroutine waits on the write lock the discovery worker holds — but that latency is off the response path.
-- **~500 to ~2,000 requests/s, or more than one bodega: `postgres`.** It is the only sink that keeps the trail queryable at that rate, and its hot-path p99 stays under 25 ms across the whole range with no writes lost to a timeout. It is also the only way to report across instances: each host keeps its own `audit_db` for ACLs and tokens, and their events land in one place.
-- **Above ~2,000 requests/s, or when the SIEM already exists: `syslog` or `jsonl`.** Neither dropped a row at any rate measured. You are trading `bodega discover promote` and `GET /api/v1/audit` for that; if you need them back, run one instance on `postgres`.
+- **Up to ~2,000 requests/s: `sqlite`.** Nothing drops, and the store you already have needs no daemon. Its hot-path p99 is the worst of the four even at 500 requests/s (over a second, because the request goroutine waits on the write lock the discovery batch holds), but that latency is off the response path.
+- **Above ~2,000 requests/s, or more than one bodega: `postgres`.** It dropped no observations at any rate measured here and lost no hot-path write to a timeout, and its p99 stays under 25 ms across the whole range. It is also the only way to report across instances: each host keeps its own `audit_db` for ACLs and tokens, and their events land in one place.
+- **When the SIEM already exists, at any rate: `syslog` or `jsonl`.** Neither dropped a row at any rate measured, and both have the cheapest hot-path latency of the four. You are trading `bodega discover promote` and `GET /api/v1/audit` for that; if you need them back, run one instance on `postgres`.
 
-**The drops in that table are not the sink.** `DiscoveryRecorder` drains its 1,024-deep queue with a single goroutine doing one synchronous write per row, so the discovery half is capped by one write's latency however wide the pool underneath is: about 2,700 rows/s on `sqlite` and about 900/s on `postgres`, where each upsert costs a network round trip. That is why `postgres` starts dropping observations at 2,000 requests/s despite absorbing 12,500 hot-path writes/s. The hot-path event rows, which are written concurrently, show what the sink can actually take. Batching that worker is filed as [#217](https://github.com/ravinald/bodega/issues/217).
+**What `sqlite` drops at 8,000 requests/s is the write lock, not the drain.** `DiscoveryRecorder` accumulates up to 128 observations or 50 ms, whichever comes first, and writes the batch as one statement. Serially it was one write latency per row, which held the drain to about 2,700 rows/s on `sqlite` and about 900/s on `postgres` (each upsert there costs a network round trip) however wide the pool underneath was, and made `postgres` drop more observations than `sqlite` at 2,000 requests/s while absorbing 40% more hot-path writes. Batched, `postgres` drains 11,700 rows/s and takes everything offered at 8,000 requests/s. `sqlite` takes everything up to 2,000 and drops 64% at 8,000, because its batch contends with 64 request goroutines for the one write lock, which is a property of the store rather than of how the queue is drained.
 
 **Event types:**
 

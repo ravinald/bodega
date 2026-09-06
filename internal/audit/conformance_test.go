@@ -118,7 +118,7 @@ func testEventSink(t *testing.T, mk func(t *testing.T) sinkHarness) {
 		}},
 
 		{"every_discovery_field_survives", func(t *testing.T, ctx context.Context, h sinkHarness) {
-			if err := h.sink.RecordDiscovery(ctx, fullRow); err != nil {
+			if _, err := h.sink.RecordDiscovery(ctx, fullRow); err != nil {
 				t.Fatalf("RecordDiscovery: %v", err)
 			}
 			got := h.discoveries(t)
@@ -142,7 +142,7 @@ func testEventSink(t *testing.T, mk func(t *testing.T) sinkHarness) {
 		{"decision_outside_the_set_is_refused", func(t *testing.T, ctx context.Context, h sinkHarness) {
 			bad := fullRow
 			bad.Decision = "would_deny" // retired by SQLite migration 010
-			if err := h.sink.RecordDiscovery(ctx, bad); err == nil {
+			if _, err := h.sink.RecordDiscovery(ctx, bad); err == nil {
 				t.Fatal("RecordDiscovery accepted a decision outside the set; every sink must refuse it")
 			}
 			if got := h.discoveries(t); len(got) != 0 {
@@ -207,7 +207,7 @@ func testEventSink(t *testing.T, mk func(t *testing.T) sinkHarness) {
 		// the two halves of the sink set, asserted rather than assumed.
 		{"repeat_observations_collapse_only_on_a_queryable_sink", func(t *testing.T, ctx context.Context, h sinkHarness) {
 			for i := 0; i < 3; i++ {
-				if err := h.sink.RecordDiscovery(ctx, fullRow); err != nil {
+				if _, err := h.sink.RecordDiscovery(ctx, fullRow); err != nil {
 					t.Fatalf("RecordDiscovery %d: %v", i, err)
 				}
 			}
@@ -235,6 +235,49 @@ func testEventSink(t *testing.T, mk func(t *testing.T) sinkHarness) {
 			// unavailable for exactly this reason.
 			if len(got) != 3 {
 				t.Errorf("write-only sink emitted %d records for 3 observations, want 3", len(got))
+			}
+		}},
+
+		// One batch carrying the same upsert key twice. Postgres refuses an ON
+		// CONFLICT DO UPDATE that would touch one row twice in a single
+		// statement, so a sink that batched without merging first would fail
+		// the whole write on ordinary traffic — a live request stream repeats
+		// keys constantly. The counts must come out the same as three separate
+		// calls, which is the case above.
+		{"a_batch_repeating_a_key_counts_the_same_as_separate_calls", func(t *testing.T, ctx context.Context, h sinkHarness) {
+			other := fullRow
+			other.PkgName = "github.com/aws/aws-sdk-go-v2/config"
+			batch := []DiscoveryRow{fullRow, other, fullRow, fullRow}
+			applied, err := h.sink.RecordDiscovery(ctx, batch...)
+			if err != nil {
+				t.Fatalf("RecordDiscovery batch: %v", err)
+			}
+			if applied != len(batch) {
+				t.Fatalf("sink applied %d of %d observations", applied, len(batch))
+			}
+			got := h.discoveries(t)
+			if !h.queryable {
+				if len(got) != len(batch) {
+					t.Errorf("write-only sink emitted %d records for a batch of %d, want %d", len(got), len(batch), len(batch))
+				}
+				return
+			}
+			if len(got) != 2 {
+				t.Fatalf("queryable sink kept %d rows for 2 upsert keys, want 2", len(got))
+			}
+			rows, err := h.sink.(EventReader).ListDiscovery(ctx, DiscoveryFilter{})
+			if err != nil {
+				t.Fatalf("ListDiscovery: %v", err)
+			}
+			counts := map[string]int64{}
+			for _, r := range rows {
+				counts[r.PkgName] = r.RequestCount
+			}
+			if counts[fullRow.PkgName] != 3 {
+				t.Errorf("request_count = %d for the repeated key, want 3", counts[fullRow.PkgName])
+			}
+			if counts[other.PkgName] != 1 {
+				t.Errorf("request_count = %d for the single key, want 1", counts[other.PkgName])
 			}
 		}},
 

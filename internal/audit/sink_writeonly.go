@@ -112,6 +112,21 @@ func encodeDiscovery(r DiscoveryRow) ([]byte, error) {
 	})
 }
 
+// encodeDiscoveryBatch renders every row before any of them is written, so a
+// row a sink cannot encode fails the whole call rather than leaving half a
+// batch in the stream and a collector to notice the seam.
+func encodeDiscoveryBatch(rows []DiscoveryRow) ([][]byte, error) {
+	lines := make([][]byte, 0, len(rows))
+	for _, r := range rows {
+		line, err := encodeDiscovery(r)
+		if err != nil {
+			return nil, err
+		}
+		lines = append(lines, line)
+	}
+	return lines, nil
+}
+
 // ---- syslog -----------------------------------------------------------------
 
 // syslogSink hands each event to a syslog daemon and keeps nothing. It exists
@@ -184,12 +199,21 @@ func (s *syslogSink) Record(_ context.Context, ev Event) error {
 	return s.w.Info(string(line))
 }
 
-func (s *syslogSink) RecordDiscovery(_ context.Context, r DiscoveryRow) error {
-	line, err := encodeDiscovery(r)
+// RecordDiscovery emits one line per observation, since a write-only sink has
+// no upsert key to collapse on. The writer is line-oriented, so a batch is a
+// loop and a failure part-way through returns where it stopped: the caller
+// counts only the lines that did not go out.
+func (s *syslogSink) RecordDiscovery(_ context.Context, rows ...DiscoveryRow) (int, error) {
+	lines, err := encodeDiscoveryBatch(rows)
 	if err != nil {
-		return fmt.Errorf("encode discovery row for %q: %w", SinkSyslog, err)
+		return 0, fmt.Errorf("encode discovery row for %q: %w", SinkSyslog, err)
 	}
-	return s.w.Info(string(line))
+	for i, line := range lines {
+		if err := s.w.Info(string(line)); err != nil {
+			return i, err
+		}
+	}
+	return len(rows), nil
 }
 
 // ---- jsonl ------------------------------------------------------------------
@@ -231,10 +255,15 @@ func (s *jsonlSink) Name() string { return SinkJSONL }
 
 func (s *jsonlSink) Close() error { return s.f.Close() }
 
-func (s *jsonlSink) write(line []byte) error {
+func (s *jsonlSink) write(lines ...[]byte) error {
+	var buf []byte
+	for _, line := range lines {
+		buf = append(buf, line...)
+		buf = append(buf, '\n')
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.f.Write(append(line, '\n')); err != nil {
+	if _, err := s.f.Write(buf); err != nil {
 		return fmt.Errorf("write audit sink %q at %s: %w", SinkJSONL, s.path, err)
 	}
 	return nil
@@ -248,12 +277,22 @@ func (s *jsonlSink) Record(_ context.Context, ev Event) error {
 	return s.write(line)
 }
 
-func (s *jsonlSink) RecordDiscovery(_ context.Context, r DiscoveryRow) error {
-	line, err := encodeDiscovery(r)
+// RecordDiscovery appends one line per observation, since a write-only sink has
+// no upsert key to collapse on, and does it in one write: a batch split into N
+// writes is N syscalls and N places another process appending to the same file
+// can interleave a line of its own.
+func (s *jsonlSink) RecordDiscovery(_ context.Context, rows ...DiscoveryRow) (int, error) {
+	lines, err := encodeDiscoveryBatch(rows)
 	if err != nil {
-		return fmt.Errorf("encode discovery row for %q: %w", SinkJSONL, err)
+		return 0, fmt.Errorf("encode discovery row for %q: %w", SinkJSONL, err)
 	}
-	return s.write(line)
+	if len(lines) == 0 {
+		return 0, nil
+	}
+	if err := s.write(lines...); err != nil {
+		return 0, err
+	}
+	return len(rows), nil
 }
 
 // ValidateSyslogDSN reports whether dsn is an address newSyslogSink can dial.

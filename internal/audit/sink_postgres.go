@@ -119,21 +119,27 @@ func (s *postgresSink) Record(ctx context.Context, ev Event) error {
 	return err
 }
 
-func (s *postgresSink) RecordDiscovery(ctx context.Context, r DiscoveryRow) error {
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO upstream_discovery
-		   (registry_type, host, pattern_hint, pkg_name, pkg_version, decision, last_client, upstream_url)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		 ON CONFLICT(registry_type, pattern_hint, pkg_name, pkg_version, decision)
-		 DO UPDATE SET
-		   request_count = upstream_discovery.request_count + 1,
-		   last_seen     = now(),
-		   last_client   = excluded.last_client,
-		   host          = CASE WHEN excluded.host = '' THEN upstream_discovery.host ELSE excluded.host END,
-		   upstream_url  = CASE WHEN excluded.upstream_url = '' THEN upstream_discovery.upstream_url ELSE excluded.upstream_url END`,
-		r.RegistryType, r.Host, r.PatternHint, r.PkgName, r.PkgVersion, r.Decision, r.LastClient, r.UpstreamURL,
-	)
-	return err
+// RecordDiscovery upserts the batch as one multi-row statement, which is one
+// round trip and one commit for the whole batch. Serially, each observation
+// cost a round trip and a commit fsync of its own, and that — not the pool —
+// was what capped the drain at about 900 rows/s.
+func (s *postgresSink) RecordDiscovery(ctx context.Context, rows ...DiscoveryRow) (int, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	if err := validateDiscovery(rows); err != nil {
+		return 0, err
+	}
+	applied := 0
+	for _, chunk := range chunkDiscovery(rows) {
+		//nolint:gosec // G202: the statement is assembled from a generated placeholder list; every value is bound.
+		q, args := buildDiscoveryUpsert(coalesceDiscovery(chunk), true)
+		if _, err := s.db.ExecContext(ctx, q, args...); err != nil {
+			return applied, err
+		}
+		applied += len(chunk)
+	}
+	return applied, nil
 }
 
 // pgArgs accumulates bound values and hands out the $N placeholders postgres

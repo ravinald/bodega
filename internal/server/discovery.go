@@ -26,6 +26,30 @@ const discoveryQueueSize = 1024
 // to spam.
 const discoveryDropLogPeriod = time.Hour
 
+// discoveryBatchSize is how many observations one write carries. Eight full
+// batches empty the queue, and the queryable sinks pay one statement, one
+// round trip and one commit per batch instead of per row — which is what
+// capped the drain at one write latency however wide the pool underneath was.
+// At nine bound parameters per row a full batch binds 1,152, far inside every
+// driver's variable ceiling.
+const discoveryBatchSize = 128
+
+// discoveryBatchWait bounds how long an observation waits when the request
+// rate is too low to fill a batch. A thousand hosts running `apt update` twice
+// an hour is about 7 requests/s, so this rather than the batch size is what
+// decides when their rows appear; 50ms is below what a reader of `bodega
+// discover list` can perceive, and 20 wakeups a second on an idle server costs
+// nothing.
+const discoveryBatchWait = 50 * time.Millisecond
+
+// discoverySink is the recorder's whole view of the audit store: one batched
+// write reporting how many observations it moved. *audit.DB satisfies it. It
+// is an interface so the loss accounting can be driven by a store that refuses
+// or half-accepts a batch, which no real sink does on demand.
+type discoverySink interface {
+	RecordDiscovery(ctx context.Context, rows ...audit.DiscoveryRow) (int, error)
+}
+
 // DiscoveryRecorder writes upstream-fetch observations through a single worker
 // goroutine, so the request path never blocks on a SQLite write. Callers send
 // to Record(); the worker drains the channel until the context passed to
@@ -35,7 +59,7 @@ const discoveryDropLogPeriod = time.Hour
 // constructs one only when both the audit DB and a non-empty discover_mode
 // are configured.
 type DiscoveryRecorder struct {
-	db     *audit.DB
+	db     discoverySink
 	logger *slog.Logger
 	ch     chan audit.DiscoveryRow
 
@@ -68,23 +92,37 @@ func (r *DiscoveryRecorder) Record(row audit.DiscoveryRow) {
 }
 
 // Start drains the queue until ctx is cancelled. Spawn it once from the server
-// lifecycle (Server.Start). When ctx is done, the worker flushes any rows
-// still in the buffered channel before returning.
+// lifecycle (Server.Start). Rows accumulate until the batch is full or
+// discoveryBatchWait elapses, whichever comes first; when ctx is done, the
+// worker flushes the partial batch in hand and everything still in the
+// buffered channel before returning.
 func (r *DiscoveryRecorder) Start(ctx context.Context) {
 	if r == nil {
 		return
 	}
-	tick := time.NewTicker(discoveryDropLogPeriod)
-	defer tick.Stop()
+	logTick := time.NewTicker(discoveryDropLogPeriod)
+	defer logTick.Stop()
+	// A ticker rather than a timer armed on the first row of each batch: the
+	// timer is the tighter bound but has to be stopped, drained and reset on
+	// every flush, and 20 wakeups a second buys the whole dance away for a
+	// worst-case latency of one period instead of one period past the first row.
+	flushTick := time.NewTicker(discoveryBatchWait)
+	defer flushTick.Stop()
 
+	batch := make([]audit.DiscoveryRow, 0, discoveryBatchSize)
 	for {
 		select {
 		case <-ctx.Done():
-			r.drain()
+			r.drain(batch)
 			return
 		case row := <-r.ch:
-			r.write(ctx, row)
-		case <-tick.C:
+			batch = append(batch, row)
+			if len(batch) >= discoveryBatchSize {
+				batch = r.flush(ctx, batch)
+			}
+		case <-flushTick.C:
+			batch = r.flush(ctx, batch)
+		case <-logTick.C:
 			r.summarize()
 		}
 	}
@@ -104,34 +142,48 @@ func (r *DiscoveryRecorder) summarize() {
 	}
 }
 
-// drain pulls any remaining rows out of the buffered channel on shutdown.
-// Uses a fresh, time-bounded context — the parent ctx is already cancelled.
-func (r *DiscoveryRecorder) drain() {
+// drain writes the partial batch Start was holding, then everything still in
+// the buffered channel, then summarizes. Uses a fresh, time-bounded context —
+// the parent ctx is already cancelled, and a batch handed a cancelled context
+// is a batch the sink refuses on the way out the door.
+func (r *DiscoveryRecorder) drain(batch []audit.DiscoveryRow) {
 	drainCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	for {
 		select {
 		case row := <-r.ch:
-			r.write(drainCtx, row)
+			batch = append(batch, row)
+			if len(batch) >= discoveryBatchSize {
+				batch = r.flush(drainCtx, batch)
+			}
 		default:
+			r.flush(drainCtx, batch)
 			r.summarize()
 			return
 		}
 	}
 }
 
-// write persists one dequeued row. A failure here is a different loss from a
-// full queue: backpressure means bodega is taking more traffic than the writer
-// drains, a rejected write means the database itself is not accepting rows.
-// They are counted apart so an operator reading the summary knows which one to
-// chase, and logged at Error because nothing downstream retries.
-func (r *DiscoveryRecorder) write(ctx context.Context, row audit.DiscoveryRow) {
-	if err := r.db.RecordDiscovery(ctx, row); err != nil {
-		r.failed.Add(1)
-		r.logger.Error("discovery write failed, observation lost",
-			"type", row.RegistryType, "hint", row.PatternHint,
-			"pkg", row.PkgName, "decision", row.Decision, "error", err)
+// flush writes the accumulated batch and hands back the emptied slice. A batch
+// the sink refuses is counted as failed, never as dropped: backpressure means
+// bodega is taking more traffic than the writer drains, a rejected write means
+// the store itself is not accepting rows, and an operator sent to fix capacity
+// for a store that is saying no is chasing the wrong thing. The sink reports
+// how many observations it moved, so a batch that lands in part costs the
+// counters only the part that did not, and the log line carries both numbers
+// rather than leaving the reader to infer one from the other.
+func (r *DiscoveryRecorder) flush(ctx context.Context, batch []audit.DiscoveryRow) []audit.DiscoveryRow {
+	if len(batch) == 0 {
+		return batch
 	}
+	applied, err := r.db.RecordDiscovery(ctx, batch...)
+	if err != nil {
+		lost := max(0, len(batch)-applied)
+		r.failed.Add(uint64(lost))
+		r.logger.Error("discovery batch write failed, observations lost — this is not backpressure, check the audit sink",
+			"batch", len(batch), "applied", applied, "lost", lost, "error", err)
+	}
+	return batch[:0]
 }
 
 // classifyDecision maps the policy check result onto the discovery row's

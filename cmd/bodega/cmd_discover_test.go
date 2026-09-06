@@ -64,7 +64,7 @@ func (e *discoverEnv) seedDiscovery(t *testing.T, rows ...audit.DiscoveryRow) {
 	}
 	defer func() { _ = db.Close() }()
 	for _, row := range rows {
-		if err := db.RecordDiscovery(context.Background(), row); err != nil {
+		if _, err := db.RecordDiscovery(context.Background(), row); err != nil {
 			t.Fatalf("seed discovery row %+v: %v", row, err)
 		}
 	}

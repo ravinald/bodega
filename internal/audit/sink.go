@@ -38,7 +38,19 @@ type EventSink interface {
 	// refused or which one cannot answer.
 	Name() string
 	Record(ctx context.Context, ev Event) error
-	RecordDiscovery(ctx context.Context, r DiscoveryRow) error
+
+	// RecordDiscovery writes a batch of observations and returns how many of
+	// them reached the destination. It is a batch on the interface rather than
+	// an optional capability the transactional sinks add: an optional one
+	// needs a fallback at the call site, and a fallback that loops is exactly
+	// the serial drain the batch exists to remove.
+	//
+	// The returned count is what the caller lost track of when err is
+	// non-nil — len(rows) - applied observations did not land. A sink that
+	// writes the batch as one statement returns 0 or len(rows) and nothing
+	// between; one that writes row by row returns where it stopped.
+	RecordDiscovery(ctx context.Context, rows ...DiscoveryRow) (applied int, err error)
+
 	Close() error
 }
 
@@ -117,4 +129,124 @@ func newSink(sc SinkConfig, embedded *sql.DB, readOnly bool) (EventSink, error) 
 		return newJSONLSink(sc.DSN)
 	}
 	return nil, fmt.Errorf("unknown audit_sink %q (want one of: %s)", sc.Kind, strings.Join(Sinks(), ", "))
+}
+
+// discoveryUpsertCols is the column count each batched row binds. It sets how
+// many rows one statement can carry: discoveryBatchRows x this stays under
+// SQLite's 32,766 variable ceiling and postgres's 65,535.
+const discoveryUpsertCols = 9
+
+// discoveryBatchRows caps the rows in one INSERT. The recorder batches well
+// below this; the cap is here so a larger batch splits into legal statements
+// instead of failing at the driver with "too many SQL variables".
+const discoveryBatchRows = 500
+
+// validateDiscovery refuses a batch carrying a decision outside the set before
+// any of it is written. The queryable sinks have a CHECK that would refuse the
+// statement anyway, but it would take every other row in the batch with it and
+// report the loss as the store refusing; catching it here keeps one caller bug
+// from reading as backpressure on the whole batch.
+func validateDiscovery(rows []DiscoveryRow) error {
+	for _, r := range rows {
+		if !ValidDecision(r.Decision) {
+			return fmt.Errorf("discovery decision %q is outside the set (%s)", r.Decision, strings.Join(Decisions(), ", "))
+		}
+	}
+	return nil
+}
+
+// coalesceDiscovery merges observations sharing the upsert key and sets
+// RequestCount to how many each merged row stands for. Postgres refuses an ON
+// CONFLICT DO UPDATE that would touch one row twice in a single statement, and
+// a batch drawn from a live request stream repeats keys constantly, so the
+// merge is what makes a batched upsert legal rather than a way to shorten it.
+//
+// The merge reproduces what the same rows did arriving one at a time: counts
+// add, the last observation wins last_client, and a non-empty host or
+// upstream_url overwrites while an empty one leaves the earlier value alone.
+// RequestCount on the input is ignored — callers record observations, not
+// counts.
+func coalesceDiscovery(rows []DiscoveryRow) []DiscoveryRow {
+	type key struct{ regType, hint, pkg, version, decision string }
+	at := make(map[key]int, len(rows))
+	out := make([]DiscoveryRow, 0, len(rows))
+	for _, r := range rows {
+		k := key{r.RegistryType, r.PatternHint, r.PkgName, r.PkgVersion, r.Decision}
+		i, seen := at[k]
+		if !seen {
+			r.RequestCount = 1
+			at[k] = len(out)
+			out = append(out, r)
+			continue
+		}
+		m := &out[i]
+		m.RequestCount++
+		m.LastClient = r.LastClient
+		if r.Host != "" {
+			m.Host = r.Host
+		}
+		if r.UpstreamURL != "" {
+			m.UpstreamURL = r.UpstreamURL
+		}
+	}
+	return out
+}
+
+// buildDiscoveryUpsert renders the multi-row upsert for rows, already
+// coalesced. postgres wants $N placeholders and now(); SQLite wants ? and
+// strftime. Nothing else about the statement differs, and one builder is what
+// stops the two sinks drifting apart on the merge rules.
+func buildDiscoveryUpsert(rows []DiscoveryRow, postgres bool) (string, []any) {
+	var b strings.Builder
+	b.WriteString(`INSERT INTO upstream_discovery
+		   (registry_type, host, pattern_hint, pkg_name, pkg_version, decision, last_client, upstream_url, request_count)
+		 VALUES `)
+	args := make([]any, 0, len(rows)*discoveryUpsertCols)
+	for i, r := range rows {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteByte('(')
+		for c := range discoveryUpsertCols {
+			if c > 0 {
+				b.WriteString(", ")
+			}
+			if postgres {
+				fmt.Fprintf(&b, "$%d", i*discoveryUpsertCols+c+1)
+			} else {
+				b.WriteByte('?')
+			}
+		}
+		b.WriteByte(')')
+		args = append(args, r.RegistryType, r.Host, r.PatternHint, r.PkgName, r.PkgVersion,
+			r.Decision, r.LastClient, r.UpstreamURL, r.RequestCount)
+	}
+	lastSeen := `strftime('%Y-%m-%dT%H:%M:%fZ','now')`
+	if postgres {
+		lastSeen = "now()"
+	}
+	b.WriteString(`
+		 ON CONFLICT(registry_type, pattern_hint, pkg_name, pkg_version, decision)
+		 DO UPDATE SET
+		   request_count = upstream_discovery.request_count + excluded.request_count,
+		   last_seen     = ` + lastSeen + `,
+		   last_client   = excluded.last_client,
+		   host          = CASE WHEN excluded.host = '' THEN upstream_discovery.host ELSE excluded.host END,
+		   upstream_url  = CASE WHEN excluded.upstream_url = '' THEN upstream_discovery.upstream_url ELSE excluded.upstream_url END`)
+	return b.String(), args
+}
+
+// chunkDiscovery splits rows into statement-sized pieces. Each piece is one
+// statement, so a batch that outgrows the parameter ceiling lands in part
+// rather than not at all, and the caller is told how much of it moved.
+func chunkDiscovery(rows []DiscoveryRow) [][]DiscoveryRow {
+	if len(rows) <= discoveryBatchRows {
+		return [][]DiscoveryRow{rows}
+	}
+	var out [][]DiscoveryRow
+	for start := 0; start < len(rows); start += discoveryBatchRows {
+		end := min(start+discoveryBatchRows, len(rows))
+		out = append(out, rows[start:end])
+	}
+	return out
 }
