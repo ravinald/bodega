@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -80,6 +81,12 @@ type appModel struct {
 	// filterMode is true when the user has pressed / in the Sources pane.
 	filterMode  bool
 	filterInput string
+
+	// logSearchMode is true while the Log pane's find (/) or filter (f) query
+	// is being typed. logSearchFilter picks which of the two is being edited.
+	logSearchMode   bool
+	logSearchFilter bool
+	logSearchInput  string
 
 	// lastCreated tracks the most recently created entry for post-save focus.
 	lastCreatedType string
@@ -214,6 +221,9 @@ func (m appModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	if m.filterMode {
 		return m.handleFilterKey(msg)
+	}
+	if m.logSearchMode {
+		return m.handleLogSearchKey(msg)
 	}
 
 	switch msg.String() {
@@ -420,6 +430,10 @@ func (m appModel) handlePopupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, cmd
 
+	case popupAuditTable:
+		_, cmd := m.popup.HandleAuditTableKey(msg)
+		return m, cmd
+
 	case popupTokenManager:
 		dismissed := m.popup.HandleTokenManagerKey(key)
 		if dismissed {
@@ -459,6 +473,32 @@ func (m appModel) handleFilterKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	m.syncDetails()
+	return m, nil
+}
+
+// handleLogSearchKey handles keypresses while the Log pane's / or f query is
+// being typed. The query applies on every keystroke, so the pane shows what the
+// current input matches before Enter commits it.
+func (m appModel) handleLogSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		m.logSearchMode = false
+	case "esc":
+		m.logSearchMode = false
+		m.logSearchInput = ""
+		m.log.ClearSearch()
+	case "backspace":
+		if len(m.logSearchInput) > 0 {
+			runes := []rune(m.logSearchInput)
+			m.logSearchInput = string(runes[:len(runes)-1])
+		}
+		m.log.SetSearch(m.logSearchInput, m.logSearchFilter)
+	default:
+		if len(msg.Runes) > 0 {
+			m.logSearchInput += string(msg.Runes)
+			m.log.SetSearch(m.logSearchInput, m.logSearchFilter)
+		}
+	}
 	return m, nil
 }
 
@@ -804,7 +844,26 @@ func (m appModel) handleLogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.log.ScrollUp()
 	case "down", "j":
 		m.log.ScrollDown()
-	case "tab", "esc":
+	case "/", "f":
+		// / finds and scrolls to a match; f hides everything that does not
+		// match. Both edit the same query, so switching between them keeps
+		// what was already typed.
+		m.logSearchMode = true
+		m.logSearchFilter = msg.String() == "f"
+		m.logSearchInput = m.log.query
+		m.log.SetSearch(m.logSearchInput, m.logSearchFilter)
+	case "n":
+		m.log.NextMatch()
+	case "N":
+		m.log.PrevMatch()
+	case "tab":
+		m = m.toggleFocus()
+	case "esc":
+		// Esc drops an active query first; a second press changes pane.
+		if m.log.Searching() {
+			m.log.ClearSearch()
+			return m, nil
+		}
 		m = m.toggleFocus()
 	case "q":
 		m.popup = popupModel{
@@ -851,10 +910,13 @@ func (m *appModel) syncDetails() {
 func (m *appModel) buildAuditPopup() popupModel {
 	logPane := m.log
 	cfg := m.cfg
+	width, height := m.width, m.height
+	next := &popupModel{}
 
 	p := popupModel{
 		kind:      popupForm,
 		formTitle: "Audit Log Query",
+		nextPopup: next,
 		formFields: []formField{
 			{Label: "Event type", Value: "", Select: true,
 				Options: []string{"", "fetch", "build", "create", "delete", "cache"}},
@@ -905,26 +967,147 @@ func (m *appModel) buildAuditPopup() popupModel {
 			return
 		}
 
-		logPane.appendLog(dimStyle.Render(fmt.Sprintf("── Audit Log (%d events) ──", len(events))))
-		logPane.appendLog(fmt.Sprintf("%-20s %-8s %-8s %-30s %-10s %-15s %s",
-			"TIMESTAMP", "EVENT", "TYPE", "NAME", "STATUS", "CLIENT", "DURATION"))
-
-		for _, ev := range events {
-			dur := ""
-			if ev.DurationMs > 0 {
-				dur = fmt.Sprintf("%dms", ev.DurationMs)
-			}
-			ts := ev.Timestamp.Format("2006-01-02 15:04:05")
-			name := ev.PkgName
-			if ev.PkgVersion != "" {
-				name += "@" + ev.PkgVersion
-			}
-			logPane.appendLog(fmt.Sprintf("%-20s %-8s %-8s %-30s %-10s %-15s %s",
-				ts, ev.EventType, ev.PkgType, name, ev.Status, ev.ClientIP, dur))
+		logPane.appendLog(dimStyle.Render(fmt.Sprintf("Audit query returned %d events.", len(events))))
+		*next = popupModel{
+			kind:       popupAuditTable,
+			auditTitle: fmt.Sprintf("Audit Log (%d events)", len(events)),
+			auditTable: newAuditTable(events, width, height),
 		}
 	}
 
 	return p
+}
+
+// auditColumns are the audit table's columns in display order. Width is filled
+// in from the data by newAuditTable.
+var auditColumns = []string{"TIMESTAMP", "EVENT", "TYPE", "NAME", "STATUS", "CLIENT", "DURATION"}
+
+// auditNameColumn is the index of NAME, the column that gives up width first:
+// a package path is the only cell long enough to push the rest off-screen, and
+// the only one a reader can still identify from its head.
+const auditNameColumn = 3
+
+// elideHead shortens s to w cells by dropping its leading characters. Package
+// names are paths, and the segment that identifies one is at the end.
+func elideHead(s string, w int) string {
+	runes := []rune(s)
+	if w < 2 || len(runes) <= w {
+		return s
+	}
+	return "…" + string(runes[len(runes)-(w-1):])
+}
+
+// newAuditTable builds the results table for an audit query. Column widths come
+// from the data rather than a constant, because the values that overflow a
+// guessed width (serve_fetch, dists/jammy-updates/InRelease) are the common
+// case, not the exception.
+func newAuditTable(events []audit.StoredEvent, screenW, screenH int) table.Model {
+	rows := make([]table.Row, 0, len(events))
+	for _, ev := range events {
+		dur := ""
+		if ev.DurationMs > 0 {
+			dur = fmt.Sprintf("%dms", ev.DurationMs)
+		}
+		name := ev.PkgName
+		if ev.PkgVersion != "" {
+			name += "@" + ev.PkgVersion
+		}
+		rows = append(rows, table.Row{
+			ev.Timestamp.Format("2006-01-02 15:04:05"),
+			string(ev.EventType),
+			ev.PkgType,
+			name,
+			ev.Status,
+			ev.ClientIP,
+			dur,
+		})
+	}
+
+	// A column no event filled in (DURATION on served requests, for one) is
+	// width spent on nothing, and NAME is the column paying for it.
+	empty := make([]bool, len(auditColumns))
+	for i := range empty {
+		empty[i] = true
+	}
+	widths := make([]int, len(auditColumns))
+	for i, title := range auditColumns {
+		widths[i] = len(title)
+	}
+	for _, r := range rows {
+		for i, cell := range r {
+			if cell != "" {
+				empty[i] = false
+			}
+			if w := lipgloss.Width(cell); w > widths[i] {
+				widths[i] = w
+			}
+		}
+	}
+
+	// Each column costs its width plus the cell style's one-cell padding on
+	// both sides. Anything over budget comes out of NAME, which truncates
+	// with an ellipsis rather than shifting its neighbours.
+	const cellPadding = 2
+	budget := screenW*90/100 - 8
+	total := 0
+	for i, w := range widths {
+		if empty[i] {
+			continue
+		}
+		total += w + cellPadding
+	}
+	if over := total - budget; over > 0 {
+		widths[auditNameColumn] -= over
+		if widths[auditNameColumn] < 12 {
+			widths[auditNameColumn] = 12
+		}
+	}
+
+	// The table truncates a cell at its tail, which makes every
+	// dists/<suite>/InRelease row read the same. Cut the head instead.
+	for _, r := range rows {
+		r[auditNameColumn] = elideHead(r[auditNameColumn], widths[auditNameColumn])
+	}
+
+	cols := make([]table.Column, 0, len(auditColumns))
+	for i, title := range auditColumns {
+		if empty[i] {
+			continue
+		}
+		cols = append(cols, table.Column{Title: title, Width: widths[i]})
+	}
+	for i := range rows {
+		kept := make(table.Row, 0, len(cols))
+		for j, cell := range rows[i] {
+			if empty[j] {
+				continue
+			}
+			kept = append(kept, cell)
+		}
+		rows[i] = kept
+	}
+
+	// The table subtracts its header from the height it is given, so a table
+	// asked for len(rows) shows one row fewer than it holds.
+	height := len(rows) + 1
+	if maxH := screenH - 10; height > maxH {
+		height = maxH
+	}
+	if height < 4 {
+		height = 4
+	}
+
+	t := table.New(
+		table.WithColumns(cols),
+		table.WithRows(rows),
+		table.WithHeight(height),
+		table.WithFocused(true),
+	)
+	st := table.DefaultStyles()
+	st.Header = st.Header.Bold(true).Foreground(colorTypeLabel)
+	st.Selected = st.Selected.Foreground(lipgloss.Color("255")).Background(colorSelectedBg)
+	t.SetStyles(st)
+	return t
 }
 
 func fieldValue(fields []formField, key string) string {
@@ -2255,7 +2438,7 @@ func (m appModel) View() string {
 		logLabel = " Log - " + m.logPath + " "
 	}
 	logTitle := titleStyle(m.focus == focusLog).Render(logLabel)
-	logPane = overlayTitle(logPane, logTitle)
+	logPane = overlayTitle(logPane, logTitle+m.logSearchIndicator())
 
 	screen := lipgloss.JoinVertical(lipgloss.Left, topRow, logPane)
 
@@ -2303,4 +2486,29 @@ func Run(cfg *config.Config, store *manifest.Store, s3client *bos3.Client, store
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, err := p.Run()
 	return err
+}
+
+// logSearchIndicator renders the Log pane's find/filter state into its title:
+// the prefix that entered the mode, the query, and the match position. A query
+// with no hits reads (0/0) rather than disappearing.
+func (m appModel) logSearchIndicator() string {
+	if !m.logSearchMode && !m.log.Searching() {
+		return ""
+	}
+	prefix := "/"
+	if m.logSearchFilter {
+		prefix = "filter:"
+	}
+	label := " " + prefix + m.logSearchInput
+	if m.log.Searching() {
+		if m.logSearchFilter {
+			label += fmt.Sprintf(" (%d)", m.log.MatchCount())
+		} else {
+			label += fmt.Sprintf(" (%d/%d)", m.log.MatchPos(), m.log.MatchCount())
+		}
+	}
+	if m.logSearchMode {
+		label += "_"
+	}
+	return dimStyle.Render(label + " ")
 }

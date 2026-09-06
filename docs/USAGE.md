@@ -2238,11 +2238,24 @@ A read-only audit database used to be the quieter version of the same loss: `Rec
 | `Tab` | Switch focus between Sources and Log pane |
 | `Up`/`Down` or `j`/`k` | Navigate |
 | `Enter` | Expand/collapse group |
-| `/` | Filter sources |
+| `/` | Filter sources (Sources pane), find text (Log pane) |
 | `?` | Show help |
 | `q` | Quit |
 | `C` | Open config editor |
+| `E` | Edit the selected entry as raw JSON |
+| `L` | Query the audit log |
 | `T` | Open token manager |
+
+With the Log pane focused:
+
+| Key | Action |
+|-----|--------|
+| `/` | Find text; the view jumps to the first match |
+| `f` | Filter the pane to matching lines only |
+| `n` / `N` | Next / previous match |
+| `Esc` | Clear the query; a second press returns focus to Sources |
+
+Both queries are case-insensitive substring matches, applied on every keystroke, and they match the text a line prints rather than the escape sequences that color it. The pane title carries the query and the match position, `/apt (2/17)` for a find and `filter:apt (17)` for a filter. `n` and `N` wrap at the ends. The current match is highlighted, which is also how you spot a query with no hits: the count reads `(0/0)` and nothing is marked.
 
 ### Config editor
 
@@ -2258,6 +2271,17 @@ The **Sources line** field for an apt entry is a command an operator pastes into
 
 - **The suite is intersected against the served set.** The pane names the first suite the entry is published to that `apt_suites` (or `apt_codename`) also answers for. An entry naming a suite outside that set reaches no index, and a line pointing at it 404s the whole `dists/` path, which apt reports as "Unable to locate package" — the message a misspelled name produces. The fallback is the first served suite. `GET /api/v1/status` lists such entries under `apt.unserved`.
 - **The signing state comes from the key file, not the running server.** The pane applies the same acceptance test `bodega serve` does — the key must load, and both its armored and dearmored public forms must render — but it reads the file. A server that already loaded a key keeps signing after the file is deleted, because a reload never takes signing away (see [Rotation](#rotation)), so the two disagree until a restart. A note beside the line says so and points at `GET /api/v1/status`, which reports what the server is actually doing.
+
+### Audit log
+
+`L` opens a query form over the audit trail (event type, package type, package name, client IP, limit). Results open in a scrollable table: `Up`/`Down` move, `Esc` or `q` closes it, and the Log pane keeps a line recording how many events the query returned.
+
+The table sizes its columns from the rows it is showing, not from a fixed width, because the values that overflow a guessed width are the common case rather than the exception: `serve_fetch` is 11 characters and `dists/jammy-backports/InRelease` is 31. Two things follow from that:
+
+- **A column no event filled in is dropped.** Served requests carry no `DURATION`, so querying them gives that width back to `NAME` instead of printing a column of nothing.
+- **`NAME` is the column that gives up width first, and it loses its head.** A package name is a path whose identifying part is at the end, so a truncated one reads `…orts/InRelease`. Every other column is short enough to print whole; widen the terminal to see a name in full.
+
+`bodega audit events` prints the same data as fixed-width text for a pipeline.
 
 ### Build stages
 

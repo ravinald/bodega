@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,7 +9,9 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // openConfigForm loads the config file at path with the given --region override
@@ -147,4 +150,51 @@ func lastLogLine(t *testing.T, m *appModel) string {
 		t.Fatal("nothing reached the log pane")
 	}
 	return m.log.outputLines[len(m.log.outputLines)-1]
+}
+
+// TestAuditQueryOpensResultsTable drives the whole L path: the query form saves,
+// and the results replace it with the table popup. The form's onFormSave closes
+// over the popup the builder returned, not the copy the app is driving, so the
+// hand-off only works through the shared nextPopup pointer.
+func TestAuditQueryOpensResultsTable(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "audit.db")
+	adb, err := audit.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open audit DB: %v", err)
+	}
+	if err := adb.Record(context.Background(), audit.Event{
+		EventType: "serve_fetch",
+		PkgType:   "apt",
+		PkgName:   "dists/jammy-updates/InRelease",
+		Status:    "success",
+		ClientIP:  "172.233.223.16",
+	}); err != nil {
+		t.Fatalf("record event: %v", err)
+	}
+	adb.Close()
+
+	m := newAppModel(&config.Config{AuditDB: dbPath}, manifest.NewLocalStore(t.TempDir()), nil, nil, nil)
+	m.width, m.height = 140, 40
+	m.popup = m.buildAuditPopup()
+
+	next, _ := m.handlePopupKey(tea.KeyMsg{Type: tea.KeyEnter})
+	am, ok := next.(appModel)
+	if !ok {
+		t.Fatalf("handlePopupKey returned %T, want appModel", next)
+	}
+	if am.popup.kind != popupAuditTable {
+		t.Fatalf("popup kind = %v after the query saved, want the results table", am.popup.kind)
+	}
+	if got := len(am.popup.auditTable.Rows()); got != 1 {
+		t.Errorf("table holds %d rows, want 1", got)
+	}
+	if !strings.Contains(am.popup.View(140, 40), "dists/jammy-updates/InRelease") {
+		t.Error("the recorded event is missing from the rendered table")
+	}
+
+	next, _ = am.handlePopupKey(tea.KeyMsg{Type: tea.KeyEscape})
+	am = next.(appModel)
+	if am.popup.kind != popupNone {
+		t.Errorf("esc left popup kind %v, want popupNone", am.popup.kind)
+	}
 }
