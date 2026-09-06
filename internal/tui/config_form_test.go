@@ -9,6 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // openConfigForm loads the config file at path with the given --region override
@@ -147,4 +148,30 @@ func lastLogLine(t *testing.T, m *appModel) string {
 		t.Fatal("nothing reached the log pane")
 	}
 	return m.log.outputLines[len(m.log.outputLines)-1]
+}
+
+// TestJSONEditPopupEscClears covers the raw-JSON edit popup opened by E. It has
+// no form behind the textarea, so closing the overlay has to close the popup
+// too; leaving the kind set renders an empty box that eats every key.
+func TestJSONEditPopupEscClears(t *testing.T) {
+	cfg, err := config.Load("", "", "", "", false, false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	m := newAppModel(cfg, manifest.NewLocalStore(t.TempDir()), nil, nil, nil)
+	m.width, m.height = 120, 40
+	m.popup = popupModel{kind: popupJSONEdit, editType: "apt", editName: "nginx"}
+	m.popup.OpenJSONOverlay(m.width, m.height, "{}", "Edit: apt/nginx")
+
+	next, _ := m.handlePopupKey(tea.KeyMsg{Type: tea.KeyEscape})
+	am, ok := next.(appModel)
+	if !ok {
+		t.Fatalf("handlePopupKey returned %T, want appModel", next)
+	}
+	if am.popup.kind != popupNone {
+		t.Errorf("popup kind = %v after esc, want popupNone", am.popup.kind)
+	}
+	if v := am.popup.View(m.width, m.height); v != "" {
+		t.Errorf("popup still renders after esc:\n%s", v)
+	}
 }
