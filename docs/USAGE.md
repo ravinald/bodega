@@ -885,6 +885,8 @@ Both suites are then served by one instance and apt resolves dependencies across
 
 Set it whenever a reverse proxy terminates TLS or publishes a different hostname. bodega then sees a loopback listener with both TLS keys empty, so `tls_cert`/`tls_key` describe the proxy's back end and nothing describes the URL an operator would copy. Deriving the scheme from that pair is what printed `http://` on the sources line of a deployment that is `https://` everywhere a client can see. With `public_url` unset, callers holding a request answer from the request (honoring `X-Forwarded-Proto` from a trusted peer), and callers with none print `<bodega-host>:8080` as a placeholder and say that it is one.
 
+It is also consumed rather than displayed. Every `dist.tarball` bodega writes into an npm packument is built from it (see [Client configuration](#client-configuration)), so a `public_url` naming a host or scheme clients cannot reach fails `npm install` at the tarball fetch rather than at the packument, and npm reports a URL this key composed without naming the key or the packument it came in. Check it first when npm resolves a version and then 404s or times out fetching the `.tgz`.
+
 `discover_mode` turns the upstream-observation log on, and does nothing else: enforcement does not move with it. Valid values are `""` (off) and `"observe"`; anything else is rejected at load. `"learn"` was removed and is refused by name, with the error pointing at `observe` and `bodega pkg convert` — it suppressed the allow-list and recorded nothing `observe` does not. See [`bodega discover ...`](#bodega-discover-) for what gets logged and what to do with it.
 
 `spool_dir`, `spool_max_artifact_bytes` and `spool_max_total_bytes` bound the disk the proxy spends copying upstream artifacts. An empty `spool_dir` means `{build_root}/tmp`, and `bodega serve` refuses to start when it cannot create that directory or write in it. See [Large artifacts and the spool directory](#large-artifacts-and-the-spool-directory) for the two ceilings, what a refused client is told, and where the pressure is reported.
@@ -1356,6 +1358,10 @@ helm repo add bodega https://bodega-host:8080/helm
 npm install --registry https://bodega-host:8080/npm <package>
 ```
 
+bodega rewrites every `dist.tarball` in a packument onto its own `/npm/` route before serving it. Relayed as upstream wrote them, those URLs name `registry.npmjs.org`, and npm's resolver replaces the origin while keeping the upstream path — so the client asks for `/<package>/-/<file>.tgz` with the `/npm` prefix dropped and gets a 404. On a deployment where that path happened to resolve it would get the tarball from a request bodega never sees, past the hidden-package and hidden-version checks, the version constraint, the audit row, the checksum and the cache.
+
+The scheme and host it rewrites to come from [`public_url`](#configuration), or from the request when no `public_url` is set. The cached object is still the document the registry served: the rewrite happens on the way out, so a cache hit and a cache miss hand the client the same URLs and the stored copy remains evidence of what upstream published.
+
 **git** (a `git_upstreams` namespace, clone URL ending in `.git`):
 ```bash
 git clone https://bodega-host:8080/git/github/octocat/Hello-World.git
@@ -1605,7 +1611,7 @@ A `spool_max_artifact_bytes` above a non-zero `spool_max_total_bytes` is refused
 
 A cut transfer is still refused rather than cached: a body shorter than the `Content-Length` the upstream declared fails, the spool file is removed, and no checksum is recorded. Caching short bytes as authoritative is what made every later fetch of the real artifact fail verification against the truncated digest.
 
-The npm packument and the PyPI simple index are the two responses bodega still reads whole, because it parses them. Those are capped at 256 MB and are not spooled, so neither ceiling applies to them.
+The npm packument and the PyPI simple index are the two responses bodega parses rather than relays. A miss on either is spooled and cached like any other object, so the ceilings above still decide what upstream may send; the parse runs on the way out, on a copy read back into memory. For the packument that read is capped at 256 MB on every path it takes — the cache hit, the spooled miss, and the direct fetch the hidden-version filter uses — and a document over the cap is refused with a `502` rather than served with its upstream `dist.tarball` URLs intact.
 
 ### APT index generation
 

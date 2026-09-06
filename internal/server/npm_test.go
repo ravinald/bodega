@@ -2,6 +2,11 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/ravinald/bodega/internal/manifest"
@@ -257,5 +262,227 @@ func TestFilterPackumentByManifest_Constraint(t *testing.T) {
 	}
 	if _, has := times["2026.4.1"]; !has {
 		t.Error("time entry for in-constraint 2026.4.1 should survive")
+	}
+}
+
+// tarballOf pulls one version's dist.tarball out of a packument body.
+func tarballOf(t *testing.T, body []byte, version string) string {
+	t.Helper()
+	var doc struct {
+		Versions map[string]struct {
+			Dist struct {
+				Tarball string `json:"tarball"`
+			} `json:"dist"`
+		} `json:"versions"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		t.Fatalf("unmarshal packument: %v (body %s)", err, truncateForTest(body))
+	}
+	v, ok := doc.Versions[version]
+	if !ok {
+		t.Fatalf("packument has no version %s (body %s)", version, truncateForTest(body))
+	}
+	return v.Dist.Tarball
+}
+
+func truncateForTest(b []byte) string {
+	if len(b) > 400 {
+		return string(b[:400]) + "…"
+	}
+	return string(b)
+}
+
+// A scoped package carries the scope in its tarball path, and bodega's own
+// route splits it back out on "/-/". Composed wrong, the scope lands in the
+// filename half and every scoped install 404s.
+func TestRewriteNpmPackumentScoped(t *testing.T) {
+	raw := []byte(`{
+		"name": "@scope/pkg",
+		"versions": {
+			"1.0.0": {"name":"@scope/pkg","version":"1.0.0","dist":{"tarball":"https://registry.npmjs.org/@scope/pkg/-/pkg-1.0.0.tgz","integrity":"sha512-aaa"}}
+		}
+	}`)
+	out, err := rewriteNpmPackument(raw, "https://bodega.example.com/npm", "@scope/pkg")
+	if err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	const want = "https://bodega.example.com/npm/@scope/pkg/-/pkg-1.0.0.tgz"
+	if got := tarballOf(t, out, "1.0.0"); got != want {
+		t.Errorf("dist.tarball = %q, want %q", got, want)
+	}
+	// The integrity hash is the client's check on the bytes; a rewrite that
+	// drops it has clients install what they cannot verify.
+	if !strings.Contains(string(out), "sha512-aaa") {
+		t.Errorf("rewrite dropped dist.integrity: %s", truncateForTest(out))
+	}
+}
+
+// The upstream host is not what the rewrite keys on. A packument whose
+// tarballs already live on a private registry or a CDN has to land on bodega
+// the same way registry.npmjs.org's does — which is what separates a rewrite
+// from a strings.Replace of the default hostname.
+func TestRewriteNpmPackumentNonDefaultHost(t *testing.T) {
+	raw := []byte(`{
+		"name": "widget",
+		"dist": {"tarball": "https://npm.corp.internal/artifacts/widget-3.0.0.tgz"},
+		"versions": {
+			"1.0.0": {"version":"1.0.0","dist":{"tarball":"https://npm.corp.internal/deep/nested/path/widget-1.0.0.tgz"}},
+			"2.0.0": {"version":"2.0.0","dist":{"tarball":"https://cdn.example.net/t/widget-2.0.0.tgz?sig=abc"}}
+		}
+	}`)
+	out, err := rewriteNpmPackument(raw, "https://bodega.example.com/npm", "widget")
+	if err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	for version, want := range map[string]string{
+		"1.0.0": "https://bodega.example.com/npm/widget/-/widget-1.0.0.tgz",
+		"2.0.0": "https://bodega.example.com/npm/widget/-/widget-2.0.0.tgz",
+	} {
+		if got := tarballOf(t, out, version); got != want {
+			t.Errorf("version %s: dist.tarball = %q, want %q", version, got, want)
+		}
+	}
+	for _, host := range []string{"npm.corp.internal", "cdn.example.net"} {
+		if strings.Contains(string(out), host) {
+			t.Errorf("rewritten packument still names %s: %s", host, truncateForTest(out))
+		}
+	}
+	// The version-manifest route (/npm/{pkg}/{version}) answers with a
+	// top-level dist and no versions map. Left alone it is the same bypass.
+	var doc map[string]any
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	dist, _ := doc["dist"].(map[string]any)
+	if got := dist["tarball"]; got != "https://bodega.example.com/npm/widget/-/widget-3.0.0.tgz" {
+		t.Errorf("top-level dist.tarball = %v, want the bodega route", got)
+	}
+}
+
+// A packument too large to buffer is refused, not relayed: served unrewritten
+// it points the client straight past bodega, which is the defect. The cap is
+// the one the filtered path already imposes through fetchUpstream, so neither
+// packument path is bounded by the spool.
+func TestNpmPackumentOverTheBufferIsRefused(t *testing.T) {
+	saved := maxUpstreamBody
+	maxUpstreamBody = 64
+	t.Cleanup(func() { maxUpstreamBody = saved })
+
+	rec := httptest.NewRecorder()
+	w := &npmPackumentWriter{ResponseWriter: rec, base: "https://bodega.example.com/npm", pkg: "big"}
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write([]byte(strings.Repeat("x", 128))); err == nil {
+		t.Error("Write past the cap returned nil; the copy would read a body nothing can use")
+	}
+	if err := w.flush(); err == nil {
+		t.Error("flush returned nil for a body it could not rewrite")
+	}
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", rec.Code)
+	}
+}
+
+const npmFixturePackument = `{
+	"name": "@scope/pkg",
+	"dist-tags": {"latest": "1.1.0"},
+	"versions": {
+		"1.0.0": {"name":"@scope/pkg","version":"1.0.0","dist":{"tarball":"%[1]s/@scope/pkg/-/pkg-1.0.0.tgz"}},
+		"1.1.0": {"name":"@scope/pkg","version":"1.1.0","dist":{"tarball":"%[1]s/@scope/pkg/-/pkg-1.1.0.tgz"}}
+	},
+	"time": {"created":"2026-01-01T00:00:00Z","1.0.0":"2026-01-01T00:00:00Z","1.1.0":"2026-02-01T00:00:00Z"}
+}`
+
+// The filtered and unfiltered packument paths are two functions serving one
+// document, and a client that trips the filter must not be told a different
+// URL from one that does not. The cache hit is the third answer to the same
+// question: the rewrite runs on the way out, so it applies to a stored copy
+// that still carries the upstream URL.
+func TestNpmPackumentRewriteIsTheSameOnEveryPath(t *testing.T) {
+	s := proxyingServer(t)
+	up := newRecordingUpstream(t)
+	up.route("/@scope/pkg", fmt.Sprintf(npmFixturePackument, up.ts.URL))
+	s.cfg.NpmUpstream = up.ts.URL
+
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+	get := func() []byte {
+		t.Helper()
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+"/npm/@scope/pkg", nil)
+		if err != nil {
+			t.Fatalf("build request: %v", err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET packument: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read packument: %v", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, truncateForTest(body))
+		}
+		return body
+	}
+
+	want := ts.URL + "/npm/@scope/pkg/-/pkg-1.1.0.tgz"
+	miss := tarballOf(t, get(), "1.1.0")
+	if miss != want {
+		t.Errorf("cache miss: dist.tarball = %q, want %q", miss, want)
+	}
+	hit := tarballOf(t, get(), "1.1.0")
+	if hit != want {
+		t.Errorf("cache hit: dist.tarball = %q, want %q", hit, want)
+	}
+	// Without this the second request could have been another miss, and the
+	// assertion above would say nothing about the path that serves from
+	// storage.
+	var fetches int
+	for _, p := range up.paths() {
+		if p == "/@scope/pkg" {
+			fetches++
+		}
+	}
+	if fetches != 1 {
+		t.Errorf("upstream saw %d packument fetches for two requests, want 1: the second must be a cache hit", fetches)
+	}
+
+	// The stored object stays the document the registry served. Rewritten
+	// before the cache write it would carry this instance's public_url, which
+	// is wrong the moment that key changes or a second instance shares the
+	// store.
+	cached, err := s.typeStore(manifest.TypeNpm).GetStream(t.Context(), manifest.NpmPackumentKey("@scope/pkg"))
+	if err != nil || cached == nil {
+		t.Fatalf("read the cached packument: %v", err)
+	}
+	defer func() { _ = cached.Body.Close() }()
+	stored, err := io.ReadAll(cached.Body)
+	if err != nil {
+		t.Fatalf("read the cached packument body: %v", err)
+	}
+	if got := tarballOf(t, stored, "1.1.0"); got != up.ts.URL+"/@scope/pkg/-/pkg-1.1.0.tgz" {
+		t.Errorf("cached dist.tarball = %q, want the upstream URL untouched", got)
+	}
+
+	// Hiding 1.0.0 sends the same package down serveFilteredPackument.
+	pm := &manifest.PackageManifest{
+		ConfigVersion: manifest.CurrentConfigVersion,
+		Name:          "@scope/pkg",
+		Type:          manifest.TypeNpm,
+		Versions: []manifest.VersionEntry{
+			{Version: "1.1.0", Mode: manifest.ModeProxy},
+			{Version: "1.0.0", Hidden: true},
+		},
+	}
+	if err := s.store.SavePackage(t.Context(), pm); err != nil {
+		t.Fatalf("seed npm/@scope/pkg: %v", err)
+	}
+	filtered := get()
+	if got := tarballOf(t, filtered, "1.1.0"); got != want {
+		t.Errorf("filtered path: dist.tarball = %q, want %q", got, want)
+	}
+	if strings.Contains(string(filtered), `"1.0.0"`) {
+		t.Errorf("filtered packument still lists the hidden 1.0.0: %s", truncateForTest(filtered))
 	}
 }

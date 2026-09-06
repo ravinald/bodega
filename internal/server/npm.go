@@ -1,9 +1,14 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
+	"path"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/ravinald/bodega/internal/manifest"
@@ -84,7 +89,21 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 	upstream := s.cfg.NpmUpstream + "/" + pkgName
 	s3Key := manifest.NpmPackumentKey(pkgName)
 	forceProxy := pm != nil && packageMode(pm) == manifest.ModeProxy
-	s.proxyOrCache(w, r, s.typeStore(manifest.TypeNpm), s3Key, upstream, manifest.TypeNpm, pkgName, pkgName, false, forceProxy)
+	rw := &npmPackumentWriter{ResponseWriter: w, base: s.npmPublicRoot(r), pkg: pkgName}
+	s.proxyOrCache(rw, r, s.typeStore(manifest.TypeNpm), s3Key, upstream, manifest.TypeNpm, pkgName, pkgName, false, forceProxy)
+	if err := rw.flush(); err != nil {
+		s.logger.Error("npm packument response failed", "package", pkgName, "error", err)
+	}
+}
+
+// npmPublicRoot is the /npm route root on this bodega: the base every
+// dist.tarball is rewritten onto.
+//
+// publicBase, not r.TLS or r.Host on their own. A client consumes these URLs
+// rather than reading them, so a wrong scheme here is not cosmetic: it is
+// every tarball fetch leaving TLS, which is the defect B19 fixed for cargo.
+func (s *Server) npmPublicRoot(r *http.Request) string {
+	return s.publicBase(r) + "/npm"
 }
 
 // @bitwarden/cli + cli-2026.4.0.tgz → 2026.4.0. "" on unexpected shape.
@@ -139,6 +158,17 @@ func (s *Server) serveFilteredPackument(w http.ResponseWriter, r *http.Request, 
 	if err != nil {
 		s.logger.Error("packument filter failed", "pkg", pkgName, "error", err)
 		http.Error(w, "packument filter failed", http.StatusInternalServerError)
+		return
+	}
+
+	// The same rewrite the unfiltered path applies, through the same function.
+	// A client whose package trips the filter and one whose package does not
+	// have to be told the same URL for the same version; two composition sites
+	// is two that can drift.
+	filtered, err = rewriteNpmPackument(filtered, s.npmPublicRoot(r), pkgName)
+	if err != nil {
+		s.logger.Error("packument rewrite failed", "pkg", pkgName, "error", err)
+		http.Error(w, "packument rewrite failed", http.StatusBadGateway)
 		return
 	}
 
@@ -215,4 +245,182 @@ func filterPackumentByManifest(body []byte, pm *manifest.PackageManifest) ([]byt
 	}
 
 	return json.Marshal(doc)
+}
+
+// npmPackumentWriter buffers a proxied packument so every dist.tarball can be
+// pointed back at bodega before the client sees it.
+//
+// Served as it arrives, a packument names registry.npmjs.org. pacote replaces
+// the origin and keeps the upstream path, so the client asks bodega for
+// /<pkg>/-/<file> with no /npm prefix and gets a 404 — and on a deployment
+// where the path happened to line up it would get the tarball from a request
+// bodega never sees, past the hidden-package and hidden-version checks, the
+// version constraint, the audit row and the cache write, all of which live in
+// handleNpm's tarball branch.
+//
+// The rewrite runs after the cache write, not before it. Rewriting first would
+// store one instance's public_url in the cached object: wrong the moment that
+// key changes, wrong for every other instance the moment two share a store,
+// and it would stop the cached copy being evidence of what the registry
+// published. The cost is a parse per packument request, paid on the metadata
+// path only — no artifact goes through here.
+//
+// Buffering rather than streaming: a JSON value cannot be rewritten from a
+// chunk that may have split it in half. proxyOrCache has already spooled the
+// bytes to disk and written them to the cache before the first Write lands
+// here, so nothing about spool_max_artifact_bytes changes — a packument that
+// is refused by the spool today is still refused there, and one served today
+// is still served. What the buffer adds is one in-memory copy, capped at
+// maxUpstreamBody so a stream bounded by the spool does not become an
+// unbounded allocation. Over that cap the response is refused rather than
+// relayed unrewritten, which is the same ceiling and the same answer the
+// filtered path already gives through fetchUpstream.
+//
+// It is not an http.Flusher and has no ReadFrom. Both would defeat the buffer.
+type npmPackumentWriter struct {
+	http.ResponseWriter
+	base   string // bodega's own /npm root
+	pkg    string // the package name the client asked for
+	status int
+	body   bytes.Buffer
+	tooBig bool
+}
+
+func (p *npmPackumentWriter) WriteHeader(code int) {
+	if p.status == 0 {
+		p.status = code
+	}
+}
+
+func (p *npmPackumentWriter) Write(b []byte) (int, error) {
+	if p.status == 0 {
+		p.status = http.StatusOK
+	}
+	if int64(p.body.Len()+len(b)) > maxUpstreamBody {
+		p.tooBig = true
+		p.body.Reset()
+		// An error rather than a silent discard: it stops the copy at the
+		// ceiling instead of reading the rest of a body nothing will use, and
+		// no status line has gone out yet, so flush can still refuse.
+		return 0, fmt.Errorf("packument for %s exceeds bodega's %d-byte rewrite buffer", p.pkg, maxUpstreamBody)
+	}
+	return p.body.Write(b)
+}
+
+// flush rewrites a successful packument and writes the buffered response
+// through. A refusal or an error passes untouched: those bodies carry no
+// tarball URLs, and a 403 from the allow-list must reach the client as the
+// handler wrote it.
+func (p *npmPackumentWriter) flush() error {
+	if p.status == 0 {
+		p.status = http.StatusOK
+	}
+	body := p.body.Bytes()
+	if p.status == http.StatusOK {
+		if p.tooBig {
+			err := fmt.Errorf("packument for %s exceeds bodega's %d-byte rewrite buffer: serving it unrewritten would point the client at the upstream registry", p.pkg, maxUpstreamBody)
+			http.Error(p.ResponseWriter, err.Error(), http.StatusBadGateway)
+			return err
+		}
+		rewritten, err := rewriteNpmPackument(body, p.base, p.pkg)
+		if err != nil {
+			http.Error(p.ResponseWriter, "packument rewrite failed", http.StatusBadGateway)
+			return err
+		}
+		body = rewritten
+		// proxyS3 sets ETag from the stored object, which is the upstream
+		// document rather than what is going out. Left on, it labels the
+		// rewritten body with a validator for different bytes.
+		p.Header().Del("ETag")
+	}
+	p.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	p.ResponseWriter.WriteHeader(p.status)
+	//nolint:gosec // G705: body is the JSON packument; Content-Type is set by the handler.
+	_, err := p.ResponseWriter.Write(body)
+	return err
+}
+
+// npmPackageNamePattern is the npm registry constraint on package names,
+// applied to the name the upstream document carries because that name is what
+// a rewritten URL is composed from. A registry that answered with a name
+// containing path syntax would otherwise choose the route bodega hands its own
+// clients.
+var npmPackageNamePattern = regexp.MustCompile(`^(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*$`)
+
+// rewriteNpmPackument points every dist.tarball in a packument at this
+// bodega's /npm route. base is npmPublicRoot; pkgName is the package the
+// client asked for, used when the document names no usable name of its own.
+//
+// The document's own name wins where it is one npm would accept, so the
+// version-manifest route (/npm/{pkg}/{version}, which carries a top-level
+// dist) composes the package's URL rather than the request path's.
+//
+// Numbers survive as they were written: json.Number rather than float64, so
+// re-serializing does not reformat a field bodega never read.
+func rewriteNpmPackument(body []byte, base, pkgName string) ([]byte, error) {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var doc map[string]any
+	if err := dec.Decode(&doc); err != nil {
+		return nil, fmt.Errorf("parse packument for %s: %w", pkgName, err)
+	}
+
+	name := pkgName
+	if n, ok := doc["name"].(string); ok && npmPackageNamePattern.MatchString(n) {
+		name = n
+	}
+	prefix := base + "/" + npmEscapeName(name) + "/-/"
+
+	rewriteNpmDistTarball(doc, prefix)
+	if versions, ok := doc["versions"].(map[string]any); ok {
+		for _, v := range versions {
+			if entry, ok := v.(map[string]any); ok {
+				rewriteNpmDistTarball(entry, prefix)
+			}
+		}
+	}
+	return json.Marshal(doc)
+}
+
+// rewriteNpmDistTarball points one version entry's dist.tarball at bodega,
+// keeping the filename the upstream published.
+//
+// The filename is the only part of the upstream URL that carries information
+// bodega needs: its own tarball route parses the version back out of it and
+// composes the upstream URL from npm_upstream. So the host and path the
+// document arrived with are dropped rather than edited, and a packument whose
+// tarballs already live on a private registry or a CDN rewrites the same way
+// registry.npmjs.org's does.
+//
+// An entry naming no file is left as it stands: a rewrite that cannot name a
+// target is a guess, and bodega's route would 404 it anyway.
+func rewriteNpmDistTarball(entry map[string]any, prefix string) {
+	dist, ok := entry["dist"].(map[string]any)
+	if !ok {
+		return
+	}
+	tarball, ok := dist["tarball"].(string)
+	if !ok || tarball == "" {
+		return
+	}
+	u, err := url.Parse(tarball)
+	if err != nil {
+		return
+	}
+	file := path.Base(u.EscapedPath())
+	if file == "" || file == "." || file == "/" {
+		return
+	}
+	dist["tarball"] = prefix + file
+}
+
+// npmEscapeName renders a package name into a URL path, leaving the scope
+// separator a separator: "@scope/pkg" is two path segments on the wire and
+// handleNpm splits the request back on "/-/" to recover it.
+func npmEscapeName(name string) string {
+	parts := strings.Split(name, "/")
+	for i, seg := range parts {
+		parts[i] = url.PathEscape(seg)
+	}
+	return strings.Join(parts, "/")
 }
