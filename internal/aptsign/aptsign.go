@@ -115,6 +115,24 @@ func DefaultKeyPaths(storagePath string) []string {
 	return paths
 }
 
+// inCredentialsDir reports whether path is a file systemd placed in this
+// service's credential directory.
+//
+// The boundary is checked with a separator rather than a prefix so a sibling
+// directory sharing the name's opening characters ("/run/credentials/a.service"
+// against "/run/credentials/a.service-backup") is outside, and both sides are
+// cleaned first so ".." cannot walk out and back in. An unset or relative
+// CREDENTIALS_DIRECTORY exempts nothing: systemd always sets an absolute path,
+// so anything else is a caller's environment rather than systemd's, and "/"
+// would exempt the entire filesystem.
+func inCredentialsDir(path string) bool {
+	dir := os.Getenv(CredentialsEnv)
+	if dir == "" || !filepath.IsAbs(dir) || filepath.Clean(dir) == string(filepath.Separator) {
+		return false
+	}
+	return strings.HasPrefix(filepath.Clean(path), filepath.Clean(dir)+string(filepath.Separator))
+}
+
 // WritablePaths is DefaultKeyPaths without the systemd credential directory,
 // which is a read-only tmpfs. Key generation writes to the first of these it
 // can create.
@@ -153,7 +171,22 @@ func LoadPath(path string) (*KeyRing, error) {
 	// A signing key readable by anyone but its owner is a key you have to
 	// assume is copied. Refuse rather than warn: a warning in a journal
 	// nobody reads is how an 0644 key survives to the next audit.
-	if mode := info.Mode().Perm(); mode&0o077 != 0 {
+	//
+	// The group bit alone is forgiven inside $CREDENTIALS_DIRECTORY, and it
+	// has to be: systemd writes a LoadCredential= file 0440 root:root with an
+	// ACL for the service user, on a read-only tmpfs, so 0600 is a mode
+	// nothing there can set. Refusing it made LoadCredential= — the delivery
+	// docs/bodega.service ships and `apt key generate` recommends —
+	// unusable, and it failed soft: the server came up serving an unsigned
+	// repository while the operator who had just generated a key believed
+	// otherwise.
+	//
+	// World-readable stays refused everywhere, that directory included.
+	// systemd never writes 0004, so a key carrying it there was put there by
+	// something else, and the exemption is for systemd's delivery rather than
+	// for the location.
+	mode := info.Mode().Perm()
+	if mode&0o007 != 0 || (mode&0o070 != 0 && !inCredentialsDir(path)) {
 		return nil, fmt.Errorf("apt signing key %s is mode %#o and readable beyond its owner; run chmod 600 %s", path, mode, path)
 	}
 	data, err := os.ReadFile(path) //nolint:gosec // operator-supplied path from the documented search order

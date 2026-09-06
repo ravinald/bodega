@@ -11,8 +11,11 @@ import (
 func newInitCmd(gf *globalFlags) *cobra.Command {
 	return &cobra.Command{
 		Use:   "init",
-		Short: "Create the S3 bucket with encryption, versioning, and public access block",
-		Long: `init creates the bootstrap S3 bucket and configures it with:
+		Short: "Create the bucket an s3 storage backend needs (encryption, versioning, public access block)",
+		Long: `init is for the s3 storage backend only. An install whose backend is
+"local" stores artifacts in a directory and needs nothing from this command.
+
+It creates the bucket named by --bucket / REPO_BUCKET and configures it with:
   - Server-side encryption (AES-256 / SSE-S3)
   - Versioning enabled
   - All public access blocked

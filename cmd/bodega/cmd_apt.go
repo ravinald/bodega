@@ -31,7 +31,9 @@ after being compromised.
 The key carries no passphrase. On an unattended service the passphrase would
 have to be readable from somewhere with the same permissions as the key, so it
 adds a failure mode and protects nothing. File permissions are the boundary:
-bodega refuses to load a key readable beyond its owner.`,
+bodega refuses to load a key readable beyond its owner. A key delivered as a
+systemd credential is the one exception, because systemd writes it 0440 on a
+read-only tmpfs no other service can reach and no chmod can change.`,
 	}
 	keyParent.AddCommand(
 		newAptKeyGenerateCmd(gf),

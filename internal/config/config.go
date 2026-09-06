@@ -550,23 +550,26 @@ func (c *Config) RootForType(typ string) string {
 
 // ResolveSpoolDir names the directory the proxy copies an upstream artifact
 // through on its way to storage and the client: spool_dir, else
-// <build_root>/tmp, which is where cmd/bodega/cmd_repair_keys.go already
-// spools. Deriving it from the config rather than reading $TMPDIR is what
-// stops the artifact traffic landing on the filesystem that also holds the
-// audit database and the local store without anyone choosing it.
+// <storage_path>/tmp. Deriving it from the config rather than reading $TMPDIR
+// is what stops the artifact traffic landing on a filesystem nobody chose.
 //
-// os.TempDir is reachable only from a hand-built Config, since Load always
-// fills BuildRoot. It is probed and refused at startup like any other resolved
-// location, so the fallback cannot bring a server up over a spool it cannot
-// write.
+// It hangs off storage_path rather than build_root because the server unit
+// docs/bodega.service ships runs ProtectSystem=strict with ReadWritePaths
+// naming storage_path and log_dir alone. build_root defaults to /opt/bodega,
+// which that unit makes read-only, so a build_root default meant serve refused
+// to start on the deployment the unit describes. The spool also feeds
+// storage_path on every miss, so sharing a filesystem with it turns the final
+// move into a rename.
+//
+// DefaultStoragePath stands in when storage_path is unset, which is what an
+// S3-only install leaves it as. defaultManifestDir resolves the same way for
+// the same reason: both land inside the unit's ReadWritePaths whether or not
+// the operator wrote the key.
 func (c *Config) ResolveSpoolDir() string {
 	if c.SpoolDir != "" {
 		return c.SpoolDir
 	}
-	if c.BuildRoot != "" {
-		return filepath.Join(c.BuildRoot, "tmp")
-	}
-	return os.TempDir()
+	return filepath.Join(firstNonEmpty(c.StoragePath, DefaultStoragePath), "tmp")
 }
 
 // spoolCeiling resolves one of the two spool byte ceilings against the file

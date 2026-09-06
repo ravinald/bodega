@@ -12,9 +12,9 @@ import (
 func newRemoveCmd(gf *globalFlags) *cobra.Command {
 	return &cobra.Command{
 		Use:   "remove <type> <name>",
-		Short: "Remove artifacts from S3 without touching the manifest",
-		Long: `remove deletes the artifact(s) for the named entry from S3. The manifest
-file is not modified.
+		Short: "Remove artifacts from the storage backend without touching the manifest",
+		Long: `remove deletes the artifact(s) for the named entry from the storage
+backend. The manifest file is not modified.
 
 Every version of the entry is removed, each from the backend its own record
 names. An entry no object key resolves for is an error, not a no-op: both

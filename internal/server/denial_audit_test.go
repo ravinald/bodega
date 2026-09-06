@@ -25,8 +25,12 @@ func newDenialServer(t *testing.T, adminCIDR, denyList []string) *Server {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := &config.Config{
-		AptCodename:     "noble",
-		LogDir:          dir,
+		AptCodename: "noble",
+		LogDir:      dir,
+		// The spool hangs off storage_path, and an unset one resolves to
+		// config.DefaultStoragePath, which no test user can create: Start
+		// would refuse before writing the audit rows these tests read.
+		StoragePath:     dir,
 		AuditDB:         filepath.Join(dir, "audit.db"),
 		AdminPermitCIDR: adminCIDR,
 		DenyList:        denyList,

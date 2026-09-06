@@ -201,15 +201,15 @@ bodega pkg create git netbox --storage archive   # pin this package's writes
 
 `--storage` sets `storage_policy` on the new package and is never prompted for. Almost every package answers it "whatever the type rule says", and `bodega pkg edit` opens the whole manifest, so the field is reachable interactively without a ninth question in an already-long form. An unknown backend name is rejected before the first prompt, and a name on a `pypi` entry warns that the write path will not consult it.
 
-### `bodega pkg delete <type> <name> [--remove-from-s3]`
+### `bodega pkg delete <type> <name> [--remove-artifacts]`
 
-Removes an entry from the manifest. Pass `--remove-from-s3` to also delete the artifacts first. Frozen entries cannot be deleted.
+Removes an entry from the manifest. Pass `--remove-artifacts` to also delete the artifacts first. Frozen entries cannot be deleted.
 
 Every version is removed, each from the backend its own entry records, and each key is checked with a `Head` before the delete so the output distinguishes "removed" from "was already gone". An entry no key resolves for (pypi, or an apt entry with no recorded pool path) fails the command with the manifest entry intact: the entry is the only record of which bytes to clean up, so dropping it after a delete that looked nowhere would orphan them.
 
 ### `bodega pkg remove <type> <name>`
 
-Removes an entry's artifacts from the object store without touching the manifest. Resolution, per-version backends and the no-key refusal are the same as `pkg delete --remove-from-s3`.
+Removes an entry's artifacts from the object store without touching the manifest. Resolution, per-version backends and the no-key refusal are the same as `pkg delete --remove-artifacts`.
 
 ### `bodega pkg import <file> [file...]`
 
@@ -312,6 +312,16 @@ dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\n' \
 ```
 
 `--merge` never overwrites a recorded version, so an entry someone promoted to `hosted` stays hosted.
+
+**A catalog is an inventory, not a repository.** Importing one records what a host has; it does not make bodega able to serve those packages, and pointing the host's `sources.list` at bodega after this step gets an empty index. The two are separate on purpose — the catalog is what `bodega status`, `bodega policy` and the discovery residue read — but the order to do them in is the other way round from the way the request usually arrives. Serve first, catalog second:
+
+| You want                                                 | Read                                                                       |
+| -------------------------------------------------------- | -------------------------------------------------------------------------- |
+| the host to install from bodega                          | [Mirroring an upstream archive](#mirroring-an-upstream-archive)            |
+| bodega to serve `.deb`s you built or downloaded yourself | [APT index generation](#apt-index-generation) and `bodega build fetch apt` |
+| a record of what the host already has                    | this section                                                               |
+
+For apt specifically, `bodega build fetch apt` shells out to `apt-get download <name>` on the bodega host: it passes no version, so a catalog entry's version names the storage key and nothing else, and the host can only resolve releases its own apt sources carry. A bodega on noble cannot fetch a jammy catalog that way. Mirroring is what serves another release.
 
 ### `bodega pkg export [type] [name]`
 

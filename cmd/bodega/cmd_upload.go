@@ -13,7 +13,7 @@ func newUploadCmd(gf *globalFlags) *cobra.Command {
 	var replacePlacement bool
 	cmd := &cobra.Command{
 		Use:   "upload [TYPE...]",
-		Short: "Upload built artifacts to S3 (cascades through full pipeline if needed)",
+		Short: "Upload built artifacts to the storage backend (cascades through full pipeline if needed)",
 		Long: `upload ensures all pipeline stages are complete and then syncs the local
 build artifacts to S3 for the specified types.
 

@@ -470,17 +470,19 @@ func TestStartRefusesAnUnwritableSpoolDir(t *testing.T) {
 	}
 }
 
-// <build_root>/tmp is the default because cmd/bodega/cmd_repair_keys.go
-// already spools there. Deriving it from $TMPDIR instead is what put the
-// artifact traffic on the filesystem holding the audit database and the local
-// store with nobody choosing it.
-func TestSpoolDirDefaultsUnderBuildRoot(t *testing.T) {
+// <storage_path>/tmp is the default, and build_root does not displace it even
+// when set. docs/bodega.service runs ProtectSystem=strict with ReadWritePaths
+// naming storage_path and log_dir alone, so a spool under build_root's
+// /opt/bodega default is a directory the service cannot create: serve refused
+// to start on the deployment the shipped unit describes. Deriving it from
+// $TMPDIR instead would put the artifact traffic on a filesystem nobody chose.
+func TestSpoolDirDefaultsUnderStoragePath(t *testing.T) {
 	root := t.TempDir()
 	cfg := &config.Config{
 		AptCodename: "noble",
 		LogDir:      t.TempDir(),
-		StoragePath: t.TempDir(),
-		BuildRoot:   root,
+		StoragePath: root,
+		BuildRoot:   filepath.Join(t.TempDir(), "unwritable-by-the-unit"),
 	}
 	s := newServer(cfg, manifest.NewLocalStore(t.TempDir()), nil, "127.0.0.1:0",
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
