@@ -592,7 +592,7 @@ An audit database written under the retired `discover_mode: "learn"` also holds 
 | npm | packument, tarball | every request; `no_manifest` on a tarball for an unknown package |
 | pypi | simple index, wheel | every request, including the read of the upstream simple index a wheel is resolved through; `no_manifest` on a wheel for an unknown distribution |
 | gomod | `/go/...` | every request; `no_manifest` on a module with no entry |
-| helm | `/helm/charts/*.tgz` | every request; `no_manifest` on a chart with no entry, with an empty upstream URL (a chart repo is named per version entry, so with no entry there is no URL to record) |
+| helm | `/helm/charts/*.tgz` | every request; `no_manifest` on a chart with no entry, with an empty upstream URL (a chart repo is named per version entry, so with no entry there is no URL to record). The package and version are read back out of the chart key, so `cert-manager-1.14.0-rc.1.tgz` is recorded as `cert-manager` at `1.14.0-rc.1` and a promote names a chart that exists |
 | git | `/git/{namespace}/...` | one row per clone under an `open` namespace, with an empty version. A clone is two requests, an `info/refs` GET and a `git-upload-pack` POST, and both pass the allow-list; only the `info/refs` leg is recorded, so a git count means the same thing as every other type's. `no_manifest` on an uncataloged repository under a `catalog` one; `no_namespace` on a first segment naming no `git_upstreams` entry, with the namespace as both the package and the pattern |
 | binary | `/binaries/{namespace}/...` | every request under an `open` namespace; `no_manifest` on an uncataloged path under a `catalog` one; `no_namespace` on a first segment naming no `binary_upstreams` entry, once any entry exists |
 

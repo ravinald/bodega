@@ -368,6 +368,8 @@ Each cached row is keyed by its object key and also carries the package type, na
 
 helm and cargo are the two trees whose key flattens name and version into one filename, and `-` is legal inside both a chart name and a prerelease version. `ParseKey` splits at the first `-` that opens a digit run ending at `.` or at the end of the name, so `cert-manager-1.14.0-rc.1.tgz` reads as `cert-manager` at `1.14.0-rc.1` and the crate `md-5-0.10.6.crate` keeps its numeric tail. One shape has no answer from the key alone: an unversioned chart whose name ends in a digit segment reads that segment as a version. Charts are the only type that can omit a version, so nothing else is exposed to it.
 
+The chart request path reads the same rule. `handleHelmChart` builds the requested key with `HelmChartKey` and takes the name and version back out of it with `ParseKey`, so the proxy-mode lookup, the `no_manifest` discovery row and the per-version storage backend all name the chart a client would type. The key itself is the request's own filename either way, so where a chart is stored does not depend on the split.
+
 ### Where the CIDR lists live
 
 `admin_permit_cidr`, `deny_list` and `trusted_proxies` live in the audit database, in `acl_lists` and `acl_entries` (migration `008`). They are the only runtime values that have moved out of `config.json` so far; `docs-internal/CONFIG_TO_DB_MIGRATION.md` scopes the rest.
