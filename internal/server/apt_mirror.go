@@ -231,8 +231,9 @@ func (s *Server) serveAptMirror(w http.ResponseWriter, r *http.Request, store st
 	// policyCandidate is the upstream URL: apt is a host-scoped type, so the
 	// allow-list matches its hostname. proxyOrCache runs that check before
 	// fetchUpstream, which is what keeps a refused archive from being
-	// contacted at all. The discovery row's version is read back off the key
-	// by pkgVersionFromKey, which parses the same filename this handler did.
+	// contacted at all. The discovery row's name and version are read back off
+	// the key by manifest.ParseKey, which parses the same filename this
+	// handler did.
 	s.proxyOrCache(w, r, store, key, upstream, manifest.TypeApt, upstream, pkgName, immutable, true)
 }
 

@@ -10,53 +10,88 @@ type roundTrip struct {
 	version string
 }
 
-// keyRoundTrips holds one case per member of AllTypes, built by the
+// keyRoundTrips holds at least one case per member of AllTypes, built by the
 // constructor rather than by a hand-written string: a key literal would keep
 // passing after the constructor changed the layout underneath it.
+//
+// Every type whose encoding can alter a name carries a name that exercises it.
+// npm, git and binary get one with a slash; helm and cargo get one with a
+// literal "--", which SafeName never produces for them and unsafeName used to
+// decode back to a slash on the way out.
 //
 // pypi is the one entry with no constructor. Wheels upload as a directory and
 // ArtifactKeys answers ErrPypiNoObjectKey for them, so the key here is built
 // from PypiWheelPrefix the way the sync writes it.
-var keyRoundTrips = map[string]roundTrip{
+var keyRoundTrips = map[string][]roundTrip{
 	TypeBinary: {
-		key:     BinaryKey("aws-cli", "2.15.0", "awscliv2.zip"),
-		name:    "aws-cli",
-		version: "2.15.0",
+		{
+			key:     BinaryKey("aws-cli", "2.15.0", "awscliv2.zip"),
+			name:    "aws-cli",
+			version: "2.15.0",
+		},
 	},
 	TypeGit: {
-		key:     GitKey("github.com/ravinald/bodega", "v1.2.0", false),
-		name:    "github.com/ravinald/bodega",
-		version: "v1.2.0",
+		{
+			key:     GitKey("github.com/ravinald/bodega", "v1.2.0", false),
+			name:    "github.com/ravinald/bodega",
+			version: "v1.2.0",
+		},
 	},
 	TypeApt: {
-		key:     AptKey("pool/main/n/nginx/nginx_1.24.0-2ubuntu7.1_amd64.deb"),
-		name:    "nginx",
-		version: "1.24.0-2ubuntu7.1",
+		{
+			key:     AptKey("pool/main/n/nginx/nginx_1.24.0-2ubuntu7.1_amd64.deb"),
+			name:    "nginx",
+			version: "1.24.0-2ubuntu7.1",
+		},
 	},
 	TypePypi: {
-		key:     PypiWheelPrefix + "1.26.0/boto3-1.26.0-py3-none-any.whl",
-		name:    "boto3",
-		version: "1.26.0",
+		{
+			key:     PypiWheelPrefix + "1.26.0/boto3-1.26.0-py3-none-any.whl",
+			name:    "boto3",
+			version: "1.26.0",
+		},
 	},
 	TypeGomod: {
-		key:     GomodKey("github.com/aws/aws-sdk-go-v2", "v1.30.0", ".zip"),
-		name:    "github.com/aws/aws-sdk-go-v2",
-		version: "v1.30.0",
+		{
+			key:     GomodKey("github.com/aws/aws-sdk-go-v2", "v1.30.0", ".zip"),
+			name:    "github.com/aws/aws-sdk-go-v2",
+			version: "v1.30.0",
+		},
 	},
 	TypeHelm: {
-		key:     HelmChartKey("ingress-nginx", "4.11.2"),
-		name:    "ingress-nginx",
-		version: "4.11.2",
+		{
+			key:     HelmChartKey("ingress-nginx", "4.11.2"),
+			name:    "ingress-nginx",
+			version: "4.11.2",
+		},
+		// A chart name cannot hold a slash, so "--" in one is literal.
+		// Decoding it turned a proxy-mode request for foo--bar into a
+		// manifest lookup for foo/bar, which matched nothing.
+		{
+			key:     HelmChartKey("foo--bar", "1.2.3"),
+			name:    "foo--bar",
+			version: "1.2.3",
+		},
 	},
 	TypeNpm: {
-		key:     NpmTarballKey("@bitwarden/cli", "2024.7.2"),
-		name:    "@bitwarden/cli",
-		version: "2024.7.2",
+		{
+			key:     NpmTarballKey("@bitwarden/cli", "2024.7.2"),
+			name:    "@bitwarden/cli",
+			version: "2024.7.2",
+		},
 	},
 	TypeCargo: {
-		key:     CargoCrateKey("serde", "1.0.210"),
-		name:    "serde",
-		version: "1.0.210",
+		{
+			key:     CargoCrateKey("serde", "1.0.210"),
+			name:    "serde",
+			version: "1.0.210",
+		},
+		// Same for a crate name: "--" is two hyphens, not an encoded "/".
+		{
+			key:     CargoCrateKey("foo--bar", "1.2.3"),
+			name:    "foo--bar",
+			version: "1.2.3",
+		},
 	},
 }
 
@@ -66,15 +101,17 @@ var keyRoundTrips = map[string]roundTrip{
 // `bodega pkg checksum clear` its only filter.
 func TestParseKeyRoundTripsEveryType(t *testing.T) {
 	for _, typ := range AllTypes {
-		want, ok := keyRoundTrips[typ]
-		if !ok {
+		cases, ok := keyRoundTrips[typ]
+		if !ok || len(cases) == 0 {
 			t.Errorf("type %q is in AllTypes with no round-trip case: build its key with the constructor and add the ParseKey arm that reads it back", typ)
 			continue
 		}
-		gotType, gotName, gotVersion := ParseKey(want.key)
-		if gotType != typ || gotName != want.name || gotVersion != want.version {
-			t.Errorf("ParseKey(%q) = (%q, %q, %q), want (%q, %q, %q)",
-				want.key, gotType, gotName, gotVersion, typ, want.name, want.version)
+		for _, want := range cases {
+			gotType, gotName, gotVersion := ParseKey(want.key)
+			if gotType != typ || gotName != want.name || gotVersion != want.version {
+				t.Errorf("ParseKey(%q) = (%q, %q, %q), want (%q, %q, %q)",
+					want.key, gotType, gotName, gotVersion, typ, want.name, want.version)
+			}
 		}
 	}
 	for typ := range keyRoundTrips {
