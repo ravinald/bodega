@@ -222,6 +222,7 @@ type fileSnapshot struct {
 	spaced   map[string]bool // keys the file separates from the one above with a blank line
 	resolved map[string]json.RawMessage
 	pinned   map[string]bool // keys Pin marked as chosen, written whether or not they differ
+	cleared  map[string]bool // keys Clear marked for removal, deleted from the file whatever they hold
 }
 
 // legacyKeyAliases maps a retired config key onto the one that replaced it. A
@@ -562,7 +563,7 @@ func (c *Config) RootForType(typ string) string {
 // move into a rename.
 //
 // DefaultStoragePath stands in when storage_path is unset, which is what an
-// S3-only install leaves it as. defaultManifestDir resolves the same way for
+// S3-only install leaves it as. DefaultManifestDir resolves the same way for
 // the same reason: both land inside the unit's ReadWritePaths whether or not
 // the operator wrote the key.
 func (c *Config) ResolveSpoolDir() string {
@@ -647,7 +648,7 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	cfg.Bucket = firstNonEmpty(flagBucket, os.Getenv(EnvBucket), cfg.Bucket)
 	cfg.Region = firstNonEmpty(flagRegion, os.Getenv(EnvRegion), cfg.Region, DefaultRegion)
 	cfg.BuildRoot = firstNonEmpty(flagBuildRoot, os.Getenv(EnvBuildRoot), cfg.BuildRoot, DefaultBuildRoot)
-	cfg.ManifestDir = firstNonEmpty(manifestDir, os.Getenv(EnvManifestDir), cfg.ManifestDir, defaultManifestDir(cfg.StoragePath))
+	cfg.ManifestDir = firstNonEmpty(manifestDir, os.Getenv(EnvManifestDir), cfg.ManifestDir, DefaultManifestDir(cfg.StoragePath))
 	cfg.LogDir = firstNonEmpty(cfg.LogDir, DefaultLogDir)
 
 	// Log window height: new field, fall back to legacy shell_height.
@@ -811,6 +812,38 @@ func (c *Config) Pin(keys ...string) {
 	}
 	for _, k := range keys {
 		c.snapshot.pinned[k] = true
+		delete(c.snapshot.cleared, k)
+	}
+}
+
+// Clear marks config keys for removal, so the next Save deletes them from the
+// file whatever the file and the Config say.
+//
+// A reset needs this and pinning cannot express it. Assigning a field its
+// built-in default produces a diff of zero against a baseline that already
+// resolved to that default, so `bodega --region us-west-2 shell` leaves an
+// older region on disk; pinning the key instead writes the default in as a
+// setting, which is the destructive save marshalForFile exists to prevent. An
+// absent key already means "use the built-in default" everywhere else and
+// survives a later change to what that default is.
+//
+// The struct tags cannot carry this either. Deleting on absence from the
+// marshalled keys works only under omitempty, and omitempty on an int or a
+// bool cannot tell a cleared key from an operator's deliberate 0 or false.
+//
+// One write: a successful Save discards the set, so a later save of a key the
+// operator has since retyped writes it rather than dropping it again. Pin and
+// Clear are contradictory instructions on one key, so the later call wins.
+func (c *Config) Clear(keys ...string) {
+	if c.snapshot == nil {
+		return
+	}
+	if c.snapshot.cleared == nil {
+		c.snapshot.cleared = make(map[string]bool, len(keys))
+	}
+	for _, k := range keys {
+		c.snapshot.cleared[k] = true
+		delete(c.snapshot.pinned, k)
 	}
 }
 
@@ -1045,6 +1078,9 @@ func (c *Config) SaveReport() (string, []string, error) {
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		return "", nil, fmt.Errorf("write config %s: %w", path, err)
 	}
+	if c.snapshot != nil {
+		c.snapshot.cleared = nil
+	}
 	return path, changed, nil
 }
 
@@ -1108,6 +1144,10 @@ func (c *Config) marshalForFile() ([]byte, []string, error) {
 		if _, ok := current[k]; !ok {
 			delete(out, k)
 		}
+	}
+	// Clear says so outright, for the keys omitempty cannot speak for.
+	for k := range c.snapshot.cleared {
+		delete(out, k)
 	}
 	order := append([]string(nil), c.snapshot.order...)
 	for old, replacement := range legacyKeyAliases {
@@ -1597,7 +1637,10 @@ func parseConfigError(path string, err error) error {
 	return fmt.Errorf("parse config %s: %w", path, err)
 }
 
-// defaultManifestDir returns the built-in manifest directory, always absolute.
+// DefaultManifestDir returns the built-in manifest directory, always absolute.
+// It is what Load resolves when no config, environment variable or flag names
+// one, so a caller clearing manifest_dir can keep the running process pointed
+// at the directory the next Load will choose.
 //
 // A bare relative "manifests" under a unit with no WorkingDirectory= resolves
 // to /manifests, which ProtectSystem=strict makes unreadable; the server then
@@ -1615,7 +1658,7 @@ func parseConfigError(path string, err error) error {
 // a directory no config named while the file in front of the operator promised
 // another one. Either layout names its directory with manifest_dir,
 // $BODEGA_MANIFEST_DIR or --manifest-dir.
-func defaultManifestDir(storagePath string) string {
+func DefaultManifestDir(storagePath string) string {
 	return filepath.Join(firstNonEmpty(storagePath, DefaultStoragePath), "manifests")
 }
 

@@ -253,3 +253,127 @@ func TestSaveWritesOperatorEdits(t *testing.T) {
 		t.Errorf("reloaded ManifestDir = %q, want /srv/manifests", reloaded.ManifestDir)
 	}
 }
+
+// TestClearRemovesAKeyTheDiffCannotSee is #265. Save rewrites only what differs
+// from the resolved baseline, and a flag feeds that baseline, so assigning a
+// field its built-in default under `--region us-west-2` produces a diff of zero
+// and the file goes on naming us-east-1. Pinning is the wrong lever: it writes
+// the default in as a setting, which is the destructive save the diff exists to
+// prevent. Clear says the key leaves.
+func TestClearRemovesAKeyTheDiffCannotSee(t *testing.T) {
+	path := loadedFrom(t, `{"region": "us-east-1", "token": "seeded-token"}`) //nolint:gosec // G101: a fixture, not a credential
+
+	cfg, err := config.Load("", "", config.DefaultRegion, "", false, false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	cfg.Region = config.DefaultRegion
+	cfg.Clear("region")
+	_, written, err := cfg.SaveReport()
+	if err != nil {
+		t.Fatalf("SaveReport: %v", err)
+	}
+
+	keys := savedKeys(t, path)
+	if got, ok := keys["region"]; ok {
+		t.Errorf("region = %s after a clear, want the key gone", got)
+	}
+	if got, want := string(keys["token"]), `"seeded-token"`; got != want { //nolint:gosec // G101: a fixture, not a credential
+		t.Errorf("token = %s, want %s", got, want)
+	}
+	if len(written) != 1 || written[0] != "region" {
+		t.Errorf("SaveReport reported %v, want just region; a removal is a change the file carries", written)
+	}
+
+	reloaded, err := config.Load("", "", "", "", false, false)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.Region != config.DefaultRegion {
+		t.Errorf("region after a reload = %q, want the built-in default an absent key means", reloaded.Region)
+	}
+}
+
+// TestClearRemovesZeroValuedKeys covers what a struct tag cannot say. Deleting
+// on absence from the marshalled keys works only under omitempty, and omitempty
+// on an int or a bool cannot tell a cleared key from a deliberate 0 or false —
+// which is why logwindow_height and custom_paths carry none.
+func TestClearRemovesZeroValuedKeys(t *testing.T) {
+	path := loadedFrom(t, `{"logwindow_height": 40, "custom_paths": true, "apt_root": "/srv/apt"}`)
+
+	cfg, err := config.Load("", "", "", "", false, false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	cfg.LogWindowHeight = config.DefaultLogWindowHeight
+	cfg.CustomPaths = false
+	cfg.AptRoot = ""
+	cfg.Clear("logwindow_height", "custom_paths", "apt_root")
+	if _, err := cfg.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	keys := savedKeys(t, path)
+	for _, k := range []string{"logwindow_height", "custom_paths", "apt_root"} {
+		if got, ok := keys[k]; ok {
+			t.Errorf("%s = %s after a clear, want the key gone", k, got)
+		}
+	}
+}
+
+// TestClearAppliesToOneWrite pins the scope. A cleared key that stayed cleared
+// would let one reset go on deleting whatever the operator typed afterwards for
+// the life of the process.
+func TestClearAppliesToOneWrite(t *testing.T) {
+	path := loadedFrom(t, `{"region": "us-east-1"}`)
+
+	cfg, err := config.Load("", "", "", "", false, false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	cfg.Clear("region")
+	if _, err := cfg.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if _, ok := savedKeys(t, path)["region"]; ok {
+		t.Fatal("the clear left region in the file")
+	}
+
+	cfg.Region = "eu-central-1"
+	cfg.Pin("region")
+	if _, err := cfg.Save(); err != nil {
+		t.Fatalf("second Save: %v", err)
+	}
+	if got, want := string(savedKeys(t, path)["region"]), `"eu-central-1"`; got != want {
+		t.Errorf("region after a later save = %s, want %s", got, want)
+	}
+}
+
+// TestPinAndClearLastCallWins settles the contradiction rather than leaving the
+// order of two map lookups to decide it.
+func TestPinAndClearLastCallWins(t *testing.T) {
+	path := loadedFrom(t, `{"region": "us-east-1"}`)
+
+	cfg, err := config.Load("", "", "", "", false, false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	cfg.Region = "eu-central-1"
+	cfg.Clear("region")
+	cfg.Pin("region")
+	if _, err := cfg.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if got, want := string(savedKeys(t, path)["region"]), `"eu-central-1"`; got != want {
+		t.Errorf("region after Clear then Pin = %s, want %s", got, want)
+	}
+
+	cfg.Pin("region")
+	cfg.Clear("region")
+	if _, err := cfg.Save(); err != nil {
+		t.Fatalf("second Save: %v", err)
+	}
+	if got, ok := savedKeys(t, path)["region"]; ok {
+		t.Errorf("region after Pin then Clear = %s, want the key gone", got)
+	}
+}
