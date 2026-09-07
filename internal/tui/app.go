@@ -339,12 +339,16 @@ func (m appModel) handlePopupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 		// Ctrl+R: reset to defaults with confirmation.
+		//
+		// The reset reaches the eleven fields this form edits and nothing else,
+		// and Save writes only what differs from the resolved config, so both
+		// the prompt and the report name the fields rather than the file. A
+		// line saying the config was reset left an admin_permit_cidr of
+		// 0.0.0.0/0 in place under a success message (#183, #227).
 		if key == "ctrl+r" && !m.popup.selectOpen {
-			// Stash the current form state and show a confirm popup.
-			// On confirm, populate defaults and save.
 			m.popup = popupModel{
 				kind:    popupConfirm,
-				message: "Reset configuration to defaults? This will overwrite the config file.",
+				message: "Reset this form's fields to their defaults and save?\nConfig keys the form does not edit are left as they are.",
 				onYes: func() {
 					m.cfg.Bucket = ""
 					m.cfg.Region = config.DefaultRegion
@@ -357,11 +361,14 @@ func (m appModel) handlePopupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.cfg.GitRoot = ""
 					m.cfg.PypiRoot = ""
 					m.cfg.BinaryRoot = ""
-					path, err := m.cfg.Save()
-					if err != nil {
+					path, written, err := m.cfg.SaveReport()
+					switch {
+					case err != nil:
 						m.log.appendLog(errorStyle.Render("Failed to save: " + err.Error()))
-					} else {
-						m.log.appendLog(successStyle.Render("Config reset to defaults and saved to " + path))
+					case len(written) == 0:
+						m.log.appendLog(dimStyle.Render("Form fields already at their defaults; " + path + " is unchanged"))
+					default:
+						m.log.appendLog(successStyle.Render("Reset " + strings.Join(written, ", ") + " in " + path))
 					}
 				},
 				pendingAsyncCmd: nil,

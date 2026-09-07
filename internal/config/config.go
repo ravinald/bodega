@@ -89,7 +89,7 @@ type Config struct {
 	Bucket            string   `json:"bucket"`
 	Region            string   `json:"region"`
 	BuildRoot         string   `json:"build_root"`
-	ManifestDir       string   `json:"manifest_dir"`
+	ManifestDir       string   `json:"manifest_dir,omitempty"` // unset means {storage_path}/manifests, so clearing it drops the key rather than pinning "" as a setting
 	LogDir            string   `json:"log_dir"`
 	LogWindowHeight   int      `json:"logwindow_height"`
 	LogLevel          int      `json:"log_level"` // --log-level and $BODEGA_LOG_LEVEL are resolved by the caller, not by Load
