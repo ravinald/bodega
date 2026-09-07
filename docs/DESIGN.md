@@ -2,7 +2,7 @@
 
 ## What is it
 
-Bodega is a self-hosted package repository that sits between your infrastructure and the public internet. It fetches, builds, and serves seven artifact types through native package manager protocols. Your instances talk to bodega instead of the internet, and bodega decides where the bits come from.
+Bodega is a self-hosted package repository that sits between your infrastructure and the public internet. It fetches, builds, and serves eight artifact types through native package manager protocols. Your instances talk to bodega instead of the internet, and bodega decides where the bits come from.
 
 It replaces the grab bag of internal mirrors, S3 scripts, and "just curl it" patterns that tend to accumulate when you operate package infrastructure at scale. One tool, one config file, one S3 bucket.
 
@@ -95,15 +95,16 @@ Moving an artifact between backends is `bodega pkg move`, which copies, verifies
 
 ## Package types
 
-| Type | Source | Artifact | Client protocol |
-|------|--------|----------|-----------------|
-| apt | Package name, git repo, or apt-get source | .deb in Debian repo layout | deb822 `.sources` with `Signed-By:`; see below |
-| git | GitHub release tarball or bare clone | .tar.gz or .bundle | `curl https://bodega/git/<name>/<file>` |
-| pypi | Wheel build from requirements.txt | .whl files | `pip install --index-url https://bodega/pypi/simple/` |
-| binary | Direct URL download | Original file | `curl https://bodega/binaries/<name>/<ver>/<file>` |
-| gomod | GOPROXY upstream or local build | .zip, .mod, .info | `GOPROXY=https://bodega/go,direct go get <module>` |
-| helm | Chart repo or direct URL | .tgz | `helm repo add bodega https://bodega/helm` |
-| npm | Registry upstream or local | .tgz | `npm install --registry https://bodega/npm/` |
+| Type   | Source                                    | Artifact                   | Client protocol                                                                      |
+| ------ | ----------------------------------------- | -------------------------- | ------------------------------------------------------------------------------------ |
+| apt    | Package name, git repo, or apt-get source | .deb in Debian repo layout | deb822 `.sources` with `Signed-By:`; see below                                       |
+| git    | GitHub release tarball or bare clone      | .tar.gz or .bundle         | `curl https://bodega/git/<name>/<file>`                                              |
+| pypi   | Wheel build from requirements.txt         | .whl files                 | `pip install --index-url https://bodega/pypi/simple/`                                |
+| binary | Direct URL download                       | Original file              | `curl https://bodega/binaries/<name>/<ver>/<file>`                                   |
+| gomod  | GOPROXY upstream or local build           | .zip, .mod, .info          | `GOPROXY=https://bodega/go,direct go get <module>`                                   |
+| helm   | Chart repo or direct URL                  | .tgz                       | `helm repo add bodega https://bodega/helm`                                           |
+| npm    | Registry upstream or local                | .tgz                       | `npm install --registry https://bodega/npm/`                                         |
+| cargo  | Sparse registry upstream or local         | .crate                     | `[registries.bodega] index = "sparse+https://bodega/cargo/"` in `.cargo/config.toml` |
 
 `internal/server/apt.go` generates `Release` and the `Packages` bodies it digests as one snapshot, and signs it there with a key `internal/aptsign` loads at startup and re-reads on every `SIGHUP`, held behind an `atomic.Pointer` because the reload writes it while request handlers read it. `InRelease` is the clearsigned `Release`; `Release.gpg` is the armored detached signature; `/apt/bodega-archive-keyring.{asc,gpg}` serve the public key from memory. With no key installed all four 404 and the unsigned `Release` still serves, which is the ordinary fallback apt has always taken. Signed and unsigned coexist at the same URLs indefinitely.
 
@@ -165,6 +166,7 @@ Each package is a `PackageManifest` JSON file:
 ```
 
 The manifest envelope contains:
+
 - **config_version**: schema version (always 1)
 - **name**: canonical package name
 - **type**: package ecosystem
@@ -173,6 +175,7 @@ The manifest envelope contains:
 - **versions**: array of VersionEntry objects
 
 Each VersionEntry represents a concrete or policy version:
+
 - Policy entries use `version: "*"` with `version_constraint: "any"`
 - Concrete versions have a specific version identifier and full metadata
 - `hidden: true` excludes the version from client view but keeps it in the record
@@ -184,12 +187,12 @@ Each VersionEntry represents a concrete or policy version:
 
 A version policy entry is created with a wildcard version (`*`) and a constraint:
 
-| Constraint | Behavior | Example |
-|-----------|----------|---------|
-| `exact` | Only this exact version | `python3@3.12.3` |
-| `compatible` | Same major version, any minor/patch (^) | `django@5.x` |
-| `patch` | Same major.minor, any patch (~) | `numpy@1.26.x` |
-| `any` | All versions (*) | `libssl3@*` |
+| Constraint   | Behavior                                | Example          |
+| ------------ | --------------------------------------- | ---------------- |
+| `exact`      | Only this exact version                 | `python3@3.12.3` |
+| `compatible` | Same major version, any minor/patch (^) | `django@5.x`     |
+| `patch`      | Same major.minor, any patch (~)         | `numpy@1.26.x`   |
+| `any`        | All versions (*)                        | `libssl3@*`      |
 
 A policy entry with `version_constraint: "any"` displayed as `python3@*` allows bodega to auto-resolve new versions from apt-cache or upstream registries. Concrete versions are stored alongside the policy entry.
 
@@ -226,21 +229,21 @@ The rule exists because `log_level` defaults to `0` and `internal/logging/level.
 
 Currently logged at `Error` under this rule, from `serve`, `newServer` and `Start` before the listener binds. Runtime `Error` lines on the request path are not startup conditions and are not listed:
 
-| Condition | What changes | Site |
-|-----------|--------------|------|
-| Storage backend fails to construct | Every package route answers 503; the API and `/healthz` still serve | `startupStorage`, `cmd/bodega/cmd_serve.go` |
-| `deny_list` has an unparseable entry | The whole deny list is dropped, so every address it named is served | `newServer`, `internal/server/server.go` |
-| `trusted_proxies` has an unparseable entry | The whole list is dropped, so `X-Forwarded-For` is ignored and every request is attributed to the proxy | `newServer`, `internal/server/server.go` |
-| No packages loaded | Every repository index publishes as empty | `cmd/bodega/cmd_serve.go` |
-| Plaintext authorized on `:443` | Every request and response is in the clear on the port clients read as TLS | `guardPlaintext`, `internal/server/server.go` |
-| A retired `tls_autocert: true`, or `--tls-autocert`/`--tls-domain`, with no cert pair | The option that promised TLS promises nothing; the server binds in the clear or refuses | `reportRetiredTLSKeys`, `cmd/bodega/cmd_serve.go` |
-| Pepper file unreadable | Token auth does not work | `newServer`, `internal/server/server.go` |
-| `audit_events` omits `denied` | No refusal the server makes is recorded, and the journal is the only copy | `newServer`, `internal/server/server.go` |
-| `audit_sink` is write-only | `GET /api/v1/audit` answers 501 and the discovery reads refuse, rather than returning an empty page | `newServer`, `internal/server/server.go` |
-| `git` or `git-http-backend` absent | The smart-HTTP route is never registered, so `git clone` 404s; the bundle route is unaffected | `resolveGitTool`, `internal/server/githttp.go` |
-| apt signing key present but unusable | The apt repository is signed with the previously loaded key, or not at all | `loadAptSigner`, `internal/server/apt.go` |
-| apt signing key loaded but its public half will not render | The key is never installed, so `Signed-By:` has nothing to point at and clients fall back to `[trusted=yes]` | `loadAptSigner`, `internal/server/apt.go` |
-| apt signing key loaded but its keyring will not render | The key is never installed, so the repository is served unsigned | `loadAptSigner`, `internal/server/apt.go` |
+| Condition                                                                             | What changes                                                                                                 | Site                                              |
+| ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ | ------------------------------------------------- |
+| Storage backend fails to construct                                                    | Every package route answers 503; the API and `/healthz` still serve                                          | `startupStorage`, `cmd/bodega/cmd_serve.go`       |
+| `deny_list` has an unparseable entry                                                  | The whole deny list is dropped, so every address it named is served                                          | `newServer`, `internal/server/server.go`          |
+| `trusted_proxies` has an unparseable entry                                            | The whole list is dropped, so `X-Forwarded-For` is ignored and every request is attributed to the proxy      | `newServer`, `internal/server/server.go`          |
+| No packages loaded                                                                    | Every repository index publishes as empty                                                                    | `cmd/bodega/cmd_serve.go`                         |
+| Plaintext authorized on `:443`                                                        | Every request and response is in the clear on the port clients read as TLS                                   | `guardPlaintext`, `internal/server/server.go`     |
+| A retired `tls_autocert: true`, or `--tls-autocert`/`--tls-domain`, with no cert pair | The option that promised TLS promises nothing; the server binds in the clear or refuses                      | `reportRetiredTLSKeys`, `cmd/bodega/cmd_serve.go` |
+| Pepper file unreadable                                                                | Token auth does not work                                                                                     | `newServer`, `internal/server/server.go`          |
+| `audit_events` omits `denied`                                                         | No refusal the server makes is recorded, and the journal is the only copy                                    | `newServer`, `internal/server/server.go`          |
+| `audit_sink` is write-only                                                            | `GET /api/v1/audit` answers 501 and the discovery reads refuse, rather than returning an empty page          | `newServer`, `internal/server/server.go`          |
+| `git` or `git-http-backend` absent                                                    | The smart-HTTP route is never registered, so `git clone` 404s; the bundle route is unaffected                | `resolveGitTool`, `internal/server/githttp.go`    |
+| apt signing key present but unusable                                                  | The apt repository is signed with the previously loaded key, or not at all                                   | `loadAptSigner`, `internal/server/apt.go`         |
+| apt signing key loaded but its public half will not render                            | The key is never installed, so `Signed-By:` has nothing to point at and clients fall back to `[trusted=yes]` | `loadAptSigner`, `internal/server/apt.go`         |
+| apt signing key loaded but its keyring will not render                                | The key is never installed, so the repository is served unsigned                                             | `loadAptSigner`, `internal/server/apt.go`         |
 
 Two audit conditions moved past this rule and are now **fatal for `serve`**: an audit store that will not open, and an `audit_db` the process cannot write. Both used to log at `Error` and continue, which left a server that answers `/healthz` while dropping the record of every request it refuses. Held on `Server.auditErr` and returned from `Start` before the listener binds, the same shape `adminErr` already had. An unset `audit_db` is not one of them: that is an install that asked for no audit trail.
 
@@ -250,12 +253,12 @@ Left below `Error` on purpose, because what gets served is what was asked for: a
 
 A manifest entry is what makes a package servable, so how entries get written is how a bodega install becomes useful. There are four ways, and they answer different questions.
 
-| Path | Answers | Use it when |
-|------|---------|-------------|
-| `bodega pkg create` | "add this one package" | You know what you want. Interactive, one entry at a time |
-| `bodega pkg convert` + `pkg import` | "what does this host already have" | Standing up a server for hosts that already exist |
-| `bodega discover promote` | "what did clients reach for that we could not serve" | A catalog is in place and something fell through it |
-| `POST /api/v1/packages...` | the same, from other tooling | Provisioning, CI, anything not a person at a terminal |
+| Path                                | Answers                                              | Use it when                                              |
+| ----------------------------------- | ---------------------------------------------------- | -------------------------------------------------------- |
+| `bodega pkg create`                 | "add this one package"                               | You know what you want. Interactive, one entry at a time |
+| `bodega pkg convert` + `pkg import` | "what does this host already have"                   | Standing up a server for hosts that already exist        |
+| `bodega discover promote`           | "what did clients reach for that we could not serve" | A catalog is in place and something fell through it      |
+| `POST /api/v1/packages...`          | the same, from other tooling                         | Provisioning, CI, anything not a person at a terminal    |
 
 `pkg convert` reads a package manager's own inventory on the host: `dpkg-query`, `pip list`, `npm ls`, `go list -m all`, `cargo install --list`, `helm list`. That answer is complete on the first run and needs no observation window, which is what distinguishes it from discovery. A host that has been stable for six months fetches nothing, so a proxy watching it learns nothing; the host's package database still knows everything it has.
 
@@ -340,12 +343,12 @@ The pipeline cascades automatically. Running `bodega build upload` will fetch an
 
 When bodega fetches a git entry, it scans the extracted source for dependency files and auto-creates manifest entries:
 
-| File found | Action |
-|------------|--------|
-| `requirements.txt` | Populate pypi base_requirements, create PypiPackage entries |
-| `go.mod` | Create GomodEntry for each require (mode: proxy) |
-| `package.json` | Create NpmEntry for each dependency (mode: proxy) |
-| `Gemfile`, `pom.xml`, etc. | Log as found, unsupported ecosystem |
+| File found                 | Action                                                      |
+| -------------------------- | ----------------------------------------------------------- |
+| `requirements.txt`         | Populate pypi base_requirements, create PypiPackage entries |
+| `go.mod`                   | Create GomodEntry for each require (mode: proxy)            |
+| `package.json`             | Create NpmEntry for each dependency (mode: proxy)           |
+| `Gemfile`, `pom.xml`, etc. | Log as found, unsupported ecosystem                         |
 
 Discovered entries default to proxy mode. The operator can change any entry to hosted if they want to build and pin it locally. Duplicate entries are skipped.
 
@@ -407,11 +410,11 @@ The `RealIPMiddleware` extracts the client IP from `X-Real-IP` or `X-Forwarded-F
 
 `trusted_proxies` names that set, and it is tri-state. The three answers survive the move to the database, which is what the `acl_lists` marker row is for:
 
-| Value | In the database | Meaning |
-|-------|-----------------|---------|
-| absent / `null` | no marker row | Built-in default: loopback plus RFC 1918 |
-| `[]` | marker row, no entries | Trust no forwarded header from any peer |
-| `["10.9.0.0/16", ...]` | marker row plus entries | Trust exactly these |
+| Value                  | In the database         | Meaning                                  |
+| ---------------------- | ----------------------- | ---------------------------------------- |
+| absent / `null`        | no marker row           | Built-in default: loopback plus RFC 1918 |
+| `[]`                   | marker row, no entries  | Trust no forwarded header from any peer  |
+| `["10.9.0.0/16", ...]` | marker row plus entries | Trust exactly these                      |
 
 An operator who wrote `[]` disabled header trust on purpose. Handing the RFC 1918 default back because a table came up empty would restore it to a deployment that asked to have none, so `bodega acl proxies add` on a list that was never set says out loud that the built-in default has just ended.
 
@@ -440,11 +443,11 @@ An empty `admin_permit_cidr` refuses every mutation **and** all four admin reads
 
 Three ways the list can end up empty, and what each gets:
 
-| Route | Result |
-| --------------------------------------------------- | ---------------------------------------------------------------------------------- |
-| Key absent from `config.json` on a fresh install | `config.Load` substitutes `["127.0.0.0/8", "::1/128"]`. The empty state is unreachable through the file. |
-| Key present but parsing to nothing (a typo, or blank entries) | `Start` refuses, naming the entry and pointing at `bodega acl admin list`. |
-| `bodega acl admin remove <last> --force` | Accepted, and it locks the operator out of both halves. That is what `--force` is for; the refusal text says so. |
+| Route                                                         | Result                                                                                                           |
+| ------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Key absent from `config.json` on a fresh install              | `config.Load` substitutes `["127.0.0.0/8", "::1/128"]`. The empty state is unreachable through the file.         |
+| Key present but parsing to nothing (a typo, or blank entries) | `Start` refuses, naming the entry and pointing at `bodega acl admin list`.                                       |
+| `bodega acl admin remove <last> --force`                      | Accepted, and it locks the operator out of both halves. That is what `--force` is for; the refusal text says so. |
 
 The localhost default stays the first line and the startup refusal is the second, because they cover different cases. The default answers an absent key; it never sees a key the operator wrote. The startup refusal answers a key that is present and unusable, which is the one case where falling back to a default would substitute bodega's access control list for the operator's.
 
@@ -457,7 +460,15 @@ Both are re-read per request rather than captured when the handler chain is buil
 
 Every add and remove is recorded in the audit database as a `create` or `delete` event with `pkg_type=acl`, the list in `pkg_name`, the CIDR in `pkg_version` and the OS user in `actor`. Who changed the rule sits beside the record of who the rule turned away.
 
-Package-serving read endpoints remain unauthenticated. Package manager clients (apt, pip, go, npm, helm) use standard protocols that don't support auth headers, so those read paths stay open by design. The four admin reads above are the exception, and a refusal on one is itself recorded in the audit database.
+Package-serving read endpoints remain unauthenticated. That is a decision about what bodega gates, not a limit the clients impose. Each of the eight can present a credential: apt reads `/etc/apt/auth.conf.d/`, pip takes them in the index URL or from a keyring, npm carries `//<registry>/:_authToken` in `.npmrc`, go reads `.netrc` for a `GOPROXY` host, cargo has registry tokens and credential providers, helm takes `--username`/`--password` on `repo add`, and the git and binary routes are plain HTTP where `git credential` and `curl -u` already work. bodega asks none of them, because the chokepoint it operates sits on what leaves the network toward upstream rather than on who inside the network may read the cache. The four admin reads above are the exception, and a refusal on one is itself recorded in the audit database.
+
+### What the read path does not scope
+
+Nothing bodega serves varies by consumer. The upstream allow-list, the age and OSV gates, hidden and frozen versions, and every version constraint hold one answer for the whole fleet, and every index (`Packages`, the pypi simple index, the npm packument, `index.yaml`, `@v/list`, the cargo sparse index) is generated once and cached with no consumer in the key. The only client attribute the serve path reads is the IP that `trusted_proxies` resolved, and it reaches two places: the deny list, which answers 403 on all routes, and the audit and discovery rows, which record it.
+
+There is therefore no way to say that one host may fetch a package and another may not, or to pin a version for one host and leave it floating for another. One axis comes close by accident: an apt client names a suite in its `sources.list`, and each codename under `apt_upstreams` is its own mirrored `dists/` tree, so two hosts on different codenames see different content. Nothing enforces it. A host running jammy that requests noble gets noble.
+
+The catalog does not carry the boundary either. `bodega pkg convert` reads one host's own inventory and `bodega pkg import` writes it, and the host identity is dropped in between: a `PackageManifest` records no origin, tag or group, so a set that came off a golden host is indistinguishable from the rest of the catalog once it lands.
 
 ### Response hardening
 
@@ -520,29 +531,29 @@ One JSON file, named by `$BODEGA_CONFIG_FILE` when that is set and otherwise the
 
 Key fields:
 
-| Field | Default | Purpose |
-|-------|---------|---------|
-| `bucket` | (required) | S3 bucket name |
-| `storage_backends` | {} | Additional backends, by name |
-| `storage_by_type` | {} | Which named backend each type's next write targets |
-| `storage_policy` | (per package) | Manifest field overriding `storage_by_type` for one package |
-| `region` | us-west-2 | AWS region |
-| `build_root` | /opt/bodega | Where artifacts are built locally |
-| `manifest_dir` | {storage_path}/manifests | Where manifests live on a filesystem backend. Always absolute: a relative value under a unit with no `WorkingDirectory=` resolves against `/`. `bodega serve` creates it when absent and refuses to start when it cannot |
-| `proxy_cache_enabled` | false | Global proxy/cache toggle |
-| `metadata_ttl` | 1h | How long mutable proxy resources are cached |
-| `deny_list` | [] | CIDR entries to block. **Bootstrap only**: copied into the audit DB on first start, then owned by `bodega acl deny` |
-| `admin_permit_cidr` | [127.0.0.0/8, ::1/128] | CIDRs allowed to reach the admin surface: mutations and the four admin reads. Empty permits nobody; a value that parses to nothing stops the start. **Bootstrap only**: owned by `bodega acl admin` after the first start |
-| `trusted_proxies` | null (loopback + RFC 1918) | Peers whose forwarded headers are believed; `[]` trusts none. **Bootstrap only**: owned by `bodega acl proxies` after the first start |
-| `tls_min_version` | 1.3 | Floor for bodega's own listener; `1.2` or `1.3` |
-| `api_token` | (none) | Bearer token for mutation API |
-| `tls_cert` / `tls_key` | (none) | Manual TLS. Setting one without the other is fatal at load, not a request for plaintext |
-| `allow_plaintext` | false | Authorizes an unencrypted listener. With no cert pair `bodega serve` refuses to bind without it, and refuses on `:443` naming the port |
-| `audit_db` | {log_dir}/audit.db | Embedded store: the event stream under `audit_sink: sqlite`, and the ACLs, tokens, checksums and policies under every sink |
-| `audit_sink` | sqlite | Where the event stream goes: `sqlite`, `postgres`, `syslog` or `jsonl`. An unknown value is refused at load |
-| `audit_sink_dsn` | (none) | Destination for the sink: a libpq string, a syslog `scheme://address`, or an absolute JSONL path. Refused with `sqlite` rather than ignored |
-| `git_upstreams` | {} | Namespaces under `/git/` mapped onto an upstream forge, each in `open` or `catalog` mode |
-| `binary_upstreams` | {} | Namespaces under `/binaries/` mapped onto an upstream download host, each in `open` or `catalog` mode. While empty, `/binaries/` serves from storage as before |
+| Field                  | Default                    | Purpose                                                                                                                                                                                                                   |
+| ---------------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bucket`               | (required)                 | S3 bucket name                                                                                                                                                                                                            |
+| `storage_backends`     | {}                         | Additional backends, by name                                                                                                                                                                                              |
+| `storage_by_type`      | {}                         | Which named backend each type's next write targets                                                                                                                                                                        |
+| `storage_policy`       | (per package)              | Manifest field overriding `storage_by_type` for one package                                                                                                                                                               |
+| `region`               | us-west-2                  | AWS region                                                                                                                                                                                                                |
+| `build_root`           | /opt/bodega                | Where artifacts are built locally                                                                                                                                                                                         |
+| `manifest_dir`         | {storage_path}/manifests   | Where manifests live on a filesystem backend. Always absolute: a relative value under a unit with no `WorkingDirectory=` resolves against `/`. `bodega serve` creates it when absent and refuses to start when it cannot  |
+| `proxy_cache_enabled`  | false                      | Global proxy/cache toggle                                                                                                                                                                                                 |
+| `metadata_ttl`         | 1h                         | How long mutable proxy resources are cached                                                                                                                                                                               |
+| `deny_list`            | []                         | CIDR entries to block. **Bootstrap only**: copied into the audit DB on first start, then owned by `bodega acl deny`                                                                                                       |
+| `admin_permit_cidr`    | [127.0.0.0/8, ::1/128]     | CIDRs allowed to reach the admin surface: mutations and the four admin reads. Empty permits nobody; a value that parses to nothing stops the start. **Bootstrap only**: owned by `bodega acl admin` after the first start |
+| `trusted_proxies`      | null (loopback + RFC 1918) | Peers whose forwarded headers are believed; `[]` trusts none. **Bootstrap only**: owned by `bodega acl proxies` after the first start                                                                                     |
+| `tls_min_version`      | 1.3                        | Floor for bodega's own listener; `1.2` or `1.3`                                                                                                                                                                           |
+| `api_token`            | (none)                     | Bearer token for mutation API                                                                                                                                                                                             |
+| `tls_cert` / `tls_key` | (none)                     | Manual TLS. Setting one without the other is fatal at load, not a request for plaintext                                                                                                                                   |
+| `allow_plaintext`      | false                      | Authorizes an unencrypted listener. With no cert pair `bodega serve` refuses to bind without it, and refuses on `:443` naming the port                                                                                    |
+| `audit_db`             | {log_dir}/audit.db         | Embedded store: the event stream under `audit_sink: sqlite`, and the ACLs, tokens, checksums and policies under every sink                                                                                                |
+| `audit_sink`           | sqlite                     | Where the event stream goes: `sqlite`, `postgres`, `syslog` or `jsonl`. An unknown value is refused at load                                                                                                               |
+| `audit_sink_dsn`       | (none)                     | Destination for the sink: a libpq string, a syslog `scheme://address`, or an absolute JSONL path. Refused with `sqlite` rather than ignored                                                                               |
+| `git_upstreams`        | {}                         | Namespaces under `/git/` mapped onto an upstream forge, each in `open` or `catalog` mode                                                                                                                                  |
+| `binary_upstreams`     | {}                         | Namespaces under `/binaries/` mapped onto an upstream download host, each in `open` or `catalog` mode. While empty, `/binaries/` serves from storage as before                                                            |
 
 The TUI config editor (`C` key in `bodega shell`) writes to the same file, and reports the path `Save` returned rather than a second guess at it.
 
