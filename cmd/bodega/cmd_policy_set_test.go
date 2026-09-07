@@ -1,6 +1,8 @@
 package main
 
 import (
+	"io"
+	"os"
 	"strings"
 	"testing"
 
@@ -51,4 +53,47 @@ func TestRequireEcosystem_AcceptsCovered(t *testing.T) {
 	if err := requireEcosystem("NPM", policy.OSVEcosystems(), "OSV gate", "x"); err == nil {
 		t.Error("registry types are lowercase; NPM must be refused, not silently accepted")
 	}
+}
+
+// The rows that predate the refusal above are the ones nobody is told about:
+// `list` prints them beside the enforced rows with nothing to tell them apart.
+func TestReportUncoveredNamesTheStoredRowsNoGateReads(t *testing.T) {
+	out := captureStdout(t, func() {
+		reportUncovered("age gate", []string{"npm", "helm", "apt"}, policy.AgeEcosystems(), "bodega policy age remove")
+	})
+	for _, want := range []string{"helm", "apt", "never read", "bodega policy age remove"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("note does not mention %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "npm") {
+		t.Errorf("npm is covered by the age gate and must not be flagged:\n%s", out)
+	}
+
+	if quiet := captureStdout(t, func() {
+		reportUncovered("age gate", policy.AgeEcosystems(), policy.AgeEcosystems(), "bodega policy age remove")
+	}); quiet != "" {
+		t.Errorf("a fully covered policy set printed a note:\n%s", quiet)
+	}
+}
+
+// captureStdout runs fn with os.Stdout redirected and returns what it wrote.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	orig := os.Stdout
+	os.Stdout = w
+	fn()
+	os.Stdout = orig
+	if err := w.Close(); err != nil {
+		t.Fatalf("close pipe: %v", err)
+	}
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read pipe: %v", err)
+	}
+	return string(out)
 }

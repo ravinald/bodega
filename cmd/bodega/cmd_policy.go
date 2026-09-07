@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"text/tabwriter"
 
@@ -290,4 +291,31 @@ Exit code 1 if any violations are found — suitable for CI pipelines.`,
 			return fmt.Errorf("%d policy violation(s) detected", violations)
 		},
 	}
+}
+
+// reportUncovered follows a policy table with the rows whose gate cannot
+// evaluate them. `set` refuses to write one now, but a row written before that
+// refusal survives and the table above just listed it as an enforced gate with
+// nothing distinguishing it. gate names the gate for the message, removeCmd
+// the command that clears the row.
+func reportUncovered(gate string, stored, covered []string, removeCmd string) {
+	var stale []string
+	for _, eco := range stored {
+		if !slices.Contains(covered, eco) {
+			stale = append(stale, eco)
+		}
+	}
+	if len(stale) == 0 {
+		return
+	}
+	fmt.Printf("\nNot enforced: the %s cannot evaluate %s, so %s stored and never read.\n"+
+		"Remove with '%s <ecosystem>'.\n",
+		gate, strings.Join(stale, ", "), rowPlural(len(stale)), removeCmd)
+}
+
+func rowPlural(n int) string {
+	if n == 1 {
+		return "that row is"
+	}
+	return "those rows are"
 }

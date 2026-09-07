@@ -115,7 +115,7 @@ func (c *AgeChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 		Check:  "age",
 		Action: policy.Action,
 		Reason: fmt.Sprintf("%s@%s is %s old, policy requires %s",
-			pm.Name, version, shortDuration(age), shortDuration(minAge)),
+			pm.Name, version, ShortDuration(age), ShortDuration(minAge)),
 		Details: map[string]any{
 			"published_at":    publishedAt.UTC().Format(time.RFC3339),
 			"age_seconds":     int64(age.Seconds()),
@@ -236,7 +236,10 @@ func (c *AgeChecker) getJSON(ctx context.Context, url string, into any) error {
 	return json.Unmarshal(body, into)
 }
 
-func shortDuration(d time.Duration) string {
+// ShortDuration renders a policy window the way an operator wrote it: "7d"
+// rather than "168h0m0s". The startup banner, the doctor report and a gate's
+// own reason string quote the same duration, so they render it the same way.
+func ShortDuration(d time.Duration) string {
 	days := int64(d / (24 * time.Hour))
 	if days >= 1 {
 		return fmt.Sprintf("%dd", days)

@@ -340,6 +340,20 @@ func openAuditDB(gf *globalFlags) *audit.DB {
 	return db
 }
 
+// auditDBPath resolves where the embedded store lives, falling back to
+// <log_dir>/audit.db. Empty means no store is configured at all. Separate from
+// the opener because opening creates the file, and a command that only reports
+// on an install must not bring one into existence to do it.
+func auditDBPath(cfg *config.Config) string {
+	if cfg.AuditDB != "" {
+		return cfg.AuditDB
+	}
+	if cfg.LogDir != "" {
+		return filepath.Join(cfg.LogDir, "audit.db")
+	}
+	return ""
+}
+
 // openAuditDBErr is openAuditDB with the reason kept. Read commands use it so
 // "postgres refused the connection" does not arrive as "could not open audit
 // database". A nil *DB with a nil error means no audit store is configured.
@@ -348,13 +362,9 @@ func openAuditDBErr(gf *globalFlags) (*audit.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("could not load config: %w", err)
 	}
-	dbPath := cfg.AuditDB
+	dbPath := auditDBPath(cfg)
 	if dbPath == "" {
-		if cfg.LogDir != "" {
-			dbPath = filepath.Join(cfg.LogDir, "audit.db")
-		} else {
-			return nil, nil
-		}
+		return nil, nil
 	}
 	db, err := audit.OpenWithSink(dbPath, audit.SinkConfig{Kind: cfg.AuditSink, DSN: cfg.AuditSinkDSN})
 	if err != nil {

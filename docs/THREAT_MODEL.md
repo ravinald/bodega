@@ -20,6 +20,15 @@ risk:
 - **Silent version drift.** Manifest entries pin a concrete version. Subsequent
   fetches must produce the same SHA-256, or the cached artifact wins. Tuesday's
   build produces the same bytes as last Tuesday's build.
+- **A malicious release inside its own withdrawal window.** A fresh install is
+  seeded with a minimum publish age of `7d` on `npm` and `pypi`, action `warn`,
+  and `bodega serve` names it at startup. The npm and PyPI campaigns of
+  2025-2026 were caught and the versions pulled within days of publication, so
+  an import that waits a week gets the withdrawal rather than the payload.
+  Checksum pinning is the wrong tool for this one: it guarantees today's fetch
+  matches the first one, so a compromised *first* fetch is served faithfully
+  and forever with `checksum_verified` beside it. The cooldown is what makes
+  the first fetch late enough to be safe.
 - **Compromised upstream releases.** When an upstream package is replaced with
   a malicious version (the canonical example being the npm or PyPI account
   takeovers of recent years), bodega's `pkg hide` and `pkg freeze` operations
@@ -53,6 +62,15 @@ defence against:
   the contents of that bundle are outside bodega's allow-list. Bodega may
   see the request for the outer artifact and may even cache it, but it has
   no visibility into the libraries linked or interpreted inside.
+- **Anything the shipped defaults do not reach.** The seeded cooldown covers
+  `npm` and `pypi` and reports rather than refuses. It says nothing about
+  `gomod` or `cargo`, which can be dated and get no seed; it cannot cover
+  `apt`, `binary`, `git` or `helm` at all, because those have no upstream
+  publish timestamp to date a version against. Every other control is off on a
+  new install: the upstream allow-list is empty, which accepts every
+  candidate, and the OSV gate has no rows until an operator adds one. An
+  install created before the seed shipped gains nothing on upgrade, by
+  design: a new default must not change what a running fleet enforces.
 - **Build-time code execution by trusted packages.** A `setup.py` that
   `os.system`s out, an `npm install` lifecycle script, a `cargo build` script
   — all of these run with the build user's privileges and can do anything
@@ -141,7 +159,37 @@ instance, the recommended posture is:
 - **Run `bodega doctor` in CI** as a gate step. Exit 2 is a finding; exit 0
   is clean. The output is tab-aligned and tabwriter-stable, so a pipeline
   can both gate on the exit code and surface the per-check detail in the
-  build log.
+  build log. The checks themselves write nothing, but every bodega command
+  bootstraps a config file on first run, so a runner holding neither
+  `/etc/bodega/config.json` nor `~/.config/bodega/config.json` gains the
+  second one (the first, as root) before the first check executes. That file
+  and the log directory it names are all a doctor run creates. The posture
+  checks open the audit database read-only, so a run against an install one
+  release behind neither brings a database into existence nor migrates the
+  one it finds: an upgrade is something you schedule, not something a report
+  does to you. A host with no install reads `N/A` rather than gaining one.
+- **Harden the seeded cooldown and add an allow-list.** `bodega policy age
+  set npm 7d block` turns the shipped `warn` into a refusal once you have
+  watched it for a release cycle; `bodega policy add <type> <pattern>`
+  constrains what may be fetched at all. Run them on the server, not on the
+  clients: they are the install's own posture, and they take effect without a
+  restart.
+
+On the bodega host itself, `doctor` adds three checks that read the audit
+database rather than the machine. They report `N/A` on a client host with no
+install:
+
+- `policy-coverage`: no allow-list rule and no publish-age or OSV gate, so
+  every upstream fetch is admitted. It counts both gates because
+  `admit.checkVersions` runs both, so an install carrying either one already
+  refuses fetches and reporting it as wide open is a claim its own
+  `policy_violation` records disprove.
+- `policy-ignored`: a gate set to `ignore` on every ecosystem it covers.
+  That is where an install lands when somebody silences an alert during an
+  incident and nobody puts it back.
+- `policy-ecosystem`: a stored row whose gate cannot evaluate it, written
+  before `policy set` learned to refuse one. It lists as active policy and is
+  read by nothing.
 
 ## See also
 

@@ -230,6 +230,27 @@ The `admin_permit_cidr` key in `config.json` seeds the list on first start and i
 
 Manage tokens with `bodega token list` and `bodega token revoke`. In the TUI, press `T` to open the token manager. See [USAGE.md](USAGE.md#rest-api) for full details.
 
+## 13. What a fresh install enforces
+
+One control, on by default: a minimum publish age of `7d` on `npm` and `pypi`, action `warn`. A version published less than a week ago is admitted and flagged rather than refused, and `bodega serve` names the gate in its startup banner.
+
+```bash
+bodega policy age list          # npm 7d warn, pypi 7d warn
+bodega policy age set npm 7d block   # refuse instead of report
+bodega policy age remove npm         # drop the gate, permanently
+```
+
+That cooldown is the control the 2025-2026 npm and PyPI campaigns turned on: the malicious versions were withdrawn within days of publication, so a fetch that waits a week gets the withdrawal instead of the payload. Checksum pinning does not cover it. Pinning guarantees that today's fetch matches the first one, so a compromised first fetch is served faithfully and forever with `checksum_verified` beside it.
+
+What it does not cover:
+
+- **Only `npm` and `pypi`.** `gomod` and `cargo` can be dated too and get no seed; `apt`, `binary`, `git` and `helm` have no upstream publish timestamp at all, and `bodega policy age set` refuses them.
+- **`warn`, not `block`.** A version inside the window is admitted and recorded as `policy_warn`. Hardening it is `bodega policy age set <ecosystem> 7d block`.
+- **Nothing else is on.** The upstream allow-list is empty, which accepts every candidate, and the OSV gate has no rows. Add them with `bodega policy add <type> <pattern>` and `bodega policy osv set npm warn`.
+- **Upgrades gain nothing.** An install created before this default keeps enforcing exactly what it enforced. bodega records the seed as a one-time decision, so it also never returns after `bodega policy age remove`.
+
+`bodega doctor` reports an install with no allow-list rule and no age gate, and one whose gates are all set to `ignore`, at exit 2. See [THREAT_MODEL.md](THREAT_MODEL.md) for what the chokepoint does and does not defend.
+
 ## Next steps
 
 - Set up a systemd service for `bodega serve`

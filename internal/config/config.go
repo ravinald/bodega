@@ -1415,6 +1415,8 @@ func defaultConfigContent() []byte {
   "apt_signing_name": "",
   "apt_signing_email": "",
 
+  "_comment_policy": "Policy lives in the audit database, not in this file, so it changes on a running server. A fresh install is seeded with a minimum publish age of 7d on npm and pypi at action warn: a version published less than a week ago is admitted and flagged rather than refused. That cooldown is the control that catches a compromised release inside the window upstream withdraws it in. Checksum pinning cannot: it guarantees today's bytes match the first fetch, including a first fetch that was already malicious. Read it with 'bodega policy age list', harden it with 'bodega policy age set npm 7d block', drop it with 'bodega policy age remove npm'. A removal is final: bodega records that this install has decided the age gate, so no upgrade re-seeds it. An install upgraded from a release before this default gains nothing and keeps enforcing what it already enforced; 'bodega doctor' reports one that enforces nothing.",
+
   "_comment_audit": "audit_db defaults to {log_dir}/audit.db. timezone is the display timezone for audit queries (default UTC); audit_events limits which event types are recorded, empty records all.",
   "audit_db": "",
   "timezone": "",
