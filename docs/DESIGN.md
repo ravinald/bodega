@@ -111,11 +111,17 @@ An unsigned source needs `deb [trusted=yes] https://bodega/apt/ noble main`, whi
 
 The signature seals the last hop only: it proves the bytes are the ones this bodega asserted. It carries no claim about upstream, because bodega records no upstream verification result and a source-built `.deb` never had an upstream signature. `docs/USAGE.md` states the full scope.
 
-### Mirrored codenames
+### Generated suites and mirrored codenames
 
-A codename in `apt_upstreams` is served from an upstream archive instead of generated. `internal/server/apt_mirror.go` proxies `dists/<codename>/...` through `proxyOrCache` — `by-hash/` paths immutable, everything else mutable under `metadata_ttl` — and the pool artifacts the index points at, immutable. bodega parses no upstream index: apt reads the proxied `Packages` and composes the next request itself, so every component and architecture the upstream publishes resolves without bodega knowing they exist.
+A codename is served in one of two shapes, and this document and `docs/USAGE.md` use these two names for them throughout. A **generated suite** is a codename in `apt_suites`: bodega builds `Release` and the `Packages` bodies from its own manifest entries and signs them. A **mirrored codename** is a codename in `apt_upstreams`: bodega proxies an upstream archive's `dists/` tree and the pool artifacts it names, and forwards the archive's signature untouched. A codename is one or the other, never both.
 
-`InRelease` and `Release.gpg` are forwarded unchanged, so the archive's own signature reaches the client and verifies against the distro keyring already on the host. bodega's key signs generated suites and nothing else, and `config.Load` refuses a codename that appears in both `apt_suites` and `apt_upstreams`: a signature over a `Release` is a signature over the digests of the `Packages` beside it, one URL serves one `Packages` per component and architecture, so a shared codename would hand a client an index its signature does not describe. `docs-internal/DESIGN_apt-suites-and-signing_2026_08_25.md` records the two rejected alternatives.
+`internal/server/apt_mirror.go` proxies `dists/<codename>/...` through `proxyOrCache` — `by-hash/` paths immutable, everything else mutable under `metadata_ttl` — and the pool artifacts the index points at, immutable. bodega parses no upstream index: apt reads the proxied `Packages` and composes the next request itself, so every component and architecture the upstream publishes resolves without bodega knowing they exist.
+
+A mirror gives an operator four things: a chokepoint, because every fetch leaves the network through bodega and the host allow-list (`bodega policy add apt <host>`) decides which archives it may reach at all; a cache, so the second host to install a package pays no upstream bandwidth; an audit row per request; and discovery rows naming the dependency closure the fleet actually installed. It gives no per-package control. There is no allow-list, no version pin, and no `hidden` or `frozen` under a mirrored codename, because bodega parses no upstream index and so has nothing to filter against: every package the archive publishes is reachable, and one that was not would 404 mid-install on the first `Depends:` chain that reached it. Per-package control is what a generated suite is for, since an `apt_suites` codename publishes the manifest entries an operator put in it and nothing else.
+
+`InRelease` and `Release.gpg` are forwarded unchanged, so the archive's own signature reaches the client and verifies against the distro keyring already on the host. bodega's key signs generated suites and nothing else, and `config.Load` refuses a codename that appears in both `apt_suites` and `apt_upstreams`: a signature over a `Release` is a signature over the digests of the `Packages` beside it, one URL serves one `Packages` per component and architecture, so a shared codename would hand a client an index its signature does not describe.
+
+Two alternatives were rejected. Leaving the codename in `apt_suites` while `apt_upstreams` takes over its `dists/` tree, with bodega simply not signing it, gives silent partial service: the locally built `.deb`s stay in the store and `bodega status apt` keeps listing them while the forwarded `Packages` names only upstream packages, so nothing serves them and every diagnostic reports success. Merging the two indexes under bodega's own signature is the shape that would put a local and an upstream `.deb` in one suite, and it costs the multi-paragraph `deb822` parser deferred in `internal/deb822`, run over an index tens of megabytes uncompressed per component and architecture; a precedence rule for a package name present on both sides, which is a supply-chain decision, because local-wins lets anyone with manifest write access shadow `libc6`; republished or stripped `by-hash/` bodies, since the upstream `Release` advertises digests of the upstream bytes; and a second refresh loop, because a merged index has to track the upstream's freshness as well as bodega's. An operator who wants both in one apt transaction gets it today by listing two suites in one `.sources` stanza.
 
 A pool request carries no codename, so bodega probes the configured archives in sorted order with a `HEAD` and remembers which one answered, positively or negatively, for an hour. A pool path a manifest entry owns is never probed: the entry's `Packages` stanza already published a `SHA256` computed at package time, and caching another archive's artifact there would serve bytes the client's own hash check rejects.
 
@@ -259,9 +265,9 @@ It also settles an ordering problem. Catalog mode returns 404 against an empty s
 
 Every path runs the same admission checks (`internal/admit`): structural validation, the upstream allow-list, then the age and OSV version checks. A manifest's fate does not depend on which surface it arrived through.
 
-## Apt three-mode workflow
+## Apt entry-creation modes
 
-Apt entries support three distinct workflows:
+Three ways to write an apt manifest entry, and all three answer where the `.deb` comes from. None of them decides how the repository is served. That is the generated-suite versus mirrored-codename split under [Generated suites and mirrored codenames](#generated-suites-and-mirrored-codenames), and an operator asking whether bodega can proxy a whole distribution wants that section rather than this one. The answer is yes.
 
 ### 1. Package name mode
 
@@ -374,7 +380,7 @@ The chart request path reads the same rule, ambiguities included. `handleHelmCha
 
 ### Where the CIDR lists live
 
-`admin_permit_cidr`, `deny_list` and `trusted_proxies` live in the audit database, in `acl_lists` and `acl_entries` (migration `008`). They are the only runtime values that have moved out of `config.json` so far; `docs-internal/CONFIG_TO_DB_MIGRATION.md` scopes the rest.
+`admin_permit_cidr`, `deny_list` and `trusted_proxies` live in the audit database, in `acl_lists` and `acl_entries` (migration `008`). They are the only runtime values that have moved out of `config.json` so far. The rest of the runtime set (`proxy_cache_enabled`, `metadata_ttl`, the upstream URLs, `audit_events`) is a candidate and unscheduled. The bootstrap set stays in the file by definition: `storage_backend`, `bucket`, `region` and the filesystem paths are what locate the database the other values would live in.
 
 The move buys two things. A change lands on a running server, within 30 seconds on its own or at once on `systemctl reload bodega`, so widening the admin list no longer means a restart. And the write path is `bodega acl`, which touches one row, rather than `Config.Save()`, which rewrites the whole file including keys the caller never named.
 
