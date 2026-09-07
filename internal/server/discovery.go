@@ -5,8 +5,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"path"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -218,6 +216,17 @@ func (s *Server) recordDiscovery(ctx context.Context, r *http.Request, regType, 
 		pkgName = policyCandidate
 	}
 
+	// Name and version both come off the key, which is the one derivation of
+	// what was fetched. Splitting them — name from the caller, version from
+	// the key — is what let one prerelease chart request record
+	// "cert-manager" at "rc.1" while the handler served 1.14.0-rc.1. A key
+	// from outside every tree (the pypi simple index, a cargo sparse path)
+	// carries no identity, and the caller's name stands.
+	_, keyName, pkgVersion := manifest.ParseKey(s3Key)
+	if keyName != "" {
+		pkgName = keyName
+	}
+
 	hint := policy.SuggestPattern(regType, host, fullPath, pkgName)
 	if hint == "" {
 		// Fall back to the candidate so the row is still aggregatable —
@@ -225,7 +234,7 @@ func (s *Server) recordDiscovery(ctx context.Context, r *http.Request, regType, 
 		hint = policyCandidate
 	}
 
-	s.recordDiscoveryRaw(ctx, r, regType, host, hint, pkgName, pkgVersionFromKey(s3Key), decision, upstreamURL)
+	s.recordDiscoveryRaw(ctx, r, regType, host, hint, pkgName, pkgVersion, decision, upstreamURL)
 }
 
 // recordCacheHit writes the discovery row for a request the cache answered.
@@ -330,48 +339,4 @@ func splitUpstreamURL(raw string) (string, string) {
 		return raw, ""
 	}
 	return u.Hostname(), u.Path
-}
-
-// pkgVersionFromKey extracts a best-effort version string from an S3 key.
-// Used only for discovery rows — wrong answers degrade aggregation quality
-// but don't change behavior. Returns "" when no version segment is obvious.
-func pkgVersionFromKey(key string) string {
-	switch {
-	case strings.HasPrefix(key, "gomod/"):
-		// gomod/<module>/@v/<version>.<ext>
-		if idx := strings.Index(key, "/@v/"); idx > 0 {
-			ver := key[idx+len("/@v/"):]
-			if dot := strings.LastIndex(ver, "."); dot > 0 {
-				return ver[:dot]
-			}
-			return ver
-		}
-	case strings.HasPrefix(key, "charts/"):
-		// charts/<chart>-<version>.tgz
-		base := strings.TrimSuffix(path.Base(key), ".tgz")
-		if idx := strings.LastIndex(base, "-"); idx > 0 {
-			return base[idx+1:]
-		}
-	case strings.HasPrefix(key, "npm/"):
-		// npm/<safe-name>/-/<version>.tgz or npm/<safe-name>/packument.json
-		base := path.Base(key)
-		if strings.HasSuffix(base, ".tgz") {
-			return strings.TrimSuffix(base, ".tgz")
-		}
-	case strings.HasPrefix(key, manifest.AptPoolPrefix):
-		// packages/apt/pool/<component>/<letter>/<source>/<pkg>_<version>_<arch>.deb
-		// The version lives inside the filename, not in a path segment, and
-		// these are the rows that record what a fleet's dependency closure
-		// actually pulled — a blank version there costs the aggregation the
-		// only thing that distinguishes one install from the next.
-		_, version := manifest.AptDebIdentity(path.Base(key))
-		return version
-	case strings.HasPrefix(key, "pypi/wheels/"):
-		// pypi/wheels/<version>/<dist>-<version>-<...>.whl
-		segs := strings.Split(key, "/")
-		if len(segs) >= 3 {
-			return segs[2]
-		}
-	}
-	return ""
 }

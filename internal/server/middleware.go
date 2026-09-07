@@ -14,6 +14,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/logging"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // contextKey is an unexported type for context keys in this package.
@@ -563,12 +564,16 @@ func parsePackagePath(path string) (pkgType, pkgName, pkgVersion string) {
 		return "gomod", full, ""
 	case strings.HasPrefix(path, "/helm/charts/"):
 		filename := strings.TrimPrefix(path, "/helm/charts/")
-		// chart-name-version.tgz → name, version
-		filename = strings.TrimSuffix(filename, ".tgz")
-		if idx := strings.LastIndex(filename, "-"); idx > 0 {
-			return "helm", filename[:idx], filename[idx+1:]
+		base, isChart := strings.CutSuffix(filename, ".tgz")
+		if !isChart {
+			return "helm", filename, ""
 		}
-		return "helm", filename, ""
+		// The same two lines handleHelmChart runs, so the serve_fetch event
+		// names the chart and version the request path resolved. A rule of its
+		// own here recorded "cert-manager-1.14.0" at "rc.1" for a request the
+		// handler served as cert-manager 1.14.0-rc.1.
+		_, name, version := manifest.ParseKey(manifest.HelmChartKey(base, ""))
+		return "helm", name, version
 	case strings.HasPrefix(path, "/helm/"):
 		return "helm", "index", ""
 	case strings.HasPrefix(path, "/npm/"):

@@ -227,8 +227,8 @@ func lastSegment(s string) string {
 
 // ParseKey inverts the constructors above: given an object key, it returns the
 // package type, name and version the key was built from. Names come back
-// canonical, slashes restored, so a name returned here is the string the
-// constructor was handed.
+// canonical, with the slashes their encoding collapsed restored, so a name
+// returned here is the string the constructor was handed.
 //
 // A key no constructor could have produced returns three empty strings. An
 // empty type is the caller's signal to record the key alone — a checksum row
@@ -317,7 +317,8 @@ func ParseKey(key string) (typ, name, version string) {
 			return TypeCargo, "", ""
 		}
 		n, v := splitTrailingVersion(base)
-		return TypeCargo, unsafeName(n), v
+		// Returned as stored: a crate name holds no slash. See unsafeName.
+		return TypeCargo, n, v
 
 	case strings.HasPrefix(key, cargoIndexPrefix):
 		// Keyed by the registry path cargo requested. The trailing segment is
@@ -334,7 +335,8 @@ func ParseKey(key string) (typ, name, version string) {
 			return TypeHelm, "", ""
 		}
 		n, v := splitTrailingVersion(base)
-		return TypeHelm, unsafeName(n), v
+		// Returned as stored: a chart name holds no slash. See unsafeName.
+		return TypeHelm, n, v
 
 	case strings.HasPrefix(key, npmPrefix):
 		dir, file, ok := strings.Cut(strings.TrimPrefix(key, npmPrefix), "/")
@@ -434,6 +436,12 @@ func opensVersion(s string) bool {
 
 // unsafeName reverses SafeName, restoring the slashes a stored path segment
 // collapsed to "--".
+//
+// Only npm, git and binary reach it, because only their names carry a slash.
+// A helm chart name and a cargo crate name cannot, so SafeName is a no-op on
+// the way in and this would be lossy on the way out: the chart "foo--bar"
+// would come back as "foo/bar", which matches no manifest entry and so is
+// never fetched from upstream.
 func unsafeName(segment string) string {
 	return strings.ReplaceAll(segment, "--", "/")
 }

@@ -3,6 +3,7 @@ package server
 import (
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -95,6 +96,106 @@ func identities(rows []audit.DiscoveryRow) []string {
 	out := make([]string, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, row.PkgName+"/"+row.PkgVersion)
+	}
+	return out
+}
+
+// TestHelmPrereleaseAgreesAcrossEveryDerivation drives one proxy-mode request
+// and reads back every place its identity is written down. Three derivations
+// ran over the same request and only the handler's had moved: the discovery
+// row split at the last "-" and recorded cert-manager at "rc.1", the
+// serve_fetch event split the same way and recorded "cert-manager-1.14.0" at
+// "rc.1", and an operator reading `discover list` or `audit events` got a name
+// and version no repository serves. A test that checks one of the three is
+// what let this survive two items, so this checks all three off one request.
+func TestHelmPrereleaseAgreesAcrossEveryDerivation(t *testing.T) {
+	const (
+		wantChart   = "cert-manager"
+		wantVersion = "1.14.0-rc.1"
+	)
+	s := proxyingServer(t)
+	up := newRecordingUpstream(t)
+	up.route("/charts/"+prereleaseChart, "chart bytes")
+	seedProxyHelm(t, s, wantChart, wantVersion, up.ts.URL+"/charts")
+
+	if status, body := getStatusAndBody(t, s, "/helm/charts/"+prereleaseChart); status != http.StatusOK {
+		t.Fatalf("status = %d (%q), want 200; upstream saw %v", status, body, up.paths())
+	}
+
+	// The request path itself: the proxy-mode branch only fires on a manifest
+	// lookup for the chart the seed names.
+	if !up.sawPath("/charts/" + prereleaseChart) {
+		t.Errorf("upstream saw %v, want /charts/%s", up.paths(), prereleaseChart)
+	}
+
+	rows := waitForAnyDiscovery(t, s, 1)
+	var gotRow bool
+	for _, row := range rows {
+		if row.PkgName == wantChart && row.PkgVersion == wantVersion {
+			gotRow = true
+		}
+	}
+	if !gotRow {
+		t.Errorf("no discovery row for %s at %s; rows carry %v", wantChart, wantVersion, identities(rows))
+	}
+
+	fetches := waitForServeFetch(t, s, 1)
+	var gotEvent bool
+	for _, ev := range fetches {
+		if ev.PkgType == manifest.TypeHelm && ev.PkgName == wantChart && ev.PkgVersion == wantVersion {
+			gotEvent = true
+		}
+	}
+	if !gotEvent {
+		t.Errorf("no serve_fetch event for helm %s at %s; events carry %v",
+			wantChart, wantVersion, eventIdentities(fetches))
+	}
+}
+
+// waitForAnyDiscovery is waitForDiscovery with no decision filter: a fetch the
+// allow-list permitted lands under no_policy, not no_manifest.
+func waitForAnyDiscovery(t *testing.T, s *Server, want int) []audit.DiscoveryRow {
+	t.Helper()
+	var rows []audit.DiscoveryRow
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		var err error
+		rows, err = s.auditDB.ListDiscovery(t.Context(), audit.DiscoveryFilter{})
+		if err != nil {
+			t.Fatalf("list discovery: %v", err)
+		}
+		if len(rows) >= want {
+			return rows
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("discovery rows = %d after 3s, want %d (%+v)", len(rows), want, rows)
+	return nil
+}
+
+// waitForServeFetch polls the audit table: AuditMiddleware writes the event
+// after the handler returns, which can be after the client has read the body.
+func waitForServeFetch(t *testing.T, s *Server, want int) []audit.StoredEvent {
+	t.Helper()
+	var events []audit.StoredEvent
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		var err error
+		events, err = s.auditDB.Query(t.Context(), audit.Filter{EventType: audit.EventServeFetch})
+		if err != nil {
+			t.Fatalf("query audit db: %v", err)
+		}
+		if len(events) >= want {
+			return events
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("serve_fetch events = %d after 3s, want %d (%+v)", len(events), want, events)
+	return nil
+}
+
+func eventIdentities(events []audit.StoredEvent) []string {
+	out := make([]string, 0, len(events))
+	for _, ev := range events {
+		out = append(out, ev.PkgType+"/"+ev.PkgName+"/"+ev.PkgVersion)
 	}
 	return out
 }
