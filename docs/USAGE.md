@@ -704,7 +704,7 @@ An audit database written under the retired `discover_mode: "learn"` also holds 
 These are not observed yet. A quiet discovery log for one of them means the hook does not reach it, not that no client asked:
 
 - **apt with no `apt_upstreams`**: `/apt/pool/...` reads storage directly with nothing upstream to fetch, so neither a hit nor a miss is recorded. A pool path a manifest entry owns behaves the same way even on a mirroring instance: it is served from storage and never proxied.
-- **generated apt suites**: `dists/` for a codename in `apt_suites` is built from bodega's own manifests, so there is no upstream request to observe. Only mirrored codenames produce rows.
+- **generated suites**: `dists/` for a codename in `apt_suites` is built from bodega's own manifests, so there is no upstream request to observe. Only mirrored codenames produce rows.
 - **git bundles**: `/git/{name}/{file}` serves an uploaded bundle or release archive from storage. Nothing upstream, nothing logged.
 - **git mirror refreshes**: a smart-HTTP request records one row per request, but the periodic `git remote update` it triggers is not separately logged. The row says a client asked; it does not say whether that request also refreshed the mirror.
 - **binary outside a namespace, with `binary_upstreams` empty**: `/binaries/...` reads storage exactly as it did before the block existed, and records nothing — an install that has not opted in. Once any entry exists, a first segment naming no key is not this case: it 404s without touching storage and records a `no_namespace` row, which is in the table above.
@@ -1417,7 +1417,7 @@ The deb822 `.sources` form is preferred over the one-line `.list` form because `
 
 The suite (`noble` above) is any entry in `apt_suites`. One instance serves several: list them on the `Suites:` line, or give each its own sources line in the one-line format. A `.deb` listed in two suites is stored once in the shared `pool/` and appears in both `Packages` indexes with the same `Filename:`.
 
-A **mirrored** suite is configured differently, because something else signs it:
+A **mirrored codename** is configured differently, because something else signs it:
 
 ```
 Types: deb
@@ -1584,7 +1584,7 @@ TLS is what authenticates an unsigned source, which is why every URL here is `ht
 
 It seals the last hop: the bytes are the ones **this bodega** asserted, and the hash chain from `Release` to `Packages` to each `.deb` holds under a key the client pinned.
 
-It carries no claim about upstream. `apt-get download` does verify against the distro's own keyring on the build host, but that result is recorded nowhere and does not reach the client; a source-built `.deb` never had an upstream signature at all. For a mirrored suite the upstream signature is forwarded unchanged instead, which is a stronger claim than bodega could make about the same bytes — see [Mirroring an upstream archive](#mirroring-an-upstream-archive). bodega's key signs generated suites and nothing else.
+It carries no claim about upstream. `apt-get download` does verify against the distro's own keyring on the build host, but that result is recorded nowhere and does not reach the client; a source-built `.deb` never had an upstream signature at all. For a mirrored codename the upstream signature is forwarded unchanged instead, which is a stronger claim than bodega could make about the same bytes — see [Mirroring an upstream archive](#mirroring-an-upstream-archive). bodega's key signs generated suites and nothing else.
 
 It does not catch a tampered `.deb` that manifests were not also edited; the client already catches that. `_sha256` is computed once at package time and served from the manifest, never recomputed from disk, so swapping a pooled file fails the client's own hash check whether or not the repository is signed. What signing adds is coverage of an attacker who can write manifests too.
 
@@ -1605,7 +1605,7 @@ Or skip the network entirely: `bodega apt key export --keyring` writes the same 
 
 ### Mirroring an upstream archive
 
-A codename listed in `apt_upstreams` is served from upstream rather than generated. bodega proxies `dists/<codename>/...` and the pool artifacts the index points at, caching each on the way through. This is what makes `apt update && apt install <anything>` work against bodega for packages nobody pre-built: apt reads the proxied `Packages`, resolves dependencies locally, then asks bodega for each `.deb` by its `Filename:`.
+A codename listed in `apt_upstreams` is a **mirrored codename**: served from upstream rather than generated, the other of the two shapes a codename can take. A codename in `apt_suites` is a **generated suite**, built from bodega's own manifest entries and signed by bodega. bodega proxies `dists/<codename>/...` and the pool artifacts the index points at, caching each on the way through. This is what makes `apt update && apt install <anything>` work against bodega for packages nobody pre-built: apt reads the proxied `Packages`, resolves dependencies locally, then asks bodega for each `.deb` by its `Filename:`.
 
 ```json
 "apt_upstreams": {
@@ -1626,7 +1626,7 @@ bodega parses no index. The upstream `Release` names the components, architectur
 
 #### `[trusted=yes]` is not needed, and is wrong here
 
-The upstream `InRelease` is forwarded byte-for-byte, signature intact, and apt verifies it against the distro keyring already installed on the host (`ubuntu-keyring`, `debian-archive-keyring`). Neither `[trusted=yes]` nor `Signed-By:` belongs on a mirrored source: the first discards a signature that is right there and valid, and the second points apt at bodega's key, which signed nothing in that tree. The startup banner, the TUI, the web UI and `GET /api/v1/status` all render a mirrored suite with neither option, and say why beside the line.
+The upstream `InRelease` is forwarded byte-for-byte, signature intact, and apt verifies it against the distro keyring already installed on the host (`ubuntu-keyring`, `debian-archive-keyring`). Neither `[trusted=yes]` nor `Signed-By:` belongs on a source line naming a mirrored codename: the first discards a signature that is right there and valid, and the second points apt at bodega's key, which signed nothing in that tree. The startup banner, the TUI, the web UI and `GET /api/v1/status` all render a mirrored codename with neither option, and say why beside the line.
 
 #### Open mode only
 
