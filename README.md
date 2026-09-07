@@ -90,7 +90,7 @@ Exactly one file is in force, and one rule answers for reading it, writing it an
 
 ## Running under systemd
 
-A sample unit file is shipped at [docs/bodega.service](docs/bodega.service). It's `Type=notify` and takes advantage of bodega's built-in sd_notify support to accurately signal readiness. Copy to `/etc/systemd/system/`, edit `User`/paths to match your install, then `sudo systemctl daemon-reload && sudo systemctl enable --now bodega`.
+A sample unit file is shipped at [docs/bodega.service](docs/bodega.service). It's `Type=notify` and takes advantage of bodega's built-in sd_notify support to accurately signal readiness. Copy to `/etc/systemd/system/`, edit `User`/paths to match your install, then `sudo systemctl daemon-reload && sudo systemctl enable --now bodega`. The unit's own header carries the steps around it: the service account, the two writable directories, and the ownership pass that has to come after any bodega command you run as root, because those leave `config.json` and `audit.db` owned by root and the service will not start on either.
 
 Reload manifests without a restart via `sudo systemctl reload bodega` (fires SIGHUP to the process). Logs land in the journal — `journalctl -u bodega -f`.
 

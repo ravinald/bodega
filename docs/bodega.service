@@ -1,11 +1,37 @@
 # Systemd unit for bodega
 #
 # Copy to /etc/systemd/system/bodega.service and edit User, paths,
-# and environment to match your install. Then:
+# and environment to match your install. The service account and the two
+# writable directories have to exist first; nothing here creates them:
+#
+#   sudo useradd --system --home-dir /var/lib/bodega --shell /usr/sbin/nologin bodega
+#   sudo mkdir -p /etc/bodega /var/lib/bodega /var/log/bodega
+#
+# Write the config and generate the signing key (see LoadCredential= below),
+# then hand both trees to the service account last:
+#
+#   sudo chown -R bodega:bodega /var/lib/bodega /var/log/bodega
+#   sudo chown root:bodega /etc/bodega/config.json
+#   sudo chmod 0640 /etc/bodega/config.json
 #
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now bodega
 #   journalctl -u bodega -f
+#
+# The order and the -R both carry weight. Any bodega command run as root seeds
+# state this service then has to open: /etc/bodega/config.json arrives mode 0600
+# root:root, and /var/log/bodega/audit.db arrives root-owned even when the
+# directory around it already belongs to bodega. Chowning the trees before those
+# commands run, or without -R, leaves the files behind and the start fails on one
+# of
+#
+#   Error: read config /etc/bodega/config.json: open ...: permission denied
+#   Error: audit db /var/log/bodega/audit.db is not writable by this process
+#   (uid 999): every denial, fetch and lifecycle row would be dropped with no
+#   error anywhere.
+#
+# Mode 0640 root:bodega is the config's resting state: the running server only
+# reads it, and the commands that edit it still want root.
 #
 # Recommended config.json additions when running under systemd:
 #
