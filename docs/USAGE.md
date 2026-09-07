@@ -2360,9 +2360,11 @@ The `?` help lays its sections into as many columns as the terminal is wide enou
 
 ### Config editor
 
-Press `C` to open the config form. `Ctrl+S` saves, `Ctrl+T` loads defaults, `Ctrl+R` resets. Changes take effect immediately.
+Press `C` to open the config form. `Ctrl+S` saves, `Ctrl+T` loads defaults into the fields, `Ctrl+R` resets those fields to their defaults and saves. Changes take effect immediately.
 
 A save writes the keys you edited, plus any key whose value differs from what the running process resolved. Fields are prefilled with that resolved config — what is in force, flags and environment included — so pressing save without touching a field records nothing, and the log line says the file is unchanged rather than claiming a save. Editing a field pins its key even when you type back the value already shown: `bodega --manifest-dir /srv/m shell` prefills `/srv/m`, and retyping it is how you make it stick. The log line names the keys that reached the file.
+
+`Ctrl+R` reaches the eleven fields on the form and nothing else. Every other key in the file survives it: `token`, `deny_list`, `admin_permit_cidr`, `audit_db`, `discover_mode`, `apt_codename`, the upstream keys and the TLS pair. Its log line names the keys the reset wrote, because it is the same write a save makes and it is subject to the same diff. Clearing an `admin_permit_cidr` you no longer want is `bodega acl admin`, not a reset.
 
 The form edits no ACL. `deny_list`, `admin_permit_cidr` and `trusted_proxies` are seeded from the config file on first start and inert afterwards, so a field writing them to `config.json` would accept a value, save it, report success and change nothing about who the server refuses. Edit them with `bodega acl deny`, `bodega acl admin` and `bodega acl proxies`; the form says so under its title.
 

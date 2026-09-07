@@ -1,7 +1,9 @@
 package tui
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -223,4 +225,113 @@ func TestJSONEditPopupEscClears(t *testing.T) {
 	if v := am.popup.View(m.width, m.height); v != "" {
 		t.Errorf("popup still renders after esc:\n%s", v)
 	}
+}
+
+// TestConfigFormResetLeavesKeysOutsideTheFormAlone drives Ctrl+R the way a
+// keystroke reaches it. The reset assigns eleven fields; Save writes only what
+// differs from the resolved config, so every other key in the file survives —
+// including an admin_permit_cidr of 0.0.0.0/0, which the old "Config reset to
+// defaults and saved to <path>" line told the operator was gone (#227).
+func TestConfigFormResetLeavesKeysOutsideTheFormAlone(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	seeded := `{
+  "region": "us-east-1",
+  "build_root": "/srv/build",
+  "custom_paths": true,
+  "apt_root": "/srv/apt",
+  "admin_permit_cidr": ["0.0.0.0/0"],
+  "token": "seeded-token",
+  "deny_list": ["10.0.0.5/32"],
+  "audit_db": "/srv/audit.db",
+  "discover_mode": "observe",
+  "apt_codename": "jammy",
+  "tls_cert": "/srv/tls/cert.pem",
+  "tls_key": "/srv/tls/key.pem"
+}`
+	if err := os.WriteFile(path, []byte(seeded), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	am, _ := openConfigForm(t, path, "")
+	next, _ := am.handlePopupKey(tea.KeyMsg{Type: tea.KeyCtrlR})
+	am, ok := next.(appModel)
+	if !ok {
+		t.Fatalf("handlePopupKey returned %T, want appModel", next)
+	}
+	if am.popup.kind != popupConfirm {
+		t.Fatalf("ctrl+r left popup kind %v, want the confirm", am.popup.kind)
+	}
+	if strings.Contains(am.popup.message, "config file") {
+		t.Errorf("confirm prompt %q promises the config file; the reset reaches this form's fields alone", am.popup.message)
+	}
+	if am.popup.onYes == nil {
+		t.Fatal("the reset confirm carries no onYes")
+	}
+	am.popup.onYes()
+
+	keys := savedConfigKeys(t, path)
+	for k, want := range map[string]string{ //nolint:gosec // G101: the seeded token is the value under test, not a credential
+		"admin_permit_cidr": `["0.0.0.0/0"]`,
+		"token":             `"seeded-token"`,
+		"deny_list":         `["10.0.0.5/32"]`,
+		"audit_db":          `"/srv/audit.db"`,
+		"discover_mode":     `"observe"`,
+		"apt_codename":      `"jammy"`,
+		"tls_cert":          `"/srv/tls/cert.pem"`,
+		"tls_key":           `"/srv/tls/key.pem"`,
+	} {
+		got, ok := keys[k]
+		if !ok {
+			t.Errorf("reset dropped %q, which the form does not edit", k)
+			continue
+		}
+		if got != want {
+			t.Errorf("reset rewrote %q to %s, want %s", k, got, want)
+		}
+	}
+
+	if got, ok := keys["manifest_dir"]; ok {
+		t.Errorf("reset added manifest_dir = %s to a file that never named it", got)
+	}
+	if got := keys["region"]; got != `"`+config.DefaultRegion+`"` {
+		t.Errorf("region after the reset = %s, want the built-in default", got)
+	}
+	if _, ok := keys["apt_root"]; ok {
+		t.Error("reset kept apt_root; the form cleared it, so the key has to go")
+	}
+
+	line := lastLogLine(t, &am)
+	for _, phrase := range []string{"Config reset to defaults", "config file"} {
+		if strings.Contains(line, phrase) {
+			t.Errorf("reset logged %q, which claims more than it wrote", line)
+		}
+	}
+	for _, key := range []string{"region", "build_root", "custom_paths", "apt_root"} {
+		if !strings.Contains(line, key) {
+			t.Errorf("reset logged %q, want it to name %s", line, key)
+		}
+	}
+}
+
+// savedConfigKeys reads a config file back as top-level keys with their values
+// compacted, so a test can assert on what survived a write.
+func savedConfigKeys(t *testing.T, path string) map[string]string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read saved config: %v", err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("unmarshal saved config: %v", err)
+	}
+	out := make(map[string]string, len(raw))
+	for k, v := range raw {
+		var buf bytes.Buffer
+		if err := json.Compact(&buf, v); err != nil {
+			t.Fatalf("compact %q: %v", k, err)
+		}
+		out[k] = buf.String()
+	}
+	return out
 }
