@@ -208,23 +208,28 @@ func (s *Server) recordDiscovery(ctx context.Context, r *http.Request, regType, 
 
 	host, fullPath := splitUpstreamURL(upstreamURL)
 
-	// Discovery-time package name preference: explicit > policy candidate. For
-	// URL-scoped types the policy candidate is the URL itself, which is not
-	// useful as an aggregation key — callers pass discoveryPkgName separately.
+	// The version is the key's alone. Taking it from anywhere else is what let
+	// one prerelease chart request record "cert-manager" at "rc.1" while the
+	// handler served 1.14.0-rc.1.
+	//
+	// The name prefers the caller, which read it off the request path and so
+	// knows a literal "--" from an encoded "/". ParseKey cannot: it restores
+	// the slash for npm, git and binary because a scoped name genuinely
+	// carries one, so letting it win recorded the npm package "foo--bar" as
+	// "foo/bar". Falling back to the key covers a caller with no name of its
+	// own, and helm's caller name is itself ParseKey-derived, so the chart
+	// request still has one source. A key from outside every tree (the pypi
+	// simple index, a cargo sparse path) yields neither, and the policy
+	// candidate stands.
+	_, keyName, pkgVersion := manifest.ParseKey(s3Key)
 	pkgName := discoveryPkgName
 	if pkgName == "" {
-		pkgName = policyCandidate
-	}
-
-	// Name and version both come off the key, which is the one derivation of
-	// what was fetched. Splitting them — name from the caller, version from
-	// the key — is what let one prerelease chart request record
-	// "cert-manager" at "rc.1" while the handler served 1.14.0-rc.1. A key
-	// from outside every tree (the pypi simple index, a cargo sparse path)
-	// carries no identity, and the caller's name stands.
-	_, keyName, pkgVersion := manifest.ParseKey(s3Key)
-	if keyName != "" {
 		pkgName = keyName
+	}
+	if pkgName == "" {
+		// For URL-scoped types the candidate is the URL itself, which is a
+		// poor aggregation key but better than an empty column.
+		pkgName = policyCandidate
 	}
 
 	hint := policy.SuggestPattern(regType, host, fullPath, pkgName)

@@ -486,3 +486,99 @@ func TestNpmPackumentRewriteIsTheSameOnEveryPath(t *testing.T) {
 		t.Errorf("filtered packument still lists the hidden 1.0.0: %s", truncateForTest(filtered))
 	}
 }
+
+// TestNpmPrereleaseServeFetchNamesTheKeyVersion pins the audit derivation to
+// the one handleNpm stores under. parsePackagePath split the tarball at its
+// last "-", so a prerelease reached `bodega audit events` as version "rc.1"
+// while the object key and the discovery row both carried "1.0.0-rc.1".
+func TestNpmPrereleaseServeFetchNamesTheKeyVersion(t *testing.T) {
+	const (
+		wantPkg     = "mypkg"
+		wantVersion = "1.0.0-rc.1"
+		tarball     = wantPkg + "-" + wantVersion + ".tgz"
+	)
+	s := proxyingServer(t)
+	up := newRecordingUpstream(t)
+	up.route("/"+wantPkg+"/-/"+tarball, "tarball bytes")
+	s.cfg.NpmUpstream = up.ts.URL
+
+	pm := &manifest.PackageManifest{
+		ConfigVersion: manifest.CurrentConfigVersion,
+		Name:          wantPkg,
+		Type:          manifest.TypeNpm,
+		Versions:      []manifest.VersionEntry{{Version: wantVersion, Mode: manifest.ModeProxy}},
+	}
+	if err := s.store.SavePackage(t.Context(), pm); err != nil {
+		t.Fatalf("seed npm/%s: %v", wantPkg, err)
+	}
+
+	if status, body := getStatusAndBody(t, s, "/npm/"+wantPkg+"/-/"+tarball); status != http.StatusOK {
+		t.Fatalf("status = %d (%q), want 200; upstream saw %v", status, body, up.paths())
+	}
+
+	events := waitForServeFetch(t, s, 1)
+	for _, ev := range events {
+		if ev.PkgType == manifest.TypeNpm && ev.PkgName == wantPkg && ev.PkgVersion == wantVersion {
+			return
+		}
+	}
+	t.Errorf("no serve_fetch event for npm %s at %s; events carry %v",
+		wantPkg, wantVersion, eventIdentities(events))
+}
+
+// TestNpmDoubleHyphenNameAgreesAcrossEveryDerivation pins the discovery row to
+// the name npm published. A scoped package's "/" is stored as "--", so
+// ParseKey decodes it back on the way out; a package whose literal name
+// carries "--" is indistinguishable at that point and comes back as "foo/bar".
+// The caller knows which it is, having read the name off the request path, so
+// the row takes the key's name only where the caller has none. Letting the key
+// win recorded foo/bar against a serve_fetch event and an object key that both
+// said foo--bar: one request, two identities, the shape #239 reports.
+func TestNpmDoubleHyphenNameAgreesAcrossEveryDerivation(t *testing.T) {
+	const (
+		wantPkg     = "foo--bar"
+		wantVersion = "1.0.0"
+		tarball     = wantPkg + "-" + wantVersion + ".tgz"
+	)
+	s := proxyingServer(t)
+	up := newRecordingUpstream(t)
+	up.route("/"+wantPkg+"/-/"+tarball, "tarball bytes")
+	s.cfg.NpmUpstream = up.ts.URL
+
+	pm := &manifest.PackageManifest{
+		ConfigVersion: manifest.CurrentConfigVersion,
+		Name:          wantPkg,
+		Type:          manifest.TypeNpm,
+		Versions:      []manifest.VersionEntry{{Version: wantVersion, Mode: manifest.ModeProxy}},
+	}
+	if err := s.store.SavePackage(t.Context(), pm); err != nil {
+		t.Fatalf("seed npm/%s: %v", wantPkg, err)
+	}
+
+	if status, body := getStatusAndBody(t, s, "/npm/"+wantPkg+"/-/"+tarball); status != http.StatusOK {
+		t.Fatalf("status = %d (%q), want 200; upstream saw %v", status, body, up.paths())
+	}
+
+	rows := waitForAnyDiscovery(t, s, 1)
+	var gotRow bool
+	for _, row := range rows {
+		if row.PkgName == wantPkg && row.PkgVersion == wantVersion {
+			gotRow = true
+		}
+	}
+	if !gotRow {
+		t.Errorf("no discovery row for %s at %s; rows carry %v", wantPkg, wantVersion, identities(rows))
+	}
+
+	events := waitForServeFetch(t, s, 1)
+	var gotEvent bool
+	for _, ev := range events {
+		if ev.PkgType == manifest.TypeNpm && ev.PkgName == wantPkg && ev.PkgVersion == wantVersion {
+			gotEvent = true
+		}
+	}
+	if !gotEvent {
+		t.Errorf("no serve_fetch event for npm %s at %s; events carry %v",
+			wantPkg, wantVersion, eventIdentities(events))
+	}
+}
