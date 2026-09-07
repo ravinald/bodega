@@ -579,14 +579,12 @@ func parsePackagePath(path string) (pkgType, pkgName, pkgVersion string) {
 	case strings.HasPrefix(path, "/npm/"):
 		full := strings.TrimPrefix(path, "/npm/")
 		if idx := strings.Index(full, "/-/"); idx >= 0 {
+			// Anchored on the package name, the way handleNpm derives the
+			// version it stores under. Splitting at the last "-" instead read
+			// "cli-1.0.0-rc.1.tgz" as version "rc.1", so the audit event named
+			// a version the object key does not carry.
 			pkgName := full[:idx]
-			tarball := full[idx+3:]
-			// Extract version from tarball name
-			tarball = strings.TrimSuffix(tarball, ".tgz")
-			if vIdx := strings.LastIndex(tarball, "-"); vIdx > 0 {
-				return "npm", pkgName, tarball[vIdx+1:]
-			}
-			return "npm", pkgName, ""
+			return "npm", pkgName, npmVersionFromTarball(pkgName, full[idx+3:])
 		}
 		return "npm", full, ""
 	case strings.HasPrefix(path, "/cargo/"):
