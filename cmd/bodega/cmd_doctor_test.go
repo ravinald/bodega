@@ -199,6 +199,38 @@ func TestDoctorCoverageSaysHowManyGatesAreInForce(t *testing.T) {
 	}
 }
 
+// An OSV gate refuses fetches from the same admission path the age gate runs
+// in, so an install carrying one is not wide open. Measured against the
+// shipped binary before it was: 0 rules, 0 age rows and osv npm block read
+// "every upstream fetch is admitted", which the operator's own
+// policy_violation records disprove.
+func TestDoctorCoverageCountsTheOSVGate(t *testing.T) {
+	store := fakePosture{osvs: []audit.OSVPolicy{{Ecosystem: "npm", Action: "block"}}}
+	f := findingFor(t, serverPosture(context.Background(), store), "policy-coverage")
+	if f.IsFinding() {
+		t.Fatalf("an install with a blocking OSV gate reported %s: %s", f.Status, f.Detail)
+	}
+	if !strings.Contains(f.Detail, "1 with an OSV gate") {
+		t.Errorf("detail %q does not count the OSV gate", f.Detail)
+	}
+	if strings.Contains(f.Detail, "in force") {
+		t.Errorf("coverage qualified an install whose only gate enforces: %q", f.Detail)
+	}
+}
+
+// A silenced OSV gate is coverage without enforcement, the same as a silenced
+// age gate, and the in-force count has to span both tables to say so.
+func TestDoctorCoverageInForceSpansBothGates(t *testing.T) {
+	store := fakePosture{
+		ages: []audit.AgePolicy{{Ecosystem: "npm", MinAgeSeconds: 604800, Action: "warn"}},
+		osvs: []audit.OSVPolicy{{Ecosystem: "npm", Action: "ignore"}},
+	}
+	f := findingFor(t, serverPosture(context.Background(), store), "policy-coverage")
+	if !strings.Contains(f.Detail, "1 in force") {
+		t.Errorf("coverage reported %q on an install with one live gate and one silenced", f.Detail)
+	}
+}
+
 // A fresh install enforces everything it configured, so the line stays as
 // short as it was before the silenced case needed spelling out.
 func TestDoctorCoverageStaysQuietWhenEveryGateRuns(t *testing.T) {

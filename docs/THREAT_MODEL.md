@@ -162,12 +162,12 @@ instance, the recommended posture is:
   build log. The checks themselves write nothing, but every bodega command
   bootstraps a config file on first run, so a runner holding neither
   `/etc/bodega/config.json` nor `~/.config/bodega/config.json` gains the
-  second one (the first, as root) before the first check executes. That is
-  the only file a doctor run creates. The posture checks open the audit
-  database read-only, so a run against an install one release behind neither
-  brings a database into existence nor migrates the one it finds: an upgrade
-  is something you schedule, not something a report does to you. A host with
-  no install reads `N/A` rather than gaining one.
+  second one (the first, as root) before the first check executes. That file
+  and the log directory it names are all a doctor run creates. The posture
+  checks open the audit database read-only, so a run against an install one
+  release behind neither brings a database into existence nor migrates the
+  one it finds: an upgrade is something you schedule, not something a report
+  does to you. A host with no install reads `N/A` rather than gaining one.
 - **Harden the seeded cooldown and add an allow-list.** `bodega policy age
   set npm 7d block` turns the shipped `warn` into a refusal once you have
   watched it for a release cycle; `bodega policy add <type> <pattern>`
@@ -179,8 +179,11 @@ On the bodega host itself, `doctor` adds three checks that read the audit
 database rather than the machine. They report `N/A` on a client host with no
 install:
 
-- `policy-coverage`: no allow-list rule and no publish-age gate, so every
-  upstream fetch is admitted.
+- `policy-coverage`: no allow-list rule and no publish-age or OSV gate, so
+  every upstream fetch is admitted. It counts both gates because
+  `admit.checkVersions` runs both, so an install carrying either one already
+  refuses fetches and reporting it as wide open is a claim its own
+  `policy_violation` records disprove.
 - `policy-ignored`: a gate set to `ignore` on every ecosystem it covers.
   That is where an install lands when somebody silences an alert during an
   incident and nobody puts it back.

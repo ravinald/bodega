@@ -18,9 +18,9 @@ import (
 // newDoctorCmd reports host-level configuration that would silently bypass
 // bodega's supply-chain controls, and the server's own policy posture where
 // this machine holds an install. The checks are read-only: doctor changes
-// nothing it inspects and never creates the audit database it reports on. The
-// one file a doctor run can leave behind is not a check's doing — main()
-// writes a default config file before any command runs.
+// nothing it inspects and never creates the audit database it reports on.
+// What a doctor run can leave behind is not a check's doing — main() writes a
+// default config file, and the log directory it names, before any command runs.
 // Exit code is 0 when all checks are clean (OK or N/A) and 2 when at least
 // one check produced a finding (WARN or FAIL); this matches the convention
 // used by other CI-gating linters.
@@ -41,17 +41,17 @@ outside bodega's allow-list. Common findings:
   - GOPROXY unset or falling through to proxy.golang.org
 
 Where this machine holds a bodega install, doctor also reports the server's
-own posture: an install with no allow-list rule and no publish-age gate
-admits every upstream fetch, and one whose gates are all set to ignore is
-configured but enforcing nothing. Those checks read the audit database and
-report N/A on a client host that has none.
+own posture: an install with no allow-list rule and no publish-age or OSV
+gate admits every upstream fetch, and one whose gates are all set to ignore
+is configured but enforcing nothing. Those checks read the audit database
+and report N/A on a client host that has none.
 
 Reports only: the posture checks open the audit database read-only, so a
-doctor run neither creates one nor migrates the one it finds. One caveat
-for a CI runner. Every bodega
-command bootstraps a config file on first run, doctor included, so a host
-with neither /etc/bodega/config.json nor ~/.config/bodega/config.json gains
-the second one (the first, as root) before the checks execute.
+doctor run neither creates one nor migrates the one it finds. One caveat for
+a CI runner. Every bodega command bootstraps a config file on first run,
+doctor included, so a host with neither /etc/bodega/config.json nor
+~/.config/bodega/config.json gains the second one (the first, as root), and
+the log directory that config names, before the checks execute.
 
 Exit code is 0 when clean and 2 when one or more findings are present, so
 this command can gate CI pipelines for build hosts that are supposed to
@@ -166,7 +166,7 @@ func serverPosture(ctx context.Context, store postureStore) []host.Finding {
 		return postureUnavailable("read osv policy: " + err.Error())
 	}
 	return []host.Finding{
-		policyCoverage(rules, ages),
+		policyCoverage(rules, ages, osvs),
 		policyIgnored(ages, osvs),
 		policyEcosystem(ages, osvs),
 	}
@@ -210,22 +210,28 @@ func enforcing(rows []gateRow, covered []string) []gateRow {
 // policyCoverage is the zero-policy install: a caching proxy with an audit
 // trail. Every upstream fetch is admitted, and nothing in the request path
 // would have refused the compromised release the audit trail then records.
-func policyCoverage(rules []audit.PolicyInfo, ages []audit.AgePolicy) host.Finding {
+// It reads every gate admit.checkVersions runs, age and OSV both: an install
+// carrying one of them refuses fetches, so reporting it as wide open is a
+// false statement the operator can disprove from their own logs.
+func policyCoverage(rules []audit.PolicyInfo, ages []audit.AgePolicy, osvs []audit.OSVPolicy) host.Finding {
 	f := host.Finding{Check: "policy-coverage", Status: host.StatusOK}
-	gated := enforcing(ageRows(ages), policy.AgeEcosystems())
-	if len(rules) > 0 || len(gated) > 0 {
-		f.Detail = fmt.Sprintf("%d allow-list rule(s), %d ecosystem(s) with a publish-age gate", len(rules), len(gated))
+	aged := enforcing(ageRows(ages), policy.AgeEcosystems())
+	scanned := enforcing(osvRows(osvs), policy.OSVEcosystems())
+	gates := slices.Concat(aged, scanned)
+	if len(rules) > 0 || len(gates) > 0 {
+		f.Detail = fmt.Sprintf("%d allow-list rule(s), %d ecosystem(s) with a publish-age gate, %d with an OSV gate",
+			len(rules), len(aged), len(scanned))
 		// This check asks whether anybody ever configured a policy; whether it
 		// runs is policy-ignored's question. Counting a silenced row as a gate
 		// is the right answer to the first question and a false statement on
 		// its own, so the count that matters at 03:00 goes on the same line.
-		if inForce := len(gated) - ignoredCount(gated); inForce < len(gated) {
+		if inForce := len(gates) - ignoredCount(gates); inForce < len(gates) {
 			f.Detail += fmt.Sprintf(" (%d in force; see policy-ignored)", inForce)
 		}
 		return f
 	}
 	f.Status = host.StatusWarn
-	f.Detail = "no allow-list rule and no publish-age gate: every upstream fetch is admitted"
+	f.Detail = "no allow-list rule and no publish-age or OSV gate: every upstream fetch is admitted"
 	f.Remediation = "bodega policy add npm <package> to constrain what may be fetched; " +
 		"bodega policy age set npm 7d warn for a publish-age cooldown"
 	return f
