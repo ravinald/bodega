@@ -254,14 +254,19 @@ func (a *DB) DisplayLocation() *time.Location {
 // queue behind every write. Waiting for the lock keeps both.
 const busyTimeout = 5 * time.Second
 
-// dsn attaches the busy_timeout pragma to a database path. An empty path is
-// left alone: the driver only strips a query string when it appears at index
-// 1 or later, so "?..." on its own would be taken as a filename.
-func dsn(path string) string {
+// dsn attaches the busy_timeout pragma to a database path, and query_only
+// alongside it for a handle that must not write. An empty path is left alone:
+// the driver only strips a query string when it appears at index 1 or later,
+// so "?..." on its own would be taken as a filename.
+func dsn(path string, queryOnly bool) string {
 	if path == "" {
 		return path
 	}
-	return fmt.Sprintf("%s?_pragma=busy_timeout(%d)", path, busyTimeout.Milliseconds())
+	out := fmt.Sprintf("%s?_pragma=busy_timeout(%d)", path, busyTimeout.Milliseconds())
+	if queryOnly {
+		out += "&_pragma=query_only(true)"
+	}
+	return out
 }
 
 // Open opens (or creates) the audit database at path and runs migrations.
@@ -282,8 +287,38 @@ func Open(path string) (*DB, error) {
 // replaces. A sink that cannot be reached is an error here rather than a
 // warning, so `bodega serve` can refuse to start on it.
 func OpenWithSink(path string, sc SinkConfig) (*DB, error) {
-	readOnly := false
-	if path != "" {
+	return openStore(path, sc, false)
+}
+
+// OpenReadOnly opens an existing store for reading and nothing else: no
+// directory creation, no migration, no backfill, no default posture.
+//
+// A command that reports on an install must not change the install to produce
+// the report. Opening read-write runs whatever migrations are pending, and on
+// a database that predates migration 012 that decides the default posture on
+// the operator's behalf, from a process the operator ran to be told what the
+// posture already was. query_only makes that a database error rather than a
+// convention, so a write added later to a read path fails loudly here.
+//
+// Queries against a store older than this binary's schema return "no such
+// table" rather than being migrated into range. That is the honest answer:
+// the caller reports it and the operator upgrades when they mean to.
+func OpenReadOnly(path string) (*DB, error) {
+	// query_only stops writes through the handle; it does not stop the driver
+	// creating an empty file for a path that is not there. Refusing here is
+	// what keeps a report on a host with no install from leaving one behind.
+	if path == "" {
+		return nil, fmt.Errorf("no audit db path")
+	}
+	if _, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("audit db %s: %w", path, err)
+	}
+	return openStore(path, SinkConfig{}, true)
+}
+
+func openStore(path string, sc SinkConfig, forceReadOnly bool) (*DB, error) {
+	readOnly := forceReadOnly
+	if path != "" && !forceReadOnly {
 		// A first run has log_dir but not the directory under it. That is a
 		// fixable condition, not a missing store, and since `bodega serve`
 		// now refuses to start without the audit store, leaving it unfixed
@@ -303,7 +338,7 @@ func OpenWithSink(path string, sc SinkConfig) (*DB, error) {
 		}
 	}
 
-	db, err := sql.Open("sqlite", dsn(path))
+	db, err := sql.Open("sqlite", dsn(path, forceReadOnly))
 	if err != nil {
 		return nil, fmt.Errorf("open audit db %s: %w", path, err)
 	}
@@ -321,6 +356,25 @@ func OpenWithSink(path string, sc SinkConfig) (*DB, error) {
 			_ = db.Close()
 			return nil, fmt.Errorf("migrate audit db: %w", err)
 		}
+		// Default posture. policy_seeds decides, not the emptiness of
+		// age_policy: an operator who removed every row chose no gate, and a
+		// re-seed would overrule them on the next restart. An install crossing
+		// migration 012 claims the marker with nothing behind it, so an
+		// upgrade never changes what a running fleet enforces.
+		//
+		// `from` is the only evidence that this open is the upgrade, and it
+		// lives in a local variable. Anything fallible between the migration
+		// and the claim is a path where Open aborts, the retry reads 12, and
+		// the marker gets written by nobody. The backfill below is such a
+		// path without needing a crash: it rewrites every mis-identified
+		// checksum row, and a store that refuses that write fails the open
+		// after 012 has already committed.
+		if from < policySeedVersion {
+			if err := claimPolicySeed(context.Background(), db, PolicySeedAge); err != nil {
+				_ = db.Close()
+				return nil, fmt.Errorf("claim age policy default: %w", err)
+			}
+		}
 		// Migration 011 corrects identity the request-path parser got wrong on
 		// every cached artifact of seven of the eight ecosystems. It reads only
 		// s3_key, so it runs here on the upgrade that crosses it rather than
@@ -333,17 +387,6 @@ func OpenWithSink(path string, sc SinkConfig) (*DB, error) {
 			}
 			if n > 0 {
 				slog.Info("checksum rows re-derived from their object key", "rows", n, "migration", checksumIdentityVersion)
-			}
-		}
-		// Default posture. policy_seeds decides, not the emptiness of
-		// age_policy: an operator who removed every row chose no gate, and a
-		// re-seed would overrule them on the next restart. An install crossing
-		// migration 012 claims the marker with nothing behind it, so an
-		// upgrade never changes what a running fleet enforces.
-		if from < policySeedVersion {
-			if err := claimPolicySeed(context.Background(), db, PolicySeedAge); err != nil {
-				_ = db.Close()
-				return nil, fmt.Errorf("claim age policy default: %w", err)
 			}
 		}
 		seeded, err := seedDefaultAgePolicy(context.Background(), db)

@@ -167,3 +167,92 @@ func TestEmptyPolicySetSurvivesRestart(t *testing.T) {
 		t.Fatalf("restart re-seeded %v over an operator who cleared the table", got)
 	}
 }
+
+// TestAbortedUpgradeDoesNotSeedOnRetry is the ordering the claim depends on.
+// `from` is the only evidence that an open is the upgrade across migration
+// 012, and it lives in a local variable: anything fallible between the
+// migration committing and the marker being written is an open that aborts,
+// a retry that reads 12, and a marker nobody ever wrote. The next open then
+// seeds a fleet that chose nothing.
+//
+// The abort here is the checksum backfill, which is reachable without a crash:
+// it rewrites every row whose identity the old parser got wrong, and a store
+// that refuses the write fails the open after 012 has committed.
+func TestAbortedUpgradeDoesNotSeedOnRetry(t *testing.T) {
+	path := migrateTo(t, checksumIdentityVersion-1)
+
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("reopen raw: %v", err)
+	}
+	seedPreIdentityChecksums(t, raw)
+	if _, err := raw.Exec(
+		`CREATE TRIGGER refuse_checksum_update BEFORE UPDATE ON checksums
+		 BEGIN SELECT RAISE(ABORT, 'checksums is not writable'); END`,
+	); err != nil {
+		t.Fatalf("install refusing trigger: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	if db, err := Open(path); err == nil {
+		_ = db.Close()
+		t.Fatal("the backfill was expected to fail the first open; the test proves nothing if it succeeded")
+	}
+
+	// The retry: migrations are already at 12, so the backfill is skipped and
+	// the open succeeds. What it must not do is treat this install as fresh.
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen after the aborted upgrade: %v", err)
+	}
+	defer db.Close()
+
+	if got := agePolicyMap(t, db); len(got) != 0 {
+		t.Fatalf("an upgrade that aborted mid-open came back seeded with %v", got)
+	}
+	seeded, err := db.PolicySeeded(context.Background(), PolicySeedAge)
+	if err != nil {
+		t.Fatalf("policy seeded: %v", err)
+	}
+	if !seeded {
+		t.Error("the aborted upgrade left the marker unclaimed; a later open would still seed")
+	}
+}
+
+// TestOpenReadOnlyLeavesTheStoreAlone is what a reporting command needs from
+// the store: no migration, no seed, no file where there was none. Opening
+// read-write to answer "what does this install enforce" would answer it by
+// changing it.
+func TestOpenReadOnlyLeavesTheStoreAlone(t *testing.T) {
+	path := migrateTo(t, policySeedVersion-1)
+
+	db, err := OpenReadOnly(path)
+	if err != nil {
+		t.Fatalf("open read-only: %v", err)
+	}
+	if !db.ReadOnly() {
+		t.Error("OpenReadOnly returned a writable handle")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("reopen raw: %v", err)
+	}
+	defer func() { _ = raw.Close() }()
+	var version int
+	if err := raw.QueryRow("SELECT version FROM schema_migrations").Scan(&version); err != nil {
+		t.Fatalf("read schema version: %v", err)
+	}
+	if want := int(policySeedVersion) - 1; version != want {
+		t.Errorf("read-only open migrated the store from %d to %d", want, version)
+	}
+
+	if _, err := OpenReadOnly(filepath.Join(t.TempDir(), "absent.db")); err == nil {
+		t.Error("OpenReadOnly created the database it was asked to read")
+	}
+}

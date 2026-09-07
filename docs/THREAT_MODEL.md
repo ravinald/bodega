@@ -163,9 +163,11 @@ instance, the recommended posture is:
   bootstraps a config file on first run, so a runner holding neither
   `/etc/bodega/config.json` nor `~/.config/bodega/config.json` gains the
   second one (the first, as root) before the first check executes. That is
-  the only file a doctor run creates: it never brings an audit database into
-  existence to report on, which is why the posture checks below read `N/A`
-  rather than inventing an install.
+  the only file a doctor run creates. The posture checks open the audit
+  database read-only, so a run against an install one release behind neither
+  brings a database into existence nor migrates the one it finds: an upgrade
+  is something you schedule, not something a report does to you. A host with
+  no install reads `N/A` rather than gaining one.
 - **Harden the seeded cooldown and add an allow-list.** `bodega policy age
   set npm 7d block` turns the shipped `warn` into a refusal once you have
   watched it for a release cycle; `bodega policy add <type> <pattern>`

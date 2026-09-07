@@ -46,8 +46,9 @@ admits every upstream fetch, and one whose gates are all set to ignore is
 configured but enforcing nothing. Those checks read the audit database and
 report N/A on a client host that has none.
 
-Reports only: doctor changes nothing it inspects, and never creates the
-audit database it reports on. One caveat for a CI runner. Every bodega
+Reports only: the posture checks open the audit database read-only, so a
+doctor run neither creates one nor migrates the one it finds. One caveat
+for a CI runner. Every bodega
 command bootstraps a config file on first run, doctor included, so a host
 with neither /etc/bodega/config.json nor ~/.config/bodega/config.json gains
 the second one (the first, as root) before the checks execute.
@@ -127,12 +128,13 @@ func serverPostureFindings(ctx context.Context, gf *globalFlags) []host.Finding 
 	if _, err := os.Stat(path); err != nil {
 		return postureUnavailable("no bodega install on this host (" + path + " does not exist)")
 	}
-	db, err := openAuditDBErr(gf)
+	// Read-only for the same reason. The read-write opener migrates whatever
+	// it finds, so a doctor run against an install that predates migration 012
+	// would claim the seed marker on an operator who only asked what their
+	// posture was.
+	db, err := audit.OpenReadOnly(path)
 	if err != nil {
-		return postureUnavailable(err.Error())
-	}
-	if db == nil {
-		return postureUnavailable("no audit store configured")
+		return postureUnavailable("could not read audit store at " + path + ": " + err.Error())
 	}
 	defer db.Close()
 	return serverPosture(ctx, db)
@@ -213,6 +215,13 @@ func policyCoverage(rules []audit.PolicyInfo, ages []audit.AgePolicy) host.Findi
 	gated := enforcing(ageRows(ages), policy.AgeEcosystems())
 	if len(rules) > 0 || len(gated) > 0 {
 		f.Detail = fmt.Sprintf("%d allow-list rule(s), %d ecosystem(s) with a publish-age gate", len(rules), len(gated))
+		// This check asks whether anybody ever configured a policy; whether it
+		// runs is policy-ignored's question. Counting a silenced row as a gate
+		// is the right answer to the first question and a false statement on
+		// its own, so the count that matters at 03:00 goes on the same line.
+		if inForce := len(gated) - ignoredCount(gated); inForce < len(gated) {
+			f.Detail += fmt.Sprintf(" (%d in force; see policy-ignored)", inForce)
+		}
 		return f
 	}
 	f.Status = host.StatusWarn
@@ -220,6 +229,16 @@ func policyCoverage(rules []audit.PolicyInfo, ages []audit.AgePolicy) host.Findi
 	f.Remediation = "bodega policy add npm <package> to constrain what may be fetched; " +
 		"bodega policy age set npm 7d warn for a publish-age cooldown"
 	return f
+}
+
+func ignoredCount(rows []gateRow) int {
+	n := 0
+	for _, r := range rows {
+		if r.action == policy.ActionIgnore {
+			n++
+		}
+	}
+	return n
 }
 
 // policyIgnored is the install that had a gate and lost it. Silencing one

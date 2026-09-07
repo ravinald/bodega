@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/host"
+
+	_ "modernc.org/sqlite" // the audit store's driver, for the raw handles below
 )
 
 // fakePosture is the audit read surface with nothing behind it, so a posture
@@ -180,4 +183,120 @@ func TestDoctorIgnoredIsNotMaskedByADeadRow(t *testing.T) {
 	if c := findingFor(t, findings, "policy-coverage"); strings.Contains(c.Detail, "2 ecosystem") {
 		t.Errorf("coverage counted the dead helm row as a gate: %s", c.Detail)
 	}
+}
+
+// Coverage asks whether a policy exists, so an all-ignore install keeps its
+// OK; that is policy-ignored's finding to report and it does. What the line
+// cannot do is claim two working gates on an install that refuses nothing.
+func TestDoctorCoverageSaysHowManyGatesAreInForce(t *testing.T) {
+	store := fakePosture{ages: []audit.AgePolicy{
+		{Ecosystem: "npm", MinAgeSeconds: 604800, Action: "ignore"},
+		{Ecosystem: "pypi", MinAgeSeconds: 604800, Action: "ignore"},
+	}}
+	f := findingFor(t, serverPosture(context.Background(), store), "policy-coverage")
+	if !strings.Contains(f.Detail, "0 in force") {
+		t.Errorf("coverage reported %q on an install whose every gate is ignored", f.Detail)
+	}
+}
+
+// A fresh install enforces everything it configured, so the line stays as
+// short as it was before the silenced case needed spelling out.
+func TestDoctorCoverageStaysQuietWhenEveryGateRuns(t *testing.T) {
+	store := fakePosture{ages: []audit.AgePolicy{
+		{Ecosystem: "npm", MinAgeSeconds: 604800, Action: "warn"},
+		{Ecosystem: "pypi", MinAgeSeconds: 604800, Action: "warn"},
+	}}
+	f := findingFor(t, serverPosture(context.Background(), store), "policy-coverage")
+	if strings.Contains(f.Detail, "in force") {
+		t.Errorf("coverage qualified a fully enforcing install: %q", f.Detail)
+	}
+}
+
+// doctor reports on the install; it does not upgrade it. Opening the store
+// read-write runs pending migrations, so a doctor run against an install that
+// predates migration 012 would claim the seed marker and decide the default
+// posture for an operator who only asked what theirs was.
+func TestDoctorDoesNotMigrateAnAuditDatabase(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "audit.db")
+	db, err := audit.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open audit db: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close audit db: %v", err)
+	}
+	// Wind the store back to an install that predates the seed. Faster than
+	// rebuilding it from the embedded migrations, which package main cannot
+	// reach, and it reproduces what the read-write opener would act on: a
+	// recorded version below 012 with no policy_seeds table behind it.
+	rewindPastPolicySeed(t, dbPath)
+
+	cfgPath := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"audit_db":`+strconv.Quote(dbPath)+`}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("BODEGA_CONFIG_FILE", cfgPath)
+
+	serverPostureFindings(context.Background(), &globalFlags{})
+
+	if v := schemaVersion(t, dbPath); v != policySeedSchema-1 {
+		t.Fatalf("doctor migrated the install from schema %d to %d", policySeedSchema-1, v)
+	}
+	if tableExists(t, dbPath, "policy_seeds") {
+		t.Fatal("doctor recreated policy_seeds, deciding the default posture for the operator")
+	}
+}
+
+// policySeedSchema is migration 012, where the seed marker arrived. Spelled
+// here rather than imported: internal/audit keeps its own copy unexported, and
+// a test that reads the constant it is checking cannot catch it moving.
+const policySeedSchema = 12
+
+func rewindPastPolicySeed(t *testing.T, path string) {
+	t.Helper()
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer raw.Close()
+	for _, stmt := range []string{
+		"DROP TABLE policy_seeds",
+		"DELETE FROM age_policy",
+		"UPDATE schema_migrations SET version = " + strconv.Itoa(policySeedSchema-1),
+	} {
+		if _, err := raw.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+}
+
+func schemaVersion(t *testing.T, path string) int {
+	t.Helper()
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer raw.Close()
+	var v int
+	if err := raw.QueryRow("SELECT version FROM schema_migrations").Scan(&v); err != nil {
+		t.Fatalf("read schema version: %v", err)
+	}
+	return v
+}
+
+func tableExists(t *testing.T, path, name string) bool {
+	t.Helper()
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer raw.Close()
+	var n int
+	if err := raw.QueryRow(
+		"SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?", name,
+	).Scan(&n); err != nil {
+		t.Fatalf("read sqlite_master: %v", err)
+	}
+	return n > 0
 }
