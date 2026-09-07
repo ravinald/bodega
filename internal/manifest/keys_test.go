@@ -65,8 +65,10 @@ var keyRoundTrips = map[string][]roundTrip{
 			version: "4.11.2",
 		},
 		// A chart name cannot hold a slash, so "--" in one is literal.
-		// Decoding it turned a proxy-mode request for foo--bar into a
-		// manifest lookup for foo/bar, which matched nothing.
+		// Decoding it named the chart foo/bar in the discovery row and the
+		// serve_fetch event. The lookup itself survived, SafeName being
+		// applied again on the way to the manifest, so the damage was
+		// confined to what an operator reads back.
 		{
 			key:     HelmChartKey("foo--bar", "1.2.3"),
 			name:    "foo--bar",

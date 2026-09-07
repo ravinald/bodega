@@ -440,8 +440,13 @@ func opensVersion(s string) bool {
 // Only npm, git and binary reach it, because only their names carry a slash.
 // A helm chart name and a cargo crate name cannot, so SafeName is a no-op on
 // the way in and this would be lossy on the way out: the chart "foo--bar"
-// would come back as "foo/bar", which matches no manifest entry and so is
-// never fetched from upstream.
+// would come back as "foo/bar".
+//
+// The cost of that is the recorded identity, not the fetch. Every read path
+// runs the name back through SafeName — manifestPath resolves "foo/bar" to
+// helm/foo--bar/manifest.json — so the chart was still found and still served.
+// What an operator read in `discover list` and promoted from was a chart name
+// no repository serves.
 func unsafeName(segment string) string {
 	return strings.ReplaceAll(segment, "--", "/")
 }
