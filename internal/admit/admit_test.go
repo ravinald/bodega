@@ -1,11 +1,19 @@
 package admit
 
 import (
+	"archive/zip"
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 )
 
 func aptPkg(name, version string) *manifest.PackageManifest {
@@ -158,5 +166,164 @@ func TestAdmitRefusesAnUnservableSuite(t *testing.T) {
 	pm.Versions[0].Suites = []string{"jammy"}
 	if res := Admit(t.Context(), nil, nil, &config.Config{}, pm, ""); !res.OK() {
 		t.Errorf("refused a legal suite this server does not serve yet: %s", res.Reason)
+	}
+}
+
+// TestAdmitReportsADegradedOSVGate is the reason the version checks report on
+// Result rather than only into the audit table. With no synced OSV database
+// the gate answers "I could not tell", and an operator importing a package
+// has to read that at the moment of the import: a clean line and a row filed
+// under policy_warn is how a dark gate stays dark.
+func TestAdmitReportsADegradedOSVGate(t *testing.T) {
+	adb, err := audit.Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatalf("open audit db: %v", err)
+	}
+	defer adb.Close()
+	if err := adb.SetOSVPolicy(t.Context(), audit.OSVPolicy{
+		Ecosystem: manifest.TypeNpm, Action: policy.ActionBlock,
+	}); err != nil {
+		t.Fatalf("set osv policy: %v", err)
+	}
+
+	// An empty directory: osv_db_dir is configured and `policy osv sync` has
+	// never run, which is the state a fresh air-gapped install is in.
+	cfg := &config.Config{StoragePath: t.TempDir(), OSVDBDir: t.TempDir()}
+	pm := &manifest.PackageManifest{
+		Name: "minimist", Type: manifest.TypeNpm,
+		Versions: []manifest.VersionEntry{{Version: "1.2.0"}, {Version: "1.2.1"}},
+	}
+
+	res := Admit(t.Context(), nil, adb, cfg, pm, "")
+	if !res.OK() {
+		t.Fatalf("a degraded gate warns, it does not refuse: %s", res.Reason)
+	}
+	line := ""
+	for _, w := range res.Warnings {
+		if strings.Contains(w, "osv:") {
+			line = w
+		}
+	}
+	if line == "" {
+		t.Fatalf("an unsynced OSV gate admitted with nothing said: %v", res.Warnings)
+	}
+	if !strings.Contains(line, "policy osv sync") {
+		t.Errorf("the warning does not name the next step: %q", line)
+	}
+	if !strings.Contains(line, "osv_api_fallback") {
+		t.Errorf("the warning does not say nothing was queried: %q", line)
+	}
+	// Both versions share one reason, so it is stated once and names them.
+	if !strings.Contains(line, "2 versions") || !strings.Contains(line, "1.2.0") {
+		t.Errorf("repeated reasons should collapse onto the versions they cover: %q", line)
+	}
+	if got := strings.Count(strings.Join(res.Warnings, "\n"), "policy osv sync"); got != 1 {
+		t.Errorf("the same finding was reported %d times", got)
+	}
+}
+
+// osvExport serves one ecosystem's records in the shape OSV publishes them,
+// so a test can sync a real database without reaching the network.
+func osvExport(t *testing.T, records ...map[string]any) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+		for _, rec := range records {
+			f, err := zw.Create(rec["id"].(string) + ".json")
+			if err != nil {
+				t.Errorf("zip create: %v", err)
+				return
+			}
+			if err := json.NewEncoder(f).Encode(rec); err != nil {
+				t.Errorf("zip write: %v", err)
+				return
+			}
+		}
+		if err := zw.Close(); err != nil {
+			t.Errorf("zip close: %v", err)
+			return
+		}
+		_, _ = w.Write(buf.Bytes())
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestAdmitKeepsWarningsBehindABlock covers the ordering the flush is deferred
+// for. A block returns from the version loop early, and the warning that
+// explains why the gate was degraded was collected before it: reporting only
+// the block would tell the operator the import failed and not that the gate
+// answering it was stale.
+func TestAdmitKeepsWarningsBehindABlock(t *testing.T) {
+	adb, err := audit.Open(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatalf("open audit db: %v", err)
+	}
+	defer adb.Close()
+	if err := adb.SetOSVPolicy(t.Context(), audit.OSVPolicy{
+		Ecosystem: manifest.TypeNpm, Action: policy.ActionBlock,
+	}); err != nil {
+		t.Fatalf("set osv policy: %v", err)
+	}
+
+	dir := t.TempDir()
+	db := policy.NewOSVDatabase(dir)
+	db.ExportBase = osvExport(t, map[string]any{
+		"id": "GHSA-test-0001",
+		"affected": []map[string]any{{
+			"package":  map[string]string{"name": "minimist", "ecosystem": "npm"},
+			"versions": []string{"1.2.0"},
+		}},
+	}).URL
+	if _, err := db.Sync(t.Context(), "npm"); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	// Stale the instant it is written, so a clean version warns while a
+	// version the archive does name still blocks.
+	cfg := &config.Config{StoragePath: t.TempDir(), OSVDBDir: dir, OSVDBMaxAge: "1ns"}
+	pm := &manifest.PackageManifest{
+		Name: "minimist", Type: manifest.TypeNpm,
+		Versions: []manifest.VersionEntry{{Version: "1.2.8"}, {Version: "1.2.0"}},
+	}
+
+	res := Admit(t.Context(), nil, adb, cfg, pm, "")
+	if res.OK() {
+		t.Fatal("a version the archive names as vulnerable was admitted")
+	}
+	if !strings.Contains(res.Reason, "GHSA-test-0001") {
+		t.Errorf("the block does not name the record: %q", res.Reason)
+	}
+	found := false
+	for _, w := range res.Warnings {
+		if strings.Contains(w, "1.2.8") && strings.Contains(w, "policy osv sync") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the stale-gate warning collected before the block was dropped: %v", res.Warnings)
+	}
+}
+
+// TestOSVCheckerReusesTheDatabase pins the gate to one decompressed index per
+// directory. osvChecker runs once per Admit and Admit runs once per package,
+// so a database built per call throws the index away between packages: the
+// 635-package catalog this gate exists to admit would re-read the whole npm
+// ecosystem 635 times.
+func TestOSVCheckerReusesTheDatabase(t *testing.T) {
+	cfg := &config.Config{OSVDBDir: t.TempDir()}
+
+	first := osvChecker(cfg, nil)
+	if first.LocalDB == nil {
+		t.Fatal("osv_db_dir is set and no local database was wired")
+	}
+	if second := osvChecker(cfg, nil); first.LocalDB != second.LocalDB {
+		t.Error("each admission built its own OSV database; the index cannot survive one package")
+	}
+
+	other := &config.Config{OSVDBDir: t.TempDir()}
+	if osvChecker(other, nil).LocalDB == first.LocalDB {
+		t.Error("two osv_db_dir values shared one database")
 	}
 }

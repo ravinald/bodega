@@ -31,6 +31,13 @@ var osvEcosystemFor = map[string]string{
 	manifest.TypeCargo: "crates.io",
 }
 
+// OSVEcosystemFor returns OSV's identifier for a registry type, or "" when
+// the type has no OSV equivalent. `policy osv sync` needs the mapping to name
+// the export it fetches, and a second copy of the table is how the two drift.
+func OSVEcosystemFor(registryType string) string {
+	return osvEcosystemFor[registryType]
+}
+
 // OSVEcosystems returns the registry types the OSV gate can query, sorted.
 func OSVEcosystems() []string {
 	out := make([]string, 0, len(osvEcosystemFor))
@@ -46,6 +53,23 @@ type OSVChecker struct {
 
 	Endpoint string // defaults to https://api.osv.dev/v1/query
 	HTTP     *http.Client
+
+	// LocalDB is the synced OSV mirror the gate answers from. Nil means no
+	// osv_db_dir is configured, which is not the same as an empty database:
+	// both produce a warn, and neither produces a pass.
+	LocalDB *OSVDatabase
+
+	// AllowAPIFallback authorizes a live query when the local database cannot
+	// answer. Off by default: on a restricted network every version would
+	// otherwise stall for the client timeout against a host that never
+	// answers, and a bulk import pays that per version.
+	AllowAPIFallback bool
+
+	// MaxAge is how old a synced ecosystem may be before a clean answer from
+	// it warns instead of passing. Zero means DefaultOSVMaxAge.
+	MaxAge time.Duration
+
+	Now func() time.Time
 }
 
 func NewOSVChecker(store OSVStore) *OSVChecker {
@@ -53,6 +77,8 @@ func NewOSVChecker(store OSVStore) *OSVChecker {
 		store:    store,
 		Endpoint: "https://api.osv.dev/v1/query",
 		HTTP:     &http.Client{Timeout: 15 * time.Second},
+		MaxAge:   DefaultOSVMaxAge,
+		Now:      time.Now,
 	}
 }
 
@@ -76,12 +102,17 @@ func (c *OSVChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 		return Result{Check: "osv", Action: ActionPass}
 	}
 
-	vulns, err := c.query(ctx, osvEco, pm.Name, ve.Version)
-	if err != nil {
+	ans := c.lookup(ctx, osvEco, pm.Name, ve.Version)
+	if ans.err != nil {
 		return Result{Check: "osv", Action: ActionWarn,
-			Reason: fmt.Sprintf("osv query failed for %s/%s@%s: %v", pm.Type, pm.Name, ve.Version, err)}
+			Reason: fmt.Sprintf("osv lookup failed for %s/%s@%s: %v", pm.Type, pm.Name, ve.Version, ans.err)}
 	}
+	vulns := ans.vulns
 	if len(vulns) == 0 {
+		// A gate that could not answer must not report a clean result.
+		if ans.degraded != "" {
+			return Result{Check: "osv", Action: ActionWarn, Reason: ans.degraded}
+		}
 		return Result{Check: "osv", Action: ActionPass}
 	}
 
@@ -102,13 +133,112 @@ func (c *OSVChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 		details["severity"] = sev
 	}
 
+	reason := fmt.Sprintf("%s@%s has %d OSV record(s): %s",
+		pm.Name, ve.Version, len(vulns), strings.Join(ids, ", "))
+	if ans.degraded != "" {
+		reason += " (" + ans.degraded + ")"
+	}
 	return Result{
-		Check:  "osv",
-		Action: policy.Action,
-		Reason: fmt.Sprintf("%s@%s has %d OSV record(s): %s",
-			pm.Name, ve.Version, len(vulns), strings.Join(ids, ", ")),
+		Check:   "osv",
+		Action:  policy.Action,
+		Reason:  reason,
 		Details: details,
 	}
+}
+
+// osvAnswer is one lookup's evidence. degraded names why the answer cannot be
+// trusted to be complete — no local database, or one too old to have seen a
+// recent advisory — and turns an empty vuln list into a warn instead of a
+// pass. err means nothing answered at all.
+type osvAnswer struct {
+	vulns    []osvVuln
+	degraded string
+	err      error
+}
+
+// lookup answers from the local database, and reaches api.osv.dev only when
+// the local copy cannot answer and osv_api_fallback authorizes it.
+func (c *OSVChecker) lookup(ctx context.Context, osvEco, name, version string) osvAnswer {
+	unusable := ""
+	switch meta, err := c.LocalDB.Meta(osvEco); {
+	case err == nil:
+		vulns, skipped, matchErr := c.LocalDB.Match(osvEco, name, version)
+		if matchErr != nil {
+			unusable = fmt.Sprintf("local OSV database for %s is unreadable (%v); run `bodega policy osv sync`", osvEco, matchErr)
+			break
+		}
+		degraded := unevaluatedReason(name, version, skipped)
+		age := meta.Age(c.now())
+		if age <= c.maxAge() {
+			return osvAnswer{vulns: vulns, degraded: degraded}
+		}
+		stale := fmt.Sprintf("local OSV database for %s is %s old (synced %s); run `bodega policy osv sync`",
+			osvEco, ShortDuration(age), meta.FetchedAt.UTC().Format(time.RFC3339))
+		if c.AllowAPIFallback {
+			if fresh, apiErr := c.query(ctx, osvEco, name, version); apiErr == nil {
+				return osvAnswer{vulns: fresh}
+			}
+		}
+		if degraded != "" {
+			stale += "; " + degraded
+		}
+		return osvAnswer{vulns: vulns, degraded: stale}
+	case errors.Is(err, ErrOSVDBMissing):
+		if c.LocalDB == nil {
+			unusable = "no local OSV database configured (set osv_db_dir); run `bodega policy osv sync`"
+		} else {
+			unusable = fmt.Sprintf("no local OSV database for %s in %s; run `bodega policy osv sync`", osvEco, c.LocalDB.Dir())
+		}
+	default:
+		unusable = fmt.Sprintf("local OSV database for %s is unreadable (%v); run `bodega policy osv sync`", osvEco, err)
+	}
+
+	if !c.AllowAPIFallback {
+		return osvAnswer{degraded: unusable + "; osv_api_fallback is off, so nothing was queried"}
+	}
+	vulns, err := c.query(ctx, osvEco, name, version)
+	if err != nil {
+		return osvAnswer{err: fmt.Errorf("%s; api fallback failed: %w", unusable, err)}
+	}
+	return osvAnswer{vulns: vulns}
+}
+
+// unevaluatedReason names the records that mention the package but carry a
+// version bound no ordering can place, so a version they might cover never
+// reports clean without the operator being told which records nobody read.
+// api.osv.dev drops the same ranges and says nothing, which is why the reason
+// carries the bound: it is upstream data, not a local misconfiguration, and
+// the only way to settle it is to read the record.
+func unevaluatedReason(name, version string, skipped []string) string {
+	if len(skipped) == 0 {
+		return ""
+	}
+	shown, extra := skipped, ""
+	if len(shown) > osvSkipListLimit {
+		extra = fmt.Sprintf(" and %d more", len(shown)-osvSkipListLimit)
+		shown = shown[:osvSkipListLimit]
+	}
+	return fmt.Sprintf("%d OSV record(s) for %s were not evaluated against %s: %s%s",
+		len(skipped), name, version, strings.Join(shown, ", "), extra)
+}
+
+// osvSkipListLimit caps the ids one reason carries. A package whose own
+// version string cannot be ordered skips every record naming it, and torch
+// alone carries 30-odd.
+const osvSkipListLimit = 5
+
+func (c *OSVChecker) now() time.Time {
+	if c.Now != nil {
+		return c.Now()
+	}
+	return time.Now()
+}
+
+func (c *OSVChecker) maxAge() time.Duration {
+	if c.MaxAge <= 0 {
+		return DefaultOSVMaxAge
+	}
+	return c.MaxAge
 }
 
 type osvSeverity struct {

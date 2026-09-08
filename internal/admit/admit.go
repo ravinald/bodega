@@ -86,7 +86,7 @@ func Admit(
 	if err := checkAllowList(ctx, checker, adb, pm, actor); err != nil {
 		return Result{Decision: PolicyBlocked, Reason: err.Error(), Warnings: res.Warnings}
 	}
-	if err := checkVersions(ctx, adb, pm, actor); err != nil {
+	if err := checkVersions(ctx, adb, cfg, pm, actor, &res); err != nil {
 		return Result{Decision: PolicyBlocked, Reason: err.Error(), Warnings: res.Warnings}
 	}
 	return res
@@ -187,18 +187,25 @@ func checkAllowList(ctx context.Context, checker *policy.Checker, adb *audit.DB,
 
 // checkVersions runs the per-version checks (age, OSV). They live in the audit
 // database, so with no database there is nothing to check against. Warn-level
-// results are recorded and do not block.
-func checkVersions(ctx context.Context, adb *audit.DB, pm *manifest.PackageManifest, actor string) error {
+// results do not block; they are recorded and reported on res, because a gate
+// that answered "I could not tell" has to say so where the operator is
+// looking. Recording alone leaves an OSV gate with no synced database printing
+// a clean import and filing the warning somewhere nobody reads until after the
+// package is in the store.
+func checkVersions(ctx context.Context, adb *audit.DB, cfg *config.Config, pm *manifest.PackageManifest, actor string, res *Result) error {
 	if adb == nil {
 		return nil
 	}
 	checkers := []policy.VersionChecker{
 		policy.NewAgeChecker(adb),
-		policy.NewOSVChecker(adb),
+		osvChecker(cfg, adb),
 	}
+	warns := &versionWarnings{}
+	defer warns.flush(res)
 	for i := range pm.Versions {
 		ve := &pm.Versions[i]
 		combined := policy.RunChecks(ctx, pm, ve, checkers...)
+		warns.add(ve.Version, combined.Warns)
 		if details := combined.AuditDetails(); details != nil {
 			blob, _ := json.Marshal(details)
 			status := "policy_warn"
@@ -220,6 +227,69 @@ func checkVersions(ctx context.Context, adb *audit.DB, pm *manifest.PackageManif
 		}
 	}
 	return nil
+}
+
+// versionWarnings collects the per-version warns of one manifest into the
+// lines a caller prints. A degraded gate gives every version of a package the
+// same reason, so the versions are gathered under it: a 40-version import
+// states the finding once instead of scrolling it past the operator 40 times.
+type versionWarnings struct {
+	order    []string
+	versions map[string][]string
+}
+
+func (w *versionWarnings) add(version string, warns []policy.Result) {
+	for _, r := range warns {
+		line := r.Check + ": " + r.Reason
+		if w.versions == nil {
+			w.versions = map[string][]string{}
+		}
+		if _, seen := w.versions[line]; !seen {
+			w.order = append(w.order, line)
+		}
+		w.versions[line] = append(w.versions[line], version)
+	}
+}
+
+// flush renders each collected reason onto res. It runs even when a later
+// version blocked, so the warning that explains why the gate was degraded is
+// not lost behind the block that followed it.
+func (w *versionWarnings) flush(res *Result) {
+	if res == nil {
+		return
+	}
+	for _, line := range w.order {
+		res.Warnings = append(res.Warnings, describeVersions(w.versions[line])+": "+line)
+	}
+}
+
+// describeVersions names the versions a warning covers, listing at most three
+// so one line stays one line.
+func describeVersions(versions []string) string {
+	const shown = 3
+	if len(versions) == 1 {
+		return versions[0]
+	}
+	if len(versions) <= shown {
+		return fmt.Sprintf("%d versions (%s)", len(versions), strings.Join(versions, ", "))
+	}
+	return fmt.Sprintf("%d versions (%s, ...)", len(versions), strings.Join(versions[:shown], ", "))
+}
+
+// osvChecker points the OSV gate at the local database `bodega policy osv
+// sync` wrote. The config keys are read here rather than in internal/policy so
+// the gate stays usable from a test or a tool that holds no Config; a nil one
+// leaves the checker with no database and no fallback, which warns rather than
+// passing.
+func osvChecker(cfg *config.Config, adb *audit.DB) *policy.OSVChecker {
+	ck := policy.NewOSVChecker(adb)
+	if cfg == nil {
+		return ck
+	}
+	ck.LocalDB = policy.SharedOSVDatabase(cfg.ResolveOSVDBDir())
+	ck.AllowAPIFallback = cfg.OSVAPIFallback
+	ck.MaxAge = cfg.ResolveOSVDBMaxAge()
+	return ck
 }
 
 // CheckBackendName rejects a name no configured backend answers to. The empty

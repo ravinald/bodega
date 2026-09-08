@@ -185,6 +185,9 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		// by field position would pass or fail on the order of the struct.
 		"spool_max_artifact_bytes": int64(1 << 20),
 		"spool_max_total_bytes":    int64(4 << 20),
+		// Load parses this one, so the string filler's "value-<key>" is
+		// refused before the round trip can measure anything.
+		"osv_db_max_age": "72h",
 	}
 
 	v := reflect.ValueOf(cfg).Elem()
