@@ -780,6 +780,8 @@ Flagged by OSV:
   1.2.0        GHSA-vh95-rmgr-6w4m, GHSA-xvch-5gv4-984h  (checked 2026-09-08)
 ```
 
+The `OSV` cell reads `n/a` on `apt`, `binary`, `git` and `helm`. Those four have no OSV ecosystem identifier, so no rescan can ever answer for them, and `unchecked` would send the operator to a verb that refuses to run on them. On the covered types the cell reads `unchecked`, `clean` or a finding count, and `CHECKED` carries the date of the last conclusive answer.
+
 `GET /api/v1/packages/{type}/{name}/{version}` carries the same three keys on the version's `metadata`.
 
 ### `bodega policy age <set|list|remove>`

@@ -297,8 +297,9 @@ func showVersionList(ctx context.Context, store *manifest.Store, typ, name strin
 				hidden = "yes"
 			}
 			st := policy.OSVStampOf(ve)
+			osvState, osvChecked := osvVersionState(typ, st)
 			fmt.Printf("%-12s %-15s %-6s %-8s %-8s %-10s %-11s %-10s\n",
-				v, platform, "-", frozen, hidden, constraint, st.State(), osvCheckedOn(st))
+				v, platform, "-", frozen, hidden, constraint, osvState, osvChecked)
 			if st.Flagged() {
 				flagged = append(flagged, fmt.Sprintf("  %-12s %s  (checked %s)",
 					v, strings.Join(st.Vulns, ", "), osvCheckedOn(st)))
@@ -311,6 +312,18 @@ func showVersionList(ctx context.Context, store *manifest.Store, typ, name strin
 		fmt.Printf("\nFlagged by OSV:\n%s\n", strings.Join(flagged, "\n"))
 	}
 	return nil
+}
+
+// osvVersionState renders a version's OSV and CHECKED cells. A registry type
+// OSV holds no records for reads "n/a" rather than "unchecked": no command can
+// ever change that cell, and "unchecked" would send the operator to
+// `policy osv rescan`, which refuses to run on an ecosystem the gate does not
+// cover.
+func osvVersionState(registryType string, st policy.OSVStamp) (state, checked string) {
+	if policy.OSVEcosystemFor(registryType) == "" {
+		return "n/a", "-"
+	}
+	return st.State(), osvCheckedOn(st)
 }
 
 // osvCheckedOn renders the date the OSV gate last answered for a version.
