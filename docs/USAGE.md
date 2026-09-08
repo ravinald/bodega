@@ -599,11 +599,11 @@ The fallback is off by default because the deployment this gate exists for canno
 
 ```
 $ bodega policy osv sync
-ECOSYSTEM  OSV        RECORDS  PACKAGES  SIZE     FETCHED
-cargo      crates.io  2701     1610      120.1KB  2026-09-08T01:53:24Z
-gomod      Go         8968     1588      402.9KB  2026-09-08T01:53:25Z
-npm        npm        228106   224290    3.8MB    2026-09-08T01:53:43Z
-pypi       PyPI       24755    13281     1.1MB    2026-09-08T01:53:27Z
+ECOSYSTEM  OSV        RECORDS  PACKAGES  SIZE       FETCHED
+cargo      crates.io  2701     1610      120.1 KiB  2026-09-08T01:53:24Z
+gomod      Go         8968     1588      402.9 KiB  2026-09-08T01:53:25Z
+npm        npm        228106   224290    3.8 MiB    2026-09-08T01:53:43Z
+pypi       PyPI       24755    13281     1.1 MiB    2026-09-08T01:53:27Z
 
 Wrote /var/lib/bodega/osv
 ```
@@ -632,12 +632,18 @@ The directory carries its own fetch timestamps, so a copy that stopped being ref
 
 #### Staleness and the missing database
 
-A gate that cannot answer does not report a clean result. With no local database for an ecosystem, or one older than `osv_db_max_age`, a version with no known records is `warn`, never `pass`, and the reason names the next step:
+A gate that cannot answer does not report a clean result. With no local database for an ecosystem, or one older than `osv_db_max_age`, a version with no known records is `warn`, never `pass`, and the import says so on stderr as it happens:
 
 ```
-no local OSV database for Go in /var/lib/bodega/osv; run `bodega policy osv sync`; osv_api_fallback is off, so nothing was queried
-local OSV database for npm is 30d old (synced 2026-08-09T01:53:43Z); run `bodega policy osv sync`
+$ bodega pkg import lodash.json
+npm/lodash: 4 versions (4.17.4, 4.17.5, 4.17.6, ...): osv: no local OSV database for npm in /var/lib/bodega/osv; run `bodega policy osv sync`; osv_api_fallback is off, so nothing was queried
+Imported npm/lodash (4 version(s))
+
+$ bodega pkg import lodash.json     # database synced in March
+npm/lodash: 4 versions (4.17.4, 4.17.5, 4.17.6, ...): osv: local OSV database for npm is 178d old (synced 2026-03-14T01:53:43Z); run `bodega policy osv sync`
 ```
+
+Every version of a package hits the same degraded gate, so the reason is stated once and names the versions it covered rather than repeating per version. The mutation API returns the same lines in the `warnings` array of each import result, and the audit trail records the version-level detail under `policy_warn` either way.
 
 A stale database still blocks on what it does hold — old data names old vulnerabilities correctly — and the age rides along in the reason. With `osv_api_fallback` on, a stale or missing ecosystem is answered from `api.osv.dev` instead, and only a failed query falls back to the stale copy.
 

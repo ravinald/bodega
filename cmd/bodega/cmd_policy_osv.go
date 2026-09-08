@@ -192,9 +192,6 @@ and point osv_db_dir at the copy.`,
 				ecosystems = args
 			}
 			db := policy.NewOSVDatabase(cfg.ResolveOSVDBDir())
-			if db == nil {
-				return fmt.Errorf("no OSV database directory: set osv_db_dir or storage_path")
-			}
 
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 			fmt.Fprintln(w, "ECOSYSTEM\tOSV\tRECORDS\tPACKAGES\tSIZE\tFETCHED")
@@ -209,7 +206,7 @@ and point osv_db_dir at the copy.`,
 					continue
 				}
 				fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%s\t%s\n", eco, osvEco,
-					meta.Records, meta.Packages, humanBytes(meta.Bytes),
+					meta.Records, meta.Packages, humanSize(meta.Bytes),
 					meta.FetchedAt.Format(time.RFC3339))
 				wrote++
 			}
@@ -247,17 +244,4 @@ func onOff(b bool) string {
 		return "on"
 	}
 	return "off"
-}
-
-func humanBytes(n int64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%dB", n)
-	}
-	div, exp := int64(unit), 0
-	for v := n / unit; v >= unit; v /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f%cB", float64(n)/float64(div), "KMGTPE"[exp])
 }
