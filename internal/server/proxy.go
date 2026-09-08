@@ -548,7 +548,12 @@ func (s *Server) verifyProxyChecksum(ctx context.Context, s3Key, computed string
 		return fmt.Errorf("checksum lookup unavailable: %w", err)
 	}
 
-	if stored == nil {
+	// A row with no value is a digest an operator cleared to escape an upstream
+	// that republished different bytes. The row itself is kept because the apt
+	// index reads it to tell a mirrored .deb from a built one, so "no digest"
+	// arrives as a blank value rather than a missing row and takes the
+	// first-fetch path (#225).
+	if stored == nil || stored.Value == "" {
 		// First fetch — store the computed checksum.
 		pkgType, pkgName, pkgVersion := manifest.ParseKey(s3Key)
 		if err := s.auditDB.StoreChecksum(ctx, s3Key, pkgType, pkgName, pkgVersion, "sha256", computed, "computed"); err != nil {
@@ -577,11 +582,25 @@ func (s *Server) verifyProxyChecksum(ctx context.Context, s3Key, computed string
 				Details:    string(details),
 			})
 		}
-		return fmt.Errorf("sha256 mismatch for %s: stored=%s computed=%s", s3Key, stored.Value[:12]+"...", computed[:12]+"...")
+		return fmt.Errorf("sha256 mismatch for %s: stored=%s computed=%s", s3Key, shortDigest(stored.Value), shortDigest(computed))
 	}
 
 	s.logger.Debug("checksum verified", "key", s3Key)
 	return nil
+}
+
+// shortDigest is the leading hex of a digest, enough to name which two
+// disagreed without printing two 64-character strings.
+//
+// It takes the whole value when it is shorter. A stored value is whatever the
+// table holds, and a panic on the slice would turn the refusal into a dropped
+// connection, which a client reports as a network fault rather than as the
+// checksum gate saying no.
+func shortDigest(v string) string {
+	if len(v) <= 12 {
+		return v
+	}
+	return v[:12] + "..."
 }
 
 // upstreamPolicyVerdict is the allow-list decision for one candidate, with no

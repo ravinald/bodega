@@ -571,11 +571,11 @@ func TestOpenBackfillsChecksumIdentityOnUpgrade(t *testing.T) {
 	}
 
 	// And the point of the whole item: the recovery command now matches.
-	cleared, err := db.ClearChecksumsByPackage(ctx, manifest.TypeApt, "nginx")
+	cleared, matched, err := db.ClearChecksumsByPackage(ctx, manifest.TypeApt, "nginx")
 	if err != nil {
 		t.Fatalf("clear apt/nginx: %v", err)
 	}
-	if cleared != 1 {
-		t.Errorf("cleared = %d, want 1", cleared)
+	if cleared != 1 || matched != 1 {
+		t.Errorf("cleared/matched = %d/%d, want 1/1", cleared, matched)
 	}
 }
