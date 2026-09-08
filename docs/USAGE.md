@@ -681,7 +681,9 @@ Earlier versions wrote that row, printed `Set helm OSV policy: block`, and then 
 
 The local matcher implements OSV's own evaluation: an enumerated `versions` list matches exactly, and a range is walked event by event in version order, under semver for npm, Go and crates.io and PEP 440 for PyPI. Measured against `api.osv.dev` over 395 sampled `(package, version)` pairs across the four ecosystems, it agrees on 392.
 
-An ecosystem is decompressed on the first version checked against it and held for the life of the process, so a bulk import pays one decompression rather than one round trip per version. What it holds, measured on the 2026-09 exports: npm 85 MB, PyPI 47 MB, gomod 6 MB, cargo 1.5 MB. An ecosystem with no policy row is never loaded.
+An ecosystem is decompressed on the first version checked against it and held until `sync` replaces the archive, so a bulk import pays one decompression rather than one round trip per version. What it holds, measured on the 2026-09 exports: npm 85 MB, PyPI 47 MB, gomod 6 MB, cargo 1.5 MB. An ecosystem with no policy row is never loaded.
+
+A running server picks up a sync without a restart: it checks the archive it loaded from on each match and reloads when the file changes. `sync` is a separate process from the server enforcing the gate, so without that check the server would report the fresh fetch time under `bodega policy osv list` while still matching against the copy it loaded before the sync.
 
 The three disagreements are one deliberate divergence: **withdrawn advisories are dropped at sync**, and the API still returns some of them (PYSEC-2024-115, retracted in July 2026, comes back on a `langchain-community` query while other withdrawn records do not). A retracted advisory blocking an import is a false positive the operator has no way to clear.
 

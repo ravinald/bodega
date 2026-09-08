@@ -85,7 +85,21 @@ type OSVDatabase struct {
 	HTTP       *http.Client
 
 	mu     sync.Mutex
-	loaded map[string]*osvIndex
+	loaded map[string]cachedIndex
+}
+
+// cachedIndex is a decompressed ecosystem plus the identity of the archive it
+// was read from. `policy osv sync` is its own process, so a server that
+// trusted its first load would answer from the copy it held while Meta read
+// the newer fetch time off disk: a gate reporting current and matching stale.
+type cachedIndex struct {
+	idx  *osvIndex
+	size int64
+	mod  time.Time
+}
+
+func (c cachedIndex) current(st os.FileInfo) bool {
+	return c.size == st.Size() && c.mod.Equal(st.ModTime())
 }
 
 // NewOSVDatabase returns a database rooted at dir. A nil return means the
@@ -100,7 +114,7 @@ func NewOSVDatabase(dir string) *OSVDatabase {
 		// Generous next to the 15s admission timeout: this is one operator
 		// command pulling a few hundred megabytes, not a per-version query.
 		HTTP:   &http.Client{Timeout: 10 * time.Minute},
-		loaded: map[string]*osvIndex{},
+		loaded: map[string]cachedIndex{},
 	}
 }
 
@@ -218,9 +232,6 @@ func (d *OSVDatabase) index(ecosystem string) (*osvIndex, error) {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if idx, ok := d.loaded[ecosystem]; ok {
-		return idx, nil
-	}
 	f, err := os.Open(d.indexPath(ecosystem))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, ErrOSVDBMissing
@@ -229,6 +240,16 @@ func (d *OSVDatabase) index(ecosystem string) (*osvIndex, error) {
 		return nil, err
 	}
 	defer f.Close()
+	// Stat the open handle rather than the path: Sync replaces the archive by
+	// rename, so this describes the bytes about to be read and cannot record a
+	// fingerprint for content that was swapped out mid-load.
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if c, ok := d.loaded[ecosystem]; ok && c.current(st) {
+		return c.idx, nil
+	}
 	zr, err := gzip.NewReader(f)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", d.indexPath(ecosystem), err)
@@ -239,9 +260,9 @@ func (d *OSVDatabase) index(ecosystem string) (*osvIndex, error) {
 		return nil, fmt.Errorf("parse %s: %w", d.indexPath(ecosystem), err)
 	}
 	if d.loaded == nil {
-		d.loaded = map[string]*osvIndex{}
+		d.loaded = map[string]cachedIndex{}
 	}
-	d.loaded[ecosystem] = &idx
+	d.loaded[ecosystem] = cachedIndex{idx: &idx, size: st.Size(), mod: st.ModTime()}
 	return &idx, nil
 }
 

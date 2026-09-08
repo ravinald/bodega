@@ -370,3 +370,87 @@ func TestOSVPackageKey(t *testing.T) {
 		}
 	}
 }
+
+// recordServer serves an arbitrary record set as an ecosystem export, so a
+// test can stand in for a second sync that found something new.
+func recordServer(t *testing.T, records []map[string]any) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+		for _, rec := range records {
+			f, err := zw.Create(rec["id"].(string) + ".json")
+			if err != nil {
+				t.Errorf("zip create: %v", err)
+				return
+			}
+			if err := json.NewEncoder(f).Encode(rec); err != nil {
+				t.Errorf("zip write: %v", err)
+				return
+			}
+		}
+		if err := zw.Close(); err != nil {
+			t.Errorf("zip close: %v", err)
+			return
+		}
+		_, _ = w.Write(buf.Bytes())
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestOSVDatabase_ReloadsAfterOutOfProcessSync pins the case the cache gets
+// wrong on its own: `policy osv sync` is a separate process from the server
+// enforcing the gate, so a database that trusted its first load would report
+// the fresh fetch time Meta reads off disk while matching against the copy it
+// held before the sync. A gate that answers from data it has already been told
+// is superseded is the silent-stale failure the warn path exists to prevent.
+func TestOSVDatabase_ReloadsAfterOutOfProcessSync(t *testing.T) {
+	dir := t.TempDir()
+	serving := NewOSVDatabase(dir) // the long-running server
+	syncing := NewOSVDatabase(dir) // `bodega policy osv sync`
+
+	srv := recordServer(t, []map[string]any{{
+		"id": "GHSA-old", "affected": []map[string]any{{
+			"package":  map[string]any{"name": "lodash", "ecosystem": "npm"},
+			"versions": []string{"4.17.4"},
+		}},
+	}})
+	syncing.ExportBase = srv.URL
+	if _, err := syncing.Sync(context.Background(), "npm"); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+
+	got, err := serving.Match("npm", "lodash", "4.17.4")
+	if err != nil {
+		t.Fatalf("match: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "GHSA-old" {
+		t.Fatalf("first match: %v", vulnIDs(got))
+	}
+
+	// A second sync, in its own process, finds a newly disclosed advisory.
+	srv2 := recordServer(t, []map[string]any{{
+		"id": "GHSA-old", "affected": []map[string]any{{
+			"package":  map[string]any{"name": "lodash", "ecosystem": "npm"},
+			"versions": []string{"4.17.4"},
+		}},
+	}, {
+		"id": "GHSA-new", "affected": []map[string]any{{
+			"package":  map[string]any{"name": "lodash", "ecosystem": "npm"},
+			"versions": []string{"4.17.4"},
+		}},
+	}})
+	syncing.ExportBase = srv2.URL
+	if _, err := syncing.Sync(context.Background(), "npm"); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+
+	got, err = serving.Match("npm", "lodash", "4.17.4")
+	if err != nil {
+		t.Fatalf("match after sync: %v", err)
+	}
+	if ids := vulnIDs(got); len(ids) != 2 {
+		t.Errorf("a synced advisory must be visible to a process that already loaded the ecosystem; got %v", ids)
+	}
+}
