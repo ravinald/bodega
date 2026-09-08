@@ -102,6 +102,30 @@ func (c cachedIndex) current(st os.FileInfo) bool {
 	return c.size == st.Size() && c.mod.Equal(st.ModTime())
 }
 
+// sharedDBs holds one database per directory for the life of the process.
+var sharedDBs sync.Map // dir -> *OSVDatabase
+
+// SharedOSVDatabase returns the process-wide database for dir. The decompressed
+// index is cached on the instance, and the gate builds its checker once per
+// package admitted, so a per-caller database re-reads the whole ecosystem for
+// every package: measured on the 2026-09 npm export, 404ms and a fresh 85 MB
+// heap per package against 33µs on a reused one. Revalidating against the
+// archive's size and modtime is what makes one instance safe to keep across a
+// `policy osv sync`; see cachedIndex.
+//
+// `policy osv sync` builds its own with NewOSVDatabase: it overrides the
+// transport, and a fetch has nothing to reuse.
+func SharedOSVDatabase(dir string) *OSVDatabase {
+	if strings.TrimSpace(dir) == "" {
+		return nil
+	}
+	if db, ok := sharedDBs.Load(dir); ok {
+		return db.(*OSVDatabase)
+	}
+	db, _ := sharedDBs.LoadOrStore(dir, NewOSVDatabase(dir))
+	return db.(*OSVDatabase)
+}
+
 // NewOSVDatabase returns a database rooted at dir. A nil return means the
 // directory is unconfigured, which callers read as "no local database".
 func NewOSVDatabase(dir string) *OSVDatabase {

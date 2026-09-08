@@ -286,7 +286,7 @@ func osvChecker(cfg *config.Config, adb *audit.DB) *policy.OSVChecker {
 	if cfg == nil {
 		return ck
 	}
-	ck.LocalDB = policy.NewOSVDatabase(cfg.ResolveOSVDBDir())
+	ck.LocalDB = policy.SharedOSVDatabase(cfg.ResolveOSVDBDir())
 	ck.AllowAPIFallback = cfg.OSVAPIFallback
 	ck.MaxAge = cfg.ResolveOSVDBMaxAge()
 	return ck

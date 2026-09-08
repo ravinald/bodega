@@ -454,3 +454,13 @@ func TestOSVDatabase_ReloadsAfterOutOfProcessSync(t *testing.T) {
 		t.Errorf("a synced advisory must be visible to a process that already loaded the ecosystem; got %v", ids)
 	}
 }
+
+func TestSharedOSVDatabase(t *testing.T) {
+	dir := t.TempDir()
+	if a, b := SharedOSVDatabase(dir), SharedOSVDatabase(dir); a != b {
+		t.Error("one directory handed out two databases, so the index cache is per-caller")
+	}
+	if SharedOSVDatabase("  ") != nil {
+		t.Error("an unconfigured directory must read as no local database, not an empty one")
+	}
+}

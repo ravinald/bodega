@@ -305,3 +305,25 @@ func TestAdmitKeepsWarningsBehindABlock(t *testing.T) {
 		t.Errorf("the stale-gate warning collected before the block was dropped: %v", res.Warnings)
 	}
 }
+
+// TestOSVCheckerReusesTheDatabase pins the gate to one decompressed index per
+// directory. osvChecker runs once per Admit and Admit runs once per package,
+// so a database built per call throws the index away between packages: the
+// 635-package catalog this gate exists to admit would re-read the whole npm
+// ecosystem 635 times.
+func TestOSVCheckerReusesTheDatabase(t *testing.T) {
+	cfg := &config.Config{OSVDBDir: t.TempDir()}
+
+	first := osvChecker(cfg, nil)
+	if first.LocalDB == nil {
+		t.Fatal("osv_db_dir is set and no local database was wired")
+	}
+	if second := osvChecker(cfg, nil); first.LocalDB != second.LocalDB {
+		t.Error("each admission built its own OSV database; the index cannot survive one package")
+	}
+
+	other := &config.Config{OSVDBDir: t.TempDir()}
+	if osvChecker(other, nil).LocalDB == first.LocalDB {
+		t.Error("two osv_db_dir values shared one database")
+	}
+}
