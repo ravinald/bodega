@@ -391,11 +391,13 @@ than gaining an invented date.
 				return fmt.Errorf("no package named %q%s in %s: nothing was re-checked",
 					nameFlag, as, strings.Join(types, ", "))
 			}
-			// Only claim the database came up empty when every manifest was
-			// readable. With a failure in the walk the cause was the store,
-			// and naming OSV sends the operator to the wrong subsystem.
+			// Name the population, not a cause. A walk answers for nothing
+			// when the mirror is missing, when the store failed, and when
+			// every entry carries a range no point lookup settles; the
+			// reasons printed above tell those apart, and asserting one of
+			// them here sends the operator to the wrong subsystem.
 			if sum.Answered == 0 && sum.Walked > 0 && failures == 0 {
-				return fmt.Errorf("nothing was re-checked: the local OSV database answered for none of %d version(s)", sum.Walked)
+				return fmt.Errorf("nothing was re-checked: none of %d version(s) could be answered for; the reasons are above", sum.Walked)
 			}
 			if failures > 0 {
 				return fmt.Errorf("%d package(s) could not be read or written; their stamps are unchanged", failures)

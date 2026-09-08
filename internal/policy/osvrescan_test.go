@@ -283,6 +283,87 @@ func TestOSVRescan_SkipsEcosystemsOSVCannotAnswer(t *testing.T) {
 	}
 }
 
+// TestOSVRescan_NonExactConstraintIsUnanswered covers the range a point
+// lookup cannot settle. The server resolves a non-exact constraint against
+// upstream and serves releases the manifest never lists, so asking OSV about
+// the base version and writing a check date on the answer dates a query that
+// covered one of them.
+func TestOSVRescan_NonExactConstraintIsUnanswered(t *testing.T) {
+	// ^1.2.0 and ~1.2.0 both cover 1.2.5, which this advisory flags; 1.2.0
+	// itself is outside it, so the point lookup comes back clean.
+	db := dbWithNpm(t, t.TempDir(), npmAdvisory("GHSA-doomed", "minimist", "1.2.4", "1.2.6"))
+
+	for _, constraint := range []string{
+		manifest.ConstraintCompatible,
+		manifest.ConstraintPatch,
+		manifest.ConstraintAny,
+	} {
+		t.Run(constraint, func(t *testing.T) {
+			ve := &manifest.VersionEntry{
+				Version:           "1.2.0",
+				VersionConstraint: constraint,
+				Metadata:          map[string]string{OSVMetaCheckedAt: "2026-01-01T00:00:00Z"},
+			}
+			ch := rescanChecker(db).Rescan(context.Background(), npmPkg(), ve)
+			if ch.Answered {
+				t.Fatalf("constraint %q serves versions the point lookup never saw: %+v", constraint, ch)
+			}
+			if !strings.Contains(ch.Reason, constraint) {
+				t.Errorf("the reason must name the constraint, got %q", ch.Reason)
+			}
+			if got := ve.Metadata[OSVMetaCheckedAt]; got != "2026-01-01T00:00:00Z" {
+				t.Errorf("an unanswered version keeps its previous stamp, got %q", got)
+			}
+		})
+	}
+
+	// The controls: an exact constraint and the empty default name one
+	// version, so both still answer and still carry a date.
+	for _, constraint := range []string{"", manifest.ConstraintExact} {
+		t.Run("answers/"+constraint, func(t *testing.T) {
+			ve := &manifest.VersionEntry{Version: "1.2.0", VersionConstraint: constraint}
+			if ch := rescanChecker(db).Rescan(context.Background(), npmPkg(), ve); !ch.Answered {
+				t.Fatalf("constraint %q names one version: %+v", constraint, ch)
+			}
+			if ve.Metadata[OSVMetaCheckedAt] == "" {
+				t.Errorf("constraint %q must still be dated", constraint)
+			}
+		})
+	}
+}
+
+// TestOSVCheck_NonExactConstraintDoesNotStampClean is the same blind spot at
+// admission. A record found against the base version is still reported, so the
+// guard costs no finding it would otherwise have made.
+func TestOSVCheck_NonExactConstraintDoesNotStampClean(t *testing.T) {
+	db := dbWithNpm(t, t.TempDir(), npmAdvisory("GHSA-doomed", "minimist", "1.2.4", "1.2.6"))
+	store := &fakeOSVStore{policies: map[string]audit.OSVPolicy{
+		manifest.TypeNpm: {Ecosystem: manifest.TypeNpm, Action: ActionBlock},
+	}}
+	ck := NewOSVChecker(store)
+	ck.LocalDB = db
+
+	clean := &manifest.VersionEntry{Version: "1.2.0", VersionConstraint: manifest.ConstraintAny}
+	if r := ck.Check(context.Background(), npmPkg(), clean); r.Action != ActionWarn {
+		t.Fatalf("an unevaluated range warns rather than passing: %+v", r)
+	}
+	if got := clean.Metadata[OSVMetaCheckedAt]; got != "" {
+		t.Errorf("admission stamped a check date on an %q constraint entry: %q",
+			manifest.ConstraintAny, got)
+	}
+
+	flagged := &manifest.VersionEntry{Version: "1.2.5", VersionConstraint: manifest.ConstraintAny}
+	if r := ck.Check(context.Background(), npmPkg(), flagged); r.Action != ActionBlock {
+		t.Fatalf("a record against the base version still blocks: %+v", r)
+	}
+	if flagged.Metadata[OSVMetaVulns] != "GHSA-doomed" {
+		t.Errorf("the ids are still recorded, got %q", flagged.Metadata[OSVMetaVulns])
+	}
+	if got := flagged.Metadata[OSVMetaCheckedAt]; got != "" {
+		t.Errorf("a range nobody evaluated carries no date, got %q", got)
+	}
+}
+
 // TestOSVCheck_StampsCleanAtAdmission keeps admission and rescan writing the
 // same three keys. A version admitted clean after this lands must not read as
 // unchecked until somebody runs a rescan.

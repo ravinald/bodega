@@ -102,7 +102,7 @@ func (c *OSVChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 		return Result{Check: "osv", Action: ActionPass}
 	}
 
-	ans := c.lookup(ctx, osvEco, pm.Name, ve.Version)
+	ans := c.answerFor(ctx, osvEco, pm, ve)
 	if ans.err != nil {
 		return Result{Check: "osv", Action: ActionWarn,
 			Reason: fmt.Sprintf("osv lookup failed for %s/%s@%s: %v", pm.Type, pm.Name, ve.Version, ans.err)}
@@ -172,6 +172,43 @@ type osvAnswer struct {
 // two states the date exists to keep apart.
 func (a osvAnswer) conclusive() bool {
 	return a.err == nil && a.answered && (a.degraded == "" || len(a.vulns) > 0)
+}
+
+// answerFor is the lookup both admission and rescan go through.
+//
+// A version entry whose constraint is not exact does not name one version: the
+// server resolves the range against upstream and serves releases the manifest
+// never lists, so a point lookup on the base version answers a question nobody
+// asked. Marking that inconclusive keeps the range out of the check date while
+// still carrying any record found against the base version itself, which is
+// the same shape as an answer read from stale data.
+func (c *OSVChecker) answerFor(ctx context.Context, osvEco string, pm *manifest.PackageManifest, ve *manifest.VersionEntry) osvAnswer {
+	ans := c.lookup(ctx, osvEco, pm.Name, ve.Version)
+	reason := constraintUnevaluatedReason(pm.Name, ve)
+	if reason == "" || ans.err != nil {
+		return ans
+	}
+	ans.answered = false
+	if ans.degraded == "" {
+		ans.degraded = reason
+	} else {
+		ans.degraded += "; " + reason
+	}
+	return ans
+}
+
+// constraintUnevaluatedReason names a constraint no point lookup can settle.
+// Anything other than exact and the empty default is treated as a range,
+// including a value this build does not recognize: guessing at an unknown
+// constraint is how a version gets dated against a query that never covered
+// it.
+func constraintUnevaluatedReason(name string, ve *manifest.VersionEntry) string {
+	switch ve.VersionConstraint {
+	case "", manifest.ConstraintExact:
+		return ""
+	}
+	return fmt.Sprintf("%s is stored under the %q version constraint, so the versions served are resolved upstream and only %s was queried",
+		name, ve.VersionConstraint, ve.Version)
 }
 
 // lookup answers from the local database, and reaches api.osv.dev only when

@@ -714,7 +714,7 @@ A version with OSV records is stamped on its `VersionEntry.Metadata`, so the fin
 
 `vetting.osv.severity` is present only when at least one record carried a score, and ids OSV scored nothing for are absent from it; `vetting.osv.vulns` is the full list either way. A version matching several records at different severities keeps them apart by id, so a reader ranking findings parses the stamp instead of querying OSV a second time.
 
-`vetting.osv.checked_at` is what makes the other two readable. Without it a version with no findings and a version nobody ever queried both carry an absent `vetting.osv.vulns`, so "no known vulnerabilities" and "nobody looked" print the same. The date is written on a clean result and a flagged one alike, and only when the gate reached a verdict: a check answered out of a database too old to be trusted names the records it found and leaves the date where it was.
+`vetting.osv.checked_at` is what makes the other two readable. Without it a version with no findings and a version nobody ever queried both carry an absent `vetting.osv.vulns`, so "no known vulnerabilities" and "nobody looked" print the same. The date is written on a clean result and a flagged one alike, and only when the gate reached a verdict: a check answered out of a database too old to be trusted names the records it found and leaves the date where it was, and an entry whose `version_constraint` is not exact is never dated at all, because the range it names is not the version that was queried.
 
 Versions imported before this key existed cannot be backfilled. Nothing on disk records when they were checked, and dating them from the manifest's timestamp would invent the fact the field carries, so they read as `unchecked` until a rescan answers for them.
 
@@ -739,6 +739,8 @@ Rescanned 2 version(s): 2 answered, 1 newly flagged, 0 newly cleared.
 
 A manifest the walk cannot read or cannot write back counts as unanswered, with the error as its reason, and the walk continues. A package listed in the index whose manifest file is gone counts the same way, naming that state as its reason: `bodega repair` reports the same drift, and a walk that skipped it silently would report a package nobody could look at as a package with no findings. One corrupt file does not cost you the report on everything beside it; the command still exits 1 so the failure is not silent.
 
+**A non-exact `version_constraint` is not one version, so nothing dates it.** An entry stored under `compatible`, `patch` or `any` names a range the server resolves against upstream, and it serves in-range releases the manifest never lists. A lookup on the base version answers for exactly one of them, so those entries count unanswered, keep whatever stamp they had, and earn a row naming the constraint. A record found against the base version itself is still reported and still stamped; only the date is withheld. Admission applies the same rule on import. `bodega pkg refresh` materializes the in-range releases as exact entries, and a rescan dates each of those.
+
 The table lists what an operator has to read: every version carrying findings, the ones that just gained or lost them, and the ones nothing could answer for. A version that stayed clean is in the count on stderr and nowhere else. Findings go to stdout and the summary to stderr, so a report pipes cleanly while the counts stay on the terminal.
 
 **Rescan records and decides nothing.** It never blocks, hides, freezes or deletes. An OSV data refresh that flags the base image half a fleet runs on would otherwise take that fleet offline with no operator in the loop, on the strength of a third-party data push. What to do about a version that has become vulnerable is a decision, and it stays with the person reading the report.
@@ -753,7 +755,7 @@ npm   minimist  1.2.5    unanswered  no local OSV database for npm in /var/lib/b
 Rescanned 2 version(s): 0 answered, 0 newly flagged, 0 newly cleared.
 2 version(s) unanswered; their previous stamp is unchanged.
   2 x no local OSV database for npm in /var/lib/bodega/osv; run `bodega policy osv sync`; osv_api_fallback is off, so nothing was queried
-Error: nothing was re-checked: the local OSV database answered for none of 2 version(s)
+Error: nothing was re-checked: none of 2 version(s) could be answered for; the reasons are above
 ```
 
 Every unanswered version earns its own row. An unanswered version keeps the stamp it had. Overwriting a real finding with a blank one because the mirror was missing is how a rescan reports a clean fleet it never looked at.

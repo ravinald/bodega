@@ -90,7 +90,7 @@ func (c *OSVChecker) Rescan(ctx context.Context, pm *manifest.PackageManifest, v
 		return OSVRescanChange{Reason: fmt.Sprintf("%s has no OSV ecosystem", pm.Type)}
 	}
 
-	ans := c.lookup(ctx, osvEco, pm.Name, ve.Version)
+	ans := c.answerFor(ctx, osvEco, pm, ve)
 	if !ans.conclusive() {
 		reason := ans.degraded
 		if ans.err != nil {
