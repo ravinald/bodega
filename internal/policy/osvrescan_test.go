@@ -383,3 +383,41 @@ func TestOSVCheck_StampsCleanAtAdmission(t *testing.T) {
 		t.Error("an admission-time clean result must carry a check date")
 	}
 }
+
+// TestOSVStamp_UndatableFindingsDropTheOldDate pins the pairing R2 exists for:
+// the date beside a set of ids has to be the date those ids were found. Data
+// too old to date a verdict against still names records, and the stamp keeps
+// them, but the date left over from the clean check before it would otherwise
+// render as "1 vuln(s), checked <the day it was clean>".
+func TestOSVStamp_UndatableFindingsDropTheOldDate(t *testing.T) {
+	dir := t.TempDir()
+	dbWithNpm(t, dir, npmAdvisory("GHSA-doomed", "minimist", "1.2.4", "1.2.9"))
+
+	clean := "2026-01-01T00:00:00Z"
+	ve := &manifest.VersionEntry{
+		Version:  "1.2.5",
+		Metadata: map[string]string{OSVMetaCheckedAt: clean},
+	}
+
+	store := &fakeOSVStore{policies: map[string]audit.OSVPolicy{
+		manifest.TypeNpm: {Ecosystem: manifest.TypeNpm, Action: ActionBlock},
+	}}
+	ck := NewOSVChecker(store)
+	ck.LocalDB = NewOSVDatabase(dir)
+	ck.MaxAge = 7 * 24 * time.Hour
+	ck.Now = func() time.Time { return time.Now().Add(400 * 24 * time.Hour) }
+
+	r := ck.Check(context.Background(), npmPkg(), ve)
+	if r.Action != ActionBlock {
+		t.Fatalf("stale data still names a vulnerable version: %+v", r)
+	}
+	if !strings.Contains(ve.Metadata[OSVMetaVulns], "GHSA-doomed") {
+		t.Errorf("the ids are worth keeping: %q", ve.Metadata[OSVMetaVulns])
+	}
+	if got := ve.Metadata[OSVMetaCheckedAt]; got != "" {
+		t.Errorf("a clean check's date must not label findings it never saw: %q", got)
+	}
+	if st := OSVStampOf(*ve); !st.Flagged() || !st.Checked.IsZero() {
+		t.Errorf("stamp should read flagged with no date, got %+v", st)
+	}
+}

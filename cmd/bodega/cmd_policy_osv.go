@@ -56,7 +56,11 @@ what turns that into an answer about today.
 	}
 	cmd.AddCommand(newPolicyOSVSetCmd(gf), newPolicyOSVListCmd(gf),
 		newPolicyOSVRemoveCmd(gf), newPolicyOSVSyncCmd(gf),
-		newPolicyOSVRescanCmd(gf))
+		// The policy subtree is quiet, and rescan is the one verb under it
+		// that rewrites manifests. Without this the server keeps serving the
+		// pre-rescan stamp for the life of the process, because
+		// manifest.Store answers from its cache after the first read.
+		signalsReload(newPolicyOSVRescanCmd(gf)))
 	return cmd
 }
 
@@ -331,7 +335,7 @@ than gaining an invented date.
 				sum.Add(policy.OSVRescanChange{Reason: reason})
 				row(typ, pkg, "-", "unanswered", reason)
 			}
-			matched, failures := 0, 0
+			matched, failures, saved := 0, 0, 0
 			for _, t := range types {
 				for _, name := range store.ListPackages(t) {
 					if wantName != "" && name != wantName {
@@ -375,7 +379,9 @@ than gaining an invented date.
 						if err := store.SavePackage(ctx, pm); err != nil {
 							failures++
 							fail(t, name, fmt.Sprintf("save %s/%s: %v", t, name, err))
+							continue
 						}
+						saved++
 					}
 				}
 			}
@@ -383,6 +389,9 @@ than gaining an invented date.
 				return err
 			}
 			sum.Report(os.Stderr)
+			if saved == 0 {
+				suppressReload(cmd)
+			}
 			if wantName != "" && matched == 0 {
 				as := ""
 				if wantName != nameFlag {
@@ -400,6 +409,12 @@ than gaining an invented date.
 				return fmt.Errorf("nothing was re-checked: none of %d version(s) could be answered for; the reasons are above", sum.Walked)
 			}
 			if failures > 0 {
+				// The post-run hook fires only after a nil return, and a walk
+				// that re-stamped eight packages before failing on the ninth
+				// still changed what the server should be serving.
+				if saved > 0 {
+					signalReloadNow(cmd, gf)
+				}
 				return fmt.Errorf("%d package(s) could not be read or written; their stamps are unchanged", failures)
 			}
 			return nil

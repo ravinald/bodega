@@ -60,6 +60,17 @@ func noReloadSignalSelf(cmd *cobra.Command) *cobra.Command {
 	return cmd
 }
 
+// signalReloadNow sends the signal from inside a RunE that is about to return
+// an error. Cobra runs PersistentPostRun only after a nil return, so a verb
+// that wrote part of what it set out to write and then failed would leave the
+// server answering from before the write. It reads the same classification the
+// hook does, so a quiet verb calling it still sends nothing.
+func signalReloadNow(cmd *cobra.Command, gf *globalFlags) {
+	if intent, ok := reloadIntent(cmd); ok && intent == reloadSignal {
+		notifyServer(gf)
+	}
+}
+
 func classifyReload(cmd *cobra.Command, intent string) *cobra.Command {
 	if cmd.Annotations == nil {
 		cmd.Annotations = map[string]string{}

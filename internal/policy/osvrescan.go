@@ -23,9 +23,10 @@ const (
 )
 
 // stampOSV records one conclusive lookup on the version. A zero checkedAt
-// writes no date: the caller found records in data too old to date a verdict
-// against, and the ids are worth keeping while the claim "checked today" is
-// not.
+// drops the date rather than leaving the previous one: the caller found
+// records in data too old to date a verdict against, and a date written by an
+// earlier clean check would then sit beside the new ids as if it had produced
+// them. The ids are worth keeping; the claim "clean as of that day" is not.
 //
 // An empty vulns list clears the previous findings. That is the point of a
 // rescan against an advisory OSV withdrew, and it is why the caller must not
@@ -38,7 +39,9 @@ func stampOSV(ve *manifest.VersionEntry, vulns []osvVuln, checkedAt time.Time) {
 	if ve.Metadata == nil {
 		ve.Metadata = map[string]string{}
 	}
-	if !checkedAt.IsZero() {
+	if checkedAt.IsZero() {
+		delete(ve.Metadata, OSVMetaCheckedAt)
+	} else {
 		ve.Metadata[OSVMetaCheckedAt] = checkedAt.UTC().Format(time.RFC3339)
 	}
 	ids := vulnIDs(vulns)
