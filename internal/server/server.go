@@ -872,9 +872,12 @@ func (s *Server) handleAPIPackageVersion(w http.ResponseWriter, r *http.Request)
 	name := r.PathValue("name")
 	version := r.PathValue("version")
 
+	// cargo is in this list and not in the two handlers above: the OSV gate
+	// covers crates.io, so a cargo version carries the same vetting stamp as
+	// an npm one and an operator has to be able to read it back.
 	switch t {
 	case manifest.TypeApt, manifest.TypeGit, manifest.TypePypi, manifest.TypeBinary,
-		manifest.TypeGomod, manifest.TypeHelm, manifest.TypeNpm:
+		manifest.TypeGomod, manifest.TypeHelm, manifest.TypeNpm, manifest.TypeCargo:
 		pm, err := s.store.GetPackage(ctx, t, name)
 		if err != nil {
 			s.logger.Error("get package failed", "type", t, "name", name, "error", err)

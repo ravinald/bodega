@@ -221,9 +221,14 @@ func TestRescanCommand_ClearsAndFiltersByName(t *testing.T) {
 	})
 	syncInto(t, root, advisory("GHSA-unrelated", "leftpad", "0", "1.0.0"))
 
-	if _, stderr, err := runRescan(t, "--name", "not-a-package"); err != nil ||
-		!strings.Contains(stderr, "Rescanned 0 version(s)") {
-		t.Fatalf("--name must scope the walk: err=%v stderr=%q", err, stderr)
+	// A --name nobody matches must not print requirement 3's clean shape and
+	// exit 0: "0 newly flagged" over a typo reads as "nothing is vulnerable".
+	_, stderr, err := runRescan(t, "--name", "not-a-package")
+	if err == nil {
+		t.Fatalf("--name matching nothing must not exit 0: stderr=%q", stderr)
+	}
+	if !strings.Contains(err.Error(), "not-a-package") {
+		t.Errorf("the error must name what matched nothing: %v", err)
 	}
 	if st := stampOf(t, root, "1.2.5"); !st.Flagged() {
 		t.Fatalf("a filtered-out package was rewritten: %+v", st)
@@ -260,5 +265,85 @@ func TestRescanCommand_RefusesTypeOSVCannotAnswer(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error should name %q, got: %v", want, err)
 		}
+	}
+}
+
+// rescanAdd installs a second package into an existing rescanInstall root and
+// re-writes the index the walk reads.
+func rescanAdd(t *testing.T, root, name string, versions ...manifest.VersionEntry) {
+	t.Helper()
+	store := manifest.NewLocalStore(filepath.Join(root, "manifests"))
+	if err := store.LoadIndex(context.Background()); err != nil {
+		t.Fatalf("LoadIndex: %v", err)
+	}
+	for _, ve := range versions {
+		if err := store.AddVersion(context.Background(), manifest.TypeNpm, name, ve); err != nil {
+			t.Fatalf("AddVersion %s@%s: %v", name, ve.Version, err)
+		}
+	}
+	if err := store.SaveIndex(context.Background()); err != nil {
+		t.Fatalf("SaveIndex: %v", err)
+	}
+}
+
+// TestRescanCommand_NameTakesThePackagesOwnName pins --name to the spelling an
+// operator types. The index keys packages by SafeName, so comparing the flag
+// against the stored key raw walks zero versions for every scoped npm package
+// and every gomod module path, and reports that as a clean run.
+func TestRescanCommand_NameTakesThePackagesOwnName(t *testing.T) {
+	root := rescanInstall(t, manifest.VersionEntry{Version: "1.2.5"})
+	rescanAdd(t, root, "@types/node", manifest.VersionEntry{Version: "18.0.0"})
+	syncInto(t, root, advisory("GHSA-node-types", "@types/node", "0", "18.1.0"))
+
+	stdout, stderr, err := runRescan(t, "--name", "@types/node")
+	if err != nil {
+		t.Fatalf("rescan: %v\n%s", err, stderr)
+	}
+	if !strings.Contains(stderr, "1 answered") || !strings.Contains(stderr, "1 newly flagged") {
+		t.Errorf("the scoped name must walk its own package: %q", stderr)
+	}
+	if !strings.Contains(stdout, "GHSA-node-types") {
+		t.Errorf("the report must name the finding: %q", stdout)
+	}
+	// The encoded form still resolves: SafeName is idempotent, so an operator
+	// reading a filename and typing what they saw is not punished for it.
+	if _, stderr, err := runRescan(t, "--name", "@types--node"); err != nil ||
+		!strings.Contains(stderr, "1 answered") {
+		t.Errorf("the on-disk form must resolve too: err=%v stderr=%q", err, stderr)
+	}
+	// minimist is outside the filter and must keep its unchecked state.
+	if st := stampOf(t, root, "1.2.5"); !st.Checked.IsZero() {
+		t.Errorf("a filtered-out package was rescanned: %+v", st)
+	}
+}
+
+// TestRescanCommand_UnreadableManifestKeepsTheReport is the walk's failure
+// mode: one corrupt manifest used to abort the run before the table flushed
+// and before the summary printed, while the versions already stamped were
+// written to disk. State changed and nothing said what.
+func TestRescanCommand_UnreadableManifestKeepsTheReport(t *testing.T) {
+	root := rescanInstall(t, manifest.VersionEntry{Version: "1.2.0"})
+	rescanAdd(t, root, "corrupt-pkg", manifest.VersionEntry{Version: "1.0.0"})
+	corrupt := filepath.Join(root, "manifests", manifest.TypeNpm, "corrupt-pkg", "manifest.json")
+	if err := os.WriteFile(corrupt, []byte("{ not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	syncInto(t, root, advisory("GHSA-old", "minimist", "0", "1.2.3"))
+
+	stdout, stderr, err := runRescan(t)
+	if err == nil {
+		t.Fatal("an unreadable manifest must not exit 0")
+	}
+	if !strings.Contains(stdout, "corrupt-pkg") || !strings.Contains(stdout, "unanswered") {
+		t.Errorf("the table must name the package it could not read: %q", stdout)
+	}
+	if !strings.Contains(stderr, "1 newly flagged") {
+		t.Errorf("the summary must survive the failure: %q", stderr)
+	}
+	if !strings.Contains(stderr, "unanswered; their previous stamp is unchanged") {
+		t.Errorf("the failure must land in the unanswered count: %q", stderr)
+	}
+	if st := stampOf(t, root, "1.2.0"); !st.Flagged() {
+		t.Errorf("the readable sibling was not rescanned: %+v", st)
 	}
 }

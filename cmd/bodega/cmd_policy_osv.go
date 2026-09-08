@@ -13,6 +13,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
 
@@ -302,18 +303,47 @@ than gaining an invented date.
 			}
 			ck := admit.OSVChecker(cfg, adb)
 
+			// The index keys packages by manifest.SafeName, which collapses
+			// "/" to "--". Comparing the operator's spelling against that
+			// walks nothing for every scoped npm package and every gomod
+			// module path.
+			wantName := ""
+			if nameFlag != "" {
+				wantName = manifest.SafeName(nameFlag)
+			}
+
 			ctx := cmd.Context()
 			var sum policy.OSVRescanSummary
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 			rows := 0
+			row := func(typ, pkg, version, state, detail string) {
+				if rows == 0 {
+					fmt.Fprintln(w, "TYPE\tPACKAGE\tVERSION\tSTATE\tDETAIL")
+				}
+				rows++
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", typ, pkg, version, state, detail)
+			}
+			// A manifest that will not load or will not save is one package
+			// the run could not answer for, not grounds to discard the report
+			// for every other package. The walk finishes and the summary says
+			// what it missed.
+			fail := func(typ, pkg, format string, err error) {
+				ch := policy.OSVRescanChange{Reason: fmt.Sprintf(format+": %v", typ+"/"+pkg, err)}
+				sum.Add(ch)
+				row(typ, pkg, "-", "unanswered", ch.Reason)
+			}
+			matched, failures := 0, 0
 			for _, t := range types {
 				for _, name := range store.ListPackages(t) {
-					if nameFlag != "" && name != nameFlag {
+					if wantName != "" && name != wantName {
 						continue
 					}
+					matched++
 					pm, err := store.GetPackage(ctx, t, name)
 					if err != nil {
-						return fmt.Errorf("load %s/%s: %w", t, name, err)
+						failures++
+						fail(t, name, "load %s", err)
+						continue
 					}
 					if pm == nil {
 						continue
@@ -330,18 +360,15 @@ than gaining an invented date.
 						if state == "" {
 							continue
 						}
-						if rows == 0 {
-							fmt.Fprintln(w, "TYPE\tPACKAGE\tVERSION\tSTATE\tDETAIL")
-						}
-						rows++
-						fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", t, pm.Name, ve.Version, state, detail)
+						row(t, pm.Name, ve.Version, state, detail)
 					}
 					// One write per package, and only when something was
 					// answered: a walk that learned nothing must not rewrite
 					// every manifest in the store.
 					if changed {
 						if err := store.SavePackage(ctx, pm); err != nil {
-							return fmt.Errorf("save %s/%s: %w", t, name, err)
+							failures++
+							fail(t, name, "save %s", err)
 						}
 					}
 				}
@@ -350,8 +377,19 @@ than gaining an invented date.
 				return err
 			}
 			sum.Report(os.Stderr)
+			if wantName != "" && matched == 0 {
+				as := ""
+				if wantName != nameFlag {
+					as = fmt.Sprintf(" (index key %q)", wantName)
+				}
+				return fmt.Errorf("no package named %q%s in %s: nothing was re-checked",
+					nameFlag, as, strings.Join(types, ", "))
+			}
 			if sum.Answered == 0 && sum.Walked > 0 {
 				return fmt.Errorf("nothing was re-checked: the local OSV database answered for none of %d version(s)", sum.Walked)
+			}
+			if failures > 0 {
+				return fmt.Errorf("%d package(s) could not be read or written; their stamps are unchanged", failures)
 			}
 			return nil
 		},

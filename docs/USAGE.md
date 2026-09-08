@@ -735,7 +735,9 @@ npm   minimist  1.2.0    flagged (new)  GHSA-vh95-rmgr-6w4m, GHSA-xvch-5gv4-984h
 Rescanned 2 version(s): 2 answered, 1 newly flagged, 0 newly cleared.
 ```
 
-`--type` and `--name` scope the walk. `--type` refuses an ecosystem OSV has no records for, rather than reporting a clean pass over it.
+`--type` and `--name` scope the walk. `--type` refuses an ecosystem OSV has no records for, rather than reporting a clean pass over it. `--name` takes the package name as you would type it anywhere else, scoped npm packages and gomod module paths included: `--name '@types/node'` and `--name 'github.com/spf13/cobra'` both resolve to the encoded key the manifest index stores. A `--name` that matches no package exits 1 rather than reporting a clean walk over nothing.
+
+A manifest the walk cannot read or cannot write back counts as unanswered, with the error as its reason, and the walk continues. One corrupt file does not cost you the report on everything beside it; the command still exits 1 so the failure is not silent.
 
 The table lists what an operator has to read: every version carrying findings, the ones that just gained or lost them, and the ones nothing could answer for. A version that stayed clean is in the count on stderr and nowhere else. Findings go to stdout and the summary to stderr, so a report pipes cleanly while the counts stay on the terminal.
 
@@ -747,13 +749,14 @@ The table lists what an operator has to read: every version carrying findings, t
 $ bodega policy osv rescan
 TYPE  PACKAGE   VERSION  STATE       DETAIL
 npm   minimist  1.2.0    unanswered  no local OSV database for npm in /var/lib/bodega/osv; run `bodega policy osv sync`; osv_api_fallback is off, so nothing was queried
+npm   minimist  1.2.5    unanswered  no local OSV database for npm in /var/lib/bodega/osv; run `bodega policy osv sync`; osv_api_fallback is off, so nothing was queried
 Rescanned 2 version(s): 0 answered, 0 newly flagged, 0 newly cleared.
 2 version(s) unanswered; their previous stamp is unchanged.
   2 x no local OSV database for npm in /var/lib/bodega/osv; run `bodega policy osv sync`; osv_api_fallback is off, so nothing was queried
 Error: nothing was re-checked: the local OSV database answered for none of 2 version(s)
 ```
 
-An unanswered version keeps the stamp it had. Overwriting a real finding with a blank one because the mirror was missing is how a rescan reports a clean fleet it never looked at.
+Every unanswered version earns its own row. An unanswered version keeps the stamp it had. Overwriting a real finding with a blank one because the mirror was missing is how a rescan reports a clean fleet it never looked at.
 
 Unlike `set`, `list` and the gate itself, `rescan` reads no policy row. Whether a version is vulnerable today is the same fact under `warn`, `block` and `ignore`; the row decides what admission does with a finding, not whether the finding is recorded. So an install that has configured no OSV policy still gets the report.
 
