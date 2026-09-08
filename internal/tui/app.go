@@ -353,7 +353,7 @@ func (m appModel) handlePopupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.cfg.Bucket = ""
 					m.cfg.Region = config.DefaultRegion
 					m.cfg.BuildRoot = config.DefaultBuildRoot
-					m.cfg.ManifestDir = ""
+					m.cfg.ManifestDir = config.DefaultManifestDir(m.cfg.StoragePath)
 					m.cfg.LogDir = config.DefaultLogDir
 					m.cfg.LogWindowHeight = config.DefaultLogWindowHeight
 					m.cfg.CustomPaths = false
@@ -361,14 +361,15 @@ func (m appModel) handlePopupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.cfg.GitRoot = ""
 					m.cfg.PypiRoot = ""
 					m.cfg.BinaryRoot = ""
+					m.cfg.Clear(allConfigFormKeys()...)
 					path, written, err := m.cfg.SaveReport()
 					switch {
 					case err != nil:
 						m.log.appendLog(errorStyle.Render("Failed to save: " + err.Error()))
 					case len(written) == 0:
-						m.log.appendLog(dimStyle.Render("Form fields already at their defaults; " + path + " is unchanged"))
+						m.log.appendLog(dimStyle.Render(path + " named none of this form's keys; it is unchanged"))
 					default:
-						m.log.appendLog(successStyle.Render("Reset " + strings.Join(written, ", ") + " in " + path))
+						m.log.appendLog(successStyle.Render("Removed " + strings.Join(written, ", ") + " from " + path))
 					}
 				},
 				pendingAsyncCmd: nil,
@@ -1143,6 +1144,17 @@ var configFormKeys = map[string]string{
 	"Git root":          "git_root",
 	"PyPI root":         "pypi_root",
 	"Binary root":       "binary_root",
+}
+
+// allConfigFormKeys names every config.json key the form owns. Ctrl+R removes
+// exactly these, so every other key in the file stays whoever else's setting it
+// was.
+func allConfigFormKeys() []string {
+	keys := make([]string, 0, len(configFormKeys))
+	for _, k := range configFormKeys {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 // editedConfigKeys names the config keys behind the fields the operator typed

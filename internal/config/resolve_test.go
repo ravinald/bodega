@@ -229,7 +229,7 @@ func TestPrecedenceMatrix(t *testing.T) {
 			env:     EnvManifestDir,
 			load:    func(flag string) (*Config, error) { return Load(flag, "", "", "", false, false) },
 			get:     func(c *Config) string { return c.ManifestDir },
-			builtin: defaultManifestDir,
+			builtin: DefaultManifestDir,
 		},
 		{
 			name:    "build_root",
@@ -300,13 +300,13 @@ func TestPrecedenceMatrix(t *testing.T) {
 // repository over it without a word in the journal.
 func TestDefaultManifestDirIsAbsolute(t *testing.T) {
 	for _, storagePath := range []string{"", "/srv/bodega"} {
-		got := defaultManifestDir(storagePath)
+		got := DefaultManifestDir(storagePath)
 		if !filepath.IsAbs(got) {
-			t.Errorf("defaultManifestDir(%q) = %q, want an absolute path", storagePath, got)
+			t.Errorf("DefaultManifestDir(%q) = %q, want an absolute path", storagePath, got)
 		}
 	}
-	if got, want := defaultManifestDir("/srv/bodega"), "/srv/bodega/manifests"; got != want {
-		t.Errorf("defaultManifestDir(/srv/bodega) = %q, want %q", got, want)
+	if got, want := DefaultManifestDir("/srv/bodega"), "/srv/bodega/manifests"; got != want {
+		t.Errorf("DefaultManifestDir(/srv/bodega) = %q, want %q", got, want)
 	}
 }
 

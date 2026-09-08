@@ -111,18 +111,9 @@ func TestConfigFormLeavesPrefilledFieldsAlone(t *testing.T) {
 	if reloaded.Region != "us-east-1" {
 		t.Errorf("region after an untouched save = %q, want the file's us-east-1", reloaded.Region)
 	}
-	if reloaded.ManifestDir != defaultManifestDirFor(reloaded.StoragePath) {
+	if reloaded.ManifestDir != config.DefaultManifestDir(reloaded.StoragePath) {
 		t.Errorf("manifest_dir after an untouched save = %q, want the built-in", reloaded.ManifestDir)
 	}
-}
-
-// defaultManifestDirFor mirrors the built-in the config package resolves, which
-// is unexported there.
-func defaultManifestDirFor(storagePath string) string {
-	if storagePath == "" {
-		storagePath = config.DefaultStoragePath
-	}
-	return filepath.Join(storagePath, "manifests")
 }
 
 // TestConfigFormReportsWhatItWrote pins the message. "Config saved" after a
@@ -290,14 +281,10 @@ func TestConfigFormResetLeavesKeysOutsideTheFormAlone(t *testing.T) {
 		}
 	}
 
-	if got, ok := keys["manifest_dir"]; ok {
-		t.Errorf("reset added manifest_dir = %s to a file that never named it", got)
-	}
-	if got := keys["region"]; got != `"`+config.DefaultRegion+`"` {
-		t.Errorf("region after the reset = %s, want the built-in default", got)
-	}
-	if _, ok := keys["apt_root"]; ok {
-		t.Error("reset kept apt_root; the form cleared it, so the key has to go")
+	for _, k := range allConfigFormKeys() {
+		if got, ok := keys[k]; ok {
+			t.Errorf("reset left %q = %s in the file; the form's keys go absent, and absent is what means \"use the default\"", k, got)
+		}
 	}
 
 	line := lastLogLine(t, &am)
@@ -310,6 +297,82 @@ func TestConfigFormResetLeavesKeysOutsideTheFormAlone(t *testing.T) {
 		if !strings.Contains(line, key) {
 			t.Errorf("reset logged %q, want it to name %s", line, key)
 		}
+	}
+	if !strings.Contains(line, "Removed") {
+		t.Errorf("reset logged %q; the keys left the file, so the line says removed", line)
+	}
+}
+
+// TestConfigFormResetClearsAKeyAFlagPinsToItsDefault drives the case the seeded
+// test above cannot reach. Save diffs against the resolved baseline, and a flag
+// feeds that baseline, so `--region us-west-2` where us-west-2 is also the
+// built-in default makes assigning the default a diff of zero: the reset was a
+// no-op and the log line said the fields were already at their defaults while
+// the file went on naming us-east-1 (#265).
+func TestConfigFormResetClearsAKeyAFlagPinsToItsDefault(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	seeded := `{
+  "region": "us-east-1",
+  "token": "seeded-token"
+}`
+	if err := os.WriteFile(path, []byte(seeded), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	am, _ := openConfigForm(t, path, config.DefaultRegion)
+	next, _ := am.handlePopupKey(tea.KeyMsg{Type: tea.KeyCtrlR})
+	am, ok := next.(appModel)
+	if !ok {
+		t.Fatalf("handlePopupKey returned %T, want appModel", next)
+	}
+	if am.popup.onYes == nil {
+		t.Fatal("the reset confirm carries no onYes")
+	}
+	am.popup.onYes()
+
+	keys := savedConfigKeys(t, path)
+	if got, ok := keys["region"]; ok {
+		t.Errorf("region after the reset = %s, want the key gone; the next Load reads it as a setting", got)
+	}
+	if got, want := keys["token"], `"seeded-token"`; got != want { //nolint:gosec // G101: the seeded token is the value under test, not a credential
+		t.Errorf("reset rewrote token to %s, want %s", got, want)
+	}
+	if line := lastLogLine(t, &am); !strings.Contains(line, "region") {
+		t.Errorf("reset logged %q, want it to name the region it removed", line)
+	}
+}
+
+// TestConfigFormSaveAfterResetWritesARetypedKey pins Clear to one write. The
+// reset removes region; an operator who then types one in and saves has to get
+// it, or the reset would go on deleting the key for the life of the process.
+func TestConfigFormSaveAfterResetWritesARetypedKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"region": "us-east-1"}`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	am, cfg := openConfigForm(t, path, config.DefaultRegion)
+	next, _ := am.handlePopupKey(tea.KeyMsg{Type: tea.KeyCtrlR})
+	am, ok := next.(appModel)
+	if !ok {
+		t.Fatalf("handlePopupKey returned %T, want appModel", next)
+	}
+	am.popup.onYes()
+	if got, ok := savedConfigKeys(t, path)["region"]; ok {
+		t.Fatalf("the reset left region = %s in the file", got)
+	}
+
+	// The same *config.Config, so the same snapshot the reset cleared.
+	next, _ = newAppModel(cfg, nil, nil, nil, nil).handleSourcesKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("C")})
+	am, ok = next.(appModel)
+	if !ok {
+		t.Fatalf("handleSourcesKey returned %T, want appModel", next)
+	}
+	typeInto(t, &am.popup, "Region", "eu-central-1")
+	am.popup.onFormSave(am.popup.formFields)
+
+	if got, want := savedConfigKeys(t, path)["region"], `"eu-central-1"`; got != want {
+		t.Errorf("region after a retype and save = %s, want %s", got, want)
 	}
 }
 
