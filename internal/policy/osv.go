@@ -110,26 +110,30 @@ func (c *OSVChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 	vulns := ans.vulns
 	if len(vulns) == 0 {
 		// A gate that could not answer must not report a clean result.
-		if ans.degraded != "" {
+		if !ans.conclusive() {
 			return Result{Check: "osv", Action: ActionWarn, Reason: ans.degraded}
 		}
+		// Dating a clean result is what stops it reading, a year later, like
+		// a version nobody ever looked at.
+		stampOSV(ve, nil, c.now())
 		return Result{Check: "osv", Action: ActionPass}
 	}
 
 	// Stamp onto VersionEntry.Metadata so the knowledge follows the version.
-	ids := vulnIDs(vulns)
-	if ve.Metadata == nil {
-		ve.Metadata = map[string]string{}
+	// Records found in stale data are still records, so they are stamped
+	// without a date rather than dropped.
+	checkedAt := time.Time{}
+	if ans.conclusive() {
+		checkedAt = c.now()
 	}
-	ve.Metadata["vetting.osv.vulns"] = strings.Join(ids, ",")
+	stampOSV(ve, vulns, checkedAt)
 
+	ids := vulnIDs(vulns)
 	details := map[string]any{
 		"vulns": ids,
 		"count": len(vulns),
 	}
 	if sev := vulnSeverities(vulns); len(sev) > 0 {
-		blob, _ := json.Marshal(sev)
-		ve.Metadata["vetting.osv.severity"] = string(blob)
 		details["severity"] = sev
 	}
 
@@ -150,10 +154,24 @@ func (c *OSVChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 // trusted to be complete — no local database, or one too old to have seen a
 // recent advisory — and turns an empty vuln list into a warn instead of a
 // pass. err means nothing answered at all.
+//
+// answered separates the two shapes degraded covers: current data with a
+// caveat, versus no verdict at all. A rescan stamps a check date only on the
+// first, because dating a clean result against a database synced in March
+// asserts the thing the date exists to prove.
 type osvAnswer struct {
 	vulns    []osvVuln
 	degraded string
+	answered bool
 	err      error
+}
+
+// conclusive reports whether the answer is one the gate acts on: current data,
+// and nothing left unread that could still cover this version. Anything else
+// leaves the check date alone, because "clean" and "nobody could tell" are the
+// two states the date exists to keep apart.
+func (a osvAnswer) conclusive() bool {
+	return a.err == nil && a.answered && (a.degraded == "" || len(a.vulns) > 0)
 }
 
 // lookup answers from the local database, and reaches api.osv.dev only when
@@ -170,13 +188,13 @@ func (c *OSVChecker) lookup(ctx context.Context, osvEco, name, version string) o
 		degraded := unevaluatedReason(name, version, skipped)
 		age := meta.Age(c.now())
 		if age <= c.maxAge() {
-			return osvAnswer{vulns: vulns, degraded: degraded}
+			return osvAnswer{vulns: vulns, degraded: degraded, answered: true}
 		}
 		stale := fmt.Sprintf("local OSV database for %s is %s old (synced %s); run `bodega policy osv sync`",
 			osvEco, ShortDuration(age), meta.FetchedAt.UTC().Format(time.RFC3339))
 		if c.AllowAPIFallback {
 			if fresh, apiErr := c.query(ctx, osvEco, name, version); apiErr == nil {
-				return osvAnswer{vulns: fresh}
+				return osvAnswer{vulns: fresh, answered: true}
 			}
 		}
 		if degraded != "" {
@@ -200,7 +218,7 @@ func (c *OSVChecker) lookup(ctx context.Context, osvEco, name, version string) o
 	if err != nil {
 		return osvAnswer{err: fmt.Errorf("%s; api fallback failed: %w", unusable, err)}
 	}
-	return osvAnswer{vulns: vulns}
+	return osvAnswer{vulns: vulns, answered: true}
 }
 
 // unevaluatedReason names the records that mention the package but carry a

@@ -164,6 +164,8 @@ bodega show pkg pypi django 5.2.12    # specific version detail
 bodega show pkg pypi django json      # JSON output
 ```
 
+The version list carries an `OSV` and a `CHECKED` column per version, and names the flagged ids underneath. See [`bodega policy osv`](#bodega-policy-osv-syncsetlistremoverescan) for what `unchecked` means and how the date gets written.
+
 ### `bodega pkg hide TYPE NAME [VERSION]`
 
 Toggle the hidden flag on a package or version. Hidden packages are not served to clients but remain in the manifest for record-keeping.
@@ -573,7 +575,7 @@ Removes a rule. Tries by ID first; falls back to deleting by pattern, scoped to 
 
 Walks every manifest in the store and reports any entry whose upstream URL or package name would be rejected by the current policy. Exits with code 1 on any violation — suitable for CI.
 
-### `bodega policy osv <sync|set|list|remove>`
+### `bodega policy osv <sync|set|list|remove|rescan>`
 
 Matches every `(ecosystem, name, version)` an import carries against a local copy of the OSV database and warns or blocks on the per-ecosystem policy.
 
@@ -582,6 +584,7 @@ bodega policy osv sync
 bodega policy osv set cargo block
 bodega policy osv set npm warn
 bodega policy osv list
+bodega policy osv rescan --type npm
 bodega policy osv remove npm
 ```
 
@@ -707,12 +710,70 @@ A version with OSV records is stamped on its `VersionEntry.Metadata`, so the fin
 |-----|-------|
 | `vetting.osv.vulns` | comma-separated OSV ids, sorted |
 | `vetting.osv.severity` | JSON object keyed by OSV id, each value the record's `severity` array as OSV returned it |
+| `vetting.osv.checked_at` | RFC 3339 timestamp of the last check that reached a verdict |
 
 `vetting.osv.severity` is present only when at least one record carried a score, and ids OSV scored nothing for are absent from it; `vetting.osv.vulns` is the full list either way. A version matching several records at different severities keeps them apart by id, so a reader ranking findings parses the stamp instead of querying OSV a second time.
+
+`vetting.osv.checked_at` is what makes the other two readable. Without it a version with no findings and a version nobody ever queried both carry an absent `vetting.osv.vulns`, so "no known vulnerabilities" and "nobody looked" print the same. The date is written on a clean result and a flagged one alike, and only when the gate reached a verdict: a check answered out of a database too old to be trusted names the records it found and leaves the date where it was.
+
+Versions imported before this key existed cannot be backfilled. Nothing on disk records when they were checked, and dating them from the manifest's timestamp would invent the fact the field carries, so they read as `unchecked` until a rescan answers for them.
 
 ```json
 {"GHSA-xxxx-yyyy-zzzz":[{"type":"CVSS_V3","score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}]}
 ```
+
+#### Rescan
+
+Admission checks a version once, on the day somebody imported it. That answer never gets revisited, so a version admitted clean fourteen months ago is still recorded as clean, and CVEs published against versions already in the field are the normal case rather than the exception. **Admission-time checking alone does not tell you what is vulnerable today.** It tells you what was vulnerable on the day of the import, and nothing in the output distinguishes those two sentences.
+
+`rescan` closes that gap. It walks the manifests, re-runs the lookup against the local database, and re-stamps every version it can answer for.
+
+```
+$ bodega policy osv rescan
+TYPE  PACKAGE   VERSION  STATE          DETAIL
+npm   minimist  1.2.0    flagged (new)  GHSA-vh95-rmgr-6w4m, GHSA-xvch-5gv4-984h
+Rescanned 2 version(s): 2 answered, 1 newly flagged, 0 newly cleared.
+```
+
+`--type` and `--name` scope the walk. `--type` refuses an ecosystem OSV has no records for, rather than reporting a clean pass over it.
+
+The table lists what an operator has to read: every version carrying findings, the ones that just gained or lost them, and the ones nothing could answer for. A version that stayed clean is in the count on stderr and nowhere else. Findings go to stdout and the summary to stderr, so a report pipes cleanly while the counts stay on the terminal.
+
+**Rescan records and decides nothing.** It never blocks, hides, freezes or deletes. An OSV data refresh that flags the base image half a fleet runs on would otherwise take that fleet offline with no operator in the loop, on the strength of a third-party data push. What to do about a version that has become vulnerable is a decision, and it stays with the person reading the report.
+
+**A run that could not read the database does not look like a clean run.** Both print zero newly flagged, so the summary carries an unanswered count and the reason behind it, and the command exits 1 when it answered for nothing:
+
+```
+$ bodega policy osv rescan
+TYPE  PACKAGE   VERSION  STATE       DETAIL
+npm   minimist  1.2.0    unanswered  no local OSV database for npm in /var/lib/bodega/osv; run `bodega policy osv sync`; osv_api_fallback is off, so nothing was queried
+Rescanned 2 version(s): 0 answered, 0 newly flagged, 0 newly cleared.
+2 version(s) unanswered; their previous stamp is unchanged.
+  2 x no local OSV database for npm in /var/lib/bodega/osv; run `bodega policy osv sync`; osv_api_fallback is off, so nothing was queried
+Error: nothing was re-checked: the local OSV database answered for none of 2 version(s)
+```
+
+An unanswered version keeps the stamp it had. Overwriting a real finding with a blank one because the mirror was missing is how a rescan reports a clean fleet it never looked at.
+
+Unlike `set`, `list` and the gate itself, `rescan` reads no policy row. Whether a version is vulnerable today is the same fact under `warn`, `block` and `ignore`; the row decides what admission does with a finding, not whether the finding is recorded. So an install that has configured no OSV policy still gets the report.
+
+Nothing schedules a rescan. Pair it with `sync` in the same cron entry: refreshing the mirror and never re-reading it against what is stored leaves the gate current for imports that have not happened yet and stale for everything already served.
+
+Results surface where an operator already looks. `bodega show pkg <type> <name>` carries an `OSV` and a `CHECKED` column per version and names the flagged ids underneath:
+
+```
+$ bodega show pkg npm minimist
+Package: minimist
+
+VERSION      PLATFORM        STORED FROZEN   HIDDEN   CONSTRAINT OSV         CHECKED
+1.2.0        any             -      no       no       exact      2 vuln(s)   2026-09-08
+1.2.8        any             -      no       no       exact      clean       2026-09-08
+
+Flagged by OSV:
+  1.2.0        GHSA-vh95-rmgr-6w4m, GHSA-xvch-5gv4-984h  (checked 2026-09-08)
+```
+
+`GET /api/v1/packages/{type}/{name}/{version}` carries the same three keys on the version's `metadata`.
 
 ### `bodega policy age <set|list|remove>`
 
@@ -1982,6 +2043,7 @@ All API responses are JSON. The full API is documented in [OpenAPI 3.0 format](.
 | GET | `/api/v1/packages` | All entries across all types |
 | GET | `/api/v1/packages/{type}` | Entries for one type |
 | GET | `/api/v1/packages/{type}/{name}` | Single entry details |
+| GET | `/api/v1/packages/{type}/{name}/{version}` | One version, as a manifest scoped to it. Carries the `vetting.osv.*` keys on `metadata` |
 | GET | `/api/v1/status` | Health check with entry counts, S3 probe, and the apt client state |
 | GET | `/api/v1/config` | Non-sensitive config (bucket, region, manifest_dir) |
 | GET | `/api/v1/audit` | Query audit events (supports filters) |

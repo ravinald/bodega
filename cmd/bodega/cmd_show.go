@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 )
 
 func newShowCmd(gf *globalFlags) *cobra.Command {
@@ -264,10 +265,12 @@ func showVersionList(ctx context.Context, store *manifest.Store, typ, name strin
 	fmt.Println()
 
 	if admin {
-		fmt.Printf("%-12s %-15s %-6s %-8s %-8s %-10s\n", "VERSION", "PLATFORM", "STORED", "FROZEN", "HIDDEN", "CONSTRAINT")
+		fmt.Printf("%-12s %-15s %-6s %-8s %-8s %-10s %-11s %-10s\n",
+			"VERSION", "PLATFORM", "STORED", "FROZEN", "HIDDEN", "CONSTRAINT", "OSV", "CHECKED")
 	} else {
 		fmt.Printf("%-12s %-15s %-10s\n", "VERSION", "PLATFORM", "CONSTRAINT")
 	}
+	var flagged []string
 	for _, ve := range pm.Versions {
 		if ve.Hidden && !admin {
 			continue
@@ -293,12 +296,32 @@ func showVersionList(ctx context.Context, store *manifest.Store, typ, name strin
 			if ve.Hidden {
 				hidden = "yes"
 			}
-			fmt.Printf("%-12s %-15s %-6s %-8s %-8s %-10s\n", v, platform, "-", frozen, hidden, constraint)
+			st := policy.OSVStampOf(ve)
+			fmt.Printf("%-12s %-15s %-6s %-8s %-8s %-10s %-11s %-10s\n",
+				v, platform, "-", frozen, hidden, constraint, st.State(), osvCheckedOn(st))
+			if st.Flagged() {
+				flagged = append(flagged, fmt.Sprintf("  %-12s %s  (checked %s)",
+					v, strings.Join(st.Vulns, ", "), osvCheckedOn(st)))
+			}
 		} else {
 			fmt.Printf("%-12s %-15s %-10s\n", v, platform, constraint)
 		}
 	}
+	if len(flagged) > 0 {
+		fmt.Printf("\nFlagged by OSV:\n%s\n", strings.Join(flagged, "\n"))
+	}
 	return nil
+}
+
+// osvCheckedOn renders the date the OSV gate last answered for a version.
+// "never" rather than a blank column: a version carrying no check date was
+// either imported before the date existed or never reached the gate, and both
+// mean nobody can say what it is today.
+func osvCheckedOn(st policy.OSVStamp) string {
+	if st.Checked.IsZero() {
+		return "never"
+	}
+	return st.Checked.UTC().Format("2006-01-02")
 }
 
 // ---------- depth 3: version detail or "all" ----------

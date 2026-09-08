@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/policy"
 )
@@ -42,14 +43,19 @@ sync is the only subcommand that reaches the network. Admission answers
 from the directory sync wrote (osv_db_dir), and queries api.osv.dev only
 when osv_api_fallback is on and the local copy cannot answer.
 
+Admission checks a version once, on the day it was imported. rescan is
+what turns that into an answer about today.
+
   bodega policy osv sync
   bodega policy osv set npm block
   bodega policy osv set pypi warn
   bodega policy osv list
+  bodega policy osv rescan --type npm
   bodega policy osv remove npm`,
 	}
 	cmd.AddCommand(newPolicyOSVSetCmd(gf), newPolicyOSVListCmd(gf),
-		newPolicyOSVRemoveCmd(gf), newPolicyOSVSyncCmd(gf))
+		newPolicyOSVRemoveCmd(gf), newPolicyOSVSyncCmd(gf),
+		newPolicyOSVRescanCmd(gf))
 	return cmd
 }
 
@@ -244,4 +250,133 @@ func onOff(b bool) string {
 		return "on"
 	}
 	return "off"
+}
+
+func newPolicyOSVRescanCmd(gf *globalFlags) *cobra.Command {
+	var typeFlag, nameFlag string
+	cmd := &cobra.Command{
+		Use:   "rescan [--type TYPE] [--name NAME]",
+		Short: "Re-check stored versions against the local OSV database",
+		Long: `Walk the manifests, re-run the OSV lookup for every stored version in
+an OSV-covered ecosystem, and re-stamp what the local database says
+today. Admission checked each version once, on the day it was imported;
+advisories published against versions already in the field are the normal
+case, so that answer ages out.
+
+rescan records and decides nothing. It never blocks, hides, freezes or
+deletes: an OSV data refresh that flags a base image would otherwise take
+a fleet offline with no operator in the loop. What it changes is the
+stamp, and the summary on stderr is what an operator acts on.
+
+Versions the database cannot answer for keep the stamp they had. A
+version checked before the check date existed reads as unchecked rather
+than gaining an invented date.
+
+  bodega policy osv rescan
+  bodega policy osv rescan --type npm
+  bodega policy osv rescan --type pypi --name django`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig(gf)
+			if err != nil {
+				return err
+			}
+			if err := ensureMutable(cfg); err != nil {
+				return err
+			}
+			types := policy.OSVEcosystems()
+			if typeFlag != "" {
+				if err := requireEcosystem(typeFlag, policy.OSVEcosystems(), "OSV gate",
+					"there are no OSV records to re-check it against"); err != nil {
+					return err
+				}
+				types = []string{typeFlag}
+			}
+			store, err := loadStore(gf)
+			if err != nil {
+				return fmt.Errorf("load manifests: %w", err)
+			}
+			adb := openAuditDB(gf)
+			if adb != nil {
+				defer adb.Close()
+			}
+			ck := admit.OSVChecker(cfg, adb)
+
+			ctx := cmd.Context()
+			var sum policy.OSVRescanSummary
+			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+			rows := 0
+			for _, t := range types {
+				for _, name := range store.ListPackages(t) {
+					if nameFlag != "" && name != nameFlag {
+						continue
+					}
+					pm, err := store.GetPackage(ctx, t, name)
+					if err != nil {
+						return fmt.Errorf("load %s/%s: %w", t, name, err)
+					}
+					if pm == nil {
+						continue
+					}
+					changed := false
+					for i := range pm.Versions {
+						ve := &pm.Versions[i]
+						ch := ck.Rescan(ctx, pm, ve)
+						sum.Add(ch)
+						if ch.Answered {
+							changed = true
+						}
+						state, detail := rescanRow(ch)
+						if state == "" {
+							continue
+						}
+						if rows == 0 {
+							fmt.Fprintln(w, "TYPE\tPACKAGE\tVERSION\tSTATE\tDETAIL")
+						}
+						rows++
+						fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", t, pm.Name, ve.Version, state, detail)
+					}
+					// One write per package, and only when something was
+					// answered: a walk that learned nothing must not rewrite
+					// every manifest in the store.
+					if changed {
+						if err := store.SavePackage(ctx, pm); err != nil {
+							return fmt.Errorf("save %s/%s: %w", t, name, err)
+						}
+					}
+				}
+			}
+			if err := w.Flush(); err != nil {
+				return err
+			}
+			sum.Report(os.Stderr)
+			if sum.Answered == 0 && sum.Walked > 0 {
+				return fmt.Errorf("nothing was re-checked: the local OSV database answered for none of %d version(s)", sum.Walked)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&typeFlag, "type", "", "Restrict the walk to one registry type")
+	cmd.Flags().StringVar(&nameFlag, "name", "", "Restrict the walk to one package name")
+	return cmd
+}
+
+// rescanRow renders the one line a version earns in the report, or "" for a
+// version that stayed clean. A clean version is in the summary count and
+// nowhere else: the table is the list an operator has to read, and padding it
+// with every version that did not change is how the two flagged rows get
+// missed.
+func rescanRow(ch policy.OSVRescanChange) (state, detail string) {
+	switch {
+	case !ch.Answered:
+		return "unanswered", ch.Reason
+	case ch.Flagged:
+		return "flagged (new)", strings.Join(ch.Vulns, ", ")
+	case len(ch.Vulns) > 0:
+		return "flagged", strings.Join(ch.Vulns, ", ")
+	case ch.Cleared:
+		return "cleared", "no OSV records match it today"
+	default:
+		return "", ""
+	}
 }
