@@ -1,0 +1,78 @@
+[
+ {
+  "affected": [
+   {
+    "package": {
+     "ecosystem": "Go",
+     "name": "github.com/gogo/protobuf",
+     "purl": "pkg:golang/github.com/gogo/protobuf"
+    },
+    "ranges": [
+     {
+      "events": [
+       {
+        "introduced": "0"
+       },
+       {
+        "fixed": "1.3.2"
+       }
+      ],
+      "type": "SEMVER"
+     }
+    ]
+   }
+  ],
+  "aliases": [
+   "BIT-consul-2021-3121",
+   "BIT-protobuf-2021-3121",
+   "CVE-2021-3121",
+   "GO-2021-0053"
+  ],
+  "id": "GHSA-c3h9-896r-86jm",
+  "modified": "2026-02-04T02:43:17.273837Z",
+  "published": "2022-03-28T20:28:00Z",
+  "schema_version": "1.7.3",
+  "severity": [
+   {
+    "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:H",
+    "type": "CVSS_V3"
+   }
+  ],
+  "summary": "Improper Input Validation in GoGo Protobuf"
+ },
+ {
+  "affected": [
+   {
+    "package": {
+     "ecosystem": "Go",
+     "name": "github.com/gogo/protobuf",
+     "purl": "pkg:golang/github.com/gogo/protobuf"
+    },
+    "ranges": [
+     {
+      "events": [
+       {
+        "introduced": "0"
+       },
+       {
+        "fixed": "1.3.2"
+       }
+      ],
+      "type": "SEMVER"
+     }
+    ]
+   }
+  ],
+  "aliases": [
+   "BIT-consul-2021-3121",
+   "BIT-protobuf-2021-3121",
+   "CVE-2021-3121",
+   "GHSA-c3h9-896r-86jm"
+  ],
+  "id": "GO-2021-0053",
+  "modified": "2026-02-04T03:28:45.369468Z",
+  "published": "2021-04-14T20:04:52Z",
+  "schema_version": "1.7.3",
+  "summary": "Panic due to improper input validation in github.com/gogo/protobuf"
+ }
+]

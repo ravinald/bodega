@@ -573,18 +573,87 @@ Removes a rule. Tries by ID first; falls back to deleting by pattern, scoped to 
 
 Walks every manifest in the store and reports any entry whose upstream URL or package name would be rejected by the current policy. Exits with code 1 on any violation — suitable for CI.
 
-### `bodega policy osv <set|list|remove>`
+### `bodega policy osv <sync|set|list|remove>`
 
-Queries `api.osv.dev` for every `(ecosystem, name, version)` an import carries and warns or blocks on the per-ecosystem policy.
+Matches every `(ecosystem, name, version)` an import carries against a local copy of the OSV database and warns or blocks on the per-ecosystem policy.
 
 ```bash
+bodega policy osv sync
 bodega policy osv set cargo block
 bodega policy osv set npm warn
 bodega policy osv list
 bodega policy osv remove npm
 ```
 
-Coverage is the set of registry types with an OSV ecosystem identifier:
+`sync` is the only OSV subcommand that reaches the network. Admission reads the synced directory and nothing else, unless `osv_api_fallback` is on.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `osv_db_dir` | `{storage_path}/osv` | Directory holding one archive and one metadata file per ecosystem |
+| `osv_api_fallback` | `false` | Authorize a live `api.osv.dev` query when the local copy cannot answer |
+| `osv_db_max_age` | `168h` | How old a synced ecosystem may be before a clean answer warns instead of passing |
+
+The fallback is off by default because the deployment this gate exists for cannot reach `api.osv.dev`: with it on, every version stalls for the 15-second client timeout against a host that never answers, once per version, which a 635-package import pays 635 times.
+
+#### Sync
+
+```
+$ bodega policy osv sync
+ECOSYSTEM  OSV        RECORDS  PACKAGES  SIZE     FETCHED
+cargo      crates.io  2701     1610      120.1KB  2026-09-08T01:53:24Z
+gomod      Go         8968     1588      402.9KB  2026-09-08T01:53:25Z
+npm        npm        228106   224290    3.8MB    2026-09-08T01:53:43Z
+pypi       PyPI       24755    13281     1.1MB    2026-09-08T01:53:27Z
+
+Wrote /var/lib/bodega/osv
+```
+
+Name ecosystems to sync a subset (`bodega policy osv sync npm pypi`). Each archive is written under a temporary name and renamed, so an interrupted sync leaves the previous copy in place rather than a half-written one the gate would read as truth.
+
+The numbers are the distilled database, not the download: OSV's npm export is 222 MB of JSON, and what lands on disk is 3.8 MB because sync keeps the ids, summaries, severities and affected ranges and drops the prose. A full sync of all four ecosystems takes about 15 seconds on a home connection and the whole directory is around 5.5 MB.
+
+#### Air-gapped
+
+`sync` is a network fetch and nothing else, so the connected host and the enforcing host need not be the same:
+
+```bash
+# On a host with a route to the internet:
+bodega policy osv sync
+tar czf osv-db.tar.gz -C /var/lib/bodega osv
+
+# On the restricted host:
+tar xzf osv-db.tar.gz -C /srv/bodega
+# set "osv_db_dir": "/srv/bodega/osv" in config.json, or unpack under
+# {storage_path}/osv and leave the key alone
+bodega policy osv list   # confirm the fetch times came across
+```
+
+The directory carries its own fetch timestamps, so a copy that stopped being refreshed reports its real age rather than the day it was copied.
+
+#### Staleness and the missing database
+
+A gate that cannot answer does not report a clean result. With no local database for an ecosystem, or one older than `osv_db_max_age`, a version with no known records is `warn`, never `pass`, and the reason names the next step:
+
+```
+no local OSV database for Go in /var/lib/bodega/osv; run `bodega policy osv sync`; osv_api_fallback is off, so nothing was queried
+local OSV database for npm is 30d old (synced 2026-08-09T01:53:43Z); run `bodega policy osv sync`
+```
+
+A stale database still blocks on what it does hold — old data names old vulnerabilities correctly — and the age rides along in the reason. With `osv_api_fallback` on, a stale or missing ecosystem is answered from `api.osv.dev` instead, and only a failed query falls back to the stale copy.
+
+`bodega policy osv list` reports the state per ecosystem, so a gate that is current is distinguishable from one that stopped syncing in March:
+
+```
+$ bodega policy osv list
+ECOSYSTEM  ACTION  UPDATED     DB SYNCED             DB AGE
+gomod      block   2026-09-08  never                 -
+npm        block   2026-09-08  2026-09-08T01:53:43Z  47s
+pypi       warn    2026-09-08  2026-09-08T01:53:27Z  1m4s
+
+Local OSV database: /var/lib/bodega/osv (api.osv.dev fallback: off)
+```
+
+Coverage is the set of registry types with an OSV ecosystem identifier, which is also the set of exports `sync` fetches:
 
 | Type | OSV ecosystem |
 |------|---------------|
@@ -601,6 +670,14 @@ Error: the OSV gate does not cover ecosystem "helm": the row would be stored and
 ```
 
 Earlier versions wrote that row, printed `Set helm OSV policy: block`, and then passed every helm version, because the checker short-circuits on any type outside the table above. Nothing reported the gap. The refusal replaces a gate the operator believed was on. It does not remove the rows already written: `bodega policy osv list` names them under the table and `bodega doctor` reports them, in the shape shown under [`bodega policy age`](#bodega-policy-age-setlistremove).
+
+#### Matching
+
+The local matcher implements OSV's own evaluation: an enumerated `versions` list matches exactly, and a range is walked event by event in version order, under semver for npm, Go and crates.io and PEP 440 for PyPI. Measured against `api.osv.dev` over 395 sampled `(package, version)` pairs across the four ecosystems, it agrees on 392.
+
+An ecosystem is decompressed on the first version checked against it and held for the life of the process, so a bulk import pays one decompression rather than one round trip per version. What it holds, measured on the 2026-09 exports: npm 85 MB, PyPI 47 MB, gomod 6 MB, cargo 1.5 MB. An ecosystem with no policy row is never loaded.
+
+The three disagreements are one deliberate divergence: **withdrawn advisories are dropped at sync**, and the API still returns some of them (PYSEC-2024-115, retracted in July 2026, comes back on a `langchain-community` query while other withdrawn records do not). A retracted advisory blocking an import is a false positive the operator has no way to clear.
 
 A version with OSV records is stamped on its `VersionEntry.Metadata`, so the finding follows the version into the manifest rather than living only in the audit event:
 

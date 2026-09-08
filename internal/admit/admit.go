@@ -86,7 +86,7 @@ func Admit(
 	if err := checkAllowList(ctx, checker, adb, pm, actor); err != nil {
 		return Result{Decision: PolicyBlocked, Reason: err.Error(), Warnings: res.Warnings}
 	}
-	if err := checkVersions(ctx, adb, pm, actor); err != nil {
+	if err := checkVersions(ctx, adb, cfg, pm, actor); err != nil {
 		return Result{Decision: PolicyBlocked, Reason: err.Error(), Warnings: res.Warnings}
 	}
 	return res
@@ -188,13 +188,13 @@ func checkAllowList(ctx context.Context, checker *policy.Checker, adb *audit.DB,
 // checkVersions runs the per-version checks (age, OSV). They live in the audit
 // database, so with no database there is nothing to check against. Warn-level
 // results are recorded and do not block.
-func checkVersions(ctx context.Context, adb *audit.DB, pm *manifest.PackageManifest, actor string) error {
+func checkVersions(ctx context.Context, adb *audit.DB, cfg *config.Config, pm *manifest.PackageManifest, actor string) error {
 	if adb == nil {
 		return nil
 	}
 	checkers := []policy.VersionChecker{
 		policy.NewAgeChecker(adb),
-		policy.NewOSVChecker(adb),
+		osvChecker(cfg, adb),
 	}
 	for i := range pm.Versions {
 		ve := &pm.Versions[i]
@@ -220,6 +220,22 @@ func checkVersions(ctx context.Context, adb *audit.DB, pm *manifest.PackageManif
 		}
 	}
 	return nil
+}
+
+// osvChecker points the OSV gate at the local database `bodega policy osv
+// sync` wrote. The config keys are read here rather than in internal/policy so
+// the gate stays usable from a test or a tool that holds no Config; a nil one
+// leaves the checker with no database and no fallback, which warns rather than
+// passing.
+func osvChecker(cfg *config.Config, adb *audit.DB) *policy.OSVChecker {
+	ck := policy.NewOSVChecker(adb)
+	if cfg == nil {
+		return ck
+	}
+	ck.LocalDB = policy.NewOSVDatabase(cfg.ResolveOSVDBDir())
+	ck.AllowAPIFallback = cfg.OSVAPIFallback
+	ck.MaxAge = cfg.ResolveOSVDBMaxAge()
+	return ck
 }
 
 // CheckBackendName rejects a name no configured backend answers to. The empty

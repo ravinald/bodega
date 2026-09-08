@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -31,17 +32,24 @@ func newPolicyOSVCmd(gf *globalFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "osv",
 		Short: "OSV vulnerability gate per ecosystem",
-		Long: `Query api.osv.dev for every imported (ecosystem, name, version)
-and flag or block based on the per-ecosystem policy. OSV coverage maps
-npm, pypi, gomod and cargo. Any other ecosystem has no OSV identifier,
-so set refuses it rather than writing a row the gate never reads.
+		Long: `Match every imported (ecosystem, name, version) against the local
+OSV database and flag or block based on the per-ecosystem policy. OSV
+coverage maps npm, pypi, gomod and cargo. Any other ecosystem has no OSV
+identifier, so set refuses it rather than writing a row the gate never
+reads.
 
+sync is the only subcommand that reaches the network. Admission answers
+from the directory sync wrote (osv_db_dir), and queries api.osv.dev only
+when osv_api_fallback is on and the local copy cannot answer.
+
+  bodega policy osv sync
   bodega policy osv set npm block
   bodega policy osv set pypi warn
   bodega policy osv list
   bodega policy osv remove npm`,
 	}
-	cmd.AddCommand(newPolicyOSVSetCmd(gf), newPolicyOSVListCmd(gf), newPolicyOSVRemoveCmd(gf))
+	cmd.AddCommand(newPolicyOSVSetCmd(gf), newPolicyOSVListCmd(gf),
+		newPolicyOSVRemoveCmd(gf), newPolicyOSVSyncCmd(gf))
 	return cmd
 }
 
@@ -85,8 +93,13 @@ func newPolicyOSVSetCmd(gf *globalFlags) *cobra.Command {
 func newPolicyOSVListCmd(gf *globalFlags) *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
-		Short: "List OSV policies",
+		Short: "List OSV policies and the local database's per-ecosystem sync time",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig(gf)
+			if err != nil {
+				return err
+			}
+			db := policy.NewOSVDatabase(cfg.ResolveOSVDBDir())
 			adb := openAuditDB(gf)
 			if adb == nil {
 				return fmt.Errorf("audit DB unavailable")
@@ -97,19 +110,24 @@ func newPolicyOSVListCmd(gf *globalFlags) *cobra.Command {
 				return err
 			}
 			if len(rows) == 0 {
-				fmt.Println("No OSV policies configured.")
+				fmt.Printf("No OSV policies configured.\nLocal OSV database: %s (api.osv.dev fallback: %s)\n",
+					db.Dir(), onOff(cfg.OSVAPIFallback))
 				return nil
 			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-			fmt.Fprintln(w, "ECOSYSTEM\tACTION\tUPDATED")
+			fmt.Fprintln(w, "ECOSYSTEM\tACTION\tUPDATED\tDB SYNCED\tDB AGE")
 			stored := make([]string, 0, len(rows))
 			for _, p := range rows {
-				fmt.Fprintf(w, "%s\t%s\t%s\n", p.Ecosystem, p.Action, p.UpdatedAt.Format("2006-01-02"))
+				synced, age := osvDBState(db, p.Ecosystem)
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
+					p.Ecosystem, p.Action, p.UpdatedAt.Format("2006-01-02"), synced, age)
 				stored = append(stored, p.Ecosystem)
 			}
 			if err := w.Flush(); err != nil {
 				return err
 			}
+			fmt.Printf("\nLocal OSV database: %s (api.osv.dev fallback: %s)\n",
+				db.Dir(), onOff(cfg.OSVAPIFallback))
 			reportUncovered("OSV gate", stored, policy.OSVEcosystems(), "bodega policy osv remove")
 			return nil
 		},
@@ -145,4 +163,101 @@ func newPolicyOSVRemoveCmd(gf *globalFlags) *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func newPolicyOSVSyncCmd(gf *globalFlags) *cobra.Command {
+	return &cobra.Command{
+		Use:   "sync [ecosystem...]",
+		Short: "Fetch or refresh the local OSV database",
+		Long: `Download OSV's per-ecosystem export into osv_db_dir, one archive
+per ecosystem, and record when each was fetched. With no arguments every
+covered ecosystem is synced.
+
+This is the only OSV subcommand that reaches the network. On an
+air-gapped host, run it where the network is, copy the directory over,
+and point osv_db_dir at the copy.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig(gf)
+			if err != nil {
+				return err
+			}
+			ecosystems := policy.OSVEcosystems()
+			if len(args) > 0 {
+				for _, eco := range args {
+					if err := requireEcosystem(eco, policy.OSVEcosystems(), "OSV gate",
+						"there is no export to fetch for it"); err != nil {
+						return err
+					}
+				}
+				ecosystems = args
+			}
+			db := policy.NewOSVDatabase(cfg.ResolveOSVDBDir())
+			if db == nil {
+				return fmt.Errorf("no OSV database directory: set osv_db_dir or storage_path")
+			}
+
+			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+			fmt.Fprintln(w, "ECOSYSTEM\tOSV\tRECORDS\tPACKAGES\tSIZE\tFETCHED")
+			var failed []string
+			wrote := 0
+			for _, eco := range ecosystems {
+				osvEco := policy.OSVEcosystemFor(eco)
+				meta, err := db.Sync(cmd.Context(), osvEco)
+				if err != nil {
+					failed = append(failed, fmt.Sprintf("%s: %v", eco, err))
+					fmt.Fprintf(w, "%s\t%s\t-\t-\t-\tFAILED\n", eco, osvEco)
+					continue
+				}
+				fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%s\t%s\n", eco, osvEco,
+					meta.Records, meta.Packages, humanBytes(meta.Bytes),
+					meta.FetchedAt.Format(time.RFC3339))
+				wrote++
+			}
+			if err := w.Flush(); err != nil {
+				return err
+			}
+			if wrote > 0 {
+				fmt.Printf("\nWrote %s\n", db.Dir())
+			}
+			if len(failed) > 0 {
+				return fmt.Errorf("sync failed for %d ecosystem(s): %s", len(failed), strings.Join(failed, "; "))
+			}
+			return nil
+		},
+	}
+}
+
+// osvDBState renders one ecosystem's sync time and age for the list table. An
+// ecosystem that was never synced reads "never" rather than a blank column:
+// the gate warns on it, and the operator has to see which one.
+func osvDBState(db *policy.OSVDatabase, ecosystem string) (string, string) {
+	osvEco := policy.OSVEcosystemFor(ecosystem)
+	if osvEco == "" {
+		return "n/a", "-"
+	}
+	meta, err := db.Meta(osvEco)
+	if err != nil {
+		return "never", "-"
+	}
+	return meta.FetchedAt.Format(time.RFC3339), policy.ShortDuration(meta.Age(time.Now()))
+}
+
+func onOff(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
+}
+
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%dB", n)
+	}
+	div, exp := int64(unit), 0
+	for v := n / unit; v >= unit; v /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f%cB", float64(n)/float64(div), "KMGTPE"[exp])
 }

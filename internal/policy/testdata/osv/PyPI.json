@@ -1,0 +1,444 @@
+[
+ {
+  "affected": [
+   {
+    "package": {
+     "ecosystem": "PyPI",
+     "name": "pyyaml",
+     "purl": "pkg:pypi/pyyaml"
+    },
+    "ranges": [
+     {
+      "events": [
+       {
+        "introduced": "5.1"
+       },
+       {
+        "fixed": "5.2"
+       }
+      ],
+      "type": "ECOSYSTEM"
+     }
+    ],
+    "versions": [
+     "5.1",
+     "5.1.1",
+     "5.1.2",
+     "5.2b1"
+    ]
+   }
+  ],
+  "aliases": [
+   "CVE-2019-20477",
+   "PYSEC-2020-176"
+  ],
+  "id": "GHSA-3pqx-4fqf-j49f",
+  "modified": "2024-10-25T21:23:11.506576Z",
+  "published": "2021-04-20T16:40:42Z",
+  "schema_version": "1.7.3",
+  "severity": [
+   {
+    "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "type": "CVSS_V3"
+   },
+   {
+    "score": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
+    "type": "CVSS_V4"
+   }
+  ],
+  "summary": "Deserialization of Untrusted Data in PyYAML"
+ },
+ {
+  "affected": [
+   {
+    "package": {
+     "ecosystem": "PyPI",
+     "name": "pyyaml",
+     "purl": "pkg:pypi/pyyaml"
+    },
+    "ranges": [
+     {
+      "events": [
+       {
+        "introduced": "5.1b7"
+       },
+       {
+        "fixed": "5.3.1"
+       }
+      ],
+      "type": "ECOSYSTEM"
+     }
+    ],
+    "versions": [
+     "5.1",
+     "5.1.1",
+     "5.1.2",
+     "5.1b7",
+     "5.2",
+     "5.2b1",
+     "5.3",
+     "5.3b1"
+    ]
+   }
+  ],
+  "aliases": [
+   "CVE-2020-1747",
+   "PYSEC-2020-96"
+  ],
+  "id": "GHSA-6757-jp84-gxfx",
+  "modified": "2026-05-04T08:57:14.897560893Z",
+  "published": "2021-04-20T16:14:24Z",
+  "schema_version": "1.7.5",
+  "severity": [
+   {
+    "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "type": "CVSS_V3"
+   },
+   {
+    "score": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
+    "type": "CVSS_V4"
+   }
+  ],
+  "summary": "Improper Input Validation in PyYAML"
+ },
+ {
+  "affected": [
+   {
+    "package": {
+     "ecosystem": "PyPI",
+     "name": "pyyaml",
+     "purl": "pkg:pypi/pyyaml"
+    },
+    "ranges": [
+     {
+      "events": [
+       {
+        "introduced": "0"
+       },
+       {
+        "fixed": "5.4"
+       }
+      ],
+      "type": "ECOSYSTEM"
+     }
+    ],
+    "versions": [
+     "3.01",
+     "3.02",
+     "3.03",
+     "3.04",
+     "3.05",
+     "3.06",
+     "3.07",
+     "3.08",
+     "3.09",
+     "3.10",
+     "3.11",
+     "3.12",
+     "3.13",
+     "3.13b1",
+     "3.13rc1",
+     "4.2b1",
+     "4.2b2",
+     "4.2b4",
+     "5.1",
+     "5.1.1",
+     "5.1.2",
+     "5.1b1",
+     "5.1b3",
+     "5.1b5",
+     "5.1b7",
+     "5.2",
+     "5.2b1",
+     "5.3",
+     "5.3.1",
+     "5.3b1",
+     "5.4b1",
+     "5.4b2"
+    ]
+   }
+  ],
+  "aliases": [
+   "CVE-2020-14343",
+   "PYSEC-2021-142"
+  ],
+  "id": "GHSA-8q59-q68h-6hv4",
+  "modified": "2026-02-04T03:33:10.792778Z",
+  "published": "2021-03-25T21:26:26Z",
+  "schema_version": "1.7.3",
+  "severity": [
+   {
+    "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "type": "CVSS_V3"
+   },
+   {
+    "score": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
+    "type": "CVSS_V4"
+   }
+  ],
+  "summary": "Improper Input Validation in PyYAML"
+ },
+ {
+  "affected": [
+   {
+    "package": {
+     "ecosystem": "PyPI",
+     "name": "pyyaml",
+     "purl": "pkg:pypi/pyyaml"
+    },
+    "ranges": [
+     {
+      "events": [
+       {
+        "introduced": "0"
+       },
+       {
+        "fixed": "5.1"
+       }
+      ],
+      "type": "ECOSYSTEM"
+     }
+    ],
+    "versions": [
+     "3.01",
+     "3.02",
+     "3.03",
+     "3.04",
+     "3.05",
+     "3.06",
+     "3.07",
+     "3.08",
+     "3.09",
+     "3.10",
+     "3.11",
+     "3.12",
+     "3.13",
+     "3.13b1",
+     "3.13rc1",
+     "4.2b1",
+     "4.2b2",
+     "4.2b4",
+     "5.1b1",
+     "5.1b3",
+     "5.1b5",
+     "5.1b7"
+    ]
+   }
+  ],
+  "aliases": [
+   "CVE-2017-18342",
+   "PYSEC-2018-49"
+  ],
+  "id": "GHSA-rprw-h62v-c2w7",
+  "modified": "2026-07-01T17:45:34.796248930Z",
+  "published": "2019-01-04T17:45:26Z",
+  "schema_version": "1.7.5",
+  "severity": [
+   {
+    "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "type": "CVSS_V3"
+   }
+  ],
+  "summary": "PyYAML insecurely deserializes YAML strings leading to arbitrary code execution"
+ },
+ {
+  "affected": [
+   {
+    "package": {
+     "ecosystem": "PyPI",
+     "name": "pyyaml",
+     "purl": "pkg:pypi/pyyaml"
+    },
+    "ranges": [
+     {
+      "events": [
+       {
+        "introduced": "0"
+       },
+       {
+        "fixed": "5.1"
+       }
+      ],
+      "type": "ECOSYSTEM"
+     }
+    ],
+    "versions": [
+     "3.01",
+     "3.02",
+     "3.03",
+     "3.04",
+     "3.05",
+     "3.06",
+     "3.07",
+     "3.08",
+     "3.09",
+     "3.10",
+     "3.11",
+     "3.12",
+     "3.13",
+     "3.13b1",
+     "3.13rc1",
+     "4.2b1",
+     "4.2b2",
+     "4.2b4",
+     "5.1b1",
+     "5.1b3",
+     "5.1b5",
+     "5.1b7"
+    ]
+   }
+  ],
+  "aliases": [
+   "CVE-2017-18342",
+   "GHSA-rprw-h62v-c2w7"
+  ],
+  "id": "PYSEC-2018-49",
+  "modified": "2023-11-08T03:59:15.614863Z",
+  "published": "2018-06-27T12:29:00Z",
+  "schema_version": "1.7.3"
+ },
+ {
+  "affected": [
+   {
+    "package": {
+     "ecosystem": "PyPI",
+     "name": "pyyaml",
+     "purl": "pkg:pypi/pyyaml"
+    },
+    "ranges": [
+     {
+      "events": [
+       {
+        "introduced": "5.1"
+       },
+       {
+        "fixed": "5.2b1"
+       }
+      ],
+      "type": "ECOSYSTEM"
+     }
+    ],
+    "versions": [
+     "5.1",
+     "5.1.1",
+     "5.1.2"
+    ]
+   }
+  ],
+  "aliases": [
+   "CVE-2019-20477",
+   "GHSA-3pqx-4fqf-j49f"
+  ],
+  "id": "PYSEC-2020-176",
+  "modified": "2023-11-08T04:01:30.627114Z",
+  "published": "2020-02-19T04:15:00Z",
+  "schema_version": "1.7.3"
+ },
+ {
+  "affected": [
+   {
+    "package": {
+     "ecosystem": "PyPI",
+     "name": "pyyaml",
+     "purl": "pkg:pypi/pyyaml"
+    },
+    "ranges": [
+     {
+      "events": [
+       {
+        "introduced": "5.1"
+       },
+       {
+        "fixed": "5.3.1"
+       }
+      ],
+      "type": "ECOSYSTEM"
+     }
+    ],
+    "versions": [
+     "5.1",
+     "5.1.1",
+     "5.1.2",
+     "5.2b1",
+     "5.2",
+     "5.3b1",
+     "5.3"
+    ]
+   }
+  ],
+  "aliases": [
+   "CVE-2020-1747",
+   "GHSA-6757-jp84-gxfx"
+  ],
+  "id": "PYSEC-2020-96",
+  "modified": "2026-05-04T08:57:14.897560893Z",
+  "published": "2020-03-24T15:15:00Z",
+  "schema_version": "1.7.5"
+ },
+ {
+  "affected": [
+   {
+    "package": {
+     "ecosystem": "PyPI",
+     "name": "pyyaml",
+     "purl": "pkg:pypi/pyyaml"
+    },
+    "ranges": [
+     {
+      "events": [
+       {
+        "introduced": "0"
+       },
+       {
+        "fixed": "5.4"
+       }
+      ],
+      "type": "ECOSYSTEM"
+     }
+    ],
+    "versions": [
+     "3.01",
+     "3.02",
+     "3.03",
+     "3.04",
+     "3.05",
+     "3.06",
+     "3.07",
+     "3.08",
+     "3.09",
+     "3.10",
+     "3.11",
+     "3.12",
+     "3.13",
+     "3.13b1",
+     "3.13rc1",
+     "4.2b1",
+     "4.2b2",
+     "4.2b4",
+     "5.1",
+     "5.1.1",
+     "5.1.2",
+     "5.1b1",
+     "5.1b3",
+     "5.1b5",
+     "5.1b7",
+     "5.2",
+     "5.2b1",
+     "5.3",
+     "5.3.1",
+     "5.3b1",
+     "5.4b1",
+     "5.4b2"
+    ]
+   }
+  ],
+  "aliases": [
+   "CVE-2020-14343",
+   "GHSA-8q59-q68h-6hv4"
+  ],
+  "id": "PYSEC-2021-142",
+  "modified": "2023-11-08T04:02:26.414885Z",
+  "published": "2021-02-09T21:15:00Z",
+  "schema_version": "1.7.3"
+ }
+]

@@ -20,6 +20,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
 )
@@ -129,6 +130,19 @@ type Config struct {
 	AptSigningName    string   `json:"apt_signing_name,omitempty"`  // UID name on a key made by `bodega apt key generate`
 	AptSigningEmail   string   `json:"apt_signing_email,omitempty"` // UID email on a key made by `bodega apt key generate`
 	AdminPermitCIDR   []string `json:"admin_permit_cidr,omitempty"` // CIDRs allowed to hit mutation API; default ["127.0.0.0/8","::1/128"]
+
+	// OSV gate. osv_db_dir holds the per-ecosystem archives `bodega policy osv
+	// sync` writes and defaults to {storage_path}/osv, so a connected host
+	// needs no configuration and an air-gapped one points the key at wherever
+	// the directory was copied. osv_api_fallback authorizes a live
+	// api.osv.dev query when the local copy cannot answer; it is off by
+	// default because a restricted network should fail visibly rather than
+	// stall for the client timeout once per version. osv_db_max_age is how
+	// old a synced ecosystem may be before a clean answer warns instead of
+	// passing.
+	OSVDBDir       string `json:"osv_db_dir,omitempty"`
+	OSVAPIFallback bool   `json:"osv_api_fallback,omitempty"`
+	OSVDBMaxAge    string `json:"osv_db_max_age,omitempty"`
 
 	// Proxy spool. spool_dir is where an upstream artifact is copied on its
 	// way to storage and the client; see ResolveSpoolDir for the default. The
@@ -573,6 +587,35 @@ func (c *Config) ResolveSpoolDir() string {
 	return filepath.Join(firstNonEmpty(c.StoragePath, DefaultStoragePath), "tmp")
 }
 
+// ResolveOSVDBDir returns the directory the local OSV database lives in.
+// Unset means {storage_path}/osv rather than "no database": the gate should
+// find what `bodega policy osv sync` wrote without a second key being set.
+func (c *Config) ResolveOSVDBDir() string {
+	if c == nil {
+		return ""
+	}
+	if c.OSVDBDir != "" {
+		return c.OSVDBDir
+	}
+	return filepath.Join(firstNonEmpty(c.StoragePath, DefaultStoragePath), "osv")
+}
+
+// ResolveOSVDBMaxAge returns the staleness window for a synced ecosystem, or
+// zero when the key is unset, which leaves the default with the gate that
+// enforces it (policy.DefaultOSVMaxAge) rather than stating it in two places.
+// Load has already refused an unparseable value, so a bad one here can only
+// come from a Config built in code.
+func (c *Config) ResolveOSVDBMaxAge() time.Duration {
+	if c == nil || c.OSVDBMaxAge == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(c.OSVDBMaxAge)
+	if err != nil || d <= 0 {
+		return 0
+	}
+	return d
+}
+
 // spoolCeiling resolves one of the two spool byte ceilings against the file
 // that was actually read. An absent key takes the built-in default; a key
 // written as 0 is an operator turning the ceiling off, and json.Unmarshal
@@ -684,6 +727,15 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	if cfg.SpoolMaxTotalBytes > 0 && cfg.SpoolMaxArtifactBytes > cfg.SpoolMaxTotalBytes {
 		return nil, fmt.Errorf("spool_max_artifact_bytes (%d) is above spool_max_total_bytes (%d): no artifact that large could ever be admitted, so every fetch over the budget would be refused for a reason naming the wrong key",
 			cfg.SpoolMaxArtifactBytes, cfg.SpoolMaxTotalBytes)
+	}
+
+	// osv_db_max_age is read once per admission; a value time.ParseDuration
+	// rejects would otherwise fall back to the default with nothing said, and
+	// the operator would believe a tighter window was in force.
+	if cfg.OSVDBMaxAge != "" {
+		if d, err := time.ParseDuration(cfg.OSVDBMaxAge); err != nil || d <= 0 {
+			return nil, fmt.Errorf("invalid osv_db_max_age %q (want a positive Go duration, e.g. \"168h\")", cfg.OSVDBMaxAge)
+		}
 	}
 
 	// Discover mode: "" or "observe" — typo'd values fail loudly so operators
@@ -1433,6 +1485,11 @@ func defaultConfigContent() []byte {
   "_comment_binary_upstreams_paths": "While this is empty, /binaries/{path...} serves from storage exactly as it always has. Once any entry exists, a request whose first segment names no key here 404s and is recorded as no_namespace instead of falling through to a storage read — including a path that used to resolve. Name a namespace for every tree you still serve locally, or leave the block empty.",
   "_comment_binary_upstreams_auth": "Only public, unauthenticated upstreams are supported. A namespace pointing at a private release endpoint fails as a 404 with no credential prompt, which looks identical to a typo in the path — check the upstream by hand before hunting the path.",
   "binary_upstreams": {},
+
+  "_comment_osv": "osv_db_dir: where 'bodega policy osv sync' writes the OSV database, one archive per ecosystem. Empty means {storage_path}/osv. Admission matches against this directory and reaches no network. On an air-gapped host, sync where the network is, copy the directory over, and point this key at the copy. osv_api_fallback: authorize a live api.osv.dev query when the local copy cannot answer. Off by default — on a restricted network every version would otherwise stall for the client timeout against a host that never answers. osv_db_max_age: how old a synced ecosystem may be before a clean answer warns instead of passing; a Go duration, default 168h.",
+  "osv_db_dir": "",
+  "osv_api_fallback": false,
+  "osv_db_max_age": "168h",
 
   "_comment_discover": "Discover mode: \"\" off, \"observe\" record every upstream request bodega could not answer from its own manifests. It changes no decision: the allow-list, catalog mode, version constraints and the ACLs enforce the same either way. See bodega discover --help.",
   "discover_mode": "",

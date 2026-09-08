@@ -77,6 +77,7 @@ func TestOSVPolicy_NoVulnsPass(t *testing.T) {
 	}}
 	ck := NewOSVChecker(store)
 	ck.Endpoint = srv.URL
+	ck.AllowAPIFallback = true
 
 	r := ck.Check(context.Background(),
 		&manifest.PackageManifest{Name: "pkg", Type: manifest.TypeNpm},
@@ -94,6 +95,7 @@ func TestOSVPolicy_BlockOnVulns(t *testing.T) {
 	}}
 	ck := NewOSVChecker(store)
 	ck.Endpoint = srv.URL
+	ck.AllowAPIFallback = true
 
 	ve := &manifest.VersionEntry{Version: "4.17.4"}
 	r := ck.Check(context.Background(),
@@ -115,6 +117,7 @@ func TestOSVPolicy_WarnDoesNotBlock(t *testing.T) {
 	}}
 	ck := NewOSVChecker(store)
 	ck.Endpoint = srv.URL
+	ck.AllowAPIFallback = true
 
 	ve := &manifest.VersionEntry{Version: "1.0.0"}
 	r := ck.Check(context.Background(),
@@ -165,6 +168,7 @@ func TestOSVPolicy_CargoVulnerableVersion(t *testing.T) {
 	}}
 	ck := NewOSVChecker(store)
 	ck.Endpoint = srv.URL
+	ck.AllowAPIFallback = true
 
 	ve := &manifest.VersionEntry{Version: "0.1.44"}
 	r := ck.Check(context.Background(),
@@ -218,6 +222,7 @@ func TestOSVPolicy_SeverityStampedPerRecord(t *testing.T) {
 	}}
 	ck := NewOSVChecker(store)
 	ck.Endpoint = srv.URL
+	ck.AllowAPIFallback = true
 
 	ve := &manifest.VersionEntry{Version: "1.0.0"}
 	ck.Check(context.Background(),
