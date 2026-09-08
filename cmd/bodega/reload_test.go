@@ -201,9 +201,12 @@ func TestHideWithdrawsFromServedPackages(t *testing.T) {
 	srv := server.New(cfg, srvStore, stores, fmt.Sprintf("127.0.0.1:%d", port), nil)
 	srv.SetQuiet(true)
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- srv.Start(ctx) }()
+	// Waiting for Start to return keeps this server's SIGHUP handler from
+	// reading the host-path globals while a later cleanup restores them.
+	// Cleanups run LIFO, so this one precedes the restore registered above.
+	t.Cleanup(func() { cancel(); <-serveErr })
+	go func() { defer close(serveErr); serveErr <- srv.Start(ctx) }()
 
 	packagesURL := fmt.Sprintf("http://127.0.0.1:%d/apt/dists/noble/main/binary-amd64/Packages", port)
 	if !eventually(t, func() bool { return strings.Contains(httpGet(t, packagesURL), "Package: hello") }) {
@@ -380,9 +383,12 @@ func TestRescanReachesTheServedAPI(t *testing.T) {
 	srv := server.New(cfg, srvStore, stores, fmt.Sprintf("127.0.0.1:%d", port), nil)
 	srv.SetQuiet(true)
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- srv.Start(ctx) }()
+	// Waiting for Start to return keeps this server's SIGHUP handler from
+	// reading the host-path globals while a later cleanup restores them.
+	// Cleanups run LIFO, so this one precedes the restore registered above.
+	t.Cleanup(func() { cancel(); <-serveErr })
+	go func() { defer close(serveErr); serveErr <- srv.Start(ctx) }()
 
 	versionURL := fmt.Sprintf("http://127.0.0.1:%d/api/v1/packages/npm/minimist/1.2.5", port)
 	if !eventually(t, func() bool { return strings.Contains(httpGet(t, versionURL), "2026-01-01") }) {

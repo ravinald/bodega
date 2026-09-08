@@ -555,6 +555,13 @@ func (s *Server) Start(ctx context.Context) error {
 	// built from them.
 	sighupCh := make(chan os.Signal, 1)
 	signal.Notify(sighupCh, syscall.SIGHUP)
+	// Without this the handler goroutine outlives the server it belongs to and
+	// keeps reloading global state on every later SIGHUP, so a process that
+	// stops and restarts a server ends up with several of them racing.
+	defer func() {
+		signal.Stop(sighupCh)
+		close(sighupCh)
+	}()
 	//nolint:gosec // G118: signal handler is server-lifecycle, intentionally decoupled from any request context.
 	go func() {
 		for range sighupCh {
