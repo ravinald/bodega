@@ -47,18 +47,29 @@ func osvVersionOrder(ecosystem string) string {
 // affects reports whether version falls inside an `affected` entry, by the
 // same rule api.osv.dev applies: an enumerated version list is an exact match,
 // and a range is walked event by event in version order.
-func (a osvAffected) affects(order, version string) bool {
+//
+// unorderable names a version string that stopped a range from being walked at
+// all. It is not a match and it is not a clean answer, so the caller reports it
+// instead of counting it either way.
+func (a osvAffected) affects(order, version string) (matched bool, unorderable string) {
 	for _, v := range a.Versions {
-		if v == version || compareVersions(order, v, version) == 0 {
-			return true
+		if v == version {
+			return true, ""
+		}
+		if c, ok := compareVersions(order, v, version); ok && c == 0 {
+			return true, ""
 		}
 	}
 	for _, r := range a.Ranges {
-		if r.affects(order, version) {
-			return true
+		hit, bad := r.affects(order, version)
+		if hit {
+			return true, ""
+		}
+		if bad != "" && unorderable == "" {
+			unorderable = bad
 		}
 	}
-	return false
+	return false, unorderable
 }
 
 // rangeEvent is one event resolved to its version and kind for sorting.
@@ -75,13 +86,22 @@ type rangeEvent struct {
 // take the state of the last event at or below the queried version.
 // introduced/fixed at the same version sort introduced first, so a range that
 // introduces and fixes at one point leaves nothing affected.
-func (r osvRange) affects(order, version string) bool {
+//
+// A bound the ordering cannot place leaves the whole range unevaluated, which
+// is what api.osv.dev does with it: no version of pynetbox matches
+// PYSEC-2024-325, whose last_affected is "4.1.0-NA", not even one well below
+// that bound. Walking such a range on a string comparison instead blocks
+// imports OSV calls clean.
+func (r osvRange) affects(order, version string) (matched bool, unorderable string) {
 	if r.Type == "GIT" {
-		return false
+		return false, ""
 	}
 	rangeOrder := order
 	if r.Type == "SEMVER" {
 		rangeOrder = orderSemver
+	}
+	if !orderable(rangeOrder, version) {
+		return false, version
 	}
 
 	events := make([]rangeEvent, 0, len(r.Events))
@@ -95,11 +115,19 @@ func (r osvRange) affects(order, version string) bool {
 			events = append(events, rangeEvent{e.Fixed, 2, false})
 		}
 	}
+	for _, e := range events {
+		if !e.min && !orderable(rangeOrder, e.version) {
+			return false, e.version
+		}
+	}
+
+	// Every bound and the queried version parse by here, so the comparisons
+	// below cannot report "unordered".
 	sort.SliceStable(events, func(i, j int) bool {
 		if events[i].min != events[j].min {
 			return events[i].min
 		}
-		if c := compareVersions(rangeOrder, events[i].version, events[j].version); c != 0 {
+		if c, _ := compareVersions(rangeOrder, events[i].version, events[j].version); c != 0 {
 			return c < 0
 		}
 		return events[i].kind < events[j].kind
@@ -109,7 +137,7 @@ func (r osvRange) affects(order, version string) bool {
 	for _, e := range events {
 		c := 1
 		if !e.min {
-			c = compareVersions(rangeOrder, version, e.version)
+			c, _ = compareVersions(rangeOrder, version, e.version)
 		}
 		switch e.kind {
 		case 0:
@@ -126,17 +154,26 @@ func (r osvRange) affects(order, version string) bool {
 			}
 		}
 	}
-	return vulnerable
+	return vulnerable, ""
 }
 
-// compareVersions returns -1, 0 or 1. A version neither parser accepts falls
-// back to string comparison, which keeps a malformed range from silently
-// matching everything.
-func compareVersions(order, a, b string) int {
+// compareVersions returns -1, 0 or 1, and whether both operands could be
+// ordered at all. A false second return is not "equal" and not "less": callers
+// have to decide what an unorderable version means to them, because the
+// string comparison this used to fall back to is an ordering only by accident.
+func compareVersions(order, a, b string) (int, bool) {
 	if order == orderPEP440 {
 		return comparePEP440(a, b)
 	}
 	return compareSemver(a, b)
+}
+
+// orderable reports whether an ordering can place a version.
+func orderable(order, v string) bool {
+	if order == orderPEP440 {
+		return parsePEP440(v).ok
+	}
+	return parseSemver(v).ok
 }
 
 type semverVersion struct {
@@ -175,29 +212,29 @@ func parseSemver(v string) semverVersion {
 	return semverVersion{release: release, pre: pre, ok: true}
 }
 
-func compareSemver(a, b string) int {
+func compareSemver(a, b string) (int, bool) {
 	pa, pb := parseSemver(a), parseSemver(b)
 	if !pa.ok || !pb.ok {
-		return strings.Compare(a, b)
+		return 0, false
 	}
 	if c := compareInts(pa.release, pb.release); c != 0 {
-		return c
+		return c, true
 	}
 	// A release outranks any of its prereleases.
 	switch {
 	case len(pa.pre) == 0 && len(pb.pre) == 0:
-		return 0
+		return 0, true
 	case len(pa.pre) == 0:
-		return 1
+		return 1, true
 	case len(pb.pre) == 0:
-		return -1
+		return -1, true
 	}
 	for i := 0; i < len(pa.pre) && i < len(pb.pre); i++ {
 		if c := comparePreIdent(pa.pre[i], pb.pre[i]); c != 0 {
-			return c
+			return c, true
 		}
 	}
-	return compareInt(len(pa.pre), len(pb.pre))
+	return compareInt(len(pa.pre), len(pb.pre)), true
 }
 
 // comparePreIdent orders two prerelease identifiers: numeric ones compare
@@ -305,43 +342,43 @@ func normalizePreLetter(l string) string {
 	return l
 }
 
-func comparePEP440(a, b string) int {
+func comparePEP440(a, b string) (int, bool) {
 	pa, pb := parsePEP440(a), parsePEP440(b)
 	if !pa.ok || !pb.ok {
-		return strings.Compare(a, b)
+		return 0, false
 	}
 	if c := compareInt(pa.epoch, pb.epoch); c != 0 {
-		return c
+		return c, true
 	}
 	if c := compareInts(pa.release, pb.release); c != 0 {
-		return c
+		return c, true
 	}
 	if c := compareInt(pa.preRank, pb.preRank); c != 0 {
-		return c
+		return c, true
 	}
 	if pa.preRank == 0 {
 		if c := strings.Compare(pa.preLtr, pb.preLtr); c != 0 {
-			return c
+			return c, true
 		}
 		if c := compareInt(pa.preNum, pb.preNum); c != 0 {
-			return c
+			return c, true
 		}
 	}
 	if c := compareInt(pa.postRank, pb.postRank); c != 0 {
-		return c
+		return c, true
 	}
 	if pa.postRank == 0 {
 		if c := compareInt(pa.postNum, pb.postNum); c != 0 {
-			return c
+			return c, true
 		}
 	}
 	if c := compareInt(pa.devRank, pb.devRank); c != 0 {
-		return c
+		return c, true
 	}
 	if pa.devRank == 0 {
-		return compareInt(pa.devNum, pb.devNum)
+		return compareInt(pa.devNum, pb.devNum), true
 	}
-	return 0
+	return 0, true
 }
 
 // compareInts compares release segments, treating a missing trailing segment

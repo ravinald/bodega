@@ -610,6 +610,8 @@ Wrote /var/lib/bodega/osv
 
 Name ecosystems to sync a subset (`bodega policy osv sync npm pypi`). Each archive is written under a temporary name and renamed, so an interrupted sync leaves the previous copy in place rather than a half-written one the gate would read as truth.
 
+An export that distills to no packages fails that ecosystem's row and writes nothing. Otherwise it would land a database with a current fetch time, and every version in the ecosystem would read clean for the whole `osv_db_max_age` window: `RECORDS 0` shows once in this table and never again.
+
 The numbers are the distilled database, not the download: OSV's npm export is 222 MB of JSON, and what lands on disk is 3.8 MB because sync keeps the ids, summaries, severities and affected ranges and drops the prose. A full sync of all four ecosystems takes about 15 seconds on a home connection and the whole directory is around 5.5 MB.
 
 #### Air-gapped
@@ -679,13 +681,25 @@ Earlier versions wrote that row, printed `Set helm OSV policy: block`, and then 
 
 #### Matching
 
-The local matcher implements OSV's own evaluation: an enumerated `versions` list matches exactly, and a range is walked event by event in version order, under semver for npm, Go and crates.io and PEP 440 for PyPI. Measured against `api.osv.dev` over 395 sampled `(package, version)` pairs across the four ecosystems, it agrees on 392.
+The local matcher implements OSV's own evaluation: an enumerated `versions` list matches exactly, and a range is walked event by event in version order, under semver for npm, Go and crates.io and PEP 440 for PyPI. Measured against `api.osv.dev` over 240 range-boundary `(package, version)` pairs drawn across the four ecosystems, it agrees on all 240.
 
 An ecosystem is decompressed on the first version checked against it and held until `sync` replaces the archive, so a bulk import pays one decompression rather than one round trip per version. One process shares that copy across every package it admits: importing 100 npm packages at 4 versions each against the 2026-09 export takes 0.5s. What it holds, measured on the same exports: npm 85 MB, PyPI 47 MB, gomod 6 MB, cargo 1.5 MB. An ecosystem with no policy row is never loaded.
 
 A running server picks up a sync without a restart: it checks the archive it loaded from on each match and reloads when the file changes. `sync` is a separate process from the server enforcing the gate, so without that check the server would report the fresh fetch time under `bodega policy osv list` while still matching against the copy it loaded before the sync.
 
-The three disagreements are one deliberate divergence: **withdrawn advisories are dropped at sync**, and the API still returns some of them (PYSEC-2024-115, retracted in July 2026, comes back on a `langchain-community` query while other withdrawn records do not). A retracted advisory blocking an import is a false positive the operator has no way to clear.
+Two classes of record it does not answer the way `api.osv.dev` does.
+
+**Withdrawn advisories are dropped at sync.** The API still returns some of them (PYSEC-2024-115, retracted in July 2026, comes back on a `langchain-community` query while other withdrawn records do not). A retracted advisory blocking an import is a false positive the operator has no way to clear.
+
+**A range bound no ordering can place leaves that range unevaluated.** OSV carries 46 of them across the four exports as of 2026-09-08, in 15 packages: `4.1.0-NA` bounding `pynetbox`, `2.6.0-cu124` bounding `torch`, `0.8.3ubuntu7.5` bounding `python-apt`, `9.6.0b1` bounding `github.com/redis/go-redis/v9`. Such a record neither matches nor clears. The gate names it instead, so a version never reports clean on a record nobody could read:
+
+```
+$ bodega pkg import pynetbox.json
+pypi/pynetbox: 4.1.0: osv: 1 OSV record(s) for pynetbox were not evaluated against 4.1.0: PYSEC-2024-325 (bound "4.1.0-NA")
+Imported pypi/pynetbox (1 version(s))
+```
+
+A version matching other records blocks on those and carries the unevaluated ids in the same reason, capped at five ids plus a count. `api.osv.dev` is not consistent on this population: over 130 probes at published versions across those 15 packages it agreed 123 times, returning nothing for the record exactly as the local matcher does. The other 7 are the API failing open on a bound it also cannot place, returning GHSA-jqqh-999x-w26w, fixed in `buildbot` 0.7.11p3 in 2007, for `buildbot@4.3.0`. Reproducing that would mean shipping a block no operator can clear, so the matcher reports the record and declines to guess. Turn `osv_api_fallback` on to see what the API says about one.
 
 A version with OSV records is stamped on its `VersionEntry.Metadata`, so the finding follows the version into the manifest rather than living only in the audit event:
 

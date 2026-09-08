@@ -440,5 +440,42 @@
   "modified": "2023-11-08T04:02:26.414885Z",
   "published": "2021-02-09T21:15:00Z",
   "schema_version": "1.7.3"
+ },
+ {
+  "affected": [
+   {
+    "package": {
+     "ecosystem": "PyPI",
+     "name": "pynetbox",
+     "purl": "pkg:pypi/pynetbox"
+    },
+    "ranges": [
+     {
+      "events": [
+       {
+        "introduced": "0"
+       },
+       {
+        "last_affected": "4.1.0-NA"
+       }
+      ],
+      "type": "ECOSYSTEM"
+     }
+    ]
+   }
+  ],
+  "aliases": [
+   "CVE-2024-47226"
+  ],
+  "id": "PYSEC-2024-325",
+  "modified": "2026-07-13T07:15:41.279397016Z",
+  "published": "2024-09-22T02:15:02.797Z",
+  "schema_version": "1.7.5",
+  "severity": [
+   {
+    "score": "CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:C/C:L/I:L/A:N",
+    "type": "CVSS_V3"
+   }
+  ]
  }
 ]

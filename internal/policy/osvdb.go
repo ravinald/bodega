@@ -227,27 +227,45 @@ func (d *OSVDatabase) Meta(ecosystem string) (OSVDBMeta, error) {
 }
 
 // Match returns the records covering one (ecosystem, name, version), the same
-// answer POST /v1/query gives for the same triple.
-func (d *OSVDatabase) Match(ecosystem, name, version string) ([]osvVuln, error) {
+// answer POST /v1/query gives for the same triple, plus the records that name
+// the package and could not be evaluated against it.
+//
+// A skipped record is neither a hit nor a clean answer. OSV publishes a small
+// number of range bounds no ordering can place ("4.1.0-NA", "2.6.0-cu124",
+// "0.8.3ubuntu7.5"), and api.osv.dev drops those ranges silently; the caller
+// reports them instead, because a record naming this exact package that
+// nothing evaluated is what a pass would be hiding.
+func (d *OSVDatabase) Match(ecosystem, name, version string) (vulns []osvVuln, skipped []string, err error) {
 	if d == nil {
-		return nil, ErrOSVDBMissing
+		return nil, nil, ErrOSVDBMissing
 	}
 	idx, err := d.index(ecosystem)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	order := osvVersionOrder(ecosystem)
-	var out []osvVuln
 	for _, rec := range idx.Packages[osvPackageKey(ecosystem, name)] {
+		hit, unorderable := false, ""
 		for _, aff := range rec.Affected {
-			if aff.affects(order, version) {
-				out = append(out, osvVuln{ID: rec.ID, Summary: rec.Summary, Severity: rec.Severity})
+			matched, bad := aff.affects(order, version)
+			if matched {
+				hit = true
 				break
 			}
+			if bad != "" && unorderable == "" {
+				unorderable = bad
+			}
+		}
+		switch {
+		case hit:
+			vulns = append(vulns, osvVuln{ID: rec.ID, Summary: rec.Summary, Severity: rec.Severity})
+		case unorderable != "":
+			skipped = append(skipped, fmt.Sprintf("%s (bound %q)", rec.ID, unorderable))
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out, nil
+	sort.Slice(vulns, func(i, j int) bool { return vulns[i].ID < vulns[j].ID })
+	sort.Strings(skipped)
+	return vulns, skipped, nil
 }
 
 func (d *OSVDatabase) index(ecosystem string) (*osvIndex, error) {
@@ -405,6 +423,15 @@ func distill(ecosystem, zipPath string) (*osvIndex, int, error) {
 				ID: raw.ID, Summary: raw.Summary, Severity: raw.Severity, Affected: affected,
 			})
 		}
+	}
+	// An export that distills to nothing would be written with a current fetch
+	// time, and the gate would then report every version of every package in
+	// the ecosystem clean, inside the max-age window, forever. That is the one
+	// failure shape the warn-on-missing rule exists to prevent, so a sync that
+	// produced no index fails instead of replacing a working copy.
+	if len(idx.Packages) == 0 {
+		return nil, 0, fmt.Errorf("the %s export yielded no packages (%d file(s) in the archive, %d advisory record(s)); refusing to write a database that would report every version clean",
+			ecosystem, len(zr.File), records)
 	}
 	return idx, records, nil
 }

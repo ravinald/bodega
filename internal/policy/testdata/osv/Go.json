@@ -4,6 +4,88 @@
    {
     "package": {
      "ecosystem": "Go",
+     "name": "github.com/redis/go-redis/v9",
+     "purl": "pkg:golang/github.com/redis/go-redis/v9"
+    },
+    "ranges": [
+     {
+      "events": [
+       {
+        "introduced": "9.7.0-beta.1"
+       },
+       {
+        "fixed": "9.7.3"
+       }
+      ],
+      "type": "SEMVER"
+     }
+    ]
+   },
+   {
+    "package": {
+     "ecosystem": "Go",
+     "name": "github.com/redis/go-redis/v9",
+     "purl": "pkg:golang/github.com/redis/go-redis/v9"
+    },
+    "ranges": [
+     {
+      "events": [
+       {
+        "introduced": "9.6.0b1"
+       },
+       {
+        "fixed": "9.6.3"
+       }
+      ],
+      "type": "ECOSYSTEM"
+     }
+    ]
+   },
+   {
+    "package": {
+     "ecosystem": "Go",
+     "name": "github.com/redis/go-redis/v9",
+     "purl": "pkg:golang/github.com/redis/go-redis/v9"
+    },
+    "ranges": [
+     {
+      "events": [
+       {
+        "introduced": "9.5.1"
+       },
+       {
+        "fixed": "9.5.5"
+       }
+      ],
+      "type": "SEMVER"
+     }
+    ]
+   }
+  ],
+  "aliases": [
+   "CVE-2025-29923",
+   "GO-2025-3540"
+  ],
+  "id": "GHSA-92cp-5422-2mw7",
+  "modified": "2026-09-02T21:30:06.524228928Z",
+  "published": "2025-03-20T18:49:59Z",
+  "related": [
+   "CGA-rgfh-76wx-p645"
+  ],
+  "schema_version": "1.9.0",
+  "severity": [
+   {
+    "score": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:L/A:N",
+    "type": "CVSS_V3"
+   }
+  ],
+  "summary": "go-redis allows potential out of order responses when `CLIENT SETINFO` times out during connection establishment"
+ },
+ {
+  "affected": [
+   {
+    "package": {
+     "ecosystem": "Go",
      "name": "github.com/gogo/protobuf",
      "purl": "pkg:golang/github.com/gogo/protobuf"
     },

@@ -162,14 +162,15 @@ func (c *OSVChecker) lookup(ctx context.Context, osvEco, name, version string) o
 	unusable := ""
 	switch meta, err := c.LocalDB.Meta(osvEco); {
 	case err == nil:
-		vulns, matchErr := c.LocalDB.Match(osvEco, name, version)
+		vulns, skipped, matchErr := c.LocalDB.Match(osvEco, name, version)
 		if matchErr != nil {
 			unusable = fmt.Sprintf("local OSV database for %s is unreadable (%v); run `bodega policy osv sync`", osvEco, matchErr)
 			break
 		}
+		degraded := unevaluatedReason(name, version, skipped)
 		age := meta.Age(c.now())
 		if age <= c.maxAge() {
-			return osvAnswer{vulns: vulns}
+			return osvAnswer{vulns: vulns, degraded: degraded}
 		}
 		stale := fmt.Sprintf("local OSV database for %s is %s old (synced %s); run `bodega policy osv sync`",
 			osvEco, ShortDuration(age), meta.FetchedAt.UTC().Format(time.RFC3339))
@@ -177,6 +178,9 @@ func (c *OSVChecker) lookup(ctx context.Context, osvEco, name, version string) o
 			if fresh, apiErr := c.query(ctx, osvEco, name, version); apiErr == nil {
 				return osvAnswer{vulns: fresh}
 			}
+		}
+		if degraded != "" {
+			stale += "; " + degraded
 		}
 		return osvAnswer{vulns: vulns, degraded: stale}
 	case errors.Is(err, ErrOSVDBMissing):
@@ -198,6 +202,30 @@ func (c *OSVChecker) lookup(ctx context.Context, osvEco, name, version string) o
 	}
 	return osvAnswer{vulns: vulns}
 }
+
+// unevaluatedReason names the records that mention the package but carry a
+// version bound no ordering can place, so a version they might cover never
+// reports clean without the operator being told which records nobody read.
+// api.osv.dev drops the same ranges and says nothing, which is why the reason
+// carries the bound: it is upstream data, not a local misconfiguration, and
+// the only way to settle it is to read the record.
+func unevaluatedReason(name, version string, skipped []string) string {
+	if len(skipped) == 0 {
+		return ""
+	}
+	shown, extra := skipped, ""
+	if len(shown) > osvSkipListLimit {
+		extra = fmt.Sprintf(" and %d more", len(shown)-osvSkipListLimit)
+		shown = shown[:osvSkipListLimit]
+	}
+	return fmt.Sprintf("%d OSV record(s) for %s were not evaluated against %s: %s%s",
+		len(skipped), name, version, strings.Join(shown, ", "), extra)
+}
+
+// osvSkipListLimit caps the ids one reason carries. A package whose own
+// version string cannot be ordered skips every record naming it, and torch
+// alone carries 30-odd.
+const osvSkipListLimit = 5
 
 func (c *OSVChecker) now() time.Time {
 	if c.Now != nil {

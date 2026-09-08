@@ -34,7 +34,7 @@ func TestOSVLiveAgreement(t *testing.T) {
 		}
 		ck := NewOSVChecker(nil)
 		for _, version := range []string{tc.vulnerable, tc.clean} {
-			local, err := db.Match(tc.ecosystem, tc.pkg, version)
+			local, _, err := db.Match(tc.ecosystem, tc.pkg, version)
 			if err != nil {
 				t.Fatalf("%s match: %v", tc.ecosystem, err)
 			}

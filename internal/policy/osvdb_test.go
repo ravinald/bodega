@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -147,7 +148,7 @@ func TestOSVDatabase_MissingEcosystemIsNotEmpty(t *testing.T) {
 	if _, err := db.Meta("npm"); !errors.Is(err, ErrOSVDBMissing) {
 		t.Errorf("unsynced ecosystem must report missing, got %v", err)
 	}
-	if _, err := db.Match("npm", "lodash", "4.17.4"); !errors.Is(err, ErrOSVDBMissing) {
+	if _, _, err := db.Match("npm", "lodash", "4.17.4"); !errors.Is(err, ErrOSVDBMissing) {
 		t.Errorf("unsynced ecosystem must not answer 'no vulns', got %v", err)
 	}
 }
@@ -158,7 +159,7 @@ func TestOSVDatabase_MissingEcosystemIsNotEmpty(t *testing.T) {
 func TestOSVMatcher_AgreesWithAPI(t *testing.T) {
 	db := syncedDB(t)
 	for _, tc := range osvAgreementCases {
-		vulns, err := db.Match(tc.ecosystem, tc.pkg, tc.vulnerable)
+		vulns, _, err := db.Match(tc.ecosystem, tc.pkg, tc.vulnerable)
 		if err != nil {
 			t.Fatalf("%s match: %v", tc.ecosystem, err)
 		}
@@ -173,7 +174,7 @@ func TestOSVMatcher_AgreesWithAPI(t *testing.T) {
 				break
 			}
 		}
-		clean, err := db.Match(tc.ecosystem, tc.pkg, tc.clean)
+		clean, _, err := db.Match(tc.ecosystem, tc.pkg, tc.clean)
 		if err != nil {
 			t.Fatalf("%s match: %v", tc.ecosystem, err)
 		}
@@ -350,7 +351,12 @@ func TestOSVRange_IntroducedZeroCoversPrereleases(t *testing.T) {
 		{"release after the fix", fixed, "136.1", false},
 	}
 	for _, tc := range cases {
-		if got := tc.r.affects(orderSemver, tc.version); got != tc.want {
+		got, unorderable := tc.r.affects(orderSemver, tc.version)
+		if unorderable != "" {
+			t.Errorf("%s: affects(%q) could not order %q", tc.name, tc.version, unorderable)
+			continue
+		}
+		if got != tc.want {
 			t.Errorf("%s: affects(%q) = %v, want %v", tc.name, tc.version, got, tc.want)
 		}
 	}
@@ -421,7 +427,7 @@ func TestOSVDatabase_ReloadsAfterOutOfProcessSync(t *testing.T) {
 		t.Fatalf("first sync: %v", err)
 	}
 
-	got, err := serving.Match("npm", "lodash", "4.17.4")
+	got, _, err := serving.Match("npm", "lodash", "4.17.4")
 	if err != nil {
 		t.Fatalf("match: %v", err)
 	}
@@ -446,7 +452,7 @@ func TestOSVDatabase_ReloadsAfterOutOfProcessSync(t *testing.T) {
 		t.Fatalf("second sync: %v", err)
 	}
 
-	got, err = serving.Match("npm", "lodash", "4.17.4")
+	got, _, err = serving.Match("npm", "lodash", "4.17.4")
 	if err != nil {
 		t.Fatalf("match after sync: %v", err)
 	}
@@ -462,5 +468,107 @@ func TestSharedOSVDatabase(t *testing.T) {
 	}
 	if SharedOSVDatabase("  ") != nil {
 		t.Error("an unconfigured directory must read as no local database, not an empty one")
+	}
+}
+
+// TestOSVMatcher_UnorderableBoundIsSkippedNotMatched pins the two halves of
+// the rule against records OSV publishes today. PYSEC-2024-325 bounds pynetbox
+// with "4.1.0-NA", which no ordering can place; comparing it as a string put
+// every 4.1.0 below the bound and blocked an import api.osv.dev answers with
+// no records at all. GHSA-92cp-5422-2mw7 carries one such range beside two
+// well-formed ones, so it also proves the bad range does not cost the good
+// ones their match.
+func TestOSVMatcher_UnorderableBoundIsSkippedNotMatched(t *testing.T) {
+	db := syncedDB(t)
+	cases := []struct {
+		eco, pkg, version string
+		wantIDs           []string
+		wantSkip          string
+	}{
+		{"PyPI", "pynetbox", "4.1.0", nil, `PYSEC-2024-325 (bound "4.1.0-NA")`},
+		{"PyPI", "pynetbox", "3.0.0", nil, `PYSEC-2024-325 (bound "4.1.0-NA")`},
+		{"Go", "github.com/redis/go-redis/v9", "9.5.2", []string{"GHSA-92cp-5422-2mw7"}, ""},
+		{"Go", "github.com/redis/go-redis/v9", "9.7.1", []string{"GHSA-92cp-5422-2mw7"}, ""},
+		{"Go", "github.com/redis/go-redis/v9", "9.6.1", nil, `GHSA-92cp-5422-2mw7 (bound "9.6.0b1")`},
+	}
+	for _, tc := range cases {
+		vulns, skipped, err := db.Match(tc.eco, tc.pkg, tc.version)
+		if err != nil {
+			t.Fatalf("%s %s@%s: %v", tc.eco, tc.pkg, tc.version, err)
+		}
+		if got := strings.Join(vulnIDs(vulns), ","); got != strings.Join(tc.wantIDs, ",") {
+			t.Errorf("%s %s@%s matched %q, api.osv.dev returns %q", tc.eco, tc.pkg, tc.version, got, tc.wantIDs)
+		}
+		if got := strings.Join(skipped, ","); got != tc.wantSkip {
+			t.Errorf("%s %s@%s skipped %q, want %q", tc.eco, tc.pkg, tc.version, got, tc.wantSkip)
+		}
+	}
+}
+
+// TestOSVChecker_UnevaluatedRecordWarnsInsteadOfPassing is the R4 shape for a
+// record nothing could read: pynetbox has no matching advisory and one that
+// went unevaluated, so the gate reports the id and the bound rather than a
+// clean version.
+func TestOSVChecker_UnevaluatedRecordWarnsInsteadOfPassing(t *testing.T) {
+	store := &fakeOSVStore{policies: map[string]audit.OSVPolicy{
+		manifest.TypePypi: {Ecosystem: manifest.TypePypi, Action: ActionBlock},
+	}}
+	ck := NewOSVChecker(store)
+	ck.LocalDB = syncedDB(t)
+	ck.Endpoint = "http://127.0.0.1:0/never"
+
+	r := ck.Check(context.Background(),
+		&manifest.PackageManifest{Name: "pynetbox", Type: manifest.TypePypi},
+		&manifest.VersionEntry{Version: "4.1.0"})
+	if r.Action != ActionWarn {
+		t.Fatalf("an unevaluated record must warn, not %q: %+v", r.Action, r)
+	}
+	if !contains(r.Reason, "PYSEC-2024-325") || !contains(r.Reason, "4.1.0-NA") {
+		t.Errorf("reason must name the record and the bound nobody could order: %q", r.Reason)
+	}
+}
+
+// TestOSVDatabase_SyncRefusesEmptyExport covers the one way a sync can leave
+// the gate blind while reporting itself current: an export that distills to
+// nothing writes a fetch time the max-age window then accepts, and every
+// version in the ecosystem reads clean until someone notices the record count.
+func TestOSVDatabase_SyncRefusesEmptyExport(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+		f, err := zw.Create("README")
+		if err != nil {
+			t.Errorf("zip create: %v", err)
+			return
+		}
+		_, _ = f.Write([]byte("no advisories here"))
+		if err := zw.Close(); err != nil {
+			t.Errorf("zip close: %v", err)
+			return
+		}
+		_, _ = w.Write(buf.Bytes())
+	}))
+	defer srv.Close()
+
+	db := NewOSVDatabase(t.TempDir())
+	db.ExportBase = srv.URL
+	if _, err := db.Sync(context.Background(), "npm"); err == nil {
+		t.Fatal("an export holding no advisories must fail the sync, not write an empty database")
+	}
+	if _, err := db.Meta("npm"); !errors.Is(err, ErrOSVDBMissing) {
+		t.Errorf("a refused sync must leave the ecosystem unsynced, got %v", err)
+	}
+
+	store := &fakeOSVStore{policies: map[string]audit.OSVPolicy{
+		manifest.TypeNpm: {Ecosystem: manifest.TypeNpm, Action: ActionBlock},
+	}}
+	ck := NewOSVChecker(store)
+	ck.LocalDB = db
+	ck.Endpoint = "http://127.0.0.1:0/never"
+	r := ck.Check(context.Background(),
+		&manifest.PackageManifest{Name: "minimist", Type: manifest.TypeNpm},
+		&manifest.VersionEntry{Version: "1.2.0"})
+	if r.Action != ActionWarn {
+		t.Fatalf("a refused sync must leave the gate warning, not %q: %+v", r.Action, r)
 	}
 }
