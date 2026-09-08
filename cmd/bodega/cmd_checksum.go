@@ -6,6 +6,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 func newChecksumCmd(gf *globalFlags) *cobra.Command {
@@ -65,12 +66,19 @@ func newChecksumListCmd(gf *globalFlags) *cobra.Command {
 			fmt.Println("---")
 
 			for _, cs := range checksums {
+				// A cleared row keeps its identity and loses its digest. An
+				// empty column reads as a display bug; the word says the row is
+				// doing its other job, holding the artifact's provenance.
+				value := cs.Value
+				if value == "" {
+					value = "(cleared)"
+				}
 				fmt.Printf("%-8s %-40s %-10s %-8s %-64s %s\n",
 					cs.PkgType,
 					truncate(cs.PkgName, 40),
 					cs.PkgVersion,
 					cs.Algorithm,
-					cs.Value,
+					value,
 					cs.Source,
 				)
 			}
@@ -91,8 +99,12 @@ func newChecksumClearCmd(gf *globalFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "clear <type> <name>",
 		Short: "Clear cached checksums for a package",
-		Long: `clear removes cached checksums for the specified package.
-The next fetch will re-compute and store a fresh checksum.`,
+		Long: `clear blanks the cached digests for the specified package.
+The next fetch re-computes and stores a fresh checksum.
+
+The row itself is kept. For apt it is also the record that tells a .deb the
+mirror cached from one bodega built, and deleting it would republish the
+archive's bytes under bodega's own signature.`,
 		Example: `  bodega pkg checksum clear gomod github.com/aws/aws-sdk-go-v2
   bodega pkg checksum clear npm lodash`,
 		Args: cobra.ExactArgs(2),
@@ -106,11 +118,16 @@ The next fetch will re-compute and store a fresh checksum.`,
 
 			db, err := audit.Open(cfg.AuditDB)
 			if err != nil {
-				return fmt.Errorf("open audit db: %w", err)
+				return fmt.Errorf("open audit db %s: %w; the digest lives there, so clear it on the host that serves this instance", cfg.AuditDB, err)
 			}
 			defer db.Close()
 
 			ctx := backgroundCtx()
+
+			if pkgType == manifest.TypeApt {
+				fmt.Fprintln(cmd.OutOrStdout(),
+					"apt: the digest goes, the row stays. Cached upstream .debs stay out of the index; the next fetch stores a fresh digest.")
+			}
 
 			if version != "" {
 				// Clear specific version — need to find the S3 key.
@@ -124,24 +141,29 @@ The next fetch will re-compute and store a fresh checksum.`,
 						if err := db.ClearChecksum(ctx, cs.S3Key); err != nil {
 							return err
 						}
-						fmt.Fprintf(cmd.OutOrStdout(), "Cleared checksum for %s/%s@%s\n", pkgType, pkgName, version)
+						fmt.Fprintf(cmd.OutOrStdout(), "Cleared checksum for %s/%s@%s; the next fetch recomputes it.\n", pkgType, pkgName, version)
 						found = true
 					}
 				}
 				if !found {
-					return fmt.Errorf("no checksum found for %s/%s@%s", pkgType, pkgName, version)
+					return fmt.Errorf("no checksum found for %s/%s@%s: nothing was cleared, and the 502 you are chasing is not a stale digest for this version; run `bodega pkg checksum list --type %s --name %s` for the versions that do have one",
+						pkgType, pkgName, version, pkgType, pkgName)
 				}
 			} else {
 				// Clear all versions.
-				n, err := db.ClearChecksumsByPackage(ctx, pkgType, pkgName)
+				cleared, matched, err := db.ClearChecksumsByPackage(ctx, pkgType, pkgName)
 				if err != nil {
-					return err
+					return fmt.Errorf("clear checksums for %s/%s: %w; the digests are unchanged, so a re-fetch still answers 502", pkgType, pkgName, err)
 				}
-				if n == 0 {
-					fmt.Fprintf(cmd.OutOrStdout(), "No cached checksums matched %s/%s; nothing was cleared.\n", pkgType, pkgName)
-					return nil
+				switch {
+				case matched == 0:
+					fmt.Fprintf(cmd.OutOrStdout(), "No cached checksums matched %s/%s; nothing was cleared. Run `bodega pkg checksum list --type %s` for the names this instance recorded.\n", pkgType, pkgName, pkgType)
+				case cleared == 0:
+					fmt.Fprintf(cmd.OutOrStdout(), "%d row(s) for %s/%s already carry no digest; nothing was cleared. A 502 that survives this is not a stale checksum.\n", matched, pkgType, pkgName)
+				default:
+					fmt.Fprintf(cmd.OutOrStdout(), "Cleared %d checksum(s) for %s/%s; the next fetch recomputes them.\n", cleared, pkgType, pkgName)
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "Cleared %d checksum(s) for %s/%s\n", n, pkgType, pkgName)
+				return nil
 			}
 
 			return nil

@@ -450,15 +450,24 @@ Lists cached SHA-256 checksums stored in the audit database.
 
 ### `bodega pkg checksum clear <type> <name> [--version VER]`
 
-Clears cached checksums for a package. The next fetch will recompute and store a fresh checksum. Use `--version` to clear only a specific version.
+Clears cached checksums for a package. The next fetch recomputes and stores a fresh checksum. Use `--version` to clear only a specific version.
 
-The command prints how many rows it deleted, and says nothing matched when the filter found no rows. `<type>` and `<name>` are matched against the identity the proxy derived from the object key when it cached the artifact, which is what `bodega pkg checksum list` shows in its `TYPE` and `NAME` columns.
+**The digest goes; the row stays.** For apt that row is also the record that tells a `.deb` the mirror cached from one bodega built, and the cached artifact sits in `pool/` long after its digest is cleared. Deleting the row would drop the artifact out of the mirrored-pool exclusion set while it is still there to be matched by filename, and the next rebuild would publish upstream bytes with no `SHA256` under bodega's own archive key. So a clear blanks the value and leaves the row where the index can still read it; the command says so before it acts.
+
+Clearing twice is not an error and does not report a second removal — a 502 that survives the first clear is not a stale digest, and the output separates that from a package name spelled wrong.
+
+`<type>` and `<name>` are matched against the identity the proxy derived from the object key when it cached the artifact, which is what `bodega pkg checksum list` shows in its `TYPE` and `NAME` columns. A cleared row shows `(cleared)` in that listing's `CHECKSUM` column.
 
 ```console
 $ bodega pkg checksum clear apt nginx
-Cleared 3 checksum(s) for apt/nginx
+apt: the digest goes, the row stays. Cached upstream .debs stay out of the index; the next fetch stores a fresh digest.
+Cleared 3 checksum(s) for apt/nginx; the next fetch recomputes them.
 $ bodega pkg checksum clear apt nginx
-No cached checksums matched apt/nginx; nothing was cleared.
+apt: the digest goes, the row stays. Cached upstream .debs stay out of the index; the next fetch stores a fresh digest.
+3 row(s) for apt/nginx already carry no digest; nothing was cleared. A 502 that survives this is not a stale checksum.
+$ bodega pkg checksum clear apt ngnix
+apt: the digest goes, the row stays. Cached upstream .debs stay out of the index; the next fetch stores a fresh digest.
+No cached checksums matched apt/ngnix; nothing was cleared. Run `bodega pkg checksum list --type apt` for the names this instance recorded.
 ```
 
 ### `bodega token generate <label> [expiry <duration|date|never>] [comment]`
@@ -1731,16 +1740,17 @@ A mutation-API rebuild runs on a background context rather than the request's. T
 
 `Release` carries `Date` backdated 24 hours to tolerate client clock skew, and `Valid-Until` 14 days after that. The expiry is stamped when the snapshot is built and does not move on its own, which is why the refresh ticker is not an optimization: a server whose refresh loop stops eventually serves an expired `Release`, and every client fails `apt update` at once — including with `[trusted=yes]`, since `Acquire::Check-Valid-Until` is independent of trust. Within 24 hours of expiry the server logs at `WARN` on every `Release` fetch.
 
-Four cases drop an entry from the index silently, and the client sees `Unable to locate package` for all four, which is also what a typo produces. Each is logged at `WARN` once per rebuild:
+Five cases drop an entry from the index silently, and the client sees `Unable to locate package` for all five, which is also what a typo produces. Each is logged at `WARN` once per rebuild:
 
 - The entry names suites, none of which is in `apt_suites`. This one also appears in `GET /api/v1/status` as `apt.unserved`, so an operator holding the API can tell a missing package from a misspelled one without reading the server's log. A suite name no configuration could ever serve (one containing `/`, which `apt_suites` rejects at load) is refused at the write instead, by both `POST /api/v1/packages/apt` and `bodega pkg import`.
 - The entry has no `version`. No CLI verb can address a versionless entry, so publishing one hands clients a package nobody can withdraw. `POST /api/v1/packages/apt`, `bodega pkg import` and `bodega pkg edit` refuse to write one; `bodega repair` clears the ones already in a manifest.
 - The entry has no `Architecture` in its metadata. deb822 has no default architecture, so there is nothing to substitute; set it with `bodega pkg edit` or re-run the build.
 - The entry has no `_pool_path` and no `.deb` in the pool matches its name, version and architecture. Ordinarily this is the gap between `bodega pkg create` and the upload that follows.
+- The entry matched a pool object by filename, carries no `SHA256`, and this instance's `pool/` has held upstream bytes — a checksum row records a mirrored fetch, or `apt_upstreams` is set. A filename match is not evidence of provenance there, and a stanza with no digest leaves the client nothing to check the substitution against. Record the digest with `bodega pkg edit`, or re-run `bodega build package` so the entry carries `_pool_path` and `_sha256` together. On an instance that has never mirrored, an out-of-band upload with no digest still publishes.
 
 An entry that records `_pool_path` addresses its pool object directly, so an index whose entries all carry one is built without listing the pool at all. A listing is taken only for the entries that need the filename match, cached for `metadata_ttl`, and re-taken when the cached one leaves any of them unresolved — but no more often than every 15 seconds. The two bounds answer opposite failures. Without the re-take, a `.deb` uploaded out of band stays out of the index for the whole `metadata_ttl` and stays out silently. Without the floor under it, an entry staged before its `.deb` is uploaded holds the index in the unresolved state indefinitely, and every apt write then pays for a full walk of the pool on every configured backend: one listing per write for the length of a bulk import.
 
-The filename match is exact — `<package>_<version>_<architecture>.deb` and nothing looser — and objects the mirror cached are excluded from it. Both matter on any instance that has ever mirrored: `pool/` then holds `.deb`s bodega did not build, an entry without `_pool_path` publishes no `SHA256` (that field comes from the same metadata `_pool_path` does), and a client has nothing to check the substitution against. Bodega tells the two apart by the audit checksum table, which holds a row per mirrored fetch, and consults it on every rebuild that has an entry to resolve by filename. **Removing `apt_upstreams` does not make the exclusion unnecessary.** Retiring mirroring leaves every cached upstream `.deb` in `pool/` and every checksum row in the database; an index built from the config alone would republish those bytes under bodega's own signature the next time the snapshot was rebuilt. Clear them with `bodega pkg checksum clear apt <name>` only alongside deleting the objects themselves — the row is what keeps the artifact out of the index. On a mirroring instance whose audit database cannot be read, no entry without `_pool_path` reaches the index at all and the rebuild says so at `WARN`; entries that carry `_pool_path` are unaffected, so the repository keeps serving.
+The filename match is exact — `<package>_<version>_<architecture>.deb` and nothing looser — and objects the mirror cached are excluded from it. Both matter on any instance that has ever mirrored: `pool/` then holds `.deb`s bodega did not build, an entry without `_pool_path` publishes no `SHA256` (that field comes from the same metadata `_pool_path` does), and a client has nothing to check the substitution against. Bodega tells the two apart by the audit checksum table, which holds a row per mirrored fetch, and consults it on every rebuild that has an entry to resolve by filename. **Removing `apt_upstreams` does not make the exclusion unnecessary.** Retiring mirroring leaves every cached upstream `.deb` in `pool/` and every checksum row in the database; an index built from the config alone would republish those bytes under bodega's own signature the next time the snapshot was rebuilt. `bodega pkg checksum clear apt <name>` blanks the digest and leaves the row for exactly this reason: the row is what keeps the artifact out of the index, and it outlives the digest an operator clears to escape a 502. On a mirroring instance whose audit database cannot be read, no entry without `_pool_path` reaches the index at all and the rebuild says so at `WARN`; entries that carry `_pool_path` are unaffected, so the repository keeps serving.
 
 An architecture is served only if some entry published to that suite declares it. `Release` advertises exactly those architectures in `Architectures:`, and `binary-<arch>/Packages` 404s for any other, since `Release` records no digest for it. With no architecture-specific entry at all the suite falls back to `amd64`.
 
@@ -2156,7 +2166,7 @@ Checksums protect against upstream tampering and bit-rot.
 - First proxy fetch: computes SHA-256, stores in audit DB under the artifact's type, name and version, all three read back out of the object key
 - Subsequent proxy fetches: verifies against stored; returns **502 Bad Gateway** on mismatch
 
-When an upstream republishes different bytes under a version it already served, every subsequent fetch answers 502 with `checksum verification failed — upstream content may be tampered`. Clearing the stored digest is the way out, and it is why the row carries package identity: `clear` deletes by type and name, and rows recorded without them could only be reached by editing the database. Stores mirrored before this release have their identity re-derived from `s3_key` once, on the first open after upgrade; the log line names the row count.
+When an upstream republishes different bytes under a version it already served, every subsequent fetch answers 502 with `checksum verification failed — upstream content may be tampered`. Clearing the stored digest is the way out, and it is why the row carries package identity: `clear` matches by type and name, and rows recorded without them could only be reached by editing the database. A row with no digest reads as one never fetched, so the next fetch stores what it computed rather than answering 502 forever. Stores mirrored before this release have their identity re-derived from `s3_key` once, on the first open after upgrade; the log line names the row count.
 
 **Management:**
 ```bash

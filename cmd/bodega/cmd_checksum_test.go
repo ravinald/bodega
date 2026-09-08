@@ -76,16 +76,34 @@ func TestChecksumClearReportsWhatItDeleted(t *testing.T) {
 	if !strings.Contains(out, "Cleared 1 checksum(s) for apt/nginx") {
 		t.Errorf("output does not name the row count:\n%s", out)
 	}
+	// What the clear does to the apt index, said before it is done: the row is
+	// the mirrored-pool record, and an operator chasing a 502 reads this
+	// paragraph rather than the exclusion section of USAGE.md (#225).
+	if !strings.Contains(out, "the digest goes, the row stays") {
+		t.Errorf("clear does not say what it leaves behind for apt:\n%s", out)
+	}
 
-	// Second run: the same command over an empty match has to say so.
+	// Second run: the digest is already gone, and saying "Cleared 1" again
+	// would send an operator whose 502 persists looking in the wrong place.
 	out, err = runChecksum(t, "clear", "apt", "nginx")
 	if err != nil {
 		t.Fatalf("second checksum clear: %v", err)
 	}
 	if !strings.Contains(out, "nothing was cleared") {
-		t.Errorf("a clear that matched nothing still reported success:\n%s", out)
+		t.Errorf("a clear with no digest to remove still reported success:\n%s", out)
 	}
 	if strings.Contains(out, "Cleared 1") {
-		t.Errorf("a clear that matched nothing reported a deletion:\n%s", out)
+		t.Errorf("a clear with no digest to remove reported one:\n%s", out)
+	}
+
+	// A name nothing recorded is a different answer from a name already
+	// cleared, because the next step differs: check the spelling, or stop
+	// blaming the checksum.
+	out, err = runChecksum(t, "clear", "apt", "ngnix")
+	if err != nil {
+		t.Fatalf("misspelled checksum clear: %v", err)
+	}
+	if !strings.Contains(out, "No cached checksums matched apt/ngnix") {
+		t.Errorf("a name nothing recorded reads the same as one already cleared:\n%s", out)
 	}
 }

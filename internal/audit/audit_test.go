@@ -419,9 +419,18 @@ func TestClearChecksum(t *testing.T) {
 		t.Fatalf("ClearChecksum: %v", err)
 	}
 
+	// The digest goes, the row stays. For apt the row is also what keeps a
+	// cached upstream .deb out of the signed index, and the artifact outlives
+	// the clear (#225).
 	cs, _ := db.GetChecksum(ctx, key)
-	if cs != nil {
-		t.Error("checksum should be cleared")
+	if cs == nil {
+		t.Fatal("the row went with the digest")
+	}
+	if cs.Value != "" {
+		t.Errorf("value = %q, want empty", cs.Value)
+	}
+	if cs.PkgName != "lodash" || cs.Source != "computed" {
+		t.Errorf("identity = %q/%q, want lodash/computed", cs.PkgName, cs.Source)
 	}
 }
 
@@ -443,32 +452,46 @@ func TestClearChecksumsByPackage(t *testing.T) {
 	_ = db.StoreChecksum(ctx, "npm/lodash/lodash-4.18.tgz", "npm", "lodash", "4.18.0", "sha256", "bbb", "computed")
 	_ = db.StoreChecksum(ctx, "npm/react/react-18.tgz", "npm", "react", "18.0.0", "sha256", "ccc", "computed")
 
-	n, err := db.ClearChecksumsByPackage(ctx, "npm", "lodash")
+	cleared, matched, err := db.ClearChecksumsByPackage(ctx, "npm", "lodash")
 	if err != nil {
 		t.Fatalf("ClearChecksumsByPackage: %v", err)
 	}
-	if n != 2 {
-		t.Errorf("deleted = %d, want 2 — the count is what the operator is told", n)
+	if cleared != 2 || matched != 2 {
+		t.Errorf("cleared/matched = %d/%d, want 2/2 — the count is what the operator is told", cleared, matched)
 	}
 
 	lodash, _ := db.ListChecksums(ctx, "npm", "lodash")
-	if len(lodash) != 0 {
-		t.Errorf("lodash checksums = %d, want 0", len(lodash))
+	if len(lodash) != 2 {
+		t.Fatalf("lodash rows = %d, want 2 — the rows outlive their digests (#225)", len(lodash))
+	}
+	for _, cs := range lodash {
+		if cs.Value != "" {
+			t.Errorf("lodash %s value = %q, want empty", cs.PkgVersion, cs.Value)
+		}
 	}
 
 	react, _ := db.ListChecksums(ctx, "npm", "react")
-	if len(react) != 1 {
-		t.Errorf("react checksums = %d, want 1 (should not be affected)", len(react))
+	if len(react) != 1 || react[0].Value != "ccc" {
+		t.Errorf("react checksums = %+v, want one untouched row", react)
 	}
 
-	// A filter matching nothing is not an error, and the zero is the whole
-	// signal: an operator clearing a stale digest has to know it did not.
-	n, err = db.ClearChecksumsByPackage(ctx, "npm", "lodash")
+	// Clearing twice is not an error, and the zero is the whole signal: an
+	// operator clearing a stale digest has to know it did nothing. matched
+	// separates that from a package name spelled wrong.
+	cleared, matched, err = db.ClearChecksumsByPackage(ctx, "npm", "lodash")
 	if err != nil {
 		t.Fatalf("second ClearChecksumsByPackage: %v", err)
 	}
-	if n != 0 {
-		t.Errorf("deleted = %d on an empty match, want 0", n)
+	if cleared != 0 || matched != 2 {
+		t.Errorf("cleared/matched = %d/%d on a second run, want 0/2", cleared, matched)
+	}
+
+	cleared, matched, err = db.ClearChecksumsByPackage(ctx, "npm", "lodahs")
+	if err != nil {
+		t.Fatalf("misspelled ClearChecksumsByPackage: %v", err)
+	}
+	if cleared != 0 || matched != 0 {
+		t.Errorf("cleared/matched = %d/%d on a name nothing recorded, want 0/0", cleared, matched)
 	}
 }
 

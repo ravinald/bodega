@@ -43,9 +43,25 @@ const (
 // once per client.
 type fixtureArchive struct {
 	ts      *httptest.Server
+	mu      sync.RWMutex // guards objects; setObject writes from the test goroutine
 	objects map[string]string
 	hits    sync.Map // path -> *atomic.Int64
 	delay   time.Duration
+}
+
+// setObject replaces what the archive serves at rel, which is an upstream
+// republishing different bytes under a path it already served.
+func (a *fixtureArchive) setObject(rel, body string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.objects[rel] = body
+}
+
+func (a *fixtureArchive) object(rel string) (string, bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	body, ok := a.objects[rel]
+	return body, ok
 }
 
 func (a *fixtureArchive) count(path string) int64 {
@@ -67,7 +83,7 @@ func newFixtureArchive(t testing.TB, objects map[string]string) *fixtureArchive 
 	a := &fixtureArchive{objects: objects}
 	a.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rel := strings.TrimPrefix(r.URL.Path, "/ubuntu/")
-		body, ok := a.objects[rel]
+		body, ok := a.object(rel)
 		if !ok {
 			http.NotFound(w, r)
 			return
@@ -908,6 +924,11 @@ func TestPoolCacheControlFollowsTheOutcome(t *testing.T) {
 // the mirror wrote, not on the fallback path itself. Without this the fix for
 // #170 would have retired the out-of-band upload route instead of protecting
 // it.
+//
+// On a pool that has held upstream bytes the entry has to carry its own digest.
+// A filename match is not evidence of provenance there, and a stanza with no
+// SHA256 gives the client nothing to check the substitution against, so the
+// generator refuses it — see TestOutOfBandDebWithoutDigestStaysOut.
 func TestOutOfBandDebStillResolves(t *testing.T) {
 	archive := newFixtureArchive(t, map[string]string{fixtureDeb: fixtureDebBody})
 	s := mirrorServer(t, archive)
@@ -916,7 +937,10 @@ func TestOutOfBandDebStillResolves(t *testing.T) {
 		Version:    "3.3.0-4build1",
 		SourceName: "htop",
 		Suites:     []string{"local"},
-		Metadata:   map[string]string{"Architecture": "amd64"},
+		Metadata: map[string]string{
+			"Architecture": "amd64",
+			"_sha256":      fmt.Sprintf("%x", sha256.Sum256([]byte(fallbackDebBody))),
+		},
 	}); err != nil {
 		t.Fatalf("AddVersion: %v", err)
 	}
@@ -951,6 +975,39 @@ func TestOutOfBandDebStillResolves(t *testing.T) {
 	}
 	if strings.Contains(string(body), "Filename: "+fallbackDeb) {
 		t.Errorf("an unverifiable pool object was published anyway:\n%s", body)
+	}
+}
+
+// The same out-of-band upload with no digest recorded. The audit database is
+// readable and says the object is not one the mirror wrote, so the exclusion
+// admits it — and the stanza would still carry no SHA256, on a pool that
+// demonstrably holds upstream bytes. Publishing it hands a client an
+// unverifiable binary under bodega's archive key, which is #170 by a second
+// route: nothing distinguishes this object from a mirrored one whose checksum
+// row was never written (#225).
+func TestOutOfBandDebWithoutDigestStaysOut(t *testing.T) {
+	archive := newFixtureArchive(t, map[string]string{fixtureDeb: fixtureDebBody})
+	s := mirrorServer(t, archive)
+
+	if err := s.store.AddVersion(t.Context(), manifest.TypeApt, "htop", manifest.VersionEntry{
+		Version:    "3.3.0-4build1",
+		SourceName: "htop",
+		Suites:     []string{"local"},
+		Metadata:   map[string]string{"Architecture": "amd64"},
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+	if err := s.typeStore(manifest.TypeApt).Put(t.Context(), manifest.AptKey(fallbackDeb), []byte(fallbackDebBody)); err != nil {
+		t.Fatalf("seed pool object: %v", err)
+	}
+	s.rebuildAptSnapshot(t.Context())
+
+	code, body := mirrorGet(t, s, "/apt/dists/local/main/binary-amd64/Packages")
+	if code != http.StatusOK {
+		t.Fatalf("generated Packages = %d, want 200", code)
+	}
+	if strings.Contains(string(body), "Filename: "+fallbackDeb) {
+		t.Errorf("a digest-less pool match was published on a mirroring instance:\n%s", body)
 	}
 }
 
@@ -1146,7 +1203,7 @@ func TestMirroredPoolFetchIsCheckSummedUnderItsPackage(t *testing.T) {
 	}
 
 	// The recovery command's query, against the row the fetch just wrote.
-	cleared, err := s.auditDB.ClearChecksumsByPackage(ctx, manifest.TypeApt, "nginx")
+	cleared, _, err := s.auditDB.ClearChecksumsByPackage(ctx, manifest.TypeApt, "nginx")
 	if err != nil {
 		t.Fatalf("clear apt/nginx: %v", err)
 	}
@@ -1157,7 +1214,104 @@ func TestMirroredPoolFetchIsCheckSummedUnderItsPackage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("re-list apt checksums: %v", err)
 	}
-	if len(left) != 0 {
-		t.Errorf("apt checksum rows after clear = %d, want 0", len(left))
+	// The digest goes and the row stays: it is also the record that keeps this
+	// object out of the index, and the .deb is still in pool/ (#225).
+	if len(left) != 1 {
+		t.Fatalf("apt checksum rows after clear = %d, want 1 — the mirrored-pool record went with the digest", len(left))
+	}
+	if left[0].Value != "" {
+		t.Errorf("value after clear = %q, want empty — the stale digest survived the remedy", left[0].Value)
+	}
+	if left[0].Source != "computed" || left[0].S3Key != row.S3Key {
+		t.Errorf("cleared row = %q/%q, want computed/%q — aptMirroredPoolKeys reads both", left[0].Source, left[0].S3Key, row.S3Key)
+	}
+}
+
+// TestClearedChecksumKeepsTheMirroredDebOutOfTheIndex is #225, and the
+// reproduction the caveat carried: TestAuditFallbackEntryAdoptsMirroredDeb with
+// the documented remedy run in the middle of it. `bodega pkg checksum clear apt
+// nginx` used to delete the rows aptMirroredPoolKeys reads, and the cached
+// upstream .deb stayed in pool/ under the exact filename the fallback entry
+// resolves by, so the next rebuild published it with no SHA256.
+//
+// The assertion is on the generated Packages, not on the table: the table is
+// the mechanism, and a fix that kept rows while losing the serve-path outcome
+// would pass a table-level check.
+func TestClearedChecksumKeepsTheMirroredDebOutOfTheIndex(t *testing.T) {
+	upstreamBytes := "\x21<arch>\nbytes from ports.ubuntu.com, not from the build"
+	archive := newFixtureArchive(t, map[string]string{fixtureDeb: upstreamBytes})
+	s := mirrorServer(t, archive)
+
+	if err := s.store.AddVersion(t.Context(), manifest.TypeApt, "nginx", manifest.VersionEntry{
+		Version:    "1.24.0-2ubuntu7.1",
+		SourceName: "nginx",
+		Suites:     []string{"local"},
+		Metadata:   map[string]string{"Architecture": "amd64"},
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+	if code, _ := mirrorGet(t, s, "/apt/"+fixtureDeb); code != http.StatusOK {
+		t.Fatalf("mirrored pool fetch failed")
+	}
+
+	// The operator chases a 502 and reaches for the documented remedy.
+	if _, _, err := s.auditDB.ClearChecksumsByPackage(t.Context(), manifest.TypeApt, "nginx"); err != nil {
+		t.Fatalf("clear apt/nginx: %v", err)
+	}
+	s.aptPool.Store(nil)
+	s.rebuildAptSnapshot(t.Context())
+
+	code, body := mirrorGet(t, s, "/apt/dists/local/main/binary-amd64/Packages")
+	if code != http.StatusOK {
+		t.Fatalf("generated Packages = %d, want 200", code)
+	}
+	if strings.Contains(string(body), "Filename: "+fixtureDeb) {
+		t.Errorf("clearing the checksum republished the cached upstream artifact:\n%s", body)
+	}
+	if strings.Contains(string(body), "Package: nginx") && !strings.Contains(string(body), "SHA256:") {
+		t.Errorf("nginx published with no digest after the clear:\n%s", body)
+	}
+}
+
+// The case clear is documented for, on the type where the row now survives it:
+// an upstream republishes different bytes under a version it already served,
+// every fetch answers 502, and clearing the digest is the way out. The row
+// staying behind must not turn that remedy into a permanent 502 — a blank value
+// takes the first-fetch path and stores what the next fetch computed.
+func TestClearedChecksumLetsRepublishedBytesThrough(t *testing.T) {
+	archive := newFixtureArchive(t, map[string]string{fixtureDeb: fixtureDebBody})
+	s := mirrorServer(t, archive)
+
+	if code, _ := mirrorGet(t, s, "/apt/"+fixtureDeb); code != http.StatusOK {
+		t.Fatalf("first pool fetch failed")
+	}
+
+	// The archive republishes, and the cached object is dropped so the next
+	// request goes upstream rather than being served from the pool.
+	republished := "\x21<arch>\nrepublished under the same version"
+	archive.setObject(fixtureDeb, republished)
+	if err := s.typeStore(manifest.TypeApt).Delete(t.Context(), manifest.AptKey(fixtureDeb)); err != nil {
+		t.Fatalf("drop cached object: %v", err)
+	}
+	if code, _ := mirrorGet(t, s, "/apt/"+fixtureDeb); code != http.StatusBadGateway {
+		t.Fatalf("republished fetch = %d, want 502 — the stored digest did not catch the change", code)
+	}
+
+	if _, _, err := s.auditDB.ClearChecksumsByPackage(t.Context(), manifest.TypeApt, "nginx"); err != nil {
+		t.Fatalf("clear apt/nginx: %v", err)
+	}
+	if code, _ := mirrorGet(t, s, "/apt/"+fixtureDeb); code != http.StatusOK {
+		t.Fatalf("fetch after clear = %d, want 200 — the remedy no longer clears the mismatch", code)
+	}
+
+	stored, err := s.auditDB.GetChecksum(t.Context(), manifest.AptKey(fixtureDeb))
+	if err != nil {
+		t.Fatalf("GetChecksum: %v", err)
+	}
+	if stored == nil || stored.Value != fmt.Sprintf("%x", sha256.Sum256([]byte(republished))) {
+		t.Errorf("stored digest = %+v, want the republished bytes' — the next fetch recorded nothing to verify against", stored)
+	}
+	if stored != nil && stored.Source != "computed" {
+		t.Errorf("source after re-store = %q, want computed — the mirrored-pool exclusion filters on it", stored.Source)
 	}
 }

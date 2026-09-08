@@ -428,7 +428,7 @@ func (s *Server) reloadManifests(ctx context.Context) {
 // and pool state.
 func (s *Server) buildAptSnapshot(ctx context.Context) (*aptSnapshot, error) {
 	served := s.cfg.ServedAptSuites()
-	poolMap, err := s.aptPoolMapForIndex(ctx, served)
+	poolMap, sharedPool, err := s.aptPoolMapForIndex(ctx, served)
 	if err != nil {
 		return nil, fmt.Errorf("list apt pool keys: %w", err)
 	}
@@ -441,7 +441,7 @@ func (s *Server) buildAptSnapshot(ctx context.Context) (*aptSnapshot, error) {
 	}
 	snap.poolStorage = s.aptPoolStorage(ctx)
 	for _, suite := range served {
-		snap.suites[suite] = s.buildAptSuiteIndex(ctx, suite, poolMap, date, snap.validUntil)
+		snap.suites[suite] = s.buildAptSuiteIndex(ctx, suite, poolMap, sharedPool, date, snap.validUntil)
 	}
 	s.auditAptEntries(ctx, served, poolMap)
 	return snap, nil
@@ -513,10 +513,10 @@ func (s *Server) aptFallbacks(ctx context.Context, served []string) []aptFallbac
 // aptPoolRelistFloor. Retaking on every unresolved entry instead charged a
 // full listing to every write for as long as one staged entry waited for its
 // .deb, which is the per-write bound the cache exists to hold.
-func (s *Server) aptPoolMapForIndex(ctx context.Context, served []string) (map[string]string, error) {
+func (s *Server) aptPoolMapForIndex(ctx context.Context, served []string) (map[string]string, bool, error) {
 	fallbacks := s.aptFallbacks(ctx, served)
 	if len(fallbacks) == 0 {
-		return nil, nil
+		return nil, false, nil
 	}
 	mirrored, err := s.aptMirroredPoolKeys(ctx)
 	if err != nil {
@@ -527,16 +527,20 @@ func (s *Server) aptPoolMapForIndex(ctx context.Context, served []string) (map[s
 		// any of its packages. auditAptEntries reports each dropped entry.
 		s.logger.Warn("cannot tell a mirrored .deb from a built one, so no apt entry without _pool_path reaches the index",
 			"error", err)
-		return nil, nil
+		return nil, false, nil
 	}
+	// A pool that has held upstream bytes, or an instance still configured to
+	// put some there. Either way a filename match is no longer evidence of
+	// provenance, which is what generateAptPackages needs to know.
+	shared := len(mirrored) > 0 || len(s.cfg.AptUpstreams) > 0
 	if cached := s.aptCachedPoolMap(mirrored, fallbacks); cached != nil {
-		return cached, nil
+		return cached, shared, nil
 	}
 	keys, err := s.aptPoolKeysFresh(ctx)
 	if err != nil {
-		return nil, err
+		return nil, shared, err
 	}
-	return aptPoolMap(keys, mirrored), nil
+	return aptPoolMap(keys, mirrored), shared, nil
 }
 
 // aptCachedPoolMap returns the map the cached listing yields when that listing
@@ -680,7 +684,7 @@ func (s *Server) aptPoolStorage(ctx context.Context) map[string]string {
 
 // buildAptSuiteIndex generates one suite's Packages bodies and the Release
 // that vouches for them.
-func (s *Server) buildAptSuiteIndex(ctx context.Context, suite string, poolMap map[string]string, date, validUntil time.Time) *aptSuiteIndex {
+func (s *Server) buildAptSuiteIndex(ctx context.Context, suite string, poolMap map[string]string, sharedPool bool, date, validUntil time.Time) *aptSuiteIndex {
 	// Collect unique architectures from manifest metadata.
 	arches := s.aptArchitectures(ctx, suite)
 	if len(arches) == 0 {
@@ -699,7 +703,7 @@ func (s *Server) buildAptSuiteIndex(ctx context.Context, suite string, poolMap m
 	}
 	var entries []indexEntry
 	for _, arch := range arches {
-		pkgData := s.generateAptPackages(ctx, suite, arch, poolMap)
+		pkgData := s.generateAptPackages(ctx, suite, arch, poolMap, sharedPool)
 		entries = append(entries, indexEntry{
 			path: "main/binary-" + arch + "/Packages",
 			data: pkgData,
@@ -1178,7 +1182,7 @@ func (s *Server) aptArchitectures(ctx context.Context, suite string) []string {
 // generateAptPackages builds a Debian Packages file for the given suite and
 // architecture from manifest metadata, resolving entries that carry no
 // _pool_path against poolMap. poolMap is nil when no entry needed one.
-func (s *Server) generateAptPackages(ctx context.Context, suite, arch string, poolMap map[string]string) []byte {
+func (s *Server) generateAptPackages(ctx context.Context, suite, arch string, poolMap map[string]string, sharedPool bool) []byte {
 	var buf bytes.Buffer
 	for _, name := range s.store.ListPackages(manifest.TypeApt) {
 		pm, _ := s.store.GetPackage(ctx, manifest.TypeApt, name)
@@ -1213,11 +1217,32 @@ func (s *Server) generateAptPackages(ctx context.Context, suite, arch string, po
 
 			// Determine the pool path: prefer stored _pool_path, fall back to S3 lookup.
 			poolPath := ve.Metadata["_pool_path"]
-			if poolPath == "" {
+			matchedByFilename := poolPath == ""
+			if matchedByFilename {
 				poolPath = s.findDebInPool(poolMap, pkgName, ve.Version, veArch)
 			}
 			if poolPath == "" {
 				continue // no .deb uploaded yet
+			}
+
+			sha256Value := ve.Metadata["_sha256"]
+			if sha256Value == "" && ve.Checksum != nil && ve.Checksum.Algorithm == "sha256" {
+				sha256Value = ve.Checksum.Value
+			}
+			// On a pool that has held upstream bytes, a filename match plus no
+			// digest is unverifiable by construction: the client has nothing to
+			// check the substitution against, and the object may be a mirrored
+			// .deb the exclusion set failed to name — a row lost with the audit
+			// database, or one written before this instance had one (#170,
+			// #225). aptMirroredPoolKeys refuses the same way when it cannot
+			// read the record at all. Entries carrying _pool_path are bodega's
+			// own writes and unaffected; so is every entry on an instance that
+			// has never mirrored, where the pool holds only what the operator
+			// put in it.
+			if sharedPool && matchedByFilename && sha256Value == "" {
+				s.logger.Warn("apt entry matched a pool object by filename and carries no SHA256, so it stays out of an index whose pool has held upstream bytes; record the digest with `bodega pkg edit` or re-upload through bodega",
+					"package", pkgName, "version", ve.Version, "arch", veArch, "pool_path", poolPath)
+				continue
 			}
 
 			// Emit canonical apt fields from the manifest in Debian Policy §5.3
@@ -1283,11 +1308,7 @@ func (s *Server) generateAptPackages(ctx context.Context, suite, arch string, po
 			if sha1 := ve.Metadata["_sha1"]; sha1 != "" {
 				fmt.Fprintf(&buf, "SHA1: %s\n", sha1)
 			}
-			if sha256 := ve.Metadata["_sha256"]; sha256 != "" {
-				fmt.Fprintf(&buf, "SHA256: %s\n", sha256)
-			} else if ve.Checksum != nil && ve.Checksum.Algorithm == "sha256" {
-				writeDebField(&buf, "SHA256", ve.Checksum.Value)
-			}
+			writeDebField(&buf, "SHA256", sha256Value)
 
 			// Description goes last and re-introduces the continuation prefix
 			// that deb822.ParseSingle stripped. A manifest-level description

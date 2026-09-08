@@ -553,9 +553,22 @@ func (a *DB) ListChecksums(ctx context.Context, pkgType, pkgName string) ([]Stor
 	return checksums, rows.Err()
 }
 
-// ClearChecksum removes a stored checksum by S3 key.
+// ClearChecksum blanks the stored digest for an S3 key, keeping the row.
+//
+// The row is two records in one. The digest is what verifyProxyChecksum
+// compares a re-fetch against, and clearing it is how an operator escapes an
+// upstream that republished different bytes. Its s3_key and "computed" source
+// are also the only thing that tells a cached upstream .deb in pool/ from one
+// bodega built, which is what keeps the archive's bytes out of an index signed
+// with bodega's key (#225). Deleting the row cleared the first and destroyed
+// the second while the artifact stayed in pool/.
+//
+// A blank value reads as "no digest recorded": verifyProxyChecksum stores the
+// next computed one over it, exactly as it does for a key it has never seen.
 func (a *DB) ClearChecksum(ctx context.Context, s3Key string) error {
-	result, err := a.db.ExecContext(ctx, "DELETE FROM checksums WHERE s3_key = ?", s3Key)
+	result, err := a.db.ExecContext(ctx,
+		`UPDATE checksums SET value = '', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+		 WHERE s3_key = ?`, s3Key)
 	if err != nil {
 		return err
 	}
@@ -566,24 +579,34 @@ func (a *DB) ClearChecksum(ctx context.Context, s3Key string) error {
 	return nil
 }
 
-// ClearChecksumsByPackage removes all stored checksums for a package and
-// returns how many rows it deleted. Zero is not an error here — the caller is
-// an operator escaping a checksum mismatch, and they need to be told the
-// filter matched nothing rather than read a success message over a table that
-// still holds the stale digest.
-func (a *DB) ClearChecksumsByPackage(ctx context.Context, pkgType, pkgName string) (int64, error) {
+// ClearChecksumsByPackage blanks the stored digest on every row for a package.
+// See ClearChecksum for why the rows stay.
+//
+// It returns two counts because the rows outlive their digests and the caller
+// is an operator escaping a checksum mismatch. cleared is how many digests went
+// — zero is not an error, and it is the whole signal that the remedy did
+// nothing. matched is how many rows carry the name at all, which separates a
+// package clear-run-twice from a package spelled wrong.
+func (a *DB) ClearChecksumsByPackage(ctx context.Context, pkgType, pkgName string) (cleared, matched int64, err error) {
+	if err := a.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM checksums WHERE pkg_type = ? AND pkg_name = ?",
+		pkgType, pkgName,
+	).Scan(&matched); err != nil {
+		return 0, 0, err
+	}
 	result, err := a.db.ExecContext(ctx,
-		"DELETE FROM checksums WHERE pkg_type = ? AND pkg_name = ?",
+		`UPDATE checksums SET value = '', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+		 WHERE pkg_type = ? AND pkg_name = ? AND value != ''`,
 		pkgType, pkgName,
 	)
 	if err != nil {
-		return 0, err
+		return 0, matched, err
 	}
-	n, err := result.RowsAffected()
+	cleared, err = result.RowsAffected()
 	if err != nil {
-		return 0, err
+		return 0, matched, err
 	}
-	return n, nil
+	return cleared, matched, nil
 }
 
 // ---- API Token Management ---------------------------------------------------
