@@ -327,10 +327,9 @@ than gaining an invented date.
 			// the run could not answer for, not grounds to discard the report
 			// for every other package. The walk finishes and the summary says
 			// what it missed.
-			fail := func(typ, pkg, format string, err error) {
-				ch := policy.OSVRescanChange{Reason: fmt.Sprintf(format+": %v", typ+"/"+pkg, err)}
-				sum.Add(ch)
-				row(typ, pkg, "-", "unanswered", ch.Reason)
+			fail := func(typ, pkg, reason string) {
+				sum.Add(policy.OSVRescanChange{Reason: reason})
+				row(typ, pkg, "-", "unanswered", reason)
 			}
 			matched, failures := 0, 0
 			for _, t := range types {
@@ -342,10 +341,17 @@ than gaining an invented date.
 					pm, err := store.GetPackage(ctx, t, name)
 					if err != nil {
 						failures++
-						fail(t, name, "load %s", err)
+						fail(t, name, fmt.Sprintf("load %s/%s: %v", t, name, err))
 						continue
 					}
+					// An index entry whose manifest file is gone is a package
+					// the run could not answer for, not one with nothing to
+					// say. 'bodega repair' counts the same state as an issue;
+					// skipping it silently here reports a fleet nobody looked
+					// at as a fleet with no findings.
 					if pm == nil {
+						failures++
+						fail(t, name, fmt.Sprintf("%s/%s is in the index with no manifest file", t, name))
 						continue
 					}
 					changed := false
@@ -368,7 +374,7 @@ than gaining an invented date.
 					if changed {
 						if err := store.SavePackage(ctx, pm); err != nil {
 							failures++
-							fail(t, name, "save %s", err)
+							fail(t, name, fmt.Sprintf("save %s/%s: %v", t, name, err))
 						}
 					}
 				}
@@ -385,7 +391,10 @@ than gaining an invented date.
 				return fmt.Errorf("no package named %q%s in %s: nothing was re-checked",
 					nameFlag, as, strings.Join(types, ", "))
 			}
-			if sum.Answered == 0 && sum.Walked > 0 {
+			// Only claim the database came up empty when every manifest was
+			// readable. With a failure in the walk the cause was the store,
+			// and naming OSV sends the operator to the wrong subsystem.
+			if sum.Answered == 0 && sum.Walked > 0 && failures == 0 {
 				return fmt.Errorf("nothing was re-checked: the local OSV database answered for none of %d version(s)", sum.Walked)
 			}
 			if failures > 0 {

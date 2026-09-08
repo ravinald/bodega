@@ -347,3 +347,34 @@ func TestRescanCommand_UnreadableManifestKeepsTheReport(t *testing.T) {
 		t.Errorf("the readable sibling was not rescanned: %+v", st)
 	}
 }
+
+// TestRescanCommand_IndexEntryWithNoManifestIsUnanswered pins the drift
+// 'bodega repair' already names: a package in the index whose manifest file is
+// gone. The walk used to skip it with no row, no count and exit 0, so a run
+// that answered for nothing printed the same three zeros as a clean one and a
+// cron reading the exit code recorded it as a fleet with no findings.
+func TestRescanCommand_IndexEntryWithNoManifestIsUnanswered(t *testing.T) {
+	root := rescanInstall(t, manifest.VersionEntry{Version: "1.2.0"})
+	rescanAdd(t, root, "ghost", manifest.VersionEntry{Version: "1.0.0"})
+	if err := os.Remove(filepath.Join(root, "manifests", manifest.TypeNpm, "ghost", "manifest.json")); err != nil {
+		t.Fatal(err)
+	}
+	syncInto(t, root, advisory("GHSA-old", "minimist", "0", "1.2.3"))
+
+	stdout, stderr, err := runRescan(t, "--name", "ghost")
+	if err == nil {
+		t.Fatal("an index entry with no manifest must not exit 0")
+	}
+	if !strings.Contains(stdout, "ghost") || !strings.Contains(stdout, "unanswered") {
+		t.Errorf("the table must name the package it could not read: %q", stdout)
+	}
+	if !strings.Contains(stderr, "no manifest file") {
+		t.Errorf("the summary must name the state it could not answer for: %q", stderr)
+	}
+	if !strings.Contains(stderr, "1 version(s) unanswered") {
+		t.Errorf("the missing manifest must land in the unanswered count: %q", stderr)
+	}
+	if strings.Contains(err.Error(), "local OSV database") {
+		t.Errorf("the error must name the store, not OSV: %v", err)
+	}
+}

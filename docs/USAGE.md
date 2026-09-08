@@ -737,7 +737,7 @@ Rescanned 2 version(s): 2 answered, 1 newly flagged, 0 newly cleared.
 
 `--type` and `--name` scope the walk. `--type` refuses an ecosystem OSV has no records for, rather than reporting a clean pass over it. `--name` takes the package name as you would type it anywhere else, scoped npm packages and gomod module paths included: `--name '@types/node'` and `--name 'github.com/spf13/cobra'` both resolve to the encoded key the manifest index stores. A `--name` that matches no package exits 1 rather than reporting a clean walk over nothing.
 
-A manifest the walk cannot read or cannot write back counts as unanswered, with the error as its reason, and the walk continues. One corrupt file does not cost you the report on everything beside it; the command still exits 1 so the failure is not silent.
+A manifest the walk cannot read or cannot write back counts as unanswered, with the error as its reason, and the walk continues. A package listed in the index whose manifest file is gone counts the same way, naming that state as its reason: `bodega repair` reports the same drift, and a walk that skipped it silently would report a package nobody could look at as a package with no findings. One corrupt file does not cost you the report on everything beside it; the command still exits 1 so the failure is not silent.
 
 The table lists what an operator has to read: every version carrying findings, the ones that just gained or lost them, and the ones nothing could answer for. A version that stayed clean is in the count on stderr and nowhere else. Findings go to stdout and the summary to stderr, so a report pipes cleanly while the counts stay on the terminal.
 
