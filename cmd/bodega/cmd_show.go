@@ -270,6 +270,11 @@ func showVersionList(ctx context.Context, store *manifest.Store, typ, name strin
 	} else {
 		fmt.Printf("%-12s %-15s %-10s\n", "VERSION", "PLATFORM", "CONSTRAINT")
 	}
+	// The row's cells and the flagged block below the table read the same
+	// stamp, so one answer to "can OSV cover this type at all" has to drive
+	// both: an imported manifest can carry vetting.osv.* keys for a type
+	// bodega's own writers never stamp.
+	osvCovered := policy.OSVEcosystemFor(typ) != ""
 	var flagged []string
 	for _, ve := range pm.Versions {
 		if ve.Hidden && !admin {
@@ -297,10 +302,10 @@ func showVersionList(ctx context.Context, store *manifest.Store, typ, name strin
 				hidden = "yes"
 			}
 			st := policy.OSVStampOf(ve)
-			osvState, osvChecked := osvVersionState(typ, st)
+			osvState, osvChecked := osvVersionState(osvCovered, st)
 			fmt.Printf("%-12s %-15s %-6s %-8s %-8s %-10s %-11s %-10s\n",
 				v, platform, "-", frozen, hidden, constraint, osvState, osvChecked)
-			if st.Flagged() {
+			if osvCovered && st.Flagged() {
 				flagged = append(flagged, fmt.Sprintf("  %-12s %s  (checked %s)",
 					v, strings.Join(st.Vulns, ", "), osvCheckedOn(st)))
 			}
@@ -319,8 +324,8 @@ func showVersionList(ctx context.Context, store *manifest.Store, typ, name strin
 // ever change that cell, and "unchecked" would send the operator to
 // `policy osv rescan`, which refuses to run on an ecosystem the gate does not
 // cover.
-func osvVersionState(registryType string, st policy.OSVStamp) (state, checked string) {
-	if policy.OSVEcosystemFor(registryType) == "" {
+func osvVersionState(covered bool, st policy.OSVStamp) (state, checked string) {
+	if !covered {
 		return "n/a", "-"
 	}
 	return st.State(), osvCheckedOn(st)

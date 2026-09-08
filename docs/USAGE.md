@@ -780,7 +780,7 @@ Flagged by OSV:
   1.2.0        GHSA-vh95-rmgr-6w4m, GHSA-xvch-5gv4-984h  (checked 2026-09-08)
 ```
 
-The `OSV` cell reads `n/a` on `apt`, `binary`, `git` and `helm`. Those four have no OSV ecosystem identifier, so no rescan can ever answer for them, and `unchecked` would send the operator to a verb that refuses to run on them. On the covered types the cell reads `unchecked`, `clean` or a finding count, and `CHECKED` carries the date of the last conclusive answer.
+The `OSV` cell reads `n/a` on `apt`, `binary`, `git` and `helm`. Those four have no OSV ecosystem identifier, so no rescan can ever answer for them, and `unchecked` would send the operator to a verb that refuses to run on them. On the covered types the cell reads `unchecked`, `clean` or a finding count, and `CHECKED` carries the date of the last conclusive answer. The `Flagged by OSV` block obeys the same rule: a version whose row reads `n/a` never appears in it. `bodega pkg import` accepts a manifest carrying `vetting.osv.*` keys for any type, so a stamp exported from another instance can land on `apt`, and printing it as a dated finding under a cell that says the check can never run would contradict the row four lines above it.
 
 `GET /api/v1/packages/{type}/{name}/{version}` carries the same three keys on the version's `metadata`.
 

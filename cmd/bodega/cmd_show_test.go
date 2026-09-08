@@ -72,10 +72,19 @@ func TestShowVersionList_FlaggedVersionNamesItsFindings(t *testing.T) {
 // the same. OSV holds no apt records, and `policy osv rescan --type apt`
 // refuses to run, so an apt row saying "unchecked" names a fix that does not
 // exist.
+//
+// The stamped version is the case `pkg import` reaches: VersionEntry.Metadata
+// is modeled, so an export from one instance carries whatever vetting.osv.*
+// keys the source wrote, onto a type bodega's own writers never stamp.
 func TestShowVersionList_UncoveredEcosystemReadsNA(t *testing.T) {
 	for _, typ := range []string{manifest.TypeApt, manifest.TypeGit, manifest.TypeBinary, manifest.TypeHelm} {
 		t.Run(typ, func(t *testing.T) {
-			store := showStore(t, typ, "hello", manifest.VersionEntry{Version: "1.0.0"})
+			store := showStore(t, typ, "hello",
+				manifest.VersionEntry{Version: "1.0.0"},
+				manifest.VersionEntry{Version: "1.1.0", Metadata: map[string]string{
+					policy.OSVMetaVulns:     "CVE-2024-7347",
+					policy.OSVMetaCheckedAt: "2026-09-01T00:00:00Z",
+				}})
 
 			out := captureStdout(t, func() {
 				if err := showVersionList(context.Background(), store, typ, "hello", true, false); err != nil {
@@ -83,12 +92,17 @@ func TestShowVersionList_UncoveredEcosystemReadsNA(t *testing.T) {
 				}
 			})
 
-			row := versionRow(t, out, "1.0.0")
-			if !strings.Contains(row, "n/a") {
-				t.Errorf("%s has no OSV answer to give, so the column must read n/a: %q", typ, row)
+			for _, v := range []string{"1.0.0", "1.1.0"} {
+				row := versionRow(t, out, v)
+				if !strings.Contains(row, "n/a") {
+					t.Errorf("%s has no OSV answer to give, so the column must read n/a: %q", typ, row)
+				}
+				if strings.Contains(row, "unchecked") || strings.Contains(row, "never") {
+					t.Errorf("%s must not promise a check that can never happen: %q", typ, row)
+				}
 			}
-			if strings.Contains(row, "unchecked") || strings.Contains(row, "never") {
-				t.Errorf("%s must not promise a check that can never happen: %q", typ, row)
+			if strings.Contains(out, "Flagged by OSV:") || strings.Contains(out, "CVE-2024-7347") {
+				t.Errorf("%s reads n/a in the table, so an imported stamp must not reappear as a finding:\n%s", typ, out)
 			}
 		})
 	}
