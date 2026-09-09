@@ -436,17 +436,29 @@ func rescanRow(ch policy.OSVRescanChange) (state, detail string) {
 		// Ids first: an operator scanning the column for advisory names has
 		// to find one here too, or a matched record hides behind the prose
 		// explaining why nothing was written.
-		if len(ch.Vulns) > 0 {
-			return "unanswered", strings.Join(ch.Vulns, ", ") + "; " + ch.Reason
-		}
-		return "unanswered", ch.Reason
+		return "unanswered", withReason(strings.Join(ch.Vulns, ", "), ch.Reason)
 	case ch.Flagged:
-		return "flagged (new)", strings.Join(ch.Vulns, ", ")
+		return "flagged (new)", withReason(strings.Join(ch.Vulns, ", "), ch.Reason)
 	case len(ch.Vulns) > 0:
-		return "flagged", strings.Join(ch.Vulns, ", ")
+		return "flagged", withReason(strings.Join(ch.Vulns, ", "), ch.Reason)
 	case ch.Cleared:
-		return "cleared", "no OSV records match it today"
+		return "cleared", withReason("no OSV records match it today", ch.Reason)
 	default:
 		return "", ""
+	}
+}
+
+// withReason appends what qualified an answer to the answer itself. The row is
+// the only per-version surface an operator reads, so a caveat that reaches the
+// stderr reason counts and not the row leaves one line claiming a complete
+// verdict the run never had.
+func withReason(detail, reason string) string {
+	switch {
+	case reason == "":
+		return detail
+	case detail == "":
+		return reason
+	default:
+		return detail + "; " + reason
 	}
 }

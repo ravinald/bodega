@@ -466,3 +466,83 @@ func TestOSVDatable(t *testing.T) {
 		}
 	}
 }
+
+// npmVersionList builds an advisory that names its affected versions
+// explicitly. OSV's `versions` list matches by string equality, so it is the
+// one way a record can cover a version string no ordering can place.
+func npmVersionList(id, pkg string, versions ...string) map[string]any {
+	list := make([]any, 0, len(versions))
+	for _, v := range versions {
+		list = append(list, v)
+	}
+	return map[string]any{
+		"id":       id,
+		"modified": "2026-09-01T00:00:00Z",
+		"affected": []any{map[string]any{
+			"package":  map[string]any{"ecosystem": "npm", "name": pkg},
+			"versions": list,
+		}},
+	}
+}
+
+// TestOSVRescan_MatchBesideUnreadRecordIsNotDated pins the dating rule against
+// the case that reads as complete and is not: a version one record covers by
+// name while a second record naming the same package went unread. Matching
+// something says nothing about what the unread record would have said, and the
+// same version with zero matches beside that record is already unanswered.
+// Without this, one hit buys a date and the two halves of the same lookup are
+// dated by different rules.
+func TestOSVRescan_MatchBesideUnreadRecordIsNotDated(t *testing.T) {
+	db := dbWithNpm(t, t.TempDir(),
+		npmVersionList("GHSA-exact-2026", "minimist", "nightly-2026"),
+		npmAdvisory("GHSA-ranged-2026", "minimist", "0", "9.9.9"),
+	)
+	ve := &manifest.VersionEntry{Version: "nightly-2026"}
+
+	ch := rescanChecker(db).Rescan(context.Background(), npmPkg(), ve)
+	if ch.Answered || ch.Flagged {
+		t.Fatalf("an answer missing a record is not one to date: %+v", ch)
+	}
+	if len(ch.Vulns) != 1 || ch.Vulns[0] != "GHSA-exact-2026" {
+		t.Errorf("the matched record must still reach the report, got %v", ch.Vulns)
+	}
+	if !strings.Contains(ch.Reason, "GHSA-ranged-2026") {
+		t.Errorf("the reason must name the record nobody read, got %q", ch.Reason)
+	}
+	if got := ve.Metadata[OSVMetaCheckedAt]; got != "" {
+		t.Errorf("no date is owed for a partial read, got %q", got)
+	}
+}
+
+// TestOSVCheck_MatchBesideUnreadRecordIsNotDated keeps admission on the same
+// rule. Both paths date through conclusive(), so a change that lets one of
+// them date a partial read silently moves the other.
+func TestOSVCheck_MatchBesideUnreadRecordIsNotDated(t *testing.T) {
+	db := dbWithNpm(t, t.TempDir(),
+		npmVersionList("GHSA-exact-2026", "minimist", "nightly-2026"),
+		npmAdvisory("GHSA-ranged-2026", "minimist", "0", "9.9.9"),
+	)
+	store := &fakeOSVStore{policies: map[string]audit.OSVPolicy{
+		manifest.TypeNpm: {Ecosystem: manifest.TypeNpm, Action: ActionBlock},
+	}}
+	ck := NewOSVChecker(store)
+	ck.LocalDB = db
+
+	ve := &manifest.VersionEntry{
+		Version:  "nightly-2026",
+		Metadata: map[string]string{OSVMetaCheckedAt: "2026-01-01T00:00:00Z"},
+	}
+	r := ck.Check(context.Background(), npmPkg(), ve)
+	if r.Action != ActionBlock {
+		t.Fatalf("a matched record still blocks: %+v", r)
+	}
+	if !strings.Contains(r.Reason, "GHSA-ranged-2026") {
+		t.Errorf("admission must name the record nobody read, got %q", r.Reason)
+	}
+	if ve.Metadata[OSVMetaVulns] != "GHSA-exact-2026" {
+		t.Errorf("the ids are still recorded, got %q", ve.Metadata[OSVMetaVulns])
+	}
+	if got := ve.Metadata[OSVMetaCheckedAt]; got != "" {
+		t.Errorf("the stale date must not survive a partial read, got %q", got)
+	}
+}

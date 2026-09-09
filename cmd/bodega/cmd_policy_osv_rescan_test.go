@@ -418,3 +418,98 @@ func TestRescanCommand_RangeEntryPrintsItsMatchedRecord(t *testing.T) {
 		t.Errorf("an unanswered version is written nothing: %+v", st)
 	}
 }
+
+// advisoryVersions builds an advisory naming its affected versions outright,
+// which is the one way a record covers a version string no ordering places.
+func advisoryVersions(id, pkg string, versions ...string) map[string]any {
+	list := make([]any, 0, len(versions))
+	for _, v := range versions {
+		list = append(list, v)
+	}
+	return map[string]any{
+		"id":       id,
+		"modified": "2026-09-01T00:00:00Z",
+		"affected": []any{map[string]any{
+			"package":  map[string]any{"ecosystem": "npm", "name": pkg},
+			"versions": list,
+		}},
+	}
+}
+
+// TestRescanCommand_RowNamesTheRecordNobodyCouldRead is the operator-visible
+// half of the partial-read rule. A version one record covers by name while a
+// second went unread is not a complete answer, and the row is where an
+// operator learns that: a line carrying only the matched id reads as a settled
+// verdict, and the record that could still cover the version appears nowhere
+// but the stderr reason counts.
+func TestRescanCommand_RowNamesTheRecordNobodyCouldRead(t *testing.T) {
+	root := rescanInstall(t, manifest.VersionEntry{Version: "nightly-2026"})
+	syncInto(t, root,
+		advisoryVersions("GHSA-exact-2026", "minimist", "nightly-2026"),
+		advisory("GHSA-ranged-2026", "minimist", "0", "9.9.9"),
+	)
+
+	stdout, stderr, err := runRescan(t)
+	if err == nil {
+		t.Fatalf("a walk that answered for nothing must not exit 0: stdout=%q", stdout)
+	}
+	var row string
+	for _, line := range strings.Split(stdout, "\n") {
+		if strings.Contains(line, "nightly-2026") && strings.Contains(line, "GHSA-exact-2026") {
+			row = line
+		}
+	}
+	if row == "" {
+		t.Fatalf("no row named the matched record: %q", stdout)
+	}
+	if !strings.Contains(row, "GHSA-ranged-2026") {
+		t.Errorf("the row must name the record nobody could read, got %q", row)
+	}
+	if !strings.Contains(stderr, "0 answered") {
+		t.Errorf("a partial read is not an answer: %q", stderr)
+	}
+	if st := stampOf(t, root, "nightly-2026"); !st.Checked.IsZero() {
+		t.Errorf("a partial read earns no date: %+v", st)
+	}
+}
+
+// TestRescanRow_FlaggedRowsCarryTheirReason drives the renderer directly. Both
+// flagged arms are reachable only through a dating rule that admits a
+// qualified answer, so an assertion routed through the command would go green
+// the moment that rule tightened and stop guarding the row at all.
+func TestRescanRow_FlaggedRowsCarryTheirReason(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		ch        policy.OSVRescanChange
+		wantState string
+	}{
+		{"new", policy.OSVRescanChange{
+			Answered: true, Flagged: true,
+			Vulns:  []string{"GHSA-hit"},
+			Reason: "1 OSV record(s) were not evaluated: GHSA-unread",
+		}, "flagged (new)"},
+		{"standing", policy.OSVRescanChange{
+			Answered: true,
+			Vulns:    []string{"GHSA-hit"},
+			Reason:   "1 OSV record(s) were not evaluated: GHSA-unread",
+		}, "flagged"},
+	} {
+		state, detail := rescanRow(tc.ch)
+		if state != tc.wantState {
+			t.Errorf("%s: state = %q, want %q", tc.name, state, tc.wantState)
+		}
+		if !strings.Contains(detail, "GHSA-hit") {
+			t.Errorf("%s: the matched id must lead the row, got %q", tc.name, detail)
+		}
+		if !strings.Contains(detail, "GHSA-unread") {
+			t.Errorf("%s: the row must name what qualified the answer, got %q", tc.name, detail)
+		}
+	}
+
+	// An unqualified answer earns no separator to trail.
+	if _, detail := rescanRow(policy.OSVRescanChange{
+		Answered: true, Flagged: true, Vulns: []string{"GHSA-hit"},
+	}); detail != "GHSA-hit" {
+		t.Errorf("a clean flagged row is the ids alone, got %q", detail)
+	}
+}

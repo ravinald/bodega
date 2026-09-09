@@ -170,8 +170,14 @@ type osvAnswer struct {
 // and nothing left unread that could still cover this version. Anything else
 // leaves the check date alone, because "clean" and "nobody could tell" are the
 // two states the date exists to keep apart.
+//
+// Matching a record is not a substitute for reading the rest of them. One hit
+// beside an unread record is still an incomplete answer, and dating it makes
+// the version indistinguishable from one whose whole database was read; the
+// same version with no hits and the same unread record is already reported
+// unanswered.
 func (a osvAnswer) conclusive() bool {
-	return a.err == nil && a.answered && (a.degraded == "" || len(a.vulns) > 0)
+	return a.err == nil && a.answered && a.degraded == ""
 }
 
 // answerFor is the lookup both admission and rescan go through.
