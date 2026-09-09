@@ -197,14 +197,26 @@ func (c *OSVChecker) answerFor(ctx context.Context, osvEco string, pm *manifest.
 	return ans
 }
 
-// constraintUnevaluatedReason names a constraint no point lookup can settle.
-// Anything other than exact and the empty default is treated as a range,
-// including a value this build does not recognize: guessing at an unknown
-// constraint is how a version gets dated against a query that never covered
-// it.
-func constraintUnevaluatedReason(name string, ve *manifest.VersionEntry) string {
+// OSVDatable reports whether one point lookup can date this entry. Anything
+// other than exact and the empty default is a range, including a value this
+// build does not recognize: guessing at an unknown constraint is how a version
+// gets dated against a query that never covered it.
+//
+// Exported because the writer and the renderer have to agree. A stamp written
+// under one constraint outlives an edit to that constraint, and an imported
+// manifest carries whatever date its source wrote, so `show pkg` has to ask
+// the question again at render time rather than trust the bytes.
+func OSVDatable(ve manifest.VersionEntry) bool {
 	switch ve.VersionConstraint {
 	case "", manifest.ConstraintExact:
+		return true
+	}
+	return false
+}
+
+// constraintUnevaluatedReason names a constraint no point lookup can settle.
+func constraintUnevaluatedReason(name string, ve *manifest.VersionEntry) string {
+	if OSVDatable(*ve) {
 		return ""
 	}
 	return fmt.Sprintf("%s is stored under the %q version constraint, so the versions served are resolved upstream and only %s was queried",

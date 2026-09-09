@@ -107,3 +107,54 @@ func TestShowVersionList_UncoveredEcosystemReadsNA(t *testing.T) {
 		})
 	}
 }
+
+// TestShowVersionList_RangeEntryIsNeverDated is the renderer's half of the
+// rule the gate already applies: a non-exact constraint names a range the
+// server resolves upstream, so no point lookup dates it. A date on such an
+// entry arrived by import or by an edit to the constraint after the check, and
+// printing it as a clean verdict asserts an answer for the in-range releases
+// nobody queried.
+//
+// The ids stay. Those are records against the base version and they are real.
+func TestShowVersionList_RangeEntryIsNeverDated(t *testing.T) {
+	store := showStore(t, manifest.TypeNpm, "minimist",
+		manifest.VersionEntry{Version: "1.2.0", VersionConstraint: manifest.ConstraintCompatible,
+			Metadata: map[string]string{policy.OSVMetaCheckedAt: "2026-01-01T00:00:00Z"}},
+		manifest.VersionEntry{Version: "1.2.9", VersionConstraint: manifest.ConstraintPatch,
+			Metadata: map[string]string{
+				policy.OSVMetaVulns:     "GHSA-range-hit",
+				policy.OSVMetaCheckedAt: "2026-01-01T00:00:00Z",
+			}},
+		manifest.VersionEntry{Version: "1.3.0", VersionConstraint: manifest.ConstraintExact,
+			Metadata: map[string]string{policy.OSVMetaCheckedAt: "2026-01-01T00:00:00Z"}})
+
+	out := captureStdout(t, func() {
+		if err := showVersionList(context.Background(), store, manifest.TypeNpm, "minimist", true, false); err != nil {
+			t.Errorf("showVersionList: %v", err)
+		}
+	})
+
+	row := versionRow(t, out, "1.2.0")
+	if strings.Contains(row, "clean") || strings.Contains(row, "2026-01-01") {
+		t.Errorf("a range entry with no findings is unchecked, not clean and dated: %q", row)
+	}
+	if !strings.Contains(row, "unchecked") || !strings.Contains(row, "never") {
+		t.Errorf("a range entry nothing could date must say so: %q", row)
+	}
+
+	row = versionRow(t, out, "1.2.9")
+	if !strings.Contains(row, "1 vuln(s)") {
+		t.Errorf("a record against the base version is real and stays: %q", row)
+	}
+	if strings.Contains(row, "2026-01-01") {
+		t.Errorf("the finding stays, the date does not: %q", row)
+	}
+	if !strings.Contains(out, "GHSA-range-hit  (checked never)") {
+		t.Errorf("the flagged block must drop the date too:\n%s", out)
+	}
+
+	// The control: an exact entry names one version, so its date stands.
+	if row := versionRow(t, out, "1.3.0"); !strings.Contains(row, "clean") || !strings.Contains(row, "2026-01-01") {
+		t.Errorf("an exact entry keeps the date the gate wrote: %q", row)
+	}
+}

@@ -421,3 +421,48 @@ func TestOSVStamp_UndatableFindingsDropTheOldDate(t *testing.T) {
 		t.Errorf("stamp should read flagged with no date, got %+v", st)
 	}
 }
+
+// TestOSVRescan_NonExactConstraintStillNamesItsRecords is the other half of
+// the range rule. The entry is not stamped and not counted, but a record
+// matched against the base version is a real record: admission blocks on it,
+// and a rescan that reported nothing would be silent on the exact case it
+// exists for.
+func TestOSVRescan_NonExactConstraintStillNamesItsRecords(t *testing.T) {
+	db := dbWithNpm(t, t.TempDir(), npmAdvisory("GHSA-range-hit", "minimist", "1.2.9", "1.3.0"))
+	ve := &manifest.VersionEntry{
+		Version:           "1.2.9",
+		VersionConstraint: manifest.ConstraintCompatible,
+	}
+
+	ch := rescanChecker(db).Rescan(context.Background(), npmPkg(), ve)
+	if ch.Answered || ch.Flagged {
+		t.Fatalf("a range entry is still unanswered and uncounted: %+v", ch)
+	}
+	if len(ch.Vulns) != 1 || ch.Vulns[0] != "GHSA-range-hit" {
+		t.Errorf("the matched record must reach the report, got %v", ch.Vulns)
+	}
+	if len(ve.Metadata) != 0 {
+		t.Errorf("an unanswered version is written nothing, got %v", ve.Metadata)
+	}
+}
+
+// TestOSVDatable pins the predicate the writer and the renderer share. They
+// drifted apart once already: the writer stopped dating a range entry and
+// `show pkg` kept printing any date one carried as a clean verdict.
+func TestOSVDatable(t *testing.T) {
+	for _, tc := range []struct {
+		constraint string
+		want       bool
+	}{
+		{"", true},
+		{manifest.ConstraintExact, true},
+		{manifest.ConstraintCompatible, false},
+		{manifest.ConstraintPatch, false},
+		{manifest.ConstraintAny, false},
+		{"constraint-from-a-later-build", false},
+	} {
+		if got := OSVDatable(manifest.VersionEntry{VersionConstraint: tc.constraint}); got != tc.want {
+			t.Errorf("OSVDatable(%q) = %v, want %v", tc.constraint, got, tc.want)
+		}
+	}
+}

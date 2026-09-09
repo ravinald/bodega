@@ -433,6 +433,12 @@ than gaining an invented date.
 func rescanRow(ch policy.OSVRescanChange) (state, detail string) {
 	switch {
 	case !ch.Answered:
+		// Ids first: an operator scanning the column for advisory names has
+		// to find one here too, or a matched record hides behind the prose
+		// explaining why nothing was written.
+		if len(ch.Vulns) > 0 {
+			return "unanswered", strings.Join(ch.Vulns, ", ") + "; " + ch.Reason
+		}
 		return "unanswered", ch.Reason
 	case ch.Flagged:
 		return "flagged (new)", strings.Join(ch.Vulns, ", ")

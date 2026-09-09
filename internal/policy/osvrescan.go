@@ -67,7 +67,11 @@ func stampOSV(ve *manifest.VersionEntry, vulns []osvVuln, checkedAt time.Time) {
 // take a fleet offline without an operator in the loop.
 type OSVRescanChange struct {
 	Answered bool
-	Vulns    []string
+	// Vulns are the ids the lookup matched, reported whether or not the run
+	// could answer for the version: a range entry is not stamped and not
+	// counted, and a record found against its base version is still worth
+	// naming in the row.
+	Vulns []string
 	// Flagged is the transition into findings: unchecked or clean before,
 	// carrying ids now. Cleared is the reverse, which is what an OSV
 	// withdrawal looks like from here.
@@ -99,7 +103,13 @@ func (c *OSVChecker) Rescan(ctx context.Context, pm *manifest.PackageManifest, v
 		if ans.err != nil {
 			reason = ans.err.Error()
 		}
-		return OSVRescanChange{Reason: reason}
+		// A record matched against the base version is a real record, and
+		// admission names it on the same entry against the same database.
+		// The version stays unanswered and unstamped, because the range it
+		// stands for was never queried, but dropping the ids would leave the
+		// verb built for the late-published advisory silent on the case it
+		// exists for.
+		return OSVRescanChange{Vulns: vulnIDs(ans.vulns), Reason: reason}
 	}
 
 	ids := vulnIDs(ans.vulns)

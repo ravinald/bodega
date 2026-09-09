@@ -7,6 +7,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -302,6 +303,14 @@ func showVersionList(ctx context.Context, store *manifest.Store, typ, name strin
 				hidden = "yes"
 			}
 			st := policy.OSVStampOf(ve)
+			if !policy.OSVDatable(ve) {
+				// The gate refuses to date a range entry, so a date on one
+				// arrived by import or by an edit to the constraint after
+				// the check. The ids are records against the base version
+				// and stay; the date claims an answer for the in-range
+				// releases nobody queried.
+				st.Checked = time.Time{}
+			}
 			osvState, osvChecked := osvVersionState(osvCovered, st)
 			fmt.Printf("%-12s %-15s %-6s %-8s %-8s %-10s %-11s %-10s\n",
 				v, platform, "-", frozen, hidden, constraint, osvState, osvChecked)
