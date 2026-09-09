@@ -259,6 +259,13 @@ func runPage(t *testing.T, hash string, canned map[string]any) probeResult {
 	t.Helper()
 	node, err := exec.LookPath("node")
 	if err != nil {
+		// A developer without node still gets the rest of the suite. CI is the
+		// one place where a skip here would be indistinguishable from a pass,
+		// so on a runner it is a failure: GitHub's ubuntu images ship node,
+		// and the day one stops, this says so rather than going quiet.
+		if os.Getenv("CI") != "" {
+			t.Fatal("node not on PATH; the page's own JavaScript went unexercised on a CI runner")
+		}
 		t.Skip("node not on PATH; the page's own JavaScript cannot be executed here")
 	}
 
