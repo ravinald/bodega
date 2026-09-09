@@ -314,16 +314,16 @@ func TestAdmitKeepsWarningsBehindABlock(t *testing.T) {
 func TestOSVCheckerReusesTheDatabase(t *testing.T) {
 	cfg := &config.Config{OSVDBDir: t.TempDir()}
 
-	first := osvChecker(cfg, nil)
+	first := OSVChecker(cfg, nil)
 	if first.LocalDB == nil {
 		t.Fatal("osv_db_dir is set and no local database was wired")
 	}
-	if second := osvChecker(cfg, nil); first.LocalDB != second.LocalDB {
+	if second := OSVChecker(cfg, nil); first.LocalDB != second.LocalDB {
 		t.Error("each admission built its own OSV database; the index cannot survive one package")
 	}
 
 	other := &config.Config{OSVDBDir: t.TempDir()}
-	if osvChecker(other, nil).LocalDB == first.LocalDB {
+	if OSVChecker(other, nil).LocalDB == first.LocalDB {
 		t.Error("two osv_db_dir values shared one database")
 	}
 }

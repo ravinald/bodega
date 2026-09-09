@@ -11,7 +11,9 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
 
@@ -42,14 +44,23 @@ sync is the only subcommand that reaches the network. Admission answers
 from the directory sync wrote (osv_db_dir), and queries api.osv.dev only
 when osv_api_fallback is on and the local copy cannot answer.
 
+Admission checks a version once, on the day it was imported. rescan is
+what turns that into an answer about today.
+
   bodega policy osv sync
   bodega policy osv set npm block
   bodega policy osv set pypi warn
   bodega policy osv list
+  bodega policy osv rescan --type npm
   bodega policy osv remove npm`,
 	}
 	cmd.AddCommand(newPolicyOSVSetCmd(gf), newPolicyOSVListCmd(gf),
-		newPolicyOSVRemoveCmd(gf), newPolicyOSVSyncCmd(gf))
+		newPolicyOSVRemoveCmd(gf), newPolicyOSVSyncCmd(gf),
+		// The policy subtree is quiet, and rescan is the one verb under it
+		// that rewrites manifests. Without this the server keeps serving the
+		// pre-rescan stamp for the life of the process, because
+		// manifest.Store answers from its cache after the first read.
+		signalsReload(newPolicyOSVRescanCmd(gf)))
 	return cmd
 }
 
@@ -244,4 +255,210 @@ func onOff(b bool) string {
 		return "on"
 	}
 	return "off"
+}
+
+func newPolicyOSVRescanCmd(gf *globalFlags) *cobra.Command {
+	var typeFlag, nameFlag string
+	cmd := &cobra.Command{
+		Use:   "rescan [--type TYPE] [--name NAME]",
+		Short: "Re-check stored versions against the local OSV database",
+		Long: `Walk the manifests, re-run the OSV lookup for every stored version in
+an OSV-covered ecosystem, and re-stamp what the local database says
+today. Admission checked each version once, on the day it was imported;
+advisories published against versions already in the field are the normal
+case, so that answer ages out.
+
+rescan records and decides nothing. It never blocks, hides, freezes or
+deletes: an OSV data refresh that flags a base image would otherwise take
+a fleet offline with no operator in the loop. What it changes is the
+stamp, and the summary on stderr is what an operator acts on.
+
+Versions the database cannot answer for keep the stamp they had. A
+version checked before the check date existed reads as unchecked rather
+than gaining an invented date.
+
+  bodega policy osv rescan
+  bodega policy osv rescan --type npm
+  bodega policy osv rescan --type pypi --name django`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig(gf)
+			if err != nil {
+				return err
+			}
+			if err := ensureMutable(cfg); err != nil {
+				return err
+			}
+			types := policy.OSVEcosystems()
+			if typeFlag != "" {
+				if err := requireEcosystem(typeFlag, policy.OSVEcosystems(), "OSV gate",
+					"there are no OSV records to re-check it against"); err != nil {
+					return err
+				}
+				types = []string{typeFlag}
+			}
+			store, err := loadStore(gf)
+			if err != nil {
+				return fmt.Errorf("load manifests: %w", err)
+			}
+			adb := openAuditDB(gf)
+			if adb != nil {
+				defer adb.Close()
+			}
+			ck := admit.OSVChecker(cfg, adb)
+
+			// The index keys packages by manifest.SafeName, which collapses
+			// "/" to "--". Comparing the operator's spelling against that
+			// walks nothing for every scoped npm package and every gomod
+			// module path.
+			wantName := ""
+			if nameFlag != "" {
+				wantName = manifest.SafeName(nameFlag)
+			}
+
+			ctx := cmd.Context()
+			var sum policy.OSVRescanSummary
+			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+			rows := 0
+			row := func(typ, pkg, version, state, detail string) {
+				if rows == 0 {
+					fmt.Fprintln(w, "TYPE\tPACKAGE\tVERSION\tSTATE\tDETAIL")
+				}
+				rows++
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", typ, pkg, version, state, detail)
+			}
+			// A manifest that will not load or will not save is one package
+			// the run could not answer for, not grounds to discard the report
+			// for every other package. The walk finishes and the summary says
+			// what it missed.
+			fail := func(typ, pkg, reason string) {
+				sum.Add(policy.OSVRescanChange{Reason: reason})
+				row(typ, pkg, "-", "unanswered", reason)
+			}
+			matched, failures, saved := 0, 0, 0
+			for _, t := range types {
+				for _, name := range store.ListPackages(t) {
+					if wantName != "" && name != wantName {
+						continue
+					}
+					matched++
+					pm, err := store.GetPackage(ctx, t, name)
+					if err != nil {
+						failures++
+						fail(t, name, fmt.Sprintf("load %s/%s: %v", t, name, err))
+						continue
+					}
+					// An index entry whose manifest file is gone is a package
+					// the run could not answer for, not one with nothing to
+					// say. 'bodega repair' counts the same state as an issue;
+					// skipping it silently here reports a fleet nobody looked
+					// at as a fleet with no findings.
+					if pm == nil {
+						failures++
+						fail(t, name, fmt.Sprintf("%s/%s is in the index with no manifest file", t, name))
+						continue
+					}
+					changed := false
+					for i := range pm.Versions {
+						ve := &pm.Versions[i]
+						ch := ck.Rescan(ctx, pm, ve)
+						sum.Add(ch)
+						if ch.Answered {
+							changed = true
+						}
+						state, detail := rescanRow(ch)
+						if state == "" {
+							continue
+						}
+						row(t, pm.Name, ve.Version, state, detail)
+					}
+					// One write per package, and only when something was
+					// answered: a walk that learned nothing must not rewrite
+					// every manifest in the store.
+					if changed {
+						if err := store.SavePackage(ctx, pm); err != nil {
+							failures++
+							fail(t, name, fmt.Sprintf("save %s/%s: %v", t, name, err))
+							continue
+						}
+						saved++
+					}
+				}
+			}
+			if err := w.Flush(); err != nil {
+				return err
+			}
+			sum.Report(os.Stderr)
+			if saved == 0 {
+				suppressReload(cmd)
+			}
+			if wantName != "" && matched == 0 {
+				as := ""
+				if wantName != nameFlag {
+					as = fmt.Sprintf(" (index key %q)", wantName)
+				}
+				return fmt.Errorf("no package named %q%s in %s: nothing was re-checked",
+					nameFlag, as, strings.Join(types, ", "))
+			}
+			// Name the population, not a cause. A walk answers for nothing
+			// when the mirror is missing, when the store failed, and when
+			// every entry carries a range no point lookup settles; the
+			// reasons printed above tell those apart, and asserting one of
+			// them here sends the operator to the wrong subsystem.
+			if sum.Answered == 0 && sum.Walked > 0 && failures == 0 {
+				return fmt.Errorf("nothing was re-checked: none of %d version(s) could be answered for; the reasons are above", sum.Walked)
+			}
+			if failures > 0 {
+				// The post-run hook fires only after a nil return, and a walk
+				// that re-stamped eight packages before failing on the ninth
+				// still changed what the server should be serving.
+				if saved > 0 {
+					signalReloadNow(cmd, gf)
+				}
+				return fmt.Errorf("%d package(s) could not be read or written; their stamps are unchanged", failures)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&typeFlag, "type", "", "Restrict the walk to one registry type")
+	cmd.Flags().StringVar(&nameFlag, "name", "", "Restrict the walk to one package name")
+	return cmd
+}
+
+// rescanRow renders the one line a version earns in the report, or "" for a
+// version that stayed clean. A clean version is in the summary count and
+// nowhere else: the table is the list an operator has to read, and padding it
+// with every version that did not change is how the two flagged rows get
+// missed.
+func rescanRow(ch policy.OSVRescanChange) (state, detail string) {
+	switch {
+	case !ch.Answered:
+		// Ids first: an operator scanning the column for advisory names has
+		// to find one here too, or a matched record hides behind the prose
+		// explaining why nothing was written.
+		return "unanswered", withReason(strings.Join(ch.Vulns, ", "), ch.Reason)
+	case ch.Flagged:
+		return "flagged (new)", withReason(strings.Join(ch.Vulns, ", "), ch.Reason)
+	case len(ch.Vulns) > 0:
+		return "flagged", withReason(strings.Join(ch.Vulns, ", "), ch.Reason)
+	case ch.Cleared:
+		return "cleared", withReason("no OSV records match it today", ch.Reason)
+	default:
+		return "", ""
+	}
+}
+
+// withReason appends what qualified an answer to the answer itself. The row is
+// the only per-version surface an operator reads, so a caveat that reaches the
+// stderr reason counts and not the row leaves one line claiming a complete
+// verdict the run never had.
+func withReason(detail, reason string) string {
+	switch {
+	case reason == "":
+		return detail
+	case detail == "":
+		return reason
+	default:
+		return detail + "; " + reason
+	}
 }

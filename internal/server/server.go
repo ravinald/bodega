@@ -555,6 +555,13 @@ func (s *Server) Start(ctx context.Context) error {
 	// built from them.
 	sighupCh := make(chan os.Signal, 1)
 	signal.Notify(sighupCh, syscall.SIGHUP)
+	// Without this the handler goroutine outlives the server it belongs to and
+	// keeps reloading global state on every later SIGHUP, so a process that
+	// stops and restarts a server ends up with several of them racing.
+	defer func() {
+		signal.Stop(sighupCh)
+		close(sighupCh)
+	}()
 	//nolint:gosec // G118: signal handler is server-lifecycle, intentionally decoupled from any request context.
 	go func() {
 		for range sighupCh {
@@ -872,9 +879,12 @@ func (s *Server) handleAPIPackageVersion(w http.ResponseWriter, r *http.Request)
 	name := r.PathValue("name")
 	version := r.PathValue("version")
 
+	// cargo is in this list and not in the two handlers above: the OSV gate
+	// covers crates.io, so a cargo version carries the same vetting stamp as
+	// an npm one and an operator has to be able to read it back.
 	switch t {
 	case manifest.TypeApt, manifest.TypeGit, manifest.TypePypi, manifest.TypeBinary,
-		manifest.TypeGomod, manifest.TypeHelm, manifest.TypeNpm:
+		manifest.TypeGomod, manifest.TypeHelm, manifest.TypeNpm, manifest.TypeCargo:
 		pm, err := s.store.GetPackage(ctx, t, name)
 		if err != nil {
 			s.logger.Error("get package failed", "type", t, "name", name, "error", err)

@@ -198,7 +198,7 @@ func checkVersions(ctx context.Context, adb *audit.DB, cfg *config.Config, pm *m
 	}
 	checkers := []policy.VersionChecker{
 		policy.NewAgeChecker(adb),
-		osvChecker(cfg, adb),
+		OSVChecker(cfg, adb),
 	}
 	warns := &versionWarnings{}
 	defer warns.flush(res)
@@ -276,12 +276,17 @@ func describeVersions(versions []string) string {
 	return fmt.Sprintf("%d versions (%s, ...)", len(versions), strings.Join(versions[:shown], ", "))
 }
 
-// osvChecker points the OSV gate at the local database `bodega policy osv
+// OSVChecker points the OSV gate at the local database `bodega policy osv
 // sync` wrote. The config keys are read here rather than in internal/policy so
 // the gate stays usable from a test or a tool that holds no Config; a nil one
 // leaves the checker with no database and no fallback, which warns rather than
 // passing.
-func osvChecker(cfg *config.Config, adb *audit.DB) *policy.OSVChecker {
+//
+// Exported for `bodega policy osv rescan`, which has to answer from the same
+// database and the same fallback rule admission answers from. A second copy of
+// these three keys is how a rescan starts reporting on data admission never
+// read.
+func OSVChecker(cfg *config.Config, adb *audit.DB) *policy.OSVChecker {
 	ck := policy.NewOSVChecker(adb)
 	if cfg == nil {
 		return ck

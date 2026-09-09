@@ -7,10 +7,12 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 )
 
 func newShowCmd(gf *globalFlags) *cobra.Command {
@@ -264,10 +266,17 @@ func showVersionList(ctx context.Context, store *manifest.Store, typ, name strin
 	fmt.Println()
 
 	if admin {
-		fmt.Printf("%-12s %-15s %-6s %-8s %-8s %-10s\n", "VERSION", "PLATFORM", "STORED", "FROZEN", "HIDDEN", "CONSTRAINT")
+		fmt.Printf("%-12s %-15s %-6s %-8s %-8s %-10s %-11s %-10s\n",
+			"VERSION", "PLATFORM", "STORED", "FROZEN", "HIDDEN", "CONSTRAINT", "OSV", "CHECKED")
 	} else {
 		fmt.Printf("%-12s %-15s %-10s\n", "VERSION", "PLATFORM", "CONSTRAINT")
 	}
+	// The row's cells and the flagged block below the table read the same
+	// stamp, so one answer to "can OSV cover this type at all" has to drive
+	// both: an imported manifest can carry vetting.osv.* keys for a type
+	// bodega's own writers never stamp.
+	osvCovered := policy.OSVEcosystemFor(typ) != ""
+	var flagged []string
 	for _, ve := range pm.Versions {
 		if ve.Hidden && !admin {
 			continue
@@ -293,12 +302,53 @@ func showVersionList(ctx context.Context, store *manifest.Store, typ, name strin
 			if ve.Hidden {
 				hidden = "yes"
 			}
-			fmt.Printf("%-12s %-15s %-6s %-8s %-8s %-10s\n", v, platform, "-", frozen, hidden, constraint)
+			st := policy.OSVStampOf(ve)
+			if !policy.OSVDatable(ve) {
+				// The gate refuses to date a range entry, so a date on one
+				// arrived by import or by an edit to the constraint after
+				// the check. The ids are records against the base version
+				// and stay; the date claims an answer for the in-range
+				// releases nobody queried.
+				st.Checked = time.Time{}
+			}
+			osvState, osvChecked := osvVersionState(osvCovered, st)
+			fmt.Printf("%-12s %-15s %-6s %-8s %-8s %-10s %-11s %-10s\n",
+				v, platform, "-", frozen, hidden, constraint, osvState, osvChecked)
+			if osvCovered && st.Flagged() {
+				flagged = append(flagged, fmt.Sprintf("  %-12s %s  (checked %s)",
+					v, strings.Join(st.Vulns, ", "), osvCheckedOn(st)))
+			}
 		} else {
 			fmt.Printf("%-12s %-15s %-10s\n", v, platform, constraint)
 		}
 	}
+	if len(flagged) > 0 {
+		fmt.Printf("\nFlagged by OSV:\n%s\n", strings.Join(flagged, "\n"))
+	}
 	return nil
+}
+
+// osvVersionState renders a version's OSV and CHECKED cells. A registry type
+// OSV holds no records for reads "n/a" rather than "unchecked": no command can
+// ever change that cell, and "unchecked" would send the operator to
+// `policy osv rescan`, which refuses to run on an ecosystem the gate does not
+// cover.
+func osvVersionState(covered bool, st policy.OSVStamp) (state, checked string) {
+	if !covered {
+		return "n/a", "-"
+	}
+	return st.State(), osvCheckedOn(st)
+}
+
+// osvCheckedOn renders the date the OSV gate last answered for a version.
+// "never" rather than a blank column: a version carrying no check date was
+// either imported before the date existed or never reached the gate, and both
+// mean nobody can say what it is today.
+func osvCheckedOn(st policy.OSVStamp) string {
+	if st.Checked.IsZero() {
+		return "never"
+	}
+	return st.Checked.UTC().Format("2006-01-02")
 }
 
 // ---------- depth 3: version detail or "all" ----------

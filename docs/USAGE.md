@@ -164,6 +164,8 @@ bodega show pkg pypi django 5.2.12    # specific version detail
 bodega show pkg pypi django json      # JSON output
 ```
 
+The version list carries an `OSV` and a `CHECKED` column per version, and names the flagged ids underneath. See [`bodega policy osv`](#bodega-policy-osv-syncsetlistremoverescan) for what `unchecked` means and how the date gets written.
+
 ### `bodega pkg hide TYPE NAME [VERSION]`
 
 Toggle the hidden flag on a package or version. Hidden packages are not served to clients but remain in the manifest for record-keeping.
@@ -573,7 +575,7 @@ Removes a rule. Tries by ID first; falls back to deleting by pattern, scoped to 
 
 Walks every manifest in the store and reports any entry whose upstream URL or package name would be rejected by the current policy. Exits with code 1 on any violation — suitable for CI.
 
-### `bodega policy osv <sync|set|list|remove>`
+### `bodega policy osv <sync|set|list|remove|rescan>`
 
 Matches every `(ecosystem, name, version)` an import carries against a local copy of the OSV database and warns or blocks on the per-ecosystem policy.
 
@@ -582,6 +584,7 @@ bodega policy osv sync
 bodega policy osv set cargo block
 bodega policy osv set npm warn
 bodega policy osv list
+bodega policy osv rescan --type npm
 bodega policy osv remove npm
 ```
 
@@ -699,7 +702,7 @@ pypi/pynetbox: 4.1.0: osv: 1 OSV record(s) for pynetbox were not evaluated again
 Imported pypi/pynetbox (1 version(s))
 ```
 
-A version matching other records blocks on those and carries the unevaluated ids in the same reason, capped at five ids plus a count. `api.osv.dev` is not consistent on this population: over 130 probes at published versions across those 15 packages it agreed 123 times, returning nothing for the record exactly as the local matcher does. The other 7 are the API failing open on a bound it also cannot place, returning GHSA-jqqh-999x-w26w, fixed in `buildbot` 0.7.11p3 in 2007, for `buildbot@4.3.0`. Reproducing that would mean shipping a block no operator can clear, so the matcher reports the record and declines to guess. Turn `osv_api_fallback` on to see what the API says about one.
+A version matching other records blocks on those and carries the unevaluated ids in the same reason, capped at five ids plus a count. Matching one record settles nothing about the one nobody read, so such a version is stamped with its ids and no check date, the same treatment the identical version with zero matches beside that record already gets. `api.osv.dev` is not consistent on this population: over 130 probes at published versions across those 15 packages it agreed 123 times, returning nothing for the record exactly as the local matcher does. The other 7 are the API failing open on a bound it also cannot place, returning GHSA-jqqh-999x-w26w, fixed in `buildbot` 0.7.11p3 in 2007, for `buildbot@4.3.0`. Reproducing that would mean shipping a block no operator can clear, so the matcher reports the record and declines to guess. Turn `osv_api_fallback` on to see what the API says about one.
 
 A version with OSV records is stamped on its `VersionEntry.Metadata`, so the finding follows the version into the manifest rather than living only in the audit event:
 
@@ -707,12 +710,81 @@ A version with OSV records is stamped on its `VersionEntry.Metadata`, so the fin
 |-----|-------|
 | `vetting.osv.vulns` | comma-separated OSV ids, sorted |
 | `vetting.osv.severity` | JSON object keyed by OSV id, each value the record's `severity` array as OSV returned it |
+| `vetting.osv.checked_at` | RFC 3339 timestamp of the last check that reached a verdict |
 
 `vetting.osv.severity` is present only when at least one record carried a score, and ids OSV scored nothing for are absent from it; `vetting.osv.vulns` is the full list either way. A version matching several records at different severities keeps them apart by id, so a reader ranking findings parses the stamp instead of querying OSV a second time.
+
+`vetting.osv.checked_at` is what makes the other two readable. Without it a version with no findings and a version nobody ever queried both carry an absent `vetting.osv.vulns`, so "no known vulnerabilities" and "nobody looked" print the same. The date is written on a clean result and a flagged one alike, and only when the gate reached a verdict: a check answered out of a database too old to be trusted names the records it found and drops the date rather than keeping the one already there, an entry whose `version_constraint` is not exact is never dated at all, because the range it names is not the version that was queried, and a record naming the package that nobody could evaluate withholds the date whether or not some other record matched. A date left in place would then sit beside findings the check that wrote it never saw, and `show pkg` would render a fresh flag under the day the version last read clean.
+
+Versions imported before this key existed cannot be backfilled. Nothing on disk records when they were checked, and dating them from the manifest's timestamp would invent the fact the field carries, so they read as `unchecked` until a rescan answers for them.
 
 ```json
 {"GHSA-xxxx-yyyy-zzzz":[{"type":"CVSS_V3","score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}]}
 ```
+
+#### Rescan
+
+Admission checks a version once, on the day somebody imported it. That answer never gets revisited, so a version admitted clean fourteen months ago is still recorded as clean, and CVEs published against versions already in the field are the normal case rather than the exception. **Admission-time checking alone does not tell you what is vulnerable today.** It tells you what was vulnerable on the day of the import, and nothing in the output distinguishes those two sentences.
+
+`rescan` closes that gap. It walks the manifests, re-runs the lookup against the local database, and re-stamps every version it can answer for.
+
+```
+$ bodega policy osv rescan
+TYPE  PACKAGE   VERSION  STATE          DETAIL
+npm   minimist  1.2.0    flagged (new)  GHSA-vh95-rmgr-6w4m, GHSA-xvch-5gv4-984h
+Rescanned 2 version(s): 2 answered, 1 newly flagged, 0 newly cleared.
+```
+
+`--type` and `--name` scope the walk. `--type` refuses an ecosystem OSV has no records for, rather than reporting a clean pass over it. `--name` takes the package name as you would type it anywhere else, scoped npm packages and gomod module paths included: `--name '@types/node'` and `--name 'github.com/spf13/cobra'` both resolve to the encoded key the manifest index stores. A `--name` that matches no package exits 1 rather than reporting a clean walk over nothing.
+
+A manifest the walk cannot read or cannot write back counts as unanswered, with the error as its reason, and the walk continues. A package listed in the index whose manifest file is gone counts the same way, naming that state as its reason: `bodega repair` reports the same drift, and a walk that skipped it silently would report a package nobody could look at as a package with no findings. One corrupt file does not cost you the report on everything beside it; the command still exits 1 so the failure is not silent.
+
+**A non-exact `version_constraint` is not one version, so nothing dates it.** An entry stored under `compatible`, `patch` or `any` names a range the server resolves against upstream, and it serves in-range releases the manifest never lists. A lookup on the base version answers for exactly one of them, so those entries count unanswered, keep the stamp they had, and earn a row naming the constraint. A record matched against the base version is still named in that row, ahead of the reason: it is a real record, and a verb built for the late-published advisory that printed nothing on it would be silent on its own case.
+
+Admission and rescan part company on what they write for such an entry, on purpose. Admission is the moment the record is learned, so it stamps the ids and withholds the date, dropping any date the entry already carried. Rescan writes nothing at all: it is re-reading an entry that already exists, and the only thing it could add is a claim about releases it never queried. `show pkg` applies the same rule at render time, printing `never` in `CHECKED` for a range entry whatever date it carries, because an imported manifest and an edit to the constraint after a check both put a date there that no lookup supports. `bodega pkg refresh` materializes the in-range releases as exact entries, and a rescan dates each of those.
+
+The table lists what an operator has to read: every version carrying findings, the ones that just gained or lost them, and the ones nothing could answer for. Whatever qualified an answer is on the row that answer produced, after the ids: a caveat that reached only the reason counts on stderr leaves one line claiming a verdict the run never had. A version that stayed clean is in the count on stderr and nowhere else. Findings go to stdout and the summary to stderr, so a report pipes cleanly while the counts stay on the terminal.
+
+**Rescan records and decides nothing.** It never blocks, hides, freezes or deletes. An OSV data refresh that flags the base image half a fleet runs on would otherwise take that fleet offline with no operator in the loop, on the strength of a third-party data push. What to do about a version that has become vulnerable is a decision, and it stays with the person reading the report.
+
+**A run that could not read the database does not look like a clean run.** Both print zero newly flagged, so the summary carries an unanswered count and the reason behind it, and the command exits 1 when it answered for nothing:
+
+```
+$ bodega policy osv rescan
+TYPE  PACKAGE   VERSION  STATE       DETAIL
+npm   minimist  1.2.0    unanswered  no local OSV database for npm in /var/lib/bodega/osv; run `bodega policy osv sync`; osv_api_fallback is off, so nothing was queried
+npm   minimist  1.2.5    unanswered  no local OSV database for npm in /var/lib/bodega/osv; run `bodega policy osv sync`; osv_api_fallback is off, so nothing was queried
+Rescanned 2 version(s): 0 answered, 0 newly flagged, 0 newly cleared.
+2 version(s) unanswered; their previous stamp is unchanged.
+  2 x no local OSV database for npm in /var/lib/bodega/osv; run `bodega policy osv sync`; osv_api_fallback is off, so nothing was queried
+Error: nothing was re-checked: none of 2 version(s) could be answered for; the reasons are above
+```
+
+Every unanswered version earns its own row. An unanswered version keeps the stamp it had. Overwriting a real finding with a blank one because the mirror was missing is how a rescan reports a clean fleet it never looked at.
+
+Unlike `set`, `list` and the gate itself, `rescan` reads no policy row. Whether a version is vulnerable today is the same fact under `warn`, `block` and `ignore`; the row decides what admission does with a finding, not whether the finding is recorded. So an install that has configured no OSV policy still gets the report.
+
+A rescan that wrote anything signals a running `bodega serve`, so the API reflects the new stamps without a restart. `manifest.Store` answers a package request from its cache once it has served that package, so without the signal a long-running server would keep calling a freshly flagged version clean for the life of the process. A walk that saved nothing sends nothing, and a walk that saved some packages before failing on others signals anyway before it exits 1.
+
+Nothing schedules a rescan. Pair it with `sync` in the same cron entry: refreshing the mirror and never re-reading it against what is stored leaves the gate current for imports that have not happened yet and stale for everything already served.
+
+Results surface where an operator already looks. `bodega show pkg <type> <name>` carries an `OSV` and a `CHECKED` column per version and names the flagged ids underneath:
+
+```
+$ bodega show pkg npm minimist
+Package: minimist
+
+VERSION      PLATFORM        STORED FROZEN   HIDDEN   CONSTRAINT OSV         CHECKED
+1.2.0        any             -      no       no       exact      2 vuln(s)   2026-09-08
+1.2.8        any             -      no       no       exact      clean       2026-09-08
+
+Flagged by OSV:
+  1.2.0        GHSA-vh95-rmgr-6w4m, GHSA-xvch-5gv4-984h  (checked 2026-09-08)
+```
+
+The `OSV` cell reads `n/a` on `apt`, `binary`, `git` and `helm`. Those four have no OSV ecosystem identifier, so no rescan can ever answer for them, and `unchecked` would send the operator to a verb that refuses to run on them. On the covered types the cell reads `unchecked`, `clean` or a finding count, and `CHECKED` carries the date of the last conclusive answer. The `Flagged by OSV` block obeys the same rule: a version whose row reads `n/a` never appears in it. `bodega pkg import` accepts a manifest carrying `vetting.osv.*` keys for any type, so a stamp exported from another instance can land on `apt`, and printing it as a dated finding under a cell that says the check can never run would contradict the row four lines above it.
+
+`GET /api/v1/packages/{type}/{name}/{version}` carries the same three keys on the version's `metadata`.
 
 ### `bodega policy age <set|list|remove>`
 
@@ -1831,7 +1903,7 @@ A rebuild happens on:
 
 **A manifest edited by hand is picked up on the next tick, or at once on `SIGHUP`** (`kill -HUP $(cat <log_dir>/bodega.pid)`). The tick re-reads the manifest index from the backend before rebuilding, so an edit made outside the process reaches the index without a signal; the wait is up to an hour. A verb that changes what is served signals, so the normal workflow never waits, and the tick is the floor under a signal that never arrived.
 
-The TUI reaches none of that. Its freeze, delete and remove actions call the same work the verbs do without passing through cobra, so they signal from the run helpers themselves; a mutating action added there gets it by construction rather than by remembering. Which CLI verb signals is declared once per command where it is registered in `cmd/bodega/main.go`, and a group answers for its subtree. `TestEveryRunnableCommandIsClassified` fails the build on a command that declares neither, because a verb missing its signal looks exactly like a verb that never needed one: `pkg hide`, `freeze`, `refresh` and `remove` each shipped without it, and a hidden package stayed published until someone restarted the server. `bodega apt key` and `bodega acl` are in the quiet group on purpose: the rotation runbook above signals with `systemctl reload`, and the access lists carry their own 30s cache.
+The TUI reaches none of that. Its freeze, delete and remove actions call the same work the verbs do without passing through cobra, so they signal from the run helpers themselves; a mutating action added there gets it by construction rather than by remembering. Which CLI verb signals is declared once per command where it is registered in `cmd/bodega/main.go`, and a group answers for its subtree; a leaf overrides its group, which is how `bodega policy osv rescan` signals from under a quiet `policy`. `TestEveryRunnableCommandIsClassified` fails the build on a command that declares neither, because a verb missing its signal looks exactly like a verb that never needed one: `pkg hide`, `freeze`, `refresh` and `remove` each shipped without it, and a hidden package stayed published until someone restarted the server. `bodega apt key` and `bodega acl` are in the quiet group on purpose: the rotation runbook above signals with `systemctl reload`, and the access lists carry their own 30s cache.
 
 The retry interval matters because a snapshot that never built is a 503 on every apt request, and the ordinary way to land there is transient: expired credentials, or a network that was not up when systemd started the unit. Those clear in seconds and the first few attempts catch them. A wrong bucket, revoked credentials or a role that lost `s3:ListBucket` never clears at all, so the interval doubles up to the hourly one: 7 attempts in the first hour rather than 240, each of which is a manifest reload, a pool listing and an `ERROR` line against a dependency already failing. The first snapshot puts the loop straight back on the hourly interval however far the retry had walked.
 
@@ -1982,6 +2054,7 @@ All API responses are JSON. The full API is documented in [OpenAPI 3.0 format](.
 | GET | `/api/v1/packages` | All entries across all types |
 | GET | `/api/v1/packages/{type}` | Entries for one type |
 | GET | `/api/v1/packages/{type}/{name}` | Single entry details |
+| GET | `/api/v1/packages/{type}/{name}/{version}` | One version, as a manifest scoped to it. Carries the `vetting.osv.*` keys on `metadata` |
 | GET | `/api/v1/status` | Health check with entry counts, S3 probe, and the apt client state |
 | GET | `/api/v1/config` | Non-sensitive config (bucket, region, manifest_dir) |
 | GET | `/api/v1/audit` | Query audit events (supports filters) |

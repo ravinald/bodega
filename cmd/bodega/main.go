@@ -118,9 +118,7 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 	// command in the tree defines one, so this hook sees every successful
 	// invocation and signals for the ones classified in the trees below.
 	root.PersistentPostRun = func(cmd *cobra.Command, _ []string) {
-		if intent, ok := reloadIntent(cmd); ok && intent == reloadSignal {
-			notifyServer(gf)
-		}
+		signalReloadNow(cmd, gf)
 	}
 
 	// Persistent flags apply to every sub-command.

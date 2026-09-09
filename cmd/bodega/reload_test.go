@@ -1,11 +1,15 @@
 package main
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -20,6 +24,7 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 	"github.com/ravinald/bodega/internal/server"
 	"github.com/ravinald/bodega/internal/storage"
 )
@@ -93,6 +98,27 @@ func TestWithdrawalVerbsSignal(t *testing.T) {
 		}
 		if got, ok := reloadIntent(cmd); !ok || got != intent {
 			t.Errorf("%s = %q (found=%v), want %q", path, got, ok, intent)
+		}
+	}
+}
+
+// TestManifestWritingVerbsSignal pins the verbs whose classification the guard
+// above cannot check. TestEveryRunnableCommandIsClassified asserts only that
+// some intent resolves, and "quiet" inherited from a group resolves fine: that
+// is how 'policy osv rescan' shipped rewriting manifests under the policy
+// subtree's quiet, leaving a running server serving the pre-rescan stamp for
+// the life of the process.
+func TestManifestWritingVerbsSignal(t *testing.T) {
+	root := newRootCmd()
+	for _, path := range []string{"policy osv rescan"} {
+		cmd, _, err := root.Find(strings.Fields(path))
+		if err != nil {
+			t.Errorf("find %q: %v", path, err)
+			continue
+		}
+		if got, ok := reloadIntent(cmd); !ok || got != reloadSignal {
+			t.Errorf("%s writes manifests, so it must signal the server: got %q (found=%v), want %q",
+				path, got, ok, reloadSignal)
 		}
 	}
 }
@@ -175,9 +201,12 @@ func TestHideWithdrawsFromServedPackages(t *testing.T) {
 	srv := server.New(cfg, srvStore, stores, fmt.Sprintf("127.0.0.1:%d", port), nil)
 	srv.SetQuiet(true)
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- srv.Start(ctx) }()
+	// Waiting for Start to return keeps this server's SIGHUP handler from
+	// reading the host-path globals while a later cleanup restores them.
+	// Cleanups run LIFO, so this one precedes the restore registered above.
+	t.Cleanup(func() { cancel(); <-serveErr })
+	go func() { defer close(serveErr); serveErr <- srv.Start(ctx) }()
 
 	packagesURL := fmt.Sprintf("http://127.0.0.1:%d/apt/dists/noble/main/binary-amd64/Packages", port)
 	if !eventually(t, func() bool { return strings.Contains(httpGet(t, packagesURL), "Package: hello") }) {
@@ -248,8 +277,9 @@ func writeTestConfig(t *testing.T, dir, manifestDir, storagePath, logDir string,
   "listen_addr": "127.0.0.1:%d",
   "allow_plaintext": true,
   "apt_codename": "noble",
-  "spool_dir": %q
-}`, storagePath, manifestDir, logDir, port, filepath.Join(dir, "spool"))
+  "spool_dir": %q,
+  "osv_db_dir": %q
+}`, storagePath, manifestDir, logDir, port, filepath.Join(dir, "spool"), filepath.Join(dir, "osv"))
 	path := filepath.Join(dir, "config.json")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -298,4 +328,130 @@ func eventually(t *testing.T, cond func() bool) bool {
 		time.Sleep(20 * time.Millisecond)
 	}
 	return false
+}
+
+// TestRescanReachesTheServedAPI is requirement 5's second half, and the half a
+// classification test cannot reach. manifest.Store answers from its cache once
+// it has served a package, so a rescan that re-stamps a version on disk leaves
+// a running server calling that version clean for the life of the process. The
+// GET before the rescan is what puts the pre-rescan answer in that cache.
+func TestRescanReachesTheServedAPI(t *testing.T) {
+	dir := t.TempDir()
+	manifestDir := filepath.Join(dir, "manifests")
+	storagePath := filepath.Join(dir, "storage")
+	logDir := filepath.Join(dir, "log")
+
+	keyPath, pepperPaths := aptsign.SystemKeyPath, audit.DefaultPepperPaths
+	aptsign.SystemKeyPath = filepath.Join(dir, "etc", aptsign.KeyFileName)
+	audit.DefaultPepperPaths = []string{filepath.Join(dir, "etc", "pepper")}
+	t.Cleanup(func() {
+		aptsign.SystemKeyPath, audit.DefaultPepperPaths = keyPath, pepperPaths
+	})
+
+	store := manifest.NewLocalStore(manifestDir)
+	if err := store.AddVersion(t.Context(), manifest.TypeNpm, "minimist", manifest.VersionEntry{
+		Version:  "1.2.5",
+		Metadata: map[string]string{policy.OSVMetaCheckedAt: "2026-01-01T00:00:00Z"},
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+	if err := store.SaveIndex(t.Context()); err != nil {
+		t.Fatalf("SaveIndex: %v", err)
+	}
+
+	port := freePort(t)
+	writeTestConfig(t, dir, manifestDir, storagePath, logDir, port)
+	syncNpmOSVDB(t, filepath.Join(dir, "osv"))
+
+	cfg, err := config.Load("", "", "", "", false, false)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	srvStore := manifest.NewLocalStore(cfg.ManifestDir)
+	if err := srvStore.LoadIndex(t.Context()); err != nil {
+		t.Fatalf("server LoadIndex: %v", err)
+	}
+	stores, err := storage.NewResolver(t.Context(), cfg)
+	if err != nil {
+		t.Fatalf("storage resolver: %v", err)
+	}
+
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	t.Cleanup(func() { signal.Stop(hup) })
+
+	srv := server.New(cfg, srvStore, stores, fmt.Sprintf("127.0.0.1:%d", port), nil)
+	srv.SetQuiet(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	serveErr := make(chan error, 1)
+	// Waiting for Start to return keeps this server's SIGHUP handler from
+	// reading the host-path globals while a later cleanup restores them.
+	// Cleanups run LIFO, so this one precedes the restore registered above.
+	t.Cleanup(func() { cancel(); <-serveErr })
+	go func() { defer close(serveErr); serveErr <- srv.Start(ctx) }()
+
+	versionURL := fmt.Sprintf("http://127.0.0.1:%d/api/v1/packages/npm/minimist/1.2.5", port)
+	if !eventually(t, func() bool { return strings.Contains(httpGet(t, versionURL), "2026-01-01") }) {
+		select {
+		case err := <-serveErr:
+			t.Fatalf("server exited: %v", err)
+		default:
+		}
+		t.Fatalf("the version never served its pre-rescan stamp:\n%s", httpGet(t, versionURL))
+	}
+
+	root := newRootCmd()
+	root.SetArgs([]string{"policy", "osv", "rescan", "--type", "npm"})
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	if err := root.Execute(); err != nil {
+		t.Fatalf("policy osv rescan: %v", err)
+	}
+
+	if !eventually(t, func() bool { return strings.Contains(httpGet(t, versionURL), "GHSA-served") }) {
+		t.Errorf("the API is still serving the pre-rescan stamp:\n%s", httpGet(t, versionURL))
+	}
+}
+
+// syncNpmOSVDB writes an OSV database holding one npm advisory that covers
+// 1.2.5, through the same Sync path an operator runs, so the test asserts on
+// the archive format the checker reads rather than a hand-built copy of it.
+func syncNpmOSVDB(t *testing.T, dir string) {
+	t.Helper()
+	rec := map[string]any{
+		"id":       "GHSA-served",
+		"modified": "2026-09-01T00:00:00Z",
+		"affected": []any{map[string]any{
+			"package": map[string]any{"ecosystem": "npm", "name": "minimist"},
+			"ranges": []any{map[string]any{
+				"type":   "SEMVER",
+				"events": []any{map[string]any{"introduced": "1.2.4"}, map[string]any{"fixed": "1.2.9"}},
+			}},
+		}},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+		f, err := zw.Create("GHSA-served.json")
+		if err != nil {
+			t.Errorf("zip create: %v", err)
+			return
+		}
+		if err := json.NewEncoder(f).Encode(rec); err != nil {
+			t.Errorf("zip write: %v", err)
+			return
+		}
+		if err := zw.Close(); err != nil {
+			t.Errorf("zip close: %v", err)
+			return
+		}
+		_, _ = w.Write(buf.Bytes())
+	}))
+	t.Cleanup(srv.Close)
+
+	db := policy.NewOSVDatabase(dir)
+	db.ExportBase = srv.URL
+	if _, err := db.Sync(t.Context(), "npm"); err != nil {
+		t.Fatalf("sync npm: %v", err)
+	}
 }
