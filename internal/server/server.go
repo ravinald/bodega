@@ -260,7 +260,11 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 						"audit_events", strings.Join(cfg.AuditEvents, ","))
 				}
 			}
-			if db.ReadOnly() && cfg.AuditSink == audit.SinkSQLite {
+			// SinkName reports what audit.newSink actually built, which is
+			// the sqlite sink for an empty audit_sink as much as for the
+			// explicit string. Comparing against cfg.AuditSink instead skipped
+			// the guard for every hand-built Config that leaves the key unset.
+			if db.ReadOnly() && db.SinkName() == audit.SinkSQLite {
 				// Record is a silent no-op on a read-only sqlite handle, so
 				// every denial, lifecycle and fetch row would be discarded
 				// without an error anywhere. Query still works, which is what
