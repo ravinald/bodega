@@ -1324,32 +1324,87 @@ func TestFieldValueFromSlice(t *testing.T) {
 	}
 }
 
+// clientURLExemptType is the one member of manifest.AllTypes clientURL answers
+// "" for by design: a sources line needs the served suites and the signing
+// state as well as the base URL, so aptSources renders it instead. See the
+// comment on clientURL and TestAptSourcesFollowsServerState.
+//
+// Held as a single identity rather than a set so a ninth ecosystem added to
+// AllTypes fails the tests below rather than joining a growing skip list.
+const clientURLExemptType = manifest.TypeApt
+
+// clientURLSeeds carries one package per member of manifest.AllTypes. The
+// version entries differ because clientURL reads different fields off them:
+// git wants a ref, binary a filename, helm a version.
+var clientURLSeeds = map[string]struct {
+	name  string
+	entry manifest.VersionEntry
+}{
+	manifest.TypeApt:    {"pkg-a", manifest.VersionEntry{Version: "1.0"}},
+	manifest.TypePypi:   {"pkg-b", manifest.VersionEntry{Version: "1.0"}},
+	manifest.TypeGomod:  {"example.com/m", manifest.VersionEntry{Version: "v1.0.0"}},
+	manifest.TypeNpm:    {"pkg-c", manifest.VersionEntry{Version: "1.0.0"}},
+	manifest.TypeHelm:   {"chart", manifest.VersionEntry{Version: "1.0.0"}},
+	manifest.TypeGit:    {"org/repo", manifest.VersionEntry{Ref: "v1.0.0"}},
+	manifest.TypeBinary: {"tool", manifest.VersionEntry{Version: "1.0.0", Filename: "tool"}},
+	manifest.TypeCargo:  {"time", manifest.VersionEntry{Version: "0.3.36"}},
+}
+
+// seedClientURLTypes stores one package per member of manifest.AllTypes and
+// returns the store alongside the types clientURL is expected to answer for.
+// The list used to be six literals in the test body, which is why clientURL
+// returning "" for cargo stayed green from the day cargo landed.
+func seedClientURLTypes(t *testing.T) (*manifest.Store, []struct{ typ, name string }) {
+	t.Helper()
+	store := manifest.NewLocalStore(t.TempDir())
+	ctx := t.Context()
+	var entries []struct{ typ, name string }
+	for _, typ := range manifest.AllTypes {
+		seed, ok := clientURLSeeds[typ]
+		if !ok {
+			t.Fatalf("%s is in manifest.AllTypes with no seed here, so nothing asserts the details pane can render it", typ)
+		}
+		if err := store.AddVersion(ctx, typ, seed.name, seed.entry); err != nil {
+			t.Fatalf("seed %s/%s: %v", typ, seed.name, err)
+		}
+		if typ == clientURLExemptType {
+			continue
+		}
+		entries = append(entries, struct{ typ, name string }{typ, seed.name})
+	}
+	return store, entries
+}
+
+// TestClientURLCoversEveryKnownType asserts every type but the one exemption
+// hands an operator something to copy. clientURL falls through to "" for a
+// type it has no arm for, and renderEntryDetails drops the row when the string
+// is empty, so an uncovered type shows a detail panel with no instruction at
+// all rather than a wrong one.
+func TestClientURLCoversEveryKnownType(t *testing.T) {
+	store, entries := seedClientURLTypes(t)
+	cfg := &config.Config{}
+
+	for _, e := range entries {
+		t.Run(e.typ, func(t *testing.T) {
+			if got := clientURL(cfg, store, e.typ, e.name); got == "" {
+				t.Errorf("clientURL returned \"\", so the details pane renders no client instruction for a stored %s package", e.typ)
+			}
+		})
+	}
+
+	// The exemption is asserted, not assumed. apt renders through aptSources,
+	// and clientURL answering for it would put two instructions in one pane.
+	if got := clientURL(cfg, store, clientURLExemptType, clientURLSeeds[clientURLExemptType].name); got != "" {
+		t.Errorf("clientURL(%s) = %q, want \"\": aptSources renders the sources line", clientURLExemptType, got)
+	}
+}
+
 // Guards that the client snippets the details pane emits follow the scheme the
 // server is configured to answer on. An http:// snippet for a TLS server is
 // unauthenticated delivery to a root-privileged installer, since apt needs
 // [trusted=yes] against an unsigned repository.
 func TestClientURLSchemeFollowsTLSConfig(t *testing.T) {
-	store := manifest.NewLocalStore(t.TempDir())
-	ctx := t.Context()
-	_ = store.AddVersion(ctx, manifest.TypeApt, "pkg-a", manifest.VersionEntry{Version: "1.0"})
-	_ = store.AddVersion(ctx, manifest.TypePypi, "pkg-b", manifest.VersionEntry{Version: "1.0"})
-	_ = store.AddVersion(ctx, manifest.TypeGomod, "example.com/m", manifest.VersionEntry{Version: "v1.0.0"})
-	_ = store.AddVersion(ctx, manifest.TypeNpm, "pkg-c", manifest.VersionEntry{Version: "1.0.0"})
-	_ = store.AddVersion(ctx, manifest.TypeHelm, "chart", manifest.VersionEntry{Version: "1.0.0"})
-	_ = store.AddVersion(ctx, manifest.TypeGit, "org/repo", manifest.VersionEntry{Ref: "v1.0.0"})
-	_ = store.AddVersion(ctx, manifest.TypeBinary, "tool", manifest.VersionEntry{Version: "1.0.0", Filename: "tool"})
-
-	// apt is absent on purpose: a sources line is not a URL, and it needs the
-	// served suites and the signing state as well as the base. See
-	// TestAptSourcesFollowsServerState.
-	entries := []struct{ typ, name string }{
-		{manifest.TypePypi, "pkg-b"},
-		{manifest.TypeGomod, "example.com/m"},
-		{manifest.TypeNpm, "pkg-c"},
-		{manifest.TypeHelm, "chart"},
-		{manifest.TypeGit, "org/repo"},
-		{manifest.TypeBinary, "tool"},
-	}
+	store, entries := seedClientURLTypes(t)
 
 	tlsCfg := &config.Config{TLSCert: "/etc/bodega/cert.pem", TLSKey: "/etc/bodega/key.pem"}
 	for _, e := range entries {

@@ -33,6 +33,10 @@ var (
 	reBarColors = regexp.MustCompile(`(?s)var barColors = \{(.*?)\}`)
 	reObjectKey = regexp.MustCompile(`(\w+)\s*:`)
 	reTypeRule  = regexp.MustCompile(`\.type-([a-z0-9_-]+)\s*\{`)
+	// getClientUrl's body, up to the first closing brace in column 0. Every
+	// brace inside the function is indented, so that is its end.
+	reClientURLFn = regexp.MustCompile(`(?s)\nfunction getClientUrl\(.*?\n\}`)
+	reSwitchCase  = regexp.MustCompile(`case '([a-z0-9_-]+)':`)
 )
 
 func objectKeys(t *testing.T, re *regexp.Regexp, src, what string) map[string]bool {
@@ -445,4 +449,32 @@ func equalStrings(got, want []string) bool {
 		}
 	}
 	return true
+}
+
+// TestWebClientInstructionCoversEveryKnownType pins getClientUrl's switch to
+// manifest.AllTypes. The function shipped with seven arms and fell through to
+// "" for the eighth, and showEntry drops the row when the string is empty, so
+// a crate's detail panel was the one panel of eight with nothing to copy. The
+// switch is read out of the embedded asset for the same reason the tables
+// above are: //go:embed compiles the page without inspecting it.
+func TestWebClientInstructionCoversEveryKnownType(t *testing.T) {
+	src := webIndex(t)
+
+	body := reClientURLFn.FindString(src)
+	if body == "" {
+		t.Fatal("web/index.html: no getClientUrl function found; the test's regexp and the page have drifted")
+	}
+	cases := map[string]bool{}
+	for _, m := range reSwitchCase.FindAllStringSubmatch(body, -1) {
+		cases[m[1]] = true
+	}
+	if len(cases) == 0 {
+		t.Fatal("web/index.html: getClientUrl has no case labels; the test's regexp and the page have drifted")
+	}
+
+	for _, typ := range manifest.AllTypes {
+		if !cases[typ] {
+			t.Errorf("getClientUrl has no case for %q, so it falls through to \"\" and the detail panel drops the client-instruction row entirely", typ)
+		}
+	}
 }

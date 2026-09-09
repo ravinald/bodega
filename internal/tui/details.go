@@ -153,7 +153,7 @@ func (m detailsModel) s3AndClientFields(n *TreeNode) string {
 	if n.EntryType == manifest.TypeApt {
 		pm, _ := m.store.GetPackage(context.Background(), manifest.TypeApt, n.Name)
 		src := aptSources(m.cfg, pm, m.aptSigned)
-		sb.WriteString(field("Sources line", src.OneLine))
+		sb.WriteString(field(clientFieldLabel(manifest.TypeApt), src.OneLine))
 		sb.WriteByte('\n')
 		for _, note := range append(src.Notes, aptDiskStateNote) {
 			sb.WriteString(noteField("Note", note, m.width))
@@ -162,7 +162,14 @@ func (m detailsModel) s3AndClientFields(n *TreeNode) string {
 		return sb.String()
 	}
 	if url := clientURL(m.cfg, m.store, n.EntryType, n.Name); url != "" {
-		sb.WriteString(field("Package URL", url))
+		label := clientFieldLabel(n.EntryType)
+		if strings.Contains(url, "\n") {
+			// A stanza runs onto continuation lines, which read as separate
+			// fields unless they are indented under the first.
+			sb.WriteString(noteField(label, url, m.width))
+		} else {
+			sb.WriteString(field(label, url))
+		}
 		sb.WriteByte('\n')
 	}
 	return sb.String()
@@ -497,8 +504,31 @@ func clientURL(cfg *config.Config, store *manifest.Store, entryType, name string
 		return fmt.Sprintf("%s/helm/charts/%s-%s.tgz", base, pm.Name, ve.Version)
 	case manifest.TypeNpm:
 		return fmt.Sprintf("npm install --registry %s/npm/ %s", base, name)
+	case manifest.TypeCargo:
+		// Cargo hands back no URL. A client reaches the sparse index only once
+		// .cargo/config.toml names it as a registry, so the stanza and the
+		// command that uses it travel together as one string. The command is a
+		// TOML comment because the web copies this field verbatim and its
+		// destination is that config file: a bare shell line pasted there
+		// fails the parse, and the stanza alone never names the --registry
+		// flag.
+		return fmt.Sprintf("[registries.bodega]\nindex = \"sparse+%s/cargo/\"\n# cargo add --registry bodega %s", base, name)
 	}
 	return ""
+}
+
+// clientFieldLabel names the detail-pane row holding a type's client
+// instruction. Two of the eight hand back something other than a URL: apt a
+// sources line, cargo a registry stanza. Calling either a "Package URL" sends
+// an operator looking for something to curl.
+func clientFieldLabel(entryType string) string {
+	switch entryType {
+	case manifest.TypeApt:
+		return "Sources line"
+	case manifest.TypeCargo:
+		return "Registry stanza"
+	}
+	return "Package URL"
 }
 
 func (m detailsModel) renderGroupDetails() string {
