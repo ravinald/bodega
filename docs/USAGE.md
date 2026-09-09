@@ -2590,6 +2590,10 @@ Access the dashboard at `https://bodega-host:8080/` when the server is running.
 - **Copy utilities**: one-click copy for Package URL and Package JSON Config
 - **Browser-based browsing**: explore packages by type and version
 
+The type list is the server's, not the page's. The tree, the per-type bars and both expand-all loops render one group per key in the `/api/v1/packages` envelope, which carries every ecosystem the server knows with an empty array for the ones holding nothing. The page keeps a preferred order (apt first, then git, pypi, binary, gomod, helm, npm) and anything outside it renders after, sorted. So an ecosystem added to the server shows up in a browser with no change to the page, and a stored package can never be missing from the tree while the header counts it.
+
+A permalink naming a type the server does not serve is refused by name: `#<type>/<name>/<version>` is checked against those same keys, and a stale bookmark gets a message naming the type it asked for and the types this instance answers for.
+
 The dashboard is read-only. Mutations are made via CLI, TUI, or REST API.
 
 ---
