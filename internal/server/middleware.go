@@ -238,7 +238,10 @@ func recordDenial(db *audit.DB, r *http.Request, reason string, extra map[string
 // parseAPIPackagePath would leave the subject columns empty on exactly the
 // refusals an operator would filter by package to find.
 func recordDenialFor(db *audit.DB, r *http.Request, pkgType, pkgName, pkgVersion, reason string, extra map[string]string) {
-	if db == nil {
+	// ShouldRecord before the bound, not just inside Record: a server whose
+	// audit_events leaves out "denied" would otherwise serialize every 403 on
+	// denialWriteSlots to reach a write that returns immediately.
+	if db == nil || !db.ShouldRecord(audit.EventDenied) {
 		return
 	}
 	details := map[string]string{
@@ -254,6 +257,12 @@ func recordDenialFor(db *audit.DB, r *http.Request, pkgType, pkgName, pkgVersion
 	}
 	ctx, cancel := auditContext(r)
 	defer cancel()
+	select {
+	case denialWriteSlots <- struct{}{}:
+		defer func() { <-denialWriteSlots }()
+	case <-ctx.Done():
+		return
+	}
 	_ = db.Record(ctx, audit.Event{
 		EventType:  audit.EventDenied,
 		PkgType:    pkgType,
@@ -278,6 +287,28 @@ func (s *Server) recordVersionRefusal(r *http.Request, pkgType, pkgName, entryVe
 			"entry_version": entryVersion,
 		})
 }
+
+// denialWriteSlots caps how many denial rows are being written at once. A
+// refusal is the only database write an anonymous caller controls, and it is
+// synchronous, so 64 concurrent 403s were 64 goroutines contending for SQLite's
+// single write lock: 6100 refusals/s fell to 800/s and the slowest 403 took
+// 1.6s. One slot removes the contention and restores the serial rate, and
+// because Go queues blocked channel senders in FIFO order, a caller waits only
+// on the callers ahead of it rather than on the whole flood, so 64 concurrent
+// refusals settle in ~10ms.
+//
+// One slot per process, not per Server: the bound exists because SQLite admits
+// one writer per file, and a process serves one audit database.
+//
+// Waiting for a slot is not a way to lose a row. Discovery's queue may discard
+// an observation because it is statistical; a refusal is the record of who was
+// turned away and has no second source, so a caller blocks rather than skipping
+// the write. The wait spends the auditWriteTimeout budget the write already
+// had, which keeps a wedged database from pinning goroutines and leaves the
+// only discard the one that existed before this bound: exhausting that budget.
+// A flood reaches it later than it used to, because the queue drains at the
+// serial rate instead of the contended one.
+var denialWriteSlots = make(chan struct{}, 1)
 
 // auditWriteTimeout bounds a detached audit write. Long enough to outlast the
 // SQLite busy timeout under contention, short enough that a wedged database

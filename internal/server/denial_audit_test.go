@@ -7,8 +7,10 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -477,5 +479,159 @@ func TestServerAppliesAuditConfigToItsOwnHandle(t *testing.T) {
 	}
 	if rows := denials(t, s); len(rows) != 0 {
 		t.Errorf("denial rows = %d, want 0 — audit_events excluded the type (%+v)", len(rows), rows)
+	}
+
+	// The read-only guard is the other thing newServer does with this handle,
+	// and it tested cfg.AuditSink rather than the sink the handle opened.
+	// audit.newSink maps an empty Kind to sqlite, so a Config that leaves
+	// audit_sink unset gets a sqlite sink the guard declined to check: Record
+	// is a silent no-op on a read-only handle, and every denial, fetch and
+	// lifecycle row would be dropped with nothing said. config.Load defaults
+	// the key, so `bodega serve` never reached it; every hand-built Config
+	// does, including newDenialServer above.
+	t.Run("read-only handle", func(t *testing.T) {
+		if os.Getuid() == 0 {
+			t.Skip("root writes a 0444 file, so the handle would not be read-only")
+		}
+		for name, sink := range map[string]string{"unset": "", "explicit": audit.SinkSQLite} {
+			t.Run(name, func(t *testing.T) {
+				dir := t.TempDir()
+				dbPath := filepath.Join(dir, "audit.db")
+				// Opened once writable so the schema exists, then sealed: an
+				// absent file would fail to open, which is the other guard.
+				db, err := audit.Open(dbPath)
+				if err != nil {
+					t.Fatalf("seed audit db: %v", err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatalf("close seed handle: %v", err)
+				}
+				if err := os.Chmod(dbPath, 0o444); err != nil {
+					t.Fatalf("seal audit db: %v", err)
+				}
+
+				s := newServer(&config.Config{
+					AptCodename:     "noble",
+					LogDir:          dir,
+					StoragePath:     dir,
+					AuditDB:         dbPath,
+					AuditSink:       sink,
+					AdminPermitCIDR: []string{"127.0.0.0/8"},
+					AllowPlaintext:  true,
+				}, manifest.NewLocalStore(t.TempDir()), nil, "127.0.0.1:0",
+					slog.New(slog.NewTextHandler(io.Discard, nil)))
+				t.Cleanup(func() {
+					if s.auditDB != nil {
+						_ = s.auditDB.Close()
+					}
+				})
+
+				if s.auditDB == nil || !s.auditDB.ReadOnly() {
+					t.Fatal("handle is not read-only; the guard has nothing to fire on")
+				}
+				if s.auditErr == nil {
+					t.Fatal("newServer accepted a read-only audit db: every denial, fetch and lifecycle row would be dropped with no error anywhere")
+				}
+				if !strings.Contains(s.auditErr.Error(), "not writable by this process") {
+					t.Errorf("auditErr does not name the cause: %v", s.auditErr)
+				}
+			})
+		}
+	})
+}
+
+// TestDenialWritesAreBounded drives the one write path an anonymous caller
+// controls. B16 landed the denial row as a synchronous insert, so N concurrent
+// refusals were N goroutines contending for SQLite's single write lock, and the
+// cost of refusing a request became the server's to pay. Measured on this tree
+// before denialWriteSlots: 1280 refusals at 800/s against 6100/s serial, the
+// slowest single 403 at 1.58s (DELETE) and 1.49s (GET). After: 8500/s, and the
+// slowest 403 at 9-17ms.
+//
+// The ceiling is 500ms, chosen against the numbers CI measures rather than
+// these: under -race the same runs are 2.03s to 3.37s unbounded and 61ms to
+// 69ms bounded across repeats, so 500ms sits 7x above the bounded worst and 4x
+// below the cheapest unbounded one, near the midpoint of a 35x separation.
+//
+// #253 and #274 are the standing evidence that a wall-clock assertion on this
+// database flakes on a loaded runner. The margin survives one because the two
+// sides do not scale together: unbounded, the slowest request waits for the
+// whole flood, so it grows with load and with runner slowness alike; bounded,
+// it waits only on the 64 callers ahead of it in the channel's FIFO queue,
+// which is a twentieth of the run. A runner slow enough to push the bounded
+// case over 500ms pushes the unbounded case further above it, not closer.
+//
+// GET is here because DenyListMiddleware has no method guard: on an install
+// with a non-empty deny_list, a deny-listed address floods the writer with
+// reads. It reaches the writer through the same recordDenialFor funnel, so the
+// bound covers it, and this asserts that rather than assuming it.
+func TestDenialWritesAreBounded(t *testing.T) {
+	const (
+		workers = 64
+		each    = 20
+		ceiling = 500 * time.Millisecond
+	)
+
+	for _, tc := range []struct {
+		name     string
+		method   string
+		path     string
+		denyList []string
+	}{
+		{name: "mutation", method: "DELETE", path: "/api/v1/packages/apt/hello"},
+		{name: "read", method: "GET", path: "/apt/dists/noble/Release", denyList: []string{"203.0.113.0/24"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newDenialServer(t, []string{"127.0.0.0/8"}, tc.denyList)
+			h := s.handler()
+
+			// Per-worker slots rather than a shared max under a mutex: the
+			// lock would itself serialize the callers whose contention is the
+			// thing being measured.
+			worst := make([]time.Duration, workers)
+			var wg sync.WaitGroup
+			for w := range workers {
+				wg.Add(1)
+				go func(w int) {
+					defer wg.Done()
+					for range each {
+						req := httptest.NewRequest(tc.method, tc.path, nil)
+						req.RemoteAddr = "127.0.0.1:33333"
+						req.Header.Set("X-Real-IP", "203.0.113.9")
+						rec := httptest.NewRecorder()
+
+						start := time.Now()
+						h.ServeHTTP(rec, req)
+						if d := time.Since(start); d > worst[w] {
+							worst[w] = d
+						}
+						if rec.Code != http.StatusForbidden {
+							t.Errorf("status = %d, want 403", rec.Code)
+						}
+					}
+				}(w)
+			}
+			wg.Wait()
+
+			var slowest time.Duration
+			for _, d := range worst {
+				slowest = max(slowest, d)
+			}
+			if slowest > ceiling {
+				t.Errorf("slowest single 403 = %v, want under %v — an anonymous caller is paying the audit writer's contention",
+					slowest.Round(time.Millisecond), ceiling)
+			}
+
+			// The bound blocks; it must not drop. Count rather than Query:
+			// Query caps at 1000 rows and would report loss that is paging.
+			n, err := s.auditDB.Count(t.Context(), audit.Filter{EventType: audit.EventDenied})
+			if err != nil {
+				t.Fatalf("count denials: %v", err)
+			}
+			if n != workers*each {
+				t.Errorf("denial rows = %d, want %d — the bound discarded refusals", n, workers*each)
+			}
+			t.Logf("%d refusals, slowest 403 %v", n, slowest.Round(time.Millisecond))
+		})
 	}
 }
