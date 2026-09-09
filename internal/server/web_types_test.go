@@ -381,12 +381,14 @@ func TestWebUIRendersEveryServedType(t *testing.T) {
 		t.Errorf("render order = %v, want %v", got.RenderTypes, want)
 	}
 
-	// #280: the header sums entry_count, which counts packages, while each
-	// group counts the version entries the tree lists under it. The seed gives
-	// one nuget package two versions so the two totals differ, and an equality
-	// between them would be measuring the seed rather than the page. The
-	// relation that holds, and the one #280 broke, is that every type the
-	// header counts renders a group carrying that type's entries.
+	// The header states both quantities: entry_count's package total, and a
+	// version total the page sums from the same entriesForType the groups
+	// render. The seed gives package i of a type i+1 versions, so the two
+	// differ here (5 packages, 6 versions) and neither can stand in for the
+	// other. The version half equals the tree total by construction, which is
+	// why it is asserted rather than sampled: a header computed from
+	// entry_count instead, or an entriesForType that stops at one version per
+	// package, fails this. #280 broke membership, caught per type below.
 	packages, treeEntries, total := 0, 0, 0
 	for _, g := range got.Groups {
 		total += g.Count
@@ -402,8 +404,8 @@ func TestWebUIRendersEveryServedType(t *testing.T) {
 			t.Errorf("%s group lists %d entries, want the %d versions the server sent", typ, g.Count, entries[typ])
 		}
 	}
-	if want := fmt.Sprintf("%d packages", packages); got.StatusText != want || total != treeEntries {
-		t.Errorf("header %q over groups totalling %d entries, want %q over %d; either the header counts a type that renders no group, or a group lists fewer entries than the server sent", got.StatusText, total, want, treeEntries)
+	if want := fmt.Sprintf("%d packages, %d versions", packages, treeEntries); got.StatusText != want || total != treeEntries {
+		t.Errorf("header %q over groups totalling %d entries, want %q over %d; either the header counts a quantity the tree does not list, or a group lists fewer entries than the server sent", got.StatusText, total, want, treeEntries)
 	}
 
 	bars := map[string]string{}
