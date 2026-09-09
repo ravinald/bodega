@@ -1901,3 +1901,26 @@ func TestHelpStaysSingleColumnWhenNarrow(t *testing.T) {
 		t.Error("a 160x40 screen should split the help into columns")
 	}
 }
+
+// TestCargoStanzaSurvivesANarrowPane guards the one client instruction whose
+// meaning depends on where its line breaks fall. The pane has no copy
+// affordance, so an operator retypes what they read: a reflowed "index =" is a
+// TOML parse error, and cargo reports it against their config file rather than
+// against the pane that produced it.
+func TestCargoStanzaSurvivesANarrowPane(t *testing.T) {
+	store, _ := seedClientURLTypes(t)
+	cfg := &config.Config{PublicURL: "http://127.0.0.1:18742"}
+	leaf := firstVersionLeaf(t, BuildTree(store, nil), manifest.TypeCargo)
+
+	for _, width := range []int{40, 54, 80, 120} {
+		m := newDetailsModel(store, cfg)
+		m.SetSize(width, 40)
+		m.SetNode(leaf)
+		pane := m.renderEntryDetails()
+		for _, want := range strings.Split(clientURL(cfg, store, manifest.TypeCargo, leaf.Name), "\n") {
+			if !strings.Contains(pane, want) {
+				t.Errorf("width %d: no line carries %q; retyping the pane gives invalid TOML. Pane:\n%s", width, want, pane)
+			}
+		}
+	}
+}

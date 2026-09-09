@@ -121,6 +121,26 @@ func noteField(key, value string, width int) string {
 	return sb.String()
 }
 
+// stanzaField renders a multi-line value one source line per row, indented
+// under the first, and never reflows one. The pane offers nothing to copy, so
+// an operator retypes what they read into the file the value belongs in: a
+// cargo registry stanza wrapped after "index =" is a TOML parse error, and the
+// error surfaces against their config rather than against this pane. A line
+// wider than the pane runs off the right edge instead, which is visible and
+// fixed by widening the terminal. noteField keeps its reflow, which is right
+// for the prose it was written for.
+func stanzaField(key, value string) string {
+	// keyStyle pads to 12; the first row writes one space after it.
+	const keyWidth = 13
+	lines := strings.Split(value, "\n")
+	var sb strings.Builder
+	sb.WriteString(keyStyle.Render(key+":") + " " + valueStyle.Render(lines[0]))
+	for _, l := range lines[1:] {
+		sb.WriteString("\n" + strings.Repeat(" ", keyWidth) + valueStyle.Render(l))
+	}
+	return sb.String()
+}
+
 // boolField renders a boolean field with coloured yes/no.
 func boolField(key string, val bool) string {
 	k := keyStyle.Render(key + ":")
@@ -164,9 +184,7 @@ func (m detailsModel) s3AndClientFields(n *TreeNode) string {
 	if url := clientURL(m.cfg, m.store, n.EntryType, n.Name); url != "" {
 		label := clientFieldLabel(n.EntryType)
 		if strings.Contains(url, "\n") {
-			// A stanza runs onto continuation lines, which read as separate
-			// fields unless they are indented under the first.
-			sb.WriteString(noteField(label, url, m.width))
+			sb.WriteString(stanzaField(label, url))
 		} else {
 			sb.WriteString(field(label, url))
 		}
