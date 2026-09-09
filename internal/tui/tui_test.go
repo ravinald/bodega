@@ -124,8 +124,8 @@ func TestBuildTree(t *testing.T) {
 
 	roots := BuildTree(store, statuses)
 
-	if len(roots) != 7 {
-		t.Fatalf("expected 7 root groups, got %d", len(roots))
+	if len(roots) != len(manifest.AllTypes) {
+		t.Fatalf("expected %d root groups, got %d", len(manifest.AllTypes), len(roots))
 	}
 
 	// apt group — children are now package sub-groups
@@ -171,6 +171,43 @@ func TestBuildTree(t *testing.T) {
 	}
 	if !pypiPkg.Children[0].InS3 {
 		t.Error("pypi pkg: InS3 should be true")
+	}
+}
+
+// TestBuildTreeCoversEveryKnownType asserts an operator can reach every stored
+// ecosystem from the Sources pane. BuildTree appends one root group per type by
+// hand, and a type it has no arm for is unreachable in the TUI no matter what
+// the store holds or how well the detail pane renders it.
+func TestBuildTreeCoversEveryKnownType(t *testing.T) {
+	store, _ := seedClientURLTypes(t)
+
+	roots := BuildTree(store, nil)
+
+	byType := make(map[string]TreeNode, len(roots))
+	for _, r := range roots {
+		byType[r.EntryType] = r
+	}
+
+	for _, typ := range manifest.AllTypes {
+		t.Run(typ, func(t *testing.T) {
+			group, ok := byType[typ]
+			if !ok {
+				t.Fatalf("no root group for %s, so a stored %s package has no node to select in the Sources pane", typ, typ)
+			}
+			if len(group.Children) == 0 {
+				t.Errorf("%s root group is empty despite a seeded package", typ)
+			}
+			// The badge is how a group is told apart at a glance; typeIcon
+			// degrades an uncovered type to a blank column beside seven
+			// lettered siblings.
+			if strings.TrimSpace(typeIcon(typ)) == "" {
+				t.Errorf("typeIcon(%s) is blank, so the %s group renders with no badge", typ, typ)
+			}
+		})
+	}
+
+	if len(roots) != len(manifest.AllTypes) {
+		t.Errorf("root groups = %d, want %d: a group for a type not in AllTypes is a node nothing serves", len(roots), len(manifest.AllTypes))
 	}
 }
 
@@ -1397,6 +1434,69 @@ func TestClientURLCoversEveryKnownType(t *testing.T) {
 	if got := clientURL(cfg, store, clientURLExemptType, clientURLSeeds[clientURLExemptType].name); got != "" {
 		t.Errorf("clientURL(%s) = %q, want \"\": aptSources renders the sources line", clientURLExemptType, got)
 	}
+}
+
+// TestDetailsPaneRendersClientInstructionForEveryKnownType drives the whole
+// path an operator walks: BuildTree produces the node, the pane renders it.
+// clientURL answering for a type proves nothing on its own — renderEntryDetails
+// dispatches on EntryType too, and a type missing there renders a pane that
+// never calls s3AndClientFields, so a correct instruction reaches nobody.
+func TestDetailsPaneRendersClientInstructionForEveryKnownType(t *testing.T) {
+	store, _ := seedClientURLTypes(t)
+	cfg := &config.Config{}
+	roots := BuildTree(store, nil)
+
+	for _, typ := range manifest.AllTypes {
+		t.Run(typ, func(t *testing.T) {
+			leaf := firstVersionLeaf(t, roots, typ)
+
+			want := clientURL(cfg, store, typ, leaf.Name)
+			if typ == clientURLExemptType {
+				pm, err := store.GetPackage(t.Context(), typ, leaf.Name)
+				if err != nil {
+					t.Fatalf("get %s/%s: %v", typ, leaf.Name, err)
+				}
+				want = aptSources(cfg, pm, aptKeyLoaded(cfg)).OneLine
+			}
+			if want == "" {
+				t.Fatalf("no client instruction to render for %s", typ)
+			}
+
+			m := newDetailsModel(store, cfg)
+			m.SetSize(120, 40)
+			m.SetNode(leaf)
+			pane := m.renderEntryDetails()
+
+			// The label wraps under keyStyle's fixed width and a stanza runs
+			// onto continuation lines, so the first line of the instruction is
+			// what survives both intact.
+			firstLine := strings.SplitN(want, "\n", 2)[0]
+			if !strings.Contains(pane, firstLine) {
+				t.Errorf("details pane for %s carries no client instruction; want a line holding %q, got:\n%s", typ, firstLine, pane)
+			}
+		})
+	}
+}
+
+// firstVersionLeaf walks type > package > version and returns the leaf node the
+// details pane is handed when an operator selects a stored package.
+func firstVersionLeaf(t *testing.T, roots []TreeNode, typ string) *TreeNode {
+	t.Helper()
+	for i := range roots {
+		if roots[i].EntryType != typ {
+			continue
+		}
+		if len(roots[i].Children) == 0 {
+			t.Fatalf("%s group has no packages", typ)
+		}
+		pkg := &roots[i].Children[0]
+		if len(pkg.Children) == 0 {
+			t.Fatalf("%s package %q has no versions", typ, pkg.Name)
+		}
+		return &pkg.Children[0]
+	}
+	t.Fatalf("no root group for %s", typ)
+	return nil
 }
 
 // Guards that the client snippets the details pane emits follow the scheme the

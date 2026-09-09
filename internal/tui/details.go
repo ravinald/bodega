@@ -843,6 +843,23 @@ func (m detailsModel) renderEntryDetails() string {
 		sb.WriteByte('\n')
 		sb.WriteString(m.s3AndClientFields(n))
 		sb.WriteString(platformAndBuildEnv(ve.Platform, ve.BuildEnv))
+
+	case manifest.TypeCargo:
+		sb.WriteString(field("Crate", pm.Name))
+		sb.WriteByte('\n')
+		sb.WriteString(field("Version", ve.Version))
+		sb.WriteByte('\n')
+		if ve.URL != "" {
+			sb.WriteString(field("Source URL", ve.URL))
+			sb.WriteByte('\n')
+		}
+		sb.WriteString(checksumFields(ve.Checksum, ve.ChecksumVerified))
+		sb.WriteString(boolField("Frozen", ve.Frozen))
+		sb.WriteByte('\n')
+		sb.WriteString(boolField("Hidden", ve.Hidden))
+		sb.WriteByte('\n')
+		sb.WriteString(m.s3AndClientFields(n))
+		sb.WriteString(platformAndBuildEnv(ve.Platform, ve.BuildEnv))
 	}
 
 	// Render metadata map if present.

@@ -2510,6 +2510,7 @@ A read-only audit database used to be the quieter version of the same loss: `Rec
 │ gomod/             │                            │
 │ helm/              │                            │
 │ npm/               │                            │
+│ cargo/             │                            │
 ├─ Log ──────────────┴────────────────────────────┤
 │ [gomod] github.com/aws/sdk: fetching...         │
 │ [gomod] github.com/aws/sdk: checksum verified   │
