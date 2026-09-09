@@ -378,3 +378,43 @@ func TestRescanCommand_IndexEntryWithNoManifestIsUnanswered(t *testing.T) {
 		t.Errorf("the error must name the store, not OSV: %v", err)
 	}
 }
+
+// TestRescanCommand_RangeEntryPrintsItsMatchedRecord pins the operator-visible
+// half of the range rule. The stamp is withheld because a point lookup cannot
+// settle a constraint, but the record matched against the base version is the
+// finding the run exists to surface, and a row carrying only the constraint
+// prose buries it. Asserted on stdout because that is what an operator reads:
+// the policy layer's Vulns field can be right while the row drops it.
+func TestRescanCommand_RangeEntryPrintsItsMatchedRecord(t *testing.T) {
+	root := rescanInstall(t, manifest.VersionEntry{
+		Version:           "1.2.9",
+		VersionConstraint: manifest.ConstraintCompatible,
+	})
+	syncInto(t, root, advisory("GHSA-range-hit", "minimist", "1.2.9", "1.3.0"))
+
+	stdout, stderr, err := runRescan(t)
+	if err == nil {
+		t.Fatalf("a walk that answered for nothing must not exit 0: stdout=%q", stdout)
+	}
+	var row string
+	for _, line := range strings.Split(stdout, "\n") {
+		if strings.Contains(line, "1.2.9") && strings.Contains(line, "unanswered") {
+			row = line
+		}
+	}
+	if row == "" {
+		t.Fatalf("no unanswered row for the range entry: %q", stdout)
+	}
+	if !strings.Contains(row, "GHSA-range-hit") {
+		t.Errorf("the matched record must be named in the row, got %q", row)
+	}
+	if i, j := strings.Index(row, "GHSA-range-hit"), strings.Index(row, "constraint"); j >= 0 && i > j {
+		t.Errorf("the id must lead the reason prose, got %q", row)
+	}
+	if !strings.Contains(stderr, "0 answered") {
+		t.Errorf("a range entry stays uncounted: %q", stderr)
+	}
+	if st := stampOf(t, root, "1.2.9"); !st.Checked.IsZero() || st.Flagged() {
+		t.Errorf("an unanswered version is written nothing: %+v", st)
+	}
+}
