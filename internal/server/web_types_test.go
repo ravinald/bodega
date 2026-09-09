@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -147,9 +148,11 @@ func TestWebUIEnvelopesCarryCargo(t *testing.T) {
 		t.Errorf("GET /api/v1/status: entry_count[cargo] = %d, want 1", status.EntryCount["cargo"])
 	}
 
-	// The header sums entry_count; the tree sums the groups the loop renders.
-	// Both count packages, so they agree only when every counted type is also
-	// a rendered one.
+	// Both sides here are package counts: entry_count is len(ListPackages),
+	// and each /api/v1/packages value is the list the page groups by type. The
+	// tree's own totals are version entries, a different quantity, asserted
+	// against the rendered page in TestWebUIRendersEveryServedType. What #280
+	// broke is membership, which is what the key check below catches.
 	header := 0
 	for typ, n := range status.EntryCount {
 		header += n
@@ -157,12 +160,12 @@ func TestWebUIEnvelopesCarryCargo(t *testing.T) {
 			t.Errorf("entry_count counts %q, which /api/v1/packages has no key for, so the header counts a group the tree cannot render", typ)
 		}
 	}
-	rendered := 0
+	served := 0
 	for _, pkgs := range envelope {
-		rendered += len(pkgs)
+		served += len(pkgs)
 	}
-	if header != rendered {
-		t.Errorf("header total = %d, groups total = %d; the header counts entries the tree does not list", header, rendered)
+	if header != served {
+		t.Errorf("entry_count totals %d packages against %d in /api/v1/packages; the header counts packages the page is never handed", header, served)
 	}
 }
 
@@ -307,18 +310,28 @@ func runPage(t *testing.T, hash string, canned map[string]any) probeResult {
 }
 
 // cannedEnvelopes builds the three responses the page fetches, one key per
-// named type, in the shape the server emits.
-func cannedEnvelopes(counts map[string]int) map[string]any {
+// named type, in the shape the server emits. counts is packages per type, and
+// package i of a type carries i+1 versions so that entry_count (packages) and
+// the tree (version entries) come apart wherever a type holds more than one
+// package. The second return is the version-entry total per type, so a caller
+// asserts what the tree lists without restating that rule as a second list.
+func cannedEnvelopes(counts map[string]int) (map[string]any, map[string]int) {
 	packages := map[string]any{}
 	entryCount := map[string]int{}
 	byType := map[string]any{}
+	entries := map[string]int{}
 	for typ, n := range counts {
 		pkgs := []any{}
 		for i := 0; i < n; i++ {
+			versions := []any{}
+			for v := 0; v <= i; v++ {
+				versions = append(versions, map[string]any{"version": fmt.Sprintf("%d.0.0", v+1)})
+			}
 			pkgs = append(pkgs, map[string]any{
-				"name":     typ + "-pkg",
-				"versions": []any{map[string]any{"version": "1.0.0"}},
+				"name":     fmt.Sprintf("%s-pkg-%d", typ, i),
+				"versions": versions,
 			})
+			entries[typ] += len(versions)
 		}
 		packages[typ] = pkgs
 		entryCount[typ] = n
@@ -328,14 +341,16 @@ func cannedEnvelopes(counts map[string]int) map[string]any {
 		"/api/v1/packages": packages,
 		"/api/v1/status":   map[string]any{"entry_count": entryCount},
 		"/api/v1/metrics":  map[string]any{"global": map[string]any{}, "by_type": byType},
-	}
+	}, entries
 }
 
 // TestWebUIRendersEveryServedType runs the page's script against an envelope
 // carrying a type typeOrder does not name. The literal used to be the render
 // set, so a crate the read API answered for was invisible in the browser.
 func TestWebUIRendersEveryServedType(t *testing.T) {
-	got := runPage(t, "", cannedEnvelopes(map[string]int{"apt": 1, "npm": 1, "cargo": 1, "nuget": 2}))
+	counts := map[string]int{"apt": 1, "npm": 1, "cargo": 1, "nuget": 2}
+	canned, entries := cannedEnvelopes(counts)
+	got := runPage(t, "", canned)
 
 	rendered := map[string]probeGroup{}
 	for _, g := range got.Groups {
@@ -360,14 +375,29 @@ func TestWebUIRendersEveryServedType(t *testing.T) {
 		t.Errorf("render order = %v, want %v", got.RenderTypes, want)
 	}
 
-	// #280: the header sums entry_count across every type, so it matches the
-	// tree only when every counted type also renders a group.
-	total := 0
+	// #280: the header sums entry_count, which counts packages, while each
+	// group counts the version entries the tree lists under it. The seed gives
+	// one nuget package two versions so the two totals differ, and an equality
+	// between them would be measuring the seed rather than the page. The
+	// relation that holds, and the one #280 broke, is that every type the
+	// header counts renders a group carrying that type's entries.
+	packages, treeEntries, total := 0, 0, 0
 	for _, g := range got.Groups {
 		total += g.Count
 	}
-	if got.StatusText != "5 packages" || total != 5 {
-		t.Errorf("header %q against groups totalling %d; the header must count what the tree lists", got.StatusText, total)
+	for typ, n := range counts {
+		packages += n
+		treeEntries += entries[typ]
+		g, ok := rendered[typ]
+		if !ok {
+			continue // already reported as a group the server sent and the page dropped
+		}
+		if g.Count != entries[typ] {
+			t.Errorf("%s group lists %d entries, want the %d versions the server sent", typ, g.Count, entries[typ])
+		}
+	}
+	if want := fmt.Sprintf("%d packages", packages); got.StatusText != want || total != treeEntries {
+		t.Errorf("header %q over groups totalling %d entries, want %q over %d; either the header counts a type that renders no group, or a group lists fewer entries than the server sent", got.StatusText, total, want, treeEntries)
 	}
 
 	bars := map[string]string{}
@@ -389,7 +419,8 @@ func TestWebUIRendersEveryServedType(t *testing.T) {
 // exactly that loop.
 func TestWebUIRejectsUnservedPermalinkType(t *testing.T) {
 	const payload = `<img src=x onerror=alert(1)>`
-	got := runPage(t, "#"+payload+"/pkg/1.0.0", cannedEnvelopes(map[string]int{"apt": 1, "cargo": 1}))
+	canned, _ := cannedEnvelopes(map[string]int{"apt": 1, "cargo": 1})
+	got := runPage(t, "#"+payload+"/pkg/1.0.0", canned)
 
 	if len(got.ExpandedGroups) != 0 {
 		t.Errorf("expandedGroups = %v, want empty: a permalink type the server never sent must not reach it", got.ExpandedGroups)
