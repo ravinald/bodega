@@ -226,6 +226,38 @@ paths:
         "404":
           description: Package not found
 
+  /api/v1/packages/{type}/{name}/{version}:
+    get:
+      summary: Get a single version of a package
+      description: |
+        Returns the package manifest with every top-level field intact and
+        `versions` holding only the matching entry, so the payload round-trips
+        through `bodega pkg import` and the editor. This is where a version's
+        vetting stamps are read back.
+      operationId: getPackageVersion
+      tags: [packages]
+      parameters:
+        - $ref: "#/components/parameters/PackageType"
+        - $ref: "#/components/parameters/PackageName"
+        - name: version
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Package manifest scoped to one version
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PackageManifest"
+        "404":
+          description: Unknown type, or package or version not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /api/v1/packages/{type}/{name}/hide:
     patch:
       summary: Toggle hidden flag
@@ -522,7 +554,7 @@ components:
       required: true
       schema:
         type: string
-        enum: [apt, git, pypi, binary, gomod, helm, npm]
+        enum: [apt, git, pypi, binary, gomod, helm, npm, cargo]
     PackageName:
       name: name
       in: path
@@ -586,6 +618,10 @@ components:
           items:
             $ref: "#/components/schemas/PackageManifest"
         npm:
+          type: array
+          items:
+            $ref: "#/components/schemas/PackageManifest"
+        cargo:
           type: array
           items:
             $ref: "#/components/schemas/PackageManifest"

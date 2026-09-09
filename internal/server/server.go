@@ -803,27 +803,18 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 
 // ---- REST API --------------------------------------------------------------
 
-// packagesResponse is the JSON envelope for /api/v1/packages.
-type packagesResponse struct {
-	Apt    []*manifest.PackageManifest `json:"apt"`
-	Git    []*manifest.PackageManifest `json:"git"`
-	Pypi   []*manifest.PackageManifest `json:"pypi"`
-	Binary []*manifest.PackageManifest `json:"binary"`
-	Gomod  []*manifest.PackageManifest `json:"gomod"`
-	Helm   []*manifest.PackageManifest `json:"helm"`
-	Npm    []*manifest.PackageManifest `json:"npm"`
-}
+// packagesResponse is the JSON envelope for /api/v1/packages: one key per
+// manifest.AllTypes member, always present, empty array when the ecosystem
+// holds nothing. A struct with fixed fields cannot say that — a missing key
+// reads to a client as a type the server has never heard of, which is the
+// same answer it gives for a typo.
+type packagesResponse map[string][]*manifest.PackageManifest
 
 func (s *Server) handleAPIPackages(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	resp := packagesResponse{
-		Apt:    loadAllPackages(ctx, s.store, manifest.TypeApt),
-		Git:    loadAllPackages(ctx, s.store, manifest.TypeGit),
-		Pypi:   loadAllPackages(ctx, s.store, manifest.TypePypi),
-		Binary: loadAllPackages(ctx, s.store, manifest.TypeBinary),
-		Gomod:  loadAllPackages(ctx, s.store, manifest.TypeGomod),
-		Helm:   loadAllPackages(ctx, s.store, manifest.TypeHelm),
-		Npm:    loadAllPackages(ctx, s.store, manifest.TypeNpm),
+	resp := make(packagesResponse, len(manifest.AllTypes))
+	for _, typ := range manifest.AllTypes {
+		resp[typ] = loadAllPackages(ctx, s.store, typ)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -831,15 +822,13 @@ func (s *Server) handleAPIPackages(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAPIPackagesByType(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	t := r.PathValue("type")
-	switch t {
-	case manifest.TypeApt, manifest.TypeGit, manifest.TypePypi, manifest.TypeBinary,
-		manifest.TypeGomod, manifest.TypeHelm, manifest.TypeNpm:
-		writeJSON(w, http.StatusOK, loadAllPackages(ctx, s.store, t))
-	default:
+	if !manifest.IsKnownType(t) {
 		writeJSON(w, http.StatusNotFound, map[string]string{
-			"error": fmt.Sprintf("unknown type %q — must be one of: apt, git, pypi, binary, gomod, helm, npm", t),
+			"error": fmt.Sprintf("unknown type %q — must be one of: %s", t, strings.Join(manifest.AllTypes, ", ")),
 		})
+		return
 	}
+	writeJSON(w, http.StatusOK, loadAllPackages(ctx, s.store, t))
 }
 
 func (s *Server) handleAPIPackage(w http.ResponseWriter, r *http.Request) {
@@ -847,25 +836,23 @@ func (s *Server) handleAPIPackage(w http.ResponseWriter, r *http.Request) {
 	t := r.PathValue("type")
 	name := r.PathValue("name")
 
-	switch t {
-	case manifest.TypeApt, manifest.TypeGit, manifest.TypePypi, manifest.TypeBinary,
-		manifest.TypeGomod, manifest.TypeHelm, manifest.TypeNpm:
-		pm, err := s.store.GetPackage(ctx, t, name)
-		if err != nil {
-			s.logger.Error("get package failed", "type", t, "name", name, "error", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
-			return
-		}
-		if pm == nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
-			return
-		}
-		writeJSON(w, http.StatusOK, pm)
-	default:
+	if !manifest.IsKnownType(t) {
 		writeJSON(w, http.StatusNotFound, map[string]string{
 			"error": fmt.Sprintf("unknown type %q", t),
 		})
+		return
 	}
+	pm, err := s.store.GetPackage(ctx, t, name)
+	if err != nil {
+		s.logger.Error("get package failed", "type", t, "name", name, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if pm == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, pm)
 }
 
 // handleAPIPackageVersion returns a PackageManifest scoped to a single
@@ -879,35 +866,30 @@ func (s *Server) handleAPIPackageVersion(w http.ResponseWriter, r *http.Request)
 	name := r.PathValue("name")
 	version := r.PathValue("version")
 
-	// cargo is in this list and not in the two handlers above: the OSV gate
-	// covers crates.io, so a cargo version carries the same vetting stamp as
-	// an npm one and an operator has to be able to read it back.
-	switch t {
-	case manifest.TypeApt, manifest.TypeGit, manifest.TypePypi, manifest.TypeBinary,
-		manifest.TypeGomod, manifest.TypeHelm, manifest.TypeNpm, manifest.TypeCargo:
-		pm, err := s.store.GetPackage(ctx, t, name)
-		if err != nil {
-			s.logger.Error("get package failed", "type", t, "name", name, "error", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
-			return
-		}
-		if pm == nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "package not found"})
-			return
-		}
-		scoped := pm.ScopeToVersion(version)
-		if scoped == nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{
-				"error": fmt.Sprintf("version %q not found in %s/%s", version, t, name),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, scoped)
-	default:
+	if !manifest.IsKnownType(t) {
 		writeJSON(w, http.StatusNotFound, map[string]string{
 			"error": fmt.Sprintf("unknown type %q", t),
 		})
+		return
 	}
+	pm, err := s.store.GetPackage(ctx, t, name)
+	if err != nil {
+		s.logger.Error("get package failed", "type", t, "name", name, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if pm == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "package not found"})
+		return
+	}
+	scoped := pm.ScopeToVersion(version)
+	if scoped == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"error": fmt.Sprintf("version %q not found in %s/%s", version, t, name),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, scoped)
 }
 
 // statusResponse is the JSON shape for /api/v1/status.
@@ -942,20 +924,16 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 		spool.Dir = ""
 		version = ""
 	}
+	entryCount := make(map[string]int, len(manifest.AllTypes))
+	for _, typ := range manifest.AllTypes {
+		entryCount[typ] = len(s.store.ListPackages(typ))
+	}
 	resp := statusResponse{
-		Healthy: true,
-		Version: version,
-		Apt:     s.aptStatusFor(r),
-		Spool:   spool,
-		EntryCount: map[string]int{
-			manifest.TypeApt:    len(s.store.ListPackages(manifest.TypeApt)),
-			manifest.TypeGit:    len(s.store.ListPackages(manifest.TypeGit)),
-			manifest.TypePypi:   len(s.store.ListPackages(manifest.TypePypi)),
-			manifest.TypeBinary: len(s.store.ListPackages(manifest.TypeBinary)),
-			manifest.TypeGomod:  len(s.store.ListPackages(manifest.TypeGomod)),
-			manifest.TypeHelm:   len(s.store.ListPackages(manifest.TypeHelm)),
-			manifest.TypeNpm:    len(s.store.ListPackages(manifest.TypeNpm)),
-		},
+		Healthy:    true,
+		Version:    version,
+		Apt:        s.aptStatusFor(r),
+		Spool:      spool,
+		EntryCount: entryCount,
 	}
 
 	if s.stores == nil {
