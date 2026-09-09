@@ -188,7 +188,12 @@ body {
   flex-shrink: 0;
   text-align: right;
 }
-.field .val { word-break: break-all; }
+/* cargo's client instruction is the only field value carrying newlines: a
+   registry stanza, not a URL. Without pre-wrap the browser collapses it to one
+   line and an operator who selects the text rather than clicking copy gets a
+   TOML parse error. #detail computes to text-align: center, which every
+   one-line value hides, so the override is needed for the lines to align. */
+.field .val { word-break: break-all; white-space: pre-wrap; text-align: left; }
 .field .val.yes { color: var(--green); }
 .field .val.no { color: var(--fg-dim); }
 .field .val.uploaded { color: var(--green); }

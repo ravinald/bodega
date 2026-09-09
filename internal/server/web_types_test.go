@@ -37,6 +37,8 @@ var (
 	// brace inside the function is indented, so that is its end.
 	reClientURLFn = regexp.MustCompile(`(?s)\nfunction getClientUrl\(.*?\n\}`)
 	reSwitchCase  = regexp.MustCompile(`case '([a-z0-9_-]+)':`)
+	// The .field .val rule, excluding its .yes/.no/.url modifiers.
+	reFieldValRule = regexp.MustCompile(`(?s)\.field \.val\s*\{(.*?)\}`)
 )
 
 func objectKeys(t *testing.T, re *regexp.Regexp, src, what string) map[string]bool {
@@ -475,6 +477,38 @@ func TestWebClientInstructionCoversEveryKnownType(t *testing.T) {
 	for _, typ := range manifest.AllTypes {
 		if !cases[typ] {
 			t.Errorf("getClientUrl has no case for %q, so it falls through to \"\" and the detail panel drops the client-instruction row entirely", typ)
+		}
+	}
+}
+
+// TestWebMultiLineClientInstructionWraps guards the CSS the moment a client
+// instruction stops being one line. cargo's is a three-line registry stanza,
+// and .field .val shipped with no white-space declaration, so the browser
+// collapsed it to a single line: the copy affordance handed over legal TOML
+// while the text on screen was a parse error, which is the worse half to get
+// wrong because retyping it is what docs/USAGE.md invites. text-align comes
+// with it because #detail computes to center, which every one-line value in
+// the pane's history hid. Conditional on a newline actually being in a case
+// body, so a page whose instructions are all single lines needs neither.
+func TestWebMultiLineClientInstructionWraps(t *testing.T) {
+	src := webIndex(t)
+
+	body := reClientURLFn.FindString(src)
+	if body == "" {
+		t.Fatal("web/index.html: no getClientUrl function found; the test's regexp and the page have drifted")
+	}
+	if !strings.Contains(body, `\n`) {
+		t.Skip("no getClientUrl case emits a newline, so the pane has no multi-line value to wrap")
+	}
+
+	m := reFieldValRule.FindStringSubmatch(src)
+	if m == nil {
+		t.Fatal("web/index.html: no .field .val rule found; the test's regexp and the page have drifted")
+	}
+	decls := m[1]
+	for _, want := range []string{"white-space: pre-wrap", "text-align: left"} {
+		if !strings.Contains(decls, want) {
+			t.Errorf(".field .val does not declare %q, so a client instruction carrying a newline renders as one line: {%s}", want, decls)
 		}
 	}
 }
