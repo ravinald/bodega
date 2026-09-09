@@ -314,6 +314,7 @@ body {
 .type-gomod { color: #5fd7ff; }
 .type-helm { color: #0087ff; }
 .type-npm { color: #ff005f; }
+.type-cargo { color: #d75fd7; }
 </style>
 </head>
 <body>
@@ -339,8 +340,31 @@ body {
 </div>
 
 <script>
-const typeIcons = {apt:'A', git:'G', pypi:'P', binary:'B', gomod:'M', helm:'H', npm:'N'};
+const typeIcons = {apt:'A', git:'G', pypi:'P', binary:'B', gomod:'M', helm:'H', npm:'N', cargo:'C'};
+// typeOrder decides the order types render in and never which types render.
+// apt leads this page deliberately, which manifest.AllTypes build order (binary
+// first) would undo, so the preference is written out rather than derived.
 const typeOrder = ['apt','git','pypi','binary','gomod','helm','npm'];
+
+// renderTypes orders one server envelope's keys for display. Its input is the
+// keys of a server response and nothing else: /api/v1/packages, entry_count on
+// /api/v1/status and by_type on /api/v1/metrics each carry one key per
+// ecosystem the server knows, empty ones included. That is what keeps a type
+// string taken from a URL fragment out of the DOM. Every key the typeOrder
+// prefix does not name still renders, after it, so a ninth ecosystem appears
+// in the browser as soon as the server emits its key with no edit here.
+function renderTypes(keys) {
+  const rest = new Set(keys || []);
+  const out = [];
+  for (const t of typeOrder) { if (rest.delete(t)) out.push(t); }
+  return out.concat(Array.from(rest).sort());
+}
+
+// typeIcon falls back to the type's first letter so an ecosystem this page has
+// no icon row for renders a badge instead of the string "undefined".
+function typeIcon(type) {
+  return typeIcons[type] || (type ? type.charAt(0).toUpperCase() : '?');
+}
 let allData = null;
 // serverApt is the apt block of /api/v1/status: the sources line rendered by
 // the server, one per served suite, plus the URL in force. The page composes
@@ -436,7 +460,7 @@ function render() {
   }
   wasFiltering = isFiltering;
 
-  for (const type of typeOrder) {
+  for (const type of renderTypes(Object.keys(allData || {}))) {
     let entries = entriesForType(type);
     if (filter) {
       entries = entries.filter(e => entryDisplayName(type, e).toLowerCase().includes(filter));
@@ -457,8 +481,8 @@ function render() {
     const expanded = expandedGroups.has(type);
     header.innerHTML =
       '<span class="arrow">' + (expanded ? '\u25BC' : '\u25B6') + '</span>' +
-      '<span class="icon type-' + type + '">' + typeIcons[type] + '</span>' +
-      '<span>' + type + '/</span>' +
+      '<span class="icon type-' + escapeHtml(type) + '">' + typeIcon(type) + '</span>' +
+      '<span>' + escapeHtml(type) + '/</span>' +
       '<span class="count">(' + entries.length + ')</span>';
     header.onclick = () => {
       if (expandedGroups.has(type)) expandedGroups.delete(type);
@@ -720,8 +744,8 @@ async function showDashboard() {
     html += '<div class="dash-section"><h3>Packages by Type</h3>';
     var maxPkg = 0;
     for (var t in m.by_type) { if (m.by_type[t].packages > maxPkg) maxPkg = m.by_type[t].packages; }
-    var barColors = {apt:'#ffaf00', git:'#8787ff', pypi:'#b8860b', binary:'#00d787', gomod:'#5fd7ff', helm:'#0087ff', npm:'#ff005f'};
-    for (var t of typeOrder) {
+    var barColors = {apt:'#ffaf00', git:'#8787ff', pypi:'#b8860b', binary:'#00d787', gomod:'#5fd7ff', helm:'#0087ff', npm:'#ff005f', cargo:'#d75fd7'};
+    for (var t of renderTypes(Object.keys(m.by_type || {}))) {
       var bt = m.by_type[t] || {packages:0};
       var w = maxPkg > 0 ? Math.round(bt.packages * 100 / maxPkg) : 0;
       html += '<div class="dash-bar-row">';
@@ -741,7 +765,7 @@ async function showDashboard() {
 async function showTypeMetrics(type) {
   var d = document.getElementById('detail');
   var entries = entriesForType(type);
-  var html = '<div class="detail-title"><span class="type-badge">' + type + '</span> Repository</div>';
+  var html = '<div class="detail-title"><span class="type-badge">' + escapeHtml(type) + '</span> Repository</div>';
 
   // Summary cards.
   var versions = 0, frozen = 0, hidden = 0;
@@ -789,9 +813,10 @@ function dashCard(value, label) {
 }
 
 function expandAll() {
-  for (var t of typeOrder) expandedGroups.add(t);
+  var types = renderTypes(Object.keys(allData || {}));
+  for (var t of types) expandedGroups.add(t);
   if (!allData) { render(); return; }
-  for (var t of typeOrder) {
+  for (var t of types) {
     var entries = entriesForType(t);
     var g = groupByName(t, entries);
     for (var n of g.order) expandedPkgs.add(t + '/' + n);
@@ -864,6 +889,18 @@ async function init() {
     var parts = path.split('/');
     if (parts.length >= 2 && allData) {
       var type = parts[0];
+      var served = renderTypes(Object.keys(allData));
+      // A permalink is user input, so its type is checked against the keys the
+      // server sent before anything downstream treats it as one. Reported by
+      // name because a bookmark outlives the ecosystem it was taken against,
+      // and the reader needs to see which half went stale.
+      if (served.indexOf(type) < 0) {
+        var d = document.getElementById('detail');
+        d.className = 'detail-empty';
+        d.textContent = 'This link names the type "' + type + '", which this server does not serve. Types served: ' + served.join(', ') + '.';
+        render();
+        return;
+      }
       var name = parts.slice(1, -1).join('/') || parts[1];
       var ver = parts.length > 2 ? parts[parts.length - 1] : '';
       expandedGroups.add(type);
