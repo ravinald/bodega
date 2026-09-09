@@ -1912,12 +1912,19 @@ func TestCargoStanzaSurvivesANarrowPane(t *testing.T) {
 	cfg := &config.Config{PublicURL: "http://127.0.0.1:18742"}
 	leaf := firstVersionLeaf(t, BuildTree(store, nil), manifest.TypeCargo)
 
+	// An empty instruction splits to one empty string, which every pane
+	// contains: the guard would pass on the defect it exists to catch.
+	stanza := clientURL(cfg, store, manifest.TypeCargo, leaf.Name)
+	if stanza == "" {
+		t.Fatalf("no client instruction to render for %s", manifest.TypeCargo)
+	}
+
 	for _, width := range []int{40, 54, 80, 120} {
 		m := newDetailsModel(store, cfg)
 		m.SetSize(width, 40)
 		m.SetNode(leaf)
 		pane := m.renderEntryDetails()
-		for _, want := range strings.Split(clientURL(cfg, store, manifest.TypeCargo, leaf.Name), "\n") {
+		for _, want := range strings.Split(stanza, "\n") {
 			if !strings.Contains(pane, want) {
 				t.Errorf("width %d: no line carries %q; retyping the pane gives invalid TOML. Pane:\n%s", width, want, pane)
 			}
