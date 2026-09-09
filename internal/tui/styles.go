@@ -93,6 +93,8 @@ func typeIcon(t string) string {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("33")).Render("H")
 	case "npm":
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render("N")
+	case "cargo":
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("130")).Render("C")
 	default:
 		return " "
 	}

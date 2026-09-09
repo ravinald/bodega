@@ -269,6 +269,10 @@ func BuildTree(store *manifest.Store, statuses []inventory.EntryStatus) []TreeNo
 	npmEntries := collectEntries(manifest.TypeNpm, func(ve manifest.VersionEntry) string { return ve.Version })
 	roots = append(roots, buildGroup(manifest.TypeNpm, npmEntries))
 
+	// cargo
+	cargoEntries := collectEntries(manifest.TypeCargo, func(ve manifest.VersionEntry) string { return ve.Version })
+	roots = append(roots, buildGroup(manifest.TypeCargo, cargoEntries))
+
 	return roots
 }
 

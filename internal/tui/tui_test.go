@@ -124,8 +124,8 @@ func TestBuildTree(t *testing.T) {
 
 	roots := BuildTree(store, statuses)
 
-	if len(roots) != 7 {
-		t.Fatalf("expected 7 root groups, got %d", len(roots))
+	if len(roots) != len(manifest.AllTypes) {
+		t.Fatalf("expected %d root groups, got %d", len(manifest.AllTypes), len(roots))
 	}
 
 	// apt group — children are now package sub-groups
@@ -171,6 +171,43 @@ func TestBuildTree(t *testing.T) {
 	}
 	if !pypiPkg.Children[0].InS3 {
 		t.Error("pypi pkg: InS3 should be true")
+	}
+}
+
+// TestBuildTreeCoversEveryKnownType asserts an operator can reach every stored
+// ecosystem from the Sources pane. BuildTree appends one root group per type by
+// hand, and a type it has no arm for is unreachable in the TUI no matter what
+// the store holds or how well the detail pane renders it.
+func TestBuildTreeCoversEveryKnownType(t *testing.T) {
+	store, _ := seedClientURLTypes(t)
+
+	roots := BuildTree(store, nil)
+
+	byType := make(map[string]TreeNode, len(roots))
+	for _, r := range roots {
+		byType[r.EntryType] = r
+	}
+
+	for _, typ := range manifest.AllTypes {
+		t.Run(typ, func(t *testing.T) {
+			group, ok := byType[typ]
+			if !ok {
+				t.Fatalf("no root group for %s, so a stored %s package has no node to select in the Sources pane", typ, typ)
+			}
+			if len(group.Children) == 0 {
+				t.Errorf("%s root group is empty despite a seeded package", typ)
+			}
+			// The badge is how a group is told apart at a glance; typeIcon
+			// degrades an uncovered type to a blank column beside seven
+			// lettered siblings.
+			if strings.TrimSpace(typeIcon(typ)) == "" {
+				t.Errorf("typeIcon(%s) is blank, so the %s group renders with no badge", typ, typ)
+			}
+		})
+	}
+
+	if len(roots) != len(manifest.AllTypes) {
+		t.Errorf("root groups = %d, want %d: a group for a type not in AllTypes is a node nothing serves", len(roots), len(manifest.AllTypes))
 	}
 }
 
@@ -1324,32 +1361,150 @@ func TestFieldValueFromSlice(t *testing.T) {
 	}
 }
 
+// clientURLExemptType is the one member of manifest.AllTypes clientURL answers
+// "" for by design: a sources line needs the served suites and the signing
+// state as well as the base URL, so aptSources renders it instead. See the
+// comment on clientURL and TestAptSourcesFollowsServerState.
+//
+// Held as a single identity rather than a set so a ninth ecosystem added to
+// AllTypes fails the tests below rather than joining a growing skip list.
+const clientURLExemptType = manifest.TypeApt
+
+// clientURLSeeds carries one package per member of manifest.AllTypes. The
+// version entries differ because clientURL reads different fields off them:
+// git wants a ref, binary a filename, helm a version.
+var clientURLSeeds = map[string]struct {
+	name  string
+	entry manifest.VersionEntry
+}{
+	manifest.TypeApt:    {"pkg-a", manifest.VersionEntry{Version: "1.0"}},
+	manifest.TypePypi:   {"pkg-b", manifest.VersionEntry{Version: "1.0"}},
+	manifest.TypeGomod:  {"example.com/m", manifest.VersionEntry{Version: "v1.0.0"}},
+	manifest.TypeNpm:    {"pkg-c", manifest.VersionEntry{Version: "1.0.0"}},
+	manifest.TypeHelm:   {"chart", manifest.VersionEntry{Version: "1.0.0"}},
+	manifest.TypeGit:    {"org/repo", manifest.VersionEntry{Ref: "v1.0.0"}},
+	manifest.TypeBinary: {"tool", manifest.VersionEntry{Version: "1.0.0", Filename: "tool"}},
+	manifest.TypeCargo:  {"time", manifest.VersionEntry{Version: "0.3.36"}},
+}
+
+// seedClientURLTypes stores one package per member of manifest.AllTypes and
+// returns the store alongside the types clientURL is expected to answer for.
+// The list used to be six literals in the test body, which is why clientURL
+// returning "" for cargo stayed green from the day cargo landed.
+func seedClientURLTypes(t *testing.T) (*manifest.Store, []struct{ typ, name string }) {
+	t.Helper()
+	store := manifest.NewLocalStore(t.TempDir())
+	ctx := t.Context()
+	var entries []struct{ typ, name string }
+	for _, typ := range manifest.AllTypes {
+		seed, ok := clientURLSeeds[typ]
+		if !ok {
+			t.Fatalf("%s is in manifest.AllTypes with no seed here, so nothing asserts the details pane can render it", typ)
+		}
+		if err := store.AddVersion(ctx, typ, seed.name, seed.entry); err != nil {
+			t.Fatalf("seed %s/%s: %v", typ, seed.name, err)
+		}
+		if typ == clientURLExemptType {
+			continue
+		}
+		entries = append(entries, struct{ typ, name string }{typ, seed.name})
+	}
+	return store, entries
+}
+
+// TestClientURLCoversEveryKnownType asserts every type but the one exemption
+// hands an operator something to copy. clientURL falls through to "" for a
+// type it has no arm for, and renderEntryDetails drops the row when the string
+// is empty, so an uncovered type shows a detail panel with no instruction at
+// all rather than a wrong one.
+func TestClientURLCoversEveryKnownType(t *testing.T) {
+	store, entries := seedClientURLTypes(t)
+	cfg := &config.Config{}
+
+	for _, e := range entries {
+		t.Run(e.typ, func(t *testing.T) {
+			if got := clientURL(cfg, store, e.typ, e.name); got == "" {
+				t.Errorf("clientURL returned \"\", so the details pane renders no client instruction for a stored %s package", e.typ)
+			}
+		})
+	}
+
+	// The exemption is asserted, not assumed. apt renders through aptSources,
+	// and clientURL answering for it would put two instructions in one pane.
+	if got := clientURL(cfg, store, clientURLExemptType, clientURLSeeds[clientURLExemptType].name); got != "" {
+		t.Errorf("clientURL(%s) = %q, want \"\": aptSources renders the sources line", clientURLExemptType, got)
+	}
+}
+
+// TestDetailsPaneRendersClientInstructionForEveryKnownType drives the whole
+// path an operator walks: BuildTree produces the node, the pane renders it.
+// clientURL answering for a type proves nothing on its own — renderEntryDetails
+// dispatches on EntryType too, and a type missing there renders a pane that
+// never calls s3AndClientFields, so a correct instruction reaches nobody.
+func TestDetailsPaneRendersClientInstructionForEveryKnownType(t *testing.T) {
+	store, _ := seedClientURLTypes(t)
+	cfg := &config.Config{}
+	roots := BuildTree(store, nil)
+
+	for _, typ := range manifest.AllTypes {
+		t.Run(typ, func(t *testing.T) {
+			leaf := firstVersionLeaf(t, roots, typ)
+
+			want := clientURL(cfg, store, typ, leaf.Name)
+			if typ == clientURLExemptType {
+				pm, err := store.GetPackage(t.Context(), typ, leaf.Name)
+				if err != nil {
+					t.Fatalf("get %s/%s: %v", typ, leaf.Name, err)
+				}
+				want = aptSources(cfg, pm, aptKeyLoaded(cfg)).OneLine
+			}
+			if want == "" {
+				t.Fatalf("no client instruction to render for %s", typ)
+			}
+
+			m := newDetailsModel(store, cfg)
+			m.SetSize(120, 40)
+			m.SetNode(leaf)
+			pane := m.renderEntryDetails()
+
+			// The label wraps under keyStyle's fixed width and a stanza runs
+			// onto continuation lines, so the first line of the instruction is
+			// what survives both intact.
+			firstLine := strings.SplitN(want, "\n", 2)[0]
+			if !strings.Contains(pane, firstLine) {
+				t.Errorf("details pane for %s carries no client instruction; want a line holding %q, got:\n%s", typ, firstLine, pane)
+			}
+		})
+	}
+}
+
+// firstVersionLeaf walks type > package > version and returns the leaf node the
+// details pane is handed when an operator selects a stored package.
+func firstVersionLeaf(t *testing.T, roots []TreeNode, typ string) *TreeNode {
+	t.Helper()
+	for i := range roots {
+		if roots[i].EntryType != typ {
+			continue
+		}
+		if len(roots[i].Children) == 0 {
+			t.Fatalf("%s group has no packages", typ)
+		}
+		pkg := &roots[i].Children[0]
+		if len(pkg.Children) == 0 {
+			t.Fatalf("%s package %q has no versions", typ, pkg.Name)
+		}
+		return &pkg.Children[0]
+	}
+	t.Fatalf("no root group for %s", typ)
+	return nil
+}
+
 // Guards that the client snippets the details pane emits follow the scheme the
 // server is configured to answer on. An http:// snippet for a TLS server is
 // unauthenticated delivery to a root-privileged installer, since apt needs
 // [trusted=yes] against an unsigned repository.
 func TestClientURLSchemeFollowsTLSConfig(t *testing.T) {
-	store := manifest.NewLocalStore(t.TempDir())
-	ctx := t.Context()
-	_ = store.AddVersion(ctx, manifest.TypeApt, "pkg-a", manifest.VersionEntry{Version: "1.0"})
-	_ = store.AddVersion(ctx, manifest.TypePypi, "pkg-b", manifest.VersionEntry{Version: "1.0"})
-	_ = store.AddVersion(ctx, manifest.TypeGomod, "example.com/m", manifest.VersionEntry{Version: "v1.0.0"})
-	_ = store.AddVersion(ctx, manifest.TypeNpm, "pkg-c", manifest.VersionEntry{Version: "1.0.0"})
-	_ = store.AddVersion(ctx, manifest.TypeHelm, "chart", manifest.VersionEntry{Version: "1.0.0"})
-	_ = store.AddVersion(ctx, manifest.TypeGit, "org/repo", manifest.VersionEntry{Ref: "v1.0.0"})
-	_ = store.AddVersion(ctx, manifest.TypeBinary, "tool", manifest.VersionEntry{Version: "1.0.0", Filename: "tool"})
-
-	// apt is absent on purpose: a sources line is not a URL, and it needs the
-	// served suites and the signing state as well as the base. See
-	// TestAptSourcesFollowsServerState.
-	entries := []struct{ typ, name string }{
-		{manifest.TypePypi, "pkg-b"},
-		{manifest.TypeGomod, "example.com/m"},
-		{manifest.TypeNpm, "pkg-c"},
-		{manifest.TypeHelm, "chart"},
-		{manifest.TypeGit, "org/repo"},
-		{manifest.TypeBinary, "tool"},
-	}
+	store, entries := seedClientURLTypes(t)
 
 	tlsCfg := &config.Config{TLSCert: "/etc/bodega/cert.pem", TLSKey: "/etc/bodega/key.pem"}
 	for _, e := range entries {
@@ -1744,5 +1899,35 @@ func TestHelpStaysSingleColumnWhenNarrow(t *testing.T) {
 	}
 	if got := renderHelpColumns(helpText, 160, 40); got == single {
 		t.Error("a 160x40 screen should split the help into columns")
+	}
+}
+
+// TestCargoStanzaSurvivesANarrowPane guards the one client instruction whose
+// meaning depends on where its line breaks fall. The pane has no copy
+// affordance, so an operator retypes what they read: a reflowed "index =" is a
+// TOML parse error, and cargo reports it against their config file rather than
+// against the pane that produced it.
+func TestCargoStanzaSurvivesANarrowPane(t *testing.T) {
+	store, _ := seedClientURLTypes(t)
+	cfg := &config.Config{PublicURL: "http://127.0.0.1:18742"}
+	leaf := firstVersionLeaf(t, BuildTree(store, nil), manifest.TypeCargo)
+
+	// An empty instruction splits to one empty string, which every pane
+	// contains: the guard would pass on the defect it exists to catch.
+	stanza := clientURL(cfg, store, manifest.TypeCargo, leaf.Name)
+	if stanza == "" {
+		t.Fatalf("no client instruction to render for %s", manifest.TypeCargo)
+	}
+
+	for _, width := range []int{40, 54, 80, 120} {
+		m := newDetailsModel(store, cfg)
+		m.SetSize(width, 40)
+		m.SetNode(leaf)
+		pane := m.renderEntryDetails()
+		for _, want := range strings.Split(stanza, "\n") {
+			if !strings.Contains(pane, want) {
+				t.Errorf("width %d: no line carries %q; retyping the pane gives invalid TOML. Pane:\n%s", width, want, pane)
+			}
+		}
 	}
 }

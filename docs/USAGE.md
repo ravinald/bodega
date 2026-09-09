@@ -2510,6 +2510,7 @@ A read-only audit database used to be the quieter version of the same loss: `Rec
 │ gomod/             │                            │
 │ helm/              │                            │
 │ npm/               │                            │
+│ cargo/             │                            │
 ├─ Log ──────────────┴────────────────────────────┤
 │ [gomod] github.com/aws/sdk: fetching...         │
 │ [gomod] github.com/aws/sdk: checksum verified   │
@@ -2558,6 +2559,20 @@ The form edits no ACL. `deny_list`, `admin_permit_cidr` and `trusted_proxies` ar
 
 ### Details pane
 
+The last field of an entry is the client instruction, and its label names the shape rather than assuming a URL: **Sources line** for apt, **Registry stanza** for cargo, **Package URL** for the other six. All three carry the base URL `public_url` and the TLS pair resolve to, so a pane behind a terminating proxy prints what a client outside it reaches.
+
+cargo is the one type whose instruction is a file rather than a command. A client reaches the sparse index only once `.cargo/config.toml` names it as a registry, so the field carries the stanza and the command that uses it as one value:
+
+```toml
+[registries.bodega]
+index = "sparse+https://bodega.example.com/cargo/"
+# cargo add --registry bodega <crate>
+```
+
+The command is a TOML comment because the web dashboard's copy affordance copies the field verbatim and its destination is that config file: a bare shell line pasted there fails the parse. Uncomment it, or retype it at a prompt.
+
+In the TUI the stanza's three lines are rendered one per row and never reflowed, so a pane too narrow to hold `index = "..."` cuts the line at the right edge instead of wrapping it. The pane offers nothing to copy, so what an operator reads is what they retype: a wrapped `index =` is a TOML parse error, and cargo reports it against their config file rather than against the pane. Widening the terminal is the fix, and the floor is around 85 columns for a loopback base, rising with the length of `public_url`: `https://bodega.example.com` needs 92. Do not count on the cut announcing itself. At 84 columns with bodega's default port it takes the closing quote and nothing else, leaving a line that reads as finished and parses as an unterminated string, so the row to check is the one ending `/cargo/"`.
+
 The **Sources line** field for an apt entry is a command an operator pastes into `/etc/apt/sources.list.d/`, so it is rendered by the server-side renderer every other emitter uses ([Client configuration](#client-configuration)) rather than composed in the pane. Two things it does that are not obvious:
 
 - **The suite is intersected against the served set.** The pane names the first suite the entry is published to that `apt_suites` (or `apt_codename`) also answers for. An entry naming a suite outside that set reaches no index, and a line pointing at it 404s the whole `dists/` path, which apt reports as "Unable to locate package" — the message a misspelled name produces. The fallback is the first served suite. `GET /api/v1/status` lists such entries under `apt.unserved`.
@@ -2587,7 +2602,7 @@ Access the dashboard at `https://bodega-host:8080/` when the server is running.
 **Features:**
 - **Live metrics**: package counts by type, total artifact size, version statistics
 - **Status view**: per-package build and upload status
-- **Copy utilities**: one-click copy for Package URL and Package JSON Config
+- **Copy utilities**: one-click copy for the client instruction (Package URL, Sources line or Registry stanza, per type) and Package JSON Config
 - **Browser-based browsing**: explore packages by type and version
 
 The type list is the server's, not the page's. The tree, the per-type bars and both expand-all loops render one group per key in the `/api/v1/packages` envelope, which carries every ecosystem the server knows with an empty array for the ones holding nothing. The page keeps a preferred order (apt first, then git, pypi, binary, gomod, helm, npm) and anything outside it renders after, sorted. So an ecosystem added to the server shows up in a browser with no change to the page, and a stored package can never be missing from the tree while the header counts it.

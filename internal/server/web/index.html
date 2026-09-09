@@ -188,7 +188,12 @@ body {
   flex-shrink: 0;
   text-align: right;
 }
-.field .val { word-break: break-all; }
+/* cargo's client instruction is the only field value carrying newlines: a
+   registry stanza, not a URL. Without pre-wrap the browser collapses it to one
+   line and an operator who selects the text rather than clicking copy gets a
+   TOML parse error. #detail computes to text-align: center, which every
+   one-line value hides, so the override is needed for the lines to align. */
+.field .val { word-break: break-all; white-space: pre-wrap; text-align: left; }
 .field .val.yes { color: var(--green); }
 .field .val.no { color: var(--fg-dim); }
 .field .val.uploaded { color: var(--green); }
@@ -592,7 +597,7 @@ function showDetail(type, entry) {
     fields.push(['Constraint', entry.version_constraint]);
   fields.push(['Frozen', entry.frozen ? 'yes' : 'no', entry.frozen ? 'yes' : 'no']);
   if (clientUrl && !isPolicyEntry) {
-    fields.push([type === 'apt' ? 'Sources line' : 'Package URL', clientUrl, 'url']);
+    fields.push([clientFieldLabel(type), clientUrl, 'url']);
     if (type === 'apt') {
       const src = aptSourcesFor(entry);
       for (const note of (src && src.notes) || []) fields.push(['Note', note]);
@@ -709,8 +714,30 @@ function getClientUrl(type, entry) {
       return base + '/helm/charts/' + entry.name + '-' + (entry.version || '') + '.tgz';
     case 'npm':
       return 'npm install --registry ' + base + '/npm/ ' + entry.name;
+    // Cargo hands back no URL. A client reaches the sparse index only once
+    // .cargo/config.toml names it as a registry, so the stanza and the command
+    // that uses it travel together as one string. The command is a TOML
+    // comment because the copy affordance copies this field verbatim and its
+    // destination is that config file: a bare shell line pasted there fails
+    // the parse, and the stanza alone never names the --registry flag.
+    case 'cargo':
+      return '[registries.bodega]\n'
+        + 'index = "sparse+' + base + '/cargo/"\n'
+        + '# cargo add --registry bodega ' + entry.name;
   }
   return '';
+}
+
+// clientFieldLabel names the detail-pane row holding a type's client
+// instruction. Two of the eight hand back something other than a URL: apt a
+// sources line, cargo a registry stanza. Calling either a "Package URL" sends
+// an operator looking for something to curl.
+function clientFieldLabel(type) {
+  switch (type) {
+    case 'apt': return 'Sources line';
+    case 'cargo': return 'Registry stanza';
+  }
+  return 'Package URL';
 }
 
 async function showDashboard() {
