@@ -103,7 +103,7 @@ type profileDocEntry struct {
 func newProfileCreateCmd(gf *globalFlags) *cobra.Command {
 	var description, fromOrigin, fromFile, out string
 	var pins []string
-	var force bool
+	var force, overwrite bool
 
 	c := &cobra.Command{
 		Use:   "create <name>",
@@ -141,7 +141,13 @@ decide which package is held would pin one and leave the other floating with
 nothing said about it.
 
 A slash is read as the qualifier only when what precedes it is one of the
-eight types, so @babel/core and github.com/lib/pq are each one name.`,
+eight types, so @babel/core and github.com/lib/pq are each one name. One
+package named by two --pin spellings is refused: the pin count is what you
+check against the flags you typed.
+
+--out refuses a path that already holds something. The file it names is the
+one an operator edited between the two commands, and re-running the generator
+over it is how that edit is lost. --overwrite replaces it.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
@@ -150,10 +156,13 @@ eight types, so @babel/core and github.com/lib/pq are each one name.`,
 					"run them as two commands with an editor between")
 			}
 			if fromOrigin != "" {
-				return writeBaseline(gf, name, description, fromOrigin, out, pins)
+				return writeBaseline(gf, name, description, fromOrigin, out, pins, overwrite)
 			}
 			if out != "" {
 				return fmt.Errorf("--out names where a baseline is written and only --from-origin writes one")
+			}
+			if overwrite {
+				return fmt.Errorf("--overwrite governs the baseline --out writes and only --from-origin writes one")
 			}
 			if len(pins) > 0 {
 				return fmt.Errorf("--pin names an exception in a --from-origin baseline; " +
@@ -176,14 +185,18 @@ eight types, so @babel/core and github.com/lib/pq are each one name.`,
 	c.Flags().StringVar(&fromFile, "from-file", "", "Create the profile from a baseline file")
 	c.Flags().StringArrayVar(&pins, "pin", nil, "Pin this package's version in the baseline, as <name> or <type>/<name> (repeatable)")
 	c.Flags().BoolVar(&force, "force", false, "Accept a closed type with no entries, which permits nothing of that type")
+	c.Flags().BoolVar(&overwrite, "overwrite", false, "Replace an existing --out file, discarding whatever it holds")
 	return c
 }
 
 // writeBaseline collects what a host was cataloged with and writes it as a
 // document. It creates no profile: that is --from-file's job, and the split is
 // the review step.
-func writeBaseline(gf *globalFlags, name, description, origin, out string, pins []string) error {
+func writeBaseline(gf *globalFlags, name, description, origin, out string, pins []string, overwrite bool) error {
 	if err := requireBaselineFile(out, "--out"); err != nil {
+		return err
+	}
+	if err := requireBaselineAbsent(out, overwrite); err != nil {
 		return err
 	}
 	store, err := loadStore(gf)
@@ -250,6 +263,7 @@ func applyBaselinePins(doc *profileDoc, found []originPackage, pins []string, ou
 		return 0, nil
 	}
 	count := 0
+	pinnedBy := map[string]string{}
 	for _, pin := range pins {
 		p, err := resolveBaselinePin(doc, found, pin, out)
 		if err != nil {
@@ -261,6 +275,12 @@ func applyBaselinePins(doc *profileDoc, found []originPackage, pins []string, ou
 				pin, p.Type, p.Name, doc.Origin, len(p.Versions), strings.Join(p.Versions, ", "),
 				doc.Name, p.Type, p.Name)
 		}
+		key := p.Type + "/" + p.Name
+		if first, ok := pinnedBy[key]; ok {
+			return 0, fmt.Errorf("--pin %s and --pin %s both name %s, which is either a slip or two versions meant for one package.\n"+
+				"  Name it once:  --pin %s", first, pin, key, key)
+		}
+		pinnedBy[key] = pin
 		for i := range doc.Entries {
 			if doc.Entries[i].Type == p.Type && doc.Entries[i].Name == p.Name {
 				doc.Entries[i].Constraint = manifest.ConstraintExact
@@ -371,6 +391,28 @@ func requireBaselineFile(path, flag string) error {
 			"command that produced it was never read by anyone, which is the one thing this step is for", flag)
 	}
 	return nil
+}
+
+// requireBaselineAbsent refuses to write over a file that already exists.
+//
+// The generate-edit-create round trip means the path named by --out is, on
+// every run after the first, the file an operator has already spent time on.
+// A silent overwrite discards the review this whole split exists to force,
+// and reports success while doing it.
+func requireBaselineAbsent(path string, overwrite bool) error {
+	if overwrite {
+		return nil
+	}
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	return fmt.Errorf("%s already exists, and a baseline is written to be edited before it is used.\n"+
+		"  Read what is there:  bodega profile create <name> --from-file %s\n"+
+		"  Write somewhere else:  --out <other path>\n"+
+		"  Replace it, losing whatever it holds:  --overwrite", path, path)
 }
 
 // createFromDoc writes a whole document: the profile, its markers, its
@@ -667,11 +709,11 @@ already bound moves it, and says which profile it came from.`,
 			if err != nil {
 				return err
 			}
-			recordProfileEvent(ctx, adb, audit.EventCreate, profile, identity, "bind identity="+identity)
 			if previous == profile {
 				fmt.Printf("%s is already bound to %s.\n", identity, profile)
 				return nil
 			}
+			recordProfileEvent(ctx, adb, audit.EventCreate, profile, identity, "bind identity="+identity)
 			if previous != "" {
 				fmt.Printf("Bound %s to %s, moved from %s.\n", identity, profile, previous)
 				return nil
@@ -1290,7 +1332,11 @@ version it holds is one nothing can serve.`,
 				}
 				resolved := entitle.New(checkView(d))
 				for _, e := range d.Entries {
-					reason := entryResolves(ctx, store, resolved, e)
+					reason, err := entryResolves(ctx, store, resolved, e)
+					if err != nil {
+						_ = w.Flush()
+						return err
+					}
 					if reason == "" {
 						continue
 					}
@@ -1354,10 +1400,18 @@ func checkView(d *audit.ProfileDetail) *audit.ProfileDetail {
 // answer excludes it, so an entry whose only match is hidden names a version
 // nothing can serve. Frozen is deliberately not the same: it blocks build,
 // edit and delete, and the version still serves.
-func entryResolves(ctx context.Context, store *manifest.Store, p *entitle.Profile, e audit.ProfileEntry) string {
+// A manifest the store cannot read is returned as an error rather than a
+// reason, because the two repairs are opposite ones: a missing package means
+// the entry names something the catalog dropped, and an operator reading that
+// in CI removes the entry. A read failure means the catalog is broken and the
+// entry is very likely fine.
+func entryResolves(ctx context.Context, store *manifest.Store, p *entitle.Profile, e audit.ProfileEntry) (string, error) {
 	pm, err := store.GetPackage(ctx, e.Type, e.Name)
-	if err != nil || pm == nil {
-		return "no " + e.Type + " package by that name in the catalog"
+	if err != nil {
+		return "", fmt.Errorf("load %s/%s: %w", e.Type, e.Name, err)
+	}
+	if pm == nil {
+		return "no " + e.Type + " package by that name in the catalog", nil
 	}
 	var servable, hidden, hiddenMatch []string
 	var last entitle.Decision
@@ -1371,28 +1425,28 @@ func entryResolves(ctx context.Context, store *manifest.Store, p *entitle.Profil
 			continue
 		}
 		if last.Permitted {
-			return ""
+			return "", nil
 		}
 		servable = append(servable, ve.Version)
 	}
 	switch {
 	case len(pm.Versions) == 0:
-		return "the catalog holds the package with no versions"
+		return "the catalog holds the package with no versions", nil
 	case len(servable) == 0:
 		return fmt.Sprintf("every cataloged version is hidden (%s), so nothing serves this package",
-			strings.Join(hidden, ", "))
+			strings.Join(hidden, ", ")), nil
 	case len(hiddenMatch) > 0:
 		return fmt.Sprintf("%s permits only hidden versions (%s), which nothing serves",
-			orDash(strings.TrimSpace(e.Constraint+" "+e.Version)), strings.Join(hiddenMatch, ", "))
+			orDash(strings.TrimSpace(e.Constraint+" "+e.Version)), strings.Join(hiddenMatch, ", ")), nil
 	case last.Rule != nil && last.Entry == nil:
 		// The type's version default refused on its own, and the entry's own
 		// fields are empty because the default is what stood in for them.
 		// entitle has already written the sentence that names the rule; a
 		// message rebuilt from the entry here would name nothing.
-		return last.Reason
+		return last.Reason, nil
 	}
 	return fmt.Sprintf("%s permits none of the cataloged versions (%s)",
-		orDash(strings.TrimSpace(e.Constraint+" "+e.Version)), strings.Join(servable, ", "))
+		orDash(strings.TrimSpace(e.Constraint+" "+e.Version)), strings.Join(servable, ", ")), nil
 }
 
 // originPackage is one cataloged package that names a host as an origin.

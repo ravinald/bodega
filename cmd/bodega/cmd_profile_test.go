@@ -818,3 +818,131 @@ func TestProfileBaselinePinAcceptsANameContainingASlash(t *testing.T) {
 		}
 	}
 }
+
+// The file --out names is, on every run after the first, the one the operator
+// edited. Overwriting it discards the review the generate-edit-create split
+// exists to force, and the success line reports a write that destroyed work.
+func TestProfileBaselineDoesNotOverwriteAnEditedFile(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedCatalog(t, env, "db01", map[string][]string{"requests": {"2.31.0"}})
+
+	baseline := filepath.Join(t.TempDir(), "db.json")
+	mustRunProfile(t, "create", "db", "--from-origin", "db01", "--out", baseline)
+
+	edited := `{"config_version":1,"name":"db","description":"reviewed by hand","types":[],"entries":[]}`
+	if err := os.WriteFile(baseline, []byte(edited), 0o644); err != nil {
+		t.Fatalf("write edit: %v", err)
+	}
+
+	_, err := runProfile(t, "create", "db", "--from-origin", "db01", "--out", baseline)
+	if err == nil {
+		t.Fatal("a second --from-origin wrote over the edited baseline")
+	}
+	for _, want := range []string{"already exists", "--overwrite"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q:\n%s", want, err)
+		}
+	}
+	blob, readErr := os.ReadFile(baseline)
+	if readErr != nil {
+		t.Fatalf("read baseline: %v", readErr)
+	}
+	if !strings.Contains(string(blob), "reviewed by hand") {
+		t.Fatalf("the edit did not survive the refusal:\n%s", blob)
+	}
+
+	if _, err := runProfile(t, "create", "db", "--from-origin", "db01", "--out", baseline, "--overwrite"); err != nil {
+		t.Fatalf("--overwrite was refused: %v", err)
+	}
+	blob, readErr = os.ReadFile(baseline)
+	if readErr != nil {
+		t.Fatalf("read baseline: %v", readErr)
+	}
+	if strings.Contains(string(blob), "reviewed by hand") {
+		t.Error("--overwrite left the old file in place")
+	}
+}
+
+// A manifest the store cannot read is a broken catalog, not a profile naming
+// a package that was dropped. Reporting one as the other sends CI at the
+// repair that deletes the entry.
+func TestProfileCheckSeparatesAnUnreadableManifestFromAMissingPackage(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedCatalog(t, env, "db01", map[string][]string{"requests": {"2.31.0"}})
+	mustRunProfile(t, "create", "web")
+	mustRunProfile(t, "add", "web", manifest.TypePypi, "requests")
+
+	if _, err := runProfile(t, "check", "web"); err != nil {
+		t.Fatalf("the gate failed before the manifest was corrupted: %v", err)
+	}
+
+	corrupt := filepath.Join(env.manifestDir, manifest.TypePypi, "requests", "manifest.json")
+	if err := os.WriteFile(corrupt, []byte("not json at all"), 0o644); err != nil {
+		t.Fatalf("corrupt manifest: %v", err)
+	}
+
+	out, err := runProfile(t, "check", "web")
+	if err == nil {
+		t.Fatalf("an unreadable manifest passed the gate:\n%s", out)
+	}
+	if strings.Contains(err.Error(), "no pypi package by that name") ||
+		strings.Contains(out, "no pypi package by that name") {
+		t.Errorf("a read failure is reported as a missing package:\n%s\n%s", err, out)
+	}
+	if !strings.Contains(err.Error(), "pypi/requests") {
+		t.Errorf("the failure does not name the package it could not read:\n%s", err)
+	}
+}
+
+// An audit trail for an access control answers "when did this change". A
+// create event for a bind that moved nothing is an answer that is wrong.
+func TestProfileRebindingToTheSameProfileRecordsNothing(t *testing.T) {
+	env := newDiscoverEnv(t)
+	mustRunProfile(t, "create", "web")
+	mustRunProfile(t, "bind", "web", "db01", "--force")
+	out := mustRunProfile(t, "bind", "web", "db01", "--force")
+	if !strings.Contains(out, "already bound") {
+		t.Fatalf("the second bind did not report a no-op:\n%s", out)
+	}
+
+	adb, err := audit.Open(env.auditDB)
+	if err != nil {
+		t.Fatalf("open audit: %v", err)
+	}
+	defer func() { _ = adb.Close() }()
+	events, err := adb.Query(context.Background(), audit.Filter{PkgType: "profile", Limit: 100})
+	if err != nil {
+		t.Fatalf("query events: %v", err)
+	}
+	binds := 0
+	for _, e := range events {
+		if strings.HasPrefix(e.Details, "bind identity=") {
+			binds++
+		}
+	}
+	if binds != 1 {
+		t.Errorf("two binds of one identity to one profile wrote %d audit rows, want 1", binds)
+	}
+}
+
+// Two spellings of one package inflate the only number the command reports,
+// and the pin count is what an operator checks against the flags they typed.
+func TestProfileBaselinePinRefusesOnePackageNamedTwice(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedCatalog(t, env, "db01", map[string][]string{"psycopg2": {"2.9.9"}})
+
+	baseline := filepath.Join(t.TempDir(), "dp.json")
+	_, err := runProfile(t, "create", "dp", "--from-origin", "db01", "--out", baseline,
+		"--pin", "psycopg2", "--pin", "pypi/psycopg2")
+	if err == nil {
+		t.Fatal("one package named by two --pin spellings was accepted")
+	}
+	for _, want := range []string{"psycopg2", "pypi/psycopg2", "both name"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q:\n%s", want, err)
+		}
+	}
+	if _, statErr := os.Stat(baseline); statErr == nil {
+		t.Error("the refused command wrote a baseline anyway")
+	}
+}

@@ -822,6 +822,16 @@ bodega profile create db --from-file db.json
 
 The round trip through a file is the review step, and `--out -` and `--from-file -` are both refused. A host's inventory holds its accidents alongside its requirements, and locking membership to it enshrines whatever was installed by hand at 03:00; a baseline piped straight from the command that produced it was never read by anyone.
 
+For the same reason `--out` refuses a path that already holds something. On every run after the first that file is the one the operator edited, and a silent overwrite discards the review while reporting a successful write. `--overwrite` replaces it:
+
+```text
+$ bodega profile create db --from-origin db01 --out db.json
+db.json already exists, and a baseline is written to be edited before it is used.
+  Read what is there:  bodega profile create <name> --from-file db.json
+  Write somewhere else:  --out <other path>
+  Replace it, losing whatever it holds:  --overwrite
+```
+
 Entries default to name-only with `constraint_kind: any`, so the baseline says what the host may fetch and not which build of it. `--pin <name>` (repeatable) names the exceptions. A baseline that pins every version is re-authored monthly until somebody stops, which is how a control becomes ignored.
 
 A `--pin` that does not name one package is refused rather than resolved, on either axis. Two cataloged versions:
@@ -843,6 +853,14 @@ $ bodega profile create db --from-origin db01 --out db.json --pin psycopg2
 ```
 
 `--pin <type>/<name>` is the qualified spelling, and it pins the one it names while the other stays floating. The baseline is walked in a fixed type order, so resolving a bare name would let that order decide which package an operator holds.
+
+Naming one package twice is refused too, whichever spellings are used. The count in the success line is what an operator checks against the flags they typed, and two names for one package are either a slip or two versions meant for one entry:
+
+```text
+$ bodega profile create dp --from-origin db01 --out dp.json --pin psycopg2 --pin pypi/psycopg2
+--pin psycopg2 and --pin pypi/psycopg2 both name pypi/psycopg2, which is either a slip or two versions meant for one package.
+  Name it once:  --pin pypi/psycopg2
+```
 
 A slash is read as the qualifier only when what precedes it names one of the eight types, none of which carries a slash. So `--pin @babel/core` and `--pin github.com/lib/pq` each name one npm or gomod package, and the qualified spellings for them are `npm/@babel/core` and `gomod/github.com/lib/pq`.
 
@@ -875,6 +893,13 @@ $ bodega profile check db2
 PROFILE  TYPE  PACKAGE   REASON
 db2      pypi  requests  exact 9.9.9 permits none of the cataloged versions (2.31.0)
 Error: 1 profile violation(s) detected
+```
+
+A manifest the store cannot read stops the gate instead of appearing in that table. The two repairs are opposite ones: a missing package means the entry names something the catalog dropped, and an operator reading that in CI deletes the entry, which is the wrong fix for a catalog that is merely unreadable.
+
+```text
+$ bodega profile check web
+Error: load pypi/requests: parse package pypi/requests: invalid character 'o' in literal null (expecting 'u')
 ```
 
 Every mutation writes an audit event with `pkg_type=profile`, the profile in `pkg_name` and what inside it in `pkg_version`, so `bodega audit events --type create` shows who changed a control and when.
