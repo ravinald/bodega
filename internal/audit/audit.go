@@ -122,6 +122,15 @@ const (
 	DenialVersionConstraint = "version_constraint" // requested version outside the entry's version_constraint
 	DenialPushRefused       = "push_refused"       // git smart-HTTP push against a read-only mirror
 
+	// Refusals by the host profile bound to the requesting identity. Two
+	// values rather than one, because the operator's repair is opposite in
+	// each case: a membership refusal is widened by adding the package to the
+	// profile, a constraint refusal by moving the pin. Collapsed into one
+	// status, the row says a profile said no and leaves which lever to pull to
+	// whoever decodes the details blob.
+	DenialProfileMembership = "profile_membership" // package outside a closed profile's set
+	DenialProfileConstraint = "profile_constraint" // version outside the profile's constraint
+
 	// Refusals that are about this host rather than about the client. They
 	// still belong in the denial table: the operator's question is "why did
 	// that fetch not happen", and an answer split across two channels is one

@@ -55,6 +55,9 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+		if !s.entitleGate(w, r, manifest.TypeNpm, pkgName, reqVersion) {
+			return
+		}
 
 		upstream := s.cfg.NpmUpstream + "/" + pkgName + "/-/" + tarball
 		if pm != nil && packageMode(pm) == manifest.ModeProxy {
@@ -76,20 +79,27 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if !s.entitleGate(w, r, manifest.TypeNpm, pkgName, "") {
+		return
+	}
+	prof, scope := s.profileIndexScope(r, manifest.TypeNpm, pkgName)
+	permit := profileVersionFilter(prof, manifest.TypeNpm, pkgName)
 
 	w.Header().Set("Content-Type", "application/json")
 
-	// Filtered packument is not cached — its S3 key would collide with the
-	// unfiltered copy.
+	// The manifest-filtered packument is still not cached: the hidden-version
+	// and constraint filters are per-package facts with no key to scope them
+	// under, so their document would collide with the unfiltered copy. The
+	// profile filter below has one, which is what lets it stay cached.
 	if pm != nil && (hasHiddenVersion(pm) || hasVersionConstraint(pm)) {
-		s.serveFilteredPackument(w, r, pkgName, pm)
+		s.serveFilteredPackument(w, r, pkgName, pm, permit)
 		return
 	}
 
 	upstream := s.cfg.NpmUpstream + "/" + pkgName
-	s3Key := manifest.NpmPackumentKey(pkgName)
+	s3Key := profileIndexKey(scope, manifest.NpmPackumentKey(pkgName))
 	forceProxy := pm != nil && packageMode(pm) == manifest.ModeProxy
-	rw := &npmPackumentWriter{ResponseWriter: w, base: s.npmPublicRoot(r), pkg: pkgName}
+	rw := &npmPackumentWriter{ResponseWriter: w, base: s.npmPublicRoot(r), pkg: pkgName, permit: permit}
 	s.proxyOrCache(rw, r, s.typeStore(manifest.TypeNpm), s3Key, upstream, manifest.TypeNpm, pkgName, pkgName, false, forceProxy)
 	if err := rw.flush(); err != nil {
 		s.logger.Error("npm packument response failed", "package", pkgName, "error", err)
@@ -145,7 +155,7 @@ func hasVersionConstraint(pm *manifest.PackageManifest) bool {
 	return vc != "" && vc != manifest.ConstraintAny && baseVer != ""
 }
 
-func (s *Server) serveFilteredPackument(w http.ResponseWriter, r *http.Request, pkgName string, pm *manifest.PackageManifest) {
+func (s *Server) serveFilteredPackument(w http.ResponseWriter, r *http.Request, pkgName string, pm *manifest.PackageManifest, permit func(string) bool) {
 	upstream := s.cfg.NpmUpstream + "/" + pkgName
 	data, ct, err := fetchUpstream(r.Context(), upstream)
 	if err != nil {
@@ -157,6 +167,13 @@ func (s *Server) serveFilteredPackument(w http.ResponseWriter, r *http.Request, 
 	filtered, err := filterPackumentByManifest(data, pm)
 	if err != nil {
 		s.logger.Error("packument filter failed", "pkg", pkgName, "error", err)
+		http.Error(w, "packument filter failed", http.StatusInternalServerError)
+		return
+	}
+
+	filtered, err = filterPackumentByProfile(filtered, permit)
+	if err != nil {
+		s.logger.Error("packument profile filter failed", "pkg", pkgName, "error", err)
 		http.Error(w, "packument filter failed", http.StatusInternalServerError)
 		return
 	}
@@ -200,51 +217,12 @@ func filterPackumentByManifest(body []byte, pm *manifest.PackageManifest) ([]byt
 		return body, nil
 	}
 
-	var doc map[string]any
-	if err := json.Unmarshal(body, &doc); err != nil {
-		return nil, err
-	}
-
-	rejected := func(v string) bool {
+	return filterPackumentVersions(body, func(v string) bool {
 		if hidden[v] {
 			return true
 		}
-		if hasConstraint && !versionAllowed(baseVer, v, vc) {
-			return true
-		}
-		return false
-	}
-
-	if versions, ok := doc["versions"].(map[string]any); ok {
-		for v := range versions {
-			if rejected(v) {
-				delete(versions, v)
-			}
-		}
-	}
-	if times, ok := doc["time"].(map[string]any); ok {
-		for v := range times {
-			if v == "created" || v == "modified" {
-				continue
-			}
-			if rejected(v) {
-				delete(times, v)
-			}
-		}
-	}
-	if tags, ok := doc["dist-tags"].(map[string]any); ok {
-		for tag, v := range tags {
-			s, ok := v.(string)
-			if !ok {
-				continue
-			}
-			if rejected(s) {
-				delete(tags, tag)
-			}
-		}
-	}
-
-	return json.Marshal(doc)
+		return hasConstraint && !versionAllowed(baseVer, v, vc)
+	})
 }
 
 // npmPackumentWriter buffers a proxied packument so every dist.tarball can be
@@ -279,8 +257,12 @@ func filterPackumentByManifest(body []byte, pm *manifest.PackageManifest) ([]byt
 // It is not an http.Flusher and has no ReadFrom. Both would defeat the buffer.
 type npmPackumentWriter struct {
 	http.ResponseWriter
-	base   string // bodega's own /npm root
-	pkg    string // the package name the client asked for
+	base string // bodega's own /npm root
+	pkg  string // the package name the client asked for
+	// permit is the profile's version rule for this package, nil when no
+	// profile governs it. Applied before the tarball rewrite, so a version the
+	// profile refuses never acquires a bodega URL to be fetched by.
+	permit func(string) bool
 	status int
 	body   bytes.Buffer
 	tooBig bool
@@ -322,7 +304,12 @@ func (p *npmPackumentWriter) flush() error {
 			http.Error(p.ResponseWriter, err.Error(), http.StatusBadGateway)
 			return err
 		}
-		rewritten, err := rewriteNpmPackument(body, p.base, p.pkg)
+		filtered, err := filterPackumentByProfile(body, p.permit)
+		if err != nil {
+			http.Error(p.ResponseWriter, "packument filter failed", http.StatusBadGateway)
+			return err
+		}
+		rewritten, err := rewriteNpmPackument(filtered, p.base, p.pkg)
 		if err != nil {
 			http.Error(p.ResponseWriter, "packument rewrite failed", http.StatusBadGateway)
 			return err

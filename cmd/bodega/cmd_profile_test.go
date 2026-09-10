@@ -83,30 +83,50 @@ func mustRunProfile(t *testing.T, args ...string) string {
 	return out
 }
 
-// A closed type with nothing listed permits nothing of that type. It is
-// reachable, it is almost never meant, and the refusal follows the empty
+// A closed type that blocks with nothing listed permits nothing of that type.
+// It is reachable, it is almost never meant, and the refusal follows the empty
 // admin_permit_cidr precedent: name what the flag does rather than only
 // refusing.
 func TestProfileClosedAndEmptyIsRefusedWithoutForce(t *testing.T) {
 	newDiscoverEnv(t)
 	mustRunProfile(t, "create", "web")
 
-	out, err := runProfile(t, "set", "web", "apt", "--membership", "closed")
+	out, err := runProfile(t, "set", "web", "apt", "--membership", "closed", "--expansion", "block")
 	if err == nil {
-		t.Fatalf("a closed apt marker with no entries was accepted:\n%s", out)
+		t.Fatalf("a closed blocking apt marker with no entries was accepted:\n%s", out)
 	}
 	msg := err.Error()
-	for _, want := range []string{"permits nothing", "--force", "bodega profile add web apt", "--membership open"} {
+	for _, want := range []string{"permits nothing", "--force", "bodega profile add web apt", "--membership open", "--expansion warn"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("the refusal does not mention %q:\n%s", want, msg)
 		}
 	}
 
-	if _, err := runProfile(t, "set", "web", "apt", "--membership", "closed", "--force"); err != nil {
+	if _, err := runProfile(t, "set", "web", "apt", "--membership", "closed", "--expansion", "block", "--force"); err != nil {
 		t.Fatalf("--force did not accept the state the refusal says it accepts: %v", err)
 	}
 	if out := mustRunProfile(t, "show", "web"); !strings.Contains(out, "Closed for apt with nothing listed") {
 		t.Errorf("show does not report the forced state, so it reads like a profile nobody consults:\n%s", out)
+	}
+}
+
+// The same empty closed set under the default expansion is not an outage and
+// is not refused. It records every apt fetch as a reach outside the class,
+// which is the state requirement 6 asks for: detect first, block on purpose.
+func TestProfileClosedAndEmptyUnderWarnIsAccepted(t *testing.T) {
+	newDiscoverEnv(t)
+	mustRunProfile(t, "create", "web")
+
+	out := mustRunProfile(t, "set", "web", "apt", "--membership", "closed")
+	if !strings.Contains(out, "expansion=warn") {
+		t.Errorf("set did not report the expansion it wrote, so the default is invisible:\n%s", out)
+	}
+	shown := mustRunProfile(t, "show", "web")
+	if strings.Contains(shown, "every apt request from a bound host is refused") {
+		t.Errorf("show describes an outage the profile is not in:\n%s", shown)
+	}
+	if !strings.Contains(shown, "reach outside this class") {
+		t.Errorf("show does not say what warn actually does:\n%s", shown)
 	}
 }
 
@@ -116,7 +136,7 @@ func TestProfileRemovingTheLastEntryOfAClosedTypeIsRefused(t *testing.T) {
 	newDiscoverEnv(t)
 	mustRunProfile(t, "create", "web")
 	mustRunProfile(t, "add", "web", "apt", "nginx")
-	mustRunProfile(t, "set", "web", "apt", "--membership", "closed")
+	mustRunProfile(t, "set", "web", "apt", "--membership", "closed", "--expansion", "block")
 
 	if _, err := runProfile(t, "remove", "web", "apt", "nginx"); err == nil {
 		t.Fatal("removing the last entry of a closed type was accepted, leaving it permitting nothing")

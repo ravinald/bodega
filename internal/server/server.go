@@ -100,6 +100,13 @@ type Server struct {
 	identity   atomic.Pointer[identitySet]
 	identityAt atomic.Int64
 	identityMu sync.Mutex
+	// profiles is the live answer for the profile binding table, held the same
+	// way and on the same TTL as acl and identity. See
+	// internal/server/profile.go.
+	profiles   atomic.Pointer[profileSet]
+	profilesAt atomic.Int64
+	profileMu  sync.Mutex
+
 	// cidrInert latches whether CIDR bindings are currently unresolvable for
 	// want of a trusted_proxies answer, so the log records each entry into
 	// that state once rather than every cache refresh. See
@@ -674,12 +681,13 @@ func (s *Server) recordLifecycle(ev audit.EventType, addr string, tlsMode bool) 
 // the same trap in a rarer shape, and the hourly tick already treats a failed
 // manifest read as non-fatal and rebuilds anyway.
 func (s *Server) reload(ctx context.Context) {
-	s.logger.Info("reload requested, re-reading manifests, the apt signing key, the CIDR access lists and the identity bindings")
+	s.logger.Info("reload requested, re-reading manifests, the apt signing key, the CIDR access lists, the identity bindings and the profile bindings")
 	s.reloadManifests(ctx)
 	s.loadAptSigner()
 	s.rebuildAptSnapshot(ctx)
 	s.refreshACLs(ctx)
 	s.refreshIdentities(ctx)
+	s.refreshProfiles(ctx)
 	s.logger.Info("reload complete")
 }
 

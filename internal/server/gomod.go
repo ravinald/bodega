@@ -31,6 +31,36 @@ func (s *Server) handleGomod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The listing names no version, so it is decided at the membership level
+	// and filtered below; every other file under @v/ names one.
+	if !s.entitleGate(w, r, manifest.TypeGomod, module, gomodVersionFromFile(file)) {
+		return
+	}
+	if file == "list" {
+		prof, scope := s.profileIndexScope(r, manifest.TypeGomod, module)
+		if permit := profileVersionFilter(prof, manifest.TypeGomod, module); permit != nil {
+			rw := &indexFilterWriter{
+				ResponseWriter: w,
+				subject:        module + "/@v/list",
+				filter:         func(b []byte) []byte { return filterGomodList(b, permit) },
+			}
+			s.serveGomodFile(rw, r, pm, module, file, profileIndexKey(scope, s3Key), upstream, immutable)
+			if err := rw.flush(); err != nil {
+				s.logger.Error("gomod list response failed", "module", module, "error", err)
+			}
+			return
+		}
+	}
+
+	s.serveGomodFile(w, r, pm, module, file, s3Key, upstream, immutable)
+}
+
+// serveGomodFile is the body of handleGomod once the profile has decided
+// whether the response passes through a filter. Split so the filtered and
+// unfiltered paths cannot answer a request differently for any reason other
+// than the filter.
+func (s *Server) serveGomodFile(w http.ResponseWriter, r *http.Request, pm *manifest.PackageManifest, module, file, s3Key, upstream string, immutable bool) {
+	ctx := r.Context()
 	if pm != nil && packageMode(pm) == manifest.ModeProxy {
 		// Version constraint enforcement: check if the requested version is allowed.
 		if immutable {
@@ -50,6 +80,7 @@ func (s *Server) handleGomod(w http.ResponseWriter, r *http.Request) {
 		s.proxyOrCache(w, r, s.typeStore(manifest.TypeGomod), s3Key, upstream, manifest.TypeGomod, module, module, immutable, true)
 		return
 	}
+
 	if pm == nil {
 		s.recordNoManifest(ctx, r, manifest.TypeGomod, module, gomodVersionFromFile(file), upstream)
 	}

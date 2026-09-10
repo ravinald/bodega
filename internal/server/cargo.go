@@ -93,10 +93,30 @@ func (s *Server) handleCargoIndex(w http.ResponseWriter, r *http.Request, p stri
 		return
 	}
 
+	// The sparse index names no version, so it is decided at the membership
+	// level here and by version in the filter below.
+	if !s.entitleGate(w, r, manifest.TypeCargo, crate, "") {
+		return
+	}
+	prof, scope := s.profileIndexScope(r, manifest.TypeCargo, crate)
+	permit := profileVersionFilter(prof, manifest.TypeCargo, crate)
+
 	upstream := strings.TrimRight(s.cfg.CargoUpstream, "/") + "/" + p
-	s3Key := manifest.CargoIndexKey(p)
+	s3Key := profileIndexKey(scope, manifest.CargoIndexKey(p))
 	forceProxy := pm != nil && packageMode(pm) == manifest.ModeProxy
-	s.proxyOrCache(w, r, s.typeStore(manifest.TypeCargo), s3Key, upstream, manifest.TypeCargo, crate, crate, false, forceProxy)
+	if permit == nil {
+		s.proxyOrCache(w, r, s.typeStore(manifest.TypeCargo), s3Key, upstream, manifest.TypeCargo, crate, crate, false, forceProxy)
+		return
+	}
+	rw := &indexFilterWriter{
+		ResponseWriter: w,
+		subject:        "the cargo index for " + crate,
+		filter:         func(b []byte) []byte { return filterCargoIndex(b, permit) },
+	}
+	s.proxyOrCache(rw, r, s.typeStore(manifest.TypeCargo), s3Key, upstream, manifest.TypeCargo, crate, crate, false, forceProxy)
+	if err := rw.flush(); err != nil {
+		s.logger.Error("cargo index response failed", "crate", crate, "error", err)
+	}
 }
 
 func (s *Server) handleCargoDownload(w http.ResponseWriter, r *http.Request, p string) {
@@ -123,6 +143,10 @@ func (s *Server) handleCargoDownload(w http.ResponseWriter, r *http.Request, p s
 			http.NotFound(w, r)
 			return
 		}
+	}
+
+	if !s.entitleGate(w, r, manifest.TypeCargo, crate, version) {
+		return
 	}
 
 	w = cacheImmutableOn200(w, path.Base(p))

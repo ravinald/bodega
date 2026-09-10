@@ -10,8 +10,37 @@ import (
 
 // ---- Helm chart repository -------------------------------------------------
 
+// handleHelmIndex serves the generated chart index, with the charts and
+// releases this host's profile does not permit removed.
+//
+// The key is not profile-scoped, unlike the four indexes bodega caches from an
+// upstream: this document is generated into storage by `bodega build`, so
+// there is no cache entry a filtered copy could be written to and none for a
+// second profile to read. The filter runs on the way out, against the live
+// profile, so an operator's edit lands within the binding cache TTL rather
+// than at the next build.
 func (s *Server) handleHelmIndex(w http.ResponseWriter, r *http.Request) {
-	s.proxyS3(w, r, s.typeStore(manifest.TypeHelm), manifest.HelmIndexKey)
+	prof := s.profileFor(r)
+	if prof == nil {
+		s.proxyS3(w, r, s.typeStore(manifest.TypeHelm), manifest.HelmIndexKey)
+		return
+	}
+	covers := func(chart string) bool { return prof.Covers(manifest.TypeHelm, chart).Permitted }
+	permit := func(chart, version string) bool {
+		if f := profileVersionFilter(prof, manifest.TypeHelm, chart); f != nil {
+			return f(version)
+		}
+		return true
+	}
+	rw := &indexFilterWriter{
+		ResponseWriter: w,
+		subject:        "the helm chart index",
+		filter:         func(b []byte) []byte { return filterHelmIndex(b, covers, permit) },
+	}
+	s.proxyS3(rw, r, s.typeStore(manifest.TypeHelm), manifest.HelmIndexKey)
+	if err := rw.flush(); err != nil {
+		s.logger.Error("helm index response failed", "error", err)
+	}
 }
 
 func (s *Server) handleHelmChart(w http.ResponseWriter, r *http.Request) {
@@ -33,6 +62,9 @@ func (s *Server) handleHelmChart(w http.ResponseWriter, r *http.Request) {
 	// cert-manager at 1.14.0-rc.1, not cert-manager-1.14.0 at rc.1.
 	key := manifest.HelmChartKey(strings.TrimSuffix(file, ".tgz"), "")
 	_, chartName, chartVersion := manifest.ParseKey(key)
+	if !s.entitleGate(w, r, manifest.TypeHelm, chartName, chartVersion) {
+		return
+	}
 	pm, _ := s.store.GetPackage(ctx, manifest.TypeHelm, chartName)
 	if pm != nil && packageMode(pm) == manifest.ModeProxy {
 		// Use the URL from the first version that has one.

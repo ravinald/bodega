@@ -22,6 +22,14 @@ func rule(typ, membership, versionDefault string) audit.ProfileTypeRule {
 	return audit.ProfileTypeRule{Type: typ, Membership: membership, VersionDefault: versionDefault}
 }
 
+// blocking is the marker an operator writes when a closed set is meant to
+// refuse. The default expansion is warn, so a test asserting a refusal has to
+// say so; one that leaves it unset is asserting the default instead.
+func blocking(r audit.ProfileTypeRule) audit.ProfileTypeRule {
+	r.Expansion = audit.ExpansionBlock
+	return r
+}
+
 // TestOpenTypeWithOnePinnedPackage is the ordinary case the third level exists
 // for: everything of a type tracks, except the one package held because a
 // newer major breaks something.
@@ -58,7 +66,7 @@ func TestOpenTypeWithOnePinnedPackage(t *testing.T) {
 // of packages, each tracking upstream.
 func TestClosedTypeWithFloatingVersions(t *testing.T) {
 	p := profile("db",
-		[]audit.ProfileTypeRule{rule(manifest.TypePypi, audit.MembershipClosed, audit.VersionFloating)},
+		[]audit.ProfileTypeRule{blocking(rule(manifest.TypePypi, audit.MembershipClosed, audit.VersionFloating))},
 		[]audit.ProfileEntry{
 			{Type: manifest.TypePypi, Name: "requests"},
 			{Type: manifest.TypePypi, Name: "psycopg2"},
@@ -83,7 +91,7 @@ func TestClosedTypeWithFloatingVersions(t *testing.T) {
 // refusal text promises.
 func TestClosedAndEmptyPermitsNothing(t *testing.T) {
 	p := profile("locked",
-		[]audit.ProfileTypeRule{rule(manifest.TypeHelm, audit.MembershipClosed, audit.VersionFloating)},
+		[]audit.ProfileTypeRule{blocking(rule(manifest.TypeHelm, audit.MembershipClosed, audit.VersionFloating))},
 		nil)
 
 	d := p.Permits(manifest.TypeHelm, "anything", "1.0.0")
@@ -145,7 +153,7 @@ func TestTypeWithNoMarkerIsUngoverned(t *testing.T) {
 	}
 
 	closed := profile("web",
-		[]audit.ProfileTypeRule{rule(manifest.TypeHelm, audit.MembershipClosed, audit.VersionFloating)}, nil)
+		[]audit.ProfileTypeRule{blocking(rule(manifest.TypeHelm, audit.MembershipClosed, audit.VersionFloating))}, nil)
 	if closed.Permits(manifest.TypeHelm, "cert-manager", "1.14.0").Permitted {
 		t.Error("the same absence of entries answered the same way with a marker present, so the marker records nothing")
 	}
@@ -242,5 +250,113 @@ func TestOpenAndPinnedNamesWhatItCannotAnswer(t *testing.T) {
 	}
 	if !strings.Contains(d.Reason, "names none") {
 		t.Errorf("the refusal does not explain the state that produced it: %s", d.Reason)
+	}
+}
+
+// The expansion triple, which is what decides a package outside a closed set.
+// The default is warn rather than block: a new transitive dependency is
+// ordinary upstream maintenance, and the cost of refusing it is a host that
+// stops getting patched.
+func TestExpansionDecidesAPackageOutsideAClosedSet(t *testing.T) {
+	for _, tc := range []struct {
+		expansion string
+		permitted bool
+		outside   bool
+		refusal   string
+	}{
+		{"", true, true, ""}, // a marker written before expansion existed
+		{audit.ExpansionWarn, true, true, ""},
+		{audit.ExpansionBlock, false, true, RefusalMembership},
+		{audit.ExpansionIgnore, true, true, ""},
+	} {
+		t.Run("expansion="+tc.expansion, func(t *testing.T) {
+			r := rule(manifest.TypeNpm, audit.MembershipClosed, audit.VersionPinned)
+			r.Expansion = tc.expansion
+			p := profile("web", []audit.ProfileTypeRule{r},
+				[]audit.ProfileEntry{{Type: manifest.TypeNpm, Name: "lodash", Version: "4.17.21"}})
+
+			d := p.Permits(manifest.TypeNpm, "left-pad", "1.3.0")
+			if d.Permitted != tc.permitted {
+				t.Errorf("permitted = %v, want %v: %s", d.Permitted, tc.permitted, d.Reason)
+			}
+			if d.Outside != tc.outside {
+				t.Errorf("outside = %v, want %v: the version rule is skipped on this", d.Outside, tc.outside)
+			}
+			wantReport := tc.expansion != audit.ExpansionIgnore
+			if d.Reportable() != wantReport {
+				t.Errorf("reportable = %v, want %v: ignore is the operator saying not to hear about this type",
+					d.Reportable(), wantReport)
+			}
+			if d.Refusal != tc.refusal {
+				t.Errorf("refusal = %q, want %q", d.Refusal, tc.refusal)
+			}
+			if !d.Governed {
+				t.Error("a decision by a type marker reported itself ungoverned")
+			}
+		})
+	}
+}
+
+// A package expansion permitted skips the version rule. The type default here
+// is pinned and no entry names a version for left-pad, so applying it would
+// refuse every version and turn warn into block through the back door.
+func TestExpansionPermitSkipsTheVersionRule(t *testing.T) {
+	r := rule(manifest.TypeNpm, audit.MembershipClosed, audit.VersionPinned)
+	r.Expansion = audit.ExpansionWarn
+	p := profile("web", []audit.ProfileTypeRule{r},
+		[]audit.ProfileEntry{{Type: manifest.TypeNpm, Name: "lodash", Version: "4.17.21"}})
+
+	for _, v := range []string{"1.3.0", "2.0.0", ""} {
+		if d := p.Permits(manifest.TypeNpm, "left-pad", v); !d.Permitted {
+			t.Errorf("warn refused left-pad at %q through the version rule: %s", v, d.Reason)
+		}
+	}
+	// The listed package still answers to the pinned default.
+	if d := p.Permits(manifest.TypeNpm, "lodash", "4.17.22"); d.Permitted {
+		t.Error("the pinned default stopped holding a package the profile does list")
+	}
+}
+
+// Covers is what an index generator asks, and it must agree with Permits about
+// membership: a listing that shows a package the request predicate then
+// refuses is the mid-install 403 the filters exist to prevent.
+func TestCoversAgreesWithPermitsOnMembership(t *testing.T) {
+	p := profile("web",
+		[]audit.ProfileTypeRule{blocking(rule(manifest.TypePypi, audit.MembershipClosed, audit.VersionFloating))},
+		[]audit.ProfileEntry{{Type: manifest.TypePypi, Name: "requests"}})
+
+	for _, name := range []string{"requests", "django"} {
+		covers := p.Covers(manifest.TypePypi, name)
+		permits := p.Permits(manifest.TypePypi, name, "1.0.0")
+		if covers.Permitted != permits.Permitted {
+			t.Errorf("%s: Covers says %v and Permits says %v", name, covers.Permitted, permits.Permitted)
+		}
+	}
+	// A type with no marker is ungoverned through both, which is the signal an
+	// index generator reads as "leave this document alone".
+	if d := p.Covers(manifest.TypeHelm, "cert-manager"); d.Governed {
+		t.Error("a type the profile states no rule for reported itself governed")
+	}
+	// The nil profile is the unprofiled host.
+	var nilProfile *Profile
+	if d := nilProfile.Covers(manifest.TypeApt, "nginx"); !d.Permitted || d.Governed {
+		t.Errorf("the nil profile answered permitted=%v governed=%v, want true/false", d.Permitted, d.Governed)
+	}
+}
+
+// A refusal by the version rule and a refusal by membership are separable, and
+// the operator's repair is opposite in each case.
+func TestRefusalKindsAreSeparable(t *testing.T) {
+	r := blocking(rule(manifest.TypePypi, audit.MembershipClosed, audit.VersionPinned))
+	p := profile("db", []audit.ProfileTypeRule{r}, []audit.ProfileEntry{{
+		Type: manifest.TypePypi, Name: "requests",
+		Constraint: manifest.ConstraintExact, Version: "2.31.0",
+	}})
+
+	if d := p.Permits(manifest.TypePypi, "requests", "2.32.0"); d.Refusal != RefusalConstraint {
+		t.Errorf("a version outside the pin reported refusal %q, want %q", d.Refusal, RefusalConstraint)
+	}
+	if d := p.Permits(manifest.TypePypi, "django", "5.0"); d.Refusal != RefusalMembership {
+		t.Errorf("a package outside the set reported refusal %q, want %q", d.Refusal, RefusalMembership)
 	}
 }

@@ -88,6 +88,10 @@ type profileDocType struct {
 	Type           string `json:"type"`
 	Membership     string `json:"membership"`
 	VersionDefault string `json:"version_default"`
+	// Expansion is omitted when it is the default, so a baseline stays about
+	// what the host has rather than about a posture nobody chose. An absent
+	// value reads as warn on the way in.
+	Expansion string `json:"expansion,omitempty"`
 }
 
 type profileDocEntry struct {
@@ -222,6 +226,7 @@ func writeBaseline(gf *globalFlags, name, description, origin, out string, pins 
 				Type:           p.Type,
 				Membership:     audit.MembershipClosed,
 				VersionDefault: audit.VersionFloating,
+				Expansion:      audit.ExpansionWarn,
 			})
 		}
 		doc.Entries = append(doc.Entries, profileDocEntry{
@@ -436,7 +441,7 @@ func createFromDoc(gf *globalFlags, doc *profileDoc, force bool) error {
 	for _, t := range doc.Types {
 		types = append(types, audit.ProfileTypeRule{
 			Profile: doc.Name, Type: t.Type, Membership: t.Membership,
-			VersionDefault: t.VersionDefault, Actor: actor,
+			VersionDefault: t.VersionDefault, Expansion: t.Expansion, Actor: actor,
 		})
 	}
 	entries := make([]audit.ProfileEntry, 0, len(doc.Entries))
@@ -509,7 +514,7 @@ func validateDoc(doc *profileDoc) error {
 // checkClosedAndEmpty refuses a document whose closed type lists nothing.
 func checkClosedAndEmpty(doc *profileDoc, force bool) error {
 	for _, t := range doc.Types {
-		if t.Membership != audit.MembershipClosed {
+		if t.Membership != audit.MembershipClosed || !refusesUnlisted(t.Expansion) {
 			continue
 		}
 		listed := 0
@@ -530,13 +535,21 @@ func checkClosedAndEmpty(doc *profileDoc, force bool) error {
 // is reachable, it is almost never meant, and nothing downstream reports it
 // because a profile permitting nothing looks exactly like one nobody consults.
 func closedAndEmptyRefusal(profile, typ string) error {
-	return fmt.Errorf("profile %s would be closed for %s with no %s entries, which permits nothing of that type.\n"+
+	return fmt.Errorf("profile %s would be closed for %s with no %s entries and expansion %s, which permits nothing of that type.\n"+
 		"  Every %s request from a host bound to this profile is refused, and the refusal names no package because none is listed.\n"+
 		"  List something:  bodega profile add %s %s <name>\n"+
 		"  Open the type:   bodega profile set %s %s --membership open\n"+
+		"  Detect instead:  bodega profile set %s %s --expansion warn\n"+
 		"  Mean it:         re-run with --force, which accepts the empty closed set as written",
-		profile, typ, typ, typ, profile, typ, profile, typ)
+		profile, typ, typ, audit.ExpansionBlock, typ, profile, typ, profile, typ, profile, typ)
 }
+
+// refusesUnlisted reports whether a closed type's expansion action turns an
+// unlisted package into a 403. It is the discriminator for every warning about
+// an empty closed set: under warn and ignore that set records or serves, and a
+// refusal text promising an outage would be describing a state the profile is
+// not in.
+func refusesUnlisted(expansion string) bool { return expansion == audit.ExpansionBlock }
 
 func newProfileListCmd(gf *globalFlags) *cobra.Command {
 	return &cobra.Command{
@@ -631,7 +644,7 @@ func newProfileShowCmd(gf *globalFlags) *cobra.Command {
 				fmt.Println("  none — this profile states no rule for any type, so it permits everything")
 			} else {
 				w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-				fmt.Fprintln(w, "  TYPE\tMEMBERSHIP\tVERSION DEFAULT\tENTRIES")
+				fmt.Fprintln(w, "  TYPE\tMEMBERSHIP\tVERSION DEFAULT\tEXPANSION\tENTRIES")
 				for _, t := range d.Types {
 					n := 0
 					for _, e := range d.Entries {
@@ -639,7 +652,13 @@ func newProfileShowCmd(gf *globalFlags) *cobra.Command {
 							n++
 						}
 					}
-					fmt.Fprintf(w, "  %s\t%s\t%s\t%d\n", t.Type, t.Membership, t.VersionDefault, n)
+					expansion := "-"
+					if t.Membership == audit.MembershipClosed {
+						// An open type lists nothing to be outside of, so
+						// printing a value there would read as a rule in force.
+						expansion = t.Expansion
+					}
+					fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%d\n", t.Type, t.Membership, t.VersionDefault, expansion, n)
 				}
 				_ = w.Flush()
 			}
@@ -669,10 +688,17 @@ func reportClosedAndEmpty(d *audit.ProfileDetail) {
 		if t.Membership != audit.MembershipClosed {
 			continue
 		}
-		if !slices.ContainsFunc(d.Entries, func(e audit.ProfileEntry) bool { return e.Type == t.Type }) {
+		if slices.ContainsFunc(d.Entries, func(e audit.ProfileEntry) bool { return e.Type == t.Type }) {
+			continue
+		}
+		if refusesUnlisted(t.Expansion) {
 			fmt.Printf("\nClosed for %s with nothing listed: every %s request from a bound host is refused.\n",
 				t.Type, t.Type)
+			continue
 		}
+		fmt.Printf("\nClosed for %s with nothing listed, expansion %s: every %s request from a bound host is served and recorded as a reach outside this class.\n"+
+			"  Read what it recorded:  bodega discover list %s\n",
+			t.Type, t.Expansion, t.Type, t.Type)
 	}
 }
 
@@ -804,19 +830,32 @@ func newProfileUnbindCmd(gf *globalFlags) *cobra.Command {
 }
 
 func newProfileSetCmd(gf *globalFlags) *cobra.Command {
-	var membership, versionDefault string
+	var membership, versionDefault, expansion string
 	var force bool
 	c := &cobra.Command{
 		Use:   "set <profile> <type>",
-		Short: "Set membership and the version default for one package type",
+		Short: "Set membership, the version default and the expansion action for one package type",
 		Long: `Write the per-type marker: which packages of this type the profile covers,
-and the version rule they carry unless an entry overrides it.
+the version rule they carry unless an entry overrides it, and what happens to
+a fetch outside the set.
 
   --membership closed    only the packages this profile lists
   --membership open      every package of this type in the catalog
 
   --version-default pinned     only the version each entry names
   --version-default floating   any version
+
+  --expansion warn       serve it, and record the reach outside the class
+  --expansion block      refuse it with 403
+  --expansion ignore     serve it and record nothing
+
+--expansion defaults to warn and applies to a closed type alone, because an
+open type lists nothing to be outside of. warn rather than block: a new
+transitive dependency is ordinary upstream maintenance, and the cost of
+refusing it is a host that stops getting patched. Read what warn records, then
+narrow. The rows land with decision "denied" in the discovery table:
+
+  bodega discover list npm
 
 The marker's presence is itself an answer. A type with no marker is one the
 profile states no rule for, and the fleet-wide controls decide it alone; a
@@ -832,9 +871,13 @@ name keeps the value it has.`,
 			if err := requirePackageType(typ); err != nil {
 				return err
 			}
-			if membership == "" && versionDefault == "" {
-				return fmt.Errorf("name what to set: --membership <%s> or --version-default <%s>",
-					strings.Join(audit.Memberships(), "|"), strings.Join(audit.VersionDefaults(), "|"))
+			if membership == "" && versionDefault == "" && expansion == "" {
+				return fmt.Errorf("name what to set: --membership <%s>, --version-default <%s> or --expansion <%s>",
+					strings.Join(audit.Memberships(), "|"), strings.Join(audit.VersionDefaults(), "|"),
+					strings.Join(audit.Expansions(), "|"))
+			}
+			if expansion != "" && !audit.ValidExpansion(expansion) {
+				return fmt.Errorf("--expansion must be one of: %s", strings.Join(audit.Expansions(), ", "))
 			}
 			ctx := backgroundCtx()
 			adb, err := openProfileStore(gf)
@@ -850,10 +893,12 @@ name keeps the value it has.`,
 			rule := audit.ProfileTypeRule{
 				Profile: profile, Type: typ,
 				Membership: audit.MembershipOpen, VersionDefault: audit.VersionFloating,
+				Expansion: audit.ExpansionWarn,
 			}
 			for _, t := range d.Types {
 				if t.Type == typ {
 					rule.Membership, rule.VersionDefault = t.Membership, t.VersionDefault
+					rule.Expansion = t.Expansion
 				}
 			}
 			if membership != "" {
@@ -862,9 +907,12 @@ name keeps the value it has.`,
 			if versionDefault != "" {
 				rule.VersionDefault = versionDefault
 			}
+			if expansion != "" {
+				rule.Expansion = expansion
+			}
 			rule.Actor = audit.CurrentActor()
 
-			if rule.Membership == audit.MembershipClosed && !force {
+			if rule.Membership == audit.MembershipClosed && refusesUnlisted(rule.Expansion) && !force {
 				listed := slices.ContainsFunc(d.Entries, func(e audit.ProfileEntry) bool { return e.Type == typ })
 				if !listed {
 					return closedAndEmptyRefusal(profile, typ)
@@ -874,14 +922,16 @@ name keeps the value it has.`,
 				return err
 			}
 			recordProfileEvent(ctx, adb, audit.EventEdit, profile, typ,
-				fmt.Sprintf("membership=%s version_default=%s", rule.Membership, rule.VersionDefault))
-			fmt.Printf("%s %s: membership=%s version_default=%s\n",
-				profile, typ, rule.Membership, rule.VersionDefault)
+				fmt.Sprintf("membership=%s version_default=%s expansion=%s",
+					rule.Membership, rule.VersionDefault, rule.Expansion))
+			fmt.Printf("%s %s: membership=%s version_default=%s expansion=%s\n",
+				profile, typ, rule.Membership, rule.VersionDefault, rule.Expansion)
 			return nil
 		},
 	}
 	c.Flags().StringVar(&membership, "membership", "", "closed | open")
 	c.Flags().StringVar(&versionDefault, "version-default", "", "pinned | floating")
+	c.Flags().StringVar(&expansion, "expansion", "", "warn | block | ignore (closed types only; default warn)")
 	c.Flags().BoolVar(&force, "force", false, "Accept a closed type with no entries, which permits nothing of that type")
 	return c
 }
@@ -1178,7 +1228,7 @@ func newProfileRemoveCmd(gf *globalFlags) *cobra.Command {
 // closed type with nothing listed.
 func lastEntryOfClosedType(d *audit.ProfileDetail, typ, name string) bool {
 	closed := slices.ContainsFunc(d.Types, func(t audit.ProfileTypeRule) bool {
-		return t.Type == typ && t.Membership == audit.MembershipClosed
+		return t.Type == typ && t.Membership == audit.MembershipClosed && refusesUnlisted(t.Expansion)
 	})
 	if !closed {
 		return false

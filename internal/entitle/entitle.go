@@ -24,10 +24,42 @@ type Decision struct {
 	Governed  bool
 	Reason    string
 
+	// Refusal names which rule said no: RefusalMembership or
+	// RefusalConstraint, and "" on a permit. An operator reading a denial has
+	// two opposite repairs available — widen the set, or move a pin — and a
+	// single "profile refused this" leaves them guessing which.
+	Refusal string
+
+	// Outside reports a package the profile does not list under a closed type,
+	// whichever expansion action followed. It is what tells Permits to skip
+	// the version rule — a package the profile does not carry has no entry
+	// naming a version, and holding it to the type default would turn warn
+	// into block through the back door. Reportable is the narrower question of
+	// whether to record it.
+	Outside bool
+
 	// Rule and Entry are the levels that decided, when one did. Entry is nil
 	// when the type's default answered alone.
 	Rule  *audit.ProfileTypeRule
 	Entry *audit.ProfileEntry
+}
+
+// Refusal kinds. They are the response body's vocabulary as well as the audit
+// row's, so a client reading an error and an operator reading a row are
+// looking at the same word.
+const (
+	RefusalMembership = "membership"
+	RefusalConstraint = "constraint"
+)
+
+// Reportable reports whether a decision is a reach outside the host's class
+// that the caller should record. Every Outside decision is one except under
+// ExpansionIgnore, which is the operator saying not to hear about this type.
+//
+// A method rather than a second boolean, so the one place that knows what
+// ignore means is the package that defines it.
+func (d Decision) Reportable() bool {
+	return d.Outside && d.Rule != nil && d.Rule.Expansion != audit.ExpansionIgnore
 }
 
 // Profile is a profile resolved for lookup: the per-type markers and the
@@ -69,25 +101,29 @@ func (p *Profile) Name() string {
 	return p.name
 }
 
-// Permits reports whether p allows typ/name at version.
-//
-// Three levels, resolved in order:
+// Covers answers the first two levels alone: does p govern typ, and is name
+// inside the set it governs. It is what an index generator asks, because a
+// listing decides which packages appear before any version is in hand, and it
+// is the first half of Permits so the two cannot drift.
 //
 //  1. The type marker. Absent, the profile states no rule for typ and the
 //     decision is ungoverned: fleet-wide controls decide it alone, exactly as
 //     they did before any profile existed.
 //  2. Membership. Closed admits only the packages the profile lists, so a
-//     closed marker with no entries permits nothing of that type. Open admits
+//     closed marker with no entries covers nothing of that type. Open admits
 //     every package of that type in the catalog.
-//  3. The version rule. A per-entry constraint overrides the type's version
-//     default, in both directions: one pinned package inside a floating type,
-//     and one floating package inside a pinned type.
 //
-// A nil profile is the host nothing binds, and it permits everything
+// A package outside a closed set is answered by the type's expansion action
+// rather than by membership alone: block refuses it, warn serves it and leaves
+// the decision Reportable so the caller records the reach, ignore serves it
+// and reports nothing. warn is the default because a new transitive dependency
+// is ordinary upstream maintenance and refusing it leaves the host unpatched.
+//
+// A nil profile is the host nothing binds, and it covers everything
 // ungoverned. That is the state every host is in before an operator writes a
 // profile, and making it a refusal would turn the first `bodega profile
 // create` into a fleet-wide outage.
-func (p *Profile) Permits(typ, name, version string) Decision {
+func (p *Profile) Covers(typ, name string) Decision {
 	if p == nil {
 		return Decision{Permitted: true, Reason: "no profile is bound to this host"}
 	}
@@ -99,15 +135,52 @@ func (p *Profile) Permits(typ, name, version string) Decision {
 		}
 	}
 
-	entry, listed := p.entries[typ][name]
-	if !listed && rule.Membership == audit.MembershipClosed {
-		return Decision{
-			Governed: true,
-			Rule:     &rule,
-			Reason: fmt.Sprintf("profile %q is closed for %s and does not list %s",
-				p.name, typ, name),
-		}
+	if _, listed := p.entries[typ][name]; listed || rule.Membership != audit.MembershipClosed {
+		return Decision{Permitted: true, Governed: true, Rule: &rule}
 	}
+
+	d := Decision{Governed: true, Rule: &rule}
+	switch rule.Expansion {
+	case audit.ExpansionBlock:
+		d.Refusal = RefusalMembership
+		d.Outside = true
+		d.Reason = fmt.Sprintf("profile %q is closed for %s and does not list %s",
+			p.name, typ, name)
+	case audit.ExpansionIgnore:
+		d.Permitted = true
+		d.Outside = true
+		d.Reason = fmt.Sprintf("profile %q is closed for %s and ignores packages it does not list", p.name, typ)
+	default:
+		// Empty as well as "warn": a marker written before expansion existed
+		// carries no value, and the column default says what that means.
+		d.Permitted = true
+		d.Outside = true
+		d.Reason = fmt.Sprintf("profile %q is closed for %s and does not list %s, permitted because %s expansion is %s",
+			p.name, typ, name, typ, audit.ExpansionWarn)
+	}
+	return d
+}
+
+// Permits reports whether p allows typ/name at version.
+//
+// Covers answers the first two levels; the third is the version rule, where a
+// per-entry constraint overrides the type's version default in both
+// directions: one pinned package inside a floating type, and one floating
+// package inside a pinned type.
+//
+// A package Covers permitted by expansion skips the version rule entirely. It
+// is outside the set, so no entry names a version for it and the type default
+// is a rule about the profile's own packages; applying a pinned default to a
+// package the profile does not list would turn warn into block through the
+// back door.
+func (p *Profile) Permits(typ, name, version string) Decision {
+	d := p.Covers(typ, name)
+	if !d.Permitted || !d.Governed || d.Outside {
+		return d
+	}
+
+	rule := *d.Rule
+	entry, listed := p.entries[typ][name]
 
 	kind, base := versionRule(rule, entry, listed)
 	if kind == audit.VersionPinned {
@@ -116,23 +189,25 @@ func (p *Profile) Permits(typ, name, version string) Decision {
 		// is nothing to compare against.
 		return Decision{
 			Governed: true,
-			Rule:     &rule,
+			Rule:     d.Rule,
+			Refusal:  RefusalConstraint,
 			Reason: fmt.Sprintf("profile %q pins every %s version and names none for %s",
 				p.name, typ, name),
 		}
 	}
 
-	d := Decision{Governed: true, Rule: &rule}
+	out := Decision{Governed: true, Rule: d.Rule}
 	if listed {
-		d.Entry = &entry
+		out.Entry = &entry
 	}
-	d.Permitted, d.Reason = matches(kind, base, version)
-	if d.Permitted {
-		d.Reason = fmt.Sprintf("profile %q permits %s/%s at %s (%s)", p.name, typ, name, version, d.Reason)
+	out.Permitted, out.Reason = matches(kind, base, version)
+	if out.Permitted {
+		out.Reason = fmt.Sprintf("profile %q permits %s/%s at %s (%s)", p.name, typ, name, version, out.Reason)
 	} else {
-		d.Reason = fmt.Sprintf("profile %q does not permit %s/%s at %s: %s", p.name, typ, name, version, d.Reason)
+		out.Refusal = RefusalConstraint
+		out.Reason = fmt.Sprintf("profile %q does not permit %s/%s at %s: %s", p.name, typ, name, version, out.Reason)
 	}
-	return d
+	return out
 }
 
 // versionRule resolves the third level against the first. It returns a

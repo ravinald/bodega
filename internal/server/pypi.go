@@ -33,11 +33,17 @@ func (s *Server) handlePypiIndex(w http.ResponseWriter, r *http.Request) {
 
 	names := uniquePackageNames(keys)
 
-	// Filter out hidden packages.
+	// Filter out hidden packages, and the ones this host's profile does not
+	// cover. The root index names no version, so it is decided at the
+	// membership level alone.
+	prof := s.profileFor(r)
 	var visible []string
 	for _, n := range names {
 		pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, n)
 		if pkg != nil && isPackageHidden(pkg) {
+			continue
+		}
+		if !prof.Covers(manifest.TypePypi, n).Permitted {
 			continue
 		}
 		visible = append(visible, n)
@@ -62,6 +68,11 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if !s.entitleGate(w, r, manifest.TypePypi, pkgName, "") {
+		return
+	}
+	prof, scope := s.profileIndexScope(r, manifest.TypePypi, pkgName)
+	permit := profileVersionFilter(prof, manifest.TypePypi, pkgName)
 	normalized := normalizePkgName(pkgName)
 
 	// Proxy the simple index from upstream PyPI, republished onto bodega's own
@@ -80,8 +91,10 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 	// /pypi/wheels/, which answers from storage before it reaches the network.
 	if pkg != nil && packageMode(pkg) == manifest.ModeProxy {
 		upstream := s.pypiSimpleURL(normalized)
-		rw := &pypiIndexWriter{ResponseWriter: w, indexURL: upstream}
-		s.proxyOrCache(rw, r, s.typeStore(manifest.TypePypi), "pypi/simple/"+normalized+"/index.html", upstream, manifest.TypePypi, pkgName, pkgName, false, true)
+		rw := &pypiIndexWriter{ResponseWriter: w, indexURL: upstream, permit: permit}
+		s.proxyOrCache(rw, r, s.typeStore(manifest.TypePypi),
+			profileIndexKey(scope, "pypi/simple/"+normalized+"/index.html"),
+			upstream, manifest.TypePypi, pkgName, pkgName, false, true)
 		if err := rw.flush(); err != nil {
 			s.logger.Warn("client read of a republished pypi index was cut short", "package", pkgName, "error", err)
 		}
@@ -110,6 +123,11 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 		dist := wheelDistName(filename)
 		if normalizePkgName(dist) != normalized {
 			continue
+		}
+		if permit != nil {
+			if _, version := wheelIdentity(filename); version != "" && !permit(version) {
+				continue
+			}
 		}
 		relPath := strings.TrimPrefix(key, manifest.PypiWheelPrefix)
 		wheels = append(wheels, wheelEntry{relPath: relPath, filename: filename})
@@ -149,6 +167,9 @@ func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
 	// (e.g. "boto3-1.26.0-py3-none-any.whl" → "boto3", "1.26.0").
 	dist, distVersion := wheelIdentity(file)
 	if dist != "" {
+		if !s.entitleGate(w, r, manifest.TypePypi, dist, distVersion) {
+			return
+		}
 		normalized := normalizePkgName(dist)
 		pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, dist)
 		if pkg != nil && packageMode(pkg) == manifest.ModeProxy {
@@ -190,8 +211,12 @@ func (s *Server) pypiSimpleURL(normalized string) string {
 type pypiIndexWriter struct {
 	http.ResponseWriter
 	indexURL string
-	status   int
-	body     bytes.Buffer
+	// permit is the profile's version rule for this distribution, nil when no
+	// profile governs it. Applied before the href rewrite so the two passes
+	// read the upstream filenames rather than one reading the other's output.
+	permit func(string) bool
+	status int
+	body   bytes.Buffer
 }
 
 func (p *pypiIndexWriter) WriteHeader(code int) {
@@ -216,7 +241,7 @@ func (p *pypiIndexWriter) flush() error {
 		p.status = http.StatusOK
 	}
 	if p.status == http.StatusOK {
-		body = rewritePypiIndex(body, p.indexURL)
+		body = rewritePypiIndex(filterPypiSimplePage(body, p.permit), p.indexURL)
 		// proxyS3 sets ETag from the stored object, which is the upstream
 		// document rather than what is going out. Left on, it labels the
 		// republished body with a validator for different bytes.
@@ -289,6 +314,21 @@ func rewritePypiIndex(body []byte, indexURL string) []byte {
 		out := pypiHrefPattern.ReplaceAll(tag, []byte(`href="`+html.EscapeString(href)+`"`))
 		return pypiMetadataAttrPattern.ReplaceAll(out, nil)
 	})
+}
+
+// pypiHrefFilename recovers the filename one href names, unescaped. An href
+// that does not parse yields "", which every caller reads as "this anchor
+// names no file bodega can place".
+func pypiHrefFilename(href string) string {
+	u, err := url.Parse(html.UnescapeString(href))
+	if err != nil {
+		return ""
+	}
+	name, err := url.PathUnescape(path.Base(u.Path))
+	if err != nil || name == "." || name == "/" {
+		return ""
+	}
+	return name
 }
 
 // pypiHrefPattern pulls the link targets out of a PEP 503 index. The document
