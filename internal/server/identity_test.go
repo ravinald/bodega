@@ -349,8 +349,21 @@ func TestDoctorWritesWhatEachClientSends(t *testing.T) {
 // netrcHeader reads the login and password for the one machine in the file and
 // sends them as Basic, which is what libcurl, requests and the go toolchain
 // each do with a netrc entry.
+//
+// It refuses a comment preceded by a blank line first, because a Fields scan
+// reads such a file exactly as happily as a good one and pip does not: Python's
+// netrc module rejects that placement, and rejects the whole file for it, so
+// requests hands back no credential at all. libcurl parses it regardless, which
+// is why a reader modeled on curl alone let the shape through.
 func netrcHeader(t *testing.T, file string) string {
 	t.Helper()
+	lines := strings.Split(file, "\n")
+	for i, l := range lines {
+		if i > 0 && strings.HasPrefix(strings.TrimSpace(l), "#") && strings.TrimSpace(lines[i-1]) == "" {
+			t.Fatalf("line %d is a comment after a blank line, which Python's netrc refuses,\n"+
+				"taking every other credential in the file with it:\n%s", i+1, file)
+		}
+	}
 	fields := strings.Fields(file)
 	var login, password string
 	for i := 0; i+1 < len(fields); i++ {

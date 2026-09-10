@@ -334,7 +334,7 @@ func TestRotationSurvivesTheClientsOwnRewrite(t *testing.T) {
 			// bodega before --write-credentials existed wrote a stanza for
 			// this host by hand and it carries no fence either.
 			client: "pip",
-			seed: "machine other.internal\n  login someone\n  password someone-elses\n" +
+			seed: "machine other.internal\n  login someone\n  password someone-elses\n\n" +
 				"machine bodega.internal\n  login bodega\n  password " + old + "\n",
 			operator: "machine other.internal",
 			entry:    "machine bodega.internal",
@@ -421,6 +421,74 @@ func TestRotationSurvivesTheClientsOwnRewrite(t *testing.T) {
 			t.Fatalf("the first stanza for the host carries %q, want %q:\n%s", got, fresh, data)
 		}
 	})
+}
+
+// Python's netrc module refuses a `#` line preceded by a blank one, and
+// refuses the whole file rather than the entry, so pip loses every credential
+// in it. Silently, both ways: requests catches NetrcParseError and hands back
+// no credential at all, and libcurl parses the same file without complaint, so
+// git and curl keep working while pip stops.
+//
+// Characterized against CPython 3.14.7 netrc._parse: a comment on line 1 is
+// fine, a comment directly after `password p` is fine, a comment anywhere
+// after a blank line is not. A blank line between stanzas is how a netrc is
+// idiomatically written, which is exactly the shape an append lands in.
+func TestNetrcCarriesNoCommentAfterABlankLine(t *testing.T) {
+	const old, fresh = "tok-old", "tok-fresh"
+	const operator = "machine other.internal\n  login someone\n  password KEEPME\n\n"
+
+	seeds := map[string]string{
+		"a stanza the operator wrote by hand": operator +
+			"machine bodega.internal\n  login bodega\n  password " + old + "\n",
+		"a fenced block an earlier build left": operator +
+			managedBegin + "\nmachine bodega.internal\n  login bodega\n  password " + old + "\n" + managedEnd + "\n",
+		"nothing for this host yet": operator,
+	}
+
+	for name, seed := range seeds {
+		t.Run(name, func(t *testing.T) {
+			home := scratchHome(t)
+			target := targetFor(t, home, "pip")
+			if err := os.WriteFile(target.Path, []byte(seed), 0o600); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			// Twice. The second run rotates over bodega's own output, which
+			// is the file config management meets every hour after the first.
+			for run := 1; run <= 2; run++ {
+				if _, err := WriteCredential(target, testBase(t), fresh); err != nil {
+					t.Fatalf("run %d: %v", run, err)
+				}
+				data, err := os.ReadFile(target.Path)
+				if err != nil {
+					t.Fatalf("run %d: read back: %v", run, err)
+				}
+				body := string(data)
+				if n := netrcCommentAfterBlank(body); n != 0 {
+					t.Fatalf("run %d: line %d is a comment after a blank line, which Python's netrc refuses,\n"+
+						"taking every other credential in the file with it:\n%s", run, n, body)
+				}
+				if got := firstNetrcPassword(t, body, "bodega.internal"); got != fresh {
+					t.Fatalf("run %d: the entry carries %q, want %q:\n%s", run, got, fresh, body)
+				}
+				if !strings.Contains(body, "password KEEPME") {
+					t.Fatalf("run %d: the operator's own stanza did not survive:\n%s", run, body)
+				}
+			}
+		})
+	}
+}
+
+// netrcCommentAfterBlank returns the 1-based line number of the first comment
+// preceded by a blank line, or 0. That is the one placement Python's netrc
+// module rejects, and it rejects the whole file for it.
+func netrcCommentAfterBlank(file string) int {
+	lines := strings.Split(file, "\n")
+	for i, l := range lines {
+		if i > 0 && strings.HasPrefix(strings.TrimSpace(l), "#") && strings.TrimSpace(lines[i-1]) == "" {
+			return i + 1
+		}
+	}
+	return 0
 }
 
 // firstNetrcPassword returns the password of the first stanza for machine,
@@ -510,6 +578,23 @@ func TestNetrcOwnedRemovesOnlyThisHostsStanza(t *testing.T) {
 				"machine z.internal\n  login z\n  password 2\n",
 			want: "machine a.internal\n  login a\n  password 1\n" +
 				"machine z.internal\n  login z\n  password 2\n",
+		},
+		{
+			// The idiomatic file: stanzas separated by a blank line. The cut
+			// leaves the separator that preceded bodega's stanza behind,
+			// which is what put a fence after a blank line.
+			name: "blank-separated stanzas",
+			in: "machine a.internal\n  login a\n  password 1\n\n" +
+				"machine bodega.internal\n  login bodega\n  password old\n\n" +
+				"machine z.internal\n  login z\n  password 2\n",
+			want: "machine a.internal\n  login a\n  password 1\n\n" +
+				"\nmachine z.internal\n  login z\n  password 2\n",
+		},
+		{
+			name: "blank-separated, this host last",
+			in: "machine a.internal\n  login a\n  password 1\n\n" +
+				"machine bodega.internal\n  login bodega\n  password old\n",
+			want: "machine a.internal\n  login a\n  password 1\n\n",
 		},
 		{
 			name: "two stanzas on one line",

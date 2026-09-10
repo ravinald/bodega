@@ -22,9 +22,10 @@ import (
 // rotate.
 
 // managedBegin and managedEnd fence what bodega owns inside a file it shares
-// with the operator. Rewriting the block in place is what keeps a second
-// --write-credentials run idempotent instead of additive; nothing outside the
-// fence is read or altered.
+// with the operator, in the formats that can carry a comment anywhere. What
+// keeps a second --write-credentials run idempotent instead of additive is
+// removing bodega's own entry before placing the fresh one; nothing else in
+// the file is read or altered.
 //
 // The fence is not the only anchor, because bodega does not own these files.
 // cargo, helm and npm each re-serialize their own configuration as part of
@@ -38,9 +39,22 @@ import (
 // one for the other reason an unfenced entry is there: the operator who
 // configured bodega before this command existed wrote it. See CredentialTarget.
 //
-// Every format below takes `#` to end of line as a comment: netrc (apt's
-// parser and Go's both strip it, confirmed against apt 2.8.3 on noble), npm's
-// ini, cargo's TOML, and YAML.
+// The fence goes only where a comment is safe wherever an append can put it.
+// ~/.netrc is not such a file. Python's netrc module rejects a `#` line
+// preceded by a blank one, and rejects the whole file rather than the entry,
+// so pip loses every credential in it — silently, because requests catches
+// NetrcParseError and hands back no credential at all. A blank line between
+// stanzas is how a netrc is idiomatically written, so that is the shape an
+// append lands in. Go's parser is no safer a home for one: cmd/go's
+// parseNetrc scans strings.Fields in pairs and ignores `#` rather than
+// stripping it, which makes a fence inert there only while no keyword lands
+// on an even index. So the netrc targets write the stanza alone and let
+// netrcOwned be the anchor, which is what it already was.
+//
+// apt keeps its fence: that file is bodega's alone and replaced whole, its
+// fence is line 1, and apt's parser does strip `#` (confirmed against apt
+// 2.8.3 on noble). npm's ini, cargo's TOML and YAML take `#` to end of line
+// with no positional rule.
 const (
 	managedBegin = "# BEGIN bodega credential — written by bodega doctor --write-credentials"
 	managedEnd   = "# END bodega credential"
@@ -68,6 +82,11 @@ type CredentialTarget struct {
 	// whole, when set, means the file is bodega's alone: the block is the
 	// file, and there is no operator content to preserve around it.
 	whole bool
+
+	// bare, when set, means the entry is written with no fence around it,
+	// because a comment is not safe everywhere an append can land it. Only
+	// the netrc targets; owned is their anchor instead. See managedBegin.
+	bare bool
 
 	// appendGuard refuses an append into a file whose shape would not carry
 	// the block. Only helm has one; nil means appending is always legal.
@@ -112,6 +131,7 @@ func CredentialTargets(home string) []CredentialTarget {
 			Path:   netrc,
 			Mode:   0o600,
 			body:   netrcEntry,
+			bare:   true,
 			owned:  netrcOwned,
 			Note:   "pip reads netrc through requests; no index-url change is needed for the credential",
 		},
@@ -127,6 +147,7 @@ func CredentialTargets(home string) []CredentialTarget {
 			Path:   netrc,
 			Mode:   0o600,
 			body:   netrcEntry,
+			bare:   true,
 			owned:  netrcOwned,
 			Note:   "the go toolchain reads netrc for the GOPROXY host",
 		},
@@ -152,6 +173,7 @@ func CredentialTargets(home string) []CredentialTarget {
 			Path:   netrc,
 			Mode:   0o600,
 			body:   netrcEntry,
+			bare:   true,
 			owned:  netrcOwned,
 			Note:   "git reads netrc through libcurl; no credential helper is required",
 		},
@@ -160,6 +182,7 @@ func CredentialTargets(home string) []CredentialTarget {
 			Path:   netrc,
 			Mode:   0o600,
 			body:   netrcEntry,
+			bare:   true,
 			owned:  netrcOwned,
 			Note:   "curl needs --netrc to consult it; wget consults it already",
 		},
@@ -216,11 +239,19 @@ func helmEntry(base *url.URL, token string) string {
 // anything, which is the only way to inspect the apt target: it resolves to
 // /etc/apt/auth.conf.d and nowhere else.
 func (t CredentialTarget) Render(base *url.URL, token string) string {
-	block := managedBegin + "\n" + t.body(base, token) + "\n" + managedEnd + "\n"
+	block := t.block(base, token)
 	if t.createDoc != nil {
 		return t.createDoc(block)
 	}
 	return block
+}
+
+// block is what bodega owns inside t.Path: the entry, fenced unless t is bare.
+func (t CredentialTarget) block(base *url.URL, token string) string {
+	if t.bare {
+		return t.body(base, token) + "\n"
+	}
+	return managedBegin + "\n" + t.body(base, token) + "\n" + managedEnd + "\n"
 }
 
 // WriteCredential renders t's block for base and token and lands it in t.Path,
@@ -237,7 +268,7 @@ func WriteCredential(t CredentialTarget, base *url.URL, token string) (bool, err
 	if token == "" {
 		return false, fmt.Errorf("%s: no token to write", t.Client)
 	}
-	block := managedBegin + "\n" + t.body(base, token) + "\n" + managedEnd + "\n"
+	block := t.block(base, token)
 
 	existing := ""
 	if data, err := os.ReadFile(t.Path); err == nil {
@@ -262,12 +293,17 @@ func WriteCredential(t CredentialTarget, base *url.URL, token string) (bool, err
 		if t.owned != nil {
 			before, after = t.owned(before, base), t.owned(after, base)
 		}
-		if fenced {
+		if fenced && !t.bare {
 			// Replacing a block already in the file puts it back exactly
 			// where it was, so only the append below can land in a bad place.
 			next = before + block + after
 			break
 		}
+		// A bare target has no fence to replace, so what a fence written by
+		// an earlier build left around rejoins and the entry goes to the end.
+		// after is empty whenever no fence was found, which is every other
+		// route to this line.
+		before += after
 		if t.appendGuard != nil {
 			if err := t.appendGuard(before); err != nil {
 				return false, fmt.Errorf("%s: %s: %w", t.Client, t.Path, err)

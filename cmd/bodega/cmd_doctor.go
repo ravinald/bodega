@@ -64,8 +64,11 @@ route everything through bodega.
 takes a token and writes it into the file each of the eight clients reads
 its credential from, so a host can be attributed on the read path without
 eight hand edits. Five files serve the eight: pip, go, git and curl/wget all
-read ~/.netrc. Everything bodega writes is fenced by a marker comment and
-rewritten in place on a second run; nothing outside the fence is touched.
+read ~/.netrc. A second run rewrites bodega's own entry rather than stacking
+another beside it, and nothing else in those files is touched. ~/.netrc gets
+no marker comment: Python's netrc module refuses a comment that follows a
+blank line, and refuses the whole file for it, so a marker there would cost
+pip every credential in the file. The machine <host> stanza is the anchor.
 
   bodega doctor --write-credentials --token bodega_ak_... --url https://bodega.internal
 
