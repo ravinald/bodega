@@ -82,7 +82,8 @@ func TestUnknownAuthSchemesYieldNoCredential(t *testing.T) {
 }
 
 // identityFor builds the set once and answers one request through it, which is
-// what the middleware does per request.
+// what the middleware does per request. trusted_proxies is answered here: these
+// cases are about resolution order, and the unanswered case is its own test.
 func identityFor(t *testing.T, bindings []audit.IdentityBinding, tokens []audit.TokenHash, header, ip string) string {
 	t.Helper()
 	set := newIdentitySet(bindings, tokens)
@@ -91,7 +92,7 @@ func identityFor(t *testing.T, bindings []audit.IdentityBinding, tokens []audit.
 		r.Header.Set("Authorization", header)
 	}
 	cred, _ := credentialFrom(r)
-	return set.resolve(cred, ip, testPepper, time.Now())
+	return set.resolve(cred, ip, testPepper, time.Now(), true)
 }
 
 // The order in requirement 3, and the case that makes it observable: an
@@ -157,7 +158,9 @@ func TestExpiredTokenFallsThroughToTheCIDR(t *testing.T) {
 // today, with an audit row that names nobody rather than no audit row.
 func TestUnidentifiedRequestIsStillServedAndStillRecorded(t *testing.T) {
 	ctx := context.Background()
-	s := newACLServer(t, &config.Config{})
+	// trusted_proxies answered, so the CIDR binding resolves at all. Unanswered
+	// is TestCIDRBindingsAreInertUntilTrustedProxiesIsAnswered.
+	s := newACLServer(t, &config.Config{TrustedProxies: []string{}})
 	s.pepper = testPepper
 	if _, err := s.auditDB.AddIdentityBinding(ctx, audit.IdentityBinding{
 		Kind: audit.BindCIDR, Key: "10.20.0.0/16", Identity: "devbox",
@@ -521,4 +524,133 @@ func TestRotatedCredentialIsWhatTheClientSends(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The hole the startup refusal alone leaves open: an operator binds a CIDR on
+// a server that is already running. guardCIDRBindings ran at boot with nothing
+// bound and passed, and both paths that install a binding afterwards — SIGHUP
+// and the cache TTL — reach the read path with no guard between them. So the
+// instance would serve, header-assertable by any RFC 1918 peer, the exact
+// arrangement it refuses to start carrying.
+//
+// Every case here drives a request through and records a row, so none of them
+// can be satisfied by refusing the request. Attribution is what changes.
+func TestCIDRBindingsAreInertUntilTrustedProxiesIsAnswered(t *testing.T) {
+	ctx := context.Background()
+	const tok = "bodega_ak_build07"
+
+	// serve builds the chain the way handler() does for these two middlewares
+	// and returns the identity the handler saw.
+	serve := func(t *testing.T, s *Server, remote, header string) (int, string) {
+		t.Helper()
+		var h http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Seen-Identity", Identity(r))
+			w.WriteHeader(http.StatusOK)
+		})
+		h = AuditMiddleware(s.auditDB)(h)
+		h = IdentityMiddleware(s.identityFunc())(h)
+		req := httptest.NewRequest(http.MethodGet, "/cargo/config.json", nil)
+		req.RemoteAddr = remote
+		if header != "" {
+			req.Header.Set("Authorization", header)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code, rec.Header().Get("X-Seen-Identity")
+	}
+
+	// running starts from the state guardCIDRBindings passes: no bindings, and
+	// trusted_proxies left at the built-in default.
+	running := func(t *testing.T) *Server {
+		t.Helper()
+		s := newACLServer(t, &config.Config{AllowPlaintext: true})
+		s.pepper = testPepper
+		if err := s.guardCIDRBindings(ctx); err != nil {
+			t.Fatalf("startup refused with nothing bound: %v", err)
+		}
+		return s
+	}
+
+	bindCIDR := func(t *testing.T, s *Server) {
+		t.Helper()
+		if _, err := s.auditDB.AddIdentityBinding(ctx, audit.IdentityBinding{
+			Kind: audit.BindCIDR, Key: "10.20.0.0/16", Identity: "sneaky-fleet",
+		}); err != nil {
+			t.Fatalf("bind cidr: %v", err)
+		}
+	}
+
+	t.Run("bound after start", func(t *testing.T) {
+		s := running(t)
+		bindCIDR(t, s)
+		s.refreshIdentities(ctx) // what the 30-second TTL does on its own
+
+		code, id := serve(t, s, "10.20.0.9:5000", "")
+		if code != http.StatusOK {
+			t.Fatalf("status %d, want 200: the guard withholds a name, never a package", code)
+		}
+		if id != "" {
+			t.Fatalf("resolved %q from an address on a default-trusted_proxies instance; "+
+				"the binding is assertable by any RFC 1918 peer and must name nobody", id)
+		}
+		events, err := s.auditDB.Query(ctx, audit.Filter{EventType: audit.EventServeFetch})
+		if err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		if len(events) != 1 {
+			t.Fatalf("recorded %d serve_fetch rows, want 1", len(events))
+		}
+		if events[0].Identity != "" || events[0].ClientIP != "10.20.0.9" {
+			t.Fatalf("row = (ip %q, identity %q), want (10.20.0.9, empty)",
+				events[0].ClientIP, events[0].Identity)
+		}
+	})
+
+	t.Run("bound then SIGHUP", func(t *testing.T) {
+		s := running(t)
+		bindCIDR(t, s)
+		s.reload(ctx) // the whole reload, not refreshIdentities alone
+
+		if code, id := serve(t, s, "10.20.0.9:5000", ""); code != http.StatusOK || id != "" {
+			t.Fatalf("after reload: status %d, identity %q; want 200 and no identity", code, id)
+		}
+	})
+
+	t.Run("token bindings still resolve", func(t *testing.T) {
+		s := running(t)
+		bindCIDR(t, s)
+		const id = "tok-1"
+		if err := s.auditDB.InsertToken(ctx, id, "build-07", audit.HashToken(tok, testPepper), "", nil); err != nil {
+			t.Fatalf("insert token: %v", err)
+		}
+		if _, err := s.auditDB.AddIdentityBinding(ctx, audit.IdentityBinding{
+			Kind: audit.BindToken, Key: id, Identity: "build-07",
+		}); err != nil {
+			t.Fatalf("bind token: %v", err)
+		}
+		s.refreshIdentities(ctx)
+
+		// A credential is a claim the caller had to hold. An address is a claim
+		// anyone inside RFC 1918 can make with a header, which is the whole
+		// difference the guard turns on.
+		if _, got := serve(t, s, "10.20.0.9:5000", "Bearer "+tok); got != "build-07" {
+			t.Fatalf("token resolved to %q, want build-07: the guard is on the CIDR half alone", got)
+		}
+		if _, got := serve(t, s, "10.20.0.9:5000", ""); got != "" {
+			t.Fatalf("address alone resolved to %q, want no identity", got)
+		}
+	})
+
+	t.Run("answered proxies bring the binding back", func(t *testing.T) {
+		s := running(t)
+		bindCIDR(t, s)
+		if _, err := s.auditDB.SeedACL(ctx, audit.ACLProxies, nil, "ravi"); err != nil {
+			t.Fatalf("seed proxies: %v", err)
+		}
+		s.reload(ctx)
+
+		if _, got := serve(t, s, "10.20.0.9:5000", ""); got != "sneaky-fleet" {
+			t.Fatalf("resolved %q with trusted_proxies answered, want sneaky-fleet", got)
+		}
+	})
 }

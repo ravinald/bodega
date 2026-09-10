@@ -703,6 +703,19 @@ The default trusts loopback plus RFC 1918, and bodega returns `X-Real-IP` verbat
 
 It is a refusal rather than a warning because `log_level` defaults to `Error`, so a warning here is written for nobody and the instance runs anyway. `bodega identity bind cidr` prints the same guidance at bind time, so the interlock is discovered from the command that armed it rather than from a server that will not come back up. A token binding needs no proxy answer, because the credential is the claim; an instance carrying only token bindings starts unchanged.
 
+**Binding on a running server is gated the same way, where the binding is read.** Startup is the rarer way into that state: the ordinary operator order is the reverse, because the server is already running when the bind happens. `bodega serve` came up with nothing bound and passed the check, and both paths that install a binding afterwards, `systemctl reload bodega` and the 30-second cache, land it behind that check. So resolution itself asks the same question. While `trusted_proxies` is unanswered, a CIDR binding resolves as absent: the request is served exactly as it was before, and the row names nobody rather than naming a host any RFC 1918 peer could have claimed with a header. Token bindings resolve throughout, because a credential is a claim the caller had to hold.
+
+Entering that state writes one `ERROR` line naming both remedies, and leaving it writes one `INFO`. The operator who got there by binding never saw the startup refusal, and `bodega identity bind cidr` prints its warning to stderr on a command that commonly runs under config management with its output discarded:
+
+```
+ERROR CIDR identity bindings are inert while trusted_proxies is still the built-in
+default; requests from a bound network are recorded unidentified bindings=1
+remedy="bodega acl proxies add <proxy-cidr>, or \"trusted_proxies\": [] to trust no
+forwarded header"
+```
+
+Answering `trusted_proxies` brings the bindings back with no restart: `bodega acl proxies add <cidr>` is picked up within the cache TTL, and the config-file form on the next start.
+
 #### Where the identity shows up
 
 `bodega audit events` gains an `IDENTITY` column beside `CLIENT`, and `--identity <name>` filters on it. `bodega discover show` gains `LAST IDENTITY` beside `LAST CLIENT`, and the CSV export carries `last_identity`. Neither replaces the address: the deny list matched on the address, one identity holds several, and a row that dropped it would lose which one asked.

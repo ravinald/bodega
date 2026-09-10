@@ -100,6 +100,11 @@ type Server struct {
 	identity   atomic.Pointer[identitySet]
 	identityAt atomic.Int64
 	identityMu sync.Mutex
+	// cidrInert latches whether CIDR bindings are currently unresolvable for
+	// want of a trusted_proxies answer, so the log records each entry into
+	// that state once rather than every cache refresh. See
+	// Server.logInertCIDRBindings.
+	cidrInert atomic.Bool
 
 	// aptSign is the signing key and the two served renderings of its public
 	// half. nil when no key is installed, which is a supported configuration:

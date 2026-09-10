@@ -159,7 +159,11 @@ func newIdentitySet(bindings []audit.IdentityBinding, tokens []audit.TokenHash) 
 // bound to, falls through to the CIDR rather than refusing — this path adds
 // attribution, never admission, and a request that would have been served
 // yesterday is served today.
-func (s *identitySet) resolve(cred, clientIP, pepper string, now time.Time) string {
+//
+// cidrTrusted is the caller's answer to "may an address name a host here",
+// which is false while trusted_proxies is still the built-in default. See
+// Server.cidrBindingsTrusted.
+func (s *identitySet) resolve(cred, clientIP, pepper string, now time.Time, cidrTrusted bool) string {
 	if s == nil {
 		return ""
 	}
@@ -167,6 +171,9 @@ func (s *identitySet) resolve(cred, clientIP, pepper string, now time.Time) stri
 		if id := s.identityForToken(cred, pepper, now); id != "" {
 			return id
 		}
+	}
+	if !cidrTrusted {
+		return ""
 	}
 	addr, err := netip.ParseAddr(clientIP)
 	if err != nil {
@@ -254,7 +261,28 @@ func (s *Server) identityCached() *identitySet {
 func (s *Server) storeIdentities(set *identitySet) *identitySet {
 	s.identity.Store(set)
 	s.identityAt.Store(time.Now().UnixNano())
+	s.logInertCIDRBindings(set)
 	return set
+}
+
+// logInertCIDRBindings reports the state guardCIDRBindings refuses to start in,
+// once on entering it and once on leaving. Only a bind against a running server
+// reaches it, so the startup refusal never printed and the one stderr line
+// `identity bind` writes is all the operator got — from a command that commonly
+// runs under config management with its output discarded. Error level, because
+// log_level defaults to Error and anything quieter is written for nobody.
+func (s *Server) logInertCIDRBindings(set *identitySet) {
+	inert := len(set.cidr) > 0 && !s.aclNow().trustedSet
+	if s.cidrInert.Swap(inert) == inert {
+		return
+	}
+	if !inert {
+		s.logger.Info("trusted_proxies is answered; CIDR identity bindings resolve again")
+		return
+	}
+	s.logger.Error("CIDR identity bindings are inert while trusted_proxies is still the built-in default; requests from a bound network are recorded unidentified",
+		"bindings", len(set.cidr),
+		"remedy", "bodega acl proxies add <proxy-cidr>, or \"trusted_proxies\": [] to trust no forwarded header")
 }
 
 // refreshIdentities re-reads the binding table regardless of cache age, so
@@ -310,9 +338,25 @@ func (s *Server) identityFunc() func(*http.Request) string {
 			return ""
 		}
 		cred, _ := credentialFrom(r)
-		return set.resolve(cred, ClientIP(r), s.pepper, time.Now())
+		return set.resolve(cred, ClientIP(r), s.pepper, time.Now(), s.cidrBindingsTrusted())
 	}
 }
+
+// cidrBindingsTrusted reports whether an address may name a host on this
+// request. It is the same predicate guardCIDRBindings refuses to start on, read
+// where the binding is consumed rather than only where the process boots.
+//
+// Startup is not the only way into that state, and it is the rarer one. An
+// operator binds on a server that is already running: guardCIDRBindings ran at
+// boot with no bindings and passed, SIGHUP and the cache TTL then install the
+// new binding with nothing between them and the read path. The instance ends up
+// serving the arrangement it would have refused to start carrying.
+//
+// So with trusted_proxies unanswered the CIDR half resolves as absent. Token
+// bindings still resolve, because a credential is a claim the caller had to
+// hold; an address is a claim any RFC 1918 peer can make with a header. The
+// request is served either way and the row simply names nobody.
+func (s *Server) cidrBindingsTrusted() bool { return s.aclNow().trustedSet }
 
 // guardCIDRBindings refuses to start an instance where a CIDR binding is
 // assertable by whoever sends a header.
