@@ -484,15 +484,47 @@ func (r *responseRecorder) Flush() {
 	}
 }
 
+// redactedHeaders names the headers whose value is a credential. The name
+// survives, so a debug log still answers "did this client send one"; the value
+// never reaches the file, because these are the exact secrets bodega hands out.
+//
+// Read-path identity is what makes this a leak rather than a curiosity. Before
+// it, the only Authorization headers arriving were operator mutations; now
+// every package GET can carry a token and `bodega doctor --write-credentials`
+// puts one on eight client hosts. The tokens are unscoped, so a token in a log
+// the journal group can read is a write credential (docs/THREAT_MODEL.md).
+// recordDenial states the same position for audit rows: no header is copied
+// into one.
+//
+// Lowercase keys, matched after folding: http.Header canonicalizes what it
+// parses, but formatHeaders is also handed response headers, which a handler
+// may have set through the map directly.
+var redactedHeaders = map[string]bool{
+	"authorization":       true,
+	"proxy-authorization": true,
+	"cookie":              true,
+	"set-cookie":          true,
+}
+
+// redactedValue replaces a credential rather than shortening it. A prefix or a
+// hash would still be reversible against a token whose alphabet and length are
+// published, which defeats the point of not writing it down.
+const redactedValue = "[redacted]"
+
 func formatHeaders(h http.Header) string {
 	var sb strings.Builder
 	for k, vs := range h {
+		redact := redactedHeaders[strings.ToLower(k)]
 		for _, v := range vs {
 			if sb.Len() > 0 {
 				sb.WriteString("; ")
 			}
 			sb.WriteString(k)
 			sb.WriteString(": ")
+			if redact {
+				sb.WriteString(redactedValue)
+				continue
+			}
 			sb.WriteString(v)
 		}
 	}

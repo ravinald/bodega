@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"io"
 	"log/slog"
 	"net"
@@ -653,5 +654,89 @@ func TestMutationAuthDELETEAlsoGated(t *testing.T) {
 
 	if rec.Code != http.StatusForbidden {
 		t.Errorf("DELETE from non-permitted IP: status = %d, want 403", rec.Code)
+	}
+}
+
+// The debug request log is where the credential this item distributes would
+// otherwise land. Before read-path identity the only Authorization headers
+// reaching this server were operator mutations; now every package GET can
+// carry one and `bodega doctor --write-credentials` writes one onto eight
+// client hosts. The tokens are unscoped, so a token in a log file is a write
+// credential wherever admin_permit_cidr reaches past loopback.
+//
+// The header name has to survive: "did this client send a credential" is the
+// question debug logging is on for.
+func TestDebugRequestLogRedactsCredentialHeaders(t *testing.T) {
+	const tok = "bodega_ak_51810714d2c29d30eeef"
+
+	for _, tc := range []struct {
+		name, header, value string
+		absent              []string
+	}{
+		{
+			name:   "bearer",
+			header: "Authorization",
+			value:  "Bearer " + tok,
+			absent: []string{tok},
+		},
+		{
+			// Assert the decoded pair, not the blob: a future change that
+			// logged only the base64 would still be handing out the token.
+			name:   "basic",
+			header: "Authorization",
+			value:  basicAuth("bodega", tok),
+			absent: []string{tok, "bodega:" + tok, base64.StdEncoding.EncodeToString([]byte("bodega:" + tok))},
+		},
+		{
+			name:   "cargo raw",
+			header: "Authorization",
+			value:  tok,
+			absent: []string{tok},
+		},
+		{
+			name:   "proxy",
+			header: "Proxy-Authorization",
+			value:  "Basic " + base64.StdEncoding.EncodeToString([]byte("bodega:"+tok)),
+			absent: []string{tok, base64.StdEncoding.EncodeToString([]byte("bodega:" + tok))},
+		},
+		{
+			name:   "cookie",
+			header: "Cookie",
+			value:  "session=" + tok,
+			absent: []string{tok},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			h := RequestLogger(newTestLogger(&buf, slog.LevelDebug))(testHandler("ok"))
+
+			req := httptest.NewRequest(http.MethodGet, "/cargo/config.json", nil)
+			req.Header.Set(tc.header, tc.value)
+			h.ServeHTTP(httptest.NewRecorder(), req)
+
+			out := buf.String()
+			for _, secret := range tc.absent {
+				if strings.Contains(out, secret) {
+					t.Fatalf("%s header put %q in the debug log:\n%s", tc.header, secret, out)
+				}
+			}
+			if !strings.Contains(out, tc.header) {
+				t.Fatalf("%s header name is missing; the log no longer says whether a credential arrived:\n%s", tc.header, out)
+			}
+			if !strings.Contains(out, redactedValue) {
+				t.Fatalf("no %s marker in the log:\n%s", redactedValue, out)
+			}
+		})
+	}
+
+	// A header that is not a credential still logs its value, or debug logging
+	// has been traded for silence rather than for redaction.
+	var buf bytes.Buffer
+	h := RequestLogger(newTestLogger(&buf, slog.LevelDebug))(testHandler("ok"))
+	req := httptest.NewRequest(http.MethodGet, "/cargo/config.json", nil)
+	req.Header.Set("User-Agent", "cargo/1.83.0")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if !strings.Contains(buf.String(), "cargo/1.83.0") {
+		t.Fatalf("an ordinary header lost its value:\n%s", buf.String())
 	}
 }
