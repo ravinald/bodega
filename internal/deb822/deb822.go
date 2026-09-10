@@ -4,15 +4,15 @@
 // preserved as a blank line inside the value, per Debian's convention
 // for paragraph breaks within long fields like Description.
 //
-// Only single-paragraph parsing is exposed today. Multi-paragraph input
-// (Packages indices, Release files, dpkg status files) is a future
-// addition when a consumer needs it.
+// ParseSingle reads one paragraph; ParseStream reads a multi-paragraph
+// document (a Packages index, a dpkg status file) one paragraph at a time.
 package deb822
 
 import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"io"
 	"strings"
 )
 
@@ -69,4 +69,53 @@ func ParseSingle(data []byte) (map[string]string, error) {
 	}
 	flush()
 	return fields, nil
+}
+
+// ParseStream reads a multi-paragraph document and calls fn once per
+// paragraph, in file order. Paragraphs are separated by a blank line, and a
+// trailing separator is not required.
+//
+// It streams rather than returning a slice because the documents that need it
+// are large: an Ubuntu universe Packages index is tens of thousands of
+// paragraphs and hundreds of megabytes uncompressed, while a caller matching a
+// host inventory against it keeps a few hundred. fn owns the map it is handed
+// and may retain it.
+//
+// An error from fn stops the walk and is returned unchanged, so a caller that
+// has seen enough can end the read with a sentinel of its own.
+func ParseStream(r io.Reader, fn func(fields map[string]string) error) error {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+
+	var para bytes.Buffer
+	flush := func() error {
+		if para.Len() == 0 {
+			return nil
+		}
+		fields, err := ParseSingle(para.Bytes())
+		para.Reset()
+		if err != nil {
+			return err
+		}
+		if len(fields) == 0 {
+			return nil
+		}
+		return fn(fields)
+	}
+
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(bytes.TrimRight(line, " \t\r")) == 0 {
+			if err := flush(); err != nil {
+				return err
+			}
+			continue
+		}
+		para.Write(line)
+		para.WriteByte('\n')
+	}
+	if err := sc.Err(); err != nil {
+		return err
+	}
+	return flush()
 }

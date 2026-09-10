@@ -26,8 +26,8 @@ import (
 // upstream's covers the digests of upstream's. One URL can serve one Packages
 // file per (component, arch), so a shared codename would necessarily hand a
 // client an InRelease whose digests do not describe the index it gets next.
-// The alternatives and why they lost are in
-// docs-internal/DESIGN_apt-suites-and-signing_2026_08_25.md.
+// docs/USAGE.md carries the operator-facing half under "Mirroring an upstream
+// archive".
 //
 // Dependency awareness arrives free with the index: apt parses the proxied
 // Packages locally and then asks bodega for each .deb by its Filename, so the

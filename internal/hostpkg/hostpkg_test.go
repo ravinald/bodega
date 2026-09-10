@@ -53,6 +53,39 @@ func TestAptSkipsRemovedButNotPurged(t *testing.T) {
 	}
 }
 
+// TestAptRowsCarryTheArchitecture is what ParseAptRows exists for. The
+// manifest an import writes has no architecture on it, so a pin reading the
+// same output would have to re-derive one and could disagree with the importer
+// about which rows are installed. 158 of the 635 packages this host has are
+// Architecture: all, and each one is published inside binary-<arch> rather
+// than an index of its own.
+func TestAptRowsCarryTheArchitecture(t *testing.T) {
+	inv, err := ParseAptRows(fixture(t, "apt-dpkg-query-ns0.txt"))
+	if err != nil {
+		t.Fatalf("ParseAptRows: %v", err)
+	}
+	res, err := ParseApt(fixture(t, "apt-dpkg-query-ns0.txt"))
+	if err != nil {
+		t.Fatalf("ParseApt: %v", err)
+	}
+	if len(inv.Rows) != len(res.Packages) {
+		t.Fatalf("ParseAptRows found %d rows, ParseApt found %d packages, from one status rule", len(inv.Rows), len(res.Packages))
+	}
+
+	archAll := 0
+	for _, row := range inv.Rows {
+		if row.Arch == "" {
+			t.Fatalf("%s has no architecture", row.Name)
+		}
+		if row.Arch == "all" {
+			archAll++
+		}
+	}
+	if archAll != 158 {
+		t.Errorf("counted %d Architecture: all rows, want 158", archAll)
+	}
+}
+
 // TestAptFormatsAgree cross-checks the two inventory formats against each
 // other. Both captures come from the same host at the same moment, so a
 // disagreement is a parser bug in one of them, and neither parser grades its

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/ravinald/bodega/internal/manifest"
@@ -18,6 +19,25 @@ import (
 // packages the host does not have and nothing will ever request.
 const dpkgInstalled = "install ok installed"
 
+// AptRow is one installed package as the host reports it, before anything
+// turns it into a manifest.
+//
+// The architecture is here and not on the manifest because only a pin needs
+// it: matching a host against a served index has to know that an "all" package
+// is published under binary-<arch> rather than an index of its own.
+type AptRow struct {
+	Name    string
+	Version string
+	Arch    string
+}
+
+// AptInventory is one host's installed apt packages and what was dropped
+// getting there.
+type AptInventory struct {
+	Rows     []AptRow
+	Warnings []string
+}
+
 // ParseApt converts either of apt's two inventory formats.
 //
 // 'dpkg-query -W' is the documented input because it is machine readable and
@@ -25,9 +45,28 @@ const dpkgInstalled = "install ok installed"
 // what an operator reaches for, even though apt prints a warning that its CLI
 // has no stable interface.
 func ParseApt(r io.Reader) (Result, error) {
+	inv, err := ParseAptRows(r)
+	if err != nil {
+		return Result{}, err
+	}
+	res := Result{Warnings: inv.Warnings}
+	for _, row := range inv.Rows {
+		res.Packages = append(res.Packages, pkg(manifest.TypeApt, row.Name, row.Version, "", ""))
+	}
+	sortPackages(res.Packages)
+	return res, nil
+}
+
+// ParseAptRows reads the same two formats ParseApt does and returns the rows
+// themselves, architecture included.
+//
+// ParseApt is built on it so that "installed" means one thing across the
+// commands: the status rule and the count it reports live here, and a second
+// reader of the same output cannot drift from them.
+func ParseAptRows(r io.Reader) (AptInventory, error) {
 	data, err := io.ReadAll(r)
 	if err != nil {
-		return Result{}, fmt.Errorf("read apt inventory: %w", err)
+		return AptInventory{}, fmt.Errorf("read apt inventory: %w", err)
 	}
 	text := string(data)
 	if strings.Contains(text, "\t") {
@@ -39,8 +78,8 @@ func ParseApt(r io.Reader) (Result, error) {
 // parseDpkgQuery reads the tab-separated form:
 //
 //	name<TAB>version<TAB>arch<TAB>status
-func parseDpkgQuery(text string) (Result, error) {
-	var res Result
+func parseDpkgQuery(text string) (AptInventory, error) {
+	var res AptInventory
 	skipped := 0
 	sc := bufio.NewScanner(strings.NewReader(text))
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -51,10 +90,10 @@ func parseDpkgQuery(text string) (Result, error) {
 		}
 		f := strings.Split(line, "\t")
 		if len(f) < 4 {
-			return Result{}, fmt.Errorf("dpkg-query line has %d fields, want 4: %q\n"+
+			return AptInventory{}, fmt.Errorf("dpkg-query line has %d fields, want 4: %q\n"+
 				"expected the format bodega asks for: dpkg-query -W -f='${Package}\\t${Version}\\t${Architecture}\\t${Status}\\n'", len(f), line)
 		}
-		name, version, status := f[0], f[1], f[3]
+		name, version, arch, status := f[0], f[1], f[2], f[3]
 		if status != dpkgInstalled {
 			skipped++
 			continue
@@ -62,16 +101,16 @@ func parseDpkgQuery(text string) (Result, error) {
 		if name == "" || version == "" {
 			continue
 		}
-		res.Packages = append(res.Packages, pkg(manifest.TypeApt, name, version, "", ""))
+		res.Rows = append(res.Rows, AptRow{Name: name, Version: version, Arch: arch})
 	}
 	if err := sc.Err(); err != nil {
-		return Result{}, fmt.Errorf("scan dpkg-query output: %w", err)
+		return AptInventory{}, fmt.Errorf("scan dpkg-query output: %w", err)
 	}
 	if skipped > 0 {
 		res.Warnings = append(res.Warnings, fmt.Sprintf(
 			"skipped %d package(s) present in the dpkg database but not installed (removed, config files retained)", skipped))
 	}
-	sortPackages(res.Packages)
+	sortRows(res.Rows)
 	return res, nil
 }
 
@@ -82,8 +121,8 @@ func parseDpkgQuery(text string) (Result, error) {
 // The leading "Listing..." line and any apt warning are skipped. The bracketed
 // markers are read only to confirm the package is installed: bodega imports
 // the whole closure, so [installed,automatic] is kept alongside [installed].
-func parseAptList(text string) (Result, error) {
-	var res Result
+func parseAptList(text string) (AptInventory, error) {
+	var res AptInventory
 	sc := bufio.NewScanner(strings.NewReader(text))
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
@@ -102,14 +141,32 @@ func parseAptList(text string) (Result, error) {
 			continue
 		}
 		version := rest[1]
+		var arch string
+		if len(rest) >= 3 {
+			arch = rest[2]
+		}
 		if !strings.Contains(line, "[installed") && !strings.Contains(line, "[upgradable") {
 			continue
 		}
-		res.Packages = append(res.Packages, pkg(manifest.TypeApt, name, version, "", ""))
+		res.Rows = append(res.Rows, AptRow{Name: name, Version: version, Arch: arch})
 	}
 	if err := sc.Err(); err != nil {
-		return Result{}, fmt.Errorf("scan apt list output: %w", err)
+		return AptInventory{}, fmt.Errorf("scan apt list output: %w", err)
 	}
-	sortPackages(res.Packages)
+	sortRows(res.Rows)
 	return res, nil
+}
+
+// sortRows orders by name, then architecture, for the same reason
+// sortPackages does: an operator diffs one run against the last, and map or
+// input order would make every line look changed. Two rows can share a name on
+// a multi-arch host, where amd64 and i386 builds of one library are both
+// installed.
+func sortRows(rows []AptRow) {
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Name != rows[j].Name {
+			return rows[i].Name < rows[j].Name
+		}
+		return rows[i].Arch < rows[j].Arch
+	})
 }
