@@ -398,8 +398,16 @@ async function load() {
     if (status.version) {
       document.getElementById('wordmark').title = 'bodega ' + status.version;
     }
+    // The header reports what the server serves and never the filtered view.
+    // It is written once, here, while the filter box re-runs render() on every
+    // keystroke; counting matches instead would make it jump while an operator
+    // types. Two quantities, both named, because entry_count counts packages
+    // and every group below counts versions.
+    const packages = Object.values(status.entry_count || {}).reduce((a,b) => a+b, 0);
+    const versions = treeEntryTotal();
     document.getElementById('status-text').textContent =
-      Object.values(status.entry_count || {}).reduce((a,b) => a+b, 0) + ' packages';
+      packages + (packages === 1 ? ' package, ' : ' packages, ') +
+      versions + (versions === 1 ? ' version' : ' versions');
   } catch(e) {
     document.getElementById('status-text').textContent = 'error loading';
   }
@@ -423,6 +431,16 @@ function entriesForType(type) {
     }
   }
   return entries;
+}
+
+// treeEntryTotal is the header's version count, defined as what the tree
+// lists rather than computed a second way: entriesForType decides what a group
+// renders, and summing it over the same keys renderTypes produces makes the
+// header's total the sum of the group counts by construction. A separate loop
+// applying the version rule again is the drift this replaces.
+function treeEntryTotal() {
+  return renderTypes(Object.keys(allData || {}))
+    .reduce((n, type) => n + entriesForType(type).length, 0);
 }
 
 function entryVersion(type, e) {
