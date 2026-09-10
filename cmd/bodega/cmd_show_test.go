@@ -185,9 +185,10 @@ func TestShowVersionListDisplaysOrigins(t *testing.T) {
 	}
 }
 
-// The repo view renders what a client may see. An internal hostname is not
-// that, so `show repo` withholds the column `show pkg` prints.
-func TestShowVersionListWithholdsOriginsFromTheRepoView(t *testing.T) {
+// The repo table renders what a client may see. An internal hostname is not
+// that, so it withholds the column `show pkg` prints. The --json form of the
+// same command is a manifest dump and still carries the key.
+func TestShowVersionListWithholdsOriginsFromTheRepoTable(t *testing.T) {
 	store := showStore(t, manifest.TypePypi, "requests",
 		manifest.VersionEntry{Version: "2.31.0", Metadata: map[string]string{admit.MetaOrigin: "db01"}})
 

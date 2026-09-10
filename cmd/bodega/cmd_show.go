@@ -266,10 +266,10 @@ func showVersionList(ctx context.Context, store *manifest.Store, typ, name strin
 	}
 	fmt.Println()
 
-	// ORIGIN is on the admin table only. The repo view renders what a client
-	// may see, and an origin is an internal hostname: the catalog's answer to
-	// "which machine contributed this row" is for the operator, not for the
-	// consumer of the repository.
+	// ORIGIN is on the admin table only. The repo table renders what a client
+	// may see, and an origin is an internal hostname. Its --json sibling still
+	// carries the key: that output is a manifest dump, and it already emits
+	// _pool_path and every other internal metadata key for the same reason.
 	if admin {
 		fmt.Printf("%-12s %-15s %-6s %-8s %-8s %-10s %-11s %-10s %s\n",
 			"VERSION", "PLATFORM", "STORED", "FROZEN", "HIDDEN", "CONSTRAINT", "OSV", "CHECKED", "ORIGIN")
@@ -501,7 +501,8 @@ func printVersionDetail(pm *manifest.PackageManifest, ve manifest.VersionEntry, 
 	keys := make([]string, 0, len(ve.Metadata))
 	for k := range ve.Metadata {
 		// Description-Full is too long for the block; origin has its own line
-		// above, which the repo view withholds on purpose.
+		// above, which the repo view withholds on purpose. Printing it here
+		// would put it back and repeat it for an admin.
 		if k != "Description-Full" && k != admit.MetaOrigin {
 			keys = append(keys, k)
 		}

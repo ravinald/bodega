@@ -346,7 +346,7 @@ bodega pkg convert apt --origin db01 db01-installed.txt \
   | bodega pkg import --server https://bodega.example --merge -
 ```
 
-`bodega show pkg apt <name>` prints an `ORIGIN` column naming the hosts behind each version, and `bodega pkg export` carries the field, so a catalog stays attributable across a migration between instances. `bodega show repo` withholds it: an origin is an internal hostname, and the repo view renders what a client may see.
+`bodega show pkg apt <name>` prints an `ORIGIN` column naming the hosts behind each version, and `bodega pkg export` carries the field, so a catalog stays attributable across a migration between instances. The `bodega show repo` table withholds it: an origin is an internal hostname, and that view renders what a client may see. `bodega show repo <type> <name> json` still carries the key, as it does `_pool_path` and every other internal metadata key — that output is a manifest dump, not the client-facing rendering.
 
 **A catalog is an inventory, not a repository.** Importing one records what a host has; it does not make bodega able to serve those packages, and pointing the host's `sources.list` at bodega after this step gets an empty index. The two are separate on purpose — the catalog is what `bodega status`, `bodega policy` and the discovery residue read — but the order to do them in is the other way round from the way the request usually arrives. Serve first, catalog second:
 
