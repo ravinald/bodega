@@ -8,6 +8,16 @@ import (
 	"testing"
 )
 
+// scratchHome is a home directory with helm's two path overrides cleared, so
+// a developer who exports HELM_REPOSITORY_CONFIG or XDG_CONFIG_HOME does not
+// send a test write outside the scratch tree.
+func scratchHome(t *testing.T) string {
+	t.Helper()
+	t.Setenv("HELM_REPOSITORY_CONFIG", "")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	return t.TempDir()
+}
+
 func testBase(t *testing.T) *url.URL {
 	t.Helper()
 	u, err := url.Parse("https://bodega.internal")
@@ -45,7 +55,7 @@ func writeAll(t *testing.T, home, token string) map[string]string {
 // ~/.netrc, and writing four copies of one secret would be four things to
 // rotate.
 func TestEveryClientHasACredentialTarget(t *testing.T) {
-	home := t.TempDir()
+	home := scratchHome(t)
 	targets := CredentialTargets(home)
 
 	want := []string{"apt", "pip", "npm", "gomod", "cargo", "helm", "git", "binary"}
@@ -107,7 +117,7 @@ func TestEveryClientHasACredentialTarget(t *testing.T) {
 	if !strings.Contains(cargo, "[registries.bodega]") || strings.Contains(cargo, "Bearer") {
 		t.Fatalf("cargo credentials are not a bare registry token:\n%s", cargo)
 	}
-	helm := files[filepath.Join(home, ".config", "helm", "repositories.yaml")]
+	helm := files[targetFor(t, home, "helm").Path]
 	if !strings.Contains(helm, "username: bodega") || !strings.Contains(helm, "password: "+tok) {
 		t.Fatalf("helm repositories.yaml carries no credential:\n%s", helm)
 	}
@@ -117,7 +127,7 @@ func TestEveryClientHasACredentialTarget(t *testing.T) {
 // block, not stack another one, and it must leave what the operator wrote
 // alone.
 func TestWriteCredentialIsIdempotentAndPreservesOperatorContent(t *testing.T) {
-	home := t.TempDir()
+	home := scratchHome(t)
 	const operator = "//registry.internal/:_authToken=someone-elses\n"
 	npmrc := filepath.Join(home, ".npmrc")
 	if err := os.WriteFile(npmrc, []byte(operator), 0o600); err != nil {
@@ -154,12 +164,12 @@ func TestWriteCredentialIsIdempotentAndPreservesOperatorContent(t *testing.T) {
 // helm's file is the one where appending is not always legal. Refusing beats
 // writing a repository entry into whatever key happened to follow.
 func TestHelmRefusesAFileItWouldCorrupt(t *testing.T) {
-	home := t.TempDir()
-	path := filepath.Join(home, ".config", "helm", "repositories.yaml")
+	home := scratchHome(t)
+	target := targetFor(t, home, "helm")
+	path := target.Path
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	target := targetFor(t, home, "helm")
 
 	t.Run("repositories last", func(t *testing.T) {
 		if err := os.WriteFile(path, []byte("apiVersion: \"\"\nrepositories:\n- name: other\n  url: https://x\n"), 0o600); err != nil {
@@ -209,7 +219,7 @@ func targetFor(t *testing.T, home, client string) CredentialTarget {
 // encodes the shape a repository entry can live in, and a bare sequence fails
 // it for the same reason helm's parser does.
 func TestHelmCreatesAParseableDocument(t *testing.T) {
-	home := t.TempDir()
+	home := scratchHome(t)
 	target := targetFor(t, home, "helm")
 	if changed, err := WriteCredential(target, testBase(t), "tok"); err != nil || !changed {
 		t.Fatalf("create: changed=%v err=%v", changed, err)
@@ -250,5 +260,153 @@ func TestHelmCreatesAParseableDocument(t *testing.T) {
 	}
 	if err := helmAppendable(rotated); err != nil {
 		t.Fatalf("rotation broke the shape: %v\n%s", err, rotated)
+	}
+}
+
+// Requirement 6, on the file the client left rather than the one bodega left.
+// cargo, helm and npm each rewrite their own configuration during ordinary use
+// and drop comments doing it, so the fence is gone by the second run. Anchoring
+// on the fence alone appended a second bodega entry holding the pre-rotation
+// token: cargo then refuses to parse the file at all, helm resolves charts
+// through the stale entry, npm accumulates dead credential lines.
+//
+// Each case starts from the shape that client's own serializer produces.
+func TestRotationSurvivesTheClientsOwnRewrite(t *testing.T) {
+	const old, fresh = "tok-old", "tok-fresh"
+
+	cases := []struct {
+		client string
+		// seed is the file as the client re-serialized it: no markers, an
+		// entry bodega owns holding the old token, operator content beside it.
+		seed string
+		// operator is content the rotation must not touch.
+		operator string
+		// entry counts what must appear exactly once afterwards.
+		entry string
+	}{
+		{
+			client: "cargo",
+			seed: "[registries.bodega]\ntoken = \"" + old + "\"\n\n" +
+				"[registry]\ntoken = \"crates-io-secret\"\n",
+			operator: "crates-io-secret",
+			entry:    "[registries.bodega]",
+		},
+		{
+			client: "helm",
+			seed: "apiVersion: \"\"\ngenerated: \"2026-01-01T00:00:00Z\"\nrepositories:\n" +
+				"- name: bitnami\n  url: https://charts.bitnami.com/bitnami\n" +
+				"- name: bodega\n  url: https://bodega.internal/helm\n  username: bodega\n  password: " + old + "\n",
+			operator: "name: bitnami",
+			entry:    "- name: bodega",
+		},
+		{
+			client:   "npm",
+			seed:     "//registry.internal/:_authToken=someone-elses\n//bodega.internal/npm/:_authToken=" + old + "\n",
+			operator: "//registry.internal/:_authToken=someone-elses",
+			entry:    "//bodega.internal/npm/:_authToken=",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.client, func(t *testing.T) {
+			home := scratchHome(t)
+			target := targetFor(t, home, tc.client)
+			if err := os.MkdirAll(filepath.Dir(target.Path), 0o700); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			if err := os.WriteFile(target.Path, []byte(tc.seed), 0o600); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+
+			if changed, err := WriteCredential(target, testBase(t), fresh); err != nil || !changed {
+				t.Fatalf("rotation: changed=%v err=%v", changed, err)
+			}
+			data, err := os.ReadFile(target.Path)
+			if err != nil {
+				t.Fatalf("read back: %v", err)
+			}
+			body := string(data)
+
+			if n := strings.Count(body, tc.entry); n != 1 {
+				t.Fatalf("%d %q entries after the rotation, want 1:\n%s", n, tc.entry, body)
+			}
+			if strings.Contains(body, old) {
+				t.Fatalf("the pre-rotation token is still in the file:\n%s", body)
+			}
+			if !strings.Contains(body, fresh) {
+				t.Fatalf("the new token did not land:\n%s", body)
+			}
+			if !strings.Contains(body, tc.operator) {
+				t.Fatalf("content bodega does not own did not survive:\n%s", body)
+			}
+			// A third run has a fence again and must still not stack.
+			if changed, err := WriteCredential(target, testBase(t), fresh); err != nil || changed {
+				t.Fatalf("third write with the same token: changed=%v err=%v; want no change", changed, err)
+			}
+		})
+	}
+
+	t.Run("helm still parses", func(t *testing.T) {
+		home := scratchHome(t)
+		target := targetFor(t, home, "helm")
+		if err := os.MkdirAll(filepath.Dir(target.Path), 0o700); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(target.Path, []byte(cases[1].seed), 0o600); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		if _, err := WriteCredential(target, testBase(t), fresh); err != nil {
+			t.Fatalf("rotation: %v", err)
+		}
+		data, _ := os.ReadFile(target.Path)
+		body := string(data)
+		if err := helmAppendable(body); err != nil {
+			t.Fatalf("the rotated file is one helm's parser would reject: %v\n%s", err, body)
+		}
+		if strings.Count(body, "apiVersion:") != 1 || strings.Count(body, "\nrepositories:\n") != 1 {
+			t.Fatalf("the rotation duplicated the document keys:\n%s", body)
+		}
+	})
+}
+
+// helm is the one target whose path is not the same on every platform, and
+// getting it wrong is silent: the credential lands in a file helm never opens
+// and doctor prints "written" over it.
+func TestHelmConfigPathFollowsHelm(t *testing.T) {
+	const home = "/home/op"
+	none := func(string) string { return "" }
+
+	cases := []struct {
+		name string
+		goos string
+		env  map[string]string
+		want string
+	}{
+		{name: "linux default", goos: "linux", want: "/home/op/.config/helm/repositories.yaml"},
+		{name: "darwin default", goos: "darwin", want: "/home/op/Library/Preferences/helm/repositories.yaml"},
+		{
+			name: "XDG beats the platform default",
+			goos: "darwin",
+			env:  map[string]string{"XDG_CONFIG_HOME": "/xdg"},
+			want: "/xdg/helm/repositories.yaml",
+		},
+		{
+			name: "HELM_REPOSITORY_CONFIG beats XDG",
+			goos: "linux",
+			env:  map[string]string{"XDG_CONFIG_HOME": "/xdg", "HELM_REPOSITORY_CONFIG": "/etc/helm/repos.yaml"},
+			want: "/etc/helm/repos.yaml",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := none
+			if tc.env != nil {
+				env = func(k string) string { return tc.env[k] }
+			}
+			if got := helmConfigPath(home, tc.goos, env); got != tc.want {
+				t.Fatalf("helmConfigPath(%s) = %q, want %q", tc.goos, got, tc.want)
+			}
+		})
 	}
 }

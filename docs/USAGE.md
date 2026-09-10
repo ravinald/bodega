@@ -733,7 +733,7 @@ bodega doctor --write-credentials --token bodega_ak_... --url https://bodega.int
 | `npm`    | `~/.npmrc`                         | `//host/npm/:_authToken=`              |
 | `gomod`  | `~/.netrc`                         | read for the `GOPROXY` host            |
 | `cargo`  | `~/.cargo/credentials.toml`        | `[registries.bodega] token`            |
-| `helm`   | `~/.config/helm/repositories.yaml` | `username` / `password` on the repo    |
+| `helm`   | helm's own config path (see below) | `username` / `password` on the repo    |
 | `git`    | `~/.netrc`                         | read through libcurl                   |
 | `binary` | `~/.netrc`                         | `curl --netrc`; wget reads it already  |
 
@@ -741,9 +741,9 @@ pip, go, git and curl/wget all read `~/.netrc`, so one host-scoped entry serves 
 
 apt gets a file to itself because its `machine` line carries the scheme, which plain netrc does not understand. Bare, apt matches the host and then declines: `Credentials for <host> match, but the protocol is not encrypted. Annotate with http:// to use.` — so an unannotated entry is inert on every plaintext deployment. `doctor` writes the scheme from `--url`, which also keeps the credential to the scheme bodega told clients to use rather than offering it on both. Verified against apt 2.8.3 on noble over `http` and `https`; the `#` fence is a comment to apt's parser and is skipped.
 
-Every write is fenced by a marker comment and replaced in place on a second run, so nothing an operator wrote in those files is touched and a rotation leaves no old token behind. The apt file needs root and the other four do not; a run as a normal user configures seven clients, names the one it could not, and exits 2.
+Every write is fenced by a marker comment and replaced in place on a second run, so nothing an operator wrote in those files is touched. The fence is not the only anchor, because bodega does not own these files: `cargo login`, `helm repo add` and `npm config set` each re-serialize the file and drop comments doing it, which takes the fence with them. So `doctor` also finds its own entry by the key that entry carries — cargo's `[registries.bodega]` table, the repository named `bodega`, the `//<host>/npm/:_authToken=` line — and replaces that, marker or no marker. What the second run guarantees is one bodega entry holding the new token, in a file its client still parses. Stacking a second entry is not cosmetic: cargo rejects a duplicate key and stops reading the file at all, taking the operator's crates.io token with it, and helm resolves a chart through the first matching entry, which would be the pre-rotation one. The apt file needs root and the other four do not; a run as a normal user configures seven clients, names the one it could not, and exits 2.
 
-helm's `repositories.yaml` is the one target where appending is not always legal. A file whose `repositories:` list is not last would take an appended entry into whatever key followed, so `doctor` refuses that file and prints the `helm repo add bodega <url> --username bodega --password <token>` line to run instead.
+helm's path is the one that is not the same everywhere: `doctor` resolves it the way helm does, `$HELM_REPOSITORY_CONFIG` first, then `$XDG_CONFIG_HOME/helm/repositories.yaml`, then the platform default, which is `~/Library/Preferences/helm/repositories.yaml` on macOS and `~/.config/helm/repositories.yaml` elsewhere. The table prints the path it resolved. `repositories.yaml` is also the one target where appending is not always legal. A file whose `repositories:` list is not last would take an appended entry into whatever key followed, so `doctor` refuses that file and prints the `helm repo add bodega <url> --username bodega --password <token>` line to run instead.
 
 Writing a credential changes what an audit row says, never what the host may fetch. It does change what the host may **write**, which is why `doctor` prints this before it touches a file:
 

@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -404,15 +406,19 @@ func cargoHeader(t *testing.T, file string) string {
 // helmHeader takes the username and password off the bodega repository entry
 // and sends them as Basic, which is what helm does with a repo that carries
 // credentials.
+//
+// First entry wins, not last: helm resolves a chart reference through the
+// first repository matching the name, so a file carrying two bodega entries
+// puts the older one on the wire.
 func helmHeader(t *testing.T, file string) string {
 	t.Helper()
 	var user, pass string
 	for _, line := range strings.Split(file, "\n") {
 		line = strings.TrimSpace(line)
-		if rest, ok := strings.CutPrefix(line, "username: "); ok {
+		if rest, ok := strings.CutPrefix(line, "username: "); ok && user == "" {
 			user = rest
 		}
-		if rest, ok := strings.CutPrefix(line, "password: "); ok {
+		if rest, ok := strings.CutPrefix(line, "password: "); ok && pass == "" {
 			pass = rest
 		}
 	}
@@ -420,4 +426,86 @@ func helmHeader(t *testing.T, file string) string {
 		t.Fatalf("no credential on the helm repository entry:\n%s", file)
 	}
 	return basicAuth(user, pass)
+}
+
+// The other half of that seam: what goes on the wire after a rotation, when
+// the file bodega rewrites is the one its client re-serialized rather than the
+// one bodega left. cargo, helm and npm all drop the marker comment when they
+// write their own configuration, so anchoring on the fence alone stacked a
+// second entry and the stale token was what the client sent.
+func TestRotatedCredentialIsWhatTheClientSends(t *testing.T) {
+	const stale, fresh = "bodega_ak_stale", "bodega_ak_fresh"
+	base, err := url.Parse("https://bodega.internal")
+	if err != nil {
+		t.Fatalf("parse base: %v", err)
+	}
+
+	cases := []struct {
+		client string
+		seed   string
+		read   func(*testing.T, string) string
+		form   credentialForm
+	}{
+		{
+			client: "cargo",
+			seed:   "[registries.bodega]\ntoken = \"" + stale + "\"\n\n[registry]\ntoken = \"crates-io\"\n",
+			read:   cargoHeader,
+			form:   formRaw,
+		},
+		{
+			client: "helm",
+			seed: "apiVersion: \"\"\ngenerated: \"2026-01-01T00:00:00Z\"\nrepositories:\n" +
+				"- name: bodega\n  url: https://bodega.internal/helm\n  username: bodega\n  password: " + stale + "\n" +
+				"- name: bitnami\n  url: https://charts.bitnami.com/bitnami\n",
+			read: helmHeader,
+			form: formBasic,
+		},
+		{
+			client: "npm",
+			seed:   "registry=https://registry.internal/\n//bodega.internal/npm/:_authToken=" + stale + "\n",
+			read:   npmHeader,
+			form:   formBearer,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.client, func(t *testing.T) {
+			t.Setenv("HELM_REPOSITORY_CONFIG", "")
+			t.Setenv("XDG_CONFIG_HOME", "")
+			home := t.TempDir()
+
+			var target host.CredentialTarget
+			for _, candidate := range host.CredentialTargets(home) {
+				if candidate.Client == tc.client {
+					target = candidate
+				}
+			}
+			if target.Client == "" {
+				t.Fatalf("no credential target for %q", tc.client)
+			}
+			if err := os.MkdirAll(filepath.Dir(target.Path), 0o700); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			if err := os.WriteFile(target.Path, []byte(tc.seed), 0o600); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			if _, err := host.WriteCredential(target, base, fresh); err != nil {
+				t.Fatalf("rotate: %v", err)
+			}
+			data, err := os.ReadFile(target.Path)
+			if err != nil {
+				t.Fatalf("read back: %v", err)
+			}
+
+			r := httptest.NewRequest(http.MethodGet, "/apt/dists/noble/Release", nil)
+			r.Header.Set("Authorization", tc.read(t, string(data)))
+			got, form := credentialFrom(r)
+			if got != fresh {
+				t.Fatalf("after rotation %s sends %q, not the new token:\n%s", tc.client, got, data)
+			}
+			if form != tc.form {
+				t.Fatalf("%s: credential form %v, want %v", tc.client, form, tc.form)
+			}
+		})
+	}
 }

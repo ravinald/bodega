@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -21,9 +22,19 @@ import (
 // rotate.
 
 // managedBegin and managedEnd fence what bodega owns inside a file it shares
-// with the operator. Rewriting the block in place is what makes a second
+// with the operator. Rewriting the block in place is what keeps a second
 // --write-credentials run idempotent instead of additive; nothing outside the
 // fence is read or altered.
+//
+// The fence is not the only anchor, because bodega does not own these files.
+// cargo, helm and npm each re-serialize their own configuration as part of
+// ordinary use (`cargo login`, `helm repo add`, `npm config set`) and drop
+// comments when they do, which takes the fence with it. A run that then
+// appended would leave two bodega entries, the first holding the pre-rotation
+// token: cargo rejects the whole file as a duplicate key, helm resolves charts
+// through the stale one and puts it on the wire, npm grows a dead line per
+// rotation. So each of those targets also carries an `owned` locator that
+// finds bodega's entry by its own key, marker or no marker. See CredentialTarget.
 //
 // Every format below takes `#` to end of line as a comment: netrc (apt's
 // parser and Go's both strip it, confirmed against apt 2.8.3 on noble), npm's
@@ -66,6 +77,13 @@ type CredentialTarget struct {
 	// line. Only helm, which unmarshals the whole file into a struct, needs
 	// keys around the entry before its parser will accept it.
 	createDoc func(block string) string
+
+	// owned returns existing with bodega's own entry removed, found by the
+	// key that entry carries rather than by the fence around it. Set on the
+	// three targets whose client rewrites the file and discards the fence;
+	// nil where nothing but bodega ever writes the entry, which is true of
+	// netrc (no client rewrites it) and of apt (whole, replaced every run).
+	owned func(existing string, base *url.URL) string
 }
 
 // CredentialTargets returns every target in a stable order, resolved against
@@ -97,6 +115,7 @@ func CredentialTargets(home string) []CredentialTarget {
 			Path:   filepath.Join(home, ".npmrc"),
 			Mode:   0o600,
 			body:   npmEntry,
+			owned:  npmOwned,
 		},
 		{
 			Client: "gomod",
@@ -110,15 +129,17 @@ func CredentialTargets(home string) []CredentialTarget {
 			Path:   filepath.Join(home, ".cargo", "credentials.toml"),
 			Mode:   0o600,
 			body:   cargoEntry,
+			owned:  cargoOwned,
 			Note:   "point cargo at the registry too: [registries.bodega] index = \"sparse+<base>/cargo/\" in config.toml",
 		},
 		{
 			Client:      "helm",
-			Path:        filepath.Join(home, ".config", "helm", "repositories.yaml"),
+			Path:        helmConfigPath(home, runtime.GOOS, os.Getenv),
 			Mode:        0o600,
 			body:        helmEntry,
 			appendGuard: helmAppendable,
 			createDoc:   helmDocument,
+			owned:       helmOwned,
 		},
 		{
 			Client: "git",
@@ -222,17 +243,32 @@ func WriteCredential(t CredentialTarget, base *url.URL, token string) (bool, err
 	case t.whole || existing == "":
 		next = t.Render(base, token)
 	default:
-		if t.appendGuard != nil && !strings.Contains(existing, managedBegin) {
-			// Only an append can land in the wrong place. Replacing a block
-			// already in the file puts it back exactly where it was.
-			if err := t.appendGuard(existing); err != nil {
+		before, after, fenced, err := cutManaged(existing)
+		if err != nil {
+			return false, fmt.Errorf("%s: %s: %w", t.Client, t.Path, err)
+		}
+		// Anything bodega left behind that the client's own rewrite carried
+		// out of the fence goes too, on both sides of where the fence was.
+		// Removing it before the block is placed is what makes the second run
+		// a rotation rather than a second credential.
+		if t.owned != nil {
+			before, after = t.owned(before, base), t.owned(after, base)
+		}
+		if fenced {
+			// Replacing a block already in the file puts it back exactly
+			// where it was, so only the append below can land in a bad place.
+			next = before + block + after
+			break
+		}
+		if t.appendGuard != nil {
+			if err := t.appendGuard(before); err != nil {
 				return false, fmt.Errorf("%s: %s: %w", t.Client, t.Path, err)
 			}
 		}
-		var err error
-		if next, err = spliceManaged(existing, block); err != nil {
-			return false, fmt.Errorf("%s: %s: %w", t.Client, t.Path, err)
+		if before != "" && !strings.HasSuffix(before, "\n") {
+			before += "\n"
 		}
+		next = before + block
 	}
 	if next == existing {
 		return false, nil
@@ -251,29 +287,26 @@ func WriteCredential(t CredentialTarget, base *url.URL, token string) (bool, err
 	return true, nil
 }
 
-// spliceManaged replaces the fenced block in existing, or appends it. An
-// unterminated begin marker is an error rather than something to guess at:
-// appending past it would nest one block inside another and the next run would
-// replace both.
-func spliceManaged(existing, block string) (string, error) {
+// cutManaged splits existing around the fenced block and reports whether one
+// was there. An unterminated begin marker is an error rather than something to
+// guess at: writing past it would nest one block inside another and the next
+// run would replace both.
+func cutManaged(existing string) (before, after string, found bool, err error) {
 	start := strings.Index(existing, managedBegin)
 	if start < 0 {
-		if !strings.HasSuffix(existing, "\n") {
-			existing += "\n"
-		}
-		return existing + block, nil
+		return existing, "", false, nil
 	}
 	rest := existing[start:]
 	end := strings.Index(rest, managedEnd)
 	if end < 0 {
-		return "", fmt.Errorf("has a %q line with no %q after it; remove the partial block and run again",
+		return "", "", false, fmt.Errorf("has a %q line with no %q after it; remove the partial block and run again",
 			managedBegin, managedEnd)
 	}
 	end += len(managedEnd)
 	if strings.HasPrefix(rest[end:], "\n") {
 		end++
 	}
-	return existing[:start] + block + rest[end:], nil
+	return existing[:start], rest[end:], true, nil
 }
 
 // helmDocument is the repositories.yaml bodega writes when the host has none.
@@ -314,4 +347,106 @@ func helmAppendable(existing string) error {
 			"run helm repo add bodega <url> --username bodega --password <token> instead", strings.TrimSpace(l))
 	}
 	return nil
+}
+
+// helmConfigPath resolves repositories.yaml the way helm resolves it. It is
+// the one target here whose location is not the same everywhere: helm reads
+// $HELM_REPOSITORY_CONFIG first, then XDG, and its per-platform default is
+// ~/Library/Preferences/helm on macOS rather than ~/.config/helm. Writing the
+// Linux path on a Mac lands the credential in a file helm never opens, and
+// doctor prints "written" over it.
+//
+// goos and env are parameters so a test can drive every platform from one.
+func helmConfigPath(home, goos string, env func(string) string) string {
+	if p := env("HELM_REPOSITORY_CONFIG"); p != "" {
+		return p
+	}
+	if p := env("XDG_CONFIG_HOME"); p != "" {
+		return filepath.Join(p, "helm", "repositories.yaml")
+	}
+	if goos == "darwin" {
+		return filepath.Join(home, "Library", "Preferences", "helm", "repositories.yaml")
+	}
+	return filepath.Join(home, ".config", "helm", "repositories.yaml")
+}
+
+// npmOwned drops the _authToken line bodega wrote for this registry path.
+// npm's ini is last-wins, so a stacked duplicate is inert rather than wrong,
+// but it is still a live credential sitting in a file after its rotation.
+func npmOwned(existing string, base *url.URL) string {
+	key := fmt.Sprintf("//%s/npm/:_authToken=", base.Host)
+	return keepLines(existing, func(line string) bool {
+		return !strings.HasPrefix(strings.TrimSpace(line), key)
+	})
+}
+
+// cargoOwned drops an existing [registries.bodega] table and everything under
+// it, up to the next table header. A second one is not a stale entry cargo
+// ignores: it is a duplicate key, and cargo refuses to parse the file at all,
+// taking the operator's unrelated crates.io token down with it.
+func cargoOwned(existing string, _ *url.URL) string {
+	skipping := false
+	return keepLines(existing, func(line string) bool {
+		if trimmed := strings.TrimSpace(line); strings.HasPrefix(trimmed, "[") {
+			skipping = trimmed == "[registries.bodega]"
+		}
+		return !skipping
+	})
+}
+
+// helmOwned drops the repository entry named bodega, wherever helm's own
+// serializer left it. helm resolves a chart reference through the first entry
+// matching the name, so a stale duplicate does not sit idle: it is the one
+// whose credential goes on the wire, and `helm repo update` fetches the index
+// once per copy.
+func helmOwned(existing string, _ *url.URL) string {
+	lines := strings.Split(existing, "\n")
+	out := make([]string, 0, len(lines))
+	for i := 0; i < len(lines); i++ {
+		if !strings.HasPrefix(strings.TrimSpace(lines[i]), "-") {
+			out = append(out, lines[i])
+			continue
+		}
+		end := i + 1
+		for indent := yamlIndent(lines[i]); end < len(lines); end++ {
+			if strings.TrimSpace(lines[end]) == "" || yamlIndent(lines[end]) <= indent {
+				break
+			}
+		}
+		if !helmEntryNamed(lines[i:end], "bodega") {
+			out = append(out, lines[i:end]...)
+		}
+		i = end - 1
+	}
+	return strings.Join(out, "\n")
+}
+
+func yamlIndent(line string) int {
+	return len(line) - len(strings.TrimLeft(line, " "))
+}
+
+// helmEntryNamed reports whether a repositories list item carries name: want,
+// on either the item's own dash line or a line under it.
+func helmEntryNamed(item []string, want string) bool {
+	for _, l := range item {
+		field := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(l), "-"))
+		name, ok := strings.CutPrefix(field, "name:")
+		if ok && strings.Trim(strings.TrimSpace(name), `"'`) == want {
+			return true
+		}
+	}
+	return false
+}
+
+// keepLines returns existing with every line keep rejects removed, preserving
+// whether the input ended in a newline.
+func keepLines(existing string, keep func(line string) bool) string {
+	lines := strings.Split(existing, "\n")
+	out := make([]string, 0, len(lines))
+	for _, l := range lines {
+		if keep(l) {
+			out = append(out, l)
+		}
+	}
+	return strings.Join(out, "\n")
 }
