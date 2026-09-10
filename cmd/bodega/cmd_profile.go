@@ -211,7 +211,7 @@ func writeBaseline(gf *globalFlags, name, description, origin, out string, pins 
 	}
 	sort.Slice(doc.Types, func(i, j int) bool { return doc.Types[i].Type < doc.Types[j].Type })
 
-	pinned, err := applyBaselinePins(doc, found, pins)
+	pinned, err := applyBaselinePins(doc, found, pins, out)
 	if err != nil {
 		return err
 	}
@@ -233,7 +233,7 @@ func writeBaseline(gf *globalFlags, name, description, origin, out string, pins 
 // package the host reports at more than one version. Choosing between them
 // here would invent a rule the operator did not state, and the version they
 // meant is the one thing a pin has to get right.
-func applyBaselinePins(doc *profileDoc, found []originPackage, pins []string) (int, error) {
+func applyBaselinePins(doc *profileDoc, found []originPackage, pins []string, out string) (int, error) {
 	if len(pins) == 0 {
 		return 0, nil
 	}
@@ -246,8 +246,9 @@ func applyBaselinePins(doc *profileDoc, found []originPackage, pins []string) (i
 		p, ok := byName[pin]
 		if !ok {
 			return 0, fmt.Errorf("--pin %s: the baseline holds no package by that name.\n"+
-				"  It lists what %s was cataloged with; check the spelling against 'bodega profile create %s --from-origin %s --out -'",
-				pin, doc.Origin, doc.Name, doc.Origin)
+				"  It lists what %s was cataloged with:  bodega show pkg <type> %s\n"+
+				"  Or write it without --pin and read the names out of the file:  bodega profile create %s --from-origin %s --out %s",
+				pin, doc.Origin, pin, doc.Name, doc.Origin, out)
 		}
 		if len(p.Versions) != 1 {
 			return 0, fmt.Errorf("--pin %s: %s is cataloged from %s at %d versions (%s), so a pin here would pick one for you.\n"+
@@ -314,6 +315,9 @@ func requireBaselineFile(path, flag string) error {
 // createFromDoc writes a whole document: the profile, its markers, its
 // entries. Every write is one audit event naming the profile.
 func createFromDoc(gf *globalFlags, doc *profileDoc, force bool) error {
+	if err := validateDoc(doc); err != nil {
+		return err
+	}
 	if err := checkClosedAndEmpty(doc, force); err != nil {
 		return err
 	}
@@ -325,36 +329,61 @@ func createFromDoc(gf *globalFlags, doc *profileDoc, force bool) error {
 	defer adb.Close()
 
 	actor := audit.CurrentActor()
-	if err := adb.CreateProfile(ctx, audit.Profile{
+	types := make([]audit.ProfileTypeRule, 0, len(doc.Types))
+	for _, t := range doc.Types {
+		types = append(types, audit.ProfileTypeRule{
+			Profile: doc.Name, Type: t.Type, Membership: t.Membership,
+			VersionDefault: t.VersionDefault, Actor: actor,
+		})
+	}
+	entries := make([]audit.ProfileEntry, 0, len(doc.Entries))
+	for _, e := range doc.Entries {
+		entries = append(entries, audit.ProfileEntry{
+			Profile: doc.Name, Type: e.Type, Name: e.Name, Constraint: e.Constraint,
+			Version: e.Version, Origin: e.Origin, Reason: e.Reason,
+			ReviewAfter: e.ReviewAfter, Actor: actor,
+		})
+	}
+	if err := adb.CreateProfileWith(ctx, audit.Profile{
 		Name: doc.Name, Description: doc.Description, Actor: actor,
-	}); err != nil {
+	}, types, entries); err != nil {
 		return err
 	}
 	recordProfileEvent(ctx, adb, audit.EventCreate, doc.Name, "",
 		fmt.Sprintf("types=%d entries=%d origin=%s", len(doc.Types), len(doc.Entries), doc.Origin))
 
-	for _, t := range doc.Types {
-		if err := adb.SetProfileTypeRule(ctx, audit.ProfileTypeRule{
-			Profile: doc.Name, Type: t.Type, Membership: t.Membership,
-			VersionDefault: t.VersionDefault, Actor: actor,
-		}); err != nil {
-			return fmt.Errorf("%s: %w", t.Type, err)
-		}
-	}
-	for _, e := range doc.Entries {
-		if _, err := adb.PutProfileEntry(ctx, audit.ProfileEntry{
-			Profile: doc.Name, Type: e.Type, Name: e.Name, Constraint: e.Constraint,
-			Version: e.Version, Origin: e.Origin, Reason: e.Reason,
-			ReviewAfter: e.ReviewAfter, Actor: actor,
-		}); err != nil {
-			return fmt.Errorf("%s/%s: %w", e.Type, e.Name, err)
-		}
-	}
 	fmt.Printf("Created profile %s: %d type rule(s), %d entr%s.\n",
 		doc.Name, len(doc.Types), len(doc.Entries), plural(len(doc.Entries), "y", "ies"))
 	if len(doc.Types) == 0 {
 		fmt.Printf("It states no rule for any type yet, so it permits everything.\n"+
 			"  bodega profile set %s apt --membership closed --version-default floating\n", doc.Name)
+	}
+	return nil
+}
+
+// validateDoc runs the whole document through the checks the interactive
+// verbs make, before the first row is written.
+//
+// The hand-edited file is the path --from-origin makes mandatory, so it is
+// where a typo is most likely and it earns the strictest reading rather than
+// the loosest: a marker under a type bodega does not serve governs nothing,
+// and the type the operator meant stays open with nothing reporting it.
+func validateDoc(doc *profileDoc) error {
+	for i, t := range doc.Types {
+		if err := requirePackageType(t.Type); err != nil {
+			return fmt.Errorf("types[%d]: %w", i, err)
+		}
+	}
+	for i, e := range doc.Entries {
+		if err := requirePackageType(e.Type); err != nil {
+			return fmt.Errorf("entries[%d]: %w", i, err)
+		}
+		if strings.TrimSpace(e.Name) == "" {
+			return fmt.Errorf("entries[%d]: an entry needs a package name", i)
+		}
+		if err := requireConstraintVersion(e.Constraint, e.Version); err != nil {
+			return fmt.Errorf("entries[%d] (%s/%s): %w", i, e.Type, e.Name, err)
+		}
 	}
 	return nil
 }
@@ -734,16 +763,17 @@ this package alone, in either direction:
   --constraint compatible --version 5.2   same major, at or above 5.2
   --constraint patch --version 1.26.4     same major.minor, at or above 1.26.4
 
-Adding an entry that already exists replaces it, because changing the version
-a package is held at is the ordinary edit and a remove-then-add loses the
-reason in the gap. 'bodega profile pin' is this command with the pinning
-arguments already filled in.`,
+Adding an entry that already exists edits it: every flag you give is written
+and every field you leave out keeps what it held, so changing the version a
+package is held at does not drop the reason it was held for. Clearing a
+constraint is 'bodega profile unpin'. 'bodega profile pin' is this command
+with the pinning arguments already filled in.`,
 		Args: cobra.ExactArgs(3),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return putProfileEntry(gf, args[0], args[1], args[2], audit.ProfileEntry{
 				Constraint: constraint, Version: version, Reason: reason,
 				ReviewAfter: reviewAfter, Origin: origin,
-			})
+			}, changedFlags(cmd, "constraint", "version", "reason", "review-after", "origin"))
 		},
 	}
 	c.Flags().StringVar(&constraint, "constraint", "", "exact | compatible | patch | any; empty defers to the type's version default")
@@ -773,10 +803,12 @@ current on.`,
 					"cannot tell a deliberate hold from an accident, so it is never lifted.\n" +
 					"  bodega profile pin <profile> <type> <name> <version> --reason \"15 breaks the config\"")
 			}
+			supplied := changedFlags(cmd, "review-after")
+			supplied["constraint"], supplied["version"], supplied["reason"] = true, true, true
 			return putProfileEntry(gf, args[0], args[1], args[2], audit.ProfileEntry{
 				Constraint: manifest.ConstraintExact, Version: args[3],
 				Reason: reason, ReviewAfter: reviewAfter,
-			})
+			}, supplied)
 		},
 	}
 	c.Flags().StringVar(&reason, "reason", "", "Why this version is held (required)")
@@ -831,13 +863,18 @@ type that is a different decision: the package stops being permitted at all.`,
 	}
 }
 
-// putProfileEntry is the one write behind add and pin.
-func putProfileEntry(gf *globalFlags, profile, typ, name string, e audit.ProfileEntry) error {
+// putProfileEntry is the one write behind add and pin. supplied names the
+// fields the operator gave; everything else is carried over from the stored
+// entry, so a second `add` edits rather than replaces.
+//
+// The alternative, writing whatever the flags hold, means a bare `add` on a
+// pinned package erases the pin, its reason and its review date in one
+// command with nothing said about it. `unpin` is the deliberate path and it
+// preserves all three, so replace-on-add destroys more by accident than the
+// verb written to do it destroys on purpose.
+func putProfileEntry(gf *globalFlags, profile, typ, name string, e audit.ProfileEntry, supplied map[string]bool) error {
 	if err := requirePackageType(typ); err != nil {
 		return err
-	}
-	if e.Constraint != "" && e.Constraint != manifest.ConstraintAny && e.Version == "" {
-		return fmt.Errorf("constraint %s is measured against a version and none was given: --version <v>", e.Constraint)
 	}
 	ctx := backgroundCtx()
 	adb, err := openProfileStore(gf)
@@ -845,6 +882,19 @@ func putProfileEntry(gf *globalFlags, profile, typ, name string, e audit.Profile
 		return err
 	}
 	defer adb.Close()
+
+	d, err := adb.GetProfile(ctx, profile)
+	if err != nil {
+		return err
+	}
+	if i := slices.IndexFunc(d.Entries, func(x audit.ProfileEntry) bool {
+		return x.Type == typ && x.Name == name
+	}); i >= 0 {
+		e = mergeProfileEntry(d.Entries[i], e, supplied)
+	}
+	if err := requireConstraintVersion(e.Constraint, e.Version); err != nil {
+		return err
+	}
 
 	e.Profile, e.Type, e.Name = profile, typ, name
 	e.Actor = audit.CurrentActor()
@@ -865,6 +915,47 @@ func putProfileEntry(gf *globalFlags, profile, typ, name string, e audit.Profile
 	}
 	fmt.Printf("%s %s/%s in %s%s.\n", verb, typ, name, profile, constraintSuffix(e))
 	return nil
+}
+
+// changedFlags reports which of names the operator actually gave, which is
+// what separates "set this to empty" from "leave this alone".
+func changedFlags(cmd *cobra.Command, names ...string) map[string]bool {
+	out := make(map[string]bool, len(names))
+	for _, n := range names {
+		out[n] = cmd.Flags().Changed(n)
+	}
+	return out
+}
+
+// mergeProfileEntry overwrites only the fields supplied names, leaving the
+// stored value for the rest.
+func mergeProfileEntry(stored, e audit.ProfileEntry, supplied map[string]bool) audit.ProfileEntry {
+	out := stored
+	if supplied["constraint"] {
+		out.Constraint = e.Constraint
+	}
+	if supplied["version"] {
+		out.Version = e.Version
+	}
+	if supplied["reason"] {
+		out.Reason = e.Reason
+	}
+	if supplied["review-after"] {
+		out.ReviewAfter = e.ReviewAfter
+	}
+	if supplied["origin"] {
+		out.Origin = e.Origin
+	}
+	return out
+}
+
+// requireConstraintVersion refuses a constraint with nothing to measure. It is
+// the same rule for a flag and for a line in a baseline file.
+func requireConstraintVersion(kind, version string) error {
+	if kind == "" || kind == manifest.ConstraintAny || version != "" {
+		return nil
+	}
+	return fmt.Errorf("constraint %s is measured against a version and none was given: --version <v>", kind)
 }
 
 func constraintSuffix(e audit.ProfileEntry) string {

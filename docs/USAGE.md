@@ -787,7 +787,7 @@ bodega profile add web gomod k8s   --constraint compatible --version 5.2.0
 bodega profile add web pypi numpy  --constraint patch --version 1.26.4
 ```
 
-With no `--constraint` the entry defers to its type's version default. Adding an entry that already exists replaces it, because changing the version a package is held at is the ordinary edit and a remove-then-add loses the reason in the gap.
+With no `--constraint` the entry defers to its type's version default. Adding an entry that already exists edits it: every flag you give is written and every field you leave out keeps what it held, because changing the version a package is held at is the ordinary edit and a remove-then-add loses the reason in the gap. A bare `bodega profile add web apt postgresql` on a pinned entry therefore changes nothing; clearing a constraint is `unpin`.
 
 `pin` is `add` with the pinning arguments filled in, and it **requires `--reason`**: a pin with no reason outlives the problem it was written for, and the next operator cannot tell a deliberate hold from an accident, so it is never lifted. `--review-after <YYYY-MM-DD>` gives it a date it stops looking current on; nothing enforces the date, `bodega profile show` prints it.
 
@@ -802,6 +802,8 @@ bodega profile create db --from-origin db01 --out db.json --pin postgresql
 $EDITOR db.json
 bodega profile create db --from-file db.json
 ```
+
+`--from-file` reads the whole document before it writes anything, through the same checks `add` and `set` make: a package type outside the eight, an entry with no name and a constraint with no version are each refused with the offending line named. The profile, its markers and its entries then land in one transaction. A document rejected halfway would otherwise leave a bindable profile holding a subset of what was authored, which is not a failed create but a working access control permitting less than anyone wrote.
 
 The round trip through a file is the review step, and `--out -` and `--from-file -` are both refused. A host's inventory holds its accidents alongside its requirements, and locking membership to it enshrines whatever was installed by hand at 03:00; a baseline piped straight from the command that produced it was never read by anyone.
 
@@ -838,9 +840,9 @@ bodega profile check db
 `check` is the CI gate and exits 1 on any violation, the same contract `bodega policy check` has. It asks whether each entry permits at least one version the catalog actually carries, so a pin the catalog dropped and a range constraint nothing satisfies are both caught:
 
 ```text
-$ bodega profile check
+$ bodega profile check db2
 PROFILE  TYPE  PACKAGE   REASON
-db       pypi  requests  pinned to 9.9.9, which the catalog does not carry
+db2      pypi  requests  exact 9.9.9 permits none of the cataloged versions (2.31.0)
 Error: 1 profile violation(s) detected
 ```
 

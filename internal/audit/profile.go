@@ -247,11 +247,8 @@ func (a *DB) profileEntries(ctx context.Context, profile string) ([]ProfileEntry
 
 // SetProfileTypeRule writes or replaces one type marker.
 func (a *DB) SetProfileTypeRule(ctx context.Context, r ProfileTypeRule) error {
-	if !ValidMembership(r.Membership) {
-		return fmt.Errorf("membership %q is not one of: %s", r.Membership, strings.Join(Memberships(), ", "))
-	}
-	if !ValidVersionDefault(r.VersionDefault) {
-		return fmt.Errorf("version default %q is not one of: %s", r.VersionDefault, strings.Join(VersionDefaults(), ", "))
+	if err := validateProfileTypeRule(r); err != nil {
+		return err
 	}
 	if err := a.requireProfile(ctx, r.Profile); err != nil {
 		return err
@@ -259,17 +256,18 @@ func (a *DB) SetProfileTypeRule(ctx context.Context, r ProfileTypeRule) error {
 	if a.readOnly {
 		return errors.New("audit db is read-only")
 	}
-	_, err := a.db.ExecContext(ctx,
-		`INSERT INTO profile_types (profile, pkg_type, membership, version_default, actor)
-		 VALUES (?, ?, ?, ?, ?)
-		 ON CONFLICT(profile, pkg_type) DO UPDATE SET
-		     membership = excluded.membership,
-		     version_default = excluded.version_default,
-		     actor = excluded.actor,
-		     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+	_, err := a.db.ExecContext(ctx, insertProfileTypeSQL,
 		r.Profile, r.Type, r.Membership, r.VersionDefault, r.Actor)
 	return err
 }
+
+const insertProfileTypeSQL = `INSERT INTO profile_types (profile, pkg_type, membership, version_default, actor)
+	 VALUES (?, ?, ?, ?, ?)
+	 ON CONFLICT(profile, pkg_type) DO UPDATE SET
+	     membership = excluded.membership,
+	     version_default = excluded.version_default,
+	     actor = excluded.actor,
+	     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`
 
 // PutProfileEntry writes or replaces one entry, reporting whether it was new.
 //
@@ -278,12 +276,8 @@ func (a *DB) SetProfileTypeRule(ctx context.Context, r ProfileTypeRule) error {
 // the reason and the review date in the gap.
 func (a *DB) PutProfileEntry(ctx context.Context, e ProfileEntry) (bool, error) {
 	e.Name = strings.TrimSpace(e.Name)
-	if e.Name == "" {
-		return false, errors.New("an entry needs a package name")
-	}
-	if e.Constraint != "" && !ValidProfileConstraint(e.Constraint) {
-		return false, fmt.Errorf("constraint %q is not one of: %s",
-			e.Constraint, strings.Join(ProfileConstraints(), ", "))
+	if err := validateProfileEntry(e); err != nil {
+		return false, err
 	}
 	if err := a.requireProfile(ctx, e.Profile); err != nil {
 		return false, err
@@ -297,23 +291,24 @@ func (a *DB) PutProfileEntry(ctx context.Context, e ProfileEntry) (bool, error) 
 		e.Profile, e.Type, e.Name).Scan(&existed); err != nil {
 		return false, err
 	}
-	_, err := a.db.ExecContext(ctx,
-		`INSERT INTO profile_entries
-		     (profile, pkg_type, pkg_name, constraint_kind, version, origin, reason, review_after, actor)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(profile, pkg_type, pkg_name) DO UPDATE SET
-		     constraint_kind = excluded.constraint_kind,
-		     version = excluded.version,
-		     origin = excluded.origin,
-		     reason = excluded.reason,
-		     review_after = excluded.review_after,
-		     actor = excluded.actor`,
+	_, err := a.db.ExecContext(ctx, insertProfileEntrySQL,
 		e.Profile, e.Type, e.Name, e.Constraint, e.Version, e.Origin, e.Reason, e.ReviewAfter, e.Actor)
 	if err != nil {
 		return false, err
 	}
 	return existed == 0, nil
 }
+
+const insertProfileEntrySQL = `INSERT INTO profile_entries
+	     (profile, pkg_type, pkg_name, constraint_kind, version, origin, reason, review_after, actor)
+	 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	 ON CONFLICT(profile, pkg_type, pkg_name) DO UPDATE SET
+	     constraint_kind = excluded.constraint_kind,
+	     version = excluded.version,
+	     origin = excluded.origin,
+	     reason = excluded.reason,
+	     review_after = excluded.review_after,
+	     actor = excluded.actor`
 
 // RemoveProfileEntry deletes one entry, reporting whether it was there.
 func (a *DB) RemoveProfileEntry(ctx context.Context, profile, typ, name string) (bool, error) {
@@ -419,6 +414,93 @@ func (a *DB) requireProfile(ctx context.Context, name string) error {
 	}
 	if n == 0 {
 		return fmt.Errorf("%w: %q", ErrNoProfile, name)
+	}
+	return nil
+}
+
+// CreateProfileWith writes a profile, its type markers and its entries in one
+// transaction.
+//
+// A document rejected partway would otherwise leave a bindable profile holding
+// a subset of what was authored, which is not a failed create: a closed type
+// listing three of seven packages is a working access control permitting less
+// than anyone wrote, under a name no verb here can reuse or remove. Same reason
+// SeedACL claims a list and fills it atomically.
+func (a *DB) CreateProfileWith(ctx context.Context, p Profile, types []ProfileTypeRule, entries []ProfileEntry) error {
+	p.Name = strings.TrimSpace(p.Name)
+	if err := validateProfileName(p.Name); err != nil {
+		return err
+	}
+	for _, r := range types {
+		if err := validateProfileTypeRule(r); err != nil {
+			return fmt.Errorf("%s: %w", r.Type, err)
+		}
+	}
+	for i := range entries {
+		entries[i].Name = strings.TrimSpace(entries[i].Name)
+		if err := validateProfileEntry(entries[i]); err != nil {
+			return fmt.Errorf("%s/%s: %w", entries[i].Type, entries[i].Name, err)
+		}
+	}
+	if a.readOnly {
+		return errors.New("audit db is read-only")
+	}
+
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx,
+		`INSERT OR IGNORE INTO profiles (name, description, actor) VALUES (?, ?, ?)`,
+		p.Name, p.Description, p.Actor)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("%w: %q", ErrProfileExists, p.Name)
+	}
+	for _, r := range types {
+		if _, err := tx.ExecContext(ctx, insertProfileTypeSQL,
+			p.Name, r.Type, r.Membership, r.VersionDefault, r.Actor); err != nil {
+			return fmt.Errorf("%s: %w", r.Type, err)
+		}
+	}
+	for _, e := range entries {
+		if _, err := tx.ExecContext(ctx, insertProfileEntrySQL,
+			p.Name, e.Type, e.Name, e.Constraint, e.Version, e.Origin,
+			e.Reason, e.ReviewAfter, e.Actor); err != nil {
+			return fmt.Errorf("%s/%s: %w", e.Type, e.Name, err)
+		}
+	}
+	return tx.Commit()
+}
+
+// validateProfileTypeRule and validateProfileEntry hold the checks the single-
+// row writers make, so the whole-document path can run them before the first
+// write rather than discovering the third one halfway through.
+func validateProfileTypeRule(r ProfileTypeRule) error {
+	if !ValidMembership(r.Membership) {
+		return fmt.Errorf("membership %q is not one of: %s", r.Membership, strings.Join(Memberships(), ", "))
+	}
+	if !ValidVersionDefault(r.VersionDefault) {
+		return fmt.Errorf("version default %q is not one of: %s", r.VersionDefault, strings.Join(VersionDefaults(), ", "))
+	}
+	return nil
+}
+
+func validateProfileEntry(e ProfileEntry) error {
+	if strings.TrimSpace(e.Name) == "" {
+		return errors.New("an entry needs a package name")
+	}
+	if e.Constraint != "" && !ValidProfileConstraint(e.Constraint) {
+		return fmt.Errorf("constraint %q is not one of: %s",
+			e.Constraint, strings.Join(ProfileConstraints(), ", "))
 	}
 	return nil
 }

@@ -404,3 +404,131 @@ func TestProfileRefusesAnUnknownPackageType(t *testing.T) {
 		t.Fatal("a marker for a type bodega does not serve was accepted")
 	}
 }
+
+// writeDoc puts a baseline on disk the way an operator's editor leaves it.
+func writeDoc(t *testing.T, dir, name, body string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+	return path
+}
+
+// A document rejected partway leaves nothing behind. Half of a closed list is
+// a working access control permitting less than anyone authored, and with no
+// delete verb the name could not be reused to correct it.
+func TestProfileCreateFromFileIsAllOrNothing(t *testing.T) {
+	newDiscoverEnv(t)
+	dir := t.TempDir()
+	broken := writeDoc(t, dir, "half.json", `{
+	  "config_version": 1, "name": "half",
+	  "types": [{"type": "pypi", "membership": "closed", "version_default": "floating"}],
+	  "entries": [
+	    {"type": "pypi", "name": "requests", "constraint_kind": "any"},
+	    {"type": "pypi", "name": "", "constraint_kind": "any"},
+	    {"type": "pypi", "name": "psycopg2", "constraint_kind": "any"}
+	  ]
+	}`)
+
+	if _, err := runProfile(t, "create", "half", "--from-file", broken); err == nil {
+		t.Fatal("an entry with no package name was accepted")
+	}
+	out, err := runProfile(t, "show", "half")
+	if err == nil {
+		t.Fatalf("the rejected create left a profile behind:\n%s", out)
+	}
+	if !strings.Contains(err.Error(), "no such profile") {
+		t.Errorf("show reports something other than an absent profile: %v", err)
+	}
+
+	fixed := writeDoc(t, dir, "half.json", `{
+	  "config_version": 1, "name": "half",
+	  "types": [{"type": "pypi", "membership": "closed", "version_default": "floating"}],
+	  "entries": [
+	    {"type": "pypi", "name": "requests", "constraint_kind": "any"},
+	    {"type": "pypi", "name": "psycopg2", "constraint_kind": "any"}
+	  ]
+	}`)
+	shown := mustRunProfile(t, "create", "half", "--from-file", fixed)
+	if !strings.Contains(shown, "2 entries") {
+		t.Errorf("re-running after the fix did not write both entries:\n%s", shown)
+	}
+}
+
+// The hand-edited file is the path --from-origin makes mandatory, so it runs
+// through the same checks `add` and `set` make. A marker under a type bodega
+// does not serve governs nothing, and the type the operator meant stays open.
+func TestProfileCreateFromFileRefusesAnUnknownType(t *testing.T) {
+	newDiscoverEnv(t)
+	doc := writeDoc(t, t.TempDir(), "typo.json", `{
+	  "config_version": 1, "name": "typo",
+	  "types": [{"type": "ap", "membership": "closed", "version_default": "pinned"}],
+	  "entries": [{"type": "ap", "name": "nginx", "constraint_kind": "any"}]
+	}`)
+
+	_, err := runProfile(t, "create", "typo", "--from-file", doc)
+	if err == nil {
+		t.Fatal(`"ap" was accepted as a package type`)
+	}
+	for _, want := range []string{`no package type named "ap"`, "apt", "pypi"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q:\n%v", want, err)
+		}
+	}
+	if out, err := runProfile(t, "show", "typo"); err == nil {
+		t.Fatalf("the refused create left a profile behind:\n%s", out)
+	}
+}
+
+// The same rule `add` enforces on --constraint: a constraint with nothing to
+// measure against permits by accident or refuses by accident, never on purpose.
+func TestProfileCreateFromFileRefusesAConstraintWithNoVersion(t *testing.T) {
+	newDiscoverEnv(t)
+	doc := writeDoc(t, t.TempDir(), "noversion.json", `{
+	  "config_version": 1, "name": "nv",
+	  "types": [{"type": "pypi", "membership": "closed", "version_default": "floating"}],
+	  "entries": [{"type": "pypi", "name": "requests", "constraint_kind": "exact"}]
+	}`)
+
+	_, err := runProfile(t, "create", "nv", "--from-file", doc)
+	if err == nil {
+		t.Fatal("exact with no version was accepted")
+	}
+	if !strings.Contains(err.Error(), "measured against a version") {
+		t.Errorf("the refusal does not say what is missing:\n%v", err)
+	}
+}
+
+// A bare `add` on a pinned package is an edit, not a replacement. `unpin` is
+// the deliberate path and it preserves the reason and the review date; the
+// accidental path must not destroy more than it does.
+func TestProfileAddPreservesAPinsReasonAndReviewDate(t *testing.T) {
+	newDiscoverEnv(t)
+	mustRunProfile(t, "create", "web")
+	mustRunProfile(t, "pin", "web", "apt", "postgresql-14", "14.11",
+		"--reason", "15 breaks the config", "--review-after", "2027-01-01")
+
+	mustRunProfile(t, "add", "web", "apt", "postgresql-14")
+	shown := mustRunProfile(t, "show", "web")
+	for _, want := range []string{"15 breaks the config", "2027-01-01", "14.11"} {
+		if !strings.Contains(shown, want) {
+			t.Errorf("a bare add erased %q:\n%s", want, shown)
+		}
+	}
+
+	mustRunProfile(t, "add", "web", "apt", "postgresql-14", "--version", "14.12")
+	shown = mustRunProfile(t, "show", "web")
+	if !strings.Contains(shown, "14.12") || !strings.Contains(shown, "15 breaks the config") {
+		t.Errorf("editing the version dropped the reason it was held for:\n%s", shown)
+	}
+
+	mustRunProfile(t, "unpin", "web", "apt", "postgresql-14")
+	shown = mustRunProfile(t, "show", "web")
+	if strings.Contains(shown, "14.12") {
+		t.Errorf("unpin left the version behind:\n%s", shown)
+	}
+	if !strings.Contains(shown, "15 breaks the config") {
+		t.Errorf("unpin dropped the reason:\n%s", shown)
+	}
+}
