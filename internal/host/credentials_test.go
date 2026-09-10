@@ -197,6 +197,30 @@ func TestHelmRefusesAFileItWouldCorrupt(t *testing.T) {
 			t.Fatalf("a refused write still touched the file:\n%s", after)
 		}
 	})
+
+	// What `helm repo remove <last>` leaves. `repositories:` is present, so
+	// the key check passes and no top-level key follows it, but the value is
+	// inline and a block sequence written under it is a second value for one
+	// key. helm reports that as `did not find expected key` at the next
+	// `helm repo add`; `helm repo list` swallows it and exits 0, so nothing
+	// connects the breakage to the doctor run that caused it.
+	t.Run("repositories is an empty list", func(t *testing.T) {
+		const emptied = "apiVersion: \"\"\ngenerated: \"0001-01-01T00:00:00Z\"\nrepositories: []\n"
+		if err := os.WriteFile(path, []byte(emptied), 0o600); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		_, err := WriteCredential(target, testBase(t), "tok")
+		if err == nil {
+			t.Fatal("appended a block sequence under repositories: [], which helm cannot parse")
+		}
+		if !strings.Contains(err.Error(), "helm repo add") {
+			t.Fatalf("refusal names no way forward:\n%v", err)
+		}
+		after, _ := os.ReadFile(path)
+		if string(after) != emptied {
+			t.Fatalf("a refused write still touched the file:\n%s", after)
+		}
+	})
 }
 
 func targetFor(t *testing.T, home, client string) CredentialTarget {
@@ -305,6 +329,16 @@ func TestRotationSurvivesTheClientsOwnRewrite(t *testing.T) {
 			operator: "//registry.internal/:_authToken=someone-elses",
 			entry:    "//bodega.internal/npm/:_authToken=",
 		},
+		{
+			// Nothing rewrites ~/.netrc, but an operator who configured
+			// bodega before --write-credentials existed wrote a stanza for
+			// this host by hand and it carries no fence either.
+			client: "pip",
+			seed: "machine other.internal\n  login someone\n  password someone-elses\n" +
+				"machine bodega.internal\n  login bodega\n  password " + old + "\n",
+			operator: "machine other.internal",
+			entry:    "machine bodega.internal",
+		},
 	}
 
 	for _, tc := range cases {
@@ -367,6 +401,47 @@ func TestRotationSurvivesTheClientsOwnRewrite(t *testing.T) {
 			t.Fatalf("the rotation duplicated the document keys:\n%s", body)
 		}
 	})
+
+	// Four clients read ~/.netrc and they do not agree on which duplicate
+	// wins: libcurl takes the first match, Python's netrc module the last. A
+	// last-match reader passes over a file holding both stanzas, so the
+	// assertion has to be the first-match one that git, curl and wget use.
+	t.Run("netrc is read first-match", func(t *testing.T) {
+		home := scratchHome(t)
+		target := targetFor(t, home, "git")
+		seed := "machine bodega.internal\n  login bodega\n  password " + old + "\n"
+		if err := os.WriteFile(target.Path, []byte(seed), 0o600); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		if _, err := WriteCredential(target, testBase(t), fresh); err != nil {
+			t.Fatalf("rotation: %v", err)
+		}
+		data, _ := os.ReadFile(target.Path)
+		if got := firstNetrcPassword(t, string(data), "bodega.internal"); got != fresh {
+			t.Fatalf("the first stanza for the host carries %q, want %q:\n%s", got, fresh, data)
+		}
+	})
+}
+
+// firstNetrcPassword returns the password of the first stanza for machine,
+// which is the entry libcurl and therefore git, curl and wget present.
+func firstNetrcPassword(t *testing.T, file, machine string) string {
+	t.Helper()
+	fields := strings.Fields(file)
+	for i := 0; i+1 < len(fields); i++ {
+		if fields[i] != "machine" || fields[i+1] != machine {
+			continue
+		}
+		for j := i + 2; j+1 < len(fields); j++ {
+			switch fields[j] {
+			case "password":
+				return fields[j+1]
+			case "machine", "default", "macdef":
+				return ""
+			}
+		}
+	}
+	return ""
 }
 
 // helm is the one target whose path is not the same on every platform, and
@@ -406,6 +481,72 @@ func TestHelmConfigPathFollowsHelm(t *testing.T) {
 			}
 			if got := helmConfigPath(home, tc.goos, env); got != tc.want {
 				t.Fatalf("helmConfigPath(%s) = %q, want %q", tc.goos, got, tc.want)
+			}
+		})
+	}
+}
+
+// netrcOwned is the one locator that cannot work line by line: netrc is a
+// token stream, a stanza runs to the next machine/default/macdef wherever
+// that falls, and a macro body is arbitrary text. Everything it does not own
+// has to come back byte for byte.
+func TestNetrcOwnedRemovesOnlyThisHostsStanza(t *testing.T) {
+	base := testBase(t)
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "empty", in: "", want: ""},
+		{
+			name: "nothing for this host",
+			in:   "machine other.internal\n  login a\n  password b\n",
+			want: "machine other.internal\n  login a\n  password b\n",
+		},
+		{
+			name: "stanza between two others",
+			in: "machine a.internal\n  login a\n  password 1\n" +
+				"machine bodega.internal\n  login bodega\n  password old\n" +
+				"machine z.internal\n  login z\n  password 2\n",
+			want: "machine a.internal\n  login a\n  password 1\n" +
+				"machine z.internal\n  login z\n  password 2\n",
+		},
+		{
+			name: "two stanzas on one line",
+			in:   "machine bodega.internal login bodega password old machine z.internal login z password 2\n",
+			want: "machine z.internal login z password 2\n",
+		},
+		{
+			name: "apt's scheme spelling",
+			in:   "machine https://bodega.internal\n  login bodega\n  password old\nmachine z.internal\n",
+			want: "machine z.internal\n",
+		},
+		{
+			name: "a password that reads machine",
+			in:   "machine other.internal\n  login a\n  password machine\n  account bodega.internal\n",
+			want: "machine other.internal\n  login a\n  password machine\n  account bodega.internal\n",
+		},
+		{
+			name: "a macro body naming this host",
+			in:   "macdef init\n  put machine bodega.internal\n\nmachine other.internal\n  login a\n",
+			want: "macdef init\n  put machine bodega.internal\n\nmachine other.internal\n  login a\n",
+		},
+		{
+			name: "the default entry survives",
+			in:   "machine bodega.internal\n  login bodega\n  password old\ndefault\n  login anon\n",
+			want: "default\n  login anon\n",
+		},
+		{
+			name: "an operator comment above another host",
+			in:   "machine bodega.internal\n  login bodega\n  password old\n# the CI mirror\nmachine z.internal\n",
+			want: "# the CI mirror\nmachine z.internal\n",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := netrcOwned(tc.in, base); got != tc.want {
+				t.Fatalf("netrcOwned:\n got %q\nwant %q", got, tc.want)
 			}
 		})
 	}

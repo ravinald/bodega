@@ -34,7 +34,9 @@ import (
 // token: cargo rejects the whole file as a duplicate key, helm resolves charts
 // through the stale one and puts it on the wire, npm grows a dead line per
 // rotation. So each of those targets also carries an `owned` locator that
-// finds bodega's entry by its own key, marker or no marker. See CredentialTarget.
+// finds bodega's entry by its own key, marker or no marker. ~/.netrc carries
+// one for the other reason an unfenced entry is there: the operator who
+// configured bodega before this command existed wrote it. See CredentialTarget.
 //
 // Every format below takes `#` to end of line as a comment: netrc (apt's
 // parser and Go's both strip it, confirmed against apt 2.8.3 on noble), npm's
@@ -79,10 +81,12 @@ type CredentialTarget struct {
 	createDoc func(block string) string
 
 	// owned returns existing with bodega's own entry removed, found by the
-	// key that entry carries rather than by the fence around it. Set on the
-	// three targets whose client rewrites the file and discards the fence;
-	// nil where nothing but bodega ever writes the entry, which is true of
-	// netrc (no client rewrites it) and of apt (whole, replaced every run).
+	// key that entry carries rather than by the fence around it. Set
+	// everywhere an entry for this host can already be in the file without a
+	// fence around it: the three targets whose client rewrites the file and
+	// discards comments, and netrc, where the operator who configured bodega
+	// by hand wrote one. nil only on apt, which is bodega's file alone and
+	// replaced whole every run.
 	owned func(existing string, base *url.URL) string
 }
 
@@ -108,6 +112,7 @@ func CredentialTargets(home string) []CredentialTarget {
 			Path:   netrc,
 			Mode:   0o600,
 			body:   netrcEntry,
+			owned:  netrcOwned,
 			Note:   "pip reads netrc through requests; no index-url change is needed for the credential",
 		},
 		{
@@ -122,6 +127,7 @@ func CredentialTargets(home string) []CredentialTarget {
 			Path:   netrc,
 			Mode:   0o600,
 			body:   netrcEntry,
+			owned:  netrcOwned,
 			Note:   "the go toolchain reads netrc for the GOPROXY host",
 		},
 		{
@@ -146,6 +152,7 @@ func CredentialTargets(home string) []CredentialTarget {
 			Path:   netrc,
 			Mode:   0o600,
 			body:   netrcEntry,
+			owned:  netrcOwned,
 			Note:   "git reads netrc through libcurl; no credential helper is required",
 		},
 		{
@@ -153,6 +160,7 @@ func CredentialTargets(home string) []CredentialTarget {
 			Path:   netrc,
 			Mode:   0o600,
 			body:   netrcEntry,
+			owned:  netrcOwned,
 			Note:   "curl needs --netrc to consult it; wget consults it already",
 		},
 	}
@@ -325,15 +333,25 @@ func helmDocument(block string) string {
 // helmAppendable refuses to append a repository under a repositories.yaml
 // whose shape would not carry it. helm's own file ends with the repositories
 // list, so appending a list item lands inside it; a file where another
-// top-level key follows would take bodega's entry into that key instead.
+// top-level key follows would take bodega's entry into that key instead, and
+// one whose repositories: holds an inline value has no list to append under.
 func helmAppendable(existing string) error {
 	idx := -1
 	lines := strings.Split(existing, "\n")
 	for i, l := range lines {
-		if strings.HasPrefix(l, "repositories:") {
-			idx = i
-			break
+		if !strings.HasPrefix(l, "repositories:") {
+			continue
 		}
+		// `helm repo remove <last>` leaves `repositories: []`. A block
+		// sequence written after that is a second value for one key, which
+		// helm rejects whole: `helm repo list` reports no repositories and
+		// exits 0, and the damage surfaces at the next `helm repo add`.
+		if v := strings.TrimSpace(strings.TrimPrefix(l, "repositories:")); v != "" && !strings.HasPrefix(v, "#") {
+			return fmt.Errorf("has repositories: %s, a value rather than a list to add a repository to; "+
+				"run helm repo add bodega <url> --username bodega --password <token> instead", v)
+		}
+		idx = i
+		break
 	}
 	if idx < 0 {
 		return fmt.Errorf("has no top-level repositories: key, so there is no list to add a repository to; " +
@@ -449,4 +467,155 @@ func keepLines(existing string, keep func(line string) bool) string {
 		}
 	}
 	return strings.Join(out, "\n")
+}
+
+// netrcOwned drops the stanza an operator wrote for bodega's own host.
+//
+// The other locators exist because the client rewrites the file. This one
+// exists because a person did: anyone who configured bodega by hand before
+// --write-credentials shipped already has a `machine <bodega-host>` stanza in
+// ~/.netrc, and appending beside it leaves two credentials for one host in a
+// file four clients read two different ways. libcurl takes the first match and
+// Python's netrc module the last, so git, curl and wget would keep presenting
+// the pre-rotation secret while pip presented the new one, and the doctor
+// table would report four successes.
+//
+// apt's `machine <scheme>://<host>` spelling goes too. apt has its own file,
+// but a hand-written ~/.netrc can carry either form and both name this host.
+func netrcOwned(existing string, base *url.URL) string {
+	names := map[string]bool{base.Hostname(): true}
+	if base.Scheme != "" {
+		names[base.Scheme+"://"+base.Hostname()] = true
+	}
+
+	var cuts [][2]int
+	start, last := -1, -1
+	// A stanza runs from its `machine` keyword to the next `machine`,
+	// `default` or `macdef`, which netrc allows on the same line. Cutting the
+	// whole line is right for the usual file and wrong for that one, so the
+	// end is the next keyword when it shares the line and the line end
+	// otherwise. Everything outside the cut survives byte for byte.
+	closeAt := func(next int) {
+		if start < 0 {
+			return
+		}
+		end := netrcLineEnd(existing, last)
+		if next >= 0 && next < end {
+			end = next
+		}
+		cuts = append(cuts, [2]int{start, end})
+		start, last = -1, -1
+	}
+
+	toks := netrcTokens(existing)
+	for i := 0; i < len(toks); i++ {
+		tok := toks[i]
+		switch tok.text {
+		case "machine":
+			closeAt(tok.start)
+			if i+1 >= len(toks) {
+				continue
+			}
+			i++
+			if names[toks[i].text] {
+				start, last = netrcLineStart(existing, tok.start), toks[i].end
+			}
+		case "default":
+			closeAt(tok.start)
+		case "macdef":
+			// A macro body is arbitrary text ending at a blank line, so its
+			// words are not keywords and must not open a stanza.
+			closeAt(tok.start)
+			body := strings.Index(existing[tok.end:], "\n\n")
+			if body < 0 {
+				return netrcCut(existing, cuts)
+			}
+			for i+1 < len(toks) && toks[i+1].start < tok.end+body {
+				i++
+			}
+		case "login", "password", "account":
+			// Consume the value with its keyword: a password that reads
+			// `machine` is a secret, not the start of a stanza.
+			if i+1 < len(toks) {
+				i++
+			}
+			if start >= 0 {
+				last = toks[i].end
+			}
+		default:
+			if start >= 0 {
+				last = tok.end
+			}
+		}
+	}
+	closeAt(-1)
+	return netrcCut(existing, cuts)
+}
+
+// netrcToken is one whitespace-separated word and where it sits in the file.
+type netrcToken struct {
+	text       string
+	start, end int
+}
+
+// netrcTokens splits a netrc file into tokens, skipping a `#` comment to the
+// end of its line. Only a `#` that opens a token starts one, so a password
+// carrying the character survives intact.
+func netrcTokens(s string) []netrcToken {
+	var toks []netrcToken
+	for i := 0; i < len(s); {
+		switch s[i] {
+		case ' ', '\t', '\n', '\r':
+			i++
+		case '#':
+			for i < len(s) && s[i] != '\n' {
+				i++
+			}
+		default:
+			start := i
+			for i < len(s) && !netrcSpace(s[i]) {
+				i++
+			}
+			toks = append(toks, netrcToken{text: s[start:i], start: start, end: i})
+		}
+	}
+	return toks
+}
+
+func netrcSpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+}
+
+// netrcLineStart returns the offset the cut begins at: the start of pos's line
+// when nothing but whitespace precedes the token there, and the token itself
+// when another stanza shares the line.
+func netrcLineStart(s string, pos int) int {
+	bol := strings.LastIndexByte(s[:pos], '\n') + 1
+	if strings.TrimSpace(s[bol:pos]) != "" {
+		return pos
+	}
+	return bol
+}
+
+// netrcLineEnd returns the offset just past the newline ending pos's line.
+func netrcLineEnd(s string, pos int) int {
+	if nl := strings.IndexByte(s[pos:], '\n'); nl >= 0 {
+		return pos + nl + 1
+	}
+	return len(s)
+}
+
+// netrcCut removes the ordered, non-overlapping ranges from s.
+func netrcCut(s string, cuts [][2]int) string {
+	if len(cuts) == 0 {
+		return s
+	}
+	var b strings.Builder
+	prev := 0
+	for _, c := range cuts {
+		b.WriteString(s[prev:c[0]])
+		prev = c[1]
+	}
+	b.WriteString(s[prev:])
+	return b.String()
 }
