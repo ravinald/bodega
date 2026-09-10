@@ -766,3 +766,55 @@ func TestProfileBaselinePinRefusesANameCatalogedUnderTwoTypes(t *testing.T) {
 		}
 	}
 }
+
+// TestProfileBaselinePinAcceptsANameContainingASlash covers the two ecosystems
+// whose names carry a slash of their own. Reading the first one as a type
+// leaves them reachable only by qualified spelling, and the refusal points at
+// a lookup under a type bodega does not serve.
+func TestProfileBaselinePinAcceptsANameContainingASlash(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedCatalogTyped(t, env, "db01", manifest.TypeNpm, map[string][]string{"@babel/core": {"7.24.0"}})
+	seedCatalogTyped(t, env, "db01", manifest.TypeGomod, map[string][]string{"github.com/lib/pq": {"v1.10.9"}})
+
+	for _, tc := range []struct{ pin, typ, version string }{
+		{"@babel/core", manifest.TypeNpm, "7.24.0"},
+		{"github.com/lib/pq", manifest.TypeGomod, "v1.10.9"},
+	} {
+		baseline := filepath.Join(t.TempDir(), "b.json")
+		out, err := runProfile(t, "create", "b", "--from-origin", "db01", "--out", baseline, "--pin", tc.pin)
+		if err != nil {
+			t.Fatalf("--pin %s: unambiguous bare name refused: %v\n%s", tc.pin, err, out)
+		}
+		blob, readErr := os.ReadFile(baseline)
+		if readErr != nil {
+			t.Fatalf("read baseline: %v", readErr)
+		}
+		var doc profileDoc
+		if err := json.Unmarshal(blob, &doc); err != nil {
+			t.Fatalf("parse baseline: %v", err)
+		}
+		var found bool
+		for _, e := range doc.Entries {
+			if e.Type == tc.typ && e.Name == tc.pin {
+				found = true
+				if e.Constraint != manifest.ConstraintExact || e.Version != tc.version {
+					t.Errorf("--pin %s did not land: %+v", tc.pin, e)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("--pin %s: %s/%s absent from the baseline", tc.pin, tc.typ, tc.pin)
+		}
+	}
+
+	baseline := filepath.Join(t.TempDir(), "typo.json")
+	_, err := runProfile(t, "create", "b", "--from-origin", "db01", "--out", baseline, "--pin", "npmm/@babel/core")
+	if err == nil {
+		t.Fatal("a --pin under a type bodega does not serve was accepted")
+	}
+	for _, want := range []string{`"npmm" is no package type`, manifest.TypeNpm} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q:\n%s", want, err)
+		}
+	}
+}

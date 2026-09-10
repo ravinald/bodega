@@ -756,12 +756,12 @@ bodega profile show web
 
 `set` writes the per-type marker. Both flags are optional on a type that already has one: what you do not name keeps the value it has.
 
-| Flag                          | Value      | Meaning                                     |
-| ----------------------------- | ---------- | ------------------------------------------- |
-| `--membership`                | `closed`   | only the packages this profile lists        |
-| `--membership`                | `open`     | every package of this type in the catalog   |
-| `--version-default`           | `pinned`   | only the version each entry names           |
-| `--version-default`           | `floating` | any version                                 |
+| Flag                | Value      | Meaning                                   |
+| ------------------- | ---------- | ----------------------------------------- |
+| `--membership`      | `closed`   | only the packages this profile lists      |
+| `--membership`      | `open`     | every package of this type in the catalog |
+| `--version-default` | `pinned`   | only the version each entry names         |
+| `--version-default` | `floating` | any version                               |
 
 The marker's presence is itself an answer. A type with **no** marker is one the profile states no rule for, and the fleet-wide controls decide it alone; a type **with** a marker is decided by the profile even when no entry names a package.
 
@@ -843,6 +843,8 @@ $ bodega profile create db --from-origin db01 --out db.json --pin psycopg2
 ```
 
 `--pin <type>/<name>` is the qualified spelling, and it pins the one it names while the other stays floating. The baseline is walked in a fixed type order, so resolving a bare name would let that order decide which package an operator holds.
+
+A slash is read as the qualifier only when what precedes it names one of the eight types, none of which carries a slash. So `--pin @babel/core` and `--pin github.com/lib/pq` each name one npm or gomod package, and the qualified spellings for them are `npm/@babel/core` and `gomod/github.com/lib/pq`.
 
 #### Binding hosts
 

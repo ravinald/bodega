@@ -138,7 +138,10 @@ A --pin takes a bare name, or <type>/<name> where one name is cataloged under
 more than one type. A bare name matching two types is refused rather than
 resolved: the baseline is walked in a fixed type order, and letting that order
 decide which package is held would pin one and leave the other floating with
-nothing said about it.`,
+nothing said about it.
+
+A slash is read as the qualifier only when what precedes it is one of the
+eight types, so @babel/core and github.com/lib/pq are each one name.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
@@ -276,8 +279,13 @@ func applyBaselinePins(doc *profileDoc, found []originPackage, pins []string, ou
 // manifest.AllTypes order, so picking one would let an enumeration order
 // decide which package an operator holds, and the one they meant would stay
 // floating with the success line counting the pin.
+//
+// The <type>/<name> form is taken only when the prefix is one of the eight
+// types, none of which contains a slash. Every gomod module path and every
+// npm scoped name carries a slash of its own, so reading the first one as a
+// type would leave two ecosystems reachable by qualified spelling alone.
 func resolveBaselinePin(doc *profileDoc, found []originPackage, pin, out string) (originPackage, error) {
-	if typ, name, qualified := strings.Cut(pin, "/"); qualified {
+	if typ, name, qualified := strings.Cut(pin, "/"); qualified && slices.Contains(manifest.AllTypes, typ) {
 		i := slices.IndexFunc(found, func(p originPackage) bool { return p.Type == typ && p.Name == name })
 		if i < 0 {
 			return originPackage{}, fmt.Errorf("--pin %s: the baseline holds no %s package named %s.\n"+
@@ -296,10 +304,16 @@ func resolveBaselinePin(doc *profileDoc, found []originPackage, pin, out string)
 	}
 	switch len(matches) {
 	case 0:
+		hint := ""
+		if typ, _, qualified := strings.Cut(pin, "/"); qualified && !slices.Contains(manifest.AllTypes, typ) {
+			hint = fmt.Sprintf("  Read as one name, because %q is no package type; bodega serves: %s\n",
+				typ, strings.Join(manifest.AllTypes, ", "))
+		}
 		return originPackage{}, fmt.Errorf("--pin %s: the baseline holds no package by that name.\n"+
+			"%s"+
 			"  It lists what %s was cataloged with:  bodega show pkg <type> %s\n"+
 			"  Or write it without --pin and read the names out of the file:  bodega profile create %s --from-origin %s --out %s",
-			pin, doc.Origin, pin, doc.Name, doc.Origin, out)
+			pin, hint, doc.Origin, pin, doc.Name, doc.Origin, out)
 	case 1:
 		return matches[0], nil
 	default:
