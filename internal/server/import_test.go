@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
@@ -203,5 +204,68 @@ func TestBulkImportRefusesAnOversizedBody(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "NDJSON") {
 		t.Errorf("the error does not tell the caller what to do instead: %s", w.Body.String())
+	}
+}
+
+// aptManifestFrom is aptManifest with the origin the host cataloging it
+// recorded.
+func aptManifestFrom(name, version, origin string) string {
+	return fmt.Sprintf(`{"config_version":1,"name":%q,"type":"apt","versions":[{"version":%q,"source_name":%q,"metadata":{"origin":%q}}]}`,
+		name, version, name, origin)
+}
+
+// originsOf reads the origins the store holds for one apt version.
+func originsOf(t *testing.T, s *Server, name, version string) []string {
+	t.Helper()
+	pm, _ := s.store.GetPackage(t.Context(), manifest.TypeApt, name)
+	if pm == nil {
+		t.Fatalf("apt/%s is not in the store", name)
+	}
+	for _, ve := range pm.Versions {
+		if ve.Version == version {
+			return admit.Origins(ve)
+		}
+	}
+	t.Fatalf("apt/%s has no version %s", name, version)
+	return nil
+}
+
+// The bulk route is what 'bodega pkg import --server' pushes through, so a
+// fleet cataloging itself over HTTP has to accumulate origins the same way the
+// local store does. Both call admit.MergeVersions; this pins the behavior at
+// the surface.
+func TestBulkImportMergeAccumulatesOrigins(t *testing.T) {
+	s, _, _ := refreshTestServer(t)
+
+	if _, resp := postImport(t, s, "["+aptManifestFrom("curl", "8.5.0", "db01")+"]", ""); resp.Imported != 1 {
+		t.Fatalf("first push: imported = %d, want 1; results: %+v", resp.Imported, resp.Results)
+	}
+	if _, resp := postImport(t, s, "["+aptManifestFrom("curl", "8.5.0", "db02")+"]", "merge=true"); resp.Merged != 1 {
+		t.Fatalf("merge push: merged = %d, want 1; results: %+v", resp.Merged, resp.Results)
+	}
+
+	got := originsOf(t, s, "curl", "8.5.0")
+	if len(got) != 2 || got[0] != "db01" || got[1] != "db02" {
+		t.Errorf("origins = %v, want [db01 db02]", got)
+	}
+}
+
+// A manifest's origin must not depend on which route wrote it: a package
+// created through the single-entry route and one pushed in a bulk catalog
+// carry the field alike.
+func TestCreateEntryStoresTheOrigin(t *testing.T) {
+	s, _, _ := refreshTestServer(t)
+	body := aptManifestFrom("wget", "1.21.4", "db01")
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/packages/apt", strings.NewReader(body))
+	r.SetPathValue("type", manifest.TypeApt)
+	w := httptest.NewRecorder()
+
+	s.handleCreateEntry(w, r)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body: %s", w.Code, w.Body.String())
+	}
+	if got := originsOf(t, s, "wget", "1.21.4"); len(got) != 1 || got[0] != "db01" {
+		t.Errorf("origins = %v, want [db01]", got)
 	}
 }

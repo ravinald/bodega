@@ -145,7 +145,7 @@ func (s *Server) importOne(ctx context.Context, pm *manifest.PackageManifest, me
 	target := pm
 	outcome := ImportImported
 	if existing != nil {
-		mergeVersions(existing, pm)
+		admit.MergeVersions(existing, pm)
 		target = existing
 		outcome = ImportMerged
 	} else {
@@ -169,24 +169,6 @@ func (s *Server) importOne(ctx context.Context, pm *manifest.PackageManifest, me
 	}
 	out.Outcome = outcome
 	return out
-}
-
-// mergeVersions adds versions the stored package does not carry. An existing
-// version is never overwritten, which is what keeps a hosted entry from being
-// downgraded to proxy by a re-import of the host that first named it.
-func mergeVersions(existing, incoming *manifest.PackageManifest) {
-	for _, ve := range incoming.Versions {
-		found := false
-		for _, have := range existing.Versions {
-			if have.Version == ve.Version {
-				found = true
-				break
-			}
-		}
-		if !found {
-			existing.Versions = append(existing.Versions, ve)
-		}
-	}
 }
 
 func (resp *ImportResponse) record(res ImportResult) {

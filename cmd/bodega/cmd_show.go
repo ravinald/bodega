@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
@@ -265,9 +266,13 @@ func showVersionList(ctx context.Context, store *manifest.Store, typ, name strin
 	}
 	fmt.Println()
 
+	// ORIGIN is on the admin table only. The repo view renders what a client
+	// may see, and an origin is an internal hostname: the catalog's answer to
+	// "which machine contributed this row" is for the operator, not for the
+	// consumer of the repository.
 	if admin {
-		fmt.Printf("%-12s %-15s %-6s %-8s %-8s %-10s %-11s %-10s\n",
-			"VERSION", "PLATFORM", "STORED", "FROZEN", "HIDDEN", "CONSTRAINT", "OSV", "CHECKED")
+		fmt.Printf("%-12s %-15s %-6s %-8s %-8s %-10s %-11s %-10s %s\n",
+			"VERSION", "PLATFORM", "STORED", "FROZEN", "HIDDEN", "CONSTRAINT", "OSV", "CHECKED", "ORIGIN")
 	} else {
 		fmt.Printf("%-12s %-15s %-10s\n", "VERSION", "PLATFORM", "CONSTRAINT")
 	}
@@ -312,8 +317,8 @@ func showVersionList(ctx context.Context, store *manifest.Store, typ, name strin
 				st.Checked = time.Time{}
 			}
 			osvState, osvChecked := osvVersionState(osvCovered, st)
-			fmt.Printf("%-12s %-15s %-6s %-8s %-8s %-10s %-11s %-10s\n",
-				v, platform, "-", frozen, hidden, constraint, osvState, osvChecked)
+			fmt.Printf("%-12s %-15s %-6s %-8s %-8s %-10s %-11s %-10s %s\n",
+				v, platform, "-", frozen, hidden, constraint, osvState, osvChecked, originCell(ve))
 			if osvCovered && st.Flagged() {
 				flagged = append(flagged, fmt.Sprintf("  %-12s %s  (checked %s)",
 					v, strings.Join(st.Vulns, ", "), osvCheckedOn(st)))
@@ -326,6 +331,17 @@ func showVersionList(ctx context.Context, store *manifest.Store, typ, name strin
 		fmt.Printf("\nFlagged by OSV:\n%s\n", strings.Join(flagged, "\n"))
 	}
 	return nil
+}
+
+// originCell renders the hosts a version was cataloged from. A dash rather
+// than a blank keeps the column readable on a store predating the field, where
+// every row is empty.
+func originCell(ve manifest.VersionEntry) string {
+	origins := admit.Origins(ve)
+	if len(origins) == 0 {
+		return "-"
+	}
+	return strings.Join(origins, ", ")
 }
 
 // osvVersionState renders a version's OSV and CHECKED cells. A registry type
@@ -440,6 +456,9 @@ func printVersionDetail(pm *manifest.PackageManifest, ve manifest.VersionEntry, 
 	if len(ve.RequiredBy) > 0 {
 		fmt.Printf("Required by: %s\n", strings.Join(ve.RequiredBy, ", "))
 	}
+	if origins := admit.Origins(ve); admin && len(origins) > 0 {
+		fmt.Printf("Origins:     %s\n", strings.Join(origins, ", "))
+	}
 
 	if admin && ve.BuildEnv != nil {
 		fmt.Println("Build Environment:")
@@ -476,14 +495,19 @@ func printVersionDetail(pm *manifest.PackageManifest, ve manifest.VersionEntry, 
 	if ve.AppVersion != "" {
 		fmt.Printf("App Version: %s\n", ve.AppVersion)
 	}
-	if len(ve.Metadata) > 0 {
-		fmt.Println("Metadata:")
-		keys := make([]string, 0, len(ve.Metadata))
-		for k := range ve.Metadata {
-			if k != "Description-Full" {
-				keys = append(keys, k)
-			}
+	// The header is printed from the filtered key set, not from the map: an
+	// entry whose only metadata is its origin would otherwise print a
+	// "Metadata:" heading with nothing under it.
+	keys := make([]string, 0, len(ve.Metadata))
+	for k := range ve.Metadata {
+		// Description-Full is too long for the block; origin has its own line
+		// above, which the repo view withholds on purpose.
+		if k != "Description-Full" && k != admit.MetaOrigin {
+			keys = append(keys, k)
 		}
+	}
+	if len(keys) > 0 {
+		fmt.Println("Metadata:")
 		sort.Strings(keys)
 		for _, k := range keys {
 			fmt.Printf("  %-16s %s\n", k+":", ve.Metadata[k])

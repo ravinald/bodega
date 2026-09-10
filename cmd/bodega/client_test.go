@@ -200,7 +200,7 @@ func TestRemoteImportFailsWhenNothingLands(t *testing.T) {
 		[]byte(`[{"config_version":1,"name":"hello","type":"apt","versions":[{"version":"2.10"}]}]`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := importToServer(srv.URL, "", true, false, []string{catalog}); err == nil {
+	if err := importToServer(srv.URL, "", true, false, "", []string{catalog}); err == nil {
 		t.Fatal("a push where every package was refused reported success")
 	}
 }
