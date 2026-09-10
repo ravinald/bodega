@@ -132,7 +132,13 @@ what the host may fetch and not which build of it. --pin names the exceptions:
 a package whose version is held, which is a claim an operator makes about one
 package and not a shape a generator should give every package. A baseline that
 pins every version is re-authored monthly until somebody stops, which is how a
-control becomes ignored.`,
+control becomes ignored.
+
+A --pin takes a bare name, or <type>/<name> where one name is cataloged under
+more than one type. A bare name matching two types is refused rather than
+resolved: the baseline is walked in a fixed type order, and letting that order
+decide which package is held would pin one and leave the other floating with
+nothing said about it.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
@@ -165,7 +171,7 @@ control becomes ignored.`,
 	c.Flags().StringVar(&fromOrigin, "from-origin", "", "Build a baseline from the packages cataloged from this host")
 	c.Flags().StringVarP(&out, "out", "o", "", "Write the --from-origin baseline here")
 	c.Flags().StringVar(&fromFile, "from-file", "", "Create the profile from a baseline file")
-	c.Flags().StringArrayVar(&pins, "pin", nil, "Pin this package's version in the baseline (repeatable)")
+	c.Flags().StringArrayVar(&pins, "pin", nil, "Pin this package's version in the baseline, as <name> or <type>/<name> (repeatable)")
 	c.Flags().BoolVar(&force, "force", false, "Accept a closed type with no entries, which permits nothing of that type")
 	return c
 }
@@ -229,31 +235,27 @@ func writeBaseline(gf *globalFlags, name, description, origin, out string, pins 
 	return nil
 }
 
-// applyBaselinePins turns --pin names into exact constraints, refusing a
+// applyBaselinePins turns --pin arguments into exact constraints, refusing a
 // package the host reports at more than one version. Choosing between them
 // here would invent a rule the operator did not state, and the version they
 // meant is the one thing a pin has to get right.
+//
+// A pin names either one package (apt/postgresql-14) or, where the name is
+// unambiguous across the baseline, the bare name.
 func applyBaselinePins(doc *profileDoc, found []originPackage, pins []string, out string) (int, error) {
 	if len(pins) == 0 {
 		return 0, nil
 	}
-	byName := map[string]originPackage{}
-	for _, p := range found {
-		byName[p.Name] = p
-	}
 	count := 0
 	for _, pin := range pins {
-		p, ok := byName[pin]
-		if !ok {
-			return 0, fmt.Errorf("--pin %s: the baseline holds no package by that name.\n"+
-				"  It lists what %s was cataloged with:  bodega show pkg <type> %s\n"+
-				"  Or write it without --pin and read the names out of the file:  bodega profile create %s --from-origin %s --out %s",
-				pin, doc.Origin, pin, doc.Name, doc.Origin, out)
+		p, err := resolveBaselinePin(doc, found, pin, out)
+		if err != nil {
+			return 0, err
 		}
 		if len(p.Versions) != 1 {
-			return 0, fmt.Errorf("--pin %s: %s is cataloged from %s at %d versions (%s), so a pin here would pick one for you.\n"+
+			return 0, fmt.Errorf("--pin %s: %s/%s is cataloged from %s at %d versions (%s), so a pin here would pick one for you.\n"+
 				"  Create the profile, then name the version:  bodega profile pin %s %s %s <version> --reason <why>",
-				pin, p.Name, doc.Origin, len(p.Versions), strings.Join(p.Versions, ", "),
+				pin, p.Type, p.Name, doc.Origin, len(p.Versions), strings.Join(p.Versions, ", "),
 				doc.Name, p.Type, p.Name)
 		}
 		for i := range doc.Entries {
@@ -265,6 +267,51 @@ func applyBaselinePins(doc *profileDoc, found []originPackage, pins []string, ou
 		}
 	}
 	return count, nil
+}
+
+// resolveBaselinePin picks the one package a --pin argument names.
+//
+// A bare name matching two types is refused rather than resolved, for the
+// reason the two-version case above is refused: the baseline is walked in
+// manifest.AllTypes order, so picking one would let an enumeration order
+// decide which package an operator holds, and the one they meant would stay
+// floating with the success line counting the pin.
+func resolveBaselinePin(doc *profileDoc, found []originPackage, pin, out string) (originPackage, error) {
+	if typ, name, qualified := strings.Cut(pin, "/"); qualified {
+		i := slices.IndexFunc(found, func(p originPackage) bool { return p.Type == typ && p.Name == name })
+		if i < 0 {
+			return originPackage{}, fmt.Errorf("--pin %s: the baseline holds no %s package named %s.\n"+
+				"  What %s was cataloged with:  bodega show pkg %s %s\n"+
+				"  Or write it without --pin and read the names out of the file:  bodega profile create %s --from-origin %s --out %s",
+				pin, typ, name, doc.Origin, typ, name, doc.Name, doc.Origin, out)
+		}
+		return found[i], nil
+	}
+
+	var matches []originPackage
+	for _, p := range found {
+		if p.Name == pin {
+			matches = append(matches, p)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return originPackage{}, fmt.Errorf("--pin %s: the baseline holds no package by that name.\n"+
+			"  It lists what %s was cataloged with:  bodega show pkg <type> %s\n"+
+			"  Or write it without --pin and read the names out of the file:  bodega profile create %s --from-origin %s --out %s",
+			pin, doc.Origin, pin, doc.Name, doc.Origin, out)
+	case 1:
+		return matches[0], nil
+	default:
+		var types, spellings []string
+		for _, m := range matches {
+			types = append(types, m.Type)
+			spellings = append(spellings, "  --pin "+m.Type+"/"+m.Name)
+		}
+		return originPackage{}, fmt.Errorf("--pin %s: %s is cataloged from %s under %d types (%s), so a pin here would pick one for you.\n"+
+			"  Name the one you mean:\n%s",
+			pin, pin, doc.Origin, len(matches), strings.Join(types, ", "), strings.Join(spellings, "\n"))
+	}
 }
 
 // readBaseline reads a document back. The file is the review step, so stdin is
@@ -859,9 +906,14 @@ func newProfileUnpinCmd(gf *globalFlags) *cobra.Command {
 		Short: "Release a pin, leaving the package listed",
 		Long: `Drop the version constraint from an entry and keep the entry.
 
-The package stays a member of the profile and takes its type's version default
-again. Removing the entry outright is 'bodega profile remove', and on a closed
-type that is a different decision: the package stops being permitted at all.`,
+The version the pin named stays on the entry as its base, because that is the
+shape a pinned type default reads: an entry with a version and no constraint
+of its own is held at that version, and one with neither is a pin with nothing
+to pin to, which permits no version at all. A floating default ignores the base
+and takes any version, so keeping it costs nothing there.
+
+Removing the entry outright is 'bodega profile remove', and on a closed type
+that is a different decision: the package stops being permitted at all.`,
 		Args: cobra.ExactArgs(3),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			profile, typ, name := args[0], args[1], args[2]
@@ -888,16 +940,38 @@ type that is a different decision: the package stops being permitted at all.`,
 					typ, name, typ)
 				return nil
 			}
-			e.Constraint, e.Version, e.Actor = "", "", audit.CurrentActor()
+			e.Constraint, e.Actor = "", audit.CurrentActor()
 			if _, err := adb.PutProfileEntry(ctx, e); err != nil {
 				return err
 			}
 			recordProfileEvent(ctx, adb, audit.EventEdit, profile, typ+"/"+name, "unpin")
-			fmt.Printf("Released the pin on %s/%s in %s; it takes the %s version default again.\n",
-				typ, name, profile, typ)
+			fmt.Printf("Released the pin on %s/%s in %s; %s\n",
+				typ, name, profile, unpinConsequence(d.Types, profile, typ, name, e.Version))
 			return nil
 		},
 	}
+}
+
+// unpinConsequence names what the entry permits now, resolved against the
+// type marker. "It takes the type default again" is true and useless: under a
+// pinned default the answer turns on whether the entry still names a version,
+// and an operator releasing a hold is entitled to know they did not impose a
+// total one.
+func unpinConsequence(types []audit.ProfileTypeRule, profile, typ, name, version string) string {
+	i := slices.IndexFunc(types, func(t audit.ProfileTypeRule) bool { return t.Type == typ })
+	if i < 0 {
+		return fmt.Sprintf("the profile states no rule for %s, so nothing in it governs %s.", typ, name)
+	}
+	if types[i].VersionDefault == audit.VersionFloating {
+		return fmt.Sprintf("the %s default is floating, so it takes any version.", typ)
+	}
+	if version == "" {
+		return fmt.Sprintf("the %s default is pinned and the entry names no version, so it now permits nothing.\n"+
+			"  Give it one:   bodega profile pin %s %s %s <version> --reason <why>\n"+
+			"  Or float it:   bodega profile add %s %s %s --constraint any",
+			typ, profile, typ, name, profile, typ, name)
+	}
+	return fmt.Sprintf("the %s default is pinned, so it holds at %s.", typ, version)
 }
 
 // putProfileEntry is the one write behind add and pin. supplied names the

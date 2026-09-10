@@ -791,7 +791,22 @@ With no `--constraint` the entry defers to its type's version default. Adding an
 
 `pin` is `add` with the pinning arguments filled in, and it **requires `--reason`**: a pin with no reason outlives the problem it was written for, and the next operator cannot tell a deliberate hold from an accident, so it is never lifted. `--review-after <YYYY-MM-DD>` gives it a date it stops looking current on; nothing enforces the date, `bodega profile show` prints it.
 
-`unpin` drops the constraint and keeps the entry, so the package stays a member and takes its type's default again. `remove` deletes the entry, which on a closed type means the package is no longer permitted at all.
+`unpin` drops the constraint and keeps the entry, so the package stays a member. The version the pin named stays on the entry as its base, because that is the shape a pinned type default reads: an entry with a version and no constraint of its own is held at that version, and one with neither is a pin with nothing to pin to, which permits no version at all. A floating default ignores the base and takes any version. `unpin` says which of the three it left you in:
+
+```text
+$ bodega profile unpin vd pypi numpy
+Released the pin on pypi/numpy in vd; the pypi default is pinned, so it holds at 1.26.4.
+
+$ bodega profile unpin fl pypi requests
+Released the pin on pypi/requests in fl; the pypi default is floating, so it takes any version.
+
+$ bodega profile unpin nv2 pypi requests
+Released the pin on pypi/requests in nv2; the pypi default is pinned and the entry names no version, so it now permits nothing.
+  Give it one:   bodega profile pin nv2 pypi requests <version> --reason <why>
+  Or float it:   bodega profile add nv2 pypi requests --constraint any
+```
+
+`remove` deletes the entry, which on a closed type means the package is no longer permitted at all.
 
 #### Building a profile from a host
 
@@ -807,13 +822,27 @@ bodega profile create db --from-file db.json
 
 The round trip through a file is the review step, and `--out -` and `--from-file -` are both refused. A host's inventory holds its accidents alongside its requirements, and locking membership to it enshrines whatever was installed by hand at 03:00; a baseline piped straight from the command that produced it was never read by anyone.
 
-Entries default to name-only with `constraint_kind: any`, so the baseline says what the host may fetch and not which build of it. `--pin <name>` (repeatable) names the exceptions. A baseline that pins every version is re-authored monthly until somebody stops, which is how a control becomes ignored. A `--pin` naming a package the host reports at two versions is refused rather than resolved:
+Entries default to name-only with `constraint_kind: any`, so the baseline says what the host may fetch and not which build of it. `--pin <name>` (repeatable) names the exceptions. A baseline that pins every version is re-authored monthly until somebody stops, which is how a control becomes ignored.
+
+A `--pin` that does not name one package is refused rather than resolved, on either axis. Two cataloged versions:
 
 ```text
 $ bodega profile create db --from-origin db01 --out db.json --pin requests
---pin requests: requests is cataloged from db01 at 2 versions (2.31.0, 2.32.0), so a pin here would pick one for you.
+--pin requests: pypi/requests is cataloged from db01 at 2 versions (2.31.0, 2.32.0), so a pin here would pick one for you.
   Create the profile, then name the version:  bodega profile pin db pypi requests <version> --reason <why>
 ```
+
+Or one name under two types:
+
+```text
+$ bodega profile create db --from-origin db01 --out db.json --pin psycopg2
+--pin psycopg2: psycopg2 is cataloged from db01 under 2 types (pypi, npm), so a pin here would pick one for you.
+  Name the one you mean:
+  --pin pypi/psycopg2
+  --pin npm/psycopg2
+```
+
+`--pin <type>/<name>` is the qualified spelling, and it pins the one it names while the other stays floating. The baseline is walked in a fixed type order, so resolving a bare name would let that order decide which package an operator holds.
 
 #### Binding hosts
 

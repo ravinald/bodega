@@ -43,6 +43,11 @@ func runProfile(t *testing.T, args ...string) (string, error) {
 // `bodega pkg convert --origin` writes it with.
 func seedCatalog(t *testing.T, env *discoverEnv, origin string, pkgs map[string][]string) {
 	t.Helper()
+	seedCatalogTyped(t, env, origin, manifest.TypePypi, pkgs)
+}
+
+func seedCatalogTyped(t *testing.T, env *discoverEnv, origin, typ string, pkgs map[string][]string) {
+	t.Helper()
 	ctx := context.Background()
 	store := manifest.NewLocalStore(env.manifestDir)
 	if err := store.LoadIndex(ctx); err != nil {
@@ -52,7 +57,7 @@ func seedCatalog(t *testing.T, env *discoverEnv, origin string, pkgs map[string]
 		pm := &manifest.PackageManifest{
 			ConfigVersion: manifest.CurrentConfigVersion,
 			Name:          name,
-			Type:          manifest.TypePypi,
+			Type:          typ,
 		}
 		for _, v := range versions {
 			pm.Versions = append(pm.Versions, manifest.VersionEntry{Version: v})
@@ -525,8 +530,8 @@ func TestProfileAddPreservesAPinsReasonAndReviewDate(t *testing.T) {
 
 	mustRunProfile(t, "unpin", "web", "apt", "postgresql-14")
 	shown = mustRunProfile(t, "show", "web")
-	if strings.Contains(shown, "14.12") {
-		t.Errorf("unpin left the version behind:\n%s", shown)
+	if !strings.Contains(shown, "14.12") {
+		t.Errorf("unpin dropped the version a pinned type default reads:\n%s", shown)
 	}
 	if !strings.Contains(shown, "15 breaks the config") {
 		t.Errorf("unpin dropped the reason:\n%s", shown)
@@ -687,5 +692,77 @@ func hideVersion(t *testing.T, env *discoverEnv, name, version string) {
 	}
 	if err := store.SavePackage(ctx, pm); err != nil {
 		t.Fatalf("save %s: %v", name, err)
+	}
+}
+
+// unpin is sold as the way to relax a hold. Under a pinned version default an
+// entry naming no version permits nothing, so clearing the version alongside
+// the constraint would make the release a total refusal and print the
+// opposite. The version stays as the base the default reads.
+func TestProfileUnpinLeavesAPinnedDefaultSomethingToHoldAt(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedCatalog(t, env, "db01", map[string][]string{"numpy": {"1.26.4"}})
+	mustRunProfile(t, "create", "vd")
+	mustRunProfile(t, "add", "vd", "pypi", "numpy", "--version", "1.26.4")
+	mustRunProfile(t, "set", "vd", "pypi", "--membership", "closed", "--version-default", "pinned")
+	if out, err := runProfile(t, "check", "vd"); err != nil {
+		t.Fatalf("a version with no constraint is the shape a pinned default reads: %v\n%s", err, out)
+	}
+
+	mustRunProfile(t, "pin", "vd", "pypi", "numpy", "1.26.4", "--reason", "held")
+	out := mustRunProfile(t, "unpin", "vd", "pypi", "numpy")
+	if !strings.Contains(out, "1.26.4") {
+		t.Errorf("unpin does not say what the entry is held at now:\n%s", out)
+	}
+	if out, err := runProfile(t, "check", "vd"); err != nil {
+		t.Fatalf("unpin turned a released hold into a total one: %v\n%s", err, out)
+	}
+}
+
+// A bare --pin matching two types is the two-version refusal on another axis:
+// resolving it lets manifest.AllTypes order decide which package an operator
+// holds, and the one they meant stays floating with the pin counted.
+func TestProfileBaselinePinRefusesANameCatalogedUnderTwoTypes(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedCatalog(t, env, "db01", map[string][]string{"numpy": {"1.26.4"}, "psycopg2": {"2.9.9"}})
+	seedCatalogTyped(t, env, "db01", manifest.TypeNpm, map[string][]string{"psycopg2": {"3.1.0"}})
+
+	baseline := filepath.Join(t.TempDir(), "coll.json")
+	_, err := runProfile(t, "create", "coll", "--from-origin", "db01", "--out", baseline, "--pin", "psycopg2")
+	if err == nil {
+		t.Fatal("--pin picked one of two types cataloging the same name")
+	}
+	for _, want := range []string{"pypi", "npm", "--pin pypi/psycopg2", "--pin npm/psycopg2"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q:\n%s", want, err)
+		}
+	}
+	if _, statErr := os.Stat(baseline); !os.IsNotExist(statErr) {
+		t.Error("a refused pin still wrote a baseline")
+	}
+
+	mustRunProfile(t, "create", "coll", "--from-origin", "db01", "--out", baseline, "--pin", "pypi/psycopg2")
+	blob, err := os.ReadFile(baseline)
+	if err != nil {
+		t.Fatalf("read baseline: %v", err)
+	}
+	var doc profileDoc
+	if err := json.Unmarshal(blob, &doc); err != nil {
+		t.Fatalf("parse baseline: %v", err)
+	}
+	for _, e := range doc.Entries {
+		if e.Name != "psycopg2" {
+			continue
+		}
+		switch e.Type {
+		case manifest.TypePypi:
+			if e.Constraint != manifest.ConstraintExact || e.Version != "2.9.9" {
+				t.Errorf("the qualified pin did not land on pypi/psycopg2: %+v", e)
+			}
+		case manifest.TypeNpm:
+			if e.Constraint != manifest.ConstraintAny || e.Version != "" {
+				t.Errorf("the pin reached npm/psycopg2, which it did not name: %+v", e)
+			}
+		}
 	}
 }
