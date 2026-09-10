@@ -345,11 +345,11 @@ func (s *Server) guardCIDRBindings(ctx context.Context) error {
 type cidrBindingTrustError struct{ bindings int }
 
 func (e *cidrBindingTrustError) Error() string {
-	noun := "CIDR identity bindings exist"
+	noun, verb := "CIDR identity bindings", "exist"
 	if e.bindings == 1 {
-		noun = "a CIDR identity binding exists"
+		noun, verb = "CIDR identity binding", "exists"
 	}
-	return fmt.Sprintf("refusing to serve: %d %s while trusted_proxies is still the built-in default (loopback + RFC 1918).\n"+
+	return fmt.Sprintf("refusing to serve: %d %s %s while trusted_proxies is still the built-in default (loopback + RFC 1918).\n"+
 		"  Every peer in that range has its X-Real-IP believed verbatim, so any of them can claim\n"+
 		"  an address inside a bound network and collect that identity. Answer trusted_proxies\n"+
 		"  either way:\n"+
@@ -358,5 +358,5 @@ func (e *cidrBindingTrustError) Error() string {
 		"                                            trust no forwarded header from anyone\n"+
 		"  Leaving the default is what is not accepted.\n"+
 		"  The live list:  bodega acl proxies list\n"+
-		"  The bindings:   bodega identity list", e.bindings, noun, config.ConfigPath())
+		"  The bindings:   bodega identity list", e.bindings, noun, verb, config.ConfigPath())
 }

@@ -44,9 +44,10 @@ type IdentityBinding struct {
 //
 // Reason distinguishes the two ways a write is ambiguous: the same key already
 // naming a different identity, and a second CIDR of the same prefix length
-// covering an address the first already covers. The second cannot be a primary
-// key violation, because 10.0.0.0/8 and ::ffff:10.0.0.0/104 are the same set of
-// addresses spelled two ways.
+// covering an address the first already covers. Every write through
+// AddIdentityBinding is the first, because NormalizeBindCIDR makes the key the
+// address set; the second is there for a row that reached the table some other
+// way.
 type BindingConflict struct {
 	Existing IdentityBinding
 	Want     IdentityBinding
@@ -112,6 +113,12 @@ func NormalizeBindCIDR(in string) (netip.Prefix, error) {
 //   - the key is already bound to a different identity
 //   - a CIDR of the same prefix length already covers an address this one does
 //
+// Normalizing the CIDR first collapses the second into the first: masked and
+// with the IPv4-mapped spelling folded back, two prefixes of equal length are
+// either the same key or disjoint. So ::ffff:10.0.0.0/104 against 10.0.0.0/8
+// is refused as the key collision it is, and the overlap check below only ever
+// fires on a row written around this function.
+//
 // Rebinding a key to the identity it already has is a no-op reporting false.
 func (a *DB) AddIdentityBinding(ctx context.Context, b IdentityBinding) (bool, error) {
 	if !ValidBindKind(b.Kind) {
@@ -171,6 +178,11 @@ func findBindingConflict(existing []IdentityBinding, want IdentityBinding) *Bind
 	if want.Kind != BindCIDR {
 		return nil
 	}
+	// Unreachable for anything NormalizeBindCIDR touched, and kept for what it
+	// did not: a row inserted straight into the table can carry an unmasked
+	// key like 10.0.0.5/8, which the loop above does not match against
+	// 10.0.0.0/8 and which Overlaps does.
+
 	wp, err := netip.ParsePrefix(want.Key)
 	if err != nil {
 		return nil

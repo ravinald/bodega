@@ -6,12 +6,14 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/host"
 )
 
 const testPepper = "pepper-for-tests"
@@ -229,10 +231,22 @@ func TestStartRefusesACIDRBindingUnderDefaultTrustedProxies(t *testing.T) {
 			"bodega acl proxies add",  // name the proxy
 			"\"trusted_proxies\": []", // or write an empty list
 			"trusted_proxies is still the built-in default",
+			// One binding is the common first state, so the singular branch is
+			// the one most operators meet. docs/USAGE.md quotes this line.
+			"1 CIDR identity binding exists while",
 		} {
 			if !strings.Contains(err.Error(), phrase) {
 				t.Fatalf("refusal does not carry %q:\n%s", phrase, err)
 			}
+		}
+
+		if _, err := s.auditDB.AddIdentityBinding(ctx, audit.IdentityBinding{
+			Kind: audit.BindCIDR, Key: "192.168.0.0/16", Identity: "office",
+		}); err != nil {
+			t.Fatalf("second bind: %v", err)
+		}
+		if got := s.guardCIDRBindings(ctx).Error(); !strings.Contains(got, "2 CIDR identity bindings exist while") {
+			t.Fatalf("plural branch reads wrong:\n%s", got)
 		}
 	})
 
@@ -271,4 +285,139 @@ func TestStartRefusesACIDRBindingUnderDefaultTrustedProxies(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The seam nothing asserted: what bodega doctor writes is what its client
+// sends. TestEveryClientCredentialFormParses drives headers written by hand,
+// so both halves could drift the same way and stay green. This one renders
+// each target through the writer, reads it back the way its client does, and
+// puts the result on the wire.
+//
+// The readers below are deliberately small and literal. They are not a claim
+// that this is how apt or cargo parse their files; they are a claim about
+// where the credential sits in the file bodega wrote, which is the half of the
+// contract bodega owns.
+func TestDoctorWritesWhatEachClientSends(t *testing.T) {
+	const tok = "bodega_ak_deadbeef"
+	base, err := url.Parse("https://bodega.internal")
+	if err != nil {
+		t.Fatalf("parse base: %v", err)
+	}
+
+	readers := map[string]func(*testing.T, string) string{
+		"apt":    netrcHeader,
+		"pip":    netrcHeader,
+		"npm":    npmHeader,
+		"gomod":  netrcHeader,
+		"cargo":  cargoHeader,
+		"helm":   helmHeader,
+		"git":    netrcHeader,
+		"binary": netrcHeader,
+	}
+	forms := map[string]credentialForm{
+		"apt": formBasic, "pip": formBasic, "npm": formBearer, "gomod": formBasic,
+		"cargo": formRaw, "helm": formBasic, "git": formBasic, "binary": formBasic,
+	}
+
+	targets := host.CredentialTargets(t.TempDir())
+	if len(targets) != len(readers) {
+		t.Fatalf("%d targets, %d readers; every client bodega writes for must be read back", len(targets), len(readers))
+	}
+	for _, target := range targets {
+		t.Run(target.Client, func(t *testing.T) {
+			read, ok := readers[target.Client]
+			if !ok {
+				t.Fatalf("no reader for %q", target.Client)
+			}
+			header := read(t, target.Render(base, tok))
+
+			r := httptest.NewRequest(http.MethodGet, "/apt/dists/noble/Release", nil)
+			r.Header.Set("Authorization", header)
+			got, form := credentialFrom(r)
+			if got != tok {
+				t.Fatalf("%s: the file doctor wrote yields %q on the wire, not the token", target.Client, got)
+			}
+			if form != forms[target.Client] {
+				t.Fatalf("%s: parsed as form %q, want %q", target.Client, form, forms[target.Client])
+			}
+		})
+	}
+}
+
+// netrcHeader reads the login and password for the one machine in the file and
+// sends them as Basic, which is what libcurl, requests and the go toolchain
+// each do with a netrc entry.
+func netrcHeader(t *testing.T, file string) string {
+	t.Helper()
+	fields := strings.Fields(file)
+	var login, password string
+	for i := 0; i+1 < len(fields); i++ {
+		switch fields[i] {
+		case "login":
+			login = fields[i+1]
+		case "password":
+			password = fields[i+1]
+		}
+	}
+	if login == "" || password == "" {
+		t.Fatalf("no netrc login/password in:\n%s", file)
+	}
+	return basicAuth(login, password)
+}
+
+// npmHeader takes the _authToken npm keys on the registry path and sends it as
+// Bearer, which is npm's own wire form.
+func npmHeader(t *testing.T, file string) string {
+	t.Helper()
+	for _, line := range strings.Split(file, "\n") {
+		_, value, ok := strings.Cut(line, ":_authToken=")
+		if ok {
+			return "Bearer " + strings.TrimSpace(value)
+		}
+	}
+	t.Fatalf("no _authToken in:\n%s", file)
+	return ""
+}
+
+// cargoHeader takes the registry token and sends it as the whole Authorization
+// value, with no scheme. Cargo is the only client bodega serves that does this.
+func cargoHeader(t *testing.T, file string) string {
+	t.Helper()
+	inRegistry := false
+	for _, line := range strings.Split(file, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "[") {
+			inRegistry = line == "[registries.bodega]"
+			continue
+		}
+		if !inRegistry {
+			continue
+		}
+		if rest, ok := strings.CutPrefix(line, "token = "); ok {
+			return strings.Trim(rest, `"`)
+		}
+	}
+	t.Fatalf("no [registries.bodega] token in:\n%s", file)
+	return ""
+}
+
+// helmHeader takes the username and password off the bodega repository entry
+// and sends them as Basic, which is what helm does with a repo that carries
+// credentials.
+func helmHeader(t *testing.T, file string) string {
+	t.Helper()
+	var user, pass string
+	for _, line := range strings.Split(file, "\n") {
+		line = strings.TrimSpace(line)
+		if rest, ok := strings.CutPrefix(line, "username: "); ok {
+			user = rest
+		}
+		if rest, ok := strings.CutPrefix(line, "password: "); ok {
+			pass = rest
+		}
+	}
+	if user == "" || pass == "" {
+		t.Fatalf("no credential on the helm repository entry:\n%s", file)
+	}
+	return basicAuth(user, pass)
 }

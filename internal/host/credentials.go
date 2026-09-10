@@ -26,7 +26,8 @@ import (
 // fence is read or altered.
 //
 // Every format below takes `#` to end of line as a comment: netrc (apt's
-// parser and Go's both strip it), npm's ini, cargo's TOML, and YAML.
+// parser and Go's both strip it, confirmed against apt 2.8.3 on noble), npm's
+// ini, cargo's TOML, and YAML.
 const (
 	managedBegin = "# BEGIN bodega credential — written by bodega doctor --write-credentials"
 	managedEnd   = "# END bodega credential"
@@ -58,6 +59,13 @@ type CredentialTarget struct {
 	// appendGuard refuses an append into a file whose shape would not carry
 	// the block. Only helm has one; nil means appending is always legal.
 	appendGuard func(existing string) error
+
+	// createDoc wraps the block in the surrounding document a client needs
+	// when bodega is the one creating the file. nil means the block stands
+	// alone, which is true of every format here that a client reads line by
+	// line. Only helm, which unmarshals the whole file into a struct, needs
+	// keys around the entry before its parser will accept it.
+	createDoc func(block string) string
 }
 
 // CredentialTargets returns every target in a stable order, resolved against
@@ -75,7 +83,7 @@ func CredentialTargets(home string) []CredentialTarget {
 			Path:   "/etc/apt/auth.conf.d/bodega.conf",
 			Mode:   0o600,
 			whole:  true,
-			body:   netrcEntry,
+			body:   aptNetrcEntry,
 		},
 		{
 			Client: "pip",
@@ -110,6 +118,7 @@ func CredentialTargets(home string) []CredentialTarget {
 			Mode:        0o600,
 			body:        helmEntry,
 			appendGuard: helmAppendable,
+			createDoc:   helmDocument,
 		},
 		{
 			Client: "git",
@@ -132,6 +141,26 @@ func netrcEntry(base *url.URL, token string) string {
 	return fmt.Sprintf("machine %s\n  login bodega\n  password %s", base.Hostname(), token)
 }
 
+// aptNetrcEntry annotates the machine line with the scheme, which is apt's own
+// extension to netrc and the reason apt has a file to itself.
+//
+// A bare `machine <host>` matches, and apt then declines to send it over plain
+// HTTP: "Credentials for <host> match, but the protocol is not encrypted.
+// Annotate with http:// to use." Unannotated, the entry is inert on every
+// plaintext deployment and the request falls through to whatever the address
+// resolves to. Annotated, it also narrows the credential to the scheme bodega
+// told clients to use rather than offering it on both.
+//
+// The four clients sharing ~/.netrc get netrcEntry instead: libcurl, requests
+// and the go toolchain each read plain netrc, where a scheme in the machine
+// name is not a host they will ever match.
+func aptNetrcEntry(base *url.URL, token string) string {
+	if base.Scheme == "" {
+		return netrcEntry(base, token)
+	}
+	return fmt.Sprintf("machine %s://%s\n  login bodega\n  password %s", base.Scheme, base.Hostname(), token)
+}
+
 func npmEntry(base *url.URL, token string) string {
 	// npm keys the credential on the registry path, not the host, so the
 	// _authToken is scoped to bodega's npm route and travels with nothing else.
@@ -148,6 +177,21 @@ func cargoEntry(_ *url.URL, token string) string {
 func helmEntry(base *url.URL, token string) string {
 	return fmt.Sprintf("- name: bodega\n  url: %s/helm\n  username: bodega\n  password: %s\n  insecure_skip_tls_verify: false",
 		strings.TrimSuffix(base.String(), "/"), token)
+}
+
+// Render returns the file contents this target lands on a host that has none.
+// For every target but helm that is the fenced block alone; helm's parser
+// needs the surrounding document, so createDoc supplies it.
+//
+// Exported so a caller can see what a client will read without writing
+// anything, which is the only way to inspect the apt target: it resolves to
+// /etc/apt/auth.conf.d and nowhere else.
+func (t CredentialTarget) Render(base *url.URL, token string) string {
+	block := managedBegin + "\n" + t.body(base, token) + "\n" + managedEnd + "\n"
+	if t.createDoc != nil {
+		return t.createDoc(block)
+	}
+	return block
 }
 
 // WriteCredential renders t's block for base and token and lands it in t.Path,
@@ -176,7 +220,7 @@ func WriteCredential(t CredentialTarget, base *url.URL, token string) (bool, err
 	var next string
 	switch {
 	case t.whole || existing == "":
-		next = block
+		next = t.Render(base, token)
 	default:
 		if t.appendGuard != nil && !strings.Contains(existing, managedBegin) {
 			// Only an append can land in the wrong place. Replacing a block
@@ -230,6 +274,19 @@ func spliceManaged(existing, block string) (string, error) {
 		end++
 	}
 	return existing[:start] + block + rest[end:], nil
+}
+
+// helmDocument is the repositories.yaml bodega writes when the host has none.
+//
+// helm unmarshals this file into a struct, so a bare YAML sequence is not a
+// partial file it tolerates: it is rejected whole, and every later
+// `helm repo add` fails with it until someone deletes the file. The entry
+// needs the top-level keys around it, which is the same rule helmAppendable
+// enforces on a file that already exists. The zero timestamp keeps a second
+// --write-credentials run byte-identical; helm rewrites it on its own next
+// write.
+func helmDocument(block string) string {
+	return "apiVersion: \"\"\ngenerated: \"0001-01-01T00:00:00Z\"\nrepositories:\n" + block
 }
 
 // helmAppendable refuses to append a repository under a repositories.yaml

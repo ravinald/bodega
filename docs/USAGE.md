@@ -668,14 +668,16 @@ bodega identity unbind cidr 10.20.0.0/16
 
 **One token or one CIDR resolves to at most one identity.** A second binding that would make the answer ambiguous is refused here, at write time, and the refusal names the binding it collided with:
 
-```
-refusing to bind cidr 10.0.0.0/8 to "ci": 10.0.0.0/8 covers the same addresses at the same
-prefix length, so longest-prefix resolution could not choose between them.
+```text
+$ bodega identity bind cidr ::ffff:10.0.0.0/104 ci
+refusing to bind cidr 10.0.0.0/8 to "ci": that cidr is already bound to "fleet".
   Already bound: cidr 10.0.0.0/8 -> fleet
   Remove it first (bodega identity unbind cidr 10.0.0.0/8), or bind to the same identity
 ```
 
-Two prefixes of different lengths over the same addresses are fine, and are what longest-prefix resolution is for: `10.0.0.0/8` as `fleet` and `10.20.0.0/16` as `devbox` coexist, and `10.20.0.9` resolves to `devbox`. Keys are normalized before they are stored, so `10.20.5.9/16` bound is `10.20.0.0/16` listed, a bare address is a `/32` or `/128`, and `::ffff:10.0.0.0/104` is the same key as `10.0.0.0/8`.
+Keys are normalized before they are stored, which is why that reads as a plain collision rather than an overlap: `10.20.5.9/16` bound is `10.20.0.0/16` listed, a bare address is a `/32` or `/128`, and `::ffff:10.0.0.0/104` is the same key as `10.0.0.0/8`. Two masked prefixes of the same length are then either the same key or disjoint, so the refusal always names the row you collided with and the command that undoes it.
+
+Two prefixes of different lengths over the same addresses are fine, and are what longest-prefix resolution is for: `10.0.0.0/8` as `fleet` and `10.20.0.0/16` as `devbox` coexist, and `10.20.0.9` resolves to `devbox`.
 
 Rebinding a key to the identity it already has is a no-op, not an error, so a config-management run can assert the binding every hour.
 
@@ -726,7 +728,7 @@ bodega doctor --write-credentials --token bodega_ak_... --url https://bodega.int
 
 | Client   | File                               | Form                                   |
 | -------- | ---------------------------------- | -------------------------------------- |
-| `apt`    | `/etc/apt/auth.conf.d/bodega.conf` | netrc `machine` / `login` / `password` |
+| `apt`    | `/etc/apt/auth.conf.d/bodega.conf` | netrc, `machine <scheme>://<host>`     |
 | `pip`    | `~/.netrc`                         | read through requests                  |
 | `npm`    | `~/.npmrc`                         | `//host/npm/:_authToken=`              |
 | `gomod`  | `~/.netrc`                         | read for the `GOPROXY` host            |
@@ -737,11 +739,23 @@ bodega doctor --write-credentials --token bodega_ak_... --url https://bodega.int
 
 pip, go, git and curl/wget all read `~/.netrc`, so one host-scoped entry serves four clients and there is one secret to rotate rather than four. The table `doctor` prints reports `current` for the three that find the entry the first already wrote.
 
+apt gets a file to itself because its `machine` line carries the scheme, which plain netrc does not understand. Bare, apt matches the host and then declines: `Credentials for <host> match, but the protocol is not encrypted. Annotate with http:// to use.` — so an unannotated entry is inert on every plaintext deployment. `doctor` writes the scheme from `--url`, which also keeps the credential to the scheme bodega told clients to use rather than offering it on both. Verified against apt 2.8.3 on noble over `http` and `https`; the `#` fence is a comment to apt's parser and is skipped.
+
 Every write is fenced by a marker comment and replaced in place on a second run, so nothing an operator wrote in those files is touched and a rotation leaves no old token behind. The apt file needs root and the other four do not; a run as a normal user configures seven clients, names the one it could not, and exits 2.
 
 helm's `repositories.yaml` is the one target where appending is not always legal. A file whose `repositories:` list is not last would take an appended entry into whatever key followed, so `doctor` refuses that file and prints the `helm repo add bodega <url> --username bodega --password <token>` line to run instead.
 
-Writing a credential changes what an audit row says, never what the host may fetch.
+Writing a credential changes what an audit row says, never what the host may fetch. It does change what the host may **write**, which is why `doctor` prints this before it touches a file:
+
+```text
+Before writing: bodega tokens carry no scope, so this same token is the
+credential half of the mutation gate. A host that holds it and whose address
+is inside admin_permit_cidr can POST and DELETE against this bodega.
+  Keep admin_permit_cidr at loopback (bodega acl admin list), or treat every
+  host you write a credential to as admin-capable.
+```
+
+`bodega token generate` takes a label and nothing else: a token is a token. The mutation gate accepts any unexpired one of them once `admin_permit_cidr` reaches past loopback, so the credential in a build host's `~/.netrc` is also the credential that authorizes `POST /api/v1/...` from that host. Keeping `admin_permit_cidr` at loopback makes the gate ignore tokens entirely and is the remedy that costs nothing; otherwise every host you write a credential to is admin-capable and should be treated that way. Scoped tokens would sever the two and do not exist yet. See [Threat model](THREAT_MODEL.md).
 
 ### `bodega policy list [--type TYPE]`
 

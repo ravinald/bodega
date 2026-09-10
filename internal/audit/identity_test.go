@@ -60,8 +60,9 @@ func TestBindingRefusesASecondIdentityForOneKey(t *testing.T) {
 }
 
 // Requirement 3's refusal. Two /8s covering 10.0.0.1 are the same network
-// spelled two ways, and the IPv4-mapped spelling is the one a primary key
-// alone would let through.
+// spelled two ways, and NormalizeBindCIDR is what makes them one key: the
+// refusal an operator sees names the key collision, and the equal-prefix
+// overlap check never has to fire on a write that came through here.
 func TestBindingRefusesEqualPrefixCoveringTheSameAddress(t *testing.T) {
 	ctx := context.Background()
 	db := newIdentityTestDB(t)
@@ -80,6 +81,9 @@ func TestBindingRefusesEqualPrefixCoveringTheSameAddress(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "10.0.0.0/8") {
 		t.Fatalf("refusal does not name the first binding:\n%s", err)
+	}
+	if !strings.Contains(err.Error(), `already bound to "fleet"`) {
+		t.Fatalf("refusal does not read as the key collision normalization makes it:\n%s", err)
 	}
 
 	// A different prefix length over the same addresses is legal: that is what

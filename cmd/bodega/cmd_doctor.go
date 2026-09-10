@@ -155,6 +155,8 @@ func writeClientCredentials(gf *globalFlags, token, baseURL string) error {
 		return fmt.Errorf("resolve home directory: %w", err)
 	}
 
+	printCredentialPrecondition()
+
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "CLIENT\tSTATUS\tFILE\tNOTE")
 	failed := 0
@@ -183,6 +185,23 @@ func writeClientCredentials(gf *globalFlags, token, baseURL string) error {
 	fmt.Println("Credential written. bodega attributes a request carrying it to whatever")
 	fmt.Println("bodega identity bind token <id> <name> named, and serves it either way.")
 	return nil
+}
+
+// printCredentialPrecondition states what the token being written can do
+// beyond the read path, before the write rather than after it.
+//
+// api_tokens rows carry no scope, so the mutation gate accepts any unexpired
+// one of them as its credential half. Read-path attribution is the reason this
+// command exists, but the token it distributes is the same credential, and a
+// client host inside admin_permit_cidr gains write access the moment it holds
+// one. Nothing in the read path grants that; the absence of scopes does.
+func printCredentialPrecondition() {
+	fmt.Println("Before writing: bodega tokens carry no scope, so this same token is the")
+	fmt.Println("credential half of the mutation gate. A host that holds it and whose address")
+	fmt.Println("is inside admin_permit_cidr can POST and DELETE against this bodega.")
+	fmt.Println("  Keep admin_permit_cidr at loopback (bodega acl admin list), or treat every")
+	fmt.Println("  host you write a credential to as admin-capable.")
+	fmt.Println()
 }
 
 // postureChecks names the server-posture rows in the order doctor prints them.
