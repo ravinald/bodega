@@ -15,7 +15,14 @@ import (
 // installed on db01 and db02 came from both. A catalog holding four hosts'
 // inventories that records only the last writer cannot answer which machine
 // contributed a row, which is the first question anyone asks of it.
-const MetaOrigin = "origin"
+//
+// The leading underscore marks it as bodega's own record rather than a field
+// of the ecosystem being served, which is what keeps it out of a generated
+// index: the apt Packages generator copies unrecognized metadata keys into the
+// stanza verbatim, and that file is served unauthenticated to every host
+// pointed at bodega. deb822 field names are also case-insensitive, so a bare
+// "origin" is the Origin field the generator suppresses on purpose.
+const MetaOrigin = "_origin"
 
 // Origins lists the hosts recorded on a version entry, in the order they were
 // added. First-seen order is kept so the machine that introduced a package
@@ -36,10 +43,12 @@ func Origins(ve manifest.VersionEntry) []string {
 
 // ApplyOrigin records origin on every version entry of pm that carries none.
 //
-// An entry already naming a different host fails rather than being
+// An entry naming hosts that do not include origin fails rather than being
 // overwritten. The flag and the payload are two claims about where the row
 // came from, and silently preferring either discards the fact the field exists
-// to hold.
+// to hold. An entry that already lists origin among its hosts agrees with the
+// flag: re-importing a merged export of db01 and db02 with --origin db01 is a
+// restatement, not a contradiction.
 func ApplyOrigin(pm *manifest.PackageManifest, origin string) error {
 	origin = strings.TrimSpace(origin)
 	if origin == "" {
@@ -55,7 +64,7 @@ func ApplyOrigin(pm *manifest.PackageManifest, origin string) error {
 			setOrigins(ve, []string{origin})
 			continue
 		}
-		if len(have) == 1 && have[0] == origin {
+		if slices.Contains(have, origin) {
 			continue
 		}
 		return fmt.Errorf("%s/%s version %s: --origin %s disagrees with the origin already on the payload (%s); "+

@@ -210,7 +210,7 @@ func TestBulkImportRefusesAnOversizedBody(t *testing.T) {
 // aptManifestFrom is aptManifest with the origin the host cataloging it
 // recorded.
 func aptManifestFrom(name, version, origin string) string {
-	return fmt.Sprintf(`{"config_version":1,"name":%q,"type":"apt","versions":[{"version":%q,"source_name":%q,"metadata":{"origin":%q}}]}`,
+	return fmt.Sprintf(`{"config_version":1,"name":%q,"type":"apt","versions":[{"version":%q,"source_name":%q,"metadata":{"_origin":%q}}]}`,
 		name, version, name, origin)
 }
 

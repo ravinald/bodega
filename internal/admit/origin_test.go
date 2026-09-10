@@ -51,6 +51,25 @@ func TestApplyOriginAcceptsAMatchingPayload(t *testing.T) {
 	}
 }
 
+// A flag naming one of several recorded hosts restates what the payload says.
+// Re-importing an export that merged db01 and db02 with --origin db01 has to
+// pass, or the same catalog is importable one host earlier and not after.
+func TestApplyOriginAcceptsAPayloadThatAlreadyListsTheHost(t *testing.T) {
+	pm := pkg("requests", entry("2.31.0", "db01", "db02"))
+	if err := ApplyOrigin(pm, "db01"); err != nil {
+		t.Fatalf("--origin db01 over a payload naming db01,db02 must pass: %v", err)
+	}
+	if err := ApplyOrigin(pm, "db03"); err == nil {
+		t.Error("--origin db03 over a payload naming db01,db02 must fail")
+	} else {
+		for _, want := range []string{"db01", "db02", "db03"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not name %s", err, want)
+			}
+		}
+	}
+}
+
 func TestApplyOriginRefusesACommaInTheName(t *testing.T) {
 	if err := ApplyOrigin(pkg("requests", entry("2.31.0")), "db01,db02"); err == nil {
 		t.Fatal("a comma is the list separator; one name cannot carry it")

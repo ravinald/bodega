@@ -110,7 +110,7 @@ func TestImportOriginStampsAPayloadCarryingNone(t *testing.T) {
 func TestImportOriginRefusesAPayloadThatDisagrees(t *testing.T) {
 	env := newDiscoverEnv(t)
 	catalog := writeTemp(t, "catalog.json", `[{"config_version":1,"name":"requests","type":"pypi",`+
-		`"versions":[{"version":"2.31.0","metadata":{"origin":"db02"}}]}]`)
+		`"versions":[{"version":"2.31.0","metadata":{"_origin":"db02"}}]}]`)
 
 	err := runImport(t, "--origin", "db01", catalog)
 	if err == nil {
@@ -133,7 +133,7 @@ func TestImportMergeAccumulatesOrigins(t *testing.T) {
 	env := newDiscoverEnv(t)
 	catalogFrom := func(host string) string {
 		return fmt.Sprintf(`[{"config_version":1,"name":"requests","type":"pypi",`+
-			`"versions":[{"version":"2.31.0","metadata":{"origin":%q}}]}]`, host)
+			`"versions":[{"version":"2.31.0","metadata":{"_origin":%q}}]}]`, host)
 	}
 
 	if err := runImport(t, writeTemp(t, "db01.json", catalogFrom("db01"))); err != nil {
@@ -154,7 +154,7 @@ func TestImportMergeAccumulatesOrigins(t *testing.T) {
 func TestExportThenImportPreservesOrigins(t *testing.T) {
 	source := newDiscoverEnv(t)
 	catalog := writeTemp(t, "catalog.json", `[{"config_version":1,"name":"requests","type":"pypi",`+
-		`"versions":[{"version":"2.31.0","metadata":{"origin":"db01,db02"}}]}]`)
+		`"versions":[{"version":"2.31.0","metadata":{"_origin":"db01,db02"}}]}]`)
 	if err := runImport(t, catalog); err != nil {
 		t.Fatalf("seed import: %v", err)
 	}

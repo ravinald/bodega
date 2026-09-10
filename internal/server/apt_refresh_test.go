@@ -19,6 +19,7 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/aptsign"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -601,5 +602,49 @@ func TestArchitectureLessEntryIsLogged(t *testing.T) {
 				t.Errorf("the entry was also reported as unpooled, which names the wrong fix:\n%s", logged)
 			}
 		})
+	}
+}
+
+// TestOriginStaysOutOfThePackagesIndex pins the boundary the metadata key's
+// underscore prefix exists to hold. The Packages file is served
+// unauthenticated to every host pointed at bodega, and the extras loop copies
+// any key it does not recognize into the stanza, so a bare "origin" would
+// publish the internal hostnames of every machine that contributed a row.
+func TestOriginStaysOutOfThePackagesIndex(t *testing.T) {
+	s, cs, _ := refreshTestServer(t)
+	cs.Seed("packages/apt/pool/main/c/curl/curl_8.5.0_amd64.deb", "\x00deb")
+	if err := s.store.AddVersion(t.Context(), manifest.TypeApt, "curl", manifest.VersionEntry{
+		Version:      "8.5.0",
+		SourceName:   "curl",
+		ArtifactSize: 10,
+		Metadata: map[string]string{
+			"Architecture":   "amd64",
+			"_pool_path":     "pool/main/c/curl/curl_8.5.0_amd64.deb",
+			admit.MetaOrigin: "db01,db02",
+		},
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+	if err := s.store.SaveIndex(t.Context()); err != nil {
+		t.Fatalf("SaveIndex: %v", err)
+	}
+
+	got := string(s.generateAptPackages(t.Context(), "noble", "amd64", nil, false))
+
+	if !strings.Contains(got, "Package: curl") {
+		t.Fatalf("the entry never reached the index, so the assertions below prove nothing:\n%s", got)
+	}
+	for _, leak := range []string{"db01", "db02"} {
+		if strings.Contains(got, leak) {
+			t.Errorf("the Packages index published the hostname %q:\n%s", leak, got)
+		}
+	}
+	// deb822 field names are case-insensitive, so an "origin:" stanza line is
+	// the Origin field this generator suppresses on purpose, whatever its case.
+	for _, line := range strings.Split(got, "\n") {
+		field, _, ok := strings.Cut(line, ":")
+		if ok && strings.EqualFold(strings.TrimPrefix(field, "_"), "Origin") {
+			t.Errorf("the Packages index carries an Origin field (%q):\n%s", line, got)
+		}
 	}
 }

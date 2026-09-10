@@ -244,7 +244,7 @@ Without `--merge`, importing a package that already exists is an error. With `--
 
 #### `--origin`
 
-Every version entry records the host it was cataloged from, under the `origin` metadata key. `bodega pkg convert` stamps it and the import preserves what arrives. The field is what lets a catalog holding four hosts' inventories answer which machine contributed a row, and what lets a baseline set for a class of host be built from the machine that defines the class.
+Every version entry records the host it was cataloged from, under the `_origin` metadata key. `bodega pkg convert` stamps it and the import preserves what arrives. The field is what lets a catalog holding four hosts' inventories answer which machine contributed a row, and what lets a baseline set for a class of host be built from the machine that defines the class.
 
 `--origin` sets it on a file that carries none: an inventory captured by hand, or a manifest written before the field existed. A file whose entries already name a _different_ host fails the import, naming both:
 
@@ -254,6 +254,8 @@ Error: db02-catalog.json: pypi/requests version 2.31.0: --origin db01 disagrees 
 ```
 
 Nothing is written. Two claims about where a row came from cannot both be true, and picking one silently is how the field stops being evidence.
+
+A flag naming a host the entry already lists passes. `--origin db01` over an entry recording `db01,db02` restates what the file says, so re-importing an export that merged two hosts does not have to drop the flag it was captured with.
 
 `--merge` **adds** an origin rather than replacing it. A package installed on `db01` and `db02` came from both, so a second host reporting a version already in the store leaves the entry recording `db01,db02`. Nothing else on that entry moves, which is what keeps a `hosted` version from being downgraded to `proxy`.
 
@@ -287,7 +289,7 @@ pip list --format=json | bodega pkg convert pypi | bodega pkg import -
 bodega pkg convert apt --origin db01 db01-installed.txt
 ```
 
-Every version entry is stamped with the host the inventory describes, under the `origin` metadata key, defaulting to this machine's hostname. That is what running convert on the host buys beyond reading the inventory: a catalog assembled from four machines can name the contributor of each row, and a baseline for a class of host can be built from the machine that defines the class. `--origin <name>` names the host when the capture was taken there and converted somewhere else. See [`--origin`](#--origin) for what the import does with it.
+Every version entry is stamped with the host the inventory describes, under the `_origin` metadata key, defaulting to this machine's hostname. That is what running convert on the host buys beyond reading the inventory: a catalog assembled from four machines can name the contributor of each row, and a baseline for a class of host can be built from the machine that defines the class. `--origin <name>` names the host when the capture was taken there and converted somewhere else. See [`--origin`](#--origin) for what the import does with it.
 
 | Type | Source command |
 |------|----------------|
@@ -2206,7 +2208,7 @@ It is a separate route from `POST /api/v1/packages/{type}` because the two want 
 
 - **Body**: a JSON array of `PackageManifest`, or one manifest per line (NDJSON). Both decode one manifest at a time, so a large catalog never lands in memory whole. Types may be mixed in one push.
 - **Size**: 64 MiB, against 1 MiB on the single-package route. A bare 2000-package catalog is only about 220 KB, but a `pkg export` of a populated store carries architecture, section, pool path and description per entry and clears 1 MiB well before it clears the package count.
-- **`?merge=true`**: adds versions to packages that already exist, matching `pkg import --merge`. A recorded version is never overwritten, which keeps a `hosted` entry from being downgraded to `proxy` by a re-import. The `origin` metadata key is the exception: a merge unions it, so a version reported by `db01` and then by `db02` records both. This route, `POST /api/v1/packages/{type}` and `bodega pkg import` share one merge, so the answer cannot depend on which surface wrote it.
+- **`?merge=true`**: adds versions to packages that already exist, matching `pkg import --merge`. A recorded version is never overwritten, which keeps a `hosted` entry from being downgraded to `proxy` by a re-import. The `_origin` metadata key is the exception: a merge unions it, so a version reported by `db01` and then by `db02` records both. This route and `bodega pkg import` share one merge, `admit.MergeVersions`, so the answer cannot depend on which of the two wrote it. `POST /api/v1/packages/{type}` does not merge at all: it answers `409 Conflict` on a package that already exists. All three share `admit.Admit`.
 - **Status**: `200` whenever the body parsed, including when every package was refused. `400` for a body that is not manifests, `413` over the size limit.
 
 ```json
