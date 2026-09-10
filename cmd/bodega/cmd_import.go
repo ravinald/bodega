@@ -21,6 +21,7 @@ import (
 
 func newImportCmd(gf *globalFlags) *cobra.Command {
 	var merge bool
+	var origin string
 	var serverURL string
 	var allowPlaintext bool
 
@@ -40,6 +41,13 @@ Examples:
   bodega pkg import bundle.json             # array of many packages
   cat manifest.json | bodega pkg import -
   bodega pkg import --merge updated.json    # add versions to existing package
+  bodega pkg import --origin db01 catalog.json
+
+Every version entry carries the host it was cataloged from, stamped by
+'bodega pkg convert'. That is preserved as it arrives. --origin sets it on a
+file that carries none, and refuses a file whose entries already name a
+different host rather than picking a winner. --merge adds a new origin to a
+version that already has one: a package on db01 and db02 came from both.
 
 With --server, the manifests are sent to a running bodega instead of written
 locally. That is how a host catalogs itself: 'bodega pkg convert' reads the
@@ -61,7 +69,7 @@ server_url in the config file, and the bearer token from $BODEGA_TOKEN.
 			// exactly what this flag exists to avoid.
 			if target := cfg.ResolveServerURL(serverURL); target != "" {
 				suppressReload(cmd)
-				return importToServer(target, cfg.ResolveToken(), allowPlaintext, merge, args)
+				return importToServer(target, cfg.ResolveToken(), allowPlaintext, merge, origin, args)
 			}
 
 			if err := ensureMutable(cfg); err != nil {
@@ -98,6 +106,9 @@ server_url in the config file, and the bearer token from $BODEGA_TOKEN.
 
 				for i := range pms {
 					pm := &pms[i]
+					if err := admit.ApplyOrigin(pm, origin); err != nil {
+						return fmt.Errorf("%s: %w", path, err)
+					}
 					res := admit.Admit(ctx, checker, adb, cfg, pm, audit.CurrentActor())
 					for _, w := range res.Warnings {
 						fmt.Fprintf(os.Stderr, "%s/%s: %s\n", pm.Type, pm.Name, w)
@@ -112,19 +123,7 @@ server_url in the config file, and the bearer token from $BODEGA_TOKEN.
 					}
 
 					if existing != nil && merge {
-						// Merge new versions into existing package.
-						for _, ve := range pm.Versions {
-							found := false
-							for _, ev := range existing.Versions {
-								if ev.Version == ve.Version {
-									found = true
-									break
-								}
-							}
-							if !found {
-								existing.Versions = append(existing.Versions, ve)
-							}
-						}
+						admit.MergeVersions(existing, pm)
 						if err := store.SavePackage(ctx, existing); err != nil {
 							return fmt.Errorf("save %s/%s: %w", pm.Type, pm.Name, err)
 						}
@@ -165,6 +164,7 @@ server_url in the config file, and the bearer token from $BODEGA_TOKEN.
 	}
 
 	cmd.Flags().BoolVar(&merge, "merge", false, "Merge versions into existing package instead of rejecting duplicates")
+	cmd.Flags().StringVar(&origin, "origin", "", "Host these manifests were cataloged from; refused when the payload already names a different one")
 	cmd.Flags().StringVar(&serverURL, "server", "", "Push to this bodega server instead of writing the local manifest store")
 	cmd.Flags().BoolVar(&allowPlaintext, "allow-plaintext", false, "Permit --server over http; refused by default because a bearer token would travel in the clear")
 	return cmd
@@ -231,7 +231,7 @@ func checkBackendName(cfg *config.Config, name string) error {
 // A partial landing is normal for a host catalog and is not an error: the
 // packages that were refused are named, and the exit status reflects only
 // whether anything failed to land at all.
-func importToServer(target, token string, allowPlaintext, merge bool, paths []string) error {
+func importToServer(target, token string, allowPlaintext, merge bool, origin string, paths []string) error {
 	client, err := NewClient(target, token, allowPlaintext)
 	if err != nil {
 		return err
@@ -246,6 +246,11 @@ func importToServer(target, token string, allowPlaintext, merge bool, paths []st
 		batch, err := decodeManifests(data)
 		if err != nil {
 			return fmt.Errorf("parse %s: %w", path, err)
+		}
+		for i := range batch {
+			if err := admit.ApplyOrigin(&batch[i], origin); err != nil {
+				return fmt.Errorf("%s: %w", path, err)
+			}
 		}
 		pms = append(pms, batch...)
 	}

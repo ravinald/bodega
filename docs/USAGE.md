@@ -222,6 +222,7 @@ bodega pkg import nginx.json                       # import from file
 bodega pkg import packages/*.json                  # import multiple files
 cat manifest.json | bodega pkg import -            # import from stdin
 bodega pkg import --merge updated.json             # add versions to existing package
+bodega pkg import --origin db01 catalog.json       # stamp a payload that carries none
 ```
 
 The JSON format is the same `PackageManifest` used internally:
@@ -240,6 +241,25 @@ The JSON format is the same `PackageManifest` used internally:
 ```
 
 Without `--merge`, importing a package that already exists is an error. With `--merge`, new versions are added to the existing package.
+
+#### `--origin`
+
+Every version entry records the host it was cataloged from, under the `_origin` metadata key. `bodega pkg convert` stamps it and the import preserves what arrives. The field is what lets a catalog holding four hosts' inventories answer which machine contributed a row, and what lets a baseline set for a class of host be built from the machine that defines the class.
+
+`--origin` sets it on a file that carries none: an inventory captured by hand, or a manifest written before the field existed. A file whose entries already name a _different_ host fails the import, naming both:
+
+```console
+$ bodega pkg import --origin db01 db02-catalog.json
+Error: db02-catalog.json: pypi/requests version 2.31.0: --origin db01 disagrees with the origin already on the payload (db02); drop the flag to keep what the file records, or re-run 'bodega pkg convert --origin' against the inventory
+```
+
+Nothing is written. Two claims about where a row came from cannot both be true, and picking one silently is how the field stops being evidence.
+
+A flag naming a host the entry already lists passes. `--origin db01` over an entry recording `db01,db02` restates what the file says, so re-importing an export that merged two hosts does not have to drop the flag it was captured with.
+
+`--merge` **adds** an origin rather than replacing it. A package installed on `db01` and `db02` came from both, so a second host reporting a version already in the store leaves the entry recording `db01,db02`. Nothing else on that entry moves, which is what keeps a `hosted` version from being downgraded to `proxy`.
+
+`--origin` applies on the `--server` path too: the payload is stamped on the host before it is pushed, so `POST /api/v1/packages/import` receives the same field a local import would have written.
 
 #### Importing to a remote server
 
@@ -266,7 +286,10 @@ Run it on the host being cataloged. It reads stdin by default, writes JSON to st
 dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\n' | bodega pkg convert apt > catalog.json
 apt list --installed | bodega pkg convert apt -o catalog.json
 pip list --format=json | bodega pkg convert pypi | bodega pkg import -
+bodega pkg convert apt --origin db01 db01-installed.txt
 ```
+
+Every version entry is stamped with the host the inventory describes, under the `_origin` metadata key, defaulting to this machine's hostname. That is what running convert on the host buys beyond reading the inventory: a catalog assembled from four machines can name the contributor of each row, and a baseline for a class of host can be built from the machine that defines the class. `--origin <name>` names the host when the capture was taken there and converted somewhere else. See [`--origin`](#--origin) for what the import does with it.
 
 | Type | Source command |
 |------|----------------|
@@ -295,6 +318,8 @@ Every skip and every gap is reported on stderr, so stdout stays a clean payload 
 
 ```bash
 # On the host being cataloged. Neither step needs a manifest store here.
+# Every entry is stamped with this machine's hostname, so the catalog can
+# still name the contributor once other hosts land in it.
 dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\n' \
   | bodega pkg convert apt > catalog.json
 
@@ -313,7 +338,17 @@ dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\n' \
   | bodega pkg import --server https://bodega.example --merge -
 ```
 
-`--merge` never overwrites a recorded version, so an entry someone promoted to `hosted` stays hosted.
+`--merge` never overwrites a recorded version, so an entry someone promoted to `hosted` stays hosted. The origins are the one thing it adds to a version already in the store: run the same package through from `db01` and from `db02` and the entry records both, which is the fact the field exists to hold.
+
+Converting a capture taken on another machine needs the name passed:
+
+```bash
+# The dpkg-query output was collected on db01 and copied here.
+bodega pkg convert apt --origin db01 db01-installed.txt \
+  | bodega pkg import --server https://bodega.example --merge -
+```
+
+`bodega show pkg apt <name>` prints an `ORIGIN` column naming the hosts behind each version, and `bodega pkg export` carries the field, so a catalog stays attributable across a migration between instances. The `bodega show repo` table withholds it: an origin is an internal hostname, and that view renders what a client may see. `bodega show repo <type> <name> json` still carries the key, as it does `_pool_path` and every other internal metadata key — that output is a manifest dump, not the client-facing rendering.
 
 **A catalog is an inventory, not a repository.** Importing one records what a host has; it does not make bodega able to serve those packages, and pointing the host's `sources.list` at bodega after this step gets an empty index. The two are separate on purpose — the catalog is what `bodega status`, `bodega policy` and the discovery residue read — but the order to do them in is the other way round from the way the request usually arrives. Serve first, catalog second:
 
@@ -2173,7 +2208,7 @@ It is a separate route from `POST /api/v1/packages/{type}` because the two want 
 
 - **Body**: a JSON array of `PackageManifest`, or one manifest per line (NDJSON). Both decode one manifest at a time, so a large catalog never lands in memory whole. Types may be mixed in one push.
 - **Size**: 64 MiB, against 1 MiB on the single-package route. A bare 2000-package catalog is only about 220 KB, but a `pkg export` of a populated store carries architecture, section, pool path and description per entry and clears 1 MiB well before it clears the package count.
-- **`?merge=true`**: adds versions to packages that already exist, matching `pkg import --merge`. A recorded version is never overwritten, which keeps a `hosted` entry from being downgraded to `proxy` by a re-import.
+- **`?merge=true`**: adds versions to packages that already exist, matching `pkg import --merge`. A recorded version is never overwritten, which keeps a `hosted` entry from being downgraded to `proxy` by a re-import. The `_origin` metadata key is the exception: a merge unions it, so a version reported by `db01` and then by `db02` records both. This route and `bodega pkg import` share one merge, `admit.MergeVersions`, so the answer cannot depend on which of the two wrote it. `POST /api/v1/packages/{type}` does not merge at all: it answers `409 Conflict` on a package that already exists. All three share `admit.Admit`.
 - **Status**: `200` whenever the body parsed, including when every package was refused. `400` for a body that is not manifests, `413` over the size limit.
 
 ```json

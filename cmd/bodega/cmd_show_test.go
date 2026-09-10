@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
@@ -156,5 +157,47 @@ func TestShowVersionList_RangeEntryIsNeverDated(t *testing.T) {
 	// The control: an exact entry names one version, so its date stands.
 	if row := versionRow(t, out, "1.3.0"); !strings.Contains(row, "clean") || !strings.Contains(row, "2026-01-01") {
 		t.Errorf("an exact entry keeps the date the gate wrote: %q", row)
+	}
+}
+
+// A catalog that cannot say which host put a package in it cannot answer the
+// first question asked of it, so the origins have to reach the operator's
+// screen and not only the manifest file.
+func TestShowVersionListDisplaysOrigins(t *testing.T) {
+	store := showStore(t, manifest.TypePypi, "requests",
+		manifest.VersionEntry{Version: "2.31.0", Metadata: map[string]string{admit.MetaOrigin: "db01,db02"}},
+		manifest.VersionEntry{Version: "2.32.0"})
+
+	out := captureStdout(t, func() {
+		if err := showVersionList(context.Background(), store, manifest.TypePypi, "requests", true, false); err != nil {
+			t.Errorf("showVersionList: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "ORIGIN") {
+		t.Errorf("the admin table has no ORIGIN column:\n%s", out)
+	}
+	if row := versionRow(t, out, "2.31.0"); !strings.Contains(row, "db01, db02") {
+		t.Errorf("a version cataloged from two hosts must name both: %q", row)
+	}
+	if row := versionRow(t, out, "2.32.0"); !strings.HasSuffix(strings.TrimRight(row, " "), "-") {
+		t.Errorf("a version with no recorded origin must read as a dash: %q", row)
+	}
+}
+
+// The repo table renders what a client may see. An internal hostname is not
+// that, so it withholds the column `show pkg` prints. The --json form of the
+// same command is a manifest dump and still carries the key.
+func TestShowVersionListWithholdsOriginsFromTheRepoTable(t *testing.T) {
+	store := showStore(t, manifest.TypePypi, "requests",
+		manifest.VersionEntry{Version: "2.31.0", Metadata: map[string]string{admit.MetaOrigin: "db01"}})
+
+	out := captureStdout(t, func() {
+		if err := showVersionList(context.Background(), store, manifest.TypePypi, "requests", false, false); err != nil {
+			t.Errorf("showVersionList: %v", err)
+		}
+	})
+	if strings.Contains(out, "db01") {
+		t.Errorf("the repo view leaked an origin hostname:\n%s", out)
 	}
 }
