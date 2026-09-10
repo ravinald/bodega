@@ -1,6 +1,7 @@
 package deb822
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -132,5 +133,62 @@ func TestParseSingle_RealBashControl(t *testing.T) {
 	}
 	if !strings.Contains(got["Description"], "\n\nBash is ultimately") {
 		t.Errorf("Description missing blank-paragraph split: %q", got["Description"])
+	}
+}
+
+func TestParseStream_ParagraphsInOrder(t *testing.T) {
+	// No trailing blank line after the last paragraph, which is what a
+	// Packages index served over HTTP often ends with.
+	input := "Package: apparmor\nVersion: 3.0.4\n\n" +
+		"Package: ca-certificates\nVersion: 20230311\nArchitecture: all\n\n\n" +
+		"Package: zerofree\nVersion: 1.1.1"
+
+	var names, versions []string
+	if err := ParseStream(strings.NewReader(input), func(fields map[string]string) error {
+		names = append(names, fields["Package"])
+		versions = append(versions, fields["Version"])
+		return nil
+	}); err != nil {
+		t.Fatalf("ParseStream: %v", err)
+	}
+
+	if got, want := strings.Join(names, " "), "apparmor ca-certificates zerofree"; got != want {
+		t.Errorf("packages = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(versions, " "), "3.0.4 20230311 1.1.1"; got != want {
+		t.Errorf("versions = %q, want %q", got, want)
+	}
+}
+
+// TestParseStream_StopsOnCallbackError keeps the walk abandonable. A caller
+// reading a hundred-megabyte index to answer one question should not have to
+// read the rest of it.
+func TestParseStream_StopsOnCallbackError(t *testing.T) {
+	stop := errors.New("seen enough")
+	seen := 0
+	err := ParseStream(strings.NewReader("Package: a\n\nPackage: b\n\nPackage: c\n"), func(map[string]string) error {
+		seen++
+		return stop
+	})
+	if !errors.Is(err, stop) {
+		t.Errorf("error = %v, want the caller's own sentinel", err)
+	}
+	if seen != 1 {
+		t.Errorf("callback ran %d times after asking to stop", seen)
+	}
+}
+
+// TestParseStream_ReportsAMalformedParagraph keeps a broken index from reading
+// as a short one. Silently skipping the paragraph would report every package
+// after it as absent.
+func TestParseStream_ReportsAMalformedParagraph(t *testing.T) {
+	err := ParseStream(strings.NewReader("Package: a\n\nthis line has no colon\n"), func(map[string]string) error {
+		return nil
+	})
+	if err == nil {
+		t.Fatal("a paragraph that is not deb822 was accepted")
+	}
+	if !strings.Contains(err.Error(), "expected Key: value") {
+		t.Errorf("error = %q, want it to name the malformed line", err)
 	}
 }

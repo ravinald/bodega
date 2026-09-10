@@ -786,8 +786,7 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	// Generated and mirrored codenames are disjoint by construction: the two
 	// indexes describe different package sets, and one URL can serve only one
 	// of them, so a shared name would hand a client an InRelease whose digests
-	// do not cover the Packages it is served next. See
-	// docs-internal/DESIGN_apt-suites-and-signing_2026_08_25.md.
+	// do not cover the Packages it is served next.
 	if err := validateAptUpstreams(cfg.AptUpstreams); err != nil {
 		return nil, err
 	}

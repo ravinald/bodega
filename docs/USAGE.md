@@ -322,8 +322,71 @@ dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\n' \
 | the host to install from bodega                          | [Mirroring an upstream archive](#mirroring-an-upstream-archive)            |
 | bodega to serve `.deb`s you built or downloaded yourself | [APT index generation](#apt-index-generation) and `bodega build fetch apt` |
 | a record of what the host already has                    | this section                                                               |
+| the host to keep the versions it runs once behind bodega | [`bodega pin apt`](#bodega-pin-apt-file-)                                  |
 
 For apt specifically, `bodega build fetch apt` shells out to `apt-get download <name>` on the bodega host: it passes no version, so a catalog entry's version names the storage key and nothing else, and the host can only resolve releases its own apt sources carry. A bodega on noble cannot fetch a jammy catalog that way. Mirroring is what serves another release.
+
+Once the host installs from bodega, `bodega pin apt` closes the loop the other two rows leave open: it reads the same inventory this section converts, checks each installed version against the indices bodega actually serves, and writes the preferences file that holds the host where it is. That is a different question from the catalog, and it is the one asked on the day a host is moved behind bodega.
+
+### `bodega pin apt [file|-]`
+
+Turns a host's installed apt packages into a preferences file pinning each one to the version it runs, and a list of the packages that cannot be pinned.
+
+Run it after the host's `sources.list` points at bodega. It reads the same inventory `bodega pkg convert apt` reads, asks a bodega whether each installed version is still published by a suite it serves, and writes the answer in two parts.
+
+```bash
+dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\n' \
+  | BODEGA_SERVER=https://bodega.example bodega pin apt - \
+      -o bodega-pin --unresolved bodega-hold
+
+sudo install -m 0644 bodega-pin /etc/apt/preferences.d/bodega-pin
+sudo apt-mark hold $(cat bodega-hold)
+```
+
+```text
+apt: skipped 139 package(s) present in the dpkg database but not installed (removed, config files retained)
+pin apt: resolving against https://bodega.example ($BODEGA_SERVER)
+pin apt: 635 installed, 627 pinned, 8 unresolved
+pin apt: hold these instead, their installed version is on no served suite: apt-mark hold cloud-init fwupd linux-generic ...
+```
+
+| Flag                | Default            | What it does                                        |
+| ------------------- | ------------------ | --------------------------------------------------- |
+| `-o`, `--output`    | stdout             | Where the preferences file goes                     |
+| `--unresolved`      | stderr             | Where the unresolved package names go, one per line |
+| `--priority`        | `1001`             | `Pin-Priority` on every stanza                      |
+| `--server`          | config             | Which bodega answers                                |
+| `--suite`           | every served suite | Match against these suites only                     |
+| `--allow-plaintext` | off                | Permit `--server` over `http`                       |
+
+#### Why two artifacts
+
+Pinning everything is the trap this command exists to remove. A `Pin: version` stanza naming a version no served suite publishes leaves apt with **no candidate at all** for that package: `apt update` stays quiet, and the failure surfaces at the next `apt upgrade` as a package that cannot be installed at any version. On one Ubuntu 22.04 host 8 of 635 installed packages were in that state, because `jammy-updates` drops what it supersedes and those versions had left the archive.
+
+So a package that does not resolve is left out of the preferences file and named in the unresolved list instead. `apt-mark hold` is what to do with that list. Holding freezes the package where it is, which is the honest version of what a pin to an unavailable version was trying to say.
+
+An unresolved package is not an error and never fails the command. It is the expected result for a version the archive has moved past, and exiting non-zero would break every configuration-management run wrapping this.
+
+#### Why `Pin-Priority: 1001`
+
+1000 is the threshold above which apt will downgrade. At 1000 a package that has already drifted ahead of its pin stays ahead; at 1001 apt pulls it back to the pinned version. The generated file says this in its header, because the file outlives the runbook. `--priority` takes any other value, and the header changes to match.
+
+#### How a version is resolved
+
+For each installed package, the command reads the `Packages` indices over HTTP the way an apt client does, and asks whether any suite this bodega serves publishes that exact version. Generated suites and mirrored codenames answer alike: bodega serves both under `/apt/dists/`, so a mirrored archive's index is read through the same route without the command fetching anything from upstream itself.
+
+- The suites come from `GET /api/v1/status`, which reports both sets. `--suite` narrows that to a named list.
+- Each suite's `Release` names its components and architectures. Only architectures this host has packages for are fetched.
+- `Packages.gz` is read first, uncompressed `Packages` second.
+- An **`Architecture: all` package is found inside `binary-<arch>`**, because that is where every archive publishes one. Nothing publishes `binary-all`, and looking for it there is how a naive match loses every architecture-independent package on the host: 158 of the 635 above.
+
+Which bodega answers, in order: `--server`, `$BODEGA_SERVER`, `server_url`, `public_url`, then this host's own listener from `listen_addr`. The last one is for running the command on the bodega host itself. A loopback target is read over plaintext `http` without `--allow-plaintext`, because the refusal exists to keep a bearer token off a network others can read and there is no such network on `127.0.0.1`. The token comes from `$BODEGA_TOKEN` or `token` in the config file.
+
+#### Gaps
+
+- **`Packages.xz` is not read.** Go ships no xz decoder, and every archive publishing `.xz` publishes `.gz` beside it. An archive publishing only `.xz` is named in an error rather than counted as empty, since an index silently read as zero packages would turn every package in it into an unresolved one.
+- **Coverage decays from the moment it is measured.** A version that leaves the archive while pinned turns into an apt error at the next `update`, not a warning now. Re-run this after every upgrade window and re-read the counts.
+- **Nothing is installed and nothing is written to the manifest store.** The output is a file to review, then copy. Pinning a host is separate from cataloging it: see [Cataloging a host end to end](#cataloging-a-host-end-to-end).
 
 ### `bodega pkg export [type] [name]`
 

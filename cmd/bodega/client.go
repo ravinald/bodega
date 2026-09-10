@@ -104,6 +104,26 @@ func (c *Client) Import(pms []manifest.PackageManifest, merge bool) (*server.Imp
 	return &out, nil
 }
 
+// Get fetches one path under the server's base URL, with the bearer token when
+// one is set. The caller owns the response body and every status code: an apt
+// index route answers 404 for a suite this server does not carry, which is an
+// answer rather than a failure.
+func (c *Client) Get(path string) (*http.Response, error) {
+	endpoint := c.BaseURL + "/" + strings.TrimLeft(path, "/")
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w\nCheck the server is running and reachable from this host", endpoint, err)
+	}
+	return resp, nil
+}
+
 // serverError pulls the message out of bodega's error envelope, falling back
 // to the raw body so a proxy's HTML error page is still readable.
 func serverError(payload []byte) string {
