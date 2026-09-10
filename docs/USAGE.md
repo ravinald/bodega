@@ -727,6 +727,183 @@ bodega audit events --type denied --identity build-07
 
 Bindings are read per request through a 30-second cache, on the same schedule as the CIDR lists, so a change lands on a running server without a restart and at once on `systemctl reload bodega`.
 
+### `bodega profile <create|list|show|bind|unbind|set|add|remove|pin|unpin|diff|check>`
+
+Declares what one class of host may fetch, and the version rule each package carries for that class. Everything else in bodega holds one answer for the whole fleet; a profile is the axis that varies by consumer.
+
+A profile is a view over one catalog, never a second catalog. Storage, object keys, the checksum table and the manifests do not change: an artifact reached through two profiles is one artifact with one checksum.
+
+**Nothing here is enforced on the serve path yet.** These commands build the model and the predicate; the read path does not consult a profile, so what bodega answers is unchanged. `bodega pin` is the host-side half of the same idea and is a different thing: it emits apt preferences for a host to apply, where a profile decides what bodega will answer.
+
+Three levels:
+
+| Level           | Command                | Decides                                                                      |
+| --------------- | ---------------------- | ---------------------------------------------------------------------------- |
+| the profile     | `create`, `bind`       | which hosts it governs                                                       |
+| the type marker | `set`                  | membership (`closed`, `open`) and the version default (`pinned`, `floating`) |
+| the entry       | `add`, `pin`, `remove` | one package, and optionally a constraint overriding its type's default       |
+
+```bash
+bodega profile create web --description "public web tier"
+bodega profile set web apt --membership closed --version-default floating
+bodega profile add web apt nginx
+bodega profile pin web apt postgresql 14.11 --reason "15 breaks the config" --review-after 2027-01-01
+bodega profile bind web db01
+bodega profile show web
+```
+
+#### Membership and the version default
+
+`set` writes the per-type marker. Both flags are optional on a type that already has one: what you do not name keeps the value it has.
+
+| Flag                | Value      | Meaning                                   |
+| ------------------- | ---------- | ----------------------------------------- |
+| `--membership`      | `closed`   | only the packages this profile lists      |
+| `--membership`      | `open`     | every package of this type in the catalog |
+| `--version-default` | `pinned`   | only the version each entry names         |
+| `--version-default` | `floating` | any version                               |
+
+The marker's presence is itself an answer. A type with **no** marker is one the profile states no rule for, and the fleet-wide controls decide it alone; a type **with** a marker is decided by the profile even when no entry names a package.
+
+That is why a `closed` type with nothing listed is a state you can reach, and why `set` and `remove` refuse it without `--force`:
+
+```text
+$ bodega profile set web apt --membership closed
+profile web would be closed for apt with no apt entries, which permits nothing of that type.
+  Every apt request from a host bound to this profile is refused, and the refusal names no package because none is listed.
+  List something:  bodega profile add web apt <name>
+  Open the type:   bodega profile set web apt --membership open
+  Mean it:         re-run with --force, which accepts the empty closed set as written
+```
+
+#### Entries and constraints
+
+`--constraint` is the third level, and it overrides the type's version default for one package in either direction: one pinned package inside a floating type, one floating package inside a pinned type. The four kinds are the ones a manifest version entry already carries.
+
+```bash
+bodega profile add web npm express --constraint exact --version 4.18.2
+bodega profile add web npm lodash  --constraint any            # floats inside a pinned type
+bodega profile add web gomod k8s   --constraint compatible --version 5.2.0
+bodega profile add web pypi numpy  --constraint patch --version 1.26.4
+```
+
+With no `--constraint` the entry defers to its type's version default. Adding an entry that already exists edits it: every flag you give is written and every field you leave out keeps what it held, because changing the version a package is held at is the ordinary edit and a remove-then-add loses the reason in the gap. A bare `bodega profile add web apt postgresql` on a pinned entry therefore changes nothing; clearing a constraint is `unpin`.
+
+`pin` is `add` with the pinning arguments filled in, and it **requires `--reason`**: a pin with no reason outlives the problem it was written for, and the next operator cannot tell a deliberate hold from an accident, so it is never lifted. `--review-after <YYYY-MM-DD>` gives it a date it stops looking current on; nothing enforces the date, `bodega profile show` prints it.
+
+`unpin` drops the constraint and keeps the entry, so the package stays a member. The version the pin named stays on the entry as its base, because that is the shape a pinned type default reads: an entry with a version and no constraint of its own is held at that version, and one with neither is a pin with nothing to pin to, which permits no version at all. A floating default ignores the base and takes any version. `unpin` says which of the three it left you in:
+
+```text
+$ bodega profile unpin vd pypi numpy
+Released the pin on pypi/numpy in vd; the pypi default is pinned, so it holds at 1.26.4.
+
+$ bodega profile unpin fl pypi requests
+Released the pin on pypi/requests in fl; the pypi default is floating, so it takes any version.
+
+$ bodega profile unpin nv2 pypi requests
+Released the pin on pypi/requests in nv2; the pypi default is pinned and the entry names no version, so it now permits nothing.
+  Give it one:   bodega profile pin nv2 pypi requests <version> --reason <why>
+  Or float it:   bodega profile add nv2 pypi requests --constraint any
+```
+
+`remove` deletes the entry, which on a closed type means the package is no longer permitted at all.
+
+#### Building a profile from a host
+
+`--from-origin` collects the packages carrying that host as an origin — the field `bodega pkg convert --origin` records — and writes them to a file. It creates nothing:
+
+```bash
+bodega profile create db --from-origin db01 --out db.json --pin postgresql
+$EDITOR db.json
+bodega profile create db --from-file db.json
+```
+
+`--from-file` reads the whole document before it writes anything, through the same checks `add` and `set` make: a package type outside the eight, an entry with no name and a constraint with no version are each refused with the offending line named. A key named twice is refused the same way, naming both lines: one type carries one marker and one package carries one entry, so the later row would replace the earlier and take its constraint, reason and review date with it. The profile, its markers and its entries then land in one transaction. A document rejected halfway would otherwise leave a bindable profile holding a subset of what was authored, which is not a failed create but a working access control permitting less than anyone wrote.
+
+The round trip through a file is the review step, and `--out -` and `--from-file -` are both refused. A host's inventory holds its accidents alongside its requirements, and locking membership to it enshrines whatever was installed by hand at 03:00; a baseline piped straight from the command that produced it was never read by anyone.
+
+For the same reason `--out` refuses a path that already holds something. On every run after the first that file is the one the operator edited, and a silent overwrite discards the review while reporting a successful write. `--overwrite` replaces it:
+
+```text
+$ bodega profile create db --from-origin db01 --out db.json
+db.json already exists, and a baseline is written to be edited before it is used.
+  Read what is there:  bodega profile create <name> --from-file db.json
+  Write somewhere else:  --out <other path>
+  Replace it, losing whatever it holds:  --overwrite
+```
+
+Entries default to name-only with `constraint_kind: any`, so the baseline says what the host may fetch and not which build of it. `--pin <name>` (repeatable) names the exceptions. A baseline that pins every version is re-authored monthly until somebody stops, which is how a control becomes ignored.
+
+A `--pin` that does not name one package is refused rather than resolved, on either axis. Two cataloged versions:
+
+```text
+$ bodega profile create db --from-origin db01 --out db.json --pin requests
+--pin requests: pypi/requests is cataloged from db01 at 2 versions (2.31.0, 2.32.0), so a pin here would pick one for you.
+  Create the profile, then name the version:  bodega profile pin db pypi requests <version> --reason <why>
+```
+
+Or one name under two types:
+
+```text
+$ bodega profile create db --from-origin db01 --out db.json --pin psycopg2
+--pin psycopg2: psycopg2 is cataloged from db01 under 2 types (pypi, npm), so a pin here would pick one for you.
+  Name the one you mean:
+  --pin pypi/psycopg2
+  --pin npm/psycopg2
+```
+
+`--pin <type>/<name>` is the qualified spelling, and it pins the one it names while the other stays floating. The baseline is walked in a fixed type order, so resolving a bare name would let that order decide which package an operator holds.
+
+Naming one package twice is refused too, whichever spellings are used. The count in the success line is what an operator checks against the flags they typed, and two names for one package are either a slip or two versions meant for one entry:
+
+```text
+$ bodega profile create dp --from-origin db01 --out dp.json --pin psycopg2 --pin pypi/psycopg2
+--pin psycopg2 and --pin pypi/psycopg2 both name pypi/psycopg2, which is either a slip or two versions meant for one package.
+  Name it once:  --pin pypi/psycopg2
+```
+
+A slash is read as the qualifier only when what precedes it names one of the eight types, none of which carries a slash. So `--pin @babel/core` and `--pin github.com/lib/pq` each name one npm or gomod package, and the qualified spellings for them are `npm/@babel/core` and `gomod/github.com/lib/pq`.
+
+#### Binding hosts
+
+`bind` attaches a profile to one of the identities `bodega identity` resolves, so bodega answers "which host is this" once and the profile says what that host may fetch. One identity resolves to at most one profile; binding an identity that is already bound moves it and says where it came from.
+
+```bash
+bodega identity bind cidr 10.20.0.0/16 devbox
+bodega profile bind web devbox
+bodega profile unbind devbox
+```
+
+`bind` refuses a name no identity binding produces. A profile bound to a typo is inert: no request ever resolves to that name, so the profile is never consulted and nothing reports it. `--force` binds ahead of the identity binding. The same inertness arrives later when the identity binding is removed underneath a live profile binding, so `bodega profile show` marks a bound host no identity binding still resolves to.
+
+#### Falsifying a profile: `diff` and `check`
+
+```bash
+bodega profile diff db --origin db01
+bodega profile check
+bodega profile check db
+```
+
+`diff` names what the host has that the profile does not list and what the profile lists that the host does not have. Without it a baseline written six months ago and a host that has moved on look identical from the outside.
+
+`check` is the CI gate and exits 1 on any violation, the same contract `bodega policy check` has. It asks whether each entry permits at least one version the catalog can serve, so a pin the catalog dropped, a pin whose version was hidden and a range constraint nothing satisfies are all caught:
+
+```text
+$ bodega profile check db2
+PROFILE  TYPE  PACKAGE   REASON
+db2      pypi  requests  exact 9.9.9 permits none of the cataloged versions (2.31.0)
+Error: 1 profile violation(s) detected
+```
+
+A manifest the store cannot read stops the gate instead of appearing in that table. The two repairs are opposite ones: a missing package means the entry names something the catalog dropped, and an operator reading that in CI deletes the entry, which is the wrong fix for a catalog that is merely unreadable.
+
+```text
+$ bodega profile check web
+Error: load pypi/requests: parse package pypi/requests: invalid character 'o' in literal null (expecting 'u')
+```
+
+Every mutation writes an audit event with `pkg_type=profile`, the profile in `pkg_name` and what inside it in `pkg_version`, so `bodega audit events --type create` shows who changed a control and when.
+
 ### `bodega doctor [--write-credentials --token TOKEN [--url URL]]`
 
 Without flags, `doctor` reports and changes nothing. With `--write-credentials` it writes one token into the file each of the eight clients reads its credential from, because a feature that costs eight hand edits does not get adopted:

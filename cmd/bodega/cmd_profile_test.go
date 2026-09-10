@@ -1,0 +1,948 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/ravinald/bodega/internal/admit"
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/manifest"
+)
+
+// runProfile drives the command tree the way an operator does, so a refusal
+// that lives in the wrong layer cannot pass by being unreachable.
+func runProfile(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	cmd := newProfileCmd(&globalFlags{})
+	cmd.SetArgs(args)
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SilenceUsage, cmd.SilenceErrors = true, true
+
+	stdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stdout = w
+	execErr := cmd.Execute()
+	_ = w.Close()
+	os.Stdout = stdout
+	var printed bytes.Buffer
+	_, _ = printed.ReadFrom(r)
+	return printed.String() + out.String(), execErr
+}
+
+// seedCatalog writes packages carrying an origin, through the same accessor
+// `bodega pkg convert --origin` writes it with.
+func seedCatalog(t *testing.T, env *discoverEnv, origin string, pkgs map[string][]string) {
+	t.Helper()
+	seedCatalogTyped(t, env, origin, manifest.TypePypi, pkgs)
+}
+
+func seedCatalogTyped(t *testing.T, env *discoverEnv, origin, typ string, pkgs map[string][]string) {
+	t.Helper()
+	ctx := context.Background()
+	store := manifest.NewLocalStore(env.manifestDir)
+	if err := store.LoadIndex(ctx); err != nil {
+		t.Fatalf("load index: %v", err)
+	}
+	for name, versions := range pkgs {
+		pm := &manifest.PackageManifest{
+			ConfigVersion: manifest.CurrentConfigVersion,
+			Name:          name,
+			Type:          typ,
+		}
+		for _, v := range versions {
+			pm.Versions = append(pm.Versions, manifest.VersionEntry{Version: v})
+		}
+		if err := admit.ApplyOrigin(pm, origin); err != nil {
+			t.Fatalf("apply origin: %v", err)
+		}
+		if err := store.SavePackage(ctx, pm); err != nil {
+			t.Fatalf("save %s: %v", name, err)
+		}
+	}
+	if err := store.SaveIndex(ctx); err != nil {
+		t.Fatalf("save index: %v", err)
+	}
+}
+
+func mustRunProfile(t *testing.T, args ...string) string {
+	t.Helper()
+	out, err := runProfile(t, args...)
+	if err != nil {
+		t.Fatalf("bodega profile %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return out
+}
+
+// A closed type with nothing listed permits nothing of that type. It is
+// reachable, it is almost never meant, and the refusal follows the empty
+// admin_permit_cidr precedent: name what the flag does rather than only
+// refusing.
+func TestProfileClosedAndEmptyIsRefusedWithoutForce(t *testing.T) {
+	newDiscoverEnv(t)
+	mustRunProfile(t, "create", "web")
+
+	out, err := runProfile(t, "set", "web", "apt", "--membership", "closed")
+	if err == nil {
+		t.Fatalf("a closed apt marker with no entries was accepted:\n%s", out)
+	}
+	msg := err.Error()
+	for _, want := range []string{"permits nothing", "--force", "bodega profile add web apt", "--membership open"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("the refusal does not mention %q:\n%s", want, msg)
+		}
+	}
+
+	if _, err := runProfile(t, "set", "web", "apt", "--membership", "closed", "--force"); err != nil {
+		t.Fatalf("--force did not accept the state the refusal says it accepts: %v", err)
+	}
+	if out := mustRunProfile(t, "show", "web"); !strings.Contains(out, "Closed for apt with nothing listed") {
+		t.Errorf("show does not report the forced state, so it reads like a profile nobody consults:\n%s", out)
+	}
+}
+
+// Removing the last entry of a closed type reaches the same state by the more
+// likely route, so it meets the same refusal.
+func TestProfileRemovingTheLastEntryOfAClosedTypeIsRefused(t *testing.T) {
+	newDiscoverEnv(t)
+	mustRunProfile(t, "create", "web")
+	mustRunProfile(t, "add", "web", "apt", "nginx")
+	mustRunProfile(t, "set", "web", "apt", "--membership", "closed")
+
+	if _, err := runProfile(t, "remove", "web", "apt", "nginx"); err == nil {
+		t.Fatal("removing the last entry of a closed type was accepted, leaving it permitting nothing")
+	}
+	if _, err := runProfile(t, "remove", "web", "apt", "nginx", "--force"); err != nil {
+		t.Fatalf("--force did not accept the removal: %v", err)
+	}
+}
+
+// --from-origin refuses to create anything. The baseline goes through a file
+// so a host's accidents get read before they become a control.
+func TestProfileFromOriginRefusesWithoutAFile(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedCatalog(t, env, "db01", map[string][]string{"requests": {"2.31.0"}})
+
+	_, err := runProfile(t, "create", "web", "--from-origin", "db01")
+	if err == nil {
+		t.Fatal("--from-origin created a profile directly")
+	}
+	for _, want := range []string{"--out", "--from-file", "accidents"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q:\n%s", want, err)
+		}
+	}
+
+	if _, err := runProfile(t, "create", "web", "--from-origin", "db01", "--out", "-"); err == nil {
+		t.Fatal("--out - was accepted; a baseline piped straight on was never read by anyone")
+	}
+	if _, err := runProfile(t, "create", "web", "--from-file", "-"); err == nil {
+		t.Fatal("--from-file - was accepted")
+	}
+}
+
+// The baseline names what the host was cataloged with, defaults every entry to
+// name-only `any`, and pins only what --pin names.
+func TestProfileFromOriginBaselineAndCreate(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedCatalog(t, env, "db01", map[string][]string{
+		"requests": {"2.31.0"},
+		"psycopg2": {"2.9.9"},
+	})
+	seedCatalog(t, env, "web01", map[string][]string{"django": {"5.0"}})
+
+	baseline := filepath.Join(t.TempDir(), "db.json")
+	out := mustRunProfile(t, "create", "db", "--from-origin", "db01", "--out", baseline, "--pin", "psycopg2")
+	if !strings.Contains(out, "Nothing was created") {
+		t.Errorf("the baseline step does not say it created nothing:\n%s", out)
+	}
+
+	blob, err := os.ReadFile(baseline)
+	if err != nil {
+		t.Fatalf("read baseline: %v", err)
+	}
+	var doc profileDoc
+	if err := json.Unmarshal(blob, &doc); err != nil {
+		t.Fatalf("parse baseline: %v", err)
+	}
+	if len(doc.Entries) != 2 {
+		t.Fatalf("the baseline holds %d entries, want the 2 cataloged from db01: %+v", len(doc.Entries), doc.Entries)
+	}
+	for _, e := range doc.Entries {
+		if e.Name == "django" {
+			t.Error("the baseline carries a package cataloged from another host")
+		}
+		if e.Name == "requests" {
+			if e.Constraint != manifest.ConstraintAny || e.Version != "" {
+				t.Errorf("an unpinned entry is not name-only: %+v", e)
+			}
+		}
+		if e.Name == "psycopg2" {
+			if e.Constraint != manifest.ConstraintExact || e.Version != "2.9.9" {
+				t.Errorf("--pin did not pin: %+v", e)
+			}
+		}
+	}
+	if len(doc.Types) != 1 || doc.Types[0].Membership != audit.MembershipClosed ||
+		doc.Types[0].VersionDefault != audit.VersionFloating {
+		t.Errorf("the baseline's type marker is not closed+floating: %+v", doc.Types)
+	}
+
+	if _, err := runProfile(t, "create", "db", "--from-file", baseline); err != nil {
+		t.Fatalf("create from the baseline: %v", err)
+	}
+	shown := mustRunProfile(t, "show", "db")
+	for _, want := range []string{"psycopg2", "2.9.9", "requests", "closed", "floating"} {
+		if !strings.Contains(shown, want) {
+			t.Errorf("show does not carry %q:\n%s", want, shown)
+		}
+	}
+}
+
+// A pin has to name one version. The host reporting two is the operator's
+// decision to make, not the generator's.
+func TestProfilePinOfATwoVersionPackageIsRefused(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedCatalog(t, env, "db01", map[string][]string{"requests": {"2.31.0", "2.32.0"}})
+
+	_, err := runProfile(t, "create", "db", "--from-origin", "db01",
+		"--out", filepath.Join(t.TempDir(), "db.json"), "--pin", "requests")
+	if err == nil {
+		t.Fatal("--pin picked one of two cataloged versions")
+	}
+	for _, want := range []string{"2.31.0", "2.32.0", "bodega profile pin"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q:\n%s", want, err)
+		}
+	}
+}
+
+// A pin with no reason outlives the problem it was written for.
+func TestProfilePinRequiresAReason(t *testing.T) {
+	newDiscoverEnv(t)
+	mustRunProfile(t, "create", "web")
+
+	if _, err := runProfile(t, "pin", "web", "apt", "postgresql", "14.11"); err == nil {
+		t.Fatal("a pin with no reason was accepted")
+	}
+	mustRunProfile(t, "pin", "web", "apt", "postgresql", "14.11", "--reason", "15 breaks the config")
+
+	out := mustRunProfile(t, "show", "web")
+	if !strings.Contains(out, "15 breaks the config") {
+		t.Errorf("show does not carry the reason, so nobody can tell a deliberate hold from an accident:\n%s", out)
+	}
+
+	mustRunProfile(t, "unpin", "web", "apt", "postgresql")
+	out = mustRunProfile(t, "show", "web")
+	if strings.Contains(out, "exact") {
+		t.Errorf("unpin left the constraint in place:\n%s", out)
+	}
+	if !strings.Contains(out, "postgresql") {
+		t.Errorf("unpin removed the entry; releasing a pin keeps the package listed:\n%s", out)
+	}
+}
+
+// check is the CI gate: an entry naming a package the catalog does not hold,
+// or a version it does not carry, exits non-zero.
+func TestProfileCheckFailsOnAnEntryThatStoppedResolving(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedCatalog(t, env, "db01", map[string][]string{"requests": {"2.31.0"}})
+	mustRunProfile(t, "create", "db")
+	mustRunProfile(t, "add", "db", "pypi", "requests")
+
+	if out, err := runProfile(t, "check"); err != nil {
+		t.Fatalf("check failed on a profile whose entries resolve: %v\n%s", err, out)
+	}
+
+	mustRunProfile(t, "pin", "db", "pypi", "requests", "9.9.9", "--reason", "held")
+	out, err := runProfile(t, "check")
+	if err == nil {
+		t.Fatalf("check passed on a pin the catalog cannot serve:\n%s", out)
+	}
+	if !strings.Contains(out, "9.9.9") {
+		t.Errorf("the violation does not name the version:\n%s", out)
+	}
+
+	mustRunProfile(t, "add", "db", "pypi", "gone")
+	if out, err := runProfile(t, "check", "db"); err == nil {
+		t.Fatalf("check passed on an entry naming no cataloged package:\n%s", out)
+	}
+}
+
+// A range constraint the catalog cannot satisfy is the same defect as a pin it
+// cannot serve, and it is the one a string comparison in the gate would miss.
+// The gate asks entitle for the answer, so it catches both.
+func TestProfileCheckAsksThePredicate(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedCatalog(t, env, "db01", map[string][]string{"requests": {"2.31.0"}})
+	mustRunProfile(t, "create", "db")
+	mustRunProfile(t, "add", "db", "pypi", "requests", "--constraint", "compatible", "--version", "3.0.0")
+
+	out, err := runProfile(t, "check", "db")
+	if err == nil {
+		t.Fatalf("check passed on a constraint no cataloged version satisfies:\n%s", out)
+	}
+	if !strings.Contains(out, "2.31.0") {
+		t.Errorf("the violation does not name what the catalog does carry:\n%s", out)
+	}
+
+	mustRunProfile(t, "add", "db", "pypi", "requests", "--constraint", "compatible", "--version", "2.0.0")
+	if out, err := runProfile(t, "check", "db"); err != nil {
+		t.Fatalf("check failed on a constraint 2.31.0 satisfies: %v\n%s", err, out)
+	}
+}
+
+// Without diff a baseline is an assertion nobody can falsify.
+func TestProfileDiffNamesBothDirections(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedCatalog(t, env, "db01", map[string][]string{
+		"requests": {"2.31.0"},
+		"psycopg2": {"2.9.9"},
+	})
+	mustRunProfile(t, "create", "db")
+	mustRunProfile(t, "add", "db", "pypi", "requests")
+	mustRunProfile(t, "add", "db", "pypi", "retired")
+
+	out := mustRunProfile(t, "diff", "db", "--origin", "db01")
+	if !strings.Contains(out, "pypi/psycopg2") {
+		t.Errorf("diff does not name what the host has and the profile does not:\n%s", out)
+	}
+	if !strings.Contains(out, "pypi/retired") {
+		t.Errorf("diff does not name what the profile has and the host does not:\n%s", out)
+	}
+	if strings.Contains(out, "pypi/requests\t") {
+		t.Errorf("diff reported a package both sides carry:\n%s", out)
+	}
+	if _, err := runProfile(t, "diff", "db"); err == nil {
+		t.Error("diff with no --origin was accepted; it has nothing to compare against")
+	}
+}
+
+// A profile bound to a name no identity resolves to is inert and looks
+// identical to one that works.
+func TestProfileBindRefusesAnUnknownIdentity(t *testing.T) {
+	env := newDiscoverEnv(t)
+	mustRunProfile(t, "create", "web")
+
+	_, err := runProfile(t, "bind", "web", "db01")
+	if err == nil {
+		t.Fatal("a binding to a name no identity binding produces was accepted")
+	}
+	for _, want := range []string{"bodega identity list", "--force"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q:\n%s", want, err)
+		}
+	}
+
+	adb, err := audit.Open(env.auditDB)
+	if err != nil {
+		t.Fatalf("open audit db: %v", err)
+	}
+	if _, err := adb.AddIdentityBinding(context.Background(), audit.IdentityBinding{
+		Kind: audit.BindCIDR, Key: "10.20.0.0/16", Identity: "db01",
+	}); err != nil {
+		t.Fatalf("seed identity binding: %v", err)
+	}
+	_ = adb.Close()
+
+	if out := mustRunProfile(t, "bind", "web", "db01"); !strings.Contains(out, "Bound db01 to web") {
+		t.Errorf("bind did not report what it bound:\n%s", out)
+	}
+	mustRunProfile(t, "create", "db")
+	if out := mustRunProfile(t, "bind", "db", "db01"); !strings.Contains(out, "moved from web") {
+		t.Errorf("a rebind did not say where the host came from:\n%s", out)
+	}
+	if out := mustRunProfile(t, "unbind", "db01"); !strings.Contains(out, "Unbound db01") {
+		t.Errorf("unbind did not report what it removed:\n%s", out)
+	}
+}
+
+// Every mutation writes an audit event, as `bodega acl` does. A control whose
+// changes are not recorded is one nobody can review.
+func TestProfileMutationsAreAudited(t *testing.T) {
+	env := newDiscoverEnv(t)
+	mustRunProfile(t, "create", "web")
+	mustRunProfile(t, "set", "web", "apt", "--membership", "open", "--version-default", "floating")
+	mustRunProfile(t, "add", "web", "apt", "nginx")
+	mustRunProfile(t, "pin", "web", "apt", "postgresql", "14.11", "--reason", "held")
+	mustRunProfile(t, "remove", "web", "apt", "nginx")
+
+	adb, err := audit.Open(env.auditDB)
+	if err != nil {
+		t.Fatalf("open audit db: %v", err)
+	}
+	defer func() { _ = adb.Close() }()
+	events, err := adb.Query(context.Background(), audit.Filter{PkgType: "profile", Limit: 100})
+	if err != nil {
+		t.Fatalf("query audit events: %v", err)
+	}
+	if len(events) < 5 {
+		t.Fatalf("5 mutations produced %d audit rows", len(events))
+	}
+	for _, ev := range events {
+		if ev.PkgName != "web" {
+			t.Errorf("an audit row does not name the profile: %+v", ev)
+		}
+		if ev.Actor == "" {
+			t.Errorf("an audit row names no actor: %+v", ev)
+		}
+	}
+}
+
+// A typo in the type is a marker or an entry nothing will ever read.
+func TestProfileRefusesAnUnknownPackageType(t *testing.T) {
+	newDiscoverEnv(t)
+	mustRunProfile(t, "create", "web")
+	if _, err := runProfile(t, "add", "web", "rpm", "httpd"); err == nil {
+		t.Fatal("an entry under a type bodega does not serve was accepted")
+	}
+	if _, err := runProfile(t, "set", "web", "rpm", "--membership", "open"); err == nil {
+		t.Fatal("a marker for a type bodega does not serve was accepted")
+	}
+}
+
+// writeDoc puts a baseline on disk the way an operator's editor leaves it.
+func writeDoc(t *testing.T, dir, name, body string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+	return path
+}
+
+// A document rejected partway leaves nothing behind. Half of a closed list is
+// a working access control permitting less than anyone authored, and with no
+// delete verb the name could not be reused to correct it.
+func TestProfileCreateFromFileIsAllOrNothing(t *testing.T) {
+	newDiscoverEnv(t)
+	dir := t.TempDir()
+	broken := writeDoc(t, dir, "half.json", `{
+	  "config_version": 1, "name": "half",
+	  "types": [{"type": "pypi", "membership": "closed", "version_default": "floating"}],
+	  "entries": [
+	    {"type": "pypi", "name": "requests", "constraint_kind": "any"},
+	    {"type": "pypi", "name": "", "constraint_kind": "any"},
+	    {"type": "pypi", "name": "psycopg2", "constraint_kind": "any"}
+	  ]
+	}`)
+
+	if _, err := runProfile(t, "create", "half", "--from-file", broken); err == nil {
+		t.Fatal("an entry with no package name was accepted")
+	}
+	out, err := runProfile(t, "show", "half")
+	if err == nil {
+		t.Fatalf("the rejected create left a profile behind:\n%s", out)
+	}
+	if !strings.Contains(err.Error(), "no such profile") {
+		t.Errorf("show reports something other than an absent profile: %v", err)
+	}
+
+	fixed := writeDoc(t, dir, "half.json", `{
+	  "config_version": 1, "name": "half",
+	  "types": [{"type": "pypi", "membership": "closed", "version_default": "floating"}],
+	  "entries": [
+	    {"type": "pypi", "name": "requests", "constraint_kind": "any"},
+	    {"type": "pypi", "name": "psycopg2", "constraint_kind": "any"}
+	  ]
+	}`)
+	shown := mustRunProfile(t, "create", "half", "--from-file", fixed)
+	if !strings.Contains(shown, "2 entries") {
+		t.Errorf("re-running after the fix did not write both entries:\n%s", shown)
+	}
+}
+
+// The hand-edited file is the path --from-origin makes mandatory, so it runs
+// through the same checks `add` and `set` make. A marker under a type bodega
+// does not serve governs nothing, and the type the operator meant stays open.
+func TestProfileCreateFromFileRefusesAnUnknownType(t *testing.T) {
+	newDiscoverEnv(t)
+	doc := writeDoc(t, t.TempDir(), "typo.json", `{
+	  "config_version": 1, "name": "typo",
+	  "types": [{"type": "ap", "membership": "closed", "version_default": "pinned"}],
+	  "entries": [{"type": "ap", "name": "nginx", "constraint_kind": "any"}]
+	}`)
+
+	_, err := runProfile(t, "create", "typo", "--from-file", doc)
+	if err == nil {
+		t.Fatal(`"ap" was accepted as a package type`)
+	}
+	for _, want := range []string{`no package type named "ap"`, "apt", "pypi"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q:\n%v", want, err)
+		}
+	}
+	if out, err := runProfile(t, "show", "typo"); err == nil {
+		t.Fatalf("the refused create left a profile behind:\n%s", out)
+	}
+}
+
+// The same rule `add` enforces on --constraint: a constraint with nothing to
+// measure against permits by accident or refuses by accident, never on purpose.
+func TestProfileCreateFromFileRefusesAConstraintWithNoVersion(t *testing.T) {
+	newDiscoverEnv(t)
+	doc := writeDoc(t, t.TempDir(), "noversion.json", `{
+	  "config_version": 1, "name": "nv",
+	  "types": [{"type": "pypi", "membership": "closed", "version_default": "floating"}],
+	  "entries": [{"type": "pypi", "name": "requests", "constraint_kind": "exact"}]
+	}`)
+
+	_, err := runProfile(t, "create", "nv", "--from-file", doc)
+	if err == nil {
+		t.Fatal("exact with no version was accepted")
+	}
+	if !strings.Contains(err.Error(), "measured against a version") {
+		t.Errorf("the refusal does not say what is missing:\n%v", err)
+	}
+}
+
+// A bare `add` on a pinned package is an edit, not a replacement. `unpin` is
+// the deliberate path and it preserves the reason and the review date; the
+// accidental path must not destroy more than it does.
+func TestProfileAddPreservesAPinsReasonAndReviewDate(t *testing.T) {
+	newDiscoverEnv(t)
+	mustRunProfile(t, "create", "web")
+	mustRunProfile(t, "pin", "web", "apt", "postgresql-14", "14.11",
+		"--reason", "15 breaks the config", "--review-after", "2027-01-01")
+
+	mustRunProfile(t, "add", "web", "apt", "postgresql-14")
+	shown := mustRunProfile(t, "show", "web")
+	for _, want := range []string{"15 breaks the config", "2027-01-01", "14.11"} {
+		if !strings.Contains(shown, want) {
+			t.Errorf("a bare add erased %q:\n%s", want, shown)
+		}
+	}
+
+	mustRunProfile(t, "add", "web", "apt", "postgresql-14", "--version", "14.12")
+	shown = mustRunProfile(t, "show", "web")
+	if !strings.Contains(shown, "14.12") || !strings.Contains(shown, "15 breaks the config") {
+		t.Errorf("editing the version dropped the reason it was held for:\n%s", shown)
+	}
+
+	mustRunProfile(t, "unpin", "web", "apt", "postgresql-14")
+	shown = mustRunProfile(t, "show", "web")
+	if !strings.Contains(shown, "14.12") {
+		t.Errorf("unpin dropped the version a pinned type default reads:\n%s", shown)
+	}
+	if !strings.Contains(shown, "15 breaks the config") {
+		t.Errorf("unpin dropped the reason:\n%s", shown)
+	}
+}
+
+// A document naming one key twice is a document whose meaning depends on row
+// order. The last row wins in SQL, so the pin, its reason and its review date
+// vanish and the success line counts a row nothing stored.
+func TestProfileCreateFromFileRefusesADuplicateKey(t *testing.T) {
+	newDiscoverEnv(t)
+	dir := t.TempDir()
+	dupEntry := writeDoc(t, dir, "dup-entry.json", `{
+	  "config_version": 1, "name": "dup2",
+	  "types": [{"type": "pypi", "membership": "closed", "version_default": "floating"}],
+	  "entries": [
+	    {"type": "pypi", "name": "numpy", "constraint_kind": "exact", "version": "1.26.4",
+	     "reason": "1.27 breaks the build", "review_after": "2027-01-01"},
+	    {"type": "pypi", "name": "requests", "constraint_kind": "any"},
+	    {"type": "pypi", "name": "numpy", "constraint_kind": "any"}
+	  ]
+	}`)
+
+	_, err := runProfile(t, "create", "dup2", "--from-file", dupEntry)
+	if err == nil {
+		t.Fatal("a document naming pypi/numpy twice was accepted")
+	}
+	for _, want := range []string{"entries[0]", "entries[2]", "pypi/numpy"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q:\n%v", want, err)
+		}
+	}
+	if out, err := runProfile(t, "show", "dup2"); err == nil {
+		t.Fatalf("the refused create left a profile behind:\n%s", out)
+	}
+
+	dupType := writeDoc(t, dir, "dup-type.json", `{
+	  "config_version": 1, "name": "dup",
+	  "types": [
+	    {"type": "pypi", "membership": "open", "version_default": "floating"},
+	    {"type": "pypi", "membership": "closed", "version_default": "pinned"}
+	  ],
+	  "entries": [{"type": "pypi", "name": "numpy", "constraint_kind": "any"}]
+	}`)
+	_, err = runProfile(t, "create", "dup", "--from-file", dupType)
+	if err == nil {
+		t.Fatal("a document stating two rules for pypi was accepted")
+	}
+	for _, want := range []string{"types[0]", "types[1]", "pypi"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q:\n%v", want, err)
+		}
+	}
+}
+
+// Hiding a version is the ordinary way a version stops being served, so an
+// entry whose only match is hidden names a version nothing can answer with.
+func TestProfileCheckCountsAHiddenVersionAsUnservable(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedCatalog(t, env, "db01", map[string][]string{"psycopg2": {"2.9.9"}})
+	mustRunProfile(t, "create", "hid")
+	mustRunProfile(t, "add", "hid", "pypi", "psycopg2",
+		"--constraint", "exact", "--version", "2.9.9", "--reason", "held")
+
+	if out, err := runProfile(t, "check", "hid"); err != nil {
+		t.Fatalf("check failed while the version was servable: %v\n%s", err, out)
+	}
+
+	hideVersion(t, env, "psycopg2", "2.9.9")
+	out, err := runProfile(t, "check", "hid")
+	if err == nil {
+		t.Fatalf("check passed on an entry whose only match is hidden:\n%s", out)
+	}
+	if !strings.Contains(out, "hidden") || !strings.Contains(out, "2.9.9") {
+		t.Errorf("the violation does not say the version is hidden:\n%s", out)
+	}
+}
+
+// A violation an operator cannot act on is a violation nobody fixes. When the
+// type's version default did the refusing, the entry's own fields are empty
+// and only the predicate's sentence names the rule.
+func TestProfileCheckNamesTheVersionDefaultThatRefused(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedCatalog(t, env, "db01", map[string][]string{"requests": {"2.31.0", "2.32.0"}})
+	mustRunProfile(t, "create", "pt")
+	mustRunProfile(t, "add", "pt", "pypi", "requests")
+	mustRunProfile(t, "set", "pt", "pypi", "--membership", "closed", "--version-default", "pinned")
+
+	out, err := runProfile(t, "check", "pt")
+	if err == nil {
+		t.Fatalf("check passed on an entry the type default refuses:\n%s", out)
+	}
+	if !strings.Contains(out, "pins every pypi version") {
+		t.Errorf("the violation names no rule an operator can act on:\n%s", out)
+	}
+}
+
+// A profile binding outlives the identity binding underneath it, and the
+// result is as inert as the typo `profile bind` refuses. show says so.
+func TestProfileShowNamesABindingThatStoppedResolving(t *testing.T) {
+	env := newDiscoverEnv(t)
+	mustRunProfile(t, "create", "db")
+
+	adb, err := audit.Open(env.auditDB)
+	if err != nil {
+		t.Fatalf("open audit db: %v", err)
+	}
+	ctx := context.Background()
+	if _, err := adb.AddIdentityBinding(ctx, audit.IdentityBinding{
+		Kind: audit.BindCIDR, Key: "10.20.0.0/16", Identity: "devbox",
+	}); err != nil {
+		t.Fatalf("seed identity binding: %v", err)
+	}
+	_ = adb.Close()
+
+	mustRunProfile(t, "bind", "db", "devbox")
+	if shown := mustRunProfile(t, "show", "db"); strings.Contains(shown, "no identity binding resolves") {
+		t.Fatalf("show calls a live binding unresolvable:\n%s", shown)
+	}
+
+	adb, err = audit.Open(env.auditDB)
+	if err != nil {
+		t.Fatalf("reopen audit db: %v", err)
+	}
+	removed, err := adb.RemoveIdentityBinding(ctx, audit.BindCIDR, "10.20.0.0/16")
+	if err != nil || !removed {
+		t.Fatalf("remove identity binding: removed=%v err=%v", removed, err)
+	}
+	_ = adb.Close()
+
+	shown := mustRunProfile(t, "show", "db")
+	if !strings.Contains(shown, "no identity binding resolves") {
+		t.Errorf("show reports a binding no request reaches as if it worked:\n%s", shown)
+	}
+}
+
+// hideVersion marks a cataloged version hidden, as `bodega pkg hide` does.
+func hideVersion(t *testing.T, env *discoverEnv, name, version string) {
+	t.Helper()
+	ctx := context.Background()
+	store := manifest.NewLocalStore(env.manifestDir)
+	if err := store.LoadIndex(ctx); err != nil {
+		t.Fatalf("load index: %v", err)
+	}
+	pm, err := store.GetPackage(ctx, manifest.TypePypi, name)
+	if err != nil || pm == nil {
+		t.Fatalf("get %s: %v", name, err)
+	}
+	found := false
+	for i := range pm.Versions {
+		if pm.Versions[i].Version == version {
+			pm.Versions[i].Hidden = true
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("%s has no version %s to hide", name, version)
+	}
+	if err := store.SavePackage(ctx, pm); err != nil {
+		t.Fatalf("save %s: %v", name, err)
+	}
+}
+
+// unpin is sold as the way to relax a hold. Under a pinned version default an
+// entry naming no version permits nothing, so clearing the version alongside
+// the constraint would make the release a total refusal and print the
+// opposite. The version stays as the base the default reads.
+func TestProfileUnpinLeavesAPinnedDefaultSomethingToHoldAt(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedCatalog(t, env, "db01", map[string][]string{"numpy": {"1.26.4"}})
+	mustRunProfile(t, "create", "vd")
+	mustRunProfile(t, "add", "vd", "pypi", "numpy", "--version", "1.26.4")
+	mustRunProfile(t, "set", "vd", "pypi", "--membership", "closed", "--version-default", "pinned")
+	if out, err := runProfile(t, "check", "vd"); err != nil {
+		t.Fatalf("a version with no constraint is the shape a pinned default reads: %v\n%s", err, out)
+	}
+
+	mustRunProfile(t, "pin", "vd", "pypi", "numpy", "1.26.4", "--reason", "held")
+	out := mustRunProfile(t, "unpin", "vd", "pypi", "numpy")
+	if !strings.Contains(out, "1.26.4") {
+		t.Errorf("unpin does not say what the entry is held at now:\n%s", out)
+	}
+	if out, err := runProfile(t, "check", "vd"); err != nil {
+		t.Fatalf("unpin turned a released hold into a total one: %v\n%s", err, out)
+	}
+}
+
+// A bare --pin matching two types is the two-version refusal on another axis:
+// resolving it lets manifest.AllTypes order decide which package an operator
+// holds, and the one they meant stays floating with the pin counted.
+func TestProfileBaselinePinRefusesANameCatalogedUnderTwoTypes(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedCatalog(t, env, "db01", map[string][]string{"numpy": {"1.26.4"}, "psycopg2": {"2.9.9"}})
+	seedCatalogTyped(t, env, "db01", manifest.TypeNpm, map[string][]string{"psycopg2": {"3.1.0"}})
+
+	baseline := filepath.Join(t.TempDir(), "coll.json")
+	_, err := runProfile(t, "create", "coll", "--from-origin", "db01", "--out", baseline, "--pin", "psycopg2")
+	if err == nil {
+		t.Fatal("--pin picked one of two types cataloging the same name")
+	}
+	for _, want := range []string{"pypi", "npm", "--pin pypi/psycopg2", "--pin npm/psycopg2"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q:\n%s", want, err)
+		}
+	}
+	if _, statErr := os.Stat(baseline); !os.IsNotExist(statErr) {
+		t.Error("a refused pin still wrote a baseline")
+	}
+
+	mustRunProfile(t, "create", "coll", "--from-origin", "db01", "--out", baseline, "--pin", "pypi/psycopg2")
+	blob, err := os.ReadFile(baseline)
+	if err != nil {
+		t.Fatalf("read baseline: %v", err)
+	}
+	var doc profileDoc
+	if err := json.Unmarshal(blob, &doc); err != nil {
+		t.Fatalf("parse baseline: %v", err)
+	}
+	for _, e := range doc.Entries {
+		if e.Name != "psycopg2" {
+			continue
+		}
+		switch e.Type {
+		case manifest.TypePypi:
+			if e.Constraint != manifest.ConstraintExact || e.Version != "2.9.9" {
+				t.Errorf("the qualified pin did not land on pypi/psycopg2: %+v", e)
+			}
+		case manifest.TypeNpm:
+			if e.Constraint != manifest.ConstraintAny || e.Version != "" {
+				t.Errorf("the pin reached npm/psycopg2, which it did not name: %+v", e)
+			}
+		}
+	}
+}
+
+// TestProfileBaselinePinAcceptsANameContainingASlash covers the two ecosystems
+// whose names carry a slash of their own. Reading the first one as a type
+// leaves them reachable only by qualified spelling, and the refusal points at
+// a lookup under a type bodega does not serve.
+func TestProfileBaselinePinAcceptsANameContainingASlash(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedCatalogTyped(t, env, "db01", manifest.TypeNpm, map[string][]string{"@babel/core": {"7.24.0"}})
+	seedCatalogTyped(t, env, "db01", manifest.TypeGomod, map[string][]string{"github.com/lib/pq": {"v1.10.9"}})
+
+	for _, tc := range []struct{ pin, typ, version string }{
+		{"@babel/core", manifest.TypeNpm, "7.24.0"},
+		{"github.com/lib/pq", manifest.TypeGomod, "v1.10.9"},
+	} {
+		baseline := filepath.Join(t.TempDir(), "b.json")
+		out, err := runProfile(t, "create", "b", "--from-origin", "db01", "--out", baseline, "--pin", tc.pin)
+		if err != nil {
+			t.Fatalf("--pin %s: unambiguous bare name refused: %v\n%s", tc.pin, err, out)
+		}
+		blob, readErr := os.ReadFile(baseline)
+		if readErr != nil {
+			t.Fatalf("read baseline: %v", readErr)
+		}
+		var doc profileDoc
+		if err := json.Unmarshal(blob, &doc); err != nil {
+			t.Fatalf("parse baseline: %v", err)
+		}
+		var found bool
+		for _, e := range doc.Entries {
+			if e.Type == tc.typ && e.Name == tc.pin {
+				found = true
+				if e.Constraint != manifest.ConstraintExact || e.Version != tc.version {
+					t.Errorf("--pin %s did not land: %+v", tc.pin, e)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("--pin %s: %s/%s absent from the baseline", tc.pin, tc.typ, tc.pin)
+		}
+	}
+
+	baseline := filepath.Join(t.TempDir(), "typo.json")
+	_, err := runProfile(t, "create", "b", "--from-origin", "db01", "--out", baseline, "--pin", "npmm/@babel/core")
+	if err == nil {
+		t.Fatal("a --pin under a type bodega does not serve was accepted")
+	}
+	for _, want := range []string{`"npmm" is no package type`, manifest.TypeNpm} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q:\n%s", want, err)
+		}
+	}
+}
+
+// The file --out names is, on every run after the first, the one the operator
+// edited. Overwriting it discards the review the generate-edit-create split
+// exists to force, and the success line reports a write that destroyed work.
+func TestProfileBaselineDoesNotOverwriteAnEditedFile(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedCatalog(t, env, "db01", map[string][]string{"requests": {"2.31.0"}})
+
+	baseline := filepath.Join(t.TempDir(), "db.json")
+	mustRunProfile(t, "create", "db", "--from-origin", "db01", "--out", baseline)
+
+	edited := `{"config_version":1,"name":"db","description":"reviewed by hand","types":[],"entries":[]}`
+	if err := os.WriteFile(baseline, []byte(edited), 0o644); err != nil {
+		t.Fatalf("write edit: %v", err)
+	}
+
+	_, err := runProfile(t, "create", "db", "--from-origin", "db01", "--out", baseline)
+	if err == nil {
+		t.Fatal("a second --from-origin wrote over the edited baseline")
+	}
+	for _, want := range []string{"already exists", "--overwrite"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q:\n%s", want, err)
+		}
+	}
+	blob, readErr := os.ReadFile(baseline)
+	if readErr != nil {
+		t.Fatalf("read baseline: %v", readErr)
+	}
+	if !strings.Contains(string(blob), "reviewed by hand") {
+		t.Fatalf("the edit did not survive the refusal:\n%s", blob)
+	}
+
+	if _, err := runProfile(t, "create", "db", "--from-origin", "db01", "--out", baseline, "--overwrite"); err != nil {
+		t.Fatalf("--overwrite was refused: %v", err)
+	}
+	blob, readErr = os.ReadFile(baseline)
+	if readErr != nil {
+		t.Fatalf("read baseline: %v", readErr)
+	}
+	if strings.Contains(string(blob), "reviewed by hand") {
+		t.Error("--overwrite left the old file in place")
+	}
+}
+
+// A manifest the store cannot read is a broken catalog, not a profile naming
+// a package that was dropped. Reporting one as the other sends CI at the
+// repair that deletes the entry.
+func TestProfileCheckSeparatesAnUnreadableManifestFromAMissingPackage(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedCatalog(t, env, "db01", map[string][]string{"requests": {"2.31.0"}})
+	mustRunProfile(t, "create", "web")
+	mustRunProfile(t, "add", "web", manifest.TypePypi, "requests")
+
+	if _, err := runProfile(t, "check", "web"); err != nil {
+		t.Fatalf("the gate failed before the manifest was corrupted: %v", err)
+	}
+
+	corrupt := filepath.Join(env.manifestDir, manifest.TypePypi, "requests", "manifest.json")
+	if err := os.WriteFile(corrupt, []byte("not json at all"), 0o644); err != nil {
+		t.Fatalf("corrupt manifest: %v", err)
+	}
+
+	out, err := runProfile(t, "check", "web")
+	if err == nil {
+		t.Fatalf("an unreadable manifest passed the gate:\n%s", out)
+	}
+	if strings.Contains(err.Error(), "no pypi package by that name") ||
+		strings.Contains(out, "no pypi package by that name") {
+		t.Errorf("a read failure is reported as a missing package:\n%s\n%s", err, out)
+	}
+	if !strings.Contains(err.Error(), "pypi/requests") {
+		t.Errorf("the failure does not name the package it could not read:\n%s", err)
+	}
+}
+
+// An audit trail for an access control answers "when did this change". A
+// create event for a bind that moved nothing is an answer that is wrong.
+func TestProfileRebindingToTheSameProfileRecordsNothing(t *testing.T) {
+	env := newDiscoverEnv(t)
+	mustRunProfile(t, "create", "web")
+	mustRunProfile(t, "bind", "web", "db01", "--force")
+	out := mustRunProfile(t, "bind", "web", "db01", "--force")
+	if !strings.Contains(out, "already bound") {
+		t.Fatalf("the second bind did not report a no-op:\n%s", out)
+	}
+
+	adb, err := audit.Open(env.auditDB)
+	if err != nil {
+		t.Fatalf("open audit: %v", err)
+	}
+	defer func() { _ = adb.Close() }()
+	events, err := adb.Query(context.Background(), audit.Filter{PkgType: "profile", Limit: 100})
+	if err != nil {
+		t.Fatalf("query events: %v", err)
+	}
+	binds := 0
+	for _, e := range events {
+		if strings.HasPrefix(e.Details, "bind identity=") {
+			binds++
+		}
+	}
+	if binds != 1 {
+		t.Errorf("two binds of one identity to one profile wrote %d audit rows, want 1", binds)
+	}
+}
+
+// Two spellings of one package inflate the only number the command reports,
+// and the pin count is what an operator checks against the flags they typed.
+func TestProfileBaselinePinRefusesOnePackageNamedTwice(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedCatalog(t, env, "db01", map[string][]string{"psycopg2": {"2.9.9"}})
+
+	baseline := filepath.Join(t.TempDir(), "dp.json")
+	_, err := runProfile(t, "create", "dp", "--from-origin", "db01", "--out", baseline,
+		"--pin", "psycopg2", "--pin", "pypi/psycopg2")
+	if err == nil {
+		t.Fatal("one package named by two --pin spellings was accepted")
+	}
+	for _, want := range []string{"psycopg2", "pypi/psycopg2", "both name"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not mention %q:\n%s", want, err)
+		}
+	}
+	if _, statErr := os.Stat(baseline); statErr == nil {
+		t.Error("the refused command wrote a baseline anyway")
+	}
+}
