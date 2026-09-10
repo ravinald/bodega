@@ -369,11 +369,19 @@ func createFromDoc(gf *globalFlags, doc *profileDoc, force bool) error {
 // the loosest: a marker under a type bodega does not serve governs nothing,
 // and the type the operator meant stays open with nothing reporting it.
 func validateDoc(doc *profileDoc) error {
+	firstType := map[string]int{}
 	for i, t := range doc.Types {
 		if err := requirePackageType(t.Type); err != nil {
 			return fmt.Errorf("types[%d]: %w", i, err)
 		}
+		if j, dup := firstType[t.Type]; dup {
+			return fmt.Errorf("types[%d] and types[%d] both state a rule for %s: one type carries one membership "+
+				"and one version default, so the later row would replace the earlier without saying so.\n"+
+				"  Delete one. Merging them would invent a rule neither row states", j, i, t.Type)
+		}
+		firstType[t.Type] = i
 	}
+	firstEntry := map[string]int{}
 	for i, e := range doc.Entries {
 		if err := requirePackageType(e.Type); err != nil {
 			return fmt.Errorf("entries[%d]: %w", i, err)
@@ -384,6 +392,13 @@ func validateDoc(doc *profileDoc) error {
 		if err := requireConstraintVersion(e.Constraint, e.Version); err != nil {
 			return fmt.Errorf("entries[%d] (%s/%s): %w", i, e.Type, e.Name, err)
 		}
+		key := e.Type + "/" + e.Name
+		if j, dup := firstEntry[key]; dup {
+			return fmt.Errorf("entries[%d] and entries[%d] both name %s, which is one entry: the later row would "+
+				"replace the earlier, taking its constraint, reason and review date with it.\n"+
+				"  Keep the one you mean", j, i, key)
+		}
+		firstEntry[key] = i
 	}
 	return nil
 }
@@ -485,6 +500,10 @@ func newProfileShowCmd(gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("list profile bindings: %w", err)
 			}
+			resolvable, err := resolvableIdentities(ctx, adb)
+			if err != nil {
+				return err
+			}
 
 			fmt.Printf("Profile:     %s\n", d.Profile.Name)
 			if d.Profile.Description != "" {
@@ -498,6 +517,10 @@ func newProfileShowCmd(gf *globalFlags) *cobra.Command {
 			}
 			for _, b := range bindings {
 				fmt.Printf("  %s\n", b.Identity)
+				if !resolvable[b.Identity] {
+					fmt.Printf("    no identity binding resolves to this name, so no request reaches this profile\n"+
+						"    bodega identity bind cidr <cidr> %s\n", b.Identity)
+				}
 			}
 
 			fmt.Printf("\nType rules (%d):\n", len(d.Types))
@@ -609,20 +632,34 @@ func requireIdentity(ctx context.Context, adb *audit.DB, identity string, force 
 	if force {
 		return nil
 	}
-	bindings, err := adb.ListIdentityBindings(ctx)
+	resolvable, err := resolvableIdentities(ctx, adb)
 	if err != nil {
-		return fmt.Errorf("read identity bindings: %w", err)
+		return err
 	}
-	for _, b := range bindings {
-		if b.Identity == identity {
-			return nil
-		}
+	if resolvable[identity] {
+		return nil
 	}
 	return fmt.Errorf("no identity binding resolves to %q, so no request would ever reach this profile.\n"+
 		"  The names:   bodega identity list\n"+
 		"  A new one:   bodega identity bind cidr <cidr> %s\n"+
 		"  Bind anyway: --force, for a name whose identity binding comes later",
 		identity, identity)
+}
+
+// resolvableIdentities is the set of names an identity binding produces. bind
+// refuses a name outside it, and the same inertness arrives later when the
+// identity binding is removed underneath a live profile binding, which is why
+// show consults it too: nothing else reports a binding that stopped resolving.
+func resolvableIdentities(ctx context.Context, adb *audit.DB) (map[string]bool, error) {
+	bindings, err := adb.ListIdentityBindings(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read identity bindings: %w", err)
+	}
+	out := make(map[string]bool, len(bindings))
+	for _, b := range bindings {
+		out[b.Identity] = true
+	}
+	return out, nil
 }
 
 func newProfileUnbindCmd(gf *globalFlags) *cobra.Command {
@@ -1224,23 +1261,50 @@ func checkView(d *audit.ProfileDetail) *audit.ProfileDetail {
 // constraint no cataloged version satisfies are the same defect — a control
 // that refuses everything it names — and a second implementation of "does this
 // constraint match" is what internal/admit exists to have prevented.
+//
+// A hidden version counts as absent, because every handler that builds an
+// answer excludes it, so an entry whose only match is hidden names a version
+// nothing can serve. Frozen is deliberately not the same: it blocks build,
+// edit and delete, and the version still serves.
 func entryResolves(ctx context.Context, store *manifest.Store, p *entitle.Profile, e audit.ProfileEntry) string {
 	pm, err := store.GetPackage(ctx, e.Type, e.Name)
 	if err != nil || pm == nil {
 		return "no " + e.Type + " package by that name in the catalog"
 	}
-	var have []string
+	var servable, hidden, hiddenMatch []string
+	var last entitle.Decision
 	for _, ve := range pm.Versions {
-		if p.Permits(e.Type, e.Name, ve.Version).Permitted {
+		last = p.Permits(e.Type, e.Name, ve.Version)
+		if ve.Hidden {
+			hidden = append(hidden, ve.Version)
+			if last.Permitted {
+				hiddenMatch = append(hiddenMatch, ve.Version)
+			}
+			continue
+		}
+		if last.Permitted {
 			return ""
 		}
-		have = append(have, ve.Version)
+		servable = append(servable, ve.Version)
 	}
-	if len(have) == 0 {
+	switch {
+	case len(pm.Versions) == 0:
 		return "the catalog holds the package with no versions"
+	case len(servable) == 0:
+		return fmt.Sprintf("every cataloged version is hidden (%s), so nothing serves this package",
+			strings.Join(hidden, ", "))
+	case len(hiddenMatch) > 0:
+		return fmt.Sprintf("%s permits only hidden versions (%s), which nothing serves",
+			orDash(strings.TrimSpace(e.Constraint+" "+e.Version)), strings.Join(hiddenMatch, ", "))
+	case last.Rule != nil && last.Entry == nil:
+		// The type's version default refused on its own, and the entry's own
+		// fields are empty because the default is what stood in for them.
+		// entitle has already written the sentence that names the rule; a
+		// message rebuilt from the entry here would name nothing.
+		return last.Reason
 	}
 	return fmt.Sprintf("%s permits none of the cataloged versions (%s)",
-		orDash(strings.TrimSpace(e.Constraint+" "+e.Version)), strings.Join(have, ", "))
+		orDash(strings.TrimSpace(e.Constraint+" "+e.Version)), strings.Join(servable, ", "))
 }
 
 // originPackage is one cataloged package that names a host as an origin.

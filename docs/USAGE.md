@@ -803,7 +803,7 @@ $EDITOR db.json
 bodega profile create db --from-file db.json
 ```
 
-`--from-file` reads the whole document before it writes anything, through the same checks `add` and `set` make: a package type outside the eight, an entry with no name and a constraint with no version are each refused with the offending line named. The profile, its markers and its entries then land in one transaction. A document rejected halfway would otherwise leave a bindable profile holding a subset of what was authored, which is not a failed create but a working access control permitting less than anyone wrote.
+`--from-file` reads the whole document before it writes anything, through the same checks `add` and `set` make: a package type outside the eight, an entry with no name and a constraint with no version are each refused with the offending line named. A key named twice is refused the same way, naming both lines: one type carries one marker and one package carries one entry, so the later row would replace the earlier and take its constraint, reason and review date with it. The profile, its markers and its entries then land in one transaction. A document rejected halfway would otherwise leave a bindable profile holding a subset of what was authored, which is not a failed create but a working access control permitting less than anyone wrote.
 
 The round trip through a file is the review step, and `--out -` and `--from-file -` are both refused. A host's inventory holds its accidents alongside its requirements, and locking membership to it enshrines whatever was installed by hand at 03:00; a baseline piped straight from the command that produced it was never read by anyone.
 
@@ -825,7 +825,7 @@ bodega profile bind web devbox
 bodega profile unbind devbox
 ```
 
-`bind` refuses a name no identity binding produces. A profile bound to a typo is inert: no request ever resolves to that name, so the profile is never consulted and nothing reports it. `--force` binds ahead of the identity binding.
+`bind` refuses a name no identity binding produces. A profile bound to a typo is inert: no request ever resolves to that name, so the profile is never consulted and nothing reports it. `--force` binds ahead of the identity binding. The same inertness arrives later when the identity binding is removed underneath a live profile binding, so `bodega profile show` marks a bound host no identity binding still resolves to.
 
 #### Falsifying a profile: `diff` and `check`
 
@@ -837,7 +837,7 @@ bodega profile check db
 
 `diff` names what the host has that the profile does not list and what the profile lists that the host does not have. Without it a baseline written six months ago and a host that has moved on look identical from the outside.
 
-`check` is the CI gate and exits 1 on any violation, the same contract `bodega policy check` has. It asks whether each entry permits at least one version the catalog actually carries, so a pin the catalog dropped and a range constraint nothing satisfies are both caught:
+`check` is the CI gate and exits 1 on any violation, the same contract `bodega policy check` has. It asks whether each entry permits at least one version the catalog can serve, so a pin the catalog dropped, a pin whose version was hidden and a range constraint nothing satisfies are all caught:
 
 ```text
 $ bodega profile check db2

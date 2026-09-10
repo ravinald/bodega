@@ -532,3 +532,160 @@ func TestProfileAddPreservesAPinsReasonAndReviewDate(t *testing.T) {
 		t.Errorf("unpin dropped the reason:\n%s", shown)
 	}
 }
+
+// A document naming one key twice is a document whose meaning depends on row
+// order. The last row wins in SQL, so the pin, its reason and its review date
+// vanish and the success line counts a row nothing stored.
+func TestProfileCreateFromFileRefusesADuplicateKey(t *testing.T) {
+	newDiscoverEnv(t)
+	dir := t.TempDir()
+	dupEntry := writeDoc(t, dir, "dup-entry.json", `{
+	  "config_version": 1, "name": "dup2",
+	  "types": [{"type": "pypi", "membership": "closed", "version_default": "floating"}],
+	  "entries": [
+	    {"type": "pypi", "name": "numpy", "constraint_kind": "exact", "version": "1.26.4",
+	     "reason": "1.27 breaks the build", "review_after": "2027-01-01"},
+	    {"type": "pypi", "name": "requests", "constraint_kind": "any"},
+	    {"type": "pypi", "name": "numpy", "constraint_kind": "any"}
+	  ]
+	}`)
+
+	_, err := runProfile(t, "create", "dup2", "--from-file", dupEntry)
+	if err == nil {
+		t.Fatal("a document naming pypi/numpy twice was accepted")
+	}
+	for _, want := range []string{"entries[0]", "entries[2]", "pypi/numpy"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q:\n%v", want, err)
+		}
+	}
+	if out, err := runProfile(t, "show", "dup2"); err == nil {
+		t.Fatalf("the refused create left a profile behind:\n%s", out)
+	}
+
+	dupType := writeDoc(t, dir, "dup-type.json", `{
+	  "config_version": 1, "name": "dup",
+	  "types": [
+	    {"type": "pypi", "membership": "open", "version_default": "floating"},
+	    {"type": "pypi", "membership": "closed", "version_default": "pinned"}
+	  ],
+	  "entries": [{"type": "pypi", "name": "numpy", "constraint_kind": "any"}]
+	}`)
+	_, err = runProfile(t, "create", "dup", "--from-file", dupType)
+	if err == nil {
+		t.Fatal("a document stating two rules for pypi was accepted")
+	}
+	for _, want := range []string{"types[0]", "types[1]", "pypi"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q:\n%v", want, err)
+		}
+	}
+}
+
+// Hiding a version is the ordinary way a version stops being served, so an
+// entry whose only match is hidden names a version nothing can answer with.
+func TestProfileCheckCountsAHiddenVersionAsUnservable(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedCatalog(t, env, "db01", map[string][]string{"psycopg2": {"2.9.9"}})
+	mustRunProfile(t, "create", "hid")
+	mustRunProfile(t, "add", "hid", "pypi", "psycopg2",
+		"--constraint", "exact", "--version", "2.9.9", "--reason", "held")
+
+	if out, err := runProfile(t, "check", "hid"); err != nil {
+		t.Fatalf("check failed while the version was servable: %v\n%s", err, out)
+	}
+
+	hideVersion(t, env, "psycopg2", "2.9.9")
+	out, err := runProfile(t, "check", "hid")
+	if err == nil {
+		t.Fatalf("check passed on an entry whose only match is hidden:\n%s", out)
+	}
+	if !strings.Contains(out, "hidden") || !strings.Contains(out, "2.9.9") {
+		t.Errorf("the violation does not say the version is hidden:\n%s", out)
+	}
+}
+
+// A violation an operator cannot act on is a violation nobody fixes. When the
+// type's version default did the refusing, the entry's own fields are empty
+// and only the predicate's sentence names the rule.
+func TestProfileCheckNamesTheVersionDefaultThatRefused(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedCatalog(t, env, "db01", map[string][]string{"requests": {"2.31.0", "2.32.0"}})
+	mustRunProfile(t, "create", "pt")
+	mustRunProfile(t, "add", "pt", "pypi", "requests")
+	mustRunProfile(t, "set", "pt", "pypi", "--membership", "closed", "--version-default", "pinned")
+
+	out, err := runProfile(t, "check", "pt")
+	if err == nil {
+		t.Fatalf("check passed on an entry the type default refuses:\n%s", out)
+	}
+	if !strings.Contains(out, "pins every pypi version") {
+		t.Errorf("the violation names no rule an operator can act on:\n%s", out)
+	}
+}
+
+// A profile binding outlives the identity binding underneath it, and the
+// result is as inert as the typo `profile bind` refuses. show says so.
+func TestProfileShowNamesABindingThatStoppedResolving(t *testing.T) {
+	env := newDiscoverEnv(t)
+	mustRunProfile(t, "create", "db")
+
+	adb, err := audit.Open(env.auditDB)
+	if err != nil {
+		t.Fatalf("open audit db: %v", err)
+	}
+	ctx := context.Background()
+	if _, err := adb.AddIdentityBinding(ctx, audit.IdentityBinding{
+		Kind: audit.BindCIDR, Key: "10.20.0.0/16", Identity: "devbox",
+	}); err != nil {
+		t.Fatalf("seed identity binding: %v", err)
+	}
+	_ = adb.Close()
+
+	mustRunProfile(t, "bind", "db", "devbox")
+	if shown := mustRunProfile(t, "show", "db"); strings.Contains(shown, "no identity binding resolves") {
+		t.Fatalf("show calls a live binding unresolvable:\n%s", shown)
+	}
+
+	adb, err = audit.Open(env.auditDB)
+	if err != nil {
+		t.Fatalf("reopen audit db: %v", err)
+	}
+	removed, err := adb.RemoveIdentityBinding(ctx, audit.BindCIDR, "10.20.0.0/16")
+	if err != nil || !removed {
+		t.Fatalf("remove identity binding: removed=%v err=%v", removed, err)
+	}
+	_ = adb.Close()
+
+	shown := mustRunProfile(t, "show", "db")
+	if !strings.Contains(shown, "no identity binding resolves") {
+		t.Errorf("show reports a binding no request reaches as if it worked:\n%s", shown)
+	}
+}
+
+// hideVersion marks a cataloged version hidden, as `bodega pkg hide` does.
+func hideVersion(t *testing.T, env *discoverEnv, name, version string) {
+	t.Helper()
+	ctx := context.Background()
+	store := manifest.NewLocalStore(env.manifestDir)
+	if err := store.LoadIndex(ctx); err != nil {
+		t.Fatalf("load index: %v", err)
+	}
+	pm, err := store.GetPackage(ctx, manifest.TypePypi, name)
+	if err != nil || pm == nil {
+		t.Fatalf("get %s: %v", name, err)
+	}
+	found := false
+	for i := range pm.Versions {
+		if pm.Versions[i].Version == version {
+			pm.Versions[i].Hidden = true
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("%s has no version %s to hide", name, version)
+	}
+	if err := store.SavePackage(ctx, pm); err != nil {
+		t.Fatalf("save %s: %v", name, err)
+	}
+}
