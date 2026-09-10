@@ -307,6 +307,7 @@ func (s *Server) recordDiscoveryRaw(_ context.Context, r *http.Request, regType,
 		Decision:     decision,
 		UpstreamURL:  upstreamURL,
 		LastClient:   ClientIP(r),
+		LastIdentity: Identity(r),
 	})
 }
 

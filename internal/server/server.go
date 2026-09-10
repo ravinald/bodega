@@ -95,6 +95,17 @@ type Server struct {
 	aclAt atomic.Int64 // UnixNano the cached set was resolved
 	aclMu sync.Mutex   // serializes refreshes so a stale cache costs one query
 
+	// identity is the live answer for the identity binding table, held the
+	// same way and on the same TTL as acl. See internal/server/identity.go.
+	identity   atomic.Pointer[identitySet]
+	identityAt atomic.Int64
+	identityMu sync.Mutex
+	// cidrInert latches whether CIDR bindings are currently unresolvable for
+	// want of a trusted_proxies answer, so the log records each entry into
+	// that state once rather than every cache refresh. See
+	// Server.logInertCIDRBindings.
+	cidrInert atomic.Bool
+
 	// aptSign is the signing key and the two served renderings of its public
 	// half. nil when no key is installed, which is a supported configuration:
 	// signed and unsigned coexist at the same URLs, and the signature is
@@ -299,6 +310,7 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 	// first sight, then resolve the live set the middleware chain reads.
 	s.seedACLs(context.Background())
 	s.refreshACLs(context.Background())
+	s.refreshIdentities(context.Background())
 
 	// Resolve the git toolchain before routes are registered: whether
 	// git-http-backend exists decides which routes exist.
@@ -379,6 +391,12 @@ func (s *Server) handler() http.Handler {
 	var h http.Handler = s.mux
 	h = AuditMiddleware(s.auditDB)(h)
 	h = MutationAuthMiddleware(s.adminNetsFunc(), s.auditDB, s.pepper, s.logger)(h)
+	// Inside the deny list, so a refused address costs no token hash: a
+	// deny-listed peer is the one client that can flood this server on
+	// purpose. Outside everything that writes an audit row, so every row
+	// downstream — the fetch, the denial, the discovery observation — names
+	// the host and not only the address.
+	h = IdentityMiddleware(s.identityFunc())(h)
 	h = DenyListMiddleware(s.denyNetsFunc(), s.auditDB)(h)
 	h = RequestLogger(s.logger)(h)
 	h = SecurityHeadersMiddleware(s.publicScheme)(h)
@@ -465,6 +483,10 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	if err := s.guardPlaintext(); err != nil {
+		return err
+	}
+
+	if err := s.guardCIDRBindings(ctx); err != nil {
 		return err
 	}
 
@@ -652,11 +674,12 @@ func (s *Server) recordLifecycle(ev audit.EventType, addr string, tlsMode bool) 
 // the same trap in a rarer shape, and the hourly tick already treats a failed
 // manifest read as non-fatal and rebuilds anyway.
 func (s *Server) reload(ctx context.Context) {
-	s.logger.Info("reload requested, re-reading manifests, the apt signing key and the CIDR access lists")
+	s.logger.Info("reload requested, re-reading manifests, the apt signing key, the CIDR access lists and the identity bindings")
 	s.reloadManifests(ctx)
 	s.loadAptSigner()
 	s.rebuildAptSnapshot(ctx)
 	s.refreshACLs(ctx)
+	s.refreshIdentities(ctx)
 	s.logger.Info("reload complete")
 }
 
@@ -1241,6 +1264,7 @@ func (s *Server) handleAPIAudit(w http.ResponseWriter, r *http.Request) {
 		PkgType:   q.Get("pkg_type"),
 		PkgName:   q.Get("name"),
 		ClientIP:  q.Get("client"),
+		Identity:  q.Get("identity"),
 		Limit:     50,
 	}
 	if since := q.Get("since"); since != "" {

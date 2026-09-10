@@ -23,6 +23,7 @@ type contextKey int
 const (
 	clientIPKey contextKey = iota
 	trustedNetsKey
+	identityKey
 )
 
 // ClientIP returns the resolved client IP from the request context, falling
@@ -269,6 +270,7 @@ func recordDenialFor(db *audit.DB, r *http.Request, pkgType, pkgName, pkgVersion
 		PkgName:    pkgName,
 		PkgVersion: pkgVersion,
 		ClientIP:   ClientIP(r),
+		Identity:   Identity(r),
 		UserAgent:  truncateField(r.UserAgent(), maxDetailField),
 		Status:     reason,
 		Details:    string(blob),
@@ -482,15 +484,47 @@ func (r *responseRecorder) Flush() {
 	}
 }
 
+// redactedHeaders names the headers whose value is a credential. The name
+// survives, so a debug log still answers "did this client send one"; the value
+// never reaches the file, because these are the exact secrets bodega hands out.
+//
+// Read-path identity is what makes this a leak rather than a curiosity. Before
+// it, the only Authorization headers arriving were operator mutations; now
+// every package GET can carry a token and `bodega doctor --write-credentials`
+// puts one on eight client hosts. The tokens are unscoped, so a token in a log
+// the journal group can read is a write credential (docs/THREAT_MODEL.md).
+// recordDenial states the same position for audit rows: no header is copied
+// into one.
+//
+// Lowercase keys, matched after folding: http.Header canonicalizes what it
+// parses, but formatHeaders is also handed response headers, which a handler
+// may have set through the map directly.
+var redactedHeaders = map[string]bool{
+	"authorization":       true,
+	"proxy-authorization": true,
+	"cookie":              true,
+	"set-cookie":          true,
+}
+
+// redactedValue replaces a credential rather than shortening it. A prefix or a
+// hash would still be reversible against a token whose alphabet and length are
+// published, which defeats the point of not writing it down.
+const redactedValue = "[redacted]"
+
 func formatHeaders(h http.Header) string {
 	var sb strings.Builder
 	for k, vs := range h {
+		redact := redactedHeaders[strings.ToLower(k)]
 		for _, v := range vs {
 			if sb.Len() > 0 {
 				sb.WriteString("; ")
 			}
 			sb.WriteString(k)
 			sb.WriteString(": ")
+			if redact {
+				sb.WriteString(redactedValue)
+				continue
+			}
 			sb.WriteString(v)
 		}
 	}
@@ -549,6 +583,7 @@ func AuditMiddleware(db *audit.DB) func(http.Handler) http.Handler {
 				PkgName:    pkgName,
 				PkgVersion: pkgVersion,
 				ClientIP:   ClientIP(r),
+				Identity:   Identity(r),
 				UserAgent:  r.UserAgent(),
 				Status:     "success",
 				DurationMs: duration.Milliseconds(),
@@ -657,10 +692,12 @@ func LocalhostOnly(nets []*net.IPNet) bool {
 // captured at chain build time would leave a widened server still admitting
 // unauthenticated mutations until it restarted.
 //
-// GET/HEAD/OPTIONS requests pass through unconditionally — package manager
-// clients (apt, pip, go, npm) cannot send auth headers over standard protocols.
-// The exceptions are the four admin reads, which Server.requireAdmin gates
-// with the same AdminPermits predicate this uses.
+// GET/HEAD/OPTIONS requests pass through unconditionally: the read path is
+// open by design, not because a client could not authenticate. Every one of
+// the eight can (see credentialFrom), and IdentityMiddleware reads what they
+// send to attribute the request; what may be fetched is a separate question
+// this gate does not ask. The exceptions are the four admin reads, which
+// Server.requireAdmin gates with the same AdminPermits predicate this uses.
 func MutationAuthMiddleware(admin NetsFunc, auditDB *audit.DB, pepper string, logger *slog.Logger) func(http.Handler) http.Handler {
 	// Cache token hashes to avoid per-request DB queries.
 	var cachedHashes []audit.TokenHash

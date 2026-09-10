@@ -49,6 +49,7 @@ type wireEvent struct {
 	DurationMs int64  `json:"duration_ms"`
 	Details    string `json:"details"`
 	Actor      string `json:"actor"`
+	Identity   string `json:"identity"`
 }
 
 type wireDiscovery struct {
@@ -60,6 +61,7 @@ type wireDiscovery struct {
 	Decision     string `json:"decision"`
 	UpstreamURL  string `json:"upstream_url"`
 	LastClient   string `json:"last_client"`
+	LastIdentity string `json:"last_identity"`
 }
 
 // encodeEvent renders one event as a single line with no interior newline.
@@ -81,6 +83,7 @@ func encodeEvent(ev Event) ([]byte, error) {
 			DurationMs: ev.DurationMs,
 			Details:    ev.Details,
 			Actor:      ev.Actor,
+			Identity:   ev.Identity,
 		},
 	})
 }
@@ -108,6 +111,7 @@ func encodeDiscovery(r DiscoveryRow) ([]byte, error) {
 			Decision:     r.Decision,
 			UpstreamURL:  r.UpstreamURL,
 			LastClient:   r.LastClient,
+			LastIdentity: r.LastIdentity,
 		},
 	})
 }

@@ -76,6 +76,19 @@ defence against:
   — all of these run with the build user's privileges and can do anything
   that user can. Bodega controls *which* packages run; it does not sandbox
   what they do once they run.
+- **A read-path credential being read-only.** `bodega token generate` takes a
+  label and nothing else; the rows in `api_tokens` carry no scope. The
+  mutation gate accepts any unexpired one of them as its credential half
+  whenever `admin_permit_cidr` reaches past loopback, so a token written to a
+  client host by `bodega doctor --write-credentials` authorizes `POST` and
+  `DELETE` from that host too, if its address is inside `admin_permit_cidr`.
+  Read-path identity did not introduce this; it is what unscoped tokens have
+  always meant, and it matters now because the read path is the first place
+  those tokens live on machines other than an operator's. Two remedies exist
+  today, and `--write-credentials` prints them before it writes: keep
+  `admin_permit_cidr` at loopback, which makes the gate ignore tokens
+  entirely, or treat every host holding a written credential as
+  admin-capable. Scoped tokens would sever the two and are not shipped.
 
 ## Out-of-scope distribution formats
 

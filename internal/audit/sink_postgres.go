@@ -111,10 +111,10 @@ func runPostgresMigrations(db *sql.DB) error {
 
 func (s *postgresSink) Record(ctx context.Context, ev Event) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO events (event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details, actor)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		`INSERT INTO events (event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details, actor, identity)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 		string(ev.EventType), ev.PkgType, ev.PkgName, ev.PkgVersion,
-		ev.ClientIP, ev.UserAgent, ev.Status, ev.DurationMs, ev.Details, ev.Actor,
+		ev.ClientIP, ev.UserAgent, ev.Status, ev.DurationMs, ev.Details, ev.Actor, ev.Identity,
 	)
 	return err
 }
@@ -173,6 +173,9 @@ func (s *postgresSink) QueryEvents(ctx context.Context, f Filter) ([]StoredEvent
 	if f.Actor != "" {
 		where = append(where, "actor = "+a.next(f.Actor))
 	}
+	if f.Identity != "" {
+		where = append(where, "identity = "+a.next(f.Identity))
+	}
 	if !f.Since.IsZero() {
 		where = append(where, "timestamp >= "+a.next(f.Since.UTC()))
 	}
@@ -180,7 +183,7 @@ func (s *postgresSink) QueryEvents(ctx context.Context, f Filter) ([]StoredEvent
 		where = append(where, "timestamp <= "+a.next(f.Until.UTC()))
 	}
 
-	q := "SELECT id, timestamp, event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details, actor FROM events"
+	q := "SELECT id, timestamp, event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details, actor, identity FROM events"
 	if len(where) > 0 {
 		//nolint:gosec // G202: WHERE clause assembled from a fixed slice of internal predicates; values are bound via $N parameters.
 		q += " WHERE " + strings.Join(where, " AND ")
@@ -203,7 +206,7 @@ func (s *postgresSink) QueryEvents(ctx context.Context, f Filter) ([]StoredEvent
 		if err := rows.Scan(&se.ID, &ts, &et,
 			&se.PkgType, &se.PkgName, &se.PkgVersion,
 			&se.ClientIP, &se.UserAgent, &se.Status,
-			&se.DurationMs, &se.Details, &se.Actor); err != nil {
+			&se.DurationMs, &se.Details, &se.Actor, &se.Identity); err != nil {
 			return nil, err
 		}
 		se.EventType = EventType(et)
@@ -252,7 +255,7 @@ func (s *postgresSink) ListDiscovery(ctx context.Context, f DiscoveryFilter) ([]
 	}
 
 	q := `SELECT registry_type, host, pattern_hint, pkg_name, pkg_version, decision,
-	             upstream_url, first_seen, last_seen, last_client, request_count
+	             upstream_url, first_seen, last_seen, last_client, last_identity, request_count
 	      FROM upstream_discovery`
 	if len(where) > 0 {
 		//nolint:gosec // G202: WHERE clause assembled from a fixed slice of internal predicates; values are bound via $N parameters.
@@ -273,7 +276,7 @@ func (s *postgresSink) ListDiscovery(ctx context.Context, f DiscoveryFilter) ([]
 		var r DiscoveryRow
 		var firstSeen, lastSeen time.Time
 		if err := rows.Scan(&r.RegistryType, &r.Host, &r.PatternHint, &r.PkgName, &r.PkgVersion,
-			&r.Decision, &r.UpstreamURL, &firstSeen, &lastSeen, &r.LastClient, &r.RequestCount); err != nil {
+			&r.Decision, &r.UpstreamURL, &firstSeen, &lastSeen, &r.LastClient, &r.LastIdentity, &r.RequestCount); err != nil {
 			return nil, err
 		}
 		r.FirstSeen = firstSeen.UTC()

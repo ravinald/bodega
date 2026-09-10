@@ -62,6 +62,10 @@ type DiscoveryRow struct {
 	FirstSeen    time.Time
 	LastSeen     time.Time
 	LastClient   string
+	// LastIdentity is what an identity binding resolved the last requester to,
+	// empty when nothing bound it. It follows LastClient rather than replacing
+	// it, for the same reason Event.Identity follows Event.ClientIP.
+	LastIdentity string
 	RequestCount int64
 }
 

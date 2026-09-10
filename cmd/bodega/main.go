@@ -226,6 +226,7 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 		noReloadSignal(newAptCmd(gf)),
 		noReloadSignal(newTokenCmd(gf)),
 		noReloadSignal(newACLCmd(gf)),
+		noReloadSignal(newIdentityCmd(gf)),
 		noReloadSignal(newPolicyCmd(gf)),
 		noReloadSignal(newDiscoverCmd(gf)),
 		noReloadSignal(newPinCmd(gf)),
