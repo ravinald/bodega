@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"slices"
 	"strings"
@@ -28,7 +29,9 @@ import (
 // The threat model and rationale for each check is documented in
 // docs/THREAT_MODEL.md.
 func newDoctorCmd(gf *globalFlags) *cobra.Command {
-	return &cobra.Command{
+	var writeCreds bool
+	var token, baseURL string
+	c := &cobra.Command{
 		Use:   "doctor",
 		Short: "Inspect the local host and this install's policy posture for gaps in bodega's controls",
 		Long: `doctor scans the machine running this command for distribution channels
@@ -57,9 +60,24 @@ Exit code is 0 when clean and 2 when one or more findings are present, so
 this command can gate CI pipelines for build hosts that are supposed to
 route everything through bodega.
 
+--write-credentials is the one thing doctor does that is not a report. It
+takes a token and writes it into the file each of the eight clients reads
+its credential from, so a host can be attributed on the read path without
+eight hand edits. Five files serve the eight: pip, go, git and curl/wget all
+read ~/.netrc. Everything bodega writes is fenced by a marker comment and
+rewritten in place on a second run; nothing outside the fence is touched.
+
+  bodega doctor --write-credentials --token bodega_ak_... --url https://bodega.internal
+
+The token names the host through bodega identity bind token <id> <name>. The
+write changes what an audit row says, never what the host may fetch.
+
 See docs/THREAT_MODEL.md for the rationale behind each check.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if writeCreds {
+				return writeClientCredentials(gf, token, baseURL)
+			}
 			findings := make([]host.Finding, 0, len(host.AllChecks())+len(postureChecks))
 			for _, fn := range host.AllChecks() {
 				findings = append(findings, fn())
@@ -96,6 +114,75 @@ See docs/THREAT_MODEL.md for the rationale behind each check.`,
 			return nil
 		},
 	}
+	c.Flags().BoolVar(&writeCreds, "write-credentials", false,
+		"Write a read-path credential into each client's own configuration file")
+	c.Flags().StringVar(&token, "token", "",
+		"The token to write (bodega token generate <label>)")
+	c.Flags().StringVar(&baseURL, "url", "",
+		"Base URL clients reach this bodega at; defaults to public_url from the config file")
+	return c
+}
+
+// writeClientCredentials lands one token in every file the eight clients read
+// their credential from, and prints what it did per client.
+//
+// It reports rather than aborting on the first failure: /etc/apt/auth.conf.d
+// needs root and the other seven do not, so a run as a normal user should
+// configure seven clients and name the one it could not.
+func writeClientCredentials(gf *globalFlags, token, baseURL string) error {
+	if token == "" {
+		return fmt.Errorf("--write-credentials needs a --token to write.\n" +
+			"  Mint one:  bodega token generate <label>\n" +
+			"  Name the host it belongs to:  bodega identity bind token <id> <name>")
+	}
+	if baseURL == "" {
+		cfg, err := loadConfig(gf)
+		if err != nil {
+			return fmt.Errorf("load config: %w", err)
+		}
+		baseURL = cfg.PublicURL
+	}
+	if baseURL == "" {
+		return fmt.Errorf("--write-credentials needs the base URL clients reach this bodega at.\n" +
+			"  Pass --url https://bodega.internal, or set public_url in the config file")
+	}
+	base, err := url.Parse(baseURL)
+	if err != nil || base.Host == "" {
+		return fmt.Errorf("%q is not a URL with a host: pass --url https://bodega.internal", baseURL)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("resolve home directory: %w", err)
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "CLIENT\tSTATUS\tFILE\tNOTE")
+	failed := 0
+	for _, t := range host.CredentialTargets(home) {
+		status, note := "written", t.Note
+		changed, err := host.WriteCredential(t, base, token)
+		switch {
+		case err != nil:
+			status, note = "FAILED", err.Error()
+			failed++
+		case !changed:
+			// Four clients share ~/.netrc, so three of them find the entry
+			// the first already wrote. Unchanged is the answer, not a failure.
+			status = "current"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", t.Client, status, t.Path, note)
+	}
+	_ = w.Flush()
+
+	if failed > 0 {
+		fmt.Printf("\n%d of %d clients could not be written. /etc/apt/auth.conf.d needs root; the rest do not.\n",
+			failed, len(host.CredentialTargets(home)))
+		os.Exit(2) //nolint:revive // same CI-gating exit code the checks use
+	}
+	fmt.Println()
+	fmt.Println("Credential written. bodega attributes a request carrying it to whatever")
+	fmt.Println("bodega identity bind token <id> <name> named, and serves it either way.")
+	return nil
 }
 
 // postureChecks names the server-posture rows in the order doctor prints them.

@@ -23,6 +23,7 @@ type contextKey int
 const (
 	clientIPKey contextKey = iota
 	trustedNetsKey
+	identityKey
 )
 
 // ClientIP returns the resolved client IP from the request context, falling
@@ -269,6 +270,7 @@ func recordDenialFor(db *audit.DB, r *http.Request, pkgType, pkgName, pkgVersion
 		PkgName:    pkgName,
 		PkgVersion: pkgVersion,
 		ClientIP:   ClientIP(r),
+		Identity:   Identity(r),
 		UserAgent:  truncateField(r.UserAgent(), maxDetailField),
 		Status:     reason,
 		Details:    string(blob),
@@ -549,6 +551,7 @@ func AuditMiddleware(db *audit.DB) func(http.Handler) http.Handler {
 				PkgName:    pkgName,
 				PkgVersion: pkgVersion,
 				ClientIP:   ClientIP(r),
+				Identity:   Identity(r),
 				UserAgent:  r.UserAgent(),
 				Status:     "success",
 				DurationMs: duration.Milliseconds(),
@@ -657,10 +660,12 @@ func LocalhostOnly(nets []*net.IPNet) bool {
 // captured at chain build time would leave a widened server still admitting
 // unauthenticated mutations until it restarted.
 //
-// GET/HEAD/OPTIONS requests pass through unconditionally — package manager
-// clients (apt, pip, go, npm) cannot send auth headers over standard protocols.
-// The exceptions are the four admin reads, which Server.requireAdmin gates
-// with the same AdminPermits predicate this uses.
+// GET/HEAD/OPTIONS requests pass through unconditionally: the read path is
+// open by design, not because a client could not authenticate. Every one of
+// the eight can (see credentialFrom), and IdentityMiddleware reads what they
+// send to attribute the request; what may be fetched is a separate question
+// this gate does not ask. The exceptions are the four admin reads, which
+// Server.requireAdmin gates with the same AdminPermits predicate this uses.
 func MutationAuthMiddleware(admin NetsFunc, auditDB *audit.DB, pepper string, logger *slog.Logger) func(http.Handler) http.Handler {
 	// Cache token hashes to avoid per-request DB queries.
 	var cachedHashes []audit.TokenHash

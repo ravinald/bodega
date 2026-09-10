@@ -144,6 +144,11 @@ type Event struct {
 	DurationMs int64
 	Details    string // JSON blob for extra context
 	Actor      string // OS user for CLI/TUI events; empty for HTTP events (use ClientIP instead)
+	// Identity is the host an identity binding resolved this request to, and
+	// is empty when nothing bound it. It sits alongside ClientIP rather than
+	// replacing it: the deny list matched on the address, and one identity can
+	// hold several.
+	Identity string
 }
 
 // StoredEvent is an Event with its database ID and timestamp.
@@ -160,6 +165,7 @@ type Filter struct {
 	PkgName   string    // empty = all
 	ClientIP  string    // empty = all
 	Actor     string    // empty = all
+	Identity  string    // empty = all
 	Since     time.Time // zero = no lower bound
 	Until     time.Time // zero = no upper bound
 	Limit     int       // 0 = default (1000)

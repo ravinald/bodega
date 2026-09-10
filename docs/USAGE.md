@@ -534,6 +534,8 @@ Queries the configured audit sink. Under `audit_sink: "syslog"` or `"jsonl"` it 
 | `--pkg-type` | | Package type filter |
 | `--name` | | Package name filter |
 | `--client` | | Client IP filter |
+| `--identity` | | Identity filter: the host name an identity binding resolved the request to |
+| `--actor` | | Actor filter (CLI and TUI events, matched against the OS user) |
 | `--since` | | Show events after this time (RFC3339 or YYYY-MM-DD) |
 | `--limit` | `20` | Max events to show |
 
@@ -542,7 +544,10 @@ bodega audit events                                    # last 20 events
 bodega audit events --type fetch --limit 50            # last 50 fetches
 bodega audit events --pkg-type gomod --since 2026-04-07
 bodega audit events --client 10.0.0.5
+bodega audit events --identity build-07                # every request one host made
 ```
+
+The `CLIENT` and `IDENTITY` columns are printed together and neither substitutes for the other: the deny list matched on the address, and one identity holds several. `IDENTITY` is blank on a request no binding resolved, which is every request until `bodega identity bind` runs.
 
 ### `bodega pkg checksum list [--type TYPE] [--name NAME]`
 
@@ -638,6 +643,105 @@ A server holding one skips it, serves the rest of the list, and names the entry 
 Every add and remove writes an audit row: a `create` or `delete` event with `pkg_type=acl`, the list name, the CIDR and the OS user who ran the command. `bodega audit events` shows the list in its `NAME` column; the CIDR is in the record's version field, which `GET /api/v1/audit` returns and the table view does not.
 
 The first write to a list copies the config file's value in and says so. After that the database owns the list and the file's entry is inert; see **Configuration** below.
+
+### `bodega identity <bind|unbind|list>`
+
+Maps something the serve path can observe about a request to a host name, so the audit and discovery tables say which host asked rather than only which address did.
+
+Two kinds, because they answer different questions:
+
+| Kind    | Key                   | Right for                               | Bootstrap                               |
+| ------- | --------------------- | --------------------------------------- | --------------------------------------- |
+| `token` | an `api_tokens` id    | naming one host precisely               | the host needs the credential first     |
+| `cidr`  | a CIDR, stored masked | "everything on this subnet is a devbox" | none, but `trusted_proxies` must be set |
+
+```bash
+bodega identity bind cidr 10.20.0.0/16 devbox
+bodega identity bind token 4f3c9a... build-07 --comment "CI runner"
+bodega identity list
+bodega identity unbind cidr 10.20.0.0/16
+```
+
+`bind token` refuses an id no token has, because a binding to a mistyped id is inert and looks identical to one that works: every request from that host resolves through the CIDR fallback, or to nothing, and the rows read as a host that never authenticated. `bodega token list` prints the ids.
+
+**Resolution order on a request is token, then longest-prefix CIDR, then unidentified.** A token beats a CIDR that disagrees, because the credential is the more specific statement. A credential that matches no token, matches an expired one, or matches a token nothing is bound to falls through to the CIDR rather than refusing: this table decides what an audit row says, never what may be fetched. A request carrying no credential is served exactly as it was before any binding existed.
+
+**One token or one CIDR resolves to at most one identity.** A second binding that would make the answer ambiguous is refused here, at write time, and the refusal names the binding it collided with:
+
+```
+refusing to bind cidr 10.0.0.0/8 to "ci": 10.0.0.0/8 covers the same addresses at the same
+prefix length, so longest-prefix resolution could not choose between them.
+  Already bound: cidr 10.0.0.0/8 -> fleet
+  Remove it first (bodega identity unbind cidr 10.0.0.0/8), or bind to the same identity
+```
+
+Two prefixes of different lengths over the same addresses are fine, and are what longest-prefix resolution is for: `10.0.0.0/8` as `fleet` and `10.20.0.0/16` as `devbox` coexist, and `10.20.0.9` resolves to `devbox`. Keys are normalized before they are stored, so `10.20.5.9/16` bound is `10.20.0.0/16` listed, a bare address is a `/32` or `/128`, and `::ffff:10.0.0.0/104` is the same key as `10.0.0.0/8`.
+
+Rebinding a key to the identity it already has is a no-op, not an error, so a config-management run can assert the binding every hour.
+
+#### A CIDR binding needs `trusted_proxies` answered
+
+`bodega serve` **refuses to start** when a CIDR binding exists and `trusted_proxies` is still the built-in default:
+
+```
+refusing to serve: 1 CIDR identity binding exists while trusted_proxies is still the
+built-in default (loopback + RFC 1918).
+  Every peer in that range has its X-Real-IP believed verbatim, so any of them can claim
+  an address inside a bound network and collect that identity. Answer trusted_proxies
+  either way:
+    bodega acl proxies add <proxy-cidr>     name the proxy that terminates for clients
+    "trusted_proxies": [] in /etc/bodega/config.json
+                                            trust no forwarded header from anyone
+  Leaving the default is what is not accepted.
+  The live list:  bodega acl proxies list
+  The bindings:   bodega identity list
+```
+
+The default trusts loopback plus RFC 1918, and bodega returns `X-Real-IP` verbatim from any peer in that set. On a default-configured instance a CIDR binding is therefore assertable by whoever sends a header, which is not a caveat to document: it is the binding meaning nothing. Both remedies are accepted. `bodega acl proxies add <cidr>` names the proxy that terminates for your clients and claims the list for the database, which is what ends the built-in default. `"trusted_proxies": []` in the config file claims it empty on the next start, so bodega answers to the peer address alone. There is no `acl proxies remove` path out of the default, on purpose: `remove` refuses a CIDR the list does not hold rather than claiming the list as a side effect, so a typo cannot silently move an instance from the default to trusting nobody.
+
+It is a refusal rather than a warning because `log_level` defaults to `Error`, so a warning here is written for nobody and the instance runs anyway. `bodega identity bind cidr` prints the same guidance at bind time, so the interlock is discovered from the command that armed it rather than from a server that will not come back up. A token binding needs no proxy answer, because the credential is the claim; an instance carrying only token bindings starts unchanged.
+
+#### Where the identity shows up
+
+`bodega audit events` gains an `IDENTITY` column beside `CLIENT`, and `--identity <name>` filters on it. `bodega discover list` gains `LAST IDENTITY` beside `LAST CLIENT`, and the CSV export carries `last_identity`. Neither replaces the address: the deny list matched on the address, one identity holds several, and a row that dropped it would lose which one asked.
+
+```bash
+bodega audit events --identity build-07 --limit 50
+bodega audit events --type denied --identity build-07
+```
+
+Bindings are read per request through a 30-second cache, on the same schedule as the CIDR lists, so a change lands on a running server without a restart and at once on `systemctl reload bodega`.
+
+### `bodega doctor [--write-credentials --token TOKEN [--url URL]]`
+
+Without flags, `doctor` reports and changes nothing. With `--write-credentials` it writes one token into the file each of the eight clients reads its credential from, because a feature that costs eight hand edits does not get adopted:
+
+```bash
+bodega token generate devbox-3
+bodega identity bind token <id> devbox-3
+bodega doctor --write-credentials --token bodega_ak_... --url https://bodega.internal
+```
+
+`--url` defaults to `public_url` from the config file. Five files serve the eight clients:
+
+| Client   | File                               | Form                                   |
+| -------- | ---------------------------------- | -------------------------------------- |
+| `apt`    | `/etc/apt/auth.conf.d/bodega.conf` | netrc `machine` / `login` / `password` |
+| `pip`    | `~/.netrc`                         | read through requests                  |
+| `npm`    | `~/.npmrc`                         | `//host/npm/:_authToken=`              |
+| `gomod`  | `~/.netrc`                         | read for the `GOPROXY` host            |
+| `cargo`  | `~/.cargo/credentials.toml`        | `[registries.bodega] token`            |
+| `helm`   | `~/.config/helm/repositories.yaml` | `username` / `password` on the repo    |
+| `git`    | `~/.netrc`                         | read through libcurl                   |
+| `binary` | `~/.netrc`                         | `curl --netrc`; wget reads it already  |
+
+pip, go, git and curl/wget all read `~/.netrc`, so one host-scoped entry serves four clients and there is one secret to rotate rather than four. The table `doctor` prints reports `current` for the three that find the entry the first already wrote.
+
+Every write is fenced by a marker comment and replaced in place on a second run, so nothing an operator wrote in those files is touched and a rotation leaves no old token behind. The apt file needs root and the other four do not; a run as a normal user configures seven clients, names the one it could not, and exits 2.
+
+helm's `repositories.yaml` is the one target where appending is not always legal. A file whose `repositories:` list is not last would take an appended entry into whatever key followed, so `doctor` refuses that file and prints the `helm repo add bodega <url> --username bodega --password <token>` line to run instead.
+
+Writing a credential changes what an audit row says, never what the host may fetch.
 
 ### `bodega policy list [--type TYPE]`
 
@@ -1739,6 +1843,18 @@ git clone https://bodega-host:8080/git/github/octocat/Hello-World.git
 ```
 
 See [Git smart-HTTP](#git-smart-http) for what bodega does with that request.
+
+#### Naming the host in the audit trail
+
+None of the stanzas above carries a credential, and none needs one: every package route is open. A credential buys attribution. With one written, the `serve_fetch` row and the discovery observation name the host rather than the address it happened to hold, which is the difference between reading an audit trail and correlating one against DHCP leases.
+
+```bash
+bodega token generate devbox-3                                          # on the server
+bodega identity bind token <id> devbox-3                                # on the server
+bodega doctor --write-credentials --token bodega_ak_... --url https://bodega-host:8080
+```
+
+The last line runs on the client and writes the token into the file each of its package managers reads. See [`bodega doctor`](#bodega-doctor---write-credentials---token-token---url-url) for what lands where, and [`bodega identity`](#bodega-identity-bindunbindlist) for the CIDR binding that covers a whole subnet with no credential to distribute.
 
 ### Git smart-HTTP
 

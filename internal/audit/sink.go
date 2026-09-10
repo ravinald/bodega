@@ -134,7 +134,7 @@ func newSink(sc SinkConfig, embedded *sql.DB, readOnly bool) (EventSink, error) 
 // discoveryUpsertCols is the column count each batched row binds. It sets how
 // many rows one statement can carry: discoveryBatchRows x this stays under
 // SQLite's 32,766 variable ceiling and postgres's 65,535.
-const discoveryUpsertCols = 9
+const discoveryUpsertCols = 10
 
 // discoveryBatchRows caps the rows in one INSERT. The recorder batches well
 // below this; the cap is here so a larger batch splits into legal statements
@@ -182,6 +182,7 @@ func coalesceDiscovery(rows []DiscoveryRow) []DiscoveryRow {
 		m := &out[i]
 		m.RequestCount++
 		m.LastClient = r.LastClient
+		m.LastIdentity = r.LastIdentity
 		if r.Host != "" {
 			m.Host = r.Host
 		}
@@ -199,7 +200,7 @@ func coalesceDiscovery(rows []DiscoveryRow) []DiscoveryRow {
 func buildDiscoveryUpsert(rows []DiscoveryRow, postgres bool) (string, []any) {
 	var b strings.Builder
 	b.WriteString(`INSERT INTO upstream_discovery
-		   (registry_type, host, pattern_hint, pkg_name, pkg_version, decision, last_client, upstream_url, request_count)
+		   (registry_type, host, pattern_hint, pkg_name, pkg_version, decision, last_client, last_identity, upstream_url, request_count)
 		 VALUES `)
 	args := make([]any, 0, len(rows)*discoveryUpsertCols)
 	for i, r := range rows {
@@ -219,7 +220,7 @@ func buildDiscoveryUpsert(rows []DiscoveryRow, postgres bool) (string, []any) {
 		}
 		b.WriteByte(')')
 		args = append(args, r.RegistryType, r.Host, r.PatternHint, r.PkgName, r.PkgVersion,
-			r.Decision, r.LastClient, r.UpstreamURL, r.RequestCount)
+			r.Decision, r.LastClient, r.LastIdentity, r.UpstreamURL, r.RequestCount)
 	}
 	lastSeen := `strftime('%Y-%m-%dT%H:%M:%fZ','now')`
 	if postgres {
@@ -231,6 +232,7 @@ func buildDiscoveryUpsert(rows []DiscoveryRow, postgres bool) (string, []any) {
 		   request_count = upstream_discovery.request_count + excluded.request_count,
 		   last_seen     = ` + lastSeen + `,
 		   last_client   = excluded.last_client,
+		   last_identity = excluded.last_identity,
 		   host          = CASE WHEN excluded.host = '' THEN upstream_discovery.host ELSE excluded.host END,
 		   upstream_url  = CASE WHEN excluded.upstream_url = '' THEN upstream_discovery.upstream_url ELSE excluded.upstream_url END`)
 	return b.String(), args

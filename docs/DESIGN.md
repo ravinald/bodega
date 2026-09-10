@@ -457,7 +457,49 @@ Both are re-read per request rather than captured when the handler chain is buil
 
 Every add and remove is recorded in the audit database as a `create` or `delete` event with `pkg_type=acl`, the list in `pkg_name`, the CIDR in `pkg_version` and the OS user in `actor`. Who changed the rule sits beside the record of who the rule turned away.
 
-Package-serving read endpoints remain unauthenticated. Package manager clients (apt, pip, go, npm, helm) use standard protocols that don't support auth headers, so those read paths stay open by design. The four admin reads above are the exception, and a refusal on one is itself recorded in the audit database.
+Package-serving read endpoints remain unauthenticated. That is a policy, not a limitation: this document used to justify it by saying package-manager clients cannot send auth headers, and that was wrong for all eight of them. What they can send is described under **Read-path identity** below, and bodega now reads it to attribute a request. What may be fetched is a separate question the read path still does not ask. The four admin reads above are the exception, and a refusal on one is itself recorded in the audit database.
+
+### Read-path identity
+
+Every package route is open, and until migration `013` the only client attribute the serve path read was the resolved IP, which reached the deny list and the audit rows and stopped there. An operator asking "which host pulled this" got an address and a DHCP lease to correlate it against.
+
+A binding maps something the serve path can observe to a name. Two kinds, in `identity_bindings`:
+
+| Kind    | Key                | Answers                                 | Costs                                                     |
+| ------- | ------------------ | --------------------------------------- | --------------------------------------------------------- |
+| `token` | an `api_tokens` id | "this credential belongs to build-07"   | the host needs the credential before it can be attributed |
+| `cidr`  | a masked CIDR      | "everything on this subnet is a devbox" | no bootstrap problem; needs `trusted_proxies` answered    |
+
+Neither replaces the other. A token binding is the precise statement and has a bootstrap problem on a host that did not exist an hour ago; a CIDR binding has none and cannot tell two hosts on one subnet apart.
+
+**What each client sends.** Eight routes, three header shapes, and `credentialFrom` in `internal/server/identity.go` parses all three without asking which route the request landed on:
+
+| Client | Where the credential lives        | On the wire              |
+| ------ | --------------------------------- | ------------------------ |
+| apt    | `/etc/apt/auth.conf.d/`           | `Authorization: Basic`   |
+| pip    | `~/.netrc`, or the index URL      | `Authorization: Basic`   |
+| npm    | `_authToken` in `.npmrc`          | `Authorization: Bearer`  |
+| go     | `~/.netrc` for the `GOPROXY` host | `Authorization: Basic`   |
+| cargo  | `~/.cargo/credentials.toml`       | `Authorization: <token>` |
+| helm   | `--username` / `--password`       | `Authorization: Basic`   |
+| git    | `~/.netrc`, read by libcurl       | `Authorization: Basic`   |
+| binary | `~/.netrc`, read by curl or wget  | `Authorization: Basic`   |
+
+On `Basic`, the password wins and the username is the fallback: apt, go and git all carry a login plus the secret, while a pip index URL of the form `https://<token>@host/pypi/simple/` has only the user half to put it in. Cargo is the one client that sends its token with no scheme at all, which is why a single unrecognized word is read as a credential and `Digest`, `Negotiate` and a scheme with an empty value are not.
+
+**Resolution order is token, then longest-prefix CIDR, then unidentified.** The token wins because it is the more specific statement: an operator who issued a credential to one host said more about that host than the subnet it happens to sit in. A credential that matches no token, or matches an expired one, or matches a token nothing is bound to, falls through to the CIDR rather than refusing. This path adds attribution and never admission, so a request served yesterday is served today; all that changes is what the row says.
+
+**One token or one CIDR resolves to at most one identity, and the second write is what says so.** The primary key `(kind, bind_key)` refuses a key already bound to a different name. Equal-prefix overlap needs a check of its own, because `10.0.0.0/8` and `::ffff:10.0.0.0/104` are one set of addresses spelled two ways and a primary key would let the second through; `NormalizeBindCIDR` folds the IPv4-mapped form back and masks the host bits, so the key is the address set. Two bindings of the same prefix length covering one address are refused when the second is written, naming the first. Resolving that ambiguity at read time would make the answer depend on row order, which nothing about the table guarantees.
+
+**`bodega serve` refuses to start when a CIDR binding exists and `trusted_proxies` is still the built-in default.** The default is loopback plus RFC 1918, and bodega returns `X-Real-IP` verbatim from any peer in that set (see **IP resolution**), so on a default-configured instance a CIDR binding is assertable by whoever sends a header: any RFC 1918 peer claims an address inside a bound network and collects that identity. Both remedies are accepted and the refusal names both: `bodega acl proxies add <cidr>` names the proxy and claims the list for the database, and `"trusted_proxies": []` in the config file claims it empty on the next start. Leaving the default is what is not. `acl proxies remove` is deliberately not a way out of the default, because it refuses a CIDR the list does not hold rather than claiming the list as a side effect. A token binding has no such hole, because the credential is the claim, and an instance carrying only token bindings starts unchanged.
+
+It is a refusal rather than a warning for the same reason the empty `admin_permit_cidr` refusal is: `log_level` defaults to `Error`, so a warning here is written for nobody and the instance runs anyway. `bodega identity bind cidr` prints the same guidance at bind time, because discovering an interlock from a server that will not come back up is worse than discovering it from the command that armed it.
+
+**The identity sits beside the address, never in place of it.** `events.identity` and `upstream_discovery.last_identity` are new columns next to `client_ip` and `last_client`. The deny list matched on the address, one identity holds several addresses, and a row that dropped the address would lose which of them asked.
+
+`IdentityMiddleware` sits inside `DenyListMiddleware` and outside everything that writes an audit row. Inside the deny list, so a refused address costs no token hash: a deny-listed peer is the one client that can flood this server on purpose. Outside the audit and mutation gates, so the fetch row, the denial row and the discovery observation all name the host. The binding table is read per request through a 30-second cache, on the same schedule and through the same `SIGHUP` refresh as the CIDR lists, so `bodega identity bind` and `bodega acl` issued in the same minute land together.
+
+`bodega doctor --write-credentials --token <tok> --url <base>` writes the credential into each client's own file, because a feature that costs eight hand edits does not get adopted. Five files serve the eight clients: pip, go, git and curl/wget all read `~/.netrc`, and writing four copies of one secret would be four things to rotate. Each write is fenced by a marker comment and replaced in place on a second run, so nothing an operator wrote in those files is touched and a rotation leaves no old token behind. helm's `repositories.yaml` is the one target where appending is not always legal, and it refuses with the `helm repo add` line to run instead rather than writing a repository entry into whatever key followed.
 
 ### Response hardening
 

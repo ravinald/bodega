@@ -27,10 +27,10 @@ func (s *sqliteSink) Record(ctx context.Context, ev Event) error {
 		return nil
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO events (event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details, actor)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO events (event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details, actor, identity)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		string(ev.EventType), ev.PkgType, ev.PkgName, ev.PkgVersion,
-		ev.ClientIP, ev.UserAgent, ev.Status, ev.DurationMs, ev.Details, ev.Actor,
+		ev.ClientIP, ev.UserAgent, ev.Status, ev.DurationMs, ev.Details, ev.Actor, ev.Identity,
 	)
 	return err
 }
@@ -81,6 +81,10 @@ func (s *sqliteSink) QueryEvents(ctx context.Context, f Filter) ([]StoredEvent, 
 		where = append(where, "actor = ?")
 		args = append(args, f.Actor)
 	}
+	if f.Identity != "" {
+		where = append(where, "identity = ?")
+		args = append(args, f.Identity)
+	}
 	if !f.Since.IsZero() {
 		where = append(where, "timestamp >= ?")
 		args = append(args, f.Since.UTC().Format(time.RFC3339Nano))
@@ -90,7 +94,7 @@ func (s *sqliteSink) QueryEvents(ctx context.Context, f Filter) ([]StoredEvent, 
 		args = append(args, f.Until.UTC().Format(time.RFC3339Nano))
 	}
 
-	query := "SELECT id, timestamp, event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details, actor FROM events"
+	query := "SELECT id, timestamp, event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details, actor, identity FROM events"
 	if len(where) > 0 {
 		//nolint:gosec // G202: WHERE clause assembled from a fixed slice of internal predicates; values are bound via ? parameters in `args`.
 		query += " WHERE " + strings.Join(where, " AND ")
@@ -113,7 +117,7 @@ func (s *sqliteSink) QueryEvents(ctx context.Context, f Filter) ([]StoredEvent, 
 		err := rows.Scan(&se.ID, &ts, &et,
 			&se.PkgType, &se.PkgName, &se.PkgVersion,
 			&se.ClientIP, &se.UserAgent, &se.Status,
-			&se.DurationMs, &se.Details, &se.Actor)
+			&se.DurationMs, &se.Details, &se.Actor, &se.Identity)
 		if err != nil {
 			return nil, err
 		}
@@ -170,7 +174,7 @@ func (s *sqliteSink) ListDiscovery(ctx context.Context, f DiscoveryFilter) ([]Di
 	}
 
 	q := `SELECT registry_type, host, pattern_hint, pkg_name, pkg_version, decision,
-	             upstream_url, first_seen, last_seen, last_client, request_count
+	             upstream_url, first_seen, last_seen, last_client, last_identity, request_count
 	      FROM upstream_discovery`
 	if len(where) > 0 {
 		//nolint:gosec // G202: WHERE clause assembled from a fixed slice of internal predicates; values are bound via ? parameters in `args`.
@@ -191,7 +195,7 @@ func (s *sqliteSink) ListDiscovery(ctx context.Context, f DiscoveryFilter) ([]Di
 		var r DiscoveryRow
 		var firstSeen, lastSeen string
 		if err := rows.Scan(&r.RegistryType, &r.Host, &r.PatternHint, &r.PkgName, &r.PkgVersion,
-			&r.Decision, &r.UpstreamURL, &firstSeen, &lastSeen, &r.LastClient, &r.RequestCount); err != nil {
+			&r.Decision, &r.UpstreamURL, &firstSeen, &lastSeen, &r.LastClient, &r.LastIdentity, &r.RequestCount); err != nil {
 			return nil, err
 		}
 		r.FirstSeen, _ = time.Parse(time.RFC3339Nano, firstSeen)

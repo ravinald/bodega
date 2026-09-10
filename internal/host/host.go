@@ -3,7 +3,9 @@
 //
 // Each check returns a Finding. Checks are organised one per file so adding a
 // new format (e.g. a future container-runtime check) is an isolated change.
-// All checks are read-only and must not modify the host.
+// All checks are read-only and must not modify the host. credentials.go is the
+// one surface here that writes, and only when an operator asks for it by name:
+// see CredentialTargets and WriteCredential.
 package host
 
 import "os"
