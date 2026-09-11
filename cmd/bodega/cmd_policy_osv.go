@@ -284,6 +284,12 @@ and point osv_db_dir at the copy.`,
 // them. A gate that stopped syncing jammy in March is a gate that stopped, and
 // averaging it against a fresh noble would hide exactly that.
 func osvDBState(db *policy.OSVDatabase, ecosystem string, aptSuites []string) (string, string) {
+	if !policy.OSVCovers(ecosystem) {
+		// A stored row for a type the gate cannot query. "never" would read as
+		// a sync nobody has run yet, and there is no sync that would fix it;
+		// reportUncovered names the row under the table.
+		return "n/a", "-"
+	}
 	osvEcos, _ := policy.OSVExportsFor(ecosystem, aptSuites)
 	if len(osvEcos) == 0 {
 		return "never", "-"
