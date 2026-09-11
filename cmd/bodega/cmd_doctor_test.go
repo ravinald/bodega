@@ -102,18 +102,18 @@ func TestDoctorAcceptsAPartiallyIgnoredPolicy(t *testing.T) {
 func TestDoctorReportsRowsNoGateCanEvaluate(t *testing.T) {
 	store := fakePosture{
 		ages: []audit.AgePolicy{{Ecosystem: "helm", MinAgeSeconds: 604800, Action: "block"}},
-		osvs: []audit.OSVPolicy{{Ecosystem: "apt", Action: "block"}},
+		osvs: []audit.OSVPolicy{{Ecosystem: "git", Action: "block"}},
 	}
 	f := findingFor(t, serverPosture(context.Background(), store), "policy-ecosystem")
 	if !f.IsFinding() {
-		t.Fatalf("rows for helm and apt reported %s: %s", f.Status, f.Detail)
+		t.Fatalf("rows for helm and git reported %s: %s", f.Status, f.Detail)
 	}
-	for _, want := range []string{"helm", "apt"} {
+	for _, want := range []string{"helm", "git"} {
 		if !strings.Contains(f.Detail, want) {
 			t.Errorf("detail %q does not name %q", f.Detail, want)
 		}
 	}
-	for _, want := range []string{"bodega policy age remove helm", "bodega policy osv remove apt"} {
+	for _, want := range []string{"bodega policy age remove helm", "bodega policy osv remove git"} {
 		if !strings.Contains(f.Remediation, want) {
 			t.Errorf("remediation %q does not name %q", f.Remediation, want)
 		}

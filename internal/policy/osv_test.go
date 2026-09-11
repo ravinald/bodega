@@ -56,16 +56,16 @@ func TestOSVPolicy_NoPolicy(t *testing.T) {
 }
 
 func TestOSVPolicy_UnsupportedEcosystem(t *testing.T) {
-	// apt has no OSV mapping; short-circuit even with a policy row.
+	// git has no OSV mapping; short-circuit even with a policy row.
 	store := &fakeOSVStore{policies: map[string]audit.OSVPolicy{
-		manifest.TypeApt: {Ecosystem: manifest.TypeApt, Action: ActionBlock},
+		manifest.TypeGit: {Ecosystem: manifest.TypeGit, Action: ActionBlock},
 	}}
 	ck := NewOSVChecker(store)
 	r := ck.Check(context.Background(),
-		&manifest.PackageManifest{Name: "bash", Type: manifest.TypeApt},
-		&manifest.VersionEntry{Version: "5.2"})
+		&manifest.PackageManifest{Name: "netbox", Type: manifest.TypeGit},
+		&manifest.VersionEntry{Version: "v4.5.7"})
 	if r.Action != ActionPass {
-		t.Errorf("apt not in osvEcosystemFor; expected pass, got %+v", r)
+		t.Errorf("git not in osvEcosystemFor; expected pass, got %+v", r)
 	}
 }
 
@@ -185,7 +185,7 @@ func TestOSVPolicy_CargoVulnerableVersion(t *testing.T) {
 }
 
 func TestOSVEcosystems_CoversCargo(t *testing.T) {
-	want := []string{manifest.TypeCargo, manifest.TypeGomod, manifest.TypeNpm, manifest.TypePypi}
+	want := []string{manifest.TypeApt, manifest.TypeCargo, manifest.TypeGomod, manifest.TypeNpm, manifest.TypePypi}
 	got := OSVEcosystems()
 	if len(got) != len(want) {
 		t.Fatalf("OSVEcosystems() = %v, want %v", got, want)

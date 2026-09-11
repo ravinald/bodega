@@ -280,7 +280,7 @@ func showVersionList(ctx context.Context, store *manifest.Store, typ, name strin
 	// stamp, so one answer to "can OSV cover this type at all" has to drive
 	// both: an imported manifest can carry vetting.osv.* keys for a type
 	// bodega's own writers never stamp.
-	osvCovered := policy.OSVEcosystemFor(typ) != ""
+	osvCovered := policy.OSVCovers(typ)
 	var flagged []string
 	for _, ve := range pm.Versions {
 		if ve.Hidden && !admin {

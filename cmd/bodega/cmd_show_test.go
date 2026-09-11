@@ -70,15 +70,18 @@ func TestShowVersionList_FlaggedVersionNamesItsFindings(t *testing.T) {
 
 // TestShowVersionList_UncoveredEcosystemReadsNA pins the distinction R2 exists
 // for, one level up: "nobody looked" and "nothing can ever look" must not print
-// the same. OSV holds no apt records, and `policy osv rescan --type apt`
-// refuses to run, so an apt row saying "unchecked" names a fix that does not
-// exist.
+// the same. OSV holds no records a git clone, a downloaded binary or a helm
+// chart can be matched against, and `policy osv rescan --type git` refuses to
+// run, so a git row saying "unchecked" names a fix that does not exist.
+//
+// apt is not in this list: OSV carries Ubuntu and Debian advisories, so an apt
+// row reads unchecked or clean like any other covered type.
 //
 // The stamped version is the case `pkg import` reaches: VersionEntry.Metadata
 // is modeled, so an export from one instance carries whatever vetting.osv.*
 // keys the source wrote, onto a type bodega's own writers never stamp.
 func TestShowVersionList_UncoveredEcosystemReadsNA(t *testing.T) {
-	for _, typ := range []string{manifest.TypeApt, manifest.TypeGit, manifest.TypeBinary, manifest.TypeHelm} {
+	for _, typ := range []string{manifest.TypeGit, manifest.TypeBinary, manifest.TypeHelm} {
 		t.Run(typ, func(t *testing.T) {
 			store := showStore(t, typ, "hello",
 				manifest.VersionEntry{Version: "1.0.0"},

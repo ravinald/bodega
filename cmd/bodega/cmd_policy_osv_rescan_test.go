@@ -253,15 +253,15 @@ func TestRescanCommand_ClearsAndFiltersByName(t *testing.T) {
 	}
 }
 
-// TestRescanCommand_RefusesTypeOSVCannotAnswer keeps --type apt from reporting
+// TestRescanCommand_RefusesTypeOSVCannotAnswer keeps --type git from reporting
 // a clean walk over an ecosystem the gate has no records for.
 func TestRescanCommand_RefusesTypeOSVCannotAnswer(t *testing.T) {
 	rescanInstall(t)
-	_, _, err := runRescan(t, "--type", "apt")
+	_, _, err := runRescan(t, "--type", "git")
 	if err == nil {
-		t.Fatal("apt has no OSV ecosystem; rescan must refuse it")
+		t.Fatal("git has no OSV ecosystem; rescan must refuse it")
 	}
-	for _, want := range []string{"apt", "OSV gate", "npm"} {
+	for _, want := range []string{"git", "OSV gate", "npm"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error should name %q, got: %v", want, err)
 		}

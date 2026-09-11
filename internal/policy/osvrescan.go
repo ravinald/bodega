@@ -20,6 +20,12 @@ const (
 	OSVMetaVulns     = "vetting.osv.vulns"
 	OSVMetaSeverity  = "vetting.osv.severity"
 	OSVMetaCheckedAt = "vetting.osv.checked_at"
+	// OSVMetaQueried names what was actually asked: for apt that is the
+	// source package, under the OSV ecosystem of the entry's own suite, and
+	// neither is the name or the version string on the manifest. A finding an
+	// operator cannot trace back to the package they installed is a finding
+	// they will not act on.
+	OSVMetaQueried = "vetting.osv.queried"
 )
 
 // stampOSV records one conclusive lookup on the version. A zero checkedAt
@@ -32,12 +38,19 @@ const (
 // rescan against an advisory OSV withdrew, and it is why the caller must not
 // call this at all when the database could not answer — a blank stamp and a
 // clean stamp are the same bytes.
-func stampOSV(ve *manifest.VersionEntry, vulns []osvVuln, checkedAt time.Time) {
+func stampOSV(ve *manifest.VersionEntry, vulns []osvVuln, checkedAt time.Time, queried string) {
 	if ve == nil {
 		return
 	}
 	if ve.Metadata == nil {
 		ve.Metadata = map[string]string{}
+	}
+	// Empty for the language ecosystems, where the registry type and the
+	// package name already say everything a lookup used.
+	if queried == "" {
+		delete(ve.Metadata, OSVMetaQueried)
+	} else {
+		ve.Metadata[OSVMetaQueried] = queried
 	}
 	if checkedAt.IsZero() {
 		delete(ve.Metadata, OSVMetaCheckedAt)
@@ -92,12 +105,12 @@ func (c *OSVChecker) Rescan(ctx context.Context, pm *manifest.PackageManifest, v
 	if pm == nil || ve == nil || ve.Version == "" {
 		return OSVRescanChange{Reason: "no version to look up"}
 	}
-	osvEco, ok := osvEcosystemFor[pm.Type]
-	if !ok {
-		return OSVRescanChange{Reason: fmt.Sprintf("%s has no OSV ecosystem", pm.Type)}
+	lk := osvLookupFor(pm, ve)
+	if lk.reason != "" {
+		return OSVRescanChange{Reason: lk.reason}
 	}
 
-	ans := c.answerFor(ctx, osvEco, pm, ve)
+	ans := c.answerFor(ctx, lk, ve)
 	if !ans.conclusive() {
 		reason := ans.degraded
 		if ans.err != nil {
@@ -114,7 +127,7 @@ func (c *OSVChecker) Rescan(ctx context.Context, pm *manifest.PackageManifest, v
 
 	ids := vulnIDs(ans.vulns)
 	had := ve.Metadata[OSVMetaVulns] != ""
-	stampOSV(ve, ans.vulns, c.now())
+	stampOSV(ve, ans.vulns, c.now(), lk.queried)
 	return OSVRescanChange{
 		Answered: true,
 		Vulns:    ids,

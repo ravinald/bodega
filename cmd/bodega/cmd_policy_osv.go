@@ -36,9 +36,15 @@ func newPolicyOSVCmd(gf *globalFlags) *cobra.Command {
 		Short: "OSV vulnerability gate per ecosystem",
 		Long: `Match every imported (ecosystem, name, version) against the local
 OSV database and flag or block based on the per-ecosystem policy. OSV
-coverage maps npm, pypi, gomod and cargo. Any other ecosystem has no OSV
-identifier, so set refuses it rather than writing a row the gate never
+coverage maps npm, pypi, gomod, cargo and apt. Any other ecosystem has no
+OSV identifier, so set refuses it rather than writing a row the gate never
 reads.
+
+apt is keyed on the release rather than on one identifier. Ubuntu and
+Debian backport a security fix into the revision without moving the
+upstream version, so the records that settle a version live in the export
+for the suite that version is published to, and the query carries the full
+version string and the source package name.
 
 sync is the only subcommand that reaches the network. Admission answers
 from the directory sync wrote (osv_db_dir), and queries api.osv.dev only
@@ -49,7 +55,7 @@ what turns that into an answer about today.
 
   bodega policy osv sync
   bodega policy osv set npm block
-  bodega policy osv set pypi warn
+  bodega policy osv set apt block
   bodega policy osv list
   bodega policy osv rescan --type npm
   bodega policy osv remove npm`,
@@ -129,7 +135,7 @@ func newPolicyOSVListCmd(gf *globalFlags) *cobra.Command {
 			fmt.Fprintln(w, "ECOSYSTEM\tACTION\tUPDATED\tDB SYNCED\tDB AGE")
 			stored := make([]string, 0, len(rows))
 			for _, p := range rows {
-				synced, age := osvDBState(db, p.Ecosystem)
+				synced, age := osvDBState(db, p.Ecosystem, cfg.ServedAptSuites())
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
 					p.Ecosystem, p.Action, p.UpdatedAt.Format("2006-01-02"), synced, age)
 				stored = append(stored, p.Ecosystem)
@@ -184,6 +190,13 @@ func newPolicyOSVSyncCmd(gf *globalFlags) *cobra.Command {
 per ecosystem, and record when each was fetched. With no arguments every
 covered ecosystem is synced.
 
+apt expands to one index per apt suite the server serves, because OSV keys
+Ubuntu and Debian advisories on the release. Those releases are distilled
+out of one archive each: OSV stopped rebuilding its per-release archives in
+October 2024 and keeps the aggregate current. A suite OSV publishes no
+records for is named on stderr and fetched for nothing; entries published
+to it warn at admission rather than reporting clean.
+
 This is the only OSV subcommand that reaches the network. On an
 air-gapped host, run it where the network is, copy the directory over,
 and point osv_db_dir at the copy.`,
@@ -204,21 +217,43 @@ and point osv_db_dir at the copy.`,
 			}
 			db := policy.NewOSVDatabase(cfg.ResolveOSVDBDir())
 
-			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-			fmt.Fprintln(w, "ECOSYSTEM\tOSV\tRECORDS\tPACKAGES\tSIZE\tFETCHED")
+			// apt is one export per served suite: OSV keys Ubuntu and
+			// Debian advisories on the release, because the revision that
+			// carries a backported fix is a fact about one release. Resolve
+			// every ecosystem first, then hand the whole list over at once:
+			// several releases come out of one archive, and a fetch per
+			// release would download it once each.
+			var osvEcos, skipped []string
+			owner := map[string]string{}
 			var failed []string
-			wrote := 0
 			for _, eco := range ecosystems {
-				osvEco := policy.OSVEcosystemFor(eco)
-				meta, err := db.Sync(cmd.Context(), osvEco)
-				if err != nil {
-					failed = append(failed, fmt.Sprintf("%s: %v", eco, err))
-					fmt.Fprintf(w, "%s\t%s\t-\t-\t-\tFAILED\n", eco, osvEco)
+				exports, unmapped := policy.OSVExportsFor(eco, cfg.ServedAptSuites())
+				for _, suite := range unmapped {
+					skipped = append(skipped, fmt.Sprintf("%s: OSV publishes no Ubuntu or Debian export for suite %q", eco, suite))
+				}
+				if len(exports) == 0 {
+					failed = append(failed, fmt.Sprintf("%s: no OSV export to fetch", eco))
 					continue
 				}
-				fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%s\t%s\n", eco, osvEco,
-					meta.Records, meta.Packages, humanSize(meta.Bytes),
-					meta.FetchedAt.Format(time.RFC3339))
+				for _, osvEco := range exports {
+					osvEcos = append(osvEcos, osvEco)
+					owner[osvEco] = eco
+				}
+			}
+
+			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+			fmt.Fprintln(w, "ECOSYSTEM\tOSV\tRECORDS\tPACKAGES\tSIZE\tFETCHED")
+			wrote := 0
+			for _, res := range db.SyncGroup(cmd.Context(), osvEcos) {
+				eco := owner[res.Ecosystem]
+				if res.Err != nil {
+					failed = append(failed, fmt.Sprintf("%s: %v", eco, res.Err))
+					fmt.Fprintf(w, "%s\t%s\t-\t-\t-\tFAILED\n", eco, res.Ecosystem)
+					continue
+				}
+				fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%s\t%s\n", eco, res.Ecosystem,
+					res.Meta.Records, res.Meta.Packages, humanSize(res.Meta.Bytes),
+					res.Meta.FetchedAt.Format(time.RFC3339))
 				wrote++
 			}
 			if err := w.Flush(); err != nil {
@@ -226,6 +261,12 @@ and point osv_db_dir at the copy.`,
 			}
 			if wrote > 0 {
 				fmt.Printf("\nWrote %s\n", db.Dir())
+			}
+			// Named, never silent: a suite nothing was fetched for is a suite
+			// whose entries the gate will warn on, and the operator has to
+			// learn that here rather than from every import.
+			for _, s := range skipped {
+				fmt.Fprintf(os.Stderr, "skipped %s\n", s)
 			}
 			if len(failed) > 0 {
 				return fmt.Errorf("sync failed for %d ecosystem(s): %s", len(failed), strings.Join(failed, "; "))
@@ -238,16 +279,26 @@ and point osv_db_dir at the copy.`,
 // osvDBState renders one ecosystem's sync time and age for the list table. An
 // ecosystem that was never synced reads "never" rather than a blank column:
 // the gate warns on it, and the operator has to see which one.
-func osvDBState(db *policy.OSVDatabase, ecosystem string) (string, string) {
-	osvEco := policy.OSVEcosystemFor(ecosystem)
-	if osvEco == "" {
-		return "n/a", "-"
-	}
-	meta, err := db.Meta(osvEco)
-	if err != nil {
+//
+// apt spans one export per served suite, and the row reports the oldest of
+// them. A gate that stopped syncing jammy in March is a gate that stopped, and
+// averaging it against a fresh noble would hide exactly that.
+func osvDBState(db *policy.OSVDatabase, ecosystem string, aptSuites []string) (string, string) {
+	osvEcos, _ := policy.OSVExportsFor(ecosystem, aptSuites)
+	if len(osvEcos) == 0 {
 		return "never", "-"
 	}
-	return meta.FetchedAt.Format(time.RFC3339), policy.ShortDuration(meta.Age(time.Now()))
+	var oldest time.Time
+	for _, osvEco := range osvEcos {
+		meta, err := db.Meta(osvEco)
+		if err != nil {
+			return "never", "-"
+		}
+		if oldest.IsZero() || meta.FetchedAt.Before(oldest) {
+			oldest = meta.FetchedAt
+		}
+	}
+	return oldest.Format(time.RFC3339), policy.ShortDuration(time.Since(oldest))
 }
 
 func onOff(b bool) string {

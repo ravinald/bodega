@@ -26,14 +26,7 @@ import (
 // A new advisory against one of these packages changes what the live API
 // returns and does not change the fixtures, which is why the comparison
 // against the live service is its own opt-in test (TestOSVLiveAgreement).
-var osvAgreementCases = []struct {
-	registryType string
-	ecosystem    string
-	pkg          string
-	vulnerable   string
-	ids          []string
-	clean        string
-}{
+var osvAgreementCases = []osvAgreementCase{
 	{
 		registryType: manifest.TypeNpm,
 		ecosystem:    "npm",
@@ -70,13 +63,35 @@ var osvAgreementCases = []struct {
 	},
 }
 
+// osvAgreementCase is one (ecosystem, package, version) pair the local matcher
+// has to answer exactly as api.osv.dev does.
+//
+// No Ubuntu or Debian release is a case here. Every distro package carries
+// advisories nobody has fixed yet, so no version of one is ever clean, and the
+// clean half of this table is a claim about api.osv.dev rather than about a
+// frozen fixture. TestOSVLiveDistroAgreement makes the distro comparison
+// against the live service directly.
+type osvAgreementCase struct {
+	registryType string
+	ecosystem    string
+	pkg          string
+	vulnerable   string
+	ids          []string
+	clean        string
+}
+
+// osvDistroFixtures are the releases syncedDB writes beside the agreement
+// cases, distilled out of the Ubuntu and Debian fixtures the same way a real
+// sync distills them out of the aggregate archive.
+var osvDistroFixtures = []string{"Ubuntu:22.04:LTS", "Ubuntu:24.04:LTS", "Debian:12"}
+
 // exportServer serves the testdata records as OSV's per-ecosystem export:
 // <base>/<ecosystem>/all.zip, one JSON file per record.
 func exportServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		eco := filepath.Base(filepath.Dir(r.URL.Path))
-		raw, err := os.ReadFile(filepath.Join("testdata", "osv", eco+".json"))
+		raw, err := os.ReadFile(filepath.Join("testdata", "osv", OSVEcosystemFile(eco)+".json"))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
@@ -116,9 +131,14 @@ func syncedDB(t *testing.T) *OSVDatabase {
 	t.Cleanup(srv.Close)
 	db := NewOSVDatabase(t.TempDir())
 	db.ExportBase = srv.URL
+	ecosystems := make([]string, 0, len(osvAgreementCases)+len(osvDistroFixtures))
 	for _, tc := range osvAgreementCases {
-		if _, err := db.Sync(context.Background(), tc.ecosystem); err != nil {
-			t.Fatalf("sync %s: %v", tc.ecosystem, err)
+		ecosystems = append(ecosystems, tc.ecosystem)
+	}
+	ecosystems = append(ecosystems, osvDistroFixtures...)
+	for _, res := range db.SyncGroup(context.Background(), ecosystems) {
+		if res.Err != nil {
+			t.Fatalf("sync %s: %v", res.Ecosystem, res.Err)
 		}
 	}
 	return db
@@ -137,7 +157,7 @@ func TestOSVDatabase_SyncWritesArchiveAndMeta(t *testing.T) {
 		if time.Since(meta.FetchedAt) > time.Minute {
 			t.Errorf("%s: fetch timestamp not recorded: %v", tc.ecosystem, meta.FetchedAt)
 		}
-		if _, err := os.Stat(filepath.Join(db.Dir(), tc.ecosystem+".json.gz")); err != nil {
+		if _, err := os.Stat(filepath.Join(db.Dir(), OSVEcosystemFile(tc.ecosystem)+".json.gz")); err != nil {
 			t.Errorf("%s: archive missing: %v", tc.ecosystem, err)
 		}
 	}
