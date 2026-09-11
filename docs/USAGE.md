@@ -1320,6 +1320,8 @@ The local matcher implements OSV's own evaluation: an enumerated `versions` list
 
 An ecosystem is decompressed on the first version checked against it and held until `sync` replaces the archive, so a bulk import pays one decompression rather than one round trip per version. One process shares that copy across every package it admits: importing 100 npm packages at 4 versions each against the 2026-09 export takes 0.5s. What it holds, measured on the same exports: npm 85 MB, PyPI 47 MB, gomod 6 MB, cargo 1.5 MB. An ecosystem with no policy row is never loaded.
 
+The Ubuntu and Debian releases cost an order of magnitude more, because a distro advisory enumerates every published version it covers rather than bounding a range: measured 2026-09-11, `Ubuntu:22.04:LTS` holds 826 MB, `Ubuntu:24.04:LTS` 305 MB and `Debian:12` 102 MB, and a release is loaded on the first apt version checked against it. Size the host for the releases you serve, or keep the apt gate on a machine that imports rather than on the one that serves.
+
 A running server picks up a sync without a restart: it checks the archive it loaded from on each match and reloads when the file changes. `sync` is a separate process from the server enforcing the gate, so without that check the server would report the fresh fetch time under `bodega policy osv list` while still matching against the copy it loaded before the sync.
 
 Two classes of record it does not answer the way `api.osv.dev` does.
