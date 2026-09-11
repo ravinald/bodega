@@ -242,7 +242,9 @@ func (c *OSVChecker) answerFor(ctx context.Context, lk osvLookup, ve *manifest.V
 	for _, t := range lk.targets {
 		ans := c.lookup(ctx, t.ecosystem, t.name, ve.Version)
 		if ans.err != nil {
-			return osvAnswer{err: ans.err}
+			// Whole, not just the error: a caller reads the ids off an
+			// answer it could not act on, and lookup builds this one.
+			return ans
 		}
 		for _, v := range ans.vulns {
 			if seen[v.ID] {
