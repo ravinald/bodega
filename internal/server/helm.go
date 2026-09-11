@@ -26,6 +26,7 @@ import (
 // question they can answer; the refusal with a reason attached is on the chart
 // pull. See TestHelmIndexIsNotRefusedByAProfile and docs/USAGE.md.
 func (s *Server) handleHelmIndex(w http.ResponseWriter, r *http.Request) {
+	noSharedCache(w)
 	prof := s.profileFor(r)
 	if prof == nil {
 		s.proxyS3(w, r, s.typeStore(manifest.TypeHelm), manifest.HelmIndexKey)
@@ -59,7 +60,7 @@ func (s *Server) handleHelmChart(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	w = cacheImmutableOn200(w, file)
+	w = cachePrivateOn200(w, file)
 
 	// The whole basename as an unversioned chart yields the key the request
 	// names, which ParseKey then splits the way HelmChartKey built it. Reading

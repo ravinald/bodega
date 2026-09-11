@@ -661,3 +661,158 @@ func TestProfileGateRunsOnEveryPackageRoute(t *testing.T) {
 		})
 	}
 }
+
+// getHeaderWithToken is getWithToken's header half. The cache assertions below
+// are about what a proxy is told, and a second client's body proves nothing on
+// a server with no cache in front of it, which is every test server.
+func getHeaderWithToken(t *testing.T, s *Server, token, path string) (int, http.Header) {
+	t.Helper()
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+path, nil)
+	if err != nil {
+		t.Fatalf("build request for %s: %v", path, err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode, resp.Header
+}
+
+// cacheProbeServer seeds one artifact and one index per enforced type and
+// binds a profile that permits all of them, so every assertion below is made
+// against a 200 rather than against a refusal that happens to carry no header.
+func cacheProbeServer(t *testing.T) *profileFixture {
+	t.Helper()
+	s := proxyingServer(t)
+
+	up := newRecordingUpstream(t)
+	up.route("/left-pad", fmt.Sprintf(npmProfilePackument, up.ts.URL))
+	up.route("/se/rd/serde", `{"name":"serde","vers":"1.0.0","cksum":"a"}`+"\n")
+	up.route("/example.com/mod/@v/list", "v1.0.0\n")
+	up.route("/example.com/mod/@v/v1.0.0.info", `{"Version":"v1.0.0"}`)
+	s.cfg.NpmUpstream = up.ts.URL
+	s.cfg.CargoUpstream = up.ts.URL
+	s.cfg.GomodUpstream = up.ts.URL
+
+	seed(t, s, manifest.TypePypi, map[string]string{
+		"pypi/wheels/requests-2.31.0-py3-none-any.whl": "wheel",
+	})
+	seed(t, s, manifest.TypeNpm, map[string]string{
+		manifest.NpmTarballKey("left-pad", "1.2.0"): "tarball",
+	})
+	seed(t, s, manifest.TypeHelm, map[string]string{
+		manifest.HelmIndexKey:                           helmProfileIndex,
+		manifest.HelmChartKey("cert-manager", "1.14.0"): "chart",
+	})
+	seed(t, s, manifest.TypeGit, map[string]string{
+		manifest.GitKey("repo", "v1.0.0", false): "bundle",
+	})
+	seed(t, s, manifest.TypeCargo, map[string]string{
+		manifest.CargoCrateKey("serde", "1.0.0"): "crate",
+	})
+	seed(t, s, manifest.TypeBinary, map[string]string{
+		manifest.BinaryKey("tool", "1.0.0", "tool.tar.gz"): "binary",
+	})
+	if err := s.store.AddVersion(t.Context(), manifest.TypeCargo, "serde",
+		manifest.VersionEntry{Version: "1.0.0"}); err != nil {
+		t.Fatalf("AddVersion serde: %v", err)
+	}
+	if err := s.store.SavePackage(t.Context(), &manifest.PackageManifest{
+		ConfigVersion: manifest.CurrentConfigVersion,
+		Name:          "example.com/mod",
+		Type:          manifest.TypeGomod,
+		Versions:      []manifest.VersionEntry{{Version: "v1.0.0", Mode: manifest.ModeProxy}},
+	}); err != nil {
+		t.Fatalf("seed the gomod manifest: %v", err)
+	}
+
+	rules := []audit.ProfileTypeRule{
+		closedRule(manifest.TypePypi, audit.VersionFloating, audit.ExpansionBlock),
+		closedRule(manifest.TypeNpm, audit.VersionFloating, audit.ExpansionBlock),
+		closedRule(manifest.TypeHelm, audit.VersionFloating, audit.ExpansionBlock),
+		closedRule(manifest.TypeGit, audit.VersionFloating, audit.ExpansionBlock),
+		closedRule(manifest.TypeCargo, audit.VersionFloating, audit.ExpansionBlock),
+		closedRule(manifest.TypeGomod, audit.VersionFloating, audit.ExpansionBlock),
+		closedRule(manifest.TypeBinary, audit.VersionFloating, audit.ExpansionBlock),
+	}
+	entries := []audit.ProfileEntry{
+		{Type: manifest.TypePypi, Name: "requests"},
+		{Type: manifest.TypeNpm, Name: "left-pad"},
+		{Type: manifest.TypeHelm, Name: "cert-manager"},
+		{Type: manifest.TypeGit, Name: "repo"},
+		{Type: manifest.TypeCargo, Name: "serde"},
+		{Type: manifest.TypeGomod, Name: "example.com/mod"},
+		{Type: manifest.TypeBinary, Name: "tool"},
+	}
+	return bindProfile(t, s, "probe", "probe01", rules, entries)
+}
+
+// The profile decides what a URL returns, so a shared cache must be kept out
+// of every response it decides. Before this, an artifact went out marked
+// "public, max-age=31536000, immutable" — one host's wheel stored by an nginx
+// in front and handed to a host of another class for a year, with no row
+// written and no error raised anywhere. RFC 9111 §3.5 would have withheld
+// storage from a request carrying Authorization; "public" is what opted back
+// in, and a CIDR-identified host never sent a credential to be covered by that
+// clause in the first place.
+//
+// Asserted on the header rather than on a second client's body: a body
+// comparison passes against any server with no cache in front of it.
+func TestProfileEnforcedRoutesKeepASharedCacheOut(t *testing.T) {
+	f := cacheProbeServer(t)
+
+	t.Run("artifacts", func(t *testing.T) {
+		for _, tc := range []struct{ path, want string }{
+			{"/pypi/wheels/requests-2.31.0-py3-none-any.whl", cachePrivateImmutable},
+			{"/npm/left-pad/-/left-pad-1.2.0.tgz", cachePrivateImmutable},
+			{"/helm/charts/cert-manager-1.14.0.tgz", cachePrivateImmutable},
+			{"/git/repo/repo-v1.0.0.bundle", cachePrivateImmutable},
+			// Neither filename earns a freshness lifetime, and both still
+			// answer the separate question of who may store the bytes.
+			{"/cargo/serde/1.0.0/download", cachePrivate},
+			{"/binaries/tool/1.0.0/tool.tar.gz", cachePrivate},
+			{"/go/example.com/mod/@v/v1.0.0.info", cachePrivate},
+		} {
+			status, hdr := getHeaderWithToken(t, f.s, f.token, tc.path)
+			if status != http.StatusOK {
+				t.Errorf("GET %s = %d, want 200", tc.path, status)
+				continue
+			}
+			if got := hdr.Get("Cache-Control"); got != tc.want {
+				t.Errorf("GET %s Cache-Control = %q, want %q", tc.path, got, tc.want)
+			}
+		}
+	})
+
+	// Every index route, identified and not. Gated on a profile being bound, a
+	// cache filled by an unidentified request would still answer a profiled
+	// one, which is the same bypass arriving by a longer road.
+	t.Run("indexes", func(t *testing.T) {
+		for _, path := range []string{
+			"/pypi/simple/",
+			"/pypi/simple/requests/",
+			"/npm/left-pad",
+			"/go/example.com/mod/@v/list",
+			"/cargo/se/rd/serde",
+			"/helm/index.yaml",
+		} {
+			for _, token := range []string{f.token, ""} {
+				status, hdr := getHeaderWithToken(t, f.s, token, path)
+				if status != http.StatusOK {
+					t.Errorf("GET %s (token %q) = %d, want 200", path, token, status)
+					continue
+				}
+				if got := hdr.Get("Cache-Control"); got != cacheNoStore {
+					t.Errorf("GET %s (token %q) Cache-Control = %q, want %q", path, token, got, cacheNoStore)
+				}
+			}
+		}
+	})
+}

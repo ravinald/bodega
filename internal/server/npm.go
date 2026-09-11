@@ -22,7 +22,7 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 	if idx := strings.Index(fullPath, "/-/"); idx >= 0 {
 		pkgName := fullPath[:idx]   // canonical, e.g. "@bitwarden/cli"
 		tarball := fullPath[idx+3:] // URL form, e.g. "cli-2026.3.0.tgz"
-		w = cacheImmutableOn200(w, tarball)
+		w = cachePrivateOn200(w, tarball)
 
 		// Storage uses the safe-encoded form everywhere; the URL does not, so
 		// the version has to come back out of the wire filename before a key
@@ -72,6 +72,7 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Packument request: path is just the package name (possibly scoped).
+	noSharedCache(w)
 	pkgName := fullPath
 	pm, _ := s.store.GetPackage(ctx, manifest.TypeNpm, pkgName)
 

@@ -943,6 +943,8 @@ Two enforcement points, and the order matters.
 
 No filtered index is stored. Each one is produced by running the profile's filter over the response on the way out, so what sits in the cache is the document the upstream served and one cached object answers every host class correctly. An install with no profiles pays nothing, and a fleet with twenty profiles pays one copy and one upstream fetch per index rather than twenty. A cache hit filters identically to a miss, so a `bodega profile` edit lands within the binding cache TTL rather than at the next upstream refresh. The helm `index.yaml` is generated into storage by `bodega build` rather than cached, and is filtered the same way on the way out.
 
+An HTTP cache in front of bodega is the other half of that, and it is a deployment setting rather than a bodega one: every enforced artifact goes out `private` and every enforced index `no-cache, no-store, must-revalidate`, so a proxy that obeys its response headers is safe and one told to ignore them is not. See [Caching in front of a profile-enforced bodega](#caching-in-front-of-a-profile-enforced-bodega).
+
 Every refusal writes an audit row naming the profile, the package, the version and which rule refused it. The two rules are separate statuses, because the repairs are opposite:
 
 ```bash
@@ -2594,6 +2596,24 @@ Stripping at the proxy is still the right belt, but it is no longer the only one
 ```json
 "trusted_proxies": ["127.0.0.1/32"]
 ```
+
+#### Caching in front of a profile-enforced bodega
+
+Leave the proxy cache off for `/pypi/`, `/npm/`, `/go/`, `/cargo/`, `/helm/`, `/git/` and `/binaries/`, or let it obey the headers bodega sends and nothing more.
+
+A profile decides what those routes return, so one URL answers two hosts with two documents. A shared cache cannot evaluate a profile: it stores the first answer and hands it to the next host, with no denial row written and no error anywhere. bodega closes this from its side — artifacts go out `private`, indexes go out `no-cache, no-store, must-revalidate` — but a proxy configured to cache past the response headers reopens it. In nginx that means not setting `proxy_ignore_headers Cache-Control` and not forcing `proxy_cache_valid` on these locations.
+
+`/apt/` is the exception and may be cached normally: apt is not profile-enforced, so every host gets the same `.deb` and the pool still ships `public, max-age=31536000, immutable`.
+
+To check what a deployment is sending:
+
+```bash
+curl -sI -H "Authorization: Bearer $BODEGA_TOKEN" \
+  https://bodega.example.com/pypi/wheels/requests-2.31.0-py3-none-any.whl | grep -i cache-control
+# cache-control: private, max-age=31536000, immutable
+```
+
+A `public` on any route but `/apt/` means the request did not reach this version of bodega.
 
 That matters most when bodega and its proxy do not share a host. The default trusts every RFC 1918 address, so on a private network with other tenants the proxy is not the only peer bodega believes.
 

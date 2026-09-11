@@ -1738,8 +1738,41 @@ func isImmutableArtifact(filename string) bool {
 	return false
 }
 
-// cacheImmutableOn200 defers the Cache-Control header to a response that earns
-// it, returning w unchanged for a filename that was never going to get one.
+// Cache-Control directives, split by who is allowed to store the answer.
+//
+// A profile decides what the seven non-apt types return, so one URL answers
+// two hosts with two documents. A shared cache cannot evaluate a profile: it
+// stores the first answer and hands it to the next host, with no row written
+// and no error anywhere. That is the enforcement bypassed rather than a
+// refusal made illegible. Vary does not reach it either — a CIDR-identified
+// host sends no request header to vary on.
+//
+// Which directive a route sends never depends on whether a profile is bound.
+// Gated on that, a cache filled by an unidentified request would still answer
+// a profiled one.
+const (
+	// cacheSharedImmutable is for bytes every host gets the same copy of. apt
+	// is the one type bodega does not profile-enforce, so it keeps the shared
+	// grant; F16 is where that changes.
+	cacheSharedImmutable = "public, max-age=31536000, immutable"
+	// cachePrivateImmutable keeps the client-side year and withdraws the
+	// shared grant. RFC 9111 §3.5 would have withheld storage from a request
+	// carrying Authorization on its own; "public" is what opted back in.
+	cachePrivateImmutable = "private, max-age=31536000, immutable"
+	// cachePrivate is the floor for a profile-enforced artifact whose filename
+	// earns no freshness lifetime. Without it a shared cache may still store
+	// the response under heuristic freshness and serve it to another class of
+	// host.
+	cachePrivate = "private"
+	// cacheNoStore is for a filtered index: not merely unshared but unstored,
+	// because the document is valid, parseable and wrong about what any other
+	// host may install.
+	cacheNoStore = "no-cache, no-store, must-revalidate"
+)
+
+// cacheSharedImmutableOn200 defers the Cache-Control header to a response that
+// earns it, returning w unchanged for a filename that was never going to get
+// one.
 //
 // Setting it up front is wrong in a way nothing local reveals: http.Error does
 // not clear the header map, so a 403 from the allow-list and a 404 from an
@@ -1747,53 +1780,73 @@ func isImmutableArtifact(filename string) bool {
 // An operator who then runs "bodega policy add apt <host>" has fixed nothing
 // for any client behind a caching proxy that believed the first answer, and
 // has no way to reach into it.
-func cacheImmutableOn200(w http.ResponseWriter, filename string) http.ResponseWriter {
+func cacheSharedImmutableOn200(w http.ResponseWriter, filename string) http.ResponseWriter {
 	if !isImmutableArtifact(filename) {
 		return w
 	}
-	return &immutableWriter{ResponseWriter: w}
+	return &cacheDirectiveWriter{ResponseWriter: w, directive: cacheSharedImmutable}
 }
 
-// immutableWriter sets Cache-Control on the way out, once, and only when the
-// status is 200.
+// cachePrivateOn200 is the same deferral for an artifact route a profile
+// gates. It always stamps something, because the question it answers is not
+// how long the bytes stay fresh but whether a proxy may hand them to a host
+// that asked with a different identity — and that is "no" for a cargo crate
+// and a namespaced binary as much as for a wheel.
+func cachePrivateOn200(w http.ResponseWriter, filename string) http.ResponseWriter {
+	directive := cachePrivate
+	if isImmutableArtifact(filename) {
+		directive = cachePrivateImmutable
+	}
+	return &cacheDirectiveWriter{ResponseWriter: w, directive: directive}
+}
+
+// noSharedCache marks a document whose content a profile decides. Set before
+// the handler writes anything, so a refusal on the same route carries it too.
+func noSharedCache(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", cacheNoStore)
+}
+
+// cacheDirectiveWriter sets Cache-Control on the way out, once, and only when
+// the status is 200.
 //
 // ReadFrom and Flush are forwarded explicitly. Embedding an interface promotes
 // only that interface's methods, so without them a wrapped writer loses the
 // sendfile path proxyS3's io.Copy takes and stops being an http.Flusher.
-type immutableWriter struct {
+type cacheDirectiveWriter struct {
 	http.ResponseWriter
-	started bool
+	directive string
+	started   bool
 }
 
-func (iw *immutableWriter) WriteHeader(code int) {
+func (iw *cacheDirectiveWriter) WriteHeader(code int) {
 	iw.begin(code)
 	iw.ResponseWriter.WriteHeader(code)
 }
 
-func (iw *immutableWriter) Write(b []byte) (int, error) {
+func (iw *cacheDirectiveWriter) Write(b []byte) (int, error) {
 	iw.begin(http.StatusOK)
 	return iw.ResponseWriter.Write(b)
 }
 
-func (iw *immutableWriter) ReadFrom(r io.Reader) (int64, error) {
+func (iw *cacheDirectiveWriter) ReadFrom(r io.Reader) (int64, error) {
 	iw.begin(http.StatusOK)
 	return io.Copy(iw.ResponseWriter, r)
 }
 
-func (iw *immutableWriter) Flush() {
+func (iw *cacheDirectiveWriter) Flush() {
 	if f, ok := iw.ResponseWriter.(http.Flusher); ok {
 		iw.begin(http.StatusOK)
 		f.Flush()
 	}
 }
 
-func (iw *immutableWriter) begin(code int) {
+func (iw *cacheDirectiveWriter) begin(code int) {
 	if iw.started {
 		return
 	}
 	iw.started = true
 	if code == http.StatusOK {
-		iw.ResponseWriter.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		iw.ResponseWriter.Header().Set("Cache-Control", iw.directive)
 	}
 }
 

@@ -80,6 +80,7 @@ func (s *Server) handleCargo(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCargoIndex(w http.ResponseWriter, r *http.Request, p string) {
+	noSharedCache(w)
 	crate, ok := cargoCrateFromIndexPath(p)
 	if !ok {
 		http.Error(w, "invalid cargo index path", http.StatusBadRequest)
@@ -148,7 +149,7 @@ func (s *Server) handleCargoDownload(w http.ResponseWriter, r *http.Request, p s
 		return
 	}
 
-	w = cacheImmutableOn200(w, path.Base(p))
+	w = cachePrivateOn200(w, path.Base(p))
 	// cargo_dl_upstream, not cargo_upstream: the sparse index host serves the
 	// index and nothing else, and crates.io names the download root separately
 	// in the index's own config.json.

@@ -21,6 +21,7 @@ import (
 // handlePypiIndex generates a PEP 503 root index listing all packages found
 // under the pypi/wheels/ S3 prefix.
 func (s *Server) handlePypiIndex(w http.ResponseWriter, r *http.Request) {
+	noSharedCache(w)
 	if !s.requireStorage(w, s.typeStore(manifest.TypePypi)) {
 		return
 	}
@@ -59,6 +60,7 @@ func (s *Server) handlePypiIndex(w http.ResponseWriter, r *http.Request) {
 
 // handlePypiPackage generates a PEP 503 per-package index listing wheel files.
 func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
+	noSharedCache(w)
 	if !s.requireStorage(w, s.typeStore(manifest.TypePypi)) {
 		return
 	}
@@ -160,7 +162,7 @@ func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
 	file := path.Base(p)
 	// Wrapped rather than set: proxyOrResolve and proxyVersion below can both
 	// answer 403 or 404, and http.Error leaves the header map alone.
-	w = cacheImmutableOn200(w, file)
+	w = cachePrivateOn200(w, file)
 
 	// Extract package name and version from the wheel filename
 	// (e.g. "boto3-1.26.0-py3-none-any.whl" → "boto3", "1.26.0").

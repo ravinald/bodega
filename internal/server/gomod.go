@@ -31,6 +31,16 @@ func (s *Server) handleGomod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// list and @latest are the mutable documents a profile decides the content
+	// of; everything else under @v/ is an artifact whose bytes a profile
+	// decides the reachability of. Neither may be stored by a cache shared
+	// across host classes.
+	if immutable {
+		w = cachePrivateOn200(w, file)
+	} else {
+		noSharedCache(w)
+	}
+
 	// The listing names no version, so it is decided at the membership level
 	// and filtered below; every other file under @v/ names one.
 	if !s.entitleGate(w, r, manifest.TypeGomod, module, gomodVersionFromFile(file)) {
