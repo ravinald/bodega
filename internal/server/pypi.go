@@ -71,8 +71,7 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 	if !s.entitleGate(w, r, manifest.TypePypi, pkgName, "") {
 		return
 	}
-	prof, scope := s.profileIndexScope(r, manifest.TypePypi, pkgName)
-	permit := profileVersionFilter(prof, manifest.TypePypi, pkgName)
+	permit := profileVersionFilter(s.profileFor(r), manifest.TypePypi, pkgName)
 	normalized := normalizePkgName(pkgName)
 
 	// Proxy the simple index from upstream PyPI, republished onto bodega's own
@@ -93,7 +92,7 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 		upstream := s.pypiSimpleURL(normalized)
 		rw := &pypiIndexWriter{ResponseWriter: w, indexURL: upstream, permit: permit}
 		s.proxyOrCache(rw, r, s.typeStore(manifest.TypePypi),
-			profileIndexKey(scope, "pypi/simple/"+normalized+"/index.html"),
+			"pypi/simple/"+normalized+"/index.html",
 			upstream, manifest.TypePypi, pkgName, pkgName, false, true)
 		if err := rw.flush(); err != nil {
 			s.logger.Warn("client read of a republished pypi index was cut short", "package", pkgName, "error", err)

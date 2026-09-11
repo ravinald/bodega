@@ -937,11 +937,11 @@ Two enforcement points, and the order matters.
 
 **The request predicate is the control.** It runs on every package route for pypi, npm, gomod, cargo, helm, git and binary, and answers 403. A client that already holds a tarball URL fetches it without reading any index, so an implementation that only filtered indexes would enforce nothing.
 
-**The index filter is what makes the refusal legible.** A resolver told "no such version" picks another one; a resolver handed an opaque 403 halfway through an install stops with a stack trace and leaves the environment half-built. Six documents are filtered: the pypi simple root and its per-distribution pages, the npm packument's `versions` map (with the `time` entries and `dist-tags` that point at dropped versions), the gomod `@v/list`, the cargo sparse index, and the helm `index.yaml`. git and binary publish no index, so the predicate is the whole story there.
+**The index filter is what makes the refusal legible.** A resolver told "no such version" picks another one; a resolver handed an opaque 403 halfway through an install stops with a stack trace and leaves the environment half-built. Six documents are filtered: the pypi simple root and its per-distribution pages, the npm packument's `versions` map (with the `time` entries and `dist-tags` that point at dropped versions), the gomod `@v/list`, the cargo sparse index, and the helm `index.yaml` (which answers 200 with the refused charts absent rather than 403, because a refused index fails `helm repo add` itself). git and binary publish no index, so the predicate is the whole story there.
 
 **apt is deliberately excluded**, and is tracked separately. Refusing an apt fetch at the pool leaves `dpkg` holding a half-configured transaction, which is a worse outcome than no control at all; the apt answer belongs at the generated index, not at fetch time.
 
-A filtered index is cached under a key carrying the profile, so one host class is never served another's document. An unidentified request — and an identified one whose profile states no rule for that type — keeps today's unfiltered document under today's key, so an install with no profiles pays nothing. The helm index is the exception with no key to scope: `bodega build` generates it into storage rather than caching it from an upstream, so there is no cache entry for a second profile to read, and the filter runs on the way out against the live profile.
+No filtered index is stored. Each one is produced by running the profile's filter over the response on the way out, so what sits in the cache is the document the upstream served and one cached object answers every host class correctly. An install with no profiles pays nothing, and a fleet with twenty profiles pays one copy and one upstream fetch per index rather than twenty. A cache hit filters identically to a miss, so a `bodega profile` edit lands within the binding cache TTL rather than at the next upstream refresh. The helm `index.yaml` is generated into storage by `bodega build` rather than cached, and is filtered the same way on the way out.
 
 Every refusal writes an audit row naming the profile, the package, the version and which rule refused it. The two rules are separate statuses, because the repairs are opposite:
 
@@ -1020,11 +1020,20 @@ Caused by:
     Or open it:  bodega profile set web cargo --membership open
 ```
 
-**helm.** A refused `index.yaml` reads as a repository that is not one. The message names neither the chart nor the profile, so this is the ecosystem where the audit row is the only place the reason lives:
+**helm.** `helm repo add` succeeds and the charts are simply not there. The index answers 200 with the refused charts filtered out of it, because a 403 on `index.yaml` fails the repository rather than the install, so the first thing an operator sees is an empty search:
 
 ```text
 $ helm repo add bodega http://bodega:8080/helm
-Error: looks like "http://bodega:8080/helm" is not a valid chart repository or cannot be reached: failed to fetch http://bodega:8080/helm/index.yaml : 403 Forbidden
+"bodega" has been added to your repositories
+$ helm search repo bodega
+No results found
+```
+
+The refusal arrives at the pull, and helm prints neither the chart name nor bodega's body. This is the ecosystem where the audit row is the only place the reason lives:
+
+```text
+$ helm pull bodega/cert-manager --version 1.14.0
+Error: failed to fetch http://bodega:8080/helm/charts/cert-manager-1.14.0.tgz : 403 Forbidden
 ```
 
 **git.** `git` relays the body as `remote:` lines before its own error:

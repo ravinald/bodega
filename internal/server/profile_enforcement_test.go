@@ -501,14 +501,20 @@ func TestProfileFiltersTheHelmIndex(t *testing.T) {
 }
 
 // The hazard with no error attached: two host classes, one package, two
-// documents. The assertion is on the cache keys rather than on the bodies,
-// because a body comparison passes whenever the two profiles happen to agree
-// and would have passed against the tree where both wrote the same key.
-func TestTwoProfilesGetTwoDocumentsAndTwoCacheKeys(t *testing.T) {
+// documents. The assertion is on the cached bytes rather than on the two
+// response bodies, because a body comparison passes whenever the two profiles
+// happen to agree, and it passes just as well against a tree that stores one
+// host's filtered document where the other will read it.
+//
+// What keeps that from happening is that no filtered document is ever stored:
+// the filter runs over the buffered response on the way out, so the cache
+// holds the upstream's index and one fetch answers every profile.
+func TestTwoProfilesGetTwoDocumentsFromOneCachedIndex(t *testing.T) {
 	s := proxyingServer(t)
 	up := newRecordingUpstream(t)
-	up.route("/se/rd/serde", `{"name":"serde","vers":"1.0.0","cksum":"a"}`+"\n"+
-		`{"name":"serde","vers":"2.0.0","cksum":"b"}`+"\n")
+	const upstreamIndex = `{"name":"serde","vers":"1.0.0","cksum":"a"}` + "\n" +
+		`{"name":"serde","vers":"2.0.0","cksum":"b"}` + "\n"
+	up.route("/se/rd/serde", upstreamIndex)
 	s.cfg.CargoUpstream = up.ts.URL
 
 	held := bindProfile(t, s, "held", "held01",
@@ -532,33 +538,69 @@ func TestTwoProfilesGetTwoDocumentsAndTwoCacheKeys(t *testing.T) {
 
 	base := manifest.CargoIndexKey("se/rd/serde")
 	keys := storedKeys(t, s, manifest.TypeCargo, "")
-	for _, want := range []string{profileIndexKey("held", base), profileIndexKey("tracking", base)} {
-		if !containsKey(keys, want) {
-			t.Errorf("no cache entry at %q; the two profiles share a key and one will be served the other's document\n  keys: %v", want, keys)
-		}
+	if len(keys) != 1 || keys[0] != base {
+		t.Fatalf("the cargo store holds %v, want the one upstream index at %q", keys, base)
 	}
-	if containsKey(keys, base) {
-		t.Errorf("a filtered index was cached under the shared key %q: %v", base, keys)
+	if got := storedObject(t, s, manifest.TypeCargo, base); got != upstreamIndex {
+		t.Errorf("the cached index is a filtered document; served from here a second host class\n"+
+			"gets a document that is valid, parseable and wrong about what it may install:\n%s", got)
+	}
+	if n := len(up.paths()); n != 1 {
+		t.Errorf("the upstream index was fetched %d times for 2 profiles: %v", n, up.paths())
 	}
 
-	// An unidentified request resolves to no profile and keeps today's key, so
-	// an install with no profiles pays nothing for this feature.
-	if _, body := getWithToken(t, s, "", "/cargo/se/rd/serde"); !strings.Contains(body, `"vers":"2.0.0"`) {
+	// An unidentified request resolves to no profile, reads the same cached
+	// object and is filtered by nothing, so an install with no profiles pays
+	// neither a fetch nor a stored copy for this feature.
+	if _, body := getWithToken(t, s, "", "/cargo/se/rd/serde"); body != upstreamIndex {
 		t.Errorf("an unidentified request was filtered:\n%s", body)
 	}
-	if !containsKey(storedKeys(t, s, manifest.TypeCargo, ""), base) {
-		t.Errorf("an unidentified request did not cache under today's key: %v",
-			storedKeys(t, s, manifest.TypeCargo, ""))
+	if keys := storedKeys(t, s, manifest.TypeCargo, ""); len(keys) != 1 {
+		t.Errorf("an unidentified request added a cache entry: %v", keys)
 	}
 }
 
-func containsKey(keys []string, want string) bool {
-	for _, k := range keys {
-		if k == want {
-			return true
+func storedObject(t *testing.T, s *Server, typ, key string) string {
+	t.Helper()
+	data, err := s.typeStore(typ).Get(context.Background(), key)
+	if err != nil {
+		t.Fatalf("read %s: %v", key, err)
+	}
+	return string(data)
+}
+
+// The helm index answers 200 under a profile that permits no chart at all.
+//
+// A 403 here fails `helm repo add` rather than the install, and helm prints
+// neither the profile nor a chart name, so the operator gets "not a valid
+// chart repository" for a repository that is valid and a policy they cannot
+// see. The empty index sends them to `helm search repo`; the chart pull
+// carries the refusal. docs/USAGE.md documents both, and this asserts the
+// server still produces what it documents.
+func TestHelmIndexIsNotRefusedByAProfile(t *testing.T) {
+	s := proxyingServer(t)
+	seed(t, s, manifest.TypeHelm, map[string]string{manifest.HelmIndexKey: helmProfileIndex})
+
+	f := bindProfile(t, s, "locked", "locked01",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypeHelm, audit.VersionFloating, audit.ExpansionBlock)}, nil)
+
+	status, body := f.get(t, "/helm/index.yaml")
+	if status != http.StatusOK {
+		t.Fatalf("the chart index answered %d under a blocking profile, want 200: %s", status, body)
+	}
+	if !strings.Contains(body, "apiVersion: v1") {
+		t.Errorf("the index is not a chart repository document:\n%s", body)
+	}
+	for _, gone := range []string{"cert-manager", "redis"} {
+		if strings.Contains(body, gone) {
+			t.Errorf("the index lists %s, which the closed set does not carry:\n%s", gone, body)
 		}
 	}
-	return false
+	// The refusal an operator meets is the pull, and that one names the repair.
+	status, body = f.get(t, "/helm/charts/cert-manager-1.14.0.tgz")
+	if status != http.StatusForbidden {
+		t.Fatalf("the chart pull answered %d, want 403: %s", status, body)
+	}
 }
 
 // Requirement 1, and the thing a per-handler test cannot show: the predicate

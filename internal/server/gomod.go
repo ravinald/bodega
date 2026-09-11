@@ -37,14 +37,13 @@ func (s *Server) handleGomod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if file == "list" {
-		prof, scope := s.profileIndexScope(r, manifest.TypeGomod, module)
-		if permit := profileVersionFilter(prof, manifest.TypeGomod, module); permit != nil {
+		if permit := profileVersionFilter(s.profileFor(r), manifest.TypeGomod, module); permit != nil {
 			rw := &indexFilterWriter{
 				ResponseWriter: w,
 				subject:        module + "/@v/list",
 				filter:         func(b []byte) []byte { return filterGomodList(b, permit) },
 			}
-			s.serveGomodFile(rw, r, pm, module, file, profileIndexKey(scope, s3Key), upstream, immutable)
+			s.serveGomodFile(rw, r, pm, module, file, s3Key, upstream, immutable)
 			if err := rw.flush(); err != nil {
 				s.logger.Error("gomod list response failed", "module", module, "error", err)
 			}

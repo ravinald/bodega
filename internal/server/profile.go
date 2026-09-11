@@ -8,7 +8,6 @@ import (
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/entitle"
-	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // profileSet is the binding table and every profile it names, resolved once
@@ -228,46 +227,22 @@ func profileReachHint(p *entitle.Profile, typ, name string) string {
 	return fmt.Sprintf("bodega profile add %s %s %s", p.Name(), typ, name)
 }
 
-// profileIndexKey scopes a cached index to the profile whose view of it is
-// being served.
+// The filtered indexes are never stored. Every one of them is produced by
+// running the profile's filter over the buffered response on the way out, so
+// what sits in the cache under an index's key is the document the upstream
+// served, exactly as it is for the pypi href rewrite and the npm tarball
+// rewrite. A cache hit filters identically to a miss, which is what lets one
+// cached object answer every host class correctly and lets an operator's
+// profile edit land within the binding cache TTL rather than at the next
+// upstream refresh.
 //
-// An index filtered for one host class and cached under the shared key is
-// served to every other class from that cache, with no error anywhere: the
-// second host gets a document that is valid, parseable and wrong about what it
-// may install. The npm packument path avoided that by refusing to cache a
-// filtered document at all; the profile in the key is the version of that
-// answer which still caches.
-//
-// An unidentified request, and an identified one whose profile states no rule
-// for the type, both get the key they get today. An install with no profiles
-// pays nothing, and neither does a profile that governs apt alone.
-//
-// The prefix is deliberately outside every type tree. manifest.ParseKey reads
-// a type out of a key's leading segment, and a scoped key must not answer as
-// one of the eight: the checksum table is keyed by object key, and the same
-// bytes acquiring a second identity is what migration 014 refused to do.
-// Indexes are mutable and so are never checksummed, which is what keeps this
-// safe rather than merely unobserved.
-func profileIndexKey(profile, key string) string {
-	if profile == "" {
-		return key
-	}
-	return "profiles/" + manifest.SafeName(profile) + "/" + key
-}
-
-// profileIndexScope reports the profile name a filtered index for typ/name
-// should be cached under, and the profile to filter with. An empty name means
-// nothing is filtered and today's key stands.
-func (s *Server) profileIndexScope(r *http.Request, typ, name string) (*entitle.Profile, string) {
-	p := s.profileFor(r)
-	if p == nil {
-		return nil, ""
-	}
-	if !p.Covers(typ, name).Governed {
-		return nil, ""
-	}
-	return p, p.Name()
-}
+// The hazard this closes is a filtered document reaching the cache: served
+// from there to a second host class it is valid, parseable and wrong about
+// what that host may install, with no error anywhere. A profile-scoped key
+// would close it too, at the cost of a private copy of every index per
+// profile and an upstream fetch to fill each one. See
+// TestTwoProfilesGetTwoDocumentsFromOneCachedIndex, which asserts the stored
+// bytes against the upstream document rather than against a response body.
 
 // profileVersionFilter is the per-version predicate an index filter applies.
 // It is Permits with the type and package already bound, so an index generator

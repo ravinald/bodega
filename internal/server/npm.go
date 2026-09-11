@@ -82,22 +82,22 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 	if !s.entitleGate(w, r, manifest.TypeNpm, pkgName, "") {
 		return
 	}
-	prof, scope := s.profileIndexScope(r, manifest.TypeNpm, pkgName)
-	permit := profileVersionFilter(prof, manifest.TypeNpm, pkgName)
+	permit := profileVersionFilter(s.profileFor(r), manifest.TypeNpm, pkgName)
 
 	w.Header().Set("Content-Type", "application/json")
 
-	// The manifest-filtered packument is still not cached: the hidden-version
-	// and constraint filters are per-package facts with no key to scope them
-	// under, so their document would collide with the unfiltered copy. The
-	// profile filter below has one, which is what lets it stay cached.
+	// The manifest-filtered packument is still not cached: that path builds its
+	// document from the manifest rather than from the upstream's, so what it
+	// would write is not the object the key names. The profile filter below
+	// runs over the buffered response instead, which is why this path caches:
+	// the object stays the upstream packument.
 	if pm != nil && (hasHiddenVersion(pm) || hasVersionConstraint(pm)) {
 		s.serveFilteredPackument(w, r, pkgName, pm, permit)
 		return
 	}
 
 	upstream := s.cfg.NpmUpstream + "/" + pkgName
-	s3Key := profileIndexKey(scope, manifest.NpmPackumentKey(pkgName))
+	s3Key := manifest.NpmPackumentKey(pkgName)
 	forceProxy := pm != nil && packageMode(pm) == manifest.ModeProxy
 	rw := &npmPackumentWriter{ResponseWriter: w, base: s.npmPublicRoot(r), pkg: pkgName, permit: permit}
 	s.proxyOrCache(rw, r, s.typeStore(manifest.TypeNpm), s3Key, upstream, manifest.TypeNpm, pkgName, pkgName, false, forceProxy)

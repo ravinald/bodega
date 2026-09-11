@@ -98,11 +98,10 @@ func (s *Server) handleCargoIndex(w http.ResponseWriter, r *http.Request, p stri
 	if !s.entitleGate(w, r, manifest.TypeCargo, crate, "") {
 		return
 	}
-	prof, scope := s.profileIndexScope(r, manifest.TypeCargo, crate)
-	permit := profileVersionFilter(prof, manifest.TypeCargo, crate)
+	permit := profileVersionFilter(s.profileFor(r), manifest.TypeCargo, crate)
 
 	upstream := strings.TrimRight(s.cfg.CargoUpstream, "/") + "/" + p
-	s3Key := profileIndexKey(scope, manifest.CargoIndexKey(p))
+	s3Key := manifest.CargoIndexKey(p)
 	forceProxy := pm != nil && packageMode(pm) == manifest.ModeProxy
 	if permit == nil {
 		s.proxyOrCache(w, r, s.typeStore(manifest.TypeCargo), s3Key, upstream, manifest.TypeCargo, crate, crate, false, forceProxy)

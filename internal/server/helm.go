@@ -13,12 +13,18 @@ import (
 // handleHelmIndex serves the generated chart index, with the charts and
 // releases this host's profile does not permit removed.
 //
-// The key is not profile-scoped, unlike the four indexes bodega caches from an
-// upstream: this document is generated into storage by `bodega build`, so
-// there is no cache entry a filtered copy could be written to and none for a
-// second profile to read. The filter runs on the way out, against the live
-// profile, so an operator's edit lands within the binding cache TTL rather
-// than at the next build.
+// The filter runs on the way out against the live profile, as it does on the
+// four indexes bodega caches from an upstream, so an operator's edit lands
+// within the binding cache TTL rather than at the next build. Here the
+// document is generated into storage by `bodega build` rather than cached,
+// which means a filtered copy has nowhere to land even by accident.
+//
+// The route is not gated. A profile that permits no chart answers 200 with an
+// empty `entries:` map, because a 403 on this path fails `helm repo add`
+// itself and helm names neither the profile nor a chart in what it prints. An
+// empty repository sends the operator to `helm search repo`, which is the
+// question they can answer; the refusal with a reason attached is on the chart
+// pull. See TestHelmIndexIsNotRefusedByAProfile and docs/USAGE.md.
 func (s *Server) handleHelmIndex(w http.ResponseWriter, r *http.Request) {
 	prof := s.profileFor(r)
 	if prof == nil {
