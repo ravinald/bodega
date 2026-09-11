@@ -500,11 +500,16 @@ func validateDoc(doc *profileDoc) error {
 		if err := requireConstraintVersion(e.Constraint, e.Version); err != nil {
 			return fmt.Errorf("entries[%d] (%s/%s): %w", i, e.Type, e.Name, err)
 		}
-		key := e.Type + "/" + e.Name
+		key := profileKey(e.Type, e.Name)
 		if j, dup := firstEntry[key]; dup {
+			spelling := ""
+			if doc.Entries[j].Name != e.Name {
+				spelling = fmt.Sprintf("\n  %q and %q are one project once the name is normalized, which is the form "+
+					"the gate compares", doc.Entries[j].Name, e.Name)
+			}
 			return fmt.Errorf("entries[%d] and entries[%d] both name %s, which is one entry: the later row would "+
-				"replace the earlier, taking its constraint, reason and review date with it.\n"+
-				"  Keep the one you mean", j, i, key)
+				"replace the earlier, taking its constraint, reason and review date with it.%s\n"+
+				"  Keep the one you mean", j, i, key, spelling)
 		}
 		firstEntry[key] = i
 	}
@@ -1033,9 +1038,7 @@ that is a different decision: the package stops being permitted at all.`,
 			if err != nil {
 				return err
 			}
-			idx := slices.IndexFunc(d.Entries, func(e audit.ProfileEntry) bool {
-				return e.Type == typ && e.Name == name
-			})
+			idx := findProfileEntry(d.Entries, typ, name)
 			if idx < 0 {
 				return fmt.Errorf("profile %s does not list %s/%s, so there is no pin to release.\n"+
 					"  What it lists:  bodega profile show %s", profile, typ, name, profile)
@@ -1104,10 +1107,13 @@ func putProfileEntry(gf *globalFlags, profile, typ, name string, e audit.Profile
 	if err != nil {
 		return err
 	}
-	if i := slices.IndexFunc(d.Entries, func(x audit.ProfileEntry) bool {
-		return x.Type == typ && x.Name == name
-	}); i >= 0 {
+	// Adopting the stored spelling is what keeps this an edit. The upsert
+	// conflicts on the name as written, so re-adding an entry under pypi's
+	// other spelling would insert a second row, and entitle.New would index
+	// both under one key and keep whichever it read last.
+	if i := findProfileEntry(d.Entries, typ, name); i >= 0 {
 		e = mergeProfileEntry(d.Entries[i], e, supplied)
+		name = d.Entries[i].Name
 	}
 	if err := requireConstraintVersion(e.Constraint, e.Version); err != nil {
 		return err
@@ -1204,6 +1210,9 @@ func newProfileRemoveCmd(gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if i := findProfileEntry(d.Entries, typ, name); i >= 0 {
+				name = d.Entries[i].Name
+			}
 			if !force && lastEntryOfClosedType(d, typ, name) {
 				return closedAndEmptyRefusal(profile, typ)
 			}
@@ -1222,6 +1231,24 @@ func newProfileRemoveCmd(gf *globalFlags) *cobra.Command {
 	}
 	c.Flags().BoolVar(&force, "force", false, "Remove the last entry of a closed type, which leaves it permitting nothing")
 	return c
+}
+
+// findProfileEntry returns the index of the entry the gate would match for a
+// typed name, -1 for none. An operator types whatever spelling they have in
+// front of them, and for pypi that is routinely not the one stored: comparing
+// raw reports a listed package as absent and leaves the entry in force.
+func findProfileEntry(entries []audit.ProfileEntry, typ, name string) int {
+	key := profileKey(typ, name)
+	return slices.IndexFunc(entries, func(e audit.ProfileEntry) bool {
+		return profileKey(e.Type, e.Name) == key
+	})
+}
+
+// profileKey is entitle.Key qualified by type, which is how the CLI holds a
+// package: entitle keeps one map per type and these maps do not, so dropping
+// the prefix would merge pypi/requests with npm/requests.
+func profileKey(typ, name string) string {
+	return typ + "/" + entitle.Key(typ, name)
 }
 
 // lastEntryOfClosedType reports whether removing this entry would leave a
@@ -1282,13 +1309,16 @@ drift.`,
 				return err
 			}
 
+			// Keyed by what the gate compares, printed as each side spells it:
+			// a pypi entry written django against a package cataloged as Django
+			// is one package, and keying raw reports it as drift on both sides.
 			onHost := map[string]originPackage{}
 			for _, p := range found {
-				onHost[p.Type+"/"+p.Name] = p
+				onHost[profileKey(p.Type, p.Name)] = p
 			}
 			inProfile := map[string]audit.ProfileEntry{}
 			for _, e := range d.Entries {
-				inProfile[e.Type+"/"+e.Name] = e
+				inProfile[profileKey(e.Type, e.Name)] = e
 			}
 
 			var hostOnly, profileOnly []string
@@ -1312,12 +1342,13 @@ drift.`,
 			w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
 			fmt.Fprintf(w, "On %s, not in %s (%d):\n", origin, profile, len(hostOnly))
 			for _, k := range hostOnly {
-				fmt.Fprintf(w, "  %s\t%s\n", k, strings.Join(onHost[k].Versions, ", "))
+				p := onHost[k]
+				fmt.Fprintf(w, "  %s/%s\t%s\n", p.Type, p.Name, strings.Join(p.Versions, ", "))
 			}
 			fmt.Fprintf(w, "\nIn %s, not on %s (%d):\n", profile, origin, len(profileOnly))
 			for _, k := range profileOnly {
 				e := inProfile[k]
-				fmt.Fprintf(w, "  %s\t%s\n", k, orDash(e.Constraint+" "+e.Version))
+				fmt.Fprintf(w, "  %s/%s\t%s\n", e.Type, e.Name, orDash(e.Constraint+" "+e.Version))
 			}
 			_ = w.Flush()
 			if len(hostOnly) == 0 && len(profileOnly) == 0 && len(found) > 0 {

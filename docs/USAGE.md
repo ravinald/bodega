@@ -837,6 +837,14 @@ Released the pin on pypi/requests in nv2; the pypi default is pinned and the ent
 
 A `pypi` entry is matched PEP 503 normalized, on both sides of the comparison: `django` covers the wheel pypi publishes as `Django-4.2.11-py3-none-any.whl`, and `python-3parclient` covers the sdist PEP 625 writes as `python_3parclient-4.2.10.tar.gz`. Compared literally the gate refuses a distribution the profile lists, and worse, the mismatch reads as a package outside the set, where the version rule is skipped and the pin never applies. No other type is normalized: `gomod` module paths and `git` namespaces are case-sensitive by specification, and `cargo` refuses a crate name that is not already lowercase.
 
+The verbs match the same way. `add`, `pin`, `unpin` and `remove` find the entry under whichever spelling you type, so `bodega profile remove ops pypi Django` removes the entry stored as `django` instead of reporting it absent, and re-adding a package under its other spelling edits that entry rather than writing a second row beside it. `bodega profile diff` compares both sides under the same rule, so a profile listing `django` against a host cataloged with `Django` reports no drift. A document naming both spellings is refused at `create --from-file`, because only one of the two constraints would survive:
+
+```text
+entries[0] and entries[1] both name pypi/django, which is one entry: the later row would replace the earlier, taking its constraint, reason and review date with it.
+  "django" and "Django" are one project once the name is normalized, which is the form the gate compares
+  Keep the one you mean
+```
+
 `remove` deletes the entry, which on a closed type means the package is no longer permitted at all.
 
 #### Building a profile from a host

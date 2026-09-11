@@ -89,14 +89,18 @@ func New(d *audit.ProfileDetail) *Profile {
 		if p.entries[e.Type] == nil {
 			p.entries[e.Type] = map[string]audit.ProfileEntry{}
 		}
-		p.entries[e.Type][entryKey(e.Type, e.Name)] = e
+		p.entries[e.Type][Key(e.Type, e.Name)] = e
 	}
 	return p
 }
 
-// entryKey is the form both sides of the membership comparison are held in:
-// New indexes the entries with it and Covers looks one up with it, so no
-// caller has to normalize a name before asking.
+// Key is the form both sides of the membership comparison are held in: New
+// indexes the entries with it and Covers looks one up with it, so no caller
+// has to normalize a name before asking.
+//
+// It is exported because the CLI compares the same two sides outside the gate.
+// A duplicate check, a drift report or a lookup by typed name that compares
+// raw disagrees with what the server will decide, and disagrees silently.
 //
 // pypi needs it because the two sides carry different spellings of one
 // project. An operator writes the normalized name, and the gate is handed
@@ -109,7 +113,7 @@ func New(d *audit.ProfileDetail) *Profile {
 // case-sensitive by specification, and collapsing '.' to '-' there would merge
 // github.com/foo.bar/x with github.com/foo-bar/x into one entry; cargo already
 // refuses a crate name that is not lowercase.
-func entryKey(typ, name string) string {
+func Key(typ, name string) string {
 	if typ != manifest.TypePypi {
 		return name
 	}
@@ -174,7 +178,7 @@ func (p *Profile) Covers(typ, name string) Decision {
 		}
 	}
 
-	if _, listed := p.entries[typ][entryKey(typ, name)]; listed || rule.Membership != audit.MembershipClosed {
+	if _, listed := p.entries[typ][Key(typ, name)]; listed || rule.Membership != audit.MembershipClosed {
 		return Decision{Permitted: true, Governed: true, Rule: &rule}
 	}
 
@@ -219,7 +223,7 @@ func (p *Profile) Permits(typ, name, version string) Decision {
 	}
 
 	rule := *d.Rule
-	entry, listed := p.entries[typ][entryKey(typ, name)]
+	entry, listed := p.entries[typ][Key(typ, name)]
 
 	kind, base := versionRule(rule, entry, listed)
 	if kind == audit.VersionPinned {
