@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/entitle"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/storage"
 )
@@ -993,5 +994,102 @@ func TestProfileKeepsThePinnedSdistOfAHyphenatedName(t *testing.T) {
 	}
 	if strings.Contains(body, "python-3parclient-4.2.11.tar.gz") {
 		t.Errorf("the page lists a version the pin refuses:\n%s", body)
+	}
+}
+
+// pypi publishes a project under a spelling the operator never types: the
+// capital in Django-4.2.11-py3-none-any.whl, and the underscores PEP 625 puts
+// in every sdist. Compared raw against an entry, a listed distribution is
+// refused and the repair text names a second entry for a package already
+// listed.
+func TestProfileDecidesAboutTheNormalizedPypiName(t *testing.T) {
+	const (
+		wheel = "Django-4.2.11-py3-none-any.whl"
+		sdist = "python_3parclient-4.2.10.tar.gz"
+	)
+	s := proxyingServer(t)
+	seed(t, s, manifest.TypePypi, map[string]string{
+		"pypi/wheels/" + wheel: "wheel bytes",
+		"pypi/wheels/" + sdist: "sdist bytes",
+	})
+	f := bindProfile(t, s, "ops", "ops01",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypePypi, audit.VersionFloating, audit.ExpansionBlock)},
+		[]audit.ProfileEntry{
+			{Type: manifest.TypePypi, Name: "django", Constraint: manifest.ConstraintAny},
+			{Type: manifest.TypePypi, Name: "python-3parclient", Constraint: manifest.ConstraintAny},
+		})
+
+	for _, file := range []string{wheel, sdist} {
+		if status, body := f.get(t, "/pypi/wheels/"+file); status != http.StatusOK {
+			t.Errorf("GET /pypi/wheels/%s = %d, want 200: %s", file, status, body)
+		}
+	}
+}
+
+// The half that matters more: under the warn default a spelling mismatch reads
+// as a package outside the set, so Permits returns at membership and the pin is
+// never applied. The index hides the release and the artifact route serves it,
+// which is the disagreement filterPypiSimplePage exists to prevent.
+func TestProfilePinSurvivesThePypiFilenameSpelling(t *testing.T) {
+	const (
+		pinned = "Django-4.2.11-py3-none-any.whl"
+		newer  = "Django-5.0.0-py3-none-any.whl"
+	)
+	s := proxyingServer(t)
+	seed(t, s, manifest.TypePypi, map[string]string{
+		"pypi/wheels/" + pinned: "pinned bytes",
+		"pypi/wheels/" + newer:  "newer bytes",
+	})
+	f := bindProfile(t, s, "ops", "ops01",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypePypi, audit.VersionPinned, "")},
+		[]audit.ProfileEntry{{
+			Type: manifest.TypePypi, Name: "django",
+			Constraint: manifest.ConstraintExact, Version: "4.2.11",
+		}})
+
+	status, body := f.get(t, "/pypi/simple/django/")
+	if status != http.StatusOK {
+		t.Fatalf("the distribution page answered %d: %s", status, body)
+	}
+	if !strings.Contains(body, pinned) {
+		t.Errorf("the page dropped the pinned wheel:\n%s", body)
+	}
+	if strings.Contains(body, newer) {
+		t.Errorf("the page lists a version the pin refuses:\n%s", body)
+	}
+
+	if status, body := f.get(t, "/pypi/wheels/"+pinned); status != http.StatusOK {
+		t.Errorf("the pinned wheel answered %d, want 200: %s", status, body)
+	}
+	status, body = f.get(t, "/pypi/wheels/"+newer)
+	if status != http.StatusForbidden {
+		t.Fatalf("the version outside the pin answered %d, want 403: %s", status, body)
+	}
+	if !strings.Contains(body, entitle.RefusalConstraint) {
+		t.Errorf("the refusal does not name the constraint rule:\n%s", body)
+	}
+	row := profileDenial(t, s, audit.DenialProfileConstraint)
+	if got := denialDetails(t, row)["rule"]; got != entitle.RefusalConstraint {
+		t.Errorf("denial rule = %q, want %q", got, entitle.RefusalConstraint)
+	}
+}
+
+// wheelIdentity places nothing in a filename opening with a hyphen, and the
+// object key is composed from the client's path regardless. Gated only on a
+// placeable name, a profile that permits nothing serves the object and records
+// neither a refusal nor a reach.
+func TestProfileRefusesAnUnplaceableWheelFilename(t *testing.T) {
+	s := proxyingServer(t)
+	seed(t, s, manifest.TypePypi, map[string]string{"pypi/wheels/-x.whl": "bytes"})
+	f := bindProfile(t, s, "ops", "ops01",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypePypi, audit.VersionFloating, audit.ExpansionBlock)},
+		nil)
+
+	status, body := f.get(t, "/pypi/wheels/-x.whl")
+	if status != http.StatusForbidden {
+		t.Fatalf("an unplaceable filename answered %d, want 403: %s", status, body)
+	}
+	if !strings.Contains(body, entitle.RefusalMembership) {
+		t.Errorf("the refusal does not name the membership rule:\n%s", body)
 	}
 }

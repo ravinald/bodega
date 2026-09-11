@@ -835,6 +835,8 @@ Released the pin on pypi/requests in nv2; the pypi default is pinned and the ent
   Or float it:   bodega profile add nv2 pypi requests --constraint any
 ```
 
+A `pypi` entry is matched PEP 503 normalized, on both sides of the comparison: `django` covers the wheel pypi publishes as `Django-4.2.11-py3-none-any.whl`, and `python-3parclient` covers the sdist PEP 625 writes as `python_3parclient-4.2.10.tar.gz`. Compared literally the gate refuses a distribution the profile lists, and worse, the mismatch reads as a package outside the set, where the version rule is skipped and the pin never applies. No other type is normalized: `gomod` module paths and `git` namespaces are case-sensitive by specification, and `cargo` refuses a crate name that is not already lowercase.
+
 `remove` deletes the entry, which on a closed type means the package is no longer permitted at all.
 
 #### Building a profile from a host

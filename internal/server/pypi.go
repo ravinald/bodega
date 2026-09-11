@@ -167,10 +167,21 @@ func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
 	// Extract package name and version from the wheel filename
 	// (e.g. "boto3-1.26.0-py3-none-any.whl" → "boto3", "1.26.0").
 	dist, distVersion := wheelIdentity(file)
+
+	// A filename wheelIdentity cannot place still names an object key, which is
+	// composed from the client's path either way, so gating only the placeable
+	// ones serves "-x.whl" to a profile that permits nothing. The filename
+	// stands in for the package: no entry can name it, so a closed type answers
+	// it as the reach it is, and its version is as unreadable as its name.
+	gateName, gateVersion := dist, distVersion
+	if gateName == "" {
+		gateName, gateVersion = file, ""
+	}
+	if !s.entitleGate(w, r, manifest.TypePypi, gateName, gateVersion) {
+		return
+	}
+
 	if dist != "" {
-		if !s.entitleGate(w, r, manifest.TypePypi, dist, distVersion) {
-			return
-		}
 		normalized := normalizePkgName(dist)
 		pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, dist)
 		if pkg != nil && packageMode(pkg) == manifest.ModeProxy {

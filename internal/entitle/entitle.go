@@ -6,6 +6,7 @@ package entitle
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/builder"
@@ -88,9 +89,47 @@ func New(d *audit.ProfileDetail) *Profile {
 		if p.entries[e.Type] == nil {
 			p.entries[e.Type] = map[string]audit.ProfileEntry{}
 		}
-		p.entries[e.Type][e.Name] = e
+		p.entries[e.Type][entryKey(e.Type, e.Name)] = e
 	}
 	return p
+}
+
+// entryKey is the form both sides of the membership comparison are held in:
+// New indexes the entries with it and Covers looks one up with it, so no
+// caller has to normalize a name before asking.
+//
+// pypi needs it because the two sides carry different spellings of one
+// project. An operator writes the normalized name, and the gate is handed
+// whatever the URL or the filename carried: pypi publishes
+// Django-4.2.11-py3-none-any.whl with the capital, and PEP 625 writes every
+// sdist with underscores. Compared raw, a listed distribution is refused and a
+// pin is never reached, because Permits returns at membership.
+//
+// Every other type is identity. gomod module paths and git namespaces are
+// case-sensitive by specification, and collapsing '.' to '-' there would merge
+// github.com/foo.bar/x with github.com/foo-bar/x into one entry; cargo already
+// refuses a crate name that is not lowercase.
+func entryKey(typ, name string) string {
+	if typ != manifest.TypePypi {
+		return name
+	}
+	// PEP 503: lowercase, and every run of [-_.] becomes one hyphen.
+	name = strings.ToLower(name)
+	var b strings.Builder
+	b.Grow(len(name))
+	sep := false
+	for i := 0; i < len(name); i++ {
+		if c := name[i]; c == '-' || c == '_' || c == '.' {
+			sep = true
+			continue
+		}
+		if sep && b.Len() > 0 {
+			b.WriteByte('-')
+		}
+		sep = false
+		b.WriteByte(name[i])
+	}
+	return b.String()
 }
 
 // Name returns the profile's name, empty for the nil profile.
@@ -135,7 +174,7 @@ func (p *Profile) Covers(typ, name string) Decision {
 		}
 	}
 
-	if _, listed := p.entries[typ][name]; listed || rule.Membership != audit.MembershipClosed {
+	if _, listed := p.entries[typ][entryKey(typ, name)]; listed || rule.Membership != audit.MembershipClosed {
 		return Decision{Permitted: true, Governed: true, Rule: &rule}
 	}
 
@@ -180,7 +219,7 @@ func (p *Profile) Permits(typ, name, version string) Decision {
 	}
 
 	rule := *d.Rule
-	entry, listed := p.entries[typ][name]
+	entry, listed := p.entries[typ][entryKey(typ, name)]
 
 	kind, base := versionRule(rule, entry, listed)
 	if kind == audit.VersionPinned {
