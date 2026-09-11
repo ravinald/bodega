@@ -327,3 +327,18 @@ func TestOSVCheckerReusesTheDatabase(t *testing.T) {
 		t.Error("two osv_db_dir values shared one database")
 	}
 }
+
+// TestOSVCheckerCarriesTheDefaultAptSuite pins the one key the gate cannot
+// derive on its own. Every apt manifest written before the suites field keeps
+// that field empty, and the server publishes those entries under
+// apt_codename; without the codename here the gate declines to answer for the
+// shape most of the catalog has.
+func TestOSVCheckerCarriesTheDefaultAptSuite(t *testing.T) {
+	cfg := &config.Config{OSVDBDir: t.TempDir(), AptCodename: "jammy"}
+	if got := OSVChecker(cfg, nil).DefaultAptSuite; got != "jammy" {
+		t.Errorf("DefaultAptSuite = %q, want jammy", got)
+	}
+	if got := OSVChecker(nil, nil).DefaultAptSuite; got != "" {
+		t.Errorf("no config means no default, got %q", got)
+	}
+}

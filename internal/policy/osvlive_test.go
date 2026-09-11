@@ -2,7 +2,9 @@ package policy
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -65,6 +67,10 @@ var osvLiveDistroCases = []struct {
 	{"Ubuntu:22.04:LTS", "expat", []string{"2.4.7-1ubuntu0.2", "2.4.7-1ubuntu0.6"}},
 	// An epoch, and a dfsg-repacked upstream version.
 	{"Ubuntu:22.04:LTS", "zlib", []string{"1:1.2.11.dfsg-2ubuntu9", "1:1.2.11.dfsg-2ubuntu9.2"}},
+	// universe, so every record is filed under Ubuntu:Pro:22.04:LTS and the
+	// main ecosystem answers with a handful. The local index folds both.
+	{"Ubuntu:22.04:LTS", "imagemagick", []string{
+		"8:6.9.11.60+dfsg-1.3ubuntu0.22.04.3", "8:6.9.11.60+dfsg-1.3ubuntu0.22.04.5+esm14"}},
 	{"Ubuntu:24.04:LTS", "expat", []string{"2.6.1-2build1", "2.6.1-2ubuntu0.1"}},
 	// "+deb12u1" is the shape semver discards as a build tag, making the two
 	// revisions compare equal and the unpatched one report clean.
@@ -110,13 +116,42 @@ func TestOSVLiveDistroAgreement(t *testing.T) {
 				t.Errorf("%s %s@%s: %d record(s) no ordering could place: %v",
 					tc.ecosystem, tc.pkg, version, len(skipped), skipped)
 			}
-			remote, err := ck.query(ctx, tc.ecosystem, tc.pkg, version)
+			// The local index holds one release under one key and the API
+			// holds it under two, so the comparison unions the API side.
+			// Querying the main string alone would read the fold as a local
+			// defect; see ubuntuProEcosystem.
+			remote, err := liveDistroIDs(ctx, ck, tc.ecosystem, tc.pkg, version)
 			if err != nil {
 				t.Fatalf("%s query: %v", tc.ecosystem, err)
 			}
-			if got, want := strings.Join(vulnIDs(local), ","), strings.Join(vulnIDs(remote), ","); got != want {
+			if got, want := strings.Join(vulnIDs(local), ","), strings.Join(remote, ","); got != want {
 				t.Errorf("%s %s@%s:\n local %q\n   api %q", tc.ecosystem, tc.pkg, version, got, want)
 			}
 		}
 	}
+}
+
+// liveDistroIDs is what api.osv.dev answers for one release, across both of
+// the ecosystem strings it files that release under, sorted and deduped.
+func liveDistroIDs(ctx context.Context, ck *OSVChecker, ecosystem, pkg, version string) ([]string, error) {
+	seen := map[string]bool{}
+	var ids []string
+	for _, eco := range []string{ecosystem, ubuntuProEcosystem(ecosystem)} {
+		if eco == "" {
+			continue
+		}
+		vulns, err := ck.query(ctx, eco, pkg, version)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", eco, err)
+		}
+		for _, id := range vulnIDs(vulns) {
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids, nil
 }

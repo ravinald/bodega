@@ -262,6 +262,14 @@ func TestAptOSVEcosystem(t *testing.T) {
 		{"bookworm", "Debian:12"},
 		{"bookworm-backports", "Debian:12"},
 		{"trixie", "Debian:13"},
+		{"questing", "Ubuntu:25.10"},
+		{"forky", "Debian:14"},
+		// A superseded interim release carries a handful of records rather
+		// than a release's worth, which distills to an index that passes
+		// sync's no-packages check and then reports the rest of the release
+		// clean. Absent, so the gate warns instead.
+		{"mantic", ""},
+		{"oracular", ""},
 		{"plucky", ""},
 		{"stable", ""},
 		{"", ""},
@@ -332,5 +340,99 @@ func TestCompareDebian(t *testing.T) {
 		if parseDebian(v).ok {
 			t.Errorf("parseDebian(%q) claimed to order an unorderable version", v)
 		}
+	}
+}
+
+// TestOSVApt_ProRecordsAnswerTheSameRelease covers the half of a release OSV
+// files under a second ecosystem string.
+//
+// Ubuntu:22.04:LTS carries main and Ubuntu:Pro:22.04:LTS carries universe, and
+// the two sets are disjoint: measured 2026-09-11, a stock jammy imagemagick
+// answers with 4 records under the first and 179 under the second. An index
+// built from the first alone reports that host clean on everything outside
+// main and dates the answer.
+func TestOSVApt_ProRecordsAnswerTheSameRelease(t *testing.T) {
+	ck := aptChecker(t)
+
+	pm := &manifest.PackageManifest{Name: "imagemagick-6.q16", Type: manifest.TypeApt}
+	ve := &manifest.VersionEntry{
+		Version:    "8:6.9.11.60+dfsg-1.3ubuntu0.22.04.3",
+		SourceName: "imagemagick",
+		Suites:     []string{"jammy"},
+	}
+	r := ck.Check(context.Background(), pm, ve)
+	if r.Action != ActionBlock {
+		t.Fatalf("USN-6621-1 fixes jammy imagemagick at +esm3 and this version is below it; the gate reported %q: %s", r.Action, r.Reason)
+	}
+	if got := ve.Metadata[OSVMetaVulns]; got != "USN-6621-1" {
+		t.Errorf("stamped %q, want USN-6621-1", got)
+	}
+	if got, want := ve.Metadata[OSVMetaQueried], "source package imagemagick in Ubuntu:22.04:LTS"; got != want {
+		t.Errorf("stamped %q, want %q: the Pro half is folded into the release's own index, not queried as a second ecosystem", got, want)
+	}
+
+	// A record whose Pro entry names a different source package than its main
+	// entry lands under that package, and not under the one the main entry
+	// names: the fold is per `affected` entry.
+	node, _, err := ck.LocalDB.Match("Ubuntu:22.04:LTS", "nodejs", "12.22.9-1ubuntu3.6")
+	if err != nil {
+		t.Fatalf("match: %v", err)
+	}
+	if got := vulnIDs(node); len(got) != 1 || got[0] != "UBUNTU-CVE-2022-40735" {
+		t.Errorf("the Pro entry of UBUNTU-CVE-2022-40735 names nodejs; jammy nodejs got %v", got)
+	}
+}
+
+// TestOSVApt_FIPSRecordsAreNotFolded is the limit on the fold above.
+//
+// OSV also publishes Ubuntu:Pro:FIPS:<rel> and Ubuntu:Pro:FIPS-updates:<rel>,
+// whose versions are FIPS builds. UBUNTU-CVE-2022-40735 fixes jammy openssl at
+// 3.0.2-0ubuntu1.16 and the FIPS build at 3.0.2-0ubuntu1.16+Fips1, so a prefix
+// match on "Ubuntu:Pro:" reports a patched stock host against a FIPS revision
+// it never installed.
+func TestOSVApt_FIPSRecordsAreNotFolded(t *testing.T) {
+	ck := aptChecker(t)
+
+	// The premise: the record is in the jammy index at all.
+	behind, _, err := ck.LocalDB.Match("Ubuntu:22.04:LTS", "openssl", "3.0.2-0ubuntu1.15")
+	if err != nil {
+		t.Fatalf("match: %v", err)
+	}
+	if got := vulnIDs(behind); len(got) != 1 || got[0] != "UBUNTU-CVE-2022-40735" {
+		t.Fatalf("3.0.2-0ubuntu1.15 is behind the stock fix at 3.0.2-0ubuntu1.16; got %v", got)
+	}
+
+	pm := &manifest.PackageManifest{Name: "libssl3", Type: manifest.TypeApt}
+	ve := &manifest.VersionEntry{Version: "3.0.2-0ubuntu1.16", SourceName: "openssl", Suites: []string{"jammy"}}
+	if r := ck.Check(context.Background(), pm, ve); r.Action != ActionPass {
+		t.Fatalf("3.0.2-0ubuntu1.16 carries the stock fix; the FIPS revisions are about a build this host does not run: %q %s", r.Action, r.Reason)
+	}
+}
+
+// TestOSVApt_NoSuitesFallsBackToDefault covers the shape every apt manifest
+// written before the suites field existed has. The server publishes such an
+// entry under apt_codename, so that is the release whose advisories cover it,
+// and sync has already downloaded that index because ServedAptSuites always
+// includes the codename.
+func TestOSVApt_NoSuitesFallsBackToDefault(t *testing.T) {
+	ck := aptChecker(t)
+	ck.DefaultAptSuite = "jammy"
+
+	pm := &manifest.PackageManifest{Name: "libexpat1", Type: manifest.TypeApt}
+	ve := &manifest.VersionEntry{Version: "2.4.7-1ubuntu0.2", SourceName: "expat"}
+	r := ck.Check(context.Background(), pm, ve)
+	if r.Action != ActionBlock {
+		t.Fatalf("an entry naming no suite is served under apt_codename and answered from it; got %q: %s", r.Action, r.Reason)
+	}
+	if got, want := ve.Metadata[OSVMetaQueried], "source package expat in Ubuntu:22.04:LTS"; got != want {
+		t.Errorf("stamped %q, want %q", got, want)
+	}
+
+	// A default OSV publishes nothing for is still unanswerable, and names the
+	// codename rather than leaving the operator to guess where it came from.
+	ck.DefaultAptSuite = "plucky"
+	ve = &manifest.VersionEntry{Version: "2.4.7-1ubuntu0.2", SourceName: "expat"}
+	if r := ck.Check(context.Background(), pm, ve); r.Action != ActionWarn || !strings.Contains(r.Reason, "plucky") {
+		t.Errorf("want a warn naming plucky, got %q: %s", r.Action, r.Reason)
 	}
 }

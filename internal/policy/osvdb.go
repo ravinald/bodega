@@ -516,17 +516,40 @@ func distill(ecosystems []string, zipPath string) (map[string]*osvIndex, map[str
 // An OSV ecosystem string can carry a release suffix ("Debian:12",
 // "Alpine:v3.19"). A language ecosystem is requested under the bare name and
 // takes everything under it; a distro release is requested in full and takes
-// only an exact match, because folding Ubuntu:Pro:22.04:LTS and every other
-// release into one index would answer a jammy host with advisories that are
-// not about it.
+// only its own release, because folding every Ubuntu release into one index
+// would answer a jammy host with advisories that are not about it.
+//
+// Its own release is two strings, not one: see ubuntuProEcosystem.
 func distillEcosystem(ecosystems []string, recorded string) string {
 	base, _, _ := strings.Cut(recorded, ":")
 	for _, eco := range ecosystems {
-		if recorded == eco || base == eco {
+		if recorded == eco || base == eco || recorded == ubuntuProEcosystem(eco) {
 			return eco
 		}
 	}
 	return ""
+}
+
+// ubuntuProEcosystem is the second string OSV files one Ubuntu release's
+// advisories under, or "" for an ecosystem that has none.
+//
+// OSV splits a release across Ubuntu:22.04:LTS, which carries main, and
+// Ubuntu:Pro:22.04:LTS, which carries universe and on the ESM releases very
+// nearly everything. The two sets are disjoint, so an index built from the
+// first alone answers a jammy imagemagick with 4 records where 183 exist, and a
+// xenial expat with none at all. Both halves are about the same host and both
+// name stock revisions as their fixed versions, so they belong in one index.
+//
+// Matched as an exact pair and never as a prefix. OSV also publishes
+// Ubuntu:Pro:FIPS:22.04:LTS and Ubuntu:Pro:FIPS-updates:22.04:LTS, whose
+// versions are FIPS builds: a prefix match reports those against a host that
+// never installed one.
+func ubuntuProEcosystem(ecosystem string) string {
+	rel, found := strings.CutPrefix(ecosystem, "Ubuntu:")
+	if !found {
+		return ""
+	}
+	return "Ubuntu:Pro:" + rel
 }
 
 func (d *OSVDatabase) writeIndex(ecosystem string, idx *osvIndex) (int64, error) {

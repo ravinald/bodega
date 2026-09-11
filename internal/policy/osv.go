@@ -86,6 +86,11 @@ type OSVChecker struct {
 	// it warns instead of passing. Zero means DefaultOSVMaxAge.
 	MaxAge time.Duration
 
+	// DefaultAptSuite is the suite an apt entry naming none is served under,
+	// which is the server's apt_codename. Empty leaves such an entry
+	// unanswerable, which is what a test or a tool holding no Config gets.
+	DefaultAptSuite string
+
 	Now func() time.Time
 }
 
@@ -127,7 +132,7 @@ func (c *OSVChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 		return Result{Check: "osv", Action: ActionWarn,
 			Reason: fmt.Sprintf("apt entry %s carries no version, so no advisory can be evaluated against it", pm.Name)}
 	}
-	lk := osvLookupFor(pm, ve)
+	lk := osvLookupFor(pm, ve, c.DefaultAptSuite)
 	if lk.reason != "" {
 		return Result{Check: "osv", Action: ActionWarn, Reason: lk.reason}
 	}
@@ -399,6 +404,17 @@ type osvVuln struct {
 	Severity []osvSeverity `json:"severity"`
 }
 
+// osvAPIBodyLimit caps what one api.osv.dev response may cost in memory. A
+// distro ecosystem gets an order of magnitude more than a language one because
+// a USN enumerates every version it covers: measured 2026-09-11, one query for
+// linux 5.15.0-91.101 in Ubuntu:22.04:LTS answers with 32.8 MB.
+func osvAPIBodyLimit(ecosystem string) int64 {
+	if isDistroEcosystem(ecosystem) {
+		return 64 << 20
+	}
+	return 4 << 20
+}
+
 func (c *OSVChecker) query(ctx context.Context, ecosystem, name, version string) ([]osvVuln, error) {
 	body, _ := json.Marshal(map[string]any{
 		"package": map[string]string{"name": name, "ecosystem": ecosystem},
@@ -417,9 +433,16 @@ func (c *OSVChecker) query(ctx context.Context, ecosystem, name, version string)
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("POST %s: HTTP %d", c.Endpoint, resp.StatusCode)
 	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	// One byte past the cap, so a body that reaches it is reported as too
+	// large rather than as the truncated JSON it would otherwise parse as.
+	limit := osvAPIBodyLimit(ecosystem)
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
 		return nil, err
+	}
+	if int64(len(raw)) > limit {
+		return nil, fmt.Errorf("osv response for %s %s@%s is larger than the %d MiB cap; run `bodega policy osv sync` and answer from the local database",
+			ecosystem, name, version, limit>>20)
 	}
 	var out struct {
 		Vulns []osvVuln `json:"vulns"`

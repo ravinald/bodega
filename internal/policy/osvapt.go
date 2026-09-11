@@ -18,17 +18,25 @@ import (
 // different source packages with different fixed versions. OSV's aggregate
 // `Ubuntu` export carries every release at once and cannot tell them apart.
 //
-// A codename OSV publishes no export for is absent rather than approximated to
-// its nearest neighbor. The gate warns on it, which is the honest answer; a
-// neighbor's advisories would be the wrong ones.
+// A codename OSV carries no release's worth of records for is absent rather
+// than approximated to its nearest neighbor. The gate warns on it, which is the
+// honest answer; a neighbor's advisories would be the wrong ones.
+//
+// A superseded interim Ubuntu release is absent for the same reason even though
+// OSV answers for it: measured 2026-09-11, mantic, oracular and plucky each
+// carry a handful of records against a release's thousands (3, 3 and 4 across
+// ten probed source packages, against 421 for xenial). A handful is worse than
+// none, because it distills to a non-empty index that passes sync's own
+// no-packages check and then reports the rest of the release clean for the
+// whole osv_db_max_age window.
 var aptOSVEcosystem = map[string]string{
 	"trusty":   "Ubuntu:14.04:LTS",
 	"xenial":   "Ubuntu:16.04:LTS",
 	"bionic":   "Ubuntu:18.04:LTS",
 	"focal":    "Ubuntu:20.04:LTS",
 	"jammy":    "Ubuntu:22.04:LTS",
-	"mantic":   "Ubuntu:23.10",
 	"noble":    "Ubuntu:24.04:LTS",
+	"questing": "Ubuntu:25.10",
 	"wheezy":   "Debian:7",
 	"jessie":   "Debian:8",
 	"stretch":  "Debian:9",
@@ -36,6 +44,7 @@ var aptOSVEcosystem = map[string]string{
 	"bullseye": "Debian:11",
 	"bookworm": "Debian:12",
 	"trixie":   "Debian:13",
+	"forky":    "Debian:14",
 }
 
 // aptPockets are the suffixes a suite name carries when it names a pocket
@@ -134,9 +143,16 @@ type osvLookup struct {
 // holding a jammy entry and a noble entry answered from one codename is wrong
 // about one of them, in the direction that reports a vulnerable host clean.
 //
+// defaultSuite covers the entry that names no suite, which is every apt entry
+// written before the field existed. The server publishes those under
+// apt_codename, so that is the release whose advisories cover them, and it is
+// already in the synced set because ServedAptSuites always includes it. Empty
+// when the caller holds no Config, and then the entry is unanswerable rather
+// than answered from a release nothing chose.
+//
 // A reason means nothing can answer. B34's rule holds here: the caller warns
 // with it rather than passing.
-func osvLookupFor(pm *manifest.PackageManifest, ve *manifest.VersionEntry) osvLookup {
+func osvLookupFor(pm *manifest.PackageManifest, ve *manifest.VersionEntry, defaultSuite string) osvLookup {
 	if pm.Type != manifest.TypeApt {
 		eco := osvEcosystemFor[pm.Type]
 		if eco == "" {
@@ -149,9 +165,10 @@ func osvLookupFor(pm *manifest.PackageManifest, ve *manifest.VersionEntry) osvLo
 	if name == "" {
 		name, kind = pm.Name, "binary package"
 	}
-	exports, unmapped := OSVExportsFor(manifest.TypeApt, ve.Suites)
+	suites := ve.EffectiveSuites(defaultSuite)
+	exports, unmapped := OSVExportsFor(manifest.TypeApt, suites)
 	if len(exports) == 0 {
-		return osvLookup{reason: aptUnmappedReason(pm.Name, ve.Suites, unmapped)}
+		return osvLookup{reason: aptUnmappedReason(pm.Name, suites, unmapped)}
 	}
 	out := osvLookup{
 		queried: fmt.Sprintf("%s %s in %s", kind, name, strings.Join(exports, ", ")),
@@ -169,6 +186,9 @@ func osvLookupFor(pm *manifest.PackageManifest, ve *manifest.VersionEntry) osvLo
 // aptUnmappedReason says which suite stopped the lookup, and what to do about
 // it. "apt is not covered" would send the operator to the gate's configuration
 // for a problem that lives on one version entry.
+//
+// The no-suite branch is reachable only from a caller holding no default: a
+// server resolves an entry naming none to apt_codename before it gets here.
 func aptUnmappedReason(name string, suites, unmapped []string) string {
 	if len(suites) == 0 {
 		return fmt.Sprintf("apt entry %s names no suite, so no Ubuntu or Debian release identifies the advisories that cover it; set suites on the version entry", name)

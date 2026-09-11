@@ -1189,8 +1189,8 @@ The fallback is off by default because the deployment this gate exists for canno
 ```
 $ bodega policy osv sync
 ECOSYSTEM  OSV               RECORDS  PACKAGES  SIZE       FETCHED
-apt        Ubuntu:22.04:LTS  32346    2399      8.2 MiB    2026-09-11T20:25:46Z
-apt        Ubuntu:24.04:LTS  29047    2241      3.6 MiB    2026-09-11T20:25:46Z
+apt        Ubuntu:22.04:LTS  36268    2594      8.2 MiB    2026-09-11T21:28:15Z
+apt        Ubuntu:24.04:LTS  31958    2399      3.6 MiB    2026-09-11T21:28:15Z
 cargo      crates.io         2701     1610      120.1 KiB  2026-09-08T01:53:24Z
 gomod      Go                8968     1588      402.9 KiB  2026-09-08T01:53:25Z
 npm        npm               228106   224290    3.8 MiB    2026-09-08T01:53:43Z
@@ -1200,11 +1200,11 @@ Wrote /var/lib/bodega/osv
 skipped apt: OSV publishes no Ubuntu or Debian export for suite "plucky"
 ```
 
-Name ecosystems to sync a subset (`bodega policy osv sync npm pypi`). `apt` expands to one row per served suite, and the suites that resolve to the same distro come out of one download. Each archive is written under a temporary name and renamed, so an interrupted sync leaves the previous copy in place rather than a half-written one the gate would read as truth.
+Name ecosystems to sync a subset (`bodega policy osv sync npm pypi`). The no-argument form syncs everything the gate covers, `apt` included, so it pulls the aggregate `Ubuntu` and `Debian` archives whether or not this install serves apt: name the ecosystems to skip that. `apt` expands to one row per served suite, and the suites that resolve to the same distro come out of one download. Each archive is written under a temporary name and renamed, so an interrupted sync leaves the previous copy in place rather than a half-written one the gate would read as truth.
 
 An export that distills to no packages fails that ecosystem's row and writes nothing. Otherwise it would land a database with a current fetch time, and every version in the ecosystem would read clean for the whole `osv_db_max_age` window: `RECORDS 0` shows once in this table and never again.
 
-The numbers are the distilled database, not the download: OSV's npm export is 222 MB of JSON, and what lands on disk is 3.8 MB because sync keeps the ids, summaries, severities and affected ranges and drops the prose. A full sync of the four language ecosystems takes about 15 seconds on a home connection and leaves around 5.5 MB on disk. `apt` costs more on both counts, because the aggregate `Ubuntu` archive is 681 MB and `Debian` 330 MB: measured 2026-09-11, two Ubuntu releases out of one download took 63 seconds and wrote 11.8 MB.
+The numbers are the distilled database, not the download: OSV's npm export is 222 MB of JSON, and what lands on disk is 3.8 MB because sync keeps the ids, summaries, severities and affected ranges and drops the prose. A full sync of the four language ecosystems takes about 15 seconds on a home connection and leaves around 5.5 MB on disk. `apt` costs more on both counts, because the aggregate `Ubuntu` archive is 681 MB and `Debian` 330 MB: measured 2026-09-11, two Ubuntu releases out of one download took 64 seconds and wrote 11.9 MiB.
 
 #### Air-gapped
 
@@ -1255,15 +1255,15 @@ Local OSV database: /var/lib/bodega/osv (api.osv.dev fallback: off)
 
 Coverage is the set of registry types the gate can query, which is also the set of exports `sync` fetches:
 
-| Type  | OSV ecosystem                                                            |
-| ----- | ------------------------------------------------------------------------ |
-| npm   | `npm`                                                                    |
-| pypi  | `PyPI`                                                                   |
-| gomod | `Go`                                                                     |
-| cargo | `crates.io`                                                              |
-| apt   | one per served suite (`Ubuntu:22.04:LTS` , `Debian:12`); see [apt](#apt) |
+| Type  | OSV ecosystem                                                           |
+| ----- | ----------------------------------------------------------------------- |
+| npm   | `npm`                                                                   |
+| pypi  | `PyPI`                                                                  |
+| gomod | `Go`                                                                    |
+| cargo | `crates.io`                                                             |
+| apt   | one per served suite (`Ubuntu:22.04:LTS`, `Debian:12`); see [apt](#apt) |
 
-`binary` , `git` and `helm` have no OSV identifier. `set` refuses them:
+`binary`, `git` and `helm` have no OSV identifier. `set` refuses them:
 
 ```
 $ bodega policy osv set helm block
@@ -1282,19 +1282,26 @@ OSV carries `Ubuntu` and `Debian` ecosystems sourced from USN and DSA, and the f
 
 **The ecosystem comes from the entry's own suite.** A pocket suffix is stripped, so `jammy-security` resolves the same as `jammy`.
 
-| Suite    | OSV ecosystem      | Suite      | OSV ecosystem |
-| -------- | ------------------ | ---------- | ------------- |
-| `trusty` | `Ubuntu:14.04:LTS` | `wheezy`   | `Debian:7`    |
-| `xenial` | `Ubuntu:16.04:LTS` | `jessie`   | `Debian:8`    |
-| `bionic` | `Ubuntu:18.04:LTS` | `stretch`  | `Debian:9`    |
-| `focal`  | `Ubuntu:20.04:LTS` | `buster`   | `Debian:10`   |
-| `jammy`  | `Ubuntu:22.04:LTS` | `bullseye` | `Debian:11`   |
-| `mantic` | `Ubuntu:23.10`     | `bookworm` | `Debian:12`   |
-| `noble`  | `Ubuntu:24.04:LTS` | `trixie`   | `Debian:13`   |
+| Suite      | OSV ecosystem      | Suite      | OSV ecosystem |
+| ---------- | ------------------ | ---------- | ------------- |
+| `trusty`   | `Ubuntu:14.04:LTS` | `wheezy`   | `Debian:7`    |
+| `xenial`   | `Ubuntu:16.04:LTS` | `jessie`   | `Debian:8`    |
+| `bionic`   | `Ubuntu:18.04:LTS` | `stretch`  | `Debian:9`    |
+| `focal`    | `Ubuntu:20.04:LTS` | `buster`   | `Debian:10`   |
+| `jammy`    | `Ubuntu:22.04:LTS` | `bullseye` | `Debian:11`   |
+| `noble`    | `Ubuntu:24.04:LTS` | `bookworm` | `Debian:12`   |
+| `questing` | `Ubuntu:25.10`     | `trixie`   | `Debian:13`   |
+|            |                    | `forky`    | `Debian:14`   |
 
-The suite on the version entry, never `apt_codename`. One catalog holds entries for both releases, and answering both from one codename is wrong about one of them, in the direction that reports a vulnerable host clean: noble's version strings are newer than every jammy advisory's fixed version, so a noble entry checked against jammy's records matches nothing.
+A codename is absent when OSV carries no release's worth of records for it, which is every superseded interim Ubuntu release: measured 2026-09-11, `mantic`, `oracular` and `plucky` answer with 3, 3 and 4 records across ten probed source packages, against 421 for `xenial`. A handful is worse for the operator than none, because it distills to a non-empty index that passes the no-packages check under [Sync](#sync) and then reports the rest of the release clean for the whole `osv_db_max_age` window. The gate warns on an absent codename instead.
 
-**The source package is queried.** Advisories are issued against the source package, and one source builds many binaries: `expat` builds `libexpat1` , `libexpat1-dev` and `expat` itself. `bodega pkg convert apt` records the source in `source_name` , and that is the name the gate queries; an entry recording none is queried under its binary name. The stamp says which was used either way, so a finding on `libexpat1` traces back to the `expat` advisory that produced it.
+The suite on the version entry, never `apt_codename`. One catalog holds entries for both releases, and answering both from one codename is wrong about one of them, in the direction that reports a vulnerable host clean: noble's version strings are newer than every jammy advisory's fixed version, so a noble entry checked against jammy's records matches nothing. An entry naming no suite at all is the exception, because the server publishes it under `apt_codename`: that is the release it is served from, so that is the release whose advisories cover it, and `sync` has already fetched that index because the served set always includes the codename.
+
+**One release is two OSV ecosystem strings.** `Ubuntu:22.04:LTS` carries main and `Ubuntu:Pro:22.04:LTS` carries universe, and on the ESM releases very nearly everything. The two sets are disjoint. Measured 2026-09-11, a stock jammy `imagemagick 8:6.9.11.60+dfsg-1.3ubuntu0.22.04.3` answers with 4 records under the first and 179 under the second, and a xenial `expat 2.1.0-7ubuntu0.16.04.5+esm8` answers with none under the first and 37 under the second. Both halves are about the same host and both name stock revisions as their fixed versions, so `sync` folds them into one index per release: the `queried` stamp names `Ubuntu:22.04:LTS` and the answer covers both.
+
+The `Ubuntu:Pro:FIPS:22.04:LTS`, `Ubuntu:Pro:FIPS-preview:22.04:LTS` and `Ubuntu:Pro:FIPS-updates:22.04:LTS` strings are not folded. Their version strings are FIPS builds, so a host running the stock package would report against a revision it never installed: `UBUNTU-CVE-2022-40735` fixes jammy `openssl` at `3.0.2-0ubuntu1.16` and the FIPS build at `3.0.2-0ubuntu1.16+Fips1`, and a patched stock host sorts below the second.
+
+**The source package is queried.** Advisories are issued against the source package, and one source builds many binaries: `expat` builds `libexpat1`, `libexpat1-dev` and `expat` itself. `bodega pkg convert apt` records the source in `source_name`, and that is the name the gate queries; an entry recording none is queried under its binary name. The stamp says which was used either way, so a finding on `libexpat1` traces back to the `expat` advisory that produced it.
 
 **Versions compare under dpkg's ordering, revision included.** Epoch, upstream version and revision compare separately, `~` sorts below the end of the string, and leading zeros carry no weight, so `3.0.2-0ubuntu1.15` is newer than `3.0.2-0ubuntu1.2`. semver gets `2.5.0-1+deb12u1` wrong in the expensive direction: it reads `+deb12u1` as build metadata and discards it, so an unpatched `2.5.0-1` compares equal to the revision carrying the fix and reports clean.
 
@@ -1303,7 +1310,7 @@ $ bodega pkg import expat.json      # jammy, one revision short of the fix
 apt/libexpat1: 2.4.7-1ubuntu0.2: osv: libexpat1@2.4.7-1ubuntu0.2 has 2 OSV record(s): USN-6694-1, USN-7000-2, queried as source package expat in Ubuntu:22.04:LTS
 ```
 
-An entry the gate cannot place warns and never passes, the same rule the missing database follows: a suite OSV publishes no records for (an interim Ubuntu release, or a suite name of your own), an entry naming no suite at all, or an entry whose version is not yet resolved.
+An entry the gate cannot place warns and never passes, the same rule the missing database follows: a suite OSV publishes no records for (an interim Ubuntu release, or a suite name of your own), an entry whose own suites and `apt_codename` are both unmapped, or an entry whose version is not yet resolved.
 
 ```
 apt/libexpat1: 2.6.3-2: osv: apt entry libexpat1 names suite(s) plucky, which OSV publishes no Ubuntu or Debian export for
@@ -1417,7 +1424,7 @@ Flagged by OSV:
   1.2.0        GHSA-vh95-rmgr-6w4m, GHSA-xvch-5gv4-984h  (checked 2026-09-08)
 ```
 
-The `OSV` cell reads `n/a` on `binary` , `git` and `helm`. Those three have no OSV ecosystem identifier, so no rescan can ever answer for them, and `unchecked` would send the operator to a verb that refuses to run on them. On the covered types the cell reads `unchecked`, `clean` or a finding count, and `CHECKED` carries the date of the last conclusive answer. The `Flagged by OSV` block obeys the same rule: a version whose row reads `n/a` never appears in it. `bodega pkg import` accepts a manifest carrying `vetting.osv.*` keys for any type, so a stamp exported from another instance can land on `git` , and printing it as a dated finding under a cell that says the check can never run would contradict the row four lines above it.
+The `OSV` cell reads `n/a` on `binary`, `git` and `helm`. Those three have no OSV ecosystem identifier, so no rescan can ever answer for them, and `unchecked` would send the operator to a verb that refuses to run on them. On the covered types the cell reads `unchecked`, `clean` or a finding count, and `CHECKED` carries the date of the last conclusive answer. The `Flagged by OSV` block obeys the same rule: a version whose row reads `n/a` never appears in it. `bodega pkg import` accepts a manifest carrying `vetting.osv.*` keys for any type, so a stamp exported from another instance can land on `git`, and printing it as a dated finding under a cell that says the check can never run would contradict the row four lines above it.
 
 `GET /api/v1/packages/{type}/{name}/{version}` carries the same three keys on the version's `metadata`.
 

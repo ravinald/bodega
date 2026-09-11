@@ -284,7 +284,7 @@ func describeVersions(versions []string) string {
 //
 // Exported for `bodega policy osv rescan`, which has to answer from the same
 // database and the same fallback rule admission answers from. A second copy of
-// these three keys is how a rescan starts reporting on data admission never
+// these four keys is how a rescan starts reporting on data admission never
 // read.
 func OSVChecker(cfg *config.Config, adb *audit.DB) *policy.OSVChecker {
 	ck := policy.NewOSVChecker(adb)
@@ -294,6 +294,7 @@ func OSVChecker(cfg *config.Config, adb *audit.DB) *policy.OSVChecker {
 	ck.LocalDB = policy.SharedOSVDatabase(cfg.ResolveOSVDBDir())
 	ck.AllowAPIFallback = cfg.OSVAPIFallback
 	ck.MaxAge = cfg.ResolveOSVDBMaxAge()
+	ck.DefaultAptSuite = cfg.AptCodename
 	return ck
 }
 
