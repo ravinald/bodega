@@ -35,7 +35,7 @@ That defaults to this machine's hostname; --origin names another when the
 input was captured elsewhere.
 
 Sources per type:
-  apt     dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\n'
+  apt     dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\t${source:Package}\n'
           apt list --installed
   pypi    pip list --format=json
   npm     npm ls --global --json --depth=0
@@ -48,7 +48,7 @@ downloaded binary, so those are cataloged with 'bodega pkg create' or found by
 running the server with discover_mode set to "observe".
 
 Examples:
-  dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\n' | bodega pkg convert apt > catalog.json
+  dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\t${source:Package}\n' | bodega pkg convert apt > catalog.json
   apt list --installed | bodega pkg convert apt -o catalog.json
   pip list --format=json | bodega pkg convert pypi | bodega pkg import -
   bodega pkg convert apt installed.txt

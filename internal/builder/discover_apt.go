@@ -274,9 +274,14 @@ func FetchAptMetadata(pkgName string) *manifest.VersionEntry {
 //	 Python, the high-level, interactive object oriented language,
 //	 includes an extensive class library with lots of goodies.
 func parseAptShowOutput(output, pkgName string) *manifest.VersionEntry {
+	// apt prints Source: only when the source package differs from the binary
+	// one, so its absence in a stanza is the statement that the two are equal
+	// rather than a field nobody captured. Default accordingly, and the OSV
+	// gate reads a name this path confirmed rather than warning on it.
 	ve := &manifest.VersionEntry{
-		SourceName: pkgName,
-		Metadata:   make(map[string]string),
+		SourceName:    pkgName,
+		SourcePackage: pkgName,
+		Metadata:      make(map[string]string),
 	}
 
 	// Fields we promote to VersionEntry fields rather than Metadata.
@@ -321,6 +326,9 @@ func parseAptShowOutput(output, pkgName string) *manifest.VersionEntry {
 		switch key {
 		case "Version":
 			ve.Version = val
+		case "Source":
+			ve.SourcePackage = aptSourceName(val)
+			ve.Metadata[key] = val
 		case "Architecture":
 			ve.Platform = "linux/" + val
 			ve.Metadata[key] = val
@@ -451,6 +459,9 @@ func fillResolvedVersion(ctx context.Context, store *manifest.Store, pkgName str
 		if resolved.SourceName != "" {
 			merged.SourceName = resolved.SourceName
 		}
+		if resolved.SourcePackage != "" {
+			merged.SourcePackage = resolved.SourcePackage
+		}
 		if resolved.ArtifactSize > 0 {
 			merged.ArtifactSize = resolved.ArtifactSize
 		}
@@ -525,4 +536,16 @@ func DropVersionlessAptEntries(ctx context.Context, store *manifest.Store, pkgNa
 		return 0, err
 	}
 	return blank, nil
+}
+
+// aptSourceName strips the version a Source: field carries when the source
+// package was built at a version the binary does not share: dpkg writes
+// "expat (2.4.7-1)" in that case and the bare name otherwise. Advisories are
+// keyed on the name alone, so the parenthesized half is noise the OSV lookup
+// would query and miss on.
+func aptSourceName(val string) string {
+	if i := strings.IndexByte(val, '('); i > 0 {
+		val = val[:i]
+	}
+	return strings.TrimSpace(val)
 }

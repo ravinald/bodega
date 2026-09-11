@@ -111,6 +111,9 @@ func (c *OSVChecker) Rescan(ctx context.Context, pm *manifest.PackageManifest, v
 	}
 
 	ans := c.answerFor(ctx, lk, ve)
+	if reason := lk.emptyAnswerReason(ans.vulns); ans.err == nil && reason != "" {
+		return OSVRescanChange{Reason: reason}
+	}
 	if !ans.conclusive() {
 		reason := ans.degraded
 		if ans.err != nil {

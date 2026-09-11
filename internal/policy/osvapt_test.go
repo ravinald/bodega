@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/hostpkg"
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
@@ -23,7 +24,7 @@ func aptChecker(t *testing.T) *OSVChecker {
 
 func aptEntry(version, suite string) (*manifest.PackageManifest, *manifest.VersionEntry) {
 	return &manifest.PackageManifest{Name: "libexpat1", Type: manifest.TypeApt},
-		&manifest.VersionEntry{Version: version, SourceName: "expat", Suites: []string{suite}}
+		&manifest.VersionEntry{Version: version, SourcePackage: "expat", Suites: []string{suite}}
 }
 
 // TestOSVApt_BackportedRevisionReportsClean is the test this item exists for.
@@ -173,17 +174,17 @@ func TestOSVApt_UnanswerableEntryWarns(t *testing.T) {
 	}{
 		{
 			name: "suite with no OSV export",
-			ve:   manifest.VersionEntry{Version: "2.6.3-2", SourceName: "expat", Suites: []string{"plucky"}},
+			ve:   manifest.VersionEntry{Version: "2.6.3-2", SourcePackage: "expat", Suites: []string{"plucky"}},
 			want: "plucky",
 		},
 		{
 			name: "no suite at all",
-			ve:   manifest.VersionEntry{Version: "2.6.3-2", SourceName: "expat"},
+			ve:   manifest.VersionEntry{Version: "2.6.3-2", SourcePackage: "expat"},
 			want: "names no suite",
 		},
 		{
 			name: "no version",
-			ve:   manifest.VersionEntry{SourceName: "expat", Suites: []string{"jammy"}},
+			ve:   manifest.VersionEntry{SourcePackage: "expat", Suites: []string{"jammy"}},
 			want: "carries no version",
 		},
 	} {
@@ -211,9 +212,9 @@ func TestOSVApt_PartiallyMappedSuitesDoNotReadAsWhole(t *testing.T) {
 	ck := aptChecker(t)
 
 	ve := &manifest.VersionEntry{
-		Version:    "2.4.7-1ubuntu0.4",
-		SourceName: "expat",
-		Suites:     []string{"jammy", "plucky"},
+		Version:       "2.4.7-1ubuntu0.4",
+		SourcePackage: "expat",
+		Suites:        []string{"jammy", "plucky"},
 	}
 	r := ck.Check(context.Background(),
 		&manifest.PackageManifest{Name: "libexpat1", Type: manifest.TypeApt}, ve)
@@ -234,9 +235,9 @@ func TestOSVApt_MultipleSuitesUnionTheirRecords(t *testing.T) {
 	ck := aptChecker(t)
 
 	ve := &manifest.VersionEntry{
-		Version:    "2.4.7-1ubuntu0.2",
-		SourceName: "expat",
-		Suites:     []string{"jammy", "noble"},
+		Version:       "2.4.7-1ubuntu0.2",
+		SourcePackage: "expat",
+		Suites:        []string{"jammy", "noble"},
 	}
 	r := ck.Check(context.Background(),
 		&manifest.PackageManifest{Name: "libexpat1", Type: manifest.TypeApt}, ve)
@@ -358,9 +359,9 @@ func TestOSVApt_ProRecordsAnswerTheSameRelease(t *testing.T) {
 
 	pm := &manifest.PackageManifest{Name: "imagemagick-6.q16", Type: manifest.TypeApt}
 	ve := &manifest.VersionEntry{
-		Version:    "8:6.9.11.60+dfsg-1.3ubuntu0.22.04.3",
-		SourceName: "imagemagick",
-		Suites:     []string{"jammy"},
+		Version:       "8:6.9.11.60+dfsg-1.3ubuntu0.22.04.3",
+		SourcePackage: "imagemagick",
+		Suites:        []string{"jammy"},
 	}
 	r := ck.Check(context.Background(), pm, ve)
 	if r.Action != ActionBlock {
@@ -405,7 +406,7 @@ func TestOSVApt_FIPSRecordsAreNotFolded(t *testing.T) {
 	}
 
 	pm := &manifest.PackageManifest{Name: "libssl3", Type: manifest.TypeApt}
-	ve := &manifest.VersionEntry{Version: "3.0.2-0ubuntu1.16", SourceName: "openssl", Suites: []string{"jammy"}}
+	ve := &manifest.VersionEntry{Version: "3.0.2-0ubuntu1.16", SourcePackage: "openssl", Suites: []string{"jammy"}}
 	if r := ck.Check(context.Background(), pm, ve); r.Action != ActionPass {
 		t.Fatalf("3.0.2-0ubuntu1.16 carries the stock fix; the FIPS revisions are about a build this host does not run: %q %s", r.Action, r.Reason)
 	}
@@ -421,7 +422,7 @@ func TestOSVApt_NoSuitesFallsBackToDefault(t *testing.T) {
 	ck.DefaultAptSuite = "jammy"
 
 	pm := &manifest.PackageManifest{Name: "libexpat1", Type: manifest.TypeApt}
-	ve := &manifest.VersionEntry{Version: "2.4.7-1ubuntu0.2", SourceName: "expat"}
+	ve := &manifest.VersionEntry{Version: "2.4.7-1ubuntu0.2", SourcePackage: "expat"}
 	r := ck.Check(context.Background(), pm, ve)
 	if r.Action != ActionBlock {
 		t.Fatalf("an entry naming no suite is served under apt_codename and answered from it; got %q: %s", r.Action, r.Reason)
@@ -433,8 +434,107 @@ func TestOSVApt_NoSuitesFallsBackToDefault(t *testing.T) {
 	// A default OSV publishes nothing for is still unanswerable, and names the
 	// codename rather than leaving the operator to guess where it came from.
 	ck.DefaultAptSuite = "plucky"
-	ve = &manifest.VersionEntry{Version: "2.4.7-1ubuntu0.2", SourceName: "expat"}
+	ve = &manifest.VersionEntry{Version: "2.4.7-1ubuntu0.2", SourcePackage: "expat"}
 	if r := ck.Check(context.Background(), pm, ve); r.Action != ActionWarn || !strings.Contains(r.Reason, "plucky") {
 		t.Errorf("want a warn naming plucky, got %q: %s", r.Action, r.Reason)
+	}
+}
+
+// TestOSVApt_ImportedHostEntryQueriesItsSource drives requirement 2 through
+// the shape the tree actually produces.
+//
+// Every fixture above hand-writes the source package onto the entry, and no
+// importer in bodega ever did that: a catalog comes out of 'bodega pkg convert
+// apt', and jammy's own libexpat1 is two revisions behind two USNs. The gate
+// queries OSV's Ubuntu ecosystem, which is keyed on source packages alone, so
+// reading the binary name off the manifest returns nothing and dates it clean
+// — a false negative on roughly seven in ten packages a host reports, since 73
+// of the 101 installed in a stock ubuntu:22.04 container have a source name
+// their binary name does not equal.
+func TestOSVApt_ImportedHostEntryQueriesItsSource(t *testing.T) {
+	res, err := hostpkg.ParseApt(strings.NewReader(
+		"libexpat1\t2.4.7-1ubuntu0.2\tamd64\tinstall ok installed\texpat\n"))
+	if err != nil {
+		t.Fatalf("parse dpkg-query capture: %v", err)
+	}
+	if len(res.Packages) != 1 {
+		t.Fatalf("imported %d packages, want 1", len(res.Packages))
+	}
+	pm := res.Packages[0]
+	ve := pm.Versions[0]
+	if pm.Name != "libexpat1" || ve.SourcePackage != "expat" {
+		t.Fatalf("import recorded name=%q source_package=%q, want libexpat1 built from expat",
+			pm.Name, ve.SourcePackage)
+	}
+
+	ck := aptChecker(t)
+	ck.DefaultAptSuite = "jammy"
+	r := ck.Check(context.Background(), &pm, &ve)
+	if r.Action != ActionBlock {
+		t.Fatalf("a jammy libexpat1 two revisions behind USN-6694-1 and USN-7000-2 must not pass; got %q: %s",
+			r.Action, r.Reason)
+	}
+	if got, want := ve.Metadata[OSVMetaVulns], "USN-6694-1,USN-7000-2"; got != want {
+		t.Errorf("stamped %q, want %q", got, want)
+	}
+	if got, want := ve.Metadata[OSVMetaQueried], "source package expat in Ubuntu:22.04:LTS"; got != want {
+		t.Errorf("stamped %q, want %q", got, want)
+	}
+}
+
+// TestOSVApt_UnrecordedSourceDoesNotDateAClean covers the entry no capture can
+// fix: 'apt list --installed' prints no source name in any position, and every
+// catalog written before bodega asked dpkg for one carries the binary name
+// alone. An empty answer under that name means "patched" or "never in the
+// index" and nothing distinguishes them, so B34's rule applies and the gate
+// warns instead of stamping a date.
+//
+// A match settles the ambiguity on its own, which is what keeps the 28 of 101
+// packages whose source and binary names agree reporting normally rather than
+// warning wholesale.
+func TestOSVApt_UnrecordedSourceDoesNotDateAClean(t *testing.T) {
+	ck := aptChecker(t)
+	ck.DefaultAptSuite = "jammy"
+
+	res, err := hostpkg.ParseApt(strings.NewReader(
+		"libexpat1\t2.4.7-1ubuntu0.2\tamd64\tinstall ok installed\n"))
+	if err != nil {
+		t.Fatalf("parse four-field capture: %v", err)
+	}
+	pm := res.Packages[0]
+	ve := pm.Versions[0]
+	if ve.SourcePackage != "" {
+		t.Fatalf("a four-field capture records no source package, got %q", ve.SourcePackage)
+	}
+	r := ck.Check(context.Background(), &pm, &ve)
+	if r.Action != ActionWarn {
+		t.Fatalf("an empty answer under an unverified binary name is not a clean one; got %q: %s",
+			r.Action, r.Reason)
+	}
+	if !strings.Contains(r.Reason, "source:Package") {
+		t.Errorf("the warn has to name the capture that fixes it: %q", r.Reason)
+	}
+	if ve.Metadata[OSVMetaCheckedAt] != "" {
+		t.Errorf("nothing was answered, so nothing may be dated: %q", ve.Metadata[OSVMetaCheckedAt])
+	}
+
+	// Rescan reaches the same lookup and must reach the same verdict, or a
+	// nightly pass quietly re-dates what admission refused to.
+	ch := ck.Rescan(context.Background(), &pm, &ve)
+	if ch.Answered {
+		t.Errorf("rescan answered an entry admission could not: %+v", ch)
+	}
+	if !strings.Contains(ch.Reason, "source:Package") {
+		t.Errorf("rescan reason = %q", ch.Reason)
+	}
+
+	// A binary name that is also a source name answers on its own evidence.
+	pm = manifest.PackageManifest{Name: "expat", Type: manifest.TypeApt}
+	ve = manifest.VersionEntry{Version: "2.4.7-1ubuntu0.2", Suites: []string{"jammy"}}
+	if r := ck.Check(context.Background(), &pm, &ve); r.Action != ActionBlock {
+		t.Fatalf("expat under its own name matches its own advisories: %q %s", r.Action, r.Reason)
+	}
+	if got, want := ve.Metadata[OSVMetaQueried], "binary package expat in Ubuntu:22.04:LTS"; got != want {
+		t.Errorf("stamped %q, want %q", got, want)
 	}
 }

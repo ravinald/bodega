@@ -283,7 +283,7 @@ Converts a package manager's own report of what is installed into bodega manifes
 Run it on the host being cataloged. It reads stdin by default, writes JSON to stdout, and touches no manifest store, so the output can be read, diffed and edited before anything reaches bodega. Feed it to `bodega pkg import` when it looks right.
 
 ```bash
-dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\n' | bodega pkg convert apt > catalog.json
+dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\t${source:Package}\n' | bodega pkg convert apt > catalog.json
 apt list --installed | bodega pkg convert apt -o catalog.json
 pip list --format=json | bodega pkg convert pypi | bodega pkg import -
 bodega pkg convert apt --origin db01 db01-installed.txt
@@ -293,7 +293,7 @@ Every version entry is stamped with the host the inventory describes, under the 
 
 | Type | Source command |
 |------|----------------|
-| `apt` | `dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\n'`, or `apt list --installed` |
+| `apt` | `dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\t${source:Package}\n'`, or `apt list --installed` |
 | `pypi` | `pip list --format=json` |
 | `npm` | `npm ls --global --json --depth=0` |
 | `gomod` | `go list -m all`, or `go version -m <binary>` |
@@ -306,7 +306,8 @@ Prefer `dpkg-query` to `apt list --installed`: it is machine readable, it carrie
 
 #### What convert does and does not resolve
 
-- **apt** entries carry the name, the version and `source_name`, and no URL. The build pipeline resolves them with `apt-get download`, against the bodega server's own sources.
+- **apt** entries carry the name, the version, `source_name`, `source_package` and no URL. The build pipeline resolves them with `apt-get download`, against the bodega server's own sources.
+- **The source package is recorded from `${source:Package}`, and only from there.** `source_name` is the name `apt-get download` asks for and is always the binary name; `source_package` is what USN and DSA are issued against, and the OSV gate queries that one. The two differ on 73 of the 101 packages a stock `ubuntu:22.04` container installs (`libssl3` from `openssl`, `bsdutils` from `util-linux`), so a capture that drops the field leaves the gate unable to answer for most of the host: see [apt](#apt) under the OSV gate. `apt list --installed` prints the source name in no position at all, so a catalog captured that way can never carry one. A four-field capture taken before bodega asked still parses unchanged; re-capture with the fifth field to give the gate something to query.
 - **pypi, npm, gomod and cargo** entries carry a name and a version and import as `proxy`. The registry is already known from `pypi_upstream` and its siblings, so nothing else is needed. Flip an entry to `hosted` and run the pipeline to pre-fetch the artifact.
 - **helm** entries import with **no URL**. A helm release records the chart it came from (`nginx-18.2.4`) but not the repository, and bodega resolves helm upstreams per version. Fill the URLs in before importing, or resolve them with `helm search repo <chart> -o json`. Guessing a repository would put an unverified URL into a supply-chain catalog.
 - **cargo** crates installed from a git or path source are skipped: the registry has no such version to serve.
@@ -1301,7 +1302,13 @@ The suite on the version entry, never `apt_codename`. One catalog holds entries 
 
 The FIPS, Realtime and Nvidia-BlueField strings are not folded: the fold matches `Ubuntu:Pro:<rel>` as an exact pair, so `Ubuntu:Pro:FIPS-preview:22.04:LTS`, `Ubuntu:Pro:FIPS-updates:22.04:LTS`, `Ubuntu:Pro:Realtime:22.04:LTS` and `Ubuntu:Nvidia-BlueField:22.04:LTS` all fall outside it. Each carries revisions of a build the stock host never installed, so folding one in reports against a version that was never there: `UBUNTU-CVE-2022-40735` fixes jammy `openssl` at `3.0.2-0ubuntu1.16` and the FIPS build at `3.0.2-0ubuntu1.16+Fips1`, and a patched stock host sorts below the second.
 
-**The source package is queried.** Advisories are issued against the source package, and one source builds many binaries: `expat` builds `libexpat1`, `libexpat1-dev` and `expat` itself. `bodega pkg convert apt` records the source in `source_name`, and that is the name the gate queries; an entry recording none is queried under its binary name. The stamp says which was used either way, so a finding on `libexpat1` traces back to the `expat` advisory that produced it.
+**The source package is queried, and it is a different field from `source_name`.** Advisories are issued against the source package, and one source builds many binaries: `expat` builds `libexpat1`, `libexpat1-dev` and `expat` itself. OSV's `Ubuntu` and `Debian` ecosystems are keyed on the source alone, so a lookup for `libexpat1` returns nothing at all while `expat` returns 51 records. The gate reads `source_package`, which `bodega pkg convert apt` fills from dpkg's `${source:Package}` and the builder fills from `apt show`'s `Source:` line. `source_name` is not that field and never was: every importer sets it to the binary name, because `apt-get download` needs the binary name to resolve a `.deb`.
+
+**An entry recording no source package is queried under its binary name, and an empty answer from that query warns rather than passing.** The two cases are indistinguishable from the string alone: `libssl3` matching nothing and a patched `bash` matching nothing look the same. A match is self-validating, so the 28 of 101 packages whose source and binary names agree still report normally; only the empty answer is ambiguous, and B34's rule applies to it. The stamp says which name was used either way, so a finding on `libexpat1` traces back to the `expat` advisory that produced it.
+
+```
+apt/libssl3: 3.0.2-0ubuntu1.26: osv: apt entry libssl3 was queried under its binary name in Ubuntu:22.04:LTS and matched nothing, but Ubuntu and Debian advisories are issued against the source package, so an empty answer here is not a clean one; re-capture the host with dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\t${source:Package}\n' and re-import, or set source_package on the version entry
+```
 
 **Versions compare under dpkg's ordering, revision included.** Epoch, upstream version and revision compare separately, `~` sorts below the end of the string, and leading zeros carry no weight, so `3.0.2-0ubuntu1.15` is newer than `3.0.2-0ubuntu1.2`. semver gets `2.5.0-1+deb12u1` wrong in the expensive direction: it reads `+deb12u1` as build metadata and discards it, so an unpatched `2.5.0-1` compares equal to the revision carrying the fix and reports clean.
 
@@ -1614,7 +1621,7 @@ Generated 3 package manifests (4 version entries) to stdout. Nothing was written
 ```bash
 # 1. Read each host's own inventory. This is the bulk of any catalog and it is
 #    complete on the first run — no waiting, no traffic required.
-dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\n' | bodega pkg convert apt > apt.json
+dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\t${source:Package}\n' | bodega pkg convert apt > apt.json
 pip list --format=json | bodega pkg convert pypi > pypi.json
 bodega pkg import apt.json pypi.json
 
@@ -2141,6 +2148,7 @@ Every key but `platform` is omitted when empty, so an entry stamped on a host wi
 {
   "version": "2.4.2",
   "source_name": "amazon-efs-utils",
+  "source_package": "amazon-efs-utils",
   "url": "https://github.com/aws/efs-utils.git",
   "build_cmd": "make deb",
   "deb_glob": "build/*.deb",
@@ -2148,7 +2156,8 @@ Every key but `platform` is omitted when empty, so an entry stamped on a host wi
 }
 ```
 
-- **source_name**: upstream Debian package / source directory name
+- **source_name**: upstream Debian package / source directory name. This is what `apt-get download` and a source build ask for, so it is the binary package name on every imported entry.
+- **source_package**: the Debian source package this binary was built from, as `dpkg-query -W -f='${source:Package}'` reports it. Read by the OSV gate and by nothing else, because USN and DSA are keyed on it. Absent means no capture recorded one, which is not the same as equal to the name: see [apt](#apt) under the OSV gate for what the gate does with the difference.
 - **build_cmd**: shell command to produce .deb
 - **deb_glob**: path glob to locate produced .deb
 - **suites**: apt suites this .deb is published to. Absent means the server's default suite (`apt_codename`). A suite name may not contain `/`. The pool is flat and shared, so one entry listed in two suites is one `.deb` served under both `dists/` trees.

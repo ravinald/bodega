@@ -131,6 +131,19 @@ type VersionEntry struct {
 	// Defaults to the package Name when absent.
 	SourceName string `json:"source_name,omitempty"`
 
+	// SourcePackage is the Debian source package this binary was built from,
+	// as dpkg reports it in ${source:Package}.
+	//
+	// Separate from SourceName, which every importer fills with the name apt
+	// downloads under and 'apt-get download' needs to stay the binary name.
+	// This one is what USN and DSA are issued against: one source builds many
+	// binaries, and OSV's Ubuntu and Debian ecosystems are keyed on the source
+	// alone, so a lookup under "libexpat1" matches nothing while "expat"
+	// answers. Empty means no capture recorded it, which is not the same as
+	// "equal to the binary name": the OSV gate warns rather than reading an
+	// empty answer as clean. See policy.osvLookupFor.
+	SourcePackage string `json:"source_package,omitempty"`
+
 	// BuildCmd is the shell command executed inside the cloned source directory
 	// to produce a .deb file.
 	BuildCmd string `json:"build_cmd,omitempty"`

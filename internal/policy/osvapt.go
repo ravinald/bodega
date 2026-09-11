@@ -130,6 +130,9 @@ type osvLookup struct {
 	// note qualifies a partial answer: a suite with no OSV export sitting
 	// beside suites that have one.
 	note string
+	// unverifiedName marks an apt lookup made under the binary package name
+	// because nothing recorded the source. See emptyAnswerReason.
+	unverifiedName string
 	// reason means nothing could be queried at all.
 	reason string
 }
@@ -162,7 +165,7 @@ func osvLookupFor(pm *manifest.PackageManifest, ve *manifest.VersionEntry, defau
 		return osvLookup{targets: []osvTarget{{ecosystem: eco, name: pm.Name}}}
 	}
 
-	name, kind := ve.SourceName, "source package"
+	name, kind := ve.SourcePackage, "source package"
 	if name == "" {
 		name, kind = pm.Name, "binary package"
 	}
@@ -174,6 +177,9 @@ func osvLookupFor(pm *manifest.PackageManifest, ve *manifest.VersionEntry, defau
 	out := osvLookup{
 		queried: fmt.Sprintf("%s %s in %s", kind, name, strings.Join(exports, ", ")),
 	}
+	if ve.SourcePackage == "" {
+		out.unverifiedName = aptUnverifiedNameReason(pm.Name, exports)
+	}
 	for _, eco := range exports {
 		out.targets = append(out.targets, osvTarget{ecosystem: eco, name: name})
 	}
@@ -182,6 +188,25 @@ func osvLookupFor(pm *manifest.PackageManifest, ve *manifest.VersionEntry, defau
 			strings.Join(unmapped, ", "))
 	}
 	return out
+}
+
+// aptUnverifiedNameReason is the warn an empty answer under a binary package
+// name earns, and it has to name the capture that would fix it: an operator
+// told only that the gate could not answer has nowhere to go.
+//
+// OSV's Ubuntu and Debian ecosystems are keyed on the source package alone, so
+// "libexpat1" matches nothing there whether the host is patched or not. Of the
+// 101 packages installed in a stock ubuntu:22.04 container, 73 have a source
+// name the binary name does not equal; the other 28 answer correctly under
+// either. A match therefore settles it: the name that returned records is a
+// source package, and only the empty answer is ambiguous.
+func aptUnverifiedNameReason(name string, exports []string) string {
+	return fmt.Sprintf("apt entry %s was queried under its binary name in %s and matched nothing, "+
+		"but Ubuntu and Debian advisories are issued against the source package, "+
+		"so an empty answer here is not a clean one; re-capture the host with "+
+		"dpkg-query -W -f='${Package}\\t${Version}\\t${Architecture}\\t${Status}\\t${source:Package}\\n' "+
+		"and re-import, or set source_package on the version entry",
+		name, strings.Join(exports, ", "))
 }
 
 // aptUnmappedReason says which suite stopped the lookup, and what to do about
@@ -196,4 +221,20 @@ func aptUnmappedReason(name string, suites, unmapped []string) string {
 	}
 	return fmt.Sprintf("apt entry %s names suite(s) %s, which OSV publishes no Ubuntu or Debian export for",
 		name, strings.Join(unmapped, ", "))
+}
+
+// emptyAnswerReason names why an empty result cannot be read as clean, or ""
+// when it can.
+//
+// B34's rule, applied to the one case the lookup itself cannot rule out: a
+// binary package name queried against a source-keyed ecosystem answers empty
+// for a patched host and for a name that was never in the index, and nothing
+// in the answer tells the two apart. A non-empty answer is self-validating and
+// needs no warn, which is what keeps the packages whose source and binary
+// names agree reporting normally.
+func (lk osvLookup) emptyAnswerReason(vulns []osvVuln) string {
+	if len(vulns) > 0 {
+		return ""
+	}
+	return lk.unverifiedName
 }

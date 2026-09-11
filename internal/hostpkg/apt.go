@@ -29,6 +29,10 @@ type AptRow struct {
 	Name    string
 	Version string
 	Arch    string
+	// Source is the Debian source package, from dpkg's ${source:Package}.
+	// Empty when the capture did not ask for it, which is every capture taken
+	// from 'apt list --installed' and every one taken before bodega asked.
+	Source string
 }
 
 // AptInventory is one host's installed apt packages and what was dropped
@@ -51,7 +55,9 @@ func ParseApt(r io.Reader) (Result, error) {
 	}
 	res := Result{Warnings: inv.Warnings}
 	for _, row := range inv.Rows {
-		res.Packages = append(res.Packages, pkg(manifest.TypeApt, row.Name, row.Version, "", ""))
+		pm := pkg(manifest.TypeApt, row.Name, row.Version, "", "")
+		pm.Versions[0].SourcePackage = row.Source
+		res.Packages = append(res.Packages, pm)
 	}
 	sortPackages(res.Packages)
 	return res, nil
@@ -77,7 +83,14 @@ func ParseAptRows(r io.Reader) (AptInventory, error) {
 
 // parseDpkgQuery reads the tab-separated form:
 //
-//	name<TAB>version<TAB>arch<TAB>status
+//	name<TAB>version<TAB>arch<TAB>status[<TAB>source]
+//
+// The source package is last on purpose. dpkg's own field order would put
+// ${source:Package} second, and that capture parses with no error and drops
+// every row on the host: f[3] is then the architecture, which is not
+// dpkgInstalled, so each row counts as present-but-not-installed and the
+// operator gets a count with nothing to compare it against. Appending keeps
+// the four-field capture taken before this field existed reading unchanged.
 func parseDpkgQuery(text string) (AptInventory, error) {
 	var res AptInventory
 	skipped := 0
@@ -90,10 +103,14 @@ func parseDpkgQuery(text string) (AptInventory, error) {
 		}
 		f := strings.Split(line, "\t")
 		if len(f) < 4 {
-			return AptInventory{}, fmt.Errorf("dpkg-query line has %d fields, want 4: %q\n"+
-				"expected the format bodega asks for: dpkg-query -W -f='${Package}\\t${Version}\\t${Architecture}\\t${Status}\\n'", len(f), line)
+			return AptInventory{}, fmt.Errorf("dpkg-query line has %d fields, want at least 4: %q\n"+
+				"expected the format bodega asks for: dpkg-query -W -f='${Package}\\t${Version}\\t${Architecture}\\t${Status}\\t${source:Package}\\n'", len(f), line)
 		}
 		name, version, arch, status := f[0], f[1], f[2], f[3]
+		var source string
+		if len(f) > 4 {
+			source = strings.TrimSpace(f[4])
+		}
 		if status != dpkgInstalled {
 			skipped++
 			continue
@@ -101,7 +118,7 @@ func parseDpkgQuery(text string) (AptInventory, error) {
 		if name == "" || version == "" {
 			continue
 		}
-		res.Rows = append(res.Rows, AptRow{Name: name, Version: version, Arch: arch})
+		res.Rows = append(res.Rows, AptRow{Name: name, Version: version, Arch: arch, Source: source})
 	}
 	if err := sc.Err(); err != nil {
 		return AptInventory{}, fmt.Errorf("scan dpkg-query output: %w", err)

@@ -28,7 +28,11 @@
           },
           "source_name": {
             "type": "string",
-            "description": "Upstream package or directory name. Defaults to name when absent."
+            "description": "Upstream package or directory name. Defaults to name when absent. This is the name 'apt-get download' asks for, so it is the binary package name."
+          },
+          "source_package": {
+            "type": "string",
+            "description": "Debian source package this binary was built from, as dpkg reports it in ${source:Package}. Read by the OSV gate, because Ubuntu and Debian advisories are issued against the source. Absent means no capture recorded one, which is not the same as equal to name."
           },
           "url": {
             "type": "string",

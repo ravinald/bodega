@@ -148,6 +148,9 @@ func (c *OSVChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 		if !ans.conclusive() {
 			return Result{Check: "osv", Action: ActionWarn, Reason: ans.degraded}
 		}
+		if reason := lk.emptyAnswerReason(vulns); reason != "" {
+			return Result{Check: "osv", Action: ActionWarn, Reason: reason}
+		}
 		// Dating a clean result is what stops it reading, a year later, like
 		// a version nobody ever looked at.
 		stampOSV(ve, nil, c.now(), lk.queried)
