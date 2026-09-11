@@ -378,15 +378,46 @@ func (s *Server) resolvePypiWheel(ctx context.Context, normalized, filename stri
 		errUpstreamNotFound, indexURL, listed, filename)
 }
 
-// wheelIdentity splits a wheel filename into its distribution and version.
-// PEP 427 fixes the first two hyphen-separated fields, so this is exact for a
-// conforming name and yields an empty version for anything else, which routes
-// by type instead of guessing.
+// pypiSdistSuffixes are the archive extensions pypi publishes source
+// distributions under. setuptools writes .tar.gz, .zip on Windows, and the
+// other two survive in the older half of the index.
+var pypiSdistSuffixes = []string{".tar.gz", ".tar.bz2", ".tar.xz", ".zip", ".tgz"}
+
+// wheelIdentity splits a distribution filename into its project and version.
+// It yields an empty version for a name it cannot place, which every caller
+// reads as "decide this on membership alone" rather than as a version to hold
+// to a constraint.
+//
+// A wheel is exact: PEP 427 fixes the first two hyphen-separated fields. An
+// sdist is not, because the project name may carry hyphens of its own
+// (PEP 625 normalizes them to underscores, and the files predating it are
+// still on the index), so the split is the first hyphen that begins a version.
+// Reading an sdist as a wheel is what refused django-5.0.0.tar.gz at the pin
+// that named 5.0.0: the version came back as "5.0.0.tar.gz", which matches no
+// constraint an operator can write.
 func wheelIdentity(filename string) (dist, version string) {
+	for _, ext := range pypiSdistSuffixes {
+		if base, ok := strings.CutSuffix(filename, ext); ok {
+			return sdistIdentity(base, filename)
+		}
+	}
 	base := strings.TrimSuffix(filename, ".whl")
 	parts := strings.Split(base, "-")
 	if len(parts) < 2 {
 		return wheelDistName(filename), ""
 	}
 	return parts[0], parts[1]
+}
+
+// sdistIdentity splits {name}-{version} at the first hyphen whose remainder
+// opens with a digit. That places backports-abc-0.5 as backports-abc at 0.5
+// and foo-1.0-beta1 as foo at 1.0-beta1. A last-hyphen split misplaces the
+// second, a first-hyphen split misplaces the first.
+func sdistIdentity(base, filename string) (dist, version string) {
+	for i := 1; i < len(base)-1; i++ {
+		if base[i] == '-' && base[i+1] >= '0' && base[i+1] <= '9' {
+			return base[:i], base[i+1:]
+		}
+	}
+	return wheelDistName(filename), ""
 }

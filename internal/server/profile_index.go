@@ -84,10 +84,15 @@ var pypiAnchorElementPattern = regexp.MustCompile(`(?s)<a\s[^>]*>.*?</a>`)
 // 503 per-distribution index.
 //
 // The version comes off the filename through wheelIdentity, which is the same
-// parse the wheel route makes when the client comes back for the file. A file
-// whose name yields no version is kept: an sdist or a wheel bodega could not
-// place is not a version the profile refused, and refusing what could not be
-// read would hide artifacts on the strength of a filename shape.
+// parse the wheel route makes when the client comes back for the file. The two
+// have to agree: they are the index and the artifact for one file, so a page
+// that lists what the route then refuses is the mid-install 403 this filter
+// exists to prevent, and a page that hides what the route would serve loses a
+// release nobody decided against.
+//
+// A file whose name yields no version is kept. What could not be read is not a
+// version the profile refused, and dropping it would hide an artifact on the
+// strength of a filename shape.
 func filterPypiSimplePage(body []byte, permit func(string) bool) []byte {
 	if permit == nil {
 		return body
@@ -228,6 +233,15 @@ func filterHelmIndex(body []byte, covers func(chart string) bool, permit func(ch
 			}
 			continue
 		}
+		// A key at the left margin ends the entries block. `helm repo index`
+		// writes generated: there, and read as release content it is emitted
+		// or dropped with whichever chart happened to come last.
+		if line != "" && !strings.HasPrefix(line, " ") {
+			flushGroup()
+			inEntries = false
+			out = append(out, line)
+			continue
+		}
 		if m := helmChartKeyPattern.FindStringSubmatch(line); m != nil {
 			flushGroup()
 			chart = strings.TrimSpace(m[1])
@@ -248,7 +262,7 @@ func filterHelmIndex(body []byte, covers func(chart string) bool, permit func(ch
 	}
 	flushGroup()
 
-	return []byte(strings.Join(out, "\n") + "\n")
+	return []byte(strings.TrimRight(strings.Join(out, "\n"), "\n") + "\n")
 }
 
 // indexFilterWriter buffers a proxied index so a profile filter runs over the

@@ -351,6 +351,89 @@ func TestProfileFiltersThePypiDistributionPage(t *testing.T) {
 	}
 }
 
+// A source distribution of the pinned version is the pinned version. Reading
+// it as a wheel left the archive suffix on the version ("5.0.0.tar.gz"), which
+// matches no constraint an operator can write, so the pin refused the file it
+// was written to allow — and for a distribution publishing no wheel that is
+// every file on the page.
+//
+// The page and the artifact are asserted together because they are the index
+// and the route for one file: either one disagreeing is a client told one
+// thing and served another.
+func TestProfilePermitsTheSdistOfThePinnedVersion(t *testing.T) {
+	s := proxyingServer(t)
+	up := newRecordingUpstream(t)
+	const sdist = "django-5.0.0.tar.gz"
+	up.route("/simple/django/", fmt.Sprintf(
+		`<!DOCTYPE html><html><body>`+
+			`<a href="%[1]s/files/django-5.0.0-py3-none-any.whl">django-5.0.0-py3-none-any.whl</a><br/>`+
+			`<a href="%[1]s/files/django-5.0.0.tar.gz">django-5.0.0.tar.gz</a><br/>`+
+			`<a href="%[1]s/files/django-6.0.0.tar.gz">django-6.0.0.tar.gz</a><br/>`+
+			`</body></html>`, up.ts.URL))
+	up.route("/files/"+sdist, "sdist bytes")
+	s.cfg.PypiUpstream = up.ts.URL
+	if err := s.store.SavePackage(t.Context(), &manifest.PackageManifest{
+		ConfigVersion: manifest.CurrentConfigVersion,
+		Name:          "django",
+		Type:          manifest.TypePypi,
+		Versions:      []manifest.VersionEntry{{Version: "5.0.0", URL: up.ts.URL, Mode: manifest.ModeProxy}},
+	}); err != nil {
+		t.Fatalf("seed the django manifest: %v", err)
+	}
+
+	f := bindProfile(t, s, "pinned", "pinned01",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypePypi, audit.VersionPinned, audit.ExpansionBlock)},
+		[]audit.ProfileEntry{{
+			Type: manifest.TypePypi, Name: "django",
+			Constraint: manifest.ConstraintExact, Version: "5.0.0",
+		}})
+
+	status, body := f.get(t, "/pypi/simple/django/")
+	if status != http.StatusOK {
+		t.Fatalf("the distribution page answered %d: %s", status, body)
+	}
+	if !strings.Contains(body, sdist) {
+		t.Errorf("the page dropped the sdist of the pinned version:\n%s", body)
+	}
+	if strings.Contains(body, "django-6.0.0.tar.gz") {
+		t.Errorf("the page lists an sdist the pin refuses:\n%s", body)
+	}
+
+	if status, body := f.get(t, "/pypi/wheels/"+sdist); status != http.StatusOK {
+		t.Fatalf("the sdist of the pinned version answered %d, want 200: %s", status, body)
+	}
+	status, body = f.get(t, "/pypi/wheels/django-6.0.0.tar.gz")
+	if status != http.StatusForbidden {
+		t.Fatalf("an sdist outside the pin answered %d, want 403: %s", status, body)
+	}
+	if !strings.Contains(body, "constraint") {
+		t.Errorf("the refusal does not name the rule:\n%s", body)
+	}
+}
+
+// The parse the page filter and the artifact route share. A version that comes
+// back carrying an archive suffix is compared to a constraint that can never
+// match it, so every row here is a refusal or a hidden file when it is wrong.
+func TestWheelIdentityPlacesSdistsAndWheels(t *testing.T) {
+	for _, tc := range []struct{ file, dist, version string }{
+		{"django-5.0.0-py3-none-any.whl", "django", "5.0.0"},
+		{"django-5.0.0.tar.gz", "django", "5.0.0"},
+		{"django-5.0.0.zip", "django", "5.0.0"},
+		// PEP 625 normalizes the hyphens out of a project name; the files that
+		// predate it are still on the index.
+		{"backports-abc-0.5.tar.gz", "backports-abc", "0.5"},
+		{"foo-1.0-beta1.tar.bz2", "foo", "1.0-beta1"},
+		// Nothing to place: decided on membership alone rather than against a
+		// version this could only have guessed at.
+		{"django.tar.gz", "django.tar.gz", ""},
+	} {
+		dist, version := wheelIdentity(tc.file)
+		if dist != tc.dist || version != tc.version {
+			t.Errorf("wheelIdentity(%q) = %q, %q; want %q, %q", tc.file, dist, version, tc.dist, tc.version)
+		}
+	}
+}
+
 const npmProfilePackument = `{
   "name": "left-pad",
   "dist-tags": {"latest": "1.3.0"},
@@ -469,6 +552,7 @@ entries:
     version: 19.0.0
     urls:
     - charts/redis-19.0.0.tgz
+generated: "2026-01-01T00:00:00Z"
 `
 
 func TestProfileFiltersTheHelmIndex(t *testing.T) {
@@ -497,6 +581,12 @@ func TestProfileFiltersTheHelmIndex(t *testing.T) {
 	}
 	if !strings.Contains(body, "apiVersion: v1") {
 		t.Errorf("the filter ate the document header:\n%s", body)
+	}
+	// `helm repo index` writes generated: after the entries block, where a
+	// filter reading every line inside entries as release content drops it
+	// with whichever chart came last.
+	if !strings.Contains(body, "generated:") {
+		t.Errorf("the filter ate a top-level key following the entries block:\n%s", body)
 	}
 }
 
@@ -595,6 +685,9 @@ func TestHelmIndexIsNotRefusedByAProfile(t *testing.T) {
 		if strings.Contains(body, gone) {
 			t.Errorf("the index lists %s, which the closed set does not carry:\n%s", gone, body)
 		}
+	}
+	if !strings.Contains(body, "generated:") {
+		t.Errorf("the filter ate a top-level key following the entries block:\n%s", body)
 	}
 	// The refusal an operator meets is the pull, and that one names the repair.
 	status, body = f.get(t, "/helm/charts/cert-manager-1.14.0.tgz")
