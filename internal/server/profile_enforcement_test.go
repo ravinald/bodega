@@ -1093,3 +1093,89 @@ func TestProfileRefusesAnUnplaceableWheelFilename(t *testing.T) {
 		t.Errorf("the refusal does not name the membership rule:\n%s", body)
 	}
 }
+
+// helmAnnotatedIndex is the shape `helm repo index` writes for a chart
+// carrying Artifact Hub annotations. sigs.k8s.io/yaml sorts mapping keys, so
+// annotations opens the release and the opening line is a key with no value
+// on it, which is also the shape of a chart key.
+const helmAnnotatedIndex = `apiVersion: v1
+entries:
+  cert-manager:
+  - annotations:
+      artifacthub.io/category: security
+      artifacthub.io/license: Apache-2.0
+    apiVersion: v1
+    name: cert-manager
+    version: 1.14.0
+    urls:
+    - charts/cert-manager-1.14.0.tgz
+  - annotations:
+      artifacthub.io/category: security
+    apiVersion: v1
+    name: cert-manager
+    version: 1.15.0
+    urls:
+    - charts/cert-manager-1.15.0.tgz
+  redis:
+  - annotations:
+      artifacthub.io/category: database
+    name: redis
+    version: 19.0.0
+    urls:
+    - charts/redis-19.0.0.tgz
+generated: "2026-01-01T00:00:00Z"
+`
+
+func TestProfileFiltersAHelmIndexWhoseReleasesOpenOnAMapping(t *testing.T) {
+	s := proxyingServer(t)
+	seed(t, s, manifest.TypeHelm, map[string]string{manifest.HelmIndexKey: helmAnnotatedIndex})
+
+	f := bindProfile(t, s, "web", "web01",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypeHelm, audit.VersionPinned, audit.ExpansionBlock)},
+		[]audit.ProfileEntry{{
+			Type: manifest.TypeHelm, Name: "cert-manager",
+			Constraint: manifest.ConstraintExact, Version: "1.14.0",
+		}})
+
+	status, body := f.get(t, "/helm/index.yaml")
+	if status != http.StatusOK {
+		t.Fatalf("the chart index answered %d: %s", status, body)
+	}
+	// The chart key, not the name field of a release: reading the release's
+	// opening line as a chart key drops this one and every release under it,
+	// which leaves helm an empty entries map and the operator the wrong
+	// repair.
+	if !strings.Contains(body, "\n  cert-manager:\n") {
+		t.Errorf("the filter dropped the chart key of a covered chart:\n%s", body)
+	}
+	if !strings.Contains(body, "version: 1.14.0") {
+		t.Errorf("the index dropped the pinned release:\n%s", body)
+	}
+	if !strings.Contains(body, "artifacthub.io/license") {
+		t.Errorf("the kept release lost the fields under its opening key:\n%s", body)
+	}
+	if strings.Contains(body, "version: 1.15.0") {
+		t.Errorf("the index lists a release the pin refuses:\n%s", body)
+	}
+	if strings.Contains(body, "redis") {
+		t.Errorf("the index lists a chart outside the closed set:\n%s", body)
+	}
+}
+
+// The comment on filterHelmIndex promises a document it does not recognize
+// comes back as it went in. That only holds if a profile refusing nothing is
+// also a no-op, which is the case a Contains assertion on a filtered body
+// cannot see: it passes just as well against a reordered document.
+func TestHelmIndexFilterLeavesAPermittedDocumentByteForByte(t *testing.T) {
+	for name, in := range map[string]string{
+		"annotated": helmAnnotatedIndex,
+		"plain":     helmProfileIndex,
+	} {
+		t.Run(name, func(t *testing.T) {
+			out := filterHelmIndex([]byte(in), func(string) bool { return true }, nil)
+			if string(out) != in {
+				t.Errorf("a filter refusing nothing rewrote the document (%d -> %d bytes):\n%s", len(in), len(out), out)
+			}
+		})
+	}
+}

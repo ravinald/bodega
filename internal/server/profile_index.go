@@ -244,17 +244,23 @@ func filterHelmIndex(body []byte, covers func(chart string) bool, permit func(ch
 			out = append(out, line)
 			continue
 		}
+		// The release check comes first because a release whose opening
+		// field is a value-less mapping key ("  - annotations:") also
+		// satisfies the chart-key pattern. `helm repo index` marshals through
+		// sigs.k8s.io/yaml, which sorts keys, so every chart carrying Artifact
+		// Hub annotations opens exactly that way and the other order read the
+		// whole index as one empty chart.
+		if strings.HasPrefix(line, "  - ") {
+			flushBlock()
+			block = append(block, line)
+			continue
+		}
 		if m := helmChartKeyPattern.FindStringSubmatch(line); m != nil {
 			flushGroup()
 			chart = strings.TrimSpace(m[1])
 			if covers(chart) {
 				keyLine = line
 			}
-			continue
-		}
-		if strings.HasPrefix(line, "  - ") {
-			flushBlock()
-			block = append(block, line)
 			continue
 		}
 		if strings.TrimSpace(line) == "" {
