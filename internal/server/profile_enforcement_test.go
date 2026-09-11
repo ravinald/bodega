@@ -423,6 +423,13 @@ func TestWheelIdentityPlacesSdistsAndWheels(t *testing.T) {
 		// predate it are still on the index.
 		{"backports-abc-0.5.tar.gz", "backports-abc", "0.5"},
 		{"foo-1.0-beta1.tar.bz2", "foo", "1.0-beta1"},
+		// A hyphen followed by a digit is not a version: python-3parclient is
+		// one package on pypi and 3parclient-4.2.10 is no version of another.
+		{"python-3parclient-4.2.10.tar.gz", "python-3parclient", "4.2.10"},
+		// The same rule read right to left, which is what keeps the numeric
+		// tail of a project name out of the version.
+		{"sphinxcontrib-2048-0.1.tar.gz", "sphinxcontrib-2048", "0.1"},
+		{"py2neo-2021.2.3.tar.gz", "py2neo", "2021.2.3"},
 		// Nothing to place: decided on membership alone rather than against a
 		// version this could only have guessed at.
 		{"django.tar.gz", "django.tar.gz", ""},
@@ -908,4 +915,83 @@ func TestProfileEnforcedRoutesKeepASharedCacheOut(t *testing.T) {
 			}
 		}
 	})
+}
+
+// A project whose name carries a hyphen followed by a digit, which the split
+// used to read as a version. All three assertions fail the same way when it
+// does: the profile decides about a package nobody named.
+func TestProfileDecidesAboutTheWholeHyphenatedName(t *testing.T) {
+	const sdist = "python-3parclient-4.2.10.tar.gz"
+
+	listed := proxyingServer(t)
+	seed(t, listed, manifest.TypePypi, map[string]string{"pypi/wheels/" + sdist: "sdist bytes"})
+	f := bindProfile(t, listed, "ops", "ops01",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypePypi, audit.VersionFloating, audit.ExpansionBlock)},
+		[]audit.ProfileEntry{{
+			Type: manifest.TypePypi, Name: "python-3parclient",
+			Constraint: manifest.ConstraintAny,
+		}})
+	if status, body := f.get(t, "/pypi/wheels/"+sdist); status != http.StatusOK {
+		t.Fatalf("the listed package answered %d, want 200: %s", status, body)
+	}
+
+	// The other direction, and the one that matters more: an entry for
+	// "python" entitles a host to python, not to every project whose name
+	// starts with it.
+	prefix := proxyingServer(t)
+	seed(t, prefix, manifest.TypePypi, map[string]string{"pypi/wheels/" + sdist: "sdist bytes"})
+	g := bindProfile(t, prefix, "ops", "ops01",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypePypi, audit.VersionFloating, audit.ExpansionBlock)},
+		[]audit.ProfileEntry{{
+			Type: manifest.TypePypi, Name: "python",
+			Constraint: manifest.ConstraintAny,
+		}})
+	status, body := g.get(t, "/pypi/wheels/"+sdist)
+	if status != http.StatusForbidden {
+		t.Fatalf("a package the profile does not list answered %d, want 403: %s", status, body)
+	}
+	if !strings.Contains(body, "pypi/python-3parclient") {
+		t.Errorf("the refusal names a package the operator did not request:\n%s", body)
+	}
+}
+
+// The index half of the same name. The page knows which distribution it is
+// for, so it places the version by stripping that name; guessing dropped every
+// anchor and left pip reporting no matching distribution.
+func TestProfileKeepsThePinnedSdistOfAHyphenatedName(t *testing.T) {
+	s := proxyingServer(t)
+	up := newRecordingUpstream(t)
+	const sdist = "python-3parclient-4.2.10.tar.gz"
+	up.route("/simple/python-3parclient/", fmt.Sprintf(
+		`<!DOCTYPE html><html><body>`+
+			`<a href="%[1]s/files/python-3parclient-4.2.10.tar.gz">python-3parclient-4.2.10.tar.gz</a><br/>`+
+			`<a href="%[1]s/files/python-3parclient-4.2.11.tar.gz">python-3parclient-4.2.11.tar.gz</a><br/>`+
+			`</body></html>`, up.ts.URL))
+	s.cfg.PypiUpstream = up.ts.URL
+	if err := s.store.SavePackage(t.Context(), &manifest.PackageManifest{
+		ConfigVersion: manifest.CurrentConfigVersion,
+		Name:          "python-3parclient",
+		Type:          manifest.TypePypi,
+		Versions:      []manifest.VersionEntry{{Version: "4.2.10", URL: up.ts.URL, Mode: manifest.ModeProxy}},
+	}); err != nil {
+		t.Fatalf("seed the python-3parclient manifest: %v", err)
+	}
+
+	f := bindProfile(t, s, "pinned", "pinned01",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypePypi, audit.VersionPinned, audit.ExpansionBlock)},
+		[]audit.ProfileEntry{{
+			Type: manifest.TypePypi, Name: "python-3parclient",
+			Constraint: manifest.ConstraintExact, Version: "4.2.10",
+		}})
+
+	status, body := f.get(t, "/pypi/simple/python-3parclient/")
+	if status != http.StatusOK {
+		t.Fatalf("the distribution page answered %d: %s", status, body)
+	}
+	if !strings.Contains(body, sdist) {
+		t.Errorf("the page dropped the sdist of the pinned version:\n%s", body)
+	}
+	if strings.Contains(body, "python-3parclient-4.2.11.tar.gz") {
+		t.Errorf("the page lists a version the pin refuses:\n%s", body)
+	}
 }

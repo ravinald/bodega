@@ -83,17 +83,19 @@ var pypiAnchorElementPattern = regexp.MustCompile(`(?s)<a\s[^>]*>.*?</a>`)
 // filterPypiSimplePage drops the files a profile does not permit from a PEP
 // 503 per-distribution index.
 //
-// The version comes off the filename through wheelIdentity, which is the same
-// parse the wheel route makes when the client comes back for the file. The two
-// have to agree: they are the index and the artifact for one file, so a page
-// that lists what the route then refuses is the mid-install 403 this filter
-// exists to prevent, and a page that hides what the route would serve loses a
-// release nobody decided against.
+// The version comes off the filename through pypiPageVersion, which strips
+// the page's own distribution name rather than guessing where the name ends.
+// The wheel route makes the looser parse when the client comes back for the
+// file, because a URL is all it has. The two have to agree on every name
+// either can place: they are the index and the artifact for one file, so a
+// page that lists what the route then refuses is the mid-install 403 this
+// filter exists to prevent, and a page that hides what the route would serve
+// loses a release nobody decided against.
 //
 // A file whose name yields no version is kept. What could not be read is not a
 // version the profile refused, and dropping it would hide an artifact on the
 // strength of a filename shape.
-func filterPypiSimplePage(body []byte, permit func(string) bool) []byte {
+func filterPypiSimplePage(body []byte, pkg string, permit func(string) bool) []byte {
 	if permit == nil {
 		return body
 	}
@@ -102,7 +104,7 @@ func filterPypiSimplePage(body []byte, permit func(string) bool) []byte {
 		if m == nil {
 			return el
 		}
-		_, version := wheelIdentity(pypiHrefFilename(string(m[1])))
+		version := pypiPageVersion(pkg, pypiHrefFilename(string(m[1])))
 		if version == "" || permit(version) {
 			return el
 		}

@@ -92,7 +92,7 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 	// /pypi/wheels/, which answers from storage before it reaches the network.
 	if pkg != nil && packageMode(pkg) == manifest.ModeProxy {
 		upstream := s.pypiSimpleURL(normalized)
-		rw := &pypiIndexWriter{ResponseWriter: w, indexURL: upstream, permit: permit}
+		rw := &pypiIndexWriter{ResponseWriter: w, indexURL: upstream, pkg: pkgName, permit: permit}
 		s.proxyOrCache(rw, r, s.typeStore(manifest.TypePypi),
 			"pypi/simple/"+normalized+"/index.html",
 			upstream, manifest.TypePypi, pkgName, pkgName, false, true)
@@ -212,6 +212,10 @@ func (s *Server) pypiSimpleURL(normalized string) string {
 type pypiIndexWriter struct {
 	http.ResponseWriter
 	indexURL string
+	// pkg is the distribution this page is for, which is what lets the filter
+	// place a filename's version by stripping the name rather than guessing at
+	// where it ends.
+	pkg string
 	// permit is the profile's version rule for this distribution, nil when no
 	// profile governs it. Applied before the href rewrite so the two passes
 	// read the upstream filenames rather than one reading the other's output.
@@ -242,7 +246,7 @@ func (p *pypiIndexWriter) flush() error {
 		p.status = http.StatusOK
 	}
 	if p.status == http.StatusOK {
-		body = rewritePypiIndex(filterPypiSimplePage(body, p.permit), p.indexURL)
+		body = rewritePypiIndex(filterPypiSimplePage(body, p.pkg, p.permit), p.indexURL)
 		// proxyS3 sets ETag from the stored object, which is the upstream
 		// document rather than what is going out. Left on, it labels the
 		// republished body with a validator for different bytes.
@@ -391,7 +395,7 @@ var pypiSdistSuffixes = []string{".tar.gz", ".tar.bz2", ".tar.xz", ".zip", ".tgz
 // A wheel is exact: PEP 427 fixes the first two hyphen-separated fields. An
 // sdist is not, because the project name may carry hyphens of its own
 // (PEP 625 normalizes them to underscores, and the files predating it are
-// still on the index), so the split is the first hyphen that begins a version.
+// still on the index), so the split is the last hyphen that begins a version.
 // Reading an sdist as a wheel is what refused django-5.0.0.tar.gz at the pin
 // that named 5.0.0: the version came back as "5.0.0.tar.gz", which matches no
 // constraint an operator can write.
@@ -409,15 +413,95 @@ func wheelIdentity(filename string) (dist, version string) {
 	return parts[0], parts[1]
 }
 
-// sdistIdentity splits {name}-{version} at the first hyphen whose remainder
-// opens with a digit. That places backports-abc-0.5 as backports-abc at 0.5
-// and foo-1.0-beta1 as foo at 1.0-beta1. A last-hyphen split misplaces the
-// second, a first-hyphen split misplaces the first.
+// sdistIdentity splits {name}-{version} by scanning hyphens right to left and
+// taking the first whose remainder opens with an all-digit release segment
+// (the run up to the next '.', '-' or '_'). That places backports-abc-0.5 as
+// backports-abc at 0.5, python-3parclient-4.2.10 as python-3parclient at
+// 4.2.10, and foo-1.0-beta1 as foo at 1.0-beta1.
+//
+// Right to left rather than left to right is what places sphinxcontrib-2048
+// at 0.1; scanning forward reads it as sphinxcontrib at 2048-0.1. Requiring a
+// whole numeric segment rather than a leading digit is what keeps
+// python-3parclient off the 3parclient-4.2.10 reading, which named the wrong
+// package in both the refusal and the audit row.
+//
+// {name}-{version} with hyphens legal on both sides has no unambiguous
+// reading, so the residual case is a post-release such as foo-1.0-1, which
+// comes back as foo-1.0 at 1. The filename does not settle it. The index
+// filter never has to guess, because it knows the distribution its page is
+// for: see pypiPageVersion.
 func sdistIdentity(base, filename string) (dist, version string) {
-	for i := 1; i < len(base)-1; i++ {
-		if base[i] == '-' && base[i+1] >= '0' && base[i+1] <= '9' {
+	for i := len(base) - 2; i > 0; i-- {
+		if base[i] == '-' && opensOnRelease(base[i+1:]) {
 			return base[:i], base[i+1:]
 		}
 	}
 	return wheelDistName(filename), ""
+}
+
+// opensOnRelease reports whether a version candidate begins with a numeric
+// release segment, which PEP 440 requires of every version and which the tail
+// of a project name ("abc", "beta1") does not satisfy.
+func opensOnRelease(v string) bool {
+	n := strings.IndexAny(v, ".-_")
+	if n < 0 {
+		n = len(v)
+	}
+	if n == 0 {
+		return false
+	}
+	for i := 0; i < n; i++ {
+		if v[i] < '0' || v[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// pypiPageVersion places a file's version on a per-distribution index, where
+// the distribution is known and the filename does not have to be guessed at.
+// It strips the page's own name off the front, which is exact for every
+// project whose name carries a hyphen: python-3parclient-4.2.10.tar.gz splits
+// nowhere a filename alone settles, and the heuristic split refused the
+// pinned release and hid it from the page.
+//
+// A file that does not carry the page's name falls back to wheelIdentity. PEP
+// 503 permits such an entry and nothing here can place it better than the
+// artifact route will when the client comes back for it.
+func pypiPageVersion(pkg, filename string) string {
+	normalized := normalizePkgName(pkg)
+	for _, ext := range pypiSdistSuffixes {
+		if base, ok := strings.CutSuffix(filename, ext); ok {
+			if v, ok := versionAfterName(base, normalized); ok {
+				return v
+			}
+			_, v := sdistIdentity(base, filename)
+			return v
+		}
+	}
+	if base, ok := strings.CutSuffix(filename, ".whl"); ok {
+		if v, ok := versionAfterName(base, normalized); ok {
+			// PEP 427 puts the build and compatibility tags after the version,
+			// and none of them is part of it.
+			if i := strings.IndexByte(v, '-'); i >= 0 {
+				v = v[:i]
+			}
+			return v
+		}
+	}
+	_, v := wheelIdentity(filename)
+	return v
+}
+
+// versionAfterName returns what follows the shortest filename prefix that
+// normalizes to the distribution name. Normalizing the prefix is what makes it
+// match a file published under PEP 625 (python_3parclient-4.2.10.tar.gz) as
+// well as one predating it.
+func versionAfterName(base, normalized string) (string, bool) {
+	for i := 1; i < len(base)-1; i++ {
+		if base[i] == '-' && normalizePkgName(base[:i]) == normalized {
+			return base[i+1:], true
+		}
+	}
+	return "", false
 }
