@@ -1179,3 +1179,27 @@ func TestHelmIndexFilterLeavesAPermittedDocumentByteForByte(t *testing.T) {
 		})
 	}
 }
+
+// A filename whose extension bodega does not know is not a wheel, and the
+// wheel split reads one anyway. This one belongs to msgpack-python; read as a
+// wheel it comes back as msgpack, so a profile listing an unrelated project of
+// that name decided about it.
+func TestProfileGatesAnUnknownPypiExtensionUnderItsFilename(t *testing.T) {
+	const file = "msgpack-python-0.3.0.win-amd64-py2.7.exe"
+	s := proxyingServer(t)
+	seed(t, s, manifest.TypePypi, map[string]string{"pypi/wheels/" + file: "bytes"})
+	f := bindProfile(t, s, "ops", "ops01",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypePypi, audit.VersionFloating, audit.ExpansionBlock)},
+		[]audit.ProfileEntry{{Type: manifest.TypePypi, Name: "msgpack"}})
+
+	status, body := f.get(t, "/pypi/wheels/"+file)
+	if status != http.StatusForbidden {
+		t.Fatalf("a file of a project the profile does not list answered %d, want 403: %s", status, body)
+	}
+	if !strings.Contains(body, file) {
+		t.Errorf("the refusal does not name the file it refused:\n%s", body)
+	}
+	if strings.Contains(body, "pypi/msgpack ") {
+		t.Errorf("the refusal names the project the filename split guessed:\n%s", body)
+	}
+}

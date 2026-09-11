@@ -1000,6 +1000,16 @@ Collecting ok
 ERROR: Could not install requirement ok from http://bodega:8080/pypi/wheels/ok-1.0.0-py3-none-any.whl because of HTTP error 403 Client Error: Forbidden for url: http://bodega:8080/pypi/wheels/ok-1.0.0-py3-none-any.whl
 ```
 
+A filename bodega cannot place onto a project and a version is refused under the filename itself, so the body and the audit row name a file where they normally name a package. `pip` never asks for one of these; they are `bdist_wininst` and `.egg` files predating the wheel:
+
+```text
+membership: profile "web" does not list pypi/msgpack-python-0.3.0.win-amd64-py2.7.exe.
+  Add it:      bodega profile add web pypi msgpack-python-0.3.0.win-amd64-py2.7.exe
+  Or open it:  bodega profile set web pypi --membership open
+```
+
+Take the repair it prints literally and the entry matches nothing else. Name the real project, or open the type.
+
 **npm.** The same text for a packument and for a tarball, with the URL as the only thing that tells them apart. It does not print bodega's body:
 
 ```text

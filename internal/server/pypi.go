@@ -401,7 +401,7 @@ var pypiSdistSuffixes = []string{".tar.gz", ".tar.bz2", ".tar.xz", ".zip", ".tgz
 // wheelIdentity splits a distribution filename into its project and version.
 // It yields an empty version for a name it cannot place, which every caller
 // reads as "decide this on membership alone" rather than as a version to hold
-// to a constraint.
+// to a constraint, and an empty project too for an extension it does not know.
 //
 // A wheel is exact: PEP 427 fixes the first two hyphen-separated fields. An
 // sdist is not, because the project name may carry hyphens of its own
@@ -416,7 +416,16 @@ func wheelIdentity(filename string) (dist, version string) {
 			return sdistIdentity(base, filename)
 		}
 	}
-	base := strings.TrimSuffix(filename, ".whl")
+	base, ok := strings.CutSuffix(filename, ".whl")
+	if !ok {
+		// An extension bodega does not know is not a wheel, and the wheel
+		// split reads one anyway: msgpack-python-0.3.0.win-amd64-py2.7.exe, a
+		// bdist_wininst file pypi still publishes, comes back as msgpack at
+		// python — a package no profile lists and a version nobody wrote.
+		// Placing neither is what makes a closed type answer the file as the
+		// reach it is rather than decide about the wrong project.
+		return "", ""
+	}
 	parts := strings.Split(base, "-")
 	if len(parts) < 2 {
 		return wheelDistName(filename), ""
