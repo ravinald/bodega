@@ -417,3 +417,49 @@ func find(pms []manifest.PackageManifest, name string) *manifest.PackageManifest
 	}
 	return nil
 }
+
+// TestAptCaptureRecordsItsRelease is the other half of what an apt capture has
+// to carry. dpkg reports no codename in either format, so the release comes
+// from the host convert runs on, and it is the field that decides which
+// advisories answer for a version: Ubuntu and Debian backport a fix without
+// moving the upstream version, so a noble revision checked against jammy's
+// records matches nothing and dates itself clean.
+func TestAptCaptureRecordsItsRelease(t *testing.T) {
+	const capture = "libexpat1\t2.6.1-2build1\tamd64\tinstall ok installed\texpat\n"
+
+	res, err := ParseAptWithSuite(strings.NewReader(capture), "noble")
+	if err != nil {
+		t.Fatalf("ParseAptWithSuite: %v", err)
+	}
+	if got := res.Packages[0].Versions[0].Suites; len(got) != 1 || got[0] != "noble" {
+		t.Errorf("suites = %v, want [noble]", got)
+	}
+
+	// A capture with no release recorded must record none. The OSV gate warns
+	// on that entry rather than guessing, which is the honest answer; a
+	// codename picked here would be one nothing chose.
+	none, err := ParseApt(strings.NewReader(capture))
+	if err != nil {
+		t.Fatalf("ParseApt: %v", err)
+	}
+	if got := none.Packages[0].Versions[0].Suites; len(got) != 0 {
+		t.Errorf("suites = %v, want none", got)
+	}
+	if blank, err := ParseAptWithSuite(strings.NewReader(capture), "  "); err != nil {
+		t.Fatalf("ParseAptWithSuite: %v", err)
+	} else if got := blank.Packages[0].Versions[0].Suites; len(got) != 0 {
+		t.Errorf("whitespace recorded suites = %v, want none", got)
+	}
+
+	// Every row, not the first: a host inventory is a thousand packages and
+	// one release.
+	all, err := ParseAptWithSuite(fixture(t, "apt-dpkg-query-jammy-source.txt"), "jammy")
+	if err != nil {
+		t.Fatalf("ParseAptWithSuite: %v", err)
+	}
+	for _, pm := range all.Packages {
+		if got := pm.Versions[0].Suites; len(got) != 1 || got[0] != "jammy" {
+			t.Fatalf("%s: suites = %v, want [jammy]", pm.Name, got)
+		}
+	}
+}

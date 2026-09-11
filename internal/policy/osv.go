@@ -91,6 +91,15 @@ type OSVChecker struct {
 	// unanswerable, which is what a test or a tool holding no Config gets.
 	DefaultAptSuite string
 
+	// ServedAptSuites is apt_suites, and it bounds DefaultAptSuite rather than
+	// widening it: an apt entry naming no suite is answered from the codename
+	// only while the codename is the one release this bodega serves. Two
+	// releases and nothing on the entry says which of them its version string
+	// came from, so the gate warns instead of choosing. Empty leaves the
+	// fallback unbounded, which is the single-release install and every caller
+	// holding no Config.
+	ServedAptSuites []string
+
 	Now func() time.Time
 }
 
@@ -132,7 +141,7 @@ func (c *OSVChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 		return Result{Check: "osv", Action: ActionWarn,
 			Reason: fmt.Sprintf("apt entry %s carries no version, so no advisory can be evaluated against it", pm.Name)}
 	}
-	lk := osvLookupFor(pm, ve, c.DefaultAptSuite)
+	lk := osvLookupFor(pm, ve, c.DefaultAptSuite, c.ServedAptSuites)
 	if lk.reason != "" {
 		return Result{Check: "osv", Action: ActionWarn, Reason: lk.reason}
 	}

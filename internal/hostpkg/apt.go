@@ -42,21 +42,44 @@ type AptInventory struct {
 	Warnings []string
 }
 
-// ParseApt converts either of apt's two inventory formats.
+// ParseApt converts either of apt's two inventory formats, recording no
+// release. It is the Parser the type dispatch hands out, and a suite is not a
+// thing every manager has; see ParseAptWithSuite for the capture's own.
 //
 // 'dpkg-query -W' is the documented input because it is machine readable and
 // carries the status field. 'apt list --installed' is accepted because it is
 // what an operator reaches for, even though apt prints a warning that its CLI
 // has no stable interface.
 func ParseApt(r io.Reader) (Result, error) {
+	return ParseAptWithSuite(r, "")
+}
+
+// ParseAptWithSuite is ParseApt with the release the inventory was captured
+// on, written onto every entry's Suites.
+//
+// The release is the capture's to record and nothing else's. Ubuntu and Debian
+// backport a security fix without moving the upstream version, so the
+// advisories that settle a version live in the export for its own release, and
+// a catalog holding jammy and noble entries at once cannot be answered from
+// one server-wide codename: it would be wrong about one of them, in the
+// direction that reports a vulnerable host clean. dpkg reports no codename in
+// either format, so it comes from the host convert runs on or from --suite.
+//
+// An empty suite records none rather than guessing. See policy.osvLookupFor
+// for what the OSV gate does with an entry naming no release.
+func ParseAptWithSuite(r io.Reader, suite string) (Result, error) {
 	inv, err := ParseAptRows(r)
 	if err != nil {
 		return Result{}, err
 	}
+	suite = strings.TrimSpace(suite)
 	res := Result{Warnings: inv.Warnings}
 	for _, row := range inv.Rows {
 		pm := pkg(manifest.TypeApt, row.Name, row.Version, "", "")
 		pm.Versions[0].SourcePackage = row.Source
+		if suite != "" {
+			pm.Versions[0].Suites = []string{suite}
+		}
 		res.Packages = append(res.Packages, pm)
 	}
 	sortPackages(res.Packages)

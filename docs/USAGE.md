@@ -286,10 +286,24 @@ Run it on the host being cataloged. It reads stdin by default, writes JSON to st
 dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\t${source:Package}\n' | bodega pkg convert apt > catalog.json
 apt list --installed | bodega pkg convert apt -o catalog.json
 pip list --format=json | bodega pkg convert pypi | bodega pkg import -
-bodega pkg convert apt --origin db01 db01-installed.txt
+bodega pkg convert apt --origin db01 --suite noble db01-installed.txt
 ```
 
 Every version entry is stamped with the host the inventory describes, under the `_origin` metadata key, defaulting to this machine's hostname. That is what running convert on the host buys beyond reading the inventory: a catalog assembled from four machines can name the contributor of each row, and a baseline for a class of host can be built from the machine that defines the class. `--origin <name>` names the host when the capture was taken there and converted somewhere else. See [`--origin`](#--origin) for what the import does with it.
+
+An apt inventory records one more thing about the host: the release it was captured on, on every version entry's `suites`. That is the field the OSV gate keys apt advisories on, and it has to come from the capture because dpkg reports no codename in either format and the fix for a CVE is a fact about one release: see [apt](#apt) under the OSV gate. It defaults to `VERSION_CODENAME` in this machine's `/etc/os-release`, and `--suite <codename>` names the release when the capture came from another one. Either way the run says which release it recorded:
+
+```
+apt: recording release "jammy" on every entry (VERSION_CODENAME in /etc/os-release)
+```
+
+A host that names no codename resolves none: converting a capture on a Mac, or on a distro that publishes no `VERSION_CODENAME`, records no release and says so. The gate warns on such an entry rather than guessing a release for it, so the flag is the fix:
+
+```
+apt: no release recorded on these entries: no --suite, and /etc/os-release names no VERSION_CODENAME.
+  The OSV gate answers an apt version from the advisories published for its own release, and warns rather than
+  guessing one. Re-run with --suite <codename> to record it.
+```
 
 | Type | Source command |
 |------|----------------|
@@ -306,7 +320,8 @@ Prefer `dpkg-query` to `apt list --installed`: it is machine readable, it carrie
 
 #### What convert does and does not resolve
 
-- **apt** entries carry the name, the version, `source_name`, `source_package` and no URL. The build pipeline resolves them with `apt-get download`, against the bodega server's own sources.
+- **apt** entries carry the name, the version, `source_name`, `source_package`, `suites` and no URL. The build pipeline resolves them with `apt-get download`, against the bodega server's own sources.
+- **The release is recorded on every entry, from `--suite` or this machine's `/etc/os-release`.** `suites` is what the OSV gate keys apt advisories on, because Ubuntu and Debian backport a fix without moving the upstream version. An entry carrying none falls back to the server's `apt_codename`, which is right on a bodega serving one release and a guess on a bodega serving two: see [apt](#apt) under the OSV gate.
 - **The source package is recorded from `${source:Package}`, and only from there.** `source_name` is the name `apt-get download` asks for and is always the binary name; `source_package` is what USN and DSA are issued against, and the OSV gate queries that one. The two differ on 73 of the 101 packages a stock `ubuntu:22.04` container installs (`libssl3` from `openssl`, `bsdutils` from `util-linux`), so a capture that drops the field leaves the gate unable to answer for most of the host: see [apt](#apt) under the OSV gate. `apt list --installed` prints the source name in no position at all, so a catalog captured that way can never carry one. A four-field capture taken before bodega asked still parses unchanged; re-capture with the fifth field to give the gate something to query.
 - **pypi, npm, gomod and cargo** entries carry a name and a version and import as `proxy`. The registry is already known from `pypi_upstream` and its siblings, so nothing else is needed. Flip an entry to `hosted` and run the pipeline to pre-fetch the artifact.
 - **helm** entries import with **no URL**. A helm release records the chart it came from (`nginx-18.2.4`) but not the repository, and bodega resolves helm upstreams per version. Fill the URLs in before importing, or resolve them with `helm search repo <chart> -o json`. Guessing a repository would put an unverified URL into a supply-chain catalog.
@@ -341,13 +356,15 @@ dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\n' \
 
 `--merge` never overwrites a recorded version, so an entry someone promoted to `hosted` stays hosted. The origins are the one thing it adds to a version already in the store: run the same package through from `db01` and from `db02` and the entry records both, which is the fact the field exists to hold.
 
-Converting a capture taken on another machine needs the name passed:
+Converting a capture taken on another machine needs the name passed, and the release with it:
 
 ```bash
-# The dpkg-query output was collected on db01 and copied here.
-bodega pkg convert apt --origin db01 db01-installed.txt \
+# The dpkg-query output was collected on db01, a noble host, and copied here.
+bodega pkg convert apt --origin db01 --suite noble db01-installed.txt \
   | bodega pkg import --server https://bodega.example --merge -
 ```
+
+Both flags default to this machine, so leaving `--suite` off here records the release the _converting_ host runs. That is right when convert runs on the host being cataloged and wrong the moment it does not, and the failure is quiet: the advisories for the wrong release match nothing, and every version in the capture reports clean.
 
 `bodega show pkg apt <name>` prints an `ORIGIN` column naming the hosts behind each version, and `bodega pkg export` carries the field, so a catalog stays attributable across a migration between instances. The `bodega show repo` table withholds it: an origin is an internal hostname, and that view renders what a client may see. `bodega show repo <type> <name> json` still carries the key, as it does `_pool_path` and every other internal metadata key — that output is a manifest dump, not the client-facing rendering.
 
@@ -1296,7 +1313,17 @@ OSV carries `Ubuntu` and `Debian` ecosystems sourced from USN and DSA, and the f
 
 A codename is absent when OSV carries no release's worth of records for it, which is every superseded interim Ubuntu release: measured 2026-09-11, `mantic`, `oracular` and `plucky` answer with 3, 3 and 4 records across ten probed source packages, against 421 for `xenial`. A handful is worse for the operator than none, because it distills to a non-empty index that passes the no-packages check under [Sync](#sync) and then reports the rest of the release clean for the whole `osv_db_max_age` window. The gate warns on an absent codename instead.
 
-The suite on the version entry, never `apt_codename`. One catalog holds entries for both releases, and answering both from one codename is wrong about one of them, in the direction that reports a vulnerable host clean: noble's version strings are newer than every jammy advisory's fixed version, so a noble entry checked against jammy's records matches nothing. An entry naming no suite at all is the exception, because the server publishes it under `apt_codename`: that is the release it is served from, so that is the release whose advisories cover it, and `sync` has already fetched that index because the served set always includes the codename.
+The suite on the version entry, never `apt_codename`. One catalog holds entries for both releases, and answering both from one codename is wrong about one of them, in the direction that reports a vulnerable host clean: noble's version strings are newer than every jammy advisory's fixed version, so a noble entry checked against jammy's records matches nothing. `bodega pkg convert apt` is what puts the release on the entry, from the host it runs on or from `--suite`; see [`bodega pkg convert`](#bodega-pkg-convert-type-file-).
+
+An entry naming no suite falls back to `apt_codename`, and only while the codename is the one release this bodega serves. That is the release the server publishes such an entry under, so it is the release whose advisories cover it, and `sync` has already fetched the index because the served set always includes the codename.
+
+With `apt_suites` holding two releases the fallback becomes a guess about the one thing being checked. A catalog imported before capture recorded a release carries jammy and noble entries that look identical on the manifest, so the gate declines rather than picking:
+
+```
+apt/libexpat1: 2.6.1-2build1: osv: apt entry libexpat1 names no suite and this bodega serves 2 releases (Ubuntu:22.04:LTS, Ubuntu:24.04:LTS), so nothing identifies which release's advisories cover its version; set suites on the version entry, or re-capture the host with 'bodega pkg convert apt --suite <codename>' and re-import
+```
+
+Pockets are not releases: `jammy`, `jammy-security` and `jammy-updates` are one set of advisories, so serving all three keeps the fallback unambiguous. A served suite OSV publishes no export for does count as another release, because it is another release an entry could have come from and this gate cannot place it either way.
 
 **One release is two OSV ecosystem strings.** `Ubuntu:22.04:LTS` carries main and `Ubuntu:Pro:22.04:LTS` carries universe, and on the ESM releases very nearly everything. The two sets are disjoint. Measured 2026-09-11, a stock jammy `imagemagick 8:6.9.11.60+dfsg-1.3ubuntu0.22.04.3` answers with 4 records under the first and 179 under the second, and a xenial `expat 2.1.0-7ubuntu0.16.04.5+esm8` answers with none under the first and 37 under the second. Both halves are about the same host and both name stock revisions as their fixed versions, so `sync` folds them into one index per release: the `queried` stamp names `Ubuntu:22.04:LTS` and the answer covers both.
 

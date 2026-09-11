@@ -56,11 +56,40 @@ var aptPockets = []string{"-security", "-updates", "-backports", "-proposed"}
 // AptOSVEcosystem returns the OSV ecosystem that answers for one apt suite, or
 // "" when OSV publishes no export for the release it names.
 func AptOSVEcosystem(suite string) string {
+	return aptOSVEcosystem[aptSuiteBase(suite)]
+}
+
+// aptSuiteBase is the release a suite name belongs to, pocket stripped.
+func aptSuiteBase(suite string) string {
 	base := strings.ToLower(strings.TrimSpace(suite))
 	for _, pocket := range aptPockets {
 		base = strings.TrimSuffix(base, pocket)
 	}
-	return aptOSVEcosystem[base]
+	return base
+}
+
+// aptServedReleases folds a served suite set onto the releases it names.
+//
+// apt_suites holds suite names, and several of them are one release: jammy and
+// jammy-security are the same set of advisories. A suite OSV publishes no
+// export for still counts as a release here, because the question this answers
+// is how many releases a suite-less entry could belong to, and an entry no
+// export covers is an entry this gate cannot place either way.
+func aptServedReleases(suites []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(suites))
+	for _, suite := range suites {
+		id := AptOSVEcosystem(suite)
+		if id == "" {
+			id = aptSuiteBase(suite)
+		}
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
 }
 
 // OSVExportsFor returns the OSV exports a registry type is answered from, and
@@ -148,15 +177,23 @@ type osvLookup struct {
 // about one of them, in the direction that reports a vulnerable host clean.
 //
 // defaultSuite covers the entry that names no suite, which is every apt entry
-// written before the field existed. The server publishes those under
-// apt_codename, so that is the release whose advisories cover them, and it is
-// already in the synced set because ServedAptSuites always includes it. Empty
-// when the caller holds no Config, and then the entry is unanswerable rather
-// than answered from a release nothing chose.
+// written before the field existed and every one an older capture produced.
+// The server publishes those under apt_codename, so that is the release whose
+// advisories cover them, and it is already in the synced set because
+// ServedAptSuites always includes it. Empty when the caller holds no Config,
+// and then the entry is unanswerable rather than answered from a release
+// nothing chose.
+//
+// servedSuites is the floor under that fallback. One release served makes
+// apt_codename the only release such an entry can belong to; two make the
+// fallback a guess, and the version string is the thing being guessed about,
+// so a noble revision checked against jammy's records matches nothing and
+// dates itself clean. Nothing on the entry identifies which release covers it,
+// so B34's rule applies and nothing is picked.
 //
 // A reason means nothing can answer. B34's rule holds here: the caller warns
 // with it rather than passing.
-func osvLookupFor(pm *manifest.PackageManifest, ve *manifest.VersionEntry, defaultSuite string) osvLookup {
+func osvLookupFor(pm *manifest.PackageManifest, ve *manifest.VersionEntry, defaultSuite string, servedSuites []string) osvLookup {
 	if pm.Type != manifest.TypeApt {
 		eco := osvEcosystemFor[pm.Type]
 		if eco == "" {
@@ -168,6 +205,11 @@ func osvLookupFor(pm *manifest.PackageManifest, ve *manifest.VersionEntry, defau
 	name, kind := ve.SourcePackage, "source package"
 	if name == "" {
 		name, kind = pm.Name, "binary package"
+	}
+	if len(ve.Suites) == 0 {
+		if releases := aptServedReleases(servedSuites); len(releases) > 1 {
+			return osvLookup{reason: aptAmbiguousSuiteReason(pm.Name, releases)}
+		}
 	}
 	suites := ve.EffectiveSuites(defaultSuite)
 	exports, unmapped := OSVExportsFor(manifest.TypeApt, suites)
@@ -207,6 +249,20 @@ func aptUnverifiedNameReason(name string, exports []string) string {
 		"dpkg-query -W -f='${Package}\\t${Version}\\t${Architecture}\\t${Status}\\t${source:Package}\\n' "+
 		"and re-import, or set source_package on the version entry",
 		name, strings.Join(exports, ", "))
+}
+
+// aptAmbiguousSuiteReason is the warn an entry naming no release earns on a
+// bodega serving more than one.
+//
+// It names the releases rather than saying "several", because the operator's
+// next move is to pick the one this capture came from, and it names the flag
+// that records it at capture: a manifest fixed by hand is fixed again by the
+// next import of the same inventory.
+func aptAmbiguousSuiteReason(name string, releases []string) string {
+	return fmt.Sprintf("apt entry %s names no suite and this bodega serves %d releases (%s), "+
+		"so nothing identifies which release's advisories cover its version; "+
+		"set suites on the version entry, or re-capture the host with 'bodega pkg convert apt --suite <codename>' and re-import",
+		name, len(releases), strings.Join(releases, ", "))
 }
 
 // aptUnmappedReason says which suite stopped the lookup, and what to do about

@@ -105,7 +105,7 @@ func (c *OSVChecker) Rescan(ctx context.Context, pm *manifest.PackageManifest, v
 	if pm == nil || ve == nil || ve.Version == "" {
 		return OSVRescanChange{Reason: "no version to look up"}
 	}
-	lk := osvLookupFor(pm, ve, c.DefaultAptSuite)
+	lk := osvLookupFor(pm, ve, c.DefaultAptSuite, c.ServedAptSuites)
 	if lk.reason != "" {
 		return OSVRescanChange{Reason: lk.reason}
 	}

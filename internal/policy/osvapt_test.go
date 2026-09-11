@@ -538,3 +538,118 @@ func TestOSVApt_UnrecordedSourceDoesNotDateAClean(t *testing.T) {
 		t.Errorf("stamped %q, want %q", got, want)
 	}
 }
+
+// TestOSVApt_CaptureAnswersFromTheReleaseItWasTakenOn drives requirement 1
+// through the shape the tree actually produces.
+//
+// Every other suite test here hand-writes Suites onto the entry. A catalog
+// comes out of 'bodega pkg convert apt', and until that command recorded the
+// release, every entry it wrote fell back to the server's apt_codename: one
+// global setting answering for every host in the catalog. Both directions of
+// that mismatch are wrong, and one of them is wrong in the direction the whole
+// item exists to prevent.
+func TestOSVApt_CaptureAnswersFromTheReleaseItWasTakenOn(t *testing.T) {
+	ck := aptChecker(t)
+	// A server on jammy, holding a capture from a noble host.
+	ck.DefaultAptSuite = "jammy"
+
+	res, err := hostpkg.ParseAptWithSuite(strings.NewReader(
+		"libexpat1\t2.6.1-2build1\tamd64\tinstall ok installed\texpat\n"), "noble")
+	if err != nil {
+		t.Fatalf("parse noble capture: %v", err)
+	}
+	pm, ve := res.Packages[0], res.Packages[0].Versions[0]
+
+	// 2.6.1-2build1 is one revision short of USN-7000-1, which fixes noble's
+	// expat at 2.6.1-2ubuntu0.1. jammy's records say nothing about it: its
+	// versions never leave 2.4.7, so answering this entry from the codename
+	// matches nothing and dates a vulnerable host clean.
+	r := ck.Check(context.Background(), &pm, &ve)
+	if r.Action != ActionBlock {
+		t.Fatalf("a noble libexpat1 behind USN-7000-1 must not pass because the server runs jammy; got %q: %s",
+			r.Action, r.Reason)
+	}
+	if got, want := ve.Metadata[OSVMetaVulns], "USN-7000-1"; got != want {
+		t.Errorf("stamped %q, want %q", got, want)
+	}
+	if got, want := ve.Metadata[OSVMetaQueried], "source package expat in Ubuntu:24.04:LTS"; got != want {
+		t.Errorf("stamped %q, want %q", got, want)
+	}
+
+	// The mirror image: a fully patched jammy host converted on a noble
+	// server. USN-7000-1 is not about this host, and blocking on it sends an
+	// operator to patch a package that is already current.
+	ck.DefaultAptSuite = "noble"
+	res, err = hostpkg.ParseAptWithSuite(strings.NewReader(
+		"libexpat1\t2.4.7-1ubuntu0.4\tamd64\tinstall ok installed\texpat\n"), "jammy")
+	if err != nil {
+		t.Fatalf("parse jammy capture: %v", err)
+	}
+	pm, ve = res.Packages[0], res.Packages[0].Versions[0]
+	if r := ck.Check(context.Background(), &pm, &ve); r.Action != ActionPass {
+		t.Fatalf("a patched jammy libexpat1 must not report noble's advisory; got %q: %s", r.Action, r.Reason)
+	}
+	if got, want := ve.Metadata[OSVMetaQueried], "source package expat in Ubuntu:22.04:LTS"; got != want {
+		t.Errorf("stamped %q, want %q", got, want)
+	}
+}
+
+// TestOSVApt_SuitelessEntryWarnsWhenSeveralReleasesAreServed is the floor under
+// the apt_codename fallback, for the catalogs imported before a capture
+// recorded its release.
+//
+// apt_suites can hold several releases at once, and the fallback then picks one
+// of them for an entry that names none. The version string is the thing being
+// guessed about, so the guess is wrong for every host not on the codename, and
+// it fails silently: the advisories for the wrong release match nothing and the
+// entry is dated clean. B34's rule applies, so nothing is picked.
+func TestOSVApt_SuitelessEntryWarnsWhenSeveralReleasesAreServed(t *testing.T) {
+	ck := aptChecker(t)
+	ck.DefaultAptSuite = "jammy"
+	ck.ServedAptSuites = []string{"jammy", "noble"}
+
+	pm := &manifest.PackageManifest{Name: "libexpat1", Type: manifest.TypeApt}
+	ve := &manifest.VersionEntry{Version: "2.6.1-2build1", SourcePackage: "expat"}
+	r := ck.Check(context.Background(), pm, ve)
+	if r.Action != ActionWarn {
+		t.Fatalf("two releases served and nothing on the entry says which; got %q: %s", r.Action, r.Reason)
+	}
+	for _, want := range []string{"Ubuntu:22.04:LTS", "Ubuntu:24.04:LTS", "--suite"} {
+		if !strings.Contains(r.Reason, want) {
+			t.Errorf("the warn has to name %s: %q", want, r.Reason)
+		}
+	}
+	if ve.Metadata[OSVMetaCheckedAt] != "" {
+		t.Errorf("nothing was answered, so nothing may be dated: %q", ve.Metadata[OSVMetaCheckedAt])
+	}
+
+	// Rescan reaches the same lookup, or a nightly pass re-dates what
+	// admission refused to.
+	if ch := ck.Rescan(context.Background(), pm, ve); ch.Answered {
+		t.Errorf("rescan answered an entry admission could not: %+v", ch)
+	}
+
+	// Pockets are not releases. jammy and jammy-security are one set of
+	// advisories, so an entry naming no suite is still unambiguous.
+	ck.ServedAptSuites = []string{"jammy", "jammy-security", "jammy-updates"}
+	ve = &manifest.VersionEntry{Version: "2.4.7-1ubuntu0.2", SourcePackage: "expat"}
+	if r := ck.Check(context.Background(), pm, ve); r.Action != ActionBlock {
+		t.Fatalf("one release under three suite names is still one release; got %q: %s", r.Action, r.Reason)
+	}
+
+	// A suite no OSV export covers is still another release the entry could
+	// belong to, and answering it from jammy's records would be the same
+	// wrong-release failure.
+	ck.ServedAptSuites = []string{"jammy", "plucky"}
+	ve = &manifest.VersionEntry{Version: "2.4.7-1ubuntu0.2", SourcePackage: "expat"}
+	if r := ck.Check(context.Background(), pm, ve); r.Action != ActionWarn {
+		t.Fatalf("jammy beside an unmapped suite is two releases; got %q: %s", r.Action, r.Reason)
+	}
+
+	// An entry naming its own release is unaffected by what else is served.
+	ck.ServedAptSuites = []string{"jammy", "noble"}
+	ve = &manifest.VersionEntry{Version: "2.4.7-1ubuntu0.2", SourcePackage: "expat", Suites: []string{"jammy"}}
+	if r := ck.Check(context.Background(), pm, ve); r.Action != ActionBlock {
+		t.Fatalf("the entry names jammy; got %q: %s", r.Action, r.Reason)
+	}
+}

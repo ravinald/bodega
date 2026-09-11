@@ -295,6 +295,7 @@ func OSVChecker(cfg *config.Config, adb *audit.DB) *policy.OSVChecker {
 	ck.AllowAPIFallback = cfg.OSVAPIFallback
 	ck.MaxAge = cfg.ResolveOSVDBMaxAge()
 	ck.DefaultAptSuite = cfg.AptCodename
+	ck.ServedAptSuites = cfg.ServedAptSuites()
 	return ck
 }
 
