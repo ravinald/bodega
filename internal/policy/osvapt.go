@@ -37,6 +37,7 @@ var aptOSVEcosystem = map[string]string{
 	"jammy":    "Ubuntu:22.04:LTS",
 	"noble":    "Ubuntu:24.04:LTS",
 	"questing": "Ubuntu:25.10",
+	"resolute": "Ubuntu:26.04:LTS",
 	"wheezy":   "Debian:7",
 	"jessie":   "Debian:8",
 	"stretch":  "Debian:9",

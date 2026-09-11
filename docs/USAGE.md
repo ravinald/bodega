@@ -1291,7 +1291,7 @@ OSV carries `Ubuntu` and `Debian` ecosystems sourced from USN and DSA, and the f
 | `jammy`    | `Ubuntu:22.04:LTS` | `bullseye` | `Debian:11`   |
 | `noble`    | `Ubuntu:24.04:LTS` | `bookworm` | `Debian:12`   |
 | `questing` | `Ubuntu:25.10`     | `trixie`   | `Debian:13`   |
-|            |                    | `forky`    | `Debian:14`   |
+| `resolute` | `Ubuntu:26.04:LTS` | `forky`    | `Debian:14`   |
 
 A codename is absent when OSV carries no release's worth of records for it, which is every superseded interim Ubuntu release: measured 2026-09-11, `mantic`, `oracular` and `plucky` answer with 3, 3 and 4 records across ten probed source packages, against 421 for `xenial`. A handful is worse for the operator than none, because it distills to a non-empty index that passes the no-packages check under [Sync](#sync) and then reports the rest of the release clean for the whole `osv_db_max_age` window. The gate warns on an absent codename instead.
 
@@ -1299,7 +1299,7 @@ The suite on the version entry, never `apt_codename`. One catalog holds entries 
 
 **One release is two OSV ecosystem strings.** `Ubuntu:22.04:LTS` carries main and `Ubuntu:Pro:22.04:LTS` carries universe, and on the ESM releases very nearly everything. The two sets are disjoint. Measured 2026-09-11, a stock jammy `imagemagick 8:6.9.11.60+dfsg-1.3ubuntu0.22.04.3` answers with 4 records under the first and 179 under the second, and a xenial `expat 2.1.0-7ubuntu0.16.04.5+esm8` answers with none under the first and 37 under the second. Both halves are about the same host and both name stock revisions as their fixed versions, so `sync` folds them into one index per release: the `queried` stamp names `Ubuntu:22.04:LTS` and the answer covers both.
 
-The `Ubuntu:Pro:FIPS:22.04:LTS`, `Ubuntu:Pro:FIPS-preview:22.04:LTS` and `Ubuntu:Pro:FIPS-updates:22.04:LTS` strings are not folded. Their version strings are FIPS builds, so a host running the stock package would report against a revision it never installed: `UBUNTU-CVE-2022-40735` fixes jammy `openssl` at `3.0.2-0ubuntu1.16` and the FIPS build at `3.0.2-0ubuntu1.16+Fips1`, and a patched stock host sorts below the second.
+The FIPS, Realtime and Nvidia-BlueField strings are not folded: the fold matches `Ubuntu:Pro:<rel>` as an exact pair, so `Ubuntu:Pro:FIPS-preview:22.04:LTS`, `Ubuntu:Pro:FIPS-updates:22.04:LTS`, `Ubuntu:Pro:Realtime:22.04:LTS` and `Ubuntu:Nvidia-BlueField:22.04:LTS` all fall outside it. Each carries revisions of a build the stock host never installed, so folding one in reports against a version that was never there: `UBUNTU-CVE-2022-40735` fixes jammy `openssl` at `3.0.2-0ubuntu1.16` and the FIPS build at `3.0.2-0ubuntu1.16+Fips1`, and a patched stock host sorts below the second.
 
 **The source package is queried.** Advisories are issued against the source package, and one source builds many binaries: `expat` builds `libexpat1`, `libexpat1-dev` and `expat` itself. `bodega pkg convert apt` records the source in `source_name`, and that is the name the gate queries; an entry recording none is queried under its binary name. The stamp says which was used either way, so a finding on `libexpat1` traces back to the `expat` advisory that produced it.
 
@@ -1426,7 +1426,7 @@ Flagged by OSV:
 
 The `OSV` cell reads `n/a` on `binary`, `git` and `helm`. Those three have no OSV ecosystem identifier, so no rescan can ever answer for them, and `unchecked` would send the operator to a verb that refuses to run on them. On the covered types the cell reads `unchecked`, `clean` or a finding count, and `CHECKED` carries the date of the last conclusive answer. The `Flagged by OSV` block obeys the same rule: a version whose row reads `n/a` never appears in it. `bodega pkg import` accepts a manifest carrying `vetting.osv.*` keys for any type, so a stamp exported from another instance can land on `git`, and printing it as a dated finding under a cell that says the check can never run would contradict the row four lines above it.
 
-`GET /api/v1/packages/{type}/{name}/{version}` carries the same three keys on the version's `metadata`.
+`GET /api/v1/packages/{type}/{name}/{version}` carries the same four keys on the version's `metadata`.
 
 ### `bodega policy age <set|list|remove>`
 

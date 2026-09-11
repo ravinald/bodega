@@ -263,6 +263,8 @@ func TestAptOSVEcosystem(t *testing.T) {
 		{"bookworm-backports", "Debian:12"},
 		{"trixie", "Debian:13"},
 		{"questing", "Ubuntu:25.10"},
+		{"resolute", "Ubuntu:26.04:LTS"},
+		{"resolute-security", "Ubuntu:26.04:LTS"},
 		{"forky", "Debian:14"},
 		// A superseded interim release carries a handful of records rather
 		// than a release's worth, which distills to an index that passes

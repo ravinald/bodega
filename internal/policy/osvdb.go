@@ -541,9 +541,10 @@ func distillEcosystem(ecosystems []string, recorded string) string {
 // name stock revisions as their fixed versions, so they belong in one index.
 //
 // Matched as an exact pair and never as a prefix. OSV also publishes
-// Ubuntu:Pro:FIPS:22.04:LTS and Ubuntu:Pro:FIPS-updates:22.04:LTS, whose
-// versions are FIPS builds: a prefix match reports those against a host that
-// never installed one.
+// Ubuntu:Pro:FIPS-preview:<rel>, Ubuntu:Pro:FIPS-updates:<rel>,
+// Ubuntu:Pro:Realtime:<rel> and Ubuntu:Nvidia-BlueField:<rel>, each carrying
+// revisions of a build a stock host never installed: a prefix match reports
+// those against a host running the stock package.
 func ubuntuProEcosystem(ecosystem string) string {
 	rel, found := strings.CutPrefix(ecosystem, "Ubuntu:")
 	if !found {
