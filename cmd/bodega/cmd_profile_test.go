@@ -83,30 +83,50 @@ func mustRunProfile(t *testing.T, args ...string) string {
 	return out
 }
 
-// A closed type with nothing listed permits nothing of that type. It is
-// reachable, it is almost never meant, and the refusal follows the empty
+// A closed type that blocks with nothing listed permits nothing of that type.
+// It is reachable, it is almost never meant, and the refusal follows the empty
 // admin_permit_cidr precedent: name what the flag does rather than only
 // refusing.
 func TestProfileClosedAndEmptyIsRefusedWithoutForce(t *testing.T) {
 	newDiscoverEnv(t)
 	mustRunProfile(t, "create", "web")
 
-	out, err := runProfile(t, "set", "web", "apt", "--membership", "closed")
+	out, err := runProfile(t, "set", "web", "apt", "--membership", "closed", "--expansion", "block")
 	if err == nil {
-		t.Fatalf("a closed apt marker with no entries was accepted:\n%s", out)
+		t.Fatalf("a closed blocking apt marker with no entries was accepted:\n%s", out)
 	}
 	msg := err.Error()
-	for _, want := range []string{"permits nothing", "--force", "bodega profile add web apt", "--membership open"} {
+	for _, want := range []string{"permits nothing", "--force", "bodega profile add web apt", "--membership open", "--expansion warn"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("the refusal does not mention %q:\n%s", want, msg)
 		}
 	}
 
-	if _, err := runProfile(t, "set", "web", "apt", "--membership", "closed", "--force"); err != nil {
+	if _, err := runProfile(t, "set", "web", "apt", "--membership", "closed", "--expansion", "block", "--force"); err != nil {
 		t.Fatalf("--force did not accept the state the refusal says it accepts: %v", err)
 	}
 	if out := mustRunProfile(t, "show", "web"); !strings.Contains(out, "Closed for apt with nothing listed") {
 		t.Errorf("show does not report the forced state, so it reads like a profile nobody consults:\n%s", out)
+	}
+}
+
+// The same empty closed set under the default expansion is not an outage and
+// is not refused. It records every apt fetch as a reach outside the class,
+// which is the state requirement 6 asks for: detect first, block on purpose.
+func TestProfileClosedAndEmptyUnderWarnIsAccepted(t *testing.T) {
+	newDiscoverEnv(t)
+	mustRunProfile(t, "create", "web")
+
+	out := mustRunProfile(t, "set", "web", "apt", "--membership", "closed")
+	if !strings.Contains(out, "expansion=warn") {
+		t.Errorf("set did not report the expansion it wrote, so the default is invisible:\n%s", out)
+	}
+	shown := mustRunProfile(t, "show", "web")
+	if strings.Contains(shown, "every apt request from a bound host is refused") {
+		t.Errorf("show describes an outage the profile is not in:\n%s", shown)
+	}
+	if !strings.Contains(shown, "reach outside this class") {
+		t.Errorf("show does not say what warn actually does:\n%s", shown)
 	}
 }
 
@@ -116,7 +136,7 @@ func TestProfileRemovingTheLastEntryOfAClosedTypeIsRefused(t *testing.T) {
 	newDiscoverEnv(t)
 	mustRunProfile(t, "create", "web")
 	mustRunProfile(t, "add", "web", "apt", "nginx")
-	mustRunProfile(t, "set", "web", "apt", "--membership", "closed")
+	mustRunProfile(t, "set", "web", "apt", "--membership", "closed", "--expansion", "block")
 
 	if _, err := runProfile(t, "remove", "web", "apt", "nginx"); err == nil {
 		t.Fatal("removing the last entry of a closed type was accepted, leaving it permitting nothing")
@@ -944,5 +964,90 @@ func TestProfileBaselinePinRefusesOnePackageNamedTwice(t *testing.T) {
 	}
 	if _, statErr := os.Stat(baseline); statErr == nil {
 		t.Error("the refused command wrote a baseline anyway")
+	}
+}
+
+// entitle indexes a pypi entry under its PEP 503 name, so a document listing
+// two spellings of one project resolves to one entry with the later row's
+// constraint. The duplicate check promises that cannot happen, and comparing
+// raw is how it happens anyway: an operator pins 4.2.11, nothing warns, and
+// the fleet gets whatever the second row named.
+func TestProfileCreateFromFileRefusesTwoSpellingsOfOnePypiName(t *testing.T) {
+	newDiscoverEnv(t)
+	dir := t.TempDir()
+	doc := writeDoc(t, dir, "two-spellings.json", `{
+	  "config_version": 1, "name": "ops",
+	  "types": [{"type": "pypi", "membership": "closed", "version_default": "pinned"}],
+	  "entries": [
+	    {"type": "pypi", "name": "django", "constraint_kind": "exact", "version": "4.2.11",
+	     "reason": "5.0 breaks the admin", "review_after": "2027-01-01"},
+	    {"type": "pypi", "name": "Django", "constraint_kind": "exact", "version": "5.0.0"}
+	  ]
+	}`)
+
+	_, err := runProfile(t, "create", "ops", "--from-file", doc)
+	if err == nil {
+		t.Fatal("a document naming django and Django was accepted; one of the two pins would have vanished")
+	}
+	for _, want := range []string{"entries[0]", "entries[1]", "pypi/django", "Django"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q:\n%v", want, err)
+		}
+	}
+	if out, err := runProfile(t, "show", "ops"); err == nil {
+		t.Fatalf("the refused create left a profile behind:\n%s", out)
+	}
+}
+
+// diff is read to decide whether a profile still matches its host. Keyed raw,
+// a pypi entry written django against a package cataloged as Django lands in
+// both columns at once, and the repair it invites is a second entry the gate
+// would collapse.
+func TestProfileDiffReadsAPypiNameTheWayTheGateDoes(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedCatalog(t, env, "web01", map[string][]string{"Django": {"4.2.11"}})
+	mustRunProfile(t, "create", "web")
+	mustRunProfile(t, "add", "web", "pypi", "django")
+
+	out := mustRunProfile(t, "diff", "web", "--origin", "web01")
+	if strings.Contains(out, "not in web (1)") || strings.Contains(out, "not on web01 (1)") {
+		t.Errorf("diff reported one package as drift on both sides:\n%s", out)
+	}
+	if !strings.Contains(out, "name the same 1 package") {
+		t.Errorf("diff does not agree with the gate about one package:\n%s", out)
+	}
+}
+
+// The gate matches a typed name the same way for every verb. Comparing raw in
+// the CLI splits one entry in two on add, which entitle then collapses to
+// whichever row it read last, and reports a listed package as absent on
+// remove while the entry stays in force.
+func TestProfileEntryVerbsMatchTheSpellingTheGateHolds(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedCatalog(t, env, "web01", map[string][]string{"Django": {"4.2.11", "5.0.0"}})
+	mustRunProfile(t, "create", "web")
+	mustRunProfile(t, "add", "web", "pypi", "django", "--version", "4.2.11", "--reason", "5.0 breaks the admin")
+
+	out := mustRunProfile(t, "add", "web", "pypi", "Django", "--version", "5.0.0")
+	if !strings.Contains(out, "Updated") {
+		t.Errorf("adding the other spelling created a second entry:\n%s", out)
+	}
+	show := mustRunProfile(t, "show", "web")
+	if !strings.Contains(show, "Entries (1)") {
+		t.Errorf("the profile holds two rows for one project:\n%s", show)
+	}
+	if !strings.Contains(show, "5.0 breaks the admin") {
+		t.Errorf("the merge dropped the reason the first row carried:\n%s", show)
+	}
+
+	if out := mustRunProfile(t, "unpin", "web", "pypi", "Django"); strings.Contains(out, "does not list") {
+		t.Errorf("unpin does not see an entry the gate honors:\n%s", out)
+	}
+	out = mustRunProfile(t, "remove", "web", "pypi", "DJANGO")
+	if !strings.Contains(out, "Removed") {
+		t.Errorf("remove reported a listed package as absent:\n%s", out)
+	}
+	if show := mustRunProfile(t, "show", "web"); !strings.Contains(show, "Entries (0)") {
+		t.Errorf("the entry survived its own removal:\n%s", show)
 	}
 }

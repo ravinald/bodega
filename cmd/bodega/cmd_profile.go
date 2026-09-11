@@ -88,6 +88,10 @@ type profileDocType struct {
 	Type           string `json:"type"`
 	Membership     string `json:"membership"`
 	VersionDefault string `json:"version_default"`
+	// Expansion is omitted when it is the default, so a baseline stays about
+	// what the host has rather than about a posture nobody chose. An absent
+	// value reads as warn on the way in.
+	Expansion string `json:"expansion,omitempty"`
 }
 
 type profileDocEntry struct {
@@ -222,6 +226,7 @@ func writeBaseline(gf *globalFlags, name, description, origin, out string, pins 
 				Type:           p.Type,
 				Membership:     audit.MembershipClosed,
 				VersionDefault: audit.VersionFloating,
+				Expansion:      audit.ExpansionWarn,
 			})
 		}
 		doc.Entries = append(doc.Entries, profileDocEntry{
@@ -436,7 +441,7 @@ func createFromDoc(gf *globalFlags, doc *profileDoc, force bool) error {
 	for _, t := range doc.Types {
 		types = append(types, audit.ProfileTypeRule{
 			Profile: doc.Name, Type: t.Type, Membership: t.Membership,
-			VersionDefault: t.VersionDefault, Actor: actor,
+			VersionDefault: t.VersionDefault, Expansion: t.Expansion, Actor: actor,
 		})
 	}
 	entries := make([]audit.ProfileEntry, 0, len(doc.Entries))
@@ -495,11 +500,16 @@ func validateDoc(doc *profileDoc) error {
 		if err := requireConstraintVersion(e.Constraint, e.Version); err != nil {
 			return fmt.Errorf("entries[%d] (%s/%s): %w", i, e.Type, e.Name, err)
 		}
-		key := e.Type + "/" + e.Name
+		key := profileKey(e.Type, e.Name)
 		if j, dup := firstEntry[key]; dup {
+			spelling := ""
+			if doc.Entries[j].Name != e.Name {
+				spelling = fmt.Sprintf("\n  %q and %q are one project once the name is normalized, which is the form "+
+					"the gate compares", doc.Entries[j].Name, e.Name)
+			}
 			return fmt.Errorf("entries[%d] and entries[%d] both name %s, which is one entry: the later row would "+
-				"replace the earlier, taking its constraint, reason and review date with it.\n"+
-				"  Keep the one you mean", j, i, key)
+				"replace the earlier, taking its constraint, reason and review date with it.%s\n"+
+				"  Keep the one you mean", j, i, key, spelling)
 		}
 		firstEntry[key] = i
 	}
@@ -509,7 +519,7 @@ func validateDoc(doc *profileDoc) error {
 // checkClosedAndEmpty refuses a document whose closed type lists nothing.
 func checkClosedAndEmpty(doc *profileDoc, force bool) error {
 	for _, t := range doc.Types {
-		if t.Membership != audit.MembershipClosed {
+		if t.Membership != audit.MembershipClosed || !refusesUnlisted(t.Expansion) {
 			continue
 		}
 		listed := 0
@@ -530,13 +540,21 @@ func checkClosedAndEmpty(doc *profileDoc, force bool) error {
 // is reachable, it is almost never meant, and nothing downstream reports it
 // because a profile permitting nothing looks exactly like one nobody consults.
 func closedAndEmptyRefusal(profile, typ string) error {
-	return fmt.Errorf("profile %s would be closed for %s with no %s entries, which permits nothing of that type.\n"+
+	return fmt.Errorf("profile %s would be closed for %s with no %s entries and expansion %s, which permits nothing of that type.\n"+
 		"  Every %s request from a host bound to this profile is refused, and the refusal names no package because none is listed.\n"+
 		"  List something:  bodega profile add %s %s <name>\n"+
 		"  Open the type:   bodega profile set %s %s --membership open\n"+
+		"  Detect instead:  bodega profile set %s %s --expansion warn\n"+
 		"  Mean it:         re-run with --force, which accepts the empty closed set as written",
-		profile, typ, typ, typ, profile, typ, profile, typ)
+		profile, typ, typ, audit.ExpansionBlock, typ, profile, typ, profile, typ, profile, typ)
 }
+
+// refusesUnlisted reports whether a closed type's expansion action turns an
+// unlisted package into a 403. It is the discriminator for every warning about
+// an empty closed set: under warn and ignore that set records or serves, and a
+// refusal text promising an outage would be describing a state the profile is
+// not in.
+func refusesUnlisted(expansion string) bool { return expansion == audit.ExpansionBlock }
 
 func newProfileListCmd(gf *globalFlags) *cobra.Command {
 	return &cobra.Command{
@@ -631,7 +649,7 @@ func newProfileShowCmd(gf *globalFlags) *cobra.Command {
 				fmt.Println("  none — this profile states no rule for any type, so it permits everything")
 			} else {
 				w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-				fmt.Fprintln(w, "  TYPE\tMEMBERSHIP\tVERSION DEFAULT\tENTRIES")
+				fmt.Fprintln(w, "  TYPE\tMEMBERSHIP\tVERSION DEFAULT\tEXPANSION\tENTRIES")
 				for _, t := range d.Types {
 					n := 0
 					for _, e := range d.Entries {
@@ -639,7 +657,13 @@ func newProfileShowCmd(gf *globalFlags) *cobra.Command {
 							n++
 						}
 					}
-					fmt.Fprintf(w, "  %s\t%s\t%s\t%d\n", t.Type, t.Membership, t.VersionDefault, n)
+					expansion := "-"
+					if t.Membership == audit.MembershipClosed {
+						// An open type lists nothing to be outside of, so
+						// printing a value there would read as a rule in force.
+						expansion = t.Expansion
+					}
+					fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%d\n", t.Type, t.Membership, t.VersionDefault, expansion, n)
 				}
 				_ = w.Flush()
 			}
@@ -669,10 +693,17 @@ func reportClosedAndEmpty(d *audit.ProfileDetail) {
 		if t.Membership != audit.MembershipClosed {
 			continue
 		}
-		if !slices.ContainsFunc(d.Entries, func(e audit.ProfileEntry) bool { return e.Type == t.Type }) {
+		if slices.ContainsFunc(d.Entries, func(e audit.ProfileEntry) bool { return e.Type == t.Type }) {
+			continue
+		}
+		if refusesUnlisted(t.Expansion) {
 			fmt.Printf("\nClosed for %s with nothing listed: every %s request from a bound host is refused.\n",
 				t.Type, t.Type)
+			continue
 		}
+		fmt.Printf("\nClosed for %s with nothing listed, expansion %s: every %s request from a bound host is served and recorded as a reach outside this class.\n"+
+			"  Read what it recorded:  bodega discover list %s\n",
+			t.Type, t.Expansion, t.Type, t.Type)
 	}
 }
 
@@ -804,19 +835,32 @@ func newProfileUnbindCmd(gf *globalFlags) *cobra.Command {
 }
 
 func newProfileSetCmd(gf *globalFlags) *cobra.Command {
-	var membership, versionDefault string
+	var membership, versionDefault, expansion string
 	var force bool
 	c := &cobra.Command{
 		Use:   "set <profile> <type>",
-		Short: "Set membership and the version default for one package type",
+		Short: "Set membership, the version default and the expansion action for one package type",
 		Long: `Write the per-type marker: which packages of this type the profile covers,
-and the version rule they carry unless an entry overrides it.
+the version rule they carry unless an entry overrides it, and what happens to
+a fetch outside the set.
 
   --membership closed    only the packages this profile lists
   --membership open      every package of this type in the catalog
 
   --version-default pinned     only the version each entry names
   --version-default floating   any version
+
+  --expansion warn       serve it, and record the reach outside the class
+  --expansion block      refuse it with 403
+  --expansion ignore     serve it and record nothing
+
+--expansion defaults to warn and applies to a closed type alone, because an
+open type lists nothing to be outside of. warn rather than block: a new
+transitive dependency is ordinary upstream maintenance, and the cost of
+refusing it is a host that stops getting patched. Read what warn records, then
+narrow. The rows land with decision "denied" in the discovery table:
+
+  bodega discover list npm
 
 The marker's presence is itself an answer. A type with no marker is one the
 profile states no rule for, and the fleet-wide controls decide it alone; a
@@ -832,9 +876,13 @@ name keeps the value it has.`,
 			if err := requirePackageType(typ); err != nil {
 				return err
 			}
-			if membership == "" && versionDefault == "" {
-				return fmt.Errorf("name what to set: --membership <%s> or --version-default <%s>",
-					strings.Join(audit.Memberships(), "|"), strings.Join(audit.VersionDefaults(), "|"))
+			if membership == "" && versionDefault == "" && expansion == "" {
+				return fmt.Errorf("name what to set: --membership <%s>, --version-default <%s> or --expansion <%s>",
+					strings.Join(audit.Memberships(), "|"), strings.Join(audit.VersionDefaults(), "|"),
+					strings.Join(audit.Expansions(), "|"))
+			}
+			if expansion != "" && !audit.ValidExpansion(expansion) {
+				return fmt.Errorf("--expansion must be one of: %s", strings.Join(audit.Expansions(), ", "))
 			}
 			ctx := backgroundCtx()
 			adb, err := openProfileStore(gf)
@@ -850,10 +898,12 @@ name keeps the value it has.`,
 			rule := audit.ProfileTypeRule{
 				Profile: profile, Type: typ,
 				Membership: audit.MembershipOpen, VersionDefault: audit.VersionFloating,
+				Expansion: audit.ExpansionWarn,
 			}
 			for _, t := range d.Types {
 				if t.Type == typ {
 					rule.Membership, rule.VersionDefault = t.Membership, t.VersionDefault
+					rule.Expansion = t.Expansion
 				}
 			}
 			if membership != "" {
@@ -862,9 +912,12 @@ name keeps the value it has.`,
 			if versionDefault != "" {
 				rule.VersionDefault = versionDefault
 			}
+			if expansion != "" {
+				rule.Expansion = expansion
+			}
 			rule.Actor = audit.CurrentActor()
 
-			if rule.Membership == audit.MembershipClosed && !force {
+			if rule.Membership == audit.MembershipClosed && refusesUnlisted(rule.Expansion) && !force {
 				listed := slices.ContainsFunc(d.Entries, func(e audit.ProfileEntry) bool { return e.Type == typ })
 				if !listed {
 					return closedAndEmptyRefusal(profile, typ)
@@ -874,14 +927,16 @@ name keeps the value it has.`,
 				return err
 			}
 			recordProfileEvent(ctx, adb, audit.EventEdit, profile, typ,
-				fmt.Sprintf("membership=%s version_default=%s", rule.Membership, rule.VersionDefault))
-			fmt.Printf("%s %s: membership=%s version_default=%s\n",
-				profile, typ, rule.Membership, rule.VersionDefault)
+				fmt.Sprintf("membership=%s version_default=%s expansion=%s",
+					rule.Membership, rule.VersionDefault, rule.Expansion))
+			fmt.Printf("%s %s: membership=%s version_default=%s expansion=%s\n",
+				profile, typ, rule.Membership, rule.VersionDefault, rule.Expansion)
 			return nil
 		},
 	}
 	c.Flags().StringVar(&membership, "membership", "", "closed | open")
 	c.Flags().StringVar(&versionDefault, "version-default", "", "pinned | floating")
+	c.Flags().StringVar(&expansion, "expansion", "", "warn | block | ignore (closed types only; default warn)")
 	c.Flags().BoolVar(&force, "force", false, "Accept a closed type with no entries, which permits nothing of that type")
 	return c
 }
@@ -983,9 +1038,7 @@ that is a different decision: the package stops being permitted at all.`,
 			if err != nil {
 				return err
 			}
-			idx := slices.IndexFunc(d.Entries, func(e audit.ProfileEntry) bool {
-				return e.Type == typ && e.Name == name
-			})
+			idx := findProfileEntry(d.Entries, typ, name)
 			if idx < 0 {
 				return fmt.Errorf("profile %s does not list %s/%s, so there is no pin to release.\n"+
 					"  What it lists:  bodega profile show %s", profile, typ, name, profile)
@@ -1054,10 +1107,13 @@ func putProfileEntry(gf *globalFlags, profile, typ, name string, e audit.Profile
 	if err != nil {
 		return err
 	}
-	if i := slices.IndexFunc(d.Entries, func(x audit.ProfileEntry) bool {
-		return x.Type == typ && x.Name == name
-	}); i >= 0 {
+	// Adopting the stored spelling is what keeps this an edit. The upsert
+	// conflicts on the name as written, so re-adding an entry under pypi's
+	// other spelling would insert a second row, and entitle.New would index
+	// both under one key and keep whichever it read last.
+	if i := findProfileEntry(d.Entries, typ, name); i >= 0 {
 		e = mergeProfileEntry(d.Entries[i], e, supplied)
+		name = d.Entries[i].Name
 	}
 	if err := requireConstraintVersion(e.Constraint, e.Version); err != nil {
 		return err
@@ -1154,6 +1210,9 @@ func newProfileRemoveCmd(gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if i := findProfileEntry(d.Entries, typ, name); i >= 0 {
+				name = d.Entries[i].Name
+			}
 			if !force && lastEntryOfClosedType(d, typ, name) {
 				return closedAndEmptyRefusal(profile, typ)
 			}
@@ -1174,11 +1233,29 @@ func newProfileRemoveCmd(gf *globalFlags) *cobra.Command {
 	return c
 }
 
+// findProfileEntry returns the index of the entry the gate would match for a
+// typed name, -1 for none. An operator types whatever spelling they have in
+// front of them, and for pypi that is routinely not the one stored: comparing
+// raw reports a listed package as absent and leaves the entry in force.
+func findProfileEntry(entries []audit.ProfileEntry, typ, name string) int {
+	key := profileKey(typ, name)
+	return slices.IndexFunc(entries, func(e audit.ProfileEntry) bool {
+		return profileKey(e.Type, e.Name) == key
+	})
+}
+
+// profileKey is entitle.Key qualified by type, which is how the CLI holds a
+// package: entitle keeps one map per type and these maps do not, so dropping
+// the prefix would merge pypi/requests with npm/requests.
+func profileKey(typ, name string) string {
+	return typ + "/" + entitle.Key(typ, name)
+}
+
 // lastEntryOfClosedType reports whether removing this entry would leave a
 // closed type with nothing listed.
 func lastEntryOfClosedType(d *audit.ProfileDetail, typ, name string) bool {
 	closed := slices.ContainsFunc(d.Types, func(t audit.ProfileTypeRule) bool {
-		return t.Type == typ && t.Membership == audit.MembershipClosed
+		return t.Type == typ && t.Membership == audit.MembershipClosed && refusesUnlisted(t.Expansion)
 	})
 	if !closed {
 		return false
@@ -1232,13 +1309,16 @@ drift.`,
 				return err
 			}
 
+			// Keyed by what the gate compares, printed as each side spells it:
+			// a pypi entry written django against a package cataloged as Django
+			// is one package, and keying raw reports it as drift on both sides.
 			onHost := map[string]originPackage{}
 			for _, p := range found {
-				onHost[p.Type+"/"+p.Name] = p
+				onHost[profileKey(p.Type, p.Name)] = p
 			}
 			inProfile := map[string]audit.ProfileEntry{}
 			for _, e := range d.Entries {
-				inProfile[e.Type+"/"+e.Name] = e
+				inProfile[profileKey(e.Type, e.Name)] = e
 			}
 
 			var hostOnly, profileOnly []string
@@ -1262,12 +1342,13 @@ drift.`,
 			w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
 			fmt.Fprintf(w, "On %s, not in %s (%d):\n", origin, profile, len(hostOnly))
 			for _, k := range hostOnly {
-				fmt.Fprintf(w, "  %s\t%s\n", k, strings.Join(onHost[k].Versions, ", "))
+				p := onHost[k]
+				fmt.Fprintf(w, "  %s/%s\t%s\n", p.Type, p.Name, strings.Join(p.Versions, ", "))
 			}
 			fmt.Fprintf(w, "\nIn %s, not on %s (%d):\n", profile, origin, len(profileOnly))
 			for _, k := range profileOnly {
 				e := inProfile[k]
-				fmt.Fprintf(w, "  %s\t%s\n", k, orDash(e.Constraint+" "+e.Version))
+				fmt.Fprintf(w, "  %s/%s\t%s\n", e.Type, e.Name, orDash(e.Constraint+" "+e.Version))
 			}
 			_ = w.Flush()
 			if len(hostOnly) == 0 && len(profileOnly) == 0 && len(found) > 0 {

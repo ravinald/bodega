@@ -25,6 +25,29 @@ const (
 	VersionFloating = "floating" // any version
 )
 
+// Expansion values decide what a closed type does about a package it does not
+// list. The default is ExpansionWarn: a new transitive dependency is ordinary
+// upstream maintenance, and refusing it by default leaves the host unpatched.
+//
+// The strings are policy.ActionWarn, ActionBlock and ActionIgnore, spelled
+// again here because internal/policy imports this package and the import
+// cannot run the other way. TestExpansionMatchesPolicyActions holds the two
+// together.
+const (
+	ExpansionWarn   = "warn"   // serve it, and record the reach outside the class
+	ExpansionBlock  = "block"  // refuse it
+	ExpansionIgnore = "ignore" // serve it and record nothing
+)
+
+// Expansions returns the legal values in a stable order, for error text and
+// flag help that has to enumerate them.
+func Expansions() []string { return []string{ExpansionWarn, ExpansionBlock, ExpansionIgnore} }
+
+// ValidExpansion reports whether e is one of the three.
+func ValidExpansion(e string) bool {
+	return e == ExpansionWarn || e == ExpansionBlock || e == ExpansionIgnore
+}
+
 // ErrNoProfile is returned for a profile name no row has.
 var ErrNoProfile = errors.New("no such profile")
 
@@ -41,6 +64,16 @@ func ValidMembership(m string) bool { return m == MembershipClosed || m == Membe
 
 // ValidVersionDefault reports whether v is one of the two.
 func ValidVersionDefault(v string) bool { return v == VersionPinned || v == VersionFloating }
+
+// expansionOrDefault fills the unset expansion with warn, matching the column
+// default. A marker written before expansion existed, and one written by a
+// caller that states nothing about it, both mean "detect, do not refuse".
+func expansionOrDefault(e string) string {
+	if e == "" {
+		return ExpansionWarn
+	}
+	return e
+}
 
 // ProfileConstraints returns the constraint kinds an entry may carry. They are
 // the four already on manifest.VersionEntry rather than a private spelling of
@@ -78,8 +111,11 @@ type ProfileTypeRule struct {
 	Type           string
 	Membership     string
 	VersionDefault string
-	Actor          string
-	UpdatedAt      time.Time
+	// Expansion is what a closed membership does about an unlisted package.
+	// It has no meaning on an open type, which lists nothing to be outside of.
+	Expansion string
+	Actor     string
+	UpdatedAt time.Time
 }
 
 // ProfileEntry names one package inside a profile. Constraint is empty when
@@ -203,7 +239,7 @@ func (a *DB) GetProfile(ctx context.Context, name string) (*ProfileDetail, error
 
 func (a *DB) profileTypes(ctx context.Context, profile string) ([]ProfileTypeRule, error) {
 	rows, err := a.db.QueryContext(ctx,
-		`SELECT profile, pkg_type, membership, version_default, actor, updated_at
+		`SELECT profile, pkg_type, membership, version_default, expansion, actor, updated_at
 		   FROM profile_types WHERE profile = ? ORDER BY pkg_type`, profile)
 	if err != nil {
 		return nil, err
@@ -213,7 +249,8 @@ func (a *DB) profileTypes(ctx context.Context, profile string) ([]ProfileTypeRul
 	for rows.Next() {
 		var r ProfileTypeRule
 		var ts string
-		if err := rows.Scan(&r.Profile, &r.Type, &r.Membership, &r.VersionDefault, &r.Actor, &ts); err != nil {
+		if err := rows.Scan(&r.Profile, &r.Type, &r.Membership, &r.VersionDefault,
+			&r.Expansion, &r.Actor, &ts); err != nil {
 			return nil, err
 		}
 		r.UpdatedAt, _ = time.Parse(time.RFC3339Nano, ts)
@@ -247,6 +284,7 @@ func (a *DB) profileEntries(ctx context.Context, profile string) ([]ProfileEntry
 
 // SetProfileTypeRule writes or replaces one type marker.
 func (a *DB) SetProfileTypeRule(ctx context.Context, r ProfileTypeRule) error {
+	r.Expansion = expansionOrDefault(r.Expansion)
 	if err := validateProfileTypeRule(r); err != nil {
 		return err
 	}
@@ -257,15 +295,16 @@ func (a *DB) SetProfileTypeRule(ctx context.Context, r ProfileTypeRule) error {
 		return errors.New("audit db is read-only")
 	}
 	_, err := a.db.ExecContext(ctx, insertProfileTypeSQL,
-		r.Profile, r.Type, r.Membership, r.VersionDefault, r.Actor)
+		r.Profile, r.Type, r.Membership, r.VersionDefault, r.Expansion, r.Actor)
 	return err
 }
 
-const insertProfileTypeSQL = `INSERT INTO profile_types (profile, pkg_type, membership, version_default, actor)
-	 VALUES (?, ?, ?, ?, ?)
+const insertProfileTypeSQL = `INSERT INTO profile_types (profile, pkg_type, membership, version_default, expansion, actor)
+	 VALUES (?, ?, ?, ?, ?, ?)
 	 ON CONFLICT(profile, pkg_type) DO UPDATE SET
 	     membership = excluded.membership,
 	     version_default = excluded.version_default,
+	     expansion = excluded.expansion,
 	     actor = excluded.actor,
 	     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`
 
@@ -467,7 +506,8 @@ func (a *DB) CreateProfileWith(ctx context.Context, p Profile, types []ProfileTy
 	}
 	for _, r := range types {
 		if _, err := tx.ExecContext(ctx, insertProfileTypeSQL,
-			p.Name, r.Type, r.Membership, r.VersionDefault, r.Actor); err != nil {
+			p.Name, r.Type, r.Membership, r.VersionDefault,
+			expansionOrDefault(r.Expansion), r.Actor); err != nil {
 			return fmt.Errorf("%s: %w", r.Type, err)
 		}
 	}
@@ -490,6 +530,9 @@ func validateProfileTypeRule(r ProfileTypeRule) error {
 	}
 	if !ValidVersionDefault(r.VersionDefault) {
 		return fmt.Errorf("version default %q is not one of: %s", r.VersionDefault, strings.Join(VersionDefaults(), ", "))
+	}
+	if r.Expansion != "" && !ValidExpansion(r.Expansion) {
+		return fmt.Errorf("expansion %q is not one of: %s", r.Expansion, strings.Join(Expansions(), ", "))
 	}
 	return nil
 }

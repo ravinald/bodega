@@ -8,8 +8,10 @@ import (
 )
 
 // immutableHeader is what a served artifact carries and what a refusal must
-// not: a year, past which no caching proxy will re-ask.
-const immutableHeader = "public, max-age=31536000, immutable"
+// not: a year, past which no client will re-ask. "private" rather than
+// "public" because a profile decides what these URLs return — see
+// TestProfileEnforcedRoutesKeepASharedCacheOut.
+const immutableHeader = "private, max-age=31536000, immutable"
 
 // TestCacheControlFollowsTheOutcomePerHandler is issue #199, the sibling of
 // #171. Five handlers set Cache-Control before they knew the outcome, and
@@ -59,10 +61,12 @@ func TestCacheControlFollowsTheOutcomePerHandler(t *testing.T) {
 		wantOutcome(t, s, "/git/present/present-v1.0.0.bundle", http.StatusOK, immutableHeader)
 	})
 
-	// cargo qualifies for neither answer: the download path's last segment is
-	// "download", which isImmutableArtifact does not match. The case is here so
-	// that adding ".crate" to that list is a change someone makes on purpose,
-	// with a test naming what it turns on.
+	// cargo earns no freshness lifetime: the download path's last segment is
+	// "download", which isImmutableArtifact does not match. It still gets the
+	// bare "private", because who may store the answer is a separate question
+	// from how long it stays fresh. The case is here so that adding ".crate"
+	// to that list is a change someone makes on purpose, with a test naming
+	// what it turns on.
 	t.Run("cargo download", func(t *testing.T) {
 		s := newDiscoveryServer(t)
 		wantOutcome(t, s, "/cargo/absent/1.0.0/download", http.StatusBadGateway, "")
@@ -72,7 +76,7 @@ func TestCacheControlFollowsTheOutcomePerHandler(t *testing.T) {
 			t.Fatalf("AddVersion: %v", err)
 		}
 		seed(t, s, manifest.TypeCargo, manifest.CargoCrateKey("present", "1.0.0"))
-		wantOutcome(t, s, "/cargo/present/1.0.0/download", http.StatusOK, "")
+		wantOutcome(t, s, "/cargo/present/1.0.0/download", http.StatusOK, cachePrivate)
 	})
 }
 

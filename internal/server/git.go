@@ -41,7 +41,10 @@ func (s *Server) handleGitBundle(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	w = cacheImmutableOn200(w, file)
+	if !s.entitleGate(w, r, manifest.TypeGit, name, ref) {
+		return
+	}
+	w = cachePrivateOn200(w, file)
 	s.proxyVersion(w, r, manifest.TypeGit, name, ref, manifest.GitKey(name, ref, release))
 }
 
@@ -77,6 +80,12 @@ func (s *Server) handleGitNamespace(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.gitTool == nil {
 		http.NotFound(w, r)
+		return
+	}
+	// The namespace is the unit a profile lists for smart-HTTP, because it is
+	// the unit git_upstreams keys on and the only package identity a clone URL
+	// carries. A clone names no version, so membership is the whole decision.
+	if !s.entitleGate(w, r, manifest.TypeGit, ns, "") {
 		return
 	}
 	s.handleGitSmart(w, r, ns, rest, gu)

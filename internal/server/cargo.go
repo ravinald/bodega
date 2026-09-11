@@ -80,6 +80,7 @@ func (s *Server) handleCargo(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCargoIndex(w http.ResponseWriter, r *http.Request, p string) {
+	noSharedCache(w)
 	crate, ok := cargoCrateFromIndexPath(p)
 	if !ok {
 		http.Error(w, "invalid cargo index path", http.StatusBadRequest)
@@ -93,10 +94,29 @@ func (s *Server) handleCargoIndex(w http.ResponseWriter, r *http.Request, p stri
 		return
 	}
 
+	// The sparse index names no version, so it is decided at the membership
+	// level here and by version in the filter below.
+	if !s.entitleGate(w, r, manifest.TypeCargo, crate, "") {
+		return
+	}
+	permit := profileVersionFilter(s.profileFor(r), manifest.TypeCargo, crate)
+
 	upstream := strings.TrimRight(s.cfg.CargoUpstream, "/") + "/" + p
 	s3Key := manifest.CargoIndexKey(p)
 	forceProxy := pm != nil && packageMode(pm) == manifest.ModeProxy
-	s.proxyOrCache(w, r, s.typeStore(manifest.TypeCargo), s3Key, upstream, manifest.TypeCargo, crate, crate, false, forceProxy)
+	if permit == nil {
+		s.proxyOrCache(w, r, s.typeStore(manifest.TypeCargo), s3Key, upstream, manifest.TypeCargo, crate, crate, false, forceProxy)
+		return
+	}
+	rw := &indexFilterWriter{
+		ResponseWriter: w,
+		subject:        "the cargo index for " + crate,
+		filter:         func(b []byte) []byte { return filterCargoIndex(b, permit) },
+	}
+	s.proxyOrCache(rw, r, s.typeStore(manifest.TypeCargo), s3Key, upstream, manifest.TypeCargo, crate, crate, false, forceProxy)
+	if err := rw.flush(); err != nil {
+		s.logger.Error("cargo index response failed", "crate", crate, "error", err)
+	}
 }
 
 func (s *Server) handleCargoDownload(w http.ResponseWriter, r *http.Request, p string) {
@@ -125,7 +145,11 @@ func (s *Server) handleCargoDownload(w http.ResponseWriter, r *http.Request, p s
 		}
 	}
 
-	w = cacheImmutableOn200(w, path.Base(p))
+	if !s.entitleGate(w, r, manifest.TypeCargo, crate, version) {
+		return
+	}
+
+	w = cachePrivateOn200(w, path.Base(p))
 	// cargo_dl_upstream, not cargo_upstream: the sparse index host serves the
 	// index and nothing else, and crates.io names the download root separately
 	// in the index's own config.json.

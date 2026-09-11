@@ -63,6 +63,14 @@ func (s *Server) handleBinary(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// No binary extension reaches isImmutableArtifact and none should: an
+	// uploader names these files whatever it likes, so there is no filename
+	// shape bodega can read a year-long freshness promise off. The shared-cache
+	// grant is a separate question, and a profile answers it no.
+	w = cachePrivateOn200(w, filename)
+	if !s.entitleGate(w, r, manifest.TypeBinary, pkg, version) {
+		return
+	}
 	s.proxyVersion(w, r, manifest.TypeBinary, pkg, version, manifest.BinaryKey(pkg, version, filename))
 }
 
@@ -88,6 +96,14 @@ func (s *Server) handleBinaryUpstream(w http.ResponseWriter, r *http.Request, ns
 	pkgName := ns + "/" + rest
 	upstream := bu.URL + rest
 	key := manifest.BinaryPrefix + pkgName
+
+	// <namespace>/<rest> is the name a manifest entry carries for a namespaced
+	// binary, so it is what a profile lists. The path names no version bodega
+	// can parse, which leaves membership as the whole decision here.
+	w = cachePrivateOn200(w, rest)
+	if !s.entitleGate(w, r, manifest.TypeBinary, pkgName, "") {
+		return
+	}
 
 	// Anything that is not an explicit "open" is catalog. The default is
 	// applied at config load, but a Server built in code carries whatever mode

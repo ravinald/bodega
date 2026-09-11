@@ -733,15 +733,15 @@ Declares what one class of host may fetch, and the version rule each package car
 
 A profile is a view over one catalog, never a second catalog. Storage, object keys, the checksum table and the manifests do not change: an artifact reached through two profiles is one artifact with one checksum.
 
-**Nothing here is enforced on the serve path yet.** These commands build the model and the predicate; the read path does not consult a profile, so what bodega answers is unchanged. `bodega pin` is the host-side half of the same idea and is a different thing: it emits apt preferences for a host to apply, where a profile decides what bodega will answer.
+The read path enforces this for pypi, npm, gomod, cargo, helm, git and binary. apt is not enforced at fetch time and is the deliberate exception; see [What is enforced, and where](#what-is-enforced-and-where). `bodega pin` is the host-side half of the same idea and is a different thing: it emits apt preferences for a host to apply, where a profile decides what bodega will answer.
 
 Three levels:
 
-| Level           | Command                | Decides                                                                      |
-| --------------- | ---------------------- | ---------------------------------------------------------------------------- |
-| the profile     | `create`, `bind`       | which hosts it governs                                                       |
-| the type marker | `set`                  | membership (`closed`, `open`) and the version default (`pinned`, `floating`) |
-| the entry       | `add`, `pin`, `remove` | one package, and optionally a constraint overriding its type's default       |
+| Level           | Command                | Decides                                                                                                         |
+| --------------- | ---------------------- | --------------------------------------------------------------------------------------------------------------- |
+| the profile     | `create`, `bind`       | which hosts it governs                                                                                          |
+| the type marker | `set`                  | membership (`closed`, `open`), the version default (`pinned`, `floating`) and the expansion action for one type |
+| the entry       | `add`, `pin`, `remove` | one package, and optionally a constraint overriding its type's default                                          |
 
 ```bash
 bodega profile create web --description "public web tier"
@@ -756,23 +756,52 @@ bodega profile show web
 
 `set` writes the per-type marker. Both flags are optional on a type that already has one: what you do not name keeps the value it has.
 
-| Flag                | Value      | Meaning                                   |
-| ------------------- | ---------- | ----------------------------------------- |
-| `--membership`      | `closed`   | only the packages this profile lists      |
-| `--membership`      | `open`     | every package of this type in the catalog |
-| `--version-default` | `pinned`   | only the version each entry names         |
-| `--version-default` | `floating` | any version                               |
+| Flag                | Value      | Meaning                                          |
+| ------------------- | ---------- | ------------------------------------------------ |
+| `--membership`      | `closed`   | only the packages this profile lists             |
+| `--membership`      | `open`     | every package of this type in the catalog        |
+| `--version-default` | `pinned`   | only the version each entry names                |
+| `--version-default` | `floating` | any version                                      |
+| `--expansion`       | `warn`     | serve it, and record the reach outside the class |
+| `--expansion`       | `block`    | refuse it with 403                               |
+| `--expansion`       | `ignore`   | serve it and record nothing                      |
 
 The marker's presence is itself an answer. A type with **no** marker is one the profile states no rule for, and the fleet-wide controls decide it alone; a type **with** a marker is decided by the profile even when no entry names a package.
 
-That is why a `closed` type with nothing listed is a state you can reach, and why `set` and `remove` refuse it without `--force`:
+#### Expansion: what a closed type does about a package it does not list
+
+`--expansion` decides that, per type, and it **defaults to `warn`**. A new transitive dependency is ordinary upstream maintenance, and the cost of refusing one is a host that stops getting patched; `block` is for the profile where an operator has decided otherwise. It is the same `warn | block | ignore` triple `bodega policy age` and `bodega policy osv` carry.
+
+`warn` serves the fetch and writes a discovery row with decision `denied`, so the reach outside the class lands in the table an operator already watches. Read it, then narrow:
+
+```bash
+bodega profile set web npm --membership closed   # warn, the default
+bodega discover list npm                         # the denied rows are what the fleet reached for
+bodega profile add web npm express               # the ones that belong
+bodega profile set web npm --expansion block     # now refuse the rest
+```
+
+The row's `PATTERN` column carries the command that closes it, because nothing about a reach outside a profile is promoted into an allow-list rule and the column would otherwise hold a hint nobody can act on:
 
 ```text
-$ bodega profile set web apt --membership closed
-profile web would be closed for apt with no apt entries, which permits nothing of that type.
+$ bodega discover list gomod
+TYPE   PATTERN                                             HOST              COUNT  DECISIONS    LAST SEEN
+gomod  bodega profile add web gomod github.com/pkg/errors                    1      denied       2026-09-10 23:51
+```
+
+`ignore` writes nothing, which is the operator saying not to hear about this type at all.
+
+Expansion applies to a closed type alone — an open type lists nothing to be outside of, and `bodega profile show` prints `-` for it. It does not touch a version constraint: an entry's constraint is a version an operator named on purpose, so a request outside it is refused whatever the expansion says.
+
+That is why a `closed` type with `--expansion block` and nothing listed is a state you can reach, and why `set` and `remove` refuse it without `--force`:
+
+```text
+$ bodega profile set web apt --membership closed --expansion block
+profile web would be closed for apt with no apt entries and expansion block, which permits nothing of that type.
   Every apt request from a host bound to this profile is refused, and the refusal names no package because none is listed.
   List something:  bodega profile add web apt <name>
   Open the type:   bodega profile set web apt --membership open
+  Detect instead:  bodega profile set web apt --expansion warn
   Mean it:         re-run with --force, which accepts the empty closed set as written
 ```
 
@@ -804,6 +833,16 @@ $ bodega profile unpin nv2 pypi requests
 Released the pin on pypi/requests in nv2; the pypi default is pinned and the entry names no version, so it now permits nothing.
   Give it one:   bodega profile pin nv2 pypi requests <version> --reason <why>
   Or float it:   bodega profile add nv2 pypi requests --constraint any
+```
+
+A `pypi` entry is matched PEP 503 normalized, on both sides of the comparison: `django` covers the wheel pypi publishes as `Django-4.2.11-py3-none-any.whl`, and `python-3parclient` covers the sdist PEP 625 writes as `python_3parclient-4.2.10.tar.gz`. Compared literally the gate refuses a distribution the profile lists, and worse, the mismatch reads as a package outside the set, where the version rule is skipped and the pin never applies. No other type is normalized: `gomod` module paths and `git` namespaces are case-sensitive by specification, and `cargo` refuses a crate name that is not already lowercase.
+
+The verbs match the same way. `add`, `pin`, `unpin` and `remove` find the entry under whichever spelling you type, so `bodega profile remove ops pypi Django` removes the entry stored as `django` instead of reporting it absent, and re-adding a package under its other spelling edits that entry rather than writing a second row beside it. `bodega profile diff` compares both sides under the same rule, so a profile listing `django` against a host cataloged with `Django` reports no drift. A document naming both spellings is refused at `create --from-file`, because only one of the two constraints would survive:
+
+```text
+entries[0] and entries[1] both name pypi/django, which is one entry: the later row would replace the earlier, taking its constraint, reason and review date with it.
+  "django" and "Django" are one project once the name is normalized, which is the form the gate compares
+  Keep the one you mean
 ```
 
 `remove` deletes the entry, which on a closed type means the package is no longer permitted at all.
@@ -901,6 +940,147 @@ A manifest the store cannot read stops the gate instead of appearing in that tab
 $ bodega profile check web
 Error: load pypi/requests: parse package pypi/requests: invalid character 'o' in literal null (expecting 'u')
 ```
+
+#### What is enforced, and where
+
+Two enforcement points, and the order matters.
+
+**The request predicate is the control.** It runs on every package route for pypi, npm, gomod, cargo, helm, git and binary, and answers 403. A client that already holds a tarball URL fetches it without reading any index, so an implementation that only filtered indexes would enforce nothing.
+
+**The index filter is what makes the refusal legible.** A resolver told "no such version" picks another one; a resolver handed an opaque 403 halfway through an install stops with a stack trace and leaves the environment half-built. Six documents are filtered: the pypi simple root and its per-distribution pages, the npm packument's `versions` map (with the `time` entries and `dist-tags` that point at dropped versions), the gomod `@v/list`, the cargo sparse index, and the helm `index.yaml` (which answers 200 with the refused charts absent rather than 403, because a refused index fails `helm repo add` itself). git and binary publish no index, so the predicate is the whole story there.
+
+**apt is deliberately excluded**, and is tracked separately. Refusing an apt fetch at the pool leaves `dpkg` holding a half-configured transaction, which is a worse outcome than no control at all; the apt answer belongs at the generated index, not at fetch time.
+
+No filtered index is stored. Each one is produced by running the profile's filter over the response on the way out, so what sits in the cache is the document the upstream served and one cached object answers every host class correctly. An install with no profiles pays nothing, and a fleet with twenty profiles pays one copy and one upstream fetch per index rather than twenty. A cache hit filters identically to a miss, so a `bodega profile` edit lands within the binding cache TTL rather than at the next upstream refresh. The helm `index.yaml` is generated into storage by `bodega build` rather than cached, and is filtered the same way on the way out.
+
+An HTTP cache in front of bodega is the other half of that, and it is a deployment setting rather than a bodega one: every enforced artifact goes out `private` and every enforced index `no-cache, no-store, must-revalidate`, so a proxy that obeys its response headers is safe and one told to ignore them is not. See [Caching in front of a profile-enforced bodega](#caching-in-front-of-a-profile-enforced-bodega).
+
+Every refusal writes an audit row naming the profile, the package, the version and which rule refused it. The two rules are separate statuses, because the repairs are opposite:
+
+```bash
+bodega audit events --type denied
+```
+
+```text
+TIMESTAMP            EVENT   TYPE   NAME                   STATUS               CLIENT     IDENTITY
+2026-09-10 23:52:00  denied  pypi   requests               profile_constraint   127.0.0.1  web01
+2026-09-10 23:51:46  denied  gomod  github.com/pkg/errors  profile_membership   127.0.0.1  web01
+```
+
+| Status               | Means                                         | Repair                         |
+| -------------------- | --------------------------------------------- | ------------------------------ |
+| `profile_membership` | the package is outside a closed profile's set | `bodega profile add`, or widen |
+| `profile_constraint` | the version is outside the profile's rule     | `bodega profile pin`, or unpin |
+
+#### What each client shows when it is refused
+
+The message differs per ecosystem, and three of the seven print bodega's own body verbatim. That is why the refusal names the repair:
+
+```text
+membership: profile "web" does not list gomod/example.com/mod at v1.0.0.
+  Add it:      bodega profile add web gomod example.com/mod
+  Or open it:  bodega profile set web gomod --membership open
+```
+
+**pypi.** A filtered index reads to `pip` as a distribution that publishes nothing, so it resolves against what is left rather than failing on what is gone:
+
+```text
+$ pip install django
+Looking in indexes: http://bodega:8080/pypi/simple/
+ERROR: Could not find a version that satisfies the requirement django (from versions: none)
+ERROR: No matching distribution found for django
+```
+
+A refused wheel, which is a client that already knew the URL, names the file and the status:
+
+```text
+$ pip install ok
+Collecting ok
+  ERROR: HTTP error 403 while getting http://bodega:8080/pypi/wheels/ok-1.0.0-py3-none-any.whl (from http://bodega:8080/pypi/simple/ok/)
+ERROR: Could not install requirement ok from http://bodega:8080/pypi/wheels/ok-1.0.0-py3-none-any.whl because of HTTP error 403 Client Error: Forbidden for url: http://bodega:8080/pypi/wheels/ok-1.0.0-py3-none-any.whl
+```
+
+A filename bodega cannot place onto a project and a version is refused under the filename itself, so the body and the audit row name a file where they normally name a package. `pip` never asks for one of these; they are `bdist_wininst` and `.egg` files predating the wheel:
+
+```text
+membership: profile "web" does not list pypi/msgpack-python-0.3.0.win-amd64-py2.7.exe.
+  Add it:      bodega profile add web pypi msgpack-python-0.3.0.win-amd64-py2.7.exe
+  Or open it:  bodega profile set web pypi --membership open
+```
+
+Take the repair it prints literally and the entry matches nothing else. Name the real project, or open the type.
+
+**npm.** The same text for a packument and for a tarball, with the URL as the only thing that tells them apart. It does not print bodega's body:
+
+```text
+$ npm install ok
+npm error code E403
+npm error 403 403 Forbidden - GET http://bodega:8080/npm/ok/-/ok-1.0.0.tgz
+npm error 403 In most cases, you or one of your dependencies are requesting a package version that is forbidden by your security policy, or on a server you do not have access to.
+```
+
+**gomod.** `go` prints the whole response body under `server response:`, so the operator reading the failure gets the repair without opening the audit log:
+
+```text
+$ go get example.com/mod@v1.0.0
+go: example.com/mod@v1.0.0: reading http://bodega:8080/go/example.com/mod/@v/v1.0.0.info: 403 Forbidden
+	server response:
+	membership: profile "web" does not list gomod/example.com/mod at v1.0.0.
+	  Add it:      bodega profile add web gomod example.com/mod
+	  Or open it:  bodega profile set web gomod --membership open
+```
+
+**cargo.** Also prints the body, under `body:`, and names the sparse-index URL rather than the crate:
+
+```text
+$ cargo fetch
+Caused by:
+  failed to get successful HTTP response from `http://bodega:8080/cargo/se/rd/serde` (10.0.0.4), got 403
+  body:
+  membership: profile "web" does not list cargo/serde.
+    Add it:      bodega profile add web cargo serde
+    Or open it:  bodega profile set web cargo --membership open
+```
+
+**helm.** `helm repo add` succeeds and the charts are simply not there. The index answers 200 with the refused charts filtered out of it, because a 403 on `index.yaml` fails the repository rather than the install, so the first thing an operator sees is an empty search:
+
+```text
+$ helm repo add bodega http://bodega:8080/helm
+"bodega" has been added to your repositories
+$ helm search repo bodega
+No results found
+```
+
+The refusal arrives at the pull, and helm prints neither the chart name nor bodega's body. This is the ecosystem where the audit row is the only place the reason lives:
+
+```text
+$ helm pull bodega/cert-manager --version 1.14.0
+Error: failed to fetch http://bodega:8080/helm/charts/cert-manager-1.14.0.tgz : 403 Forbidden
+```
+
+**git.** `git` relays the body as `remote:` lines before its own error:
+
+```text
+$ git clone http://bodega:8080/git/github/foo/bar.git
+Cloning into 'bar'...
+remote: membership: profile "web" does not list git/github.
+remote:   Add it:      bodega profile add web git github
+remote:   Or open it:  bodega profile set web git --membership open
+fatal: unable to access 'http://bodega:8080/git/github/foo/bar.git/': The requested URL returned error: 403
+```
+
+**binary.** Whatever the fetcher says about a 403. `curl -fSL` exits 22 and prints no body; `wget` exits 8 and names the status:
+
+```text
+$ curl -fSL http://bodega:8080/binaries/tool/1.0/tool.tar.gz -o tool.tar.gz
+curl: (22) The requested URL returned error: 403
+
+$ wget http://bodega:8080/binaries/tool/1.0/tool.tar.gz
+HTTP request sent, awaiting response... 403 Forbidden
+2026-09-10 16:43:44 ERROR 403: Forbidden.
+```
+
+`-f` is what hides the reason: it makes `curl` fail without writing the body. Drop it to read the refusal, and note that it also drops the non-zero exit, so a script needs `-w '%{http_code}'` to keep both.
 
 Every mutation writes an audit event with `pkg_type=profile`, the profile in `pkg_name` and what inside it in `pkg_version`, so `bodega audit events --type create` shows who changed a control and when.
 
@@ -2436,6 +2616,24 @@ Stripping at the proxy is still the right belt, but it is no longer the only one
 ```json
 "trusted_proxies": ["127.0.0.1/32"]
 ```
+
+#### Caching in front of a profile-enforced bodega
+
+Leave the proxy cache off for `/pypi/`, `/npm/`, `/go/`, `/cargo/`, `/helm/`, `/git/` and `/binaries/`, or let it obey the headers bodega sends and nothing more.
+
+A profile decides what those routes return, so one URL answers two hosts with two documents. A shared cache cannot evaluate a profile: it stores the first answer and hands it to the next host, with no denial row written and no error anywhere. bodega closes this from its side — artifacts go out `private`, indexes go out `no-cache, no-store, must-revalidate` — but a proxy configured to cache past the response headers reopens it. In nginx that means not setting `proxy_ignore_headers Cache-Control` and not forcing `proxy_cache_valid` on these locations.
+
+`/apt/` is the exception and may be cached normally: apt is not profile-enforced, so every host gets the same `.deb` and the pool still ships `public, max-age=31536000, immutable`.
+
+To check what a deployment is sending:
+
+```bash
+curl -sI -H "Authorization: Bearer $BODEGA_TOKEN" \
+  https://bodega.example.com/pypi/wheels/requests-2.31.0-py3-none-any.whl | grep -i cache-control
+# cache-control: private, max-age=31536000, immutable
+```
+
+A `public` on any route but `/apt/` means the request did not reach this version of bodega.
 
 That matters most when bodega and its proxy do not share a host. The default trusts every RFC 1918 address, so on a private network with other tenants the proxy is not the only peer bodega believes.
 

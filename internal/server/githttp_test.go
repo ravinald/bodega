@@ -669,8 +669,12 @@ func TestWriteCGIResponse(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rec.Code)
 	}
-	if got := rec.Header().Get("Cache-Control"); got != "no-cache" {
-		t.Errorf("Cache-Control = %q, want %q", got, "no-cache")
+	// The CGI's own "no-cache" is dropped and bodega's directive replaces it.
+	// Forwarded, git-http-backend's "public, max-age=31536000" on a loose
+	// object would let a shared cache serve one profile's clone to a host with
+	// another.
+	if got := rec.Header().Get("Cache-Control"); got != cacheNoStore {
+		t.Errorf("Cache-Control = %q, want %q", got, cacheNoStore)
 	}
 	if got := rec.Body.String(); got != "not found\n" {
 		t.Errorf("body = %q", got)

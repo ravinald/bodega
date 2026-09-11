@@ -712,8 +712,17 @@ func writeCGIResponse(w http.ResponseWriter, out io.Reader) (wrote bool, err err
 			status = n
 			continue
 		}
+		// git-http-backend marks a loose object and a pack file
+		// "public, max-age=31536000". The namespace they came from is
+		// profile-gated, so bodega decides this header rather than forwarding
+		// a grant that would let a shared cache hand one host class's clone to
+		// another.
+		if strings.EqualFold(name, "Cache-Control") {
+			continue
+		}
 		w.Header().Add(name, value)
 	}
+	noSharedCache(w)
 	w.WriteHeader(status)
 	_, err = io.Copy(newFlushWriter(w), br)
 	return true, err

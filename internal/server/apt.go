@@ -41,7 +41,7 @@ func (s *Server) handleAptPool(w http.ResponseWriter, r *http.Request) {
 	// Wrapped rather than set: the outcome is not known here, and a refusal
 	// that ships a year-long "immutable" outlives the policy change that would
 	// have corrected it. Covers handleAptMirrorPool below, which inherits w.
-	w = cacheImmutableOn200(w, path.Base(p))
+	w = cacheSharedImmutableOn200(w, path.Base(p))
 	store, err := s.aptPoolStore(poolPath)
 	if err != nil {
 		s.logger.Error("storage backend recorded for pooled .deb is not configured",
