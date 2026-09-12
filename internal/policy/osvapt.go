@@ -171,13 +171,22 @@ type osvLookup struct {
 // For a language ecosystem that is the registry type's own OSV identifier and
 // the package name. For apt it is the source package, because advisories are
 // issued against the source and one source builds the several binaries a host
-// reports, queried against the ecosystem of every suite the entry itself
-// names. The entry's suites and not the server's apt_codename: a catalog
-// holding a jammy entry and a noble entry answered from one codename is wrong
-// about one of them, in the direction that reports a vulnerable host clean.
+// reports, queried against the ecosystem of the release the entry itself
+// records. The entry's own release and not the server's apt_codename: a
+// catalog holding a jammy entry and a noble entry answered from one codename
+// is wrong about one of them, in the direction that reports a vulnerable host
+// clean.
 //
-// defaultSuite covers the entry that names no suite, which is every apt entry
-// written before the field existed and every one an older capture produced.
+// CaptureSuite answers first because it is the only field that means "the
+// release this version string came from". Suites means "the dists/<suite>/ this
+// .deb is published to", and the two part company on any server whose
+// apt_codename is a house name: a noble capture published to "internal" is
+// answered from noble's advisories and served out of dists/internal. Suites is
+// still read for the entry a person wrote by hand, where the suite served is
+// the only release named at all.
+//
+// defaultSuite covers the entry that records neither, which is every apt entry
+// written before the fields existed and every one an older capture produced.
 // The server publishes those under apt_codename, so that is the release whose
 // advisories cover them, and it is already in the synced set because
 // ServedAptSuites always includes it. Empty when the caller holds no Config,
@@ -206,12 +215,15 @@ func osvLookupFor(pm *manifest.PackageManifest, ve *manifest.VersionEntry, defau
 	if name == "" {
 		name, kind = pm.Name, "binary package"
 	}
-	if len(ve.Suites) == 0 {
-		if releases := aptServedReleases(servedSuites); len(releases) > 1 {
-			return osvLookup{reason: aptAmbiguousSuiteReason(pm.Name, releases)}
+	suites := []string{ve.CaptureSuite}
+	if ve.CaptureSuite == "" {
+		if len(ve.Suites) == 0 {
+			if releases := aptServedReleases(servedSuites); len(releases) > 1 {
+				return osvLookup{reason: aptAmbiguousSuiteReason(pm.Name, releases)}
+			}
 		}
+		suites = ve.EffectiveSuites(defaultSuite)
 	}
-	suites := ve.EffectiveSuites(defaultSuite)
 	exports, unmapped := OSVExportsFor(manifest.TypeApt, suites)
 	if len(exports) == 0 {
 		return osvLookup{reason: aptUnmappedReason(pm.Name, suites, unmapped)}
@@ -259,9 +271,9 @@ func aptUnverifiedNameReason(name string, exports []string) string {
 // that records it at capture: a manifest fixed by hand is fixed again by the
 // next import of the same inventory.
 func aptAmbiguousSuiteReason(name string, releases []string) string {
-	return fmt.Sprintf("apt entry %s names no suite and this bodega serves %d releases (%s), "+
+	return fmt.Sprintf("apt entry %s names no release and this bodega serves %d releases (%s), "+
 		"so nothing identifies which release's advisories cover its version; "+
-		"set suites on the version entry, or re-capture the host with 'bodega pkg convert apt --suite <codename>' and re-import",
+		"set capture_suite on the version entry, or re-capture the host with 'bodega pkg convert apt --suite <codename>' and re-import",
 		name, len(releases), strings.Join(releases, ", "))
 }
 
@@ -273,7 +285,7 @@ func aptAmbiguousSuiteReason(name string, releases []string) string {
 // server resolves an entry naming none to apt_codename before it gets here.
 func aptUnmappedReason(name string, suites, unmapped []string) string {
 	if len(suites) == 0 {
-		return fmt.Sprintf("apt entry %s names no suite, so no Ubuntu or Debian release identifies the advisories that cover it; set suites on the version entry", name)
+		return fmt.Sprintf("apt entry %s names no release, so no Ubuntu or Debian advisories identify the ones that cover it; set capture_suite on the version entry", name)
 	}
 	return fmt.Sprintf("apt entry %s names suite(s) %s, which OSV publishes no Ubuntu or Debian export for",
 		name, strings.Join(unmapped, ", "))

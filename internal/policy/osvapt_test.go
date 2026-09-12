@@ -22,9 +22,13 @@ func aptChecker(t *testing.T) *OSVChecker {
 	return ck
 }
 
+// aptEntry is the shape a capture produces: the release on CaptureSuite, which
+// is the field 'bodega pkg convert apt' writes and the field the gate reads
+// first. Suites is the publishing set and answers only for an entry a person
+// wrote by hand; see TestOSVApt_CaptureSuiteOutranksThePublishingSuites.
 func aptEntry(version, suite string) (*manifest.PackageManifest, *manifest.VersionEntry) {
 	return &manifest.PackageManifest{Name: "libexpat1", Type: manifest.TypeApt},
-		&manifest.VersionEntry{Version: version, SourcePackage: "expat", Suites: []string{suite}}
+		&manifest.VersionEntry{Version: version, SourcePackage: "expat", CaptureSuite: suite}
 }
 
 // TestOSVApt_BackportedRevisionReportsClean is the test this item exists for.
@@ -178,9 +182,9 @@ func TestOSVApt_UnanswerableEntryWarns(t *testing.T) {
 			want: "plucky",
 		},
 		{
-			name: "no suite at all",
+			name: "no release at all",
 			ve:   manifest.VersionEntry{Version: "2.6.3-2", SourcePackage: "expat"},
-			want: "names no suite",
+			want: "names no release",
 		},
 		{
 			name: "no version",
@@ -651,5 +655,57 @@ func TestOSVApt_SuitelessEntryWarnsWhenSeveralReleasesAreServed(t *testing.T) {
 	ve = &manifest.VersionEntry{Version: "2.4.7-1ubuntu0.2", SourcePackage: "expat", Suites: []string{"jammy"}}
 	if r := ck.Check(context.Background(), pm, ve); r.Action != ActionBlock {
 		t.Fatalf("the entry names jammy; got %q: %s", r.Action, r.Reason)
+	}
+}
+
+// TestOSVApt_CaptureSuiteOutranksThePublishingSuites pins the split between the
+// two fields that carry a suite name.
+//
+// suites decides which dists/<suite>/ the .deb is published to, and a bodega
+// whose apt_codename is a local name serves suites no captured host ever ran:
+// the documented mirror configuration publishes an "internal" suite built from
+// noble upstreams. So the release a version string came from cannot live in
+// suites without taking the entry out of every generated index, and the gate
+// reads capture_suite first. suites is still read for the entry nothing
+// captured, where the suite it is served under is the only release named.
+func TestOSVApt_CaptureSuiteOutranksThePublishingSuites(t *testing.T) {
+	ck := aptChecker(t)
+	ck.DefaultAptSuite = "internal"
+	ck.ServedAptSuites = []string{"internal"}
+
+	pm := &manifest.PackageManifest{Name: "libexpat1", Type: manifest.TypeApt}
+	// A noble capture published to a house suite: "internal" maps to no OSV
+	// release, and the capture is what the answer has to come from.
+	ve := &manifest.VersionEntry{Version: "2.6.1-2build1", SourcePackage: "expat",
+		CaptureSuite: "noble", Suites: []string{"internal"}}
+	r := ck.Check(context.Background(), pm, ve)
+	if r.Action != ActionBlock {
+		t.Fatalf("a noble capture behind USN-7000-1 must report it whatever suite it is served under; got %q: %s",
+			r.Action, r.Reason)
+	}
+	if got, want := ve.Metadata[OSVMetaQueried], "source package expat in Ubuntu:24.04:LTS"; got != want {
+		t.Errorf("stamped %q, want %q", got, want)
+	}
+
+	// Nothing captured: the suite served is the only release on the entry.
+	ve = &manifest.VersionEntry{Version: "2.4.7-1ubuntu0.2", SourcePackage: "expat", Suites: []string{"jammy"}}
+	if r := ck.Check(context.Background(), pm, ve); r.Action != ActionBlock {
+		t.Fatalf("a hand-published jammy entry still answers from jammy; got %q: %s", r.Action, r.Reason)
+	}
+	if got, want := ve.Metadata[OSVMetaQueried], "source package expat in Ubuntu:22.04:LTS"; got != want {
+		t.Errorf("stamped %q, want %q", got, want)
+	}
+
+	// A capture from a release OSV publishes nothing for warns on its own
+	// release rather than falling through to the publishing suite, which would
+	// answer a plucky host from whatever jammy says.
+	ve = &manifest.VersionEntry{Version: "2.6.3-2", SourcePackage: "expat",
+		CaptureSuite: "plucky", Suites: []string{"jammy"}}
+	r = ck.Check(context.Background(), pm, ve)
+	if r.Action != ActionWarn {
+		t.Fatalf("plucky maps to no export and jammy is not its stand-in; got %q: %s", r.Action, r.Reason)
+	}
+	if !strings.Contains(r.Reason, "plucky") {
+		t.Errorf("the warn has to name the release that stopped the lookup: %q", r.Reason)
 	}
 }

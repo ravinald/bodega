@@ -117,6 +117,7 @@ func newPolicyOSVListCmd(gf *globalFlags) *cobra.Command {
 				return err
 			}
 			db := policy.NewOSVDatabase(cfg.ResolveOSVDBDir())
+			db.ExportBase = osvExportBase
 			adb := openAuditDB(gf)
 			if adb == nil {
 				return fmt.Errorf("audit DB unavailable")
@@ -182,6 +183,12 @@ func newPolicyOSVRemoveCmd(gf *globalFlags) *cobra.Command {
 	}
 }
 
+// osvExportBase is the bucket sync fetches from. A variable so this command's
+// own tests can drive it against a stand-in export: OSV's real bucket is the
+// only other answer, and a test that reaches it proves nothing about the exit
+// code it was written for.
+var osvExportBase = policy.DefaultOSVExportBase
+
 func newPolicyOSVSyncCmd(gf *globalFlags) *cobra.Command {
 	return &cobra.Command{
 		Use:   "sync [ecosystem...]",
@@ -195,7 +202,11 @@ Ubuntu and Debian advisories on the release. Those releases are distilled
 out of one archive each: OSV stopped rebuilding its per-release archives in
 October 2024 and keeps the aggregate current. A suite OSV publishes no
 records for is named on stderr and fetched for nothing; entries published
-to it warn at admission rather than reporting clean.
+to it warn at admission rather than reporting clean. A suite set where none
+of them resolves is a skip in the no-argument form, so an install whose
+suites are local names still exits 0 once the other ecosystems have
+written; naming apt on the command line fails, because that request fetched
+nothing.
 
 This is the only OSV subcommand that reaches the network. On an
 air-gapped host, run it where the network is, copy the directory over,
@@ -206,7 +217,8 @@ and point osv_db_dir at the copy.`,
 				return err
 			}
 			ecosystems := policy.OSVEcosystems()
-			if len(args) > 0 {
+			named := len(args) > 0
+			if named {
 				for _, eco := range args {
 					if err := requireEcosystem(eco, policy.OSVEcosystems(), "OSV gate",
 						"there is no export to fetch for it"); err != nil {
@@ -216,6 +228,7 @@ and point osv_db_dir at the copy.`,
 				ecosystems = args
 			}
 			db := policy.NewOSVDatabase(cfg.ResolveOSVDBDir())
+			db.ExportBase = osvExportBase
 
 			// apt is one export per served suite: OSV keys Ubuntu and
 			// Debian advisories on the release, because the revision that
@@ -232,7 +245,17 @@ and point osv_db_dir at the copy.`,
 					skipped = append(skipped, fmt.Sprintf("%s: OSV publishes no Ubuntu or Debian export for suite %q", eco, suite))
 				}
 				if len(exports) == 0 {
-					failed = append(failed, fmt.Sprintf("%s: no OSV export to fetch", eco))
+					// Only apt can resolve to nothing, and a suite set that
+					// does is a skip rather than a failure: the language
+					// ecosystems synced, and an operator whose apt_suites are
+					// house names would otherwise get exit 1 out of the
+					// no-argument form forever. Naming the type on the command
+					// line still fails, because that request fetched nothing.
+					if named {
+						failed = append(failed, fmt.Sprintf("%s: no OSV export to fetch", eco))
+					} else if len(unmapped) == 0 {
+						skipped = append(skipped, fmt.Sprintf("%s: no suite to fetch an OSV export for", eco))
+					}
 					continue
 				}
 				for _, osvEco := range exports {

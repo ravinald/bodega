@@ -291,7 +291,7 @@ bodega pkg convert apt --origin db01 --suite noble db01-installed.txt
 
 Every version entry is stamped with the host the inventory describes, under the `_origin` metadata key, defaulting to this machine's hostname. That is what running convert on the host buys beyond reading the inventory: a catalog assembled from four machines can name the contributor of each row, and a baseline for a class of host can be built from the machine that defines the class. `--origin <name>` names the host when the capture was taken there and converted somewhere else. See [`--origin`](#--origin) for what the import does with it.
 
-An apt inventory records one more thing about the host: the release it was captured on, on every version entry's `suites`. That is the field the OSV gate keys apt advisories on, and it has to come from the capture because dpkg reports no codename in either format and the fix for a CVE is a fact about one release: see [apt](#apt) under the OSV gate. It defaults to `VERSION_CODENAME` in this machine's `/etc/os-release`, and `--suite <codename>` names the release when the capture came from another one. Either way the run says which release it recorded:
+An apt inventory records one more thing about the host: the release it was captured on, on every version entry's `capture_suite`. That is the field the OSV gate keys apt advisories on, and it has to come from the capture because dpkg reports no codename in either format and the fix for a CVE is a fact about one release: see [apt](#apt) under the OSV gate. It is not `suites`, which decides which `dists/<suite>/` the entry is published to; the two are different values on any server whose `apt_codename` is a name of your own. It defaults to `VERSION_CODENAME` in this machine's `/etc/os-release`, and `--suite <codename>` names the release when the capture came from another one. Either way the run says which release it recorded:
 
 ```
 apt: recording release "jammy" on every entry (VERSION_CODENAME in /etc/os-release)
@@ -320,8 +320,8 @@ Prefer `dpkg-query` to `apt list --installed`: it is machine readable, it carrie
 
 #### What convert does and does not resolve
 
-- **apt** entries carry the name, the version, `source_name`, `source_package`, `suites` and no URL. The build pipeline resolves them with `apt-get download`, against the bodega server's own sources.
-- **The release is recorded on every entry, from `--suite` or this machine's `/etc/os-release`.** `suites` is what the OSV gate keys apt advisories on, because Ubuntu and Debian backport a fix without moving the upstream version. An entry carrying none falls back to the server's `apt_codename`, which is right on a bodega serving one release and a guess on a bodega serving two: see [apt](#apt) under the OSV gate.
+- **apt** entries carry the name, the version, `source_name`, `source_package`, `capture_suite` and no URL. The build pipeline resolves them with `apt-get download`, against the bodega server's own sources.
+- **The release is recorded on every entry, from `--suite` or this machine's `/etc/os-release`.** `capture_suite` is what the OSV gate keys apt advisories on, because Ubuntu and Debian backport a fix without moving the upstream version. Convert records no `suites`, so the entry publishes to whatever suite the importing server serves: a release written into `suites` would take every converted entry out of the indexes of a bodega whose `apt_codename` is a local name. An entry carrying no `capture_suite` falls back to `suites` and then to the server's `apt_codename`, which is right on a bodega serving one release and a guess on a bodega serving two: see [apt](#apt) under the OSV gate.
 - **The source package is recorded from `${source:Package}`, and only from there.** `source_name` is the name `apt-get download` asks for and is always the binary name; `source_package` is what USN and DSA are issued against, and the OSV gate queries that one. The two differ on 73 of the 101 packages a stock `ubuntu:22.04` container installs (`libssl3` from `openssl`, `bsdutils` from `util-linux`), so a capture that drops the field leaves the gate unable to answer for most of the host: see [apt](#apt) under the OSV gate. `apt list --installed` prints the source name in no position at all, so a catalog captured that way can never carry one. A four-field capture taken before bodega asked still parses unchanged; re-capture with the fifth field to give the gate something to query.
 - **pypi, npm, gomod and cargo** entries carry a name and a version and import as `proxy`. The registry is already known from `pypi_upstream` and its siblings, so nothing else is needed. Flip an entry to `hosted` and run the pipeline to pre-fetch the artifact.
 - **helm** entries import with **no URL**. A helm release records the chart it came from (`nginx-18.2.4`) but not the repository, and bodega resolves helm upstreams per version. Fill the URLs in before importing, or resolve them with `helm search repo <chart> -o json`. Guessing a repository would put an unverified URL into a supply-chain catalog.
@@ -1220,6 +1220,8 @@ skipped apt: OSV publishes no Ubuntu or Debian export for suite "plucky"
 
 Name ecosystems to sync a subset (`bodega policy osv sync npm pypi`). The no-argument form syncs everything the gate covers, `apt` included, so it pulls the aggregate `Ubuntu` and `Debian` archives whether or not this install serves apt: name the ecosystems to skip that. `apt` expands to one row per served suite, and the suites that resolve to the same distro come out of one download. Each archive is written under a temporary name and renamed, so an interrupted sync leaves the previous copy in place rather than a half-written one the gate would read as truth.
 
+A suite set where no suite resolves to a release is a skip rather than a failure: the mirror configuration under [Mirroring an upstream archive](#mirroring-an-upstream-archive) serves only house names, so the no-argument form names them on stderr and still exits 0 once the other ecosystems have written. Naming `apt` on the command line there exits non-zero, because that request asked for an export and fetched nothing.
+
 An export that distills to no packages fails that ecosystem's row and writes nothing. Otherwise it would land a database with a current fetch time, and every version in the ecosystem would read clean for the whole `osv_db_max_age` window: `RECORDS 0` shows once in this table and never again.
 
 The numbers are the distilled database, not the download: OSV's npm export is 222 MB of JSON, and what lands on disk is 3.8 MB because sync keeps the ids, summaries, severities and affected ranges and drops the prose. A full sync of the four language ecosystems takes about 15 seconds on a home connection and leaves around 5.5 MB on disk. `apt` costs more on both counts, because the aggregate `Ubuntu` archive is 681 MB and `Debian` 330 MB: measured 2026-09-11, two Ubuntu releases out of one download took 64 seconds and wrote 11.9 MiB.
@@ -1298,7 +1300,7 @@ Ubuntu and Debian fix a vulnerability by backporting the patch into the package 
 
 OSV carries `Ubuntu` and `Debian` ecosystems sourced from USN and DSA, and the fixed versions in them are the distro's own revisions. Three things have to line up before that data can answer.
 
-**The ecosystem comes from the entry's own suite.** A pocket suffix is stripped, so `jammy-security` resolves the same as `jammy`.
+**The ecosystem comes from the release the entry itself records.** A pocket suffix is stripped, so `jammy-security` resolves the same as `jammy`.
 
 | Suite      | OSV ecosystem      | Suite      | OSV ecosystem |
 | ---------- | ------------------ | ---------- | ------------- |
@@ -1313,14 +1315,16 @@ OSV carries `Ubuntu` and `Debian` ecosystems sourced from USN and DSA, and the f
 
 A codename is absent when OSV carries no release's worth of records for it, which is every superseded interim Ubuntu release: measured 2026-09-11, `mantic`, `oracular` and `plucky` answer with 3, 3 and 4 records across ten probed source packages, against 421 for `xenial`. A handful is worse for the operator than none, because it distills to a non-empty index that passes the no-packages check under [Sync](#sync) and then reports the rest of the release clean for the whole `osv_db_max_age` window. The gate warns on an absent codename instead.
 
-The suite on the version entry, never `apt_codename`. One catalog holds entries for both releases, and answering both from one codename is wrong about one of them, in the direction that reports a vulnerable host clean: noble's version strings are newer than every jammy advisory's fixed version, so a noble entry checked against jammy's records matches nothing. `bodega pkg convert apt` is what puts the release on the entry, from the host it runs on or from `--suite`; see [`bodega pkg convert`](#bodega-pkg-convert-type-file-).
+The release on the version entry, never `apt_codename`. One catalog holds entries for both releases, and answering both from one codename is wrong about one of them, in the direction that reports a vulnerable host clean: noble's version strings are newer than every jammy advisory's fixed version, so a noble entry checked against jammy's records matches nothing. `bodega pkg convert apt` is what puts the release on the entry, from the host it runs on or from `--suite`; see [`bodega pkg convert`](#bodega-pkg-convert-type-file-).
 
-An entry naming no suite falls back to `apt_codename`, and only while the codename is the one release this bodega serves. That is the release the server publishes such an entry under, so it is the release whose advisories cover it, and `sync` has already fetched the index because the served set always includes the codename.
+**The release and the publishing suite are two fields.** `capture_suite` is the release the captured host was running and the gate reads it first. `suites` is the set of `dists/<suite>/` trees the `.deb` is offered under, and the index generator reads that one. They hold the same value on a bodega serving upstream codenames and different values on the mirror configuration under [Mirroring an upstream archive](#mirroring-an-upstream-archive), where `apt_codename` is `internal` and `apt_upstreams` holds noble: a jammy capture there is answered from `Ubuntu:22.04:LTS` and served out of `dists/internal/`. Writing the release into `suites` instead would drop every converted entry out of every generated index, and nothing would say so at convert, import or serve time.
+
+An entry recording neither falls back to `apt_codename`, and only while the codename is the one release this bodega serves. That is the release the server publishes such an entry under, so it is the release whose advisories cover it, and `sync` has already fetched the index because the served set always includes the codename.
 
 With `apt_suites` holding two releases the fallback becomes a guess about the one thing being checked. A catalog imported before capture recorded a release carries jammy and noble entries that look identical on the manifest, so the gate declines rather than picking:
 
 ```
-apt/libexpat1: 2.6.1-2build1: osv: apt entry libexpat1 names no suite and this bodega serves 2 releases (Ubuntu:22.04:LTS, Ubuntu:24.04:LTS), so nothing identifies which release's advisories cover its version; set suites on the version entry, or re-capture the host with 'bodega pkg convert apt --suite <codename>' and re-import
+apt/libexpat1: 2.6.1-2build1: osv: apt entry libexpat1 names no release and this bodega serves 2 releases (Ubuntu:22.04:LTS, Ubuntu:24.04:LTS), so nothing identifies which release's advisories cover its version; set capture_suite on the version entry, or re-capture the host with 'bodega pkg convert apt --suite <codename>' and re-import
 ```
 
 Pockets are not releases: `jammy`, `jammy-security` and `jammy-updates` are one set of advisories, so serving all three keeps the fallback unambiguous. A served suite OSV publishes no export for does count as another release, because it is another release an entry could have come from and this gate cannot place it either way.
@@ -2176,6 +2180,7 @@ Every key but `platform` is omitted when empty, so an entry stamped on a host wi
   "version": "2.4.2",
   "source_name": "amazon-efs-utils",
   "source_package": "amazon-efs-utils",
+  "capture_suite": "noble",
   "url": "https://github.com/aws/efs-utils.git",
   "build_cmd": "make deb",
   "deb_glob": "build/*.deb",
@@ -2185,6 +2190,7 @@ Every key but `platform` is omitted when empty, so an entry stamped on a host wi
 
 - **source_name**: upstream Debian package / source directory name. This is what `apt-get download` and a source build ask for, so it is the binary package name on every imported entry.
 - **source_package**: the Debian source package this binary was built from, as `dpkg-query -W -f='${source:Package}'` reports it. Read by the OSV gate and by nothing else, because USN and DSA are keyed on it. Absent means no capture recorded one, which is not the same as equal to the name: see [apt](#apt) under the OSV gate for what the gate does with the difference.
+- **capture_suite**: the release the host this version was captured on was running, from `bodega pkg convert apt --suite` or the converting machine's `/etc/os-release`. Read by the OSV gate, which keys a distro advisory on the release because Ubuntu and Debian backport a fix without moving the upstream version. Ignored by the index generator: **suites** below decides where the `.deb` is published, and on a server whose `apt_codename` is a name of your own the two fields hold different values.
 - **build_cmd**: shell command to produce .deb
 - **deb_glob**: path glob to locate produced .deb
 - **suites**: apt suites this .deb is published to. Absent means the server's default suite (`apt_codename`). A suite name may not contain `/`. The pool is flat and shared, so one entry listed in two suites is one `.deb` served under both `dists/` trees.

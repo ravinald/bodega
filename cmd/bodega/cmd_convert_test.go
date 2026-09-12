@@ -53,8 +53,15 @@ func TestConvertAptRecordsTheSuite(t *testing.T) {
 	if len(pms) != 1 {
 		t.Fatalf("converted %d packages, want 1", len(pms))
 	}
-	if got := pms[0].Versions[0].Suites; len(got) != 1 || got[0] != "jammy" {
-		t.Errorf("suites = %v, want [jammy]", got)
+	if got := pms[0].Versions[0].CaptureSuite; got != "jammy" {
+		t.Errorf("capture_suite = %q, want jammy", got)
+	}
+	// The release is recorded as provenance and never as placement: suites
+	// picks the dists/<suite>/ the entry is published to, and a server whose
+	// apt_codename is a local name serves none of the codenames a capture
+	// carries, so the entry would vanish from every generated index.
+	if got := pms[0].Versions[0].Suites; len(got) != 0 {
+		t.Errorf("suites = %v, want none", got)
 	}
 	// Silence would let an operator convert a capture from another release on
 	// this machine and never learn which release got recorded.
@@ -78,8 +85,8 @@ func TestConvertAptResolvesTheSuiteFromOSRelease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("convert: %v", err)
 	}
-	if got := res.Packages[0].Versions[0].Suites; len(got) != 1 || got[0] != "noble" {
-		t.Errorf("suites = %v, want [noble]", got)
+	if got := res.Packages[0].Versions[0].CaptureSuite; got != "noble" {
+		t.Errorf("capture_suite = %q, want noble", got)
 	}
 	// The flag outranks the host: a capture taken elsewhere is the whole
 	// reason it exists.
@@ -87,8 +94,8 @@ func TestConvertAptResolvesTheSuiteFromOSRelease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("convert: %v", err)
 	}
-	if got := res.Packages[0].Versions[0].Suites; len(got) != 1 || got[0] != "jammy" {
-		t.Errorf("suites = %v, want [jammy]", got)
+	if got := res.Packages[0].Versions[0].CaptureSuite; got != "jammy" {
+		t.Errorf("capture_suite = %q, want jammy", got)
 	}
 
 	// A host that names no codename records none: a capture converted on a
@@ -101,8 +108,8 @@ func TestConvertAptResolvesTheSuiteFromOSRelease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("convert: %v", err)
 	}
-	if got := res.Packages[0].Versions[0].Suites; len(got) != 0 {
-		t.Errorf("suites = %v, want none recorded", got)
+	if got := res.Packages[0].Versions[0].CaptureSuite; got != "" {
+		t.Errorf("capture_suite = %q, want none recorded", got)
 	}
 	if !strings.Contains(errbuf.String(), "--suite") {
 		t.Errorf("the warning has to name the flag that fixes it: %q", errbuf.String())
@@ -134,8 +141,8 @@ func TestConvertAptSuiteIsTrimmed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pkg convert apt: %v", err)
 	}
-	if got := pms[0].Versions[0].Suites; len(got) != 1 || got[0] != "jammy" {
-		t.Errorf("suites = %v, want [jammy]", got)
+	if got := pms[0].Versions[0].CaptureSuite; got != "jammy" {
+		t.Errorf("capture_suite = %q, want jammy", got)
 	}
 	if strings.Contains(errs, `"  jammy  "`) {
 		t.Errorf("the run reported the untrimmed flag: %q", errs)

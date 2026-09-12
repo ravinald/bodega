@@ -144,6 +144,20 @@ type VersionEntry struct {
 	// empty answer as clean. See policy.osvLookupFor.
 	SourcePackage string `json:"source_package,omitempty"`
 
+	// CaptureSuite is the apt release the host this version was captured on
+	// was running, as 'bodega pkg convert apt' records it from --suite or the
+	// machine's /etc/os-release.
+	//
+	// Provenance, not placement: the OSV gate keys a distro advisory on the
+	// release because Ubuntu and Debian backport a fix without moving the
+	// upstream version, and the index generator ignores this field entirely.
+	// Suites is the publishing field and cannot carry the release instead: a
+	// server whose apt_codename is a house name serves suites the captured
+	// host never named, so writing "noble" into Suites drops the entry out of
+	// every generated index. Empty means no capture recorded a release; see
+	// policy.osvLookupFor for what the gate does then.
+	CaptureSuite string `json:"capture_suite,omitempty"`
+
 	// BuildCmd is the shell command executed inside the cloned source directory
 	// to produce a .deb file.
 	BuildCmd string `json:"build_cmd,omitempty"`

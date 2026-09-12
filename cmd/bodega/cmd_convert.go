@@ -43,7 +43,10 @@ An apt inventory also records the release it was captured on, because Ubuntu
 and Debian backport a security fix without moving the upstream version, so the
 advisories that settle a version are the ones published for its own release.
 That defaults to VERSION_CODENAME in this machine's /etc/os-release; --suite
-names the release when the capture came from another one.
+names the release when the capture came from another one. It is recorded as the
+capture's own release and not as a suite the entry publishes to, so importing a
+catalog into a server serving suites of its own changes nothing about where the
+entries are served.
 
 Sources per type:
   apt     dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\t${source:Package}\n'

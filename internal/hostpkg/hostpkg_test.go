@@ -431,8 +431,14 @@ func TestAptCaptureRecordsItsRelease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseAptWithSuite: %v", err)
 	}
-	if got := res.Packages[0].Versions[0].Suites; len(got) != 1 || got[0] != "noble" {
-		t.Errorf("suites = %v, want [noble]", got)
+	if got := res.Packages[0].Versions[0].CaptureSuite; got != "noble" {
+		t.Errorf("capture_suite = %q, want noble", got)
+	}
+	// Not the publishing field. A server whose apt_codename is a house name
+	// serves no suite a captured host could have named, so a release written
+	// into Suites takes the entry out of every generated index.
+	if got := res.Packages[0].Versions[0].Suites; len(got) != 0 {
+		t.Errorf("suites = %v, want none: the release is provenance, not placement", got)
 	}
 
 	// A capture with no release recorded must record none. The OSV gate warns
@@ -442,13 +448,13 @@ func TestAptCaptureRecordsItsRelease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseApt: %v", err)
 	}
-	if got := none.Packages[0].Versions[0].Suites; len(got) != 0 {
-		t.Errorf("suites = %v, want none", got)
+	if got := none.Packages[0].Versions[0].CaptureSuite; got != "" {
+		t.Errorf("capture_suite = %q, want none", got)
 	}
 	if blank, err := ParseAptWithSuite(strings.NewReader(capture), "  "); err != nil {
 		t.Fatalf("ParseAptWithSuite: %v", err)
-	} else if got := blank.Packages[0].Versions[0].Suites; len(got) != 0 {
-		t.Errorf("whitespace recorded suites = %v, want none", got)
+	} else if got := blank.Packages[0].Versions[0].CaptureSuite; got != "" {
+		t.Errorf("whitespace recorded capture_suite = %q, want none", got)
 	}
 
 	// Every row, not the first: a host inventory is a thousand packages and
@@ -458,8 +464,8 @@ func TestAptCaptureRecordsItsRelease(t *testing.T) {
 		t.Fatalf("ParseAptWithSuite: %v", err)
 	}
 	for _, pm := range all.Packages {
-		if got := pm.Versions[0].Suites; len(got) != 1 || got[0] != "jammy" {
-			t.Fatalf("%s: suites = %v, want [jammy]", pm.Name, got)
+		if got := pm.Versions[0].CaptureSuite; got != "jammy" {
+			t.Fatalf("%s: capture_suite = %q, want jammy", pm.Name, got)
 		}
 	}
 }

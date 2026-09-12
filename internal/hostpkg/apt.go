@@ -55,7 +55,7 @@ func ParseApt(r io.Reader) (Result, error) {
 }
 
 // ParseAptWithSuite is ParseApt with the release the inventory was captured
-// on, written onto every entry's Suites.
+// on, written onto every entry's CaptureSuite.
 //
 // The release is the capture's to record and nothing else's. Ubuntu and Debian
 // backport a security fix without moving the upstream version, so the
@@ -64,6 +64,11 @@ func ParseApt(r io.Reader) (Result, error) {
 // one server-wide codename: it would be wrong about one of them, in the
 // direction that reports a vulnerable host clean. dpkg reports no codename in
 // either format, so it comes from the host convert runs on or from --suite.
+//
+// CaptureSuite and not Suites, which decides which dists/<suite>/ the entry is
+// published to: a server whose apt_codename is a house name serves no suite
+// the captured host could have named, so recording the release there would
+// take every converted entry out of the generated indexes.
 //
 // An empty suite records none rather than guessing. See policy.osvLookupFor
 // for what the OSV gate does with an entry naming no release.
@@ -77,9 +82,7 @@ func ParseAptWithSuite(r io.Reader, suite string) (Result, error) {
 	for _, row := range inv.Rows {
 		pm := pkg(manifest.TypeApt, row.Name, row.Version, "", "")
 		pm.Versions[0].SourcePackage = row.Source
-		if suite != "" {
-			pm.Versions[0].Suites = []string{suite}
-		}
+		pm.Versions[0].CaptureSuite = suite
 		res.Packages = append(res.Packages, pm)
 	}
 	sortPackages(res.Packages)

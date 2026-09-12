@@ -22,6 +22,7 @@ import (
 	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/aptsign"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/hostpkg"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/storage"
 )
@@ -646,5 +647,53 @@ func TestOriginStaysOutOfThePackagesIndex(t *testing.T) {
 		if ok && strings.EqualFold(strings.TrimPrefix(field, "_"), "Origin") {
 			t.Errorf("the Packages index carries an Origin field (%q):\n%s", line, got)
 		}
+	}
+}
+
+// TestCaptureSuiteStaysOutOfThePublishingDecision pins the boundary between the
+// release an apt entry was captured on and the suite it is published to.
+//
+// The documented mirror configuration names its generated suite locally:
+// apt_codename "internal", built from noble upstreams. No captured host ever
+// runs a suite called "internal", so recording a capture's release in suites
+// drops every converted entry out of every generated index, with nothing said
+// at convert, import or serve time. capture_suite carries the release for the
+// OSV gate and this generator ignores it.
+func TestCaptureSuiteStaysOutOfThePublishingDecision(t *testing.T) {
+	dir := t.TempDir()
+	store := manifest.NewLocalStore(dir)
+
+	// The shape 'bodega pkg convert apt --suite jammy' writes, plus the
+	// metadata resolution fills in before an entry can be published.
+	res, err := hostpkg.ParseAptWithSuite(strings.NewReader(
+		"libexpat1\t2.4.7-1ubuntu0.2\tamd64\tinstall ok installed\texpat\n"), "jammy")
+	if err != nil {
+		t.Fatalf("ParseAptWithSuite: %v", err)
+	}
+	ve := res.Packages[0].Versions[0]
+	if ve.CaptureSuite != "jammy" {
+		t.Fatalf("the capture recorded %q, so this test proves nothing", ve.CaptureSuite)
+	}
+	ve.ArtifactSize = 10
+	ve.Metadata = map[string]string{
+		"Architecture": "amd64",
+		"_pool_path":   "pool/main/e/expat/libexpat1_2.4.7-1ubuntu0.2_amd64.deb",
+	}
+	if err := store.AddVersion(t.Context(), manifest.TypeApt, "libexpat1", ve); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+	if err := store.SaveIndex(t.Context()); err != nil {
+		t.Fatalf("SaveIndex: %v", err)
+	}
+
+	cs := &ctxStore{Memory: storage.NewMemory()}
+	cs.Seed("packages/apt/"+ve.Metadata["_pool_path"], "\x00deb")
+	cfg := &config.Config{ManifestDir: dir, AptCodename: "internal",
+		AptSuites: []string{"internal"}, MetadataTTL: "1h"}
+	s := newServer(cfg, store, storage.NewSingle(cs), ":0", nil)
+
+	got := string(s.generateAptPackages(t.Context(), "internal", "amd64", nil, false))
+	if !strings.Contains(got, "Package: libexpat1") {
+		t.Fatalf("a jammy capture served under apt_codename \"internal\" reached no index:\n%s", got)
 	}
 }
