@@ -1,6 +1,8 @@
 package builder
 
 import (
+	"context"
+	"io"
 	"testing"
 
 	"github.com/ravinald/bodega/internal/manifest"
@@ -400,4 +402,50 @@ func TestAddAptEdgeReplacesThisParentsEarlierEdgeToTheSamePackage(t *testing.T) 
 		}
 	}
 	t.Error("pgbouncer's own edge was removed, which no rebuild of postgresql-14 decides")
+}
+
+// Each CLI invocation builds a fresh Store, and a Store that never read
+// graph.json starts from an empty one. Saving then replaced the file with
+// whatever that run discovered, destroying every earlier run's edges with no
+// error and nothing in the output to say so: a pin's closure was the last
+// import alone.
+func TestImportsAccumulateEdgesAcrossRuns(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	ImportAptDeps(ctx, manifest.NewLocalStore(dir), "nginx", []DiscoveredDep{
+		{Ecosystem: manifest.TypeApt, Name: "libpcre3", Version: "2.0.0", RawSpec: "libpcre3 (= 2.0.0)"},
+	}, io.Discard)
+	ImportAptDeps(ctx, manifest.NewLocalStore(dir), "postgresql-14", []DiscoveredDep{
+		{Ecosystem: manifest.TypeApt, Name: "libpq5", Version: "14.9", RawSpec: "libpq5 (= 14.9)"},
+	}, io.Discard)
+	ImportDeps(ctx, manifest.NewLocalStore(dir), "django", manifest.VersionEntry{}, []DiscoveredDep{
+		{Ecosystem: manifest.TypePypi, Name: "sqlparse", Version: "0.4.4",
+			RequiredBy: "pypi/django@4.2.11", RawSpec: "sqlparse>=0.3.1",
+			// Already cataloged, which a graph holding only first sightings
+			// would drop.
+			Exists: true},
+	}, io.Discard)
+
+	check := manifest.NewLocalStore(dir)
+	if err := check.LoadGraph(ctx); err != nil {
+		t.Fatalf("load graph: %v", err)
+	}
+	want := map[string]string{
+		"apt/nginx":          "apt/libpcre3@2.0.0",
+		"apt/postgresql-14":  "apt/libpq5@14.9",
+		"pypi/django@4.2.11": "pypi/sqlparse@0.4.4",
+	}
+	got := map[string]string{}
+	for _, e := range check.Edges() {
+		got[e.Parent] = e.Child
+	}
+	if len(got) != len(want) {
+		t.Fatalf("graph = %+v, want an edge from each of the three imports", check.Edges())
+	}
+	for parent, child := range want {
+		if got[parent] != child {
+			t.Errorf("%s -> %q, want %q", parent, got[parent], child)
+		}
+	}
 }

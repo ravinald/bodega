@@ -313,6 +313,16 @@ func parseAptRelation(s string) (aptRelation, bool) {
 // ImportAptDeps creates manifest entries and graph edges for discovered apt
 // dependencies. Only imports deps where Exists is false. Returns count added.
 func ImportAptDeps(ctx context.Context, store *manifest.Store, parentName string, deps []DiscoveredDep, out io.Writer) int {
+	// The graph is read before it is written. A Store that never loaded it
+	// starts from an empty one, and SaveGraph then replaces graph.json with
+	// whatever this run discovered: every edge an earlier run recorded is
+	// destroyed, with no error and nothing in the output to say so. A pin's
+	// closure would then be the last import alone.
+	if err := store.LoadGraph(ctx); err != nil {
+		_, _ = fmt.Fprintf(out, "  [apt] WARNING: could not read the dependency graph, so no edge was recorded: %v\n", err)
+		return 0
+	}
+
 	added := 0
 	wroteEdge := false
 	for _, d := range deps {
