@@ -1900,6 +1900,7 @@ version it holds is one nothing can serve.`,
 			}
 
 			var violations int
+			var notes []string
 			var srcIndex aptSourceIndex
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 			for _, name := range names {
@@ -1915,10 +1916,13 @@ version it holds is one nothing can serve.`,
 					}
 				}
 				for _, e := range d.Entries {
-					reason, err := entryResolves(ctx, store, resolved, e, srcIndex)
+					reason, note, err := entryResolves(ctx, store, resolved, e, srcIndex)
 					if err != nil {
 						_ = w.Flush()
 						return err
+					}
+					if note != "" {
+						notes = append(notes, fmt.Sprintf("  %s %s %s: %s", name, e.Type, e.Name, note))
 					}
 					if reason == "" {
 						continue
@@ -1931,6 +1935,13 @@ version it holds is one nothing can serve.`,
 				}
 			}
 			_ = w.Flush()
+			if len(notes) > 0 {
+				// Printed whichever way the gate went, and outside the
+				// violation count: the entry resolves, so failing CI on it
+				// would leave deleting the pin as the only way to green.
+				fmt.Printf("%d apt pin(s) permit part of their own source's binaries:\n%s\n",
+					len(notes), strings.Join(notes, "\n"))
+			}
 			if violations == 0 {
 				fmt.Printf("OK: every entry in %d profile(s) resolves in the catalog.\n", len(names))
 				return nil
@@ -1988,17 +1999,18 @@ func checkView(d *audit.ProfileDetail) *audit.ProfileDetail {
 // the entry names something the catalog dropped, and an operator reading that
 // in CI removes the entry. A read failure means the catalog is broken and the
 // entry is very likely fine.
-func entryResolves(ctx context.Context, store *manifest.Store, p *entitle.Profile, e audit.ProfileEntry, srcIndex aptSourceIndex) (string, error) {
+func entryResolves(ctx context.Context, store *manifest.Store, p *entitle.Profile, e audit.ProfileEntry, srcIndex aptSourceIndex) (string, string, error) {
 	pm, err := store.GetPackage(ctx, e.Type, e.Name)
 	if err != nil {
-		return "", fmt.Errorf("load %s/%s: %w", e.Type, e.Name, err)
+		return "", "", fmt.Errorf("load %s/%s: %w", e.Type, e.Name, err)
 	}
 	versions, reason := entryVersions(p, e, pm, srcIndex)
 	if reason != "" {
-		return reason, nil
+		return reason, "", nil
 	}
-	var servable, hidden, hiddenMatch []string
+	var servable, hidden, hiddenMatch, dropped []string
 	var last entitle.Decision
+	permitted := false
 	for _, ve := range versions {
 		last = p.Permits(e.Type, e.Name, ve.Version)
 		if ve.Hidden {
@@ -2009,35 +2021,52 @@ func entryResolves(ctx context.Context, store *manifest.Store, p *entitle.Profil
 			continue
 		}
 		if last.Permitted {
-			return "", nil
+			permitted = true
+			continue
 		}
 		servable = append(servable, ve.Version)
+		dropped = append(dropped, ve.Name+" "+ve.Version)
+	}
+	if permitted {
+		return "", aptPinDropsSiblings(p, e, dropped), nil
 	}
 	switch {
 	case len(versions) == 0:
-		return "the catalog holds the package with no versions", nil
+		return "the catalog holds the package with no versions", "", nil
 	case len(servable) == 0:
 		return fmt.Sprintf("every cataloged version is hidden (%s), so nothing serves this package",
-			strings.Join(hidden, ", ")), nil
+			strings.Join(hidden, ", ")), "", nil
 	case len(hiddenMatch) > 0:
 		return fmt.Sprintf("%s permits only hidden versions (%s), which nothing serves",
-			orDash(strings.TrimSpace(e.Constraint+" "+e.Version)), strings.Join(hiddenMatch, ", ")), nil
+			orDash(strings.TrimSpace(e.Constraint+" "+e.Version)), strings.Join(hiddenMatch, ", ")), "", nil
 	case last.Rule != nil && last.Entry == nil:
 		// The type's version default refused on its own, and the entry's own
 		// fields are empty because the default is what stood in for them.
 		// entitle has already written the sentence that names the rule; a
 		// message rebuilt from the entry here would name nothing.
-		return last.Reason, nil
+		return last.Reason, "", nil
 	}
 	return fmt.Sprintf("%s permits none of the cataloged versions (%s)",
-		orDash(strings.TrimSpace(e.Constraint+" "+e.Version)), strings.Join(servable, ", ")), nil
+		orDash(strings.TrimSpace(e.Constraint+" "+e.Version)), strings.Join(servable, ", ")), "", nil
 }
 
-// aptSourceIndex maps a Debian source package to every version entry the
-// catalog holds for a binary built from it. nil is the unbuilt index and
-// answers nothing, which is what a check with no apt-scoped profile wants: the
-// walk costs one GetPackage per apt package and buys nothing there.
-type aptSourceIndex map[string][]manifest.VersionEntry
+// aptSourceBinary is one cataloged version of one binary package, carrying the
+// name it is cataloged under.
+//
+// The name is not recoverable from the entry once membership has collapsed
+// onto the source: an entry reading "nginx" is answered by versions of nginx
+// and nginx-common alike, and a report that cannot say which binary a refused
+// version belongs to sends the operator to `dpkg -l` to find out.
+type aptSourceBinary struct {
+	Name string
+	manifest.VersionEntry
+}
+
+// aptSourceIndex maps a Debian source package to every cataloged binary built
+// from it. nil is the unbuilt index and answers nothing, which is what a check
+// with no apt-scoped profile wants: the walk costs one GetPackage per apt
+// package and buys nothing there.
+type aptSourceIndex map[string][]aptSourceBinary
 
 // newAptSourceIndex walks the apt catalog once per check run.
 func newAptSourceIndex(ctx context.Context, store *manifest.Store) (aptSourceIndex, error) {
@@ -2052,11 +2081,49 @@ func newAptSourceIndex(ctx context.Context, store *manifest.Store) (aptSourceInd
 		}
 		for _, ve := range pm.Versions {
 			if ve.SourcePackage != "" {
-				idx[ve.SourcePackage] = append(idx[ve.SourcePackage], ve)
+				idx[ve.SourcePackage] = append(idx[ve.SourcePackage], aptSourceBinary{Name: pm.Name, VersionEntry: ve})
 			}
 		}
 	}
 	return idx, nil
+}
+
+// aptPinDropsSiblings reports an apt pin that permits some of its source's
+// binaries and not the others, and "" for every entry that is not one.
+//
+// The filtered index and the pool predicate both compare a binary's own
+// Version:, because the pool has a .deb filename and no index to look a source
+// version up in. A binNMU is where that shows: source nginx at
+// 1.24.0-2ubuntu7.1 ships nginx-common at +b1, so an exact pin written from
+// either version keeps some of the set and drops the rest, and apt reports the
+// whole dependent group as kept back. Nothing about the pin says so, which is
+// why this prints rather than staying silent.
+//
+// It is not a violation and does not fail the gate. The entry resolves — the
+// profile serves something — and the only repair available today is to widen
+// the constraint to any, which is to delete the acceptance record F15 made a
+// pin into. An operator deleting a pin to turn CI green is a worse outcome
+// than an operator reading one line about what apt will do. A pin naming the
+// source version proper needs a capture recording ${source:Version}, and no
+// catalog holds one.
+func aptPinDropsSiblings(p *entitle.Profile, e audit.ProfileEntry, dropped []string) string {
+	if len(dropped) == 0 || !aptFilteredEntry(p, e) {
+		return ""
+	}
+	return fmt.Sprintf("%s drops %s from the filtered index, %s built from the same source; apt reports %s kept back",
+		orDash(strings.TrimSpace(e.Constraint+" "+e.Version)), strings.Join(dropped, ", "),
+		plural(len(dropped), "a binary", "binaries"), plural(len(dropped), "it as", "them as"))
+}
+
+// aptFilteredEntry reports whether this entry is governed by a filtered apt
+// codename, which is the one case where membership closes on the source
+// package rather than on the name the catalog holds.
+func aptFilteredEntry(p *entitle.Profile, e audit.ProfileEntry) bool {
+	if e.Type != manifest.TypeApt {
+		return false
+	}
+	base, _ := p.AptScope()
+	return base != ""
 }
 
 // entryVersions returns the cataloged versions an entry is checked against,
@@ -2074,17 +2141,12 @@ func newAptSourceIndex(ctx context.Context, store *manifest.Store) (aptSourceInd
 // deliberately not taught to match either spelling: a set closed on binary
 // names fires on every rename, split and transition Ubuntu ships as ordinary
 // maintenance, which is the closure this item rejected.
-func entryVersions(p *entitle.Profile, e audit.ProfileEntry, pm *manifest.PackageManifest, srcIndex aptSourceIndex) ([]manifest.VersionEntry, string) {
-	filtered := false
-	if e.Type == manifest.TypeApt {
-		base, _ := p.AptScope()
-		filtered = base != ""
-	}
-	if !filtered {
+func entryVersions(p *entitle.Profile, e audit.ProfileEntry, pm *manifest.PackageManifest, srcIndex aptSourceIndex) ([]aptSourceBinary, string) {
+	if !aptFilteredEntry(p, e) {
 		if pm == nil {
 			return nil, "no " + e.Type + " package by that name in the catalog"
 		}
-		return pm.Versions, ""
+		return namedVersions(pm), ""
 	}
 
 	built := srcIndex[e.Name]
@@ -2099,7 +2161,37 @@ func entryVersions(p *entitle.Profile, e audit.ProfileEntry, pm *manifest.Packag
 			"%s is a binary built from source %s, so it matches no paragraph in the index. List %s instead",
 			e.Name, src, src)
 	}
-	return append(slices.Clone(pm.Versions), built...), ""
+	// The package's own versions and the source index's overlap whenever the
+	// entry names a source that also ships a binary of that name: nginx is
+	// cataloged under nginx and carries SourcePackage nginx, so it arrives
+	// from both sides and every message built from the list names it twice.
+	return dedupeVersions(append(namedVersions(pm), built...)), ""
+}
+
+// dedupeVersions keeps the first of each (binary, version) pair, in order.
+func dedupeVersions(in []aptSourceBinary) []aptSourceBinary {
+	seen := make(map[string]bool, len(in))
+	out := make([]aptSourceBinary, 0, len(in))
+	for _, b := range in {
+		key := b.Name + "\x00" + b.Version
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, b)
+	}
+	return out
+}
+
+// namedVersions pairs a manifest's versions with the name it is cataloged
+// under, so one loop reads both the package's own versions and the ones an
+// apt source index contributed.
+func namedVersions(pm *manifest.PackageManifest) []aptSourceBinary {
+	out := make([]aptSourceBinary, 0, len(pm.Versions))
+	for _, ve := range pm.Versions {
+		out = append(out, aptSourceBinary{Name: pm.Name, VersionEntry: ve})
+	}
+	return out
 }
 
 // aptBinarySource returns the source package a cataloged binary was built

@@ -414,8 +414,42 @@ func TestStatusNamesTheHostsOwnFilteredStanza(t *testing.T) {
 // A pin becomes real for apt through the index, not through a 403. The
 // paragraph at the version the profile does not permit is simply absent, which
 // is what apt reports as a package held back.
+//
+// htop is listed beside it and floats, so the filter keeps something: a
+// profile whose every entry refuses every paragraph withdraws the codename
+// instead, which is the case below this one.
 func TestAConstraintDropsTheVersionFromTheFilteredIndex(t *testing.T) {
 	s, _ := aptProfileServer(t)
+	rule := closedRule(manifest.TypeApt, audit.VersionFloating, audit.ExpansionBlock)
+	rule.AptBase = mirroredCodename
+	bindProfile(t, s, "pinned", "pinned-host", []audit.ProfileTypeRule{rule}, []audit.ProfileEntry{
+		{Type: manifest.TypeApt, Name: "nginx", Constraint: manifest.ConstraintExact, Version: "1.20.0-1"},
+		{Type: manifest.TypeApt, Name: "htop"},
+	})
+	s.rebuildAptSnapshot(context.Background())
+
+	index := aptProfileIndex(t, s, "fixture-pinned")
+	if strings.Contains(index, "Package: nginx") {
+		t.Errorf("the filtered index carries a version the profile's pin refuses:\n%s", index)
+	}
+	if !strings.Contains(index, "Package: htop") {
+		t.Errorf("one entry's pin took another entry's package with it:\n%s", index)
+	}
+}
+
+// A profile that lists apt packages and keeps no paragraph is a name matching
+// no source in the base, or a pin no paragraph carries. Served, it is an empty
+// Packages under bodega's signature: every package on the host reported kept
+// back, and one Info line carrying the counts as the only trace. The codename
+// is withdrawn instead, which fails apt update on the source line the operator
+// installed.
+//
+// Closed with nothing listed is the case this must not catch. It permits
+// nothing on purpose, and an empty index is the correct service of it.
+func TestAPinNoParagraphCarriesWithdrawsTheCodename(t *testing.T) {
+	s, _ := aptProfileServer(t)
+	var logged bytes.Buffer
+	s.logger = slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelError}))
 	rule := closedRule(manifest.TypeApt, audit.VersionFloating, audit.ExpansionBlock)
 	rule.AptBase = mirroredCodename
 	bindProfile(t, s, "pinned", "pinned-host", []audit.ProfileTypeRule{rule}, []audit.ProfileEntry{
@@ -423,9 +457,34 @@ func TestAConstraintDropsTheVersionFromTheFilteredIndex(t *testing.T) {
 	})
 	s.rebuildAptSnapshot(context.Background())
 
-	index := aptProfileIndex(t, s, "fixture-pinned")
-	if strings.Contains(index, "Package: nginx") {
-		t.Errorf("the filtered index carries a version the profile's pin refuses:\n%s", index)
+	code, body := mirrorGet(t, s, "/apt/dists/fixture-pinned/main/binary-amd64/Packages")
+	if code == http.StatusOK && len(bytes.TrimSpace(body)) == 0 {
+		t.Fatalf("an empty Packages was signed and served: the host is told its whole installed set no longer exists")
+	}
+	if code != http.StatusNotFound {
+		t.Errorf("GET the filtered Packages for a profile whose pin matches nothing = %d, want 404", code)
+	}
+	if !strings.Contains(logged.String(), "kept none") {
+		t.Errorf("the withdrawal was not logged at Error, so nothing tells the operator why apt update started failing:\n%s", logged.String())
+	}
+}
+
+// Closed with nothing listed is the deliberate empty set, and it still serves:
+// the guard above must separate "permits nothing on purpose" from "permits
+// nothing by accident".
+func TestAClosedAptRuleWithNoEntriesStillServesItsEmptyIndex(t *testing.T) {
+	s, _ := aptProfileServer(t)
+	rule := closedRule(manifest.TypeApt, audit.VersionFloating, audit.ExpansionBlock)
+	rule.AptBase = mirroredCodename
+	bindProfile(t, s, "none", "none-host", []audit.ProfileTypeRule{rule}, nil)
+	s.rebuildAptSnapshot(context.Background())
+
+	code, body := mirrorGet(t, s, "/apt/dists/fixture-none/main/binary-amd64/Packages")
+	if code != http.StatusOK {
+		t.Fatalf("GET the filtered Packages for a profile listing nothing = %d, want 200", code)
+	}
+	if len(bytes.TrimSpace(body)) != 0 {
+		t.Errorf("a profile listing no apt package was served paragraphs:\n%s", body)
 	}
 }
 
@@ -567,25 +626,56 @@ func TestAMalformedParagraphWithdrawsTheCodenameRatherThanTruncatingIt(t *testin
 	}
 }
 
-// The membership closed over the source, so the version compared has to be the
-// source's too. A binNMU ships nginx-common at +b1 out of source nginx at the
-// version the operator pinned; judged on the paragraph's own Version: it is
-// dropped, and nginx is kept beside it — an uninstallable package, for a
-// reason the operator cannot find in the pin they wrote.
-func TestAnExactPinOnTheSourceKeepsItsBinNMUBinary(t *testing.T) {
-	s, _ := aptProfileServer(t)
-	rule := closedRule(manifest.TypeApt, audit.VersionFloating, audit.ExpansionBlock)
-	rule.AptBase = mirroredCodename
-	bindProfile(t, s, "pinned", "pinned-host", []audit.ProfileTypeRule{rule}, []audit.ProfileEntry{
-		{Type: manifest.TypeApt, Name: "nginx", Constraint: manifest.ConstraintExact, Version: profileNginxVersion},
-	})
-	s.rebuildAptSnapshot(context.Background())
+// The filtered index and the pool predicate answer one question, so they have
+// to compare one version. The filter closes the name over the source and the
+// version over the paragraph's own Version:, because the pool has a .deb
+// filename and no index to resolve a source version in; a filter judging the
+// source version instead offers a binNMU's binary and lets the backstop refuse
+// it after apt has resolved a transaction, which is the outcome this whole
+// shape exists to avoid.
+//
+// Asserted as an invariant over the served document rather than on a package
+// list: every Filename the index offers is served, and every artifact it
+// dropped is refused, whichever version the operator pinned.
+func TestEveryArtifactTheFilteredIndexOffersIsServedFromThePool(t *testing.T) {
+	for _, pin := range []string{profileNginxVersion, profileNginxVersion + "+b1"} {
+		t.Run("pin="+pin, func(t *testing.T) {
+			s, _ := aptProfileServer(t)
+			rule := closedRule(manifest.TypeApt, audit.VersionFloating, audit.ExpansionBlock)
+			rule.AptBase = mirroredCodename
+			f := bindProfile(t, s, "pinned", "pinned-host", []audit.ProfileTypeRule{rule}, []audit.ProfileEntry{
+				{Type: manifest.TypeApt, Name: "nginx", Constraint: manifest.ConstraintExact, Version: pin},
+				{Type: manifest.TypeApt, Name: "htop"},
+			})
+			s.rebuildAptSnapshot(context.Background())
 
-	index := aptProfileIndex(t, s, "fixture-pinned")
-	for _, want := range []string{"Package: nginx\n", "Package: nginx-common\n"} {
-		if !strings.Contains(index, want) {
-			t.Errorf("the pin on source nginx at %s dropped %q, which is the binNMU of that same source:\n%s", profileNginxVersion, want, index)
-		}
+			index := aptProfileIndex(t, s, "fixture-pinned")
+			offered := map[string]bool{}
+			for _, line := range strings.Split(index, "\n") {
+				if rest, ok := strings.CutPrefix(line, "Filename: "); ok {
+					offered[rest] = true
+				}
+			}
+			if len(offered) == 0 {
+				t.Fatalf("the filtered index offers nothing, so the invariant below is vacuous:\n%s", index)
+			}
+			for _, deb := range []string{profileNginxDeb, profileNginxCommonDeb, profileHtopDeb} {
+				code, _ := f.get(t, "/apt/"+deb)
+				switch {
+				case offered[deb] && code != http.StatusOK:
+					t.Errorf("the index offers %s and the pool answered %d: apt resolves a transaction against the index and takes that refusal mid-run", deb, code)
+				case !offered[deb] && code != http.StatusForbidden:
+					t.Errorf("the index omits %s and the pool answered %d, so the backstop is not behind the filter", deb, code)
+				}
+			}
+			// The binNMU is the one artifact whose two versions differ, so a
+			// pin naming either one has to leave it on a single side of the
+			// line rather than offered here and refused there.
+			if offered[profileNginxCommonDeb] != (pin == profileNginxVersion+"+b1") {
+				t.Errorf("pin %s offered the binNMU binary = %v; the index and the .deb filename carry one version between them",
+					pin, offered[profileNginxCommonDeb])
+			}
+		})
 	}
 }
 

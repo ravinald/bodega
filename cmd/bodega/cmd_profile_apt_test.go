@@ -291,3 +291,61 @@ func TestAptBaseInABaselineIsRefusedWithoutBlockExpansion(t *testing.T) {
 		t.Errorf("the refusal does not name the repair:\n%s", err)
 	}
 }
+
+// An exact pin lands on a source, and the filter compares each paragraph's own
+// Version:, so a binNMU puts one of that source's binaries outside the pin the
+// operator wrote. Nothing in the pin says so, and the host meets it as the
+// whole dependent group reported kept back.
+//
+// Reported and not counted: the entry resolves, and the only repair available
+// today is to widen the constraint to any, which deletes the acceptance record
+// the pin is. A gate that fails here is a gate an operator turns green by
+// removing the pin.
+func TestProfileCheckReportsAPinThatDropsItsSourcesOtherBinaries(t *testing.T) {
+	env := newDiscoverEnv(t)
+	mirrorNoble(t)
+	seedAptCatalog(t, env, "web01", map[string]aptSeed{
+		"nginx":        {source: "nginx", versions: []string{"1.24.0-2ubuntu7.1"}},
+		"nginx-common": {source: "nginx", versions: []string{"1.24.0-2ubuntu7.1+b1"}},
+	})
+	mustRunProfile(t, "create", "web")
+	mustRunProfile(t, "add", "web", "apt", "nginx", "--constraint", "exact", "--version", "1.24.0-2ubuntu7.1")
+	mustRunProfile(t, "set", "web", "apt", "--membership", "closed", "--expansion", "block", "--base", "noble")
+
+	out := mustRunProfile(t, "check", "web")
+	for _, want := range []string{"nginx-common 1.24.0-2ubuntu7.1+b1", "kept back"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("check does not report that the pin drops %q, so the server's answer and the gate's disagree:\n%s", want, out)
+		}
+	}
+
+	// The pin moved to the rebuilt binary's version, which drops the source's
+	// own binary instead. That one is cataloged under the entry's name and
+	// names the entry as its source, so it reaches the report from both the
+	// package and the source index and is named twice unless they are merged.
+	mustRunProfile(t, "pin", "web", "apt", "nginx", "1.24.0-2ubuntu7.1+b1", "--reason", "a binNMU is the case under test")
+	out = mustRunProfile(t, "check", "web")
+	if got := strings.Count(out, "nginx 1.24.0-2ubuntu7.1"); got != 1 {
+		t.Errorf("the report names the dropped binary %d times, want 1:\n%s", got, out)
+	}
+}
+
+// The same shape with no binNMU in it. Every binary of the source carries the
+// pinned version, so there is nothing to report and a line here would train an
+// operator to read past the one that matters.
+func TestProfileCheckIsSilentWhenAPinCoversEveryBinaryOfItsSource(t *testing.T) {
+	env := newDiscoverEnv(t)
+	mirrorNoble(t)
+	seedAptCatalog(t, env, "web01", map[string]aptSeed{
+		"nginx":        {source: "nginx", versions: []string{"1.24.0-2ubuntu7.1"}},
+		"nginx-common": {source: "nginx", versions: []string{"1.24.0-2ubuntu7.1"}},
+	})
+	mustRunProfile(t, "create", "web")
+	mustRunProfile(t, "add", "web", "apt", "nginx", "--constraint", "exact", "--version", "1.24.0-2ubuntu7.1")
+	mustRunProfile(t, "set", "web", "apt", "--membership", "closed", "--expansion", "block", "--base", "noble")
+
+	out := mustRunProfile(t, "check", "web")
+	if strings.Contains(out, "kept back") {
+		t.Errorf("check reported a dropped binary for a source whose binaries all carry the pinned version:\n%s", out)
+	}
+}

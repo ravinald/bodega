@@ -210,6 +210,13 @@ func (s *Server) aptProfileIndexes(ctx context.Context, date, validUntil time.Ti
 // base publishes, and fails the whole codename when any one of them cannot be
 // read or parsed.
 //
+// A filter that keeps nothing fails the same way, when the profile lists apt
+// packages at all. Closed with nothing listed permits nothing deliberately and
+// serves an empty index; closed with entries none of which match a paragraph is
+// a misspelled source or an unsatisfiable pin, and the served result is
+// identical — a signed empty Packages, every package on the host kept back, and
+// one Info line carrying the counts.
+//
 // All or nothing per codename, rather than per architecture. A Release naming
 // three architectures with two filtered bodies behind it is a signed document
 // telling an amd64 host the suite holds nothing for it, and apt reports that
@@ -231,6 +238,10 @@ func (s *Server) aptFilteredPackages(ctx context.Context, ps aptProfileSuite, ar
 		filtered, kept, dropped, err := filterAptPackages(raw, ps.permit)
 		if err != nil {
 			return nil, fmt.Errorf("filter the upstream Packages for %s/%s: %w", ps.base, arch, err)
+		}
+		if kept == 0 && ps.permit.Lists(manifest.TypeApt) {
+			return nil, fmt.Errorf("the filter kept none of the %d paragraphs %s/%s publishes, and the profile lists apt packages: a name that matches no source in this base, or a pin no paragraph carries. Serving it would sign an empty Packages and report every package on the host as kept back",
+				dropped, ps.base, arch)
 		}
 		s.logger.Info("filtered an upstream apt index for a profile",
 			"profile", ps.profile, "codename", ps.codename, "arch", arch,
@@ -268,13 +279,23 @@ func (s *Server) aptFilteredPackages(ctx context.Context, ps aptProfileSuite, ar
 // docs/DESIGN.md names silent partial service as the reason not-signing lost;
 // this is the same failure reached from the other side.
 //
-// The version compared is the source's, not the paragraph's Version:. The
-// membership closed over the source name, and on a binNMU the two differ.
+// The name is the source's and the version is the paragraph's own. They are
+// different halves on purpose, because the version has to be the one the pool
+// compares: aptPoolGate reads it off the .deb filename and has no index in
+// hand, so a filter judging the source version would offer a binNMU's binary
+// and let the backstop refuse it mid-transaction — the outcome the header
+// above calls worse than no control. What that costs is stated where an
+// operator meets it: an exact pin on a source that binNMU'd one of its
+// binaries permits the binaries at that version and drops the rebuilt one, so
+// apt reports the pair as kept back rather than installing half of it, and
+// `bodega profile check` names the dropped binary at the write. A pin on the
+// source version proper needs a capture recording ${source:Version}, which no
+// catalog holds today.
 func filterAptPackages(index []byte, p *entitle.Profile) (out []byte, kept, dropped int, err error) {
 	var buf bytes.Buffer
 	err = deb822.ParseStreamRaw(bytes.NewReader(index), func(raw []byte, fields map[string]string) error {
 		source := deb822.SourceName(fields)
-		if source == "" || !p.Permits(manifest.TypeApt, source, deb822.SourceVersion(fields)).Permitted {
+		if source == "" || !p.Permits(manifest.TypeApt, source, fields["Version"]).Permitted {
 			dropped++
 			return nil
 		}
@@ -484,11 +505,20 @@ func aptReleaseDigests(release map[string]string) map[string]string {
 // with no legible half — the 403 mid-transaction this whole shape exists to
 // avoid, arriving on a package the index the client read said it could have.
 //
-// The source package comes from the pool path. Debian lays the pool out as
-// pool/<component>/<prefix>/<source>/<binary>_<version>_<arch>.deb and
-// builder.PackageApt writes bodega's own artifacts to the same shape, so the
-// fourth segment is the source name under either provenance — no index lookup,
-// and the same identity filterAptPackages closed the membership over.
+// The source package comes from the pool path, with no index lookup: Debian
+// lays the pool out as
+// pool/<component>/<prefix>/<source>/<binary>_<version>_<arch>.deb, so segment
+// four is the identity filterAptPackages closed the membership over, for every
+// artifact mirrored out of an upstream archive.
+//
+// It is not that for a .deb bodega built. builder.PackageApt lays its pool out
+// under ve.SourceName, which every importer fills with the name apt-get
+// download needs — the binary's — while the real source sits in
+// ve.SourcePackage. Segment four is then the binary name, so a profile listing
+// sources refuses a generated-suite artifact whose two names differ. That
+// fails closed and stays off the documented road: doctor --write-apt-sources
+// installs the filtered stanza alone, so a host reaches those artifacts only
+// after adding a generated-suite line by hand.
 func (s *Server) aptPoolGate(w http.ResponseWriter, r *http.Request, poolPath string) bool {
 	name, version := manifest.AptDebIdentity(path.Base(poolPath))
 	if source := aptPoolSourceName(poolPath); source != "" {

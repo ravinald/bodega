@@ -179,6 +179,20 @@ func (p *Profile) AptScope() (base, refused string) {
 	return r.AptBase, ""
 }
 
+// Lists reports whether the profile names at least one package of typ.
+//
+// It answers the one question a closed set cannot answer from its own
+// membership: closed with nothing listed permits nothing on purpose, and
+// closed with entries that match nothing permits nothing by accident. The apt
+// filter needs them apart, because the first is a codename that correctly
+// serves an empty index and the second is a pin nothing in the base satisfies.
+func (p *Profile) Lists(typ string) bool {
+	if p == nil {
+		return false
+	}
+	return len(p.entries[typ]) > 0
+}
+
 // Name returns the profile's name, empty for the nil profile.
 func (p *Profile) Name() string {
 	if p == nil {

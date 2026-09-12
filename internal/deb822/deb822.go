@@ -35,29 +35,6 @@ func SourceName(fields map[string]string) string {
 	return strings.TrimSpace(fields["Package"])
 }
 
-// SourceVersion is the version of the source package a binary paragraph was
-// built from: what the Source: field carries in parentheses, and the binary's
-// own Version: where the field carries none.
-//
-// Debian writes "Source: nginx (1.24.0-2ubuntu7.1)" exactly when the two
-// differ, which is what a binNMU produces — source 1.24.0-2ubuntu7.1 shipping
-// a binary at 1.24.0-2ubuntu7.1+b1. A caller whose membership closes over the
-// source name has to compare a version against the source too. Handed the
-// binary's, an exact pin taken from the source record refuses that binary and
-// keeps its siblings, which leaves the kept package uninstallable for a reason
-// the operator cannot find in the pin they wrote.
-func SourceVersion(fields map[string]string) string {
-	src := fields["Source"]
-	if i := strings.IndexByte(src, '('); i >= 0 {
-		if j := strings.IndexByte(src[i:], ')'); j > 1 {
-			if v := strings.TrimSpace(src[i+1 : i+j]); v != "" {
-				return v
-			}
-		}
-	}
-	return strings.TrimSpace(fields["Version"])
-}
-
 // SourceField strips the version a Source: field carries, for a caller reading
 // the field on its own rather than a whole paragraph.
 func SourceField(val string) string {
