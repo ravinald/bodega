@@ -137,24 +137,46 @@ func Key(typ, name string) string {
 }
 
 // AptScope is the mirrored codename this profile's filtered apt index derives
-// from, and "" for a profile that does not scope apt.
+// from, and "" for a profile that does not scope apt. refused is non-empty
+// only when the profile names a base and some other field disqualifies it, so
+// a caller can say which rule withdrew the codename rather than reporting a
+// profile that scopes nothing.
 //
-// Both halves are required. A base with an open membership admits every
-// package the archive publishes, so the filtered view would be the same
-// document under a second name — signed by bodega instead of the archive,
-// which is strictly worse: it replaces a signature the host already trusts
-// with one covering identical bytes. A closed membership with no base has
-// nothing to filter, because bodega's own manifest entries are already served
-// under the generated suites.
-func (p *Profile) AptScope() string {
+// Three fields, all required, and every one of them rules out the same end
+// state: a filtered view that is the upstream index verbatim, re-signed under
+// bodega's key. That trade is strictly worse than not filtering at all — it
+// replaces a signature the host already verifies against the distro keyring
+// with one covering identical bytes, and turns aptGatesPool on, which drops
+// the pool from public to private for no filtering in return.
+//
+//   - A closed membership with no base has nothing to filter; bodega's own
+//     manifest entries are already served under the generated suites.
+//   - An open membership admits every package the archive publishes.
+//   - An expansion that permits an unlisted package reaches the same place by
+//     the other road: Covers answers Permitted for everything outside the set
+//     under warn and ignore, so filterAptPackages copies every paragraph
+//     through. block is the one action that makes a closed set subtract.
+//
+// The seven other types keep warn as their fleet default, which F13 chose
+// deliberately. apt alone pays a trust downgrade for the unfiltered outcome,
+// and checkProfileAptBase refuses the combination at the write so an operator
+// meets it as an error with a repair rather than as a codename that stopped
+// being served.
+func (p *Profile) AptScope() (base, refused string) {
 	if p == nil {
-		return ""
+		return "", ""
 	}
 	r, ok := p.types[manifest.TypeApt]
-	if !ok || r.Membership != audit.MembershipClosed {
-		return ""
+	if !ok || r.AptBase == "" {
+		return "", ""
 	}
-	return r.AptBase
+	switch {
+	case r.Membership != audit.MembershipClosed:
+		return "", fmt.Sprintf("its apt membership is %s, which admits every package the archive publishes", r.Membership)
+	case r.Expansion != audit.ExpansionBlock:
+		return "", fmt.Sprintf("its apt expansion is %s, which permits a package the profile does not list, so the filtered index would carry every upstream paragraph", audit.ExpansionOrDefault(r.Expansion))
+	}
+	return r.AptBase, ""
 }
 
 // Name returns the profile's name, empty for the nil profile.

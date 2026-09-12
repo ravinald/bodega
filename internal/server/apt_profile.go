@@ -99,7 +99,12 @@ func (s *Server) aptProfileSuites(ctx context.Context) []aptProfileSuite {
 			continue
 		}
 		p := entitle.New(d)
-		base := p.AptScope()
+		base, refused := p.AptScope()
+		if refused != "" {
+			s.logger.Error("a profile names an apt base and has no filtered codename, because the filtered index would be the upstream document verbatim under bodega's signature; set the apt rule to membership closed with expansion block, or drop the base",
+				"profile", prof.Name, "reason", refused)
+			continue
+		}
 		if base == "" {
 			continue
 		}
@@ -501,7 +506,11 @@ func (s *Server) aptPoolGate(w http.ResponseWriter, r *http.Request, poolPath st
 // proxy to overturn.
 func (s *Server) aptGatesPool(r *http.Request) bool {
 	p := s.profileFor(r)
-	return p != nil && p.AptScope() != ""
+	if p == nil {
+		return false
+	}
+	base, _ := p.AptScope()
+	return base != ""
 }
 
 // aptPoolSourceName reads the source package out of a pool path, and "" from

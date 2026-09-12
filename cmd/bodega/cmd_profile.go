@@ -236,6 +236,8 @@ func writeBaseline(gf *globalFlags, name, description, origin, out string, pins 
 
 	doc := &profileDoc{ConfigVersion: 1, Name: name, Description: description, Origin: origin}
 	seenTypes := map[string]bool{}
+	seenEntries := map[string]bool{}
+	var renamed []string
 	for _, p := range found {
 		if !seenTypes[p.Type] {
 			seenTypes[p.Type] = true
@@ -246,9 +248,21 @@ func writeBaseline(gf *globalFlags, name, description, origin, out string, pins 
 				Expansion:      audit.ExpansionWarn,
 			})
 		}
+		entry := p.entryName()
+		if entry != p.Name {
+			renamed = append(renamed, p.Name+" -> "+entry)
+		}
+		// One apt source builds many binaries, and a host installs several of
+		// them. Listing the source once is the set the filter will close over;
+		// repeating it is the duplicate validateDoc refuses on the way back in.
+		key := profileKey(p.Type, entry)
+		if seenEntries[key] {
+			continue
+		}
+		seenEntries[key] = true
 		doc.Entries = append(doc.Entries, profileDocEntry{
 			Type:       p.Type,
-			Name:       p.Name,
+			Name:       entry,
 			Constraint: manifest.ConstraintAny,
 			Origin:     origin,
 		})
@@ -269,6 +283,14 @@ func writeBaseline(gf *globalFlags, name, description, origin, out string, pins 
 	}
 	fmt.Printf("Wrote a baseline for %s to %s: %d package(s) across %d type(s), %d pinned.\n",
 		origin, out, len(doc.Entries), len(doc.Types), pinned)
+	if len(renamed) > 0 {
+		// ListPackages answers in index order, so an unsorted list reorders
+		// itself between two runs over one unchanged catalog.
+		sort.Strings(renamed)
+		fmt.Printf("%d apt binar%s %s listed under the source package %s built from, which is what a filtered codename closes over:\n  %s\n",
+			len(renamed), plural(len(renamed), "y", "ies"), plural(len(renamed), "is", "are"),
+			plural(len(renamed), "it was", "they were"), strings.Join(renamed, "\n  "))
+	}
 	fmt.Printf("Nothing was created. Read it, edit it, then:\n  bodega profile create %s --from-file %s\n", name, out)
 	return nil
 }
@@ -297,14 +319,14 @@ func applyBaselinePins(doc *profileDoc, found []originPackage, pins []string, ou
 				pin, p.Type, p.Name, doc.Origin, len(p.Versions), strings.Join(p.Versions, ", "),
 				doc.Name, p.Type, p.Name)
 		}
-		key := p.Type + "/" + p.Name
+		key := p.Type + "/" + p.entryName()
 		if first, ok := pinnedBy[key]; ok {
 			return 0, fmt.Errorf("--pin %s and --pin %s both name %s, which is either a slip or two versions meant for one package.\n"+
 				"  Name it once:  --pin %s", first, pin, key, key)
 		}
 		pinnedBy[key] = pin
 		for i := range doc.Entries {
-			if doc.Entries[i].Type == p.Type && doc.Entries[i].Name == p.Name {
+			if doc.Entries[i].Type == p.Type && doc.Entries[i].Name == p.entryName() {
 				doc.Entries[i].Constraint = manifest.ConstraintExact
 				doc.Entries[i].Version = p.Versions[0]
 				count++
@@ -507,6 +529,18 @@ func validateDoc(doc *profileDoc) error {
 		firstType[t.Type] = i
 		if t.AptBase != "" && t.Type != manifest.TypeApt {
 			return fmt.Errorf("types[%d]: apt_base is read on the apt rule alone; on %s it stores a control nothing consults", i, t.Type)
+		}
+		if t.AptBase != "" && t.Type == manifest.TypeApt {
+			if t.Membership != audit.MembershipClosed {
+				return fmt.Errorf("types[%d]: apt_base needs membership closed; an open apt rule admits every package the archive "+
+					"publishes, so the filtered index would be the same document under a second name, signed by bodega "+
+					"instead of by the archive", i)
+			}
+			if !refusesUnlisted(t.Expansion) {
+				return fmt.Errorf("types[%d]: %w", i, aptBaseNeedsBlockRefusal(doc.Name, audit.ProfileTypeRule{
+					Type: t.Type, Membership: t.Membership, Expansion: t.Expansion, AptBase: t.AptBase,
+				}))
+			}
 		}
 	}
 	firstEntry := map[string]int{}
@@ -1007,6 +1041,9 @@ func checkProfileAptBase(gf *globalFlags, profile string, rule audit.ProfileType
 			"so the filtered index would be the same document under a second name, signed by bodega instead of by the archive.\n"+
 			"  Close it:  bodega profile set %s apt --membership closed --base %s", profile, rule.AptBase)
 	}
+	if !refusesUnlisted(rule.Expansion) {
+		return aptBaseNeedsBlockRefusal(profile, rule)
+	}
 	cfg, err := loadConfig(gf)
 	if err != nil {
 		return nil
@@ -1022,6 +1059,32 @@ func checkProfileAptBase(gf *globalFlags, profile string, rule audit.ProfileType
 			rule.AptBase, orNone(strings.Join(cfg.MirroredAptCodenames(), " ")))
 	}
 	return nil
+}
+
+// aptBaseNeedsBlockRefusal is the second half of the open-membership refusal
+// above, reached by the other road. Under warn and ignore the predicate
+// permits every package the profile does not list, so the filter keeps every
+// upstream paragraph and the codename serves the archive's own index under
+// bodega's signature: the host stops verifying against the distro keyring, the
+// pool drops from public to private, and nothing is filtered in return.
+//
+// warn stays the fleet default for the seven other types, where an unlisted
+// package is served and reported and the index is not what enforces. apt is
+// the one type whose unfiltered outcome costs a signature the host already
+// trusts, so it is the one type where the default has to be stated rather than
+// inherited.
+func aptBaseNeedsBlockRefusal(profile string, rule audit.ProfileTypeRule) error {
+	have := audit.ExpansionOrDefault(rule.Expansion)
+	if rule.Expansion == "" {
+		have += " (the default this rule does not name)"
+	}
+	return fmt.Errorf("--base needs --expansion %s; this rule takes %s, which permits a package the profile does not list, "+
+		"so every upstream paragraph survives the filter and %s would serve the archive's own index under bodega's "+
+		"signature instead of the archive's: a host that stops verifying against the distro keyring, for no filtering.\n"+
+		"  Filter it:  bodega profile set %s apt --membership closed --expansion %s --base %s\n"+
+		"  Or drop the base: the profile then reads the mirrored codename %s unchanged, verified against the distro keyring",
+		audit.ExpansionBlock, have, config.ProfileAptCodename(rule.AptBase, profile),
+		profile, audit.ExpansionBlock, rule.AptBase, rule.AptBase)
 }
 
 func orNone(s string) string {
@@ -1837,6 +1900,7 @@ version it holds is one nothing can serve.`,
 			}
 
 			var violations int
+			var srcIndex aptSourceIndex
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 			for _, name := range names {
 				d, err := adb.GetProfile(ctx, name)
@@ -1844,8 +1908,14 @@ version it holds is one nothing can serve.`,
 					return err
 				}
 				resolved := entitle.New(checkView(d))
+				if base, _ := resolved.AptScope(); base != "" && srcIndex == nil {
+					if srcIndex, err = newAptSourceIndex(ctx, store); err != nil {
+						_ = w.Flush()
+						return err
+					}
+				}
 				for _, e := range d.Entries {
-					reason, err := entryResolves(ctx, store, resolved, e)
+					reason, err := entryResolves(ctx, store, resolved, e, srcIndex)
 					if err != nil {
 						_ = w.Flush()
 						return err
@@ -1918,17 +1988,18 @@ func checkView(d *audit.ProfileDetail) *audit.ProfileDetail {
 // the entry names something the catalog dropped, and an operator reading that
 // in CI removes the entry. A read failure means the catalog is broken and the
 // entry is very likely fine.
-func entryResolves(ctx context.Context, store *manifest.Store, p *entitle.Profile, e audit.ProfileEntry) (string, error) {
+func entryResolves(ctx context.Context, store *manifest.Store, p *entitle.Profile, e audit.ProfileEntry, srcIndex aptSourceIndex) (string, error) {
 	pm, err := store.GetPackage(ctx, e.Type, e.Name)
 	if err != nil {
 		return "", fmt.Errorf("load %s/%s: %w", e.Type, e.Name, err)
 	}
-	if pm == nil {
-		return "no " + e.Type + " package by that name in the catalog", nil
+	versions, reason := entryVersions(p, e, pm, srcIndex)
+	if reason != "" {
+		return reason, nil
 	}
 	var servable, hidden, hiddenMatch []string
 	var last entitle.Decision
-	for _, ve := range pm.Versions {
+	for _, ve := range versions {
 		last = p.Permits(e.Type, e.Name, ve.Version)
 		if ve.Hidden {
 			hidden = append(hidden, ve.Version)
@@ -1943,7 +2014,7 @@ func entryResolves(ctx context.Context, store *manifest.Store, p *entitle.Profil
 		servable = append(servable, ve.Version)
 	}
 	switch {
-	case len(pm.Versions) == 0:
+	case len(versions) == 0:
 		return "the catalog holds the package with no versions", nil
 	case len(servable) == 0:
 		return fmt.Sprintf("every cataloged version is hidden (%s), so nothing serves this package",
@@ -1962,11 +2033,125 @@ func entryResolves(ctx context.Context, store *manifest.Store, p *entitle.Profil
 		orDash(strings.TrimSpace(e.Constraint+" "+e.Version)), strings.Join(servable, ", ")), nil
 }
 
+// aptSourceIndex maps a Debian source package to every version entry the
+// catalog holds for a binary built from it. nil is the unbuilt index and
+// answers nothing, which is what a check with no apt-scoped profile wants: the
+// walk costs one GetPackage per apt package and buys nothing there.
+type aptSourceIndex map[string][]manifest.VersionEntry
+
+// newAptSourceIndex walks the apt catalog once per check run.
+func newAptSourceIndex(ctx context.Context, store *manifest.Store) (aptSourceIndex, error) {
+	idx := aptSourceIndex{}
+	for _, name := range store.ListPackages(manifest.TypeApt) {
+		pm, err := store.GetPackage(ctx, manifest.TypeApt, name)
+		if err != nil {
+			return nil, fmt.Errorf("load %s/%s: %w", manifest.TypeApt, name, err)
+		}
+		if pm == nil {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			if ve.SourcePackage != "" {
+				idx[ve.SourcePackage] = append(idx[ve.SourcePackage], ve)
+			}
+		}
+	}
+	return idx, nil
+}
+
+// entryVersions returns the cataloged versions an entry is checked against,
+// or the reason it names nothing the profile could ever serve.
+//
+// For seven types that is the package's own version list. apt under a filtered
+// codename is the eighth, because membership there closes on the source
+// package: filterAptPackages reads Source: out of each upstream paragraph and
+// aptPoolGate reads the source segment out of the pool path, so an entry naming
+// a source the catalog holds only as binaries is correct and resolves, and an
+// entry naming a binary whose source differs is a control that matches no
+// paragraph in the index it governs.
+//
+// The second case is reported rather than repaired, and the filter is
+// deliberately not taught to match either spelling: a set closed on binary
+// names fires on every rename, split and transition Ubuntu ships as ordinary
+// maintenance, which is the closure this item rejected.
+func entryVersions(p *entitle.Profile, e audit.ProfileEntry, pm *manifest.PackageManifest, srcIndex aptSourceIndex) ([]manifest.VersionEntry, string) {
+	filtered := false
+	if e.Type == manifest.TypeApt {
+		base, _ := p.AptScope()
+		filtered = base != ""
+	}
+	if !filtered {
+		if pm == nil {
+			return nil, "no " + e.Type + " package by that name in the catalog"
+		}
+		return pm.Versions, ""
+	}
+
+	built := srcIndex[e.Name]
+	if pm == nil {
+		if len(built) == 0 {
+			return nil, "no apt package by that name in the catalog, and nothing cataloged names it as a source package"
+		}
+		return built, ""
+	}
+	if src := aptBinarySource(pm, e.Name); src != "" {
+		return nil, fmt.Sprintf("this profile serves a filtered apt codename, which closes on the source package; "+
+			"%s is a binary built from source %s, so it matches no paragraph in the index. List %s instead",
+			e.Name, src, src)
+	}
+	return append(slices.Clone(pm.Versions), built...), ""
+}
+
+// aptBinarySource returns the source package a cataloged binary was built
+// from when it differs from name, and "" when it agrees or when no capture
+// recorded one.
+//
+// Any agreeing entry clears the package: source and binary coincide for most
+// of the archive, and a single four-field capture recording no source is not
+// evidence of a divergence.
+func aptBinarySource(pm *manifest.PackageManifest, name string) string {
+	first := ""
+	for _, ve := range pm.Versions {
+		switch ve.SourcePackage {
+		case "", name:
+			return ""
+		default:
+			if first == "" {
+				first = ve.SourcePackage
+			}
+		}
+	}
+	return first
+}
+
 // originPackage is one cataloged package that names a host as an origin.
 type originPackage struct {
 	Type     string
 	Name     string
+	Source   string
 	Versions []string
+}
+
+// entryName is the name a baseline lists this package under, which for apt is
+// the source package and for every other type is the package's own name.
+//
+// apt membership is closed over the source on both paths that consult it:
+// filterAptPackages reads Source: out of each upstream paragraph, and
+// aptPoolGate reads the source segment out of the pool path. A baseline
+// listing binaries therefore matches nothing: a host running nginx-common
+// catalogs as nginx-common and the filter looks up nginx, so every divergent
+// binary is reported to the host as kept back, which is the silent partial
+// service docs/DESIGN.md names as the reason not-signing lost.
+//
+// A capture that recorded no source falls back to the binary name rather than
+// dropping the entry. The four-field dpkg-query format carries no Source:
+// column, so an older capture has nothing better to offer, and a name that is
+// right whenever the two coincide beats an entry that is absent.
+func (p originPackage) entryName() string {
+	if p.Type == manifest.TypeApt && p.Source != "" {
+		return p.Source
+	}
+	return p.Name
 }
 
 // packagesFromOrigin walks the catalog for packages carrying origin on at
@@ -1982,13 +2167,18 @@ func packagesFromOrigin(store *manifest.Store, origin string) ([]originPackage, 
 				return nil, fmt.Errorf("load %s/%s: %w", typ, name, err)
 			}
 			var versions []string
+			source := ""
 			for _, ve := range pm.Versions {
-				if slices.Contains(admit.Origins(ve), origin) {
-					versions = append(versions, ve.Version)
+				if !slices.Contains(admit.Origins(ve), origin) {
+					continue
+				}
+				versions = append(versions, ve.Version)
+				if source == "" {
+					source = ve.SourcePackage
 				}
 			}
 			if len(versions) > 0 {
-				out = append(out, originPackage{Type: typ, Name: pm.Name, Versions: versions})
+				out = append(out, originPackage{Type: typ, Name: pm.Name, Source: source, Versions: versions})
 			}
 		}
 	}

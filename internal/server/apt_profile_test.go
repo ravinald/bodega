@@ -623,3 +623,79 @@ func TestAptPoolSourceName(t *testing.T) {
 		}
 	}
 }
+
+// A closed membership at the default expansion reaches the same end state the
+// open-membership refusal above exists to prevent, by the other road: Covers
+// permits every package the profile does not list under warn and ignore, so
+// the filter keeps every paragraph and the codename would serve the archive's
+// own index byte for byte under bodega's signature. The host would stop
+// verifying against the distro keyring it already trusts, and the pool would
+// drop from public to private, for no filtering at all.
+func TestAClosedAptRuleAtTheDefaultExpansionServesNoFilteredCodename(t *testing.T) {
+	for _, expansion := range []string{audit.ExpansionWarn, audit.ExpansionIgnore, ""} {
+		t.Run("expansion="+expansionLabel(expansion), func(t *testing.T) {
+			s, _ := aptProfileServer(t)
+			var logged bytes.Buffer
+			s.logger = slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelError}))
+			f := aptProfileBind(t, s, "web", expansion, "nginx")
+
+			if names, _ := s.aptFilteredSuites(); len(names) != 0 {
+				t.Errorf("filtered codenames = %v, want none: the document under them is the upstream index re-signed", names)
+			}
+			if code, _ := mirrorGet(t, s, "/apt/dists/"+mirroredCodename+"-web/InRelease"); code != http.StatusNotFound {
+				t.Errorf("GET the filtered codename = %d, want 404", code)
+			}
+			if !strings.Contains(logged.String(), "web") || !strings.Contains(logged.String(), "expansion") {
+				t.Errorf("the withdrawal is not in the log, so the operator sees a codename that never appears:\n%s", logged.String())
+			}
+
+			// The mirrored codename still serves, upstream signature intact,
+			// and the pool keeps its shared-cache grant: nothing gates it.
+			code, served := f.get(t, "/apt/dists/"+mirroredCodename+"/main/binary-amd64/Packages")
+			if code != http.StatusOK || string(served) != aptProfilePackages() {
+				t.Errorf("the mirrored index was not left alone: code=%d", code)
+			}
+			if code, _ := f.get(t, "/apt/"+profileHtopDeb); code != http.StatusOK {
+				t.Errorf("pool fetch = %d, want 200: the pool is gated for a profile with no filtered index behind it", code)
+			}
+		})
+	}
+}
+
+// The mechanism behind the withdrawal above, asserted on the filter itself so
+// the reason cannot drift from the rule: under warn the permitted set is every
+// package in the archive, and what comes out is the bytes that went in.
+func TestTheFilterUnderTheDefaultExpansionWouldCopyTheUpstreamIndexVerbatim(t *testing.T) {
+	upstream := aptProfilePackages()
+	for _, expansion := range []string{audit.ExpansionWarn, audit.ExpansionIgnore, ""} {
+		d := &audit.ProfileDetail{
+			Profile: audit.Profile{Name: "web"},
+			Types: []audit.ProfileTypeRule{{
+				Type: manifest.TypeApt, Membership: audit.MembershipClosed,
+				VersionDefault: audit.VersionFloating, Expansion: expansion,
+				AptBase: mirroredCodename,
+			}},
+			Entries: []audit.ProfileEntry{{Type: manifest.TypeApt, Name: "nginx"}},
+		}
+		p := entitle.New(d)
+		if base, refused := p.AptScope(); base != "" || refused == "" {
+			t.Fatalf("expansion %q: AptScope = (%q, %q), want no base and a reason", expansion, base, refused)
+		}
+		filtered, _, dropped, err := filterAptPackages([]byte(upstream), p)
+		if err != nil {
+			t.Fatalf("expansion %q: filter: %v", expansion, err)
+		}
+		if dropped != 0 || string(filtered) != upstream {
+			t.Errorf("expansion %q: the filter dropped %d paragraphs; this case is a refusal precisely because it drops none", expansion, dropped)
+		}
+	}
+}
+
+// expansionLabel names the empty expansion in a subtest title, where "" would
+// render as a bare slash.
+func expansionLabel(s string) string {
+	if s == "" {
+		return "unset"
+	}
+	return s
+}

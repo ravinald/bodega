@@ -952,6 +952,20 @@ db.json already exists, and a baseline is written to be edited before it is used
   Replace it, losing whatever it holds:  --overwrite
 ```
 
+**apt entries are written under the source package.** A host running `nginx`, `nginx-common` and `libexpat1` catalogs three binaries; the baseline lists `nginx` and `expat`, because that is the identity a filtered codename and the pool predicate both close over. Every collapse is named in the success line, so an operator reading the file recognizes a name they never installed:
+
+```text
+$ bodega profile create web --from-origin web01 --out web.json
+Wrote a baseline for web01 to web.json: 2 package(s) across 1 type(s), 0 pinned.
+2 apt binaries are listed under the source package they were built from, which is what a filtered codename closes over:
+  libexpat1 -> expat
+  nginx-common -> nginx
+Nothing was created. Read it, edit it, then:
+  bodega profile create web --from-file web.json
+```
+
+`--pin libexpat1` still names the binary the host reports and lands on the `expat` entry it was collapsed onto. A capture taken before `bodega pkg convert apt` recorded the source package has no source to use and falls back to the binary name.
+
 Entries default to name-only with `constraint_kind: any`, so the baseline says what the host may fetch and not which build of it. `--pin <name>` (repeatable) names the exceptions. A baseline that pins every version is re-authored monthly until somebody stops, which is how a control becomes ignored.
 
 A `--pin` that does not name one package is refused rather than resolved, on either axis. Two cataloged versions:
@@ -1180,9 +1194,22 @@ web apt: membership=closed version_default=floating expansion=block
   filtered codename: noble-web (from noble), served after the next index rebuild
 ```
 
-`--base` names a codename in `apt_upstreams`, and the derived codename is always `<base>-<profile>`. It must not collide with anything in `apt_suites` or `apt_upstreams`; `set` refuses at the write rather than leaving one ERROR line an hour later in the server's log. Two profiles over different bases can still derive one codename (`security-web` over `noble` and `web` over `noble-security` both give `noble-security-web`), which `set` cannot see because it holds one profile at a time. The rebuild serves neither and names both profiles in the log. `--base` needs `--membership closed`: an open set admits everything the archive publishes, so there is nothing to filter, and bodega would be re-signing the archive's own bytes under its own key. A profile with an open apt rule reads the mirrored codename unchanged.
+`--base` names a codename in `apt_upstreams`, and the derived codename is always `<base>-<profile>`. It must not collide with anything in `apt_suites` or `apt_upstreams`; `set` refuses at the write rather than leaving one ERROR line an hour later in the server's log. Two profiles over different bases can still derive one codename (`security-web` over `noble` and `web` over `noble-security` both give `noble-security-web`), which `set` cannot see because it holds one profile at a time. The rebuild serves neither and names both profiles in the log. `--base` needs `--membership closed` **and** `--expansion block`, and both refusals are the same one reached from opposite directions. An open set admits everything the archive publishes; `warn` and `ignore` are closed sets that serve what they do not list, so the filter keeps every paragraph either way. What bodega would publish is the archive's own index, byte for byte, under bodega's signature instead of the archive's: the host stops verifying against the distro keyring it already has, `/apt/pool/` drops from `public` to `private`, and nothing is filtered in return. `warn` remains the default for the seven other types, where the index is not what enforces and an unlisted package is served and reported. apt is the one type whose unfiltered outcome costs a signature, so it is the one type where the posture is stated rather than inherited. A profile with an open apt rule, or a closed one with no base, reads the mirrored codename unchanged.
 
-**Membership closes over the source package.** `bodega profile add web apt nginx` covers `nginx-common`, `nginx-core` and every other binary that source builds. Ubuntu renames and splits binaries within a stable source as routine maintenance, and a set closed on binary names would fire on each one.
+```text
+$ bodega profile set web apt --membership closed --base noble
+--base needs --expansion block; this rule takes warn, which permits a package the profile does not list, so every upstream paragraph survives the filter and noble-web would serve the archive's own index under bodega's signature instead of the archive's: a host that stops verifying against the distro keyring, for no filtering.
+  Filter it:  bodega profile set web apt --membership closed --expansion block --base noble
+  Or drop the base: the profile then reads the mirrored codename noble unchanged, verified against the distro keyring
+```
+
+**Membership closes over the source package.** `bodega profile add web apt nginx` covers `nginx-common`, `nginx-core` and every other binary that source builds. Ubuntu renames and splits binaries within a stable source as routine maintenance, and a set closed on binary names would fire on each one. `--from-origin` writes source names for the same reason, and `bodega profile check` reports an apt entry naming a binary whose source differs — an entry that matches no paragraph in the index it governs, so the host is told the package does not exist:
+
+```text
+$ bodega profile check web
+PROFILE  TYPE  PACKAGE    REASON
+web      apt   libexpat1  this profile serves a filtered apt codename, which closes on the source package; libexpat1 is a binary built from source expat, so it matches no paragraph in the index. List expat instead
+```
 
 **A pin is real for apt through the index.** An entry pinned to a version drops every other version's paragraph from the filtered `Packages`, which apt reads as "no candidate" rather than as a refusal. The version compared is the source's: a binNMU ships `nginx-common` at `1.24.0-2ubuntu7.1+b1` out of source `nginx` at `1.24.0-2ubuntu7.1`, and a pin written off the source record keeps it.
 

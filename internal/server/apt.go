@@ -1027,7 +1027,9 @@ func (s *Server) aptFilteredSuites() (names []string, byCodename map[string]stri
 // a host at a suite nobody decided on, and it would look authoritative.
 func (s *Server) aptHostSources(r *http.Request, st aptsources.State, out aptStatus) (string, *aptsources.Sources) {
 	if r != nil {
-		if p := s.profileFor(r); p != nil && p.AptScope() != "" {
+		p := s.profileFor(r)
+		base, _ := p.AptScope()
+		if base != "" {
 			_, byCodename := s.aptFilteredSuites()
 			for codename, profile := range byCodename {
 				if profile != p.Name() {

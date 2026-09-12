@@ -65,10 +65,13 @@ func ValidMembership(m string) bool { return m == MembershipClosed || m == Membe
 // ValidVersionDefault reports whether v is one of the two.
 func ValidVersionDefault(v string) bool { return v == VersionPinned || v == VersionFloating }
 
-// expansionOrDefault fills the unset expansion with warn, matching the column
+// ExpansionOrDefault fills the unset expansion with warn, matching the column
 // default. A marker written before expansion existed, and one written by a
 // caller that states nothing about it, both mean "detect, do not refuse".
-func expansionOrDefault(e string) string {
+// Exported because a refusal that quotes the rule in force has to name warn
+// where the row holds "", and a second copy of that substitution is how the
+// message and the behavior drift.
+func ExpansionOrDefault(e string) string {
 	if e == "" {
 		return ExpansionWarn
 	}
@@ -313,7 +316,7 @@ func (a *DB) profileEntries(ctx context.Context, profile string) ([]ProfileEntry
 
 // SetProfileTypeRule writes or replaces one type marker.
 func (a *DB) SetProfileTypeRule(ctx context.Context, r ProfileTypeRule) error {
-	r.Expansion = expansionOrDefault(r.Expansion)
+	r.Expansion = ExpansionOrDefault(r.Expansion)
 	if err := validateProfileTypeRule(r); err != nil {
 		return err
 	}
@@ -549,7 +552,7 @@ func (a *DB) CreateProfileWith(ctx context.Context, p Profile, types []ProfileTy
 	for _, r := range types {
 		if _, err := tx.ExecContext(ctx, insertProfileTypeSQL,
 			p.Name, r.Type, r.Membership, r.VersionDefault,
-			expansionOrDefault(r.Expansion), r.AptBase, r.Actor); err != nil {
+			ExpansionOrDefault(r.Expansion), r.AptBase, r.Actor); err != nil {
 			return fmt.Errorf("%s: %w", r.Type, err)
 		}
 	}
