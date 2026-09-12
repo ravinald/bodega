@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -175,7 +176,7 @@ func (s *Server) aptProfileIndexes(ctx context.Context, date, validUntil time.Ti
 		return nil
 	}
 	releases := map[string]map[string]string{}
-	cache := map[string][]byte{}
+	cache := map[string]aptIndexRead{}
 	out := make([]aptProfileSuite, 0, len(suites))
 	for _, ps := range suites {
 		release, ok := releases[ps.base]
@@ -206,9 +207,22 @@ func (s *Server) aptProfileIndexes(ctx context.Context, date, validUntil time.Ti
 	return out
 }
 
+// aptIndexRead is one (base, architecture) upstream read, shared across every
+// profile deriving from that base: the decompressed index, or the fact that
+// this archive publishes no such architecture. The second is cached for the
+// same reason as the first — without it, a base two profiles derive from
+// spends one 404 per profile per rebuild on every architecture it does not
+// carry.
+type aptIndexRead struct {
+	body []byte
+	// notPublished is set when the fetch 404d, which is the archive saying it
+	// does not carry that architecture rather than that its index is wrong.
+	notPublished bool
+}
+
 // aptFilteredPackages filters one profile's view of every architecture its
-// base publishes, and fails the whole codename when any one of them cannot be
-// read or parsed.
+// base publishes, dropping the ones the archive does not carry and failing the
+// whole codename when one it does carry cannot be read or parsed.
 //
 // A filter that keeps nothing fails the same way, when the profile lists apt
 // packages at all. Closed with nothing listed permits nothing deliberately and
@@ -217,25 +231,50 @@ func (s *Server) aptProfileIndexes(ctx context.Context, date, validUntil time.Ti
 // identical — a signed empty Packages, every package on the host kept back, and
 // one Info line carrying the counts.
 //
-// All or nothing per codename, rather than per architecture. A Release naming
+// A 404 is a different class from every other failure and has to stay apart
+// from it, because Ubuntu guarantees one. archive.ubuntu.com publishes a
+// single Release per suite naming all seven architectures and a SHA256 for
+// each, and then serves amd64 and i386 alone: the other five live on
+// ports.ubuntu.com, and nothing in the Release records the split. Failing the
+// codename on the first 404 means the canonical upstream — the one
+// defaultConfigContent and docs/USAGE.md both print — filters amd64 correctly
+// and serves it to nobody. The architecture is dropped instead, and
+// aptIndexFrom builds Architectures: from what survived, so an arm64 host
+// reading that archive is told the suite holds nothing for it, which is true
+// of that archive.
+//
+// Everything else is all or nothing per codename: a digest mismatch, a
+// decompression failure, a parse break, any non-404 status. A Release naming
 // three architectures with two filtered bodies behind it is a signed document
 // telling an amd64 host the suite holds nothing for it, and apt reports that
 // as a suite that does not support the architecture — a bodega failure worded
 // as an archive fact. Withdrawing the codename instead fails `apt update` on
 // the line the operator installed, which names the instance that stopped
-// answering.
-func (s *Server) aptFilteredPackages(ctx context.Context, ps aptProfileSuite, arches []string, release map[string]string, cache map[string][]byte) (map[string][]byte, error) {
+// answering. Withdrawing it when no architecture survives at all is the same
+// rule: an empty Release is a suite with no architectures, which apt reads the
+// same way.
+func (s *Server) aptFilteredPackages(ctx context.Context, ps aptProfileSuite, arches []string, release map[string]string, cache map[string]aptIndexRead) (map[string][]byte, error) {
 	out := make(map[string][]byte, len(arches))
 	for _, arch := range arches {
-		raw, ok := cache[ps.base+"/"+arch]
+		read, ok := cache[ps.base+"/"+arch]
 		if !ok {
-			var err error
-			if raw, err = s.aptUpstreamPackages(ctx, ps.base, arch, release); err != nil {
+			body, err := s.aptUpstreamPackages(ctx, ps.base, arch, release)
+			switch {
+			case errors.Is(err, errUpstreamNotFound):
+				read = aptIndexRead{notPublished: true}
+				s.logger.Info("an apt base declares an architecture this archive does not serve, so filtered codenames over it carry the rest; the arch is served from another host (ports.ubuntu.com for Ubuntu's non-x86 ports) and reaching it needs its own apt_upstreams entry",
+					"base", ps.base, "arch", arch)
+			case err != nil:
 				return nil, fmt.Errorf("read the upstream Packages for %s/%s: %w", ps.base, arch, err)
+			default:
+				read = aptIndexRead{body: body}
 			}
-			cache[ps.base+"/"+arch] = raw
+			cache[ps.base+"/"+arch] = read
 		}
-		filtered, kept, dropped, err := filterAptPackages(raw, ps.permit)
+		if read.notPublished {
+			continue
+		}
+		filtered, kept, dropped, err := filterAptPackages(read.body, ps.permit)
 		if err != nil {
 			return nil, fmt.Errorf("filter the upstream Packages for %s/%s: %w", ps.base, arch, err)
 		}
@@ -247,6 +286,10 @@ func (s *Server) aptFilteredPackages(ctx context.Context, ps aptProfileSuite, ar
 			"profile", ps.profile, "codename", ps.codename, "arch", arch,
 			"kept", kept, "dropped", dropped)
 		out[arch] = filtered
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%s publishes none of the %d architectures its Release names (%s); the filtered Release would name no architecture at all, which apt reads as a suite that does not support the host",
+			ps.base, len(arches), strings.Join(arches, " "))
 	}
 	return out, nil
 }
@@ -312,11 +355,17 @@ func filterAptPackages(index []byte, p *entitle.Profile) (out []byte, kept, drop
 }
 
 // aptUpstreamArches reads the base codename's Release and returns the
-// architectures whose main Packages index the archive actually publishes.
+// architectures it both names and publishes a digest for.
 //
-// Both halves are needed. Architectures: is what the archive claims, and the
-// SHA256 block is what it published; asking for an arch listed in the first
-// and absent from the second is a 404 per rebuild, per profile, forever.
+// The SHA256 block is the second half because an index with no digest beside
+// it is one bodega would sign without having checked it against anything, and
+// the digest is the only thing standing between a mirror mid-sync and a signed
+// Release describing stanzas the pool no longer has.
+//
+// It is not a list of what the archive serves, and nothing in a Release is.
+// Ubuntu's names seven architectures and publishes a digest for all seven
+// while archive.ubuntu.com carries two, so the answer here is an upper bound
+// and aptFilteredPackages drops what 404s out of it.
 func (s *Server) aptUpstreamArches(base string, release map[string]string) ([]string, error) {
 	declared := strings.Fields(release["Architectures"])
 	if len(declared) == 0 {
@@ -530,10 +579,11 @@ func (s *Server) aptPoolGate(w http.ResponseWriter, r *http.Request, poolPath st
 // aptGatesPool reports whether this request's own profile scopes apt, which is
 // the one condition under which the pool route is a profile-decided one.
 //
-// Asked separately from aptPoolGate because the answer decides the cache
-// directive as well as the predicate, and the two have to agree: a route that
+// It decides the predicate and nothing else. The cache directive is a server
+// fact rather than a request one — see handleAptPool — because a route that
 // refuses one host and ships `public` to the next has handed the refusal to a
-// proxy to overturn.
+// proxy to overturn, and the next host is an unidentified one on every
+// instance.
 func (s *Server) aptGatesPool(r *http.Request) bool {
 	p := s.profileFor(r)
 	if p == nil {

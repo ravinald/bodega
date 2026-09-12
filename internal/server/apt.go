@@ -49,13 +49,18 @@ func (s *Server) handleAptPool(w http.ResponseWriter, r *http.Request) {
 	// that ships a year-long "immutable" outlives the policy change that would
 	// have corrected it. Covers handleAptMirrorPool below, which inherits w.
 	//
-	// public while nothing gates the route and private the moment something
-	// does. Every host is served the same .deb either way — the filtered index
-	// decides what a host is told exists, not which bytes it gets — but a
-	// shared cache holding a public copy would answer a refused host out of a
-	// permitted host's fetch, without the request ever reaching the predicate
-	// above.
-	if gated {
+	// Decided on a server fact, never on the requesting host's own profile.
+	// Every host is served the same .deb — the filtered index decides what a
+	// host is told exists, not which bytes it gets — but a shared cache holding
+	// a public copy answers a refused host out of somebody else's fetch, with
+	// the request never reaching the predicate above. Gated on the requester,
+	// the somebody else is an unidentified host: every host before it is bound,
+	// and every host under an open apt membership, both of which keep reaching
+	// this route ungated by design. So the moment this instance serves any
+	// filtered codename at all, the whole route loses the shared grant. An
+	// instance with none keeps it, because there is no refusal for a proxy to
+	// overturn.
+	if filtered, _ := s.aptFilteredSuites(); len(filtered) > 0 {
 		w = cachePrivateOn200(w, path.Base(p))
 	} else {
 		w = cacheSharedImmutableOn200(w, path.Base(p))

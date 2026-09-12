@@ -86,17 +86,24 @@ func aptProfilePackages() string {
 // the client would then refuse.
 func aptProfileServer(t *testing.T) (*Server, *fixtureArchive) {
 	t.Helper()
-	return aptProfileServerWith(t, "amd64", aptProfilePackages(), map[string]string{
+	return aptProfileServerWith(t, "amd64", aptProfilePackages(), aptProfilePool())
+}
+
+// aptProfilePool is the .deb body behind every Filename: the fixture index
+// names, so a pool fetch resolves rather than 404ing past the predicate.
+func aptProfilePool() map[string]string {
+	return map[string]string{
 		profileNginxDeb:       "\x21<arch>\nnginx bytes",
 		profileNginxCommonDeb: "\x21<arch>\nnginx-common bytes",
 		profileHtopDeb:        "\x21<arch>\nhtop bytes",
-	})
+	}
 }
 
 // aptProfileServerWith is aptProfileServer over an archive the caller supplies,
 // for the test that builds its index and its .debs with dpkg rather than
-// writing them out by hand.
-func aptProfileServerWith(t *testing.T, arch, packages string, pool map[string]string) (*Server, *fixtureArchive) {
+// writing them out by hand, and for the one whose Release declares
+// architectures the archive does not serve.
+func aptProfileServerWith(t *testing.T, arch, packages string, pool map[string]string, alsoDeclared ...string) (*Server, *fixtureArchive) {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv(aptsign.CredentialsEnv, dir)
@@ -112,7 +119,7 @@ func aptProfileServerWith(t *testing.T, arch, packages string, pool map[string]s
 	if err != nil {
 		t.Fatalf("generate upstream key: %v", err)
 	}
-	objects := fixtureDistsArch(t, upstreamKR, packages, arch)
+	objects := fixtureDistsArch(t, upstreamKR, packages, arch, alsoDeclared...)
 	for rel, body := range pool {
 		objects[rel] = body
 	}
@@ -306,42 +313,150 @@ func TestOpenAptMembershipGetsTheMirroredCodenameUnchanged(t *testing.T) {
 	}
 }
 
-// A refusal a proxy can overturn is not a refusal. The pool ships public while
-// nothing gates it and private the moment a profile does, because a shared
-// cache would otherwise answer a refused host out of a permitted host's fetch
-// with the request never reaching the predicate.
-func TestAGatedPoolRouteLosesTheSharedCacheGrant(t *testing.T) {
-	s, _ := aptProfileServer(t)
-	f := aptProfileBind(t, s, "web", audit.ExpansionBlock, "nginx")
-
+// poolCacheControl is the Cache-Control one pool fetch comes back with, under
+// the identity the caller names or none at all.
+func poolCacheControl(t *testing.T, s *Server, token, poolPath string) string {
+	t.Helper()
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
-	header := func(token string) string {
-		t.Helper()
-		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+"/apt/"+profileNginxDeb, nil)
-		if err != nil {
-			t.Fatalf("build request: %v", err)
-		}
-		if token != "" {
-			req.Header.Set("Authorization", "Bearer "+token)
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatalf("GET the pool: %v", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-		_, _ = io.Copy(io.Discard, resp.Body)
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("GET the pool = %d, want 200", resp.StatusCode)
-		}
-		return resp.Header.Get("Cache-Control")
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+"/apt/"+poolPath, nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
 	}
-	if got := header(f.token); strings.Contains(got, "public") || !strings.Contains(got, "private") {
-		t.Errorf("Cache-Control for a profile-gated pool fetch = %q, want private", got)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	if got := header(""); !strings.Contains(got, "public") {
-		t.Errorf("Cache-Control for an unprofiled pool fetch = %q, want public: apt pays nothing where no profile scopes it", got)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET the pool: %v", err)
 	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET the pool = %d, want 200", resp.StatusCode)
+	}
+	return resp.Header.Get("Cache-Control")
+}
+
+// A refusal a proxy can overturn is not a refusal, and the requesting host's
+// own profile cannot decide the directive that prevents it. An unidentified
+// request — every host before it is bound, and every host under an open apt
+// membership — reaches this route ungated by design, so gated on the requester
+// it fills a shared cache with a year-long public copy of the object the next
+// profiled request is refused, and the predicate never runs. The instance
+// answers instead: any filtered codename served at all costs the whole route
+// its shared grant, and an instance with none keeps it.
+func TestAGatedPoolRouteLosesTheSharedCacheGrant(t *testing.T) {
+	t.Run("an instance serving a filtered codename", func(t *testing.T) {
+		s, _ := aptProfileServer(t)
+		f := aptProfileBind(t, s, "web", audit.ExpansionBlock, "nginx")
+
+		if got := poolCacheControl(t, s, f.token, profileNginxDeb); strings.Contains(got, "public") || !strings.Contains(got, "private") {
+			t.Errorf("Cache-Control for a profile-gated pool fetch = %q, want private", got)
+		}
+		// The object web is refused, fetched with no identity at all. This is
+		// the response a shared cache would hold and hand back to web.
+		if got := poolCacheControl(t, s, "", profileHtopDeb); strings.Contains(got, "public") {
+			t.Errorf("Cache-Control for an unidentified fetch of an object a profile is refused = %q: a shared cache stores that and answers the refused host out of it", got)
+		}
+	})
+
+	t.Run("an instance serving none", func(t *testing.T) {
+		s, _ := aptProfileServer(t)
+		if got := poolCacheControl(t, s, "", profileHtopDeb); !strings.Contains(got, "public") {
+			t.Errorf("Cache-Control for a pool fetch where nothing is gated = %q, want public: apt pays nothing where no profile scopes it", got)
+		}
+	})
+}
+
+// Requirement 1 against the archive the documentation tells an operator to
+// write. archive.ubuntu.com publishes one Release per suite naming all seven
+// architectures and a SHA256 for each, then serves amd64 and i386 alone —
+// ports.ubuntu.com carries the rest, and nothing in the Release records the
+// split. Failing the codename on the first 404 means amd64 filters correctly
+// and is served to nobody.
+func TestADeclaredArchitectureTheArchiveDoesNotServeDropsItselfNotTheCodename(t *testing.T) {
+	s, _ := aptProfileServerWith(t, "amd64", aptProfilePackages(), aptProfilePool(), "arm64")
+	aptProfileBind(t, s, "web", audit.ExpansionBlock, "nginx")
+
+	names, _ := s.aptFilteredSuites()
+	if len(names) != 1 || names[0] != "fixture-web" {
+		t.Fatalf("filtered codenames = %v, want [fixture-web]: the archive serves amd64 and the filter succeeded on it", names)
+	}
+	if idx := aptProfileIndex(t, s, "fixture-web"); !strings.Contains(idx, "Package: nginx\n") {
+		t.Errorf("the served architecture's filtered index is missing what the profile lists:\n%s", idx)
+	}
+
+	// The Release names what survived and nothing else. Declaring arm64 with
+	// no Packages behind it is a signed document apt reads as an archive
+	// fault, which is the failure the drop is avoiding.
+	code, release := mirrorGet(t, s, "/apt/dists/fixture-web/Release")
+	if code != http.StatusOK {
+		t.Fatalf("GET the filtered Release = %d, want 200", code)
+	}
+	if got := mustParseRelease(t, release)["Architectures"]; got != "amd64" {
+		t.Errorf("the filtered Release names Architectures %q, want amd64 alone: the archive publishes no arm64 body", got)
+	}
+	if code, _ := mirrorGet(t, s, "/apt/dists/fixture-web/main/binary-arm64/Packages"); code != http.StatusNotFound {
+		t.Errorf("GET the dropped architecture's Packages = %d, want 404", code)
+	}
+}
+
+// The other half of the same split: a 404 is the archive saying it does not
+// carry that architecture, and anything else is the index being wrong. A body
+// that does not verify against the digest its own Release published withdraws
+// the codename however many architectures are healthy beside it, because
+// serving it would sign stanzas naming artifacts the pool no longer has.
+func TestAServedArchitectureThatDoesNotVerifyWithdrawsTheCodename(t *testing.T) {
+	gzPath := func(arch string) string {
+		return "dists/" + mirroredCodename + "/main/binary-" + arch + "/Packages.gz"
+	}
+
+	// One architecture, and it is the broken one: nothing survives, and a
+	// Release naming no architecture at all is a suite apt reads as not
+	// supporting the host.
+	t.Run("the only architecture the archive serves", func(t *testing.T) {
+		s, archive := aptProfileServerWith(t, "amd64", aptProfilePackages(), aptProfilePool(), "arm64")
+		archive.setObject(gzPath("amd64"), "a body from a different sync")
+		aptProfileBind(t, s, "web", audit.ExpansionBlock, "nginx")
+
+		if names, _ := s.aptFilteredSuites(); len(names) != 0 {
+			t.Fatalf("filtered codenames = %v, want none: the one architecture served did not verify", names)
+		}
+		if code, _ := mirrorGet(t, s, "/apt/dists/fixture-web/Release"); code != http.StatusNotFound {
+			t.Errorf("GET the withdrawn codename's Release = %d, want 404", code)
+		}
+	})
+
+	// Every declared architecture 404s, which a mirror produces by publishing
+	// a Release ahead of the indexes it names. Dropping each in turn leaves a
+	// Release carrying no Architectures: at all, and apt reads that the same
+	// way it reads a suite that does not support the host.
+	t.Run("every architecture the Release names", func(t *testing.T) {
+		s, archive := aptProfileServerWith(t, "amd64", aptProfilePackages(), aptProfilePool(), "arm64")
+		archive.removeObject(gzPath("amd64"))
+		aptProfileBind(t, s, "web", audit.ExpansionBlock, "nginx")
+
+		if names, _ := s.aptFilteredSuites(); len(names) != 0 {
+			t.Fatalf("filtered codenames = %v, want none: the archive serves no architecture its Release names", names)
+		}
+	})
+
+	// One broken beside one healthy, which is the case that separates the two
+	// classes. Dropping arm64 here and serving amd64 alone is the outcome a
+	// drop rule that tested err != nil rather than errUpstreamNotFound would
+	// produce, and it signs a suite an operator was never told is short.
+	t.Run("one architecture beside a healthy one", func(t *testing.T) {
+		s, archive := aptProfileServerWith(t, "amd64", aptProfilePackages(), aptProfilePool(), "arm64")
+		// The Release publishes a placeholder digest for arm64, so any body
+		// at all under that path is an index against a digest it fails.
+		archive.setObject(gzPath("arm64"), string(gzipFixture(aptProfilePackages())))
+		aptProfileBind(t, s, "web", audit.ExpansionBlock, "nginx")
+
+		if names, _ := s.aptFilteredSuites(); len(names) != 0 {
+			t.Fatalf("filtered codenames = %v, want none: one architecture's index did not match the digest its own Release published", names)
+		}
+	})
 }
 
 // Requirement 7's server half: which codename a host reads is a fact only the

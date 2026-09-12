@@ -58,6 +58,14 @@ func (a *fixtureArchive) setObject(rel, body string) {
 	a.objects[rel] = body
 }
 
+// removeObject withdraws a path the archive was serving, which is an archive
+// that publishes a digest for something it does not carry.
+func (a *fixtureArchive) removeObject(rel string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.objects, rel)
+}
+
 func (a *fixtureArchive) object(rel string) (string, bool) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -125,7 +133,14 @@ func fixtureDists(t *testing.T, kr *aptsign.KeyRing, packages string) map[string
 // needs: the client reads binary-<its own arch>/Packages and nothing else, so
 // an arm64 host handed an amd64-only Release reports a suite that does not
 // support the architecture rather than the outcome under test.
-func fixtureDistsArch(t *testing.T, kr *aptsign.KeyRing, packages, arch string) map[string]string {
+//
+// alsoDeclared names architectures the Release declares and publishes a digest
+// for while the archive serves no body: archive.ubuntu.com is that archive,
+// with one Release per suite naming all seven and amd64 and i386 alone served
+// there. Deriving the Release from the one body written is what makes declared
+// and published agree in a fixture and nowhere else, so a generator that takes
+// a 404 on a declared architecture passes here and fails on Ubuntu.
+func fixtureDistsArch(t *testing.T, kr *aptsign.KeyRing, packages, arch string, alsoDeclared ...string) map[string]string {
 	t.Helper()
 	packagesPath := "main/binary-" + arch + "/Packages"
 	sum := sha256.Sum256([]byte(packages))
@@ -137,19 +152,27 @@ func fixtureDistsArch(t *testing.T, kr *aptsign.KeyRing, packages, arch string) 
 	gzBody := gzipFixture(packages)
 	gzSum := sha256.Sum256(gzBody)
 
-	release := strings.Join([]string{
+	digests := []string{
+		fmt.Sprintf(" %s %d %s", digest, len(packages), packagesPath),
+		fmt.Sprintf(" %s %d %s.gz", hex.EncodeToString(gzSum[:]), len(gzBody), packagesPath),
+	}
+	for _, other := range alsoDeclared {
+		rest := "main/binary-" + other + "/Packages"
+		digests = append(digests,
+			fmt.Sprintf(" %s %d %s", strings.Repeat("0", 64), 1, rest),
+			fmt.Sprintf(" %s %d %s", strings.Repeat("0", 64), 1, rest+".gz"))
+	}
+
+	release := strings.Join(append([]string{
 		"Origin: Ubuntu",
 		"Label: Ubuntu",
 		"Suite: " + mirroredCodename,
 		"Codename: " + mirroredCodename,
 		"Components: main",
-		"Architectures: " + arch,
+		"Architectures: " + strings.Join(append([]string{arch}, alsoDeclared...), " "),
 		"Acquire-By-Hash: yes",
 		"SHA256:",
-		fmt.Sprintf(" %s %d %s", digest, len(packages), packagesPath),
-		fmt.Sprintf(" %s %d %s.gz", hex.EncodeToString(gzSum[:]), len(gzBody), packagesPath),
-		"",
-	}, "\n")
+	}, append(digests, "")...), "\n")
 
 	inRelease, err := kr.ClearSign([]byte(release))
 	if err != nil {
