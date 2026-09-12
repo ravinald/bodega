@@ -405,7 +405,12 @@ func (c *OSVChecker) maxAge() time.Duration {
 	return c.MaxAge
 }
 
-type osvSeverity struct {
+// OSVSeverity is one score OSV published for one advisory: the scoring
+// system it came from and the vector or value itself. Exported because the
+// stamp it is persisted into is read outside this package — `bodega profile
+// pins` renders it and the pins endpoint returns it — and a severity a caller
+// has to re-query OSV to read is a severity nothing will read.
+type OSVSeverity struct {
 	Type  string `json:"type"`
 	Score string `json:"score"`
 }
@@ -413,7 +418,7 @@ type osvSeverity struct {
 type osvVuln struct {
 	ID       string        `json:"id"`
 	Summary  string        `json:"summary"`
-	Severity []osvSeverity `json:"severity"`
+	Severity []OSVSeverity `json:"severity"`
 }
 
 // osvAPIBodyLimit caps what one api.osv.dev response may cost in memory. A
@@ -470,8 +475,8 @@ func (c *OSVChecker) query(ctx context.Context, ecosystem, name, version string)
 // json.Marshal sorts the keys, so the stamped value is stable across runs.
 // Records OSV scored no severity for are absent; vetting.osv.vulns is the
 // list of what was queried.
-func vulnSeverities(vs []osvVuln) map[string][]osvSeverity {
-	out := make(map[string][]osvSeverity, len(vs))
+func vulnSeverities(vs []osvVuln) map[string][]OSVSeverity {
+	out := make(map[string][]OSVSeverity, len(vs))
 	for _, v := range vs {
 		if v.ID == "" || len(v.Severity) == 0 {
 			continue

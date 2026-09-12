@@ -1,0 +1,15 @@
+-- pinned_at is when the version this entry holds was last decided.
+--
+-- Separate from created_at because the two answer different questions and the
+-- upsert in PutProfileEntry only ever writes one of them. created_at is when
+-- the package joined the profile; re-pinning it at a new version leaves that
+-- date alone, which is correct for an entry's own age and wrong for the
+-- report this column exists for. `bodega profile pins` measures a review date
+-- against the decision, and a pin moved yesterday under an entry written two
+-- years ago would otherwise read as two years stale.
+--
+-- Empty on every row 014 and 015 wrote, and the reader falls back to
+-- created_at for those rather than inventing a date. That fallback is a lower
+-- bound rather than a guess: the entry existed then, so whatever pin it
+-- carries is at least that old.
+ALTER TABLE profile_entries ADD COLUMN pinned_at TEXT NOT NULL DEFAULT '';

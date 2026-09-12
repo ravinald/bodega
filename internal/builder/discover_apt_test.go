@@ -1,6 +1,8 @@
 package builder
 
 import (
+	"context"
+	"io"
 	"testing"
 
 	"github.com/ravinald/bodega/internal/manifest"
@@ -313,5 +315,137 @@ Source: binutils-arm-none-eabi (15build1)
 					ve.SourceName, tc.pkg)
 			}
 		})
+	}
+}
+
+// `apt-cache depends` prints package names and drops every version relation,
+// and "which release" is the whole of what a pin needs. The relation lives in
+// the control stanza.
+func TestParseAptRelationStanzasReadsTheDeclaredVersions(t *testing.T) {
+	output := `Package: postgresql-14
+Version: 14.9-0ubuntu0.22.04.1
+Architecture: amd64
+Pre-Depends: postgresql-common (>= 142), debconf (>= 0.5)
+Depends: libpq5 (= 14.9), libssl3 (>= 3.0.0), libc6 | libc6-udeb, locales, python3:any (>= 3.12)
+Description: object-relational SQL database
+
+Package: postgresql-14
+Version: 14.8-0ubuntu0.22.04.1
+Depends: libpq5 (= 14.8)
+`
+	rels := parseAptRelationStanzas(output)
+
+	// The candidate stanza alone. Merging the two would declare libpq5 at both
+	// 14.9 and 14.8, and the pin would hold whichever was read last.
+	if got := rels["libpq5"]; got.Operator != "=" || got.Version != "14.9" || got.Raw != "libpq5 (= 14.9)" {
+		t.Errorf("libpq5 relation = %+v, want an exact 14.9 from the first stanza", got)
+	}
+	// A floor holds nothing still: the dependency may move upward whatever the
+	// parent is pinned at.
+	if got := rels["libssl3"]; got.Operator != ">=" || got.Version != "3.0.0" {
+		t.Errorf("libssl3 relation = %+v, want the >= floor recorded as a floor", got)
+	}
+	if got, ok := rels["locales"]; !ok || got.Operator != "" || got.Version != "" {
+		t.Errorf("locales relation = %+v (present=%v), want a dependency by name alone", got, ok)
+	}
+	// An alternative is another package the parent may be built against.
+	if _, ok := rels["libc6-udeb"]; !ok {
+		t.Error("an alternative dependency is dropped, so an edge to the one bodega cataloged is never written")
+	}
+	// The architecture qualifier names which build satisfies the dependency,
+	// not which release.
+	if got := rels["python3"]; got.Operator != ">=" || got.Version != "3.12" {
+		t.Errorf("python3:any relation = %+v, want the qualifier stripped from the name", got)
+	}
+	// Pre-Depends is a hard dependency and belongs in the closure.
+	if got := rels["postgresql-common"]; got.Operator != ">=" || got.Version != "142" {
+		t.Errorf("Pre-Depends relation = %+v, want it read alongside Depends", got)
+	}
+	if len(rels) != 8 {
+		t.Errorf("relations = %d, want 8: %+v", len(rels), rels)
+	}
+}
+
+func TestParseAptRelationStanzasOnNothingToRead(t *testing.T) {
+	for _, in := range []string{"", "Package: base-files\nVersion: 12ubuntu4\n", "not a stanza"} {
+		if rels := parseAptRelationStanzas(in); rels != nil {
+			t.Errorf("parseAptRelationStanzas(%q) = %+v, want nil", in, rels)
+		}
+	}
+}
+
+// A rebuild after the declared version moved must not leave both releases in
+// the graph: the closure walk would answer with whichever edge the file listed
+// first, which is an answer that depends on write order rather than on apt.
+func TestAddAptEdgeReplacesThisParentsEarlierEdgeToTheSamePackage(t *testing.T) {
+	store := manifest.NewLocalStore(t.TempDir())
+	store.AddEdge(manifest.DepEdge{Parent: "apt/postgresql-14", Child: "apt/libpq5@14.9"})
+	store.AddEdge(manifest.DepEdge{Parent: "apt/pgbouncer", Child: "apt/libpq5@14.9"})
+
+	addAptEdge(store, "postgresql-14", DiscoveredDep{
+		Name: "libpq5", Version: "15.1", Constraint: manifest.ConstraintExact, RawSpec: "libpq5 (= 15.1)",
+	})
+
+	var children []string
+	for _, e := range store.Edges() {
+		if e.Parent == "apt/postgresql-14" {
+			children = append(children, e.Child)
+		}
+	}
+	if len(children) != 1 || children[0] != "apt/libpq5@15.1" {
+		t.Errorf("postgresql-14 children = %v, want apt/libpq5@15.1 alone", children)
+	}
+	// Another parent's edge to the same package is somebody else's fact.
+	for _, e := range store.Edges() {
+		if e.Parent == "apt/pgbouncer" && e.Child == "apt/libpq5@14.9" {
+			return
+		}
+	}
+	t.Error("pgbouncer's own edge was removed, which no rebuild of postgresql-14 decides")
+}
+
+// Each CLI invocation builds a fresh Store, and a Store that never read
+// graph.json starts from an empty one. Saving then replaced the file with
+// whatever that run discovered, destroying every earlier run's edges with no
+// error and nothing in the output to say so: a pin's closure was the last
+// import alone.
+func TestImportsAccumulateEdgesAcrossRuns(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	ImportAptDeps(ctx, manifest.NewLocalStore(dir), "nginx", []DiscoveredDep{
+		{Ecosystem: manifest.TypeApt, Name: "libpcre3", Version: "2.0.0", RawSpec: "libpcre3 (= 2.0.0)"},
+	}, io.Discard)
+	ImportAptDeps(ctx, manifest.NewLocalStore(dir), "postgresql-14", []DiscoveredDep{
+		{Ecosystem: manifest.TypeApt, Name: "libpq5", Version: "14.9", RawSpec: "libpq5 (= 14.9)"},
+	}, io.Discard)
+	ImportDeps(ctx, manifest.NewLocalStore(dir), "django", manifest.VersionEntry{}, []DiscoveredDep{
+		{Ecosystem: manifest.TypePypi, Name: "sqlparse", Version: "0.4.4",
+			RequiredBy: "pypi/django@4.2.11", RawSpec: "sqlparse>=0.3.1",
+			// Already cataloged, which a graph holding only first sightings
+			// would drop.
+			Exists: true},
+	}, io.Discard)
+
+	check := manifest.NewLocalStore(dir)
+	if err := check.LoadGraph(ctx); err != nil {
+		t.Fatalf("load graph: %v", err)
+	}
+	want := map[string]string{
+		"apt/nginx":          "apt/libpcre3@2.0.0",
+		"apt/postgresql-14":  "apt/libpq5@14.9",
+		"pypi/django@4.2.11": "pypi/sqlparse@0.4.4",
+	}
+	got := map[string]string{}
+	for _, e := range check.Edges() {
+		got[e.Parent] = e.Child
+	}
+	if len(got) != len(want) {
+		t.Fatalf("graph = %+v, want an edge from each of the three imports", check.Edges())
+	}
+	for parent, child := range want {
+		if got[parent] != child {
+			t.Errorf("%s -> %q, want %q", parent, got[parent], child)
+		}
 	}
 }

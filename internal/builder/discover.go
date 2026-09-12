@@ -160,7 +160,27 @@ func ScanDeps(cfg *Config, store *manifest.Store, name string, ve manifest.Versi
 // ImportDeps adds the given discovered dependencies to the store and saves.
 // Only imports deps where Exists is false. Returns counts of added per ecosystem.
 func ImportDeps(ctx context.Context, store *manifest.Store, parentName string, parentVE manifest.VersionEntry, deps []DiscoveredDep, out io.Writer) (pypiAdded, gomodAdded, npmAdded int) {
+	// Read the graph before adding to it. A Store that never loaded it starts
+	// from an empty one and the save below replaces graph.json with this run's
+	// edges alone, destroying every earlier run's with no error.
+	if err := store.LoadGraph(ctx); err != nil {
+		_, _ = fmt.Fprintf(out, "    WARNING: could not read the dependency graph, so no edge was recorded: %v\n", err)
+		return 0, 0, 0
+	}
+	wroteEdge := false
 	for _, d := range deps {
+		// The edge is recorded whether or not the package is new. A dependency
+		// already in the catalog is still a dependency, and a graph holding
+		// only first sightings reports a pin on a mature package as implying
+		// nothing.
+		store.AddEdge(manifest.DepEdge{
+			Parent:     d.RequiredBy,
+			Child:      fmt.Sprintf("%s/%s@%s", d.Ecosystem, d.Name, d.Version),
+			Constraint: d.Constraint,
+			RawSpec:    d.RawSpec,
+		})
+		wroteEdge = true
+
 		if d.Exists {
 			continue
 		}
@@ -191,14 +211,6 @@ func ImportDeps(ctx context.Context, store *manifest.Store, parentName string, p
 				npmAdded++
 			}
 		}
-		// Add dependency graph edge.
-		childRef := fmt.Sprintf("%s/%s@%s", d.Ecosystem, d.Name, d.Version)
-		store.AddEdge(manifest.DepEdge{
-			Parent:     d.RequiredBy,
-			Child:      childRef,
-			Constraint: d.Constraint,
-			RawSpec:    d.RawSpec,
-		})
 	}
 
 	if pypiAdded > 0 {
@@ -221,7 +233,7 @@ func ImportDeps(ctx context.Context, store *manifest.Store, parentName string, p
 	}
 
 	// Save the dependency graph.
-	if pypiAdded+gomodAdded+npmAdded > 0 {
+	if wroteEdge {
 		if err := store.SaveGraph(ctx); err != nil {
 			_, _ = fmt.Fprintf(out, "    WARNING: could not save dependency graph: %v\n", err)
 		}

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -16,11 +17,12 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/entitle"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/pins"
 )
 
 func newProfileCmd(gf *globalFlags) *cobra.Command {
 	parent := &cobra.Command{
-		Use:   "profile <create|list|show|bind|unbind|set|add|remove|pin|unpin|diff|check>",
+		Use:   "profile <create|list|show|bind|unbind|set|add|remove|pin|pins|unpin|diff|check>",
 		Short: "Declare what one class of host may fetch",
 		Long: `A profile names the set of packages one class of host may fetch, and the
 version rule each of them carries for that class.
@@ -51,6 +53,7 @@ Examples:
   bodega profile set web apt --membership closed --version-default floating
   bodega profile add web apt nginx
   bodega profile pin web apt postgresql-14 14.11 --reason "15 breaks the config"
+  bodega profile pins --stale
   bodega profile bind web db01
   bodega profile diff web --origin db01
   bodega profile check`,
@@ -65,6 +68,7 @@ Examples:
 		newProfileAddCmd(gf),
 		newProfileRemoveCmd(gf),
 		newProfilePinCmd(gf),
+		newProfilePinsCmd(gf),
 		newProfileUnpinCmd(gf),
 		newProfileDiffCmd(gf),
 		newProfileCheckCmd(gf),
@@ -965,6 +969,9 @@ constraint is 'bodega profile unpin'. 'bodega profile pin' is this command
 with the pinning arguments already filled in.`,
 		Args: cobra.ExactArgs(3),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := pins.ValidateReviewDate(reviewAfter); err != nil {
+				return err
+			}
 			return putProfileEntry(gf, args[0], args[1], args[2], audit.ProfileEntry{
 				Constraint: constraint, Version: version, Reason: reason,
 				ReviewAfter: reviewAfter, Origin: origin,
@@ -981,6 +988,7 @@ with the pinning arguments already filled in.`,
 
 func newProfilePinCmd(gf *globalFlags) *cobra.Command {
 	var reason, reviewAfter string
+	var strictClosure bool
 	c := &cobra.Command{
 		Use:   "pin <profile> <type> <name> <version>",
 		Short: "Hold one package at one version, with a reason",
@@ -989,7 +997,30 @@ func newProfilePinCmd(gf *globalFlags) *cobra.Command {
 --reason is required. A pin with no reason outlives the problem it was written
 for: nobody who finds it later can tell a deliberate hold from an accident, so
 it is never lifted. --review-after gives the same pin a date it stops looking
-current on.`,
+current on, and 'bodega profile pins --stale' is the gate that finds it.
+
+A pin is not local. The version being held was built against particular
+releases of everything it depends on, so holding it holds those too, and the
+dependency closure is reported before the pin is written.
+
+  default          report the closure and pin the one package you named
+  --strict-closure pin every package in the closure at the version the graph
+                   records, so the profile states what it is already implying
+
+Reporting is the default because extending a pin across a closure freezes a
+growing set: each package pinned drags its own dependencies in, and a host
+stops receiving security updates for all of them without anyone deciding that
+it should. --strict-closure is for the operator who has read the report and
+wants the implication written down.
+
+--strict-closure never overwrites an entry somebody else gave a reason. Those
+are named and left where they are: moving one would take the version backward
+across whatever its reason records and replace the reason with a generated
+string. Move such an entry with 'bodega profile pin' on the package itself.
+
+On apt, --strict-closure has nothing to pin to unless the dependency was
+declared with an '=' relation: a '>=' floor holds no version still, and the
+closure reports those members with no version rather than choosing one.`,
 		Args: cobra.ExactArgs(4),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if strings.TrimSpace(reason) == "" {
@@ -998,17 +1029,325 @@ current on.`,
 					"cannot tell a deliberate hold from an accident, so it is never lifted.\n" +
 					"  bodega profile pin <profile> <type> <name> <version> --reason \"15 breaks the config\"")
 			}
+			if err := pins.ValidateReviewDate(reviewAfter); err != nil {
+				return err
+			}
+			profile, typ, name, version := args[0], args[1], args[2], args[3]
+			closure, err := reportPinClosure(gf, profile, typ, name, version, strictClosure)
+			if err != nil {
+				return err
+			}
 			supplied := changedFlags(cmd, "review-after")
 			supplied["constraint"], supplied["version"], supplied["reason"] = true, true, true
-			return putProfileEntry(gf, args[0], args[1], args[2], audit.ProfileEntry{
-				Constraint: manifest.ConstraintExact, Version: args[3],
-				Reason: reason, ReviewAfter: reviewAfter,
-			}, supplied)
+			if err := putProfileEntry(gf, profile, typ, name, audit.ProfileEntry{
+				Constraint: manifest.ConstraintExact, Version: version,
+				Reason: reason, ReviewAfter: reviewAfter, PinnedAt: time.Now().UTC(),
+			}, supplied); err != nil {
+				return err
+			}
+			if !strictClosure {
+				return nil
+			}
+			return extendPinAcrossClosure(gf, profile, closure, reason, reviewAfter)
 		},
 	}
 	c.Flags().StringVar(&reason, "reason", "", "Why this version is held (required)")
 	c.Flags().StringVar(&reviewAfter, "review-after", "", "Date after which the pin should be re-examined (YYYY-MM-DD)")
+	c.Flags().BoolVar(&strictClosure, "strict-closure", false,
+		"Also pin every package in the dependency closure, at the version the graph records. "+
+			"Off by default: the default reports the closure and freezes nothing beyond the package you named")
 	return c
+}
+
+// reportPinClosure prints what else the pin holds still, before anything is
+// written. It returns the closure so --strict-closure does not walk it twice.
+//
+// A graph bodega cannot read is reported and does not stop the pin. The
+// closure is what the operator learns from the command, not a control the pin
+// depends on, and refusing to hold a package because graph.json is missing
+// would make an unrelated catalog defect block a security decision.
+func reportPinClosure(gf *globalFlags, profile, typ, name, version string, strict bool) (pins.Closure, error) {
+	closure := pins.Closure{Type: typ, Name: name, Version: version}
+	store, err := loadStore(gf)
+	if err != nil {
+		return closure, fmt.Errorf("load manifests: %w", err)
+	}
+	ctx := backgroundCtx()
+	if err := store.LoadGraph(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "could not read the dependency graph, so this pin's closure is unreported: %v\n", err)
+		return closure, nil
+	}
+	closure = pins.Of(store.Edges(), typ, name, version)
+	if len(closure.Members) == 0 {
+		return closure, nil
+	}
+
+	fmt.Printf("Pinning %s at %s holds %d other package(s) still:\n", closure.Ref(), version, len(closure.Members))
+	w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "  PACKAGE\tHELD AT\tVIA\tSPEC")
+	for _, m := range closure.Members {
+		fmt.Fprintf(w, "  %s\t%s\t%s\t%s\n", m.Ref(), orDash(m.Version), m.Via, orDash(m.RawSpec))
+	}
+	_ = w.Flush()
+
+	adb, err := openProfileReader(gf)
+	if err != nil {
+		return closure, err
+	}
+	defer adb.Close()
+	d, err := adb.GetProfile(ctx, profile)
+	if err != nil {
+		return closure, err
+	}
+	for _, c := range closure.Conflicts(entitle.New(checkView(d))) {
+		fmt.Printf("  conflict: %s\n", c.Reason)
+	}
+	if !strict && len(closure.Resolved()) > 0 {
+		fmt.Printf("  Pin the closure too:  --strict-closure\n")
+	}
+	return closure, nil
+}
+
+// impliedReasonPrefix opens the reason --strict-closure writes. It is how the
+// command tells an entry it wrote itself from one an operator authored: the
+// first may be refreshed, the second is a record that only its author may
+// replace.
+const impliedReasonPrefix = "implied by the "
+
+// impliedReason is the reason --strict-closure records on a closure member,
+// naming the pin that implied it so the entry says why it is there without
+// anyone reading the graph.
+func impliedReason(closure pins.Closure, reason string) string {
+	return fmt.Sprintf("%s%s pin at %s: %s", impliedReasonPrefix, closure.Ref(), closure.Version, reason)
+}
+
+// extendPinAcrossClosure writes the pins the closure implies, at the versions
+// the graph records.
+//
+// A member the graph names no version for is skipped and said so: the edge
+// records that the package is depended on and not which release, so pinning it
+// would mean choosing a version on the operator's behalf, which is the one
+// thing a pin must never be.
+//
+// A member already carrying an operator-authored reason is skipped too, and
+// that is the case this command exists to report. The conflict it prints one
+// line earlier is precisely an entry somebody else pinned deliberately;
+// overwriting it would move the version backward across whatever fix the
+// reason names and replace the reason with a generated string, leaving the
+// word "Updated" as the only trace. The operator moves it with 'bodega profile
+// pin', where they say why.
+func extendPinAcrossClosure(gf *globalFlags, profile string, closure pins.Closure, reason, reviewAfter string) error {
+	resolved := closure.Resolved()
+	if len(resolved) == 0 {
+		fmt.Printf("--strict-closure: the graph records no version for anything %s reaches, so nothing more was pinned.\n",
+			closure.Ref())
+		return nil
+	}
+
+	held, err := profileEntriesByRef(gf, profile)
+	if err != nil {
+		return fmt.Errorf("--strict-closure: read %s: %w", profile, err)
+	}
+
+	implied := impliedReason(closure, reason)
+	var refused []audit.ProfileEntry
+	for _, m := range resolved {
+		if e, ok := held[m.Ref()]; ok && operatorAuthored(e) {
+			refused = append(refused, e)
+			continue
+		}
+		supplied := map[string]bool{
+			"constraint": true, "version": true, "reason": true, "review-after": reviewAfter != "",
+		}
+		if err := putProfileEntry(gf, profile, m.Type, m.Name, audit.ProfileEntry{
+			Constraint: manifest.ConstraintExact, Version: m.Version,
+			Reason: implied, ReviewAfter: reviewAfter, PinnedAt: time.Now().UTC(),
+		}, supplied); err != nil {
+			return fmt.Errorf("--strict-closure: pin %s: %w", m.Ref(), err)
+		}
+	}
+	for _, e := range refused {
+		fmt.Printf("--strict-closure: left %s/%s at %s alone; it carries a reason somebody wrote: %s\n",
+			e.Type, e.Name, orDash(e.Version), e.Reason)
+		fmt.Printf("  Move it deliberately:  bodega profile pin %s %s %s <version> --reason <why>\n",
+			profile, e.Type, e.Name)
+	}
+	if skipped := len(closure.Members) - len(resolved); skipped > 0 {
+		fmt.Printf("--strict-closure: %d closure member(s) carry no version in the graph and were left floating; pin them by name once you know the release.\n", skipped)
+	}
+	return nil
+}
+
+// operatorAuthored answers whether a profile entry carries a record that only
+// its author may replace. An entry --strict-closure wrote itself is not one:
+// refreshing those is the whole of what a second run does.
+func operatorAuthored(e audit.ProfileEntry) bool {
+	r := strings.TrimSpace(e.Reason)
+	return r != "" && !strings.HasPrefix(r, impliedReasonPrefix)
+}
+
+// profileEntriesByRef reads a profile's entries keyed as "type/name".
+func profileEntriesByRef(gf *globalFlags, profile string) (map[string]audit.ProfileEntry, error) {
+	adb, err := openProfileReader(gf)
+	if err != nil {
+		return nil, err
+	}
+	defer adb.Close()
+	d, err := adb.GetProfile(backgroundCtx(), profile)
+	if err != nil {
+		return nil, err
+	}
+	held := make(map[string]audit.ProfileEntry, len(d.Entries))
+	for _, e := range d.Entries {
+		held[e.Type+"/"+e.Name] = e
+	}
+	return held, nil
+}
+
+func newProfilePinsCmd(gf *globalFlags) *cobra.Command {
+	var stale, asJSON bool
+	c := &cobra.Command{
+		Use:   "pins [profile]",
+		Short: "List every pin with its reason, its review date and the advisories against it",
+		Long: `Report every version a profile holds, and what bodega knows about it.
+
+A pin is a decision to stop receiving updates for one package. "Pinned at
+14.9" and "not receiving security updates for postgres" are the same sentence,
+and this is where the second one is written down: each pin is listed with the
+reason an operator gave, who gave it, when, the review date, and the OSV
+advisories recorded against the version being held.
+
+A pin accepts the known vulnerabilities in that version for the life of the
+pin. Nothing here tracks what is done about them: no suppression state, no
+ticket, no severity clock. The reason and the review date are the whole of
+bodega's suppression concept, and the report is what a tool that does track
+remediation reads.
+
+The OSV column is the stamp 'bodega policy osv rescan' writes. A version no run
+has ever answered for reads 'unchecked' rather than 'clean': an empty advisory
+list means nobody looked as often as it means there is nothing to find, and a
+pin is the one place that distinction decides whether somebody acts.
+
+--stale narrows the report to the pins past their review date and exits 1, so
+it works as a CI or cron gate. A pin with no review date is never stale, which
+is why 'pin --review-after' is worth writing.`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var profile string
+			if len(args) == 1 {
+				profile = args[0]
+			}
+			adb, err := openProfileReader(gf)
+			if err != nil {
+				return err
+			}
+			defer adb.Close()
+			store, err := loadStore(gf)
+			if err != nil {
+				return fmt.Errorf("load manifests: %w", err)
+			}
+			all, err := pins.Collect(backgroundCtx(), adb, store, profile, time.Now().UTC())
+			if err != nil {
+				return err
+			}
+			shown := all
+			if stale {
+				shown = pins.Stale(all)
+			}
+			if asJSON {
+				if shown == nil {
+					// An empty array rather than null, matching the endpoint:
+					// a consumer has to tell "no pins" from a field it failed
+					// to parse, and null reads as the second.
+					shown = []pins.Pin{}
+				}
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				if err := enc.Encode(shown); err != nil {
+					return err
+				}
+			} else {
+				printPins(shown, all, stale)
+			}
+			if stale && len(shown) > 0 {
+				return fmt.Errorf("%d pin(s) past their review date", len(shown))
+			}
+			return nil
+		},
+	}
+	c.Flags().BoolVar(&stale, "stale", false, "Only the pins past their review date; exits 1 when any is found")
+	c.Flags().BoolVar(&asJSON, "json", false, "Emit the records GET /api/v1/profiles/{name}/pins returns")
+	return c
+}
+
+// printPins renders the report. The advisory ids and their scores go under the
+// table rather than in it: a version carrying three GHSAs with two scores each
+// is a paragraph, and a column wide enough for it makes every other row
+// unreadable.
+func printPins(shown, all []pins.Pin, stale bool) {
+	if len(shown) == 0 {
+		if stale {
+			fmt.Printf("No pin is past its review date (%d pin(s) checked).\n", len(all))
+			return
+		}
+		fmt.Println("No pins. Nothing in any profile holds a package at one version.")
+		fmt.Println("  bodega profile pin <profile> <type> <name> <version> --reason <why>")
+		return
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "PROFILE\tTYPE\tPACKAGE\tVERSION\tPINNED\tBY\tREVIEW AFTER\tOVERDUE\tOSV\tCHECKED\tREASON")
+	for _, p := range shown {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			p.Profile, p.Type, p.Name, p.Version, pinDate(p.PinnedAt), orDash(p.Actor),
+			orDash(p.ReviewAfter), overdueCell(p), p.OSV.State, pinDate(p.OSV.Checked), orDash(p.Reason))
+	}
+	_ = w.Flush()
+
+	for _, p := range shown {
+		if len(p.OSV.Vulns) == 0 {
+			continue
+		}
+		fmt.Printf("\n%s %s/%s at %s accepts %d known advisory(ies) for the life of the pin:\n",
+			p.Profile, p.Type, p.Name, p.Version, len(p.OSV.Vulns))
+		for _, id := range p.OSV.Vulns {
+			scores := p.OSV.Severity[id]
+			if len(scores) == 0 {
+				fmt.Printf("  %s  (OSV recorded no score)\n", id)
+				continue
+			}
+			var rendered []string
+			for _, sev := range scores {
+				rendered = append(rendered, strings.TrimSpace(sev.Type+" "+sev.Score))
+			}
+			fmt.Printf("  %s  %s\n", id, strings.Join(rendered, ", "))
+		}
+	}
+	for _, p := range shown {
+		if !p.Cataloged {
+			fmt.Printf("\n%s %s/%s: the catalog holds no version %s, so nothing can be checked against it.\n"+
+				"  What it holds:  bodega show pkg %s %s\n",
+				p.Profile, p.Type, p.Name, p.Version, p.Type, p.Name)
+		}
+	}
+}
+
+// pinDate renders a date cell, "-" for a date nothing recorded.
+func pinDate(t *time.Time) string {
+	if t == nil {
+		return "-"
+	}
+	return t.UTC().Format(pins.ReviewDateLayout)
+}
+
+// overdueCell says how far past its review date a pin is. A pin with a review
+// date still ahead of it reads "-" rather than a negative number of days: the
+// column answers "is this overdue and by how much", and a countdown in it
+// would need a second reading to tell the two apart.
+func overdueCell(p pins.Pin) string {
+	if !p.Stale {
+		return "-"
+	}
+	return fmt.Sprintf("%dd", p.OverdueDays)
 }
 
 func newProfileUnpinCmd(gf *globalFlags) *cobra.Command {
@@ -1168,6 +1507,13 @@ func mergeProfileEntry(stored, e audit.ProfileEntry, supplied map[string]bool) a
 	}
 	if supplied["origin"] {
 		out.Origin = e.Origin
+	}
+	// PinnedAt moves only when the caller sets it, which is the pin path
+	// alone. An `add` that edits a pin's reason carries the stored date
+	// through, so correcting a typo does not re-date the decision and reset
+	// the review clock it is measured against.
+	if !e.PinnedAt.IsZero() {
+		out.PinnedAt = e.PinnedAt
 	}
 	return out
 }

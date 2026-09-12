@@ -444,6 +444,7 @@ func (s *Server) buildAptSnapshot(ctx context.Context) (*aptSnapshot, error) {
 		snap.suites[suite] = s.buildAptSuiteIndex(ctx, suite, poolMap, sharedPool, date, snap.validUntil)
 	}
 	s.auditAptEntries(ctx, served, poolMap)
+	s.reportPinFeasibility(ctx)
 	return snap, nil
 }
 
