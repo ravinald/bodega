@@ -13,6 +13,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
+
+	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
@@ -112,12 +115,19 @@ func osvBucket(t *testing.T) *httptest.Server {
 
 func runSync(t *testing.T, args ...string) (stdout, stderr string, err error) {
 	t.Helper()
+	return runOSVCmd(t, newPolicyOSVSyncCmd(&globalFlags{}), args...)
+}
+
+// runOSVCmd drives one subcommand with the process streams redirected, because
+// both commands write their table to os.Stdout and their warnings to os.Stderr
+// rather than to the cobra streams.
+func runOSVCmd(t *testing.T, cmd *cobra.Command, args ...string) (stdout, stderr string, err error) {
+	t.Helper()
 	outR, outW, _ := os.Pipe()
 	errR, errW, _ := os.Pipe()
 	oldOut, oldErr := os.Stdout, os.Stderr
 	os.Stdout, os.Stderr = outW, errW
 
-	cmd := newPolicyOSVSyncCmd(&globalFlags{})
 	cmd.SetArgs(args)
 	cmd.SetOut(io.Discard)
 	cmd.SetErr(io.Discard)
@@ -253,5 +263,98 @@ func TestSyncCommand_MirrorInstallFetchesWhatItCaptured(t *testing.T) {
 	}
 	if !strings.Contains(stderr, `"internal"`) {
 		t.Errorf("the house suite still has to be named, since entries recording no release warn on it: %q", stderr)
+	}
+}
+
+// TestSyncCommand_OneUnreadableAptManifestStillSyncsEverythingElse covers the
+// form a cron runs. The manifest read happens before any fetch, so returning on
+// the first unparsable apt package leaves npm, pypi, gomod and cargo unsynced
+// over a file none of them has anything to do with.
+func TestSyncCommand_OneUnreadableAptManifestStillSyncsEverythingElse(t *testing.T) {
+	root := syncInstall(t, "noble", "noble")
+	storeAptEntry(t, root, "libexpat1", manifest.VersionEntry{
+		Version:       "2.4.7-1ubuntu0.2",
+		SourcePackage: "expat",
+		CaptureSuite:  "jammy",
+		Suites:        []string{"noble"},
+	})
+	mpath := filepath.Join(root, "manifests", "apt", "libexpat1", "manifest.json")
+	if err := os.WriteFile(mpath, []byte("{ this is not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, err := runSync(t)
+	if err != nil {
+		t.Fatalf("one unreadable apt manifest failed the whole sync: %v", err)
+	}
+	for _, eco := range []string{"npm", "PyPI", "Go", "crates.io", "Ubuntu:24.04:LTS"} {
+		if !strings.Contains(stdout, eco) {
+			t.Errorf("%s never synced, so the exit code above proves nothing:\n%s", eco, stdout)
+		}
+	}
+	if _, err := policy.NewOSVDatabase(filepath.Join(root, "osv")).Meta("npm"); err != nil {
+		t.Errorf("npm wrote nothing to the database: %v", err)
+	}
+	if !strings.Contains(stderr, "libexpat1") {
+		t.Errorf("the unreadable package has to be named, or its release is silently missing: %q", stderr)
+	}
+}
+
+// setOSVPolicy writes one policy row into the install's audit store, which is
+// what list reads its rows from.
+func setOSVPolicy(t *testing.T, root, ecosystem, action string) {
+	t.Helper()
+	adb, err := audit.Open(filepath.Join(root, "logs", "audit.db"))
+	if err != nil {
+		t.Fatalf("open audit db: %v", err)
+	}
+	defer adb.Close()
+	if err := adb.SetOSVPolicy(context.Background(), audit.OSVPolicy{Ecosystem: ecosystem, Action: action}); err != nil {
+		t.Fatalf("set %s policy: %v", ecosystem, err)
+	}
+}
+
+// TestListCommand_AptReadsNeverWhenACapturedReleaseHasNoIndex pins list to the
+// set sync resolves from. A release a capture records and no suite serves is
+// one the gate reads, so an absent index for it is the row's answer: reporting
+// the apt row synced off the served suites alone makes the command that reports
+// the gate's health the one thing in the install that lies about it.
+func TestListCommand_AptReadsNeverWhenACapturedReleaseHasNoIndex(t *testing.T) {
+	root := syncInstall(t, "noble", "noble")
+	storeAptEntry(t, root, "libexpat1", manifest.VersionEntry{
+		Version:       "2.4.7-1ubuntu0.2",
+		SourcePackage: "expat",
+		CaptureSuite:  "jammy",
+		Suites:        []string{"noble"},
+	})
+	setOSVPolicy(t, root, manifest.TypeApt, "block")
+	if _, _, err := runSync(t, "apt"); err != nil {
+		t.Fatalf("sync apt: %v", err)
+	}
+
+	stdout, _, err := runOSVCmd(t, newPolicyOSVListCmd(&globalFlags{}))
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if strings.Contains(stdout, "never") {
+		t.Fatalf("both indexes are present, so the row must carry a sync time:\n%s", stdout)
+	}
+
+	jammy, err := filepath.Glob(filepath.Join(root, "osv", "Ubuntu-22.04-LTS.*"))
+	if err != nil || len(jammy) == 0 {
+		t.Fatalf("the jammy index is not where list looks for it: %v %v", jammy, err)
+	}
+	for _, f := range jammy {
+		if err := os.Remove(f); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	stdout, _, err = runOSVCmd(t, newPolicyOSVListCmd(&globalFlags{}))
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if !strings.Contains(stdout, "never") {
+		t.Errorf("the captured release has no index and rescan says so; list reported apt synced:\n%s", stdout)
 	}
 }

@@ -132,11 +132,25 @@ func newPolicyOSVListCmd(gf *globalFlags) *cobra.Command {
 					db.Dir(), onOff(cfg.OSVAPIFallback))
 				return nil
 			}
+			// The apt row spans one index per release, and the releases are
+			// the set sync resolves, not the served suites: a captured-only
+			// release is one the gate reads and nothing serves. Resolving it
+			// here from apt_suites reports apt synced while rescan answers
+			// "no local OSV database" for that release.
+			aptSuites := cfg.ServedAptSuites()
+			if slices.ContainsFunc(rows, func(p audit.OSVPolicy) bool { return p.Ecosystem == manifest.TypeApt }) {
+				var notes []string
+				aptSuites, notes = aptOSVSuites(cmd.Context(), gf, aptSuites)
+				for _, n := range notes {
+					fmt.Fprintf(os.Stderr, "warning: %s\n", n)
+				}
+			}
+
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 			fmt.Fprintln(w, "ECOSYSTEM\tACTION\tUPDATED\tDB SYNCED\tDB AGE")
 			stored := make([]string, 0, len(rows))
 			for _, p := range rows {
-				synced, age := osvDBState(db, p.Ecosystem, cfg.ServedAptSuites())
+				synced, age := osvDBState(db, p.Ecosystem, aptSuites)
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
 					p.Ecosystem, p.Action, p.UpdatedAt.Format("2006-01-02"), synced, age)
 				stored = append(stored, p.Ecosystem)
@@ -189,8 +203,10 @@ func newPolicyOSVRemoveCmd(gf *globalFlags) *cobra.Command {
 // code it was written for.
 var osvExportBase = policy.DefaultOSVExportBase
 
-// aptSyncSuites is the suite set sync resolves apt exports from: the ones this
-// bodega serves, plus the releases its own manifests record.
+// aptOSVSuites is the apt release set both sync and list resolve from: the
+// suites this bodega serves, plus the releases its own manifests record. One
+// function because the two commands have to agree: a release sync fetches for
+// and list omits is a gate whose health report contradicts the gate.
 //
 // Those are two different fields on purpose. apt_suites names the dists/<suite>/
 // trees a .deb is published to; the gate answers an entry from the release that
@@ -201,7 +217,12 @@ var osvExportBase = policy.DefaultOSVExportBase
 //
 // Both entry fields are read, because the lookup reads both: capture_suite when
 // the capture recorded one, the publishing suites when it did not.
-func aptSyncSuites(ctx context.Context, store *manifest.Store, served []string) ([]string, error) {
+//
+// A store or a package that will not load degrades to what did load and comes
+// back in notes rather than as an error. The no-argument sync is what a cron
+// runs, and this read happens before any fetch: returning here over one
+// unparsable apt manifest leaves npm, pypi, gomod and cargo unsynced too.
+func aptOSVSuites(ctx context.Context, gf *globalFlags, served []string) (suites, notes []string) {
 	out := make([]string, 0, len(served)+4)
 	seen := map[string]bool{}
 	add := func(s string) {
@@ -214,14 +235,18 @@ func aptSyncSuites(ctx context.Context, store *manifest.Store, served []string) 
 	for _, s := range served {
 		add(s)
 	}
+	store, err := loadStore(gf)
+	if err != nil {
+		return out, []string{fmt.Sprintf("apt: manifests unreadable (%v); resolved from apt_suites alone", err)}
+	}
 	for _, name := range store.ListPackages(manifest.TypeApt) {
 		pm, err := store.GetPackage(ctx, manifest.TypeApt, name)
 		if err != nil {
-			return nil, fmt.Errorf("load apt/%s: %w", name, err)
+			notes = append(notes, fmt.Sprintf("apt: manifest apt/%s will not load (%v); a release only it records is not in the set", name, err))
+			continue
 		}
 		// An index entry whose manifest file is gone names no release to
-		// fetch for. 'bodega repair' and rescan both report it; failing the
-		// whole sync over it would leave every other ecosystem unsynced too.
+		// fetch for. 'bodega repair' and rescan both report it.
 		if pm == nil {
 			continue
 		}
@@ -232,7 +257,7 @@ func aptSyncSuites(ctx context.Context, store *manifest.Store, served []string) 
 			}
 		}
 	}
-	return out, nil
+	return out, notes
 }
 
 func newPolicyOSVSyncCmd(gf *globalFlags) *cobra.Command {
@@ -278,18 +303,15 @@ and point osv_db_dir at the copy.`,
 			db := policy.NewOSVDatabase(cfg.ResolveOSVDBDir())
 			db.ExportBase = osvExportBase
 
-			// Resolved only when apt is in the set: a manifest store that
-			// will not load has nothing to say about npm, and failing
-			// 'sync npm' over one is the wrong answer.
+			// Read only when apt is in the set: a manifest store that will
+			// not load has nothing to say about npm, and making 'sync npm'
+			// wait on one is the wrong answer.
+			var osvEcos, skipped, failed []string
 			aptSuites := cfg.ServedAptSuites()
 			if slices.Contains(ecosystems, manifest.TypeApt) {
-				store, err := loadStore(gf)
-				if err != nil {
-					return fmt.Errorf("load manifests: %w", err)
-				}
-				if aptSuites, err = aptSyncSuites(cmd.Context(), store, aptSuites); err != nil {
-					return err
-				}
+				var notes []string
+				aptSuites, notes = aptOSVSuites(cmd.Context(), gf, aptSuites)
+				skipped = append(skipped, notes...)
 			}
 
 			// apt is one export per release: OSV keys Ubuntu and
@@ -298,9 +320,7 @@ and point osv_db_dir at the copy.`,
 			// every ecosystem first, then hand the whole list over at once:
 			// several releases come out of one archive, and a fetch per
 			// release would download it once each.
-			var osvEcos, skipped []string
 			owner := map[string]string{}
-			var failed []string
 			for _, eco := range ecosystems {
 				exports, unmapped := policy.OSVExportsFor(eco, aptSuites)
 				for _, suite := range unmapped {
