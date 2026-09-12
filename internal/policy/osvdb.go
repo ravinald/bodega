@@ -53,7 +53,7 @@ func (m OSVDBMeta) Age(now time.Time) time.Duration { return now.Sub(m.FetchedAt
 type osvRecord struct {
 	ID       string        `json:"id"`
 	Summary  string        `json:"summary,omitempty"`
-	Severity []osvSeverity `json:"severity,omitempty"`
+	Severity []OSVSeverity `json:"severity,omitempty"`
 	Affected []osvAffected `json:"affected"`
 }
 
@@ -455,7 +455,7 @@ func distill(ecosystems []string, zipPath string) (map[string]*osvIndex, map[str
 			ID        string        `json:"id"`
 			Summary   string        `json:"summary"`
 			Withdrawn string        `json:"withdrawn"`
-			Severity  []osvSeverity `json:"severity"`
+			Severity  []OSVSeverity `json:"severity"`
 			Affected  []struct {
 				Package struct {
 					Name      string `json:"name"`

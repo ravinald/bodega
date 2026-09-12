@@ -745,7 +745,7 @@ bodega audit events --type denied --identity build-07
 
 Bindings are read per request through a 30-second cache, on the same schedule as the CIDR lists, so a change lands on a running server without a restart and at once on `systemctl reload bodega`.
 
-### `bodega profile <create|list|show|bind|unbind|set|add|remove|pin|unpin|diff|check>`
+### `bodega profile <create|list|show|bind|unbind|set|add|remove|pin|pins|unpin|diff|check>`
 
 Declares what one class of host may fetch, and the version rule each package carries for that class. Everything else in bodega holds one answer for the whole fleet; a profile is the axis that varies by consumer.
 
@@ -766,6 +766,7 @@ bodega profile create web --description "public web tier"
 bodega profile set web apt --membership closed --version-default floating
 bodega profile add web apt nginx
 bodega profile pin web apt postgresql 14.11 --reason "15 breaks the config" --review-after 2027-01-01
+bodega profile pins --stale
 bodega profile bind web db01
 bodega profile show web
 ```
@@ -836,7 +837,9 @@ bodega profile add web pypi numpy  --constraint patch --version 1.26.4
 
 With no `--constraint` the entry defers to its type's version default. Adding an entry that already exists edits it: every flag you give is written and every field you leave out keeps what it held, because changing the version a package is held at is the ordinary edit and a remove-then-add loses the reason in the gap. A bare `bodega profile add web apt postgresql` on a pinned entry therefore changes nothing; clearing a constraint is `unpin`.
 
-`pin` is `add` with the pinning arguments filled in, and it **requires `--reason`**: a pin with no reason outlives the problem it was written for, and the next operator cannot tell a deliberate hold from an accident, so it is never lifted. `--review-after <YYYY-MM-DD>` gives it a date it stops looking current on; nothing enforces the date, `bodega profile show` prints it.
+`pin` is `add` with the pinning arguments filled in, and it **requires `--reason`**: a pin with no reason outlives the problem it was written for, and the next operator cannot tell a deliberate hold from an accident, so it is never lifted. `--review-after <YYYY-MM-DD>` gives it a date it stops looking current on, and it is refused unless it parses: a date stored as "next quarter" is a pin that is never overdue, and `pins --stale` would pass on it forever. Nothing enforces the date; `bodega profile pins` is what reads it.
+
+A pin is not local, so `pin` reports the dependency closure before it writes anything. See [Pins as recorded decisions](#pins-as-recorded-decisions).
 
 `unpin` drops the constraint and keeps the entry, so the package stays a member. The version the pin named stays on the entry as its base, because that is the shape a pinned type default reads: an entry with a version and no constraint of its own is held at that version, and one with neither is a pin with nothing to pin to, which permits no version at all. A floating default ignores the base and takes any version. `unpin` says which of the three it left you in:
 
@@ -864,6 +867,54 @@ entries[0] and entries[1] both name pypi/django, which is one entry: the later r
 ```
 
 `remove` deletes the entry, which on a closed type means the package is no longer permitted at all.
+
+#### Pins as recorded decisions
+
+A pin is a decision to stop receiving updates for one package. "Pinned at 14.9" and "not receiving security updates for postgres" are the same sentence, and only one of them normally gets written down. **A pin accepts the known vulnerabilities in that version for the life of the pin**, and `bodega profile pins` is where that acceptance is legible.
+
+```bash
+bodega profile pins            # every pin in every profile
+bodega profile pins db         # one profile
+bodega profile pins --stale    # only the overdue ones; exits 1 when any is found
+bodega profile pins --json     # the records the API returns
+```
+
+Nothing else in a normal stack holds both halves. `apt-mark hold` knows the hold and not the advisories; a scanner knows the advisories and not why you are on that version. bodega stores the pin and keeps the OSV answer current, so the report carries the decision and the findings in one row:
+
+```text
+$ bodega profile pins
+PROFILE  TYPE  PACKAGE  VERSION  PINNED      BY    REVIEW AFTER  OVERDUE  OSV        CHECKED     REASON
+web      pypi  django   4.2.11   2026-03-02  ravi  2026-08-01    41d      flagged    2026-09-09  5 drops the middleware
+ci       pypi  django   4.2.12   2026-09-11  ravi  -             -        unchecked  -           reproducing a build
+
+web pypi/django at 4.2.11 accepts 1 known advisory(ies) for the life of the pin:
+  GHSA-xxxx-yyyy-zzzz  CVSS_V3 CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H
+```
+
+The `OSV` column is the stamp [`bodega policy osv rescan`](#rescan) writes, and it reads `unchecked` rather than `clean` for a version no run has ever answered for. An empty advisory list means nobody looked as often as it means there is nothing to find, and a pin is the one place that distinction decides whether somebody acts. `n/a` is a registry type OSV holds no records for. A pinned version the catalog no longer carries is called out under the table, because there is no stamp to read for it.
+
+`PINNED` is when the held version was last decided, which is not when the entry was created: moving a pin to a new version re-dates it, and correcting its reason with `add` does not. A row written before that column existed falls back to the entry's own creation date, which is a lower bound rather than a guess.
+
+`--stale` exits 1, so it works as a CI or cron gate the same way `bodega profile check` does. A pin with no review date is never stale, which is what makes `--review-after` worth writing.
+
+**The closure.** Holding postgresql-14 at 14.9 holds everything 14.9 was built against: a dependency edge names the version the parent needs, and pinning the parent does not move it. apt meets that during an upgrade, as a widening set held back or a proposal to remove the package. bodega sits on the index and holds the graph, so `pin` says it first:
+
+```text
+$ bodega profile pin db apt postgresql-14 14.9 --reason "15 breaks the config"
+Pinning apt/postgresql-14 at 14.9 holds 2 other package(s) still:
+  PACKAGE       HELD AT  VIA                 SPEC
+  apt/libpq5    14.9     apt/postgresql-14   libpq5 (= 14.9)
+  apt/libssl3   3.0.2    apt/libpq5          libssl3 (>= 3.0.0)
+  conflict: apt/postgresql-14 at 14.9 needs apt/libpq5 14.9, and the profile refuses it: exact 15.1 does not match 14.9
+  Pin the closure too:  --strict-closure
+Added apt/postgresql-14 in db (exact 14.9).
+```
+
+**Reporting is the default and freezing is not.** The default pins the one package you named and tells you what it implies. `--strict-closure` pins every closure member at the version the graph records, with a reason naming the pin that implied it. Extending by default would freeze a growing set — each package pinned drags its own dependencies in — and a host would stop receiving security updates for all of them with nobody having decided that it should. A closure member the graph records no version for is left floating and said so, because pinning it would mean choosing a release on your behalf.
+
+The same feasibility check runs at apt index generation, where it reports and extends nothing. A pin whose own closure the profile contradicts is logged with the conflict and the command that would resolve it.
+
+**What this is not.** bodega reports what it knows about what it serves and tracks no remediation: there is no suppression workflow, no ticket integration and no severity SLA here. The pin's own reason and review date are the whole of its suppression concept, and that boundary is deliberate — the tool that tracks remediation reads `GET /api/v1/profiles/{name}/pins` and owns the rest.
 
 #### Building a profile from a host
 
@@ -2776,6 +2827,7 @@ All API responses are JSON. The full API is documented in [OpenAPI 3.0 format](.
 | GET | `/api/v1/status` | Health check with entry counts, S3 probe, and the apt client state |
 | GET | `/api/v1/config` | Non-sensitive config (bucket, region, manifest_dir) |
 | GET | `/api/v1/audit` | Query audit events (supports filters) |
+| GET | `/api/v1/profiles/{name}/pins` | One profile's pins, with their reason, review date and OSV state. `?stale=true` narrows to the overdue ones. Admin-gated. See [Pins as recorded decisions](#pins-as-recorded-decisions) |
 | GET | `/healthz` | Health probe (returns `ok`) |
 
 #### The `apt` block on `/api/v1/status`

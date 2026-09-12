@@ -796,6 +796,9 @@ func (s *Server) registerRoutes() {
 	m.HandleFunc("POST /api/v1/tokens", s.handleCreateToken)
 	m.HandleFunc("DELETE /api/v1/tokens/{id}", s.handleRevokeToken)
 
+	// Host profiles
+	m.HandleFunc("GET /api/v1/profiles/{name}/pins", s.handleAPIProfilePins)
+
 	// Upstream allow-list policies (mutation-gated)
 	m.HandleFunc("GET /api/v1/policies", s.handleListPolicies)
 	m.HandleFunc("POST /api/v1/policies", s.handleCreatePolicy)

@@ -132,6 +132,29 @@ type ProfileEntry struct {
 	ReviewAfter string
 	Actor       string
 	CreatedAt   time.Time
+	// PinnedAt is when the version this entry holds was last decided, which
+	// outlives neither the entry nor the reason: re-pinning at a new version
+	// moves it and CreatedAt stays where it was. Zero on an entry written
+	// before migration 016 and on one that was never pinned.
+	PinnedAt time.Time
+}
+
+// Pinned reports whether this entry holds one version rather than deferring to
+// its type's default. It is the definition `bodega profile pins` and the pins
+// endpoint both list by, so neither can drift from the other about what counts.
+func (e ProfileEntry) Pinned() bool {
+	return e.Constraint == manifest.ConstraintExact && e.Version != ""
+}
+
+// PinDecidedAt is the date the pin was last set, falling back to the entry's
+// own creation for a row written before migration 016. The fallback is a lower
+// bound rather than a guess: the entry existed then, so its pin is at least
+// that old.
+func (e ProfileEntry) PinDecidedAt() time.Time {
+	if !e.PinnedAt.IsZero() {
+		return e.PinnedAt
+	}
+	return e.CreatedAt
 }
 
 // ProfileBinding attaches a profile to an identity migration 013 resolves.
@@ -262,7 +285,7 @@ func (a *DB) profileTypes(ctx context.Context, profile string) ([]ProfileTypeRul
 func (a *DB) profileEntries(ctx context.Context, profile string) ([]ProfileEntry, error) {
 	rows, err := a.db.QueryContext(ctx,
 		`SELECT profile, pkg_type, pkg_name, constraint_kind, version, origin, reason,
-		        review_after, actor, created_at
+		        review_after, actor, created_at, pinned_at
 		   FROM profile_entries WHERE profile = ? ORDER BY pkg_type, pkg_name`, profile)
 	if err != nil {
 		return nil, err
@@ -271,12 +294,13 @@ func (a *DB) profileEntries(ctx context.Context, profile string) ([]ProfileEntry
 	var out []ProfileEntry
 	for rows.Next() {
 		var e ProfileEntry
-		var ts string
+		var ts, pinnedAt string
 		if err := rows.Scan(&e.Profile, &e.Type, &e.Name, &e.Constraint, &e.Version,
-			&e.Origin, &e.Reason, &e.ReviewAfter, &e.Actor, &ts); err != nil {
+			&e.Origin, &e.Reason, &e.ReviewAfter, &e.Actor, &ts, &pinnedAt); err != nil {
 			return nil, err
 		}
 		e.CreatedAt, _ = time.Parse(time.RFC3339Nano, ts)
+		e.PinnedAt, _ = time.Parse(time.RFC3339Nano, pinnedAt)
 		out = append(out, e)
 	}
 	return out, rows.Err()
@@ -331,7 +355,8 @@ func (a *DB) PutProfileEntry(ctx context.Context, e ProfileEntry) (bool, error) 
 		return false, err
 	}
 	_, err := a.db.ExecContext(ctx, insertProfileEntrySQL,
-		e.Profile, e.Type, e.Name, e.Constraint, e.Version, e.Origin, e.Reason, e.ReviewAfter, e.Actor)
+		e.Profile, e.Type, e.Name, e.Constraint, e.Version, e.Origin, e.Reason,
+		e.ReviewAfter, e.Actor, formatPinnedAt(e.PinnedAt))
 	if err != nil {
 		return false, err
 	}
@@ -339,15 +364,26 @@ func (a *DB) PutProfileEntry(ctx context.Context, e ProfileEntry) (bool, error) 
 }
 
 const insertProfileEntrySQL = `INSERT INTO profile_entries
-	     (profile, pkg_type, pkg_name, constraint_kind, version, origin, reason, review_after, actor)
-	 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	     (profile, pkg_type, pkg_name, constraint_kind, version, origin, reason, review_after, actor, pinned_at)
+	 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	 ON CONFLICT(profile, pkg_type, pkg_name) DO UPDATE SET
 	     constraint_kind = excluded.constraint_kind,
 	     version = excluded.version,
 	     origin = excluded.origin,
 	     reason = excluded.reason,
 	     review_after = excluded.review_after,
-	     actor = excluded.actor`
+	     actor = excluded.actor,
+	     pinned_at = excluded.pinned_at`
+
+// formatPinnedAt renders the pin date for storage. A zero time writes the
+// empty string rather than year one, which is what the migration's default
+// holds and what PinDecidedAt reads as "fall back to created_at".
+func formatPinnedAt(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format("2006-01-02T15:04:05.000Z")
+}
 
 // RemoveProfileEntry deletes one entry, reporting whether it was there.
 func (a *DB) RemoveProfileEntry(ctx context.Context, profile, typ, name string) (bool, error) {
@@ -514,7 +550,7 @@ func (a *DB) CreateProfileWith(ctx context.Context, p Profile, types []ProfileTy
 	for _, e := range entries {
 		if _, err := tx.ExecContext(ctx, insertProfileEntrySQL,
 			p.Name, e.Type, e.Name, e.Constraint, e.Version, e.Origin,
-			e.Reason, e.ReviewAfter, e.Actor); err != nil {
+			e.Reason, e.ReviewAfter, e.Actor, formatPinnedAt(e.PinnedAt)); err != nil {
 			return fmt.Errorf("%s/%s: %w", e.Type, e.Name, err)
 		}
 	}

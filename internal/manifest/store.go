@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 )
@@ -456,6 +457,23 @@ func (s *Store) ParentsOf(child string) []DepEdge {
 		return nil
 	}
 	return parentsOf(s.graph, child)
+}
+
+// Edges returns a copy of every dependency edge.
+//
+// ParentsOf and ChildrenOf match a reference exactly, which answers one hop
+// and cannot answer a closure: the writers spell a node two ways — apt records
+// "apt/nginx" and the language discoverers record "pypi/django@5.2.12" — so a
+// walk that probes by exact reference misses every edge stored under the other
+// spelling. A caller walking the graph reads it whole and matches on its own
+// terms.
+func (s *Store) Edges() []DepEdge {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.graph == nil {
+		return nil
+	}
+	return slices.Clone(s.graph.Edges)
 }
 
 // ChildrenOf returns all edges where Parent == parent.

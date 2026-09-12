@@ -2,12 +2,14 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/entitle"
+	"github.com/ravinald/bodega/internal/pins"
 )
 
 // profileSet is the binding table and every profile it names, resolved once
@@ -113,6 +115,118 @@ func (s *Server) resolveProfiles(ctx context.Context) *profileSet {
 		}
 	}
 	return set
+}
+
+// handleAPIProfilePins answers what one profile holds still, and what bodega
+// knows about the versions it holds.
+//
+// Admin-gated, with the audit trail and the token list: a pin report is the
+// list of versions a class of host is deliberately not patching, together with
+// the advisories against them. That is the most useful document on this server
+// to somebody who should not have it.
+//
+// It reports and does not remediate. No suppression state, no ticket, no
+// severity SLA: the pin's own reason and review date are the whole of bodega's
+// suppression concept, and a vulnerability management tool consuming this
+// already owns the rest.
+func (s *Server) handleAPIProfilePins(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if s.auditDB == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit database not configured"})
+		return
+	}
+	name := r.PathValue("name")
+	report, err := pins.Collect(r.Context(), s.auditDB, s.store, name, time.Now().UTC())
+	if errors.Is(err, audit.ErrNoProfile) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		s.logger.Error("could not read the pins for a profile", "profile", name, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not read the profile pins"})
+		return
+	}
+	if report == nil {
+		// An empty array rather than null: a client reading this to decide
+		// what a host class is not patching has to tell "no pins" from a field
+		// it failed to parse, and null reads as the second.
+		report = []pins.Pin{}
+	}
+	if r.URL.Query().Get("stale") == "true" {
+		if report = pins.Stale(report); report == nil {
+			report = []pins.Pin{}
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"profile": name, "pins": report})
+}
+
+// reportPinFeasibility checks every profile's pins against the dependency
+// graph when the index is generated, and reports what it finds.
+//
+// It extends nothing. A pin whose closure the profile refuses is a real
+// problem — apt meets it as a widening set held back, or a proposal to remove
+// the package — and the available fixes are opposite: move the pin, or pin the
+// closure with it. Choosing the second here would freeze a growing set on
+// every rebuild, since each package pinned drags its own dependencies in, and
+// a host would stop receiving security updates for all of them with nobody
+// having decided that it should. The strict behavior is `bodega profile pin
+// --strict-closure`, where an operator has read the closure first.
+//
+// Runs beside auditAptEntries, on the index refresh rather than per request:
+// the graph is a catalog-wide fact and the answer does not change between two
+// fetches.
+func (s *Server) reportPinFeasibility(ctx context.Context) {
+	if s.auditDB == nil || s.store == nil {
+		return
+	}
+	profiles, err := s.auditDB.ListProfiles(ctx)
+	if err != nil {
+		s.logger.Error("could not read the profiles to check pin feasibility", "error", err)
+		return
+	}
+	if len(profiles) == 0 {
+		return
+	}
+	if err := s.store.LoadGraph(ctx); err != nil {
+		s.logger.Warn("could not read the dependency graph, so no pin's closure was checked at this rebuild",
+			"error", err)
+		return
+	}
+	edges := s.store.Edges()
+	if len(edges) == 0 {
+		return
+	}
+
+	var conflicts []string
+	held := 0
+	for _, prof := range profiles {
+		d, err := s.auditDB.GetProfile(ctx, prof.Name)
+		if err != nil {
+			s.logger.Error("could not read a profile to check pin feasibility", "profile", prof.Name, "error", err)
+			continue
+		}
+		p := entitle.New(d)
+		for _, e := range d.Entries {
+			if !e.Pinned() {
+				continue
+			}
+			c := pins.Of(edges, e.Type, e.Name, e.Version)
+			held += len(c.Members)
+			for _, cf := range c.Conflicts(p) {
+				conflicts = append(conflicts, prof.Name+": "+cf.Reason)
+			}
+		}
+	}
+	if len(conflicts) > 0 {
+		s.logger.Warn("profile pins hold versions their own dependency closure contradicts; move the pin or pin the closure with 'bodega profile pin --strict-closure'",
+			"count", len(conflicts), "conflicts", capForLog(conflicts))
+	}
+	if held > 0 {
+		s.logger.Debug("profile pins hold further packages still through the dependency graph",
+			"packages_held", held)
+	}
 }
 
 // profileFor is the whole of the read path's profile lookup: which host is

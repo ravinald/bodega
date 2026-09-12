@@ -203,6 +203,10 @@ func (s *OSVRescanSummary) Report(w io.Writer) {
 type OSVStamp struct {
 	Checked time.Time
 	Vulns   []string
+	// Severity is the per-advisory score B34 persisted and nothing read until
+	// now, keyed by OSV id. An id present in Vulns and absent here is one OSV
+	// scored nothing for, which is not the same as a score of zero.
+	Severity map[string][]OSVSeverity
 }
 
 // Flagged reports whether the version carries findings.
@@ -232,10 +236,37 @@ func OSVStampOf(ve manifest.VersionEntry) OSVStamp {
 		}
 		sort.Strings(st.Vulns)
 	}
+	if raw := ve.Metadata[OSVMetaSeverity]; raw != "" {
+		// A blob that does not parse is dropped rather than reported. The ids
+		// beside it are the finding; a score bodega could not read is a
+		// rendering detail, and failing the whole stamp over one would hide
+		// the advisory list that matters.
+		var sev map[string][]OSVSeverity
+		if err := json.Unmarshal([]byte(raw), &sev); err == nil && len(sev) > 0 {
+			st.Severity = sev
+		}
+	}
 	if raw := ve.Metadata[OSVMetaCheckedAt]; raw != "" {
 		if t, err := time.Parse(time.RFC3339, raw); err == nil {
 			st.Checked = t
 		}
 	}
 	return st
+}
+
+// Scores renders the scores recorded for one advisory id, in the order OSV
+// published them. Empty for an id OSV scored nothing for.
+func (s OSVStamp) Scores(id string) []string {
+	var out []string
+	for _, sev := range s.Severity[id] {
+		if sev.Score == "" {
+			continue
+		}
+		if sev.Type == "" {
+			out = append(out, sev.Score)
+			continue
+		}
+		out = append(out, sev.Type+" "+sev.Score)
+	}
+	return out
 }

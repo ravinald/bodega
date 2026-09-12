@@ -20,6 +20,8 @@ tags:
     description: Server configuration
   - name: metrics
     description: Package metrics
+  - name: profiles
+    description: What one class of host may fetch
 
 paths:
   /healthz:
@@ -404,6 +406,64 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/AuditEvent"
+
+  /api/v1/profiles/{name}/pins:
+    get:
+      summary: List a profile's version pins
+      description: >
+        Returns every version this profile holds at one release, with the reason
+        an operator recorded, who recorded it and when, the review date, how far
+        past it the pin is, and the OSV advisories against the pinned version.
+        A pinned version no OSV run has ever answered for reports state
+        "unchecked" rather than "clean".
+
+
+        A pin accepts the known vulnerabilities in that version for the life of
+        the pin. bodega reports what it knows about what it serves and tracks no
+        remediation: there is no suppression workflow, no ticket integration and
+        no severity SLA here, and the pin's own reason and review date are the
+        whole of its suppression concept.
+
+
+        Admin-gated, with the audit trail and the token list: this is the list
+        of versions a class of host is deliberately not patching.
+      operationId: listProfilePins
+      tags: [profiles]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Profile name
+        - name: stale
+          in: query
+          schema:
+            type: string
+            enum: ["true"]
+          description: Narrow the report to the pins past their review date
+      responses:
+        "200":
+          description: The profile's pins
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  profile:
+                    type: string
+                  pins:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ProfilePin"
+        "403":
+          description: Caller is not in admin_permit_cidr
+        "404":
+          description: No such profile
+        "503":
+          description: Audit database not configured
 
   /api/v1/tokens:
     get:
@@ -884,6 +944,80 @@ components:
           type: integer
         details:
           type: string
+
+    ProfilePin:
+      type: object
+      properties:
+        profile:
+          type: string
+        type:
+          type: string
+          description: Package type
+        name:
+          type: string
+        version:
+          type: string
+          description: The version this pin holds
+        reason:
+          type: string
+          description: Why the version is held. A pin cannot be written without one.
+        actor:
+          type: string
+        pinned_at:
+          type: string
+          format: date-time
+          description: >
+            When the held version was last decided. Absent on a pin written
+            before the column existed and never re-pinned since.
+        review_after:
+          type: string
+          description: "Date after which the pin should be re-examined (YYYY-MM-DD)"
+        overdue_days:
+          type: integer
+          description: Whole days past the review date; 0 when the pin is not overdue
+        stale:
+          type: boolean
+        cataloged:
+          type: boolean
+          description: >
+            Whether the catalog still holds the pinned version. False means
+            nothing serves it, so there is no OSV stamp to read.
+        osv:
+          $ref: "#/components/schemas/ProfilePinOSV"
+
+    ProfilePinOSV:
+      type: object
+      properties:
+        state:
+          type: string
+          enum: [unchecked, clean, flagged, "n/a"]
+          description: >
+            unchecked when no run has ever answered for this version, which is
+            not the same as clean; "n/a" when OSV holds no records for this
+            registry type.
+        vulns:
+          type: array
+          items:
+            type: string
+          description: OSV advisory identifiers recorded against the pinned version
+        severity:
+          type: object
+          description: >
+            Scores keyed by advisory id, each the severity array OSV published.
+            An id in vulns and absent here is one OSV scored nothing for.
+          additionalProperties:
+            type: array
+            items:
+              type: object
+              properties:
+                type:
+                  type: string
+                score:
+                  type: string
+        checked_at:
+          type: string
+          format: date-time
+          description: When the OSV answer was last refreshed. Absent when unchecked.
 
     TokenInfo:
       type: object

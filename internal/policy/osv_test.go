@@ -234,7 +234,7 @@ func TestOSVPolicy_SeverityStampedPerRecord(t *testing.T) {
 	if raw == "" {
 		t.Fatal("severity should be stamped alongside vetting.osv.vulns")
 	}
-	var got map[string][]osvSeverity
+	var got map[string][]OSVSeverity
 	if err := json.Unmarshal([]byte(raw), &got); err != nil {
 		t.Fatalf("a later reader must parse the stamp without re-querying OSV: %v", err)
 	}
