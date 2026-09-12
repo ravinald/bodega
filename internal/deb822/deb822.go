@@ -5,7 +5,9 @@
 // for paragraph breaks within long fields like Description.
 //
 // ParseSingle reads one paragraph; ParseStream reads a multi-paragraph
-// document (a Packages index, a dpkg status file) one paragraph at a time.
+// document (a Packages index, a dpkg status file) one paragraph at a time,
+// and ParseStreamRaw hands the paragraph's own bytes over with the fields so a
+// filter can copy what it keeps rather than re-serialize it.
 package deb822
 
 import (
@@ -15,6 +17,32 @@ import (
 	"io"
 	"strings"
 )
+
+// SourceName is the source package a binary paragraph belongs to.
+//
+// Debian omits Source: when it matches the binary name and writes
+// "expat (2.4.7-1)" when the source was built at a version the binary does not
+// share, so the bare field is neither always present nor always a bare name.
+// Two callers want the same answer for different reasons — an advisory lookup
+// keyed on the source name, and a profile whose membership closes over it —
+// and Ubuntu renames, splits and transitions binaries within one stable source
+// often enough that the two disagreeing would show up as a package refused on
+// ordinary maintenance.
+func SourceName(fields map[string]string) string {
+	if src := SourceField(fields["Source"]); src != "" {
+		return src
+	}
+	return strings.TrimSpace(fields["Package"])
+}
+
+// SourceField strips the version a Source: field carries, for a caller reading
+// the field on its own rather than a whole paragraph.
+func SourceField(val string) string {
+	if i := strings.IndexByte(val, '('); i > 0 {
+		val = val[:i]
+	}
+	return strings.TrimSpace(val)
+}
 
 // ParseSingle parses one deb822 paragraph. Continuation lines are joined
 // into the value with "\n"; the leading continuation whitespace is
@@ -84,6 +112,25 @@ func ParseSingle(data []byte) (map[string]string, error) {
 // An error from fn stops the walk and is returned unchanged, so a caller that
 // has seen enough can end the read with a sentinel of its own.
 func ParseStream(r io.Reader, fn func(fields map[string]string) error) error {
+	return ParseStreamRaw(r, func(_ []byte, fields map[string]string) error { return fn(fields) })
+}
+
+// ParseStreamRaw is ParseStream with the paragraph's own bytes handed to fn
+// beside the parsed fields.
+//
+// It exists for a caller that copies paragraphs through rather than rewriting
+// them. ParseSingle returns a map, so the field order, the continuation
+// layout and any field this package folds are all gone by the time fn sees
+// them; re-serializing from the map is a second grammar to get wrong, and it
+// gets it wrong silently — a Packages index that still parses, with a
+// Description that lost its leading space or a rare field flattened onto one
+// line. A filter that decides per paragraph and emits raw needs no grammar at
+// all on the way out.
+//
+// raw is the paragraph including its trailing newline and excluding the blank
+// line that ended it. The buffer behind it is reused on the next paragraph, so
+// fn must copy anything it retains.
+func ParseStreamRaw(r io.Reader, fn func(raw []byte, fields map[string]string) error) error {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 
@@ -92,15 +139,19 @@ func ParseStream(r io.Reader, fn func(fields map[string]string) error) error {
 		if para.Len() == 0 {
 			return nil
 		}
-		fields, err := ParseSingle(para.Bytes())
-		para.Reset()
+		raw := para.Bytes()
+		fields, err := ParseSingle(raw)
 		if err != nil {
+			para.Reset()
 			return err
 		}
 		if len(fields) == 0 {
+			para.Reset()
 			return nil
 		}
-		return fn(fields)
+		err = fn(raw, fields)
+		para.Reset()
+		return err
 	}
 
 	for sc.Scan() {

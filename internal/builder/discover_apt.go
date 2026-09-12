@@ -506,7 +506,7 @@ func parseAptShowOutput(output, pkgName string) *manifest.VersionEntry {
 		case "Version":
 			ve.Version = val
 		case "Source":
-			ve.SourcePackage = aptSourceName(val)
+			ve.SourcePackage = deb822.SourceField(val)
 			ve.Metadata[key] = val
 		case "Architecture":
 			ve.Platform = "linux/" + val
@@ -715,16 +715,4 @@ func DropVersionlessAptEntries(ctx context.Context, store *manifest.Store, pkgNa
 		return 0, err
 	}
 	return blank, nil
-}
-
-// aptSourceName strips the version a Source: field carries when the source
-// package was built at a version the binary does not share: dpkg writes
-// "expat (2.4.7-1)" in that case and the bare name otherwise. Advisories are
-// keyed on the name alone, so the parenthesized half is noise the OSV lookup
-// would query and miss on.
-func aptSourceName(val string) string {
-	if i := strings.IndexByte(val, '('); i > 0 {
-		val = val[:i]
-	}
-	return strings.TrimSpace(val)
 }

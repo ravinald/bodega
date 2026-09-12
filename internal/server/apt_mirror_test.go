@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -118,6 +119,12 @@ func fixtureDists(t *testing.T, kr *aptsign.KeyRing, packages string) map[string
 	t.Helper()
 	sum := sha256.Sum256([]byte(packages))
 	digest := hex.EncodeToString(sum[:])
+	// A real archive publishes both forms and lists both digests, and the
+	// filtered-index generator reads the compressed one. A fixture that
+	// published only the plain form would make every profile suite fail for a
+	// reason no archive produces.
+	gzBody := gzipFixture(packages)
+	gzSum := sha256.Sum256(gzBody)
 
 	release := strings.Join([]string{
 		"Origin: Ubuntu",
@@ -129,6 +136,7 @@ func fixtureDists(t *testing.T, kr *aptsign.KeyRing, packages string) map[string
 		"Acquire-By-Hash: yes",
 		"SHA256:",
 		fmt.Sprintf(" %s %d %s", digest, len(packages), packagesPath),
+		fmt.Sprintf(" %s %d %s.gz", hex.EncodeToString(gzSum[:]), len(gzBody), packagesPath),
 		"",
 	}, "\n")
 
@@ -143,12 +151,22 @@ func fixtureDists(t *testing.T, kr *aptsign.KeyRing, packages string) map[string
 
 	base := "dists/" + mirroredCodename + "/"
 	return map[string]string{
-		base + "Release":     release,
-		base + "InRelease":   string(inRelease),
-		base + "Release.gpg": string(detached),
-		base + packagesPath:  packages,
+		base + "Release":            release,
+		base + "InRelease":          string(inRelease),
+		base + "Release.gpg":        string(detached),
+		base + packagesPath:         packages,
+		base + packagesPath + ".gz": string(gzBody),
 		base + "main/binary-amd64/by-hash/SHA256/" + digest: packages,
 	}
+}
+
+// gzipFixture compresses an index the way an archive publishes it.
+func gzipFixture(body string) []byte {
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	_, _ = gw.Write([]byte(body))
+	_ = gw.Close()
+	return buf.Bytes()
 }
 
 // fixturePackages is the one-stanza index whose Filename points at the pool

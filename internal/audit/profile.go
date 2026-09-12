@@ -114,6 +114,11 @@ type ProfileTypeRule struct {
 	// Expansion is what a closed membership does about an unlisted package.
 	// It has no meaning on an open type, which lists nothing to be outside of.
 	Expansion string
+	// AptBase is the mirrored codename the profile's filtered apt index
+	// derives from, and has meaning on the apt row alone. Empty means the
+	// profile does not scope apt: no synthetic codename is generated and a
+	// host under it reads the mirrored codename unchanged.
+	AptBase   string
 	Actor     string
 	UpdatedAt time.Time
 }
@@ -262,7 +267,7 @@ func (a *DB) GetProfile(ctx context.Context, name string) (*ProfileDetail, error
 
 func (a *DB) profileTypes(ctx context.Context, profile string) ([]ProfileTypeRule, error) {
 	rows, err := a.db.QueryContext(ctx,
-		`SELECT profile, pkg_type, membership, version_default, expansion, actor, updated_at
+		`SELECT profile, pkg_type, membership, version_default, expansion, apt_base, actor, updated_at
 		   FROM profile_types WHERE profile = ? ORDER BY pkg_type`, profile)
 	if err != nil {
 		return nil, err
@@ -273,7 +278,7 @@ func (a *DB) profileTypes(ctx context.Context, profile string) ([]ProfileTypeRul
 		var r ProfileTypeRule
 		var ts string
 		if err := rows.Scan(&r.Profile, &r.Type, &r.Membership, &r.VersionDefault,
-			&r.Expansion, &r.Actor, &ts); err != nil {
+			&r.Expansion, &r.AptBase, &r.Actor, &ts); err != nil {
 			return nil, err
 		}
 		r.UpdatedAt, _ = time.Parse(time.RFC3339Nano, ts)
@@ -319,16 +324,17 @@ func (a *DB) SetProfileTypeRule(ctx context.Context, r ProfileTypeRule) error {
 		return errors.New("audit db is read-only")
 	}
 	_, err := a.db.ExecContext(ctx, insertProfileTypeSQL,
-		r.Profile, r.Type, r.Membership, r.VersionDefault, r.Expansion, r.Actor)
+		r.Profile, r.Type, r.Membership, r.VersionDefault, r.Expansion, r.AptBase, r.Actor)
 	return err
 }
 
-const insertProfileTypeSQL = `INSERT INTO profile_types (profile, pkg_type, membership, version_default, expansion, actor)
-	 VALUES (?, ?, ?, ?, ?, ?)
+const insertProfileTypeSQL = `INSERT INTO profile_types (profile, pkg_type, membership, version_default, expansion, apt_base, actor)
+	 VALUES (?, ?, ?, ?, ?, ?, ?)
 	 ON CONFLICT(profile, pkg_type) DO UPDATE SET
 	     membership = excluded.membership,
 	     version_default = excluded.version_default,
 	     expansion = excluded.expansion,
+	     apt_base = excluded.apt_base,
 	     actor = excluded.actor,
 	     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`
 
@@ -543,7 +549,7 @@ func (a *DB) CreateProfileWith(ctx context.Context, p Profile, types []ProfileTy
 	for _, r := range types {
 		if _, err := tx.ExecContext(ctx, insertProfileTypeSQL,
 			p.Name, r.Type, r.Membership, r.VersionDefault,
-			expansionOrDefault(r.Expansion), r.Actor); err != nil {
+			expansionOrDefault(r.Expansion), r.AptBase, r.Actor); err != nil {
 			return fmt.Errorf("%s: %w", r.Type, err)
 		}
 	}
@@ -569,6 +575,13 @@ func validateProfileTypeRule(r ProfileTypeRule) error {
 	}
 	if r.Expansion != "" && !ValidExpansion(r.Expansion) {
 		return fmt.Errorf("expansion %q is not one of: %s", r.Expansion, strings.Join(Expansions(), ", "))
+	}
+	// Refused rather than stored and ignored. Nothing outside the apt index
+	// generator reads the column, so a base on an npm row is a control the
+	// operator believes they set and no code path consults.
+	if r.AptBase != "" && r.Type != manifest.TypeApt {
+		return fmt.Errorf("apt base %q on a %s rule: the base names the mirrored codename an apt index is filtered from and is read on the apt rule alone",
+			r.AptBase, r.Type)
 	}
 	return nil
 }

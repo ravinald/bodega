@@ -1,0 +1,456 @@
+package server
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"net/http"
+	"path"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/deb822"
+	"github.com/ravinald/bodega/internal/entitle"
+	"github.com/ravinald/bodega/internal/manifest"
+)
+
+// ---- apt under a profile ---------------------------------------------------
+//
+// For the seven other types the request predicate is the control and the index
+// filter is what makes a refusal legible. apt inverts that, and the inversion
+// is the whole reason this file exists.
+//
+// apt clients decide what to request by reading a Packages index. A client
+// refused at the pool has already resolved a transaction, so the 403 arrives
+// mid-run: apt aborts the whole thing, and every security update in the same
+// invocation is abandoned with it. The same package absent from the index
+// instead produces "The following packages have been kept back", and the rest
+// of the upgrade proceeds. Same policy, same verdict, opposite outcome, and
+// the second one fails quietly in a cron log — so for apt the index filter is
+// the enforcement and aptPoolGate is the backstop for a client that composed a
+// URL without reading an index.
+//
+// Filtering Packages forces a matching Release, and Release is signed. Signing
+// per profile on render would put a key operation on the hottest cached path
+// and make InRelease uncacheable across hosts, so a profile that scopes apt is
+// served under a codename of its own, generated and signed once per rebuild
+// like any other generated suite.
+//
+// The boundary then lives in the client's sources.list, which the host can
+// edit. It scopes what a correctly configured host is told exists; it
+// authorizes nothing on its own. docs/THREAT_MODEL.md states that limit and
+// the one below it: bodega re-signs an upstream index it fetched over TLS and
+// did not verify against the distro keyring, so a filtered codename's chain of
+// trust ends at the archive's certificate rather than at its signing key.
+
+const (
+	// aptProfileComponent is the only component a filtered codename carries.
+	// Every generated suite serves main alone — handleAptPackages 404s the
+	// rest — and a filtered view is a generated suite. A base whose packages
+	// live in universe is named in the log rather than silently half-served.
+	aptProfileComponent = "main"
+
+	// aptProfileFetchTimeout bounds one upstream index fetch. A rebuild walks
+	// (profile x architecture) and runs on a timer nothing waits on, so a slow
+	// archive must cost a bounded amount rather than hold the rebuild until
+	// aptRebuildTimeout fires and takes every suite's regeneration with it.
+	aptProfileFetchTimeout = 2 * time.Minute
+)
+
+// aptProfileSuite is one profile's filtered codename: which upstream suite it
+// derives from, what it is served as, and the predicate that decides its
+// contents.
+type aptProfileSuite struct {
+	profile  string
+	base     string
+	codename string
+	permit   *entitle.Profile
+	index    *aptSuiteIndex
+}
+
+// aptProfileSuites resolves every profile that scopes apt into a suite this
+// server can generate, dropping the ones it cannot with the reason.
+//
+// Read from the profile tables directly rather than from the binding set,
+// because a codename exists whether or not a host is bound to it yet: an
+// operator writes the profile, reads the sources line off `bodega doctor`, and
+// binds the host afterwards. Requiring the binding first would mean the
+// codename 404s during exactly the step that installs it.
+func (s *Server) aptProfileSuites(ctx context.Context) []aptProfileSuite {
+	if s.auditDB == nil {
+		return nil
+	}
+	profiles, err := s.auditDB.ListProfiles(ctx)
+	if err != nil {
+		s.logger.Error("could not read the profiles, so no filtered apt codename was generated at this rebuild", "error", err)
+		return nil
+	}
+	var out []aptProfileSuite
+	for _, prof := range profiles {
+		d, err := s.auditDB.GetProfile(ctx, prof.Name)
+		if err != nil {
+			s.logger.Error("could not read a profile to generate its filtered apt codename", "profile", prof.Name, "error", err)
+			continue
+		}
+		p := entitle.New(d)
+		base := p.AptScope()
+		if base == "" {
+			continue
+		}
+		if !s.cfg.MirrorsAptCodename(base) {
+			s.logger.Error("a profile names an apt base no upstream archive serves, so it has no filtered codename; add the base to apt_upstreams or move the profile onto one that is there",
+				"profile", prof.Name, "base", base,
+				"mirrored", strings.Join(s.cfg.MirroredAptCodenames(), " "))
+			continue
+		}
+		codename := config.ProfileAptCodename(base, prof.Name)
+		if err := s.cfg.ValidateProfileAptCodename(codename, base, prof.Name); err != nil {
+			s.logger.Error("a profile's filtered apt codename cannot be served", "error", err)
+			continue
+		}
+		out = append(out, aptProfileSuite{profile: prof.Name, base: base, codename: codename, permit: p})
+	}
+	return out
+}
+
+// aptProfileIndexes generates and signs one filtered dists/ tree per profile
+// that scopes apt, for the snapshot under construction.
+//
+// One fetch per (base, architecture) serves every profile over that base. Two
+// profiles filtering noble read one upstream Packages between them, which is
+// the difference between a linear cost in profiles and a linear cost in bases.
+func (s *Server) aptProfileIndexes(ctx context.Context, date, validUntil time.Time) []aptProfileSuite {
+	suites := s.aptProfileSuites(ctx)
+	if len(suites) == 0 {
+		return nil
+	}
+	releases := map[string]map[string]string{}
+	cache := map[string][]byte{}
+	out := make([]aptProfileSuite, 0, len(suites))
+	for _, ps := range suites {
+		release, ok := releases[ps.base]
+		if !ok {
+			var err error
+			if release, err = s.aptUpstreamRelease(ctx, ps.base); err != nil {
+				s.logger.Error("could not read the upstream Release for a profile's apt base, so its filtered codename is not regenerated at this rebuild",
+					"profile", ps.profile, "base", ps.base, "error", err)
+				continue
+			}
+			releases[ps.base] = release
+		}
+		arches, err := s.aptUpstreamArches(ps.base, release)
+		if err != nil {
+			s.logger.Error("could not tell which architectures a profile's apt base publishes, so its filtered codename is not regenerated at this rebuild",
+				"profile", ps.profile, "base", ps.base, "error", err)
+			continue
+		}
+		packages := make(map[string][]byte, len(arches))
+		for _, arch := range arches {
+			raw, ok := cache[ps.base+"/"+arch]
+			if !ok {
+				raw, err = s.aptUpstreamPackages(ctx, ps.base, arch, release)
+				if err != nil {
+					s.logger.Error("could not read an upstream Packages index for a profile's apt base",
+						"profile", ps.profile, "base", ps.base, "arch", arch, "error", err)
+					continue
+				}
+				cache[ps.base+"/"+arch] = raw
+			}
+			filtered, kept, dropped := filterAptPackages(raw, ps.permit)
+			packages[arch] = filtered
+			s.logger.Info("filtered an upstream apt index for a profile",
+				"profile", ps.profile, "codename", ps.codename, "arch", arch,
+				"kept", kept, "dropped", dropped)
+		}
+		if len(packages) == 0 {
+			s.logger.Error("a profile's filtered apt codename has no architecture to serve, so it is not regenerated at this rebuild",
+				"profile", ps.profile, "codename", ps.codename)
+			continue
+		}
+		ps.index = s.aptIndexFrom(ps.codename, packages, date, validUntil)
+		out = append(out, ps)
+	}
+	return out
+}
+
+// filterAptPackages copies through the paragraphs a profile permits and drops
+// the rest, returning the filtered index and the two counts.
+//
+// Membership is evaluated on the source package, not the binary. Ubuntu
+// renames, splits and transitions binary packages within one stable source as
+// ordinary maintenance — libfoo1 becomes libfoo1t64, a source ships a new -dev
+// — and a set closed on binary names fires on every one of those until an
+// operator sets the type to ignore, which is a control switched off by the
+// noise it makes rather than by a decision.
+//
+// The kept paragraphs are the upstream's own bytes. deb822.ParseSingle answers
+// with a map, so re-serializing from it would be a second grammar to get
+// wrong, and it would get it wrong the way a re-serializer does: an index that
+// still parses, carrying a Description that lost its continuation prefix.
+// Filename is upstream's too and needs no rewrite, because it is relative to
+// the archive root and bodega serves the pool at the same offset — which is
+// also what keeps one pool object answering every profile.
+//
+// A paragraph that does not parse stops nothing and is dropped, named in the
+// count: this index is re-signed under bodega's key, and copying a paragraph
+// bodega could not read into a document bodega vouches for is the one outcome
+// worse than a missing package.
+func filterAptPackages(index []byte, p *entitle.Profile) (out []byte, kept, dropped int) {
+	var buf bytes.Buffer
+	err := deb822.ParseStreamRaw(bytes.NewReader(index), func(raw []byte, fields map[string]string) error {
+		source := deb822.SourceName(fields)
+		if source == "" || !p.Permits(manifest.TypeApt, source, fields["Version"]).Permitted {
+			dropped++
+			return nil
+		}
+		kept++
+		buf.Write(raw)
+		buf.WriteByte('\n')
+		return nil
+	})
+	if err != nil {
+		// ParseStreamRaw only errors on a malformed paragraph, and it has
+		// already written every good one before it. Whatever follows the bad
+		// paragraph is lost, which is why the caller logs the counts.
+		dropped++
+	}
+	return buf.Bytes(), kept, dropped
+}
+
+// aptUpstreamArches reads the base codename's Release and returns the
+// architectures whose main Packages index the archive actually publishes.
+//
+// Both halves are needed. Architectures: is what the archive claims, and the
+// SHA256 block is what it published; asking for an arch listed in the first
+// and absent from the second is a 404 per rebuild, per profile, forever.
+func (s *Server) aptUpstreamArches(base string, release map[string]string) ([]string, error) {
+	declared := strings.Fields(release["Architectures"])
+	if len(declared) == 0 {
+		return nil, fmt.Errorf("the Release for %q names no Architectures", base)
+	}
+	published := aptReleaseDigests(release)
+	var out []string
+	for _, arch := range declared {
+		if _, ok := published[aptPackagesPath(arch)+".gz"]; ok {
+			out = append(out, arch)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("the Release for %q publishes no %s/binary-*/Packages.gz for any of the architectures it names (%s)",
+			base, aptProfileComponent, strings.Join(declared, " "))
+	}
+	if comps := strings.Fields(release["Components"]); len(comps) > 1 {
+		s.logger.Info("a filtered apt codename carries one component; the base publishes more, and packages outside it are not served under the profile",
+			"base", base, "served", aptProfileComponent, "upstream", strings.Join(comps, " "))
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// aptUpstreamRelease fetches and parses the Release for a mirrored codename.
+//
+// Release rather than InRelease: bodega has no distro keyring to check a
+// signature against, so the clearsigned form would only add a wrapper to
+// strip. What the document is used for is the digest list — see
+// aptUpstreamPackages — and docs/THREAT_MODEL.md states what that does and
+// does not buy.
+func (s *Server) aptUpstreamRelease(ctx context.Context, base string) (map[string]string, error) {
+	body, err := s.aptUpstreamFetch(ctx, base, "Release")
+	if err != nil {
+		return nil, err
+	}
+	return deb822.ParseSingle(body)
+}
+
+// aptUpstreamPackages fetches one architecture's compressed Packages index and
+// returns it decompressed, after checking it against the digest the Release
+// published for it.
+//
+// The digest check is not a signature and does not pretend to be one. It
+// catches the failure a mirror produces on its own: a Packages body from one
+// sync beside a Release from the next, which would have bodega sign an index
+// whose stanzas name .deb digests the pool no longer has.
+func (s *Server) aptUpstreamPackages(ctx context.Context, base, arch string, release map[string]string) ([]byte, error) {
+	rest := aptPackagesPath(arch) + ".gz"
+	want := aptReleaseDigests(release)[rest]
+	body, err := s.aptUpstreamFetch(ctx, base, rest)
+	if err != nil {
+		return nil, err
+	}
+	if want != "" {
+		if got := sha256.Sum256(body); hex.EncodeToString(got[:]) != want {
+			return nil, fmt.Errorf("the %s served for %s/%s does not match the SHA256 its own Release publishes: the archive's index and its digest list are from different syncs, and signing it would vouch for stanzas naming artifacts the pool no longer has",
+				rest, base, arch)
+		}
+	}
+	gz, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("decompress %s for %s: %w", rest, base, err)
+	}
+	defer func() { _ = gz.Close() }()
+	out, err := io.ReadAll(io.LimitReader(gz, maxUpstreamBody+1))
+	if err != nil {
+		return nil, fmt.Errorf("decompress %s for %s: %w", rest, base, err)
+	}
+	if int64(len(out)) > maxUpstreamBody {
+		return nil, fmt.Errorf("%s for %s decompresses past bodega's %d-byte buffer", rest, base, maxUpstreamBody)
+	}
+	return out, nil
+}
+
+// aptUpstreamFetch reads one path under a mirrored codename's dists/ tree from
+// the first archive configured for it, allow-list first.
+//
+// The first archive alone, matching handleAptMirrorDists: several archives can
+// serve one codename and each publishes its own Release, so reading the digest
+// list from one and the Packages from another is the hash mismatch the
+// disjoint-namespace rule exists to prevent.
+//
+// The allow-list is checked before the request rather than after, for the
+// reason aptResolvePoolUpstream states: a fetch that asks first and checks the
+// answer later has already made the request the rule forbids. Nothing is
+// recorded as discovery here — this is bodega reading its own index on a
+// timer, not a host reaching for a package.
+func (s *Server) aptUpstreamFetch(ctx context.Context, base, rest string) ([]byte, error) {
+	key := base + "/" + rest
+	if body, ok := s.aptUpstreamCached(key); ok {
+		return body, nil
+	}
+	ups := s.cfg.AptUpstreams[base]
+	if len(ups) == 0 {
+		return nil, fmt.Errorf("no archive is configured for %q", base)
+	}
+	url := ups[0].URL + "/dists/" + base + "/" + rest
+	if s.policy != nil {
+		_, violation, err := s.upstreamPolicyVerdict(ctx, manifest.TypeApt, url)
+		if err != nil {
+			return nil, fmt.Errorf("policy check for %s: %w", url, err)
+		}
+		if violation {
+			return nil, fmt.Errorf("%s is off the apt allow-list, so no filtered index can be generated from it: bodega policy add apt <host>", url)
+		}
+	}
+	ctx, cancel := context.WithTimeout(ctx, aptProfileFetchTimeout)
+	defer cancel()
+	body, _, err := fetchUpstream(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	s.aptUpstreamIdx.Store(key, aptUpstreamDoc{body: body, at: time.Now()})
+	return body, nil
+}
+
+// aptUpstreamDoc is one cached upstream index document and when it was read.
+type aptUpstreamDoc struct {
+	body []byte
+	at   time.Time
+}
+
+// aptUpstreamCached answers from the last read while it is inside
+// metadata_ttl, which is the same clock the mirrored dists/ tree is served
+// under: these are the same documents, reached by a different caller.
+//
+// A rebuild is triggered by the hourly tick and by every profile write, and
+// the second one arrives in bursts — an operator listing a baseline writes one
+// entry per package. Refetching tens of megabytes per write from an archive
+// that republishes daily is the cost this bounds, and the staleness it trades
+// for is bounded by the same setting an operator already tuned for the mirror.
+func (s *Server) aptUpstreamCached(key string) ([]byte, bool) {
+	ttl := s.cache.MetadataTTL
+	if ttl <= 0 {
+		return nil, false
+	}
+	v, ok := s.aptUpstreamIdx.Load(key)
+	if !ok {
+		return nil, false
+	}
+	doc, ok := v.(aptUpstreamDoc)
+	if !ok || time.Since(doc.at) >= ttl {
+		return nil, false
+	}
+	return doc.body, true
+}
+
+// aptPackagesPath is the Release-relative path of one architecture's Packages
+// index, which is both what the digest list keys on and what the fetch asks
+// for. One spelling, because a mismatch between the two reads as an archive
+// that publishes no digest rather than as a typo.
+func aptPackagesPath(arch string) string {
+	return aptProfileComponent + "/binary-" + arch + "/Packages"
+}
+
+// aptReleaseDigests indexes a Release's SHA256 block by path. Each line is
+// "<digest> <size> <path>", and deb822 hands the whole block over as one
+// newline-joined value.
+func aptReleaseDigests(release map[string]string) map[string]string {
+	out := map[string]string{}
+	for _, line := range strings.Split(release["SHA256"], "\n") {
+		f := strings.Fields(line)
+		if len(f) == 3 {
+			out[f[2]] = f[0]
+		}
+	}
+	return out
+}
+
+// ---- the backstop ----------------------------------------------------------
+
+// aptPoolGate is the request predicate on /apt/pool/, and it answers true when
+// the handler should carry on.
+//
+// It is the backstop rather than the control, which is the opposite of every
+// other type: the filtered index has already decided what this host was told
+// exists, and a request arriving here for something outside the profile came
+// from a client that composed a URL without reading an index. Refusing it
+// costs that client its transaction, which is the price of a request nothing
+// offered.
+//
+// Which is also why it runs for a profile that scopes apt and for no other. A
+// profile whose apt membership is open reads the mirrored codename unchanged
+// and has no filtered index behind it, so a refusal here would be enforcement
+// with no legible half — the 403 mid-transaction this whole shape exists to
+// avoid, arriving on a package the index the client read said it could have.
+//
+// The source package comes from the pool path. Debian lays the pool out as
+// pool/<component>/<prefix>/<source>/<binary>_<version>_<arch>.deb and
+// builder.PackageApt writes bodega's own artifacts to the same shape, so the
+// fourth segment is the source name under either provenance — no index lookup,
+// and the same identity filterAptPackages closed the membership over.
+func (s *Server) aptPoolGate(w http.ResponseWriter, r *http.Request, poolPath string) bool {
+	name, version := manifest.AptDebIdentity(path.Base(poolPath))
+	if source := aptPoolSourceName(poolPath); source != "" {
+		name = source
+	}
+	return s.entitleGate(w, r, manifest.TypeApt, name, version)
+}
+
+// aptGatesPool reports whether this request's own profile scopes apt, which is
+// the one condition under which the pool route is a profile-decided one.
+//
+// Asked separately from aptPoolGate because the answer decides the cache
+// directive as well as the predicate, and the two have to agree: a route that
+// refuses one host and ships `public` to the next has handed the refusal to a
+// proxy to overturn.
+func (s *Server) aptGatesPool(r *http.Request) bool {
+	p := s.profileFor(r)
+	return p != nil && p.AptScope() != ""
+}
+
+// aptPoolSourceName reads the source package out of a pool path, and "" from
+// a path that is not laid out as a pool. A caller falling back to the binary
+// name is right to: a private archive free-forming its pool is a set closed on
+// whatever the path carried, which is wrong in the direction of refusing too
+// much and shows up as a refusal rather than as a leak.
+func aptPoolSourceName(poolPath string) string {
+	parts := strings.Split(poolPath, "/")
+	if len(parts) != 5 || parts[0] != "pool" {
+		return ""
+	}
+	return parts[3]
+}

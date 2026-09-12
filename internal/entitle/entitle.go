@@ -136,6 +136,27 @@ func Key(typ, name string) string {
 	return b.String()
 }
 
+// AptScope is the mirrored codename this profile's filtered apt index derives
+// from, and "" for a profile that does not scope apt.
+//
+// Both halves are required. A base with an open membership admits every
+// package the archive publishes, so the filtered view would be the same
+// document under a second name — signed by bodega instead of the archive,
+// which is strictly worse: it replaces a signature the host already trusts
+// with one covering identical bytes. A closed membership with no base has
+// nothing to filter, because bodega's own manifest entries are already served
+// under the generated suites.
+func (p *Profile) AptScope() string {
+	if p == nil {
+		return ""
+	}
+	r, ok := p.types[manifest.TypeApt]
+	if !ok || r.Membership != audit.MembershipClosed {
+		return ""
+	}
+	return r.AptBase
+}
+
 // Name returns the profile's name, empty for the nil profile.
 func (p *Profile) Name() string {
 	if p == nil {

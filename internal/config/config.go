@@ -464,6 +464,42 @@ func (c *Config) MirrorsAptCodename(codename string) bool {
 	return ok
 }
 
+// ProfileAptCodename is the codename a profile's filtered apt index is served
+// under: the mirrored codename it derives from, with the profile appended.
+//
+// Derived rather than stored so nothing has to keep two spellings in step. The
+// base is in the name because a profile filters one upstream suite and the
+// operator reading a sources line needs to see which; the profile is in it
+// because two profiles over one base are the ordinary case.
+func ProfileAptCodename(base, profile string) string {
+	return base + "-" + profile
+}
+
+// ValidateProfileAptCodename reports whether a derived codename can be served
+// beside what this config already answers for.
+//
+// Three ways it cannot. A name apt itself will not parse as a suite; a
+// collision with a generated suite, whose Release this one would shadow in
+// handleAptDists; and a collision with a mirrored codename, where a proxied
+// dists/ tree wins the route and the filtered index is generated for nobody.
+// Each is a profile rename or an apt_upstreams key rename, so the error names
+// the pair that produced it.
+func (c *Config) ValidateProfileAptCodename(codename, base, profile string) error {
+	if !aptCodenamePattern.MatchString(codename) {
+		return fmt.Errorf("profile %q over base %q derives the codename %q, which must match %s — rename the profile to a lowercase word",
+			profile, base, codename, aptCodenamePattern)
+	}
+	if c.ServesAptSuite(codename) {
+		return fmt.Errorf("profile %q over base %q derives the codename %q, which apt_suites already serves: one URL serves one Release, and the generated suite owns it",
+			profile, base, codename)
+	}
+	if c.MirrorsAptCodename(codename) {
+		return fmt.Errorf("profile %q over base %q derives the codename %q, which apt_upstreams already mirrors: the proxied dists/ tree wins the route and the filtered index would be generated for nobody",
+			profile, base, codename)
+	}
+	return nil
+}
+
 // MirroredAptCodenames returns the mirrored codenames in sorted order, for the
 // emitters that list what an instance serves.
 func (c *Config) MirroredAptCodenames() []string {
@@ -793,7 +829,7 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	for _, suite := range cfg.AptSuites {
 		if cfg.MirrorsAptCodename(suite) {
 			return nil, fmt.Errorf("apt codename %q is in both apt_suites and apt_upstreams: bodega generates and signs one, mirrors the other, and one URL can serve only one of them. "+
-				"Drop it from apt_suites to mirror it, or from apt_upstreams to keep serving your own .debs under that name — a mirrored suite needs a name of its own", suite)
+				"Drop it from apt_suites to mirror it, or from apt_upstreams to keep serving your own .debs under that name — a mirrored codename needs a name of its own", suite)
 		}
 	}
 

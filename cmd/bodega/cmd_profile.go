@@ -15,6 +15,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/entitle"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/pins"
@@ -58,18 +59,24 @@ Examples:
   bodega profile diff web --origin db01
   bodega profile check`,
 	}
+	// The write verbs signal, the read verbs do not. A profile edit used to
+	// change nothing the server held that a TTL would not pick up on its own,
+	// because every index filter ran over the response on the way out. apt is
+	// generated instead: a filtered codename is built and signed at snapshot
+	// time, so without the signal `bodega profile add` lands in the index at
+	// the next hourly tick with nothing saying so.
 	parent.AddCommand(
-		newProfileCreateCmd(gf),
+		signalsReload(newProfileCreateCmd(gf)),
 		newProfileListCmd(gf),
 		newProfileShowCmd(gf),
-		newProfileBindCmd(gf),
-		newProfileUnbindCmd(gf),
-		newProfileSetCmd(gf),
-		newProfileAddCmd(gf),
-		newProfileRemoveCmd(gf),
-		newProfilePinCmd(gf),
+		signalsReload(newProfileBindCmd(gf)),
+		signalsReload(newProfileUnbindCmd(gf)),
+		signalsReload(newProfileSetCmd(gf)),
+		signalsReload(newProfileAddCmd(gf)),
+		signalsReload(newProfileRemoveCmd(gf)),
+		signalsReload(newProfilePinCmd(gf)),
 		newProfilePinsCmd(gf),
-		newProfileUnpinCmd(gf),
+		signalsReload(newProfileUnpinCmd(gf)),
 		newProfileDiffCmd(gf),
 		newProfileCheckCmd(gf),
 	)
@@ -96,6 +103,12 @@ type profileDocType struct {
 	// what the host has rather than about a posture nobody chose. An absent
 	// value reads as warn on the way in.
 	Expansion string `json:"expansion,omitempty"`
+	// AptBase is the mirrored codename an apt rule's filtered index is
+	// generated from. It is in the document because a baseline read off a host
+	// already knows which release that host runs, and leaving it out would
+	// make the one field a filtered index cannot be built without the one
+	// field --from-file cannot set.
+	AptBase string `json:"apt_base,omitempty"`
 }
 
 type profileDocEntry struct {
@@ -445,7 +458,7 @@ func createFromDoc(gf *globalFlags, doc *profileDoc, force bool) error {
 	for _, t := range doc.Types {
 		types = append(types, audit.ProfileTypeRule{
 			Profile: doc.Name, Type: t.Type, Membership: t.Membership,
-			VersionDefault: t.VersionDefault, Expansion: t.Expansion, Actor: actor,
+			VersionDefault: t.VersionDefault, Expansion: t.Expansion, AptBase: t.AptBase, Actor: actor,
 		})
 	}
 	entries := make([]audit.ProfileEntry, 0, len(doc.Entries))
@@ -492,6 +505,9 @@ func validateDoc(doc *profileDoc) error {
 				"  Delete one. Merging them would invent a rule neither row states", j, i, t.Type)
 		}
 		firstType[t.Type] = i
+		if t.AptBase != "" && t.Type != manifest.TypeApt {
+			return fmt.Errorf("types[%d]: apt_base is read on the apt rule alone; on %s it stores a control nothing consults", i, t.Type)
+		}
 	}
 	firstEntry := map[string]int{}
 	for i, e := range doc.Entries {
@@ -653,7 +669,7 @@ func newProfileShowCmd(gf *globalFlags) *cobra.Command {
 				fmt.Println("  none — this profile states no rule for any type, so it permits everything")
 			} else {
 				w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-				fmt.Fprintln(w, "  TYPE\tMEMBERSHIP\tVERSION DEFAULT\tEXPANSION\tENTRIES")
+				fmt.Fprintln(w, "  TYPE\tMEMBERSHIP\tVERSION DEFAULT\tEXPANSION\tAPT BASE\tENTRIES")
 				for _, t := range d.Types {
 					n := 0
 					for _, e := range d.Entries {
@@ -667,7 +683,8 @@ func newProfileShowCmd(gf *globalFlags) *cobra.Command {
 						// printing a value there would read as a rule in force.
 						expansion = t.Expansion
 					}
-					fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%d\n", t.Type, t.Membership, t.VersionDefault, expansion, n)
+					fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%s\t%d\n",
+						t.Type, t.Membership, t.VersionDefault, expansion, orDash(t.AptBase), n)
 				}
 				_ = w.Flush()
 			}
@@ -839,7 +856,7 @@ func newProfileUnbindCmd(gf *globalFlags) *cobra.Command {
 }
 
 func newProfileSetCmd(gf *globalFlags) *cobra.Command {
-	var membership, versionDefault, expansion string
+	var membership, versionDefault, expansion, base string
 	var force bool
 	c := &cobra.Command{
 		Use:   "set <profile> <type>",
@@ -857,6 +874,19 @@ a fetch outside the set.
   --expansion warn       serve it, and record the reach outside the class
   --expansion block      refuse it with 403
   --expansion ignore     serve it and record nothing
+
+  --base <codename>      apt only: the mirrored codename this profile's
+                         filtered index is generated from
+
+--base is what makes apt enforceable under a profile, and it applies to a
+closed apt rule alone. bodega serves the profile a codename of its own,
+"<base>-<profile>", holding a filtered view of the base's Packages signed with
+bodega's own key; a host reads that codename instead of the base. Without it a
+closed apt rule filters nothing, because refusing a .deb at the pool would
+abort an apt transaction the client had already planned.
+
+  bodega profile set web apt --membership closed --base noble
+  bodega doctor --write-apt-sources --token ... --url https://bodega.internal
 
 --expansion defaults to warn and applies to a closed type alone, because an
 open type lists nothing to be outside of. warn rather than block: a new
@@ -880,8 +910,8 @@ name keeps the value it has.`,
 			if err := requirePackageType(typ); err != nil {
 				return err
 			}
-			if membership == "" && versionDefault == "" && expansion == "" {
-				return fmt.Errorf("name what to set: --membership <%s>, --version-default <%s> or --expansion <%s>",
+			if membership == "" && versionDefault == "" && expansion == "" && !cmd.Flags().Changed("base") {
+				return fmt.Errorf("name what to set: --membership <%s>, --version-default <%s>, --expansion <%s> or --base <codename>",
 					strings.Join(audit.Memberships(), "|"), strings.Join(audit.VersionDefaults(), "|"),
 					strings.Join(audit.Expansions(), "|"))
 			}
@@ -919,6 +949,12 @@ name keeps the value it has.`,
 			if expansion != "" {
 				rule.Expansion = expansion
 			}
+			if cmd.Flags().Changed("base") {
+				rule.AptBase = base
+			}
+			if err := checkProfileAptBase(gf, profile, rule); err != nil {
+				return err
+			}
 			rule.Actor = audit.CurrentActor()
 
 			if rule.Membership == audit.MembershipClosed && refusesUnlisted(rule.Expansion) && !force {
@@ -935,14 +971,64 @@ name keeps the value it has.`,
 					rule.Membership, rule.VersionDefault, rule.Expansion))
 			fmt.Printf("%s %s: membership=%s version_default=%s expansion=%s\n",
 				profile, typ, rule.Membership, rule.VersionDefault, rule.Expansion)
+			if rule.AptBase != "" {
+				fmt.Printf("  filtered codename: %s (from %s), served after the next index rebuild\n",
+					config.ProfileAptCodename(rule.AptBase, profile), rule.AptBase)
+			}
 			return nil
 		},
 	}
 	c.Flags().StringVar(&membership, "membership", "", "closed | open")
 	c.Flags().StringVar(&versionDefault, "version-default", "", "pinned | floating")
 	c.Flags().StringVar(&expansion, "expansion", "", "warn | block | ignore (closed types only; default warn)")
+	c.Flags().StringVar(&base, "base", "", "apt only: the mirrored codename the filtered index is generated from")
 	c.Flags().BoolVar(&force, "force", false, "Accept a closed type with no entries, which permits nothing of that type")
 	return c
+}
+
+// checkProfileAptBase refuses a base this instance could not serve, at the
+// write rather than at the next index rebuild.
+//
+// Stored, a bad base is a control the operator believes they set: nothing
+// refuses it, the codename never appears, and the only evidence is one ERROR
+// line an hour later in the server's journal. The config read is best-effort
+// for the same reason the write is not — an operator setting a profile from a
+// host with no config file still gets the shape check, which is the half that
+// catches a typo.
+func checkProfileAptBase(gf *globalFlags, profile string, rule audit.ProfileTypeRule) error {
+	if rule.AptBase == "" {
+		return nil
+	}
+	if rule.Type != manifest.TypeApt {
+		return fmt.Errorf("--base is read on the apt rule alone; %q would store it where nothing reads it", rule.Type)
+	}
+	if rule.Membership != audit.MembershipClosed {
+		return fmt.Errorf("--base needs --membership closed: an open apt rule admits every package the archive publishes, "+
+			"so the filtered index would be the same document under a second name, signed by bodega instead of by the archive.\n"+
+			"  Close it:  bodega profile set %s apt --membership closed --base %s", profile, rule.AptBase)
+	}
+	cfg, err := loadConfig(gf)
+	if err != nil {
+		return nil
+	}
+	codename := config.ProfileAptCodename(rule.AptBase, profile)
+	if err := cfg.ValidateProfileAptCodename(codename, rule.AptBase, profile); err != nil {
+		return err
+	}
+	if !cfg.MirrorsAptCodename(rule.AptBase) {
+		return fmt.Errorf("no upstream archive is configured for the codename %q, so there is no Packages index to filter.\n"+
+			"  Mirrored here:  %s\n"+
+			"  Add one:        apt_upstreams in the config file",
+			rule.AptBase, orNone(strings.Join(cfg.MirroredAptCodenames(), " ")))
+	}
+	return nil
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "none"
+	}
+	return s
 }
 
 func newProfileAddCmd(gf *globalFlags) *cobra.Command {

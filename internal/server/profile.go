@@ -242,9 +242,11 @@ func (s *Server) profileFor(r *http.Request) *entitle.Profile {
 // a git namespace, a packument, an index. Those are decided at the membership
 // level alone, because there is no version yet to hold to a constraint.
 //
-// apt does not reach here and is deliberately excluded: refusing an apt fetch
-// at the pool costs the client a half-applied transaction, and the control
-// there belongs at the index. See docs/DESIGN.md.
+// apt reaches here from one route only, and as a backstop rather than as the
+// control: refusing an apt fetch at the pool costs the client a half-applied
+// transaction, so the enforcement is the filtered index a profile is served
+// under and aptPoolGate catches a client that composed a URL without reading
+// one. See internal/server/apt_profile.go and docs/DESIGN.md.
 func (s *Server) entitleGate(w http.ResponseWriter, r *http.Request, typ, name, version string) bool {
 	p := s.profileFor(r)
 	if p == nil {

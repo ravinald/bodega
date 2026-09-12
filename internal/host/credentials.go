@@ -331,6 +331,63 @@ func WriteCredential(t CredentialTarget, base *url.URL, token string) (bool, err
 	return true, nil
 }
 
+// AptSourcesPath is the file bodega's own deb822 stanza is installed as, and
+// AptSourcesMode is what it and the keyring beside it are created with.
+//
+// A .sources file of its own rather than a line appended to
+// /etc/apt/sources.list: the file is bodega's alone and replaced whole, so a
+// profile moved to a different codename leaves nothing behind. Both files are
+// world-readable on purpose — neither holds a secret, the keyring is a public
+// key, and apt reads them as a user that is not always root.
+const (
+	AptSourcesPath = "/etc/apt/sources.list.d/bodega.sources"
+	AptSourcesMode = os.FileMode(0o644)
+)
+
+// WriteAptSources installs the stanza a bodega instance said this host should
+// read, and the keyring its Signed-By: names. It reports the paths it wrote,
+// in order, and stops at the first failure.
+//
+// The keyring goes first. A stanza naming a Signed-By: path that does not
+// exist fails `apt update` outright with "The following signatures couldn't be
+// verified", and a host left in that state has no working sources at all —
+// where the reverse order leaves the previous sources working until the file
+// that replaces them is complete.
+//
+// Neither file is merged with what is there. keyringPath is where the archive
+// key lives on the client and the stanza is bodega's own document; an operator
+// who wants a second source writes a second file, which is what the .list.d
+// directory is for.
+func WriteAptSources(keyringPath, stanza string, keyring []byte) ([]string, error) {
+	if len(keyring) == 0 {
+		return nil, fmt.Errorf("no keyring to install: this bodega serves its apt index unsigned, and a stanza with no Signed-By: would need [trusted=yes], which turns verification off for the source permanently.\n" +
+			"  Sign it on the server:  bodega apt key generate")
+	}
+	if !strings.Contains(stanza, keyringPath) {
+		return nil, fmt.Errorf("the stanza this bodega returned does not name %s in a Signed-By: line, so installing the keyring there would leave it unread", keyringPath)
+	}
+	var wrote []string
+	for _, f := range []struct {
+		path string
+		data []byte
+	}{
+		{keyringPath, keyring},
+		{AptSourcesPath, []byte(strings.TrimRight(stanza, "\n") + "\n")},
+	} {
+		if err := os.MkdirAll(filepath.Dir(f.path), 0o755); err != nil {
+			return wrote, fmt.Errorf("create %s: %w", filepath.Dir(f.path), err)
+		}
+		if err := os.WriteFile(f.path, f.data, AptSourcesMode); err != nil {
+			return wrote, fmt.Errorf("write %s: %w", f.path, err)
+		}
+		if err := os.Chmod(f.path, AptSourcesMode); err != nil {
+			return wrote, fmt.Errorf("chmod %s: %w", f.path, err)
+		}
+		wrote = append(wrote, f.path)
+	}
+	return wrote, nil
+}
+
 // cutManaged splits existing around the fenced block and reports whether one
 // was there. An unterminated begin marker is an error rather than something to
 // guess at: writing past it would nest one block inside another and the next
