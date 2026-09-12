@@ -327,3 +327,36 @@ func TestOSVCheckerReusesTheDatabase(t *testing.T) {
 		t.Error("two osv_db_dir values shared one database")
 	}
 }
+
+// TestOSVCheckerCarriesTheDefaultAptSuite pins the one key the gate cannot
+// derive on its own. Every apt manifest written before the suites field keeps
+// that field empty, and the server publishes those entries under
+// apt_codename; without the codename here the gate declines to answer for the
+// shape most of the catalog has.
+func TestOSVCheckerCarriesTheDefaultAptSuite(t *testing.T) {
+	cfg := &config.Config{OSVDBDir: t.TempDir(), AptCodename: "jammy"}
+	if got := OSVChecker(cfg, nil).DefaultAptSuite; got != "jammy" {
+		t.Errorf("DefaultAptSuite = %q, want jammy", got)
+	}
+	if got := OSVChecker(nil, nil).DefaultAptSuite; got != "" {
+		t.Errorf("no config means no default, got %q", got)
+	}
+}
+
+// TestOSVCheckerCarriesTheServedAptSuites pins the bound on that fallback.
+// apt_suites can serve several releases at once, and the codename then answers
+// for entries captured on the others: their advisories match nothing, so the
+// entry is dated clean. The gate can only decline that if it knows how many
+// releases are served.
+func TestOSVCheckerCarriesTheServedAptSuites(t *testing.T) {
+	cfg := &config.Config{OSVDBDir: t.TempDir(), AptCodename: "jammy", AptSuites: []string{"jammy", "noble"}}
+	if got := OSVChecker(cfg, nil).ServedAptSuites; len(got) != 2 || got[0] != "jammy" || got[1] != "noble" {
+		t.Errorf("ServedAptSuites = %v, want [jammy noble]", got)
+	}
+	// The codename alone is one release, which is the install the fallback is
+	// unambiguous for.
+	one := &config.Config{OSVDBDir: t.TempDir(), AptCodename: "jammy"}
+	if got := OSVChecker(one, nil).ServedAptSuites; len(got) != 1 || got[0] != "jammy" {
+		t.Errorf("ServedAptSuites = %v, want [jammy]", got)
+	}
+}

@@ -24,6 +24,12 @@ type OSVStore interface {
 // osvEcosystemFor maps bodega's registry types to OSV's ecosystem identifiers.
 // Ecosystems without an OSV equivalent short-circuit to pass, so `bodega
 // policy osv set` refuses to write a row for one; see OSVEcosystems.
+//
+// apt is covered and is deliberately not in here. One identifier per registry
+// type is the assumption this table encodes, and apt breaks it: Ubuntu and
+// Debian backport a fix without moving the upstream version, so the records
+// that settle a version live in the export for its own release. See
+// osvLookupFor and OSVExportsFor.
 var osvEcosystemFor = map[string]string{
 	manifest.TypeNpm:   "npm",
 	manifest.TypePypi:  "PyPI",
@@ -32,18 +38,29 @@ var osvEcosystemFor = map[string]string{
 }
 
 // OSVEcosystemFor returns OSV's identifier for a registry type, or "" when
-// the type has no OSV equivalent. `policy osv sync` needs the mapping to name
-// the export it fetches, and a second copy of the table is how the two drift.
+// the type has no single OSV equivalent. `policy osv sync` needs the mapping
+// to name the export it fetches, and a second copy of the table is how the two
+// drift. apt returns "" here and is still covered; ask OSVExportsFor, which
+// answers for every type.
 func OSVEcosystemFor(registryType string) string {
 	return osvEcosystemFor[registryType]
 }
 
+// OSVCovers reports whether the gate can query a registry type at all. It is
+// the question `show pkg` asks before printing "unchecked" rather than "n/a",
+// and OSVEcosystemFor is the wrong one to ask now that apt has no single
+// identifier.
+func OSVCovers(registryType string) bool {
+	return registryType == manifest.TypeApt || osvEcosystemFor[registryType] != ""
+}
+
 // OSVEcosystems returns the registry types the OSV gate can query, sorted.
 func OSVEcosystems() []string {
-	out := make([]string, 0, len(osvEcosystemFor))
+	out := make([]string, 0, len(osvEcosystemFor)+1)
 	for eco := range osvEcosystemFor {
 		out = append(out, eco)
 	}
+	out = append(out, manifest.TypeApt)
 	sort.Strings(out)
 	return out
 }
@@ -69,6 +86,20 @@ type OSVChecker struct {
 	// it warns instead of passing. Zero means DefaultOSVMaxAge.
 	MaxAge time.Duration
 
+	// DefaultAptSuite is the suite an apt entry naming none is served under,
+	// which is the server's apt_codename. Empty leaves such an entry
+	// unanswerable, which is what a test or a tool holding no Config gets.
+	DefaultAptSuite string
+
+	// ServedAptSuites is apt_suites, and it bounds DefaultAptSuite rather than
+	// widening it: an apt entry naming no suite is answered from the codename
+	// only while the codename is the one release this bodega serves. Two
+	// releases and nothing on the entry says which of them its version string
+	// came from, so the gate warns instead of choosing. Empty leaves the
+	// fallback unbounded, which is the single-release install and every caller
+	// holding no Config.
+	ServedAptSuites []string
+
 	Now func() time.Time
 }
 
@@ -83,11 +114,16 @@ func NewOSVChecker(store OSVStore) *OSVChecker {
 }
 
 func (c *OSVChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve *manifest.VersionEntry) Result {
-	if pm == nil || ve == nil || ve.Version == "" {
+	if pm == nil || ve == nil {
 		return Result{Check: "osv", Action: ActionPass}
 	}
-	osvEco, ok := osvEcosystemFor[pm.Type]
-	if !ok {
+	if !OSVCovers(pm.Type) {
+		return Result{Check: "osv", Action: ActionPass}
+	}
+	// An apt entry with no version is a stub whose .deb nothing has resolved
+	// yet, and a stub is exactly what the gate must not wave through: see the
+	// warn below, once the policy row says the gate is on at all.
+	if ve.Version == "" && pm.Type != manifest.TypeApt {
 		return Result{Check: "osv", Action: ActionPass}
 	}
 
@@ -101,8 +137,16 @@ func (c *OSVChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 	if policy.Action == ActionIgnore {
 		return Result{Check: "osv", Action: ActionPass}
 	}
+	if ve.Version == "" {
+		return Result{Check: "osv", Action: ActionWarn,
+			Reason: fmt.Sprintf("apt entry %s carries no version, so no advisory can be evaluated against it", pm.Name)}
+	}
+	lk := osvLookupFor(pm, ve, c.DefaultAptSuite, c.ServedAptSuites)
+	if lk.reason != "" {
+		return Result{Check: "osv", Action: ActionWarn, Reason: lk.reason}
+	}
 
-	ans := c.answerFor(ctx, osvEco, pm, ve)
+	ans := c.answerFor(ctx, lk, ve)
 	if ans.err != nil {
 		return Result{Check: "osv", Action: ActionWarn,
 			Reason: fmt.Sprintf("osv lookup failed for %s/%s@%s: %v", pm.Type, pm.Name, ve.Version, ans.err)}
@@ -113,9 +157,12 @@ func (c *OSVChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 		if !ans.conclusive() {
 			return Result{Check: "osv", Action: ActionWarn, Reason: ans.degraded}
 		}
+		if reason := lk.emptyAnswerReason(vulns); reason != "" {
+			return Result{Check: "osv", Action: ActionWarn, Reason: reason}
+		}
 		// Dating a clean result is what stops it reading, a year later, like
 		// a version nobody ever looked at.
-		stampOSV(ve, nil, c.now())
+		stampOSV(ve, nil, c.now(), lk.queried)
 		return Result{Check: "osv", Action: ActionPass}
 	}
 
@@ -126,7 +173,7 @@ func (c *OSVChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 	if ans.conclusive() {
 		checkedAt = c.now()
 	}
-	stampOSV(ve, vulns, checkedAt)
+	stampOSV(ve, vulns, checkedAt, lk.queried)
 
 	ids := vulnIDs(vulns)
 	details := map[string]any{
@@ -136,9 +183,15 @@ func (c *OSVChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 	if sev := vulnSeverities(vulns); len(sev) > 0 {
 		details["severity"] = sev
 	}
+	if lk.queried != "" {
+		details["queried"] = lk.queried
+	}
 
 	reason := fmt.Sprintf("%s@%s has %d OSV record(s): %s",
 		pm.Name, ve.Version, len(vulns), strings.Join(ids, ", "))
+	if lk.queried != "" {
+		reason += ", queried as " + lk.queried
+	}
 	if ans.degraded != "" {
 		reason += " (" + ans.degraded + ")"
 	}
@@ -182,25 +235,63 @@ func (a osvAnswer) conclusive() bool {
 
 // answerFor is the lookup both admission and rescan go through.
 //
+// An entry resolves to several targets when it is published to several apt
+// suites, and the same .deb is offered to every one of them: a record against
+// any of those releases is a finding on this version. The answers fold into
+// one, and one target that could not be read leaves the whole entry
+// inconclusive: a union built from half the sources is a clean answer about a
+// question nobody finished asking.
+//
 // A version entry whose constraint is not exact does not name one version: the
 // server resolves the range against upstream and serves releases the manifest
 // never lists, so a point lookup on the base version answers a question nobody
 // asked. Marking that inconclusive keeps the range out of the check date while
 // still carrying any record found against the base version itself, which is
 // the same shape as an answer read from stale data.
-func (c *OSVChecker) answerFor(ctx context.Context, osvEco string, pm *manifest.PackageManifest, ve *manifest.VersionEntry) osvAnswer {
-	ans := c.lookup(ctx, osvEco, pm.Name, ve.Version)
-	reason := constraintUnevaluatedReason(pm.Name, ve)
-	if reason == "" || ans.err != nil {
-		return ans
+func (c *OSVChecker) answerFor(ctx context.Context, lk osvLookup, ve *manifest.VersionEntry) osvAnswer {
+	out := osvAnswer{answered: true}
+	seen := map[string]bool{}
+	var degraded []string
+	if lk.note != "" {
+		out.answered = false
+		degraded = append(degraded, lk.note)
 	}
-	ans.answered = false
-	if ans.degraded == "" {
-		ans.degraded = reason
-	} else {
-		ans.degraded += "; " + reason
+	for _, t := range lk.targets {
+		ans := c.lookup(ctx, t.ecosystem, t.name, ve.Version)
+		if ans.err != nil {
+			// Whole, not just the error: a caller reads the ids off an
+			// answer it could not act on, and lookup builds this one.
+			return ans
+		}
+		for _, v := range ans.vulns {
+			if seen[v.ID] {
+				continue
+			}
+			seen[v.ID] = true
+			out.vulns = append(out.vulns, v)
+		}
+		if !ans.answered {
+			out.answered = false
+		}
+		if ans.degraded != "" {
+			degraded = append(degraded, ans.degraded)
+		}
 	}
-	return ans
+	if reason := constraintUnevaluatedReason(queryName(lk), ve); reason != "" {
+		out.answered = false
+		degraded = append(degraded, reason)
+	}
+	out.degraded = strings.Join(degraded, "; ")
+	return out
+}
+
+// queryName is the name the entry was looked up under, for a reason that has
+// to name something the operator can find in the manifest.
+func queryName(lk osvLookup) string {
+	if len(lk.targets) == 0 {
+		return ""
+	}
+	return lk.targets[0].name
 }
 
 // OSVDatable reports whether one point lookup can date this entry. Anything
@@ -325,6 +416,17 @@ type osvVuln struct {
 	Severity []osvSeverity `json:"severity"`
 }
 
+// osvAPIBodyLimit caps what one api.osv.dev response may cost in memory. A
+// distro ecosystem gets an order of magnitude more than a language one because
+// a USN enumerates every version it covers: measured 2026-09-11, one query for
+// linux 5.15.0-91.101 in Ubuntu:22.04:LTS answers with 32.8 MB.
+func osvAPIBodyLimit(ecosystem string) int64 {
+	if isDistroEcosystem(ecosystem) {
+		return 64 << 20
+	}
+	return 4 << 20
+}
+
 func (c *OSVChecker) query(ctx context.Context, ecosystem, name, version string) ([]osvVuln, error) {
 	body, _ := json.Marshal(map[string]any{
 		"package": map[string]string{"name": name, "ecosystem": ecosystem},
@@ -343,9 +445,16 @@ func (c *OSVChecker) query(ctx context.Context, ecosystem, name, version string)
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("POST %s: HTTP %d", c.Endpoint, resp.StatusCode)
 	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	// One byte past the cap, so a body that reaches it is reported as too
+	// large rather than as the truncated JSON it would otherwise parse as.
+	limit := osvAPIBodyLimit(ecosystem)
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
 		return nil, err
+	}
+	if int64(len(raw)) > limit {
+		return nil, fmt.Errorf("osv response for %s %s@%s is larger than the %d MiB cap; run `bodega policy osv sync` and answer from the local database",
+			ecosystem, name, version, limit>>20)
 	}
 	var out struct {
 		Vulns []osvVuln `json:"vulns"`

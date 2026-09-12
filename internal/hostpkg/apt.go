@@ -29,6 +29,10 @@ type AptRow struct {
 	Name    string
 	Version string
 	Arch    string
+	// Source is the Debian source package, from dpkg's ${source:Package}.
+	// Empty when the capture did not ask for it, which is every capture taken
+	// from 'apt list --installed' and every one taken before bodega asked.
+	Source string
 }
 
 // AptInventory is one host's installed apt packages and what was dropped
@@ -38,20 +42,48 @@ type AptInventory struct {
 	Warnings []string
 }
 
-// ParseApt converts either of apt's two inventory formats.
+// ParseApt converts either of apt's two inventory formats, recording no
+// release. It is the Parser the type dispatch hands out, and a suite is not a
+// thing every manager has; see ParseAptWithSuite for the capture's own.
 //
 // 'dpkg-query -W' is the documented input because it is machine readable and
 // carries the status field. 'apt list --installed' is accepted because it is
 // what an operator reaches for, even though apt prints a warning that its CLI
 // has no stable interface.
 func ParseApt(r io.Reader) (Result, error) {
+	return ParseAptWithSuite(r, "")
+}
+
+// ParseAptWithSuite is ParseApt with the release the inventory was captured
+// on, written onto every entry's CaptureSuite.
+//
+// The release is the capture's to record and nothing else's. Ubuntu and Debian
+// backport a security fix without moving the upstream version, so the
+// advisories that settle a version live in the export for its own release, and
+// a catalog holding jammy and noble entries at once cannot be answered from
+// one server-wide codename: it would be wrong about one of them, in the
+// direction that reports a vulnerable host clean. dpkg reports no codename in
+// either format, so it comes from the host convert runs on or from --suite.
+//
+// CaptureSuite and not Suites, which decides which dists/<suite>/ the entry is
+// published to: a server whose apt_codename is a house name serves no suite
+// the captured host could have named, so recording the release there would
+// take every converted entry out of the generated indexes.
+//
+// An empty suite records none rather than guessing. See policy.osvLookupFor
+// for what the OSV gate does with an entry naming no release.
+func ParseAptWithSuite(r io.Reader, suite string) (Result, error) {
 	inv, err := ParseAptRows(r)
 	if err != nil {
 		return Result{}, err
 	}
+	suite = strings.TrimSpace(suite)
 	res := Result{Warnings: inv.Warnings}
 	for _, row := range inv.Rows {
-		res.Packages = append(res.Packages, pkg(manifest.TypeApt, row.Name, row.Version, "", ""))
+		pm := pkg(manifest.TypeApt, row.Name, row.Version, "", "")
+		pm.Versions[0].SourcePackage = row.Source
+		pm.Versions[0].CaptureSuite = suite
+		res.Packages = append(res.Packages, pm)
 	}
 	sortPackages(res.Packages)
 	return res, nil
@@ -77,7 +109,14 @@ func ParseAptRows(r io.Reader) (AptInventory, error) {
 
 // parseDpkgQuery reads the tab-separated form:
 //
-//	name<TAB>version<TAB>arch<TAB>status
+//	name<TAB>version<TAB>arch<TAB>status[<TAB>source]
+//
+// The source package is last on purpose. dpkg's own field order would put
+// ${source:Package} second, and that capture parses with no error and drops
+// every row on the host: f[3] is then the architecture, which is not
+// dpkgInstalled, so each row counts as present-but-not-installed and the
+// operator gets a count with nothing to compare it against. Appending keeps
+// the four-field capture taken before this field existed reading unchanged.
 func parseDpkgQuery(text string) (AptInventory, error) {
 	var res AptInventory
 	skipped := 0
@@ -90,10 +129,14 @@ func parseDpkgQuery(text string) (AptInventory, error) {
 		}
 		f := strings.Split(line, "\t")
 		if len(f) < 4 {
-			return AptInventory{}, fmt.Errorf("dpkg-query line has %d fields, want 4: %q\n"+
-				"expected the format bodega asks for: dpkg-query -W -f='${Package}\\t${Version}\\t${Architecture}\\t${Status}\\n'", len(f), line)
+			return AptInventory{}, fmt.Errorf("dpkg-query line has %d fields, want at least 4: %q\n"+
+				"expected the format bodega asks for: dpkg-query -W -f='${Package}\\t${Version}\\t${Architecture}\\t${Status}\\t${source:Package}\\n'", len(f), line)
 		}
 		name, version, arch, status := f[0], f[1], f[2], f[3]
+		var source string
+		if len(f) > 4 {
+			source = strings.TrimSpace(f[4])
+		}
 		if status != dpkgInstalled {
 			skipped++
 			continue
@@ -101,7 +144,7 @@ func parseDpkgQuery(text string) (AptInventory, error) {
 		if name == "" || version == "" {
 			continue
 		}
-		res.Rows = append(res.Rows, AptRow{Name: name, Version: version, Arch: arch})
+		res.Rows = append(res.Rows, AptRow{Name: name, Version: version, Arch: arch, Source: source})
 	}
 	if err := sc.Err(); err != nil {
 		return AptInventory{}, fmt.Errorf("scan dpkg-query output: %w", err)

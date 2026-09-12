@@ -46,7 +46,7 @@ To catalog a host that already exists rather than adding packages one at a time:
 
 ```bash
 # On the host. Neither step needs a manifest store there.
-dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\n' \
+dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\t${source:Package}\n' \
   | bodega pkg convert apt > catalog.json
 bodega pkg import --server https://bodega.example catalog.json
 ```

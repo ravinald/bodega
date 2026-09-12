@@ -10,6 +10,7 @@ cannot occur.
 | `apt-list-installed-ns0.txt` | `apt list --installed` | the same host, same moment |
 | `apt-dpkg-query-ubuntu2404.txt` | `dpkg-query -W` | `ubuntu:24.04` container, arm64, after `apt-get install curl jq` then `apt-get remove jq` |
 | `apt-list-installed-ubuntu2404.txt` | `apt list --installed` | the same container, same moment |
+| `apt-dpkg-query-jammy-source.txt` | `dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\t${source:Package}\n'` | `ubuntu:22.04` container, arm64, stock |
 | `pypi-pip-list.json` | `pip list --format=json` | macOS, Homebrew python |
 | `npm-ls-global.json` | `npm ls --global --json --depth=0` | macOS, Homebrew node |
 | `cargo-install-list.txt` | `cargo install --list` | macOS |
@@ -27,7 +28,14 @@ skips the status filter mirrors 139 packages the host does not have. The
 matching `apt list --installed` capture lists exactly those 635, so the two
 formats cross-check each other and neither is graded against its own parser.
 
-The container capture covers what a long-lived server does not show: a package
+The jammy capture is the source-package case. 73 of its 101 rows carry a source
+name their binary name does not equal (`libssl3` from `openssl`, `bsdutils` from
+`util-linux`, `libapt-pkg6.0` from `apt`), which is the ratio that decides how
+much of a host the OSV gate can answer for: Ubuntu and Debian advisories are
+keyed on the source alone. A hand-written fixture would have made that ratio a
+guess.
+
+The ubuntu2404 capture covers what a long-lived server does not show: a package
 installed from a repo carries a real suite (`noble-updates,noble-security,now`)
 rather than `now`, and the `[installed,automatic]` and `[installed,auto-removable]`
 markers appear. A base image alone shows `[installed,local]` for everything,

@@ -249,3 +249,69 @@ func TestDropVersionlessAptEntriesKeepsAStagedPackage(t *testing.T) {
 		t.Error("the staged entry did not survive")
 	}
 }
+
+// TestParseAptShowSourcePackage covers the three shapes a Source: field takes
+// in a real jammy index. The OSV gate queries this name against an ecosystem
+// keyed on source packages, so a version left on it turns every lookup for
+// that package into a miss the gate reads as clean.
+func TestParseAptShowSourcePackage(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		pkg    string
+		stanza string
+		want   string
+	}{
+		{
+			// apt show libexpat1, ubuntu:22.04 container.
+			name: "source differs from binary",
+			pkg:  "libexpat1",
+			stanza: `Package: libexpat1
+Version: 2.4.7-1ubuntu0.7
+Priority: important
+Section: libs
+Source: expat
+Origin: Ubuntu
+`,
+			want: "expat",
+		},
+		{
+			// apt show bash on the same container prints no Source: at all.
+			// Debian policy omits it exactly when the two names are equal, so
+			// its absence is an answer rather than a gap.
+			name: "no Source line",
+			pkg:  "bash",
+			stanza: `Package: bash
+Version: 5.1-6ubuntu1.1
+Priority: required
+Section: shells
+`,
+			want: "bash",
+		},
+		{
+			// The jammy Packages indices carry 1500-odd of these: dpkg writes
+			// the source version in parens when the binary does not share it.
+			name: "source carries its own version",
+			pkg:  "binutils-arm-none-eabi",
+			stanza: `Package: binutils-arm-none-eabi
+Version: 2.38-3ubuntu1+15build1
+Section: devel
+Source: binutils-arm-none-eabi (15build1)
+`,
+			want: "binutils-arm-none-eabi",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ve := parseAptShowOutput(tc.stanza, tc.pkg)
+			if ve == nil {
+				t.Fatal("stanza did not parse")
+			}
+			if ve.SourcePackage != tc.want {
+				t.Errorf("SourcePackage = %q, want %q", ve.SourcePackage, tc.want)
+			}
+			if ve.SourceName != tc.pkg {
+				t.Errorf("SourceName = %q, want %q: 'apt-get download' wants the binary name",
+					ve.SourceName, tc.pkg)
+			}
+		})
+	}
+}

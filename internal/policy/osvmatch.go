@@ -13,6 +13,7 @@ import (
 const (
 	orderSemver = "semver"
 	orderPEP440 = "pep440"
+	orderDebian = "debian"
 )
 
 // osvAffected is the subset of an OSV record's `affected` entry the matcher
@@ -35,13 +36,25 @@ type osvEvent struct {
 }
 
 // osvVersionOrder returns the ordering an ECOSYSTEM range uses for an OSV
-// ecosystem. PyPI orders by PEP 440 and the rest of what bodega maps order by
-// semver, so an unknown ecosystem gets semver rather than an error.
+// ecosystem. PyPI orders by PEP 440, Ubuntu and Debian by dpkg's ordering, and
+// the rest of what bodega maps order by semver, so an unknown ecosystem gets
+// semver rather than an error.
 func osvVersionOrder(ecosystem string) string {
-	if ecosystem == "PyPI" {
+	switch {
+	case ecosystem == "PyPI":
 		return orderPEP440
+	case isDistroEcosystem(ecosystem):
+		return orderDebian
 	}
 	return orderSemver
+}
+
+// isDistroEcosystem reports whether an OSV ecosystem is one of the per-release
+// Ubuntu or Debian exports ("Ubuntu:22.04:LTS", "Debian:12"), whose versions
+// are full distro version strings rather than upstream releases.
+func isDistroEcosystem(ecosystem string) bool {
+	base, _, _ := strings.Cut(ecosystem, ":")
+	return base == "Ubuntu" || base == "Debian"
 }
 
 // affects reports whether version falls inside an `affected` entry, by the
@@ -162,16 +175,22 @@ func (r osvRange) affects(order, version string) (matched bool, unorderable stri
 // have to decide what an unorderable version means to them, because the
 // string comparison this used to fall back to is an ordering only by accident.
 func compareVersions(order, a, b string) (int, bool) {
-	if order == orderPEP440 {
+	switch order {
+	case orderPEP440:
 		return comparePEP440(a, b)
+	case orderDebian:
+		return compareDebian(a, b)
 	}
 	return compareSemver(a, b)
 }
 
 // orderable reports whether an ordering can place a version.
 func orderable(order, v string) bool {
-	if order == orderPEP440 {
+	switch order {
+	case orderPEP440:
 		return parsePEP440(v).ok
+	case orderDebian:
+		return parseDebian(v).ok
 	}
 	return parseSemver(v).ok
 }
@@ -380,6 +399,146 @@ func comparePEP440(a, b string) (int, bool) {
 	}
 	return 0, true
 }
+
+// debianVersion is a distro version string split the way dpkg splits it:
+// [epoch:]upstream_version[-debian_revision], with the three parts compared
+// separately and in that order.
+//
+// The revision is where Ubuntu and Debian carry a backported security fix, and
+// it is the part every other ordering here throws away. semver reads
+// "2.5.0-1+deb12u1" as 2.5.0 with a prerelease and a build tag it discards,
+// making it equal to "2.5.0-1", the revision that does not have the fix.
+type debianVersion struct {
+	epoch    int
+	upstream string
+	revision string
+	ok       bool
+}
+
+// parseDebian splits a version per Debian policy 5.6.12. A version that does
+// not start with a digit, or carries a character the grammar does not allow,
+// is refused rather than guessed at: the matcher reports an unorderable bound
+// instead of walking a range on a comparison that means nothing.
+func parseDebian(v string) debianVersion {
+	s := strings.TrimSpace(v)
+	if s == "" {
+		return debianVersion{}
+	}
+	out := debianVersion{ok: true}
+	if i := strings.IndexByte(s, ':'); i >= 0 {
+		n, err := strconv.Atoi(s[:i])
+		if err != nil || n < 0 {
+			return debianVersion{}
+		}
+		out.epoch = n
+		s = s[i+1:]
+	}
+	// The last hyphen splits the revision off, so an upstream version may
+	// contain one: "1.0-beta-3" is upstream "1.0-beta", revision "3".
+	if i := strings.LastIndexByte(s, '-'); i >= 0 {
+		out.revision = s[i+1:]
+		s = s[:i]
+	}
+	out.upstream = s
+	if s == "" || s[0] < '0' || s[0] > '9' ||
+		!debianChars(out.upstream) || !debianChars(out.revision) {
+		return debianVersion{}
+	}
+	return out
+}
+
+func debianChars(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		case c == '.' || c == '+' || c == '-' || c == '~' || c == ':':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func compareDebian(a, b string) (int, bool) {
+	pa, pb := parseDebian(a), parseDebian(b)
+	if !pa.ok || !pb.ok {
+		return 0, false
+	}
+	if c := compareInt(pa.epoch, pb.epoch); c != 0 {
+		return c, true
+	}
+	if c := compareDebianPart(pa.upstream, pb.upstream); c != 0 {
+		return c, true
+	}
+	return compareDebianPart(pa.revision, pb.revision), true
+}
+
+// debianOrder ranks one byte for dpkg's comparison. `~` sorts below the end of
+// the string, which is what makes 1.0~rc1 older than 1.0; letters sort below
+// every other punctuation mark; and a digit ties with the end of the string,
+// because the digit runs are compared in their own pass.
+func debianOrder(c byte) int {
+	switch {
+	case c >= '0' && c <= '9':
+		return 0
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		return int(c)
+	case c == '~':
+		return -1
+	}
+	return int(c) + 256
+}
+
+// compareDebianPart is dpkg's verrevcmp: alternate between a run of non-digits
+// compared by debianOrder and a run of digits compared numerically, with
+// leading zeros stripped so 1.07 and 1.7 are the same version. Transcribed
+// rather than approximated, because an approximation that gets one pair
+// backwards reports a patched host as vulnerable.
+func compareDebianPart(a, b string) int {
+	i, j := 0, 0
+	for i < len(a) || j < len(b) {
+		firstDiff := 0
+		for (i < len(a) && !isDebianDigit(a[i])) || (j < len(b) && !isDebianDigit(b[j])) {
+			ac, bc := 0, 0
+			if i < len(a) {
+				ac = debianOrder(a[i])
+			}
+			if j < len(b) {
+				bc = debianOrder(b[j])
+			}
+			if ac != bc {
+				return compareInt(ac, bc)
+			}
+			i++
+			j++
+		}
+		for i < len(a) && a[i] == '0' {
+			i++
+		}
+		for j < len(b) && b[j] == '0' {
+			j++
+		}
+		for i < len(a) && isDebianDigit(a[i]) && j < len(b) && isDebianDigit(b[j]) {
+			if firstDiff == 0 {
+				firstDiff = int(a[i]) - int(b[j])
+			}
+			i++
+			j++
+		}
+		switch {
+		case i < len(a) && isDebianDigit(a[i]):
+			return 1
+		case j < len(b) && isDebianDigit(b[j]):
+			return -1
+		case firstDiff != 0:
+			return compareInt(firstDiff, 0)
+		}
+	}
+	return 0
+}
+
+func isDebianDigit(c byte) bool { return c >= '0' && c <= '9' }
 
 // compareInts compares release segments, treating a missing trailing segment
 // as zero so 1.2 and 1.2.0 are the same version.

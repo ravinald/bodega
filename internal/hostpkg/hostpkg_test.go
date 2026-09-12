@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ravinald/bodega/internal/admit"
@@ -329,6 +330,142 @@ func TestNoImporterForGitOrBinary(t *testing.T) {
 		}
 		if !bytes.Contains([]byte(err.Error()), []byte("observe")) {
 			t.Errorf("the error for %q does not point at what does cover it: %v", typ, err)
+		}
+	}
+}
+
+// TestAptRecordsTheSourcePackage covers the fifth dpkg-query field. Ubuntu and
+// Debian advisories are issued against the source package, so an import that
+// drops it leaves the OSV gate querying "libssl3" against an index that only
+// knows "openssl". 73 of this container's 101 packages are in that position.
+func TestAptRecordsTheSourcePackage(t *testing.T) {
+	res, err := ParseApt(fixture(t, "apt-dpkg-query-jammy-source.txt"))
+	if err != nil {
+		t.Fatalf("ParseApt: %v", err)
+	}
+	if got := len(res.Packages); got != 101 {
+		t.Fatalf("imported %d packages, want 101", got)
+	}
+
+	differing := 0
+	for _, pm := range res.Packages {
+		ve := pm.Versions[0]
+		if ve.SourcePackage == "" {
+			t.Fatalf("%s: source_package is empty, but the capture carries one for every row", pm.Name)
+		}
+		if ve.SourceName != pm.Name {
+			t.Fatalf("%s: source_name = %q; 'apt-get download' wants the binary name and must not be repurposed",
+				pm.Name, ve.SourceName)
+		}
+		if ve.SourcePackage != pm.Name {
+			differing++
+		}
+	}
+	if differing != 73 {
+		t.Errorf("counted %d packages whose source differs from their binary name, want 73", differing)
+	}
+
+	for name, want := range map[string]string{
+		"libssl3":       "openssl",
+		"bsdutils":      "util-linux",
+		"libapt-pkg6.0": "apt",
+		"base-files":    "base-files",
+	} {
+		pm := find(res.Packages, name)
+		if pm == nil {
+			t.Fatalf("%s is missing from the import", name)
+		}
+		if got := pm.Versions[0].SourcePackage; got != want {
+			t.Errorf("%s: source_package = %q, want %q", name, got, want)
+		}
+	}
+}
+
+// TestAptSourcePackageIsAppendedNotInserted holds the field's position. dpkg's
+// own ordering would put ${source:Package} second, and that capture parses
+// with no error while dropping every row on the host: the fourth field is then
+// the architecture, which no status test matches. Appending keeps the
+// four-field capture taken before this field existed reading unchanged.
+func TestAptSourcePackageIsAppendedNotInserted(t *testing.T) {
+	appended, err := ParseApt(strings.NewReader(
+		"libexpat1\t2.4.7-1ubuntu0.2\tamd64\tinstall ok installed\texpat\n"))
+	if err != nil {
+		t.Fatalf("appended: %v", err)
+	}
+	if len(appended.Packages) != 1 || appended.Packages[0].Versions[0].SourcePackage != "expat" {
+		t.Fatalf("appended form did not parse: %+v", appended.Packages)
+	}
+
+	legacy, err := ParseApt(strings.NewReader(
+		"libexpat1\t2.4.7-1ubuntu0.2\tamd64\tinstall ok installed\n"))
+	if err != nil {
+		t.Fatalf("four-field: %v", err)
+	}
+	if len(legacy.Packages) != 1 {
+		t.Fatalf("the four-field capture must keep parsing, got %d packages", len(legacy.Packages))
+	}
+	if got := legacy.Packages[0].Versions[0].SourcePackage; got != "" {
+		t.Errorf("a capture that recorded no source must record none, got %q", got)
+	}
+}
+
+func find(pms []manifest.PackageManifest, name string) *manifest.PackageManifest {
+	for i := range pms {
+		if pms[i].Name == name {
+			return &pms[i]
+		}
+	}
+	return nil
+}
+
+// TestAptCaptureRecordsItsRelease is the other half of what an apt capture has
+// to carry. dpkg reports no codename in either format, so the release comes
+// from the host convert runs on, and it is the field that decides which
+// advisories answer for a version: Ubuntu and Debian backport a fix without
+// moving the upstream version, so a noble revision checked against jammy's
+// records matches nothing and dates itself clean.
+func TestAptCaptureRecordsItsRelease(t *testing.T) {
+	const capture = "libexpat1\t2.6.1-2build1\tamd64\tinstall ok installed\texpat\n"
+
+	res, err := ParseAptWithSuite(strings.NewReader(capture), "noble")
+	if err != nil {
+		t.Fatalf("ParseAptWithSuite: %v", err)
+	}
+	if got := res.Packages[0].Versions[0].CaptureSuite; got != "noble" {
+		t.Errorf("capture_suite = %q, want noble", got)
+	}
+	// Not the publishing field. A server whose apt_codename is a house name
+	// serves no suite a captured host could have named, so a release written
+	// into Suites takes the entry out of every generated index.
+	if got := res.Packages[0].Versions[0].Suites; len(got) != 0 {
+		t.Errorf("suites = %v, want none: the release is provenance, not placement", got)
+	}
+
+	// A capture with no release recorded must record none. The OSV gate warns
+	// on that entry rather than guessing, which is the honest answer; a
+	// codename picked here would be one nothing chose.
+	none, err := ParseApt(strings.NewReader(capture))
+	if err != nil {
+		t.Fatalf("ParseApt: %v", err)
+	}
+	if got := none.Packages[0].Versions[0].CaptureSuite; got != "" {
+		t.Errorf("capture_suite = %q, want none", got)
+	}
+	if blank, err := ParseAptWithSuite(strings.NewReader(capture), "  "); err != nil {
+		t.Fatalf("ParseAptWithSuite: %v", err)
+	} else if got := blank.Packages[0].Versions[0].CaptureSuite; got != "" {
+		t.Errorf("whitespace recorded capture_suite = %q, want none", got)
+	}
+
+	// Every row, not the first: a host inventory is a thousand packages and
+	// one release.
+	all, err := ParseAptWithSuite(fixture(t, "apt-dpkg-query-jammy-source.txt"), "jammy")
+	if err != nil {
+		t.Fatalf("ParseAptWithSuite: %v", err)
+	}
+	for _, pm := range all.Packages {
+		if got := pm.Versions[0].CaptureSuite; got != "jammy" {
+			t.Fatalf("%s: capture_suite = %q, want jammy", pm.Name, got)
 		}
 	}
 }

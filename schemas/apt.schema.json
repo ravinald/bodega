@@ -28,7 +28,16 @@
           },
           "source_name": {
             "type": "string",
-            "description": "Upstream package or directory name. Defaults to name when absent."
+            "description": "Upstream package or directory name. Defaults to name when absent. This is the name 'apt-get download' asks for, so it is the binary package name."
+          },
+          "source_package": {
+            "type": "string",
+            "description": "Debian source package this binary was built from, as dpkg reports it in ${source:Package}. Read by the OSV gate, because Ubuntu and Debian advisories are issued against the source. Absent means no capture recorded one, which is not the same as equal to name."
+          },
+          "capture_suite": {
+            "type": "string",
+            "description": "Release the host this version was captured on was running, as 'bodega pkg convert apt' records it from --suite or /etc/os-release. Read by the OSV gate, which keys a distro advisory on the release because Ubuntu and Debian backport a fix without moving the upstream version. Ignored by the index generator: suites decides where the .deb is published, and on a server whose apt_codename is a local name the two are different values.",
+            "pattern": "^[^/]*$"
           },
           "url": {
             "type": "string",

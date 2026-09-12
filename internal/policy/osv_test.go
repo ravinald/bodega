@@ -1,10 +1,12 @@
 package policy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/ravinald/bodega/internal/audit"
@@ -56,16 +58,16 @@ func TestOSVPolicy_NoPolicy(t *testing.T) {
 }
 
 func TestOSVPolicy_UnsupportedEcosystem(t *testing.T) {
-	// apt has no OSV mapping; short-circuit even with a policy row.
+	// git has no OSV mapping; short-circuit even with a policy row.
 	store := &fakeOSVStore{policies: map[string]audit.OSVPolicy{
-		manifest.TypeApt: {Ecosystem: manifest.TypeApt, Action: ActionBlock},
+		manifest.TypeGit: {Ecosystem: manifest.TypeGit, Action: ActionBlock},
 	}}
 	ck := NewOSVChecker(store)
 	r := ck.Check(context.Background(),
-		&manifest.PackageManifest{Name: "bash", Type: manifest.TypeApt},
-		&manifest.VersionEntry{Version: "5.2"})
+		&manifest.PackageManifest{Name: "netbox", Type: manifest.TypeGit},
+		&manifest.VersionEntry{Version: "v4.5.7"})
 	if r.Action != ActionPass {
-		t.Errorf("apt not in osvEcosystemFor; expected pass, got %+v", r)
+		t.Errorf("git not in osvEcosystemFor; expected pass, got %+v", r)
 	}
 }
 
@@ -185,7 +187,7 @@ func TestOSVPolicy_CargoVulnerableVersion(t *testing.T) {
 }
 
 func TestOSVEcosystems_CoversCargo(t *testing.T) {
-	want := []string{manifest.TypeCargo, manifest.TypeGomod, manifest.TypeNpm, manifest.TypePypi}
+	want := []string{manifest.TypeApt, manifest.TypeCargo, manifest.TypeGomod, manifest.TypeNpm, manifest.TypePypi}
 	got := OSVEcosystems()
 	if len(got) != len(want) {
 		t.Fatalf("OSVEcosystems() = %v, want %v", got, want)
@@ -250,5 +252,56 @@ func TestOSVPolicy_SeverityStampedPerRecord(t *testing.T) {
 	}
 	if ve.Metadata["vetting.osv.vulns"] != "GHSA-high,GHSA-low,GHSA-unscored" {
 		t.Errorf("ids must still list every record: %q", ve.Metadata["vetting.osv.vulns"])
+	}
+}
+
+// TestOSVQuery_DistroResponsesExceedTheLanguageCap pins the API fallback's
+// body limit on both sides.
+//
+// The 4 MiB cap was sized for the language ecosystems. A USN enumerates every
+// version it covers, so a distro query runs an order of magnitude past it:
+// measured 2026-09-11, linux 5.15.0-91.101 in Ubuntu:22.04:LTS answers with
+// 32.8 MB. Under the old cap the body was truncated and the operator read
+// "parse osv response: unexpected end of JSON input", which names nothing they
+// can act on.
+func TestOSVQuery_DistroResponsesExceedTheLanguageCap(t *testing.T) {
+	// Padding rides in a summary so the response stays valid JSON at any size.
+	padded := func(n int) http.HandlerFunc {
+		return func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"vulns":[{"id":"USN-0000-1","summary":"`))
+			chunk := bytes.Repeat([]byte("x"), 64<<10)
+			for written := 0; written < n; written += len(chunk) {
+				_, _ = w.Write(chunk)
+			}
+			_, _ = w.Write([]byte(`"}]}`))
+		}
+	}
+
+	srv := httptest.NewServer(padded(6 << 20))
+	defer srv.Close()
+	ck := NewOSVChecker(&fakeOSVStore{})
+	ck.Endpoint = srv.URL
+
+	vulns, err := ck.query(context.Background(), "Ubuntu:22.04:LTS", "linux", "5.15.0-91.101")
+	if err != nil {
+		t.Fatalf("a 6 MiB distro response is inside the cap: %v", err)
+	}
+	if len(vulns) != 1 || vulns[0].ID != "USN-0000-1" {
+		t.Fatalf("got %v", vulnIDs(vulns))
+	}
+
+	// Past the cap the reason names the cap. Anything else sends the operator
+	// after an upstream JSON defect that is not there.
+	_, err = ck.query(context.Background(), "npm", "lodash", "4.17.4")
+	if err == nil {
+		t.Fatal("a 6 MiB response is past the 4 MiB language cap")
+	}
+	if !strings.Contains(err.Error(), "larger than the 4 MiB cap") {
+		t.Errorf("the error must name the cap rather than blaming the JSON: %v", err)
+	}
+
+	if got, want := osvAPIBodyLimit("Ubuntu:22.04:LTS"), int64(64<<20); got != want {
+		t.Errorf("osvAPIBodyLimit(distro) = %d, want %d", got, want)
 	}
 }

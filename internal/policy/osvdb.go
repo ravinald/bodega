@@ -150,53 +150,122 @@ func (d *OSVDatabase) Dir() string {
 	return d.dir
 }
 
+// OSVSyncResult is one ecosystem's outcome from a sync run. Ecosystems that
+// share an export share its failure: a download that never arrived is one
+// error, reported against every ecosystem that was waiting on it.
+type OSVSyncResult struct {
+	Ecosystem string
+	Meta      OSVDBMeta
+	Err       error
+}
+
 // Sync downloads one ecosystem's export, distills it and replaces what the
-// directory holds for that ecosystem. The archive is written under a temporary
-// name and renamed, so an interrupted sync leaves the previous copy in place
-// rather than a half-written one the matcher would read as truth.
+// directory holds for that ecosystem.
 func (d *OSVDatabase) Sync(ctx context.Context, ecosystem string) (OSVDBMeta, error) {
-	if d == nil {
-		return OSVDBMeta{}, errors.New("no OSV database directory configured (set osv_db_dir)")
+	res := d.SyncGroup(ctx, []string{ecosystem})
+	if len(res) == 0 {
+		return OSVDBMeta{}, fmt.Errorf("invalid OSV ecosystem %q", ecosystem)
 	}
-	if err := validEcosystemFile(ecosystem); err != nil {
-		return OSVDBMeta{}, err
+	return res[0].Meta, res[0].Err
+}
+
+// SyncGroup downloads each export once and writes an index per ecosystem
+// distilled from it, in the order given. Several ecosystems can share one
+// export (every Ubuntu release is distilled out of Ubuntu/all.zip), so
+// fetching per ecosystem would pull 681 MB once per release.
+//
+// Each archive is written under a temporary name and renamed, so an
+// interrupted sync leaves the previous copy in place rather than a
+// half-written one the matcher would read as truth.
+func (d *OSVDatabase) SyncGroup(ctx context.Context, ecosystems []string) []OSVSyncResult {
+	out := make([]OSVSyncResult, 0, len(ecosystems))
+	fail := func(eco string, err error) { out = append(out, OSVSyncResult{Ecosystem: eco, Err: err}) }
+	if d == nil {
+		for _, eco := range ecosystems {
+			fail(eco, errors.New("no OSV database directory configured (set osv_db_dir)"))
+		}
+		return out
 	}
 	if err := os.MkdirAll(d.dir, 0o755); err != nil {
-		return OSVDBMeta{}, fmt.Errorf("create %s: %w", d.dir, err)
+		for _, eco := range ecosystems {
+			fail(eco, fmt.Errorf("create %s: %w", d.dir, err))
+		}
+		return out
 	}
 
-	src := fmt.Sprintf("%s/%s/all.zip", strings.TrimSuffix(d.ExportBase, "/"), ecosystem)
-	zipPath, err := d.download(ctx, src)
-	if err != nil {
-		return OSVDBMeta{}, err
+	// Group by export, preserving the caller's order within each group so the
+	// report reads the way the command was written.
+	bySource := map[string][]string{}
+	var sources []string
+	for _, eco := range ecosystems {
+		if err := validEcosystemFile(eco); err != nil {
+			fail(eco, err)
+			continue
+		}
+		src := OSVExportSource(eco)
+		if _, seen := bySource[src]; !seen {
+			sources = append(sources, src)
+		}
+		bySource[src] = append(bySource[src], eco)
 	}
-	defer os.Remove(zipPath)
 
-	idx, records, err := distill(ecosystem, zipPath)
-	if err != nil {
-		return OSVDBMeta{}, err
+	for _, source := range sources {
+		group := bySource[source]
+		src := fmt.Sprintf("%s/%s/all.zip", strings.TrimSuffix(d.ExportBase, "/"), source)
+		zipPath, err := d.download(ctx, src)
+		if err != nil {
+			for _, eco := range group {
+				fail(eco, err)
+			}
+			continue
+		}
+		indexes, records, err := distill(group, zipPath)
+		os.Remove(zipPath)
+		if err != nil {
+			for _, eco := range group {
+				fail(eco, err)
+			}
+			continue
+		}
+		fetchedAt := time.Now().UTC()
+		for _, eco := range group {
+			idx := indexes[eco]
+			// An export that distills to nothing would be written with a
+			// current fetch time, and the gate would then report every
+			// version of every package in the ecosystem clean, inside the
+			// max-age window, forever. That is the one failure shape the
+			// warn-on-missing rule exists to prevent, so a sync that produced
+			// no index fails instead of replacing a working copy.
+			if idx == nil || len(idx.Packages) == 0 {
+				fail(eco, fmt.Errorf("%s yielded no packages for ecosystem %q (%d advisory record(s) named it); refusing to write a database that would report every version clean",
+					src, eco, records[eco]))
+				continue
+			}
+			idx.FetchedAt = fetchedAt
+			n, err := d.writeIndex(eco, idx)
+			if err != nil {
+				fail(eco, err)
+				continue
+			}
+			meta := OSVDBMeta{
+				Ecosystem: eco,
+				Source:    src,
+				FetchedAt: fetchedAt,
+				Records:   records[eco],
+				Packages:  len(idx.Packages),
+				Bytes:     n,
+			}
+			if err := d.writeMeta(meta); err != nil {
+				fail(eco, err)
+				continue
+			}
+			d.mu.Lock()
+			delete(d.loaded, eco)
+			d.mu.Unlock()
+			out = append(out, OSVSyncResult{Ecosystem: eco, Meta: meta})
+		}
 	}
-	idx.FetchedAt = time.Now().UTC()
-
-	n, err := d.writeIndex(ecosystem, idx)
-	if err != nil {
-		return OSVDBMeta{}, err
-	}
-	meta := OSVDBMeta{
-		Ecosystem: ecosystem,
-		Source:    src,
-		FetchedAt: idx.FetchedAt,
-		Records:   records,
-		Packages:  len(idx.Packages),
-		Bytes:     n,
-	}
-	if err := d.writeMeta(meta); err != nil {
-		return OSVDBMeta{}, err
-	}
-	d.mu.Lock()
-	delete(d.loaded, ecosystem)
-	d.mu.Unlock()
-	return meta, nil
+	return out
 }
 
 // Meta reads what the last sync recorded for an ecosystem. It returns
@@ -347,30 +416,40 @@ func (d *OSVDatabase) download(ctx context.Context, src string) (string, error) 
 	return tmp.Name(), nil
 }
 
-// distill reads the export and keeps only what a verdict needs: the records
-// that name a package in this ecosystem, grouped by package.
+// distill reads the export once and keeps only what a verdict needs: the
+// records that name a package in each requested ecosystem, grouped by package.
+//
+// Several ecosystems come out of one archive. OSV stopped writing the
+// per-release Ubuntu and Debian exports in October 2024 and kept rebuilding
+// the aggregate daily, so the release a record applies to is read out of the
+// `affected` entry's own ecosystem string rather than out of the URL it was
+// fetched from. See OSVExportSource.
 //
 // Withdrawn records are dropped, which is one deliberate divergence from
 // api.osv.dev: it still returns some of them (PYSEC-2024-115, retracted in
 // July 2026, comes back on a langchain-community query) and filters others.
 // A retracted advisory blocking an import is a false positive the operator
 // cannot clear, so the local database does not carry them.
-func distill(ecosystem, zipPath string) (*osvIndex, int, error) {
+func distill(ecosystems []string, zipPath string) (map[string]*osvIndex, map[string]int, error) {
 	zr, err := zip.OpenReader(zipPath)
 	if err != nil {
-		return nil, 0, fmt.Errorf("read %s: %w", zipPath, err)
+		return nil, nil, fmt.Errorf("read %s: %w", zipPath, err)
 	}
 	defer func() { _ = zr.Close() }()
 
-	idx := &osvIndex{Ecosystem: ecosystem, Packages: map[string][]osvRecord{}}
-	records := 0
+	indexes := make(map[string]*osvIndex, len(ecosystems))
+	records := make(map[string]int, len(ecosystems))
+	for _, eco := range ecosystems {
+		indexes[eco] = &osvIndex{Ecosystem: eco, Packages: map[string][]osvRecord{}}
+	}
+
 	for _, entry := range zr.File {
 		if !strings.HasSuffix(entry.Name, ".json") {
 			continue
 		}
 		rc, err := entry.Open()
 		if err != nil {
-			return nil, 0, fmt.Errorf("read %s in %s: %w", entry.Name, zipPath, err)
+			return nil, nil, fmt.Errorf("read %s in %s: %w", entry.Name, zipPath, err)
 		}
 		var raw struct {
 			ID        string        `json:"id"`
@@ -389,20 +468,18 @@ func distill(ecosystem, zipPath string) (*osvIndex, int, error) {
 		err = json.NewDecoder(rc).Decode(&raw)
 		rc.Close()
 		if err != nil {
-			return nil, 0, fmt.Errorf("parse %s in %s: %w", entry.Name, zipPath, err)
+			return nil, nil, fmt.Errorf("parse %s in %s: %w", entry.Name, zipPath, err)
 		}
 		if raw.ID == "" || raw.Withdrawn != "" {
 			continue
 		}
-		records++
 
-		// One record can name several packages; each gets its own entry
-		// holding only the ranges that apply to it.
-		byPackage := map[string][]osvAffected{}
+		// One record can name several packages and several ecosystems; each
+		// gets its own entry holding only the ranges that apply to it.
+		byEcosystem := map[string]map[string][]osvAffected{}
 		for _, aff := range raw.Affected {
-			// An OSV ecosystem string can carry a suffix ("Debian:12",
-			// "Alpine:v3.19"); the part before the colon is the ecosystem.
-			if eco, _, _ := strings.Cut(aff.Package.Ecosystem, ":"); eco != ecosystem {
+			eco := distillEcosystem(ecosystems, aff.Package.Ecosystem)
+			if eco == "" {
 				continue
 			}
 			var ranges []osvRange
@@ -415,25 +492,65 @@ func distill(ecosystem, zipPath string) (*osvIndex, int, error) {
 			if len(aff.Versions) == 0 && len(ranges) == 0 {
 				continue
 			}
-			key := osvPackageKey(ecosystem, aff.Package.Name)
-			byPackage[key] = append(byPackage[key], osvAffected{Versions: aff.Versions, Ranges: ranges})
+			if byEcosystem[eco] == nil {
+				byEcosystem[eco] = map[string][]osvAffected{}
+			}
+			key := osvPackageKey(eco, aff.Package.Name)
+			byEcosystem[eco][key] = append(byEcosystem[eco][key], osvAffected{Versions: aff.Versions, Ranges: ranges})
 		}
-		for key, affected := range byPackage {
-			idx.Packages[key] = append(idx.Packages[key], osvRecord{
-				ID: raw.ID, Summary: raw.Summary, Severity: raw.Severity, Affected: affected,
-			})
+		for eco, byPackage := range byEcosystem {
+			records[eco]++
+			for key, affected := range byPackage {
+				indexes[eco].Packages[key] = append(indexes[eco].Packages[key], osvRecord{
+					ID: raw.ID, Summary: raw.Summary, Severity: raw.Severity, Affected: affected,
+				})
+			}
 		}
 	}
-	// An export that distills to nothing would be written with a current fetch
-	// time, and the gate would then report every version of every package in
-	// the ecosystem clean, inside the max-age window, forever. That is the one
-	// failure shape the warn-on-missing rule exists to prevent, so a sync that
-	// produced no index fails instead of replacing a working copy.
-	if len(idx.Packages) == 0 {
-		return nil, 0, fmt.Errorf("the %s export yielded no packages (%d file(s) in the archive, %d advisory record(s)); refusing to write a database that would report every version clean",
-			ecosystem, len(zr.File), records)
+	return indexes, records, nil
+}
+
+// distillEcosystem picks which requested ecosystem an `affected` entry belongs
+// to, or "" for one nothing asked about.
+//
+// An OSV ecosystem string can carry a release suffix ("Debian:12",
+// "Alpine:v3.19"). A language ecosystem is requested under the bare name and
+// takes everything under it; a distro release is requested in full and takes
+// only its own release, because folding every Ubuntu release into one index
+// would answer a jammy host with advisories that are not about it.
+//
+// Its own release is two strings, not one: see ubuntuProEcosystem.
+func distillEcosystem(ecosystems []string, recorded string) string {
+	base, _, _ := strings.Cut(recorded, ":")
+	for _, eco := range ecosystems {
+		if recorded == eco || base == eco || recorded == ubuntuProEcosystem(eco) {
+			return eco
+		}
 	}
-	return idx, records, nil
+	return ""
+}
+
+// ubuntuProEcosystem is the second string OSV files one Ubuntu release's
+// advisories under, or "" for an ecosystem that has none.
+//
+// OSV splits a release across Ubuntu:22.04:LTS, which carries main, and
+// Ubuntu:Pro:22.04:LTS, which carries universe and on the ESM releases very
+// nearly everything. The two sets are disjoint, so an index built from the
+// first alone answers a jammy imagemagick with 4 records where 183 exist, and a
+// xenial expat with none at all. Both halves are about the same host and both
+// name stock revisions as their fixed versions, so they belong in one index.
+//
+// Matched as an exact pair and never as a prefix. OSV also publishes
+// Ubuntu:Pro:FIPS-preview:<rel>, Ubuntu:Pro:FIPS-updates:<rel>,
+// Ubuntu:Pro:Realtime:<rel> and Ubuntu:Nvidia-BlueField:<rel>, each carrying
+// revisions of a build a stock host never installed: a prefix match reports
+// those against a host running the stock package.
+func ubuntuProEcosystem(ecosystem string) string {
+	rel, found := strings.CutPrefix(ecosystem, "Ubuntu:")
+	if !found {
+		return ""
+	}
+	return "Ubuntu:Pro:" + rel
 }
 
 func (d *OSVDatabase) writeIndex(ecosystem string, idx *osvIndex) (int64, error) {
@@ -480,11 +597,22 @@ func (d *OSVDatabase) writeMeta(meta OSVDBMeta) error {
 }
 
 func (d *OSVDatabase) indexPath(ecosystem string) string {
-	return filepath.Join(d.dir, ecosystem+".json.gz")
+	return filepath.Join(d.dir, OSVEcosystemFile(ecosystem)+".json.gz")
 }
 
 func (d *OSVDatabase) metaPath(ecosystem string) string {
-	return filepath.Join(d.dir, ecosystem+".meta.json")
+	return filepath.Join(d.dir, OSVEcosystemFile(ecosystem)+".meta.json")
+}
+
+// OSVEcosystemFile is the base name an ecosystem's archive and metadata are
+// written under. OSV's per-release distro ecosystems carry colons
+// ("Ubuntu:22.04:LTS"), and a filename does not have to: the air-gapped
+// runbook copies this directory between hosts with whatever archiver is to
+// hand, and a colon in a member name is where that copy stops being portable.
+// The language ecosystems have no colon, so their files keep the names an
+// earlier sync wrote.
+func OSVEcosystemFile(ecosystem string) string {
+	return strings.ReplaceAll(ecosystem, ":", "-")
 }
 
 // validEcosystemFile refuses an ecosystem name that would escape the database
