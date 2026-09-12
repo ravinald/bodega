@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"github.com/ravinald/bodega/internal/aptsign"
 	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/deb822"
 	"github.com/ravinald/bodega/internal/entitle"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -34,22 +36,35 @@ const (
 	// nginx-common share a source and are the requirement-3 case: a profile
 	// listing the source has to carry both, because a set closed on binary
 	// names fires the first time Ubuntu splits one.
-	profileNginxDeb       = "pool/main/n/nginx/nginx_1.24.0-2ubuntu7.1_amd64.deb"
-	profileNginxCommonDeb = "pool/main/n/nginx/nginx-common_1.24.0-2ubuntu7.1_amd64.deb"
+	profileNginxDeb = "pool/main/n/nginx/nginx_1.24.0-2ubuntu7.1_amd64.deb"
+	// A binNMU: source nginx at 1.24.0-2ubuntu7.1 shipping this binary at
+	// +b1. Ubuntu produces one on every no-change rebuild, and it is the one
+	// shape where the version on the paragraph is not the version a pin
+	// written against the source names.
+	profileNginxCommonDeb = "pool/main/n/nginx/nginx-common_1.24.0-2ubuntu7.1+b1_amd64.deb"
 	profileHtopDeb        = "pool/main/h/htop/htop_3.3.0-4build1_amd64.deb"
+
+	// The source version every stanza here derives from, and what an operator
+	// pinning nginx reads off the source record.
+	profileNginxVersion = "1.24.0-2ubuntu7.1"
 )
 
 // aptProfilePackages is the upstream index the filter runs over: two binaries
-// from source nginx and one from source htop.
+// from source nginx and one from source htop, with nginx depending on the
+// package outside the baseline that requirement 4 rests on.
 func aptProfilePackages() string {
-	stanza := func(pkg, source, version, poolPath, desc string) string {
+	stanza := func(pkg, source, version, depends, poolPath, desc string) string {
 		lines := []string{"Package: " + pkg}
 		if source != "" {
 			lines = append(lines, "Source: "+source)
 		}
 		lines = append(lines,
 			"Version: "+version,
-			"Architecture: amd64",
+			"Architecture: amd64")
+		if depends != "" {
+			lines = append(lines, "Depends: "+depends)
+		}
+		lines = append(lines,
 			"Filename: "+poolPath,
 			"Size: 42",
 			"SHA256: 0000000000000000000000000000000000000000000000000000000000000000",
@@ -60,9 +75,9 @@ func aptProfilePackages() string {
 			"", "")
 		return strings.Join(lines, "\n")
 	}
-	return stanza("nginx", "", "1.24.0-2ubuntu7.1", profileNginxDeb, "fixture web server") +
-		stanza("nginx-common", "nginx (1.24.0-2ubuntu7.1)", "1.24.0-2ubuntu7.1", profileNginxCommonDeb, "fixture web server common files") +
-		stanza("htop", "", "3.3.0-4build1", profileHtopDeb, "fixture process viewer")
+	return stanza("nginx", "", profileNginxVersion, "htop", profileNginxDeb, "fixture web server") +
+		stanza("nginx-common", "nginx ("+profileNginxVersion+")", profileNginxVersion+"+b1", "", profileNginxCommonDeb, "fixture web server common files") +
+		stanza("htop", "", "3.3.0-4build1", "", profileHtopDeb, "fixture process viewer")
 }
 
 // aptProfileServer is a mirroring server with a bodega signing key installed,
@@ -70,6 +85,18 @@ func aptProfilePackages() string {
 // generated suite with no key serves an unsigned Release that Signed-By: on
 // the client would then refuse.
 func aptProfileServer(t *testing.T) (*Server, *fixtureArchive) {
+	t.Helper()
+	return aptProfileServerWith(t, "amd64", aptProfilePackages(), map[string]string{
+		profileNginxDeb:       "\x21<arch>\nnginx bytes",
+		profileNginxCommonDeb: "\x21<arch>\nnginx-common bytes",
+		profileHtopDeb:        "\x21<arch>\nhtop bytes",
+	})
+}
+
+// aptProfileServerWith is aptProfileServer over an archive the caller supplies,
+// for the test that builds its index and its .debs with dpkg rather than
+// writing them out by hand.
+func aptProfileServerWith(t *testing.T, arch, packages string, pool map[string]string) (*Server, *fixtureArchive) {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv(aptsign.CredentialsEnv, dir)
@@ -85,10 +112,10 @@ func aptProfileServer(t *testing.T) (*Server, *fixtureArchive) {
 	if err != nil {
 		t.Fatalf("generate upstream key: %v", err)
 	}
-	objects := fixtureDists(t, upstreamKR, aptProfilePackages())
-	objects[profileNginxDeb] = "\x21<arch>\nnginx bytes"
-	objects[profileNginxCommonDeb] = "\x21<arch>\nnginx-common bytes"
-	objects[profileHtopDeb] = "\x21<arch>\nhtop bytes"
+	objects := fixtureDistsArch(t, upstreamKR, packages, arch)
+	for rel, body := range pool {
+		objects[rel] = body
+	}
 
 	archive := newFixtureArchive(t, objects)
 	s := mirrorServer(t, archive)
@@ -102,8 +129,15 @@ func aptProfileServer(t *testing.T) (*Server, *fixtureArchive) {
 // and rebuilds the index, which is when a filtered codename comes into being.
 func aptProfileBind(t *testing.T, s *Server, name string, expansion string, packages ...string) *profileFixture {
 	t.Helper()
+	return aptProfileBindBase(t, s, name, mirroredCodename, expansion, packages...)
+}
+
+// aptProfileBindBase is aptProfileBind with the base named, for the cases
+// where which upstream suite a profile derives from is what is under test.
+func aptProfileBindBase(t *testing.T, s *Server, name, base, expansion string, packages ...string) *profileFixture {
+	t.Helper()
 	rule := closedRule(manifest.TypeApt, audit.VersionFloating, expansion)
-	rule.AptBase = mirroredCodename
+	rule.AptBase = base
 	entries := make([]audit.ProfileEntry, 0, len(packages))
 	for _, p := range packages {
 		entries = append(entries, audit.ProfileEntry{Type: manifest.TypeApt, Name: p})
@@ -425,15 +459,133 @@ func TestFilterKeepsASourcesBinariesAndDropsTheRest(t *testing.T) {
 		}},
 		Entries: []audit.ProfileEntry{{Type: manifest.TypeApt, Name: "nginx"}},
 	}
-	out, kept, dropped := filterAptPackages([]byte(aptProfilePackages()), entitle.New(d))
+	out, kept, dropped, err := filterAptPackages([]byte(aptProfilePackages()), entitle.New(d))
+	if err != nil {
+		t.Fatalf("filter a well-formed index: %v", err)
+	}
 	if kept != 2 || dropped != 1 {
 		t.Errorf("kept/dropped = %d/%d, want 2/1", kept, dropped)
 	}
-	if strings.Contains(string(out), "htop") {
+	// Package:, not a bare "htop": the kept nginx paragraph names htop in its
+	// Depends:, which the filter leaves alone for apt to fail to resolve.
+	if strings.Contains(string(out), "Package: htop") {
 		t.Errorf("filtered output carries a package outside the set:\n%s", out)
 	}
 	if !strings.Contains(string(out), "Package: nginx-common") {
 		t.Errorf("filtered output dropped a binary of a source the profile lists:\n%s", out)
+	}
+}
+
+// Requirement 4 and 8's second case, on the document. The apt-visible outcome
+// is TestRealAptHoldsBackTheDependentPackage, which drives a real apt under
+// the apt_integration tag; this is the cheap half, and it is the assertion
+// that fails the day the filter starts pulling a dependency in behind the
+// profile's back rather than leaving apt to hold the dependent package.
+func TestADependencyOutsideTheBaselineIsFilteredOut(t *testing.T) {
+	s, _ := aptProfileServer(t)
+	aptProfileBind(t, s, "web", audit.ExpansionBlock, "nginx")
+
+	index := aptProfileIndex(t, s, "fixture-web")
+	if !strings.Contains(index, "\nDepends: htop\n") {
+		t.Errorf("the dependent paragraph lost its Depends:, so the filter rewrote a dependency rather than leaving it for apt to resolve:\n%s", index)
+	}
+	if strings.Contains(index, "Package: htop") {
+		t.Errorf("the filtered index offers the dependency the profile does not list, so apt installs it instead of holding nginx back:\n%s", index)
+	}
+	if !strings.Contains(index, "Package: nginx-common") {
+		t.Errorf("the package with no dependency outside the baseline was dropped too, which is the whole upgrade failing rather than one package held:\n%s", index)
+	}
+}
+
+// Requirement 1 has one derivation per profile, and ProfileAptCodename joins
+// two names that each carry hyphens: "security-web" over noble and "web" over
+// noble-security both derive noble-security-web. Serving one of them hands the
+// other profile's hosts an index filtered for a set they are not in, and the
+// 403 arrives at the pool mid-transaction, which is what this file exists to
+// avoid. Neither is served, and the log names the rename that fixes it.
+func TestTwoProfilesDerivingOneCodenameServeNeither(t *testing.T) {
+	s, archive := aptProfileServer(t)
+	var logged bytes.Buffer
+	s.logger = slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelError}))
+	s.cfg.AptUpstreams["fixture-a"] = []config.AptUpstream{{URL: archive.URL()}}
+
+	aptProfileBindBase(t, s, "a-b", mirroredCodename, audit.ExpansionBlock, "nginx")
+	aptProfileBindBase(t, s, "b", "fixture-a", audit.ExpansionBlock, "htop")
+
+	if names, _ := s.aptFilteredSuites(); len(names) != 0 {
+		t.Errorf("filtered codenames = %v, want none: one of the two profiles is being served the other's filter", names)
+	}
+	if code, _ := mirrorGet(t, s, "/apt/dists/fixture-a-b/InRelease"); code != http.StatusNotFound {
+		t.Errorf("GET the colliding codename = %d, want 404", code)
+	}
+	for _, want := range []string{"fixture-a-b", "a-b over fixture", "b over fixture-a"} {
+		if !strings.Contains(logged.String(), want) {
+			t.Errorf("the log does not name %q, so an operator reading it cannot tell which two profiles to rename:\n%s", want, logged.String())
+		}
+	}
+}
+
+// A truncated index is the failure mode this file's opening paragraph calls
+// worse than no control: every package past the break is reported to the fleet
+// as kept back, and the counts read exactly like a correct run of a shorter
+// index. The codename is withdrawn instead, which fails apt update on the line
+// the operator installed.
+func TestAMalformedParagraphWithdrawsTheCodenameRatherThanTruncatingIt(t *testing.T) {
+	s, archive := aptProfileServer(t)
+	aptProfileBind(t, s, "all", audit.ExpansionBlock, "nginx", "htop")
+	if index := aptProfileIndex(t, s, "fixture-all"); !strings.Contains(index, "Package: htop") {
+		t.Fatalf("the profile lists every source and its index is already short:\n%s", index)
+	}
+
+	// An orphan continuation line ahead of the last stanza: ParseStreamRaw
+	// stops there, so a filter that returned what it had would drop htop and
+	// log kept=2 dropped=1, which is what a correct filter of this fixture
+	// logs for the profile that lists nginx alone.
+	good := aptProfilePackages()
+	broken := strings.Replace(good, "Package: htop", " orphan continuation\nPackage: htop", 1)
+	if broken == good {
+		t.Fatal("the fixture no longer carries the stanza this test corrupts")
+	}
+	kr, err := aptsign.Generate("fixture archive", "archive@fixture.invalid", aptsign.KeyEd25519)
+	if err != nil {
+		t.Fatalf("generate upstream key: %v", err)
+	}
+	for rel, body := range fixtureDists(t, kr, broken) {
+		archive.setObject(rel, body)
+	}
+	// The upstream documents are cached for metadata_ttl, and this is the same
+	// rebuild from apt's point of view.
+	s.cache.MetadataTTL = 0
+	s.rebuildAptSnapshot(context.Background())
+
+	code, body := mirrorGet(t, s, "/apt/dists/fixture-all/main/binary-amd64/Packages")
+	if code == http.StatusOK && !strings.Contains(string(body), "Package: htop") {
+		t.Fatalf("a truncated index was signed and served: htop is absent from a document bodega vouches for, with no error anywhere:\n%s", body)
+	}
+	if code != http.StatusNotFound {
+		t.Errorf("GET the filtered Packages after an unparsable upstream = %d, want 404", code)
+	}
+}
+
+// The membership closed over the source, so the version compared has to be the
+// source's too. A binNMU ships nginx-common at +b1 out of source nginx at the
+// version the operator pinned; judged on the paragraph's own Version: it is
+// dropped, and nginx is kept beside it — an uninstallable package, for a
+// reason the operator cannot find in the pin they wrote.
+func TestAnExactPinOnTheSourceKeepsItsBinNMUBinary(t *testing.T) {
+	s, _ := aptProfileServer(t)
+	rule := closedRule(manifest.TypeApt, audit.VersionFloating, audit.ExpansionBlock)
+	rule.AptBase = mirroredCodename
+	bindProfile(t, s, "pinned", "pinned-host", []audit.ProfileTypeRule{rule}, []audit.ProfileEntry{
+		{Type: manifest.TypeApt, Name: "nginx", Constraint: manifest.ConstraintExact, Version: profileNginxVersion},
+	})
+	s.rebuildAptSnapshot(context.Background())
+
+	index := aptProfileIndex(t, s, "fixture-pinned")
+	for _, want := range []string{"Package: nginx\n", "Package: nginx-common\n"} {
+		if !strings.Contains(index, want) {
+			t.Errorf("the pin on source nginx at %s dropped %q, which is the binNMU of that same source:\n%s", profileNginxVersion, want, index)
+		}
 	}
 }
 

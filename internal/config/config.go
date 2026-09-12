@@ -1539,7 +1539,7 @@ func defaultConfigContent() []byte {
   "apt_suites": ["noble"],
 
   "_comment_apt_upstreams": "apt_upstreams: codenames mirrored from an upstream archive instead of generated, e.g. {\"noble\": [{\"url\": \"https://archive.ubuntu.com/ubuntu\"}, {\"url\": \"https://security.ubuntu.com/ubuntu\"}]}. bodega proxies the upstream dists/ tree unchanged, signature included, so clients verify against the distro keyring they already have and need no [trusted=yes]. Empty means every codename is generated, which is what every install without this key does.",
-  "_comment_apt_upstreams_disjoint": "A codename may not appear in both apt_suites and apt_upstreams — bodega signs one and forwards the other's signature, and a shared name would serve an index whose digests do not cover the packages beside it. Mirrored suites need names of their own.",
+  "_comment_apt_upstreams_disjoint": "A codename may not appear in both apt_suites and apt_upstreams — bodega signs one and forwards the other's signature, and a shared name would serve an index whose digests do not cover the packages beside it. A mirrored codename needs a name of its own.",
   "_comment_apt_upstreams_pool": "/apt/pool/ carries no codename, so a .deb is resolved by probing every configured archive in sorted order and remembering which one answered. There is no per-package allow-list for apt: constrain it with 'bodega policy add apt <host>'.",
   "apt_upstreams": {},
 

@@ -842,7 +842,7 @@ type aptStatus struct {
 	Sources       []aptsources.Sources `json:"sources"`
 
 	// Filtered names the codenames generated from a profile's view of a
-	// mirrored suite, in sorted order. They are generated suites in every way
+	// mirrored codename, in sorted order. They are generated suites in every way
 	// that matters to a client — bodega's key signs them and Signed-By: goes
 	// on the line — and separate from Suites because nothing in apt_suites
 	// produced them and an operator reading the config would not find them.

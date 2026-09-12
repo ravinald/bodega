@@ -117,6 +117,17 @@ func newFixtureArchive(t testing.TB, objects map[string]string) *fixtureArchive 
 // a digest would keep passing after the server started serving different bytes.
 func fixtureDists(t *testing.T, kr *aptsign.KeyRing, packages string) map[string]string {
 	t.Helper()
+	return fixtureDistsArch(t, kr, packages, "amd64")
+}
+
+// fixtureDistsArch is fixtureDists for an archive publishing an architecture
+// other than amd64, which is what a test driving a real apt in a container
+// needs: the client reads binary-<its own arch>/Packages and nothing else, so
+// an arm64 host handed an amd64-only Release reports a suite that does not
+// support the architecture rather than the outcome under test.
+func fixtureDistsArch(t *testing.T, kr *aptsign.KeyRing, packages, arch string) map[string]string {
+	t.Helper()
+	packagesPath := "main/binary-" + arch + "/Packages"
 	sum := sha256.Sum256([]byte(packages))
 	digest := hex.EncodeToString(sum[:])
 	// A real archive publishes both forms and lists both digests, and the
@@ -132,7 +143,7 @@ func fixtureDists(t *testing.T, kr *aptsign.KeyRing, packages string) map[string
 		"Suite: " + mirroredCodename,
 		"Codename: " + mirroredCodename,
 		"Components: main",
-		"Architectures: amd64",
+		"Architectures: " + arch,
 		"Acquire-By-Hash: yes",
 		"SHA256:",
 		fmt.Sprintf(" %s %d %s", digest, len(packages), packagesPath),
@@ -156,7 +167,7 @@ func fixtureDists(t *testing.T, kr *aptsign.KeyRing, packages string) map[string
 		base + "Release.gpg":        string(detached),
 		base + packagesPath:         packages,
 		base + packagesPath + ".gz": string(gzBody),
-		base + "main/binary-amd64/by-hash/SHA256/" + digest: packages,
+		base + "main/binary-" + arch + "/by-hash/SHA256/" + digest: packages,
 	}
 }
 

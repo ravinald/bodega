@@ -297,7 +297,7 @@ func writeAptSourcesFile(gf *globalFlags, token, baseURL string, allowPlaintext 
 	if err != nil {
 		return err
 	}
-	wrote, err := host.WriteAptSources(aptsources.ClientKeyringPath, apt.Host.Deb822, keyring)
+	wrote, err := host.WriteAptSources("", aptsources.ClientKeyringPath, apt.Host.Deb822, keyring)
 	for _, p := range wrote {
 		fmt.Printf("wrote %s\n", p)
 	}

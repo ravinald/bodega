@@ -1180,11 +1180,11 @@ web apt: membership=closed version_default=floating expansion=block
   filtered codename: noble-web (from noble), served after the next index rebuild
 ```
 
-`--base` names a codename in `apt_upstreams`, and the derived codename is always `<base>-<profile>`. It must not collide with anything in `apt_suites` or `apt_upstreams`; `set` refuses at the write rather than leaving one ERROR line an hour later in the server's log. `--base` needs `--membership closed`: an open set admits everything the archive publishes, so there is nothing to filter, and bodega would be re-signing the archive's own bytes under its own key. A profile with an open apt rule reads the mirrored codename unchanged.
+`--base` names a codename in `apt_upstreams`, and the derived codename is always `<base>-<profile>`. It must not collide with anything in `apt_suites` or `apt_upstreams`; `set` refuses at the write rather than leaving one ERROR line an hour later in the server's log. Two profiles over different bases can still derive one codename (`security-web` over `noble` and `web` over `noble-security` both give `noble-security-web`), which `set` cannot see because it holds one profile at a time. The rebuild serves neither and names both profiles in the log. `--base` needs `--membership closed`: an open set admits everything the archive publishes, so there is nothing to filter, and bodega would be re-signing the archive's own bytes under its own key. A profile with an open apt rule reads the mirrored codename unchanged.
 
 **Membership closes over the source package.** `bodega profile add web apt nginx` covers `nginx-common`, `nginx-core` and every other binary that source builds. Ubuntu renames and splits binaries within a stable source as routine maintenance, and a set closed on binary names would fire on each one.
 
-**A pin is real for apt through the index.** An entry pinned to a version drops every other version's paragraph from the filtered `Packages`, which apt reads as "no candidate" rather than as a refusal.
+**A pin is real for apt through the index.** An entry pinned to a version drops every other version's paragraph from the filtered `Packages`, which apt reads as "no candidate" rather than as a refusal. The version compared is the source's: a binNMU ships `nginx-common` at `1.24.0-2ubuntu7.1+b1` out of source `nginx` at `1.24.0-2ubuntu7.1`, and a pin written off the source record keeps it.
 
 The filtered codename is a generated suite: bodega signs its `Release`, so the client's stanza carries `Signed-By:` and needs no `[trusted=yes]`. `bodega doctor --write-apt-sources` installs both:
 
@@ -1234,7 +1234,7 @@ Three limits, stated rather than left to be found:
 - **bodega re-signs an index it did not verify a signature on.** It checks the archive's TLS certificate and the SHA256 the archive's own `Release` publishes for the `Packages` beside it, and it holds no distro keyring to check `InRelease` against. A mirrored codename forwards the archive's signature intact; a filtered one does not. See [Threat model](THREAT_MODEL.md).
 - **One component, `main`**, matching every other generated suite. A base publishing more is named in the server log, and packages outside `main` are not served under the profile.
 
-Filtered codenames appear in the startup banner and in `GET /api/v1/status` under `apt.filtered`, with a rendered stanza each in `apt.sources`. Nothing in the config file names them, so those are the two places to read them off. They are regenerated on the hourly index rebuild and on every `bodega profile` write, and the upstream indexes they are built from are cached behind `metadata_ttl`.
+Filtered codenames appear in the startup banner and in `GET /api/v1/status` under `apt.filtered`, with a rendered stanza each in `apt.sources`. Nothing in the config file names them, so those are the two places to read them off. They are regenerated on the hourly index rebuild and on every `bodega profile` write, and the upstream indexes they are built from are cached behind `metadata_ttl`. A rebuild that cannot read or parse the upstream `Packages` withdraws the codename rather than serving the part of it that arrived, so `apt update` fails on a source line naming the instance; a truncated index would instead report every package past the break as kept back.
 
 ### `bodega doctor [--write-credentials --token TOKEN [--url URL]] [--write-apt-sources]`
 

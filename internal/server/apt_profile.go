@@ -116,6 +116,45 @@ func (s *Server) aptProfileSuites(ctx context.Context) []aptProfileSuite {
 		}
 		out = append(out, aptProfileSuite{profile: prof.Name, base: base, codename: codename, permit: p})
 	}
+	return s.dropCollidingCodenames(out)
+}
+
+// dropCollidingCodenames removes every profile whose derived codename another
+// profile also derives, and names the group that lost.
+//
+// Neither is served rather than the last one written winning. ProfileAptCodename
+// joins base and profile with a hyphen and both halves carry hyphens of their
+// own, so "security-web" over noble and "web" over noble-security both derive
+// noble-security-web on ordinary Ubuntu naming. Serving one of them hands the
+// other profile's hosts an index filtered for a set they are not in: they are
+// offered a package, request it, and aptPoolGate refuses them mid-transaction,
+// which is the outcome this file exists to prevent. Dropping both instead
+// fails `apt update` on both, and the log names the rename that fixes it.
+//
+// ValidateProfileAptCodename cannot catch this. It is handed one profile and
+// checks it against the config, and the profile it collides with is in neither.
+func (s *Server) dropCollidingCodenames(suites []aptProfileSuite) []aptProfileSuite {
+	claims := map[string][]aptProfileSuite{}
+	for _, ps := range suites {
+		claims[ps.codename] = append(claims[ps.codename], ps)
+	}
+	out := make([]aptProfileSuite, 0, len(suites))
+	for _, ps := range suites {
+		group := claims[ps.codename]
+		if len(group) == 1 {
+			out = append(out, ps)
+			continue
+		}
+		if group[0].profile != ps.profile {
+			continue
+		}
+		pairs := make([]string, 0, len(group))
+		for _, g := range group {
+			pairs = append(pairs, g.profile+" over "+g.base)
+		}
+		s.logger.Error("two profiles derive one filtered apt codename, so neither is served and both hosts' apt update fails; rename a profile, or move one onto a base whose name does not overlap the other's",
+			"codename", ps.codename, "profiles", strings.Join(pairs, ", "))
+	}
 	return out
 }
 
@@ -150,33 +189,50 @@ func (s *Server) aptProfileIndexes(ctx context.Context, date, validUntil time.Ti
 				"profile", ps.profile, "base", ps.base, "error", err)
 			continue
 		}
-		packages := make(map[string][]byte, len(arches))
-		for _, arch := range arches {
-			raw, ok := cache[ps.base+"/"+arch]
-			if !ok {
-				raw, err = s.aptUpstreamPackages(ctx, ps.base, arch, release)
-				if err != nil {
-					s.logger.Error("could not read an upstream Packages index for a profile's apt base",
-						"profile", ps.profile, "base", ps.base, "arch", arch, "error", err)
-					continue
-				}
-				cache[ps.base+"/"+arch] = raw
-			}
-			filtered, kept, dropped := filterAptPackages(raw, ps.permit)
-			packages[arch] = filtered
-			s.logger.Info("filtered an upstream apt index for a profile",
-				"profile", ps.profile, "codename", ps.codename, "arch", arch,
-				"kept", kept, "dropped", dropped)
-		}
-		if len(packages) == 0 {
-			s.logger.Error("a profile's filtered apt codename has no architecture to serve, so it is not regenerated at this rebuild",
-				"profile", ps.profile, "codename", ps.codename)
+		packages, err := s.aptFilteredPackages(ctx, ps, arches, release, cache)
+		if err != nil {
+			s.logger.Error("a profile's filtered apt codename is not regenerated at this rebuild, so it stops being served until the read succeeds",
+				"profile", ps.profile, "codename", ps.codename, "error", err)
 			continue
 		}
 		ps.index = s.aptIndexFrom(ps.codename, packages, date, validUntil)
 		out = append(out, ps)
 	}
 	return out
+}
+
+// aptFilteredPackages filters one profile's view of every architecture its
+// base publishes, and fails the whole codename when any one of them cannot be
+// read or parsed.
+//
+// All or nothing per codename, rather than per architecture. A Release naming
+// three architectures with two filtered bodies behind it is a signed document
+// telling an amd64 host the suite holds nothing for it, and apt reports that
+// as a suite that does not support the architecture — a bodega failure worded
+// as an archive fact. Withdrawing the codename instead fails `apt update` on
+// the line the operator installed, which names the instance that stopped
+// answering.
+func (s *Server) aptFilteredPackages(ctx context.Context, ps aptProfileSuite, arches []string, release map[string]string, cache map[string][]byte) (map[string][]byte, error) {
+	out := make(map[string][]byte, len(arches))
+	for _, arch := range arches {
+		raw, ok := cache[ps.base+"/"+arch]
+		if !ok {
+			var err error
+			if raw, err = s.aptUpstreamPackages(ctx, ps.base, arch, release); err != nil {
+				return nil, fmt.Errorf("read the upstream Packages for %s/%s: %w", ps.base, arch, err)
+			}
+			cache[ps.base+"/"+arch] = raw
+		}
+		filtered, kept, dropped, err := filterAptPackages(raw, ps.permit)
+		if err != nil {
+			return nil, fmt.Errorf("filter the upstream Packages for %s/%s: %w", ps.base, arch, err)
+		}
+		s.logger.Info("filtered an upstream apt index for a profile",
+			"profile", ps.profile, "codename", ps.codename, "arch", arch,
+			"kept", kept, "dropped", dropped)
+		out[arch] = filtered
+	}
+	return out, nil
 }
 
 // filterAptPackages copies through the paragraphs a profile permits and drops
@@ -197,15 +253,23 @@ func (s *Server) aptProfileIndexes(ctx context.Context, date, validUntil time.Ti
 // the archive root and bodega serves the pool at the same offset — which is
 // also what keeps one pool object answering every profile.
 //
-// A paragraph that does not parse stops nothing and is dropped, named in the
-// count: this index is re-signed under bodega's key, and copying a paragraph
-// bodega could not read into a document bodega vouches for is the one outcome
-// worse than a missing package.
-func filterAptPackages(index []byte, p *entitle.Profile) (out []byte, kept, dropped int) {
+// A paragraph that does not parse fails the whole filter. ParseStreamRaw stops
+// where it could not read, so what the buffer holds at that point is every
+// paragraph up to the break and none of the unbounded tail after it: a break
+// at stanza 10 of 60,000 leaves a document the rest of this file would sign,
+// serve, and log as kept=9 dropped=1, which is indistinguishable from a
+// correct filter of a ten-stanza index. Every package past the break is then
+// reported to the fleet as kept back, with one Info line as the only trace.
+// docs/DESIGN.md names silent partial service as the reason not-signing lost;
+// this is the same failure reached from the other side.
+//
+// The version compared is the source's, not the paragraph's Version:. The
+// membership closed over the source name, and on a binNMU the two differ.
+func filterAptPackages(index []byte, p *entitle.Profile) (out []byte, kept, dropped int, err error) {
 	var buf bytes.Buffer
-	err := deb822.ParseStreamRaw(bytes.NewReader(index), func(raw []byte, fields map[string]string) error {
+	err = deb822.ParseStreamRaw(bytes.NewReader(index), func(raw []byte, fields map[string]string) error {
 		source := deb822.SourceName(fields)
-		if source == "" || !p.Permits(manifest.TypeApt, source, fields["Version"]).Permitted {
+		if source == "" || !p.Permits(manifest.TypeApt, source, deb822.SourceVersion(fields)).Permitted {
 			dropped++
 			return nil
 		}
@@ -215,12 +279,10 @@ func filterAptPackages(index []byte, p *entitle.Profile) (out []byte, kept, drop
 		return nil
 	})
 	if err != nil {
-		// ParseStreamRaw only errors on a malformed paragraph, and it has
-		// already written every good one before it. Whatever follows the bad
-		// paragraph is lost, which is why the caller logs the counts.
-		dropped++
+		return nil, kept, dropped, fmt.Errorf("paragraph %d does not parse, and everything after it would be missing from an index bodega signs: %w",
+			kept+dropped+1, err)
 	}
-	return buf.Bytes(), kept, dropped
+	return buf.Bytes(), kept, dropped, nil
 }
 
 // aptUpstreamArches reads the base codename's Release and returns the

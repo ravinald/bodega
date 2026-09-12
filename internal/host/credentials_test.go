@@ -636,3 +636,122 @@ func TestNetrcOwnedRemovesOnlyThisHostsStanza(t *testing.T) {
 		})
 	}
 }
+
+// WriteAptSources is the one credential-adjacent write that installs two files
+// with an order between them, and both its guards refuse rather than writing a
+// host into a state where apt update fails on every source it has.
+//
+// keyringPath is the client-side constant aptsources renders into Signed-By:,
+// repeated here rather than imported: what the guard compares is the path the
+// stanza names, and a test taking both from one symbol would pass against a
+// server that stopped naming it.
+const testKeyringPath = "/etc/apt/keyrings/bodega-archive-keyring.gpg"
+
+func testAptStanza() string {
+	return strings.Join([]string{
+		"Types: deb",
+		"URIs: https://bodega.internal/apt",
+		"Suites: noble-web",
+		"Components: main",
+		"Signed-By: " + testKeyringPath,
+	}, "\n")
+}
+
+func TestWriteAptSourcesInstallsTheKeyringAndTheStanza(t *testing.T) {
+	root := t.TempDir()
+	wrote, err := WriteAptSources(root, testKeyringPath, testAptStanza(), []byte("keyring bytes"))
+	if err != nil {
+		t.Fatalf("write the apt sources: %v", err)
+	}
+	want := []string{filepath.Join(root, testKeyringPath), filepath.Join(root, AptSourcesPath)}
+	if len(wrote) != 2 || wrote[0] != want[0] || wrote[1] != want[1] {
+		t.Fatalf("wrote %v, want %v in that order", wrote, want)
+	}
+	for _, p := range wrote {
+		info, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("stat %s: %v", p, err)
+		}
+		if info.Mode().Perm() != AptSourcesMode.Perm() {
+			t.Errorf("%s has mode %v, want %v: apt reads both as a user that is not always root", p, info.Mode().Perm(), AptSourcesMode.Perm())
+		}
+	}
+	body, err := os.ReadFile(want[1])
+	if err != nil {
+		t.Fatalf("read the stanza: %v", err)
+	}
+	if !strings.HasSuffix(string(body), "\n") || strings.HasSuffix(string(body), "\n\n") {
+		t.Errorf("the stanza was written with %q at the end, want exactly one newline", string(body[len(body)-2:]))
+	}
+	if !strings.Contains(string(body), "Signed-By: "+testKeyringPath) {
+		t.Errorf("the installed stanza names no keyring:\n%s", body)
+	}
+}
+
+// The keyring lands first, so a failure on the second write leaves a host whose
+// previous sources still resolve. The reverse order leaves a stanza pointing at
+// a Signed-By: path that does not exist, which fails apt update outright and
+// takes every other source on the host with it.
+func TestWriteAptSourcesLandsTheKeyringBeforeTheStanza(t *testing.T) {
+	root := t.TempDir()
+	// A file where the .sources directory belongs: the second write cannot
+	// succeed, and what survives is what a host is left holding.
+	blocked := filepath.Join(root, filepath.Dir(AptSourcesPath))
+	if err := os.MkdirAll(filepath.Dir(blocked), 0o755); err != nil {
+		t.Fatalf("prepare the blocked path: %v", err)
+	}
+	if err := os.WriteFile(blocked, []byte("not a directory"), 0o644); err != nil {
+		t.Fatalf("prepare the blocked path: %v", err)
+	}
+
+	wrote, err := WriteAptSources(root, testKeyringPath, testAptStanza(), []byte("keyring bytes"))
+	if err == nil {
+		t.Fatal("writing the stanza under a path that is a file reported success")
+	}
+	if len(wrote) != 1 || wrote[0] != filepath.Join(root, testKeyringPath) {
+		t.Fatalf("wrote %v, want the keyring alone: it is the file that has to exist before the stanza names it", wrote)
+	}
+	if _, err := os.Stat(filepath.Join(root, testKeyringPath)); err != nil {
+		t.Errorf("the keyring is not on disk after a partial run: %v", err)
+	}
+}
+
+func TestWriteAptSourcesRefusesWhatWouldNeedTrustedYes(t *testing.T) {
+	cases := []struct {
+		name    string
+		stanza  string
+		keyring []byte
+		want    string
+	}{
+		{
+			name:    "no keyring to install",
+			stanza:  testAptStanza(),
+			keyring: nil,
+			want:    "bodega apt key generate",
+		},
+		{
+			name:    "a stanza that names no keyring",
+			stanza:  "Types: deb\nURIs: https://bodega.internal/apt\nSuites: noble\nComponents: main",
+			keyring: []byte("keyring bytes"),
+			want:    testKeyringPath,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			wrote, err := WriteAptSources(root, testKeyringPath, tc.stanza, tc.keyring)
+			if err == nil {
+				t.Fatal("a stanza apt could only read with [trusted=yes] was installed")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not name %q, so the operator is not told what to run", err, tc.want)
+			}
+			if len(wrote) != 0 {
+				t.Errorf("wrote %v before refusing; a refused run has to leave the host's sources alone", wrote)
+			}
+			if _, err := os.Stat(filepath.Join(root, AptSourcesPath)); !os.IsNotExist(err) {
+				t.Errorf("the stanza was installed anyway: %v", err)
+			}
+		})
+	}
+}

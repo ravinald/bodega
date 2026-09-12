@@ -358,7 +358,12 @@ const (
 // key lives on the client and the stanza is bodega's own document; an operator
 // who wants a second source writes a second file, which is what the .list.d
 // directory is for.
-func WriteAptSources(keyringPath, stanza string, keyring []byte) ([]string, error) {
+//
+// root prefixes both paths and is empty everywhere but a test. Both of them
+// are absolute and outside home — apt reads /etc/apt and nowhere else — so
+// without it the only way to exercise the guards and the ordering below is to
+// write the running host's real sources.
+func WriteAptSources(root, keyringPath, stanza string, keyring []byte) ([]string, error) {
 	if len(keyring) == 0 {
 		return nil, fmt.Errorf("no keyring to install: this bodega serves its apt index unsigned, and a stanza with no Signed-By: would need [trusted=yes], which turns verification off for the source permanently.\n" +
 			"  Sign it on the server:  bodega apt key generate")
@@ -371,8 +376,8 @@ func WriteAptSources(keyringPath, stanza string, keyring []byte) ([]string, erro
 		path string
 		data []byte
 	}{
-		{keyringPath, keyring},
-		{AptSourcesPath, []byte(strings.TrimRight(stanza, "\n") + "\n")},
+		{filepath.Join(root, keyringPath), keyring},
+		{filepath.Join(root, AptSourcesPath), []byte(strings.TrimRight(stanza, "\n") + "\n")},
 	} {
 		if err := os.MkdirAll(filepath.Dir(f.path), 0o755); err != nil {
 			return wrote, fmt.Errorf("create %s: %w", filepath.Dir(f.path), err)

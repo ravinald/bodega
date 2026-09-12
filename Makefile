@@ -63,7 +63,7 @@ PREFIX  ?= $(DEFAULT_PREFIX)
 BINDIR  ?= $(PREFIX)/bin
 DESTDIR ?=
 
-.PHONY: all depend build install uninstall test lint vet fmt fmt-check clean tidy tidy-check ci-drift check cross help
+.PHONY: all depend build install uninstall test test-apt lint vet fmt fmt-check clean tidy tidy-check ci-drift check cross help
 
 all: build
 
@@ -164,6 +164,13 @@ test:
 ## test-verbose: Run all tests with verbose output
 test-verbose:
 	go test -race -count=1 -v ./...
+
+## test-apt: Drive a real apt against a filtered codename in a container (needs docker)
+# Out of `check` on purpose: it pulls an image, installs dpkg-dev inside it and
+# reaches archive.ubuntu.com. It is the only assertion of what apt does with a
+# filtered index rather than what the index says.
+test-apt:
+	go test -tags apt_integration -count=1 -timeout 20m -run TestRealApt ./internal/server/
 
 ## bench: Run benchmarks
 bench:
