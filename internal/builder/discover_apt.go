@@ -2,6 +2,7 @@ package builder
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -9,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/ravinald/bodega/internal/deb822"
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
@@ -47,6 +49,13 @@ func DiscoverAptDeps(store *manifest.Store, pkgName, depth string, out io.Writer
 	names := parseAptCacheDepends(string(output), pkgName)
 	_, _ = fmt.Fprintf(out, "  [apt] found %d dependencies\n", len(names))
 
+	// `apt-cache depends` answers which packages, never which releases of
+	// them, and "which release" is the whole of what a pin needs: postgresql-14
+	// held at 14.9 holds libpq5 still only because it was declared
+	// `Depends: libpq5 (= 14.9)`. The relation lives in the control stanza, so
+	// read it from there and leave `depends` to enumerate the names.
+	rels := fetchAptRelations(pkgName)
+
 	var deps []DiscoveredDep
 	for _, name := range names {
 		d := DiscoveredDep{
@@ -54,6 +63,17 @@ func DiscoverAptDeps(store *manifest.Store, pkgName, depth string, out io.Writer
 			Name:       name,
 			RawSpec:    name,
 			RequiredBy: "apt/" + pkgName,
+		}
+		if r, ok := rels[name]; ok {
+			d.RawSpec = r.Raw
+			// Only an equality relation holds a release still. A `>=` floor
+			// says the dependency may move upward and pinning the parent does
+			// nothing to stop it, so recording a version there would invent a
+			// hold nobody declared.
+			if r.Operator == "=" {
+				d.Version = r.Version
+				d.Constraint = manifest.ConstraintExact
+			}
 		}
 		// Check if already in the store.
 		if pm, err := store.GetPackage(ctx, manifest.TypeApt, name); err == nil && pm != nil {
@@ -144,11 +164,165 @@ func isVirtualPkg(name string) bool {
 	return strings.HasPrefix(name, "<") && strings.HasSuffix(name, ">")
 }
 
+// aptRelation is one dependency as the control stanza declares it: the package
+// named, and the version relation that names a release of it.
+type aptRelation struct {
+	Name string
+	// Operator is the Debian relation ("=", ">=", "<=", ">>", "<<"), empty for
+	// a dependency declared by name alone.
+	Operator string
+	Version  string
+	// Raw is the relation as written, so a report shows the operator the
+	// specifier they would recognize from the package metadata.
+	Raw string
+}
+
+// addAptEdge records one dependency edge, versioned where the relation named a
+// release.
+//
+// Any edge this parent already held to the same package is removed first. The
+// graph dedupes on the exact (parent, child) pair, so a rebuild after the
+// declared version moved would leave 14.9 and 15.1 both recorded and the
+// closure walk would answer with whichever the file happened to list first.
+func addAptEdge(store *manifest.Store, parentName string, d DiscoveredDep) {
+	parent := "apt/" + parentName
+	child := "apt/" + d.Name
+	for _, e := range store.Edges() {
+		if e.Parent != parent {
+			continue
+		}
+		if e.Child == child || strings.HasPrefix(e.Child, child+"@") {
+			store.RemoveEdge(e.Parent, e.Child)
+		}
+	}
+	if d.Version != "" {
+		child += "@" + d.Version
+	}
+	store.AddEdge(manifest.DepEdge{
+		Parent:     parent,
+		Child:      child,
+		Constraint: d.Constraint,
+		RawSpec:    d.RawSpec,
+	})
+}
+
+// fetchAptRelations reads one package's declared dependency relations from its
+// control stanza. Returns nil when apt-cache is unavailable or the package is
+// unknown, which leaves every dependency recorded by name alone.
+func fetchAptRelations(pkgName string) map[string]aptRelation {
+	if _, err := exec.LookPath("apt-cache"); err != nil {
+		return nil
+	}
+	out, err := exec.Command("apt-cache", "show", pkgName).Output()
+	if err != nil || len(out) == 0 {
+		return nil
+	}
+	return parseAptRelationStanzas(string(out))
+}
+
+// parseAptRelationStanzas reads the Depends and Pre-Depends relations from the
+// first stanza of `apt-cache show` output.
+//
+// The first stanza alone: apt prints one per candidate version, newest first,
+// and merging them would mix the relations of releases that declared different
+// ones. Only the candidate is the release bodega is about to catalog.
+func parseAptRelationStanzas(output string) map[string]aptRelation {
+	var fields map[string]string
+	stop := errors.New("first stanza read")
+	err := deb822.ParseStream(strings.NewReader(output), func(f map[string]string) error {
+		fields = f
+		return stop
+	})
+	if err != nil && !errors.Is(err, stop) {
+		return nil
+	}
+	if fields == nil {
+		return nil
+	}
+	rels := map[string]aptRelation{}
+	for _, key := range []string{"Depends", "Pre-Depends"} {
+		for _, r := range parseAptRelationField(fields[key]) {
+			// A package named by both fields keeps the first relation read.
+			// Debian does not define which wins, and a Pre-Depends repeating a
+			// Depends declares the same release in practice.
+			if _, seen := rels[r.Name]; !seen {
+				rels[r.Name] = r
+			}
+		}
+	}
+	if len(rels) == 0 {
+		return nil
+	}
+	return rels
+}
+
+// parseAptRelationField parses a Depends-style field value:
+//
+//	libpq5 (= 14.9), libssl3 (>= 3.0.0), libc6 | libc6-udeb, python3:any
+//
+// Alternatives are each returned. An alternative is another way to satisfy the
+// dependency, so both are packages the parent may be built against and the one
+// bodega cataloged is the one the edge lands on.
+func parseAptRelationField(field string) []aptRelation {
+	var out []aptRelation
+	for _, group := range strings.Split(field, ",") {
+		for _, alt := range strings.Split(group, "|") {
+			if r, ok := parseAptRelation(alt); ok {
+				out = append(out, r)
+			}
+		}
+	}
+	return out
+}
+
+// parseAptRelation parses one relation: "libpq5 (= 14.9)", "libc6",
+// "python3:any (>= 3.12)". The architecture qualifier is dropped; it names
+// which build satisfies the dependency, not which release.
+func parseAptRelation(s string) (aptRelation, bool) {
+	raw := strings.Join(strings.Fields(s), " ")
+	if raw == "" {
+		return aptRelation{}, false
+	}
+	r := aptRelation{Raw: raw}
+	rest := raw
+	if open := strings.Index(rest, "("); open >= 0 {
+		end := strings.Index(rest[open:], ")")
+		if end < 0 {
+			return aptRelation{}, false
+		}
+		op, version, found := strings.Cut(strings.TrimSpace(rest[open+1:open+end]), " ")
+		if !found {
+			return aptRelation{}, false
+		}
+		switch op {
+		case "=", ">=", "<=", ">>", "<<":
+			r.Operator, r.Version = op, strings.TrimSpace(version)
+		default:
+			return aptRelation{}, false
+		}
+		rest = rest[:open]
+	}
+	name, _, _ := strings.Cut(strings.TrimSpace(rest), ":")
+	if name == "" || isVirtualPkg(name) {
+		return aptRelation{}, false
+	}
+	r.Name = name
+	return r, true
+}
+
 // ImportAptDeps creates manifest entries and graph edges for discovered apt
 // dependencies. Only imports deps where Exists is false. Returns count added.
 func ImportAptDeps(ctx context.Context, store *manifest.Store, parentName string, deps []DiscoveredDep, out io.Writer) int {
 	added := 0
+	wroteEdge := false
 	for _, d := range deps {
+		// The edge is written whether or not the package is new. A dependency
+		// already in the catalog is still a dependency, and a graph that
+		// recorded only first sightings would report a pin on a mature
+		// package as implying nothing.
+		addAptEdge(store, parentName, d)
+		wroteEdge = true
+
 		if d.Exists {
 			_, _ = fmt.Fprintf(out, "  [apt] %s: already in store, skipping\n", d.Name)
 			continue
@@ -169,13 +343,6 @@ func ImportAptDeps(ctx context.Context, store *manifest.Store, parentName string
 
 		// Resolve the concrete version with full metadata.
 		ResolveAndCreateConcreteVersion(ctx, store, d.Name, out)
-
-		// Add dependency graph edge.
-		store.AddEdge(manifest.DepEdge{
-			Parent:  "apt/" + parentName,
-			Child:   "apt/" + d.Name,
-			RawSpec: d.Name,
-		})
 	}
 
 	if added > 0 {
@@ -183,6 +350,8 @@ func ImportAptDeps(ctx context.Context, store *manifest.Store, parentName string
 		if err := store.SaveIndex(ctx); err != nil {
 			_, _ = fmt.Fprintf(out, "  [apt] WARNING: could not save index: %v\n", err)
 		}
+	}
+	if wroteEdge {
 		if err := store.SaveGraph(ctx); err != nil {
 			_, _ = fmt.Fprintf(out, "  [apt] WARNING: could not save dependency graph: %v\n", err)
 		}

@@ -253,20 +253,3 @@ func OSVStampOf(ve manifest.VersionEntry) OSVStamp {
 	}
 	return st
 }
-
-// Scores renders the scores recorded for one advisory id, in the order OSV
-// published them. Empty for an id OSV scored nothing for.
-func (s OSVStamp) Scores(id string) []string {
-	var out []string
-	for _, sev := range s.Severity[id] {
-		if sev.Score == "" {
-			continue
-		}
-		if sev.Type == "" {
-			out = append(out, sev.Score)
-			continue
-		}
-		out = append(out, sev.Type+" "+sev.Score)
-	}
-	return out
-}

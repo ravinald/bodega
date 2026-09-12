@@ -1011,7 +1011,16 @@ Reporting is the default because extending a pin across a closure freezes a
 growing set: each package pinned drags its own dependencies in, and a host
 stops receiving security updates for all of them without anyone deciding that
 it should. --strict-closure is for the operator who has read the report and
-wants the implication written down.`,
+wants the implication written down.
+
+--strict-closure never overwrites an entry somebody else gave a reason. Those
+are named and left where they are: moving one would take the version backward
+across whatever its reason records and replace the reason with a generated
+string. Move such an entry with 'bodega profile pin' on the package itself.
+
+On apt, --strict-closure has nothing to pin to unless the dependency was
+declared with an '=' relation: a '>=' floor holds no version still, and the
+closure reports those members with no version rather than choosing one.`,
 		Args: cobra.ExactArgs(4),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if strings.TrimSpace(reason) == "" {
@@ -1099,6 +1108,19 @@ func reportPinClosure(gf *globalFlags, profile, typ, name, version string, stric
 	return closure, nil
 }
 
+// impliedReasonPrefix opens the reason --strict-closure writes. It is how the
+// command tells an entry it wrote itself from one an operator authored: the
+// first may be refreshed, the second is a record that only its author may
+// replace.
+const impliedReasonPrefix = "implied by the "
+
+// impliedReason is the reason --strict-closure records on a closure member,
+// naming the pin that implied it so the entry says why it is there without
+// anyone reading the graph.
+func impliedReason(closure pins.Closure, reason string) string {
+	return fmt.Sprintf("%s%s pin at %s: %s", impliedReasonPrefix, closure.Ref(), closure.Version, reason)
+}
+
 // extendPinAcrossClosure writes the pins the closure implies, at the versions
 // the graph records.
 //
@@ -1106,6 +1128,14 @@ func reportPinClosure(gf *globalFlags, profile, typ, name, version string, stric
 // records that the package is depended on and not which release, so pinning it
 // would mean choosing a version on the operator's behalf, which is the one
 // thing a pin must never be.
+//
+// A member already carrying an operator-authored reason is skipped too, and
+// that is the case this command exists to report. The conflict it prints one
+// line earlier is precisely an entry somebody else pinned deliberately;
+// overwriting it would move the version backward across whatever fix the
+// reason names and replace the reason with a generated string, leaving the
+// word "Updated" as the only trace. The operator moves it with 'bodega profile
+// pin', where they say why.
 func extendPinAcrossClosure(gf *globalFlags, profile string, closure pins.Closure, reason, reviewAfter string) error {
 	resolved := closure.Resolved()
 	if len(resolved) == 0 {
@@ -1113,8 +1143,19 @@ func extendPinAcrossClosure(gf *globalFlags, profile string, closure pins.Closur
 			closure.Ref())
 		return nil
 	}
-	implied := fmt.Sprintf("implied by the %s pin at %s: %s", closure.Ref(), closure.Version, reason)
+
+	held, err := profileEntriesByRef(gf, profile)
+	if err != nil {
+		return fmt.Errorf("--strict-closure: read %s: %w", profile, err)
+	}
+
+	implied := impliedReason(closure, reason)
+	var refused []audit.ProfileEntry
 	for _, m := range resolved {
+		if e, ok := held[m.Ref()]; ok && operatorAuthored(e) {
+			refused = append(refused, e)
+			continue
+		}
 		supplied := map[string]bool{
 			"constraint": true, "version": true, "reason": true, "review-after": reviewAfter != "",
 		}
@@ -1125,10 +1166,42 @@ func extendPinAcrossClosure(gf *globalFlags, profile string, closure pins.Closur
 			return fmt.Errorf("--strict-closure: pin %s: %w", m.Ref(), err)
 		}
 	}
+	for _, e := range refused {
+		fmt.Printf("--strict-closure: left %s/%s at %s alone; it carries a reason somebody wrote: %s\n",
+			e.Type, e.Name, orDash(e.Version), e.Reason)
+		fmt.Printf("  Move it deliberately:  bodega profile pin %s %s %s <version> --reason <why>\n",
+			profile, e.Type, e.Name)
+	}
 	if skipped := len(closure.Members) - len(resolved); skipped > 0 {
 		fmt.Printf("--strict-closure: %d closure member(s) carry no version in the graph and were left floating; pin them by name once you know the release.\n", skipped)
 	}
 	return nil
+}
+
+// operatorAuthored answers whether a profile entry carries a record that only
+// its author may replace. An entry --strict-closure wrote itself is not one:
+// refreshing those is the whole of what a second run does.
+func operatorAuthored(e audit.ProfileEntry) bool {
+	r := strings.TrimSpace(e.Reason)
+	return r != "" && !strings.HasPrefix(r, impliedReasonPrefix)
+}
+
+// profileEntriesByRef reads a profile's entries keyed as "type/name".
+func profileEntriesByRef(gf *globalFlags, profile string) (map[string]audit.ProfileEntry, error) {
+	adb, err := openProfileReader(gf)
+	if err != nil {
+		return nil, err
+	}
+	defer adb.Close()
+	d, err := adb.GetProfile(backgroundCtx(), profile)
+	if err != nil {
+		return nil, err
+	}
+	held := make(map[string]audit.ProfileEntry, len(d.Entries))
+	for _, e := range d.Entries {
+		held[e.Type+"/"+e.Name] = e
+	}
+	return held, nil
 }
 
 func newProfilePinsCmd(gf *globalFlags) *cobra.Command {

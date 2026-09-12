@@ -288,3 +288,67 @@ func TestProfilePinDateMovesWithTheVersionAndNotWithAnEdit(t *testing.T) {
 		t.Errorf("moving the pin to a new version left the decision dated %s", after)
 	}
 }
+
+// --strict-closure is recommended by the conflict line one command earlier,
+// and the entry it conflicts with is exactly the one somebody pinned
+// deliberately. Overwriting it would take the version backward across the fix
+// its reason names, replace the reason with a generated string, and leave the
+// word "Updated" as the only trace.
+func TestStrictClosureRefusesToMoveAPinSomebodyElseWrote(t *testing.T) {
+	env := newDiscoverEnv(t)
+	seedVersions(t, env, manifest.TypeApt, "postgresql-14",
+		[]manifest.VersionEntry{{Version: "14.9"}})
+	seedVersions(t, env, manifest.TypeApt, "libpq5",
+		[]manifest.VersionEntry{{Version: "14.9"}, {Version: "15.1"}})
+	seedEdges(t, env,
+		manifest.DepEdge{Parent: "apt/postgresql-14", Child: "apt/libpq5@14.9", RawSpec: "libpq5 (= 14.9)"},
+	)
+	mustRunProfile(t, "create", "db")
+	mustRunProfile(t, "pin", "db", "apt", "libpq5", "15.1",
+		"--reason", "CVE-2026-1111 fixed in 15.1", "--review-after", "2027-01-01")
+
+	out := mustRunProfile(t, "pin", "db", "apt", "postgresql-14", "14.9",
+		"--reason", "15 breaks the config", "--strict-closure")
+	if !strings.Contains(out, "left apt/libpq5 at 15.1 alone") {
+		t.Errorf("--strict-closure does not say which member it refused to move:\n%s", out)
+	}
+	if !strings.Contains(out, "bodega profile pin db apt libpq5") {
+		t.Errorf("the refusal does not say how to move it deliberately:\n%s", out)
+	}
+
+	got := decodePins(t, mustRunProfile(t, "pins", "--json"))
+	byName := map[string]pins.Pin{}
+	for _, p := range got {
+		byName[p.Name] = p
+	}
+	held := byName["libpq5"]
+	if held.Version != "15.1" {
+		t.Errorf("libpq5 moved to %q, taking the version backward across a recorded fix", held.Version)
+	}
+	if held.Reason != "CVE-2026-1111 fixed in 15.1" {
+		t.Errorf("the operator's reason is now %q, so what the pin accepted is unrecorded", held.Reason)
+	}
+	if held.ReviewAfter != "2027-01-01" {
+		t.Errorf("review date = %q, want the one written for this pin", held.ReviewAfter)
+	}
+	if byName["postgresql-14"].Version != "14.9" {
+		t.Errorf("the pin the operator asked for was not written: %+v", byName["postgresql-14"])
+	}
+
+	// A second run refreshes what the first wrote: an "implied by" reason is
+	// this command's own record, not somebody's decision.
+	seedEdges(t, env,
+		manifest.DepEdge{Parent: "apt/postgresql-14", Child: "apt/libssl3@3.0.2", RawSpec: "libssl3 (= 3.0.2)"},
+	)
+	mustRunProfile(t, "pin", "db", "apt", "postgresql-14", "14.9",
+		"--reason", "15 breaks the config", "--strict-closure")
+	again := mustRunProfile(t, "pin", "db", "apt", "postgresql-14", "14.9",
+		"--reason", "15 still breaks the config", "--strict-closure")
+	if strings.Contains(again, "left apt/libssl3") {
+		t.Errorf("--strict-closure refuses to refresh an entry it wrote itself:\n%s", again)
+	}
+	shown := mustRunProfile(t, "show", "db")
+	if !strings.Contains(shown, "15 still breaks the config") {
+		t.Errorf("the closure pin was not refreshed with the pin's current reason:\n%s", shown)
+	}
+}

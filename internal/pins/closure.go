@@ -30,9 +30,9 @@ type Member struct {
 	Type string
 	Name string
 	// Version is the version the edge names, empty when the edge names none.
-	// apt's discoverer records the dependency by name alone, so a member with
-	// no version is a package the pin reaches without bodega knowing which
-	// release of it the pin requires.
+	// A dependency declared without an equality relation has none: an apt
+	// `>=` floor may move upward whatever the parent is pinned at, so the pin
+	// reaches the package without holding any release of it still.
 	Version string
 	// Constraint and RawSpec are the edge's own, carried through so a report
 	// can show the specifier an operator would recognize from the upstream
@@ -69,11 +69,18 @@ type Conflict struct {
 // Of walks the dependency edges downward from one pinned package and returns
 // every package it holds still.
 //
-// edges is the whole graph rather than a per-node lookup, because the two
-// writers spell a node differently: the apt discoverer records "apt/nginx" and
-// the language discoverers record "pypi/django@5.2.12". A walk keyed on an
-// exact reference sees one writer's edges and reports the other's packages as
-// unreachable, which reads as a pin that implies nothing.
+// edges is the whole graph rather than a per-node lookup, because a node is
+// not spelled one way: an apt parent is recorded as "apt/postgresql-14" and a
+// language one as "pypi/django@5.2.12". A walk keyed on an exact reference
+// sees one spelling's edges and reports the other's packages as unreachable,
+// which reads as a pin that implies nothing.
+//
+// The version is part of the key, not noise to be stripped. A catalog holding
+// two releases of one package records both releases' children under the same
+// name, and a walk that merged them would report a pin on 4.2.11 as holding
+// 5.2.12's dependencies — packages that pin never implied, at versions nothing
+// chose. So a parent that records a version is matched on the version, and
+// only a parent that records none applies to whatever release you pinned.
 //
 // Members come back sorted by reference, so a report and a test read the same
 // order whatever order the graph was written in. A cycle terminates: a node
@@ -81,33 +88,54 @@ type Conflict struct {
 func Of(edges []manifest.DepEdge, typ, name, version string) Closure {
 	c := Closure{Type: typ, Name: name, Version: version}
 
-	byParent := map[string][]manifest.DepEdge{}
+	versioned := map[string][]manifest.DepEdge{}
+	unversioned := map[string][]manifest.DepEdge{}
 	for _, e := range edges {
-		pt, pn, _ := SplitRef(e.Parent)
+		pt, pn, pv := SplitRef(e.Parent)
 		if pn == "" {
 			continue
 		}
-		byParent[pt+"/"+pn] = append(byParent[pt+"/"+pn], e)
+		if pv == "" {
+			unversioned[pt+"/"+pn] = append(unversioned[pt+"/"+pn], e)
+			continue
+		}
+		versioned[pt+"/"+pn+"@"+pv] = append(versioned[pt+"/"+pn+"@"+pv], e)
 	}
 
-	root := typ + "/" + name
-	seen := map[string]bool{root: true}
-	frontier := []string{root}
+	// A member carries its own version forward, so the next hop expands the
+	// release that member is held at rather than every release of it.
+	childrenOf := func(m Member) []manifest.DepEdge {
+		if m.Version == "" {
+			return unversioned[m.Ref()]
+		}
+		byVersion := versioned[m.Ref()+"@"+m.Version]
+		if len(byVersion) == 0 {
+			return unversioned[m.Ref()]
+		}
+		out := make([]manifest.DepEdge, 0, len(unversioned[m.Ref()])+len(byVersion))
+		out = append(out, unversioned[m.Ref()]...)
+		return append(out, byVersion...)
+	}
+
+	root := Member{Type: typ, Name: name, Version: version}
+	seen := map[string]bool{root.Ref(): true}
+	frontier := []Member{root}
 	for depth := 1; len(frontier) > 0; depth++ {
-		var next []string
+		var next []Member
 		for _, parent := range frontier {
-			for _, e := range byParent[parent] {
+			for _, e := range childrenOf(parent) {
 				ct, cn, cv := SplitRef(e.Child)
 				if cn == "" || seen[ct+"/"+cn] {
 					continue
 				}
 				seen[ct+"/"+cn] = true
-				c.Members = append(c.Members, Member{
+				m := Member{
 					Type: ct, Name: cn, Version: cv,
 					Constraint: e.Constraint, RawSpec: e.RawSpec,
-					Via: parent, Depth: depth,
-				})
-				next = append(next, ct+"/"+cn)
+					Via: parent.Ref(), Depth: depth,
+				}
+				c.Members = append(c.Members, m)
+				next = append(next, m)
 			}
 		}
 		frontier = next
@@ -160,8 +188,10 @@ func (c Closure) Resolved() []Member {
 }
 
 // SplitRef parses a graph reference into its type, name and version. A
-// reference carries no version on the apt discoverer's edges and carries one
-// on every other writer's.
+// reference carries a version wherever the writer knew one: every language
+// discoverer, and apt where the dependency was declared with an equality
+// relation. It carries none for an apt parent, or for a dependency declared as
+// a floor.
 //
 // The version is split at the last '@' rather than the first, because an npm
 // scope puts one inside the name: "npm/@babel/core@7.24.0" is one package at

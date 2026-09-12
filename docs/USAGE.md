@@ -902,15 +902,26 @@ The `OSV` column is the stamp [`bodega policy osv rescan`](#rescan) writes, and 
 ```text
 $ bodega profile pin db apt postgresql-14 14.9 --reason "15 breaks the config"
 Pinning apt/postgresql-14 at 14.9 holds 2 other package(s) still:
-  PACKAGE       HELD AT  VIA                 SPEC
-  apt/libpq5    14.9     apt/postgresql-14   libpq5 (= 14.9)
-  apt/libssl3   3.0.2    apt/libpq5          libssl3 (>= 3.0.0)
-  conflict: apt/postgresql-14 at 14.9 needs apt/libpq5 14.9, and the profile refuses it: exact 15.1 does not match 14.9
+  PACKAGE      HELD AT  VIA                SPEC
+  apt/libpq5   14.9     apt/postgresql-14  libpq5 (= 14.9)
+  apt/libssl3  -        apt/postgresql-14  libssl3 (>= 3.0.0)
+  conflict: apt/postgresql-14 at 14.9 needs apt/libpq5 14.9, and the profile refuses it: profile "db" does not permit apt/libpq5 at 14.9: pinned to 15.1
   Pin the closure too:  --strict-closure
 Added apt/postgresql-14 in db (exact 14.9).
 ```
 
-**Reporting is the default and freezing is not.** The default pins the one package you named and tells you what it implies. `--strict-closure` pins every closure member at the version the graph records, with a reason naming the pin that implied it. Extending by default would freeze a growing set — each package pinned drags its own dependencies in — and a host would stop receiving security updates for all of them with nobody having decided that it should. A closure member the graph records no version for is left floating and said so, because pinning it would mean choosing a release on your behalf.
+`HELD AT` comes from the relation the dependency was declared with, not from what happens to be installed. `libpq5 (= 14.9)` holds a release still and reads `14.9`; `libssl3 (>= 3.0.0)` is a floor that may move upward whatever postgresql-14 is pinned at, so it reads `-` and `--strict-closure` has nothing to pin it to. The language discoverers record the version on every edge, so a pypi or gomod closure resolves throughout.
+
+**Reporting is the default and freezing is not.** The default pins the one package you named and tells you what it implies. `--strict-closure` pins every closure member at the version the graph records, with a reason naming the pin that implied it. Extending by default would freeze a growing set: each package pinned drags its own dependencies in, and a host would stop receiving security updates for all of them with nobody having decided that it should. A closure member the graph records no version for is left floating and said so, because pinning it would mean choosing a release on your behalf.
+
+`--strict-closure` also leaves alone any entry somebody already gave a reason, and names each one it refused to move:
+
+```text
+--strict-closure: left apt/libpq5 at 15.1 alone; it carries a reason somebody wrote: CVE-2026-1111 fixed in 15.1
+  Move it deliberately:  bodega profile pin db apt libpq5 <version> --reason <why>
+```
+
+That entry is usually the one the conflict line names, which makes it the entry the command is being run to resolve. Overwriting it would take the version backward across whatever fix its reason records and replace the reason with a generated string, leaving the word `Updated` as the only trace. An entry `--strict-closure` wrote itself carries the `implied by` reason and is refreshed on the next run, because that record is this command's own.
 
 The same feasibility check runs at apt index generation, where it reports and extends nothing. A pin whose own closure the profile contradicts is logged with the conflict and the command that would resolve it.
 
