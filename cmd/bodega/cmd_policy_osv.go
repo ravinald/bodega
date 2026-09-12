@@ -189,6 +189,52 @@ func newPolicyOSVRemoveCmd(gf *globalFlags) *cobra.Command {
 // code it was written for.
 var osvExportBase = policy.DefaultOSVExportBase
 
+// aptSyncSuites is the suite set sync resolves apt exports from: the ones this
+// bodega serves, plus the releases its own manifests record.
+//
+// Those are two different fields on purpose. apt_suites names the dists/<suite>/
+// trees a .deb is published to; the gate answers an entry from the release that
+// entry itself records, which on a mirror install is no served suite at all.
+// Resolving the fetch from the served set alone leaves the one export the gate
+// reads the one export nothing downloads, and the warn it then emits on every
+// entry forever names a sync that cannot fix it.
+//
+// Both entry fields are read, because the lookup reads both: capture_suite when
+// the capture recorded one, the publishing suites when it did not.
+func aptSyncSuites(ctx context.Context, store *manifest.Store, served []string) ([]string, error) {
+	out := make([]string, 0, len(served)+4)
+	seen := map[string]bool{}
+	add := func(s string) {
+		if s == "" || seen[s] {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	for _, s := range served {
+		add(s)
+	}
+	for _, name := range store.ListPackages(manifest.TypeApt) {
+		pm, err := store.GetPackage(ctx, manifest.TypeApt, name)
+		if err != nil {
+			return nil, fmt.Errorf("load apt/%s: %w", name, err)
+		}
+		// An index entry whose manifest file is gone names no release to
+		// fetch for. 'bodega repair' and rescan both report it; failing the
+		// whole sync over it would leave every other ecosystem unsynced too.
+		if pm == nil {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			add(ve.CaptureSuite)
+			for _, s := range ve.Suites {
+				add(s)
+			}
+		}
+	}
+	return out, nil
+}
+
 func newPolicyOSVSyncCmd(gf *globalFlags) *cobra.Command {
 	return &cobra.Command{
 		Use:   "sync [ecosystem...]",
@@ -197,14 +243,16 @@ func newPolicyOSVSyncCmd(gf *globalFlags) *cobra.Command {
 per ecosystem, and record when each was fetched. With no arguments every
 covered ecosystem is synced.
 
-apt expands to one index per apt suite the server serves, because OSV keys
-Ubuntu and Debian advisories on the release. Those releases are distilled
-out of one archive each: OSV stopped rebuilding its per-release archives in
-October 2024 and keeps the aggregate current. A suite OSV publishes no
-records for is named on stderr and fetched for nothing; entries published
-to it warn at admission rather than reporting clean. A suite set where none
-of them resolves is a skip in the no-argument form, so an install whose
-suites are local names still exits 0 once the other ecosystems have
+apt expands to one index per release, because OSV keys Ubuntu and Debian
+advisories on the release. The set is the suites this server serves plus
+the releases its own manifests record, so a capture from a release nobody
+publishes is fetched for too. Those releases are distilled out of one
+archive each: OSV stopped rebuilding its per-release archives in October
+2024 and keeps the aggregate current. A suite OSV publishes no records for
+is named on stderr and fetched for nothing; entries published to it warn at
+admission rather than reporting clean. A set where nothing resolves is a
+skip in the no-argument form, so an install whose suites are local names
+and whose catalog holds no apt still exits 0 once the other ecosystems have
 written; naming apt on the command line fails, because that request fetched
 nothing.
 
@@ -230,7 +278,21 @@ and point osv_db_dir at the copy.`,
 			db := policy.NewOSVDatabase(cfg.ResolveOSVDBDir())
 			db.ExportBase = osvExportBase
 
-			// apt is one export per served suite: OSV keys Ubuntu and
+			// Resolved only when apt is in the set: a manifest store that
+			// will not load has nothing to say about npm, and failing
+			// 'sync npm' over one is the wrong answer.
+			aptSuites := cfg.ServedAptSuites()
+			if slices.Contains(ecosystems, manifest.TypeApt) {
+				store, err := loadStore(gf)
+				if err != nil {
+					return fmt.Errorf("load manifests: %w", err)
+				}
+				if aptSuites, err = aptSyncSuites(cmd.Context(), store, aptSuites); err != nil {
+					return err
+				}
+			}
+
+			// apt is one export per release: OSV keys Ubuntu and
 			// Debian advisories on the release, because the revision that
 			// carries a backported fix is a fact about one release. Resolve
 			// every ecosystem first, then hand the whole list over at once:
@@ -240,17 +302,18 @@ and point osv_db_dir at the copy.`,
 			owner := map[string]string{}
 			var failed []string
 			for _, eco := range ecosystems {
-				exports, unmapped := policy.OSVExportsFor(eco, cfg.ServedAptSuites())
+				exports, unmapped := policy.OSVExportsFor(eco, aptSuites)
 				for _, suite := range unmapped {
 					skipped = append(skipped, fmt.Sprintf("%s: OSV publishes no Ubuntu or Debian export for suite %q", eco, suite))
 				}
 				if len(exports) == 0 {
-					// Only apt can resolve to nothing, and a suite set that
-					// does is a skip rather than a failure: the language
+					// Only apt can resolve to nothing, and a set that does
+					// is a skip rather than a failure: the language
 					// ecosystems synced, and an operator whose apt_suites are
-					// house names would otherwise get exit 1 out of the
-					// no-argument form forever. Naming the type on the command
-					// line still fails, because that request fetched nothing.
+					// house names and whose catalog holds no apt would
+					// otherwise get exit 1 out of the no-argument form
+					// forever. Naming the type on the command line still
+					// fails, because that request fetched nothing.
 					if named {
 						failed = append(failed, fmt.Sprintf("%s: no OSV export to fetch", eco))
 					} else if len(unmapped) == 0 {

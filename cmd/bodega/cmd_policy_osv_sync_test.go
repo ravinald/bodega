@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
 
@@ -71,11 +73,21 @@ func osvBucket(t *testing.T) *httptest.Server {
 			// The aggregate archive carries every release at once, with the
 			// release in each affected entry's ecosystem string; the distill
 			// filter is what keys an index on one release.
-			rel := "Ubuntu:22.04:LTS"
+			rels := []string{"Ubuntu:22.04:LTS", "Ubuntu:24.04:LTS"}
 			if eco == "Debian" {
-				rel = "Debian:12"
+				rels = []string{"Debian:12"}
 			}
-			rec["affected"].([]any)[0].(map[string]any)["package"].(map[string]any)["ecosystem"] = rel
+			affected := rec["affected"].([]any)
+			base := affected[0].(map[string]any)
+			out := make([]any, 0, len(rels))
+			for _, rel := range rels {
+				one := map[string]any{
+					"package": map[string]any{"ecosystem": rel, "name": "expat"},
+					"ranges":  base["ranges"],
+				}
+				out = append(out, one)
+			}
+			rec["affected"] = out
 		}
 		var buf bytes.Buffer
 		zw := zip.NewWriter(&buf)
@@ -170,5 +182,76 @@ func TestSyncCommand_MappedAptSuiteFetchesItsRelease(t *testing.T) {
 	}
 	if _, err := policy.NewOSVDatabase(filepath.Join(root, "osv")).Meta("Ubuntu:22.04:LTS"); err != nil {
 		t.Errorf("the jammy index was not written: %v", err)
+	}
+}
+
+// storeAptEntry puts one apt version entry in the install's manifest store,
+// index included: the walk lists packages out of the index, not off disk.
+func storeAptEntry(t *testing.T, root, name string, ve manifest.VersionEntry) {
+	t.Helper()
+	store := manifest.NewLocalStore(filepath.Join(root, "manifests"))
+	if err := store.AddVersion(context.Background(), manifest.TypeApt, name, ve); err != nil {
+		t.Fatalf("AddVersion %s: %v", ve.Version, err)
+	}
+	if err := store.SaveIndex(context.Background()); err != nil {
+		t.Fatalf("SaveIndex: %v", err)
+	}
+}
+
+// TestSyncCommand_CapturedReleaseIsFetchedBesideTheServedSuite pins the set
+// sync resolves apt from against the set the gate reads.
+//
+// capture_suite is the release the gate answers an entry from and apt_suites is
+// where the .deb is published, so a bodega serving noble can hold a jammy
+// capture. Resolving the fetch from the served suites alone leaves that entry
+// unanswerable forever, and the warn names a sync that just ran.
+func TestSyncCommand_CapturedReleaseIsFetchedBesideTheServedSuite(t *testing.T) {
+	root := syncInstall(t, "noble", "noble")
+	storeAptEntry(t, root, "libexpat1", manifest.VersionEntry{
+		Version:       "2.4.7-1ubuntu0.2",
+		SourcePackage: "expat",
+		CaptureSuite:  "jammy",
+		Suites:        []string{"noble"},
+	})
+
+	stdout, _, err := runSync(t, "apt")
+	if err != nil {
+		t.Fatalf("sync apt: %v", err)
+	}
+	for _, eco := range []string{"Ubuntu:22.04:LTS", "Ubuntu:24.04:LTS"} {
+		if !strings.Contains(stdout, eco) {
+			t.Errorf("%s is missing from the table:\n%s", eco, stdout)
+		}
+		if _, err := policy.NewOSVDatabase(filepath.Join(root, "osv")).Meta(eco); err != nil {
+			t.Errorf("the %s index was not written: %v", eco, err)
+		}
+	}
+}
+
+// TestSyncCommand_MirrorInstallFetchesWhatItCaptured is the documented mirror:
+// apt_codename is a house name OSV publishes nothing for, and the releases live
+// on the captures alone. The skip covering the house name is not the whole of
+// apt there, or that install's gate answers nothing at all.
+func TestSyncCommand_MirrorInstallFetchesWhatItCaptured(t *testing.T) {
+	root := syncInstall(t, "internal", "internal")
+	storeAptEntry(t, root, "libexpat1", manifest.VersionEntry{
+		Version:       "2.6.1-2build1",
+		SourcePackage: "expat",
+		CaptureSuite:  "noble",
+		Suites:        []string{"internal"},
+	})
+
+	stdout, stderr, err := runSync(t)
+	if err != nil {
+		t.Fatalf("no-argument sync: %v", err)
+	}
+	if !strings.Contains(stdout, "Ubuntu:24.04:LTS") {
+		t.Fatalf("the captured release was never fetched:\n%s\n%s", stdout, stderr)
+	}
+	if _, err := policy.NewOSVDatabase(filepath.Join(root, "osv")).Meta("Ubuntu:24.04:LTS"); err != nil {
+		t.Errorf("the noble index was not written: %v", err)
+	}
+	if !strings.Contains(stderr, `"internal"`) {
+		t.Errorf("the house suite still has to be named, since entries recording no release warn on it: %q", stderr)
 	}
 }
