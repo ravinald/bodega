@@ -483,6 +483,11 @@ func createFromDoc(gf *globalFlags, doc *profileDoc, force bool) error {
 			VersionDefault: t.VersionDefault, Expansion: t.Expansion, AptBase: t.AptBase, Actor: actor,
 		})
 	}
+	for _, rule := range types {
+		if err := checkProfileAptBase(gf, doc.Name, rule); err != nil {
+			return err
+		}
+	}
 	entries := make([]audit.ProfileEntry, 0, len(doc.Entries))
 	for _, e := range doc.Entries {
 		entries = append(entries, audit.ProfileEntry{
@@ -1027,7 +1032,8 @@ name keeps the value it has.`,
 }
 
 // checkProfileAptBase refuses a base this instance could not serve, at the
-// write rather than at the next index rebuild.
+// write rather than at the next index rebuild. Both roads to a stored rule run
+// it: the flags set reads, and the document --from-file reads.
 //
 // Stored, a bad base is a control the operator believes they set: nothing
 // refuses it, the codename never appears, and the only evidence is one ERROR
@@ -1045,7 +1051,10 @@ func checkProfileAptBase(gf *globalFlags, profile string, rule audit.ProfileType
 	if rule.Membership != audit.MembershipClosed {
 		return fmt.Errorf("--base needs --membership closed: an open apt rule admits every package the archive publishes, "+
 			"so the filtered index would be the same document under a second name, signed by bodega instead of by the archive.\n"+
-			"  Close it:  bodega profile set %s apt --membership closed --base %s", profile, rule.AptBase)
+			"  Close it:  bodega profile set %s apt --membership closed --base %s\n"+
+			"  Or drop the base:  bodega profile set %s apt --membership %s --base \"\"\n"+
+			"    the profile then reads the mirrored codename %s unchanged, verified against the distro keyring",
+			profile, rule.AptBase, profile, rule.Membership, rule.AptBase)
 	}
 	if !refusesUnlisted(rule.Expansion) {
 		return aptBaseNeedsBlockRefusal(profile, rule)
@@ -1084,13 +1093,18 @@ func aptBaseNeedsBlockRefusal(profile string, rule audit.ProfileTypeRule) error 
 	if rule.Expansion == "" {
 		have += " (the default this rule does not name)"
 	}
+	drop := fmt.Sprintf("bodega profile set %s apt --base \"\"", profile)
+	if rule.Expansion != "" {
+		drop = fmt.Sprintf("bodega profile set %s apt --expansion %s --base \"\"", profile, rule.Expansion)
+	}
 	return fmt.Errorf("--base needs --expansion %s; this rule takes %s, which permits a package the profile does not list, "+
 		"so every upstream paragraph survives the filter and %s would serve the archive's own index under bodega's "+
 		"signature instead of the archive's: a host that stops verifying against the distro keyring, for no filtering.\n"+
 		"  Filter it:  bodega profile set %s apt --membership closed --expansion %s --base %s\n"+
-		"  Or drop the base: the profile then reads the mirrored codename %s unchanged, verified against the distro keyring",
+		"  Or drop the base:  %s\n"+
+		"    the profile then reads the mirrored codename %s unchanged, verified against the distro keyring",
 		audit.ExpansionBlock, have, config.ProfileAptCodename(rule.AptBase, profile),
-		profile, audit.ExpansionBlock, rule.AptBase, rule.AptBase)
+		profile, audit.ExpansionBlock, rule.AptBase, drop, rule.AptBase)
 }
 
 func orNone(s string) string {

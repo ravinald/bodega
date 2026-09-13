@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -457,4 +458,139 @@ func TestClearingTheAptBaseIsReportedAndRecorded(t *testing.T) {
 	if !found {
 		t.Errorf("no audit row records the cleared base:\n%+v", evs)
 	}
+}
+
+// writeAptBaseDoc writes a --from-file document whose apt rule carries a base,
+// shaped so validateDoc passes it and only the config half can refuse it.
+func writeAptBaseDoc(t *testing.T, profile, base string) string {
+	t.Helper()
+	doc := profileDoc{
+		ConfigVersion: 1,
+		Name:          profile,
+		Types: []profileDocType{{
+			Type:           manifest.TypeApt,
+			Membership:     audit.MembershipClosed,
+			VersionDefault: audit.VersionFloating,
+			Expansion:      audit.ExpansionBlock,
+			AptBase:        base,
+		}},
+		Entries: []profileDocEntry{{Type: manifest.TypeApt, Name: "nginx", Constraint: manifest.ConstraintAny}},
+	}
+	blob, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal doc: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), profile+".json")
+	if err := os.WriteFile(path, blob, 0o600); err != nil {
+		t.Fatalf("write doc: %v", err)
+	}
+	return path
+}
+
+// serveAptSuite puts a codename in apt_suites, which is the set a derived
+// codename collides with.
+func serveAptSuite(t *testing.T, suite string) {
+	t.Helper()
+	path := os.Getenv(config.EnvConfigFile)
+	blob, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(blob, &cfg); err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+	cfg["apt_suites"] = []any{suite}
+	out, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+}
+
+// noProfileRow asserts the refused document wrote nothing: a refusal that
+// reports an error and stores the rule anyway leaves the same control the
+// operator believes they set.
+func noProfileRow(t *testing.T, env *discoverEnv, profile string) {
+	t.Helper()
+	db, err := audit.Open(env.auditDB)
+	if err != nil {
+		t.Fatalf("open audit db: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.GetProfile(context.Background(), profile); !errors.Is(err, audit.ErrNoProfile) {
+		t.Fatalf("the refused document wrote a profile row: GetProfile(%q) = %v", profile, err)
+	}
+}
+
+// A base is a hand-typed codename in a file --from-origin wrote for an operator
+// to edit, so the typo reaches the fleet as every host's apt update 404ing on a
+// stanza doctor wrote from a codename nothing was ever going to generate. The
+// document road runs the same config check the flags do.
+func TestABaselineBaseNoArchiveMirrorsIsRefused(t *testing.T) {
+	t.Run("a base nothing mirrors", func(t *testing.T) {
+		env := newDiscoverEnv(t)
+		mirrorNoble(t)
+		path := writeAptBaseDoc(t, "web", "nobble")
+
+		_, err := runProfile(t, "create", "web", "--from-file", path)
+		if err == nil {
+			t.Fatal("a document naming an unmirrored base was accepted")
+		}
+		for _, want := range []string{"nobble", "apt_upstreams", "noble"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal does not name %q:\n%s", want, err)
+			}
+		}
+		noProfileRow(t, env, "web")
+	})
+
+	t.Run("a derived codename apt_suites already serves", func(t *testing.T) {
+		env := newDiscoverEnv(t)
+		mirrorNoble(t)
+		serveAptSuite(t, config.ProfileAptCodename("noble", "web"))
+		path := writeAptBaseDoc(t, "web", "noble")
+
+		_, err := runProfile(t, "create", "web", "--from-file", path)
+		if err == nil {
+			t.Fatal("a document deriving a codename apt_suites serves was accepted")
+		}
+		if !strings.Contains(err.Error(), "apt_suites") {
+			t.Errorf("the refusal does not name the collision:\n%s", err)
+		}
+		noProfileRow(t, env, "web")
+	})
+}
+
+// Opening a profile that carries a base is refused, correctly, and the operator
+// asked for the opposite of the repair the refusal used to print alone. Both
+// directions out of the state are named or the refusal is a dead end.
+func TestOpeningAnAptRuleOverALiveBaseNamesBothWaysOut(t *testing.T) {
+	newDiscoverEnv(t)
+	mirrorNoble(t)
+	mustRunProfile(t, "create", "web")
+	mustRunProfile(t, "add", "web", "apt", "nginx")
+	mustRunProfile(t, "set", "web", "apt", "--membership", "closed", "--expansion", "block", "--base", "noble")
+
+	out, err := runProfile(t, "set", "web", "apt", "--membership", "open")
+	if err == nil {
+		t.Fatalf("--membership open was accepted over a live base:\n%s", out)
+	}
+	for _, want := range []string{`--base ""`, "--membership open", "--membership closed"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q:\n%s", want, err)
+		}
+	}
+
+	// The expansion refusal is the same dead end reached by the other flag.
+	if _, err := runProfile(t, "set", "web", "apt", "--expansion", "warn"); err == nil {
+		t.Fatal("--expansion warn was accepted over a live base")
+	} else if !strings.Contains(err.Error(), `--base ""`) {
+		t.Errorf("the expansion refusal names no way to drop the base:\n%s", err)
+	}
+
+	// The route it prints is one an operator can run.
+	mustRunProfile(t, "set", "web", "apt", "--membership", "open", "--base", "")
 }
