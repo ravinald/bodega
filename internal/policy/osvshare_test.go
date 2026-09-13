@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"sort"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -116,11 +117,53 @@ func TestOSVShareOneCopyPerAdvisory(t *testing.T) {
 	}
 }
 
+// osvValueIndex and osvValueRecord are the archive's value shape: records held
+// by value under each package key, and each record's `affected` entries a
+// plain slice rather than the named type that canonicalizes them. Sharing
+// needed pointers, and both distill and the load path moved to them together,
+// so every index in the process is now pointer-shaped and a comparison between
+// two of them cannot see a pointer encoding that drifted. These two types are
+// the fixed point that comparison needs: they never change with the decode,
+// so a *osvRecord that stopped encoding as the record it points at fails
+// TestOSVShareWritesTheSameArchive rather than silently rewriting archives.
+type osvValueIndex struct {
+	Ecosystem string                      `json:"ecosystem"`
+	FetchedAt time.Time                   `json:"fetched_at"`
+	Packages  map[string][]osvValueRecord `json:"packages"`
+}
+
+type osvValueRecord struct {
+	ID       string        `json:"id"`
+	Summary  string        `json:"summary,omitempty"`
+	Severity []OSVSeverity `json:"severity,omitempty"`
+	Affected []osvAffected `json:"affected"`
+}
+
+func valueShapedOSV(idx *osvIndex) *osvValueIndex {
+	out := &osvValueIndex{
+		Ecosystem: idx.Ecosystem,
+		FetchedAt: idx.FetchedAt,
+		Packages:  make(map[string][]osvValueRecord, len(idx.Packages)),
+	}
+	for key, recs := range idx.Packages {
+		values := make([]osvValueRecord, len(recs))
+		for i, rec := range recs {
+			values[i] = osvValueRecord{
+				ID: rec.ID, Summary: rec.Summary, Severity: rec.Severity,
+				Affected: []osvAffected(rec.Affected),
+			}
+		}
+		out.Packages[key] = values
+	}
+	return out
+}
+
 // TestOSVShareWritesTheSameArchive holds the line writeIndex depends on:
 // sharing changes identity, so a loaded index has to encode to the bytes the
-// distilled one it was written from encodes to. distill feeds writeIndex
-// today; a future caller handing it an index it loaded must not write a
-// different archive, and nothing in the load path would report it if it did.
+// distilled one it was written from encodes to, and both have to encode to
+// what the value shape does. distill feeds writeIndex today; a future caller
+// handing it an index it loaded must not write a different archive, and
+// nothing in the load path would report it if it did.
 func TestOSVShareWritesTheSameArchive(t *testing.T) {
 	for _, pop := range osvSharePopulations(t) {
 		zipPath := exportZip(t, "archive-"+pop.name, pop.records)
@@ -135,8 +178,13 @@ func TestOSVShareWritesTheSameArchive(t *testing.T) {
 			distilled[eco].FetchedAt = mustOSVIndex(t, db, eco).FetchedAt
 			want := marshalOSV(t, distilled[eco])
 			for _, share := range []bool{true, false} {
-				if got := marshalOSV(t, loadOSVIndex(t, db.dir, eco, share)); got != want {
+				loaded := loadOSVIndex(t, db.dir, eco, share)
+				if got := marshalOSV(t, loaded); got != want {
 					t.Errorf("%s/%s (shared=%v): a loaded index encodes to different bytes than the distilled one:\n%s\nwant\n%s",
+						pop.name, eco, share, got, want)
+				}
+				if got := marshalOSV(t, valueShapedOSV(loaded)); got != want {
+					t.Errorf("%s/%s (shared=%v): the pointer shape encodes to different bytes than the value shape:\n%s\nwant\n%s",
 						pop.name, eco, share, got, want)
 				}
 			}
