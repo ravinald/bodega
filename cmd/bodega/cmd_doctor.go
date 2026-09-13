@@ -16,6 +16,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/host"
 	"github.com/ravinald/bodega/internal/policy"
 )
@@ -116,6 +117,7 @@ See docs/THREAT_MODEL.md for the rationale behind each check.`,
 				findings = append(findings, fn())
 			}
 			findings = append(findings, serverPostureFindings(backgroundCtx(), gf)...)
+			findings = append(findings, retiredConfigKeys(gf))
 
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 			fmt.Fprintln(w, "CHECK\tSTATUS\tDETAIL")
@@ -362,6 +364,61 @@ func getBody(c *Client, path string) ([]byte, error) {
 		return nil, fmt.Errorf("GET %s: %s\n%s", path, resp.Status, serverError(body))
 	}
 	return body, nil
+}
+
+// retiredKeyReaders names the config keys nothing reads any more, and what to
+// do about each. Save preserves a key it did not parse, so a retired key
+// survives every write and goes on looking like a setting in force — which is
+// B11's reason for reporting tls_autocert at the server, and the same reason
+// this row exists for an operator who never starts one.
+var retiredKeyReaders = []struct {
+	key    string
+	reason string
+}{
+	{"tls_autocert", "bodega has no ACME client; set tls_cert and tls_key, or terminate TLS in front and set allow_plaintext"},
+	{"tls_domain", "bodega has no ACME client; set tls_cert and tls_key, or terminate TLS in front and set allow_plaintext"},
+	{"custom_paths", "the per-type roots are always honored, so this gated nothing; delete the key and keep or clear the roots themselves"},
+}
+
+// retiredConfigKeys reports keys the file still carries that nothing reads. A
+// key held at its zero value says nothing was asked for and is not reported:
+// "custom_paths": false and an absent custom_paths describe the same install.
+func retiredConfigKeys(gf *globalFlags) host.Finding {
+	f := host.Finding{Check: "retired-config-keys", Status: host.StatusOK}
+
+	cfg, err := loadConfig(gf)
+	if err != nil {
+		f.Status = host.StatusNA
+		f.Detail = "could not read the config file: " + err.Error()
+		return f
+	}
+
+	var found []string
+	for _, k := range retiredKeyReaders {
+		raw, ok := cfg.RawFileValue(k.key)
+		if !ok || isZeroJSON(raw) {
+			continue
+		}
+		found = append(found, k.key+" ("+k.reason+")")
+	}
+	if len(found) == 0 {
+		f.Detail = "the config file carries no key that nothing reads"
+		return f
+	}
+	f.Status = host.StatusWarn
+	f.Detail = "retired keys still in " + config.ConfigPath() + ": " + strings.Join(found, "; ")
+	f.Remediation = "delete them; they are preserved on every save and read by nothing"
+	return f
+}
+
+// isZeroJSON reports whether a raw value is the zero of its own shape, which
+// is how a key that was written and never meant reads.
+func isZeroJSON(raw json.RawMessage) bool {
+	switch v := strings.TrimSpace(string(raw)); v {
+	case "", "false", "0", `""`, "null", "[]", "{}":
+		return true
+	}
+	return false
 }
 
 // postureChecks names the server-posture rows in the order doctor prints them.

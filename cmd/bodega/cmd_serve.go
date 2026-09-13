@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -237,8 +238,22 @@ func retiredTLSFlags(flags *pflag.FlagSet) []string {
 func reportRetiredTLSKeys(cfg *config.Config, retiredFlags []string, logger *slog.Logger) {
 	given := retiredFlags
 	if len(given) == 0 {
+		// Both keys, because Save preserves a key it did not parse: a
+		// tls_domain left in config.json survives every write and goes on
+		// looking like a setting in force, which is B11's reason for reporting
+		// tls_autocert at all. B29 gave the two flags equal treatment on the
+		// command line and scoped itself there; this is the config half.
+		//
+		// tls_autocert is a bool and only "true" says anything was asked for.
+		// tls_domain is a string, so any non-empty value is the request.
 		if raw, ok := cfg.RawFileValue("tls_autocert"); ok && string(raw) == "true" {
-			given = []string{"tls_autocert"}
+			given = append(given, "tls_autocert")
+		}
+		if raw, ok := cfg.RawFileValue("tls_domain"); ok {
+			var domain string
+			if json.Unmarshal(raw, &domain) == nil && strings.TrimSpace(domain) != "" {
+				given = append(given, "tls_domain")
+			}
 		}
 	}
 	if len(given) == 0 {
