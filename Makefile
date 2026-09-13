@@ -113,11 +113,22 @@ build:
 	go build $(GOFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY) $(CMD_PKG)
 	@echo "Built: $(BUILD_DIR)/$(BINARY) (version: $(VERSION))"
 
-## cross: Cross-compile for linux/amd64 (run on macOS workstation)
+# CROSS_TARGETS is every linux pair a bodega host might be. arm64 is here
+# because both development guests are aarch64 and the amd64-only target failed
+# on them as "cannot execute binary file", which reads as a broken upload
+# rather than as the wrong architecture. Override to narrow it:
+#   make cross CROSS_TARGETS=linux/amd64
+CROSS_TARGETS ?= linux/amd64 linux/arm64
+
+## cross: Cross-compile for every pair in CROSS_TARGETS (run on macOS workstation)
 cross:
 	@mkdir -p $(BUILD_DIR)
-	GOOS=linux GOARCH=amd64 go build $(GOFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY)-linux-amd64 $(CMD_PKG)
-	@echo "Built: $(BUILD_DIR)/$(BINARY)-linux-amd64 (version: $(VERSION))"
+	@for target in $(CROSS_TARGETS); do \
+		goos=$${target%%/*}; goarch=$${target##*/}; \
+		out="$(BUILD_DIR)/$(BINARY)-$$goos-$$goarch"; \
+		GOOS=$$goos GOARCH=$$goarch go build $(GOFLAGS) $(LDFLAGS) -o "$$out" $(CMD_PKG) || exit 1; \
+		echo "Built: $$out (version: $(VERSION))"; \
+	done
 
 ## install: Install bodega to $(BINDIR) (sudo only if needed; override PREFIX/BINDIR)
 install: build
