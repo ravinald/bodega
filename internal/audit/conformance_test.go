@@ -95,9 +95,14 @@ func testEventSink(t *testing.T, mk func(t *testing.T) sinkHarness) {
 
 	cases := []struct {
 		name string
-		run  func(t *testing.T, ctx context.Context, h sinkHarness)
+		// budget shrinks the SQLite busy_timeout every handle in this case
+		// opens with. Zero leaves the shipped value alone. It exists so a case
+		// about lock contention can assert against a wait it chose rather than
+		// against how fast the machine running it happens to be.
+		budget time.Duration
+		run    func(t *testing.T, ctx context.Context, h sinkHarness)
 	}{
-		{"every_event_field_survives", func(t *testing.T, ctx context.Context, h sinkHarness) {
+		{"every_event_field_survives", 0, func(t *testing.T, ctx context.Context, h sinkHarness) {
 			if err := h.sink.Record(ctx, fullEvent); err != nil {
 				t.Fatalf("Record: %v", err)
 			}
@@ -117,7 +122,7 @@ func testEventSink(t *testing.T, mk func(t *testing.T) sinkHarness) {
 			}
 		}},
 
-		{"every_discovery_field_survives", func(t *testing.T, ctx context.Context, h sinkHarness) {
+		{"every_discovery_field_survives", 0, func(t *testing.T, ctx context.Context, h sinkHarness) {
 			if _, err := h.sink.RecordDiscovery(ctx, fullRow); err != nil {
 				t.Fatalf("RecordDiscovery: %v", err)
 			}
@@ -139,7 +144,7 @@ func testEventSink(t *testing.T, mk func(t *testing.T) sinkHarness) {
 		// The embedded store enforces the decision set with a CHECK. A sink
 		// that accepted a value the store refuses would let a swap widen what
 		// the discovery table can hold, and `discover promote` filters on it.
-		{"decision_outside_the_set_is_refused", func(t *testing.T, ctx context.Context, h sinkHarness) {
+		{"decision_outside_the_set_is_refused", 0, func(t *testing.T, ctx context.Context, h sinkHarness) {
 			bad := fullRow
 			bad.Decision = "would_deny" // retired by SQLite migration 010
 			if _, err := h.sink.RecordDiscovery(ctx, bad); err == nil {
@@ -153,7 +158,7 @@ func testEventSink(t *testing.T, mk func(t *testing.T) sinkHarness) {
 		// One newline-carrying event must stay one record. A sink that wrote
 		// the user agent raw would produce two, and the second would parse as
 		// a truncated record rather than failing loudly.
-		{"a_newline_cannot_forge_a_second_record", func(t *testing.T, ctx context.Context, h sinkHarness) {
+		{"a_newline_cannot_forge_a_second_record", 0, func(t *testing.T, ctx context.Context, h sinkHarness) {
 			if err := h.sink.Record(ctx, fullEvent); err != nil {
 				t.Fatalf("Record: %v", err)
 			}
@@ -165,7 +170,18 @@ func testEventSink(t *testing.T, mk func(t *testing.T) sinkHarness) {
 		// B9 requirement 2, held against every sink: eight goroutines, fifty
 		// events each, through one handle. SQLite stored 30 of 400 before the
 		// busy_timeout landed, and a new sink must not ship below that bar.
-		{"concurrent_writers_keep_every_event", func(t *testing.T, ctx context.Context, h sinkHarness) {
+		// The lock budget is 1ms rather than the shipped 5s, because 5s
+		// asserts two things at once: that the sink keeps every event, and
+		// that the machine is fast enough to finish inside the wait. The
+		// second one is not a property of bodega, and it is the one that
+		// failed — on CI, storing 397 to 399 of 400, reported as the exact
+		// regression B9 exists to prevent.
+		//
+		// Measured on Linux under -race with only this value varied: 400 of
+		// 400 at 5s, 399 at 200ms, ~390 at 50ms, ~338 at 10ms. At 1ms an
+		// unbounded writer pool loses rows on any machine, so what remains
+		// under test is whether the sink serializes its own writes.
+		{"concurrent_writers_keep_every_event", time.Millisecond, func(t *testing.T, ctx context.Context, h sinkHarness) {
 			const writers, per = 8, 50
 			var wg sync.WaitGroup
 			errs := make(chan error, writers*per)
@@ -205,7 +221,7 @@ func testEventSink(t *testing.T, mk func(t *testing.T) sinkHarness) {
 
 		// Capability-scoped from here down. These are the differences between
 		// the two halves of the sink set, asserted rather than assumed.
-		{"repeat_observations_collapse_only_on_a_queryable_sink", func(t *testing.T, ctx context.Context, h sinkHarness) {
+		{"repeat_observations_collapse_only_on_a_queryable_sink", 0, func(t *testing.T, ctx context.Context, h sinkHarness) {
 			for i := 0; i < 3; i++ {
 				if _, err := h.sink.RecordDiscovery(ctx, fullRow); err != nil {
 					t.Fatalf("RecordDiscovery %d: %v", i, err)
@@ -244,7 +260,7 @@ func testEventSink(t *testing.T, mk func(t *testing.T) sinkHarness) {
 		// the whole write on ordinary traffic — a live request stream repeats
 		// keys constantly. The counts must come out the same as three separate
 		// calls, which is the case above.
-		{"a_batch_repeating_a_key_counts_the_same_as_separate_calls", func(t *testing.T, ctx context.Context, h sinkHarness) {
+		{"a_batch_repeating_a_key_counts_the_same_as_separate_calls", 0, func(t *testing.T, ctx context.Context, h sinkHarness) {
 			other := fullRow
 			other.PkgName = "github.com/aws/aws-sdk-go-v2/config"
 			batch := []DiscoveryRow{fullRow, other, fullRow, fullRow}
@@ -281,7 +297,7 @@ func testEventSink(t *testing.T, mk func(t *testing.T) sinkHarness) {
 			}
 		}},
 
-		{"a_write_only_sink_answers_no_query", func(t *testing.T, ctx context.Context, h sinkHarness) {
+		{"a_write_only_sink_answers_no_query", 0, func(t *testing.T, ctx context.Context, h sinkHarness) {
 			if err := h.sink.Record(ctx, fullEvent); err != nil {
 				t.Fatalf("Record: %v", err)
 			}
@@ -302,7 +318,7 @@ func testEventSink(t *testing.T, mk func(t *testing.T) sinkHarness) {
 			}
 		}},
 
-		{"filters_select_by_event_type", func(t *testing.T, ctx context.Context, h sinkHarness) {
+		{"filters_select_by_event_type", 0, func(t *testing.T, ctx context.Context, h sinkHarness) {
 			if !h.queryable {
 				t.Skip("write-only sink: no query surface to filter with")
 			}
@@ -335,6 +351,12 @@ func testEventSink(t *testing.T, mk func(t *testing.T) sinkHarness) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			// Before mk: the budget is baked into the DSN at open.
+			if tc.budget > 0 {
+				prev := lockBudget
+				lockBudget = tc.budget
+				t.Cleanup(func() { lockBudget = prev })
+			}
 			h := mk(t)
 			tc.run(t, context.Background(), h)
 		})

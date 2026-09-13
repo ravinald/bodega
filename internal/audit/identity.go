@@ -156,7 +156,7 @@ func (a *DB) AddIdentityBinding(ctx context.Context, b IdentityBinding) (bool, e
 		}
 	}
 
-	_, err = a.db.ExecContext(ctx,
+	_, err = a.writer().ExecContext(ctx,
 		`INSERT INTO identity_bindings (kind, bind_key, identity, comment, actor) VALUES (?, ?, ?, ?, ?)`,
 		b.Kind, b.Key, b.Identity, b.Comment, b.Actor)
 	if err != nil {
@@ -249,7 +249,7 @@ func (a *DB) RemoveIdentityBinding(ctx context.Context, kind, key string) (bool,
 		}
 		key = p.String()
 	}
-	res, err := a.db.ExecContext(ctx,
+	res, err := a.writer().ExecContext(ctx,
 		`DELETE FROM identity_bindings WHERE kind = ? AND bind_key = ?`, kind, key)
 	if err != nil {
 		return false, err

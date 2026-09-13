@@ -23,7 +23,7 @@ type PolicyInfo struct {
 // SQLite UNIQUE constraint violation) if a rule with the same type+kind+
 // pattern already exists.
 func (a *DB) InsertPolicy(ctx context.Context, p PolicyInfo) error {
-	_, err := a.db.ExecContext(ctx,
+	_, err := a.writer().ExecContext(ctx,
 		`INSERT INTO upstream_policies (id, registry_type, rule_kind, pattern, comment, created_by)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
 		p.ID, p.RegistryType, p.RuleKind, p.Pattern, p.Comment, p.CreatedBy,
@@ -67,7 +67,7 @@ func (a *DB) GetPoliciesByType(ctx context.Context, registryType string) ([]Poli
 // DeletePolicyByID removes a rule by its UUID. Returns (true, nil) when a row
 // was actually deleted.
 func (a *DB) DeletePolicyByID(ctx context.Context, id string) (bool, error) {
-	res, err := a.db.ExecContext(ctx, `DELETE FROM upstream_policies WHERE id = ?`, id)
+	res, err := a.writer().ExecContext(ctx, `DELETE FROM upstream_policies WHERE id = ?`, id)
 	if err != nil {
 		return false, err
 	}
@@ -84,9 +84,9 @@ func (a *DB) DeletePolicyByPattern(ctx context.Context, registryType, pattern st
 		err error
 	)
 	if registryType == "" {
-		res, err = a.db.ExecContext(ctx, `DELETE FROM upstream_policies WHERE pattern = ?`, pattern)
+		res, err = a.writer().ExecContext(ctx, `DELETE FROM upstream_policies WHERE pattern = ?`, pattern)
 	} else {
-		res, err = a.db.ExecContext(ctx,
+		res, err = a.writer().ExecContext(ctx,
 			`DELETE FROM upstream_policies WHERE registry_type = ? AND pattern = ?`,
 			registryType, pattern,
 		)

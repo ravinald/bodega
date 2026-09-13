@@ -22,7 +22,7 @@ type AgePolicy struct {
 var ErrAgePolicyNotFound = errors.New("age policy not set for ecosystem")
 
 func (a *DB) SetAgePolicy(ctx context.Context, p AgePolicy) error {
-	_, err := a.db.ExecContext(ctx, `
+	_, err := a.writer().ExecContext(ctx, `
 		INSERT INTO age_policy (ecosystem, min_age_seconds, action, updated_at)
 		VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 		ON CONFLICT(ecosystem) DO UPDATE SET
@@ -71,7 +71,7 @@ func (a *DB) ListAgePolicies(ctx context.Context) ([]AgePolicy, error) {
 }
 
 func (a *DB) DeleteAgePolicy(ctx context.Context, ecosystem string) (bool, error) {
-	res, err := a.db.ExecContext(ctx, `DELETE FROM age_policy WHERE ecosystem = ?`, ecosystem)
+	res, err := a.writer().ExecContext(ctx, `DELETE FROM age_policy WHERE ecosystem = ?`, ecosystem)
 	if err != nil {
 		return false, err
 	}
