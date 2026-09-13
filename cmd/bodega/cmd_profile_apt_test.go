@@ -349,3 +349,112 @@ func TestProfileCheckIsSilentWhenAPinCoversEveryBinaryOfItsSource(t *testing.T) 
 		t.Errorf("check reported a dropped binary for a source whose binaries all carry the pinned version:\n%s", out)
 	}
 }
+
+// aptRule reads one profile's apt rule back through the store the server reads,
+// so an assertion about what `set` wrote cannot be satisfied by what it printed.
+func aptRule(t *testing.T, env *discoverEnv, profile string) audit.ProfileTypeRule {
+	t.Helper()
+	db, err := audit.Open(env.auditDB)
+	if err != nil {
+		t.Fatalf("open audit db: %v", err)
+	}
+	defer db.Close()
+	d, err := db.GetProfile(context.Background(), profile)
+	if err != nil {
+		t.Fatalf("get profile %s: %v", profile, err)
+	}
+	for _, r := range d.Types {
+		if r.Type == manifest.TypeApt {
+			return r
+		}
+	}
+	t.Fatalf("profile %s states no apt rule", profile)
+	return audit.ProfileTypeRule{}
+}
+
+// An edit naming one flag keeps the base, which is the fleet's whole apt
+// control: cleared, AptScope returns empty, the next rebuild generates no
+// filtered codename, and every host whose sources.list bodega doctor wrote
+// fails apt update against a 404. The read-back loop carries three fields and
+// has to carry the fourth.
+func TestAnAptEditNamingNoBaseKeepsIt(t *testing.T) {
+	env := newDiscoverEnv(t)
+	mirrorNoble(t)
+	mustRunProfile(t, "create", "web")
+	mustRunProfile(t, "add", "web", "apt", "nginx")
+	mustRunProfile(t, "set", "web", "apt", "--membership", "closed", "--expansion", "block", "--base", "noble")
+
+	out := mustRunProfile(t, "set", "web", "apt", "--version-default", "pinned")
+	if got := aptRule(t, env, "web"); got.AptBase != "noble" {
+		t.Fatalf("--version-default cleared the base: apt_base=%q, want %q", got.AptBase, "noble")
+	}
+	if !strings.Contains(out, "noble-web") {
+		t.Errorf("the edit does not report the codename it left standing:\n%s", out)
+	}
+
+	// --base "" still clears it, which is the documented way to drop one.
+	mustRunProfile(t, "set", "web", "apt", "--base", "")
+	if got := aptRule(t, env, "web"); got.AptBase != "" {
+		t.Fatalf(`--base "" left apt_base=%q`, got.AptBase)
+	}
+}
+
+// The refusal checkProfileAptBase states is reachable by the spelling that omits
+// --base. Read back, the rule carries one, so an expansion that permits an
+// unlisted package meets the same error rather than silently retiring the
+// codename.
+func TestAnAptEditNamingNoBaseMeetsTheExpansionRefusal(t *testing.T) {
+	env := newDiscoverEnv(t)
+	mirrorNoble(t)
+	mustRunProfile(t, "create", "web")
+	mustRunProfile(t, "add", "web", "apt", "nginx")
+	mustRunProfile(t, "set", "web", "apt", "--membership", "closed", "--expansion", "block", "--base", "noble")
+
+	out, err := runProfile(t, "set", "web", "apt", "--expansion", "warn")
+	if err == nil {
+		t.Fatalf("--expansion warn was accepted over a live base, which retires the codename:\n%s", out)
+	}
+	for _, want := range []string{"--expansion block", "noble-web", "warn"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q:\n%s", want, err)
+		}
+	}
+	if got := aptRule(t, env, "web"); got.Expansion != audit.ExpansionBlock || got.AptBase != "noble" {
+		t.Errorf("the refused edit landed anyway: expansion=%q apt_base=%q", got.Expansion, got.AptBase)
+	}
+}
+
+// Clearing a base is a fleet-wide change to what apt serves, so it is reported
+// and recorded. The echo line names every field it did not change; omitting the
+// one it did is how an operator learns about it from a host instead.
+func TestClearingTheAptBaseIsReportedAndRecorded(t *testing.T) {
+	env := newDiscoverEnv(t)
+	mirrorNoble(t)
+	mustRunProfile(t, "create", "web")
+	mustRunProfile(t, "add", "web", "apt", "nginx")
+	mustRunProfile(t, "set", "web", "apt", "--membership", "closed", "--expansion", "block", "--base", "noble")
+
+	out := mustRunProfile(t, "set", "web", "apt", "--base", "")
+	if !strings.Contains(out, "no base") {
+		t.Errorf("clearing the base printed nothing about it:\n%s", out)
+	}
+
+	db, err := audit.Open(env.auditDB)
+	if err != nil {
+		t.Fatalf("open audit db: %v", err)
+	}
+	defer db.Close()
+	evs, err := db.Query(context.Background(), audit.Filter{PkgType: "profile", PkgName: "web"})
+	if err != nil {
+		t.Fatalf("query events: %v", err)
+	}
+	var found bool
+	for _, ev := range evs {
+		if strings.Contains(ev.Details, `apt_base=""`) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no audit row records the cleared base:\n%+v", evs)
+	}
+}

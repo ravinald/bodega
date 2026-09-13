@@ -971,7 +971,7 @@ name keeps the value it has.`,
 			for _, t := range d.Types {
 				if t.Type == typ {
 					rule.Membership, rule.VersionDefault = t.Membership, t.VersionDefault
-					rule.Expansion = t.Expansion
+					rule.Expansion, rule.AptBase = t.Expansion, t.AptBase
 				}
 			}
 			if membership != "" {
@@ -1000,14 +1000,20 @@ name keeps the value it has.`,
 			if err := adb.SetProfileTypeRule(ctx, rule); err != nil {
 				return err
 			}
-			recordProfileEvent(ctx, adb, audit.EventEdit, profile, typ,
-				fmt.Sprintf("membership=%s version_default=%s expansion=%s",
-					rule.Membership, rule.VersionDefault, rule.Expansion))
+			details := fmt.Sprintf("membership=%s version_default=%s expansion=%s",
+				rule.Membership, rule.VersionDefault, rule.Expansion)
+			if typ == manifest.TypeApt {
+				details += fmt.Sprintf(" apt_base=%q", rule.AptBase)
+			}
+			recordProfileEvent(ctx, adb, audit.EventEdit, profile, typ, details)
 			fmt.Printf("%s %s: membership=%s version_default=%s expansion=%s\n",
 				profile, typ, rule.Membership, rule.VersionDefault, rule.Expansion)
-			if rule.AptBase != "" {
+			switch {
+			case rule.AptBase != "":
 				fmt.Printf("  filtered codename: %s (from %s), served after the next index rebuild\n",
 					config.ProfileAptCodename(rule.AptBase, profile), rule.AptBase)
+			case typ == manifest.TypeApt:
+				fmt.Printf("  no base: this profile's hosts read the mirrored codenames unfiltered\n")
 			}
 			return nil
 		},
