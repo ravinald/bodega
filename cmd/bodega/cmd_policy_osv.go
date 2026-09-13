@@ -435,18 +435,11 @@ func reportUntrimmed(order []string, byRow map[string][]string) {
 		if len(ecos) == 0 {
 			continue
 		}
-		fmt.Printf("\nOversized: %s %s synced before enumerated version lists were trimmed, so each\n"+
-			"holds several times the memory its advisories need. The advisories are current;\n"+
-			"re-sync with 'bodega policy osv sync %s' to reclaim it.\n",
-			strings.Join(ecos, ", "), archivePlural(len(ecos)), row)
+		fmt.Printf("\nOversized: %s.\nSynced before enumerated version lists were trimmed, so each holds several times\n"+
+			"the memory its advisories need. The advisories are current; re-sync with\n"+
+			"'bodega policy osv sync %s' to reclaim it.\n",
+			strings.Join(ecos, ", "), row)
 	}
-}
-
-func archivePlural(n int) string {
-	if n == 1 {
-		return "was"
-	}
-	return "were"
 }
 
 func onOff(b bool) string {
