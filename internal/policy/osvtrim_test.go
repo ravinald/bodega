@@ -30,6 +30,14 @@ type osvTrimPopulation struct {
 // alone reports a rule it never exercised. These entries reach outside their
 // ranges under each of the three orderings, which is the case the per-string
 // condition exists for.
+//
+// TRIM-PEP440-2 and TRIM-PEP440-3 are the other case: an entry whose only
+// range is SEMVER under an ecosystem that orders by PEP 440. Semver places
+// "1.0.0-1" below the fixed bound as a prerelease, PEP 440 reads it as
+// post-release 1 and calls it equal to "1.0.0.post1", which semver cannot
+// place at all. Dropping it would answer that query out of a range the query
+// is never judged under, so the divergence shows only with both spellings in
+// the population.
 const osvTrimAdversarial = `[
  {"id": "TRIM-SEMVER-1",
   "affected": [{"package": {"ecosystem": "npm", "name": "reaches-outside"},
@@ -42,6 +50,13 @@ const osvTrimAdversarial = `[
   "affected": [{"package": {"ecosystem": "PyPI", "name": "reaches-outside"},
    "versions": ["1.0", "1.5", "4.1.0-NA"],
    "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "0"}, {"fixed": "2.0"}]}]}]},
+ {"id": "TRIM-PEP440-2",
+  "affected": [{"package": {"ecosystem": "PyPI", "name": "semver-range"},
+   "versions": ["1.0.0-1"],
+   "ranges": [{"type": "SEMVER", "events": [{"introduced": "0"}, {"fixed": "1.0.0"}]}]}]},
+ {"id": "TRIM-PEP440-3",
+  "affected": [{"package": {"ecosystem": "PyPI", "name": "pep440-spellings"},
+   "versions": ["1.0.0.post1"]}]},
  {"id": "TRIM-DEBIAN-1",
   "affected": [{"package": {"ecosystem": "Ubuntu:22.04:LTS", "name": "reaches-outside"},
    "versions": ["2.4.7-1ubuntu0.2", "2.4.7-1ubuntu0.3", "9:99-1"],
@@ -132,20 +147,31 @@ func TestOSVTrimChangesNoVerdict(t *testing.T) {
 	}
 }
 
-// TestOSVTrimKeepsUnplaceableVersions defends the orderable guard, which no
-// comparison of verdicts can: dropping a string the entry's ranges match never
-// changes an answer, orderable or not, because the query of that same string
-// walks those same ranges. What the guard buys is that the rule stands on its
-// own rather than on osvRange.affects refusing a version it cannot place, and
-// that an ecosystem ordering is never overruled by a SEMVER range carried in
-// the same entry.
+// TestOSVTrimKeepsUnplaceableVersions defends the two guards a comparison of
+// verdicts reaches badly or not at all. Dropping a string the entry's ranges
+// match never changes an answer, orderable or not, because the query of that
+// same string walks those same ranges; what the orderable guard buys is that
+// the rule stands on its own rather than on osvRange.affects refusing a
+// version it cannot place. The SEMVER guard does reach a verdict, but only
+// through a population carrying both spellings of one version, so the rule is
+// pinned here as well.
 func TestOSVTrimKeepsUnplaceableVersions(t *testing.T) {
 	// Real shapes: "4.1.0-NA" bounds pynetbox on PyPI and parses as semver
 	// while PEP 440 refuses it.
-	ranges := []osvRange{{Type: "SEMVER", Events: []osvEvent{{Introduced: "0"}}}}
-	got := trimCovered(orderPEP440, []string{"1.0", "4.1.0-NA"}, ranges)
+	ecosystem := []osvRange{{Type: "ECOSYSTEM", Events: []osvEvent{{Introduced: "0"}}}}
+	got := trimCovered(orderPEP440, []string{"1.0", "4.1.0-NA"}, ecosystem)
 	if len(got) != 1 || got[0] != "4.1.0-NA" {
 		t.Errorf("trimCovered kept %v, want only the version PEP 440 cannot place", got)
+	}
+	// A SEMVER range decides nothing for a PEP 440 ecosystem: it places
+	// "1.0.0-1" as a prerelease below the bound, while the query that reaches
+	// it, "1.0.0.post1", is placed by PEP 440 or by nothing.
+	semver := []osvRange{{Type: "SEMVER", Events: []osvEvent{{Introduced: "0"}, {Fixed: "1.0.0"}}}}
+	if kept := trimCovered(orderPEP440, []string{"1.0.0-1"}, semver); len(kept) != 1 {
+		t.Errorf("a SEMVER range under PEP 440 dropped %v; it decides no string the query is judged by", kept)
+	}
+	if kept := trimCovered(orderSemver, []string{"1.0.0-1"}, semver); len(kept) != 0 {
+		t.Errorf("under semver that same range is the ordering the query uses; trim kept %v", kept)
 	}
 	if kept := trimCovered(orderDebian, []string{"1:2.4.7-1ubuntu0.2"}, nil); len(kept) != 1 {
 		t.Errorf("an entry with no range is the enumerated list or nothing; trim kept %v", kept)

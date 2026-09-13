@@ -130,22 +130,38 @@ func (a osvAffected) affects(order, version string) (matched bool, unorderable s
 // of short strings the decoder allocates one at a time; the strings the ranges
 // cover carry nothing the ranges do not.
 //
+// Only the ranges order itself decides are allowed to drop a string.
+// osvRange.affects overrides the ecosystem ordering with semver for a SEMVER
+// range, so an entry can carry a range that places a string under one ordering
+// while the query that reaches it is placed under another: PEP 440 reads
+// "1.0.0-1" as post-release 1 and calls it equal to "1.0.0.post1", semver reads
+// it as a prerelease below a `fixed: "1.0.0"` bound. Dropping under semver and
+// answering under PEP 440 turns that match into a miss, so such a range is left
+// out of the decision and its strings are kept.
+//
 // The drop is a no-op for affects by construction rather than by sampling,
 // which is why it is decided per string. Let v be a dropped string and q a
 // queried one. If q == v, the ranges match v by the drop condition, so they
-// match q. If the ordering reports v and q equal, q compares identically to v
-// at every bound, so the walk returns for q what it returned for v. If the
+// match q. If the ordering reports v and q equal, the range that placed v is
+// walked under that same ordering, so q compares identically to v at every one
+// of its bounds and the walk returns for q what it returned for v. If the
 // ordering cannot place q, q equals no dropped string, because every dropped
 // string was orderable. A string the ranges do not place is kept, so a list
 // reaching outside its own ranges keeps exactly the strings that reach.
 //
-// An entry with no range is returned untouched: it is the enumerated list or
-// nothing.
+// An entry the ordering decides no range of is returned untouched: it is the
+// enumerated list or nothing.
 func trimCovered(order string, versions []string, ranges []osvRange) []string {
-	if len(ranges) == 0 {
+	var covered osvAffected
+	for _, r := range ranges {
+		if r.Type == "SEMVER" && order != orderSemver {
+			continue
+		}
+		covered.Ranges = append(covered.Ranges, r)
+	}
+	if len(covered.Ranges) == 0 {
 		return versions
 	}
-	covered := osvAffected{Ranges: ranges}
 	var keep []string
 	for _, v := range versions {
 		if orderable(order, v) {

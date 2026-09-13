@@ -425,19 +425,23 @@ func osvDBState(db *policy.OSVDatabase, ecosystem string, aptSuites []string) (s
 	return oldest.Format(time.RFC3339), policy.ShortDuration(time.Since(oldest)), untrimmed
 }
 
-// reportUntrimmed names the archives a re-sync would shrink, per row, with the
-// command that does it. An archive written before the trim enumerates every
-// version each advisory covers, which costs a long-running process several
-// times what the same advisories need.
+// reportUntrimmed names the archives written before the trim, per row, with
+// the command that replaces them. What a re-sync reclaims is a property of the
+// advisories rather than of the archive, so the notice says what the trim does
+// instead of promising a figure: it is most of a distro release's resident
+// cost and nothing at all on npm, whose advisories enumerate no versions.
 func reportUntrimmed(order []string, byRow map[string][]string) {
 	for _, row := range order {
 		ecos := byRow[row]
 		if len(ecos) == 0 {
 			continue
 		}
-		fmt.Printf("\nOversized: %s.\nSynced before enumerated version lists were trimmed, so each holds several times\n"+
-			"the memory its advisories need. The advisories are current; re-sync with\n"+
-			"'bodega policy osv sync %s' to reclaim it.\n",
+		fmt.Printf("\nSynced before the version-list trim: %s.\n"+
+			"Each holds every version its advisories enumerate, where a re-sync keeps only the\n"+
+			"ones those advisories' own ranges do not place. On the Ubuntu and Debian releases\n"+
+			"that is most of what the index costs in memory; on an ecosystem whose advisories\n"+
+			"enumerate nothing it is no difference at all. The advisories are current; re-sync\n"+
+			"with 'bodega policy osv sync %s'.\n",
 			strings.Join(ecos, ", "), row)
 	}
 }

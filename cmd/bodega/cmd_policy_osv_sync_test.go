@@ -375,8 +375,8 @@ func TestListCommand_NamesAnArchiveSyncedBeforeTheTrim(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	if strings.Contains(stdout, "Oversized") {
-		t.Fatalf("this sync trimmed; list reported it oversized anyway:\n%s", stdout)
+	if strings.Contains(stdout, "Synced before the version-list trim") {
+		t.Fatalf("this sync trimmed; list named it pre-trim anyway:\n%s", stdout)
 	}
 
 	// A sidecar an older version wrote carries no trimming flag at all, and
@@ -403,7 +403,7 @@ func TestListCommand_NamesAnArchiveSyncedBeforeTheTrim(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	if !strings.Contains(stdout, "Oversized: Ubuntu:22.04:LTS") {
+	if !strings.Contains(stdout, "Synced before the version-list trim: Ubuntu:22.04:LTS") {
 		t.Errorf("the pre-trim archive is unnamed, so nothing in the install would ever say so:\n%s", stdout)
 	}
 	if !strings.Contains(stdout, "bodega policy osv sync apt") {
