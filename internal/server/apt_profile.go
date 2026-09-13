@@ -83,14 +83,14 @@ type aptProfileSuite struct {
 // operator writes the profile, reads the sources line off `bodega doctor`, and
 // binds the host afterwards. Requiring the binding first would mean the
 // codename 404s during exactly the step that installs it.
-func (s *Server) aptProfileSuites(ctx context.Context) []aptProfileSuite {
+func (s *Server) aptProfileSuites(ctx context.Context) (suites []aptProfileSuite, scoped bool) {
 	if s.auditDB == nil {
-		return nil
+		return nil, false
 	}
 	profiles, err := s.auditDB.ListProfiles(ctx)
 	if err != nil {
 		s.logger.Error("could not read the profiles, so no filtered apt codename was generated at this rebuild", "error", err)
-		return nil
+		return nil, false
 	}
 	var out []aptProfileSuite
 	for _, prof := range profiles {
@@ -109,6 +109,12 @@ func (s *Server) aptProfileSuites(ctx context.Context) []aptProfileSuite {
 		if base == "" {
 			continue
 		}
+		// Recorded here, ahead of every withdrawal below and of the ones
+		// aptProfileIndexes makes after that. The pool predicate refuses this
+		// profile's hosts whether or not a codename survives to be served, so
+		// a cache directive that waits for one is right about the archive and
+		// wrong about the refusal.
+		scoped = true
 		if !s.cfg.MirrorsAptCodename(base) {
 			s.logger.Error("a profile names an apt base no upstream archive serves, so it has no filtered codename; add the base to apt_upstreams or move the profile onto one that is there",
 				"profile", prof.Name, "base", base,
@@ -122,7 +128,7 @@ func (s *Server) aptProfileSuites(ctx context.Context) []aptProfileSuite {
 		}
 		out = append(out, aptProfileSuite{profile: prof.Name, base: base, codename: codename, permit: p})
 	}
-	return s.dropCollidingCodenames(out)
+	return s.dropCollidingCodenames(out), scoped
 }
 
 // dropCollidingCodenames removes every profile whose derived codename another
@@ -170,10 +176,10 @@ func (s *Server) dropCollidingCodenames(suites []aptProfileSuite) []aptProfileSu
 // One fetch per (base, architecture) serves every profile over that base. Two
 // profiles filtering noble read one upstream Packages between them, which is
 // the difference between a linear cost in profiles and a linear cost in bases.
-func (s *Server) aptProfileIndexes(ctx context.Context, date, validUntil time.Time) []aptProfileSuite {
-	suites := s.aptProfileSuites(ctx)
+func (s *Server) aptProfileIndexes(ctx context.Context, date, validUntil time.Time) (served []aptProfileSuite, scoped bool) {
+	suites, scoped := s.aptProfileSuites(ctx)
 	if len(suites) == 0 {
-		return nil
+		return nil, scoped
 	}
 	releases := map[string]map[string]string{}
 	cache := map[string]aptIndexRead{}
@@ -204,7 +210,7 @@ func (s *Server) aptProfileIndexes(ctx context.Context, date, validUntil time.Ti
 		ps.index = s.aptIndexFrom(ps.codename, packages, date, validUntil)
 		out = append(out, ps)
 	}
-	return out
+	return out, scoped
 }
 
 // aptIndexRead is one (base, architecture) upstream read, shared across every
@@ -591,6 +597,26 @@ func (s *Server) aptGatesPool(r *http.Request) bool {
 	}
 	base, _ := p.AptScope()
 	return base != ""
+}
+
+// aptScopedAnywhere reports whether any profile on this instance scopes apt,
+// which is the server fact the pool route's cache directive turns on. See
+// handleAptPool for why that directive cannot be a per-request one.
+//
+// Two sources, because each covers a window the other leaves open. The binding
+// set is live from the moment a host is bound and is what aptGatesPool itself
+// reads, so the two cannot disagree about a request in flight — including
+// before the first rebuild has generated any codename at all. The snapshot
+// answers for a profile written and not yet bound, which is the order bodega
+// documents: write the profile, read the sources line off `bodega doctor`,
+// bind the host. That profile's codename is already served, and a public copy
+// cached during that window outlives the binding by a year.
+func (s *Server) aptScopedAnywhere() bool {
+	if s.profileNow().scopesApt() {
+		return true
+	}
+	snap := s.aptSnap.Load()
+	return snap == nil || snap.profilesScopeApt
 }
 
 // aptPoolSourceName reads the source package out of a pool path, and "" from

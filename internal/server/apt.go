@@ -56,11 +56,12 @@ func (s *Server) handleAptPool(w http.ResponseWriter, r *http.Request) {
 	// the request never reaching the predicate above. Gated on the requester,
 	// the somebody else is an unidentified host: every host before it is bound,
 	// and every host under an open apt membership, both of which keep reaching
-	// this route ungated by design. So the moment this instance serves any
-	// filtered codename at all, the whole route loses the shared grant. An
-	// instance with none keeps it, because there is no refusal for a proxy to
-	// overturn.
-	if filtered, _ := s.aptFilteredSuites(); len(filtered) > 0 {
+	// this route ungated by design. So the moment any profile on this instance
+	// scopes apt, the whole route loses the shared grant. An instance where
+	// none does keeps it, because there is no refusal for a proxy to overturn.
+	// Not the filtered codenames served: every fail-closed path in
+	// apt_profile.go withdraws one and leaves the predicate refusing.
+	if s.aptScopedAnywhere() {
 		w = cachePrivateOn200(w, path.Base(p))
 	} else {
 		w = cacheSharedImmutableOn200(w, path.Base(p))
@@ -369,6 +370,12 @@ type aptSnapshot struct {
 	// "default", while absent means there is no entry to have recorded
 	// anything and the type rule applies.
 	poolStorage map[string]string
+
+	// profilesScopeApt records whether any profile scoped apt at the moment
+	// this snapshot was built, before the withdrawals that decide
+	// profileSuites. A profile whose codename a rebuild withdrew still has
+	// its hosts refused at the pool, so the two are different questions.
+	profilesScopeApt bool
 }
 
 // rebuildAptSnapshot regenerates the index and publishes it to every
@@ -476,7 +483,9 @@ func (s *Server) buildAptSnapshot(ctx context.Context) (*aptSnapshot, error) {
 	// them unchanged and one snapshot retires as a unit. A profile's Release
 	// and its Packages have to be generated together for the reason every
 	// suite's do: the first carries the digests of the second.
-	for _, ps := range s.aptProfileIndexes(ctx, date, snap.validUntil) {
+	profileSuites, scoped := s.aptProfileIndexes(ctx, date, snap.validUntil)
+	snap.profilesScopeApt = scoped
+	for _, ps := range profileSuites {
 		snap.suites[ps.codename] = ps.index
 		if snap.profileSuites == nil {
 			snap.profileSuites = map[string]string{}

@@ -344,8 +344,11 @@ func poolCacheControl(t *testing.T, s *Server, token, poolPath string) string {
 // membership — reaches this route ungated by design, so gated on the requester
 // it fills a shared cache with a year-long public copy of the object the next
 // profiled request is refused, and the predicate never runs. The instance
-// answers instead: any filtered codename served at all costs the whole route
-// its shared grant, and an instance with none keeps it.
+// answers instead, on the same fact the predicate reads: any profile scoping
+// apt at all costs the whole route its shared grant, and an instance with none
+// keeps it. Deciding it on the codenames actually served instead is the same
+// hole one door along, because every fail-closed path here withdraws a
+// codename and leaves the predicate refusing.
 func TestAGatedPoolRouteLosesTheSharedCacheGrant(t *testing.T) {
 	t.Run("an instance serving a filtered codename", func(t *testing.T) {
 		s, _ := aptProfileServer(t)
@@ -365,6 +368,91 @@ func TestAGatedPoolRouteLosesTheSharedCacheGrant(t *testing.T) {
 		s, _ := aptProfileServer(t)
 		if got := poolCacheControl(t, s, "", profileHtopDeb); !strings.Contains(got, "public") {
 			t.Errorf("Cache-Control for a pool fetch where nothing is gated = %q, want public: apt pays nothing where no profile scopes it", got)
+		}
+	})
+
+	// A profile that scopes apt whose codename the rebuild withdrew. Its
+	// hosts are still refused, because the predicate reads the profile tables
+	// and not the served codenames; a directive read off the codenames sees
+	// none and hands a proxy the year-long copy of what was just refused.
+	// Every fail-closed road in this file arrives in this state: a collision,
+	// a digest mismatch, a parse break, kept == 0, an unmirrored base.
+	t.Run("a profile whose codename the rebuild withdrew", func(t *testing.T) {
+		s, _ := aptProfileServer(t)
+		rule := closedRule(manifest.TypeApt, audit.VersionFloating, audit.ExpansionBlock)
+		rule.AptBase = "nosuchcodename"
+		f := bindProfile(t, s, "stray", "stray-host", []audit.ProfileTypeRule{rule},
+			[]audit.ProfileEntry{{Type: manifest.TypeApt, Name: "nginx"}})
+		s.rebuildAptSnapshot(context.Background())
+
+		if names, _ := s.aptFilteredSuites(); len(names) != 0 {
+			t.Fatalf("filtered codenames = %v, want none: nothing mirrors the base", names)
+		}
+		if code, _ := f.get(t, "/apt/"+profileHtopDeb); code != http.StatusForbidden {
+			t.Fatalf("the profiled host's pool fetch = %d, want 403: the predicate still refuses it", code)
+		}
+		if got := poolCacheControl(t, s, "", profileHtopDeb); strings.Contains(got, "public") {
+			t.Errorf("Cache-Control for an unidentified fetch of an object a profile was just refused = %q: no codename is served, and the refusal is still real", got)
+		}
+	})
+
+	// No snapshot at all: the first rebuild has not landed, or it failed. The
+	// binding set still answers for a bound host, but a profile written and
+	// not yet bound is invisible until a rebuild reads the profile tables, so
+	// the route pays one restart's worth of unshared .deb fetches rather than
+	// guess in the direction of a year-long public copy.
+	t.Run("before any snapshot exists", func(t *testing.T) {
+		s, _ := aptProfileServer(t)
+		s.aptSnap.Store(nil)
+		if got := poolCacheControl(t, s, "", profileHtopDeb); strings.Contains(got, "public") {
+			t.Errorf("Cache-Control with no snapshot built = %q: nothing has read the profile tables yet", got)
+		}
+	})
+
+	// A profile written and not yet bound to a host, over a base nothing
+	// mirrors. Nothing is refused this second, which is the whole trap: the
+	// operator writes the profile, reads the sources line off `bodega doctor`
+	// and binds the host afterwards, and a public copy cached in that window
+	// outlives the binding by a year. The base is unmirrored so that the
+	// codename is withdrawn too, which is the state a snapshot fact recorded
+	// after the withdrawals would answer no to.
+	t.Run("a profile written before any host is bound to it", func(t *testing.T) {
+		s, _ := aptProfileServer(t)
+		rule := closedRule(manifest.TypeApt, audit.VersionFloating, audit.ExpansionBlock)
+		rule.Profile, rule.AptBase = "unbound", "nosuchcodename"
+		if err := s.auditDB.CreateProfileWith(context.Background(), audit.Profile{Name: "unbound"},
+			[]audit.ProfileTypeRule{rule},
+			[]audit.ProfileEntry{{Profile: "unbound", Type: manifest.TypeApt, Name: "nginx"}}); err != nil {
+			t.Fatalf("create the unbound profile: %v", err)
+		}
+		s.refreshProfiles(context.Background())
+		s.rebuildAptSnapshot(context.Background())
+
+		if got := poolCacheControl(t, s, "", profileHtopDeb); strings.Contains(got, "public") {
+			t.Errorf("Cache-Control while a profile that scopes apt waits for its first binding = %q: the cache entry outlives the binding", got)
+		}
+	})
+
+	// The startup window, and the workflow bodega documents: the profile is
+	// written and bound, the rebuild that generates its codename has not run
+	// yet. This one is every restart of a healthy instance rather than a
+	// misconfiguration, so a fix that reads only a rebuilt snapshot passes the
+	// case above and fails here.
+	t.Run("before the rebuild that generates the codename", func(t *testing.T) {
+		s, _ := aptProfileServer(t)
+		rule := closedRule(manifest.TypeApt, audit.VersionFloating, audit.ExpansionBlock)
+		rule.AptBase = mirroredCodename
+		f := bindProfile(t, s, "web", "web-host", []audit.ProfileTypeRule{rule},
+			[]audit.ProfileEntry{{Type: manifest.TypeApt, Name: "nginx"}})
+
+		if names, _ := s.aptFilteredSuites(); len(names) != 0 {
+			t.Fatalf("filtered codenames = %v, want none before the first rebuild", names)
+		}
+		if code, _ := f.get(t, "/apt/"+profileHtopDeb); code != http.StatusForbidden {
+			t.Fatalf("the profiled host's pool fetch = %d, want 403", code)
+		}
+		if got := poolCacheControl(t, s, "", profileHtopDeb); strings.Contains(got, "public") {
+			t.Errorf("Cache-Control in the window between binding a profile and the rebuild = %q: the predicate is live from the binding, so the directive has to be too", got)
 		}
 	})
 }
