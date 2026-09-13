@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
 
@@ -212,4 +213,43 @@ func sortRows(rows []AptRow) {
 		}
 		return rows[i].Arch < rows[j].Arch
 	})
+}
+
+// OSReleasePath is where a Linux host names its release. Absent everywhere
+// else, which is the case the empty answer covers.
+const OSReleasePath = "/etc/os-release"
+
+// OSReleaseCodename reads VERSION_CODENAME out of an os-release file. Empty
+// covers every way that can fail: no file (running on a Mac), or a distro that
+// publishes no codename at all, which is most of them outside Debian.
+//
+// It lives beside ParseAptWithSuite because every writer of CaptureSuite needs
+// the same answer from the same place: `pkg convert apt` without --suite, and
+// the two create paths that build an entry from the host's own apt. A second
+// implementation would be a second way for one of them to record a release the
+// others disagree with.
+func OSReleaseCodename(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		key, val, ok := strings.Cut(strings.TrimSpace(sc.Text()), "=")
+		if !ok || key != "VERSION_CODENAME" {
+			continue
+		}
+		return strings.TrimSpace(strings.Trim(strings.TrimSpace(val), `"'`))
+	}
+	return ""
+}
+
+// LocalAptSuite is the release this machine runs, for a path building an entry
+// from the host's own apt. Empty off Linux and on a distro with no codename,
+// and empty records none rather than guessing: an entry naming the wrong
+// release is answered from the wrong advisory export, in the direction that
+// reports a vulnerable host clean.
+func LocalAptSuite() string {
+	return OSReleaseCodename(OSReleasePath)
 }
