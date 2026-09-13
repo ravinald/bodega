@@ -101,18 +101,19 @@ func newPolicyAgeListCmd(gf *globalFlags) *cobra.Command {
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 			fmt.Fprintln(w, "ECOSYSTEM\tMIN AGE\tACTION\tUPDATED")
 			stored := make([]string, 0, len(rows))
+			covered := policy.AgeEcosystems()
 			for _, p := range rows {
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n",
 					p.Ecosystem,
 					policy.ShortDuration(time.Duration(p.MinAgeSeconds)*time.Second),
-					p.Action,
+					renderAction(p.Action, p.Ecosystem, covered),
 					p.UpdatedAt.Format("2006-01-02"))
 				stored = append(stored, p.Ecosystem)
 			}
 			if err := w.Flush(); err != nil {
 				return err
 			}
-			reportUncovered("age gate", stored, policy.AgeEcosystems(), "bodega policy age remove")
+			reportUncovered("age gate", stored, covered, "bodega policy age remove")
 			return nil
 		},
 	}

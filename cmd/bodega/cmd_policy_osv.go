@@ -150,10 +150,12 @@ func newPolicyOSVListCmd(gf *globalFlags) *cobra.Command {
 			fmt.Fprintln(w, "ECOSYSTEM\tACTION\tUPDATED\tDB SYNCED\tDB AGE")
 			stored := make([]string, 0, len(rows))
 			untrimmed := map[string][]string{}
+			covered := policy.OSVEcosystems()
 			for _, p := range rows {
 				synced, age, old := osvDBState(db, p.Ecosystem, aptSuites)
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
-					p.Ecosystem, p.Action, p.UpdatedAt.Format("2006-01-02"), synced, age)
+					p.Ecosystem, renderAction(p.Action, p.Ecosystem, covered),
+					p.UpdatedAt.Format("2006-01-02"), synced, age)
 				stored = append(stored, p.Ecosystem)
 				untrimmed[p.Ecosystem] = old
 			}
@@ -163,7 +165,7 @@ func newPolicyOSVListCmd(gf *globalFlags) *cobra.Command {
 			reportUntrimmed(stored, untrimmed)
 			fmt.Printf("\nLocal OSV database: %s (api.osv.dev fallback: %s)\n",
 				db.Dir(), onOff(cfg.OSVAPIFallback))
-			reportUncovered("OSV gate", stored, policy.OSVEcosystems(), "bodega policy osv remove")
+			reportUncovered("OSV gate", stored, covered, "bodega policy osv remove")
 			return nil
 		},
 	}

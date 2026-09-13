@@ -313,6 +313,18 @@ func reportUncovered(gate string, stored, covered []string, removeCmd string) {
 		gate, strings.Join(stale, ", "), rowPlural(len(stale)), removeCmd)
 }
 
+// renderAction marks an action the gate cannot carry out. reportUncovered
+// writes a footnote naming the ecosystem, and the row above it still read
+// exactly like an enforcing one — the row is what an operator scans, and a
+// stored policy that enforces nothing must not look like a stored policy that
+// does.
+func renderAction(action, eco string, covered []string) string {
+	if slices.Contains(covered, eco) {
+		return action
+	}
+	return action + " (not enforced)"
+}
+
 func rowPlural(n int) string {
 	if n == 1 {
 		return "that row is"
