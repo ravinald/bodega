@@ -1940,7 +1940,6 @@ A default config is created on first run. All fields are optional.
   "log_dir": "/var/log/bodega",
   "logwindow_height": 12,
   "log_level": 0,
-  "custom_paths": false,
   "apt_root": "",
   "git_root": "",
   "pypi_root": "",
@@ -2227,7 +2226,9 @@ sudo mv /opt/bodega/cargo  "$CARGO_ROOT/cargo"
 
 Or clear the key and keep everything under `build_root`. `apt_root`, `git_root`, `pypi_root` and `binary_root` need none of this: the build path already carried those four.
 
-**Gap:** `custom_paths` gates none of this. The build path reads each root directly, so a root left in the config file stays in force after the flag is turned off. `config.RootForType` applies the gate and has no callers.
+`custom_paths` used to sit in front of all of this and gated nothing: the build path reads each root directly through `builder.rootFor`, so a root left in the file stayed in force after the flag was turned off, and the TUI stopped showing the value that was still deciding where artifacts land. The key is gone. Nothing moves as a result, because the behavior it claimed to gate is the behavior that was already running; a file that still carries it loads unchanged and `bodega doctor` names it under `retired-config-keys`.
+
+**Gap:** the TUI's config form shows four of the eight roots — `apt_root`, `git_root`, `pypi_root`, `binary_root` — so `gomod_root`, `helm_root`, `npm_root` and `cargo_root` can only be set by editing the file. Ctrl+R clears the same four. Tracked as #227.
 
 ### Audit database
 
@@ -2835,7 +2836,7 @@ Two refusals sit behind the same guard:
 - **Half a pair.** `tls_cert` set with `tls_key` empty, or the reverse, is fatal — at load for the config file, and at startup for `--tls-cert`/`--tls-key`, which are applied after the file is read. `allow_plaintext` does not excuse it: half a pair is a truncated edit, and reading it as a request for plaintext is how a server that served TLS yesterday answers in the clear today. `Config.Save()` marshals the whole resolved config back over the file, so a cert path cleared in the TUI reaches the listener with nothing else in the way.
 - **Port 443.** An empty pair on `:443` refuses even though the message differs, naming the port. A port is not authorization, but it is the strongest evidence available that whoever wrote `listen_addr` expected a certificate. `allow_plaintext` still starts it, with an `ERROR` on every start — the shipped `log_level` prints only `ERROR`, and a line the default install cannot see is not a warning. Off `:443` an authorized plaintext listener is silent: it serves what the operator asked for.
 
-bodega has no ACME client. `tls_autocert` and `tls_domain` were config keys that nothing implemented, and they are gone. Both halves say so rather than disappearing: a file that still carries `tls_autocert: true` logs at startup that nothing reads it, and `--tls-autocert`/`--tls-domain` still parse — hidden and deprecated, off `--help` — so an upgraded unit file starts and gets the same message instead of `unknown flag: --tls-autocert` and exit 1 on every `Restart=always` cycle. Get a certificate from `certbot` or your CA, or terminate TLS at a proxy in front and set `public_url`.
+bodega has no ACME client. `tls_autocert` and `tls_domain` were config keys that nothing implemented, and they are gone. Both halves say so rather than disappearing: a file that still carries either key logs at startup that nothing reads it, and `--tls-autocert`/`--tls-domain` still parse — hidden and deprecated, off `--help` — so an upgraded unit file starts and gets the same message instead of `unknown flag: --tls-autocert` and exit 1 on every `Restart=always` cycle. Get a certificate from `certbot` or your CA, or terminate TLS at a proxy in front and set `public_url`.
 
 Behind a TLS-terminating proxy, set `allow_plaintext` together with `public_url` — see [Behind a reverse proxy](#behind-a-reverse-proxy).
 

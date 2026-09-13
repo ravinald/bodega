@@ -228,7 +228,7 @@ func TestConfigFormResetLeavesKeysOutsideTheFormAlone(t *testing.T) {
 	seeded := `{
   "region": "us-east-1",
   "build_root": "/srv/build",
-  "custom_paths": true,
+  "git_root": "/srv/git",
   "apt_root": "/srv/apt",
   "admin_permit_cidr": ["0.0.0.0/0"],
   "token": "seeded-token",
@@ -293,7 +293,7 @@ func TestConfigFormResetLeavesKeysOutsideTheFormAlone(t *testing.T) {
 			t.Errorf("reset logged %q, which claims more than it wrote", line)
 		}
 	}
-	for _, key := range []string{"region", "build_root", "custom_paths", "apt_root"} {
+	for _, key := range []string{"region", "build_root", "git_root", "apt_root"} {
 		if !strings.Contains(line, key) {
 			t.Errorf("reset logged %q, want it to name %s", line, key)
 		}
