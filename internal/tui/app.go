@@ -25,6 +25,7 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/hostpkg"
 	"github.com/ravinald/bodega/internal/inventory"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
@@ -1762,6 +1763,10 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 			{Label: "Deb Glob", Value: restore("Deb Glob", ""),
 				Disabled: !isSourceBuild,
 				Hint:     "glob pattern to find .deb after build"},
+			{Label: "Source Package", Value: restore("Source Package", ""),
+				Hint: "Debian source package; Ubuntu and Debian advisories are keyed on it, not on the binary name"},
+			{Label: "Capture Suite", Value: restore("Capture Suite", hostpkg.LocalAptSuite()),
+				Hint: "release this version came from; blank records none rather than guessing"},
 			{Label: "Include Deps", Value: restore("Include Deps", "None"), Select: true,
 				Disabled: !isPkgName,
 				Options:  []string{"None", "Direct", "Transitive"},
@@ -2137,6 +2142,16 @@ func saveCreateEntry(store *manifest.Store, fields []formField) error {
 			}
 			ve.DebGlob = fieldValueFromSlice(fields, "Deb Glob")
 		}
+		// SourceName is what `apt-get download` needs and SourcePackage is the
+		// Debian source, which is the only key Ubuntu and Debian advisories
+		// carry. An entry with no source package makes the OSV gate warn rather
+		// than answer, because an empty result under a binary name cannot be
+		// read as clean.
+		ve.SourcePackage = fieldValueFromSlice(fields, "Source Package")
+		// CaptureSuite and not Suites: Suites decides which dists/<suite>/ the
+		// entry publishes to, so a release written there drops the entry out of
+		// every generated index on a server whose apt_codename is a house name.
+		ve.CaptureSuite = fieldValueFromSlice(fields, "Capture Suite")
 
 	case manifest.TypeGit:
 		ve.Ref = fieldValueFromSlice(fields, "Ref")
@@ -2212,7 +2227,15 @@ func (m *appModel) makeJSONApplyFn() func(buf string) string {
 				setFieldValue(p.formFields, "Filename", ve.Filename)
 			}
 			if ve.SourceName != "" {
-				setFieldValue(p.formFields, "Source Name", ve.SourceName)
+				// "Package Name" is the apt form's label for it; "Source Name"
+				// matches no field, so this set was a no-op.
+				setFieldValue(p.formFields, "Package Name", ve.SourceName)
+			}
+			if ve.SourcePackage != "" {
+				setFieldValue(p.formFields, "Source Package", ve.SourcePackage)
+			}
+			if ve.CaptureSuite != "" {
+				setFieldValue(p.formFields, "Capture Suite", ve.CaptureSuite)
 			}
 			if ve.BuildCmd != "" {
 				setFieldValue(p.formFields, "Build Cmd", ve.BuildCmd)
