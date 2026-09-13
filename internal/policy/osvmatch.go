@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"encoding/json"
 	"regexp"
 	"sort"
 	"strconv"
@@ -20,8 +21,24 @@ const (
 // reads. GIT ranges are dropped at sync: they carry commit hashes, which no
 // version string an import supplies can be compared against.
 type osvAffected struct {
-	Versions []string   `json:"versions,omitempty"`
-	Ranges   []osvRange `json:"ranges,omitempty"`
+	Versions osvVersions `json:"versions,omitempty"`
+	Ranges   []osvRange  `json:"ranges,omitempty"`
+}
+
+// osvVersions is an enumerated version list, canonicalized as it decodes. See
+// internOSV for why the decode is where this has to happen.
+type osvVersions []string
+
+func (v *osvVersions) UnmarshalJSON(b []byte) error {
+	var raw []string
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	for i, s := range raw {
+		raw[i] = internOSV(s)
+	}
+	*v = raw
+	return nil
 }
 
 type osvRange struct {
@@ -29,10 +46,32 @@ type osvRange struct {
 	Events []osvEvent `json:"events"`
 }
 
+func (r *osvRange) UnmarshalJSON(b []byte) error {
+	type raw osvRange
+	var v raw
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	v.Type = internOSV(v.Type)
+	*r = osvRange(v)
+	return nil
+}
+
 type osvEvent struct {
 	Introduced   string `json:"introduced,omitempty"`
 	Fixed        string `json:"fixed,omitempty"`
 	LastAffected string `json:"last_affected,omitempty"`
+}
+
+func (e *osvEvent) UnmarshalJSON(b []byte) error {
+	type raw osvEvent
+	var v raw
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	v.Introduced, v.Fixed, v.LastAffected = internOSV(v.Introduced), internOSV(v.Fixed), internOSV(v.LastAffected)
+	*e = osvEvent(v)
+	return nil
 }
 
 // osvVersionOrder returns the ordering an ECOSYSTEM range uses for an OSV
@@ -83,6 +122,40 @@ func (a osvAffected) affects(order, version string) (matched bool, unorderable s
 		}
 	}
 	return false, unorderable
+}
+
+// trimCovered drops the enumerated versions an entry's own ranges already
+// place. A distro advisory lists every published revision it covers and then
+// bounds the same span with a range, so one Ubuntu release arrives as millions
+// of short strings the decoder allocates one at a time; the strings the ranges
+// cover carry nothing the ranges do not.
+//
+// The drop is a no-op for affects by construction rather than by sampling,
+// which is why it is decided per string. Let v be a dropped string and q a
+// queried one. If q == v, the ranges match v by the drop condition, so they
+// match q. If the ordering reports v and q equal, q compares identically to v
+// at every bound, so the walk returns for q what it returned for v. If the
+// ordering cannot place q, q equals no dropped string, because every dropped
+// string was orderable. A string the ranges do not place is kept, so a list
+// reaching outside its own ranges keeps exactly the strings that reach.
+//
+// An entry with no range is returned untouched: it is the enumerated list or
+// nothing.
+func trimCovered(order string, versions []string, ranges []osvRange) []string {
+	if len(ranges) == 0 {
+		return versions
+	}
+	covered := osvAffected{Ranges: ranges}
+	var keep []string
+	for _, v := range versions {
+		if orderable(order, v) {
+			if hit, _ := covered.affects(order, v); hit {
+				continue
+			}
+		}
+		keep = append(keep, v)
+	}
+	return keep
 }
 
 // rangeEvent is one event resolved to its version and kind for sorting.
