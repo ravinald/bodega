@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -437,10 +439,10 @@ func RequestLogger(logger *slog.Logger) func(http.Handler) http.Handler {
 			// Trace level: add bodies.
 			if logger.Enabled(r.Context(), logging.LevelTrace) {
 				if len(reqBody) > 0 {
-					attrs = append(attrs, slog.String("req_body", string(reqBody)))
+					attrs = append(attrs, slog.String("req_body", redactBody(r.Header.Get("Content-Type"), reqBody)))
 				}
 				if rec.captureBody && len(rec.body) > 0 && !isBinaryContentType(rec.Header().Get("Content-Type")) {
-					attrs = append(attrs, slog.String("resp_body", string(rec.body)))
+					attrs = append(attrs, slog.String("resp_body", redactBody(rec.Header().Get("Content-Type"), rec.body)))
 				}
 			}
 
@@ -926,4 +928,106 @@ func isGitUploadPack(r *http.Request) bool {
 	return r.Method == http.MethodPost &&
 		strings.HasPrefix(r.URL.Path, "/git/") &&
 		strings.HasSuffix(r.URL.Path, "/git-upload-pack")
+}
+
+// redactedBodyKeys are the JSON keys whose values are credentials. Matched
+// case-insensitively at any depth.
+//
+// Keyed rather than routed on purpose. POST /api/v1/tokens returns the
+// plaintext token in its body because that is the one moment it can be read
+// (handleCreateToken), and a route list would have to be extended by whoever
+// later adds a route returning a signing key or a session — which is the
+// remembering that put the token in the journal in the first place. The key
+// travels with the value.
+var redactedBodyKeys = map[string]bool{
+	"token":         true,
+	"access_token":  true,
+	"refresh_token": true,
+	"secret":        true,
+	"password":      true,
+	"private_key":   true,
+	"signing_key":   true,
+	"session":       true,
+}
+
+// redactBody renders a captured body for the trace log with credential values
+// replaced.
+//
+// A well-formed JSON body is decoded and walked, which is exact. One that does
+// not decode is scrubbed textually against the same key set rather than
+// withheld: maxBodyCapture truncates at 64KB and a handler may answer with a
+// JSON content type over something that is not JSON, and both are cases trace
+// level exists to show. Withholding them would leave the operator debugging a
+// malformed request with nothing to look at. The textual pass matches the key,
+// which on a truncated document is still present ahead of the value it names.
+//
+// Non-JSON bodies pass through, which is what every body did before this.
+func redactBody(contentType string, body []byte) string {
+	if !isJSONContentType(contentType) {
+		return string(body)
+	}
+	var v any
+	if err := json.Unmarshal(body, &v); err == nil {
+		if out, mErr := json.Marshal(redactJSONValue(v)); mErr == nil {
+			return string(out)
+		}
+	}
+	return string(credentialKeyPattern.ReplaceAll(body, []byte(`"${1}":"`+redactedValue+`"`)))
+}
+
+// credentialKeyPattern matches a JSON credential key and whatever follows it up
+// to the end of its string value, tolerating a value the capture cut short. It
+// is the fallback for a body json.Unmarshal refused; the decoded walk is what
+// runs when there is a document to walk.
+var credentialKeyPattern = regexp.MustCompile(`(?i)"(` + redactedKeyAlternation() + `)"\s*:\s*"(?:[^"\\]|\\.)*"?`)
+
+// redactedKeyAlternation renders redactedBodyKeys as a regexp alternation,
+// longest first so a prefix key cannot shadow a longer one.
+func redactedKeyAlternation() string {
+	keys := make([]string, 0, len(redactedBodyKeys))
+	for k := range redactedBodyKeys {
+		keys = append(keys, regexp.QuoteMeta(k))
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if len(keys[i]) != len(keys[j]) {
+			return len(keys[i]) > len(keys[j])
+		}
+		return keys[i] < keys[j]
+	})
+	return strings.Join(keys, "|")
+}
+
+// redactJSONValue walks a decoded JSON document replacing the values of
+// redactedBodyKeys. Nested objects and arrays are walked, because a credential
+// nested under a wrapper is the same credential.
+func redactJSONValue(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, val := range t {
+			if redactedBodyKeys[strings.ToLower(k)] {
+				out[k] = redactedValue
+				continue
+			}
+			out[k] = redactJSONValue(val)
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, val := range t {
+			out[i] = redactJSONValue(val)
+		}
+		return out
+	}
+	return v
+}
+
+// isJSONContentType reports whether a Content-Type names a JSON body, covering
+// the +json structured-suffix forms an API may answer with.
+func isJSONContentType(ct string) bool {
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	ct = strings.ToLower(strings.TrimSpace(ct))
+	return ct == "application/json" || ct == "text/json" || strings.HasSuffix(ct, "+json")
 }
