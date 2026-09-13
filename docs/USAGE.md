@@ -784,6 +784,7 @@ bodega profile show web
 | `--expansion`       | `warn`     | serve it, and record the reach outside the class |
 | `--expansion`       | `block`    | refuse it with 403                               |
 | `--expansion`       | `ignore`   | serve it and record nothing                      |
+| `--base`            | codename   | apt only: the mirrored codename this profile's filtered index is generated from |
 
 The marker's presence is itself an answer. A type with **no** marker is one the profile states no rule for, and the fleet-wide controls decide it alone; a type **with** a marker is decided by the profile even when no entry names a package.
 
@@ -951,6 +952,20 @@ db.json already exists, and a baseline is written to be edited before it is used
   Replace it, losing whatever it holds:  --overwrite
 ```
 
+**apt entries are written under the source package.** A host running `nginx`, `nginx-common` and `libexpat1` catalogs three binaries; the baseline lists `nginx` and `expat`, because that is the identity a filtered codename and the pool predicate both close over. Every collapse is named in the success line, so an operator reading the file recognizes a name they never installed:
+
+```text
+$ bodega profile create web --from-origin web01 --out web.json
+Wrote a baseline for web01 to web.json: 2 package(s) across 1 type(s), 0 pinned.
+2 apt binaries are listed under the source package they were built from, which is what a filtered codename closes over:
+  libexpat1 -> expat
+  nginx-common -> nginx
+Nothing was created. Read it, edit it, then:
+  bodega profile create web --from-file web.json
+```
+
+`--pin libexpat1` still names the binary the host reports and lands on the `expat` entry it was collapsed onto. A capture taken before `bodega pkg convert apt` recorded the source package has no source to use and falls back to the binary name.
+
 Entries default to name-only with `constraint_kind: any`, so the baseline says what the host may fetch and not which build of it. `--pin <name>` (repeatable) names the exceptions. A baseline that pins every version is re-authored monthly until somebody stops, which is how a control becomes ignored.
 
 A `--pin` that does not name one package is refused rather than resolved, on either axis. Two cataloged versions:
@@ -1029,7 +1044,7 @@ Two enforcement points, and the order matters.
 
 **The index filter is what makes the refusal legible.** A resolver told "no such version" picks another one; a resolver handed an opaque 403 halfway through an install stops with a stack trace and leaves the environment half-built. Six documents are filtered: the pypi simple root and its per-distribution pages, the npm packument's `versions` map (with the `time` entries and `dist-tags` that point at dropped versions), the gomod `@v/list`, the cargo sparse index, and the helm `index.yaml` (which answers 200 with the refused charts absent rather than 403, because a refused index fails `helm repo add` itself). git and binary publish no index, so the predicate is the whole story there.
 
-**apt is deliberately excluded**, and is tracked separately. Refusing an apt fetch at the pool leaves `dpkg` holding a half-configured transaction, which is a worse outcome than no control at all; the apt answer belongs at the generated index, not at fetch time.
+**apt inverts the two.** For apt the filtered index is the control and the request predicate is the backstop, because refusing an apt fetch at the pool is worse than having no control at all: apt has already resolved the transaction by then, takes the 403 mid-run and aborts everything, including the security updates in the same invocation. Filtered out of the index instead, apt reports the package kept back and upgrades the rest. See [apt under a profile](#apt-under-a-profile).
 
 No filtered index is stored. Each one is produced by running the profile's filter over the response on the way out, so what sits in the cache is the document the upstream served and one cached object answers every host class correctly. An install with no profiles pays nothing, and a fleet with twenty profiles pays one copy and one upstream fetch per index rather than twenty. A cache hit filters identically to a miss, so a `bodega profile` edit lands within the binding cache TTL rather than at the next upstream refresh. The helm `index.yaml` is generated into storage by `bodega build` rather than cached, and is filtered the same way on the way out.
 
@@ -1164,9 +1179,98 @@ HTTP request sent, awaiting response... 403 Forbidden
 
 Every mutation writes an audit event with `pkg_type=profile`, the profile in `pkg_name` and what inside it in `pkg_version`, so `bodega audit events --type create` shows who changed a control and when.
 
-### `bodega doctor [--write-credentials --token TOKEN [--url URL]]`
+#### apt under a profile
 
-Without flags, `doctor` reports and changes nothing. With `--write-credentials` it writes one token into the file each of the eight clients reads its credential from, because a feature that costs eight hand edits does not get adopted:
+apt is the one type where a profile changes what bodega **serves** rather than what it refuses. Give the apt rule a base and bodega generates a second codename holding a filtered view of it:
+
+```bash
+bodega profile add web apt nginx
+bodega profile add web apt curl
+bodega profile set web apt --membership closed --expansion block --base noble
+```
+
+```text
+web apt: membership=closed version_default=floating expansion=block
+  filtered codename: noble-web (from noble), served after the next index rebuild
+```
+
+`--base` names a codename in `apt_upstreams`, and the derived codename is always `<base>-<profile>`. It must not collide with anything in `apt_suites` or `apt_upstreams`; `set` and `create --from-file` both refuse at the write rather than leaving one ERROR line an hour later in the server's log, and a refused document writes no profile row. Two profiles over different bases can still derive one codename (`security-web` over `noble` and `web` over `noble-security` both give `noble-security-web`), which `set` cannot see because it holds one profile at a time. The rebuild serves neither and names both profiles in the log. `--base` needs `--membership closed` **and** `--expansion block`, and both refusals are the same one reached from opposite directions. Each names both ways out, since an operator opening a profile asked for the opposite of keeping the base: close it or block it to keep the codename, or `--base ""` to drop it. An open set admits everything the archive publishes; `warn` and `ignore` are closed sets that serve what they do not list, so the filter keeps every paragraph either way. What bodega would publish is the archive's own index, byte for byte, under bodega's signature instead of the archive's: the host stops verifying against the distro keyring it already has, `/apt/pool/` drops from `public` to `private`, and nothing is filtered in return. `warn` remains the default for the seven other types, where the index is not what enforces and an unlisted package is served and reported. apt is the one type whose unfiltered outcome costs a signature, so it is the one type where the posture is stated rather than inherited. A profile with an open apt rule, or a closed one with no base, reads the mirrored codename unchanged. The base keeps its value like every other flag on `set`: an edit naming `--version-default` alone leaves the codename standing, and `--base ""` is how you drop one. Dropping it retires the codename across the fleet, so `set` prints `no base` and the audit row carries `apt_base=""` rather than letting an operator learn it from a host whose `apt update` 404s.
+
+```text
+$ bodega profile set web apt --membership closed --base noble
+--base needs --expansion block; this rule takes warn, which permits a package the profile does not list, so every upstream paragraph survives the filter and noble-web would serve the archive's own index under bodega's signature instead of the archive's: a host that stops verifying against the distro keyring, for no filtering.
+  Filter it:  bodega profile set web apt --membership closed --expansion block --base noble
+  Or drop the base:  bodega profile set web apt --expansion warn --base ""
+    the profile then reads the mirrored codename noble unchanged, verified against the distro keyring
+```
+
+**Membership closes over the source package.** `bodega profile add web apt nginx` covers `nginx-common`, `nginx-core` and every other binary that source builds. Ubuntu renames and splits binaries within a stable source as routine maintenance, and a set closed on binary names would fire on each one. `--from-origin` writes source names for the same reason, and `bodega profile check` reports an apt entry naming a binary whose source differs — an entry that matches no paragraph in the index it governs, so the host is told the package does not exist:
+
+```text
+$ bodega profile check web
+PROFILE  TYPE  PACKAGE    REASON
+web      apt   libexpat1  this profile serves a filtered apt codename, which closes on the source package; libexpat1 is a binary built from source expat, so it matches no paragraph in the index. List expat instead
+```
+
+**A pin is real for apt through the index.** An entry pinned to a version drops every other version's paragraph from the filtered `Packages`, which apt reads as "no candidate" rather than as a refusal. The name is the source and the version is each paragraph's own `Version:`, so that the pool predicate behind the index compares the same version off the `.deb` filename. A binNMU is where the two spellings of one release diverge: source `nginx` at `1.24.0-2ubuntu7.1` ships `nginx-common` at `+b1`, so an exact pin holds the binaries at the version you wrote and drops that source's rebuilt ones, and apt reports the group as kept back. `bodega profile check` names the binary and version a pin drops without failing the gate, since the repair is to widen the constraint to `any` and that discards the reason the pin records. A profile that lists apt packages and whose pins match no paragraph at all serves no codename: `apt update` fails on the source line rather than the host being told its installed set no longer exists.
+
+The filtered codename is a generated suite: bodega signs its `Release`, so the client's stanza carries `Signed-By:` and needs no `[trusted=yes]`. `bodega doctor --write-apt-sources` installs both:
+
+```bash
+bodega doctor --write-apt-sources --url https://bodega.internal
+```
+
+```text
+wrote /etc/apt/keyrings/bodega-archive-keyring.gpg
+wrote /etc/apt/sources.list.d/bodega.sources
+
+Profile "web": this host reads noble-web, a filtered view of what bodega mirrors.
+```
+
+```text
+Types: deb
+URIs: https://bodega.internal/apt/
+Suites: noble-web
+Components: main
+Signed-By: /etc/apt/keyrings/bodega-archive-keyring.gpg
+```
+
+The server composes that stanza, because which codename a host reads is a fact only the running instance holds. Pass `--token` for a host identified by a token; a host bound with `bodega identity bind cidr` is identified by its address and needs none. A host bodega cannot identify is told which codenames exist rather than handed one.
+
+What the client then sees when a dependency is outside the baseline:
+
+```text
+The following packages have been kept back:
+  demo-app
+The following packages will be upgraded:
+  demo-tool
+1 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.
+```
+
+That is the whole point of the shape. The same policy enforced at fetch time gives `403` mid-transaction and `E: Failed to fetch`, with nothing upgraded.
+
+Three limits, stated rather than left to be found:
+
+- **The `sources.list` is a scoping boundary, not an authorization one.** The host can edit it and read the unfiltered mirrored codename; the codename's name is not a secret either. What refuses the artifacts behind it is the request predicate at `/apt/pool/`, which runs on identity:
+
+  ```text
+  membership: profile "web" does not list apt/demo-extra at 1.0.
+    Add it:      bodega profile add web apt demo-extra
+    Or open it:  bodega profile set web apt --membership open
+  ```
+
+- **bodega re-signs an index it did not verify a signature on.** It checks the archive's TLS certificate and the SHA256 the archive's own `Release` publishes for the `Packages` beside it, and it holds no distro keyring to check `InRelease` against. A mirrored codename forwards the archive's signature intact; a filtered one does not. See [Threat model](THREAT_MODEL.md).
+- **One component, `main`**, matching every other generated suite. A base publishing more is named in the server log, and packages outside `main` are not served under the profile.
+
+Filtered codenames appear in the startup banner and in `GET /api/v1/status` under `apt.filtered`, with a rendered stanza each in `apt.sources`. Nothing in the config file names them, so those are the two places to read them off. They are regenerated on the hourly index rebuild and on every `bodega profile` write, and the upstream indexes they are built from are cached behind `metadata_ttl`. A rebuild that cannot read or parse the upstream `Packages` withdraws the codename rather than serving the part of it that arrived, so `apt update` fails on a source line naming the instance; a truncated index would instead report every package past the break as kept back. An architecture the base's `Release` names and the archive answers 404 for is the exception: it is dropped from the filtered `Release` and the rest is served, because `archive.ubuntu.com` declares all seven and carries two, and the codename is withdrawn only when none survives.
+
+### `bodega doctor [--write-credentials --token TOKEN [--url URL]] [--write-apt-sources]`
+
+Without flags, `doctor` reports and changes nothing. It has two writes, and they run one at a time.
+
+`--write-apt-sources` asks the server which apt suite this host should read and installs the keyring and the stanza; see [apt under a profile](#apt-under-a-profile).
+
+With `--write-credentials` it writes one token into the file each of the eight clients reads its credential from, because a feature that costs eight hand edits does not get adopted:
 
 ```bash
 bodega token generate devbox-3
@@ -2783,11 +2887,11 @@ Stripping at the proxy is still the right belt, but it is no longer the only one
 
 #### Caching in front of a profile-enforced bodega
 
-Leave the proxy cache off for `/pypi/`, `/npm/`, `/go/`, `/cargo/`, `/helm/`, `/git/` and `/binaries/`, or let it obey the headers bodega sends and nothing more.
+Leave the proxy cache off for `/pypi/`, `/npm/`, `/go/`, `/cargo/`, `/helm/`, `/git/`, `/binaries/` and `/apt/`, or let it obey the headers bodega sends and nothing more.
 
 A profile decides what those routes return, so one URL answers two hosts with two documents. A shared cache cannot evaluate a profile: it stores the first answer and hands it to the next host, with no denial row written and no error anywhere. bodega closes this from its side — artifacts go out `private`, indexes go out `no-cache, no-store, must-revalidate` — but a proxy configured to cache past the response headers reopens it. In nginx that means not setting `proxy_ignore_headers Cache-Control` and not forcing `proxy_cache_valid` on these locations.
 
-`/apt/` is the exception and may be cached normally: apt is not profile-enforced, so every host gets the same `.deb` and the pool still ships `public, max-age=31536000, immutable`.
+`/apt/` used to be the exception and no longer is. The `dists/` tree has always shipped `no-cache, no-store, must-revalidate`, and the pool now ships `public, max-age=31536000, immutable` only while the requesting host's profile does not scope apt; a host whose profile does gets `private`. The bytes are the same for everyone — a filtered index decides what a host is told exists, not what it receives — but a cached `public` copy would answer a refused host out of a permitted host's fetch, and the request would never reach the predicate that refuses it.
 
 To check what a deployment is sending:
 

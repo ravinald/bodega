@@ -89,6 +89,50 @@ defence against:
   `admin_permit_cidr` at loopback, which makes the gate ignore tokens
   entirely, or treat every host holding a written credential as
   admin-capable. Scoped tokens would sever the two and are not shipped.
+- **A profile's apt codename being an authorization boundary.** It is a
+  scoping one. A profile that scopes apt is served a filtered `Packages` under
+  a codename of its own, and the host reads that codename because its
+  `sources.list` names it — a file the host can edit. Nothing stops a host from
+  writing the unfiltered mirrored codename into that file and reading the
+  archive whole, and nothing about the filtered codename's name is a secret:
+  it is `<base>-<profile>`, it appears in the startup banner and in
+  `GET /api/v1/status`, and it is served to whoever asks for it. What the
+  filtered index buys is that a *correctly configured* host is never offered a
+  package outside its class, which is what turns a refusal into `kept back`
+  instead of an aborted transaction. What refuses the artifacts behind it is
+  the request predicate at `/apt/pool/`, which runs on identity rather than on
+  what the client's sources say. Read the two together: the index decides what
+  a host is told exists, the predicate decides what it may fetch. The gap
+  closes when the token that identifies a host also gates the codename, which
+  is not shipped.
+- **The chain of trust behind a filtered apt codename.** bodega re-signs it
+  with bodega's own key, and what bodega verified before signing is the
+  archive's TLS certificate and the SHA256 that the archive's own `Release`
+  publishes for the `Packages` beside it. It does not verify the archive's
+  `InRelease` signature, because it holds no distro keyring to check one
+  against. So a filtered codename's trust ends at the archive's certificate,
+  where a *mirrored* codename forwards the archive's signature untouched and
+  the client checks it against the distro keyring already on the host. That is
+  a real difference and it is the price of filtering: one URL serves one
+  `Release`, and an index bodega narrowed cannot carry a signature over the
+  index it narrowed. An operator who wants the upstream signature end to end
+  points the host at the mirrored codename and accepts that it is unfiltered.
+  Which is why a filtered codename that would filter nothing is refused rather
+  than served: an apt rule with a base needs closed membership *and* `block`
+  expansion, because `warn` and `ignore` permit every package the profile does
+  not list and the filter then copies the upstream index through verbatim. That
+  document is the trust downgrade above paid for no filtering, and it is the
+  one shape where a control the operator believes they set makes the host
+  strictly less safe than having written no profile at all.
+- **An apt entry naming a binary package.** Membership for apt closes on the
+  source, so an entry spelled `nginx-common` or `libexpat1` matches no
+  paragraph in the index it governs and the host is told the package does not
+  exist. The failure is availability rather than disclosure — nothing outside
+  the class is offered — but it is silent, arrives as `kept back` on a package
+  the operator listed themselves, and is the shape most likely to get a control
+  turned off. `--from-origin` writes source names and `bodega profile check`
+  reports the divergence; neither is a runtime gate, so an entry hand-written
+  under a binary name is caught at `check` time or not at all.
 
 ## Out-of-scope distribution formats
 

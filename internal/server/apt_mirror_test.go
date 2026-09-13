@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -55,6 +56,14 @@ func (a *fixtureArchive) setObject(rel, body string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.objects[rel] = body
+}
+
+// removeObject withdraws a path the archive was serving, which is an archive
+// that publishes a digest for something it does not carry.
+func (a *fixtureArchive) removeObject(rel string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.objects, rel)
 }
 
 func (a *fixtureArchive) object(rel string) (string, bool) {
@@ -116,21 +125,54 @@ func newFixtureArchive(t testing.TB, objects map[string]string) *fixtureArchive 
 // a digest would keep passing after the server started serving different bytes.
 func fixtureDists(t *testing.T, kr *aptsign.KeyRing, packages string) map[string]string {
 	t.Helper()
+	return fixtureDistsArch(t, kr, packages, "amd64")
+}
+
+// fixtureDistsArch is fixtureDists for an archive publishing an architecture
+// other than amd64, which is what a test driving a real apt in a container
+// needs: the client reads binary-<its own arch>/Packages and nothing else, so
+// an arm64 host handed an amd64-only Release reports a suite that does not
+// support the architecture rather than the outcome under test.
+//
+// alsoDeclared names architectures the Release declares and publishes a digest
+// for while the archive serves no body: archive.ubuntu.com is that archive,
+// with one Release per suite naming all seven and amd64 and i386 alone served
+// there. Deriving the Release from the one body written is what makes declared
+// and published agree in a fixture and nowhere else, so a generator that takes
+// a 404 on a declared architecture passes here and fails on Ubuntu.
+func fixtureDistsArch(t *testing.T, kr *aptsign.KeyRing, packages, arch string, alsoDeclared ...string) map[string]string {
+	t.Helper()
+	packagesPath := "main/binary-" + arch + "/Packages"
 	sum := sha256.Sum256([]byte(packages))
 	digest := hex.EncodeToString(sum[:])
+	// A real archive publishes both forms and lists both digests, and the
+	// filtered-index generator reads the compressed one. A fixture that
+	// published only the plain form would make every profile suite fail for a
+	// reason no archive produces.
+	gzBody := gzipFixture(packages)
+	gzSum := sha256.Sum256(gzBody)
 
-	release := strings.Join([]string{
+	digests := []string{
+		fmt.Sprintf(" %s %d %s", digest, len(packages), packagesPath),
+		fmt.Sprintf(" %s %d %s.gz", hex.EncodeToString(gzSum[:]), len(gzBody), packagesPath),
+	}
+	for _, other := range alsoDeclared {
+		rest := "main/binary-" + other + "/Packages"
+		digests = append(digests,
+			fmt.Sprintf(" %s %d %s", strings.Repeat("0", 64), 1, rest),
+			fmt.Sprintf(" %s %d %s", strings.Repeat("0", 64), 1, rest+".gz"))
+	}
+
+	release := strings.Join(append([]string{
 		"Origin: Ubuntu",
 		"Label: Ubuntu",
 		"Suite: " + mirroredCodename,
 		"Codename: " + mirroredCodename,
 		"Components: main",
-		"Architectures: amd64",
+		"Architectures: " + strings.Join(append([]string{arch}, alsoDeclared...), " "),
 		"Acquire-By-Hash: yes",
 		"SHA256:",
-		fmt.Sprintf(" %s %d %s", digest, len(packages), packagesPath),
-		"",
-	}, "\n")
+	}, append(digests, "")...), "\n")
 
 	inRelease, err := kr.ClearSign([]byte(release))
 	if err != nil {
@@ -143,12 +185,22 @@ func fixtureDists(t *testing.T, kr *aptsign.KeyRing, packages string) map[string
 
 	base := "dists/" + mirroredCodename + "/"
 	return map[string]string{
-		base + "Release":     release,
-		base + "InRelease":   string(inRelease),
-		base + "Release.gpg": string(detached),
-		base + packagesPath:  packages,
-		base + "main/binary-amd64/by-hash/SHA256/" + digest: packages,
+		base + "Release":            release,
+		base + "InRelease":          string(inRelease),
+		base + "Release.gpg":        string(detached),
+		base + packagesPath:         packages,
+		base + packagesPath + ".gz": string(gzBody),
+		base + "main/binary-" + arch + "/by-hash/SHA256/" + digest: packages,
 	}
+}
+
+// gzipFixture compresses an index the way an archive publishes it.
+func gzipFixture(body string) []byte {
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	_, _ = gw.Write([]byte(body))
+	_ = gw.Close()
+	return buf.Bytes()
 }
 
 // fixturePackages is the one-stanza index whose Filename points at the pool

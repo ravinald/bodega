@@ -38,10 +38,34 @@ func (s *Server) handleAptPool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	poolPath := "pool/" + p
+	// The backstop, and the one route where the profile predicate is not the
+	// control: apt_profile.go states why the filtered index carries that
+	// weight for apt and this does not.
+	gated := s.aptGatesPool(r)
+	if gated && !s.aptPoolGate(w, r, poolPath) {
+		return
+	}
 	// Wrapped rather than set: the outcome is not known here, and a refusal
 	// that ships a year-long "immutable" outlives the policy change that would
 	// have corrected it. Covers handleAptMirrorPool below, which inherits w.
-	w = cacheSharedImmutableOn200(w, path.Base(p))
+	//
+	// Decided on a server fact, never on the requesting host's own profile.
+	// Every host is served the same .deb — the filtered index decides what a
+	// host is told exists, not which bytes it gets — but a shared cache holding
+	// a public copy answers a refused host out of somebody else's fetch, with
+	// the request never reaching the predicate above. Gated on the requester,
+	// the somebody else is an unidentified host: every host before it is bound,
+	// and every host under an open apt membership, both of which keep reaching
+	// this route ungated by design. So the moment any profile on this instance
+	// scopes apt, the whole route loses the shared grant. An instance where
+	// none does keeps it, because there is no refusal for a proxy to overturn.
+	// Not the filtered codenames served: every fail-closed path in
+	// apt_profile.go withdraws one and leaves the predicate refusing.
+	if s.aptScopedAnywhere() {
+		w = cachePrivateOn200(w, path.Base(p))
+	} else {
+		w = cacheSharedImmutableOn200(w, path.Base(p))
+	}
 	store, err := s.aptPoolStore(poolPath)
 	if err != nil {
 		s.logger.Error("storage backend recorded for pooled .deb is not configured",
@@ -334,12 +358,24 @@ type aptSnapshot struct {
 	builtAt    time.Time
 	validUntil time.Time
 
+	// profileSuites maps a filtered codename to the profile it was generated
+	// for. Recorded here rather than recomputed, because the status route is a
+	// per-request caller and resolving it from the profile tables would charge
+	// a query per profile to a question the rebuild already answered.
+	profileSuites map[string]string
+
 	// poolStorage maps a pool path to the backend name its version entry
 	// records, with an empty record stored as the default. A present entry
 	// and an absent one have to be distinguishable: present-but-empty means
 	// "default", while absent means there is no entry to have recorded
 	// anything and the type rule applies.
 	poolStorage map[string]string
+
+	// profilesScopeApt records whether any profile scoped apt at the moment
+	// this snapshot was built, before the withdrawals that decide
+	// profileSuites. A profile whose codename a rebuild withdrew still has
+	// its hosts refused at the pool, so the two are different questions.
+	profilesScopeApt bool
 }
 
 // rebuildAptSnapshot regenerates the index and publishes it to every
@@ -442,6 +478,19 @@ func (s *Server) buildAptSnapshot(ctx context.Context) (*aptSnapshot, error) {
 	snap.poolStorage = s.aptPoolStorage(ctx)
 	for _, suite := range served {
 		snap.suites[suite] = s.buildAptSuiteIndex(ctx, suite, poolMap, sharedPool, date, snap.validUntil)
+	}
+	// Filtered codenames join the same map, so every dists/ handler routes to
+	// them unchanged and one snapshot retires as a unit. A profile's Release
+	// and its Packages have to be generated together for the reason every
+	// suite's do: the first carries the digests of the second.
+	profileSuites, scoped := s.aptProfileIndexes(ctx, date, snap.validUntil)
+	snap.profilesScopeApt = scoped
+	for _, ps := range profileSuites {
+		snap.suites[ps.codename] = ps.index
+		if snap.profileSuites == nil {
+			snap.profileSuites = map[string]string{}
+		}
+		snap.profileSuites[ps.codename] = ps.profile
 	}
 	s.auditAptEntries(ctx, served, poolMap)
 	s.reportPinFeasibility(ctx)
@@ -692,19 +741,40 @@ func (s *Server) buildAptSuiteIndex(ctx context.Context, suite string, poolMap m
 		arches = []string{"amd64"}
 	}
 
+	packages := make(map[string][]byte, len(arches))
+	for _, arch := range arches {
+		packages[arch] = s.generateAptPackages(ctx, suite, arch, poolMap, sharedPool)
+	}
+	return s.aptIndexFrom(suite, packages, date, validUntil)
+}
+
+// aptIndexFrom assembles one generated suite from its Packages bodies: the
+// gzip variants, the Release that carries their digests, and the signature
+// over it.
+//
+// Shared with the filtered codenames a profile is served under, which differ
+// from a manifest-built suite in where the stanzas came from and in nothing
+// else. Two copies of this would be two answers to what a bodega-signed
+// Release says, and the one that drifted would fail as a hash mismatch on the
+// client rather than as anything visible here.
+func (s *Server) aptIndexFrom(suite string, packages map[string][]byte, date, validUntil time.Time) *aptSuiteIndex {
+	arches := make([]string, 0, len(packages))
+	for arch := range packages {
+		arches = append(arches, arch)
+	}
+	sort.Strings(arches)
+
 	idx := &aptSuiteIndex{
 		packages:   make(map[string][]byte, len(arches)),
 		packagesGz: make(map[string][]byte, len(arches)),
 	}
-
-	// Generate Packages content for each arch to compute checksums.
 	type indexEntry struct {
 		path string
 		data []byte
 	}
 	var entries []indexEntry
 	for _, arch := range arches {
-		pkgData := s.generateAptPackages(ctx, suite, arch, poolMap, sharedPool)
+		pkgData := packages[arch]
 		entries = append(entries, indexEntry{
 			path: "main/binary-" + arch + "/Packages",
 			data: pkgData,
@@ -784,6 +854,26 @@ type aptStatus struct {
 	UnservedCount int                  `json:"unserved_count,omitempty"`
 	PublicURL     string               `json:"public_url"`
 	Sources       []aptsources.Sources `json:"sources"`
+
+	// Filtered names the codenames generated from a profile's view of a
+	// mirrored codename, in sorted order. They are generated suites in every way
+	// that matters to a client — bodega's key signs them and Signed-By: goes
+	// on the line — and separate from Suites because nothing in apt_suites
+	// produced them and an operator reading the config would not find them.
+	Filtered []string `json:"filtered,omitempty"`
+
+	// Profile is the profile bound to the request that asked, when one scopes
+	// apt for it, and Host is the single stanza that host should install.
+	//
+	// The server answers this rather than leaving a client to pick a block out
+	// of the list, for the reason this package exists at all: which codename a
+	// host reads is a fact only the server holds, and every emitter that
+	// guessed at one guessed wrong. Host is nil when the answer is the
+	// operator's — no profile scopes apt and this instance serves more than
+	// one codename — because a guess there is a host pointed at the wrong
+	// suite with nothing reporting it.
+	Profile string              `json:"profile,omitempty"`
+	Host    *aptsources.Sources `json:"host,omitempty"`
 }
 
 // aptUnservedEntry is one manifest entry that names no suite this server
@@ -877,6 +967,7 @@ func (s *Server) aptStatusFor(r *http.Request) aptStatus {
 		ctx = r.Context()
 	}
 	unserved, unservedCount := s.aptUnservedEntries(ctx)
+	filtered, _ := s.aptFilteredSuites()
 	out := aptStatus{
 		Signed:        st.Signed,
 		Fingerprints:  st.Fingerprints,
@@ -885,12 +976,13 @@ func (s *Server) aptStatusFor(r *http.Request) aptStatus {
 		Unserved:      unserved,
 		UnservedCount: unservedCount,
 		PublicURL:     st.PublicURL,
-		Sources:       make([]aptsources.Sources, 0, len(st.Suites)+len(mirrored)),
+		Filtered:      filtered,
+		Sources:       make([]aptsources.Sources, 0, len(st.Suites)+len(mirrored)+len(filtered)),
 	}
 	if st.Signed {
 		out.KeyringURL = aptsources.KeyringRoute
 	}
-	if len(st.Suites) == 0 && len(mirrored) == 0 {
+	if len(st.Suites) == 0 && len(mirrored) == 0 && len(filtered) == 0 {
 		return aptStatus{Signed: out.Signed, Fingerprints: out.Fingerprints, KeyringURL: out.KeyringURL,
 			Suites: []string{}, Unserved: out.Unserved, UnservedCount: out.UnservedCount,
 			PublicURL: out.PublicURL, Sources: []aptsources.Sources{aptsources.Render(st)}}
@@ -901,7 +993,7 @@ func (s *Server) aptStatusFor(r *http.Request) aptStatus {
 		out.Sources = append(out.Sources, aptsources.Render(one))
 	}
 	// A mirrored codename gets its own block. It cannot share the generated
-	// one's stanza: those carry Signed-By: or Trusted:, and a mirrored suite
+	// one's stanza: those carry Signed-By: or Trusted:, and a mirrored codename
 	// must carry neither, so folding them onto one Suites: line would apply
 	// the wrong trust to half of it.
 	for _, codename := range mirrored {
@@ -910,7 +1002,70 @@ func (s *Server) aptStatusFor(r *http.Request) aptStatus {
 		one.Mirrored = true
 		out.Sources = append(out.Sources, aptsources.Render(one))
 	}
+	// A filtered codename renders as what it is: a suite bodega generated and
+	// signed. Same stanza shape as an apt_suites codename, because from the
+	// client's side that is the only thing it is.
+	for _, codename := range out.Filtered {
+		one := st
+		one.Suites = []string{codename}
+		out.Sources = append(out.Sources, aptsources.Render(one))
+	}
+	out.Profile, out.Host = s.aptHostSources(r, st, out)
 	return out
+}
+
+// aptFilteredSuites names the filtered codenames the loaded snapshot carries,
+// sorted, and the profile each belongs to.
+func (s *Server) aptFilteredSuites() (names []string, byCodename map[string]string) {
+	snap := s.aptSnap.Load()
+	if snap == nil || len(snap.profileSuites) == 0 {
+		return nil, nil
+	}
+	names = make([]string, 0, len(snap.profileSuites))
+	for codename := range snap.profileSuites {
+		names = append(names, codename)
+	}
+	sort.Strings(names)
+	return names, snap.profileSuites
+}
+
+// aptHostSources picks the one stanza the requesting host should install.
+//
+// A host bound to a profile that scopes apt reads that profile's filtered
+// codename and nothing else: reading the base beside it would hand the same
+// client an unfiltered index for the same packages, and apt takes the highest
+// version it is offered from either.
+//
+// Everyone else gets an answer only when there is one codename to give. With
+// several served and no profile to choose between them, naming one would point
+// a host at a suite nobody decided on, and it would look authoritative.
+func (s *Server) aptHostSources(r *http.Request, st aptsources.State, out aptStatus) (string, *aptsources.Sources) {
+	if r != nil {
+		p := s.profileFor(r)
+		base, _ := p.AptScope()
+		if base != "" {
+			_, byCodename := s.aptFilteredSuites()
+			for codename, profile := range byCodename {
+				if profile != p.Name() {
+					continue
+				}
+				one := st
+				one.Suites = []string{codename}
+				rendered := aptsources.Render(one)
+				return p.Name(), &rendered
+			}
+			// The profile scopes apt and no codename answers for it: the
+			// rebuild refused the base or has not run since the profile was
+			// written. Naming the base instead would serve this host the
+			// unfiltered index its profile exists to narrow.
+			return p.Name(), nil
+		}
+	}
+	if len(out.Sources) == 1 {
+		one := out.Sources[0]
+		return "", &one
+	}
+	return "", nil
 }
 
 // publicBase returns the base URL clients reach this server at, with no
@@ -1426,6 +1581,16 @@ func (s *Server) aptSourcesBanner() string {
 		one := st
 		one.Suites = []string{codename}
 		one.Mirrored = true
+		blocks = append(blocks, aptsources.Render(one))
+	}
+	// And one per filtered codename. A profile's suite is not in apt_suites
+	// and not in apt_upstreams, so an operator reading the config file finds
+	// no trace of it; leaving it off the banner as well would mean the only
+	// place the name appears is the log line that built it.
+	filtered, _ := s.aptFilteredSuites()
+	for _, codename := range filtered {
+		one := st
+		one.Suites = []string{codename}
 		blocks = append(blocks, aptsources.Render(one))
 	}
 	var b strings.Builder

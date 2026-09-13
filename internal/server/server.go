@@ -143,6 +143,12 @@ type Server struct {
 	// a burst of writes paid for a full listing each — multiplied by the
 	// number of backends once the listing fans out.
 	aptPool atomic.Pointer[aptPoolListing]
+	// aptUpstreamIdx caches the upstream index documents a filtered codename
+	// is generated from, behind metadata_ttl. Every profile write signals a
+	// reload and a reload rebuilds the snapshot, so without it an operator
+	// adding twenty entries would refetch the base's Packages twenty times
+	// from an archive that republishes it daily.
+	aptUpstreamIdx sync.Map
 
 	// aptRoutes remembers which configured archive answered for each pool
 	// path, because a pool request carries no codename to resolve it by.

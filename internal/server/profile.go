@@ -23,6 +23,14 @@ import (
 // would be answered by a profile nobody wrote.
 type profileSet struct {
 	byIdentity map[string]*entitle.Profile
+
+	// aptScoped records whether any profile in this set scopes apt, which is
+	// the union of every answer aptGatesPool can give this generation. The
+	// pool route's cache directive turns on it: a directive decided on the
+	// requesting host would ship a shared copy of the object the next host is
+	// refused, and one decided on the filtered codenames actually served
+	// would do the same for every profile whose codename a rebuild withdrew.
+	aptScoped bool
 }
 
 // profileFor returns the profile bound to the host this request resolved to,
@@ -34,6 +42,14 @@ func (p *profileSet) profileFor(identity string) *entitle.Profile {
 		return nil
 	}
 	return p.byIdentity[identity]
+}
+
+// scopesApt reports whether any profile here scopes apt. A nil set is the
+// state before the bindings have ever been read, and answers yes: nothing has
+// looked at the profile tables yet, so a "no" would be a guess in the
+// direction of a year-long public copy.
+func (p *profileSet) scopesApt() bool {
+	return p == nil || p.aptScoped
 }
 
 func (s *Server) profileNow() *profileSet {
@@ -112,6 +128,9 @@ func (s *Server) resolveProfiles(ctx context.Context) *profileSet {
 		}
 		if p != nil {
 			set.byIdentity[b.Identity] = p
+			if base, _ := p.AptScope(); base != "" {
+				set.aptScoped = true
+			}
 		}
 	}
 	return set
@@ -242,9 +261,11 @@ func (s *Server) profileFor(r *http.Request) *entitle.Profile {
 // a git namespace, a packument, an index. Those are decided at the membership
 // level alone, because there is no version yet to hold to a constraint.
 //
-// apt does not reach here and is deliberately excluded: refusing an apt fetch
-// at the pool costs the client a half-applied transaction, and the control
-// there belongs at the index. See docs/DESIGN.md.
+// apt reaches here from one route only, and as a backstop rather than as the
+// control: refusing an apt fetch at the pool costs the client a half-applied
+// transaction, so the enforcement is the filtered index a profile is served
+// under and aptPoolGate catches a client that composed a URL without reading
+// one. See internal/server/apt_profile.go and docs/DESIGN.md.
 func (s *Server) entitleGate(w http.ResponseWriter, r *http.Request, typ, name, version string) bool {
 	p := s.profileFor(r)
 	if p == nil {

@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"slices"
@@ -11,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/host"
 	"github.com/ravinald/bodega/internal/policy"
@@ -29,7 +33,7 @@ import (
 // The threat model and rationale for each check is documented in
 // docs/THREAT_MODEL.md.
 func newDoctorCmd(gf *globalFlags) *cobra.Command {
-	var writeCreds bool
+	var writeCreds, writeAptSources, allowPlaintext bool
 	var token, baseURL string
 	c := &cobra.Command{
 		Use:   "doctor",
@@ -75,11 +79,37 @@ pip every credential in the file. The machine <host> stanza is the anchor.
 The token names the host through bodega identity bind token <id> <name>. The
 write changes what an audit row says, never what the host may fetch.
 
+--write-apt-sources is the other write, and it is the one place a host's apt
+configuration is composed from what the server knows rather than guessed at.
+It asks bodega which suite this host reads — a profile that scopes apt is
+served a filtered codename of its own — then installs the archive keyring and
+writes that stanza to /etc/apt/sources.list.d/bodega.sources.
+
+  bodega doctor --write-apt-sources --token bodega_ak_... --url https://bodega.internal
+
+--token is optional: a host bound with "bodega identity bind cidr" is
+identified by its address and needs none. A host bodega cannot identify gets
+told which codenames exist rather than handed one.
+
+Signed-By: goes on the line and names the keyring this command just installed.
+The alternative is [trusted=yes], which turns signature verification off for
+the source permanently and would discard the reason the filtered index is
+signed at all. Both files need root, and the stanza scopes what a correctly
+configured host sees: a host that edits it back reaches the unfiltered
+codename, which is why the request predicate still runs at the pool.
+
 See docs/THREAT_MODEL.md for the rationale behind each check.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if writeCreds && writeAptSources {
+				return fmt.Errorf("run one write at a time: --write-credentials places the token every client reads, " +
+					"--write-apt-sources asks the server which suite this host reads and installs it")
+			}
 			if writeCreds {
 				return writeClientCredentials(gf, token, baseURL)
+			}
+			if writeAptSources {
+				return writeAptSourcesFile(gf, token, baseURL, allowPlaintext)
 			}
 			findings := make([]host.Finding, 0, len(host.AllChecks())+len(postureChecks))
 			for _, fn := range host.AllChecks() {
@@ -119,10 +149,14 @@ See docs/THREAT_MODEL.md for the rationale behind each check.`,
 	}
 	c.Flags().BoolVar(&writeCreds, "write-credentials", false,
 		"Write a read-path credential into each client's own configuration file")
+	c.Flags().BoolVar(&writeAptSources, "write-apt-sources", false,
+		"Install the archive keyring and the apt sources stanza this server says the host should read")
 	c.Flags().StringVar(&token, "token", "",
 		"The token to write (bodega token generate <label>)")
 	c.Flags().StringVar(&baseURL, "url", "",
 		"Base URL clients reach this bodega at; defaults to public_url from the config file")
+	c.Flags().BoolVar(&allowPlaintext, "allow-plaintext", false,
+		"Permit --url over http; refused by default because a bearer token would travel in the clear")
 	return c
 }
 
@@ -205,6 +239,129 @@ func printCredentialPrecondition() {
 	fmt.Println("  Keep admin_permit_cidr at loopback (bodega acl admin list), or treat every")
 	fmt.Println("  host you write a credential to as admin-capable.")
 	fmt.Println()
+}
+
+// aptClientConfig is the half of GET /api/v1/status this command reads. The
+// server composes the stanza and this decodes it: which codename a host reads
+// is a fact only the running instance holds, and every emitter that derived
+// one for itself derived it wrong. internal/aptsources carries that history.
+type aptClientConfig struct {
+	Apt aptClientStatus `json:"apt"`
+}
+
+type aptClientStatus struct {
+	Signed     bool                 `json:"signed"`
+	KeyringURL string               `json:"keyring_url"`
+	Suites     []string             `json:"suites"`
+	Mirrored   []string             `json:"mirrored"`
+	Filtered   []string             `json:"filtered"`
+	Profile    string               `json:"profile"`
+	Host       *aptsources.Sources  `json:"host"`
+	Sources    []aptsources.Sources `json:"sources"`
+}
+
+// writeAptSourcesFile installs what the server says this host's apt
+// configuration is: the keyring first, then the stanza that names it.
+//
+// --token is optional here and is not an oversight. The server answers with
+// whatever host this request resolves to, and a host bound by `bodega identity
+// bind cidr` sends no header at all — demanding a token would make one of the
+// two identification modes unusable from the command that configures it. What
+// a host with neither gets is the fleet-wide answer, which aptNoStanza names
+// rather than installs.
+func writeAptSourcesFile(gf *globalFlags, token, baseURL string, allowPlaintext bool) error {
+	if baseURL == "" {
+		cfg, err := loadConfig(gf)
+		if err != nil {
+			return fmt.Errorf("load config: %w", err)
+		}
+		baseURL = cfg.PublicURL
+	}
+	if baseURL == "" {
+		return fmt.Errorf("--write-apt-sources needs the base URL clients reach this bodega at.\n" +
+			"  Pass --url https://bodega.internal, or set public_url in the config file")
+	}
+	client, err := NewClient(baseURL, token, allowPlaintext)
+	if err != nil {
+		return err
+	}
+	var status aptClientConfig
+	if err := getJSON(client, "/api/v1/status", &status); err != nil {
+		return err
+	}
+	apt := status.Apt
+	if apt.Host == nil {
+		return aptNoStanza(apt)
+	}
+	keyring, err := getBody(client, aptsources.KeyringRoute)
+	if err != nil {
+		return err
+	}
+	wrote, err := host.WriteAptSources("", aptsources.ClientKeyringPath, apt.Host.Deb822, keyring)
+	for _, p := range wrote {
+		fmt.Printf("wrote %s\n", p)
+	}
+	if err != nil {
+		return err
+	}
+	if apt.Profile != "" {
+		fmt.Printf("\nProfile %q: this host reads %s, a filtered view of what bodega mirrors.\n",
+			apt.Profile, apt.Host.Suite)
+		fmt.Println("The stanza scopes what this host is told exists. It authorizes nothing on")
+		fmt.Println("its own: a host that edits it reaches the unfiltered codename, and the")
+		fmt.Println("request predicate at /apt/pool/ is what refuses the artifacts behind it.")
+	}
+	fmt.Println("\nApply it:  apt-get update")
+	return nil
+}
+
+// aptNoStanza explains a server that would not name one suite for this host,
+// which is two different situations and two different repairs.
+func aptNoStanza(apt aptClientStatus) error {
+	if apt.Profile != "" {
+		return fmt.Errorf("profile %q scopes apt and this server is serving no filtered codename for it yet.\n"+
+			"  The base has to be a mirrored codename, and the index rebuilds on the hour:\n"+
+			"  bodega profile show %s   (check APT BASE)\n"+
+			"  Then look at the server's log for the base it refused", apt.Profile, apt.Profile)
+	}
+	served := slices.Concat(apt.Suites, apt.Mirrored, apt.Filtered)
+	if len(served) == 0 {
+		return fmt.Errorf("this bodega serves no apt suite, so there is no stanza to install")
+	}
+	return fmt.Errorf("no profile scopes apt for this host and this bodega serves %d codenames, so which one this host should read is your decision rather than the server's: %s.\n"+
+		"  This host may simply not be identified. Pass --token, or bind its address:  bodega identity bind cidr <cidr> <name>\n"+
+		"  Then give the profile a base:  bodega profile set <profile> apt --membership closed --base <codename>\n"+
+		"  Or write the stanza by hand from:  bodega status apt",
+		len(served), strings.Join(served, ", "))
+}
+
+// getJSON reads one JSON document off the read API, treating any non-200 as
+// the failure it is: a caller here is asking a question with one right answer.
+func getJSON(c *Client, path string, out any) error {
+	body, err := getBody(c, path)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		return fmt.Errorf("parse %s: %w", path, err)
+	}
+	return nil
+}
+
+func getBody(c *Client, path string) ([]byte, error) {
+	resp, err := c.Get(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET %s: %s\n%s", path, resp.Status, serverError(body))
+	}
+	return body, nil
 }
 
 // postureChecks names the server-posture rows in the order doctor prints them.
