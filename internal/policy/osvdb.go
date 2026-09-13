@@ -41,6 +41,11 @@ type OSVDBMeta struct {
 	Records   int       `json:"records"`
 	Packages  int       `json:"packages"`
 	Bytes     int64     `json:"bytes"`
+	// Trimmed records that the sync dropped the enumerated versions an
+	// entry's own ranges already cover. An archive written before that
+	// decodes to false, which is the right answer: it still costs what it
+	// cost, and only a re-sync changes that. See trimCovered.
+	Trimmed bool `json:"trimmed,omitempty"`
 }
 
 // Age reports how long ago the ecosystem was fetched, relative to now.
@@ -55,6 +60,76 @@ type osvRecord struct {
 	Summary  string        `json:"summary,omitempty"`
 	Severity []OSVSeverity `json:"severity,omitempty"`
 	Affected []osvAffected `json:"affected"`
+}
+
+func (r *osvRecord) UnmarshalJSON(b []byte) error {
+	type raw osvRecord
+	var v raw
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	v.ID, v.Summary = internOSV(v.ID), internOSV(v.Summary)
+	*r = osvRecord(v)
+	return nil
+}
+
+// The table one decode canonicalizes its strings through, and the lock that
+// scopes it to that decode.
+//
+// The archive stores a record once per package it names, so a release arrives
+// as many copies of every id, range bound and range type: measured on the
+// 2026-09 export, Ubuntu:22.04:LTS is 772,549 record entries for 36,268
+// advisories, whose 934,788 range bounds take 3,423 distinct values. Every one
+// of those copies is its own allocation out of json.Decoder.
+//
+// Interning has to run inside the decode. A pass over the decoded index lowers
+// what the process keeps and leaves the peak exactly where it was, because
+// every duplicate is live at once before the pass can start, and the peak is
+// the figure that gets a host OOM-killed. Interning here lets each duplicate
+// die as garbage a few thousand at a time.
+//
+// The table is package-level because encoding/json hands an Unmarshaler no
+// per-decode state. osvDecode is held for the whole of one decode, which
+// serializes archive loads across every database in the process: two
+// concurrent multi-gigabyte decodes is a way to run a host out of memory, not
+// a way to finish sooner.
+var (
+	osvDecode sync.Mutex
+	osvCanon  map[string]string
+)
+
+// internOSV returns the canonical copy of s for the decode in progress, or s
+// unchanged outside one. Callers hold osvDecode; see osvCanon.
+func internOSV(s string) string {
+	if s == "" || osvCanon == nil {
+		return s
+	}
+	if c, ok := osvCanon[s]; ok {
+		return c
+	}
+	osvCanon[s] = s
+	return s
+}
+
+// beginOSVDecode opens a decode and returns the function that ends it. The
+// table is dropped at that point; the canonical strings stay reachable through
+// whatever the decode produced. Every decode of these types takes the lock
+// whether it interns or not, because osvCanon is read from the Unmarshalers.
+//
+// intern is off for the language ecosystems, where it is a cost and not a
+// saving: npm's export names about one package per advisory, so its records
+// arrive once each and there is nothing to canonicalize. Measured on the
+// 2026-09 export, interning npm left the retained figure where it was and
+// added 48 MB to the peak, which is the table itself.
+func beginOSVDecode(intern bool) func() {
+	osvDecode.Lock()
+	if intern {
+		osvCanon = map[string]string{}
+	}
+	return func() {
+		osvCanon = nil
+		osvDecode.Unlock()
+	}
 }
 
 // osvIndex is the on-disk archive: every record that names a package in this
@@ -219,7 +294,7 @@ func (d *OSVDatabase) SyncGroup(ctx context.Context, ecosystems []string) []OSVS
 			}
 			continue
 		}
-		indexes, records, err := distill(group, zipPath)
+		indexes, records, err := distill(group, zipPath, trimEnumerated)
 		os.Remove(zipPath)
 		if err != nil {
 			for _, eco := range group {
@@ -254,6 +329,7 @@ func (d *OSVDatabase) SyncGroup(ctx context.Context, ecosystems []string) []OSVS
 				Records:   records[eco],
 				Packages:  len(idx.Packages),
 				Bytes:     n,
+				Trimmed:   trimEnumerated,
 			}
 			if err := d.writeMeta(meta); err != nil {
 				fail(eco, err)
@@ -367,7 +443,14 @@ func (d *OSVDatabase) index(ecosystem string) (*osvIndex, error) {
 	}
 	defer func() { _ = zr.Close() }()
 	var idx osvIndex
-	if err := json.NewDecoder(zr).Decode(&idx); err != nil {
+	// The distro exports are where a record repeats: one advisory names every
+	// binary package its source builds, so the archive carries it once per
+	// name and the decoder allocates every id and range bound afresh each
+	// time.
+	end := beginOSVDecode(isDistroEcosystem(ecosystem))
+	err = json.NewDecoder(zr).Decode(&idx)
+	end()
+	if err != nil {
 		return nil, fmt.Errorf("parse %s: %w", d.indexPath(ecosystem), err)
 	}
 	if d.loaded == nil {
@@ -416,6 +499,18 @@ func (d *OSVDatabase) download(ctx context.Context, src string) (string, error) 
 	return tmp.Name(), nil
 }
 
+// What distill does with an entry's enumerated version list. A sync writes
+// trimEnumerated and nothing else selects keepEnumerated: no config key, no
+// environment variable and no request, because an index whose trim was turned
+// off is one the agreement tests are the only thing checking, and a caller who
+// could choose would be choosing how its own advisories are evaluated.
+// TestOSVTrimChangesNoVerdict needs both shapes in one process, which is the
+// whole reason this is an argument rather than a constant.
+const (
+	trimEnumerated = true
+	keepEnumerated = false
+)
+
 // distill reads the export once and keeps only what a verdict needs: the
 // records that name a package in each requested ecosystem, grouped by package.
 //
@@ -430,12 +525,19 @@ func (d *OSVDatabase) download(ctx context.Context, src string) (string, error) 
 // July 2026, comes back on a langchain-community query) and filters others.
 // A retracted advisory blocking an import is a false positive the operator
 // cannot clear, so the local database does not carry them.
-func distill(ecosystems []string, zipPath string) (map[string]*osvIndex, map[string]int, error) {
+//
+// trim selects what an entry's enumerated version list keeps; see
+// trimEnumerated and trimCovered.
+func distill(ecosystems []string, zipPath string, trim bool) (map[string]*osvIndex, map[string]int, error) {
 	zr, err := zip.OpenReader(zipPath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read %s: %w", zipPath, err)
 	}
 	defer func() { _ = zr.Close() }()
+
+	// Held, not interned: distill reads each record of the export once, so
+	// there is little to canonicalize, and the Unmarshalers read osvCanon.
+	defer beginOSVDecode(false)()
 
 	indexes := make(map[string]*osvIndex, len(ecosystems))
 	records := make(map[string]int, len(ecosystems))
@@ -492,11 +594,19 @@ func distill(ecosystems []string, zipPath string) (map[string]*osvIndex, map[str
 			if len(aff.Versions) == 0 && len(ranges) == 0 {
 				continue
 			}
+			versions := aff.Versions
+			if trim {
+				// The ordering the entry was folded into, which is the one
+				// Match resolves the query under. Deciding the trim under any
+				// other would evaluate a PyPI entry as semver and a distro
+				// entry under a rule no lookup applies.
+				versions = trimCovered(osvVersionOrder(eco), versions, ranges)
+			}
 			if byEcosystem[eco] == nil {
 				byEcosystem[eco] = map[string][]osvAffected{}
 			}
 			key := osvPackageKey(eco, aff.Package.Name)
-			byEcosystem[eco][key] = append(byEcosystem[eco][key], osvAffected{Versions: aff.Versions, Ranges: ranges})
+			byEcosystem[eco][key] = append(byEcosystem[eco][key], osvAffected{Versions: osvVersions(versions), Ranges: ranges})
 		}
 		for eco, byPackage := range byEcosystem {
 			records[eco]++

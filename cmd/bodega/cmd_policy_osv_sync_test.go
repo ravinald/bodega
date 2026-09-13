@@ -358,3 +358,58 @@ func TestListCommand_AptReadsNeverWhenACapturedReleaseHasNoIndex(t *testing.T) {
 		t.Errorf("the captured release has no index and rescan says so; list reported apt synced:\n%s", stdout)
 	}
 }
+
+// TestListCommand_NamesAnArchiveSyncedBeforeTheTrim pins the one thing that
+// would otherwise tell an operator nothing: an archive a pre-trim version
+// synced keeps the old cost forever, the gate answers from it correctly, and
+// no column in the table moves. The row keeps its sync time, because what is
+// stale about that archive is its size and not its advisories.
+func TestListCommand_NamesAnArchiveSyncedBeforeTheTrim(t *testing.T) {
+	root := syncInstall(t, "jammy", "jammy")
+	setOSVPolicy(t, root, manifest.TypeApt, "block")
+	if _, _, err := runSync(t, "apt"); err != nil {
+		t.Fatalf("sync apt: %v", err)
+	}
+
+	stdout, _, err := runOSVCmd(t, newPolicyOSVListCmd(&globalFlags{}))
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if strings.Contains(stdout, "Synced before the version-list trim") {
+		t.Fatalf("this sync trimmed; list named it pre-trim anyway:\n%s", stdout)
+	}
+
+	// A sidecar an older version wrote carries no trimming flag at all, and
+	// decoding it to false is the answer that matters.
+	metaPath := filepath.Join(root, "osv", "Ubuntu-22.04-LTS.meta.json")
+	raw, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta map[string]any
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		t.Fatal(err)
+	}
+	delete(meta, "trimmed")
+	blob, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(metaPath, blob, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, _, err = runOSVCmd(t, newPolicyOSVListCmd(&globalFlags{}))
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if !strings.Contains(stdout, "Synced before the version-list trim: Ubuntu:22.04:LTS") {
+		t.Errorf("the pre-trim archive is unnamed, so nothing in the install would ever say so:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "bodega policy osv sync apt") {
+		t.Errorf("naming the archive without the command that fixes it is a finding an operator cannot act on:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "never") {
+		t.Errorf("the advisories in that archive are current; the row must keep its sync time:\n%s", stdout)
+	}
+}

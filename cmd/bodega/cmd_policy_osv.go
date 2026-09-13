@@ -149,15 +149,18 @@ func newPolicyOSVListCmd(gf *globalFlags) *cobra.Command {
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 			fmt.Fprintln(w, "ECOSYSTEM\tACTION\tUPDATED\tDB SYNCED\tDB AGE")
 			stored := make([]string, 0, len(rows))
+			untrimmed := map[string][]string{}
 			for _, p := range rows {
-				synced, age := osvDBState(db, p.Ecosystem, aptSuites)
+				synced, age, old := osvDBState(db, p.Ecosystem, aptSuites)
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
 					p.Ecosystem, p.Action, p.UpdatedAt.Format("2006-01-02"), synced, age)
 				stored = append(stored, p.Ecosystem)
+				untrimmed[p.Ecosystem] = old
 			}
 			if err := w.Flush(); err != nil {
 				return err
 			}
+			reportUntrimmed(stored, untrimmed)
 			fmt.Printf("\nLocal OSV database: %s (api.osv.dev fallback: %s)\n",
 				db.Dir(), onOff(cfg.OSVAPIFallback))
 			reportUncovered("OSV gate", stored, policy.OSVEcosystems(), "bodega policy osv remove")
@@ -389,28 +392,58 @@ and point osv_db_dir at the copy.`,
 // apt spans one export per served suite, and the row reports the oldest of
 // them. A gate that stopped syncing jammy in March is a gate that stopped, and
 // averaging it against a fresh noble would hide exactly that.
-func osvDBState(db *policy.OSVDatabase, ecosystem string, aptSuites []string) (string, string) {
+// osvDBState is one row's sync time and age, plus the ecosystems under it
+// whose archive predates the version-list trim. The untrimmed set stays out of
+// the DB SYNCED column on purpose: such an archive is stale in size, not in
+// content, and a column reading "never" or an age warning would tell an
+// operator their advisories are old when they are current.
+func osvDBState(db *policy.OSVDatabase, ecosystem string, aptSuites []string) (string, string, []string) {
 	if !policy.OSVCovers(ecosystem) {
 		// A stored row for a type the gate cannot query. "never" would read as
 		// a sync nobody has run yet, and there is no sync that would fix it;
 		// reportUncovered names the row under the table.
-		return "n/a", "-"
+		return "n/a", "-", nil
 	}
 	osvEcos, _ := policy.OSVExportsFor(ecosystem, aptSuites)
 	if len(osvEcos) == 0 {
-		return "never", "-"
+		return "never", "-", nil
 	}
 	var oldest time.Time
+	var untrimmed []string
 	for _, osvEco := range osvEcos {
 		meta, err := db.Meta(osvEco)
 		if err != nil {
-			return "never", "-"
+			return "never", "-", nil
+		}
+		if !meta.Trimmed {
+			untrimmed = append(untrimmed, osvEco)
 		}
 		if oldest.IsZero() || meta.FetchedAt.Before(oldest) {
 			oldest = meta.FetchedAt
 		}
 	}
-	return oldest.Format(time.RFC3339), policy.ShortDuration(time.Since(oldest))
+	return oldest.Format(time.RFC3339), policy.ShortDuration(time.Since(oldest)), untrimmed
+}
+
+// reportUntrimmed names the archives written before the trim, per row, with
+// the command that replaces them. What a re-sync reclaims is a property of the
+// advisories rather than of the archive, so the notice says what the trim does
+// instead of promising a figure: it is most of a distro release's resident
+// cost and nothing at all on npm, whose advisories enumerate no versions.
+func reportUntrimmed(order []string, byRow map[string][]string) {
+	for _, row := range order {
+		ecos := byRow[row]
+		if len(ecos) == 0 {
+			continue
+		}
+		fmt.Printf("\nSynced before the version-list trim: %s.\n"+
+			"Each holds every version its advisories enumerate, where a re-sync keeps only the\n"+
+			"ones those advisories' own ranges do not place. On the Ubuntu and Debian releases\n"+
+			"that is most of what the index costs in memory; on an ecosystem whose advisories\n"+
+			"enumerate nothing it is no difference at all. The advisories are current; re-sync\n"+
+			"with 'bodega policy osv sync %s'.\n",
+			strings.Join(ecos, ", "), row)
+	}
 }
 
 func onOff(b bool) string {
