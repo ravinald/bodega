@@ -215,7 +215,9 @@ func (s *Server) pypiSimpleURL(normalized string) string {
 // from a chunk that may have split it in half. What is held is one simple
 // index, which runs from a few kilobytes to a couple of megabytes for the
 // oldest distributions on pypi, and proxyOrCache has already spooled the same
-// bytes to disk before the first Write lands here. Wrapping the writer rather
+// bytes to disk before the first Write lands here. maxUpstreamBody is the
+// ceiling on that buffer, which bounds a hostile or broken upstream rather
+// than any real index. Wrapping the writer rather
 // than teaching proxyOrCache a transform hook keeps the cached object the
 // document the upstream actually served, which is what makes it evidence.
 //
@@ -233,6 +235,14 @@ type pypiIndexWriter struct {
 	permit func(string) bool
 	status int
 	body   bytes.Buffer
+	// tooBig records that the upstream ran past maxUpstreamBody. B33 settled
+	// the same question for the npm packument: serving an unrewritten body is
+	// the bypass the rewrite exists to close, so refusing is the honest answer
+	// and a ceiling has to exist for refusing to be possible. Without one the
+	// only bound was spool_max_artifact_bytes on the miss path, and nothing at
+	// all on the cache-hit path where proxyS3 streams a stored object straight
+	// in.
+	tooBig bool
 }
 
 func (p *pypiIndexWriter) WriteHeader(code int) {
@@ -244,6 +254,14 @@ func (p *pypiIndexWriter) WriteHeader(code int) {
 func (p *pypiIndexWriter) Write(b []byte) (int, error) {
 	if p.status == 0 {
 		p.status = http.StatusOK
+	}
+	if int64(p.body.Len()+len(b)) > maxUpstreamBody {
+		p.tooBig = true
+		p.body.Reset()
+		// An error rather than a silent discard: it stops the copy at the
+		// ceiling instead of reading the rest of a body nothing will use, and
+		// no status line has gone out yet, so flush can still refuse.
+		return 0, fmt.Errorf("simple index for %s exceeds bodega's %d-byte rewrite buffer", p.pkg, maxUpstreamBody)
 	}
 	return p.body.Write(b)
 }
@@ -257,6 +275,11 @@ func (p *pypiIndexWriter) flush() error {
 		p.status = http.StatusOK
 	}
 	if p.status == http.StatusOK {
+		if p.tooBig {
+			err := fmt.Errorf("simple index for %s exceeds bodega's %d-byte rewrite buffer: serving it unrewritten would point the client at the upstream index", p.pkg, maxUpstreamBody)
+			http.Error(p.ResponseWriter, err.Error(), http.StatusBadGateway)
+			return err
+		}
 		body = rewritePypiIndex(filterPypiSimplePage(body, p.pkg, p.permit), p.indexURL)
 		// proxyS3 sets ETag from the stored object, which is the upstream
 		// document rather than what is going out. Left on, it labels the
