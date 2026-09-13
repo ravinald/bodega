@@ -23,9 +23,16 @@ been completed yet.
   apt     Copy .deb into pool directory structure (fetches and builds if needed)
   pypi    Generate MANIFEST.sha256 for the wheels directory
           (fetches and builds if needed)
+  helm    Generate index.yaml across every fetched chart
+  npm     Generate the packuments across every fetched package
+  gomod   No-op (the downloaded module zip is already the artifact)
+  cargo   No-op (the downloaded crate tarball is already the artifact)
 
-If no types are given, all four are packaged in dependency order:
-  binary → git → apt → pypi
+helm and npm package across the whole type rather than per entry, because
+index.yaml and the packuments are repository metadata: naming one entry
+regenerates everything.
+
+` + typeOrderSentence("packaged") + `
 
 When a name is given after the type, only that entry is packaged.`,
 		Example: `  bodega build package
