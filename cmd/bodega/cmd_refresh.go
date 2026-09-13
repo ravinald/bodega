@@ -26,10 +26,10 @@ With type and name, refreshes only that specific package.
 
 New versions are created as manifest records but not fetched until you run
 'bodega fetch'. For proxy-mode entries, versions are served on demand.`,
-		Example: `  bodega refresh
-  bodega refresh pypi
-  bodega refresh pypi django
-  bodega refresh --force`,
+		Example: `  bodega pkg refresh
+  bodega pkg refresh pypi
+  bodega pkg refresh pypi django
+  bodega pkg refresh --force`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig(gf)
 			if err != nil {
