@@ -559,6 +559,12 @@ func validateDoc(doc *profileDoc) error {
 		if err := requireConstraintVersion(e.Constraint, e.Version); err != nil {
 			return fmt.Errorf("entries[%d] (%s/%s): %w", i, e.Type, e.Name, err)
 		}
+		// Refused here rather than at the write: createFromDoc reaches
+		// CreateProfileWith as one transaction, and a document rejected halfway
+		// is what that path exists to avoid.
+		if err := pins.ValidateReviewDate("review_after", e.ReviewAfter); err != nil {
+			return fmt.Errorf("entries[%d] (%s/%s): %w", i, e.Type, e.Name, err)
+		}
 		key := profileKey(e.Type, e.Name)
 		if j, dup := firstEntry[key]; dup {
 			spelling := ""
@@ -1138,7 +1144,7 @@ constraint is 'bodega profile unpin'. 'bodega profile pin' is this command
 with the pinning arguments already filled in.`,
 		Args: cobra.ExactArgs(3),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := pins.ValidateReviewDate(reviewAfter); err != nil {
+			if err := pins.ValidateReviewDate("--review-after", reviewAfter); err != nil {
 				return err
 			}
 			return putProfileEntry(gf, args[0], args[1], args[2], audit.ProfileEntry{
@@ -1198,7 +1204,7 @@ closure reports those members with no version rather than choosing one.`,
 					"cannot tell a deliberate hold from an accident, so it is never lifted.\n" +
 					"  bodega profile pin <profile> <type> <name> <version> --reason \"15 breaks the config\"")
 			}
-			if err := pins.ValidateReviewDate(reviewAfter); err != nil {
+			if err := pins.ValidateReviewDate("--review-after", reviewAfter); err != nil {
 				return err
 			}
 			profile, typ, name, version := args[0], args[1], args[2], args[3]
@@ -1210,7 +1216,8 @@ closure reports those members with no version rather than choosing one.`,
 			supplied["constraint"], supplied["version"], supplied["reason"] = true, true, true
 			if err := putProfileEntry(gf, profile, typ, name, audit.ProfileEntry{
 				Constraint: manifest.ConstraintExact, Version: version,
-				Reason: reason, ReviewAfter: reviewAfter, PinnedAt: time.Now().UTC(),
+				Reason: reason, ReviewAfter: reviewAfter,
+				PinnedAt: time.Now().UTC(), PinnedBy: audit.CurrentActor(),
 			}, supplied); err != nil {
 				return err
 			}
@@ -1235,6 +1242,43 @@ closure reports those members with no version rather than choosing one.`,
 // closure is what the operator learns from the command, not a control the pin
 // depends on, and refusing to hold a package because graph.json is missing
 // would make an unrelated catalog defect block a security decision.
+// reportEmptyClosure separates the two things an empty closure can mean. A pin
+// that holds nothing still and a pin bodega has no edges for printed the same
+// nothing, which is the failure R4 names: an operator who does not know a pin
+// implies eleven others finds out during an upgrade.
+//
+// Which ecosystems appear as a parent is read off the graph rather than listed
+// here, because the answer is a property of whichever discoverers have run and
+// a list kept beside them would go stale the first time that changed.
+func reportEmptyClosure(edges []manifest.DepEdge, typ, name string) {
+	ref := typ + "/" + name
+
+	if len(edges) == 0 {
+		fmt.Printf("No dependency graph is recorded, so nothing says what pinning %s holds still.\n", ref)
+		fmt.Printf("  Run 'bodega build fetch' for a type that discovers dependencies to write one.\n")
+		return
+	}
+
+	parentTypes := map[string]bool{}
+	for _, e := range edges {
+		if t, _, ok := strings.Cut(e.Parent, "/"); ok {
+			parentTypes[t] = true
+		}
+	}
+	if !parentTypes[typ] {
+		known := make([]string, 0, len(parentTypes))
+		for t := range parentTypes {
+			known = append(known, t)
+		}
+		sort.Strings(known)
+		fmt.Printf("Nothing records what a %s package depends on, so pinning %s may hold others still without saying so.\n", typ, ref)
+		fmt.Printf("  The graph has %d edge(s), and only these types appear as a parent: %s.\n", len(edges), strings.Join(known, ", "))
+		return
+	}
+
+	fmt.Printf("Pinning %s holds nothing else still: the graph records %d edge(s) and none of them depends on it.\n", ref, len(edges))
+}
+
 func reportPinClosure(gf *globalFlags, profile, typ, name, version string, strict bool) (pins.Closure, error) {
 	closure := pins.Closure{Type: typ, Name: name, Version: version}
 	store, err := loadStore(gf)
@@ -1246,8 +1290,10 @@ func reportPinClosure(gf *globalFlags, profile, typ, name, version string, stric
 		fmt.Fprintf(os.Stderr, "could not read the dependency graph, so this pin's closure is unreported: %v\n", err)
 		return closure, nil
 	}
-	closure = pins.Of(store.Edges(), typ, name, version)
+	edges := store.Edges()
+	closure = pins.Of(edges, typ, name, version)
 	if len(closure.Members) == 0 {
+		reportEmptyClosure(edges, typ, name)
 		return closure, nil
 	}
 
@@ -1330,7 +1376,8 @@ func extendPinAcrossClosure(gf *globalFlags, profile string, closure pins.Closur
 		}
 		if err := putProfileEntry(gf, profile, m.Type, m.Name, audit.ProfileEntry{
 			Constraint: manifest.ConstraintExact, Version: m.Version,
-			Reason: implied, ReviewAfter: reviewAfter, PinnedAt: time.Now().UTC(),
+			Reason: implied, ReviewAfter: reviewAfter,
+			PinnedAt: time.Now().UTC(), PinnedBy: audit.CurrentActor(),
 		}, supplied); err != nil {
 			return fmt.Errorf("--strict-closure: pin %s: %w", m.Ref(), err)
 		}
@@ -1677,12 +1724,14 @@ func mergeProfileEntry(stored, e audit.ProfileEntry, supplied map[string]bool) a
 	if supplied["origin"] {
 		out.Origin = e.Origin
 	}
-	// PinnedAt moves only when the caller sets it, which is the pin path
-	// alone. An `add` that edits a pin's reason carries the stored date
-	// through, so correcting a typo does not re-date the decision and reset
-	// the review clock it is measured against.
+	// PinnedAt and PinnedBy move only when the caller sets them, which is the
+	// pin path alone. An `add` that edits a pin's reason carries both through,
+	// so correcting a typo neither re-dates the decision nor reassigns it. They
+	// move together because a date from one decision beside a name from another
+	// is worse than either being stale.
 	if !e.PinnedAt.IsZero() {
 		out.PinnedAt = e.PinnedAt
+		out.PinnedBy = e.PinnedBy
 	}
 	return out
 }
