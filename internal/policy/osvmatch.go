@@ -25,6 +25,39 @@ type osvAffected struct {
 	Ranges   []osvRange  `json:"ranges,omitempty"`
 }
 
+// osvAffectedList is a record's `affected` entries, shared across the records
+// that carry an equal payload. One advisory names every binary package its
+// source builds and the archive stores it once per name, so a release arrives
+// as many copies of one payload: measured on the 2026-09 export,
+// Ubuntu:22.04:LTS is 772,549 record entries over 3,434 distinct payloads,
+// 610,349 of them the single payload of an advisory nothing has fixed. npm
+// fans its records out barely at all and still takes 228,869 entries over
+// 8,316 payloads.
+//
+// The table is keyed on the raw bytes and compares them in full, which a Go
+// map does on every key it returns. A key that compared a hash alone would
+// hand one advisory's ranges to another package on a collision, and the gate
+// would then answer clean for a version that is affected with no error
+// anywhere. See osvSharedAffected for why this runs inside the decode.
+type osvAffectedList []osvAffected
+
+func (l *osvAffectedList) UnmarshalJSON(b []byte) error {
+	if shared, ok := osvSharedAffected[string(b)]; ok {
+		*l = shared
+		return nil
+	}
+	var raw []osvAffected
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	*l = raw
+	if osvSharedAffected != nil {
+		// b is the decoder's buffer, so the key is a copy by construction.
+		osvSharedAffected[string(b)] = *l
+	}
+	return nil
+}
+
 // osvVersions is an enumerated version list, canonicalized as it decodes. See
 // internOSV for why the decode is where this has to happen.
 type osvVersions []string

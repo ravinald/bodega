@@ -191,8 +191,15 @@ func TestOSVTrimKeepsUnplaceableVersions(t *testing.T) {
 //	  /usr/bin/time -l /tmp/policy.test -test.run TestOSVIndexRSS
 //
 // BODEGA_OSV_INDEX_UNTRIMMED=1 measures the pre-trim shape instead, out of a
-// second database under <dir>/untrimmed, so both figures come off one host in
-// one session rather than off two checkouts.
+// second database under <dir>/untrimmed, and BODEGA_OSV_INDEX_UNSHARED=1
+// decodes the same archive without sharing equal `affected` payloads, so every
+// figure a comparison needs comes off one host in one session rather than off
+// two checkouts.
+//
+// The three counts it prints past the heap are what separate a payload table
+// that did nothing from one that was never consulted: the record entries the
+// index holds against the distinct payloads and the distinct whole records
+// under them, the payloads counted by the value the decode canonicalizes on.
 //
 // It never syncs, because a harness that downloaded 650 MB would not be run
 // twice: an archive it does not find it distills out of the export zip beside
@@ -209,6 +216,7 @@ func TestOSVIndexRSS(t *testing.T) {
 		t.Fatal("set BODEGA_OSV_LIVE_DIR to a synced directory and BODEGA_OSV_INDEX_ECOSYSTEM to one ecosystem in it")
 	}
 	trim := os.Getenv("BODEGA_OSV_INDEX_UNTRIMMED") == ""
+	defer withOSVSharing(os.Getenv("BODEGA_OSV_INDEX_UNSHARED") == "")()
 	dir := root
 	if !trim {
 		dir = filepath.Join(root, "untrimmed")
@@ -233,8 +241,9 @@ func TestOSVIndexRSS(t *testing.T) {
 		t.Fatalf("%s match: %v", eco, err)
 	}
 
-	// Read the heap before counting anything: a walk that deduped ids would
-	// allocate into the figure this exists to report.
+	// Read the heap before counting anything: the walk below re-marshals every
+	// record entry to dedupe it, which would allocate into the figure this
+	// exists to report.
 	runtime.GC()
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
@@ -244,16 +253,23 @@ func TestOSVIndexRSS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("%s: %v", eco, err)
 	}
-	enumerated := 0
+	enumerated, entries := 0, 0
+	payloads, records := map[string]bool{}, map[string]bool{}
 	for _, recs := range idx.Packages {
+		entries += len(recs)
 		for _, rec := range recs {
 			for _, aff := range rec.Affected {
 				enumerated += len(aff.Versions)
 			}
+			payloads[marshalOSV(t, rec.Affected)] = true
+			records[marshalOSV(t, rec)] = true
 		}
 	}
-	t.Logf("%s (trimmed=%v): retained %d MB, %d record(s), %d package(s), %d enumerated version string(s); %s@%s matched %v, skipped %v",
-		eco, trim, retained>>20, meta.Records, len(idx.Packages), enumerated, pkg, version, vulnIDs(vulns), skipped)
+	t.Logf("%s (trimmed=%v, shared=%v): retained %d MB, %d advisory record(s), %d package(s), "+
+		"%d record entr(ies) over %d distinct payload(s) and %d distinct record(s), "+
+		"%d enumerated version string(s); %s@%s matched %v, skipped %v",
+		eco, trim, osvShareDecoded, retained>>20, meta.Records, len(idx.Packages),
+		entries, len(payloads), len(records), enumerated, pkg, version, vulnIDs(vulns), skipped)
 	runtime.KeepAlive(idx)
 }
 
@@ -441,6 +457,19 @@ func versionStrings(t *testing.T, raw []byte) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// marshalOSV renders a decoded value back to the bytes it decoded from, which
+// is the value the payload table keys on: writeIndex encodes the archive with
+// this same marshaler, so two entries collide here exactly when they collided
+// in the table.
+func marshalOSV(t *testing.T, v any) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }
 
 func countVersionStrings(t *testing.T, db *OSVDatabase, ecosystem string) int {
