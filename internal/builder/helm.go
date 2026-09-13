@@ -168,13 +168,20 @@ func PackageHelm(cfg *Config, store *manifest.Store) *Summary {
 			continue
 		}
 
+		// helm parses index.yaml as a map, so the chart key is written once with
+		// every release beneath it. A key repeated per release makes the whole
+		// repository unparsable rather than shadowing an earlier entry.
+		keyWritten := false
 		for _, ve := range pm.Versions {
 			filename := helmChartFilename(name, ve)
 			if !fileExists(helmLocalPath(d, name, ve)) {
 				continue
 			}
 
-			_, _ = fmt.Fprintf(f, "  %s:\n", name)
+			if !keyWritten {
+				_, _ = fmt.Fprintf(f, "  %s:\n", name)
+				keyWritten = true
+			}
 			_, _ = fmt.Fprintf(f, "  - name: %s\n", name)
 			_, _ = fmt.Fprintf(f, "    version: %s\n", ve.Version)
 			if ve.AppVersion != "" {
