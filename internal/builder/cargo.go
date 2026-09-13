@@ -11,7 +11,24 @@ import (
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
-const defaultCargoRegistry = "https://index.crates.io"
+// defaultCargoDownloadRoot is where crate tarballs come from when no config
+// supplies one. crates.io serves the sparse index and the tarballs from
+// separate hosts, and the index host answers a /download path with 404.
+const defaultCargoDownloadRoot = "https://static.crates.io/crates"
+
+// cargoDownloadURL composes where a crate tarball is fetched from. The entry's
+// own URL wins as the per-entry override it has always been; otherwise the
+// configured download root, never the sparse index root.
+func cargoDownloadURL(cfg *Config, name string, ve manifest.VersionEntry) string {
+	root := strings.TrimRight(ve.URL, "/")
+	if root == "" {
+		root = strings.TrimRight(cfg.CargoDLUpstream, "/")
+	}
+	if root == "" {
+		root = defaultCargoDownloadRoot
+	}
+	return root + "/" + name + "/" + ve.Version + "/download"
+}
 
 // cargoCrateFilename returns the conventional .crate tarball name.
 func cargoCrateFilename(name string, ve manifest.VersionEntry) string {
@@ -80,11 +97,6 @@ func FetchCargo(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 			start := time.Now()
 			out := cfg.entryWriter(manifest.TypeCargo, name)
 
-			registry := strings.TrimRight(ve.URL, "/")
-			if registry == "" {
-				registry = defaultCargoRegistry
-			}
-
 			if err := mkdirAll(cargoLocalDir(d, name, ve)); err != nil {
 				result.Err = err
 				result.Elapsed = time.Since(start)
@@ -94,7 +106,7 @@ func FetchCargo(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 				continue
 			}
 
-			url := registry + "/" + pm.Name + "/" + ve.Version + "/download"
+			url := cargoDownloadURL(cfg, pm.Name, ve)
 			dest := cargoCratePath(d, name, ve)
 
 			_, _ = fmt.Fprintf(out, "  [cargo] %s@%s: fetching %s\n", pm.Name, ve.Version, url)
