@@ -56,10 +56,10 @@ func (m OSVDBMeta) Age(now time.Time) time.Duration { return now.Sub(m.FetchedAt
 // OSV publishes (details, references, credits) is dropped at sync, which is
 // what keeps the npm archive from costing 222 MB on disk and in memory.
 type osvRecord struct {
-	ID       string        `json:"id"`
-	Summary  string        `json:"summary,omitempty"`
-	Severity []OSVSeverity `json:"severity,omitempty"`
-	Affected []osvAffected `json:"affected"`
+	ID       string          `json:"id"`
+	Summary  string          `json:"summary,omitempty"`
+	Severity []OSVSeverity   `json:"severity,omitempty"`
+	Affected osvAffectedList `json:"affected"`
 }
 
 func (r *osvRecord) UnmarshalJSON(b []byte) error {
@@ -73,8 +73,9 @@ func (r *osvRecord) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// The table one decode canonicalizes its strings through, and the lock that
-// scopes it to that decode.
+// The tables one decode canonicalizes through, and the lock that scopes them
+// to that decode: strings through osvCanon, `affected` payloads through
+// osvSharedAffected, whole records through osvSharedRecords.
 //
 // The archive stores a record once per package it names, so a release arrives
 // as many copies of every id, range bound and range type: measured on the
@@ -94,9 +95,20 @@ func (r *osvRecord) UnmarshalJSON(b []byte) error {
 // concurrent multi-gigabyte decodes is a way to run a host out of memory, not
 // a way to finish sooner.
 var (
-	osvDecode sync.Mutex
-	osvCanon  map[string]string
+	osvDecode         sync.Mutex
+	osvCanon          map[string]string
+	osvSharedAffected map[string]osvAffectedList
+	osvSharedRecords  map[string]*osvRecord
 )
+
+// osvShareDecoded selects whether a load shares the equal values it decodes.
+// Nothing outside a test writes it, and there is deliberately no config key,
+// environment variable or database field that reaches it: the unshared shape
+// exists so one process can decode an archive both ways and compare, and an
+// operator who could select it would be choosing the decode that comparison
+// exists to check. It is separate from interning because the two are measured
+// as a pair, and one bool covering both moves two levers at once.
+var osvShareDecoded = true
 
 // internOSV returns the canonical copy of s for the decode in progress, or s
 // unchanged outside one. Callers hold osvDecode; see osvCanon.
@@ -111,23 +123,36 @@ func internOSV(s string) string {
 	return s
 }
 
-// beginOSVDecode opens a decode and returns the function that ends it. The
-// table is dropped at that point; the canonical strings stay reachable through
-// whatever the decode produced. Every decode of these types takes the lock
-// whether it interns or not, because osvCanon is read from the Unmarshalers.
+// beginOSVDecode opens a decode and returns the function that ends it. Both
+// tables are dropped at that point; what they canonicalized stays reachable
+// through whatever the decode produced. Every decode of these types takes the
+// lock whether it canonicalizes or not, because the Unmarshalers read these
+// tables unconditionally.
 //
 // intern is off for the language ecosystems, where it is a cost and not a
 // saving: npm's export names about one package per advisory, so its records
 // arrive once each and there is nothing to canonicalize. Measured on the
 // 2026-09 export, interning npm left the retained figure where it was and
 // added 48 MB to the peak, which is the table itself.
-func beginOSVDecode(intern bool) func() {
+//
+// share is on everywhere, because duplication is not a distro shape: npm fans
+// a record out 1.001x and an `affected` payload 27x, its 228,869 entries
+// taking 8,316 distinct payloads. The table size that made interning
+// distro-only is not a concern here either way, at thousands of payloads
+// against the hundreds of thousands osvCanon holds. The record table is the
+// larger of the two (175,514 entries on Ubuntu:22.04:LTS) and still pays for
+// itself, because what it holds is one pointer against the whole record.
+func beginOSVDecode(intern, share bool) func() {
 	osvDecode.Lock()
 	if intern {
 		osvCanon = map[string]string{}
 	}
+	if share {
+		osvSharedAffected = map[string]osvAffectedList{}
+		osvSharedRecords = map[string]*osvRecord{}
+	}
 	return func() {
-		osvCanon = nil
+		osvCanon, osvSharedAffected, osvSharedRecords = nil, nil, nil
 		osvDecode.Unlock()
 	}
 }
@@ -135,9 +160,55 @@ func beginOSVDecode(intern bool) func() {
 // osvIndex is the on-disk archive: every record that names a package in this
 // ecosystem, grouped by the key a lookup builds from the package name.
 type osvIndex struct {
-	Ecosystem string                 `json:"ecosystem"`
-	FetchedAt time.Time              `json:"fetched_at"`
-	Packages  map[string][]osvRecord `json:"packages"`
+	Ecosystem string                   `json:"ecosystem"`
+	FetchedAt time.Time                `json:"fetched_at"`
+	Packages  map[string]osvRecordList `json:"packages"`
+}
+
+// osvRecordList is the records one package key carries, shared across the keys
+// that carry an equal record. It holds pointers because a value element cannot
+// be redirected from inside its own UnmarshalJSON, which is why the
+// canonicalization is here and not on osvRecord.
+//
+// A shared record reaches what sharing the payload alone leaves behind: the
+// backing array of every entry, and each record's own Severity slice.
+// Ubuntu:22.04:LTS carries 772,549 record entries over 175,514 distinct
+// records; Debian:12, which names source packages rather than binaries, has
+// 52,268 over 51,646 and barely moves.
+//
+// Marshaling is unaffected: encoding/json writes a *osvRecord as the record it
+// points at, so an index loaded here encodes to the bytes distill's value-
+// shaped one does. See TestOSVShareWritesTheSameArchive.
+type osvRecordList []*osvRecord
+
+func (l *osvRecordList) UnmarshalJSON(b []byte) error {
+	var raws []json.RawMessage
+	if err := json.Unmarshal(b, &raws); err != nil {
+		return err
+	}
+	out := make(osvRecordList, len(raws))
+	for i, raw := range raws {
+		if rec, ok := osvSharedRecords[string(raw)]; ok {
+			out[i] = rec
+			continue
+		}
+		rec := new(osvRecord)
+		if err := json.Unmarshal(raw, rec); err != nil {
+			return err
+		}
+		out[i] = rec
+		if osvSharedRecords != nil {
+			// raw is the decoder's buffer, so the key is a copy by
+			// construction. A Go map compares a key in full on every hit,
+			// which is the property this rests on: a table that compared a
+			// hash alone would hand one advisory's ranges to another package
+			// on a collision, and the gate would then answer clean for a
+			// version that is affected, with no error anywhere.
+			osvSharedRecords[string(raw)] = rec
+		}
+	}
+	*l = out
+	return nil
 }
 
 // OSVDatabase is the local mirror of OSV's per-ecosystem exports: one archive
@@ -446,8 +517,9 @@ func (d *OSVDatabase) index(ecosystem string) (*osvIndex, error) {
 	// The distro exports are where a record repeats: one advisory names every
 	// binary package its source builds, so the archive carries it once per
 	// name and the decoder allocates every id and range bound afresh each
-	// time.
-	end := beginOSVDecode(isDistroEcosystem(ecosystem))
+	// time. The payloads repeat everywhere, which is why sharing is not
+	// conditioned on the ecosystem the way interning is.
+	end := beginOSVDecode(isDistroEcosystem(ecosystem), osvShareDecoded)
 	err = json.NewDecoder(zr).Decode(&idx)
 	end()
 	if err != nil {
@@ -535,14 +607,17 @@ func distill(ecosystems []string, zipPath string, trim bool) (map[string]*osvInd
 	}
 	defer func() { _ = zr.Close() }()
 
-	// Held, not interned: distill reads each record of the export once, so
-	// there is little to canonicalize, and the Unmarshalers read osvCanon.
-	defer beginOSVDecode(false)()
+	// Held, not canonicalized: distill reads each record of the export once,
+	// so there is little to intern, and it decodes the export into the
+	// anonymous struct below rather than into osvRecord, so osvAffectedList's
+	// Unmarshaler is never reached and a payload table here would stay empty.
+	// The lock is still taken, because the Unmarshalers read both tables.
+	defer beginOSVDecode(false, false)()
 
 	indexes := make(map[string]*osvIndex, len(ecosystems))
 	records := make(map[string]int, len(ecosystems))
 	for _, eco := range ecosystems {
-		indexes[eco] = &osvIndex{Ecosystem: eco, Packages: map[string][]osvRecord{}}
+		indexes[eco] = &osvIndex{Ecosystem: eco, Packages: map[string]osvRecordList{}}
 	}
 
 	for _, entry := range zr.File {
@@ -578,7 +653,7 @@ func distill(ecosystems []string, zipPath string, trim bool) (map[string]*osvInd
 
 		// One record can name several packages and several ecosystems; each
 		// gets its own entry holding only the ranges that apply to it.
-		byEcosystem := map[string]map[string][]osvAffected{}
+		byEcosystem := map[string]map[string]osvAffectedList{}
 		for _, aff := range raw.Affected {
 			eco := distillEcosystem(ecosystems, aff.Package.Ecosystem)
 			if eco == "" {
@@ -603,7 +678,7 @@ func distill(ecosystems []string, zipPath string, trim bool) (map[string]*osvInd
 				versions = trimCovered(osvVersionOrder(eco), versions, ranges)
 			}
 			if byEcosystem[eco] == nil {
-				byEcosystem[eco] = map[string][]osvAffected{}
+				byEcosystem[eco] = map[string]osvAffectedList{}
 			}
 			key := osvPackageKey(eco, aff.Package.Name)
 			byEcosystem[eco][key] = append(byEcosystem[eco][key], osvAffected{Versions: osvVersions(versions), Ranges: ranges})
@@ -611,7 +686,7 @@ func distill(ecosystems []string, zipPath string, trim bool) (map[string]*osvInd
 		for eco, byPackage := range byEcosystem {
 			records[eco]++
 			for key, affected := range byPackage {
-				indexes[eco].Packages[key] = append(indexes[eco].Packages[key], osvRecord{
+				indexes[eco].Packages[key] = append(indexes[eco].Packages[key], &osvRecord{
 					ID: raw.ID, Summary: raw.Summary, Severity: raw.Severity, Affected: affected,
 				})
 			}
