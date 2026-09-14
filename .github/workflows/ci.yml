@@ -67,9 +67,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # shellcheck and shfmt ship on the runner image, so nothing is installed
-      # here. jq does too, and the harness self-test builds every finding
-      # record with it.
+      # shellcheck and jq ship on the runner image; shfmt does not, so it is
+      # installed here. jq matters because the harness self-test builds every
+      # finding record with it.
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      # Pinned to the version the Makefile guard expects developers to have
+      # locally. shfmt reformats between minor releases, so an unpinned install
+      # fails `shfmt -d` on a runner-image bump with no change to the shell.
+      - run: go install mvdan.cc/sh/v3/cmd/shfmt@v3.14.0
       - run: make harness
 
   test:
