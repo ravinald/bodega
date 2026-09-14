@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -111,5 +112,65 @@ func TestPinChecksumSkipsPypi(t *testing.T) {
 	}
 	if len(rows) != 0 {
 		t.Errorf("pypi recorded %d rows against no object key: %+v", len(rows), rows)
+	}
+}
+
+// TestVerifyFetchedPinsAnAlreadyFetchedArtifact covers the path every fetch
+// past the first actually takes. A build root holding the artifact answers
+// "already fetched, skipping", which downloaded nothing and so checked
+// nothing — so on a long-lived install the checksum cache stayed empty however
+// many times the pipeline ran.
+func TestVerifyFetchedPinsAnAlreadyFetchedArtifact(t *testing.T) {
+	pm := &manifest.PackageManifest{
+		Type:     manifest.TypeHelm,
+		Name:     "podinfo",
+		Versions: []manifest.VersionEntry{{Version: "6.7.0", URL: "https://example.invalid/podinfo-6.7.0.tgz"}},
+	}
+	cfg, store, db := pinEnv(t, pm)
+	ve := pm.Versions[0]
+
+	path := cfg.fetchedArtifact(manifest.TypeHelm, "podinfo", ve)
+	if path == "" {
+		t.Fatal("helm resolved no artifact path, so the skip path can check nothing")
+	}
+	body := []byte("chart bytes")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// No digest on the entry yet: the skip path records one.
+	if err := cfg.verifyFetched(t.Context(), store, manifest.TypeHelm, "podinfo", ve); err != nil {
+		t.Fatalf("verifyFetched on an unpinned entry: %v", err)
+	}
+	rows, err := db.ListChecksums(t.Context(), manifest.TypeHelm, "podinfo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Value != ComputeBytesSHA256(body) {
+		t.Fatalf("the skip path recorded %+v, want the digest of the artifact on disk", rows)
+	}
+
+	// Tamper with the artifact in the build root. The next run takes the same
+	// skip path and must refuse rather than upload it.
+	stored, err := store.GetPackage(t.Context(), manifest.TypeHelm, "podinfo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinned := stored.Versions[0]
+	if pinned.Checksum == nil {
+		t.Fatal("the manifest entry carries no checksum after a pin")
+	}
+	if err := os.WriteFile(path, []byte("tampered"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err = cfg.verifyFetched(t.Context(), store, manifest.TypeHelm, "podinfo", pinned)
+	if err == nil {
+		t.Fatal("an artifact edited in the build root passed the skip path")
+	}
+	if !strings.Contains(err.Error(), "podinfo") {
+		t.Errorf("the refusal does not name the package: %v", err)
 	}
 }

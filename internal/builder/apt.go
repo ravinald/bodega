@@ -247,6 +247,11 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 				stage := CheckAptStage(cfg, name, ve)
 				if stage.Fetched {
 					cfg.logf("  [apt] %s: already fetched, skipping", name)
+					if err := cfg.verifyFetched(ctx, store, manifest.TypeApt, name, ve); err != nil {
+						cfg.logf("  [apt] %s: %v", name, err)
+						summary.Failures++
+						summary.Results = append(summary.Results, Result{Type: manifest.TypeApt, Name: name, Err: err})
+					}
 					continue
 				}
 			}

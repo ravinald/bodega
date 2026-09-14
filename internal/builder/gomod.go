@@ -77,6 +77,11 @@ func FetchGomod(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 				stage := CheckGomodStage(cfg, name, ve)
 				if stage.Fetched {
 					cfg.logf("  [gomod] %s: already fetched, skipping", name)
+					if err := cfg.verifyFetched(ctx, store, manifest.TypeGomod, name, ve); err != nil {
+						cfg.logf("  [gomod] %s: %v", name, err)
+						summary.Failures++
+						summary.Results = append(summary.Results, Result{Type: manifest.TypeGomod, Name: name, Err: err})
+					}
 					continue
 				}
 			}

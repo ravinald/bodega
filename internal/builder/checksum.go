@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/ravinald/bodega/internal/manifest"
 )
@@ -186,4 +187,76 @@ func (c *Config) findAndUpdateBinaryChecksum(store *manifest.Store, name string,
 // findAndUpdateCargoChecksum updates Checksum and ChecksumVerified on a cargo VersionEntry and saves.
 func (c *Config) findAndUpdateCargoChecksum(store *manifest.Store, name string, ve manifest.VersionEntry, cs *manifest.Checksum, verified bool) error {
 	return c.updateVersionChecksum(context.Background(), store, manifest.TypeCargo, name, ve, cs, verified)
+}
+
+// fetchedArtifact returns the path of the artifact a completed fetch left on
+// disk for this entry, or "" when the type has no single object to digest.
+//
+// It mirrors what each Check*Stage looks at when it answers Fetched, because
+// the one caller is the skip path those checks gate.
+func (c *Config) fetchedArtifact(typ, name string, ve manifest.VersionEntry) string {
+	d := buildDirs(c.rootFor(typ))
+	switch typ {
+	case manifest.TypeBinary:
+		return binaryDestPath(d, name, ve)
+	case manifest.TypeCargo:
+		return cargoCratePath(d, name, ve)
+	case manifest.TypeHelm:
+		return helmLocalPath(d, name, ve)
+	case manifest.TypeNpm:
+		return npmTarballPath(d, name, ve)
+	case manifest.TypeGomod:
+		// The .zip is the artifact; .info and .mod travel with it.
+		return filepath.Join(gomodDir(d, name), ve.Version+".zip")
+	case manifest.TypeGit:
+		if ve.IsRelease() {
+			return gitReleaseArchive(d, name, ve)
+		}
+		// A clone-mode bundle is generated here at package time, so there are
+		// no upstream bytes for a digest to attest to.
+		return ""
+	case manifest.TypeApt:
+		rel := ve.Metadata["_pool_path"]
+		if rel == "" {
+			return ""
+		}
+		return filepath.Join(d.aptRepo, rel)
+	}
+	return ""
+}
+
+// verifyFetched re-checks an artifact a previous run already fetched, and pins
+// its digest when nothing has.
+//
+// It is the other half of "enforced on subsequent fetches". A build root that
+// already holds the artifact takes the "already fetched, skipping" path, which
+// downloaded nothing and so checked nothing: on any install past its first
+// run, that path is what every later fetch actually does. The digest is
+// recomputed off the bytes on disk, so an artifact edited in the build root
+// between runs is caught here rather than uploaded.
+func (c *Config) verifyFetched(ctx context.Context, store *manifest.Store, typ, name string, ve manifest.VersionEntry) error {
+	path := c.fetchedArtifact(typ, name, ve)
+	if path == "" {
+		return nil
+	}
+	computed, err := computeFileSHA256(path)
+	if err != nil {
+		// The stage check said this was fetched and the file is unreadable.
+		// That is a disagreement worth reporting, not a checksum failure.
+		return fmt.Errorf("%s/%s: %w", typ, name, err)
+	}
+	if ve.Checksum != nil {
+		if err := verifyChecksum(ve.Checksum, computed); err != nil {
+			return fmt.Errorf("%s/%s: the artifact on disk no longer matches the manifest: %w", typ, name, err)
+		}
+		pm, err := store.GetPackage(ctx, typ, name)
+		if err != nil || pm == nil {
+			return nil //nolint:nilerr // the fetch loop already holds the manifest; a read failure here is not its verdict
+		}
+		return c.pinChecksum(ctx, pm, ve, ve.Checksum)
+	}
+	// Fetched by a build that recorded no digest. Record one now rather than
+	// leaving the entry permanently unpinned: the skip path is the only place
+	// it will ever be reached again.
+	return c.updateVersionChecksum(ctx, store, typ, name, ve, newSHA256Checksum(computed), false)
 }

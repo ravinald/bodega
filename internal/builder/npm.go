@@ -120,6 +120,11 @@ func FetchNpm(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 				stage := CheckNpmStage(cfg, name, ve)
 				if stage.Fetched {
 					cfg.logf("  [npm] %s: already fetched, skipping", name)
+					if err := cfg.verifyFetched(ctx, store, manifest.TypeNpm, name, ve); err != nil {
+						cfg.logf("  [npm] %s: %v", name, err)
+						summary.Failures++
+						summary.Results = append(summary.Results, Result{Type: manifest.TypeNpm, Name: name, Err: err})
+					}
 					continue
 				}
 			}

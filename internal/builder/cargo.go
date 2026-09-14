@@ -89,6 +89,11 @@ func FetchCargo(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 			if !cfg.Force {
 				if CheckCargoStage(cfg, name, ve).Fetched {
 					cfg.logf("  [cargo] %s@%s: already fetched, skipping", pm.Name, ve.Version)
+					if err := cfg.verifyFetched(ctx, store, manifest.TypeCargo, name, ve); err != nil {
+						cfg.logf("  [cargo] %s@%s: %v", pm.Name, ve.Version, err)
+						summary.Failures++
+						summary.Results = append(summary.Results, Result{Type: manifest.TypeCargo, Name: name, Err: err})
+					}
 					continue
 				}
 			}
