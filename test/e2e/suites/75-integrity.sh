@@ -66,15 +66,20 @@ e2e_bodega server "pkg verify" || true
 check_eq INT-03 "a clean store verifies" 0 "$E2E_RC" \
 	"cmd/bodega/cmd_verify.go:15" "bodega pkg verify" "$E2E_RC"
 
-# A run that prints "MISSING (no manifest file)" and then "All manifests passed
-# integrity check" at exit 0 says two things that cannot both be true, and the
-# reassuring one is last and is what a reader keeps.
-if printf '%s' "$E2E_OUT" | grep -q MISSING; then
-	check_lacks INT-03a "a verify reporting MISSING does not also declare every manifest passed" \
-		"All manifests passed" "$E2E_OUT" "cmd/bodega/cmd_verify.go:15" "bodega pkg verify"
+# The summary line cannot contradict the rows above it. A run printing a row it
+# could not confirm must not close on "passed integrity check", and a run
+# printing none must say so. Both readings are the same invariant, and the check
+# asserts whichever the store produced.
+#
+# It used to guard itself behind a MISSING row and skip when there was none, so
+# once the MISSING rows went the check could only ever SKIP: the store shape it
+# was written to confirm was the one shape it stopped measuring.
+if printf '%s' "$E2E_OUT" | grep -qE 'MISSING|UNVERIFIABLE|ERROR|FAIL'; then
+	check_lacks INT-03a "the verify summary does not contradict the rows above it" \
+		"passed integrity check" "$E2E_OUT" "cmd/bodega/cmd_verify.go:15" "bodega pkg verify"
 else
-	e2e_skip INT-03a "a verify reporting MISSING does not also declare every manifest passed" \
-		"no MISSING rows in this store"
+	check_contains INT-03a "the verify summary does not contradict the rows above it" \
+		"passed integrity check" "$E2E_OUT" "cmd/bodega/cmd_verify.go:15" "bodega pkg verify"
 fi
 
 # The manifest is a directory per package holding manifest.json, not a flat
