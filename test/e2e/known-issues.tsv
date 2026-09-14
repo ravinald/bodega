@@ -1,0 +1,16 @@
+# check-id	issue	note
+#
+# A FAIL whose check id appears here is reported XFAIL, and a PASS is reported
+# XPASS. XPASS is the signal to close the issue and delete the row.
+#
+# Without this file every run re-files the same open caveats and the report
+# buries the new findings under the known ones. Add a row when an issue is
+# filed; delete it when the issue closes.
+#
+# Seeded from the open caveats on 2026-09-14.
+GAT-05	320	two tests read /etc/bodega and /var/lib/bodega instead of a temp dir
+CLI-NPM-05	319	handleNpm looks up <pkg>/<version>, so no hidden-version policy applies
+PIPE-APT-07	311	PackageApt writes pool paths under the binary name
+PROF-16	310	an apt pin cannot name a source version
+PROF-17	300	attestation serves provenance for a package the profile refuses
+PIPE-APT-08	271	_pool_path is unconditional provenance, so no SHA256 when mirroring
