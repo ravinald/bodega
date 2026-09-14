@@ -133,26 +133,6 @@ func TestNormalizeBindCIDR(t *testing.T) {
 	}
 }
 
-// CIDRBindingCount is what bodega serve asks before it binds a listener, so it
-// must count CIDR bindings and nothing else.
-func TestCIDRBindingCountIgnoresTokenBindings(t *testing.T) {
-	ctx := context.Background()
-	db := newIdentityTestDB(t)
-	if _, err := db.AddIdentityBinding(ctx, IdentityBinding{Kind: BindToken, Key: "t1", Identity: "a"}); err != nil {
-		t.Fatalf("token binding: %v", err)
-	}
-	n, err := db.CIDRBindingCount(ctx)
-	if err != nil || n != 0 {
-		t.Fatalf("count with only a token binding = %d, %v; want 0", n, err)
-	}
-	if _, err := db.AddIdentityBinding(ctx, IdentityBinding{Kind: BindCIDR, Key: "10.0.0.0/8", Identity: "a"}); err != nil {
-		t.Fatalf("cidr binding: %v", err)
-	}
-	if n, err = db.CIDRBindingCount(ctx); err != nil || n != 1 {
-		t.Fatalf("count = %d, %v; want 1", n, err)
-	}
-}
-
 // Requirement 5 at the storage layer: the identity lands beside the address,
 // and neither displaces the other.
 func TestEventAndDiscoveryRowsCarryIdentityBesideTheAddress(t *testing.T) {

@@ -224,16 +224,6 @@ func (a *DB) ListIdentityBindings(ctx context.Context) ([]IdentityBinding, error
 	return out, rows.Err()
 }
 
-// CIDRBindingCount reports how many CIDR bindings exist. `bodega serve` asks
-// this before it binds a listener: a CIDR binding on an instance that believes
-// X-Real-IP from every RFC 1918 peer is assertable by any of them.
-func (a *DB) CIDRBindingCount(ctx context.Context) (int, error) {
-	var n int
-	err := a.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM identity_bindings WHERE kind = ?`, BindCIDR).Scan(&n)
-	return n, err
-}
-
 // RemoveIdentityBinding deletes one binding, reporting whether it was there.
 func (a *DB) RemoveIdentityBinding(ctx context.Context, kind, key string) (bool, error) {
 	if !ValidBindKind(kind) {

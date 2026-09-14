@@ -34,15 +34,7 @@ type profileFixture struct {
 func bindProfile(t *testing.T, s *Server, profile, identity string, types []audit.ProfileTypeRule, entries []audit.ProfileEntry) *profileFixture {
 	t.Helper()
 	ctx := context.Background()
-	for i := range types {
-		types[i].Profile = profile
-	}
-	for i := range entries {
-		entries[i].Profile = profile
-	}
-	if err := s.auditDB.CreateProfileWith(ctx, audit.Profile{Name: profile}, types, entries); err != nil {
-		t.Fatalf("create profile %s: %v", profile, err)
-	}
+	writeProfile(t, s, profile, types, entries)
 	token := "bodega_ak_" + profile
 	tokenID := "tok-" + profile
 	if err := s.auditDB.InsertToken(ctx, tokenID, profile, audit.HashToken(token, s.pepper), "", nil); err != nil {
@@ -53,12 +45,50 @@ func bindProfile(t *testing.T, s *Server, profile, identity string, types []audi
 	}); err != nil {
 		t.Fatalf("bind identity %s: %v", identity, err)
 	}
+	bindProfileTo(t, s, profile, identity)
+	return &profileFixture{s: s, token: token}
+}
+
+// writeProfile creates the profile, its type rules and its entries. Split out
+// because the two binding kinds differ only in how a request finds the
+// identity, never in what the profile says.
+func writeProfile(t *testing.T, s *Server, profile string, types []audit.ProfileTypeRule, entries []audit.ProfileEntry) {
+	t.Helper()
+	for i := range types {
+		types[i].Profile = profile
+	}
+	for i := range entries {
+		entries[i].Profile = profile
+	}
+	if err := s.auditDB.CreateProfileWith(context.Background(), audit.Profile{Name: profile}, types, entries); err != nil {
+		t.Fatalf("create profile %s: %v", profile, err)
+	}
+}
+
+func bindProfileTo(t *testing.T, s *Server, profile, identity string) {
+	t.Helper()
+	ctx := context.Background()
 	if _, err := s.auditDB.BindProfile(ctx, audit.ProfileBinding{Identity: identity, Profile: profile}); err != nil {
 		t.Fatalf("bind profile %s to %s: %v", profile, identity, err)
 	}
 	s.refreshIdentities(ctx)
 	s.refreshProfiles(ctx)
-	return &profileFixture{s: s, token: token}
+}
+
+// bindProfileByCIDR binds through the other half of the identity table: the
+// host is named by the address it connects from and sends no credential at
+// all. The fixture's requests carry no Authorization header for that reason —
+// a CIDR-identified host is the one that has none to send.
+func bindProfileByCIDR(t *testing.T, s *Server, profile, identity, cidr string, types []audit.ProfileTypeRule, entries []audit.ProfileEntry) *profileFixture {
+	t.Helper()
+	writeProfile(t, s, profile, types, entries)
+	if _, err := s.auditDB.AddIdentityBinding(context.Background(), audit.IdentityBinding{
+		Kind: audit.BindCIDR, Key: cidr, Identity: identity,
+	}); err != nil {
+		t.Fatalf("bind %s to %s: %v", cidr, identity, err)
+	}
+	bindProfileTo(t, s, profile, identity)
+	return &profileFixture{s: s}
 }
 
 // closedRule is the marker most of these tests want: a fixed set that refuses

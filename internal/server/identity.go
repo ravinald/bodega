@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/base64"
-	"fmt"
 	"net/http"
 	"net/netip"
 	"sort"
@@ -12,7 +11,6 @@ import (
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
-	"github.com/ravinald/bodega/internal/config"
 )
 
 // Identity returns the host an identity binding resolved this request to, or
@@ -150,8 +148,10 @@ func newIdentitySet(bindings []audit.IdentityBinding, tokens []audit.TokenHash) 
 	return set
 }
 
-// resolve answers "which host is this", in the order token, longest-prefix
-// CIDR, unidentified.
+// resolve answers "which host is this" in one fixed order: the bound token,
+// then the longest-prefix bound CIDR, then unidentified. Nothing here reads a
+// map in range order, so two requests carrying the same credential from the
+// same address can never resolve differently.
 //
 // The token wins because it is the precise answer: an operator who issued a
 // credential to one host said more about that host than the subnet it happens
@@ -160,9 +160,9 @@ func newIdentitySet(bindings []audit.IdentityBinding, tokens []audit.TokenHash) 
 // attribution, never admission, and a request that would have been served
 // yesterday is served today.
 //
-// cidrTrusted is the caller's answer to "may an address name a host here",
-// which is false while trusted_proxies is still the built-in default. See
-// Server.cidrBindingsTrusted.
+// cidrTrusted is the caller's answer to "may this address name a host", which
+// is false for an address a forwarded header asserted on an instance that has
+// not said which proxies it believes. See Server.cidrAddressTrusted.
 func (s *identitySet) resolve(cred, clientIP, pepper string, now time.Time, cidrTrusted bool) string {
 	if s == nil {
 		return ""
@@ -261,28 +261,7 @@ func (s *Server) identityCached() *identitySet {
 func (s *Server) storeIdentities(set *identitySet) *identitySet {
 	s.identity.Store(set)
 	s.identityAt.Store(time.Now().UnixNano())
-	s.logInertCIDRBindings(set)
 	return set
-}
-
-// logInertCIDRBindings reports the state guardCIDRBindings refuses to start in,
-// once on entering it and once on leaving. Only a bind against a running server
-// reaches it, so the startup refusal never printed and the one stderr line
-// `identity bind` writes is all the operator got — from a command that commonly
-// runs under config management with its output discarded. Error level, because
-// log_level defaults to Error and anything quieter is written for nobody.
-func (s *Server) logInertCIDRBindings(set *identitySet) {
-	inert := len(set.cidr) > 0 && !s.aclNow().trustedSet
-	if s.cidrInert.Swap(inert) == inert {
-		return
-	}
-	if !inert {
-		s.logger.Info("trusted_proxies is answered; CIDR identity bindings resolve again")
-		return
-	}
-	s.logger.Error("CIDR identity bindings are inert while trusted_proxies is still the built-in default; requests from a bound network are recorded unidentified",
-		"bindings", len(set.cidr),
-		"remedy", "bodega acl proxies add <proxy-cidr>, or \"trusted_proxies\": [] to trust no forwarded header")
 }
 
 // refreshIdentities re-reads the binding table regardless of cache age, so
@@ -338,69 +317,34 @@ func (s *Server) identityFunc() func(*http.Request) string {
 			return ""
 		}
 		cred, _ := credentialFrom(r)
-		return set.resolve(cred, ClientIP(r), s.pepper, time.Now(), s.cidrBindingsTrusted())
+		return set.resolve(cred, ClientIP(r), s.pepper, time.Now(), cidrAddressTrusted(r))
 	}
 }
 
-// cidrBindingsTrusted reports whether an address may name a host on this
-// request. It is the same predicate guardCIDRBindings refuses to start on, read
-// where the binding is consumed rather than only where the process boots.
+// cidrAddressTrusted reports whether this request's address may name a host.
 //
-// Startup is not the only way into that state, and it is the rarer one. An
-// operator binds on a server that is already running: guardCIDRBindings ran at
-// boot with no bindings and passed, SIGHUP and the cache TTL then install the
-// new binding with nothing between them and the read path. The instance ends up
-// serving the arrangement it would have refused to start carrying.
+// The hazard a CIDR binding carries is not the address, it is the header. With
+// trusted_proxies left at the built-in default, loopback plus RFC 1918, any
+// peer in that range has its X-Real-IP believed verbatim, so it can claim an
+// address inside a bound network and collect that identity. An address read
+// off the connection carries no such claim: it is whatever completed a
+// handshake, and nothing a client writes changes it.
 //
-// So with trusted_proxies unanswered the CIDR half resolves as absent. Token
-// bindings still resolve, because a credential is a claim the caller had to
-// hold; an address is a claim any RFC 1918 peer can make with a header. The
-// request is served either way and the row simply names nobody.
-func (s *Server) cidrBindingsTrusted() bool { return s.aclNow().trustedSet }
-
-// guardCIDRBindings refuses to start an instance where a CIDR binding is
-// assertable by whoever sends a header.
+// So the gate is per request and on provenance. A forwarded address names a
+// host only once the operator has answered trusted_proxies, which is them
+// naming the peers whose headers they believe. A direct peer address always
+// names a host, because refusing it would make CIDR bindings inert on every
+// install that never put a proxy in front of bodega — the read-only hosts the
+// binding kind exists for.
 //
-// trusted_proxies defaults to loopback plus RFC 1918, and a peer inside that
-// set has its X-Real-IP believed verbatim. So on a default-configured
-// instance, any RFC 1918 peer can name itself 10.1.2.3 and collect whatever
-// identity 10.1.0.0/16 is bound to. A token binding has no such hole: the
-// credential is the claim.
-//
-// A refusal rather than a warning, on the same rule as the empty
-// admin_permit_cidr refusal: log_level defaults to Error, so a warning here
-// is written for nobody and the instance runs anyway.
-func (s *Server) guardCIDRBindings(ctx context.Context) error {
-	if s.auditDB == nil {
-		return nil
+// Both halves come from the one snapshot RealIPMiddleware took. Re-reading the
+// ACL set here instead would let a reload arriving between the two middlewares
+// answer "was the proxy named" for a header this request had already believed
+// under the old set, and an excluded peer would collect the identity with
+// nothing logged.
+func cidrAddressTrusted(r *http.Request) bool {
+	if !clientIPForwarded(r) {
+		return true
 	}
-	if s.aclNow().trustedSet {
-		return nil // the operator answered, whichever way
-	}
-	n, err := s.auditDB.CIDRBindingCount(ctx)
-	if err != nil || n == 0 {
-		return err
-	}
-	return &cidrBindingTrustError{bindings: n}
-}
-
-// cidrBindingTrustError is the startup refusal. A type rather than a string so
-// a test can assert the condition without matching prose.
-type cidrBindingTrustError struct{ bindings int }
-
-func (e *cidrBindingTrustError) Error() string {
-	noun, verb := "CIDR identity bindings", "exist"
-	if e.bindings == 1 {
-		noun, verb = "CIDR identity binding", "exists"
-	}
-	return fmt.Sprintf("refusing to serve: %d %s %s while trusted_proxies is still the built-in default (loopback + RFC 1918).\n"+
-		"  Every peer in that range has its X-Real-IP believed verbatim, so any of them can claim\n"+
-		"  an address inside a bound network and collect that identity. Answer trusted_proxies\n"+
-		"  either way:\n"+
-		"    bodega acl proxies add <proxy-cidr>     name the proxy that terminates for clients\n"+
-		"    \"trusted_proxies\": [] in %s\n"+
-		"                                            trust no forwarded header from anyone\n"+
-		"  Leaving the default is what is not accepted.\n"+
-		"  The live list:  bodega acl proxies list\n"+
-		"  The bindings:   bodega identity list", e.bindings, noun, verb, config.ConfigPath())
+	return trustedNetsConfigured(r)
 }

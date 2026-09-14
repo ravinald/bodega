@@ -110,12 +110,6 @@ type Server struct {
 	profilesAt atomic.Int64
 	profileMu  sync.Mutex
 
-	// cidrInert latches whether CIDR bindings are currently unresolvable for
-	// want of a trusted_proxies answer, so the log records each entry into
-	// that state once rather than every cache refresh. See
-	// Server.logInertCIDRBindings.
-	cidrInert atomic.Bool
-
 	// aptSign is the signing key and the two served renderings of its public
 	// half. nil when no key is installed, which is a supported configuration:
 	// signed and unsigned coexist at the same URLs, and the signature is
@@ -499,10 +493,6 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	if err := s.guardPlaintext(); err != nil {
-		return err
-	}
-
-	if err := s.guardCIDRBindings(ctx); err != nil {
 		return err
 	}
 

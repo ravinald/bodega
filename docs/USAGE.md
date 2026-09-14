@@ -668,10 +668,10 @@ Maps something the serve path can observe about a request to a host name, so the
 
 Two kinds, because they answer different questions:
 
-| Kind    | Key                   | Right for                               | Bootstrap                               |
-| ------- | --------------------- | --------------------------------------- | --------------------------------------- |
-| `token` | an `api_tokens` id    | naming one host precisely               | the host needs the credential first     |
-| `cidr`  | a CIDR, stored masked | "everything on this subnet is a devbox" | none, but `trusted_proxies` must be set |
+| Kind    | Key                   | Right for                               | Bootstrap                           |
+| ------- | --------------------- | --------------------------------------- | ----------------------------------- |
+| `token` | an `api_tokens` id    | naming one host precisely               | the host needs the credential first |
+| `cidr`  | a CIDR, stored masked | "everything on this subnet is a devbox" | none; the address is the claim      |
 
 ```bash
 bodega identity bind cidr 10.20.0.0/16 devbox
@@ -682,7 +682,7 @@ bodega identity unbind cidr 10.20.0.0/16
 
 `bind token` refuses an id no token has, because a binding to a mistyped id is inert and looks identical to one that works: every request from that host resolves through the CIDR fallback, or to nothing, and the rows read as a host that never authenticated. `bodega token list` prints the ids.
 
-**Resolution order on a request is token, then longest-prefix CIDR, then unidentified.** A token beats a CIDR that disagrees, because the credential is the more specific statement. A credential that matches no token, matches an expired one, or matches a token nothing is bound to falls through to the CIDR rather than refusing: this table decides what an audit row says, never what may be fetched. A request carrying no credential is served exactly as it was before any binding existed.
+This table decides what an audit row says, never what may be fetched: a request carrying no credential is served exactly as it was before any binding existed. **Which kinds resolve and in what order** is below.
 
 **One token or one CIDR resolves to at most one identity.** A second binding that would make the answer ambiguous is refused here, at write time, and the refusal names the binding it collided with:
 
@@ -699,40 +699,55 @@ Two prefixes of different lengths over the same addresses are fine, and are what
 
 Rebinding a key to the identity it already has is a no-op, not an error, so a config-management run can assert the binding every hour.
 
-#### A CIDR binding needs `trusted_proxies` answered
+#### Which kinds resolve, and in what order
 
-`bodega serve` **refuses to start** when a CIDR binding exists and `trusted_proxies` is still the built-in default:
+Both kinds resolve on every request, in one fixed order:
 
+| Order | Kind      | Resolves when                                                              |
+| ----- | --------- | -------------------------------------------------------------------------- |
+| 1     | `token`   | the request carries a credential matching an unexpired token that is bound |
+| 2     | `cidr`    | the request's address falls inside a bound prefix; the longest prefix wins |
+| 3     | _nothing_ | neither matched, and the row records the address alone                     |
+
+The order is fixed rather than incidental, so the same credential from the same address always resolves to the same name. A token beats a CIDR that disagrees because the credential is the more specific statement: an operator who issued one to a host said more about that host than the subnet it sits in. A credential that matches no token, matches an expired one, or matches a token nothing is bound to falls through to the CIDR rather than refusing.
+
+The address a CIDR binding matches on is the one `trusted_proxies` resolved, not the socket's peer. So a client behind a proxy resolves to the client, and two clients behind the same proxy resolve to different identities rather than both to the proxy.
+
+#### A forwarded address needs `trusted_proxies` answered
+
+Where that address came from decides whether it may name a host:
+
+| The address came from                             | Names a host                              |
+| ------------------------------------------------- | ----------------------------------------- |
+| the connection, with no forwarded header believed | always                                    |
+| `X-Real-IP` or `X-Forwarded-For`                  | only once `trusted_proxies` has an answer |
+
+An address read off the connection is whatever completed a TCP handshake, and nothing a client writes changes it. A header is whatever the peer chose to write. The built-in default trusts loopback plus RFC 1918, and bodega returns `X-Real-IP` verbatim from any peer in that set, so on a default-configured instance any RFC 1918 peer could claim an address inside a bound network and collect that identity. That forgery is what the gate refuses, and it refuses it per request rather than refusing the whole binding.
+
+A request is judged against the list in force when its header was read, not the list in force when the identity is resolved. So an `acl proxies add` or a SIGHUP landing mid-request neither grants nor retracts an identity for a request already in flight; the change applies from the next one.
+
+So a bodega that clients reach directly needs nothing configured: `bodega identity bind cidr` works the moment it returns. One behind a proxy needs `trusted_proxies` answered, either way:
+
+- `bodega acl proxies add <cidr>` names the proxy that terminates for your clients and claims the list for the database, which is what ends the built-in default. It is picked up within the cache TTL, with no restart.
+- `"trusted_proxies": []` in the config file claims it empty on the next start, so bodega answers to the peer address alone.
+
+There is no `acl proxies remove` path out of the default, on purpose: `remove` refuses a CIDR the list does not hold rather than claiming the list as a side effect, so a typo cannot silently move an instance from the default to trusting nobody.
+
+`bodega identity bind cidr` says which of the two you are in at bind time, so a proxied deployment learns it from the command that wrote the binding rather than from an audit row that names nobody:
+
+```text
+Bound cidr 10.20.0.0/16 to devbox.
+
+Note: trusted_proxies is still the built-in default (loopback + RFC 1918), so every peer
+in that range has its X-Real-IP believed verbatim and an address read out of a forwarded
+header names nobody. A client that connects to bodega directly resolves through this
+binding now; one behind a proxy needs the answer:
+  bodega acl proxies add <proxy-cidr>   name the proxy that terminates for clients
+  "trusted_proxies": [] in /etc/bodega/config.json
+                                        trust no forwarded header from anyone
 ```
-refusing to serve: 1 CIDR identity binding exists while trusted_proxies is still the
-built-in default (loopback + RFC 1918).
-  Every peer in that range has its X-Real-IP believed verbatim, so any of them can claim
-  an address inside a bound network and collect that identity. Answer trusted_proxies
-  either way:
-    bodega acl proxies add <proxy-cidr>     name the proxy that terminates for clients
-    "trusted_proxies": [] in /etc/bodega/config.json
-                                            trust no forwarded header from anyone
-  Leaving the default is what is not accepted.
-  The live list:  bodega acl proxies list
-  The bindings:   bodega identity list
-```
 
-The default trusts loopback plus RFC 1918, and bodega returns `X-Real-IP` verbatim from any peer in that set. On a default-configured instance a CIDR binding is therefore assertable by whoever sends a header, which is not a caveat to document: it is the binding meaning nothing. Both remedies are accepted. `bodega acl proxies add <cidr>` names the proxy that terminates for your clients and claims the list for the database, which is what ends the built-in default. `"trusted_proxies": []` in the config file claims it empty on the next start, so bodega answers to the peer address alone. There is no `acl proxies remove` path out of the default, on purpose: `remove` refuses a CIDR the list does not hold rather than claiming the list as a side effect, so a typo cannot silently move an instance from the default to trusting nobody.
-
-It is a refusal rather than a warning because `log_level` defaults to `Error`, so a warning here is written for nobody and the instance runs anyway. `bodega identity bind cidr` prints the same guidance at bind time, so the interlock is discovered from the command that armed it rather than from a server that will not come back up. A token binding needs no proxy answer, because the credential is the claim; an instance carrying only token bindings starts unchanged.
-
-**Binding on a running server is gated the same way, where the binding is read.** Startup is the rarer way into that state: the ordinary operator order is the reverse, because the server is already running when the bind happens. `bodega serve` came up with nothing bound and passed the check, and both paths that install a binding afterwards, `systemctl reload bodega` and the 30-second cache, land it behind that check. So resolution itself asks the same question. While `trusted_proxies` is unanswered, a CIDR binding resolves as absent: the request is served exactly as it was before, and the row names nobody rather than naming a host any RFC 1918 peer could have claimed with a header. Token bindings resolve throughout, because a credential is a claim the caller had to hold.
-
-Entering that state writes one `ERROR` line naming both remedies, and leaving it writes one `INFO`. The operator who got there by binding never saw the startup refusal, and `bodega identity bind cidr` prints its warning to stderr on a command that commonly runs under config management with its output discarded:
-
-```
-ERROR CIDR identity bindings are inert while trusted_proxies is still the built-in
-default; requests from a bound network are recorded unidentified bindings=1
-remedy="bodega acl proxies add <proxy-cidr>, or \"trusted_proxies\": [] to trust no
-forwarded header"
-```
-
-Answering `trusted_proxies` brings the bindings back with no restart: `bodega acl proxies add <cidr>` is picked up within the cache TTL, and the config-file form on the next start.
+A token binding is unaffected either way, because the credential is the claim and no header can assert it.
 
 #### Where the identity shows up
 
