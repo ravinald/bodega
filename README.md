@@ -6,16 +6,16 @@
 
 A self-hosted package repository manager backed by pluggable object storage. Fetches, builds, and serves eight package types to standard clients without leaving your network.
 
-| Type | Client | Protocol |
-|------|--------|----------|
-| apt | `apt-get` | Debian repository |
-| git | `git clone` | Git bundles |
-| pypi | `pip install` | PEP 503 simple index |
-| binary | `curl` | Direct download |
-| gomod | `go get` | GOPROXY |
-| helm | `helm install` | Chart repository |
-| npm | `npm install` | npm registry |
-| cargo | `cargo` | Sparse registry index |
+| Type   | Client         | Protocol              |
+| ------ | -------------- | --------------------- |
+| apt    | `apt-get`      | Debian repository     |
+| git    | `git clone`    | Git bundles           |
+| pypi   | `pip install`  | PEP 503 simple index  |
+| binary | `curl`         | Direct download       |
+| gomod  | `go get`       | GOPROXY               |
+| helm   | `helm install` | Chart repository      |
+| npm    | `npm install`  | npm registry          |
+| cargo  | `cargo`        | Sparse registry index |
 
 ## Features
 
@@ -58,8 +58,9 @@ For a guided walkthrough, see [docs/QUICKSTART.md](docs/QUICKSTART.md). For comp
 ## Development
 
 ```bash
-make check      # every job CI blocks on: build, test, vet, lint, fmt, tidy
+make check      # every job CI blocks on: build, test, vet, lint, fmt, tidy, harness
 make test       # run tests with race detector
+make harness    # lint the e2e suites and run their own tests (no VMs needed)
 make vet        # go vet
 make lint       # golangci-lint
 make fmt        # goimports / gofmt
@@ -73,20 +74,27 @@ make tidy-check # fail on go.mod / go.sum drift or a checksum mismatch,
 CI job, and `make ci-drift` fails if the CI job list, the leg each job maps to
 and `ci.yml` stop agreeing.
 
+Every leg above is a unit test or a linter. `test/e2e/` is the other half: it
+ships a build to two hosts and drives `apt-get`, `pip`, `helm`, `npm`, `cargo`,
+`go`, `git` and `curl` against a running server, then writes a findings file.
+It needs two machines and several minutes, so it runs by hand rather than in
+CI — `make e2e`, and [`test/e2e/README.md`](test/e2e/README.md) for what it
+measures and how to read the result.
+
 ## Configuration
 
 Resolved in priority order: CLI flags → environment variables → config file → defaults.
 
 Exactly one file is in force, and one rule answers for reading it, writing it and creating it: `$BODEGA_CONFIG_FILE` when set, otherwise the first of `/etc/bodega/config.json` and `~/.config/bodega/config.json` that exists, otherwise the system path as root and the user path as anyone else. A file bodega cannot read or parse is an error naming the path, never a quiet fall back to defaults. See [Which file is the config](docs/USAGE.md#which-file-is-the-config).
 
-| Environment variable | Purpose |
-|---------------------|---------|
-| `REPO_BUCKET` | S3 bucket name (when using S3 backend) |
-| `AWS_REGION` | AWS region (default: us-west-2) |
-| `BODEGA_MANIFEST_DIR` | Manifest directory (default: `{storage_path}/manifests`). Overridden by `--manifest-dir`. |
-| `BODEGA_LOG_LEVEL` | Logging verbosity 0-4 |
-| `BODEGA_CONFIG_FILE` | Use this exact path as the config file, whether or not it exists. A generated default is written there too, so nothing touches `/etc` or `~/.config`. |
-| `BODEGA_LISTEN_ADDR` | HTTP listen address for `bodega serve` (default `:8080`). Overridden by `--addr`. |
+| Environment variable  | Purpose                                                                                                                                               |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `REPO_BUCKET`         | S3 bucket name (when using S3 backend)                                                                                                                |
+| `AWS_REGION`          | AWS region (default: us-west-2)                                                                                                                       |
+| `BODEGA_MANIFEST_DIR` | Manifest directory (default: `{storage_path}/manifests`). Overridden by `--manifest-dir`.                                                             |
+| `BODEGA_LOG_LEVEL`    | Logging verbosity 0-4                                                                                                                                 |
+| `BODEGA_CONFIG_FILE`  | Use this exact path as the config file, whether or not it exists. A generated default is written there too, so nothing touches `/etc` or `~/.config`. |
+| `BODEGA_LISTEN_ADDR`  | HTTP listen address for `bodega serve` (default `:8080`). Overridden by `--addr`.                                                                     |
 
 ## Running under systemd
 
