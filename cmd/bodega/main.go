@@ -29,6 +29,11 @@ import (
 	"github.com/ravinald/bodega/internal/storage"
 )
 
+// breakGlassAll is the --break-glass-update-md5 argument that reaches the whole
+// store rather than one package type. index.json, graph.json and metrics.json
+// sit at the store root and belong to no type, so nothing narrower stamps them.
+const breakGlassAll = "all"
+
 // Build metadata baked in via -ldflags by both `make build` and GoReleaser.
 // Tag-driven version, full git SHA, and an RFC-3339 build timestamp.
 var (
@@ -142,7 +147,8 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 
 	// --break-glass-update-md5 is a top-level flag, not a sub-command.
 	var breakGlassType string
-	root.Flags().StringVar(&breakGlassType, "break-glass-update-md5", "", "Recompute MD5 for the named manifest type and exit")
+	root.Flags().StringVar(&breakGlassType, "break-glass-update-md5", "",
+		"Recompute MD5 sidecars for the named manifest type, or "+breakGlassAll+" for the whole store, and exit")
 	root.RunE = func(cmd *cobra.Command, args []string) error {
 		if showVersion {
 			fmt.Printf("bodega %s (commit %s, built %s)\n", version, commit, buildDate)
@@ -151,14 +157,29 @@ Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json
 		if breakGlassType == "" {
 			return cmd.Help()
 		}
-		if !isValidType(breakGlassType) {
-			return fmt.Errorf("unknown type %q — must be one of: %s", breakGlassType, strings.Join(manifest.AllTypes, ", "))
+		if breakGlassType != breakGlassAll && !isValidType(breakGlassType) {
+			return fmt.Errorf("unknown type %q — must be %s, or one of: %s", breakGlassType, breakGlassAll, strings.Join(manifest.AllTypes, ", "))
 		}
-		cfg, err := loadConfig(gf)
+		store, err := loadStore(gf)
 		if err != nil {
 			return err
 		}
-		return manifest.ForceUpdateMD5(cfg.ManifestDir, breakGlassType)
+		scope := breakGlassType
+		if scope == breakGlassAll {
+			// index.json, graph.json and metrics.json sit at the store root
+			// and belong to no type, so nothing but the whole store reaches
+			// them. An empty prefix is that.
+			scope = ""
+		}
+		stamped, err := store.RestampMD5(backgroundCtx(), scope)
+		for _, name := range stamped {
+			fmt.Printf("Updated %s.md5\n", name)
+		}
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Re-stamped %d manifest(s) in %s.\n", len(stamped), store.Label())
+		return nil
 	}
 
 	// The root runs, so it is classified like any other verb. Quiet because

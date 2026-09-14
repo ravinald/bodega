@@ -25,8 +25,8 @@ A self-hosted package repository manager backed by pluggable object storage. Fet
 - **TUI**: three-pane interactive terminal interface (sources, details, log)
 - **Web dashboard**: live metrics, status view, copy-to-clipboard utilities
 - **Audit trail**: SQLite database recording every fetch, build, and mutation
-- **Checksum verification**: computed on first fetch, enforced on subsequent fetches
-- **Manifest integrity**: MD5 verification on every read/write
+- **Checksum verification**: a SHA-256 pinned on first fetch and enforced on the next, for every type with a per-version object key. pypi and clone-mode git are the two gaps — see [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)
+- **Manifest integrity**: every manifest write emits an MD5 sidecar in the same operation; `bodega pkg verify` compares the pair and exits non-zero on a mismatch or on a manifest it cannot verify
 - **Access control**: IP-based mutation API gating with optional Bearer token auth
 - **Host import**: read a host's own installed set (`dpkg-query`, `pip`, `npm`, `go`, `cargo`, `helm`) and catalog it in one push
 - **Supply chain control**: hide bad versions, freeze known-good artifacts. See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) for what bodega protects against and the distribution formats (snap, flatpak, AppImage auto-updaters, Homebrew casks) that are intentionally out of scope.

@@ -601,6 +601,7 @@ func PackageApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 					ve.Metadata["_md5"] = md5
 					ve.Metadata["_sha1"] = sha1
 					ve.Metadata["_sha256"] = sha256
+					ve.Checksum = newSHA256Checksum(sha256)
 				}
 				ve.ArtifactSize = fi.Size()
 				// Persist the updated metadata back to the store.
@@ -613,6 +614,15 @@ func PackageApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 					}
 					if err := store.SavePackage(ctx, updated); err != nil {
 						_, _ = fmt.Fprintf(out, "    WARNING: could not save metadata: %v\n", err)
+					}
+					// apt is the one covered type that never reaches
+					// updateVersionChecksum: its digest arrives with the
+					// control data rather than from a download, so the pin is
+					// made here against the same _pool_path just recorded.
+					if err := cfg.pinChecksum(ctx, updated, ve, ve.Checksum); err != nil {
+						_, _ = fmt.Fprintf(out, "    ERROR: %v\n", err)
+						result.Err = err
+						summary.Failures++
 					}
 				}
 			}

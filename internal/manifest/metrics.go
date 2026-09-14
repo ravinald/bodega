@@ -86,7 +86,7 @@ func (s *Store) SaveMetrics(ctx context.Context) error {
 	}
 	data = append(data, '\n')
 	b := s.resolveBackend()
-	return b.Write(ctx, metricsFile, data)
+	return writeManifest(ctx, b, metricsFile, data)
 }
 
 // LoadMetrics reads cached metrics from the backend.

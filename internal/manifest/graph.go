@@ -38,7 +38,7 @@ func saveGraph(ctx context.Context, b Backend, g *DependencyGraph) error {
 		return fmt.Errorf("marshal %s: %w", graphFile, err)
 	}
 	data = append(data, '\n')
-	if err := b.Write(ctx, graphFile, data); err != nil {
+	if err := writeManifest(ctx, b, graphFile, data); err != nil {
 		return fmt.Errorf("write %s to %s: %w", graphFile, b.Label(), err)
 	}
 	return nil
