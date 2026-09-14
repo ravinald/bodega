@@ -62,6 +62,10 @@ type Config struct {
 	// Fetch* function validates candidate URLs/packages before network I/O.
 	// When nil, the allow-list is not enforced.
 	Policy *policy.Checker
+	// CargoDLUpstream is the host crate tarballs are fetched from. crates.io
+	// splits the sparse index from the download host, and the index host serves
+	// no downloads, so composing a download URL from the index root 404s.
+	CargoDLUpstream string
 }
 
 // checkPolicy runs the upstream allow-list for (regType, candidate). Returns
@@ -172,6 +176,8 @@ func NewConfig(app *config.Config) *Config {
 		CargoRoot:      app.CargoRoot,
 		AutoImportDeps: true,
 		BodegaVersion:  Version,
+
+		CargoDLUpstream: app.CargoDLUpstream,
 	}
 }
 
