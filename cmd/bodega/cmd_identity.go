@@ -29,19 +29,21 @@ Two kinds, because they answer different questions:
   cidr  <cidr> <name>  no bootstrap problem; right for "this subnet is devboxes"
 
 Resolution order on a request is token, then longest-prefix CIDR, then
-unidentified. A request carrying no credential is served exactly as it was
-before any binding existed: this table decides what the audit row says, never
-what may be fetched.
+unidentified. It is fixed, so the same credential from the same address always
+resolves to the same name. A request carrying no credential is served exactly
+as it was before any binding existed: this table decides what the audit row
+says, never what may be fetched.
 
 One token or one CIDR resolves to at most one name. A second binding that
 would make the answer ambiguous is refused here, at write time, naming the
 one already in the table.
 
-A CIDR binding needs trusted_proxies answered. On the built-in default any
-RFC 1918 peer can send X-Real-IP and be believed, which makes a CIDR binding
-assertable by whoever asks; bodega serve refuses to start in that state. Name
-the proxy with ` + "`bodega acl proxies add`" + `, or write "trusted_proxies": []
-in the config file to trust no forwarded header at all.
+A CIDR binding matches the address the request arrived on. Where a proxy
+terminates for clients, that address comes out of X-Real-IP or
+X-Forwarded-For, and a header is only as good as the peer that sent it: a
+forwarded address names a host only once trusted_proxies has an answer. Give
+it one with ` + "`bodega acl proxies add <proxy-cidr>`" + `, or write
+"trusted_proxies": [] in the config file to trust no forwarded header at all.
 
 Examples:
   bodega identity bind cidr 10.20.0.0/16 devbox
@@ -121,18 +123,19 @@ func requireToken(ctx context.Context, adb *audit.DB, id string) error {
 		"  A new one:  bodega token generate <label>", id)
 }
 
-// proxyTrustWarning repeats, at bind time, the refusal `bodega serve` will
-// produce on its next start. Discovering an interlock from a server that will
-// not come back up is worse than discovering it from the command that armed it.
+// proxyTrustWarning says, at bind time, what the binding will not cover. A
+// direct client resolves through it either way; a client behind a proxy does
+// not, and finding that out from an audit row that names nobody is worse than
+// finding it out from the command that wrote the binding.
 func proxyTrustWarning(ctx context.Context, adb *audit.DB, cfg *config.Config) string {
 	owned, err := adb.ACLSeeded(ctx, audit.ACLProxies)
 	if err != nil || owned || cfg.TrustedProxies != nil {
 		return ""
 	}
-	return "\nWarning: trusted_proxies is still the built-in default (loopback + RFC 1918), and every\n" +
-		"peer in that range has its X-Real-IP believed verbatim, so any of them can claim an\n" +
-		"address inside a bound network and collect that identity. bodega serve refuses to start\n" +
-		"in this state. Answer it either way:\n" +
+	return "\nNote: trusted_proxies is still the built-in default (loopback + RFC 1918), so every peer\n" +
+		"in that range has its X-Real-IP believed verbatim and an address read out of a forwarded\n" +
+		"header names nobody. A client that connects to bodega directly resolves through this\n" +
+		"binding now; one behind a proxy needs the answer:\n" +
 		"  bodega acl proxies add <proxy-cidr>   name the proxy that terminates for clients\n" +
 		"  \"trusted_proxies\": [] in " + config.ConfigPath() + "\n" +
 		"                                        trust no forwarded header from anyone\n"

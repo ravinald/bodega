@@ -101,18 +101,20 @@ check_eq PROF-09 "--stale exits 1 once a pin is overdue" 1 "$E2E_RC" \
 
 # ---- bind it to the client -------------------------------------------------
 
-# Bound through a token identity rather than a CIDR one, because a CIDR
-# binding does not reach the request: the audit row for a request from the
-# bound address carries an empty identity column, so profileFor finds nothing
-# and every gate below passes. PROF-ID-01 measures that separately. Binding
-# through the token is what makes the surface checks below mean something
-# rather than all reporting a control that is absent.
-e2e_bodega server "token generate e2e-profile-token expiry 1d 'e2e profile binding'" || true
-E2E_PROFILE_TOKEN="$(printf '%s' "$E2E_OUT" | awk '/^[[:space:]]*Token:/ {print $2; exit}')"
-e2e_bodega server "token list" || true
-E2E_PROFILE_TOKEN_ID="$(printf '%s' "$E2E_OUT" | awk '/e2e-profile-token/ {print $1; exit}')"
+# Bound through a CIDR identity, which is the binding an operator reaches for
+# to scope a read-only host: reads require no credential, so it is the only
+# kind such a host can carry. Every probe below therefore sends no
+# Authorization header at all, and a surface that answers 200 is one where the
+# address never reached profileFor.
+#
+# Any binding this CIDR already carries is removed first: bodega refuses to
+# rebind an address to a second identity, and the refusal would report as the
+# CIDR path being broken rather than as a leftover from an earlier run.
+e2e_bodega server "identity unbind cidr $E2E_CLIENT_CIDR" >/dev/null 2>&1 || true
+e2e_bodega server "identity bind cidr $E2E_CLIENT_CIDR e2e-host --comment 'e2e run'" || true
+check_eq PROF-ID-01 "a CIDR identity binds" 0 "$E2E_RC" \
+	"cmd/bodega/cmd_identity.go:59" "bodega identity bind cidr $E2E_CLIENT_CIDR e2e-host" "$E2E_RC"
 
-e2e_bodega server "identity bind token $E2E_PROFILE_TOKEN_ID e2e-host --comment 'e2e run'" || true
 e2e_bodega server "profile bind e2e-profile e2e-host --force" || true
 check_eq PROF-10 "the profile binds to the client's identity" 0 "$E2E_RC" \
 	"cmd/bodega/cmd_profile.go:782" "bodega profile bind e2e-profile e2e-host" "$E2E_RC"
@@ -130,14 +132,14 @@ check_contains PROF-10b "the profile reports a bound host" "e2e-host" "$E2E_OUT"
 
 E2E_HOST=client
 
-# e2e_http sends no Authorization header, and the identity is what selects the
-# profile, so every probe here carries the bearer.
+# No credential on any of these, deliberately. The client's address is what
+# selects the profile, so a probe that carried a bearer would be measuring the
+# token half of the binding table over again.
 prof_get() {
-	e2e_on client "curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
-		-H 'Authorization: Bearer $E2E_PROFILE_TOKEN' '$E2E_BASE_URL$1'"
+	e2e_on client "curl -s -o /dev/null -w '%{http_code}' --max-time 30 '$E2E_BASE_URL$1'"
 }
 prof_body() {
-	e2e_on client "curl -s --max-time 30 -H 'Authorization: Bearer $E2E_PROFILE_TOKEN' '$E2E_BASE_URL$1'"
+	e2e_on client "curl -s --max-time 30 '$E2E_BASE_URL$1'"
 }
 
 prof_get "/binaries/hello-binary/1.0.0/LICENSE" || true
@@ -198,42 +200,30 @@ check_ne PROF-17 "attestation does not answer for a package the profile refuses"
 	"200" "$E2E_OUT" "internal/server/attestation.go:27" \
 	"GET an attestation for an unentitled package"
 
-# ---- a CIDR binding never reaches the request -------------------------------
+# ---- the row the binding is confirmed from ---------------------------------
 #
-# `identity bind cidr` is the only binding available to a client that sends no
-# bearer token, and reads require none, so it is the binding an operator
-# reaches for to scope a read-only host. The row it produces carries no
-# identity, so the profile selects nothing and every entitlement control is
-# inert for that host.
-
-# Any binding this CIDR already carries is removed first: bodega refuses to
-# rebind an address to a second identity, and the refusal would report as the
-# CIDR path being broken rather than as a leftover from an earlier run.
-E2E_HOST=server
-e2e_bodega server "identity unbind cidr $E2E_CLIENT_CIDR" >/dev/null 2>&1 || true
-e2e_bodega server "identity bind cidr $E2E_CLIENT_CIDR e2e-cidr-host --comment 'e2e run'" || true
-check_eq PROF-ID-01 "a CIDR identity binds" 0 "$E2E_RC" \
-	"cmd/bodega/cmd_identity.go:59" "bodega identity bind cidr $E2E_CLIENT_CIDR e2e-cidr-host" "$E2E_RC"
-e2e_reload server || true
-sleep 3
-
-E2E_HOST=client
-e2e_http client "/binaries/hello-binary/1.0.0/LICENSE" || true
+# Every check above measures a refusal, and a server that resolved nothing
+# would refuse nothing, so the attribution itself is asserted directly. The
+# audit row is how an operator confirms a binding without re-deriving it, and
+# an empty IDENTITY column beside a listed binding is what this whole suite
+# section exists to catch.
 
 E2E_HOST=server
 e2e_bodega server "audit events --client ${E2E_CLIENT_ADDR:-127.0.0.1} --limit 3" || true
 check_contains PROF-ID-02 "a request from a CIDR-bound address is attributed to its identity" \
-	"e2e-cidr-host" "$E2E_OUT" "internal/server/identity.go:219" \
+	"e2e-host" "$E2E_OUT" "internal/server/identity.go:219" \
 	"bodega audit events --client ${E2E_CLIENT_ADDR:-127.0.0.1}"
 
-e2e_bodega server "identity unbind cidr $E2E_CLIENT_CIDR" || true
+e2e_bodega server "audit events --identity e2e-host --limit 3" || true
+check_contains PROF-ID-03 "--identity returns the requests it attributed" \
+	"${E2E_CLIENT_ADDR:-127.0.0.1}" "$E2E_OUT" "cmd/bodega/cmd_audit.go:119" \
+	"bodega audit events --identity e2e-host"
 
 # ---- restore ---------------------------------------------------------------
 
 E2E_HOST=server
 e2e_bodega server "profile unbind e2e-host" || true
-e2e_bodega server "identity unbind token $E2E_PROFILE_TOKEN_ID" || true
-e2e_bodega server "token revoke e2e-profile-token" || true
+e2e_bodega server "identity unbind cidr $E2E_CLIENT_CIDR" || true
 e2e_reload server || true
 sleep 3
 E2E_HOST=client

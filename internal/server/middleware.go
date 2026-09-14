@@ -24,6 +24,7 @@ type contextKey int
 
 const (
 	clientIPKey contextKey = iota
+	clientIPForwardedKey
 	trustedNetsKey
 	identityKey
 )
@@ -73,8 +74,12 @@ func RealIPMiddleware(trusted NetsFunc) func(http.Handler) http.Handler {
 			if trustedNets == nil {
 				trustedNets = defaultTrustedNets()
 			}
-			ip := resolveClientIP(r, trustedNets)
+			ip, forwarded := resolveClientIP(r, trustedNets)
 			ctx := context.WithValue(r.Context(), clientIPKey, ip)
+			// Carried because an identity binding may name a host by address,
+			// and an address a peer asserted in a header is a weaker claim
+			// than the one the TCP connection made. See cidrAddressTrusted.
+			ctx = context.WithValue(ctx, clientIPForwardedKey, forwarded)
 			// Carried so every later reader of a forwarded header answers to
 			// the same trusted set this middleware resolved against. Without
 			// it requestScheme falls back to the built-in default and an
@@ -96,20 +101,25 @@ func trustedNetsFor(r *http.Request) []*net.IPNet {
 	return defaultTrustedNets()
 }
 
-func resolveClientIP(r *http.Request, trusted []*net.IPNet) string {
+// resolveClientIP returns the address the request should be attributed to and
+// whether it came out of a forwarded header rather than off the connection.
+// The second return is the provenance the CIDR half of the identity table
+// gates on: the peer address is whatever completed a TCP handshake, while a
+// header is whatever the peer chose to write.
+func resolveClientIP(r *http.Request, trusted []*net.IPNet) (string, bool) {
 	peerHost, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		return r.RemoteAddr, false
 	}
 
 	peerIP := net.ParseIP(peerHost)
 	if peerIP == nil || !isTrusted(peerIP, trusted) {
-		return peerHost
+		return peerHost, false
 	}
 
 	// Trust X-Real-IP first (set by nginx).
 	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
-		return realIP
+		return realIP, true
 	}
 
 	// Fall back to X-Forwarded-For (last entry before our trusted proxy).
@@ -120,14 +130,23 @@ func resolveClientIP(r *http.Request, trusted []*net.IPNet) string {
 			ip := strings.TrimSpace(parts[i])
 			parsed := net.ParseIP(ip)
 			if parsed == nil || !isTrusted(parsed, trusted) {
-				return ip
+				return ip, true
 			}
 		}
 		// All IPs are trusted; return the leftmost.
-		return strings.TrimSpace(parts[0])
+		return strings.TrimSpace(parts[0]), true
 	}
 
-	return peerHost
+	return peerHost, false
+}
+
+// clientIPForwarded reports whether ClientIP is reading an address a header
+// asserted. False when RealIPMiddleware never ran, which is the case in tests
+// that drive a handler directly: there ClientIP falls back to RemoteAddr, and
+// the connection is exactly what that address is.
+func clientIPForwarded(r *http.Request) bool {
+	forwarded, _ := r.Context().Value(clientIPForwardedKey).(bool)
+	return forwarded
 }
 
 func isTrusted(ip net.IP, nets []*net.IPNet) bool {

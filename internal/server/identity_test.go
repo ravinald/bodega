@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"encoding/base64"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -158,8 +157,6 @@ func TestExpiredTokenFallsThroughToTheCIDR(t *testing.T) {
 // today, with an audit row that names nobody rather than no audit row.
 func TestUnidentifiedRequestIsStillServedAndStillRecorded(t *testing.T) {
 	ctx := context.Background()
-	// trusted_proxies answered, so the CIDR binding resolves at all. Unanswered
-	// is TestCIDRBindingsAreInertUntilTrustedProxiesIsAnswered.
 	s := newACLServer(t, &config.Config{TrustedProxies: []string{}})
 	s.pepper = testPepper
 	if _, err := s.auditDB.AddIdentityBinding(ctx, audit.IdentityBinding{
@@ -211,84 +208,6 @@ func TestUnidentifiedRequestIsStillServedAndStillRecorded(t *testing.T) {
 	}
 	if e := byIP["203.0.113.9"]; e.Identity != "" {
 		t.Fatalf("unidentified request recorded identity %q, want empty", e.Identity)
-	}
-}
-
-// Requirement 4. trusted_proxies defaults to loopback + RFC 1918 and bodega
-// returns X-Real-IP verbatim from any peer in that set, so a CIDR binding on a
-// default-configured instance is assertable by whoever sends a header.
-func TestStartRefusesACIDRBindingUnderDefaultTrustedProxies(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("default trusted_proxies refuses", func(t *testing.T) {
-		s := newACLServer(t, &config.Config{AllowPlaintext: true})
-		if _, err := s.auditDB.AddIdentityBinding(ctx, audit.IdentityBinding{
-			Kind: audit.BindCIDR, Key: "10.20.0.0/16", Identity: "devbox",
-		}); err != nil {
-			t.Fatalf("bind: %v", err)
-		}
-		err := s.guardCIDRBindings(ctx)
-		var want *cidrBindingTrustError
-		if !errors.As(err, &want) {
-			t.Fatalf("guard returned %v, want the startup refusal", err)
-		}
-		for _, phrase := range []string{
-			"bodega acl proxies add",  // name the proxy
-			"\"trusted_proxies\": []", // or write an empty list
-			"trusted_proxies is still the built-in default",
-			// One binding is the common first state, so the singular branch is
-			// the one most operators meet. docs/USAGE.md quotes this line.
-			"1 CIDR identity binding exists while",
-		} {
-			if !strings.Contains(err.Error(), phrase) {
-				t.Fatalf("refusal does not carry %q:\n%s", phrase, err)
-			}
-		}
-
-		if _, err := s.auditDB.AddIdentityBinding(ctx, audit.IdentityBinding{
-			Kind: audit.BindCIDR, Key: "192.168.0.0/16", Identity: "office",
-		}); err != nil {
-			t.Fatalf("second bind: %v", err)
-		}
-		if got := s.guardCIDRBindings(ctx).Error(); !strings.Contains(got, "2 CIDR identity bindings exist while") {
-			t.Fatalf("plural branch reads wrong:\n%s", got)
-		}
-	})
-
-	t.Run("a token binding alone is fine", func(t *testing.T) {
-		s := newACLServer(t, &config.Config{AllowPlaintext: true})
-		if _, err := s.auditDB.AddIdentityBinding(ctx, audit.IdentityBinding{
-			Kind: audit.BindToken, Key: "tok-1", Identity: "build-07",
-		}); err != nil {
-			t.Fatalf("bind: %v", err)
-		}
-		if err := s.guardCIDRBindings(ctx); err != nil {
-			t.Fatalf("a token binding needs no proxy answer, but startup refused: %v", err)
-		}
-	})
-
-	for _, tc := range []struct {
-		name    string
-		entries []string
-	}{
-		{"named proxy", []string{"192.0.2.7/32"}},
-		{"explicitly empty", nil},
-	} {
-		t.Run("answered: "+tc.name, func(t *testing.T) {
-			s := newACLServer(t, &config.Config{AllowPlaintext: true})
-			if _, err := s.auditDB.AddIdentityBinding(ctx, audit.IdentityBinding{
-				Kind: audit.BindCIDR, Key: "10.20.0.0/16", Identity: "devbox",
-			}); err != nil {
-				t.Fatalf("bind: %v", err)
-			}
-			if _, err := s.auditDB.SeedACL(ctx, audit.ACLProxies, tc.entries, "ravi"); err != nil {
-				t.Fatalf("seed proxies: %v", err)
-			}
-			s.refreshACLs(ctx)
-			if err := s.guardCIDRBindings(ctx); err != nil {
-				t.Fatalf("trusted_proxies answered (%s) and startup still refused: %v", tc.name, err)
-			}
-		})
 	}
 }
 
@@ -526,22 +445,22 @@ func TestRotatedCredentialIsWhatTheClientSends(t *testing.T) {
 	}
 }
 
-// The hole the startup refusal alone leaves open: an operator binds a CIDR on
-// a server that is already running. guardCIDRBindings ran at boot with nothing
-// bound and passed, and both paths that install a binding afterwards — SIGHUP
-// and the cache TTL — reach the read path with no guard between them. So the
-// instance would serve, header-assertable by any RFC 1918 peer, the exact
-// arrangement it refuses to start carrying.
+// A CIDR binding names the connection, not a header. The hazard it carries is
+// X-Real-IP: with trusted_proxies left at the built-in default, loopback plus
+// RFC 1918, bodega believes that header verbatim from any peer in that range,
+// so one of them could claim an address inside a bound network and collect the
+// identity. An address read off the connection carries no such claim.
 //
-// Every case here drives a request through and records a row, so none of them
-// can be satisfied by refusing the request. Attribution is what changes.
-func TestCIDRBindingsAreInertUntilTrustedProxiesIsAnswered(t *testing.T) {
+// So the gate is on provenance rather than on config state. Every case drives
+// the real RealIPMiddleware, because the provenance is what that middleware
+// settles and a chain without it would assert nothing.
+func TestACIDRBindingResolvesAConnectionAndNotAForgedHeader(t *testing.T) {
 	ctx := context.Background()
 	const tok = "bodega_ak_build07"
 
-	// serve builds the chain the way handler() does for these two middlewares
-	// and returns the identity the handler saw.
-	serve := func(t *testing.T, s *Server, remote, header string) (int, string) {
+	// serve builds the chain in handler()'s order for the three middlewares
+	// that matter here, and returns the identity the handler saw.
+	serve := func(t *testing.T, s *Server, remote, realIP, auth string) (int, string) {
 		t.Helper()
 		var h http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("X-Seen-Identity", Identity(r))
@@ -549,76 +468,89 @@ func TestCIDRBindingsAreInertUntilTrustedProxiesIsAnswered(t *testing.T) {
 		})
 		h = AuditMiddleware(s.auditDB)(h)
 		h = IdentityMiddleware(s.identityFunc())(h)
+		h = RealIPMiddleware(s.trustedNetsFunc())(h)
 		req := httptest.NewRequest(http.MethodGet, "/cargo/config.json", nil)
 		req.RemoteAddr = remote
-		if header != "" {
-			req.Header.Set("Authorization", header)
+		if realIP != "" {
+			req.Header.Set("X-Real-IP", realIP)
+		}
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
 		}
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		return rec.Code, rec.Header().Get("X-Seen-Identity")
 	}
 
-	// running starts from the state guardCIDRBindings passes: no bindings, and
-	// trusted_proxies left at the built-in default.
-	running := func(t *testing.T) *Server {
+	// bound is an instance with one CIDR binding and trusted_proxies still at
+	// the built-in default, which is where every install starts.
+	bound := func(t *testing.T) *Server {
 		t.Helper()
 		s := newACLServer(t, &config.Config{AllowPlaintext: true})
 		s.pepper = testPepper
-		if err := s.guardCIDRBindings(ctx); err != nil {
-			t.Fatalf("startup refused with nothing bound: %v", err)
-		}
-		return s
-	}
-
-	bindCIDR := func(t *testing.T, s *Server) {
-		t.Helper()
 		if _, err := s.auditDB.AddIdentityBinding(ctx, audit.IdentityBinding{
-			Kind: audit.BindCIDR, Key: "10.20.0.0/16", Identity: "sneaky-fleet",
+			Kind: audit.BindCIDR, Key: "10.20.0.0/16", Identity: "devbox",
 		}); err != nil {
 			t.Fatalf("bind cidr: %v", err)
 		}
+		s.refreshIdentities(ctx)
+		return s
 	}
 
-	t.Run("bound after start", func(t *testing.T) {
-		s := running(t)
-		bindCIDR(t, s)
-		s.refreshIdentities(ctx) // what the 30-second TTL does on its own
-
-		code, id := serve(t, s, "10.20.0.9:5000", "")
+	t.Run("a direct peer inside the binding resolves", func(t *testing.T) {
+		s := bound(t)
+		code, id := serve(t, s, "10.20.0.9:5000", "", "")
 		if code != http.StatusOK {
-			t.Fatalf("status %d, want 200: the guard withholds a name, never a package", code)
+			t.Fatalf("status %d, want 200: attribution never gates a fetch", code)
 		}
-		if id != "" {
-			t.Fatalf("resolved %q from an address on a default-trusted_proxies instance; "+
-				"the binding is assertable by any RFC 1918 peer and must name nobody", id)
+		if id != "devbox" {
+			t.Fatalf("resolved %q, want devbox: the address completed a handshake and nothing a client writes changes it", id)
 		}
 		events, err := s.auditDB.Query(ctx, audit.Filter{EventType: audit.EventServeFetch})
 		if err != nil {
 			t.Fatalf("query: %v", err)
 		}
-		if len(events) != 1 {
-			t.Fatalf("recorded %d serve_fetch rows, want 1", len(events))
-		}
-		if events[0].Identity != "" || events[0].ClientIP != "10.20.0.9" {
-			t.Fatalf("row = (ip %q, identity %q), want (10.20.0.9, empty)",
-				events[0].ClientIP, events[0].Identity)
+		if len(events) != 1 || events[0].Identity != "devbox" || events[0].ClientIP != "10.20.0.9" {
+			t.Fatalf("rows = %+v, want one naming devbox at 10.20.0.9", events)
 		}
 	})
 
-	t.Run("bound then SIGHUP", func(t *testing.T) {
-		s := running(t)
-		bindCIDR(t, s)
-		s.reload(ctx) // the whole reload, not refreshIdentities alone
-
-		if code, id := serve(t, s, "10.20.0.9:5000", ""); code != http.StatusOK || id != "" {
-			t.Fatalf("after reload: status %d, identity %q; want 200 and no identity", code, id)
+	t.Run("an RFC 1918 peer cannot claim the network by header", func(t *testing.T) {
+		s := bound(t)
+		// 10.99.0.1 is inside the built-in trusted set, so RealIPMiddleware
+		// believes its X-Real-IP. That is the forge the gate exists for.
+		code, id := serve(t, s, "10.99.0.1:5000", "10.20.0.9", "")
+		if code != http.StatusOK {
+			t.Fatalf("status %d, want 200", code)
+		}
+		if id != "" {
+			t.Fatalf("resolved %q from a header on a default-trusted_proxies instance; the binding must name nobody", id)
 		}
 	})
 
-	t.Run("token bindings still resolve", func(t *testing.T) {
-		s := running(t)
-		bindCIDR(t, s)
+	t.Run("a peer outside the trusted set has its header ignored", func(t *testing.T) {
+		s := bound(t)
+		if _, id := serve(t, s, "203.0.113.9:5000", "10.20.0.9", ""); id != "" {
+			t.Fatalf("resolved %q: RealIPMiddleware does not believe this peer, so the address is 203.0.113.9", id)
+		}
+	})
+
+	t.Run("answering trusted_proxies admits the proxy's header", func(t *testing.T) {
+		s := bound(t)
+		if _, err := s.auditDB.SeedACL(ctx, audit.ACLProxies, []string{"10.99.0.0/16"}, "ravi"); err != nil {
+			t.Fatalf("seed proxies: %v", err)
+		}
+		s.reload(ctx)
+		if _, id := serve(t, s, "10.99.0.1:5000", "10.20.0.9", ""); id != "devbox" {
+			t.Fatalf("resolved %q with the proxy named, want devbox", id)
+		}
+	})
+
+	// Requirement 2. A credential is the precise answer and wins over the
+	// subnet, on every request and from either address, because resolve walks
+	// the token first rather than reading a map in range order.
+	t.Run("a token beats the address it arrives from", func(t *testing.T) {
+		s := bound(t)
 		const id = "tok-1"
 		if err := s.auditDB.InsertToken(ctx, id, "build-07", audit.HashToken(tok, testPepper), "", nil); err != nil {
 			t.Fatalf("insert token: %v", err)
@@ -630,27 +562,10 @@ func TestCIDRBindingsAreInertUntilTrustedProxiesIsAnswered(t *testing.T) {
 		}
 		s.refreshIdentities(ctx)
 
-		// A credential is a claim the caller had to hold. An address is a claim
-		// anyone inside RFC 1918 can make with a header, which is the whole
-		// difference the guard turns on.
-		if _, got := serve(t, s, "10.20.0.9:5000", "Bearer "+tok); got != "build-07" {
-			t.Fatalf("token resolved to %q, want build-07: the guard is on the CIDR half alone", got)
-		}
-		if _, got := serve(t, s, "10.20.0.9:5000", ""); got != "" {
-			t.Fatalf("address alone resolved to %q, want no identity", got)
-		}
-	})
-
-	t.Run("answered proxies bring the binding back", func(t *testing.T) {
-		s := running(t)
-		bindCIDR(t, s)
-		if _, err := s.auditDB.SeedACL(ctx, audit.ACLProxies, nil, "ravi"); err != nil {
-			t.Fatalf("seed proxies: %v", err)
-		}
-		s.reload(ctx)
-
-		if _, got := serve(t, s, "10.20.0.9:5000", ""); got != "sneaky-fleet" {
-			t.Fatalf("resolved %q with trusted_proxies answered, want sneaky-fleet", got)
+		for i := range 20 {
+			if _, got := serve(t, s, "10.20.0.9:5000", "", "Bearer "+tok); got != "build-07" {
+				t.Fatalf("request %d resolved %q, want build-07 on every one of them", i, got)
+			}
 		}
 	})
 }
