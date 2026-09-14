@@ -16,6 +16,14 @@
 #   ./run.sh --suite 45-        # only suites whose name starts 45-
 #   ./run.sh --no-ship          # reuse what is installed; for iterating
 #   ./run.sh --file <run-id>    # open an issue per unmapped FAIL
+#
+# Before a long unattended run:
+#
+#   ./run.sh --validate         # every script parses; no guest touched
+#   ./run.sh --dry-run          # walk every suite, reach no guest, list every
+#                               # command it would run and every check id
+#   ./run.sh --preflight        # the foundation only, for real, in seconds
+#   ./run.sh --deadline 480     # stop after 8h with a report rather than hang
 
 set -euo pipefail
 
@@ -85,6 +93,8 @@ SUITE_FILTER=""
 SHIP=yes
 ALLOW_DIRTY=no
 FILE_RUN_ID=""
+E2E_DRY_RUN=no
+DEADLINE_MIN=0
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -109,6 +119,17 @@ while [ $# -gt 0 ]; do
 		SUITE_FILTER="${2:?--suite needs a prefix}"
 		shift
 		;;
+	--dry-run)
+		E2E_DRY_RUN=yes
+		ALLOW_DIRTY=yes
+		SHIP=no
+		;;
+	--preflight) SUITE_FILTER="00-" ;;
+	--validate) MODE=validate ;;
+	--deadline)
+		DEADLINE_MIN="${2:?--deadline needs minutes}"
+		shift
+		;;
 	--no-ship) SHIP=no ;;
 	--allow-dirty) ALLOW_DIRTY=yes ;;
 	-h | --help) usage 0 ;;
@@ -120,6 +141,27 @@ done
 assert_tooling
 
 case "$MODE" in
+validate)
+	# Static only: parse every script and confirm the suite preamble is there.
+	# It reaches no guest and takes under a second, so it is the cheapest thing
+	# to run before a long unattended pass.
+	rc=0
+	for f in "$E2E_DIR"/lib/*.sh "$E2E_DIR"/suites/*.sh "$E2E_DIR/run.sh"; do
+		if bash -n "$f"; then
+			printf 'ok     %s\n' "${f#"$E2E_DIR"/}"
+		else
+			printf 'PARSE  %s\n' "${f#"$E2E_DIR"/}"
+			rc=1
+		fi
+	done
+	for f in "$E2E_DIR"/suites/*.sh; do
+		if ! grep -q 'lib/assert.sh' "$f"; then
+			printf 'PREAMBLE %s does not source lib/assert.sh\n' "${f#"$E2E_DIR"/}"
+			rc=1
+		fi
+	done
+	exit "$rc"
+	;;
 selftest) exec "$E2E_DIR/lib/selftest.sh" ;;
 list)
 	for s in "$E2E_DIR"/suites/*.sh; do
@@ -158,8 +200,10 @@ E2E_LOG_DIR="$E2E_RUN_DIR/logs"
 E2E_FINDINGS="$E2E_RUN_DIR/findings.jsonl"
 E2E_SSH_CTL_DIR="$(mktemp -d /tmp/e2e-ssh.XXXXXX)"
 E2E_ARTIFACT_DIR="$E2E_RUN_DIR/artifacts"
+E2E_DRY_PLAN="$E2E_RUN_DIR/dry-run-plan.txt"
 
 mkdir -p "$E2E_LOG_DIR" "$E2E_ARTIFACT_DIR"
+: >"$E2E_DRY_PLAN"
 : >"$E2E_FINDINGS"
 
 cleanup() {
@@ -175,7 +219,9 @@ trap cleanup EXIT
 
 export E2E_DIR REPO_ROOT E2E_RUN_ID E2E_RUN_DIR E2E_LOG_DIR E2E_FINDINGS
 export E2E_COMMIT E2E_SSH_CTL_DIR E2E_KNOWN_FILE E2E_ARTIFACT_DIR
+export E2E_DRY_RUN E2E_DRY_PLAN
 
+[ "$E2E_DRY_RUN" = yes ] && printf 'DRY RUN — no guest is contacted and nothing is measured\n'
 printf 'bodega e2e  run=%s  commit=%s\n' "$E2E_RUN_ID" "$E2E_COMMIT"
 printf 'server=%s  client=%s\n\n' "$E2E_SERVER_HOST" "$E2E_CLIENT_HOST"
 
@@ -187,8 +233,29 @@ printf 'server=%s  client=%s\n\n' "$E2E_SERVER_HOST" "$E2E_CLIENT_HOST"
 E2E_SHIP="$SHIP"
 export E2E_SHIP
 
+RUN_STARTED="$(date -u +%s)"
+DEADLINE_HIT=no
+
 for suite_file in "$E2E_DIR"/suites/*.sh; do
 	suite="$(basename "$suite_file" .sh)"
+
+	# A deadline turns an overnight hang into a report. Every ssh call already
+	# carries its own timeout, so this is the outer belt: it catches a suite
+	# that is slow rather than stuck, which no per-command timeout can see.
+	if [ "$DEADLINE_MIN" -gt 0 ] && [ "$DEADLINE_HIT" = no ]; then
+		elapsed=$((($(date -u +%s) - RUN_STARTED) / 60))
+		if [ "$elapsed" -ge "$DEADLINE_MIN" ]; then
+			DEADLINE_HIT=yes
+			printf '\ndeadline of %s minutes reached; remaining suites are blocked\n' "$DEADLINE_MIN"
+		fi
+	fi
+	if [ "$DEADLINE_HIT" = yes ]; then
+		E2E_SUITE="$suite"
+		E2E_HOST=local
+		e2e_block "${suite%%-*}-DEADLINE" "$suite" "run deadline of ${DEADLINE_MIN}m reached before this suite started"
+		continue
+	fi
+
 	if [ -n "$SUITE_FILTER" ]; then
 		case "$suite" in
 		"$SUITE_FILTER"*) ;;
@@ -213,14 +280,25 @@ done
 
 # ---- report ----------------------------------------------------------------
 
+# Two suites sharing a check id make the known-issue map ambiguous and the
+# report wrong, and nothing else in the harness would notice.
 E2E_SUITE="report"
+dupes="$(jq -r .id "$E2E_FINDINGS" | sort | uniq -d | tr '\n' ' ')"
+if [ -n "$dupes" ]; then
+	printf '\nduplicate check ids: %s\n' "$dupes" >&2
+	e2e_record IDS-01 FAIL "check ids are unique across suites" "no duplicates" "$dupes" "jq -r .id findings.jsonl | uniq -d" 1 ""
+fi
+
 e2e_report "$E2E_FINDINGS" "$E2E_RUN_DIR/report.md" "$E2E_RUN_ID"
 
 printf '\n%s\n' "─────────────────────────────────────────"
-printf 'PASS %d   FAIL %d   XFAIL %d   XPASS %d   SKIP %d   BLOCKED %d\n' \
-	"$E2E_N_PASS" "$E2E_N_FAIL" "$E2E_N_XFAIL" "$E2E_N_XPASS" "$E2E_N_SKIP" "$E2E_N_BLOCKED"
+printf 'PASS %d   FAIL %d   XFAIL %d   XPASS %d   SKIP %d   BLOCKED %d   DRY %d\n' \
+	"$E2E_N_PASS" "$E2E_N_FAIL" "$E2E_N_XFAIL" "$E2E_N_XPASS" "$E2E_N_SKIP" "$E2E_N_BLOCKED" "$E2E_N_DRY"
 printf 'report:   %s\n' "$E2E_RUN_DIR/report.md"
 printf 'findings: %s\n' "$E2E_FINDINGS"
+if [ "$E2E_DRY_RUN" = yes ]; then
+	printf 'commands it would run: %s (%d)\n' "$E2E_DRY_PLAN" "$(wc -l <"$E2E_DRY_PLAN" | tr -d ' ')"
+fi
 if [ "$E2E_N_FAIL" -gt 0 ]; then
 	printf 'file them: %s --file %s\n' "$0" "$E2E_RUN_ID"
 fi

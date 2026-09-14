@@ -14,7 +14,7 @@
 [ -n "${E2E_LIB_ASSERT:-}" ] && return 0
 E2E_LIB_ASSERT=1
 
-E2E_VERDICTS="PASS FAIL SKIP BLOCKED XFAIL XPASS"
+E2E_VERDICTS="PASS FAIL SKIP BLOCKED XFAIL XPASS DRY"
 
 # Counters, read by the runner's summary line.
 E2E_N_PASS=0
@@ -23,6 +23,7 @@ E2E_N_SKIP=0
 E2E_N_BLOCKED=0
 E2E_N_XFAIL=0
 E2E_N_XPASS=0
+E2E_N_DRY=0
 
 # e2e_known <check-id> -> prints the issue number, or nothing.
 e2e_known() {
@@ -48,6 +49,14 @@ e2e_record() {
 		;;
 	esac
 
+	# In a dry run nothing was measured, so nothing may be reported as measured.
+	# Coercing here rather than at each call site means a suite cannot report a
+	# pass it did not earn, however it is written.
+	if [ "${E2E_DRY_RUN:-no}" = yes ]; then
+		actual="would have run"
+		verdict=DRY
+	fi
+
 	issue="$(e2e_known "$id")"
 	if [ -n "$issue" ]; then
 		case "$verdict" in
@@ -63,6 +72,7 @@ e2e_record() {
 	BLOCKED) E2E_N_BLOCKED=$((E2E_N_BLOCKED + 1)) ;;
 	XFAIL) E2E_N_XFAIL=$((E2E_N_XFAIL + 1)) ;;
 	XPASS) E2E_N_XPASS=$((E2E_N_XPASS + 1)) ;;
+	DRY) E2E_N_DRY=$((E2E_N_DRY + 1)) ;;
 	esac
 
 	jq -cn \
@@ -95,6 +105,7 @@ e2e_progress() {
 		PASS | XFAIL) color=$'\033[32m' ;;
 		FAIL | XPASS) color=$'\033[31m' ;;
 		SKIP | BLOCKED) color=$'\033[33m' ;;
+		DRY) color=$'\033[36m' ;;
 		esac
 		printf '%s%-8s\033[0m %-14s %s\n' "$color" "$verdict" "$id" "$title"
 	else

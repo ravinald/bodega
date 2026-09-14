@@ -67,6 +67,19 @@ e2e_on() {
 	local host outf errf
 	host="$(e2e_host_for "$alias")" || return 2
 
+	# A dry run reaches no guest. Every command is logged and reported as if it
+	# had succeeded with empty output, which walks each suite to its end and
+	# proves the scripts parse and reach every check. It does not prove the
+	# assertions: a suite branching on output takes the happy path here.
+	if [ "${E2E_DRY_RUN:-no}" = yes ]; then
+		E2E_OUT=""
+		E2E_ERR=""
+		E2E_RC=0
+		e2e_log_transcript "$alias" 0 "[dry-run] $*"
+		printf '%s\n' "[dry-run] $alias: $*" >>"${E2E_DRY_PLAN:-/dev/null}"
+		return 0
+	fi
+
 	outf="$(mktemp "${TMPDIR:-/tmp}/e2e-out.XXXXXX")"
 	errf="$(mktemp "${TMPDIR:-/tmp}/e2e-err.XXXXXX")"
 
@@ -103,6 +116,13 @@ e2e_onq() {
 # e2e_local <command...> — same contract, on this workstation.
 e2e_local() {
 	local outf errf
+	if [ "${E2E_DRY_RUN:-no}" = yes ]; then
+		E2E_OUT=""
+		E2E_ERR=""
+		E2E_RC=0
+		printf '%s\n' "[dry-run] local: $*" >>"${E2E_DRY_PLAN:-/dev/null}"
+		return 0
+	fi
 	outf="$(mktemp "${TMPDIR:-/tmp}/e2e-out.XXXXXX")"
 	errf="$(mktemp "${TMPDIR:-/tmp}/e2e-err.XXXXXX")"
 
@@ -136,6 +156,10 @@ e2e_log_transcript() {
 e2e_put() {
 	local alias="$1" src="$2" dst="$3" host
 	host="$(e2e_host_for "$alias")" || return 2
+	if [ "${E2E_DRY_RUN:-no}" = yes ]; then
+		printf '%s\n' "[dry-run] $alias: scp $src -> $dst" >>"${E2E_DRY_PLAN:-/dev/null}"
+		return 0
+	fi
 	local opts=()
 	while IFS= read -r o; do opts+=("$o"); done < <(e2e_ssh_opts "$host")
 	# e2e_ssh_opts ends with the host; scp wants it in the destination instead.
