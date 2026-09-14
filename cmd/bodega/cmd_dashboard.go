@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 
@@ -214,24 +215,28 @@ func printGlobalDashboard(m globalMetrics) {
 	fmt.Println(boxEmpty(w))
 
 	// Per-type table.
-	fmt.Println(boxRow(w, "  "+innerTop("By Type", 46)))
-	fmt.Println(boxRow(w, fmt.Sprintf("  │ %-9s %4s %4s %4s %-14s │", "TYPE", "PKG", "VER", "UP", "STORAGE")))
+	typeHead := fmt.Sprintf("│ %-9s %4s %4s %4s %-14s │", "TYPE", "PKG", "VER", "UP", "STORAGE")
+	typeInner := cols(typeHead) - 2
+	fmt.Println(boxRow(w, "  "+innerTop("By Type", typeInner)))
+	fmt.Println(boxRow(w, "  "+typeHead))
 	for _, t := range m.Types {
 		fmt.Println(boxRow(w, fmt.Sprintf("  │ %-9s %4d %4d %4d %-14s │", t.Type, t.Packages, t.Versions, t.Present, humanSize(t.StorageB))))
 	}
-	fmt.Println(boxRow(w, "  "+innerBottom(46)))
+	fmt.Println(boxRow(w, "  "+innerBottom(typeInner)))
 	fmt.Println(boxEmpty(w))
 
 	// Per-backend table. One volume filling up is the failure a combined
 	// storage number cannot show.
 	if len(m.Backends) > 0 {
-		fmt.Println(boxRow(w, "  "+innerTop("By Backend", 46)))
-		fmt.Println(boxRow(w, fmt.Sprintf("  │ %-11s %4s %4s %4s %-13s │", "BACKEND", "UP", "MISS", "ERR", "STORAGE")))
+		beHead := fmt.Sprintf("│ %-11s %4s %4s %4s %-13s │", "BACKEND", "UP", "MISS", "ERR", "STORAGE")
+		beInner := cols(beHead) - 2
+		fmt.Println(boxRow(w, "  "+innerTop("By Backend", beInner)))
+		fmt.Println(boxRow(w, "  "+beHead))
 		for _, b := range m.Backends {
 			fmt.Println(boxRow(w, fmt.Sprintf("  │ %-11s %4d %4d %4d %-13s │",
 				b.Name, b.Present, b.Missing, b.Errors, humanSize(b.StorageB))))
 		}
-		fmt.Println(boxRow(w, "  "+innerBottom(46)))
+		fmt.Println(boxRow(w, "  "+innerBottom(beInner)))
 		fmt.Println(boxEmpty(w))
 	}
 
@@ -262,23 +267,28 @@ func printTypeMetrics(m globalMetrics) {
 }
 
 // Box drawing helpers.
+//
+// Every border is measured in columns, never in bytes. len() on a string
+// holding box-drawing runes over-counts by two per rune, since each is three
+// bytes of UTF-8 and one column wide, so a border sized with len() comes out
+// short and the inner boxes overrun the outer one. Rune count is exact for the
+// content here: box-drawing characters and ASCII are one column each.
+func cols(s string) int { return utf8.RuneCountInString(s) }
+
+// Every helper below renders w+2 columns: the two corners plus w of interior.
 func boxTop(title string, w int) string {
 	t := "─ " + title + " "
-	return "╭" + t + strings.Repeat("─", w-len(t)-1) + "╮"
+	return "╭" + t + strings.Repeat("─", max(0, w-cols(t))) + "╮"
 }
 func boxBottom(w int) string { return "╰" + strings.Repeat("─", w) + "╯" }
 func boxEmpty(w int) string  { return "│" + strings.Repeat(" ", w) + "│" }
 func boxRow(w int, content string) string {
-	pad := w - len(content)
-	if pad < 0 {
-		pad = 0
-	}
-	return "│" + content + strings.Repeat(" ", pad) + "│"
+	return "│" + content + strings.Repeat(" ", max(0, w-cols(content))) + "│"
 }
 
 func innerTop(title string, w int) string {
 	t := "─ " + title + " "
-	return "┌" + t + strings.Repeat("─", w-len(t)-1) + "┐"
+	return "┌" + t + strings.Repeat("─", max(0, w-cols(t))) + "┐"
 }
 func innerBottom(w int) string { return "└" + strings.Repeat("─", w) + "┘" }
 
