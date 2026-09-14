@@ -1,12 +1,18 @@
 package server
 
 import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 
+	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
@@ -101,11 +107,24 @@ func (s *Server) handleCargoIndex(w http.ResponseWriter, r *http.Request, p stri
 	}
 	permit := profileVersionFilter(s.profileFor(r), manifest.TypeCargo, crate)
 
+	// An entry is bodega's own claim about the crate, so the index line is
+	// generated from it rather than fetched. Proxied instead, every hosted
+	// crate 404s on the route cargo resolves through while its /download route
+	// serves the bytes to nobody who can find them.
+	//
+	// The entry decides, not its mode: mode records where a version's bytes
+	// come from and the download route reads it on its own, so excluding
+	// proxy-mode entries here left a pinned crate answering the upstream's
+	// failure on the route cargo resolves through.
+	if pm != nil {
+		s.serveManifestCargoIndex(w, r, crate, pm, permit)
+		return
+	}
+
 	upstream := strings.TrimRight(s.cfg.CargoUpstream, "/") + "/" + p
 	s3Key := manifest.CargoIndexKey(p)
-	forceProxy := pm != nil && packageMode(pm) == manifest.ModeProxy
 	if permit == nil {
-		s.proxyOrCache(w, r, s.typeStore(manifest.TypeCargo), s3Key, upstream, manifest.TypeCargo, crate, crate, false, forceProxy)
+		s.proxyOrCache(w, r, s.typeStore(manifest.TypeCargo), s3Key, upstream, manifest.TypeCargo, crate, crate, false, false)
 		return
 	}
 	rw := &indexFilterWriter{
@@ -113,10 +132,123 @@ func (s *Server) handleCargoIndex(w http.ResponseWriter, r *http.Request, p stri
 		subject:        "the cargo index for " + crate,
 		filter:         func(b []byte) []byte { return filterCargoIndex(b, permit) },
 	}
-	s.proxyOrCache(rw, r, s.typeStore(manifest.TypeCargo), s3Key, upstream, manifest.TypeCargo, crate, crate, false, forceProxy)
+	s.proxyOrCache(rw, r, s.typeStore(manifest.TypeCargo), s3Key, upstream, manifest.TypeCargo, crate, crate, false, false)
 	if err := rw.flush(); err != nil {
 		s.logger.Error("cargo index response failed", "crate", crate, "error", err)
 	}
+}
+
+// cargoIndexLine is one line of cargo's sparse-index document. The field
+// order is the one crates.io publishes: cargo reads by name, a person reading
+// a line does not.
+type cargoIndexLine struct {
+	Name string `json:"name"`
+	Vers string `json:"vers"`
+	// Always empty: bodega records no cargo dependency metadata, and a
+	// resolver fed a dependency list nobody uploaded resolves against a claim
+	// this server cannot support. The cost is that a hosted crate needing a
+	// dependency fails to compile, since cargo fetches what this line names
+	// and nothing else. Stated as a gap in docs/USAGE.md, tracked in #356.
+	Deps     []cargoIndexDep     `json:"deps"`
+	Cksum    string              `json:"cksum"`
+	Features map[string][]string `json:"features"`
+	Yanked   bool                `json:"yanked"`
+}
+
+// cargoIndexDep is the dependency record cargo's sparse protocol defines.
+// Declared so deps serializes as a typed empty list rather than as null, which
+// cargo refuses to deserialize.
+type cargoIndexDep struct {
+	Name            string   `json:"name"`
+	Req             string   `json:"req"`
+	Features        []string `json:"features"`
+	Optional        bool     `json:"optional"`
+	DefaultFeatures bool     `json:"default_features"`
+	Target          *string  `json:"target"`
+	Kind            string   `json:"kind"`
+}
+
+// serveManifestCargoIndex answers a sparse-index document out of the manifest
+// store, with no upstream in the path at all.
+//
+// A version is dropped when it is hidden, when the entry's constraint excludes
+// it, or when no sha256 can be established for its crate. The last is not
+// caution: cargo verifies every download against cksum and reports a mismatch
+// as a corrupt crate, which sends whoever hits it looking at their disk rather
+// than at this registry.
+func (s *Server) serveManifestCargoIndex(w http.ResponseWriter, r *http.Request, crate string, pm *manifest.PackageManifest, permit func(string) bool) {
+	ctx := r.Context()
+	vc, baseVer := packageVersionConstraint(pm)
+	hasConstraint := vc != "" && vc != manifest.ConstraintAny && baseVer != ""
+
+	var out bytes.Buffer
+	for _, ve := range pm.Versions {
+		if ve.Version == "" || ve.Hidden {
+			continue
+		}
+		if hasConstraint && !versionAllowed(baseVer, ve.Version, vc) {
+			continue
+		}
+		cksum := s.cargoCksum(ctx, crate, ve)
+		if cksum == "" {
+			s.logger.Warn("cargo index line dropped: no sha256 for the crate",
+				"crate", crate, "version", ve.Version)
+			continue
+		}
+		line, err := json.Marshal(cargoIndexLine{
+			Name:     crate,
+			Vers:     ve.Version,
+			Deps:     []cargoIndexDep{},
+			Cksum:    cksum,
+			Features: map[string][]string{},
+		})
+		if err != nil {
+			s.logger.Error("cargo index line failed to marshal", "crate", crate, "version", ve.Version, "error", err)
+			continue
+		}
+		out.Write(line)
+		out.WriteByte('\n')
+	}
+
+	// The same profile filter that runs over a proxied index, through the same
+	// function. A generated document that skipped it would hand a scoped host
+	// the versions its profile excludes.
+	body := filterCargoIndex(out.Bytes(), permit)
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	//nolint:gosec // G705: body is the generated NDJSON index; Content-Type is set above.
+	_, _ = w.Write(body)
+}
+
+// cargoCksum is the sha256 cargo verifies a download against.
+//
+// The recorded checksum first: `bodega build fetch` writes one for every crate
+// it pulls, so the stored bytes are read only for an entry that arrived some
+// other way. That read is the whole crate on a metadata request, which is why
+// it is the fallback and not the source — and why a missing checksum is not
+// made up from nothing.
+func (s *Server) cargoCksum(ctx context.Context, crate string, ve manifest.VersionEntry) string {
+	if cs := ve.Checksum; cs != nil && cs.Algorithm == "sha256" && isSHA256Hex(cs.Value) {
+		return strings.ToLower(cs.Value)
+	}
+	store, err := s.versionStore(ctx, manifest.TypeCargo, crate, ve.Version)
+	if err != nil || store == nil {
+		return ""
+	}
+	data, err := store.Get(ctx, manifest.CargoCrateKey(crate, ve.Version))
+	if err != nil || data == nil {
+		return ""
+	}
+	return builder.ComputeBytesSHA256(data)
+}
+
+// isSHA256Hex reports whether v is a full hex sha256 digest. A truncated or
+// otherwise malformed value is not a checksum cargo can use.
+func isSHA256Hex(v string) bool {
+	raw, err := hex.DecodeString(v)
+	return err == nil && len(raw) == sha256.Size
 }
 
 func (s *Server) handleCargoDownload(w http.ResponseWriter, r *http.Request, p string) {

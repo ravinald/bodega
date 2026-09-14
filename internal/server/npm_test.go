@@ -51,27 +51,6 @@ func TestIsVersionHidden(t *testing.T) {
 	}
 }
 
-func TestHasHiddenVersion(t *testing.T) {
-	cases := []struct {
-		name string
-		pm   *manifest.PackageManifest
-		want bool
-	}{
-		{"none hidden", &manifest.PackageManifest{Versions: []manifest.VersionEntry{
-			{Version: "1.0.0"}, {Version: "2.0.0"},
-		}}, false},
-		{"one hidden", &manifest.PackageManifest{Versions: []manifest.VersionEntry{
-			{Version: "1.0.0"}, {Version: "2.0.0", Hidden: true},
-		}}, true},
-		{"empty", &manifest.PackageManifest{}, false},
-	}
-	for _, c := range cases {
-		if got := hasHiddenVersion(c.pm); got != c.want {
-			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
-		}
-	}
-}
-
 func TestFilterPackumentByManifest_Hidden(t *testing.T) {
 	raw := []byte(`{
 		"name": "@bitwarden/cli",
@@ -156,33 +135,6 @@ func TestFilterPackumentByManifest_NoOp(t *testing.T) {
 	}
 	if string(out) != string(raw) {
 		t.Errorf("expected passthrough; got rewritten bytes")
-	}
-}
-
-// TestHasVersionConstraint exercises the detection helper used to decide
-// whether the handler needs to run the packument through the filter.
-func TestHasVersionConstraint(t *testing.T) {
-	cases := []struct {
-		name string
-		pm   *manifest.PackageManifest
-		want bool
-	}{
-		{"no versions", &manifest.PackageManifest{}, false},
-		{"no constraint", &manifest.PackageManifest{Versions: []manifest.VersionEntry{{Version: "1.0.0"}}}, false},
-		{"any constraint is trivial",
-			&manifest.PackageManifest{Versions: []manifest.VersionEntry{{Version: "1.0.0", VersionConstraint: manifest.ConstraintAny}}},
-			false},
-		{"compatible is non-trivial",
-			&manifest.PackageManifest{Versions: []manifest.VersionEntry{{Version: "2026.4.1", VersionConstraint: manifest.ConstraintCompatible}}},
-			true},
-		{"exact is non-trivial",
-			&manifest.PackageManifest{Versions: []manifest.VersionEntry{{Version: "2026.4.1", VersionConstraint: manifest.ConstraintExact}}},
-			true},
-	}
-	for _, c := range cases {
-		if got := hasVersionConstraint(c.pm); got != c.want {
-			t.Errorf("%s: hasVersionConstraint = %v, want %v", c.name, got, c.want)
-		}
 	}
 }
 
@@ -392,11 +344,11 @@ const npmFixturePackument = `{
 	"time": {"created":"2026-01-01T00:00:00Z","1.0.0":"2026-01-01T00:00:00Z","1.1.0":"2026-02-01T00:00:00Z"}
 }`
 
-// The filtered and unfiltered packument paths are two functions serving one
-// document, and a client that trips the filter must not be told a different
-// URL from one that does not. The cache hit is the third answer to the same
-// question: the rewrite runs on the way out, so it applies to a stored copy
-// that still carries the upstream URL.
+// The generated and proxied packument paths are two functions serving one
+// document, and a client whose package has an entry must not be told a
+// different URL from one whose package has none. The cache hit is the third
+// answer to the same question: the rewrite runs on the way out, so it applies
+// to a stored copy that still carries the upstream URL.
 func TestNpmPackumentRewriteIsTheSameOnEveryPath(t *testing.T) {
 	s := proxyingServer(t)
 	up := newRecordingUpstream(t)
@@ -465,7 +417,8 @@ func TestNpmPackumentRewriteIsTheSameOnEveryPath(t *testing.T) {
 		t.Errorf("cached dist.tarball = %q, want the upstream URL untouched", got)
 	}
 
-	// Hiding 1.0.0 sends the same package down serveFilteredPackument.
+	// An entry for the same package moves it onto the generated path, which
+	// composes dist.tarball through the same function as the rewrite above.
 	pm := &manifest.PackageManifest{
 		ConfigVersion: manifest.CurrentConfigVersion,
 		Name:          "@scope/pkg",
@@ -478,12 +431,12 @@ func TestNpmPackumentRewriteIsTheSameOnEveryPath(t *testing.T) {
 	if err := s.store.SavePackage(t.Context(), pm); err != nil {
 		t.Fatalf("seed npm/@scope/pkg: %v", err)
 	}
-	filtered := get()
-	if got := tarballOf(t, filtered, "1.1.0"); got != want {
-		t.Errorf("filtered path: dist.tarball = %q, want %q", got, want)
+	generated := get()
+	if got := tarballOf(t, generated, "1.1.0"); got != want {
+		t.Errorf("generated path: dist.tarball = %q, want %q", got, want)
 	}
-	if strings.Contains(string(filtered), `"1.0.0"`) {
-		t.Errorf("filtered packument still lists the hidden 1.0.0: %s", truncateForTest(filtered))
+	if strings.Contains(string(generated), `"1.0.0"`) {
+		t.Errorf("generated packument still lists the hidden 1.0.0: %s", truncateForTest(generated))
 	}
 }
 

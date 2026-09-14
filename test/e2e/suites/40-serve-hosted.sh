@@ -55,9 +55,9 @@ e2e_index_check SRV-IDX-gomod "gomod serves @v/list for a hosted module" \
 e2e_index_check SRV-IDX-helm "helm serves index.yaml for a hosted chart" \
 	"/helm/index.yaml" "internal/server/helm.go:28"
 e2e_index_check SRV-IDX-npm "npm serves a packument for a hosted package" \
-	"/npm/left-pad" "internal/server/npm.go:72"
+	"/npm/left-pad" "internal/server/npm.go:264"
 e2e_index_check SRV-IDX-cargo "cargo serves a sparse index entry for a hosted crate" \
-	"/cargo/it/oa/itoa" "internal/server/cargo.go:82"
+	"/cargo/it/oa/itoa" "internal/server/cargo.go:179"
 e2e_index_check SRV-IDX-cargo-config "cargo serves config.json" \
 	"/cargo/config.json" "internal/server/cargo.go:44"
 

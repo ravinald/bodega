@@ -2,6 +2,9 @@ package server
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
@@ -70,37 +74,67 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Packument request: path is just the package name (possibly scoped).
+	// Packument request: the path is the package name, followed on the
+	// version-manifest route by the version segment.
+	//
+	// The manifest is looked up under the package rather than under the whole
+	// path. Under the path, /npm/left-pad/1.3.0 finds no entry and every
+	// policy below it — the hidden package, the hidden version, the
+	// constraint — is decided by a lookup that was never going to hit (#319).
 	noSharedCache(w)
-	pkgName := fullPath
+	pkgName := npmPackageFromPath(fullPath)
+	reqVersion := strings.TrimPrefix(strings.TrimPrefix(fullPath, pkgName), "/")
 	pm, _ := s.store.GetPackage(ctx, manifest.TypeNpm, pkgName)
 
-	if pm != nil && isPackageHidden(pm) {
-		http.NotFound(w, r)
-		return
+	if pm != nil {
+		if isPackageHidden(pm) {
+			http.NotFound(w, r)
+			return
+		}
+		// The same two refusals the tarball branch makes, in the same shape:
+		// 404 for a hidden version, 403 for one the constraint excludes.
+		if reqVersion != "" {
+			if isVersionHidden(pm, reqVersion) {
+				http.NotFound(w, r)
+				return
+			}
+			vc, baseVer := packageVersionConstraint(pm)
+			if vc != "" && vc != manifest.ConstraintAny && baseVer != "" && !versionAllowed(baseVer, reqVersion, vc) {
+				s.recordVersionRefusal(r, manifest.TypeNpm, pkgName, baseVer, reqVersion, vc)
+				http.Error(w, "version not allowed by constraint", http.StatusForbidden)
+				return
+			}
+		}
 	}
-	if !s.entitleGate(w, r, manifest.TypeNpm, pkgName, "") {
+	if !s.entitleGate(w, r, manifest.TypeNpm, pkgName, reqVersion) {
 		return
 	}
 	permit := profileVersionFilter(s.profileFor(r), manifest.TypeNpm, pkgName)
 
 	w.Header().Set("Content-Type", "application/json")
 
-	// The manifest-filtered packument is still not cached: that path builds its
-	// document from the manifest rather than from the upstream's, so what it
-	// would write is not the object the key names. The profile filter below
-	// runs over the buffered response instead, which is why this path caches:
-	// the object stays the upstream packument.
-	if pm != nil && (hasHiddenVersion(pm) || hasVersionConstraint(pm)) {
-		s.serveFilteredPackument(w, r, pkgName, pm, permit)
+	// An entry is bodega's own claim about the package, so the document is
+	// generated from it rather than fetched. Proxying it instead is what 404s
+	// every hosted npm package on an install with proxy_cache_enabled false:
+	// the tarballs are already here and nothing but this document tells a
+	// client where they are.
+	//
+	// The entry decides, not its mode. Mode records where a version's bytes
+	// come from and the tarball route reads it on its own; excluding
+	// proxy-mode entries here left a pinned package answering the upstream's
+	// failure on the one route a client resolves through.
+	if pm != nil {
+		s.serveManifestPackument(w, r, pkgName, reqVersion, pm, permit)
 		return
 	}
 
-	upstream := s.cfg.NpmUpstream + "/" + pkgName
-	s3Key := manifest.NpmPackumentKey(pkgName)
-	forceProxy := pm != nil && packageMode(pm) == manifest.ModeProxy
-	rw := &npmPackumentWriter{ResponseWriter: w, base: s.npmPublicRoot(r), pkg: pkgName, permit: permit}
-	s.proxyOrCache(rw, r, s.typeStore(manifest.TypeNpm), s3Key, upstream, manifest.TypeNpm, pkgName, pkgName, false, forceProxy)
+	// fullPath upstream and in the key, pkgName everywhere a package is named.
+	// The version-manifest route and the packument are two documents, and one
+	// cache key for both would serve whichever was fetched first.
+	upstream := s.cfg.NpmUpstream + "/" + fullPath
+	s3Key := manifest.NpmPackumentKey(fullPath)
+	rw := &npmPackumentWriter{ResponseWriter: w, base: s.npmPublicRoot(r), pkg: fullPath, permit: permit}
+	s.proxyOrCache(rw, r, s.typeStore(manifest.TypeNpm), s3Key, upstream, manifest.TypeNpm, pkgName, pkgName, false, false)
 	if err := rw.flush(); err != nil {
 		s.logger.Error("npm packument response failed", "package", pkgName, "error", err)
 	}
@@ -141,62 +175,169 @@ func isVersionHidden(pm *manifest.PackageManifest, version string) bool {
 	return false
 }
 
-func hasHiddenVersion(pm *manifest.PackageManifest) bool {
-	for _, ve := range pm.Versions {
-		if ve.Hidden {
-			return true
-		}
-	}
-	return false
-}
-
-func hasVersionConstraint(pm *manifest.PackageManifest) bool {
-	vc, baseVer := packageVersionConstraint(pm)
-	return vc != "" && vc != manifest.ConstraintAny && baseVer != ""
-}
-
-func (s *Server) serveFilteredPackument(w http.ResponseWriter, r *http.Request, pkgName string, pm *manifest.PackageManifest, permit func(string) bool) {
-	upstream := s.cfg.NpmUpstream + "/" + pkgName
-	data, ct, err := fetchUpstream(r.Context(), upstream)
+// serveManifestPackument answers a packument out of the manifest store, with
+// no upstream in the path at all.
+//
+// What bodega records about a version is the version, its checksum and where
+// its tarball lives. Everything else an upstream packument carries —
+// dependencies, engines, publish times — is absent rather than invented: a
+// client resolves against this document, and a dependency list bodega guessed
+// would be a claim nobody uploaded. A hosted package with dependencies needs
+// each of them hosted too, which is the same requirement the tarball route has
+// always had.
+//
+// reqVersion is set on the version-manifest route, where npm asks for one
+// version and expects that version's object rather than the whole document.
+func (s *Server) serveManifestPackument(w http.ResponseWriter, r *http.Request, pkgName, reqVersion string, pm *manifest.PackageManifest, permit func(string) bool) {
+	body, err := json.Marshal(npmPackumentFromManifest(pkgName, s.npmPublicRoot(r), pm))
 	if err != nil {
-		s.logger.Error("packument fetch failed", "url", upstream, "error", err)
-		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
+		s.logger.Error("packument generation failed", "pkg", pkgName, "error", err)
+		http.Error(w, "packument generation failed", http.StatusInternalServerError)
 		return
 	}
 
-	filtered, err := filterPackumentByManifest(data, pm)
-	if err != nil {
+	// The two filters the proxied document goes through, in the same order and
+	// through the same functions. A generated document that skipped them would
+	// serve a scoped host the versions its profile excludes, and would be the
+	// one npm path where hiding a version did nothing.
+	if body, err = filterPackumentByManifest(body, pm); err != nil {
 		s.logger.Error("packument filter failed", "pkg", pkgName, "error", err)
 		http.Error(w, "packument filter failed", http.StatusInternalServerError)
 		return
 	}
-
-	filtered, err = filterPackumentByProfile(filtered, permit)
-	if err != nil {
+	if body, err = filterPackumentByProfile(body, permit); err != nil {
 		s.logger.Error("packument profile filter failed", "pkg", pkgName, "error", err)
 		http.Error(w, "packument filter failed", http.StatusInternalServerError)
 		return
 	}
 
-	// The same rewrite the unfiltered path applies, through the same function.
-	// A client whose package trips the filter and one whose package does not
-	// have to be told the same URL for the same version; two composition sites
-	// is two that can drift.
-	filtered, err = rewriteNpmPackument(filtered, s.npmPublicRoot(r), pkgName)
-	if err != nil {
-		s.logger.Error("packument rewrite failed", "pkg", pkgName, "error", err)
-		http.Error(w, "packument rewrite failed", http.StatusBadGateway)
+	var doc map[string]any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		s.logger.Error("packument reparse failed", "pkg", pkgName, "error", err)
+		http.Error(w, "packument generation failed", http.StatusInternalServerError)
 		return
 	}
+	versions, _ := doc["versions"].(map[string]any)
 
-	if ct == "" {
-		ct = "application/json"
+	if reqVersion != "" {
+		entry, ok := versions[reqVersion]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		doc = map[string]any{}
+		if m, ok := entry.(map[string]any); ok {
+			doc = m
+		}
+	} else if latest := npmLatestVersion(versions); latest != "" {
+		// After the filters, never before. A dist-tag is written last because
+		// latest has to name a version that survived them: pointed at one the
+		// profile removed, `npm install <pkg>` resolves what this host is
+		// refused and fails on the tarball.
+		doc["dist-tags"] = map[string]any{"latest": latest}
 	}
-	w.Header().Set("Content-Type", ct)
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(filtered)))
+
+	body, err = json.Marshal(doc)
+	if err != nil {
+		s.logger.Error("packument generation failed", "pkg", pkgName, "error", err)
+		http.Error(w, "packument generation failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusOK)
-	//nolint:gosec // G705: filtered is the JSON packument body; Content-Type set to application/json above.
-	_, _ = w.Write(filtered)
+	//nolint:gosec // G705: body is the generated JSON packument; Content-Type is set by the handler.
+	_, _ = w.Write(body)
+}
+
+// npmPackumentFromManifest renders every version an entry records. base is
+// npmPublicRoot, so dist.tarball composes exactly as rewriteNpmPackument
+// composes it for a proxied document: a client must not be told two URLs for
+// one version depending on which path answered.
+//
+// An entry whose version is a floating dist-tag names no artifact — the
+// builder resolves it at fetch time and leaves the entry alone — so it is
+// skipped rather than published as a version literally called "latest".
+func npmPackumentFromManifest(pkgName, base string, pm *manifest.PackageManifest) map[string]any {
+	versions := map[string]any{}
+	for _, ve := range pm.Versions {
+		if ve.Version == "" || isNpmFloatingVersion(ve.Version) {
+			continue
+		}
+		dist := map[string]any{
+			"tarball": base + "/" + npmEscapeName(pkgName) + "/-/" + npmTarballFilename(pkgName, ve.Version),
+		}
+		if integrity := npmIntegrity(ve.Checksum); integrity != "" {
+			dist["integrity"] = integrity
+		}
+		entry := map[string]any{
+			"name":    pkgName,
+			"version": ve.Version,
+			"dist":    dist,
+		}
+		if desc := firstNonEmpty(ve.Description, pm.Description); desc != "" {
+			entry["description"] = desc
+		}
+		versions[ve.Version] = entry
+	}
+	doc := map[string]any{"name": pkgName, "versions": versions}
+	if pm.Description != "" {
+		doc["description"] = pm.Description
+	}
+	return doc
+}
+
+// isNpmFloatingVersion reports the dist-tag spellings the builder accepts in
+// place of a version.
+func isNpmFloatingVersion(v string) bool {
+	return v == "latest"
+}
+
+// npmTarballFilename is the name the tarball route parses a version back out
+// of: the package basename, so a scoped package drops its scope.
+func npmTarballFilename(pkgName, version string) string {
+	basename := pkgName
+	if idx := strings.LastIndex(basename, "/"); idx >= 0 {
+		basename = basename[idx+1:]
+	}
+	return basename + "-" + version + ".tgz"
+}
+
+// npmIntegrity renders a recorded sha256 as the subresource-integrity string
+// npm checks a tarball against.
+//
+// Empty for anything else, including a digest under another algorithm. npm
+// fails a mismatch as a corrupt download rather than as a metadata problem, so
+// an integrity field bodega cannot stand behind costs more than none at all.
+func npmIntegrity(cs *manifest.Checksum) string {
+	if cs == nil || cs.Algorithm != "sha256" {
+		return ""
+	}
+	raw, err := hex.DecodeString(cs.Value)
+	if err != nil || len(raw) != sha256.Size {
+		return ""
+	}
+	return "sha256-" + base64.StdEncoding.EncodeToString(raw)
+}
+
+// npmLatestVersion is the highest version left in a generated packument.
+//
+// A version no semver parse can place is skipped rather than ordered by
+// string, which is an ordering only by accident: with nothing placeable the
+// document carries no dist-tags at all, and npm asks for an explicit version
+// instead of installing whichever one sorted last.
+func npmLatestVersion(versions map[string]any) string {
+	best := ""
+	var bestSV builder.SemVer
+	for v := range versions {
+		sv, ok := builder.ParseSemVer(v)
+		if !ok {
+			continue
+		}
+		if best == "" || bestSV.Less(sv) {
+			best, bestSV = v, sv
+		}
+	}
+	return best
 }
 
 // Strip hidden + out-of-constraint versions (and any dist-tags pointing at

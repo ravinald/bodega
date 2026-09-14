@@ -144,7 +144,7 @@ e2e_on client "rm -rf /tmp/e2e-cargo && mkdir -p /tmp/e2e-cargo/src && \
 	printf '[source.crates-io]\nreplace-with = \"bodega\"\n\n[source.bodega]\nregistry = \"sparse+%s/cargo/\"\n' '$E2E_BASE_URL' > /tmp/e2e-cargo/.cargo/config.toml && \
 	cd /tmp/e2e-cargo && cargo fetch --offline 2>/dev/null; cargo fetch 2>&1 | tail -6" || true
 check_eq CLI-CARGO-01 "cargo resolves a crate from the bodega sparse index" 0 "$E2E_RC" \
-	"internal/server/cargo.go:82" "cargo fetch against sparse+$E2E_BASE_URL/cargo/" "$E2E_RC"
+	"internal/server/cargo.go:179" "cargo fetch against sparse+$E2E_BASE_URL/cargo/" "$E2E_RC"
 
 # ---- helm ------------------------------------------------------------------
 

@@ -13,16 +13,10 @@
 #
 # Seeded from the open caveats on 2026-09-14.
 GAT-05	320	two tests read /etc/bodega and /var/lib/bodega instead of a temp dir
-CLI-NPM-05	319	handleNpm looks up <pkg>/<version>, so no hidden-version policy applies
 PIPE-APT-07	311	PackageApt writes pool paths under the binary name
 PROF-16	310	an apt pin cannot name a source version
 PIPE-APT-08	271	_pool_path is unconditional provenance, so no SHA256 when mirroring
 PIPE-VERSION-pypi	325	filed from run 20260914T091319Z-9f7c138
-SRV-IDX-npm	326	filed from run 20260914T091319Z-9f7c138
-SRV-IDX-cargo	327	filed from run 20260914T091319Z-9f7c138
-CLI-NPM-01	328	filed from run 20260914T091319Z-9f7c138
-CLI-NPM-02	329	filed from run 20260914T091319Z-9f7c138
-CLI-CARGO-01	330	filed from run 20260914T091319Z-9f7c138
 CLI-GIT-02	331	filed from run 20260914T091319Z-9f7c138
 POL-17	332	filed from run 20260914T091319Z-9f7c138
 PROF-14	333	filed from run 20260914T091319Z-9f7c138
