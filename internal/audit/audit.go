@@ -184,11 +184,42 @@ type Filter struct {
 // door to the configured event sink. See the package comment for why only one
 // of those two halves is pluggable.
 type DB struct {
-	db       *sql.DB
+	db *sql.DB
+	// wdb is the write handle, capped at one connection. Nil on a read-only
+	// open, where writer() falls back to db and Record is a no-op anyway.
+	// See writer() for why there are two.
+	wdb      *sql.DB
 	sink     EventSink       // where events go; sqliteSink shares db when audit_sink is "sqlite"
 	filter   map[string]bool // nil = record all; otherwise only listed types
 	location *time.Location  // display timezone (storage is always UTC)
 	readOnly bool            // true when the backing file is not writable; Record becomes a no-op
+}
+
+// writer is the handle every write goes through, and it is separate from the
+// read pool on purpose.
+//
+// database/sql pools connections, and each SQLite connection is an independent
+// writer competing for the one write lock. Eight goroutines through one
+// unbounded pool are eight contenders, and the loser is refused unless
+// busy_timeout keeps it waiting — which made "no row is lost" a function of
+// whether the lock wait outlasted the load. Measured on Linux under -race with
+// only the timeout varied: 400 of 400 at 5s, 399 at 200ms, ~390 at 50ms, ~338
+// at 10ms. CI crossed that line occasionally and the suite reported it as the
+// regression B9 exists to prevent.
+//
+// Capping this handle at one connection moves the serialization from SQLite's
+// lock to Go's pool, so bodega's own writes queue instead of racing and the
+// write path cannot produce SQLITE_BUSY against itself at any timeout.
+//
+// The read pool stays unbounded, which is the half the busyTimeout comment
+// below is right about: SetMaxOpenConns(1) on a shared handle would put a
+// dashboard query behind every write, and WAL mode is turned on so that it is
+// not. Two handles keep both properties; one handle can only have either.
+func (a *DB) writer() *sql.DB {
+	if a.wdb != nil {
+		return a.wdb
+	}
+	return a.db
 }
 
 // SinkName returns the configured sink kind, for error text and status output
@@ -269,6 +300,18 @@ func (a *DB) DisplayLocation() *time.Location {
 // queue behind every write. Waiting for the lock keeps both.
 const busyTimeout = 5 * time.Second
 
+// lockBudget is what dsn writes into the busy_timeout pragma. It is a variable
+// so a test can shrink it and drive the no-row-lost guarantee against a lock
+// wait it controls, rather than against however fast the machine happens to
+// be. Production never changes it.
+//
+// It stays at 5s even though the write path can no longer contend with itself:
+// busy_timeout still governs a writer outside this process. `sqlite3` on the
+// audit file, a second bodega on the same volume, or a backup holding a read
+// transaction while the WAL checkpoints are all real, and each is a wait this
+// process cannot serialize away.
+var lockBudget = busyTimeout
+
 // dsn attaches the busy_timeout pragma to a database path, and query_only
 // alongside it for a handle that must not write. An empty path is left alone:
 // the driver only strips a query string when it appears at index 1 or later,
@@ -277,7 +320,7 @@ func dsn(path string, queryOnly bool) string {
 	if path == "" {
 		return path
 	}
-	out := fmt.Sprintf("%s?_pragma=busy_timeout(%d)", path, busyTimeout.Milliseconds())
+	out := fmt.Sprintf("%s?_pragma=busy_timeout(%d)", path, lockBudget.Milliseconds())
 	if queryOnly {
 		out += "&_pragma=query_only(true)"
 	}
@@ -358,17 +401,41 @@ func openStore(path string, sc SinkConfig, forceReadOnly bool) (*DB, error) {
 		return nil, fmt.Errorf("open audit db %s: %w", path, err)
 	}
 
+	// The write handle. One connection, so bodega's own writes queue in Go's
+	// pool rather than racing for SQLite's write lock; see DB.writer. A
+	// read-only open gets none, because query_only refuses the writes anyway
+	// and a second handle would only be a second thing to close.
+	var wdb *sql.DB
+	if !readOnly {
+		wdb, err = sql.Open("sqlite", dsn(path, false))
+		if err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("open audit db %s for writing: %w", path, err)
+		}
+		wdb.SetMaxOpenConns(1)
+	}
+	closeAll := func() {
+		if wdb != nil {
+			_ = wdb.Close()
+		}
+		_ = db.Close()
+	}
+
 	// WAL mode needs write access; skip on read-only handles (journal_mode
 	// returns the existing mode silently when write is denied, but we'd rather
 	// not even attempt the PRAGMA).
+	//
+	// Every statement here runs on the write handle. A migration racing the
+	// read pool is the one ordering that has to be impossible, and WAL is what
+	// the read pool needs set before it reads anything.
 	if !readOnly {
-		if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
-			_ = db.Close()
+		if _, err := wdb.Exec("PRAGMA journal_mode=WAL"); err != nil {
+			closeAll()
 			return nil, fmt.Errorf("set WAL mode: %w", err)
 		}
-		from, err := runMigrations(db)
+		from, err := runMigrations(wdb)
 		if err != nil {
-			_ = db.Close()
+			closeAll()
 			return nil, fmt.Errorf("migrate audit db: %w", err)
 		}
 		// Default posture. policy_seeds decides, not the emptiness of
@@ -386,7 +453,7 @@ func openStore(path string, sc SinkConfig, forceReadOnly bool) (*DB, error) {
 		// after 012 has already committed.
 		if from < policySeedVersion {
 			if err := claimPolicySeed(context.Background(), db, PolicySeedAge); err != nil {
-				_ = db.Close()
+				closeAll()
 				return nil, fmt.Errorf("claim age policy default: %w", err)
 			}
 		}
@@ -397,7 +464,7 @@ func openStore(path string, sc SinkConfig, forceReadOnly bool) (*DB, error) {
 		if from < checksumIdentityVersion {
 			n, err := backfillChecksumIdentity(context.Background(), db)
 			if err != nil {
-				_ = db.Close()
+				closeAll()
 				return nil, fmt.Errorf("backfill checksum package identity: %w", err)
 			}
 			if n > 0 {
@@ -406,7 +473,7 @@ func openStore(path string, sc SinkConfig, forceReadOnly bool) (*DB, error) {
 		}
 		seeded, err := seedDefaultAgePolicy(context.Background(), db)
 		if err != nil {
-			_ = db.Close()
+			closeAll()
 			return nil, fmt.Errorf("seed default age policy: %w", err)
 		}
 		if len(seeded) > 0 {
@@ -415,25 +482,32 @@ func openStore(path string, sc SinkConfig, forceReadOnly bool) (*DB, error) {
 		}
 	}
 
-	sink, err := newSink(sc, db, readOnly)
+	sink, err := newSink(sc, db, wdb, readOnly)
 	if err != nil {
-		_ = db.Close()
+		closeAll()
 		return nil, err
 	}
-	return &DB{db: db, sink: sink, readOnly: readOnly}, nil
+	return &DB{db: db, wdb: wdb, sink: sink, readOnly: readOnly}, nil
 }
 
 // ReadOnly returns true when the backing file is not writable. Record silently
 // no-ops on a read-only handle; Query keeps working.
 func (a *DB) ReadOnly() bool { return a.readOnly }
 
-// Close closes the sink and then the embedded database. The sqlite sink shares
-// the embedded handle and its Close is a no-op, so the file is closed once.
+// Close closes the sink and then both embedded handles. The sqlite sink shares
+// them and its Close is a no-op, so each is closed once.
 func (a *DB) Close() error {
 	sinkErr := a.sink.Close()
+	var wErr error
+	if a.wdb != nil {
+		wErr = a.wdb.Close()
+	}
 	dbErr := a.db.Close()
-	if sinkErr != nil {
+	switch {
+	case sinkErr != nil:
 		return sinkErr
+	case wErr != nil:
+		return wErr
 	}
 	return dbErr
 }
@@ -493,7 +567,7 @@ type StoredChecksum struct {
 
 // StoreChecksum inserts or updates a checksum record keyed by S3 key.
 func (a *DB) StoreChecksum(ctx context.Context, s3Key, pkgType, pkgName, pkgVersion, algorithm, value, source string) error {
-	_, err := a.db.ExecContext(ctx,
+	_, err := a.writer().ExecContext(ctx,
 		`INSERT INTO checksums (s3_key, pkg_type, pkg_name, pkg_version, algorithm, value, source)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(s3_key) DO UPDATE SET
@@ -581,7 +655,7 @@ func (a *DB) ListChecksums(ctx context.Context, pkgType, pkgName string) ([]Stor
 // A blank value reads as "no digest recorded": verifyProxyChecksum stores the
 // next computed one over it, exactly as it does for a key it has never seen.
 func (a *DB) ClearChecksum(ctx context.Context, s3Key string) error {
-	result, err := a.db.ExecContext(ctx,
+	result, err := a.writer().ExecContext(ctx,
 		`UPDATE checksums SET value = '', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 		 WHERE s3_key = ?`, s3Key)
 	if err != nil {
@@ -609,7 +683,7 @@ func (a *DB) ClearChecksumsByPackage(ctx context.Context, pkgType, pkgName strin
 	).Scan(&matched); err != nil {
 		return 0, 0, err
 	}
-	result, err := a.db.ExecContext(ctx,
+	result, err := a.writer().ExecContext(ctx,
 		`UPDATE checksums SET value = '', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 		 WHERE pkg_type = ? AND pkg_name = ? AND value != ''`,
 		pkgType, pkgName,
@@ -649,7 +723,7 @@ func (a *DB) InsertToken(ctx context.Context, id, label, hash, comment string, e
 	if expiresAt != nil {
 		exp = sql.NullString{String: expiresAt.UTC().Format(time.RFC3339), Valid: true}
 	}
-	_, err := a.db.ExecContext(ctx,
+	_, err := a.writer().ExecContext(ctx,
 		"INSERT INTO api_tokens (id, label, hash, comment, expires_at) VALUES (?, ?, ?, ?, ?)",
 		id, label, hash, comment, exp,
 	)
@@ -722,7 +796,7 @@ func (a *DB) GetTokenHashes(ctx context.Context) ([]TokenHash, error) {
 
 // UpdateTokenLastUsed sets the last_used timestamp for a token.
 func (a *DB) UpdateTokenLastUsed(ctx context.Context, id string) error {
-	_, err := a.db.ExecContext(ctx,
+	_, err := a.writer().ExecContext(ctx,
 		"UPDATE api_tokens SET last_used = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
 		id,
 	)
@@ -732,7 +806,7 @@ func (a *DB) UpdateTokenLastUsed(ctx context.Context, id string) error {
 // DeleteToken removes a token by ID.
 // DeleteToken removes a token by ID. Returns an error if the token does not exist.
 func (a *DB) DeleteToken(ctx context.Context, id string) (bool, error) {
-	result, err := a.db.ExecContext(ctx,
+	result, err := a.writer().ExecContext(ctx,
 		"DELETE FROM api_tokens WHERE id = ?",
 		id,
 	)
@@ -745,7 +819,7 @@ func (a *DB) DeleteToken(ctx context.Context, id string) (bool, error) {
 
 // DeleteTokenByLabel removes a token by label.
 func (a *DB) DeleteTokenByLabel(ctx context.Context, label string) error {
-	_, err := a.db.ExecContext(ctx,
+	_, err := a.writer().ExecContext(ctx,
 		"DELETE FROM api_tokens WHERE label = ?",
 		label,
 	)

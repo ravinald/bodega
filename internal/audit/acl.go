@@ -73,7 +73,7 @@ func (a *DB) SeedACL(ctx context.Context, list string, entries []string, actor s
 	if a.readOnly {
 		return false, errors.New("audit db is read-only")
 	}
-	tx, err := a.db.BeginTx(ctx, nil)
+	tx, err := a.writer().BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
@@ -147,7 +147,7 @@ func (a *DB) AddACL(ctx context.Context, e ACLEntry) (bool, error) {
 	if a.readOnly {
 		return false, errors.New("audit db is read-only")
 	}
-	res, err := a.db.ExecContext(ctx,
+	res, err := a.writer().ExecContext(ctx,
 		`INSERT OR IGNORE INTO acl_entries (list, cidr, comment, actor) VALUES (?, ?, ?, ?)`,
 		e.List, e.CIDR, e.Comment, e.Actor)
 	if err != nil {
@@ -165,7 +165,7 @@ func (a *DB) RemoveACL(ctx context.Context, list, cidr string) (bool, error) {
 	if a.readOnly {
 		return false, errors.New("audit db is read-only")
 	}
-	res, err := a.db.ExecContext(ctx, `DELETE FROM acl_entries WHERE list = ? AND cidr = ?`, list, cidr)
+	res, err := a.writer().ExecContext(ctx, `DELETE FROM acl_entries WHERE list = ? AND cidr = ?`, list, cidr)
 	if err != nil {
 		return false, err
 	}

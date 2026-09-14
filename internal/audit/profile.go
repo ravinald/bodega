@@ -209,7 +209,7 @@ func (a *DB) CreateProfile(ctx context.Context, p Profile) error {
 	if a.readOnly {
 		return errors.New("audit db is read-only")
 	}
-	res, err := a.db.ExecContext(ctx,
+	res, err := a.writer().ExecContext(ctx,
 		`INSERT OR IGNORE INTO profiles (name, description, actor) VALUES (?, ?, ?)`,
 		p.Name, p.Description, p.Actor)
 	if err != nil {
@@ -342,7 +342,7 @@ func (a *DB) SetProfileTypeRule(ctx context.Context, r ProfileTypeRule) error {
 	if a.readOnly {
 		return errors.New("audit db is read-only")
 	}
-	_, err := a.db.ExecContext(ctx, insertProfileTypeSQL,
+	_, err := a.writer().ExecContext(ctx, insertProfileTypeSQL,
 		r.Profile, r.Type, r.Membership, r.VersionDefault, r.Expansion, r.AptBase, r.Actor)
 	return err
 }
@@ -379,7 +379,7 @@ func (a *DB) PutProfileEntry(ctx context.Context, e ProfileEntry) (bool, error) 
 		e.Profile, e.Type, e.Name).Scan(&existed); err != nil {
 		return false, err
 	}
-	_, err := a.db.ExecContext(ctx, insertProfileEntrySQL,
+	_, err := a.writer().ExecContext(ctx, insertProfileEntrySQL,
 		e.Profile, e.Type, e.Name, e.Constraint, e.Version, e.Origin, e.Reason,
 		e.ReviewAfter, e.Actor, formatPinnedAt(e.PinnedAt), e.PinnedBy)
 	if err != nil {
@@ -416,7 +416,7 @@ func (a *DB) RemoveProfileEntry(ctx context.Context, profile, typ, name string) 
 	if a.readOnly {
 		return false, errors.New("audit db is read-only")
 	}
-	res, err := a.db.ExecContext(ctx,
+	res, err := a.writer().ExecContext(ctx,
 		`DELETE FROM profile_entries WHERE profile = ? AND pkg_type = ? AND pkg_name = ?`,
 		profile, typ, name)
 	if err != nil {
@@ -449,7 +449,7 @@ func (a *DB) BindProfile(ctx context.Context, b ProfileBinding) (string, error) 
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return "", err
 	}
-	_, err = a.db.ExecContext(ctx,
+	_, err = a.writer().ExecContext(ctx,
 		`INSERT INTO profile_bindings (identity, profile, comment, actor) VALUES (?, ?, ?, ?)
 		 ON CONFLICT(identity) DO UPDATE SET
 		     profile = excluded.profile,
@@ -468,7 +468,7 @@ func (a *DB) UnbindProfile(ctx context.Context, identity string) (bool, error) {
 	if a.readOnly {
 		return false, errors.New("audit db is read-only")
 	}
-	res, err := a.db.ExecContext(ctx, `DELETE FROM profile_bindings WHERE identity = ?`, identity)
+	res, err := a.writer().ExecContext(ctx, `DELETE FROM profile_bindings WHERE identity = ?`, identity)
 	if err != nil {
 		return false, err
 	}
@@ -547,7 +547,7 @@ func (a *DB) CreateProfileWith(ctx context.Context, p Profile, types []ProfileTy
 		return errors.New("audit db is read-only")
 	}
 
-	tx, err := a.db.BeginTx(ctx, nil)
+	tx, err := a.writer().BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}

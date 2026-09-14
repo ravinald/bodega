@@ -107,10 +107,10 @@ func IsUnqueryable(err error) bool {
 	return errors.As(err, &e)
 }
 
-// newSink builds the configured sink. embedded is the always-open SQLite
-// handle that holds operational state; the sqlite sink shares it rather than
-// opening the file twice, and the other three ignore it.
-func newSink(sc SinkConfig, embedded *sql.DB, readOnly bool) (EventSink, error) {
+// newSink builds the configured sink. read and write are the always-open
+// SQLite handles that hold operational state; the sqlite sink shares both
+// rather than opening the file again, and the other three ignore them.
+func newSink(sc SinkConfig, read, write *sql.DB, readOnly bool) (EventSink, error) {
 	kind := sc.Kind
 	if kind == "" {
 		kind = SinkSQLite
@@ -120,7 +120,7 @@ func newSink(sc SinkConfig, embedded *sql.DB, readOnly bool) (EventSink, error) 
 		if sc.DSN != "" {
 			return nil, fmt.Errorf("audit_sink %q takes no audit_sink_dsn: it writes to audit_db (%s)", SinkSQLite, "the same file the ACLs and tokens live in")
 		}
-		return &sqliteSink{db: embedded, readOnly: readOnly}, nil
+		return &sqliteSink{rdb: read, wdb: write, readOnly: readOnly}, nil
 	case SinkPostgres:
 		return newPostgresSink(sc.DSN)
 	case SinkSyslog:

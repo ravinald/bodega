@@ -16,7 +16,7 @@ type OSVPolicy struct {
 var ErrOSVPolicyNotFound = errors.New("osv policy not set for ecosystem")
 
 func (a *DB) SetOSVPolicy(ctx context.Context, p OSVPolicy) error {
-	_, err := a.db.ExecContext(ctx, `
+	_, err := a.writer().ExecContext(ctx, `
 		INSERT INTO osv_policy (ecosystem, action, updated_at)
 		VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 		ON CONFLICT(ecosystem) DO UPDATE SET
@@ -64,7 +64,7 @@ func (a *DB) ListOSVPolicies(ctx context.Context) ([]OSVPolicy, error) {
 }
 
 func (a *DB) DeleteOSVPolicy(ctx context.Context, ecosystem string) (bool, error) {
-	res, err := a.db.ExecContext(ctx, `DELETE FROM osv_policy WHERE ecosystem = ?`, ecosystem)
+	res, err := a.writer().ExecContext(ctx, `DELETE FROM osv_policy WHERE ecosystem = ?`, ecosystem)
 	if err != nil {
 		return false, err
 	}

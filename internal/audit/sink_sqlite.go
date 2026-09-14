@@ -9,11 +9,17 @@ import (
 )
 
 // sqliteSink writes the event stream into the same file the operational state
-// lives in. It shares that handle rather than opening the database twice: two
-// *sql.DB pools on one file are two sets of connections contending for the
-// same write lock, which is the loss busyTimeout exists to stop.
+// lives in, through the same two handles *DB uses: rdb for queries and wdb for
+// writes.
+//
+// It shares them rather than opening the file a third time. Two unbounded
+// pools on one file are two sets of connections contending for the same write
+// lock, which is the loss busyTimeout exists to stop; the split that does ship
+// works because exactly one of the two pools writes and it is capped at one
+// connection. See DB.writer.
 type sqliteSink struct {
-	db       *sql.DB
+	rdb      *sql.DB
+	wdb      *sql.DB
 	readOnly bool
 }
 
@@ -26,7 +32,7 @@ func (s *sqliteSink) Record(ctx context.Context, ev Event) error {
 	if s.readOnly {
 		return nil
 	}
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.wdb.ExecContext(ctx,
 		`INSERT INTO events (event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details, actor, identity)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		string(ev.EventType), ev.PkgType, ev.PkgName, ev.PkgVersion,
@@ -49,7 +55,7 @@ func (s *sqliteSink) RecordDiscovery(ctx context.Context, rows ...DiscoveryRow) 
 	for _, chunk := range chunkDiscovery(rows) {
 		//nolint:gosec // G202: the statement is assembled from a generated placeholder list; every value is bound.
 		q, args := buildDiscoveryUpsert(coalesceDiscovery(chunk), false)
-		if _, err := s.db.ExecContext(ctx, q, args...); err != nil {
+		if _, err := s.wdb.ExecContext(ctx, q, args...); err != nil {
 			return applied, err
 		}
 		applied += len(chunk)
@@ -103,7 +109,7 @@ func (s *sqliteSink) QueryEvents(ctx context.Context, f Filter) ([]StoredEvent, 
 	//nolint:gosec // G202: LIMIT clause built from a clamped int literal, no user-controlled string interpolation.
 	query += fmt.Sprintf(" LIMIT %d", effectiveLimit(f.Limit))
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.rdb.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +154,7 @@ func (s *sqliteSink) CountEvents(ctx context.Context, f Filter) (int64, error) {
 	}
 
 	var count int64
-	err := s.db.QueryRowContext(ctx, query, args...).Scan(&count)
+	err := s.rdb.QueryRowContext(ctx, query, args...).Scan(&count)
 	return count, err
 }
 
@@ -184,7 +190,7 @@ func (s *sqliteSink) ListDiscovery(ctx context.Context, f DiscoveryFilter) ([]Di
 	//nolint:gosec // G202: LIMIT clause built from a clamped int literal, no user-controlled string interpolation.
 	q += fmt.Sprintf(" LIMIT %d", effectiveLimit(f.Limit))
 
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	rows, err := s.rdb.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -224,10 +230,10 @@ func (s *sqliteSink) AggregateDiscovery(ctx context.Context, registryType string
 	if registryType != "" {
 		q += " WHERE registry_type = ?"
 		q += " GROUP BY registry_type, pattern_hint ORDER BY last_seen DESC"
-		rows, err = s.db.QueryContext(ctx, q, registryType)
+		rows, err = s.rdb.QueryContext(ctx, q, registryType)
 	} else {
 		q += " GROUP BY registry_type, pattern_hint ORDER BY last_seen DESC"
-		rows, err = s.db.QueryContext(ctx, q)
+		rows, err = s.rdb.QueryContext(ctx, q)
 	}
 	if err != nil {
 		return nil, err
@@ -265,9 +271,9 @@ func (s *sqliteSink) ClearDiscovery(ctx context.Context, registryType string) (i
 		err error
 	)
 	if registryType == "" {
-		res, err = s.db.ExecContext(ctx, `DELETE FROM upstream_discovery`)
+		res, err = s.wdb.ExecContext(ctx, `DELETE FROM upstream_discovery`)
 	} else {
-		res, err = s.db.ExecContext(ctx,
+		res, err = s.wdb.ExecContext(ctx,
 			`DELETE FROM upstream_discovery WHERE registry_type = ?`, registryType)
 	}
 	if err != nil {
@@ -281,9 +287,9 @@ func (s *sqliteSink) DiscoveryCount(ctx context.Context, registryType string) (i
 	var n int64
 	var err error
 	if registryType == "" {
-		err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM upstream_discovery`).Scan(&n)
+		err = s.rdb.QueryRowContext(ctx, `SELECT COUNT(*) FROM upstream_discovery`).Scan(&n)
 	} else {
-		err = s.db.QueryRowContext(ctx,
+		err = s.rdb.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM upstream_discovery WHERE registry_type = ?`,
 			registryType).Scan(&n)
 	}
