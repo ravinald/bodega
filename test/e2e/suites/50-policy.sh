@@ -61,9 +61,13 @@ e2e_bodega server "policy list" || true
 check_contains POL-07 "the added rule is listed" "registry.npmjs.org" "$E2E_OUT" \
 	"cmd/bodega/cmd_policy.go:49" "bodega policy list"
 
+# Exit 1 on a violation is the useful behavior, so the verdict is about the
+# output rather than the code: asserting 0 turns "the scan found something"
+# into a harness failure.
 e2e_bodega server "policy check" || true
-check_eq POL-08 "policy check runs against the stored manifests" 0 "$E2E_RC" \
-	"cmd/bodega/cmd_policy.go:241" "bodega policy check" "$E2E_RC"
+check_matches POL-08 "policy check reports either a clean scan or the violations it found" \
+	'no policy violations|violation' "$E2E_OUT$E2E_ERR" \
+	"cmd/bodega/cmd_policy.go:241" "bodega policy check"
 
 e2e_bodega server "policy remove 'registry.npmjs.org/*' --type npm" || true
 check_eq POL-09 "the rule can be removed" 0 "$E2E_RC" \

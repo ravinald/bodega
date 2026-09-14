@@ -24,7 +24,10 @@ fi
 
 E2E_HOST=server
 GO=/usr/local/go/bin/go
-WORK=~/bodega-e2e-work
+# An absolute path, not ~: the tilde expands on the workstation before the
+# command is sent, so the guest was told to mkdir a path under this machine's
+# home and answered "Permission denied".
+WORK=/tmp/bodega-e2e-work
 
 e2e_on server "test -x $GO" || true
 if [ "$E2E_RC" -ne 0 ]; then
@@ -36,7 +39,9 @@ fi
 # with no .git, so the guest cannot push and there is no second checkout to
 # keep in sync.
 E2E_HOST=local
-e2e_local sh -c "git -C '$REPO_ROOT' archive --format=tar HEAD > /tmp/e2e-tree.tar" || true
+# --output rather than a shell redirect: e2e_local runs the command directly,
+# so a `>` in the argument list is an argument, not a redirection.
+e2e_local git -C "$REPO_ROOT" archive --format=tar --output=/tmp/e2e-tree.tar HEAD || true
 check_eq GAT-01 "the tree archives at HEAD" 0 "$E2E_RC" \
 	"docs-internal/DEV_HOSTS.md" "git archive --format=tar HEAD" "$E2E_RC"
 
@@ -45,6 +50,17 @@ E2E_HOST=server
 e2e_on server "rm -rf $WORK && mkdir -p $WORK && tar -xf /tmp/e2e-tree.tar -C $WORK && test -f $WORK/go.mod" || true
 check_eq GAT-02 "the tree unpacks on the server guest" 0 "$E2E_RC" \
 	"docs-internal/DEV_HOSTS.md" "tar -xf /tmp/e2e-tree.tar -C $WORK" "$E2E_RC"
+
+# Everything below compiles that tree. Without it they would each report a
+# compiler error as a test failure, and the report would name seven defects
+# where there is one broken prerequisite.
+if [ "$E2E_RC" -ne 0 ]; then
+	for id in GAT-05 GAT-06 GAT-07 GAT-08 GAT-09 GAT-10 GAT-11; do
+		e2e_block "$id" "a gated Go suite" "the tree did not unpack on the server guest (GAT-02)"
+	done
+	unset GO WORK id
+	return 0
+fi
 
 # ---- the two tests that fail on a host with bodega installed ---------------
 #

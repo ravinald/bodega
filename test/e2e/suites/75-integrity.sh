@@ -27,8 +27,12 @@ e2e_bodega server "pkg checksum list" || true
 check_eq INT-01 "the checksum cache is readable" 0 "$E2E_RC" \
 	"cmd/bodega/cmd_checksum.go:36" "bodega pkg checksum list" "$E2E_RC"
 
-check_contains INT-02 "a checksum was pinned on first fetch" "binary" "$E2E_OUT" \
-	"docs/USAGE.md#checksum-verification" "bodega pkg checksum list"
+# README.md: "Checksum verification: computed on first fetch, enforced on
+# subsequent fetches." Eight types have been fetched and uploaded by the time
+# this runs, so an empty cache means the first half of that sentence did not
+# happen and the second half has nothing to enforce against.
+check_lacks INT-02 "the checksum cache is not empty after eight types were fetched" \
+	"No cached checksums" "$E2E_OUT" "README.md" "bodega pkg checksum list"
 
 # ---- manifest integrity ----------------------------------------------------
 #
@@ -40,9 +44,31 @@ e2e_bodega server "pkg verify" || true
 check_eq INT-03 "a clean store verifies" 0 "$E2E_RC" \
 	"cmd/bodega/cmd_verify.go:15" "bodega pkg verify" "$E2E_RC"
 
-e2e_on server "sudo cp /var/lib/bodega/manifests/binary/hello-binary.json /tmp/e2e-manifest.bak && \
-	sudo sed -i 's/\"description\": \"[^\"]*\"/\"description\": \"tampered\"/' \
-	/var/lib/bodega/manifests/binary/hello-binary.json" || true
+# A run that prints "MISSING (no manifest file)" and then "All manifests passed
+# integrity check" at exit 0 says two things that cannot both be true, and the
+# reassuring one is last and is what a reader keeps.
+if printf '%s' "$E2E_OUT" | grep -q MISSING; then
+	check_lacks INT-03a "a verify reporting MISSING does not also declare every manifest passed" \
+		"All manifests passed" "$E2E_OUT" "cmd/bodega/cmd_verify.go:15" "bodega pkg verify"
+else
+	e2e_skip INT-03a "a verify reporting MISSING does not also declare every manifest passed" \
+		"no MISSING rows in this store"
+fi
+
+# The manifest is a directory per package holding manifest.json, not a flat
+# <name>.json. The flat path does not exist, so a sed against it edits nothing
+# and `pkg verify` then passes a store nobody tampered with: the check reported
+# a working detector while testing no detection at all.
+MANIFEST=/var/lib/bodega/manifests/binary/hello-binary/manifest.json
+e2e_on server "sudo test -f $MANIFEST" || true
+check_eq INT-03b "the manifest the tamper test edits exists" 0 "$E2E_RC" \
+	"internal/manifest" "test -f $MANIFEST" "$E2E_RC"
+
+e2e_on server "sudo cp -p $MANIFEST /tmp/e2e-manifest.bak && \
+	sudo sed -i 's/\"description\":[^,}]*/\"description\":\"tampered by the e2e harness\"/' \
+	$MANIFEST && sudo grep -c tampered $MANIFEST" || true
+check_eq INT-03c "the tamper actually changed the file" "1" "$E2E_OUT" \
+	"internal/manifest" "sed -i the description, then grep -c tampered"
 e2e_bodega server "pkg verify" || true
 check_ne INT-04 "an edited manifest fails verification" 0 "$E2E_RC" \
 	"cmd/bodega/cmd_verify.go:15" "bodega pkg verify after editing a manifest" "$E2E_RC"
@@ -56,8 +82,8 @@ e2e_bodega server "pkg verify" || true
 check_eq INT-06 "break-glass restores agreement between manifest and sidecar" 0 "$E2E_RC" \
 	"cmd/bodega/main.go:145" "bodega --break-glass-update-md5 binary" "$E2E_RC"
 
-e2e_on server "sudo cp /tmp/e2e-manifest.bak /var/lib/bodega/manifests/binary/hello-binary.json && \
-	sudo chown ${E2E_SERVICE_USER:-bodega} /var/lib/bodega/manifests/binary/hello-binary.json" || true
+e2e_on server "sudo cp /tmp/e2e-manifest.bak $MANIFEST && \
+	sudo chown ${E2E_SERVICE_USER:-bodega} $MANIFEST" || true
 e2e_bodega server "--break-glass-update-md5 binary" || true
 
 # ---- repair ----------------------------------------------------------------
@@ -88,4 +114,4 @@ e2e_bodega server "build status" || true
 check_lacks INT-11 "nothing is missing from the backend" "MISSING" "$E2E_OUT" \
 	"cmd/bodega/cmd_status.go:15" "bodega build status"
 
-unset before
+unset before MANIFEST

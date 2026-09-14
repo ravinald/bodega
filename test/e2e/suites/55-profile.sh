@@ -39,15 +39,19 @@ e2e_bodega server "profile list" || true
 check_contains PROF-02 "the profile is listed" "e2e-profile" "$E2E_OUT" \
 	"cmd/bodega/cmd_profile.go:628" "bodega profile list"
 
-# Closed membership on every type, so anything the profile does not name is
-# refused. An open membership would make every check below pass on a profile
-# that entitles nothing.
+# Closed membership AND expansion block. Closed alone is not a refusal: with
+# the default `warn` expansion, `profile show` says so in as many words —
+# "every apt request from a bound host is served and recorded as a reach
+# outside this class". A suite that set only the membership would measure a
+# profile that refuses nothing and read every 200 as a missing control.
 for t in binary git apt pypi gomod helm npm cargo; do
-	e2e_bodega server "profile set e2e-profile $t --membership closed" || true
+	e2e_bodega server "profile set e2e-profile $t --membership closed --expansion block" || true
 done
 e2e_bodega server "profile show e2e-profile" || true
 check_contains PROF-03 "the profile shows closed membership" "closed" "$E2E_OUT" \
 	"cmd/bodega/cmd_profile.go:909" "bodega profile set e2e-profile <type> --membership closed"
+check_contains PROF-03b "the profile blocks rather than warns on expansion" "block" "$E2E_OUT" \
+	"internal/audit/profile.go:44" "bodega profile set e2e-profile <type> --expansion block"
 
 # One entry, so the suite can tell "entitled" from "refused" on the same server.
 e2e_bodega server "profile add e2e-profile binary hello-binary --reason 'e2e run'" || true
@@ -93,6 +97,13 @@ check_eq PROF-10 "the profile binds to the client's identity" 0 "$E2E_RC" \
 	"cmd/bodega/cmd_profile.go:782" "bodega profile bind e2e-profile e2e-host" "$E2E_RC"
 e2e_reload server || true
 sleep 3
+
+# The binding is confirmed before anything is measured through it. Without this
+# a refresh that has not landed yet makes every enforcement check below report
+# a control that is absent rather than one that is late.
+e2e_bodega server "profile show e2e-profile" || true
+check_contains PROF-10b "the profile reports a bound host" "e2e-host" "$E2E_OUT" \
+	"cmd/bodega/cmd_profile.go:673" "bodega profile show e2e-profile"
 
 # ---- enforcement, per surface ---------------------------------------------
 

@@ -110,8 +110,24 @@ check_matches SYS-10 "--allow-plaintext=false refuses a plaintext listener" \
 # The unit's header names config.json and audit.db. The pepper is created later,
 # by the command the quick start tells you to run, and is not on the list.
 
-e2e_on server "stat -c '%U' /etc/bodega/config.json /var/log/bodega/audit.db 2>/dev/null | sort -u | tr '\n' ' '" || true
-check_lacks SYS-11 "neither config nor audit db is left owned by root" \
-	"root" "$E2E_OUT" "docs/bodega.service" "stat -c %U /etc/bodega/config.json /var/log/bodega/audit.db"
+# Readability by the service user, not ownership. A root-owned config with the
+# service's group and 0640 is a correct posture and a common one; what breaks
+# the service is a file it cannot read, whoever owns it.
+e2e_on server "for f in /etc/bodega/config.json /var/log/bodega/audit.db; do \
+	sudo -u ${E2E_SERVICE_USER:-bodega} test -r \$f || echo \"unreadable: \$f\"; done; true" || true
+check_eq SYS-11 "the service user can read its config and its audit database" \
+	"" "$E2E_OUT" "docs/bodega.service" \
+	"sudo -u ${E2E_SERVICE_USER:-bodega} test -r /etc/bodega/config.json /var/log/bodega/audit.db"
+
+# Writability is the other half and the one the unit header warns about: a
+# root-owned audit.db stops the service starting, and a cache directory the
+# service cannot write degrades to a WARN it still answers requests through.
+e2e_on server "sudo -u ${E2E_SERVICE_USER:-bodega} test -w /var/log/bodega/audit.db && echo writable || echo unwritable" || true
+check_eq SYS-12 "the service user can write its audit database" "writable" "$E2E_OUT" \
+	"docs/bodega.service" "sudo -u ${E2E_SERVICE_USER:-bodega} test -w /var/log/bodega/audit.db"
+
+e2e_on server "sudo -u ${E2E_SERVICE_USER:-bodega} test -w /var/lib/bodega && echo writable || echo unwritable" || true
+check_eq SYS-13 "the service user can write its storage root" "writable" "$E2E_OUT" \
+	"docs/bodega.service" "sudo -u ${E2E_SERVICE_USER:-bodega} test -w /var/lib/bodega"
 
 unset pid_before fpr

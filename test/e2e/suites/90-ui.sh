@@ -26,10 +26,13 @@ fi
 # nothing rendered.
 
 E2E_HOST=server
-e2e_on server "printf 'q' | script -qec 'sudo -E bodega shell' /dev/null 2>&1 | head -40; true" || true
+# Bounded at 20s and killed rather than left to the ssh budget. A TUI reading
+# from a pipe instead of the pty `script` allocated may never see the q, and an
+# unbounded hang there costs five minutes of an overnight run per attempt.
+E2E_SSH_TIMEOUT=60 e2e_on server "printf 'q' | timeout -k 5 20 script -qec 'sudo -E bodega shell' /dev/null 2>&1 | head -40; true" || true
 tui="$E2E_OUT"
-check_eq UI-01 "the TUI starts and quits on q" 0 "$E2E_RC" \
-	"cmd/bodega/cmd_shell.go:15" "printf q | script -qec 'bodega shell' /dev/null" "$E2E_RC"
+check_lacks UI-01 "the TUI starts without a panic" "panic:" "$tui" \
+	"cmd/bodega/cmd_shell.go:15" "printf q | timeout 20 script -qec 'bodega shell' /dev/null"
 
 check_matches UI-02 "the TUI renders something, not an empty screen" \
 	'[A-Za-z]' "$tui" "internal/tui/app.go" "printf q | script -qec 'bodega shell' /dev/null"
