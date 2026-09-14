@@ -121,6 +121,13 @@ check_eq PROF-10 "the profile binds to the client's identity" 0 "$E2E_RC" \
 e2e_reload server || true
 sleep 3
 
+# Every row this suite goes on to assert about is bounded to after this moment.
+# An earlier run of this suite leaves rows carrying the same identity, and
+# `--identity e2e-host` over the whole table would pass on those alone — which
+# is a check that reports a working binding on a tree where it is broken.
+e2e_on server "date -u -d '-1 minute' +%Y-%m-%dT%H:%M:%SZ" >/dev/null 2>&1 || true
+E2E_PROFILE_SINCE="$E2E_OUT"
+
 # The binding is confirmed before anything is measured through it. Without this
 # a refresh that has not landed yet makes every enforcement check below report
 # a control that is absent rather than one that is late.
@@ -209,15 +216,15 @@ check_ne PROF-17 "attestation does not answer for a package the profile refuses"
 # section exists to catch.
 
 E2E_HOST=server
-e2e_bodega server "audit events --client ${E2E_CLIENT_ADDR:-127.0.0.1} --limit 3" || true
+e2e_bodega server "audit events --client ${E2E_CLIENT_ADDR:-127.0.0.1} --since $E2E_PROFILE_SINCE --limit 3" || true
 check_contains PROF-ID-02 "a request from a CIDR-bound address is attributed to its identity" \
 	"e2e-host" "$E2E_OUT" "internal/server/identity.go:219" \
-	"bodega audit events --client ${E2E_CLIENT_ADDR:-127.0.0.1}"
+	"bodega audit events --client ${E2E_CLIENT_ADDR:-127.0.0.1} --since $E2E_PROFILE_SINCE"
 
-e2e_bodega server "audit events --identity e2e-host --limit 3" || true
+e2e_bodega server "audit events --identity e2e-host --since $E2E_PROFILE_SINCE --limit 3" || true
 check_contains PROF-ID-03 "--identity returns the requests it attributed" \
 	"${E2E_CLIENT_ADDR:-127.0.0.1}" "$E2E_OUT" "cmd/bodega/cmd_audit.go:119" \
-	"bodega audit events --identity e2e-host"
+	"bodega audit events --identity e2e-host --since $E2E_PROFILE_SINCE"
 
 # ---- restore ---------------------------------------------------------------
 
