@@ -896,6 +896,8 @@ The `OSV` column is the stamp [`bodega policy osv rescan`](#rescan) writes, and 
 
 `PINNED` is when the held version was last decided, which is not when the entry was created: moving a pin to a new version re-dates it, and correcting its reason with `add` does not. A row written before that column existed falls back to the entry's own creation date, which is a lower bound rather than a guess.
 
+`BY` is who made that decision, and it moves with `PINNED` rather than with the last write. A colleague correcting a typo in your reason does not take the byline, because the row would then name them beside your date. Every other profile command reports the last writer, which is what those commands mean by it. A row written before the column existed falls back to the last writer, since that is the only name the table has ever held for it.
+
 `--stale` exits 1, so it works as a CI or cron gate the same way `bodega profile check` does. A pin with no review date is never stale, which is what makes `--review-after` worth writing.
 
 **The closure.** Holding postgresql-14 at 14.9 holds everything 14.9 was built against: a dependency edge names the version the parent needs, and pinning the parent does not move it. apt meets that during an upgrade, as a widening set held back or a proposal to remove the package. bodega sits on the index and holds the graph, so `pin` says it first:
@@ -911,7 +913,11 @@ Pinning apt/postgresql-14 at 14.9 holds 2 other package(s) still:
 Added apt/postgresql-14 in db (exact 14.9).
 ```
 
-`HELD AT` comes from the relation the dependency was declared with, not from what happens to be installed. `libpq5 (= 14.9)` holds a release still and reads `14.9`; `libssl3 (>= 3.0.0)` is a floor that may move upward whatever postgresql-14 is pinned at, so it reads `-` and `--strict-closure` has nothing to pin it to. The language discoverers record the version on every edge, so a pypi or gomod closure resolves throughout.
+`HELD AT` comes from the relation the dependency was declared with, not from what happens to be installed. `libpq5 (= 14.9)` holds a release still and reads `14.9`; `libssl3 (>= 3.0.0)` is a floor that may move upward whatever postgresql-14 is pinned at, so it reads `-` and `--strict-closure` has nothing to pin it to. The language discoverers record the version on every edge they write, so a closure that reaches a pypi or gomod package resolves to a version rather than a dash.
+
+**Which packages have a closure at all is a narrower question.** Only two code paths write an edge, and both write the parent as an `apt` or a `git` package: `discover_apt.go` writes `apt/<parent>` to `apt/<child>`, and `ImportDeps` writes `git/<repo>@<ref>` to the language packages that repo requires. No path writes an edge whose parent is a pypi, gomod, npm or cargo package, so pinning one of those reports no closure — not because it holds nothing still, but because nothing recorded what it depends on. `bodega profile pin` says which of the two it is rather than printing nothing, and `bodega profile check` is the gate that would otherwise pass silently.
+
+Recording language-to-language edges is a larger change: `ImportDeps` fixes one parent ref per scanned repository, and a transitive graph needs a parent ref per dependency. Nothing schedules it.
 
 **Reporting is the default and freezing is not.** The default pins the one package you named and tells you what it implies. `--strict-closure` pins every closure member at the version the graph records, with a reason naming the pin that implied it. Extending by default would freeze a growing set: each package pinned drags its own dependencies in, and a host would stop receiving security updates for all of them with nobody having decided that it should. A closure member the graph records no version for is left floating and said so, because pinning it would mean choosing a release on your behalf.
 
@@ -1675,17 +1681,19 @@ Error: the age gate does not cover ecosystem "apt": there is no upstream publish
 
 The two gates failed differently before they refused. OSV passed silently. Age never did: a missing timestamp is a `warn` with the ecosystem named, so an apt policy made every apt version noisy rather than invisible. Refusing the row up front is a usability fix on that side and a security fix on the OSV side.
 
-`set` grew that refusal after the fact, so a row written before it is still stored and still read by nothing. Both `list` commands name those rows under the table, and `bodega doctor` reports them as `policy-ecosystem`:
+`set` grew that refusal after the fact, so a row written before it is still stored and still read by nothing. Both `list` commands mark the row's action and name it again under the table, and `bodega doctor` reports it as `policy-ecosystem`:
 
 ```
 $ bodega policy age list
-ECOSYSTEM  MIN AGE  ACTION  UPDATED
-helm       7d       block   2026-03-11
-npm        7d       warn    2026-09-06
+ECOSYSTEM  MIN AGE  ACTION                UPDATED
+helm       7d       block (not enforced)  2026-03-11
+npm        7d       warn                  2026-09-06
 
 Not enforced: the age gate cannot evaluate helm, so that row is stored and never read.
 Remove with 'bodega policy age remove <ecosystem>'.
 ```
+
+The marker is on the row because the row is what an operator scans. A footnote alone left `block` reading as a block in the column where every other row's action is real, and the two rows above are the whole difference between a gate that runs and one that does not.
 
 Nothing else counts such a row as enforcement. The `bodega serve` startup banner names only ecosystems the age gate can date, so an install carrying the `helm` row above with `npm` and `pypi` on `ignore` reports `minimum publish age: none enforced` rather than the block that never runs.
 
