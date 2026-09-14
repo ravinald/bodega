@@ -111,16 +111,24 @@ check_matches ACC-06 "token generate prints a token once" '.{24,}' "${E2E_TOKEN:
 # The unit's header calls for an ownership pass over config.json and audit.db.
 # The pepper is not on that list and is created later, by the one command the
 # quick start tells you to run before widening the admin list.
-e2e_on server "stat -c '%U %a' /etc/bodega/pepper 2>/dev/null || echo absent" || true
+# The pepper is removed and re-created here rather than inspected where it
+# lies. A previous run of this suite repairs the ownership at the end, so
+# reading whatever is on disk measures the last repair instead of what
+# `token generate` writes, and the check passes on every run after the first.
+e2e_on server "sudo rm -f /etc/bodega/pepper" || true
+e2e_bodega server "token generate e2e-pepper-probe expiry 1d 'e2e pepper probe'" || true
+e2e_on server "stat -c '%U:%G %a' /etc/bodega/pepper 2>/dev/null || echo absent" || true
 pepper_state="$E2E_OUT"
 if [ "$pepper_state" = absent ]; then
-	e2e_skip ACC-06b "the service can read the pepper token generate wrote" \
-		"no /etc/bodega/pepper on this install"
+	e2e_skip ACC-06b "the service user can read the pepper token generate wrote" \
+		"token generate wrote no /etc/bodega/pepper on this install"
 else
 	e2e_on server "sudo -u ${E2E_SERVICE_USER:-bodega} test -r /etc/bodega/pepper && echo readable || echo unreadable" || true
 	check_eq ACC-06b "the service user can read the pepper token generate wrote" \
-		"readable" "$E2E_OUT" "internal/audit/pepper.go:17" "sudo -u ${E2E_SERVICE_USER:-bodega} test -r /etc/bodega/pepper"
+		"readable" "$E2E_OUT ($pepper_state)" "internal/audit/pepper.go:17" \
+		"rm /etc/bodega/pepper; sudo bodega token generate; sudo -u ${E2E_SERVICE_USER:-bodega} test -r /etc/bodega/pepper"
 fi
+e2e_bodega server "token revoke e2e-pepper-probe" >/dev/null 2>&1 || true
 
 # Repaired here rather than left broken, so the checks below measure the token
 # path instead of re-reporting the pepper. ACC-06b above is where the defect is
