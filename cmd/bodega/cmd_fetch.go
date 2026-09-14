@@ -22,9 +22,12 @@ func newFetchCmd(gf *globalFlags) *cobra.Command {
   git     Clone bare repository to repos/
   apt     Clone source repo (or apt-get download .deb) to sources/
   pypi    Resolve requirements from cloned git repos, write combined-requirements.txt
+  gomod   Download module zips to gomod/
+  helm    Download chart archives to charts/
+  npm     Download package tarballs to npm/
+  cargo   Download crate tarballs to cargo/
 
-If no types are given, all seven are fetched in dependency order:
-  binary → git → apt → pypi → gomod → helm → npm
+` + typeOrderSentence("fetched") + `
 
 Append 'force' to re-fetch even if artifacts already exist.
 When a name is given after the type, only that entry is fetched.`,

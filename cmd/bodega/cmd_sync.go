@@ -36,9 +36,9 @@ If no types are given all of them are synced.
 
 For the smart variant that runs missing pipeline stages before uploading,
 use 'upload' instead.`,
-		Example: `  bodega sync
-  bodega sync apt
-  bodega sync git pypi`,
+		Example: `  bodega build sync
+  bodega build sync apt
+  bodega build sync git pypi`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			types, err := resolveTypes(args)
 			if err != nil {

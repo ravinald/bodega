@@ -31,7 +31,7 @@ Creates the S3 bucket with server-side encryption (AES-256), versioning enabled,
 
 ### `bodega build fetch [TYPE...] [NAME]`
 
-Downloads raw sources without building or packaging. If no types are given, all types are fetched in dependency order: `binary → git → apt → pypi → gomod → helm → npm`.
+Downloads raw sources without building or packaging. If no types are given, all eight are fetched in dependency order: `binary, git, apt, pypi, gomod, helm, npm, cargo`.
 
 When a name is given after the type, only that entry is fetched.
 
@@ -2420,7 +2420,7 @@ Actually, the operations are more granular: fetch, build/run, sync, upload.
 
 **Stage cascading:** Each stage automatically runs its prerequisites if outputs are missing. Running `bodega build upload` on a fresh system will cascade through fetch and build stages first.
 
-**Build order:** `binary → git → apt → pypi → gomod → helm → npm`. This order reflects dependencies (e.g., pypi may reference git-cloned repos for its base requirements).
+**Build order:** `binary, git, apt, pypi, gomod, helm, npm, cargo`. This order reflects dependencies (e.g., pypi may reference git-cloned repos for its base requirements). It is `manifest.AllTypes`, and the three build subcommands render their help from it rather than restating it.
 
 **Per-entry failures** are logged but do not abort the run. A non-zero exit code is returned if any entry failed.
 
@@ -3555,7 +3555,7 @@ Git smart-HTTP mirrors are the one tree that is not a storage key. They are bare
 ```bash
 make check          # every job CI blocks on, cheapest leg first
 make build          # compile to ./dist/bodega
-make cross          # cross-compile for linux/amd64
+make cross          # cross-compile for every pair in CROSS_TARGETS (linux/amd64, linux/arm64)
 make test           # run tests with race detector
 make test-verbose   # verbose test output
 make bench          # run benchmarks

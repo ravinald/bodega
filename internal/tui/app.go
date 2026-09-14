@@ -1318,6 +1318,7 @@ var createTypeOptions = []string{
 	"Select...",
 	manifest.TypeApt,
 	manifest.TypeBinary,
+	manifest.TypeCargo,
 	manifest.TypeGit,
 	manifest.TypeGomod,
 	manifest.TypeHelm,
@@ -1710,6 +1711,38 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 				Hint: "skip URL reachability check"},
 		})
 
+	case manifest.TypeCargo:
+		modeVal := restore("Mode", "hosted")
+		isProxy := modeVal == "proxy"
+		constraintVal := prevLabelSelect["Version"]
+		if constraintVal == "" {
+			constraintVal = "exact (=)"
+		}
+		versionVal := restore("Version", "")
+		versionDisabled := false
+		if isProxy {
+			versionVal = ""
+			versionDisabled = true
+		}
+		checksumVal := restore("Checksum", "")
+		return restoreCursors([]formField{
+			typeField,
+			{Label: "Mode", Value: modeVal, Select: true,
+				Options: []string{"hosted", "proxy"},
+				Hint:    "hosted = S3 only; proxy = fetch from upstream on cache miss"},
+			{Label: "Name", Value: restore("Name", ""),
+				Hint: "crate name, e.g. serde or tokio"},
+			{Label: "Version", Value: versionVal, Disabled: versionDisabled,
+				LabelSelect: true, LabelSelectValue: constraintVal,
+				LabelSelectOptions: []string{"exact (=)", "compatible (^)", "patch (~)", "latest (*)"}},
+			{Label: "Source URL", Value: restore("Source URL", ""),
+				Hint: "sparse index URL; leave empty for index.crates.io"},
+			{Label: "Checksum", Value: checksumVal,
+				Hint: checksumHint(checksumVal)},
+			{Label: "Skip validation", Value: restore("Skip validation", "no"), Checkbox: true,
+				Hint: "skip URL reachability check"},
+		})
+
 	default: // manifest.TypeApt
 		aptMode := restore("Apt Mode", "Package Name")
 		buildFrom := restore("Build From", "Git repo")
@@ -1917,6 +1950,10 @@ func validateCreateFields(fields []formField) string {
 		if fieldValueFromSlice(fields, "Version") == "" {
 			return "Version is required for npm entries"
 		}
+	case manifest.TypeCargo:
+		if fieldValueFromSlice(fields, "Version") == "" {
+			return "Version is required for cargo entries"
+		}
 	}
 	// Block save if checksum is present but invalid.
 	chk := fieldValueFromSlice(fields, "Checksum")
@@ -1972,7 +2009,7 @@ func validateRemote(entryType string, fields []formField) string {
 		if url != "" {
 			return validateURLReachable(url)
 		}
-	case manifest.TypeNpm:
+	case manifest.TypeNpm, manifest.TypeCargo:
 		url := fieldValueFromSlice(fields, "Source URL")
 		if url != "" {
 			return validateURLReachable(url)
@@ -2161,7 +2198,7 @@ func saveCreateEntry(store *manifest.Store, fields []formField) error {
 	case manifest.TypeHelm:
 		ve.AppVersion = fieldValueFromSlice(fields, "App Version")
 
-	case manifest.TypeGomod, manifest.TypeNpm:
+	case manifest.TypeGomod, manifest.TypeNpm, manifest.TypeCargo:
 		// nothing extra
 
 	default:
@@ -2298,6 +2335,10 @@ func extractNameFromURL(rawURL, entryType string) string {
 		// npm: last segment or @scope/name
 		seg := lastURLSegment(rawURL)
 		return seg
+	case manifest.TypeCargo:
+		// The cargo Source URL is the sparse index root, which names no crate,
+		// so there is nothing to derive a name from. The Name field is required.
+		return ""
 	default:
 		seg := lastURLSegment(rawURL)
 		if seg == "" {

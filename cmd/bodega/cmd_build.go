@@ -21,13 +21,14 @@ func newBuildRunCmd(gf *globalFlags) *cobra.Command {
 		Long: `build compiles or prepares sources for the specified types. It automatically
 fetches sources first if they have not already been fetched.
 
-  binary  Download the file (fetch is the final artifact; no compilation)
-  git     Clone the bare repository if not already present
-  apt     Fetch source (if needed), then run build_cmd to produce a .deb
-  pypi    Resolve requirements (if needed), then run pip wheel
+  binary       Download the file (fetch is the final artifact; no compilation)
+  git          Clone the bare repository if not already present
+  apt          Fetch source (if needed), then run build_cmd to produce a .deb
+  pypi         Resolve requirements (if needed), then run pip wheel
+  gomod, helm  No build step: what fetch downloads is the artifact
+  npm, cargo   No build step: what fetch downloads is the artifact
 
-If no types are given, all four are processed in dependency order:
-  binary → git → apt → pypi
+` + typeOrderSentence("processed") + `
 
 When a name is given after the type, only that entry is built.`,
 		Example: `  bodega build run

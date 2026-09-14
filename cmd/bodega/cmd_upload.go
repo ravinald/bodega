@@ -29,9 +29,9 @@ that version records. pypi's wheels have no per-version object key, so they
 sync as a directory to the backend its type rule names.
 
 If no types are given all of them are uploaded.`,
-		Example: `  bodega upload
-  bodega upload apt
-  bodega upload git pypi`,
+		Example: `  bodega build upload
+  bodega build upload apt
+  bodega build upload git pypi`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			types, err := resolveTypes(args)
 			if err != nil {

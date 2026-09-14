@@ -421,7 +421,7 @@ func requireBucket(cfg *config.Config) error {
 	return nil
 }
 
-// isValidType returns true when t is one of the four known manifest types.
+// isValidType returns true when t is a known manifest type.
 func isValidType(t string) bool {
 	for _, known := range manifest.AllTypes {
 		if t == known {
@@ -431,6 +431,18 @@ func isValidType(t string) bool {
 	return false
 }
 
+// typeOrderSentence renders the default type order for a help screen from
+// manifest.AllTypes. Three build subcommands carried the order as prose and all
+// three were stale — two at four types, one at seven, against eight — because
+// nothing tied the sentence to the list it described.
+//
+// Commas rather than arrows: the line is read in a terminal, where "binary >
+// git" reads as a redirection.
+func typeOrderSentence(verb string) string {
+	return fmt.Sprintf("If no types are given, all %d are %s in dependency order:\n  %s",
+		len(manifest.AllTypes), verb, strings.Join(manifest.AllTypes, ", "))
+}
+
 // resolveTypes expands an empty slice to AllTypes and validates each entry.
 func resolveTypes(args []string) ([]string, error) {
 	if len(args) == 0 {
@@ -438,7 +450,7 @@ func resolveTypes(args []string) ([]string, error) {
 	}
 	for _, t := range args {
 		if !isValidType(t) {
-			return nil, fmt.Errorf("unknown type %q — must be one of: apt, git, pypi, binary", t)
+			return nil, fmt.Errorf("unknown type %q — must be one of: %s", t, strings.Join(manifest.AllTypes, ", "))
 		}
 	}
 	return args, nil

@@ -241,11 +241,13 @@ func writeBaseline(gf *globalFlags, name, description, origin, out string, pins 
 	for _, p := range found {
 		if !seenTypes[p.Type] {
 			seenTypes[p.Type] = true
+			// Expansion is deliberately unset: warn is what an absent value
+			// reads as, and writing it out would present the default as a
+			// posture somebody chose.
 			doc.Types = append(doc.Types, profileDocType{
 				Type:           p.Type,
 				Membership:     audit.MembershipClosed,
 				VersionDefault: audit.VersionFloating,
-				Expansion:      audit.ExpansionWarn,
 			})
 		}
 		entry := p.entryName()
