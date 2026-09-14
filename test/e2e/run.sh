@@ -225,6 +225,13 @@ export E2E_DRY_RUN E2E_DRY_PLAN
 printf 'bodega e2e  run=%s  commit=%s\n' "$E2E_RUN_ID" "$E2E_COMMIT"
 printf 'server=%s  client=%s\n\n' "$E2E_SERVER_HOST" "$E2E_CLIENT_HOST"
 
+# Defaults for a filtered run that skips 10-ship, which is what normally sets
+# these. A suite reading an empty base URL builds requests against "/healthz"
+# and reports a connection failure as a server defect.
+: "${E2E_BASE_URL:=http://$E2E_SERVER_HOST:8080}"
+: "${E2E_SERVICE_USER:=bodega}"
+export E2E_BASE_URL E2E_SERVICE_USER
+
 # ---- suite driver ----------------------------------------------------------
 
 # A suite that dies takes its own checks down, not the run. Every later suite
@@ -256,12 +263,21 @@ for suite_file in "$E2E_DIR"/suites/*.sh; do
 		continue
 	fi
 
-	if [ -n "$SUITE_FILTER" ]; then
-		case "$suite" in
-		"$SUITE_FILTER"*) ;;
-		*) continue ;;
-		esac
-	fi
+	# 00-preflight is a prerequisite, not a suite you can filter away. It sets
+	# the reachability flags every other suite reads, so skipping it turns a
+	# filtered run into a wall of BLOCKED and a filter typo into a run that
+	# measures nothing.
+	case "$suite" in
+	00-*) ;;
+	*)
+		if [ -n "$SUITE_FILTER" ]; then
+			case "$suite" in
+			"$SUITE_FILTER"*) ;;
+			*) continue ;;
+			esac
+		fi
+		;;
+	esac
 
 	E2E_SUITE="$suite"
 	E2E_HOST="local"
