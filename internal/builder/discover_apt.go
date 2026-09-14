@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/ravinald/bodega/internal/deb822"
+	"github.com/ravinald/bodega/internal/hostpkg"
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
@@ -434,11 +435,16 @@ func FetchAptMetadata(pkgName string) *manifest.VersionEntry {
 	if err != nil || len(out) == 0 {
 		return nil
 	}
-	return parseAptShowOutput(string(out), pkgName)
+	return parseAptShowOutput(string(out), pkgName, hostpkg.LocalAptSuite())
 }
 
 // parseAptShowOutput parses the output of `apt-cache show` into a VersionEntry.
-// Extracts Version, Description, Architecture, and all other fields into Metadata.
+// Extracts Version, Description, Architecture, and all other fields into
+// Metadata, and stamps the release the caller resolved.
+//
+// The suite is a parameter rather than read here: the empty answer is the only
+// one reachable off Linux, so a test on a macOS workstation could not tell a
+// release that was recorded from one that was never resolved.
 //
 // Sample output:
 //
@@ -452,14 +458,26 @@ func FetchAptMetadata(pkgName string) *manifest.VersionEntry {
 //	Description: interactive high-level object-oriented language (default version)
 //	 Python, the high-level, interactive object oriented language,
 //	 includes an extensive class library with lots of goodies.
-func parseAptShowOutput(output, pkgName string) *manifest.VersionEntry {
+func parseAptShowOutput(output, pkgName, suite string) *manifest.VersionEntry {
 	// apt prints Source: only when the source package differs from the binary
 	// one, so its absence in a stanza is the statement that the two are equal
 	// rather than a field nobody captured. Default accordingly, and the OSV
 	// gate reads a name this path confirmed rather than warning on it.
+	// CaptureSuite, not Suites: this entry's version string was resolved
+	// against this host's apt sources, so the release it came from is this
+	// host's. Suites decides which dists/<suite>/ the entry publishes to, and
+	// a server whose apt_codename is a house name serves no suite this host
+	// could have named — writing the release there would take the entry out of
+	// every generated index.
+	//
+	// Empty off Linux, which records none rather than guessing. F14 bounded
+	// the apt_codename fallback for exactly this entry: on a bodega serving two
+	// releases, an entry naming no release now warns instead of being answered
+	// from a codename that may be the other one.
 	ve := &manifest.VersionEntry{
 		SourceName:    pkgName,
 		SourcePackage: pkgName,
+		CaptureSuite:  suite,
 		Metadata:      make(map[string]string),
 	}
 
@@ -573,6 +591,9 @@ func ResolveAndCreateConcreteVersion(ctx context.Context, store *manifest.Store,
 						if existing.Platform == "" && fresh.Platform != "" {
 							pm.Versions[i].Platform = fresh.Platform
 						}
+						if existing.CaptureSuite == "" && fresh.CaptureSuite != "" {
+							pm.Versions[i].CaptureSuite = fresh.CaptureSuite
+						}
 						_ = store.SavePackage(ctx, pm)
 						_, _ = fmt.Fprintf(out, "  [apt] %s@%s: backfilled metadata\n", pkgName, version)
 					}
@@ -624,6 +645,12 @@ func ResolveAndCreateConcreteVersion(ctx context.Context, store *manifest.Store,
 // fillResolvedVersion writes resolved onto the first version-less entry for
 // pkgName, preserving anything the operator set that the upstream fetch does
 // not carry. Reports whether such an entry existed.
+//
+// The field list is hand-maintained and has gone stale once already:
+// CaptureSuite reached FetchAptMetadata and stopped here, so `pkg create apt`
+// wrote an entry carrying the source package and no release. Anything the
+// resolver learns from apt and the operator cannot type belongs on this list;
+// TestResolvedFieldsReachThePlaceholder is what notices the next one.
 func fillResolvedVersion(ctx context.Context, store *manifest.Store, pkgName string, resolved *manifest.VersionEntry) bool {
 	pm, err := store.GetPackage(ctx, manifest.TypeApt, pkgName)
 	if err != nil || pm == nil {
@@ -640,6 +667,9 @@ func fillResolvedVersion(ctx context.Context, store *manifest.Store, pkgName str
 		}
 		if resolved.SourcePackage != "" {
 			merged.SourcePackage = resolved.SourcePackage
+		}
+		if resolved.CaptureSuite != "" {
+			merged.CaptureSuite = resolved.CaptureSuite
 		}
 		if resolved.ArtifactSize > 0 {
 			merged.ArtifactSize = resolved.ArtifactSize

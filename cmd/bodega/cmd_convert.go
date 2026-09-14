@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -188,29 +187,13 @@ func resolveAptSuite(flag, osRelease string) (suite, why string) {
 	return "", "no --suite, and " + osRelease + " names no VERSION_CODENAME"
 }
 
-// osReleasePath is where a Linux host names its release. Absent everywhere
-// else, which is the case the empty answer covers.
-const osReleasePath = "/etc/os-release"
+// osReleasePath and osReleaseCodename name the release this host runs. They
+// live in internal/hostpkg beside ParseAptWithSuite, because every writer of
+// CaptureSuite has to get the same answer from the same place and the create
+// paths cannot import cmd.
+const osReleasePath = hostpkg.OSReleasePath
 
-// osReleaseCodename reads VERSION_CODENAME out of an os-release file. Empty
-// covers every way that can fail: no file (convert run on a Mac), or a distro
-// that publishes no codename at all, which is most of them outside Debian.
-func osReleaseCodename(path string) string {
-	f, err := os.Open(path)
-	if err != nil {
-		return ""
-	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		key, val, ok := strings.Cut(strings.TrimSpace(sc.Text()), "=")
-		if !ok || key != "VERSION_CODENAME" {
-			continue
-		}
-		return strings.TrimSpace(strings.Trim(strings.TrimSpace(val), `"'`))
-	}
-	return ""
-}
+func osReleaseCodename(path string) string { return hostpkg.OSReleaseCodename(path) }
 
 // resolveOrigin names the host an inventory came from. Convert runs on the
 // machine being cataloged in the common case, so the hostname is right without
