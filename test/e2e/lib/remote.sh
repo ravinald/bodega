@@ -86,8 +86,13 @@ e2e_on() {
 	local opts=()
 	while IFS= read -r o; do opts+=("$o"); done < <(e2e_ssh_opts "$host")
 
+	# pipefail on the guest, always. Without it `cmd | tail -5` reports tail's
+	# exit code, so a client that 404s and a client that succeeds are both rc 0:
+	# npm failing to find a package read as a pass until this landed. Suites
+	# pipe constantly, to trim output and to parse it, so the fix belongs here
+	# rather than at several dozen call sites.
 	set +e
-	timeout "${E2E_SSH_TIMEOUT:-300}" ssh "${opts[@]}" -- "$@" >"$outf" 2>"$errf"
+	timeout "${E2E_SSH_TIMEOUT:-300}" ssh "${opts[@]}" -- "set -o pipefail; $*" >"$outf" 2>"$errf"
 	E2E_RC=$?
 	set -e
 

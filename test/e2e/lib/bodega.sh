@@ -88,3 +88,18 @@ e2e_reset_store() {
 		sudo chown -R ${E2E_SERVICE_USER:-bodega} /var/lib/bodega; \
 		sudo systemctl start bodega"
 }
+
+# e2e_apt_version — the guest's candidate version for the apt fixture, resolved
+# once and cached in E2E_APT_VERSION.
+#
+# Read from the guest rather than pinned in a fixture: an apt version is a
+# property of the suite the guest tracks, and a constant goes stale at the next
+# point release and fails as "no candidate", which reads as a bodega defect.
+e2e_apt_version() {
+	if [ -z "${E2E_APT_VERSION:-}" ]; then
+		e2e_on server "apt-cache policy hello | awk '/Candidate:/{print \$2}'" || true
+		E2E_APT_VERSION="$E2E_OUT"
+		export E2E_APT_VERSION
+	fi
+	printf '%s' "$E2E_APT_VERSION"
+}

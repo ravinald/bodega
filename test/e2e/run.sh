@@ -230,7 +230,11 @@ printf 'server=%s  client=%s\n\n' "$E2E_SERVER_HOST" "$E2E_CLIENT_HOST"
 # and reports a connection failure as a server defect.
 : "${E2E_BASE_URL:=http://$E2E_SERVER_HOST:8080}"
 : "${E2E_SERVICE_USER:=bodega}"
-export E2E_BASE_URL E2E_SERVICE_USER
+# Declared empty rather than left unset: the suites run under `set -u`, so a
+# value one suite produces and another reads aborts the reader when the
+# producer was filtered out, and an aborted suite reports no verdicts at all.
+: "${E2E_APT_VERSION:=}"
+export E2E_BASE_URL E2E_SERVICE_USER E2E_APT_VERSION
 
 # ---- suite driver ----------------------------------------------------------
 

@@ -30,6 +30,8 @@ e2e_restart server || true
 check_eq SRV-01 "the server restarts with proxy caching off" 0 "$E2E_RC" \
 	"internal/server/proxy.go:281" "systemctl restart bodega" "$E2E_RC"
 
+e2e_apt_version >/dev/null
+
 E2E_HOST=client
 
 # ---- index routes ----------------------------------------------------------

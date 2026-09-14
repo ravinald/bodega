@@ -36,9 +36,7 @@ e2e_restart server || true
 # The apt version is a property of the suite the guest tracks, so it is read
 # rather than pinned. A constant goes stale at the next point release and fails
 # as "no candidate", which reads as a bodega defect.
-e2e_on server "apt-cache policy hello | awk '/Candidate:/{print \$2}'" || true
-E2E_APT_VERSION="$E2E_OUT"
-export E2E_APT_VERSION
+e2e_apt_version >/dev/null
 check_matches PIPE-01 "the guest offers an apt candidate for the fixture" \
 	'^[0-9]' "${E2E_APT_VERSION:-none}" "docs-internal/DEV_HOSTS.md" "apt-cache policy hello"
 
