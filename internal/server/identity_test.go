@@ -569,3 +569,80 @@ func TestACIDRBindingResolvesAConnectionAndNotAForgedHeader(t *testing.T) {
 		}
 	})
 }
+
+// A reload is not instantaneous from a request's point of view: RealIPMiddleware
+// decides whether to believe a header, and IdentityMiddleware runs after it.
+// Both must answer to the same trusted set, or an operator narrowing
+// trusted_proxies hands the in-flight request a decision made under the old set
+// and a verdict made under the new one. The peer excluded by the reload is the
+// one that collects an identity it was never granted.
+func TestCIDRForwardedTrustUsesRealIPSnapshot(t *testing.T) {
+	ctx := context.Background()
+
+	// serve drives the two middlewares in handler()'s order with an ACL
+	// refresh wedged between them, which is where a SIGHUP can land.
+	serve := func(t *testing.T, s *Server, remote, realIP string, betweenACLs []string) string {
+		t.Helper()
+		var h http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Seen-Identity", Identity(r))
+		})
+		h = IdentityMiddleware(s.identityFunc())(h)
+		reloadBetween := func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if _, err := s.auditDB.SeedACL(ctx, audit.ACLProxies, betweenACLs, "ravi"); err != nil {
+					t.Errorf("seed proxies mid-chain: %v", err)
+				}
+				s.refreshACLs(ctx)
+				next.ServeHTTP(w, r)
+			})
+		}
+		h = reloadBetween(h)
+		h = RealIPMiddleware(s.trustedNetsFunc())(h)
+		req := httptest.NewRequest(http.MethodGet, "/cargo/config.json", nil)
+		req.RemoteAddr = remote
+		req.Header.Set("X-Real-IP", realIP)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Header().Get("X-Seen-Identity")
+	}
+
+	bound := func(t *testing.T, seed []string) *Server {
+		t.Helper()
+		s := newACLServer(t, &config.Config{AllowPlaintext: true})
+		s.pepper = testPepper
+		if _, err := s.auditDB.AddIdentityBinding(ctx, audit.IdentityBinding{
+			Kind: audit.BindCIDR, Key: "10.20.0.0/16", Identity: "devbox",
+		}); err != nil {
+			t.Fatalf("bind cidr: %v", err)
+		}
+		if seed != nil {
+			if _, err := s.auditDB.SeedACL(ctx, audit.ACLProxies, seed, "ravi"); err != nil {
+				t.Fatalf("seed proxies: %v", err)
+			}
+		}
+		s.refreshACLs(ctx)
+		s.refreshIdentities(ctx)
+		return s
+	}
+
+	// The header was believed under the built-in default, and the reload
+	// excludes the peer that sent it. The answer belongs to the snapshot the
+	// header was read against, so this peer names nobody.
+	t.Run("a reload excluding the peer does not bless a header already read", func(t *testing.T) {
+		s := bound(t, nil)
+		if id := serve(t, s, "10.99.0.1:5000", "10.20.0.9", []string{"192.168.50.0/24"}); id != "" {
+			t.Fatalf("resolved %q from a header believed under the built-in default; 10.99.0.1 is not a configured proxy", id)
+		}
+	})
+
+	// The inverse transition, so the assertion is about the snapshot rather
+	// than about one direction of change: the peer was a named proxy when its
+	// header was read, and a reload that drops trusted_proxies afterwards does
+	// not retract that.
+	t.Run("a reload after the header was read does not retract the proxy", func(t *testing.T) {
+		s := bound(t, []string{"10.99.0.0/16"})
+		if id := serve(t, s, "10.99.0.1:5000", "10.20.0.9", nil); id != "devbox" {
+			t.Fatalf("resolved %q, want devbox: the header was read while this peer was a named proxy", id)
+		}
+	})
+}

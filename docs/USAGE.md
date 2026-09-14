@@ -724,6 +724,8 @@ Where that address came from decides whether it may name a host:
 
 An address read off the connection is whatever completed a TCP handshake, and nothing a client writes changes it. A header is whatever the peer chose to write. The built-in default trusts loopback plus RFC 1918, and bodega returns `X-Real-IP` verbatim from any peer in that set, so on a default-configured instance any RFC 1918 peer could claim an address inside a bound network and collect that identity. That forgery is what the gate refuses, and it refuses it per request rather than refusing the whole binding.
 
+A request is judged against the list in force when its header was read, not the list in force when the identity is resolved. So an `acl proxies add` or a SIGHUP landing mid-request neither grants nor retracts an identity for a request already in flight; the change applies from the next one.
+
 So a bodega that clients reach directly needs nothing configured: `bodega identity bind cidr` works the moment it returns. One behind a proxy needs `trusted_proxies` answered, either way:
 
 - `bodega acl proxies add <cidr>` names the proxy that terminates for your clients and claims the list for the database, which is what ends the built-in default. It is picked up within the cache TTL, with no restart.

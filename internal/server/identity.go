@@ -317,7 +317,7 @@ func (s *Server) identityFunc() func(*http.Request) string {
 			return ""
 		}
 		cred, _ := credentialFrom(r)
-		return set.resolve(cred, ClientIP(r), s.pepper, time.Now(), s.cidrAddressTrusted(r))
+		return set.resolve(cred, ClientIP(r), s.pepper, time.Now(), cidrAddressTrusted(r))
 	}
 }
 
@@ -336,9 +336,15 @@ func (s *Server) identityFunc() func(*http.Request) string {
 // names a host, because refusing it would make CIDR bindings inert on every
 // install that never put a proxy in front of bodega — the read-only hosts the
 // binding kind exists for.
-func (s *Server) cidrAddressTrusted(r *http.Request) bool {
+//
+// Both halves come from the one snapshot RealIPMiddleware took. Re-reading the
+// ACL set here instead would let a reload arriving between the two middlewares
+// answer "was the proxy named" for a header this request had already believed
+// under the old set, and an excluded peer would collect the identity with
+// nothing logged.
+func cidrAddressTrusted(r *http.Request) bool {
 	if !clientIPForwarded(r) {
 		return true
 	}
-	return s.aclNow().trustedSet
+	return trustedNetsConfigured(r)
 }

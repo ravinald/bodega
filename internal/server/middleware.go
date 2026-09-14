@@ -26,6 +26,7 @@ const (
 	clientIPKey contextKey = iota
 	clientIPForwardedKey
 	trustedNetsKey
+	trustedNetsConfiguredKey
 	identityKey
 )
 
@@ -71,6 +72,7 @@ func RealIPMiddleware(trusted NetsFunc) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			trustedNets := trusted.nets()
+			configured := trustedNets != nil
 			if trustedNets == nil {
 				trustedNets = defaultTrustedNets()
 			}
@@ -86,6 +88,11 @@ func RealIPMiddleware(trusted NetsFunc) func(http.Handler) http.Handler {
 			// operator who narrowed trusted_proxies still has X-Forwarded-Proto
 			// believed from a peer they excluded.
 			ctx = context.WithValue(ctx, trustedNetsKey, trustedNets)
+			// The provenance gate reads this rather than the ACL set, so a
+			// reload landing between the two middlewares cannot join this
+			// request's header decision to a configuration that arrived after
+			// it. See cidrAddressTrusted.
+			ctx = context.WithValue(ctx, trustedNetsConfiguredKey, configured)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
@@ -147,6 +154,14 @@ func resolveClientIP(r *http.Request, trusted []*net.IPNet) (string, bool) {
 func clientIPForwarded(r *http.Request) bool {
 	forwarded, _ := r.Context().Value(clientIPForwardedKey).(bool)
 	return forwarded
+}
+
+// trustedNetsConfigured reports whether the set RealIPMiddleware believed this
+// request's header against was the operator's answer to trusted_proxies rather
+// than the built-in default. False when the middleware never ran.
+func trustedNetsConfigured(r *http.Request) bool {
+	configured, _ := r.Context().Value(trustedNetsConfiguredKey).(bool)
+	return configured
 }
 
 func isTrusted(ip net.IP, nets []*net.IPNet) bool {
