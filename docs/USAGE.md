@@ -2517,6 +2517,23 @@ bodega rewrites every `dist.tarball` in a packument onto its own `/npm/` route b
 
 The scheme and host it rewrites to come from [`public_url`](#configuration), or from the request when no `public_url` is set. The cached object is still the document the registry served: the rewrite happens on the way out, so a cache hit and a cache miss hand the client the same URLs and the stored copy remains evidence of what upstream published.
 
+A package a `hosted` entry names is answered from the manifest instead, with no upstream in the path: every version the entry records, each `dist.tarball` on this server's `/npm/` route, `dist.integrity` wherever a sha256 was recorded, and `dist-tags.latest` naming the highest version left after the hidden-version, constraint and profile filters have run. So `npm install --registry` works with `proxy_cache_enabled` false and no route to `registry.npmjs.org`. A package no entry names is still proxied, and so is a `proxy`-mode entry: its manifest lists the versions somebody pinned rather than the versions the registry publishes, and a document generated from it would hide the rest.
+
+**Gap:** a generated packument carries no `dependencies`. bodega records none for an npm version, so npm resolves a hosted package as having none and installs none. A package with dependencies needs each of them named in the consuming `package.json`, where npm resolves them as top-level entries in their own right.
+
+**cargo** (`.cargo/config.toml`, since a sparse registry is named in a file rather than on the command line):
+```toml
+[source.crates-io]
+replace-with = "bodega"
+
+[source.bodega]
+registry = "sparse+https://bodega-host:8080/cargo/"
+```
+
+A crate a `hosted` entry names gets the same treatment as npm: the sparse-index document is generated from the manifest, one JSON object per line, filtered the same three ways. `cksum` carries the sha256 `bodega build fetch` recorded, or the digest of the stored crate for an entry that arrived without one. A version whose checksum cannot be established is left out rather than published with an empty one — cargo reports a `cksum` mismatch as a corrupt download, which sends whoever hits it to their disk rather than to this registry.
+
+**Gap:** a generated index line declares `deps: []`. bodega records no cargo dependency metadata, so cargo fetches none and a hosted crate that needs one fails to compile. Hosting a crate with dependencies waits on the index line carrying them.
+
 **git** (a `git_upstreams` namespace, clone URL ending in `.git`):
 ```bash
 git clone https://bodega-host:8080/git/github/octocat/Hello-World.git
