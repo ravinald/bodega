@@ -18,8 +18,8 @@ func newFreezeCmd(gf *globalFlags) *cobra.Command {
 
 A frozen entry cannot be built, edited, or deleted. Running freeze on an
 already-frozen entry unfreezes it.`,
-		Example: `  bodega freeze binary awscli-v2
-  bodega freeze git netbox`,
+		Example: `  bodega pkg freeze binary awscli-v2
+  bodega pkg freeze git netbox`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			t, name := args[0], args[1]

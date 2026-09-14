@@ -26,8 +26,8 @@ func newDeleteCmd(gf *globalFlags) *cobra.Command {
 Use --remove-artifacts to also delete the entry's artifact bytes from the
 storage backend each version's record names.
 Frozen entries cannot be deleted; unfreeze them first with 'bodega freeze'.`,
-		Example: `  bodega delete git netbox
-  bodega delete binary awscli-v2 --remove-artifacts`,
+		Example: `  bodega pkg delete git netbox
+  bodega pkg delete binary awscli-v2 --remove-artifacts`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			t, name := args[0], args[1]

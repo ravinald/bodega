@@ -94,7 +94,6 @@ type Config struct {
 	LogDir            string   `json:"log_dir"`
 	LogWindowHeight   int      `json:"logwindow_height"`
 	LogLevel          int      `json:"log_level"` // --log-level and $BODEGA_LOG_LEVEL are resolved by the caller, not by Load
-	CustomPaths       bool     `json:"custom_paths"`
 	AptRoot           string   `json:"apt_root,omitempty"`
 	GitRoot           string   `json:"git_root,omitempty"`
 	PypiRoot          string   `json:"pypi_root,omitempty"`
@@ -556,48 +555,6 @@ type StorageSpec struct {
 // links internal/storage has no drivers for a backend name to collide with,
 // which makes the check below vacuous rather than wrong.
 var StorageDrivers = func() []string { return nil }
-
-// RootForType returns the effective build root for a given source type.
-func (c *Config) RootForType(typ string) string {
-	if !c.CustomPaths {
-		return c.BuildRoot
-	}
-	switch typ {
-	case "apt":
-		if c.AptRoot != "" {
-			return c.AptRoot
-		}
-	case "git":
-		if c.GitRoot != "" {
-			return c.GitRoot
-		}
-	case "pypi":
-		if c.PypiRoot != "" {
-			return c.PypiRoot
-		}
-	case "binary":
-		if c.BinaryRoot != "" {
-			return c.BinaryRoot
-		}
-	case "gomod":
-		if c.GomodRoot != "" {
-			return c.GomodRoot
-		}
-	case "helm":
-		if c.HelmRoot != "" {
-			return c.HelmRoot
-		}
-	case "npm":
-		if c.NpmRoot != "" {
-			return c.NpmRoot
-		}
-	case "cargo":
-		if c.CargoRoot != "" {
-			return c.CargoRoot
-		}
-	}
-	return c.BuildRoot
-}
 
 // ResolveSpoolDir names the directory the proxy copies an upstream artifact
 // through on its way to storage and the client: spool_dir, else
@@ -1152,7 +1109,7 @@ func (c *Config) Save() (string, error) {
 // pinned when the key was never touched. An empty list means the file on disk
 // already said what the Config says.
 func (c *Config) SaveReport() (string, []string, error) {
-	data, changed, err := c.marshalForFile()
+	data, changed, written, order, err := c.marshalForFile()
 	if err != nil {
 		return "", nil, err
 	}
@@ -1167,6 +1124,22 @@ func (c *Config) SaveReport() (string, []string, error) {
 	}
 	if c.snapshot != nil {
 		c.snapshot.cleared = nil
+		// The snapshot becomes what is now on disk, so the next save answers
+		// "what did this write change" rather than "what differs from the file
+		// at startup". Without it every save after the first re-reports the
+		// same keys, and the "nothing to save" line is unreachable for the rest
+		// of the session once any key has moved.
+		//
+		// resolved stays where it is: it records what flags and environment
+		// resolved to at startup, which a save does not change. pinned is
+		// dropped because this write consumed those pins — a key Pin marked is
+		// written whether or not it differs, and marking it again for the next
+		// save would re-report it forever.
+		if written != nil {
+			c.snapshot.raw = written
+			c.snapshot.order = order
+		}
+		c.snapshot.pinned = nil
 	}
 	return path, changed, nil
 }
@@ -1193,18 +1166,18 @@ func (c *Config) SaveReport() (string, []string, error) {
 //
 // The second return names the keys whose bytes in the file changed, so a caller
 // can report what it wrote rather than that it wrote.
-func (c *Config) marshalForFile() ([]byte, []string, error) {
+func (c *Config) marshalForFile() ([]byte, []string, map[string]json.RawMessage, []string, error) {
 	if c.snapshot == nil {
 		data, err := json.MarshalIndent(c, "", "  ")
 		if err != nil {
-			return nil, nil, fmt.Errorf("marshal config: %w", err)
+			return nil, nil, nil, nil, fmt.Errorf("marshal config: %w", err)
 		}
-		return append(data, '\n'), nil, nil
+		return append(data, '\n'), nil, nil, nil, nil
 	}
 
 	current, err := marshalKeys(c)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 
 	// Values from the file are re-emitted byte for byte, so a key an operator
@@ -1220,7 +1193,7 @@ func (c *Config) marshalForFile() ([]byte, []string, error) {
 		}
 		indented, err := indentValue(v)
 		if err != nil {
-			return nil, nil, fmt.Errorf("marshal config key %q: %w", k, err)
+			return nil, nil, nil, nil, fmt.Errorf("marshal config key %q: %w", k, err)
 		}
 		out[k] = indented
 	}
@@ -1248,7 +1221,7 @@ func (c *Config) marshalForFile() ([]byte, []string, error) {
 		}
 		indented, err := indentValue(v)
 		if err != nil {
-			return nil, nil, fmt.Errorf("marshal config key %q: %w", replacement, err)
+			return nil, nil, nil, nil, fmt.Errorf("marshal config key %q: %w", replacement, err)
 		}
 		out[replacement] = indented
 		order = append(order, replacement)
@@ -1256,9 +1229,9 @@ func (c *Config) marshalForFile() ([]byte, []string, error) {
 
 	data, err := encodeOrdered(out, order, c.snapshot.spaced)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
-	return data, changedKeys(c.snapshot.raw, out), nil
+	return data, changedKeys(c.snapshot.raw, out), out, order, nil
 }
 
 // changedKeys names the top-level keys whose value the write altered, sorted.
@@ -1479,7 +1452,6 @@ func defaultConfigContent() []byte {
   "log_dir": "/var/log/bodega",
   "logwindow_height": 12,
   "log_level": 0,
-  "custom_paths": false,
   "apt_root": "",
   "git_root": "",
   "pypi_root": "",

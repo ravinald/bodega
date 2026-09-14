@@ -45,11 +45,17 @@ type OSVState struct {
 // accepts the known vulnerabilities in that version for the life of the pin,
 // and what to do about them belongs to the tool that tracks remediation.
 type Pin struct {
-	Profile     string     `json:"profile"`
-	Type        string     `json:"type"`
-	Name        string     `json:"name"`
-	Version     string     `json:"version"`
-	Reason      string     `json:"reason"`
+	Profile string `json:"profile"`
+	Type    string `json:"type"`
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	Reason  string `json:"reason"`
+	// Actor is who decided this pin, paired with PinnedAt. It is not the
+	// entry's last writer: audit.ProfileEntry.Actor is reassigned on every
+	// write, so a second operator correcting a typo in a reason took the
+	// byline while the date stayed with the original decision, and the row
+	// then named one person beside another person's date. The other profile
+	// commands still report the last writer, which is what they mean by it.
 	Actor       string     `json:"actor,omitempty"`
 	PinnedAt    *time.Time `json:"pinned_at,omitempty"`
 	ReviewAfter string     `json:"review_after,omitempty"`
@@ -118,7 +124,7 @@ func Stale(all []Pin) []Pin {
 func pinFor(ctx context.Context, store *manifest.Store, e audit.ProfileEntry, now time.Time) (Pin, error) {
 	p := Pin{
 		Profile: e.Profile, Type: e.Type, Name: e.Name, Version: e.Version,
-		Reason: e.Reason, Actor: e.Actor, ReviewAfter: e.ReviewAfter,
+		Reason: e.Reason, Actor: e.PinDecidedBy(), ReviewAfter: e.ReviewAfter,
 		OSV: OSVState{State: OSVUnchecked},
 	}
 	if at := e.PinDecidedAt(); !at.IsZero() {
@@ -206,14 +212,17 @@ func ParseReviewDate(s string) (time.Time, bool) {
 // Stored unvalidated, "next quarter" is a pin that never comes due: --stale is
 // a CI gate, and a date it cannot parse is silently not overdue forever, which
 // is the exact failure the review date exists to prevent.
-func ValidateReviewDate(s string) error {
+// The label names where the value came from, because the same check guards a
+// command-line flag and a key in a --from-file document, and an error naming
+// --review-after for a value nobody typed sends the reader to the wrong place.
+func ValidateReviewDate(label, s string) error {
 	if s == "" {
 		return nil
 	}
 	if _, ok := ParseReviewDate(s); !ok {
-		return fmt.Errorf("--review-after %q is not a date: write it as YYYY-MM-DD, for example %s.\n"+
+		return fmt.Errorf("%s %q is not a date: write it as YYYY-MM-DD, for example %s.\n"+
 			"  A date nothing can parse is a pin that is never overdue, so 'bodega profile pins --stale' would pass on it forever",
-			s, time.Now().UTC().AddDate(0, 6, 0).Format(ReviewDateLayout))
+			label, s, time.Now().UTC().AddDate(0, 6, 0).Format(ReviewDateLayout))
 	}
 	return nil
 }

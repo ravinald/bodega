@@ -25,6 +25,7 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/hostpkg"
 	"github.com/ravinald/bodega/internal/inventory"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
@@ -356,7 +357,6 @@ func (m appModel) handlePopupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.cfg.ManifestDir = config.DefaultManifestDir(m.cfg.StoragePath)
 					m.cfg.LogDir = config.DefaultLogDir
 					m.cfg.LogWindowHeight = config.DefaultLogWindowHeight
-					m.cfg.CustomPaths = false
 					m.cfg.AptRoot = ""
 					m.cfg.GitRoot = ""
 					m.cfg.PypiRoot = ""
@@ -551,23 +551,19 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "C":
-		customVal := "no"
-		if m.cfg.CustomPaths {
-			customVal = "yes"
-		}
+		// The per-type roots are shown unconditionally. custom_paths used to
+		// hide them and gated nothing: builder.rootFor reads each root
+		// directly, so a root left in the file stayed in force while the form
+		// stopped showing the value that was still deciding where artifacts
+		// land.
 		fields := []formField{
 			{Label: "Bucket", Value: m.cfg.Bucket},
 			{Label: "Region", Value: m.cfg.Region},
 			{Label: "Build root", Value: m.cfg.BuildRoot},
-			{Label: "Custom paths", Checkbox: true, Value: customVal},
-		}
-		if m.cfg.CustomPaths {
-			fields = append(fields,
-				formField{Label: "APT root", Value: m.cfg.AptRoot},
-				formField{Label: "Git root", Value: m.cfg.GitRoot},
-				formField{Label: "PyPI root", Value: m.cfg.PypiRoot},
-				formField{Label: "Binary root", Value: m.cfg.BinaryRoot},
-			)
+			{Label: "APT root", Value: m.cfg.AptRoot},
+			{Label: "Git root", Value: m.cfg.GitRoot},
+			{Label: "PyPI root", Value: m.cfg.PypiRoot},
+			{Label: "Binary root", Value: m.cfg.BinaryRoot},
 		}
 		fields = append(fields,
 			formField{Label: "Manifest dir", Value: m.cfg.ManifestDir},
@@ -623,7 +619,6 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 						cfgRef.LogWindowHeight = v
 					}
 				}
-				cfgRef.CustomPaths = fieldValue(fields, "Custom paths") == "yes"
 				cfgRef.AptRoot = fieldValue(fields, "APT root")
 				cfgRef.GitRoot = fieldValue(fields, "Git root")
 				cfgRef.PypiRoot = fieldValue(fields, "PyPI root")
@@ -1139,7 +1134,6 @@ var configFormKeys = map[string]string{
 	"Manifest dir":      "manifest_dir",
 	"Log dir":           "log_dir",
 	"Log window height": "logwindow_height",
-	"Custom paths":      "custom_paths",
 	"APT root":          "apt_root",
 	"Git root":          "git_root",
 	"PyPI root":         "pypi_root",
@@ -1318,6 +1312,7 @@ var createTypeOptions = []string{
 	"Select...",
 	manifest.TypeApt,
 	manifest.TypeBinary,
+	manifest.TypeCargo,
 	manifest.TypeGit,
 	manifest.TypeGomod,
 	manifest.TypeHelm,
@@ -1710,6 +1705,38 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 				Hint: "skip URL reachability check"},
 		})
 
+	case manifest.TypeCargo:
+		modeVal := restore("Mode", "hosted")
+		isProxy := modeVal == "proxy"
+		constraintVal := prevLabelSelect["Version"]
+		if constraintVal == "" {
+			constraintVal = "exact (=)"
+		}
+		versionVal := restore("Version", "")
+		versionDisabled := false
+		if isProxy {
+			versionVal = ""
+			versionDisabled = true
+		}
+		checksumVal := restore("Checksum", "")
+		return restoreCursors([]formField{
+			typeField,
+			{Label: "Mode", Value: modeVal, Select: true,
+				Options: []string{"hosted", "proxy"},
+				Hint:    "hosted = S3 only; proxy = fetch from upstream on cache miss"},
+			{Label: "Name", Value: restore("Name", ""),
+				Hint: "crate name, e.g. serde or tokio"},
+			{Label: "Version", Value: versionVal, Disabled: versionDisabled,
+				LabelSelect: true, LabelSelectValue: constraintVal,
+				LabelSelectOptions: []string{"exact (=)", "compatible (^)", "patch (~)", "latest (*)"}},
+			{Label: "Source URL", Value: restore("Source URL", ""),
+				Hint: "sparse index URL; leave empty for index.crates.io"},
+			{Label: "Checksum", Value: checksumVal,
+				Hint: checksumHint(checksumVal)},
+			{Label: "Skip validation", Value: restore("Skip validation", "no"), Checkbox: true,
+				Hint: "skip URL reachability check"},
+		})
+
 	default: // manifest.TypeApt
 		aptMode := restore("Apt Mode", "Package Name")
 		buildFrom := restore("Build From", "Git repo")
@@ -1762,6 +1789,10 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 			{Label: "Deb Glob", Value: restore("Deb Glob", ""),
 				Disabled: !isSourceBuild,
 				Hint:     "glob pattern to find .deb after build"},
+			{Label: "Source Package", Value: restore("Source Package", ""),
+				Hint: "Debian source package; Ubuntu and Debian advisories are keyed on it, not on the binary name"},
+			{Label: "Capture Suite", Value: restore("Capture Suite", hostpkg.LocalAptSuite()),
+				Hint: "release this version came from; blank records none rather than guessing"},
 			{Label: "Include Deps", Value: restore("Include Deps", "None"), Select: true,
 				Disabled: !isPkgName,
 				Options:  []string{"None", "Direct", "Transitive"},
@@ -1917,6 +1948,10 @@ func validateCreateFields(fields []formField) string {
 		if fieldValueFromSlice(fields, "Version") == "" {
 			return "Version is required for npm entries"
 		}
+	case manifest.TypeCargo:
+		if fieldValueFromSlice(fields, "Version") == "" {
+			return "Version is required for cargo entries"
+		}
 	}
 	// Block save if checksum is present but invalid.
 	chk := fieldValueFromSlice(fields, "Checksum")
@@ -1972,7 +2007,7 @@ func validateRemote(entryType string, fields []formField) string {
 		if url != "" {
 			return validateURLReachable(url)
 		}
-	case manifest.TypeNpm:
+	case manifest.TypeNpm, manifest.TypeCargo:
 		url := fieldValueFromSlice(fields, "Source URL")
 		if url != "" {
 			return validateURLReachable(url)
@@ -2137,6 +2172,16 @@ func saveCreateEntry(store *manifest.Store, fields []formField) error {
 			}
 			ve.DebGlob = fieldValueFromSlice(fields, "Deb Glob")
 		}
+		// SourceName is what `apt-get download` needs and SourcePackage is the
+		// Debian source, which is the only key Ubuntu and Debian advisories
+		// carry. An entry with no source package makes the OSV gate warn rather
+		// than answer, because an empty result under a binary name cannot be
+		// read as clean.
+		ve.SourcePackage = fieldValueFromSlice(fields, "Source Package")
+		// CaptureSuite and not Suites: Suites decides which dists/<suite>/ the
+		// entry publishes to, so a release written there drops the entry out of
+		// every generated index on a server whose apt_codename is a house name.
+		ve.CaptureSuite = fieldValueFromSlice(fields, "Capture Suite")
 
 	case manifest.TypeGit:
 		ve.Ref = fieldValueFromSlice(fields, "Ref")
@@ -2161,7 +2206,7 @@ func saveCreateEntry(store *manifest.Store, fields []formField) error {
 	case manifest.TypeHelm:
 		ve.AppVersion = fieldValueFromSlice(fields, "App Version")
 
-	case manifest.TypeGomod, manifest.TypeNpm:
+	case manifest.TypeGomod, manifest.TypeNpm, manifest.TypeCargo:
 		// nothing extra
 
 	default:
@@ -2212,7 +2257,15 @@ func (m *appModel) makeJSONApplyFn() func(buf string) string {
 				setFieldValue(p.formFields, "Filename", ve.Filename)
 			}
 			if ve.SourceName != "" {
-				setFieldValue(p.formFields, "Source Name", ve.SourceName)
+				// "Package Name" is the apt form's label for it; "Source Name"
+				// matches no field, so this set was a no-op.
+				setFieldValue(p.formFields, "Package Name", ve.SourceName)
+			}
+			if ve.SourcePackage != "" {
+				setFieldValue(p.formFields, "Source Package", ve.SourcePackage)
+			}
+			if ve.CaptureSuite != "" {
+				setFieldValue(p.formFields, "Capture Suite", ve.CaptureSuite)
 			}
 			if ve.BuildCmd != "" {
 				setFieldValue(p.formFields, "Build Cmd", ve.BuildCmd)
@@ -2298,6 +2351,10 @@ func extractNameFromURL(rawURL, entryType string) string {
 		// npm: last segment or @scope/name
 		seg := lastURLSegment(rawURL)
 		return seg
+	case manifest.TypeCargo:
+		// The cargo Source URL is the sparse index root, which names no crate,
+		// so there is nothing to derive a name from. The Name field is required.
+		return ""
 	default:
 		seg := lastURLSegment(rawURL)
 		if seg == "" {

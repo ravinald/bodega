@@ -145,6 +145,11 @@ type ProfileEntry struct {
 	// moves it and CreatedAt stays where it was. Zero on an entry written
 	// before migration 016 and on one that was never pinned.
 	PinnedAt time.Time
+	// PinnedBy is who decided that version, and moves with PinnedAt rather
+	// than with Actor. Actor is the last writer, so an edit to a reason
+	// reassigns it; the pin report needs the name that goes with the date it
+	// prints. Empty on a row written before migration 018.
+	PinnedBy string
 }
 
 // Pinned reports whether this entry holds one version rather than deferring to
@@ -163,6 +168,17 @@ func (e ProfileEntry) PinDecidedAt() time.Time {
 		return e.PinnedAt
 	}
 	return e.CreatedAt
+}
+
+// PinDecidedBy is who set the pin, falling back to the last writer for a row
+// written before migration 018. On a row nobody has edited the two name the
+// same person, and on one that has been edited the last writer is the only
+// name the table has ever held.
+func (e ProfileEntry) PinDecidedBy() string {
+	if e.PinnedBy != "" {
+		return e.PinnedBy
+	}
+	return e.Actor
 }
 
 // ProfileBinding attaches a profile to an identity migration 013 resolves.
@@ -293,7 +309,7 @@ func (a *DB) profileTypes(ctx context.Context, profile string) ([]ProfileTypeRul
 func (a *DB) profileEntries(ctx context.Context, profile string) ([]ProfileEntry, error) {
 	rows, err := a.db.QueryContext(ctx,
 		`SELECT profile, pkg_type, pkg_name, constraint_kind, version, origin, reason,
-		        review_after, actor, created_at, pinned_at
+		        review_after, actor, created_at, pinned_at, pinned_by
 		   FROM profile_entries WHERE profile = ? ORDER BY pkg_type, pkg_name`, profile)
 	if err != nil {
 		return nil, err
@@ -304,7 +320,7 @@ func (a *DB) profileEntries(ctx context.Context, profile string) ([]ProfileEntry
 		var e ProfileEntry
 		var ts, pinnedAt string
 		if err := rows.Scan(&e.Profile, &e.Type, &e.Name, &e.Constraint, &e.Version,
-			&e.Origin, &e.Reason, &e.ReviewAfter, &e.Actor, &ts, &pinnedAt); err != nil {
+			&e.Origin, &e.Reason, &e.ReviewAfter, &e.Actor, &ts, &pinnedAt, &e.PinnedBy); err != nil {
 			return nil, err
 		}
 		e.CreatedAt, _ = time.Parse(time.RFC3339Nano, ts)
@@ -365,7 +381,7 @@ func (a *DB) PutProfileEntry(ctx context.Context, e ProfileEntry) (bool, error) 
 	}
 	_, err := a.writer().ExecContext(ctx, insertProfileEntrySQL,
 		e.Profile, e.Type, e.Name, e.Constraint, e.Version, e.Origin, e.Reason,
-		e.ReviewAfter, e.Actor, formatPinnedAt(e.PinnedAt))
+		e.ReviewAfter, e.Actor, formatPinnedAt(e.PinnedAt), e.PinnedBy)
 	if err != nil {
 		return false, err
 	}
@@ -373,8 +389,8 @@ func (a *DB) PutProfileEntry(ctx context.Context, e ProfileEntry) (bool, error) 
 }
 
 const insertProfileEntrySQL = `INSERT INTO profile_entries
-	     (profile, pkg_type, pkg_name, constraint_kind, version, origin, reason, review_after, actor, pinned_at)
-	 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	     (profile, pkg_type, pkg_name, constraint_kind, version, origin, reason, review_after, actor, pinned_at, pinned_by)
+	 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	 ON CONFLICT(profile, pkg_type, pkg_name) DO UPDATE SET
 	     constraint_kind = excluded.constraint_kind,
 	     version = excluded.version,
@@ -382,7 +398,8 @@ const insertProfileEntrySQL = `INSERT INTO profile_entries
 	     reason = excluded.reason,
 	     review_after = excluded.review_after,
 	     actor = excluded.actor,
-	     pinned_at = excluded.pinned_at`
+	     pinned_at = excluded.pinned_at,
+	     pinned_by = excluded.pinned_by`
 
 // formatPinnedAt renders the pin date for storage. A zero time writes the
 // empty string rather than year one, which is what the migration's default
@@ -559,7 +576,7 @@ func (a *DB) CreateProfileWith(ctx context.Context, p Profile, types []ProfileTy
 	for _, e := range entries {
 		if _, err := tx.ExecContext(ctx, insertProfileEntrySQL,
 			p.Name, e.Type, e.Name, e.Constraint, e.Version, e.Origin,
-			e.Reason, e.ReviewAfter, e.Actor, formatPinnedAt(e.PinnedAt)); err != nil {
+			e.Reason, e.ReviewAfter, e.Actor, formatPinnedAt(e.PinnedAt), e.PinnedBy); err != nil {
 			return fmt.Errorf("%s/%s: %w", e.Type, e.Name, err)
 		}
 	}

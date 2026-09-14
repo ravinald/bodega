@@ -31,7 +31,7 @@ Creates the S3 bucket with server-side encryption (AES-256), versioning enabled,
 
 ### `bodega build fetch [TYPE...] [NAME]`
 
-Downloads raw sources without building or packaging. If no types are given, all types are fetched in dependency order: `binary → git → apt → pypi → gomod → helm → npm`.
+Downloads raw sources without building or packaging. If no types are given, all eight are fetched in dependency order: `binary, git, apt, pypi, gomod, helm, npm, cargo`.
 
 When a name is given after the type, only that entry is fetched.
 
@@ -896,6 +896,8 @@ The `OSV` column is the stamp [`bodega policy osv rescan`](#rescan) writes, and 
 
 `PINNED` is when the held version was last decided, which is not when the entry was created: moving a pin to a new version re-dates it, and correcting its reason with `add` does not. A row written before that column existed falls back to the entry's own creation date, which is a lower bound rather than a guess.
 
+`BY` is who made that decision, and it moves with `PINNED` rather than with the last write. A colleague correcting a typo in your reason does not take the byline, because the row would then name them beside your date. Every other profile command reports the last writer, which is what those commands mean by it. A row written before the column existed falls back to the last writer, since that is the only name the table has ever held for it.
+
 `--stale` exits 1, so it works as a CI or cron gate the same way `bodega profile check` does. A pin with no review date is never stale, which is what makes `--review-after` worth writing.
 
 **The closure.** Holding postgresql-14 at 14.9 holds everything 14.9 was built against: a dependency edge names the version the parent needs, and pinning the parent does not move it. apt meets that during an upgrade, as a widening set held back or a proposal to remove the package. bodega sits on the index and holds the graph, so `pin` says it first:
@@ -911,7 +913,11 @@ Pinning apt/postgresql-14 at 14.9 holds 2 other package(s) still:
 Added apt/postgresql-14 in db (exact 14.9).
 ```
 
-`HELD AT` comes from the relation the dependency was declared with, not from what happens to be installed. `libpq5 (= 14.9)` holds a release still and reads `14.9`; `libssl3 (>= 3.0.0)` is a floor that may move upward whatever postgresql-14 is pinned at, so it reads `-` and `--strict-closure` has nothing to pin it to. The language discoverers record the version on every edge, so a pypi or gomod closure resolves throughout.
+`HELD AT` comes from the relation the dependency was declared with, not from what happens to be installed. `libpq5 (= 14.9)` holds a release still and reads `14.9`; `libssl3 (>= 3.0.0)` is a floor that may move upward whatever postgresql-14 is pinned at, so it reads `-` and `--strict-closure` has nothing to pin it to. The language discoverers record the version on every edge they write, so a closure that reaches a pypi or gomod package resolves to a version rather than a dash.
+
+**Which packages have a closure at all is a narrower question.** Only two code paths write an edge, and both write the parent as an `apt` or a `git` package: `discover_apt.go` writes `apt/<parent>` to `apt/<child>`, and `ImportDeps` writes `git/<repo>@<ref>` to the language packages that repo requires. No path writes an edge whose parent is a pypi, gomod, npm or cargo package, so pinning one of those reports no closure — not because it holds nothing still, but because nothing recorded what it depends on. `bodega profile pin` says which of the two it is rather than printing nothing, and `bodega profile check` is the gate that would otherwise pass silently.
+
+Recording language-to-language edges is a larger change: `ImportDeps` fixes one parent ref per scanned repository, and a transitive graph needs a parent ref per dependency. Nothing schedules it.
 
 **Reporting is the default and freezing is not.** The default pins the one package you named and tells you what it implies. `--strict-closure` pins every closure member at the version the graph records, with a reason naming the pin that implied it. Extending by default would freeze a growing set: each package pinned drags its own dependencies in, and a host would stop receiving security updates for all of them with nobody having decided that it should. A closure member the graph records no version for is left floating and said so, because pinning it would mean choosing a release on your behalf.
 
@@ -1675,17 +1681,19 @@ Error: the age gate does not cover ecosystem "apt": there is no upstream publish
 
 The two gates failed differently before they refused. OSV passed silently. Age never did: a missing timestamp is a `warn` with the ecosystem named, so an apt policy made every apt version noisy rather than invisible. Refusing the row up front is a usability fix on that side and a security fix on the OSV side.
 
-`set` grew that refusal after the fact, so a row written before it is still stored and still read by nothing. Both `list` commands name those rows under the table, and `bodega doctor` reports them as `policy-ecosystem`:
+`set` grew that refusal after the fact, so a row written before it is still stored and still read by nothing. Both `list` commands mark the row's action and name it again under the table, and `bodega doctor` reports it as `policy-ecosystem`:
 
 ```
 $ bodega policy age list
-ECOSYSTEM  MIN AGE  ACTION  UPDATED
-helm       7d       block   2026-03-11
-npm        7d       warn    2026-09-06
+ECOSYSTEM  MIN AGE  ACTION                UPDATED
+helm       7d       block (not enforced)  2026-03-11
+npm        7d       warn                  2026-09-06
 
 Not enforced: the age gate cannot evaluate helm, so that row is stored and never read.
 Remove with 'bodega policy age remove <ecosystem>'.
 ```
+
+The marker is on the row because the row is what an operator scans. A footnote alone left `block` reading as a block in the column where every other row's action is real, and the two rows above are the whole difference between a gate that runs and one that does not.
 
 Nothing else counts such a row as enforcement. The `bodega serve` startup banner names only ecosystems the age gate can date, so an install carrying the `helm` row above with `npm` and `pypi` on `ignore` reports `minimum publish age: none enforced` rather than the block that never runs.
 
@@ -1940,7 +1948,6 @@ A default config is created on first run. All fields are optional.
   "log_dir": "/var/log/bodega",
   "logwindow_height": 12,
   "log_level": 0,
-  "custom_paths": false,
   "apt_root": "",
   "git_root": "",
   "pypi_root": "",
@@ -2227,7 +2234,9 @@ sudo mv /opt/bodega/cargo  "$CARGO_ROOT/cargo"
 
 Or clear the key and keep everything under `build_root`. `apt_root`, `git_root`, `pypi_root` and `binary_root` need none of this: the build path already carried those four.
 
-**Gap:** `custom_paths` gates none of this. The build path reads each root directly, so a root left in the config file stays in force after the flag is turned off. `config.RootForType` applies the gate and has no callers.
+`custom_paths` used to sit in front of all of this and gated nothing: the build path reads each root directly through `builder.rootFor`, so a root left in the file stayed in force after the flag was turned off, and the TUI stopped showing the value that was still deciding where artifacts land. The key is gone. Nothing moves as a result, because the behavior it claimed to gate is the behavior that was already running; a file that still carries it loads unchanged and `bodega doctor` names it under `retired-config-keys`.
+
+**Gap:** the TUI's config form shows four of the eight roots — `apt_root`, `git_root`, `pypi_root`, `binary_root` — so `gomod_root`, `helm_root`, `npm_root` and `cargo_root` can only be set by editing the file. Ctrl+R clears the same four. Tracked as #227.
 
 ### Audit database
 
@@ -2420,7 +2429,7 @@ Actually, the operations are more granular: fetch, build/run, sync, upload.
 
 **Stage cascading:** Each stage automatically runs its prerequisites if outputs are missing. Running `bodega build upload` on a fresh system will cascade through fetch and build stages first.
 
-**Build order:** `binary → git → apt → pypi → gomod → helm → npm`. This order reflects dependencies (e.g., pypi may reference git-cloned repos for its base requirements).
+**Build order:** `binary, git, apt, pypi, gomod, helm, npm, cargo`. This order reflects dependencies (e.g., pypi may reference git-cloned repos for its base requirements). It is `manifest.AllTypes`, and the three build subcommands render their help from it rather than restating it.
 
 **Per-entry failures** are logged but do not abort the run. A non-zero exit code is returned if any entry failed.
 
@@ -2835,7 +2844,7 @@ Two refusals sit behind the same guard:
 - **Half a pair.** `tls_cert` set with `tls_key` empty, or the reverse, is fatal — at load for the config file, and at startup for `--tls-cert`/`--tls-key`, which are applied after the file is read. `allow_plaintext` does not excuse it: half a pair is a truncated edit, and reading it as a request for plaintext is how a server that served TLS yesterday answers in the clear today. `Config.Save()` marshals the whole resolved config back over the file, so a cert path cleared in the TUI reaches the listener with nothing else in the way.
 - **Port 443.** An empty pair on `:443` refuses even though the message differs, naming the port. A port is not authorization, but it is the strongest evidence available that whoever wrote `listen_addr` expected a certificate. `allow_plaintext` still starts it, with an `ERROR` on every start — the shipped `log_level` prints only `ERROR`, and a line the default install cannot see is not a warning. Off `:443` an authorized plaintext listener is silent: it serves what the operator asked for.
 
-bodega has no ACME client. `tls_autocert` and `tls_domain` were config keys that nothing implemented, and they are gone. Both halves say so rather than disappearing: a file that still carries `tls_autocert: true` logs at startup that nothing reads it, and `--tls-autocert`/`--tls-domain` still parse — hidden and deprecated, off `--help` — so an upgraded unit file starts and gets the same message instead of `unknown flag: --tls-autocert` and exit 1 on every `Restart=always` cycle. Get a certificate from `certbot` or your CA, or terminate TLS at a proxy in front and set `public_url`.
+bodega has no ACME client. `tls_autocert` and `tls_domain` were config keys that nothing implemented, and they are gone. Both halves say so rather than disappearing: a file that still carries either key logs at startup that nothing reads it, and `--tls-autocert`/`--tls-domain` still parse — hidden and deprecated, off `--help` — so an upgraded unit file starts and gets the same message instead of `unknown flag: --tls-autocert` and exit 1 on every `Restart=always` cycle. Get a certificate from `certbot` or your CA, or terminate TLS at a proxy in front and set `public_url`.
 
 Behind a TLS-terminating proxy, set `allow_plaintext` together with `public_url` — see [Behind a reverse proxy](#behind-a-reverse-proxy).
 
@@ -3369,6 +3378,8 @@ Fields on every row: timestamp, event type, package type/name/version, client IP
 
 - **404s on package routes.** `apt update` probes several optional index paths on every run, so recording absences would bury the fetches. A miss that reached upstream is a `cache` event; a miss against an unknown name is in the journal only.
 - **Request and response headers or bodies.** Those are a `log_level: 3` (debug) and `log_level: 4` (trace) concern in the journal, not an audit record, and a header dump would carry the very credentials the denial rows are careful not to hold. The journal dump redacts them for the same reason: `Authorization`, `Proxy-Authorization`, `Cookie` and `Set-Cookie` log their name and `[redacted]` in place of the value, so a debug log still answers whether a client sent a credential and holds nothing that can be replayed. Read-path identity is what made that pressing — before it the only `Authorization` headers arriving were operator mutations, and now every package GET can carry one that `bodega doctor --write-credentials` put on the client host.
+
+  The body capture at `log_level: 4` carries the same secret by the other route. `POST /api/v1/tokens` returns the plaintext token in its response body, because that is the one moment it can be read, so the trace log wrote it down. Bodies now redact by JSON key the way headers redact by name: `token`, `access_token`, `refresh_token`, `secret`, `password`, `private_key`, `signing_key` and `session` log `[redacted]` in place of the value at any depth, and the rest of the document is untouched. The key travels with the value rather than with the route, so a later endpoint returning a signing key is covered without anyone remembering to extend a list. A body that claims JSON and does not parse is scrubbed against the same key set textually rather than withheld: `maxBodyCapture` truncates at 64KB and a handler can answer with a JSON content type over something that is not JSON, and both are cases trace level exists to show. The key is still present ahead of the value it names even on a document the capture cut short, so the scrub reaches the credential while the rest of the body stays readable.
 - **Successful admin reads.** Only the refusals are rows; a permitted `GET /api/v1/audit` is journal-only.
 
 Denials record at every gate in the middleware chain, at the admin-read gate, and at the five refusals a handler decides for itself: a `DELETE` on a frozen entry (`entry_frozen`), a version outside an entry's `version_constraint` (`version_constraint`), a git push against a read-only mirror (`push_refused`, on both the `info/refs?service=git-receive-pack` probe and the `git-receive-pack` POST), and the two proxy spool bounds (`spool_artifact_too_large`, `spool_budget_exhausted`). The `status` column names which gate refused.
@@ -3553,7 +3564,7 @@ Git smart-HTTP mirrors are the one tree that is not a storage key. They are bare
 ```bash
 make check          # every job CI blocks on, cheapest leg first
 make build          # compile to ./dist/bodega
-make cross          # cross-compile for linux/amd64
+make cross          # cross-compile for every pair in CROSS_TARGETS (linux/amd64, linux/arm64)
 make test           # run tests with race detector
 make test-verbose   # verbose test output
 make bench          # run benchmarks

@@ -132,7 +132,7 @@ Description: interactive high-level object-oriented language (default version)
  This package is a dependency package.
 
 `
-	ve := parseAptShowOutput(output, "python3")
+	ve := parseAptShowOutput(output, "python3", "")
 	if ve == nil {
 		t.Fatal("expected non-nil VersionEntry")
 	}
@@ -170,7 +170,7 @@ Description: interactive high-level object-oriented language (default version)
 }
 
 func TestParseAptShowOutput_Empty(t *testing.T) {
-	ve := parseAptShowOutput("", "pkg")
+	ve := parseAptShowOutput("", "pkg", "")
 	if ve != nil {
 		t.Errorf("expected nil for empty input, got %+v", ve)
 	}
@@ -303,7 +303,7 @@ Source: binutils-arm-none-eabi (15build1)
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ve := parseAptShowOutput(tc.stanza, tc.pkg)
+			ve := parseAptShowOutput(tc.stanza, tc.pkg, "")
 			if ve == nil {
 				t.Fatal("stanza did not parse")
 			}

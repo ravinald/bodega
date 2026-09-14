@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/url"
 	"path"
-	"regexp"
 	"strconv"
 	"strings"
 
@@ -328,20 +327,40 @@ func (p *npmPackumentWriter) flush() error {
 	return err
 }
 
-// npmPackageNamePattern is the npm registry constraint on package names,
-// applied to the name the upstream document carries because that name is what
-// a rewritten URL is composed from. A registry that answered with a name
-// containing path syntax would otherwise choose the route bodega hands its own
-// clients.
-var npmPackageNamePattern = regexp.MustCompile(`^(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*$`)
+// npmPackageFromPath recovers the package a /npm request names, dropping the
+// trailing version segment the version-manifest route carries.
+//
+// The shape is unambiguous because a scope is the only thing that puts a slash
+// in a package name: no slash is a bare packument, one slash is either a
+// scoped packument or "<pkg>/<version>" depending on the leading @, and two is
+// "@scope/pkg/<version>". Go decodes %2f before PathValue, so a scoped name
+// arrives here already canonical.
+//
+// The request path and not the document's own name. Preferring the document
+// was how the version segment ended up inside a composed tarball prefix for a
+// legacy uppercase name, since such a name fails npm's own pattern and fell
+// back to the raw path. It also let an upstream answering /npm/victim with
+// {"name":"other"} move every rewritten URL onto /npm/other/-/, which is a
+// substitution no pattern catches: "other" is a perfectly legal name.
+func npmPackageFromPath(fullPath string) string {
+	scoped := strings.HasPrefix(fullPath, "@")
+	parts := strings.Split(fullPath, "/")
+	switch {
+	case scoped && len(parts) > 2:
+		return parts[0] + "/" + parts[1]
+	case !scoped && len(parts) > 1:
+		return parts[0]
+	}
+	return fullPath
+}
 
 // rewriteNpmPackument points every dist.tarball in a packument at this
-// bodega's /npm route. base is npmPublicRoot; pkgName is the package the
-// client asked for, used when the document names no usable name of its own.
+// bodega's /npm route. base is npmPublicRoot; pkgName is the request path,
+// which npmPackageFromPath reduces to the package.
 //
-// The document's own name wins where it is one npm would accept, so the
-// version-manifest route (/npm/{pkg}/{version}, which carries a top-level
-// dist) composes the package's URL rather than the request path's.
+// Both routes reach here: the packument route, whose path is the package, and
+// the version-manifest route (/npm/{pkg}/{version}), whose path carries a
+// version segment that must not land inside the composed prefix.
 //
 // Numbers survive as they were written: json.Number rather than float64, so
 // re-serializing does not reformat a field bodega never read.
@@ -353,11 +372,7 @@ func rewriteNpmPackument(body []byte, base, pkgName string) ([]byte, error) {
 		return nil, fmt.Errorf("parse packument for %s: %w", pkgName, err)
 	}
 
-	name := pkgName
-	if n, ok := doc["name"].(string); ok && npmPackageNamePattern.MatchString(n) {
-		name = n
-	}
-	prefix := base + "/" + npmEscapeName(name) + "/-/"
+	prefix := base + "/" + npmEscapeName(npmPackageFromPath(pkgName)) + "/-/"
 
 	rewriteNpmDistTarball(doc, prefix)
 	if versions, ok := doc["versions"].(map[string]any); ok {

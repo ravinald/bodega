@@ -308,7 +308,7 @@ func TestSave_OmitsRuntimeAndResolvedValues(t *testing.T) {
 			t.Errorf("saved config %q = %s, want %s — Save wrote a resolved value as though the operator had set it", k, got, want)
 		}
 	}
-	for _, k := range []string{"bucket", "region", "build_root", "log_dir", "logwindow_height", "custom_paths", "proxy_cache_enabled"} {
+	for _, k := range []string{"bucket", "region", "build_root", "log_dir", "logwindow_height", "proxy_cache_enabled"} {
 		if _, ok := keys[k]; !ok {
 			t.Errorf("saved config is missing non-omitempty key %q", k)
 		}

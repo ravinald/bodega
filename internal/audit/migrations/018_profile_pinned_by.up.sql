@@ -1,0 +1,17 @@
+-- pinned_by is who decided the version this entry holds.
+--
+-- The companion to 016 on the other axis. PutProfileEntry assigns actor on
+-- every write, so a second operator correcting a typo in a reason took the
+-- byline while pinned_at kept the original decision date, and the row then
+-- paired one person's name with another person's decision. That is the exact
+-- confusion 016 was added to prevent.
+--
+-- actor stays what it is, the last writer, which is what every profile command
+-- other than the pin report means by it. Preserving actor across a merge would
+-- have made the column read "first writer" everywhere, wrong for the commands
+-- that are not about a pin.
+--
+-- Empty on every row written before this migration, and the reader falls back
+-- to actor for those: on a row nobody has edited the two are the same person,
+-- and on one that has been edited actor is the only name there has ever been.
+ALTER TABLE profile_entries ADD COLUMN pinned_by TEXT NOT NULL DEFAULT '';

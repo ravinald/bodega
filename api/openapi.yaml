@@ -260,6 +260,49 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /api/v1/packages/{type}/{name}/{version}/attestation:
+    get:
+      summary: Fetch a version's provenance attestation
+      description: |
+        Resolves the `attestation_uri` recorded on the version entry and answers
+        with the envelope. Nothing in bodega writes that blob: an external
+        authority puts it somewhere and the manifest records where, so this
+        route reads rather than generates.
+
+        An `https://` URI answers 302 to it. An `s3://` URI is proxied from the
+        backend whose bucket matches, falling back to the type rule when no
+        configured backend claims that bucket — the fallback is what answered
+        before named backends existed, and a WARN in the journal says which of
+        the two resolved it.
+
+        Not gated by the host profile. A profile refuses artifacts; this is
+        metadata about one, and the decision to leave it ungated is recorded
+        against issue #300.
+      operationId: getAttestation
+      tags: [packages]
+      parameters:
+        - $ref: "#/components/parameters/PackageType"
+        - $ref: "#/components/parameters/PackageName"
+        - name: version
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The attestation envelope, proxied from object storage
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "302":
+          description: Redirect to the http(s) attestation_uri the entry records
+        "404":
+          description: Unknown type, package or version, or no attestation_uri recorded
+        "502":
+          description: attestation_uri is malformed or names an unsupported scheme
+
   /api/v1/packages/{type}/{name}/hide:
     patch:
       summary: Toggle hidden flag
@@ -525,6 +568,101 @@ paths:
                     type: string
                     format: date-time
 
+  /api/v1/policies:
+    get:
+      summary: List upstream allow-list rules
+      description: |
+        Returns every allow-list rule, or those for one registry type when
+        `type` is given. Restricted to IPs in `admin_permit_cidr`.
+
+        The rule objects carry Go field names rather than the snake_case the
+        rest of this API uses, because `audit.PolicyInfo` has no JSON tags.
+        That is what ships; changing it breaks existing clients.
+      operationId: listPolicies
+      tags: [status]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: type
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter to one registry type
+      responses:
+        "200":
+          description: Allow-list rules
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PolicyRule"
+        "403":
+          description: Client IP is not in admin_permit_cidr
+        "503":
+          description: Audit database not configured
+    post:
+      summary: Add an upstream allow-list rule
+      description: |
+        The rule kind is derived from the registry type rather than supplied:
+        one type has one meaningful match shape, and letting a caller pick
+        produced rules that matched nothing. Adding a rule invalidates the
+        checker's cache, so it takes effect on the next fetch.
+      operationId: createPolicy
+      tags: [status]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [registry_type, pattern]
+              properties:
+                registry_type:
+                  type: string
+                pattern:
+                  type: string
+                comment:
+                  type: string
+      responses:
+        "201":
+          description: Rule created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicyRule"
+        "400":
+          description: Unknown registry type, or pattern missing
+        "503":
+          description: Audit database not configured
+
+  /api/v1/policies/{id}:
+    delete:
+      summary: Revoke an allow-list rule
+      description: |
+        Removes one rule by id and invalidates the checker's cache. Recorded as
+        a delete event in the audit trail.
+      operationId: revokePolicy
+      tags: [status]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Rule revoked
+        "404":
+          description: No rule with that id
+        "503":
+          description: Audit database not configured
+
   /api/v1/tokens/{id}:
     delete:
       summary: Revoke a token
@@ -685,6 +823,32 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/PackageManifest"
+
+    PolicyRule:
+      type: object
+      description: |
+        One upstream allow-list rule. The field names are capitalised because
+        audit.PolicyInfo carries no JSON tags; the rest of this API is
+        snake_case and this is the exception, not the convention.
+      properties:
+        ID:
+          type: string
+        RegistryType:
+          type: string
+          example: pypi
+        RuleKind:
+          type: string
+          description: Derived from RegistryType rather than supplied by the caller
+        Pattern:
+          type: string
+        Comment:
+          type: string
+        CreatedAt:
+          type: string
+          format: date-time
+        CreatedBy:
+          type: string
+          description: Token label when added through this API, else the CLI actor
 
     ImportResult:
       type: object

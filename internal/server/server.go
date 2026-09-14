@@ -58,23 +58,26 @@ var contentTypes = map[string]string{
 
 // Server is the bodega HTTP package server.
 type Server struct {
-	cfg          *config.Config
-	store        *manifest.Store
-	stores       storage.Resolver
-	mux          *http.ServeMux
-	addr         string
-	logger       *slog.Logger
-	cache        CacheConfig
-	auditDB      *audit.DB
-	policy       *policy.Checker
-	discoverMode string             // "" or "observe" — see internal/server/discovery.go
-	discovery    *DiscoveryRecorder // nil when discover_mode == "" or auditDB == nil
-	denyNets     []*net.IPNet
-	adminNets    []*net.IPNet // CIDRs allowed to reach the admin surface (admin_permit_cidr)
-	adminErr     error        // set when admin_permit_cidr parses to nothing; Start refuses on it
-	auditErr     error        // set when the configured audit sink will not record; Start refuses on it
-	spool        *spoolLimiter
-	spoolErr     error // set when spool_dir cannot be created or written; Start refuses on it
+	cfg    *config.Config
+	store  *manifest.Store
+	stores storage.Resolver
+	mux    *http.ServeMux
+	// routePatterns is every pattern registerRoutes put on the mux, in
+	// registration order. Read by the OpenAPI conformance test.
+	routePatterns []string
+	addr          string
+	logger        *slog.Logger
+	cache         CacheConfig
+	auditDB       *audit.DB
+	policy        *policy.Checker
+	discoverMode  string             // "" or "observe" — see internal/server/discovery.go
+	discovery     *DiscoveryRecorder // nil when discover_mode == "" or auditDB == nil
+	denyNets      []*net.IPNet
+	adminNets     []*net.IPNet // CIDRs allowed to reach the admin surface (admin_permit_cidr)
+	adminErr      error        // set when admin_permit_cidr parses to nothing; Start refuses on it
+	auditErr      error        // set when the configured audit sink will not record; Start refuses on it
+	spool         *spoolLimiter
+	spoolErr      error // set when spool_dir cannot be created or written; Start refuses on it
 	// trustedNets are the proxies whose forwarded headers are believed.
 	// trustedNetsSet distinguishes "operator wrote an empty list" from
 	// "operator wrote nothing": the first trusts no header from anyone, the
@@ -718,10 +721,25 @@ func sdNotify(state string) {
 func sdNotifyReady()    { sdNotify("READY=1") }
 func sdNotifyStopping() { sdNotify("STOPPING=1") }
 
+// routeRecorder wires patterns into the mux and keeps the list. http.ServeMux
+// does not report what was registered on it, and the OpenAPI document is
+// hand-maintained: four operations were routed and undocumented because
+// nothing could compare the two. The conformance test reads this.
+type routeRecorder struct {
+	mux      *http.ServeMux
+	patterns []string
+}
+
+func (r *routeRecorder) HandleFunc(pattern string, h func(http.ResponseWriter, *http.Request)) {
+	r.patterns = append(r.patterns, pattern)
+	r.mux.HandleFunc(pattern, h)
+}
+
 // registerRoutes wires all URL patterns to their handler methods.
 // Requires Go 1.22+ enhanced ServeMux patterns.
 func (s *Server) registerRoutes() {
-	m := s.mux
+	m := &routeRecorder{mux: s.mux}
+	defer func() { s.routePatterns = m.patterns }()
 
 	// Web UI
 	s.registerWebUI()

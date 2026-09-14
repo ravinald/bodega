@@ -29,12 +29,12 @@ Under audit_sink "syslog" or "jsonl" it refuses: those sinks ship events out
 and keep nothing to read back.
 
 Examples:
-  bodega audit                                    # last 20 events
-  bodega audit --type fetch --limit 50            # last 50 fetch events
-  bodega audit --pkg-type gomod --name github.com/aws/aws-sdk-go-v2
-  bodega audit --client 10.0.0.5 --since 2026-04-07
-  bodega audit --identity build-07                 # every request an identity binding attributed
-  bodega audit --type denied --limit 50            # requests the server refused
+  bodega audit events                                    # last 20 events
+  bodega audit events --type fetch --limit 50            # last 50 fetch events
+  bodega audit events --pkg-type gomod --name github.com/aws/aws-sdk-go-v2
+  bodega audit events --client 10.0.0.5 --since 2026-04-07
+  bodega audit events --identity build-07                # every request an identity binding attributed
+  bodega audit events --type denied --limit 50           # requests the server refused
 
 A "denied" event carries the gate that refused it in the STATUS column:
 deny_list, client_ip_unparsable, ip_not_permitted, no_tokens_configured,

@@ -16,7 +16,7 @@ sudo make install             # installs to /usr/local/bin/bodega
 Cross-compile for Linux from macOS:
 
 ```bash
-make cross                    # builds ./dist/bodega-linux-amd64
+make cross                    # builds ./dist/bodega-linux-amd64 and -linux-arm64
 ```
 
 ## 2. Configure

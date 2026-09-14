@@ -297,24 +297,24 @@ func TestClearRemovesAKeyTheDiffCannotSee(t *testing.T) {
 // TestClearRemovesZeroValuedKeys covers what a struct tag cannot say. Deleting
 // on absence from the marshalled keys works only under omitempty, and omitempty
 // on an int or a bool cannot tell a cleared key from a deliberate 0 or false —
-// which is why logwindow_height and custom_paths carry none.
+// which is why logwindow_height and proxy_cache_enabled carry none.
 func TestClearRemovesZeroValuedKeys(t *testing.T) {
-	path := loadedFrom(t, `{"logwindow_height": 40, "custom_paths": true, "apt_root": "/srv/apt"}`)
+	path := loadedFrom(t, `{"logwindow_height": 40, "proxy_cache_enabled": true, "apt_root": "/srv/apt"}`)
 
 	cfg, err := config.Load("", "", "", "", false, false)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	cfg.LogWindowHeight = config.DefaultLogWindowHeight
-	cfg.CustomPaths = false
+	cfg.ProxyCacheEnabled = false
 	cfg.AptRoot = ""
-	cfg.Clear("logwindow_height", "custom_paths", "apt_root")
+	cfg.Clear("logwindow_height", "proxy_cache_enabled", "apt_root")
 	if _, err := cfg.Save(); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
 	keys := savedKeys(t, path)
-	for _, k := range []string{"logwindow_height", "custom_paths", "apt_root"} {
+	for _, k := range []string{"logwindow_height", "proxy_cache_enabled", "apt_root"} {
 		if got, ok := keys[k]; ok {
 			t.Errorf("%s = %s after a clear, want the key gone", k, got)
 		}
