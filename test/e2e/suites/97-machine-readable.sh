@@ -37,7 +37,10 @@ for spec in \
 	id="${spec%%:*}"
 	cmd="${spec#*:}"
 	e2e_bodega server "$cmd" || true
-	if printf '%s' "$E2E_OUT" | jq -e . >/dev/null 2>&1; then
+	# `jq empty` parses without judging the value. `jq -e .` treats null and
+	# false as failure, so an empty export reports as unparseable output when
+	# what it emitted was valid JSON.
+	if printf '%s' "$E2E_OUT" | jq empty >/dev/null 2>&1; then
 		e2e_record "JSON-HAS-$id" PASS "$cmd emits parseable JSON" \
 			"a JSON document" "parsed" "bodega $cmd" 0 "cmd/bodega"
 	else
@@ -62,3 +65,11 @@ for cmd in \
 done
 
 unset spec id cmd
+
+# An empty export is `null`, not `[]`. Valid JSON either way, and a consumer
+# written the obvious way breaks on it: `jq '.[]'` over null is an error, and a
+# shell loop over the result iterates nothing without saying why.
+e2e_bodega server "discover export json" || true
+check_ne JSON-EMPTY-01 "an empty discover export is a collection, not null" \
+	"null" "$(printf '%s' "$E2E_OUT" | tr -d '[:space:]')" \
+	"cmd/bodega/cmd_discover.go:332" "bodega discover export json on an empty table"

@@ -34,6 +34,13 @@ CREATE_BODY='{"config_version":1,"name":"e2e-acl-probe","type":"binary","version
 E2E_HOST=server
 e2e_bodega server "pkg delete binary e2e-acl-probe" >/dev/null 2>&1 || true
 
+# Every token an earlier suite or an earlier run left behind is revoked first.
+# ACC-05 asserts that widening the admin list is refused while no token exists,
+# and one surviving token makes that widening legal: the check then reports a
+# missing guard against a precondition the suite never established.
+e2e_on server "sudo bodega token list 2>/dev/null | awk 'NR>1 && NF {print \$1}' | \
+	while read -r id; do sudo bodega token revoke \"\$id\" >/dev/null 2>&1 || true; done; true" || true
+
 # ---- the shape before anything is widened ----------------------------------
 
 E2E_HOST=server
