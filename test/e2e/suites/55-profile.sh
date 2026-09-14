@@ -31,11 +31,15 @@ E2E_HOST=server
 # ---- build a profile -------------------------------------------------------
 
 e2e_bodega server "profile remove e2e-profile binary hello-binary --force" >/dev/null 2>&1 || true
-# --overwrite, not --force: a second run of this suite meets the profile the
-# first one left behind, and `profile create` refuses a name that exists.
-e2e_bodega server "profile create e2e-profile --description 'e2e run' --overwrite" || true
-check_eq PROF-01 "a profile is created" 0 "$E2E_RC" \
-	"cmd/bodega/cmd_profile.go:130" "bodega profile create e2e-profile" "$E2E_RC"
+# `profile create` refuses a name that exists and there is no `profile delete`,
+# so a second run of this suite always meets the profile the first one left.
+# --overwrite is not the escape: it governs the baseline --out writes, and only
+# --from-origin writes one. The verdict is therefore that the profile exists,
+# not that this command created it.
+e2e_bodega server "profile create e2e-profile --description 'e2e run'" || true
+e2e_bodega server "profile list" || true
+check_contains PROF-01 "the profile exists after create" "e2e-profile" "$E2E_OUT" \
+	"cmd/bodega/cmd_profile.go:130" "bodega profile create e2e-profile; bodega profile list"
 
 e2e_bodega server "profile list" || true
 check_contains PROF-02 "the profile is listed" "e2e-profile" "$E2E_OUT" \
@@ -97,7 +101,18 @@ check_eq PROF-09 "--stale exits 1 once a pin is overdue" 1 "$E2E_RC" \
 
 # ---- bind it to the client -------------------------------------------------
 
-e2e_bodega server "identity bind cidr $E2E_CLIENT_CIDR e2e-host --comment 'e2e run'" || true
+# Bound through a token identity rather than a CIDR one, because a CIDR
+# binding does not reach the request: the audit row for a request from the
+# bound address carries an empty identity column, so profileFor finds nothing
+# and every gate below passes. PROF-ID-01 measures that separately. Binding
+# through the token is what makes the surface checks below mean something
+# rather than all reporting a control that is absent.
+e2e_bodega server "token generate e2e-profile-token expiry 1d 'e2e profile binding'" || true
+E2E_PROFILE_TOKEN="$(printf '%s' "$E2E_OUT" | awk '/^[[:space:]]*Token:/ {print $2; exit}')"
+e2e_bodega server "token list" || true
+E2E_PROFILE_TOKEN_ID="$(printf '%s' "$E2E_OUT" | awk '/e2e-profile-token/ {print $1; exit}')"
+
+e2e_bodega server "identity bind token $E2E_PROFILE_TOKEN_ID e2e-host --comment 'e2e run'" || true
 e2e_bodega server "profile bind e2e-profile e2e-host --force" || true
 check_eq PROF-10 "the profile binds to the client's identity" 0 "$E2E_RC" \
 	"cmd/bodega/cmd_profile.go:782" "bodega profile bind e2e-profile e2e-host" "$E2E_RC"
@@ -115,9 +130,19 @@ check_contains PROF-10b "the profile reports a bound host" "e2e-host" "$E2E_OUT"
 
 E2E_HOST=client
 
-e2e_http client "/binaries/hello-binary/1.0.0/LICENSE" || true
+# e2e_http sends no Authorization header, and the identity is what selects the
+# profile, so every probe here carries the bearer.
+prof_get() {
+	e2e_on client "curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
+		-H 'Authorization: Bearer $E2E_PROFILE_TOKEN' '$E2E_BASE_URL$1'"
+}
+prof_body() {
+	e2e_on client "curl -s --max-time 30 -H 'Authorization: Bearer $E2E_PROFILE_TOKEN' '$E2E_BASE_URL$1'"
+}
+
+prof_get "/binaries/hello-binary/1.0.0/LICENSE" || true
 check_eq PROF-11 "the entitled artifact is still served" "200" "$E2E_OUT" \
-	"internal/server/binary.go:71" "GET an entitled binary"
+	"internal/server/binary.go:71" "GET an entitled binary with the bound identity"
 
 for spec in \
 	"git:/git/uuid/uuid-v1.6.0.bundle:internal/server/git.go:44" \
@@ -128,7 +153,7 @@ for spec in \
 	rest="${spec#*:}"
 	path="${rest%%:*}"
 	ref="${rest#*:}"
-	e2e_http client "$path" || true
+	prof_get "$path" || true
 	check_ne "PROF-DENY-$t" "a $t artifact outside the profile is refused" \
 		"200" "$E2E_OUT" "$ref" "GET $path under a closed profile"
 done
@@ -136,19 +161,26 @@ done
 # helm is the deliberate exception: the index is filtered to empty rather than
 # refused, so `helm repo add` still succeeds against a profile entitling no
 # charts. A 403 here would break the client before it could report anything.
-e2e_http client "/helm/index.yaml" || true
+prof_get "/helm/index.yaml" || true
 check_eq PROF-12 "the helm index is filtered rather than refused" "200" "$E2E_OUT" \
 	"internal/server/helm.go:22" "GET /helm/index.yaml under a closed profile"
 
-e2e_body client "/helm/index.yaml" || true
+prof_body "/helm/index.yaml" || true
 check_lacks PROF-13 "the filtered helm index publishes no unentitled chart" \
 	"podinfo-6.7.0.tgz" "$E2E_OUT" "internal/server/helm.go:28" "GET /helm/index.yaml"
 
 # apt is filtered at the index too, rather than gated per request.
-e2e_body client "/apt/dists/noble/main/binary-arm64/Packages" || true
+prof_body "/apt/dists/noble/main/binary-arm64/Packages" || true
 check_lacks PROF-14 "the filtered apt index publishes no unentitled package" \
 	"Package: hello" "$E2E_OUT" "internal/server/apt_profile.go:347" \
 	"GET /apt/dists/noble/main/binary-arm64/Packages"
+
+# aptPoolGate is the backstop behind the index filter. An index that leaks the
+# package name and a pool that hands over the .deb are different failures: one
+# discloses what exists, the other lets the host install it.
+prof_get "/apt/pool/main/h/hello/hello_${E2E_APT_VERSION}_arm64.deb" || true
+check_ne PROF-14b "the apt pool refuses an unentitled .deb" "200" "$E2E_OUT" \
+	"internal/server/apt.go:64" "GET the pool .deb under a closed apt profile"
 
 # A refusal that leaves no trail is a refusal nobody can audit.
 E2E_HOST=server
@@ -161,16 +193,47 @@ check_contains PROF-15 "a profile refusal is recorded with its reason" \
 # #300: the attestation endpoint answers for a package the profile refuses.
 
 E2E_HOST=client
-e2e_http client "/api/v1/packages/helm/podinfo/6.7.0/attestation" || true
+prof_get "/api/v1/packages/helm/podinfo/6.7.0/attestation" || true
 check_ne PROF-17 "attestation does not answer for a package the profile refuses" \
 	"200" "$E2E_OUT" "internal/server/attestation.go:27" \
 	"GET an attestation for an unentitled package"
+
+# ---- a CIDR binding never reaches the request -------------------------------
+#
+# `identity bind cidr` is the only binding available to a client that sends no
+# bearer token, and reads require none, so it is the binding an operator
+# reaches for to scope a read-only host. The row it produces carries no
+# identity, so the profile selects nothing and every entitlement control is
+# inert for that host.
+
+# Any binding this CIDR already carries is removed first: bodega refuses to
+# rebind an address to a second identity, and the refusal would report as the
+# CIDR path being broken rather than as a leftover from an earlier run.
+E2E_HOST=server
+e2e_bodega server "identity unbind cidr $E2E_CLIENT_CIDR" >/dev/null 2>&1 || true
+e2e_bodega server "identity bind cidr $E2E_CLIENT_CIDR e2e-cidr-host --comment 'e2e run'" || true
+check_eq PROF-ID-01 "a CIDR identity binds" 0 "$E2E_RC" \
+	"cmd/bodega/cmd_identity.go:59" "bodega identity bind cidr $E2E_CLIENT_CIDR e2e-cidr-host" "$E2E_RC"
+e2e_reload server || true
+sleep 3
+
+E2E_HOST=client
+e2e_http client "/binaries/hello-binary/1.0.0/LICENSE" || true
+
+E2E_HOST=server
+e2e_bodega server "audit events --client ${E2E_CLIENT_ADDR:-127.0.0.1} --limit 3" || true
+check_contains PROF-ID-02 "a request from a CIDR-bound address is attributed to its identity" \
+	"e2e-cidr-host" "$E2E_OUT" "internal/server/identity.go:219" \
+	"bodega audit events --client ${E2E_CLIENT_ADDR:-127.0.0.1}"
+
+e2e_bodega server "identity unbind cidr $E2E_CLIENT_CIDR" || true
 
 # ---- restore ---------------------------------------------------------------
 
 E2E_HOST=server
 e2e_bodega server "profile unbind e2e-host" || true
-e2e_bodega server "identity unbind cidr $E2E_CLIENT_CIDR" || true
+e2e_bodega server "identity unbind token $E2E_PROFILE_TOKEN_ID" || true
+e2e_bodega server "token revoke e2e-profile-token" || true
 e2e_reload server || true
 sleep 3
 E2E_HOST=client

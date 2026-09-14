@@ -57,7 +57,9 @@ e2e_on server "sudo find /var/lib/bodega/cargo/index -type f 2>/dev/null | head 
 check_contains PXY-CARGO-02 "the proxied cargo index entry is written to storage" \
 	"anyhow" "${E2E_OUT:-nothing stored}" "internal/server/proxy.go:59" "find /var/lib/bodega/cargo/index"
 
-# gomod: a module nothing hosts.
+# gomod: a module nothing hosts. npm and cargo above answer the same shape from
+# upstream, so a 404 here is a difference between types rather than the proxy
+# being off, and README.md advertises the cache for gomod alongside them.
 E2E_HOST=client
 e2e_http client "/go/github.com/pkg/errors/@v/list" || true
 check_eq PXY-GOMOD-01 "a gomod list missing locally is answered upstream" "200" "$E2E_OUT" \
@@ -73,6 +75,13 @@ E2E_HOST=server
 e2e_bodega server "audit events --type cache --limit 50" || true
 check_contains PXY-02 "cache rows are recorded for the proxied fetches" \
 	"cache" "$E2E_OUT" "internal/server/audit.go:92" "bodega audit events --type cache"
+
+# Named separately so the report distinguishes "the filter found nothing" from
+# "the type is never written". A trail that records serve_fetch and denied but
+# no cache row cannot answer which artifacts came from upstream.
+e2e_bodega server "audit events --limit 400" || true
+check_contains PXY-02b "the trail carries at least one cache event of any kind" \
+	"cache" "$E2E_OUT" "internal/server/audit.go:92" "bodega audit events --limit 400"
 
 # ---- the spool caps --------------------------------------------------------
 #
