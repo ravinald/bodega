@@ -103,3 +103,21 @@ e2e_apt_version() {
 	fi
 	printf '%s' "$E2E_APT_VERSION"
 }
+
+# e2e_wait_for_health <alias> [seconds] — poll /healthz until it answers.
+#
+# Used after a deliberate kill, where the question is whether the supervisor
+# brings the process back and how long it takes. A fixed sleep answers neither:
+# too short and a working restart reads as a failure, too long and a unit that
+# never comes back costs the budget anyway.
+e2e_wait_for_health() {
+	local alias="$1" budget="${2:-30}" waited=0
+	while [ "$waited" -lt "$budget" ]; do
+		if e2e_on "$alias" "curl -sf -o /dev/null --max-time 5 http://127.0.0.1:8080/healthz" >/dev/null 2>&1; then
+			return 0
+		fi
+		sleep 1
+		waited=$((waited + 1))
+	done
+	return 1
+}
