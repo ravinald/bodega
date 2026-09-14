@@ -55,9 +55,17 @@ const (
 // directed to buf. When cfg.LogDir is set and accessible, a BuildLogger is
 // created and its session writer is teed into the buffer so that all output
 // lands in both the TUI log pane and the on-disk session log.
-func builderCfg(buf *bytes.Buffer, cfg *config.Config) *builder.Config {
+//
+// auditDB is the database the shell command opened and closes on exit. Every
+// builder.Config the TUI runs a stage on is built here so that no stage can
+// reach a fetcher without it: NewConfig leaves AuditDB to the caller, and a
+// fetcher holding a nil one writes the digest to the manifest and silently
+// skips the checksum row `pkg checksum list` reads. It may be nil when the
+// install configures no audit_db, which is the same state the CLI passes.
+func builderCfg(buf *bytes.Buffer, cfg *config.Config, auditDB *audit.DB) *builder.Config {
 	bc := builder.NewConfig(cfg)
 	bc.Stdout = buf
+	bc.AuditDB = auditDB
 
 	if cfg.LogDir != "" {
 		logger, err := logging.NewBuildLogger(cfg.LogDir)
@@ -76,20 +84,20 @@ func builderCfg(buf *bytes.Buffer, cfg *config.Config) *builder.Config {
 
 // executeStage runs a specific build pipeline stage for a single entry and
 // returns a tea.Cmd that delivers the result as a cmdOutputMsg.
-func executeStage(stage BuildStage, entryType, entryName string, cfg *config.Config, store *manifest.Store, stores storage.Resolver, force ...bool) tea.Cmd {
+func executeStage(stage BuildStage, entryType, entryName string, cfg *config.Config, store *manifest.Store, stores storage.Resolver, auditDB *audit.DB, force ...bool) tea.Cmd {
 	return func() tea.Msg {
 		var buf bytes.Buffer
 		var err error
 		refresh := false
 
-		bc := builderCfg(&buf, cfg)
+		bc := builderCfg(&buf, cfg, auditDB)
 		if len(force) > 0 && force[0] {
 			bc.Force = true
 		}
 
 		switch stage {
 		case StageFetch:
-			err = runFetch(&buf, cfg, store, []string{entryType, "--entry", entryName})
+			err = runFetch(&buf, cfg, store, auditDB, []string{entryType, "--entry", entryName})
 		case StageBuild:
 			err = runBuildStage(&buf, bc, store, entryType, entryName)
 		case StagePackage:
@@ -98,13 +106,13 @@ func executeStage(stage BuildStage, entryType, entryName string, cfg *config.Con
 			if stores == nil {
 				err = fmt.Errorf("deploy requires a configured storage backend")
 			} else {
-				err = runUpload(&buf, cfg, store, stores, []string{entryType})
+				err = runUpload(&buf, cfg, store, stores, auditDB, []string{entryType})
 				if err == nil {
 					refresh = true
 				}
 			}
 		case StageAll:
-			err = runFullPipeline(&buf, cfg, bc, store, stores, entryType, entryName)
+			err = runFullPipeline(&buf, cfg, bc, store, stores, auditDB, entryType, entryName)
 			if err == nil {
 				refresh = true
 			}
@@ -193,9 +201,9 @@ func runPackageStage(buf *bytes.Buffer, bc *builder.Config, store *manifest.Stor
 }
 
 // runFullPipeline runs fetch → build → package → upload for a single entry.
-func runFullPipeline(buf *bytes.Buffer, cfg *config.Config, bc *builder.Config, store *manifest.Store, stores storage.Resolver, entryType, entryName string) error {
+func runFullPipeline(buf *bytes.Buffer, cfg *config.Config, bc *builder.Config, store *manifest.Store, stores storage.Resolver, auditDB *audit.DB, entryType, entryName string) error {
 	// Fetch
-	if err := runFetch(buf, cfg, store, []string{entryType, "--entry", entryName}); err != nil {
+	if err := runFetch(buf, cfg, store, auditDB, []string{entryType, "--entry", entryName}); err != nil {
 		return fmt.Errorf("fetch: %w", err)
 	}
 	// Build
@@ -211,14 +219,14 @@ func runFullPipeline(buf *bytes.Buffer, cfg *config.Config, bc *builder.Config, 
 		fmt.Fprintf(buf, "Skipping deploy: no storage backend configured.\n")
 		return nil
 	}
-	return runUpload(buf, cfg, store, stores, []string{entryType})
+	return runUpload(buf, cfg, store, stores, auditDB, []string{entryType})
 }
 
 // executeSyncAll uploads all artifact types to S3 and returns a tea.Cmd.
-func executeSyncAll(types []string, cfg *config.Config, store *manifest.Store, stores storage.Resolver) tea.Cmd {
+func executeSyncAll(types []string, cfg *config.Config, store *manifest.Store, stores storage.Resolver, auditDB *audit.DB) tea.Cmd {
 	return func() tea.Msg {
 		var buf bytes.Buffer
-		err := runUpload(&buf, cfg, store, stores, types)
+		err := runUpload(&buf, cfg, store, stores, auditDB, types)
 		return cmdOutputMsg{output: buf.String(), refresh: err == nil, err: err}
 	}
 }
@@ -295,13 +303,13 @@ func signalServer(buf *bytes.Buffer, cfg *config.Config) {
 	}
 }
 
-func runFetch(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, args []string) error {
+func runFetch(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, auditDB *audit.DB, args []string) error {
 	entryFilter, remaining := extractFlag(args, "--entry")
 	types, err := resolveTypes(remaining)
 	if err != nil {
 		return err
 	}
-	bc := builderCfg(buf, cfg)
+	bc := builderCfg(buf, cfg, auditDB)
 	totalFail := 0
 	for _, t := range types {
 		var sum *builder.Summary
@@ -346,7 +354,7 @@ func runFetch(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, args
 // knew four of the eight types and reported the other four as "No artifacts",
 // carried its own copies of the key prefixes, and synced whole directories to
 // the default bucket whatever storage_by_type said.
-func runUpload(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, stores storage.Resolver, args []string) error {
+func runUpload(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, stores storage.Resolver, auditDB *audit.DB, args []string) error {
 	if stores == nil {
 		return fmt.Errorf("upload requires a configured storage backend")
 	}
@@ -355,7 +363,7 @@ func runUpload(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, sto
 		return err
 	}
 	pl := placement.NewWith(stores, store, buf, false)
-	bc := builderCfg(buf, cfg)
+	bc := builderCfg(buf, cfg, auditDB)
 	ctx := context.Background()
 	for _, t := range types {
 		fmt.Fprintf(buf, "\n--- upload: %s ---\n", t)

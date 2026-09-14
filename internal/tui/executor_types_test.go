@@ -22,7 +22,7 @@ var stageRunners = map[string]func(buf *bytes.Buffer, bc *builder.Config, store 
 	// directory, which is how this test first wrote a pypi artifact into the
 	// package source tree.
 	"fetch": func(buf *bytes.Buffer, bc *builder.Config, store *manifest.Store, typ string) error {
-		return runFetch(buf, &config.Config{BuildRoot: bc.BuildRoot, ManifestDir: bc.ManifestDir}, store, []string{typ})
+		return runFetch(buf, &config.Config{BuildRoot: bc.BuildRoot, ManifestDir: bc.ManifestDir}, store, nil, []string{typ})
 	},
 	"build": func(buf *bytes.Buffer, bc *builder.Config, store *manifest.Store, typ string) error {
 		return runBuildStage(buf, bc, store, typ, "")
@@ -81,7 +81,7 @@ func TestStagesNameAnUnhandledType(t *testing.T) {
 func TestExecuteStageNamesAnUnhandledStage(t *testing.T) {
 	store := manifest.NewLocalStore(t.TempDir())
 	cfg := &config.Config{BuildRoot: t.TempDir(), ManifestDir: t.TempDir()}
-	msg := executeStage(BuildStage(99), manifest.TypeGomod, "example.com/m", cfg, store, nil)()
+	msg := executeStage(BuildStage(99), manifest.TypeGomod, "example.com/m", cfg, store, nil, nil)()
 	out, ok := msg.(cmdOutputMsg)
 	if !ok {
 		t.Fatalf("executeStage returned %T, want cmdOutputMsg", msg)

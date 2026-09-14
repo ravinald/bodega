@@ -64,7 +64,7 @@ func TestTUIUploadReachesTheNamedBackend(t *testing.T) {
 	seedLocal(t, cfg.BuildRoot, "binaries/awscli/2.0.0/awscli.zip", "binary-bytes")
 
 	var buf bytes.Buffer
-	if err := runUpload(&buf, cfg, store, stores, []string{manifest.TypeBinary}); err != nil {
+	if err := runUpload(&buf, cfg, store, stores, nil, []string{manifest.TypeBinary}); err != nil {
 		t.Fatalf("runUpload: %v", err)
 	}
 
@@ -110,7 +110,7 @@ func TestTUIUploadCoversEveryType(t *testing.T) {
 	for _, s := range seeds {
 		types = append(types, s.typ)
 	}
-	if err := runUpload(&buf, cfg, store, stores, types); err != nil {
+	if err := runUpload(&buf, cfg, store, stores, nil, types); err != nil {
 		t.Fatalf("runUpload: %v", err)
 	}
 	for _, s := range seeds {
