@@ -18,3 +18,26 @@ PIPE-APT-07	311	PackageApt writes pool paths under the binary name
 PROF-16	310	an apt pin cannot name a source version
 PROF-17	300	attestation serves provenance for a package the profile refuses
 PIPE-APT-08	271	_pool_path is unconditional provenance, so no SHA256 when mirroring
+PIPE-VERSION-pypi	325	filed from run 20260914T091319Z-9f7c138
+SRV-IDX-npm	326	filed from run 20260914T091319Z-9f7c138
+SRV-IDX-cargo	327	filed from run 20260914T091319Z-9f7c138
+CLI-NPM-01	328	filed from run 20260914T091319Z-9f7c138
+CLI-NPM-02	329	filed from run 20260914T091319Z-9f7c138
+CLI-CARGO-01	330	filed from run 20260914T091319Z-9f7c138
+CLI-GIT-02	331	filed from run 20260914T091319Z-9f7c138
+POL-17	332	filed from run 20260914T091319Z-9f7c138
+PROF-14	333	filed from run 20260914T091319Z-9f7c138
+PROF-14b	334	filed from run 20260914T091319Z-9f7c138
+PROF-ID-02	335	filed from run 20260914T091319Z-9f7c138
+ACC-06b	337	filed from run 20260914T091319Z-9f7c138
+PXY-GOMOD-01	338	filed from run 20260914T091319Z-9f7c138
+PXY-02	339	filed from run 20260914T091319Z-9f7c138
+PXY-02b	340	filed from run 20260914T091319Z-9f7c138
+PXY-04	341	filed from run 20260914T091319Z-9f7c138
+INT-02	342	filed from run 20260914T091319Z-9f7c138
+INT-02b	343	filed from run 20260914T091319Z-9f7c138
+INT-02c	344	filed from run 20260914T091319Z-9f7c138
+INT-03a	345	filed from run 20260914T091319Z-9f7c138
+INT-04	346	filed from run 20260914T091319Z-9f7c138
+INT-05	347	filed from run 20260914T091319Z-9f7c138
+JSON-EMPTY-01	348	filed from run 20260914T091319Z-9f7c138
