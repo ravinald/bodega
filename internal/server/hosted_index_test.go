@@ -378,6 +378,52 @@ func TestAPackageNoEntryNamesIsNotGenerated(t *testing.T) {
 	}
 }
 
+// R1: an entry chooses generation, and the mode it records does not. Reserved
+// for hosted entries, generation left a proxy-mode package answering the
+// upstream's failure on the one route a client resolves through, while the
+// versions it pins sat in the manifest the whole time.
+func TestNpmPackumentIsGeneratedForAProxyModeEntry(t *testing.T) {
+	s := hostedServer(t)
+	ve := sha256Entry("1.3.0", leftPadTarball)
+	ve.Mode = manifest.ModeProxy
+	addVersion(t, s, manifest.TypeNpm, "left-pad", ve)
+
+	status, body := getStatusAndBody(t, s, "/npm/left-pad")
+	if status != http.StatusOK {
+		t.Fatalf("GET /npm/left-pad on a proxy-mode entry = %d, want 200: %s", status, body)
+	}
+	entry := npmVersionEntry(t, decodeJSON(t, body), "1.3.0")
+	if entry == nil {
+		t.Fatalf("packument names no 1.3.0: %s", body)
+	}
+	dist, _ := entry["dist"].(map[string]any)
+	if tarball, _ := dist["tarball"].(string); !strings.HasSuffix(tarball, "/npm/left-pad/-/left-pad-1.3.0.tgz") {
+		t.Errorf("dist.tarball = %q, want this bodega's /npm route", tarball)
+	}
+}
+
+// R3: the same for the sparse index. cargo resolves through this document and
+// nothing else, so a proxy-mode crate whose upstream is unreachable was a
+// crate cargo could not name, with its versions recorded here all along.
+func TestCargoIndexIsGeneratedForAProxyModeEntry(t *testing.T) {
+	s := hostedServer(t)
+	ve := sha256Entry("1.0.11", itoaCrate)
+	ve.Mode = manifest.ModeProxy
+	addVersion(t, s, manifest.TypeCargo, "itoa", ve)
+
+	status, body := getStatusAndBody(t, s, "/cargo/it/oa/itoa")
+	if status != http.StatusOK {
+		t.Fatalf("GET /cargo/it/oa/itoa on a proxy-mode entry = %d, want 200: %s", status, body)
+	}
+	recs := cargoIndexRecords(t, body)
+	if len(recs) != 1 {
+		t.Fatalf("index carries %d lines, want 1: %s", len(recs), body)
+	}
+	if recs[0]["vers"] != "1.0.11" || recs[0]["cksum"] != sha256Hex(itoaCrate) {
+		t.Errorf("index line = %v, want 1.0.11 carrying the crate's digest %s", recs[0], sha256Hex(itoaCrate))
+	}
+}
+
 // #319: the version-manifest route resolves its manifest under the package,
 // so the hidden-version and constraint policies reach it. Looked up under
 // "<pkg>/<version>" the lookup never hit and every refusal below it was

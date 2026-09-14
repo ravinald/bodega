@@ -107,24 +107,24 @@ func (s *Server) handleCargoIndex(w http.ResponseWriter, r *http.Request, p stri
 	}
 	permit := profileVersionFilter(s.profileFor(r), manifest.TypeCargo, crate)
 
-	// A hosted entry is bodega's own claim about the crate, so the index line
-	// is generated from it rather than fetched. Proxied instead, every hosted
+	// An entry is bodega's own claim about the crate, so the index line is
+	// generated from it rather than fetched. Proxied instead, every hosted
 	// crate 404s on the route cargo resolves through while its /download route
 	// serves the bytes to nobody who can find them.
 	//
-	// Mode, not merely the presence of an entry: a proxy-mode entry names the
-	// versions somebody pinned, not the versions crates.io publishes, and a
-	// document generated from it would hide the rest.
-	if pm != nil && packageMode(pm) != manifest.ModeProxy {
+	// The entry decides, not its mode: mode records where a version's bytes
+	// come from and the download route reads it on its own, so excluding
+	// proxy-mode entries here left a pinned crate answering the upstream's
+	// failure on the route cargo resolves through.
+	if pm != nil {
 		s.serveManifestCargoIndex(w, r, crate, pm, permit)
 		return
 	}
 
 	upstream := strings.TrimRight(s.cfg.CargoUpstream, "/") + "/" + p
 	s3Key := manifest.CargoIndexKey(p)
-	forceProxy := pm != nil && packageMode(pm) == manifest.ModeProxy
 	if permit == nil {
-		s.proxyOrCache(w, r, s.typeStore(manifest.TypeCargo), s3Key, upstream, manifest.TypeCargo, crate, crate, false, forceProxy)
+		s.proxyOrCache(w, r, s.typeStore(manifest.TypeCargo), s3Key, upstream, manifest.TypeCargo, crate, crate, false, false)
 		return
 	}
 	rw := &indexFilterWriter{
@@ -132,7 +132,7 @@ func (s *Server) handleCargoIndex(w http.ResponseWriter, r *http.Request, p stri
 		subject:        "the cargo index for " + crate,
 		filter:         func(b []byte) []byte { return filterCargoIndex(b, permit) },
 	}
-	s.proxyOrCache(rw, r, s.typeStore(manifest.TypeCargo), s3Key, upstream, manifest.TypeCargo, crate, crate, false, forceProxy)
+	s.proxyOrCache(rw, r, s.typeStore(manifest.TypeCargo), s3Key, upstream, manifest.TypeCargo, crate, crate, false, false)
 	if err := rw.flush(); err != nil {
 		s.logger.Error("cargo index response failed", "crate", crate, "error", err)
 	}

@@ -113,29 +113,18 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 
-	// A hosted entry is bodega's own claim about the package, so the document
-	// is generated from it rather than fetched. Proxying it instead is what
-	// 404s every hosted npm package on an install with proxy_cache_enabled
-	// false: the tarballs are already here and nothing but this document tells
-	// a client where they are.
+	// An entry is bodega's own claim about the package, so the document is
+	// generated from it rather than fetched. Proxying it instead is what 404s
+	// every hosted npm package on an install with proxy_cache_enabled false:
+	// the tarballs are already here and nothing but this document tells a
+	// client where they are.
 	//
-	// Mode, not merely the presence of an entry. A proxy-mode entry exists to
-	// say "this comes from upstream", and its manifest names the versions
-	// somebody pinned rather than the versions the registry publishes —
-	// generated from it, the document would hide every other release while the
-	// tarball route went on serving them.
-	if pm != nil && packageMode(pm) != manifest.ModeProxy {
+	// The entry decides, not its mode. Mode records where a version's bytes
+	// come from and the tarball route reads it on its own; excluding
+	// proxy-mode entries here left a pinned package answering the upstream's
+	// failure on the one route a client resolves through.
+	if pm != nil {
 		s.serveManifestPackument(w, r, pkgName, reqVersion, pm, permit)
-		return
-	}
-
-	// The manifest-filtered packument is still not cached: that path builds its
-	// document from the manifest rather than from the upstream's, so what it
-	// would write is not the object the key names. The profile filter below
-	// runs over the buffered response instead, which is why this path caches:
-	// the object stays the upstream packument.
-	if pm != nil && (hasHiddenVersion(pm) || hasVersionConstraint(pm)) {
-		s.serveFilteredPackument(w, r, fullPath, pkgName, pm, permit)
 		return
 	}
 
@@ -144,9 +133,8 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 	// cache key for both would serve whichever was fetched first.
 	upstream := s.cfg.NpmUpstream + "/" + fullPath
 	s3Key := manifest.NpmPackumentKey(fullPath)
-	forceProxy := pm != nil && packageMode(pm) == manifest.ModeProxy
 	rw := &npmPackumentWriter{ResponseWriter: w, base: s.npmPublicRoot(r), pkg: fullPath, permit: permit}
-	s.proxyOrCache(rw, r, s.typeStore(manifest.TypeNpm), s3Key, upstream, manifest.TypeNpm, pkgName, pkgName, false, forceProxy)
+	s.proxyOrCache(rw, r, s.typeStore(manifest.TypeNpm), s3Key, upstream, manifest.TypeNpm, pkgName, pkgName, false, false)
 	if err := rw.flush(); err != nil {
 		s.logger.Error("npm packument response failed", "package", pkgName, "error", err)
 	}
@@ -185,67 +173,6 @@ func isVersionHidden(pm *manifest.PackageManifest, version string) bool {
 		}
 	}
 	return false
-}
-
-func hasHiddenVersion(pm *manifest.PackageManifest) bool {
-	for _, ve := range pm.Versions {
-		if ve.Hidden {
-			return true
-		}
-	}
-	return false
-}
-
-func hasVersionConstraint(pm *manifest.PackageManifest) bool {
-	vc, baseVer := packageVersionConstraint(pm)
-	return vc != "" && vc != manifest.ConstraintAny && baseVer != ""
-}
-
-// reqPath is what the client asked for and pkgName is the package it names:
-// the two differ on the version-manifest route, where the upstream document to
-// fetch is the version's and the package every filter is keyed on is not.
-func (s *Server) serveFilteredPackument(w http.ResponseWriter, r *http.Request, reqPath, pkgName string, pm *manifest.PackageManifest, permit func(string) bool) {
-	upstream := s.cfg.NpmUpstream + "/" + reqPath
-	data, ct, err := fetchUpstream(r.Context(), upstream)
-	if err != nil {
-		s.logger.Error("packument fetch failed", "url", upstream, "error", err)
-		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
-		return
-	}
-
-	filtered, err := filterPackumentByManifest(data, pm)
-	if err != nil {
-		s.logger.Error("packument filter failed", "pkg", pkgName, "error", err)
-		http.Error(w, "packument filter failed", http.StatusInternalServerError)
-		return
-	}
-
-	filtered, err = filterPackumentByProfile(filtered, permit)
-	if err != nil {
-		s.logger.Error("packument profile filter failed", "pkg", pkgName, "error", err)
-		http.Error(w, "packument filter failed", http.StatusInternalServerError)
-		return
-	}
-
-	// The same rewrite the unfiltered path applies, through the same function.
-	// A client whose package trips the filter and one whose package does not
-	// have to be told the same URL for the same version; two composition sites
-	// is two that can drift.
-	filtered, err = rewriteNpmPackument(filtered, s.npmPublicRoot(r), pkgName)
-	if err != nil {
-		s.logger.Error("packument rewrite failed", "pkg", pkgName, "error", err)
-		http.Error(w, "packument rewrite failed", http.StatusBadGateway)
-		return
-	}
-
-	if ct == "" {
-		ct = "application/json"
-	}
-	w.Header().Set("Content-Type", ct)
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(filtered)))
-	w.WriteHeader(http.StatusOK)
-	//nolint:gosec // G705: filtered is the JSON packument body; Content-Type set to application/json above.
-	_, _ = w.Write(filtered)
 }
 
 // serveManifestPackument answers a packument out of the manifest store, with
