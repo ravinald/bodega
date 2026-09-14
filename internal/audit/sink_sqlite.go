@@ -25,6 +25,18 @@ type sqliteSink struct {
 
 func (s *sqliteSink) Name() string { return SinkSQLite }
 
+// writer is the handle every sink write goes through, for the same reason
+// DB.writer exists: a new write that names the field picks whichever handle
+// its neighbour picked, and rdb is query_only. On a read-only open there is no
+// write handle, so this returns the one that refuses rather than the nil the
+// field holds.
+func (s *sqliteSink) writer() *sql.DB {
+	if s.wdb != nil {
+		return s.wdb
+	}
+	return s.rdb
+}
+
 // Close is a no-op: the handle belongs to *DB, which closes it.
 func (s *sqliteSink) Close() error { return nil }
 
@@ -32,7 +44,7 @@ func (s *sqliteSink) Record(ctx context.Context, ev Event) error {
 	if s.readOnly {
 		return nil
 	}
-	_, err := s.wdb.ExecContext(ctx,
+	_, err := s.writer().ExecContext(ctx,
 		`INSERT INTO events (event_type, pkg_type, pkg_name, pkg_version, client_ip, user_agent, status, duration_ms, details, actor, identity)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		string(ev.EventType), ev.PkgType, ev.PkgName, ev.PkgVersion,
@@ -55,7 +67,7 @@ func (s *sqliteSink) RecordDiscovery(ctx context.Context, rows ...DiscoveryRow) 
 	for _, chunk := range chunkDiscovery(rows) {
 		//nolint:gosec // G202: the statement is assembled from a generated placeholder list; every value is bound.
 		q, args := buildDiscoveryUpsert(coalesceDiscovery(chunk), false)
-		if _, err := s.wdb.ExecContext(ctx, q, args...); err != nil {
+		if _, err := s.writer().ExecContext(ctx, q, args...); err != nil {
 			return applied, err
 		}
 		applied += len(chunk)
@@ -271,9 +283,9 @@ func (s *sqliteSink) ClearDiscovery(ctx context.Context, registryType string) (i
 		err error
 	)
 	if registryType == "" {
-		res, err = s.wdb.ExecContext(ctx, `DELETE FROM upstream_discovery`)
+		res, err = s.writer().ExecContext(ctx, `DELETE FROM upstream_discovery`)
 	} else {
-		res, err = s.wdb.ExecContext(ctx,
+		res, err = s.writer().ExecContext(ctx,
 			`DELETE FROM upstream_discovery WHERE registry_type = ?`, registryType)
 	}
 	if err != nil {

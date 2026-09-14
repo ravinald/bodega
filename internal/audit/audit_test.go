@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -32,6 +33,40 @@ func TestOpenCreatesDB(t *testing.T) {
 
 	if _, err := os.Stat(path); err != nil {
 		t.Errorf("db file not created: %v", err)
+	}
+}
+
+// TestReadPoolRefusesWrites holds the two-handle split to its precondition:
+// exactly one pool writes. A write that reaches the read pool costs no error
+// and no row, it just puts a second unbounded set of connections back on the
+// write lock, which is the contention the single-connection write handle was
+// added to remove. query_only turns that into a failure at the first call.
+func TestReadPoolRefusesWrites(t *testing.T) {
+	db := tempDB(t)
+	ctx := context.Background()
+
+	const ins = `INSERT INTO acl_entries (list, cidr) VALUES ('deny', '203.0.113.0/24')`
+
+	_, err := db.db.ExecContext(ctx, ins)
+	if err == nil {
+		t.Fatal("the read pool accepted an INSERT; it must be opened query_only")
+	}
+	if !strings.Contains(err.Error(), "readonly") {
+		t.Errorf("read pool refused with %v, want SQLite's readonly-database error", err)
+	}
+
+	// Control: the same statement through the write handle. Without it the
+	// assertion above would also pass on a store where nothing can be written.
+	if _, err := db.writer().ExecContext(ctx, ins); err != nil {
+		t.Fatalf("write handle refused the same INSERT: %v", err)
+	}
+
+	// The sqlite sink reads through this very handle rather than opening the
+	// file a third time, so its reads inherit the refusal above.
+	if sink, ok := db.sink.(*sqliteSink); !ok {
+		t.Fatalf("default sink is %T, want *sqliteSink", db.sink)
+	} else if sink.rdb != db.db {
+		t.Error("the sqlite sink reads through a handle that is not the store's read pool")
 	}
 }
 

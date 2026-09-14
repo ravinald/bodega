@@ -186,8 +186,9 @@ type Filter struct {
 type DB struct {
 	db *sql.DB
 	// wdb is the write handle, capped at one connection. Nil on a read-only
-	// open, where writer() falls back to db and Record is a no-op anyway.
-	// See writer() for why there are two.
+	// open, where writer() falls back to db — which is query_only, so the
+	// write is refused rather than quietly taken. See writer() for why there
+	// are two.
 	wdb      *sql.DB
 	sink     EventSink       // where events go; sqliteSink shares db when audit_sink is "sqlite"
 	filter   map[string]bool // nil = record all; otherwise only listed types
@@ -215,6 +216,10 @@ type DB struct {
 // below is right about: SetMaxOpenConns(1) on a shared handle would put a
 // dashboard query behind every write, and WAL mode is turned on so that it is
 // not. Two handles keep both properties; one handle can only have either.
+//
+// That split holds only while exactly one of the two pools writes, so the read
+// pool is opened query_only and this accessor is how a write finds the other
+// one. A write that names a.db instead fails at SQLite.
 func (a *DB) writer() *sql.DB {
 	if a.wdb != nil {
 		return a.wdb
@@ -396,7 +401,14 @@ func openStore(path string, sc SinkConfig, forceReadOnly bool) (*DB, error) {
 		}
 	}
 
-	db, err := sql.Open("sqlite", dsn(path, forceReadOnly))
+	// The read pool, query_only on every open and not just the read-only
+	// ones. Two handles only keep their properties while exactly one of them
+	// writes, and the way that stops being true is a write added to a read
+	// path copying the handle its neighbour named. Through a writable read
+	// pool that write succeeds, silently restoring the two-contender shape
+	// busyTimeout was papering over; through this one it is a database error
+	// at the first call.
+	db, err := sql.Open("sqlite", dsn(path, true))
 	if err != nil {
 		return nil, fmt.Errorf("open audit db %s: %w", path, err)
 	}
@@ -452,7 +464,7 @@ func openStore(path string, sc SinkConfig, forceReadOnly bool) (*DB, error) {
 		// checksum row, and a store that refuses that write fails the open
 		// after 012 has already committed.
 		if from < policySeedVersion {
-			if err := claimPolicySeed(context.Background(), db, PolicySeedAge); err != nil {
+			if err := claimPolicySeed(context.Background(), wdb, PolicySeedAge); err != nil {
 				closeAll()
 				return nil, fmt.Errorf("claim age policy default: %w", err)
 			}
@@ -462,7 +474,7 @@ func openStore(path string, sc SinkConfig, forceReadOnly bool) (*DB, error) {
 		// s3_key, so it runs here on the upgrade that crosses it rather than
 		// costing every open a full scan of a table that grows with the cache.
 		if from < checksumIdentityVersion {
-			n, err := backfillChecksumIdentity(context.Background(), db)
+			n, err := backfillChecksumIdentity(context.Background(), wdb)
 			if err != nil {
 				closeAll()
 				return nil, fmt.Errorf("backfill checksum package identity: %w", err)
@@ -471,7 +483,7 @@ func openStore(path string, sc SinkConfig, forceReadOnly bool) (*DB, error) {
 				slog.Info("checksum rows re-derived from their object key", "rows", n, "migration", checksumIdentityVersion)
 			}
 		}
-		seeded, err := seedDefaultAgePolicy(context.Background(), db)
+		seeded, err := seedDefaultAgePolicy(context.Background(), wdb)
 		if err != nil {
 			closeAll()
 			return nil, fmt.Errorf("seed default age policy: %w", err)
