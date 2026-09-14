@@ -40,6 +40,28 @@ check_lacks INT-02 "the checksum cache is not empty after eight types were fetch
 # sidecar is what a tampering attempt looks like from the filesystem, and
 # `pkg verify` is the only thing that reads the pair.
 
+# The sidecar is the thing verification compares against. With none on disk,
+# `pkg verify` has nothing to check and its "All manifests passed integrity
+# check" is a statement about an empty comparison. README.md advertises
+# "Manifest integrity: MD5 verification on every read/write".
+e2e_on server "sudo find /var/lib/bodega/manifests -name '*.md5' | wc -l | tr -d ' '" || true
+check_ne INT-02b "the manifest store carries md5 sidecars to verify against" \
+	"0" "$E2E_OUT" "README.md" "find /var/lib/bodega/manifests -name '*.md5' | wc -l"
+
+# Reported MISSING while the file is on disk, in the same output that then
+# declares every manifest passed.
+e2e_on server "sudo test -f /var/lib/bodega/manifests/cargo/itoa/manifest.json && echo present || echo absent" || true
+cargo_manifest="$E2E_OUT"
+e2e_bodega server "pkg verify" || true
+if [ "$cargo_manifest" = present ]; then
+	check_lacks INT-02c "verify does not report a manifest missing while it is on disk" \
+		"cargo    MISSING" "$E2E_OUT" "cmd/bodega/cmd_verify.go:15" \
+		"bodega pkg verify with cargo/itoa/manifest.json present"
+else
+	e2e_skip INT-02c "verify does not report a manifest missing while it is on disk" \
+		"no cargo manifest in this store"
+fi
+
 e2e_bodega server "pkg verify" || true
 check_eq INT-03 "a clean store verifies" 0 "$E2E_RC" \
 	"cmd/bodega/cmd_verify.go:15" "bodega pkg verify" "$E2E_RC"
@@ -114,4 +136,4 @@ e2e_bodega server "build status" || true
 check_lacks INT-11 "nothing is missing from the backend" "MISSING" "$E2E_OUT" \
 	"cmd/bodega/cmd_status.go:15" "bodega build status"
 
-unset before MANIFEST
+unset before MANIFEST cargo_manifest

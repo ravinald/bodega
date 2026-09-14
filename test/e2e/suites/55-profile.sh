@@ -31,7 +31,9 @@ E2E_HOST=server
 # ---- build a profile -------------------------------------------------------
 
 e2e_bodega server "profile remove e2e-profile binary hello-binary --force" >/dev/null 2>&1 || true
-e2e_bodega server "profile create e2e-profile --description 'e2e run' --force" || true
+# --overwrite, not --force: a second run of this suite meets the profile the
+# first one left behind, and `profile create` refuses a name that exists.
+e2e_bodega server "profile create e2e-profile --description 'e2e run' --overwrite" || true
 check_eq PROF-01 "a profile is created" 0 "$E2E_RC" \
 	"cmd/bodega/cmd_profile.go:130" "bodega profile create e2e-profile" "$E2E_RC"
 
@@ -44,8 +46,12 @@ check_contains PROF-02 "the profile is listed" "e2e-profile" "$E2E_OUT" \
 # "every apt request from a bound host is served and recorded as a reach
 # outside this class". A suite that set only the membership would measure a
 # profile that refuses nothing and read every 200 as a missing control.
+# --force because six of these types end up closed with nothing listed, and
+# bodega refuses that combination by default: it permits nothing of the type
+# and the refusal names no package, so it wants you to mean it. Here it is
+# meant — the whole suite is about what a profile refuses.
 for t in binary git apt pypi gomod helm npm cargo; do
-	e2e_bodega server "profile set e2e-profile $t --membership closed --expansion block" || true
+	e2e_bodega server "profile set e2e-profile $t --membership closed --expansion block --force" || true
 done
 e2e_bodega server "profile show e2e-profile" || true
 check_contains PROF-03 "the profile shows closed membership" "closed" "$E2E_OUT" \

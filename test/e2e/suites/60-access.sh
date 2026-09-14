@@ -93,14 +93,6 @@ check_ne ACC-05 "widening past loopback is refused while no token exists" \
 
 # ---- a token, then the widening -------------------------------------------
 
-e2e_bodega server "token generate e2e-token expiry 1d 'e2e run'" || true
-# Anchored on the "Token:" label. Taking the longest string in the output
-# instead picks up the token ID, which is the same shape, printed two lines
-# later, and produces a 401 that reads as a broken auth path.
-E2E_TOKEN="$(printf '%s' "$E2E_OUT" | awk '/^[[:space:]]*Token:/ {print $2; exit}')"
-check_matches ACC-06 "token generate prints a token once" '.{24,}' "${E2E_TOKEN:-none}" \
-	"cmd/bodega/cmd_token.go:37" "bodega token generate e2e-token expiry 1d"
-
 # The pepper is the file the token hash is keyed on. `token generate` creates
 # /etc/bodega/pepper when run as root, mode 0600 root:root, and the service runs
 # as its own user: it cannot read that file, falls back to the pepper under its
@@ -133,8 +125,21 @@ e2e_bodega server "token revoke e2e-pepper-probe" >/dev/null 2>&1 || true
 # Repaired here rather than left broken, so the checks below measure the token
 # path instead of re-reporting the pepper. ACC-06b above is where the defect is
 # recorded.
+#
+# This runs before the token the later checks use is minted. Removing the
+# pepper invalidates every token already hashed against it, so probing after
+# minting leaves that token permanently rejected and the authorization checks
+# fail for a reason the suite created.
 e2e_on server "sudo chown ${E2E_SERVICE_USER:-bodega} /etc/bodega/pepper 2>/dev/null; true" || true
 e2e_restart server || true
+
+e2e_bodega server "token generate e2e-token expiry 1d 'e2e run'" || true
+# Anchored on the "Token:" label. Taking the longest string in the output
+# instead picks up the token ID, which is the same shape, printed two lines
+# later, and produces a 401 that reads as a broken auth path.
+E2E_TOKEN="$(printf '%s' "$E2E_OUT" | awk '/^[[:space:]]*Token:/ {print $2; exit}')"
+check_matches ACC-06 "token generate prints a token once" '.{24,}' "${E2E_TOKEN:-none}" \
+	"cmd/bodega/cmd_token.go:37" "bodega token generate e2e-token expiry 1d"
 
 e2e_bodega server "acl admin add $E2E_CLIENT_CIDR --comment 'e2e run'" || true
 check_eq ACC-07 "widening is accepted once a token exists" 0 "$E2E_RC" \

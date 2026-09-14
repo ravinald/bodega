@@ -303,6 +303,21 @@ done
 # Two suites sharing a check id make the known-issue map ambiguous and the
 # report wrong, and nothing else in the harness would notice.
 E2E_SUITE="report"
+# A mapping whose check id no verdict carries is an issue the harness does not
+# cover yet. Not an error: the row is how you see which open issues still have
+# no check behind them, and the alternative is finding out by not finding out.
+if [ -z "$SUITE_FILTER" ] && [ "$E2E_DRY_RUN" = no ]; then
+	uncovered=""
+	while IFS=$'\t' read -r kid kissue _; do
+		case "$kid" in '' | '#'*) continue ;; esac
+		jq -e --arg id "$kid" 'select(.id==$id)' "$E2E_FINDINGS" >/dev/null 2>&1 ||
+			uncovered="$uncovered $kid(#$kissue)"
+	done <"$E2E_KNOWN_FILE"
+	if [ -n "$uncovered" ]; then
+		printf '\nknown issues with no check yet:%s\n' "$uncovered"
+	fi
+fi
+
 dupes="$(jq -r .id "$E2E_FINDINGS" | sort | uniq -d | tr '\n' ' ')"
 if [ -n "$dupes" ]; then
 	printf '\nduplicate check ids: %s\n' "$dupes" >&2
