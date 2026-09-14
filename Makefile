@@ -17,7 +17,7 @@ GO_INSTALL := /usr/local/go/bin/go
 # are both read against. `make ci-drift` fails when the two disagree, so a job
 # added to CI cannot reach main without also reaching the drover gate — which
 # is how gofmt drift shipped through a green gate once already.
-CI_GATE_JOBS := vet lint fmt tidy test
+CI_GATE_JOBS := vet lint fmt tidy test harness
 
 # Each CI job paired with the `check` leg that runs it. The names differ by
 # convention (fmt > fmt-check), so without the pairing a job sits in
@@ -26,11 +26,16 @@ CI_GATE_JOBS := vet lint fmt tidy test
 # Written out rather than derived: deriving `check`'s prerequisites from
 # CI_GATE_JOBS runs them in that list's order, which puts lint ahead of
 # fmt-check and costs the cheapest-first ordering CHECK_LEGS holds.
-CI_GATE_TARGETS := vet=vet lint=lint fmt=fmt-check tidy=tidy-check test=test
+CI_GATE_TARGETS := vet=vet lint=lint fmt=fmt-check tidy=tidy-check test=test harness=harness
 
 # The legs `check` runs, in order. `check` has no prerequisites outside this
 # list, so it is what ran, and `ci-drift` reads CI_GATE_TARGETS against it.
-CHECK_LEGS := ci-drift fmt-check tidy-check vet build lint test
+CHECK_LEGS := ci-drift fmt-check tidy-check harness vet build lint test
+
+# Every shell file in the tree. `shfmt -f` finds them by shebang and by
+# shell= directive, so a suite added without touching this line is still
+# linted.
+E2E_SHELL := $(shell shfmt -f test/e2e 2>/dev/null)
 
 # ---- Install paths ---------------------------------------------------------
 # `make install` writes to $(DESTDIR)$(BINDIR). Defaults are auto-detected
@@ -63,7 +68,7 @@ PREFIX  ?= $(DEFAULT_PREFIX)
 BINDIR  ?= $(PREFIX)/bin
 DESTDIR ?=
 
-.PHONY: all depend build install uninstall test test-apt lint vet fmt fmt-check clean tidy tidy-check ci-drift check cross help
+.PHONY: all depend build install uninstall test test-verbose test-apt bench lint vet fmt fmt-check clean tidy tidy-check ci-drift check cross harness e2e help
 
 all: build
 
@@ -182,6 +187,34 @@ test-verbose:
 # filtered index rather than what the index says.
 test-apt:
 	go test -tags apt_integration -count=1 -timeout 20m -run TestRealApt ./internal/server/
+
+## harness: Lint the e2e harness and run its own tests (no VM needed)
+#
+# The e2e suites are the only shell in the tree, so without a leg here they are
+# the one thing `make check` does not read. shellcheck runs with -x so it
+# follows the sourced libraries; without it every suite reports its shared
+# globals as unassigned and the real findings hide among them.
+#
+# The self-test matters more than the lint. A bug that turned every verdict
+# into PASS would lint clean and report a perfect run against a broken server.
+harness:
+	@if ! command -v shellcheck >/dev/null 2>&1; then \
+		echo "harness: shellcheck not installed (brew install shellcheck)"; exit 1; \
+	fi
+	@if ! command -v shfmt >/dev/null 2>&1; then \
+		echo "harness: shfmt not installed (brew install shfmt)"; exit 1; \
+	fi
+	shellcheck -x $(E2E_SHELL)
+	shfmt -d $(E2E_SHELL)
+	test/e2e/run.sh --self-test
+
+## e2e: Drive the full end-to-end suite against the two dev guests
+#
+# Out of `check` on purpose: it needs both UTM guests powered on, installs
+# ecosystem clients, and ends in a destructive suite. See
+# docs-internal/DEV_HOSTS.md for what it expects to find.
+e2e:
+	test/e2e/run.sh $(E2E_ARGS)
 
 ## bench: Run benchmarks
 bench:
