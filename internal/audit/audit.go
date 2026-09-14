@@ -452,7 +452,7 @@ func openStore(path string, sc SinkConfig, forceReadOnly bool) (*DB, error) {
 		// checksum row, and a store that refuses that write fails the open
 		// after 012 has already committed.
 		if from < policySeedVersion {
-			if err := claimPolicySeed(context.Background(), db, PolicySeedAge); err != nil {
+			if err := claimPolicySeed(context.Background(), wdb, PolicySeedAge); err != nil {
 				closeAll()
 				return nil, fmt.Errorf("claim age policy default: %w", err)
 			}
@@ -462,7 +462,7 @@ func openStore(path string, sc SinkConfig, forceReadOnly bool) (*DB, error) {
 		// s3_key, so it runs here on the upgrade that crosses it rather than
 		// costing every open a full scan of a table that grows with the cache.
 		if from < checksumIdentityVersion {
-			n, err := backfillChecksumIdentity(context.Background(), db)
+			n, err := backfillChecksumIdentity(context.Background(), wdb)
 			if err != nil {
 				closeAll()
 				return nil, fmt.Errorf("backfill checksum package identity: %w", err)
@@ -471,7 +471,7 @@ func openStore(path string, sc SinkConfig, forceReadOnly bool) (*DB, error) {
 				slog.Info("checksum rows re-derived from their object key", "rows", n, "migration", checksumIdentityVersion)
 			}
 		}
-		seeded, err := seedDefaultAgePolicy(context.Background(), db)
+		seeded, err := seedDefaultAgePolicy(context.Background(), wdb)
 		if err != nil {
 			closeAll()
 			return nil, fmt.Errorf("seed default age policy: %w", err)

@@ -145,8 +145,11 @@ func backfillChecksumIdentity(ctx context.Context, db *sql.DB) (int64, error) {
 		rows.Close()
 		return 0, fmt.Errorf("read checksum rows: %w", err)
 	}
-	// Closed before the updates rather than deferred: SQLite will not write
-	// through a connection still streaming the same table.
+	// Closed before the updates rather than deferred. SQLite will not write
+	// through a connection still streaming the same table, and this runs on
+	// the write handle, whose pool is capped at one connection: a deferred
+	// Close leaves BeginTx below waiting for the connection the rows are
+	// holding, which hangs Open instead of failing it.
 	rows.Close()
 	if len(fix) == 0 {
 		return 0, nil
