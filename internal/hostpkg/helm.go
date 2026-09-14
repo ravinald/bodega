@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"unicode"
 
 	"github.com/ravinald/bodega/internal/manifest"
 )
@@ -54,21 +53,23 @@ func ParseHelm(r io.Reader) (Result, error) {
 }
 
 // splitChart recovers a chart's name and version from the single field helm
-// reports them in. The separator is the last hyphen whose right side starts
-// with a digit, because chart names contain hyphens too:
-// "kube-prometheus-stack-62.7.0" is one name and one version, not four.
+// reports them in, by asking manifest.ParseKey — the same derivation
+// handleHelmChart and parsePackagePath have both run since B36.
+//
+// It used to be a fourth rule: scan right to left for a hyphen whose next byte
+// is a digit. That reads "kube-prometheus-stack-62.7.0" correctly and stops at
+// the "v" in "mychart-v1.2.3", returning the whole string as the name at no
+// version, because builder.ParseSemVer accepts and keeps the prefix and this
+// did not. Helm charts are routinely published v-prefixed, so bodega wrote a
+// manifest entry naming a chart no repository serves while every other
+// identity derivation in the tree resolved it.
 func splitChart(chart string) (name, version string) {
-	for i := len(chart) - 1; i > 0; i-- {
-		if chart[i] != '-' {
-			continue
-		}
-		rest := chart[i+1:]
-		if rest != "" && unicode.IsDigit(rune(rest[0])) {
-			return chart[:i], rest
-		}
-	}
 	if strings.TrimSpace(chart) == "" {
 		return "", ""
 	}
-	return chart, ""
+	_, name, version = manifest.ParseKey(manifest.HelmChartKey(chart, ""))
+	if name == "" {
+		return chart, ""
+	}
+	return name, version
 }

@@ -357,7 +357,6 @@ func (m appModel) handlePopupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.cfg.ManifestDir = config.DefaultManifestDir(m.cfg.StoragePath)
 					m.cfg.LogDir = config.DefaultLogDir
 					m.cfg.LogWindowHeight = config.DefaultLogWindowHeight
-					m.cfg.CustomPaths = false
 					m.cfg.AptRoot = ""
 					m.cfg.GitRoot = ""
 					m.cfg.PypiRoot = ""
@@ -552,23 +551,19 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "C":
-		customVal := "no"
-		if m.cfg.CustomPaths {
-			customVal = "yes"
-		}
+		// The per-type roots are shown unconditionally. custom_paths used to
+		// hide them and gated nothing: builder.rootFor reads each root
+		// directly, so a root left in the file stayed in force while the form
+		// stopped showing the value that was still deciding where artifacts
+		// land.
 		fields := []formField{
 			{Label: "Bucket", Value: m.cfg.Bucket},
 			{Label: "Region", Value: m.cfg.Region},
 			{Label: "Build root", Value: m.cfg.BuildRoot},
-			{Label: "Custom paths", Checkbox: true, Value: customVal},
-		}
-		if m.cfg.CustomPaths {
-			fields = append(fields,
-				formField{Label: "APT root", Value: m.cfg.AptRoot},
-				formField{Label: "Git root", Value: m.cfg.GitRoot},
-				formField{Label: "PyPI root", Value: m.cfg.PypiRoot},
-				formField{Label: "Binary root", Value: m.cfg.BinaryRoot},
-			)
+			{Label: "APT root", Value: m.cfg.AptRoot},
+			{Label: "Git root", Value: m.cfg.GitRoot},
+			{Label: "PyPI root", Value: m.cfg.PypiRoot},
+			{Label: "Binary root", Value: m.cfg.BinaryRoot},
 		}
 		fields = append(fields,
 			formField{Label: "Manifest dir", Value: m.cfg.ManifestDir},
@@ -624,7 +619,6 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 						cfgRef.LogWindowHeight = v
 					}
 				}
-				cfgRef.CustomPaths = fieldValue(fields, "Custom paths") == "yes"
 				cfgRef.AptRoot = fieldValue(fields, "APT root")
 				cfgRef.GitRoot = fieldValue(fields, "Git root")
 				cfgRef.PypiRoot = fieldValue(fields, "PyPI root")
@@ -1140,7 +1134,6 @@ var configFormKeys = map[string]string{
 	"Manifest dir":      "manifest_dir",
 	"Log dir":           "log_dir",
 	"Log window height": "logwindow_height",
-	"Custom paths":      "custom_paths",
 	"APT root":          "apt_root",
 	"Git root":          "git_root",
 	"PyPI root":         "pypi_root",
