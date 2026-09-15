@@ -46,9 +46,7 @@ func TestTokenMintedAsRootValidatesAgainstAnotherAccount(t *testing.T) {
 	t.Setenv("BODEGA_CONFIG_FILE", filepath.Join(tree, "etc", "config.json"))
 	t.Setenv(audit.ServiceUserEnv, svc.Username)
 	pepper := filepath.Join(tree, "etc", "pepper")
-	prev := audit.DefaultPepperPaths
-	audit.DefaultPepperPaths = []string{pepper}
-	t.Cleanup(func() { audit.DefaultPepperPaths = prev })
+	usePepperPaths(t, tree)
 
 	token := mintAsRoot(t)
 
@@ -69,7 +67,7 @@ func TestTokenMintedAsRootValidatesAgainstAnotherAccount(t *testing.T) {
 	}
 
 	handTreeTo(t, tree, svc, pepper)
-	base := serveAs(t, svc, tree)
+	base, _ := serveAs(t, svc, tree)
 
 	const body = `{"config_version":1,"name":"two-account-probe","type":"binary",` +
 		`"versions":[{"version":"1.0.0","url":"https://example.invalid/x"}]}`
@@ -86,6 +84,51 @@ func TestTokenMintedAsRootValidatesAgainstAnotherAccount(t *testing.T) {
 	}
 }
 
+// TestABrokenSecondPepperDoesNotUnseatTheFirstOverHTTP is requirement 3 at the
+// only altitude that settles it. Two peppers on one host is the state this
+// defect creates, so an upgrade meets it; the resolver used to abandon the
+// whole search when a candidate behind the winner would not open, and the
+// server then came up with no pepper at all and answered 401 to the token it
+// had been reading fine a minute earlier.
+func TestABrokenSecondPepperDoesNotUnseatTheFirstOverHTTP(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to mint as one account and serve as another")
+	}
+	svc := unprivilegedAccount(t)
+	tree := installTree(t, svc)
+
+	t.Setenv("BODEGA_CONFIG_FILE", filepath.Join(tree, "etc", "config.json"))
+	t.Setenv(audit.ServiceUserEnv, svc.Username)
+	pepper := filepath.Join(tree, "etc", "pepper")
+	usePepperPaths(t, tree)
+
+	token := mintAsRoot(t)
+
+	// The loser, after the mint: a self-referential symlink is a path that
+	// opens for nobody, root included, which is what separates this from the
+	// permission cases.
+	xdg := pepperPaths(tree)[1]
+	if err := os.MkdirAll(filepath.Dir(xdg), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(xdg), err)
+	}
+	if err := os.Symlink("pepper", xdg); err != nil {
+		t.Fatalf("symlink %s: %v", xdg, err)
+	}
+
+	handTreeTo(t, tree, svc, pepper)
+	base, serveLog := serveAs(t, svc, tree)
+
+	const body = `{"config_version":1,"name":"shadow-probe","type":"binary",` +
+		`"versions":[{"version":"1.0.0","url":"https://example.invalid/x"}]}`
+	if code := post(t, base, token, body); code != http.StatusOK && code != http.StatusCreated {
+		t.Fatalf("the token root minted got %d from a server running as %q with a broken pepper further down "+
+			"the search order: %s is still readable and still the one in force", code, svc.Username, pepper)
+	}
+	if !strings.Contains(serveLog(), xdg) {
+		t.Errorf("serve never named the second pepper at %s:\n%s", xdg, serveLog())
+	}
+}
+
 // TestServeAsTheServiceAccountHelper is the child half. It is a test only
 // because that is how a process re-enters this binary; -test.run selects it and
 // the environment gate keeps it out of an ordinary run.
@@ -94,7 +137,7 @@ func TestServeAsTheServiceAccountHelper(t *testing.T) {
 	if tree == "" {
 		t.Skip("child half of TestTokenMintedAsRootValidatesAgainstAnotherAccount")
 	}
-	audit.DefaultPepperPaths = []string{filepath.Join(tree, "etc", "pepper")}
+	audit.DefaultPepperPaths = pepperPaths(tree)
 	cmd := newServeCmd(&globalFlags{})
 	cmd.SetArgs([]string{"--addr", os.Getenv(serveAddrEnv), "--allow-plaintext", "--quiet"})
 	if err := cmd.Execute(); err != nil {
@@ -116,6 +159,22 @@ func unprivilegedAccount(t *testing.T) *user.User {
 	}
 	t.Skip("this host has no second account to serve as")
 	return nil
+}
+
+// pepperPaths is the shipped search order relocated under tree: the privileged
+// path first, the serving account's own XDG path second.
+func pepperPaths(tree string) []string {
+	return []string{
+		filepath.Join(tree, "etc", "pepper"),
+		filepath.Join(tree, "var", ".config", "bodega", "pepper"),
+	}
+}
+
+func usePepperPaths(t *testing.T, tree string) {
+	t.Helper()
+	prev := audit.DefaultPepperPaths
+	audit.DefaultPepperPaths = pepperPaths(tree)
+	t.Cleanup(func() { audit.DefaultPepperPaths = prev })
 }
 
 // installTree lays out the three directories the unit header describes, under
@@ -212,8 +271,9 @@ func handTreeTo(t *testing.T, tree string, svc *user.User, keepRootOwned string)
 	}
 }
 
-// serveAs starts the server as svc and returns the base URL once it answers.
-func serveAs(t *testing.T, svc *user.User, tree string) string {
+// serveAs starts the server as svc and returns the base URL once it answers,
+// with an accessor for everything the child wrote.
+func serveAs(t *testing.T, svc *user.User, tree string) (string, func() string) {
 	t.Helper()
 	uid, _ := strconv.Atoi(svc.Uid)
 	gid, _ := strconv.Atoi(svc.Gid)
@@ -245,12 +305,12 @@ func serveAs(t *testing.T, svc *user.User, tree string) string {
 		resp, err := http.Get(base + "/healthz")
 		if err == nil {
 			_ = resp.Body.Close()
-			return base
+			return base, log.String
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatalf("server as %s never answered on %s:\n%s", svc.Username, addr, log.String())
-	return ""
+	return "", log.String
 }
 
 func freeAddr(t *testing.T) string {

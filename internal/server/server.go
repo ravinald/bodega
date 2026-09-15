@@ -263,9 +263,13 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 	default:
 		logger.Error("could not load or create pepper file — token auth will not work", "error", err)
 	}
-	for _, p := range pst.Shadowed {
+	for _, c := range pst.Shadowed {
+		args := []any{"in_force", pst.Path, "ignored", c.Path}
+		if c.Err != nil {
+			args = append(args, "error", c.Err)
+		}
 		logger.Error("a second pepper is present and ignored; tokens minted against it are refused until it becomes the one in force",
-			"in_force", pst.Path, "ignored", p)
+			args...)
 	}
 	// Open the audit store and attach the configured sink. Held for Start to
 	// refuse on, not logged and continued: a proxy that cannot record who it

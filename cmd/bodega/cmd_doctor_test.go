@@ -343,7 +343,7 @@ func tableExists(t *testing.T, path, name string) bool {
 // other bit, and the pepper at 0640 has none.
 func TestDoctorReportsAPepperTheServiceAccountCannotRead(t *testing.T) {
 	dir := pepperTree(t, 0o644, 0o640)
-	f := pepperFinding(audit.PepperState{Path: filepath.Join(dir, "pepper")}, serviceAccount, nil)
+	f := pepperFinding(audit.PepperState{Path: filepath.Join(dir, "pepper")}, nil, serviceAccount, nil)
 
 	if f.Status != host.StatusFail {
 		t.Fatalf("a 0640 root:root pepper beside a 0644 root:root config reported %s: %s", f.Status, f.Detail)
@@ -371,7 +371,7 @@ func TestDoctorAcceptsAPepperTheServiceAccountReads(t *testing.T) {
 	id.GID = int(fi.Sys().(*syscall.Stat_t).Gid)
 	id.GIDs = []int{id.GID}
 
-	if f := pepperFinding(audit.PepperState{Path: path}, id, nil); f.IsFinding() {
+	if f := pepperFinding(audit.PepperState{Path: path}, nil, id, nil); f.IsFinding() {
 		t.Fatalf("a pepper whose group the service account is in reported %s: %s", f.Status, f.Detail)
 	}
 }
@@ -384,7 +384,7 @@ func TestDoctorNamesTheDirectoryThatWithholdsThePepper(t *testing.T) {
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatalf("chmod: %v", err)
 	}
-	f := pepperFinding(audit.PepperState{Path: filepath.Join(dir, "pepper")}, serviceAccount, nil)
+	f := pepperFinding(audit.PepperState{Path: filepath.Join(dir, "pepper")}, nil, serviceAccount, nil)
 
 	if f.Status != host.StatusFail {
 		t.Fatalf("a pepper inside a 0700 directory reported %s: %s", f.Status, f.Detail)
@@ -416,7 +416,7 @@ func TestDoctorNamesTheDirectoryBehindASymlinkedPepper(t *testing.T) {
 		t.Fatalf("symlink: %v", err)
 	}
 
-	f := pepperFinding(audit.PepperState{Path: link}, serviceAccount, nil)
+	f := pepperFinding(audit.PepperState{Path: link}, nil, serviceAccount, nil)
 	if f.Status != host.StatusFail {
 		t.Fatalf("a 0644 pepper behind a 0700 directory reported %s: %s", f.Status, f.Detail)
 	}
@@ -436,15 +436,46 @@ func TestDoctorAcceptsAPepperReachedThroughASymlink(t *testing.T) {
 	if err := os.Symlink(filepath.Join(root, "pepper"), link); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}
-	if f := pepperFinding(audit.PepperState{Path: link}, serviceAccount, nil); f.IsFinding() {
+	if f := pepperFinding(audit.PepperState{Path: link}, nil, serviceAccount, nil); f.IsFinding() {
 		t.Fatalf("a pepper every uid can walk to and read reported %s: %s", f.Status, f.Detail)
+	}
+}
+
+// A pepper the resolver could not open at all. The shipped check threw that
+// error away, read the empty state as absence and printed "no pepper on this
+// host" while the server refused every token minted against the file that is
+// sitting right there.
+func TestDoctorReportsAPepperThatWillNotOpen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pepper")
+	if err := os.Symlink("pepper", path); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	st, resErr := audit.ResolvePepper([]string{path})
+	f := pepperFinding(st, resErr, serviceAccount, nil)
+
+	if f.Status != host.StatusFail {
+		t.Fatalf("a pepper that will not open reported %s: %s", f.Status, f.Detail)
+	}
+	if strings.Contains(f.Detail, "no pepper on this host") {
+		t.Fatalf("detail reports absence for a pepper that exists: %s", f.Detail)
+	}
+	if !strings.Contains(f.Detail, path) {
+		t.Errorf("detail %q does not name the path", f.Detail)
+	}
+	if !strings.Contains(f.Detail, "symbolic links") {
+		t.Errorf("detail %q does not carry why it would not open", f.Detail)
+	}
+	if f.Remediation == "" || strings.Contains(f.Remediation, "chown") || strings.Contains(f.Remediation, "chmod") {
+		t.Errorf("remediation %q sends the operator to an ownership change for a path that will not open", f.Remediation)
 	}
 }
 
 // A host running the server as whoever invoked it has no second account to
 // check against, and a FAIL there would fire on every developer laptop.
 func TestDoctorSkipsThePepperWithNoServiceAccount(t *testing.T) {
-	f := pepperFinding(audit.PepperState{Path: "/etc/bodega/pepper"}, audit.ServiceIdentity{}, audit.ErrNoServiceAccount)
+	f := pepperFinding(audit.PepperState{Path: "/etc/bodega/pepper"}, nil, audit.ServiceIdentity{}, audit.ErrNoServiceAccount)
 	if f.Status != host.StatusNA {
 		t.Fatalf("status %s on a host with no service account, want N/A: %s", f.Status, f.Detail)
 	}
@@ -454,7 +485,7 @@ func TestDoctorSkipsThePepperWithNoServiceAccount(t *testing.T) {
 // either, so reporting "nothing to check" would send the operator to the
 // pepper instead of to useradd.
 func TestDoctorReportsAnAccountTheHostDoesNotHave(t *testing.T) {
-	f := pepperFinding(audit.PepperState{Path: "/etc/bodega/pepper"}, audit.ServiceIdentity{},
+	f := pepperFinding(audit.PepperState{Path: "/etc/bodega/pepper"}, nil, audit.ServiceIdentity{},
 		errors.New("/etc/systemd/system/bodega.service runs the server as \"bodega\" and this host has no such account"))
 	if f.Status != host.StatusFail {
 		t.Fatalf("status %s, want FAIL: %s", f.Status, f.Detail)

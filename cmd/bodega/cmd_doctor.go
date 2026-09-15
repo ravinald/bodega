@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -420,16 +421,29 @@ func retiredConfigKeys(gf *globalFlags) host.Finding {
 // account's uid and group memberships against the pepper's mode and every
 // directory above it.
 func pepperPosture() host.Finding {
-	st, _ := audit.ResolvePepper(audit.DefaultPepperPaths)
+	st, resErr := audit.ResolvePepper(audit.DefaultPepperPaths)
 	id, err := audit.ResolveServiceIdentity()
-	return pepperFinding(st, id, err)
+	return pepperFinding(st, resErr, id, err)
 }
 
-func pepperFinding(st audit.PepperState, id audit.ServiceIdentity, idErr error) host.Finding {
+func pepperFinding(st audit.PepperState, resErr error, id audit.ServiceIdentity, idErr error) host.Finding {
 	f := host.Finding{Check: "pepper", Status: host.StatusOK}
 	if st.Path == "" {
 		f.Status = host.StatusNA
 		f.Detail = "no pepper on this host; the first `bodega token generate` writes one"
+		return f
+	}
+	// A path that will not open for this process is reported ahead of the
+	// account checks below, which would answer a permission question about a
+	// file whose problem is not permission. Absent this branch a symlink cycle
+	// read as "no pepper on this host" while the server refused every token.
+	var unreadable *audit.PepperUnreadableError
+	if errors.As(resErr, &unreadable) && !errors.Is(resErr, fs.ErrPermission) {
+		f.Status = host.StatusFail
+		f.Detail = fmt.Sprintf("%s is the pepper in force and cannot be read: %v; every token minted on this "+
+			"host is answered with \"invalid token\", which names the credential rather than this file",
+			st.Path, unreadable.Err)
+		f.Remediation = "repair or remove " + st.Path + ", then mint again with `sudo bodega token generate`"
 		return f
 	}
 	switch {

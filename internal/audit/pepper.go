@@ -35,10 +35,19 @@ type PepperState struct {
 	// Shadowed names every candidate that exists behind Path. Two peppers on
 	// one host hash tokens differently, so the loser is reported rather than
 	// quietly discarded.
-	Shadowed []string
+	Shadowed []PepperCandidate
 
 	// Created is true when this call generated the pepper at Path.
 	Created bool
+}
+
+// PepperCandidate is a pepper path that exists and what reading it produced.
+// A candidate that will not open is still a candidate: passing over it falls
+// through to the next path in the search order, and a server hashing against a
+// pepper the operator never minted against answers 401 to every token.
+type PepperCandidate struct {
+	Path string
+	Err  error
 }
 
 // PepperUnreadableError reports a pepper that exists and this process cannot
@@ -51,11 +60,19 @@ type PepperUnreadableError struct {
 }
 
 func (e *PepperUnreadableError) Error() string {
-	return fmt.Sprintf("pepper %s exists and this process (uid %d) cannot read it: "+
-		"every token minted against it is refused with \"invalid token\", which names the "+
-		"credential rather than this file. Give the serving account read access "+
+	const consequence = "every token minted against it is refused with \"invalid token\", " +
+		"which names the credential rather than this file"
+	if !errors.Is(e.Err, fs.ErrPermission) {
+		// A symlink cycle, a dangling target, a disk error: the path is broken
+		// rather than closed, and no ownership change opens it. Naming one
+		// here sends the operator to chmod a file that is not the problem.
+		return fmt.Sprintf("pepper %s exists and cannot be read (%v): %s. Repair or remove it",
+			e.Path, e.Err, consequence)
+	}
+	return fmt.Sprintf("pepper %s exists and this process (uid %d) cannot read it: %s. "+
+		"Give the serving account read access "+
 		"(chown root:<service-group> %s && chmod 0640 %s), or remove it",
-		e.Path, os.Getuid(), e.Path, e.Path)
+		e.Path, os.Getuid(), consequence, e.Path, e.Path)
 }
 
 func (e *PepperUnreadableError) Unwrap() error { return e.Err }
@@ -134,10 +151,13 @@ func ResolvePepper(paths []string) (PepperState, error) {
 			found = append(found, candidate{path: p, pepper: pepper})
 		case errors.Is(err, fs.ErrNotExist):
 			continue
-		case errors.Is(err, fs.ErrPermission):
-			found = append(found, candidate{path: p, err: err})
 		default:
-			return PepperState{}, fmt.Errorf("read pepper %s: %w", p, err)
+			// Permission, a symlink cycle, an I/O error: the path exists and
+			// this process cannot read it. Returning here instead would
+			// discard an already selected readable pepper because a candidate
+			// further down the order is broken, and the server would serve
+			// with no pepper at all.
+			found = append(found, candidate{path: p, err: err})
 		}
 	}
 	if len(found) == 0 {
@@ -145,7 +165,7 @@ func ResolvePepper(paths []string) (PepperState, error) {
 	}
 	st := PepperState{Path: found[0].path, Pepper: found[0].pepper}
 	for _, c := range found[1:] {
-		st.Shadowed = append(st.Shadowed, c.path)
+		st.Shadowed = append(st.Shadowed, PepperCandidate{Path: c.path, Err: c.err})
 	}
 	if found[0].err != nil {
 		return st, &PepperUnreadableError{Path: found[0].path, Err: found[0].err}

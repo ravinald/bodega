@@ -481,7 +481,7 @@ func TestSecondPepperIsReportedNotPreferred(t *testing.T) {
 	if st.Path != system || st.Pepper != "5ca1ab1e" {
 		t.Fatalf("in force %s (%s), want %s", st.Path, st.Pepper, system)
 	}
-	if len(st.Shadowed) != 1 || st.Shadowed[0] != xdg {
+	if len(st.Shadowed) != 1 || st.Shadowed[0].Path != xdg {
 		t.Fatalf("shadowed %v, want [%s]", st.Shadowed, xdg)
 	}
 }
@@ -504,5 +504,71 @@ func TestEmptyPepperIsNotAPepper(t *testing.T) {
 	}
 	if len(st.Shadowed) != 0 {
 		t.Fatalf("shadowed %v, want none", st.Shadowed)
+	}
+}
+
+// TestASelectedPepperThatWillNotOpenIsRefusedNotSkipped pins requirement 2 for
+// the failure that is not permission. A symlink cycle, a dangling target or a
+// disk error reads as neither "absent" nor "denied", and the shipped resolver
+// abandoned the whole search on one: the caller got an empty state, read it as
+// a host with no pepper, and served with none while refusing every token.
+func TestASelectedPepperThatWillNotOpenIsRefusedNotSkipped(t *testing.T) {
+	dir := t.TempDir()
+	system := filepath.Join(dir, "etc", "pepper")
+	xdg := filepath.Join(dir, "state", "pepper")
+	writePepper(t, xdg, "0ddba11")
+	if err := os.MkdirAll(filepath.Dir(system), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Symlink("pepper", system); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	st, err := ResolvePepper([]string{system, xdg})
+	var unreadable *PepperUnreadableError
+	if !errors.As(err, &unreadable) {
+		t.Fatalf("resolve returned %v, want a refusal naming %s", err, system)
+	}
+	if unreadable.Path != system {
+		t.Fatalf("refusal names %s, want %s", unreadable.Path, system)
+	}
+	if st.Path != system {
+		t.Fatalf("in force %q, want %s: an unreadable first candidate still wins, or the fall-through is silent", st.Path, system)
+	}
+	if strings.Contains(unreadable.Error(), "chmod") || strings.Contains(unreadable.Error(), "chown") {
+		t.Errorf("refusal sends the operator to an ownership change for a path that will not open: %v", unreadable)
+	}
+	if !strings.Contains(unreadable.Error(), system) {
+		t.Errorf("refusal does not name the path: %v", unreadable)
+	}
+}
+
+// TestABrokenSecondPepperDoesNotEraseTheFirst pins requirement 3 in the
+// direction that matters on an upgrade: the loser is reported, and its own
+// read failure does not cost the host the pepper every live token is keyed on.
+func TestABrokenSecondPepperDoesNotEraseTheFirst(t *testing.T) {
+	dir := t.TempDir()
+	system := filepath.Join(dir, "etc", "pepper")
+	xdg := filepath.Join(dir, "state", "pepper")
+	writePepper(t, system, "5ca1ab1e")
+	if err := os.MkdirAll(filepath.Dir(xdg), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Symlink("pepper", xdg); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	st, err := ResolvePepper([]string{system, xdg})
+	if err != nil {
+		t.Fatalf("resolve refused over a broken candidate behind a readable one: %v", err)
+	}
+	if st.Path != system || st.Pepper != "5ca1ab1e" {
+		t.Fatalf("in force %q (%q), want %s: every token minted against it is now refused", st.Path, st.Pepper, system)
+	}
+	if len(st.Shadowed) != 1 || st.Shadowed[0].Path != xdg {
+		t.Fatalf("shadowed %v, want [%s]", st.Shadowed, xdg)
+	}
+	if st.Shadowed[0].Err == nil {
+		t.Errorf("%s is reported as an ordinary second pepper; it cannot be read at all", xdg)
 	}
 }

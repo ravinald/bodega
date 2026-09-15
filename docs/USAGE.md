@@ -610,7 +610,7 @@ bodega token generate ci-pipeline "Jenkins deploy key"    # with a comment
 bodega token generate ci-pipeline expiry 90d "CI token"   # expiry + comment
 ```
 
-On first run, a pepper file is auto-generated at `/etc/bodega/pepper` (or `~/.config/bodega/pepper`) with `0600` permissions. This pepper is combined with the token before hashing, so the stored hash alone cannot be used to forge tokens.
+On first run, a pepper file is auto-generated at `/etc/bodega/pepper` (or `~/.config/bodega/pepper`), mode `0640` owned by root in the group the service runs in, or `0600` where the host names no service account. This pepper is combined with the token before hashing, so the stored hash alone cannot be used to forge tokens.
 
 ### `bodega token list`
 

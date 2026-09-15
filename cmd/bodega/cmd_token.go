@@ -79,9 +79,12 @@ Examples:
 				return err
 			}
 			pepper := pst.Pepper
-			for _, p := range pst.Shadowed {
+			for _, c := range pst.Shadowed {
 				fmt.Fprintf(os.Stderr, "warning: a second pepper at %s is ignored. This token is keyed on %s, "+
-					"and a server reading %s will refuse it.\n", p, pst.Path, p)
+					"and a server reading %s will refuse it.\n", c.Path, pst.Path, c.Path)
+				if c.Err != nil {
+					fmt.Fprintf(os.Stderr, "warning: %s cannot be read either: %v\n", c.Path, c.Err)
+				}
 			}
 
 			// Generate random token.
