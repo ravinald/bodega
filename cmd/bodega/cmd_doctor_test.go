@@ -470,6 +470,58 @@ func TestDoctorNamesTheAccountSystemdWouldRun(t *testing.T) {
 	}
 }
 
+// TestDoctorFollowsAClearedGroup is the review's second reproduction on the
+// doctor side. An operator who clears Group= with `systemctl edit` leaves a
+// pepper already handed to the unit's original group, and the check that
+// reports OK for it is the one command that exists to find this.
+func TestDoctorFollowsAClearedGroup(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to hand the pepper to a group this process is not in")
+	}
+	serving, stale := twoDoctorAccounts(t)
+	units := t.TempDir()
+	writeUnitFile(t, filepath.Join(units, "lib", "bodega.service"),
+		"[Service]\nType=notify\nUser="+stale.Username+"\nGroup="+doctorGroupName(t, stale)+"\n")
+	writeUnitFile(t, filepath.Join(units, "etc", "bodega.service.d", "10-account.conf"),
+		"[Service]\nUser="+serving.Username+"\nGroup=\n")
+	swapDoctorUnitDirs(t, filepath.Join(units, "etc"), filepath.Join(units, "lib"))
+
+	// root:<the group the unit named before the edit>, 0640: what the mint
+	// left on disk while the resolver still read the cleared key as absent.
+	path := filepath.Join(pepperTree(t, 0o644, 0o640), "pepper")
+	staleGID, err := strconv.Atoi(stale.Gid)
+	if err != nil {
+		t.Fatalf("gid of %s: %v", stale.Username, err)
+	}
+	if err := os.Chown(path, 0, staleGID); err != nil {
+		t.Fatalf("chown %s: %v", path, err)
+	}
+	prev := audit.DefaultPepperPaths
+	audit.DefaultPepperPaths = []string{path}
+	t.Cleanup(func() { audit.DefaultPepperPaths = prev })
+
+	f := pepperPosture()
+	if f.Status != host.StatusFail {
+		t.Fatalf("status %s, want FAIL: %s serves in its own primary group and cannot read a root:%s pepper: %s",
+			f.Status, serving.Username, doctorGroupName(t, stale), f.Detail)
+	}
+	if !strings.Contains(f.Detail, strconv.Quote(serving.Username)) {
+		t.Errorf("detail %q does not name %q, the account the unit runs the server as", f.Detail, serving.Username)
+	}
+	if want := "chown root:" + doctorGroupName(t, serving); !strings.Contains(f.Remediation, want) {
+		t.Errorf("remediation %q does not carry %q, the chown that hands the pepper over", f.Remediation, want)
+	}
+}
+
+func doctorGroupName(t *testing.T, u *user.User) string {
+	t.Helper()
+	g, err := user.LookupGroupId(u.Gid)
+	if err != nil {
+		t.Skipf("no group named for gid %s (%s): %v", u.Gid, u.Username, err)
+	}
+	return g.Name
+}
+
 // twoDoctorAccounts names two accounts this process is not, with distinct
 // groups: one the unit runs the server as, one a masked drop-in names.
 func twoDoctorAccounts(t *testing.T) (serving, masked *user.User) {

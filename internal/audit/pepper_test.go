@@ -2,7 +2,9 @@ package audit
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"strconv"
@@ -180,6 +182,67 @@ func TestCreatedPepperFollowsTheUnitSystemdWouldLoad(t *testing.T) {
 	}
 }
 
+// TestCreatedPepperFollowsAClearedGroup is the review's second reproduction,
+// and it measures the mint rather than the parse: an empty Group= that leaves
+// the unit's original group standing chowns the pepper to a group the service
+// is no longer in, and the check that follows the chown asks the same wrong
+// identity, so the mint reports success and prints a token nothing accepts.
+func TestCreatedPepperFollowsAClearedGroup(t *testing.T) {
+	serving, stale := twoServiceAccounts(t)
+	units := t.TempDir()
+	writeUnit(t, filepath.Join(units, "lib", unitName),
+		"[Service]\nType=notify\nUser="+stale.Username+"\nGroup="+groupNameOf(t, stale)+"\n")
+	writeUnit(t, filepath.Join(units, "etc", unitName+".d", "10-account.conf"),
+		"[Service]\nUser="+serving.Username+"\nGroup=\n")
+	swapUnitDirs(t, filepath.Join(units, "etc"), filepath.Join(units, "lib"))
+
+	dir := worldTraversableDir(t)
+	path := filepath.Join(dir, "pepper")
+	st, err := LoadOrCreatePepper([]string{path})
+	if st.Path != path || !st.Created {
+		t.Fatalf("created=%v path=%s, want true and %s", st.Created, st.Path, path)
+	}
+	servingGID, staleGID := gidOf(t, serving), gidOf(t, stale)
+
+	if os.Geteuid() != 0 {
+		// No chown to make, so the refusal is the outcome and the group it
+		// names is what this case measures: the remediation line is a chown
+		// the operator pastes.
+		var handoff *PepperHandoffError
+		if !errors.As(err, &handoff) {
+			t.Fatalf("err = %v, want a *PepperHandoffError: %s cannot read a 0600 pepper this process owns",
+				err, serving.Username)
+		}
+		if want := groupNameOf(t, serving); handoff.Identity.Group != want {
+			t.Fatalf("handoff names group %q, want %q: the unit's Group= was cleared, so %s serves in "+
+				"its own primary group", handoff.Identity.Group, want, serving.Username)
+		}
+		return
+	}
+
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	sys := fiOf(t, path).Sys().(*syscall.Stat_t)
+	if sys.Uid != 0 {
+		t.Errorf("pepper owned by uid %d, want root: the account that serves must not be able to rewrite it", sys.Uid)
+	}
+	if mode := modeOf(t, path); mode != 0o640 {
+		t.Errorf("pepper mode %04o, want 0640", mode)
+	}
+	switch gid := int(sys.Gid); gid {
+	case staleGID:
+		t.Fatalf("pepper handed to gid %d (%s), the group the unit named before the edit cleared it: "+
+			"%s serves in gid %d and cannot read it", gid, groupNameOf(t, stale), serving.Username, servingGID)
+	case servingGID:
+	default:
+		t.Fatalf("pepper gid %d, want %d (%s)", gid, servingGID, serving.Username)
+	}
+	if err := opensAs(t, serving, path); err != nil {
+		t.Fatalf("%s could not open %s: %v", serving.Username, path, err)
+	}
+}
+
 // A pepper written before this check existed reaches `token generate` through
 // the load path, not the create path, so the mint verifies what it loaded too.
 // This is the state an upgrade lands in: /etc/bodega/pepper already on disk,
@@ -277,6 +340,35 @@ func gidOf(t *testing.T, u *user.User) int {
 		t.Fatalf("gid of %s: %v", u.Username, err)
 	}
 	return gid
+}
+
+func groupNameOf(t *testing.T, u *user.User) string {
+	t.Helper()
+	g, err := user.LookupGroupId(u.Gid)
+	if err != nil {
+		t.Skipf("no group named for gid %s (%s): %v", u.Gid, u.Username, err)
+	}
+	return g.Name
+}
+
+// opensAs opens path in a child running as u, with supplementary groups
+// cleared. Asking CanRead again would only get the implementation to agree
+// with itself; every measurement in this item came back from the kernel.
+func opensAs(t *testing.T, u *user.User, path string) error {
+	t.Helper()
+	gid := gidOf(t, u)
+	uid, err := strconv.Atoi(u.Uid)
+	if err != nil {
+		t.Fatalf("uid of %s: %v", u.Username, err)
+	}
+	cmd := exec.Command("/bin/sh", "-c", `exec <"$1"`, "sh", path)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{
+		Uid: uint32(uid), Gid: uint32(gid), Groups: []uint32{uint32(gid)}, //nolint:gosec // ids this test read out of /etc/passwd
+	}}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 func fiOf(t *testing.T, path string) os.FileInfo {

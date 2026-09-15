@@ -180,6 +180,55 @@ WantedBy=multi-user.target
 		}
 	})
 
+	// The review's second reproduction. `systemctl edit` that clears Group=
+	// writes the key with nothing after it, which systemd reads as a reset to
+	// the effective user's primary group rather than as a group named "". A
+	// parse that cannot tell an empty assignment from a missing one keeps the
+	// unit's original group and hands the pepper to it.
+	t.Run("an empty Group= clears the unit's group", func(t *testing.T) {
+		dir := t.TempDir()
+		writeUnit(t, filepath.Join(dir, "lib", unitName), unit)
+		writeUnit(t, filepath.Join(dir, "etc", unitName+".d", "10-account.conf"),
+			"[Service]\nUser=daemon\nGroup=\n")
+		swapUnitDirs(t, filepath.Join(dir, "etc"), filepath.Join(dir, "lib"))
+
+		name, group, _ := declaredServiceAccount()
+		if name != "daemon" || group != "" {
+			t.Fatalf("got %q/%q, want daemon and no group: systemd runs a reset Group= as "+
+				"daemon's primary group, not as the unit's own %q", name, group, "bodega")
+		}
+	})
+
+	// The other half of the same distinction: a drop-in that never mentions
+	// Group= leaves the unit's standing, so treating both as empty would move
+	// the pepper off a group the operator did name.
+	t.Run("an absent Group= leaves the unit's group", func(t *testing.T) {
+		dir := t.TempDir()
+		writeUnit(t, filepath.Join(dir, "lib", unitName), unit)
+		writeUnit(t, filepath.Join(dir, "etc", unitName+".d", "10-account.conf"),
+			"[Service]\nUser=daemon\n")
+		swapUnitDirs(t, filepath.Join(dir, "etc"), filepath.Join(dir, "lib"))
+
+		name, group, _ := declaredServiceAccount()
+		if name != "daemon" || group != "bodega" {
+			t.Fatalf("got %q/%q, want daemon/bodega: the drop-in names no Group=", name, group)
+		}
+	})
+
+	// User= resets the same way, and there it means root: no separate account,
+	// so whoever writes the pepper reads it and 0600 is the right posture.
+	t.Run("an empty User= clears the unit's account", func(t *testing.T) {
+		dir := t.TempDir()
+		writeUnit(t, filepath.Join(dir, "lib", unitName), unit)
+		writeUnit(t, filepath.Join(dir, "etc", unitName+".d", "10-account.conf"),
+			"[Service]\nUser=\n")
+		swapUnitDirs(t, filepath.Join(dir, "etc"), filepath.Join(dir, "lib"))
+
+		if name, _, _ := declaredServiceAccount(); name != "" {
+			t.Fatalf("got %q, want no account: a reset User= runs the server as root", name)
+		}
+	})
+
 	// The review's reproduction. systemd selects drop-ins by basename across
 	// the whole search path, so an /etc file masks the vendor file of the same
 	// name and the vendor User= is never read. Applying both hands the pepper
@@ -285,6 +334,28 @@ func TestResolveServiceIdentityFillsTheGroupSet(t *testing.T) {
 	}
 	if id.Group == "" {
 		t.Error("Group is empty; the chown in every remediation line names it")
+	}
+}
+
+// A cleared Group= has to reach the numeric gid, not just the parsed string:
+// the chown in the handoff and in every remediation line is keyed on it, and
+// the group the unit named before the edit is one the service is no longer in.
+func TestResolveServiceIdentityFollowsAClearedGroup(t *testing.T) {
+	serving, stale := twoServiceAccounts(t)
+	units := t.TempDir()
+	writeUnit(t, filepath.Join(units, "lib", unitName),
+		"[Service]\nType=notify\nUser="+serving.Username+"\nGroup="+groupNameOf(t, stale)+"\n")
+	writeUnit(t, filepath.Join(units, "etc", unitName+".d", "10-account.conf"),
+		"[Service]\nGroup=\n")
+	swapUnitDirs(t, filepath.Join(units, "etc"), filepath.Join(units, "lib"))
+
+	id, err := ResolveServiceIdentity()
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if want := gidOf(t, serving); id.GID != want {
+		t.Fatalf("resolved gid %d (%q), want %d (%q): an empty Group= selects %s's primary group",
+			id.GID, id.Group, want, groupNameOf(t, serving), serving.Username)
 	}
 }
 

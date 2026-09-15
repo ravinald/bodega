@@ -213,11 +213,11 @@ func declaredServiceAccount() (name, group, source string) {
 	}
 	for _, path := range unitFragments() {
 		u, g := readUnitAccount(path)
-		if u != "" {
-			name, source = u, path
+		if u.set {
+			name, source = u.value, path
 		}
-		if g != "" {
-			group = g
+		if g.set {
+			group = g.value
 		}
 	}
 	if name == "" {
@@ -275,14 +275,27 @@ func unitFragments() []string {
 	return frags
 }
 
+// unitValue is an assignment as a fragment carried it, present or absent.
+//
+// systemd reads `Group=` with nothing after it as a reset to the default
+// rather than as a group named "": the process runs in the effective user's
+// primary group. Collapsing the two onto an empty string leaves the previous
+// fragment's group standing, so a `systemctl edit` that clears Group= hands
+// the pepper to a group the service is no longer in, and the check that
+// follows the mint asks the same wrong identity and agrees.
+type unitValue struct {
+	value string
+	set   bool
+}
+
 // readUnitAccount pulls User= and Group= out of a unit file's [Service]
 // section. Last assignment wins, which is what systemd does with a key set
-// twice. A file that names neither returns two empty strings and changes
+// twice. A file that names neither returns two unset values and changes
 // nothing, which is how a drop-in carrying an unrelated setting behaves.
-func readUnitAccount(path string) (name, group string) {
+func readUnitAccount(path string) (name, group unitValue) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", ""
+		return name, group
 	}
 	defer f.Close()
 
@@ -304,9 +317,9 @@ func readUnitAccount(path string) (name, group string) {
 		switch {
 		case !found:
 		case strings.TrimSpace(k) == "User":
-			name = strings.TrimSpace(v)
+			name = unitValue{value: strings.TrimSpace(v), set: true}
 		case strings.TrimSpace(k) == "Group":
-			group = strings.TrimSpace(v)
+			group = unitValue{value: strings.TrimSpace(v), set: true}
 		}
 	}
 	return name, group
