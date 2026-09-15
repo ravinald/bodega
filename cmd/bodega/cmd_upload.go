@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/ravinald/bodega/internal/builder"
+	"github.com/ravinald/bodega/internal/policy"
 )
 
 func newUploadCmd(gf *globalFlags) *cobra.Command {
@@ -48,7 +49,25 @@ If no types are given all of them are uploaded.`,
 				return fmt.Errorf("load manifests: %w", err)
 			}
 
+			auditDB := openAuditDB(gf)
+			if auditDB != nil {
+				defer auditDB.Close()
+			}
+
+			var policyChecker *policy.Checker
+			if auditDB != nil {
+				policyChecker = policy.NewChecker(auditDB)
+			}
+
 			bcfg := builder.NewConfig(cfg)
+			// upload is the only advertised command that reaches a hosted
+			// artifact without naming a stage: ensureUploadable runs fetch,
+			// build and package under this config. Left nil, every digest
+			// those stages compute stops at pinChecksum's nil guard, so a
+			// first install driven entirely by `build upload` uploads
+			// artifacts nothing is pinned against.
+			bcfg.AuditDB = auditDB
+			bcfg.Policy = policyChecker
 
 			ctx := backgroundCtx()
 			pl, err := newPlacer(ctx, cfg, store, os.Stdout, replacePlacement)

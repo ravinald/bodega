@@ -34,6 +34,17 @@ check_eq INT-01 "the checksum cache is readable" 0 "$E2E_RC" \
 check_lacks INT-02 "the checksum cache is not empty after eight types were fetched" \
 	"No cached checksums" "$E2E_OUT" "README.md" "bodega pkg checksum list"
 
+# INT-02 passes on any row, and by the time this suite runs the proxy suites
+# have served gomod, npm, pypi and cargo, each of which writes a "computed" row
+# of its own. binary is served from the store and never proxied, so a row for
+# the fixture can only have come from the `build upload` cascade 30-pipeline
+# ran against an un-fetched store: the route a first install takes.
+e2e_bodega server "pkg checksum list --type binary --name hello-binary" || true
+check_matches INT-02d "the build upload cascade pinned the digest it fetched" \
+	'^binary[[:space:]]+hello-binary[[:space:]]+1\.0\.0.*manifest' "$E2E_OUT" \
+	"internal/builder/checksum.go:132" \
+	"bodega pkg checksum list --type binary --name hello-binary"
+
 # ---- manifest integrity ----------------------------------------------------
 #
 # Every manifest carries an md5 sidecar. Editing the manifest without the

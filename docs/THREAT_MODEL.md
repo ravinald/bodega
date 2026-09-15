@@ -23,9 +23,11 @@ risk:
   object key the server serves it under, and a later fetch producing different
   bytes is refused rather than stored. Both halves of the pipeline write that
   one record: `build fetch` pins what it downloads, and the proxy pins what it
-  caches on behalf of a client. Tuesday's build produces the same bytes as last
-  Tuesday's build, and `bodega pkg checksum list` is the record of which
-  versions are pinned.
+  caches on behalf of a client. `build upload` reaches upstream through that
+  same fetch when a stage is missing, so the one-command install pins as it
+  cascades rather than uploading artifacts nothing is pinned against.
+  Tuesday's build produces the same bytes as last Tuesday's build, and
+  `bodega pkg checksum list` is the record of which versions are pinned.
 
   Two artifacts are not covered, and the gap is in the shape of the artifact
   rather than in the check. **pypi** wheels upload as a directory holding the

@@ -53,6 +53,27 @@ E2EFIXTURE" || true
 		"cmd/bodega/cmd_import.go:29" "bodega pkg import /tmp/e2e-fx-$t.json" "$E2E_RC"
 done
 
+# ---- one cascade from an un-fetched store ----------------------------------
+#
+# The stage loop below runs `build fetch` first, so by the time it reaches
+# `build upload` every artifact is already on disk and the cascade inside upload
+# has nothing left to run. That cascade is the advertised one-command install
+# and it carries its own builder config, so the digest it pins on a first fetch
+# is only exercised when nothing has been fetched yet.
+#
+# binary is the type whose fetch is the whole pipeline, so one cascade covers
+# fetch through upload without leaving the other seven in a state the loop has
+# to account for.
+
+e2e_bodega server "build upload binary" || true
+check_eq PIPE-CASCADE "build upload cascades from an un-fetched store" 0 "$E2E_RC" \
+	"cmd/bodega/cmd_upload.go:51" "bodega build upload binary" "$E2E_RC"
+
+e2e_bodega server "pkg checksum list --type binary --name hello-binary" || true
+check_lacks PIPE-CASCADE-PIN "the cascade pinned the digest it fetched" \
+	"No cached checksums" "$E2E_OUT" "internal/builder/checksum.go:132" \
+	"bodega pkg checksum list --type binary --name hello-binary"
+
 # ---- stages ----------------------------------------------------------------
 #
 # `build upload` cascades every earlier stage, so running them separately is
