@@ -226,6 +226,8 @@ bodega acl admin add 10.0.0.0/8
 
 Widening past localhost is what turns the Bearer requirement on, so `bodega acl admin add` refuses to do it while no token exists: the next mutation would answer 401 with nothing naming the cause. Both live in the audit database, so neither needs a restart.
 
+Tokens are hashed against `/etc/bodega/pepper`, which the first `bodega token generate` creates. It lands mode 0640 owned by root, in the group the installed [bodega.service](bodega.service) runs the server in: `Group=` where the unit names one, the `User=` account's primary group where it does not. So the pepper needs no entry in that unit's ownership pass and follows a `systemctl edit` that moves the account. Where the file cannot be handed over, `token generate` fails instead of printing a token the server would answer `401 invalid token` to, and a server that meets one refuses to start rather than falling back to a second pepper under its own home. `bodega doctor` reports the same mismatch with the chown to run, and a pepper that will not open for anyone (a symlink cycle, a bad disk) with what the open returned instead, because no ownership change reaches one. Two peppers on one host is survivable: the first path in the search order wins and `token generate` names the one it ignored, whether that one is readable or broken.
+
 The `admin_permit_cidr` key in `config.json` seeds the list on first start and is ignored afterwards. Editing it on a running install changes nothing.
 
 Manage tokens with `bodega token list` and `bodega token revoke`. In the TUI, press `T` to open the token manager. See [USAGE.md](USAGE.md#rest-api) for full details.

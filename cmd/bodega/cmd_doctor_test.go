@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/ravinald/bodega/internal/audit"
@@ -331,4 +334,350 @@ func tableExists(t *testing.T, path, name string) bool {
 		t.Fatalf("read sqlite_master: %v", err)
 	}
 	return n > 0
+}
+
+// The reproduction the review sent back. The shipped check compared the
+// pepper's grants to config.json's and called them equal: both root:root, both
+// granting owner and group. What it never asked is which triple the service
+// account actually reads through — the config at 0644 hands it over on the
+// other bit, and the pepper at 0640 has none.
+func TestDoctorReportsAPepperTheServiceAccountCannotRead(t *testing.T) {
+	dir := pepperTree(t, 0o644, 0o640)
+	f := pepperFinding(audit.PepperState{Path: filepath.Join(dir, "pepper")}, nil, serviceAccount, nil)
+
+	if f.Status != host.StatusFail {
+		t.Fatalf("a 0640 root:root pepper beside a 0644 root:root config reported %s: %s", f.Status, f.Detail)
+	}
+	for _, want := range []string{"pepper", serviceAccount.Name} {
+		if !strings.Contains(f.Detail, want) {
+			t.Errorf("detail %q does not name %q", f.Detail, want)
+		}
+	}
+	if !strings.Contains(f.Remediation, "chown root:"+serviceAccount.Group) {
+		t.Errorf("remediation %q does not carry the chown to run", f.Remediation)
+	}
+}
+
+// The OK side has to be readability, not a matching pair of grants: a check
+// that only ever fails is as useless as one that only ever passes.
+func TestDoctorAcceptsAPepperTheServiceAccountReads(t *testing.T) {
+	dir := pepperTree(t, 0o644, 0o640)
+	path := filepath.Join(dir, "pepper")
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	id := serviceAccount
+	id.GID = int(fi.Sys().(*syscall.Stat_t).Gid)
+	id.GIDs = []int{id.GID}
+
+	if f := pepperFinding(audit.PepperState{Path: path}, nil, id, nil); f.IsFinding() {
+		t.Fatalf("a pepper whose group the service account is in reported %s: %s", f.Status, f.Detail)
+	}
+}
+
+// A directory the service account cannot enter withholds a pepper whose own
+// mode hands it over, and the chown goes on the directory. Naming the file
+// there sends the operator to chown something already correct.
+func TestDoctorNamesTheDirectoryThatWithholdsThePepper(t *testing.T) {
+	dir := pepperTree(t, 0o644, 0o644)
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	f := pepperFinding(audit.PepperState{Path: filepath.Join(dir, "pepper")}, nil, serviceAccount, nil)
+
+	if f.Status != host.StatusFail {
+		t.Fatalf("a pepper inside a 0700 directory reported %s: %s", f.Status, f.Detail)
+	}
+	if !strings.Contains(f.Detail, dir) || !strings.Contains(f.Remediation, dir) {
+		t.Errorf("detail %q / remediation %q do not name the directory %q", f.Detail, f.Remediation, dir)
+	}
+}
+
+// A symlinked config directory whose target sits under a directory the
+// service account cannot enter. The pepper's own mode hands it over, so
+// doctor reported OK and the operator's next move was to re-mint into the
+// same 401 — which is the failure this check exists to end.
+func TestDoctorNamesTheDirectoryBehindASymlinkedPepper(t *testing.T) {
+	root := pepperTree(t, 0o644, 0o644)
+	closed := filepath.Join(root, "private")
+	if err := os.Mkdir(closed, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Chmod(closed, 0o700); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	target := filepath.Join(closed, "pepper")
+	if err := os.Rename(filepath.Join(root, "pepper"), target); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	link := filepath.Join(root, "pepper")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	f := pepperFinding(audit.PepperState{Path: link}, nil, serviceAccount, nil)
+	if f.Status != host.StatusFail {
+		t.Fatalf("a 0644 pepper behind a 0700 directory reported %s: %s", f.Status, f.Detail)
+	}
+	if !strings.Contains(f.Detail, closed) {
+		t.Errorf("detail %q does not name %q, the directory that refuses the walk", f.Detail, closed)
+	}
+	if want := "chgrp " + serviceAccount.Group + " " + closed; !strings.Contains(f.Remediation, want) {
+		t.Errorf("remediation %q carries no %q: a chown of the pepper leaves the directory refusing it", f.Remediation, want)
+	}
+}
+
+// The OK side of the same shape. A check that refuses on sight of a symlink
+// sends the operator to chmod a tree nothing is wrong with.
+func TestDoctorAcceptsAPepperReachedThroughASymlink(t *testing.T) {
+	root := pepperTree(t, 0o644, 0o644)
+	link := filepath.Join(root, "pepper-link")
+	if err := os.Symlink(filepath.Join(root, "pepper"), link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if f := pepperFinding(audit.PepperState{Path: link}, nil, serviceAccount, nil); f.IsFinding() {
+		t.Fatalf("a pepper every uid can walk to and read reported %s: %s", f.Status, f.Detail)
+	}
+}
+
+// A pepper the resolver could not open at all. The shipped check threw that
+// error away, read the empty state as absence and printed "no pepper on this
+// host" while the server refused every token minted against the file that is
+// sitting right there.
+func TestDoctorReportsAPepperThatWillNotOpen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pepper")
+	if err := os.Symlink("pepper", path); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	st, resErr := audit.ResolvePepper([]string{path})
+	f := pepperFinding(st, resErr, serviceAccount, nil)
+
+	if f.Status != host.StatusFail {
+		t.Fatalf("a pepper that will not open reported %s: %s", f.Status, f.Detail)
+	}
+	if strings.Contains(f.Detail, "no pepper on this host") {
+		t.Fatalf("detail reports absence for a pepper that exists: %s", f.Detail)
+	}
+	if !strings.Contains(f.Detail, path) {
+		t.Errorf("detail %q does not name the path", f.Detail)
+	}
+	if !strings.Contains(f.Detail, "symbolic links") {
+		t.Errorf("detail %q does not carry why it would not open", f.Detail)
+	}
+	if f.Remediation == "" || strings.Contains(f.Remediation, "chown") || strings.Contains(f.Remediation, "chmod") {
+		t.Errorf("remediation %q sends the operator to an ownership change for a path that will not open", f.Remediation)
+	}
+}
+
+// A host running the server as whoever invoked it has no second account to
+// check against, and a FAIL there would fire on every developer laptop.
+func TestDoctorSkipsThePepperWithNoServiceAccount(t *testing.T) {
+	f := pepperFinding(audit.PepperState{Path: "/etc/bodega/pepper"}, nil, audit.ServiceIdentity{}, audit.ErrNoServiceAccount)
+	if f.Status != host.StatusNA {
+		t.Fatalf("status %s on a host with no service account, want N/A: %s", f.Status, f.Detail)
+	}
+}
+
+// The unit names an account that does not exist. The service cannot start
+// either, so reporting "nothing to check" would send the operator to the
+// pepper instead of to useradd.
+func TestDoctorReportsAnAccountTheHostDoesNotHave(t *testing.T) {
+	f := pepperFinding(audit.PepperState{Path: "/etc/bodega/pepper"}, nil, audit.ServiceIdentity{},
+		errors.New("/etc/systemd/system/bodega.service runs the server as \"bodega\" and this host has no such account"))
+	if f.Status != host.StatusFail {
+		t.Fatalf("status %s, want FAIL: %s", f.Status, f.Detail)
+	}
+	if !strings.Contains(f.Detail, "bodega.service") {
+		t.Errorf("detail %q does not name where the account was declared", f.Detail)
+	}
+}
+
+// pepperPosture resolves the account itself, and that resolution is where the
+// defect the review sent back lived: a vendor drop-in masked by an /etc file
+// of the same name named a second account, doctor tested the pepper against
+// that one and reported OK while the account systemd runs the server as could
+// not open the file. Every case above hands pepperFinding an identity and so
+// cannot see it.
+func TestDoctorNamesTheAccountSystemdWouldRun(t *testing.T) {
+	serving, masked := twoDoctorAccounts(t)
+	units := t.TempDir()
+	writeUnitFile(t, filepath.Join(units, "lib", "bodega.service"),
+		"[Service]\nType=notify\nUser="+serving.Username+"\n")
+	writeUnitFile(t, filepath.Join(units, "lib", "bodega.service.d", "10-account.conf"),
+		"[Service]\nUser="+masked.Username+"\n")
+	writeUnitFile(t, filepath.Join(units, "etc", "bodega.service.d", "10-account.conf"),
+		"[Service]\nRestart=always\n")
+	swapDoctorUnitDirs(t, filepath.Join(units, "etc"), filepath.Join(units, "lib"))
+
+	path := filepath.Join(pepperTree(t, 0o644, 0o640), "pepper")
+	if os.Geteuid() == 0 {
+		// root:masked 0640 is the shape the wrong account's handoff leaves:
+		// readable by the drop-in's account, closed to the one serving.
+		gid, err := strconv.Atoi(masked.Gid)
+		if err != nil {
+			t.Fatalf("gid of %s: %v", masked.Username, err)
+		}
+		if err := os.Chown(path, 0, gid); err != nil {
+			t.Fatalf("chown %s: %v", path, err)
+		}
+	} else if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatalf("chmod %s: %v", path, err)
+	}
+	prev := audit.DefaultPepperPaths
+	audit.DefaultPepperPaths = []string{path}
+	t.Cleanup(func() { audit.DefaultPepperPaths = prev })
+
+	f := pepperPosture()
+	if f.Status != host.StatusFail {
+		t.Fatalf("status %s, want FAIL: %s serves and cannot read %s: %s",
+			f.Status, serving.Username, path, f.Detail)
+	}
+	if !strings.Contains(f.Detail, strconv.Quote(serving.Username)) {
+		t.Errorf("detail %q does not name %q, the account the unit runs the server as",
+			f.Detail, serving.Username)
+	}
+	if strings.Contains(f.Detail, strconv.Quote(masked.Username)) {
+		t.Errorf("detail %q names %q, which systemd never reads: its drop-in is masked by the /etc "+
+			"file of the same name", f.Detail, masked.Username)
+	}
+	if !strings.Contains(f.Remediation, "chown root:") {
+		t.Errorf("remediation %q carries no command to run", f.Remediation)
+	}
+}
+
+// TestDoctorFollowsAClearedGroup is the review's second reproduction on the
+// doctor side. An operator who clears Group= with `systemctl edit` leaves a
+// pepper already handed to the unit's original group, and the check that
+// reports OK for it is the one command that exists to find this.
+func TestDoctorFollowsAClearedGroup(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to hand the pepper to a group this process is not in")
+	}
+	serving, stale := twoDoctorAccounts(t)
+	units := t.TempDir()
+	writeUnitFile(t, filepath.Join(units, "lib", "bodega.service"),
+		"[Service]\nType=notify\nUser="+stale.Username+"\nGroup="+doctorGroupName(t, stale)+"\n")
+	writeUnitFile(t, filepath.Join(units, "etc", "bodega.service.d", "10-account.conf"),
+		"[Service]\nUser="+serving.Username+"\nGroup=\n")
+	swapDoctorUnitDirs(t, filepath.Join(units, "etc"), filepath.Join(units, "lib"))
+
+	// root:<the group the unit named before the edit>, 0640: what the mint
+	// left on disk while the resolver still read the cleared key as absent.
+	path := filepath.Join(pepperTree(t, 0o644, 0o640), "pepper")
+	staleGID, err := strconv.Atoi(stale.Gid)
+	if err != nil {
+		t.Fatalf("gid of %s: %v", stale.Username, err)
+	}
+	if err := os.Chown(path, 0, staleGID); err != nil {
+		t.Fatalf("chown %s: %v", path, err)
+	}
+	prev := audit.DefaultPepperPaths
+	audit.DefaultPepperPaths = []string{path}
+	t.Cleanup(func() { audit.DefaultPepperPaths = prev })
+
+	f := pepperPosture()
+	if f.Status != host.StatusFail {
+		t.Fatalf("status %s, want FAIL: %s serves in its own primary group and cannot read a root:%s pepper: %s",
+			f.Status, serving.Username, doctorGroupName(t, stale), f.Detail)
+	}
+	if !strings.Contains(f.Detail, strconv.Quote(serving.Username)) {
+		t.Errorf("detail %q does not name %q, the account the unit runs the server as", f.Detail, serving.Username)
+	}
+	if want := "chown root:" + doctorGroupName(t, serving); !strings.Contains(f.Remediation, want) {
+		t.Errorf("remediation %q does not carry %q, the chown that hands the pepper over", f.Remediation, want)
+	}
+}
+
+func doctorGroupName(t *testing.T, u *user.User) string {
+	t.Helper()
+	g, err := user.LookupGroupId(u.Gid)
+	if err != nil {
+		t.Skipf("no group named for gid %s (%s): %v", u.Gid, u.Username, err)
+	}
+	return g.Name
+}
+
+// twoDoctorAccounts names two accounts this process is not, with distinct
+// groups: one the unit runs the server as, one a masked drop-in names.
+func twoDoctorAccounts(t *testing.T) (serving, masked *user.User) {
+	t.Helper()
+	var found []*user.User
+	for _, name := range []string{"daemon", "bin", "www", "games", "sys", "nobody"} {
+		u, err := user.Lookup(name)
+		if err != nil {
+			continue
+		}
+		uid, err := strconv.Atoi(u.Uid)
+		if err != nil || uid == os.Getuid() {
+			continue
+		}
+		if len(found) == 1 && u.Gid == found[0].Gid {
+			continue
+		}
+		if found = append(found, u); len(found) == 2 {
+			return found[0], found[1]
+		}
+	}
+	t.Skip("this host has fewer than two accounts to model a masked drop-in with")
+	return nil, nil
+}
+
+func writeUnitFile(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func swapDoctorUnitDirs(t *testing.T, dirs ...string) {
+	t.Helper()
+	prev := audit.UnitSearchDirs
+	audit.UnitSearchDirs = dirs
+	t.Cleanup(func() { audit.UnitSearchDirs = prev })
+}
+
+// serviceAccount is an identity this process is not: it owns nothing in a
+// tree the test just built and belongs to none of its groups, which is the
+// service account's position relative to a file root wrote.
+var serviceAccount = audit.ServiceIdentity{
+	Name: "bodega", Group: "bodega",
+	UID: 4242, GID: 4242, GIDs: []int{4242},
+	Source: "/etc/systemd/system/bodega.service",
+}
+
+// pepperTree builds /etc/bodega as the reproduction describes it, under a
+// directory every uid can walk into: t.TempDir() sits at 0700 and would refuse
+// the identity before the file under test got a say.
+func pepperTree(t *testing.T, configMode, pepperMode os.FileMode) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "bodega-doctor")
+	if err != nil {
+		t.Fatalf("mkdtemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatalf("chmod %s: %v", dir, err)
+	}
+	for name, mode := range map[string]os.FileMode{"config.json": configMode, "pepper": pepperMode} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x\n"), mode); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		if err := os.Chmod(filepath.Join(dir, name), mode); err != nil {
+			t.Fatalf("chmod %s: %v", name, err)
+		}
+	}
+	// The pepper check names the path the kernel lands on, and /tmp is a
+	// symlink to /private/tmp on macOS, so a case comparing against the
+	// unresolved root would measure that rather than what it built.
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatalf("resolve %s: %v", dir, err)
+	}
+	return resolved
 }

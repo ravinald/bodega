@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -117,7 +119,7 @@ See docs/THREAT_MODEL.md for the rationale behind each check.`,
 				findings = append(findings, fn())
 			}
 			findings = append(findings, serverPostureFindings(backgroundCtx(), gf)...)
-			findings = append(findings, retiredConfigKeys(gf))
+			findings = append(findings, retiredConfigKeys(gf), pepperPosture())
 
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 			fmt.Fprintln(w, "CHECK\tSTATUS\tDETAIL")
@@ -408,6 +410,72 @@ func retiredConfigKeys(gf *globalFlags) host.Finding {
 	f.Status = host.StatusWarn
 	f.Detail = "retired keys still in " + config.ConfigPath() + ": " + strings.Join(found, "; ")
 	f.Remediation = "delete them; they are preserved on every save and read by nothing"
+	return f
+}
+
+// pepperPosture reports a pepper the account the server runs as cannot read.
+//
+// doctor normally runs as root, which reads every file on the box, so the
+// question is not whether this process can open it. The account comes from the
+// systemd unit's User= (or BODEGA_SERVICE_USER), and the test is that
+// account's uid and group memberships against the pepper's mode and every
+// directory above it.
+func pepperPosture() host.Finding {
+	st, resErr := audit.ResolvePepper(audit.DefaultPepperPaths)
+	id, err := audit.ResolveServiceIdentity()
+	return pepperFinding(st, resErr, id, err)
+}
+
+func pepperFinding(st audit.PepperState, resErr error, id audit.ServiceIdentity, idErr error) host.Finding {
+	f := host.Finding{Check: "pepper", Status: host.StatusOK}
+	if st.Path == "" {
+		f.Status = host.StatusNA
+		f.Detail = "no pepper on this host; the first `bodega token generate` writes one"
+		return f
+	}
+	// A path that will not open for this process is reported ahead of the
+	// account checks below, which would answer a permission question about a
+	// file whose problem is not permission. Absent this branch a symlink cycle
+	// read as "no pepper on this host" while the server refused every token.
+	var unreadable *audit.PepperUnreadableError
+	if errors.As(resErr, &unreadable) && !errors.Is(resErr, fs.ErrPermission) {
+		f.Status = host.StatusFail
+		f.Detail = fmt.Sprintf("%s is the pepper in force and cannot be read: %v; every token minted on this "+
+			"host is answered with \"invalid token\", which names the credential rather than this file",
+			st.Path, unreadable.Err)
+		f.Remediation = "repair or remove " + st.Path + ", then mint again with `sudo bodega token generate`"
+		return f
+	}
+	switch {
+	case errors.Is(idErr, audit.ErrNoServiceAccount):
+		f.Status = host.StatusNA
+		f.Detail = st.Path + " is in force, and this host names no service account (no systemd unit with " +
+			"User=, no " + audit.ServiceUserEnv + "): whoever writes the pepper is whoever reads it"
+		return f
+	case idErr != nil:
+		f.Status = host.StatusFail
+		f.Detail = "cannot tell which account serves " + st.Path + ": " + idErr.Error()
+		f.Remediation = "create the account the unit names, or set " + audit.ServiceUserEnv
+		return f
+	}
+
+	ok, blocker, err := id.CanRead(st.Path)
+	switch {
+	case ok:
+		f.Detail = fmt.Sprintf("%s is readable by %q, the account %s runs the server as", st.Path, id.Name, id.Source)
+		return f
+	case err != nil:
+		f.Status = host.StatusWarn
+		f.Detail = "could not inspect " + blocker + ": " + err.Error()
+		f.Remediation = "check the pepper exists and this account can stat it"
+		return f
+	}
+
+	f.Status = host.StatusFail
+	f.Detail = fmt.Sprintf("%s refuses %q, the account %s runs the server as: every token minted on this host "+
+		"is answered with \"invalid token\", which names the credential rather than this file",
+		blocker, id.Name, id.Source)
+	f.Remediation = audit.PepperRemedy("sudo ", blocker, id.Group)
 	return f
 }
 

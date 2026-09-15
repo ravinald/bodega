@@ -100,20 +100,17 @@ check_ne ACC-05 "widening past loopback is refused while no token exists" \
 
 # ---- a token, then the widening -------------------------------------------
 
-# The pepper is the file the token hash is keyed on. `token generate` creates
-# /etc/bodega/pepper when run as root, mode 0600 root:root, and the service runs
-# as its own user: it cannot read that file, falls back to the pepper under its
-# own XDG path, and rejects every token the admin mints. The refusal is
-# "invalid token" and 401, which names the credential rather than the file, so
-# the operator re-mints instead of looking at ownership.
+# The pepper is the file the token hash is keyed on, and `token generate` is
+# what creates it. Run as root it used to land 0600 root:root, which the
+# service account cannot read: the server fell back to the pepper under its own
+# XDG path and answered 401 "invalid token" to every token the admin minted,
+# naming the credential rather than the file. A new pepper now lands
+# root:$E2E_SERVICE_USER mode 0640, with the account read from User= in the
+# installed unit rather than guessed at from a neighbouring file's ownership.
 #
-# The unit's header calls for an ownership pass over config.json and audit.db.
-# The pepper is not on that list and is created later, by the one command the
-# quick start tells you to run before widening the admin list.
-# The pepper is removed and re-created here rather than inspected where it
-# lies. A previous run of this suite repairs the ownership at the end, so
-# reading whatever is on disk measures the last repair instead of what
-# `token generate` writes, and the check passes on every run after the first.
+# Removed and re-created rather than inspected where it lies: reading whatever
+# is on disk measures the last thing that touched it, and this check exists to
+# measure what `token generate` itself writes.
 e2e_on server "sudo rm -f /etc/bodega/pepper" || true
 e2e_bodega server "token generate e2e-pepper-probe expiry 1d 'e2e pepper probe'" || true
 e2e_on server "stat -c '%U:%G %a' /etc/bodega/pepper 2>/dev/null || echo absent" || true
@@ -123,21 +120,23 @@ if [ "$pepper_state" = absent ]; then
 		"token generate wrote no /etc/bodega/pepper on this install"
 else
 	e2e_on server "sudo -u ${E2E_SERVICE_USER:-bodega} test -r /etc/bodega/pepper && echo readable || echo unreadable" || true
+	# The ownership goes on the actual only when it is the explanation.
+	# check_eq is string equality, so carrying it unconditionally made
+	# "readable (root:bodega 640)" unequal to "readable" and the check could
+	# only ever FAIL, fix or no fix.
+	pepper_readable="$E2E_OUT"
+	[ "$pepper_readable" = readable ] || pepper_readable="$pepper_readable ($pepper_state)"
 	check_eq ACC-06b "the service user can read the pepper token generate wrote" \
-		"readable" "$E2E_OUT ($pepper_state)" "internal/audit/pepper.go:17" \
+		"readable" "$pepper_readable" "internal/audit/service_account.go:120" \
 		"rm /etc/bodega/pepper; sudo bodega token generate; sudo -u ${E2E_SERVICE_USER:-bodega} test -r /etc/bodega/pepper"
 fi
 e2e_bodega server "token revoke e2e-pepper-probe" >/dev/null 2>&1 || true
 
-# Repaired here rather than left broken, so the checks below measure the token
-# path instead of re-reporting the pepper. ACC-06b above is where the defect is
-# recorded.
-#
-# This runs before the token the later checks use is minted. Removing the
-# pepper invalidates every token already hashed against it, so probing after
-# minting leaves that token permanently rejected and the authorization checks
-# fail for a reason the suite created.
-e2e_on server "sudo chown ${E2E_SERVICE_USER:-bodega} /etc/bodega/pepper 2>/dev/null; true" || true
+# The restart runs before the token the later checks use is minted. Removing
+# the pepper above invalidates every token already hashed against it, so the
+# server has to pick up the new one or the authorization checks fail for a
+# reason this suite created. No chown pairs with it any more: `token generate`
+# writes a pepper the service account can read, which is what ACC-06b asserts.
 e2e_restart server || true
 
 e2e_bodega server "token generate e2e-token expiry 1d 'e2e run'" || true
@@ -256,4 +255,4 @@ e2e_bodega server "acl admin list" || true
 check_lacks ACC-20 "the admin list is back to loopback" "$E2E_CLIENT_CIDR" "$E2E_OUT" \
 	"cmd/bodega/cmd_acl.go:246" "bodega acl admin list"
 
-unset CREATE_BODY client_status pepper_state revoked_after waited
+unset CREATE_BODY client_status pepper_state pepper_readable revoked_after waited

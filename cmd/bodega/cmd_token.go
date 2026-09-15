@@ -67,9 +67,24 @@ Examples:
 			defer adb.Close()
 
 			// Load or create pepper.
-			pepper, err := audit.LoadOrCreatePepper(audit.DefaultPepperPaths)
+			pst, err := audit.LoadOrCreatePepper(audit.DefaultPepperPaths)
 			if err != nil {
 				return fmt.Errorf("pepper: %w", err)
+			}
+			// The mint aborts rather than keying a token on a pepper the
+			// server cannot open. A pepper written before this check existed
+			// reaches here readable by root alone, and root is not who
+			// validates the token.
+			if err := audit.VerifyPepperHandoff(pst.Path); err != nil {
+				return err
+			}
+			pepper := pst.Pepper
+			for _, c := range pst.Shadowed {
+				fmt.Fprintf(os.Stderr, "warning: a second pepper at %s is ignored. This token is keyed on %s, "+
+					"and a server reading %s will refuse it.\n", c.Path, pst.Path, c.Path)
+				if c.Err != nil {
+					fmt.Fprintf(os.Stderr, "warning: %s cannot be read either: %v\n", c.Path, c.Err)
+				}
 			}
 
 			// Generate random token.
