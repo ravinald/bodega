@@ -273,6 +273,82 @@ func TestVerifyPepperHandoffCatchesAPepperItDidNotWrite(t *testing.T) {
 	}
 }
 
+// TestCreatedPepperThroughASymlinkedDirIsStillHandedOver drives requirement 1
+// through the shape the review reproduced on: a symlinked config directory
+// whose target sits under a parent the service account cannot enter.
+// LoadOrCreatePepper writes through the link and the file lands at a mode that
+// hands it to the service group, so every check that asks only about the file
+// agrees it worked. The account still cannot open it, because what refuses is
+// a directory no part of the path names.
+func TestCreatedPepperThroughASymlinkedDirIsStillHandedOver(t *testing.T) {
+	root := worldTraversableDir(t)
+	closed := mkdirMode(t, filepath.Join(root, "private"), 0o700)
+	link := symlinkTo(t, mkdirMode(t, filepath.Join(closed, "bodega"), 0o755), filepath.Join(root, "etc-bodega"))
+	path := filepath.Join(link, "pepper")
+	t.Setenv(ServiceUserEnv, secondAccount(t))
+
+	st, err := LoadOrCreatePepper([]string{path})
+	if st.Path != path || !st.Created {
+		t.Fatalf("created=%v path=%s, want true and %s", st.Created, st.Path, path)
+	}
+	var handoff *PepperHandoffError
+	if !errors.As(err, &handoff) {
+		t.Fatalf("err = %v, want a *PepperHandoffError: %s refuses the account the pepper was handed to, "+
+			"and a token minted here is answered \"invalid token\"", err, closed)
+	}
+	if handoff.Blocker != closed {
+		t.Errorf("blocker %q, want %q: the remediation goes on the directory the walk stopped at", handoff.Blocker, closed)
+	}
+	if os.Geteuid() != 0 {
+		return
+	}
+	u, err := user.Lookup(handoff.Identity.Name)
+	if err != nil {
+		t.Fatalf("lookup %s: %v", handoff.Identity.Name, err)
+	}
+	if err := opensAs(t, u, path); err == nil {
+		t.Fatalf("%s opened %s: this fixture models a refusal the kernel did not make", u.Username, path)
+	}
+}
+
+// The same link, on the load path `token generate` takes for a pepper already
+// on disk. The file is 0644 here, so anything that asks about the file alone
+// reports it readable and mints against it.
+func TestVerifyPepperHandoffWalksASymlinkedPath(t *testing.T) {
+	root := worldTraversableDir(t)
+	closed := mkdirMode(t, filepath.Join(root, "private"), 0o700)
+	_, target := pepperUnder(t, closed)
+	link := symlinkTo(t, target, filepath.Join(root, "pepper"))
+	t.Setenv(ServiceUserEnv, secondAccount(t))
+
+	err := VerifyPepperHandoff(link)
+	var handoff *PepperHandoffError
+	if !errors.As(err, &handoff) {
+		t.Fatalf("err = %v, want a *PepperHandoffError: the pepper is 0644 and %s refuses the walk to it", err, closed)
+	}
+	if handoff.Blocker != closed {
+		t.Fatalf("blocker %q, want %q", handoff.Blocker, closed)
+	}
+	if want := "chgrp " + handoff.Identity.Group + " " + closed; !strings.Contains(handoff.Error(), want) {
+		t.Errorf("error %q carries no %q: a chown of the pepper leaves the directory refusing it", handoff.Error(), want)
+	}
+}
+
+// A pepper reached through a symlink every component of which grants the
+// account is readable. A check that refuses on sight of a link would fail an
+// install nothing is wrong with, and the operator would chmod a tree that is
+// already correct.
+func TestVerifyPepperHandoffAcceptsAReadableSymlink(t *testing.T) {
+	root := worldTraversableDir(t)
+	_, target := pepperUnder(t, mkdirMode(t, filepath.Join(root, "open"), 0o755))
+	link := symlinkTo(t, target, filepath.Join(root, "pepper"))
+	t.Setenv(ServiceUserEnv, secondAccount(t))
+
+	if err := VerifyPepperHandoff(link); err != nil {
+		t.Fatalf("VerifyPepperHandoff(%s): %v: every component of the resolved path is open to every uid", link, err)
+	}
+}
+
 // A host with no unit and no environment override runs the server as whoever
 // ran the command. There is no second account to hand anything to, and a
 // refusal there would break every single-account install.

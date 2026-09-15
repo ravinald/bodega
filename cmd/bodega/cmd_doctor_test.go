@@ -394,6 +394,53 @@ func TestDoctorNamesTheDirectoryThatWithholdsThePepper(t *testing.T) {
 	}
 }
 
+// A symlinked config directory whose target sits under a directory the
+// service account cannot enter. The pepper's own mode hands it over, so
+// doctor reported OK and the operator's next move was to re-mint into the
+// same 401 — which is the failure this check exists to end.
+func TestDoctorNamesTheDirectoryBehindASymlinkedPepper(t *testing.T) {
+	root := pepperTree(t, 0o644, 0o644)
+	closed := filepath.Join(root, "private")
+	if err := os.Mkdir(closed, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Chmod(closed, 0o700); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	target := filepath.Join(closed, "pepper")
+	if err := os.Rename(filepath.Join(root, "pepper"), target); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	link := filepath.Join(root, "pepper")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	f := pepperFinding(audit.PepperState{Path: link}, serviceAccount, nil)
+	if f.Status != host.StatusFail {
+		t.Fatalf("a 0644 pepper behind a 0700 directory reported %s: %s", f.Status, f.Detail)
+	}
+	if !strings.Contains(f.Detail, closed) {
+		t.Errorf("detail %q does not name %q, the directory that refuses the walk", f.Detail, closed)
+	}
+	if want := "chgrp " + serviceAccount.Group + " " + closed; !strings.Contains(f.Remediation, want) {
+		t.Errorf("remediation %q carries no %q: a chown of the pepper leaves the directory refusing it", f.Remediation, want)
+	}
+}
+
+// The OK side of the same shape. A check that refuses on sight of a symlink
+// sends the operator to chmod a tree nothing is wrong with.
+func TestDoctorAcceptsAPepperReachedThroughASymlink(t *testing.T) {
+	root := pepperTree(t, 0o644, 0o644)
+	link := filepath.Join(root, "pepper-link")
+	if err := os.Symlink(filepath.Join(root, "pepper"), link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if f := pepperFinding(audit.PepperState{Path: link}, serviceAccount, nil); f.IsFinding() {
+		t.Fatalf("a pepper every uid can walk to and read reported %s: %s", f.Status, f.Detail)
+	}
+}
+
 // A host running the server as whoever invoked it has no second account to
 // check against, and a FAIL there would fire on every developer laptop.
 func TestDoctorSkipsThePepperWithNoServiceAccount(t *testing.T) {
@@ -594,5 +641,12 @@ func pepperTree(t *testing.T, configMode, pepperMode os.FileMode) string {
 			t.Fatalf("chmod %s: %v", name, err)
 		}
 	}
-	return dir
+	// The pepper check names the path the kernel lands on, and /tmp is a
+	// symlink to /private/tmp on macOS, so a case comparing against the
+	// unresolved root would measure that rather than what it built.
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatalf("resolve %s: %v", dir, err)
+	}
+	return resolved
 }

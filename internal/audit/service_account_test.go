@@ -24,7 +24,14 @@ func worldTraversableDir(t *testing.T) string {
 	if err := os.Chmod(dir, 0o755); err != nil {
 		t.Fatalf("chmod %s: %v", dir, err)
 	}
-	return dir
+	// CanRead names the path the kernel lands on, and /tmp is a symlink to
+	// /private/tmp on macOS, so a case comparing against the unresolved root
+	// would be measuring that rather than the refusal it built.
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatalf("resolve %s: %v", dir, err)
+	}
+	return resolved
 }
 
 // otherAccount is an identity that is nobody on this host: it matches no
@@ -123,6 +130,122 @@ func TestCanReadNamesTheDirectoryThatRefuses(t *testing.T) {
 	}
 	if blocker != etc {
 		t.Errorf("blocker %q, want the directory %q", blocker, etc)
+	}
+}
+
+// mkdirMode creates a directory at exactly mode, past the umask Mkdir applies.
+func mkdirMode(t *testing.T, path string, mode os.FileMode) string {
+	t.Helper()
+	if err := os.Mkdir(path, mode); err != nil {
+		t.Fatalf("mkdir %s: %v", path, err)
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatalf("chmod %s: %v", path, err)
+	}
+	return path
+}
+
+// pepperUnder builds dir/bodega/pepper with both the directory and the file
+// open to every uid, so the only thing that can refuse a case is the mode that
+// case set on purpose.
+func pepperUnder(t *testing.T, dir string) (bodega, pepper string) {
+	t.Helper()
+	bodega = mkdirMode(t, filepath.Join(dir, "bodega"), 0o755)
+	pepper = filepath.Join(bodega, "pepper")
+	if err := os.WriteFile(pepper, []byte("5ca1ab1e\n"), 0o644); err != nil {
+		t.Fatalf("write %s: %v", pepper, err)
+	}
+	if err := os.Chmod(pepper, 0o644); err != nil {
+		t.Fatalf("chmod %s: %v", pepper, err)
+	}
+	return bodega, pepper
+}
+
+func symlinkTo(t *testing.T, target, link string) string {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink %s -> %s: %v", link, target, err)
+	}
+	return link
+}
+
+// TestCanReadFollowsSymlinksTheWayTheKernelDoes is the second defect the
+// review sent back. The check walked the path it was handed lexically and
+// stat'd each component, and stat follows a link: it reported the target's
+// mode and nothing about the directories the kernel walked to reach it, so a
+// pepper behind a root-only directory read as OK to the privileged process
+// minting against it. Resolving up front and checking only the target has the
+// opposite blind spot, which is the last case here.
+func TestCanReadFollowsSymlinksTheWayTheKernelDoes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// build returns the path to check and the component that must be
+		// named as refusing it, empty where the account can read it.
+		build func(t *testing.T, root string) (path, blocker string)
+	}{
+		{"symlinked pepper behind a closed directory", func(t *testing.T, root string) (string, string) {
+			closed := mkdirMode(t, filepath.Join(root, "private"), 0o700)
+			_, target := pepperUnder(t, closed)
+			return symlinkTo(t, target, filepath.Join(root, "pepper")), closed
+		}},
+		{"symlinked pepper the account reads", func(t *testing.T, root string) (string, string) {
+			open := mkdirMode(t, filepath.Join(root, "open"), 0o755)
+			_, target := pepperUnder(t, open)
+			return symlinkTo(t, target, filepath.Join(root, "pepper")), ""
+		}},
+		{"symlinked parent behind a closed directory", func(t *testing.T, root string) (string, string) {
+			closed := mkdirMode(t, filepath.Join(root, "private"), 0o700)
+			dir, _ := pepperUnder(t, closed)
+			link := symlinkTo(t, dir, filepath.Join(root, "etc-bodega"))
+			return filepath.Join(link, "pepper"), closed
+		}},
+		{"symlinked parent the account walks", func(t *testing.T, root string) (string, string) {
+			open := mkdirMode(t, filepath.Join(root, "open"), 0o755)
+			dir, _ := pepperUnder(t, open)
+			link := symlinkTo(t, dir, filepath.Join(root, "etc-bodega"))
+			return filepath.Join(link, "pepper"), ""
+		}},
+		{"a refusal on the side the link was typed on", func(t *testing.T, root string) (string, string) {
+			open := mkdirMode(t, filepath.Join(root, "open"), 0o755)
+			_, target := pepperUnder(t, open)
+			closed := mkdirMode(t, filepath.Join(root, "private"), 0o700)
+			return symlinkTo(t, target, filepath.Join(closed, "pepper")), closed
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path, want := tc.build(t, worldTraversableDir(t))
+			ok, blocker, err := otherAccount.CanRead(path)
+			if err != nil {
+				t.Fatalf("CanRead(%s): %v", path, err)
+			}
+			if want == "" {
+				if !ok {
+					t.Fatalf("CanRead(%s) = false, blocked at %q: every component grants %q", path, blocker, otherAccount.Name)
+				}
+				return
+			}
+			if ok {
+				t.Fatalf("CanRead(%s) = true: %s refuses %q, and a pepper minted there is a token nothing accepts",
+					path, want, otherAccount.Name)
+			}
+			if blocker != want {
+				t.Errorf("blocker %q, want %q: the remediation goes on the component that actually refuses", blocker, want)
+			}
+		})
+	}
+}
+
+// A cycle has no target to land on. Walking it is an unresponsive doctor and a
+// mint that never returns, so it is reported the way the kernel reports it.
+func TestCanReadReportsASymlinkCycle(t *testing.T) {
+	root := worldTraversableDir(t)
+	a, b := filepath.Join(root, "a"), filepath.Join(root, "b")
+	symlinkTo(t, b, a)
+	symlinkTo(t, a, b)
+
+	ok, blocker, err := otherAccount.CanRead(filepath.Join(a, "pepper"))
+	if ok || err == nil {
+		t.Fatalf("CanRead = %v, err %v (blocker %q), want a refusal naming the loop", ok, err, blocker)
 	}
 }
 

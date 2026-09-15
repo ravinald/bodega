@@ -85,8 +85,24 @@ func (e *PepperHandoffError) Error() string {
 	if e.Err != nil {
 		msg += ": " + e.Err.Error()
 	}
-	return msg + fmt.Sprintf(". Every token hashed against it would be refused with \"invalid token\". "+
-		"Hand it over with: chown root:%s %s && chmod 0640 %s", e.Identity.Group, e.Path, e.Path)
+	return msg + ". Every token hashed against it would be refused with \"invalid token\". " +
+		"Hand it over with: " + PepperRemedy("", blocker, e.Identity.Group)
+}
+
+// PepperRemedy names the commands that open blocker to group, each prefixed
+// with run: "sudo " for a line an operator pastes later, empty for a command
+// already running as root.
+//
+// What blocker is decides which commands they are. A directory needs search,
+// and 0640 on it withholds the pepper exactly as before; the pepper itself
+// needs read, and 0750 on a secret hands out the execute bit for nothing. A
+// symlink resolves to one or the other, so neither can be assumed from the
+// path the operator typed.
+func PepperRemedy(run, blocker, group string) string {
+	if fi, err := os.Stat(blocker); err == nil && fi.IsDir() {
+		return fmt.Sprintf("%schgrp %s %s && %schmod 0750 %s", run, group, blocker, run, blocker)
+	}
+	return fmt.Sprintf("%schown root:%s %s && %schmod 0640 %s", run, group, blocker, run, blocker)
 }
 
 func (e *PepperHandoffError) Unwrap() error { return e.Err }

@@ -133,37 +133,82 @@ func VerifyPepperHandoff(path string) error {
 	return &PepperHandoffError{Path: path, Identity: id, Blocker: blocker, Err: err}
 }
 
-// CanRead reports whether id can open path for reading, and names the first
-// component that refuses it. The directory half is not decoration: /etc/bodega
-// at 0700 root:root withholds a pepper whose own mode grants it, and the
-// operator has to chmod the directory rather than the file.
+// maxSymlinkHops bounds resolution where Linux does, so a symlink cycle is a
+// reported refusal rather than a hang.
+const maxSymlinkHops = 40
+
+// CanRead reports whether id can open path for reading, and names the
+// component that refuses it.
+//
+// It walks the path a component at a time the way the kernel does, because
+// neither half alone is the answer. The directory half is not decoration:
+// /etc/bodega at 0700 root:root withholds a pepper whose own mode grants it,
+// and the operator has to chmod the directory rather than the file. Nor is a
+// symlink transparent: os.Stat reports the target's mode and says nothing
+// about the directories walked to reach it, so a root-only directory behind a
+// symlinked config dir reads as success to a root process that can traverse it
+// and the pepper lands where the service cannot open it. Resolving up front
+// and checking only the target has the opposite blind spot, since the original
+// path's own ancestors still have to grant search.
 func (id ServiceIdentity) CanRead(path string) (ok bool, blocker string, err error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return false, path, err
 	}
-	var chain []string
-	for p := abs; ; p = filepath.Dir(p) {
-		chain = append(chain, p)
-		if p == filepath.Dir(p) {
-			break
+
+	cur := string(filepath.Separator)
+	rest := pathComponents(abs)
+	hops := 0
+	for len(rest) > 0 {
+		comp := rest[0]
+		rest = rest[1:]
+		if comp == "" || comp == "." {
+			continue
 		}
-	}
-	// Root of the filesystem first: the outermost refusal is the one to report.
-	for i := len(chain) - 1; i >= 0; i-- {
-		need := uint32(0o111) // search, on every directory above the target
-		if i == 0 {
-			need = 0o444 // read, on the target itself
+		// Search on every directory actually walked through, wherever a link
+		// landed us, before anything inside it is looked up.
+		if granted, err := id.grants(cur, 0o111); err != nil || !granted {
+			return false, cur, err
 		}
-		granted, err := id.grants(chain[i], need)
+		if comp == ".." {
+			cur = filepath.Dir(cur)
+			continue
+		}
+		next := filepath.Join(cur, comp)
+		fi, err := os.Lstat(next)
 		if err != nil {
-			return false, chain[i], err
+			return false, next, err
 		}
-		if !granted {
-			return false, chain[i], nil
+		if fi.Mode()&os.ModeSymlink == 0 {
+			cur = next
+			continue
 		}
+		if hops++; hops > maxSymlinkHops {
+			return false, next, syscall.ELOOP
+		}
+		target, err := os.Readlink(next)
+		if err != nil {
+			return false, next, err
+		}
+		if filepath.IsAbs(target) {
+			cur = string(filepath.Separator)
+		}
+		// A relative target resolves against the directory holding the link,
+		// which is cur, so it stays put.
+		rest = append(pathComponents(target), rest...)
+	}
+	// cur is what open(2) would land on, and read is what it needs there.
+	if granted, err := id.grants(cur, 0o444); err != nil || !granted {
+		return false, cur, err
 	}
 	return true, "", nil
+}
+
+// pathComponents splits a path into the names the walk consumes. Empty
+// elements from a leading, trailing or doubled separator are left in and
+// skipped by the caller, which is also what makes "/" a zero-component path.
+func pathComponents(p string) []string {
+	return strings.Split(strings.Trim(p, string(filepath.Separator)), string(filepath.Separator))
 }
 
 // grants reports whether id holds any of the bits in need on path.

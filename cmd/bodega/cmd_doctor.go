@@ -461,11 +461,7 @@ func pepperFinding(st audit.PepperState, id audit.ServiceIdentity, idErr error) 
 	f.Detail = fmt.Sprintf("%s refuses %q, the account %s runs the server as: every token minted on this host "+
 		"is answered with \"invalid token\", which names the credential rather than this file",
 		blocker, id.Name, id.Source)
-	if blocker == st.Path {
-		f.Remediation = fmt.Sprintf("sudo chown root:%s %s && sudo chmod 0640 %s", id.Group, st.Path, st.Path)
-	} else {
-		f.Remediation = fmt.Sprintf("sudo chgrp %s %s && sudo chmod 0750 %s", id.Group, blocker, blocker)
-	}
+	f.Remediation = audit.PepperRemedy("sudo ", blocker, id.Group)
 	return f
 }
 
