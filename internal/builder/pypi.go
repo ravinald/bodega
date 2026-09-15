@@ -3,6 +3,7 @@ package builder
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -308,15 +309,22 @@ var pypiReqOptions = []pypiOption{
 // pypiLineSource checks one logical line for anything that decides where pip
 // downloads from.
 func pypiLineSource(path, indexRoot, line string, seen map[string]bool) error {
-	args, opts := breakPypiArgsOptions(line)
+	args, optionsText := breakPypiArgsOptions(line)
 	for _, arg := range args {
 		if u := pypiURLToken(arg); u != "" {
 			return fmt.Errorf("%s names %s, which pip downloads without asking the %s the manifest approved",
 				path, u, indexRoot)
 		}
 	}
+	opts, err := pypiShlex(optionsText)
+	if err != nil {
+		return fmt.Errorf("%s: %s %w; pip splits options the same way and fails the file, so fix the quoting",
+			path, optionsText, err)
+	}
 
 	for i := 0; i < len(opts); i++ {
+		// optparse discards a token that is not an option and keeps reading
+		// the ones after it, so a stray value decides no origin.
 		if !strings.HasPrefix(opts[i], "-") {
 			continue
 		}
@@ -328,7 +336,6 @@ func pypiLineSource(path, indexRoot, line string, seen map[string]bool) error {
 			i++
 			value = opts[i]
 		}
-		value = strings.Trim(value, `"'`)
 
 		switch opt.class {
 		case pypiOptionIndex:
@@ -362,15 +369,100 @@ func pypiLineSource(path, indexRoot, line string, seen map[string]bool) error {
 }
 
 // breakPypiArgsOptions splits a logical line the way pip does: the tokens up to
-// the first one starting with a dash are the requirement, the rest are options.
-func breakPypiArgsOptions(line string) (args, opts []string) {
-	fields := strings.Fields(line)
-	for i, f := range fields {
-		if strings.HasPrefix(f, "-") {
-			return fields[:i], fields[i:]
+// the first one starting with a dash are the requirement, the rest are the
+// options string.
+//
+// The split is on a literal space rather than on whitespace, and the boundary
+// is decided before any quote is removed, because that is what pip does. A
+// leading `"-r"` is therefore part of the requirement to pip, not an include,
+// and a tab never separates a requirement from an option.
+func breakPypiArgsOptions(line string) (args []string, options string) {
+	tokens := strings.Split(line, " ")
+	for i, tok := range tokens {
+		if strings.HasPrefix(tok, "-") {
+			return tokens[:i], strings.Join(tokens[i:], " ")
 		}
 	}
-	return fields, nil
+	return tokens, ""
+}
+
+// pypiShlex splits an options string the way pip does, which is Python's
+// shlex.split in POSIX mode: quotes are removed, a backslash escapes the next
+// character, and inside double quotes it escapes only a quote or another
+// backslash.
+//
+// Splitting on whitespace alone reads `--pre "--index-url" http://elsewhere/`
+// as one inert option and two fragments that name no option at all, while pip
+// reads an index option and downloads from it. Every concealment of that shape
+// costs one quote or one backslash, so the tokenizer is the boundary, not the
+// spellings it happens to produce.
+//
+// https://pip.pypa.io/en/stable/reference/requirements-file-format/
+func pypiShlex(s string) ([]string, error) {
+	const (
+		whitespace = " \t\r\n"
+		quotes     = `'"`
+	)
+	in := func(set string, c byte) bool { return strings.IndexByte(set, c) >= 0 }
+
+	var (
+		out     []string
+		token   []byte
+		quoted  bool
+		state   byte = ' ' // ' ' or 'a' outside a quote, else the open quote or a backslash
+		escaped byte = ' '
+	)
+	flush := func() {
+		out = append(out, string(token))
+		token, quoted = nil, false
+	}
+
+	for i := range len(s) {
+		c := s[i]
+		switch {
+		case state == '\\':
+			// Only a quote or the backslash itself is escapable inside a
+			// quoted string; anything else keeps the backslash it followed.
+			if in(quotes, escaped) && c != '\\' && c != escaped {
+				token = append(token, '\\')
+			}
+			token = append(token, c)
+			state = escaped
+		case in(quotes, state):
+			quoted = true
+			switch {
+			case c == state:
+				state = 'a'
+			case c == '\\' && state == '"':
+				escaped, state = state, c
+			default:
+				token = append(token, c)
+			}
+		case in(whitespace, c):
+			state = ' '
+			if len(token) > 0 || quoted {
+				flush()
+			}
+		case c == '\\':
+			escaped, state = 'a', c
+		case in(quotes, c):
+			state = c
+		default:
+			token = append(token, c)
+			state = 'a'
+		}
+	}
+
+	switch {
+	case in(quotes, state):
+		return nil, fmt.Errorf("closes no %c quotation", state)
+	case state == '\\':
+		return nil, errors.New("ends on a backslash that escapes nothing")
+	}
+	if len(token) > 0 || quoted {
+		flush()
+	}
+	return out, nil
 }
 
 // cutRequirementOption resolves one option token into the option pip reads and

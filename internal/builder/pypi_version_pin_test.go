@@ -842,3 +842,130 @@ func TestFetchPypiAcceptsRequirementOptionsThatDecideNoOrigin(t *testing.T) {
 		t.Fatalf("options that name no origin failed the fetch: %+v", summary.Results)
 	}
 }
+
+// R1: pip runs shlex over the option half of a line before optparse reads it,
+// so one quote or one backslash hides an option from a scan that compares whole
+// tokens while leaving pip reading it unchanged. Each case below downloads from
+// the other index under pip 26.2.1 while naming no option a token comparison
+// can see. The leading --pre is what carries them past pip's own args/options
+// boundary, which is decided on the raw text before any quote is removed.
+func TestFetchPypiFailsOnQuotedAndEscapedOptions(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		files map[string]string
+	}{
+		{"an index option in quotes", map[string]string{
+			"requirements.txt": "--pre \"--index-url\" OTHER/simple/\nsix\n",
+		}},
+		{"an index option behind a backslash", map[string]string{
+			"requirements.txt": "--pre \\--index-url OTHER/simple/\nsix\n",
+		}},
+		{"an include in quotes", map[string]string{
+			"requirements.txt": "--pre \"-r\" nested.txt\nsix\n",
+			"nested.txt":       "--index-url OTHER/simple/\n",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			selected := pypiIndex(t, "six", "1.16.0")
+			other := pypiWheelIndex(t, "six", "1.16.0")
+
+			files := map[string]string{}
+			for name, body := range tc.files {
+				files[name] = strings.ReplaceAll(body, "OTHER", other.URL)
+			}
+
+			cfg, store := pypiBaseReqEnv(t, selected.URL, files)
+			summary := FetchPypi(cfg, store)
+			if !summary.HasFailures() {
+				t.Fatalf("quoting hid an index option from the fetch: %+v", summary.Results)
+			}
+			var msg string
+			for _, r := range summary.Results {
+				if r.Err != nil {
+					msg = r.Err.Error()
+				}
+			}
+			for _, want := range []string{"requirements.txt", other.URL, selected.URL} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("the failure does not name %q: %s", want, msg)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(cfg.rootFor(manifest.TypePypi), "combined-requirements.txt")); !os.IsNotExist(err) {
+				t.Error("a fetch that could not settle the origin still wrote a requirements file")
+			}
+
+			// The selected index serves no wheel bytes, so anything pip
+			// stored it reached the other index to get.
+			stored, out := pypiPipHonors(t, selected.URL, files)
+			if len(stored) == 0 || !strings.Contains(out, other.URL) {
+				t.Errorf("pip stored %v without reading %s, so this spelling proves nothing:\n%s", stored, other.URL, out)
+			}
+		})
+	}
+}
+
+// Options this fetch cannot tokenize are options pip cannot tokenize either:
+// shlex raises and pip fails the file. Passing the line through would leave the
+// origin decided by whichever of the two guessed.
+func TestFetchPypiRefusesOptionsItCannotTokenize(t *testing.T) {
+	for _, tc := range []struct {
+		name, requirements, want string
+	}{
+		{"a quotation nothing closes", "--index-url \"http://example.invalid/simple/\nsix\n", "closes no"},
+		{"a backslash escaping nothing", "--find-links a\\ \nsix\n", "escapes nothing"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			selected := pypiIndex(t, "six", "1.16.0")
+			cfg, store := pypiBaseReqEnv(t, selected.URL, map[string]string{
+				"requirements.txt": tc.requirements,
+			})
+
+			summary := FetchPypi(cfg, store)
+			if !summary.HasFailures() {
+				t.Fatalf("a line neither reader can tokenize reached pip: %+v", summary.Results)
+			}
+			var msg string
+			for _, r := range summary.Results {
+				if r.Err != nil {
+					msg = r.Err.Error()
+				}
+			}
+			for _, want := range []string{"requirements.txt", tc.want} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("the failure does not name %q: %s", want, msg)
+				}
+			}
+		})
+	}
+}
+
+// Quoting is ordinary in a requirements file, and a fetch that read it as
+// concealment would reject files pip builds. A quoted index option naming the
+// selected index agrees with the manifest, and a quoted path is how a file with
+// a space in its name gets included at all.
+func TestFetchPypiAcceptsQuotedValuesNamingTheSelectedIndex(t *testing.T) {
+	selected := pypiIndex(t, "six", "1.16.0")
+	cfg, store := pypiBaseReqEnv(t, selected.URL, map[string]string{
+		"requirements.txt": "# app\n" +
+			"--index-url \"" + selected.URL + "/simple/\"\n" +
+			"--index-url='" + selected.URL + "/simple/'\n" +
+			"-r \"app extras.txt\"\n" +
+			"attrs\n",
+		"app extras.txt": "-i '" + selected.URL + "/simple/'\nattrs\n",
+	})
+
+	if summary := FetchPypi(cfg, store); summary.HasFailures() {
+		t.Fatalf("quoted values naming the selected index failed the fetch: %+v", summary.Results)
+	}
+}
+
+// A quoted leading token is part of the requirement to pip, not an option: pip
+// decides the args/options boundary on the raw text. Reading `"-r"` there as an
+// include would refuse a line pip never treats as one.
+func TestFetchPypiReadsAQuotedLeadingTokenAsPipDoes(t *testing.T) {
+	line := "\"-r\" nested.txt"
+	args, options := breakPypiArgsOptions(line)
+	if options != "" || len(args) != 2 {
+		t.Fatalf("breakPypiArgsOptions(%q) = %q, %q; pip reads the whole line as the requirement", line, args, options)
+	}
+}
