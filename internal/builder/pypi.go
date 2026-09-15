@@ -40,6 +40,82 @@ func pypiWheelsDir(d dirs) string {
 	return d.wheels
 }
 
+// defaultPypiIndex is the index a pypi entry resolves against when it names no
+// URL of its own.
+const defaultPypiIndex = "https://pypi.org"
+
+// pypiOfferedMax caps how many versions an unresolvable-version error prints.
+// A popular distribution offers hundreds, and an error nobody can read at 03:00
+// is not a better error than a vague one.
+const pypiOfferedMax = 5
+
+// resolvePypiVersion returns the concrete version an entry resolves to, read
+// off the index that will serve it. The empty string means the entry names no
+// version, so the caller writes a bare requirement and lets pip resolve it
+// inside the closure the base requirements already constrain.
+//
+// Resolution happens here rather than being left to pip because the manifest is
+// the record of what was approved: an unpinned requirement line let pip take
+// whatever was newest, and a 1.16.0 entry produced a 1.17.0 wheel with nothing
+// reporting the substitution.
+func resolvePypiVersion(name string, ve manifest.VersionEntry) (string, error) {
+	want := strings.TrimSpace(ve.Version)
+	if want == "" || want == "*" {
+		return "", nil
+	}
+
+	root := ve.URL
+	if root == "" {
+		root = defaultPypiIndex
+	}
+	available, err := pypiVersionsAt(root, name)
+	if err != nil {
+		return "", fmt.Errorf("pypi %s: reading %s to resolve %s: %w", name, root, want, err)
+	}
+
+	constraint := ve.VersionConstraint
+	if constraint == "" {
+		constraint = manifest.ConstraintExact
+	}
+
+	// Literal match before the semver filter. PyPI versions are PEP 440, not
+	// semver, so ParseSemVer rejects "2.0.0rc1" and "0.6.dev1" outright and
+	// FilterVersions would refuse a pin the index plainly offers.
+	if constraint == manifest.ConstraintExact {
+		for _, v := range available {
+			if v == want {
+				return v, nil
+			}
+		}
+	}
+	if matches := FilterVersions(available, constraint, want); len(matches) > 0 {
+		return matches[len(matches)-1], nil
+	}
+
+	return "", fmt.Errorf("pypi %s: version_constraint %q on %s resolves to nothing; the index at %s offers %s",
+		name, constraint, want, root, pypiOffered(available))
+}
+
+// pypiOffered renders an index's version list for an error message, newest last.
+func pypiOffered(available []string) string {
+	if len(available) == 0 {
+		return "no versions at all"
+	}
+	if len(available) <= pypiOfferedMax {
+		return strings.Join(available, ", ")
+	}
+	return fmt.Sprintf("%s (%d versions in all)",
+		strings.Join(available[len(available)-pypiOfferedMax:], ", "), len(available))
+}
+
+// pypiRequirement renders one resolved entry as a pip requirement line.
+func pypiRequirement(name, resolved string) string {
+	if resolved == "" {
+		return name
+	}
+	return name + "==" + resolved
+}
+
 // CheckPypiStage inspects the filesystem to determine which pipeline stages
 // have completed for the pypi packages.
 func CheckPypiStage(cfg *Config, store *manifest.Store) StageStatus {
@@ -159,14 +235,54 @@ func FetchPypi(cfg *Config, store *manifest.Store) *Summary {
 	pkgNames := store.ListPackages(manifest.TypePypi)
 	_, _ = fmt.Fprintf(out, "    Extra packages: %d\n", len(pkgNames))
 	reqLines = append(reqLines, "\n# Extra packages from manifest\n")
+	unresolved := false
 	for _, name := range pkgNames {
 		if err := cfg.EnforcePolicy(ctx, manifest.TypePypi, name, "", ""); err != nil {
 			_, _ = fmt.Fprintf(out, "      %s — SKIPPED: %v\n", name, err)
 			summary.Failures++
 			continue
 		}
-		_, _ = fmt.Fprintf(out, "      %s\n", name)
-		reqLines = append(reqLines, name+"\n")
+
+		pm, err := store.GetPackage(ctx, manifest.TypePypi, name)
+		if err != nil {
+			// The entry says which version was approved, so a fetch that cannot
+			// read it has nothing to honor and must not fall back to a bare
+			// requirement line.
+			err = fmt.Errorf("pypi %s: read the manifest entry: %w", name, err)
+			_, _ = fmt.Fprintf(out, "      %s — FAILED: %v\n", name, err)
+			summary.Failures++
+			summary.Total++
+			summary.Results = append(summary.Results, Result{Type: manifest.TypePypi, Name: name, Err: err})
+			unresolved = true
+			continue
+		}
+
+		// A package with no version entries names no version, which is the
+		// shape auto-imported dependencies arrive in.
+		entries := []manifest.VersionEntry{{}}
+		if pm != nil && len(pm.Versions) > 0 {
+			entries = pm.Versions
+		}
+		for _, ve := range entries {
+			resolved, err := resolvePypiVersion(name, ve)
+			if err != nil {
+				_, _ = fmt.Fprintf(out, "      %s — FAILED: %v\n", name, err)
+				summary.Failures++
+				summary.Total++
+				summary.Results = append(summary.Results, Result{Type: manifest.TypePypi, Name: name, Err: err})
+				unresolved = true
+				continue
+			}
+			spec := pypiRequirement(name, resolved)
+			_, _ = fmt.Fprintf(out, "      %s\n", spec)
+			reqLines = append(reqLines, spec+"\n")
+		}
+	}
+
+	// No requirements file at all rather than one missing the entry that failed:
+	// a partial file builds cleanly and stores a closure nobody approved.
+	if unresolved {
+		return summary
 	}
 
 	// Write combined requirements file.

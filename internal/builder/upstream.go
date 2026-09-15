@@ -15,8 +15,18 @@ var upstreamClient = &http.Client{Timeout: 30 * time.Second}
 
 // DiscoverPyPIVersions queries PyPI for all available versions of a package.
 func DiscoverPyPIVersions(name string) ([]string, error) {
+	return pypiVersionsAt(defaultPypiIndex, name)
+}
+
+// pypiVersionsAt reads a distribution's releases from the JSON API under root,
+// sorted ascending.
+//
+// The JSON API rather than the PEP 503 document under /simple/: a constraint is
+// resolved against versions, and the simple index names files, so reading it
+// means parsing a version back out of every wheel and sdist filename.
+func pypiVersionsAt(root, name string) ([]string, error) {
 	normalized := strings.ReplaceAll(strings.ToLower(name), "_", "-")
-	url := "https://pypi.org/pypi/" + normalized + "/json"
+	url := strings.TrimRight(root, "/") + "/pypi/" + normalized + "/json"
 	resp, err := upstreamClient.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("query pypi: %w", err)
