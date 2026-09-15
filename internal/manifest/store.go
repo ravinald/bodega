@@ -22,6 +22,11 @@ import (
 
 const (
 	indexFile = "index.json"
+
+	// manifestFile is the per-package manifest's basename. One directory per
+	// package, not a flat <type>.json: the flat layout is what cmd_verify's
+	// walk was still looking at when it reported every type MISSING.
+	manifestFile = "manifest.json"
 )
 
 // packageKey returns the canonical map key for a package: "type/safeName".
@@ -31,7 +36,7 @@ func packageKey(typ, name string) string {
 
 // manifestPath returns the backend-relative path for a package manifest file.
 func manifestPath(typ, name string) string {
-	return typ + "/" + SafeName(name) + "/manifest.json"
+	return typ + "/" + SafeName(name) + "/" + manifestFile
 }
 
 // Store is the in-memory cache of package manifests, their index, and their
@@ -129,11 +134,15 @@ func (s *Store) SaveIndex(ctx context.Context) error {
 		return fmt.Errorf("marshal %s: %w", indexFile, err)
 	}
 	data = append(data, '\n')
-	if err := b.Write(ctx, indexFile, data); err != nil {
+	if err := writeManifest(ctx, b, indexFile, data); err != nil {
 		return fmt.Errorf("write %s to %s: %w", indexFile, b.Label(), err)
 	}
-	// Also update cached metrics.
-	_ = s.SaveMetrics(ctx)
+	// Metrics are written through the same helper, so a sidecar that fails to
+	// land here would otherwise leave metrics.json unverifiable behind a
+	// successful SaveIndex.
+	if err := s.SaveMetrics(ctx); err != nil {
+		return fmt.Errorf("update cached metrics in %s: %w", b.Label(), err)
+	}
 	return nil
 }
 
@@ -245,7 +254,7 @@ func (s *Store) SavePackage(ctx context.Context, pm *PackageManifest) error {
 	data = append(data, '\n')
 
 	b := s.resolveBackend()
-	if err := b.Write(ctx, manifestPath(pm.Type, pm.Name), data); err != nil {
+	if err := writeManifest(ctx, b, manifestPath(pm.Type, pm.Name), data); err != nil {
 		return fmt.Errorf("write package %s/%s to %s: %w", pm.Type, pm.Name, b.Label(), err)
 	}
 
@@ -263,7 +272,7 @@ func (s *Store) SavePackage(ctx context.Context, pm *PackageManifest) error {
 // Returns nil when the manifest does not exist.
 func (s *Store) DeletePackage(ctx context.Context, typ, name string) error {
 	b := s.resolveBackend()
-	if err := b.Delete(ctx, manifestPath(typ, name)); err != nil {
+	if err := deleteManifest(ctx, b, manifestPath(typ, name)); err != nil {
 		return fmt.Errorf("delete package %s/%s from %s: %w", typ, name, b.Label(), err)
 	}
 

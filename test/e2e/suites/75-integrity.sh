@@ -34,6 +34,17 @@ check_eq INT-01 "the checksum cache is readable" 0 "$E2E_RC" \
 check_lacks INT-02 "the checksum cache is not empty after eight types were fetched" \
 	"No cached checksums" "$E2E_OUT" "README.md" "bodega pkg checksum list"
 
+# INT-02 passes on any row, and by the time this suite runs the proxy suites
+# have served gomod, npm, pypi and cargo, each of which writes a "computed" row
+# of its own. binary is served from the store and never proxied, so a row for
+# the fixture can only have come from the `build upload` cascade 30-pipeline
+# ran against an un-fetched store: the route a first install takes.
+e2e_bodega server "pkg checksum list --type binary --name hello-binary" || true
+check_matches INT-02d "the build upload cascade pinned the digest it fetched" \
+	'^binary[[:space:]]+hello-binary[[:space:]]+1\.0\.0.*manifest' "$E2E_OUT" \
+	"internal/builder/checksum.go:132" \
+	"bodega pkg checksum list --type binary --name hello-binary"
+
 # ---- manifest integrity ----------------------------------------------------
 #
 # Every manifest carries an md5 sidecar. Editing the manifest without the
@@ -66,15 +77,20 @@ e2e_bodega server "pkg verify" || true
 check_eq INT-03 "a clean store verifies" 0 "$E2E_RC" \
 	"cmd/bodega/cmd_verify.go:15" "bodega pkg verify" "$E2E_RC"
 
-# A run that prints "MISSING (no manifest file)" and then "All manifests passed
-# integrity check" at exit 0 says two things that cannot both be true, and the
-# reassuring one is last and is what a reader keeps.
-if printf '%s' "$E2E_OUT" | grep -q MISSING; then
-	check_lacks INT-03a "a verify reporting MISSING does not also declare every manifest passed" \
-		"All manifests passed" "$E2E_OUT" "cmd/bodega/cmd_verify.go:15" "bodega pkg verify"
+# The summary line cannot contradict the rows above it. A run printing a row it
+# could not confirm must not close on "passed integrity check", and a run
+# printing none must say so. Both readings are the same invariant, and the check
+# asserts whichever the store produced.
+#
+# It used to guard itself behind a MISSING row and skip when there was none, so
+# once the MISSING rows went the check could only ever SKIP: the store shape it
+# was written to confirm was the one shape it stopped measuring.
+if printf '%s' "$E2E_OUT" | grep -qE 'MISSING|UNVERIFIABLE|ERROR|FAIL'; then
+	check_lacks INT-03a "the verify summary does not contradict the rows above it" \
+		"passed integrity check" "$E2E_OUT" "cmd/bodega/cmd_verify.go:15" "bodega pkg verify"
 else
-	e2e_skip INT-03a "a verify reporting MISSING does not also declare every manifest passed" \
-		"no MISSING rows in this store"
+	check_contains INT-03a "the verify summary does not contradict the rows above it" \
+		"passed integrity check" "$E2E_OUT" "cmd/bodega/cmd_verify.go:15" "bodega pkg verify"
 fi
 
 # The manifest is a directory per package holding manifest.json, not a flat

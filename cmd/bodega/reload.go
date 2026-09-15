@@ -17,7 +17,7 @@ const (
 	reloadAnnotation = "bodega.reload"
 	// reloadSelfAnnotation classifies one command and not its subtree. The
 	// root needs it: it is runnable in its own right, since
-	// --break-glass-update-md5 writes through manifest.ForceUpdateMD5, and an
+	// --break-glass-update-md5 writes through Store.RestampMD5, and an
 	// inherited classification there would hand every undeclared verb in the
 	// tree a default. That is what the guard exists to refuse.
 	reloadSelfAnnotation = "bodega.reload.self"

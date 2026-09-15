@@ -89,7 +89,11 @@ bodega build status apt pypi       # check apt and pypi only
 
 ### `bodega pkg verify`
 
-Checks that every `.md5` companion file matches its manifest. Use this to detect out-of-band modifications.
+Walks every manifest in the store — one `<type>/<name>/manifest.json` per package, plus `index.json`, `graph.json` and `metrics.json` at the root — and compares each against its `.md5` sidecar. Use this to detect out-of-band modifications.
+
+One row per manifest: `OK`, `FAIL` when the sidecar disagrees, `UNVERIFIABLE` when there is no sidecar to compare against, `ERROR` when the object could not be read. `UNVERIFIABLE` is not a pass, and the command exits non-zero when anything failed or could not be verified.
+
+A store where no manifest carries a sidecar predates sidecars being written on every write; re-stamp it once with `bodega --break-glass-update-md5 all`. A store where some carry one and some do not has a writer that skipped a sidecar, which re-stamping hides rather than fixes. `pkg verify` says which of the two it is found.
 
 ### `bodega pkg refresh [TYPE] [NAME] [--force]`
 
@@ -1879,9 +1883,11 @@ Deletes discovery rows for one type, or all of them when the type is omitted.
 
 Dumps the raw rows to stdout for offline analysis.
 
-### `bodega --break-glass-update-md5 <type>`
+### `bodega --break-glass-update-md5 <type|all>`
 
-Recomputes the MD5 digest for a manifest that was edited outside of the tool.
+Recomputes the `.md5` sidecar for every manifest of one package type, or for the whole store with `all`. It stamps whatever the manifest now says without asking why the two disagreed, which is why it is a break-glass flag rather than a verb.
+
+`all` is the only form that reaches `index.json`, `graph.json` and `metrics.json`: those sit at the store root and belong to no type.
 
 ---
 
@@ -3261,12 +3267,16 @@ The allow-list checks the package name for `pypi`, `npm` and `gomod`, so `bodega
 Checksums protect against upstream tampering and bit-rot.
 
 **Builder path** (hosted entries):
-- First `bodega build fetch`: computes SHA-256, stores on the manifest entry
-- Subsequent fetches: verifies against stored checksum; fails on mismatch
+- First `bodega build fetch`: computes SHA-256, stores it on the manifest entry and pins it in the audit DB under the artifact's object key
+- Subsequent fetches: verifies against both; fails the entry on mismatch, naming the pinned digest and the fetched one
 
 **Proxy path** (cached entries):
 - First proxy fetch: computes SHA-256, stores in audit DB under the artifact's type, name and version, all three read back out of the object key
 - Subsequent proxy fetches: verifies against stored; returns **502 Bad Gateway** on mismatch
+
+Both paths write the same row, keyed by the object key, so a version pinned by the pipeline is the one the proxy enforces on serve and `bodega pkg checksum list` shows. Neither path overwrites a digest already on record: a disagreement is refused, not stored. The row's `SOURCE` column says which wrote it — `computed` for the proxy, `manifest` for the pipeline — and under the apt prefix that word is the only thing separating a `.deb` mirrored from an archive from one bodega built, so an index that publishes under bodega's own signature reads it.
+
+Two artifacts have no per-version object key to pin against. **pypi** wheels upload as a directory holding a resolved dependency closure rather than one object per version. **Clone-mode git** ships a bundle generated locally at package time, so there are no upstream bytes to attest to and `git bundle create` is not reproducible byte-for-byte; a git entry fetched as a release tarball pins normally. Neither is an error: the fetch records the digest on the manifest entry and skips the cache row.
 
 When an upstream republishes different bytes under a version it already served, every subsequent fetch answers 502 with `checksum verification failed — upstream content may be tampered`. Clearing the stored digest is the way out, and it is why the row carries package identity: `clear` matches by type and name, and rows recorded without them could only be reached by editing the database. A row with no digest reads as one never fetched, so the next fetch stores what it computed rather than answering 502 forever. Stores mirrored before this release have their identity re-derived from `s3_key` once, on the first open after upgrade; the log line names the row count.
 
@@ -3560,7 +3570,7 @@ manifests/
   ...
 ```
 
-The tool verifies MD5 on every manifest read and writes a fresh MD5 after every modification. Use `bodega pkg verify` to check integrity, and `bodega --break-glass-update-md5 <type>` to recompute after a manual edit.
+Every manifest write emits its `.md5` sidecar in the same operation, through one helper that all four writers (`SavePackage`, `SaveIndex`, `SaveGraph`, `SaveMetrics`) go through. Reads do not verify; `bodega pkg verify` is what compares a manifest against its sidecar, and `bodega --break-glass-update-md5 <type|all>` recomputes one after a deliberate manual edit.
 
 ---
 

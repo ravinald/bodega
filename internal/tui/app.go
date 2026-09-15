@@ -693,6 +693,7 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		cfg := m.cfg
 		store := m.store
 		stores := m.stores
+		auditDB := m.auditDB
 
 		// Build a title showing what will be built.
 		var title string
@@ -716,7 +717,7 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// Run entries sequentially to prevent log interleaving.
 			var cmds []tea.Cmd
 			for _, be := range buildEntries {
-				cmds = append(cmds, executeStage(stage, be.typ, be.name, cfg, store, stores, force))
+				cmds = append(cmds, executeStage(stage, be.typ, be.name, cfg, store, stores, auditDB, force))
 			}
 			m.sources.ClearMarks()
 			return tea.Sequence(cmds...)
@@ -730,7 +731,7 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.log.appendLog(dimStyle.Render("Syncing all artifacts to storage..."))
-		return m, executeSyncAll(nil, m.cfg, m.store, m.stores)
+		return m, executeSyncAll(nil, m.cfg, m.store, m.stores, m.auditDB)
 
 	case "I":
 		if m.s3client == nil {

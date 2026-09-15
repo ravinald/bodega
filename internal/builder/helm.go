@@ -68,6 +68,11 @@ func FetchHelm(cfg *Config, store *manifest.Store, entryFilter string) *Summary 
 				stage := CheckHelmStage(cfg, name, ve)
 				if stage.Fetched {
 					cfg.logf("  [helm] %s: already fetched, skipping", name)
+					if err := cfg.verifyFetched(ctx, store, manifest.TypeHelm, name, ve); err != nil {
+						cfg.logf("  [helm] %s: %v", name, err)
+						summary.Failures++
+						summary.Results = append(summary.Results, Result{Type: manifest.TypeHelm, Name: name, Err: err})
+					}
 					continue
 				}
 			}

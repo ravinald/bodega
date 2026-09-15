@@ -106,6 +106,11 @@ func FetchGit(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 				stage := CheckGitStage(cfg, name, ve)
 				if stage.Fetched {
 					cfg.logf("  [git] %s: already fetched, skipping (use 'force' to re-fetch)", name)
+					if err := cfg.verifyFetched(ctx, store, manifest.TypeGit, name, ve); err != nil {
+						cfg.logf("  [git] %s: %v", name, err)
+						summary.Failures++
+						summary.Results = append(summary.Results, Result{Type: manifest.TypeGit, Name: name, Err: err})
+					}
 					continue
 				}
 			}

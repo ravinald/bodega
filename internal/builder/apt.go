@@ -35,6 +35,111 @@ func aptSourceDir(d dirs, name string, ve manifest.VersionEntry) string {
 	return filepath.Join(d.sources, sourceName)
 }
 
+// aptSourceName returns the archive source package name for an entry, which
+// defaults to the manifest entry's own name.
+func aptSourceName(name string, ve manifest.VersionEntry) string {
+	if ve.SourceName != "" {
+		return ve.SourceName
+	}
+	return name
+}
+
+// aptPoolRelPath returns the store-relative pool path the package stage copies
+// a .deb to. The fetch stage records it before the copy happens: apt's object
+// key is that pool path, so a digest computed at fetch time has nothing to key
+// a checksum row on until it exists.
+func aptPoolRelPath(sourceName, debName string) string {
+	if sourceName == "" || debName == "" {
+		return ""
+	}
+	return "pool/main/" + sourceName[:1] + "/" + sourceName + "/" + debName
+}
+
+// aptFetchedDeb returns the .deb a completed fetch left under sources/ for this
+// entry, or "" when the entry's fetch produces a source tree to build instead.
+// It answers for the same two branches CheckAptStage calls fetched by finding a
+// .deb, so what the fetch digests and what a later run re-checks are one path.
+func aptFetchedDeb(d dirs, name string, ve manifest.VersionEntry) string {
+	sourceName := aptSourceName(name, ve)
+	switch {
+	case ve.BuildCmd != "":
+		return ""
+	case ve.URL != "":
+		return filepath.Join(d.sources, sourceName, filepath.Base(ve.URL))
+	default:
+		matches, _ := filepath.Glob(filepath.Join(d.sources, sourceName, sourceName+"*.deb"))
+		if len(matches) == 0 {
+			return ""
+		}
+		return matches[0]
+	}
+}
+
+// pinFetchedDeb digests a .deb this fetch downloaded, enforces a digest an
+// earlier fetch recorded, and records one when none exists.
+//
+// Without it apt's first record arrived at the package stage, so a second
+// `build fetch apt` had no manifest digest to compare against and no pool path
+// to look a pinned row up by. Both are written here, off the bytes that just
+// landed.
+func (c *Config) pinFetchedDeb(ctx context.Context, store *manifest.Store, name string, ve manifest.VersionEntry, debPath string, out io.Writer) error {
+	computed, err := computeFileSHA256(debPath)
+	if err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(out, "    SHA-256: %s\n", computed)
+
+	verified := false
+	if ve.Checksum != nil {
+		if err := verifyChecksum(ve.Checksum, computed); err != nil {
+			return fmt.Errorf("apt/%s: %w", name, err)
+		}
+		verified = true
+		_, _ = fmt.Fprintf(out, "    Checksum verified against manifest\n")
+	}
+
+	rel := aptPoolRelPath(aptSourceName(name, ve), filepath.Base(debPath))
+	if err := stampAptPoolPath(ctx, store, name, ve, rel); err != nil {
+		return err
+	}
+	return c.updateVersionChecksum(ctx, store, manifest.TypeApt, name, ve, newSHA256Checksum(computed), verified)
+}
+
+// stampAptPoolPath records the pool path on the stored version entry so
+// ArtifactKeys can derive an object key from it.
+func stampAptPoolPath(ctx context.Context, store *manifest.Store, name string, targetVE manifest.VersionEntry, rel string) error {
+	if rel == "" {
+		return nil
+	}
+	pm, err := store.GetPackage(ctx, manifest.TypeApt, name)
+	if err != nil || pm == nil {
+		return err
+	}
+	targetKey := targetVE.Version
+	if targetKey == "" {
+		targetKey = targetVE.Ref
+	}
+	for i := range pm.Versions {
+		ve := &pm.Versions[i]
+		veKey := ve.Version
+		if veKey == "" {
+			veKey = ve.Ref
+		}
+		if veKey != targetKey {
+			continue
+		}
+		if ve.Metadata == nil {
+			ve.Metadata = make(map[string]string)
+		}
+		if ve.Metadata["_pool_path"] == rel {
+			return nil
+		}
+		ve.Metadata["_pool_path"] = rel
+		return store.SavePackage(ctx, pm)
+	}
+	return nil
+}
+
 // aptGetDownloadViaTemp runs `apt-get download` from a world-writable tempdir
 // (so the _apt sandbox user can write there) and then moves the resulting .deb
 // into pkgDir. Falls back to copy+remove if the tempdir and pkgDir are on
@@ -127,10 +232,7 @@ func CheckAptStage(cfg *Config, name string, ve manifest.VersionEntry) StageStat
 
 	case ve.URL != "":
 		// Direct URL download: fetch = .deb file present.
-		destDir := filepath.Join(d.sources, sourceName)
-		filename := filepath.Base(ve.URL)
-		dest := filepath.Join(destDir, filename)
-		if fileExists(dest) {
+		if fileExists(aptFetchedDeb(d, name, ve)) {
 			s.Fetched = true
 			s.Built = true // no build step
 		}
@@ -152,9 +254,7 @@ func CheckAptStage(cfg *Config, name string, ve manifest.VersionEntry) StageStat
 
 	default:
 		// apt-get download: fetch = .deb file present in per-package subdir.
-		pkgDir := filepath.Join(d.sources, sourceName)
-		matches, _ := filepath.Glob(filepath.Join(pkgDir, sourceName+"*.deb"))
-		s.Fetched = len(matches) > 0
+		s.Fetched = aptFetchedDeb(d, name, ve) != ""
 		s.Built = s.Fetched // no separate build step
 	}
 
@@ -247,6 +347,11 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 				stage := CheckAptStage(cfg, name, ve)
 				if stage.Fetched {
 					cfg.logf("  [apt] %s: already fetched, skipping", name)
+					if err := cfg.verifyFetched(ctx, store, manifest.TypeApt, name, ve); err != nil {
+						cfg.logf("  [apt] %s: %v", name, err)
+						summary.Failures++
+						summary.Results = append(summary.Results, Result{Type: manifest.TypeApt, Name: name, Err: err})
+					}
 					continue
 				}
 			}
@@ -342,6 +447,13 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 				} else {
 					artifactPath, fetchErr = aptGetDownloadViaTemp(out, sourceName, pkgDir)
 				}
+			}
+
+			// A source-build branch leaves a directory to compile; the two
+			// download branches leave the published artifact itself, which is
+			// what a digest can attest to.
+			if fetchErr == nil && strings.HasSuffix(artifactPath, ".deb") {
+				fetchErr = cfg.pinFetchedDeb(ctx, store, name, ve, artifactPath, out)
 			}
 
 			if fetchErr != nil {
@@ -543,12 +655,9 @@ func PackageApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 			_, _ = fmt.Fprintf(out, "    Package: %s (%s)\n", debName, humanBytes(fi.Size()))
 
 			// Copy .deb into pool/main/<letter>/<name>/ layout.
-			sourceName := ve.SourceName
-			if sourceName == "" {
-				sourceName = name
-			}
-			letter := string(sourceName[0])
-			poolDir := filepath.Join(d.aptRepo, "pool", "main", letter, sourceName)
+			sourceName := aptSourceName(name, ve)
+			poolRelPath := aptPoolRelPath(sourceName, debName)
+			poolDir := filepath.Dir(filepath.Join(d.aptRepo, filepath.FromSlash(poolRelPath)))
 			if err := mkdirAll(poolDir); err != nil {
 				result.Err = fmt.Errorf("create pool dir: %w", err)
 				_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
@@ -565,7 +674,6 @@ func PackageApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 				_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
 				summary.Failures++
 			} else {
-				poolRelPath := "pool/main/" + letter + "/" + sourceName + "/" + debName
 				_, _ = fmt.Fprintf(out, "    Copied to %s\n", poolRelPath)
 				result.Artifacts = []string{dest}
 
@@ -594,6 +702,14 @@ func PackageApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 				}
 				if md5, sha1, sha256, err := computeDebHashes(dest); err != nil {
 					_, _ = fmt.Fprintf(out, "    WARNING: could not compute hashes: %v\n", err)
+				} else if err := verifyChecksum(ve.Checksum, sha256); err != nil {
+					// The fetch stage digested these same bytes. A package
+					// stage disagreeing means they changed in the build root
+					// between the two, so the record stands and this run does
+					// not overwrite it.
+					result.Err = fmt.Errorf("apt/%s: the .deb no longer matches the digest recorded at fetch: %w", name, err)
+					_, _ = fmt.Fprintf(out, "    ERROR: %v\n", result.Err)
+					summary.Failures++
 				} else {
 					if ve.Metadata == nil {
 						ve.Metadata = make(map[string]string)
@@ -601,6 +717,7 @@ func PackageApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 					ve.Metadata["_md5"] = md5
 					ve.Metadata["_sha1"] = sha1
 					ve.Metadata["_sha256"] = sha256
+					ve.Checksum = newSHA256Checksum(sha256)
 				}
 				ve.ArtifactSize = fi.Size()
 				// Persist the updated metadata back to the store.
@@ -613,6 +730,15 @@ func PackageApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 					}
 					if err := store.SavePackage(ctx, updated); err != nil {
 						_, _ = fmt.Fprintf(out, "    WARNING: could not save metadata: %v\n", err)
+					}
+					// apt is the one covered type that never reaches
+					// updateVersionChecksum: its digest arrives with the
+					// control data rather than from a download, so the pin is
+					// made here against the same _pool_path just recorded.
+					if err := cfg.pinChecksum(ctx, updated, ve, ve.Checksum); err != nil {
+						_, _ = fmt.Fprintf(out, "    ERROR: %v\n", err)
+						result.Err = err
+						summary.Failures++
 					}
 				}
 			}
@@ -733,9 +859,7 @@ func locateDebFile(d dirs, name string, ve manifest.VersionEntry) (string, error
 
 	case ve.URL != "":
 		// Direct URL download: .deb at sources/<sourceName>/<filename>.
-		destDir := filepath.Join(d.sources, sourceName)
-		filename := filepath.Base(ve.URL)
-		dest := filepath.Join(destDir, filename)
+		dest := aptFetchedDeb(d, name, ve)
 		if fileExists(dest) {
 			return dest, nil
 		}

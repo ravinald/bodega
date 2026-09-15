@@ -63,7 +63,17 @@ When a name is given after the type, only that entry is packaged.`,
 				return fmt.Errorf("load manifests: %w", err)
 			}
 
+			auditDB := openAuditDB(gf)
+			if auditDB != nil {
+				defer auditDB.Close()
+			}
+
 			bcfg := builder.NewConfig(cfg)
+			// The package stage records EventPackage and pins the apt digest,
+			// and both went nowhere while this was nil: apt's _pool_path is
+			// written here rather than at fetch, so the pool key a checksum row
+			// is filed under does not exist until this stage runs.
+			bcfg.AuditDB = auditDB
 
 			var allSummaries []*builder.Summary
 

@@ -17,9 +17,47 @@ risk:
   by registry type (package name for pypi/npm/cargo, prefix for gomod/git,
   hostname for apt). A request for `reqeusts` does not match an allow rule for
   `requests`, and the fetch is rejected before any bytes leave the network.
-- **Silent version drift.** Manifest entries pin a concrete version. Subsequent
-  fetches must produce the same SHA-256, or the cached artifact wins. Tuesday's
-  build produces the same bytes as last Tuesday's build.
+- **Silent version drift.** Manifest entries pin a concrete version, an npm
+  dist-tag being the exception named below. The first
+  fetch records that version's SHA-256 in the audit database, keyed by the
+  object key the server serves it under, and a later fetch producing different
+  bytes is refused rather than stored. Both halves of the pipeline write that
+  one record: `build fetch` pins what it downloads, and the proxy pins what it
+  caches on behalf of a client. `build upload` reaches upstream through that
+  same fetch when a stage is missing, so the one-command install pins as it
+  cascades rather than uploading artifacts nothing is pinned against.
+  Tuesday's build produces the same bytes as last Tuesday's build, and
+  `bodega pkg checksum list` is the record of which versions are pinned.
+
+  Two artifacts are not covered, and the gap is in the shape of the artifact
+  rather than in the check. **pypi** wheels upload as a directory holding the
+  resolved dependency closure, so no per-version object key exists to pin one
+  against; the closure is pinned by the requirements set instead.
+  **Clone-mode git** ships a bundle this instance generates locally at package
+  time, so there are no upstream bytes for a digest to attest to, and `git
+  bundle create` is not reproducible byte-for-byte — a pin would fail the next
+  repackage rather than catch anything. A git entry fetched as a release
+  tarball is covered normally.
+
+  An **npm dist-tag** (`latest`, or an entry left without a version) pins per
+  resolved version rather than per manifest entry. The tag is meant to move, so
+  a digest written onto the entry would refuse the next legitimate release; the
+  digest goes on the resolved version's own object key instead. Every concrete
+  version the tag has ever resolved to is on record and shows as its own row in
+  `bodega pkg checksum list`, and a later resolution to one of them is refused
+  if the bytes changed. The tag advancing to a new release is not a mismatch;
+  an existing version being republished under it is.
+
+  An **apt** entry pins at whichever stage first holds the `.deb`. A direct URL
+  or an `apt-get download` produces the artifact during fetch, so the digest and
+  the pool key the server will publish it under are both recorded there, and a
+  later fetch returning different bytes under the same filename is refused
+  rather than stored. An entry carrying a `build_cmd` has no `.deb` until the
+  build runs: its digest is recorded at package time off what this instance
+  compiled, because no upstream download happened for an earlier stage to
+  attest to.
+
+  Nothing else is exempt: binary, apt, gomod, helm, npm and cargo all pin.
 - **A malicious release inside its own withdrawal window.** A fresh install is
   seeded with a minimum publish age of `7d` on `npm` and `pypi`, action `warn`,
   and `bodega serve` names it at startup. The npm and PyPI campaigns of
@@ -40,6 +78,17 @@ risk:
   records every dependency it discovers and creates manifest entries for
   them. Subsequent builds resolve dependencies against those pinned entries
   rather than re-querying public registries.
+- **An out-of-band edit to a manifest.** The manifest is the record of what was
+  approved, and it is a JSON file an operator can open in an editor. Every
+  manifest write emits an MD5 sidecar in the same operation, and
+  `bodega pkg verify` compares each manifest against its own and exits non-zero
+  on a mismatch. A manifest carrying no sidecar is reported `UNVERIFIABLE`
+  rather than passed: nothing was compared, and a run that counted that as a
+  pass would answer yes to every edited manifest in the store. The limit is
+  worth stating plainly — MD5 and a sidecar in the same directory detect an
+  edit, not an attacker, because whoever can rewrite the manifest can rewrite
+  the sidecar beside it. It catches a hand-edit, a partial restore and a
+  half-finished write; it is not a signature.
 - **Opaque CI fetches.** A `bodega serve` instance is the single place to look
   when answering "what did our build pull from the internet?" The audit DB
   records every fetch event with client IP, package name, version, and
