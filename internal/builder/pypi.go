@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -183,50 +184,279 @@ func pypiSourceConflict(path, indexRoot string, seen map[string]bool) error {
 	}
 	defer func() { _ = f.Close() }()
 
-	scanner := bufio.NewScanner(f)
+	lines, err := pypiLogicalLines(f)
+	if err != nil {
+		return fmt.Errorf("read requirements: %w", err)
+	}
+	for _, line := range lines {
+		if err := pypiLineSource(path, indexRoot, line, seen); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// pypiLogicalLines returns the lines pip parses, not the lines the file holds.
+//
+// pip joins a line ending in a backslash onto the next one with no separator
+// and strips comments afterward, so `--index-` and `url https://elsewhere/`
+// on consecutive lines are one --index-url option by the time any of it is
+// read. A checker working on physical lines sees two fragments, matches
+// neither, and passes the origin through.
+func pypiLogicalLines(r io.Reader) ([]string, error) {
+	scanner := bufio.NewScanner(r)
+	var (
+		lines   []string
+		pending []string
+	)
+	flush := func(line string) {
+		if len(pending) > 0 {
+			line = strings.Join(pending, "") + line
+			pending = nil
+		}
+		if line = strings.TrimSpace(pypiStripComment(line)); line != "" {
+			lines = append(lines, line)
+		}
+	}
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") || !strings.HasPrefix(line, "-") {
+		line := strings.TrimRight(scanner.Text(), "\r")
+		// A comment never continues, however it ends: pip tests the comment
+		// first, so a trailing backslash inside one joins nothing, and the
+		// space it inserts is what keeps the comment separable afterward.
+		if comment := pypiCommentOnly(line); comment || !strings.HasSuffix(line, `\`) {
+			if comment {
+				line = " " + line
+			}
+			flush(line)
 			continue
 		}
-		opt, value := cutRequirementOption(line)
-		switch opt {
-		case "-i", "--index-url":
+		pending = append(pending, strings.Trim(line, `\`))
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	if len(pending) > 0 {
+		flush("")
+	}
+	return lines, nil
+}
+
+// pypiStripComment drops a comment, which pip recognizes at the start of a line
+// or after whitespace. A `#` with no space in front of it belongs to the token
+// it sits in, as in --hash=sha256:....
+func pypiStripComment(line string) string {
+	for i := range len(line) {
+		if line[i] != '#' {
+			continue
+		}
+		if i == 0 || line[i-1] == ' ' || line[i-1] == '\t' {
+			return line[:i]
+		}
+	}
+	return line
+}
+
+// pypiCommentOnly reports whether a line carries nothing but a comment.
+func pypiCommentOnly(line string) bool {
+	return strings.HasPrefix(strings.TrimSpace(line), "#")
+}
+
+// pypiOptionClass says what an option does to the origin bytes arrive from.
+type pypiOptionClass int
+
+const (
+	pypiOptionInert   pypiOptionClass = iota // decides nothing about the origin
+	pypiOptionIndex                          // selects the index
+	pypiOptionOrigin                         // adds or replaces an origin
+	pypiOptionInclude                        // pulls in a file pip parses the same way
+	pypiOptionDirect                         // names something pip downloads without an index
+)
+
+// pypiOption is one option pip accepts inside a requirements file.
+type pypiOption struct {
+	long  string
+	short string
+	value bool
+	class pypiOptionClass
+}
+
+// pypiReqOptions is every option pip reads from a requirements file, classified
+// by what it does to acquisition. The list is exhaustive on purpose: anything
+// absent from it is refused rather than ignored, because optparse resolves an
+// unambiguous prefix (`--index-u`) to its full option, so an origin can be
+// named in spellings no list of exact tokens will ever match.
+var pypiReqOptions = []pypiOption{
+	{long: "--index-url", short: "-i", value: true, class: pypiOptionIndex},
+	{long: "--extra-index-url", value: true, class: pypiOptionOrigin},
+	{long: "--find-links", short: "-f", value: true, class: pypiOptionOrigin},
+	{long: "--no-index", class: pypiOptionOrigin},
+	{long: "--trusted-host", value: true, class: pypiOptionOrigin},
+	{long: "--requirement", short: "-r", value: true, class: pypiOptionInclude},
+	{long: "--constraint", short: "-c", value: true, class: pypiOptionInclude},
+	{long: "--editable", short: "-e", value: true, class: pypiOptionDirect},
+	{long: "--pre", class: pypiOptionInert},
+	{long: "--prefer-binary", class: pypiOptionInert},
+	{long: "--require-hashes", class: pypiOptionInert},
+	{long: "--no-binary", value: true, class: pypiOptionInert},
+	{long: "--only-binary", value: true, class: pypiOptionInert},
+	{long: "--hash", value: true, class: pypiOptionInert},
+	{long: "--config-settings", short: "-C", value: true, class: pypiOptionInert},
+	{long: "--global-option", value: true, class: pypiOptionInert},
+	{long: "--use-feature", value: true, class: pypiOptionInert},
+}
+
+// pypiLineSource checks one logical line for anything that decides where pip
+// downloads from.
+func pypiLineSource(path, indexRoot, line string, seen map[string]bool) error {
+	args, opts := breakPypiArgsOptions(line)
+	for _, arg := range args {
+		if u := pypiURLToken(arg); u != "" {
+			return fmt.Errorf("%s names %s, which pip downloads without asking the %s the manifest approved",
+				path, u, indexRoot)
+		}
+	}
+
+	for i := 0; i < len(opts); i++ {
+		if !strings.HasPrefix(opts[i], "-") {
+			continue
+		}
+		opt, value, attached, err := cutRequirementOption(opts[i])
+		if err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		if opt.value && !attached && i+1 < len(opts) {
+			i++
+			value = opts[i]
+		}
+		value = strings.Trim(value, `"'`)
+
+		switch opt.class {
+		case pypiOptionIndex:
 			if !sameIndexRoot(value, indexRoot) {
 				return fmt.Errorf("%s names %s %s and the manifest resolved against %s; one fetch downloads from one index",
-					path, opt, value, indexRoot)
+					path, opt.long, value, indexRoot)
 			}
-		case "--extra-index-url", "-f", "--find-links":
-			return fmt.Errorf("%s names %s %s, which adds an origin beside the %s the manifest approved",
-				path, opt, value, indexRoot)
-		case "-r", "--requirement":
-			next := value
-			if next == "" {
+		case pypiOptionOrigin:
+			return fmt.Errorf("%s names %s%s, which acquires outside the %s the manifest approved",
+				path, opt.long, pypiValueSuffix(value), indexRoot)
+		case pypiOptionDirect:
+			if u := pypiURLToken(value); u != "" {
+				return fmt.Errorf("%s names %s %s, which pip downloads without asking the %s the manifest approved",
+					path, opt.long, u, indexRoot)
+			}
+		case pypiOptionInclude:
+			if value == "" {
 				continue
 			}
+			next := value
 			if !filepath.IsAbs(next) {
 				next = filepath.Join(filepath.Dir(path), next)
 			}
 			if err := pypiSourceConflict(next, indexRoot, seen); err != nil {
 				return fmt.Errorf("%s includes %s: %w", path, value, err)
 			}
+		case pypiOptionInert:
 		}
 	}
-	return scanner.Err()
+	return nil
 }
 
-// cutRequirementOption splits a pip option line into the option and its value,
-// accepting both spellings pip does: `--index-url URL` and `--index-url=URL`.
-func cutRequirementOption(line string) (opt, value string) {
+// breakPypiArgsOptions splits a logical line the way pip does: the tokens up to
+// the first one starting with a dash are the requirement, the rest are options.
+func breakPypiArgsOptions(line string) (args, opts []string) {
 	fields := strings.Fields(line)
-	opt = fields[0]
-	if name, inline, ok := strings.Cut(opt, "="); ok {
-		return name, inline
+	for i, f := range fields {
+		if strings.HasPrefix(f, "-") {
+			return fields[:i], fields[i:]
+		}
 	}
-	if len(fields) > 1 {
-		value = fields[1]
+	return fields, nil
+}
+
+// cutRequirementOption resolves one option token into the option pip reads and
+// whatever value is attached to it.
+//
+// optparse accepts four spellings of the same option — `--index-url URL`,
+// `--index-url=URL`, `-i URL` and `-iURL` — and any unambiguous prefix of a
+// long name. Recognizing only the spaced spelling hands the other three to pip
+// unread, and pip downloads from the index they name.
+func cutRequirementOption(tok string) (opt pypiOption, value string, attached bool, err error) {
+	if strings.HasPrefix(tok, "--") {
+		name := tok
+		if cut, inline, ok := strings.Cut(tok, "="); ok {
+			name, value, attached = cut, inline, true
+		}
+		opt, err = matchPypiLongOption(name)
+		if err != nil {
+			return pypiOption{}, "", false, err
+		}
+		return opt, value, attached, nil
 	}
-	return opt, value
+
+	// Short options are never grouped here: every one pip reads from a
+	// requirements file takes a value, so -iURL is a value, not two flags.
+	name := tok
+	if len(tok) > 2 {
+		name, value, attached = tok[:2], tok[2:], true
+	}
+	for _, o := range pypiReqOptions {
+		if o.short != "" && o.short == name {
+			return o, value, attached, nil
+		}
+	}
+	return pypiOption{}, "", false, unknownPypiOption(tok)
+}
+
+// matchPypiLongOption resolves a long option name, prefix included.
+func matchPypiLongOption(name string) (pypiOption, error) {
+	var hits []pypiOption
+	for _, o := range pypiReqOptions {
+		if o.long == name {
+			return o, nil
+		}
+		if strings.HasPrefix(o.long, name) {
+			hits = append(hits, o)
+		}
+	}
+	switch len(hits) {
+	case 0:
+		return pypiOption{}, unknownPypiOption(name)
+	case 1:
+		return hits[0], nil
+	}
+	names := make([]string, 0, len(hits))
+	for _, o := range hits {
+		names = append(names, o.long)
+	}
+	return pypiOption{}, fmt.Errorf("%s abbreviates %s, and which one pip reads decides where it downloads from",
+		name, strings.Join(names, " and "))
+}
+
+// unknownPypiOption reports an option this fetch cannot classify. Refusing
+// rather than ignoring: an unread option is an option that may name an index,
+// and the fetch cannot hold a pin it has already handed to pip.
+func unknownPypiOption(tok string) error {
+	return fmt.Errorf("names %s, which this fetch does not interpret; an option it cannot read may point pip at another origin", tok)
+}
+
+// pypiURLToken returns the URL a token names, if it names one. A requirement
+// may carry its own download (`six @ https://host/six.whl`, a bare URL, a
+// `git+ssh://` reference), which pip fetches without consulting any index.
+func pypiURLToken(tok string) string {
+	tok = strings.Trim(tok, `"'`)
+	if strings.Contains(tok, "://") {
+		return tok
+	}
+	return ""
+}
+
+// pypiValueSuffix renders an option's value for an error message, or nothing
+// when the option takes none.
+func pypiValueSuffix(value string) string {
+	if value == "" {
+		return ""
+	}
+	return " " + value
 }
 
 // sameIndexRoot reports whether a pip index option points at the index the

@@ -697,3 +697,148 @@ func TestFetchPypiAcceptsIncludedRequirementsOnTheSelectedIndex(t *testing.T) {
 		t.Fatalf("an included file naming the selected index failed the fetch: %+v", summary.Results)
 	}
 }
+
+// pypiPipHonors runs real pip over the generated header and an application's
+// requirements file, and returns the wheels pip stored. The selected index
+// serves the JSON API and no wheel bytes, so a stored wheel is proof that
+// something inside the application's file moved acquisition elsewhere.
+func pypiPipHonors(t *testing.T, selected string, files map[string]string) ([]string, string) {
+	t.Helper()
+	app := t.TempDir()
+	for name, body := range files {
+		path := filepath.Join(app, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("mkdir for %s: %v", name, err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	return pypiWheelRun(t, fmt.Sprintf("--index-url %s/simple/\n-r %s\n",
+		strings.TrimRight(selected, "/"), filepath.Join(app, "requirements.txt")))
+}
+
+// R1: pip reads a requirements file by its own grammar. It joins a line ending
+// in a backslash onto the next with no separator, takes a short option's value
+// attached to it, resolves an unambiguous abbreviation of a long option, and
+// honors global options out of a constraint file. Each of these names an index
+// in a spelling that matches no whole-line token, so a fetch that accepted them
+// approved a pin against one index and downloaded from another.
+func TestFetchPypiFailsOnPipSyntaxThatMovesTheOrigin(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		files map[string]string
+	}{
+		{"a short option carrying its value", map[string]string{
+			"requirements.txt": "-iOTHER/simple/\nsix\n",
+		}},
+		{"an include carrying its path", map[string]string{
+			"requirements.txt": "-rnested.txt\nsix\n",
+			"nested.txt":       "--index-url OTHER/simple/\n",
+		}},
+		{"a constraint file", map[string]string{
+			"requirements.txt": "-c constraints.txt\nsix\n",
+			"constraints.txt":  "--index-url OTHER/simple/\nsix==1.16.0\n",
+		}},
+		{"an option split across a continuation", map[string]string{
+			"requirements.txt": "--index-\\\nurl OTHER/simple/\nsix\n",
+		}},
+		{"an abbreviated long option", map[string]string{
+			"requirements.txt": "--index-ur OTHER/simple/\nsix\n",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			selected := pypiIndex(t, "six", "1.16.0")
+			other := pypiWheelIndex(t, "six", "1.16.0")
+
+			files := map[string]string{}
+			for name, body := range tc.files {
+				files[name] = strings.ReplaceAll(body, "OTHER", other.URL)
+			}
+
+			cfg, store := pypiBaseReqEnv(t, selected.URL, files)
+			summary := FetchPypi(cfg, store)
+			if !summary.HasFailures() {
+				t.Fatalf("an included file moved the origin silently: %+v", summary.Results)
+			}
+			var msg string
+			for _, r := range summary.Results {
+				if r.Err != nil {
+					msg = r.Err.Error()
+				}
+			}
+			for _, want := range []string{"requirements.txt", other.URL, selected.URL} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("the failure does not name %q: %s", want, msg)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(cfg.rootFor(manifest.TypePypi), "combined-requirements.txt")); !os.IsNotExist(err) {
+				t.Error("a fetch that could not settle the origin still wrote a requirements file")
+			}
+
+			// Rejecting a spelling pip ignores would prove nothing, so the
+			// same file goes to real pip behind the same generated header.
+			t.Run("pip acquires from it", func(t *testing.T) {
+				stored, out := pypiPipHonors(t, selected.URL, files)
+				if len(stored) == 0 {
+					t.Skipf("pip stored nothing from %s, so this spelling proves nothing here:\n%s", other.URL, out)
+				}
+				if !strings.Contains(out, other.URL) {
+					t.Errorf("pip stored %v without reading %s:\n%s", stored, other.URL, out)
+				}
+			})
+		})
+	}
+}
+
+// R1: an origin can also be named in syntax that classifies as nothing here —
+// an option this fetch never taught itself, an abbreviation pip resolves and it
+// cannot, an index switched off, a download that asks no index at all. Passing
+// an unreadable line through leaves pip the only reader of it.
+func TestFetchPypiRefusesRequirementSyntaxItCannotRead(t *testing.T) {
+	for _, tc := range []struct {
+		name, requirements string
+	}{
+		{"an option this fetch does not interpret", "--use-deprecated=html5lib\nsix\n"},
+		{"an abbreviation pip resolves and this does not", "--no- something\nsix\n"},
+		{"the index switched off", "--no-index\nsix\n"},
+		{"a requirement carrying its own download", "six @ https://example.invalid/six-1.16.0-py3-none-any.whl\n"},
+		{"an editable checkout from a vcs", "-e git+https://example.invalid/six.git#egg=six\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			selected := pypiIndex(t, "six", "1.16.0")
+			cfg, store := pypiBaseReqEnv(t, selected.URL, map[string]string{
+				"requirements.txt": tc.requirements,
+			})
+
+			summary := FetchPypi(cfg, store)
+			if !summary.HasFailures() {
+				t.Fatalf("a line this fetch cannot read reached pip unchallenged: %+v", summary.Results)
+			}
+			var msg string
+			for _, r := range summary.Results {
+				if r.Err != nil {
+					msg = r.Err.Error()
+				}
+			}
+			if !strings.Contains(msg, "requirements.txt") {
+				t.Errorf("the failure does not name the file it read: %s", msg)
+			}
+		})
+	}
+}
+
+// An application file may carry the pip options that decide nothing about the
+// origin, and a fetch that refused those would reject files pip builds fine.
+func TestFetchPypiAcceptsRequirementOptionsThatDecideNoOrigin(t *testing.T) {
+	selected := pypiIndex(t, "six", "1.16.0")
+	cfg, store := pypiBaseReqEnv(t, selected.URL, map[string]string{
+		"requirements.txt": "# app\n--prefer-binary\n--only-binary :all:\n" +
+			"-i " + selected.URL + "/simple/ # the index the manifest names\n" +
+			"attrs==23.1.0 \\\n    --hash=sha256:" + strings.Repeat("a", 64) + "\n",
+	})
+
+	if summary := FetchPypi(cfg, store); summary.HasFailures() {
+		t.Fatalf("options that name no origin failed the fetch: %+v", summary.Results)
+	}
+}

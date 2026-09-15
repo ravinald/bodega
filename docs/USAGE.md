@@ -78,10 +78,21 @@ pypi entries name 2 different indexes and one fetch can use one: https://a.examp
 
 The default is left unsaid, so a deployment that points pip at its own mirror through `pip.conf` keeps it.
 
-The applications' own requirements files are included by reference, and pip honors the last index option it parses across all of them, so one naming an origin of its own would replace the selected index after the resolver had already read it. A `-r` file that names `--index-url` pointing elsewhere, `--extra-index-url` or `--find-links` fails the fetch, through as many levels of `-r` as it takes to find it:
+The applications' own requirements files are included by reference, and pip honors the last index option it parses across all of them, so one naming an origin of its own would replace the selected index after the resolver had already read it. Those files are read the way pip reads them — backslash continuations joined, comments stripped, `-r` and `-c` followed to any depth — and every option is classified before the file is accepted:
+
+| Option                                                                                                                                                 | What the fetch does                                                  |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------- |
+| `-i`, `--index-url`                                                                                                                                    | Passes when it names the selected index, fails when it names another |
+| `--extra-index-url`, `-f`/`--find-links`, `--no-index`, `--trusted-host`                                                                               | Fails: each one acquires outside the approved index                  |
+| `-r`/`--requirement`, `-c`/`--constraint`                                                                                                              | Followed, and the included file is read under these same rules       |
+| `-e`/`--editable` naming a URL, or a requirement carrying its own download (`six @ https://host/six.whl`)                                              | Fails: pip downloads it without asking any index                     |
+| `--pre`, `--prefer-binary`, `--require-hashes`, `--no-binary`, `--only-binary`, `--hash`, `-C`/`--config-settings`, `--global-option`, `--use-feature` | Accepted: none of them decides an origin                             |
+| anything else                                                                                                                                          | Fails as uninterpreted                                               |
+
+Failing on an option nobody classified is deliberate. pip hands the line to optparse, which reads `-iURL`, `--index-url=URL`, `--index-url URL` and the unambiguous abbreviation `--index-ur URL` as the same option, and joins `--index-` and `url URL` across a backslash continuation into one before any of that. A checker matching exact tokens against physical lines reads none of those four, and an option it cannot read may be an index it never saw:
 
 ```text
-pypi base requirements for netbox@v4.5.5: /var/lib/bodega/git/sources/netbox/netbox-v4.5.5/requirements.txt names --extra-index-url https://b.example/simple/, which adds an origin beside the https://a.example the manifest approved
+pypi base requirements for netbox@v4.5.5: /var/lib/bodega/git/sources/netbox/netbox-v4.5.5/requirements.txt names --extra-index-url https://b.example/simple/, which acquires outside the https://a.example the manifest approved
 ```
 
 Naming the selected index is agreement rather than conflict, and passes. Rejecting rather than rewriting: the file belongs to the application, and editing an origin out of it hides the disagreement instead of settling it.
