@@ -78,7 +78,7 @@ pypi entries name 2 different indexes and one fetch can use one: https://a.examp
 
 The default is left unsaid, so a deployment that points pip at its own mirror through `pip.conf` keeps it.
 
-The applications' own requirements files are included by reference, and pip honors the last index option it parses across all of them, so one naming an origin of its own would replace the selected index after the resolver had already read it. Those files are read the way pip reads them — backslash continuations joined, comments stripped, `-r` and `-c` followed to any depth — and every option is classified before the file is accepted:
+The applications' own requirements files are included by reference, and pip honors the last index option it parses across all of them, so one naming an origin of its own would replace the selected index after the resolver had already read it. Those files are read the way pip reads them: backslash continuations joined, comments stripped, the requirement and option halves of a line split on a literal space before any quote is removed, the option half tokenized by the same POSIX `shlex` rules pip uses, and `-r` and `-c` followed to any depth. Every option is classified before the file is accepted:
 
 | Option                                                                                                                                                 | What the fetch does                                                  |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------- |
@@ -94,6 +94,14 @@ Failing on an option nobody classified is deliberate. pip hands the line to optp
 ```text
 pypi base requirements for netbox@v4.5.5: /var/lib/bodega/git/sources/netbox/netbox-v4.5.5/requirements.txt names --extra-index-url https://b.example/simple/, which acquires outside the https://a.example the manifest approved
 ```
+
+Quoting and escaping are part of that grammar, not decoration around it. pip runs `shlex.split` over the option half before optparse sees it, so `--pre "--index-url" https://b.example/simple/` and `--pre \--index-url https://b.example/simple/` are both an index option to pip while a reader comparing whole whitespace-separated tokens sees one inert option and two fragments naming nothing. A line neither reader can tokenize, such as an unclosed quotation, fails here for the same reason pip fails it:
+
+```text
+pypi base requirements for netbox@v4.5.5: /var/lib/bodega/git/sources/netbox/netbox-v4.5.5/requirements.txt: --index-url "https://b.example/simple/ closes no " quotation; pip splits options the same way and fails the file, so fix the quoting
+```
+
+A quoted value is ordinary and passes on its own terms: `--index-url "<selected>/simple/"` names the selected index, and `-r "app extras.txt"` includes a path with a space in it.
 
 Naming the selected index is agreement rather than conflict, and passes. Rejecting rather than rewriting: the file belongs to the application, and editing an origin out of it hides the disagreement instead of settling it.
 
