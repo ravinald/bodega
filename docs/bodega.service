@@ -37,11 +37,12 @@
 # arrives late. `bodega token generate` writes it, after the chowns above have
 # run, and every API token is hashed against it.
 #
-# It is on no chown line above because it needs none. A new pepper lands root:<the account User= below
-# names> mode 0640, resolved from this unit file: root keeps the write, the
-# service group gets the read, and nothing wider can see the key behind every
-# token hash on the box. `systemctl edit bodega` moves the account and the
-# pepper follows it.
+# It is on no chown line above because it needs none. A new pepper lands mode
+# 0640 owned by root, in the group this unit runs the server in: `Group=` where
+# it names one, and the `User=` account's primary group where it does not or
+# where a drop-in clears it. Root keeps the write, the service group gets the
+# read, and nothing wider can see the key behind every token hash on the box.
+# `systemctl edit bodega` moves the account and the pepper follows it.
 #
 # Where the account cannot be handed the file — this unit names a user that
 # does not exist, or /etc/bodega refuses it — `bodega token generate` fails
