@@ -56,6 +56,10 @@ What each `version_constraint` resolves to:
 | `compatible` | The newest release sharing the named version's epoch and major. |
 | `any` | The newest release the index offers. This is how to say "latest". |
 
+The resolved version is written as `six===1.16.0`, in PEP 440's canonical spelling. Arbitrary equality (`===`) rather than `==`, because `==` ignores a candidate's local label when the specifier carries none: against an index offering both `1.16.0` and `1.16.0+vendor.1`, `six==1.16.0` downloads the vendored build. Measured on pip 26.2.1. An entry naming `1.16.0+vendor.1` still gets that build — the label is part of the version, and local labels order by PEP 440 segment rules, so `+vendor.10` is newer than `+vendor.9` and `+9` is newer than either.
+
+The canonical spelling is not cosmetic: pip compares `===` by string equality against a candidate's normalized version, so an index listing `1.0-1` serves a wheel pip reads as `1.0.post1` and the raw spelling matches nothing.
+
 The floating constraints (`patch`, `compatible`, `any`) take a pre-release or dev release only when the version the entry names is itself one. A project publishing `2.0.0rc1` would otherwise move every `any` entry onto a release candidate nobody approved. A post release is not a pre-release: `1.16.0.post1` ships after `1.16.0` and qualifies everywhere.
 
 An entry whose `version` is empty or `*` resolves to nothing and keeps a bare, unpinned requirement line, whatever its constraint says. That is the shape an auto-imported dependency arrives in, and pinning it would over-constrain a closure the base `-r` requirements already decide.
@@ -74,6 +78,14 @@ pypi entries name 2 different indexes and one fetch can use one: https://a.examp
 
 The default is left unsaid, so a deployment that points pip at its own mirror through `pip.conf` keeps it.
 
+The applications' own requirements files are included by reference, and pip honors the last index option it parses across all of them, so one naming an origin of its own would replace the selected index after the resolver had already read it. A `-r` file that names `--index-url` pointing elsewhere, `--extra-index-url` or `--find-links` fails the fetch, through as many levels of `-r` as it takes to find it:
+
+```text
+pypi base requirements for netbox@v4.5.5: /var/lib/bodega/git/sources/netbox/netbox-v4.5.5/requirements.txt names --extra-index-url https://b.example/simple/, which adds an origin beside the https://a.example the manifest approved
+```
+
+Naming the selected index is agreement rather than conflict, and passes. Rejecting rather than rewriting: the file belongs to the application, and editing an origin out of it hides the disagreement instead of settling it.
+
 ##### When resolution fails
 
 A version that resolves to nothing fails the whole fetch, names the entry, the version asked for and what the index offered, and writes no requirements file at all:
@@ -82,11 +94,21 @@ A version that resolves to nothing fails the whole fetch, names the entry, the v
 pypi six: version_constraint "exact" on 1.99.0 resolves to nothing; the index at https://pypi.org offers 1.13.0, 1.14.0, 1.15.0, 1.16.0, 1.17.0 (34 versions in all)
 ```
 
-A partial file would build cleanly and store a closure nobody approved, so there is no half-written one to find.
+A partial file would build cleanly and store a closure nobody approved, so there is no half-written one to find. A failure also discards the file a previous successful fetch wrote. Its existence is what `build run` reads as "fetch is done", so leaving it in place after a failed re-resolve lets the next build store the closure of a pin the manifest no longer names — the ordinary sequence being fetch, edit the version, re-fetch, build.
 
 A release PyPI has emptied counts as not offered. Deleting a release leaves its key in the JSON document with an empty file list, and accepting the key resolves a pin to something pip cannot download, so the failure would surface inside the wheel build minutes later instead of here. `requests` `2.15.0` is the live example.
 
 A response larger than 64 MiB fails by size rather than as malformed JSON — `pypi <name> response exceeds 67108864 bytes`. The document is read as a stream, so memory does not track the response; the cap bounds only how long a single index answer will be read. `boto3` measures 2,117 releases through this path.
+
+##### What the build checks
+
+`build run pypi` reads the pins back out of the generated file and compares them against the wheels pip stored. A pinned distribution present at a version no pin names fails the build:
+
+```text
+pypi six: the manifest names 1.16.0 and the wheels directory holds 1.16.0+vendor.1 — pip stored a version nobody approved
+```
+
+A specifier is a filter rather than a fact. An index that answers it with another build, a pip resolving it out of a cache, or a hand-edited requirements file all end with bytes on disk the manifest does not describe, and the wheels directory is what gets published. A pin with no wheel at all passes this check: pip exiting 0 having stored nothing for a requirement is a different defect, and failing it here would report it as a substitution.
 
 #### Gaps
 

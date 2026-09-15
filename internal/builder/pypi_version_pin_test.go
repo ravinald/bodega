@@ -1,12 +1,16 @@
 package builder
 
 import (
+	"archive/zip"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -90,7 +94,7 @@ func TestFetchPypiPinsAVersionThatIsNotTheNewest(t *testing.T) {
 	if summary.HasFailures() {
 		t.Fatalf("fetch reported %d failures: %+v", summary.Failures, summary.Results)
 	}
-	if !strings.Contains(req, "six==1.16.0") {
+	if !strings.Contains(req, "six===1.16.0") {
 		t.Errorf("combined-requirements.txt does not pin the version the entry names:\n%s", req)
 	}
 	if strings.Contains(req, "1.17.0") {
@@ -135,11 +139,11 @@ func TestFetchPypiConstraintResolution(t *testing.T) {
 		version    string
 		want       string
 	}{
-		{manifest.ConstraintExact, "1.16.0", "six==1.16.0"},
-		{"", "1.16.0", "six==1.16.0"},
-		{manifest.ConstraintPatch, "1.15.0", "six==1.15.4"},
-		{manifest.ConstraintCompatible, "1.15.0", "six==1.16.2"},
-		{manifest.ConstraintAny, "1.15.0", "six==2.0.0"},
+		{manifest.ConstraintExact, "1.16.0", "six===1.16.0"},
+		{"", "1.16.0", "six===1.16.0"},
+		{manifest.ConstraintPatch, "1.15.0", "six===1.15.4"},
+		{manifest.ConstraintCompatible, "1.15.0", "six===1.16.2"},
+		{manifest.ConstraintAny, "1.15.0", "six===2.0.0"},
 		{manifest.ConstraintAny, "*", "six"},
 		{manifest.ConstraintExact, "", "six"},
 	} {
@@ -332,5 +336,364 @@ func TestHasInstallableRequirementsIgnoresPipOptions(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("%q: got %v, want %v", tc.body, got, tc.want)
 		}
+	}
+}
+
+// pypiWheelBytes builds a minimal but valid wheel for one version, so a test
+// can drive real pip over a fixture index rather than assert on the text of a
+// requirements file and call the substitution disproven.
+func pypiWheelBytes(t *testing.T, dist, version string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	info := fmt.Sprintf("%s-%s.dist-info/", dist, version)
+	for name, body := range map[string]string{
+		info + "METADATA": fmt.Sprintf("Metadata-Version: 2.1\nName: %s\nVersion: %s\n\n", dist, version),
+		info + "WHEEL":    "Wheel-Version: 1.0\nGenerator: bodega-test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+		info + "RECORD":   "",
+		dist + ".py":      fmt.Sprintf("__version__ = %q\n", version),
+	} {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatalf("wheel %s: %v", name, err)
+		}
+		if _, err := io.WriteString(w, body); err != nil {
+			t.Fatalf("wheel %s: %v", name, err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("wheel: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// pypiWheelIndex serves one distribution over the two surfaces a fetch uses:
+// the JSON API the resolver reads, and the PEP 503 pages plus wheel bytes pip
+// downloads from.
+func pypiWheelIndex(t *testing.T, dist string, versions ...string) *httptest.Server {
+	t.Helper()
+	releases := map[string]any{}
+	blobs := map[string][]byte{}
+	var links string
+	for _, v := range versions {
+		file := fmt.Sprintf("%s-%s-py3-none-any.whl", dist, v)
+		releases[v] = []any{map[string]any{"filename": file, "packagetype": "bdist_wheel"}}
+		blobs["/files/"+file] = pypiWheelBytes(t, dist, v)
+		links += fmt.Sprintf("<a href=\"/files/%s\">%s</a><br>\n", url.PathEscape(file), file)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/pypi/"+dist+"/json", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"releases": releases})
+	})
+	mux.HandleFunc("/simple/"+dist+"/", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = io.WriteString(w, links)
+	})
+	mux.HandleFunc("/files/", func(w http.ResponseWriter, r *http.Request) {
+		body, ok := blobs[r.URL.Path]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(body)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// pypiWheelRun runs real pip over a generated requirements file and returns the
+// wheel filenames it stored.
+func pypiWheelRun(t *testing.T, requirements string) ([]string, string) {
+	t.Helper()
+	if err := exec.Command("python3", "-m", "pip", "--version").Run(); err != nil {
+		t.Skipf("no python3 -m pip on this host: %v", err)
+	}
+
+	dir := t.TempDir()
+	reqPath := filepath.Join(dir, "combined-requirements.txt")
+	if err := os.WriteFile(reqPath, []byte(requirements), 0o600); err != nil {
+		t.Fatalf("write requirements: %v", err)
+	}
+	cmd := exec.Command("python3", "-m", "pip", "wheel",
+		"--no-deps", "--no-cache-dir", "--disable-pip-version-check",
+		"--wheel-dir", dir, "-r", reqPath)
+	// A PIP_* variable in the environment would decide the origin behind the
+	// requirements file, which is the question this test is asking.
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "PIP_") {
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
+	cmd.Env = append(cmd.Env, "PIP_CONFIG_FILE=/dev/null")
+	out, _ := cmd.CombinedOutput()
+
+	stored, _ := filepath.Glob(filepath.Join(dir, "*.whl"))
+	for i, whl := range stored {
+		stored[i] = filepath.Base(whl)
+	}
+	return stored, string(out)
+}
+
+// R1: the pin has to survive acquisition, not just resolution. PEP 440 version
+// matching ignores a candidate's local label when the specifier carries none,
+// so `six==1.16.0` against an index offering 1.16.0 and 1.16.0+vendor.1 stored
+// the vendored build under pip 26.2.1 — a new acquisition of a version nobody
+// approved, from the index the manifest named.
+func TestFetchPypiStoresTheVersionItResolved(t *testing.T) {
+	srv := pypiWheelIndex(t, "six", "1.16.0", "1.16.0+vendor.1")
+
+	summary, req := pypiFetchEnv(t, manifest.VersionEntry{Version: "1.16.0", URL: srv.URL})
+	if summary.HasFailures() {
+		t.Fatalf("fetch reported %d failures: %+v", summary.Failures, summary.Results)
+	}
+
+	stored, out := pypiWheelRun(t, req)
+	if len(stored) != 1 || stored[0] != "six-1.16.0-py3-none-any.whl" {
+		t.Errorf("a pin on 1.16.0 stored %v\nrequirements:\n%s\npip:\n%s", stored, req, out)
+	}
+}
+
+// An entry naming a local build gets that build, so pinning the identity does
+// not cost the ability to name one.
+func TestFetchPypiStoresANamedLocalBuild(t *testing.T) {
+	srv := pypiWheelIndex(t, "six", "1.16.0", "1.16.0+vendor.1")
+
+	summary, req := pypiFetchEnv(t, manifest.VersionEntry{Version: "1.16.0+vendor.1", URL: srv.URL})
+	if summary.HasFailures() {
+		t.Fatalf("fetch reported %d failures: %+v", summary.Failures, summary.Results)
+	}
+
+	stored, out := pypiWheelRun(t, req)
+	if len(stored) != 1 || stored[0] != "six-1.16.0+vendor.1-py3-none-any.whl" {
+		t.Errorf("a pin on 1.16.0+vendor.1 stored %v\nrequirements:\n%s\npip:\n%s", stored, req, out)
+	}
+}
+
+// R1: the store is what gets published, so the store is what gets checked. A
+// specifier is a filter rather than a fact, and a wheels directory holding a
+// version no pin names is the state B57 reported.
+func TestVerifyPypiWheelsRejectsAVersionNoPinNames(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		wheels []string
+		fails  bool
+	}{
+		{"the version the pin names", []string{"six-1.16.0-py3-none-any.whl"}, false},
+		{"a local variant of it", []string{"six-1.16.0+vendor.1-py3-none-any.whl"}, true},
+		{"a newer release", []string{"six-1.17.0-py2.py3-none-any.whl"}, true},
+		{"the pin beside a leftover", []string{"six-1.16.0-py3-none-any.whl", "six-1.17.0-py3-none-any.whl"}, false},
+		{"another spelling of it", []string{"six-1.16-py3-none-any.whl"}, false},
+		{"nothing at all", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			reqPath := filepath.Join(dir, "combined-requirements.txt")
+			if err := os.WriteFile(reqPath, []byte("--index-url https://example/simple/\nsix===1.16.0\n"), 0o600); err != nil {
+				t.Fatalf("write requirements: %v", err)
+			}
+			for _, whl := range tc.wheels {
+				if err := os.WriteFile(filepath.Join(dir, whl), []byte("x"), 0o600); err != nil {
+					t.Fatalf("write wheel: %v", err)
+				}
+			}
+			err := verifyPypiWheels(reqPath, dir)
+			if tc.fails && err == nil {
+				t.Errorf("%v passed against a pin on 1.16.0", tc.wheels)
+			}
+			if !tc.fails && err != nil {
+				t.Errorf("%v failed against a pin on 1.16.0: %v", tc.wheels, err)
+			}
+		})
+	}
+}
+
+// R1/R2: a failed fetch must leave no resolved state behind. CheckPypiStage
+// reads the requirements file's existence as "fetch is done" and the pipeline
+// skips the retry, so the previous run's file outlived the pin it came from:
+// edit a version, watch the re-fetch fail, and `build run pypi` still built the
+// closure of the version the manifest no longer names.
+func TestFetchPypiDiscardsRequirementsWhenARefetchFails(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		breakIt func(t *testing.T, cfg *Config, store *manifest.Store, pm *manifest.PackageManifest)
+	}{
+		{"the pin moves to a version the index does not offer", func(t *testing.T, _ *Config, store *manifest.Store, pm *manifest.PackageManifest) {
+			pm.Versions[0].Version = "1.99.0"
+			if err := store.SavePackage(t.Context(), pm); err != nil {
+				t.Fatalf("SavePackage: %v", err)
+			}
+		}},
+		{"a second entry names another index", func(t *testing.T, _ *Config, store *manifest.Store, _ *manifest.PackageManifest) {
+			other := pypiIndex(t, "attrs", "24.2.0")
+			if err := store.SavePackage(t.Context(), &manifest.PackageManifest{
+				Type: manifest.TypePypi, Name: "attrs",
+				Versions: []manifest.VersionEntry{{Version: "24.2.0", URL: other.URL}},
+			}); err != nil {
+				t.Fatalf("SavePackage: %v", err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := pypiIndex(t, "six", "1.16.0", "1.17.0")
+			pm := &manifest.PackageManifest{
+				Type: manifest.TypePypi, Name: "six",
+				Versions: []manifest.VersionEntry{{Version: "1.16.0", URL: srv.URL}},
+			}
+			cfg, store, _ := pinEnv(t, pm)
+			cfg.Stdout = io.Discard
+
+			if summary := FetchPypi(cfg, store); summary.HasFailures() {
+				t.Fatalf("the first fetch failed: %+v", summary.Results)
+			}
+			combinedReq := filepath.Join(cfg.rootFor(manifest.TypePypi), "combined-requirements.txt")
+			if _, err := os.Stat(combinedReq); err != nil {
+				t.Fatalf("the first fetch wrote no requirements file: %v", err)
+			}
+
+			tc.breakIt(t, cfg, store, pm)
+			if summary := FetchPypi(cfg, store); !summary.HasFailures() {
+				t.Fatalf("the re-fetch succeeded: %+v", summary.Results)
+			}
+
+			if _, err := os.Stat(combinedReq); !os.IsNotExist(err) {
+				body, _ := os.ReadFile(combinedReq)
+				t.Errorf("a failed re-fetch left the previous run's requirements in place:\n%s", body)
+			}
+			if CheckPypiStage(cfg, store).Fetched {
+				t.Error("a failed re-fetch still reports the fetch stage as done, so the pipeline skips the retry")
+			}
+			if summary := BuildPypi(cfg, store); !summary.HasFailures() {
+				t.Errorf("a build after a failed re-fetch succeeded: %+v", summary.Results)
+			}
+		})
+	}
+}
+
+// R3: local labels order by PEP 440 rather than as strings, and the resolver is
+// where that decides which artifact a constraint reaches.
+func TestResolvePypiVersionOrdersLocalLabels(t *testing.T) {
+	for _, tc := range []struct {
+		available  []string
+		version    string
+		constraint string
+		want       string
+	}{
+		{[]string{"1.0+vendor.9", "1.0+vendor.10"}, "1.0", manifest.ConstraintAny, "1.0+vendor.10"},
+		{[]string{"1.0+vendor.1"}, "1.0+vendor_1", manifest.ConstraintExact, "1.0+vendor.1"},
+		{[]string{"1.0+9", "1.0+abc"}, "1.0", manifest.ConstraintAny, "1.0+9"},
+	} {
+		srv := pypiIndex(t, "six", tc.available...)
+		got, err := resolvePypiVersion(srv.URL, "six", manifest.VersionEntry{
+			Version: tc.version, VersionConstraint: tc.constraint,
+		})
+		if err != nil || got != tc.want {
+			t.Errorf("%s %q over %v resolved to %q (err %v), want %q",
+				tc.constraint, tc.version, tc.available, got, err, tc.want)
+		}
+	}
+}
+
+// pypiBaseReqEnv stands up a pypi entry whose base requirements come from a
+// git application, and writes that application's requirements files.
+func pypiBaseReqEnv(t *testing.T, index string, files map[string]string) (*Config, *manifest.Store) {
+	t.Helper()
+	cfg, store, _ := pinEnv(t, &manifest.PackageManifest{
+		Type: manifest.TypePypi, Name: "six",
+		Versions: []manifest.VersionEntry{{Version: "1.16.0", URL: index, RequiredBy: []string{"app"}}},
+	})
+	cfg.Stdout = io.Discard
+
+	if err := store.SavePackage(t.Context(), &manifest.PackageManifest{
+		Type: manifest.TypeGit, Name: "app",
+		Versions: []manifest.VersionEntry{{Ref: "v1.0.0", URL: "https://example.org/app.git"}},
+	}); err != nil {
+		t.Fatalf("SavePackage: %v", err)
+	}
+
+	work := gitReleaseDir(buildDirs(cfg.rootFor(manifest.TypeGit)), "app", manifest.VersionEntry{Ref: "v1.0.0"})
+	if err := os.MkdirAll(work, 0o700); err != nil {
+		t.Fatalf("mkdir worktree: %v", err)
+	}
+	for name, body := range files {
+		path := filepath.Join(work, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("mkdir for %s: %v", name, err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	return cfg, store
+}
+
+// R1/R4: pip parses an included requirements file after the generated header
+// and honors the last index option it reads, so an application's own
+// requirements.txt could replace the index the manifest resolved against, or
+// add a second one beside it, with nothing in the resolver ever seeing it.
+func TestFetchPypiFailsWhenIncludedRequirementsNameAnotherOrigin(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		files map[string]string
+	}{
+		{"an index of its own", map[string]string{
+			"requirements.txt": "--index-url OTHER/simple/\nsix\n",
+		}},
+		{"an index of its own, joined by =", map[string]string{
+			"requirements.txt": "--index-url=OTHER/simple/\nsix\n",
+		}},
+		{"a second index beside the selected one", map[string]string{
+			"requirements.txt": "--extra-index-url OTHER/simple/\nsix\n",
+		}},
+		{"a directory of wheels", map[string]string{
+			"requirements.txt": "--find-links OTHER/wheels/\nsix\n",
+		}},
+		{"an index one include further down", map[string]string{
+			"requirements.txt": "-r nested/base.txt\nsix\n",
+			"nested/base.txt":  "--index-url OTHER/simple/\n",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			selected := pypiIndex(t, "six", "1.16.0")
+			other := pypiIndex(t, "six", "1.16.0", "1.17.0")
+
+			files := map[string]string{}
+			for name, body := range tc.files {
+				files[name] = strings.ReplaceAll(body, "OTHER", other.URL)
+			}
+			cfg, store := pypiBaseReqEnv(t, selected.URL, files)
+
+			summary := FetchPypi(cfg, store)
+			if !summary.HasFailures() {
+				t.Fatalf("an included file replaced the selected index silently: %+v", summary.Results)
+			}
+			var msg string
+			for _, r := range summary.Results {
+				if r.Err != nil {
+					msg = r.Err.Error()
+				}
+			}
+			for _, want := range []string{"requirements.txt", other.URL, selected.URL} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("the failure does not name %q: %s", want, msg)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(cfg.rootFor(manifest.TypePypi), "combined-requirements.txt")); !os.IsNotExist(err) {
+				t.Error("a fetch that could not settle the origin still wrote a requirements file")
+			}
+		})
+	}
+}
+
+// An included file that names the selected index is agreement, not conflict.
+func TestFetchPypiAcceptsIncludedRequirementsOnTheSelectedIndex(t *testing.T) {
+	selected := pypiIndex(t, "six", "1.16.0")
+	cfg, store := pypiBaseReqEnv(t, selected.URL, map[string]string{
+		"requirements.txt": "# app\n--index-url " + selected.URL + "/simple\nattrs\n",
+	})
+
+	if summary := FetchPypi(cfg, store); summary.HasFailures() {
+		t.Fatalf("an included file naming the selected index failed the fetch: %+v", summary.Results)
 	}
 }

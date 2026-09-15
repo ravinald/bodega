@@ -90,3 +90,59 @@ func TestParsePyVersionRejectsLegacyForms(t *testing.T) {
 		}
 	}
 }
+
+// Local labels are part of a version's identity and PEP 440 orders them by
+// segment: numerically where a segment is a number, and with any numeric
+// segment above any alphanumeric one. A string comparison puts +vendor.10
+// below +vendor.9 and +abc above +9, which resolves `any` onto the wrong
+// build of the right release.
+//
+// https://packaging.python.org/en/latest/specifications/version-specifiers/#local-version-identifiers
+func TestSortPyVersionsOrdersLocalLabels(t *testing.T) {
+	want := []string{"1.0", "1.0+abc", "1.0+vendor.9", "1.0+vendor.10", "1.0+9"}
+	got := append([]string(nil), want...)
+	for i, j := 0, len(got)-1; i < j; i, j = i+1, j-1 {
+		got[i], got[j] = got[j], got[i]
+	}
+	SortPyVersions(got)
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("ordering is\n  %v\nwant\n  %v", got, want)
+	}
+}
+
+// PEP 440 treats the three local separators as equivalent, so an entry naming
+// 1.0+vendor_1 names the artifact an index publishes as 1.0+vendor.1.
+func TestFilterPypiVersionsNormalizesLocalSeparators(t *testing.T) {
+	for _, want := range []string{"1.0+vendor_1", "1.0+vendor-1", "1.0+Vendor.1"} {
+		got := FilterPypiVersions([]string{"1.0+vendor.1"}, manifest.ConstraintExact, want)
+		if len(got) != 1 || got[0] != "1.0+vendor.1" {
+			t.Errorf("exact %q resolved to %v, want [1.0+vendor.1]", want, got)
+		}
+	}
+	if got := FilterPypiVersions([]string{"1.0"}, manifest.ConstraintExact, "1.0+vendor.1"); len(got) != 0 {
+		t.Errorf("a local build matched the plain release: %v", got)
+	}
+}
+
+// A pin is written in the canonical spelling because that is the one pip
+// compares === against: an index listing 1.0-1 serves a wheel pip reads as
+// 1.0.post1, and the raw spelling matches nothing.
+func TestPyVersionCanonical(t *testing.T) {
+	for raw, want := range map[string]string{
+		"1.16.0":           "1.16.0",
+		"1.0-1":            "1.0.post1",
+		"v1.01.0":          "1.1.0",
+		"2.0.0-rc-1":       "2.0.0rc1",
+		"1!2.0":            "1!2.0",
+		"1.0dev1":          "1.0.dev1",
+		"1.0RC1+Vendor_01": "1.0rc1+vendor.1",
+	} {
+		v, ok := ParsePyVersion(raw)
+		if !ok {
+			t.Fatalf("%q did not parse", raw)
+		}
+		if got := v.Canonical(); got != want {
+			t.Errorf("%q renders as %q, want %q", raw, got, want)
+		}
+	}
+}

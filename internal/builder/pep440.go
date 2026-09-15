@@ -25,7 +25,7 @@ type PyVersion struct {
 	PostNum int
 	Dev     bool
 	DevNum  int
-	Local   string
+	Local   string // normalized: lower case, separators collapsed to "."
 	Raw     string
 }
 
@@ -59,7 +59,7 @@ func ParsePyVersion(s string) (PyVersion, bool) {
 		return n
 	}
 
-	v := PyVersion{Raw: s, Epoch: atoi(group("epoch")), Local: group("local")}
+	v := PyVersion{Raw: s, Epoch: atoi(group("epoch")), Local: normalizeLocal(group("local"))}
 	for _, part := range strings.Split(group("release"), ".") {
 		v.Release = append(v.Release, atoi(part))
 	}
@@ -118,7 +118,7 @@ func (v PyVersion) compare(o PyVersion) int {
 		// An absent dev segment sorts after a present one, so 1.0 beats 1.0.dev9.
 		cmpInt(boolRank(!v.Dev), boolRank(!o.Dev)),
 		cmpInt(v.DevNum, o.DevNum),
-		strings.Compare(v.Local, o.Local),
+		cmpLocal(v.Local, o.Local),
 	} {
 		if c != 0 {
 			return c
@@ -161,6 +161,99 @@ func cmpInt(a, b int) int {
 	default:
 		return 0
 	}
+}
+
+// normalizeLocal renders a local version label in the one spelling PEP 440
+// compares: separators are equivalent, so `1.0+vendor_1` and `1.0+vendor.1`
+// name the same artifact, and numeric segments drop their leading zeros.
+func normalizeLocal(label string) string {
+	if label == "" {
+		return ""
+	}
+	segments := strings.FieldsFunc(strings.ToLower(label), func(r rune) bool {
+		return r == '.' || r == '-' || r == '_'
+	})
+	for i, seg := range segments {
+		if n, err := strconv.Atoi(seg); err == nil {
+			segments[i] = strconv.Itoa(n)
+		}
+	}
+	return strings.Join(segments, ".")
+}
+
+// cmpLocal orders two normalized local labels segment by segment. PEP 440
+// compares numeric segments as numbers and ranks any numeric segment above any
+// alphanumeric one, so a string comparison puts `+vendor.10` below `+vendor.9`
+// and `+abc` above `+9`. An absent label sorts below every present one.
+func cmpLocal(a, b string) int {
+	as, bs := localSegments(a), localSegments(b)
+	for i := 0; i < max(len(as), len(bs)); i++ {
+		switch {
+		case i >= len(as):
+			return -1
+		case i >= len(bs):
+			return 1
+		}
+		an, aNumeric := strconv.Atoi(as[i])
+		bn, bNumeric := strconv.Atoi(bs[i])
+		switch {
+		case aNumeric == nil && bNumeric == nil:
+			if c := cmpInt(an, bn); c != 0 {
+				return c
+			}
+		case aNumeric == nil:
+			return 1
+		case bNumeric == nil:
+			return -1
+		default:
+			if c := strings.Compare(as[i], bs[i]); c != 0 {
+				return c
+			}
+		}
+	}
+	return 0
+}
+
+func localSegments(label string) []string {
+	if label == "" {
+		return nil
+	}
+	return strings.Split(label, ".")
+}
+
+// Canonical renders the normalized PEP 440 spelling of a version: the form a
+// packaging tool compares against, with aliases, separators, implicit post
+// releases and zero-padded segments all resolved. `1.0-1` renders as
+// `1.0.post1` and `1.0RC1+Vendor_01` as `1.0rc1+vendor.1`.
+//
+// A pin is written in this spelling because pip matches `===` by string
+// equality against the candidate's canonical form: an index listing `1.0-1`
+// serves a wheel pip reads as `1.0.post1`, and the raw spelling matches
+// nothing.
+func (v PyVersion) Canonical() string {
+	var b strings.Builder
+	if v.Epoch != 0 {
+		b.WriteString(strconv.Itoa(v.Epoch) + "!")
+	}
+	for i, n := range v.Release {
+		if i > 0 {
+			b.WriteString(".")
+		}
+		b.WriteString(strconv.Itoa(n))
+	}
+	if v.PreKind != "" {
+		b.WriteString(v.PreKind + strconv.Itoa(v.PreNum))
+	}
+	if v.Post {
+		b.WriteString(".post" + strconv.Itoa(v.PostNum))
+	}
+	if v.Dev {
+		b.WriteString(".dev" + strconv.Itoa(v.DevNum))
+	}
+	if v.Local != "" {
+		b.WriteString("+" + v.Local)
+	}
+	return b.String()
 }
 
 // SortPyVersions sorts version strings by PEP 440 ordering, ascending.

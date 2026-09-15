@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -157,6 +158,88 @@ func pypiIndexLine(root string) string {
 	return "--index-url " + strings.TrimRight(root, "/") + "/simple/\n"
 }
 
+// pypiSourceConflict fails when a requirements file pip is told to read names
+// an origin of its own.
+//
+// pip parses an included file after the generated header and honors the last
+// index option it finds, so an application's requirements.txt can replace the
+// index the manifest approved, or add a second one beside it, and nothing in
+// the resolver ever sees it. Rejecting rather than rewriting: the file belongs
+// to the application, and silently editing an origin out of it hides the
+// disagreement instead of settling it.
+func pypiSourceConflict(path, indexRoot string, seen map[string]bool) error {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
+	}
+	if seen[abs] {
+		return nil
+	}
+	seen[abs] = true
+
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("read requirements: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") || !strings.HasPrefix(line, "-") {
+			continue
+		}
+		opt, value := cutRequirementOption(line)
+		switch opt {
+		case "-i", "--index-url":
+			if !sameIndexRoot(value, indexRoot) {
+				return fmt.Errorf("%s names %s %s and the manifest resolved against %s; one fetch downloads from one index",
+					path, opt, value, indexRoot)
+			}
+		case "--extra-index-url", "-f", "--find-links":
+			return fmt.Errorf("%s names %s %s, which adds an origin beside the %s the manifest approved",
+				path, opt, value, indexRoot)
+		case "-r", "--requirement":
+			next := value
+			if next == "" {
+				continue
+			}
+			if !filepath.IsAbs(next) {
+				next = filepath.Join(filepath.Dir(path), next)
+			}
+			if err := pypiSourceConflict(next, indexRoot, seen); err != nil {
+				return fmt.Errorf("%s includes %s: %w", path, value, err)
+			}
+		}
+	}
+	return scanner.Err()
+}
+
+// cutRequirementOption splits a pip option line into the option and its value,
+// accepting both spellings pip does: `--index-url URL` and `--index-url=URL`.
+func cutRequirementOption(line string) (opt, value string) {
+	fields := strings.Fields(line)
+	opt = fields[0]
+	if name, inline, ok := strings.Cut(opt, "="); ok {
+		return name, inline
+	}
+	if len(fields) > 1 {
+		value = fields[1]
+	}
+	return opt, value
+}
+
+// sameIndexRoot reports whether a pip index option points at the index the
+// manifest resolved against. The manifest records the root and pip is handed
+// the PEP 503 path under it, so the two spellings have to compare equal.
+func sameIndexRoot(value, root string) bool {
+	norm := func(s string) string {
+		s = strings.TrimRight(strings.TrimSpace(s), "/")
+		return strings.TrimSuffix(s, "/simple")
+	}
+	return norm(value) == norm(root)
+}
+
 // pypiOffered renders an index's version list for an error message, newest last.
 func pypiOffered(available []string) string {
 	if len(available) == 0 {
@@ -170,11 +253,119 @@ func pypiOffered(available []string) string {
 }
 
 // pypiRequirement renders one resolved entry as a pip requirement line.
+//
+// Arbitrary equality (===) rather than ==: PEP 440 version matching ignores a
+// candidate's local label when the specifier carries none, so `six==1.16.0`
+// against an index offering both 1.16.0 and 1.16.0+vendor.1 downloads the
+// vendored build. Measured against pip 26.2.1. === compares the whole
+// identity, so the version the resolver chose is the version pip stores.
+//
+// https://packaging.python.org/en/latest/specifications/version-specifiers/#version-matching
 func pypiRequirement(name, resolved string) string {
 	if resolved == "" {
 		return name
 	}
-	return name + "==" + resolved
+	if v, ok := ParsePyVersion(resolved); ok {
+		return name + "===" + v.Canonical()
+	}
+	return name + "===" + resolved
+}
+
+// pypiPins reads back the exact pins a fetch wrote, keyed by normalized
+// distribution name. Only the === lines are pins: the rest of the file is the
+// applications' own requirements, whose closure is pip's to resolve.
+func pypiPins(path string) (map[string]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+
+	pins := make(map[string]string)
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		name, version, ok := strings.Cut(line, "===")
+		if !ok || strings.HasPrefix(line, "#") {
+			continue
+		}
+		pins[normalisePkgName(strings.TrimSpace(name))] = strings.TrimSpace(version)
+	}
+	return pins, scanner.Err()
+}
+
+// parseWheelName splits a wheel filename into its distribution and version.
+// The remaining tags decide which interpreter and platform the wheel is for,
+// which is pip's business rather than the manifest's.
+func parseWheelName(base string) (name, version string, ok bool) {
+	// distribution-version(-build)?-python-abi-platform.whl, and neither the
+	// distribution nor the version may carry a hyphen of its own.
+	fields := strings.Split(strings.TrimSuffix(base, ".whl"), "-")
+	if len(fields) < 5 {
+		return "", "", false
+	}
+	return normalisePkgName(fields[0]), fields[1], true
+}
+
+// verifyPypiWheels fails when the wheels directory holds a pinned distribution
+// at a version no pin names.
+//
+// A pin reaches pip as a specifier, and a specifier is a filter rather than a
+// fact: an index that answers it with another build, a pip resolving it out of
+// a cache, or a hand-edited requirements file all end with bytes on disk the
+// manifest does not describe. The store is what gets published, so the store is
+// what gets checked.
+//
+// A pin with no wheel at all passes here. pip exiting 0 having stored nothing
+// for a requirement is a different defect, and failing it in this check would
+// report it as a substituted version.
+func verifyPypiWheels(reqPath, wheelsDir string) error {
+	pins, err := pypiPins(reqPath)
+	if err != nil {
+		return fmt.Errorf("read the pins back from %s: %w", reqPath, err)
+	}
+
+	stored := make(map[string][]string)
+	whlFiles, err := filepath.Glob(filepath.Join(wheelsDir, "*.whl"))
+	if err != nil {
+		return err
+	}
+	for _, whl := range whlFiles {
+		if name, version, ok := parseWheelName(filepath.Base(whl)); ok {
+			stored[name] = append(stored[name], version)
+		}
+	}
+
+	for _, name := range sortedKeys(pins) {
+		want := pins[name]
+		have := stored[name]
+		if len(have) == 0 || slices.ContainsFunc(have, func(got string) bool { return samePyVersion(got, want) }) {
+			continue
+		}
+		return fmt.Errorf("pypi %s: the manifest names %s and the wheels directory holds %s — pip stored a version nobody approved",
+			name, want, strings.Join(have, ", "))
+	}
+	return nil
+}
+
+// samePyVersion compares two version strings under PEP 440, falling back to
+// string equality for the legacy versions no parser will read.
+func samePyVersion(a, b string) bool {
+	av, aOK := ParsePyVersion(a)
+	bv, bOK := ParsePyVersion(b)
+	if aOK && bOK {
+		return av.Equal(bv)
+	}
+	return a == b
+}
+
+func sortedKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // CheckPypiStage inspects the filesystem to determine which pipeline stages
@@ -224,6 +415,24 @@ func PypiArtifactDir(cfg *Config, store *manifest.Store) (localDir, s3Prefix str
 // records: when a VersionEntry has RequiredBy set, those git repos are treated
 // as base apps and their requirements.txt files are included.
 func FetchPypi(cfg *Config, store *manifest.Store) *Summary {
+	summary := fetchPypi(cfg, store)
+	if !summary.HasFailures() {
+		return summary
+	}
+
+	// A fetch that failed must leave no resolved state behind. CheckPypiStage
+	// reads the file's existence as "fetch is done" and the pipeline then skips
+	// the retry, so a previous run's file outlives the pin it was resolved
+	// from: edit a version, watch the re-fetch fail, and `build run pypi` still
+	// stores the closure of the version nobody approved any more.
+	combinedReq := filepath.Join(cfg.rootFor(manifest.TypePypi), "combined-requirements.txt")
+	if err := os.Remove(combinedReq); err == nil {
+		_, _ = fmt.Fprintf(cfg.stdout(), "    Discarded %s: it no longer describes the manifest\n", combinedReq)
+	}
+	return summary
+}
+
+func fetchPypi(cfg *Config, store *manifest.Store) *Summary {
 	ctx := context.Background()
 	out := cfg.stdout()
 	summary := &Summary{}
@@ -297,6 +506,14 @@ func FetchPypi(cfg *Config, store *manifest.Store) *Summary {
 		reqPath := filepath.Join(worktree, "requirements.txt")
 		if _, err := os.Stat(reqPath); os.IsNotExist(err) {
 			result.Err = fmt.Errorf("requirements.txt not found in %s", worktree)
+			summary.Failures++
+			summary.Results = append(summary.Results, result)
+			summary.Total++
+			return summary
+		}
+		if err := pypiSourceConflict(reqPath, indexRoot, map[string]bool{}); err != nil {
+			result.Err = fmt.Errorf("pypi base requirements for %s@%s: %w", repoName, ref, err)
+			_, _ = fmt.Fprintf(out, "    FAILED: %v\n", result.Err)
 			summary.Failures++
 			summary.Results = append(summary.Results, result)
 			summary.Total++
@@ -484,6 +701,15 @@ func BuildPypi(cfg *Config, store *manifest.Store) *Summary {
 		"-r", combinedReq,
 	); err != nil {
 		result.Err = fmt.Errorf("pip wheel: %w", err)
+		summary.Failures++
+		summary.Results = append(summary.Results, result)
+		summary.Total++
+		return summary
+	}
+
+	if err := verifyPypiWheels(combinedReq, wheelsDir); err != nil {
+		result.Err = err
+		_, _ = fmt.Fprintf(out, "    FAILED: %v\n", err)
 		summary.Failures++
 		summary.Results = append(summary.Results, result)
 		summary.Total++
