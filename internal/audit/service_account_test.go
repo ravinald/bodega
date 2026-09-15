@@ -180,6 +180,60 @@ WantedBy=multi-user.target
 		}
 	})
 
+	// The review's reproduction. systemd selects drop-ins by basename across
+	// the whole search path, so an /etc file masks the vendor file of the same
+	// name and the vendor User= is never read. Applying both hands the pepper
+	// to an account the host does not serve as, and doctor then reports that
+	// same wrong account as able to read it.
+	t.Run("an /etc drop-in masks the vendor file of the same name", func(t *testing.T) {
+		dir := t.TempDir()
+		writeUnit(t, filepath.Join(dir, "lib", unitName), unit)
+		writeUnit(t, filepath.Join(dir, "lib", unitName+".d", "10-account.conf"),
+			"[Service]\nUser=daemon\nGroup=daemon\n")
+		writeUnit(t, filepath.Join(dir, "etc", unitName+".d", "10-account.conf"),
+			"[Service]\nRestart=always\n")
+		swapUnitDirs(t, filepath.Join(dir, "etc"), filepath.Join(dir, "lib"))
+
+		name, group, _ := declaredServiceAccount()
+		if name != "bodega" || group != "bodega" {
+			t.Fatalf("got %q/%q, want bodega/bodega: systemd never reads the vendor drop-in the "+
+				"/etc file of the same name masks, and runs the server as the unit's own User=", name, group)
+		}
+	})
+
+	// Drop-ins are ordered by basename regardless of the directory they came
+	// from, so a vendor 20- file is applied after an /etc 10- file. Walking
+	// the directories in precedence order reverses that pair.
+	t.Run("drop-ins apply in basename order across directories", func(t *testing.T) {
+		dir := t.TempDir()
+		writeUnit(t, filepath.Join(dir, "lib", unitName), unit)
+		writeUnit(t, filepath.Join(dir, "etc", unitName+".d", "10-account.conf"),
+			"[Service]\nUser=first\nGroup=first\n")
+		writeUnit(t, filepath.Join(dir, "lib", unitName+".d", "20-account.conf"),
+			"[Service]\nUser=second\nGroup=second\n")
+		swapUnitDirs(t, filepath.Join(dir, "etc"), filepath.Join(dir, "lib"))
+
+		name, group, _ := declaredServiceAccount()
+		if name != "second" || group != "second" {
+			t.Fatalf("got %q/%q, want second/second: 20-account.conf sorts last wherever it lives", name, group)
+		}
+	})
+
+	// systemd loads the first unit file on the search path and stops. One at
+	// /etc naming no User= runs the server as root; falling through to a
+	// vendor unit that names one picks an account nothing here serves as.
+	t.Run("the first unit file on the path wins, User= or not", func(t *testing.T) {
+		dir := t.TempDir()
+		writeUnit(t, filepath.Join(dir, "etc", unitName),
+			"[Service]\nType=notify\nExecStart=/usr/local/bin/bodega serve\n")
+		writeUnit(t, filepath.Join(dir, "lib", unitName), unit)
+		swapUnitDirs(t, filepath.Join(dir, "etc"), filepath.Join(dir, "lib"))
+
+		if name, _, _ := declaredServiceAccount(); name != "" {
+			t.Fatalf("got %q, want no account: the unit in force names no User=", name)
+		}
+	})
+
 	t.Run("no unit and no environment", func(t *testing.T) {
 		dir := t.TempDir()
 		swapUnitDirs(t, filepath.Join(dir, "etc"))
@@ -236,7 +290,7 @@ func TestResolveServiceIdentityFillsTheGroupSet(t *testing.T) {
 
 func swapUnitDirs(t *testing.T, dirs ...string) {
 	t.Helper()
-	prev := unitSearchDirs
-	unitSearchDirs = dirs
-	t.Cleanup(func() { unitSearchDirs = prev })
+	prev := UnitSearchDirs
+	UnitSearchDirs = dirs
+	t.Cleanup(func() { UnitSearchDirs = prev })
 }

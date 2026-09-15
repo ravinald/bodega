@@ -23,11 +23,12 @@ const ServiceUserEnv = "BODEGA_SERVICE_USER"
 // over and 0600 is the right posture.
 var ErrNoServiceAccount = errors.New("this host names no bodega service account")
 
-// unitName and unitSearchDirs reproduce systemd's own lookup, highest
-// precedence first. A variable so a test can point it at a tree it built.
+// unitName and UnitSearchDirs reproduce systemd's own lookup, highest
+// precedence first. Exported, like DefaultPepperPaths, so a test can point the
+// resolver at a tree it built.
 const unitName = "bodega.service"
 
-var unitSearchDirs = []string{
+var UnitSearchDirs = []string{
 	"/etc/systemd/system",
 	"/run/systemd/system",
 	"/usr/local/lib/systemd/system",
@@ -204,47 +205,84 @@ func (id ServiceIdentity) inGroup(gid int) bool {
 	return false
 }
 
-// declaredServiceAccount reads the account out of the environment, then out of
-// the unit systemd would load, then out of the drop-ins that override it.
+// declaredServiceAccount reads the account out of the environment, then out
+// of the unit and drop-ins systemd would load.
 func declaredServiceAccount() (name, group, source string) {
 	if v := strings.TrimSpace(os.Getenv(ServiceUserEnv)); v != "" {
 		return v, "", ServiceUserEnv
 	}
-	for _, dir := range unitSearchDirs {
-		u, g, ok := readUnitAccount(filepath.Join(dir, unitName))
-		if !ok {
-			continue
+	for _, path := range unitFragments() {
+		u, g := readUnitAccount(path)
+		if u != "" {
+			name, source = u, path
 		}
-		name, group, source = u, g, filepath.Join(dir, unitName)
-		break
+		if g != "" {
+			group = g
+		}
 	}
 	if name == "" {
 		return "", "", ""
 	}
-	// Lowest precedence first, so `systemctl edit` under /etc lands last.
-	for i := len(unitSearchDirs) - 1; i >= 0; i-- {
-		conf, _ := filepath.Glob(filepath.Join(unitSearchDirs[i], unitName+".d", "*.conf"))
-		sort.Strings(conf)
-		for _, c := range conf {
-			u, g, _ := readUnitAccount(c)
-			if u != "" {
-				name, source = u, c
-			}
-			if g != "" {
-				group = g
+	return name, group, source
+}
+
+// unitFragments lists the files systemd reads for the unit, in the order it
+// applies them: the unit itself, then its drop-ins.
+//
+// Two rules make this more than a walk of the search path, and getting either
+// wrong selects an account the host does not serve as, which hands the pepper
+// to the wrong group and leaves every minted token refused.
+//
+// A drop-in is selected by basename across the whole search path: an /etc
+// bodega.service.d/10-account.conf masks the vendor file of the same name
+// entirely, so a vendor User= systemd never reads must not reach the account.
+// And what survives is applied in basename order regardless of the directory
+// it came from, so a vendor 20-account.conf lands after an /etc
+// 10-account.conf rather than before it.
+func unitFragments() []string {
+	var frags []string
+	for _, dir := range UnitSearchDirs {
+		path := filepath.Join(dir, unitName)
+		if _, err := os.Stat(path); err == nil {
+			// systemd stops at the first unit it finds, whether or not that
+			// one names a User=. Falling through to a lower-precedence unit
+			// that does names an account nothing on this host runs as.
+			frags = append(frags, path)
+			break
+		}
+	}
+	if len(frags) == 0 {
+		return nil
+	}
+
+	selected := make(map[string]string)
+	for _, dir := range UnitSearchDirs {
+		matches, _ := filepath.Glob(filepath.Join(dir, unitName+".d", "*.conf"))
+		for _, m := range matches {
+			if base := filepath.Base(m); selected[base] == "" {
+				selected[base] = m
 			}
 		}
 	}
-	return name, group, source
+	bases := make([]string, 0, len(selected))
+	for base := range selected {
+		bases = append(bases, base)
+	}
+	sort.Strings(bases)
+	for _, base := range bases {
+		frags = append(frags, selected[base])
+	}
+	return frags
 }
 
 // readUnitAccount pulls User= and Group= out of a unit file's [Service]
 // section. Last assignment wins, which is what systemd does with a key set
-// twice; ok is false when the file names no User=, so the search moves on.
-func readUnitAccount(path string) (name, group string, ok bool) {
+// twice. A file that names neither returns two empty strings and changes
+// nothing, which is how a drop-in carrying an unrelated setting behaves.
+func readUnitAccount(path string) (name, group string) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", "", false
+		return "", ""
 	}
 	defer f.Close()
 
@@ -271,5 +309,5 @@ func readUnitAccount(path string) (name, group string, ok bool) {
 			group = strings.TrimSpace(v)
 		}
 	}
-	return name, group, name != ""
+	return name, group
 }

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -125,6 +126,60 @@ func TestCreatedPepperIsHandedToTheServiceAccount(t *testing.T) {
 	}
 }
 
+// TestCreatedPepperFollowsTheUnitSystemdWouldLoad drives the handoff through
+// the unit resolver rather than BODEGA_SERVICE_USER, because which account
+// that resolution selects is the defect the review sent back: a vendor drop-in
+// masked by an /etc file of the same name named a second account, the pepper
+// went to that account's group, and the server kept running as the unit's own
+// User= with every minted token refused.
+func TestCreatedPepperFollowsTheUnitSystemdWouldLoad(t *testing.T) {
+	serving, masked := twoServiceAccounts(t)
+	units := t.TempDir()
+	writeUnit(t, filepath.Join(units, "lib", unitName),
+		"[Service]\nType=notify\nUser="+serving.Username+"\n")
+	writeUnit(t, filepath.Join(units, "lib", unitName+".d", "10-account.conf"),
+		"[Service]\nUser="+masked.Username+"\n")
+	writeUnit(t, filepath.Join(units, "etc", unitName+".d", "10-account.conf"),
+		"[Service]\nRestart=always\n")
+	swapUnitDirs(t, filepath.Join(units, "etc"), filepath.Join(units, "lib"))
+
+	dir := worldTraversableDir(t)
+	path := filepath.Join(dir, "pepper")
+	st, err := LoadOrCreatePepper([]string{path})
+	if st.Path != path || !st.Created {
+		t.Fatalf("created=%v path=%s, want true and %s", st.Created, st.Path, path)
+	}
+	servingGID, maskedGID := gidOf(t, serving), gidOf(t, masked)
+
+	if os.Geteuid() == 0 {
+		if err != nil {
+			t.Fatalf("mint: %v", err)
+		}
+		gid := int(fiOf(t, path).Sys().(*syscall.Stat_t).Gid)
+		switch gid {
+		case maskedGID:
+			t.Fatalf("pepper handed to gid %d (%s), the account in the drop-in systemd masks: "+
+				"%s serves and cannot read it", gid, masked.Username, serving.Username)
+		case servingGID:
+		default:
+			t.Fatalf("pepper gid %d, want %d (%s)", gid, servingGID, serving.Username)
+		}
+		return
+	}
+
+	// Unprivileged there is no chown to make, so the refusal is the outcome
+	// and the account it names is what this case measures.
+	var handoff *PepperHandoffError
+	if !errors.As(err, &handoff) {
+		t.Fatalf("err = %v, want a *PepperHandoffError: %s cannot read a 0600 pepper this process owns",
+			err, serving.Username)
+	}
+	if handoff.Identity.Name != serving.Username {
+		t.Fatalf("handoff names %q, want %q: the drop-in naming %q is masked and systemd never reads it",
+			handoff.Identity.Name, serving.Username, masked.Username)
+	}
+}
+
 // A pepper written before this check existed reaches `token generate` through
 // the load path, not the create path, so the mint verifies what it loaded too.
 // This is the state an upgrade lands in: /etc/bodega/pepper already on disk,
@@ -188,6 +243,49 @@ func secondAccount(t *testing.T) string {
 	}
 	t.Skip("this host has no second account to hand a pepper to")
 	return ""
+}
+
+// twoServiceAccounts names two accounts this process is not, with distinct
+// groups: one the unit runs the server as, one a masked drop-in names.
+func twoServiceAccounts(t *testing.T) (serving, masked *user.User) {
+	t.Helper()
+	var found []*user.User
+	for _, name := range []string{"daemon", "bin", "www", "games", "sys", "nobody"} {
+		u, err := user.Lookup(name)
+		if err != nil {
+			continue
+		}
+		uid, err := strconv.Atoi(u.Uid)
+		if err != nil || uid == os.Getuid() {
+			continue
+		}
+		if len(found) == 1 && u.Gid == found[0].Gid {
+			continue
+		}
+		if found = append(found, u); len(found) == 2 {
+			return found[0], found[1]
+		}
+	}
+	t.Skip("this host has fewer than two accounts to model a masked drop-in with")
+	return nil, nil
+}
+
+func gidOf(t *testing.T, u *user.User) int {
+	t.Helper()
+	gid, err := strconv.Atoi(u.Gid)
+	if err != nil {
+		t.Fatalf("gid of %s: %v", u.Username, err)
+	}
+	return gid
+}
+
+func fiOf(t *testing.T, path string) os.FileInfo {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	return fi
 }
 
 func modeOf(t *testing.T, path string) os.FileMode {

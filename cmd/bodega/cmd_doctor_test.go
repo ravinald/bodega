@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -414,6 +415,101 @@ func TestDoctorReportsAnAccountTheHostDoesNotHave(t *testing.T) {
 	if !strings.Contains(f.Detail, "bodega.service") {
 		t.Errorf("detail %q does not name where the account was declared", f.Detail)
 	}
+}
+
+// pepperPosture resolves the account itself, and that resolution is where the
+// defect the review sent back lived: a vendor drop-in masked by an /etc file
+// of the same name named a second account, doctor tested the pepper against
+// that one and reported OK while the account systemd runs the server as could
+// not open the file. Every case above hands pepperFinding an identity and so
+// cannot see it.
+func TestDoctorNamesTheAccountSystemdWouldRun(t *testing.T) {
+	serving, masked := twoDoctorAccounts(t)
+	units := t.TempDir()
+	writeUnitFile(t, filepath.Join(units, "lib", "bodega.service"),
+		"[Service]\nType=notify\nUser="+serving.Username+"\n")
+	writeUnitFile(t, filepath.Join(units, "lib", "bodega.service.d", "10-account.conf"),
+		"[Service]\nUser="+masked.Username+"\n")
+	writeUnitFile(t, filepath.Join(units, "etc", "bodega.service.d", "10-account.conf"),
+		"[Service]\nRestart=always\n")
+	swapDoctorUnitDirs(t, filepath.Join(units, "etc"), filepath.Join(units, "lib"))
+
+	path := filepath.Join(pepperTree(t, 0o644, 0o640), "pepper")
+	if os.Geteuid() == 0 {
+		// root:masked 0640 is the shape the wrong account's handoff leaves:
+		// readable by the drop-in's account, closed to the one serving.
+		gid, err := strconv.Atoi(masked.Gid)
+		if err != nil {
+			t.Fatalf("gid of %s: %v", masked.Username, err)
+		}
+		if err := os.Chown(path, 0, gid); err != nil {
+			t.Fatalf("chown %s: %v", path, err)
+		}
+	} else if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatalf("chmod %s: %v", path, err)
+	}
+	prev := audit.DefaultPepperPaths
+	audit.DefaultPepperPaths = []string{path}
+	t.Cleanup(func() { audit.DefaultPepperPaths = prev })
+
+	f := pepperPosture()
+	if f.Status != host.StatusFail {
+		t.Fatalf("status %s, want FAIL: %s serves and cannot read %s: %s",
+			f.Status, serving.Username, path, f.Detail)
+	}
+	if !strings.Contains(f.Detail, strconv.Quote(serving.Username)) {
+		t.Errorf("detail %q does not name %q, the account the unit runs the server as",
+			f.Detail, serving.Username)
+	}
+	if strings.Contains(f.Detail, strconv.Quote(masked.Username)) {
+		t.Errorf("detail %q names %q, which systemd never reads: its drop-in is masked by the /etc "+
+			"file of the same name", f.Detail, masked.Username)
+	}
+	if !strings.Contains(f.Remediation, "chown root:") {
+		t.Errorf("remediation %q carries no command to run", f.Remediation)
+	}
+}
+
+// twoDoctorAccounts names two accounts this process is not, with distinct
+// groups: one the unit runs the server as, one a masked drop-in names.
+func twoDoctorAccounts(t *testing.T) (serving, masked *user.User) {
+	t.Helper()
+	var found []*user.User
+	for _, name := range []string{"daemon", "bin", "www", "games", "sys", "nobody"} {
+		u, err := user.Lookup(name)
+		if err != nil {
+			continue
+		}
+		uid, err := strconv.Atoi(u.Uid)
+		if err != nil || uid == os.Getuid() {
+			continue
+		}
+		if len(found) == 1 && u.Gid == found[0].Gid {
+			continue
+		}
+		if found = append(found, u); len(found) == 2 {
+			return found[0], found[1]
+		}
+	}
+	t.Skip("this host has fewer than two accounts to model a masked drop-in with")
+	return nil, nil
+}
+
+func writeUnitFile(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func swapDoctorUnitDirs(t *testing.T, dirs ...string) {
+	t.Helper()
+	prev := audit.UnitSearchDirs
+	audit.UnitSearchDirs = dirs
+	t.Cleanup(func() { audit.UnitSearchDirs = prev })
 }
 
 // serviceAccount is an identity this process is not: it owns nothing in a
