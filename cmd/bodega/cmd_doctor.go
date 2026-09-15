@@ -8,8 +8,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -117,7 +119,7 @@ See docs/THREAT_MODEL.md for the rationale behind each check.`,
 				findings = append(findings, fn())
 			}
 			findings = append(findings, serverPostureFindings(backgroundCtx(), gf)...)
-			findings = append(findings, retiredConfigKeys(gf))
+			findings = append(findings, retiredConfigKeys(gf), pepperPosture())
 
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 			fmt.Fprintln(w, "CHECK\tSTATUS\tDETAIL")
@@ -409,6 +411,111 @@ func retiredConfigKeys(gf *globalFlags) host.Finding {
 	f.Detail = "retired keys still in " + config.ConfigPath() + ": " + strings.Join(found, "; ")
 	f.Remediation = "delete them; they are preserved on every save and read by nothing"
 	return f
+}
+
+// pepperPosture reports a pepper the account running the server cannot read.
+//
+// doctor is normally run as root, which can read every pepper on the box, so
+// this models readability from ownership rather than attempting the read.
+// bodega never learns the service account's name — it lives in the unit file
+// — so the reference is the config file beside the pepper: whatever systemd
+// hands that file to is what runs the server, and the same rule decides the
+// posture a new pepper is written with.
+func pepperPosture() host.Finding {
+	f := host.Finding{Check: "pepper", Status: host.StatusOK}
+
+	st, _ := audit.ResolvePepper(audit.DefaultPepperPaths)
+	if st.Path == "" {
+		f.Status = host.StatusNA
+		f.Detail = "no pepper on this host; the first `bodega token generate` writes one"
+		return f
+	}
+
+	ref := filepath.Join(filepath.Dir(st.Path), audit.PepperConfigSibling)
+	want, err := readersOf(ref)
+	if err != nil {
+		f.Status = host.StatusNA
+		f.Detail = "no " + ref + " to compare " + st.Path + " against: " + err.Error()
+		return f
+	}
+	got, err := readersOf(st.Path)
+	if err != nil {
+		f.Status = host.StatusWarn
+		f.Detail = "could not inspect " + st.Path + ": " + err.Error()
+		f.Remediation = "check the pepper exists and this account can stat it"
+		return f
+	}
+
+	if got.covers(want) {
+		f.Detail = st.Path + " is readable by the account that reads " + ref
+		return f
+	}
+
+	f.Status = host.StatusFail
+	f.Detail = fmt.Sprintf("%s is %s and %s is %s: the account running the server cannot read the pepper, "+
+		"so every token minted here is refused with \"invalid token\"", st.Path, got, ref, want)
+	f.Remediation = fmt.Sprintf("sudo chown :%d %s && sudo chmod 0640 %s", want.gid, st.Path, st.Path)
+	return f
+}
+
+// fileReaders is the set of accounts a file's mode and ownership grant read to.
+type fileReaders struct {
+	uid, gid            uint32
+	owner, group, world bool
+}
+
+func (r fileReaders) String() string {
+	return fmt.Sprintf("uid %d gid %d mode %04o", r.uid, r.gid, r.perm())
+}
+
+func (r fileReaders) perm() uint32 {
+	var m uint32
+	for _, b := range []struct {
+		set bool
+		bit uint32
+	}{{r.owner, 0o400}, {r.group, 0o040}, {r.world, 0o004}} {
+		if b.set {
+			m |= b.bit
+		}
+	}
+	return m
+}
+
+// covers reports whether r grants read to everyone want grants it to.
+//
+// The two axes are kept apart because group membership is not knowable from
+// a stat: a uid that reads the reference as its owner may or may not be in the
+// pepper's group, and claiming it is would turn a real finding into an OK.
+func (r fileReaders) covers(want fileReaders) bool {
+	if r.world {
+		return true
+	}
+	if want.owner && !(r.owner && r.uid == want.uid) {
+		return false
+	}
+	if want.group && !(r.group && r.gid == want.gid) {
+		return false
+	}
+	return true
+}
+
+func readersOf(path string) (fileReaders, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fileReaders{}, err
+	}
+	sys, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fileReaders{}, fmt.Errorf("%s: this platform reports no file ownership", path)
+	}
+	m := fi.Mode().Perm()
+	return fileReaders{
+		uid:   sys.Uid,
+		gid:   sys.Gid,
+		owner: m&0o400 != 0,
+		group: m&0o040 != 0,
+		world: m&0o004 != 0,
+	}, nil
 }
 
 // isZeroJSON reports whether a raw value is the zero of its own shape, which

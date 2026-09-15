@@ -332,3 +332,63 @@ func tableExists(t *testing.T, path, name string) bool {
 	}
 	return n > 0
 }
+
+// TestFileReadersCovers pins the comparison behind the pepper check. Getting
+// it wrong in the permissive direction turns a real finding into an OK, which
+// is the failure shape the check exists to catch.
+func TestFileReadersCovers(t *testing.T) {
+	const (
+		root   = 0
+		svcGid = 999
+	)
+	cases := []struct {
+		name  string
+		got   fileReaders // the pepper
+		want  fileReaders // the config file beside it
+		cover bool
+	}{
+		{
+			name:  "pepper root:root 0600 against config root:bodega 0640",
+			got:   fileReaders{uid: root, gid: root, owner: true},
+			want:  fileReaders{uid: root, gid: svcGid, owner: true, group: true},
+			cover: false,
+		},
+		{
+			name:  "both root:bodega 0640",
+			got:   fileReaders{uid: root, gid: svcGid, owner: true, group: true},
+			want:  fileReaders{uid: root, gid: svcGid, owner: true, group: true},
+			cover: true,
+		},
+		{
+			name:  "pepper carries a different group",
+			got:   fileReaders{uid: root, gid: 42, owner: true, group: true},
+			want:  fileReaders{uid: root, gid: svcGid, owner: true, group: true},
+			cover: false,
+		},
+		{
+			name:  "pepper owned by another account",
+			got:   fileReaders{uid: 1000, gid: svcGid, owner: true, group: true},
+			want:  fileReaders{uid: root, gid: svcGid, owner: true, group: true},
+			cover: false,
+		},
+		{
+			name:  "config never went through the ownership pass either",
+			got:   fileReaders{uid: root, gid: root, owner: true},
+			want:  fileReaders{uid: root, gid: root, owner: true},
+			cover: true,
+		},
+		{
+			name:  "a world-readable pepper covers everything",
+			got:   fileReaders{uid: root, gid: root, owner: true, world: true},
+			want:  fileReaders{uid: root, gid: svcGid, owner: true, group: true},
+			cover: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.got.covers(tc.want); got != tc.cover {
+				t.Fatalf("covers() = %v, want %v (pepper %s, config %s)", got, tc.cover, tc.got, tc.want)
+			}
+		})
+	}
+}

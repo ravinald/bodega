@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -76,6 +77,7 @@ type Server struct {
 	adminNets     []*net.IPNet // CIDRs allowed to reach the admin surface (admin_permit_cidr)
 	adminErr      error        // set when admin_permit_cidr parses to nothing; Start refuses on it
 	auditErr      error        // set when the configured audit sink will not record; Start refuses on it
+	pepperErr     error        // set when the pepper in force is unreadable; Start refuses on it
 	spool         *spoolLimiter
 	spoolErr      error // set when spool_dir cannot be created or written; Start refuses on it
 	// trustedNets are the proxies whose forwarded headers are believed.
@@ -236,18 +238,25 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 			logger.Info("trusted proxies loaded", "entries", len(nets))
 		}
 	}
-	// Load or create pepper for token auth.
-	pepperExisted := false
-	if _, err := audit.LoadPepper(audit.DefaultPepperPaths); err == nil {
-		pepperExisted = true
-	}
-	if pepper, err := audit.LoadOrCreatePepper(audit.DefaultPepperPaths); err == nil {
-		s.pepper = pepper
-		if !pepperExisted {
-			logger.Info("pepper file created (first run)")
+	// Load or create pepper for token auth. An unreadable pepper is held for
+	// Start to refuse on rather than worked around: the server would otherwise
+	// hash against a second pepper while the admin mints against the first,
+	// and the only symptom is a 401 naming the credential.
+	pst, err := audit.LoadOrCreatePepper(audit.DefaultPepperPaths)
+	switch {
+	case err == nil:
+		s.pepper = pst.Pepper
+		if pst.Created {
+			logger.Info("pepper file created (first run)", "path", pst.Path)
 		}
-	} else {
+	case errors.As(err, new(*audit.PepperUnreadableError)):
+		s.pepperErr = err
+	default:
 		logger.Error("could not load or create pepper file — token auth will not work", "error", err)
+	}
+	for _, p := range pst.Shadowed {
+		logger.Error("a second pepper is present and ignored; tokens minted against it are refused until it becomes the one in force",
+			"in_force", pst.Path, "ignored", p)
 	}
 	// Open the audit store and attach the configured sink. Held for Start to
 	// refuse on, not logged and continued: a proxy that cannot record who it
@@ -486,6 +495,10 @@ func (s *Server) Start(ctx context.Context) error {
 
 	if s.auditErr != nil {
 		return s.auditErr
+	}
+
+	if s.pepperErr != nil {
+		return s.pepperErr
 	}
 
 	if s.spoolErr != nil {

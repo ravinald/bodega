@@ -67,9 +67,14 @@ Examples:
 			defer adb.Close()
 
 			// Load or create pepper.
-			pepper, err := audit.LoadOrCreatePepper(audit.DefaultPepperPaths)
+			pst, err := audit.LoadOrCreatePepper(audit.DefaultPepperPaths)
 			if err != nil {
 				return fmt.Errorf("pepper: %w", err)
+			}
+			pepper := pst.Pepper
+			for _, p := range pst.Shadowed {
+				fmt.Fprintf(os.Stderr, "warning: a second pepper at %s is ignored. This token is keyed on %s, "+
+					"and a server reading %s will refuse it.\n", p, pst.Path, p)
 			}
 
 			// Generate random token.

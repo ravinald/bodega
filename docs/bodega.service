@@ -33,6 +33,22 @@
 # Mode 0640 root:bodega is the config's resting state: the running server only
 # reads it, and the commands that edit it still want root.
 #
+# /etc/bodega/pepper is the third file this pass covers and the one that arrives
+# late. `bodega token generate` writes it, after the chowns above have run, and
+# every API token is hashed against it. A new pepper takes its group and mode
+# 0640 from the config.json beside it, so a config already at root:bodega hands
+# the pepper over in advance. Mint with config.json still root:root and the
+# pepper lands root:root too, and the service refuses to start on
+#
+#   Error: pepper /etc/bodega/pepper exists and this process (uid 999) cannot
+#   read it: every token minted against it is refused with "invalid token",
+#   which names the credential rather than this file.
+#
+# It refuses rather than reaching for the pepper under its own home, which is
+# how the same install used to answer 401 to every token the admin minted with
+# nothing in the journal naming a file. `bodega doctor` reports the same
+# mismatch with the chown to run.
+#
 # Recommended config.json additions when running under systemd:
 #
 #   "log_level": 1   (Warn: quiet by default, noisy on trouble;
