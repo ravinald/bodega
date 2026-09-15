@@ -190,13 +190,23 @@ func FetchNpm(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 			} else {
 				result.Artifacts = append(result.Artifacts, dest)
 
-				// Checksum verification — skipped for floating dist-tags since the
-				// resolved version (and therefore the hash) changes upstream over time.
 				computed, err := computeFileSHA256(dest)
 				if err != nil {
 					_, _ = fmt.Fprintf(out, "  [npm] %s: WARNING: could not compute checksum: %v\n", name, err)
 				} else if distTag != "" {
-					_, _ = fmt.Fprintf(out, "  [npm] %s@%s: checksum recorded for this fetch only (dist-tag %q is floating, sha256:%s...)\n", pm.Name, fetchVe.Version, distTag, computed[:12])
+					// A floating dist-tag cannot carry a digest on its manifest
+					// entry: the entry stays on the tag, so a value written there
+					// would refuse the next legitimate release as a mismatch. The
+					// pin goes on the resolved version's own object key instead,
+					// which is the key the server serves those bytes under. Every
+					// concrete version the tag has resolved to is on record, and a
+					// later resolution to the same version is checked against it.
+					if e := cfg.pinChecksum(ctx, pm, fetchVe, newSHA256Checksum(computed)); e != nil {
+						_, _ = fmt.Fprintf(out, "  [npm] %s: CHECKSUM REFUSED: %v\n", name, e)
+						result.Err = fmt.Errorf("checksum verification failed: %w", e)
+					} else {
+						_, _ = fmt.Fprintf(out, "  [npm] %s@%s: checksum pinned to the resolved version (dist-tag %q is floating, sha256:%s...)\n", pm.Name, fetchVe.Version, distTag, computed[:12])
+					}
 				} else if ve.Checksum != nil {
 					if err := verifyChecksum(ve.Checksum, computed); err != nil {
 						_, _ = fmt.Fprintf(out, "  [npm] %s: CHECKSUM MISMATCH: %v\n", name, err)

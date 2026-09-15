@@ -17,7 +17,8 @@ risk:
   by registry type (package name for pypi/npm/cargo, prefix for gomod/git,
   hostname for apt). A request for `reqeusts` does not match an allow rule for
   `requests`, and the fetch is rejected before any bytes leave the network.
-- **Silent version drift.** Manifest entries pin a concrete version. The first
+- **Silent version drift.** Manifest entries pin a concrete version, an npm
+  dist-tag being the exception named below. The first
   fetch records that version's SHA-256 in the audit database, keyed by the
   object key the server serves it under, and a later fetch producing different
   bytes is refused rather than stored. Both halves of the pipeline write that
@@ -34,8 +35,18 @@ risk:
   time, so there are no upstream bytes for a digest to attest to, and `git
   bundle create` is not reproducible byte-for-byte — a pin would fail the next
   repackage rather than catch anything. A git entry fetched as a release
-  tarball is covered normally. Nothing else is exempt: binary, apt, gomod,
-  helm, npm and cargo all pin.
+  tarball is covered normally.
+
+  An **npm dist-tag** (`latest`, or an entry left without a version) pins per
+  resolved version rather than per manifest entry. The tag is meant to move, so
+  a digest written onto the entry would refuse the next legitimate release; the
+  digest goes on the resolved version's own object key instead. Every concrete
+  version the tag has ever resolved to is on record and shows as its own row in
+  `bodega pkg checksum list`, and a later resolution to one of them is refused
+  if the bytes changed. The tag advancing to a new release is not a mismatch;
+  an existing version being republished under it is.
+
+  Nothing else is exempt: binary, apt, gomod, helm, npm and cargo all pin.
 - **A malicious release inside its own withdrawal window.** A fresh install is
   seeded with a minimum publish age of `7d` on `npm` and `pypi`, action `warn`,
   and `bodega serve` names it at startup. The npm and PyPI campaigns of
