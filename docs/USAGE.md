@@ -41,6 +41,34 @@ bodega build fetch git             # fetch git sources only
 bodega build fetch git netbox      # fetch only netbox
 ```
 
+#### How a pypi version is resolved
+
+A pypi fetch writes no wheels. It resolves each manifest entry to one concrete version and records it in `<build-root>/combined-requirements.txt`, which `build run` then hands to `pip wheel -r`. Resolution happens here, at fetch, rather than in pip: a bare requirement line means "newest that satisfies the closure", and pip has no notion of an approved version to weigh that against.
+
+Every entry resolves against the distribution's release list on the index, read from `ve.url` when the entry names one and `https://pypi.org` otherwise. What each `version_constraint` resolves to:
+
+| `version_constraint` | Resolves to |
+|----------------------|-------------|
+| `exact`, or absent | The version named. Fails when the index does not offer it. |
+| `patch` | The newest release sharing the named version's major.minor. |
+| `compatible` | The newest release sharing the named version's major. |
+| `any` | The newest release the index offers. This is how to say "latest". |
+
+An entry whose `version` is empty or `*` resolves to nothing and keeps a bare, unpinned requirement line, whatever its constraint says. That is the shape an auto-imported dependency arrives in, and pinning it would over-constrain a closure the base `-r` requirements already decide.
+
+A version that resolves to nothing fails the whole fetch, names the entry, the version asked for and what the index offered, and writes no requirements file at all:
+
+```text
+pypi six: version_constraint "exact" on 1.99.0 resolves to nothing; the index at https://pypi.org offers 1.13.0, 1.14.0, 1.15.0, 1.16.0, 1.17.0 (34 versions in all)
+```
+
+A partial file would build cleanly and store a closure nobody approved, so there is no half-written one to find.
+
+#### Gaps
+
+- **Transitive dependencies are pip's to resolve.** Only the versions the manifest names are pinned. The wheels pip pulls in behind them are whatever the closure resolves to, and the manifest does not record them until `build package` scans the wheel metadata into `dep-graph.json`.
+- **The wheels directory is flat and nothing prunes it.** `pip wheel --wheel-dir` writes every build into one directory, so changing a pin leaves the previous version's wheel behind, and the generated simple index publishes whatever is in that directory. Clear it by hand when a pin moves.
+
 ### `bodega build run [TYPE...] [NAME]`
 
 Compiles or prepares sources. Auto-fetches if sources are not already present (stage cascading). Types without a build step (binary, gomod, helm, npm) are skipped for the build phase.
