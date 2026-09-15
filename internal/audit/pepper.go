@@ -11,18 +11,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 )
 
-// SystemPepperPath is the pepper a privileged command writes, beside the
-// system config file it shares a posture with.
+// SystemPepperPath is the pepper a privileged command writes, and the first
+// path the server looks for one at.
 const SystemPepperPath = "/etc/bodega/pepper"
-
-// PepperConfigSibling is the file a new pepper takes its group and mode from.
-// bodega never learns the name of the account it runs as under systemd, so
-// the posture is copied from the one file in the same directory the operator
-// has already been told to hand to that account.
-const PepperConfigSibling = "config.json"
 
 // DefaultPepperPaths is the search order for the pepper file.
 var DefaultPepperPaths = []string{
@@ -66,6 +59,37 @@ func (e *PepperUnreadableError) Error() string {
 }
 
 func (e *PepperUnreadableError) Unwrap() error { return e.Err }
+
+// PepperHandoffError reports a pepper this process wrote and could not hand to
+// the account the server runs as. Minting against it produces a token the
+// server refuses with "invalid token", which names the credential rather than
+// this file, so the mint fails here instead of printing one that validates
+// nothing.
+type PepperHandoffError struct {
+	Path     string
+	Identity ServiceIdentity
+	Blocker  string
+	Err      error
+}
+
+func (e *PepperHandoffError) Error() string {
+	blocker := e.Blocker
+	if blocker == "" {
+		blocker = e.Path
+	}
+	msg := fmt.Sprintf("pepper %s is not readable by %q, the account %s runs the server as",
+		e.Path, e.Identity.Name, e.Identity.Source)
+	if blocker != e.Path {
+		msg += fmt.Sprintf(" (%s refuses it)", blocker)
+	}
+	if e.Err != nil {
+		msg += ": " + e.Err.Error()
+	}
+	return msg + fmt.Sprintf(". Every token hashed against it would be refused with \"invalid token\". "+
+		"Hand it over with: chown root:%s %s && chmod 0640 %s", e.Identity.Group, e.Path, e.Path)
+}
+
+func (e *PepperHandoffError) Unwrap() error { return e.Err }
 
 // ResolvePepper walks the search order and reports what it found. The first
 // candidate that exists wins, readable or not.
@@ -136,38 +160,41 @@ func LoadOrCreatePepper(paths []string) (PepperState, error) {
 		if err := os.WriteFile(p, []byte(pepper+"\n"), 0o600); err != nil {
 			continue
 		}
-		adoptSiblingPosture(p)
-		return PepperState{Path: p, Pepper: pepper, Created: true}, nil
+		return PepperState{Path: p, Pepper: pepper, Created: true}, handToServiceAccount(p)
 	}
 
 	return PepperState{}, fmt.Errorf("could not write pepper to any path: %v", paths)
 }
 
-// adoptSiblingPosture gives a newly written pepper the group and mode of the
-// config file beside it, so an account that can read one can read the other.
+// handToServiceAccount gives a newly written pepper the group of the account
+// the server runs as, and mode 0640.
 //
-// `sudo bodega token generate` otherwise leaves /etc/bodega/pepper at 0600
-// root:root and the service, running as its own account, is refused by the
-// kernel. Group plus 0640 was chosen over the two alternatives: 0644 makes the
-// key behind every token hash readable by any shell on the box, and chowning
-// to a literal "bodega" hardcodes an account name nothing requires, failing
-// silently wherever the operator picked another.
+// Group over the two alternatives: 0644 puts the key behind every token hash
+// in reach of any shell on the box, and chowning the file to the service
+// account lets a compromised server rewrite the secret the whole host's tokens
+// are keyed on. Root keeps the write, the service group gets the read.
 //
-// Best effort by design. A pepper that cannot be handed over is still written,
-// and the startup refusal and `bodega doctor` both name it.
-func adoptSiblingPosture(path string) {
-	ref, err := os.Stat(filepath.Join(filepath.Dir(path), PepperConfigSibling))
-	if err != nil {
-		return
+// Only a privileged process can hand a file to another account, so the chown
+// is gated on euid and the result is verified either way. An unprivileged mint
+// that already lands readable is fine; one that does not is an error, because
+// the alternative is a token nothing will ever accept.
+func handToServiceAccount(path string) error {
+	id, err := ResolveServiceIdentity()
+	switch {
+	case errors.Is(err, ErrNoServiceAccount):
+		return nil
+	case err != nil:
+		return err
 	}
-	sys, ok := ref.Sys().(*syscall.Stat_t)
-	if !ok {
-		return
+	if os.Geteuid() == 0 {
+		if err := os.Chown(path, 0, id.GID); err != nil {
+			return &PepperHandoffError{Path: path, Identity: id, Err: err}
+		}
+		if err := os.Chmod(path, 0o640); err != nil {
+			return &PepperHandoffError{Path: path, Identity: id, Err: err}
+		}
 	}
-	if err := os.Chown(path, -1, int(sys.Gid)); err != nil {
-		return
-	}
-	_ = os.Chmod(path, 0o640)
+	return VerifyPepperHandoff(path)
 }
 
 // HashToken computes HMAC-SHA256(token, pepper) and returns the hex-encoded result.

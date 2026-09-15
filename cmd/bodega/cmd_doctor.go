@@ -3,15 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
-	"syscall"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -413,109 +412,61 @@ func retiredConfigKeys(gf *globalFlags) host.Finding {
 	return f
 }
 
-// pepperPosture reports a pepper the account running the server cannot read.
+// pepperPosture reports a pepper the account the server runs as cannot read.
 //
-// doctor is normally run as root, which can read every pepper on the box, so
-// this models readability from ownership rather than attempting the read.
-// bodega never learns the service account's name — it lives in the unit file
-// — so the reference is the config file beside the pepper: whatever systemd
-// hands that file to is what runs the server, and the same rule decides the
-// posture a new pepper is written with.
+// doctor normally runs as root, which reads every file on the box, so the
+// question is not whether this process can open it. The account comes from the
+// systemd unit's User= (or BODEGA_SERVICE_USER), and the test is that
+// account's uid and group memberships against the pepper's mode and every
+// directory above it.
 func pepperPosture() host.Finding {
-	f := host.Finding{Check: "pepper", Status: host.StatusOK}
-
 	st, _ := audit.ResolvePepper(audit.DefaultPepperPaths)
+	id, err := audit.ResolveServiceIdentity()
+	return pepperFinding(st, id, err)
+}
+
+func pepperFinding(st audit.PepperState, id audit.ServiceIdentity, idErr error) host.Finding {
+	f := host.Finding{Check: "pepper", Status: host.StatusOK}
 	if st.Path == "" {
 		f.Status = host.StatusNA
 		f.Detail = "no pepper on this host; the first `bodega token generate` writes one"
 		return f
 	}
-
-	ref := filepath.Join(filepath.Dir(st.Path), audit.PepperConfigSibling)
-	want, err := readersOf(ref)
-	if err != nil {
+	switch {
+	case errors.Is(idErr, audit.ErrNoServiceAccount):
 		f.Status = host.StatusNA
-		f.Detail = "no " + ref + " to compare " + st.Path + " against: " + err.Error()
+		f.Detail = st.Path + " is in force, and this host names no service account (no systemd unit with " +
+			"User=, no " + audit.ServiceUserEnv + "): whoever writes the pepper is whoever reads it"
+		return f
+	case idErr != nil:
+		f.Status = host.StatusFail
+		f.Detail = "cannot tell which account serves " + st.Path + ": " + idErr.Error()
+		f.Remediation = "create the account the unit names, or set " + audit.ServiceUserEnv
 		return f
 	}
-	got, err := readersOf(st.Path)
-	if err != nil {
+
+	ok, blocker, err := id.CanRead(st.Path)
+	switch {
+	case ok:
+		f.Detail = fmt.Sprintf("%s is readable by %q, the account %s runs the server as", st.Path, id.Name, id.Source)
+		return f
+	case err != nil:
 		f.Status = host.StatusWarn
-		f.Detail = "could not inspect " + st.Path + ": " + err.Error()
+		f.Detail = "could not inspect " + blocker + ": " + err.Error()
 		f.Remediation = "check the pepper exists and this account can stat it"
 		return f
 	}
 
-	if got.covers(want) {
-		f.Detail = st.Path + " is readable by the account that reads " + ref
-		return f
-	}
-
 	f.Status = host.StatusFail
-	f.Detail = fmt.Sprintf("%s is %s and %s is %s: the account running the server cannot read the pepper, "+
-		"so every token minted here is refused with \"invalid token\"", st.Path, got, ref, want)
-	f.Remediation = fmt.Sprintf("sudo chown :%d %s && sudo chmod 0640 %s", want.gid, st.Path, st.Path)
+	f.Detail = fmt.Sprintf("%s refuses %q, the account %s runs the server as: every token minted on this host "+
+		"is answered with \"invalid token\", which names the credential rather than this file",
+		blocker, id.Name, id.Source)
+	if blocker == st.Path {
+		f.Remediation = fmt.Sprintf("sudo chown root:%s %s && sudo chmod 0640 %s", id.Group, st.Path, st.Path)
+	} else {
+		f.Remediation = fmt.Sprintf("sudo chgrp %s %s && sudo chmod 0750 %s", id.Group, blocker, blocker)
+	}
 	return f
-}
-
-// fileReaders is the set of accounts a file's mode and ownership grant read to.
-type fileReaders struct {
-	uid, gid            uint32
-	owner, group, world bool
-}
-
-func (r fileReaders) String() string {
-	return fmt.Sprintf("uid %d gid %d mode %04o", r.uid, r.gid, r.perm())
-}
-
-func (r fileReaders) perm() uint32 {
-	var m uint32
-	for _, b := range []struct {
-		set bool
-		bit uint32
-	}{{r.owner, 0o400}, {r.group, 0o040}, {r.world, 0o004}} {
-		if b.set {
-			m |= b.bit
-		}
-	}
-	return m
-}
-
-// covers reports whether r grants read to everyone want grants it to.
-//
-// The two axes are kept apart because group membership is not knowable from
-// a stat: a uid that reads the reference as its owner may or may not be in the
-// pepper's group, and claiming it is would turn a real finding into an OK.
-func (r fileReaders) covers(want fileReaders) bool {
-	if r.world {
-		return true
-	}
-	if want.owner && !(r.owner && r.uid == want.uid) {
-		return false
-	}
-	if want.group && !(r.group && r.gid == want.gid) {
-		return false
-	}
-	return true
-}
-
-func readersOf(path string) (fileReaders, error) {
-	fi, err := os.Stat(path)
-	if err != nil {
-		return fileReaders{}, err
-	}
-	sys, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return fileReaders{}, fmt.Errorf("%s: this platform reports no file ownership", path)
-	}
-	m := fi.Mode().Perm()
-	return fileReaders{
-		uid:   sys.Uid,
-		gid:   sys.Gid,
-		owner: m&0o400 != 0,
-		group: m&0o040 != 0,
-		world: m&0o004 != 0,
-	}, nil
 }
 
 // isZeroJSON reports whether a raw value is the zero of its own shape, which

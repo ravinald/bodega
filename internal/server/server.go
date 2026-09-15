@@ -251,6 +251,15 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 		}
 	case errors.As(err, new(*audit.PepperUnreadableError)):
 		s.pepperErr = err
+	case errors.As(err, new(*audit.PepperHandoffError)):
+		// This process wrote the pepper and can read it; what failed is the
+		// hand-off to the account the unit runs as. Refusing the start would
+		// take the repository down over a token path that works for whoever
+		// is serving now, so it is logged and `bodega token generate` is what
+		// refuses to mint against it.
+		s.pepper = pst.Pepper
+		logger.Error("pepper created but not handed to the service account; a token minted by another account will be refused",
+			"path", pst.Path, "error", err)
 	default:
 		logger.Error("could not load or create pepper file — token auth will not work", "error", err)
 	}

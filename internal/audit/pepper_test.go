@@ -3,8 +3,10 @@ package audit
 import (
 	"errors"
 	"os"
+	"os/user"
 	"path/filepath"
-	"syscall"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -20,16 +22,14 @@ func writePepper(t *testing.T, path, value string) {
 	}
 }
 
-// TestTokenMintedByPrivilegedProcessValidatesForServiceAccount is the whole of
-// QUICKSTART §12 in one function: root mints a token against the system
-// pepper, and the account the server runs as loads a pepper from the same
-// search order.
-//
-// The two accounts are modelled by readability, which is the only thing that
-// differs between them here. Falling through to the second pepper produces a
-// value that validates nothing and reports nothing, which is the defect: the
-// operator meets a 401 saying "invalid token" and re-mints into the same wall.
-func TestTokenMintedByPrivilegedProcessValidatesForServiceAccount(t *testing.T) {
+// TestUnreadablePepperRefusesRatherThanFallingThrough pins requirement 2. The
+// two-account validation is TestTokenMintedAsRootValidatesAgainstAnotherAccount
+// in cmd/bodega, which needs two real accounts; this one measures what the
+// serve side does when the pepper the token was minted against is closed to
+// it. Falling through to the second pepper produces a value that validates
+// nothing and reports nothing: the operator meets a 401 saying "invalid token"
+// and re-mints into the same wall.
+func TestUnreadablePepperRefusesRatherThanFallingThrough(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root reads every file, so the two-account split cannot be modelled in-process")
 	}
@@ -75,41 +75,128 @@ func TestTokenMintedByPrivilegedProcessValidatesForServiceAccount(t *testing.T) 
 	}
 }
 
-// TestCreatedPepperAdoptsConfigPosture pins requirement 1: a pepper a
-// privileged command writes is readable by the account that reads the config
-// file beside it, and by nobody wider.
-func TestCreatedPepperAdoptsConfigPosture(t *testing.T) {
-	dir := t.TempDir()
+// TestCreatedPepperIsHandedToTheServiceAccount pins requirement 1 as the
+// contract it is, which holds at either privilege level: when
+// LoadOrCreatePepper returns nil the service account can read what it wrote,
+// and when it cannot the call is an error rather than a pepper every future
+// token dies against.
+//
+// Unprivileged, the chown is not available and the error is the outcome; as
+// root the chown lands and readability is. The shipped tree returns nil in
+// both cases, having copied config.json's gid without ever asking whether the
+// service account could read the result.
+func TestCreatedPepperIsHandedToTheServiceAccount(t *testing.T) {
+	dir := worldTraversableDir(t)
 	path := filepath.Join(dir, "pepper")
-	cfg := filepath.Join(dir, PepperConfigSibling)
-	if err := os.WriteFile(cfg, []byte("{}\n"), 0o640); err != nil {
-		t.Fatalf("write %s: %v", cfg, err)
+	t.Setenv(ServiceUserEnv, secondAccount(t))
+
+	st, err := LoadOrCreatePepper([]string{path})
+	if st.Path != path || !st.Created {
+		t.Fatalf("created=%v path=%s, want true and %s", st.Created, st.Path, path)
+	}
+	id, idErr := ResolveServiceIdentity()
+	if idErr != nil {
+		t.Fatalf("resolve service identity: %v", idErr)
+	}
+	readable, blocker, canErr := id.CanRead(path)
+	if canErr != nil {
+		t.Fatalf("CanRead(%s): %v", path, canErr)
 	}
 
+	switch {
+	case readable && err != nil:
+		t.Fatalf("pepper is readable by %q and the mint still failed: %v", id.Name, err)
+	case readable:
+		if mode := modeOf(t, path); mode != 0o640 {
+			t.Errorf("pepper mode %04o, want 0640: 0644 puts the key behind every token hash on the box "+
+				"in reach of any shell", mode)
+		}
+	case err == nil:
+		t.Fatalf("%s refuses %q and LoadOrCreatePepper returned nil: every token minted against it "+
+			"would be answered \"invalid token\"", blocker, id.Name)
+	default:
+		var handoff *PepperHandoffError
+		if !errors.As(err, &handoff) {
+			t.Fatalf("err = %v, want a *PepperHandoffError naming %s", err, path)
+		}
+		if handoff.Path != path || handoff.Identity.Name != id.Name {
+			t.Errorf("handoff names %s/%q, want %s/%q", handoff.Path, handoff.Identity.Name, path, id.Name)
+		}
+	}
+}
+
+// A pepper written before this check existed reaches `token generate` through
+// the load path, not the create path, so the mint verifies what it loaded too.
+// This is the state an upgrade lands in: /etc/bodega/pepper already on disk,
+// 0600 root:root, and the tokens keyed on it already dead.
+func TestVerifyPepperHandoffCatchesAPepperItDidNotWrite(t *testing.T) {
+	dir := worldTraversableDir(t)
+	path := filepath.Join(dir, "pepper")
+	writePepper(t, path, "5ca1ab1e")
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Setenv(ServiceUserEnv, secondAccount(t))
+
+	if os.Geteuid() == 0 {
+		// Root owns it and root reads everything, so the file has to be
+		// handed to a third party for the refusal to be about the account.
+		if err := os.Chown(path, 0, 0); err != nil {
+			t.Fatalf("chown: %v", err)
+		}
+	}
+	err := VerifyPepperHandoff(path)
+	var handoff *PepperHandoffError
+	if !errors.As(err, &handoff) {
+		t.Fatalf("err = %v, want a *PepperHandoffError: a 0600 pepper is readable by its owner alone", err)
+	}
+	if !strings.Contains(handoff.Error(), "chown root:") {
+		t.Errorf("error %q carries no command to run", handoff.Error())
+	}
+}
+
+// A host with no unit and no environment override runs the server as whoever
+// ran the command. There is no second account to hand anything to, and a
+// refusal there would break every single-account install.
+func TestPepperHandoffIsSilentWithNoServiceAccount(t *testing.T) {
+	dir := worldTraversableDir(t)
+	swapUnitDirs(t, filepath.Join(dir, "no-systemd-here"))
+
+	path := filepath.Join(dir, "pepper")
 	st, err := LoadOrCreatePepper([]string{path})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if !st.Created || st.Path != path {
-		t.Fatalf("created=%v path=%s, want true and %s", st.Created, st.Path, path)
+	if mode := modeOf(t, st.Path); mode != 0o600 {
+		t.Errorf("pepper mode %04o, want 0600: nothing on this host needs it wider", mode)
 	}
+}
 
+// secondAccount names an account this process is not. Every case that needs
+// one needs it to exist, because ResolveServiceIdentity refuses a name the
+// host cannot look up.
+func secondAccount(t *testing.T) string {
+	t.Helper()
+	for _, name := range []string{"nobody", "daemon", "bin", "games"} {
+		u, err := user.Lookup(name)
+		if err != nil {
+			continue
+		}
+		if uid, err := strconv.Atoi(u.Uid); err == nil && uid != os.Getuid() {
+			return name
+		}
+	}
+	t.Skip("this host has no second account to hand a pepper to")
+	return ""
+}
+
+func modeOf(t *testing.T, path string) os.FileMode {
+	t.Helper()
 	fi, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("stat %s: %v", path, err)
 	}
-	if got := fi.Mode().Perm(); got != 0o640 {
-		t.Fatalf("pepper mode %04o, want 0640: the group that reads the config cannot read it", got)
-	}
-	ref, err := os.Stat(cfg)
-	if err != nil {
-		t.Fatalf("stat %s: %v", cfg, err)
-	}
-	pepperGid := fi.Sys().(*syscall.Stat_t).Gid
-	refGid := ref.Sys().(*syscall.Stat_t).Gid
-	if pepperGid != refGid {
-		t.Fatalf("pepper gid %d, config gid %d: the pepper does not follow the config's group", pepperGid, refGid)
-	}
+	return fi.Mode().Perm()
 }
 
 // TestSecondPepperIsReportedNotPreferred pins requirement 3: the first path

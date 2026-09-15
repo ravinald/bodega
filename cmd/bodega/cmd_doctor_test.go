@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/ravinald/bodega/internal/audit"
@@ -333,62 +335,116 @@ func tableExists(t *testing.T, path, name string) bool {
 	return n > 0
 }
 
-// TestFileReadersCovers pins the comparison behind the pepper check. Getting
-// it wrong in the permissive direction turns a real finding into an OK, which
-// is the failure shape the check exists to catch.
-func TestFileReadersCovers(t *testing.T) {
-	const (
-		root   = 0
-		svcGid = 999
-	)
-	cases := []struct {
-		name  string
-		got   fileReaders // the pepper
-		want  fileReaders // the config file beside it
-		cover bool
-	}{
-		{
-			name:  "pepper root:root 0600 against config root:bodega 0640",
-			got:   fileReaders{uid: root, gid: root, owner: true},
-			want:  fileReaders{uid: root, gid: svcGid, owner: true, group: true},
-			cover: false,
-		},
-		{
-			name:  "both root:bodega 0640",
-			got:   fileReaders{uid: root, gid: svcGid, owner: true, group: true},
-			want:  fileReaders{uid: root, gid: svcGid, owner: true, group: true},
-			cover: true,
-		},
-		{
-			name:  "pepper carries a different group",
-			got:   fileReaders{uid: root, gid: 42, owner: true, group: true},
-			want:  fileReaders{uid: root, gid: svcGid, owner: true, group: true},
-			cover: false,
-		},
-		{
-			name:  "pepper owned by another account",
-			got:   fileReaders{uid: 1000, gid: svcGid, owner: true, group: true},
-			want:  fileReaders{uid: root, gid: svcGid, owner: true, group: true},
-			cover: false,
-		},
-		{
-			name:  "config never went through the ownership pass either",
-			got:   fileReaders{uid: root, gid: root, owner: true},
-			want:  fileReaders{uid: root, gid: root, owner: true},
-			cover: true,
-		},
-		{
-			name:  "a world-readable pepper covers everything",
-			got:   fileReaders{uid: root, gid: root, owner: true, world: true},
-			want:  fileReaders{uid: root, gid: svcGid, owner: true, group: true},
-			cover: true,
-		},
+// The reproduction the review sent back. The shipped check compared the
+// pepper's grants to config.json's and called them equal: both root:root, both
+// granting owner and group. What it never asked is which triple the service
+// account actually reads through — the config at 0644 hands it over on the
+// other bit, and the pepper at 0640 has none.
+func TestDoctorReportsAPepperTheServiceAccountCannotRead(t *testing.T) {
+	dir := pepperTree(t, 0o644, 0o640)
+	f := pepperFinding(audit.PepperState{Path: filepath.Join(dir, "pepper")}, serviceAccount, nil)
+
+	if f.Status != host.StatusFail {
+		t.Fatalf("a 0640 root:root pepper beside a 0644 root:root config reported %s: %s", f.Status, f.Detail)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := tc.got.covers(tc.want); got != tc.cover {
-				t.Fatalf("covers() = %v, want %v (pepper %s, config %s)", got, tc.cover, tc.got, tc.want)
-			}
-		})
+	for _, want := range []string{"pepper", serviceAccount.Name} {
+		if !strings.Contains(f.Detail, want) {
+			t.Errorf("detail %q does not name %q", f.Detail, want)
+		}
 	}
+	if !strings.Contains(f.Remediation, "chown root:"+serviceAccount.Group) {
+		t.Errorf("remediation %q does not carry the chown to run", f.Remediation)
+	}
+}
+
+// The OK side has to be readability, not a matching pair of grants: a check
+// that only ever fails is as useless as one that only ever passes.
+func TestDoctorAcceptsAPepperTheServiceAccountReads(t *testing.T) {
+	dir := pepperTree(t, 0o644, 0o640)
+	path := filepath.Join(dir, "pepper")
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	id := serviceAccount
+	id.GID = int(fi.Sys().(*syscall.Stat_t).Gid)
+	id.GIDs = []int{id.GID}
+
+	if f := pepperFinding(audit.PepperState{Path: path}, id, nil); f.IsFinding() {
+		t.Fatalf("a pepper whose group the service account is in reported %s: %s", f.Status, f.Detail)
+	}
+}
+
+// A directory the service account cannot enter withholds a pepper whose own
+// mode hands it over, and the chown goes on the directory. Naming the file
+// there sends the operator to chown something already correct.
+func TestDoctorNamesTheDirectoryThatWithholdsThePepper(t *testing.T) {
+	dir := pepperTree(t, 0o644, 0o644)
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	f := pepperFinding(audit.PepperState{Path: filepath.Join(dir, "pepper")}, serviceAccount, nil)
+
+	if f.Status != host.StatusFail {
+		t.Fatalf("a pepper inside a 0700 directory reported %s: %s", f.Status, f.Detail)
+	}
+	if !strings.Contains(f.Detail, dir) || !strings.Contains(f.Remediation, dir) {
+		t.Errorf("detail %q / remediation %q do not name the directory %q", f.Detail, f.Remediation, dir)
+	}
+}
+
+// A host running the server as whoever invoked it has no second account to
+// check against, and a FAIL there would fire on every developer laptop.
+func TestDoctorSkipsThePepperWithNoServiceAccount(t *testing.T) {
+	f := pepperFinding(audit.PepperState{Path: "/etc/bodega/pepper"}, audit.ServiceIdentity{}, audit.ErrNoServiceAccount)
+	if f.Status != host.StatusNA {
+		t.Fatalf("status %s on a host with no service account, want N/A: %s", f.Status, f.Detail)
+	}
+}
+
+// The unit names an account that does not exist. The service cannot start
+// either, so reporting "nothing to check" would send the operator to the
+// pepper instead of to useradd.
+func TestDoctorReportsAnAccountTheHostDoesNotHave(t *testing.T) {
+	f := pepperFinding(audit.PepperState{Path: "/etc/bodega/pepper"}, audit.ServiceIdentity{},
+		errors.New("/etc/systemd/system/bodega.service runs the server as \"bodega\" and this host has no such account"))
+	if f.Status != host.StatusFail {
+		t.Fatalf("status %s, want FAIL: %s", f.Status, f.Detail)
+	}
+	if !strings.Contains(f.Detail, "bodega.service") {
+		t.Errorf("detail %q does not name where the account was declared", f.Detail)
+	}
+}
+
+// serviceAccount is an identity this process is not: it owns nothing in a
+// tree the test just built and belongs to none of its groups, which is the
+// service account's position relative to a file root wrote.
+var serviceAccount = audit.ServiceIdentity{
+	Name: "bodega", Group: "bodega",
+	UID: 4242, GID: 4242, GIDs: []int{4242},
+	Source: "/etc/systemd/system/bodega.service",
+}
+
+// pepperTree builds /etc/bodega as the reproduction describes it, under a
+// directory every uid can walk into: t.TempDir() sits at 0700 and would refuse
+// the identity before the file under test got a say.
+func pepperTree(t *testing.T, configMode, pepperMode os.FileMode) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "bodega-doctor")
+	if err != nil {
+		t.Fatalf("mkdtemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatalf("chmod %s: %v", dir, err)
+	}
+	for name, mode := range map[string]os.FileMode{"config.json": configMode, "pepper": pepperMode} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x\n"), mode); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		if err := os.Chmod(filepath.Join(dir, name), mode); err != nil {
+			t.Fatalf("chmod %s: %v", name, err)
+		}
+	}
+	return dir
 }

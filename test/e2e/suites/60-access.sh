@@ -104,9 +104,9 @@ check_ne ACC-05 "widening past loopback is refused while no token exists" \
 # what creates it. Run as root it used to land 0600 root:root, which the
 # service account cannot read: the server fell back to the pepper under its own
 # XDG path and answered 401 "invalid token" to every token the admin minted,
-# naming the credential rather than the file. A new pepper now takes its group
-# and mode 0640 from the config.json beside it, which the install has already
-# put at root:$E2E_SERVICE_USER.
+# naming the credential rather than the file. A new pepper now lands
+# root:$E2E_SERVICE_USER mode 0640, with the account read from User= in the
+# installed unit rather than guessed at from a neighbouring file's ownership.
 #
 # Removed and re-created rather than inspected where it lies: reading whatever
 # is on disk measures the last thing that touched it, and this check exists to
@@ -127,7 +127,7 @@ else
 	pepper_readable="$E2E_OUT"
 	[ "$pepper_readable" = readable ] || pepper_readable="$pepper_readable ($pepper_state)"
 	check_eq ACC-06b "the service user can read the pepper token generate wrote" \
-		"readable" "$pepper_readable" "internal/audit/pepper.go:158" \
+		"readable" "$pepper_readable" "internal/audit/service_account.go:120" \
 		"rm /etc/bodega/pepper; sudo bodega token generate; sudo -u ${E2E_SERVICE_USER:-bodega} test -r /etc/bodega/pepper"
 fi
 e2e_bodega server "token revoke e2e-pepper-probe" >/dev/null 2>&1 || true

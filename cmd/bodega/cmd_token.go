@@ -71,6 +71,13 @@ Examples:
 			if err != nil {
 				return fmt.Errorf("pepper: %w", err)
 			}
+			// The mint aborts rather than keying a token on a pepper the
+			// server cannot open. A pepper written before this check existed
+			// reaches here readable by root alone, and root is not who
+			// validates the token.
+			if err := audit.VerifyPepperHandoff(pst.Path); err != nil {
+				return err
+			}
 			pepper := pst.Pepper
 			for _, p := range pst.Shadowed {
 				fmt.Fprintf(os.Stderr, "warning: a second pepper at %s is ignored. This token is keyed on %s, "+
