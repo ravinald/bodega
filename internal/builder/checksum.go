@@ -216,11 +216,17 @@ func (c *Config) fetchedArtifact(typ, name string, ve manifest.VersionEntry) str
 		// no upstream bytes for a digest to attest to.
 		return ""
 	case manifest.TypeApt:
+		// The .deb under sources/ is what the fetch left and what the stage
+		// check calls fetched; the pool copy of the same bytes only exists
+		// once package has run. A source-build entry yields neither.
+		if deb := aptFetchedDeb(d, name, ve); deb != "" {
+			return deb
+		}
 		rel := ve.Metadata["_pool_path"]
 		if rel == "" {
 			return ""
 		}
-		return filepath.Join(d.aptRepo, rel)
+		return filepath.Join(d.aptRepo, filepath.FromSlash(rel))
 	}
 	return ""
 }

@@ -137,8 +137,12 @@ func (s *Store) SaveIndex(ctx context.Context) error {
 	if err := writeManifest(ctx, b, indexFile, data); err != nil {
 		return fmt.Errorf("write %s to %s: %w", indexFile, b.Label(), err)
 	}
-	// Also update cached metrics.
-	_ = s.SaveMetrics(ctx)
+	// Metrics are written through the same helper, so a sidecar that fails to
+	// land here would otherwise leave metrics.json unverifiable behind a
+	// successful SaveIndex.
+	if err := s.SaveMetrics(ctx); err != nil {
+		return fmt.Errorf("update cached metrics in %s: %w", b.Label(), err)
+	}
 	return nil
 }
 

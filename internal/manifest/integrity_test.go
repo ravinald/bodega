@@ -1,6 +1,8 @@
 package manifest_test
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -186,5 +188,60 @@ func TestRestampMD5WholeStore(t *testing.T) {
 		if !r.Passed() {
 			t.Errorf("%s: %s", r.Path, r.Status)
 		}
+	}
+}
+
+// failWriteBackend refuses the write of one named object and passes every other
+// call through to the real backend.
+type failWriteBackend struct {
+	manifest.Backend
+	fail string
+}
+
+func (b *failWriteBackend) Write(ctx context.Context, name string, data []byte) error {
+	if name == b.fail {
+		return fmt.Errorf("simulated write failure for %s", name)
+	}
+	return b.Backend.Write(ctx, name, data)
+}
+
+// TestSaveIndexReportsAMetricsSidecarFailure covers the half of "every manifest
+// write emits its sidecar" that a green return can hide. SaveIndex wrote
+// metrics through the same helper and then discarded its error, so a run whose
+// sidecar write failed reported success and left metrics.json behind it with
+// nothing to compare against.
+func TestSaveIndexReportsAMetricsSidecarFailure(t *testing.T) {
+	dir := t.TempDir()
+	store := manifest.NewStore(&failWriteBackend{
+		Backend: &manifest.LocalBackend{Dir: dir},
+		fail:    "metrics.json.md5",
+	})
+	pm := &manifest.PackageManifest{
+		Type:     manifest.TypeBinary,
+		Name:     "hello-binary",
+		Versions: []manifest.VersionEntry{{Version: "1.0.0"}},
+	}
+	if err := store.SavePackage(t.Context(), pm); err != nil {
+		t.Fatalf("SavePackage: %v", err)
+	}
+
+	err := store.SaveIndex(t.Context())
+	if err == nil {
+		t.Fatal("SaveIndex reported success after the metrics sidecar write failed")
+	}
+	if !strings.Contains(err.Error(), "metrics.json.md5") {
+		t.Errorf("the failure does not name the object that could not be written: %v", err)
+	}
+
+	results, verr := store.VerifyIntegrity(t.Context())
+	if verr != nil {
+		t.Fatalf("VerifyIntegrity: %v", verr)
+	}
+	got := resultFor(t, results, "metrics.json")
+	if got.Status != manifest.IntegrityUnverifiable {
+		t.Fatalf("metrics.json reported %s, want %s", got.Status, manifest.IntegrityUnverifiable)
+	}
+	if got.Passed() {
+		t.Error("a sidecar-less metrics.json reported itself as passed")
 	}
 }

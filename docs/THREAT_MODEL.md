@@ -46,6 +46,15 @@ risk:
   if the bytes changed. The tag advancing to a new release is not a mismatch;
   an existing version being republished under it is.
 
+  An **apt** entry pins at whichever stage first holds the `.deb`. A direct URL
+  or an `apt-get download` produces the artifact during fetch, so the digest and
+  the pool key the server will publish it under are both recorded there, and a
+  later fetch returning different bytes under the same filename is refused
+  rather than stored. An entry carrying a `build_cmd` has no `.deb` until the
+  build runs: its digest is recorded at package time off what this instance
+  compiled, because no upstream download happened for an earlier stage to
+  attest to.
+
   Nothing else is exempt: binary, apt, gomod, helm, npm and cargo all pin.
 - **A malicious release inside its own withdrawal window.** A fresh install is
   seeded with a minimum publish age of `7d` on `npm` and `pypi`, action `warn`,
