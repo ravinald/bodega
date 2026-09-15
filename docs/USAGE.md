@@ -45,16 +45,36 @@ bodega build fetch git netbox      # fetch only netbox
 
 A pypi fetch writes no wheels. It resolves each manifest entry to one concrete version and records it in `<build-root>/combined-requirements.txt`, which `build run` then hands to `pip wheel -r`. Resolution happens here, at fetch, rather than in pip: a bare requirement line means "newest that satisfies the closure", and pip has no notion of an approved version to weigh that against.
 
-Every entry resolves against the distribution's release list on the index, read from `ve.url` when the entry names one and `https://pypi.org` otherwise. What each `version_constraint` resolves to:
+Versions are read, ordered and compared as [PEP 440](https://packaging.python.org/en/latest/specifications/version-specifiers/), which is the scheme PyPI publishes and semver cannot read. `1.16.0.post1`, `2.0.0rc1`, `1!2.0` and `0.6.dev1` are ordinary releases on an index; under semver every one of them is unparseable and drops out of the candidate list, which reads exactly like the release not existing. `pytz` is the live example: its newest release is `2026.3.post1`, and a semver filter resolves `any` to the release before it.
+
+What each `version_constraint` resolves to:
 
 | `version_constraint` | Resolves to |
 |----------------------|-------------|
-| `exact`, or absent | The version named. Fails when the index does not offer it. |
-| `patch` | The newest release sharing the named version's major.minor. |
-| `compatible` | The newest release sharing the named version's major. |
+| `exact`, or absent | The version named, compared under PEP 440 rather than as a string, so `1.16` matches `1.16.0` and `2.0.0-rc-1` matches `2.0.0rc1`. Fails when the index does not offer it. |
+| `patch` | The newest release sharing the named version's epoch and major.minor. |
+| `compatible` | The newest release sharing the named version's epoch and major. |
 | `any` | The newest release the index offers. This is how to say "latest". |
 
+The floating constraints (`patch`, `compatible`, `any`) take a pre-release or dev release only when the version the entry names is itself one. A project publishing `2.0.0rc1` would otherwise move every `any` entry onto a release candidate nobody approved. A post release is not a pre-release: `1.16.0.post1` ships after `1.16.0` and qualifies everywhere.
+
 An entry whose `version` is empty or `*` resolves to nothing and keeps a bare, unpinned requirement line, whatever its constraint says. That is the shape an auto-imported dependency arrives in, and pinning it would over-constrain a closure the base `-r` requirements already decide.
+
+A version outside PEP 440 still resolves under `exact`, by literal match. `pytz` shipped `2011k`, which no parser will order but an index plainly offers.
+
+##### Which index
+
+Every entry resolves against one index for the whole type, and the same index serves the download. It is read from `url` on whichever entries name one, and is `https://pypi.org` when none do.
+
+One index rather than one per entry, because a fetch writes a single requirements file and pip honors one `--index-url` across all of it. Resolving each entry against its own origin and then letting pip download from its default is how a version gets approved on one index and its bytes arrive from another. So a non-default index is written into the requirements file as `--index-url <url>/simple/`, and two entries naming different origins fail the fetch:
+
+```text
+pypi entries name 2 different indexes and one fetch can use one: https://a.example (six); https://b.example (attrs)
+```
+
+The default is left unsaid, so a deployment that points pip at its own mirror through `pip.conf` keeps it.
+
+##### When resolution fails
 
 A version that resolves to nothing fails the whole fetch, names the entry, the version asked for and what the index offered, and writes no requirements file at all:
 
@@ -64,10 +84,16 @@ pypi six: version_constraint "exact" on 1.99.0 resolves to nothing; the index at
 
 A partial file would build cleanly and store a closure nobody approved, so there is no half-written one to find.
 
+A release PyPI has emptied counts as not offered. Deleting a release leaves its key in the JSON document with an empty file list, and accepting the key resolves a pin to something pip cannot download, so the failure would surface inside the wheel build minutes later instead of here. `requests` `2.15.0` is the live example.
+
+A response larger than 64 MiB fails by size rather than as malformed JSON — `pypi <name> response exceeds 67108864 bytes`. The document is read as a stream, so memory does not track the response; the cap bounds only how long a single index answer will be read. `boto3` measures 2,117 releases through this path.
+
 #### Gaps
 
 - **Transitive dependencies are pip's to resolve.** Only the versions the manifest names are pinned. The wheels pip pulls in behind them are whatever the closure resolves to, and the manifest does not record them until `build package` scans the wheel metadata into `dep-graph.json`.
 - **The wheels directory is flat and nothing prunes it.** `pip wheel --wheel-dir` writes every build into one directory, so changing a pin leaves the previous version's wheel behind, and the generated simple index publishes whatever is in that directory. Clear it by hand when a pin moves.
+- **The build venv bootstraps from pip's own default index.** `--index-url` reaches `pip wheel`; the `pip install --upgrade pip wheel setuptools` that precedes it does not. A host whose selected index is the only one reachable needs pip pointed at it through `pip.conf`.
+- **`bodega refresh` still orders pypi candidates as semver.** It proposes new manifest entries rather than resolving a fetch, so a `patch`-constrained entry will not see a post release offered to it.
 
 ### `bodega build run [TYPE...] [NAME]`
 

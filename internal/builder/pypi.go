@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -17,6 +18,10 @@ import (
 // any line that pip would treat as an install target. Blank lines and comment
 // lines (leading #) are ignored. An `-r other.txt` reference counts as
 // installable (pip will recurse into it at wheel time).
+//
+// A pip global option such as `--index-url` is not a target. Counting one
+// builds a venv, runs pip wheel over a file naming nothing, and produces zero
+// wheels without an error anywhere.
 func hasInstallableRequirements(path string) (bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -30,9 +35,20 @@ func hasInstallableRequirements(path string) (bool, error) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+		if strings.HasPrefix(line, "-") && !isRequirementInclude(line) {
+			continue
+		}
 		return true, nil
 	}
 	return false, scanner.Err()
+}
+
+// isRequirementInclude reports whether a leading-dash line pulls in another
+// requirements file, which is the one option that names install targets.
+func isRequirementInclude(line string) bool {
+	field := strings.Fields(line)[0]
+	field, _, _ = strings.Cut(field, "=")
+	return field == "-r" || field == "--requirement"
 }
 
 // pypiWheelsDir returns the local wheels directory.
@@ -58,16 +74,12 @@ const pypiOfferedMax = 5
 // the record of what was approved: an unpinned requirement line let pip take
 // whatever was newest, and a 1.16.0 entry produced a 1.17.0 wheel with nothing
 // reporting the substitution.
-func resolvePypiVersion(name string, ve manifest.VersionEntry) (string, error) {
+func resolvePypiVersion(root, name string, ve manifest.VersionEntry) (string, error) {
 	want := strings.TrimSpace(ve.Version)
 	if want == "" || want == "*" {
 		return "", nil
 	}
 
-	root := ve.URL
-	if root == "" {
-		root = defaultPypiIndex
-	}
 	available, err := pypiVersionsAt(root, name)
 	if err != nil {
 		return "", fmt.Errorf("pypi %s: reading %s to resolve %s: %w", name, root, want, err)
@@ -78,9 +90,9 @@ func resolvePypiVersion(name string, ve manifest.VersionEntry) (string, error) {
 		constraint = manifest.ConstraintExact
 	}
 
-	// Literal match before the semver filter. PyPI versions are PEP 440, not
-	// semver, so ParseSemVer rejects "2.0.0rc1" and "0.6.dev1" outright and
-	// FilterVersions would refuse a pin the index plainly offers.
+	// Literal match before the PEP 440 filter, for the legacy versions that
+	// predate the scheme: pytz shipped "2011k", which no parser will order but
+	// an index plainly offers and an entry may plainly name.
 	if constraint == manifest.ConstraintExact {
 		for _, v := range available {
 			if v == want {
@@ -88,12 +100,61 @@ func resolvePypiVersion(name string, ve manifest.VersionEntry) (string, error) {
 			}
 		}
 	}
-	if matches := FilterVersions(available, constraint, want); len(matches) > 0 {
+	if matches := FilterPypiVersions(available, constraint, want); len(matches) > 0 {
 		return matches[len(matches)-1], nil
 	}
 
 	return "", fmt.Errorf("pypi %s: version_constraint %q on %s resolves to nothing; the index at %s offers %s",
 		name, constraint, want, root, pypiOffered(available))
+}
+
+// pypiIndexRoot returns the one index every pypi entry resolves and downloads
+// against, read from the `url` of whichever entries name one.
+//
+// One index for the whole type rather than one per entry: a fetch writes a
+// single requirements file and pip honors one --index-url across all of it, so
+// resolving each entry against its own origin and then downloading everything
+// from pip's default is how a version gets approved on one index and fetched
+// from another. Two entries naming different origins is a configuration this
+// shape cannot satisfy, so it fails rather than picking a winner.
+func pypiIndexRoot(ctx context.Context, store *manifest.Store) (string, error) {
+	named := make(map[string][]string)
+	for _, name := range store.ListPackages(manifest.TypePypi) {
+		pm, err := store.GetPackage(ctx, manifest.TypePypi, name)
+		if err != nil || pm == nil {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			if root := strings.TrimRight(strings.TrimSpace(ve.URL), "/"); root != "" {
+				named[root] = append(named[root], name)
+			}
+		}
+	}
+	switch len(named) {
+	case 0:
+		return defaultPypiIndex, nil
+	case 1:
+		for root := range named {
+			return root, nil
+		}
+	}
+	roots := make([]string, 0, len(named))
+	for root, pkgs := range named {
+		roots = append(roots, fmt.Sprintf("%s (%s)", root, strings.Join(pkgs, ", ")))
+	}
+	sort.Strings(roots)
+	return "", fmt.Errorf("pypi entries name %d different indexes and one fetch can use one: %s",
+		len(named), strings.Join(roots, "; "))
+}
+
+// pypiIndexLine renders the pip option that points the wheel build at the same
+// index the resolution read. The default index is left unsaid so a deployment
+// pointing pip at its own mirror through pip.conf keeps it.
+func pypiIndexLine(root string) string {
+	if root == defaultPypiIndex {
+		return ""
+	}
+	return "--index-url " + strings.TrimRight(root, "/") + "/simple/\n"
 }
 
 // pypiOffered renders an index's version list for an error message, newest last.
@@ -174,7 +235,21 @@ func FetchPypi(cfg *Config, store *manifest.Store) *Summary {
 	combinedReq := filepath.Join(cfg.rootFor(manifest.TypePypi), "combined-requirements.txt")
 	_, _ = fmt.Fprintf(out, "\n>>> [pypi] fetch — resolving requirements\n")
 
+	indexRoot, err := pypiIndexRoot(ctx, store)
+	if err != nil {
+		result.Err = err
+		_, _ = fmt.Fprintf(out, "    FAILED: %v\n", err)
+		summary.Failures++
+		summary.Results = append(summary.Results, result)
+		summary.Total++
+		return summary
+	}
+
 	reqLines := []string{"# Auto-generated by bodega from pypi manifests\n"}
+	if line := pypiIndexLine(indexRoot); line != "" {
+		_, _ = fmt.Fprintf(out, "    Index: %s\n", indexRoot)
+		reqLines = append(reqLines, line)
+	}
 
 	// Collect base requirements: git repos referenced via RequiredBy on any pypi entry.
 	baseReqs := make(map[string]string) // repoName → ref
@@ -264,7 +339,7 @@ func FetchPypi(cfg *Config, store *manifest.Store) *Summary {
 			entries = pm.Versions
 		}
 		for _, ve := range entries {
-			resolved, err := resolvePypiVersion(name, ve)
+			resolved, err := resolvePypiVersion(indexRoot, name, ve)
 			if err != nil {
 				_, _ = fmt.Fprintf(out, "      %s — FAILED: %v\n", name, err)
 				summary.Failures++
