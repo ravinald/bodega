@@ -367,6 +367,20 @@ func runCmd(out io.Writer, dir string, name string, args ...string) error {
 	return cmd.Run()
 }
 
+// runCmdEnv runs a command with an explicit environment rather than the
+// server's own, for a tool that reads configuration out of the environment and
+// would otherwise take acquisition instructions from whatever started bodega.
+func runCmdEnv(out io.Writer, dir string, env []string, name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	cmd.Env = env
+	cmd.Stdout = out
+	cmd.Stderr = out
+	return cmd.Run()
+}
+
 // runCmdCapture runs a command and returns its combined output as a string.
 func runCmdCapture(dir, name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)

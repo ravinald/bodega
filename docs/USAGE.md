@@ -41,6 +41,128 @@ bodega build fetch git             # fetch git sources only
 bodega build fetch git netbox      # fetch only netbox
 ```
 
+#### How a pypi version is resolved
+
+A pypi fetch writes no wheels. It resolves each manifest entry to one concrete version and records it in `<build-root>/combined-requirements.txt`, which `build run` then hands to `pip wheel -r`. Resolution happens here, at fetch, rather than in pip: a bare requirement line means "newest that satisfies the closure", and pip has no notion of an approved version to weigh that against.
+
+Versions are read, ordered and compared as [PEP 440](https://packaging.python.org/en/latest/specifications/version-specifiers/), which is the scheme PyPI publishes and semver cannot read. `1.16.0.post1`, `2.0.0rc1`, `1!2.0` and `0.6.dev1` are ordinary releases on an index; under semver every one of them is unparseable and drops out of the candidate list, which reads exactly like the release not existing. `pytz` is the live example: its newest release is `2026.3.post1`, and a semver filter resolves `any` to the release before it.
+
+What each `version_constraint` resolves to:
+
+| `version_constraint` | Resolves to |
+|----------------------|-------------|
+| `exact`, or absent | The version named, compared under PEP 440 rather than as a string, so `1.16` matches `1.16.0` and `2.0.0-rc-1` matches `2.0.0rc1`. Fails when the index does not offer it. |
+| `patch` | The newest release sharing the named version's epoch and major.minor. |
+| `compatible` | The newest release sharing the named version's epoch and major. |
+| `any` | The newest release the index offers. This is how to say "latest". |
+
+The resolved version is written as `six===1.16.0`, in PEP 440's canonical spelling. Arbitrary equality (`===`) rather than `==`, because `==` ignores a candidate's local label when the specifier carries none: against an index offering both `1.16.0` and `1.16.0+vendor.1`, `six==1.16.0` downloads the vendored build. Measured on pip 26.2.1. An entry naming `1.16.0+vendor.1` still gets that build — the label is part of the version, and local labels order by PEP 440 segment rules, so `+vendor.10` is newer than `+vendor.9` and `+9` is newer than either.
+
+The canonical spelling is not cosmetic: pip compares `===` by string equality against a candidate's normalized version, so an index listing `1.0-1` serves a wheel pip reads as `1.0.post1` and the raw spelling matches nothing.
+
+The floating constraints (`patch`, `compatible`, `any`) take a pre-release or dev release only when the version the entry names is itself one. A project publishing `2.0.0rc1` would otherwise move every `any` entry onto a release candidate nobody approved. A post release is not a pre-release: `1.16.0.post1` ships after `1.16.0` and qualifies everywhere.
+
+An entry whose `version` is empty or `*` resolves to nothing and keeps a bare, unpinned requirement line, whatever its constraint says. That is the shape an auto-imported dependency arrives in, and pinning it would over-constrain a closure the base `-r` requirements already decide.
+
+A version outside PEP 440 still resolves under `exact`, by literal match. `pytz` shipped `2011k`, which no parser will order but an index plainly offers.
+
+##### Which index
+
+Every entry resolves against one index for the whole type, and the same index serves the download. It is read from `url` on whichever entries name one, and is `https://pypi.org` when none do.
+
+One index rather than one per entry, because a fetch writes a single requirements file and pip honors one `--index-url` across all of it. Resolving each entry against its own origin and then letting pip download from its default is how a version gets approved on one index and its bytes arrive from another. So the selected index is written into the requirements file as `--index-url <url>/simple/` and passed to `pip wheel` as an argument, and two entries naming different origins fail the fetch:
+
+```text
+pypi entries name 2 different indexes and one fetch can use one: https://a.example (six); https://b.example (attrs)
+```
+
+The default index is written out like any other. A deployment that wants its own mirror names it on the manifest entry; pointing pip at one through `pip.conf` no longer reaches the build, because the build runs pip with `--isolated` and an environment holding no `PIP_*` variable. pip reads those as configuration at a precedence above the requirements file, so an index named in either moves acquisition without appearing in any file this could examine, and an index nothing states is an index nothing enforces.
+
+##### What reaches pip
+
+The applications' own requirements files are read at fetch and written out again, not handed to pip by reference. The generated `combined-requirements.txt` holds the selected index, the lines read from each application's file with `-r` and `-c` includes resolved in place, and one pin per manifest entry. `-c` includes land in a generated `combined-constraints.txt` instead, reached by a single `-c`, because a constraint restricts a version without requesting the package and flattening one into the requirements installs what an application only meant to bound.
+
+Inlining rather than including, because an `-r` pointing back at the application's file leaves two parsers over one set of bytes: this one at fetch, pip's at build. Every difference between them is an acquisition instruction approved against one index and carried out against another, and five of them were found one at a time. What this reads is now what pip reads, so a construct read wrongly produces a wrong requirement rather than a silent change of origin.
+
+Lines are read the way pip reads them: backslash continuations joined, comments stripped, the requirement and option halves of a line split on a literal space before any quote is removed, the option half tokenized by the same POSIX `shlex` rules pip uses, and `-r` and `-c` followed to any depth. Every option is classified before the file is accepted:
+
+| Option                                                                                                                                                 | What the fetch does                                                  |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------- |
+| `-i`, `--index-url`                                                                                                                                    | Passes when it names the selected index, fails when it names another |
+| `--extra-index-url`, `-f`/`--find-links`, `--no-index`, `--trusted-host`                                                                               | Fails: each one acquires outside the approved index                  |
+| `-r`/`--requirement`, `-c`/`--constraint`                                                                                                              | Followed, and the included file is read under these same rules       |
+| `-e`/`--editable` naming a URL, or a requirement carrying its own download (`six @ https://host/six.whl`)                                              | Fails: pip downloads it without asking any index                     |
+| `--pre`, `--prefer-binary`, `--require-hashes`, `--no-binary`, `--only-binary`, `--hash`, `-C`/`--config-settings`, `--global-option`, `--use-feature` | Accepted: none of them decides an origin                             |
+| anything else                                                                                                                                          | Fails as uninterpreted                                               |
+
+An include is resolved by replacing its line with the file it names, so it has to be the only thing on that line. An include beside a requirement is one pip ignores outright, because a requirement line's options are scoped to that requirement; an include beside another option would drop that option when the line is replaced. Both fail rather than guess.
+
+Failing on an option nobody classified is deliberate. pip hands the line to optparse, which reads `-iURL`, `--index-url=URL`, `--index-url URL` and the unambiguous abbreviation `--index-ur URL` as the same option, and joins `--index-` and `url URL` across a backslash continuation into one before any of that. A checker matching exact tokens against physical lines reads none of those four, and an option it cannot read may be an index it never saw:
+
+```text
+pypi base requirements for netbox@v4.5.5: /var/lib/bodega/git/sources/netbox/netbox-v4.5.5/requirements.txt names --extra-index-url https://b.example/simple/, which acquires outside the https://a.example the manifest approved
+```
+
+Quoting and escaping are part of that grammar, not decoration around it. pip runs `shlex.split` over the option half before optparse sees it, so `--pre "--index-url" https://b.example/simple/` and `--pre \--index-url https://b.example/simple/` are both an index option to pip while a reader comparing whole whitespace-separated tokens sees one inert option and two fragments naming nothing. A line neither reader can tokenize, such as an unclosed quotation, fails here for the same reason pip fails it:
+
+```text
+pypi base requirements for netbox@v4.5.5: /var/lib/bodega/git/sources/netbox/netbox-v4.5.5/requirements.txt: --index-url "https://b.example/simple/ closes no " quotation; pip splits options the same way and fails the file, so fix the quoting
+```
+
+A quoted value is ordinary and passes on its own terms: `--index-url "<selected>/simple/"` names the selected index, and `-r "app extras.txt"` includes a path with a space in it.
+
+Naming the selected index is agreement rather than conflict, and passes. Rejecting rather than rewriting: the file belongs to the application, and editing an origin out of it hides the disagreement instead of settling it.
+
+##### What the file may not contain
+
+pip decodes a requirements file and splits it into lines before it reads a single option, and both stages sit above tokenization. An option either of them produces is one no tokenizer can be taught to see: a UTF-16 file holds no `://` bytes at all, and a carriage return starts a line for pip that a reader splitting on newlines never finds. These constructs are refused rather than reproduced, because matching Python's decoding and line-breaking tables is a standing obligation and not a fix.
+
+| Input                                                                                 | Why it fails                                                                                 |
+| ------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| A byte-order mark, or a `# -*- coding: ... -*-` declaration naming anything but UTF-8 | pip decodes the whole file by it; this reads UTF-8                                           |
+| Bytes that are not valid UTF-8                                                        | pip falls back to the locale encoding and reads different text                               |
+| A carriage return anywhere but the end of a line                                      | `str.splitlines` starts a line there and this does not                                       |
+| `\v`, `\f`, `\x1c`, `\x1d`, `\x1e`, `\u0085`, `\u2028`, `\u2029`                      | the same, for the seven other separators `str.splitlines` breaks on                          |
+| `${NAME}`                                                                             | pip replaces it from its own environment; there is no escape, so the only safe reading is no |
+
+Each failure names the file, the line and what to do:
+
+```text
+pypi base requirements for netbox@v4.5.5: /var/lib/bodega/.../requirements.txt: line 12 expands ${PIP_OPTS}, which pip replaces from its own environment and this cannot see; write the value, or name the index in the manifest
+```
+
+##### When resolution fails
+
+A version that resolves to nothing fails the whole fetch, names the entry, the version asked for and what the index offered, and writes no requirements file at all:
+
+```text
+pypi six: version_constraint "exact" on 1.99.0 resolves to nothing; the index at https://pypi.org offers 1.13.0, 1.14.0, 1.15.0, 1.16.0, 1.17.0 (34 versions in all)
+```
+
+A partial file would build cleanly and store a closure nobody approved, so there is no half-written one to find. A failure also discards the file a previous successful fetch wrote. Its existence is what `build run` reads as "fetch is done", so leaving it in place after a failed re-resolve lets the next build store the closure of a pin the manifest no longer names — the ordinary sequence being fetch, edit the version, re-fetch, build.
+
+A release PyPI has emptied counts as not offered. Deleting a release leaves its key in the JSON document with an empty file list, and accepting the key resolves a pin to something pip cannot download, so the failure would surface inside the wheel build minutes later instead of here. `requests` `2.15.0` is the live example.
+
+A response larger than 64 MiB fails by size rather than as malformed JSON — `pypi <name> response exceeds 67108864 bytes`. The document is read as a stream, so memory does not track the response; the cap bounds only how long a single index answer will be read. `boto3` measures 2,117 releases through this path.
+
+##### What the build checks
+
+`build run pypi` reads the pins back out of the generated file and compares them against the wheels pip stored. A pinned distribution present at a version no pin names fails the build:
+
+```text
+pypi six: the manifest names 1.16.0 and the wheels directory holds 1.16.0+vendor.1 — pip stored a version nobody approved
+```
+
+A specifier is a filter rather than a fact. An index that answers it with another build, a pip resolving it out of a cache, or a hand-edited requirements file all end with bytes on disk the manifest does not describe, and the wheels directory is what gets published. A pin with no wheel at all passes this check: pip exiting 0 having stored nothing for a requirement is a different defect, and failing it here would report it as a substitution.
+
+#### Gaps
+
+- **Transitive dependencies are pip's to resolve.** Only the versions the manifest names are pinned. The wheels pip pulls in behind them are whatever the closure resolves to, and the manifest does not record them until `build package` scans the wheel metadata into `dep-graph.json`.
+- **The wheels directory is flat and nothing prunes it.** `pip wheel --wheel-dir` writes every build into one directory, so changing a pin leaves the previous version's wheel behind, and the generated simple index publishes whatever is in that directory. Clear it by hand when a pin moves.
+- **The build toolchain is not pinned.** `pip install --upgrade pip wheel setuptools` reaches the selected index like the wheel build does, but takes whatever version that index offers, so a fixed bodega release is paired with whatever pip installed today. A selected index carrying no pip fails the build there rather than reaching past itself.
+- **Controlling the requirements language does not prove the origin of every byte.** A build installs build dependencies, obtains dynamically reported build requirements and runs build backends, and a build requirement can carry a direct reference of its own. What the generated file names is checked; what a `setup.py` reaches for while it runs is not. See [docs/THREAT_MODEL.md](THREAT_MODEL.md).
+- **`bodega refresh` still orders pypi candidates as semver.** It proposes new manifest entries rather than resolving a fetch, so a `patch`-constrained entry will not see a post release offered to it.
+
 ### `bodega build run [TYPE...] [NAME]`
 
 Compiles or prepares sources. Auto-fetches if sources are not already present (stage cascading). Types without a build step (binary, gomod, helm, npm) are skipped for the build phase.
