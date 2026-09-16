@@ -137,6 +137,8 @@ type StreamResult struct {
 	ETag string
 	// ContentType is the S3-stored content type, which may be empty.
 	ContentType string
+	// LastModified is the object's stored timestamp, zero if S3 sent none.
+	LastModified time.Time
 }
 
 // GetObjectStream opens a streaming GET for the given key.
@@ -162,6 +164,9 @@ func (c *Client) GetObjectStream(ctx context.Context, key string) (*StreamResult
 	}
 	if out.ContentType != nil {
 		result.ContentType = *out.ContentType
+	}
+	if out.LastModified != nil {
+		result.LastModified = *out.LastModified
 	}
 	return result, nil
 }

@@ -101,6 +101,7 @@ func (m *Memory) GetStream(_ context.Context, key string) (*StreamResult, error)
 		Body:          io.NopCloser(bytes.NewReader(data)),
 		ContentLength: int64(len(data)),
 		ContentType:   "application/octet-stream",
+		LastModified:  obj.modified,
 	}, nil
 }
 

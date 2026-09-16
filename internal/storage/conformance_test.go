@@ -490,6 +490,70 @@ func testObjectStore(t *testing.T, mk func() ObjectStore) {
 			if info.Size != r.ContentLength {
 				t.Fatalf("Head Size %d, GetStream ContentLength %d", info.Size, r.ContentLength)
 			}
+			// The proxy records which upstream supplied a cached object
+			// against what the store said when it read those bytes, and
+			// compares it against what the store says when it serves them. A
+			// backend whose open reports a different timestamp from its Head,
+			// or none, makes every object it holds unattributable.
+			if !info.LastModified.Equal(r.LastModified) {
+				t.Fatalf("Head LastModified %v, GetStream LastModified %v", info.LastModified, r.LastModified)
+			}
+		}},
+
+		// The proxy binds a cache hit's recorded origin to the identity
+		// GetStream reported and then streams that same handle. Nothing
+		// orders a publication against a read in progress — the writer is
+		// often a 'pkg upload' in another process — so a backend that let a
+		// replacement reach an open handle would serve one artifact's bytes
+		// under another artifact's provenance, with a length and timestamp
+		// describing neither.
+		//
+		// Both lengths, because an equal-length replacement is what a check
+		// reading ContentLength cannot tell apart.
+		{"an_open_reader_is_a_snapshot", func(t *testing.T, ctx context.Context, s ObjectStore) {
+			for _, sameLength := range []bool{true, false} {
+				key := "snap/obj-" + strconv.FormatBool(sameLength)
+				original := []byte("the bytes this reader opened")
+				replacement := []byte("a locally built artifact landing mid-read")
+				if sameLength {
+					replacement = bytes.Repeat([]byte("L"), len(original))
+				}
+				if err := s.Put(ctx, key, original); err != nil {
+					t.Fatalf("Put: %v", err)
+				}
+				r, err := s.GetStream(ctx, key)
+				if err != nil || r == nil {
+					t.Fatalf("GetStream: %+v, %v", r, err)
+				}
+				if err := s.Put(ctx, key, replacement); err != nil {
+					r.Body.Close()
+					t.Fatalf("replacement Put: %v", err)
+				}
+				got, err := io.ReadAll(r.Body)
+				r.Body.Close()
+				if err != nil {
+					t.Fatalf("read the open handle: %v", err)
+				}
+				if !bytes.Equal(got, original) {
+					t.Errorf("same_length=%v: open handle read %q, want %q — the write reached a reader already on the object",
+						sameLength, got, original)
+				}
+				if r.ContentLength != int64(len(original)) {
+					t.Errorf("same_length=%v: ContentLength %d, want %d", sameLength, r.ContentLength, len(original))
+				}
+				next, err := s.GetStream(ctx, key)
+				if err != nil || next == nil {
+					t.Fatalf("GetStream after the replacement: %+v, %v", next, err)
+				}
+				after, err := io.ReadAll(next.Body)
+				next.Body.Close()
+				if err != nil {
+					t.Fatalf("read the replacement: %v", err)
+				}
+				if !bytes.Equal(after, replacement) {
+					t.Errorf("same_length=%v: the next open read %q, want the replacement %q", sameLength, after, replacement)
+				}
+			}
 		}},
 
 		// An interrupted 'pkg move' or 'repair keys' is re-run, and the second

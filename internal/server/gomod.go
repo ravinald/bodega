@@ -90,6 +90,20 @@ func (s *Server) serveGomodFile(w http.ResponseWriter, r *http.Request, pm *mani
 		return
 	}
 
+	// A module no manifest names is answered upstream when the proxy is on, as
+	// the npm packument and the cargo sparse index already are. Left to
+	// proxyVersion it 404s, which is a `go get` for anything not catalogued
+	// here failing against a feature README.md advertises for this type.
+	//
+	// Every file under @v/ takes this path, not just the mutable ones. The
+	// listing alone answers nothing a client can act on: `go get` reads list,
+	// then .info, .mod and .zip, and proxying the first while 404ing the rest
+	// is a module resolution that fails one step later.
+	if pm == nil && s.cacheEnabled() {
+		s.proxyOrCache(w, r, s.typeStore(manifest.TypeGomod), s3Key, upstream, manifest.TypeGomod, module, module, immutable, false)
+		return
+	}
+
 	if pm == nil {
 		s.recordNoManifest(ctx, r, manifest.TypeGomod, module, gomodVersionFromFile(file), upstream)
 	}

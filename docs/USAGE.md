@@ -2217,6 +2217,7 @@ Each names the path and the config file the path came from, so the next move is 
 bodega supports two storage backends:
 
 - **`local`** (default): Stores artifacts on the local filesystem. Set `storage_path` to change the root directory (default: `/var/lib/bodega`). No initialization needed, and no bucket: every command that touches storage runs without one.
+  A write lands in a `.bodega-tmp-*` file beside the destination and is renamed into place, so a key holds either its previous object or its new one and never a half-written body, and a reader already on the object keeps the one it opened even while a replacement publishes. Listings skip those staging names. A crash mid-write leaves one behind: it is safe to delete, and nothing reads it. A new object lands at the mode the server's umask allows. Refilling an existing one restates everything the object carried that decides who can reach it: its mode, its owner and group, its access ACL and its extended attributes, all applied to the staging file before the mode that makes it readable. So a `chmod`, a `chgrp` or a `setfacl` you applied to a single artifact survives the next fetch, and a reader the artifact denied stays denied. Where the server cannot restate one of them, the refill fails, says which one, and leaves the previous object exactly as it was: handing an artifact to a group it was kept from is not a thing a cache fill gets to decide. Giving an artifact a group the server does not belong to is the case that reaches this, and it needs `CAP_CHOWN` or a server running as a member of that group.
 - **`s3`**: Stores artifacts in an S3 bucket. Set `bucket` and `region`, then run `bodega init` to create the bucket with encryption and versioning.
 
 Manifests follow the backend. On `s3` they live under the `manifests/` prefix in the bucket; on `local` they live in `manifest_dir` on disk, which is also what `--local-config` selects against any backend.
@@ -3351,6 +3352,10 @@ Configure the TTL:
 { "metadata_ttl": "1h" }
 ```
 
+**A name no manifest holds still proxies.** `gomod`, `npm` and `cargo` answer a package with no entry from upstream and cache what they get, which is what makes a clean host able to bootstrap through bodega. For `gomod` that covers the whole module protocol — `@v/list`, `.info`, `.mod` and `.zip` — because `go get` reads all four and a listing served alone fails the resolution one step later. The `npm` tarball, `pypi` wheel and `helm` chart routes are the exception: each serves only what an entry names, so an uncatalogued name reaches those as a 404 even with the proxy on.
+
+Which upstreams may be reached at all is the allow-list's decision, not this switch's: with rules configured for a type, a candidate that matches none is refused with a `cache` row at `status=policy_violation`. See [Supply Chain Management](#supply-chain-management).
+
 ### Upstream hosts
 
 Five flat keys name the registries a proxying instance fetches from. They are not interchangeable, and two ecosystems need two keys each because the registry that answers "which versions exist" is not the one that serves the bytes.
@@ -3496,9 +3501,32 @@ Convert a fleet to a request rate with `hosts x updates-per-hour x requests-per-
 | `fetch`, `build`, `package`, `upload`, `sync` | Build pipeline stage completed for an entry |
 | `create`, `delete`, `hide`, `freeze`, `edit`, `refresh`, `repair` | Manifest mutation (CLI, TUI or API) |
 | `init`, `reset`, `status`, `show` | Operator command |
-| `cache` | Proxy cache miss > upstream fetch, and upstream policy violations (`status=policy_violation`) |
+| `cache` | Every proxy outcome: an artifact served from the cache, one fetched from upstream, and the two refusals decided on the way |
 | `denied` | A request the server refused |
 | `serve_start`, `serve_stop` | `bodega serve` bound its listener / shut down |
+
+That table is the whole set. A type absent from a trail is a gap to chase rather than a type the server was never going to write: `cache` was defined and reachable only through its two refusals for several releases, so an install proxying npm and cargo all day recorded nothing saying which artifacts had come from upstream, and nothing in the trail read as missing.
+
+**Cache outcomes.** A `cache` row's `status` names which of the four happened. The first two are written on the serving path, one per request, and carry the package type, name and version off the object key with the upstream that answered in `details`:
+
+| Status | Outcome |
+|--------|---------|
+| `cache_miss` | Fetched from upstream, verified and stored. `details` names the URL that answered, which is the last hop of any redirect chain rather than the address bodega composed |
+| `cache_hit` | Served from storage with no upstream contact. A stale copy served because the upstream could not be reached, or because the spool refused the refetch, records this too: the request is what the row counts |
+| `checksum_mismatch` | Upstream bytes disagreed with the digest pinned on first fetch. The artifact was neither served nor cached |
+| `policy_violation` | The upstream allow-list refused the candidate. Written wherever the refusal is decided, including the apt pool probe, which refuses a `.deb` before there is a fetch to record |
+
+One row per request on both serving outcomes, so counting `cache_miss` over a window sizes what an upstream actually served. Every response the cache answers is counted, including the apt pool shortcut that serves a cached `.deb` without resolving which archive it came from, and including a stale copy served during an outage. A request the spool refuses with nothing cached to fall back on writes its `denied` row and no `cache` row: nothing came from upstream and nothing was served, so a row either way would be wrong. Where a stale copy does answer, both rows are written — the `denied` row names the bound that fired, the `cache_hit` names the bytes the client got.
+
+**Provenance on a hit.** `details` on a `cache_hit` names the upstream that supplied those bytes, recorded when they were fetched and read back from the store — not the candidate `gomod_upstream` or `apt_upstreams` points at now. The two diverge routinely: the pypi wheel route holds no URL on a hit at all, because composing one costs a read of the simple index that a hit exists to avoid, and a restart or a configuration edit leaves the fetched URL nowhere in memory. The lookup is local either way, so a hit still contacts nothing.
+
+A recorded origin belongs to the bytes, not to the key they sit under. A fetch reads its cached object back before recording anything and records nothing unless those bytes hash to what it fetched, so an upload that landed at the key while the fetch was in flight takes the row with it rather than inheriting it. A hit then compares what the backend reports — the object's location, its length, and its entity tag or its timestamp — against the handle it is about to serve from, not against an earlier lookup. So an artifact replaced under a key it already occupied is not credited to the archive that supplied the previous tenant, whether it was replaced by `bodega pkg upload`, by a delete and a refill, or by a move to another bucket, and whether the replacement is the same length as what it displaced or not.
+
+A response already in flight is unaffected by the replacement: it serves the object it opened, under that object's origin, and the next request serves the new one. That holds because the backends publish rather than overwrite (see [Storage backends](#storage-backends)), and it is what lets the row be written from the same open that supplies the body.
+
+Provenance a fetch is still in the middle of publishing is answered from that fetch. Bytes become readable partway through the write to storage and the origin lands after it, and a client arriving in between gets the upstream of the fill it is reading rather than a blank — once the object it is serving is confirmed to be the one that fill fetched, which costs a read of it and happens only inside that window.
+
+An object cached before bodega kept origins, filled by a path that fetches nothing, or written over since by one, carries `"upstream": ""` and `"upstream_origin": "unrecorded"` instead of a guess: a row naming a host that answered nothing reads as evidence and is not.
 
 **Denials.** A `denied` row's `status` column names the gate that turned the request away, so an address that was never permitted reads differently from a token that simply aged out:
 

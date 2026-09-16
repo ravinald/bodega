@@ -153,9 +153,17 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, poo
 	// A cached .deb needs no archive resolved for it, which is the common case
 	// once a fleet is warm: the probe below is per pool path and the cache
 	// read is not.
-	if s.aptCached(r.Context(), store, key, true) {
-		s.recordAptPoolHit(r, poolPath, key)
-		s.proxyS3(w, r, store, key)
+	if cached := s.aptCached(r.Context(), store, key, true); cached != nil {
+		// The audit row is unconditional. This shortcut is the only path a
+		// cached .deb is served by, and it used to write through
+		// recordAptPoolHit, whose first line returns on discovery being off —
+		// so on a default install every mirrored .deb after the first was
+		// served with nothing in the trail saying the cache answered it.
+		name, _ := manifest.AptDebIdentity(path.Base(poolPath))
+		s.serveCacheHit(w, r, store, key, func(obj cachedObject) {
+			s.recordCacheServed(r, manifest.TypeApt, "", name, key, obj)
+			s.recordAptPoolHit(r, poolPath, key)
+		})
 		return
 	}
 
@@ -175,7 +183,9 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, poo
 	s.serveAptMirror(w, r, store, key, base+"/"+poolPath, name, true)
 }
 
-// recordAptPoolHit writes the discovery row for a .deb served out of the cache.
+// recordAptPoolHit writes the discovery row alone for a .deb served out of the
+// cache; the audit row is its caller's, which owes one whatever discovery is
+// set to.
 //
 // The pool path names no archive — that is why aptRouteCache exists — and a
 // cached object is served without resolving one, so the archive has to be
@@ -199,7 +209,7 @@ func (s *Server) recordAptPoolHit(r *http.Request, poolPath, key string) {
 		return
 	}
 	name, _ := manifest.AptDebIdentity(path.Base(poolPath))
-	s.recordCacheHit(r.Context(), r, manifest.TypeApt, upstream, upstream, name, key)
+	s.recordCacheHitDiscovery(r.Context(), r, manifest.TypeApt, upstream, upstream, name, key)
 }
 
 // aptPoolHitUpstream names the archive a cached pool object came from, or ""
@@ -224,7 +234,7 @@ func (s *Server) aptPoolHitUpstream(poolPath string) string {
 // The waiters re-enter proxyOrCache after the leader returns and find the
 // object in storage.
 func (s *Server) serveAptMirror(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, key, upstream, pkgName string, immutable bool) {
-	if !s.aptCached(r.Context(), store, key, immutable) {
+	if s.aptCached(r.Context(), store, key, immutable) == nil {
 		release := s.aptMirror.lock(key)
 		defer release()
 	}
@@ -368,15 +378,23 @@ func (s *Server) aptProbe(ctx context.Context, rawURL string) (bool, error) {
 // It mirrors the hit condition inside proxyOrCache rather than replacing it —
 // this is the cheap precondition that decides whether to take the coalescing
 // lock, and proxyOrCache still makes the real decision.
-func (s *Server) aptCached(ctx context.Context, store storage.ObjectStore, key string, immutable bool) bool {
+// aptCached returns what the store reports about a cached object fit to serve,
+// or nil when there is none. The metadata comes back rather than a bool because
+// the audit row for the served bytes has to name the object it is describing,
+// and a second Head to recover it would be a second answer to a question this
+// one already asked.
+func (s *Server) aptCached(ctx context.Context, store storage.ObjectStore, key string, immutable bool) *storage.ObjectInfo {
 	if store == nil {
-		return false
+		return nil
 	}
 	status, err := store.Head(ctx, key)
 	if err != nil || status == nil || !status.Exists {
-		return false
+		return nil
 	}
-	return immutable || !s.isCacheStale(status)
+	if !immutable && s.isCacheStale(status) {
+		return nil
+	}
+	return status
 }
 
 // aptPoolIsLocal reports whether a manifest entry owns this pool path, which

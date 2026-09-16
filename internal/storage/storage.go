@@ -110,6 +110,12 @@ type StreamResult struct {
 	ContentLength int64
 	ETag          string
 	ContentType   string
+	// LastModified is the store's timestamp for the object this handle is on,
+	// taken by the open that produced Body. A Head taken beforehand describes
+	// whatever was at the key then, which is a different object whenever a
+	// writer landed in between, so a caller binding a record to the bytes it
+	// serves has to read the metadata off the same operation as the bytes.
+	LastModified time.Time
 }
 
 // ObjectInfo holds metadata about a stored object.

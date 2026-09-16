@@ -31,6 +31,7 @@ package audit
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -89,7 +90,7 @@ const (
 
 	// Client events (HTTP server).
 	EventServeFetch EventType = "serve_fetch" // client downloaded a package via HTTP
-	EventCache      EventType = "cache"       // proxy cache miss
+	EventCache      EventType = "cache"       // proxy outcome: hit, miss, or a refusal on the way
 
 	// EventDenied is a request the server refused: a deny-listed IP, mutation
 	// auth, an admin-only read endpoint, a frozen entry, or a version outside
@@ -98,6 +99,20 @@ const (
 	// turned away" five queries instead of one. Which gate refused is in
 	// Status; see the Denial* constants.
 	EventDenied EventType = "denied"
+)
+
+// Status values for EventCache. They name the proxy outcome, so an operator
+// asking which artifacts came from upstream can tell that from an artifact the
+// cache answered and from the two refusals that write the same type.
+//
+// A constant per outcome rather than a literal at the call site: EventCache
+// was defined and written only by the two refusals for as long as it existed,
+// because nothing on the serving path named a status it was obliged to pass.
+const (
+	CacheHit              = "cache_hit"         // served from storage, no upstream contact
+	CacheMiss             = "cache_miss"        // fetched from upstream and cached
+	CacheChecksumMismatch = "checksum_mismatch" // upstream bytes disagreed with the pinned digest
+	CachePolicyViolation  = "policy_violation"  // upstream allow-list refused the candidate
 )
 
 // Status values for EventDenied. They name the gate that refused, so an
@@ -590,6 +605,99 @@ func (a *DB) StoreChecksum(ctx context.Context, s3Key, pkgType, pkgName, pkgVers
 		s3Key, pkgType, pkgName, pkgVersion, algorithm, value, source,
 	)
 	return err
+}
+
+// ObjectIdentity is what a store reports about one cached object, and it is
+// what binds a recorded origin to those bytes rather than to their key.
+//
+// Backend is the store's Label(), so an object moved between buckets stops
+// matching. Size with Modified is the identity every backend can produce;
+// ETag is preferred where the backend supplies one, because it survives a
+// rewrite that lands the same length in the same clock tick.
+type ObjectIdentity struct {
+	Backend  string
+	Size     int64
+	ETag     string
+	Modified string
+}
+
+// Known reports whether this identity names an object at all. A zero value is
+// what a caller with no store metadata in hand passes, and it must match
+// nothing.
+func (o ObjectIdentity) Known() bool {
+	return o.Backend != "" && (o.Size >= 0 || o.ETag != "")
+}
+
+// matches reports whether stored describes the same object as o.
+//
+// ETag decides where both sides have one: it is a content token, and the two
+// fields below are not. Size and Modified together are the fallback, which
+// costs a rewrite of identical length inside one filesystem timestamp tick —
+// narrow enough to accept, and it errs toward crediting bytes that are in fact
+// the same bytes.
+func (o ObjectIdentity) matches(stored ObjectIdentity) bool {
+	if !o.Known() || !stored.Known() || o.Backend != stored.Backend {
+		return false
+	}
+	if o.ETag != "" && stored.ETag != "" {
+		return o.ETag == stored.ETag
+	}
+	return o.Size == stored.Size && o.Modified == stored.Modified
+}
+
+// StoreCacheOrigin records which upstream supplied the bytes now cached at
+// s3Key, so a later hit can name it without a network round trip. obj is what
+// the store reported about those bytes once they landed.
+//
+// It lives in the embedded store rather than in the event stream because the
+// serving path reads it to compose a row, and syslog and jsonl sinks answer no
+// reads at all. Upserted: a mutable document refetched after its TTL may come
+// from a different archive than last time, and the row has to follow the bytes.
+func (a *DB) StoreCacheOrigin(ctx context.Context, s3Key, upstreamURL string, obj ObjectIdentity) error {
+	_, err := a.writer().ExecContext(ctx,
+		`INSERT INTO cache_origins (s3_key, upstream_url, backend, object_size, object_etag, object_modified)
+		 VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(s3_key) DO UPDATE SET
+		   upstream_url = excluded.upstream_url,
+		   backend = excluded.backend,
+		   object_size = excluded.object_size,
+		   object_etag = excluded.object_etag,
+		   object_modified = excluded.object_modified,
+		   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+		s3Key, upstreamURL, obj.Backend, obj.Size, obj.ETag, obj.Modified,
+	)
+	return err
+}
+
+// CacheOrigin returns the upstream recorded for the object obj identifies at
+// s3Key, or "" when nothing recorded one — an object cached before this table
+// existed, filled by a path that fetches nothing, or written over since by one.
+// The caller says so in the row rather than substituting a current candidate.
+//
+// The identity check is here rather than at the call site so that a serving
+// path cannot read an origin without it. That is the shape the first version
+// got wrong: it trusted the key, and every writer that does not fetch — 'pkg
+// upload', a replaced object, a moved bucket — silently inherited the previous
+// tenant's attribution.
+func (a *DB) CacheOrigin(ctx context.Context, s3Key string, obj ObjectIdentity) (string, error) {
+	var (
+		upstreamURL string
+		stored      ObjectIdentity
+	)
+	err := a.db.QueryRowContext(ctx,
+		`SELECT upstream_url, backend, object_size, object_etag, object_modified
+		 FROM cache_origins WHERE s3_key = ?`, s3Key,
+	).Scan(&upstreamURL, &stored.Backend, &stored.Size, &stored.ETag, &stored.Modified)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if !obj.matches(stored) {
+		return "", nil
+	}
+	return upstreamURL, nil
 }
 
 // GetChecksum returns the stored checksum for an S3 key, or nil if not found.

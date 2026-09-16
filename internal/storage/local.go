@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -124,6 +125,7 @@ func (l *Local) GetStream(_ context.Context, key string) (*StreamResult, error) 
 		Body:          f,
 		ContentLength: fi.Size(),
 		ContentType:   ct,
+		LastModified:  fi.ModTime(),
 	}, nil
 }
 
@@ -177,6 +179,9 @@ func (l *Local) List(_ context.Context, prefix string) ([]string, error) {
 		if d.IsDir() {
 			return nil
 		}
+		if strings.HasPrefix(d.Name(), tmpPrefix) {
+			return nil
+		}
 		rel, err := filepath.Rel(l.root, path)
 		if err != nil {
 			return err
@@ -197,15 +202,141 @@ func (l *Local) List(_ context.Context, prefix string) ([]string, error) {
 	return keys, nil
 }
 
+// tmpPrefix marks a staging file that is not yet an object. It leads with a
+// dot so an operator listing the directory sees it as machinery, and List
+// skips it by this prefix so a walk concurrent with a write never returns a
+// name that is about to stop existing.
+const tmpPrefix = ".bodega-tmp-"
+
+// createStaged opens a staging file in dir at perm, which the process umask
+// filters exactly as it filters any other creation. os.CreateTemp is not used
+// because it hardcodes 0600, and correcting that afterwards means either
+// publishing every object 0644 or reading the umask back, which is only
+// possible by setting it: a window in which every other goroutine's file
+// creation takes the wrong mode.
+func createStaged(dir string, perm os.FileMode) (*os.File, error) {
+	for range 100 {
+		//nolint:gosec // perm is the writer's own mode on a replacement, or the fresh mode before umask; never a widening.
+		f, err := os.OpenFile(filepath.Join(dir, tmpPrefix+rand.Text()), os.O_RDWR|os.O_CREATE|os.O_EXCL, perm)
+		if errors.Is(err, fs.ErrExist) {
+			continue
+		}
+		return f, err
+	}
+	return nil, fmt.Errorf("create staging file in %s: no unused name", dir)
+}
+
+// openPrior opens the object a publication is about to replace, or returns nil
+// when the key holds nothing yet.
+//
+// The handle, not the path, is what the new object's access state is read
+// from, and it is held across the write so that the state applied is one the
+// object genuinely had. A key holding something that is not a regular file
+// names no object: publication replaces the name either way, and there is no
+// mode, owner or ACL on a directory that means anything on a file.
+func openPrior(p string) (*os.File, error) {
+	f, err := os.Open(p)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w. A replacement carries the access state of the object it replaces, "+
+			"which has to be read first; the previous object is unchanged", err)
+	}
+	fi, err := f.Stat()
+	if err != nil || !fi.Mode().IsRegular() {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+// publish writes p by filling a sibling staging file and renaming it into
+// place, so the key goes from its previous bytes to its new ones with no
+// intermediate state and no reuse of the inode.
+//
+// A reader holding an open handle keeps the object it opened. That is what
+// binds a cached artifact's recorded origin to the bytes the client receives:
+// the proxy takes an object's identity from the same open that supplies the
+// body, and truncating in place changed the bytes behind that handle while the
+// recorded length, timestamp and upstream still described what had been there
+// — a row crediting a server that supplied none of what was served. Locking
+// the proxy against itself would not close it, because the writer is often
+// another process using this same root.
+//
+// A new inode carries nothing the old one decided, so a replacement restates
+// all of it: mode, owner, group and extended attributes, applied to the
+// staging file before the mode that makes it readable. An operator who
+// restricted one artifact restricted it, and a refill is not a decision to
+// publish it, nor to hand it to a reader the ACL denied, nor to take it from
+// the group that owned it. Where that cannot be restated, the publication
+// fails and the old object stays: a replacement is bytes, never a change of
+// who may read them. A fresh object has no predecessor and takes freshPerm as
+// the process umask filters it, which is what the direct os.Create it replaced
+// left behind.
+func (l *Local) publish(p string, freshPerm os.FileMode, write func(io.Writer) error) (err error) {
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	prior, err := openPrior(p)
+	if err != nil {
+		return err
+	}
+	perm := freshPerm
+	if prior != nil {
+		defer prior.Close()
+		perm = stagedPerm
+	}
+	tmp, err := createStaged(dir, perm)
+	if err != nil {
+		return err
+	}
+	staged := tmp.Name()
+	defer func() {
+		if err != nil {
+			tmp.Close()
+			os.Remove(staged)
+		}
+	}()
+	if prior != nil {
+		if err = restrictStaged(tmp); err != nil {
+			return err
+		}
+	}
+	if err = write(tmp); err != nil {
+		return err
+	}
+	if prior != nil {
+		// Read after the write rather than before it. A chmod during a long
+		// fetch is a decision about the object, and the handle still names the
+		// inode whose state is being carried.
+		var want access
+		if want, err = readAccess(prior); err != nil {
+			return err
+		}
+		if err = want.applyTo(tmp, p); err != nil {
+			return err
+		}
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(staged, p)
+}
+
 func (l *Local) Put(_ context.Context, key string, data []byte) error {
 	p, err := l.path(key)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	// 0666 before the umask is what a file creation leaves. Put wrote 0644
+	// through os.WriteFile and is the one caller whose fresh objects are not
+	// group-writable on a permissive umask.
+	return l.publish(p, 0o644, func(w io.Writer) error {
+		_, err := w.Write(data)
 		return err
-	}
-	return os.WriteFile(p, data, 0o644)
+	})
 }
 
 func (l *Local) PutFile(_ context.Context, localPath, key string) error {
@@ -213,23 +344,15 @@ func (l *Local) PutFile(_ context.Context, localPath, key string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return err
-	}
 	src, err := os.Open(localPath)
 	if err != nil {
 		return err
 	}
 	defer src.Close()
-	dst, err := os.Create(p)
-	if err != nil {
+	return l.publish(p, 0o666, func(w io.Writer) error {
+		_, err := io.Copy(w, src)
 		return err
-	}
-	defer dst.Close()
-	if _, err := io.Copy(dst, src); err != nil {
-		return err
-	}
-	return dst.Close()
+	})
 }
 
 func (l *Local) Delete(_ context.Context, key string) error {
@@ -269,9 +392,6 @@ func (l *Local) SyncDir(_ context.Context, out io.Writer, localDir, keyPrefix st
 		if err != nil {
 			return err
 		}
-		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-			return err
-		}
 
 		//nolint:gosec // G122: walk root is the operator-owned storage directory; no untrusted symlink injection vector.
 		src, err := os.Open(path)
@@ -281,15 +401,10 @@ func (l *Local) SyncDir(_ context.Context, out io.Writer, localDir, keyPrefix st
 		defer src.Close()
 
 		fi, _ := src.Stat()
-		df, err := os.Create(dest)
-		if err != nil {
+		if err := l.publish(dest, 0o666, func(w io.Writer) error {
+			_, err := io.Copy(w, src)
 			return err
-		}
-		defer df.Close()
-		if _, err := io.Copy(df, src); err != nil {
-			return err
-		}
-		if err := df.Close(); err != nil {
+		}); err != nil {
 			return err
 		}
 

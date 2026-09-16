@@ -1,12 +1,21 @@
 package storage
 
 import (
+	"encoding/binary"
+	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestLocalRoundTrip(t *testing.T) {
@@ -275,5 +284,566 @@ func TestLocalTrailingSlashRootStillWrites(t *testing.T) {
 	got, err := l.Get(t.Context(), "a/b.txt")
 	if err != nil || string(got) != "x" {
 		t.Fatalf("Get = %q, %v; want \"x\", nil", got, err)
+	}
+}
+
+// localWriters drives the three entry points that publish an object, so a
+// guarantee about publication is asserted against every writer that has one
+// rather than against whichever was reached first.
+// localWriter is one of the three ways an object reaches the local backend.
+// Publication makes the same promises through all of them, so every test of
+// one runs against all three.
+type localWriter struct {
+	name  string
+	write func(t *testing.T, l *Local, key string, body []byte) error
+}
+
+func localWriters() []localWriter {
+	return []localWriter{
+		{"Put", func(t *testing.T, l *Local, key string, body []byte) error {
+			return l.Put(t.Context(), key, body)
+		}},
+		{"PutFile", func(t *testing.T, l *Local, key string, body []byte) error {
+			src := filepath.Join(t.TempDir(), "source")
+			if err := os.WriteFile(src, body, 0o600); err != nil {
+				t.Fatalf("write source: %v", err)
+			}
+			return l.PutFile(t.Context(), src, key)
+		}},
+		{"SyncDir", func(t *testing.T, l *Local, key string, body []byte) error {
+			dir, base := path.Split(key)
+			src := t.TempDir()
+			if err := os.WriteFile(filepath.Join(src, base), body, 0o600); err != nil {
+				t.Fatalf("write source: %v", err)
+			}
+			_, err := l.SyncDir(t.Context(), nil, src, dir)
+			return err
+		}},
+	}
+}
+
+// mustWrite is every test that is not about a refusal.
+func (w localWriter) mustWrite(t *testing.T, l *Local, key string, body []byte) {
+	t.Helper()
+	if err := w.write(t, l, key, body); err != nil {
+		t.Fatalf("%s: %v", w.name, err)
+	}
+}
+
+// withUmask installs a umask for the duration of one test. The umask is
+// process-global, so a test calling this must not run in parallel with
+// anything that creates a file.
+func withUmask(t *testing.T, mask int) {
+	t.Helper()
+	previous := syscall.Umask(mask)
+	t.Cleanup(func() { syscall.Umask(previous) })
+}
+
+// publishedMode is the permission bits and the three above them. A set-group
+// bit is a grant like any other, and Go spells it outside the low nine.
+func publishedMode(t *testing.T, root, key string) os.FileMode {
+	t.Helper()
+	fi, err := os.Stat(filepath.Join(root, filepath.FromSlash(key)))
+	if err != nil {
+		t.Fatalf("stat published object: %v", err)
+	}
+	return fi.Mode() & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky)
+}
+
+// An object published through a staging file and a rename carries no mode from
+// the destination it lands on, so the umask that filtered os.Create has to be
+// applied to the staging file instead. A server under umask 077 stored private
+// artifacts before publication became atomic and must still.
+func TestLocalPublishHonorsUmaskOnAFreshObject(t *testing.T) {
+	for _, w := range localWriters() {
+		t.Run(w.name, func(t *testing.T) {
+			withUmask(t, 0o077)
+			root := t.TempDir()
+			const key = "packages/npm/private.tgz"
+			w.mustWrite(t, NewLocal(root), key, []byte("secret"))
+			if got := publishedMode(t, root, key); got != 0o600 {
+				t.Errorf("published mode = %04o, want 0600", got)
+			}
+		})
+	}
+}
+
+// A refill is not a decision to publish an artifact the operator restricted,
+// so replacement keeps the mode that was there. 0644 under umask 077 is the
+// case the umask alone gets wrong: it clips the staging file, and only the
+// destination's own mode says how wide the object is meant to be.
+func TestLocalPublishKeepsTheModeOfTheObjectItReplaces(t *testing.T) {
+	for _, mode := range []os.FileMode{0o600, 0o640, 0o644, 0o640 | os.ModeSetgid} {
+		for _, w := range localWriters() {
+			t.Run(fmt.Sprintf("%v/%s", mode, w.name), func(t *testing.T) {
+				withUmask(t, 0o077)
+				root := t.TempDir()
+				const key = "packages/npm/refilled.tgz"
+				w.mustWrite(t, NewLocal(root), key, []byte("first"))
+				p := filepath.Join(root, filepath.FromSlash(key))
+				if err := os.Chmod(p, mode); err != nil {
+					t.Fatalf("chmod: %v", err)
+				}
+
+				w.mustWrite(t, NewLocal(root), key, []byte("second"))
+
+				if got := publishedMode(t, root, key); got != mode {
+					t.Errorf("published mode = %v, want %v", got, mode)
+				}
+				got, err := os.ReadFile(p)
+				if err != nil {
+					t.Fatalf("read replaced object: %v", err)
+				}
+				if string(got) != "second" {
+					t.Errorf("replaced object = %q, want %q", got, "second")
+				}
+			})
+		}
+	}
+}
+
+// aclEntry is one row of a POSIX ACL in the binary form the kernel keeps in
+// system.posix_acl_access. Tests build ACLs this way rather than shelling out
+// to setfacl, which is not installed everywhere the suite runs.
+type aclEntry struct {
+	tag  uint16
+	perm uint16
+	qual uint32
+}
+
+const (
+	aclUserObj  = 0x01
+	aclUser     = 0x02
+	aclGroupObj = 0x04
+	aclMask     = 0x10
+	aclOther    = 0x20
+	aclNoQual   = 0xFFFFFFFF
+
+	accessACL  = "system.posix_acl_access"
+	defaultACL = "system.posix_acl_default"
+)
+
+// posixACL serializes entries, which must already be in the order the kernel
+// stores them: owner, named users, owning group, named groups, mask, other.
+func posixACL(entries ...aclEntry) []byte {
+	buf := binary.LittleEndian.AppendUint32(nil, 2) // ACL_EA_VERSION
+	for _, e := range entries {
+		buf = binary.LittleEndian.AppendUint16(buf, e.tag)
+		buf = binary.LittleEndian.AppendUint16(buf, e.perm)
+		buf = binary.LittleEndian.AppendUint32(buf, e.qual)
+	}
+	return buf
+}
+
+// requirePOSIXACL sets an ACL through the Linux interface for one, and skips
+// where there is none. macOS keeps its ACLs where getxattr will not read from,
+// which is why publication clones the object it replaces there and why
+// denyNamedReader goes through chmod on that platform.
+func requirePOSIXACL(t *testing.T, target, name string, acl []byte) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skipf("POSIX ACLs are set through %s, which is Linux's interface for them", name)
+	}
+	err := unix.Setxattr(target, name, acl, 0)
+	if unsupportedXattr(err) {
+		t.Skipf("set %s on %s: %v", name, target, err)
+	}
+	if err != nil {
+		t.Fatalf("set %s on %s: %v", name, target, err)
+	}
+}
+
+// denyNamedReader puts an ACL on target that refuses one principal the mode
+// bits would let in. The principal is never the test process: an ACL it could
+// not read past would stop publication before it reached the part under test.
+func denyNamedReader(t *testing.T, target string) {
+	t.Helper()
+	if runtime.GOOS == "darwin" {
+		chmodACL(t, target, "group:_guest deny read")
+		return
+	}
+	requirePOSIXACL(t, target, accessACL, posixACL(
+		aclEntry{aclUserObj, 6, aclNoQual},
+		//nolint:gosec // G115: a uid this process does not have, which is all the entry needs.
+		aclEntry{aclUser, 0, uint32(os.Getuid() + 1)},
+		aclEntry{aclGroupObj, 4, aclNoQual},
+		aclEntry{aclMask, 4, aclNoQual},
+		aclEntry{aclOther, 4, aclNoQual},
+	))
+}
+
+// denyInheritedReader puts an ACL on a directory that every file created in it
+// afterwards is born with, which is where a staging file gets restrictions the
+// object it replaces never had.
+func denyInheritedReader(t *testing.T, dir string) {
+	t.Helper()
+	if runtime.GOOS == "darwin" {
+		chmodACL(t, dir, "group:_guest deny read,file_inherit")
+		return
+	}
+	// A named entry keeps the inherited ACL from being equivalent to the mode
+	// bits, which is the case a filesystem drops rather than stores.
+	requirePOSIXACL(t, dir, defaultACL, posixACL(
+		aclEntry{aclUserObj, 6, aclNoQual},
+		//nolint:gosec // G115: a uid this process does not have, which is all the entry needs.
+		aclEntry{aclUser, 0, uint32(os.Getuid() + 1)},
+		aclEntry{aclGroupObj, 0, aclNoQual},
+		aclEntry{aclMask, 6, aclNoQual},
+		aclEntry{aclOther, 0, aclNoQual},
+	))
+}
+
+func chmodACL(t *testing.T, target, entry string) {
+	t.Helper()
+	if out, err := exec.Command("/bin/chmod", "+a", entry, target).CombinedOutput(); err != nil {
+		t.Skipf("chmod +a %q on %s: %v: %s", entry, target, err, out)
+	}
+}
+
+// objectACL reads back whatever ACL an object carries, in whichever form the
+// platform will show one, and returns an empty string where it carries none.
+func objectACL(t *testing.T, target string) string {
+	t.Helper()
+	if runtime.GOOS == "darwin" {
+		listing, err := exec.Command("/bin/ls", "-led", target).Output()
+		if err != nil {
+			t.Fatalf("ls -led %s: %v", target, err)
+		}
+		_, acl, _ := strings.Cut(string(listing), "\n")
+		return acl
+	}
+	acl, err := readXattr(t, target, accessACL)
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%x", acl)
+}
+
+func readXattr(t *testing.T, target, name string) ([]byte, error) {
+	t.Helper()
+	size, err := unix.Getxattr(target, name, nil)
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]byte, size)
+	n, err := unix.Getxattr(target, name, buf)
+	if err != nil {
+		return nil, err
+	}
+	return buf[:n], nil
+}
+
+func statOwner(t *testing.T, target string) (int, int) {
+	t.Helper()
+	var st unix.Stat_t
+	if err := unix.Stat(target, &st); err != nil {
+		t.Fatalf("stat %s: %v", target, err)
+	}
+	return int(st.Uid), int(st.Gid)
+}
+
+// secondGroup returns a group the process belongs to that is not the one its
+// files are created in, which is the only group a test can hand an object
+// without being root.
+func secondGroup(t *testing.T) int {
+	t.Helper()
+	groups, err := os.Getgroups()
+	if err != nil {
+		t.Fatalf("getgroups: %v", err)
+	}
+	for _, gid := range groups {
+		if gid != os.Getgid() {
+			return gid
+		}
+	}
+	t.Skip("the process belongs to one group, so no test can move an object to another")
+	return 0
+}
+
+func stagingLeftovers(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read %s: %v", dir, err)
+	}
+	var left []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), tmpPrefix) {
+			left = append(left, e.Name())
+		}
+	}
+	return left
+}
+
+// A mode says who may read an object only until an ACL disagrees with it. An
+// artifact at 0644 that denies one named user is denying them; a replacement
+// that carried the 0644 and dropped the ACL would hand that user the artifact
+// and report nothing, because every bit anybody looks at is unchanged.
+func TestLocalPublishKeepsTheAccessACLOfTheObjectItReplaces(t *testing.T) {
+	for _, w := range localWriters() {
+		t.Run(w.name, func(t *testing.T) {
+			root := t.TempDir()
+			const key = "packages/npm/restricted.tgz"
+			w.mustWrite(t, NewLocal(root), key, []byte("first"))
+			p := filepath.Join(root, filepath.FromSlash(key))
+			if err := os.Chmod(p, 0o644); err != nil {
+				t.Fatalf("chmod: %v", err)
+			}
+			denyNamedReader(t, p)
+			want := objectACL(t, p)
+			if want == "" {
+				t.Fatalf("the fixture set no ACL on %s", p)
+			}
+
+			w.mustWrite(t, NewLocal(root), key, []byte("second"))
+
+			if got := objectACL(t, p); got != want {
+				t.Errorf("access ACL = %s, want %s", got, want)
+			}
+			if mode := publishedMode(t, root, key); mode != 0o644 {
+				t.Errorf("published mode = %04o, want 0644", mode)
+			}
+			if body, err := os.ReadFile(p); err != nil || string(body) != "second" {
+				t.Errorf("replaced object = %q (%v), want %q", body, err, "second")
+			}
+		})
+	}
+}
+
+// The other direction, and the reason a staging file's attributes are not
+// merely added to: a directory carrying a default ACL gives every file created
+// in it an access ACL, including the staging file. Publishing that ACL onto an
+// object that had none denies readers the object allowed.
+func TestLocalPublishDropsAnACLTheObjectNeverHad(t *testing.T) {
+	for _, w := range localWriters() {
+		t.Run(w.name, func(t *testing.T) {
+			root := t.TempDir()
+			const key = "packages/npm/plain.tgz"
+			w.mustWrite(t, NewLocal(root), key, []byte("first"))
+			p := filepath.Join(root, filepath.FromSlash(key))
+			denyInheritedReader(t, filepath.Dir(p))
+			before := publishedMode(t, root, key)
+
+			w.mustWrite(t, NewLocal(root), key, []byte("second"))
+
+			if got := objectACL(t, p); got != "" {
+				t.Errorf("the replacement inherited an ACL the object never had: %s", got)
+			}
+			if mode := publishedMode(t, root, key); mode != before {
+				t.Errorf("published mode = %04o, want %04o", mode, before)
+			}
+
+			// A fresh object in the same directory is a new file and does
+			// inherit, which publication has no business undoing.
+			const fresh = "packages/npm/inherits.tgz"
+			w.mustWrite(t, NewLocal(root), fresh, []byte("fresh"))
+			if objectACL(t, filepath.Join(root, filepath.FromSlash(fresh))) == "" {
+				t.Error("a fresh object did not inherit the directory's ACL")
+			}
+		})
+	}
+}
+
+// An artifact at 0640 owned by root:deploy is readable by the deploy group and
+// by nothing else. The group is the whole grant, and a replacement that landed
+// it root:root would take it away from every reader it had.
+func TestLocalPublishKeepsTheGroupOfTheObjectItReplaces(t *testing.T) {
+	for _, w := range localWriters() {
+		t.Run(w.name, func(t *testing.T) {
+			gid := secondGroup(t)
+			root := t.TempDir()
+			const key = "packages/npm/grouped.tgz"
+			w.mustWrite(t, NewLocal(root), key, []byte("first"))
+			p := filepath.Join(root, filepath.FromSlash(key))
+			if err := os.Chown(p, -1, gid); err != nil {
+				t.Skipf("chgrp %s to %d: %v", p, gid, err)
+			}
+			if err := os.Chmod(p, 0o640); err != nil {
+				t.Fatalf("chmod: %v", err)
+			}
+
+			w.mustWrite(t, NewLocal(root), key, []byte("second"))
+
+			if _, got := statOwner(t, p); got != gid {
+				t.Errorf("published group = %d, want %d", got, gid)
+			}
+			if mode := publishedMode(t, root, key); mode != 0o640 {
+				t.Errorf("published mode = %04o, want 0640", mode)
+			}
+		})
+	}
+}
+
+// Where the ownership cannot be restated, publication fails rather than
+// landing the bytes under different access rights. The kernel decides that:
+// an unprivileged owner cannot hand a file to a group it does not belong to,
+// and no test can create that file without being root, so the call is stubbed.
+func TestLocalPublishRefusesWhenOwnershipCannotFollow(t *testing.T) {
+	for _, w := range localWriters() {
+		t.Run(w.name, func(t *testing.T) {
+			gid := secondGroup(t)
+			root := t.TempDir()
+			const key = "packages/npm/grouped.tgz"
+			w.mustWrite(t, NewLocal(root), key, []byte("first"))
+			p := filepath.Join(root, filepath.FromSlash(key))
+			if err := os.Chown(p, -1, gid); err != nil {
+				t.Skipf("chgrp %s to %d: %v", p, gid, err)
+			}
+			if err := os.Chmod(p, 0o640); err != nil {
+				t.Fatalf("chmod: %v", err)
+			}
+
+			restore := fchown
+			fchown = func(int, int, int) error { return unix.EPERM }
+			t.Cleanup(func() { fchown = restore })
+
+			err := w.write(t, NewLocal(root), key, []byte("second"))
+
+			if err == nil {
+				t.Fatalf("%s replaced an object whose ownership it could not carry", w.name)
+			}
+			if !strings.Contains(err.Error(), "ownership") {
+				t.Errorf("error = %v, want one naming the ownership it could not restore", err)
+			}
+			if body, readErr := os.ReadFile(p); readErr != nil || string(body) != "first" {
+				t.Errorf("object = %q (%v), want the previous %q", body, readErr, "first")
+			}
+			if mode := publishedMode(t, root, key); mode != 0o640 {
+				t.Errorf("mode = %04o, want the previous 0640", mode)
+			}
+			if _, got := statOwner(t, p); got != gid {
+				t.Errorf("group = %d, want the previous %d", got, gid)
+			}
+			if left := stagingLeftovers(t, filepath.Dir(p)); len(left) != 0 {
+				t.Errorf("staging files left behind: %v", left)
+			}
+		})
+	}
+}
+
+// otherIdentity is the account the cross-identity tests read as. It owns
+// nothing, and every check below is a read of a file in a temporary directory.
+const otherIdentity = "nobody"
+
+// requireOtherIdentity skips unless this host will run a command as somebody
+// else without asking, which is what it takes to test an access boundary by
+// crossing it rather than by reading the metadata that describes it.
+func requireOtherIdentity(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("the fixture sets a POSIX ACL and a group through Linux's interfaces for them")
+	}
+	if err := exec.Command("sudo", "-n", "-u", otherIdentity, "true").Run(); err != nil {
+		t.Skipf("this host will not run a command as %s without a password: %v", otherIdentity, err)
+	}
+}
+
+func identityID(t *testing.T, flag string) uint32 {
+	t.Helper()
+	out, err := exec.Command("id", flag, otherIdentity).Output()
+	if err != nil {
+		t.Skipf("id %s %s: %v", flag, otherIdentity, err)
+	}
+	id, err := strconv.ParseUint(strings.TrimSpace(string(out)), 10, 32)
+	if err != nil {
+		t.Fatalf("id %s %s = %q: %v", flag, otherIdentity, out, err)
+	}
+	return uint32(id)
+}
+
+// reachable asks the kernel, as otherIdentity, whether it can read the object.
+func reachable(t *testing.T, p string) bool {
+	t.Helper()
+	return exec.Command("sudo", "-n", "-u", otherIdentity, "cat", p).Run() == nil
+}
+
+// traversable opens the temporary tree far enough for another account to reach
+// an object in it. Go makes a test's directory private, which would deny every
+// read below for a reason that has nothing to do with the object.
+func traversable(t *testing.T, root string) {
+	t.Helper()
+	for dir := root; strings.HasPrefix(dir, os.TempDir()+"/"); dir = filepath.Dir(dir) {
+		if err := os.Chmod(dir, 0o755); err != nil {
+			t.Fatalf("open %s to traversal: %v", dir, err)
+		}
+	}
+}
+
+// The regression the mode bits cannot show: a replacement that keeps 0644 and
+// drops the ACL under it, or keeps 0640 and moves the object to a group its
+// readers are not in. Both publish successfully, report nothing, and change
+// who holds the artifact — so the test asks the kernel, as somebody else,
+// rather than asking the metadata.
+//
+// Where publication cannot restate the ownership it refuses, and the answer is
+// the same either way: the object an identity could read before a refill is
+// the object it can read after one.
+func TestLocalPublishKeepsWhoCanReadTheObject(t *testing.T) {
+	for _, w := range localWriters() {
+		t.Run(w.name+"/denied by an ACL", func(t *testing.T) {
+			requireOtherIdentity(t)
+			root := t.TempDir()
+			traversable(t, root)
+			const key = "packages/npm/denied.tgz"
+			w.mustWrite(t, NewLocal(root), key, []byte("first"))
+			p := filepath.Join(root, filepath.FromSlash(key))
+			if err := os.Chmod(p, 0o644); err != nil {
+				t.Fatalf("chmod: %v", err)
+			}
+			requirePOSIXACL(t, p, accessACL, posixACL(
+				aclEntry{aclUserObj, 6, aclNoQual},
+				aclEntry{aclUser, 0, identityID(t, "-u")},
+				aclEntry{aclGroupObj, 4, aclNoQual},
+				aclEntry{aclMask, 4, aclNoQual},
+				aclEntry{aclOther, 4, aclNoQual},
+			))
+			if reachable(t, p) {
+				t.Fatalf("the fixture does not deny %s: it read the object before any replacement", otherIdentity)
+			}
+
+			w.mustWrite(t, NewLocal(root), key, []byte("second"))
+
+			if reachable(t, p) {
+				t.Errorf("%s reads an artifact the object denied it, at mode %04o", otherIdentity, publishedMode(t, root, key))
+			}
+		})
+
+		t.Run(w.name+"/granted by a group", func(t *testing.T) {
+			requireOtherIdentity(t)
+			root := t.TempDir()
+			traversable(t, root)
+			const key = "packages/npm/grouped.tgz"
+			w.mustWrite(t, NewLocal(root), key, []byte("first"))
+			p := filepath.Join(root, filepath.FromSlash(key))
+			gid := identityID(t, "-g")
+			if out, err := exec.Command("sudo", "-n", "chgrp", fmt.Sprint(gid), p).CombinedOutput(); err != nil {
+				t.Skipf("chgrp %s to %d: %v: %s", p, gid, err, out)
+			}
+			if err := os.Chmod(p, 0o640); err != nil {
+				t.Fatalf("chmod: %v", err)
+			}
+			if !reachable(t, p) {
+				t.Fatalf("the fixture does not grant %s: it could not read the object before any replacement", otherIdentity)
+			}
+
+			// Restating that group needs privilege this process may not have.
+			// Refusing is an answer; publishing under a group the reader is
+			// not in is not.
+			if err := w.write(t, NewLocal(root), key, []byte("second")); err != nil {
+				t.Logf("%s refused the replacement: %v", w.name, err)
+				if body, readErr := os.ReadFile(p); readErr != nil || string(body) != "first" {
+					t.Errorf("object = %q (%v), want the previous %q", body, readErr, "first")
+				}
+				if left := stagingLeftovers(t, filepath.Dir(p)); len(left) != 0 {
+					t.Errorf("staging files left behind: %v", left)
+				}
+			}
+			if _, got := statOwner(t, p); got != int(gid) {
+				t.Errorf("published group = %d, want %d", got, gid)
+			}
+			if !reachable(t, p) {
+				t.Errorf("%s lost an artifact the object granted it, at mode %04o", otherIdentity, publishedMode(t, root, key))
+			}
+		})
 	}
 }
