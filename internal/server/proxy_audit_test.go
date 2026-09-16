@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -14,8 +15,10 @@ import (
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/placement"
 	"github.com/ravinald/bodega/internal/storage"
 )
 
@@ -629,4 +632,185 @@ func TestAptPoolCacheHitWithNoRouteAndSeveralArchives(t *testing.T) {
 		t.Fatalf("upstream GETs = %d, want 1", got)
 	}
 	requireOneHitNaming(t, s, archive.URL(), other.URL())
+}
+
+// TestCacheRowsNameTheServerThatAnsweredARedirect pins provenance through a
+// redirect. upstreamClient follows one, so the URL bodega composed and the URL
+// that supplied the bytes are two different hosts: recording the first credits
+// a redirector for content it never held, and leaves the server that did hold
+// it absent from the trail an incident reads.
+func TestCacheRowsNameTheServerThatAnsweredARedirect(t *testing.T) {
+	allowLoopbackUpstream(t)
+	target := gomodUpstreamFixture(t, 4096)
+
+	var hops atomic.Int64
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hops.Add(1)
+		//nolint:gosec // G710: the destination is this test's own fixture; only the path comes from the request, and that path is what bodega asked for.
+		http.Redirect(w, r, target.URL+r.URL.Path, http.StatusFound)
+	}))
+	t.Cleanup(redirector.Close)
+
+	s := newProxyAuditServer(t, redirector.URL, 0)
+	zipPath := "/go/" + proxyAuditModule + "/@v/" + proxyAuditVersion + ".zip"
+	for i := range 2 {
+		if code, body := getProxy(t, s, zipPath); code != http.StatusOK {
+			t.Fatalf("GET %s #%d = %d, want 200 (%s)", zipPath, i+1, code, body)
+		}
+	}
+
+	// One contact for two requests. The hit reads its origin out of the audit
+	// store, and a hit that re-walked the chain to find out who answered would
+	// be paying upstream latency for a row.
+	if got := hops.Load(); got != 1 {
+		t.Errorf("redirector was contacted %d times, want 1 — the hit resolved upstream", got)
+	}
+
+	want := target.URL + "/" + proxyAuditModule + "/@v/" + proxyAuditVersion + ".zip"
+	hits, misses := splitCacheRows(t, s)
+	if misses != 1 || len(hits) != 1 {
+		t.Fatalf("cache rows = %d hit / %d miss, want 1 each (%+v)", len(hits), misses, cacheRows(t, s))
+	}
+	for _, row := range cacheRows(t, s) {
+		if !strings.Contains(row.Details, want) {
+			t.Errorf("%s row details = %q, want the responding server %q", row.Status, row.Details, want)
+		}
+		if strings.Contains(row.Details, redirector.URL) {
+			t.Errorf("%s row details = %q, credits the redirector, which supplied no bytes", row.Status, row.Details)
+		}
+	}
+}
+
+// TestARedirectOntoABlockedHostIsRefused keeps the SSRF guard on every hop.
+// The validated URL is the one bodega composed; an upstream that answers 302
+// chooses the next one, and following it unchecked would hand any registry a
+// route to the metadata service through bodega's own credentials.
+func TestARedirectOntoABlockedHostIsRefused(t *testing.T) {
+	// The destination is up and serving, so the guard is the only thing that
+	// can stop the fetch reaching it. A target that merely refuses the
+	// connection would let this pass with no guard at all.
+	blocked := gomodUpstreamFixture(t, 64)
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		//nolint:gosec // G710: see the fixture in TestCacheRowsNameTheServerThatAnsweredARedirect; the destination is test-owned.
+		http.Redirect(w, r, blocked.URL+r.URL.Path, http.StatusFound)
+	}))
+	t.Cleanup(redirector.Close)
+
+	saved := upstreamGuard
+	upstreamGuard = func(rawURL string) error {
+		if strings.HasPrefix(rawURL, redirector.URL) {
+			return nil
+		}
+		return fmt.Errorf("upstream URL resolves to a private address: %s", rawURL)
+	}
+	t.Cleanup(func() { upstreamGuard = saved })
+
+	up, err := openUpstream(t.Context(), redirector.URL+"/"+proxyAuditModule+"/@v/list")
+	if err == nil {
+		up.body.Close()
+		t.Fatalf("openUpstream followed a redirect onto %s, which the guard refuses", blocked.URL)
+	}
+}
+
+// TestUploadedBytesDoNotInheritTheProxyOrigin is the defect a key-keyed origin
+// cannot see: 'bodega pkg upload' writes a locally built artifact over a
+// mirrored one at the same key and fetches nothing, so the next hit served the
+// new bytes and credited the archive that supplied the old ones. No delete is
+// involved, which is why pruning origins for deleted keys does not reach it.
+func TestUploadedBytesDoNotInheritTheProxyOrigin(t *testing.T) {
+	archive := newFixtureArchive(t, map[string]string{fixtureDeb: fixtureDebBody})
+	s := mirrorServer(t, archive)
+	debPath := "/apt/" + fixtureDeb
+	if code, body := mirrorGet(t, s, debPath); code != http.StatusOK {
+		t.Fatalf("GET %s = %d, want 200 (%s)", debPath, code, body)
+	}
+
+	const replacement = "replacement built locally"
+	local := filepath.Join(t.TempDir(), "replacement.deb")
+	if err := os.WriteFile(local, []byte(replacement), 0o600); err != nil {
+		t.Fatalf("write the replacement artifact: %v", err)
+	}
+	// The production upload path, not a store write: the point is that a
+	// supported command puts these bytes there.
+	placer := placement.NewWith(s.stores, s.store, io.Discard, false)
+	n, err := placer.UploadPaths(t.Context(), manifest.TypeApt, []builder.ArtifactPath{{
+		Local:   local,
+		S3Key:   manifest.AptKey(fixtureDeb),
+		Package: "nginx",
+		Version: "1.24.0-2ubuntu7.1",
+	}})
+	if err != nil || n != 1 {
+		t.Fatalf("UploadPaths wrote %d objects, err = %v", n, err)
+	}
+
+	code, body := mirrorGet(t, s, debPath)
+	if code != http.StatusOK || string(body) != replacement {
+		t.Fatalf("GET %s = %d %q, want 200 %q", debPath, code, body, replacement)
+	}
+	if got := archive.count(fixtureDeb); got != 1 {
+		t.Fatalf("upstream GETs = %d, want 1 — the replacement was refetched", got)
+	}
+	// The first GET was the miss that filled the cache, so the replacement is
+	// the only request the cache answered.
+	hit := requireOneHitNaming(t, s, "", archive.URL())
+	if !strings.Contains(hit.Details, cacheOriginUnrecorded) {
+		t.Errorf("hit row details = %q, want %q for an object no fetch produced", hit.Details, cacheOriginUnrecorded)
+	}
+}
+
+// pausedPutStore holds the first PutFile open after the bytes have landed,
+// which is the window a fill is readable in and unattributed in. Nothing in
+// the recorders changes under it: it only pins a scheduling order that the
+// race detector cannot produce on demand, because every store and audit call
+// on this path is individually synchronized.
+type pausedPutStore struct {
+	storage.ObjectStore
+	written chan struct{}
+	resume  chan struct{}
+	puts    atomic.Int32
+}
+
+func (p *pausedPutStore) PutFile(ctx context.Context, localPath, key string) error {
+	err := p.ObjectStore.PutFile(ctx, localPath, key)
+	if err == nil && p.puts.Add(1) == 1 {
+		close(p.written)
+		<-p.resume
+	}
+	return err
+}
+
+// TestAHitDuringAFillNamesTheUpstreamPublishingIt covers the gap between the
+// bytes becoming readable and the origin row landing. A second client arriving
+// inside it was served the fetched artifact and recorded as unrecorded, which
+// reports the one fetch bodega could account for as the one it could not.
+func TestAHitDuringAFillNamesTheUpstreamPublishingIt(t *testing.T) {
+	allowLoopbackUpstream(t)
+	up := gomodUpstreamFixture(t, 4096)
+	s := newProxyAuditServer(t, up.URL, 0)
+	held := &pausedPutStore{
+		ObjectStore: storage.NewMemory(),
+		written:     make(chan struct{}),
+		resume:      make(chan struct{}),
+	}
+	s.stores = storage.NewSingle(held)
+
+	zipPath := "/go/" + proxyAuditModule + "/@v/" + proxyAuditVersion + ".zip"
+	filled := make(chan int, 1)
+	go func() {
+		code, _ := getProxy(t, s, zipPath)
+		filled <- code
+	}()
+
+	select {
+	case <-held.written:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the fill never published its bytes")
+	}
+
+	code, body := getProxy(t, s, zipPath)
+	close(held.resume)
+	if first := <-filled; first != http.StatusOK || code != http.StatusOK || len(body) != 4096 {
+		t.Fatalf("responses = %d and %d, body = %d bytes, want 200, 200, 4096", first, code, len(body))
+	}
+	requireOneHitNaming(t, s, up.URL)
 }

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
@@ -101,7 +102,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			// Before the body, not after: a client that hangs up mid-transfer
 			// still asked for the artifact, and the row is the record of the
 			// request rather than of the delivery.
-			s.recordCacheHit(ctx, r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key)
+			s.recordCacheHit(ctx, r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key, objectIdentity(store, status))
 			s.proxyS3(w, r, store, s3Key)
 			return
 		}
@@ -114,7 +115,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			// Stale but no upstream — serve what we have. Recorded for the
 			// same reason the fresh hit is: the row counts requests, and a
 			// cache the request never left is still a request.
-			s.recordCacheHit(ctx, r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key)
+			s.recordCacheHit(ctx, r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key, objectIdentity(store, status))
 			s.proxyS3(w, r, store, s3Key)
 			return
 		}
@@ -153,7 +154,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			// An outage is the window an operator reads these columns in.
 			// Left unrecorded, request_count and last_client go quiet exactly
 			// while the upstream is down and the cache is carrying the fleet.
-			s.recordCacheHit(ctx, r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key)
+			s.recordCacheHit(ctx, r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key, objectIdentity(store, status))
 			s.proxyS3(w, r, store, s3Key)
 			return
 		}
@@ -191,7 +192,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			// other direction. The cache row has no such double: the response
 			// is cached bytes, and an outage is precisely the window an
 			// operator asks which artifacts the cache is carrying.
-			s.recordCacheServed(r, regType, policyCandidate, discoveryPkgName, s3Key)
+			s.recordCacheServed(r, regType, policyCandidate, discoveryPkgName, s3Key, objectIdentity(store, status))
 			s.proxyS3(w, r, store, s3Key)
 			return
 		}
@@ -225,7 +226,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 				// bytes the client got. Either one alone leaves a 200 response
 				// whose artifact came from the cache indistinguishable from a
 				// request that was simply refused.
-				s.recordCacheServed(r, regType, policyCandidate, discoveryPkgName, s3Key)
+				s.recordCacheServed(r, regType, policyCandidate, discoveryPkgName, s3Key, objectIdentity(store, status))
 				s.proxyS3(w, r, store, s3Key)
 				return
 			}
@@ -258,19 +259,19 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	// them separately is how a cache entry lands in a backend the next Head
 	// never looks at.
 	if store != nil {
-		if err := store.PutFile(ctx, spool.path(), s3Key); err != nil {
-			s.logger.Warn("failed to cache object", "key", s3Key, "error", err)
-		} else {
-			s.logger.Debug("cached object", "key", s3Key, "bytes", spool.size)
-			s.recordCacheOrigin(ctx, s3Key, upstreamURL)
-		}
+		s.fillCache(ctx, store, s3Key, spool.path(), up.url, spool.size)
 	}
 
 	// After the store write and before the body: by here the fetch has been
 	// verified and cached, so the row names an upstream that actually answered
 	// rather than one that was contacted. A client that hangs up during the
 	// copy below still caused the fetch, and the row is the record of it.
-	s.recordCacheEvent(r, audit.CacheMiss, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key)
+	//
+	// up.url, not upstreamURL: the row answers which host supplied these
+	// bytes. The candidate bodega composed is what the allow-list ruled on and
+	// what discovery aggregates, and recordUpstreamAttempt above has already
+	// recorded it under both of those meanings.
+	s.recordCacheEvent(r, audit.CacheMiss, regType, up.url, policyCandidate, discoveryPkgName, s3Key)
 
 	ct := up.contentType
 	if ct == "" {
@@ -311,8 +312,17 @@ func (s *Server) isCacheStale(status *storage.ObjectInfo) bool {
 // upstreamClient is a dedicated HTTP client for upstream fetches with an
 // explicit timeout so that slow or unresponsive upstreams cannot hold
 // goroutines open indefinitely.
+//
+// CheckRedirect re-runs the SSRF guard on every hop. The guard is applied to
+// the URL bodega composed, and a registry that answers 302 chooses the next
+// one: without this, an upstream could walk the fetch to the metadata service
+// or onto the loopback interface and the validated first hop would be the only
+// address anything checked.
 var upstreamClient = &http.Client{
 	Timeout: 90 * time.Second,
+	CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+		return upstreamGuard(req.URL.String())
+	},
 }
 
 // validateUpstreamURL rejects URLs that use non-HTTPS schemes or resolve to
@@ -385,6 +395,11 @@ var upstreamGuard = validateUpstreamURL
 // upstreamStream is one upstream response whose body has not been read. The
 // caller closes body.
 type upstreamStream struct {
+	// url is the address that answered, which is the last hop of any redirect
+	// chain and not necessarily the one bodega composed. The two are the same
+	// artifact only in the sense that one pointed at the other: a redirector
+	// supplies no bytes, so crediting it in the trail names a host an incident
+	// would then go and look at for content it never held.
 	url           string
 	body          io.ReadCloser
 	contentType   string
@@ -419,8 +434,16 @@ func openUpstream(ctx context.Context, rawURL string) (*upstreamStream, error) {
 		return nil, fmt.Errorf("upstream returned %d: %s", resp.StatusCode, rawURL)
 	}
 
+	// resp.Request is the last request in the chain, so its URL is the server
+	// that produced this body. It is nil for no response net/http returns, but
+	// the fallback keeps a future transport from leaving the field empty.
+	answered := rawURL
+	if resp.Request != nil && resp.Request.URL != nil {
+		answered = resp.Request.URL.String()
+	}
+
 	return &upstreamStream{
-		url:           rawURL,
+		url:           answered,
 		body:          resp.Body,
 		contentType:   resp.Header.Get("Content-Type"),
 		contentLength: resp.ContentLength,
@@ -855,18 +878,26 @@ const cacheOriginUnrecorded = "unrecorded"
 // and a restart leaves the resolved URL nowhere in memory. Reading the origin
 // back is a primary-key lookup in the embedded store, so the hit still
 // contacts no network.
-func (s *Server) recordCacheServed(r *http.Request, regType, policyCandidate, discoveryPkgName, s3Key string) {
+func (s *Server) recordCacheServed(r *http.Request, regType, policyCandidate, discoveryPkgName, s3Key string, obj audit.ObjectIdentity) {
 	if s.auditDB == nil || !s.auditDB.ShouldRecord(audit.EventCache) {
 		return
 	}
-	s.recordCacheEvent(r, audit.CacheHit, regType, s.cachedOrigin(r, s3Key), policyCandidate, discoveryPkgName, s3Key)
+	s.recordCacheEvent(r, audit.CacheHit, regType, s.cachedOrigin(r, s3Key, obj), policyCandidate, discoveryPkgName, s3Key)
 }
 
-// cachedOrigin is the upstream recorded for s3Key, or "" when none is.
-func (s *Server) cachedOrigin(r *http.Request, s3Key string) string {
+// cachedOrigin is the upstream recorded for the object obj identifies at
+// s3Key, or "" when none is.
+//
+// The fallback to an in-flight fill covers the window between a fetch's bytes
+// becoming readable and its origin row landing. A request arriving inside it
+// reads an object that exists and finds no row for it, and recording the fetch
+// it is reading the result of as unrecorded would be wrong about a fetch this
+// process is in the middle of making. Reading the pending attribution is a map
+// lookup, so no request waits for another's store write.
+func (s *Server) cachedOrigin(r *http.Request, s3Key string, obj audit.ObjectIdentity) string {
 	ctx, cancel := auditContext(r)
 	defer cancel()
-	origin, err := s.auditDB.CacheOrigin(ctx, s3Key)
+	origin, err := s.auditDB.CacheOrigin(ctx, s3Key, obj)
 	if err != nil {
 		// Unknown, not guessed. The row says the origin is unrecorded, which
 		// is the honest answer to a lookup that could not run.
@@ -874,13 +905,44 @@ func (s *Server) cachedOrigin(r *http.Request, s3Key string) string {
 			"key", s3Key, "error", err)
 		return ""
 	}
+	if origin == "" {
+		origin = s.fills.pending(s3Key, obj)
+	}
 	return origin
+}
+
+// fillCache writes the fetched artifact to the store and records which
+// upstream supplied it, holding s3Key against readers for the whole of it.
+//
+// The order is forced from both ends. Recording first would attribute bytes
+// that may never land, and a hit on whatever is already at the key would read
+// that attribution back. Recording after without the hold leaves the window
+// this gate exists for: the object is readable the instant PutFile returns,
+// and a request arriving before the row lands sees a fill it cannot name.
+// Caching is best effort and a failed write is not the client's problem, which
+// is why nothing here is returned.
+func (s *Server) fillCache(ctx context.Context, store storage.ObjectStore, s3Key, localPath, upstreamURL string, size int64) {
+	release := s.fills.hold(s3Key, upstreamURL, size)
+	defer release()
+
+	if err := store.PutFile(ctx, localPath, s3Key); err != nil {
+		s.logger.Warn("failed to cache object", "key", s3Key, "error", err)
+		return
+	}
+	s.logger.Debug("cached object", "key", s3Key, "bytes", size)
+	s.recordCacheOrigin(ctx, store, s3Key, upstreamURL)
 }
 
 // recordCacheOrigin remembers which upstream supplied the bytes just written
 // to s3Key. It runs only after the store write succeeded: an origin for bytes
 // that never landed would be read back by a hit on somebody else's object.
-func (s *Server) recordCacheOrigin(ctx context.Context, s3Key, upstreamURL string) {
+//
+// The Head is what binds the row to those bytes rather than to their name. It
+// has to come from the store rather than from the spool, because size and
+// timestamp are the store's account of the object and a hit compares against
+// the store's account too; a backend that rewrites either on ingest would
+// otherwise make every one of its own fills fail to match.
+func (s *Server) recordCacheOrigin(ctx context.Context, store storage.ObjectStore, s3Key, upstreamURL string) {
 	if s.auditDB == nil || s3Key == "" || upstreamURL == "" {
 		return
 	}
@@ -889,8 +951,114 @@ func (s *Server) recordCacheOrigin(ctx context.Context, s3Key, upstreamURL strin
 	// otherwise leave a cached object nothing can attribute.
 	octx, cancel := context.WithTimeout(context.WithoutCancel(ctx), auditWriteTimeout)
 	defer cancel()
-	if err := s.auditDB.StoreCacheOrigin(octx, s3Key, upstreamURL); err != nil {
+
+	info, err := store.Head(octx, s3Key)
+	if err != nil {
+		s.logger.Warn("cached object could not be identified, a later hit cannot name its upstream",
+			"key", s3Key, "error", err)
+		return
+	}
+	if err := s.auditDB.StoreCacheOrigin(octx, s3Key, upstreamURL, objectIdentity(store, info)); err != nil {
 		s.logger.Warn("cache origin not recorded, a later hit on this key cannot name its upstream",
 			"key", s3Key, "upstream", upstreamURL, "error", err)
 	}
+}
+
+// objectIdentity is what the store says about one object, in the form the
+// audit store compares. The zero value is what a caller with no metadata in
+// hand produces, and it matches no recorded origin.
+func objectIdentity(store storage.ObjectStore, info *storage.ObjectInfo) audit.ObjectIdentity {
+	if store == nil || info == nil || !info.Exists {
+		return audit.ObjectIdentity{}
+	}
+	obj := audit.ObjectIdentity{
+		Backend: store.Label(),
+		Size:    info.Size,
+		ETag:    info.ETag,
+	}
+	if !info.LastModified.IsZero() {
+		obj.Modified = info.LastModified.UTC().Format(time.RFC3339Nano)
+	}
+	return obj
+}
+
+// cacheFills is the attribution for keys whose proxied bytes have reached the
+// store and whose origin row has not. A hit landing in that window reads the
+// pending entry, so a fill this process is making is never recorded as a fetch
+// nobody can account for.
+//
+// Registered before the store write rather than after it, because an object
+// becomes readable partway through PutFile and not when it returns; cleared
+// only once the row is durable in the audit store, so the two never both miss.
+// Nothing here blocks: a reader takes a map lookup, and two requests that miss
+// the same key still fetch concurrently as they did before.
+//
+// In-process by construction, which is the scope of the window it covers. A
+// second bodega's fill is invisible here, and a hit racing it finds no row and
+// says unrecorded, which is a missing answer rather than a wrong one.
+type cacheFills struct {
+	mu   sync.Mutex
+	held map[string][]*cacheFill
+}
+
+// cacheFill is one fetch being published to a key: where the bytes came from,
+// and how many of them there are.
+type cacheFill struct {
+	upstream string
+	size     int64
+}
+
+// hold registers a fetch being published to key and returns the release, which
+// the caller runs once the origin row is written. Every hold must be released:
+// a leaked one goes on attributing that key to a fetch that has finished.
+func (c *cacheFills) hold(key, upstream string, size int64) func() {
+	f := &cacheFill{upstream: upstream, size: size}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.held == nil {
+		c.held = make(map[string][]*cacheFill)
+	}
+	c.held[key] = append(c.held[key], f)
+	return func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		rest := c.held[key][:0]
+		for _, other := range c.held[key] {
+			if other != f {
+				rest = append(rest, other)
+			}
+		}
+		if len(rest) == 0 {
+			delete(c.held, key)
+			return
+		}
+		c.held[key] = rest
+	}
+}
+
+// pending is the upstream of an in-flight fill of key whose artifact is the
+// size obj reports, or "" when none is.
+//
+// The length check is what keeps the fallback from crediting the wrong bytes.
+// A reader can arrive after the hold and before the object is replaced, and
+// what it is looking at then is the previous tenant of the key: an artifact
+// some other writer put there, which this fetch did not supply and must not be
+// credited with. Two artifacts of identical length at one key during one fetch
+// of it are the same artifact in every case that is not deliberate.
+//
+// Most recent first, because a key filled twice at once ends up holding the
+// bytes of whichever finished last.
+func (c *cacheFills) pending(key string, obj audit.ObjectIdentity) string {
+	if !obj.Known() {
+		return ""
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	fills := c.held[key]
+	for i := len(fills) - 1; i >= 0; i-- {
+		if fills[i].size == obj.Size {
+			return fills[i].upstream
+		}
+	}
+	return ""
 }

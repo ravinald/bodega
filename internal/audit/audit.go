@@ -607,39 +607,95 @@ func (a *DB) StoreChecksum(ctx context.Context, s3Key, pkgType, pkgName, pkgVers
 	return err
 }
 
+// ObjectIdentity is what a store reports about one cached object, and it is
+// what binds a recorded origin to those bytes rather than to their key.
+//
+// Backend is the store's Label(), so an object moved between buckets stops
+// matching. Size with Modified is the identity every backend can produce;
+// ETag is preferred where the backend supplies one, because it survives a
+// rewrite that lands the same length in the same clock tick.
+type ObjectIdentity struct {
+	Backend  string
+	Size     int64
+	ETag     string
+	Modified string
+}
+
+// Known reports whether this identity names an object at all. A zero value is
+// what a caller with no store metadata in hand passes, and it must match
+// nothing.
+func (o ObjectIdentity) Known() bool {
+	return o.Backend != "" && (o.Size >= 0 || o.ETag != "")
+}
+
+// matches reports whether stored describes the same object as o.
+//
+// ETag decides where both sides have one: it is a content token, and the two
+// fields below are not. Size and Modified together are the fallback, which
+// costs a rewrite of identical length inside one filesystem timestamp tick —
+// narrow enough to accept, and it errs toward crediting bytes that are in fact
+// the same bytes.
+func (o ObjectIdentity) matches(stored ObjectIdentity) bool {
+	if !o.Known() || !stored.Known() || o.Backend != stored.Backend {
+		return false
+	}
+	if o.ETag != "" && stored.ETag != "" {
+		return o.ETag == stored.ETag
+	}
+	return o.Size == stored.Size && o.Modified == stored.Modified
+}
+
 // StoreCacheOrigin records which upstream supplied the bytes now cached at
-// s3Key, so a later hit can name it without a network round trip.
+// s3Key, so a later hit can name it without a network round trip. obj is what
+// the store reported about those bytes once they landed.
 //
 // It lives in the embedded store rather than in the event stream because the
 // serving path reads it to compose a row, and syslog and jsonl sinks answer no
 // reads at all. Upserted: a mutable document refetched after its TTL may come
 // from a different archive than last time, and the row has to follow the bytes.
-func (a *DB) StoreCacheOrigin(ctx context.Context, s3Key, upstreamURL string) error {
+func (a *DB) StoreCacheOrigin(ctx context.Context, s3Key, upstreamURL string, obj ObjectIdentity) error {
 	_, err := a.writer().ExecContext(ctx,
-		`INSERT INTO cache_origins (s3_key, upstream_url)
-		 VALUES (?, ?)
+		`INSERT INTO cache_origins (s3_key, upstream_url, backend, object_size, object_etag, object_modified)
+		 VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(s3_key) DO UPDATE SET
 		   upstream_url = excluded.upstream_url,
+		   backend = excluded.backend,
+		   object_size = excluded.object_size,
+		   object_etag = excluded.object_etag,
+		   object_modified = excluded.object_modified,
 		   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
-		s3Key, upstreamURL,
+		s3Key, upstreamURL, obj.Backend, obj.Size, obj.ETag, obj.Modified,
 	)
 	return err
 }
 
-// CacheOrigin returns the upstream recorded for s3Key, or "" when nothing
-// recorded one — an object cached before this table existed, or filled by a
-// path that fetches nothing. The caller says so in the row rather than
-// substituting a current candidate.
-func (a *DB) CacheOrigin(ctx context.Context, s3Key string) (string, error) {
-	var upstreamURL string
+// CacheOrigin returns the upstream recorded for the object obj identifies at
+// s3Key, or "" when nothing recorded one — an object cached before this table
+// existed, filled by a path that fetches nothing, or written over since by one.
+// The caller says so in the row rather than substituting a current candidate.
+//
+// The identity check is here rather than at the call site so that a serving
+// path cannot read an origin without it. That is the shape the first version
+// got wrong: it trusted the key, and every writer that does not fetch — 'pkg
+// upload', a replaced object, a moved bucket — silently inherited the previous
+// tenant's attribution.
+func (a *DB) CacheOrigin(ctx context.Context, s3Key string, obj ObjectIdentity) (string, error) {
+	var (
+		upstreamURL string
+		stored      ObjectIdentity
+	)
 	err := a.db.QueryRowContext(ctx,
-		`SELECT upstream_url FROM cache_origins WHERE s3_key = ?`, s3Key,
-	).Scan(&upstreamURL)
+		`SELECT upstream_url, backend, object_size, object_etag, object_modified
+		 FROM cache_origins WHERE s3_key = ?`, s3Key,
+	).Scan(&upstreamURL, &stored.Backend, &stored.Size, &stored.ETag, &stored.Modified)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
 	if err != nil {
 		return "", err
+	}
+	if !obj.matches(stored) {
+		return "", nil
 	}
 	return upstreamURL, nil
 }

@@ -80,6 +80,10 @@ type Server struct {
 	pepperErr     error        // set when the pepper in force is unreadable; Start refuses on it
 	spool         *spoolLimiter
 	spoolErr      error // set when spool_dir cannot be created or written; Start refuses on it
+	// fills holds a proxied key from the moment its bytes reach the store
+	// until its origin row does, so a hit arriving inside that window can
+	// still name the fetch it is reading. See internal/server/proxy.go.
+	fills cacheFills
 	// trustedNets are the proxies whose forwarded headers are believed.
 	// trustedNetsSet distinguishes "operator wrote an empty list" from
 	// "operator wrote nothing": the first trusts no header from anyone, the

@@ -3510,14 +3510,20 @@ That table is the whole set. A type absent from a trail is a gap to chase rather
 
 | Status | Outcome |
 |--------|---------|
-| `cache_miss` | Fetched from upstream, verified and stored. `details` names the URL that answered |
+| `cache_miss` | Fetched from upstream, verified and stored. `details` names the URL that answered, which is the last hop of any redirect chain rather than the address bodega composed |
 | `cache_hit` | Served from storage with no upstream contact. A stale copy served because the upstream could not be reached, or because the spool refused the refetch, records this too: the request is what the row counts |
 | `checksum_mismatch` | Upstream bytes disagreed with the digest pinned on first fetch. The artifact was neither served nor cached |
 | `policy_violation` | The upstream allow-list refused the candidate. Written wherever the refusal is decided, including the apt pool probe, which refuses a `.deb` before there is a fetch to record |
 
 One row per request on both serving outcomes, so counting `cache_miss` over a window sizes what an upstream actually served. Every response the cache answers is counted, including the apt pool shortcut that serves a cached `.deb` without resolving which archive it came from, and including a stale copy served during an outage. A request the spool refuses with nothing cached to fall back on writes its `denied` row and no `cache` row: nothing came from upstream and nothing was served, so a row either way would be wrong. Where a stale copy does answer, both rows are written — the `denied` row names the bound that fired, the `cache_hit` names the bytes the client got.
 
-**Provenance on a hit.** `details` on a `cache_hit` names the upstream that supplied those bytes, recorded when they were fetched and read back from the store — not the candidate `gomod_upstream` or `apt_upstreams` points at now. The two diverge routinely: the pypi wheel route holds no URL on a hit at all, because composing one costs a read of the simple index that a hit exists to avoid, and a restart or a configuration edit leaves the fetched URL nowhere in memory. An object cached before bodega kept origins, or filled by a path that fetches nothing, carries `"upstream": ""` and `"upstream_origin": "unrecorded"` instead of a guess: a row naming a host that answered nothing reads as evidence and is not.
+**Provenance on a hit.** `details` on a `cache_hit` names the upstream that supplied those bytes, recorded when they were fetched and read back from the store — not the candidate `gomod_upstream` or `apt_upstreams` points at now. The two diverge routinely: the pypi wheel route holds no URL on a hit at all, because composing one costs a read of the simple index that a hit exists to avoid, and a restart or a configuration edit leaves the fetched URL nowhere in memory. The lookup is local either way, so a hit still contacts nothing.
+
+A recorded origin belongs to the bytes, not to the key they sit under. bodega stores what the backend reported about the object — its location, its length, and its entity tag or its timestamp — and a hit compares that against the object it is about to serve before it believes the row. So an artifact replaced under a key it already occupied is not credited to the archive that supplied the previous tenant, whether it was replaced by `bodega pkg upload`, by a delete and a refill, or by a move to another bucket.
+
+Provenance a fetch is still in the middle of publishing is answered from that fetch. Bytes become readable partway through the write to storage and the origin lands after it, and a client arriving in between gets the upstream of the fill it is reading rather than a blank.
+
+An object cached before bodega kept origins, filled by a path that fetches nothing, or written over since by one, carries `"upstream": ""` and `"upstream_origin": "unrecorded"` instead of a guess: a row naming a host that answered nothing reads as evidence and is not.
 
 **Denials.** A `denied` row's `status` column names the gate that turned the request away, so an address that was never permitted reads differently from a token that simply aged out:
 
