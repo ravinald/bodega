@@ -287,3 +287,30 @@ func TestPypiBuildIgnoresAnIndexFromTheEnvironment(t *testing.T) {
 		t.Errorf("the build stored %v rather than the version the selected index serves:\n%s", stored, out)
 	}
 }
+
+// The generated pair has to be a file pip accepts, not just one that reads
+// correctly here. A constraint file pip rejects fails every build that has
+// one, and asserting on the text would not notice.
+func TestPipAcceptsTheGeneratedRequirementsAndConstraints(t *testing.T) {
+	selected := pypiWheelIndex(t, "six", "1.16.0", "1.17.0")
+	cfg, store := pypiBaseReqEnv(t, selected.URL, map[string]string{
+		"requirements.txt": "six\n-c constraints.txt\n",
+		"constraints.txt":  "six<1.17\n",
+	})
+	if summary := FetchPypi(cfg, store); summary.HasFailures() {
+		t.Fatalf("fetch reported failures: %+v", summary.Results)
+	}
+	req, err := os.ReadFile(filepath.Join(cfg.rootFor(manifest.TypePypi), "combined-requirements.txt"))
+	if err != nil {
+		t.Fatalf("read generated requirements: %v", err)
+	}
+
+	stored, out := pypiWheelRunAs(t, string(req), pypiPipEnv(),
+		"--isolated", "--index-url", pypiIndexURL(selected.URL))
+	if len(stored) == 0 {
+		t.Fatalf("pip built nothing from the generated pair:\n%s", out)
+	}
+	if !slices.Contains(stored, "six-1.16.0-py3-none-any.whl") {
+		t.Errorf("pip stored %v rather than the pinned version:\n%s", stored, out)
+	}
+}
