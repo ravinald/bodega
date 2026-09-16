@@ -2217,6 +2217,7 @@ Each names the path and the config file the path came from, so the next move is 
 bodega supports two storage backends:
 
 - **`local`** (default): Stores artifacts on the local filesystem. Set `storage_path` to change the root directory (default: `/var/lib/bodega`). No initialization needed, and no bucket: every command that touches storage runs without one.
+  A write lands in a `.bodega-tmp-*` file beside the destination and is renamed into place, so a key holds either its previous object or its new one and never a half-written body, and a reader already on the object keeps the one it opened even while a replacement publishes. Listings skip those staging names. A crash mid-write leaves one behind: it is safe to delete, and nothing reads it.
 - **`s3`**: Stores artifacts in an S3 bucket. Set `bucket` and `region`, then run `bodega init` to create the bucket with encryption and versioning.
 
 Manifests follow the backend. On `s3` they live under the `manifests/` prefix in the bucket; on `local` they live in `manifest_dir` on disk, which is also what `--local-config` selects against any backend.
@@ -3520,6 +3521,8 @@ One row per request on both serving outcomes, so counting `cache_miss` over a wi
 **Provenance on a hit.** `details` on a `cache_hit` names the upstream that supplied those bytes, recorded when they were fetched and read back from the store — not the candidate `gomod_upstream` or `apt_upstreams` points at now. The two diverge routinely: the pypi wheel route holds no URL on a hit at all, because composing one costs a read of the simple index that a hit exists to avoid, and a restart or a configuration edit leaves the fetched URL nowhere in memory. The lookup is local either way, so a hit still contacts nothing.
 
 A recorded origin belongs to the bytes, not to the key they sit under. A fetch reads its cached object back before recording anything and records nothing unless those bytes hash to what it fetched, so an upload that landed at the key while the fetch was in flight takes the row with it rather than inheriting it. A hit then compares what the backend reports — the object's location, its length, and its entity tag or its timestamp — against the handle it is about to serve from, not against an earlier lookup. So an artifact replaced under a key it already occupied is not credited to the archive that supplied the previous tenant, whether it was replaced by `bodega pkg upload`, by a delete and a refill, or by a move to another bucket, and whether the replacement is the same length as what it displaced or not.
+
+A response already in flight is unaffected by the replacement: it serves the object it opened, under that object's origin, and the next request serves the new one. That holds because the backends publish rather than overwrite (see [Storage backends](#storage-backends)), and it is what lets the row be written from the same open that supplies the body.
 
 Provenance a fetch is still in the middle of publishing is answered from that fetch. Bytes become readable partway through the write to storage and the origin lands after it, and a client arriving in between gets the upstream of the fill it is reading rather than a blank — once the object it is serving is confirmed to be the one that fill fetched, which costs a read of it and happens only inside that window.
 
