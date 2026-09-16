@@ -918,6 +918,119 @@ func TestAnUploadDuringAFillIsNotCreditedToIt(t *testing.T) {
 	}
 }
 
+// pausedOpenStore holds one GetStream after the backend has opened the object
+// and taken its metadata, which is the window a cache hit streams its body in.
+// Pausing at Head instead finishes before this window opens: the open that
+// supplies the bytes is a later call.
+type pausedOpenStore struct {
+	storage.ObjectStore
+	armed  atomic.Bool
+	opened chan struct{}
+	resume chan struct{}
+}
+
+func (p *pausedOpenStore) GetStream(ctx context.Context, key string) (*storage.StreamResult, error) {
+	res, err := p.ObjectStore.GetStream(ctx, key)
+	if err == nil && res != nil && p.armed.CompareAndSwap(true, false) {
+		close(p.opened)
+		<-p.resume
+	}
+	return res, err
+}
+
+// TestAnUploadAfterTheCacheOpenDoesNotReachTheReader pins the guarantee to the
+// bytes rather than to a lock. A hit's origin is taken from the handle that
+// serves it, so a backend publishing over the file behind that handle would
+// hand the client one artifact under the provenance of another — the length
+// and timestamp in the row describing neither.
+//
+// The upload runs through the production Placer, holding nothing the proxy
+// holds, because the writer that matters is a 'pkg upload' in another process.
+// An equal-length replacement keeps the response valid against the
+// Content-Length already taken, and is the case a size comparison cannot see.
+func TestAnUploadAfterTheCacheOpenDoesNotReachTheReader(t *testing.T) {
+	archive := newFixtureArchive(t, map[string]string{fixtureDeb: fixtureDebBody})
+	s := mirrorServer(t, archive)
+	held := &pausedOpenStore{
+		ObjectStore: storage.NewLocal(t.TempDir()),
+		opened:      make(chan struct{}),
+		resume:      make(chan struct{}),
+	}
+	s.stores = storage.NewSingle(held)
+
+	debPath := "/apt/" + fixtureDeb
+	if code, body := mirrorGet(t, s, debPath); code != http.StatusOK || string(body) != fixtureDebBody {
+		t.Fatalf("the fill responded %d %q, want 200 and the archive's bytes", code, body)
+	}
+
+	replacement := strings.Repeat("L", len(fixtureDebBody))
+	local := filepath.Join(t.TempDir(), "replacement.deb")
+	if err := os.WriteFile(local, []byte(replacement), 0o600); err != nil {
+		t.Fatalf("write the replacement artifact: %v", err)
+	}
+
+	held.armed.Store(true)
+	type served struct {
+		code int
+		body string
+	}
+	answered := make(chan served, 1)
+	go func() {
+		code, body := mirrorGet(t, s, debPath)
+		answered <- served{code, string(body)}
+	}()
+	select {
+	case <-held.opened:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the cache open never happened")
+	}
+
+	placer := placement.NewWith(s.stores, s.store, io.Discard, false)
+	n, err := placer.UploadPaths(t.Context(), manifest.TypeApt, []builder.ArtifactPath{{
+		Local:   local,
+		S3Key:   manifest.AptKey(fixtureDeb),
+		Package: "nginx",
+		Version: "1.24.0-2ubuntu7.1",
+	}})
+	close(held.resume)
+	got := <-answered
+	if err != nil || n != 1 {
+		t.Fatalf("UploadPaths wrote %d objects, err = %v", n, err)
+	}
+	if got.code != http.StatusOK || got.body != fixtureDebBody {
+		t.Fatalf("the concurrent hit served %d %q, want 200 %q — the upload reached a reader already on the object",
+			got.code, got.body, fixtureDebBody)
+	}
+	requireOneHitNaming(t, s, archive.URL())
+
+	// The upload is readable from the next open, and credits nobody: no fetch
+	// produced it.
+	code, body := mirrorGet(t, s, debPath)
+	if code != http.StatusOK || string(body) != replacement {
+		t.Fatalf("the next hit served %d %q, want 200 %q", code, body, replacement)
+	}
+	// By content rather than by position: the trail orders on a millisecond
+	// timestamp and these two hits land inside one tick, so "the second row"
+	// is whichever way the tie fell.
+	hits, _ := splitCacheRows(t, s)
+	if len(hits) != 2 {
+		t.Fatalf("cache_hit rows = %d, want 2 (%+v)", len(hits), cacheRows(t, s))
+	}
+	var credited, unrecorded int
+	for _, hit := range hits {
+		switch {
+		case strings.Contains(hit.Details, cacheOriginUnrecorded):
+			unrecorded++
+		case strings.Contains(hit.Details, archive.URL()):
+			credited++
+		}
+	}
+	if credited != 1 || unrecorded != 1 {
+		t.Errorf("hit rows credit the archive %d times and admit no origin %d times, want 1 and 1 (%+v)",
+			credited, unrecorded, hits)
+	}
+}
+
 // pausedHeadStore holds one Head open after it has read the object's metadata,
 // which is the window between deciding a request is a cache hit and opening
 // the bytes that answer it.

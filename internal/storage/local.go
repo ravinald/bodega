@@ -178,6 +178,9 @@ func (l *Local) List(_ context.Context, prefix string) ([]string, error) {
 		if d.IsDir() {
 			return nil
 		}
+		if strings.HasPrefix(d.Name(), tmpPrefix) {
+			return nil
+		}
 		rel, err := filepath.Rel(l.root, path)
 		if err != nil {
 			return err
@@ -198,15 +201,63 @@ func (l *Local) List(_ context.Context, prefix string) ([]string, error) {
 	return keys, nil
 }
 
+// tmpPrefix marks a staging file that is not yet an object. It leads with a
+// dot so an operator listing the directory sees it as machinery, and List
+// skips it by this prefix so a walk concurrent with a write never returns a
+// name that is about to stop existing.
+const tmpPrefix = ".bodega-tmp-"
+
+// publish writes p by filling a sibling staging file and renaming it into
+// place, so the key goes from its previous bytes to its new ones with no
+// intermediate state and no reuse of the inode.
+//
+// A reader holding an open handle keeps the object it opened. That is what
+// binds a cached artifact's recorded origin to the bytes the client receives:
+// the proxy takes an object's identity from the same open that supplies the
+// body, and truncating in place changed the bytes behind that handle while the
+// recorded length, timestamp and upstream still described what had been there
+// — a row crediting a server that supplied none of what was served. Locking
+// the proxy against itself would not close it, because the writer is often
+// another process using this same root.
+func (l *Local) publish(p string, write func(io.Writer) error) (err error) {
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, tmpPrefix+"*")
+	if err != nil {
+		return err
+	}
+	staged := tmp.Name()
+	defer func() {
+		if err != nil {
+			tmp.Close()
+			os.Remove(staged)
+		}
+	}()
+	if err = write(tmp); err != nil {
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	// CreateTemp opens at 0600. Every other reader of this tree expects the
+	// mode os.Create would have left.
+	if err = os.Chmod(staged, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(staged, p)
+}
+
 func (l *Local) Put(_ context.Context, key string, data []byte) error {
 	p, err := l.path(key)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	return l.publish(p, func(w io.Writer) error {
+		_, err := w.Write(data)
 		return err
-	}
-	return os.WriteFile(p, data, 0o644)
+	})
 }
 
 func (l *Local) PutFile(_ context.Context, localPath, key string) error {
@@ -214,23 +265,15 @@ func (l *Local) PutFile(_ context.Context, localPath, key string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return err
-	}
 	src, err := os.Open(localPath)
 	if err != nil {
 		return err
 	}
 	defer src.Close()
-	dst, err := os.Create(p)
-	if err != nil {
+	return l.publish(p, func(w io.Writer) error {
+		_, err := io.Copy(w, src)
 		return err
-	}
-	defer dst.Close()
-	if _, err := io.Copy(dst, src); err != nil {
-		return err
-	}
-	return dst.Close()
+	})
 }
 
 func (l *Local) Delete(_ context.Context, key string) error {
@@ -270,9 +313,6 @@ func (l *Local) SyncDir(_ context.Context, out io.Writer, localDir, keyPrefix st
 		if err != nil {
 			return err
 		}
-		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-			return err
-		}
 
 		//nolint:gosec // G122: walk root is the operator-owned storage directory; no untrusted symlink injection vector.
 		src, err := os.Open(path)
@@ -282,15 +322,10 @@ func (l *Local) SyncDir(_ context.Context, out io.Writer, localDir, keyPrefix st
 		defer src.Close()
 
 		fi, _ := src.Stat()
-		df, err := os.Create(dest)
-		if err != nil {
+		if err := l.publish(dest, func(w io.Writer) error {
+			_, err := io.Copy(w, src)
 			return err
-		}
-		defer df.Close()
-		if _, err := io.Copy(df, src); err != nil {
-			return err
-		}
-		if err := df.Close(); err != nil {
+		}); err != nil {
 			return err
 		}
 
