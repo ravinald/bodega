@@ -1,11 +1,14 @@
 package storage
 
 import (
+	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -275,5 +278,113 @@ func TestLocalTrailingSlashRootStillWrites(t *testing.T) {
 	got, err := l.Get(t.Context(), "a/b.txt")
 	if err != nil || string(got) != "x" {
 		t.Fatalf("Get = %q, %v; want \"x\", nil", got, err)
+	}
+}
+
+// localWriters drives the three entry points that publish an object, so a
+// guarantee about publication is asserted against every writer that has one
+// rather than against whichever was reached first.
+func localWriters() []struct {
+	name  string
+	write func(t *testing.T, l *Local, key string, body []byte)
+} {
+	return []struct {
+		name  string
+		write func(t *testing.T, l *Local, key string, body []byte)
+	}{
+		{"Put", func(t *testing.T, l *Local, key string, body []byte) {
+			if err := l.Put(t.Context(), key, body); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+		}},
+		{"PutFile", func(t *testing.T, l *Local, key string, body []byte) {
+			src := filepath.Join(t.TempDir(), "source")
+			if err := os.WriteFile(src, body, 0o600); err != nil {
+				t.Fatalf("write source: %v", err)
+			}
+			if err := l.PutFile(t.Context(), src, key); err != nil {
+				t.Fatalf("PutFile: %v", err)
+			}
+		}},
+		{"SyncDir", func(t *testing.T, l *Local, key string, body []byte) {
+			dir, base := path.Split(key)
+			src := t.TempDir()
+			if err := os.WriteFile(filepath.Join(src, base), body, 0o600); err != nil {
+				t.Fatalf("write source: %v", err)
+			}
+			if _, err := l.SyncDir(t.Context(), nil, src, dir); err != nil {
+				t.Fatalf("SyncDir: %v", err)
+			}
+		}},
+	}
+}
+
+// withUmask installs a umask for the duration of one test. The umask is
+// process-global, so a test calling this must not run in parallel with
+// anything that creates a file.
+func withUmask(t *testing.T, mask int) {
+	t.Helper()
+	previous := syscall.Umask(mask)
+	t.Cleanup(func() { syscall.Umask(previous) })
+}
+
+func publishedMode(t *testing.T, root, key string) os.FileMode {
+	t.Helper()
+	fi, err := os.Stat(filepath.Join(root, filepath.FromSlash(key)))
+	if err != nil {
+		t.Fatalf("stat published object: %v", err)
+	}
+	return fi.Mode().Perm()
+}
+
+// An object published through a staging file and a rename carries no mode from
+// the destination it lands on, so the umask that filtered os.Create has to be
+// applied to the staging file instead. A server under umask 077 stored private
+// artifacts before publication became atomic and must still.
+func TestLocalPublishHonorsUmaskOnAFreshObject(t *testing.T) {
+	for _, w := range localWriters() {
+		t.Run(w.name, func(t *testing.T) {
+			withUmask(t, 0o077)
+			root := t.TempDir()
+			const key = "packages/npm/private.tgz"
+			w.write(t, NewLocal(root), key, []byte("secret"))
+			if got := publishedMode(t, root, key); got != 0o600 {
+				t.Errorf("published mode = %04o, want 0600", got)
+			}
+		})
+	}
+}
+
+// A refill is not a decision to publish an artifact the operator restricted,
+// so replacement keeps the mode that was there. 0644 under umask 077 is the
+// case the umask alone gets wrong: it clips the staging file, and only the
+// destination's own mode says how wide the object is meant to be.
+func TestLocalPublishKeepsTheModeOfTheObjectItReplaces(t *testing.T) {
+	for _, mode := range []os.FileMode{0o600, 0o640, 0o644} {
+		for _, w := range localWriters() {
+			t.Run(fmt.Sprintf("%04o/%s", mode, w.name), func(t *testing.T) {
+				withUmask(t, 0o077)
+				root := t.TempDir()
+				const key = "packages/npm/refilled.tgz"
+				w.write(t, NewLocal(root), key, []byte("first"))
+				p := filepath.Join(root, filepath.FromSlash(key))
+				if err := os.Chmod(p, mode); err != nil {
+					t.Fatalf("chmod: %v", err)
+				}
+
+				w.write(t, NewLocal(root), key, []byte("second"))
+
+				if got := publishedMode(t, root, key); got != mode {
+					t.Errorf("published mode = %04o, want %04o", got, mode)
+				}
+				got, err := os.ReadFile(p)
+				if err != nil {
+					t.Fatalf("read replaced object: %v", err)
+				}
+				if string(got) != "second" {
+					t.Errorf("replaced object = %q, want %q", got, "second")
+				}
+			})
+		}
 	}
 }

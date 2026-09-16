@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -207,6 +208,24 @@ func (l *Local) List(_ context.Context, prefix string) ([]string, error) {
 // name that is about to stop existing.
 const tmpPrefix = ".bodega-tmp-"
 
+// createStaged opens a staging file in dir at perm, which the process umask
+// filters exactly as it filters any other creation. os.CreateTemp is not used
+// because it hardcodes 0600, and correcting that afterwards means either
+// publishing every object 0644 or reading the umask back, which is only
+// possible by setting it: a window in which every other goroutine's file
+// creation takes the wrong mode.
+func createStaged(dir string, perm os.FileMode) (*os.File, error) {
+	for range 100 {
+		//nolint:gosec // perm is the destination's own mode or 0666 before umask, never a widening.
+		f, err := os.OpenFile(filepath.Join(dir, tmpPrefix+rand.Text()), os.O_RDWR|os.O_CREATE|os.O_EXCL, perm)
+		if errors.Is(err, fs.ErrExist) {
+			continue
+		}
+		return f, err
+	}
+	return nil, fmt.Errorf("create staging file in %s: no unused name", dir)
+}
+
 // publish writes p by filling a sibling staging file and renaming it into
 // place, so the key goes from its previous bytes to its new ones with no
 // intermediate state and no reuse of the inode.
@@ -219,12 +238,25 @@ const tmpPrefix = ".bodega-tmp-"
 // — a row crediting a server that supplied none of what was served. Locking
 // the proxy against itself would not close it, because the writer is often
 // another process using this same root.
+//
+// Publishing a new inode carries no mode of its own, so both halves of what
+// writing in place used to decide are restated here: a fresh object takes 0666
+// before the umask, which is what os.Create left, and a replacement keeps the
+// mode the object already had. An operator who restricted one artifact
+// restricted it; a refill is not a decision to publish it. Ownership is the
+// part that cannot follow, since rename gives the object the writer's uid and
+// chown across users needs privilege the server does not hold; the same goes
+// for an ACL set on the object rather than on its directory.
 func (l *Local) publish(p string, write func(io.Writer) error) (err error) {
 	dir := filepath.Dir(p)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, tmpPrefix+"*")
+	perm, replacing := os.FileMode(0o666), false
+	if fi, statErr := os.Stat(p); statErr == nil && fi.Mode().IsRegular() {
+		perm, replacing = fi.Mode().Perm(), true
+	}
+	tmp, err := createStaged(dir, perm)
 	if err != nil {
 		return err
 	}
@@ -241,10 +273,14 @@ func (l *Local) publish(p string, write func(io.Writer) error) (err error) {
 	if err = tmp.Close(); err != nil {
 		return err
 	}
-	// CreateTemp opens at 0600. Every other reader of this tree expects the
-	// mode os.Create would have left.
-	if err = os.Chmod(staged, 0o644); err != nil {
-		return err
+	// The umask can only narrow a creation, so a replacement whose mode it
+	// clipped is restored after the bytes are written. Correcting it before
+	// the write would be the other direction on a fresh object: a moment in
+	// which the staging file is readable more widely than the object is.
+	if replacing {
+		if err = os.Chmod(staged, perm); err != nil {
+			return err
+		}
 	}
 	return os.Rename(staged, p)
 }
