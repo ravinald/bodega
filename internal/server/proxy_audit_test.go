@@ -9,7 +9,9 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
@@ -24,38 +26,75 @@ const (
 	proxyAuditVersion = "v0.9.1"
 )
 
-// gomodUpstreamFixture is a module proxy serving one version of one module:
-// the listing, the .info, the .mod and a .zip of n bytes with the length
-// declared. Every other path is a 404, which is what the real proxy answers
-// for a module it does not publish.
-func gomodUpstreamFixture(t *testing.T, zipBytes int) *httptest.Server {
-	t.Helper()
-	zip := strings.Repeat("Z", zipBytes)
-	files := map[string]string{
+// gomodFixtureFiles is the one version of one module the proxy fixtures
+// publish: the listing, the .info, the .mod and a .zip of n bytes.
+func gomodFixtureFiles(zipBytes int) map[string]string {
+	return map[string]string{
 		"list":                      proxyAuditVersion + "\n",
 		proxyAuditVersion + ".info": `{"Version":"` + proxyAuditVersion + `","Time":"2020-01-14T12:00:00Z"}`,
 		proxyAuditVersion + ".mod":  "module " + proxyAuditModule + "\n",
-		proxyAuditVersion + ".zip":  zip,
+		proxyAuditVersion + ".zip":  strings.Repeat("Z", zipBytes),
 	}
+}
+
+// serveGomodFixture answers one path under @v/ out of files and 404s
+// everything else, which is what a real module proxy does for a module it does
+// not publish. The length is declared, so the spool decides on it rather than
+// on bytes copied.
+func serveGomodFixture(w http.ResponseWriter, r *http.Request, files map[string]string) {
+	idx := strings.Index(r.URL.Path, "/@v/")
+	if idx < 0 {
+		http.NotFound(w, r)
+		return
+	}
+	body, ok := files[r.URL.Path[idx+len("/@v/"):]]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+	w.WriteHeader(http.StatusOK)
+	//nolint:gosec // G705: fixture bytes with an explicit Content-Type; nothing here comes from the request.
+	_, _ = io.WriteString(w, body)
+}
+
+// gomodUpstreamFixture is a module proxy serving gomodFixtureFiles.
+func gomodUpstreamFixture(t *testing.T, zipBytes int) *httptest.Server {
+	t.Helper()
+	files := gomodFixtureFiles(zipBytes)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		idx := strings.Index(r.URL.Path, "/@v/")
-		if idx < 0 {
-			http.NotFound(w, r)
-			return
-		}
-		body, ok := files[r.URL.Path[idx+len("/@v/"):]]
-		if !ok {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
-		w.WriteHeader(http.StatusOK)
-		//nolint:gosec // G705: fixture bytes with an explicit Content-Type; nothing here comes from the request.
-		_, _ = io.WriteString(w, body)
+		serveGomodFixture(w, r, files)
 	}))
 	t.Cleanup(ts.Close)
 	return ts
+}
+
+// outageFixture is gomodUpstreamFixture with a lever. Flipping it mid-test is
+// the only way to reach the stale-serve branches: they need an object the
+// cache already holds and an upstream that has since stopped answering, and a
+// fixture fixed at construction can be one or the other.
+type outageFixture struct {
+	ts     *httptest.Server
+	status atomic.Int32
+}
+
+// fail makes every later request answer code. Zero restores the fixture.
+func (f *outageFixture) fail(code int32) { f.status.Store(code) }
+
+func gomodOutageFixture(t *testing.T, zipBytes int) *outageFixture {
+	t.Helper()
+	f := &outageFixture{}
+	files := gomodFixtureFiles(zipBytes)
+	f.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if code := f.status.Load(); code != 0 {
+			http.Error(w, "fixture upstream is down", int(code))
+			return
+		}
+		serveGomodFixture(w, r, files)
+	}))
+	t.Cleanup(f.ts.Close)
+	return f
 }
 
 // newProxyAuditServer is a proxying bodega pointed at a fixture upstream, with
@@ -287,4 +326,307 @@ func TestCacheRowIsWrittenForEveryProxiedType(t *testing.T) {
 			t.Errorf("cargo cache row names %q/%q, want cargo/anyhow", row.PkgType, row.PkgName)
 		}
 	}
+}
+
+// splitCacheRows counts the two serving outcomes and returns the hit rows, so
+// a caller can assert on what the hit says as well as that it happened.
+func splitCacheRows(t *testing.T, s *Server) (hits []audit.StoredEvent, misses int) {
+	t.Helper()
+	for _, row := range cacheRows(t, s) {
+		switch row.Status {
+		case audit.CacheHit:
+			hits = append(hits, row)
+		case audit.CacheMiss:
+			misses++
+		}
+	}
+	return hits, misses
+}
+
+// requireOneHitNaming asserts a single cache_hit whose details credit want and
+// nothing else. The negative half is the point: a row naming a host that
+// supplied none of those bytes is worse than one admitting it does not know.
+func requireOneHitNaming(t *testing.T, s *Server, want string, notWant ...string) audit.StoredEvent {
+	t.Helper()
+	hits, _ := splitCacheRows(t, s)
+	if len(hits) != 1 {
+		t.Fatalf("cache_hit rows = %d, want 1 (%+v)", len(hits), cacheRows(t, s))
+	}
+	if want != "" && !strings.Contains(hits[0].Details, want) {
+		t.Errorf("hit row details = %q, want the upstream %q in it", hits[0].Details, want)
+	}
+	for _, bad := range notWant {
+		if strings.Contains(hits[0].Details, bad) {
+			t.Errorf("hit row details = %q, credits %q which answered nothing", hits[0].Details, bad)
+		}
+	}
+	return hits[0]
+}
+
+// TestStaleServeAfterAnUpstreamFailureWritesACacheHit covers the branch an
+// outage runs through. docs/USAGE.md promises a cache_hit when stale bytes
+// answer an upstream that could not be reached, and the fail closure served
+// them straight out of storage with no cache row at all — so the trail went
+// quiet exactly while the cache was carrying the fleet.
+func TestStaleServeAfterAnUpstreamFailureWritesACacheHit(t *testing.T) {
+	allowLoopbackUpstream(t)
+	up := gomodOutageFixture(t, 4096)
+	s := newProxyAuditServer(t, up.ts.URL, 0)
+
+	listPath := "/go/" + proxyAuditModule + "/@v/list"
+	if code, body := getProxy(t, s, listPath); code != http.StatusOK {
+		t.Fatalf("first GET %s = %d, want 200 (%s)", listPath, code, body)
+	}
+
+	// The listing is mutable, so the refetch is decided by the TTL rather than
+	// by an eviction — which is the shape an operator actually meets.
+	s.cache.MetadataTTL = time.Nanosecond
+	up.fail(http.StatusServiceUnavailable)
+
+	code, body := getProxy(t, s, listPath)
+	if code != http.StatusOK {
+		t.Fatalf("stale GET %s = %d, want 200 from the cached copy", listPath, code)
+	}
+	if body != proxyAuditVersion+"\n" {
+		t.Fatalf("stale GET body = %q, want the cached listing", body)
+	}
+
+	hits, misses := splitCacheRows(t, s)
+	if len(hits) != 1 || misses != 1 {
+		t.Fatalf("cache rows = %d hit / %d miss, want 1 and 1 (%+v)", len(hits), misses, cacheRows(t, s))
+	}
+	requireOneHitNaming(t, s, up.ts.URL)
+}
+
+// TestSpoolRefusalOverAStaleObjectWritesBothRows is the same branch under the
+// other refusal. The denial row alone leaves a 200 whose bytes came from the
+// cache indistinguishable from a request nothing was served for.
+func TestSpoolRefusalOverAStaleObjectWritesBothRows(t *testing.T) {
+	allowLoopbackUpstream(t)
+	up := gomodUpstreamFixture(t, 4096)
+	s := newProxyAuditServer(t, up.URL, 0)
+
+	listPath := "/go/" + proxyAuditModule + "/@v/list"
+	if code, body := getProxy(t, s, listPath); code != http.StatusOK {
+		t.Fatalf("first GET %s = %d, want 200 (%s)", listPath, code, body)
+	}
+
+	s.cache.MetadataTTL = time.Nanosecond
+	// One byte, so the refusal is decided on the declared length of a listing
+	// the cache already holds.
+	s.spool = newSpoolLimiter(t.TempDir(), 1, 0)
+
+	code, body := getProxy(t, s, listPath)
+	if code != http.StatusOK {
+		t.Fatalf("refused refetch GET %s = %d, want 200 from the cached copy", listPath, code)
+	}
+	if body != proxyAuditVersion+"\n" {
+		t.Fatalf("refused refetch body = %q, want the cached listing", body)
+	}
+
+	hits, misses := splitCacheRows(t, s)
+	if len(hits) != 1 || misses != 1 {
+		t.Fatalf("cache rows = %d hit / %d miss, want 1 and 1 (%+v)", len(hits), misses, cacheRows(t, s))
+	}
+	denials, err := s.auditDB.Query(context.Background(), audit.Filter{EventType: audit.EventDenied})
+	if err != nil {
+		t.Fatalf("query denied events: %v", err)
+	}
+	var refusals int
+	for _, row := range denials {
+		if row.Status == audit.DenialSpoolArtifactTooLarge {
+			refusals++
+		}
+	}
+	if refusals != 1 {
+		t.Errorf("spool_artifact_too_large rows = %d, want 1 (%+v)", refusals, denials)
+	}
+}
+
+// TestCacheHitNamesTheUpstreamThatSuppliedTheBytes pins provenance against a
+// configuration edit. The hit row used to serialize whatever the caller held
+// at the time, so moving gomod_upstream made every later hit on an immutable
+// object credit a host that was never contacted for it.
+func TestCacheHitNamesTheUpstreamThatSuppliedTheBytes(t *testing.T) {
+	allowLoopbackUpstream(t)
+	up := gomodUpstreamFixture(t, 4096)
+	s := newProxyAuditServer(t, up.URL, 0)
+
+	zipPath := "/go/" + proxyAuditModule + "/@v/" + proxyAuditVersion + ".zip"
+	if code, body := getProxy(t, s, zipPath); code != http.StatusOK {
+		t.Fatalf("first GET %s = %d, want 200 (%s)", zipPath, code, body)
+	}
+
+	const replacement = "https://replacement.invalid"
+	s.cfg.GomodUpstream = replacement
+
+	if code, body := getProxy(t, s, zipPath); code != http.StatusOK {
+		t.Fatalf("second GET %s = %d, want 200 (%s)", zipPath, code, body)
+	}
+	requireOneHitNaming(t, s, up.URL, replacement)
+}
+
+// TestCacheOriginSurvivesAServerRestart holds the origin in the store rather
+// than in memory. A resolved URL kept per process answers the second request
+// of a session and nothing after a restart, which is most of the window an
+// incident asks about.
+func TestCacheOriginSurvivesAServerRestart(t *testing.T) {
+	allowLoopbackUpstream(t)
+	up := gomodUpstreamFixture(t, 4096)
+
+	dir := t.TempDir()
+	manifests := t.TempDir()
+	// One object store across both processes: the artifact outlives the
+	// server, which is the whole premise of a cache.
+	store := storage.NewSingle(storage.NewMemory())
+	start := func(upstream string) *Server {
+		return newServer(&config.Config{
+			LogDir:            dir,
+			AuditDB:           filepath.Join(dir, "audit.db"),
+			StoragePath:       dir,
+			SpoolDir:          filepath.Join(dir, "spool"),
+			GomodUpstream:     upstream,
+			ProxyCacheEnabled: true,
+			AllowPlaintext:    true,
+		}, manifest.NewLocalStore(manifests), store, "127.0.0.1:0",
+			slog.New(slog.NewTextHandler(io.Discard, nil)))
+	}
+
+	zipPath := "/go/" + proxyAuditModule + "/@v/" + proxyAuditVersion + ".zip"
+	first := start(up.URL)
+	if code, body := getProxy(t, first, zipPath); code != http.StatusOK {
+		t.Fatalf("GET %s before the restart = %d, want 200 (%s)", zipPath, code, body)
+	}
+	if err := first.auditDB.Close(); err != nil {
+		t.Fatalf("close the first audit db: %v", err)
+	}
+
+	// Restarted onto a different upstream, so the row can be right only if the
+	// origin outlived the process that fetched the bytes. The object is
+	// immutable and cached, so nothing here contacts the replacement.
+	const replacement = "https://elsewhere.invalid"
+	second := start(replacement)
+	t.Cleanup(func() { _ = second.auditDB.Close() })
+	if code, body := getProxy(t, second, zipPath); code != http.StatusOK {
+		t.Fatalf("GET %s after the restart = %d, want 200 (%s)", zipPath, code, body)
+	}
+	requireOneHitNaming(t, second, up.URL, replacement)
+}
+
+// TestPypiWheelCacheHitNamesTheResolvedUpstream is the route that holds no URL
+// at all on a hit. A wheel's path is the file's content hash, recoverable only
+// from the simple index, so the handler passes "" rather than pay for a
+// resolution the response will not use — and the hit row carried that "".
+func TestPypiWheelCacheHitNamesTheResolvedUpstream(t *testing.T) {
+	s := proxyingServer(t)
+	up := newRecordingUpstream(t)
+	up.route("/simple/six/", fmt.Sprintf(
+		`<!DOCTYPE html><html><body><a href="%s%s#sha256=deadbeef">%s</a><br/></body></html>`,
+		up.ts.URL, testWheelRel, testWheel))
+	up.route(testWheelRel, wheelBytes)
+
+	s.cfg.PypiUpstream = up.ts.URL
+	seedProxyPypi(t, s, "six", up.ts.URL)
+
+	if status, body := getStatusAndBody(t, s, "/pypi/wheels/"+testWheel); status != http.StatusOK {
+		t.Fatalf("first wheel GET = %d, want 200 (%s); upstream saw %v", status, body, up.paths())
+	}
+	fetched := len(up.paths())
+	if status, body := getStatusAndBody(t, s, "/pypi/wheels/"+testWheel); status != http.StatusOK {
+		t.Fatalf("second wheel GET = %d, want 200 (%s)", status, body)
+	}
+	// Reading the index again would be a network round trip that still could
+	// not prove where the cached bytes came from.
+	if got := len(up.paths()); got != fetched {
+		t.Errorf("the cache hit made %d upstream request(s): %v", got-fetched, up.paths()[fetched:])
+	}
+	requireOneHitNaming(t, s, up.ts.URL+testWheelRel)
+}
+
+// TestHitOnAnObjectWithNoRecordedOriginSaysSo covers every artifact cached
+// before origins were kept. Filling the column with the candidate the config
+// names today would make a row that reads as evidence and is not.
+func TestHitOnAnObjectWithNoRecordedOriginSaysSo(t *testing.T) {
+	allowLoopbackUpstream(t)
+	up := gomodUpstreamFixture(t, 4096)
+	s := newProxyAuditServer(t, up.URL, 0)
+
+	key := manifest.GomodFileKey(proxyAuditModule, proxyAuditVersion+".zip")
+	if err := s.typeStore(manifest.TypeGomod).Put(t.Context(), key, []byte("cached by an older bodega")); err != nil {
+		t.Fatalf("seed %s: %v", key, err)
+	}
+
+	zipPath := "/go/" + proxyAuditModule + "/@v/" + proxyAuditVersion + ".zip"
+	if code, body := getProxy(t, s, zipPath); code != http.StatusOK {
+		t.Fatalf("GET %s = %d, want 200 (%s)", zipPath, code, body)
+	}
+	hit := requireOneHitNaming(t, s, "", up.URL)
+	if !strings.Contains(hit.Details, cacheOriginUnrecorded) {
+		t.Errorf("hit row details = %q, want %q where no origin was recorded", hit.Details, cacheOriginUnrecorded)
+	}
+}
+
+// TestAptPoolCacheHitIsRecordedWithDiscoveryOff is the third of B58's serving
+// paths. handleAptMirrorPool answers a cached .deb from storage directly, and
+// its only recorder returned on discover_mode being empty — so on a default
+// install every mirrored .deb after the first was served with nothing in the
+// trail saying so.
+func TestAptPoolCacheHitIsRecordedWithDiscoveryOff(t *testing.T) {
+	archive := newFixtureArchive(t, map[string]string{fixtureDeb: fixtureDebBody})
+	s := mirrorServer(t, archive)
+	s.discoverMode = ""
+
+	for i := range 2 {
+		code, body := mirrorGet(t, s, "/apt/"+fixtureDeb)
+		if code != http.StatusOK {
+			t.Fatalf("pool GET %d = %d, want 200", i+1, code)
+		}
+		if string(body) != fixtureDebBody {
+			t.Fatalf("pool GET %d body = %q, want the archive's bytes", i+1, body)
+		}
+	}
+	// One GET for two responses is what makes the second a cache hit rather
+	// than a second fetch that happens to match.
+	if got := archive.count(fixtureDeb); got != 1 {
+		t.Fatalf("upstream GETs = %d, want 1", got)
+	}
+
+	hits, misses := splitCacheRows(t, s)
+	if len(hits) != 1 || misses != 1 {
+		t.Fatalf("cache rows = %d hit / %d miss, want 1 and 1 (%+v)", len(hits), misses, cacheRows(t, s))
+	}
+	hit := hits[0]
+	if hit.PkgType != manifest.TypeApt || hit.PkgName != "nginx" || hit.PkgVersion != "1.24.0-2ubuntu7.1" {
+		t.Errorf("hit row names %q/%q/%q, want apt/nginx/1.24.0-2ubuntu7.1",
+			hit.PkgType, hit.PkgName, hit.PkgVersion)
+	}
+	if !strings.Contains(hit.Details, archive.URL()) {
+		t.Errorf("hit row details = %q, want the archive %q in it", hit.Details, archive.URL())
+	}
+}
+
+// TestAptPoolCacheHitWithNoRouteAndSeveralArchives separates the two rows the
+// shortcut owes. With no fresh route and more than one archive configured,
+// nothing in memory can name an archive for the discovery row without a
+// network probe — but the audit row is owed anyway, and it reads the origin
+// recorded when the bytes were fetched rather than guessing a candidate.
+func TestAptPoolCacheHitWithNoRouteAndSeveralArchives(t *testing.T) {
+	archive := newFixtureArchive(t, map[string]string{fixtureDeb: fixtureDebBody})
+	other := newFixtureArchive(t, map[string]string{})
+	s := mirrorServer(t, archive, other)
+
+	if code, _ := mirrorGet(t, s, "/apt/"+fixtureDeb); code != http.StatusOK {
+		t.Fatalf("first pool GET = %d, want 200", code)
+	}
+	// An empty route is what an expired one decays to: fresh, and naming no
+	// archive. aptPoolHitUpstream then has two candidates and no way to pick.
+	s.aptRoutes.put(fixtureDeb, "")
+
+	if code, body := mirrorGet(t, s, "/apt/"+fixtureDeb); code != http.StatusOK || string(body) != fixtureDebBody {
+		t.Fatalf("second pool GET = %d body %q, want 200 and the archive's bytes", code, body)
+	}
+	if got := archive.count(fixtureDeb); got != 1 {
+		t.Fatalf("upstream GETs = %d, want 1", got)
+	}
+	requireOneHitNaming(t, s, archive.URL(), other.URL())
 }

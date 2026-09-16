@@ -184,10 +184,14 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	fail := func(err error) {
 		if status != nil && status.Exists {
 			s.logger.Error("upstream fetch failed, serving the stale cached copy", "url", upstreamURL, "error", err)
-			// No row here. This branch is below the allow-list gate, which
-			// already recorded the attempt for this request; a second write
-			// would bump request_count twice for one client fetch, which is
-			// the counting error B16 fixed in the other direction.
+			// The audit row, not the discovery row. This branch is below the
+			// allow-list gate, which already recorded the attempt for this
+			// request, and a second discovery write would bump request_count
+			// twice for one client fetch — the counting error B16 fixed in the
+			// other direction. The cache row has no such double: the response
+			// is cached bytes, and an outage is precisely the window an
+			// operator asks which artifacts the cache is carrying.
+			s.recordCacheServed(r, regType, policyCandidate, discoveryPkgName, s3Key)
 			s.proxyS3(w, r, store, s3Key)
 			return
 		}
@@ -215,6 +219,13 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 				// A cached copy beats a 503 the client has to come back for,
 				// and serving it costs no spool at all — which is the point
 				// when the spool is what ran out.
+				//
+				// Two rows for one request, and they say different things: the
+				// denial names the bound that fired, the cache row names the
+				// bytes the client got. Either one alone leaves a 200 response
+				// whose artifact came from the cache indistinguishable from a
+				// request that was simply refused.
+				s.recordCacheServed(r, regType, policyCandidate, discoveryPkgName, s3Key)
 				s.proxyS3(w, r, store, s3Key)
 				return
 			}
@@ -251,6 +262,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 			s.logger.Warn("failed to cache object", "key", s3Key, "error", err)
 		} else {
 			s.logger.Debug("cached object", "key", s3Key, "bytes", spool.size)
+			s.recordCacheOrigin(ctx, s3Key, upstreamURL)
 		}
 	}
 
@@ -796,10 +808,14 @@ func (s *Server) recordCacheEvent(r *http.Request, status, regType, upstreamURL,
 	if pkgName == "" {
 		pkgName = policyCandidate
 	}
-	details, err := json.Marshal(map[string]string{
+	fields := map[string]string{
 		"upstream": truncateField(upstreamURL, maxDetailField),
 		"key":      truncateField(s3Key, maxDetailField),
-	})
+	}
+	if status == audit.CacheHit && upstreamURL == "" {
+		fields["upstream_origin"] = cacheOriginUnrecorded
+	}
+	details, err := json.Marshal(fields)
 	if err != nil {
 		details = []byte("{}")
 	}
@@ -818,6 +834,63 @@ func (s *Server) recordCacheEvent(r *http.Request, status, regType, upstreamURL,
 	}); err != nil {
 		s.logger.Error("audit write failed, proxy outcome not recorded — still serving",
 			"event_type", audit.EventCache, "status", status,
+			"key", s3Key, "upstream", upstreamURL, "error", err)
+	}
+}
+
+// cacheOriginUnrecorded marks a cache_hit whose object's origin nothing
+// recorded: cached before bodega kept origins, or filled by a path that
+// fetches nothing. Named in the row rather than left silent, because an empty
+// upstream field on its own reads as a write that dropped it.
+const cacheOriginUnrecorded = "unrecorded"
+
+// recordCacheServed writes the audit row for a response the cache answered,
+// naming the upstream that supplied those bytes rather than the one the caller
+// would fetch from today.
+//
+// The two differ more often than the old code assumed. The pypi wheel route
+// holds no URL at all on a hit, because composing one costs a read of the
+// simple index that a hit exists to avoid; an operator who edits
+// gomod_upstream makes every later hit credit a host that answered nothing;
+// and a restart leaves the resolved URL nowhere in memory. Reading the origin
+// back is a primary-key lookup in the embedded store, so the hit still
+// contacts no network.
+func (s *Server) recordCacheServed(r *http.Request, regType, policyCandidate, discoveryPkgName, s3Key string) {
+	if s.auditDB == nil || !s.auditDB.ShouldRecord(audit.EventCache) {
+		return
+	}
+	s.recordCacheEvent(r, audit.CacheHit, regType, s.cachedOrigin(r, s3Key), policyCandidate, discoveryPkgName, s3Key)
+}
+
+// cachedOrigin is the upstream recorded for s3Key, or "" when none is.
+func (s *Server) cachedOrigin(r *http.Request, s3Key string) string {
+	ctx, cancel := auditContext(r)
+	defer cancel()
+	origin, err := s.auditDB.CacheOrigin(ctx, s3Key)
+	if err != nil {
+		// Unknown, not guessed. The row says the origin is unrecorded, which
+		// is the honest answer to a lookup that could not run.
+		s.logger.Warn("cache origin lookup failed, the hit row cannot name its upstream",
+			"key", s3Key, "error", err)
+		return ""
+	}
+	return origin
+}
+
+// recordCacheOrigin remembers which upstream supplied the bytes just written
+// to s3Key. It runs only after the store write succeeded: an origin for bytes
+// that never landed would be read back by a hit on somebody else's object.
+func (s *Server) recordCacheOrigin(ctx context.Context, s3Key, upstreamURL string) {
+	if s.auditDB == nil || s3Key == "" || upstreamURL == "" {
+		return
+	}
+	// Detached for the reason every other write on this path is: the copy to
+	// the client has not started yet, and a client that hangs up here would
+	// otherwise leave a cached object nothing can attribute.
+	octx, cancel := context.WithTimeout(context.WithoutCancel(ctx), auditWriteTimeout)
+	defer cancel()
+	if err := s.auditDB.StoreCacheOrigin(octx, s3Key, upstreamURL); err != nil {
+		s.logger.Warn("cache origin not recorded, a later hit on this key cannot name its upstream",
 			"key", s3Key, "upstream", upstreamURL, "error", err)
 	}
 }

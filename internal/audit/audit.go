@@ -31,6 +31,7 @@ package audit
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -604,6 +605,43 @@ func (a *DB) StoreChecksum(ctx context.Context, s3Key, pkgType, pkgName, pkgVers
 		s3Key, pkgType, pkgName, pkgVersion, algorithm, value, source,
 	)
 	return err
+}
+
+// StoreCacheOrigin records which upstream supplied the bytes now cached at
+// s3Key, so a later hit can name it without a network round trip.
+//
+// It lives in the embedded store rather than in the event stream because the
+// serving path reads it to compose a row, and syslog and jsonl sinks answer no
+// reads at all. Upserted: a mutable document refetched after its TTL may come
+// from a different archive than last time, and the row has to follow the bytes.
+func (a *DB) StoreCacheOrigin(ctx context.Context, s3Key, upstreamURL string) error {
+	_, err := a.writer().ExecContext(ctx,
+		`INSERT INTO cache_origins (s3_key, upstream_url)
+		 VALUES (?, ?)
+		 ON CONFLICT(s3_key) DO UPDATE SET
+		   upstream_url = excluded.upstream_url,
+		   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+		s3Key, upstreamURL,
+	)
+	return err
+}
+
+// CacheOrigin returns the upstream recorded for s3Key, or "" when nothing
+// recorded one — an object cached before this table existed, or filled by a
+// path that fetches nothing. The caller says so in the row rather than
+// substituting a current candidate.
+func (a *DB) CacheOrigin(ctx context.Context, s3Key string) (string, error) {
+	var upstreamURL string
+	err := a.db.QueryRowContext(ctx,
+		`SELECT upstream_url FROM cache_origins WHERE s3_key = ?`, s3Key,
+	).Scan(&upstreamURL)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return upstreamURL, nil
 }
 
 // GetChecksum returns the stored checksum for an S3 key, or nil if not found.

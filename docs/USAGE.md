@@ -3511,11 +3511,13 @@ That table is the whole set. A type absent from a trail is a gap to chase rather
 | Status | Outcome |
 |--------|---------|
 | `cache_miss` | Fetched from upstream, verified and stored. `details` names the URL that answered |
-| `cache_hit` | Served from storage with no upstream contact. A stale copy served because the upstream could not be reached records this too: the request is what the row counts |
+| `cache_hit` | Served from storage with no upstream contact. A stale copy served because the upstream could not be reached, or because the spool refused the refetch, records this too: the request is what the row counts |
 | `checksum_mismatch` | Upstream bytes disagreed with the digest pinned on first fetch. The artifact was neither served nor cached |
 | `policy_violation` | The upstream allow-list refused the candidate. Written wherever the refusal is decided, including the apt pool probe, which refuses a `.deb` before there is a fetch to record |
 
-One row per request on both serving outcomes, so counting `cache_miss` over a window sizes what an upstream actually served. A fetch refused by the spool writes its `denied` row and no `cache` row: nothing came from upstream, and a row saying otherwise would inflate that count.
+One row per request on both serving outcomes, so counting `cache_miss` over a window sizes what an upstream actually served. Every response the cache answers is counted, including the apt pool shortcut that serves a cached `.deb` without resolving which archive it came from, and including a stale copy served during an outage. A request the spool refuses with nothing cached to fall back on writes its `denied` row and no `cache` row: nothing came from upstream and nothing was served, so a row either way would be wrong. Where a stale copy does answer, both rows are written — the `denied` row names the bound that fired, the `cache_hit` names the bytes the client got.
+
+**Provenance on a hit.** `details` on a `cache_hit` names the upstream that supplied those bytes, recorded when they were fetched and read back from the store — not the candidate `gomod_upstream` or `apt_upstreams` points at now. The two diverge routinely: the pypi wheel route holds no URL on a hit at all, because composing one costs a read of the simple index that a hit exists to avoid, and a restart or a configuration edit leaves the fetched URL nowhere in memory. An object cached before bodega kept origins, or filled by a path that fetches nothing, carries `"upstream": ""` and `"upstream_origin": "unrecorded"` instead of a guess: a row naming a host that answered nothing reads as evidence and is not.
 
 **Denials.** A `denied` row's `status` column names the gate that turned the request away, so an address that was never permitted reads differently from a token that simply aged out:
 

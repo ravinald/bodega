@@ -266,8 +266,18 @@ func (s *Server) recordCacheHit(ctx context.Context, r *http.Request, regType, u
 	// upstream, discovery says what the fleet reached for — and sharing one
 	// guard is what left an install with discovery off unable to answer the
 	// first question at all.
-	s.recordCacheEvent(r, audit.CacheHit, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key)
+	s.recordCacheServed(r, regType, policyCandidate, discoveryPkgName, s3Key)
+	s.recordCacheHitDiscovery(ctx, r, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key)
+}
 
+// recordCacheHitDiscovery is recordCacheHit's discovery half alone, for a
+// caller that has already written the audit row or must not write one.
+//
+// The split is what keeps the apt pool shortcut honest: it can resolve an
+// archive for the discovery row only from the route cache, so the row is
+// skipped where nothing in memory can name one, while the audit row is owed on
+// every served .deb regardless.
+func (s *Server) recordCacheHitDiscovery(ctx context.Context, r *http.Request, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key string) {
 	if s.discovery == nil || s.discoverMode == "" {
 		return
 	}

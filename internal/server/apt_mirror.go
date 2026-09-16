@@ -154,6 +154,13 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, poo
 	// once a fleet is warm: the probe below is per pool path and the cache
 	// read is not.
 	if s.aptCached(r.Context(), store, key, true) {
+		// The audit row is unconditional. This shortcut is the only path a
+		// cached .deb is served by, and it used to write through
+		// recordAptPoolHit, whose first line returns on discovery being off —
+		// so on a default install every mirrored .deb after the first was
+		// served with nothing in the trail saying the cache answered it.
+		name, _ := manifest.AptDebIdentity(path.Base(poolPath))
+		s.recordCacheServed(r, manifest.TypeApt, "", name, key)
 		s.recordAptPoolHit(r, poolPath, key)
 		s.proxyS3(w, r, store, key)
 		return
@@ -175,7 +182,9 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, poo
 	s.serveAptMirror(w, r, store, key, base+"/"+poolPath, name, true)
 }
 
-// recordAptPoolHit writes the discovery row for a .deb served out of the cache.
+// recordAptPoolHit writes the discovery row alone for a .deb served out of the
+// cache; the audit row is its caller's, which owes one whatever discovery is
+// set to.
 //
 // The pool path names no archive — that is why aptRouteCache exists — and a
 // cached object is served without resolving one, so the archive has to be
@@ -199,7 +208,7 @@ func (s *Server) recordAptPoolHit(r *http.Request, poolPath, key string) {
 		return
 	}
 	name, _ := manifest.AptDebIdentity(path.Base(poolPath))
-	s.recordCacheHit(r.Context(), r, manifest.TypeApt, upstream, upstream, name, key)
+	s.recordCacheHitDiscovery(r.Context(), r, manifest.TypeApt, upstream, upstream, name, key)
 }
 
 // aptPoolHitUpstream names the archive a cached pool object came from, or ""
