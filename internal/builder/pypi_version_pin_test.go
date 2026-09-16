@@ -265,11 +265,14 @@ func TestFetchPypiSendsTheSelectedIndexToPip(t *testing.T) {
 	}
 }
 
-// The default index stays unsaid, so a deployment pointing pip at its own
-// mirror through pip.conf keeps it.
-func TestFetchPypiLeavesTheDefaultIndexUnsaid(t *testing.T) {
-	if got := pypiIndexLine(defaultPypiIndex); got != "" {
-		t.Errorf("the default index was written into the requirements file as %q", got)
+// The default index is written out like any other. It used to be left unsaid
+// so a deployment could point pip at its own mirror through pip.conf, but the
+// build now runs pip with that configuration switched off, and an index
+// nothing states is an index nothing enforces.
+func TestFetchPypiWritesTheDefaultIndexToo(t *testing.T) {
+	want := "--index-url " + defaultPypiIndex + "/simple/\n"
+	if got := pypiIndexLine(defaultPypiIndex); got != want {
+		t.Errorf("the default index reached pip as %q, want %q", got, want)
 	}
 }
 
@@ -321,8 +324,12 @@ func TestHasInstallableRequirementsIgnoresPipOptions(t *testing.T) {
 	}{
 		{"# comment\n--index-url https://example/simple/\n", false},
 		{"--index-url https://example/simple/\nsix==1.16.0\n", true},
-		{"--index-url https://example/simple/\n-r /tmp/other.txt\n", true},
-		{"--requirement=/tmp/other.txt\n", true},
+		// An include names no target here any more: the generated file pulls
+		// in no other file, so an application's requirements arrive as their
+		// own lines and the only path option left is the `-c` naming the
+		// generated constraints, which requests no installs.
+		{"--index-url https://example/simple/\n-r /tmp/other.txt\n", false},
+		{"-c /var/lib/bodega/pypi/combined-constraints.txt\n", false},
 		{"\n\n", false},
 	} {
 		path := filepath.Join(t.TempDir(), "requirements.txt")

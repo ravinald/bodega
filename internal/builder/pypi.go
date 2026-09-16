@@ -5,26 +5,30 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
-// hasInstallableRequirements reports whether a pip requirements file contains
-// any line that pip would treat as an install target. Blank lines and comment
-// lines (leading #) are ignored. An `-r other.txt` reference counts as
-// installable (pip will recurse into it at wheel time).
+// hasInstallableRequirements reports whether the generated requirements file
+// contains any line pip would treat as an install target. Blank lines, comment
+// lines and options are not targets: counting one builds a venv, runs pip
+// wheel over a file naming nothing, and produces zero wheels without an error
+// anywhere.
 //
-// A pip global option such as `--index-url` is not a target. Counting one
-// builds a venv, runs pip wheel over a file naming nothing, and produces zero
-// wheels without an error anywhere.
+// A leading dash is never a target here because the generated file includes no
+// other file. An application's requirements arrive inlined, so an install
+// target it names is present as its own line rather than behind an `-r`, and
+// the only option carrying a path is the `-c` naming the generated constraint
+// file, which by definition requests no installs.
 func hasInstallableRequirements(path string) (bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -35,10 +39,7 @@ func hasInstallableRequirements(path string) (bool, error) {
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if strings.HasPrefix(line, "-") && !isRequirementInclude(line) {
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "-") {
 			continue
 		}
 		return true, nil
@@ -46,17 +47,53 @@ func hasInstallableRequirements(path string) (bool, error) {
 	return false, scanner.Err()
 }
 
-// isRequirementInclude reports whether a leading-dash line pulls in another
-// requirements file, which is the one option that names install targets.
-func isRequirementInclude(line string) bool {
-	field := strings.Fields(line)[0]
-	field, _, _ = strings.Cut(field, "=")
-	return field == "-r" || field == "--requirement"
-}
-
 // pypiWheelsDir returns the local wheels directory.
 func pypiWheelsDir(d dirs) string {
 	return d.wheels
+}
+
+// pypiPipPassthrough are the variables the build environment carries through.
+// Everything else is dropped, PIP_* above all: pip reads those as
+// configuration at a precedence above the requirements file, so a
+// PIP_INDEX_URL in the environment bodega was started with moves acquisition
+// without appearing in any file a requirements reader could examine.
+//
+// https://pip.pypa.io/en/stable/topics/configuration/
+var pypiPipPassthrough = []string{
+	"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR",
+	"SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+	"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+	"http_proxy", "https_proxy", "no_proxy",
+}
+
+// pypiPipEnv is the environment every pip invocation in a build runs under.
+func pypiPipEnv() []string {
+	env := []string{"PIP_CONFIG_FILE=" + os.DevNull}
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if slices.Contains(pypiPipPassthrough, name) {
+			env = append(env, kv)
+		}
+	}
+	return env
+}
+
+// pypiSelectedIndex reads the index out of the generated requirements file.
+//
+// The build takes the index from the file the fetch wrote rather than from the
+// manifest, so an entry edited between the two stages cannot leave pip pointed
+// somewhere the resolution never read.
+func pypiSelectedIndex(reqPath string) (string, error) {
+	data, err := os.ReadFile(reqPath)
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "--index-url "); ok {
+			return strings.TrimSpace(rest), nil
+		}
+	}
+	return "", fmt.Errorf("%s names no --index-url — re-run 'fetch pypi'", reqPath)
 }
 
 // defaultPypiIndex is the index a pypi entry resolves against when it names no
@@ -151,25 +188,47 @@ func pypiIndexRoot(ctx context.Context, store *manifest.Store) (string, error) {
 }
 
 // pypiIndexLine renders the pip option that points the wheel build at the same
-// index the resolution read. The default index is left unsaid so a deployment
-// pointing pip at its own mirror through pip.conf keeps it.
+// index the resolution read.
+//
+// The default index is written out like any other. Leaving it unsaid used to
+// let a deployment point pip at its own mirror through pip.conf, but the build
+// now runs with that configuration switched off, so an unsaid default is no
+// longer a passthrough: it is an index nothing states and nothing enforces. A
+// deployment with a mirror names it on the manifest entry.
 func pypiIndexLine(root string) string {
-	if root == defaultPypiIndex {
-		return ""
-	}
-	return "--index-url " + strings.TrimRight(root, "/") + "/simple/\n"
+	return "--index-url " + pypiIndexURL(root) + "\n"
 }
 
-// pypiSourceConflict fails when a requirements file pip is told to read names
-// an origin of its own.
+// pypiIndexURL is the simple-index URL pip is pointed at for an index root.
+func pypiIndexURL(root string) string {
+	return strings.TrimRight(root, "/") + "/simple/"
+}
+
+// pypiReader flattens an application's requirements files into lines bodega
+// writes itself.
 //
-// pip parses an included file after the generated header and honors the last
-// index option it finds, so an application's requirements.txt can replace the
-// index the manifest approved, or add a second one beside it, and nothing in
-// the resolver ever sees it. Rejecting rather than rewriting: the file belongs
-// to the application, and silently editing an origin out of it hides the
-// disagreement instead of settling it.
-func pypiSourceConflict(path, indexRoot string, seen map[string]bool) error {
+// Checking a file and then telling pip to read that same file leaves two
+// parsers over one set of bytes, and every difference between them is an
+// acquisition instruction the resolver approved one index against and pip
+// carried out against another. So the reader emits what it read: the generated
+// file holds the logical lines this parsed, includes resolved in place, and
+// pip never opens an application's file at all. A construct this cannot read
+// still fails the fetch, but a construct it reads wrongly now produces a wrong
+// requirement rather than a silent change of origin.
+//
+// Rejecting rather than rewriting an origin: the file belongs to the
+// application, and editing one out hides the disagreement instead of settling
+// it.
+type pypiReader struct {
+	indexRoot string
+	// requirements and constraints are kept apart because a constraint
+	// restricts a version without requesting the package. Flattening the two
+	// together installs whatever an application only meant to bound.
+	requirements []string
+	constraints  []string
+}
+
+func (r *pypiReader) read(path string, constraint bool, seen map[string]bool) error {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		abs = path
@@ -179,22 +238,140 @@ func pypiSourceConflict(path, indexRoot string, seen map[string]bool) error {
 	}
 	seen[abs] = true
 
-	f, err := os.Open(path)
+	data, err := pypiRequirementBytes(path)
 	if err != nil {
-		return fmt.Errorf("read requirements: %w", err)
+		return fmt.Errorf("%s: %w", path, err)
 	}
-	defer func() { _ = f.Close() }()
-
-	lines, err := pypiLogicalLines(f)
+	lines, err := pypiLogicalLines(data)
 	if err != nil {
-		return fmt.Errorf("read requirements: %w", err)
+		return fmt.Errorf("%s: %w", path, err)
 	}
 	for _, line := range lines {
-		if err := pypiLineSource(path, indexRoot, line, seen); err != nil {
+		inc, err := pypiLineSource(path, r.indexRoot, line.text)
+		if err != nil {
 			return err
+		}
+		if inc.path == "" {
+			if constraint {
+				r.constraints = append(r.constraints, line.text)
+			} else {
+				r.requirements = append(r.requirements, line.text)
+			}
+			continue
+		}
+		next := inc.path
+		if !filepath.IsAbs(next) {
+			next = filepath.Join(filepath.Dir(path), next)
+		}
+		// A constraint file's includes stay constraints however deep they go.
+		if err := r.read(next, constraint || inc.constraint, seen); err != nil {
+			return fmt.Errorf("%s line %d includes %s: %w", path, line.n, inc.path, err)
+		}
+		if inc.unusable != "" {
+			return fmt.Errorf("%s line %d %s", path, line.n, inc.unusable)
 		}
 	}
 	return nil
+}
+
+// pypiInclude names a file one logical line pulls in, and whether its contents
+// are constraints rather than requirements.
+//
+// unusable carries why the include cannot be reproduced, when it cannot. The
+// reader still follows the file before reporting it: an origin named inside is
+// the more useful thing to say, and saying the shape is wrong first would hide
+// it behind a lesser diagnosis.
+type pypiInclude struct {
+	path       string
+	constraint bool
+	unusable   string
+}
+
+// pypiLine is one logical line and the physical line it starts on, so a
+// rejection can say where to go and not just what is wrong.
+type pypiLine struct {
+	n    int
+	text string
+}
+
+// pypiBOMs are the byte-order marks pip decodes a requirements file by, in
+// pip's own order: BOM_UTF16_LE is a prefix of BOM_UTF32_LE, so the longer one
+// has to be tested first.
+var pypiBOMs = []struct {
+	bytes    string
+	encoding string
+}{
+	{"\xef\xbb\xbf", "utf-8"},
+	{"\xff\xfe\x00\x00", "utf-32-le"},
+	{"\x00\x00\xfe\xff", "utf-32-be"},
+	{"\xff\xfe", "utf-16-le"},
+	{"\xfe\xff", "utf-16-be"},
+}
+
+// pypiCodingRe matches a PEP 263 encoding declaration, the way pip does.
+var pypiCodingRe = regexp.MustCompile(`coding[:=]\s*([-\w.]+)`)
+
+// pypiEnvVarRe matches the one environment-variable form pip expands.
+var pypiEnvVarRe = regexp.MustCompile(`\$\{[A-Z0-9_]+\}`)
+
+// pypiUTF8Aliases are the encoding names a PEP 263 declaration may carry
+// without changing what the bytes mean. ASCII is here because it is a subset:
+// a file that decodes as ASCII decodes identically as UTF-8, and one that does
+// not makes pip fail loudly rather than read something else.
+var pypiUTF8Aliases = map[string]bool{
+	"utf-8": true, "utf8": true, "utf_8": true, "u8": true, "utf": true,
+	"ascii": true, "us-ascii": true, "usascii": true, "ansi_x3.4-1968": true,
+}
+
+// pypiLineBreaks are the separators Python's str.splitlines splits on beyond
+// \n and \r\n. pip calls splitlines on the decoded file, so every one of these
+// starts a line for pip that a reader splitting on \n never sees at all.
+var pypiLineBreaks = []struct{ seq, name string }{
+	{"\v", `\v`}, {"\f", `\f`}, {"\x1c", `\x1c`}, {"\x1d", `\x1d`},
+	{"\x1e", `\x1e`}, {"\u0085", `\u0085`}, {"\u2028", `\u2028`}, {"\u2029", `\u2029`},
+}
+
+// pypiRequirementBytes reads a requirements file and refuses the encodings pip
+// would decode differently from the bytes on disk.
+//
+// pip decodes the whole file before it reads a line of it: a byte-order mark,
+// or a `# -*- coding: ... -*-` comment in the first two lines, selects the
+// codec for everything after. A reader working on raw bytes and a pip decoding
+// UTF-16 do not disagree about one option, they disagree about every byte, and
+// the UTF-16 spelling of `://` appears nowhere in those bytes, so no amount of
+// token matching finds an index hidden in one.
+//
+// https://pip.pypa.io/en/stable/reference/requirements-file-format/#encoding
+func pypiRequirementBytes(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	for _, bom := range pypiBOMs {
+		if strings.HasPrefix(string(data), bom.bytes) {
+			return nil, fmt.Errorf(
+				"line 1 opens on a %s byte-order mark; pip decodes the whole file as %s and this reads it as UTF-8, so save it as UTF-8 without a mark",
+				bom.encoding, bom.encoding)
+		}
+	}
+	for n, line := range strings.SplitN(string(data), "\n", 3) {
+		if n > 1 || !strings.HasPrefix(line, "#") {
+			break
+		}
+		m := pypiCodingRe.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		if !pypiUTF8Aliases[strings.ToLower(m[1])] {
+			return nil, fmt.Errorf(
+				"line %d declares coding %s, which pip decodes the whole file by and this reads as UTF-8; save it as UTF-8 and drop the declaration",
+				n+1, m[1])
+		}
+	}
+	if !utf8.Valid(data) {
+		return nil, errors.New("holds bytes that are not UTF-8; pip falls back to the locale encoding and reads different text than this does, so save it as UTF-8")
+	}
+	return data, nil
 }
 
 // pypiLogicalLines returns the lines pip parses, not the lines the file holds.
@@ -204,23 +381,50 @@ func pypiSourceConflict(path, indexRoot string, seen map[string]bool) error {
 // on consecutive lines are one --index-url option by the time any of it is
 // read. A checker working on physical lines sees two fragments, matches
 // neither, and passes the origin through.
-func pypiLogicalLines(r io.Reader) ([]string, error) {
-	scanner := bufio.NewScanner(r)
+//
+// Before any of that pip splits the decoded text with str.splitlines, which
+// breaks on eight separators beyond \n and \r\n. Each one is a line pip reads
+// and this does not, so they are refused here rather than reproduced: an
+// application has no reason to separate requirements with a form feed, and
+// matching Python's line-breaking table is a standing obligation rather than a
+// fix.
+func pypiLogicalLines(data []byte) ([]pypiLine, error) {
+	text := string(data)
+	for _, br := range pypiLineBreaks {
+		if i := strings.Index(text, br.seq); i >= 0 {
+			return nil, fmt.Errorf(
+				"line %d holds a %s, which pip reads as the start of another line and this does not; separate lines with a newline",
+				strings.Count(text[:i], "\n")+1, br.name)
+		}
+	}
 	var (
-		lines   []string
+		lines   []pypiLine
 		pending []string
+		start   int
 	)
-	flush := func(line string) {
+	flush := func(n int, line string) {
 		if len(pending) > 0 {
 			line = strings.Join(pending, "") + line
 			pending = nil
+			n = start
 		}
 		if line = strings.TrimSpace(pypiStripComment(line)); line != "" {
-			lines = append(lines, line)
+			lines = append(lines, pypiLine{n: n, text: line})
 		}
 	}
-	for scanner.Scan() {
-		line := strings.TrimRight(scanner.Text(), "\r")
+	for i, line := range strings.Split(text, "\n") {
+		n := i + 1
+		if cr := strings.IndexByte(line, '\r'); cr >= 0 {
+			// A CR ends a line for pip wherever it sits. One at the end of a
+			// physical line is an ordinary CRLF file; one anywhere else hides
+			// every line after it inside what this reads as a single line.
+			if cr != len(line)-1 {
+				return nil, fmt.Errorf(
+					"line %d holds a carriage return mid-line, which pip reads as the start of another line and this does not; separate lines with a newline",
+					n)
+			}
+			line = line[:cr]
+		}
 		// A comment never continues, however it ends: pip tests the comment
 		// first, so a trailing backslash inside one joins nothing, and the
 		// space it inserts is what keeps the comment separable afterward.
@@ -228,16 +432,23 @@ func pypiLogicalLines(r io.Reader) ([]string, error) {
 			if comment {
 				line = " " + line
 			}
-			flush(line)
+			flush(n, line)
 			continue
+		}
+		if len(pending) == 0 {
+			start = n
 		}
 		pending = append(pending, strings.Trim(line, `\`))
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
 	if len(pending) > 0 {
-		flush("")
+		flush(0, "")
+	}
+	for _, line := range lines {
+		if v := pypiEnvVarRe.FindString(line.text); v != "" {
+			return nil, fmt.Errorf(
+				"line %d expands %s, which pip replaces from its own environment and this cannot see; write the value, or name the index in the manifest",
+				line.n, v)
+		}
 	}
 	return lines, nil
 }
@@ -307,21 +518,26 @@ var pypiReqOptions = []pypiOption{
 }
 
 // pypiLineSource checks one logical line for anything that decides where pip
-// downloads from.
-func pypiLineSource(path, indexRoot, line string, seen map[string]bool) error {
+// downloads from, and reports the file it pulls in when it pulls one in.
+func pypiLineSource(path, indexRoot, line string) (pypiInclude, error) {
+	var inc pypiInclude
 	args, optionsText := breakPypiArgsOptions(line)
 	for _, arg := range args {
 		if u := pypiURLToken(arg); u != "" {
-			return fmt.Errorf("%s names %s, which pip downloads without asking the %s the manifest approved",
+			return inc, fmt.Errorf("%s names %s, which pip downloads without asking the %s the manifest approved",
 				path, u, indexRoot)
 		}
 	}
 	opts, err := pypiShlex(optionsText)
 	if err != nil {
-		return fmt.Errorf("%s: %s %w; pip splits options the same way and fails the file, so fix the quoting",
+		return inc, fmt.Errorf("%s: %s %w; pip splits options the same way and fails the file, so fix the quoting",
 			path, optionsText, err)
 	}
 
+	// An include is reproduced by inlining the file it names, so it has to be
+	// the only thing on its line: anything beside it would be dropped when the
+	// line is replaced by what it pulled in.
+	var beside string
 	for i := 0; i < len(opts); i++ {
 		// optparse discards a token that is not an option and keeps reading
 		// the ones after it, so a stray value decides no origin.
@@ -330,42 +546,58 @@ func pypiLineSource(path, indexRoot, line string, seen map[string]bool) error {
 		}
 		opt, value, attached, err := cutRequirementOption(opts[i])
 		if err != nil {
-			return fmt.Errorf("%s: %w", path, err)
+			return inc, fmt.Errorf("%s: %w", path, err)
 		}
 		if opt.value && !attached && i+1 < len(opts) {
 			i++
 			value = opts[i]
 		}
 
+		if opt.class != pypiOptionInclude {
+			beside = opt.long
+		}
+
 		switch opt.class {
 		case pypiOptionIndex:
 			if !sameIndexRoot(value, indexRoot) {
-				return fmt.Errorf("%s names %s %s and the manifest resolved against %s; one fetch downloads from one index",
+				return inc, fmt.Errorf("%s names %s %s and the manifest resolved against %s; one fetch downloads from one index",
 					path, opt.long, value, indexRoot)
 			}
 		case pypiOptionOrigin:
-			return fmt.Errorf("%s names %s%s, which acquires outside the %s the manifest approved",
+			return inc, fmt.Errorf("%s names %s%s, which acquires outside the %s the manifest approved",
 				path, opt.long, pypiValueSuffix(value), indexRoot)
 		case pypiOptionDirect:
 			if u := pypiURLToken(value); u != "" {
-				return fmt.Errorf("%s names %s %s, which pip downloads without asking the %s the manifest approved",
+				return inc, fmt.Errorf("%s names %s %s, which pip downloads without asking the %s the manifest approved",
 					path, opt.long, u, indexRoot)
 			}
 		case pypiOptionInclude:
 			if value == "" {
 				continue
 			}
-			next := value
-			if !filepath.IsAbs(next) {
-				next = filepath.Join(filepath.Dir(path), next)
+			// An include on a line that also names a requirement is one pip
+			// ignores, because a requirement line's options are scoped to that
+			// requirement. Inlining it would install what pip would not, and
+			// dropping it would leave its origin unexamined.
+			switch {
+			case len(args) > 0:
+				inc.unusable = fmt.Sprintf("names %s %s beside the requirement %s, which pip ignores; put the include on a line of its own",
+					opt.long, value, strings.Join(args, " "))
+			case inc.path != "":
+				inc.unusable = fmt.Sprintf("names %s %s beside another include; put each on a line of its own",
+					opt.long, value)
 			}
-			if err := pypiSourceConflict(next, indexRoot, seen); err != nil {
-				return fmt.Errorf("%s includes %s: %w", path, value, err)
+			if inc.path == "" {
+				inc.path, inc.constraint = value, opt.long == "--constraint"
 			}
 		case pypiOptionInert:
 		}
 	}
-	return nil
+	if inc.path != "" && beside != "" && inc.unusable == "" {
+		inc.unusable = fmt.Sprintf("names %s beside an include, which is dropped when the include is resolved; put each on a line of its own",
+			beside)
+	}
+	return inc, nil
 }
 
 // breakPypiArgsOptions splits a logical line the way pip does: the tokens up to
@@ -747,10 +979,12 @@ func FetchPypi(cfg *Config, store *manifest.Store) *Summary {
 	// the retry, so a previous run's file outlives the pin it was resolved
 	// from: edit a version, watch the re-fetch fail, and `build run pypi` still
 	// stores the closure of the version nobody approved any more.
-	combinedReq := filepath.Join(cfg.rootFor(manifest.TypePypi), "combined-requirements.txt")
+	root := cfg.rootFor(manifest.TypePypi)
+	combinedReq := filepath.Join(root, "combined-requirements.txt")
 	if err := os.Remove(combinedReq); err == nil {
 		_, _ = fmt.Fprintf(cfg.stdout(), "    Discarded %s: it no longer describes the manifest\n", combinedReq)
 	}
+	_ = os.Remove(filepath.Join(root, "combined-constraints.txt"))
 	return summary
 }
 
@@ -776,11 +1010,10 @@ func fetchPypi(cfg *Config, store *manifest.Store) *Summary {
 		return summary
 	}
 
+	reader := &pypiReader{indexRoot: indexRoot}
 	reqLines := []string{"# Auto-generated by bodega from pypi manifests\n"}
-	if line := pypiIndexLine(indexRoot); line != "" {
-		_, _ = fmt.Fprintf(out, "    Index: %s\n", indexRoot)
-		reqLines = append(reqLines, line)
-	}
+	_, _ = fmt.Fprintf(out, "    Index: %s\n", indexRoot)
+	reqLines = append(reqLines, pypiIndexLine(indexRoot))
 
 	// Collect base requirements: git repos referenced via RequiredBy on any pypi entry.
 	baseReqs := make(map[string]string) // repoName → ref
@@ -833,7 +1066,7 @@ func fetchPypi(cfg *Config, store *manifest.Store) *Summary {
 			summary.Total++
 			return summary
 		}
-		if err := pypiSourceConflict(reqPath, indexRoot, map[string]bool{}); err != nil {
+		if err := reader.read(reqPath, false, map[string]bool{}); err != nil {
 			result.Err = fmt.Errorf("pypi base requirements for %s@%s: %w", repoName, ref, err)
 			_, _ = fmt.Fprintf(out, "    FAILED: %v\n", result.Err)
 			summary.Failures++
@@ -842,7 +1075,17 @@ func fetchPypi(cfg *Config, store *manifest.Store) *Summary {
 			return summary
 		}
 		_, _ = fmt.Fprintf(out, "    Base: %s @ %s (%s)\n", repoName, ref, reqPath)
-		reqLines = append(reqLines, fmt.Sprintf("-r %s\n", reqPath))
+	}
+
+	combinedCon := filepath.Join(cfg.rootFor(manifest.TypePypi), "combined-constraints.txt")
+	if len(reader.constraints) > 0 {
+		reqLines = append(reqLines, fmt.Sprintf("-c %s\n", combinedCon))
+	}
+	if len(reader.requirements) > 0 {
+		reqLines = append(reqLines, "\n# Requirements read from the applications' own files\n")
+		for _, line := range reader.requirements {
+			reqLines = append(reqLines, line+"\n")
+		}
 	}
 
 	// Collect extra packages from the pypi manifests.
@@ -897,6 +1140,24 @@ func fetchPypi(cfg *Config, store *manifest.Store) *Summary {
 	// a partial file builds cleanly and stores a closure nobody approved.
 	if unresolved {
 		return summary
+	}
+
+	// The constraint file lands first: the requirements file is what the next
+	// stage reads as "fetch is done", so it must not exist while the `-c` in
+	// it still points at nothing.
+	if len(reader.constraints) > 0 {
+		body := "# Auto-generated by bodega from the applications' own constraint files\n" +
+			strings.Join(reader.constraints, "\n") + "\n"
+		if err := os.WriteFile(combinedCon, []byte(body), 0o644); err != nil {
+			result.Err = fmt.Errorf("write combined constraints: %w", err)
+			summary.Failures++
+			summary.Results = append(summary.Results, result)
+			summary.Total++
+			return summary
+		}
+		_, _ = fmt.Fprintf(out, "    Constraints written to: %s\n", combinedCon)
+	} else {
+		_ = os.Remove(combinedCon)
 	}
 
 	// Write combined requirements file.
@@ -964,6 +1225,21 @@ func BuildPypi(cfg *Config, store *manifest.Store) *Summary {
 		return summary
 	}
 
+	indexURL, err := pypiSelectedIndex(combinedReq)
+	if err != nil {
+		result.Err = err
+		summary.Failures++
+		summary.Results = append(summary.Results, result)
+		summary.Total++
+		return summary
+	}
+	// The index reaches pip as an argument as well as a line in the file. A
+	// requirements file pip reads can replace a command-line --index-url, so
+	// the argument is not the stronger of the two; it is the one that holds
+	// when the file is empty of options, and it is what the log records pip
+	// was pointed at.
+	pipEnv := pypiPipEnv()
+
 	wheelsDir := pypiWheelsDir(d)
 	if err := mkdirAll(wheelsDir); err != nil {
 		cfg.logf("ERROR: %v", err)
@@ -982,9 +1258,9 @@ func BuildPypi(cfg *Config, store *manifest.Store) *Summary {
 
 	_, _ = fmt.Fprintf(out, "\n>>> [pypi] build — creating virtualenv\n")
 	// Try normal venv first; fall back to --without-pip if ensurepip is missing.
-	if err := runCmd(out, "", "python3", "-m", "venv", venvDir); err != nil {
+	if err := runCmdEnv(out, "", pipEnv, "python3", "-m", "venv", venvDir); err != nil {
 		_, _ = fmt.Fprintf(out, "    venv failed, retrying with --without-pip...\n")
-		if err2 := runCmd(out, "", "python3", "-m", "venv", "--without-pip", venvDir); err2 != nil {
+		if err2 := runCmdEnv(out, "", pipEnv, "python3", "-m", "venv", "--without-pip", venvDir); err2 != nil {
 			result.Err = fmt.Errorf("python3 -m venv: %w", err2)
 			summary.Failures++
 			summary.Results = append(summary.Results, result)
@@ -994,7 +1270,7 @@ func BuildPypi(cfg *Config, store *manifest.Store) *Summary {
 		// Install pip into the venv manually.
 		_, _ = fmt.Fprintf(out, "    Installing pip via get-pip.py...\n")
 		pythonBin := filepath.Join(venvDir, "bin", "python3")
-		if err3 := runCmd(out, "", "bash", "-c",
+		if err3 := runCmdEnv(out, "", pipEnv, "bash", "-c",
 			"curl -sS https://bootstrap.pypa.io/get-pip.py | "+pythonBin); err3 != nil {
 			result.Err = fmt.Errorf("install pip: %w", err3)
 			summary.Failures++
@@ -1006,7 +1282,13 @@ func BuildPypi(cfg *Config, store *manifest.Store) *Summary {
 
 	pipBin := filepath.Join(venvDir, "bin", "pip")
 	_, _ = fmt.Fprintf(out, "    Upgrading pip, wheel, setuptools...\n")
-	if err := runCmd(out, "", pipBin, "install", "--upgrade", "pip", "wheel", "setuptools"); err != nil {
+	// The bootstrap reaches the selected index like everything else. It used to
+	// take pip's default whatever the manifest approved, which installed three
+	// packages from pypi.org into the environment that then built every wheel.
+	// A mirror that carries no pip fails here, loudly, rather than quietly
+	// reaching past itself.
+	if err := runCmdEnv(out, "", pipEnv, pipBin, "install", "--isolated",
+		"--index-url", indexURL, "--upgrade", "pip", "wheel", "setuptools"); err != nil {
 		result.Err = fmt.Errorf("pip upgrade: %w", err)
 		summary.Failures++
 		summary.Results = append(summary.Results, result)
@@ -1016,8 +1298,10 @@ func BuildPypi(cfg *Config, store *manifest.Store) *Summary {
 
 	// Build wheels.
 	_, _ = fmt.Fprintf(out, "\n>>> [pypi] build — building wheels (C extensions will compile from source)\n")
-	if err := runCmd(out, "",
+	if err := runCmdEnv(out, "", pipEnv,
 		pipBin, "wheel",
+		"--isolated",
+		"--index-url", indexURL,
 		"--wheel-dir", wheelsDir,
 		"--progress-bar", "on",
 		"-r", combinedReq,
