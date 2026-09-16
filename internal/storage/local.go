@@ -216,7 +216,7 @@ const tmpPrefix = ".bodega-tmp-"
 // creation takes the wrong mode.
 func createStaged(dir string, perm os.FileMode) (*os.File, error) {
 	for range 100 {
-		//nolint:gosec // perm is the destination's own mode or 0666 before umask, never a widening.
+		//nolint:gosec // perm is the writer's own mode on a replacement, or the fresh mode before umask; never a widening.
 		f, err := os.OpenFile(filepath.Join(dir, tmpPrefix+rand.Text()), os.O_RDWR|os.O_CREATE|os.O_EXCL, perm)
 		if errors.Is(err, fs.ErrExist) {
 			continue
@@ -224,6 +224,31 @@ func createStaged(dir string, perm os.FileMode) (*os.File, error) {
 		return f, err
 	}
 	return nil, fmt.Errorf("create staging file in %s: no unused name", dir)
+}
+
+// openPrior opens the object a publication is about to replace, or returns nil
+// when the key holds nothing yet.
+//
+// The handle, not the path, is what the new object's access state is read
+// from, and it is held across the write so that the state applied is one the
+// object genuinely had. A key holding something that is not a regular file
+// names no object: publication replaces the name either way, and there is no
+// mode, owner or ACL on a directory that means anything on a file.
+func openPrior(p string) (*os.File, error) {
+	f, err := os.Open(p)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w. A replacement carries the access state of the object it replaces, "+
+			"which has to be read first; the previous object is unchanged", err)
+	}
+	fi, err := f.Stat()
+	if err != nil || !fi.Mode().IsRegular() {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
 }
 
 // publish writes p by filling a sibling staging file and renaming it into
@@ -239,22 +264,29 @@ func createStaged(dir string, perm os.FileMode) (*os.File, error) {
 // the proxy against itself would not close it, because the writer is often
 // another process using this same root.
 //
-// Publishing a new inode carries no mode of its own, so both halves of what
-// writing in place used to decide are restated here: a fresh object takes 0666
-// before the umask, which is what os.Create left, and a replacement keeps the
-// mode the object already had. An operator who restricted one artifact
-// restricted it; a refill is not a decision to publish it. Ownership is the
-// part that cannot follow, since rename gives the object the writer's uid and
-// chown across users needs privilege the server does not hold; the same goes
-// for an ACL set on the object rather than on its directory.
-func (l *Local) publish(p string, write func(io.Writer) error) (err error) {
+// A new inode carries nothing the old one decided, so a replacement restates
+// all of it: mode, owner, group and extended attributes, applied to the
+// staging file before the mode that makes it readable. An operator who
+// restricted one artifact restricted it, and a refill is not a decision to
+// publish it, nor to hand it to a reader the ACL denied, nor to take it from
+// the group that owned it. Where that cannot be restated, the publication
+// fails and the old object stays: a replacement is bytes, never a change of
+// who may read them. A fresh object has no predecessor and takes freshPerm as
+// the process umask filters it, which is what the direct os.Create it replaced
+// left behind.
+func (l *Local) publish(p string, freshPerm os.FileMode, write func(io.Writer) error) (err error) {
 	dir := filepath.Dir(p)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	perm, replacing := os.FileMode(0o666), false
-	if fi, statErr := os.Stat(p); statErr == nil && fi.Mode().IsRegular() {
-		perm, replacing = fi.Mode().Perm(), true
+	prior, err := openPrior(p)
+	if err != nil {
+		return err
+	}
+	perm := freshPerm
+	if prior != nil {
+		defer prior.Close()
+		perm = stagedPerm
 	}
 	tmp, err := createStaged(dir, perm)
 	if err != nil {
@@ -267,20 +299,28 @@ func (l *Local) publish(p string, write func(io.Writer) error) (err error) {
 			os.Remove(staged)
 		}
 	}()
+	if prior != nil {
+		if err = restrictStaged(tmp); err != nil {
+			return err
+		}
+	}
 	if err = write(tmp); err != nil {
 		return err
 	}
-	if err = tmp.Close(); err != nil {
-		return err
-	}
-	// The umask can only narrow a creation, so a replacement whose mode it
-	// clipped is restored after the bytes are written. Correcting it before
-	// the write would be the other direction on a fresh object: a moment in
-	// which the staging file is readable more widely than the object is.
-	if replacing {
-		if err = os.Chmod(staged, perm); err != nil {
+	if prior != nil {
+		// Read after the write rather than before it. A chmod during a long
+		// fetch is a decision about the object, and the handle still names the
+		// inode whose state is being carried.
+		var want access
+		if want, err = readAccess(prior); err != nil {
 			return err
 		}
+		if err = want.applyTo(tmp, p); err != nil {
+			return err
+		}
+	}
+	if err = tmp.Close(); err != nil {
+		return err
 	}
 	return os.Rename(staged, p)
 }
@@ -290,7 +330,10 @@ func (l *Local) Put(_ context.Context, key string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	return l.publish(p, func(w io.Writer) error {
+	// 0666 before the umask is what a file creation leaves. Put wrote 0644
+	// through os.WriteFile and is the one caller whose fresh objects are not
+	// group-writable on a permissive umask.
+	return l.publish(p, 0o644, func(w io.Writer) error {
 		_, err := w.Write(data)
 		return err
 	})
@@ -306,7 +349,7 @@ func (l *Local) PutFile(_ context.Context, localPath, key string) error {
 		return err
 	}
 	defer src.Close()
-	return l.publish(p, func(w io.Writer) error {
+	return l.publish(p, 0o666, func(w io.Writer) error {
 		_, err := io.Copy(w, src)
 		return err
 	})
@@ -358,7 +401,7 @@ func (l *Local) SyncDir(_ context.Context, out io.Writer, localDir, keyPrefix st
 		defer src.Close()
 
 		fi, _ := src.Stat()
-		if err := l.publish(dest, func(w io.Writer) error {
+		if err := l.publish(dest, 0o666, func(w io.Writer) error {
 			_, err := io.Copy(w, src)
 			return err
 		}); err != nil {

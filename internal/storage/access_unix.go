@@ -1,0 +1,212 @@
+//go:build linux || darwin
+
+package storage
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+
+	"golang.org/x/sys/unix"
+)
+
+// access is everything about a stored object that decides who can reach it:
+// the permission bits, the owning uid and gid, and the extended attributes,
+// which is where a POSIX ACL and a security label live.
+//
+// Publication replaces the inode, so a rename carries none of it. The mode
+// alone does not answer the question either: a file at 0644 can deny one named
+// user through its access ACL, and a replacement that kept the 0644 and
+// dropped the ACL hands that user the artifact. A group is the same boundary
+// in the other direction: an artifact at 0640 owned by root:deploy is readable
+// by deploy until a refill lands it root:root.
+type access struct {
+	perm   uint32
+	uid    int
+	gid    int
+	xattrs map[string][]byte
+	acl    []byte
+}
+
+// stagedPerm is what a staging file holding a replacement is readable at while
+// it is being written: the writer, and nobody else. Zero would be the tighter
+// answer and is not usable, because both kernels check an extended-attribute
+// call against the file's current mode rather than against the handle, so a
+// staging file at 0000 refuses its own owner the ACL it is there to carry.
+const stagedPerm = 0o600
+
+// restrictStaged holds a staging file at stagedPerm whatever the umask would
+// have clipped it to, so the write window is one mode rather than the
+// operator's.
+func restrictStaged(f *os.File) error {
+	return unix.Fchmod(int(f.Fd()), stagedPerm)
+}
+
+// fchown is a seam. The refusal path is what a server without CAP_CHOWN takes
+// against an artifact another user owns, and a test cannot create that file
+// without being root itself.
+var fchown = unix.Fchown
+
+// readAccess reads an object's access state from an open handle rather than
+// from its path. A path answers a fresh question every time it is resolved, so
+// a mode read from one inode and an ACL read from the next describe a state no
+// object ever had; a handle is one inode for as long as it is held.
+func readAccess(f *os.File) (a access, err error) {
+	fd := int(f.Fd())
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return access{}, err
+	}
+	a = access{
+		// The permission bits and the three above them. Go's FileMode spells
+		// setuid somewhere else entirely, so the raw mode is what travels.
+		perm:   uint32(st.Mode) & 0o7777,
+		uid:    int(st.Uid),
+		gid:    int(st.Gid),
+		xattrs: map[string][]byte{},
+	}
+	if a.acl, err = readACL(fd); err != nil {
+		return access{}, err
+	}
+	names, err := listXattr(fd)
+	if err != nil {
+		return access{}, err
+	}
+	for _, name := range names {
+		v, err := getXattr(fd, name)
+		if missingXattr(err) {
+			continue
+		}
+		if err != nil {
+			return access{}, fmt.Errorf("read attribute %s: %w", name, err)
+		}
+		a.xattrs[name] = v
+	}
+	return a, nil
+}
+
+// applyTo gives the staging handle the access state of the object it is about
+// to replace, and refuses the publication when it cannot. Order matters:
+// chown drops the attributes the kernel treats as privileged, and chmod is the
+// only step that widens anything, so it goes last. The staging file reaches
+// the mode of the object it replaces with that object's owner and ACL already
+// on it, and never before.
+func (a access) applyTo(f *os.File, key string) error {
+	fd := int(f.Fd())
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return err
+	}
+	if int(st.Uid) != a.uid || int(st.Gid) != a.gid {
+		if err := fchown(fd, a.uid, a.gid); err != nil {
+			return fmt.Errorf("publish %s: the replacement cannot be given the %d:%d ownership the object already has (%w); "+
+				"the previous object is unchanged. Run bodega as that user, or give the storage tree to the user it runs as", key, a.uid, a.gid, err)
+		}
+	}
+	if err := a.restoreXattrs(fd, key); err != nil {
+		return err
+	}
+	if err := applyACL(fd, a.acl); err != nil {
+		return fmt.Errorf("publish %s: the replacement cannot carry the object's ACL (%w); the previous object is unchanged", key, err)
+	}
+	if err := unix.Fchmod(fd, a.perm); err != nil {
+		return fmt.Errorf("publish %s: the replacement cannot be set to the object's mode %04o (%w); the previous object is unchanged", key, a.perm, err)
+	}
+	return nil
+}
+
+// restoreXattrs makes the staging file's attributes the object's attributes,
+// both directions. Removing is not housekeeping: a staging file created in a
+// directory carrying a default ACL is born with an access ACL of its own, and
+// leaving that on a replacement for an object that had none denies readers the
+// object allowed.
+func (a access) restoreXattrs(fd int, key string) error {
+	staged, err := listXattr(fd)
+	if err != nil {
+		return err
+	}
+	for _, name := range staged {
+		if _, keep := a.xattrs[name]; keep {
+			continue
+		}
+		if err := unix.Fremovexattr(fd, name); err != nil && !missingXattr(err) {
+			return fmt.Errorf("publish %s: the replacement cannot drop the %s attribute it inherited (%w); the previous object is unchanged", key, name, err)
+		}
+	}
+	for name, want := range a.xattrs {
+		if got, err := getXattr(fd, name); err == nil && string(got) == string(want) {
+			continue
+		}
+		if err := unix.Fsetxattr(fd, name, want, 0); err != nil {
+			return fmt.Errorf("publish %s: the replacement cannot carry the object's %s attribute (%w), which is where an access ACL lives; "+
+				"the previous object is unchanged", key, name, err)
+		}
+	}
+	return nil
+}
+
+// listXattr returns the attribute names on fd. A filesystem that holds no
+// attributes at all reports that as an error rather than as an empty list, and
+// an object with nothing to preserve is not a failure to preserve it.
+func listXattr(fd int) ([]string, error) {
+	for range 10 {
+		size, err := unix.Flistxattr(fd, nil)
+		if unsupportedXattr(err) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if size == 0 {
+			return nil, nil
+		}
+		buf := make([]byte, size)
+		n, err := unix.Flistxattr(fd, buf)
+		if errors.Is(err, unix.ERANGE) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		var names []string
+		for _, name := range strings.Split(string(buf[:n]), "\x00") {
+			if name != "" {
+				names = append(names, name)
+			}
+		}
+		return names, nil
+	}
+	return nil, fmt.Errorf("list extended attributes: the set kept changing under the read")
+}
+
+func getXattr(fd int, name string) ([]byte, error) {
+	for range 10 {
+		size, err := unix.Fgetxattr(fd, name, nil)
+		if err != nil {
+			return nil, err
+		}
+		buf := make([]byte, size)
+		n, err := unix.Fgetxattr(fd, name, buf)
+		if errors.Is(err, unix.ERANGE) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		return buf[:n], nil
+	}
+	return nil, fmt.Errorf("read extended attribute %s: the value kept changing under the read", name)
+}
+
+// unsupportedXattr reports a filesystem that holds no extended attributes at
+// all, which is not a failure to preserve the ones an object does not have.
+func unsupportedXattr(err error) bool {
+	return errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP) || missingXattr(err)
+}
+
+// missingXattr reports an attribute the file does not carry, which a list and
+// a read of the same file disagree about whenever another process is writing.
+func missingXattr(err error) bool {
+	return errors.Is(err, errNoAttr) || errors.Is(err, unix.ENODATA)
+}
