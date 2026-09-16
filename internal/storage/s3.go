@@ -64,6 +64,7 @@ func (s *S3) GetStream(ctx context.Context, key string) (*StreamResult, error) {
 		ContentLength: r.ContentLength,
 		ETag:          r.ETag,
 		ContentType:   r.ContentType,
+		LastModified:  r.LastModified,
 	}, nil
 }
 

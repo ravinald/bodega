@@ -490,6 +490,14 @@ func testObjectStore(t *testing.T, mk func() ObjectStore) {
 			if info.Size != r.ContentLength {
 				t.Fatalf("Head Size %d, GetStream ContentLength %d", info.Size, r.ContentLength)
 			}
+			// The proxy records which upstream supplied a cached object
+			// against what the store said when it read those bytes, and
+			// compares it against what the store says when it serves them. A
+			// backend whose open reports a different timestamp from its Head,
+			// or none, makes every object it holds unattributable.
+			if !info.LastModified.Equal(r.LastModified) {
+				t.Fatalf("Head LastModified %v, GetStream LastModified %v", info.LastModified, r.LastModified)
+			}
 		}},
 
 		// An interrupted 'pkg move' or 'repair keys' is re-run, and the second

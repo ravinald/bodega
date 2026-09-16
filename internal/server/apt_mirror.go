@@ -160,9 +160,10 @@ func (s *Server) handleAptMirrorPool(w http.ResponseWriter, r *http.Request, poo
 		// so on a default install every mirrored .deb after the first was
 		// served with nothing in the trail saying the cache answered it.
 		name, _ := manifest.AptDebIdentity(path.Base(poolPath))
-		s.recordCacheServed(r, manifest.TypeApt, "", name, key, objectIdentity(store, cached))
-		s.recordAptPoolHit(r, poolPath, key)
-		s.proxyS3(w, r, store, key)
+		s.serveCacheHit(w, r, store, key, func(obj cachedObject) {
+			s.recordCacheServed(r, manifest.TypeApt, "", name, key, obj)
+			s.recordAptPoolHit(r, poolPath, key)
+		})
 		return
 	}
 

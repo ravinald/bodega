@@ -260,7 +260,7 @@ func (s *Server) recordDiscovery(ctx context.Context, r *http.Request, regType, 
 // the whole point of counting requests. The check is a read-through cache with
 // a 30s TTL (policy.DefaultCacheTTL), so the hot path pays a mutex and a slice
 // scan, not a query.
-func (s *Server) recordCacheHit(ctx context.Context, r *http.Request, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key string, obj audit.ObjectIdentity) {
+func (s *Server) recordCacheHit(ctx context.Context, r *http.Request, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key string, obj cachedObject) {
 	// The audit row first, and outside the discover_mode guard below. The two
 	// answer different questions — the trail says which artifacts came from
 	// upstream, discovery says what the fleet reached for — and sharing one

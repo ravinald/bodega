@@ -124,6 +124,7 @@ func (l *Local) GetStream(_ context.Context, key string) (*StreamResult, error) 
 		Body:          f,
 		ContentLength: fi.Size(),
 		ContentType:   ct,
+		LastModified:  fi.ModTime(),
 	}, nil
 }
 

@@ -814,3 +814,213 @@ func TestAHitDuringAFillNamesTheUpstreamPublishingIt(t *testing.T) {
 	}
 	requireOneHitNaming(t, s, up.URL)
 }
+
+// requireHitsUnrecorded asserts that want cache_hit rows exist and that not one
+// of them credits an upstream.
+//
+// Every row rather than the newest: the trail is ordered by a millisecond
+// timestamp, so two requests inside one tick have no defined order and a test
+// reading "the last row" reads whichever the tie fell to.
+func requireHitsUnrecorded(t *testing.T, s *Server, phase string, want int) {
+	t.Helper()
+	hits, _ := splitCacheRows(t, s)
+	if len(hits) != want {
+		t.Fatalf("%s: cache_hit rows = %d, want %d (%+v)", phase, len(hits), want, cacheRows(t, s))
+	}
+	for _, hit := range hits {
+		if !strings.Contains(hit.Details, cacheOriginUnrecorded) {
+			t.Errorf("%s: hit row details = %q, want %q — the upload inherited the fill's origin",
+				phase, hit.Details, cacheOriginUnrecorded)
+		}
+	}
+}
+
+// TestAnUploadDuringAFillIsNotCreditedToIt covers the window the previous
+// origin check could not see. A fill's bytes become readable partway through
+// the store write, and a locally built artifact landing before that write's
+// origin row was identified inherited the archive the fetch was reading — at
+// the key, and then permanently, because the row was bound to whatever a Head
+// found at the key afterwards.
+//
+// Both lengths, because the first version told them apart by length: equal
+// lengths are what an attribution scheme reading a size cannot distinguish,
+// and unequal ones are what it can, so a pass on one says nothing about the
+// other.
+func TestAnUploadDuringAFillIsNotCreditedToIt(t *testing.T) {
+	for _, sameLength := range []bool{true, false} {
+		t.Run(fmt.Sprintf("same_length_%v", sameLength), func(t *testing.T) {
+			archive := newFixtureArchive(t, map[string]string{fixtureDeb: fixtureDebBody})
+			s := mirrorServer(t, archive)
+			held := &pausedPutStore{
+				ObjectStore: storage.NewLocal(t.TempDir()),
+				written:     make(chan struct{}),
+				resume:      make(chan struct{}),
+			}
+			s.stores = storage.NewSingle(held)
+
+			debPath := "/apt/" + fixtureDeb
+			filled := make(chan int, 1)
+			go func() {
+				code, _ := mirrorGet(t, s, debPath)
+				filled <- code
+			}()
+			select {
+			case <-held.written:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the fill never published its bytes")
+			}
+			released := false
+			defer func() {
+				if !released {
+					close(held.resume)
+					<-filled
+				}
+			}()
+
+			replacement := "replacement built locally"
+			if sameLength {
+				replacement = strings.Repeat("L", len(fixtureDebBody))
+			}
+			local := filepath.Join(t.TempDir(), "replacement.deb")
+			if err := os.WriteFile(local, []byte(replacement), 0o600); err != nil {
+				t.Fatalf("write the replacement artifact: %v", err)
+			}
+			// The production upload path, holding no lock the proxy holds:
+			// coordinating the two would still leave every writer outside this
+			// process, which is why the check is on the bytes.
+			placer := placement.NewWith(s.stores, s.store, io.Discard, false)
+			n, err := placer.UploadPaths(t.Context(), manifest.TypeApt, []builder.ArtifactPath{{
+				Local:   local,
+				S3Key:   manifest.AptKey(fixtureDeb),
+				Package: "nginx",
+				Version: "1.24.0-2ubuntu7.1",
+			}})
+			if err != nil || n != 1 {
+				t.Fatalf("UploadPaths wrote %d objects, err = %v", n, err)
+			}
+
+			serve := func(phase string, wantHits int) {
+				t.Helper()
+				code, body := mirrorGet(t, s, debPath)
+				if code != http.StatusOK || string(body) != replacement {
+					t.Fatalf("%s: GET %s = %d %q, want 200 %q", phase, debPath, code, body, replacement)
+				}
+				requireHitsUnrecorded(t, s, phase, wantHits)
+			}
+			serve("during the fill", 1)
+			close(held.resume)
+			released = true
+			if code := <-filled; code != http.StatusOK {
+				t.Fatalf("the fill responded %d, want 200", code)
+			}
+			serve("after the fill", 2)
+		})
+	}
+}
+
+// pausedHeadStore holds one Head open after it has read the object's metadata,
+// which is the window between deciding a request is a cache hit and opening
+// the bytes that answer it.
+type pausedHeadStore struct {
+	storage.ObjectStore
+	armed  atomic.Bool
+	read   chan struct{}
+	resume chan struct{}
+}
+
+func (p *pausedHeadStore) Head(ctx context.Context, key string) (*storage.ObjectInfo, error) {
+	info, err := p.ObjectStore.Head(ctx, key)
+	if err == nil && p.armed.CompareAndSwap(true, false) {
+		close(p.read)
+		<-p.resume
+	}
+	return info, err
+}
+
+// TestAReplacementAfterTheCacheReadIsNotCreditedToWhatItDisplaced is the same
+// defect on the serving side. The identity came from the Head that decided the
+// request was a hit, and the bytes came from a separate open afterwards, so an
+// object replaced between the two was served under the previous tenant's
+// origin — a row naming a host that supplied none of what the client got.
+func TestAReplacementAfterTheCacheReadIsNotCreditedToWhatItDisplaced(t *testing.T) {
+	allowLoopbackUpstream(t)
+	up := gomodUpstreamFixture(t, 4096)
+	s := newProxyAuditServer(t, up.URL, 0)
+	held := &pausedHeadStore{
+		ObjectStore: storage.NewLocal(t.TempDir()),
+		read:        make(chan struct{}),
+		resume:      make(chan struct{}),
+	}
+	s.stores = storage.NewSingle(held)
+
+	zipPath := "/go/" + proxyAuditModule + "/@v/" + proxyAuditVersion + ".zip"
+	if code, _ := getProxy(t, s, zipPath); code != http.StatusOK {
+		t.Fatalf("the fill responded %d, want 200", code)
+	}
+
+	const replacement = "replacement written after the cache read"
+	held.armed.Store(true)
+	type served struct {
+		code int
+		body string
+	}
+	answered := make(chan served, 1)
+	go func() {
+		code, body := getProxy(t, s, zipPath)
+		answered <- served{code, body}
+	}()
+	select {
+	case <-held.read:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the cache read never happened")
+	}
+	err := held.Put(t.Context(), manifest.GomodFileKey(proxyAuditModule, proxyAuditVersion+".zip"), []byte(replacement))
+	close(held.resume)
+	got := <-answered
+	if err != nil {
+		t.Fatalf("write the replacement object: %v", err)
+	}
+	if got.code != http.StatusOK || got.body != replacement {
+		t.Fatalf("GET %s = %d %q, want 200 %q", zipPath, got.code, got.body, replacement)
+	}
+	hits, _ := splitCacheRows(t, s)
+	if len(hits) != 1 {
+		t.Fatalf("cache_hit rows = %d, want 1 (%+v)", len(hits), cacheRows(t, s))
+	}
+	if !strings.Contains(hits[0].Details, cacheOriginUnrecorded) {
+		t.Errorf("hit row details = %q, want %q — the bytes served came from no fetch",
+			hits[0].Details, cacheOriginUnrecorded)
+	}
+}
+
+// TestARedirectLoopStopsAtTheHopBound guards the limit that supplying
+// CheckRedirect displaces. net/http applies its own ten-hop bound only while
+// the field is nil, so an upstream redirecting to itself spent a request per
+// hop and held the client's for the full 90-second client timeout.
+func TestARedirectLoopStopsAtTheHopBound(t *testing.T) {
+	allowLoopbackUpstream(t)
+	var hops atomic.Int32
+	loop := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hops.Add(1)
+		http.Redirect(w, r, "/loop", http.StatusFound)
+	}))
+	t.Cleanup(loop.Close)
+
+	// A deadline well under the client timeout, so a lost bound fails this in
+	// under a second instead of running for a minute and a half.
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	up, err := openUpstream(ctx, loop.URL+"/loop")
+	if up != nil {
+		up.body.Close()
+	}
+	if err == nil {
+		t.Fatal("openUpstream followed a redirect loop to completion")
+	}
+	if got := int(hops.Load()); got > maxUpstreamRedirects {
+		t.Errorf("upstream requests = %d, want at most %d — the hop bound is gone", got, maxUpstreamRedirects)
+	}
+	if !strings.Contains(err.Error(), "stopped after") {
+		t.Errorf("openUpstream error = %v, want the redirect bound rather than a timeout", err)
+	}
+}

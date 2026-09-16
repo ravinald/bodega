@@ -1737,21 +1737,40 @@ func (s *Server) recordedBackends(ctx context.Context, typ string) []string {
 // holds it. Callers that hold a manifest entry resolve by its recorded name;
 // callers serving regenerable, type-scoped objects pass typeStore.
 func (s *Server) proxyS3(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, s3Key string) {
-	if !s.requireStorage(w, store) {
+	result, ok := s.openStored(w, r, store, s3Key)
+	if !ok {
 		return
+	}
+	defer func() { _ = result.Body.Close() }()
+	s.serveStored(w, s3Key, result)
+}
+
+// openStored opens s3Key for streaming and answers the client itself when the
+// backend errors or holds no such object; ok is false when it has, and the
+// caller is done. The caller closes Body.
+//
+// Split out of proxyS3 so that a caller recording what it served can take the
+// object's identity off this open rather than off an earlier Head. The two
+// describe different objects whenever a writer landed between them.
+func (s *Server) openStored(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, s3Key string) (*storage.StreamResult, bool) {
+	if !s.requireStorage(w, store) {
+		return nil, false
 	}
 	result, err := store.GetStream(r.Context(), s3Key)
 	if err != nil {
 		s.logger.Error("s3 proxy error", "key", s3Key, "error", err)
 		http.Error(w, "upstream error", http.StatusBadGateway)
-		return
+		return nil, false
 	}
 	if result == nil {
 		http.NotFound(w, r)
-		return
+		return nil, false
 	}
-	defer func() { _ = result.Body.Close() }()
+	return result, true
+}
 
+// serveStored streams an already-open object to the response.
+func (s *Server) serveStored(w http.ResponseWriter, s3Key string, result *storage.StreamResult) {
 	// Set Content-Type from extension, falling back to S3's stored value.
 	ct := contentTypeForKey(s3Key)
 	if ct == "" {
