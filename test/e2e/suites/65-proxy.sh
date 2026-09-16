@@ -83,6 +83,23 @@ e2e_bodega server "audit events --limit 400" || true
 check_contains PXY-02b "the trail carries at least one cache event of any kind" \
 	"cache" "$E2E_OUT" "internal/server/audit.go:92" "bodega audit events --limit 400"
 
+# The hit itself. Everything above is a miss, so a server that recorded misses
+# and nothing else passed both checks — which is how "a cache row per outcome"
+# read as satisfied while the hit path wrote nothing. The listing was fetched
+# above and metadata_ttl is an hour, so this second request is served locally.
+#
+# The upstream the row credits is not visible here: `audit events` prints no
+# details column. internal/server/proxy_audit_test.go asserts on the blob.
+E2E_HOST=client
+e2e_http client "/go/github.com/pkg/errors/@v/list" || true
+check_eq PXY-02c-serve "the cached gomod list is served again" "200" "$E2E_OUT" \
+	"internal/server/proxy.go:104" "GET /go/github.com/pkg/errors/@v/list (cached)"
+
+E2E_HOST=server
+e2e_bodega server "audit events --type cache --limit 50" || true
+check_contains PXY-02c "a request the cache answered is recorded as a hit" \
+	"cache_hit" "$E2E_OUT" "internal/server/proxy.go:104" "bodega audit events --type cache"
+
 # ---- the spool caps --------------------------------------------------------
 #
 # A declared Content-Length over the artifact cap is refused before a byte
