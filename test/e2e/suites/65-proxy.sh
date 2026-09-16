@@ -87,13 +87,21 @@ check_contains PXY-02b "the trail carries at least one cache event of any kind" 
 #
 # A declared Content-Length over the artifact cap is refused before a byte
 # moves. Set the cap absurdly low and any upstream artifact exceeds it.
+#
+# A gomod .zip, not an npm tarball. The npm tarball route serves only what an
+# entry names, so an uncatalogued package 404s there before a spool is ever
+# opened. That is still a refusal, so PXY-03 passed while measuring the wrong
+# one and PXY-04 had no row to read. The module the listing above resolved is
+# uncatalogued by design and does reach the spool.
 
 e2e_config_set server '.spool_max_artifact_bytes = 1024' || true
 e2e_restart server || true
+E2E_HOST=server
+e2e_on server "sudo rm -rf /var/lib/bodega/gomod/github.com/pkg; true" || true
 E2E_HOST=client
-e2e_http client "/npm/lodash/-/lodash-4.17.21.tgz" || true
+e2e_http client "/go/github.com/pkg/errors/@v/v0.9.1.zip" || true
 check_ne PXY-03 "an artifact over the spool cap is not served" "200" "$E2E_OUT" \
-	"internal/server/audit.go:140" "GET a tarball larger than spool_max_artifact_bytes"
+	"internal/server/audit.go:140" "GET an artifact larger than spool_max_artifact_bytes"
 
 E2E_HOST=server
 e2e_bodega server "audit events --type denied --limit 20" || true

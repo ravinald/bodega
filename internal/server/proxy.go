@@ -254,6 +254,12 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 		}
 	}
 
+	// After the store write and before the body: by here the fetch has been
+	// verified and cached, so the row names an upstream that actually answered
+	// rather than one that was contacted. A client that hangs up during the
+	// copy below still caused the fetch, and the row is the record of it.
+	s.recordCacheEvent(r, audit.CacheMiss, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key)
+
 	ct := up.contentType
 	if ct == "" {
 		ct = contentTypeForKey(s3Key)
@@ -578,7 +584,7 @@ func (s *Server) verifyProxyChecksum(ctx context.Context, s3Key, computed string
 				PkgType:    stored.PkgType,
 				PkgName:    stored.PkgName,
 				PkgVersion: stored.PkgVersion,
-				Status:     "checksum_mismatch",
+				Status:     audit.CacheChecksumMismatch,
 				Details:    string(details),
 			})
 		}
@@ -746,12 +752,72 @@ func (s *Server) recordPolicyViolation(r *http.Request, regType, policyCandidate
 		EventType: audit.EventCache,
 		PkgType:   regType,
 		PkgName:   policyCandidate,
-		Status:    "policy_violation",
+		Status:    audit.CachePolicyViolation,
 		Details:   fmt.Sprintf("url=%s", upstreamURL),
 	}); err != nil {
 		s.logger.Error("audit write failed, denial not recorded — still refusing",
-			"event_type", audit.EventCache, "status", "policy_violation",
+			"event_type", audit.EventCache, "status", audit.CachePolicyViolation,
 			"type", regType, "candidate", policyCandidate, "url", upstreamURL,
 			"error", err)
+	}
+}
+
+// recordCacheEvent writes the audit row for one proxy outcome: an artifact the
+// cache answered, or one this request fetched from upstream and stored.
+//
+// It is separate from the discovery row recordCacheHit also writes. Discovery
+// answers "what did the fleet reach for" and is off unless discover_mode is
+// set; the audit trail answers "which artifacts came from upstream", which is
+// the first question an incident asks and has no other source. Sharing one
+// guard is how the cache row went unwritten on every install that left
+// discover_mode at its default.
+//
+// The upstream goes in details rather than a column because no column names a
+// host, and an operator reading a cache_miss row needs to know which registry
+// answered before anything else in the row is actionable.
+func (s *Server) recordCacheEvent(r *http.Request, status, regType, upstreamURL, policyCandidate, discoveryPkgName, s3Key string) {
+	if s.auditDB == nil || !s.auditDB.ShouldRecord(audit.EventCache) {
+		return
+	}
+	// The key names all three, and it is the only source that agrees with what
+	// was served: the version in particular exists nowhere else on this path.
+	keyType, keyName, pkgVersion := manifest.ParseKey(s3Key)
+	pkgType := regType
+	if pkgType == "" {
+		pkgType = keyType
+	}
+	// Same precedence recordDiscovery uses, for the same reason: the caller
+	// read the name off the request path and can tell a literal "--" from an
+	// encoded "/", and ParseKey cannot.
+	pkgName := discoveryPkgName
+	if pkgName == "" {
+		pkgName = keyName
+	}
+	if pkgName == "" {
+		pkgName = policyCandidate
+	}
+	details, err := json.Marshal(map[string]string{
+		"upstream": truncateField(upstreamURL, maxDetailField),
+		"key":      truncateField(s3Key, maxDetailField),
+	})
+	if err != nil {
+		details = []byte("{}")
+	}
+	ctx, cancel := auditContext(r)
+	defer cancel()
+	if err := s.auditDB.Record(ctx, audit.Event{
+		EventType:  audit.EventCache,
+		PkgType:    pkgType,
+		PkgName:    pkgName,
+		PkgVersion: pkgVersion,
+		ClientIP:   ClientIP(r),
+		Identity:   Identity(r),
+		UserAgent:  truncateField(r.UserAgent(), maxDetailField),
+		Status:     status,
+		Details:    string(details),
+	}); err != nil {
+		s.logger.Error("audit write failed, proxy outcome not recorded — still serving",
+			"event_type", audit.EventCache, "status", status,
+			"key", s3Key, "upstream", upstreamURL, "error", err)
 	}
 }

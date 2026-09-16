@@ -89,7 +89,7 @@ const (
 
 	// Client events (HTTP server).
 	EventServeFetch EventType = "serve_fetch" // client downloaded a package via HTTP
-	EventCache      EventType = "cache"       // proxy cache miss
+	EventCache      EventType = "cache"       // proxy outcome: hit, miss, or a refusal on the way
 
 	// EventDenied is a request the server refused: a deny-listed IP, mutation
 	// auth, an admin-only read endpoint, a frozen entry, or a version outside
@@ -98,6 +98,20 @@ const (
 	// turned away" five queries instead of one. Which gate refused is in
 	// Status; see the Denial* constants.
 	EventDenied EventType = "denied"
+)
+
+// Status values for EventCache. They name the proxy outcome, so an operator
+// asking which artifacts came from upstream can tell that from an artifact the
+// cache answered and from the two refusals that write the same type.
+//
+// A constant per outcome rather than a literal at the call site: EventCache
+// was defined and written only by the two refusals for as long as it existed,
+// because nothing on the serving path named a status it was obliged to pass.
+const (
+	CacheHit              = "cache_hit"         // served from storage, no upstream contact
+	CacheMiss             = "cache_miss"        // fetched from upstream and cached
+	CacheChecksumMismatch = "checksum_mismatch" // upstream bytes disagreed with the pinned digest
+	CachePolicyViolation  = "policy_violation"  // upstream allow-list refused the candidate
 )
 
 // Status values for EventDenied. They name the gate that refused, so an

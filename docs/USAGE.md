@@ -3351,6 +3351,10 @@ Configure the TTL:
 { "metadata_ttl": "1h" }
 ```
 
+**A name no manifest holds still proxies.** `gomod`, `npm` and `cargo` answer a package with no entry from upstream and cache what they get, which is what makes a clean host able to bootstrap through bodega. For `gomod` that covers the whole module protocol — `@v/list`, `.info`, `.mod` and `.zip` — because `go get` reads all four and a listing served alone fails the resolution one step later. The `npm` tarball, `pypi` wheel and `helm` chart routes are the exception: each serves only what an entry names, so an uncatalogued name reaches those as a 404 even with the proxy on.
+
+Which upstreams may be reached at all is the allow-list's decision, not this switch's: with rules configured for a type, a candidate that matches none is refused with a `cache` row at `status=policy_violation`. See [Supply Chain Management](#supply-chain-management).
+
 ### Upstream hosts
 
 Five flat keys name the registries a proxying instance fetches from. They are not interchangeable, and two ecosystems need two keys each because the registry that answers "which versions exist" is not the one that serves the bytes.
@@ -3496,9 +3500,22 @@ Convert a fleet to a request rate with `hosts x updates-per-hour x requests-per-
 | `fetch`, `build`, `package`, `upload`, `sync` | Build pipeline stage completed for an entry |
 | `create`, `delete`, `hide`, `freeze`, `edit`, `refresh`, `repair` | Manifest mutation (CLI, TUI or API) |
 | `init`, `reset`, `status`, `show` | Operator command |
-| `cache` | Proxy cache miss > upstream fetch, and upstream policy violations (`status=policy_violation`) |
+| `cache` | Every proxy outcome: an artifact served from the cache, one fetched from upstream, and the two refusals decided on the way |
 | `denied` | A request the server refused |
 | `serve_start`, `serve_stop` | `bodega serve` bound its listener / shut down |
+
+That table is the whole set. A type absent from a trail is a gap to chase rather than a type the server was never going to write: `cache` was defined and reachable only through its two refusals for several releases, so an install proxying npm and cargo all day recorded nothing saying which artifacts had come from upstream, and nothing in the trail read as missing.
+
+**Cache outcomes.** A `cache` row's `status` names which of the four happened. The first two are written on the serving path, one per request, and carry the package type, name and version off the object key with the upstream that answered in `details`:
+
+| Status | Outcome |
+|--------|---------|
+| `cache_miss` | Fetched from upstream, verified and stored. `details` names the URL that answered |
+| `cache_hit` | Served from storage with no upstream contact. A stale copy served because the upstream could not be reached records this too: the request is what the row counts |
+| `checksum_mismatch` | Upstream bytes disagreed with the digest pinned on first fetch. The artifact was neither served nor cached |
+| `policy_violation` | The upstream allow-list refused the candidate. Written wherever the refusal is decided, including the apt pool probe, which refuses a `.deb` before there is a fetch to record |
+
+One row per request on both serving outcomes, so counting `cache_miss` over a window sizes what an upstream actually served. A fetch refused by the spool writes its `denied` row and no `cache` row: nothing came from upstream, and a row saying otherwise would inflate that count.
 
 **Denials.** A `denied` row's `status` column names the gate that turned the request away, so an address that was never permitted reads differently from a token that simply aged out:
 
