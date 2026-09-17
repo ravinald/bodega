@@ -1244,8 +1244,8 @@ func TestMirroredPoolFetchIsCheckSummedUnderItsPackage(t *testing.T) {
 		t.Fatalf("apt checksum rows = %d, want 1 — the mirrored .deb is not filed under its type (%+v)", len(rows), rows)
 	}
 	row := rows[0]
-	if row.S3Key != manifest.AptKey(fixtureDeb) {
-		t.Errorf("s3_key = %q, want %q", row.S3Key, manifest.AptKey(fixtureDeb))
+	if row.ObjectKey != manifest.AptKey(fixtureDeb) {
+		t.Errorf("object_key = %q, want %q", row.ObjectKey, manifest.AptKey(fixtureDeb))
 	}
 	if row.PkgName != "nginx" || row.PkgVersion != "1.24.0-2ubuntu7.1" {
 		t.Errorf("identity = %q/%q, want nginx/1.24.0-2ubuntu7.1", row.PkgName, row.PkgVersion)
@@ -1274,8 +1274,8 @@ func TestMirroredPoolFetchIsCheckSummedUnderItsPackage(t *testing.T) {
 	if left[0].Value != "" {
 		t.Errorf("value after clear = %q, want empty — the stale digest survived the remedy", left[0].Value)
 	}
-	if left[0].Source != "computed" || left[0].S3Key != row.S3Key {
-		t.Errorf("cleared row = %q/%q, want computed/%q — aptMirroredPoolKeys reads both", left[0].Source, left[0].S3Key, row.S3Key)
+	if left[0].Source != "computed" || left[0].ObjectKey != row.ObjectKey {
+		t.Errorf("cleared row = %q/%q, want computed/%q — aptMirroredPoolKeys reads both", left[0].Source, left[0].ObjectKey, row.ObjectKey)
 	}
 }
 

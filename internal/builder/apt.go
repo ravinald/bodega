@@ -953,10 +953,10 @@ func AptArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) []
 				continue
 			}
 			paths = append(paths, ArtifactPath{
-				Local:   local,
-				S3Key:   manifest.AptKey(rel),
-				Package: name,
-				Version: ve.Version,
+				Local:     local,
+				ObjectKey: manifest.AptKey(rel),
+				Package:   name,
+				Version:   ve.Version,
 			})
 		}
 	}

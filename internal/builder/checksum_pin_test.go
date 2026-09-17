@@ -59,8 +59,8 @@ func TestPinChecksumRecordsAndEnforces(t *testing.T) {
 	if rows[0].Value != first || rows[0].PkgVersion != "1.0.11" {
 		t.Errorf("row is %+v, want value %s at version 1.0.11", rows[0], first)
 	}
-	if rows[0].S3Key != manifest.CargoCrateKey("itoa", "1.0.11") {
-		t.Errorf("row keyed on %q, not the object key the proxy verifies against", rows[0].S3Key)
+	if rows[0].ObjectKey != manifest.CargoCrateKey("itoa", "1.0.11") {
+		t.Errorf("row keyed on %q, not the object key the proxy verifies against", rows[0].ObjectKey)
 	}
 	// "computed" is the proxy's word for bytes an upstream served. A build row
 	// claiming it would take an apt package bodega built out of the index.

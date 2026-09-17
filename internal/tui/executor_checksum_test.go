@@ -77,8 +77,8 @@ func TestTUIFetchPinsChecksum(t *testing.T) {
 	if rows[0].PkgVersion != "6.7.0" || rows[0].Value != builder.ComputeBytesSHA256(body) {
 		t.Errorf("row is %+v, want the digest of the chart on disk at version 6.7.0", rows[0])
 	}
-	if rows[0].S3Key != manifest.HelmChartKey("podinfo", "6.7.0") {
-		t.Errorf("row keyed on %q, not the object key the proxy verifies against", rows[0].S3Key)
+	if rows[0].ObjectKey != manifest.HelmChartKey("podinfo", "6.7.0") {
+		t.Errorf("row keyed on %q, not the object key the proxy verifies against", rows[0].ObjectKey)
 	}
 }
 
@@ -126,8 +126,8 @@ func TestTUIFullPipelinePinsAptAtPackageTime(t *testing.T) {
 		t.Fatalf("the TUI full pipeline recorded %d checksum rows for apt, want 1\n%s", len(rows), out.output)
 	}
 	want := manifest.AptKey("pool/main/h/hello-tui/" + debName)
-	if rows[0].S3Key != want {
-		t.Errorf("row keyed on %q, want the pool key %q", rows[0].S3Key, want)
+	if rows[0].ObjectKey != want {
+		t.Errorf("row keyed on %q, want the pool key %q", rows[0].ObjectKey, want)
 	}
 	if rows[0].PkgVersion != "1.0" {
 		t.Errorf("row is %+v, want version 1.0", rows[0])

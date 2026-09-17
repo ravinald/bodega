@@ -486,8 +486,14 @@ func openStore(path string, sc SinkConfig, forceReadOnly bool) (*DB, error) {
 		}
 		// Migration 011 corrects identity the request-path parser got wrong on
 		// every cached artifact of seven of the eight ecosystems. It reads only
-		// s3_key, so it runs here on the upgrade that crosses it rather than
-		// costing every open a full scan of a table that grows with the cache.
+		// the object key, so it runs here on the upgrade that crosses it rather
+		// than costing every open a full scan of a table that grows with the
+		// cache.
+		//
+		// It runs after runMigrations, so on an upgrade crossing 021 it reads
+		// the renamed column; backfillChecksumIdentity resolves the name rather
+		// than assuming either, because a store stepped between 011 and 021 by
+		// hand still spells it the old way.
 		if from < checksumIdentityVersion {
 			n, err := backfillChecksumIdentity(context.Background(), wdb)
 			if err != nil {
@@ -584,7 +590,7 @@ type StoredChecksum struct {
 	PkgType    string
 	PkgName    string
 	PkgVersion string
-	S3Key      string
+	ObjectKey  string
 	Algorithm  string
 	Value      string
 	Source     string // "computed", "upstream", "manifest"
@@ -592,17 +598,17 @@ type StoredChecksum struct {
 	UpdatedAt  time.Time
 }
 
-// StoreChecksum inserts or updates a checksum record keyed by S3 key.
-func (a *DB) StoreChecksum(ctx context.Context, s3Key, pkgType, pkgName, pkgVersion, algorithm, value, source string) error {
+// StoreChecksum inserts or updates a checksum record keyed by object key.
+func (a *DB) StoreChecksum(ctx context.Context, objectKey, pkgType, pkgName, pkgVersion, algorithm, value, source string) error {
 	_, err := a.writer().ExecContext(ctx,
-		`INSERT INTO checksums (s3_key, pkg_type, pkg_name, pkg_version, algorithm, value, source)
+		`INSERT INTO checksums (object_key, pkg_type, pkg_name, pkg_version, algorithm, value, source)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(s3_key) DO UPDATE SET
+		 ON CONFLICT(object_key) DO UPDATE SET
 		   value = excluded.value,
 		   algorithm = excluded.algorithm,
 		   source = excluded.source,
 		   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
-		s3Key, pkgType, pkgName, pkgVersion, algorithm, value, source,
+		objectKey, pkgType, pkgName, pkgVersion, algorithm, value, source,
 	)
 	return err
 }
@@ -646,32 +652,33 @@ func (o ObjectIdentity) matches(stored ObjectIdentity) bool {
 }
 
 // StoreCacheOrigin records which upstream supplied the bytes now cached at
-// s3Key, so a later hit can name it without a network round trip. obj is what
-// the store reported about those bytes once they landed.
+// objectKey, so a later hit can name it without a network round trip. obj is
+// what the store reported about those bytes once they landed.
 //
 // It lives in the embedded store rather than in the event stream because the
 // serving path reads it to compose a row, and syslog and jsonl sinks answer no
 // reads at all. Upserted: a mutable document refetched after its TTL may come
 // from a different archive than last time, and the row has to follow the bytes.
-func (a *DB) StoreCacheOrigin(ctx context.Context, s3Key, upstreamURL string, obj ObjectIdentity) error {
+func (a *DB) StoreCacheOrigin(ctx context.Context, objectKey, upstreamURL string, obj ObjectIdentity) error {
 	_, err := a.writer().ExecContext(ctx,
-		`INSERT INTO cache_origins (s3_key, upstream_url, backend, object_size, object_etag, object_modified)
+		`INSERT INTO cache_origins (object_key, upstream_url, backend, object_size, object_etag, object_modified)
 		 VALUES (?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(s3_key) DO UPDATE SET
+		 ON CONFLICT(object_key) DO UPDATE SET
 		   upstream_url = excluded.upstream_url,
 		   backend = excluded.backend,
 		   object_size = excluded.object_size,
 		   object_etag = excluded.object_etag,
 		   object_modified = excluded.object_modified,
 		   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
-		s3Key, upstreamURL, obj.Backend, obj.Size, obj.ETag, obj.Modified,
+		objectKey, upstreamURL, obj.Backend, obj.Size, obj.ETag, obj.Modified,
 	)
 	return err
 }
 
 // CacheOrigin returns the upstream recorded for the object obj identifies at
-// s3Key, or "" when nothing recorded one — an object cached before this table
-// existed, filled by a path that fetches nothing, or written over since by one.
+// objectKey, or "" when nothing recorded one: an object cached before this
+// table existed, filled by a path that fetches nothing, or written over since
+// by one.
 // The caller says so in the row rather than substituting a current candidate.
 //
 // The identity check is here rather than at the call site so that a serving
@@ -679,14 +686,14 @@ func (a *DB) StoreCacheOrigin(ctx context.Context, s3Key, upstreamURL string, ob
 // got wrong: it trusted the key, and every writer that does not fetch — 'pkg
 // upload', a replaced object, a moved bucket — silently inherited the previous
 // tenant's attribution.
-func (a *DB) CacheOrigin(ctx context.Context, s3Key string, obj ObjectIdentity) (string, error) {
+func (a *DB) CacheOrigin(ctx context.Context, objectKey string, obj ObjectIdentity) (string, error) {
 	var (
 		upstreamURL string
 		stored      ObjectIdentity
 	)
 	err := a.db.QueryRowContext(ctx,
 		`SELECT upstream_url, backend, object_size, object_etag, object_modified
-		 FROM cache_origins WHERE s3_key = ?`, s3Key,
+		 FROM cache_origins WHERE object_key = ?`, objectKey,
 	).Scan(&upstreamURL, &stored.Backend, &stored.Size, &stored.ETag, &stored.Modified)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
@@ -700,14 +707,14 @@ func (a *DB) CacheOrigin(ctx context.Context, s3Key string, obj ObjectIdentity) 
 	return upstreamURL, nil
 }
 
-// GetChecksum returns the stored checksum for an S3 key, or nil if not found.
-func (a *DB) GetChecksum(ctx context.Context, s3Key string) (*StoredChecksum, error) {
+// GetChecksum returns the stored checksum for an object key, or nil if not found.
+func (a *DB) GetChecksum(ctx context.Context, objectKey string) (*StoredChecksum, error) {
 	var sc StoredChecksum
 	var createdAt, updatedAt string
 	err := a.db.QueryRowContext(ctx,
-		`SELECT id, pkg_type, pkg_name, pkg_version, s3_key, algorithm, value, source, created_at, updated_at
-		 FROM checksums WHERE s3_key = ?`, s3Key,
-	).Scan(&sc.ID, &sc.PkgType, &sc.PkgName, &sc.PkgVersion, &sc.S3Key,
+		`SELECT id, pkg_type, pkg_name, pkg_version, object_key, algorithm, value, source, created_at, updated_at
+		 FROM checksums WHERE object_key = ?`, objectKey,
+	).Scan(&sc.ID, &sc.PkgType, &sc.PkgName, &sc.PkgVersion, &sc.ObjectKey,
 		&sc.Algorithm, &sc.Value, &sc.Source, &createdAt, &updatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -734,7 +741,7 @@ func (a *DB) ListChecksums(ctx context.Context, pkgType, pkgName string) ([]Stor
 		args = append(args, pkgName)
 	}
 
-	query := "SELECT id, pkg_type, pkg_name, pkg_version, s3_key, algorithm, value, source, created_at, updated_at FROM checksums"
+	query := "SELECT id, pkg_type, pkg_name, pkg_version, object_key, algorithm, value, source, created_at, updated_at FROM checksums"
 	if len(where) > 0 {
 		//nolint:gosec // G202: WHERE clause assembled from a fixed slice of internal predicates; values are bound via ? parameters in `args`.
 		query += " WHERE " + strings.Join(where, " AND ")
@@ -751,7 +758,7 @@ func (a *DB) ListChecksums(ctx context.Context, pkgType, pkgName string) ([]Stor
 	for rows.Next() {
 		var sc StoredChecksum
 		var createdAt, updatedAt string
-		if err := rows.Scan(&sc.ID, &sc.PkgType, &sc.PkgName, &sc.PkgVersion, &sc.S3Key,
+		if err := rows.Scan(&sc.ID, &sc.PkgType, &sc.PkgName, &sc.PkgVersion, &sc.ObjectKey,
 			&sc.Algorithm, &sc.Value, &sc.Source, &createdAt, &updatedAt); err != nil {
 			return nil, err
 		}
@@ -762,11 +769,11 @@ func (a *DB) ListChecksums(ctx context.Context, pkgType, pkgName string) ([]Stor
 	return checksums, rows.Err()
 }
 
-// ClearChecksum blanks the stored digest for an S3 key, keeping the row.
+// ClearChecksum blanks the stored digest for an object key, keeping the row.
 //
 // The row is two records in one. The digest is what verifyProxyChecksum
 // compares a re-fetch against, and clearing it is how an operator escapes an
-// upstream that republished different bytes. Its s3_key and "computed" source
+// upstream that republished different bytes. Its object_key and "computed" source
 // are also the only thing that tells a cached upstream .deb in pool/ from one
 // bodega built, which is what keeps the archive's bytes out of an index signed
 // with bodega's key (#225). Deleting the row cleared the first and destroyed
@@ -774,16 +781,16 @@ func (a *DB) ListChecksums(ctx context.Context, pkgType, pkgName string) ([]Stor
 //
 // A blank value reads as "no digest recorded": verifyProxyChecksum stores the
 // next computed one over it, exactly as it does for a key it has never seen.
-func (a *DB) ClearChecksum(ctx context.Context, s3Key string) error {
+func (a *DB) ClearChecksum(ctx context.Context, objectKey string) error {
 	result, err := a.writer().ExecContext(ctx,
 		`UPDATE checksums SET value = '', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-		 WHERE s3_key = ?`, s3Key)
+		 WHERE object_key = ?`, objectKey)
 	if err != nil {
 		return err
 	}
 	n, _ := result.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("no checksum found for key %q", s3Key)
+		return fmt.Errorf("no checksum found for key %q", objectKey)
 	}
 	return nil
 }

@@ -425,7 +425,7 @@ func TestBinaryArtifactPaths(t *testing.T) {
 	// Verify S3 keys.
 	keyMap := make(map[string]string)
 	for _, p := range paths {
-		keyMap[p.S3Key] = p.Local
+		keyMap[p.ObjectKey] = p.Local
 	}
 	if _, ok := keyMap["binaries/tool-a/tool-a.zip"]; !ok {
 		t.Error("missing S3 key binaries/tool-a/tool-a.zip")
@@ -464,7 +464,7 @@ func TestAptArtifactPathsResolveWithoutPoolPath(t *testing.T) {
 
 	got := map[string]bool{}
 	for _, p := range AptArtifactPaths(cfg, store, "") {
-		got[p.S3Key] = true
+		got[p.ObjectKey] = true
 	}
 	for _, want := range []string{
 		"packages/apt/pool/main/s/stamped/stamped_1.0_amd64.deb",
@@ -502,7 +502,7 @@ func TestGitArtifactPathsCoverBundlesAndReleases(t *testing.T) {
 
 	got := map[string]bool{}
 	for _, p := range GitArtifactPaths(cfg, store, "") {
-		got[p.S3Key] = true
+		got[p.ObjectKey] = true
 	}
 	for _, want := range []string{
 		manifest.GitKey("org/cloned", "main", false),

@@ -52,8 +52,8 @@ func TestFetchAptDirectDebPinsOnFirstFetch(t *testing.T) {
 		t.Fatalf("a direct .deb fetch recorded %d checksum rows, want 1", len(rows))
 	}
 	wantKey := manifest.AptKey(aptPoolRelPath(pkg, debName))
-	if rows[0].S3Key != wantKey {
-		t.Errorf("row keyed on %q, want the pool key the server publishes under %q", rows[0].S3Key, wantKey)
+	if rows[0].ObjectKey != wantKey {
+		t.Errorf("row keyed on %q, want the pool key the server publishes under %q", rows[0].ObjectKey, wantKey)
 	}
 	pinned := ComputeBytesSHA256([]byte(body))
 	if rows[0].Value != pinned {

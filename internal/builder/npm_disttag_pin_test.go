@@ -58,8 +58,8 @@ func TestFetchNpmDistTagPinsResolvedVersion(t *testing.T) {
 		t.Fatalf("a dist-tag fetch recorded %d checksum rows, want 1", len(rows))
 	}
 	wantKey := manifest.NpmTarballKey(pkg, resolved)
-	if rows[0].S3Key != wantKey {
-		t.Errorf("row keyed on %q, want the resolved version's object key %q", rows[0].S3Key, wantKey)
+	if rows[0].ObjectKey != wantKey {
+		t.Errorf("row keyed on %q, want the resolved version's object key %q", rows[0].ObjectKey, wantKey)
 	}
 	if rows[0].PkgVersion != resolved {
 		t.Errorf("row records version %q, want the resolved %q", rows[0].PkgVersion, resolved)

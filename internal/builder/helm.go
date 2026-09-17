@@ -229,10 +229,10 @@ func HelmArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) [
 			local := helmLocalPath(d, name, ve)
 			if fileExists(local) {
 				paths = append(paths, ArtifactPath{
-					Local:   local,
-					S3Key:   manifest.HelmChartKey(pm.Name, ve.Version),
-					Package: name,
-					Version: ve.Version,
+					Local:     local,
+					ObjectKey: manifest.HelmChartKey(pm.Name, ve.Version),
+					Package:   name,
+					Version:   ve.Version,
 				})
 			}
 		}
@@ -242,8 +242,8 @@ func HelmArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) [
 	indexPath := filepath.Join(d.charts, "index.yaml")
 	if fileExists(indexPath) {
 		paths = append(paths, ArtifactPath{
-			Local: indexPath,
-			S3Key: manifest.HelmIndexKey,
+			Local:     indexPath,
+			ObjectKey: manifest.HelmIndexKey,
 		})
 	}
 

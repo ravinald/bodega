@@ -206,10 +206,10 @@ func GomodArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) 
 				local := filepath.Join(dir, ve.Version+ext)
 				if fileExists(local) {
 					paths = append(paths, ArtifactPath{
-						Local:   local,
-						S3Key:   manifest.GomodKey(pm.Name, ve.Version, ext),
-						Package: name,
-						Version: ve.Version,
+						Local:     local,
+						ObjectKey: manifest.GomodKey(pm.Name, ve.Version, ext),
+						Package:   name,
+						Version:   ve.Version,
 					})
 				}
 			}
@@ -218,8 +218,8 @@ func GomodArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) 
 			listPath := filepath.Join(dir, "list")
 			if fileExists(listPath) {
 				paths = append(paths, ArtifactPath{
-					Local: listPath,
-					S3Key: manifest.GomodListKey(pm.Name),
+					Local:     listPath,
+					ObjectKey: manifest.GomodListKey(pm.Name),
 				})
 			}
 		}

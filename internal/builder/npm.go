@@ -336,10 +336,10 @@ func NpmArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) []
 			local := npmTarballPath(d, name, ve)
 			if fileExists(local) {
 				paths = append(paths, ArtifactPath{
-					Local:   local,
-					S3Key:   manifest.NpmTarballKey(pm.Name, ve.Version),
-					Package: name,
-					Version: ve.Version,
+					Local:     local,
+					ObjectKey: manifest.NpmTarballKey(pm.Name, ve.Version),
+					Package:   name,
+					Version:   ve.Version,
 				})
 			}
 
@@ -349,8 +349,8 @@ func NpmArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) []
 				packumentPath := filepath.Join(npmLocalDir(d, name, ve), "packument.json")
 				if fileExists(packumentPath) {
 					paths = append(paths, ArtifactPath{
-						Local: packumentPath,
-						S3Key: manifest.NpmPackumentKey(pm.Name),
+						Local:     packumentPath,
+						ObjectKey: manifest.NpmPackumentKey(pm.Name),
 					})
 				}
 			}

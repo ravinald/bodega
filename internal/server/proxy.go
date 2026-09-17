@@ -628,9 +628,9 @@ func (s *Server) verifyProxyChecksum(ctx context.Context, s3Key, computed string
 		// Record the mismatch in the audit trail.
 		if s.auditDB != nil {
 			details, _ := json.Marshal(map[string]string{
-				"expected": stored.Value,
-				"computed": computed,
-				"s3_key":   s3Key,
+				"expected":   stored.Value,
+				"computed":   computed,
+				"object_key": s3Key,
 			})
 			_ = s.auditDB.Record(ctx, audit.Event{
 				EventType:  audit.EventCache,

@@ -730,10 +730,10 @@ func GitArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) []
 				continue
 			}
 			paths = append(paths, ArtifactPath{
-				Local:   local,
-				S3Key:   manifest.GitKey(pm.Name, ve.Ref, ve.IsRelease()),
-				Package: name,
-				Version: ve.Ref,
+				Local:     local,
+				ObjectKey: manifest.GitKey(pm.Name, ve.Ref, ve.IsRelease()),
+				Package:   name,
+				Version:   ve.Ref,
 			})
 		}
 	}
