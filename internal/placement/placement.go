@@ -34,6 +34,39 @@ type Placer struct {
 	store   *manifest.Store
 	out     io.Writer
 	replace bool // --replace-placement: apply the current rule to already-placed versions
+	pin     *pin // --storage: one version's write goes here, whatever the rule says
+	only    string
+}
+
+// pin is one version's write-time backend, named on the command line.
+//
+// It is a flag rather than a fourth level of the hierarchy, and the two differ
+// on the next upload of the same package. A flag records a name once; from
+// there the existing "a recorded name wins over the rule" rule in ForVersion
+// carries it, so the following upload writes to the same backend without the
+// flag and without anything still deciding. A fourth level would need a
+// per-version rule that outranks the record at every future upload, which is
+// --replace-placement permanently on for that one version — and it would have
+// to live somewhere config can hold it, which is the one place per-version
+// state does not belong.
+//
+// applied is what separates "the operator named a version and it was written"
+// from "the operator named a version this run never reached". Without it a
+// mistyped version writes to the rule's backend and reports success.
+type pin struct {
+	pkg     string
+	version string
+	backend string
+	applied bool
+}
+
+// matches reports whether this pin names ve, under the same rule VersionIndex
+// uses: Version or Ref.
+func (p *pin) matches(pkg string, ve manifest.VersionEntry) bool {
+	if p == nil || p.pkg != pkg {
+		return false
+	}
+	return ve.Version == p.version || (ve.Ref != "" && ve.Ref == p.version)
 }
 
 // New builds the resolver described by cfg and wraps it for upload use.
@@ -51,6 +84,25 @@ func New(ctx context.Context, cfg *config.Config, store *manifest.Store, out io.
 func NewWith(stores storage.Resolver, store *manifest.Store, out io.Writer, replace bool) *Placer {
 	return &Placer{stores: stores, store: store, out: out, replace: replace}
 }
+
+// PlaceVersion directs the next write of one version at a named backend,
+// overriding every level of the placement hierarchy and the name already
+// recorded. See pin for why this is a flag and not a fourth level.
+//
+// Whole-directory types are refused by the command layer before they reach
+// here: a pypi version has no object of its own to place.
+func (p *Placer) PlaceVersion(pkg, version, backend string) {
+	p.pin = &pin{pkg: pkg, version: version, backend: backend}
+}
+
+// Only restricts UploadType to one package's artifacts. Empty, the default,
+// uploads every package of the type.
+func (p *Placer) Only(pkg string) { p.only = pkg }
+
+// PlacedVersion reports whether the version named by PlaceVersion was reached.
+// False after a run means the artifact was never uploaded, so the backend the
+// operator named was never written to.
+func (p *Placer) PlacedVersion() bool { return p.pin != nil && p.pin.applied }
 
 // Stores exposes the resolver the placer was built over, for a caller that
 // needs to reach a backend by name rather than by placement.
@@ -88,6 +140,15 @@ func (p *Placer) ForVersion(ctx context.Context, typ, pkg, version, key string) 
 	name := WritePlacement(p.stores, typ, pm.StoragePolicy).Name
 	if recorded != "" && !p.replace {
 		name = recorded
+	}
+	// Last, so it beats both the rule and the recorded name: an operator
+	// naming a backend for one artifact is answering a question neither of
+	// those can be asked. record() below still warns about the copy left at
+	// the old placement, which is the whole difference between this and a
+	// hand edit of the manifest.
+	if p.pin.matches(pm.Name, pm.Versions[i]) {
+		name = p.pin.backend
+		p.pin.applied = true
 	}
 	if err := p.record(ctx, pm, i, name, key); err != nil {
 		return nil, err
@@ -312,6 +373,14 @@ func (p *Placer) UploadPaths(ctx context.Context, typ string, paths []builder.Ar
 // one key per version.
 func (p *Placer) UploadType(ctx context.Context, bcfg *builder.Config, typ string) (int, error) {
 	if typ == manifest.TypePypi {
+		if p.only != "" {
+			// One pypi package cannot be uploaded apart from the rest of its
+			// type: the wheels share a prefix and the PEP 503 index is a
+			// listing over the whole tree. Skipping loudly beats uploading
+			// every other package the operator did not name.
+			fmt.Fprintf(p.out, "    %s — skipping\n", NoPerPackagePlacement(typ))
+			return 0, nil
+		}
 		localDir, keyPrefix := builder.PypiArtifactDir(bcfg, p.store)
 		if _, err := os.Stat(localDir); os.IsNotExist(err) {
 			fmt.Fprintf(p.out, "    No wheels directory at %s — skipping\n", localDir)
@@ -329,7 +398,7 @@ func (p *Placer) UploadType(ctx context.Context, bcfg *builder.Config, typ strin
 		return n, nil
 	}
 
-	paths := ArtifactPaths(bcfg, p.store, typ, "")
+	paths := ArtifactPaths(bcfg, p.store, typ, p.only)
 	if len(paths) == 0 {
 		// Naming the directory is what separates "nothing was built" from
 		// "this command resolved a different root than the build did".

@@ -286,3 +286,146 @@ func PrintStatus(out io.Writer, statuses []EntryStatus) {
 		}
 	}
 }
+
+// CheckRelabel refuses a hand edit that repoints a version's recorded backend
+// at a backend the object is not on.
+//
+// VersionEntry.Storage is the only thing reads consult, so changing it moves
+// the record and nothing else: the bytes stay where they were and every fetch
+// of that version answers 404 for content that exists. admit.CheckBackendName
+// confirms the new name resolves to a configured backend, which is a different
+// question — a correctly spelled name for a backend that never held the
+// artifact passes it.
+//
+// The two edits this cannot tell apart from the manifest alone are correcting
+// a wrong record and stranding an artifact, so it asks the backends. The object
+// is looked for at the key the source resolves, because that is where it is: an
+// apt entry predating the _pool_path metadata key can only be located by
+// listing the pool it is actually in.
+//
+// Absent at both ends is allowed. A version created but never uploaded strands
+// nothing, and refusing it would make 'pkg create' then 'pkg edit' impossible.
+// A backend that will not answer is refused rather than waved through: an
+// unreachable backend has not said the object is there.
+//
+// before and after are the same package before and after the edit, matched by
+// version label. A version the edit added or removed is not a relabel and is
+// left to admit's own validation.
+func CheckRelabel(ctx context.Context, stores storage.Resolver, before, after *manifest.PackageManifest) error {
+	if before == nil || after == nil {
+		return nil
+	}
+	was := make(map[string]string, len(before.Versions))
+	for _, ve := range before.Versions {
+		if l := versionLabel(ve); l != "?" {
+			was[l] = ve.Storage
+		}
+	}
+
+	var stranded []string
+	for _, ve := range after.Versions {
+		label := versionLabel(ve)
+		if label == "?" {
+			continue
+		}
+		old, ok := was[label]
+		if !ok || EffectiveBackend(old) == EffectiveBackend(ve.Storage) {
+			continue
+		}
+		msg, err := checkOneRelabel(ctx, stores, after, ve, old)
+		if err != nil {
+			return err
+		}
+		if msg != "" {
+			stranded = append(stranded, msg)
+		}
+	}
+	if len(stranded) == 0 {
+		return nil
+	}
+	return fmt.Errorf("storage was repointed at a backend the object is not on:\n  %s",
+		strings.Join(stranded, "\n  "))
+}
+
+// checkOneRelabel probes one relabeled version. It returns a description when
+// the edit strands the artifact, "" when it does not, and an error when a
+// backend could not answer.
+func checkOneRelabel(ctx context.Context, stores storage.Resolver, pm *manifest.PackageManifest, ve manifest.VersionEntry, old string) (string, error) {
+	label := pm.Name + "@" + versionLabel(ve)
+	oldName, newName := EffectiveBackend(old), EffectiveBackend(ve.Storage)
+
+	src, err := stores.ByName(old)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", label, err)
+	}
+	dst, err := stores.ByName(ve.Storage)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", label, err)
+	}
+
+	key, err := relabelKey(ctx, src, pm, ve)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", label, err)
+	}
+	if key == "" {
+		// Nothing resolves for this entry, so there is no object the edit can
+		// separate from its record.
+		return "", nil
+	}
+
+	at, err := dst.Head(ctx, key)
+	if err != nil {
+		return "", fmt.Errorf("%s: %q could not answer for %s: %w", label, newName, key, err)
+	}
+	if at.Exists {
+		return "", nil
+	}
+	from, err := src.Head(ctx, key)
+	if err != nil {
+		return "", fmt.Errorf("%s: %q could not answer for %s: %w", label, oldName, key, err)
+	}
+	if !from.Exists {
+		return "", nil
+	}
+	return fmt.Sprintf("%s: %s is on %q, not %q; %s",
+		label, key, oldName, newName, relabelRemedy(pm.Type, pm.Name, versionLabel(ve), newName)), nil
+}
+
+// relabelKey resolves the one object to probe. pypi has no per-version key, so
+// the wheel-tree sentinel stands in for the whole tree — which is also the
+// granularity a pypi relabel operates at, whatever one version's entry says.
+func relabelKey(ctx context.Context, src storage.ObjectStore, pm *manifest.PackageManifest, ve manifest.VersionEntry) (string, error) {
+	if pm.Type == manifest.TypePypi {
+		return pypiSentinel, nil
+	}
+	keys, err := ArtifactKeys(ctx, src, pm, ve)
+	if err != nil || len(keys) == 0 {
+		return "", err
+	}
+	return keys[0], nil
+}
+
+// relabelRemedy names what actually moves the bytes. 'pkg move' refuses a
+// directory-placed type, so naming it there would hand the operator a command
+// that exits non-zero.
+func relabelRemedy(typ, name, version, dst string) string {
+	if typ == manifest.TypePypi {
+		return fmt.Sprintf("%s wheels move as a whole type: set storage_by_type.%s to %q "+
+			"and re-run 'bodega build upload %s --replace-placement'", typ, typ, dst, typ)
+	}
+	return fmt.Sprintf("use 'bodega pkg move %s %s@%s --to %s', which copies the bytes and then repoints the record",
+		typ, name, version, dst)
+}
+
+// versionLabel names an entry for an operator: Version, else Ref, else "?". It
+// is also the key before and after an edit are matched on, which is why a
+// manifest holding two unnamed entries matches neither.
+func versionLabel(ve manifest.VersionEntry) string {
+	if ve.Version != "" {
+		return ve.Version
+	}
+	if ve.Ref != "" {
+		return ve.Ref
+	}
+	return "?"
+}

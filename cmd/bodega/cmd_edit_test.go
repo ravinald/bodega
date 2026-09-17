@@ -1,11 +1,14 @@
 package main
 
 import (
+	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
@@ -147,5 +150,107 @@ func TestRunEditor(t *testing.T) {
 	out, _ := os.ReadFile(target)
 	if strings.TrimSpace(string(out)) != `{"a":2}` {
 		t.Errorf("after edit = %q, want {\"a\":2}", string(out))
+	}
+}
+
+// relabelFixture seeds one binary version recorded on the default backend, with
+// the artifact present on whichever backends are named, and points the process
+// at a config defining "bulk" alongside the default.
+func relabelFixture(t *testing.T, objectOn ...string) {
+	t.Helper()
+	defaultPath, bulkPath, manifestDir := t.TempDir(), t.TempDir(), t.TempDir()
+
+	body, err := json.Marshal(map[string]any{
+		"build_root":      t.TempDir(),
+		"storage_backend": "local",
+		"storage_path":    defaultPath,
+		"manifest_dir":    manifestDir,
+		"storage_backends": map[string]any{
+			"bulk": map[string]string{"driver": "local", "path": bulkPath},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(cfgPath, body, 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv(config.EnvConfigFile, cfgPath)
+	t.Setenv(config.EnvBuildRoot, "")
+	t.Setenv(config.EnvManifestDir, "")
+	t.Setenv(config.EnvBucket, "")
+
+	key := filepath.FromSlash(manifest.BinaryKey("awscli-v2", "2.15.0", "awscli.zip"))
+	for _, backend := range objectOn {
+		root := defaultPath
+		if backend == "bulk" {
+			root = bulkPath
+		}
+		obj := filepath.Join(root, key)
+		if err := os.MkdirAll(filepath.Dir(obj), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", backend, err)
+		}
+		if err := os.WriteFile(obj, []byte("awscli"), 0o644); err != nil {
+			t.Fatalf("write object on %s: %v", backend, err)
+		}
+	}
+
+	store := manifest.NewLocalStore(manifestDir)
+	if err := store.AddVersion(t.Context(), manifest.TypeBinary, "awscli-v2", manifest.VersionEntry{
+		Version:  "2.15.0",
+		Filename: "awscli.zip",
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+	if err := store.SaveIndex(t.Context()); err != nil {
+		t.Fatalf("SaveIndex: %v", err)
+	}
+}
+
+// relabelEditor writes a VersionEntry naming backend, standing in for the
+// operator who changed one line in $EDITOR.
+func relabelEditor(t *testing.T, backend string) string {
+	t.Helper()
+	script := filepath.Join(t.TempDir(), "stub-editor.sh")
+	body := "#!/bin/sh\ncat > \"$1\" <<'EOF'\n{\n  \"version\": \"2.15.0\",\n" +
+		"  \"filename\": \"awscli.zip\",\n  \"storage\": \"" + backend + "\"\n}\nEOF\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("write stub editor: %v", err)
+	}
+	return script
+}
+
+// TestEditRefusesAStorageChangeThatStrandsTheArtifact. admit.CheckBackendName
+// passes "bulk" — it is a configured backend — and the object is not on it, so
+// the edit would leave the bytes on the default and turn every read of the
+// version into a 404 for content that exists.
+func TestEditRefusesAStorageChangeThatStrandsTheArtifact(t *testing.T) {
+	relabelFixture(t, "default")
+
+	cmd := newEditCmd(&globalFlags{})
+	cmd.SetArgs([]string{manifest.TypeBinary, "awscli-v2", "2.15.0", "--editor", relabelEditor(t, "bulk")})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("edit accepted a relabel that strands the artifact")
+	}
+	if !strings.Contains(err.Error(), "bodega pkg move") {
+		t.Errorf("error = %q, want it to name the command that moves the bytes", err)
+	}
+}
+
+// TestEditAcceptsAStorageChangeThatCorrectsTheRecord. The other reading of the
+// same edit: the object is on the backend being named, so the record was wrong.
+func TestEditAcceptsAStorageChangeThatCorrectsTheRecord(t *testing.T) {
+	relabelFixture(t, "bulk")
+
+	cmd := newEditCmd(&globalFlags{})
+	cmd.SetArgs([]string{manifest.TypeBinary, "awscli-v2", "2.15.0", "--editor", relabelEditor(t, "bulk")})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("edit refused a correction: %v", err)
 	}
 }

@@ -15,8 +15,11 @@ import (
 
 	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/inventory"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 func newEditCmd(gf *globalFlags) *cobra.Command {
@@ -35,6 +38,14 @@ With VERSION, only the matching VersionEntry is edited (matches either
 Version or Ref). This is the recommended form for targeted changes.
 
 Editor resolution: --editor flag → $VISUAL → $EDITOR → "vi".
+
+Changing "storage" is checked against the backends, not only against the
+config. The name reads have to resolve by is the one on the entry, so a
+relabel moves the record and nothing else: the bytes stay where they were and
+every fetch of that version answers 404 for content that exists. An edit that
+points a version at a backend the object is not on, while the backend it names
+today holds it, is refused and names 'bodega pkg move', which copies the bytes
+first. A version with no object at either end is not a relabel and passes.
 
 A no-op save (no bytes changed) exits cleanly without touching storage.
 Validation or policy failures leave the edited temp file on disk so you can
@@ -166,6 +177,17 @@ re-run with --editor cat to inspect, or copy and retry.`,
 			if adb != nil {
 				checker = policy.NewChecker(adb)
 			}
+			// Before admit, because a relabel that strands the artifact is
+			// not a validation failure admit can see: CheckBackendName
+			// confirms the new name resolves to a configured backend, and a
+			// correctly spelled name for a backend that never held the bytes
+			// passes it. The resolver is built only when a storage field
+			// actually changed, so an edit that touches anything else opens no
+			// backends at all.
+			if err := checkRelabels(ctx, cfg, beforeJSON, pm); err != nil {
+				return keep("%v", err)
+			}
+
 			res := admit.Admit(ctx, checker, adb, cfg, pm, audit.CurrentActor())
 			for _, w := range res.Warnings {
 				fmt.Fprintf(os.Stderr, "%s/%s: %s\n", pm.Type, pm.Name, w)
@@ -292,4 +314,41 @@ func runEditor(editor, path string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// checkRelabels probes the backends when an edit changed any version's
+// recorded storage, and refuses one that would leave the bytes behind.
+//
+// beforeJSON is the authoritative pre-edit manifest the audit diff already
+// captures, parsed back rather than deep-copied: it is the same bytes the
+// record is compared against, so the two can never disagree about what the
+// edit changed.
+func checkRelabels(ctx context.Context, cfg *config.Config, beforeJSON []byte, after *manifest.PackageManifest) error {
+	var before manifest.PackageManifest
+	if err := json.Unmarshal(beforeJSON, &before); err != nil {
+		return nil // the pre-edit manifest round-trips; nothing to compare against if it did not
+	}
+	if !storageChanged(&before, after) {
+		return nil
+	}
+	stores, err := storage.NewResolver(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("connect to storage: %w", err)
+	}
+	return inventory.CheckRelabel(ctx, stores, &before, after)
+}
+
+// storageChanged reports whether any version's recorded backend differs, under
+// the empty-means-default rule so "" and "default" are not read as a move.
+func storageChanged(before, after *manifest.PackageManifest) bool {
+	was := make(map[string]string, len(before.Versions))
+	for _, ve := range before.Versions {
+		was[versionLabel(ve)] = effectiveStorage(ve.Storage)
+	}
+	for _, ve := range after.Versions {
+		if old, ok := was[versionLabel(ve)]; ok && old != effectiveStorage(ve.Storage) {
+			return true
+		}
+	}
+	return false
 }
