@@ -103,17 +103,23 @@ e2e_bodega server "policy osv remove npm" || true
 e2e_bodega server "doctor" || true
 doc="$E2E_OUT"
 check_eq POL-14 "doctor exits 2 while the host carries findings" 2 "$E2E_RC" \
-	"cmd/bodega/cmd_doctor.go:150" "bodega doctor" "$E2E_RC"
+	"cmd/bodega/cmd_doctor.go:206" "bodega doctor" "$E2E_RC"
 check_contains POL-15 "doctor reports policy coverage" "policy-coverage" "$doc" \
-	"cmd/bodega/cmd_doctor.go:427" "bodega doctor"
+	"cmd/bodega/cmd_doctor.go:558" "bodega doctor"
 check_lacks POL-16 "the policy checks are not degraded to N/A under sudo" \
-	"policy-coverage   N/A" "$doc" "cmd/bodega/cmd_doctor.go:427" "sudo bodega doctor"
+	"policy-coverage   N/A" "$doc" "cmd/bodega/cmd_doctor.go:558" "sudo bodega doctor"
 
-# The same command unprivileged cannot read a root-owned config, and reports
-# the three posture rows as N/A while still exiting 2 on an unrelated finding.
-# Nothing in the output or the exit code says the posture was never measured.
+# The same command unprivileged cannot read a root-owned config. It measures no
+# posture at all, and the three ways it has to say so are the row status, the
+# next step, and the exit code. N/A beside OK said none of them.
 e2e_bodega_user server "doctor" || true
-check_lacks POL-17 "an unprivileged doctor still measures the policy posture" \
-	"config unreadable" "$E2E_OUT" "cmd/bodega/cmd_doctor.go:539" "bodega doctor (unprivileged)"
+unpriv="$E2E_OUT"
+unpriv_rc="$E2E_RC"
+check_matches POL-17 "an unprivileged doctor reports the posture as unmeasured, not N/A" \
+	'policy-coverage[[:space:]]+SKIPPED' "$unpriv" "cmd/bodega/cmd_doctor.go:571" "bodega doctor (unprivileged)"
+check_contains POL-17b "the rows that could not run name the privilege they need" \
+	"sudo bodega doctor" "$unpriv" "cmd/bodega/cmd_doctor.go:629" "bodega doctor (unprivileged)"
+check_eq POL-17c "an unmeasured run exits 3, not the 2 a measured host with gaps exits" \
+	3 "$unpriv_rc" "cmd/bodega/cmd_doctor.go:206" "bodega doctor (unprivileged)" "$unpriv_rc"
 
-unset ages eco doc
+unset ages eco doc unpriv unpriv_rc

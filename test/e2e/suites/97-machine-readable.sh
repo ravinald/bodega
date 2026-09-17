@@ -66,10 +66,13 @@ done
 
 unset spec id cmd
 
-# An empty export is `null`, not `[]`. Valid JSON either way, and a consumer
-# written the obvious way breaks on it: `jq '.[]'` over null is an error, and a
-# shell loop over the result iterates nothing without saying why.
+# An export is a collection whether or not it holds rows. `null` is valid JSON
+# and breaks a consumer written the obvious way: `jq '.[]'` over it is an
+# error, and a shell loop over the result iterates nothing without saying why.
+# The assertion is on the document's shape rather than on emptiness, because
+# this guest's discovery table holds whatever the suites before this one drove
+# through the proxy.
 e2e_bodega server "discover export json" || true
-check_ne JSON-EMPTY-01 "an empty discover export is a collection, not null" \
-	"null" "$(printf '%s' "$E2E_OUT" | tr -d '[:space:]')" \
-	"cmd/bodega/cmd_discover.go:332" "bodega discover export json on an empty table"
+check_matches JSON-EMPTY-01 "a discover export is a collection, not null" \
+	'^\[' "$(printf '%s' "$E2E_OUT" | tr -d '[:space:]')" \
+	"cmd/bodega/cmd_discover.go:362" "bodega discover export json"

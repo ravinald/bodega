@@ -17,7 +17,6 @@ PIPE-APT-07	311	PackageApt writes pool paths under the binary name
 PROF-16	310	an apt pin cannot name a source version
 PIPE-APT-08	271	_pool_path is unconditional provenance, so no SHA256 when mirroring
 CLI-GIT-02	331	filed from run 20260914T091319Z-9f7c138
-POL-17	332	filed from run 20260914T091319Z-9f7c138
 PROF-14	333	filed from run 20260914T091319Z-9f7c138
 PROF-14b	334	filed from run 20260914T091319Z-9f7c138
 INT-02	342	filed from run 20260914T091319Z-9f7c138
@@ -26,4 +25,3 @@ INT-02c	344	filed from run 20260914T091319Z-9f7c138
 INT-03a	345	filed from run 20260914T091319Z-9f7c138
 INT-04	346	filed from run 20260914T091319Z-9f7c138
 INT-05	347	filed from run 20260914T091319Z-9f7c138
-JSON-EMPTY-01	348	filed from run 20260914T091319Z-9f7c138
