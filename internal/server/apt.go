@@ -701,7 +701,7 @@ func (s *Server) aptMirroredPoolKeys(ctx context.Context) (map[string]bool, erro
 	mirrored := make(map[string]bool)
 	for _, row := range rows {
 		if row.Source == "computed" {
-			mirrored[row.S3Key] = true
+			mirrored[row.ObjectKey] = true
 		}
 	}
 	return mirrored, nil

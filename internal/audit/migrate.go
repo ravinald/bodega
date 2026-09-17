@@ -105,13 +105,33 @@ func runMigrations(db *sql.DB) (from uint, err error) {
 // carrying package identity derived from the object key.
 const checksumIdentityVersion = 11
 
+// checksumKeyColumn resolves the name the checksums table currently spells its
+// object key under. Migration 021 renamed s3_key to object_key, and the repair
+// below has to read whichever one is there: Open applies every migration before
+// it calls the repair, so an upgrade crossing both sees the new name, while a
+// store stepped to a version between 011 and 021 by hand still holds the old
+// one. Failing the open on a column name would lose the repair on exactly the
+// databases that need it.
+func checksumKeyColumn(ctx context.Context, db *sql.DB) (string, error) {
+	var n int
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM pragma_table_info('checksums') WHERE name = 'object_key'",
+	).Scan(&n); err != nil {
+		return "", fmt.Errorf("inspect checksums columns: %w", err)
+	}
+	if n > 0 {
+		return "object_key", nil
+	}
+	return "s3_key", nil
+}
+
 // backfillChecksumIdentity re-derives pkg_type, pkg_name and pkg_version from
-// s3_key and writes back every row that disagrees, returning how many it
-// touched.
+// the object key and writes back every row that disagrees, returning how many
+// it touched.
 //
 // Rows written before migration 011 carry whatever the request-path parser
 // made of an object key: nothing at all for apt, gomod, helm and git, and
-// ("cargo", "crates") for every crate. s3_key was right the whole time, so the
+// ("cargo", "crates") for every crate. The key was right the whole time, so the
 // correction reads no upstream and no object store.
 //
 // It is Go rather than SQL because manifest.ParseKey is the derivation the
@@ -124,7 +144,13 @@ func backfillChecksumIdentity(ctx context.Context, db *sql.DB) (int64, error) {
 		typ, name, verzn string
 	}
 
-	rows, err := db.QueryContext(ctx, "SELECT s3_key, pkg_type, pkg_name, pkg_version FROM checksums")
+	keyCol, err := checksumKeyColumn(ctx, db)
+	if err != nil {
+		return 0, err
+	}
+
+	//nolint:gosec // G201: keyCol is one of two literals returned by checksumKeyColumn, never caller input.
+	rows, err := db.QueryContext(ctx, "SELECT "+keyCol+", pkg_type, pkg_name, pkg_version FROM checksums")
 	if err != nil {
 		return 0, fmt.Errorf("read checksum rows: %w", err)
 	}
@@ -161,8 +187,9 @@ func backfillChecksumIdentity(ctx context.Context, db *sql.DB) (int64, error) {
 	}
 	defer func() { _ = tx.Rollback() }()
 	for _, c := range fix {
+		//nolint:gosec // G201: keyCol is one of two literals returned by checksumKeyColumn, never caller input.
 		if _, err := tx.ExecContext(ctx,
-			"UPDATE checksums SET pkg_type = ?, pkg_name = ?, pkg_version = ? WHERE s3_key = ?",
+			"UPDATE checksums SET pkg_type = ?, pkg_name = ?, pkg_version = ? WHERE "+keyCol+" = ?",
 			c.typ, c.name, c.verzn, c.key,
 		); err != nil {
 			return 0, fmt.Errorf("backfill checksum identity for %s: %w", c.key, err)

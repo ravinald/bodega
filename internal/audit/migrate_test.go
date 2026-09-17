@@ -579,3 +579,132 @@ func TestOpenBackfillsChecksumIdentityOnUpgrade(t *testing.T) {
 		t.Errorf("cleared/matched = %d/%d, want 1/1", cleared, matched)
 	}
 }
+
+// objectKeyVersion is migration 021, where both tables stopped naming their
+// object key for one backend.
+const objectKeyVersion = 21
+
+// TestMigration021RenamesWithoutLosingRows drives the rename against a store
+// seeded at the shape it had before, in both tables. The rows are what carries
+// the risk: checksums.s3_key is the record that tells a cached upstream .deb
+// from one bodega built, and cache_origins.s3_key is the whole primary key, so
+// a rename implemented as a table rebuild that dropped either would fail
+// silently, as a cache that had simply never recorded anything.
+func TestMigration021RenamesWithoutLosingRows(t *testing.T) {
+	raw, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer func() { _ = raw.Close() }()
+
+	m := migrator(t, raw)
+	if err := m.Migrate(objectKeyVersion - 1); err != nil {
+		t.Fatalf("migrate to %d: %v", objectKeyVersion-1, err)
+	}
+	seedPreIdentityChecksums(t, raw)
+	if _, err := raw.Exec(
+		`INSERT INTO cache_origins (s3_key, upstream_url, backend, object_size, object_etag, object_modified)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		"npm/lodash/lodash-4.17.21.tgz", "https://registry.npmjs.org", "bulk", int64(4096), "etag-1", "2026-09-01T00:00:00Z",
+	); err != nil {
+		t.Fatalf("seed cache origin: %v", err)
+	}
+
+	if err := m.Migrate(objectKeyVersion); err != nil {
+		t.Fatalf("migrate to %d: %v", objectKeyVersion, err)
+	}
+
+	var checksums int
+	if err := raw.QueryRow(`SELECT COUNT(*) FROM checksums WHERE object_key != ''`).Scan(&checksums); err != nil {
+		t.Fatalf("count checksums after rename: %v", err)
+	}
+	if checksums != len(preIdentityRows) {
+		t.Errorf("checksum rows after rename = %d, want %d", checksums, len(preIdentityRows))
+	}
+
+	var upstream, backend string
+	if err := raw.QueryRow(
+		`SELECT upstream_url, backend FROM cache_origins WHERE object_key = ?`,
+		"npm/lodash/lodash-4.17.21.tgz",
+	).Scan(&upstream, &backend); err != nil {
+		t.Fatalf("read cache origin after rename: %v", err)
+	}
+	if upstream != "https://registry.npmjs.org" || backend != "bulk" {
+		t.Errorf("origin = %q/%q, want the seeded registry and backend", upstream, backend)
+	}
+
+	// The constraints ride along with the column, or a second write under the
+	// same key stops conflicting and starts duplicating.
+	if _, err := raw.Exec(
+		`INSERT INTO cache_origins (object_key, upstream_url) VALUES (?, ?)`,
+		"npm/lodash/lodash-4.17.21.tgz", "https://example.invalid",
+	); err == nil {
+		t.Error("second cache_origins row under one key inserted; the PRIMARY KEY did not survive the rename")
+	}
+	if _, err := raw.Exec(
+		`INSERT INTO checksums (object_key, pkg_type, pkg_name, pkg_version, algorithm, value, source)
+		 VALUES (?, 'npm', 'lodash', '4.17.21', 'sha256', 'deadbeef', 'computed')`,
+		"npm/lodash/lodash-4.17.21.tgz",
+	); err == nil {
+		t.Error("second checksums row under one key inserted; the UNIQUE constraint did not survive the rename")
+	}
+}
+
+// TestBackfillReadsEitherColumnName pins the ordering requirement: Open runs
+// every migration before the repair, so on an upgrade crossing both the repair
+// meets object_key, while a store stepped to a version between 011 and 021
+// still holds s3_key. Hard-coding either name loses the repair on half the
+// stores that need it.
+func TestBackfillReadsEitherColumnName(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		to      uint
+		wantCol string
+	}{
+		{"pre-rename", objectKeyVersion - 1, "s3_key"},
+		{"post-rename", objectKeyVersion, "object_key"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "audit.db"))
+			if err != nil {
+				t.Fatalf("open sqlite: %v", err)
+			}
+			defer func() { _ = raw.Close() }()
+
+			m := migrator(t, raw)
+			if err := m.Migrate(checksumIdentityVersion - 1); err != nil {
+				t.Fatalf("migrate to %d: %v", checksumIdentityVersion-1, err)
+			}
+			seedPreIdentityChecksums(t, raw)
+			if err := m.Migrate(tc.to); err != nil {
+				t.Fatalf("migrate to %d: %v", tc.to, err)
+			}
+
+			ctx := context.Background()
+			col, err := checksumKeyColumn(ctx, raw)
+			if err != nil {
+				t.Fatalf("resolve key column: %v", err)
+			}
+			if col != tc.wantCol {
+				t.Fatalf("key column = %q, want %q", col, tc.wantCol)
+			}
+
+			n, err := backfillChecksumIdentity(ctx, raw)
+			if err != nil {
+				t.Fatalf("backfill: %v", err)
+			}
+			if n != 7 {
+				t.Errorf("backfilled rows = %d, want 7", n)
+			}
+
+			var seen int
+			//nolint:gosec // G201: col is one of two literals returned by checksumKeyColumn.
+			if err := raw.QueryRow("SELECT COUNT(*) FROM checksums WHERE " + col + " != ''").Scan(&seen); err != nil {
+				t.Fatalf("count rows: %v", err)
+			}
+			if seen != len(preIdentityRows) {
+				t.Errorf("rows after backfill = %d, want %d — the correction dropped rows", seen, len(preIdentityRows))
+			}
+		})
+	}
+}

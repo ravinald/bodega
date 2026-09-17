@@ -290,12 +290,12 @@ func VersionLabel(ve manifest.VersionEntry) string {
 func (p *Placer) UploadPaths(ctx context.Context, typ string, paths []builder.ArtifactPath) (int, error) {
 	n := 0
 	for _, ap := range paths {
-		st, err := p.ForVersion(ctx, typ, ap.Package, ap.Version, ap.S3Key)
+		st, err := p.ForVersion(ctx, typ, ap.Package, ap.Version, ap.ObjectKey)
 		if err != nil {
 			return n, err
 		}
-		fmt.Fprintf(p.out, "    upload: %s/%s\n", st.Label(), ap.S3Key)
-		if err := st.PutFile(ctx, ap.Local, ap.S3Key); err != nil {
+		fmt.Fprintf(p.out, "    upload: %s/%s\n", st.Label(), ap.ObjectKey)
+		if err := st.PutFile(ctx, ap.Local, ap.ObjectKey); err != nil {
 			return n, fmt.Errorf("upload %s %s: %w", typ, ap.Local, err)
 		}
 		n++

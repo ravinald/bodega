@@ -734,10 +734,10 @@ func TestUploadedBytesDoNotInheritTheProxyOrigin(t *testing.T) {
 	// supported command puts these bytes there.
 	placer := placement.NewWith(s.stores, s.store, io.Discard, false)
 	n, err := placer.UploadPaths(t.Context(), manifest.TypeApt, []builder.ArtifactPath{{
-		Local:   local,
-		S3Key:   manifest.AptKey(fixtureDeb),
-		Package: "nginx",
-		Version: "1.24.0-2ubuntu7.1",
+		Local:     local,
+		ObjectKey: manifest.AptKey(fixtureDeb),
+		Package:   "nginx",
+		Version:   "1.24.0-2ubuntu7.1",
 	}})
 	if err != nil || n != 1 {
 		t.Fatalf("UploadPaths wrote %d objects, err = %v", n, err)
@@ -890,10 +890,10 @@ func TestAnUploadDuringAFillIsNotCreditedToIt(t *testing.T) {
 			// process, which is why the check is on the bytes.
 			placer := placement.NewWith(s.stores, s.store, io.Discard, false)
 			n, err := placer.UploadPaths(t.Context(), manifest.TypeApt, []builder.ArtifactPath{{
-				Local:   local,
-				S3Key:   manifest.AptKey(fixtureDeb),
-				Package: "nginx",
-				Version: "1.24.0-2ubuntu7.1",
+				Local:     local,
+				ObjectKey: manifest.AptKey(fixtureDeb),
+				Package:   "nginx",
+				Version:   "1.24.0-2ubuntu7.1",
 			}})
 			if err != nil || n != 1 {
 				t.Fatalf("UploadPaths wrote %d objects, err = %v", n, err)
@@ -987,10 +987,10 @@ func TestAnUploadAfterTheCacheOpenDoesNotReachTheReader(t *testing.T) {
 
 	placer := placement.NewWith(s.stores, s.store, io.Discard, false)
 	n, err := placer.UploadPaths(t.Context(), manifest.TypeApt, []builder.ArtifactPath{{
-		Local:   local,
-		S3Key:   manifest.AptKey(fixtureDeb),
-		Package: "nginx",
-		Version: "1.24.0-2ubuntu7.1",
+		Local:     local,
+		ObjectKey: manifest.AptKey(fixtureDeb),
+		Package:   "nginx",
+		Version:   "1.24.0-2ubuntu7.1",
 	}})
 	close(held.resume)
 	got := <-answered

@@ -219,10 +219,10 @@ func BinaryArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string)
 				continue
 			}
 			paths = append(paths, ArtifactPath{
-				Local:   local,
-				S3Key:   manifest.BinaryKey(pm.Name, ve.Version, binaryFilename(ve)),
-				Package: name,
-				Version: ve.Version,
+				Local:     local,
+				ObjectKey: manifest.BinaryKey(pm.Name, ve.Version, binaryFilename(ve)),
+				Package:   name,
+				Version:   ve.Version,
 			})
 		}
 	}

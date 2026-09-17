@@ -61,10 +61,10 @@ func artifactPathUpload(paths []builder.ArtifactPath, dst storage.ObjectStore, t
 	t.Helper()
 	var keys []string
 	for _, ap := range paths {
-		if err := dst.PutFile(t.Context(), ap.Local, ap.S3Key); err != nil {
+		if err := dst.PutFile(t.Context(), ap.Local, ap.ObjectKey); err != nil {
 			t.Fatalf("upload %s: %v", ap.Local, err)
 		}
-		keys = append(keys, ap.S3Key)
+		keys = append(keys, ap.ObjectKey)
 	}
 	return keys
 }

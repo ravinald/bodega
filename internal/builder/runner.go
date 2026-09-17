@@ -426,13 +426,13 @@ type StageStatus struct {
 	Packaged bool
 }
 
-// ArtifactPath pairs a local filesystem path with its target S3 object key.
+// ArtifactPath pairs a local filesystem path with its target object key.
 // Used by the upload and sync commands to resolve per-entry upload targets.
 type ArtifactPath struct {
 	// Local is the absolute path on disk.
 	Local string
-	// S3Key is the key within the bucket (no leading slash).
-	S3Key string
+	// ObjectKey is the key within the backend's namespace (no leading slash).
+	ObjectKey string
 	// Package and Version name the manifest entry this artifact belongs to.
 	// The uploader records placement against that entry, so an artifact with
 	// no entry — a generated index, a packument — leaves both empty and is

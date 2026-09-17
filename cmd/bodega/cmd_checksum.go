@@ -138,7 +138,7 @@ archive's bytes under bodega's own signature.`,
 				found := false
 				for _, cs := range checksums {
 					if cs.PkgVersion == version {
-						if err := db.ClearChecksum(ctx, cs.S3Key); err != nil {
+						if err := db.ClearChecksum(ctx, cs.ObjectKey); err != nil {
 							return err
 						}
 						fmt.Fprintf(cmd.OutOrStdout(), "Cleared checksum for %s/%s@%s; the next fetch recomputes it.\n", pkgType, pkgName, version)

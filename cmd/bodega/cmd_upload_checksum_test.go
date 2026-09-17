@@ -152,8 +152,8 @@ func TestUploadCascadePinsAFirstFetch(t *testing.T) {
 		t.Fatalf("the upload cascade recorded %d checksum rows, want 1\n%s", len(rows), out)
 	}
 	want := manifest.BinaryKey("hello-binary", "1.0.0", "hello-binary")
-	if rows[0].S3Key != want {
-		t.Errorf("row keyed on %q, not the object key %q the proxy verifies against", rows[0].S3Key, want)
+	if rows[0].ObjectKey != want {
+		t.Errorf("row keyed on %q, not the object key %q the proxy verifies against", rows[0].ObjectKey, want)
 	}
 	if rows[0].Value != builder.ComputeBytesSHA256(body) {
 		t.Errorf("row holds %q, want the digest of the bytes the fetch downloaded", rows[0].Value)
@@ -196,8 +196,8 @@ func TestUploadCascadePinsDirectAptAtPackageTime(t *testing.T) {
 		t.Fatalf("the upload cascade recorded %d checksum rows for apt, want 1\n%s", len(rows), out)
 	}
 	want := manifest.AptKey("pool/main/h/hello-upload/" + debName)
-	if rows[0].S3Key != want {
-		t.Errorf("row keyed on %q, want the pool key %q", rows[0].S3Key, want)
+	if rows[0].ObjectKey != want {
+		t.Errorf("row keyed on %q, want the pool key %q", rows[0].ObjectKey, want)
 	}
 	if rows[0].PkgVersion != "1.0" {
 		t.Errorf("row is %+v, want version 1.0", rows[0])

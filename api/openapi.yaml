@@ -1006,6 +1006,11 @@ components:
             reading this endpoint acts on whether the objects are there and on
             which backend failed, and the same name may be backed by a local
             directory on one install and a bucket on the next.
+
+            This array was `s3_entries` and its rows carried `s3_key` and
+            `in_s3` through 0.1.0. Both named a driver for objects a `local`
+            install keeps on disk, and neither is emitted now: read `key` and
+            `present`, and `backend` for which store answered.
           items:
             type: object
             required: [type, name, key, present, backend]
