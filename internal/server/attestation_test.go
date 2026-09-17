@@ -106,7 +106,7 @@ func (r attestationResolver) ByName(name string) (storage.ObjectStore, error) {
 	return r.def, nil
 }
 
-func (r attestationResolver) Placement(string, string) storage.Decision {
+func (r attestationResolver) Placement(string, string, []string) storage.Decision {
 	return storage.Decision{Name: storage.DefaultName}
 }
 

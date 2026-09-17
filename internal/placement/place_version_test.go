@@ -169,3 +169,52 @@ func TestOnlySkipsTheDirectoryPlacedType(t *testing.T) {
 		t.Errorf("pypi was skipped silently; output was %q", out.String())
 	}
 }
+
+// TestGroupPlacesTheNextWriteAndIsRecorded is the level reaching the write
+// path. A group that resolved on 'pkg storage' and not at the upload would be
+// a report of a rule nothing acts on, which is the shape this layer keeps
+// finding.
+func TestGroupPlacesTheNextWriteAndIsRecorded(t *testing.T) {
+	cfg := &config.Config{
+		StorageBackend: "local",
+		StoragePath:    t.TempDir(),
+		StorageBackends: map[string]config.StorageSpec{
+			"bulk":    {Driver: "local", Path: t.TempDir()},
+			"archive": {Driver: "local", Path: t.TempDir()},
+		},
+		StorageByType:  map[string]string{manifest.TypeBinary: "archive"},
+		StorageByGroup: map[string]string{"mirror-set": "bulk"},
+	}
+	stores, err := storage.NewResolver(t.Context(), cfg)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	store := manifest.NewLocalStore(t.TempDir())
+	if err := store.AddVersion(t.Context(), manifest.TypeBinary, "awscli-v2", manifest.VersionEntry{
+		Version: "2.15.0",
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+	pm, err := store.GetPackage(t.Context(), manifest.TypeBinary, "awscli-v2")
+	if err != nil || pm == nil {
+		t.Fatalf("GetPackage: %v", err)
+	}
+	pm.StorageGroups = []string{"mirror-set"}
+	if err := store.SavePackage(t.Context(), pm); err != nil {
+		t.Fatalf("SavePackage: %v", err)
+	}
+
+	pl := NewWith(stores, store, io.Discard, false)
+	st, err := pl.ForVersion(t.Context(), manifest.TypeBinary, "awscli-v2", "2.15.0", "binaries/awscli-v2/2.15.0/awscli")
+	if err != nil {
+		t.Fatalf("ForVersion: %v", err)
+	}
+	if st == nil {
+		t.Fatal("ForVersion returned no store")
+	}
+	// The group beat storage_by_type.binary, and the write recorded the name
+	// it chose — which is what keeps the read path off the hierarchy.
+	if got := recordedStorage(t, store); got != "bulk" {
+		t.Errorf("recorded storage = %q, want bulk from the group rule", got)
+	}
+}

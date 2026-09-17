@@ -162,7 +162,8 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 		"storage_backends": map[string]config.StorageSpec{
 			"bulk": {Driver: "local", Path: "/mnt/bulk", Prefix: "cold/"},
 		},
-		"storage_by_type": map[string]string{"apt": "bulk"},
+		"storage_by_type":  map[string]string{"apt": "bulk"},
+		"storage_by_group": map[string]string{"mirror-set": "bulk"},
 		// git_upstreams and binary_upstreams keys and values are both
 		// validated, and an empty mode is defaulted by Load, so the round trip
 		// only measures Save when the filled value is already the shape Load

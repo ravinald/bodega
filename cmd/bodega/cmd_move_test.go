@@ -55,7 +55,7 @@ func (r *testResolver) ByName(name string) (storage.ObjectStore, error) {
 	return nil, fmt.Errorf("unknown storage backend %q", name)
 }
 
-func (r *testResolver) Placement(string, string) storage.Decision {
+func (r *testResolver) Placement(string, string, []string) storage.Decision {
 	return storage.Decision{Name: storage.DefaultName}
 }
 

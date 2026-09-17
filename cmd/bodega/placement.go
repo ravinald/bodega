@@ -30,12 +30,16 @@ func newPlacer(ctx context.Context, cfg *config.Config, store *manifest.Store, o
 
 func directoryPlaced(typ string) bool { return placement.DirectoryPlaced(typ) }
 
-func writePlacement(stores storage.Resolver, typ, policy string) storage.Decision {
-	return placement.WritePlacement(stores, typ, policy)
+func writePlacement(stores storage.Resolver, typ, policy string, groups []string) storage.Decision {
+	return placement.WritePlacement(stores, typ, policy, groups)
 }
 
 func storagePolicyWarning(typ, policy string) string {
 	return placement.StoragePolicyWarning(typ, policy)
+}
+
+func storageGroupWarning(typ, group string) string {
+	return placement.StorageGroupWarning(typ, group)
 }
 
 func noPerPackagePlacement(typ string) string { return placement.NoPerPackagePlacement(typ) }

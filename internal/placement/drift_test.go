@@ -19,7 +19,7 @@ type resolveOnly struct {
 	byType map[string]string
 }
 
-func (r *resolveOnly) Placement(typ, policy string) storage.Decision {
+func (r *resolveOnly) Placement(typ, policy string, groups []string) storage.Decision {
 	if policy != "" {
 		return storage.Decision{Name: policy, Level: storage.LevelPackage}
 	}
@@ -243,5 +243,83 @@ func TestDriftOverARealResolverAgreesWithWritePlacement(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].Rule != "bulk" || rows[0].On != storage.DefaultName {
 		t.Fatalf("rows = %+v, want one row default -> bulk", rows)
+	}
+}
+
+// groupResolver is a real resolver with both placement maps populated.
+func groupResolver(t *testing.T, byType, byGroup map[string]string) storage.Resolver {
+	t.Helper()
+	cfg := &config.Config{
+		StorageBackend: "local",
+		StoragePath:    t.TempDir(),
+		StorageBackends: map[string]config.StorageSpec{
+			"bulk": {Driver: "local", Path: t.TempDir()},
+			"cold": {Driver: "local", Path: t.TempDir()},
+		},
+		StorageByType:  byType,
+		StorageByGroup: byGroup,
+	}
+	stores, err := storage.NewResolver(t.Context(), cfg)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	return stores
+}
+
+// TestWritePlacementDropsTheGroupForPypi is requirement 4. A group holds
+// packages across types, so honoring it for pypi would place one package's
+// wheels apart from the tree the PEP 503 index lists. Dropped, and said out
+// loud: a group reported as winning a level no upload reaches is the bug the
+// IgnoredPolicy field was added for.
+func TestWritePlacementDropsTheGroupForPypi(t *testing.T) {
+	stores := groupResolver(t,
+		map[string]string{manifest.TypePypi: "bulk"},
+		map[string]string{"mirror-set": "cold"})
+
+	d := WritePlacement(stores, manifest.TypePypi, "", []string{"mirror-set"})
+	if d.Name != "bulk" || d.Level != storage.LevelType {
+		t.Errorf("WritePlacement(pypi) = %+v, want bulk at LevelType", d)
+	}
+	if d.IgnoredGroup != "mirror-set" {
+		t.Errorf("IgnoredGroup = %q, want the group the write path drops", d.IgnoredGroup)
+	}
+	if !strings.Contains(d.Reason(manifest.TypePypi), "storage_by_group.mirror-set is not consulted") {
+		t.Errorf("Reason() = %q, says nothing about the dropped group", d.Reason(manifest.TypePypi))
+	}
+
+	// A membership no storage_by_group key answers would have decided nothing
+	// on any type, so reporting it as dropped would be noise.
+	if d := WritePlacement(stores, manifest.TypePypi, "", []string{"unmapped"}); d.IgnoredGroup != "" {
+		t.Errorf("IgnoredGroup = %q for a group with no rule, want empty", d.IgnoredGroup)
+	}
+	if d := WritePlacement(stores, manifest.TypeApt, "", []string{"mirror-set"}); d.Name != "cold" || d.IgnoredGroup != "" {
+		t.Errorf("WritePlacement(apt) = %+v, want cold decided by the group and nothing dropped", d)
+	}
+}
+
+// TestDriftCarriesTheDroppedGroup keeps the two report surfaces honest with
+// each other: a drifted pypi package whose operator joined it to a group has
+// two things wrong with it, and fixing one leaves the other.
+func TestDriftCarriesTheDroppedGroup(t *testing.T) {
+	stores := groupResolver(t,
+		map[string]string{manifest.TypePypi: "bulk"},
+		map[string]string{"mirror-set": "cold"})
+	store := driftStore(t, [4]string{manifest.TypePypi, "boto3", "1.26.0", ""})
+
+	pm, err := store.GetPackage(t.Context(), manifest.TypePypi, "boto3")
+	if err != nil || pm == nil {
+		t.Fatalf("GetPackage: %v", err)
+	}
+	pm.StorageGroups = []string{"mirror-set"}
+	if err := store.SavePackage(t.Context(), pm); err != nil {
+		t.Fatalf("SavePackage: %v", err)
+	}
+
+	rows, err := Drift(t.Context(), stores, store, []string{manifest.TypePypi})
+	if err != nil {
+		t.Fatalf("Drift: %v", err)
+	}
+	if len(rows) != 1 || rows[0].IgnoredGroup != "mirror-set" {
+		t.Fatalf("rows = %+v, want one row naming the dropped group", rows)
 	}
 }

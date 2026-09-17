@@ -47,6 +47,11 @@ type DriftRow struct {
 	// row because a drifted pypi package whose operator set a storage_policy
 	// has two things wrong with it and fixing one leaves the other.
 	IgnoredPolicy string
+
+	// IgnoredGroup is a storage group that would have decided this package's
+	// placement on any other type, dropped for the same directory-placed
+	// types and carried for the same reason.
+	IgnoredGroup string
 }
 
 // DirectoryPlaced reports whether this row's type moves as a whole directory.
@@ -94,7 +99,7 @@ func Drift(ctx context.Context, stores storage.Resolver, store *manifest.Store, 
 			if pm == nil {
 				continue
 			}
-			d := WritePlacement(stores, typ, pm.StoragePolicy)
+			d := WritePlacement(stores, typ, pm.StoragePolicy, pm.StorageGroups)
 			for _, ve := range pm.Versions {
 				on := EffectiveStorage(ve.Storage)
 				if on == d.Name {
@@ -108,6 +113,7 @@ func Drift(ctx context.Context, stores storage.Resolver, store *manifest.Store, 
 					Rule:          d.Name,
 					Frozen:        ve.Frozen,
 					IgnoredPolicy: d.IgnoredPolicy,
+					IgnoredGroup:  d.IgnoredGroup,
 				})
 			}
 		}

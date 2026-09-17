@@ -39,7 +39,7 @@ func (r *multiResolver) ByName(name string) (storage.ObjectStore, error) {
 	return nil, errors.New("unknown storage backend " + name)
 }
 
-func (r *multiResolver) Placement(typ, _ string) storage.Decision {
+func (r *multiResolver) Placement(typ, _ string, _ []string) storage.Decision {
 	if name := r.byType[typ]; name != "" {
 		return storage.Decision{Name: name}
 	}
@@ -47,7 +47,7 @@ func (r *multiResolver) Placement(typ, _ string) storage.Decision {
 }
 
 func (r *multiResolver) ForType(typ string) storage.ObjectStore {
-	store, err := r.ByName(r.Placement(typ, "").Name)
+	store, err := r.ByName(r.Placement(typ, "", nil).Name)
 	if err != nil {
 		return r.Default()
 	}

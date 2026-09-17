@@ -360,3 +360,97 @@ func TestOSVCheckerCarriesTheServedAptSuites(t *testing.T) {
 		t.Errorf("ServedAptSuites = %v, want [jammy]", got)
 	}
 }
+
+// TestAdmitRejectsAnUnknownStorageGroup holds the group field to the same bar
+// as the backend names beside it. A group nothing defines places nothing, so
+// the package falls through to its type rule and the operator learns of the
+// typo at an upload with no connection back to the edit.
+func TestAdmitRejectsAnUnknownStorageGroup(t *testing.T) {
+	cfg := &config.Config{
+		StorageBackends: map[string]config.StorageSpec{"cold": {Driver: "local"}},
+		StorageByGroup:  map[string]string{"mirror-set": "cold"},
+	}
+
+	pm := aptPkg("hello", "2.10")
+	pm.StorageGroups = []string{"mirrorset"}
+	res := Admit(t.Context(), nil, nil, cfg, pm, "")
+	if res.OK() {
+		t.Fatal("admitted a package in a group storage_by_group does not define")
+	}
+	if !strings.Contains(res.Reason, "mirror-set") {
+		t.Errorf("reason %q does not list the groups that do exist", res.Reason)
+	}
+
+	pm.StorageGroups = []string{"mirror-set"}
+	if res := Admit(t.Context(), nil, nil, cfg, pm, ""); !res.OK() {
+		t.Fatalf("a defined group was refused: %s", res.Reason)
+	}
+
+	pm.StorageGroups = []string{""}
+	if res := Admit(t.Context(), nil, nil, cfg, pm, ""); res.OK() {
+		t.Fatal("admitted an empty group name")
+	}
+}
+
+// TestAdmitRefusesAmbiguousGroupMembership is the answer to "a package in two
+// groups". Resolution stays deterministic either way, but a write path picking
+// one of two backends an operator meant differently is a coin toss they cannot
+// read off the manifest, so the overlap is refused where it is created.
+func TestAdmitRefusesAmbiguousGroupMembership(t *testing.T) {
+	cfg := &config.Config{
+		StorageBackends: map[string]config.StorageSpec{
+			"cold": {Driver: "local"},
+			"bulk": {Driver: "local"},
+		},
+		StorageByGroup: map[string]string{"alpha": "bulk", "omega": "cold", "also-bulk": "bulk"},
+	}
+
+	pm := aptPkg("hello", "2.10")
+	pm.StorageGroups = []string{"omega", "alpha"}
+	res := Admit(t.Context(), nil, nil, cfg, pm, "")
+	if res.OK() {
+		t.Fatal("admitted a package whose groups resolve to two backends")
+	}
+	// The winner is named because a config that already holds one has to be
+	// describable rather than mysterious.
+	if !strings.Contains(res.Reason, `"alpha"`) {
+		t.Errorf("reason %q does not name the group that would win", res.Reason)
+	}
+
+	// Two groups agreeing on one backend is not ambiguous. An operator groups
+	// by more than one axis and the sets overlap; refusing that would make the
+	// level unusable for the case it exists for.
+	pm.StorageGroups = []string{"alpha", "also-bulk"}
+	if res := Admit(t.Context(), nil, nil, cfg, pm, ""); !res.OK() {
+		t.Fatalf("two groups naming one backend were refused: %s", res.Reason)
+	}
+}
+
+// TestAdmitWarnsAboutAGroupOnADirectoryPlacedType mirrors the storage_policy
+// warning: the membership is inert rather than wrong, so it is recorded and
+// reported instead of rejected.
+func TestAdmitWarnsAboutAGroupOnADirectoryPlacedType(t *testing.T) {
+	cfg := &config.Config{
+		StorageBackends: map[string]config.StorageSpec{"cold": {Driver: "local"}},
+		StorageByGroup:  map[string]string{"mirror-set": "cold"},
+	}
+
+	pm := &manifest.PackageManifest{
+		ConfigVersion: manifest.CurrentConfigVersion,
+		Name:          "requests", Type: manifest.TypePypi,
+		StorageGroups: []string{"mirror-set"},
+		Versions:      []manifest.VersionEntry{{Version: "2.31.0"}},
+	}
+	res := Admit(t.Context(), nil, nil, cfg, pm, "")
+	if !res.OK() {
+		t.Fatalf("an inert group membership was treated as an error: %s", res.Reason)
+	}
+	if len(res.Warnings) == 0 || !strings.Contains(strings.Join(res.Warnings, " "), "mirror-set") {
+		t.Fatalf("warnings %v say nothing about the group that will not be consulted", res.Warnings)
+	}
+
+	pm.Type = manifest.TypeApt
+	if res := Admit(t.Context(), nil, nil, cfg, pm, ""); len(res.Warnings) != 0 {
+		t.Errorf("apt places per package, so its group is honored and needs no warning: %v", res.Warnings)
+	}
+}

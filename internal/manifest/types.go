@@ -92,6 +92,24 @@ type PackageManifest struct {
 	// type rule decides.
 	StoragePolicy string `json:"storage_policy,omitempty"`
 
+	// StorageGroups names the storage groups this package belongs to. A group
+	// is resolved to a backend by storage_by_group in the config, and the
+	// group rule sits between the type rule and StoragePolicy.
+	//
+	// Present tense, and the third spelling on purpose: StoragePolicy is
+	// future tense (put the next version here) and VersionEntry.Storage is
+	// past tense (this version's bytes are here), while this says what the
+	// package *is a member of* and names no backend at all. Moving a group's
+	// packages is an edit to storage_by_group, not to any manifest, which is
+	// the whole reason the level exists. Setting this moves nothing.
+	//
+	// A list rather than one name because an operator groups by more than one
+	// axis — an ecosystem's mirror set and a customer's set — and the two
+	// overlap. Resolution is by group name in sort order, first with a rule
+	// wins, so it never depends on the order this list happens to be written
+	// in; admit refuses a membership whose groups resolve to two backends.
+	StorageGroups []string `json:"storage_groups,omitempty"`
+
 	// Versions is the ordered list of version entries for this package.
 	// Multiple versions may coexist; callers select by VersionEntry.Version.
 	Versions []VersionEntry `json:"versions"`

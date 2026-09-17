@@ -188,6 +188,19 @@ type Config struct {
 	// already written lives: that is the name recorded on the version entry.
 	StorageByType map[string]string `json:"storage_by_type,omitempty"`
 
+	// StorageByGroup maps a storage *group* name to a backend name. A package
+	// joins a group with storage_groups in its manifest, and the group rule
+	// sits between the type rule and the package's own storage_policy.
+	//
+	// It exists because the two neighboring levels are the only ones there
+	// were, and forty packages that belong together fit neither: a type rule
+	// catches every package of the type, and a per-package policy is forty
+	// edits that drift apart the first time one is missed. The mapping lives
+	// here rather than in the manifests so that moving the whole set is one
+	// edit, and membership lives in the manifest so that a package declares
+	// what it belongs to next to everything else it declares.
+	StorageByGroup map[string]string `json:"storage_by_group,omitempty"`
+
 	// GitUpstreams maps a namespace under /git/ onto an upstream forge. It
 	// exists because one flat gomod_upstream-style key cannot express two
 	// forges at once, and a corporate GitLab and github.com are the same
@@ -1045,6 +1058,20 @@ func (c *Config) validateStorage() error {
 		}
 		if _, ok := c.StorageBackends[name]; !ok {
 			return fmt.Errorf("storage_by_type[%q] names undefined storage backend %q (defined: %s)", typ, name, c.definedStorageNames())
+		}
+	}
+
+	for group, name := range c.StorageByGroup {
+		switch {
+		case group == "":
+			return fmt.Errorf("invalid storage_by_group key: empty group name")
+		case name == "":
+			return fmt.Errorf("storage_by_group[%q]: empty backend name", group)
+		case name == DefaultStorageName:
+			continue
+		}
+		if _, ok := c.StorageBackends[name]; !ok {
+			return fmt.Errorf("storage_by_group[%q] names undefined storage backend %q (defined: %s)", group, name, c.definedStorageNames())
 		}
 	}
 	return nil

@@ -45,7 +45,7 @@ func TestSingleResolverUnknownNameErrors(t *testing.T) {
 func TestSingleResolverPlacementIsAlwaysDefault(t *testing.T) {
 	r := NewSingle(NewMemory())
 	for _, typ := range []string{"apt", "pypi", ""} {
-		if got := r.Placement(typ, ""); got.Name != DefaultName || got.Level != LevelDefault {
+		if got := r.Placement(typ, "", nil); got.Name != DefaultName || got.Level != LevelDefault {
 			t.Fatalf("Placement(%q) = %+v, want %q at LevelDefault", typ, got, DefaultName)
 		}
 	}

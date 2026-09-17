@@ -125,6 +125,16 @@ func validate(cfg *config.Config, pm *manifest.PackageManifest, res *Result) err
 	if w := StoragePolicyWarning(pm.Type, pm.StoragePolicy); w != "" {
 		res.Warnings = append(res.Warnings, w)
 	}
+	// A group naming nothing is refused on the same grounds as a backend
+	// naming nothing: it changes no placement, so the package silently falls
+	// through to its type rule and the operator finds out at an upload with no
+	// obvious connection back to the edit that typed it.
+	if err := CheckGroupNames(cfg, pm.StorageGroups); err != nil {
+		return fmt.Errorf("storage_groups: %w", err)
+	}
+	if w := StorageGroupWarning(pm.Type, GroupRule(cfg, pm.StorageGroups)); w != "" {
+		res.Warnings = append(res.Warnings, w)
+	}
 	// A hand-edited storage name that matches no configured backend makes the
 	// artifact unreadable: resolution never falls back to another backend, so
 	// the entry would 502 rather than serve from somewhere plausible.
@@ -315,6 +325,94 @@ func CheckBackendName(cfg *config.Config, name string) error {
 	return nil
 }
 
+// CheckGroupNames rejects a storage_groups list this install cannot act on: an
+// empty entry, a group no storage_by_group key defines, or a membership whose
+// groups resolve to two different backends.
+//
+// The last is the answer to "what does a package in two groups resolve to".
+// GroupRule still answers deterministically — first group by name with a rule
+// — so nothing downstream has to guess, but a write path answering one of two
+// backends an operator meant differently is a coin toss they cannot read off
+// the manifest. Refusing at the edit that creates the overlap is where they
+// can still fix it, and the message names the winner so a config that already
+// has one is describable rather than mysterious.
+func CheckGroupNames(cfg *config.Config, groups []string) error {
+	if len(groups) == 0 {
+		return nil
+	}
+	for _, g := range groups {
+		if strings.TrimSpace(g) == "" {
+			return fmt.Errorf("empty group name")
+		}
+	}
+	if cfg == nil {
+		return nil
+	}
+	for _, g := range groups {
+		if _, ok := cfg.StorageByGroup[g]; !ok {
+			return fmt.Errorf("unknown storage group %q (defined in storage_by_group: %s)", g, definedGroupNames(cfg))
+		}
+	}
+
+	backends := map[string][]string{}
+	for _, g := range groups {
+		name := cfg.StorageByGroup[g]
+		backends[name] = append(backends[name], g)
+	}
+	if len(backends) < 2 {
+		return nil
+	}
+	names := make([]string, 0, len(backends))
+	for name := range backends {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var parts []string
+	for _, name := range names {
+		gs := backends[name]
+		sort.Strings(gs)
+		parts = append(parts, fmt.Sprintf("%s -> %q", strings.Join(gs, ", "), name))
+	}
+	return fmt.Errorf("groups resolve to more than one backend (%s); a package is written to one backend, and %q would win by group name — "+
+		"drop a group, or point them at the same backend in storage_by_group",
+		strings.Join(parts, "; "), GroupRule(cfg, groups))
+}
+
+// GroupRule returns the group that decides placement for this membership: the
+// first by name that storage_by_group defines. Empty when none does.
+//
+// It answers with the group rather than the backend because every caller here
+// reports to an operator, whose edit is to storage_by_group or to
+// storage_groups. It mirrors the resolver's rule deliberately; the resolver
+// cannot be called instead, since it takes a built storage connection and
+// these checks run before one exists.
+func GroupRule(cfg *config.Config, groups []string) string {
+	if cfg == nil || len(groups) == 0 || len(cfg.StorageByGroup) == 0 {
+		return ""
+	}
+	sorted := append([]string(nil), groups...)
+	sort.Strings(sorted)
+	for _, g := range sorted {
+		if cfg.StorageByGroup[g] != "" {
+			return g
+		}
+	}
+	return ""
+}
+
+// definedGroupNames lists the group names an operator may use, sorted.
+func definedGroupNames(cfg *config.Config) string {
+	if len(cfg.StorageByGroup) == 0 {
+		return "none"
+	}
+	names := make([]string, 0, len(cfg.StorageByGroup))
+	for name := range cfg.StorageByGroup {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
+}
+
 func versionLabel(ve manifest.VersionEntry) string {
 	switch {
 	case ve.Version != "":
@@ -355,6 +453,19 @@ func StoragePolicyWarning(typ, policy string) string {
 	return fmt.Sprintf("warning: storage_policy %q has no effect for %s: %s. "+
 		"Set storage_by_type.%s to place the whole type; 'bodega pkg move' refuses %s for the same reason.",
 		policy, typ, NoPerPackagePlacement(typ), typ, typ)
+}
+
+// StorageGroupWarning describes a group rule the write path will ignore, on
+// the same terms and for the same reason as StoragePolicyWarning. group is the
+// group that would have decided; empty means none would, so there is nothing
+// to warn about.
+func StorageGroupWarning(typ, group string) string {
+	if group == "" || !DirectoryPlaced(typ) {
+		return ""
+	}
+	return fmt.Sprintf("warning: storage group %q has no effect for %s: %s. "+
+		"Set storage_by_type.%s to place the whole type; 'bodega pkg move' refuses %s for the same reason.",
+		group, typ, NoPerPackagePlacement(typ), typ, typ)
 }
 
 // definedBackendNames lists the usable backend names for an error message,
