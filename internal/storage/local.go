@@ -197,6 +197,13 @@ func (l *Local) List(_ context.Context, prefix string) ([]string, error) {
 			return err
 		}
 		if d.IsDir() {
+			// A staging enclosure holds nothing this store would return and
+			// is readable by the writer alone, so a walk by any other account
+			// is refused entry to it. Descending would make one process's
+			// in-flight write another's listing error.
+			if strings.HasPrefix(d.Name(), tmpPrefix) {
+				return fs.SkipDir
+			}
 			return nil
 		}
 		if strings.HasPrefix(d.Name(), tmpPrefix) {

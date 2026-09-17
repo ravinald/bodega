@@ -1047,3 +1047,42 @@ func TestLocalPublishHidesTheStagingFileAcrossTheOwnershipChange(t *testing.T) {
 		})
 	}
 }
+
+// A staging enclosure is readable by the writer alone, so every other account
+// walking the same root is refused entry to it. A listing that descended would
+// turn one process's in-flight publication into another process's error, and
+// the enclosure holds nothing a listing would have returned anyway.
+//
+// Mode 0000 is what that refusal looks like from inside the test, without a
+// second identity to run the walk as.
+func TestLocalListSkipsAStagingEnclosureItCannotEnter(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root traverses a directory at mode 0000, so the refusal under test cannot be staged")
+	}
+	root := t.TempDir()
+	l := NewLocal(root)
+	const key = "packages/npm/real.tgz"
+	if err := l.Put(t.Context(), key, []byte("an object a listing must still return")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	enclosure := filepath.Join(root, "packages", "npm", tmpPrefix+"ENCLOSURE")
+	if err := os.Mkdir(enclosure, 0o700); err != nil {
+		t.Fatalf("mkdir %s: %v", enclosure, err)
+	}
+	if err := os.WriteFile(filepath.Join(enclosure, tmpPrefix+"staged"), []byte("a body mid-write"), 0o600); err != nil {
+		t.Fatalf("write the staging file: %v", err)
+	}
+	if err := os.Chmod(enclosure, 0); err != nil {
+		t.Fatalf("close %s to entry: %v", enclosure, err)
+	}
+	// t.TempDir's own cleanup cannot remove a directory it may not enter.
+	t.Cleanup(func() { _ = os.Chmod(enclosure, 0o700) })
+
+	keys, err := l.List(t.Context(), "packages/")
+	if err != nil {
+		t.Fatalf("List while a publication holds an enclosure: %v", err)
+	}
+	if len(keys) != 1 || keys[0] != key {
+		t.Errorf("List = %v, want exactly [%s]", keys, key)
+	}
+}
