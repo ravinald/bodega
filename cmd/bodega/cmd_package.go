@@ -8,6 +8,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 )
 
 func newPackageCmd(gf *globalFlags) *cobra.Command {
@@ -68,7 +69,11 @@ When a name is given after the type, only that entry is packaged.`,
 				defer auditDB.Close()
 			}
 
-			bcfg := builder.NewConfig(cfg)
+			// The cargo arm cascades into ensureFetchedCargo, so this command
+			// reaches a fetcher and needs the allow-list the fetch commands
+			// carry; without it a rule that blocks a crate under
+			// `bodega build fetch` did not block it here.
+			bcfg := builder.NewConfig(cfg, policy.CheckerFor(auditDB))
 			// The package stage records EventPackage and pins the apt digest,
 			// and both went nowhere while this was nil: apt's _pool_path is
 			// written here rather than at fetch, so the pool key a checksum row

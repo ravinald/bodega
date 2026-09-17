@@ -30,7 +30,7 @@ func TestStampedEntryCarriesTheBuildVersion(t *testing.T) {
 		t.Fatalf("AddVersion: %v", err)
 	}
 
-	NewConfig(&config.Config{BuildRoot: root, ManifestDir: root}).
+	NewConfig(&config.Config{BuildRoot: root, ManifestDir: root}, nil).
 		StampBinaryEntry(store, "hello", ve)
 
 	pm, err := store.GetPackage(t.Context(), manifest.TypeBinary, "hello")
@@ -60,7 +60,7 @@ func TestNewConfigDefaultsTheVersion(t *testing.T) {
 	if Version != "unknown" {
 		t.Fatalf("package default Version = %q, want \"unknown\"", Version)
 	}
-	if got := NewConfig(&config.Config{}).BodegaVersion; got != "unknown" {
+	if got := NewConfig(&config.Config{}, nil).BodegaVersion; got != "unknown" {
 		t.Errorf("NewConfig().BodegaVersion = %q, want \"unknown\"", got)
 	}
 }

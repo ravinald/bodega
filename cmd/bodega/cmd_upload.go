@@ -54,12 +54,7 @@ If no types are given all of them are uploaded.`,
 				defer auditDB.Close()
 			}
 
-			var policyChecker *policy.Checker
-			if auditDB != nil {
-				policyChecker = policy.NewChecker(auditDB)
-			}
-
-			bcfg := builder.NewConfig(cfg)
+			bcfg := builder.NewConfig(cfg, policy.CheckerFor(auditDB))
 			// upload is the only advertised command that reaches a hosted
 			// artifact without naming a stage: ensureUploadable runs fetch,
 			// build and package under this config. Left nil, every digest
@@ -67,7 +62,6 @@ If no types are given all of them are uploaded.`,
 			// first install driven entirely by `build upload` uploads
 			// artifacts nothing is pinned against.
 			bcfg.AuditDB = auditDB
-			bcfg.Policy = policyChecker
 
 			ctx := backgroundCtx()
 			pl, err := newPlacer(ctx, cfg, store, os.Stdout, replacePlacement)

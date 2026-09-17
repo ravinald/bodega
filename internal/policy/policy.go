@@ -76,6 +76,17 @@ type Checker struct {
 	loaded map[string]time.Time
 }
 
+// CheckerFor returns a Checker reading rules from db, or nil when db is nil.
+// The nil has to be dropped before it becomes a Store: a nil *audit.DB wrapped
+// in the interface is a non-nil Store whose every rule load panics, so the
+// callers that pass an optional audit database go through here.
+func CheckerFor(db *audit.DB) *Checker {
+	if db == nil {
+		return nil
+	}
+	return NewChecker(db)
+}
+
 // NewChecker returns a Checker backed by store.
 func NewChecker(store Store) *Checker {
 	return &Checker{

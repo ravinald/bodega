@@ -26,7 +26,7 @@ func TestEnforcePolicyAllowsWhenMatch(t *testing.T) {
 	store := staticStore{rules: map[string][]policy.Rule{
 		manifest.TypePypi: {audit.PolicyInfo{RegistryType: manifest.TypePypi, RuleKind: policy.KindPackage, Pattern: "django"}},
 	}}
-	c := &Config{Policy: policy.NewChecker(store)}
+	c := &Config{policyChecker: policy.NewChecker(store)}
 	if err := c.EnforcePolicy(context.Background(), manifest.TypePypi, "django", "4.2", ""); err != nil {
 		t.Errorf("django should match: %v", err)
 	}
@@ -36,7 +36,7 @@ func TestEnforcePolicyBlocksWhenNoMatch(t *testing.T) {
 	store := staticStore{rules: map[string][]policy.Rule{
 		manifest.TypePypi: {audit.PolicyInfo{RegistryType: manifest.TypePypi, RuleKind: policy.KindPackage, Pattern: "django"}},
 	}}
-	c := &Config{Policy: policy.NewChecker(store)}
+	c := &Config{policyChecker: policy.NewChecker(store)}
 	err := c.EnforcePolicy(context.Background(), manifest.TypePypi, "requests", "2.31", "")
 	if !policy.IsViolation(err) {
 		t.Fatalf("requests should be blocked, got %v", err)
