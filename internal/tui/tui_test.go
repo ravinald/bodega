@@ -15,6 +15,7 @@ import (
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/inventory"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 // --- splitArgs ---
@@ -143,8 +144,8 @@ func TestBuildTree(t *testing.T) {
 	if len(aptPkg.Children) != 1 {
 		t.Fatalf("apt pkg-a versions = %d, want 1", len(aptPkg.Children))
 	}
-	if !aptPkg.Children[0].InS3 {
-		t.Error("pkg-a@1.0: InS3 should be true")
+	if !aptPkg.Children[0].Stored {
+		t.Error("pkg-a@1.0: Stored should be true")
 	}
 
 	// git group
@@ -156,8 +157,8 @@ func TestBuildTree(t *testing.T) {
 	if len(gitPkg.Children) != 1 {
 		t.Fatalf("git repo-b versions = %d, want 1", len(gitPkg.Children))
 	}
-	if gitPkg.Children[0].InS3 {
-		t.Error("repo-b@main: InS3 should be false")
+	if gitPkg.Children[0].Stored {
+		t.Error("repo-b@main: Stored should be false")
 	}
 
 	// pypi group
@@ -169,8 +170,8 @@ func TestBuildTree(t *testing.T) {
 	if len(pypiPkg.Children) != 1 {
 		t.Fatalf("pypi pkg versions = %d, want 1", len(pypiPkg.Children))
 	}
-	if !pypiPkg.Children[0].InS3 {
-		t.Error("pypi pkg: InS3 should be true")
+	if !pypiPkg.Children[0].Stored {
+		t.Error("pypi pkg: Stored should be true")
 	}
 }
 
@@ -562,7 +563,7 @@ func TestDetailsViewAptEntry(t *testing.T) {
 	d.SetNode(&TreeNode{
 		EntryType: manifest.TypeApt,
 		Name:      "pkg-a",
-		InS3:      true,
+		Stored:    true,
 	})
 	v := d.View()
 	if v == "" {
@@ -601,7 +602,7 @@ func TestDetailsRawJSONScoping(t *testing.T) {
 // Guards that the displayed object key matches where the uploader actually
 // writes: safe-encoded (/ → --) for scoped npm and git, and the module path
 // with its slashes intact for gomod, which is the form a Go client requests.
-func TestS3PathSafeEncoding(t *testing.T) {
+func TestObjectKeySafeEncoding(t *testing.T) {
 	store := manifest.NewLocalStore(t.TempDir())
 	ctx := t.Context()
 	_ = store.AddVersion(ctx, manifest.TypeNpm, "@bitwarden/cli", manifest.VersionEntry{Version: "2026.3.0"})
@@ -615,34 +616,34 @@ func TestS3PathSafeEncoding(t *testing.T) {
 		{"gomod keeps its slashes", manifest.TypeGomod, "github.com/aws/aws-sdk-go", "gomod/github.com/aws/aws-sdk-go/@v/v1.2.3.zip"},
 	}
 	for _, c := range cases {
-		got := s3Path(store, c.typ, c.name, "")
+		got := objectKey(store, c.typ, c.name, "")
 		if got != c.want {
 			t.Errorf("%s:\n  got:  %s\n  want: %s", c.label, got, c.want)
 		}
 	}
 	// git is already safe-encoded; just assert the result doesn't leak a raw '/'.
-	gitPath := s3Path(store, manifest.TypeGit, "netbox-community/netbox", "")
+	gitPath := objectKey(store, manifest.TypeGit, "netbox-community/netbox", "")
 	if strings.Contains(gitPath, "netbox-community/netbox") {
 		t.Errorf("git path leaked the canonical slash form: %s", gitPath)
 	}
 }
 
-// Guards that s3Path picks the VersionEntry matching the tree node's
+// Guards that objectKey picks the VersionEntry matching the tree node's
 // Version field rather than always the first one.
-func TestS3PathUsesSelectedVersion(t *testing.T) {
+func TestObjectKeyUsesSelectedVersion(t *testing.T) {
 	store := manifest.NewLocalStore(t.TempDir())
 	ctx := t.Context()
 	_ = store.AddVersion(ctx, manifest.TypeNpm, "pkg", manifest.VersionEntry{Version: "1.0.0"})
 	_ = store.AddVersion(ctx, manifest.TypeNpm, "pkg", manifest.VersionEntry{Version: "2.0.0"})
 
-	if got := s3Path(store, manifest.TypeNpm, "pkg", "2.0.0"); !strings.Contains(got, "2.0.0") || strings.Contains(got, "1.0.0") {
+	if got := objectKey(store, manifest.TypeNpm, "pkg", "2.0.0"); !strings.Contains(got, "2.0.0") || strings.Contains(got, "1.0.0") {
 		t.Errorf("want path for 2.0.0, got %q", got)
 	}
-	if got := s3Path(store, manifest.TypeNpm, "pkg", "1.0.0"); !strings.Contains(got, "1.0.0") || strings.Contains(got, "2.0.0") {
+	if got := objectKey(store, manifest.TypeNpm, "pkg", "1.0.0"); !strings.Contains(got, "1.0.0") || strings.Contains(got, "2.0.0") {
 		t.Errorf("want path for 1.0.0, got %q", got)
 	}
 	// Empty version falls back to Versions[0].
-	first := s3Path(store, manifest.TypeNpm, "pkg", "")
+	first := objectKey(store, manifest.TypeNpm, "pkg", "")
 	if !strings.Contains(first, "1.0.0") {
 		t.Errorf("empty version should fall back to first entry, got %q", first)
 	}
@@ -1929,5 +1930,55 @@ func TestCargoStanzaSurvivesANarrowPane(t *testing.T) {
 				t.Errorf("width %d: no line carries %q; retyping the pane gives invalid TOML. Pane:\n%s", width, want, pane)
 			}
 		}
+	}
+}
+
+// A local-only install has no bucket and no s3 driver, so nothing the details
+// pane prints may name one. The pane used to report "S3: uploaded" and an
+// "S3 path" over a bundle sitting on the host's own disk, which sent operators
+// looking for an upload no configuration would ever perform.
+func TestDetailsPaneNamesBackendNotS3OnLocalInstall(t *testing.T) {
+	root := t.TempDir()
+	cfg := &config.Config{
+		ManifestDir:    "manifests",
+		StorageBackend: "local",
+		StoragePath:    root,
+	}
+	stores, err := storage.NewResolver(t.Context(), cfg)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+
+	store := manifest.NewLocalStore(t.TempDir())
+	ctx := t.Context()
+	_ = store.AddVersion(ctx, manifest.TypeGit, "uuid", manifest.VersionEntry{
+		URL: "https://example.com/uuid",
+		Ref: "v1.6.0",
+	})
+
+	d := newDetailsModel(store, cfg)
+	d.stores = stores
+	d.width = 100
+	d.SetNode(&TreeNode{
+		EntryType: manifest.TypeGit,
+		Name:      "uuid",
+		Version:   "v1.6.0",
+		Stored:    true,
+		Backend:   storage.DefaultName,
+	})
+	v := d.View()
+
+	if strings.Contains(strings.ToLower(v), "s3") {
+		t.Errorf("details pane on a local install names S3:\n%s", v)
+	}
+	if !strings.Contains(v, storage.DefaultName) {
+		t.Errorf("details pane does not name the backend %q:\n%s", storage.DefaultName, v)
+	}
+	// The scheme is the assertion. It can only come from Local.Label(); a URI
+	// built from cfg.Bucket reads s3://, and a bare key has no scheme at all.
+	// The root itself is not compared: macOS resolves the temp dir through
+	// /private, and the viewport truncates the line to the pane width.
+	if !strings.Contains(v, "file://") {
+		t.Errorf("details pane does not print a file:// object URI:\n%s", v)
 	}
 }

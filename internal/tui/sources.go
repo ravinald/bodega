@@ -28,8 +28,13 @@ type TreeNode struct {
 	IsGroup bool
 	// Expanded controls whether child nodes are shown (group nodes only).
 	Expanded bool
-	// InS3 indicates whether the primary artifact is present in S3.
-	InS3 bool
+	// Stored indicates whether the primary artifact is present on the backend
+	// the entry records — which is the local filesystem on a local install.
+	Stored bool
+	// Backend names that backend, resolved through
+	// inventory.EffectiveBackend. Empty means no status row covers this node
+	// yet, which is not the same claim as storage.DefaultName.
+	Backend string
 	// Hidden mirrors the manifest entry's Hidden flag.
 	Hidden bool
 	// Frozen mirrors the manifest entry's Frozen flag.
@@ -66,14 +71,25 @@ type flatRow struct {
 }
 
 // BuildTree constructs the root-level tree nodes from the manifest store and
-// S3 statuses. Entries with the same name are grouped under an intermediate
-// package node so the tree has three levels: type > package > version.
+// the per-entry statuses. Entries with the same name are grouped under an
+// intermediate package node so the tree has three levels: type > package >
+// version.
 func BuildTree(store *manifest.Store, statuses []inventory.EntryStatus) []TreeNode {
 	ctx := context.Background()
 
-	s3map := make(map[string]bool, len(statuses))
+	statusMap := make(map[string]inventory.EntryStatus, len(statuses))
 	for _, st := range statuses {
-		s3map[st.Type+"/"+st.Name] = st.Present
+		statusMap[st.Type+"/"+st.Name] = st
+	}
+	// A node with no status row reports no backend rather than the default
+	// name: "nothing probed this yet" and "probed, and it lives on the
+	// default backend" are different answers, and the pane prints them apart.
+	statusOf := func(key string) (bool, string) {
+		st, ok := statusMap[key]
+		if !ok {
+			return false, ""
+		}
+		return st.Present, inventory.EffectiveBackend(st.Backend)
 	}
 
 	var roots []TreeNode
@@ -84,7 +100,7 @@ func BuildTree(store *manifest.Store, statuses []inventory.EntryStatus) []TreeNo
 		label     string // display-only version label (ref, version, name@*); may include suffix/decoration
 		version   string // raw version identifier — VersionEntry.Version, or Ref when Version is empty; keyed by ScopeToVersion
 		name      string // entry name for lookups
-		versioned string // VersionedName for s3map
+		versioned string // VersionedName for the status lookup
 		platform  string // "linux/amd64", "any", or ""
 		hidden    bool
 		frozen    bool
@@ -125,12 +141,14 @@ func BuildTree(store *manifest.Store, statuses []inventory.EntryStatus) []TreeNo
 				Expanded:  false,
 			}
 			for _, v := range versions {
+				stored, backend := statusOf(typeName + "/" + v.versioned)
 				pkgNode.Children = append(pkgNode.Children, TreeNode{
 					Label:     v.label + platformSuffix(v.platform),
 					EntryType: typeName,
 					Name:      v.name,
 					Version:   v.version,
-					InS3:      s3map[typeName+"/"+v.versioned],
+					Stored:    stored,
+					Backend:   backend,
 					Hidden:    v.hidden,
 					Frozen:    v.frozen,
 				})
@@ -239,12 +257,14 @@ func BuildTree(store *manifest.Store, statuses []inventory.EntryStatus) []TreeNo
 			Expanded:  false,
 		}
 		for _, v := range versions {
+			stored, backend := statusOf(manifest.TypePypi + "/wheels")
 			pkgNode.Children = append(pkgNode.Children, TreeNode{
 				Label:     v.label,
 				EntryType: manifest.TypePypi,
 				Name:      v.name,
 				Version:   v.version,
-				InS3:      s3map[manifest.TypePypi+"/wheels"],
+				Stored:    stored,
+				Backend:   backend,
 				Hidden:    v.hidden,
 				Frozen:    v.frozen,
 			})
@@ -711,7 +731,7 @@ func (m sourcesModel) View() string {
 			}
 		} else {
 			// Leaf entry row.
-			icon := statusIcon(row.node.InS3, row.node.Frozen, row.node.Hidden)
+			icon := statusIcon(row.node.Stored, row.node.Frozen, row.node.Hidden)
 			mark := " "
 			if row.node.Marked {
 				mark = "*"

@@ -293,14 +293,11 @@ func loadConfig(gf *globalFlags) (*config.Config, error) {
 	return cfg, nil
 }
 
-// usesLocalManifests reports whether manifests are read and written straight
-// from the filesystem rather than through the object store. Both the mutation
-// preflight and the store loader must answer this the same way: when they
-// disagree, a local install passes preflight and then fails asking for a
-// bucket it never configured. --local-config forces it on whatever the
-// configured backend is.
+// usesLocalManifests is the command layer's name for
+// config.Config.UsesLocalManifests. The answer lives on Config because the TUI
+// picks a manifest store too and cannot import this package.
 func usesLocalManifests(cfg *config.Config) bool {
-	return cfg.LocalConfig || cfg.StorageBackend == "" || cfg.StorageBackend == "local"
+	return cfg.UsesLocalManifests()
 }
 
 // storageBackendName returns the effective backend name, applying the same

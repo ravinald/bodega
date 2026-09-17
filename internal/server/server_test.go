@@ -655,16 +655,32 @@ func TestAPIStatus(t *testing.T) {
 	// The probe must resolve against objects that exist. The mock store holds
 	// pool objects and no dists/ tree, which is what a healthy install looks
 	// like.
-	entries, ok := result["s3_entries"].([]interface{})
+	entries, ok := result["backend_entries"].([]interface{})
 	if !ok || len(entries) != 1 {
-		t.Fatalf("s3_entries = %v, want one probe row", result["s3_entries"])
+		t.Fatalf("backend_entries = %v, want one probe row", result["backend_entries"])
 	}
 	probe, _ := entries[0].(map[string]interface{})
-	if got := probe["s3_key"]; got != "packages/apt/pool/" {
-		t.Errorf("s3_key = %v, want packages/apt/pool/", got)
+	if got := probe["key"]; got != "packages/apt/pool/" {
+		t.Errorf("key = %v, want packages/apt/pool/", got)
 	}
-	if probe["in_s3"] != true {
-		t.Errorf("in_s3 = %v, want true", probe["in_s3"])
+	if probe["present"] != true {
+		t.Errorf("present = %v, want true", probe["present"])
+	}
+
+	// The row has to name the backend it probed, always. The driver-named
+	// shape it replaced left an operator on a local install reading "in_s3":
+	// true over bytes no bucket held, and "backend" was omitempty, so the one
+	// honest field could vanish.
+	if got := probe["backend"]; got != storage.DefaultName {
+		t.Errorf("backend = %v, want %q", got, storage.DefaultName)
+	}
+	for _, driverNamed := range []string{"s3_entries", "s3_key", "in_s3"} {
+		if _, present := result[driverNamed]; present {
+			t.Errorf("status response still carries %q", driverNamed)
+		}
+		if _, present := probe[driverNamed]; present {
+			t.Errorf("probe row still carries %q", driverNamed)
+		}
 	}
 }
 
