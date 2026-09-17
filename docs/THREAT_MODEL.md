@@ -29,15 +29,24 @@ risk:
   Tuesday's build produces the same bytes as last Tuesday's build, and
   `bodega pkg checksum list` is the record of which versions are pinned.
 
-  Two artifacts are not covered, and the gap is in the shape of the artifact
-  rather than in the check. **pypi** wheels upload as a directory holding the
-  resolved dependency closure, so no per-version object key exists to pin one
-  against; the closure is pinned by the requirements set instead.
-  **Clone-mode git** ships a bundle this instance generates locally at package
-  time, so there are no upstream bytes for a digest to attest to, and `git
-  bundle create` is not reproducible byte-for-byte — a pin would fail the next
-  repackage rather than catch anything. A git entry fetched as a release
-  tarball is covered normally.
+  One artifact is not covered, and the gap is in the shape of the artifact
+  rather than in the check. **Clone-mode git** ships a bundle this instance
+  generates locally at package time, so there are no upstream bytes for a
+  digest to attest to, and `git bundle create` is not reproducible
+  byte-for-byte: a pin would fail the next repackage rather than catch
+  anything. A git entry fetched as a release tarball is covered normally.
+
+  A **pypi** entry pins per closure artifact rather than per manifest entry.
+  One approved version installs everything it depends on, and those transitive
+  bytes answer to no entry, so the fetch resolves the whole closure, downloads
+  it into a wheelhouse of its own, and records a digest per file keyed by
+  `pypi/wheels/<filename>` — the key the server serves that wheel under. Every
+  file of the closure shows as its own row in `bodega pkg checksum list`, and a
+  later fetch producing different bytes for a version already on record is
+  refused. The build then reaches no index at all: pip runs with `--no-index`
+  and a `--find-links` naming that wheelhouse, under `--require-hashes` against
+  the digests the fetch recorded. Redirecting it needs bytes that already hash
+  to what was approved.
 
   An **npm dist-tag** (`latest`, or an entry left without a version) pins per
   resolved version rather than per manifest entry. The tag is meant to move, so

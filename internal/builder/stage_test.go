@@ -316,9 +316,13 @@ func TestCheckPypiStage_Fetched(t *testing.T) {
 	store := manifest.NewLocalStore(root)
 
 	touchFile(t, filepath.Join(root, "combined-requirements.txt"))
+	if CheckPypiStage(cfg, store).Fetched {
+		t.Error("expected Fetched=false with no resolved closure for the build to read")
+	}
+	touchFile(t, pypiLockPath(root))
 	s := CheckPypiStage(cfg, store)
 	if !s.Fetched {
-		t.Error("expected Fetched=true when combined-requirements.txt exists")
+		t.Error("expected Fetched=true when the requirements and the closure both exist")
 	}
 	if s.Built {
 		t.Error("expected Built=false when no .whl files")
@@ -332,6 +336,7 @@ func TestCheckPypiStage_Built(t *testing.T) {
 	d := buildDirs(root)
 
 	touchFile(t, filepath.Join(root, "combined-requirements.txt"))
+	touchFile(t, pypiLockPath(root))
 	wheelsDir := pypiWheelsDir(d)
 	touchFile(t, filepath.Join(wheelsDir, "somepackage-1.0-py3-none-any.whl"))
 
@@ -351,6 +356,7 @@ func TestCheckPypiStage_Packaged(t *testing.T) {
 	d := buildDirs(root)
 
 	touchFile(t, filepath.Join(root, "combined-requirements.txt"))
+	touchFile(t, pypiLockPath(root))
 	wheelsDir := pypiWheelsDir(d)
 	touchFile(t, filepath.Join(wheelsDir, "somepackage-1.0-py3-none-any.whl"))
 	touchFile(t, filepath.Join(wheelsDir, "MANIFEST.sha256"))

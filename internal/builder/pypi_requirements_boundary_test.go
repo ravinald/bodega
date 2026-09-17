@@ -139,7 +139,7 @@ func TestFetchPypiInlinesTheApplicationRequirements(t *testing.T) {
 		"nested/extra.txt": "click==8.1.7\n",
 	})
 
-	if summary := FetchPypi(cfg, store); summary.HasFailures() {
+	if summary := resolvePypiRequirements(cfg, store); summary.HasFailures() {
 		t.Fatalf("fetch reported failures: %+v", summary.Results)
 	}
 	root := cfg.rootFor(manifest.TypePypi)
@@ -176,7 +176,7 @@ func TestFetchPypiKeepsConstraintsApartFromRequirements(t *testing.T) {
 		"constraints.txt":  "urllib3<2\n",
 	})
 
-	if summary := FetchPypi(cfg, store); summary.HasFailures() {
+	if summary := resolvePypiRequirements(cfg, store); summary.HasFailures() {
 		t.Fatalf("fetch reported failures: %+v", summary.Results)
 	}
 	root := cfg.rootFor(manifest.TypePypi)
@@ -207,8 +207,8 @@ func TestFetchPypiDiscardsConstraintsWhenARefetchFails(t *testing.T) {
 		"requirements.txt": "attrs\n-c constraints.txt\n",
 		"constraints.txt":  "urllib3<2\n",
 	})
-	if summary := FetchPypi(cfg, store); summary.HasFailures() {
-		t.Fatalf("first fetch reported failures: %+v", summary.Results)
+	if summary := resolvePypiRequirements(cfg, store); summary.HasFailures() {
+		t.Fatalf("first resolve reported failures: %+v", summary.Results)
 	}
 
 	root := cfg.rootFor(manifest.TypePypi)
@@ -297,7 +297,7 @@ func TestPipAcceptsTheGeneratedRequirementsAndConstraints(t *testing.T) {
 		"requirements.txt": "six\n-c constraints.txt\n",
 		"constraints.txt":  "six<1.17\n",
 	})
-	if summary := FetchPypi(cfg, store); summary.HasFailures() {
+	if summary := resolvePypiRequirements(cfg, store); summary.HasFailures() {
 		t.Fatalf("fetch reported failures: %+v", summary.Results)
 	}
 	req, err := os.ReadFile(filepath.Join(cfg.rootFor(manifest.TypePypi), "combined-requirements.txt"))

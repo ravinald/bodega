@@ -65,6 +65,11 @@ const (
 // Callers that delete or move an artifact must surface this rather than treat
 // it as "nothing to do": the wheels exist, they just are not addressable one
 // version at a time.
+//
+// A manifest entry is not one artifact. One approved version pulls in a whole
+// dependency closure, and the closure's members are addressable one file at a
+// time through PypiWheelKey — which is what the fetch pins a digest against.
+// This sentinel is about the entry, not about the bytes.
 var ErrPypiNoObjectKey = errors.New("pypi wheels upload as a directory and have no per-version object key")
 
 // ErrAptPoolPathUnknown reports that an apt entry carries no _pool_path, so
@@ -92,6 +97,13 @@ func GitKey(name, ref string, release bool) string {
 	}
 	safe := SafeName(name)
 	return GitPrefix + safe + "/" + safe + "-" + ref + ext
+}
+
+// PypiWheelKey returns the key one closure artifact is served under. filename
+// is the name the index gave the file, which is what the wheels directory syncs
+// under and what a client asks for by name.
+func PypiWheelKey(filename string) string {
+	return PypiWheelPrefix + filename
 }
 
 // AptKey returns the key for a .deb at poolPath, which is relative to
