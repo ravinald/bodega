@@ -548,18 +548,21 @@ func TestServerAppliesAuditConfigToItsOwnHandle(t *testing.T) {
 // slowest single 403 at 1.58s (DELETE) and 1.49s (GET). After: 8500/s, and the
 // slowest 403 at 9-17ms.
 //
-// The ceiling is 500ms, chosen against the numbers CI measures rather than
-// these: under -race the same runs are 2.03s to 3.37s unbounded and 61ms to
-// 69ms bounded across repeats, so 500ms sits 7x above the bounded worst and 4x
-// below the cheapest unbounded one, near the midpoint of a 35x separation.
+// What this asserts is the invariant rather than the latency it produces: one
+// slot in the channel, and every refusal still recorded after a flood. The
+// clock is logged and never asserted. #253, #274 and #371 are three separate
+// occasions where a wall-clock ceiling on this database failed on a loaded
+// runner with the write path untouched, and the last of them defeated a
+// ceiling calibrated in-process too: a serial pass measures per-write cost on
+// an idle machine, while the concurrent worst case on a 2-core runner is
+// dominated by 64 goroutines starving each other under -race. Measured, that
+// ratio is 1.4x on an M-series laptop and 9.3x in CI, so no multiple of a
+// serial pass separates a bounded run from an unbounded one everywhere.
 //
-// #253 and #274 are the standing evidence that a wall-clock assertion on this
-// database flakes on a loaded runner. The margin survives one because the two
-// sides do not scale together: unbounded, the slowest request waits for the
-// whole flood, so it grows with load and with runner slowness alike; bounded,
-// it waits only on the 64 callers ahead of it in the channel's FIFO queue,
-// which is a twentieth of the run. A runner slow enough to push the bounded
-// case over 500ms pushes the unbounded case further above it, not closer.
+// The cost of dropping the assertion is a regression that routes denials
+// around recordDenialFor entirely, which cap() cannot see. Nothing proposes to
+// do that, and a test that fails on a third of its runs catches less than one
+// that fails on none.
 //
 // GET is here because DenyListMiddleware has no method guard: on an install
 // with a non-empty deny_list, a deny-listed address floods the writer with
@@ -569,8 +572,14 @@ func TestDenialWritesAreBounded(t *testing.T) {
 	const (
 		workers = 64
 		each    = 20
-		ceiling = 500 * time.Millisecond
 	)
+
+	// The bound itself, asserted where a reader of the flood below would look
+	// for it. Raising this capacity is the regression the flood used to catch
+	// with a stopwatch.
+	if c := cap(denialWriteSlots); c != 1 {
+		t.Fatalf("cap(denialWriteSlots) = %d, want 1 — an anonymous caller's refusal is no longer serialized", c)
+	}
 
 	for _, tc := range []struct {
 		name     string
@@ -617,11 +626,6 @@ func TestDenialWritesAreBounded(t *testing.T) {
 			for _, d := range worst {
 				slowest = max(slowest, d)
 			}
-			if slowest > ceiling {
-				t.Errorf("slowest single 403 = %v, want under %v — an anonymous caller is paying the audit writer's contention",
-					slowest.Round(time.Millisecond), ceiling)
-			}
-
 			// The bound blocks; it must not drop. Count rather than Query:
 			// Query caps at 1000 rows and would report loss that is paging.
 			n, err := s.auditDB.Count(t.Context(), audit.Filter{EventType: audit.EventDenied})

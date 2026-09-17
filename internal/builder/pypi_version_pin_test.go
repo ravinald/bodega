@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -65,15 +66,17 @@ func pypiIndex(t *testing.T, dist string, versions ...string) *httptest.Server {
 	return pypiIndexOf(t, dist, releases...)
 }
 
-// pypiFetchEnv runs FetchPypi over a single-entry pypi manifest and returns the
-// summary and whatever combined-requirements.txt it wrote.
+// pypiFetchEnv runs the resolution half of a fetch over a single-entry pypi
+// manifest and returns the summary and whatever combined-requirements.txt it
+// wrote. The closure download is a separate phase with tests of its own; what
+// these cases are about is the text the resolution produces.
 func pypiFetchEnv(t *testing.T, ve manifest.VersionEntry) (*Summary, string) {
 	t.Helper()
 	pm := &manifest.PackageManifest{Type: manifest.TypePypi, Name: "six", Versions: []manifest.VersionEntry{ve}}
 	cfg, store, _ := pinEnv(t, pm)
 	cfg.Stdout = io.Discard
 
-	summary := FetchPypi(cfg, store)
+	summary := resolvePypiRequirements(cfg, store)
 	req, err := os.ReadFile(filepath.Join(cfg.rootFor(manifest.TypePypi), "combined-requirements.txt"))
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatalf("read combined-requirements.txt: %v", err)
@@ -346,25 +349,52 @@ func TestHasInstallableRequirementsIgnoresPipOptions(t *testing.T) {
 	}
 }
 
+// pypiDist is one distribution a fixture index serves. requires becomes the
+// wheel's Requires-Dist, which is what makes a closure bigger than the entry
+// the manifest names. marker changes the bytes without changing the version, so
+// two indexes can serve one approved version and disagree about it — the
+// substitution a per-artifact digest exists to catch.
+type pypiDist struct {
+	name     string
+	versions []string
+	requires []string
+	marker   string
+}
+
 // pypiWheelBytes builds a minimal but valid wheel for one version, so a test
 // can drive real pip over a fixture index rather than assert on the text of a
 // requirements file and call the substitution disproven.
-func pypiWheelBytes(t *testing.T, dist, version string) []byte {
+//
+// The archive is written in sorted order. Ranging a map would give one version
+// several digests across runs, and a digest that moves proves nothing about
+// bytes that moved.
+func pypiWheelBytes(t *testing.T, d pypiDist, version string) []byte {
 	t.Helper()
-	var buf bytes.Buffer
-	zw := zip.NewWriter(&buf)
-	info := fmt.Sprintf("%s-%s.dist-info/", dist, version)
-	for name, body := range map[string]string{
-		info + "METADATA": fmt.Sprintf("Metadata-Version: 2.1\nName: %s\nVersion: %s\n\n", dist, version),
+	metadata := fmt.Sprintf("Metadata-Version: 2.1\nName: %s\nVersion: %s\n", d.name, version)
+	for _, req := range d.requires {
+		metadata += "Requires-Dist: " + req + "\n"
+	}
+	info := fmt.Sprintf("%s-%s.dist-info/", d.name, version)
+	files := map[string]string{
+		info + "METADATA": metadata + "\n",
 		info + "WHEEL":    "Wheel-Version: 1.0\nGenerator: bodega-test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
 		info + "RECORD":   "",
-		dist + ".py":      fmt.Sprintf("__version__ = %q\n", version),
-	} {
+		d.name + ".py":    fmt.Sprintf("__version__ = %q\n__origin__ = %q\n", version, d.marker),
+	}
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, name := range names {
 		w, err := zw.Create(name)
 		if err != nil {
 			t.Fatalf("wheel %s: %v", name, err)
 		}
-		if _, err := io.WriteString(w, body); err != nil {
+		if _, err := io.WriteString(w, files[name]); err != nil {
 			t.Fatalf("wheel %s: %v", name, err)
 		}
 	}
@@ -374,29 +404,30 @@ func pypiWheelBytes(t *testing.T, dist, version string) []byte {
 	return buf.Bytes()
 }
 
-// pypiWheelIndex serves one distribution over the two surfaces a fetch uses:
-// the JSON API the resolver reads, and the PEP 503 pages plus wheel bytes pip
-// downloads from.
-func pypiWheelIndex(t *testing.T, dist string, versions ...string) *httptest.Server {
+// pypiWheelIndexOf serves several distributions over the two surfaces a fetch
+// uses: the JSON API the resolver reads, and the PEP 503 pages plus wheel bytes
+// pip downloads from.
+func pypiWheelIndexOf(t *testing.T, dists ...pypiDist) *httptest.Server {
 	t.Helper()
-	releases := map[string]any{}
 	blobs := map[string][]byte{}
-	var links string
-	for _, v := range versions {
-		file := fmt.Sprintf("%s-%s-py3-none-any.whl", dist, v)
-		releases[v] = []any{map[string]any{"filename": file, "packagetype": "bdist_wheel"}}
-		blobs["/files/"+file] = pypiWheelBytes(t, dist, v)
-		links += fmt.Sprintf("<a href=\"/files/%s\">%s</a><br>\n", url.PathEscape(file), file)
-	}
-
 	mux := http.NewServeMux()
-	mux.HandleFunc("/pypi/"+dist+"/json", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"releases": releases})
-	})
-	mux.HandleFunc("/simple/"+dist+"/", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/html")
-		_, _ = io.WriteString(w, links)
-	})
+	for _, d := range dists {
+		releases := map[string]any{}
+		var links string
+		for _, v := range d.versions {
+			file := fmt.Sprintf("%s-%s-py3-none-any.whl", d.name, v)
+			releases[v] = []any{map[string]any{"filename": file, "packagetype": "bdist_wheel"}}
+			blobs["/files/"+file] = pypiWheelBytes(t, d, v)
+			links += fmt.Sprintf("<a href=\"/files/%s\">%s</a><br>\n", url.PathEscape(file), file)
+		}
+		mux.HandleFunc("/pypi/"+d.name+"/json", func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"releases": releases})
+		})
+		mux.HandleFunc("/simple/"+d.name+"/", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = io.WriteString(w, links)
+		})
+	}
 	mux.HandleFunc("/files/", func(w http.ResponseWriter, r *http.Request) {
 		body, ok := blobs[r.URL.Path]
 		if !ok {
@@ -410,13 +441,25 @@ func pypiWheelIndex(t *testing.T, dist string, versions ...string) *httptest.Ser
 	return srv
 }
 
-// pypiWheelRun runs real pip over a generated requirements file and returns the
-// wheel filenames it stored.
-func pypiWheelRun(t *testing.T, requirements string) ([]string, string) {
+// pypiWheelIndex serves one distribution with no dependencies of its own.
+func pypiWheelIndex(t *testing.T, dist string, versions ...string) *httptest.Server {
+	t.Helper()
+	return pypiWheelIndexOf(t, pypiDist{name: dist, versions: versions})
+}
+
+// requirePip skips a test that drives real pip on a host without one.
+func requirePip(t *testing.T) {
 	t.Helper()
 	if err := exec.Command("python3", "-m", "pip", "--version").Run(); err != nil {
 		t.Skipf("no python3 -m pip on this host: %v", err)
 	}
+}
+
+// pypiWheelRun runs real pip over a generated requirements file and returns the
+// wheel filenames it stored.
+func pypiWheelRun(t *testing.T, requirements string) ([]string, string) {
+	t.Helper()
+	requirePip(t)
 
 	dir := t.TempDir()
 	reqPath := filepath.Join(dir, "combined-requirements.txt")
@@ -543,7 +586,8 @@ func TestFetchPypiDiscardsRequirementsWhenARefetchFails(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			srv := pypiIndex(t, "six", "1.16.0", "1.17.0")
+			requirePip(t)
+			srv := pypiWheelIndex(t, "six", "1.16.0", "1.17.0")
 			pm := &manifest.PackageManifest{
 				Type: manifest.TypePypi, Name: "six",
 				Versions: []manifest.VersionEntry{{Version: "1.16.0", URL: srv.URL}},
@@ -700,7 +744,7 @@ func TestFetchPypiAcceptsIncludedRequirementsOnTheSelectedIndex(t *testing.T) {
 		"requirements.txt": "# app\n--index-url " + selected.URL + "/simple\nattrs\n",
 	})
 
-	if summary := FetchPypi(cfg, store); summary.HasFailures() {
+	if summary := resolvePypiRequirements(cfg, store); summary.HasFailures() {
 		t.Fatalf("an included file naming the selected index failed the fetch: %+v", summary.Results)
 	}
 }
@@ -845,7 +889,7 @@ func TestFetchPypiAcceptsRequirementOptionsThatDecideNoOrigin(t *testing.T) {
 			"attrs==23.1.0 \\\n    --hash=sha256:" + strings.Repeat("a", 64) + "\n",
 	})
 
-	if summary := FetchPypi(cfg, store); summary.HasFailures() {
+	if summary := resolvePypiRequirements(cfg, store); summary.HasFailures() {
 		t.Fatalf("options that name no origin failed the fetch: %+v", summary.Results)
 	}
 }
@@ -961,7 +1005,7 @@ func TestFetchPypiAcceptsQuotedValuesNamingTheSelectedIndex(t *testing.T) {
 		"app extras.txt": "-i '" + selected.URL + "/simple/'\nattrs\n",
 	})
 
-	if summary := FetchPypi(cfg, store); summary.HasFailures() {
+	if summary := resolvePypiRequirements(cfg, store); summary.HasFailures() {
 		t.Fatalf("quoted values naming the selected index failed the fetch: %+v", summary.Results)
 	}
 }

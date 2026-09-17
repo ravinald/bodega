@@ -149,8 +149,11 @@ func Key(typ, name string) string {
 // with one covering identical bytes, and turns aptGatesPool on, which drops
 // the pool from public to private for no filtering in return.
 //
-//   - A closed membership with no base has nothing to filter; bodega's own
-//     manifest entries are already served under the generated suites.
+//   - A closed membership with no base has no upstream index to filter, so it
+//     derives no codename. It still governs apt: Governs is what the pool
+//     route and the generated suites read, so bodega's own manifest entries
+//     are filtered per profile where they are served and the pool refuses what
+//     the profile's view does not carry.
 //   - An open membership admits every package the archive publishes.
 //   - An expansion that permits an unlisted package reaches the same place by
 //     the other road: Covers answers Permitted for everything outside the set
@@ -177,6 +180,26 @@ func (p *Profile) AptScope() (base, refused string) {
 		return "", fmt.Sprintf("its apt expansion is %s, which permits a package the profile does not list, so the filtered index would carry every upstream paragraph", audit.ExpansionOrDefault(r.Expansion))
 	}
 	return r.AptBase, ""
+}
+
+// Governs reports whether the profile states a rule for typ at all.
+//
+// It is the question the apt pool route asks before deciding whether it is the
+// one deciding: Covers answers it too, but only as one field of a verdict on a
+// named package, and a route working out whether it enforces at all has no
+// package in hand yet. For apt the answer also decides the cache directive, so
+// it has to be askable of a profile rather than of a request.
+//
+// A rule with no AptBase still governs. AptScope answers the narrower question
+// of whether a filtered codename can be derived from an upstream suite, and a
+// profile that closes apt without naming one governs bodega's own generated
+// suites and the pool while deriving nothing.
+func (p *Profile) Governs(typ string) bool {
+	if p == nil {
+		return false
+	}
+	_, ok := p.types[typ]
+	return ok
 }
 
 // Lists reports whether the profile names at least one package of typ.

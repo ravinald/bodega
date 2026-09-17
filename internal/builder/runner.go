@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
@@ -58,24 +59,40 @@ type Config struct {
 	// AuditDB is an optional audit database. When set, build operations
 	// record events to the SQLite audit trail.
 	AuditDB *audit.DB
-	// Policy is an optional upstream allow-list checker. When set, each
-	// Fetch* function validates candidate URLs/packages before network I/O.
-	// When nil, the allow-list is not enforced.
-	Policy *policy.Checker
+	// policyChecker is the upstream allow-list. NewConfig is the only way to
+	// set it, and it takes it as an argument rather than leaving it to the
+	// caller, because five of eight call sites left the exported field nil and
+	// two of those reached a fetcher. Nil means no allow-list, which is an
+	// install with no audit_db to read rules from; policyNotice makes every
+	// run in that state say so on its own output.
+	policyChecker *policy.Checker
+	policyNotice  sync.Once
 	// CargoDLUpstream is the host crate tarballs are fetched from. crates.io
 	// splits the sparse index from the download host, and the index host serves
 	// no downloads, so composing a download URL from the index root 404s.
 	CargoDLUpstream string
 }
 
+// PolicyDisabledNotice is what a fetch prints, once per run, when it holds no
+// allow-list checker. Fetching proceeds: the allow-list needs an audit
+// database to read rules from, so failing closed here would refuse every fetch
+// on every install that never configured audit_db, turning an opt-in feature
+// into a hard dependency. The unenforced state is announced instead, because
+// being invisible is what let it reach two surfaces unnoticed.
+const PolicyDisabledNotice = "  policy: no upstream allow-list loaded, so every upstream is permitted. Set audit_db and add rules with `bodega policy add` to enforce one."
+
 // checkPolicy runs the upstream allow-list for (regType, candidate). Returns
 // nil if policy is disabled or the candidate is allowed; otherwise returns
 // the ViolationError (or a storage error wrapping it).
 func (c *Config) checkPolicy(ctx context.Context, regType, candidate string) error {
-	if c.Policy == nil || candidate == "" {
+	if c.policyChecker == nil {
+		c.policyNotice.Do(func() { c.logf("%s", PolicyDisabledNotice) })
 		return nil
 	}
-	return c.Policy.Check(ctx, regType, candidate)
+	if candidate == "" {
+		return nil
+	}
+	return c.policyChecker.Check(ctx, regType, candidate)
 }
 
 // EnforcePolicy validates a single manifest entry's upstream against the
@@ -157,9 +174,15 @@ var Version = "unknown"
 // literals and no two carried the same subset: sync and upload named none of
 // them, so an install setting apt_root uploaded from build_root, found nothing
 // and reported nothing to do. Fields a single caller owns — Stdout, Logger,
-// AuditDB, Policy, Force — stay the caller's to set; anything read off the
+// AuditDB, Force — stay the caller's to set; anything read off the
 // config file is set here or it reaches one command only.
-func NewConfig(app *config.Config) *Config {
+//
+// pol is a parameter rather than one of those fields because it is not a
+// single caller's: every Fetch* function gates on it, and a call site that
+// forgot it fetched past every rule with no refusal printed and no audit row
+// written. Pass policy.CheckerFor(auditDB); a nil checker is the answer only
+// where there is no audit database, and PolicyDisabledNotice says so.
+func NewConfig(app *config.Config, pol *policy.Checker) *Config {
 	return &Config{
 		BuildRoot:      app.BuildRoot,
 		ManifestDir:    app.ManifestDir,
@@ -176,6 +199,7 @@ func NewConfig(app *config.Config) *Config {
 		CargoRoot:      app.CargoRoot,
 		AutoImportDeps: true,
 		BodegaVersion:  Version,
+		policyChecker:  pol,
 
 		CargoDLUpstream: app.CargoDLUpstream,
 	}

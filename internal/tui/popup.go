@@ -179,10 +179,10 @@ Build pipeline:
                A=All     B=Build  D=Deploy
                F=Fetch   P=Package  Esc=Cancel
 
-S3 bucket operations:
+Storage operations:
   I          Initialise S3 bucket (with confirmation)
-  R          Remove artifact from S3 (with confirmation)
-  S          Sync all local artifacts to S3
+  R          Remove stored artifact from its backend (with confirmation)
+  S          Upload all local artifacts to their backends
   v          Verify manifest checksums
 
 Audit:
@@ -387,7 +387,7 @@ func (p *popupModel) renderBuildMenu() string {
 		{"F", "Fetch source"},
 		{"B", "Build from source"},
 		{"P", "Package (create artifact)"},
-		{"D", "Deploy (upload to S3)"},
+		{"D", "Deploy (upload to storage)"},
 		{"A", "All (full pipeline)"},
 	}
 

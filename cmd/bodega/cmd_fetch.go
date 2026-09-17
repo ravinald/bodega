@@ -21,7 +21,7 @@ func newFetchCmd(gf *globalFlags) *cobra.Command {
   binary  Download file from URL to binaries/
   git     Clone bare repository to repos/
   apt     Clone source repo (or apt-get download .deb) to sources/
-  pypi    Resolve requirements from cloned git repos, write combined-requirements.txt
+  pypi    Resolve requirements from cloned git repos, download the closure to wheelhouse/
   gomod   Download module zips to gomod/
   helm    Download chart archives to charts/
   npm     Download package tarballs to npm/
@@ -68,15 +68,9 @@ When a name is given after the type, only that entry is fetched.`,
 				defer auditDB.Close()
 			}
 
-			var policyChecker *policy.Checker
-			if auditDB != nil {
-				policyChecker = policy.NewChecker(auditDB)
-			}
-
-			bcfg := builder.NewConfig(cfg)
+			bcfg := builder.NewConfig(cfg, policy.CheckerFor(auditDB))
 			bcfg.Force = force
 			bcfg.AuditDB = auditDB
-			bcfg.Policy = policyChecker
 
 			var allSummaries []*builder.Summary
 

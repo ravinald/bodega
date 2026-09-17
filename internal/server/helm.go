@@ -89,6 +89,16 @@ func (s *Server) handleHelmChart(w http.ResponseWriter, r *http.Request) {
 		// empty upstream_url, which `discover promote --as manifest` reports as
 		// needing an operator-supplied URL.
 		s.recordNoManifest(ctx, r, manifest.TypeHelm, chartName, chartVersion, "")
+
+		// So this route cannot be opened by the proxy switch the way npm's
+		// tarball is: there is no host to fetch from, and composing one from a
+		// chart name would put an unverified URL into a supply-chain catalog.
+		// What it can do is stop answering a configuration gap in the shape of
+		// "no such chart", which sends an operator looking upstream for a chart
+		// that is published and reachable.
+		s.proxyVersionOrRefuse(w, r, manifest.TypeHelm, chartName, chartVersion, key,
+			"no manifest entry names helm chart "+chartName+", and a chart repository URL is recorded per version entry rather than in config, so bodega has none to fetch from; supply one: bodega pkg create helm "+chartName)
+		return
 	}
 	s.proxyVersion(w, r, manifest.TypeHelm, chartName, chartVersion, key)
 }

@@ -41,8 +41,8 @@ func TestBuildVersionReachesTheBuilder(t *testing.T) {
 	if builder.Version != version {
 		t.Errorf("builder.Version = %q, want main.version %q", builder.Version, version)
 	}
-	if builder.NewConfig(&config.Config{}).BodegaVersion != version {
+	if builder.NewConfig(&config.Config{}, nil).BodegaVersion != version {
 		t.Errorf("NewConfig stamps %q, want %q",
-			builder.NewConfig(&config.Config{}).BodegaVersion, version)
+			builder.NewConfig(&config.Config{}, nil).BodegaVersion, version)
 	}
 }

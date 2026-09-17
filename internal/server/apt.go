@@ -17,6 +17,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/aptsign"
 	"github.com/ravinald/bodega/internal/aptsources"
+	"github.com/ravinald/bodega/internal/entitle"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/storage"
 )
@@ -55,10 +56,11 @@ func (s *Server) handleAptPool(w http.ResponseWriter, r *http.Request) {
 	// a public copy answers a refused host out of somebody else's fetch, with
 	// the request never reaching the predicate above. Gated on the requester,
 	// the somebody else is an unidentified host: every host before it is bound,
-	// and every host under an open apt membership, both of which keep reaching
-	// this route ungated by design. So the moment any profile on this instance
-	// scopes apt, the whole route loses the shared grant. An instance where
-	// none does keeps it, because there is no refusal for a proxy to overturn.
+	// and every host whose profile states no apt rule, both of which keep
+	// reaching this route ungated by design. So the moment any profile on this
+	// instance governs apt, the whole route loses the shared grant. An instance
+	// where none does keeps it, because there is no refusal for a proxy to
+	// overturn.
 	// Not the filtered codenames served: every fail-closed path in
 	// apt_profile.go withdraws one and leaves the predicate refusing.
 	if s.aptScopedAnywhere() {
@@ -268,6 +270,20 @@ func (s *Server) handleAptPackagesGz(w http.ResponseWriter, r *http.Request, sui
 // no snapshot at all is a 503, because the suite may well be served and the
 // operator's next step is to look at why the build failed, not at their
 // sources.list.
+//
+// A host bound to a profile that governs apt is answered from that profile's
+// view of the suite where one exists. This is the one dists/ route that varies
+// by requester, which is why all three handlers below it send no-store: a
+// shared cache holding one host's view and replaying it to the next would
+// re-publish what the profile subtracted, and route around the signature
+// question by never asking it.
+//
+// A suite with no view for this profile falls through to the unfiltered index.
+// That is a filtered codename, which is already one profile's view and carries
+// the base's packages for nobody else, and a mirrored codename, which bodega
+// does not generate at all — docs/THREAT_MODEL.md states that the sources.list
+// a host reads is a scoping boundary rather than an authorizing one, and the
+// pool predicate is what refuses the fetch either way.
 func (s *Server) aptIndex(w http.ResponseWriter, r *http.Request, suite string) (*aptSuiteIndex, *aptSnapshot, bool) {
 	snap := s.aptSnap.Load()
 	if snap == nil {
@@ -276,6 +292,9 @@ func (s *Server) aptIndex(w http.ResponseWriter, r *http.Request, suite string) 
 		return nil, nil, false
 	}
 	idx := snap.suites[suite]
+	if view := snap.profileViews[s.profileFor(r).Name()][suite]; view != nil {
+		idx = view
+	}
 	if idx == nil {
 		http.NotFound(w, r)
 		return nil, nil, false
@@ -376,6 +395,18 @@ type aptSnapshot struct {
 	// profileSuites. A profile whose codename a rebuild withdrew still has
 	// its hosts refused at the pool, so the two are different questions.
 	profilesScopeApt bool
+
+	// profileViews holds one profile's view of every manifest-built suite,
+	// keyed profile then suite. A filtered codename is what a profile deriving
+	// from an upstream base reads; this is what its hosts read on the suites
+	// bodega builds from its own catalog, which derive from no base and so
+	// have no codename of their own to be served under.
+	//
+	// Generated at rebuild rather than per request for the reason
+	// apt_profile.go gives: Release carries the digests of the Packages beside
+	// it and is signed, so a per-request filter would put a key operation on
+	// the hottest cached path.
+	profileViews map[string]map[string]*aptSuiteIndex
 }
 
 // rebuildAptSnapshot regenerates the index and publishes it to every
@@ -476,16 +507,28 @@ func (s *Server) buildAptSnapshot(ctx context.Context) (*aptSnapshot, error) {
 		validUntil: date.Add(aptValidity),
 	}
 	snap.poolStorage = s.aptPoolStorage(ctx)
+	// Resolved before the suites are built, because a manifest-built suite is
+	// generated once per profile that governs apt as well as once unfiltered.
+	views := s.aptProfileViews(ctx)
+	snap.profilesScopeApt = len(views) > 0
 	for _, suite := range served {
-		snap.suites[suite] = s.buildAptSuiteIndex(ctx, suite, poolMap, sharedPool, date, snap.validUntil)
+		base, perProfile := s.buildAptSuiteIndex(ctx, suite, views, poolMap, sharedPool, date, snap.validUntil)
+		snap.suites[suite] = base
+		for profile, idx := range perProfile {
+			if snap.profileViews == nil {
+				snap.profileViews = map[string]map[string]*aptSuiteIndex{}
+			}
+			if snap.profileViews[profile] == nil {
+				snap.profileViews[profile] = map[string]*aptSuiteIndex{}
+			}
+			snap.profileViews[profile][suite] = idx
+		}
 	}
 	// Filtered codenames join the same map, so every dists/ handler routes to
 	// them unchanged and one snapshot retires as a unit. A profile's Release
 	// and its Packages have to be generated together for the reason every
 	// suite's do: the first carries the digests of the second.
-	profileSuites, scoped := s.aptProfileIndexes(ctx, date, snap.validUntil)
-	snap.profilesScopeApt = scoped
-	for _, ps := range profileSuites {
+	for _, ps := range s.aptProfileIndexes(ctx, views, date, snap.validUntil) {
 		snap.suites[ps.codename] = ps.index
 		if snap.profileSuites == nil {
 			snap.profileSuites = map[string]string{}
@@ -733,19 +776,43 @@ func (s *Server) aptPoolStorage(ctx context.Context) map[string]string {
 }
 
 // buildAptSuiteIndex generates one suite's Packages bodies and the Release
-// that vouches for them.
-func (s *Server) buildAptSuiteIndex(ctx context.Context, suite string, poolMap map[string]string, sharedPool bool, date, validUntil time.Time) *aptSuiteIndex {
+// that vouches for them, unfiltered and once per profile that governs apt.
+//
+// Every view names the same architectures as the unfiltered index, including
+// the ones whose filtered body is empty. Dropping an architecture that
+// filtered to nothing would leave a Release naming fewer, which apt reports as
+// a suite that does not support the host — a profile decision worded as an
+// archive fact. An empty Packages is read as what it is, and the host reports
+// its packages as unavailable rather than the suite as wrong.
+func (s *Server) buildAptSuiteIndex(ctx context.Context, suite string, views []aptProfileView, poolMap map[string]string, sharedPool bool, date, validUntil time.Time) (*aptSuiteIndex, map[string]*aptSuiteIndex) {
 	// Collect unique architectures from manifest metadata.
 	arches := s.aptArchitectures(ctx, suite)
 	if len(arches) == 0 {
 		arches = []string{"amd64"}
 	}
 
+	stanzas := make(map[string][]aptStanza, len(arches))
 	packages := make(map[string][]byte, len(arches))
 	for _, arch := range arches {
-		packages[arch] = s.generateAptPackages(ctx, suite, arch, poolMap, sharedPool)
+		stanzas[arch] = s.aptSuiteStanzas(ctx, suite, arch, poolMap, sharedPool)
+		packages[arch], _, _ = aptPackagesBody(stanzas[arch], nil)
 	}
-	return s.aptIndexFrom(suite, packages, date, validUntil)
+	if len(views) == 0 {
+		return s.aptIndexFrom(suite, packages, date, validUntil), nil
+	}
+	perProfile := make(map[string]*aptSuiteIndex, len(views))
+	for _, v := range views {
+		filtered := make(map[string][]byte, len(arches))
+		kept, dropped := 0, 0
+		for _, arch := range arches {
+			body, k, d := aptPackagesBody(stanzas[arch], v.permit)
+			filtered[arch], kept, dropped = body, kept+k, dropped+d
+		}
+		s.logger.Info("filtered a generated apt suite for a profile",
+			"profile", v.profile, "suite", suite, "kept", kept, "dropped", dropped)
+		perProfile[v.profile] = s.aptIndexFrom(suite, filtered, date, validUntil)
+	}
+	return s.aptIndexFrom(suite, packages, date, validUntil), perProfile
 }
 
 // aptIndexFrom assembles one generated suite from its Packages bodies: the
@@ -1335,11 +1402,58 @@ func (s *Server) aptArchitectures(ctx context.Context, suite string) []string {
 	return arches
 }
 
+// aptStanza is one generated Packages paragraph with the identity a profile
+// judges it by: the source package the pool path is laid out under, and the
+// version on the paragraph itself.
+//
+// The two are carried rather than re-derived because the paragraph is the only
+// place they are both known. Recovering the source from a rendered stanza
+// would mean parsing back what this file just wrote.
+type aptStanza struct {
+	source  string
+	version string
+	body    []byte
+}
+
 // generateAptPackages builds a Debian Packages file for the given suite and
 // architecture from manifest metadata, resolving entries that carry no
 // _pool_path against poolMap. poolMap is nil when no entry needed one.
 func (s *Server) generateAptPackages(ctx context.Context, suite, arch string, poolMap map[string]string, sharedPool bool) []byte {
+	body, _, _ := aptPackagesBody(s.aptSuiteStanzas(ctx, suite, arch, poolMap, sharedPool), nil)
+	return body
+}
+
+// aptPackagesBody concatenates the stanzas a profile permits, and every stanza
+// for the nil profile, which is the unfiltered index every unbound host reads.
+//
+// Membership is judged on the source package, matching filterAptPackages over
+// an upstream index and aptPoolGate over a pool path: one identity across the
+// index, the backstop and the operator's `bodega profile add`, because a
+// package the index offers and the pool refuses is the mid-transaction 403
+// this whole shape exists to avoid.
+func aptPackagesBody(stanzas []aptStanza, permit *entitle.Profile) (out []byte, kept, dropped int) {
 	var buf bytes.Buffer
+	for _, st := range stanzas {
+		if permit != nil && !permit.Permits(manifest.TypeApt, st.source, st.version).Permitted {
+			dropped++
+			continue
+		}
+		kept++
+		buf.Write(st.body)
+	}
+	return buf.Bytes(), kept, dropped
+}
+
+// aptSuiteStanzas renders one suite and architecture's paragraphs, in the
+// order ListPackages yields them.
+//
+// Rendered once and filtered per profile afterwards rather than regenerated
+// per profile: this walks every apt manifest entry and reads each one's
+// package document, so a fleet with a dozen profiles would otherwise pay a
+// dozen full walks of the catalog on every rebuild, and rebuilds run on the
+// hourly tick and again on every profile write.
+func (s *Server) aptSuiteStanzas(ctx context.Context, suite, arch string, poolMap map[string]string, sharedPool bool) []aptStanza {
+	var out []aptStanza
 	for _, name := range s.store.ListPackages(manifest.TypeApt) {
 		pm, _ := s.store.GetPackage(ctx, manifest.TypeApt, name)
 		if pm == nil || isPackageHidden(pm) {
@@ -1401,19 +1515,21 @@ func (s *Server) generateAptPackages(ctx context.Context, suite, arch string, po
 				continue
 			}
 
+			version := ve.Metadata["Version"]
+			if version == "" {
+				version = ve.Version
+			}
+
 			// Emit canonical apt fields from the manifest in Debian Policy §5.3
 			// order. Package/Version/Architecture fall back to manifest fields
 			// when metadata doesn't carry them (e.g., freshly edited entries).
+			var buf bytes.Buffer
 			if ve.Metadata["Package"] == "" {
 				writeDebField(&buf, "Package", pkgName)
 			} else {
 				writeDebField(&buf, "Package", ve.Metadata["Package"])
 			}
-			if ve.Metadata["Version"] == "" {
-				writeDebField(&buf, "Version", ve.Version)
-			} else {
-				writeDebField(&buf, "Version", ve.Metadata["Version"])
-			}
+			writeDebField(&buf, "Version", version)
 			writeDebField(&buf, "Architecture", veArch)
 
 			canonical := []string{
@@ -1480,9 +1596,10 @@ func (s *Server) generateAptPackages(ctx context.Context, suite, arch string, po
 				writeDebDescription(&buf, desc)
 			}
 			buf.WriteString("\n")
+			out = append(out, aptStanza{source: pkgName, version: version, body: buf.Bytes()})
 		}
 	}
-	return buf.Bytes()
+	return out
 }
 
 // findDebInPool resolves a manifest entry that carries no _pool_path to a pool

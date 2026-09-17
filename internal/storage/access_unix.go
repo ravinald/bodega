@@ -34,13 +34,30 @@ type access struct {
 // answer and is not usable, because both kernels check an extended-attribute
 // call against the file's current mode rather than against the handle, so a
 // staging file at 0000 refuses its own owner the ACL it is there to carry.
-const stagedPerm = 0o600
+//
+// stagedDirPerm is the same answer for the directory a replacement is staged
+// in: the server may enter it and nobody else may. See enclose in local.go for
+// why a replacement gets a directory of its own and a fresh object does not.
+const (
+	stagedPerm    = 0o600
+	stagedDirPerm = 0o700
+)
 
-// restrictStaged holds a staging file at stagedPerm whatever the umask would
-// have clipped it to, so the write window is one mode rather than the
-// operator's.
-func restrictStaged(f *os.File) error {
-	return unix.Fchmod(int(f.Fd()), stagedPerm)
+// restrictStaged holds a staging inode at perm whatever the umask would have
+// clipped it to, and strips every grant it inherited from the directory it was
+// created in.
+//
+// Fchmod alone does not strip one. A macOS ACE carrying file_inherit or
+// directory_inherit is copied onto the new inode and grants regardless of the
+// mode bits, and a Linux default ACL arrives as an access ACL the new inode
+// owns. Either one hands a reader the replacement body while it is being
+// written, under a grant the object being replaced never gave.
+func restrictStaged(f *os.File, perm uint32) error {
+	fd := int(f.Fd())
+	if err := clearACL(fd); err != nil {
+		return err
+	}
+	return unix.Fchmod(fd, perm)
 }
 
 // fchown is a seam. The refusal path is what a server without CAP_CHOWN takes
@@ -117,10 +134,12 @@ func (a access) applyTo(f *os.File, key string) error {
 }
 
 // restoreXattrs makes the staging file's attributes the object's attributes,
-// both directions. Removing is not housekeeping: a staging file created in a
-// directory carrying a default ACL is born with an access ACL of its own, and
-// leaving that on a replacement for an object that had none denies readers the
-// object allowed.
+// both directions. Removing is not housekeeping: an attribute on the staging
+// file that the object never had is a decision nobody made, and an access ACL
+// is the case where that denies readers the object allowed. A replacement is
+// staged in an enclosure stripped of its inheritance, so nothing should reach
+// here carrying one; this is the check that the enclosure held, and the only
+// one that runs against the inode rather than against the directory above it.
 func (a access) restoreXattrs(fd int, key string) error {
 	staged, err := listXattr(fd)
 	if err != nil {

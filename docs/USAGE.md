@@ -43,7 +43,7 @@ bodega build fetch git netbox      # fetch only netbox
 
 #### How a pypi version is resolved
 
-A pypi fetch writes no wheels. It resolves each manifest entry to one concrete version and records it in `<build-root>/combined-requirements.txt`, which `build run` then hands to `pip wheel -r`. Resolution happens here, at fetch, rather than in pip: a bare requirement line means "newest that satisfies the closure", and pip has no notion of an approved version to weigh that against.
+A pypi fetch resolves each manifest entry to one concrete version and records it in `<build-root>/combined-requirements.txt`. Resolution happens here, at fetch, rather than in pip: a bare requirement line means "newest that satisfies the closure", and pip has no notion of an approved version to weigh that against. The fetch then downloads the closure that file resolves to into `<build-root>/wheelhouse/` and writes `<build-root>/resolved-requirements.txt`, which pins every distribution in it with a SHA-256. See [What reaches pip](#what-reaches-pip).
 
 Versions are read, ordered and compared as [PEP 440](https://packaging.python.org/en/latest/specifications/version-specifiers/), which is the scheme PyPI publishes and semver cannot read. `1.16.0.post1`, `2.0.0rc1`, `1!2.0` and `0.6.dev1` are ordinary releases on an index; under semver every one of them is unparseable and drops out of the candidate list, which reads exactly like the release not existing. `pytz` is the live example: its newest release is `2026.3.post1`, and a semver filter resolves `any` to the release before it.
 
@@ -80,7 +80,35 @@ The default index is written out like any other. A deployment that wants its own
 
 ##### What reaches pip
 
-The applications' own requirements files are read at fetch and written out again, not handed to pip by reference. The generated `combined-requirements.txt` holds the selected index, the lines read from each application's file with `-r` and `-c` includes resolved in place, and one pin per manifest entry. `-c` includes land in a generated `combined-constraints.txt` instead, reached by a single `-c`, because a constraint restricts a version without requesting the package and flattening one into the requirements installs what an application only meant to bound.
+The build reaches no index. The fetch downloads the closure; the build turns bytes already on disk into wheels:
+
+```text
+pip wheel --isolated --no-index --find-links <build-root>/wheelhouse --require-hashes \
+    --wheel-dir <build-root>/wheels -r <build-root>/resolved-requirements.txt
+```
+
+`--no-index` is the one index control a requirements file cannot undo. pip lets a file's `--index-url` replace a command-line one outright, so pointing the build at the approved index was always the weaker half of that pair. `opts.no_index` can only be set, and every index option in `pip/_internal/req/req_file.py` is guarded by `and not no_index`, so an `--index-url`, `--extra-index-url` or `-f` at any include depth changes nothing about where bytes come from. `--find-links` appends unconditionally, which is why `--require-hashes` is there too: a link reaching pip by some other route still cannot produce bytes the fetch did not record.
+
+`resolved-requirements.txt` is the closure, one pinned line per distribution carrying a `--hash=sha256:` for every file the fetch stored:
+
+```text
+attrs==24.2.0 \
+    --hash=sha256:81921eb96de3191c8258c705618104dcb9a1c1a70e57e239745cb0dbbc9d6d4c
+six==1.16.0 \
+    --hash=sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254
+```
+
+Each of those digests is also a row in `bodega pkg checksum list`, keyed `pypi/wheels/<filename>` — the key the server serves that wheel under. A second fetch producing different bytes for a version already on record is refused, and the wheelhouse it wrote into is discarded with it. Before pip runs, the build re-digests the wheelhouse against the lock, so a file edited between the two stages fails naming the distribution and both digests rather than reporting whichever candidate pip reached first:
+
+```text
+pypi six==1.16.0: six-1.16.0-py3-none-any.whl no longer matches the digest recorded at fetch: recorded=8abb2f1d… received=63df92ac…
+```
+
+Both stages run pip out of one virtualenv under `<build-root>/build-venv`, which the fetch creates and the build reuses. It needs a `python3` whose `ensurepip` works — `python3-venv` on Debian and Ubuntu, `python3.<minor>-venv` where the distribution splits it per minor version. A host without it fails the stage naming that package rather than bootstrapping pip by piping `bootstrap.pypa.io/get-pip.py` into the interpreter, which is an origin outside every control here. Nothing upgrades that pip, so it is whatever the platform's `ensurepip` bundles.
+
+A source distribution in the closure is built at build time, and pip assembles its build environment through the same finder, so the backend has to be in the wheelhouse. `setuptools` and `wheel` are downloaded alongside the closure whenever it holds an sdist; a distribution needing another backend (`hatchling`, `flit_core`, `poetry-core`) is named as a pypi manifest entry, which puts it in the closure like anything else.
+
+The applications' own requirements files are read at fetch and written out again, not handed to pip by reference. The generated `combined-requirements.txt` holds the selected index, the lines read from each application's file with `-r` and `-c` includes resolved in place, and one pin per manifest entry. It is what the closure is resolved from; it never reaches the build. `-c` includes land in a generated `combined-constraints.txt` instead, reached by a single `-c`, because a constraint restricts a version without requesting the package and flattening one into the requirements installs what an application only meant to bound.
 
 Inlining rather than including, because an `-r` pointing back at the application's file leaves two parsers over one set of bytes: this one at fetch, pip's at build. Every difference between them is an acquisition instruction approved against one index and carried out against another, and five of them were found one at a time. What this reads is now what pip reads, so a construct read wrongly produces a wrong requirement rather than a silent change of origin.
 
@@ -603,7 +631,7 @@ pypi/boto3 -> default  (global default; no type or package rule; storage_policy 
 
 An operator reads this command to find out why a package landed where it did, so a level the write path will not use is worse than no level at all.
 
-This is the write side. It says where the _next_ version goes and nothing about where versions already uploaded live; each of those records its own backend in `storage`.
+This is the write side. It says where the _next_ version goes and nothing about where versions already uploaded live; each of those records its own backend in `storage`, and the `STORED` column of `bodega show pkg <type> <name> --admin` prints it. A version that records nothing reads `default`, which is the backend the global `storage_backend` / `storage_path` / `bucket` / `region` keys describe and the one every artifact uploaded before backends were named lives on.
 
 ### `bodega pkg move <type> <name>[@<version>] --to <backend>`
 
@@ -892,7 +920,7 @@ Declares what one class of host may fetch, and the version rule each package car
 
 A profile is a view over one catalog, never a second catalog. Storage, object keys, the checksum table and the manifests do not change: an artifact reached through two profiles is one artifact with one checksum.
 
-The read path enforces this for pypi, npm, gomod, cargo, helm, git and binary. apt is not enforced at fetch time and is the deliberate exception; see [What is enforced, and where](#what-is-enforced-and-where). `bodega pin` is the host-side half of the same idea and is a different thing: it emits apt preferences for a host to apply, where a profile decides what bodega will answer.
+The read path enforces this for pypi, npm, gomod, cargo, helm, git and binary. apt is the deliberate exception: the index a profiled host reads is the control and the fetch is only the backstop behind it; see [What is enforced, and where](#what-is-enforced-and-where). `bodega pin` is the host-side half of the same idea and is a different thing: it emits apt preferences for a host to apply, where a profile decides what bodega will answer.
 
 Three levels:
 
@@ -1351,6 +1379,8 @@ $ bodega profile set web apt --membership closed --base noble
     the profile then reads the mirrored codename noble unchanged, verified against the distro keyring
 ```
 
+**A profile with no base still governs apt.** `--base` buys a filtered view of a *mirrored* codename. A suite bodega serves from its own catalog — an `apt_suites` codename holding the entries an operator put in it — is filtered in place instead: the host reads the suite it was always pointed at and bodega answers with that profile's view of it, generated and signed at the same rebuild. Either way `/apt/pool/` refuses a `.deb` the profile does not entitle. What no base costs is the mirrored codename: that document is the archive's own, so a host reading one is offered the archive whole and meets the refusal at the fetch, which is the mid-transaction 403 the shape above avoids. Add `--base` to buy back the legible half.
+
 **Membership closes over the source package.** `bodega profile add web apt nginx` covers `nginx-common`, `nginx-core` and every other binary that source builds. Ubuntu renames and splits binaries within a stable source as routine maintenance, and a set closed on binary names would fire on each one. `--from-origin` writes source names for the same reason, and `bodega profile check` reports an apt entry naming a binary whose source differs — an entry that matches no paragraph in the index it governs, so the host is told the package does not exist:
 
 ```text
@@ -1777,9 +1807,9 @@ Results surface where an operator already looks. `bodega show pkg <type> <name>`
 $ bodega show pkg npm minimist
 Package: minimist
 
-VERSION      PLATFORM        STORED FROZEN   HIDDEN   CONSTRAINT OSV         CHECKED
-1.2.0        any             -      no       no       exact      2 vuln(s)   2026-09-08
-1.2.8        any             -      no       no       exact      clean       2026-09-08
+VERSION      PLATFORM        STORED     FROZEN   HIDDEN   CONSTRAINT OSV         CHECKED
+1.2.0        any             default    no       no       exact      2 vuln(s)   2026-09-08
+1.2.8        any             bulk       no       no       exact      clean       2026-09-08
 
 Flagged by OSV:
   1.2.0        GHSA-vh95-rmgr-6w4m, GHSA-xvch-5gv4-984h  (checked 2026-09-08)
@@ -2219,7 +2249,7 @@ Each names the path and the config file the path came from, so the next move is 
 bodega supports two storage backends:
 
 - **`local`** (default): Stores artifacts on the local filesystem. Set `storage_path` to change the root directory (default: `/var/lib/bodega`). No initialization needed, and no bucket: every command that touches storage runs without one.
-  A write lands in a `.bodega-tmp-*` file beside the destination and is renamed into place, so a key holds either its previous object or its new one and never a half-written body, and a reader already on the object keeps the one it opened even while a replacement publishes. Listings skip those staging names. A crash mid-write leaves one behind: it is safe to delete, and nothing reads it. A new object lands at the mode the server's umask allows. Refilling an existing one restates everything the object carried that decides who can reach it: its mode, its owner and group, its access ACL and its extended attributes, all applied to the staging file before the mode that makes it readable. So a `chmod`, a `chgrp` or a `setfacl` you applied to a single artifact survives the next fetch, and a reader the artifact denied stays denied. Where the server cannot restate one of them, the refill fails, says which one, and leaves the previous object exactly as it was: handing an artifact to a group it was kept from is not a thing a cache fill gets to decide. Giving an artifact a group the server does not belong to is the case that reaches this, and it needs `CAP_CHOWN` or a server running as a member of that group.
+  It is the only backend that carries per-object access state, and the only one on which a `chmod`, a `chgrp` or a `setfacl` you applied to a single artifact survives the next refill. See [Publication and access](#publication-and-access).
 - **`s3`**: Stores artifacts in an S3 bucket. Set `bucket` and `region`, then run `bodega init` to create the bucket with encryption and versioning.
 
 Manifests follow the backend. On `s3` they live under the `manifests/` prefix in the bucket; on `local` they live in `manifest_dir` on disk, which is also what `--local-config` selects against any backend.
@@ -2230,6 +2260,30 @@ A backend that fails to construct is not fatal for `bodega serve`. The server st
 ERROR storage backend unavailable — package routes will answer 503; the API and /healthz still serve
   backend=local config=/etc/bodega/config.json error=create storage root /dev/null/nope: mkdir /dev/null: not a directory
 ```
+
+### Publication and access
+
+Every backend publishes rather than overwrites. A key names the object it named before a write or the object the write stores, never something in between, whichever backend placement sent it to:
+
+- **A refill is all or nothing.** No client is served a half-written body, a truncated one or an empty one.
+- **A download in flight finishes on the object it started.** A replacement landing mid-transfer does not reach a client already reading, and the next request gets the new object.
+- **An interrupted write publishes nothing.** The key keeps what it held.
+
+What differs per backend is access, and it differs in the direction that matters:
+
+| | `local` | `s3` |
+| --- | --- | --- |
+| Refill preserves mode, owner, group, ACL, xattrs | yes | nothing to preserve |
+| A restriction survives the next refill | yes | no |
+| Bytes on disk when the write returns | not guaranteed | the service's guarantee |
+
+**On `local`, a restriction is a decision and a refill is not.** Refilling an object restates everything it carried that decides who can reach it: its mode, its owner and group, its access ACL and its extended attributes, applied to the staging file before the mode that makes it readable. So a reader the artifact denied stays denied. Where the server cannot restate one of them, the refill fails, names which one, and leaves the previous object exactly as it was: handing an artifact to a group it was kept from is not something a cache fill gets to decide. Giving an artifact a group the server does not belong to is the case that reaches this, and it needs `CAP_CHOWN` or a server running as a member of that group. A new object has nothing to carry and lands at the mode the server's umask allows.
+
+**On `s3`, it is not.** The backend reads and writes no per-object mode, owner or ACL, so there is nothing a refill can widen and equally nothing it preserves. An object ACL or a bucket policy applied outside bodega is not carried across a refill: the next write is a plain `PUT`. An artifact whose restriction has to survive refills belongs on a `local` backend, which per-package placement can arrange.
+
+**Durability.** On `local`, a write returns after the rename with no `fsync`, so a host that loses power moments later can come up holding either object. The guarantees above survive that; the bytes may not. Every artifact the store holds is refetchable from an upstream or rebuildable from source, and the alternative is an `fsync` on every proxy cache fill. Mount the storage tree with your filesystem's own barrier settings if you need the other trade.
+
+**Staging entries.** A `local` write fills a `.bodega-tmp-*` entry and renames it into place. A replacement gets a `.bodega-tmp-*` _directory_ of its own, holding one staging file, because for the length of the write that file holds a whole artifact under the server's access state rather than the object's, and a directory nothing else may enter is what keeps it unreadable until the rename. A fresh object is a `.bodega-tmp-*` file beside its destination. Listings skip both. A crash mid-write leaves one behind: it is safe to delete, and nothing reads it.
 
 ### Named backends and per-type placement
 
@@ -2340,7 +2394,9 @@ A bucket no configured backend answers to falls back to the type rule and logs a
 
 The PEP 503 indexes and the apt pool listing union every backend and fail the whole request with 502 if any one of them errors. A short index is indistinguishable from packages having been withdrawn, and apt acts on the difference.
 
-`/api/v1/status` does the opposite: one row per backend, the failing one carrying its error, `healthy: false`. A diagnostic exists to say which backend is broken. `bodega build status` and the `bodega status` dashboard follow the same policy — the dashboard's `By Backend` table exists because one volume filling up is invisible in a combined byte count.
+`/api/v1/status` does the opposite: one row per backend under `backend_entries`, the failing one carrying its error, `healthy: false`. A diagnostic exists to say which backend is broken. `bodega build status` and the `bodega status` dashboard follow the same policy — the dashboard's `By Backend` table exists because one volume filling up is invisible in a combined byte count.
+
+Every row names its backend in `backend` and reports the probe under `key` and `present`. Nothing in the row names a driver: the same backend name is a local directory on one install and a bucket on the next, and a client acting on this endpoint acts on whether the objects are there and on which backend failed. The fields were `s3_key` and `in_s3` through v1; a client reading either has to move to `key` and `present`, and `s3_entries` to `backend_entries`.
 
 #### Object size
 
@@ -2726,6 +2782,13 @@ The handler checks every occurrence of the `service` parameter, not the first. `
 #### Legacy bundle route
 
 `/git/{name}/{file}` still serves the `.bundle` and `.tar.gz` artifacts an uploader wrote to storage, unchanged. It predates smart-HTTP and stays because scripts fetch those URLs directly.
+
+```bash
+curl -O https://bodega-host:8080/git/netbox/netbox-v4.5.7.bundle
+git clone netbox-v4.5.7.bundle netbox
+```
+
+No `--branch` is needed: the packaging stage points the bundle's HEAD at the commit the entry's ref names, and refuses to write a bundle without one. A tag clones detached, a branch clones onto that branch, because git names a branch only when the bundle carries a `refs/heads/*` at HEAD's commit. A bundle written before HEAD was packaged has only its ref and clones into an empty repository whose error names the client's own branch; `bodega package git` rewrites it from the bare repo and the next `bodega sync` replaces the stored object at the same key.
 
 **A `git_upstreams` key and an uploaded git package may share a name. That is legal and neither shadows the other.** `GET /git/{name}/{file}` is the more specific ServeMux pattern, so it takes every two-segment path under `/git/`; a clone path is at least four, because the repository directory ends in `.git` and carries `info/refs` or `git-upload-pack` after it. The two coexist by depth. With `"tools"` in `git_upstreams` and a `tools` package in the manifest store, `/git/tools/tools-v1.2.0.bundle` serves the uploaded bundle and `/git/tools/org/repo.git/info/refs` resolves the upstream. Nothing rejects the pair at startup: manifest names are runtime data an operator adds and removes without restarting the server, so a startup check would refuse a config that was legal when it was written.
 
@@ -3115,7 +3178,7 @@ All API responses are JSON. The full API is documented in [OpenAPI 3.0 format](.
 | GET | `/api/v1/packages/{type}` | Entries for one type |
 | GET | `/api/v1/packages/{type}/{name}` | Single entry details |
 | GET | `/api/v1/packages/{type}/{name}/{version}` | One version, as a manifest scoped to it. Carries the `vetting.osv.*` keys on `metadata` |
-| GET | `/api/v1/status` | Health check with entry counts, S3 probe, and the apt client state |
+| GET | `/api/v1/status` | Health check with entry counts, one storage probe row per backend, and the apt client state |
 | GET | `/api/v1/config` | Non-sensitive config (bucket, region, manifest_dir) |
 | GET | `/api/v1/audit` | Query audit events (supports filters) |
 | GET | `/api/v1/profiles/{name}/pins` | One profile's pins, with their reason, review date and OSV state. `?stale=true` narrows to the overdue ones. Admin-gated. See [Pins as recorded decisions](#pins-as-recorded-decisions) |
@@ -3248,10 +3311,10 @@ When a dependency has a security issue, fails checksum verification, or is other
 
 The allow-list declares which upstream sources bodega is permitted to fetch from, at the granularity that matters for each ecosystem. It's opt-in: add a rule for a registry type and enforcement switches on for that type. Leave it empty and everything is accepted (pre-v0.2.0 behavior).
 
-Enforcement happens in four places, so there's no way around it:
+Enforcement happens in four places:
 
 - **Server proxy** (`bodega serve`) — cache-miss fetches check policy before leaving the box. Blocked fetches return 403.
-- **Builder** (`bodega build fetch`) — each fetch stage validates entries before any network I/O.
+- **Builder** — each fetch stage validates entries before any network I/O, on every surface that runs one: `bodega build fetch`, `bodega build run`, `bodega build package`, `bodega build upload`, and the interactive `bodega shell`. A refusal prints against the entry and lands in the shell's log pane like any other stage output. `bodega build sync` and `bodega repair` reach no fetcher and check nothing.
 - **Create API + import** (`POST /api/v1/packages/...`, `bodega pkg import`) — manifests referencing blocked upstreams are rejected at creation time. Fail early, not at first fetch.
 - **Interactive create** (`bodega pkg create`) — warns the operator and asks y/N to proceed. The only path that allows override, and the override writes a `policy_override` audit event.
 
@@ -3268,6 +3331,12 @@ bodega policy add pypi requests
 
 # Audit existing manifests for any violations
 bodega policy check
+```
+
+Enforcement needs the audit database, which is where the rules live. An install that configures no `audit_db` has no allow-list to apply, and every upstream is permitted. That state is announced rather than assumed: each run that reaches a fetch without one prints a single line before the first entry, on the same output the fetch reports to.
+
+```text
+  policy: no upstream allow-list loaded, so every upstream is permitted. Set audit_db and add rules with `bodega policy add` to enforce one.
 ```
 
 The allow-list is stored in SQLite (`upstream_policies` table in the audit DB) and is hot-mutable — server changes are picked up within 30 seconds, and policy mutations invalidate the cache immediately.
@@ -3354,7 +3423,9 @@ Configure the TTL:
 { "metadata_ttl": "1h" }
 ```
 
-**A name no manifest holds still proxies.** `gomod`, `npm` and `cargo` answer a package with no entry from upstream and cache what they get, which is what makes a clean host able to bootstrap through bodega. For `gomod` that covers the whole module protocol — `@v/list`, `.info`, `.mod` and `.zip` — because `go get` reads all four and a listing served alone fails the resolution one step later. The `npm` tarball, `pypi` wheel and `helm` chart routes are the exception: each serves only what an entry names, so an uncatalogued name reaches those as a 404 even with the proxy on.
+**A name no manifest holds still proxies.** `gomod`, `npm` and `cargo` answer a package with no entry from upstream and cache what they get, which is what makes a clean host able to bootstrap through bodega. For `gomod` that covers the whole module protocol — `@v/list`, `.info`, `.mod` and `.zip` — because `go get` reads all four and a listing served alone fails the resolution one step later. For `npm` it covers the packument and the tarball together, for the same reason at one remove: the proxied packument has every `dist.tarball` rewritten onto this server's own `/npm/{pkg}/-/{tarball}`, so a tarball route that refused what the packument published would fail `npm install` on a URL bodega itself named.
+
+**`pypi` wheels and `helm` charts stay catalog-only, for different reasons.** A wheel URL is read out of the simple index rather than composed from a filename, and nothing publishes one for a distribution no entry names: `/pypi/simple/{dist}/` republishes the upstream index for a `proxy`-mode distribution only and lists stored wheels otherwise. Opening the wheel route would pay a simple-index fetch per request for addresses only a guess produces. A chart repository URL is recorded per version entry rather than in config, so an uncatalogued chart names no host to reach at all, and composing one from the chart name is the guess [`pkg import`](#bodega-pkg-import-file-file) already refuses. Both routes answer the missing entry rather than a bare 404: the response names the distribution or chart, what bodega would have needed to fetch it, and the `bodega pkg create` line that supplies it. A `no_manifest` discovery row is written either way, as before.
 
 Which upstreams may be reached at all is the allow-list's decision, not this switch's: with rules configured for a type, a candidate that matches none is refused with a `cache` row at `status=policy_violation`. See [Supply Chain Management](#supply-chain-management).
 
@@ -3524,7 +3595,7 @@ One row per request on both serving outcomes, so counting `cache_miss` over a wi
 
 A recorded origin belongs to the bytes, not to the key they sit under. A fetch reads its cached object back before recording anything and records nothing unless those bytes hash to what it fetched, so an upload that landed at the key while the fetch was in flight takes the row with it rather than inheriting it. A hit then compares what the backend reports — the object's location, its length, and its entity tag or its timestamp — against the handle it is about to serve from, not against an earlier lookup. So an artifact replaced under a key it already occupied is not credited to the archive that supplied the previous tenant, whether it was replaced by `bodega pkg upload`, by a delete and a refill, or by a move to another bucket, and whether the replacement is the same length as what it displaced or not.
 
-A response already in flight is unaffected by the replacement: it serves the object it opened, under that object's origin, and the next request serves the new one. That holds because the backends publish rather than overwrite (see [Storage backends](#storage-backends)), and it is what lets the row be written from the same open that supplies the body.
+A response already in flight is unaffected by the replacement: it serves the object it opened, under that object's origin, and the next request serves the new one. That holds because every backend publishes rather than overwrites (see [Publication and access](#publication-and-access)), and it is what lets the row be written from the same open that supplies the body.
 
 Provenance a fetch is still in the middle of publishing is answered from that fetch. Bytes become readable partway through the write to storage and the origin lands after it, and a client arriving in between gets the upstream of the fill it is reading rather than a blank — once the object it is serving is confirmed to be the one that fill fetched, which costs a read of it and happens only inside that window.
 
@@ -3600,7 +3671,8 @@ A read-only audit database used to be the quieter version of the same loss: `Rec
 │ git/               │ Ref:     v4.5.7            │
 │   netbox@v4.5.7    │ Source URL: https://git... │
 │ pypi/              │ Frozen:  no                │
-│ binary/            │ S3:      ✓ uploaded        │
+│ binary/            │ Stored:  yes (backend      │
+│                    │          default)          │
 │ gomod/             │                            │
 │ helm/              │                            │
 │ npm/               │                            │
@@ -3652,6 +3724,8 @@ The reset deletes those eleven keys rather than writing the built-in defaults in
 The form edits no ACL. `deny_list`, `admin_permit_cidr` and `trusted_proxies` are seeded from the config file on first start and inert afterwards, so a field writing them to `config.json` would accept a value, save it, report success and change nothing about who the server refuses. Edit them with `bodega acl deny`, `bodega acl admin` and `bodega acl proxies`; the form says so under its title.
 
 ### Details pane
+
+Two fields report where an entry's bytes are. **Stored** answers whether the probe found the primary artifact and names the backend it looked on (`yes (backend default)`); **Object** prints that object's URI, prefixed with the backend's own label — `file://<storage_path>` for a local backend, `s3://<bucket>` for an s3 one. Both read the backend the manifest entry records, so a local-only install reports its own disk rather than a bucket it never configured. Neither field is derived from `bucket`: an install carrying a leftover `bucket` key alongside `"storage_backend": "local"` printed an `s3://` URI over bytes on its own disk through v1.
 
 The last field of an entry is the client instruction, and its label names the shape rather than assuming a URL: **Sources line** for apt, **Registry stanza** for cargo, **Package URL** for the other six. All three carry the base URL `public_url` and the TLS pair resolve to, so a pane behind a terminating proxy prints what a client outside it reaches.
 

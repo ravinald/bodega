@@ -46,6 +46,32 @@ e2e_on server "sudo find /var/lib/bodega/npm/is-number -type f 2>/dev/null | hea
 check_contains PXY-NPM-02 "the proxied npm packument is written to storage" \
 	"is-number" "${E2E_OUT:-nothing stored}" "internal/server/proxy.go:59" "find /var/lib/bodega/npm/is-number"
 
+# The tarball the packument above published. bodega rewrites every dist.tarball
+# onto its own /npm route, so this is the URL an `npm install` follows next and
+# the one that used to 404: a client resolved through bodega and then failed on
+# an address bodega named. The version is pinned rather than read back out of
+# the packument, because a shell that parses JSON to build the next request
+# fails as a parse error rather than as the route.
+E2E_HOST=client
+e2e_http client "/npm/is-number/-/is-number-7.0.0.tgz" || true
+check_eq PXY-NPM-03 "the tarball the packument published is served" "200" "$E2E_OUT" \
+	"internal/server/npm.go:82" "GET /npm/is-number/-/is-number-7.0.0.tgz"
+
+E2E_HOST=server
+e2e_on server "sudo find /var/lib/bodega/npm/is-number -name '*.tgz' -type f 2>/dev/null | head -3" || true
+check_contains PXY-NPM-04 "the proxied npm tarball is written to storage" \
+	".tgz" "${E2E_OUT:-nothing stored}" "internal/server/proxy.go:59" "find /var/lib/bodega/npm/is-number -name '*.tgz'"
+
+# helm is the route that cannot be opened: a chart repository URL is recorded
+# per version entry, so an uncatalogued chart names no host to fetch from. What
+# it owes an operator is the reason, not a bare 404 that reads as the chart not
+# existing upstream.
+E2E_HOST=client
+e2e_body client "/helm/charts/ingress-nginx-4.0.0.tgz" || true
+check_contains PXY-HELM-01 "an uncatalogued chart is refused by name, with the command that fixes it" \
+	"bodega pkg create helm ingress-nginx" "${E2E_OUT:-no body}" \
+	"internal/server/helm.go:99" "GET /helm/charts/ingress-nginx-4.0.0.tgz"
+
 # cargo: the sparse index entry for a crate nothing hosts.
 E2E_HOST=client
 e2e_http client "/cargo/an/yh/anyhow" || true
@@ -105,11 +131,11 @@ check_contains PXY-02c "a request the cache answered is recorded as a hit" \
 # A declared Content-Length over the artifact cap is refused before a byte
 # moves. Set the cap absurdly low and any upstream artifact exceeds it.
 #
-# A gomod .zip, not an npm tarball. The npm tarball route serves only what an
-# entry names, so an uncatalogued package 404s there before a spool is ever
-# opened. That is still a refusal, so PXY-03 passed while measuring the wrong
-# one and PXY-04 had no row to read. The module the listing above resolved is
-# uncatalogued by design and does reach the spool.
+# A gomod .zip, not an npm tarball. The npm tarball above is cached by now, and
+# a request the cache answers opens no spool at all, so the probe would measure
+# nothing again — for a second reason, after B58 found it measuring a route 404.
+# The module below is uncatalogued and its .zip is removed first, so the request
+# is a miss that reaches the spool.
 
 e2e_config_set server '.spool_max_artifact_bytes = 1024' || true
 e2e_restart server || true

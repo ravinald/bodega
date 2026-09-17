@@ -138,14 +138,53 @@ func TestCheckGitStage_Packaged(t *testing.T) {
 
 	mkDir(t, gitBareDir(d, "netbox", ve))
 	bundlePath := filepath.Join(d.bundles, "netbox", "netbox-"+ve.Ref+".bundle")
-	touchFile(t, bundlePath)
+	writeBundle(t, bundlePath, true)
 
 	s := CheckGitStage(cfg, "netbox", ve)
 	if !s.Fetched {
 		t.Error("expected Fetched=true")
 	}
 	if !s.Packaged {
-		t.Error("expected Packaged=true when bundle file exists")
+		t.Error("expected Packaged=true when the bundle carries a HEAD")
+	}
+}
+
+// A bundle with no HEAD clones into an empty repository. The packaging stage
+// rewrites one only while the stage check calls it unpackaged, so this is the
+// path that repairs an artifact built before HEAD was packaged.
+func TestCheckGitStage_PackagedBundleWithoutHEAD(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	ve := manifest.VersionEntry{URL: "https://github.com/netbox/netbox", Ref: "v4.0.0", Source: "clone"}
+	d := buildDirs(root)
+
+	mkDir(t, gitBareDir(d, "netbox", ve))
+	writeBundle(t, filepath.Join(d.bundles, "netbox", "netbox-"+ve.Ref+".bundle"), false)
+
+	s := CheckGitStage(cfg, "netbox", ve)
+	if !s.Built {
+		t.Error("expected Built=true: the file is on disk")
+	}
+	if s.Packaged {
+		t.Error("expected Packaged=false when the bundle carries no HEAD")
+	}
+}
+
+// writeBundle writes a bundle header, with or without a HEAD ref. Only the
+// header is read by the stage check, so the pack is a stand-in.
+func writeBundle(t *testing.T, path string, withHEAD bool) {
+	t.Helper()
+	const id = "0f11ee6918f41a04c201eceeadf612a377bc7fbc"
+	body := "# v2 git bundle\n"
+	if withHEAD {
+		body += id + " HEAD\n"
+	}
+	body += id + " refs/tags/v4.0.0\n\nPACK"
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
 	}
 }
 
@@ -277,9 +316,13 @@ func TestCheckPypiStage_Fetched(t *testing.T) {
 	store := manifest.NewLocalStore(root)
 
 	touchFile(t, filepath.Join(root, "combined-requirements.txt"))
+	if CheckPypiStage(cfg, store).Fetched {
+		t.Error("expected Fetched=false with no resolved closure for the build to read")
+	}
+	touchFile(t, pypiLockPath(root))
 	s := CheckPypiStage(cfg, store)
 	if !s.Fetched {
-		t.Error("expected Fetched=true when combined-requirements.txt exists")
+		t.Error("expected Fetched=true when the requirements and the closure both exist")
 	}
 	if s.Built {
 		t.Error("expected Built=false when no .whl files")
@@ -293,6 +336,7 @@ func TestCheckPypiStage_Built(t *testing.T) {
 	d := buildDirs(root)
 
 	touchFile(t, filepath.Join(root, "combined-requirements.txt"))
+	touchFile(t, pypiLockPath(root))
 	wheelsDir := pypiWheelsDir(d)
 	touchFile(t, filepath.Join(wheelsDir, "somepackage-1.0-py3-none-any.whl"))
 
@@ -312,6 +356,7 @@ func TestCheckPypiStage_Packaged(t *testing.T) {
 	d := buildDirs(root)
 
 	touchFile(t, filepath.Join(root, "combined-requirements.txt"))
+	touchFile(t, pypiLockPath(root))
 	wheelsDir := pypiWheelsDir(d)
 	touchFile(t, filepath.Join(wheelsDir, "somepackage-1.0-py3-none-any.whl"))
 	touchFile(t, filepath.Join(wheelsDir, "MANIFEST.sha256"))

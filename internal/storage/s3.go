@@ -24,6 +24,28 @@ func newS3FromSpec(ctx context.Context, spec Spec) (ObjectStore, error) {
 }
 
 // S3 adapts the existing internal/s3.Client to the ObjectStore interface.
+//
+// Write contract (ObjectStore.Put). S3 keeps the first three, per object. A
+// PUT is atomic, so a reader gets the previous object or the new one; a GET
+// already in flight is served from the version it opened, so an open handle is
+// a snapshot. An interrupted upload publishes nothing. A multipart upload that
+// dies partway leaves uploaded parts behind, which are billed and are not an
+// object: they never appear in List and nothing serves them, but nothing here
+// aborts them either: InitBucket sets no lifecycle rule, so clearing them is
+// the bucket's own configuration to carry.
+//
+// Durability is the bucket's. PutBytes and UploadFile return when S3
+// acknowledges the object, which is a stronger promise than Local's and is
+// still not one this package makes; it is a property of the service, and a
+// caller may not assume it of an ObjectStore.
+//
+// The fourth it keeps vacuously, and the difference from Local is worth
+// reading before an artifact is restricted. S3 carries no per-object access
+// state this backend reads or writes: no mode, no owner, no ACL. So a refill
+// has nothing to restate and nothing to widen, and equally, an object ACL or a
+// bucket policy applied outside bodega is not something a refill preserves:
+// the next write is a plain PUT. An artifact whose restriction has to survive
+// refills belongs on a local backend, which placement can arrange per package.
 type S3 struct {
 	client *bos3.Client
 }

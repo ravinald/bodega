@@ -39,9 +39,17 @@ import (
 //
 // Filtering Packages forces a matching Release, and Release is signed. Signing
 // per profile on render would put a key operation on the hottest cached path
-// and make InRelease uncacheable across hosts, so a profile that scopes apt is
-// served under a codename of its own, generated and signed once per rebuild
-// like any other generated suite.
+// and make InRelease uncacheable across hosts, so every filtered document is
+// generated and signed once per rebuild, like any other generated suite.
+//
+// Where it is served from depends on what there was to filter. A profile
+// naming a mirrored base gets a codename of its own, derived from that base
+// and installed by `bodega doctor --write-apt-sources`. A suite bodega builds
+// from its own catalog derives from nothing and has no second name to take, so
+// the profile's view is served under the suite's own — the one dists/ route
+// that answers two hosts differently, which aptIndex picks and no-store keeps
+// out of a shared cache. Without that view a bound host read the whole catalog
+// off a suite its profile entitled none of (B59).
 //
 // The boundary then lives in the client's sources.list, which the host can
 // edit. It scopes what a correctly configured host is told exists; it
@@ -75,60 +83,86 @@ type aptProfileSuite struct {
 	index    *aptSuiteIndex
 }
 
-// aptProfileSuites resolves every profile that scopes apt into a suite this
-// server can generate, dropping the ones it cannot with the reason.
+// aptProfileView is one profile that governs apt and the predicate every index
+// served to its hosts is filtered through.
+//
+// Every profile stating an apt rule produces one, whether or not it names a
+// base. The base decides only whether a filtered codename can be derived from
+// an upstream suite; the view decides what bodega's own generated suites carry
+// for that profile's hosts, and whether the pool answers them.
+type aptProfileView struct {
+	profile string
+	permit  *entitle.Profile
+}
+
+// aptProfileViews resolves every profile that governs apt, in the order the
+// profile table lists them.
 //
 // Read from the profile tables directly rather than from the binding set,
-// because a codename exists whether or not a host is bound to it yet: an
-// operator writes the profile, reads the sources line off `bodega doctor`, and
-// binds the host afterwards. Requiring the binding first would mean the
-// codename 404s during exactly the step that installs it.
-func (s *Server) aptProfileSuites(ctx context.Context) (suites []aptProfileSuite, scoped bool) {
+// because a view exists whether or not a host is bound to it yet: an operator
+// writes the profile, reads the sources line off `bodega doctor`, and binds
+// the host afterwards. Requiring the binding first would mean the index the
+// host is about to read is generated for the first time during exactly the
+// step that installs it.
+func (s *Server) aptProfileViews(ctx context.Context) []aptProfileView {
 	if s.auditDB == nil {
-		return nil, false
+		return nil
 	}
 	profiles, err := s.auditDB.ListProfiles(ctx)
 	if err != nil {
-		s.logger.Error("could not read the profiles, so no filtered apt codename was generated at this rebuild", "error", err)
-		return nil, false
+		s.logger.Error("could not read the profiles, so no apt index was filtered at this rebuild", "error", err)
+		return nil
 	}
-	var out []aptProfileSuite
+	var out []aptProfileView
 	for _, prof := range profiles {
 		d, err := s.auditDB.GetProfile(ctx, prof.Name)
 		if err != nil {
-			s.logger.Error("could not read a profile to generate its filtered apt codename", "profile", prof.Name, "error", err)
+			s.logger.Error("could not read a profile to filter its apt index", "profile", prof.Name, "error", err)
 			continue
 		}
 		p := entitle.New(d)
-		base, refused := p.AptScope()
+		if !p.Governs(manifest.TypeApt) {
+			continue
+		}
+		out = append(out, aptProfileView{profile: prof.Name, permit: p})
+	}
+	return out
+}
+
+// aptProfileSuites resolves every profile that scopes apt onto an upstream
+// base into a codename this server can generate, dropping the ones it cannot
+// with the reason.
+//
+// A profile absent from this list is not a profile bodega stopped filtering:
+// it derives no codename, and its hosts read a filtered view of the generated
+// suites instead. Only a profile that named a base and lost it is a withdrawal,
+// and each one is logged where it happens.
+func (s *Server) aptProfileSuites(views []aptProfileView) []aptProfileSuite {
+	var out []aptProfileSuite
+	for _, v := range views {
+		base, refused := v.permit.AptScope()
 		if refused != "" {
 			s.logger.Error("a profile names an apt base and has no filtered codename, because the filtered index would be the upstream document verbatim under bodega's signature; set the apt rule to membership closed with expansion block, or drop the base",
-				"profile", prof.Name, "reason", refused)
+				"profile", v.profile, "reason", refused)
 			continue
 		}
 		if base == "" {
 			continue
 		}
-		// Recorded here, ahead of every withdrawal below and of the ones
-		// aptProfileIndexes makes after that. The pool predicate refuses this
-		// profile's hosts whether or not a codename survives to be served, so
-		// a cache directive that waits for one is right about the archive and
-		// wrong about the refusal.
-		scoped = true
 		if !s.cfg.MirrorsAptCodename(base) {
 			s.logger.Error("a profile names an apt base no upstream archive serves, so it has no filtered codename; add the base to apt_upstreams or move the profile onto one that is there",
-				"profile", prof.Name, "base", base,
+				"profile", v.profile, "base", base,
 				"mirrored", strings.Join(s.cfg.MirroredAptCodenames(), " "))
 			continue
 		}
-		codename := config.ProfileAptCodename(base, prof.Name)
-		if err := s.cfg.ValidateProfileAptCodename(codename, base, prof.Name); err != nil {
+		codename := config.ProfileAptCodename(base, v.profile)
+		if err := s.cfg.ValidateProfileAptCodename(codename, base, v.profile); err != nil {
 			s.logger.Error("a profile's filtered apt codename cannot be served", "error", err)
 			continue
 		}
-		out = append(out, aptProfileSuite{profile: prof.Name, base: base, codename: codename, permit: p})
+		out = append(out, aptProfileSuite{profile: v.profile, base: base, codename: codename, permit: v.permit})
 	}
-	return s.dropCollidingCodenames(out), scoped
+	return s.dropCollidingCodenames(out)
 }
 
 // dropCollidingCodenames removes every profile whose derived codename another
@@ -176,10 +210,10 @@ func (s *Server) dropCollidingCodenames(suites []aptProfileSuite) []aptProfileSu
 // One fetch per (base, architecture) serves every profile over that base. Two
 // profiles filtering noble read one upstream Packages between them, which is
 // the difference between a linear cost in profiles and a linear cost in bases.
-func (s *Server) aptProfileIndexes(ctx context.Context, date, validUntil time.Time) (served []aptProfileSuite, scoped bool) {
-	suites, scoped := s.aptProfileSuites(ctx)
+func (s *Server) aptProfileIndexes(ctx context.Context, views []aptProfileView, date, validUntil time.Time) (served []aptProfileSuite) {
+	suites := s.aptProfileSuites(views)
 	if len(suites) == 0 {
-		return nil, scoped
+		return nil
 	}
 	releases := map[string]map[string]string{}
 	cache := map[string]aptIndexRead{}
@@ -210,7 +244,7 @@ func (s *Server) aptProfileIndexes(ctx context.Context, date, validUntil time.Ti
 		ps.index = s.aptIndexFrom(ps.codename, packages, date, validUntil)
 		out = append(out, ps)
 	}
-	return out, scoped
+	return out
 }
 
 // aptIndexRead is one (base, architecture) upstream read, shared across every
@@ -554,11 +588,19 @@ func aptReleaseDigests(release map[string]string) map[string]string {
 // costs that client its transaction, which is the price of a request nothing
 // offered.
 //
-// Which is also why it runs for a profile that scopes apt and for no other. A
-// profile whose apt membership is open reads the mirrored codename unchanged
-// and has no filtered index behind it, so a refusal here would be enforcement
-// with no legible half — the 403 mid-transaction this whole shape exists to
-// avoid, arriving on a package the index the client read said it could have.
+// Which is also why it runs for a profile that governs apt and for no other. A
+// profile stating no apt rule is ungoverned for the type, and a refusal there
+// would be enforcement with no legible half — the 403 mid-transaction this
+// whole shape exists to avoid, arriving on a package the index the client read
+// said it could have.
+//
+// It runs for a governing profile that names no base as well, which is the
+// disclosure B59 reported: bodega's own generated suites are filtered for that
+// profile and the pool is the only control over a mirrored codename, which is
+// the archive's own signed document and cannot be filtered without a base to
+// derive one from. A host in that state reads the mirror unfiltered and is
+// refused at the fetch. `bodega profile set <p> apt --apt-base <codename>`
+// buys back the legible half.
 //
 // The source package comes from the pool path, with no index lookup: Debian
 // lays the pool out as
@@ -582,7 +624,7 @@ func (s *Server) aptPoolGate(w http.ResponseWriter, r *http.Request, poolPath st
 	return s.entitleGate(w, r, manifest.TypeApt, name, version)
 }
 
-// aptGatesPool reports whether this request's own profile scopes apt, which is
+// aptGatesPool reports whether this request's own profile governs apt, which is
 // the one condition under which the pool route is a profile-decided one.
 //
 // It decides the predicate and nothing else. The cache directive is a server
@@ -591,17 +633,17 @@ func (s *Server) aptPoolGate(w http.ResponseWriter, r *http.Request, poolPath st
 // proxy to overturn, and the next host is an unidentified one on every
 // instance.
 func (s *Server) aptGatesPool(r *http.Request) bool {
-	p := s.profileFor(r)
-	if p == nil {
-		return false
-	}
-	base, _ := p.AptScope()
-	return base != ""
+	return s.profileFor(r).Governs(manifest.TypeApt)
 }
 
-// aptScopedAnywhere reports whether any profile on this instance scopes apt,
+// aptScopedAnywhere reports whether any profile on this instance governs apt,
 // which is the server fact the pool route's cache directive turns on. See
 // handleAptPool for why that directive cannot be a per-request one.
+//
+// It tracks aptGatesPool exactly, and has to: the directive exists to stop a
+// shared cache answering a refused host out of a permitted host's fetch, so a
+// predicate narrower than the one that refuses would leave the window it
+// closes half open.
 //
 // Two sources, because each covers a window the other leaves open. The binding
 // set is live from the moment a host is bound and is what aptGatesPool itself

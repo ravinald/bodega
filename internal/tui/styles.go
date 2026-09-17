@@ -63,13 +63,13 @@ var errorStyle = lipgloss.NewStyle().Foreground(colorRed)
 var successStyle = lipgloss.NewStyle().Foreground(colorGreen)
 
 // statusIcon returns the icon for a tree-node status.
-func statusIcon(inS3, frozen, hidden bool) string {
+func statusIcon(stored, frozen, hidden bool) string {
 	switch {
 	case hidden:
 		return dimStyle.Render("~")
 	case frozen:
 		return lipgloss.NewStyle().Foreground(colorYellow).Render("*")
-	case inS3:
+	case stored:
 		return lipgloss.NewStyle().Foreground(colorGreen).Render("+")
 	default:
 		return lipgloss.NewStyle().Foreground(colorRed).Render("-")

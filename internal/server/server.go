@@ -1,7 +1,8 @@
 // Package server implements the bodega HTTP package server.
 //
-// The server proxies S3-backed package artifacts to standard package manager
-// clients (apt, pip) and exposes a REST API for manifest inspection.
+// The server proxies stored package artifacts to standard package manager
+// clients (apt, pip) and exposes a REST API for manifest inspection. Which
+// backend holds the bytes is the manifest entry's business, not the handler's.
 package server
 
 import (
@@ -981,21 +982,25 @@ type statusResponse struct {
 	// repository answers the whole fleet, so its build number is a public
 	// statement of which advisories apply to it unless the field is gated the
 	// way spool.Dir is.
-	Version    string          `json:"version,omitempty"`
-	EntryCount map[string]int  `json:"entry_count"`
-	Apt        aptStatus       `json:"apt"`
-	Spool      spoolStats      `json:"spool"`
-	S3Entries  []s3EntryStatus `json:"s3_entries,omitempty"`
-	Error      string          `json:"error,omitempty"`
+	Version        string               `json:"version,omitempty"`
+	EntryCount     map[string]int       `json:"entry_count"`
+	Apt            aptStatus            `json:"apt"`
+	Spool          spoolStats           `json:"spool"`
+	BackendEntries []backendEntryStatus `json:"backend_entries,omitempty"`
+	Error          string               `json:"error,omitempty"`
 }
 
-type s3EntryStatus struct {
+// backendEntryStatus is one probe row, reported against the backend that
+// answered it. backend carries no omitempty: a row that names no backend is
+// the report this shape exists to replace, and a consumer cannot tell an
+// absent name from a local install by looking at the key.
+type backendEntryStatus struct {
 	Type    string `json:"type"`
 	Name    string `json:"name"`
-	S3Key   string `json:"s3_key"`
-	InS3    bool   `json:"in_s3"`
+	Key     string `json:"key"`
+	Present bool   `json:"present"`
 	Frozen  bool   `json:"frozen,omitempty"`
-	Backend string `json:"backend,omitempty"`
+	Backend string `json:"backend"`
 	Error   string `json:"error,omitempty"`
 }
 
@@ -1037,10 +1042,10 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 	// broken, so it reports every backend it could reach, marks the one it
 	// could not, and calls the server unhealthy.
 	for _, ns := range s.stores.All() {
-		row := s3EntryStatus{
+		row := backendEntryStatus{
 			Type:    manifest.TypeApt,
 			Name:    "apt-pool",
-			S3Key:   manifest.AptPoolPrefix,
+			Key:     manifest.AptPoolPrefix,
 			Backend: ns.Name,
 		}
 		keys, err := ns.Store.List(r.Context(), manifest.AptPoolPrefix)
@@ -1050,9 +1055,9 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 			row.Error = err.Error()
 			s.logger.Error("object store probe failed", "backend", ns.Name, "prefix", manifest.AptPoolPrefix, "error", err)
 		} else {
-			row.InS3 = len(keys) > 0
+			row.Present = len(keys) > 0
 		}
-		resp.S3Entries = append(resp.S3Entries, row)
+		resp.BackendEntries = append(resp.BackendEntries, row)
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -1658,6 +1663,40 @@ func (s *Server) proxyVersion(w http.ResponseWriter, r *http.Request, typ, pkg, 
 	s.proxyS3(w, r, store, key)
 }
 
+// proxyVersionOrRefuse serves the artifact its manifest entry names, and
+// answers reason instead of a bare 404 when no backend holds it.
+//
+// It exists for the two routes that cannot proxy an uncatalogued name: pypi,
+// where a wheel URL is read out of the simple index rather than composed, and
+// helm, where the chart repository is recorded per version entry so there is no
+// host to reach. A bare 404 on either reads as "no such artifact upstream",
+// which is a different problem with a different fix; what is actually missing
+// is the entry, and the operator needs to be told that and given the command.
+//
+// The Head is what separates the two answers, and a Head that errors falls
+// through to proxyS3 rather than refusing: a backend that cannot be read has
+// not established that the object is absent, and proxyS3 reports that as 502.
+func (s *Server) proxyVersionOrRefuse(w http.ResponseWriter, r *http.Request, typ, pkg, version, key, reason string) {
+	store, err := s.versionStore(r.Context(), typ, pkg, version)
+	if err != nil {
+		s.logger.Error("storage backend recorded for artifact is not configured",
+			"type", typ, "package", pkg, "version", version, "key", key, "error", err)
+		http.Error(w, "storage backend error", http.StatusBadGateway)
+		return
+	}
+	if !s.requireStorage(w, store) {
+		return
+	}
+	status, headErr := store.Head(r.Context(), key)
+	if headErr != nil {
+		s.logger.Error("s3 head check failed", "key", key, "error", headErr)
+	} else if status == nil || !status.Exists {
+		http.Error(w, reason, http.StatusNotFound)
+		return
+	}
+	s.proxyS3(w, r, store, key)
+}
+
 // listFanout unions List across every backend a read of typ may reach.
 //
 // One backend failing fails the whole call. A partial index is worse than an
@@ -1758,7 +1797,7 @@ func (s *Server) openStored(w http.ResponseWriter, r *http.Request, store storag
 	}
 	result, err := store.GetStream(r.Context(), s3Key)
 	if err != nil {
-		s.logger.Error("s3 proxy error", "key", s3Key, "error", err)
+		s.logger.Error("object proxy error", "key", s3Key, "error", err)
 		http.Error(w, "upstream error", http.StatusBadGateway)
 		return nil, false
 	}
@@ -1771,7 +1810,7 @@ func (s *Server) openStored(w http.ResponseWriter, r *http.Request, store storag
 
 // serveStored streams an already-open object to the response.
 func (s *Server) serveStored(w http.ResponseWriter, s3Key string, result *storage.StreamResult) {
-	// Set Content-Type from extension, falling back to S3's stored value.
+	// Set Content-Type from extension, falling back to the backend's stored value.
 	ct := contentTypeForKey(s3Key)
 	if ct == "" {
 		ct = result.ContentType
@@ -1916,7 +1955,7 @@ func (iw *cacheDirectiveWriter) begin(code int) {
 	}
 }
 
-// contentTypeForKey returns the MIME type for a given S3 key based on extension.
+// contentTypeForKey returns the MIME type for a given object key based on extension.
 func contentTypeForKey(key string) string {
 	return contentTypes[strings.ToLower(path.Ext(key))]
 }
@@ -1951,7 +1990,7 @@ func wheelDistName(filename string) string {
 	return parts[0]
 }
 
-// uniquePackageNames scans S3 keys under pypi/wheels/ and returns the sorted
+// uniquePackageNames scans object keys under pypi/wheels/ and returns the sorted
 // list of unique normalised package names found.
 func uniquePackageNames(keys []string) []string {
 	seen := make(map[string]struct{})

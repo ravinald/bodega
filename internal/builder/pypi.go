@@ -922,17 +922,23 @@ func sortedKeys(m map[string]string) []string {
 	return out
 }
 
+// isFile reports whether path exists and is a regular file.
+func isFile(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && !fi.IsDir()
+}
+
 // CheckPypiStage inspects the filesystem to determine which pipeline stages
 // have completed for the pypi packages.
 func CheckPypiStage(cfg *Config, store *manifest.Store) StageStatus {
 	d := buildDirs(cfg.rootFor(manifest.TypePypi))
 	var s StageStatus
 
-	// Fetched = combined-requirements.txt exists.
-	combinedReq := filepath.Join(cfg.rootFor(manifest.TypePypi), "combined-requirements.txt")
-	if fi, err := os.Stat(combinedReq); err == nil && !fi.IsDir() {
-		s.Fetched = true
-	}
+	// Fetched = the requirements and the closure they resolved to both exist.
+	// The build reads the lock, so a run that wrote only the requirements has
+	// nothing for the next stage and must not be reported as done.
+	root := cfg.rootFor(manifest.TypePypi)
+	s.Fetched = isFile(filepath.Join(root, "combined-requirements.txt")) && isFile(pypiLockPath(root))
 
 	if s.Fetched {
 		// Built = at least one .whl file in the wheels dir.
@@ -959,8 +965,10 @@ func PypiArtifactDir(cfg *Config, store *manifest.Store) (localDir, s3Prefix str
 }
 
 // FetchPypi resolves requirements from previously-cloned git repos and from
-// the extra packages listed in the pypi manifests, then writes
-// <build-root>/combined-requirements.txt.
+// the extra packages listed in the pypi manifests, writes
+// <build-root>/combined-requirements.txt, then downloads the closure that file
+// resolves to into <build-root>/wheelhouse/ and records a SHA-256 per file in
+// <build-root>/resolved-requirements.txt and the audit cache.
 //
 // The caller must ensure that any git repos referenced by base-requirement
 // entries have been fetched before calling FetchPypi.
@@ -985,10 +993,27 @@ func FetchPypi(cfg *Config, store *manifest.Store) *Summary {
 		_, _ = fmt.Fprintf(cfg.stdout(), "    Discarded %s: it no longer describes the manifest\n", combinedReq)
 	}
 	_ = os.Remove(filepath.Join(root, "combined-constraints.txt"))
+	// The lock and the wheelhouse go with it. Bytes left in the wheelhouse are
+	// reachable from the build through --find-links, so a closure a fetch
+	// refused must not survive the fetch that refused it.
+	_ = os.Remove(pypiLockPath(root))
+	_ = os.RemoveAll(pypiWheelhouseDir(root))
 	return summary
 }
 
 func fetchPypi(cfg *Config, store *manifest.Store) *Summary {
+	summary := resolvePypiRequirements(cfg, store)
+	if summary.HasFailures() {
+		return summary
+	}
+	return fetchPypiClosure(cfg, summary)
+}
+
+// resolvePypiRequirements writes combined-requirements.txt and, when the
+// applications carry any, combined-constraints.txt. It reaches no index for
+// bytes: it reads each entry's version off the index and each application's
+// requirements off disk.
+func resolvePypiRequirements(cfg *Config, store *manifest.Store) *Summary {
 	ctx := context.Background()
 	out := cfg.stdout()
 	summary := &Summary{}
@@ -1178,19 +1203,89 @@ func fetchPypi(cfg *Config, store *manifest.Store) *Summary {
 	result.Elapsed = time.Since(start)
 	summary.Results = append(summary.Results, result)
 	summary.Total++
-	_, _ = fmt.Fprintf(out, "    Done (%s)\n", result.Elapsed.Round(time.Millisecond))
+
+	return summary
+}
+
+// fetchPypiClosure downloads everything the resolved requirements imply, pins a
+// digest per file, and writes the lock the build reads instead of an index.
+func fetchPypiClosure(cfg *Config, summary *Summary) *Summary {
+	ctx := context.Background()
+	out := cfg.stdout()
+	root := cfg.rootFor(manifest.TypePypi)
+	combinedReq := filepath.Join(root, "combined-requirements.txt")
+	house := pypiWheelhouseDir(root)
+
+	start := time.Now()
+	result := Result{Type: manifest.TypePypi, Name: "closure"}
+	fail := func(err error) *Summary {
+		result.Err = err
+		_, _ = fmt.Fprintf(out, "    FAILED: %v\n", err)
+		summary.Failures++
+		summary.Results = append(summary.Results, result)
+		summary.Total++
+		cfg.RecordAudit(audit.EventFetch, manifest.TypePypi, "requirements", "", "failure", time.Since(start), err)
+		return summary
+	}
+
+	// An empty requirements file has no closure, and running pip over it builds
+	// a resolver environment to resolve nothing. The lock still lands, because
+	// the build reads it to decide the same thing.
+	hasReqs, err := hasInstallableRequirements(combinedReq)
+	if err != nil {
+		return fail(fmt.Errorf("read %s: %w", combinedReq, err))
+	}
+	var arts []pypiArtifact
+	if hasReqs {
+		indexURL, err := pypiSelectedIndex(combinedReq)
+		if err != nil {
+			return fail(err)
+		}
+		_, _ = fmt.Fprintf(out, "\n>>> [pypi] fetch — resolving the closure from %s\n", indexURL)
+		// Fresh: the fetch opens a pipeline run, and a venv left by an earlier
+		// one carries whatever its python was.
+		pipBin, err := ensurePypiVenv(out, root, true)
+		if err != nil {
+			return fail(err)
+		}
+		if arts, err = downloadPypiClosure(out, pipBin, indexURL, combinedReq, house); err != nil {
+			return fail(err)
+		}
+	} else if err := os.RemoveAll(house); err != nil {
+		return fail(fmt.Errorf("clear the wheelhouse at %s: %w", house, err))
+	}
+
+	if err := cfg.pinPypiClosure(ctx, arts, house); err != nil {
+		return fail(err)
+	}
+	lock := pypiLockPath(root)
+	if err := os.WriteFile(lock, []byte(pypiLockBody(arts)), 0o644); err != nil {
+		return fail(fmt.Errorf("write the resolved closure: %w", err))
+	}
+
+	elapsed := time.Since(start)
+	result.Artifacts = []string{lock}
+	result.Elapsed = elapsed
+	summary.Results = append(summary.Results, result)
+	summary.Total++
+	_, _ = fmt.Fprintf(out, "    Closure: %d artifacts pinned, recorded in %s\n", len(arts), lock)
+	_, _ = fmt.Fprintf(out, "    Done (%s)\n", elapsed.Round(time.Millisecond))
 
 	if cfg.Logger != nil {
-		cfg.Logger.Audit("OK      pypi/requirements  (%s)", result.Elapsed.Round(time.Millisecond))
+		cfg.Logger.Audit("OK      pypi/requirements  (%s)", elapsed.Round(time.Millisecond))
 	}
-	cfg.RecordAudit(audit.EventFetch, manifest.TypePypi, "requirements", "", "success", result.Elapsed, nil)
+	cfg.RecordAudit(audit.EventFetch, manifest.TypePypi, "requirements", "", "success", elapsed, nil)
 
 	return summary
 }
 
 // BuildPypi creates a build virtualenv and runs pip wheel to produce a
-// directory of wheels under <build-root>/wheels[/<version>]/.
-// combined-requirements.txt must already exist (produced by FetchPypi).
+// directory of wheels under <build-root>/wheels[/<version>]/, from the closure
+// the fetch downloaded and pinned. resolved-requirements.txt and the wheelhouse
+// beside it must already exist (produced by FetchPypi).
+//
+// No index is reachable from here. The build resolves nothing and downloads
+// nothing; it turns recorded bytes into wheels.
 func BuildPypi(cfg *Config, store *manifest.Store) *Summary {
 	out := cfg.stdout()
 	summary := &Summary{}
@@ -1199,45 +1294,46 @@ func BuildPypi(cfg *Config, store *manifest.Store) *Summary {
 	start := time.Now()
 	result := Result{Type: manifest.TypePypi, Name: "wheels"}
 
-	combinedReq := filepath.Join(cfg.rootFor(manifest.TypePypi), "combined-requirements.txt")
-	if _, err := os.Stat(combinedReq); os.IsNotExist(err) {
-		result.Err = fmt.Errorf("combined-requirements.txt not found at %s — run 'fetch pypi' first", combinedReq)
+	root := cfg.rootFor(manifest.TypePypi)
+	combinedReq := filepath.Join(root, "combined-requirements.txt")
+	lock := pypiLockPath(root)
+	house := pypiWheelhouseDir(root)
+	if _, err := os.Stat(lock); os.IsNotExist(err) {
+		result.Err = fmt.Errorf("resolved-requirements.txt not found at %s — run 'fetch pypi' first", lock)
 		summary.Failures++
 		summary.Results = append(summary.Results, result)
 		summary.Total++
 		return summary
 	}
 
-	// Skip the whole venv + pip-wheel dance when the requirements file has
-	// no installable lines. Saves ~8s per run when pypi entries resolve to
-	// nothing (e.g. a git repo whose requirements.txt only references other
-	// git repos). PackagePypi will see zero wheels and skip cleanly.
-	hasReqs, err := hasInstallableRequirements(combinedReq)
+	// Skip the whole venv + pip-wheel dance when the closure has no installable
+	// lines. Saves ~8s per run when pypi entries resolve to nothing (e.g. a git
+	// repo whose requirements.txt only references other git repos). PackagePypi
+	// will see zero wheels and skip cleanly.
+	hasReqs, err := hasInstallableRequirements(lock)
 	if err != nil {
-		result.Err = fmt.Errorf("read combined-requirements.txt: %w", err)
+		result.Err = fmt.Errorf("read %s: %w", lock, err)
 		summary.Failures++
 		summary.Results = append(summary.Results, result)
 		summary.Total++
 		return summary
 	}
 	if !hasReqs {
-		_, _ = fmt.Fprintf(out, "\n>>> [pypi] build — combined-requirements.txt has no installable packages, skipping\n")
+		_, _ = fmt.Fprintf(out, "\n>>> [pypi] build — the resolved closure has no installable packages, skipping\n")
 		return summary
 	}
 
-	indexURL, err := pypiSelectedIndex(combinedReq)
-	if err != nil {
+	// The bytes are checked before pip is pointed at them. pip would refuse the
+	// same substitution under --require-hashes, but against whichever candidate
+	// it happened to reach and only once it got there.
+	if err := verifyPypiClosure(lock, house); err != nil {
 		result.Err = err
+		_, _ = fmt.Fprintf(out, "    FAILED: %v\n", err)
 		summary.Failures++
 		summary.Results = append(summary.Results, result)
 		summary.Total++
 		return summary
 	}
-	// The index reaches pip as an argument as well as a line in the file. A
-	// requirements file pip reads can replace a command-line --index-url, so
-	// the argument is not the stronger of the two; it is the one that holds
-	// when the file is empty of options, and it is what the log records pip
-	// was pointed at.
 	pipEnv := pypiPipEnv()
 
 	wheelsDir := pypiWheelsDir(d)
@@ -1246,50 +1342,12 @@ func BuildPypi(cfg *Config, store *manifest.Store) *Summary {
 		return summary
 	}
 
-	// Create a build virtualenv.
-	venvDir := filepath.Join(cfg.rootFor(manifest.TypePypi), "build-venv")
-	if err := os.RemoveAll(venvDir); err != nil {
-		result.Err = fmt.Errorf("remove old venv: %w", err)
-		summary.Failures++
-		summary.Results = append(summary.Results, result)
-		summary.Total++
-		return summary
-	}
-
-	_, _ = fmt.Fprintf(out, "\n>>> [pypi] build — creating virtualenv\n")
-	// Try normal venv first; fall back to --without-pip if ensurepip is missing.
-	if err := runCmdEnv(out, "", pipEnv, "python3", "-m", "venv", venvDir); err != nil {
-		_, _ = fmt.Fprintf(out, "    venv failed, retrying with --without-pip...\n")
-		if err2 := runCmdEnv(out, "", pipEnv, "python3", "-m", "venv", "--without-pip", venvDir); err2 != nil {
-			result.Err = fmt.Errorf("python3 -m venv: %w", err2)
-			summary.Failures++
-			summary.Results = append(summary.Results, result)
-			summary.Total++
-			return summary
-		}
-		// Install pip into the venv manually.
-		_, _ = fmt.Fprintf(out, "    Installing pip via get-pip.py...\n")
-		pythonBin := filepath.Join(venvDir, "bin", "python3")
-		if err3 := runCmdEnv(out, "", pipEnv, "bash", "-c",
-			"curl -sS https://bootstrap.pypa.io/get-pip.py | "+pythonBin); err3 != nil {
-			result.Err = fmt.Errorf("install pip: %w", err3)
-			summary.Failures++
-			summary.Results = append(summary.Results, result)
-			summary.Total++
-			return summary
-		}
-	}
-
-	pipBin := filepath.Join(venvDir, "bin", "pip")
-	_, _ = fmt.Fprintf(out, "    Upgrading pip, wheel, setuptools...\n")
-	// The bootstrap reaches the selected index like everything else. It used to
-	// take pip's default whatever the manifest approved, which installed three
-	// packages from pypi.org into the environment that then built every wheel.
-	// A mirror that carries no pip fails here, loudly, rather than quietly
-	// reaching past itself.
-	if err := runCmdEnv(out, "", pipEnv, pipBin, "install", "--isolated",
-		"--index-url", indexURL, "--upgrade", "pip", "wheel", "setuptools"); err != nil {
-		result.Err = fmt.Errorf("pip upgrade: %w", err)
+	// The fetch built this venv to download the closure, so the same pip
+	// consumes it. Rebuilt only when a build runs without one.
+	_, _ = fmt.Fprintf(out, "\n>>> [pypi] build — build virtualenv\n")
+	pipBin, err := ensurePypiVenv(out, root, false)
+	if err != nil {
+		result.Err = err
 		summary.Failures++
 		summary.Results = append(summary.Results, result)
 		summary.Total++
@@ -1297,14 +1355,24 @@ func BuildPypi(cfg *Config, store *manifest.Store) *Summary {
 	}
 
 	// Build wheels.
-	_, _ = fmt.Fprintf(out, "\n>>> [pypi] build — building wheels (C extensions will compile from source)\n")
+	//
+	// --no-index and --find-links reach pip on the command line, and pip's own
+	// precedence is what makes that hold: a requirements file's --index-url
+	// replaces a command-line one outright, but every index option in
+	// req_file.py is guarded by `and not no_index`, so no file at any include
+	// depth can switch the index back on. --find-links appends unconditionally,
+	// which is why --require-hashes is here too: a link pip was handed by some
+	// other route still cannot produce bytes the fetch did not record.
+	_, _ = fmt.Fprintf(out, "\n>>> [pypi] build — building wheels from %s (C extensions will compile from source)\n", house)
 	if err := runCmdEnv(out, "", pipEnv,
 		pipBin, "wheel",
 		"--isolated",
-		"--index-url", indexURL,
+		"--no-index",
+		"--find-links", house,
+		"--require-hashes",
 		"--wheel-dir", wheelsDir,
 		"--progress-bar", "on",
-		"-r", combinedReq,
+		"-r", lock,
 	); err != nil {
 		result.Err = fmt.Errorf("pip wheel: %w", err)
 		summary.Failures++
