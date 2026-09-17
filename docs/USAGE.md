@@ -603,7 +603,7 @@ pypi/boto3 -> default  (global default; no type or package rule; storage_policy 
 
 An operator reads this command to find out why a package landed where it did, so a level the write path will not use is worse than no level at all.
 
-This is the write side. It says where the _next_ version goes and nothing about where versions already uploaded live; each of those records its own backend in `storage`.
+This is the write side. It says where the _next_ version goes and nothing about where versions already uploaded live; each of those records its own backend in `storage`, and the `STORED` column of `bodega show pkg <type> <name> --admin` prints it. A version that records nothing reads `default`, which is the backend the global `storage_backend` / `storage_path` / `bucket` / `region` keys describe and the one every artifact uploaded before backends were named lives on.
 
 ### `bodega pkg move <type> <name>[@<version>] --to <backend>`
 
@@ -1777,9 +1777,9 @@ Results surface where an operator already looks. `bodega show pkg <type> <name>`
 $ bodega show pkg npm minimist
 Package: minimist
 
-VERSION      PLATFORM        STORED FROZEN   HIDDEN   CONSTRAINT OSV         CHECKED
-1.2.0        any             -      no       no       exact      2 vuln(s)   2026-09-08
-1.2.8        any             -      no       no       exact      clean       2026-09-08
+VERSION      PLATFORM        STORED     FROZEN   HIDDEN   CONSTRAINT OSV         CHECKED
+1.2.0        any             default    no       no       exact      2 vuln(s)   2026-09-08
+1.2.8        any             bulk       no       no       exact      clean       2026-09-08
 
 Flagged by OSV:
   1.2.0        GHSA-vh95-rmgr-6w4m, GHSA-xvch-5gv4-984h  (checked 2026-09-08)
@@ -2364,7 +2364,9 @@ A bucket no configured backend answers to falls back to the type rule and logs a
 
 The PEP 503 indexes and the apt pool listing union every backend and fail the whole request with 502 if any one of them errors. A short index is indistinguishable from packages having been withdrawn, and apt acts on the difference.
 
-`/api/v1/status` does the opposite: one row per backend, the failing one carrying its error, `healthy: false`. A diagnostic exists to say which backend is broken. `bodega build status` and the `bodega status` dashboard follow the same policy — the dashboard's `By Backend` table exists because one volume filling up is invisible in a combined byte count.
+`/api/v1/status` does the opposite: one row per backend under `backend_entries`, the failing one carrying its error, `healthy: false`. A diagnostic exists to say which backend is broken. `bodega build status` and the `bodega status` dashboard follow the same policy — the dashboard's `By Backend` table exists because one volume filling up is invisible in a combined byte count.
+
+Every row names its backend in `backend` and reports the probe under `key` and `present`. Nothing in the row names a driver: the same backend name is a local directory on one install and a bucket on the next, and a client acting on this endpoint acts on whether the objects are there and on which backend failed. The fields were `s3_key` and `in_s3` through v1; a client reading either has to move to `key` and `present`, and `s3_entries` to `backend_entries`.
 
 #### Object size
 
@@ -3146,7 +3148,7 @@ All API responses are JSON. The full API is documented in [OpenAPI 3.0 format](.
 | GET | `/api/v1/packages/{type}` | Entries for one type |
 | GET | `/api/v1/packages/{type}/{name}` | Single entry details |
 | GET | `/api/v1/packages/{type}/{name}/{version}` | One version, as a manifest scoped to it. Carries the `vetting.osv.*` keys on `metadata` |
-| GET | `/api/v1/status` | Health check with entry counts, S3 probe, and the apt client state |
+| GET | `/api/v1/status` | Health check with entry counts, one storage probe row per backend, and the apt client state |
 | GET | `/api/v1/config` | Non-sensitive config (bucket, region, manifest_dir) |
 | GET | `/api/v1/audit` | Query audit events (supports filters) |
 | GET | `/api/v1/profiles/{name}/pins` | One profile's pins, with their reason, review date and OSV state. `?stale=true` narrows to the overdue ones. Admin-gated. See [Pins as recorded decisions](#pins-as-recorded-decisions) |
@@ -3639,7 +3641,8 @@ A read-only audit database used to be the quieter version of the same loss: `Rec
 │ git/               │ Ref:     v4.5.7            │
 │   netbox@v4.5.7    │ Source URL: https://git... │
 │ pypi/              │ Frozen:  no                │
-│ binary/            │ S3:      ✓ uploaded        │
+│ binary/            │ Stored:  yes (backend      │
+│                    │          default)          │
 │ gomod/             │                            │
 │ helm/              │                            │
 │ npm/               │                            │
@@ -3691,6 +3694,8 @@ The reset deletes those eleven keys rather than writing the built-in defaults in
 The form edits no ACL. `deny_list`, `admin_permit_cidr` and `trusted_proxies` are seeded from the config file on first start and inert afterwards, so a field writing them to `config.json` would accept a value, save it, report success and change nothing about who the server refuses. Edit them with `bodega acl deny`, `bodega acl admin` and `bodega acl proxies`; the form says so under its title.
 
 ### Details pane
+
+Two fields report where an entry's bytes are. **Stored** answers whether the probe found the primary artifact and names the backend it looked on (`yes (backend default)`); **Object** prints that object's URI, prefixed with the backend's own label — `file://<storage_path>` for a local backend, `s3://<bucket>` for an s3 one. Both read the backend the manifest entry records, so a local-only install reports its own disk rather than a bucket it never configured. Neither field is derived from `bucket`: an install carrying a leftover `bucket` key alongside `"storage_backend": "local"` printed an `s3://` URI over bytes on its own disk through v1.
 
 The last field of an entry is the client instruction, and its label names the shape rather than assuming a URL: **Sources line** for apt, **Registry stanza** for cargo, **Package URL** for the other six. All three carry the base URL `public_url` and the TLS pair resolve to, so a pane behind a terminating proxy prints what a client outside it reaches.
 

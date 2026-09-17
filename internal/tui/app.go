@@ -42,8 +42,10 @@ const (
 	focusLog
 )
 
-// s3StatusMsg carries async S3 status results back into the event loop.
-type s3StatusMsg struct {
+// storageStatusMsg carries async per-entry storage status back into the
+// event loop. The probe reads whichever backend each entry records, so a
+// local-only install fills it the same way an s3 install does.
+type storageStatusMsg struct {
 	statuses []inventory.EntryStatus
 	err      error
 }
@@ -111,22 +113,56 @@ func newAppModel(cfg *config.Config, store *manifest.Store, s3client *bos3.Clien
 		focus:     focusSources,
 		logHeight: logH,
 	}
-	m.sources = newSourcesModel(nil) // populated after S3 status arrives
+	m.sources = newSourcesModel(nil) // populated once the storage status arrives
 	m.sources.focused = true
 	m.details = newDetailsModel(store, cfg)
+	m.details.stores = stores
 	logPane := newLogPane()
 	m.log = &logPane
 	m.logPath = cfg.LogDir
 	return m
 }
 
-// Init fires the initial S3 status check.
-func (m appModel) Init() tea.Cmd {
-	return tea.Batch(m.fetchS3Status(), tea.EnableBracketedPaste)
+// loadManifestStore opens the manifest store the rest of the process reads.
+//
+// The choice is config.Config.UsesLocalManifests and nothing else. Both reload
+// paths used to test "cfg.LocalConfig || s3c == nil", and s3c is non-nil
+// whenever a bucket is configured — so an install running
+// storage_backend: local with a leftover bucket key reloaded manifests out of
+// S3 on Ctrl+R and labelled them s3://<bucket>/manifests/, while every other
+// path in the binary read the local directory.
+//
+// The nil client is still a fallback rather than a branch of its own: an s3
+// install whose client failed to build has no store to read, and a local one
+// is a better answer than a panic.
+func loadManifestStore(ctx context.Context, cfg *config.Config, s3c *bos3.Client) (*manifest.Store, error) {
+	var store *manifest.Store
+	if cfg.UsesLocalManifests() || s3c == nil {
+		store = manifest.NewLocalStore(cfg.ManifestDir)
+	} else {
+		store = manifest.NewStore(&manifest.S3Backend{
+			Prefix:   "manifests/",
+			GetFn:    s3c.GetObject,
+			PutFn:    s3c.PutBytes,
+			DeleteFn: s3c.DeleteObject,
+			ListFn:   s3c.ListPrefix,
+			Label_:   fmt.Sprintf("s3://%s/manifests/", cfg.Bucket),
+		})
+	}
+	if err := store.LoadIndex(ctx); err != nil {
+		return nil, err
+	}
+	return store, nil
 }
 
-// fetchS3Status returns a command that checks S3 status for all types.
-func (m appModel) fetchS3Status() tea.Cmd {
+// Init fires the initial storage status check.
+func (m appModel) Init() tea.Cmd {
+	return tea.Batch(m.fetchStorageStatus(), tea.EnableBracketedPaste)
+}
+
+// fetchStorageStatus returns a command that probes every type against the
+// backend each entry records.
+func (m appModel) fetchStorageStatus() tea.Cmd {
 	if m.stores == nil {
 		return nil
 	}
@@ -134,7 +170,7 @@ func (m appModel) fetchS3Status() tea.Cmd {
 	stores := m.stores
 	return func() tea.Msg {
 		statuses, err := inventory.CheckStatus(context.Background(), stores, store, manifest.AllTypes)
-		return s3StatusMsg{statuses: statuses, err: err}
+		return storageStatusMsg{statuses: statuses, err: err}
 	}
 }
 
@@ -148,9 +184,9 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.relayout()
 		return m, nil
 
-	case s3StatusMsg:
+	case storageStatusMsg:
 		if msg.err != nil {
-			m.log.appendLog(errorStyle.Render("S3 status check failed: " + msg.err.Error()))
+			m.log.appendLog(errorStyle.Render("storage status check failed: " + msg.err.Error()))
 		}
 		m.statuses = msg.statuses
 		m.sources.Refresh(m.store, m.statuses)
@@ -165,7 +201,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.details.refreshAptSigning()
 		m.sources.Refresh(m.store, m.statuses)
 		m.syncDetails()
-		return m, m.fetchS3Status()
+		return m, m.fetchStorageStatus()
 
 	case cmdOutputMsg:
 		if msg.err == errQuit {
@@ -182,24 +218,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cfg := m.cfg
 			s3c := m.s3client
 			return m, func() tea.Msg {
-				ctx := context.Background()
-				var store *manifest.Store
-				var err error
-				if cfg.LocalConfig || s3c == nil {
-					store = manifest.NewLocalStore(cfg.ManifestDir)
-					err = store.LoadIndex(ctx)
-				} else {
-					backend := &manifest.S3Backend{
-						Prefix:   "manifests/",
-						GetFn:    s3c.GetObject,
-						PutFn:    s3c.PutBytes,
-						DeleteFn: s3c.DeleteObject,
-						ListFn:   s3c.ListPrefix,
-						Label_:   fmt.Sprintf("s3://%s/manifests/", cfg.Bucket),
-					}
-					store = manifest.NewStore(backend)
-					err = store.LoadIndex(ctx)
-				}
+				store, err := loadManifestStore(context.Background(), cfg, s3c)
 				if err != nil {
 					return cmdOutputMsg{err: fmt.Errorf("reload manifests: %w", err)}
 				}
@@ -232,27 +251,12 @@ func (m appModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.quitting = true
 		return m, tea.Quit
 	case "ctrl+r":
-		// Reload manifests from backend (S3 or disk).
+		// Reload manifests from whichever store the install reads.
 		m.log.appendLog(dimStyle.Render("Reloading manifests..."))
 		cfg := m.cfg
 		s3c := m.s3client
 		return m, func() tea.Msg {
-			ctx := context.Background()
-			var store *manifest.Store
-			var err error
-			if cfg.LocalConfig || s3c == nil {
-				store = manifest.NewLocalStore(cfg.ManifestDir)
-				err = store.LoadIndex(ctx)
-			} else {
-				backend := &manifest.S3Backend{
-					Prefix: "manifests/",
-					GetFn:  s3c.GetObject,
-					PutFn:  s3c.PutBytes,
-					Label_: fmt.Sprintf("s3://%s/manifests/", cfg.Bucket),
-				}
-				store = manifest.NewStore(backend)
-				err = store.LoadIndex(ctx)
-			}
+			store, err := loadManifestStore(context.Background(), cfg, s3c)
 			if err != nil {
 				return cmdOutputMsg{err: fmt.Errorf("reload manifests: %w", err)}
 			}
@@ -459,7 +463,7 @@ func (m appModel) handlePopupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "y", "Y":
 			cmd := m.popup.pendingAsyncCmd
 			m.popup.confirm() // calls onYes synchronously, then clears popup
-			return m, tea.Batch(cmd, m.fetchS3Status())
+			return m, tea.Batch(cmd, m.fetchStorageStatus())
 		case "n", "N", "esc", "?":
 			m.popup.dismiss()
 		}
@@ -816,13 +820,13 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		var msg string
 		if len(entries) == 1 {
-			msg = fmt.Sprintf("Remove %s/%s artifact from S3?", entries[0].EntryType, entries[0].Name)
+			msg = fmt.Sprintf("Remove stored %s/%s artifact from its backend?", entries[0].EntryType, entries[0].Name)
 		} else {
-			msg = fmt.Sprintf("Remove %d selected artifacts from S3?", len(entries))
+			msg = fmt.Sprintf("Remove %d selected artifacts from their backends?", len(entries))
 		}
 		var cmds []tea.Cmd
 		for _, e := range entries {
-			cmds = append(cmds, executeRemoveFromS3(e.EntryType, e.Name, m.cfg, m.store, m.stores))
+			cmds = append(cmds, executeRemoveStored(e.EntryType, e.Name, m.cfg, m.store, m.stores))
 		}
 		m.popup = popupModel{
 			kind:            popupConfirm,
@@ -1622,7 +1626,7 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 			typeField,
 			{Label: "Mode", Value: modeVal, Select: true,
 				Options: []string{"hosted", "proxy"},
-				Hint:    "hosted = S3 only; proxy = fetch from upstream on cache miss"},
+				Hint:    "hosted = stored artifacts only; proxy = fetch from upstream on cache miss"},
 			{Label: "Name", Value: restore("Name", ""),
 				Hint: "module path, e.g. github.com/aws/aws-sdk-go-v2"},
 			{Label: "Version", Value: versionVal, Disabled: versionDisabled,
@@ -1657,7 +1661,7 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 			typeField,
 			{Label: "Mode", Value: modeVal, Select: true,
 				Options: []string{"hosted", "proxy"},
-				Hint:    "hosted = S3 only; proxy = fetch from upstream on cache miss"},
+				Hint:    "hosted = stored artifacts only; proxy = fetch from upstream on cache miss"},
 			{Label: "Name", Value: restore("Name", ""),
 				Hint: "chart name, e.g. ingress-nginx"},
 			{Label: "Version", Value: versionVal, Disabled: versionDisabled,
@@ -1692,7 +1696,7 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 			typeField,
 			{Label: "Mode", Value: modeVal, Select: true,
 				Options: []string{"hosted", "proxy"},
-				Hint:    "hosted = S3 only; proxy = fetch from upstream on cache miss"},
+				Hint:    "hosted = stored artifacts only; proxy = fetch from upstream on cache miss"},
 			{Label: "Name", Value: restore("Name", ""),
 				Hint: "package name, e.g. lodash or @scope/pkg"},
 			{Label: "Version", Value: versionVal, Disabled: versionDisabled,
@@ -1724,7 +1728,7 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 			typeField,
 			{Label: "Mode", Value: modeVal, Select: true,
 				Options: []string{"hosted", "proxy"},
-				Hint:    "hosted = S3 only; proxy = fetch from upstream on cache miss"},
+				Hint:    "hosted = stored artifacts only; proxy = fetch from upstream on cache miss"},
 			{Label: "Name", Value: restore("Name", ""),
 				Hint: "crate name, e.g. serde or tokio"},
 			{Label: "Version", Value: versionVal, Disabled: versionDisabled,

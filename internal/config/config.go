@@ -580,6 +580,20 @@ func (c *Config) ResolveSpoolDir() string {
 	return filepath.Join(firstNonEmpty(c.StoragePath, DefaultStoragePath), "tmp")
 }
 
+// UsesLocalManifests reports whether manifests are read and written straight
+// from the filesystem rather than through the object store. Every caller that
+// picks a manifest store must answer this the same way: when they disagree, a
+// local install passes the mutation preflight and then fails asking for a
+// bucket it never configured, or the TUI reloads from a leftover bucket the
+// rest of the process stopped reading. --local-config forces it on whatever
+// the configured backend is.
+func (c *Config) UsesLocalManifests() bool {
+	if c == nil {
+		return true
+	}
+	return c.LocalConfig || c.StorageBackend == "" || c.StorageBackend == "local"
+}
+
 // ResolveOSVDBDir returns the directory the local OSV database lives in.
 // Unset means {storage_path}/osv rather than "no database": the gate should
 // find what `bodega policy osv sync` wrote without a second key being set.

@@ -16,13 +16,19 @@ import (
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 // detailsModel is the bubbletea model for the top-right Details pane.
 type detailsModel struct {
-	node      *TreeNode
-	store     *manifest.Store
-	cfg       *config.Config
+	node  *TreeNode
+	store *manifest.Store
+	cfg   *config.Config
+	// stores resolves a recorded backend name to the store holding its bytes,
+	// which is the only thing that knows a local root from a bucket. Nil in
+	// tests that render a pane without an install behind it; the URI then
+	// falls back to the bare object key.
+	stores    storage.Resolver
 	buildRoot string
 	viewport  viewport.Model
 	width     int
@@ -157,17 +163,14 @@ func lipgloss_green(s string) string {
 	return successStyle.Render(s)
 }
 
-// s3AndClientFields renders S3 status, S3 path, and client URL for an entry.
-func (m detailsModel) s3AndClientFields(n *TreeNode) string {
+// storedAndClientFields renders storage status, the object's URI on the
+// backend holding it, and the client URL for an entry.
+func (m detailsModel) storedAndClientFields(n *TreeNode) string {
 	var sb strings.Builder
-	sb.WriteString(s3StatusField(n.InS3))
+	sb.WriteString(storedStatusField(n))
 	sb.WriteByte('\n')
-	if key := s3Path(m.store, n.EntryType, n.Name, n.Version); key != "" {
-		s3URI := key
-		if m.cfg.Bucket != "" {
-			s3URI = "s3://" + m.cfg.Bucket + "/" + key
-		}
-		sb.WriteString(field("S3 path", s3URI))
+	if key := objectKey(m.store, n.EntryType, n.Name, n.Version); key != "" {
+		sb.WriteString(field("Object", m.objectURI(n.Backend, key)))
 		sb.WriteByte('\n')
 	}
 	if n.EntryType == manifest.TypeApt {
@@ -315,25 +318,49 @@ func checksumFields(cs *manifest.Checksum, verified bool) string {
 	return sb.String()
 }
 
-func s3StatusField(inS3 bool) string {
-	k := keyStyle.Render("S3:")
+// storedStatusField reports whether the probe found the entry's primary
+// artifact, and names the backend it looked on. The name carries the answer:
+// a local install has no bucket, and a pane reading "not in S3" over a bundle
+// sitting on its own disk sent operators hunting an upload that was never
+// going to happen.
+func storedStatusField(n *TreeNode) string {
+	k := keyStyle.Render("Stored:")
 	var v string
-	if inS3 {
-		v = successStyle.Render("uploaded")
+	if n.Stored {
+		v = successStyle.Render("yes")
 	} else {
-		v = errorStyle.Render("not in S3")
+		v = errorStyle.Render("no")
+	}
+	if n.Backend != "" {
+		v += " " + dimStyle.Render("(backend "+n.Backend+")")
 	}
 	return k + " " + v
 }
 
-// s3Path renders the object key backing a tree node, derived the same way the
-// uploader and the server derive it. version selects a specific VersionEntry;
-// empty version falls back to the first, which is the package-header behavior.
+// objectURI prefixes an object key with the label of the backend that holds
+// it. storage.ObjectStore.Label is the one thing that distinguishes a local
+// root from a bucket; deriving the prefix from cfg.Bucket printed an s3:// URI
+// over bytes on the local disk on any install with a leftover bucket key.
+func (m detailsModel) objectURI(backend, key string) string {
+	if m.stores == nil || backend == "" {
+		return key
+	}
+	store, err := m.stores.ByName(backend)
+	if err != nil || store == nil {
+		return key
+	}
+	return strings.TrimSuffix(store.Label(), "/") + "/" + key
+}
+
+// objectKey renders the object key backing a tree node, derived the same way
+// the uploader and the server derive it. version selects a specific
+// VersionEntry; empty version falls back to the first, which is the
+// package-header behavior.
 //
 // A key shown here that nothing writes is the same defect as a key probed that
 // nothing writes, so this resolves through manifest.ArtifactKeys rather than
 // spelling the layouts out again.
-func s3Path(store *manifest.Store, entryType, name, version string) string {
+func objectKey(store *manifest.Store, entryType, name, version string) string {
 	ctx := context.Background()
 	pm, err := store.GetPackage(ctx, entryType, name)
 	if err != nil || pm == nil || len(pm.Versions) == 0 {
@@ -575,7 +602,7 @@ func (m detailsModel) renderGroupDetails() string {
 			sb.WriteString(dimStyle.Render("── Versions ──"))
 			sb.WriteByte('\n')
 			for _, child := range n.Children {
-				icon := statusIcon(child.InS3, child.Frozen, child.Hidden)
+				icon := statusIcon(child.Stored, child.Frozen, child.Hidden)
 				sb.WriteString("  " + icon + " " + child.Label)
 				sb.WriteByte('\n')
 			}
@@ -706,7 +733,7 @@ func (m detailsModel) renderEntryDetails() string {
 			sb.WriteByte('\n')
 			sb.WriteString(boolField("Hidden", ve.Hidden))
 			sb.WriteByte('\n')
-			sb.WriteString(m.s3AndClientFields(n))
+			sb.WriteString(m.storedAndClientFields(n))
 			sb.WriteString(platformAndBuildEnv(ve.Platform, ve.BuildEnv))
 		}
 
@@ -722,7 +749,7 @@ func (m detailsModel) renderEntryDetails() string {
 		sb.WriteByte('\n')
 		sb.WriteString(boolField("Hidden", ve.Hidden))
 		sb.WriteByte('\n')
-		sb.WriteString(m.s3AndClientFields(n))
+		sb.WriteString(m.storedAndClientFields(n))
 		sb.WriteString(platformAndBuildEnv(ve.Platform, ve.BuildEnv))
 		// Show discovered dependency files.
 		if deps := m.discoverGitDeps(pm.Name, ve.Ref); deps != "" {
@@ -781,7 +808,7 @@ func (m detailsModel) renderEntryDetails() string {
 		sb.WriteByte('\n')
 		sb.WriteString(boolField("Hidden", ve.Hidden))
 		sb.WriteByte('\n')
-		sb.WriteString(m.s3AndClientFields(n))
+		sb.WriteString(m.storedAndClientFields(n))
 		sb.WriteString(platformAndBuildEnv(ve.Platform, ve.BuildEnv))
 
 	case manifest.TypeBinary:
@@ -806,7 +833,7 @@ func (m detailsModel) renderEntryDetails() string {
 		sb.WriteByte('\n')
 		sb.WriteString(boolField("Hidden", ve.Hidden))
 		sb.WriteByte('\n')
-		sb.WriteString(m.s3AndClientFields(n))
+		sb.WriteString(m.storedAndClientFields(n))
 		sb.WriteString(platformAndBuildEnv(ve.Platform, ve.BuildEnv))
 
 	case manifest.TypeGomod:
@@ -823,7 +850,7 @@ func (m detailsModel) renderEntryDetails() string {
 		sb.WriteByte('\n')
 		sb.WriteString(boolField("Hidden", ve.Hidden))
 		sb.WriteByte('\n')
-		sb.WriteString(m.s3AndClientFields(n))
+		sb.WriteString(m.storedAndClientFields(n))
 		sb.WriteString(platformAndBuildEnv(ve.Platform, ve.BuildEnv))
 
 	case manifest.TypeHelm:
@@ -842,7 +869,7 @@ func (m detailsModel) renderEntryDetails() string {
 		sb.WriteByte('\n')
 		sb.WriteString(boolField("Hidden", ve.Hidden))
 		sb.WriteByte('\n')
-		sb.WriteString(m.s3AndClientFields(n))
+		sb.WriteString(m.storedAndClientFields(n))
 		sb.WriteString(platformAndBuildEnv(ve.Platform, ve.BuildEnv))
 
 	case manifest.TypeNpm:
@@ -859,7 +886,7 @@ func (m detailsModel) renderEntryDetails() string {
 		sb.WriteByte('\n')
 		sb.WriteString(boolField("Hidden", ve.Hidden))
 		sb.WriteByte('\n')
-		sb.WriteString(m.s3AndClientFields(n))
+		sb.WriteString(m.storedAndClientFields(n))
 		sb.WriteString(platformAndBuildEnv(ve.Platform, ve.BuildEnv))
 
 	case manifest.TypeCargo:
@@ -876,7 +903,7 @@ func (m detailsModel) renderEntryDetails() string {
 		sb.WriteByte('\n')
 		sb.WriteString(boolField("Hidden", ve.Hidden))
 		sb.WriteByte('\n')
-		sb.WriteString(m.s3AndClientFields(n))
+		sb.WriteString(m.storedAndClientFields(n))
 		sb.WriteString(platformAndBuildEnv(ve.Platform, ve.BuildEnv))
 	}
 

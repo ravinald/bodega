@@ -694,10 +694,10 @@ paths:
     get:
       summary: Server status
       description: >-
-        Returns health status, entry counts per type, an S3 probe result, and
-        the apt client state: whether a signing key is loaded, the served
-        suites, the public URL in force, and one rendered sources block per
-        suite.
+        Returns health status, entry counts per type, one storage probe row
+        per configured backend, and the apt client state: whether a signing key
+        is loaded, the served suites, the public URL in force, and one rendered
+        sources block per suite.
       operationId: getStatus
       tags: [status]
       responses:
@@ -998,21 +998,44 @@ components:
             type: integer
         apt:
           $ref: "#/components/schemas/AptStatus"
-        s3_entries:
+        backend_entries:
           type: array
+          description: >-
+            One probe row per configured storage backend, named by `backend`.
+            The driver behind a name is deliberately not reported: a client
+            reading this endpoint acts on whether the objects are there and on
+            which backend failed, and the same name may be backed by a local
+            directory on one install and a bucket on the next.
           items:
             type: object
+            required: [type, name, key, present, backend]
             properties:
               type:
                 type: string
+                description: Package type the probe covers.
               name:
                 type: string
-              s3_key:
+                description: Probe name within that type, e.g. `apt-pool`.
+              key:
                 type: string
-              in_s3:
+                description: Object key or prefix that was probed.
+              present:
                 type: boolean
+                description: Whether the backend holds anything under `key`.
               frozen:
                 type: boolean
+              backend:
+                type: string
+                description: >-
+                  The configured backend name this row reports on. Always
+                  present; `default` is the backend described by the global
+                  storage_backend / storage_path / bucket / region keys.
+              error:
+                type: string
+                description: >-
+                  The backend's failure for this row. A probe that fails is
+                  reported here rather than dropping the row, and sets
+                  `healthy` to false.
         error:
           type: string
 

@@ -46,7 +46,7 @@ const (
 	StageBuild
 	// StagePackage creates a distributable artifact from built sources.
 	StagePackage
-	// StageDeploy uploads the packaged artifact to S3.
+	// StageDeploy uploads the packaged artifact to the configured backend.
 	StageDeploy
 	// StageAll runs the full pipeline: fetch → build → package → deploy.
 	StageAll
@@ -227,7 +227,8 @@ func runFullPipeline(buf *bytes.Buffer, cfg *config.Config, bc *builder.Config, 
 	return runUpload(buf, cfg, store, stores, auditDB, []string{entryType})
 }
 
-// executeSyncAll uploads all artifact types to S3 and returns a tea.Cmd.
+// executeSyncAll uploads all artifact types to their placed backends and
+// returns a tea.Cmd.
 func executeSyncAll(types []string, cfg *config.Config, store *manifest.Store, stores storage.Resolver, auditDB *audit.DB) tea.Cmd {
 	return func() tea.Msg {
 		var buf bytes.Buffer
@@ -274,9 +275,10 @@ func executeDelete(entryType, entryName string, cfg *config.Config, store *manif
 	}
 }
 
-// executeRemoveFromS3 deletes the artifact from S3 without touching the
-// manifest and returns a tea.Cmd. refresh=true re-checks S3 status.
-func executeRemoveFromS3(entryType, entryName string, cfg *config.Config, store *manifest.Store, stores storage.Resolver) tea.Cmd {
+// executeRemoveStored deletes the artifact from the backend holding it,
+// without touching the manifest, and returns a tea.Cmd. refresh=true re-probes
+// the storage status.
+func executeRemoveStored(entryType, entryName string, cfg *config.Config, store *manifest.Store, stores storage.Resolver) tea.Cmd {
 	return func() tea.Msg {
 		var buf bytes.Buffer
 		err := runRemove(&buf, cfg, store, stores, entryType, entryName)

@@ -271,7 +271,7 @@ func showVersionList(ctx context.Context, store *manifest.Store, typ, name strin
 	// carries the key: that output is a manifest dump, and it already emits
 	// _pool_path and every other internal metadata key for the same reason.
 	if admin {
-		fmt.Printf("%-12s %-15s %-6s %-8s %-8s %-10s %-11s %-10s %s\n",
+		fmt.Printf("%-12s %-15s %-10s %-8s %-8s %-10s %-11s %-10s %s\n",
 			"VERSION", "PLATFORM", "STORED", "FROZEN", "HIDDEN", "CONSTRAINT", "OSV", "CHECKED", "ORIGIN")
 	} else {
 		fmt.Printf("%-12s %-15s %-10s\n", "VERSION", "PLATFORM", "CONSTRAINT")
@@ -317,8 +317,8 @@ func showVersionList(ctx context.Context, store *manifest.Store, typ, name strin
 				st.Checked = time.Time{}
 			}
 			osvState, osvChecked := osvVersionState(osvCovered, st)
-			fmt.Printf("%-12s %-15s %-6s %-8s %-8s %-10s %-11s %-10s %s\n",
-				v, platform, "-", frozen, hidden, constraint, osvState, osvChecked, originCell(ve))
+			fmt.Printf("%-12s %-15s %-10s %-8s %-8s %-10s %-11s %-10s %s\n",
+				v, platform, effectiveStorage(ve.Storage), frozen, hidden, constraint, osvState, osvChecked, originCell(ve))
 			if osvCovered && st.Flagged() {
 				flagged = append(flagged, fmt.Sprintf("  %-12s %s  (checked %s)",
 					v, strings.Join(st.Vulns, ", "), osvCheckedOn(st)))
