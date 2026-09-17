@@ -196,7 +196,10 @@ func TestAuditQueryOpensResultsTable(t *testing.T) {
 // no form behind the textarea, so closing the overlay has to close the popup
 // too; leaving the kind set renders an empty box that eats every key.
 func TestJSONEditPopupEscClears(t *testing.T) {
-	cfg, err := config.Load("", "", "", "", false, false)
+	t.Setenv(config.EnvConfigFile, filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv(config.EnvRegion, "")
+
+	cfg, err := config.Load(t.TempDir(), "", "", "", false, false)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
