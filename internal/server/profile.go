@@ -9,6 +9,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/entitle"
+	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/pins"
 )
 
@@ -24,7 +25,7 @@ import (
 type profileSet struct {
 	byIdentity map[string]*entitle.Profile
 
-	// aptScoped records whether any profile in this set scopes apt, which is
+	// aptScoped records whether any profile in this set governs apt, which is
 	// the union of every answer aptGatesPool can give this generation. The
 	// pool route's cache directive turns on it: a directive decided on the
 	// requesting host would ship a shared copy of the object the next host is
@@ -128,7 +129,7 @@ func (s *Server) resolveProfiles(ctx context.Context) *profileSet {
 		}
 		if p != nil {
 			set.byIdentity[b.Identity] = p
-			if base, _ := p.AptScope(); base != "" {
+			if p.Governs(manifest.TypeApt) {
 				set.aptScoped = true
 			}
 		}

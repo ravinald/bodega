@@ -892,7 +892,7 @@ Declares what one class of host may fetch, and the version rule each package car
 
 A profile is a view over one catalog, never a second catalog. Storage, object keys, the checksum table and the manifests do not change: an artifact reached through two profiles is one artifact with one checksum.
 
-The read path enforces this for pypi, npm, gomod, cargo, helm, git and binary. apt is not enforced at fetch time and is the deliberate exception; see [What is enforced, and where](#what-is-enforced-and-where). `bodega pin` is the host-side half of the same idea and is a different thing: it emits apt preferences for a host to apply, where a profile decides what bodega will answer.
+The read path enforces this for pypi, npm, gomod, cargo, helm, git and binary. apt is the deliberate exception: the index a profiled host reads is the control and the fetch is only the backstop behind it; see [What is enforced, and where](#what-is-enforced-and-where). `bodega pin` is the host-side half of the same idea and is a different thing: it emits apt preferences for a host to apply, where a profile decides what bodega will answer.
 
 Three levels:
 
@@ -1350,6 +1350,8 @@ $ bodega profile set web apt --membership closed --base noble
   Or drop the base:  bodega profile set web apt --expansion warn --base ""
     the profile then reads the mirrored codename noble unchanged, verified against the distro keyring
 ```
+
+**A profile with no base still governs apt.** `--base` buys a filtered view of a *mirrored* codename. A suite bodega serves from its own catalog — an `apt_suites` codename holding the entries an operator put in it — is filtered in place instead: the host reads the suite it was always pointed at and bodega answers with that profile's view of it, generated and signed at the same rebuild. Either way `/apt/pool/` refuses a `.deb` the profile does not entitle. What no base costs is the mirrored codename: that document is the archive's own, so a host reading one is offered the archive whole and meets the refusal at the fetch, which is the mid-transaction 403 the shape above avoids. Add `--base` to buy back the legible half.
 
 **Membership closes over the source package.** `bodega profile add web apt nginx` covers `nginx-common`, `nginx-core` and every other binary that source builds. Ubuntu renames and splits binaries within a stable source as routine maintenance, and a set closed on binary names would fire on each one. `--from-origin` writes source names for the same reason, and `bodega profile check` reports an apt entry naming a binary whose source differs — an entry that matches no paragraph in the index it governs, so the host is told the package does not exist:
 
