@@ -197,6 +197,19 @@ func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
 			// fetchable URL this branch knows. `discover promote --as manifest`
 			// stores it, and manifestURL trims it back to the registry root.
 			s.recordNoManifest(r.Context(), r, manifest.TypePypi, dist, distVersion, s.pypiSimpleURL(normalized))
+
+			// pypi wheels stay catalog-only where npm tarballs proxy, and the
+			// index read is only half the reason. The other half is that no
+			// client is refused by it: /pypi/simple/{dist}/ republishes an
+			// upstream index for a proxy-mode distribution only, and lists
+			// stored wheels otherwise, so an uncatalogued distribution never
+			// acquires a wheel URL for anything to follow. Opening this route
+			// would pay a simple-index fetch per request for addresses only a
+			// guess produces, which is the opposite trade to npm's.
+			s.proxyVersionOrRefuse(w, r, manifest.TypePypi, dist, distVersion, key,
+				"no manifest entry names pypi distribution "+dist+", and a wheel URL cannot be composed without reading "+
+					s.pypiSimpleURL(normalized)+"; catalog it first: bodega pkg create pypi "+dist)
+			return
 		}
 	}
 	s.proxyVersion(w, r, manifest.TypePypi, dist, distVersion, key)

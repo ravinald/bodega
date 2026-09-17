@@ -1658,6 +1658,40 @@ func (s *Server) proxyVersion(w http.ResponseWriter, r *http.Request, typ, pkg, 
 	s.proxyS3(w, r, store, key)
 }
 
+// proxyVersionOrRefuse serves the artifact its manifest entry names, and
+// answers reason instead of a bare 404 when no backend holds it.
+//
+// It exists for the two routes that cannot proxy an uncatalogued name: pypi,
+// where a wheel URL is read out of the simple index rather than composed, and
+// helm, where the chart repository is recorded per version entry so there is no
+// host to reach. A bare 404 on either reads as "no such artifact upstream",
+// which is a different problem with a different fix; what is actually missing
+// is the entry, and the operator needs to be told that and given the command.
+//
+// The Head is what separates the two answers, and a Head that errors falls
+// through to proxyS3 rather than refusing: a backend that cannot be read has
+// not established that the object is absent, and proxyS3 reports that as 502.
+func (s *Server) proxyVersionOrRefuse(w http.ResponseWriter, r *http.Request, typ, pkg, version, key, reason string) {
+	store, err := s.versionStore(r.Context(), typ, pkg, version)
+	if err != nil {
+		s.logger.Error("storage backend recorded for artifact is not configured",
+			"type", typ, "package", pkg, "version", version, "key", key, "error", err)
+		http.Error(w, "storage backend error", http.StatusBadGateway)
+		return
+	}
+	if !s.requireStorage(w, store) {
+		return
+	}
+	status, headErr := store.Head(r.Context(), key)
+	if headErr != nil {
+		s.logger.Error("s3 head check failed", "key", key, "error", headErr)
+	} else if status == nil || !status.Exists {
+		http.Error(w, reason, http.StatusNotFound)
+		return
+	}
+	s.proxyS3(w, r, store, key)
+}
+
 // listFanout unions List across every backend a read of typ may reach.
 //
 // One backend failing fails the whole call. A partial index is worse than an
