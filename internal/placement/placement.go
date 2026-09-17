@@ -137,7 +137,7 @@ func (p *Placer) ForVersion(ctx context.Context, typ, pkg, version, key string) 
 	// that predates it. The manifest is written before the bytes either way,
 	// so the record and the newest copy always agree.
 	recorded := pm.Versions[i].Storage
-	name := WritePlacement(p.stores, typ, pm.StoragePolicy).Name
+	name := WritePlacement(p.stores, typ, pm.StoragePolicy, pm.StorageGroups).Name
 	if recorded != "" && !p.replace {
 		name = recorded
 	}
@@ -165,13 +165,13 @@ func (p *Placer) ForVersion(ctx context.Context, typ, pkg, version, key string) 
 // backend with nothing to find it again. Refuse instead, naming the versions
 // that would need moving.
 //
-// A per-package storage_policy is deliberately not consulted. One directory
-// goes to one prefix, so honoring a policy for some packages of the type and
-// not others would split the tree exactly the way the refusal below exists to
-// prevent. See DirectoryPlaced: 'bodega pkg move' refuses pypi for the same
+// Neither a per-package storage_policy nor a group rule is consulted. One
+// directory goes to one prefix, so honoring either for some packages of the
+// type and not others would split the tree exactly the way the refusal below
+// exists to prevent. See DirectoryPlaced: 'bodega pkg move' refuses pypi for the same
 // reason, so the whole type moves or none of it does.
 func (p *Placer) ForType(ctx context.Context, typ string) (storage.ObjectStore, error) {
-	name := WritePlacement(p.stores, typ, "").Name
+	name := WritePlacement(p.stores, typ, "", nil).Name
 
 	var stranded []string
 	for _, pkg := range p.store.ListPackages(typ) {
@@ -281,17 +281,29 @@ func DirectoryPlaced(typ string) bool {
 
 // WritePlacement resolves the backend the write path will actually target.
 //
-// Resolver.Placement answers the three-level hierarchy in the abstract.
-// Whole-directory types never reach the package level, so asking it with a
-// policy it will not honor produces an answer no upload would ever act on —
-// which is what 'bodega pkg storage' was printing. The skipped policy travels
-// on the Decision so a caller can name it instead of quietly dropping it.
-func WritePlacement(stores storage.Resolver, typ, policy string) storage.Decision {
+// Resolver.Placement answers the four-level hierarchy in the abstract.
+// Whole-directory types never reach the package level or the group level, so
+// asking it with a policy or a membership it will not honor produces an answer
+// no upload would ever act on — which is what 'bodega pkg storage' was
+// printing. Both skipped rules travel on the Decision so a caller can name
+// them instead of quietly dropping them.
+//
+// The group level is dropped for the same reason the package level is, not for
+// a weaker one: a group holds packages across types, so honoring it for a pypi
+// package would place that package's wheels apart from the tree the PEP 503
+// index is a listing over. Set storage_by_type.pypi to place the whole type.
+func WritePlacement(stores storage.Resolver, typ, policy string, groups []string) storage.Decision {
 	if !DirectoryPlaced(typ) {
-		return stores.Placement(typ, policy)
+		return stores.Placement(typ, policy, groups)
 	}
-	d := stores.Placement(typ, "")
+	d := stores.Placement(typ, "", nil)
 	d.IgnoredPolicy = policy
+	// Only a group that would have decided is reported. Naming every group the
+	// package belongs to would report a membership that changes nothing here
+	// even on an install with no storage_by_group at all.
+	if g := stores.Placement(typ, "", groups); g.Level == storage.LevelGroup {
+		d.IgnoredGroup = g.Group
+	}
 	return d
 }
 
@@ -300,6 +312,12 @@ func WritePlacement(stores storage.Resolver, typ, policy string) storage.Decisio
 // to believe a package has been placed when nothing about it moved.
 func StoragePolicyWarning(typ, policy string) string {
 	return admit.StoragePolicyWarning(typ, policy)
+}
+
+// StorageGroupWarning reports a group rule the write path will never consult,
+// for the same reason and on the same terms.
+func StorageGroupWarning(typ, group string) string {
+	return admit.StorageGroupWarning(typ, group)
 }
 
 // NoPerPackagePlacement says why one type cannot carry a per-package

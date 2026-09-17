@@ -187,7 +187,7 @@ func TestNoNamedBackendsChangesNothing(t *testing.T) {
 	if got := recordedStorage(t, store, manifest.TypeApt, "nginx", "1.0"); got != "" {
 		t.Errorf("apt recorded %q, want the zero value", got)
 	}
-	if got := pl.Stores().Placement(manifest.TypeApt, ""); got.Name != storage.DefaultName {
+	if got := pl.Stores().Placement(manifest.TypeApt, "", nil); got.Name != storage.DefaultName {
 		t.Errorf("Placement = %q, want %q", got.Name, storage.DefaultName)
 	}
 }
@@ -326,7 +326,7 @@ func TestWritePlacementReportsWhatTheWritePathDoes(t *testing.T) {
 	}
 
 	for _, typ := range []string{manifest.TypePypi} {
-		d := writePlacement(stores, typ, "bulk")
+		d := writePlacement(stores, typ, "bulk", nil)
 		if d.Name != storage.DefaultName {
 			t.Errorf("%s: writePlacement named %q, but forType writes to %q", typ, d.Name, storage.DefaultName)
 		}
@@ -350,7 +350,7 @@ func TestWritePlacementReportsWhatTheWritePathDoes(t *testing.T) {
 		manifest.TypeBinary, manifest.TypeNpm, manifest.TypeCargo,
 		manifest.TypeGomod, manifest.TypeHelm, manifest.TypeApt, manifest.TypeGit,
 	} {
-		d := writePlacement(stores, typ, "bulk")
+		d := writePlacement(stores, typ, "bulk", nil)
 		if d.Name != "bulk" || d.Level != storage.LevelPackage {
 			t.Errorf("%s: writePlacement = %+v, want bulk at the package level", typ, d)
 		}

@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/storage"
 )
@@ -18,14 +19,19 @@ func newStorageCmd(gf *globalFlags) *cobra.Command {
 		Long: `storage resolves the placement hierarchy for one package and names the level
 that decided the answer.
 
-Three levels are consulted, most specific first: the package's own
-storage_policy, then storage_by_type for its type, then the default backend.
-Naming the winning level is the point — "bulk" on its own does not say whether
-a package policy took effect or a forgotten type rule did.
+Four levels are consulted, most specific first: the package's own
+storage_policy, then storage_by_group for the groups its storage_groups names,
+then storage_by_type for its type, then the default backend. Naming the winning
+level is the point — "bulk" on its own does not say whether a package policy
+took effect, a group the package joined, or a forgotten type rule.
 
-pypi uploads a whole directory at a time, so the package level is not consulted
-for it and a storage_policy on a pypi package changes nothing. This says so
-rather than reporting a level the upload will not use.
+A package in two groups resolves by group name, first with a rule winning.
+'bodega pkg group' lists the groups and what each holds.
+
+pypi uploads a whole directory at a time, so neither the package level nor the
+group level is consulted for it, and a storage_policy or a group on a pypi
+package changes nothing. This says so rather than reporting a level the upload
+will not use.
 
 This is the WRITE side. It says nothing about where versions already uploaded
 live; each of those records its own backend, and 'bodega show pkg' prints it.`,
@@ -63,11 +69,21 @@ live; each of those records its own backend, and 'bodega show pkg' prints it.`,
 			// writePlacement, not Placement: this command exists to report
 			// what an upload will do, and the two answers differ for a type
 			// whose package level is never consulted.
-			d := writePlacement(stores, t, pm.StoragePolicy)
+			d := writePlacement(stores, t, pm.StoragePolicy, pm.StorageGroups)
 
 			fmt.Printf("%s -> %-8s (%s)\n", t+"/"+name, d.Name, d.Reason(t))
 			if w := storagePolicyWarning(t, pm.StoragePolicy); w != "" {
 				fmt.Println("  " + w)
+			}
+			if w := storageGroupWarning(t, admit.GroupRule(cfg, pm.StorageGroups)); w != "" {
+				fmt.Println("  " + w)
+			}
+			// A membership admitted under one config can become ambiguous
+			// under a later one, since nothing re-runs admit when
+			// storage_by_group is edited. Report it where the resolution is
+			// being explained rather than leaving the winner unexplained.
+			if err := admit.CheckGroupNames(cfg, pm.StorageGroups); err != nil {
+				fmt.Printf("  warning: storage_groups: %v\n", err)
 			}
 			return nil
 		},

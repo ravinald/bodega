@@ -36,7 +36,7 @@ func TestNewResolverWithoutNamedBackendsIsSingle(t *testing.T) {
 		t.Fatalf("All() = %v, want one backend named %q", all, DefaultName)
 	}
 	for _, typ := range []string{"apt", "pypi", "binary", "git"} {
-		if got := r.Placement(typ, ""); got.Name != DefaultName {
+		if got := r.Placement(typ, "", nil); got.Name != DefaultName {
 			t.Errorf("Placement(%q) = %q, want %q", typ, got.Name, DefaultName)
 		}
 	}
@@ -44,10 +44,10 @@ func TestNewResolverWithoutNamedBackendsIsSingle(t *testing.T) {
 
 func TestPlacementFollowsStorageByType(t *testing.T) {
 	r := twoBackendResolver(t, t.TempDir(), t.TempDir(), map[string]string{"apt": "bulk"})
-	if got := r.Placement("apt", ""); got.Name != "bulk" || got.Level != LevelType {
+	if got := r.Placement("apt", "", nil); got.Name != "bulk" || got.Level != LevelType {
 		t.Errorf("Placement(apt) = %+v, want bulk at LevelType", got)
 	}
-	if got := r.Placement("pypi", ""); got.Name != DefaultName || got.Level != LevelDefault {
+	if got := r.Placement("pypi", "", nil); got.Name != DefaultName || got.Level != LevelDefault {
 		t.Errorf("Placement(pypi) = %+v, want %q at LevelDefault", got, DefaultName)
 	}
 }
@@ -61,14 +61,14 @@ func TestPackagePolicyBeatsTheTypeRule(t *testing.T) {
 	r := twoBackendResolver(t, t.TempDir(), t.TempDir(), map[string]string{"git": "bulk"})
 
 	// git's type rule says bulk. This one package says otherwise and must win.
-	if got := r.Placement("git", DefaultName); got.Name != DefaultName || got.Level != LevelPackage {
+	if got := r.Placement("git", DefaultName, nil); got.Name != DefaultName || got.Level != LevelPackage {
 		t.Errorf("Placement(git, %q) = %+v, want %q at LevelPackage", DefaultName, got, DefaultName)
 	}
-	if got := r.Placement("git", ""); got.Name != "bulk" || got.Level != LevelType {
+	if got := r.Placement("git", "", nil); got.Name != "bulk" || got.Level != LevelType {
 		t.Errorf("Placement(git, no policy) = %+v, want bulk at LevelType", got)
 	}
 	// A type with no rule of its own still honors the package policy.
-	if got := r.Placement("npm", "bulk"); got.Name != "bulk" || got.Level != LevelPackage {
+	if got := r.Placement("npm", "bulk", nil); got.Name != "bulk" || got.Level != LevelPackage {
 		t.Errorf("Placement(npm, bulk) = %+v, want bulk at LevelPackage", got)
 	}
 }
@@ -83,7 +83,7 @@ func TestDecisionReasonNamesTheDecidingRule(t *testing.T) {
 	}{
 		{Decision{Name: "bulk", Level: LevelPackage}, "package policy"},
 		{Decision{Name: "bulk", Level: LevelType}, "type rule: storage_by_type.apt"},
-		{Decision{Name: DefaultName, Level: LevelDefault}, "global default; no type or package rule"},
+		{Decision{Name: DefaultName, Level: LevelDefault}, "global default; no type, group or package rule"},
 	} {
 		if got := tc.d.Reason("apt"); got != tc.want {
 			t.Errorf("Reason() = %q, want %q", got, tc.want)
@@ -200,4 +200,104 @@ func twoBackendResolver(t *testing.T, defaultPath, bulkPath string, byType map[s
 		t.Fatalf("NewResolver: %v", err)
 	}
 	return r
+}
+
+// groupResolver builds a real resolver over "default", "bulk" and "cold" with
+// both maps populated, so the group level is exercised against NewResolver
+// rather than a hand-written double.
+func groupResolver(t *testing.T, byType, byGroup map[string]string) Resolver {
+	t.Helper()
+	cfg := &config.Config{
+		StorageBackend: "local",
+		StoragePath:    t.TempDir(),
+		StorageBackends: map[string]config.StorageSpec{
+			"bulk": {Driver: "local", Path: t.TempDir()},
+			"cold": {Driver: "local", Path: t.TempDir()},
+		},
+		StorageByType:  byType,
+		StorageByGroup: byGroup,
+	}
+	r, err := NewResolver(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	return r
+}
+
+// TestGroupSitsBetweenTypeAndPackage pins the one property the level was added
+// for. A group that lost to the type rule would place nothing an operator
+// could not already place, and one that beat the package policy would move the
+// single package that must not move.
+func TestGroupSitsBetweenTypeAndPackage(t *testing.T) {
+	r := groupResolver(t,
+		map[string]string{"apt": "bulk"},
+		map[string]string{"mirror-set": "cold"})
+
+	if got := r.Placement("apt", "", []string{"mirror-set"}); got.Name != "cold" || got.Level != LevelGroup {
+		t.Errorf("Placement(apt, no policy, mirror-set) = %+v, want cold at LevelGroup", got)
+	}
+	if got := r.Placement("apt", DefaultName, []string{"mirror-set"}); got.Name != DefaultName || got.Level != LevelPackage {
+		t.Errorf("Placement(apt, policy, mirror-set) = %+v, want %q at LevelPackage", got, DefaultName)
+	}
+	if got := r.Placement("apt", "", []string{"unmapped"}); got.Name != "bulk" || got.Level != LevelType {
+		t.Errorf("Placement(apt, group with no rule) = %+v, want bulk at LevelType", got)
+	}
+	if got := r.Placement("npm", "", []string{"unmapped"}); got.Name != DefaultName || got.Level != LevelDefault {
+		t.Errorf("Placement(npm, group with no rule) = %+v, want %q at LevelDefault", got, DefaultName)
+	}
+}
+
+// TestTwoGroupsResolveByNameNotByOrder is the answer to "what does a package in
+// two groups get". Both orderings are driven because manifest order is exactly
+// what the rule must not depend on: a rewrite that reorders the list would
+// otherwise move the next upload's bytes.
+func TestTwoGroupsResolveByNameNotByOrder(t *testing.T) {
+	r := groupResolver(t, nil, map[string]string{"alpha": "bulk", "omega": "cold"})
+
+	for _, groups := range [][]string{{"alpha", "omega"}, {"omega", "alpha"}} {
+		got := r.Placement("apt", "", groups)
+		if got.Name != "bulk" || got.Group != "alpha" {
+			t.Errorf("Placement(apt, %v) = %+v, want bulk decided by alpha", groups, got)
+		}
+	}
+
+	// The caller's slice is its manifest's field; sorting it in place would
+	// rewrite the manifest on the next save.
+	groups := []string{"omega", "alpha"}
+	r.Placement("apt", "", groups)
+	if groups[0] != "omega" {
+		t.Errorf("groups = %v after Placement, want the caller's order untouched", groups)
+	}
+}
+
+// TestGroupReasonNamesBothEdits keeps the level debuggable: a reason saying
+// only "group rule" leaves the operator hunting for which of the two files to
+// change.
+func TestGroupReasonNamesBothEdits(t *testing.T) {
+	r := groupResolver(t, nil, map[string]string{"mirror-set": "cold"})
+	got := r.Placement("apt", "", []string{"mirror-set"}).Reason("apt")
+	for _, want := range []string{"storage_by_group.mirror-set", "storage_groups"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Reason() = %q, want it to name %q", got, want)
+		}
+	}
+}
+
+// TestStorageByGroupAloneStillBuildsMulti guards the reporting path: with only
+// the default backend every group resolves to it, so the answer is the same
+// either way and a single resolver would report LevelDefault for a package the
+// operator did place by group.
+func TestStorageByGroupAloneStillBuildsMulti(t *testing.T) {
+	cfg := &config.Config{
+		StorageBackend: "local",
+		StoragePath:    t.TempDir(),
+		StorageByGroup: map[string]string{"mirror-set": DefaultName},
+	}
+	r, err := NewResolver(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	if got := r.Placement("apt", "", []string{"mirror-set"}); got.Level != LevelGroup || got.Name != DefaultName {
+		t.Errorf("Placement(apt, mirror-set) = %+v, want %q at LevelGroup", got, DefaultName)
+	}
 }

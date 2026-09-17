@@ -231,7 +231,7 @@ func (p *pair) ByName(name string) (storage.ObjectStore, error) {
 	return nil, fmt.Errorf("unknown storage backend %q", name)
 }
 
-func (p *pair) Placement(string, string) storage.Decision {
+func (p *pair) Placement(string, string, []string) storage.Decision {
 	return storage.Decision{Name: storage.DefaultName}
 }
 

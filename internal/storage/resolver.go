@@ -24,16 +24,22 @@ type NamedStore struct {
 }
 
 // Level names which rule of the placement hierarchy chose a backend. Printing
-// it is what makes a three-level hierarchy debuggable: "bulk" alone does not
-// say whether an operator's package policy took effect or a type rule they
-// forgot about did.
+// it is what makes a four-level hierarchy debuggable: "bulk" alone does not
+// say whether an operator's package policy took effect, a group they no longer
+// remember joining, or a type rule they forgot about.
 type Level int
 
 const (
-	// LevelDefault: neither a package policy nor a type rule applied.
+	// LevelDefault: no package policy, group rule or type rule applied.
 	LevelDefault Level = iota
 	// LevelType: storage_by_type[typ] decided.
 	LevelType
+	// LevelGroup: storage_by_group[g] decided, for a group g the package's
+	// storage_groups names. It sits above the type rule and below the package
+	// policy: a group is a set an operator names on purpose, so it beats the
+	// rule that catches every package of an ecosystem, and it loses to the one
+	// field that names a single package.
+	LevelGroup
 	// LevelPackage: the package manifest's storage_policy decided.
 	LevelPackage
 )
@@ -46,10 +52,17 @@ const (
 // giving it that knowledge would make a second place answer the question.
 // Dropping the policy silently is what made 'bodega pkg storage' print a level
 // no upload would ever act on.
+//
+// IgnoredGroup is the group rule dropped for the same types and the same
+// reason, carrying the group name rather than the backend: the operator's edit
+// is to storage_groups or to storage_by_group, and neither is findable from a
+// backend name.
 type Decision struct {
 	Name          string
 	Level         Level
+	Group         string // the group that decided, when Level is LevelGroup
 	IgnoredPolicy string
+	IgnoredGroup  string
 }
 
 // Reason renders the deciding rule for an operator, naming the config key the
@@ -59,13 +72,18 @@ func (d Decision) Reason(typ string) string {
 	switch d.Level {
 	case LevelPackage:
 		reason = "package policy"
+	case LevelGroup:
+		reason = fmt.Sprintf("group rule: storage_by_group.%s, from storage_groups on the package", d.Group)
 	case LevelType:
 		reason = "type rule: storage_by_type." + typ
 	default:
-		reason = "global default; no type or package rule"
+		reason = "global default; no type, group or package rule"
 	}
 	if d.IgnoredPolicy != "" {
 		reason += fmt.Sprintf("; storage_policy %q is not consulted for %s", d.IgnoredPolicy, typ)
+	}
+	if d.IgnoredGroup != "" {
+		reason += fmt.Sprintf("; storage_by_group.%s is not consulted for %s", d.IgnoredGroup, typ)
 	}
 	return reason
 }
@@ -104,17 +122,26 @@ type Resolver interface {
 	// target, and the level that decided it. Callers record the returned
 	// name alongside the artifact.
 	//
-	// policy is the package's PackageManifest.StoragePolicy. It arrives as a
-	// string rather than being looked up here because storage must never
-	// import manifest, and every caller already holds the manifest it came
-	// from. Empty means the package has no rule; pass "" for a write that
-	// belongs to no package.
+	// policy is the package's PackageManifest.StoragePolicy and groups is its
+	// StorageGroups. Both arrive as plain values rather than being looked up
+	// here because storage must never import manifest, and every caller
+	// already holds the manifest they came from. Empty means the package has
+	// no rule at that level; pass "" and nil for a write that belongs to no
+	// package.
 	//
-	// The most specific rule wins: package policy, then type rule, then the
-	// default backend. A package policy that lost to a type rule would be a
-	// trap — it is set precisely for the package whose bytes must not go
-	// where the rest of its type goes.
-	Placement(typ, policy string) Decision
+	// The most specific rule wins: package policy, then group rule, then type
+	// rule, then the default backend. A package policy that lost to a type
+	// rule would be a trap — it is set precisely for the package whose bytes
+	// must not go where the rest of its type goes — and a group that lost to
+	// the type rule would be one too, for the same reason at set scale.
+	//
+	// Groups are consulted in sort order and the first with a rule wins, so
+	// the answer never depends on the order the manifest happens to list them
+	// in nor on a map walk. Two groups pointing at different backends is an
+	// operator error admit refuses at the edit that creates it; this still has
+	// to answer, and answering the same way every time is what lets the
+	// refusal name the winner.
+	Placement(typ, policy string, groups []string) Decision
 
 	// ForType returns the backend for objects that carry no recorded name:
 	// generated indexes, proxy-cache entries and attestation
@@ -166,7 +193,11 @@ func (r *single) ByName(name string) (ObjectStore, error) {
 // to DefaultName. A policy naming a backend this install does not define is an
 // operator error, and ByName reporting it beats writing the bytes somewhere
 // the manifest did not ask for.
-func (r *single) Placement(_, policy string) Decision {
+//
+// Groups are ignored rather than resolved: a single-backend install has no
+// storage_by_group to resolve them against, since NewResolver builds this
+// shape only when both storage_backends and storage_by_type are empty.
+func (r *single) Placement(_, policy string, _ []string) Decision {
 	if policy != "" {
 		return Decision{Name: policy, Level: LevelPackage}
 	}
@@ -184,9 +215,10 @@ func (r *single) All() []NamedStore {
 // multi is a Resolver over the default backend plus every entry in
 // storage_backends, with placement decided by storage_by_type.
 type multi struct {
-	stores map[string]ObjectStore
-	byType map[string]string
-	names  []string // DefaultName first, then the rest sorted
+	stores  map[string]ObjectStore
+	byType  map[string]string
+	byGroup map[string]string
+	names   []string // DefaultName first, then the rest sorted
 }
 
 // NewResolver builds the resolver described by the whole config: the default
@@ -200,14 +232,20 @@ func NewResolver(ctx context.Context, cfg *config.Config) (Resolver, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(cfg.StorageBackends) == 0 && len(cfg.StorageByType) == 0 {
+	// storage_by_group joins the test even though every group it can name
+	// resolves to the default backend here: the answer would be the same
+	// either way, but 'bodega pkg storage' would report a level the operator
+	// did not configure, which is the reporting bug the level was added to
+	// avoid rather than introduce.
+	if len(cfg.StorageBackends) == 0 && len(cfg.StorageByType) == 0 && len(cfg.StorageByGroup) == 0 {
 		return NewSingle(def), nil
 	}
 
 	m := &multi{
-		stores: map[string]ObjectStore{DefaultName: def},
-		byType: cfg.StorageByType,
-		names:  []string{DefaultName},
+		stores:  map[string]ObjectStore{DefaultName: def},
+		byType:  cfg.StorageByType,
+		byGroup: cfg.StorageByGroup,
+		names:   []string{DefaultName},
 	}
 	named := make([]string, 0, len(cfg.StorageBackends))
 	for name := range cfg.StorageBackends {
@@ -245,9 +283,12 @@ func (r *multi) ByName(name string) (ObjectStore, error) {
 	return store, nil
 }
 
-func (r *multi) Placement(typ, policy string) Decision {
+func (r *multi) Placement(typ, policy string, groups []string) Decision {
 	if policy != "" {
 		return Decision{Name: policy, Level: LevelPackage}
+	}
+	if group, name := r.groupRule(groups); name != "" {
+		return Decision{Name: name, Level: LevelGroup, Group: group}
 	}
 	if name := r.byType[typ]; name != "" {
 		return Decision{Name: name, Level: LevelType}
@@ -255,8 +296,30 @@ func (r *multi) Placement(typ, policy string) Decision {
 	return Decision{Name: DefaultName, Level: LevelDefault}
 }
 
+// groupRule returns the group that decides and the backend it names, or two
+// empty strings when none of the groups carries a rule.
+//
+// The winner is the first group *by name* that has a rule, not the first the
+// manifest lists. Both are deterministic; this one also survives a manifest
+// rewritten in another order, and it is the rule the refusal in admit quotes
+// when two groups disagree. The input is copied before sorting because a
+// caller's slice is its manifest's field.
+func (r *multi) groupRule(groups []string) (string, string) {
+	if len(groups) == 0 || len(r.byGroup) == 0 {
+		return "", ""
+	}
+	sorted := append([]string(nil), groups...)
+	sort.Strings(sorted)
+	for _, g := range sorted {
+		if name := r.byGroup[g]; name != "" {
+			return g, name
+		}
+	}
+	return "", ""
+}
+
 func (r *multi) ForType(typ string) ObjectStore {
-	store, err := r.ByName(r.Placement(typ, "").Name)
+	store, err := r.ByName(r.Placement(typ, "", nil).Name)
 	if err != nil {
 		return r.Default()
 	}

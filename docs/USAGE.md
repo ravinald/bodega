@@ -655,22 +655,57 @@ Resolves the placement hierarchy for one package and names the level that decide
 $ bodega pkg storage binary awscli-v2
 binary/awscli-v2 -> bulk     (package policy)
 $ bodega pkg storage apt nginx
-apt/nginx  -> bulk     (type rule: storage_by_type.apt)
+apt/nginx  -> cold     (group rule: storage_by_group.mirror-set, from storage_groups on the package)
+$ bodega pkg storage npm lodash
+npm/lodash -> bulk     (type rule: storage_by_type.npm)
 $ bodega pkg storage git netbox
-git/netbox -> default  (global default; no type or package rule)
+git/netbox -> default  (global default; no type, group or package rule)
 ```
 
-`pypi` uploads a whole directory at a time, so the package level is never consulted for it. A `storage_policy` on a `pypi` package is reported as skipped rather than as the level that won:
+The group reason names both edits that could change the answer — the config key and the manifest field — because a line reading only `group rule` leaves an operator hunting for which of the two files to open. [`bodega pkg group`](#bodega-pkg-group-name) lists the other packages the same group holds.
+
+`pypi` uploads a whole directory at a time, so neither the package level nor the group level is consulted for it. A `storage_policy` or a group membership on a `pypi` package is reported as skipped rather than as the level that won:
 
 ```bash
 $ bodega pkg storage pypi boto3
-pypi/boto3 -> default  (global default; no type or package rule; storage_policy "bulk" is not consulted for pypi)
+pypi/boto3 -> default  (global default; no type, group or package rule; storage_policy "bulk" is not consulted for pypi; storage_by_group.mirror-set is not consulted for pypi)
   warning: storage_policy "bulk" has no effect for pypi: pypi wheels upload as a directory with no per-version object key, so one package cannot be placed apart from the rest of its type. Set storage_by_type.pypi to place the whole type; 'bodega pkg move' refuses pypi for the same reason.
+  warning: storage group "mirror-set" has no effect for pypi: pypi wheels upload as a directory with no per-version object key, so one package cannot be placed apart from the rest of its type. Set storage_by_type.pypi to place the whole type; 'bodega pkg move' refuses pypi for the same reason.
 ```
 
 An operator reads this command to find out why a package landed where it did, so a level the write path will not use is worse than no level at all.
 
 This is the write side. It says where the _next_ version goes and nothing about where versions already uploaded live; each of those records its own backend in `storage`, and the `STORED` column of `bodega show pkg <type> <name> --admin` prints it. A version that records nothing reads `default`, which is the backend the global `storage_backend` / `storage_path` / `bucket` / `region` keys describe and the one every artifact uploaded before backends were named lives on.
+
+### `bodega pkg group [NAME]`
+
+Lists the storage groups this install defines, or the packages one holds.
+
+```bash
+$ bodega pkg group
+GROUP          BACKEND  PACKAGES  DECIDING
+customer-acme  bulk     12        12
+mirror-set     cold     41        39
+
+'bodega pkg group NAME' lists one group's packages; 'bodega pkg storage TYPE NAME' resolves one package.
+```
+
+`PACKAGES` is how many manifests name the group. `DECIDING` is how many it actually places. The two columns are separate because membership is not placement, and a listing showing only the first reports forty-one packages held by a group that places thirty-nine of them:
+
+```bash
+$ bodega pkg group mirror-set
+mirror-set -> cold (storage_by_group.mirror-set)
+
+TYPE    PACKAGE    DECIDES
+apt     nginx      yes
+binary  kubectl    no — storage_policy "bulk" outranks it
+npm     left-pad   no — group "customer-acme" wins by name
+pypi    boto3      no — not consulted for pypi
+```
+
+A group with no packages is still listed: staging the set in the config before the manifests join it is a normal order, and omitting the row would read as a config that did not load.
+
+This is the write side, like `bodega pkg storage`. It says nothing about where already-uploaded versions live; each records its own backend, and `bodega pkg drift` is what reports the two disagreeing.
 
 ### `bodega pkg move <type> <name>[@<version>] --to <backend>`
 
@@ -2355,7 +2390,7 @@ What differs per backend is access, and it differs in the direction that matters
 
 ### Named backends and per-type placement
 
-`storage_backend`, `storage_path`, `bucket` and `region` describe one backend, whose reserved name is `default`. `storage_backends` adds more, by name. `storage_by_type` says which name the _next_ write of each package type goes to.
+`storage_backend`, `storage_path`, `bucket` and `region` describe one backend, whose reserved name is `default`. `storage_backends` adds more, by name. `storage_by_type` says which name the _next_ write of each package type goes to, and `storage_by_group` does the same for a named set of packages that is not a whole type.
 
 ```json
 {
@@ -2396,21 +2431,50 @@ The prefix is the other half of that label, and it was still concatenated verbat
 
 #### The placement hierarchy
 
-Three levels decide where the next write goes, most specific first — two for `pypi`, which never reaches the package level:
+Four levels decide where the next write goes, most specific first — two for `pypi`, which reaches neither the package level nor the group level:
 
 | Level | Where it lives | Reason |
 |-------|----------------|--------|
 | Package | `storage_policy` on the package manifest | One package whose bytes must live in a specific bucket, under a specific KMS key, while its type is shared with packages that must not |
+| Group | `storage_by_group.<group>` in the config, joined by `storage_groups` on the manifest | A set of packages that belong together and are not a whole type: forty `apt` packages a customer entitles, an air-gapped mirror set |
 | Type | `storage_by_type.<type>` in the config | A whole ecosystem on a separate volume |
 | Global | `storage_backend`/`storage_path`/`bucket`/`region` | Everything else |
 
-One version can be directed past all three at write time with [`--storage`](#placing-one-version-at-write-time) on `upload` or `sync`. That is not a fourth level: it records a name on the version entry and stops deciding, where a level would re-decide at every future upload. `pypi` cannot take it, for the same reason it never reaches the package level.
+One version can be directed past all four at write time with [`--storage`](#placing-one-version-at-write-time) on `upload` or `sync`. That is not a fifth level: it records a name on the version entry and stops deciding, where a level would re-decide at every future upload. `pypi` cannot take it, for the same reason it never reaches the package level.
 
-The most specific rule wins. A package policy that lost to a type rule would be a trap: it is set precisely for the package that must not go where the rest of its type goes, and adding a type rule later would silently move it.
+The most specific rule wins. A package policy that lost to a type rule would be a trap: it is set precisely for the package that must not go where the rest of its type goes, and adding a type rule later would silently move it. The group level sits above the type rule for the same reason at set scale, and below the package policy so that the one package singled out by name still wins.
 
-`bodega pkg storage <type> <name>` prints the resolved backend and which level decided it. Naming the winning level is what makes a three-level hierarchy debuggable — `bulk` on its own does not say whether a package policy took effect or a forgotten type rule did.
+`bodega pkg storage <type> <name>` prints the resolved backend and which level decided it. Naming the winning level is what makes a four-level hierarchy debuggable — `bulk` on its own does not say whether a package policy took effect, a group the package joined, or a forgotten type rule.
 
-`pypi` is the one type the package level is not consulted for. Its wheels upload as one directory to one prefix and the PEP 503 index is a listing over that tree, so honoring a policy for some packages and not others would split it with no listing to reunite it. `bodega pkg move` refuses `pypi` for the same reason, and setting `storage_policy` on a `pypi` package warns rather than taking effect. Set `storage_by_type.pypi` to place the whole type.
+`pypi` is the one type neither the package level nor the group level is consulted for. Its wheels upload as one directory to one prefix and the PEP 503 index is a listing over that tree, so honoring a rule for some packages and not others would split it with no listing to reunite it. A group is worse than a policy here rather than better: it holds packages across types, so one group serving a mirror set would place its `pypi` members apart from the rest of the tree. `bodega pkg move` refuses `pypi` for the same reason, and setting `storage_policy` or `storage_groups` on a `pypi` package warns rather than taking effect. Set `storage_by_type.pypi` to place the whole type.
+
+#### Storage groups
+
+A group is a name in `storage_by_group` pointing at a backend, and a package joins it by naming it in `storage_groups`:
+
+```json
+{
+  "storage_by_group": { "mirror-set": "cold", "customer-acme": "bulk" }
+}
+```
+
+```json
+{
+  "name": "nginx",
+  "type": "apt",
+  "storage_groups": ["mirror-set"]
+}
+```
+
+The mapping is in the config and the membership is in the manifest, on purpose. Moving a whole set is then one config edit instead of one manifest edit per package, and a package still declares what it belongs to beside everything else it declares. Setting either moves nothing already uploaded; `bodega pkg drift` reports the versions a group rule now disagrees with and `bodega pkg move` moves them.
+
+A package may name more than one group, because operators group by more than one axis and the sets overlap. Resolution is by **group name in sort order, first with a rule winning** — not by the order the manifest lists them, which a re-serialization could change under you. Two groups pointing at two different backends is refused at the edit that creates it, by `bodega pkg edit`, `bodega pkg import` and `POST /api/v1/packages` alike:
+
+```text
+storage_groups: groups resolve to more than one backend (alpha -> "bulk"; omega -> "cold"); a package is written to one backend, and "alpha" would win by group name — drop a group, or point them at the same backend in storage_by_group
+```
+
+Two groups naming one backend is not ambiguous and passes. A group name no `storage_by_group` key defines is refused outright, on the same grounds as a backend name nothing defines: it decides nothing, so the package falls through to its type rule and the typo surfaces at an upload with no obvious path back to the edit.
 
 #### `storage_policy` and `storage` are different fields on purpose
 
@@ -2577,6 +2641,7 @@ Each package is stored as a JSON file at `{manifest_dir}/{type}/{safeName}/manif
 | `description` | string | Short human-readable summary |
 | `dep_policy` | string | `none`, `direct`, or `transitive` |
 | `storage_policy` | string | Backend this package's _next_ version is written to, overriding `storage_by_type`. Absent means the type rule decides; see [the placement hierarchy](#the-placement-hierarchy) |
+| `storage_groups` | array | Storage groups this package belongs to, resolved to a backend by `storage_by_group`. Outranks `storage_by_type`, loses to `storage_policy`; see [Storage groups](#storage-groups) |
 
 #### Package names
 

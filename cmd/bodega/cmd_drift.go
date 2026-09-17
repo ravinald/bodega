@@ -103,17 +103,25 @@ func printDrift(out io.Writer, rows []placement.DriftRow) {
 		fmt.Fprintf(out, "  %s\n", remedy)
 	}
 
-	var policies []string
+	// A row can carry both, and fixing one leaves the other: an operator who
+	// clears an inert storage_policy on a pypi package still has it in a group
+	// that places nothing.
+	var inert []string
 	for _, r := range rows {
-		if r.IgnoredPolicy == "" {
-			continue
-		}
-		w := fmt.Sprintf("%s/%s: %s", r.Type, r.Package, storagePolicyWarning(r.Type, r.IgnoredPolicy))
-		if !slices.Contains(policies, w) {
-			policies = append(policies, w)
+		for _, w := range []string{
+			storagePolicyWarning(r.Type, r.IgnoredPolicy),
+			storageGroupWarning(r.Type, r.IgnoredGroup),
+		} {
+			if w == "" {
+				continue
+			}
+			line := fmt.Sprintf("%s/%s: %s", r.Type, r.Package, w)
+			if !slices.Contains(inert, line) {
+				inert = append(inert, line)
+			}
 		}
 	}
-	for _, w := range policies {
+	for _, w := range inert {
 		fmt.Fprintf(out, "\n  warning: %s\n", w)
 	}
 }
