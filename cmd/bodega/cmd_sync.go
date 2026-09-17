@@ -55,7 +55,7 @@ use 'upload' instead.`,
 				return fmt.Errorf("load manifests: %w", err)
 			}
 
-			bcfg := builder.NewConfig(cfg)
+			bcfg := builder.NewConfig(cfg, nil)
 
 			ctx := backgroundCtx()
 			pl, err := newPlacer(ctx, cfg, store, os.Stdout, replacePlacement)

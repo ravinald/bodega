@@ -76,16 +76,10 @@ When a name is given after the type, only that entry is built.`,
 				defer auditDB.Close()
 			}
 
-			var policyChecker *policy.Checker
-			if auditDB != nil {
-				policyChecker = policy.NewChecker(auditDB)
-			}
-
-			bcfg := builder.NewConfig(cfg)
+			bcfg := builder.NewConfig(cfg, policy.CheckerFor(auditDB))
 			bcfg.Stdout = buildOut
 			bcfg.Logger = buildLogger
 			bcfg.AuditDB = auditDB
-			bcfg.Policy = policyChecker
 
 			var allSummaries []*builder.Summary
 

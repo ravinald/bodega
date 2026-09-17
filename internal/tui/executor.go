@@ -18,6 +18,7 @@ import (
 	"github.com/ravinald/bodega/internal/logging"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/placement"
+	"github.com/ravinald/bodega/internal/policy"
 	bos3 "github.com/ravinald/bodega/internal/s3"
 	"github.com/ravinald/bodega/internal/server"
 	"github.com/ravinald/bodega/internal/storage"
@@ -62,8 +63,12 @@ const (
 // fetcher holding a nil one writes the digest to the manifest and silently
 // skips the checksum row `pkg checksum list` reads. It may be nil when the
 // install configures no audit_db, which is the same state the CLI passes.
+//
+// The allow-list reads its rules from that same database, and a stage run
+// without it fetched past every policy rule with no refusal in the log pane
+// and no audit row behind it.
 func builderCfg(buf *bytes.Buffer, cfg *config.Config, auditDB *audit.DB) *builder.Config {
-	bc := builder.NewConfig(cfg)
+	bc := builder.NewConfig(cfg, policy.CheckerFor(auditDB))
 	bc.Stdout = buf
 	bc.AuditDB = auditDB
 

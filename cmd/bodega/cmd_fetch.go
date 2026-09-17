@@ -68,15 +68,9 @@ When a name is given after the type, only that entry is fetched.`,
 				defer auditDB.Close()
 			}
 
-			var policyChecker *policy.Checker
-			if auditDB != nil {
-				policyChecker = policy.NewChecker(auditDB)
-			}
-
-			bcfg := builder.NewConfig(cfg)
+			bcfg := builder.NewConfig(cfg, policy.CheckerFor(auditDB))
 			bcfg.Force = force
 			bcfg.AuditDB = auditDB
-			bcfg.Policy = policyChecker
 
 			var allSummaries []*builder.Summary
 

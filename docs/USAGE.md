@@ -3255,10 +3255,10 @@ When a dependency has a security issue, fails checksum verification, or is other
 
 The allow-list declares which upstream sources bodega is permitted to fetch from, at the granularity that matters for each ecosystem. It's opt-in: add a rule for a registry type and enforcement switches on for that type. Leave it empty and everything is accepted (pre-v0.2.0 behavior).
 
-Enforcement happens in four places, so there's no way around it:
+Enforcement happens in four places:
 
 - **Server proxy** (`bodega serve`) — cache-miss fetches check policy before leaving the box. Blocked fetches return 403.
-- **Builder** (`bodega build fetch`) — each fetch stage validates entries before any network I/O.
+- **Builder** — each fetch stage validates entries before any network I/O, on every surface that runs one: `bodega build fetch`, `bodega build run`, `bodega build package`, `bodega build upload`, and the interactive `bodega shell`. A refusal prints against the entry and lands in the shell's log pane like any other stage output. `bodega build sync` and `bodega repair` reach no fetcher and check nothing.
 - **Create API + import** (`POST /api/v1/packages/...`, `bodega pkg import`) — manifests referencing blocked upstreams are rejected at creation time. Fail early, not at first fetch.
 - **Interactive create** (`bodega pkg create`) — warns the operator and asks y/N to proceed. The only path that allows override, and the override writes a `policy_override` audit event.
 
@@ -3275,6 +3275,12 @@ bodega policy add pypi requests
 
 # Audit existing manifests for any violations
 bodega policy check
+```
+
+Enforcement needs the audit database, which is where the rules live. An install that configures no `audit_db` has no allow-list to apply, and every upstream is permitted. That state is announced rather than assumed: each run that reaches a fetch without one prints a single line before the first entry, on the same output the fetch reports to.
+
+```text
+  policy: no upstream allow-list loaded, so every upstream is permitted. Set audit_db and add rules with `bodega policy add` to enforce one.
 ```
 
 The allow-list is stored in SQLite (`upstream_policies` table in the audit DB) and is hot-mutable — server changes are picked up within 30 seconds, and policy mutations invalidate the cache immediately.

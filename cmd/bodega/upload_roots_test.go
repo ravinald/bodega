@@ -112,7 +112,7 @@ func TestUploadNamesTheDirectoryItWalked(t *testing.T) {
 		t.Fatalf("newPlacer: %v", err)
 	}
 
-	if _, err := pl.UploadType(t.Context(), builder.NewConfig(cfg), manifest.TypeApt); err != nil {
+	if _, err := pl.UploadType(t.Context(), builder.NewConfig(cfg, nil), manifest.TypeApt); err != nil {
 		t.Fatalf("UploadType(apt): %v", err)
 	}
 	want := filepath.Join(aptRoot, "apt-repo")
@@ -128,7 +128,7 @@ func TestUploadNamesTheDirectoryItWalked(t *testing.T) {
 // skipping the type.
 func TestEveryTypeHasAnUploadCascade(t *testing.T) {
 	cfg := &config.Config{BuildRoot: t.TempDir(), ManifestDir: t.TempDir()}
-	bcfg := builder.NewConfig(cfg)
+	bcfg := builder.NewConfig(cfg, nil)
 	bcfg.Stdout = io.Discard
 	store := manifest.NewLocalStore(cfg.ManifestDir)
 
