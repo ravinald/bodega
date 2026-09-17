@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -1938,7 +1939,15 @@ func TestCargoStanzaSurvivesANarrowPane(t *testing.T) {
 // "S3 path" over a bundle sitting on the host's own disk, which sent operators
 // looking for an upload no configuration would ever perform.
 func TestDetailsPaneNamesBackendNotS3OnLocalInstall(t *testing.T) {
-	root := t.TempDir()
+	// Not t.TempDir(): it names the directory after the test, and this test's
+	// name contains "S3", which the rendered file:// URI would then carry into
+	// the assertion below. It passed on macOS only because the pane truncated
+	// the path before reaching it.
+	root, err := os.MkdirTemp("", "bodega-local")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(root) })
 	cfg := &config.Config{
 		ManifestDir:    "manifests",
 		StorageBackend: "local",
@@ -1949,7 +1958,12 @@ func TestDetailsPaneNamesBackendNotS3OnLocalInstall(t *testing.T) {
 		t.Fatalf("NewResolver: %v", err)
 	}
 
-	store := manifest.NewLocalStore(t.TempDir())
+	manifestDir, err := os.MkdirTemp("", "bodega-manifests")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(manifestDir) })
+	store := manifest.NewLocalStore(manifestDir)
 	ctx := t.Context()
 	_ = store.AddVersion(ctx, manifest.TypeGit, "uuid", manifest.VersionEntry{
 		URL: "https://example.com/uuid",
