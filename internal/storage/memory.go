@@ -20,8 +20,21 @@ import (
 // package: PutFile reads the file, Head reports Exists=false for a key that was
 // never written, and a missing Get returns (nil, nil) like every other backend.
 //
-// Safe for concurrent use. Not a cache and not persistent — process exit loses
+// Safe for concurrent use. Not a cache and not persistent: process exit loses
 // everything.
+//
+// Write contract (ObjectStore.Put). Memory keeps the first three, and keeps
+// them by construction rather than by intent, which is why they are written
+// down here. Put takes the write lock and replaces the whole slice, so no
+// reader observes a half-written object; Get and GetStream copy the slice
+// under the read lock, so a handle already returned reads the bytes it was
+// given however many Puts follow. There is no crash to survive and no
+// durability to promise: the process is the store.
+//
+// The fourth it keeps vacuously, and that is the clause to watch. Memory
+// carries no mode, owner or ACL, so a replacement has nothing to restate and a
+// test that passes here proves nothing about whether a backend that does carry
+// access state restates it. Local is where that is held.
 type Memory struct {
 	mu      sync.RWMutex
 	objects map[string]memObject

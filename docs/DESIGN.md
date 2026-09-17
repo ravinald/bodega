@@ -93,6 +93,38 @@ Objects with no version entry — generated indexes, proxy-cache entries, attest
 
 Moving an artifact between backends is `bodega pkg move`, which copies, verifies at the destination, writes the manifest, and only then considers the source. Deleting first would be unrecoverable: both backends answer a missing object with "not found" rather than an error, so an artifact lost mid-move is indistinguishable from one that was never uploaded.
 
+### Publication
+
+Placement decides which backend answers. This decides what answering means, and it is stated on `ObjectStore` itself (`internal/storage/storage.go`) rather than in one driver, because an operator who restricts an artifact cannot see which backend the placement rules sent it to. A write publishes: a key names the object it named before the call or the object the call stores, never something in between, for every reader at every instant. Four promises follow, and each backend keeps them or records that it does not.
+
+**Replacement is all or nothing.** No reader sees a partial body, a truncated one or an empty one, and none has to lock to avoid it. Locking could not be the answer regardless: the writer is routinely a `bodega pkg upload` in another process against the same tree.
+
+**An open handle is a snapshot.** A reader that opened a key reads the object it opened, to the end, however many replacements land underneath. That is what lets the cache bind a recorded upstream to the bytes it serves: the identity comes off the same open as the body, and both describe one object for the life of the handle.
+
+**An interrupted write publishes nothing.** The key holds what it held. Debris is not an object and never comes back from a listing.
+
+**Publication replaces bytes, never who may read them.** Where a backend carries access state, a replacement restates all of it, and where it cannot, the write fails and leaves the previous object exactly as it was.
+
+| Backend | Atomic | Snapshot | Crash-safe | Access preserved | Bytes on disk on return |
+| ------- | ------ | -------- | ---------- | ---------------- | ----------------- |
+| `local` | yes, rename | yes, new inode | yes | yes: mode, owner, group, ACL, xattrs | **no** |
+| `s3` | yes, per object | yes, per GET | yes | vacuous: carries none | the service's, not this package's |
+| `memory` | yes, under the lock | yes, copied out | n/a | vacuous: carries none | n/a |
+
+Vacuous is not the same as kept, which is why the table says which it is. An artifact whose restriction has to survive refills belongs on a local backend, and placement can arrange that per package.
+
+`local` is the one that declines a clause. `publish` renames without an `fsync` of the file or the directory, so a host that loses power moments after a write returns can come up holding either object. The ordering promises survive that; the bytes may not. Every artifact the store holds is refetchable or rebuildable, and the alternative is an `fsync` on every proxy cache fill.
+
+#### The staging file
+
+A replacement is written into a staging file and renamed over the key. For the length of that write the staging file is the one inode in the tree whose access state belongs to nobody: it holds a whole artifact under the writer's mode and the writer's ownership rather than the object's, because the object's access state is read from the open handle after the body lands and not before. So it needs a confidentiality rule of its own, separate from the object's — nothing but the server may read it at any point between its creation and the rename.
+
+Reordering the metadata syscalls does not deliver that. Restate the object's mode first and the staging file is readable at that mode while it is still owned by the server, so the server's group gets an artifact the object never gave them. Hand it to the object's owner first and it is readable at the writer's mode by an owner the object's own mode may deny, which is what an artifact taken away from everybody looks like. A mode of `0000` throughout would close both and is not available: both kernels check an extended-attribute call against the file's current mode, so a staging file at `0000` refuses its own owner the ACL it exists to carry. Inheritance is a third route in and is not a race at all: a `default:` POSIX ACL on Linux or a `file_inherit` ACE on macOS is on the staging file from the moment it is created, and `chmod` removes neither.
+
+So a replacement is staged inside a directory the server has to itself, stripped of whatever it inherited and holding nothing else. A path nothing may traverse cannot be opened, whatever the inode at the end of it says at any instant, and the rename out of it is the first moment the bytes are addressable. By then they carry the object's access state.
+
+A fresh object gets none of this, deliberately. It _is_ the staging file, so it takes the directory's inheritance and the process umask exactly as a direct create would, and it discloses nothing before the rename that it will not disclose after.
+
 ## Package types
 
 | Type | Source | Artifact | Client protocol |

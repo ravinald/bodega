@@ -1,9 +1,11 @@
 package storage
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path"
@@ -14,6 +16,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -436,8 +439,9 @@ func posixACL(entries ...aclEntry) []byte {
 }
 
 // requirePOSIXACL sets an ACL through the Linux interface for one, and skips
-// where there is none. macOS keeps its ACLs where getxattr will not read from,
-// which is why publication clones the object it replaces there and why
+// where there is none. macOS keeps its ACLs in com.apple.system.Security,
+// which the kernel refuses to hand to getxattr from user space, so publication
+// moves them with getattrlist and setattrlist there (see acl_darwin.go) and
 // denyNamedReader goes through chmod on that platform.
 func requirePOSIXACL(t *testing.T, target, name string, acl []byte) {
 	t.Helper()
@@ -845,5 +849,240 @@ func TestLocalPublishKeepsWhoCanReadTheObject(t *testing.T) {
 				t.Errorf("%s lost an artifact the object granted it, at mode %04o", otherIdentity, publishedMode(t, root, key))
 			}
 		})
+	}
+}
+
+// grantInheritedReader puts an ACL on a directory that every file created in
+// it afterwards is born with, granting a principal this process is not.
+//
+// The other inheritance fixtures inherit a denial, which a staging file can
+// carry harmlessly: the publication drops it again before the rename and
+// nobody was let in meanwhile. A grant is the direction that discloses, and it
+// discloses the one thing a staging file holds that no object does yet: a
+// replacement body under the writer's access state rather than the object's.
+func grantInheritedReader(t *testing.T, dir string) {
+	t.Helper()
+	if runtime.GOOS == "darwin" {
+		chmodACL(t, dir, "group:everyone allow read,file_inherit,directory_inherit")
+		return
+	}
+	requirePOSIXACL(t, dir, defaultACL, posixACL(
+		aclEntry{aclUserObj, 6, aclNoQual},
+		//nolint:gosec // G115: a uid this process does not have, which is all the entry needs.
+		aclEntry{aclUser, 4, uint32(os.Getuid() + 1)},
+		aclEntry{aclGroupObj, 4, aclNoQual},
+		aclEntry{aclMask, 6, aclNoQual},
+		aclEntry{aclOther, 4, aclNoQual},
+	))
+}
+
+// stagingBody returns the staging file a publication is filling, once it holds
+// something. A publication in flight is the only moment a staging inode's own
+// grants can be read off it: after the rename there is no staging file left.
+func stagingBody(t *testing.T, dir string) string {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var found string
+		for _, name := range stagingLeftovers(t, dir) {
+			//nolint:errcheck // a half-created enclosure is the case this polls through.
+			filepath.WalkDir(filepath.Join(dir, name), func(p string, d fs.DirEntry, err error) error {
+				if err != nil || d.IsDir() {
+					return nil //nolint:nilerr // an unreadable entry is not yet the one being filled.
+				}
+				if fi, statErr := d.Info(); statErr == nil && fi.Size() > 0 {
+					found = p
+				}
+				return nil
+			})
+		}
+		if found != "" {
+			return found
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("no staging file under %s took the body", dir)
+	return ""
+}
+
+// assertStagingIsPrivate checks every path component from the object's own
+// directory down to the staging file. A mode or an ACL on any of them is what
+// somebody else would traverse or read through, and the staging file is the
+// one inode in the tree whose access state belongs to nobody yet.
+func assertStagingIsPrivate(t *testing.T, dir, staged string) {
+	t.Helper()
+	for p := staged; p != dir; p = filepath.Dir(p) {
+		fi, err := os.Lstat(p)
+		if err != nil {
+			t.Fatalf("stat %s: %v", p, err)
+		}
+		if mode := fi.Mode().Perm(); mode&0o077 != 0 {
+			t.Errorf("staging path %s is at mode %04o, which grants somebody other than this server", p, mode)
+		}
+		if acl := objectACL(t, p); acl != "" {
+			t.Errorf("staging path %s carries an inherited ACL: %s", p, acl)
+		}
+	}
+}
+
+// The first of the two staging exposures: a directory granting read by
+// inheritance — a POSIX default ACL on Linux, a file_inherit ACE on macOS —
+// gives the staging file that grant at creation, and Fchmod does not take an
+// ACE away. So the replacement body is written under a grant the object being
+// replaced never gave, and a reader holding it sees an artifact mid-refill.
+//
+// The source is a FIFO because the window is the write. PutFile blocks on it,
+// so the staging file exists and holds a body for as long as the test wants to
+// look at it.
+func TestLocalPublishHidesTheStagingBodyFromAnInheritedGrant(t *testing.T) {
+	root := t.TempDir()
+	const key = "packages/npm/inherited.tgz"
+	l := NewLocal(root)
+	if err := l.Put(t.Context(), key, []byte("first")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	p := filepath.Join(root, filepath.FromSlash(key))
+	dir := filepath.Dir(p)
+	grantInheritedReader(t, dir)
+
+	fifo := filepath.Join(t.TempDir(), "source")
+	if err := unix.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("mkfifo %s: %v", fifo, err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- l.PutFile(context.Background(), fifo, key) }()
+
+	// Opening the write end releases PutFile's own open of the source, so the
+	// publication is under way from here; it blocks again on the next read.
+	w, err := os.OpenFile(fifo, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open the write end of %s: %v", fifo, err)
+	}
+	if _, err := w.Write([]byte("a replacement body being written")); err != nil {
+		w.Close()
+		t.Fatalf("write to %s: %v", fifo, err)
+	}
+
+	assertStagingIsPrivate(t, dir, stagingBody(t, dir))
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("close the write end: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("PutFile: %v", err)
+	}
+	if body, err := os.ReadFile(p); err != nil || string(body) != "a replacement body being written" {
+		t.Errorf("published object = %q (%v), want the replacement", body, err)
+	}
+}
+
+// requireRootWithOtherIdentity skips unless this host will both hand a file to
+// another account and read it back as that account. Only root can create the
+// fixture: an object owned by somebody else, at a mode that denies its own
+// owner, is what makes the ownership window visible at all.
+func requireRootWithOtherIdentity(t *testing.T) {
+	t.Helper()
+	requireOtherIdentity(t)
+	if os.Getuid() != 0 {
+		t.Skip("only root can give an object to another account, which is what opens the window under test")
+	}
+}
+
+// The second staging exposure, at the other end of the write. applyTo hands
+// the staging file to the object's owner before it restores the object's mode,
+// so between the two syscalls a populated replacement sits at the writer's
+// 0600 under an owner the object's own mode may deny outright. Mode 0000 is
+// the clearest case of that and a real one: an operator who takes an artifact
+// away from everybody still owns it.
+//
+// The window is a syscall wide, so the test wraps the syscall. /proc/self/fd
+// is how the staging path is recovered from the descriptor, which is all the
+// seam is handed.
+func TestLocalPublishHidesTheStagingFileAcrossTheOwnershipChange(t *testing.T) {
+	requireRootWithOtherIdentity(t)
+	for _, w := range localWriters() {
+		t.Run(w.name, func(t *testing.T) {
+			root := t.TempDir()
+			traversable(t, root)
+			const key = "packages/npm/handed-over.tgz"
+			w.mustWrite(t, NewLocal(root), key, []byte("first"))
+			p := filepath.Join(root, filepath.FromSlash(key))
+			if err := os.Chown(p, int(identityID(t, "-u")), int(identityID(t, "-g"))); err != nil {
+				t.Fatalf("chown %s: %v", p, err)
+			}
+			if err := os.Chmod(p, 0); err != nil {
+				t.Fatalf("chmod: %v", err)
+			}
+
+			var disclosed []string
+			restore := fchown
+			fchown = func(fd, uid, gid int) error {
+				err := restore(fd, uid, gid)
+				staged, linkErr := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
+				if linkErr != nil {
+					t.Errorf("resolve the staging path from fd %d: %v", fd, linkErr)
+					return err
+				}
+				if reachable(t, staged) {
+					disclosed = append(disclosed, staged)
+				}
+				return err
+			}
+			t.Cleanup(func() { fchown = restore })
+
+			w.mustWrite(t, NewLocal(root), key, []byte("a replacement the object's own owner may not read"))
+
+			if len(disclosed) != 0 {
+				t.Errorf("%s read the staging file between the ownership change and the mode that denies it: %v", otherIdentity, disclosed)
+			}
+			if mode := publishedMode(t, root, key); mode != 0 {
+				t.Errorf("published mode = %04o, want the previous 0000", mode)
+			}
+			if reachable(t, p) {
+				t.Errorf("%s reads the published object, which is at mode %04o", otherIdentity, publishedMode(t, root, key))
+			}
+			if left := stagingLeftovers(t, filepath.Dir(p)); len(left) != 0 {
+				t.Errorf("staging entries left behind: %v", left)
+			}
+		})
+	}
+}
+
+// A staging enclosure is readable by the writer alone, so every other account
+// walking the same root is refused entry to it. A listing that descended would
+// turn one process's in-flight publication into another process's error, and
+// the enclosure holds nothing a listing would have returned anyway.
+//
+// Mode 0000 is what that refusal looks like from inside the test, without a
+// second identity to run the walk as.
+func TestLocalListSkipsAStagingEnclosureItCannotEnter(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root traverses a directory at mode 0000, so the refusal under test cannot be staged")
+	}
+	root := t.TempDir()
+	l := NewLocal(root)
+	const key = "packages/npm/real.tgz"
+	if err := l.Put(t.Context(), key, []byte("an object a listing must still return")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	enclosure := filepath.Join(root, "packages", "npm", tmpPrefix+"ENCLOSURE")
+	if err := os.Mkdir(enclosure, 0o700); err != nil {
+		t.Fatalf("mkdir %s: %v", enclosure, err)
+	}
+	if err := os.WriteFile(filepath.Join(enclosure, tmpPrefix+"staged"), []byte("a body mid-write"), 0o600); err != nil {
+		t.Fatalf("write the staging file: %v", err)
+	}
+	if err := os.Chmod(enclosure, 0); err != nil {
+		t.Fatalf("close %s to entry: %v", enclosure, err)
+	}
+	// t.TempDir's own cleanup cannot remove a directory it may not enter.
+	t.Cleanup(func() { _ = os.Chmod(enclosure, 0o700) })
+
+	keys, err := l.List(t.Context(), "packages/")
+	if err != nil {
+		t.Fatalf("List while a publication holds an enclosure: %v", err)
+	}
+	if len(keys) != 1 || keys[0] != key {
+		t.Errorf("List = %v, want exactly [%s]", keys, key)
 	}
 }
