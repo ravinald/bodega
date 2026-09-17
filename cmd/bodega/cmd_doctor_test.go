@@ -681,3 +681,81 @@ func pepperTree(t *testing.T, configMode, pepperMode os.FileMode) string {
 	}
 	return resolved
 }
+
+// The run the service unit prescribes: a root-owned config and an operator who
+// did not type sudo. Before this, the three posture rows read N/A beside the
+// checks that had genuinely passed, and the summary counted an unrelated snapd
+// FAIL, so nothing in the output or the exit code said the posture was never
+// measured.
+func TestDoctorPostureIsSkippedWhenTheConfigWillNotOpen(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a 0000 file, so the unprivileged case cannot be staged here")
+	}
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"audit_db":"/var/lib/bodega/audit.db"}`), 0o000); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("BODEGA_CONFIG_FILE", cfgPath)
+
+	findings := append(serverPostureFindings(context.Background(), &globalFlags{}), retiredConfigKeys(&globalFlags{}))
+	for _, f := range findings {
+		if f.Status != host.StatusSkip {
+			t.Errorf("%s reported %s on a config it could not read, want SKIPPED: %s", f.Check, f.Status, f.Detail)
+		}
+		if f.IsFinding() {
+			t.Errorf("%s counts as a finding; a check that never ran has no verdict to report", f.Check)
+		}
+		if !strings.Contains(f.Remediation, "sudo bodega doctor") {
+			t.Errorf("%s remediation %q does not name the privilege the check needs", f.Check, f.Remediation)
+		}
+	}
+}
+
+// N/A stays a measurement. A client host with no install has no posture, and
+// telling its operator to re-run as root would send them after a file that
+// does not exist.
+func TestDoctorPostureStaysNAWithNoInstall(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	body := `{"audit_db":` + strconv.Quote(filepath.Join(dir, "audit.db")) + `}`
+	if err := os.WriteFile(cfgPath, []byte(body), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("BODEGA_CONFIG_FILE", cfgPath)
+
+	for _, f := range serverPostureFindings(context.Background(), &globalFlags{}) {
+		if f.Status != host.StatusNA {
+			t.Errorf("%s on a host with no install reported %s, want N/A", f.Check, f.Status)
+		}
+	}
+}
+
+// The summary is what a reader takes away, and a count of findings beside
+// three checks that never ran is a count of the wrong thing.
+func TestDoctorSummaryCountsWhatWasNotMeasured(t *testing.T) {
+	cases := []struct {
+		name                string
+		actionable, skipped int
+		wantCode            int
+		wantContains        []string
+	}{
+		{"clean", 0, 0, 0, []string{"OK: host configuration aligns"}},
+		{"findings only", 3, 0, 2, []string{"3 finding(s)"}},
+		{"skips only", 0, 3, 3, []string{"3 check(s) that could not run", "No finding on what was measured"}},
+		{"both", 1, 3, 3, []string{"1 finding(s)", "3 check(s) that could not run"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var out strings.Builder
+			code := doctorSummary(&out, tc.actionable, tc.skipped)
+			if code != tc.wantCode {
+				t.Errorf("exit code %d, want %d for %d finding(s) and %d skipped", code, tc.wantCode, tc.actionable, tc.skipped)
+			}
+			for _, want := range tc.wantContains {
+				if !strings.Contains(out.String(), want) {
+					t.Errorf("summary %q does not say %q", out.String(), want)
+				}
+			}
+		})
+	}
+}

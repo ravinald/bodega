@@ -25,6 +25,13 @@ const (
 	StatusWarn Status = "WARN" // Configuration detected; operator should review.
 	StatusFail Status = "FAIL" // Configuration definitively bypasses bodega controls.
 	StatusNA   Status = "N/A"  // Check is not applicable on this platform.
+
+	// StatusSkip is a check that never ran: a file it reads would not open, a
+	// store it queries would not answer. Distinct from N/A, which is a
+	// measurement: the subject is absent, so there is nothing to find. A
+	// skipped check measured nothing, so its subject may be in any state at
+	// all, and printing it beside OK is how a gap gets read as a clean row.
+	StatusSkip Status = "SKIPPED"
 )
 
 // Finding is the result of a single host inspection.
@@ -44,9 +51,15 @@ type Finding struct {
 }
 
 // IsFinding reports whether the status counts as something the operator
-// should act on. Both Warn and Fail count; OK and NA do not.
+// should act on. Both Warn and Fail count; OK, NA and Skip do not. A skipped
+// check has no verdict to report, which is its own problem and not this one.
 func (f Finding) IsFinding() bool {
 	return f.Status == StatusWarn || f.Status == StatusFail
+}
+
+// IsSkipped reports whether the check could not run.
+func (f Finding) IsSkipped() bool {
+	return f.Status == StatusSkip
 }
 
 // CheckFunc is the contract every per-format check implements.

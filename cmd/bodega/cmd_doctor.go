@@ -29,9 +29,11 @@ import (
 // nothing it inspects and never creates the audit database it reports on.
 // What a doctor run can leave behind is not a check's doing — main() writes a
 // default config file, and the log directory it names, before any command runs.
-// Exit code is 0 when all checks are clean (OK or N/A) and 2 when at least
-// one check produced a finding (WARN or FAIL); this matches the convention
-// used by other CI-gating linters.
+// Exit code is 0 when all checks are clean (OK or N/A), 2 when at least one
+// check produced a finding (WARN or FAIL), and 3 when at least one check could
+// not run (SKIPPED), whether or not it also found something. 3 outranks 2
+// because the two answer different questions: 2 is a measured host with gaps,
+// and 3 is a host doctor did not finish measuring.
 //
 // The threat model and rationale for each check is documented in
 // docs/THREAT_MODEL.md.
@@ -54,7 +56,9 @@ Where this machine holds a bodega install, doctor also reports the server's
 own posture: an install with no allow-list rule and no publish-age or OSV
 gate admits every upstream fetch, and one whose gates are all set to ignore
 is configured but enforcing nothing. Those checks read the audit database
-and report N/A on a client host that has none.
+and report N/A on a client host that has none, and SKIPPED where this account
+cannot read the config or the store: an unprivileged run against the root-owned
+paths the service unit prescribes measures no posture at all, and says so.
 
 Reports only: the posture checks open the audit database read-only, so a
 doctor run neither creates one nor migrates the one it finds. One caveat for
@@ -63,9 +67,11 @@ doctor included, so a host with neither /etc/bodega/config.json nor
 ~/.config/bodega/config.json gains the second one (the first, as root), and
 the log directory that config names, before the checks execute.
 
-Exit code is 0 when clean and 2 when one or more findings are present, so
-this command can gate CI pipelines for build hosts that are supposed to
-route everything through bodega.
+Exit code is 0 when clean, 2 when one or more findings are present, and 3
+when one or more checks could not run, so this command can gate CI pipelines
+for build hosts that are supposed to route everything through bodega. A gate
+written as "non-zero fails" needs no change; one that reads 2 specifically
+now separates a host with gaps from a report with holes in it.
 
 --write-credentials is the one thing doctor does that is not a report. It
 takes a token and writes it into the file each of the eight clients reads
@@ -123,31 +129,27 @@ See docs/THREAT_MODEL.md for the rationale behind each check.`,
 
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 			fmt.Fprintln(w, "CHECK\tSTATUS\tDETAIL")
-			actionable := 0
+			actionable, skipped := 0, 0
 			for _, f := range findings {
 				fmt.Fprintf(w, "%s\t%s\t%s\n", f.Check, f.Status, f.Detail)
-				if f.IsFinding() {
+				switch {
+				case f.IsFinding():
 					actionable++
+				case f.IsSkipped():
+					skipped++
 				}
 			}
 			_ = w.Flush()
 
 			if actionable > 0 {
-				fmt.Println()
-				fmt.Println("Remediation:")
-				for _, f := range findings {
-					if !f.IsFinding() || f.Remediation == "" {
-						continue
-					}
-					fmt.Printf("  [%s] %s\n", f.Check, f.Remediation)
-				}
-				fmt.Printf("\n%d finding(s) — host is not fully aligned with bodega's threat model.\n", actionable)
-				fmt.Println("See docs/THREAT_MODEL.md for context.")
-				os.Exit(2) //nolint:revive // CI-gating exit code distinct from cobra's 1
+				printRemediation("Remediation:", findings, host.Finding.IsFinding)
 			}
-
-			fmt.Println()
-			fmt.Println("OK: host configuration aligns with bodega's threat model.")
+			if skipped > 0 {
+				printRemediation("Could not run:", findings, host.Finding.IsSkipped)
+			}
+			if code := doctorSummary(os.Stdout, actionable, skipped); code != 0 {
+				os.Exit(code) //nolint:revive // CI-gating exit codes distinct from cobra's 1
+			}
 			return nil
 		},
 	}
@@ -162,6 +164,66 @@ See docs/THREAT_MODEL.md for the rationale behind each check.`,
 	c.Flags().BoolVar(&allowPlaintext, "allow-plaintext", false,
 		"Permit --url over http; refused by default because a bearer token would travel in the clear")
 	return c
+}
+
+// printRemediation prints one block of next steps, one line per row the
+// predicate keeps. Findings and skipped checks get separate blocks because
+// they ask for different things: a finding is a host to change, a skipped
+// check is a run to repeat with what it needed.
+func printRemediation(heading string, findings []host.Finding, keep func(host.Finding) bool) {
+	// Grouped by the step rather than by the check: the posture rows share one
+	// reason and one remedy, so a line each would repeat "re-run as root" four
+	// times and bury the row that is genuinely its own.
+	var order []string
+	checks := map[string][]string{}
+	for _, f := range findings {
+		if !keep(f) || f.Remediation == "" {
+			continue
+		}
+		if _, seen := checks[f.Remediation]; !seen {
+			order = append(order, f.Remediation)
+		}
+		checks[f.Remediation] = append(checks[f.Remediation], f.Check)
+	}
+	if len(order) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Println(heading)
+	for _, remedy := range order {
+		fmt.Printf("  [%s] %s\n", strings.Join(checks[remedy], ", "), remedy)
+	}
+}
+
+// doctorSummary writes the closing lines and returns the exit code.
+//
+// A skipped check outranks a finding, and gets a code of its own. Exit 2 is
+// what a CI gate reads as "doctor measured this host and it has gaps", and a
+// run that could not read the config measured nothing: answering with 2 would
+// make "fix these three and we are clean" a false statement, because the
+// checks that never ran can hold any number of gaps. 3 is additive for a gate
+// written as "non-zero fails", and separable for one that distinguishes.
+func doctorSummary(w io.Writer, actionable, skipped int) int {
+	fmt.Fprintln(w)
+	switch {
+	case skipped > 0 && actionable > 0:
+		fmt.Fprintf(w, "%d finding(s) on what was measured, and %d check(s) that could not run and measured nothing.\n", actionable, skipped)
+	case skipped > 0:
+		fmt.Fprintf(w, "No finding on what was measured, and %d check(s) that could not run and measured nothing.\n", skipped)
+	case actionable > 0:
+		fmt.Fprintf(w, "%d finding(s) — host is not fully aligned with bodega's threat model.\n", actionable)
+	default:
+		fmt.Fprintln(w, "OK: host configuration aligns with bodega's threat model.")
+		return 0
+	}
+	if skipped > 0 {
+		fmt.Fprintln(w, "The host cannot be called aligned with bodega's threat model on a partial read.")
+	}
+	fmt.Fprintln(w, "See docs/THREAT_MODEL.md for context.")
+	if skipped > 0 {
+		return 3
+	}
+	return 2
 }
 
 // writeClientCredentials lands one token in every file the eight clients read
@@ -390,8 +452,9 @@ func retiredConfigKeys(gf *globalFlags) host.Finding {
 
 	cfg, err := loadConfig(gf)
 	if err != nil {
-		f.Status = host.StatusNA
+		f.Status = host.StatusSkip
 		f.Detail = "could not read the config file: " + err.Error()
+		f.Remediation = skipRemedy(config.ConfigPath(), err)
 		return f
 	}
 
@@ -508,7 +571,7 @@ type postureStore interface {
 func serverPostureFindings(ctx context.Context, gf *globalFlags) []host.Finding {
 	cfg, err := loadConfig(gf)
 	if err != nil {
-		return postureUnavailable("config unreadable: " + err.Error())
+		return postureSkipped("config unreadable: "+err.Error(), skipRemedy(config.ConfigPath(), err))
 	}
 	path := auditDBPath(cfg)
 	if path == "" {
@@ -517,6 +580,13 @@ func serverPostureFindings(ctx context.Context, gf *globalFlags) []host.Finding 
 	// Stat before open: opening creates the file and seeds a fresh install's
 	// default policy, and a report is not an installation.
 	if _, err := os.Stat(path); err != nil {
+		// Absent is a measurement: this is a client host and there is no
+		// posture to read. Anything else is a path this process could not
+		// resolve, and "no bodega install" would be a claim about a server
+		// nobody looked at.
+		if !errors.Is(err, fs.ErrNotExist) {
+			return postureSkipped("could not stat the audit store at "+path+": "+err.Error(), skipRemedy(path, err))
+		}
 		return postureUnavailable("no bodega install on this host (" + path + " does not exist)")
 	}
 	// Read-only for the same reason. The read-write opener migrates whatever
@@ -525,18 +595,42 @@ func serverPostureFindings(ctx context.Context, gf *globalFlags) []host.Finding 
 	// posture was.
 	db, err := audit.OpenReadOnly(path)
 	if err != nil {
-		return postureUnavailable("could not read audit store at " + path + ": " + err.Error())
+		return postureSkipped("could not read audit store at "+path+": "+err.Error(), skipRemedy(path, err))
 	}
 	defer db.Close()
 	return serverPosture(ctx, db)
 }
 
+// postureUnavailable marks the posture rows N/A: this host holds nothing to
+// measure, which is the answer rather than the absence of one.
 func postureUnavailable(detail string) []host.Finding {
+	return postureRows(host.StatusNA, detail, "")
+}
+
+// postureSkipped marks the posture rows as never run. The remediation travels
+// with them because the reader's next step is a privilege, not a policy.
+func postureSkipped(detail, remediation string) []host.Finding {
+	return postureRows(host.StatusSkip, detail, remediation)
+}
+
+func postureRows(status host.Status, detail, remediation string) []host.Finding {
 	out := make([]host.Finding, 0, len(postureChecks))
 	for _, name := range postureChecks {
-		out = append(out, host.Finding{Check: name, Status: host.StatusNA, Detail: detail})
+		out = append(out, host.Finding{Check: name, Status: status, Detail: detail, Remediation: remediation})
 	}
 	return out
+}
+
+// skipRemedy names what a check needs before it can run again. doctor reads
+// and changes nothing, so a path it cannot open is answered by the privilege
+// that opens it: /etc/bodega/config.json and /var/lib/bodega are root-owned on
+// the host the service unit prescribes, and the unprivileged run that meets
+// them has no host defect to fix.
+func skipRemedy(path string, err error) string {
+	if errors.Is(err, fs.ErrPermission) {
+		return "re-run as root (`sudo bodega doctor`); " + path + " is readable only by the account that owns it"
+	}
+	return "make " + path + " readable by this account, then re-run `bodega doctor`"
 }
 
 // serverPosture reports what this install actually enforces. The three checks
@@ -546,15 +640,15 @@ func postureUnavailable(detail string) []host.Finding {
 func serverPosture(ctx context.Context, store postureStore) []host.Finding {
 	rules, err := store.ListPolicies(ctx)
 	if err != nil {
-		return postureUnavailable("read allow-list: " + err.Error())
+		return postureSkipped("read allow-list: "+err.Error(), "repair the audit store, then re-run `bodega doctor`")
 	}
 	ages, err := store.ListAgePolicies(ctx)
 	if err != nil {
-		return postureUnavailable("read age policy: " + err.Error())
+		return postureSkipped("read age policy: "+err.Error(), "repair the audit store, then re-run `bodega doctor`")
 	}
 	osvs, err := store.ListOSVPolicies(ctx)
 	if err != nil {
-		return postureUnavailable("read osv policy: " + err.Error())
+		return postureSkipped("read osv policy: "+err.Error(), "repair the audit store, then re-run `bodega doctor`")
 	}
 	return []host.Finding{
 		policyCoverage(rules, ages, osvs),

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1030,5 +1031,41 @@ func TestDiscoveryReadsRefuseUnderAWriteOnlySink(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// An export of nothing is an empty collection, not null. `jq '.[]'` over null
+// is an error rather than an empty iteration, so a consumer written the
+// obvious way breaks on the empty table instead of doing nothing.
+func TestDiscoverExportEmptyTableIsACollection(t *testing.T) {
+	env := newDiscoverEnv(t)
+	env.seedDiscovery(t) // no rows: the store exists and the table is empty
+
+	var runErr error
+	out := captureStdout(t, func() {
+		_, runErr = runDiscover(t, "export", "json")
+	})
+	if runErr != nil {
+		t.Fatalf("discover export json: %v", runErr)
+	}
+	if got := strings.TrimSpace(out); got != "[]" {
+		t.Errorf("empty export emitted %q, want []", got)
+	}
+	var rows []audit.DiscoveryRow
+	if err := json.Unmarshal([]byte(out), &rows); err != nil {
+		t.Fatalf("export is not JSON: %v", err)
+	}
+	if rows == nil {
+		t.Error("empty export decodes to nil, so a consumer iterating it has nothing to iterate over")
+	}
+
+	csvOut := captureStdout(t, func() {
+		_, runErr = runDiscover(t, "export", "csv")
+	})
+	if runErr != nil {
+		t.Fatalf("discover export csv: %v", runErr)
+	}
+	if !strings.HasPrefix(csvOut, "registry_type,") {
+		t.Errorf("empty csv export starts %q, want the header row", csvOut)
 	}
 }

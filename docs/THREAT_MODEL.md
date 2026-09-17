@@ -276,8 +276,12 @@ instance, the recommended posture is:
 - **Set `GOPROXY` to `http://<bodega>/gomod,off`** — never `,direct`. The
   `,off` form makes cache misses fail loudly; `,direct` silently falls
   through to public VCS, defeating the chokepoint.
-- **Run `bodega doctor` in CI** as a gate step. Exit 2 is a finding; exit 0
-  is clean. The output is tab-aligned and tabwriter-stable, so a pipeline
+- **Run `bodega doctor` in CI** as a gate step. Exit 0 is clean, exit 2 is a
+  finding, and exit 3 is a run that could not finish: a check whose config or
+  audit store would not open reports `SKIPPED` and measured nothing, so
+  answering 2 would let "fix these three and we are clean" stand on a posture
+  nobody read. 3 outranks 2 when a run produces both. The output is
+  tab-aligned and tabwriter-stable, so a pipeline
   can both gate on the exit code and surface the per-check detail in the
   build log. The checks themselves write nothing, but every bodega command
   bootstraps a config file on first run, so a runner holding neither
@@ -287,7 +291,10 @@ instance, the recommended posture is:
   checks open the audit database read-only, so a run against an install one
   release behind neither brings a database into existence nor migrates the
   one it finds: an upgrade is something you schedule, not something a report
-  does to you. A host with no install reads `N/A` rather than gaining one.
+  does to you. A host with no install reads `N/A` rather than gaining one, and
+  an account that cannot read `/etc/bodega/config.json` or `/var/lib/bodega`
+  reads `SKIPPED` with the privilege it needs, rather than `N/A` beside the
+  checks that genuinely passed.
 - **Harden the seeded cooldown and add an allow-list.** `bodega policy age
   set npm 7d block` turns the shipped `warn` into a refusal once you have
   watched it for a release cycle; `bodega policy add <type> <pattern>`
@@ -297,7 +304,7 @@ instance, the recommended posture is:
 
 On the bodega host itself, `doctor` adds three checks that read the audit
 database rather than the machine. They report `N/A` on a client host with no
-install:
+install, and `SKIPPED` where this account cannot read what they read:
 
 - `policy-coverage`: no allow-list rule and no publish-age or OSV gate, so
   every upstream fetch is admitted. It counts both gates because

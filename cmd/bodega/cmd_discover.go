@@ -360,6 +360,13 @@ func newDiscoverExportCmd(gf *globalFlags) *cobra.Command {
 			}
 
 			if format == "json" {
+				// A nil slice marshals to null, and an export of nothing is
+				// an empty collection: `jq '.[]'` over null is an error, so a
+				// consumer written the obvious way breaks on the empty table
+				// instead of iterating nothing.
+				if rows == nil {
+					rows = []audit.DiscoveryRow{}
+				}
 				enc := json.NewEncoder(os.Stdout)
 				enc.SetIndent("", "  ")
 				return enc.Encode(rows)

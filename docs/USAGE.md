@@ -1445,6 +1445,8 @@ Filtered codenames appear in the startup banner and in `GET /api/v1/status` unde
 
 Without flags, `doctor` reports and changes nothing. It has two writes, and they run one at a time.
 
+It exits 0 when every check is clean, 2 when one or more produced a finding, and 3 when one or more could not run at all. A check reports `SKIPPED` rather than `N/A` when the file or store it reads would not open, and the `Could not run:` block names what it needed: an unprivileged run against the root-owned `/etc/bodega/config.json` the service unit prescribes measures no policy posture, and three `N/A` rows beside the checks that passed said nothing about that. `N/A` keeps its meaning, which is a measurement: the subject is absent on this host.
+
 `--write-apt-sources` asks the server which apt suite this host should read and installs the keyring and the stanza; see [apt under a profile](#apt-under-a-profile).
 
 With `--write-credentials` it writes one token into the file each of the eight clients reads its credential from, because a feature that costs eight hand edits does not get adopted:
@@ -2033,7 +2035,7 @@ Deletes discovery rows for one type, or all of them when the type is omitted.
 
 #### `bodega discover export <json|csv> [type]`
 
-Dumps the raw rows to stdout for offline analysis.
+Dumps the raw rows to stdout for offline analysis. `json` emits an array whether or not the table holds rows, so `jq '.[]'` over an export of nothing iterates nothing rather than erroring on `null`; `csv` emits its header row on the same empty table.
 
 ### `bodega --break-glass-update-md5 <type|all>`
 
