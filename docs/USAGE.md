@@ -2217,7 +2217,7 @@ Each names the path and the config file the path came from, so the next move is 
 bodega supports two storage backends:
 
 - **`local`** (default): Stores artifacts on the local filesystem. Set `storage_path` to change the root directory (default: `/var/lib/bodega`). No initialization needed, and no bucket: every command that touches storage runs without one.
-  A write lands in a `.bodega-tmp-*` file beside the destination and is renamed into place, so a key holds either its previous object or its new one and never a half-written body, and a reader already on the object keeps the one it opened even while a replacement publishes. Listings skip those staging names. A crash mid-write leaves one behind: it is safe to delete, and nothing reads it. A new object lands at the mode the server's umask allows. Refilling an existing one restates everything the object carried that decides who can reach it: its mode, its owner and group, its access ACL and its extended attributes, all applied to the staging file before the mode that makes it readable. So a `chmod`, a `chgrp` or a `setfacl` you applied to a single artifact survives the next fetch, and a reader the artifact denied stays denied. Where the server cannot restate one of them, the refill fails, says which one, and leaves the previous object exactly as it was: handing an artifact to a group it was kept from is not a thing a cache fill gets to decide. Giving an artifact a group the server does not belong to is the case that reaches this, and it needs `CAP_CHOWN` or a server running as a member of that group.
+  It is the only backend that carries per-object access state, and the only one on which a `chmod`, a `chgrp` or a `setfacl` you applied to a single artifact survives the next refill. See [Publication and access](#publication-and-access).
 - **`s3`**: Stores artifacts in an S3 bucket. Set `bucket` and `region`, then run `bodega init` to create the bucket with encryption and versioning.
 
 Manifests follow the backend. On `s3` they live under the `manifests/` prefix in the bucket; on `local` they live in `manifest_dir` on disk, which is also what `--local-config` selects against any backend.
@@ -2228,6 +2228,30 @@ A backend that fails to construct is not fatal for `bodega serve`. The server st
 ERROR storage backend unavailable — package routes will answer 503; the API and /healthz still serve
   backend=local config=/etc/bodega/config.json error=create storage root /dev/null/nope: mkdir /dev/null: not a directory
 ```
+
+### Publication and access
+
+Every backend publishes rather than overwrites. A key names the object it named before a write or the object the write stores, never something in between, whichever backend placement sent it to:
+
+- **A refill is all or nothing.** No client is served a half-written body, a truncated one or an empty one.
+- **A download in flight finishes on the object it started.** A replacement landing mid-transfer does not reach a client already reading, and the next request gets the new object.
+- **An interrupted write publishes nothing.** The key keeps what it held.
+
+What differs per backend is access, and it differs in the direction that matters:
+
+| | `local` | `s3` |
+| --- | --- | --- |
+| Refill preserves mode, owner, group, ACL, xattrs | yes | nothing to preserve |
+| A restriction survives the next refill | yes | no |
+| Bytes on disk when the write returns | not guaranteed | the service's guarantee |
+
+**On `local`, a restriction is a decision and a refill is not.** Refilling an object restates everything it carried that decides who can reach it: its mode, its owner and group, its access ACL and its extended attributes, applied to the staging file before the mode that makes it readable. So a reader the artifact denied stays denied. Where the server cannot restate one of them, the refill fails, names which one, and leaves the previous object exactly as it was: handing an artifact to a group it was kept from is not something a cache fill gets to decide. Giving an artifact a group the server does not belong to is the case that reaches this, and it needs `CAP_CHOWN` or a server running as a member of that group. A new object has nothing to carry and lands at the mode the server's umask allows.
+
+**On `s3`, it is not.** The backend reads and writes no per-object mode, owner or ACL, so there is nothing a refill can widen and equally nothing it preserves. An object ACL or a bucket policy applied outside bodega is not carried across a refill: the next write is a plain `PUT`. An artifact whose restriction has to survive refills belongs on a `local` backend, which per-package placement can arrange.
+
+**Durability.** On `local`, a write returns after the rename with no `fsync`, so a host that loses power moments later can come up holding either object. The guarantees above survive that; the bytes may not. Every artifact the store holds is refetchable from an upstream or rebuildable from source, and the alternative is an `fsync` on every proxy cache fill. Mount the storage tree with your filesystem's own barrier settings if you need the other trade.
+
+**Staging entries.** A `local` write fills a `.bodega-tmp-*` entry and renames it into place. A replacement gets a `.bodega-tmp-*` _directory_ of its own, holding one staging file, because for the length of the write that file holds a whole artifact under the server's access state rather than the object's, and a directory nothing else may enter is what keeps it unreadable until the rename. A fresh object is a `.bodega-tmp-*` file beside its destination. Listings skip both. A crash mid-write leaves one behind: it is safe to delete, and nothing reads it.
 
 ### Named backends and per-type placement
 
@@ -3522,7 +3546,7 @@ One row per request on both serving outcomes, so counting `cache_miss` over a wi
 
 A recorded origin belongs to the bytes, not to the key they sit under. A fetch reads its cached object back before recording anything and records nothing unless those bytes hash to what it fetched, so an upload that landed at the key while the fetch was in flight takes the row with it rather than inheriting it. A hit then compares what the backend reports — the object's location, its length, and its entity tag or its timestamp — against the handle it is about to serve from, not against an earlier lookup. So an artifact replaced under a key it already occupied is not credited to the archive that supplied the previous tenant, whether it was replaced by `bodega pkg upload`, by a delete and a refill, or by a move to another bucket, and whether the replacement is the same length as what it displaced or not.
 
-A response already in flight is unaffected by the replacement: it serves the object it opened, under that object's origin, and the next request serves the new one. That holds because the backends publish rather than overwrite (see [Storage backends](#storage-backends)), and it is what lets the row be written from the same open that supplies the body.
+A response already in flight is unaffected by the replacement: it serves the object it opened, under that object's origin, and the next request serves the new one. That holds because every backend publishes rather than overwrites (see [Publication and access](#publication-and-access)), and it is what lets the row be written from the same open that supplies the body.
 
 Provenance a fetch is still in the middle of publishing is answered from that fetch. Bytes become readable partway through the write to storage and the origin lands after it, and a client arriving in between gets the upstream of the fill it is reading rather than a blank — once the object it is serving is confirmed to be the one that fill fetched, which costs a read of it and happens only inside that window.
 

@@ -107,3 +107,8 @@ func attrlist(trap uintptr, fd int, buf []byte) error {
 	}
 	return nil
 }
+
+// clearACL takes away an ACL an inode inherited from the directory it was
+// created in. applyACL already writes the "no ACL" filesec for a nil, and
+// reads first, so an inode that inherited nothing costs one syscall.
+func clearACL(fd int) error { return applyACL(fd, nil) }

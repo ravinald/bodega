@@ -38,6 +38,26 @@ func newLocalFromSpec(_ context.Context, spec Spec) (ObjectStore, error) {
 
 // Local is a filesystem-backed ObjectStore. Objects are stored as files at
 // <root>/<key>, with directories created as needed.
+//
+// Write contract (ObjectStore.Put). Local keeps all four. A write fills a
+// staging file and renames it over the key, so replacement is atomic and a
+// reader holding an open handle keeps the inode it opened for as long as it
+// holds it; an interrupted write leaves a .bodega-tmp-* entry that List skips
+// and nothing reads. It is the only backend that carries access state, so the
+// fourth promise is mostly about this one: a replacement restates the object's
+// mode, owner, group, ACL and extended attributes, and fails with the previous
+// object untouched where it cannot. See publish.
+//
+// Durability is not promised, and this is the one clause Local declines.
+// publish closes the staging file and renames it with no fsync of either the
+// file or the directory, so a host that loses power moments after Put returns
+// can come up holding the previous object, the new one, or a key whose rename
+// the journal never recorded. The ordering promises above survive that — the
+// rename is atomic whether or not it landed — and the bytes may not. Every
+// artifact this store holds is refetchable from an upstream or rebuildable
+// from source, and an fsync per object is paid on every proxy cache fill,
+// which is the trade taken. An operator who needs the other one mounts the
+// storage tree with the filesystem's own barrier settings.
 type Local struct {
 	root string
 }
@@ -226,6 +246,113 @@ func createStaged(dir string, perm os.FileMode) (*os.File, error) {
 	return nil, fmt.Errorf("create staging file in %s: no unused name", dir)
 }
 
+// staging is the file a publication fills, together with the directory it was
+// given to itself when it was given one.
+type staging struct {
+	file *os.File
+	// enclosure is a directory holding nothing but the staging file, empty for
+	// a staging file that is a sibling of its destination.
+	enclosure string
+}
+
+// enclose stages a replacement inside a directory nothing but this server may
+// enter, and gives the staging file inside it no grant of its own.
+//
+// Confidentiality is a rule the staging file needs separately from the object,
+// because for the length of the write the two are not the same thing. The
+// staging file holds the whole replacement body before it holds any of the
+// access state of the object it replaces, so it is an artifact under the
+// writer's mode and the writer's ownership rather than the object's, and every
+// ordering of the syscalls that fix that discloses it to somebody. Restate the
+// object's mode first and the staging file is readable at that mode while it
+// is still owned by the server, so the server's group gets it. Hand it to the
+// object's owner first and it is readable at the staging mode by an owner the
+// object's own mode may deny. Fixing both at once is not something the two
+// kernels offer, and an extended-attribute call against a file at 0000 is
+// refused, so there is no mode that is safe throughout either.
+//
+// A directory the server has to itself removes the question rather than
+// answering it: a path nothing else may traverse cannot be opened, whatever
+// the inode at the end of it says at any instant. The rename out of it is the
+// first moment the bytes are addressable, and by then they carry the object's
+// access state.
+//
+// A fresh object gets none of this and must not: it is the staging file, so it
+// takes the directory's inheritance and the umask exactly as a direct create
+// would, and it discloses nothing before the rename that it will not disclose
+// after.
+func enclose(dir string) (staging, error) {
+	for range 100 {
+		enclosure := filepath.Join(dir, tmpPrefix+rand.Text())
+		if err := os.Mkdir(enclosure, stagedDirPerm); err != nil {
+			if errors.Is(err, fs.ErrExist) {
+				continue
+			}
+			return staging{}, err
+		}
+		f, err := sealEnclosure(enclosure)
+		if err != nil {
+			os.RemoveAll(enclosure)
+			return staging{}, err
+		}
+		return staging{file: f, enclosure: enclosure}, nil
+	}
+	return staging{}, fmt.Errorf("create staging directory in %s: no unused name", dir)
+}
+
+// sealEnclosure strips the enclosure of whatever its parent's inheritance put
+// on it and then opens the staging file, which therefore inherits nothing.
+// Restricting the file too is not redundant: it makes the guarantee a property
+// of the inode rather than of an argument about the directory above it.
+func sealEnclosure(enclosure string) (*os.File, error) {
+	d, err := os.Open(enclosure)
+	if err != nil {
+		return nil, err
+	}
+	defer d.Close()
+	if err := restrictStaged(d, stagedDirPerm); err != nil {
+		return nil, fmt.Errorf("hold the staging directory %s to this server: %w", enclosure, err)
+	}
+	f, err := createStaged(enclosure, stagedPerm)
+	if err != nil {
+		return nil, err
+	}
+	if err := restrictStaged(f, stagedPerm); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+// discard removes a staging file that will not be published, and the enclosure
+// with it. A failed publication leaves the previous object and nothing else.
+func (s staging) discard() {
+	s.file.Close()
+	if s.enclosure != "" {
+		os.RemoveAll(s.enclosure)
+		return
+	}
+	os.Remove(s.file.Name())
+}
+
+// publishAs renames the staging file onto p, which is the instant the key
+// starts naming the new object.
+func (s staging) publishAs(p string) error {
+	if err := s.file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(s.file.Name(), p); err != nil {
+		return err
+	}
+	// The enclosure is empty now and the object is published either way, so a
+	// failure to remove it is not a failed write. What is left is a directory
+	// List already skips and nothing reads.
+	if s.enclosure != "" {
+		_ = os.Remove(s.enclosure)
+	}
+	return nil
+}
+
 // openPrior opens the object a publication is about to replace, or returns nil
 // when the key holds nothing yet.
 //
@@ -283,28 +410,25 @@ func (l *Local) publish(p string, freshPerm os.FileMode, write func(io.Writer) e
 	if err != nil {
 		return err
 	}
-	perm := freshPerm
-	if prior != nil {
-		defer prior.Close()
-		perm = stagedPerm
-	}
-	tmp, err := createStaged(dir, perm)
-	if err != nil {
-		return err
-	}
-	staged := tmp.Name()
-	defer func() {
-		if err != nil {
-			tmp.Close()
-			os.Remove(staged)
+	var tmp staging
+	if prior == nil {
+		f, createErr := createStaged(dir, freshPerm)
+		if createErr != nil {
+			return createErr
 		}
-	}()
-	if prior != nil {
-		if err = restrictStaged(tmp); err != nil {
+		tmp = staging{file: f}
+	} else {
+		defer prior.Close()
+		if tmp, err = enclose(dir); err != nil {
 			return err
 		}
 	}
-	if err = write(tmp); err != nil {
+	defer func() {
+		if err != nil {
+			tmp.discard()
+		}
+	}()
+	if err = write(tmp.file); err != nil {
 		return err
 	}
 	if prior != nil {
@@ -315,14 +439,11 @@ func (l *Local) publish(p string, freshPerm os.FileMode, write func(io.Writer) e
 		if want, err = readAccess(prior); err != nil {
 			return err
 		}
-		if err = want.applyTo(tmp, p); err != nil {
+		if err = want.applyTo(tmp.file, p); err != nil {
 			return err
 		}
 	}
-	if err = tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(staged, p)
+	return tmp.publishAs(p)
 }
 
 func (l *Local) Put(_ context.Context, key string, data []byte) error {

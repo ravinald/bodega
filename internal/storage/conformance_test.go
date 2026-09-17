@@ -16,10 +16,11 @@ import (
 // backends is the set every ObjectStore implementation is held to. A new
 // backend joins by adding one line here.
 //
-// S3 is absent because it needs a live bucket. It implements the same contract
-// — including the ValidateKey rule every case below pins — but nothing here
-// proves it, so a change to internal/storage/s3.go is held to this file by
-// reading rather than by running.
+// S3 is absent and stays absent: every case below writes and reads, so running
+// them means a live bucket, credentials and a region in the merge gate, and a
+// gate that needs an AWS account is a gate that stops blocking the day the
+// account is unavailable. So s3.go is held to the write contract by reading,
+// and heldByReading names what that costs.
 func conformanceBackends() map[string]func(t *testing.T) ObjectStore {
 	return map[string]func(t *testing.T) ObjectStore{
 		"local":  func(t *testing.T) ObjectStore { return NewLocal(rootWithDecoySibling(t)) },
@@ -49,6 +50,49 @@ func rootWithDecoySibling(t *testing.T) string {
 		t.Fatalf("mkdir root: %v", err)
 	}
 	return root
+}
+
+// heldByReading is the set of registered drivers no case in this file runs
+// against, each with the argument standing in for a run.
+//
+// Reading buys the ordering promises and not the access one. The S3 API
+// document says a PUT replaces an object atomically and that a GET in flight
+// keeps the version it opened, so the first three clauses of the write
+// contract are somebody else's tested behavior rather than an untested claim
+// of ours. The fourth is the one reading cannot cover, and the reason it does
+// not have to is that S3 carries no per-object access state for a replacement
+// to lose: there is no mode, owner or ACL on the path this backend writes. See
+// the contract block on the S3 type.
+//
+// What it costs is the wrapper. A Put that silently drops a key, a GetStream
+// that returns a closed body, a ValidateKey call left off a method: each is
+// caught by nothing until an operator with an s3 backend meets it.
+// Every case below pins behavior that lives in this package rather than in the
+// service, so that gap is this file's, not AWS's.
+var heldByReading = map[string]string{
+	"s3": "replacement atomicity and read-during-write are the service's, " +
+		"and there is no per-object access state for a replacement to restate",
+}
+
+// A backend satisfies ObjectStore as documented while keeping less than the
+// write contract says, and the only thing standing between that and a
+// deployment is a suite it has to remember to join. Remembering is what this
+// case replaces: a driver registered under a name config can select is either
+// run against the contract or carries a written argument for why it is not.
+func TestEveryRegisteredDriverIsHeldToTheContract(t *testing.T) {
+	run := conformanceBackends()
+	for _, driver := range Drivers() {
+		if _, ok := run[driver]; ok {
+			continue
+		}
+		if why, ok := heldByReading[driver]; ok {
+			t.Logf("%s is held by reading: %s", driver, why)
+			continue
+		}
+		t.Errorf("driver %q is registered, so an operator can place artifacts on it, "+
+			"and no case in this file runs against it. Add it to conformanceBackends, "+
+			"or add it to heldByReading with the argument that stands in for a run.", driver)
+	}
 }
 
 func TestObjectStoreConformance(t *testing.T) {

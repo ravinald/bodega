@@ -59,10 +59,53 @@ type ObjectStore interface {
 	// order would put that one refactor away.
 	List(ctx context.Context, prefix string) ([]string, error)
 
-	// Put stores data at key, overwriting any existing content.
+	// Put stores data at key.
+	//
+	// Put and PutFile publish rather than overwrite. A key names the object
+	// it named before the call or the object the call stores, never
+	// something in between, for every reader at every instant. Four promises
+	// follow, and a backend keeps each of them or says on its own type that
+	// it does not:
+	//
+	// Replacement is all or nothing. A key that held an object holds that
+	// object until the new one is complete and holds the new one afterwards.
+	// No reader sees a partial body, a truncated one or an empty one, and no
+	// reader has to take a lock to avoid it. The writer is routinely another
+	// process on the same store, so a lock could not be the answer anyway.
+	//
+	// An open handle is a snapshot. A reader that opened a key through
+	// GetStream reads the object it opened, to the end, however many
+	// replacements land underneath it, and the identity in StreamResult
+	// describes those bytes for the life of the handle. That is what lets a
+	// caller bind a record to the bytes it serves.
+	//
+	// An interrupted write publishes nothing. A crash mid-write leaves the
+	// key holding what it held; whatever debris the write left behind is not
+	// an object and never comes back from List. Durability is a separate
+	// question and this interface does not answer it: nothing here promises
+	// the new bytes have reached stable storage when Put returns. Each
+	// backend states what it does promise.
+	//
+	// Publication replaces bytes, never who may read them. Where a backend
+	// carries access state on an object — a mode, an owner, a group, an ACL
+	// — a replacement restates all of it, and where it cannot, the call fails
+	// and leaves the previous object exactly as it was. Widening is never a
+	// side effect of a refill. A backend that carries no access state keeps
+	// this one vacuously, which is a different thing from keeping it, and
+	// says so.
+	//
+	// Declining is explicit. storage_by_type and a package's storage_policy
+	// send one type's artifacts to one backend and another type's to another
+	// (see Resolver), so a promise that holds on whichever backend a reader
+	// happened to open is not a promise an operator can place an artifact
+	// against. A backend that keeps less than this and states nothing is the
+	// failure this block exists to prevent; conformance_test.go runs what it
+	// can of it against every backend it can construct.
 	Put(ctx context.Context, key string, data []byte) error
 
-	// PutFile uploads a local file to the given key.
+	// PutFile stores the contents of localPath at key, under the same
+	// contract as Put. localPath is read once and in full; a source that
+	// changes under the read is the caller's problem, not the store's.
 	PutFile(ctx context.Context, localPath, key string) error
 
 	// Delete removes the object at key. Returns nil if the object does not
