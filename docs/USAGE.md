@@ -201,18 +201,24 @@ bodega build run apt               # build apt sources only
 bodega build run apt python3
 ```
 
-### `bodega build sync [TYPE...]`
+### `bodega build sync [TYPE...] [NAME[@VERSION]]`
 
 Pushes whatever local artifacts exist to S3 **without** running any pipeline stages. Useful when artifacts were built on a different machine.
 
 ```bash
-bodega build sync                  # push all local artifacts
-bodega build sync pypi helm        # push pypi and helm only
+bodega build sync                             # push all local artifacts
+bodega build sync pypi helm                   # push pypi and helm only
+bodega build sync binary awscli-v2            # push one package
+bodega build sync binary awscli-v2@2.15.0 --storage bulk
 ```
 
 Every type but `pypi` uploads one object per manifest version, to the backend that version records: a git bundle to `repos/<name>/`, a `.deb` to the pool path its entry carries, a binary to `binaries/<name>/<version>/`. `pypi` wheels have no per-version object key, so they sync as a directory to `pypi/wheels/` on the backend `storage_by_type.pypi` names. A version whose artifact is not on disk is skipped, and so is a type with none.
 
-### `bodega build upload [TYPE...] [NAME]`
+A name after the types narrows the push to one package. An argument that is neither a known type nor a package in the catalog is an error, so `bodega build sync gitt` still fails on the typo instead of filtering for a package nothing is called and exiting 0 having pushed nothing. `pypi` is skipped when a name is given, because one package of it cannot reach storage apart from the rest.
+
+See [`--storage`](#placing-one-version-at-write-time) for directing a single version at a named backend.
+
+### `bodega build upload [TYPE...] [NAME[@VERSION]]`
 
 Runs the full pipeline (fetch → build) then uploads artifacts to S3. This is the most common command for end-to-end operation.
 
@@ -220,6 +226,39 @@ Runs the full pipeline (fetch → build) then uploads artifacts to S3. This is t
 bodega build upload                # fetch, build, and upload all types
 bodega build upload git            # fetch, build, and upload git only
 bodega build upload git netbox
+bodega build upload binary awscli-v2@2.15.0 --storage bulk
+```
+
+A name narrows the **upload**, not the cascade: `fetch`, `build` and `package` still run across the whole type, because the stage that would need the filter takes none. `bodega build sync` is the push with nothing in front of it. `pypi` is skipped when a name is given, since one package of it cannot reach storage apart from the rest.
+
+#### Placing one version at write time
+
+`--storage <backend>` writes one version's bytes to the backend you name, whatever the [placement hierarchy](#the-placement-hierarchy) resolves to. It is the surface for the one artifact that is too large, too sensitive or too slow to sit where the rest of its type sits, and which no rule can single out.
+
+```bash
+bodega build upload binary awscli-v2@2.15.0 --storage bulk
+bodega build sync   binary awscli-v2@2.15.0 --storage bulk
+```
+
+It **records** the name on the version entry rather than adding a fourth rule. The next upload of that package writes to `bulk` again without the flag, because a recorded name already wins over the rule — the same lifetime `bodega pkg move` gives a version. That is the difference from `--replace-placement`, which re-applies the current rule and keeps doing so every time it is passed.
+
+Four refusals, each because the alternative is silent:
+
+- **One type, named.** Across every type the flag would place whatever package of that name each one happens to hold.
+- **`NAME@VERSION`, not `NAME`.** Without the version it would be a package-level placement, which is `storage_policy` and already exists as `bodega pkg create --storage`.
+- **A configured backend.** A name nothing answers to would be recorded on the entry and fail every later read rather than this command.
+- **Not `pypi`.** A `pypi` version has no object of its own to place; set `storage_by_type.pypi` and re-upload with `--replace-placement`.
+
+A run whose `--storage` version was never reached fails rather than reporting the uploads it did do. One digit wrong in the version and the artifact goes where the rule says with nothing on the backend the operator named:
+
+```text
+--storage bulk named awscli-v2@2.15.1, which this run never uploaded: nothing was written to "bulk". Check the version against 'bodega show pkg binary awscli-v2'; a frozen version is skipped by every upload, and so is one whose artifact is not on disk
+```
+
+The copy at the previous placement is left where it is and named on the way past, the same warning `pkg move` prints without `--delete-source`:
+
+```text
+    warning: awscli-v2@2.15.0 moves to "bulk"; the copy in "default" is left behind
 ```
 
 ### `bodega build status [TYPE...]`
@@ -678,6 +717,35 @@ pypi is not movable: pypi wheels upload as a directory with no per-version objec
 Point `storage_by_type.pypi` at the backend you want and re-upload.
 
 `apt` and `git` were here until their uploaders learned to walk manifest entries. A `.deb` is addressed by the pool path its version entry records, a bundle by its ref, and both routes resolve a read through `storage` on the version entry, so either type moves one package at a time like the rest.
+
+### `bodega pkg drift [TYPE...]`
+
+Lists every version whose recorded backend is not the one the placement hierarchy resolves to today, across the whole catalog.
+
+```bash
+bodega pkg drift                   # every type
+bodega pkg drift binary npm        # two of them
+```
+
+```text
+TYPE    PACKAGE         VERSION           ON       RULE
+binary  awscli-v2       2.15.0            default  bulk
+git     netbox          v4.5.5 (frozen)   archive  default
+pypi    boto3           1.26.0            default  archive
+
+3 version(s) drifted. To discharge each:
+  bodega pkg move binary awscli-v2@2.15.0 --to bulk
+  bodega pkg freeze git netbox   # unfreeze first, then: bodega pkg move git netbox@v4.5.5 --to default
+  set storage_by_type.pypi to "archive" and re-run 'bodega build upload pypi --replace-placement' — pypi moves as a whole type or not at all
+```
+
+A rule change moves nothing, which is the design: everything already uploaded stays where it is and stays readable. The cost is that the change is invisible afterwards. `upload` and `sync` keep writing to the backend each version records, and only `pypi` refuses, because only `pypi` uploads a whole directory and can be split by a rule. The other seven types wrote on and reported nothing. This is where they answer.
+
+`bodega pkg move` is what discharges a row, and the command is printed with its arguments so the line can be copied. A frozen version names the unfreeze first, because `pkg move` refuses the whole command when any selected version is frozen.
+
+`pypi` gets a sentence rather than a command. Its wheels have no per-version object key and `pkg move` [refuses the type outright](#pypi-is-not-movable), so the only thing that moves them is `storage_by_type.pypi` plus a re-upload with `--replace-placement`. The remedy is printed once for the type, not once per drifted version, because one re-upload moves all of them. A `storage_policy` on a drifted `pypi` package is reported beside it: the package level is not consulted for `pypi`, so repointing the type rule leaves the inert policy behind.
+
+Nothing is written and no backend is asked where anything lives. This reads the config hierarchy on one side and the manifest record on the other and reports the pair — it is deliberately not a second resolver, because [placement and resolution share no code path](#placement-is-recorded-not-recomputed). `bodega build status` is the command that probes whether the object is actually there; `bodega pkg storage` answers the write side for one package.
 
 ### `bodega serve [flags]`
 
@@ -2328,13 +2396,15 @@ The prefix is the other half of that label, and it was still concatenated verbat
 
 #### The placement hierarchy
 
-Three levels decide where the next write goes, most specific first:
+Three levels decide where the next write goes, most specific first — two for `pypi`, which never reaches the package level:
 
 | Level | Where it lives | Reason |
 |-------|----------------|--------|
 | Package | `storage_policy` on the package manifest | One package whose bytes must live in a specific bucket, under a specific KMS key, while its type is shared with packages that must not |
 | Type | `storage_by_type.<type>` in the config | A whole ecosystem on a separate volume |
 | Global | `storage_backend`/`storage_path`/`bucket`/`region` | Everything else |
+
+One version can be directed past all three at write time with [`--storage`](#placing-one-version-at-write-time) on `upload` or `sync`. That is not a fourth level: it records a name on the version entry and stops deciding, where a level would re-decide at every future upload. `pypi` cannot take it, for the same reason it never reaches the package level.
 
 The most specific rule wins. A package policy that lost to a type rule would be a trap: it is set precisely for the package that must not go where the rest of its type goes, and adding a type rule later would silently move it.
 
@@ -2347,6 +2417,17 @@ The most specific rule wins. A package policy that lost to a type rule would be 
 `PackageManifest.storage_policy` is future tense: put new versions here. `VersionEntry.storage` is past tense: this version's bytes are here. Setting a policy moves nothing; `bodega pkg move` does that. One name for both would mislead every future reader of a manifest.
 
 `bodega pkg create --storage`, `bodega pkg edit` and `bodega pkg import` all record a `storage_policy` on a `pypi` package and warn that it will not be read. The field is recorded rather than rejected so that an existing manifest stays importable and the value survives a round trip through `pkg edit`.
+
+Editing `storage` is checked against the backends, not only against the config. A name that resolves to a configured backend passes validation and still strands the artifact, because reads resolve by the recorded name alone: the bytes stay where they were and the version becomes a 404 for content that exists. So `bodega pkg edit` asks the backend whether the object is there, and refuses an edit that points a version at a backend the object is not on while the one it names today holds it:
+
+```text
+storage was repointed at a backend the object is not on:
+  awscli-v2@2.15.0: binaries/awscli-v2/2.15.0/awscli.zip is on "default", not "bulk"; use 'bodega pkg move binary awscli-v2@2.15.0 --to bulk', which copies the bytes and then repoints the record
+```
+
+An operator relabeling a record is either correcting a wrong one or stranding an artifact, and the manifest alone cannot tell which. The object on the backend being named is the correction, and it passes. A version with no object at either end strands nothing and passes too, which is what keeps `pkg create` then `pkg edit` working on an entry not yet uploaded. A backend that will not answer is refused rather than waved through: it has not said the object is there. A `pypi` version is probed against the wheel-tree sentinel, `pypi/wheels/MANIFEST.sha256`, since it has no object of its own, and the refusal names `storage_by_type.pypi` rather than `pkg move`.
+
+The probe opens no backend at all when an edit leaves every `storage` field alone, which is almost every edit.
 
 #### Placement is recorded, not recomputed
 
@@ -2361,6 +2442,8 @@ A name no backend answers to is an error rather than a search of the others. Ser
 `upload` and `sync` honor a name a version already records. Change `storage_by_type` and they keep writing where the manifest says, so two runs either side of the change cannot produce divergent copies.
 
 `--replace-placement` is the deliberate move. It applies the current rule to versions already placed elsewhere, repoints the manifest, and warns for every object it leaves behind — nothing copies the old bytes. `bodega pkg move` is the one that copies.
+
+`bodega pkg drift` is how you find out that a rule change left anything behind. Without it the disagreement between the rule and the record is visible on `pypi` alone, where the refusal below fires; every other type writes to the backend its entry records and says nothing.
 
 `pypi` uploads a whole directory with no per-version granularity, so a changed rule refuses outright rather than splitting a tree across backends. `apt` and `git` used to refuse here too and no longer do: both resolve one key per version now, and a rule change repoints only what has not been written yet.
 
