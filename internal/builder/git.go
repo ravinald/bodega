@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -27,6 +28,41 @@ func gitBareDir(d dirs, name string, ve manifest.VersionEntry) string {
 	sn := safeName(name)
 	return filepath.Join(d.repos, sn, sn+"-"+ve.Ref+".git")
 }
+
+// bundleHasHEAD reports whether a bundle carries a HEAD ref, which is what git
+// clone reads to decide what to check out.
+//
+// The header is parsed here rather than shelled out to "git bundle list-heads"
+// because CheckGitStage runs per entry on paths that only wanted a stat. A
+// bundle opens with a version line, then capability lines in v3, then one
+// "<id> <ref>" line per ref, and a blank line closes the list.
+func bundleHasHEAD(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+
+	sc := bufio.NewScanner(io.LimitReader(f, bundleHeaderLimit))
+	if !sc.Scan() || !strings.HasPrefix(sc.Text(), "# v") {
+		return false
+	}
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "" {
+			return false
+		}
+		if _, ref, ok := strings.Cut(line, " "); ok && ref == "HEAD" {
+			return true
+		}
+	}
+	return false
+}
+
+// bundleHeaderLimit caps the header scan. A ref list runs to a few hundred
+// kilobytes on a forge repository with many tags, and past that the file is
+// either not a bundle or carries no HEAD anywhere a clone would find it.
+const bundleHeaderLimit = 1 << 20
 
 // CheckGitStage inspects the filesystem to determine which pipeline stages have
 // completed for the given git package version. It does not run any commands.
@@ -56,7 +92,10 @@ func CheckGitStage(cfg *Config, name string, ve manifest.VersionEntry) StageStat
 		bundlePath := filepath.Join(bundleDir, safeName(name)+"-"+ve.Ref+".bundle")
 		if fi, err := os.Stat(bundlePath); err == nil && !fi.IsDir() {
 			s.Built = true
-			s.Packaged = true
+			// A bundle with no HEAD clones into an empty repository, so it is a
+			// file rather than an artifact. Reporting it unpackaged is what makes
+			// the packaging stage rewrite one left behind by an earlier release.
+			s.Packaged = bundleHasHEAD(bundlePath)
 		}
 	}
 
@@ -390,8 +429,24 @@ func packageGitBundle(out interface{ Write([]byte) (int, error) }, d dirs, name 
 		_ = os.Remove(lockFile)
 	}
 
-	_, _ = fmt.Fprintf(out, "    Creating bundle for ref %s...\n", ve.Ref)
-	if err := runCmd(out, bareDir, "git", "bundle", "create", bundlePath, ve.Ref); err != nil {
+	// git clone reads a bundle's HEAD to pick what to check out, and a bundle
+	// built from a ref alone carries none: the clone lands on an unborn branch
+	// and reports "your current branch 'master' does not have any commits yet",
+	// which sends the reader to their own repository. Detaching the bare repo's
+	// HEAD at the ref puts a HEAD line in the bundle. It must be the commit, not
+	// the ref: HEAD at an annotated tag object makes clone die with "trying to
+	// write non-commit object".
+	commit, err := runCmdCapture(bareDir, "git", "rev-parse", "--verify", "--quiet", ve.Ref+"^{commit}")
+	commit = strings.TrimSpace(commit)
+	if err != nil || commit == "" {
+		return "", fmt.Errorf("resolve ref %s to a commit: %w", ve.Ref, err)
+	}
+	if err := runCmd(out, bareDir, "git", "update-ref", "--no-deref", "HEAD", commit); err != nil {
+		return "", fmt.Errorf("point HEAD at %s: %w", ve.Ref, err)
+	}
+
+	_, _ = fmt.Fprintf(out, "    Creating bundle for ref %s (HEAD %s)...\n", ve.Ref, shortCommit(commit))
+	if err := runCmd(out, bareDir, "git", "bundle", "create", bundlePath, ve.Ref, "HEAD"); err != nil {
 		return "", fmt.Errorf("git bundle create: %w", err)
 	}
 
@@ -399,8 +454,41 @@ func packageGitBundle(out interface{ Write([]byte) (int, error) }, d dirs, name 
 	if err := runCmd(out, bareDir, "git", "bundle", "verify", bundlePath); err != nil {
 		return "", fmt.Errorf("git bundle verify: %w", err)
 	}
+	if err := verifyBundleHEAD(bareDir, bundlePath, commit); err != nil {
+		return "", err
+	}
 
 	return bundlePath, nil
+}
+
+// shortCommit abbreviates a commit id for the entry log.
+func shortCommit(commit string) string {
+	if len(commit) > 7 {
+		return commit[:7]
+	}
+	return commit
+}
+
+// verifyBundleHEAD rejects a bundle whose HEAD is missing or points somewhere
+// other than the packaged commit. "git bundle verify" checks the prerequisites
+// and the pack, not the ref list, so it passes on a bundle that clones into an
+// empty repository.
+func verifyBundleHEAD(bareDir, bundlePath, commit string) error {
+	heads, err := runCmdCapture(bareDir, "git", "bundle", "list-heads", bundlePath)
+	if err != nil {
+		return fmt.Errorf("git bundle list-heads: %w\n%s", err, heads)
+	}
+	for _, line := range strings.Split(heads, "\n") {
+		id, ref, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok || strings.TrimSpace(ref) != "HEAD" {
+			continue
+		}
+		if id != commit {
+			return fmt.Errorf("bundle HEAD is %s, want %s", shortCommit(id), shortCommit(commit))
+		}
+		return nil
+	}
+	return fmt.Errorf("bundle carries no HEAD, so 'git clone %s' would check out nothing", filepath.Base(bundlePath))
 }
 
 // mergeSummaries combines two Summary values into a single one. Used by

@@ -2727,6 +2727,13 @@ The handler checks every occurrence of the `service` parameter, not the first. `
 
 `/git/{name}/{file}` still serves the `.bundle` and `.tar.gz` artifacts an uploader wrote to storage, unchanged. It predates smart-HTTP and stays because scripts fetch those URLs directly.
 
+```bash
+curl -O https://bodega-host:8080/git/netbox/netbox-v4.5.7.bundle
+git clone netbox-v4.5.7.bundle netbox
+```
+
+No `--branch` is needed: the packaging stage points the bundle's HEAD at the commit the entry's ref names, and refuses to write a bundle without one. A tag clones detached, a branch clones onto that branch, because git names a branch only when the bundle carries a `refs/heads/*` at HEAD's commit. A bundle written before HEAD was packaged has only its ref and clones into an empty repository whose error names the client's own branch; `bodega package git` rewrites it from the bare repo and the next `bodega sync` replaces the stored object at the same key.
+
 **A `git_upstreams` key and an uploaded git package may share a name. That is legal and neither shadows the other.** `GET /git/{name}/{file}` is the more specific ServeMux pattern, so it takes every two-segment path under `/git/`; a clone path is at least four, because the repository directory ends in `.git` and carries `info/refs` or `git-upload-pack` after it. The two coexist by depth. With `"tools"` in `git_upstreams` and a `tools` package in the manifest store, `/git/tools/tools-v1.2.0.bundle` serves the uploaded bundle and `/git/tools/org/repo.git/info/refs` resolves the upstream. Nothing rejects the pair at startup: manifest names are runtime data an operator adds and removes without restarting the server, so a startup check would refuse a config that was legal when it was written.
 
 #### Not implemented

@@ -155,6 +155,8 @@ curl https://bodega-host:8080/git/netbox/netbox-v4.5.7.bundle -o netbox.bundle
 git clone netbox.bundle netbox
 ```
 
+The clone lands on the ref the manifest entry pins. For a tag that is a detached HEAD, the same place `git clone --branch v4.5.7` puts you; `git switch -c work` when you want a branch.
+
 ## 7. Launch the TUI
 
 ```bash
