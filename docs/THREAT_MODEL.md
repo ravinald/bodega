@@ -151,7 +151,12 @@ defence against:
   instead of an aborted transaction. What refuses the artifacts behind it is
   the request predicate at `/apt/pool/`, which runs on identity rather than on
   what the client's sources say. Read the two together: the index decides what
-  a host is told exists, the predicate decides what it may fetch. The gap
+  a host is told exists, the predicate decides what it may fetch. A suite
+  bodega generates from its own catalog is the narrower case: its filtered view
+  is served under the suite's own name and picked on identity, so editing the
+  file does not reach around it, and what a host reaches by editing is the
+  mirrored codename, which is the archive's document and is filtered for
+  nobody. The gap
   closes when the token that identifies a host also gates the codename, which
   is not shipped.
 - **The chain of trust behind a filtered apt codename.** bodega re-signs it

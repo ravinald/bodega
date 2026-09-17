@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
@@ -24,6 +25,7 @@ import (
 	"github.com/ravinald/bodega/internal/deb822"
 	"github.com/ravinald/bodega/internal/entitle"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 // These drive the shape apt inverts: the filtered index is the enforcement and
@@ -991,4 +993,141 @@ func expansionLabel(s string) string {
 		return "unset"
 	}
 	return s
+}
+
+// ---- a suite bodega built from its own catalog ------------------------------
+//
+// The filtered-codename tests above all derive from a mirrored base. A suite
+// built from bodega's own manifest entries derives from nothing, has no second
+// name to be served under, and is what the fleet actually reads: B59 measured a
+// bound host reading the whole catalog off one its profile entitled none of.
+
+const (
+	generatedHelloDeb = "pool/main/h/hello/hello_2.10-5build1_amd64.deb"
+	generatedHtopDeb  = "pool/main/h/htop/htop_3.3.0-4build1_amd64.deb"
+)
+
+// generatedSuiteServer serves one manifest-built suite holding two packages
+// from two sources, each with its .deb in bodega's own pool.
+//
+// Two, because a profile listing one of them is the only fixture that tells a
+// filter apart from a server that serves nothing: an index filtered to empty
+// and an index that was never generated read the same from the client side.
+func generatedSuiteServer(t *testing.T) *Server {
+	t.Helper()
+	s := newDiscoveryServer(t)
+	s.cache = CacheConfig{Enabled: true, MetadataTTL: time.Hour}
+
+	pool, ok := s.stores.ForType(manifest.TypeApt).(*storage.Memory)
+	if !ok {
+		t.Fatal("the apt object store is not the in-memory one; the pool fetch below would have nothing to answer from")
+	}
+	for name, spec := range map[string]struct{ version, poolPath string }{
+		"hello": {"2.10-5build1", generatedHelloDeb},
+		"htop":  {"3.3.0-4build1", generatedHtopDeb},
+	} {
+		body := "\x21<arch>\n" + name + " bytes"
+		sum := sha256.Sum256([]byte(body))
+		if err := s.store.AddVersion(t.Context(), manifest.TypeApt, name, manifest.VersionEntry{
+			Version:      spec.version,
+			SourceName:   name,
+			ArtifactSize: int64(len(body)),
+			Metadata: map[string]string{
+				"Architecture": "amd64",
+				"_pool_path":   spec.poolPath,
+				"_sha256":      hex.EncodeToString(sum[:]),
+			},
+		}); err != nil {
+			t.Fatalf("add %s: %v", name, err)
+		}
+		pool.Seed(manifest.AptKey(spec.poolPath), body)
+	}
+	if err := s.store.SaveIndex(t.Context()); err != nil {
+		t.Fatalf("save index: %v", err)
+	}
+	s.rebuildAptSnapshot(t.Context())
+	return s
+}
+
+// generatedSuiteBind writes a profile that closes apt with no base at all,
+// which is the shape an operator gets from `bodega profile set <p> apt
+// --membership closed --expansion block` on an instance that mirrors nothing.
+func generatedSuiteBind(t *testing.T, s *Server, name string, packages ...string) *profileFixture {
+	t.Helper()
+	entries := make([]audit.ProfileEntry, 0, len(packages))
+	for _, p := range packages {
+		entries = append(entries, audit.ProfileEntry{Type: manifest.TypeApt, Name: p})
+	}
+	f := bindProfile(t, s, name, name+"-host",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypeApt, audit.VersionFloating, audit.ExpansionBlock)}, entries)
+	s.rebuildAptSnapshot(t.Context())
+	return f
+}
+
+// Requirement 1. The generated Packages and the Release that vouches for it
+// carry one stanza per entitled package and no others, for the host whose
+// profile says so and for that host alone.
+func TestGeneratedSuiteCarriesOnlyWhatTheProfileEntitles(t *testing.T) {
+	s := generatedSuiteServer(t)
+	f := generatedSuiteBind(t, s, "web", "hello")
+
+	code, index := f.get(t, "/apt/dists/noble/main/binary-amd64/Packages")
+	if code != http.StatusOK {
+		t.Fatalf("GET the generated Packages as a bound host = %d, want 200", code)
+	}
+	if !strings.Contains(index, "Package: hello\n") {
+		t.Errorf("the profile's own package is missing from its index:\n%s", index)
+	}
+	if strings.Contains(index, "Package: htop") {
+		t.Errorf("the index publishes htop, which the profile does not list:\n%s", index)
+	}
+	if got := strings.Count("\n"+index, "\nPackage: "); got != 1 {
+		t.Errorf("the index carries %d stanzas, want one per entitled package:\n%s", got, index)
+	}
+
+	// The Release a client checks the body against has to be the same host's.
+	// A filtered Packages under a Release digesting the unfiltered one is a
+	// hash mismatch, which apt reports as a corrupt archive.
+	code, release := f.get(t, "/apt/dists/noble/Release")
+	if code != http.StatusOK {
+		t.Fatalf("GET the generated Release as a bound host = %d, want 200", code)
+	}
+	if got := aptReleaseDigests(mustParseRelease(t, []byte(release)))["main/binary-amd64/Packages"]; got != sha256Hex(index) {
+		t.Errorf("the Release names %s for Packages and the body this host was served hashes to %s", got, sha256Hex(index))
+	}
+
+	// An unbound host is governed by nothing and still reads the catalog. The
+	// filter is a profile's view, not a new fleet-wide subtraction.
+	if _, body := mirrorGet(t, s, "/apt/dists/noble/main/binary-amd64/Packages"); !strings.Contains(string(body), "Package: htop") {
+		t.Errorf("an unprofiled host lost htop; the view must not replace the suite:\n%s", body)
+	}
+}
+
+// Requirement 2 and 4. The backstop behind that index: a client that composed
+// the pool URL without reading one is refused, and the refusal is answerable
+// from the server rather than only from whatever the client printed.
+func TestPoolRefusesADebOutsideAProfileThatNamesNoBase(t *testing.T) {
+	s := generatedSuiteServer(t)
+	f := generatedSuiteBind(t, s, "web", "hello")
+
+	code, body := f.get(t, "/apt/"+generatedHtopDeb)
+	if code != http.StatusForbidden {
+		t.Fatalf("pool fetch outside the profile = %d, want 403", code)
+	}
+	if !strings.Contains(body, entitle.RefusalMembership) {
+		t.Errorf("the refusal does not name which rule said no:\n%s", body)
+	}
+	row := profileDenial(t, s, audit.DenialProfileMembership)
+	if row.PkgName != "htop" {
+		t.Errorf("denial row names package %q, want htop", row.PkgName)
+	}
+	if got := denialDetails(t, row)["profile"]; got != "web" {
+		t.Errorf("denial row names profile %q, want web: a 403 a client reports as a download failure has to be answerable from the row", got)
+	}
+
+	// The entitled package still serves, which is the difference between a
+	// backstop and an outage.
+	if code, _ := f.get(t, "/apt/"+generatedHelloDeb); code != http.StatusOK {
+		t.Fatalf("pool fetch inside the profile = %d, want 200", code)
+	}
 }

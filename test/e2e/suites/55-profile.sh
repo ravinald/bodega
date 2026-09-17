@@ -187,9 +187,21 @@ check_lacks PROF-14 "the filtered apt index publishes no unentitled package" \
 # aptPoolGate is the backstop behind the index filter. An index that leaks the
 # package name and a pool that hands over the .deb are different failures: one
 # discloses what exists, the other lets the host install it.
-prof_get "/apt/pool/main/h/hello/hello_${E2E_APT_VERSION}_arm64.deb" || true
-check_ne PROF-14b "the apt pool refuses an unentitled .deb" "200" "$E2E_OUT" \
-	"internal/server/apt.go:64" "GET the pool .deb under a closed apt profile"
+#
+# Blocked rather than measured when the version is unresolved, which is a
+# filtered run that skipped 30-pipeline. The URL would then name
+# hello__arm64.deb, no object answers to that, and "not 200" passes on a 404
+# that no profile produced: this check reported XPASS on three targeted re-runs
+# and XFAIL on every full pass of the same commit for that reason alone.
+if [ -z "${E2E_APT_VERSION:-}" ]; then
+	e2e_block PROF-14b "the apt pool refuses an unentitled .deb" \
+		"the apt fixture version is unresolved, so the pool URL would name no object" \
+		"internal/server/apt.go:64"
+else
+	prof_get "/apt/pool/main/h/hello/hello_${E2E_APT_VERSION}_arm64.deb" || true
+	check_ne PROF-14b "the apt pool refuses an unentitled .deb" "200" "$E2E_OUT" \
+		"internal/server/apt.go:64" "GET the pool .deb under a closed apt profile"
+fi
 
 # A refusal that leaves no trail is a refusal nobody can audit.
 E2E_HOST=server
