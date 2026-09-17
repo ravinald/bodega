@@ -540,6 +540,28 @@ func TestServerAppliesAuditConfigToItsOwnHandle(t *testing.T) {
 	})
 }
 
+// serialDenialCost times n refusals issued one at a time, on a server of its
+// own so the rows it writes stay out of the count the caller asserts. One
+// serial pass is what denialWriteSlots makes a concurrent caller wait on, so
+// this is the bounded worst case measured on the machine the test is running
+// on rather than on the one it was written on.
+func serialDenialCost(t *testing.T, denyList []string, method, path string, n int) time.Duration {
+	t.Helper()
+	h := newDenialServer(t, []string{"127.0.0.0/8"}, denyList).handler()
+	start := time.Now()
+	for range n {
+		req := httptest.NewRequest(method, path, nil)
+		req.RemoteAddr = "127.0.0.1:33333"
+		req.Header.Set("X-Real-IP", "203.0.113.9")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("calibration status = %d, want 403 — the ceiling would be measured on a path that never reaches the writer", rec.Code)
+		}
+	}
+	return time.Since(start)
+}
+
 // TestDenialWritesAreBounded drives the one write path an anonymous caller
 // controls. B16 landed the denial row as a synchronous insert, so N concurrent
 // refusals were N goroutines contending for SQLite's single write lock, and the
@@ -548,18 +570,22 @@ func TestServerAppliesAuditConfigToItsOwnHandle(t *testing.T) {
 // slowest single 403 at 1.58s (DELETE) and 1.49s (GET). After: 8500/s, and the
 // slowest 403 at 9-17ms.
 //
-// The ceiling is 500ms, chosen against the numbers CI measures rather than
-// these: under -race the same runs are 2.03s to 3.37s unbounded and 61ms to
-// 69ms bounded across repeats, so 500ms sits 7x above the bounded worst and 4x
-// below the cheapest unbounded one, near the midpoint of a 35x separation.
+// The ceiling calibrates to the runner instead of naming a wall-clock number.
+// Both sides of the separation scale with the cost of one SQLite write, so the
+// test measures that cost in the same process: workers refusals issued
+// serially is the queue the last concurrent caller waits on, since the channel
+// hands its one slot to blocked senders in FIFO order. Under -race on an M-series
+// laptop that queue measures 59-66ms, the bounded worst case 67-84ms, and the
+// same run with the slot count raised to workers 429-487ms. The ceiling at 4x
+// the queue sits about 3x above the first and 1.8x below the second; a runner
+// slow enough to move one moves the queue it is measured against with it.
 //
-// #253 and #274 are the standing evidence that a wall-clock assertion on this
-// database flakes on a loaded runner. The margin survives one because the two
-// sides do not scale together: unbounded, the slowest request waits for the
-// whole flood, so it grows with load and with runner slowness alike; bounded,
-// it waits only on the 64 callers ahead of it in the channel's FIFO queue,
-// which is a twentieth of the run. A runner slow enough to push the bounded
-// case over 500ms pushes the unbounded case further above it, not closer.
+// #253, #274 and #371 are the standing evidence that a fixed wall-clock
+// assertion on this database flakes on a loaded runner. The 500ms this test
+// carried until #371 held for months, then failed at 594ms on a tree that had
+// not touched the write path: per-write latency on a shared runner is two
+// orders of magnitude off a developer's disk, and a constant scaled with none
+// of it.
 //
 // GET is here because DenyListMiddleware has no method guard: on an install
 // with a non-empty deny_list, a deny-listed address floods the writer with
@@ -569,7 +595,12 @@ func TestDenialWritesAreBounded(t *testing.T) {
 	const (
 		workers = 64
 		each    = 20
-		ceiling = 500 * time.Millisecond
+		// Above the bounded worst case, which is the measured queue itself,
+		// and far below the unbounded one at each times that.
+		ceilingMargin = 4
+		// A machine that serializes 64 writes in a few milliseconds would
+		// otherwise assert a ceiling small enough for scheduler noise to trip.
+		ceilingFloor = 100 * time.Millisecond
 	)
 
 	for _, tc := range []struct {
@@ -582,6 +613,9 @@ func TestDenialWritesAreBounded(t *testing.T) {
 		{name: "read", method: "GET", path: "/apt/dists/noble/Release", denyList: []string{"203.0.113.0/24"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			queue := serialDenialCost(t, tc.denyList, tc.method, tc.path, workers)
+			ceiling := max(queue*ceilingMargin, ceilingFloor)
+
 			s := newDenialServer(t, []string{"127.0.0.0/8"}, tc.denyList)
 			h := s.handler()
 
@@ -618,8 +652,9 @@ func TestDenialWritesAreBounded(t *testing.T) {
 				slowest = max(slowest, d)
 			}
 			if slowest > ceiling {
-				t.Errorf("slowest single 403 = %v, want under %v — an anonymous caller is paying the audit writer's contention",
-					slowest.Round(time.Millisecond), ceiling)
+				t.Errorf("slowest single 403 = %v, want under %v (%d serial writes took %v) — an anonymous caller is paying the audit writer's contention",
+					slowest.Round(time.Millisecond), ceiling.Round(time.Millisecond),
+					workers, queue.Round(time.Millisecond))
 			}
 
 			// The bound blocks; it must not drop. Count rather than Query:
@@ -631,7 +666,9 @@ func TestDenialWritesAreBounded(t *testing.T) {
 			if n != workers*each {
 				t.Errorf("denial rows = %d, want %d — the bound discarded refusals", n, workers*each)
 			}
-			t.Logf("%d refusals, slowest 403 %v", n, slowest.Round(time.Millisecond))
+			t.Logf("%d refusals, slowest 403 %v, ceiling %v from a %v serial queue",
+				n, slowest.Round(time.Millisecond), ceiling.Round(time.Millisecond),
+				queue.Round(time.Millisecond))
 		})
 	}
 }
