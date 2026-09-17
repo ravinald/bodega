@@ -92,7 +92,7 @@ func ensureFetchedApt(bcfg *builder.Config, store *manifest.Store, entryFilter s
 	return builder.MergeSummaries(ss...)
 }
 
-// ensureFetchedPypi runs FetchPypi when combined-requirements.txt is absent.
+// ensureFetchedPypi runs FetchPypi when the resolved closure is absent.
 func ensureFetchedPypi(bcfg *builder.Config, store *manifest.Store) *builder.Summary {
 	if builder.CheckPypiStage(bcfg, store).Fetched {
 		return &builder.Summary{}

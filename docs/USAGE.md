@@ -43,7 +43,7 @@ bodega build fetch git netbox      # fetch only netbox
 
 #### How a pypi version is resolved
 
-A pypi fetch writes no wheels. It resolves each manifest entry to one concrete version and records it in `<build-root>/combined-requirements.txt`, which `build run` then hands to `pip wheel -r`. Resolution happens here, at fetch, rather than in pip: a bare requirement line means "newest that satisfies the closure", and pip has no notion of an approved version to weigh that against.
+A pypi fetch resolves each manifest entry to one concrete version and records it in `<build-root>/combined-requirements.txt`. Resolution happens here, at fetch, rather than in pip: a bare requirement line means "newest that satisfies the closure", and pip has no notion of an approved version to weigh that against. The fetch then downloads the closure that file resolves to into `<build-root>/wheelhouse/` and writes `<build-root>/resolved-requirements.txt`, which pins every distribution in it with a SHA-256. See [What reaches pip](#what-reaches-pip).
 
 Versions are read, ordered and compared as [PEP 440](https://packaging.python.org/en/latest/specifications/version-specifiers/), which is the scheme PyPI publishes and semver cannot read. `1.16.0.post1`, `2.0.0rc1`, `1!2.0` and `0.6.dev1` are ordinary releases on an index; under semver every one of them is unparseable and drops out of the candidate list, which reads exactly like the release not existing. `pytz` is the live example: its newest release is `2026.3.post1`, and a semver filter resolves `any` to the release before it.
 
@@ -80,7 +80,35 @@ The default index is written out like any other. A deployment that wants its own
 
 ##### What reaches pip
 
-The applications' own requirements files are read at fetch and written out again, not handed to pip by reference. The generated `combined-requirements.txt` holds the selected index, the lines read from each application's file with `-r` and `-c` includes resolved in place, and one pin per manifest entry. `-c` includes land in a generated `combined-constraints.txt` instead, reached by a single `-c`, because a constraint restricts a version without requesting the package and flattening one into the requirements installs what an application only meant to bound.
+The build reaches no index. The fetch downloads the closure; the build turns bytes already on disk into wheels:
+
+```text
+pip wheel --isolated --no-index --find-links <build-root>/wheelhouse --require-hashes \
+    --wheel-dir <build-root>/wheels -r <build-root>/resolved-requirements.txt
+```
+
+`--no-index` is the one index control a requirements file cannot undo. pip lets a file's `--index-url` replace a command-line one outright, so pointing the build at the approved index was always the weaker half of that pair. `opts.no_index` can only be set, and every index option in `pip/_internal/req/req_file.py` is guarded by `and not no_index`, so an `--index-url`, `--extra-index-url` or `-f` at any include depth changes nothing about where bytes come from. `--find-links` appends unconditionally, which is why `--require-hashes` is there too: a link reaching pip by some other route still cannot produce bytes the fetch did not record.
+
+`resolved-requirements.txt` is the closure, one pinned line per distribution carrying a `--hash=sha256:` for every file the fetch stored:
+
+```text
+attrs==24.2.0 \
+    --hash=sha256:81921eb96de3191c8258c705618104dcb9a1c1a70e57e239745cb0dbbc9d6d4c
+six==1.16.0 \
+    --hash=sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254
+```
+
+Each of those digests is also a row in `bodega pkg checksum list`, keyed `pypi/wheels/<filename>` — the key the server serves that wheel under. A second fetch producing different bytes for a version already on record is refused, and the wheelhouse it wrote into is discarded with it. Before pip runs, the build re-digests the wheelhouse against the lock, so a file edited between the two stages fails naming the distribution and both digests rather than reporting whichever candidate pip reached first:
+
+```text
+pypi six==1.16.0: six-1.16.0-py3-none-any.whl no longer matches the digest recorded at fetch: recorded=8abb2f1d… received=63df92ac…
+```
+
+Both stages run pip out of one virtualenv under `<build-root>/build-venv`, which the fetch creates and the build reuses. It needs a `python3` whose `ensurepip` works — `python3-venv` on Debian and Ubuntu, `python3.<minor>-venv` where the distribution splits it per minor version. A host without it fails the stage naming that package rather than bootstrapping pip by piping `bootstrap.pypa.io/get-pip.py` into the interpreter, which is an origin outside every control here. Nothing upgrades that pip, so it is whatever the platform's `ensurepip` bundles.
+
+A source distribution in the closure is built at build time, and pip assembles its build environment through the same finder, so the backend has to be in the wheelhouse. `setuptools` and `wheel` are downloaded alongside the closure whenever it holds an sdist; a distribution needing another backend (`hatchling`, `flit_core`, `poetry-core`) is named as a pypi manifest entry, which puts it in the closure like anything else.
+
+The applications' own requirements files are read at fetch and written out again, not handed to pip by reference. The generated `combined-requirements.txt` holds the selected index, the lines read from each application's file with `-r` and `-c` includes resolved in place, and one pin per manifest entry. It is what the closure is resolved from; it never reaches the build. `-c` includes land in a generated `combined-constraints.txt` instead, reached by a single `-c`, because a constraint restricts a version without requesting the package and flattening one into the requirements installs what an application only meant to bound.
 
 Inlining rather than including, because an `-r` pointing back at the application's file leaves two parsers over one set of bytes: this one at fetch, pip's at build. Every difference between them is an acquisition instruction approved against one index and carried out against another, and five of them were found one at a time. What this reads is now what pip reads, so a construct read wrongly produces a wrong requirement rather than a silent change of origin.
 

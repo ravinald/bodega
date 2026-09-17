@@ -126,9 +126,10 @@ func (c *Config) updateVersionChecksum(ctx context.Context, store *manifest.Stor
 // the apt prefix, rewriting that word republishes an archive's bytes under
 // bodega's own signature.
 //
-// pypi has no per-version object key — wheels upload as a directory covering a
-// whole dependency closure — so ArtifactKeys returns ErrPypiNoObjectKey and
-// there is nothing to key a row on. It is the one type this does not cover.
+// A pypi entry has no per-version object key of its own, so ArtifactKeys
+// returns ErrPypiNoObjectKey and nothing is pinned here. Its closure is pinned
+// one artifact at a time through pinArtifactDigest, which the pypi fetch calls
+// per downloaded file.
 func (c *Config) pinChecksum(ctx context.Context, pm *manifest.PackageManifest, ve manifest.VersionEntry, cs *manifest.Checksum) error {
 	if c.AuditDB == nil || cs == nil || cs.Value == "" {
 		return nil
@@ -145,18 +146,28 @@ func (c *Config) pinChecksum(ctx context.Context, pm *manifest.PackageManifest, 
 	if version == "" {
 		version = ve.Ref
 	}
-	prior, err := c.AuditDB.GetChecksum(ctx, keys[0])
+	return c.pinArtifactDigest(ctx, keys[0], pm.Type, pm.Name, version, cs)
+}
+
+// pinArtifactDigest records one object key's digest and enforces an earlier
+// one. It is the rule described above, reached either from a manifest entry via
+// pinChecksum or from a key a caller derived itself.
+func (c *Config) pinArtifactDigest(ctx context.Context, key, typ, name, version string, cs *manifest.Checksum) error {
+	if c.AuditDB == nil || key == "" || cs == nil || cs.Value == "" {
+		return nil
+	}
+	prior, err := c.AuditDB.GetChecksum(ctx, key)
 	if err != nil {
-		return fmt.Errorf("read pinned checksum for %s: %w", keys[0], err)
+		return fmt.Errorf("read pinned checksum for %s: %w", key, err)
 	}
 	if prior != nil && prior.Value != "" {
 		if prior.Value != cs.Value {
 			return fmt.Errorf("%s/%s@%s: %s mismatch against the pinned digest for %s: pinned=%s fetched=%s",
-				pm.Type, pm.Name, version, cs.Algorithm, keys[0], prior.Value, cs.Value)
+				typ, name, version, cs.Algorithm, key, prior.Value, cs.Value)
 		}
 		return nil
 	}
-	return c.AuditDB.StoreChecksum(ctx, keys[0], pm.Type, pm.Name, version, cs.Algorithm, cs.Value, checksumSourceBuild)
+	return c.AuditDB.StoreChecksum(ctx, key, typ, name, version, cs.Algorithm, cs.Value, checksumSourceBuild)
 }
 
 // findAndUpdateGitChecksum updates Checksum and ChecksumVerified on a git VersionEntry and saves.
