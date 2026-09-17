@@ -67,6 +67,22 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 			s.proxyOrCache(w, r, s.typeStore(manifest.TypeNpm), storageKey, upstream, manifest.TypeNpm, pkgName, pkgName, true, true)
 			return
 		}
+		// A package no manifest names is answered upstream when the proxy is
+		// on, as the packument route does. Refusing it here is bodega 404ing a
+		// URL bodega published: the packument proxied for that same
+		// uncatalogued package has every dist.tarball rewritten onto this
+		// route, so `npm install` resolves through the proxy and then fails on
+		// the address the proxy handed it.
+		//
+		// Gated on the cache switch rather than forced past it the way cargo's
+		// crate download is, because the packument is gated the same way. With
+		// the proxy off nothing publishes a tarball URL for this package, so
+		// forcing the fetch would open egress the operator switched off and
+		// serve no client that could not already reach the registry itself.
+		if pm == nil && s.cacheEnabled() {
+			s.proxyOrCache(w, r, s.typeStore(manifest.TypeNpm), storageKey, upstream, manifest.TypeNpm, pkgName, pkgName, true, false)
+			return
+		}
 		if pm == nil {
 			s.recordNoManifest(ctx, r, manifest.TypeNpm, pkgName, reqVersion, upstream)
 		}
