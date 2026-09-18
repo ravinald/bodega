@@ -27,7 +27,21 @@ GO=/usr/local/go/bin/go
 # An absolute path, not ~: the tilde expands on the workstation before the
 # command is sent, so the guest was told to mkdir a path under this machine's
 # home and answered "Permission denied".
-WORK=/tmp/bodega-e2e-work
+#
+# /var/tmp rather than /tmp because both guests mount a 1.7G tmpfs there against
+# ~20G free on /. Linking the internal/server test binary overruns it, and the
+# compiler reports that as `disk quota exceeded`, which every check below then
+# files as a product defect. $E2E_GATED_ROOT moves the whole tree.
+#
+# The two subdirectories are what GAT-02 removes, never $GATED_ROOT itself: the
+# override is an environment variable, and `rm -rf` on one of those is how a
+# harness deletes a home directory.
+GATED_ROOT="${E2E_GATED_ROOT:-/var/tmp/bodega-e2e-gated}"
+WORK="$GATED_ROOT/tree"
+# t.TempDir() resolves through TMPDIR, so the scratch the tests write has to
+# move with the build: internal/policy/osvlive_test.go unpacks the OSV archives
+# through it and internal/server/sink_load_test.go writes its spool there.
+GOTMP="$GATED_ROOT/tmp"
 
 e2e_on server "test -x $GO" || true
 if [ "$E2E_RC" -ne 0 ]; then
@@ -47,7 +61,7 @@ check_eq GAT-01 "the tree archives at HEAD" 0 "$E2E_RC" \
 
 e2e_put server /tmp/e2e-tree.tar /tmp/e2e-tree.tar || true
 E2E_HOST=server
-e2e_on server "rm -rf $WORK && mkdir -p $WORK && tar -xf /tmp/e2e-tree.tar -C $WORK && test -f $WORK/go.mod" || true
+e2e_on server "rm -rf $WORK $GOTMP && mkdir -p $WORK $GOTMP && tar -xf /tmp/e2e-tree.tar -C $WORK && test -f $WORK/go.mod" || true
 check_eq GAT-02 "the tree unpacks on the server guest" 0 "$E2E_RC" \
 	"docs-internal/DEV_HOSTS.md" "tar -xf /tmp/e2e-tree.tar -C $WORK" "$E2E_RC"
 
@@ -58,20 +72,18 @@ if [ "$E2E_RC" -ne 0 ]; then
 	for id in GAT-05 GAT-06 GAT-07 GAT-08 GAT-09 GAT-10 GAT-11; do
 		e2e_block "$id" "a gated Go suite" "the tree did not unpack on the server guest (GAT-02)"
 	done
-	unset GO WORK id
+	unset GO GATED_ROOT WORK GOTMP id
 	return 0
 fi
 
-# ---- the two tests that fail on a host with bodega installed ---------------
+# ---- the test that read the installed config -------------------------------
 #
-# #320: both read /etc/bodega/config.json and /var/lib/bodega/manifests instead
-# of a temp directory. Both guests have those paths and both are root-owned, so
-# the tests take a permission error that a bare CI runner never sees. Mapped in
-# known-issues.tsv, so this reports XFAIL until the issue closes and XPASS the
-# moment it does.
+# #320 named two tests. The ACL half already puts BODEGA_CONFIG_FILE in force;
+# this one resolved through /etc/bodega/config.json, which is root-owned on both
+# guests, so it took a permission error a bare CI runner never sees.
 
-E2E_SSH_TIMEOUT=900 e2e_on server "cd $WORK && $GO test -count=1 -run 'TestJSONEditPopupEscClears' ./internal/tui/ 2>&1 | tail -20" || true
-check_eq GAT-05 "the TUI and ACL tests pass on a host that has bodega installed" \
+E2E_SSH_TIMEOUT=900 e2e_on server "cd $WORK && TMPDIR=$GOTMP $GO test -count=1 -run 'TestJSONEditPopupEscClears' ./internal/tui/ 2>&1 | tail -20" || true
+check_eq GAT-05 "TestJSONEditPopupEscClears passes on a host that has bodega installed" \
 	0 "$E2E_RC" "docs-internal/DEV_HOSTS.md" "go test -run TestJSONEditPopupEscClears ./internal/tui/" "$E2E_RC"
 
 # ---- contention under the runner's shape -----------------------------------
@@ -80,25 +92,25 @@ check_eq GAT-05 "the TUI and ACL tests pass on a host that has bodega installed"
 # GitHub gives two cores and this guest has sixteen. Running the whole package
 # rather than one subtest is what supplies the load.
 
-E2E_SSH_TIMEOUT=1800 e2e_on server "cd $WORK && GOMAXPROCS=2 taskset -c 0,1 $GO test -race -count=1 ./internal/audit/ 2>&1 | tail -20" || true
+E2E_SSH_TIMEOUT=1800 e2e_on server "cd $WORK && TMPDIR=$GOTMP GOMAXPROCS=2 taskset -c 0,1 $GO test -race -count=1 ./internal/audit/ 2>&1 | tail -20" || true
 check_eq GAT-06 "the audit package passes under -race on two cores" 0 "$E2E_RC" \
 	"docs/DESIGN.md:618" "GOMAXPROCS=2 taskset -c 0,1 go test -race ./internal/audit/" "$E2E_RC"
 
-E2E_SSH_TIMEOUT=2400 e2e_on server "cd $WORK && GOMAXPROCS=2 taskset -c 0,1 $GO test -race -count=1 ./internal/server/ 2>&1 | tail -20" || true
+E2E_SSH_TIMEOUT=2400 e2e_on server "cd $WORK && TMPDIR=$GOTMP GOMAXPROCS=2 taskset -c 0,1 $GO test -race -count=1 ./internal/server/ 2>&1 | tail -20" || true
 check_eq GAT-07 "the server package passes under -race on two cores" 0 "$E2E_RC" \
 	"docs/DESIGN.md:641" "GOMAXPROCS=2 taskset -c 0,1 go test -race ./internal/server/" "$E2E_RC"
 
 # ---- the env-gated harnesses ----------------------------------------------
 
-E2E_SSH_TIMEOUT=1800 e2e_on server "cd $WORK && BODEGA_SINK_LOAD=1 $GO test -count=1 -run 'SinkLoad' ./internal/server/ 2>&1 | tail -25" || true
+E2E_SSH_TIMEOUT=1800 e2e_on server "cd $WORK && TMPDIR=$GOTMP BODEGA_SINK_LOAD=1 $GO test -count=1 -run 'SinkLoad' ./internal/server/ 2>&1 | tail -25" || true
 check_eq GAT-08 "the audit sink load harness runs" 0 "$E2E_RC" \
 	"internal/server/sink_load_test.go:38" "BODEGA_SINK_LOAD=1 go test -run SinkLoad ./internal/server/" "$E2E_RC"
 
-E2E_SSH_TIMEOUT=1800 e2e_on server "cd $WORK && BODEGA_PROXY_RSS=1 $GO test -count=1 -run 'ProxyRSS' ./internal/server/ 2>&1 | tail -25" || true
+E2E_SSH_TIMEOUT=1800 e2e_on server "cd $WORK && TMPDIR=$GOTMP BODEGA_PROXY_RSS=1 $GO test -count=1 -run 'ProxyRSS' ./internal/server/ 2>&1 | tail -25" || true
 check_eq GAT-09 "the proxy RSS harness runs" 0 "$E2E_RC" \
 	"internal/server/proxy_rss_test.go:50" "BODEGA_PROXY_RSS=1 go test -run ProxyRSS ./internal/server/" "$E2E_RC"
 
-E2E_SSH_TIMEOUT=2400 e2e_on server "cd $WORK && BODEGA_OSV_LIVE=1 $GO test -count=1 ./internal/policy/ 2>&1 | tail -25" || true
+E2E_SSH_TIMEOUT=2400 e2e_on server "cd $WORK && TMPDIR=$GOTMP BODEGA_OSV_LIVE=1 $GO test -count=1 ./internal/policy/ 2>&1 | tail -25" || true
 check_eq GAT-10 "the live OSV comparison runs against api.osv.dev" 0 "$E2E_RC" \
 	"internal/policy/osvlive_test.go:21" "BODEGA_OSV_LIVE=1 go test ./internal/policy/" "$E2E_RC"
 
@@ -110,7 +122,7 @@ check_eq GAT-10 "the live OSV comparison runs against api.osv.dev" 0 "$E2E_RC" \
 
 e2e_on server "command -v docker >/dev/null 2>&1 || command -v podman >/dev/null 2>&1" || true
 if [ "$E2E_RC" -eq 0 ]; then
-	E2E_SSH_TIMEOUT=1800 e2e_on server "cd $WORK && $GO test -tags apt_integration -count=1 -timeout 20m -run TestRealApt ./internal/server/ 2>&1 | tail -25" || true
+	E2E_SSH_TIMEOUT=1800 e2e_on server "cd $WORK && TMPDIR=$GOTMP $GO test -tags apt_integration -count=1 -timeout 20m -run TestRealApt ./internal/server/ 2>&1 | tail -25" || true
 	check_eq GAT-11 "the real-apt integration test passes" 0 "$E2E_RC" \
 		"Makefile:183" "go test -tags apt_integration -run TestRealApt ./internal/server/" "$E2E_RC"
 else
@@ -119,4 +131,4 @@ else
 		"Makefile:183"
 fi
 
-unset GO WORK
+unset GO GATED_ROOT WORK GOTMP
