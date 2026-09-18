@@ -26,6 +26,7 @@ func aclTestDB(t *testing.T) *audit.DB {
 // There are three lists and the caller has to name one. Cobra would answer
 // "unknown command"; the operator needs the three names and a command to type.
 func TestACLBareAddIsRefused(t *testing.T) {
+	loadFrom(t, "{}")
 	cmd := newACLCmd(&globalFlags{})
 	cmd.SetArgs([]string{"add", "10.0.0.0/8"})
 	var out bytes.Buffer
@@ -47,6 +48,7 @@ func TestACLBareAddIsRefused(t *testing.T) {
 }
 
 func TestACLListSubcommandsExist(t *testing.T) {
+	loadFrom(t, "{}")
 	cmd := newACLCmd(&globalFlags{})
 	for _, list := range []string{"admin", "deny", "proxies"} {
 		sub, _, err := cmd.Find([]string{list, "add"})
@@ -276,6 +278,7 @@ func runACL(t *testing.T, args ...string) (string, error) {
 // --raw is on all three lists: any of them can hold a row planted before the
 // seed-time parse existed.
 func TestACLRemoveRawFlagOnEveryList(t *testing.T) {
+	loadFrom(t, "{}")
 	cmd := newACLCmd(&globalFlags{})
 	for _, list := range []string{"admin", "deny", "proxies"} {
 		sub, _, err := cmd.Find([]string{list, "remove"})

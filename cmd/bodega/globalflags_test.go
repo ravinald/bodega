@@ -18,6 +18,7 @@ import (
 // The built-in default belongs at the tail of the chain in config.Load, never
 // at the flag.
 func TestStringFlagsDoNotShadowConfig(t *testing.T) {
+	loadFrom(t, "{}")
 	root := newRootCmd()
 	for _, name := range []string{"bucket", "region", "build-root", "manifest-dir"} {
 		f := root.PersistentFlags().Lookup(name)

@@ -138,6 +138,11 @@ func TestServeAsTheServiceAccountHelper(t *testing.T) {
 		t.Skip("child half of TestTokenMintedAsRootValidatesAgainstAnotherAccount")
 	}
 	audit.DefaultPepperPaths = pepperPaths(tree)
+	// The config lives in the install the parent built and handed to a second
+	// uid, so it cannot come from this process's t.TempDir(). Naming it here
+	// rather than trusting the inherited environment means a direct
+	// -test.run of this helper resolves the tree's config, not /etc's.
+	t.Setenv("BODEGA_CONFIG_FILE", filepath.Join(tree, "etc", "config.json"))
 	cmd := newServeCmd(&globalFlags{})
 	cmd.SetArgs([]string{"--addr", os.Getenv(serveAddrEnv), "--allow-plaintext", "--quiet"})
 	if err := cmd.Execute(); err != nil {

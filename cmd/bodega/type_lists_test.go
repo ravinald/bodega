@@ -46,6 +46,7 @@ func TestResolveTypesAgreesWithIsValidType(t *testing.T) {
 // four and one said seven, against eight, because nothing tied the sentence to
 // the list. A ninth ecosystem must not be able to leave any of them stale.
 func TestBuildSubcommandHelpNamesEveryType(t *testing.T) {
+	loadFrom(t, "{}")
 	gf := &globalFlags{}
 	cmds := map[string]*cobra.Command{
 		"build run":     newBuildRunCmd(gf),

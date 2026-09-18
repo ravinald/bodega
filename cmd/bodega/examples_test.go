@@ -15,6 +15,7 @@ import (
 // Walks the whole tree rather than the one command that was wrong: the defect
 // is that nothing checked, and checking one command leaves the rest unchecked.
 func TestEveryHelpExampleParses(t *testing.T) {
+	loadFrom(t, "{}")
 	root := newRootCmd()
 
 	var walk func(*cobra.Command)

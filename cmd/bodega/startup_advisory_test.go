@@ -25,6 +25,11 @@ func defaultLog(t *testing.T) (*slog.Logger, *strings.Builder) {
 // loadFrom writes a config file, points $BODEGA_CONFIG_FILE at it and returns
 // what the real loader makes of it, so the snapshot RawFileValue reads is the
 // one a running bodega would hold.
+//
+// Tests that only build the cobra tree call it for the override alone and
+// discard the Config: every command's RunE reaches config.Load through
+// loadConfig, so without it the tree resolves /etc/bodega/config.json on a
+// host that has bodega installed.
 func loadFrom(t *testing.T, body string) *config.Config {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.json")

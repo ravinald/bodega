@@ -55,13 +55,27 @@ func TestEveryTestIsolatesTheConfigFile(t *testing.T) {
 			if walkErr != nil {
 				return walkErr
 			}
+			// "." or "_" leading the name is what the go tool itself ignores,
+			// so a file it will never compile must not be able to fail the
+			// parse below: an AppleDouble ._x.go sidecar, left by unpacking
+			// the tree with macOS tar, is a NUL-filled resource fork that
+			// aborts the whole walk with a syntax error.
+			if base := d.Name(); base != "." && (strings.HasPrefix(base, ".") || strings.HasPrefix(base, "_")) {
+				if d.IsDir() {
+					return fs.SkipDir
+				}
+				return nil
+			}
 			if d.IsDir() {
 				if d.Name() == "testdata" {
 					return fs.SkipDir
 				}
 				return nil
 			}
-			if !strings.HasSuffix(p, "_test.go") {
+			// Every .go file, not only the tests: in cmd/bodega a test reaches
+			// config.Load through the non-test helper loadConfig, so a graph
+			// built from test files alone stops at the test and reports green.
+			if !strings.HasSuffix(p, ".go") {
 				return nil
 			}
 			body, readErr := fs.ReadFile(root.FS(), p)
