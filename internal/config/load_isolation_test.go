@@ -57,9 +57,8 @@ func TestEveryTestIsolatesTheConfigFile(t *testing.T) {
 			}
 			// "." or "_" leading the name is what the go tool itself ignores,
 			// so a file it will never compile must not be able to fail the
-			// parse below: an AppleDouble ._x.go sidecar, left by unpacking
-			// the tree with macOS tar, is a NUL-filled resource fork that
-			// aborts the whole walk with a syntax error.
+			// parse below. An AppleDouble ._x.go sidecar is a NUL-filled
+			// resource fork, and one syntax error aborts the whole walk.
 			if base := d.Name(); base != "." && (strings.HasPrefix(base, ".") || strings.HasPrefix(base, "_")) {
 				if d.IsDir() {
 					return fs.SkipDir
