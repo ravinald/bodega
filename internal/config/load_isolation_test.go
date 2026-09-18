@@ -22,7 +22,7 @@ var configLoadAllowlist = map[string]string{
 	// systemConfigFile and userConfigFile seams to paths under t.TempDir() and
 	// blanks the override on purpose, so the rows with no override still read
 	// a scratch file rather than /etc.
-	"config/resolve_test.go:TestConfigPathMatrix": "drives ConfigPath's candidate list through its test seams",
+	"internal/config/resolve_test.go:TestConfigPathMatrix": "drives ConfigPath's candidate list through its test seams",
 }
 
 // config.Load with no override resolves through ConfigPath, which falls back to
@@ -35,14 +35,6 @@ var configLoadAllowlist = map[string]string{
 // file and a function name instead of arriving as a permission error from a
 // package nobody was editing.
 func TestEveryTestIsolatesTheConfigFile(t *testing.T) {
-	// os.Root rather than filepath.WalkDir: the walk and the read are scoped to
-	// internal/ and cannot follow a symlink out of it.
-	root, err := os.OpenRoot("..")
-	if err != nil {
-		t.Fatalf("open internal/: %v", err)
-	}
-	defer func() { _ = root.Close() }()
-
 	// Keyed by directory and package: an external _test package cannot call the
 	// internal one's helpers, so merging their function sets would credit a
 	// caller with an isolation it has no way to reach.
@@ -50,42 +42,54 @@ func TestEveryTestIsolatesTheConfigFile(t *testing.T) {
 	funcs := map[scope]map[string]*testFunc{}
 
 	fset := token.NewFileSet()
-	err = fs.WalkDir(root.FS(), ".", func(p string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+	// cmd/ as well as internal/: the commands are where a test drives the real
+	// cobra tree, and #320's surviving half was one of them.
+	for _, tree := range []string{"internal", "cmd"} {
+		// os.Root rather than filepath.WalkDir: the walk and the read are
+		// scoped to the tree and cannot follow a symlink out of it.
+		root, err := os.OpenRoot(path.Join("..", "..", tree))
+		if err != nil {
+			t.Fatalf("open %s/: %v", tree, err)
 		}
-		if d.IsDir() {
-			if d.Name() == "testdata" {
-				return fs.SkipDir
+		err = fs.WalkDir(root.FS(), ".", func(p string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if d.IsDir() {
+				if d.Name() == "testdata" {
+					return fs.SkipDir
+				}
+				return nil
+			}
+			if !strings.HasSuffix(p, "_test.go") {
+				return nil
+			}
+			body, readErr := fs.ReadFile(root.FS(), p)
+			if readErr != nil {
+				return readErr
+			}
+			file, parseErr := parser.ParseFile(fset, p, body, 0)
+			if parseErr != nil {
+				return parseErr
+			}
+			qual := path.Join(tree, p)
+			sc := scope{dir: path.Dir(qual), pkg: file.Name.Name}
+			if funcs[sc] == nil {
+				funcs[sc] = map[string]*testFunc{}
+			}
+			for _, decl := range file.Decls {
+				fn, ok := decl.(*ast.FuncDecl)
+				if !ok || fn.Body == nil || fn.Recv != nil {
+					continue
+				}
+				funcs[sc][fn.Name.Name] = inspectFunc(fset, qual, sc.pkg, fn)
 			}
 			return nil
+		})
+		_ = root.Close()
+		if err != nil {
+			t.Fatalf("walk %s/: %v", tree, err)
 		}
-		if !strings.HasSuffix(p, "_test.go") {
-			return nil
-		}
-		body, readErr := fs.ReadFile(root.FS(), p)
-		if readErr != nil {
-			return readErr
-		}
-		file, parseErr := parser.ParseFile(fset, p, body, 0)
-		if parseErr != nil {
-			return parseErr
-		}
-		sc := scope{dir: path.Dir(p), pkg: file.Name.Name}
-		if funcs[sc] == nil {
-			funcs[sc] = map[string]*testFunc{}
-		}
-		for _, decl := range file.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Body == nil || fn.Recv != nil {
-				continue
-			}
-			funcs[sc][fn.Name.Name] = inspectFunc(fset, p, sc.pkg, fn)
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("walk internal/: %v", err)
 	}
 
 	// Only the entry points are judged. A helper that calls Load is isolated by
@@ -112,7 +116,7 @@ func TestEveryTestIsolatesTheConfigFile(t *testing.T) {
 			if _, ok := configLoadAllowlist[fn.file+":"+name]; ok {
 				continue
 			}
-			bad = append(bad, fmt.Sprintf("internal/%s:%d: %s", fn.file, fn.line, name))
+			bad = append(bad, fmt.Sprintf("%s:%d: %s", fn.file, fn.line, name))
 		}
 	}
 	sort.Strings(bad)
