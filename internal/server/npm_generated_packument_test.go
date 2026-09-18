@@ -47,7 +47,7 @@ func TestNpmPackumentIgnoresTheStoredKeyForAManifestPackage(t *testing.T) {
 	if err != nil || pm == nil {
 		t.Fatalf("read the left-pad entry back: %v", err)
 	}
-	raw, err := json.Marshal(npmPackumentFromManifest("left-pad", base+"/npm", pm))
+	raw, err := json.Marshal(npmPackumentFromManifest("left-pad", base+"/npm", pm, s.logger))
 	if err != nil {
 		t.Fatalf("marshal the generated packument: %v", err)
 	}

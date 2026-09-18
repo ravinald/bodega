@@ -116,6 +116,45 @@ func stampArtifactSize(ctx context.Context, store *manifest.Store, typ, name str
 	if err != nil {
 		return
 	}
+	updateVersionEntry(ctx, store, typ, name, targetVE, func(ve *manifest.VersionEntry) {
+		ve.ArtifactSize = fi.Size()
+	})
+}
+
+// stampFetchRecord records everything the fetch stage learned about the bytes
+// it just wrote: their size, their sha256, and what the version declares it
+// needs. One save rather than three, so a fetch cannot leave a manifest
+// carrying a digest without the size it was measured beside.
+//
+// digest and deps are each written only when the fetch established one.
+// Clearing a recorded value because this run could not read it would turn a
+// transient upstream failure into a silent regression to the empty dependency
+// list this exists to end.
+func stampFetchRecord(ctx context.Context, store *manifest.Store, typ, name string, targetVE manifest.VersionEntry,
+	artifactPath, digest string, deps []manifest.Dependency) {
+	var size int64
+	if fi, err := os.Stat(artifactPath); err == nil {
+		size = fi.Size()
+	}
+	updateVersionEntry(ctx, store, typ, name, targetVE, func(ve *manifest.VersionEntry) {
+		if size > 0 {
+			ve.ArtifactSize = size
+		}
+		if digest != "" {
+			ve.ArtifactDigest = digest
+		}
+		if len(deps) > 0 {
+			ve.Dependencies = deps
+		}
+	})
+}
+
+// updateVersionEntry applies mutate to the stored entry matching targetVE and
+// saves the package. Silent on a package that will not load: what these
+// callers write is provenance recorded after a fetch already succeeded, and
+// failing the fetch over it would discard a good artifact.
+func updateVersionEntry(ctx context.Context, store *manifest.Store, typ, name string,
+	targetVE manifest.VersionEntry, mutate func(*manifest.VersionEntry)) {
 	pm, err := store.GetPackage(ctx, typ, name)
 	if err != nil || pm == nil {
 		return
@@ -131,7 +170,7 @@ func stampArtifactSize(ctx context.Context, store *manifest.Store, typ, name str
 			veKey = ve.Ref
 		}
 		if veKey == targetKey {
-			ve.ArtifactSize = fi.Size()
+			mutate(ve)
 			break
 		}
 	}

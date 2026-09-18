@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"path"
@@ -205,7 +206,7 @@ func isVersionHidden(pm *manifest.PackageManifest, version string) bool {
 // reqVersion is set on the version-manifest route, where npm asks for one
 // version and expects that version's object rather than the whole document.
 func (s *Server) serveManifestPackument(w http.ResponseWriter, r *http.Request, pkgName, reqVersion string, pm *manifest.PackageManifest, permit func(string) bool) {
-	body, err := json.Marshal(npmPackumentFromManifest(pkgName, s.npmPublicRoot(r), pm))
+	body, err := json.Marshal(npmPackumentFromManifest(pkgName, s.npmPublicRoot(r), pm, s.logger))
 	if err != nil {
 		s.logger.Error("packument generation failed", "pkg", pkgName, "error", err)
 		http.Error(w, "packument generation failed", http.StatusInternalServerError)
@@ -273,7 +274,7 @@ func (s *Server) serveManifestPackument(w http.ResponseWriter, r *http.Request, 
 // An entry whose version is a floating dist-tag names no artifact — the
 // builder resolves it at fetch time and leaves the entry alone — so it is
 // skipped rather than published as a version literally called "latest".
-func npmPackumentFromManifest(pkgName, base string, pm *manifest.PackageManifest) map[string]any {
+func npmPackumentFromManifest(pkgName, base string, pm *manifest.PackageManifest, logger *slog.Logger) map[string]any {
 	versions := map[string]any{}
 	for _, ve := range pm.Versions {
 		if ve.Version == "" || isNpmFloatingVersion(ve.Version) {
@@ -282,13 +283,16 @@ func npmPackumentFromManifest(pkgName, base string, pm *manifest.PackageManifest
 		dist := map[string]any{
 			"tarball": base + "/" + npmEscapeName(pkgName) + "/-/" + npmTarballFilename(pkgName, ve.Version),
 		}
-		if integrity := npmIntegrity(ve.Checksum); integrity != "" {
+		if integrity := npmIntegrity(pkgName, ve, logger); integrity != "" {
 			dist["integrity"] = integrity
 		}
 		entry := map[string]any{
 			"name":    pkgName,
 			"version": ve.Version,
 			"dist":    dist,
+		}
+		if deps := npmDependencyMap(ve.Dependencies); len(deps) > 0 {
+			entry["dependencies"] = deps
 		}
 		if desc := firstNonEmpty(ve.Description, pm.Description); desc != "" {
 			entry["description"] = desc
@@ -318,17 +322,63 @@ func npmTarballFilename(pkgName, version string) string {
 	return basename + "-" + version + ".tgz"
 }
 
-// npmIntegrity renders a recorded sha256 as the subresource-integrity string
-// npm checks a tarball against.
+// npmDependencyMap renders recorded dependencies into the object npm reads a
+// version's requirements out of. A version that recorded none omits the key
+// entirely rather than publishing an empty object, because the two say
+// different things: npm reads an empty object as "needs nothing" and no key as
+// "the registry declares nothing", and only the second is honest about a
+// version fetched before bodega recorded any.
+func npmDependencyMap(deps []manifest.Dependency) map[string]string {
+	if len(deps) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(deps))
+	for _, d := range deps {
+		if d.Name == "" {
+			continue
+		}
+		out[d.Name] = d.Req
+	}
+	return out
+}
+
+// npmIntegrity renders the digest of the bytes this server stores as the
+// subresource-integrity string npm checks a tarball against.
 //
-// Empty for anything else, including a digest under another algorithm. npm
-// fails a mismatch as a corrupt download rather than as a metadata problem, so
-// an integrity field bodega cannot stand behind costs more than none at all.
-func npmIntegrity(cs *manifest.Checksum) string {
-	if cs == nil || cs.Algorithm != "sha256" {
+// ArtifactDigest wins over Checksum because they answer different questions:
+// Checksum is what upstream or the operator declared the version should be,
+// ArtifactDigest is what the fetch stage actually wrote. npm verifies the
+// download, so the download is what integrity has to name. Neither is read
+// from storage per request — a packument lists every version, and reading each
+// stored tarball to answer one metadata request is O(versions x size).
+//
+// Where the two records disagree, the key is omitted and both are logged. That
+// is the whole difference between an operator seeing a line naming two digests
+// and a user seeing EINTEGRITY on a download that was not corrupt: npm
+// installs a version carrying no integrity, so it stays resolvable.
+//
+// Empty for a digest under another algorithm, and for a version neither record
+// covers.
+func npmIntegrity(pkgName string, ve manifest.VersionEntry, logger *slog.Logger) string {
+	recorded := ""
+	if cs := ve.Checksum; cs != nil && cs.Algorithm == "sha256" {
+		recorded = strings.ToLower(cs.Value)
+	}
+	stored := strings.ToLower(ve.ArtifactDigest)
+
+	if recorded != "" && stored != "" && recorded != stored {
+		if logger != nil {
+			logger.Error("npm dist.integrity omitted: the recorded sha256 is not the stored tarball's",
+				"package", pkgName, "version", ve.Version, "recorded", recorded, "stored", stored)
+		}
 		return ""
 	}
-	raw, err := hex.DecodeString(cs.Value)
+
+	digest := stored
+	if digest == "" {
+		digest = recorded
+	}
+	raw, err := hex.DecodeString(digest)
 	if err != nil || len(raw) != sha256.Size {
 		return ""
 	}

@@ -71,6 +71,12 @@ type Config struct {
 	// splits the sparse index from the download host, and the index host serves
 	// no downloads, so composing a download URL from the index root 404s.
 	CargoDLUpstream string
+	// CargoUpstream is the sparse index host, the other half of that split. A
+	// .crate carries Cargo.toml, which is the author's declaration and not the
+	// registry's dependency record: workspace, path and git dependencies have
+	// no sparse-index shape at all. The index line is the record, so it is
+	// fetched from here rather than reconstructed from the tarball.
+	CargoUpstream string
 }
 
 // PolicyDisabledNotice is what a fetch prints, once per run, when it holds no
@@ -202,6 +208,7 @@ func NewConfig(app *config.Config, pol *policy.Checker) *Config {
 		policyChecker:  pol,
 
 		CargoDLUpstream: app.CargoDLUpstream,
+		CargoUpstream:   app.CargoUpstream,
 	}
 }
 

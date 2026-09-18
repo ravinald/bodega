@@ -127,8 +127,8 @@ for t in $E2E_FIXTURE_TYPES; do
 	pypi) glob="/var/lib/bodega/pypi/wheels/six-*.whl" ;;
 	gomod) glob="/var/lib/bodega/gomod/github.com/google/uuid/@v/*.zip" ;;
 	helm) glob="/var/lib/bodega/charts/podinfo-*.tgz" ;;
-	npm) glob="/var/lib/bodega/npm/left-pad/*.tgz" ;;
-	cargo) glob="/var/lib/bodega/cargo/crates/itoa-*.crate" ;;
+	npm) glob="/var/lib/bodega/npm/color-convert/*.tgz" ;;
+	cargo) glob="/var/lib/bodega/cargo/crates/form_urlencoded-*.crate" ;;
 	esac
 	e2e_on server "sudo sh -c 'ls -d $glob 2>/dev/null' | head -3" || true
 	check_contains "PIPE-VERSION-$t" "the $t artifact on disk carries the pinned version" \

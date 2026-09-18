@@ -2,8 +2,12 @@ package builder
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,6 +47,114 @@ func cargoLocalDir(d dirs, name string, ve manifest.VersionEntry) string {
 // cargoCratePath returns the local path for a downloaded .crate tarball.
 func cargoCratePath(d dirs, name string, ve manifest.VersionEntry) string {
 	return filepath.Join(cargoLocalDir(d, name, ve), cargoCrateFilename(name, ve))
+}
+
+// defaultCargoIndex is the sparse index consulted for a crate's dependency
+// record when no config names one.
+const defaultCargoIndex = "https://index.crates.io"
+
+// cargoIndexMaxBytes caps an index document. One line per published version,
+// and the widest crates on crates.io run to a few hundred kilobytes.
+const cargoIndexMaxBytes = 8 * 1024 * 1024
+
+// cargoIndexPath is the sparse-index path cargo resolves a crate through. The
+// four shapes are the protocol's, keyed on name length, and the server's
+// cargoCrateFromIndexPath parses exactly these back.
+func cargoIndexPath(crate string) string {
+	switch n := len(crate); {
+	case n == 0:
+		return ""
+	case n <= 2:
+		return strconv.Itoa(n) + "/" + crate
+	case n == 3:
+		return "3/" + crate[:1] + "/" + crate
+	default:
+		return crate[:2] + "/" + crate[2:4] + "/" + crate
+	}
+}
+
+// cargoIndexDeps fetches the upstream sparse-index document for a crate and
+// returns the dependencies its line for version declares.
+//
+// The index rather than Cargo.toml inside the .crate. A registry dependency
+// carries name, req, features, optional, default_features, target and kind,
+// and Cargo.toml's workspace inheritance, path dependencies and git
+// dependencies do not map onto any of that — the registry resolved them when
+// the crate was published, and the index line is where that resolution is
+// recorded.
+//
+// Nothing found for the version returns no dependencies and no error: the
+// download root an entry names may be a private mirror the public index knows
+// nothing about, and a crate whose bytes fetched cleanly is not a failed fetch
+// because a second host had no opinion about it.
+func cargoIndexDeps(cfg *Config, crate, version string) ([]manifest.Dependency, error) {
+	root := strings.TrimRight(cfg.CargoUpstream, "/")
+	if root == "" {
+		root = defaultCargoIndex
+	}
+	p := cargoIndexPath(crate)
+	if p == "" {
+		return nil, nil
+	}
+	url := root + "/" + p
+
+	resp, err := http.Get(url) //nolint:gosec // the host is operator-configured, the path is the crate name
+	if err != nil {
+		return nil, fmt.Errorf("fetch cargo index %s: %w", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch cargo index %s: HTTP %d", url, resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, cargoIndexMaxBytes))
+	if err != nil {
+		return nil, fmt.Errorf("read cargo index %s: %w", url, err)
+	}
+
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var doc struct {
+			Vers string `json:"vers"`
+			Deps []struct {
+				Name            string   `json:"name"`
+				Req             string   `json:"req"`
+				Features        []string `json:"features"`
+				Optional        bool     `json:"optional"`
+				DefaultFeatures bool     `json:"default_features"`
+				Target          *string  `json:"target"`
+				Kind            string   `json:"kind"`
+			} `json:"deps"`
+		}
+		if err := json.Unmarshal([]byte(line), &doc); err != nil {
+			return nil, fmt.Errorf("parse cargo index %s: %w", url, err)
+		}
+		if doc.Vers != version {
+			continue
+		}
+		out := make([]manifest.Dependency, 0, len(doc.Deps))
+		for _, d := range doc.Deps {
+			dep := manifest.Dependency{
+				Name:            d.Name,
+				Req:             d.Req,
+				Features:        d.Features,
+				Optional:        d.Optional,
+				DefaultFeatures: d.DefaultFeatures,
+				Kind:            d.Kind,
+			}
+			if d.Target != nil {
+				dep.Target = *d.Target
+			}
+			out = append(out, dep)
+		}
+		return out, nil
+	}
+	return nil, nil
 }
 
 // CheckCargoStage inspects the local filesystem for a fetched crate tarball.
@@ -144,10 +256,29 @@ func FetchCargo(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 					}
 				}
 
+				// The dependency record comes from the index rather than the
+				// crate, so a failure here is a second host being unreachable
+				// and not a bad artifact. The fetch stands and the line says
+				// so: without it the index bodega publishes silently declares
+				// the crate needs nothing, which is the failure this replaces.
+				var deps []manifest.Dependency
+				if result.Err == nil {
+					d, dErr := cargoIndexDeps(cfg, pm.Name, ve.Version)
+					switch {
+					case dErr != nil:
+						_, _ = fmt.Fprintf(out, "  [cargo] %s@%s: WARNING: no dependency record: %v\n", pm.Name, ve.Version, dErr)
+					case len(d) > 0:
+						deps = d
+						_, _ = fmt.Fprintf(out, "  [cargo] %s@%s: recorded %d dependencies\n", pm.Name, ve.Version, len(d))
+					default:
+						_, _ = fmt.Fprintf(out, "  [cargo] %s@%s: the index names no dependencies\n", pm.Name, ve.Version)
+					}
+				}
+
 				if result.Err == nil {
 					_, _ = fmt.Fprintf(out, "  [cargo] %s@%s: ok\n", pm.Name, ve.Version)
 					cfg.StampCargoEntry(store, name, ve)
-					stampArtifactSize(context.Background(), store, manifest.TypeCargo, name, ve, dest)
+					stampFetchRecord(context.Background(), store, manifest.TypeCargo, name, ve, dest, computed, deps)
 				}
 			}
 

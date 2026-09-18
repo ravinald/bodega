@@ -42,6 +42,36 @@ const (
 // AllTypes is the canonical build order across all supported ecosystems.
 var AllTypes = []string{TypeBinary, TypeGit, TypeApt, TypePypi, TypeGomod, TypeHelm, TypeNpm, TypeCargo}
 
+// Dependency is one dependency a version declares, recorded in the shape the
+// registry protocol publishes rather than the shape the ecosystem's build file
+// declares. package.json and Cargo.toml both carry forms no registry serves —
+// a workspace member, a path, a git URL — so this holds what a resolver is
+// handed, not what an author wrote.
+//
+// Name and Req are the pair every ecosystem has. The rest are cargo's sparse
+// index members, which its protocol requires and npm has no equivalent for.
+type Dependency struct {
+	Name string `json:"name"`
+	Req  string `json:"req"`
+
+	// --- cargo sparse-index members ---
+
+	Features []string `json:"features,omitempty"`
+	Optional bool     `json:"optional,omitempty"`
+
+	// DefaultFeatures mirrors cargo's own default of true, so the value worth
+	// recording is the one that turns it off. Absent reads as false here and
+	// is rendered back into the index line as the member cargo requires.
+	DefaultFeatures bool `json:"default_features,omitempty"`
+
+	// Target is the cfg() expression or triple this dependency is conditional
+	// on. Empty is cargo's null: the dependency applies everywhere.
+	Target string `json:"target,omitempty"`
+
+	// Kind is "normal", "build" or "dev". Empty is cargo's "normal".
+	Kind string `json:"kind,omitempty"`
+}
+
 // Checksum records an expected digest for integrity verification.
 // Algorithm is one of "md5", "sha1", "sha256", or "sha512".
 // Value is the lowercase hex-encoded digest string.
@@ -232,6 +262,28 @@ type VersionEntry struct {
 	// Hidden excludes this version from being served to clients.
 	Hidden       bool  `json:"hidden,omitempty"`
 	ArtifactSize int64 `json:"artifact_size,omitempty"` // bytes, set at fetch time
+
+	// --- recorded by the fetch stage, alongside ArtifactSize ---
+
+	// Dependencies is what this version declares it needs, recorded when the
+	// artifact was fetched rather than read back per request. A packument
+	// lists every version, so answering one metadata request by reading each
+	// stored tarball is O(versions x size) on a route every client polls.
+	//
+	// Empty means no fetch recorded any, which is not the same as "this
+	// version has none": an entry written before the field existed carries
+	// nothing here until the next fetch runs.
+	Dependencies []Dependency `json:"dependencies,omitempty"`
+
+	// ArtifactDigest is the lowercase hex sha256 of the bytes the fetch stage
+	// stored. Checksum is what upstream or the operator declared this version
+	// should be; this is what bodega actually has.
+	//
+	// They are separate fields because they can legitimately disagree, and a
+	// server that collapsed them would have no way to notice. Where they do,
+	// the two records contradict each other about what this version is and
+	// nothing here knows which one an operator meant.
+	ArtifactDigest string `json:"artifact_digest,omitempty"`
 
 	// Frozen prevents this version from being built, edited, or deleted.
 	Frozen bool `json:"frozen,omitempty"`

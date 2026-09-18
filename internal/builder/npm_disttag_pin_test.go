@@ -36,7 +36,7 @@ func npmDistTagRegistry(t *testing.T, pkg, resolved string, tarball *string) *ht
 // allowed to move, and moving it must not read as tampering.
 func TestFetchNpmDistTagPinsResolvedVersion(t *testing.T) {
 	const pkg, resolved = "left-pad", "1.3.0"
-	tarball := "left-pad tarball bytes"
+	tarball := string(npmPackageTGZ(t, `{"name":"left-pad","version":"1.3.0"}`))
 	srv := npmDistTagRegistry(t, pkg, resolved, &tarball)
 
 	pm := &manifest.PackageManifest{
@@ -68,7 +68,7 @@ func TestFetchNpmDistTagPinsResolvedVersion(t *testing.T) {
 
 	// The tag has not moved and the bytes have. That is the case the pin exists
 	// for, so the fetch must be refused and the pin must survive it.
-	tarball = "republished under the same version"
+	tarball = string(npmPackageTGZ(t, `{"name":"left-pad","version":"1.3.0","description":"republished"}`))
 	s := FetchNpm(cfg, store, pkg)
 	if s.Failures == 0 {
 		t.Fatal("a republished tarball under an unmoved dist-tag was accepted")
@@ -89,7 +89,7 @@ func TestFetchNpmDistTagPinsResolvedVersion(t *testing.T) {
 // downloads it would be compared against the previous one's bytes and refused.
 func TestFetchNpmDistTagLeavesEntryFloating(t *testing.T) {
 	const pkg = "left-pad"
-	first := "one"
+	first := string(npmPackageTGZ(t, `{"name":"left-pad","version":"1.3.0"}`))
 	srv := npmDistTagRegistry(t, pkg, "1.3.0", &first)
 
 	pm := &manifest.PackageManifest{
@@ -112,7 +112,7 @@ func TestFetchNpmDistTagLeavesEntryFloating(t *testing.T) {
 	}
 
 	// The tag moves to a new release with different bytes.
-	second := "two"
+	second := string(npmPackageTGZ(t, `{"name":"left-pad","version":"1.4.0"}`))
 	moved := npmDistTagRegistry(t, pkg, "1.4.0", &second)
 	stored.Versions[0].URL = moved.URL
 	if err := store.SavePackage(t.Context(), stored); err != nil {

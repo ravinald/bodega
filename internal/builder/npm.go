@@ -3,6 +3,7 @@ package builder
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -224,10 +225,30 @@ func FetchNpm(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 					}
 				}
 
+				// The dependency read runs before the ok line: a tarball whose
+				// package.json cannot be read is a package npm would install
+				// and then fail to require, and reporting that fetch as a
+				// success is what put the defect in a consumer's build rather
+				// than in this output.
+				deps, depErr := readNpmDependencies(dest)
+				switch {
+				case depErr == nil:
+					if len(deps) > 0 {
+						_, _ = fmt.Fprintf(out, "  [npm] %s@%s: recorded %d dependencies\n", pm.Name, fetchVe.Version, len(deps))
+					}
+				case errors.Is(depErr, errNpmPackageJSONMissing):
+					_, _ = fmt.Fprintf(out, "  [npm] %s@%s: no package.json in the tarball, recording no dependencies\n", pm.Name, fetchVe.Version)
+				default:
+					_, _ = fmt.Fprintf(out, "  [npm] %s@%s: ERROR: %v\n", pm.Name, fetchVe.Version, depErr)
+					if result.Err == nil {
+						result.Err = fmt.Errorf("npm/%s@%s: %w", pm.Name, fetchVe.Version, depErr)
+					}
+				}
+
 				if result.Err == nil {
 					_, _ = fmt.Fprintf(out, "  [npm] %s@%s: ok\n", pm.Name, fetchVe.Version)
 					cfg.StampNpmEntry(store, name, ve)
-					stampArtifactSize(context.Background(), store, manifest.TypeNpm, name, ve, dest)
+					stampFetchRecord(context.Background(), store, manifest.TypeNpm, name, ve, dest, computed, deps)
 				}
 			}
 
