@@ -186,7 +186,7 @@ A specifier is a filter rather than a fact. An index that answers it with anothe
 #### Gaps
 
 - **Transitive dependencies are pip's to resolve.** Only the versions the manifest names are pinned. The wheels pip pulls in behind them are whatever the closure resolves to, and the manifest does not record them until `build package` scans the wheel metadata into `dep-graph.json`.
-- **The wheels directory is flat and nothing prunes it.** `pip wheel --wheel-dir` writes every build into one directory, so changing a pin leaves the previous version's wheel behind, and the generated simple index publishes whatever is in that directory. Clear it by hand when a pin moves.
+- **An orphaned wheel already in object storage stays there.** `bodega build build pypi` removes a pinned distribution's wheels at versions no pin names before pip writes beside them, and the generated simple index publishes only versions an entry names, so a re-pin no longer leaves the old version installable. Neither reaches a wheel a previous run already uploaded: `Client.SyncDir` is upload-only. Delete the object to retire it.
 - **The build toolchain is not pinned.** `pip install --upgrade pip wheel setuptools` reaches the selected index like the wheel build does, but takes whatever version that index offers, so a fixed bodega release is paired with whatever pip installed today. A selected index carrying no pip fails the build there rather than reaching past itself.
 - **Controlling the requirements language does not prove the origin of every byte.** A build installs build dependencies, obtains dynamically reported build requirements and runs build backends, and a build requirement can carry a direct reference of its own. What the generated file names is checked; what a `setup.py` reaches for while it runs is not. See [docs/THREAT_MODEL.md](THREAT_MODEL.md).
 - **`bodega refresh` still orders pypi candidates as semver.** It proposes new manifest entries rather than resolving a fetch, so a `patch`-constrained entry will not see a post release offered to it.
@@ -570,7 +570,7 @@ Both flags default to this machine, so leaving `--suite` off here records the re
 | a record of what the host already has                    | this section                                                               |
 | the host to keep the versions it runs once behind bodega | [`bodega pin apt`](#bodega-pin-apt-file-)                                  |
 
-For apt specifically, `bodega build fetch apt` shells out to `apt-get download <name>` on the bodega host: it passes no version, so a catalog entry's version names the storage key and nothing else, and the host can only resolve releases its own apt sources carry. A bodega on noble cannot fetch a jammy catalog that way. Mirroring is what serves another release.
+For apt specifically, `bodega build fetch apt` shells out to `apt-get download <name>=<version>` on the bodega host, so a catalog entry's version decides which `.deb` arrives and not only the storage key it lands under. The pin is checked three times: against the `Version table:` block of `apt-cache policy` before the download, by apt itself on the argv, and against the filename of what landed before it moves into the pool. A pin the local cache does not offer fails the entry naming the versions that are installable, rather than falling back to the candidate. The host can still only resolve releases its own apt sources carry: a bodega on noble cannot fetch a jammy catalog that way, and mirroring is what serves another release.
 
 Once the host installs from bodega, `bodega pin apt` closes the loop the other two rows leave open: it reads the same inventory this section converts, checks each installed version against the indices bodega actually serves, and writes the preferences file that holds the host where it is. That is a different question from the catalog, and it is the one asked on the day a host is moved behind bodega.
 
@@ -2754,6 +2754,8 @@ Every key but `platform` is omitted when empty, so an entry stamped on a host wi
 
 - **app_version**: application version the chart deploys
 
+The fetch opens the `.tgz` and reads `version:` from the `Chart.yaml` at its root. An archive declaring a release other than the entry's `version` fails the fetch and is deleted rather than stored, because the archive filename, the `index.yaml` entry and the `/helm/charts/` object key are all rendered from the entry: a `version` and a `url` naming different releases would otherwise publish a chart that looks right by every name bodega prints and holds another release's templates. An entry naming no version pins nothing and is not checked. `appVersion` is still the manifest's word and is not read back from the chart.
+
 ### Pypi-specific fields
 
 ```json
@@ -2832,6 +2834,8 @@ See [Signing the apt repository](#signing-the-apt-repository) below for creating
 pip install --index-url https://bodega-host:8080/pypi/simple/ <package>
 ```
 
+`/pypi/simple/<name>/` lists the wheels in storage, filtered to the versions the manifest entry names under its `version_constraint`. A distribution with no entry of its own is listed unfiltered: it arrives as somebody else's transitive dependency and the resolved closure is what pins it.
+
 **Go modules**:
 ```bash
 export GOPROXY=https://bodega-host:8080/go
@@ -2865,7 +2869,7 @@ replace-with = "bodega"
 registry = "sparse+https://bodega-host:8080/cargo/"
 ```
 
-A crate an entry names gets the same treatment as npm, on the same terms: the sparse-index document is generated from the manifest, one JSON object per line, filtered the same three ways. `cksum` carries the sha256 `bodega build fetch` recorded, or the digest of the stored crate for an entry that arrived without one. A version whose checksum cannot be established is left out rather than published with an empty one — cargo reports a `cksum` mismatch as a corrupt download, which sends whoever hits it to their disk rather than to this registry.
+A crate an entry names gets the same treatment as npm, on the same terms: the sparse-index document is generated from the manifest, one JSON object per line, filtered the same three ways. `cksum` is the digest of the crate as stored, read per request; the sha256 `bodega build fetch` recorded answers only where this server holds no bytes for the version, which is the case for a `proxy`-mode entry whose download route goes upstream. A version is left out of the index rather than published with a checksum the bytes contradict: no digest can be established for it at all, or the recorded one disagrees with the stored crate, which happens when the crate is rebuilt or replaced under a manifest that keeps the old value. cargo reports a `cksum` mismatch as a corrupt download, which sends whoever hits it to their disk rather than to this registry, so a 404 on the crate is the better failure. The mismatch is logged at error with both digests.
 
 **Gap:** a generated index line declares `deps: []`. bodega records no cargo dependency metadata, so cargo fetches none and a hosted crate that needs one fails to compile. Hosting a crate with dependencies waits on the index line carrying them.
 

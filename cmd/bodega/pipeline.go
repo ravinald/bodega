@@ -322,6 +322,11 @@ func ensurePackagedPypi(bcfg *builder.Config, store *manifest.Store) *builder.Su
 		if s.HasFailures() {
 			return builder.MergeSummaries(ss...)
 		}
+		// Re-read rather than reuse the sample taken before the build. The
+		// build decides the wheel set — it writes what pip produced and prunes
+		// what no manifest version names — so a Packaged read from before it
+		// ran describes a directory that no longer exists.
+		status = builder.CheckPypiStage(bcfg, store)
 	}
 	if !status.Packaged {
 		ss = append(ss, builder.PackagePypi(bcfg, store))

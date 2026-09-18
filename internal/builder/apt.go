@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -140,20 +141,83 @@ func stampAptPoolPath(ctx context.Context, store *manifest.Store, name string, t
 	return nil
 }
 
+// aptPinOnOffer fails when the local cache knows the package but not the
+// version the entry pins.
+//
+// `apt-get download <name>=<version>` refuses an absent version too, but it
+// refuses with apt's own message and after the network round trip. Read the
+// same table apt would resolve against first and the refusal names the entry,
+// the pin and what is installable instead, which is what the operator needs to
+// re-pin. Never the candidate: substituting it is the defect.
+func aptPinOnOffer(name, sourceName, want string) error {
+	offered, ok := aptOfferedVersions(sourceName)
+	if !ok {
+		return nil
+	}
+	if slices.Contains(offered, want) {
+		return nil
+	}
+	have := "no versions at all"
+	if len(offered) > 0 {
+		have = strings.Join(offered, ", ")
+	}
+	return fmt.Errorf("apt/%s: the manifest pins %s and the local cache offers %s for %s — run 'apt-get update' or re-pin the entry",
+		name, want, have, sourceName)
+}
+
+// aptDebVersion reads the version out of a .deb filename, which dpkg builds as
+// <name>_<version>_<arch>.deb with an epoch's colon percent-encoded.
+func aptDebVersion(base string) (string, bool) {
+	fields := strings.Split(strings.TrimSuffix(base, ".deb"), "_")
+	if len(fields) < 3 {
+		return "", false
+	}
+	v := strings.ReplaceAll(fields[1], "%3a", ":")
+	return strings.ReplaceAll(v, "%3A", ":"), true
+}
+
+// aptPinnedDeb picks the download the entry's pin names and fails when what
+// landed is another version.
+//
+// apt-get exiting 0 says a .deb arrived, not that the pinned one did: a local
+// cache stale against the archive, a pin apt resolved loosely, or a glob that
+// caught a sibling all end with bytes on disk the entry does not describe. The
+// pool key and the index entry are both rendered from the manifest version, so
+// a substitution that reaches the pool is one no client can see.
+func aptPinnedDeb(matches []string, name, want string) (string, error) {
+	if want == "" {
+		return matches[0], nil
+	}
+	got := make([]string, 0, len(matches))
+	for _, m := range matches {
+		base := filepath.Base(m)
+		if v, ok := aptDebVersion(base); ok && v == want {
+			return m, nil
+		}
+		got = append(got, base)
+	}
+	return "", fmt.Errorf("apt/%s: the manifest pins %s and apt-get download produced %s",
+		name, want, strings.Join(got, ", "))
+}
+
 // aptGetDownloadViaTemp runs `apt-get download` from a world-writable tempdir
 // (so the _apt sandbox user can write there) and then moves the resulting .deb
 // into pkgDir. Falls back to copy+remove if the tempdir and pkgDir are on
 // different filesystems (os.Rename returns EXDEV in that case).
-func aptGetDownloadViaTemp(out io.Writer, sourceName, pkgDir string) (string, error) {
+func aptGetDownloadViaTemp(out io.Writer, name, sourceName string, ve manifest.VersionEntry, pkgDir string) (string, error) {
 	tmpDir, err := os.MkdirTemp("", "bodega-apt-*")
 	if err != nil {
 		return "", fmt.Errorf("create tempdir: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
 
-	_, _ = fmt.Fprintf(out, "    Downloading %s via apt-get download...\n", sourceName)
-	if err := runCmd(out, tmpDir, "apt-get", "download", sourceName); err != nil {
-		return "", fmt.Errorf("apt-get download %s: %w", sourceName, err)
+	target := sourceName
+	if ve.Version != "" {
+		target = sourceName + "=" + ve.Version
+	}
+	_, _ = fmt.Fprintf(out, "    Downloading %s via apt-get download...\n", target)
+	if err := runCmd(out, tmpDir, "apt-get", "download", target); err != nil {
+		return "", fmt.Errorf("apt-get download %s: %w", target, err)
 	}
 
 	matches, err := filepath.Glob(filepath.Join(tmpDir, sourceName+"*.deb"))
@@ -161,7 +225,10 @@ func aptGetDownloadViaTemp(out io.Writer, sourceName, pkgDir string) (string, er
 		return "", fmt.Errorf("no .deb found for %s in %s", sourceName, tmpDir)
 	}
 
-	src := matches[0]
+	src, err := aptPinnedDeb(matches, name, ve.Version)
+	if err != nil {
+		return "", err
+	}
 	dest := filepath.Join(pkgDir, filepath.Base(src))
 	if err := moveFile(src, dest); err != nil {
 		return "", fmt.Errorf("move .deb to %s: %w", dest, err)
@@ -442,10 +509,15 @@ func FetchApt(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 				// a world-writable tempdir (_apt can sandbox normally) and move the
 				// .deb into the per-package dir afterwards.
 				pkgDir := filepath.Join(srcDir, sourceName)
-				if err := mkdirAll(pkgDir); err != nil {
-					fetchErr = fmt.Errorf("create dir %s: %w", pkgDir, err)
-				} else {
-					artifactPath, fetchErr = aptGetDownloadViaTemp(out, sourceName, pkgDir)
+				if ve.Version != "" {
+					fetchErr = aptPinOnOffer(name, sourceName, ve.Version)
+				}
+				if fetchErr == nil {
+					if err := mkdirAll(pkgDir); err != nil {
+						fetchErr = fmt.Errorf("create dir %s: %w", pkgDir, err)
+					} else {
+						artifactPath, fetchErr = aptGetDownloadViaTemp(out, name, sourceName, ve, pkgDir)
+					}
 				}
 			}
 

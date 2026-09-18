@@ -13,6 +13,7 @@ import (
 
 	"net/http"
 
+	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
@@ -56,6 +57,51 @@ func (s *Server) handlePypiIndex(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprintf(w, "    <a href=\"/pypi/simple/%s/\">%s</a>\n", html.EscapeString(n), html.EscapeString(n))
 	}
 	_, _ = fmt.Fprintf(w, "  </body>\n</html>\n")
+}
+
+// pypiEntryVersionFilter permits only the versions a manifest entry names, and
+// is nil when nothing here constrains the set.
+//
+// The per-package index is generated from the keys in storage rather than from
+// the manifest, so a wheel the manifest stopped naming stays installable: a
+// re-pin from 1.17.0 to 1.16.0 leaves the old wheel under the same prefix, pip
+// reads both links off /pypi/simple/six/ and takes the newer one. No request in
+// that sequence is refused anywhere, and the version installed is one nobody
+// approved.
+//
+// nil for a distribution with no entry, or an entry naming no version: one that
+// only ever arrives as somebody else's transitive dependency is pinned by the
+// resolved closure rather than by an entry here, and filtering it against an
+// empty set would empty the index.
+func pypiEntryVersionFilter(pm *manifest.PackageManifest) func(string) bool {
+	if pm == nil {
+		return nil
+	}
+	type pin struct{ version, constraint string }
+	var pins []pin
+	for _, ve := range pm.Versions {
+		v := strings.TrimSpace(ve.Version)
+		if v == "" || v == "*" {
+			continue
+		}
+		pins = append(pins, pin{version: v, constraint: ve.VersionConstraint})
+	}
+	if len(pins) == 0 {
+		return nil
+	}
+	return func(v string) bool {
+		for _, p := range pins {
+			// Literal equality before the PEP 440 filter, which drops what it
+			// cannot parse: pytz shipped "2011k", and an entry may name it.
+			if v == p.version {
+				return true
+			}
+			if len(builder.FilterPypiVersions([]string{v}, p.constraint, p.version)) > 0 {
+				return true
+			}
+		}
+		return false
+	}
 }
 
 // handlePypiPackage generates a PEP 503 per-package index listing wheel files.
@@ -115,6 +161,7 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 		relPath  string // relative to pypi/wheels/, e.g. "0.4.6/boto3-1.35.0.whl"
 		filename string // base filename for display
 	}
+	named := pypiEntryVersionFilter(pkg)
 	var wheels []wheelEntry
 	for _, key := range keys {
 		filename := path.Base(key)
@@ -125,8 +172,11 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 		if normalizePkgName(dist) != normalized {
 			continue
 		}
-		if permit != nil {
-			if _, version := wheelIdentity(filename); version != "" && !permit(version) {
+		if _, version := wheelIdentity(filename); version != "" {
+			if permit != nil && !permit(version) {
+				continue
+			}
+			if named != nil && !named(version) {
 				continue
 			}
 		}

@@ -1,8 +1,10 @@
 package builder
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ravinald/bodega/internal/manifest"
@@ -358,12 +360,71 @@ func TestCheckPypiStage_Packaged(t *testing.T) {
 	touchFile(t, filepath.Join(root, "combined-requirements.txt"))
 	touchFile(t, pypiLockPath(root))
 	wheelsDir := pypiWheelsDir(d)
-	touchFile(t, filepath.Join(wheelsDir, "somepackage-1.0-py3-none-any.whl"))
-	touchFile(t, filepath.Join(wheelsDir, "MANIFEST.sha256"))
+	whl := filepath.Join(wheelsDir, "somepackage-1.0-py3-none-any.whl")
+	touchFile(t, whl)
+	writeWheelManifest(t, wheelsDir, whl)
 
 	s := CheckPypiStage(cfg, store)
 	if !s.Fetched || !s.Built || !s.Packaged {
-		t.Errorf("expected all true when MANIFEST.sha256 present, got %+v", s)
+		t.Errorf("expected all true when MANIFEST.sha256 attests the wheels on disk, got %+v", s)
+	}
+}
+
+// writeWheelManifest writes the MANIFEST.sha256 PackagePypi would write for
+// exactly the wheels named.
+func writeWheelManifest(t *testing.T, wheelsDir string, whls ...string) {
+	t.Helper()
+	var body strings.Builder
+	for _, whl := range whls {
+		sum, err := computeFileSHA256(whl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(&body, "%s  %s\n", sum, filepath.Base(whl))
+	}
+	if err := os.WriteFile(filepath.Join(wheelsDir, "MANIFEST.sha256"), []byte(body.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// R7: MANIFEST.sha256 existing is not MANIFEST.sha256 being true. A build that
+// changed the wheel set leaves a file attesting the old one, and the cascade
+// reads Packaged off it and skips the stage that would correct it.
+func TestCheckPypiStageRefusesAStaleWheelManifest(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	store := manifest.NewLocalStore(root)
+	d := buildDirs(root)
+	wheelsDir := pypiWheelsDir(d)
+
+	touchFile(t, filepath.Join(root, "combined-requirements.txt"))
+	touchFile(t, pypiLockPath(root))
+	old := filepath.Join(wheelsDir, "six-1.17.0-py3-none-any.whl")
+	touchFile(t, old)
+	writeWheelManifest(t, wheelsDir, old)
+
+	if s := CheckPypiStage(cfg, store); !s.Packaged {
+		t.Fatalf("a manifest that does reconcile was rejected: %+v", s)
+	}
+
+	// The re-pin: the old wheel goes, the new one arrives, the checksums do
+	// not move.
+	if err := os.Remove(old); err != nil {
+		t.Fatal(err)
+	}
+	touchFile(t, filepath.Join(wheelsDir, "six-1.16.0-py3-none-any.whl"))
+	if s := CheckPypiStage(cfg, store); s.Packaged {
+		t.Error("a MANIFEST.sha256 naming neither wheel on disk was reported packaged")
+	}
+
+	// Same set, edited bytes.
+	whl := filepath.Join(wheelsDir, "six-1.16.0-py3-none-any.whl")
+	writeWheelManifest(t, wheelsDir, whl)
+	if err := os.WriteFile(whl, []byte("other bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if s := CheckPypiStage(cfg, store); s.Packaged {
+		t.Error("a MANIFEST.sha256 whose digest the wheel contradicts was reported packaged")
 	}
 }
 

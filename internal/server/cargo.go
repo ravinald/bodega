@@ -172,10 +172,10 @@ type cargoIndexDep struct {
 // store, with no upstream in the path at all.
 //
 // A version is dropped when it is hidden, when the entry's constraint excludes
-// it, or when no sha256 can be established for its crate. The last is not
-// caution: cargo verifies every download against cksum and reports a mismatch
-// as a corrupt crate, which sends whoever hits it looking at their disk rather
-// than at this registry.
+// it, or when cargoCksum cannot establish one sha256 the stored crate and the
+// manifest agree on. The last is not caution: cargo verifies every download
+// against cksum and reports a mismatch as a corrupt crate, which sends whoever
+// hits it looking at their disk rather than at this registry.
 func (s *Server) serveManifestCargoIndex(w http.ResponseWriter, r *http.Request, crate string, pm *manifest.PackageManifest, permit func(string) bool) {
 	ctx := r.Context()
 	vc, baseVer := packageVersionConstraint(pm)
@@ -224,20 +224,48 @@ func (s *Server) serveManifestCargoIndex(w http.ResponseWriter, r *http.Request,
 
 // cargoCksum is the sha256 cargo verifies a download against.
 //
-// The recorded checksum first: `bodega build fetch` writes one for every crate
-// it pulls, so the stored bytes are read only for an entry that arrived some
-// other way. That read is the whole crate on a metadata request, which is why
-// it is the fallback and not the source — and why a missing checksum is not
-// made up from nothing.
+// The stored crate decides, not the recorded checksum. A recorded digest is a
+// claim about bytes this server may no longer hold: rebuilt, replaced or
+// uploaded out of band, the manifest keeps the old value while /download
+// serves the new bytes, and cargo reports that disagreement as a corrupt
+// crate, which sends whoever hits it to their disk rather than to this
+// registry. So the price is a read of the crate on a metadata request, paid so
+// the index and the download route cannot disagree.
+//
+// A recorded digest that contradicts the stored bytes drops the version
+// instead of choosing a winner: the two disagree about what this version is,
+// and nothing here knows which one an operator meant. It also covers a
+// proxy-mode entry, whose /download goes upstream — the stored copy is then a
+// stale cache and the recorded digest the upstream's, so publishing either
+// over the other's objection would break a fetch.
+//
+// With nothing stored, the recorded digest is all there is, and a missing
+// checksum is not made up from nothing.
 func (s *Server) cargoCksum(ctx context.Context, crate string, ve manifest.VersionEntry) string {
+	var recorded string
 	if cs := ve.Checksum; cs != nil && cs.Algorithm == "sha256" && isSHA256Hex(cs.Value) {
-		return strings.ToLower(cs.Value)
+		recorded = strings.ToLower(cs.Value)
 	}
-	store, err := s.versionStore(ctx, manifest.TypeCargo, crate, ve.Version)
+	stored := s.storedCargoCksum(ctx, crate, ve.Version)
+	if stored == "" {
+		return recorded
+	}
+	if recorded != "" && recorded != stored {
+		s.logger.Error("cargo index line dropped: the recorded sha256 is not the stored crate's",
+			"crate", crate, "version", ve.Version, "recorded", recorded, "stored", stored)
+		return ""
+	}
+	return stored
+}
+
+// storedCargoCksum is the digest of the crate as stored, or "" when this
+// server holds no bytes for the version.
+func (s *Server) storedCargoCksum(ctx context.Context, crate, version string) string {
+	store, err := s.versionStore(ctx, manifest.TypeCargo, crate, version)
 	if err != nil || store == nil {
 		return ""
 	}
-	data, err := store.Get(ctx, manifest.CargoCrateKey(crate, ve.Version))
+	data, err := store.Get(ctx, manifest.CargoCrateKey(crate, version))
 	if err != nil || data == nil {
 		return ""
 	}
