@@ -61,13 +61,13 @@ check_ne INT-02b "the manifest store carries md5 sidecars to verify against" \
 
 # Reported MISSING while the file is on disk, in the same output that then
 # declares every manifest passed.
-e2e_on server "sudo test -f /var/lib/bodega/manifests/cargo/itoa/manifest.json && echo present || echo absent" || true
+e2e_on server "sudo test -f /var/lib/bodega/manifests/cargo/form_urlencoded/manifest.json && echo present || echo absent" || true
 cargo_manifest="$E2E_OUT"
 e2e_bodega server "pkg verify" || true
 if [ "$cargo_manifest" = present ]; then
 	check_lacks INT-02c "verify does not report a manifest missing while it is on disk" \
 		"cargo    MISSING" "$E2E_OUT" "cmd/bodega/cmd_verify.go:15" \
-		"bodega pkg verify with cargo/itoa/manifest.json present"
+		"bodega pkg verify with cargo/form_urlencoded/manifest.json present"
 else
 	e2e_skip INT-02c "verify does not report a manifest missing while it is on disk" \
 		"no cargo manifest in this store"

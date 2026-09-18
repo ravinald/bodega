@@ -155,8 +155,8 @@ check_eq PROF-11 "the entitled artifact is still served" "200" "$E2E_OUT" \
 
 for spec in \
 	"git:/git/uuid/uuid-v1.6.0.bundle:internal/server/git.go:44" \
-	"npm:/npm/left-pad/-/left-pad-1.3.0.tgz:internal/server/npm.go:59" \
-	"cargo:/cargo/itoa/1.0.11/download:internal/server/cargo.go:138" \
+	"npm:/npm/color-convert/-/color-convert-2.0.1.tgz:internal/server/npm.go:59" \
+	"cargo:/cargo/form_urlencoded/1.2.2/download:internal/server/cargo.go:138" \
 	"helm:/helm/charts/podinfo-6.7.0.tgz:internal/server/helm.go:71"; do
 	t="${spec%%:*}"
 	rest="${spec#*:}"

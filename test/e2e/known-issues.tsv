@@ -15,5 +15,3 @@
 PIPE-APT-07	311	PackageApt writes pool paths under the binary name
 PROF-16	310	an apt pin cannot name a source version
 PIPE-APT-08	271	_pool_path is unconditional provenance, so no SHA256 when mirroring
-CLI-NPM-03	356	a hosted package's declared dependencies are never installed; left-pad and itoa are leaves, so no CLI check can see it
-CLI-NPM-04	358	dist.integrity is the recorded digest, so a tarball replaced under an unchanged manifest serves EINTEGRITY

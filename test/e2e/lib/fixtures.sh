@@ -8,6 +8,19 @@
 # version. A fixture needing a login fails as a 404 and reads as a bodega bug,
 # and a floating version turns a failure into "which upstream release broke
 # this", an answer the report never carries.
+#
+# npm and cargo are pairs rather than single packages, emitted as the JSON
+# array 'pkg import' already accepts. Both were dependency-free leaves until
+# B72 — left-pad and itoa — which is why no client check had ever observed a
+# hosted package resolving with none of its dependencies. The pair is the
+# smallest fixture that can see it: color-convert@2.0.1 needs color-name
+# ~1.1.4, form_urlencoded@1.2.2 needs percent-encoding ^2.3.0, and each
+# dependency is itself a leaf, so the closure ends after one hop and the check
+# fails for one reason only.
+#
+# e2e_fixture_name and e2e_fixture_version name the first of each pair. A suite
+# walking the types measures the dependent package; the leaf is there to be
+# resolved, not asserted on.
 
 [ -n "${E2E_LIB_FIXTURES:-}" ] && return 0
 E2E_LIB_FIXTURES=1
@@ -84,22 +97,40 @@ JSON
 }
 JSON
 	npm) cat <<'JSON' ;;
-{
-  "config_version": 1,
-  "name": "left-pad",
-  "type": "npm",
-  "description": "e2e fixture: a single-file package with no dependencies",
-  "versions": [{ "version": "1.3.0" }]
-}
+[
+  {
+    "config_version": 1,
+    "name": "color-convert",
+    "type": "npm",
+    "description": "e2e fixture: a package declaring exactly one dependency",
+    "versions": [{ "version": "2.0.1" }]
+  },
+  {
+    "config_version": 1,
+    "name": "color-name",
+    "type": "npm",
+    "description": "e2e fixture: the leaf color-convert@2.0.1 depends on",
+    "versions": [{ "version": "1.1.4" }]
+  }
+]
 JSON
 	cargo) cat <<'JSON' ;;
-{
-  "config_version": 1,
-  "name": "itoa",
-  "type": "cargo",
-  "description": "e2e fixture: a crate with no dependencies",
-  "versions": [{ "version": "1.0.11" }]
-}
+[
+  {
+    "config_version": 1,
+    "name": "form_urlencoded",
+    "type": "cargo",
+    "description": "e2e fixture: a crate declaring exactly one dependency",
+    "versions": [{ "version": "1.2.2" }]
+  },
+  {
+    "config_version": 1,
+    "name": "percent-encoding",
+    "type": "cargo",
+    "description": "e2e fixture: the leaf form_urlencoded@1.2.2 depends on",
+    "versions": [{ "version": "2.3.2" }]
+  }
+]
 JSON
 	apt)
 		# The version is resolved on the guest rather than pinned here: an apt
@@ -128,8 +159,8 @@ e2e_fixture_name() {
 	pypi) printf 'six' ;;
 	gomod) printf 'github.com/google/uuid' ;;
 	helm) printf 'podinfo' ;;
-	npm) printf 'left-pad' ;;
-	cargo) printf 'itoa' ;;
+	npm) printf 'color-convert' ;;
+	cargo) printf 'form_urlencoded' ;;
 	*) return 2 ;;
 	esac
 }
@@ -142,8 +173,8 @@ e2e_fixture_version() {
 	pypi) printf '1.16.0' ;;
 	gomod) printf 'v1.6.0' ;;
 	helm) printf '6.7.0' ;;
-	npm) printf '1.3.0' ;;
-	cargo) printf '1.0.11' ;;
+	npm) printf '2.0.1' ;;
+	cargo) printf '1.2.2' ;;
 	*) return 2 ;;
 	esac
 }

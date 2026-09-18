@@ -144,11 +144,9 @@ func (s *Server) handleCargoIndex(w http.ResponseWriter, r *http.Request, p stri
 type cargoIndexLine struct {
 	Name string `json:"name"`
 	Vers string `json:"vers"`
-	// Always empty: bodega records no cargo dependency metadata, and a
-	// resolver fed a dependency list nobody uploaded resolves against a claim
-	// this server cannot support. The cost is that a hosted crate needing a
-	// dependency fails to compile, since cargo fetches what this line names
-	// and nothing else. Stated as a gap in docs/USAGE.md, tracked in #356.
+	// Deps is what the fetch stage recorded from the upstream index line for
+	// this version, and an empty list where it recorded nothing. Never null:
+	// cargo refuses to deserialize the document before it reaches the crate.
 	Deps     []cargoIndexDep     `json:"deps"`
 	Cksum    string              `json:"cksum"`
 	Features map[string][]string `json:"features"`
@@ -166,6 +164,43 @@ type cargoIndexDep struct {
 	DefaultFeatures bool     `json:"default_features"`
 	Target          *string  `json:"target"`
 	Kind            string   `json:"kind"`
+}
+
+// cargoIndexDeps renders recorded dependencies into the wire shape cargo's
+// sparse protocol defines, and an empty list for a version that recorded none.
+//
+// Empty rather than absent because deps is a required member of the record:
+// cargo fails to deserialize a line missing it, and would do so before
+// reaching the crate the line describes. An empty Target renders as cargo's
+// null, which is a dependency that applies everywhere, and an empty Kind
+// renders as "normal", which is the kind cargo assumes when a line omits it.
+func cargoIndexDeps(deps []manifest.Dependency) []cargoIndexDep {
+	out := make([]cargoIndexDep, 0, len(deps))
+	for _, d := range deps {
+		if d.Name == "" {
+			continue
+		}
+		dep := cargoIndexDep{
+			Name:            d.Name,
+			Req:             d.Req,
+			Features:        d.Features,
+			Optional:        d.Optional,
+			DefaultFeatures: d.DefaultFeatures,
+			Kind:            d.Kind,
+		}
+		if dep.Features == nil {
+			dep.Features = []string{}
+		}
+		if dep.Kind == "" {
+			dep.Kind = "normal"
+		}
+		if d.Target != "" {
+			target := d.Target
+			dep.Target = &target
+		}
+		out = append(out, dep)
+	}
+	return out
 }
 
 // serveManifestCargoIndex answers a sparse-index document out of the manifest
@@ -198,7 +233,7 @@ func (s *Server) serveManifestCargoIndex(w http.ResponseWriter, r *http.Request,
 		line, err := json.Marshal(cargoIndexLine{
 			Name:     crate,
 			Vers:     ve.Version,
-			Deps:     []cargoIndexDep{},
+			Deps:     cargoIndexDeps(ve.Dependencies),
 			Cksum:    cksum,
 			Features: map[string][]string{},
 		})

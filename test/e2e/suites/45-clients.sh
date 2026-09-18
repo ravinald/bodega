@@ -137,25 +137,66 @@ check_matches CLI-PYPI-02 "the installed module imports" '^[0-9]+\.' "$E2E_OUT$E
 
 # ---- npm -------------------------------------------------------------------
 
-e2e_on client "rm -rf $CLIENT_ROOT/npm && mkdir -p $CLIENT_ROOT/npm && cd $CLIENT_ROOT/npm && \
-	npm install --no-audit --no-fund --registry '$E2E_BASE_URL/npm' left-pad@1.3.0 2>&1 | tail -8" || true
+# color-convert rather than a leaf: it declares color-name ~1.1.4, and both are
+# hosted, so this is the one shape of install that can tell a working registry
+# from one whose packument declares no dependencies. --cache at a scratch path
+# wiped alongside the project, because npm's default cache lives in $HOME and a
+# hit there serves the packument and the tarball without asking bodega for
+# either. npm has no --no-cache: it parses as cache=false and warns that the
+# value is not a filesystem path.
+e2e_on client "rm -rf $CLIENT_ROOT/npm $CLIENT_ROOT/npm-cache && mkdir -p $CLIENT_ROOT/npm && cd $CLIENT_ROOT/npm && \
+	npm install --no-audit --no-fund --cache '$CLIENT_ROOT/npm-cache' --registry '$E2E_BASE_URL/npm' color-convert@2.0.1 2>&1 | tail -8" || true
 check_eq CLI-NPM-01 "npm installs from the bodega registry" 0 "$E2E_RC" \
-	"internal/server/npm.go:16" "npm install --registry $E2E_BASE_URL/npm left-pad@1.3.0" "$E2E_RC"
+	"internal/server/npm.go:16" "npm install --registry $E2E_BASE_URL/npm color-convert@2.0.1" "$E2E_RC"
 
-e2e_on client "test -f $CLIENT_ROOT/npm/node_modules/left-pad/package.json && echo present" || true
+e2e_on client "test -f $CLIENT_ROOT/npm/node_modules/color-convert/package.json && echo present" || true
 check_eq CLI-NPM-02 "the package lands in node_modules" "present" "$E2E_OUT" \
-	"internal/server/npm.go:21" "test -f node_modules/left-pad/package.json"
+	"internal/server/npm.go:21" "test -f node_modules/color-convert/package.json"
+
+# The defect #356 named: the install succeeds, writes one directory, and the
+# package is broken afterwards. Requiring it is the only check that sees that,
+# because the failure is MODULE_NOT_FOUND at require time and npm reports the
+# install as a success.
+e2e_on client "test -f $CLIENT_ROOT/npm/node_modules/color-name/package.json && echo present" || true
+check_eq CLI-NPM-03 "the declared dependency is installed alongside it" "present" "$E2E_OUT" \
+	"internal/server/npm.go:283" "test -f node_modules/color-name/package.json"
+
+# The resolve guard is the check, and the value is the proof it ran. Ubuntu
+# ships color-name at /usr/share/nodejs/color-name, which node falls back to
+# after the project's node_modules misses, so a bare require() of
+# color-convert succeeds on a guest whose registry served no dependency at
+# all. This check reported PASS against exactly that for one full run.
+e2e_on client "cd $CLIENT_ROOT/npm && node -e \"const p=require.resolve('color-name'); if(!p.startsWith(process.cwd())) throw new Error('resolved outside the project: '+p); console.log(require('color-convert').keyword.rgb('blue').join(','))\" 2>&1 | tail -3" || true
+check_eq CLI-NPM-04 "the package loads against the dependency bodega served" "0,0,255" "$E2E_OUT" \
+	"internal/server/npm.go:283" "node -e \"require.resolve('color-name') under the project, then require('color-convert')\""
+
+# npm verifies every tarball against dist.integrity and fails EINTEGRITY on a
+# mismatch, so CLI-NPM-01 above is the enforcement check and this is the one
+# that says the key was there to enforce. Omitted rather than contradicted is
+# the deliberate case (#358), and it looks identical from the install side.
+e2e_on client "curl -sS --max-time 30 '$E2E_BASE_URL/npm/color-convert/2.0.1'" || true
+check_contains CLI-NPM-05 "the served version document carries dist.integrity" \
+	'"integrity":"sha256-' "$E2E_OUT" "internal/server/npm.go:305" \
+	"curl $E2E_BASE_URL/npm/color-convert/2.0.1"
 
 # ---- cargo -----------------------------------------------------------------
 
 e2e_on client "rm -rf $CLIENT_ROOT/cargo && mkdir -p $CLIENT_ROOT/cargo/src && \
 	printf 'fn main() {}\n' > $CLIENT_ROOT/cargo/src/main.rs && \
-	printf '[package]\nname = \"e2e\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nitoa = \"=1.0.11\"\n' > $CLIENT_ROOT/cargo/Cargo.toml && \
+	printf '[package]\nname = \"e2e\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nform_urlencoded = \"=1.2.2\"\n' > $CLIENT_ROOT/cargo/Cargo.toml && \
 	mkdir -p $CLIENT_ROOT/cargo/.cargo && \
 	printf '[source.crates-io]\nreplace-with = \"bodega\"\n\n[source.bodega]\nregistry = \"sparse+%s/cargo/\"\n' '$E2E_BASE_URL' > $CLIENT_ROOT/cargo/.cargo/config.toml && \
 	cd $CLIENT_ROOT/cargo && cargo fetch --offline 2>/dev/null; cargo fetch 2>&1 | tail -6" || true
 check_eq CLI-CARGO-01 "cargo resolves a crate from the bodega sparse index" 0 "$E2E_RC" \
 	"internal/server/cargo.go:179" "cargo fetch against sparse+$E2E_BASE_URL/cargo/" "$E2E_RC"
+
+# form_urlencoded declares percent-encoding ^2.3.0, and cargo fetches what the
+# index line names and nothing else. A line declaring deps: [] resolves and
+# then fails at compile, which is louder than npm's but arrives just as late.
+e2e_on client "cat $CLIENT_ROOT/cargo/Cargo.lock 2>&1" || true
+check_contains CLI-CARGO-02 "cargo resolves the crate's declared dependency" \
+	"percent-encoding" "$E2E_OUT" "internal/server/cargo.go:177" \
+	"cat Cargo.lock after cargo fetch"
 
 # ---- helm ------------------------------------------------------------------
 

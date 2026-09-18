@@ -55,9 +55,9 @@ e2e_index_check SRV-IDX-gomod "gomod serves @v/list for a hosted module" \
 e2e_index_check SRV-IDX-helm "helm serves index.yaml for a hosted chart" \
 	"/helm/index.yaml" "internal/server/helm.go:28"
 e2e_index_check SRV-IDX-npm "npm serves a packument for a hosted package" \
-	"/npm/left-pad" "internal/server/npm.go:264"
+	"/npm/color-convert" "internal/server/npm.go:264"
 e2e_index_check SRV-IDX-cargo "cargo serves a sparse index entry for a hosted crate" \
-	"/cargo/it/oa/itoa" "internal/server/cargo.go:179"
+	"/cargo/fo/rm/form_urlencoded" "internal/server/cargo.go:179"
 e2e_index_check SRV-IDX-cargo-config "cargo serves config.json" \
 	"/cargo/config.json" "internal/server/cargo.go:44"
 
@@ -74,9 +74,9 @@ e2e_index_check SRV-ART-gomod "gomod serves the module zip" \
 e2e_index_check SRV-ART-helm "helm serves the chart tarball" \
 	"/helm/charts/podinfo-6.7.0.tgz" "internal/server/helm.go:53"
 e2e_index_check SRV-ART-npm "npm serves the tarball" \
-	"/npm/left-pad/-/left-pad-1.3.0.tgz" "internal/server/npm.go:21"
+	"/npm/color-convert/-/color-convert-2.0.1.tgz" "internal/server/npm.go:21"
 e2e_index_check SRV-ART-cargo "cargo serves the crate" \
-	"/cargo/itoa/1.0.11/download" "internal/server/cargo.go:122"
+	"/cargo/form_urlencoded/1.2.2/download" "internal/server/cargo.go:122"
 
 # pypi's wheel filename is resolved rather than assumed: the index is the
 # client's only route to it, and asserting a name the index does not publish

@@ -176,9 +176,15 @@ func TestNpmPackumentIsGeneratedForAHostedPackage(t *testing.T) {
 // requires, and cksum is the digest of the bytes /download serves.
 func TestCargoIndexIsGeneratedForAHostedCrate(t *testing.T) {
 	s := hostedServer(t)
-	addVersion(t, s, manifest.TypeCargo, "itoa", sha256Entry("1.0.11", itoaCrate))
+	withDeps := sha256Entry("1.0.11", itoaCrate)
+	withDeps.Dependencies = []manifest.Dependency{{
+		Name: "percent-encoding", Req: "^2.3.0", Kind: "normal",
+	}}
+	addVersion(t, s, manifest.TypeCargo, "itoa", withDeps)
 	// No recorded checksum: the digest has to come off the stored crate, or
-	// the version is dropped rather than published with an empty cksum.
+	// the version is dropped rather than published with an empty cksum. No
+	// recorded dependencies either, which is the other half of the deps
+	// assertion below.
 	addVersion(t, s, manifest.TypeCargo, "itoa", manifest.VersionEntry{Version: "1.0.10"})
 	seed(t, s, manifest.TypeCargo, map[string]string{
 		manifest.CargoCrateKey("itoa", "1.0.11"): itoaCrate,
@@ -211,8 +217,30 @@ func TestCargoIndexIsGeneratedForAHostedCrate(t *testing.T) {
 		}
 		// deps and features are required members of cargo's record, and a
 		// null for either fails to deserialize before the crate is reached.
-		if deps, ok := rec["deps"].([]any); !ok || len(deps) != 0 {
-			t.Errorf("%s: deps = %v, want an empty list", vers, rec["deps"])
+		// deps is the list the fetch recorded, so 1.0.11 publishes its one
+		// dependency and 1.0.10, which recorded none, publishes [].
+		deps, ok := rec["deps"].([]any)
+		if !ok {
+			t.Fatalf("%s: deps = %v, want a list", vers, rec["deps"])
+		}
+		if vers == "1.0.11" {
+			if len(deps) != 1 {
+				t.Fatalf("%s: deps = %v, want the one recorded dependency", vers, deps)
+			}
+			dep, _ := deps[0].(map[string]any)
+			for key, want := range map[string]any{
+				"name": "percent-encoding", "req": "^2.3.0", "kind": "normal",
+				"optional": false, "default_features": false, "target": nil,
+			} {
+				if dep[key] != want {
+					t.Errorf("%s: deps[0].%s = %v, want %v", vers, key, dep[key], want)
+				}
+			}
+			if f, ok := dep["features"].([]any); !ok || len(f) != 0 {
+				t.Errorf("%s: deps[0].features = %v, want an empty list rather than null", vers, dep["features"])
+			}
+		} else if len(deps) != 0 {
+			t.Errorf("%s: deps = %v, want an empty list for a version that recorded none", vers, deps)
 		}
 		if features, ok := rec["features"].(map[string]any); !ok || len(features) != 0 {
 			t.Errorf("%s: features = %v, want an empty object", vers, rec["features"])
