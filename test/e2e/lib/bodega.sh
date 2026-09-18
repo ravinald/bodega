@@ -49,7 +49,14 @@ e2e_config_set() {
 # e2e_restart <alias> [seconds] — restart and wait for the listener to answer.
 e2e_restart() {
 	local alias="$1" budget="${2:-30}" waited=0
-	e2e_on "$alias" "sudo systemctl restart bodega" || return 1
+	# reset-failed first, always. systemd's default start limit is 5 starts in
+	# 10 seconds and a suite walking several postures reaches that on a healthy
+	# service; once the limit trips, every later restart in the run is refused
+	# before the process is even forked. The suite then reports a config change
+	# that never took effect as a server that will not start, which sends the
+	# reader to the wrong half of the system. A unit that genuinely cannot start
+	# still fails the health poll below, so nothing is masked.
+	e2e_on "$alias" "sudo systemctl reset-failed bodega; sudo systemctl restart bodega" || return 1
 	while [ "$waited" -lt "$budget" ]; do
 		if e2e_on "$alias" "curl -sf -o /dev/null --max-time 5 http://127.0.0.1:8080/healthz" >/dev/null 2>&1; then
 			return 0
