@@ -165,6 +165,11 @@ func relabelFixture(t *testing.T, objectOn ...string) {
 		"storage_backend": "local",
 		"storage_path":    defaultPath,
 		"manifest_dir":    manifestDir,
+		// Omitting log_dir defaults it to /var/log/bodega, and edit
+		// write-tests the directory before it will accept a relabel: on a host
+		// with bodega installed that path is root-owned and the refusal names
+		// a permission rather than the storage change under test.
+		"log_dir": t.TempDir(),
 		"storage_backends": map[string]any{
 			"bulk": map[string]string{"driver": "local", "path": bulkPath},
 		},

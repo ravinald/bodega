@@ -35,6 +35,7 @@ import (
 // a missing call site looks exactly like a verb that does not need one.
 // Here it looks like a build failure instead.
 func TestEveryRunnableCommandIsClassified(t *testing.T) {
+	loadFrom(t, "{}")
 	var missing []string
 	var walk func(*cobra.Command)
 	walk = func(cmd *cobra.Command) {
@@ -68,6 +69,7 @@ func TestEveryRunnableCommandIsClassified(t *testing.T) {
 // from the root's own RunE. It must not lend it downward, or the next verb
 // registered without one inherits "quiet" and the guard above passes on it.
 func TestRootIsClassifiedAndDoesNotDescend(t *testing.T) {
+	loadFrom(t, "{}")
 	root := newRootCmd()
 	if intent, ok := reloadIntent(root); !ok || intent != reloadQuiet {
 		t.Errorf("root = %q (found=%v), want %q", intent, ok, reloadQuiet)
@@ -83,6 +85,7 @@ func TestRootIsClassifiedAndDoesNotDescend(t *testing.T) {
 // TestWithdrawalVerbsSignal names the four that did not. Only hide is driven
 // end to end below; this is what says the other three sit on the same path.
 func TestWithdrawalVerbsSignal(t *testing.T) {
+	loadFrom(t, "{}")
 	want := map[string]string{
 		"pkg hide":    reloadSignal,
 		"pkg freeze":  reloadSignal,
@@ -109,6 +112,7 @@ func TestWithdrawalVerbsSignal(t *testing.T) {
 // subtree's quiet, leaving a running server serving the pre-rescan stamp for
 // the life of the process.
 func TestManifestWritingVerbsSignal(t *testing.T) {
+	loadFrom(t, "{}")
 	root := newRootCmd()
 	for _, path := range []string{"policy osv rescan"} {
 		cmd, _, err := root.Find(strings.Fields(path))

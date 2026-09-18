@@ -14,6 +14,7 @@ import (
 // the audit DB, so these drive RunE with no store behind it.
 
 func TestPolicyOSVSet_RefusesUnmappedEcosystem(t *testing.T) {
+	loadFrom(t, "{}")
 	cmd := newPolicyOSVSetCmd(&globalFlags{})
 	err := cmd.RunE(cmd, []string{"helm", "block"})
 	if err == nil {
@@ -27,6 +28,7 @@ func TestPolicyOSVSet_RefusesUnmappedEcosystem(t *testing.T) {
 }
 
 func TestPolicyAgeSet_RefusesUnmappedEcosystem(t *testing.T) {
+	loadFrom(t, "{}")
 	cmd := newPolicyAgeSetCmd(&globalFlags{})
 	err := cmd.RunE(cmd, []string{"apt", "7d", "warn"})
 	if err == nil {
