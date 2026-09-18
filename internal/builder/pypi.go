@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -902,6 +903,122 @@ func verifyPypiWheels(reqPath, wheelsDir string) error {
 	return nil
 }
 
+// prunePypiWheels removes a pinned distribution's wheels at versions no pin
+// names.
+//
+// pip writes into a flat --wheel-dir and removes nothing it did not just
+// produce, so a re-pin from 1.17.0 to 1.16.0 leaves both wheels there:
+// MANIFEST.sha256 attests both, the sync uploads both, and the simple index
+// publishes both. verifyPypiWheels passes that directory, correctly — the
+// pinned version is present — which is why this is a separate job rather than
+// a stricter version of that check.
+//
+// An orphan already in object storage is not reached from here. Client.SyncDir
+// is upload-only, so nothing a local prune does deletes the key a client
+// resolves against.
+func prunePypiWheels(out io.Writer, reqPath, wheelsDir string) error {
+	pins, err := pypiPins(reqPath)
+	if err != nil {
+		return fmt.Errorf("read the pins back from %s: %w", reqPath, err)
+	}
+	if len(pins) == 0 {
+		return nil
+	}
+	whlFiles, err := filepath.Glob(filepath.Join(wheelsDir, "*.whl"))
+	if err != nil {
+		return err
+	}
+	for _, whl := range whlFiles {
+		name, version, ok := parseWheelName(filepath.Base(whl))
+		if !ok {
+			continue
+		}
+		want, pinned := pins[name]
+		if !pinned || samePyVersion(version, want) {
+			continue
+		}
+		if err := os.Remove(whl); err != nil {
+			return fmt.Errorf("remove %s, which no manifest version names: %w", filepath.Base(whl), err)
+		}
+		_, _ = fmt.Fprintf(out, "    Removed %s: the manifest names %s at %s\n", filepath.Base(whl), name, want)
+	}
+	return nil
+}
+
+// reconcileWheelManifest reports whether MANIFEST.sha256 and the wheels on disk
+// are the same set at the same digests.
+//
+// Bidirectional, on the same terms as verifyPypiClosure: a line naming a wheel
+// that is gone attests bytes nobody holds, and a wheel with no line ships
+// unattested. Either way the file is stale and the package stage has to write
+// it again, which its existence cannot report.
+func reconcileWheelManifest(wheelsDir, manifestPath string) error {
+	recorded, err := readWheelManifest(manifestPath)
+	if err != nil {
+		return err
+	}
+	whlFiles, err := filepath.Glob(filepath.Join(wheelsDir, "*.whl"))
+	if err != nil {
+		return err
+	}
+
+	seen := make(map[string]bool, len(recorded))
+	for _, whl := range whlFiles {
+		base := filepath.Base(whl)
+		want, ok := recorded[base]
+		if !ok {
+			return fmt.Errorf("pypi: %s holds %s, which %s attests nothing for",
+				wheelsDir, base, filepath.Base(manifestPath))
+		}
+		got, err := computeFileSHA256(whl)
+		if err != nil {
+			return err
+		}
+		if got != want {
+			return fmt.Errorf("pypi: %s no longer matches the digest in %s: recorded=%s on disk=%s",
+				base, filepath.Base(manifestPath), want, got)
+		}
+		seen[base] = true
+	}
+	missing := make([]string, 0, len(recorded))
+	for base := range recorded {
+		if !seen[base] {
+			missing = append(missing, base)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return fmt.Errorf("pypi: %s attests %s and %s holds no such file",
+			filepath.Base(manifestPath), strings.Join(missing, ", "), wheelsDir)
+	}
+	return nil
+}
+
+// readWheelManifest parses the "<sha256>  <filename>" lines generateWheelManifest
+// writes, keyed by filename.
+func readWheelManifest(path string) (map[string]string, error) {
+	f, err := os.Open(path) //nolint:gosec // the path is the build root's own
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+
+	recorded := make(map[string]string)
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		digest, name, ok := strings.Cut(line, "  ")
+		if !ok {
+			return nil, fmt.Errorf("%s: %q is not a checksum line", filepath.Base(path), line)
+		}
+		recorded[strings.TrimSpace(name)] = strings.TrimSpace(digest)
+	}
+	return recorded, scanner.Err()
+}
+
 // samePyVersion compares two version strings under PEP 440, falling back to
 // string equality for the legacy versions no parser will read.
 func samePyVersion(a, b string) bool {
@@ -947,11 +1064,16 @@ func CheckPypiStage(cfg *Config, store *manifest.Store) StageStatus {
 		s.Built = len(whlFiles) > 0
 
 		if s.Built {
-			// Packaged = MANIFEST.sha256 exists.
+			// Packaged = MANIFEST.sha256 reconciles with the wheels on disk.
+			//
+			// Its existence answers a different question. The build prunes a
+			// wheel a re-pin orphaned and pip writes the replacement beside
+			// it, so a file left by an earlier run attests a set that is no
+			// longer there — and the run that changed the set would skip the
+			// stage that would have corrected it. CheckGitStage opens its
+			// bundle for the same reason.
 			manifestFile := filepath.Join(wheelsDir, "MANIFEST.sha256")
-			if fi, err := os.Stat(manifestFile); err == nil && !fi.IsDir() {
-				s.Packaged = true
-			}
+			s.Packaged = reconcileWheelManifest(wheelsDir, manifestFile) == nil
 		}
 	}
 
@@ -1363,6 +1485,18 @@ func BuildPypi(cfg *Config, store *manifest.Store) *Summary {
 	// depth can switch the index back on. --find-links appends unconditionally,
 	// which is why --require-hashes is here too: a link pip was handed by some
 	// other route still cannot produce bytes the fetch did not record.
+	// Stale wheels go before pip writes beside them, never after: pruning the
+	// output would delete a version pip substituted and leave verifyPypiWheels
+	// with nothing to refuse.
+	if err := prunePypiWheels(out, combinedReq, wheelsDir); err != nil {
+		result.Err = err
+		_, _ = fmt.Fprintf(out, "    FAILED: %v\n", err)
+		summary.Failures++
+		summary.Results = append(summary.Results, result)
+		summary.Total++
+		return summary
+	}
+
 	_, _ = fmt.Fprintf(out, "\n>>> [pypi] build — building wheels from %s (C extensions will compile from source)\n", house)
 	if err := runCmdEnv(out, "", pipEnv,
 		pipBin, "wheel",

@@ -95,6 +95,13 @@ func FetchHelm(cfg *Config, store *manifest.Store, entryFilter string) *Summary 
 			if err := downloadURL(dest, ve.URL); err != nil {
 				_, _ = fmt.Fprintf(out, "  [helm] %s: ERROR: %v\n", name, err)
 				result.Err = err
+			} else if err := verifyHelmChartVersion(dest, name, ve.Version); err != nil {
+				// Removed rather than left where it landed: CheckHelmStage
+				// calls a chart at this path fetched, so the next run would
+				// take the skip path over bytes this one refused.
+				_ = os.Remove(dest)
+				_, _ = fmt.Fprintf(out, "  [helm] %s: ERROR: %v\n", name, err)
+				result.Err = err
 			} else {
 				result.Artifacts = append(result.Artifacts, dest)
 
@@ -147,8 +154,11 @@ func FetchHelm(cfg *Config, store *manifest.Store, entryFilter string) *Summary 
 }
 
 // PackageHelm generates an index.yaml from all fetched chart archives.
-// This is a simplified implementation that creates entries based on manifest
-// data rather than parsing Chart.yaml from each tarball.
+//
+// Entries are rendered from manifest data rather than re-read out of each
+// tarball, which holds because the fetch refuses an archive whose Chart.yaml
+// disagrees with the entry. A chart on disk that the fetch did not put there
+// is the remaining gap: appVersion here is still the manifest's word.
 func PackageHelm(cfg *Config, store *manifest.Store) *Summary {
 	ctx := context.Background()
 	summary := &Summary{}

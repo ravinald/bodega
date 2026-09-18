@@ -128,10 +128,15 @@ func fanoutServerRouted(t *testing.T, byType map[string]string, stores ...storag
 			t.Fatalf("AddVersion: %v", err)
 		}
 	}
+	// Every stored version is named by the manifest, including the one on the
+	// unreachable backend: the per-package index publishes only versions an
+	// entry names, so a version missing from the manifest would be absent for
+	// a reason these tests are not about.
 	seed("1.0", "")
 	if len(stores) > 1 {
 		seed("2.0", stores[1].Name)
 	}
+	seed("3.0", "")
 	cfg := &config.Config{ManifestDir: "manifests", AptCodename: "noble", MetadataTTL: "1h"}
 	resolver := &multiResolver{stores: stores, byType: byType}
 	ts := httptest.NewServer(server.New(cfg, store, resolver, ":0", nil).Handler())

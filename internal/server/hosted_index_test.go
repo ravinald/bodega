@@ -453,3 +453,49 @@ func TestNpmVersionRouteAppliesVersionPolicy(t *testing.T) {
 		t.Errorf("GET a version no entry names = %d, want 404: %s", status, body)
 	}
 }
+
+// R4: a recorded sha256 that is not the stored crate's must never reach the
+// index. It is a full, well-formed digest, so nothing syntactic catches it,
+// and cargo verifies the download against it and reports a corrupt crate
+// against bytes /download served intact.
+func TestCargoIndexNeverPublishesAChecksumTheStoredCrateContradicts(t *testing.T) {
+	s := hostedServer(t)
+	stale := sha256Hex("bytes no crate here holds")
+	addVersion(t, s, manifest.TypeCargo, "itoa", sha256Entry("1.0.11", itoaCrate))
+	addVersion(t, s, manifest.TypeCargo, "itoa", manifest.VersionEntry{
+		Version:  "1.0.10",
+		Checksum: &manifest.Checksum{Algorithm: "sha256", Value: stale},
+	})
+	seed(t, s, manifest.TypeCargo, map[string]string{
+		manifest.CargoCrateKey("itoa", "1.0.11"): itoaCrate,
+		manifest.CargoCrateKey("itoa", "1.0.10"): itoaOldCrate,
+	})
+
+	status, body := getStatusAndBody(t, s, "/cargo/it/oa/itoa")
+	if status != http.StatusOK {
+		t.Fatalf("GET /cargo/it/oa/itoa = %d, want 200: %s", status, body)
+	}
+	if strings.Contains(body, stale) {
+		t.Errorf("the index published a checksum the stored crate contradicts: %s", body)
+	}
+	// Dropped or corrected, either answers the requirement; published as the
+	// stale value it does not.
+	for _, rec := range cargoIndexRecords(t, body) {
+		if rec["vers"] == "1.0.10" && rec["cksum"] != sha256Hex(itoaOldCrate) {
+			t.Errorf("1.0.10 is in the index with cksum %v, want the stored crate's %s or no line at all",
+				rec["cksum"], sha256Hex(itoaOldCrate))
+		}
+	}
+	// The version whose recorded digest does agree is untouched, and the bytes
+	// it names are the bytes /download serves.
+	if !strings.Contains(body, sha256Hex(itoaCrate)) {
+		t.Fatalf("1.0.11 lost its line to a sibling's bad checksum: %s", body)
+	}
+	dStatus, dBody := getStatusAndBody(t, s, "/cargo/itoa/1.0.11/download")
+	if dStatus != http.StatusOK {
+		t.Fatalf("GET /cargo/itoa/1.0.11/download = %d, want 200: %s", dStatus, dBody)
+	}
+	if dBody != itoaCrate {
+		t.Errorf("the crate route served %q, want the bytes cksum names", dBody)
+	}
+}

@@ -746,3 +746,69 @@ func DropVersionlessAptEntries(ctx context.Context, store *manifest.Store, pkgNa
 	}
 	return blank, nil
 }
+
+// aptPolicyVersions reads every version the local cache offers out of the
+// `Version table:` block of `apt-cache policy` output.
+//
+// `Candidate:` names one version, and taking it is how a pinned entry becomes
+// whatever the archive serves today. The table is the only place the rest
+// appear, and an operator re-pinning needs to be told what is actually there.
+func aptPolicyVersions(policyOut string) []string {
+	var versions []string
+	inTable := false
+	for _, line := range strings.Split(policyOut, "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case trimmed == "Version table:":
+			inTable = true
+			continue
+		case trimmed == "":
+			continue
+		case !inTable:
+			continue
+		case strings.HasSuffix(trimmed, ":") && !strings.Contains(trimmed, " "):
+			// A second package block in the same output.
+			inTable = false
+			continue
+		}
+		fields := strings.Fields(trimmed)
+		if len(fields) > 0 && fields[0] == "***" {
+			fields = fields[1:]
+		}
+		// A version row is "<version> <priority>". The origin rows nested under
+		// it lead with the priority instead, so a leading integer is the split.
+		if len(fields) < 2 || isAllASCIIDigits(fields[0]) {
+			continue
+		}
+		versions = append(versions, fields[0])
+	}
+	return versions
+}
+
+func isAllASCIIDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// aptOfferedVersions queries the local cache for every version of a package.
+//
+// The bool reports whether the cache could be asked at all, which is not the
+// same answer as a cache that knows nothing about the package: the first must
+// not fail an entry, the second must.
+func aptOfferedVersions(pkgName string) ([]string, bool) {
+	if _, err := exec.LookPath("apt-cache"); err != nil {
+		return nil, false
+	}
+	out, err := exec.Command("apt-cache", "policy", pkgName).Output()
+	if err != nil {
+		return nil, false
+	}
+	return aptPolicyVersions(string(out)), true
+}
