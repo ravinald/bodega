@@ -264,9 +264,11 @@ func ensureFetchedCargo(bcfg *builder.Config, store *manifest.Store, entryFilter
 	return builder.MergeSummaries(ss...)
 }
 
-// ensurePackagedNpm cascades fetch → package (per-package packument.json).
+// ensureFetchedNpm fetches any missing tarballs. npm has no package stage:
+// the server generates the packument from the manifest entry per request, so
+// there is nothing between a fetched tarball and an upload.
 // Short-circuits when no npm entries are configured.
-func ensurePackagedNpm(bcfg *builder.Config, store *manifest.Store, entryFilter string) *builder.Summary {
+func ensureFetchedNpm(bcfg *builder.Config, store *manifest.Store, entryFilter string) *builder.Summary {
 	if len(store.ListPackages(manifest.TypeNpm)) == 0 {
 		fmt.Println("    No npm entries in manifest — skipping")
 		return &builder.Summary{}
@@ -291,12 +293,7 @@ func ensurePackagedNpm(bcfg *builder.Config, store *manifest.Store, entryFilter 
 			}
 		}
 	}
-	fetchSummary := builder.MergeSummaries(ss...)
-	if fetchSummary.HasFailures() {
-		return fetchSummary
-	}
-	pkgSummary := builder.PackageNpm(bcfg, store)
-	return builder.MergeSummaries(fetchSummary, pkgSummary)
+	return builder.MergeSummaries(ss...)
 }
 
 // ensurePackagedPypi cascades fetch → build → package as needed. When no pypi
@@ -353,7 +350,7 @@ func ensureUploadable(t string, bcfg *builder.Config, store *manifest.Store) err
 	case manifest.TypeHelm:
 		s = ensurePackagedHelm(bcfg, store, "")
 	case manifest.TypeNpm:
-		s = ensurePackagedNpm(bcfg, store, "")
+		s = ensureFetchedNpm(bcfg, store, "")
 	case manifest.TypeCargo:
 		s = ensureFetchedCargo(bcfg, store, "")
 	default:

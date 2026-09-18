@@ -162,11 +162,10 @@ func runBuildStage(buf *bytes.Buffer, bc *builder.Config, store *manifest.Store,
 
 // runPackageStage runs only the package step for a single entry type/name.
 //
-// helm and npm package into repository metadata rather than per-entry
-// archives: PackageHelm regenerates index.yaml and PackageNpm the packuments,
-// both across the whole type, so neither takes an entry filter. Skipping them
-// left the server serving an index that named no new chart while the stage
-// reported success.
+// helm packages into repository metadata rather than per-entry archives:
+// PackageHelm regenerates index.yaml across the whole type, so it takes no
+// entry filter. Skipping it left the server serving an index that named no new
+// chart while the stage reported success.
 func runPackageStage(buf *bytes.Buffer, bc *builder.Config, store *manifest.Store, entryType, entryName string) error {
 	totalFail := 0
 	switch entryType {
@@ -186,14 +185,12 @@ func runPackageStage(buf *bytes.Buffer, bc *builder.Config, store *manifest.Stor
 		s := builder.PackageHelm(bc, store)
 		s.Print(buf)
 		totalFail += s.Failures
-	case manifest.TypeNpm:
-		s := builder.PackageNpm(bc, store)
-		s.Print(buf)
-		totalFail += s.Failures
 	case manifest.TypeBinary:
 		fmt.Fprintf(buf, "No separate package step for binary — binaries are uploaded directly.\n")
 	case manifest.TypeGomod:
 		fmt.Fprintf(buf, "No separate package step for gomod — the fetched module zips are what ships.\n")
+	case manifest.TypeNpm:
+		fmt.Fprintf(buf, "No separate package step for npm — the server generates the packument from the manifest entry.\n")
 	case manifest.TypeCargo:
 		fmt.Fprintf(buf, "No separate package step for cargo — clients read the proxied sparse index.\n")
 	default:

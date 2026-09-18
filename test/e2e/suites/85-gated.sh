@@ -106,9 +106,9 @@ E2E_SSH_TIMEOUT=1800 e2e_on server "cd $WORK && TMPDIR=$GOTMP BODEGA_SINK_LOAD=1
 check_eq GAT-08 "the audit sink load harness runs" 0 "$E2E_RC" \
 	"internal/server/sink_load_test.go:38" "BODEGA_SINK_LOAD=1 go test -run SinkLoad ./internal/server/" "$E2E_RC"
 
-E2E_SSH_TIMEOUT=1800 e2e_on server "cd $WORK && TMPDIR=$GOTMP BODEGA_PROXY_RSS=1 $GO test -count=1 -run 'ProxyRSS' ./internal/server/ 2>&1 | tail -25" || true
+E2E_SSH_TIMEOUT=1800 e2e_on server "cd $WORK && TMPDIR=$GOTMP BODEGA_PROXY_RSS=1 $GO test -count=1 -run 'TestProxyPeakRSS' ./internal/server/ 2>&1 | tail -25" || true
 check_eq GAT-09 "the proxy RSS harness runs" 0 "$E2E_RC" \
-	"internal/server/proxy_rss_test.go:50" "BODEGA_PROXY_RSS=1 go test -run ProxyRSS ./internal/server/" "$E2E_RC"
+	"internal/server/proxy_rss_test.go:49" "BODEGA_PROXY_RSS=1 go test -run TestProxyPeakRSS ./internal/server/" "$E2E_RC"
 
 E2E_SSH_TIMEOUT=2400 e2e_on server "cd $WORK && TMPDIR=$GOTMP BODEGA_OSV_LIVE=1 $GO test -count=1 ./internal/policy/ 2>&1 | tail -25" || true
 check_eq GAT-10 "the live OSV comparison runs against api.osv.dev" 0 "$E2E_RC" \

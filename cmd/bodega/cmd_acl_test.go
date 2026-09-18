@@ -216,7 +216,12 @@ func TestACLRemoveRawDeletesAnUnparseableRow(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "audit.db")
 	cfgPath := filepath.Join(dir, "config.json")
-	if err := os.WriteFile(cfgPath, []byte(`{"audit_db":`+strconv.Quote(dbPath)+`}`), 0o644); err != nil {
+	// manifest_dir as well as audit_db: ensureMutable probes both, and an
+	// unset manifest_dir resolves to the installed default, which is
+	// root-owned on a host that has bodega installed.
+	cfgJSON := `{"audit_db":` + strconv.Quote(dbPath) +
+		`,"manifest_dir":` + strconv.Quote(filepath.Join(dir, "manifests")) + `}`
+	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 	t.Setenv("BODEGA_CONFIG_FILE", cfgPath)

@@ -106,7 +106,7 @@ func newRootCmd() *cobra.Command {
   git     Git repositories bundled at a specific ref, or mirrored for clone
   gomod   Go modules from a module proxy
   helm    Helm charts from a chart repository
-  npm     npm packages and their packuments
+  npm     npm packages from a registry
   pypi    Python wheels built from a requirements set
 
 Artifact bytes live in a storage backend: "local" (a directory) or "s3".

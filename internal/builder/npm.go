@@ -1,14 +1,11 @@
 package builder
 
 import (
-	"archive/tar"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -251,76 +248,12 @@ func FetchNpm(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 	return summary
 }
 
-// npmVersionEntry pairs a package name with its VersionEntry for packument building.
-type npmVersionEntry struct {
-	name string
-	ve   manifest.VersionEntry
-}
-
-// PackageNpm generates packument JSON files for each npm package by reading
-// package.json from the tarballs. The packument is pre-computed and cached
-// in S3 so the server can serve it without per-request tarball extraction.
-func PackageNpm(cfg *Config, store *manifest.Store) *Summary {
-	ctx := context.Background()
-	summary := &Summary{}
-	d := buildDirs(cfg.rootFor(manifest.TypeNpm))
-	out := cfg.stdout()
-
-	for _, name := range store.ListPackages(manifest.TypeNpm) {
-		pm, err := store.GetPackage(ctx, manifest.TypeNpm, name)
-		if err != nil || pm == nil {
-			continue
-		}
-
-		_, _ = fmt.Fprintf(out, "  [npm] %s: generating packument\n", pm.Name)
-
-		// pm.Name is the canonical name (e.g. "@bitwarden/cli"); `name` from the
-		// index is safe-encoded (e.g. "@bitwarden--cli") and unfit for the
-		// packument that clients consume.
-		var entries []npmVersionEntry
-		for _, ve := range pm.Versions {
-			entries = append(entries, npmVersionEntry{name: pm.Name, ve: ve})
-		}
-
-		packument := buildPackument(pm.Name, entries, d)
-
-		dir := filepath.Join(d.npm, name)
-		if err := mkdirAll(dir); err != nil {
-			cfg.logf("ERROR creating dir %s: %v", dir, err)
-			summary.Failures++
-			summary.Total++
-			continue
-		}
-
-		path := filepath.Join(dir, "packument.json")
-		data, err := json.MarshalIndent(packument, "", "  ")
-		if err != nil {
-			cfg.logf("ERROR marshaling packument for %s: %v", name, err)
-			summary.Failures++
-			summary.Total++
-			continue
-		}
-		if err := os.WriteFile(path, data, 0o644); err != nil {
-			cfg.logf("ERROR writing packument for %s: %v", name, err)
-			summary.Failures++
-			summary.Total++
-			continue
-		}
-
-		summary.Total++
-		_, _ = fmt.Fprintf(out, "  [npm] %s: packument written (%d version(s))\n", name, len(entries))
-	}
-
-	return summary
-}
-
 // NpmArtifactPaths returns local/S3 path pairs for upload.
 func NpmArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) []ArtifactPath {
 	ctx := context.Background()
 	d := buildDirs(cfg.rootFor(manifest.TypeNpm))
 	var paths []ArtifactPath
 
-	seen := make(map[string]bool)
 	for _, name := range store.ListPackages(manifest.TypeNpm) {
 		if entryFilter != "" && name != entryFilter {
 			continue
@@ -332,7 +265,6 @@ func NpmArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) []
 		}
 
 		for _, ve := range pm.Versions {
-			// Tarball.
 			local := npmTarballPath(d, name, ve)
 			if fileExists(local) {
 				paths = append(paths, ArtifactPath{
@@ -342,116 +274,8 @@ func NpmArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) []
 					Version:   ve.Version,
 				})
 			}
-
-			// Packument (once per package name).
-			if !seen[name] {
-				seen[name] = true
-				packumentPath := filepath.Join(npmLocalDir(d, name, ve), "packument.json")
-				if fileExists(packumentPath) {
-					paths = append(paths, ArtifactPath{
-						Local:     packumentPath,
-						ObjectKey: manifest.NpmPackumentKey(pm.Name),
-					})
-				}
-			}
 		}
 	}
 
 	return paths
-}
-
-// packument is the npm registry metadata document.
-type packument struct {
-	Name     string                    `json:"name"`
-	DistTags map[string]string         `json:"dist-tags"`
-	Versions map[string]packumentEntry `json:"versions"`
-}
-
-type packumentEntry struct {
-	Name    string          `json:"name"`
-	Version string          `json:"version"`
-	Dist    packumentDist   `json:"dist"`
-	Main    string          `json:"main,omitempty"`
-	Extra   json.RawMessage `json:"-"` // unused, for future expansion
-}
-
-type packumentDist struct {
-	Tarball string `json:"tarball"`
-}
-
-// buildPackument creates a packument from version entries and local tarballs.
-func buildPackument(name string, entries []npmVersionEntry, d dirs) packument {
-	p := packument{
-		Name:     name,
-		DistTags: make(map[string]string),
-		Versions: make(map[string]packumentEntry),
-	}
-
-	var latestVersion string
-	for _, nve := range entries {
-		tarballName := npmTarballFilename(nve.name, nve.ve)
-		tarballPath := filepath.Join(d.npm, nve.name, tarballName)
-
-		pe := packumentEntry{
-			Name:    nve.name,
-			Version: nve.ve.Version,
-			Dist: packumentDist{
-				// Relative URL — the server's base URL is prepended by clients.
-				Tarball: nve.name + "/-/" + tarballName,
-			},
-		}
-
-		// Try to read main field from package.json inside tarball.
-		if meta := readPackageJSON(tarballPath); meta != nil {
-			if m, ok := meta["main"].(string); ok {
-				pe.Main = m
-			}
-		}
-
-		p.Versions[nve.ve.Version] = pe
-		latestVersion = nve.ve.Version
-	}
-
-	if latestVersion != "" {
-		p.DistTags["latest"] = latestVersion
-	}
-
-	return p
-}
-
-// readPackageJSON extracts and parses package.json from an npm tarball.
-// Returns nil on any error (best-effort).
-func readPackageJSON(tarballPath string) map[string]interface{} {
-	f, err := os.Open(tarballPath)
-	if err != nil {
-		return nil
-	}
-	defer func() { _ = f.Close() }()
-
-	gz, err := gzip.NewReader(f)
-	if err != nil {
-		return nil
-	}
-	defer func() { _ = gz.Close() }()
-
-	tr := tar.NewReader(gz)
-	for {
-		hdr, err := tr.Next()
-		if err != nil {
-			return nil
-		}
-		// npm tarballs have package/package.json at the root.
-		base := filepath.Base(hdr.Name)
-		if base == "package.json" && strings.Count(hdr.Name, "/") <= 1 {
-			data, err := io.ReadAll(tr)
-			if err != nil {
-				return nil
-			}
-			var meta map[string]interface{}
-			if err := json.Unmarshal(data, &meta); err != nil {
-				return nil
-			}
-			return meta
-		}
-	}
 }

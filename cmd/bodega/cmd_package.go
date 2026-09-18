@@ -25,13 +25,12 @@ been completed yet.
   pypi    Generate MANIFEST.sha256 for the wheels directory
           (fetches and builds if needed)
   helm    Generate index.yaml across every fetched chart
-  npm     Generate the packuments across every fetched package
+  npm     No-op (the server generates the packument from the manifest entry)
   gomod   No-op (the downloaded module zip is already the artifact)
   cargo   No-op (the downloaded crate tarball is already the artifact)
 
-helm and npm package across the whole type rather than per entry, because
-index.yaml and the packuments are repository metadata: naming one entry
-regenerates everything.
+helm packages across the whole type rather than per entry, because index.yaml
+is repository metadata: naming one entry regenerates everything.
 
 ` + typeOrderSentence("packaged") + `
 
@@ -118,9 +117,9 @@ When a name is given after the type, only that entry is packaged.`,
 					)
 
 				case manifest.TypeNpm:
-					// Cascade: fetch any missing tarballs, then regenerate packuments.
+					// npm has no package stage — the server generates the packument per request.
 					allSummaries = append(allSummaries,
-						ensurePackagedNpm(bcfg, store, entryFilter),
+						ensureFetchedNpm(bcfg, store, entryFilter),
 					)
 
 				case manifest.TypeCargo:

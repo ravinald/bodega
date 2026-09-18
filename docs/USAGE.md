@@ -3911,7 +3911,7 @@ The table sizes its columns from the rows it is showing, not from a fixed width,
 
 ### Build stages
 
-The build menu dispatches all eight entry types. Only `apt` and `pypi` have a build step and only `apt`, `git`, `pypi`, `helm` and `npm` have a package step; the rest say which stage does not apply to them rather than reporting an empty success. `helm` and `npm` package across the whole type — `index.yaml` and the packuments are repository metadata, not per-entry archives — so those two stages ignore the selected entry and regenerate everything.
+The build menu dispatches all eight entry types. Only `apt` and `pypi` have a build step and only `apt`, `git`, `pypi` and `helm` have a package step; the rest say which stage does not apply to them rather than reporting an empty success. `helm` packages across the whole type — `index.yaml` is repository metadata, not a per-entry archive — so that stage ignores the selected entry and regenerates everything.
 
 ---
 
