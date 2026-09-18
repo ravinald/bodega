@@ -175,9 +175,17 @@ Rules the harness enforces or depends on:
 - **A suite that needs a value another suite produced must tolerate its
   absence**, because `--suite` can filter the producer away. `run.sh` declares
   the shared ones empty for this reason.
-- **Restore what you changed.** `60-access` puts the admin list back to
-  loopback; `65-proxy` puts the proxy back off. A suite that left the proxy on
-  would let a later "hosted" check pass on an upstream fetch.
+- **Restore what you changed, and check the restore.** `60-access` puts the
+  admin list back to loopback; `65-proxy` puts the proxy back off and empties
+  both `git_upstreams` and `binary_upstreams`, each with a check of its own. A
+  suite that left the proxy on would let a later "hosted" check pass on an
+  upstream fetch, and one that left an upstream namespace configured would
+  answer a later hosted check out of a namespace it invented.
+- **Restarts are rate-limited.** systemd allows 5 starts per 10 seconds by
+  default, and a suite walking several postures reaches that on a healthy
+  service. `e2e_restart` clears the counter before every restart; a suite that
+  restarts by hand will report a refused start as a server that will not come
+  up.
 - **Assert the thing, not a proxy for it.** `PIPE-VERSION` reads the artifact on
   disk rather than asking `show pkg` what version it holds: the manifest-side
   form compares the manifest with itself and passed a store holding a 1.17.0
