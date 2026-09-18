@@ -206,6 +206,7 @@ func FetchCargo(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 						summary.Failures++
 						summary.Results = append(summary.Results, Result{Type: manifest.TypeCargo, Name: name, Err: err})
 					}
+					backfillCargoRecord(ctx, cfg, store, pm, name, ve, cargoCratePath(d, name, ve))
 					continue
 				}
 			}
@@ -297,6 +298,48 @@ func FetchCargo(cfg *Config, store *manifest.Store, entryFilter string) *Summary
 	}
 
 	return summary
+}
+
+// backfillCargoRecord fills in a dependency list or an artifact digest the
+// entry is missing, for a crate already on disk.
+//
+// Same hole as the npm side: the record lives in the manifest and the bytes on
+// the filesystem, so re-importing a manifest onto a host that already holds
+// the crates resets every entry while the stage check still reports fetched.
+// The index bodega then publishes declares deps: [], which is the state this
+// item exists to end, reached by a route that reports nothing wrong.
+//
+// Only ever fills, never clears.
+func backfillCargoRecord(ctx context.Context, cfg *Config, store *manifest.Store,
+	pm *manifest.PackageManifest, name string, ve manifest.VersionEntry, crate string) {
+	if len(ve.Dependencies) > 0 && ve.ArtifactDigest != "" {
+		return
+	}
+	if !fileExists(crate) {
+		return
+	}
+
+	var deps []manifest.Dependency
+	if len(ve.Dependencies) == 0 {
+		d, err := cargoIndexDeps(cfg, pm.Name, ve.Version)
+		if err != nil {
+			cfg.logf("  [cargo] %s@%s: WARNING: no dependency record: %v", pm.Name, ve.Version, err)
+		} else {
+			deps = d
+		}
+	}
+
+	digest := ve.ArtifactDigest
+	if digest == "" {
+		if computed, err := computeFileSHA256(crate); err == nil {
+			digest = computed
+		}
+	}
+	if len(deps) == 0 && digest == ve.ArtifactDigest {
+		return
+	}
+	cfg.logf("  [cargo] %s@%s: recorded %d dependencies from the upstream index", pm.Name, ve.Version, len(deps))
+	stampFetchRecord(ctx, store, manifest.TypeCargo, name, ve, crate, digest, deps)
 }
 
 // CargoArtifactPaths returns local/S3 path pairs ready for upload.

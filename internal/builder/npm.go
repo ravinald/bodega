@@ -123,6 +123,7 @@ func FetchNpm(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 						summary.Failures++
 						summary.Results = append(summary.Results, Result{Type: manifest.TypeNpm, Name: name, Err: err})
 					}
+					backfillNpmRecord(ctx, cfg, store, name, ve, npmTarballPath(d, name, ve))
 					continue
 				}
 			}
@@ -267,6 +268,55 @@ func FetchNpm(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 	}
 
 	return summary
+}
+
+// backfillNpmRecord fills in a dependency list or an artifact digest the entry
+// is missing, from a tarball already on disk.
+//
+// The record lives in the manifest and the bytes live on the filesystem, so
+// the two part company: re-importing a manifest onto a host that already holds
+// the artifacts resets the entries while every stage check still reports
+// fetched, and the fetch loop skips the one step that would have written the
+// record back. Left alone, that host serves a packument declaring no
+// dependencies until somebody thinks to pass --force, and nothing says so.
+//
+// Only ever fills, never clears: an entry that already records something is
+// left as it is, so this cannot overwrite a value an operator pinned.
+func backfillNpmRecord(ctx context.Context, cfg *Config, store *manifest.Store, name string,
+	ve manifest.VersionEntry, tarball string) {
+	if len(ve.Dependencies) > 0 && ve.ArtifactDigest != "" {
+		return
+	}
+	if !fileExists(tarball) {
+		return
+	}
+
+	var deps []manifest.Dependency
+	if len(ve.Dependencies) == 0 {
+		d, err := readNpmDependencies(tarball)
+		switch {
+		case err == nil:
+			deps = d
+		case errors.Is(err, errNpmPackageJSONMissing):
+		default:
+			// A warning rather than a failure: this is a repair of a record,
+			// not a fetch, and the artifact's own integrity is verifyFetched's
+			// verdict to give.
+			cfg.logf("  [npm] %s@%s: WARNING: could not read the dependency record: %v", name, ve.Version, err)
+		}
+	}
+
+	digest := ve.ArtifactDigest
+	if digest == "" {
+		if computed, err := computeFileSHA256(tarball); err == nil {
+			digest = computed
+		}
+	}
+	if len(deps) == 0 && digest == ve.ArtifactDigest {
+		return
+	}
+	cfg.logf("  [npm] %s@%s: recorded %d dependencies from the stored tarball", name, ve.Version, len(deps))
+	stampFetchRecord(ctx, store, manifest.TypeNpm, name, ve, tarball, digest, deps)
 }
 
 // NpmArtifactPaths returns local/S3 path pairs for upload.

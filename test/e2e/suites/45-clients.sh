@@ -161,9 +161,14 @@ e2e_on client "test -f $CLIENT_ROOT/npm/node_modules/color-name/package.json && 
 check_eq CLI-NPM-03 "the declared dependency is installed alongside it" "present" "$E2E_OUT" \
 	"internal/server/npm.go:283" "test -f node_modules/color-name/package.json"
 
-e2e_on client "cd $CLIENT_ROOT/npm && node -p \"require('color-convert').keyword.rgb('blue').join(',')\" 2>&1 | tail -3" || true
-check_eq CLI-NPM-04 "the installed package loads and reaches its dependency" "0,0,255" "$E2E_OUT" \
-	"internal/server/npm.go:283" "node -p \"require('color-convert').keyword.rgb('blue')\""
+# The resolve guard is the check, and the value is the proof it ran. Ubuntu
+# ships color-name at /usr/share/nodejs/color-name, which node falls back to
+# after the project's node_modules misses, so a bare require() of
+# color-convert succeeds on a guest whose registry served no dependency at
+# all. This check reported PASS against exactly that for one full run.
+e2e_on client "cd $CLIENT_ROOT/npm && node -e \"const p=require.resolve('color-name'); if(!p.startsWith(process.cwd())) throw new Error('resolved outside the project: '+p); console.log(require('color-convert').keyword.rgb('blue').join(','))\" 2>&1 | tail -3" || true
+check_eq CLI-NPM-04 "the package loads against the dependency bodega served" "0,0,255" "$E2E_OUT" \
+	"internal/server/npm.go:283" "node -e \"require.resolve('color-name') under the project, then require('color-convert')\""
 
 # npm verifies every tarball against dist.integrity and fails EINTEGRITY on a
 # mismatch, so CLI-NPM-01 above is the enforcement check and this is the one
