@@ -106,7 +106,8 @@ known-issues.tsv        check-id -> issue number. FAIL becomes XFAIL, PASS becom
 lib/assert.sh           every verdict goes through e2e_record, the only writer of findings.jsonl
 lib/remote.sh           ssh/scp; e2e_on runs one command string on "server" or "client"
 lib/bodega.sh           bodega CLI, config, restart, HTTP helpers
-lib/fixtures.sh         the shared package set, one PackageManifest per type
+lib/fixtures.sh         the shared package set: one hosted PackageManifest per
+                        type, plus npm-proxy/cargo-proxy/gomod-proxy in proxy mode
 lib/report.sh           findings.jsonl -> report.md, and issue filing
 lib/selftest.sh         the harness's own tests. Runs with no guest reachable
 suites/*.sh             sourced in filename order
@@ -176,11 +177,13 @@ Rules the harness enforces or depends on:
   absence**, because `--suite` can filter the producer away. `run.sh` declares
   the shared ones empty for this reason.
 - **Restore what you changed, and check the restore.** `60-access` puts the
-  admin list back to loopback; `65-proxy` puts the proxy back off and empties
-  both `git_upstreams` and `binary_upstreams`, each with a check of its own. A
-  suite that left the proxy on would let a later "hosted" check pass on an
-  upstream fetch, and one that left an upstream namespace configured would
-  answer a later hosted check out of a namespace it invented.
+  admin list back to loopback; `65-proxy` puts the proxy back off, empties both
+  `git_upstreams` and `binary_upstreams`, and deletes the three proxy-mode
+  entries it imported, each with a check of its own. A suite that left the proxy
+  on would let a later "hosted" check pass on an upstream fetch, one that left
+  an upstream namespace configured would answer a later hosted check out of a
+  namespace it invented, and one that left a proxy-mode entry catalogued would
+  do the same for that one package name.
 - **Restarts are rate-limited.** systemd allows 5 starts per 10 seconds by
   default, and a suite walking several postures reaches that on a healthy
   service. `e2e_restart` clears the counter before every restart; a suite that
@@ -190,6 +193,13 @@ Rules the harness enforces or depends on:
   disk rather than asking `show pkg` what version it holds: the manifest-side
   form compares the manifest with itself and passed a store holding a 1.17.0
   wheel against an entry pinning 1.16.0.
+- **A ref carries the source location, and what was measured when the check's
+  meaning depends on a comparison.** `PXY-MODE-04` records that a proxy-mode
+  gomod fetch answers 200 with the cache switch off where an uncatalogued
+  module 404s. A location on its own leaves that comparison in a shell comment,
+  and a comment reaches no reader of `findings.jsonl`, `report.md` or a filed
+  issue. Keep it to one line and free of backticks: `report.md` and the issue
+  body both render the ref inline.
 
 Available assertions: `check_eq`, `check_ne`, `check_contains`, `check_lacks`,
 `check_matches`, `e2e_skip`, `e2e_block`, and `e2e_record` for anything with a
