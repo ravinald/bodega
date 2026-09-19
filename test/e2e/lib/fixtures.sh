@@ -26,11 +26,16 @@
 E2E_LIB_FIXTURES=1
 
 # manifest.AllTypes order, so a suite walking these reports in the order the
-# product builds them.
+# product builds them. Hosted entries, every one: the proxy-mode fixtures are
+# named apart below and deliberately absent here, because a suite walking this
+# list is walking the build pipeline and a proxy-mode entry builds nothing.
 export E2E_FIXTURE_TYPES
 E2E_FIXTURE_TYPES="binary git apt pypi gomod helm npm cargo"
 
 # e2e_fixture <type> [apt-version] — one PackageManifest on stdout.
+#
+# <type> is one of E2E_FIXTURE_TYPES, or one of npm-proxy, cargo-proxy and
+# gomod-proxy for the proxy-mode entries at the bottom of the case.
 e2e_fixture() {
 	case "$1" in
 	binary) cat <<'JSON' ;;
@@ -144,6 +149,51 @@ JSON
   "versions": [{ "version": "%s", "source_name": "hello" }]
 }\n' "${2:?apt fixture needs a version}"
 		;;
+	# ---- proxy mode ---------------------------------------------------------
+	#
+	# The eight names above are hosted entries: none sets `mode`, so
+	# EffectiveMode returns "hosted" for every one of them and every proxy
+	# check in the suite reaches the serving code through "no manifest names
+	# this". These three are the other half of that distinction — an entry a
+	# manifest does name, whose bytes come from upstream — and the serving code
+	# reads them on a different branch.
+	#
+	# Named apart rather than selected by a second argument, because apt's
+	# second argument is already its version, and because a mode argument
+	# threaded through every call site would leave the mode of a given call
+	# readable only at the caller. `npm-proxy` says what it emits where it is
+	# written. E2E_FIXTURE_TYPES keeps naming exactly the eight the pipeline
+	# suites walk, so nothing here changes what 30-pipeline imports.
+	#
+	# Each upstream is one 65-proxy.sh already depends on, so a proxy-mode
+	# fixture adds no new way for the suite to fail on somebody else's outage.
+	npm-proxy) cat <<'JSON' ;;
+{
+  "config_version": 1,
+  "name": "is-number",
+  "type": "npm",
+  "description": "e2e fixture: a proxy-mode entry, fetched from upstream on miss",
+  "versions": [{ "version": "7.0.0", "mode": "proxy" }]
+}
+JSON
+	cargo-proxy) cat <<'JSON' ;;
+{
+  "config_version": 1,
+  "name": "anyhow",
+  "type": "cargo",
+  "description": "e2e fixture: a proxy-mode entry, fetched from upstream on miss",
+  "versions": [{ "version": "1.0.86", "mode": "proxy" }]
+}
+JSON
+	gomod-proxy) cat <<'JSON' ;;
+{
+  "config_version": 1,
+  "name": "github.com/pkg/errors",
+  "type": "gomod",
+  "description": "e2e fixture: a proxy-mode entry, fetched from upstream on miss",
+  "versions": [{ "version": "v0.9.1", "mode": "proxy" }]
+}
+JSON
 	*)
 		printf 'e2e_fixture: no fixture for type %q\n' "$1" >&2
 		return 2
@@ -161,6 +211,9 @@ e2e_fixture_name() {
 	helm) printf 'podinfo' ;;
 	npm) printf 'color-convert' ;;
 	cargo) printf 'form_urlencoded' ;;
+	npm-proxy) printf 'is-number' ;;
+	cargo-proxy) printf 'anyhow' ;;
+	gomod-proxy) printf 'github.com/pkg/errors' ;;
 	*) return 2 ;;
 	esac
 }
@@ -175,6 +228,9 @@ e2e_fixture_version() {
 	helm) printf '6.7.0' ;;
 	npm) printf '2.0.1' ;;
 	cargo) printf '1.2.2' ;;
+	npm-proxy) printf '7.0.0' ;;
+	cargo-proxy) printf '1.0.86' ;;
+	gomod-proxy) printf 'v0.9.1' ;;
 	*) return 2 ;;
 	esac
 }
