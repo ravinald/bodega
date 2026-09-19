@@ -17,8 +17,10 @@
 #
 # Everything through PXY-12 reaches the serving code through `pm == nil` — no
 # manifest names the path. The proxy-mode section at the bottom drives the other
-# branch of the same distinction, and measures it by the object key rather than
-# by the status, because both branches answer 200.
+# branch. Both branches answer 200 and both derive the same artifact key, so
+# neither separates them on its own: those checks assert the stored key for the
+# layout it proves, and read the branch itself off the proxy gate with caching
+# off. Each records in its ref what it measured.
 
 # shellcheck source=../lib/assert.sh
 . "${E2E_DIR:?run.sh sets E2E_DIR}/lib/assert.sh"
@@ -297,13 +299,21 @@ check_eq PXY-12 "an uncatalogued cargo crate download proxies with caching off" 
 # ---- proxy mode: an entry a manifest names, served from upstream ------------
 #
 # Every check above reaches the serving code through `pm == nil`, which means
-# "no manifest names this": the URL is composed from config alone and whatever
-# comes back is cached under a key derived from the request. A proxy-mode entry
-# takes the other branch — internal/server/npm.go:67, cargo.go:353 and
-# gomod.go:73 each read packageMode(pm) == ModeProxy on an entry that exists —
-# and there the version the entry names, the backend it records and its digest
-# all participate. Both branches answer 200, so the status separates nothing.
-# What follows measures the stored key, or a posture where the two disagree.
+# "no manifest names this": the URL is composed from config alone. A proxy-mode
+# entry takes the other branch: internal/server/npm.go:67 and gomod.go:73 read
+# packageMode(pm) == ModeProxy on an entry that exists, and cargo.go:353 folds
+# the two into one forceProxy.
+#
+# The artifact key is not what separates them. All three routes derive it
+# before the manifest lookup and from the same inputs (npm.go:39, gomod.go:24,
+# cargo.go:352), so both branches write the same string. Asserting it still
+# says what a status cannot: the object lands in the hosted layout, keyed by
+# name and version, rather than in a slot named after the request path. What
+# does separate them is the proxy gate: npm and gomod pass forceProxy true for
+# an entry where the uncatalogued branch is gated on cacheEnabled(). The npm
+# packument separates them too, an entry generating it rather than caching it
+# (npm.go:144), and that one turns on the entry existing rather than on its
+# mode. Both branches answer 200, so the status separates nothing.
 #
 # The posture on entry is PXY-07's restore: proxy_cache_enabled false, both
 # upstream maps empty. So the switch-off half is measured first, against
@@ -358,18 +368,21 @@ E2E_HOST=client
 # rather than fetched, so the switch never enters into it.
 e2e_http client "/npm/is-number" || true
 check_eq PXY-MODE-02 "a proxy-mode npm packument is generated with caching off, where an uncatalogued name 404s" \
-	"200" "$E2E_OUT" "internal/server/npm.go:143" \
+	"200" "$E2E_OUT" \
+	"internal/server/npm.go:144; an entry of any mode generates the packument from the manifest, so the switch never enters it and this answers 200 with caching off; uncatalogued PXY-10 404s on the same path in the same posture" \
 	"GET /npm/is-number with a proxy-mode entry and proxy_cache_enabled false"
 
 e2e_http client "/npm/is-number/-/is-number-7.0.0.tgz" || true
 check_eq PXY-MODE-03 "a proxy-mode npm tarball is fetched with caching off" \
-	"200" "$E2E_OUT" "internal/server/npm.go:67" \
+	"200" "$E2E_OUT" \
+	"internal/server/npm.go:67; the proxy-mode branch passes forceProxy true, so the fetch bypasses the cache switch and answers 200 with caching off and again with it on (PXY-MODE-06); the uncatalogued branch at npm.go:83 is gated on cacheEnabled and 404s on a miss; both derive the same NpmTarballKey at npm.go:39" \
 	"GET the tarball with a proxy-mode entry and proxy_cache_enabled false"
 
 # PXY-11's module, in PXY-11's posture, with an entry. PXY-11 got 404.
 e2e_http client "/go/github.com/pkg/errors/@v/v0.9.1.info" || true
 check_eq PXY-MODE-04 "a proxy-mode gomod file is fetched with caching off, where an uncatalogued module 404s" \
-	"200" "$E2E_OUT" "internal/server/gomod.go:73" \
+	"200" "$E2E_OUT" \
+	"internal/server/gomod.go:73; the proxy-mode branch passes forceProxy true and answers 200 with caching off and again with it on (PXY-MODE-11); the uncatalogued branch at gomod.go:102 needs cacheEnabled and 404s, which PXY-11 measured; GomodFileKey is derived at gomod.go:24 before either branch, so the key is the same and the switch is the difference" \
 	"GET /go/github.com/pkg/errors/@v/v0.9.1.info with a proxy-mode entry and proxy_cache_enabled false"
 
 # The one route where the two postures agree, and it is not an oversight:
@@ -379,7 +392,8 @@ check_eq PXY-MODE-04 "a proxy-mode gomod file is fetched with caching off, where
 # code does not support.
 e2e_http client "/cargo/anyhow/1.0.86/download" || true
 check_eq PXY-MODE-05 "a proxy-mode cargo download is fetched with caching off, as an uncatalogued one already is" \
-	"200" "$E2E_OUT" "internal/server/cargo.go:353" \
+	"200" "$E2E_OUT" \
+	"internal/server/cargo.go:353; forceProxy is pm == nil || mode == proxy, true for both, so the postures agree: 200 with caching off here, with it on at PXY-MODE-09, and uncatalogued PXY-12 already 200s in this posture; CargoCrateKey at cargo.go:352 is derived for both branches" \
 	"GET /cargo/anyhow/1.0.86/download with a proxy-mode entry and proxy_cache_enabled false"
 
 # ---- the key the manifest implies ------------------------------------------
@@ -401,17 +415,21 @@ E2E_HOST=client
 e2e_http client "/npm/is-number" || true
 e2e_http client "/npm/is-number/-/is-number-7.0.0.tgz" || true
 check_eq PXY-MODE-06 "the proxy-mode npm tarball is served with caching on" "200" "$E2E_OUT" \
-	"internal/server/npm.go:67" "GET /npm/is-number/-/is-number-7.0.0.tgz"
+	"internal/server/npm.go:67; 200, the same answer PXY-MODE-03 got with caching off, so the switch changes nothing for a proxy-mode entry; the uncatalogued branch answers this route only with the switch on" \
+	"GET /npm/is-number/-/is-number-7.0.0.tgz"
 
 # The wire path carries the /-/ separator and the client-facing filename; the
 # key carries neither. NpmTarballKey derives it from the name and the version,
 # which is the hosted layout, so a proxy-mode fetch lands where an upload would
-# have and not in a slot named after the request.
+# have and not in a slot named after the request. The uncatalogued branch
+# derives that same key at npm.go:39, so this measures the layout rather than
+# which branch served it.
 E2E_HOST=server
 e2e_on server "sudo find /var/lib/bodega/npm -type f | sed 's|^/var/lib/bodega/||' | sort" || true
 check_contains PXY-MODE-07 "the proxy-mode npm tarball lands under the key its manifest implies" \
 	"npm/is-number/is-number-7.0.0.tgz" "${E2E_OUT:-nothing stored}" \
-	"internal/manifest/keys.go:147" "find /var/lib/bodega/npm -type f"
+	"internal/manifest/keys.go:147; the key is the name and the version, not the /-/ request path; npm.go:39 derives it before the manifest lookup, so the uncatalogued branch writes the same string and this measures the layout rather than the branch" \
+	"find /var/lib/bodega/npm -type f"
 
 # The other direction of the same distinction, and the one place on these three
 # routes where the branches write different keys. PXY-NPM-02 found
@@ -419,39 +437,45 @@ check_contains PXY-MODE-07 "the proxy-mode npm tarball lands under the key its m
 # that document from itself, so there is nothing to cache and the key is absent.
 check_lacks PXY-MODE-08 "a proxy-mode entry caches no packument, where an uncatalogued name does" \
 	"npm/is-number/packument.json" "${E2E_OUT:-nothing stored}" \
-	"internal/server/npm.go:143" "the same listing, against PXY-NPM-02"
+	"internal/server/npm.go:144; an entry of any mode serves this document from serveManifestPackument, so nothing is cached under npm/is-number/packument.json; the uncatalogued branch fetches and stores it at npm.go:152, which PXY-NPM-02 found; the variable is the entry, not the mode and not the switch, and it is the one key on these routes the two branches do not share" \
+	"the same listing, against PXY-NPM-02"
 
 E2E_HOST=client
 e2e_http client "/cargo/anyhow/1.0.86/download" || true
 check_eq PXY-MODE-09 "the proxy-mode cargo crate is served with caching on" "200" "$E2E_OUT" \
-	"internal/server/cargo.go:353" "GET /cargo/anyhow/1.0.86/download"
+	"internal/server/cargo.go:353; 200, as at PXY-MODE-05 with the switch off and as uncatalogued PXY-12 in that same posture: this route forces past the switch for both branches, so neither the posture nor the manifest changes the answer" \
+	"GET /cargo/anyhow/1.0.86/download"
 
 # Requested as anyhow/1.0.86/download, stored as cargo/crates/anyhow-1.0.86.crate.
-# Nothing in the key is the request path, and the backend it is written to is
-# the one versionStore reads off the entry rather than the type rule an
-# uncatalogued crate falls back to — invisible on a guest with one backend
-# configured, which is why the key is what this asserts.
+# Nothing in the key is the request path, and cargo.go:352 derives it for both
+# branches, so what the entry adds here is the backend: versionStore
+# (internal/server/server.go:1641) reads it off a matching version entry where
+# an uncatalogued crate falls back to the type rule. That is invisible on a
+# guest with one backend configured, which is why the key is what this asserts.
 E2E_HOST=server
 e2e_on server "sudo find /var/lib/bodega/cargo -type f | sed 's|^/var/lib/bodega/||' | sort" || true
 check_contains PXY-MODE-10 "the proxy-mode cargo crate lands under the key its manifest implies, not the request path" \
 	"cargo/crates/anyhow-1.0.86.crate" "${E2E_OUT:-nothing stored}" \
-	"internal/manifest/keys.go:159" "find /var/lib/bodega/cargo -type f"
+	"internal/manifest/keys.go:159; the key is the crate and the version, not the /download request path, and cargo.go:352 derives it for both branches; what the entry adds is the backend, which versionStore reads off a matching version entry at server.go:1641" \
+	"find /var/lib/bodega/cargo -type f"
 
 E2E_HOST=client
 e2e_http client "/go/github.com/pkg/errors/@v/v0.9.1.info" || true
 check_eq PXY-MODE-11 "the proxy-mode gomod file is served with caching on" "200" "$E2E_OUT" \
-	"internal/server/gomod.go:73" "GET /go/github.com/pkg/errors/@v/v0.9.1.info"
+	"internal/server/gomod.go:73; 200, the same answer PXY-MODE-04 got with caching off, so the switch changes nothing for a proxy-mode entry; the uncatalogued branch at gomod.go:102 reaches upstream only with the switch on, which is why PXY-11 404s with it off" \
+	"GET /go/github.com/pkg/errors/@v/v0.9.1.info"
 
-# gomod alone cannot be told apart by its key, and that is a property of the
-# ecosystem rather than a gap here: a Go client asks for the module path
-# verbatim, so GomodFileKey keeps the slashes and both branches derive the same
-# string (internal/manifest/keys.go:118). The measurement that does separate
-# them for this type is PXY-MODE-04 against PXY-11.
+# No artifact route here can be told apart by its key, gomod included: each
+# derives one before the manifest lookup, and for this type a Go client asks
+# for the module path verbatim, so GomodFileKey keeps the slashes
+# (internal/manifest/keys.go:118). The measurement that does separate the
+# branches for this type is PXY-MODE-04 against PXY-11.
 E2E_HOST=server
 e2e_on server "sudo find /var/lib/bodega/gomod -type f | sed 's|^/var/lib/bodega/||' | sort" || true
 check_contains PXY-MODE-12 "the proxy-mode gomod file lands under the key its manifest implies" \
 	"gomod/github.com/pkg/errors/@v/v0.9.1.info" "${E2E_OUT:-nothing stored}" \
-	"internal/manifest/keys.go:118" "find /var/lib/bodega/gomod -type f"
+	"internal/manifest/keys.go:118; GomodFileKey is derived at gomod.go:24 before the manifest lookup, so both branches write gomod/github.com/pkg/errors/@v/v0.9.1.info and the key separates nothing; for this type the branches part at the switch, PXY-MODE-04 against PXY-11" \
+	"find /var/lib/bodega/gomod -type f"
 
 # ---- restore ---------------------------------------------------------------
 #
