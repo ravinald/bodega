@@ -247,7 +247,7 @@ curl -X POST https://bodega.internal:8080/api/v1/packages/npm \
   --data-binary @/tmp/widget-cli-pre.json
 ```
 
-The API accepts the exact shape that `GET /api/v1/packages/{type}/{name}` emits, which is why the round-trip works.
+The API accepts the exact structure that `GET /api/v1/packages/{type}/{name}` emits, which is why the round-trip works.
 
 ## Integration notes
 

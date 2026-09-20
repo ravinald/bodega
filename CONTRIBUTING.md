@@ -52,7 +52,7 @@ make e2e
 
 ## Pull requests
 
-Keep the subject terse and let the diff carry the rest. A commit body earns its place when it answers something the diff cannot show: the alternative that lost, the constraint that forced this shape, a failure that arrives with no error, or the commit it corrects.
+Keep the subject terse and let the diff carry the rest. A commit body earns its place when it answers something the diff cannot show: the alternative that lost, the constraint that forced this design, a failure that arrives with no error, or the commit it corrects.
 
 Examples in documentation and help text use fictional names. A real package, company, or host appears only when something on the wire has to resolve to it: registry hosts, tool names, and actual `go.mod` dependencies. `cmd/bodega/example_names_test.go` enforces that, and also resolves every relative link in the Markdown, because nothing else does.
 

@@ -933,7 +933,7 @@ func (m *appModel) buildAuditPopup() popupModel {
 			{Label: "Event type", Value: "", Select: true,
 				Options: []string{"", "fetch", "build", "create", "delete", "cache"}},
 			{Label: "Pkg type", Value: "", Select: true,
-				Options: []string{"", "apt", "git", "pypi", "binary", "gomod", "helm", "npm"}},
+				Options: auditTypeOptions()},
 			{Label: "Pkg name", Value: ""},
 			{Label: "Client IP", Value: ""},
 			{Label: "Limit", Value: "50"},
@@ -1323,6 +1323,19 @@ var createTypeOptions = []string{
 	manifest.TypeHelm,
 	manifest.TypeNpm,
 	manifest.TypePypi,
+}
+
+// auditTypeOptions is the package-type filter for the audit query form, with an
+// empty first entry meaning "any type".
+//
+// Derived from AllTypes rather than written out: this list was hardcoded to
+// eight values and lost cargo, and unlike createTypeOptions no test held it to
+// anything. A filter missing a type silently returns no rows for it, which
+// reads as "nothing happened" rather than as a bug.
+func auditTypeOptions() []string {
+	out := make([]string, 0, len(manifest.AllTypes)+1)
+	out = append(out, "")
+	return append(out, manifest.AllTypes...)
 }
 
 // buildCreatePopup constructs the initial popupModel for the "c" create flow.

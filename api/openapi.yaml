@@ -904,7 +904,7 @@ components:
           description: Package name
         type:
           type: string
-          enum: [apt, git, pypi, binary, gomod, helm, npm]
+          enum: [apt, git, pypi, binary, gomod, helm, npm, cargo]
         description:
           type: string
         dep_policy:

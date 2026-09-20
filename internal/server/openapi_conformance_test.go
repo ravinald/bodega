@@ -62,8 +62,11 @@ func loadSpec(t *testing.T) openAPIDoc {
 	return doc
 }
 
-// Both type lists in the spec are hand-maintained, and cargo went missing from
-// both until B40 corrected them by hand. Nothing held either to the server.
+// Three type lists in the spec are hand-maintained, and cargo went missing from
+// the first two until B40 corrected them by hand. This test then guarded those
+// two and not the third, so PackageManifest.type kept the stale seven-type list
+// and nothing reported it: a spec a client generates from is wrong in a way no
+// server test can see.
 func TestOpenAPITypeListsMatchAllTypes(t *testing.T) {
 	doc := loadSpec(t)
 
@@ -82,6 +85,37 @@ func TestOpenAPITypeListsMatchAllTypes(t *testing.T) {
 		got = append(got, k)
 	}
 	assertSameSet(t, "PackagesResponse properties", got, manifest.AllTypes)
+
+	assertSameSet(t, "PackageManifest.type enum", manifestTypeEnum(t, doc), manifest.AllTypes)
+}
+
+// manifestTypeEnum digs the PackageManifest.type enum out of the untyped
+// properties map. Properties is map[string]any rather than a struct because
+// every schema in the document shares it, and only this one field carries a
+// type list worth holding to AllTypes.
+func manifestTypeEnum(t *testing.T, doc openAPIDoc) []string {
+	t.Helper()
+	props := doc.Components.Schemas["PackageManifest"].Properties
+	if len(props) == 0 {
+		t.Fatal("PackageManifest has no properties; the spec moved and this test did not")
+	}
+	field, ok := props["type"].(map[string]any)
+	if !ok {
+		t.Fatal("PackageManifest.type is not a mapping; the spec moved and this test did not")
+	}
+	raw, ok := field["enum"].([]any)
+	if !ok {
+		t.Fatal("PackageManifest.type has no enum; the spec moved and this test did not")
+	}
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		s, ok := v.(string)
+		if !ok {
+			t.Fatalf("PackageManifest.type enum holds %T, want string", v)
+		}
+		out = append(out, s)
+	}
+	return out
 }
 
 // Every route the server registers is either in the spec or in the skip list
