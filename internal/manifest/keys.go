@@ -3,6 +3,7 @@ package manifest
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -113,6 +114,29 @@ var FreeBSDCatalogFiles = []string{FreeBSDMetaFile, FreeBSDDataFile, FreeBSDCata
 func FreeBSDRepoPrefix(abi, repo string) string {
 	return FreeBSDPrefix + abi + "/" + repo + "/"
 }
+
+// freeBSDABIPattern matches an ABI directory. The colons are literal and are
+// the reason this is a pattern rather than a segment check: "FreeBSD:14:amd64"
+// is one path segment carrying two of them, and a scheme that rejected the
+// colon would fail against every real repository.
+var freeBSDABIPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$`)
+
+// freeBSDRepoPattern matches a repository directory. One segment, no
+// separators: "latest", "quarterly", "base_latest".
+var freeBSDRepoPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
+// FreeBSDValidABI reports whether abi is an ABI directory this mirror can key
+// and serve.
+//
+// It lives beside the key scheme rather than in the route, because the route
+// is not the only caller: an entry created with an ABI the route will refuse
+// is one whose every request 400s, and the form that created it is where that
+// is cheap to say.
+func FreeBSDValidABI(abi string) bool { return freeBSDABIPattern.MatchString(abi) }
+
+// FreeBSDValidRepo reports whether repo is a repository directory this mirror
+// can key and serve. It is the package name for this type.
+func FreeBSDValidRepo(repo string) bool { return freeBSDRepoPattern.MatchString(repo) }
 
 // FreeBSDKey returns the key one mirrored object is stored under. repoPath is
 // the record's own repopath from packagesite.yaml, or one of

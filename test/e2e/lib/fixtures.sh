@@ -26,17 +26,9 @@
 E2E_LIB_FIXTURES=1
 
 # manifest.AllTypes order, so a suite walking these reports in the order the
-# product builds them. Hosted but for freebsd: the other proxy-mode fixtures
-# are named apart below and deliberately absent here, because a suite walking
-# this list is walking the build pipeline and a proxy-mode entry builds
-# nothing.
-#
-# freebsd is the exception and is proxy mode on both of its entries, because a
-# hosted freebsd entry mirrors a whole repository and the two real ones do not
-# fit in a test run: pkg.freebsd.org's FreeBSD:14:amd64 base_latest measures
-# 535 packages and 1.2 GB, and its latest measures 38,325 packages and 182.8
-# GB. Proxy mode reaches the same route, the same object keys and both
-# repopath layouts for the cost of the files a check actually asks for.
+# product builds them. All hosted: the proxy-mode fixtures are named apart
+# below and deliberately absent here, because a suite walking this list is
+# walking the build pipeline and a proxy-mode entry builds nothing.
 export E2E_FIXTURE_TYPES
 E2E_FIXTURE_TYPES="binary git apt pypi gomod helm npm cargo freebsd"
 
@@ -146,18 +138,21 @@ JSON
   }
 ]
 JSON
-	freebsd) cat <<'JSON' ;;
+	# Two repositories, one per repopath layout, against the fixture upstream
+	# lib/freebsd.sh builds on the guest. The real ones are 1.2 GB and 182.8
+	# GB and a hosted entry takes all of it, so what a run can actually copy
+	# and compare byte for byte is a repository built for the purpose.
+	freebsd) cat <<JSON ;;
 [
   {
     "config_version": 1,
     "name": "latest",
     "type": "freebsd",
-    "description": "e2e fixture: the All/Hashed layout, where a repopath carries ~ and $",
+    "description": "e2e fixture: the All/Hashed layout, where a repopath carries ~ and \$",
     "versions": [
       {
         "version": "FreeBSD:14:amd64",
-        "url": "https://pkg.freebsd.org/FreeBSD:14:amd64/latest",
-        "mode": "proxy"
+        "url": "${E2E_FREEBSD_URL:-http://127.0.0.1:8099}/latest"
       }
     ]
   },
@@ -165,12 +160,11 @@ JSON
     "config_version": 1,
     "name": "base_latest",
     "type": "freebsd",
-    "description": "e2e fixture: the Hashed layout, whose catalogue spells a repopath with a leading ./",
+    "description": "e2e fixture: a catalogue spelling one repopath ./Hashed/ and one at the repository root",
     "versions": [
       {
         "version": "FreeBSD:14:amd64",
-        "url": "https://pkg.freebsd.org/FreeBSD:14:amd64/base_latest",
-        "mode": "proxy"
+        "url": "${E2E_FREEBSD_URL:-http://127.0.0.1:8099}/base_latest"
       }
     ]
   }

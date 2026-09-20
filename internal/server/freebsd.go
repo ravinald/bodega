@@ -3,7 +3,6 @@ package server
 import (
 	"net/http"
 	"path"
-	"regexp"
 	"slices"
 	"strings"
 
@@ -30,16 +29,6 @@ import (
 // This is the opposite of apt, where internal/server/apt.go generates and
 // re-signs Debian metadata because it must. Generating a pkg catalogue is a
 // separate job and applies only to packages an operator built themselves.
-
-// freeBSDABIPattern matches an ABI directory. The colons are literal and are
-// the reason this is a pattern rather than a segment check: "FreeBSD:14:amd64"
-// is one path segment carrying two of them, and a scheme that rejected the
-// colon would fail against every real repository.
-var freeBSDABIPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$`)
-
-// freeBSDRepoPattern matches a repository directory. One segment, no
-// separators: "latest", "quarterly", "base_latest".
-var freeBSDRepoPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
 // freeBSDGoneFiles are the three paths pkg asks for on an old repository and
 // no current one answers.
@@ -72,7 +61,17 @@ func (s *Server) handleFreeBSD(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	pm, _ := s.store.GetPackage(ctx, manifest.TypeFreeBSD, repo)
-	if pm != nil && isPackageHidden(pm) {
+	ve, configured := freeBSDVersion(pm, abi)
+	// One entry decides everything about this request, and it is the entry
+	// for the ABI that was asked for. A repository carries one per ABI and
+	// they are configured apart: reading the mode off the first would serve
+	// FreeBSD:13's proxy decision to a FreeBSD:14 client whose objects were
+	// mirrored, and hiding one ABI would leave it readable as long as
+	// another stayed visible.
+	if pm != nil && (isPackageHidden(pm) || ve.Hidden) {
+		// Before the cache read and before any upstream contact. hide is the
+		// quarantine control, and an ABI that still answers from the store or
+		// still warms a proxy cache is not quarantined.
 		http.NotFound(w, r)
 		return
 	}
@@ -82,7 +81,7 @@ func (s *Server) handleFreeBSD(w http.ResponseWriter, r *http.Request) {
 
 	key := manifest.FreeBSDKey(abi, repo, rest)
 	catalog := slices.Contains(manifest.FreeBSDCatalogFiles, rest)
-	proxied := pm == nil || packageMode(pm) == manifest.ModeProxy
+	proxied := !configured || ve.EffectiveMode() == manifest.ModeProxy
 
 	store, err := s.versionStore(ctx, manifest.TypeFreeBSD, repo, abi)
 	if err != nil {
@@ -92,7 +91,7 @@ func (s *Server) handleFreeBSD(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upstream := freeBSDUpstream(pm, abi, rest)
+	upstream := freeBSDUpstreamOf(ve, configured, rest)
 	if catalog && !proxied {
 		// A mirrored repository's catalogue is never fetched from upstream on
 		// a miss. Upstream's catalogue is by construction newer than this
@@ -123,24 +122,37 @@ func (s *Server) handleFreeBSD(w http.ResponseWriter, r *http.Request) {
 	s.proxyOrCache(w, r, store, key, upstream, manifest.TypeFreeBSD, upstream, repo+"/"+rest, immutable, proxied)
 }
 
-// freeBSDUpstream composes the upstream URL for one path, or "" when no entry
-// names a repository root to compose it from.
+// freeBSDVersion is the entry configured for one ABI.
+//
+// A freebsd package is a repository and its versions are the ABI directories
+// under it, each with its own mode, URL, storage backend and hidden flag. The
+// route resolves the ABI from the request path, so every one of those has to
+// be read off the entry that ABI names rather than off whichever entry the
+// manifest happens to list first.
+func freeBSDVersion(pm *manifest.PackageManifest, abi string) (manifest.VersionEntry, bool) {
+	if pm == nil {
+		return manifest.VersionEntry{}, false
+	}
+	for _, ve := range pm.Versions {
+		if ve.Version == abi {
+			return ve, true
+		}
+	}
+	return manifest.VersionEntry{}, false
+}
+
+// freeBSDUpstreamOf composes the upstream URL for one path, or "" when no
+// entry names a repository root to compose it from.
 //
 // The entry's URL is the repository root as a pkg client would be pointed at
 // it, ${ABI} already substituted. It is not composed from abi and repo here
 // for the reason it is not composed in the builder: a private repository need
 // not nest its ABIs, and nothing in a URL says which convention it follows.
-func freeBSDUpstream(pm *manifest.PackageManifest, abi, rest string) string {
-	if pm == nil {
+func freeBSDUpstreamOf(ve manifest.VersionEntry, configured bool, rest string) string {
+	if !configured || ve.URL == "" {
 		return ""
 	}
-	for _, ve := range pm.Versions {
-		if ve.Version != abi || ve.URL == "" {
-			continue
-		}
-		return strings.TrimRight(ve.URL, "/") + "/" + rest
-	}
-	return ""
+	return strings.TrimRight(ve.URL, "/") + "/" + rest
 }
 
 // splitFreeBSDPath validates a request path and splits it into the ABI, the
@@ -159,7 +171,7 @@ func splitFreeBSDPath(p string) (abi, repo, rest string, ok bool) {
 		return "", "", "", false
 	}
 	abi, repo, rest = segs[0], segs[1], segs[2]
-	if !freeBSDABIPattern.MatchString(abi) || !freeBSDRepoPattern.MatchString(repo) {
+	if !manifest.FreeBSDValidABI(abi) || !manifest.FreeBSDValidRepo(repo) {
 		return "", "", "", false
 	}
 	if rest == "" || strings.HasPrefix(rest, "/") || strings.Contains(rest, `\`) {

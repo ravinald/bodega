@@ -1992,6 +1992,24 @@ func validateCreateFields(fields []formField) string {
 		if fieldValueFromSlice(fields, "Version") == "" {
 			return "Version is required for cargo entries"
 		}
+	case manifest.TypeFreeBSD:
+		// Both halves of the path a pkg client composes, checked against what
+		// the route will accept rather than against emptiness: an entry whose
+		// ABI the route refuses is one whose every request answers 400, and
+		// here is where that costs a keystroke instead of an incident.
+		abi := fieldValueFromSlice(fields, "ABI")
+		if abi == "" {
+			return "ABI is required for freebsd entries, e.g. FreeBSD:14:amd64"
+		}
+		if !manifest.FreeBSDValidABI(abi) {
+			return "ABI must be one path segment of letters, digits, '.', '_', '-' or ':', e.g. FreeBSD:14:amd64"
+		}
+		if !manifest.FreeBSDValidRepo(name) {
+			return "Name must be the repository directory, one path segment, e.g. latest or base_latest"
+		}
+		if fieldValueFromSlice(fields, "Source URL") == "" {
+			return "Source URL is required for freebsd entries: the repository root with ${ABI} substituted"
+		}
 	}
 	// Block save if checksum is present but invalid.
 	chk := fieldValueFromSlice(fields, "Checksum")
@@ -2249,6 +2267,16 @@ func saveCreateEntry(store *manifest.Store, fields []formField) error {
 	case manifest.TypeGomod, manifest.TypeNpm, manifest.TypeCargo:
 		// nothing extra
 
+	case manifest.TypeFreeBSD:
+		// The version of a freebsd entry is the ABI directory above the
+		// repository, and the form asks for it under that name because that
+		// is what a pkg client substitutes for ${ABI}. Nothing else on this
+		// form carries it: a save that read "Version" stored an empty one,
+		// and an entry with no version is a repository the route can never
+		// resolve a mode, a URL or a backend for.
+		ve.Version = fieldValueFromSlice(fields, "ABI")
+		ve.VersionConstraint = ""
+
 	default:
 		return fmt.Errorf("unknown entry type %q", entryType)
 	}
@@ -2289,6 +2317,11 @@ func (m *appModel) makeJSONApplyFn() func(buf string) string {
 		if len(pm.Versions) > 0 {
 			ve := pm.Versions[0]
 			setFieldValue(p.formFields, "Version", ve.Version)
+			if entryType == manifest.TypeFreeBSD {
+				// The freebsd form has no Version field; its version is the
+				// ABI, under the label a pkg client would recognize.
+				setFieldValue(p.formFields, "ABI", ve.Version)
+			}
 			setFieldValue(p.formFields, "Source URL", ve.URL)
 			if ve.Ref != "" {
 				setFieldValue(p.formFields, "Ref", ve.Ref)

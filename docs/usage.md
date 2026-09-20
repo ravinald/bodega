@@ -3253,7 +3253,7 @@ The npm packument and the PyPI simple index are the two responses bodega parses 
 
 ### Mirroring a FreeBSD pkg repository
 
-A `freebsd` entry mirrors a pkg repository **byte for byte**, and that constraint decides the whole design of the type. `packagesite.pkg` and `data.pkg` are zstd tarballs, and each carries three members: `packagesite.yaml.sig` (256 B), `packagesite.yaml.pub` (451 B) and the catalogue itself. There is no `.sig` sidecar on the wire. So a byte-exact copy of those archives carries FreeBSD's own signature with it and validates against the stock fingerprint at `/usr/share/keys/pkg/trusted/pkg.freebsd.org.2013102301`, with no key of bodega's and no client-side signature configuration. Regenerating the catalogue with `pkg repo` would discard that attestation permanently and force a fingerprint onto every client.
+A `freebsd` entry mirrors a pkg repository **byte for byte**, and that constraint decides the whole design of the type. `packagesite.pkg` and `data.pkg` are zstd tarballs, and each carries three members: a 256-byte signature, a 451-byte public key and the document itself. The catalogue spells them `packagesite.yaml.sig`, `packagesite.yaml.pub` and `packagesite.yaml`; `data.pkg` spells them `data.sig`, `data.pub` and `data`. There is no `.sig` sidecar on the wire. So a byte-exact copy of those archives carries FreeBSD's own signature with it and validates against the stock fingerprint at `/usr/share/keys/pkg/trusted/pkg.freebsd.org.2013102301`, with no key of bodega's and no client-side signature configuration. Regenerating the catalogue with `pkg repo` would discard that attestation permanently and force a fingerprint onto every client.
 
 This is the opposite of what apt needs. bodega generates and re-signs Debian metadata for a generated suite because it has to; a pkg catalogue is never generated here.
 
@@ -3274,7 +3274,9 @@ The client stanza is under [Client configuration](#client-configuration).
 | `latest`      | 38,325  | 182.8 GB | `All/Hashed/zogftw-2025.02.23_1~2$snxfrbid.pkg`                |
 | `base_latest` | 535     | 1.2 GB   | `./Hashed/FreeBSD-telnet-14.snap20260920075547~2$ea5o6tyi.pkg` |
 
-There is no directory listing to crawl either: `All/` answers 403 upstream. So the mirrored object set is read out of the catalogue and from nothing else.
+There is no directory listing to crawl either: `All/` answers 403 upstream. So the mirrored object set is read out of the published archives and from nothing else.
+
+Both of them, not `packagesite.pkg` alone. `data.pkg` carries the same record per package in one JSON document, which `pkg_repo_fetch_data_fd` reads out of the member `meta.conf` names under `data`, and the two are fetched a moment apart from a repository that rebuilds continuously, so they can describe different generations. bodega mirrors the union of what they name, because it publishes both unchanged and cannot rewrite either. A `data.pkg` whose member cannot be read fails the mirror with the member named: publishing an archive whose object set is unknown is the one thing the ordering rule below cannot protect a client from.
 
 A leading `./` is dropped, because every HTTP client normalizes it out before the request leaves and keeping it would key an object under a path no request can spell. A `..` is refused rather than cleaned: the catalogue decides both the URL fetched and the path written, so a record resolving outside the repository is one this mirror must not touch.
 
@@ -3288,11 +3290,20 @@ A leading `./` is dropped, because every HTTP client normalizes it out before th
 
 A catalogue that lands ahead of the objects it names is a repository where `pkg install` resolves a package and then 404s partway through fetching it, and the upstream repositories rebuild continuously, so the window is not theoretical. The ordering holds at three layers:
 
-- The mirror stages `meta.conf`, `data.pkg` and `packagesite.pkg` outside the tree, fetches every object the catalogue names, and only then moves the three into place.
+- The mirror stages `meta.conf`, `data.pkg` and `packagesite.pkg` outside the tree, fetches every object either archive names, and only then moves the three into place.
+- Every object lands through a temporary sibling and an atomic rename, and a body short of its declared `Content-Length` is discarded. A partial file left where a package belongs is indistinguishable from a mirrored one on the next run, which is how a catalogue gets published over 3 bytes of a 100-byte package; a forced refresh that fails keeps the copy that was already good.
 - `bodega build upload` writes every object before any repository-root file, and `packagesite.pkg` last of all.
 - A **hosted** entry's catalogue is never fetched from upstream on a miss. Upstream's catalogue is by construction newer than this mirror's objects and names packages the store has never held, so a miss answers 404 and `pkg` reports the repository as unavailable rather than installing half a transaction. Objects on a hosted entry may still be proxied: an object arriving late can only complete an install, never break one.
 
 A **proxy**-mode entry holds no snapshot, so both halves come from upstream per request and are self-consistent; there is no skew for the ordering rule to prevent.
+
+#### One entry per ABI, and it answers for its own requests
+
+A `freebsd` package is a repository and its version entries are the ABI directories under it, each with its own mode, URL, storage backend and `hidden` flag. A request names the ABI in its path, so every one of those is read off the entry that ABI names: `FreeBSD:13:amd64` in proxy mode beside a mirrored `FreeBSD:14:amd64` serves each the way it was configured, and `bodega pkg hide` on one ABI stops it being served whatever the ABI beside it is doing.
+
+#### Identity bytes on the wire
+
+Every upstream fetch bodega makes for this type, the mirror's and the proxy's alike, asks for `Accept-Encoding: identity`, and a response that carries a `Content-Encoding` anyway is refused rather than decoded. Go's HTTP transport asks for gzip on its own and decodes the answer transparently, so a fetch that says nothing stores what the transport produced rather than what the repository signed. A refusal names the encoding and the URL: the usual cause is an entry pointed at a rewriting proxy rather than at an origin.
 
 #### What is deliberately not served
 

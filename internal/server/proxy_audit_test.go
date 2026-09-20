@@ -705,7 +705,7 @@ func TestARedirectOntoABlockedHostIsRefused(t *testing.T) {
 	}
 	t.Cleanup(func() { upstreamGuard = saved })
 
-	up, err := openUpstream(t.Context(), redirector.URL+"/"+proxyAuditModule+"/@v/list")
+	up, err := openUpstream(t.Context(), redirector.URL+"/"+proxyAuditModule+"/@v/list", false)
 	if err == nil {
 		up.body.Close()
 		t.Fatalf("openUpstream followed a redirect onto %s, which the guard refuses", blocked.URL)
@@ -1123,7 +1123,7 @@ func TestARedirectLoopStopsAtTheHopBound(t *testing.T) {
 	// under a second instead of running for a minute and a half.
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	up, err := openUpstream(ctx, loop.URL+"/loop")
+	up, err := openUpstream(ctx, loop.URL+"/loop", false)
 	if up != nil {
 		up.body.Close()
 	}

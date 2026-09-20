@@ -172,7 +172,7 @@ func TestCutTransferIsNeitherCachedNorChecksummed(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	up, err := openUpstream(t.Context(), ts.URL)
+	up, err := openUpstream(t.Context(), ts.URL, false)
 	if err != nil {
 		t.Fatalf("openUpstream: %v", err)
 	}
@@ -199,7 +199,7 @@ func TestSpoolFileIsRemoved(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	up, err := openUpstream(t.Context(), ts.URL)
+	up, err := openUpstream(t.Context(), ts.URL, false)
 	if err != nil {
 		t.Fatalf("openUpstream: %v", err)
 	}

@@ -29,6 +29,11 @@ const (
 	// What fbDotPath resolves to: the path the key is built from, the local
 	// tree writes, and a client requests.
 	fbDotResolved = "Hashed/FreeBSD-telnet-14.snap20260920075547~2$ea5o6tyi.pkg"
+	// A package at the repository root, with no directory segment at all. It
+	// is the layout the numbered contract names beside All/Hashed/, and the
+	// one a path-joining bug reaches first: filepath.Dir of it is the
+	// repository directory itself.
+	fbRootPath = "root.pkg"
 )
 
 // fbCatalog builds a packagesite archive in the shape upstream publishes it:
@@ -64,6 +69,12 @@ func fbCatalog(t *testing.T, pack string, repoPaths ...string) []byte {
 		t.Fatalf("close tar: %v", err)
 	}
 
+	return fbPack(t, pack, body.Bytes())
+}
+
+// fbPack compresses body the way packing_format names.
+func fbPack(t *testing.T, pack string, body []byte) []byte {
+	t.Helper()
 	var out bytes.Buffer
 	switch pack {
 	case "tzst":
@@ -71,7 +82,7 @@ func fbCatalog(t *testing.T, pack string, repoPaths ...string) []byte {
 		if err != nil {
 			t.Fatalf("zstd writer: %v", err)
 		}
-		if _, err := enc.Write(body.Bytes()); err != nil {
+		if _, err := enc.Write(body); err != nil {
 			t.Fatalf("zstd write: %v", err)
 		}
 		if err := enc.Close(); err != nil {
@@ -79,16 +90,52 @@ func fbCatalog(t *testing.T, pack string, repoPaths ...string) []byte {
 		}
 	case "tgz":
 		gz := gzip.NewWriter(&out)
-		if _, err := gz.Write(body.Bytes()); err != nil {
+		if _, err := gz.Write(body); err != nil {
 			t.Fatalf("gzip write: %v", err)
 		}
 		if err := gz.Close(); err != nil {
 			t.Fatalf("gzip close: %v", err)
 		}
 	default:
-		t.Fatalf("fbCatalog has no packing for %q", pack)
+		t.Fatalf("fbPack has no packing for %q", pack)
 	}
 	return out.Bytes()
+}
+
+// fbData builds a data.pkg in the shape upstream publishes it: data.sig,
+// data.pub and a data member holding one JSON document.
+//
+// The member names are data's own rather than packagesite's, which is what a
+// read-only fetch of FreeBSD:14:amd64/base_latest/data.pkg reports, and the
+// document is one object with a packages array rather than a record per line.
+// A reader written against packagesite's spelling walks past every member of
+// this and reports the archive as empty.
+func fbData(t *testing.T, pack string, repoPaths ...string) []byte {
+	t.Helper()
+	var records []string
+	for i, rel := range repoPaths {
+		records = append(records, `{"name":"data`+string(rune('a'+i))+`","origin":"misc/pkg","version":"1.0","repopath":"`+rel+`"}`)
+	}
+	doc := `{"groups":[],"expired_packages":[],"packages":[` + strings.Join(records, ",") + `]}`
+
+	var body bytes.Buffer
+	tw := tar.NewWriter(&body)
+	for _, m := range []struct{ name, content string }{
+		{"data.sig", strings.Repeat("s", 256)},
+		{"data.pub", strings.Repeat("p", 451)},
+		{"data", doc},
+	} {
+		if err := tw.WriteHeader(&tar.Header{Name: m.name, Mode: 0o644, Size: int64(len(m.content))}); err != nil {
+			t.Fatalf("tar header %s: %v", m.name, err)
+		}
+		if _, err := tw.Write([]byte(m.content)); err != nil {
+			t.Fatalf("tar body %s: %v", m.name, err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close tar: %v", err)
+	}
+	return fbPack(t, pack, body.Bytes())
 }
 
 // R2. packing_format is read out of meta.conf, and an absent key is reported
@@ -147,6 +194,7 @@ func TestCatalogRepoPathsCoverBothLayouts(t *testing.T) {
 	}{
 		{"latest", []string{fbHashedPath, "All/Hashed/other-1.0~2$abcdef.pkg"}, []string{fbHashedPath, "All/Hashed/other-1.0~2$abcdef.pkg"}},
 		{"base_latest", []string{fbDotPath}, []string{fbDotResolved}},
+		{"repository root", []string{fbRootPath}, []string{fbRootPath}},
 		{"both at once", []string{fbHashedPath, fbDotPath}, []string{fbHashedPath, fbDotResolved}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -202,8 +250,9 @@ func TestCatalogRefusesARepoPathThatEscapesTheRepository(t *testing.T) {
 // things in.
 type fbUpstream struct {
 	*httptest.Server
-	asked []string
-	check func(path string)
+	asked  []string
+	check  func(path string)
+	record func(r *http.Request)
 }
 
 func newFBUpstream(t *testing.T, bodies map[string]string) *fbUpstream {
@@ -212,6 +261,9 @@ func newFBUpstream(t *testing.T, bodies map[string]string) *fbUpstream {
 	up.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rel := strings.TrimPrefix(r.URL.Path, "/")
 		up.asked = append(up.asked, rel)
+		if up.record != nil {
+			up.record(r)
+		}
 		if up.check != nil {
 			up.check(rel)
 		}
@@ -246,13 +298,15 @@ func fbFixture(t *testing.T, upstreamURL string) (*Config, *manifest.Store) {
 // runs inside the upstream handler rather than after the fetch, because the
 // failure this guards is a window rather than an end state.
 func TestMirrorPlacesTheCatalogueOnlyAfterEveryObject(t *testing.T) {
-	catalog := string(fbCatalog(t, "tzst", fbHashedPath, fbDotPath))
+	catalog := string(fbCatalog(t, "tzst", fbHashedPath, fbDotPath, fbRootPath))
+	data := string(fbData(t, "tzst", fbHashedPath, fbDotPath, fbRootPath))
 	up := newFBUpstream(t, map[string]string{
-		manifest.FreeBSDMetaFile:    "packing_format = \"tzst\";\n",
+		manifest.FreeBSDMetaFile:    "packing_format = \"tzst\";\ndata = \"data\";\n",
 		manifest.FreeBSDCatalogFile: catalog,
-		manifest.FreeBSDDataFile:    "data archive bytes",
+		manifest.FreeBSDDataFile:    data,
 		fbHashedPath:                "latest layout package",
 		fbDotResolved:               "base_latest layout package",
+		fbRootPath:                  "repository-root layout package",
 	})
 	cfg, store := fbFixture(t, up.URL)
 	repoDir := filepath.Join(cfg.BuildRoot, "freebsd", fbABI, "latest")
@@ -276,9 +330,10 @@ func TestMirrorPlacesTheCatalogueOnlyAfterEveryObject(t *testing.T) {
 
 	for rel, want := range map[string]string{
 		manifest.FreeBSDCatalogFile: catalog,
-		manifest.FreeBSDDataFile:    "data archive bytes",
+		manifest.FreeBSDDataFile:    data,
 		fbHashedPath:                "latest layout package",
 		fbDotResolved:               "base_latest layout package",
+		fbRootPath:                  "repository-root layout package",
 	} {
 		got, err := os.ReadFile(filepath.Join(repoDir, filepath.FromSlash(rel)))
 		if err != nil {
@@ -297,7 +352,7 @@ func TestMirrorReadsPackingFormatRatherThanTheExtension(t *testing.T) {
 	up := newFBUpstream(t, map[string]string{
 		manifest.FreeBSDMetaFile:    "version = 2;\npacking_format = \"tgz\";\n",
 		manifest.FreeBSDCatalogFile: string(fbCatalog(t, "tgz", fbHashedPath)),
-		manifest.FreeBSDDataFile:    "data archive bytes",
+		manifest.FreeBSDDataFile:    string(fbData(t, "tgz", fbHashedPath)),
 		fbHashedPath:                "latest layout package",
 	})
 	cfg, store := fbFixture(t, up.URL)
@@ -320,7 +375,7 @@ func TestFreeBSDArtifactPathsPutTheCatalogueLast(t *testing.T) {
 	up := newFBUpstream(t, map[string]string{
 		manifest.FreeBSDMetaFile:    "packing_format = \"tzst\";\n",
 		manifest.FreeBSDCatalogFile: catalog,
-		manifest.FreeBSDDataFile:    "data archive bytes",
+		manifest.FreeBSDDataFile:    string(fbData(t, "tzst", fbHashedPath, fbDotPath)),
 		fbHashedPath:                "latest layout package",
 		fbDotResolved:               "base_latest layout package",
 	})
@@ -406,5 +461,279 @@ func TestMirrorNamesTheMissingURL(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the refusal does not name %q: %v", want, err)
 		}
+	}
+}
+
+// R5. A cut transfer leaves nothing behind that a later run can mistake for a
+// mirrored object.
+//
+// The failure this guards shipped: downloadURL creates and truncates the
+// destination before copying and leaves the stub there when the body ends
+// early, and the next ordinary fetch skips an existing file. One short read
+// was enough to publish a catalogue over 3 bytes of a 100-byte package, with
+// no failure reported on the run that did it.
+func TestMirrorRefetchesAnObjectAfterACutTransfer(t *testing.T) {
+	catalog := string(fbCatalog(t, "tzst", fbHashedPath))
+	data := string(fbData(t, "tzst", fbHashedPath))
+	whole := strings.Repeat("x", 100)
+
+	var objectRequests int
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch strings.TrimPrefix(r.URL.Path, "/") {
+		case manifest.FreeBSDMetaFile:
+			_, _ = io.WriteString(w, "packing_format = \"tzst\";\n")
+		case manifest.FreeBSDCatalogFile:
+			_, _ = io.WriteString(w, catalog)
+		case manifest.FreeBSDDataFile:
+			_, _ = io.WriteString(w, data)
+		case fbHashedPath:
+			objectRequests++
+			if objectRequests == 1 {
+				// A declared length the body does not reach: what a reset
+				// connection or a truncated origin object looks like on the
+				// wire, and the only signal that the copy is short.
+				w.Header().Set("Content-Length", "100")
+				_, _ = io.WriteString(w, "cut")
+				return
+			}
+			_, _ = io.WriteString(w, whole)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(up.Close)
+
+	cfg, store := fbFixture(t, up.URL)
+	repoDir := filepath.Join(cfg.BuildRoot, "freebsd", fbABI, "latest")
+	object := filepath.Join(repoDir, filepath.FromSlash(fbHashedPath))
+
+	if sum := FetchFreeBSD(cfg, store, ""); sum.Failures != 1 {
+		t.Fatalf("a cut transfer reported %d failures, want 1: %+v", sum.Failures, sum.Results)
+	}
+	if _, err := os.Stat(object); err == nil {
+		t.Error("the cut transfer left a file where the package belongs; the next run skips it")
+	}
+	if CheckFreeBSDStage(cfg, "latest", manifest.VersionEntry{Version: fbABI}).Fetched {
+		t.Error("the catalogue was placed over a failed object fetch")
+	}
+
+	if sum := FetchFreeBSD(cfg, store, ""); sum.Failures != 0 {
+		t.Fatalf("the retry reported %d failures: %+v", sum.Failures, sum.Results)
+	}
+	if objectRequests != 2 {
+		t.Errorf("the package was requested %d times, want 2: the retry skipped it", objectRequests)
+	}
+	body, err := os.ReadFile(object)
+	if err != nil {
+		t.Fatalf("read the mirrored package: %v", err)
+	}
+	if string(body) != whole {
+		t.Errorf("the mirrored package holds %d bytes, want the %d upstream served", len(body), len(whole))
+	}
+	if !CheckFreeBSDStage(cfg, "latest", manifest.VersionEntry{Version: fbABI}).Fetched {
+		t.Error("the retry fetched every object and still placed no catalogue")
+	}
+
+	entries, err := os.ReadDir(filepath.Dir(object))
+	if err != nil {
+		t.Fatalf("read the mirrored directory: %v", err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".part-") {
+			t.Errorf("a staging file survived the run: %s", entry.Name())
+		}
+	}
+}
+
+// R5. A forced refresh that fails keeps the copy that was already good. The
+// alternative is a mirror that gets worse every time an operator reaches for
+// --force during an upstream wobble.
+func TestMirrorKeepsAGoodObjectWhenAForcedRefreshFails(t *testing.T) {
+	catalog := string(fbCatalog(t, "tzst", fbHashedPath))
+	data := string(fbData(t, "tzst", fbHashedPath))
+	cut := false
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch strings.TrimPrefix(r.URL.Path, "/") {
+		case manifest.FreeBSDMetaFile:
+			_, _ = io.WriteString(w, "packing_format = \"tzst\";\n")
+		case manifest.FreeBSDCatalogFile:
+			_, _ = io.WriteString(w, catalog)
+		case manifest.FreeBSDDataFile:
+			_, _ = io.WriteString(w, data)
+		case fbHashedPath:
+			if cut {
+				w.Header().Set("Content-Length", "64")
+				_, _ = io.WriteString(w, "half")
+				return
+			}
+			_, _ = io.WriteString(w, "the good package")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(up.Close)
+
+	cfg, store := fbFixture(t, up.URL)
+	if sum := FetchFreeBSD(cfg, store, ""); sum.Failures != 0 {
+		t.Fatalf("first mirror reported %d failures: %+v", sum.Failures, sum.Results)
+	}
+
+	cut = true
+	cfg.Force = true
+	if sum := FetchFreeBSD(cfg, store, ""); sum.Failures != 1 {
+		t.Fatalf("the forced refresh reported %d failures, want 1: %+v", sum.Failures, sum.Results)
+	}
+	body, err := os.ReadFile(filepath.Join(cfg.BuildRoot, "freebsd", fbABI, "latest", filepath.FromSlash(fbHashedPath)))
+	if err != nil {
+		t.Fatalf("read the mirrored package after a failed refresh: %v", err)
+	}
+	if string(body) != "the good package" {
+		t.Errorf("the failed refresh replaced a good object with %q", body)
+	}
+}
+
+// R3. Every upstream request this mirror makes asks for identity bytes, and a
+// body that arrives encoded anyway is refused rather than decoded.
+//
+// Go's transport adds "Accept-Encoding: gzip" on its own and decodes the
+// answer transparently, so a mirror that says nothing stores whatever the
+// transport produced. The archives carry FreeBSD's signature as a member, and
+// the client reports the difference as a signature failure against bodega.
+func TestMirrorAsksUpstreamForIdentityEncoding(t *testing.T) {
+	var encodings []string
+	up := newFBUpstream(t, map[string]string{
+		manifest.FreeBSDMetaFile:    "packing_format = \"tzst\";\n",
+		manifest.FreeBSDCatalogFile: string(fbCatalog(t, "tzst", fbHashedPath)),
+		manifest.FreeBSDDataFile:    string(fbData(t, "tzst", fbHashedPath)),
+		fbHashedPath:                "latest layout package",
+	})
+	up.check = func(string) {}
+	up.record = func(r *http.Request) { encodings = append(encodings, r.Header.Get("Accept-Encoding")) }
+
+	cfg, store := fbFixture(t, up.URL)
+	if sum := FetchFreeBSD(cfg, store, ""); sum.Failures != 0 {
+		t.Fatalf("mirror reported %d failures: %+v", sum.Failures, sum.Results)
+	}
+	if len(encodings) != 4 {
+		t.Fatalf("the mirror made %d requests, want 4 (three root files and one object): %v", len(encodings), up.asked)
+	}
+	for i, enc := range encodings {
+		if enc != "identity" {
+			t.Errorf("request %d (%s) asked for Accept-Encoding %q, want identity", i, up.asked[i], enc)
+		}
+	}
+}
+
+// R3, the other half: an upstream that encodes anyway is a proxy rewriting
+// the bytes, and the mirror writes nothing rather than store what it cannot
+// vouch for.
+func TestMirrorRefusesAnEncodedUpstreamBody(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		_, _ = io.WriteString(w, "not the bytes that were signed")
+	}))
+	t.Cleanup(up.Close)
+
+	cfg, store := fbFixture(t, up.URL)
+	sum := FetchFreeBSD(cfg, store, "")
+	if sum.Failures != 1 {
+		t.Fatalf("an encoded body reported %d failures, want 1", sum.Failures)
+	}
+	if err := sum.Results[0].Err; err == nil || !strings.Contains(err.Error(), "Content-Encoding") {
+		t.Errorf("the refusal does not name the encoding: %v", err)
+	}
+	if fileExists(filepath.Join(cfg.BuildRoot, "freebsd", freeBSDStagingDir, fbABI, "latest", manifest.FreeBSDMetaFile)) {
+		t.Error("an encoded body was written to staging")
+	}
+}
+
+// R4, R5. Both published archives name objects, so both decide what gets
+// mirrored.
+//
+// data.pkg is fetched a moment before packagesite.pkg from a repository that
+// rebuilds continuously, so the two can describe different generations — and
+// bodega publishes the pair byte for byte, because rewriting either destroys
+// the signature it carries. Mirroring only what the catalogue named left
+// data.pkg describing packages this store had never held, which a client
+// reading data.pkg resolves and then 404s on.
+func TestMirrorFetchesEveryObjectBothArchivesName(t *testing.T) {
+	// The upstream rebuilt between the two reads: data.pkg is one generation
+	// and packagesite.pkg the next, and they name different packages.
+	data := string(fbData(t, "tzst", fbDotPath))
+	catalog := string(fbCatalog(t, "tzst", fbHashedPath))
+	up := newFBUpstream(t, map[string]string{
+		manifest.FreeBSDMetaFile:    "packing_format = \"tzst\";\ndata = \"data\";\n",
+		manifest.FreeBSDCatalogFile: catalog,
+		manifest.FreeBSDDataFile:    data,
+		fbHashedPath:                "the generation packagesite.pkg names",
+		fbDotResolved:               "the generation data.pkg names",
+	})
+
+	cfg, store := fbFixture(t, up.URL)
+	repoDir := filepath.Join(cfg.BuildRoot, "freebsd", fbABI, "latest")
+	up.check = func(rel string) {
+		if slices.Contains(manifest.FreeBSDCatalogFiles, rel) {
+			return
+		}
+		// Neither archive may be readable while an object is still in
+		// flight: a client reading either one here resolves this package.
+		for _, name := range []string{manifest.FreeBSDCatalogFile, manifest.FreeBSDDataFile} {
+			if _, err := os.Stat(filepath.Join(repoDir, name)); err == nil {
+				t.Errorf("%s was in place while %s was still being fetched", name, rel)
+			}
+		}
+	}
+
+	if sum := FetchFreeBSD(cfg, store, ""); sum.Failures != 0 {
+		t.Fatalf("mirror reported %d failures: %+v", sum.Failures, sum.Results)
+	}
+	for rel, want := range map[string]string{
+		fbHashedPath:                "the generation packagesite.pkg names",
+		fbDotResolved:               "the generation data.pkg names",
+		manifest.FreeBSDCatalogFile: catalog,
+		manifest.FreeBSDDataFile:    data,
+	} {
+		got, err := os.ReadFile(filepath.Join(repoDir, filepath.FromSlash(rel)))
+		if err != nil {
+			t.Fatalf("read the mirrored %s: %v", rel, err)
+		}
+		if string(got) != want {
+			t.Errorf("%s mirrored %d bytes, want the %d upstream served", rel, len(got), len(want))
+		}
+	}
+}
+
+// R4. data.pkg carries its records under its own member names, in one JSON
+// document rather than a record per line, and meta.conf says which member.
+// A reader written against packagesite's spelling walks past all three
+// members and reports an archive that names 535 packages as empty.
+func TestDataArchiveNamesItsOwnObjects(t *testing.T) {
+	archive := filepath.Join(t.TempDir(), manifest.FreeBSDDataFile)
+	if err := os.WriteFile(archive, fbData(t, "tzst", fbDotPath, fbRootPath, fbHashedPath), 0o644); err != nil {
+		t.Fatalf("write data.pkg: %v", err)
+	}
+
+	member, err := freeBSDDataMember([]byte("version = 2;\npacking_format = \"tzst\";\ndata = \"data\";\n"))
+	if err != nil {
+		t.Fatalf("read the data key: %v", err)
+	}
+	got, err := freeBSDDataRepoPaths(archive, "tzst", member)
+	if err != nil {
+		t.Fatalf("read data.pkg: %v", err)
+	}
+	if want := []string{fbDotResolved, fbRootPath, fbHashedPath}; !slices.Equal(got, want) {
+		t.Errorf("data.pkg named %v, want %v", got, want)
+	}
+
+	// meta.conf version 1 predates the key, so the customary name stands in.
+	if member, err := freeBSDDataMember([]byte("packing_format = \"tzst\";\n")); err != nil || member != "data" {
+		t.Errorf("an absent data key = (%q, %v), want data", member, err)
+	}
+	// A member meta.conf names and the archive does not hold is reported by
+	// that name: it is the case where the default above was the wrong guess.
+	if _, err := freeBSDDataRepoPaths(archive, "tzst", "records"); err == nil {
+		t.Error("an archive holding no such member was accepted")
+	} else if !strings.Contains(err.Error(), "records") {
+		t.Errorf("the refusal does not name the member: %v", err)
 	}
 }

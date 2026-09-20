@@ -16,6 +16,8 @@
 . "${E2E_DIR:?}/lib/remote.sh"
 # shellcheck source=../lib/bodega.sh
 . "${E2E_DIR:?}/lib/bodega.sh"
+# shellcheck source=../lib/freebsd.sh
+. "${E2E_DIR:?}/lib/freebsd.sh"
 
 if [ "${E2E_DRY_RUN:-no}" != yes ] &&
 	{ [ "${E2E_SERVER_UP:-no}" != yes ] || [ "${E2E_CLIENT_UP:-no}" != yes ]; }; then
@@ -92,6 +94,77 @@ else
 		"curl $E2E_BASE_URL/pypi/simple/six/" 0 "internal/server/pypi.go:62"
 fi
 
+# ---- freebsd, both repopath layouts ----------------------------------------
+#
+# A pkg client reads meta.conf, then packagesite.pkg, then each package at the
+# repopath its own catalogue names. Every one of those is compared against the
+# fixture bytes rather than against a status code: the two archives carry
+# FreeBSD's signature as a member, so a byte of transformation anywhere on this
+# path is a signature failure the client reports against bodega.
+#
+# The upstream is stopped first. These entries are hosted, so nothing here may
+# reach it, and taking it away is how that stops being an assumption.
+
+E2E_HOST=server
+e2e_freebsd_upstream_stop server || true
+e2e_on server "curl -s -o /dev/null -w '%{http_code}' --max-time 5 '$E2E_FREEBSD_URL/latest/meta.conf' || true" || true
+check_ne SRV-FBSD-OFFLINE "the fixture pkg upstream is down for the checks below" \
+	"200" "$E2E_OUT" "test/e2e/lib/freebsd.sh" "curl $E2E_FREEBSD_URL/latest/meta.conf"
+
+# e2e_freebsd_same <id> <title> <repo> <repopath> — the served bytes against
+# the fixture's, by digest.
+e2e_freebsd_same() {
+	local id="$1" title="$2" repo="$3" rel="$4" served="" stored=""
+	e2e_on server "curl -sf --max-time 30 '$E2E_BASE_URL/freebsd/FreeBSD:14:amd64/$repo/$rel' | sha256sum | cut -d' ' -f1" || true
+	served="$E2E_OUT"
+	e2e_on server "sudo sha256sum '$E2E_FREEBSD_ROOT/$repo/$rel' | cut -d' ' -f1" || true
+	stored="$E2E_OUT"
+	check_eq "$id" "$title" "$stored" "${served:-nothing served}" \
+		"internal/server/freebsd.go:57" "curl $E2E_BASE_URL/freebsd/FreeBSD:14:amd64/$repo/$rel"
+}
+
+for fbrepo in latest base_latest; do
+	e2e_freebsd_same "SRV-FBSD-META-$fbrepo" "$fbrepo serves meta.conf byte for byte" \
+		"$fbrepo" "meta.conf"
+	e2e_freebsd_same "SRV-FBSD-CATALOG-$fbrepo" "$fbrepo serves packagesite.pkg byte for byte" \
+		"$fbrepo" "packagesite.pkg"
+	e2e_freebsd_same "SRV-FBSD-DATA-$fbrepo" "$fbrepo serves data.pkg byte for byte" \
+		"$fbrepo" "data.pkg"
+
+	# The object is read out of the catalogue bodega just served, because the
+	# catalogue is the only authority on where a package's bytes are and a
+	# hardcoded path here would test the fixture instead of the route. The
+	# leading "./" goes the way a client drops it.
+	e2e_on server "curl -sf --max-time 30 '$E2E_BASE_URL/freebsd/FreeBSD:14:amd64/$fbrepo/packagesite.pkg' \
+		| zstd -d 2>/dev/null | tar -xOf - packagesite.yaml \
+		| python3 -c 'import json,sys; print(json.loads(sys.stdin.readline())[\"repopath\"].lstrip(\"./\"))'" || true
+	fbpath="$E2E_OUT"
+	if [ -n "$fbpath" ]; then
+		e2e_freebsd_same "SRV-FBSD-OBJ-$fbrepo" "$fbrepo serves the package its own catalogue names" \
+			"$fbrepo" "$fbpath"
+	else
+		e2e_record "SRV-FBSD-OBJ-$fbrepo" FAIL "$fbrepo serves the package its own catalogue names" \
+			"a repopath out of the served catalogue" "$(e2e_excerpt "$E2E_OUT$E2E_ERR")" \
+			"curl packagesite.pkg | zstd -d | tar -xO packagesite.yaml" "$E2E_RC" \
+			"internal/builder/freebsd_catalog.go:161"
+	fi
+done
+
+# The repository-root layout, which no upstream fixture publishes: a package
+# whose repopath has no directory segment at all.
+e2e_freebsd_same SRV-FBSD-ROOT "base_latest serves a package at the repository root" \
+	"base_latest" "root.pkg"
+
+# Refused by name rather than proxied, on a repository that holds neither.
+e2e_http server "/freebsd/FreeBSD:14:amd64/latest/digests.pkg" || true
+check_eq SRV-FBSD-GONE "a path no current pkg repository publishes is refused" \
+	"404" "$E2E_OUT" "internal/server/freebsd.go:44" \
+	"curl $E2E_BASE_URL/freebsd/FreeBSD:14:amd64/latest/digests.pkg"
+
+E2E_HOST=client
+e2e_index_check SRV-FBSD-CLIENT "a client host reaches the pkg repository root" \
+	"/freebsd/FreeBSD:14:amd64/latest/meta.conf" "internal/server/freebsd.go:57"
+
 # ---- health and metadata ---------------------------------------------------
 
 e2e_index_check SRV-02 "healthz answers without auth" "/healthz" "internal/server/server.go:748"
@@ -102,4 +175,4 @@ e2e_http client "/no-such-path" || true
 check_eq SRV-05 "an unknown path under the web root is a 404" "404" "$E2E_OUT" \
 	"internal/server/web.go:14" "curl $E2E_BASE_URL/no-such-path"
 
-unset wheel
+unset wheel fbrepo fbpath

@@ -18,6 +18,7 @@ const (
 	freeBSDABI          = "FreeBSD:14:amd64"
 	freeBSDHashedPath   = "All/Hashed/zogftw-2025.02.23_1~2$snxfrbid.pkg"
 	freeBSDBasePath     = "Hashed/FreeBSD-telnet-14.snap20260920075547~2$ea5o6tyi.pkg"
+	freeBSDRootPath     = "root.pkg"
 	freeBSDCatalogBytes = "\x28\xb5\x2f\xfd not really zstd, but never decoded on this side"
 	freeBSDMetaBytes    = "version = 2;\npacking_format = \"tzst\";\nmanifests = \"packagesite.yaml\";\n"
 )
@@ -98,14 +99,19 @@ func TestFreeBSDNegotiatesNoContentEncoding(t *testing.T) {
 // pass against a fixture that avoided the characters.
 func TestFreeBSDServesBothCatalogueLayouts(t *testing.T) {
 	for _, tc := range []struct {
+		name     string
 		repo     string
 		repoPath string
 		body     string
 	}{
-		{"latest", freeBSDHashedPath, "latest layout package"},
-		{"base_latest", freeBSDBasePath, "base_latest layout package"},
+		{"All/Hashed", "latest", freeBSDHashedPath, "latest layout package"},
+		{"Hashed", "base_latest", freeBSDBasePath, "base_latest layout package"},
+		// A package at the repository root, no directory segment at all: the
+		// layout the numbered contract names beside All/Hashed/, and the one
+		// a route that assumed a prefix serves as a repository-root file.
+		{"repository root", "base_latest", freeBSDRootPath, "repository-root layout package"},
 	} {
-		t.Run(tc.repo, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			s := hostedServer(t)
 			mirrored(t, s, tc.repo, map[string]string{
 				manifest.FreeBSDCatalogFile: freeBSDCatalogBytes,
@@ -316,5 +322,156 @@ func TestFreeBSDRefusesAPathThatEscapesItsRepository(t *testing.T) {
 		if _, _, _, ok := splitFreeBSDPath(p); !ok {
 			t.Errorf("splitFreeBSDPath(%q) refused a path a real pkg client composes", p)
 		}
+	}
+}
+
+// R5, R7. A repository carries one entry per ABI and they are configured
+// apart, so the mode is read off the entry the request names.
+//
+// packageMode reads the first version entry, which made FreeBSD:13's decision
+// answer for FreeBSD:14: a hosted ABI whose objects were never mirrored got
+// upstream's catalogue published under it, and in the other ordering a
+// configured proxy ABI 404d on every path. Both orderings are driven here
+// because either one alone passes against the bug half the time.
+func TestFreeBSDReadsTheModeOfTheABIThatWasAsked(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		other      string // the mode of the ABI nobody asked for
+		asked      string // the mode of FreeBSD:14, which the request names
+		wantStatus int
+	}{
+		{"hosted ABI behind a proxy one", manifest.ModeProxy, manifest.ModeHosted, http.StatusNotFound},
+		{"proxy ABI behind a hosted one", manifest.ModeHosted, manifest.ModeProxy, http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte("upstream catalogue"))
+			}))
+			t.Cleanup(upstream.Close)
+
+			s := proxyingServer(t)
+			addVersion(t, s, manifest.TypeFreeBSD, "latest", manifest.VersionEntry{
+				Version: "FreeBSD:13:amd64", URL: upstream.URL, Mode: tc.other,
+			})
+			addVersion(t, s, manifest.TypeFreeBSD, "latest", manifest.VersionEntry{
+				Version: freeBSDABI, URL: upstream.URL, Mode: tc.asked,
+			})
+
+			status, body := getStatusAndBody(t, s, freeBSDURL("latest", manifest.FreeBSDCatalogFile))
+			if status != tc.wantStatus {
+				t.Fatalf("GET the catalogue of a %s ABI = %d, want %d: %s", tc.asked, status, tc.wantStatus, body)
+			}
+			if tc.asked == manifest.ModeHosted && strings.Contains(body, "upstream catalogue") {
+				t.Error("a mirrored ABI was served upstream's catalogue, which names packages this store has never held")
+			}
+		})
+	}
+}
+
+// A hidden ABI is not served, whatever the ABI beside it is doing.
+//
+// isPackageHidden answers for the repository and reports hidden only when
+// every ABI is, which left `bodega pkg hide` with no effect on a repository
+// carrying more than one: the quarantined ABI kept serving its catalogue and
+// its packages. hide is the control an operator reaches for when an artifact
+// has to stop being handed out, so it holds at the entry that was asked for.
+func TestFreeBSDDoesNotServeAHiddenABI(t *testing.T) {
+	var reached int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached++
+		_, _ = w.Write([]byte("upstream bytes"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	s := proxyingServer(t)
+	addVersion(t, s, manifest.TypeFreeBSD, "latest", manifest.VersionEntry{Version: "FreeBSD:13:amd64"})
+	addVersion(t, s, manifest.TypeFreeBSD, "latest", manifest.VersionEntry{
+		Version: freeBSDABI, URL: upstream.URL, Mode: manifest.ModeProxy, Hidden: true,
+	})
+	seed(t, s, manifest.TypeFreeBSD, map[string]string{
+		manifest.FreeBSDKey(freeBSDABI, "latest", manifest.FreeBSDCatalogFile): freeBSDCatalogBytes,
+		manifest.FreeBSDKey(freeBSDABI, "latest", freeBSDHashedPath):           "a mirrored package",
+	})
+
+	for _, rest := range []string{manifest.FreeBSDCatalogFile, freeBSDHashedPath, manifest.FreeBSDMetaFile} {
+		status, body := getStatusAndBody(t, s, freeBSDURL("latest", rest))
+		if status != http.StatusNotFound {
+			t.Errorf("GET %s under a hidden ABI = %d, want 404: %s", rest, status, body)
+		}
+	}
+	if reached != 0 {
+		t.Errorf("a hidden ABI's proxy miss contacted upstream %d times", reached)
+	}
+
+	// The visible ABI beside it still answers, which is what makes the check
+	// above an assertion about the entry rather than about the repository.
+	seed(t, s, manifest.TypeFreeBSD, map[string]string{
+		manifest.FreeBSDKey("FreeBSD:13:amd64", "latest", manifest.FreeBSDCatalogFile): freeBSDCatalogBytes,
+	})
+	status, _ := getStatusAndBody(t, s, "/freebsd/FreeBSD:13:amd64/latest/"+manifest.FreeBSDCatalogFile)
+	if status != http.StatusOK {
+		t.Errorf("GET the visible ABI's catalogue = %d, want 200", status)
+	}
+}
+
+// R3. The upstream request asks for identity bytes and a body that arrives
+// encoded anyway is refused rather than cached.
+//
+// Go's transport adds "Accept-Encoding: gzip" on its own and decodes the
+// answer transparently, so what lands in the store is what the transport
+// produced. These archives carry their signature as a member; the response
+// header a client sees says nothing about what bodega stored, which is why
+// this asserts on the upstream request and on the cached object.
+func TestFreeBSDProxyAsksUpstreamForIdentityEncoding(t *testing.T) {
+	var encoding string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		encoding = r.Header.Get("Accept-Encoding")
+		_, _ = w.Write([]byte(freeBSDCatalogBytes))
+	}))
+	t.Cleanup(upstream.Close)
+
+	s := proxyingServer(t)
+	addVersion(t, s, manifest.TypeFreeBSD, "latest", manifest.VersionEntry{
+		Version: freeBSDABI, URL: upstream.URL, Mode: manifest.ModeProxy,
+	})
+
+	status, body := getStatusAndBody(t, s, freeBSDURL("latest", manifest.FreeBSDCatalogFile))
+	if status != http.StatusOK {
+		t.Fatalf("GET a proxied catalogue = %d, want 200: %s", status, body)
+	}
+	if encoding != "identity" {
+		t.Errorf("the upstream request asked for Accept-Encoding %q, want identity", encoding)
+	}
+	if body != freeBSDCatalogBytes {
+		t.Errorf("served %q, want the upstream bytes unchanged", body)
+	}
+	// Again from the store: a decoded body caches decoded, and the second
+	// request is the one every client after the first gets.
+	status, body = getStatusAndBody(t, s, freeBSDURL("latest", manifest.FreeBSDCatalogFile))
+	if status != http.StatusOK || body != freeBSDCatalogBytes {
+		t.Errorf("the cached copy served (%d, %q), want the upstream bytes unchanged", status, body)
+	}
+}
+
+// R3 again: an upstream that encodes after identity was asked for is a proxy
+// rewriting the bytes, and nothing it sends is cached or relayed.
+func TestFreeBSDProxyRefusesAnEncodedUpstreamBody(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		_, _ = w.Write([]byte("not the bytes that were signed"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	s := proxyingServer(t)
+	addVersion(t, s, manifest.TypeFreeBSD, "latest", manifest.VersionEntry{
+		Version: freeBSDABI, URL: upstream.URL, Mode: manifest.ModeProxy,
+	})
+
+	status, _ := getStatusAndBody(t, s, freeBSDURL("latest", manifest.FreeBSDCatalogFile))
+	if status != http.StatusBadGateway {
+		t.Fatalf("GET an encoded upstream body = %d, want 502", status)
+	}
+	if keys := storedKeys(t, s, manifest.TypeFreeBSD, manifest.FreeBSDRepoPrefix(freeBSDABI, "latest")); len(keys) != 0 {
+		t.Errorf("store holds %v after a refused fetch, want nothing", keys)
 	}
 }

@@ -16,6 +16,8 @@
 . "${E2E_DIR:?}/lib/bodega.sh"
 # shellcheck source=../lib/fixtures.sh
 . "${E2E_DIR:?}/lib/fixtures.sh"
+# shellcheck source=../lib/freebsd.sh
+. "${E2E_DIR:?}/lib/freebsd.sh"
 
 if [ "${E2E_DRY_RUN:-no}" != yes ] && [ "${E2E_SERVER_UP:-no}" != yes ]; then
 	E2E_HOST=local
@@ -32,6 +34,27 @@ E2E_HOST=server
 # count nobody can predict.
 e2e_reset_store server || true
 e2e_restart server || true
+
+# ---- the freebsd fixture upstream ------------------------------------------
+#
+# The freebsd entries are the only ones whose upstream this harness supplies,
+# because a hosted freebsd entry takes a whole repository and the public ones
+# run to 182.8 GB. Built before the import so the fetch stage below has
+# something to read.
+
+e2e_freebsd_fixture_build server || true
+check_contains PIPE-FBSD-FIXTURE "the guest builds a pkg repository in both repopath layouts" \
+	"base_latest/root.pkg" "$E2E_OUT$E2E_ERR" "test/e2e/lib/freebsd.sh" \
+	"sh /tmp/e2e-freebsd-fixture.sh" "$E2E_RC"
+
+if e2e_freebsd_upstream_start server; then
+	e2e_record PIPE-FBSD-UPSTREAM PASS "the fixture pkg repository answers on the guest" \
+		"200 for /latest/meta.conf" "200" "systemd-run python3 -m http.server" 0 "test/e2e/lib/freebsd.sh"
+else
+	e2e_record PIPE-FBSD-UPSTREAM FAIL "the fixture pkg repository answers on the guest" \
+		"200 for /latest/meta.conf" "$(e2e_excerpt "$E2E_OUT$E2E_ERR")" \
+		"systemd-run python3 -m http.server" "$E2E_RC" "test/e2e/lib/freebsd.sh"
+fi
 
 # The apt version is a property of the suite the guest tracks, so it is read
 # rather than pinned. A constant goes stale at the next point release and fails
@@ -158,11 +181,6 @@ check_eq PIPE-04 "every recorded dependency is satisfied" 0 "$E2E_RC" \
 # itself and passes whatever landed on disk: the pypi fetch stored a 1.17.0
 # wheel against a manifest pinning 1.16.0 and a manifest-side check called it
 # correct.
-# freebsd is the one fixture in proxy mode, so nothing of it is on disk until a
-# client asks for something. One request warms the repository root; what lands
-# is keyed by the ABI, which is what this entry pins.
-e2e_http server "/freebsd/FreeBSD:14:amd64/latest/meta.conf" || true
-
 for t in $E2E_FIXTURE_TYPES; do
 	want="$(e2e_fixture_version "$t")"
 	case "$t" in

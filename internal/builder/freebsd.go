@@ -3,7 +3,9 @@ package builder
 import (
 	"context"
 	"fmt"
+	"io"
 	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -165,11 +167,12 @@ func mirrorFreeBSDRepo(cfg *Config, d dirs, repo string, ve manifest.VersionEntr
 	// The catalogue is fetched first because it is the only thing that says
 	// which objects exist, and staged rather than placed because nothing it
 	// names has been fetched yet.
+	ctx := context.Background()
 	var staged []string
 	for _, name := range manifest.FreeBSDCatalogFiles {
 		dest := filepath.Join(staging, name)
 		_, _ = fmt.Fprintf(out, "  [freebsd] %s@%s: fetching %s\n", repo, ve.Version, base+"/"+name)
-		if err := downloadURL(dest, base+"/"+name); err != nil {
+		if err := freeBSDDownload(ctx, dest, base+"/"+name); err != nil {
 			return nil, fmt.Errorf("fetch %s for %s@%s: %w", name, repo, ve.Version, err)
 		}
 		staged = append(staged, dest)
@@ -185,11 +188,25 @@ func mirrorFreeBSDRepo(cfg *Config, d dirs, repo string, ve manifest.VersionEntr
 	}
 	_, _ = fmt.Fprintf(out, "  [freebsd] %s@%s: packing_format is %q\n", repo, ve.Version, format)
 
-	repoPaths, err := freeBSDCatalogRepoPaths(filepath.Join(staging, manifest.FreeBSDCatalogFile), format)
+	dataMember, err := freeBSDDataMember(meta)
 	if err != nil {
 		return nil, fmt.Errorf("%s@%s: %w", repo, ve.Version, err)
 	}
-	_, _ = fmt.Fprintf(out, "  [freebsd] %s@%s: the catalogue names %d objects\n", repo, ve.Version, len(repoPaths))
+
+	// Both archives, not the catalogue alone. data.pkg carries its own record
+	// per package — pkg_repo_fetch_data_fd reads the member meta.conf's "data"
+	// key names — and the two are fetched a moment apart from a repository
+	// that rebuilds continuously. Publishing the pair after mirroring only
+	// what packagesite.pkg named leaves data.pkg describing a generation whose
+	// objects were never fetched, and the ordering rule does not help: copying
+	// it last still copies it.
+	repoPaths, err := freeBSDMirrorSet(
+		filepath.Join(staging, manifest.FreeBSDCatalogFile),
+		filepath.Join(staging, manifest.FreeBSDDataFile), format, dataMember)
+	if err != nil {
+		return nil, fmt.Errorf("%s@%s: %w", repo, ve.Version, err)
+	}
+	_, _ = fmt.Fprintf(out, "  [freebsd] %s@%s: the two catalogues name %d objects between them\n", repo, ve.Version, len(repoPaths))
 
 	written := make([]string, 0, len(repoPaths)+len(manifest.FreeBSDCatalogFiles))
 	for _, rel := range repoPaths {
@@ -201,7 +218,7 @@ func mirrorFreeBSDRepo(cfg *Config, d dirs, repo string, ve manifest.VersionEntr
 		if err := mkdirAll(filepath.Dir(dest)); err != nil {
 			return written, err
 		}
-		if err := downloadURL(dest, base+"/"+rel); err != nil {
+		if err := freeBSDDownload(ctx, dest, base+"/"+rel); err != nil {
 			return written, fmt.Errorf("fetch %s for %s@%s: %w", rel, repo, ve.Version, err)
 		}
 		written = append(written, dest)
@@ -220,6 +237,81 @@ func mirrorFreeBSDRepo(cfg *Config, d dirs, repo string, ve manifest.VersionEntr
 	}
 	_, _ = fmt.Fprintf(out, "  [freebsd] %s@%s: ok\n", repo, ve.Version)
 	return written, nil
+}
+
+// freeBSDDownload copies one upstream file to dest, and either writes every
+// byte upstream served or leaves dest as it found it.
+//
+// Three things separate it from downloadURL, and each of them is a way a
+// mirror publishes a catalogue over bytes that are not what it names.
+//
+// It asks for identity encoding and refuses a body that arrives encoded
+// anyway. Go's transport adds "Accept-Encoding: gzip" on its own and decodes
+// the answer transparently, so the bytes written are the ones the transport
+// produced rather than the ones the upstream signed — and a re-encode of an
+// already-compressed archive is a signature failure a client reports against
+// bodega. Setting the header explicitly turns both halves of that off.
+//
+// It compares what it read against the declared Content-Length, because a cut
+// transfer arrives as a short read and no error.
+//
+// And it writes through a temporary sibling and renames, so a failed or
+// partial transfer cannot be mistaken for a mirrored object. downloadURL
+// creates and truncates dest first and leaves the stub behind, which is how a
+// retry skipped a file holding 3 bytes of 100 and published the catalogue
+// over it. A forced refresh that fails keeps the good copy for the same
+// reason.
+func freeBSDDownload(ctx context.Context, dest, url string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil) //nolint:gosec // G704: the URL is the entry's repository root plus a repopath the catalogue reader has already validated.
+	if err != nil {
+		return fmt.Errorf("GET %s: %w", url, err)
+	}
+	req.Header.Set("Accept-Encoding", "identity")
+
+	resp, err := http.DefaultClient.Do(req) //nolint:gosec // G704: see the request above.
+	if err != nil {
+		return fmt.Errorf("GET %s: %w", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
+	}
+	if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
+		return fmt.Errorf("GET %s: the upstream answered with Content-Encoding %q after identity was asked for; "+
+			"decoding it would store bytes the repository never signed, so nothing was written. "+
+			"Point the entry at an origin rather than at a rewriting proxy", url, enc)
+	}
+
+	tmp, err := os.CreateTemp(filepath.Dir(dest), "."+filepath.Base(dest)+".part-*")
+	if err != nil {
+		return fmt.Errorf("stage %s: %w", dest, err)
+	}
+	// Named once: every failure below has to remove the same file, and a
+	// rename makes the remove a no-op rather than a hazard.
+	staged := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(staged)
+	}()
+
+	n, err := io.Copy(tmp, resp.Body)
+	if err != nil {
+		return fmt.Errorf("read %s after %d bytes: %w — nothing was written", url, n, err)
+	}
+	if resp.ContentLength >= 0 && n != resp.ContentLength {
+		return fmt.Errorf("%s sent %d bytes against a declared Content-Length of %d: the transfer was cut and nothing was written", url, n, resp.ContentLength)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("flush %s: %w", staged, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", staged, err)
+	}
+	if err := os.Rename(staged, dest); err != nil {
+		return fmt.Errorf("place %s: %w", dest, err)
+	}
+	return nil
 }
 
 // FreeBSDArtifactPaths returns local/object-key pairs ready for upload, every

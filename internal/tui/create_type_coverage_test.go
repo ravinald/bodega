@@ -91,3 +91,82 @@ func TestAuditTypeOptionsCoverEveryType(t *testing.T) {
 			len(got), len(manifest.AllTypes)+1)
 	}
 }
+
+// The freebsd form asks for an ABI rather than a Version, and every path out
+// of it has to carry that: saveCreateEntry read "Version", found nothing, and
+// fell through to the unknown-type error, so the form could be filled in and
+// never saved. A test that checked the form's field list passed throughout.
+func TestFreeBSDCreateFormSavesTheABIAsTheVersion(t *testing.T) {
+	fields := rebuildCreateFields(manifest.TypeFreeBSD, nil)
+	setFieldValue(fields, "Type", manifest.TypeFreeBSD)
+	setFieldValue(fields, "Mode", "proxy")
+	setFieldValue(fields, "Name", "base_latest")
+	setFieldValue(fields, "ABI", "FreeBSD:14:amd64")
+	setFieldValue(fields, "Source URL", "https://pkg.freebsd.org/FreeBSD:14:amd64/base_latest")
+	setFieldValue(fields, "Skip validation", "yes")
+
+	if msg := validateCreateFields(fields); msg != "" {
+		t.Fatalf("a complete freebsd form was refused: %s", msg)
+	}
+	ve := saveAndReadBack(t, fields, manifest.TypeFreeBSD, "base_latest")
+	if ve.Version != "FreeBSD:14:amd64" {
+		t.Errorf("Version = %q, want the ABI; the route resolves a mode, a URL and a backend by it", ve.Version)
+	}
+	if ve.URL != "https://pkg.freebsd.org/FreeBSD:14:amd64/base_latest" {
+		t.Errorf("URL = %q, want the repository root", ve.URL)
+	}
+	if ve.Mode != manifest.ModeProxy {
+		t.Errorf("Mode = %q, want proxy", ve.Mode)
+	}
+}
+
+// An entry the route will refuse is worth refusing at the form, where it
+// costs a keystroke rather than a client that 400s on every request.
+func TestFreeBSDCreateFormRefusesWhatTheRouteWould(t *testing.T) {
+	for _, tc := range []struct{ name, abi, repo, url, want string }{
+		{"no ABI", "", "latest", "https://pkg.freebsd.org/x/latest", "ABI is required"},
+		{"ABI with a slash", "FreeBSD:14/amd64", "latest", "https://pkg.freebsd.org/x/latest", "ABI must be"},
+		{"repository with a slash", "FreeBSD:14:amd64", "All/latest", "https://pkg.freebsd.org/x/latest", "Name must be"},
+		{"no URL", "FreeBSD:14:amd64", "latest", "", "Source URL is required"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fields := rebuildCreateFields(manifest.TypeFreeBSD, nil)
+			setFieldValue(fields, "Type", manifest.TypeFreeBSD)
+			setFieldValue(fields, "Name", tc.repo)
+			setFieldValue(fields, "ABI", tc.abi)
+			setFieldValue(fields, "Source URL", tc.url)
+			setFieldValue(fields, "Skip validation", "yes")
+
+			msg := validateCreateFields(fields)
+			if !strings.Contains(msg, tc.want) {
+				t.Errorf("validate = %q, want it to name %q", msg, tc.want)
+			}
+		})
+	}
+}
+
+// A pasted manifest reaches the same form, and its version is the ABI. The
+// generic set writes "Version", which no freebsd field is called, so the
+// paste populated everything but the one value the entry cannot be saved
+// without.
+func TestJSONApplyPopulatesTheFreeBSDABI(t *testing.T) {
+	m := &appModel{}
+	m.popup.formFields = rebuildCreateFields(manifest.TypeFreeBSD, nil)
+	setFieldValue(m.popup.formFields, "Type", manifest.TypeFreeBSD)
+
+	apply := m.makeJSONApplyFn()
+	if msg := apply(`{"type":"freebsd","name":"latest",
+	  "versions":[{"version":"FreeBSD:14:amd64","mode":"proxy",
+	               "url":"https://pkg.freebsd.org/FreeBSD:14:amd64/latest"}]}`); msg != "" {
+		t.Fatalf("apply: %s", msg)
+	}
+	for _, tc := range []struct{ label, want string }{
+		{"Name", "latest"},
+		{"ABI", "FreeBSD:14:amd64"},
+		{"Source URL", "https://pkg.freebsd.org/FreeBSD:14:amd64/latest"},
+	} {
+		if got := fieldValueFromSlice(m.popup.formFields, tc.label); got != tc.want {
+			t.Errorf("%s = %q, want %q", tc.label, got, tc.want)
+		}
+	}
+}
