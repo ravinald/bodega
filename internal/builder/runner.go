@@ -28,14 +28,15 @@ type Config struct {
 	Region      string
 	Verbose     bool
 	// Per-type build root overrides. Empty means use BuildRoot.
-	AptRoot    string
-	GitRoot    string
-	PypiRoot   string
-	BinaryRoot string
-	GomodRoot  string
-	HelmRoot   string
-	NpmRoot    string
-	CargoRoot  string
+	AptRoot     string
+	GitRoot     string
+	PypiRoot    string
+	BinaryRoot  string
+	GomodRoot   string
+	HelmRoot    string
+	NpmRoot     string
+	CargoRoot   string
+	FreeBSDRoot string
 	// Stdout is where builder output is written; defaults to os.Stdout.
 	Stdout io.Writer
 	// Force re-fetches even if artifacts already exist on disk.
@@ -158,6 +159,10 @@ func (c *Config) rootFor(typ string) string {
 		if c.CargoRoot != "" {
 			return c.CargoRoot
 		}
+	case "freebsd":
+		if c.FreeBSDRoot != "" {
+			return c.FreeBSDRoot
+		}
 	}
 	return c.BuildRoot
 }
@@ -203,6 +208,7 @@ func NewConfig(app *config.Config, pol *policy.Checker) *Config {
 		HelmRoot:       app.HelmRoot,
 		NpmRoot:        app.NpmRoot,
 		CargoRoot:      app.CargoRoot,
+		FreeBSDRoot:    app.FreeBSDRoot,
 		AutoImportDeps: true,
 		BodegaVersion:  Version,
 		policyChecker:  pol,
@@ -236,6 +242,8 @@ func ArtifactDir(cfg *Config, typ string) string {
 		return d.npm
 	case manifest.TypeCargo:
 		return d.cargo
+	case manifest.TypeFreeBSD:
+		return d.freebsd
 	}
 	return cfg.rootFor(typ)
 }
@@ -353,6 +361,7 @@ type dirs struct {
 	charts   string
 	npm      string
 	cargo    string
+	freebsd  string
 }
 
 func buildDirs(root string) dirs {
@@ -367,6 +376,7 @@ func buildDirs(root string) dirs {
 		charts:   filepath.Join(root, "charts"),
 		npm:      filepath.Join(root, "npm"),
 		cargo:    filepath.Join(root, "cargo"),
+		freebsd:  filepath.Join(root, "freebsd"),
 	}
 }
 

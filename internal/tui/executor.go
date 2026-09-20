@@ -149,7 +149,7 @@ func runBuildStage(buf *bytes.Buffer, bc *builder.Config, store *manifest.Store,
 		s.Print(buf)
 		totalFail += s.Failures
 	case manifest.TypeGit, manifest.TypeBinary, manifest.TypeGomod,
-		manifest.TypeHelm, manifest.TypeNpm, manifest.TypeCargo:
+		manifest.TypeHelm, manifest.TypeNpm, manifest.TypeCargo, manifest.TypeFreeBSD:
 		fmt.Fprintf(buf, "No separate build step for %s — fetch retrieves what ships.\n", entryType)
 	default:
 		return fmt.Errorf("build: no build stage for entry type %q", entryType)
@@ -193,6 +193,8 @@ func runPackageStage(buf *bytes.Buffer, bc *builder.Config, store *manifest.Stor
 		fmt.Fprintf(buf, "No separate package step for npm — the server generates the packument from the manifest entry.\n")
 	case manifest.TypeCargo:
 		fmt.Fprintf(buf, "No separate package step for cargo — clients read the proxied sparse index.\n")
+	case manifest.TypeFreeBSD:
+		fmt.Fprintf(buf, "No separate package step for freebsd — the mirrored catalogue carries FreeBSD's own signature and must not be regenerated.\n")
 	default:
 		return fmt.Errorf("package: no package stage for entry type %q", entryType)
 	}
@@ -336,6 +338,8 @@ func runFetch(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, audi
 			sum = builder.FetchNpm(bc, store, entryFilter)
 		case manifest.TypeCargo:
 			sum = builder.FetchCargo(bc, store, entryFilter)
+		case manifest.TypeFreeBSD:
+			sum = builder.FetchFreeBSD(bc, store, entryFilter)
 		default:
 			return fmt.Errorf("fetch: no fetcher for entry type %q", t)
 		}

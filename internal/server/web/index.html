@@ -317,6 +317,7 @@ body {
 .type-helm { color: #0087ff; }
 .type-npm { color: #ff005f; }
 .type-cargo { color: #d75fd7; }
+.type-freebsd { color: #af0000; }
 </style>
 </head>
 <body>
@@ -342,7 +343,7 @@ body {
 </div>
 
 <script>
-const typeIcons = {apt:'A', git:'G', pypi:'P', binary:'B', gomod:'M', helm:'H', npm:'N', cargo:'C'};
+const typeIcons = {apt:'A', git:'G', pypi:'P', binary:'B', gomod:'M', helm:'H', npm:'N', cargo:'C', freebsd:'F'};
 // typeOrder decides the order types render in and never which types render.
 // apt leads this page deliberately, which manifest.AllTypes build order (binary
 // first) would undo, so the preference is written out rather than derived.
@@ -739,18 +740,32 @@ function getClientUrl(type, entry) {
       return '[registries.bodega]\n'
         + 'index = "sparse+' + base + '/cargo/"\n'
         + '# cargo add --registry bodega ' + entry.name;
+    // FreeBSD hands back a pkg.conf stanza, and ${ABI} stays literal in it:
+    // pkg substitutes the running host's ABI, which is what this entry
+    // records as its version. fingerprints is named because the whole point
+    // of mirroring the catalogue byte for byte is that FreeBSD's own
+    // signature travels inside it — a stanza without this defaults to
+    // signature_type NONE and throws that attestation away at the client.
+    case 'freebsd':
+      return 'bodega-' + entry.name + ': {\n'
+        + '  url: "' + base + '/freebsd/${ABI}/' + entry.name + '",\n'
+        + '  signature_type: "fingerprints",\n'
+        + '  fingerprints: "/usr/share/keys/pkg",\n'
+        + '  enabled: yes\n'
+        + '}';
   }
   return '';
 }
 
 // clientFieldLabel names the detail-pane row holding a type's client
-// instruction. Two of the eight hand back something other than a URL: apt a
-// sources line, cargo a registry stanza. Calling either a "Package URL" sends
-// an operator looking for something to curl.
+// instruction. Three hand back something other than a URL: apt a sources
+// line, cargo a registry stanza, freebsd a pkg.conf repository block. Calling
+// any of them a "Package URL" sends an operator looking for something to curl.
 function clientFieldLabel(type) {
   switch (type) {
     case 'apt': return 'Sources line';
     case 'cargo': return 'Registry stanza';
+    case 'freebsd': return 'Repository stanza';
   }
   return 'Package URL';
 }
@@ -786,7 +801,7 @@ async function showDashboard() {
     html += '<div class="dash-section"><h3>Packages by Type</h3>';
     var maxPkg = 0;
     for (var t in m.by_type) { if (m.by_type[t].packages > maxPkg) maxPkg = m.by_type[t].packages; }
-    var barColors = {apt:'#ffaf00', git:'#8787ff', pypi:'#b8860b', binary:'#00d787', gomod:'#5fd7ff', helm:'#0087ff', npm:'#ff005f', cargo:'#d75fd7'};
+    var barColors = {apt:'#ffaf00', git:'#8787ff', pypi:'#b8860b', binary:'#00d787', gomod:'#5fd7ff', helm:'#0087ff', npm:'#ff005f', cargo:'#d75fd7', freebsd:'#af0000'};
     for (var t of renderTypes(Object.keys(m.by_type || {}))) {
       var bt = m.by_type[t] || {packages:0};
       var w = maxPkg > 0 ? Math.round(bt.packages * 100 / maxPkg) : 0;

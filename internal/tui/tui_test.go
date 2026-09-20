@@ -1368,7 +1368,7 @@ func TestFieldValueFromSlice(t *testing.T) {
 // state as well as the base URL, so aptSources renders it instead. See the
 // comment on clientURL and TestAptSourcesFollowsServerState.
 //
-// Held as a single identity rather than a set so a ninth ecosystem added to
+// Held as a single identity rather than a set so a new ecosystem added to
 // AllTypes fails the tests below rather than joining a growing skip list.
 const clientURLExemptType = manifest.TypeApt
 
@@ -1387,6 +1387,12 @@ var clientURLSeeds = map[string]struct {
 	manifest.TypeGit:    {"org/repo", manifest.VersionEntry{Ref: "v1.0.0"}},
 	manifest.TypeBinary: {"tool", manifest.VersionEntry{Version: "1.0.0", Filename: "tool"}},
 	manifest.TypeCargo:  {"time", manifest.VersionEntry{Version: "0.3.36"}},
+	// The version is the ABI, which is what the pkg.conf stanza leaves as a
+	// literal ${ABI} and what the route carries.
+	manifest.TypeFreeBSD: {"latest", manifest.VersionEntry{
+		Version: "FreeBSD:14:amd64",
+		URL:     "https://pkg.freebsd.org/FreeBSD:14:amd64/latest",
+	}},
 }
 
 // seedClientURLTypes stores one package per member of manifest.AllTypes and

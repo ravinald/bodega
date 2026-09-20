@@ -331,6 +331,37 @@ func ensurePackagedPypi(bcfg *builder.Config, store *manifest.Store) *builder.Su
 	return builder.MergeSummaries(ss...)
 }
 
+// ensureMirroredFreeBSD mirrors any repository whose catalogue is not on disk
+// yet. There is no build or package step: the whole point of the type is that
+// bodega produces none of these bytes, so fetch is the entire cascade.
+func ensureMirroredFreeBSD(bcfg *builder.Config, store *manifest.Store, entryFilter string) *builder.Summary {
+	if len(store.ListPackages(manifest.TypeFreeBSD)) == 0 {
+		fmt.Println("    No freebsd entries in manifest — skipping")
+		return &builder.Summary{}
+	}
+	ctx := context.Background()
+	var ss []*builder.Summary
+	for _, safeName := range store.ListPackages(manifest.TypeFreeBSD) {
+		pm, err := store.GetPackage(ctx, manifest.TypeFreeBSD, safeName)
+		if err != nil || pm == nil {
+			continue
+		}
+		if entryFilter != "" && pm.Name != entryFilter {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			if ve.Frozen || ve.EffectiveMode() == manifest.ModeProxy {
+				continue
+			}
+			if !builder.CheckFreeBSDStage(bcfg, pm.Name, ve).Fetched {
+				ss = append(ss, builder.FetchFreeBSD(bcfg, store, pm.Name))
+				break
+			}
+		}
+	}
+	return builder.MergeSummaries(ss...)
+}
+
 // ensureUploadable runs whatever cascade a type needs before its artifacts are
 // read off disk. One switch instead of one arm per type in each of the upload
 // commands, which is where the two drifted.
@@ -353,8 +384,10 @@ func ensureUploadable(t string, bcfg *builder.Config, store *manifest.Store) err
 		s = ensureFetchedNpm(bcfg, store, "")
 	case manifest.TypeCargo:
 		s = ensureFetchedCargo(bcfg, store, "")
+	case manifest.TypeFreeBSD:
+		s = ensureMirroredFreeBSD(bcfg, store, "")
 	default:
-		// s stays nil and HasFailures has no nil guard, so a ninth type added
+		// s stays nil and HasFailures has no nil guard, so a tenth type added
 		// to manifest.AllTypes without an arm here panics the upload rather
 		// than skipping it. Refuse by name instead.
 		return fmt.Errorf("no upload cascade for type %q", t)

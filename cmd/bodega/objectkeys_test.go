@@ -217,6 +217,27 @@ func objectKeyCases(t *testing.T) []keyCase {
 			},
 			url: "/cargo/serde/1.0.200/download",
 		},
+		{
+			// A mirrored repository: the name is the repository directory and
+			// the version is the ABI, so the local tree, the object key and
+			// the route are all the path a pkg client composes. The package
+			// under All/Hashed carries the "~" and "$" the real catalogue
+			// does, which is what makes this a test of the key scheme rather
+			// than of a fixture.
+			typ:  manifest.TypeFreeBSD,
+			pkg:  "latest",
+			ve:   manifest.VersionEntry{Version: "FreeBSD:14:amd64"},
+			body: "packagesite-archive-bytes",
+			local: map[string]string{
+				"freebsd/FreeBSD:14:amd64/latest/packagesite.pkg":                          "packagesite-archive-bytes",
+				"freebsd/FreeBSD:14:amd64/latest/meta.conf":                                "packing_format = \"tzst\";\n",
+				"freebsd/FreeBSD:14:amd64/latest/All/Hashed/zogftw-2025.02.23_1~2$snx.pkg": "one mirrored package",
+			},
+			upload: func(t *testing.T, bcfg *builder.Config, store *manifest.Store, dst storage.ObjectStore) []string {
+				return artifactPathUpload(builder.FreeBSDArtifactPaths(bcfg, store, ""), dst, t)
+			},
+			url: "/freebsd/FreeBSD:14:amd64/latest/packagesite.pkg",
+		},
 	}
 }
 

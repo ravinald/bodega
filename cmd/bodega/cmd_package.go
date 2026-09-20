@@ -127,6 +127,13 @@ When a name is given after the type, only that entry is packaged.`,
 					allSummaries = append(allSummaries,
 						ensureFetchedCargo(bcfg, store, entryFilter),
 					)
+
+				case manifest.TypeFreeBSD:
+					// freebsd has no package stage — the mirrored catalogue is
+					// the metadata, and it is upstream's to produce.
+					allSummaries = append(allSummaries,
+						ensureMirroredFreeBSD(bcfg, store, entryFilter),
+					)
 				}
 			}
 

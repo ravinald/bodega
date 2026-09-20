@@ -549,6 +549,16 @@ func clientURL(cfg *config.Config, store *manifest.Store, entryType, name string
 		return fmt.Sprintf("%s/helm/charts/%s-%s.tgz", base, pm.Name, ve.Version)
 	case manifest.TypeNpm:
 		return fmt.Sprintf("npm install --registry %s/npm/ %s", base, name)
+	case manifest.TypeFreeBSD:
+		// A pkg.conf stanza, with ${ABI} left literal: pkg substitutes the
+		// running host's ABI, which is the string this entry records as its
+		// version. fingerprints is named because the catalogue is mirrored
+		// byte for byte precisely so FreeBSD's own signature reaches the
+		// client, and a stanza that omits it defaults to signature_type NONE
+		// and discards that attestation.
+		return fmt.Sprintf("bodega-%s: {\n  url: \"%s/freebsd/${ABI}/%s\",\n"+
+			"  signature_type: \"fingerprints\",\n  fingerprints: \"/usr/share/keys/pkg\",\n  enabled: yes\n}",
+			name, base, name)
 	case manifest.TypeCargo:
 		// Cargo hands back no URL. A client reaches the sparse index only once
 		// .cargo/config.toml names it as a registry, so the stanza and the
@@ -563,15 +573,17 @@ func clientURL(cfg *config.Config, store *manifest.Store, entryType, name string
 }
 
 // clientFieldLabel names the detail-pane row holding a type's client
-// instruction. Two of the eight hand back something other than a URL: apt a
-// sources line, cargo a registry stanza. Calling either a "Package URL" sends
-// an operator looking for something to curl.
+// instruction. Three hand back something other than a URL: apt a sources
+// line, cargo a registry stanza, freebsd a pkg.conf repository block. Calling
+// any of them a "Package URL" sends an operator looking for something to curl.
 func clientFieldLabel(entryType string) string {
 	switch entryType {
 	case manifest.TypeApt:
 		return "Sources line"
 	case manifest.TypeCargo:
 		return "Registry stanza"
+	case manifest.TypeFreeBSD:
+		return "Repository stanza"
 	}
 	return "Package URL"
 }
@@ -888,6 +900,21 @@ func (m detailsModel) renderEntryDetails() string {
 		sb.WriteByte('\n')
 		sb.WriteString(m.storedAndClientFields(n))
 		sb.WriteString(platformAndBuildEnv(ve.Platform, ve.BuildEnv))
+
+	case manifest.TypeFreeBSD:
+		sb.WriteString(field("Repository", pm.Name))
+		sb.WriteByte('\n')
+		sb.WriteString(field("ABI", ve.Version))
+		sb.WriteByte('\n')
+		if ve.URL != "" {
+			sb.WriteString(field("Source URL", ve.URL))
+			sb.WriteByte('\n')
+		}
+		sb.WriteString(boolField("Frozen", ve.Frozen))
+		sb.WriteByte('\n')
+		sb.WriteString(boolField("Hidden", ve.Hidden))
+		sb.WriteByte('\n')
+		sb.WriteString(m.storedAndClientFields(n))
 
 	case manifest.TypeCargo:
 		sb.WriteString(field("Crate", pm.Name))

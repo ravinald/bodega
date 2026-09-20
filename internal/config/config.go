@@ -116,6 +116,7 @@ type Config struct {
 	HelmRoot          string   `json:"helm_root,omitempty"`
 	NpmRoot           string   `json:"npm_root,omitempty"`
 	CargoRoot         string   `json:"cargo_root,omitempty"`
+	FreeBSDRoot       string   `json:"freebsd_root,omitempty"`
 	AuditDB           string   `json:"audit_db,omitempty"`
 	DenyList          []string `json:"deny_list,omitempty"`
 	Timezone          string   `json:"timezone,omitempty"`          // display timezone, e.g. "America/Los_Angeles"; default UTC

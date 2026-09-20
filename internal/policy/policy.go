@@ -32,7 +32,10 @@ type Rule = audit.PolicyInfo
 // empty string for unknown types.
 func RuleKindForType(registryType string) string {
 	switch registryType {
-	case manifest.TypeApt:
+	case manifest.TypeApt, manifest.TypeFreeBSD:
+		// Both are archive mirrors: what an operator trusts is the archive
+		// host, not a package name, because the request that reaches upstream
+		// carries a pool path or a repopath and no package identity at all.
 		return KindHost
 	case manifest.TypeGit:
 		return KindOrg
@@ -167,7 +170,7 @@ func (c *Checker) rulesFor(ctx context.Context, registryType string) ([]Rule, er
 
 func matchRule(registryType string, r Rule, candidate string) bool {
 	switch registryType {
-	case manifest.TypeApt:
+	case manifest.TypeApt, manifest.TypeFreeBSD:
 		return strings.EqualFold(hostFromURL(candidate), r.Pattern)
 	case manifest.TypeGit:
 		return strings.HasPrefix(stripScheme(candidate), stripScheme(r.Pattern))
@@ -236,7 +239,7 @@ func (c *Checker) HasRules(ctx context.Context, registryType string) (bool, erro
 // RuleKindForType(regType).
 func SuggestPattern(regType, host, fullPath, pkgName string) string {
 	switch regType {
-	case manifest.TypeApt:
+	case manifest.TypeApt, manifest.TypeFreeBSD:
 		return host
 	case manifest.TypeGit:
 		return host + "/" + firstSegment(fullPath) + "/"

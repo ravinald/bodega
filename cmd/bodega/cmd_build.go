@@ -137,6 +137,14 @@ When a name is given after the type, only that entry is built.`,
 					allSummaries = append(allSummaries,
 						builder.FetchCargo(bcfg, store, entryFilter),
 					)
+
+				case manifest.TypeFreeBSD:
+					// freebsd has no build step, and never will: the catalogue
+					// carries FreeBSD's own signature, so producing one here
+					// would replace an attestation with bodega's word for it.
+					allSummaries = append(allSummaries,
+						builder.FetchFreeBSD(bcfg, store, entryFilter),
+					)
 				}
 			}
 

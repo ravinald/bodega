@@ -91,7 +91,8 @@ e2e_reset_store() {
 	e2e_on "$1" "sudo systemctl stop bodega; \
 		sudo rm -rf /var/lib/bodega/manifests /var/lib/bodega/repos /var/lib/bodega/pypi \
 			/var/lib/bodega/gomod /var/lib/bodega/packages /var/lib/bodega/cargo \
-			/var/lib/bodega/binaries /var/lib/bodega/npm /var/lib/bodega/charts; \
+			/var/lib/bodega/binaries /var/lib/bodega/npm /var/lib/bodega/charts \
+			/var/lib/bodega/freebsd; \
 		sudo chown -R ${E2E_SERVICE_USER:-bodega} /var/lib/bodega; \
 		sudo systemctl start bodega"
 }

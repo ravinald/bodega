@@ -1318,6 +1318,7 @@ var createTypeOptions = []string{
 	manifest.TypeApt,
 	manifest.TypeBinary,
 	manifest.TypeCargo,
+	manifest.TypeFreeBSD,
 	manifest.TypeGit,
 	manifest.TypeGomod,
 	manifest.TypeHelm,
@@ -1751,6 +1752,27 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 				Hint: "sparse index URL; leave empty for index.crates.io"},
 			{Label: "Checksum", Value: checksumVal,
 				Hint: checksumHint(checksumVal)},
+			{Label: "Skip validation", Value: restore("Skip validation", "no"), Checkbox: true,
+				Hint: "skip URL reachability check"},
+		})
+
+	case manifest.TypeFreeBSD:
+		// A freebsd entry is a repository, not a package, so the form asks
+		// for the two halves of the path a pkg client composes: the
+		// repository directory as the name, and the ABI above it as the
+		// version. Nothing here asks for a build command — bodega produces
+		// none of these bytes.
+		return restoreCursors([]formField{
+			typeField,
+			{Label: "Mode", Value: restore("Mode", "hosted"), Select: true,
+				Options: []string{"hosted", "proxy"},
+				Hint:    "hosted = mirror the repository into storage; proxy = fetch from upstream on cache miss"},
+			{Label: "Name", Value: restore("Name", ""),
+				Hint: "repository directory, e.g. latest, quarterly or base_latest"},
+			{Label: "ABI", Value: restore("ABI", ""),
+				Hint: "the ${ABI} directory above the repository, e.g. FreeBSD:14:amd64"},
+			{Label: "Source URL", Value: restore("Source URL", ""),
+				Hint: "repository root with ${ABI} already substituted, e.g. https://pkg.freebsd.org/FreeBSD:14:amd64/latest"},
 			{Label: "Skip validation", Value: restore("Skip validation", "no"), Checkbox: true,
 				Hint: "skip URL reachability check"},
 		})

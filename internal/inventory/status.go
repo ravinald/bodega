@@ -7,8 +7,9 @@
 // all.
 //
 // The keys come from manifest.ArtifactKeys. What is added here is the probe and
-// the one lookup that needs a backend to answer: locating an apt entry that
-// predates the _pool_path metadata key.
+// the two lookups that need a backend to answer: locating an apt entry that
+// predates the _pool_path metadata key, and enumerating a mirrored FreeBSD
+// repository, whose object set its own catalogue decides.
 //
 // Placement is read from the manifest, never from the config hierarchy. An
 // entry records the backend holding its bytes; probing anywhere else reports a
@@ -21,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"sort"
 	"strings"
 
 	"github.com/ravinald/bodega/internal/manifest"
@@ -192,10 +194,15 @@ func EffectiveBackend(recorded string) string {
 //
 // The keys themselves come from manifest.ArtifactKeys, which is the one
 // derivation the uploader and the server handlers also use. What this adds is
-// the single lookup that needs a backend: an apt entry written before the
-// _pool_path metadata key existed can only be located by listing the pool, and
-// manifest cannot import storage to do it.
+// the two lookups that need a backend, neither of which manifest can do
+// because it cannot import storage: an apt entry written before the
+// _pool_path metadata key existed can only be located by listing the pool,
+// and a freebsd entry names a whole mirrored repository whose object set the
+// catalogue decides.
 func ArtifactKeys(ctx context.Context, store storage.ObjectStore, pm *manifest.PackageManifest, ve manifest.VersionEntry) ([]string, error) {
+	if pm != nil && pm.Type == manifest.TypeFreeBSD {
+		return freeBSDRepoKeys(ctx, store, pm, ve)
+	}
 	keys, err := manifest.ArtifactKeys(pm, ve)
 	if err == nil {
 		return keys, nil
@@ -208,6 +215,46 @@ func ArtifactKeys(ctx context.Context, store storage.ObjectStore, pm *manifest.P
 		return nil, err
 	}
 	return []string{manifest.AptKey(rel)}, nil
+}
+
+// freeBSDRepoKeys returns every object a mirrored repository holds, the
+// catalogue files first.
+//
+// manifest.ArtifactKeys can name the repository root — meta.conf, data.pkg,
+// packagesite.pkg — and nothing else, because the packages under a repository
+// live wherever each catalogue record's repopath says and no convention
+// derives that from a name. Listing the prefix is how `build status` sizes a
+// mirror and how `pkg delete` removes one without leaving a few thousand
+// orphaned .pkg objects behind the entry that owned them.
+//
+// Catalogue first, which is the inverse of the write order and deliberately
+// so: a delete that removed the packages first would leave a live catalogue
+// naming objects that are already gone, and the window belongs on the side
+// where a client gets "no such repository" rather than a failed install.
+func freeBSDRepoKeys(ctx context.Context, store storage.ObjectStore, pm *manifest.PackageManifest, ve manifest.VersionEntry) ([]string, error) {
+	keys, err := manifest.ArtifactKeys(pm, ve)
+	if err != nil {
+		return nil, err
+	}
+	if store == nil {
+		return keys, nil
+	}
+	listed, err := store.List(ctx, manifest.FreeBSDRepoPrefix(ve.Version, pm.Name))
+	if err != nil {
+		return nil, fmt.Errorf("list the mirrored repository %s/%s: %w", ve.Version, pm.Name, err)
+	}
+	root := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		root[k] = true
+	}
+	rest := make([]string, 0, len(listed))
+	for _, k := range listed {
+		if !root[k] {
+			rest = append(rest, k)
+		}
+	}
+	sort.Strings(rest)
+	return append(keys, rest...), nil
 }
 
 // aptPoolPathFromListing finds a version's path relative to manifest.AptPrefix

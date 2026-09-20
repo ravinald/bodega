@@ -31,7 +31,7 @@ Creates the S3 bucket with server-side encryption (AES-256), versioning enabled,
 
 ### `bodega build fetch [TYPE...] [NAME]`
 
-Downloads raw sources without building or packaging. If no types are given, all eight are fetched in dependency order: `binary, git, apt, pypi, gomod, helm, npm, cargo`.
+Downloads raw sources without building or packaging. If no types are given, all nine are fetched in dependency order: `binary, git, apt, pypi, gomod, helm, npm, cargo, freebsd`.
 
 When a name is given after the type, only that entry is fetched.
 
@@ -1216,7 +1216,7 @@ $EDITOR db.json
 bodega profile create db --from-file db.json
 ```
 
-`--from-file` reads the whole document before it writes anything, through the same checks `add` and `set` make: a package type outside the eight, an entry with no name and a constraint with no version are each refused with the offending line named. A key named twice is refused the same way, naming both lines: one type carries one marker and one package carries one entry, so the later row would replace the earlier and take its constraint, reason and review date with it. The profile, its markers and its entries then land in one transaction. A document rejected halfway would otherwise leave a bindable profile holding a subset of what was authored, which is not a failed create but a working access control permitting less than anyone wrote.
+`--from-file` reads the whole document before it writes anything, through the same checks `add` and `set` make: a package type bodega does not know, an entry with no name and a constraint with no version are each refused with the offending line named. A key named twice is refused the same way, naming both lines: one type carries one marker and one package carries one entry, so the later row would replace the earlier and take its constraint, reason and review date with it. The profile, its markers and its entries then land in one transaction. A document rejected halfway would otherwise leave a bindable profile holding a subset of what was authored, which is not a failed create but a working access control permitting less than anyone wrote.
 
 The round trip through a file is the review step, and `--out -` and `--from-file -` are both refused. A host's inventory holds its accidents alongside its requirements, and locking membership to it enshrines whatever was installed by hand at 03:00; a baseline piped straight from the command that produced it was never read by anyone.
 
@@ -1274,7 +1274,7 @@ $ bodega profile create dp --from-origin db01 --out dp.json --pin psycopg2 --pin
   Name it once:  --pin pypi/psycopg2
 ```
 
-A slash is read as the qualifier only when what precedes it names one of the eight types, none of which carries a slash. So `--pin @babel/core` and `--pin github.com/lib/pq` each name one npm or gomod package, and the qualified spellings for them are `npm/@babel/core` and `gomod/github.com/lib/pq`.
+A slash is read as the qualifier only when what precedes it names one of the package types, none of which carries a slash. So `--pin @babel/core` and `--pin github.com/lib/pq` each name one npm or gomod package, and the qualified spellings for them are `npm/@babel/core` and `gomod/github.com/lib/pq`.
 
 #### Binding hosts
 
@@ -2592,7 +2592,7 @@ Or clear the key and keep everything under `build_root`. `apt_root`, `git_root`,
 
 `custom_paths` used to sit in front of all of this and gated nothing: the build path reads each root directly through `builder.rootFor`, so a root left in the file stayed in force after the flag was turned off, and the TUI stopped showing the value that was still deciding where artifacts land. The key is gone. Nothing moves as a result, because the behavior it claimed to gate is the behavior that was already running; a file that still carries it loads unchanged and `bodega doctor` names it under `retired-config-keys`.
 
-**Gap:** the TUI's config form shows four of the eight roots — `apt_root`, `git_root`, `pypi_root`, `binary_root` — so `gomod_root`, `helm_root`, `npm_root` and `cargo_root` can only be set by editing the file. Ctrl+R clears the same four. Tracked as #227.
+**Gap:** the TUI's config form shows four of the nine roots — `apt_root`, `git_root`, `pypi_root`, `binary_root` — so `gomod_root`, `helm_root`, `npm_root`, `cargo_root` and `freebsd_root` can only be set by editing the file. Ctrl+R clears the same four. Tracked as #227.
 
 ### Audit database
 
@@ -2817,6 +2817,24 @@ The fetch opens the `.tgz` and reads `version:` from the `Chart.yaml` at its roo
 
 - **required_by**: list of packages that depend on this version
 
+### FreeBSD-specific fields
+
+```json
+{
+  "version": "FreeBSD:14:amd64",
+  "url": "https://pkg.freebsd.org/FreeBSD:14:amd64/latest",
+  "mode": "hosted"
+}
+```
+
+A `freebsd` entry is a **repository**, not a package. The name is the repository directory a pkg client asks under (`latest`, `quarterly`, `base_latest`) and the version is the ABI above it, which is the string pkg substitutes for `${ABI}` in the URL it was configured with. One entry per ABI, several versions per repository.
+
+- **version**: the ABI directory, e.g. `FreeBSD:14:amd64`. Required; nothing else says which tree of the repository an entry stands for.
+- **url**: the repository root with `${ABI}` already substituted. Required, and not composed from the other two fields: a private repository need not nest its ABIs the way `pkg.freebsd.org` does, and nothing in a URL says which convention it follows.
+- **mode**: `hosted` mirrors the whole repository into storage; `proxy` fetches from upstream on a cache miss and holds no snapshot.
+
+No checksum field. The catalogue carries FreeBSD's own signature and publishes a digest for every package, so the integrity claim is upstream's; see [Mirroring a FreeBSD pkg repository](#mirroring-a-freebsd-pkg-repository).
+
 ---
 
 ## Pipeline
@@ -2831,7 +2849,7 @@ Actually, the operations are more granular: fetch, build/run, sync, upload.
 
 **Stage cascading:** Each stage automatically runs its prerequisites if outputs are missing. Running `bodega build upload` on a fresh system will cascade through fetch and build stages first.
 
-**Build order:** `binary, git, apt, pypi, gomod, helm, npm, cargo`. This order reflects dependencies (e.g., pypi may reference git-cloned repos for its base requirements). It is `manifest.AllTypes`, and the three build subcommands render their help from it rather than restating it.
+**Build order:** `binary, git, apt, pypi, gomod, helm, npm, cargo, freebsd`. This order reflects dependencies (e.g., pypi may reference git-cloned repos for its base requirements). It is `manifest.AllTypes`, and the three build subcommands render their help from it rather than restating it.
 
 **Per-entry failures** are logged but do not abort the run. A non-zero exit code is returned if any entry failed.
 
@@ -2952,6 +2970,20 @@ bodega doctor --write-credentials --token bodega_ak_... --url https://bodega-hos
 ```
 
 The last line runs on the client and writes the token into the file each of its package managers reads. See [`bodega doctor`](#bodega-doctor---write-credentials---token-token---url-url---write-apt-sources) for what lands where, and [`bodega identity`](#bodega-identity-bindunbindlist) for the CIDR binding that covers a whole subnet with no credential to distribute.
+
+**FreeBSD pkg** (`/usr/local/etc/pkg/repos/bodega.conf`):
+
+```text
+bodega-latest: {
+  url: "https://bodega-host:8080/freebsd/${ABI}/latest",
+  signature_type: "fingerprints",
+  fingerprints: "/usr/share/keys/pkg",
+  enabled: yes
+}
+FreeBSD: { enabled: no }
+```
+
+`${ABI}` stays literal: pkg substitutes the running host's ABI, which is the string the matching manifest entry records as its version. `signature_type` is named because the catalogue is mirrored byte for byte precisely so FreeBSD's own signature reaches the client; a stanza that omits it defaults to `NONE` and throws that attestation away. The second line disables the stock repository, which is the point of pointing pkg at bodega at all. See [Mirroring a FreeBSD pkg repository](#mirroring-a-freebsd-pkg-repository).
 
 ### Git smart-HTTP
 
@@ -3218,6 +3250,57 @@ A `spool_max_artifact_bytes` above a non-zero `spool_max_total_bytes` is refused
 A cut transfer is still refused rather than cached: a body shorter than the `Content-Length` the upstream declared fails, the spool file is removed, and no checksum is recorded. Caching short bytes as authoritative is what made every later fetch of the real artifact fail verification against the truncated digest.
 
 The npm packument and the PyPI simple index are the two responses bodega parses rather than relays. A miss on either is spooled and cached like any other object, so the ceilings above still decide what upstream may send; the parse runs on the way out, on a copy read back into memory. For the packument that read is capped at 256 MB on every path it takes — the cache hit, the spooled miss, and the direct fetch the hidden-version filter uses — and a document over the cap is refused with a `502` rather than served with its upstream `dist.tarball` URLs intact.
+
+### Mirroring a FreeBSD pkg repository
+
+A `freebsd` entry mirrors a pkg repository **byte for byte**, and that constraint decides the whole design of the type. `packagesite.pkg` and `data.pkg` are zstd tarballs, and each carries three members: `packagesite.yaml.sig` (256 B), `packagesite.yaml.pub` (451 B) and the catalogue itself. There is no `.sig` sidecar on the wire. So a byte-exact copy of those archives carries FreeBSD's own signature with it and validates against the stock fingerprint at `/usr/share/keys/pkg/trusted/pkg.freebsd.org.2013102301`, with no key of bodega's and no client-side signature configuration. Regenerating the catalogue with `pkg repo` would discard that attestation permanently and force a fingerprint onto every client.
+
+This is the opposite of what apt needs. bodega generates and re-signs Debian metadata for a generated suite because it has to; a pkg catalogue is never generated here.
+
+```bash
+bodega pkg create freebsd          # prompts for the repository, the ABI and the URL
+bodega build fetch freebsd         # mirror every repository the manifest names
+bodega build upload freebsd        # place what was mirrored
+```
+
+The client stanza is under [Client configuration](#client-configuration).
+
+#### The catalogue is the only authority on where packages live
+
+`packagesite.yaml` is newline-delimited compact JSON despite the name, and each record carries `repopath`. The two repositories on `pkg.freebsd.org` spell it differently, and neither form is derivable from a package name and version:
+
+| Repository    | Records | Bytes    | A repopath                                                     |
+| ------------- | ------- | -------- | -------------------------------------------------------------- |
+| `latest`      | 38,325  | 182.8 GB | `All/Hashed/zogftw-2025.02.23_1~2$snxfrbid.pkg`                |
+| `base_latest` | 535     | 1.2 GB   | `./Hashed/FreeBSD-telnet-14.snap20260920075547~2$ea5o6tyi.pkg` |
+
+There is no directory listing to crawl either: `All/` answers 403 upstream. So the mirrored object set is read out of the catalogue and from nothing else.
+
+A leading `./` is dropped, because every HTTP client normalizes it out before the request leaves and keeping it would key an object under a path no request can spell. A `..` is refused rather than cleaned: the catalogue decides both the URL fetched and the path written, so a record resolving outside the repository is one this mirror must not touch.
+
+#### `packing_format`, not the extension
+
+`meta.conf` is plain unsigned UCL, 168 bytes upstream, and it is the first request every `pkg update` makes. The codec of `packagesite.pkg` is read from its `packing_format` key rather than inferred from the `.pkg` extension, which names the archive and not the codec: a repository built by pkg 1.16 serves `packing_format = "txz"` under files spelled `.pkg`.
+
+`tzst`, `tgz`, `tbz` and `tar` are read. `txz` is refused by name — Go ships no xz decoder — with the way out in the message: mirror a repository built by pkg 1.17 or later, or serve that one in proxy mode, where the catalogue is never parsed.
+
+#### Objects first, catalogue last
+
+A catalogue that lands ahead of the objects it names is a repository where `pkg install` resolves a package and then 404s partway through fetching it, and the upstream repositories rebuild continuously, so the window is not theoretical. The ordering holds at three layers:
+
+- The mirror stages `meta.conf`, `data.pkg` and `packagesite.pkg` outside the tree, fetches every object the catalogue names, and only then moves the three into place.
+- `bodega build upload` writes every object before any repository-root file, and `packagesite.pkg` last of all.
+- A **hosted** entry's catalogue is never fetched from upstream on a miss. Upstream's catalogue is by construction newer than this mirror's objects and names packages the store has never held, so a miss answers 404 and `pkg` reports the repository as unavailable rather than installing half a transaction. Objects on a hosted entry may still be proxied: an object arriving late can only complete an install, never break one.
+
+A **proxy**-mode entry holds no snapshot, so both halves come from upstream per request and are self-consistent; there is no skew for the ordering rule to prevent.
+
+#### What is deliberately not served
+
+`digests.pkg`, `packagesite.txz` and `repo.txz` all 404 on every current FreeBSD repository, and bodega refuses them by name rather than proxying them: a proxy would spend a round trip per client per update to cache somebody else's 404. `digests` was a `meta.conf` key whose own source comment at pkg 1.12 reads "Leave digests here so pkg will not complain", and it is gone from pkg 2.x.
+
+#### `mirror_type` and the allow-list
+
+`freebsd` is host-scoped in the upstream allow-list, the same as `apt`: `bodega policy add freebsd pkg.freebsd.org` names the archive host, because a request that reaches upstream carries a repopath and no package identity at all.
 
 ### APT index generation
 
@@ -4012,7 +4095,7 @@ The table sizes its columns from the rows it is showing, not from a fixed width,
 
 ### Build stages
 
-The build menu dispatches all eight entry types. Only `apt` and `pypi` have a build step and only `apt`, `git`, `pypi` and `helm` have a package step; the rest say which stage does not apply to them rather than reporting an empty success. `helm` packages across the whole type — `index.yaml` is repository metadata, not a per-entry archive — so that stage ignores the selected entry and regenerates everything.
+The build menu dispatches every entry type. Only `apt` and `pypi` have a build step and only `apt`, `git`, `pypi` and `helm` have a package step; the rest say which stage does not apply to them rather than reporting an empty success. `helm` packages across the whole type — `index.yaml` is repository metadata, not a per-entry archive — so that stage ignores the selected entry and regenerates everything.
 
 ---
 
@@ -4060,20 +4143,23 @@ The key layout is the same regardless of backend (local filesystem or S3). Every
 
 A name containing a slash is encoded to `--` for every type **except gomod**, which keeps its slashes: a Go client requests `GET /<module>/@v/<version>.zip` with the module path verbatim, and nothing on the wire can rewrite it back. So `@example-corp/widget-cli` stores as `npm/@example-corp--widget-cli/@example-corp--widget-cli-1.5.0.tgz` while `example.com/example-corp/widget` stores as `gomod/example.com/example-corp/widget/@v/...`.
 
-| Type      | S3 prefix       | Example key                                                          |
-| --------- | --------------- | -------------------------------------------------------------------- |
-| apt       | `packages/apt/` | `packages/apt/pool/main/h/hello/hello_2.10-3build1_amd64.deb`        |
-| git       | `repos/`        | `repos/widget/widget-v4.5.7.bundle`                                  |
-| pypi      | `pypi/wheels/`  | `pypi/wheels/examplesdk-1.35.0-py3-none-any.whl`                     |
-| binary    | `binaries/`     | `binaries/example-tool-v2/2.34.24/example-tool-exe-linux-x86_64.zip` |
-| gomod     | `gomod/`        | `gomod/example.com/example-corp/sdk/@v/v1.30.0.zip`                  |
-| helm      | `charts/`       | `charts/ingress-nginx-4.11.0.tgz`                                    |
-| npm       | `npm/`          | `npm/lodash/lodash-4.17.21.tgz`                                      |
-| cargo     | `cargo/crates/` | `cargo/crates/serde-1.0.200.crate`                                   |
-| manifests | `manifests/`    | `manifests/apt/python3/manifest.json`                                |
-| index     | `index.json`    | Fast startup without loading every manifest                          |
-| graph     | `graph.json`    | Dependency graph with typed edges                                    |
-| metrics   | `metrics.json`  | Dashboard metrics                                                    |
+`freebsd` keeps everything literal as well, for a different reason: the key is the path the upstream repository serves the object at, so an ABI's colons and a hashed filename's `~` and `$` all survive into it. S3 accepts all three in a key and every POSIX filesystem accepts them in a path, and encoding them would buy nothing while costing a decoder at four call sites — where a wrong decode serves the wrong bytes under a signature that still verifies.
+
+| Type      | S3 prefix       | Example key                                                                     |
+| --------- | --------------- | ------------------------------------------------------------------------------- |
+| apt       | `packages/apt/` | `packages/apt/pool/main/h/hello/hello_2.10-3build1_amd64.deb`                   |
+| git       | `repos/`        | `repos/widget/widget-v4.5.7.bundle`                                             |
+| pypi      | `pypi/wheels/`  | `pypi/wheels/examplesdk-1.35.0-py3-none-any.whl`                                |
+| binary    | `binaries/`     | `binaries/example-tool-v2/2.34.24/example-tool-exe-linux-x86_64.zip`            |
+| gomod     | `gomod/`        | `gomod/example.com/example-corp/sdk/@v/v1.30.0.zip`                             |
+| helm      | `charts/`       | `charts/ingress-nginx-4.11.0.tgz`                                               |
+| npm       | `npm/`          | `npm/lodash/lodash-4.17.21.tgz`                                                 |
+| cargo     | `cargo/crates/` | `cargo/crates/serde-1.0.200.crate`                                              |
+| freebsd   | `freebsd/`      | `freebsd/FreeBSD:14:amd64/latest/All/Hashed/zogftw-2025.02.23_1~2$snxfrbid.pkg` |
+| manifests | `manifests/`    | `manifests/apt/python3/manifest.json`                                           |
+| index     | `index.json`    | Fast startup without loading every manifest                                     |
+| graph     | `graph.json`    | Dependency graph with typed edges                                               |
+| metrics   | `metrics.json`  | Dashboard metrics                                                               |
 
 Git smart-HTTP mirrors are the one tree that is not a storage key. They are bare repositories under `{storage_path}/git/{namespace}/{org}/{repo}.git` on the local filesystem, never in a named backend and never in S3: `git-http-backend` reads a real directory, and `bodega pkg move` has nothing to move. Placement rules do not reach them.
 

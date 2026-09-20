@@ -256,7 +256,7 @@ That cooldown is the control the 2025-2026 npm and PyPI campaigns turned on: the
 
 What it does not cover:
 
-- **Only `npm` and `pypi`.** `gomod` and `cargo` can be dated too and get no seed; `apt`, `binary`, `git` and `helm` have no upstream publish timestamp at all, and `bodega policy age set` refuses them.
+- **Only `npm` and `pypi`.** `gomod` and `cargo` can be dated too and get no seed; `apt`, `binary`, `git`, `helm` and `freebsd` have no upstream publish timestamp at all, and `bodega policy age set` refuses them.
 - **`warn`, not `block`.** A version inside the window is admitted and recorded as `policy_warn`. Hardening it is `bodega policy age set <ecosystem> 7d block`.
 - **Nothing else is on.** The upstream allow-list is empty, which accepts every candidate, and the OSV gate has no rows. Add them with `bodega policy add <type> <pattern>` and `bodega policy osv set npm warn`.
 - **Upgrades gain nothing.** An install created before this default keeps enforcing exactly what it enforced. bodega records the seed as a one-time decision, so it also never returns after `bodega policy age remove`.

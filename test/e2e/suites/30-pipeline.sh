@@ -158,6 +158,11 @@ check_eq PIPE-04 "every recorded dependency is satisfied" 0 "$E2E_RC" \
 # itself and passes whatever landed on disk: the pypi fetch stored a 1.17.0
 # wheel against a manifest pinning 1.16.0 and a manifest-side check called it
 # correct.
+# freebsd is the one fixture in proxy mode, so nothing of it is on disk until a
+# client asks for something. One request warms the repository root; what lands
+# is keyed by the ABI, which is what this entry pins.
+e2e_http server "/freebsd/FreeBSD:14:amd64/latest/meta.conf" || true
+
 for t in $E2E_FIXTURE_TYPES; do
 	want="$(e2e_fixture_version "$t")"
 	case "$t" in
@@ -169,6 +174,14 @@ for t in $E2E_FIXTURE_TYPES; do
 	helm) glob="/var/lib/bodega/charts/podinfo-*.tgz" ;;
 	npm) glob="/var/lib/bodega/npm/color-convert/*.tgz" ;;
 	cargo) glob="/var/lib/bodega/cargo/crates/form_urlencoded-*.crate" ;;
+	freebsd) glob="/var/lib/bodega/freebsd/*/latest/meta.conf" ;;
+	*)
+		# Named rather than left to fall through: the case assigns glob and
+		# nothing resets it, so a type with no arm measures whichever path the
+		# previous iteration set and reports a verdict about another
+		# ecosystem's artifact.
+		glob="/var/lib/bodega/no-arm-for-$t"
+		;;
 	esac
 	e2e_on server "sudo sh -c 'ls -d $glob 2>/dev/null' | head -3" || true
 	check_contains "PIPE-VERSION-$t" "the $t artifact on disk carries the pinned version" \

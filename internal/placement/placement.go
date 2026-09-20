@@ -432,7 +432,7 @@ func (p *Placer) UploadType(ctx context.Context, bcfg *builder.Config, typ strin
 //
 // pypi is absent on purpose and returns nothing: its wheels have no
 // per-version object key, so they upload through ForType and SyncDir. Every
-// other type answers here, which is what lets one caller cover all eight.
+// other type answers here, which is what lets one caller cover the rest.
 func ArtifactPaths(cfg *builder.Config, store *manifest.Store, typ, entryFilter string) []builder.ArtifactPath {
 	switch typ {
 	case manifest.TypeBinary:
@@ -449,6 +449,8 @@ func ArtifactPaths(cfg *builder.Config, store *manifest.Store, typ, entryFilter 
 		return builder.NpmArtifactPaths(cfg, store, entryFilter)
 	case manifest.TypeCargo:
 		return builder.CargoArtifactPaths(cfg, store, entryFilter)
+	case manifest.TypeFreeBSD:
+		return builder.FreeBSDArtifactPaths(cfg, store, entryFilter)
 	}
 	return nil
 }

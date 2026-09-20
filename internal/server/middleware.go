@@ -701,6 +701,16 @@ func parsePackagePath(path string) (pkgType, pkgName, pkgVersion string) {
 		// Sparse index lookup: trailing path segment is the crate name.
 		parts := strings.Split(full, "/")
 		return "cargo", parts[len(parts)-1], ""
+	case strings.HasPrefix(path, "/freebsd/"):
+		// <abi>/<repo>/<rest>, the same split the handler makes. The entry is
+		// a repository, so the repository is the name and the ABI is the
+		// version; the repopath below them names a package this server never
+		// parses and has no manifest entry for.
+		parts := strings.SplitN(strings.TrimPrefix(path, "/freebsd/"), "/", 3)
+		if len(parts) >= 2 {
+			return "freebsd", parts[1], parts[0]
+		}
+		return "freebsd", "", ""
 	}
 	return "", "", ""
 }

@@ -752,7 +752,7 @@ components:
       required: true
       schema:
         type: string
-        enum: [apt, git, pypi, binary, gomod, helm, npm, cargo]
+        enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, freebsd]
     PackageName:
       name: name
       in: path
@@ -820,6 +820,10 @@ components:
           items:
             $ref: "#/components/schemas/PackageManifest"
         cargo:
+          type: array
+          items:
+            $ref: "#/components/schemas/PackageManifest"
+        freebsd:
           type: array
           items:
             $ref: "#/components/schemas/PackageManifest"
@@ -904,7 +908,7 @@ components:
           description: Package name
         type:
           type: string
-          enum: [apt, git, pypi, binary, gomod, helm, npm, cargo]
+          enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, freebsd]
         description:
           type: string
         dep_policy:

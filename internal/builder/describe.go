@@ -31,9 +31,11 @@ func FetchDescription(entryType, name, url string) string {
 	case manifest.TypeHelm:
 		return fetchHelmDescription(name, url)
 	}
-	// binary has no registry to ask. cargo does, and crates.io would answer,
-	// but no fetcher is written for it yet; the cost is an empty description
-	// rather than a wrong one.
+	// binary has no registry to ask, and neither does freebsd: an entry there
+	// is a repository rather than a package, and the description a catalogue
+	// carries is per package. cargo does, and crates.io would answer, but no
+	// fetcher is written for it yet; the cost is an empty description rather
+	// than a wrong one.
 	return ""
 }
 

@@ -108,6 +108,10 @@ When a name is given after the type, only that entry is fetched.`,
 					allSummaries = append(allSummaries,
 						builder.FetchCargo(bcfg, store, entryFilter),
 					)
+				case manifest.TypeFreeBSD:
+					allSummaries = append(allSummaries,
+						builder.FetchFreeBSD(bcfg, store, entryFilter),
+					)
 				}
 			}
 
