@@ -78,9 +78,18 @@ build() {
 	cp "$tmp/packagesite.yaml.sig" "$tmp/data.sig"
 	cp "$tmp/packagesite.yaml.pub" "$tmp/data.pub"
 
-	tar --zstd -cf "$dir/packagesite.pkg" -C "$tmp" \
+	# Byte-identical on every rebuild. tar takes the member mtimes and the
+	# owner from the scratch directory otherwise, so two runs of this fixture
+	# produce two different archives — and `bodega build fetch` skips a
+	# repository it has already mirrored, so the second run compares a freshly
+	# built upstream against the first run's mirror and reports bodega for
+	# changing bytes it never touched.
+	tarflags="--mtime=@0 --sort=name --owner=0 --group=0 --numeric-owner"
+	# shellcheck disable=SC2086  # tarflags is a deliberate word list
+	tar --zstd $tarflags -cf "$dir/packagesite.pkg" -C "$tmp" \
 		packagesite.yaml.sig packagesite.yaml.pub packagesite.yaml
-	tar --zstd -cf "$dir/data.pkg" -C "$tmp" data.sig data.pub data
+	# shellcheck disable=SC2086  # see above
+	tar --zstd $tarflags -cf "$dir/data.pkg" -C "$tmp" data.sig data.pub data
 	printf 'version = 2;\npacking_format = "tzst";\nmanifests = "packagesite.yaml";\ndata = "data";\n' \
 		>"$dir/meta.conf"
 	rm -rf "$tmp"
