@@ -62,7 +62,7 @@ The canonical spelling is not cosmetic: pip compares `===` by string equality ag
 
 The floating constraints (`patch`, `compatible`, `any`) take a pre-release or dev release only when the version the entry names is itself one. A project publishing `2.0.0rc1` would otherwise move every `any` entry onto a release candidate nobody approved. A post release is not a pre-release: `1.16.0.post1` ships after `1.16.0` and qualifies everywhere.
 
-An entry whose `version` is empty or `*` resolves to nothing and keeps a bare, unpinned requirement line, whatever its constraint says. That is the shape an auto-imported dependency arrives in, and pinning it would over-constrain a closure the base `-r` requirements already decide.
+An entry whose `version` is empty or `*` resolves to nothing and keeps a bare, unpinned requirement line, whatever its constraint says. That is the form an auto-imported dependency arrives in, and pinning it would over-constrain a closure the base `-r` requirements already decide.
 
 A version outside PEP 440 still resolves under `exact`, by literal match. `pytz` shipped `2011k`, which no parser will order but an index plainly offers.
 
@@ -316,7 +316,7 @@ bodega repair check                    # detect only, no changes
 
 Phase 4 is the only way to clear a version-less apt entry. `bodega pkg create apt` in package-name mode stages one before the upstream version is known and fills it once the lookup returns; one left over is addressable by nothing, because `pkg remove`, `pkg delete`, `hide` and `freeze` all name a version. A package whose entries are _all_ version-less is reported and left alone — that is a staging record, not a leftover.
 
-Phase 5 corrects what `bodega discover promote --as manifest` wrote while the wheel handler composed `<index>/packages/<filename>`, a path pypi.org has never served. Nothing reads the field today, so the stored URL breaks no fetch; it is rewritten because promotion never revisits a version it already wrote, and the entry would otherwise carry a URL nothing can fetch for as long as it exists. The match is on the shape, `<scheme>://<host>/packages/<file>`, on any host — an operator's own index that serves that path is rewritten to its root too, which is what the field means there as well. Entries of any other shape are left untouched. See [Upstream hosts](#upstream-hosts) for how a wheel is resolved now.
+Phase 5 corrects what `bodega discover promote --as manifest` wrote while the wheel handler composed `<index>/packages/<filename>`, a path pypi.org has never served. Nothing reads the field today, so the stored URL breaks no fetch; it is rewritten because promotion never revisits a version it already wrote, and the entry would otherwise carry a URL nothing can fetch for as long as it exists. The match is on the pattern, `<scheme>://<host>/packages/<file>`, on any host — an operator's own index that serves that path is rewritten to its root too, which is what the field means there as well. Entries of any other form are left untouched. See [Upstream hosts](#upstream-hosts) for how a wheel is resolved now.
 
 ### `bodega repair keys [--dry-run] [--delete-source] [--type TYPE]`
 
@@ -1114,7 +1114,7 @@ With no `--constraint` the entry defers to its type's version default. Adding an
 
 A pin is not local, so `pin` reports the dependency closure before it writes anything. See [Pins as recorded decisions](#pins-as-recorded-decisions).
 
-`unpin` drops the constraint and keeps the entry, so the package stays a member. The version the pin named stays on the entry as its base, because that is the shape a pinned type default reads: an entry with a version and no constraint of its own is held at that version, and one with neither is a pin with nothing to pin to, which permits no version at all. A floating default ignores the base and takes any version. `unpin` says which of the three it left you in:
+`unpin` drops the constraint and keeps the entry, so the package stays a member. The version the pin named stays on the entry as its base, because that is what a pinned type default reads: an entry with a version and no constraint of its own is held at that version, and one with neither is a pin with nothing to pin to, which permits no version at all. A floating default ignores the base and takes any version. `unpin` says which of the three it left you in:
 
 ```text
 $ bodega profile unpin vd pypi numpy
@@ -1482,7 +1482,7 @@ $ bodega profile set web apt --membership closed --base noble
     the profile then reads the mirrored codename noble unchanged, verified against the distro keyring
 ```
 
-**A profile with no base still governs apt.** `--base` buys a filtered view of a _mirrored_ codename. A suite bodega serves from its own catalog — an `apt_suites` codename holding the entries an operator put in it — is filtered in place instead: the host reads the suite it was always pointed at and bodega answers with that profile's view of it, generated and signed at the same rebuild. Either way `/apt/pool/` refuses a `.deb` the profile does not entitle. What no base costs is the mirrored codename: that document is the archive's own, so a host reading one is offered the archive whole and meets the refusal at the fetch, which is the mid-transaction 403 the shape above avoids. Add `--base` to buy back the legible half.
+**A profile with no base still governs apt.** `--base` buys a filtered view of a _mirrored_ codename. A suite bodega serves from its own catalog — an `apt_suites` codename holding the entries an operator put in it — is filtered in place instead: the host reads the suite it was always pointed at and bodega answers with that profile's view of it, generated and signed at the same rebuild. Either way `/apt/pool/` refuses a `.deb` the profile does not entitle. What no base costs is the mirrored codename: that document is the archive's own, so a host reading one is offered the archive whole and meets the refusal at the fetch, which is the mid-transaction 403 the arrangement above avoids. Add `--base` to buy back the legible half.
 
 **Membership closes over the source package.** `bodega profile add web apt nginx` covers `nginx-common`, `nginx-core` and every other binary that source builds. Ubuntu renames and splits binaries within a stable source as routine maintenance, and a set closed on binary names would fire on each one. `--from-origin` writes source names for the same reason, and `bodega profile check` reports an apt entry naming a binary whose source differs — an entry that matches no paragraph in the index it governs, so the host is told the package does not exist:
 
@@ -1527,7 +1527,7 @@ The following packages will be upgraded:
 1 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.
 ```
 
-That is the whole point of the shape. The same policy enforced at fetch time gives `403` mid-transaction and `E: Failed to fetch`, with nothing upgraded.
+That is the whole point of the design. The same policy enforced at fetch time gives `403` mid-transaction and `E: Failed to fetch`, with nothing upgraded.
 
 Three limits, stated rather than left to be found:
 
@@ -1579,7 +1579,7 @@ apt gets a file to itself because its `machine` line carries the scheme, which p
 
 A second run replaces bodega's own entry rather than stacking another beside it, and nothing else in those files is touched. Where the format allows a comment anywhere, the entry is fenced by a marker; the fence is never the anchor, because bodega does not own these files. `cargo login`, `helm repo add` and `npm config set` each re-serialize the file and drop comments doing it, which takes the fence with them. So `doctor` finds its own entry by the key that entry carries: cargo's `[registries.bodega]` table, the repository named `bodega`, the `//<host>/npm/:_authToken=` line. `~/.netrc` gets no fence at all. Python's `netrc` module refuses a `#` line preceded by a blank one, and refuses the whole file rather than the entry, so a marker appended after the blank line that idiomatically separates stanzas costs pip every credential in the file, and silently: `requests` catches the parse error and sends no credential, while libcurl reads the same file without complaint, so git and curl keep working while pip stops. There the `machine <host>` stanza is the whole anchor, which is what it already had to be. No client rewrites that file, but an operator who configured bodega by hand before this command existed left a stanza in it, and appending beside it would put two credentials for one host in a file its four readers disagree about. libcurl takes the first match and Python's `netrc` module the last, so git, curl and wget would keep presenting the pre-rotation secret while pip presented the new one, and the table would report four successes. What the second run guarantees is one bodega entry holding the new token, in a file its client still parses. Stacking a second entry is not cosmetic: cargo rejects a duplicate key and stops reading the file at all, taking the operator's crates.io token with it, and helm resolves a chart through the first matching entry, which would be the pre-rotation one. The apt file needs root and the other four do not; a run as a normal user configures seven clients, names the one it could not, and exits 2.
 
-helm's path is the one that is not the same everywhere: `doctor` resolves it the way helm does, `$HELM_REPOSITORY_CONFIG` first, then `$XDG_CONFIG_HOME/helm/repositories.yaml`, then the platform default, which is `~/Library/Preferences/helm/repositories.yaml` on macOS and `~/.config/helm/repositories.yaml` elsewhere. The table prints the path it resolved. `repositories.yaml` is also the one target where appending is not always legal. A file whose `repositories:` list is not last would take an appended entry into whatever key followed, and a `repositories: []`, which is what `helm repo remove` leaves when it removes the last repository, has no list to append under at all: a block sequence written there is a second value for one key, and helm rejects the whole file. `helm repo list` reports no repositories and exits 0 over that, so the damage would surface at the next `helm repo add` with nothing connecting it to the doctor run. Both shapes are refused, with the `helm repo add bodega <url> --username bodega --password <token>` line to run instead.
+helm's path is the one that is not the same everywhere: `doctor` resolves it the way helm does, `$HELM_REPOSITORY_CONFIG` first, then `$XDG_CONFIG_HOME/helm/repositories.yaml`, then the platform default, which is `~/Library/Preferences/helm/repositories.yaml` on macOS and `~/.config/helm/repositories.yaml` elsewhere. The table prints the path it resolved. `repositories.yaml` is also the one target where appending is not always legal. A file whose `repositories:` list is not last would take an appended entry into whatever key followed, and a `repositories: []`, which is what `helm repo remove` leaves when it removes the last repository, has no list to append under at all: a block sequence written there is a second value for one key, and helm rejects the whole file. `helm repo list` reports no repositories and exits 0 over that, so the damage would surface at the next `helm repo add` with nothing connecting it to the doctor run. Both cases are refused, with the `helm repo add bodega <url> --username bodega --password <token>` line to run instead.
 
 Writing a credential changes what an audit row says, never what the host may fetch. It does change what the host may **write**, which is why `doctor` prints this before it touches a file:
 
@@ -1740,7 +1740,7 @@ $ bodega policy osv set helm block
 Error: the OSV gate does not cover ecosystem "helm": the row would be stored and never read, leaving the gate silently off; set one of apt, cargo, gomod, npm, pypi instead
 ```
 
-Earlier versions wrote that row, printed `Set helm OSV policy: block`, and then passed every helm version, because the checker short-circuits on any type outside the table above. Nothing reported the gap. The refusal replaces a gate the operator believed was on. It does not remove the rows already written: `bodega policy osv list` names them under the table and `bodega doctor` reports them, in the shape shown under [`bodega policy age`](#bodega-policy-age-setlistremove).
+Earlier versions wrote that row, printed `Set helm OSV policy: block`, and then passed every helm version, because the checker short-circuits on any type outside the table above. Nothing reported the gap. The refusal replaces a gate the operator believed was on. It does not remove the rows already written: `bodega policy osv list` names them under the table and `bodega doctor` reports them, in the form shown under [`bodega policy age`](#bodega-policy-age-setlistremove).
 
 #### apt
 
@@ -1821,7 +1821,7 @@ The Ubuntu and Debian releases cost more than the language ones, though far less
 
 Decoding one costs between six and sixteen times what it keeps, and the transient is the figure that gets a host OOM-killed rather than the one it settles at: the decoder allocates every duplicate before the sharing collapses it, so the peak moves far less than the retained figure does. Measured the same day, one process checking a single version against `Ubuntu:22.04:LTS`: 700 MB maximum resident, settling to the 43 MB above. `Ubuntu:24.04:LTS` peaks at 363 MB for the 32 MB it keeps, `Debian:12` at 77 MB for 12 MB. Releases decode one at a time, so provision for the largest release's peak plus what the others retain: 744 MB for a host serving all three, against 2653 MB for the same host reading pre-trim archives. Adding the retained figures alone sizes that host at 87 MB and it dies on the first apt version checked. Or keep the apt gate on a machine that imports rather than on the one that serves.
 
-**An archive synced by an earlier version keeps the old cost until it is re-synced**, because the trim happens at sync and nothing rewrites an archive already on disk: read by the shipped decode, a pre-trim `Ubuntu:22.04:LTS` holds 154 MB and peaks at 2562 MB, `Ubuntu:24.04:LTS` holds 76 MB and `Debian:12` 15 MB, which is the 2653 MB above. The untrimmed shape has next to nothing to share, because an enumerated list is per package and two packages' records are then never equal: 772,514 distinct records out of 772,549 entries, against 175,514 trimmed. `bodega policy osv list` names those ecosystems under its table and `bodega policy osv sync apt` replaces them. Their advisories are current, so the gate answers from them correctly in the meantime.
+**An archive synced by an earlier version keeps the old cost until it is re-synced**, because the trim happens at sync and nothing rewrites an archive already on disk: read by the shipped decode, a pre-trim `Ubuntu:22.04:LTS` holds 154 MB and peaks at 2562 MB, `Ubuntu:24.04:LTS` holds 76 MB and `Debian:12` 15 MB, which is the 2653 MB above. The untrimmed layout has next to nothing to share, because an enumerated list is per package and two packages' records are then never equal: 772,514 distinct records out of 772,549 entries, against 175,514 trimmed. `bodega policy osv list` names those ecosystems under its table and `bodega policy osv sync apt` replaces them. Their advisories are current, so the gate answers from them correctly in the meantime.
 
 A running server picks up a sync without a restart: it checks the archive it loaded from on each match and reloads when the file changes. `sync` is a separate process from the server enforcing the gate, so without that check the server would report the fresh fetch time under `bodega policy osv list` while still matching against the copy it loaded before the sync.
 
@@ -1941,7 +1941,7 @@ bodega policy age list
 bodega policy age remove npm
 ```
 
-`min-age` takes the Go duration shapes plus a plain `<N>d` for days. The action is `warn`, `block` or `ignore`. One rule per ecosystem; `set` overwrites.
+`min-age` takes the Go duration formats plus a plain `<N>d` for days. The action is `warn`, `block` or `ignore`. One rule per ecosystem; `set` overwrites.
 
 Coverage is the set of registry types with an upstream endpoint that carries a publish timestamp:
 
@@ -2085,7 +2085,7 @@ Nothing here needs enforcement relaxed, so nothing has to be switched back after
 
 Reads the `no_manifest` rows and writes the package manifests they describe to stdout, as a JSON array. Nothing reaches the manifest store and no discovery row is touched: this command only reads.
 
-The output is the same shape [`bodega pkg convert`](#bodega-pkg-convert-type-file-) emits, so `bodega pkg import` takes it with no editing in between — the review step is what the format is for, not a conversion step.
+The output is the same format [`bodega pkg convert`](#bodega-pkg-convert-type-file-) emits, so `bodega pkg import` takes it with no editing in between — the review step is what the format is for, not a conversion step.
 
 | Flag              | Effect                                                                                     |
 | ----------------- | ------------------------------------------------------------------------------------------ |
@@ -2853,7 +2853,7 @@ Components: main
 Signed-By: /etc/apt/keyrings/bodega-archive-keyring.gpg
 ```
 
-The stanza above is the shape, not the values. Your instance prints its own on the `bodega serve` startup banner and serves it on `GET /api/v1/status`, filled in from what the running process holds: the suites it answers for, the URL from `public_url`, and `Signed-By:` or the `[trusted=yes]` fallback according to whether a signing key is loaded. Copy that one. The web UI shows the block it read from this endpoint, so it cannot disagree with the server. The TUI renders through the same renderer but supplies the signing state from the key file rather than the process, which is the one axis where the two can differ — see [Details pane](#details-pane).
+The stanza above is the template, not the values. Your instance prints its own on the `bodega serve` startup banner and serves it on `GET /api/v1/status`, filled in from what the running process holds: the suites it answers for, the URL from `public_url`, and `Signed-By:` or the `[trusted=yes]` fallback according to whether a signing key is loaded. Copy that one. The web UI shows the block it read from this endpoint, so it cannot disagree with the server. The TUI renders through the same renderer but supplies the signing state from the key file rather than the process, which is the one axis where the two can differ — see [Details pane](#details-pane).
 
 Install the keyring first. The `.gpg` route serves the dearmored form `Signed-By:` takes directly, so the client needs no `gpg` binary:
 
@@ -2955,7 +2955,7 @@ The last line runs on the client and writes the token into the file each of its 
 
 ### Git smart-HTTP
 
-`git clone` against bodega speaks the same protocol it speaks against a forge. A `git_upstreams` namespace (see [Git upstreams](design.md#git-upstreams) for the config shape) maps onto an upstream, and bodega keeps a bare mirror of every repository a client has asked for.
+`git clone` against bodega speaks the same protocol it speaks against a forge. A `git_upstreams` namespace (see [Git upstreams](design.md#git-upstreams) for the config structure) maps onto an upstream, and bodega keeps a bare mirror of every repository a client has asked for.
 
 ```text
 GET  /git/{namespace}/{org}/{repo}.git/info/refs?service=git-upload-pack
@@ -3103,7 +3103,7 @@ Or skip the network entirely: `bodega apt key export --keyring` writes the same 
 
 ### Mirroring an upstream archive
 
-A codename listed in `apt_upstreams` is a **mirrored codename**: served from upstream rather than generated, the other of the two shapes a codename can take. A codename in `apt_suites` is a **generated suite**, built from bodega's own manifest entries and signed by bodega. bodega proxies `dists/<codename>/...` and the pool artifacts the index points at, caching each on the way through. This is what makes `apt update && apt install <anything>` work against bodega for packages nobody pre-built: apt reads the proxied `Packages`, resolves dependencies locally, then asks bodega for each `.deb` by its `Filename:`.
+A codename listed in `apt_upstreams` is a **mirrored codename**: served from upstream rather than generated, the other of the two modes a codename can take. A codename in `apt_suites` is a **generated suite**, built from bodega's own manifest entries and signed by bodega. bodega proxies `dists/<codename>/...` and the pool artifacts the index points at, caching each on the way through. This is what makes `apt update && apt install <anything>` work against bodega for packages nobody pre-built: apt reads the proxied `Packages`, resolves dependencies locally, then asks bodega for each `.deb` by its `Filename:`.
 
 ```json
 "apt_upstreams": {
@@ -3786,7 +3786,7 @@ A destination that goes away **after** startup does not stop the server. The wri
 
 ### Choosing a sink
 
-Measured on an Apple M1 Ultra (Mac13,2), macOS 26.7, internal NVMe over Apple Fabric, APFS; `postgres:17-alpine` in Docker Desktop on the same host over loopback. 64 concurrent writers, 10 s per run, at a fixed offered request rate. Each request is the post-B16 shape: one event row on the hot path plus one discovery observation through the recorder's queue.
+Measured on an Apple M1 Ultra (Mac13,2), macOS 26.7, internal NVMe over Apple Fabric, APFS; `postgres:17-alpine` in Docker Desktop on the same host over loopback. 64 concurrent writers, 10 s per run, at a fixed offered request rate. Each request takes the post-B16 path: one event row on the hot path plus one discovery observation through the recorder's queue.
 
 | Offered | Sink       | Events/s landed | Discovery dropped | Hot-path write p99 |
 | ------- | ---------- | --------------- | ----------------- | ------------------ |
@@ -3980,7 +3980,7 @@ The form edits no ACL. `deny_list`, `admin_permit_cidr` and `trusted_proxies` ar
 
 Two fields report where an entry's bytes are. **Stored** answers whether the probe found the primary artifact and names the backend it looked on (`yes (backend default)`); **Object** prints that object's URI, prefixed with the backend's own label — `file://<storage_path>` for a local backend, `s3://<bucket>` for an s3 one. Both read the backend the manifest entry records, so a local-only install reports its own disk rather than a bucket it never configured. Neither field is derived from `bucket`: an install carrying a leftover `bucket` key alongside `"storage_backend": "local"` printed an `s3://` URI over bytes on its own disk through v1.
 
-The last field of an entry is the client instruction, and its label names the shape rather than assuming a URL: **Sources line** for apt, **Registry stanza** for cargo, **Package URL** for the other six. All three carry the base URL `public_url` and the TLS pair resolve to, so a pane behind a terminating proxy prints what a client outside it reaches.
+The last field of an entry is the client instruction, and its label names the format rather than assuming a URL: **Sources line** for apt, **Registry stanza** for cargo, **Package URL** for the other six. All three carry the base URL `public_url` and the TLS pair resolve to, so a pane behind a terminating proxy prints what a client outside it reaches.
 
 cargo is the one type whose instruction is a file rather than a command. A client reaches the sparse index only once `.cargo/config.toml` names it as a registry, so the field carries the stanza and the command that uses it as one value:
 

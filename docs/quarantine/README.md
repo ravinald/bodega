@@ -2,7 +2,7 @@
 
 A version you already mirror turns out to be malicious. Upstream pulls it, an advisory lands, and until you act every client pointed at your mirror is one `install` away from the payload.
 
-The window is short and you will usually miss it. In the shape these walkthroughs use, the bad build was live for a little under two hours before upstream revoked it, and the fix shipped the next day. A mirror that resolved a dist-tag during those two hours is now serving the payload from your own cache, on your own network, with your name on it.
+The window is short and you will usually miss it. In the situation these walkthroughs use, the bad build was live for a little under two hours before upstream revoked it, and the fix shipped the next day. A mirror that resolved a dist-tag during those two hours is now serving the payload from your own cache, on your own network, with your name on it.
 
 The package is fictional: `@example-corp/widget-cli`, a scoped npm CLI mirrored on a single entry tracking the `latest` dist-tag. Nothing else is. Every flag, endpoint, and keystroke here is what bodega ships.
 

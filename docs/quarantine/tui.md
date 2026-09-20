@@ -75,14 +75,14 @@ If the save fails (validation, policy, permissions), the error shows at the bott
 
 Verification:
 
-- Cursor on `1.5.0` leaf. Details pane shows `Hidden: true, Frozen: true`. JSON panel shows a scoped one-entry `PackageManifest`, the shape `bodega pkg export npm @example-corp/widget-cli 1.5.0` produces and the shape the web UI delivers for `/api/v1/packages/npm/@example-corp/widget-cli/1.5.0`. All three surfaces speak the same JSON.
+- Cursor on `1.5.0` leaf. Details pane shows `Hidden: true, Frozen: true`. JSON panel shows a scoped one-entry `PackageManifest`, the structure `bodega pkg export npm @example-corp/widget-cli 1.5.0` produces and the structure the web UI delivers for `/api/v1/packages/npm/@example-corp/widget-cli/1.5.0`. All three surfaces speak the same JSON.
 - Cursor on `1.4.2`. Details shows `Frozen: true`, no Hidden. This is the version that will serve.
 
 ## Scenario 2: relax to latest tracking, keep the tombstone
 
 1. Cursor on the `@example-corp/widget-cli` package header.
 2. `E`.
-3. Buffer now has the Scenario 1 shape. Replace with:
+3. Buffer now holds the Scenario 1 entry. Replace with:
 
 ```json
 {
@@ -128,7 +128,7 @@ To change the tombstone entry alone, to update its description say, and leave th
 
 1. Edit, `Ctrl+S`.
 
-Bodega merges the single edited version back into the stored manifest in place, leaving the `latest` entry in the other slot untouched. Same shape the CLI uses for `bodega pkg edit npm @example-corp/widget-cli 1.5.0`.
+Bodega merges the single edited version back into the stored manifest in place, leaving the `latest` entry in the other slot untouched. Same structure the CLI uses for `bodega pkg edit npm @example-corp/widget-cli 1.5.0`.
 
 ## Scenario 3: constrain to `>= 1.5.1`
 

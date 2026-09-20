@@ -24,7 +24,7 @@ Which produced this manifest on disk:
 }
 ```
 
-Tracking `latest` is fine in normal operation: bodega's builder resolves the dist-tag on every `build fetch` and pulls whatever the registry has today. The trouble with this shape during a supply-chain incident is that it offers no policy knobs: there's nothing to deny, nothing to constrain, no tombstone.
+Tracking `latest` is fine in normal operation: bodega's builder resolves the dist-tag on every `build fetch` and pulls whatever the registry has today. The trouble with this setup during a supply-chain incident is that it offers no policy knobs: there's nothing to deny, nothing to constrain, no tombstone.
 
 Each scenario replaces this entry with something more deliberate.
 
@@ -209,4 +209,4 @@ bodega pkg delete npm @example-corp/widget-cli
 bodega pkg import ~/widget-cli-pre-change.json
 ```
 
-`pkg export` writes a valid `PackageManifest`; `pkg import` accepts that same shape. They round-trip cleanly.
+`pkg export` writes a valid `PackageManifest`; `pkg import` accepts that same structure. They round-trip cleanly.

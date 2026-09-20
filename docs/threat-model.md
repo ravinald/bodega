@@ -29,7 +29,7 @@ risk:
   Tuesday's build produces the same bytes as last Tuesday's build, and
   `bodega pkg checksum list` is the record of which versions are pinned.
 
-  One artifact is not covered, and the gap is in the shape of the artifact
+  One artifact is not covered, and the gap is in the nature of the artifact
   rather than in the check. **Clone-mode git** ships a bundle this instance
   generates locally at package time, so there are no upstream bytes for a
   digest to attest to, and `git bundle create` is not reproducible
@@ -186,14 +186,14 @@ defence against:
   expansion, because `warn` and `ignore` permit every package the profile does
   not list and the filter then copies the upstream index through verbatim. That
   document is the trust downgrade above paid for no filtering, and it is the
-  one shape where a control the operator believes they set makes the host
+  one case where a control the operator believes they set makes the host
   strictly less safe than having written no profile at all.
 - **An apt entry naming a binary package.** Membership for apt closes on the
   source, so an entry spelled `nginx-common` or `libexpat1` matches no
   paragraph in the index it governs and the host is told the package does not
   exist. The failure is availability rather than disclosure, since nothing outside
   the class is offered, but it is silent, arrives as `kept back` on a package
-  the operator listed themselves, and is the shape most likely to get a control
+  the operator listed themselves, and is the case most likely to get a control
   turned off. `--from-origin` writes source names and `bodega profile check`
   reports the divergence; neither is a runtime gate, so an entry hand-written
   under a binary name is caught at `check` time or not at all.
@@ -229,7 +229,7 @@ what publishers ship.
 
 ### Flatpak
 
-Same shape as snap. Flatpak runtimes are bundled, remotes (flathub etc.)
+Same reasoning as snap. Flatpak runtimes are bundled, remotes (flathub etc.)
 are configured per-host rather than through bodega's allow-list, and updates
 happen on a user- or system-triggered cadence that bodega does not see.
 
