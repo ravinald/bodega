@@ -184,10 +184,10 @@ JSON
 		;;
 	# ---- proxy mode ---------------------------------------------------------
 	#
-	# The eight names above are hosted entries: none sets `mode`, so
+	# The nine names above are hosted entries: none sets `mode`, so
 	# EffectiveMode returns "hosted" for every one of them and every proxy
 	# check in the suite reaches the serving code through "no manifest names
-	# this". These three are the other half of that distinction — an entry a
+	# this". These four are the other half of that distinction — an entry a
 	# manifest does name, whose bytes come from upstream — and the serving code
 	# reads them on a different branch.
 	#
@@ -195,7 +195,7 @@ JSON
 	# second argument is already its version, and because a mode argument
 	# threaded through every call site would leave the mode of a given call
 	# readable only at the caller. `npm-proxy` says what it emits where it is
-	# written. E2E_FIXTURE_TYPES keeps naming exactly the eight the pipeline
+	# written. E2E_FIXTURE_TYPES keeps naming exactly the nine the pipeline
 	# suites walk, so nothing here changes what 30-pipeline imports.
 	#
 	# Each upstream is one 65-proxy.sh already depends on, so a proxy-mode

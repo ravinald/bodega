@@ -774,7 +774,7 @@ pypi    examplesdk           1.26.0            default  archive
   set storage_by_type.pypi to "archive" and re-run 'bodega build upload pypi --replace-placement' — pypi moves as a whole type or not at all
 ```
 
-A rule change moves nothing, which is the design: everything already uploaded stays where it is and stays readable. The cost is that the change is invisible afterwards. `upload` and `sync` keep writing to the backend each version records, and only `pypi` refuses, because only `pypi` uploads a whole directory and can be split by a rule. The other seven types wrote on and reported nothing. This is where they answer.
+A rule change moves nothing, which is the design: everything already uploaded stays where it is and stays readable. The cost is that the change is invisible afterwards. `upload` and `sync` keep writing to the backend each version records, and only `pypi` refuses, because only `pypi` uploads a whole directory and can be split by a rule. The other eight types wrote on and reported nothing. This is where they answer.
 
 `bodega pkg move` is what discharges a row, and the command is printed with its arguments so the line can be copied. A frozen version names the unfreeze first, because `pkg move` refuses the whole command when any selected version is frozen.
 
@@ -4026,6 +4026,7 @@ A read-only audit database used to be the quieter version of the same loss: `Rec
 │ helm/              │                            │
 │ npm/               │                            │
 │ cargo/             │                            │
+│ freebsd/           │                            │
 ├─ Log ──────────────┴────────────────────────────┤
 │ [gomod] example.com/example-corp/sdk: fetching...         │
 │ [gomod] example.com/example-corp/sdk: checksum verified   │
