@@ -228,7 +228,7 @@ check_ne SHIP-12 "the config is not left owned by root alone" "root:root" "$E2E_
 E2E_HOST=client
 e2e_curl client "$E2E_BASE_URL/api/v1/packages" || true
 api_types="$E2E_OUT"
-for t in apt git pypi binary gomod helm npm cargo; do
+for t in apt git pypi binary gomod helm npm cargo freebsd; do
 	check_contains "SHIP-13-$t" "the package API lists $t" "\"$t\"" "$api_types" \
 		"internal/manifest/types.go:43" "curl $E2E_BASE_URL/api/v1/packages"
 done
