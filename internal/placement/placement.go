@@ -366,10 +366,15 @@ func VersionLabel(ve manifest.VersionEntry) string {
 // never grew a placement lookup. An artifact with no manifest entry — a helm
 // index.yaml, an npm packument — leaves Package empty and is routed by type,
 // which ForVersion already handles.
+//
+// Each artifact resolves its own backend, except for a set-placed type: see
+// destination for the one version of that rule a published freebsd repository
+// cannot survive.
 func (p *Placer) UploadPaths(ctx context.Context, typ string, paths []builder.ArtifactPath) (int, error) {
 	n := 0
+	bound := map[versionRef]storage.ObjectStore{}
 	for _, ap := range paths {
-		st, err := p.ForVersion(ctx, typ, ap.Package, ap.Version, ap.ObjectKey)
+		st, err := p.destination(ctx, typ, ap, bound)
 		if err != nil {
 			return n, err
 		}
@@ -380,6 +385,59 @@ func (p *Placer) UploadPaths(ctx context.Context, typ string, paths []builder.Ar
 		n++
 	}
 	return n, nil
+}
+
+// versionRef names one version of one package, which is the unit a set-placed
+// type publishes as.
+type versionRef struct{ pkg, version string }
+
+// setPlaced reports whether one version of typ reaches storage as a set of
+// objects that is only meaningful whole.
+//
+// freebsd is the only one, and it is not the same property DirectoryPlaced
+// names. A pypi tree has no per-version key at all; a freebsd repository has
+// one key per object and a catalogue listing every one of them, so the
+// catalogue is valid in exactly one place: a backend already holding what it
+// names. Every other type's artifact stands on its own, apt's generated
+// indexes included — those are rebuilt from the backend rather than pinned to
+// a set enumerated somewhere else.
+func setPlaced(typ string) bool { return typ == manifest.TypeFreeBSD }
+
+// destination returns the backend ap is written to, resolving a set-placed
+// version once and holding that answer for the rest of the upload.
+//
+// ForVersion reads the manifest on every call and follows the Storage it
+// finds there. For a type whose artifacts stand alone that is the right
+// answer: an operator repointing a version mid-upload leaves each file at
+// whatever its own record said when that file went, and each file is
+// separately complete. For freebsd it is a hole wide enough to break a
+// published repository. The object set and the three repository-root files
+// are one publication, so re-resolving between them let a placement edit land
+// the objects in the backend the run established and the catalogue in a
+// different one, replacing that backend's complete generation with a
+// catalogue whose packages were written somewhere else. Both uploads return
+// a file count and no error; the client is what finds out, when it resolves a
+// package out of the catalogue it just read and gets a 404.
+//
+// Held rather than re-checked and refused. A refusal would throw away a
+// generation that is whole where this run put it, over an edit that is about
+// the next upload rather than this one. The edit still wins where it is asked
+// to: the manifest keeps the operator's new name, so the following upload
+// writes the whole set there.
+func (p *Placer) destination(ctx context.Context, typ string, ap builder.ArtifactPath, bound map[versionRef]storage.ObjectStore) (storage.ObjectStore, error) {
+	if !setPlaced(typ) || ap.Package == "" {
+		return p.ForVersion(ctx, typ, ap.Package, ap.Version, ap.ObjectKey)
+	}
+	ref := versionRef{pkg: ap.Package, version: ap.Version}
+	if st, ok := bound[ref]; ok {
+		return st, nil
+	}
+	st, err := p.ForVersion(ctx, typ, ap.Package, ap.Version, ap.ObjectKey)
+	if err != nil {
+		return nil, err
+	}
+	bound[ref] = st
+	return st, nil
 }
 
 // UploadType writes one type's local artifacts to the backends the manifest

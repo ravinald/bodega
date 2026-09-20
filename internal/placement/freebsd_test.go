@@ -14,6 +14,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 const fbUploadABI = "FreeBSD:14:amd64"
@@ -188,4 +189,106 @@ func TestFreeBSDUploadRefusesACatalogueWithAMissingObject(t *testing.T) {
 	if info.Exists {
 		t.Error("a refused enumeration still published a catalogue")
 	}
+}
+
+// fbOnUpload runs once, when the upload line for the named object is printed.
+// That line goes out after the object's destination has been resolved and
+// before its bytes are written, which is the window a placement edit in
+// flight lands in.
+type fbOnUpload struct {
+	object string
+	run    func()
+	fired  bool
+}
+
+func (h *fbOnUpload) Write(p []byte) (int, error) {
+	if !h.fired && strings.Contains(string(p), "/"+h.object) {
+		h.fired = true
+		h.run()
+	}
+	return len(p), nil
+}
+
+// fbComplete checks the two halves that make a published FreeBSD repository
+// readable: the catalogue at this backend is the generation named, and the
+// package that generation's repopath names is in the same backend. Either one
+// alone passes on a repository a client cannot install from.
+func fbComplete(t *testing.T, st storage.ObjectStore, generation []byte, repopath string) {
+	t.Helper()
+	published, err := st.Get(t.Context(), manifest.FreeBSDKey(fbUploadABI, "latest", manifest.FreeBSDCatalogFile))
+	if err != nil {
+		t.Fatalf("read the catalogue published to %s: %v", st.Label(), err)
+	}
+	if !bytes.Equal(published, generation) {
+		t.Errorf("%s holds a catalogue from another generation than the one whose objects were written there", st.Label())
+	}
+	info, err := st.Head(t.Context(), manifest.FreeBSDKey(fbUploadABI, "latest", repopath))
+	if err != nil {
+		t.Fatalf("head %s on %s: %v", repopath, st.Label(), err)
+	}
+	if !info.Exists {
+		t.Errorf("the catalogue published to %s names %s, which %s does not hold", st.Label(), repopath, st.Label())
+	}
+}
+
+// R5 at the destination boundary: the operator repoints the version while an
+// upload of it is in flight.
+//
+// ForVersion reads the manifest per artifact, so the edit used to reach the
+// catalogue without reaching the objects that had already gone. This run
+// wrote its only package to the backend it established, then replaced a
+// second backend's complete generation with a catalogue naming a package that
+// backend had never received. Both uploads returned a file count and no
+// error, and the manifest pointed clients at the broken one.
+//
+// The interleaving is the shipped TUI's rather than a contrived one:
+// executeSyncAll starts an upload without blocking the UI, and the JSON
+// editor writes a version — Storage included — into the same store that
+// upload is reading.
+func TestFreeBSDUploadKeepsItsObjectsAndCatalogueInOneBackend(t *testing.T) {
+	catA, dataA := fbGeneration(t, "a.pkg")
+	catB, dataB := fbGeneration(t, "b.pkg")
+	var generation atomic.Int32
+	up := fbUpstream(t, &generation, [2][]byte{catA, dataA}, [2][]byte{catB, dataB})
+
+	bcfg := &builder.Config{BuildRoot: t.TempDir(), Stdout: io.Discard}
+	pl, store := placerFixture(t, "")
+	fbSeed(t, store, up.URL)
+	if sum := builder.FetchFreeBSD(bcfg, store, ""); sum.Failures != 0 {
+		t.Fatalf("the first mirror failed: %+v", sum.Results)
+	}
+
+	bulk, err := pl.Stores().ByName("bulk")
+	if err != nil {
+		t.Fatalf("resolve the bulk backend: %v", err)
+	}
+	pl.out = &fbOnUpload{object: "a.pkg", run: func() {
+		generation.Store(1)
+		bcfg.Force = true
+		if sum := builder.FetchFreeBSD(bcfg, store, ""); sum.Failures != 0 {
+			t.Fatalf("the second mirror failed: %+v", sum.Results)
+		}
+		pm, err := store.GetPackage(t.Context(), manifest.TypeFreeBSD, "latest")
+		if err != nil || pm == nil {
+			t.Fatalf("load the entry: %v", err)
+		}
+		pm.Versions[0].Storage = "bulk"
+		if err := store.SavePackage(t.Context(), pm); err != nil {
+			t.Fatalf("repoint the entry at bulk: %v", err)
+		}
+		second := NewWith(pl.Stores(), store, io.Discard, false)
+		if _, err := second.UploadType(t.Context(), bcfg, manifest.TypeFreeBSD); err != nil {
+			t.Fatalf("the upload that follows the edit failed: %v", err)
+		}
+		// Asserted before the first upload resumes, so a later failure
+		// cannot be read as bulk never having held a whole generation.
+		fbComplete(t, bulk, catB, "b.pkg")
+	}}
+
+	if _, err := pl.UploadType(t.Context(), bcfg, manifest.TypeFreeBSD); err != nil {
+		t.Fatalf("the upload the edit interrupted failed: %v", err)
+	}
+
+	fbComplete(t, pl.Stores().ForType(manifest.TypeFreeBSD), catA, "a.pkg")
+	fbComplete(t, bulk, catB, "b.pkg")
 }
