@@ -1,0 +1,400 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/entitle"
+	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/pins"
+)
+
+// profileSet is the binding table and every profile it names, resolved once
+// and swapped whole. Held behind an atomic pointer on the same TTL as the ACL
+// and identity sets, because the handler chain is built at Start and an
+// operator writing `bodega profile add` against a running server has nothing
+// to rebuild it.
+//
+// Whole matters as much as atomic: a request that read one host's binding from
+// the incoming generation and another host's entries from the outgoing one
+// would be answered by a profile nobody wrote.
+type profileSet struct {
+	byIdentity map[string]*entitle.Profile
+
+	// aptScoped records whether any profile in this set governs apt, which is
+	// the union of every answer aptGatesPool can give this generation. The
+	// pool route's cache directive turns on it: a directive decided on the
+	// requesting host would ship a shared copy of the object the next host is
+	// refused, and one decided on the filtered codenames actually served
+	// would do the same for every profile whose codename a rebuild withdrew.
+	aptScoped bool
+}
+
+// profileFor returns the profile bound to the host this request resolved to,
+// or nil when nothing binds it. A nil *entitle.Profile is the unprofiled host
+// and permits everything ungoverned, so every caller can use the answer
+// without a nil check of its own.
+func (p *profileSet) profileFor(identity string) *entitle.Profile {
+	if p == nil || identity == "" {
+		return nil
+	}
+	return p.byIdentity[identity]
+}
+
+// scopesApt reports whether any profile here scopes apt. A nil set is the
+// state before the bindings have ever been read, and answers yes: nothing has
+// looked at the profile tables yet, so a "no" would be a guess in the
+// direction of a year-long public copy.
+func (p *profileSet) scopesApt() bool {
+	return p == nil || p.aptScoped
+}
+
+func (s *Server) profileNow() *profileSet {
+	if set := s.profileCached(); set != nil {
+		return set
+	}
+	s.profileMu.Lock()
+	defer s.profileMu.Unlock()
+	if set := s.profileCached(); set != nil {
+		return set
+	}
+	return s.storeProfiles(s.resolveProfiles(context.Background()))
+}
+
+func (s *Server) profileCached() *profileSet {
+	set := s.profiles.Load()
+	if set == nil {
+		return nil
+	}
+	if time.Since(time.Unix(0, s.profilesAt.Load())) >= aclCacheTTL {
+		return nil
+	}
+	return set
+}
+
+func (s *Server) storeProfiles(set *profileSet) *profileSet {
+	s.profiles.Store(set)
+	s.profilesAt.Store(time.Now().UnixNano())
+	return set
+}
+
+// refreshProfiles re-reads the bindings regardless of cache age, so SIGHUP
+// lands a profile change at once rather than within the TTL.
+func (s *Server) refreshProfiles(ctx context.Context) {
+	s.profileMu.Lock()
+	defer s.profileMu.Unlock()
+	s.storeProfiles(s.resolveProfiles(ctx))
+}
+
+// resolveProfiles reads every binding and the profiles they name.
+//
+// A read that fails keeps the last good set rather than emptying. Emptying
+// would unprofile the fleet on one query timeout, which is the same failure
+// the identity table's read guards against and is worse here: this set decides
+// admission, so losing it silently relaxes every control it carries.
+func (s *Server) resolveProfiles(ctx context.Context) *profileSet {
+	empty := &profileSet{byIdentity: map[string]*entitle.Profile{}}
+	if s.auditDB == nil {
+		return empty
+	}
+	bindings, err := s.auditDB.ListProfileBindings(ctx, "")
+	if err != nil {
+		s.logger.Error("could not read the profile bindings; keeping the last set", "error", err)
+		if set := s.profiles.Load(); set != nil {
+			return set
+		}
+		return empty
+	}
+	set := &profileSet{byIdentity: make(map[string]*entitle.Profile, len(bindings))}
+	resolved := map[string]*entitle.Profile{}
+	for _, b := range bindings {
+		p, ok := resolved[b.Profile]
+		if !ok {
+			d, err := s.auditDB.GetProfile(ctx, b.Profile)
+			if err != nil {
+				// A binding naming a profile that no longer exists resolves to
+				// nothing rather than to a refusal: the host is in the state it
+				// was in before anyone bound it.
+				s.logger.Error("a profile binding names a profile that could not be read; the host is served unprofiled",
+					"identity", b.Identity, "profile", b.Profile, "error", err)
+				resolved[b.Profile] = nil
+				continue
+			}
+			p = entitle.New(d)
+			resolved[b.Profile] = p
+		}
+		if p != nil {
+			set.byIdentity[b.Identity] = p
+			if p.Governs(manifest.TypeApt) {
+				set.aptScoped = true
+			}
+		}
+	}
+	return set
+}
+
+// handleAPIProfilePins answers what one profile holds still, and what bodega
+// knows about the versions it holds.
+//
+// Admin-gated, with the audit trail and the token list: a pin report is the
+// list of versions a class of host is deliberately not patching, together with
+// the advisories against them. That is the most useful document on this server
+// to somebody who should not have it.
+//
+// It reports and does not remediate. No suppression state, no ticket, no
+// severity SLA: the pin's own reason and review date are the whole of bodega's
+// suppression concept, and a vulnerability management tool consuming this
+// already owns the rest.
+func (s *Server) handleAPIProfilePins(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if s.auditDB == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit database not configured"})
+		return
+	}
+	name := r.PathValue("name")
+	report, err := pins.Collect(r.Context(), s.auditDB, s.store, name, time.Now().UTC())
+	if errors.Is(err, audit.ErrNoProfile) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		s.logger.Error("could not read the pins for a profile", "profile", name, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not read the profile pins"})
+		return
+	}
+	if report == nil {
+		// An empty array rather than null: a client reading this to decide
+		// what a host class is not patching has to tell "no pins" from a field
+		// it failed to parse, and null reads as the second.
+		report = []pins.Pin{}
+	}
+	if r.URL.Query().Get("stale") == "true" {
+		if report = pins.Stale(report); report == nil {
+			report = []pins.Pin{}
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"profile": name, "pins": report})
+}
+
+// reportPinFeasibility checks every profile's pins against the dependency
+// graph when the index is generated, and reports what it finds.
+//
+// It extends nothing. A pin whose closure the profile refuses is a real
+// problem — apt meets it as a widening set held back, or a proposal to remove
+// the package — and the available fixes are opposite: move the pin, or pin the
+// closure with it. Choosing the second here would freeze a growing set on
+// every rebuild, since each package pinned drags its own dependencies in, and
+// a host would stop receiving security updates for all of them with nobody
+// having decided that it should. The strict behavior is `bodega profile pin
+// --strict-closure`, where an operator has read the closure first.
+//
+// Runs beside auditAptEntries, on the index refresh rather than per request:
+// the graph is a catalog-wide fact and the answer does not change between two
+// fetches.
+func (s *Server) reportPinFeasibility(ctx context.Context) {
+	if s.auditDB == nil || s.store == nil {
+		return
+	}
+	profiles, err := s.auditDB.ListProfiles(ctx)
+	if err != nil {
+		s.logger.Error("could not read the profiles to check pin feasibility", "error", err)
+		return
+	}
+	if len(profiles) == 0 {
+		return
+	}
+	if err := s.store.LoadGraph(ctx); err != nil {
+		s.logger.Warn("could not read the dependency graph, so no pin's closure was checked at this rebuild",
+			"error", err)
+		return
+	}
+	edges := s.store.Edges()
+	if len(edges) == 0 {
+		return
+	}
+
+	var conflicts []string
+	held := 0
+	for _, prof := range profiles {
+		d, err := s.auditDB.GetProfile(ctx, prof.Name)
+		if err != nil {
+			s.logger.Error("could not read a profile to check pin feasibility", "profile", prof.Name, "error", err)
+			continue
+		}
+		p := entitle.New(d)
+		for _, e := range d.Entries {
+			if !e.Pinned() {
+				continue
+			}
+			c := pins.Of(edges, e.Type, e.Name, e.Version)
+			held += len(c.Members)
+			for _, cf := range c.Conflicts(p) {
+				conflicts = append(conflicts, prof.Name+": "+cf.Reason)
+			}
+		}
+	}
+	if len(conflicts) > 0 {
+		s.logger.Warn("profile pins hold versions their own dependency closure contradicts; move the pin or pin the closure with 'bodega profile pin --strict-closure'",
+			"count", len(conflicts), "conflicts", capForLog(conflicts))
+	}
+	if held > 0 {
+		s.logger.Debug("profile pins hold further packages still through the dependency graph",
+			"packages_held", held)
+	}
+}
+
+// profileFor is the whole of the read path's profile lookup: which host is
+// this, and what may it fetch.
+func (s *Server) profileFor(r *http.Request) *entitle.Profile {
+	return s.profileNow().profileFor(Identity(r))
+}
+
+// entitleGate is the request predicate on a package route. It answers true
+// when the handler should carry on.
+//
+// version is empty on a route that names a package without naming a version —
+// a git namespace, a packument, an index. Those are decided at the membership
+// level alone, because there is no version yet to hold to a constraint.
+//
+// apt reaches here from one route only, and as a backstop rather than as the
+// control: refusing an apt fetch at the pool costs the client a half-applied
+// transaction, so the enforcement is the filtered index a profile is served
+// under and aptPoolGate catches a client that composed a URL without reading
+// one. See internal/server/apt_profile.go and docs/design.md.
+func (s *Server) entitleGate(w http.ResponseWriter, r *http.Request, typ, name, version string) bool {
+	p := s.profileFor(r)
+	if p == nil {
+		return true
+	}
+	var d entitle.Decision
+	if version == "" {
+		d = p.Covers(typ, name)
+	} else {
+		d = p.Permits(typ, name, version)
+	}
+	if d.Reportable() {
+		s.recordProfileReach(r, p, typ, name, version)
+	}
+	if d.Permitted {
+		return true
+	}
+	s.recordProfileRefusal(r, p, typ, name, version, d)
+	http.Error(w, profileRefusalText(p, typ, name, version, d), http.StatusForbidden)
+	return false
+}
+
+// profileRefusalText is the body a refused client reads. It names the profile,
+// the package, the rule that refused and the repair, because the two refusals
+// call for opposite fixes: a membership refusal is widened by adding the
+// package, a constraint refusal by moving the pin. A client that prints only
+// "403 Forbidden" leaves the operator with the audit row, and the row is not
+// what the person running the install is looking at.
+func profileRefusalText(p *entitle.Profile, typ, name, version string, d entitle.Decision) string {
+	subject := typ + "/" + name
+	if version != "" {
+		subject += " at " + version
+	}
+	switch d.Refusal {
+	case entitle.RefusalMembership:
+		return fmt.Sprintf("%s: profile %q does not list %s.\n"+
+			"  Add it:      bodega profile add %s %s %s\n"+
+			"  Or open it:  bodega profile set %s %s --membership open\n",
+			entitle.RefusalMembership, p.Name(), subject, p.Name(), typ, name, p.Name(), typ)
+	case entitle.RefusalConstraint:
+		return fmt.Sprintf("%s: %s.\n"+
+			"  Move the pin:  bodega profile pin %s %s %s <version> --reason <why>\n"+
+			"  Or float it:   bodega profile add %s %s %s --constraint any\n",
+			entitle.RefusalConstraint, d.Reason, p.Name(), typ, name, p.Name(), typ, name)
+	}
+	return fmt.Sprintf("profile %q refused %s: %s\n", p.Name(), subject, d.Reason)
+}
+
+// recordProfileRefusal writes the denial row. The status column carries which
+// rule refused rather than one "profile" value for both, so `bodega audit
+// events` answers "widen the set or move the pin" without anyone decoding the
+// details blob.
+func (s *Server) recordProfileRefusal(r *http.Request, p *entitle.Profile, typ, name, version string, d entitle.Decision) {
+	reason := audit.DenialProfileMembership
+	if d.Refusal == entitle.RefusalConstraint {
+		reason = audit.DenialProfileConstraint
+	}
+	extra := map[string]string{
+		"profile": p.Name(),
+		"rule":    d.Refusal,
+		"detail":  d.Reason,
+	}
+	if d.Rule != nil {
+		extra["membership"] = d.Rule.Membership
+		extra["version_default"] = d.Rule.VersionDefault
+		extra["expansion"] = d.Rule.Expansion
+	}
+	if d.Entry != nil {
+		extra["entry_constraint"] = d.Entry.Constraint
+		extra["entry_version"] = d.Entry.Version
+	}
+	recordDenialFor(s.auditDB, r, typ, name, version, reason, extra)
+}
+
+// recordProfileReach writes the discovery row for a fetch outside a closed
+// profile's set, under warn as well as under block.
+//
+// decision is `denied`, which is the value the existing promote flow already
+// reads: the row means "this host reached outside its class", which is the
+// same shape of finding as "this host reached an upstream the allow-list
+// refuses" and belongs in the same table an operator already watches. Recording
+// it as no_manifest instead would read as a catalog gap and send someone to add
+// a package the profile deliberately does not list.
+func (s *Server) recordProfileReach(r *http.Request, p *entitle.Profile, typ, name, version string) {
+	s.recordDiscoveryRaw(r.Context(), r, typ, "", profileReachHint(p, typ, name), name, version,
+		audit.DecisionDenied, "")
+}
+
+// profileReachHint is the pattern_hint for a reach outside a profile. The
+// upstream allow-list hint has no meaning here — nothing about this row is
+// promoted into a policy rule — so the column carries the command that closes
+// the finding instead.
+func profileReachHint(p *entitle.Profile, typ, name string) string {
+	return fmt.Sprintf("bodega profile add %s %s %s", p.Name(), typ, name)
+}
+
+// The filtered indexes are never stored. Every one of them is produced by
+// running the profile's filter over the buffered response on the way out, so
+// what sits in the cache under an index's key is the document the upstream
+// served, exactly as it is for the pypi href rewrite and the npm tarball
+// rewrite. A cache hit filters identically to a miss, which is what lets one
+// cached object answer every host class correctly and lets an operator's
+// profile edit land within the binding cache TTL rather than at the next
+// upstream refresh.
+//
+// The hazard this closes is a filtered document reaching the cache: served
+// from there to a second host class it is valid, parseable and wrong about
+// what that host may install, with no error anywhere. A profile-scoped key
+// would close it too, at the cost of a private copy of every index per
+// profile and an upstream fetch to fill each one. See
+// TestTwoProfilesGetTwoDocumentsFromOneCachedIndex, which asserts the stored
+// bytes against the upstream document rather than against a response body.
+
+// profileVersionFilter is the per-version predicate an index filter applies.
+// It is Permits with the type and package already bound, so an index generator
+// and the request predicate cannot disagree about one version.
+//
+// nil when the profile does not govern the type, which is the signal to leave
+// the document as it is rather than to run a filter that permits everything.
+func profileVersionFilter(p *entitle.Profile, typ, name string) func(string) bool {
+	if p == nil {
+		return nil
+	}
+	if d := p.Covers(typ, name); !d.Governed || d.Outside {
+		// Outside a closed set and permitted by expansion: the profile lists
+		// no version rule for a package it does not carry, so filtering its
+		// versions would invent one.
+		return nil
+	}
+	return func(version string) bool { return p.Permits(typ, name, version).Permitted }
+}

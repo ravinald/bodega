@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  vet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - run: make vet
+      # The gate/CI drift guard runs here rather than in its own job: it is a
+      # sed and a grep, and a job of its own would be one more entry in the
+      # list it exists to keep honest.
+      - run: make ci-drift
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          # Action v7 is required for golangci-lint v2.x (our .golangci.yml is v2 format).
+          version: v2.12.2
+          args: --timeout=5m
+
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - run: go install golang.org/x/tools/cmd/goimports@latest
+      - run: make fmt-check
+
+  tidy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - run: make tidy-check
+
+  harness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # shellcheck and jq ship on the runner image; shfmt does not, so it is
+      # installed here. jq matters because the harness self-test builds every
+      # finding record with it.
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      # Pinned to the version the Makefile guard expects developers to have
+      # locally. shfmt reformats between minor releases, so an unpinned install
+      # fails `shfmt -d` on a runner-image bump with no change to the shell.
+      - run: go install mvdan.cc/sh/v3/cmd/shfmt@v3.14.0
+      - run: make harness
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - run: go test -race -count=1 -coverprofile=coverage.out ./...
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 14
+
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [vet, lint, fmt, tidy, test, harness]
+    strategy:
+      fail-fast: false
+      matrix:
+        # TODO: add windows/amd64 once cmd/bodega/cmd_reset.go's syslog usage is
+        # guarded behind build tags (Windows lacks log/syslog).
+        include:
+          - { goos: linux,  goarch: amd64 }
+          - { goos: linux,  goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: Build
+        env:
+          GOOS:        ${{ matrix.goos }}
+          GOARCH:      ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: go build -trimpath -o /dev/null ./cmd/bodega

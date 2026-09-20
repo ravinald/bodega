@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ravinald/bodega/schemas/apt.schema.json",
+  "title": "APT Package Manifest",
+  "description": "Defines Debian packages to build from source or download from system repositories.",
+  "type": "object",
+  "required": ["config_version", "entries"],
+  "properties": {
+    "config_version": {
+      "type": "integer",
+      "description": "Schema version. Current: 1.",
+      "const": 1
+    },
+    "entries": {
+      "type": "array",
+      "description": "List of APT packages to manage.",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Logical package name used in logs and the TUI."
+          },
+          "version": {
+            "type": "string",
+            "description": "Package version. Used in build paths and S3 keys to allow multiple versions."
+          },
+          "source_name": {
+            "type": "string",
+            "description": "Upstream package or directory name. Defaults to name when absent. This is the name 'apt-get download' asks for, so it is the binary package name."
+          },
+          "source_package": {
+            "type": "string",
+            "description": "Debian source package this binary was built from, as dpkg reports it in ${source:Package}. Read by the OSV gate, because Ubuntu and Debian advisories are issued against the source. Absent means no capture recorded one, which is not the same as equal to name."
+          },
+          "capture_suite": {
+            "type": "string",
+            "description": "Release the host this version was captured on was running, as 'bodega pkg convert apt' records it from --suite or /etc/os-release. Read by the OSV gate, which keys a distro advisory on the release because Ubuntu and Debian backport a fix without moving the upstream version. Ignored by the index generator: suites decides where the .deb is published, and on a server whose apt_codename is a local name the two are different values.",
+            "pattern": "^[^/]*$"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Git URL to clone for a source build. When omitted, the package is fetched via apt-get download."
+          },
+          "build_cmd": {
+            "type": "string",
+            "description": "Shell command to run from the package root (cloned source directory). The working directory is the repo root, so 'build-deb.sh' is sufficient — no './' prefix needed."
+          },
+          "deb_glob": {
+            "type": "string",
+            "description": "Glob pattern (relative to source dir) to locate the built .deb file."
+          },
+          "suites": {
+            "type": "array",
+            "description": "APT suites (dists/<suite>/) this package is published to. Absent means the server's default suite (config apt_codename). Suite names must not contain \"/\".",
+            "items": {
+              "type": "string",
+              "pattern": "^[^/]+$"
+            }
+          },
+          "frozen": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, the entry cannot be built, edited, or deleted."
+          },
+          "storage": {
+            "type": "string",
+            "description": "Name of the storage backend holding this version's artifact bytes. Absent means \"default\" — the backend defined by storage_backend/storage_path/bucket/region — and is correct for every artifact uploaded before named backends existed. It is not a placement rule: storage_by_type decides where the next write goes, this records where an already-written artifact is."
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

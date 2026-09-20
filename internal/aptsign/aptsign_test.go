@@ -1,0 +1,507 @@
+package aptsign
+
+import (
+	"bytes"
+	"crypto"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/armor"
+	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
+	"github.com/ProtonMail/go-crypto/openpgp/packet"
+)
+
+// release is a stand-in for the document the apt index generator signs. The
+// trailing newline matters: clearsign canonicalizes line endings, and a body
+// that does not end in one comes back with one added.
+const release = "Origin: bodega\nSuite: noble\nSHA256:\n abc 12 main/binary-amd64/Packages\n"
+
+func testKey(t *testing.T) *KeyRing {
+	t.Helper()
+	kr, err := Generate("bodega test", "test@example.invalid", KeyEd25519)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	return kr
+}
+
+func TestClearSignBodyMatchesRelease(t *testing.T) {
+	kr := testKey(t)
+	signed, err := kr.ClearSign([]byte(release))
+	if err != nil {
+		t.Fatalf("ClearSign: %v", err)
+	}
+	if !bytes.HasPrefix(signed, []byte("-----BEGIN PGP SIGNED MESSAGE-----")) {
+		t.Fatalf("InRelease does not open with the clearsign header:\n%s", signed)
+	}
+	block, _ := clearsign.Decode(signed)
+	if block == nil {
+		t.Fatal("clearsign.Decode returned no block")
+	}
+	if string(block.Plaintext) != release {
+		t.Errorf("clearsigned body != Release\n got: %q\nwant: %q", block.Plaintext, release)
+	}
+	pub, err := kr.PublicKey()
+	if err != nil {
+		t.Fatalf("PublicKey: %v", err)
+	}
+	if _, err := openpgp.CheckDetachedSignature(readArmoredPublic(t, pub), bytes.NewReader(block.Bytes), block.ArmoredSignature.Body, nil); err != nil {
+		t.Errorf("clearsigned signature does not verify: %v", err)
+	}
+}
+
+func TestDetachSignVerifies(t *testing.T) {
+	kr := testKey(t)
+	sig, err := kr.DetachSign([]byte(release))
+	if err != nil {
+		t.Fatalf("DetachSign: %v", err)
+	}
+	if !bytes.HasPrefix(sig, []byte("-----BEGIN PGP SIGNATURE-----")) {
+		t.Fatalf("Release.gpg is not an armored signature:\n%s", sig)
+	}
+	pub, err := kr.PublicKey()
+	if err != nil {
+		t.Fatalf("PublicKey: %v", err)
+	}
+	if _, err := openpgp.CheckArmoredDetachedSignature(readArmoredPublic(t, pub), strings.NewReader(release), bytes.NewReader(sig), nil); err != nil {
+		t.Errorf("detached signature does not verify: %v", err)
+	}
+}
+
+// TestSignaturesUseSHA512 is the reason DefaultHash is set explicitly: apt's
+// gpgv rejects SHA-1 on current releases, and the library default is not a
+// property this repository's clients can depend on.
+func TestSignaturesUseSHA512(t *testing.T) {
+	kr := testKey(t)
+	sig, err := kr.DetachSign([]byte(release))
+	if err != nil {
+		t.Fatalf("DetachSign: %v", err)
+	}
+	block, err := armor.Decode(bytes.NewReader(sig))
+	if err != nil {
+		t.Fatalf("armor.Decode: %v", err)
+	}
+	p, err := packet.Read(block.Body)
+	if err != nil {
+		t.Fatalf("packet.Read: %v", err)
+	}
+	s, ok := p.(*packet.Signature)
+	if !ok {
+		t.Fatalf("first packet is %T, want *packet.Signature", p)
+	}
+	if s.Hash != crypto.SHA512 {
+		t.Errorf("signature hash = %v, want SHA512", s.Hash)
+	}
+}
+
+// TestArmorCarriesTheCRC24Checksum is #214. gpgv 2.4.4, current on Ubuntu
+// 24.04, reads the -----END dashes as base64 payload when the footer is
+// missing and exits 2 after reporting a good signature for every key. Both
+// counts are checked because the clearsign path armors one block whatever the
+// key count, so a single-key pass proves nothing about a rotation window.
+func TestArmorCarriesTheCRC24Checksum(t *testing.T) {
+	one := testKey(t)
+	two := &KeyRing{entities: append(append(openpgp.EntityList{}, one.entities...), testKey(t).entities...)}
+
+	for _, kr := range []struct {
+		name string
+		ring *KeyRing
+	}{{"one key", one}, {"two keys", two}} {
+		signed, err := kr.ring.ClearSign([]byte(release))
+		if err != nil {
+			t.Fatalf("%s: ClearSign: %v", kr.name, err)
+		}
+		assertArmorChecksum(t, kr.name+" InRelease", signed)
+
+		sig, err := kr.ring.DetachSign([]byte(release))
+		if err != nil {
+			t.Fatalf("%s: DetachSign: %v", kr.name, err)
+		}
+		assertArmorChecksum(t, kr.name+" Release.gpg", sig)
+	}
+}
+
+// assertArmorChecksum requires a "=<4 base64 chars>" line immediately before
+// the armor trailer, which is where RFC 4880 puts the CRC24 and where gpgv
+// looks for it.
+func assertArmorChecksum(t *testing.T, what string, armored []byte) {
+	t.Helper()
+	lines := strings.Split(strings.TrimRight(string(armored), "\n"), "\n")
+	end := len(lines) - 1
+	if lines[end] != "-----END PGP SIGNATURE-----" {
+		t.Fatalf("%s does not end on the armor trailer, got %q:\n%s", what, lines[end], armored)
+	}
+	crc := lines[end-1]
+	if !strings.HasPrefix(crc, "=") || len(crc) != 5 {
+		t.Errorf("%s carries no CRC24 checksum line before the trailer, got %q; gpgv 2.4.4 exits 2 on this:\n%s", what, crc, armored)
+	}
+}
+
+// TestClearSignSurvivesAnArmorHeaderInTheBody guards the anchor
+// reArmorSignature splits on. clearsign dash-escapes a body line opening with
+// "-", so a Release carrying the literal armor header is still one document
+// with one signature block. Splitting on the bare marker lands inside the
+// escaped line and fails on the message text ("illegal base64 data at input
+// byte 0"), which takes the whole suite unsigned.
+func TestClearSignSurvivesAnArmorHeaderInTheBody(t *testing.T) {
+	kr := testKey(t)
+	body := "Origin: bodega\n-----BEGIN PGP SIGNATURE-----\nSuite: noble\n"
+	signed, err := kr.ClearSign([]byte(body))
+	if err != nil {
+		t.Fatalf("ClearSign: %v", err)
+	}
+	block, _ := clearsign.Decode(signed)
+	if block == nil {
+		t.Fatal("clearsign.Decode returned no block")
+	}
+	if string(block.Plaintext) != body {
+		t.Errorf("clearsigned body != Release\n got: %q\nwant: %q", block.Plaintext, body)
+	}
+	assertArmorChecksum(t, "InRelease with an armor header in the body", signed)
+	pub, err := kr.PublicKey()
+	if err != nil {
+		t.Fatalf("PublicKey: %v", err)
+	}
+	if _, err := openpgp.CheckDetachedSignature(readArmoredPublic(t, pub), bytes.NewReader(block.Bytes), block.ArmoredSignature.Body, nil); err != nil {
+		t.Errorf("signature does not verify: %v", err)
+	}
+}
+
+// TestDualSignVerifiesUnderEitherKey is the rotation window: apt accepts an
+// InRelease when any one signature verifies, so a client holding only the old
+// key and a client holding only the new one both pass.
+func TestDualSignVerifiesUnderEitherKey(t *testing.T) {
+	old := testKey(t)
+	incoming := testKey(t)
+	both := &KeyRing{entities: append(append(openpgp.EntityList{}, old.entities...), incoming.entities...)}
+
+	signed, err := both.ClearSign([]byte(release))
+	if err != nil {
+		t.Fatalf("ClearSign: %v", err)
+	}
+	block, _ := clearsign.Decode(signed)
+	if block == nil {
+		t.Fatal("clearsign.Decode returned no block")
+	}
+	var sigs bytes.Buffer
+	if _, err := sigs.ReadFrom(block.ArmoredSignature.Body); err != nil {
+		t.Fatalf("read signature packets: %v", err)
+	}
+
+	for name, kr := range map[string]*KeyRing{"outgoing": old, "incoming": incoming} {
+		pub, err := kr.PublicKey()
+		if err != nil {
+			t.Fatalf("%s PublicKey: %v", name, err)
+		}
+		if _, err := openpgp.CheckDetachedSignature(readArmoredPublic(t, pub), bytes.NewReader(block.Bytes), bytes.NewReader(sigs.Bytes()), nil); err != nil {
+			t.Errorf("%s key alone does not verify the dual-signed InRelease: %v", name, err)
+		}
+	}
+
+	if len(both.Fingerprints()) != 2 {
+		t.Errorf("Fingerprints = %v, want two", both.Fingerprints())
+	}
+}
+
+func TestRetireRefusesTheLastKey(t *testing.T) {
+	kr := testKey(t)
+	if _, err := kr.Retire(kr.Fingerprints()[0]); err == nil {
+		t.Fatal("Retire removed the only key; the repository would go unsigned with no warning")
+	}
+	incoming := testKey(t)
+	fp := kr.Fingerprints()[0]
+	kr.Add(incoming)
+	retired, err := kr.Retire(fp)
+	if err != nil {
+		t.Fatalf("Retire: %v", err)
+	}
+	if retired != fp {
+		t.Errorf("Retire reported %q, want the fingerprint it removed (%s)", retired, fp)
+	}
+	if got := kr.Fingerprints(); len(got) != 1 || got[0] != incoming.Fingerprints()[0] {
+		t.Errorf("after Retire: %v, want only the incoming key", got)
+	}
+}
+
+// TestRetireDemandsAnUnambiguousIdentifier is the whole point of the length
+// floor: `retire 2` used to match by suffix and close a rotation window, and
+// the only refusal was the one covering the last key.
+func TestRetireDemandsAnUnambiguousIdentifier(t *testing.T) {
+	kr := testKey(t)
+	kr.Add(testKey(t))
+	fp := kr.Fingerprints()[0]
+
+	for _, short := range []string{"", " ", fp[39:], fp[:MinRetirePrefix-1]} {
+		if _, err := kr.Retire(short); err == nil {
+			t.Fatalf("Retire(%q) succeeded; an identifier shorter than %d characters must be refused", short, MinRetirePrefix)
+		}
+	}
+	if got := kr.Fingerprints(); len(got) != 2 {
+		t.Fatalf("a refused Retire changed the key ring: %v", got)
+	}
+
+	retired, err := kr.Retire(fp[:MinRetirePrefix])
+	if err != nil {
+		t.Fatalf("Retire with a %d-character prefix: %v", MinRetirePrefix, err)
+	}
+	if retired != fp {
+		t.Errorf("Retire reported %q, want %s", retired, fp)
+	}
+}
+
+// TestRetireRefusesAnAmbiguousPrefix pins the refusal rather than the
+// resolution: picking one of two matches would retire a key the operator did
+// not name, which is a rotation window closed on the wrong side.
+func TestRetireRefusesAnAmbiguousPrefix(t *testing.T) {
+	kr := testKey(t)
+	kr.Add(testKey(t))
+	// Two generated keys never share 16 hex characters, so the ambiguity is
+	// built rather than found: a file holding one key twice has to be refused
+	// rather than resolved to whichever copy is reached first.
+	kr.entities = append(kr.entities, kr.entities[0])
+	fp := kr.Fingerprints()[0]
+	if _, err := kr.Retire(fp); err == nil {
+		t.Fatal("Retire resolved a fingerprint matching two entities instead of refusing")
+	}
+	if len(kr.Fingerprints()) != 3 {
+		t.Errorf("a refused Retire changed the key ring: %v", kr.Fingerprints())
+	}
+}
+
+// TestRetireDuringAThreeKeyOverlap drives the case the length floor exists
+// for. Suffix matching dropped every entity it matched, so one mistyped
+// character during an overlapping rotation closed the window on all three keys
+// at once and the success line echoed the argument, not what left.
+func TestRetireDuringAThreeKeyOverlap(t *testing.T) {
+	kr := testKey(t)
+	kr.Add(testKey(t))
+	kr.Add(testKey(t))
+	before := kr.Fingerprints()
+	if len(before) != 3 {
+		t.Fatalf("setup: %v, want three keys", before)
+	}
+	oldest := before[0]
+
+	for _, short := range []string{"2", oldest[len(oldest)-1:], oldest[:MinRetirePrefix-1]} {
+		if _, err := kr.Retire(short); err == nil {
+			t.Fatalf("Retire(%q) succeeded against a three-key file", short)
+		}
+	}
+	if got := kr.Fingerprints(); strings.Join(got, ",") != strings.Join(before, ",") {
+		t.Fatalf("a refused Retire changed the key ring: %v, want %v", got, before)
+	}
+
+	retired, err := kr.Retire(oldest)
+	if err != nil {
+		t.Fatalf("Retire(%s): %v", oldest, err)
+	}
+	if retired != oldest {
+		t.Errorf("Retire reported %q; the caller echoes this, so it has to name the key that left (%s)", retired, oldest)
+	}
+	if got := kr.Fingerprints(); strings.Join(got, ",") != strings.Join(before[1:], ",") {
+		t.Errorf("after Retire: %v, want the two remaining keys %v", got, before[1:])
+	}
+}
+
+// TestAddKeepsTheIncomingKeyLast fixes signature order. gpgv 2.5 stops at the
+// first signature whose key it does not hold, so the outgoing key has to sign
+// first: the rotation window exists for clients that have not updated.
+func TestAddKeepsTheIncomingKeyLast(t *testing.T) {
+	outgoing := testKey(t)
+	outgoingFP := outgoing.Fingerprints()[0]
+	incoming := testKey(t)
+	outgoing.Add(incoming)
+	got := outgoing.Fingerprints()
+	if len(got) != 2 || got[0] != outgoingFP || got[1] != incoming.Fingerprints()[0] {
+		t.Errorf("after Add: %v, want the outgoing key first and the incoming key last", got)
+	}
+}
+
+// TestWriteLoadRoundTripsBothKeys covers the file format a rotation depends
+// on: two armored blocks in one file, both read back.
+func TestWriteLoadRoundTripsBothKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, KeyFileName)
+	kr := testKey(t)
+	kr.Add(testKey(t))
+	if err := kr.WritePrivate(path); err != nil {
+		t.Fatalf("WritePrivate: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("key file mode = %#o, want 0600", info.Mode().Perm())
+	}
+
+	loaded, err := LoadPath(path)
+	if err != nil {
+		t.Fatalf("LoadPath: %v", err)
+	}
+	if got, want := loaded.Fingerprints(), kr.Fingerprints(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("round-trip fingerprints = %v, want %v", got, want)
+	}
+}
+
+func TestLoadRefusesWorldReadableKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, KeyFileName)
+	if err := testKey(t).WritePrivate(path); err != nil {
+		t.Fatalf("WritePrivate: %v", err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	_, err := LoadPath(path)
+	if err == nil {
+		t.Fatal("LoadPath accepted a 0644 signing key")
+	}
+	if !strings.Contains(err.Error(), "chmod 600") {
+		t.Errorf("error does not name the fix: %v", err)
+	}
+}
+
+func TestLoadReportsNoKey(t *testing.T) {
+	dir := t.TempDir()
+	_, err := Load([]string{filepath.Join(dir, "absent")})
+	if err == nil || !strings.Contains(err.Error(), "no apt signing key found") {
+		t.Fatalf("Load with no key = %v, want ErrNoKey", err)
+	}
+}
+
+func TestDefaultKeyPathsPrefersCredentials(t *testing.T) {
+	t.Setenv(CredentialsEnv, "/run/credentials/bodega.service")
+	got := DefaultKeyPaths("/var/lib/bodega")
+	want := []string{
+		"/run/credentials/bodega.service/" + KeyFileName,
+		SystemKeyPath,
+		"/var/lib/bodega/" + KeyFileName,
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("DefaultKeyPaths = %v, want %v", got, want)
+	}
+}
+
+func TestKeyringIsDearmored(t *testing.T) {
+	kr := testKey(t)
+	raw, err := kr.Keyring()
+	if err != nil {
+		t.Fatalf("Keyring: %v", err)
+	}
+	if bytes.Contains(raw, []byte("-----BEGIN")) {
+		t.Fatal("Keyring is armored; signed-by= would need a gpg --dearmor on the client")
+	}
+	el, err := openpgp.ReadKeyRing(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("ReadKeyRing: %v", err)
+	}
+	if len(el) != 1 || el[0].PrivateKey != nil {
+		t.Errorf("keyring holds %d entities (private=%v), want one public key", len(el), el[0].PrivateKey != nil)
+	}
+}
+
+func readArmoredPublic(t *testing.T, pub []byte) openpgp.EntityList {
+	t.Helper()
+	el, err := openpgp.ReadArmoredKeyRing(bytes.NewReader(pub))
+	if err != nil {
+		t.Fatalf("ReadArmoredKeyRing: %v", err)
+	}
+	return el
+}
+
+// systemd writes a LoadCredential= file 0440 root:root with an ACL for the
+// service user, on a read-only tmpfs. Refusing that mode made the delivery
+// docs/bodega.service ships unusable, and it failed soft: the server came up
+// serving an unsigned repository.
+func TestLoadAcceptsAGroupReadableSystemdCredential(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, KeyFileName)
+	kr := testKey(t)
+	if err := kr.WritePrivate(path); err != nil {
+		t.Fatalf("WritePrivate: %v", err)
+	}
+	if err := os.Chmod(path, 0o440); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	if _, err := LoadPath(path); err == nil {
+		t.Fatal("LoadPath accepted a 0440 key with CREDENTIALS_DIRECTORY unset; the exemption is not scoped")
+	}
+
+	t.Setenv(CredentialsEnv, dir)
+	loaded, err := LoadPath(path)
+	if err != nil {
+		t.Fatalf("LoadPath refused a systemd credential: %v", err)
+	}
+	if got, want := loaded.Fingerprints(), kr.Fingerprints(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("fingerprints = %v, want %v", got, want)
+	}
+}
+
+// The exemption is the group bit inside the credential directory, and nothing
+// wider. A world-readable key there is refused like any other: systemd never
+// writes 0004, so one carrying it was put there by something that is not
+// systemd, and the exemption is for the delivery rather than for the location.
+func TestLoadRefusesAWorldReadableKeyEvenInTheCredentialDir(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(CredentialsEnv, dir)
+	path := filepath.Join(dir, KeyFileName)
+	if err := testKey(t).WritePrivate(path); err != nil {
+		t.Fatalf("WritePrivate: %v", err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	if _, err := LoadPath(path); err == nil {
+		t.Fatal("LoadPath accepted a 0644 key inside CREDENTIALS_DIRECTORY")
+	}
+}
+
+// The exemption is the credential directory, not "any loose mode once systemd
+// is in the picture". A key outside it stays subject to the mode check even
+// while a credential directory exists.
+func TestLoadRefusesALooseKeyOutsideTheCredentialDir(t *testing.T) {
+	creds := t.TempDir()
+	t.Setenv(CredentialsEnv, creds)
+
+	elsewhere := filepath.Join(t.TempDir(), KeyFileName)
+	if err := testKey(t).WritePrivate(elsewhere); err != nil {
+		t.Fatalf("WritePrivate: %v", err)
+	}
+	if err := os.Chmod(elsewhere, 0o440); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	if _, err := LoadPath(elsewhere); err == nil {
+		t.Fatal("LoadPath accepted a 0440 key outside CREDENTIALS_DIRECTORY")
+	}
+}
+
+func TestInCredentialsDirBoundaries(t *testing.T) {
+	cases := []struct {
+		name string
+		dir  string
+		path string
+		want bool
+	}{
+		{"inside", "/run/credentials/bodega.service", "/run/credentials/bodega.service/apt-signing.key", true},
+		{"nested", "/run/credentials/bodega.service", "/run/credentials/bodega.service/sub/apt-signing.key", true},
+		{"the directory itself", "/run/credentials/bodega.service", "/run/credentials/bodega.service", false},
+		{"name-prefix sibling", "/run/credentials/a.service", "/run/credentials/a.service-backup/apt-signing.key", false},
+		{"walks out and back", "/run/credentials/a.service", "/run/credentials/a.service/../b.service/apt-signing.key", false},
+		{"unset", "", "/run/credentials/bodega.service/apt-signing.key", false},
+		{"relative", "run/credentials", "run/credentials/apt-signing.key", false},
+		{"root", "/", "/etc/bodega/apt-signing.key", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(CredentialsEnv, tc.dir)
+			if got := inCredentialsDir(tc.path); got != tc.want {
+				t.Errorf("inCredentialsDir(%q) with %s=%q = %v, want %v", tc.path, CredentialsEnv, tc.dir, got, tc.want)
+			}
+		})
+	}
+}

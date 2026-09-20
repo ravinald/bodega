@@ -1,0 +1,561 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/storage"
+)
+
+const exampleToolKey = "binaries/example-tool/2.1.0/example-tool.zip"
+
+// undeletable is a Memory store whose Delete always fails, standing in for a
+// backend that lost write permission or went read-only mid-migration.
+type undeletable struct {
+	storage.ObjectStore
+}
+
+func (undeletable) Delete(context.Context, string) error {
+	return errors.New("access denied")
+}
+
+// blackhole accepts every write and holds nothing, which is what a
+// silently-failing destination looks like from the caller's side.
+type blackhole struct {
+	storage.ObjectStore
+}
+
+func (blackhole) PutFile(context.Context, string, string) error { return nil }
+
+// testResolver is a Resolver over exactly two named backends.
+type testResolver struct {
+	def  storage.ObjectStore
+	bulk storage.ObjectStore
+}
+
+func (r *testResolver) Default() storage.ObjectStore { return r.def }
+
+func (r *testResolver) ByName(name string) (storage.ObjectStore, error) {
+	switch name {
+	case "", storage.DefaultName:
+		return r.def, nil
+	case "bulk":
+		return r.bulk, nil
+	}
+	return nil, fmt.Errorf("unknown storage backend %q", name)
+}
+
+func (r *testResolver) Placement(string, string, []string) storage.Decision {
+	return storage.Decision{Name: storage.DefaultName}
+}
+
+func (r *testResolver) ForType(string) storage.ObjectStore { return r.def }
+
+func (r *testResolver) Fanout(context.Context, string, []string) []storage.NamedStore {
+	return r.All()
+}
+
+func (r *testResolver) All() []storage.NamedStore {
+	return []storage.NamedStore{
+		{Name: storage.DefaultName, Store: r.def},
+		{Name: "bulk", Store: r.bulk},
+	}
+}
+
+// moveFixture seeds one binary entry on the default backend and returns a
+// mover pointed at "bulk".
+func moveFixture(t *testing.T, src, dst storage.ObjectStore, del bool) (*mover, *manifest.Store, *manifest.PackageManifest, *bytes.Buffer) {
+	t.Helper()
+	store := manifest.NewLocalStore(t.TempDir())
+	if err := store.AddVersion(t.Context(), manifest.TypeBinary, "example-tool", manifest.VersionEntry{
+		Version: "2.1.0",
+		URL:     "https://example.com/example-tool.zip",
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+	pm, err := store.GetPackage(t.Context(), manifest.TypeBinary, "example-tool")
+	if err != nil || pm == nil {
+		t.Fatalf("GetPackage: %v", err)
+	}
+	out := &bytes.Buffer{}
+	return &mover{
+		stores:  &testResolver{def: src, bulk: dst},
+		dst:     dst,
+		dstName: "bulk",
+		store:   store,
+		spool:   t.TempDir(),
+		out:     out,
+		del:     del,
+	}, store, pm, out
+}
+
+func recordedBackend(t *testing.T, store *manifest.Store) string {
+	t.Helper()
+	pm, err := store.GetPackage(t.Context(), manifest.TypeBinary, "example-tool")
+	if err != nil || pm == nil {
+		t.Fatalf("GetPackage: %v", err)
+	}
+	return effectiveStorage(pm.Versions[0].Storage)
+}
+
+// TestMoveSurvivesAFailingDelete is the ordering guarantee, and the reason
+// --delete-source runs last and never fails the command.
+//
+// Local.Get and the S3 client both answer a missing object with (nil, nil), so
+// a caller cannot tell "lost during the move" from "never uploaded". The
+// manifest is therefore written before anything touches the source, and a
+// delete that fails afterwards costs disk space rather than the artifact.
+func TestMoveSurvivesAFailingDelete(t *testing.T) {
+	src := storage.NewMemory()
+	src.Seed(exampleToolKey, "payload")
+	dst := storage.NewMemory()
+
+	m, store, pm, out := moveFixture(t, undeletable{src}, dst, true)
+	if err := m.moveVersion(t.Context(), pm, 0); err != nil {
+		t.Fatalf("moveVersion returned an error for a delete failure: %v", err)
+	}
+
+	if got := recordedBackend(t, store); got != "bulk" {
+		t.Fatalf("manifest records %q, want bulk — a failed delete rolled the move back", got)
+	}
+	if info, _ := dst.Head(t.Context(), exampleToolKey); info == nil || !info.Exists {
+		t.Fatal("destination has no copy")
+	}
+	if info, _ := src.Head(t.Context(), exampleToolKey); info == nil || !info.Exists {
+		t.Fatal("source copy vanished despite Delete failing")
+	}
+	if !strings.Contains(out.String(), "could not delete") {
+		t.Errorf("delete failure was not reported to the operator:\n%s", out)
+	}
+}
+
+// TestMoveLeavesTheSourceWithoutTheFlag pins the default. Deletion is opt-in.
+func TestMoveLeavesTheSourceWithoutTheFlag(t *testing.T) {
+	src := storage.NewMemory()
+	src.Seed(exampleToolKey, "payload")
+	dst := storage.NewMemory()
+
+	m, store, pm, _ := moveFixture(t, src, dst, false)
+	if err := m.moveVersion(t.Context(), pm, 0); err != nil {
+		t.Fatalf("moveVersion: %v", err)
+	}
+	if got := recordedBackend(t, store); got != "bulk" {
+		t.Fatalf("manifest records %q, want bulk", got)
+	}
+	if info, _ := src.Head(t.Context(), exampleToolKey); info == nil || !info.Exists {
+		t.Fatal("source deleted without --delete-source")
+	}
+}
+
+// TestMoveRefusesToRecordAnUnverifiedCopy is the other half of the ordering
+// guarantee: a destination that reports a successful write but holds nothing
+// must not be recorded, or every read of that version 404s afterwards.
+func TestMoveRefusesToRecordAnUnverifiedCopy(t *testing.T) {
+	src := storage.NewMemory()
+	src.Seed(exampleToolKey, "payload")
+
+	m, store, pm, _ := moveFixture(t, src, blackhole{storage.NewMemory()}, true)
+	err := m.moveVersion(t.Context(), pm, 0)
+	if err == nil {
+		t.Fatal("move succeeded against a destination holding nothing")
+	}
+	if !strings.Contains(err.Error(), "not there after the write reported success") {
+		t.Fatalf("error %q does not say the verification failed", err)
+	}
+	if got := recordedBackend(t, store); got != storage.DefaultName {
+		t.Fatalf("manifest records %q after a failed verify, want %q", got, storage.DefaultName)
+	}
+	if info, _ := src.Head(t.Context(), exampleToolKey); info == nil || !info.Exists {
+		t.Fatal("source was deleted despite the move failing")
+	}
+}
+
+// TestMoveVerifiesTheRecordedChecksum: a copy that lands with different bytes
+// is caught at the destination, not assumed correct because the write returned
+// nil.
+func TestMoveVerifiesTheRecordedChecksum(t *testing.T) {
+	src := storage.NewMemory()
+	src.Seed(exampleToolKey, "payload")
+	store := manifest.NewLocalStore(t.TempDir())
+	if err := store.AddVersion(t.Context(), manifest.TypeBinary, "example-tool", manifest.VersionEntry{
+		Version:  "2.1.0",
+		URL:      "https://example.com/example-tool.zip",
+		Checksum: &manifest.Checksum{Algorithm: "sha256", Value: strings.Repeat("0", 64)},
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+	pm, _ := store.GetPackage(t.Context(), manifest.TypeBinary, "example-tool")
+
+	dst := storage.NewMemory()
+	m := &mover{
+		stores: &testResolver{def: src, bulk: dst}, dst: dst, dstName: "bulk",
+		store: store, spool: t.TempDir(), out: &bytes.Buffer{},
+	}
+	err := m.moveVersion(t.Context(), pm, 0)
+	if err == nil || !strings.Contains(err.Error(), "sha256 is") {
+		t.Fatalf("move accepted a copy whose digest does not match the manifest: %v", err)
+	}
+	if got := recordedBackend(t, store); got != storage.DefaultName {
+		t.Fatalf("manifest records %q after a checksum failure, want %q", got, storage.DefaultName)
+	}
+}
+
+func TestSelectForMoveGuards(t *testing.T) {
+	base := func(ves ...manifest.VersionEntry) *manifest.PackageManifest {
+		return &manifest.PackageManifest{Type: manifest.TypeBinary, Name: "example-tool", Versions: ves}
+	}
+	for _, tc := range []struct {
+		name    string
+		pm      *manifest.PackageManifest
+		version string
+		want    string
+	}{
+		{
+			name: "frozen refuses outright, mirroring delete",
+			pm:   base(manifest.VersionEntry{Version: "2.1.0", Frozen: true}),
+			want: "frozen",
+		},
+		{
+			name: "a version already on the destination is not a move",
+			pm:   base(manifest.VersionEntry{Version: "2.1.0", Storage: "bulk"}),
+			want: "already recorded",
+		},
+		{
+			// pypi is the last whole-directory type. apt and git left this
+			// list when their uploaders learned to walk manifest entries.
+			name: "pypi has no per-version object to move",
+			pm:   &manifest.PackageManifest{Type: manifest.TypePypi, Name: "requests"},
+			want: "no per-version object key",
+		},
+		{
+			name:    "an unknown version names the ones that exist",
+			pm:      base(manifest.VersionEntry{Version: "2.1.0"}),
+			version: "9.9.9",
+			want:    "not found",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &testResolver{def: storage.NewMemory(), bulk: storage.NewMemory()}
+			dst, err := r.ByName("bulk")
+			if err != nil {
+				t.Fatalf("ByName: %v", err)
+			}
+			_, err = selectForMove(r, dst, tc.pm, tc.version, "bulk")
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("selectForMove = %v, want an error containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestSelectForMoveSkipsWhatIsAlreadyThere: an interrupted move must be
+// re-runnable, so a version already on the destination is skipped rather than
+// failing the versions that still need to travel.
+func TestSelectForMoveSkipsWhatIsAlreadyThere(t *testing.T) {
+	pm := &manifest.PackageManifest{
+		Type: manifest.TypeBinary, Name: "example-tool",
+		Versions: []manifest.VersionEntry{
+			{Version: "2.0.0", Storage: "bulk"},
+			{Version: "2.1.0"},
+		},
+	}
+	r := &testResolver{def: storage.NewMemory(), bulk: storage.NewMemory()}
+	dst, err := r.ByName("bulk")
+	if err != nil {
+		t.Fatalf("ByName: %v", err)
+	}
+	got, err := selectForMove(r, dst, pm, "", "bulk")
+	if err != nil {
+		t.Fatalf("selectForMove: %v", err)
+	}
+	if len(got) != 1 || got[0] != 1 {
+		t.Fatalf("selected %v, want only index 1", got)
+	}
+}
+
+func TestSplitVersionArg(t *testing.T) {
+	for _, tc := range []struct{ in, name, version string }{
+		{"example-tool", "example-tool", ""},
+		{"example-tool@2.1.0", "example-tool", "2.1.0"},
+		{"@example-corp/widget-cli", "@example-corp/widget-cli", ""},
+		{"@example-corp/widget-cli@1.5.0", "@example-corp/widget-cli", "1.5.0"},
+	} {
+		name, version := splitVersionArg(tc.in)
+		if name != tc.name || version != tc.version {
+			t.Errorf("splitVersionArg(%q) = (%q, %q), want (%q, %q)", tc.in, name, version, tc.name, tc.version)
+		}
+	}
+}
+
+// TestSelectForMoveRefusesASymlinkedSecondRoot is the case
+// TestSelectForMoveRefusesOneLocationUnderTwoNames could not reach. That one
+// hands the same store to both names, so it passes whatever Label does; this
+// one builds two real local backends over one directory, reached by two
+// spellings, which is what config gives you when a migration is staged through
+// a symlink of the old root. Before storage.canonicalRoot the two labels
+// differed, the refusal did not fire, and --delete-source removed the only
+// copy (#136, #90).
+//
+// The second half is not optional: a refusal that also refuses a genuinely
+// distinct pair has traded one defect for another.
+func TestSelectForMoveRefusesASymlinkedSecondRoot(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "store")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	link := filepath.Join(parent, "staged")
+	if err := os.Symlink(root, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	pm := &manifest.PackageManifest{
+		Type: manifest.TypeBinary, Name: "example-tool",
+		Versions: []manifest.VersionEntry{{Version: "2.1.0"}},
+	}
+
+	r := &testResolver{def: storage.NewLocal(root), bulk: storage.NewLocal(link)}
+	dst, err := r.ByName("bulk")
+	if err != nil {
+		t.Fatalf("ByName: %v", err)
+	}
+	if err := dst.Put(t.Context(), exampleToolKey, []byte("the only copy")); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	_, err = selectForMove(r, dst, pm, "", "bulk")
+	if err == nil {
+		t.Fatal("selectForMove accepted a move onto a symlink of the source root")
+	}
+	if !strings.Contains(err.Error(), "same location") {
+		t.Fatalf("error %q does not name the collision", err)
+	}
+
+	elsewhere := filepath.Join(parent, "other")
+	if err := os.MkdirAll(elsewhere, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	distinct := &testResolver{def: storage.NewLocal(root), bulk: storage.NewLocal(elsewhere)}
+	other, err := distinct.ByName("bulk")
+	if err != nil {
+		t.Fatalf("ByName: %v", err)
+	}
+	got, err := selectForMove(distinct, other, pm, "", "bulk")
+	if err != nil {
+		t.Fatalf("selectForMove refused a move between two distinct directories: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("selectForMove selected %d versions, want 1", len(got))
+	}
+}
+
+// TestSelectForMoveRefusesOneLocationUnderTwoNames is the artifact-destroying
+// case, and the reason the check sits in selectForMove rather than in
+// moveVersion.
+//
+// Two names for one bucket is documented as a normal way to stage a migration,
+// and config.Load rejects a colliding name but not a colliding path. Copying
+// then reads and writes one object: the verify re-reads what it overwrote and
+// passes, the manifest is repointed at a backend it was already on, and
+// --delete-source removes the only copy. Exit 0, three lines of success, no
+// artifact.
+func TestSelectForMoveRefusesOneLocationUnderTwoNames(t *testing.T) {
+	one := storage.NewMemory()
+	one.Seed(exampleToolKey, "the only copy")
+	r := &testResolver{def: one, bulk: one}
+	dst, err := r.ByName("bulk")
+	if err != nil {
+		t.Fatalf("ByName: %v", err)
+	}
+	pm := &manifest.PackageManifest{
+		Type: manifest.TypeBinary, Name: "example-tool",
+		Versions: []manifest.VersionEntry{{Version: "2.1.0"}},
+	}
+
+	_, err = selectForMove(r, dst, pm, "", "bulk")
+	if err == nil {
+		t.Fatal("selectForMove accepted a move whose source and destination are one location")
+	}
+	if !strings.Contains(err.Error(), "same location") {
+		t.Fatalf("error %q does not name the collision", err)
+	}
+	// The refusal is the whole command, not only --delete-source: a move that
+	// copied every object onto itself and reported success would teach the
+	// operator that the placement changed.
+	if !strings.Contains(err.Error(), "--delete-source") {
+		t.Errorf("error %q does not say what --delete-source would have cost", err)
+	}
+}
+
+// TestSelectForMoveReportsAnUnresolvableSource pins that a recorded backend no
+// config defines fails at selection, beside the other preconditions, rather
+// than after the first version has already travelled.
+func TestSelectForMoveReportsAnUnresolvableSource(t *testing.T) {
+	r := &testResolver{def: storage.NewMemory(), bulk: storage.NewMemory()}
+	dst, err := r.ByName("bulk")
+	if err != nil {
+		t.Fatalf("ByName: %v", err)
+	}
+	pm := &manifest.PackageManifest{
+		Type: manifest.TypeBinary, Name: "example-tool",
+		Versions: []manifest.VersionEntry{{Version: "2.1.0", Storage: "ghost"}},
+	}
+	if _, err := selectForMove(r, dst, pm, "", "bulk"); err == nil ||
+		!strings.Contains(err.Error(), "unknown storage backend") {
+		t.Fatalf("selectForMove = %v, want an unknown-backend error", err)
+	}
+}
+
+// TestMoveRefusesOneDirectoryUnderTwoNamesEndToEnd runs the whole command
+// against the configuration that destroyed an artifact: storage_path and
+// storage_backends.mirror.path are one directory, so the two names resolve to
+// one place and every copy lands on the object it was read from.
+//
+// The file is the assertion, not the exit status. The reported failure exited
+// 0 with three lines of success, so the exit code is the thing that lied; only
+// an artifact still on disk separates a refusal from a move that deleted the
+// only copy and reported that it had moved it.
+func TestMoveRefusesOneDirectoryUnderTwoNamesEndToEnd(t *testing.T) {
+	shared := t.TempDir()
+	manifestDir := t.TempDir()
+
+	store := manifest.NewLocalStore(manifestDir)
+	if err := store.AddVersion(t.Context(), manifest.TypeBinary, "example-tool", manifest.VersionEntry{
+		Version: "2.1.0",
+		URL:     "https://example.com/example-tool.zip",
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+
+	artifact := filepath.Join(shared, filepath.FromSlash(exampleToolKey))
+	if err := os.MkdirAll(filepath.Dir(artifact), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(artifact, []byte("the only copy"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	blob, err := json.Marshal(map[string]any{
+		"storage_backend": "local",
+		"storage_path":    shared,
+		"manifest_dir":    manifestDir,
+		"build_root":      t.TempDir(),
+		"log_dir":         t.TempDir(),
+		"storage_backends": map[string]config.StorageSpec{
+			"mirror": {Driver: "local", Path: shared},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(cfgFile, blob, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv(config.EnvConfigFile, cfgFile)
+
+	root := newRootCmd()
+	root.SetArgs([]string{"pkg", "move", "binary", "example-tool", "--to", "mirror", "--delete-source"})
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+
+	err = root.Execute()
+	if err == nil {
+		t.Fatal("move across two names for one directory succeeded; main() would exit 0")
+	}
+	for _, want := range []string{`"default"`, `"mirror"`, shared} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %s", err, want)
+		}
+	}
+	if _, statErr := os.Stat(artifact); statErr != nil {
+		t.Fatalf("artifact is gone after the refusal: %v", statErr)
+	}
+}
+
+// TestMoveSpoolsUnderTheConfiguredSpoolDir is the same claim as the repair-keys
+// case on the other command that calls copyObject: spool_dir names where every
+// bodega copy spools, not only the proxy's.
+func TestMoveSpoolsUnderTheConfiguredSpoolDir(t *testing.T) {
+	source := t.TempDir()
+	mirror := t.TempDir()
+	manifestDir := t.TempDir()
+
+	store := manifest.NewLocalStore(manifestDir)
+	if err := store.AddVersion(t.Context(), manifest.TypeBinary, "example-tool", manifest.VersionEntry{
+		Version: "2.1.0",
+		URL:     "https://example.com/example-tool.zip",
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+
+	artifact := filepath.Join(source, filepath.FromSlash(exampleToolKey))
+	if err := os.MkdirAll(filepath.Dir(artifact), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(artifact, []byte("the only copy"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	buildRoot := t.TempDir()
+	spoolDir := filepath.Join(t.TempDir(), "configured-spool")
+	writeSpoolConfig(t, map[string]any{
+		"storage_backend": "local",
+		"storage_path":    source,
+		"manifest_dir":    manifestDir,
+		"build_root":      buildRoot,
+		"log_dir":         t.TempDir(),
+		"spool_dir":       spoolDir,
+		"storage_backends": map[string]config.StorageSpec{
+			"mirror": {Driver: "local", Path: mirror},
+		},
+	})
+
+	root := newRootCmd()
+	root.SetArgs([]string{"pkg", "move", "binary", "example-tool", "--to", "mirror"})
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	if err := root.Execute(); err != nil {
+		t.Fatalf("pkg move: %v", err)
+	}
+
+	assertSpooledAt(t, spoolDir, buildRoot)
+}
+
+// writeSpoolConfig writes a config file and points $BODEGA_CONFIG_FILE at it,
+// so a cobra-level run resolves the same keys a real invocation would.
+func writeSpoolConfig(t *testing.T, keys map[string]any) {
+	t.Helper()
+	blob, err := json.Marshal(keys)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, blob, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv(config.EnvConfigFile, path)
+}
+
+// assertSpooledAt reads the directory that came into existence. Asserting the
+// configured path alone would pass on a command that spooled to both, and
+// asserting the default's absence alone would pass on one that spooled nowhere.
+func assertSpooledAt(t *testing.T, spoolDir, buildRoot string) {
+	t.Helper()
+	if _, err := os.Stat(spoolDir); err != nil {
+		t.Errorf("spool_dir %s was never created: %v", spoolDir, err)
+	}
+	fallback := filepath.Join(buildRoot, "tmp")
+	if _, err := os.Stat(fallback); err == nil {
+		t.Errorf("the copy spooled under %s, ignoring the configured spool_dir", fallback)
+	}
+}

@@ -1,0 +1,576 @@
+package builder
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/ravinald/bodega/internal/manifest"
+)
+
+// helper: create a regular file (and parent dirs) with dummy content.
+func touchFile(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte("test"), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// helper: create a directory.
+func mkDir(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", path, err)
+	}
+}
+
+func TestCheckBinaryStage_NotFetched(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	ve := manifest.VersionEntry{URL: "https://example.com/example-tool.zip"}
+	s := CheckBinaryStage(cfg, "example-tool", ve)
+	if s.Fetched || s.Built || s.Packaged {
+		t.Errorf("expected all false when file absent, got %+v", s)
+	}
+}
+
+func TestCheckBinaryStage_Fetched(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	ve := manifest.VersionEntry{URL: "https://example.com/example-tool.zip"}
+	d := buildDirs(root)
+	touchFile(t, filepath.Join(d.binaries, "example-tool", "example-tool.zip"))
+
+	s := CheckBinaryStage(cfg, "example-tool", ve)
+	if !s.Fetched || !s.Built || !s.Packaged {
+		t.Errorf("expected all true when file present, got %+v", s)
+	}
+}
+
+func TestCheckBinaryStage_Versioned(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	ve := manifest.VersionEntry{Version: "2.13.0", URL: "https://example.com/example-tool.zip"}
+	d := buildDirs(root)
+
+	// File NOT at versioned path → not fetched.
+	touchFile(t, filepath.Join(d.binaries, "example-tool", "example-tool.zip"))
+	s := CheckBinaryStage(cfg, "example-tool", ve)
+	if s.Fetched {
+		t.Error("expected Fetched=false when file at unversioned path but version is set")
+	}
+
+	// File at versioned path → fetched.
+	touchFile(t, filepath.Join(d.binaries, "example-tool", "2.13.0", "example-tool.zip"))
+	s = CheckBinaryStage(cfg, "example-tool", ve)
+	if !s.Fetched {
+		t.Error("expected Fetched=true when file at versioned path")
+	}
+}
+
+func TestBinaryDestPath_NoVersion(t *testing.T) {
+	root := t.TempDir()
+	d := buildDirs(root)
+	ve := manifest.VersionEntry{URL: "https://example.com/tool.tar.gz"}
+	got := binaryDestPath(d, "tool", ve)
+	want := filepath.Join(d.binaries, "tool", "tool.tar.gz")
+	if got != want {
+		t.Errorf("binaryDestPath (no version) = %q, want %q", got, want)
+	}
+}
+
+func TestBinaryDestPath_WithVersion(t *testing.T) {
+	root := t.TempDir()
+	d := buildDirs(root)
+	ve := manifest.VersionEntry{Version: "v1.2", URL: "https://example.com/tool.tar.gz"}
+	got := binaryDestPath(d, "tool", ve)
+	want := filepath.Join(d.binaries, "tool", "v1.2", "tool.tar.gz")
+	if got != want {
+		t.Errorf("binaryDestPath (versioned) = %q, want %q", got, want)
+	}
+}
+
+func TestBinaryDestPath_FilenameOverride(t *testing.T) {
+	root := t.TempDir()
+	d := buildDirs(root)
+	ve := manifest.VersionEntry{Filename: "custom-name.bin", URL: "https://example.com/original.bin"}
+	got := binaryDestPath(d, "tool", ve)
+	want := filepath.Join(d.binaries, "tool", "custom-name.bin")
+	if got != want {
+		t.Errorf("binaryDestPath (filename override) = %q, want %q", got, want)
+	}
+}
+
+func TestCheckGitStage_Empty(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	ve := manifest.VersionEntry{URL: "https://github.com/widget/widget", Ref: "v4.0.0", Source: "clone"}
+	s := CheckGitStage(cfg, "widget", ve)
+	if s.Fetched || s.Packaged {
+		t.Errorf("expected all false when nothing on disk, got %+v", s)
+	}
+}
+
+func TestCheckGitStage_Fetched(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	ve := manifest.VersionEntry{URL: "https://github.com/widget/widget", Ref: "v4.0.0", Source: "clone"}
+	d := buildDirs(root)
+
+	mkDir(t, gitBareDir(d, "widget", ve))
+	s := CheckGitStage(cfg, "widget", ve)
+	if !s.Fetched {
+		t.Error("expected Fetched=true when bare repo dir exists")
+	}
+	if s.Packaged {
+		t.Error("expected Packaged=false when bundle absent")
+	}
+}
+
+func TestCheckGitStage_Packaged(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	ve := manifest.VersionEntry{URL: "https://github.com/widget/widget", Ref: "v4.0.0", Source: "clone"}
+	d := buildDirs(root)
+
+	mkDir(t, gitBareDir(d, "widget", ve))
+	bundlePath := filepath.Join(d.bundles, "widget", "widget-"+ve.Ref+".bundle")
+	writeBundle(t, bundlePath, true)
+
+	s := CheckGitStage(cfg, "widget", ve)
+	if !s.Fetched {
+		t.Error("expected Fetched=true")
+	}
+	if !s.Packaged {
+		t.Error("expected Packaged=true when the bundle carries a HEAD")
+	}
+}
+
+// A bundle with no HEAD clones into an empty repository. The packaging stage
+// rewrites one only while the stage check calls it unpackaged, so this is the
+// path that repairs an artifact built before HEAD was packaged.
+func TestCheckGitStage_PackagedBundleWithoutHEAD(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	ve := manifest.VersionEntry{URL: "https://github.com/widget/widget", Ref: "v4.0.0", Source: "clone"}
+	d := buildDirs(root)
+
+	mkDir(t, gitBareDir(d, "widget", ve))
+	writeBundle(t, filepath.Join(d.bundles, "widget", "widget-"+ve.Ref+".bundle"), false)
+
+	s := CheckGitStage(cfg, "widget", ve)
+	if !s.Built {
+		t.Error("expected Built=true: the file is on disk")
+	}
+	if s.Packaged {
+		t.Error("expected Packaged=false when the bundle carries no HEAD")
+	}
+}
+
+// writeBundle writes a bundle header, with or without a HEAD ref. Only the
+// header is read by the stage check, so the pack is a stand-in.
+func writeBundle(t *testing.T, path string, withHEAD bool) {
+	t.Helper()
+	const id = "0f11ee6918f41a04c201eceeadf612a377bc7fbc"
+	body := "# v2 git bundle\n"
+	if withHEAD {
+		body += id + " HEAD\n"
+	}
+	body += id + " refs/tags/v4.0.0\n\nPACK"
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func TestGitBareDir(t *testing.T) {
+	root := t.TempDir()
+	d := buildDirs(root)
+	ve := manifest.VersionEntry{Ref: "v4.0.0", Source: "clone"}
+	got := gitBareDir(d, "widget", ve)
+	want := filepath.Join(d.repos, "widget", "widget-v4.0.0.git") // single-segment name: no "--" replacement needed
+	if got != want {
+		t.Errorf("gitBareDir = %q, want %q", got, want)
+	}
+}
+
+func TestAptSourceDir_NoVersion(t *testing.T) {
+	root := t.TempDir()
+	d := buildDirs(root)
+	ve := manifest.VersionEntry{URL: "https://example.com/example-corp/widget-utils"}
+	got := aptSourceDir(d, "efs-utils", ve)
+	want := filepath.Join(d.sources, "efs-utils")
+	if got != want {
+		t.Errorf("aptSourceDir (no version) = %q, want %q", got, want)
+	}
+}
+
+func TestAptSourceDir_WithVersion(t *testing.T) {
+	root := t.TempDir()
+	d := buildDirs(root)
+	ve := manifest.VersionEntry{Version: "2.0.1", URL: "https://example.com/example-corp/widget-utils"}
+	got := aptSourceDir(d, "efs-utils", ve)
+	want := filepath.Join(d.sources, "efs-utils-2.0.1")
+	if got != want {
+		t.Errorf("aptSourceDir (versioned) = %q, want %q", got, want)
+	}
+}
+
+func TestAptSourceDir_SourceNameOverride(t *testing.T) {
+	root := t.TempDir()
+	d := buildDirs(root)
+	ve := manifest.VersionEntry{SourceName: "amazon-efs-utils", Version: "2.0.1", URL: "https://example.com/example-corp/widget-utils"}
+	got := aptSourceDir(d, "efs-utils", ve)
+	want := filepath.Join(d.sources, "amazon-efs-utils-2.0.1")
+	if got != want {
+		t.Errorf("aptSourceDir (source_name + version) = %q, want %q", got, want)
+	}
+}
+
+func TestCheckAptStage_Empty(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	ve := manifest.VersionEntry{URL: "https://example.com/example-corp/widget-utils", BuildCmd: "make deb"}
+	s := CheckAptStage(cfg, "efs-utils", ve)
+	if s.Fetched || s.Built || s.Packaged {
+		t.Errorf("expected all false when nothing on disk, got %+v", s)
+	}
+}
+
+func TestCheckAptStage_SourceBuildFetched(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	ve := manifest.VersionEntry{URL: "https://example.com/example-corp/widget-utils", BuildCmd: "make deb"}
+	d := buildDirs(root)
+
+	mkDir(t, aptSourceDir(d, "efs-utils", ve))
+	s := CheckAptStage(cfg, "efs-utils", ve)
+	if !s.Fetched {
+		t.Error("expected Fetched=true when clone dir exists")
+	}
+	if s.Built {
+		t.Error("expected Built=false when no .deb in clone dir")
+	}
+}
+
+func TestCheckAptStage_SourceBuildBuilt(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	ve := manifest.VersionEntry{URL: "https://example.com/example-corp/widget-utils", BuildCmd: "make deb"}
+	d := buildDirs(root)
+
+	cloneDir := aptSourceDir(d, "efs-utils", ve)
+	mkDir(t, cloneDir)
+	touchFile(t, filepath.Join(cloneDir, "efs-utils_2.0.deb"))
+
+	s := CheckAptStage(cfg, "efs-utils", ve)
+	if !s.Fetched || !s.Built {
+		t.Errorf("expected Fetched+Built=true when .deb present, got %+v", s)
+	}
+}
+
+func TestCheckAptStage_AptGetFetched(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	// No URL → apt-get download entry.
+	ve := manifest.VersionEntry{}
+	d := buildDirs(root)
+
+	// .deb goes in per-package subdirectory.
+	pkgDir := filepath.Join(d.sources, "curl")
+	mkDir(t, pkgDir)
+	touchFile(t, filepath.Join(pkgDir, "curl_7.0_amd64.deb"))
+	s := CheckAptStage(cfg, "curl", ve)
+	if !s.Fetched || !s.Built {
+		t.Errorf("expected Fetched+Built=true for apt-get entry with .deb present, got %+v", s)
+	}
+}
+
+func TestPypiWheelsDir(t *testing.T) {
+	root := t.TempDir()
+	d := buildDirs(root)
+	got := pypiWheelsDir(d)
+	if got != d.wheels {
+		t.Errorf("pypiWheelsDir = %q, want %q", got, d.wheels)
+	}
+}
+
+func TestCheckPypiStage_Empty(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	store := manifest.NewLocalStore(root)
+	s := CheckPypiStage(cfg, store)
+	if s.Fetched || s.Built || s.Packaged {
+		t.Errorf("expected all false when nothing on disk, got %+v", s)
+	}
+}
+
+func TestCheckPypiStage_Fetched(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	store := manifest.NewLocalStore(root)
+
+	touchFile(t, filepath.Join(root, "combined-requirements.txt"))
+	if CheckPypiStage(cfg, store).Fetched {
+		t.Error("expected Fetched=false with no resolved closure for the build to read")
+	}
+	touchFile(t, pypiLockPath(root))
+	s := CheckPypiStage(cfg, store)
+	if !s.Fetched {
+		t.Error("expected Fetched=true when the requirements and the closure both exist")
+	}
+	if s.Built {
+		t.Error("expected Built=false when no .whl files")
+	}
+}
+
+func TestCheckPypiStage_Built(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	store := manifest.NewLocalStore(root)
+	d := buildDirs(root)
+
+	touchFile(t, filepath.Join(root, "combined-requirements.txt"))
+	touchFile(t, pypiLockPath(root))
+	wheelsDir := pypiWheelsDir(d)
+	touchFile(t, filepath.Join(wheelsDir, "somepackage-1.0-py3-none-any.whl"))
+
+	s := CheckPypiStage(cfg, store)
+	if !s.Fetched || !s.Built {
+		t.Errorf("expected Fetched+Built=true when .whl present, got %+v", s)
+	}
+	if s.Packaged {
+		t.Error("expected Packaged=false when MANIFEST.sha256 absent")
+	}
+}
+
+func TestCheckPypiStage_Packaged(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	store := manifest.NewLocalStore(root)
+	d := buildDirs(root)
+
+	touchFile(t, filepath.Join(root, "combined-requirements.txt"))
+	touchFile(t, pypiLockPath(root))
+	wheelsDir := pypiWheelsDir(d)
+	whl := filepath.Join(wheelsDir, "somepackage-1.0-py3-none-any.whl")
+	touchFile(t, whl)
+	writeWheelManifest(t, wheelsDir, whl)
+
+	s := CheckPypiStage(cfg, store)
+	if !s.Fetched || !s.Built || !s.Packaged {
+		t.Errorf("expected all true when MANIFEST.sha256 attests the wheels on disk, got %+v", s)
+	}
+}
+
+// writeWheelManifest writes the MANIFEST.sha256 PackagePypi would write for
+// exactly the wheels named.
+func writeWheelManifest(t *testing.T, wheelsDir string, whls ...string) {
+	t.Helper()
+	var body strings.Builder
+	for _, whl := range whls {
+		sum, err := computeFileSHA256(whl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(&body, "%s  %s\n", sum, filepath.Base(whl))
+	}
+	if err := os.WriteFile(filepath.Join(wheelsDir, "MANIFEST.sha256"), []byte(body.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// R7: MANIFEST.sha256 existing is not MANIFEST.sha256 being true. A build that
+// changed the wheel set leaves a file attesting the old one, and the cascade
+// reads Packaged off it and skips the stage that would correct it.
+func TestCheckPypiStageRefusesAStaleWheelManifest(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	store := manifest.NewLocalStore(root)
+	d := buildDirs(root)
+	wheelsDir := pypiWheelsDir(d)
+
+	touchFile(t, filepath.Join(root, "combined-requirements.txt"))
+	touchFile(t, pypiLockPath(root))
+	old := filepath.Join(wheelsDir, "six-1.17.0-py3-none-any.whl")
+	touchFile(t, old)
+	writeWheelManifest(t, wheelsDir, old)
+
+	if s := CheckPypiStage(cfg, store); !s.Packaged {
+		t.Fatalf("a manifest that does reconcile was rejected: %+v", s)
+	}
+
+	// The re-pin: the old wheel goes, the new one arrives, the checksums do
+	// not move.
+	if err := os.Remove(old); err != nil {
+		t.Fatal(err)
+	}
+	touchFile(t, filepath.Join(wheelsDir, "six-1.16.0-py3-none-any.whl"))
+	if s := CheckPypiStage(cfg, store); s.Packaged {
+		t.Error("a MANIFEST.sha256 naming neither wheel on disk was reported packaged")
+	}
+
+	// Same set, edited bytes.
+	whl := filepath.Join(wheelsDir, "six-1.16.0-py3-none-any.whl")
+	writeWheelManifest(t, wheelsDir, whl)
+	if err := os.WriteFile(whl, []byte("other bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if s := CheckPypiStage(cfg, store); s.Packaged {
+		t.Error("a MANIFEST.sha256 whose digest the wheel contradicts was reported packaged")
+	}
+}
+
+func TestMergeSummaries_Nil(t *testing.T) {
+	s := MergeSummaries(nil, nil)
+	if s.Total != 0 || s.Failures != 0 {
+		t.Errorf("MergeSummaries(nil,nil): want zero, got %+v", s)
+	}
+}
+
+func TestMergeSummaries(t *testing.T) {
+	a := &Summary{Total: 2, Failures: 1}
+	b := &Summary{Total: 3, Failures: 0}
+	got := MergeSummaries(a, b)
+	if got.Total != 5 || got.Failures != 1 {
+		t.Errorf("MergeSummaries: want Total=5 Failures=1, got %+v", got)
+	}
+}
+
+func TestBinaryArtifactPaths(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	d := buildDirs(root)
+
+	// Set up the store with packages.
+	store := manifest.NewLocalStore(root)
+
+	// Seed the store with binary packages.
+	ctx := t.Context()
+	if err := store.AddVersion(ctx, manifest.TypeBinary, "tool-a", manifest.VersionEntry{
+		URL: "https://example.com/tool-a.zip",
+	}); err != nil {
+		t.Fatalf("AddVersion tool-a: %v", err)
+	}
+	if err := store.AddVersion(ctx, manifest.TypeBinary, "tool-b", manifest.VersionEntry{
+		Version: "v2.0",
+		URL:     "https://example.com/tool-b.tar.gz",
+	}); err != nil {
+		t.Fatalf("AddVersion tool-b: %v", err)
+	}
+	if err := store.AddVersion(ctx, manifest.TypeBinary, "tool-c", manifest.VersionEntry{
+		URL: "https://example.com/tool-c.bin",
+	}); err != nil {
+		t.Fatalf("AddVersion tool-c: %v", err)
+	}
+	if err := store.SaveIndex(ctx); err != nil {
+		t.Fatalf("SaveIndex: %v", err)
+	}
+
+	// Put tool-a and tool-b on disk.
+	touchFile(t, filepath.Join(d.binaries, "tool-a", "tool-a.zip"))
+	touchFile(t, filepath.Join(d.binaries, "tool-b", "v2.0", "tool-b.tar.gz"))
+
+	paths := BinaryArtifactPaths(cfg, store, "")
+	if len(paths) != 2 {
+		t.Fatalf("expected 2 artifact paths, got %d: %v", len(paths), paths)
+	}
+
+	// Verify S3 keys.
+	keyMap := make(map[string]string)
+	for _, p := range paths {
+		keyMap[p.ObjectKey] = p.Local
+	}
+	if _, ok := keyMap["binaries/tool-a/tool-a.zip"]; !ok {
+		t.Error("missing S3 key binaries/tool-a/tool-a.zip")
+	}
+	if _, ok := keyMap["binaries/tool-b/v2.0/tool-b.tar.gz"]; !ok {
+		t.Error("missing S3 key binaries/tool-b/v2.0/tool-b.tar.gz")
+	}
+}
+
+// TestAptArtifactPathsResolveWithoutPoolPath covers the entry PackageApt could
+// not stamp: control extraction failed, or the entry predates _pool_path
+// entirely. It has to resolve to the key the server will look for, because a
+// silent skip here turns a package that used to upload into one that no longer
+// does, with nothing saying so.
+func TestAptArtifactPathsResolveWithoutPoolPath(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	d := buildDirs(root)
+	store := manifest.NewLocalStore(root)
+	ctx := t.Context()
+
+	if err := store.AddVersion(ctx, manifest.TypeApt, "stamped", manifest.VersionEntry{
+		Version:  "1.0",
+		Metadata: map[string]string{"_pool_path": "pool/main/s/stamped/stamped_1.0_amd64.deb"},
+	}); err != nil {
+		t.Fatalf("AddVersion stamped: %v", err)
+	}
+	if err := store.AddVersion(ctx, manifest.TypeApt, "bare", manifest.VersionEntry{
+		Version:  "2.0",
+		Metadata: map[string]string{"Architecture": "arm64"},
+	}); err != nil {
+		t.Fatalf("AddVersion bare: %v", err)
+	}
+	touchFile(t, filepath.Join(d.aptRepo, "pool", "main", "s", "stamped", "stamped_1.0_amd64.deb"))
+	touchFile(t, filepath.Join(d.aptRepo, "pool", "main", "b", "bare", "bare_2.0_arm64.deb"))
+
+	got := map[string]bool{}
+	for _, p := range AptArtifactPaths(cfg, store, "") {
+		got[p.ObjectKey] = true
+	}
+	for _, want := range []string{
+		"packages/apt/pool/main/s/stamped/stamped_1.0_amd64.deb",
+		"packages/apt/pool/main/b/bare/bare_2.0_arm64.deb",
+	} {
+		if !got[want] {
+			t.Errorf("no artifact path for %q; got %v", want, got)
+		}
+	}
+}
+
+// TestGitArtifactPathsCoverBundlesAndReleases pins that the local path and the
+// object key are derived from the same (name, ref, release) triple. A bundle
+// uploaded under a release's key, or the reverse, 404s on a route that already
+// recovered the ref correctly.
+func TestGitArtifactPathsCoverBundlesAndReleases(t *testing.T) {
+	root := t.TempDir()
+	cfg := &Config{BuildRoot: root}
+	d := buildDirs(root)
+	store := manifest.NewLocalStore(root)
+	ctx := t.Context()
+
+	if err := store.AddVersion(ctx, manifest.TypeGit, "org/cloned", manifest.VersionEntry{
+		Ref: "main", Source: "clone", URL: "https://example.com/org/cloned",
+	}); err != nil {
+		t.Fatalf("AddVersion cloned: %v", err)
+	}
+	if err := store.AddVersion(ctx, manifest.TypeGit, "tagged", manifest.VersionEntry{
+		Ref: "v1.2.3", Source: "release", URL: "https://example.com/tagged",
+	}); err != nil {
+		t.Fatalf("AddVersion tagged: %v", err)
+	}
+	touchFile(t, filepath.Join(d.bundles, "org--cloned", "org--cloned-main.bundle"))
+	touchFile(t, filepath.Join(d.bundles, "tagged", "tagged-v1.2.3.tar.gz"))
+
+	got := map[string]bool{}
+	for _, p := range GitArtifactPaths(cfg, store, "") {
+		got[p.ObjectKey] = true
+	}
+	for _, want := range []string{
+		manifest.GitKey("org/cloned", "main", false),
+		manifest.GitKey("tagged", "v1.2.3", true),
+	} {
+		if !got[want] {
+			t.Errorf("no artifact path for %q; got %v", want, got)
+		}
+	}
+}

@@ -1,0 +1,480 @@
+// Package admit holds the checks a package manifest passes before it is
+// written to the store, in one place for every caller that writes one.
+//
+// The CLI (bodega pkg import) and the mutation API (POST /api/v1/packages)
+// each grew their own copy of this sequence and the two had already drifted:
+// only the CLI rejected an unknown storage backend, and only the CLI admitted
+// cargo. A manifest's fate should not depend on which surface it arrived
+// through, so the sequence lives here and the callers keep only their own
+// response shaping.
+package admit
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
+)
+
+// Decision is the verdict on one manifest. Conflict with an existing package
+// is deliberately not among them: that answer needs the store, which callers
+// hold and this package does not.
+type Decision int
+
+const (
+	// Admitted means every check passed and the caller may write.
+	Admitted Decision = iota
+	// Invalid means the manifest is malformed or names something no install
+	// can resolve. The caller must not write it.
+	Invalid
+	// PolicyBlocked means the manifest is well-formed but the allow-list or a
+	// version check refused it.
+	PolicyBlocked
+)
+
+func (d Decision) String() string {
+	switch d {
+	case Admitted:
+		return "admitted"
+	case Invalid:
+		return "invalid"
+	case PolicyBlocked:
+		return "policy_blocked"
+	default:
+		return fmt.Sprintf("decision(%d)", int(d))
+	}
+}
+
+// Result carries the verdict and everything a caller needs to report it.
+// Warnings are non-fatal and are populated on an Admitted result too.
+type Result struct {
+	Decision Decision
+	Reason   string
+	Warnings []string
+}
+
+// OK reports whether the caller may proceed to write.
+func (r Result) OK() bool { return r.Decision == Admitted }
+
+// Admit runs every check a manifest must pass before it is stored, in the
+// order the cheapest and most specific failure comes first: structure, then
+// the URL allow-list, then the per-version checks that reach the network.
+//
+// A nil checker or audit DB disables the checks that need them, which is what
+// makes this callable from a CLI running against a bare manifest directory.
+// actor names who is writing; the API leaves it empty because an HTTP caller
+// is not the process owner.
+func Admit(
+	ctx context.Context,
+	checker *policy.Checker,
+	adb *audit.DB,
+	cfg *config.Config,
+	pm *manifest.PackageManifest,
+	actor string,
+) Result {
+	res := Result{Decision: Admitted}
+
+	if err := validate(cfg, pm, &res); err != nil {
+		return Result{Decision: Invalid, Reason: err.Error(), Warnings: res.Warnings}
+	}
+	if err := checkAllowList(ctx, checker, adb, pm, actor); err != nil {
+		return Result{Decision: PolicyBlocked, Reason: err.Error(), Warnings: res.Warnings}
+	}
+	if err := checkVersions(ctx, adb, cfg, pm, actor, &res); err != nil {
+		return Result{Decision: PolicyBlocked, Reason: err.Error(), Warnings: res.Warnings}
+	}
+	return res
+}
+
+// validate rejects a manifest the rest of bodega cannot act on, and records a
+// warning about one it can act on but will not honor.
+//
+// The split matters. A backend name nothing defines makes the artifact
+// unreadable, so it fails. A storage_policy on a whole-directory type is inert
+// rather than wrong, and manifests already in the field carry them; failing
+// would make pkg edit and pkg import refuse a file that was legal when it was
+// written.
+func validate(cfg *config.Config, pm *manifest.PackageManifest, res *Result) error {
+	if pm.Name == "" {
+		return fmt.Errorf("name is required")
+	}
+	// "." and ".." are the two names SafeName leaves as path syntax; see
+	// manifest.ValidatePackageName for what they collide with. Refused here so
+	// a bulk import reports the entry as invalid alongside its siblings rather
+	// than failing the request at the write.
+	if err := manifest.ValidatePackageName(pm.Name); err != nil {
+		return err
+	}
+	if pm.Type == "" {
+		return fmt.Errorf("type is required")
+	}
+	if !manifest.IsKnownType(pm.Type) {
+		return fmt.Errorf("unknown type %q — must be one of: %s", pm.Type, strings.Join(manifest.AllTypes, ", "))
+	}
+	// A storage_policy naming nothing fails at the next upload, long after the
+	// edit that introduced it and with no obvious connection back to it.
+	if err := CheckBackendName(cfg, pm.StoragePolicy); err != nil {
+		return fmt.Errorf("storage_policy: %w", err)
+	}
+	if w := StoragePolicyWarning(pm.Type, pm.StoragePolicy); w != "" {
+		res.Warnings = append(res.Warnings, w)
+	}
+	// A group naming nothing is refused on the same grounds as a backend
+	// naming nothing: it changes no placement, so the package silently falls
+	// through to its type rule and the operator finds out at an upload with no
+	// obvious connection back to the edit that typed it.
+	if err := CheckGroupNames(cfg, pm.StorageGroups); err != nil {
+		return fmt.Errorf("storage_groups: %w", err)
+	}
+	if w := StorageGroupWarning(pm.Type, GroupRule(cfg, pm.StorageGroups)); w != "" {
+		res.Warnings = append(res.Warnings, w)
+	}
+	// A hand-edited storage name that matches no configured backend makes the
+	// artifact unreadable: resolution never falls back to another backend, so
+	// the entry would 502 rather than serve from somewhere plausible.
+	for _, ve := range pm.Versions {
+		if err := CheckBackendName(cfg, ve.Storage); err != nil {
+			return fmt.Errorf("version %s: %w", versionLabel(ve), err)
+		}
+	}
+	// An apt entry with no version reaches no index and no verb: the generator
+	// refuses to publish it, and remove, delete, hide and freeze all address a
+	// version by name. Persisting one leaves 'bodega repair' as its only exit.
+	if pm.Type == manifest.TypeApt {
+		for _, ve := range pm.Versions {
+			if ve.Version == "" {
+				return fmt.Errorf("apt/%s has a version entry with no version; give one, or \"*\" to resolve the current upstream", pm.Name)
+			}
+			// A suite name config.Load refuses can never be served by any
+			// configuration, so the entry is unreachable however apt_suites
+			// is edited later. An unserved-but-legal suite is not refused:
+			// staging an entry before adding its suite is a normal order, and
+			// GET /api/v1/status reports what that leaves waiting.
+			for _, suite := range ve.Suites {
+				if err := config.ValidateAptSuite(suite); err != nil {
+					return fmt.Errorf("apt/%s version %s: %w", pm.Name, versionLabel(ve), err)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// checkAllowList runs the URL-level allow-list over every version. It is
+// cheap and fails fast, so it runs before the checks that reach the network.
+func checkAllowList(ctx context.Context, checker *policy.Checker, adb *audit.DB, pm *manifest.PackageManifest, actor string) error {
+	if checker == nil {
+		return nil
+	}
+	for _, ve := range pm.Versions {
+		candidate := policy.CandidateFor(pm.Type, pm.Name, ve.URL)
+		if candidate == "" {
+			continue
+		}
+		if err := checker.Check(ctx, pm.Type, candidate); err != nil {
+			if adb != nil {
+				_ = adb.Record(ctx, audit.Event{
+					EventType:  audit.EventCreate,
+					PkgType:    pm.Type,
+					PkgName:    pm.Name,
+					PkgVersion: ve.Version,
+					Actor:      actor,
+					Status:     "policy_violation",
+					Details:    fmt.Sprintf("candidate=%s", candidate),
+				})
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// checkVersions runs the per-version checks (age, OSV). They live in the audit
+// database, so with no database there is nothing to check against. Warn-level
+// results do not block; they are recorded and reported on res, because a gate
+// that answered "I could not tell" has to say so where the operator is
+// looking. Recording alone leaves an OSV gate with no synced database printing
+// a clean import and filing the warning somewhere nobody reads until after the
+// package is in the store.
+func checkVersions(ctx context.Context, adb *audit.DB, cfg *config.Config, pm *manifest.PackageManifest, actor string, res *Result) error {
+	if adb == nil {
+		return nil
+	}
+	checkers := []policy.VersionChecker{
+		policy.NewAgeChecker(adb),
+		OSVChecker(cfg, adb),
+	}
+	warns := &versionWarnings{}
+	defer warns.flush(res)
+	for i := range pm.Versions {
+		ve := &pm.Versions[i]
+		combined := policy.RunChecks(ctx, pm, ve, checkers...)
+		warns.add(ve.Version, combined.Warns)
+		if details := combined.AuditDetails(); details != nil {
+			blob, _ := json.Marshal(details)
+			status := "policy_warn"
+			if combined.Blocked() {
+				status = "policy_violation"
+			}
+			_ = adb.Record(ctx, audit.Event{
+				EventType:  audit.EventCreate,
+				PkgType:    pm.Type,
+				PkgName:    pm.Name,
+				PkgVersion: ve.Version,
+				Actor:      actor,
+				Status:     status,
+				Details:    string(blob),
+			})
+		}
+		if combined.Blocked() {
+			return fmt.Errorf("policy blocked %s@%s: %s", pm.Name, ve.Version, combined.Reasons())
+		}
+	}
+	return nil
+}
+
+// versionWarnings collects the per-version warns of one manifest into the
+// lines a caller prints. A degraded gate gives every version of a package the
+// same reason, so the versions are gathered under it: a 40-version import
+// states the finding once instead of scrolling it past the operator 40 times.
+type versionWarnings struct {
+	order    []string
+	versions map[string][]string
+}
+
+func (w *versionWarnings) add(version string, warns []policy.Result) {
+	for _, r := range warns {
+		line := r.Check + ": " + r.Reason
+		if w.versions == nil {
+			w.versions = map[string][]string{}
+		}
+		if _, seen := w.versions[line]; !seen {
+			w.order = append(w.order, line)
+		}
+		w.versions[line] = append(w.versions[line], version)
+	}
+}
+
+// flush renders each collected reason onto res. It runs even when a later
+// version blocked, so the warning that explains why the gate was degraded is
+// not lost behind the block that followed it.
+func (w *versionWarnings) flush(res *Result) {
+	if res == nil {
+		return
+	}
+	for _, line := range w.order {
+		res.Warnings = append(res.Warnings, describeVersions(w.versions[line])+": "+line)
+	}
+}
+
+// describeVersions names the versions a warning covers, listing at most three
+// so one line stays one line.
+func describeVersions(versions []string) string {
+	const shown = 3
+	if len(versions) == 1 {
+		return versions[0]
+	}
+	if len(versions) <= shown {
+		return fmt.Sprintf("%d versions (%s)", len(versions), strings.Join(versions, ", "))
+	}
+	return fmt.Sprintf("%d versions (%s, ...)", len(versions), strings.Join(versions[:shown], ", "))
+}
+
+// OSVChecker points the OSV gate at the local database `bodega policy osv
+// sync` wrote. The config keys are read here rather than in internal/policy so
+// the gate stays usable from a test or a tool that holds no Config; a nil one
+// leaves the checker with no database and no fallback, which warns rather than
+// passing.
+//
+// Exported for `bodega policy osv rescan`, which has to answer from the same
+// database and the same fallback rule admission answers from. A second copy of
+// these four keys is how a rescan starts reporting on data admission never
+// read.
+func OSVChecker(cfg *config.Config, adb *audit.DB) *policy.OSVChecker {
+	ck := policy.NewOSVChecker(adb)
+	if cfg == nil {
+		return ck
+	}
+	ck.LocalDB = policy.SharedOSVDatabase(cfg.ResolveOSVDBDir())
+	ck.AllowAPIFallback = cfg.OSVAPIFallback
+	ck.MaxAge = cfg.ResolveOSVDBMaxAge()
+	ck.DefaultAptSuite = cfg.AptCodename
+	ck.ServedAptSuites = cfg.ServedAptSuites()
+	return ck
+}
+
+// CheckBackendName rejects a name no configured backend answers to. The empty
+// string and the reserved default always pass: an entry with no name recorded
+// is on the default backend, which every install has.
+func CheckBackendName(cfg *config.Config, name string) error {
+	if name == "" || name == config.DefaultStorageName {
+		return nil
+	}
+	if cfg == nil {
+		return nil
+	}
+	if _, ok := cfg.StorageBackends[name]; !ok {
+		return fmt.Errorf("unknown storage backend %q (defined: %s)", name, definedBackendNames(cfg))
+	}
+	return nil
+}
+
+// CheckGroupNames rejects a storage_groups list this install cannot act on: an
+// empty entry, a group no storage_by_group key defines, or a membership whose
+// groups resolve to two different backends.
+//
+// The last is the answer to "what does a package in two groups resolve to".
+// GroupRule still answers deterministically — first group by name with a rule
+// — so nothing downstream has to guess, but a write path answering one of two
+// backends an operator meant differently is a coin toss they cannot read off
+// the manifest. Refusing at the edit that creates the overlap is where they
+// can still fix it, and the message names the winner so a config that already
+// has one is describable rather than mysterious.
+func CheckGroupNames(cfg *config.Config, groups []string) error {
+	if len(groups) == 0 {
+		return nil
+	}
+	for _, g := range groups {
+		if strings.TrimSpace(g) == "" {
+			return fmt.Errorf("empty group name")
+		}
+	}
+	if cfg == nil {
+		return nil
+	}
+	for _, g := range groups {
+		if _, ok := cfg.StorageByGroup[g]; !ok {
+			return fmt.Errorf("unknown storage group %q (defined in storage_by_group: %s)", g, definedGroupNames(cfg))
+		}
+	}
+
+	backends := map[string][]string{}
+	for _, g := range groups {
+		name := cfg.StorageByGroup[g]
+		backends[name] = append(backends[name], g)
+	}
+	if len(backends) < 2 {
+		return nil
+	}
+	names := make([]string, 0, len(backends))
+	for name := range backends {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var parts []string
+	for _, name := range names {
+		gs := backends[name]
+		sort.Strings(gs)
+		parts = append(parts, fmt.Sprintf("%s -> %q", strings.Join(gs, ", "), name))
+	}
+	return fmt.Errorf("groups resolve to more than one backend (%s); a package is written to one backend, and %q would win by group name — "+
+		"drop a group, or point them at the same backend in storage_by_group",
+		strings.Join(parts, "; "), GroupRule(cfg, groups))
+}
+
+// GroupRule returns the group that decides placement for this membership: the
+// first by name that storage_by_group defines. Empty when none does.
+//
+// It answers with the group rather than the backend because every caller here
+// reports to an operator, whose edit is to storage_by_group or to
+// storage_groups. It mirrors the resolver's rule deliberately; the resolver
+// cannot be called instead, since it takes a built storage connection and
+// these checks run before one exists.
+func GroupRule(cfg *config.Config, groups []string) string {
+	if cfg == nil || len(groups) == 0 || len(cfg.StorageByGroup) == 0 {
+		return ""
+	}
+	sorted := append([]string(nil), groups...)
+	sort.Strings(sorted)
+	for _, g := range sorted {
+		if cfg.StorageByGroup[g] != "" {
+			return g
+		}
+	}
+	return ""
+}
+
+// definedGroupNames lists the group names an operator may use, sorted.
+func definedGroupNames(cfg *config.Config) string {
+	if len(cfg.StorageByGroup) == 0 {
+		return "none"
+	}
+	names := make([]string, 0, len(cfg.StorageByGroup))
+	for name := range cfg.StorageByGroup {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
+}
+
+func versionLabel(ve manifest.VersionEntry) string {
+	switch {
+	case ve.Version != "":
+		return ve.Version
+	case ve.Ref != "":
+		return ve.Ref
+	default:
+		return "(unnamed)"
+	}
+}
+
+// DirectoryPlaced reports whether a type uploads as a whole directory, which
+// is what makes a per-package storage policy inert for it.
+//
+// pypi is the only one. apt and git were here until their uploaders learned to
+// walk manifest entries — a .deb has a per-version key through its pool path
+// and a bundle through its ref — and both are placed and moved per package
+// now. A pypi version has no object key at all: wheels land under one prefix
+// and the PEP 503 index is a listing over the whole tree, so a package placed
+// on another backend would drop out of the index that finds it.
+func DirectoryPlaced(typ string) bool {
+	return typ == manifest.TypePypi
+}
+
+// NoPerPackagePlacement says why one type cannot carry a per-package
+// placement, in whichever terms that type's operator will recognize.
+func NoPerPackagePlacement(typ string) string {
+	return typ + " wheels upload as a directory with no per-version object key, so one package cannot be placed apart from the rest of its type"
+}
+
+// StoragePolicyWarning describes a storage_policy the write path will ignore.
+// It is a warning rather than an error because such a manifest is inert, not
+// wrong, and refusing one would reject files that were legal when written.
+func StoragePolicyWarning(typ, policy string) string {
+	if policy == "" || !DirectoryPlaced(typ) {
+		return ""
+	}
+	return fmt.Sprintf("warning: storage_policy %q has no effect for %s: %s. "+
+		"Set storage_by_type.%s to place the whole type; 'bodega pkg move' refuses %s for the same reason.",
+		policy, typ, NoPerPackagePlacement(typ), typ, typ)
+}
+
+// StorageGroupWarning describes a group rule the write path will ignore, on
+// the same terms and for the same reason as StoragePolicyWarning. group is the
+// group that would have decided; empty means none would, so there is nothing
+// to warn about.
+func StorageGroupWarning(typ, group string) string {
+	if group == "" || !DirectoryPlaced(typ) {
+		return ""
+	}
+	return fmt.Sprintf("warning: storage group %q has no effect for %s: %s. "+
+		"Set storage_by_type.%s to place the whole type; 'bodega pkg move' refuses %s for the same reason.",
+		group, typ, NoPerPackagePlacement(typ), typ, typ)
+}
+
+// definedBackendNames lists the usable backend names for an error message,
+// reserved default first.
+func definedBackendNames(cfg *config.Config) string {
+	names := make([]string, 0, len(cfg.StorageBackends)+1)
+	for name := range cfg.StorageBackends {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return strings.Join(append([]string{config.DefaultStorageName}, names...), ", ")
+}

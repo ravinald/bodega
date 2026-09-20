@@ -1,0 +1,537 @@
+package server
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/ravinald/bodega/internal/manifest"
+)
+
+func TestNpmVersionFromTarball(t *testing.T) {
+	cases := []struct {
+		pkg, tarball, want string
+	}{
+		{"@example-corp/widget-cli", "widget-cli-1.5.0.tgz", "1.5.0"},
+		{"@example-corp/widget-cli", "widget-cli-1.5.0-beta.1.tgz", "1.5.0-beta.1"},
+		{"lodash", "lodash-4.17.21.tgz", "4.17.21"},
+		// Mismatched basename — refuse to guess.
+		{"@example-corp/widget-cli", "other-1.0.0.tgz", ""},
+		// No .tgz suffix — still strips the prefix cleanly.
+		{"lodash", "lodash-4.17.21", "4.17.21"},
+	}
+	for _, c := range cases {
+		if got := npmVersionFromTarball(c.pkg, c.tarball); got != c.want {
+			t.Errorf("npmVersionFromTarball(%q, %q) = %q, want %q",
+				c.pkg, c.tarball, got, c.want)
+		}
+	}
+}
+
+func TestIsVersionHidden(t *testing.T) {
+	pm := &manifest.PackageManifest{
+		Versions: []manifest.VersionEntry{
+			{Version: "1.0.0"},
+			{Version: "1.5.0", Hidden: true},
+			{Version: "1.5.1"},
+		},
+	}
+	if !isVersionHidden(pm, "1.5.0") {
+		t.Error("1.5.0 should be hidden")
+	}
+	if isVersionHidden(pm, "1.0.0") {
+		t.Error("1.0.0 is not hidden")
+	}
+	if isVersionHidden(pm, "nonexistent") {
+		t.Error("unknown version must not report hidden (false-positive risk)")
+	}
+}
+
+func TestFilterPackumentByManifest_Hidden(t *testing.T) {
+	raw := []byte(`{
+		"name": "@example-corp/widget-cli",
+		"dist-tags": {"latest": "1.5.0", "next": "1.5.1"},
+		"versions": {
+			"1.4.2": {"name": "@example-corp/widget-cli", "version": "1.4.2"},
+			"1.5.0": {"name": "@example-corp/widget-cli", "version": "1.5.0"},
+			"1.5.1": {"name": "@example-corp/widget-cli", "version": "1.5.1"}
+		},
+		"time": {
+			"created": "2026-04-02T00:00:00Z",
+			"1.4.2": "2026-04-02T00:00:00Z",
+			"1.5.0": "2026-04-02T00:00:00Z",
+			"1.5.1": "2026-04-03T00:00:00Z"
+		}
+	}`)
+
+	pm := &manifest.PackageManifest{
+		Name: "@example-corp/widget-cli",
+		Type: manifest.TypeNpm,
+		Versions: []manifest.VersionEntry{
+			{Version: "1.4.2"},
+			{Version: "1.5.0", Hidden: true},
+			{Version: "1.5.1"},
+		},
+	}
+
+	out, err := filterPackumentByManifest(raw, pm)
+	if err != nil {
+		t.Fatalf("filter: %v", err)
+	}
+
+	var doc map[string]any
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("unmarshal filtered: %v", err)
+	}
+
+	// Hidden version must be gone from the versions map.
+	if v, ok := doc["versions"].(map[string]any); ok {
+		if _, present := v["1.5.0"]; present {
+			t.Error("filtered packument still lists 1.5.0 in versions")
+		}
+		if _, present := v["1.5.1"]; !present {
+			t.Error("filtered packument dropped visible 1.5.1")
+		}
+	} else {
+		t.Fatal("versions key missing from filtered output")
+	}
+
+	// dist-tags pointing at hidden versions should be dropped entirely.
+	// `latest` pointed at 1.5.0 → gone. `next` pointed at 1.5.1 → kept.
+	if t_, ok := doc["dist-tags"].(map[string]any); ok {
+		if _, present := t_["latest"]; present {
+			t.Error(`dist-tag "latest" pointed at hidden 1.5.0 but wasn't removed`)
+		}
+		if _, present := t_["next"]; !present {
+			t.Error(`dist-tag "next" pointed at visible 1.5.1 and should be kept`)
+		}
+	} else {
+		t.Fatal("dist-tags key missing from filtered output")
+	}
+
+	// time entry for the hidden version should be gone.
+	if tm, ok := doc["time"].(map[string]any); ok {
+		if _, present := tm["1.5.0"]; present {
+			t.Error("filtered packument still has time entry for 1.5.0")
+		}
+		if _, present := tm["1.5.1"]; !present {
+			t.Error("filtered packument dropped time entry for visible 1.5.1")
+		}
+	}
+}
+
+func TestFilterPackumentByManifest_NoOp(t *testing.T) {
+	raw := []byte(`{"name":"lodash","versions":{"4.17.21":{"version":"4.17.21"}}}`)
+	pm := &manifest.PackageManifest{
+		Versions: []manifest.VersionEntry{{Version: "4.17.21"}},
+	}
+	out, err := filterPackumentByManifest(raw, pm)
+	if err != nil {
+		t.Fatalf("filter: %v", err)
+	}
+	if string(out) != string(raw) {
+		t.Errorf("expected passthrough; got rewritten bytes")
+	}
+}
+
+// Mirrors the quarantine walkthrough shape: pin 1.5.1 via compatible
+// constraint + keep 1.5.0 as a hidden tombstone.
+func TestFilterPackumentByManifest_Constraint(t *testing.T) {
+	raw := []byte(`{
+		"name": "@example-corp/widget-cli",
+		"dist-tags": {"latest": "1.5.1", "legacy": "1.4.2"},
+		"versions": {
+			"1.4.2": {"name": "@example-corp/widget-cli", "version": "1.4.2"},
+			"1.5.0": {"name": "@example-corp/widget-cli", "version": "1.5.0"},
+			"1.5.1": {"name": "@example-corp/widget-cli", "version": "1.5.1"},
+			"1.6.0": {"name": "@example-corp/widget-cli", "version": "1.6.0"}
+		},
+		"time": {
+			"created": "2026-04-02T00:00:00Z",
+			"1.4.2": "2026-04-02T00:00:00Z",
+			"1.5.0": "2026-04-02T00:00:00Z",
+			"1.5.1": "2026-04-03T00:00:00Z",
+			"1.6.0": "2026-05-03T00:00:00Z"
+		}
+	}`)
+
+	pm := &manifest.PackageManifest{
+		Name: "@example-corp/widget-cli",
+		Type: manifest.TypeNpm,
+		Versions: []manifest.VersionEntry{
+			{Version: "1.5.1", VersionConstraint: manifest.ConstraintCompatible},
+			{Version: "1.5.0", Hidden: true, Frozen: true},
+		},
+	}
+
+	out, err := filterPackumentByManifest(raw, pm)
+	if err != nil {
+		t.Fatalf("filter: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("unmarshal filtered: %v", err)
+	}
+
+	versions := doc["versions"].(map[string]any)
+	// Below constraint: stripped.
+	if _, has := versions["1.4.2"]; has {
+		t.Error("1.4.2 should be stripped (below 1.5.1 constraint)")
+	}
+	// Hidden: stripped (tombstone; also below constraint, so doubly stripped).
+	if _, has := versions["1.5.0"]; has {
+		t.Error("1.5.0 should be stripped (hidden)")
+	}
+	// At or above constraint, not hidden: kept.
+	if _, has := versions["1.5.1"]; !has {
+		t.Error("1.5.1 should be kept (at constraint boundary)")
+	}
+	if _, has := versions["1.6.0"]; !has {
+		t.Error("1.6.0 should be kept (above constraint)")
+	}
+
+	tags := doc["dist-tags"].(map[string]any)
+	if _, has := tags["latest"]; !has {
+		t.Error("dist-tag latest → 1.5.1 should survive")
+	}
+	if _, has := tags["legacy"]; has {
+		t.Error(`dist-tag "legacy" pointed at 1.4.2 (out-of-constraint) and should be stripped`)
+	}
+
+	times := doc["time"].(map[string]any)
+	if _, has := times["created"]; !has {
+		t.Error(`"created" is metadata, not a version; it should survive`)
+	}
+	if _, has := times["1.4.2"]; has {
+		t.Error("time entry for 1.4.2 should be stripped")
+	}
+	if _, has := times["1.5.0"]; has {
+		t.Error("time entry for hidden 1.5.0 should be stripped")
+	}
+	if _, has := times["1.5.1"]; !has {
+		t.Error("time entry for in-constraint 1.5.1 should survive")
+	}
+}
+
+// tarballOf pulls one version's dist.tarball out of a packument body.
+func tarballOf(t *testing.T, body []byte, version string) string {
+	t.Helper()
+	var doc struct {
+		Versions map[string]struct {
+			Dist struct {
+				Tarball string `json:"tarball"`
+			} `json:"dist"`
+		} `json:"versions"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		t.Fatalf("unmarshal packument: %v (body %s)", err, truncateForTest(body))
+	}
+	v, ok := doc.Versions[version]
+	if !ok {
+		t.Fatalf("packument has no version %s (body %s)", version, truncateForTest(body))
+	}
+	return v.Dist.Tarball
+}
+
+func truncateForTest(b []byte) string {
+	if len(b) > 400 {
+		return string(b[:400]) + "…"
+	}
+	return string(b)
+}
+
+// A scoped package carries the scope in its tarball path, and bodega's own
+// route splits it back out on "/-/". Composed wrong, the scope lands in the
+// filename half and every scoped install 404s.
+func TestRewriteNpmPackumentScoped(t *testing.T) {
+	raw := []byte(`{
+		"name": "@scope/pkg",
+		"versions": {
+			"1.0.0": {"name":"@scope/pkg","version":"1.0.0","dist":{"tarball":"https://registry.npmjs.org/@scope/pkg/-/pkg-1.0.0.tgz","integrity":"sha512-aaa"}}
+		}
+	}`)
+	out, err := rewriteNpmPackument(raw, "https://bodega.example.com/npm", "@scope/pkg")
+	if err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	const want = "https://bodega.example.com/npm/@scope/pkg/-/pkg-1.0.0.tgz"
+	if got := tarballOf(t, out, "1.0.0"); got != want {
+		t.Errorf("dist.tarball = %q, want %q", got, want)
+	}
+	// The integrity hash is the client's check on the bytes; a rewrite that
+	// drops it has clients install what they cannot verify.
+	if !strings.Contains(string(out), "sha512-aaa") {
+		t.Errorf("rewrite dropped dist.integrity: %s", truncateForTest(out))
+	}
+}
+
+// The upstream host is not what the rewrite keys on. A packument whose
+// tarballs already live on a private registry or a CDN has to land on bodega
+// the same way registry.npmjs.org's does — which is what separates a rewrite
+// from a strings.Replace of the default hostname.
+func TestRewriteNpmPackumentNonDefaultHost(t *testing.T) {
+	raw := []byte(`{
+		"name": "widget",
+		"dist": {"tarball": "https://npm.corp.internal/artifacts/widget-3.0.0.tgz"},
+		"versions": {
+			"1.0.0": {"version":"1.0.0","dist":{"tarball":"https://npm.corp.internal/deep/nested/path/widget-1.0.0.tgz"}},
+			"2.0.0": {"version":"2.0.0","dist":{"tarball":"https://cdn.example.net/t/widget-2.0.0.tgz?sig=abc"}}
+		}
+	}`)
+	out, err := rewriteNpmPackument(raw, "https://bodega.example.com/npm", "widget")
+	if err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	for version, want := range map[string]string{
+		"1.0.0": "https://bodega.example.com/npm/widget/-/widget-1.0.0.tgz",
+		"2.0.0": "https://bodega.example.com/npm/widget/-/widget-2.0.0.tgz",
+	} {
+		if got := tarballOf(t, out, version); got != want {
+			t.Errorf("version %s: dist.tarball = %q, want %q", version, got, want)
+		}
+	}
+	for _, host := range []string{"npm.corp.internal", "cdn.example.net"} {
+		if strings.Contains(string(out), host) {
+			t.Errorf("rewritten packument still names %s: %s", host, truncateForTest(out))
+		}
+	}
+	// The version-manifest route (/npm/{pkg}/{version}) answers with a
+	// top-level dist and no versions map. Left alone it is the same bypass.
+	var doc map[string]any
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	dist, _ := doc["dist"].(map[string]any)
+	if got := dist["tarball"]; got != "https://bodega.example.com/npm/widget/-/widget-3.0.0.tgz" {
+		t.Errorf("top-level dist.tarball = %v, want the bodega route", got)
+	}
+}
+
+// A packument too large to buffer is refused, not relayed: served unrewritten
+// it points the client straight past bodega, which is the defect. The cap is
+// the one the filtered path already imposes through fetchUpstream, so neither
+// packument path is bounded by the spool.
+func TestNpmPackumentOverTheBufferIsRefused(t *testing.T) {
+	saved := maxUpstreamBody
+	maxUpstreamBody = 64
+	t.Cleanup(func() { maxUpstreamBody = saved })
+
+	rec := httptest.NewRecorder()
+	w := &npmPackumentWriter{ResponseWriter: rec, base: "https://bodega.example.com/npm", pkg: "big"}
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write([]byte(strings.Repeat("x", 128))); err == nil {
+		t.Error("Write past the cap returned nil; the copy would read a body nothing can use")
+	}
+	if err := w.flush(); err == nil {
+		t.Error("flush returned nil for a body it could not rewrite")
+	}
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", rec.Code)
+	}
+}
+
+const npmFixturePackument = `{
+	"name": "@scope/pkg",
+	"dist-tags": {"latest": "1.1.0"},
+	"versions": {
+		"1.0.0": {"name":"@scope/pkg","version":"1.0.0","dist":{"tarball":"%[1]s/@scope/pkg/-/pkg-1.0.0.tgz"}},
+		"1.1.0": {"name":"@scope/pkg","version":"1.1.0","dist":{"tarball":"%[1]s/@scope/pkg/-/pkg-1.1.0.tgz"}}
+	},
+	"time": {"created":"2026-01-01T00:00:00Z","1.0.0":"2026-01-01T00:00:00Z","1.1.0":"2026-02-01T00:00:00Z"}
+}`
+
+// The generated and proxied packument paths are two functions serving one
+// document, and a client whose package has an entry must not be told a
+// different URL from one whose package has none. The cache hit is the third
+// answer to the same question: the rewrite runs on the way out, so it applies
+// to a stored copy that still carries the upstream URL.
+func TestNpmPackumentRewriteIsTheSameOnEveryPath(t *testing.T) {
+	s := proxyingServer(t)
+	up := newRecordingUpstream(t)
+	up.route("/@scope/pkg", fmt.Sprintf(npmFixturePackument, up.ts.URL))
+	s.cfg.NpmUpstream = up.ts.URL
+
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+	get := func() []byte {
+		t.Helper()
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+"/npm/@scope/pkg", nil)
+		if err != nil {
+			t.Fatalf("build request: %v", err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("GET packument: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read packument: %v", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body %s)", resp.StatusCode, truncateForTest(body))
+		}
+		return body
+	}
+
+	want := ts.URL + "/npm/@scope/pkg/-/pkg-1.1.0.tgz"
+	miss := tarballOf(t, get(), "1.1.0")
+	if miss != want {
+		t.Errorf("cache miss: dist.tarball = %q, want %q", miss, want)
+	}
+	hit := tarballOf(t, get(), "1.1.0")
+	if hit != want {
+		t.Errorf("cache hit: dist.tarball = %q, want %q", hit, want)
+	}
+	// Without this the second request could have been another miss, and the
+	// assertion above would say nothing about the path that serves from
+	// storage.
+	var fetches int
+	for _, p := range up.paths() {
+		if p == "/@scope/pkg" {
+			fetches++
+		}
+	}
+	if fetches != 1 {
+		t.Errorf("upstream saw %d packument fetches for two requests, want 1: the second must be a cache hit", fetches)
+	}
+
+	// The stored object stays the document the registry served. Rewritten
+	// before the cache write it would carry this instance's public_url, which
+	// is wrong the moment that key changes or a second instance shares the
+	// store.
+	cached, err := s.typeStore(manifest.TypeNpm).GetStream(t.Context(), manifest.NpmPackumentKey("@scope/pkg"))
+	if err != nil || cached == nil {
+		t.Fatalf("read the cached packument: %v", err)
+	}
+	defer func() { _ = cached.Body.Close() }()
+	stored, err := io.ReadAll(cached.Body)
+	if err != nil {
+		t.Fatalf("read the cached packument body: %v", err)
+	}
+	if got := tarballOf(t, stored, "1.1.0"); got != up.ts.URL+"/@scope/pkg/-/pkg-1.1.0.tgz" {
+		t.Errorf("cached dist.tarball = %q, want the upstream URL untouched", got)
+	}
+
+	// An entry for the same package moves it onto the generated path, which
+	// composes dist.tarball through the same function as the rewrite above.
+	pm := &manifest.PackageManifest{
+		ConfigVersion: manifest.CurrentConfigVersion,
+		Name:          "@scope/pkg",
+		Type:          manifest.TypeNpm,
+		Versions: []manifest.VersionEntry{
+			{Version: "1.1.0", Mode: manifest.ModeProxy},
+			{Version: "1.0.0", Hidden: true},
+		},
+	}
+	if err := s.store.SavePackage(t.Context(), pm); err != nil {
+		t.Fatalf("seed npm/@scope/pkg: %v", err)
+	}
+	generated := get()
+	if got := tarballOf(t, generated, "1.1.0"); got != want {
+		t.Errorf("generated path: dist.tarball = %q, want %q", got, want)
+	}
+	if strings.Contains(string(generated), `"1.0.0"`) {
+		t.Errorf("generated packument still lists the hidden 1.0.0: %s", truncateForTest(generated))
+	}
+}
+
+// TestNpmPrereleaseServeFetchNamesTheKeyVersion pins the audit derivation to
+// the one handleNpm stores under. parsePackagePath split the tarball at its
+// last "-", so a prerelease reached `bodega audit events` as version "rc.1"
+// while the object key and the discovery row both carried "1.0.0-rc.1".
+func TestNpmPrereleaseServeFetchNamesTheKeyVersion(t *testing.T) {
+	const (
+		wantPkg     = "mypkg"
+		wantVersion = "1.0.0-rc.1"
+		tarball     = wantPkg + "-" + wantVersion + ".tgz"
+	)
+	s := proxyingServer(t)
+	up := newRecordingUpstream(t)
+	up.route("/"+wantPkg+"/-/"+tarball, "tarball bytes")
+	s.cfg.NpmUpstream = up.ts.URL
+
+	pm := &manifest.PackageManifest{
+		ConfigVersion: manifest.CurrentConfigVersion,
+		Name:          wantPkg,
+		Type:          manifest.TypeNpm,
+		Versions:      []manifest.VersionEntry{{Version: wantVersion, Mode: manifest.ModeProxy}},
+	}
+	if err := s.store.SavePackage(t.Context(), pm); err != nil {
+		t.Fatalf("seed npm/%s: %v", wantPkg, err)
+	}
+
+	if status, body := getStatusAndBody(t, s, "/npm/"+wantPkg+"/-/"+tarball); status != http.StatusOK {
+		t.Fatalf("status = %d (%q), want 200; upstream saw %v", status, body, up.paths())
+	}
+
+	events := waitForServeFetch(t, s, 1)
+	for _, ev := range events {
+		if ev.PkgType == manifest.TypeNpm && ev.PkgName == wantPkg && ev.PkgVersion == wantVersion {
+			return
+		}
+	}
+	t.Errorf("no serve_fetch event for npm %s at %s; events carry %v",
+		wantPkg, wantVersion, eventIdentities(events))
+}
+
+// TestNpmDoubleHyphenNameAgreesAcrossEveryDerivation pins the discovery row to
+// the name npm published. A scoped package's "/" is stored as "--", so
+// ParseKey decodes it back on the way out; a package whose literal name
+// carries "--" is indistinguishable at that point and comes back as "foo/bar".
+// The caller knows which it is, having read the name off the request path, so
+// the row takes the key's name only where the caller has none. Letting the key
+// win recorded foo/bar against a serve_fetch event and an object key that both
+// said foo--bar: one request, two identities, the shape #239 reports.
+func TestNpmDoubleHyphenNameAgreesAcrossEveryDerivation(t *testing.T) {
+	const (
+		wantPkg     = "foo--bar"
+		wantVersion = "1.0.0"
+		tarball     = wantPkg + "-" + wantVersion + ".tgz"
+	)
+	s := proxyingServer(t)
+	up := newRecordingUpstream(t)
+	up.route("/"+wantPkg+"/-/"+tarball, "tarball bytes")
+	s.cfg.NpmUpstream = up.ts.URL
+
+	pm := &manifest.PackageManifest{
+		ConfigVersion: manifest.CurrentConfigVersion,
+		Name:          wantPkg,
+		Type:          manifest.TypeNpm,
+		Versions:      []manifest.VersionEntry{{Version: wantVersion, Mode: manifest.ModeProxy}},
+	}
+	if err := s.store.SavePackage(t.Context(), pm); err != nil {
+		t.Fatalf("seed npm/%s: %v", wantPkg, err)
+	}
+
+	if status, body := getStatusAndBody(t, s, "/npm/"+wantPkg+"/-/"+tarball); status != http.StatusOK {
+		t.Fatalf("status = %d (%q), want 200; upstream saw %v", status, body, up.paths())
+	}
+
+	rows := waitForAnyDiscovery(t, s, 1)
+	var gotRow bool
+	for _, row := range rows {
+		if row.PkgName == wantPkg && row.PkgVersion == wantVersion {
+			gotRow = true
+		}
+	}
+	if !gotRow {
+		t.Errorf("no discovery row for %s at %s; rows carry %v", wantPkg, wantVersion, identities(rows))
+	}
+
+	events := waitForServeFetch(t, s, 1)
+	var gotEvent bool
+	for _, ev := range events {
+		if ev.PkgType == manifest.TypeNpm && ev.PkgName == wantPkg && ev.PkgVersion == wantVersion {
+			gotEvent = true
+		}
+	}
+	if !gotEvent {
+		t.Errorf("no serve_fetch event for npm %s at %s; events carry %v",
+			wantPkg, wantVersion, eventIdentities(events))
+	}
+}

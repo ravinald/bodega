@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS acl_entries;
+DROP TABLE IF EXISTS acl_lists;

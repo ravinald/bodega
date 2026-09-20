@@ -1,0 +1,118 @@
+[
+ {
+  "affected": [
+   {
+    "package": {
+     "ecosystem": "npm",
+     "name": "minimist",
+     "purl": "pkg:npm/minimist"
+    },
+    "ranges": [
+     {
+      "events": [
+       {
+        "introduced": "0"
+       },
+       {
+        "fixed": "0.2.1"
+       }
+      ],
+      "type": "SEMVER"
+     }
+    ]
+   },
+   {
+    "package": {
+     "ecosystem": "npm",
+     "name": "minimist",
+     "purl": "pkg:npm/minimist"
+    },
+    "ranges": [
+     {
+      "events": [
+       {
+        "introduced": "1.0.0"
+       },
+       {
+        "fixed": "1.2.3"
+       }
+      ],
+      "type": "SEMVER"
+     }
+    ]
+   }
+  ],
+  "aliases": [
+   "CVE-2020-7598"
+  ],
+  "id": "GHSA-vh95-rmgr-6w4m",
+  "modified": "2026-03-13T22:11:31.390433Z",
+  "published": "2020-04-03T21:48:32Z",
+  "schema_version": "1.7.5",
+  "severity": [
+   {
+    "score": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:L",
+    "type": "CVSS_V3"
+   }
+  ],
+  "summary": "Prototype Pollution in minimist"
+ },
+ {
+  "affected": [
+   {
+    "package": {
+     "ecosystem": "npm",
+     "name": "minimist",
+     "purl": "pkg:npm/minimist"
+    },
+    "ranges": [
+     {
+      "events": [
+       {
+        "introduced": "1.0.0"
+       },
+       {
+        "fixed": "1.2.6"
+       }
+      ],
+      "type": "SEMVER"
+     }
+    ]
+   },
+   {
+    "package": {
+     "ecosystem": "npm",
+     "name": "minimist",
+     "purl": "pkg:npm/minimist"
+    },
+    "ranges": [
+     {
+      "events": [
+       {
+        "introduced": "0"
+       },
+       {
+        "fixed": "0.2.4"
+       }
+      ],
+      "type": "SEMVER"
+     }
+    ]
+   }
+  ],
+  "aliases": [
+   "CVE-2021-44906"
+  ],
+  "id": "GHSA-xvch-5gv4-984h",
+  "modified": "2026-03-13T22:11:59.523514Z",
+  "published": "2022-03-18T00:01:09Z",
+  "schema_version": "1.7.5",
+  "severity": [
+   {
+    "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    "type": "CVSS_V3"
+   }
+  ],
+  "summary": "Prototype Pollution in minimist"
+ }
+]

@@ -1,0 +1,22 @@
+-- expansion is what a closed profile does about a package it does not list.
+--
+-- Separate from membership because the two answer different questions.
+-- membership says which packages the profile covers; expansion says what
+-- happens to a fetch outside that set, and the honest default is not a
+-- refusal. A new transitive dependency is ordinary upstream maintenance, and a
+-- profile that blocks one leaves the host unpatched — so the default is warn:
+-- the fetch is served and the reach outside the class is recorded as a denied
+-- discovery row, which is the detection half of the control. block is for the
+-- profile where an operator has decided otherwise; ignore suppresses the row
+-- as well.
+--
+-- warn/block/ignore is the triple age_policy (004) and osv_policy (005)
+-- already carry. A fourth spelling of the same idea is a defect waiting for
+-- the day two of them disagree about what "warn" does.
+--
+-- The default applies to rows migration 014 already wrote, which is correct
+-- for them: a profile authored before expansion existed was authored under a
+-- read path that enforced nothing, and promoting it to block on upgrade would
+-- refuse fetches the operator never decided to refuse.
+ALTER TABLE profile_types ADD COLUMN expansion TEXT NOT NULL DEFAULT 'warn'
+    CHECK(expansion IN ('warn','block','ignore'));

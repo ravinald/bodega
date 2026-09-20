@@ -1,0 +1,1067 @@
+package server
+
+import (
+	"context"
+	"crypto/subtle"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/logging"
+	"github.com/ravinald/bodega/internal/manifest"
+)
+
+// contextKey is an unexported type for context keys in this package.
+type contextKey int
+
+const (
+	clientIPKey contextKey = iota
+	clientIPForwardedKey
+	trustedNetsKey
+	trustedNetsConfiguredKey
+	identityKey
+)
+
+// ClientIP returns the resolved client IP from the request context, falling
+// back to r.RemoteAddr if not set by RealIPMiddleware.
+func ClientIP(r *http.Request) string {
+	if ip, ok := r.Context().Value(clientIPKey).(string); ok {
+		return ip
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// NetsFunc supplies a CIDR set. It is called once per request rather than once
+// per chain build, so a list changed on a running server takes effect without
+// the handler chain being rebuilt. A nil NetsFunc yields no set at all.
+type NetsFunc func() []*net.IPNet
+
+// StaticNets wraps a fixed set for a caller with nothing to reload.
+func StaticNets(nets []*net.IPNet) NetsFunc {
+	return func() []*net.IPNet { return nets }
+}
+
+// nets calls f, tolerating a nil f.
+func (f NetsFunc) nets() []*net.IPNet {
+	if f == nil {
+		return nil
+	}
+	return f()
+}
+
+// RealIPMiddleware extracts the real client IP from reverse proxy headers
+// (X-Real-IP, X-Forwarded-For) and stores it in the request context.
+// Only trusts forwarded headers when the direct peer is in the trusted set.
+// A nil set, from a nil NetsFunc or one returning nil, means RFC 1918 +
+// loopback. A non-nil empty set means trust nobody, and the two must not be
+// collapsed: the second is an operator's answer, the first is the absence of
+// one.
+func RealIPMiddleware(trusted NetsFunc) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			trustedNets := trusted.nets()
+			configured := trustedNets != nil
+			if trustedNets == nil {
+				trustedNets = defaultTrustedNets()
+			}
+			ip, forwarded := resolveClientIP(r, trustedNets)
+			ctx := context.WithValue(r.Context(), clientIPKey, ip)
+			// Carried because an identity binding may name a host by address,
+			// and an address a peer asserted in a header is a weaker claim
+			// than the one the TCP connection made. See cidrAddressTrusted.
+			ctx = context.WithValue(ctx, clientIPForwardedKey, forwarded)
+			// Carried so every later reader of a forwarded header answers to
+			// the same trusted set this middleware resolved against. Without
+			// it requestScheme falls back to the built-in default and an
+			// operator who narrowed trusted_proxies still has X-Forwarded-Proto
+			// believed from a peer they excluded.
+			ctx = context.WithValue(ctx, trustedNetsKey, trustedNets)
+			// The provenance gate reads this rather than the ACL set, so a
+			// reload landing between the two middlewares cannot join this
+			// request's header decision to a configuration that arrived after
+			// it. See cidrAddressTrusted.
+			ctx = context.WithValue(ctx, trustedNetsConfiguredKey, configured)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// trustedNetsFor returns the trusted set RealIPMiddleware resolved for this
+// request. It falls back to the built-in default only when the middleware
+// never ran, which is the case in tests that exercise a handler directly.
+func trustedNetsFor(r *http.Request) []*net.IPNet {
+	if nets, ok := r.Context().Value(trustedNetsKey).([]*net.IPNet); ok {
+		return nets
+	}
+	return defaultTrustedNets()
+}
+
+// resolveClientIP returns the address the request should be attributed to and
+// whether it came out of a forwarded header rather than off the connection.
+// The second return is the provenance the CIDR half of the identity table
+// gates on: the peer address is whatever completed a TCP handshake, while a
+// header is whatever the peer chose to write.
+func resolveClientIP(r *http.Request, trusted []*net.IPNet) (string, bool) {
+	peerHost, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr, false
+	}
+
+	peerIP := net.ParseIP(peerHost)
+	if peerIP == nil || !isTrusted(peerIP, trusted) {
+		return peerHost, false
+	}
+
+	// Trust X-Real-IP first (set by nginx).
+	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+		return realIP, true
+	}
+
+	// Fall back to X-Forwarded-For (last entry before our trusted proxy).
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		// Walk from right to find the first non-trusted IP.
+		for i := len(parts) - 1; i >= 0; i-- {
+			ip := strings.TrimSpace(parts[i])
+			parsed := net.ParseIP(ip)
+			if parsed == nil || !isTrusted(parsed, trusted) {
+				return ip, true
+			}
+		}
+		// All IPs are trusted; return the leftmost.
+		return strings.TrimSpace(parts[0]), true
+	}
+
+	return peerHost, false
+}
+
+// clientIPForwarded reports whether ClientIP is reading an address a header
+// asserted. False when RealIPMiddleware never ran, which is the case in tests
+// that drive a handler directly: there ClientIP falls back to RemoteAddr, and
+// the connection is exactly what that address is.
+func clientIPForwarded(r *http.Request) bool {
+	forwarded, _ := r.Context().Value(clientIPForwardedKey).(bool)
+	return forwarded
+}
+
+// trustedNetsConfigured reports whether the set RealIPMiddleware believed this
+// request's header against was the operator's answer to trusted_proxies rather
+// than the built-in default. False when the middleware never ran.
+func trustedNetsConfigured(r *http.Request) bool {
+	configured, _ := r.Context().Value(trustedNetsConfiguredKey).(bool)
+	return configured
+}
+
+func isTrusted(ip net.IP, nets []*net.IPNet) bool {
+	for _, n := range nets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func defaultTrustedNets() []*net.IPNet {
+	cidrs := []string{
+		"127.0.0.0/8",
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"::1/128",
+		"fc00::/7",
+	}
+	var nets []*net.IPNet
+	for _, c := range cidrs {
+		_, n, err := net.ParseCIDR(c)
+		if err == nil {
+			nets = append(nets, n)
+		}
+	}
+	return nets
+}
+
+// ParseDenyList parses a list of CIDR strings into []*net.IPNet.
+// Bare addresses without a prefix length are treated as /32 (IPv4) or /128 (IPv6).
+func ParseDenyList(entries []string) ([]*net.IPNet, error) {
+	var nets []*net.IPNet
+	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		// If there's no slash, append the appropriate prefix length.
+		if !strings.Contains(entry, "/") {
+			ip := net.ParseIP(entry)
+			if ip == nil {
+				return nil, fmt.Errorf("invalid CIDR entry: %q", entry)
+			}
+			if ip.To4() != nil {
+				entry += "/32"
+			} else {
+				entry += "/128"
+			}
+		}
+		_, cidr, err := net.ParseCIDR(entry)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CIDR entry: %q: %w", entry, err)
+		}
+		nets = append(nets, cidr)
+	}
+	return nets, nil
+}
+
+// DenyListMiddleware rejects requests from clients whose IP falls within any
+// of the provided CIDR ranges, returning 403 Forbidden. It relies on
+// RealIPMiddleware having already resolved the client IP into the request
+// context. An empty set makes the middleware a pass-through, re-evaluated per
+// request rather than at chain build time so a first entry added to an empty
+// list is honored.
+//
+// auditDB may be nil; refusals are then logged nowhere but the journal.
+func DenyListMiddleware(denyNets NetsFunc, auditDB *audit.DB) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			nets := denyNets.nets()
+			if len(nets) == 0 {
+				next.ServeHTTP(w, r)
+				return
+			}
+			clientIP := ClientIP(r)
+			ip := net.ParseIP(clientIP)
+			if ip != nil {
+				for _, cidr := range nets {
+					if cidr.Contains(ip) {
+						recordDenial(auditDB, r, audit.DenialDenyList, nil)
+						http.Error(w, "Forbidden", http.StatusForbidden)
+						return
+					}
+				}
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// recordDenial writes one audit row for a request the server refused, so the
+// only queryable record of who was turned away does not live in a journal that
+// rotates. reason is one of the audit.Denial* constants and lands in the
+// status column; extra carries gate-specific context.
+//
+// It records no credential. A caller identifies a token by its id or by a
+// prefix of its peppered hash, never by the token itself, and no header is
+// copied into the row.
+//
+// A nil db is a no-op: the server keeps serving when the audit DB could not be
+// opened, and a denial must not become the thing that panics it.
+func recordDenial(db *audit.DB, r *http.Request, reason string, extra map[string]string) {
+	pkgType, pkgName := parseAPIPackagePath(r.URL.Path)
+	recordDenialFor(db, r, pkgType, pkgName, "", reason, extra)
+}
+
+// recordDenialFor is recordDenial for a handler that already knows which
+// package it refused. The package routes carry no /api/v1/packages/ prefix, so
+// parseAPIPackagePath would leave the subject columns empty on exactly the
+// refusals an operator would filter by package to find.
+func recordDenialFor(db *audit.DB, r *http.Request, pkgType, pkgName, pkgVersion, reason string, extra map[string]string) {
+	// ShouldRecord before the bound, not just inside Record: a server whose
+	// audit_events leaves out "denied" would otherwise serialize every 403 on
+	// denialWriteSlots to reach a write that returns immediately.
+	if db == nil || !db.ShouldRecord(audit.EventDenied) {
+		return
+	}
+	details := map[string]string{
+		"method": r.Method,
+		"path":   truncateField(r.URL.Path, maxDetailField),
+	}
+	for k, v := range extra {
+		details[k] = truncateField(v, maxDetailField)
+	}
+	blob, err := json.Marshal(details)
+	if err != nil {
+		blob = []byte("{}")
+	}
+	ctx, cancel := auditContext(r)
+	defer cancel()
+	select {
+	case denialWriteSlots <- struct{}{}:
+		defer func() { <-denialWriteSlots }()
+	case <-ctx.Done():
+		return
+	}
+	_ = db.Record(ctx, audit.Event{
+		EventType:  audit.EventDenied,
+		PkgType:    pkgType,
+		PkgName:    pkgName,
+		PkgVersion: pkgVersion,
+		ClientIP:   ClientIP(r),
+		Identity:   Identity(r),
+		UserAgent:  truncateField(r.UserAgent(), maxDetailField),
+		Status:     reason,
+		Details:    string(blob),
+	})
+}
+
+// recordVersionRefusal writes the row for a request refused by an entry's
+// version_constraint. The gomod and npm handlers answer 403 because the
+// version exists upstream and policy declines to serve it, which is a refusal
+// in the same sense the middleware gates are — and, unlike them, one an
+// operator will read as a broken client until the row names the constraint.
+func (s *Server) recordVersionRefusal(r *http.Request, pkgType, pkgName, entryVersion, reqVersion, constraint string) {
+	recordDenialFor(s.auditDB, r, pkgType, pkgName, reqVersion,
+		audit.DenialVersionConstraint, map[string]string{
+			"constraint":    constraint,
+			"entry_version": entryVersion,
+		})
+}
+
+// denialWriteSlots caps how many denial rows are being written at once. A
+// refusal is the only database write an anonymous caller controls, and it is
+// synchronous, so 64 concurrent 403s were 64 goroutines contending for SQLite's
+// single write lock: 6100 refusals/s fell to 800/s and the slowest 403 took
+// 1.6s. One slot removes the contention and restores the serial rate, and
+// because Go queues blocked channel senders in FIFO order, a caller waits only
+// on the callers ahead of it rather than on the whole flood, so 64 concurrent
+// refusals settle in ~10ms.
+//
+// One slot per process, not per Server: the bound exists because SQLite admits
+// one writer per file, and a process serves one audit database.
+//
+// Waiting for a slot is not a way to lose a row. Discovery's queue may discard
+// an observation because it is statistical; a refusal is the record of who was
+// turned away and has no second source, so a caller blocks rather than skipping
+// the write. The wait spends the auditWriteTimeout budget the write already
+// had, which keeps a wedged database from pinning goroutines and leaves the
+// only discard the one that existed before this bound: exhausting that budget.
+// A flood reaches it later than it used to, because the queue drains at the
+// serial rate instead of the contended one.
+var denialWriteSlots = make(chan struct{}, 1)
+
+// auditWriteTimeout bounds a detached audit write. Long enough to outlast the
+// SQLite busy timeout under contention, short enough that a wedged database
+// cannot pin goroutines indefinitely.
+const auditWriteTimeout = 10 * time.Second
+
+// auditContext returns a context that carries the request's values but not its
+// cancellation, bounded by auditWriteTimeout.
+//
+// net/http cancels r.Context() the moment the client closes the connection, and
+// ExecContext refuses an insert on a cancelled context. A scanner that fires a
+// request and hangs up without reading the response is ordinary behavior, so
+// writing a refusal on the request context loses the row precisely for the
+// callers the row exists to name. Server.recordLifecycle detaches for the same
+// reason.
+func auditContext(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(r.Context()), auditWriteTimeout)
+}
+
+// hashPrefix is the leading bytes of a peppered token hash, enough to tell two
+// rejected credentials apart in the audit trail and far too little to attack
+// the hash with.
+func hashPrefix(hash string) string {
+	const n = 12
+	if len(hash) <= n {
+		return hash
+	}
+	return hash[:n]
+}
+
+// maxDetailField caps every client-controlled string copied into an audit row.
+// A denial is written before any handler has validated the request, so path,
+// User-Agent and package name here are whatever the caller sent: unbounded,
+// they let an unauthenticated stranger choose how much disk each 403 costs.
+const maxDetailField = 256
+
+func truncateField(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
+}
+
+// parseAPIPackagePath pulls the type and name out of /api/v1/packages/{type}
+// and /api/v1/packages/{type}/{name}. The mutation gate runs before the mux,
+// so r.PathValue is empty there and a denial would otherwise carry no subject.
+func parseAPIPackagePath(path string) (pkgType, pkgName string) {
+	rest, ok := strings.CutPrefix(path, "/api/v1/packages/")
+	if !ok {
+		return "", ""
+	}
+	parts := strings.Split(rest, "/")
+	pkgType = truncateField(parts[0], maxDetailField)
+	if len(parts) > 1 {
+		pkgName = truncateField(parts[1], maxDetailField)
+	}
+	return pkgType, pkgName
+}
+
+// maxBodyCapture is the maximum number of bytes captured from request/response
+// bodies at Trace level.
+const maxBodyCapture = 64 * 1024
+
+// RequestLogger returns middleware that logs HTTP requests using the provided
+// slog.Logger. The amount of detail depends on the logger's configured level:
+//
+//   - Info:  method, path, status, duration, bytes, client IP
+//   - Debug: + request headers, response headers
+//   - Trace: + request body, response body (capped at 64KB, skips binary)
+func RequestLogger(logger *slog.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Skip health checks.
+			if r.URL.Path == "/healthz" {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			start := time.Now()
+
+			// Capture request body at Trace level.
+			var reqBody []byte
+			if logger.Enabled(r.Context(), logging.LevelTrace) && r.Body != nil && !isBinaryContentType(r.Header.Get("Content-Type")) {
+				reqBody, _ = io.ReadAll(io.LimitReader(r.Body, maxBodyCapture))
+				r.Body = io.NopCloser(io.MultiReader(
+					strings.NewReader(string(reqBody)),
+					r.Body,
+				))
+			}
+
+			rec := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
+
+			// Capture response body at Trace level.
+			if logger.Enabled(r.Context(), logging.LevelTrace) {
+				rec.captureBody = true
+			}
+
+			next.ServeHTTP(rec, r)
+
+			duration := time.Since(start)
+			clientIP := ClientIP(r)
+
+			// Info level: basic request details.
+			if !logger.Enabled(r.Context(), slog.LevelInfo) {
+				return
+			}
+			attrs := []slog.Attr{
+				slog.String("method", r.Method),
+				slog.String("path", r.URL.Path),
+				slog.Int("status", rec.statusCode),
+				slog.String("duration", formatDuration(duration)),
+				slog.Int("bytes", rec.size),
+				slog.String("client", clientIP),
+			}
+
+			// Debug level: add headers.
+			if logger.Enabled(r.Context(), slog.LevelDebug) {
+				attrs = append(attrs,
+					slog.String("req_headers", formatHeaders(r.Header)),
+					slog.String("resp_headers", formatHeaders(rec.Header())),
+				)
+			}
+
+			// Trace level: add bodies.
+			if logger.Enabled(r.Context(), logging.LevelTrace) {
+				if len(reqBody) > 0 {
+					attrs = append(attrs, slog.String("req_body", redactBody(r.Header.Get("Content-Type"), reqBody)))
+				}
+				if rec.captureBody && len(rec.body) > 0 && !isBinaryContentType(rec.Header().Get("Content-Type")) {
+					attrs = append(attrs, slog.String("resp_body", redactBody(rec.Header().Get("Content-Type"), rec.body)))
+				}
+			}
+
+			logger.LogAttrs(r.Context(), slog.LevelInfo, "http request", attrs...)
+		})
+	}
+}
+
+// responseRecorder wraps http.ResponseWriter to capture the status code,
+// response size, and optionally the response body.
+type responseRecorder struct {
+	http.ResponseWriter
+	statusCode  int
+	size        int
+	captureBody bool
+	body        []byte
+}
+
+func (r *responseRecorder) WriteHeader(code int) {
+	r.statusCode = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *responseRecorder) Write(b []byte) (int, error) {
+	n, err := r.ResponseWriter.Write(b)
+	r.size += n
+	if r.captureBody && len(r.body) < maxBodyCapture {
+		remaining := maxBodyCapture - len(r.body)
+		if n < remaining {
+			remaining = n
+		}
+		r.body = append(r.body, b[:remaining]...)
+	}
+	return n, err
+}
+
+// Flush implements http.Flusher for streaming responses.
+func (r *responseRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// redactedHeaders names the headers whose value is a credential. The name
+// survives, so a debug log still answers "did this client send one"; the value
+// never reaches the file, because these are the exact secrets bodega hands out.
+//
+// Read-path identity is what makes this a leak rather than a curiosity. Before
+// it, the only Authorization headers arriving were operator mutations; now
+// every package GET can carry a token and `bodega doctor --write-credentials`
+// puts one on eight client hosts. The tokens are unscoped, so a token in a log
+// the journal group can read is a write credential (docs/threat-model.md).
+// recordDenial states the same position for audit rows: no header is copied
+// into one.
+//
+// Lowercase keys, matched after folding: http.Header canonicalizes what it
+// parses, but formatHeaders is also handed response headers, which a handler
+// may have set through the map directly.
+var redactedHeaders = map[string]bool{
+	"authorization":       true,
+	"proxy-authorization": true,
+	"cookie":              true,
+	"set-cookie":          true,
+}
+
+// redactedValue replaces a credential rather than shortening it. A prefix or a
+// hash would still be reversible against a token whose alphabet and length are
+// published, which defeats the point of not writing it down.
+const redactedValue = "[redacted]"
+
+func formatHeaders(h http.Header) string {
+	var sb strings.Builder
+	for k, vs := range h {
+		redact := redactedHeaders[strings.ToLower(k)]
+		for _, v := range vs {
+			if sb.Len() > 0 {
+				sb.WriteString("; ")
+			}
+			sb.WriteString(k)
+			sb.WriteString(": ")
+			if redact {
+				sb.WriteString(redactedValue)
+				continue
+			}
+			sb.WriteString(v)
+		}
+	}
+	return sb.String()
+}
+
+func formatDuration(d time.Duration) string {
+	if d < time.Millisecond {
+		return fmt.Sprintf("%.0fµs", float64(d.Microseconds()))
+	}
+	if d < time.Second {
+		return fmt.Sprintf("%.1fms", float64(d.Microseconds())/1000)
+	}
+	return fmt.Sprintf("%.2fs", d.Seconds())
+}
+
+// AuditMiddleware records package fetch events to the audit database.
+// It only records events for package-serving routes (not /healthz or /api/v1/*).
+// The audit DB may be nil, in which case the middleware is a no-op.
+func AuditMiddleware(db *audit.DB) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		if db == nil {
+			return next
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			path := r.URL.Path
+
+			// Skip non-package routes.
+			if path == "/healthz" || strings.HasPrefix(path, "/api/") {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			start := time.Now()
+			rec := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
+			next.ServeHTTP(rec, r)
+			duration := time.Since(start)
+
+			// Only audit successful package fetches.
+			if rec.statusCode < 200 || rec.statusCode >= 400 {
+				return
+			}
+
+			pkgType, pkgName, pkgVersion := parsePackagePath(path)
+			if pkgType == "" {
+				return
+			}
+
+			// 404s on package routes are deliberately not recorded: the
+			// guard above has already discarded them, and apt probes several
+			// optional index paths on every update, so recording them would
+			// bury the fetches under noise no operator asked about.
+			_ = db.Record(r.Context(), audit.Event{
+				EventType:  audit.EventServeFetch,
+				PkgType:    pkgType,
+				PkgName:    pkgName,
+				PkgVersion: pkgVersion,
+				ClientIP:   ClientIP(r),
+				Identity:   Identity(r),
+				UserAgent:  r.UserAgent(),
+				Status:     "success",
+				DurationMs: duration.Milliseconds(),
+			})
+		})
+	}
+}
+
+// parsePackagePath extracts package type, name, and version from a request path.
+func parsePackagePath(path string) (pkgType, pkgName, pkgVersion string) {
+	switch {
+	case strings.HasPrefix(path, "/apt/"):
+		return "apt", strings.TrimPrefix(path, "/apt/"), ""
+	case strings.HasPrefix(path, "/pypi/wheels/"):
+		filename := strings.TrimPrefix(path, "/pypi/wheels/")
+		parts := strings.SplitN(filename, "-", 3)
+		if len(parts) >= 2 {
+			return "pypi", parts[0], parts[1]
+		}
+		return "pypi", filename, ""
+	case strings.HasPrefix(path, "/pypi/simple/"):
+		name := strings.Trim(strings.TrimPrefix(path, "/pypi/simple/"), "/")
+		return "pypi", name, ""
+	case strings.HasPrefix(path, "/git/"):
+		parts := strings.SplitN(strings.TrimPrefix(path, "/git/"), "/", 2)
+		return "git", parts[0], ""
+	case strings.HasPrefix(path, "/binaries/"):
+		parts := strings.SplitN(strings.TrimPrefix(path, "/binaries/"), "/", 3)
+		if len(parts) >= 2 {
+			return "binary", parts[0], parts[1]
+		}
+		return "binary", strings.TrimPrefix(path, "/binaries/"), ""
+	case strings.HasPrefix(path, "/go/"):
+		full := strings.TrimPrefix(path, "/go/")
+		if idx := strings.Index(full, "/@v/"); idx >= 0 {
+			module := full[:idx]
+			file := full[idx+4:]
+			// Extract version from filename (e.g., "v1.30.0.zip" → "v1.30.0")
+			if dot := strings.LastIndex(file, "."); dot > 0 && file != "list" {
+				return "gomod", module, file[:dot]
+			}
+			return "gomod", module, ""
+		}
+		return "gomod", full, ""
+	case strings.HasPrefix(path, "/helm/charts/"):
+		filename := strings.TrimPrefix(path, "/helm/charts/")
+		base, isChart := strings.CutSuffix(filename, ".tgz")
+		if !isChart {
+			return "helm", filename, ""
+		}
+		// The same two lines handleHelmChart runs, so the serve_fetch event
+		// names the chart and version the request path resolved. A rule of its
+		// own here recorded "cert-manager-1.14.0" at "rc.1" for a request the
+		// handler served as cert-manager 1.14.0-rc.1.
+		_, name, version := manifest.ParseKey(manifest.HelmChartKey(base, ""))
+		return "helm", name, version
+	case strings.HasPrefix(path, "/helm/"):
+		return "helm", "index", ""
+	case strings.HasPrefix(path, "/npm/"):
+		full := strings.TrimPrefix(path, "/npm/")
+		if idx := strings.Index(full, "/-/"); idx >= 0 {
+			// Anchored on the package name, the way handleNpm derives the
+			// version it stores under. Splitting at the last "-" instead read
+			// "cli-1.0.0-rc.1.tgz" as version "rc.1", so the audit event named
+			// a version the object key does not carry.
+			pkgName := full[:idx]
+			return "npm", pkgName, npmVersionFromTarball(pkgName, full[idx+3:])
+		}
+		return "npm", full, ""
+	case strings.HasPrefix(path, "/cargo/"):
+		full := strings.TrimPrefix(path, "/cargo/")
+		// Crate download: <crate>/<version>/download
+		if strings.HasSuffix(full, "/download") {
+			parts := strings.SplitN(strings.TrimSuffix(full, "/download"), "/", 2)
+			if len(parts) == 2 {
+				return "cargo", parts[0], parts[1]
+			}
+		}
+		// Sparse index lookup: trailing path segment is the crate name.
+		parts := strings.Split(full, "/")
+		return "cargo", parts[len(parts)-1], ""
+	}
+	return "", "", ""
+}
+
+// LocalhostOnly returns true if every entry in nets is a loopback range. It is
+// the test that decides whether the mutation API requires a Bearer token, so
+// `bodega acl` answers it the same way the middleware does rather than
+// re-deriving it.
+func LocalhostOnly(nets []*net.IPNet) bool {
+	for _, n := range nets {
+		if !n.IP.IsLoopback() {
+			return false
+		}
+	}
+	return true
+}
+
+// MutationAuthMiddleware restricts POST and DELETE requests to clients in the
+// admin allow-list. When that list extends beyond localhost, a valid Bearer
+// token is required, verified via SHA-256(token + pepper) against the
+// hashes stored in the audit DB.
+//
+// Both the allow-list and the localhost-only test are evaluated per request:
+// widening the list is exactly what turns the token requirement on, so a set
+// captured at chain build time would leave a widened server still admitting
+// unauthenticated mutations until it restarted.
+//
+// GET/HEAD/OPTIONS requests pass through unconditionally: the read path is
+// open by design, not because a client could not authenticate. Every one of
+// the eight can (see credentialFrom), and IdentityMiddleware reads what they
+// send to attribute the request; what may be fetched is a separate question
+// this gate does not ask. The exceptions are the four admin reads, which
+// Server.requireAdmin gates with the same AdminPermits predicate this uses.
+func MutationAuthMiddleware(admin NetsFunc, auditDB *audit.DB, pepper string, logger *slog.Logger) func(http.Handler) http.Handler {
+	// Cache token hashes to avoid per-request DB queries.
+	var cachedHashes []audit.TokenHash
+	var cacheTime time.Time
+	const cacheTTL = 30 * time.Second
+
+	loadHashes := func() []audit.TokenHash {
+		if time.Since(cacheTime) < cacheTTL && cachedHashes != nil {
+			return cachedHashes
+		}
+		if auditDB == nil {
+			return nil
+		}
+		hashes, err := auditDB.GetTokenHashes(context.Background())
+		if err != nil {
+			logger.Error("failed to load token hashes", "error", err)
+			return cachedHashes // return stale cache on error
+		}
+		cachedHashes = hashes
+		cacheTime = time.Now()
+		return hashes
+	}
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost && r.Method != http.MethodDelete && r.Method != http.MethodPatch {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if isGitUploadPack(r) {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// Check IP against admin_permit_cidr.
+			clientIP := net.ParseIP(ClientIP(r))
+			if clientIP == nil {
+				logger.Warn("mutation blocked: unparseable client IP", "remote", r.RemoteAddr)
+				recordDenial(auditDB, r, audit.DenialUnparseableIP, nil)
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+			adminNets := admin.nets()
+			if !AdminPermits(adminNets, clientIP) {
+				logger.Warn("mutation blocked: IP not in admin_permit_cidr",
+					"client_ip", clientIP.String(), "method", r.Method, "path", r.URL.Path)
+				recordDenial(auditDB, r, audit.DenialIPNotPermitted, nil)
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+
+			// If the allow-list goes beyond localhost, require a valid Bearer token.
+			if !LocalhostOnly(adminNets) {
+				hashes := loadHashes()
+				if len(hashes) == 0 {
+					logger.Warn("mutation blocked: no tokens configured for remote access",
+						"client_ip", clientIP.String())
+					recordDenial(auditDB, r, audit.DenialNoTokens, nil)
+					http.Error(w, "Unauthorized — no tokens configured", http.StatusUnauthorized)
+					return
+				}
+
+				auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+				if auth == "" || auth == r.Header.Get("Authorization") {
+					// No Bearer prefix or empty token.
+					logger.Warn("mutation blocked: no bearer credential",
+						"client_ip", clientIP.String(), "method", r.Method, "path", r.URL.Path)
+					recordDenial(auditDB, r, audit.DenialTokenMissing, nil)
+					http.Error(w, "Unauthorized", http.StatusUnauthorized)
+					return
+				}
+
+				// Hash the incoming token with pepper and compare.
+				incoming := audit.HashToken(auth, pepper)
+
+				var matched *audit.TokenHash
+				for i := range hashes {
+					if subtle.ConstantTimeCompare([]byte(incoming), []byte(hashes[i].Hash)) == 1 {
+						matched = &hashes[i]
+						break
+					}
+				}
+
+				if matched == nil {
+					logger.Warn("mutation blocked: invalid token",
+						"client_ip", clientIP.String(), "method", r.Method, "path", r.URL.Path)
+					// A prefix of the peppered hash, never the credential: it
+					// correlates a repeat caller across rows and is not
+					// replayable without the pepper.
+					recordDenial(auditDB, r, audit.DenialTokenInvalid,
+						map[string]string{"hash_prefix": hashPrefix(incoming)})
+					http.Error(w, "Unauthorized", http.StatusUnauthorized)
+					return
+				}
+
+				// Check expiry.
+				if matched.ExpiresAt != nil && matched.ExpiresAt.Before(time.Now()) {
+					logger.Warn("mutation blocked: token expired",
+						"token_id", matched.ID, "client_ip", clientIP.String())
+					recordDenial(auditDB, r, audit.DenialTokenExpired,
+						map[string]string{
+							"token_id":   matched.ID,
+							"expired_at": matched.ExpiresAt.UTC().Format(time.RFC3339),
+						})
+					http.Error(w, "Unauthorized — token expired", http.StatusUnauthorized)
+					return
+				}
+
+				// Update last_used asynchronously.
+				if auditDB != nil {
+					go func(id string) {
+						_ = auditDB.UpdateTokenLastUsed(context.Background(), id)
+					}(matched.ID)
+				}
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// SecurityHeadersMiddleware adds standard security headers to every response.
+//
+// HSTS follows externalScheme rather than r.TLS. A deployment behind a
+// terminating proxy has r.TLS nil on every request while every client speaks
+// https, so gating on the listener sent the header nowhere it was needed and
+// left the documented https deployment with no HSTS at all. publicScheme may
+// be nil for a caller with no configuration in hand.
+func SecurityHeadersMiddleware(publicScheme func() string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			h := w.Header()
+			h.Set("X-Content-Type-Options", "nosniff")
+			h.Set("X-Frame-Options", "DENY")
+			h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+			h.Set("Content-Security-Policy",
+				"default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'")
+			configured := ""
+			if publicScheme != nil {
+				configured = publicScheme()
+			}
+			if externalScheme(r, configured) == "https" {
+				h.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func isBinaryContentType(ct string) bool {
+	if ct == "" {
+		return false
+	}
+	ct = strings.ToLower(ct)
+	return strings.HasPrefix(ct, "application/octet-stream") ||
+		strings.HasPrefix(ct, "application/zip") ||
+		strings.HasPrefix(ct, "application/gzip") ||
+		strings.HasPrefix(ct, "application/x-") ||
+		strings.HasPrefix(ct, "image/") ||
+		strings.HasPrefix(ct, "audio/") ||
+		strings.HasPrefix(ct, "video/") ||
+		strings.Contains(ct, "debian")
+}
+
+// requestScheme reports the scheme the client used, which is not always the
+// one this listener answered on. Behind a TLS-terminating proxy r.TLS is nil
+// on every request, so reading it alone prints http:// for a deployment that
+// is https everywhere a client can see.
+//
+// X-Forwarded-Proto is honored only from a trusted peer, on the same rule
+// resolveClientIP applies to X-Real-IP: a header any client can set decides
+// nothing by itself. An untrusted peer gets the listener's own answer.
+func requestScheme(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+	proto := r.Header.Get("X-Forwarded-Proto")
+	if proto == "" || !peerIsTrusted(r, trustedNetsFor(r)) {
+		return "http"
+	}
+	if i := strings.Index(proto, ","); i >= 0 {
+		proto = proto[:i]
+	}
+	switch p := strings.ToLower(strings.TrimSpace(proto)); p {
+	case "http", "https":
+		return p
+	}
+	return "http"
+}
+
+// externalScheme reports the scheme clients use to reach this server.
+//
+// public_url outranks the request: only the operator knows the name a proxy
+// publishes, and a request answers for the listener it arrived on. With none
+// set the request answers for itself, which honors X-Forwarded-Proto from a
+// trusted peer and nothing from anyone else.
+func externalScheme(r *http.Request, configured string) string {
+	if configured != "" {
+		return configured
+	}
+	return requestScheme(r)
+}
+
+// peerIsTrusted reports whether the direct peer is one of nets, ignoring every
+// forwarded header. It answers "may this connection speak for another".
+func peerIsTrusted(r *http.Request, nets []*net.IPNet) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && isTrusted(ip, nets)
+}
+
+// isGitUploadPack reports whether a request is the read half of a git clone.
+//
+// The verb is the only thing this middleware can see, and git smart-HTTP puts
+// a read behind a POST: pack negotiation does not fit in a URL. Gating it as a
+// mutation would mean every `git clone` needs an admin token, which is not what
+// a read-only mirror is for.
+//
+// git-receive-pack is deliberately not exempt. A push arrives as a POST and
+// meets the admin gate here, ahead of the handler's own refusal and the
+// http.receivepack=false in every mirror.
+func isGitUploadPack(r *http.Request) bool {
+	return r.Method == http.MethodPost &&
+		strings.HasPrefix(r.URL.Path, "/git/") &&
+		strings.HasSuffix(r.URL.Path, "/git-upload-pack")
+}
+
+// redactedBodyKeys are the JSON keys whose values are credentials. Matched
+// case-insensitively at any depth.
+//
+// Keyed rather than routed on purpose. POST /api/v1/tokens returns the
+// plaintext token in its body because that is the one moment it can be read
+// (handleCreateToken), and a route list would have to be extended by whoever
+// later adds a route returning a signing key or a session — which is the
+// remembering that put the token in the journal in the first place. The key
+// travels with the value.
+var redactedBodyKeys = map[string]bool{
+	"token":         true,
+	"access_token":  true,
+	"refresh_token": true,
+	"secret":        true,
+	"password":      true,
+	"private_key":   true,
+	"signing_key":   true,
+	"session":       true,
+}
+
+// redactBody renders a captured body for the trace log with credential values
+// replaced.
+//
+// A well-formed JSON body is decoded and walked, which is exact. One that does
+// not decode is scrubbed textually against the same key set rather than
+// withheld: maxBodyCapture truncates at 64KB and a handler may answer with a
+// JSON content type over something that is not JSON, and both are cases trace
+// level exists to show. Withholding them would leave the operator debugging a
+// malformed request with nothing to look at. The textual pass matches the key,
+// which on a truncated document is still present ahead of the value it names.
+//
+// Non-JSON bodies pass through, which is what every body did before this.
+func redactBody(contentType string, body []byte) string {
+	if !isJSONContentType(contentType) {
+		return string(body)
+	}
+	var v any
+	if err := json.Unmarshal(body, &v); err == nil {
+		if out, mErr := json.Marshal(redactJSONValue(v)); mErr == nil {
+			return string(out)
+		}
+	}
+	return string(credentialKeyPattern.ReplaceAll(body, []byte(`"${1}":"`+redactedValue+`"`)))
+}
+
+// credentialKeyPattern matches a JSON credential key and whatever follows it up
+// to the end of its string value, tolerating a value the capture cut short. It
+// is the fallback for a body json.Unmarshal refused; the decoded walk is what
+// runs when there is a document to walk.
+var credentialKeyPattern = regexp.MustCompile(`(?i)"(` + redactedKeyAlternation() + `)"\s*:\s*"(?:[^"\\]|\\.)*"?`)
+
+// redactedKeyAlternation renders redactedBodyKeys as a regexp alternation,
+// longest first so a prefix key cannot shadow a longer one.
+func redactedKeyAlternation() string {
+	keys := make([]string, 0, len(redactedBodyKeys))
+	for k := range redactedBodyKeys {
+		keys = append(keys, regexp.QuoteMeta(k))
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if len(keys[i]) != len(keys[j]) {
+			return len(keys[i]) > len(keys[j])
+		}
+		return keys[i] < keys[j]
+	})
+	return strings.Join(keys, "|")
+}
+
+// redactJSONValue walks a decoded JSON document replacing the values of
+// redactedBodyKeys. Nested objects and arrays are walked, because a credential
+// nested under a wrapper is the same credential.
+func redactJSONValue(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, val := range t {
+			if redactedBodyKeys[strings.ToLower(k)] {
+				out[k] = redactedValue
+				continue
+			}
+			out[k] = redactJSONValue(val)
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, val := range t {
+			out[i] = redactJSONValue(val)
+		}
+		return out
+	}
+	return v
+}
+
+// isJSONContentType reports whether a Content-Type names a JSON body, covering
+// the +json structured-suffix forms an API may answer with.
+func isJSONContentType(ct string) bool {
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	ct = strings.ToLower(strings.TrimSpace(ct))
+	return ct == "application/json" || ct == "text/json" || strings.HasSuffix(ct, "+json")
+}

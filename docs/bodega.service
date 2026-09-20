@@ -1,0 +1,176 @@
+# Systemd unit for bodega
+#
+# Copy to /etc/systemd/system/bodega.service and edit User, paths,
+# and environment to match your install. The service account and the two
+# writable directories have to exist first; nothing here creates them:
+#
+#   sudo useradd --system --home-dir /var/lib/bodega --shell /usr/sbin/nologin bodega
+#   sudo mkdir -p /etc/bodega /var/lib/bodega /var/log/bodega
+#
+# Write the config and generate the signing key (see LoadCredential= below),
+# then hand both trees to the service account last:
+#
+#   sudo chown -R bodega:bodega /var/lib/bodega /var/log/bodega
+#   sudo chown root:bodega /etc/bodega/config.json
+#   sudo chmod 0640 /etc/bodega/config.json
+#
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now bodega
+#   journalctl -u bodega -f
+#
+# The order and the -R both carry weight. Any bodega command run as root seeds
+# state this service then has to open: /etc/bodega/config.json arrives mode 0600
+# root:root, and /var/log/bodega/audit.db arrives root-owned even when the
+# directory around it already belongs to bodega. Chowning the trees before those
+# commands run, or without -R, leaves the files behind and the start fails on one
+# of
+#
+#   Error: read config /etc/bodega/config.json: open ...: permission denied
+#   Error: audit db /var/log/bodega/audit.db is not writable by this process
+#   (uid 999): every denial, fetch and lifecycle row would be dropped with no
+#   error anywhere.
+#
+# Mode 0640 root:bodega is the config's resting state: the running server only
+# reads it, and the commands that edit it still want root.
+#
+# /etc/bodega/pepper is the third file this pass would cover and the one that
+# arrives late. `bodega token generate` writes it, after the chowns above have
+# run, and every API token is hashed against it.
+#
+# It is on no chown line above because it needs none. A new pepper lands mode
+# 0640 owned by root, in the group this unit runs the server in: `Group=` where
+# it names one, and the `User=` account's primary group where it does not or
+# where a drop-in clears it. Root keeps the write, the service group gets the
+# read, and nothing wider can see the key behind every token hash on the box.
+# `systemctl edit bodega` moves the account and the pepper follows it.
+#
+# Where the account cannot be handed the file — this unit names a user that
+# does not exist, or /etc/bodega refuses it — `bodega token generate` fails
+# instead of printing a token, because a token keyed on a pepper the server
+# cannot open is answered
+#
+#   401 mutation blocked: invalid token
+#
+# which names the credential and not the file, so the operator re-mints and
+# meets the same 401.
+#
+# A pepper already on disk from before that check existed is caught on the same
+# path: the mint verifies what it loaded, not only what it wrote. And a server
+# that meets one refuses to start rather than reaching for the pepper under its
+# own home:
+#
+#   Error: pepper /etc/bodega/pepper exists and this process (uid 999) cannot
+#   read it: every token minted against it is refused with "invalid token",
+#   which names the credential rather than this file.
+#
+# Falling back is how the same install used to answer 401 to every token the
+# admin minted with nothing in the journal naming a file. `bodega doctor`
+# reports the same mismatch, against the account this unit names, with the
+# chown to run.
+#
+# Recommended config.json additions when running under systemd:
+#
+#   "log_level": 1   (Warn: quiet by default, noisy on trouble;
+#                     raise to 2 for access logs when debugging)
+#   "listen_addr": ":8080"
+#
+# Override either with --addr on ExecStart or BODEGA_LISTEN_ADDR= below.
+#
+# TLS is not optional by omission. With "tls_cert" and "tls_key" both empty,
+# bodega refuses to bind and the unit fails on start rather than answering in
+# the clear on whatever "listen_addr" names. Pick one:
+#
+#   "tls_cert": "/etc/bodega/cert.pem", "tls_key": "/etc/bodega/key.pem"
+#   "allow_plaintext": true    (loopback behind a proxy that terminates TLS —
+#                               set "public_url" too, or every client snippet
+#                               bodega emits describes the back end)
+#
+# Setting one of tls_cert/tls_key without the other is an error either way.
+# Append --allow-plaintext=false to ExecStart to pin this host to TLS
+# regardless of what the config file says.
+
+[Unit]
+Description=bodega package repository server
+Documentation=https://github.com/ravinald/bodega
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Type=notify requires the bodega binary to send READY=1 on the
+# $NOTIFY_SOCKET once the listener is up; the built-in sd_notify
+# support does this automatically.
+Type=notify
+
+User=bodega
+Group=bodega
+
+# Without this, relative paths resolve against / — which ProtectSystem=strict
+# makes read-only. bodega's own manifest_dir default is absolute, so this only
+# guards a relative path an operator writes into config.json by hand.
+#
+# A hand-written relative manifest_dir with no WorkingDirectory= is a start
+# failure now, not a silent empty repository: serve creates the manifest root
+# when it can and refuses the start when it cannot, and /manifests under
+# ProtectSystem=strict is the second case.
+WorkingDirectory=/var/lib/bodega
+
+ExecStart=/usr/local/bin/bodega serve
+# SIGHUP reloads the manifests, re-reads the apt signing key, and re-reads the
+# CIDR access lists (admin_permit_cidr, deny_list, trusted_proxies) from the
+# audit database. The key rotation runbook in docs/usage.md calls this twice and
+# depends on both of the first two.
+#
+# It does NOT re-read this file or config.json. Nothing else in config.json is
+# reloadable, so a change to one of those keys still needs a restart. The access
+# lists reach a running server on their own within 30 seconds; this signal is
+# how you get them there at once.
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Point bodega at the system config. Listen address and log level live
+# inside that file so this unit doesn't need to know about them.
+Environment=BODEGA_CONFIG_FILE=/etc/bodega/config.json
+
+# APT repository signing key. systemd copies the source file into a
+# per-service tmpfs at $CREDENTIALS_DIRECTORY, mode 0400, owned by this
+# service: the unit cannot write it back and no other service can read it.
+# bodega searches $CREDENTIALS_DIRECTORY first, so this wins over
+# /etc/bodega/apt-signing.key with no config change.
+#
+# The source file must be mode 0600 or tighter — bodega refuses to load a key
+# readable beyond its owner. The copy under $CREDENTIALS_DIRECTORY is exempt
+# and has to be: systemd writes it 0440 root:root with an ACL, on a read-only
+# tmpfs, so 0600 is a mode nothing there can set. What systemd guarantees for
+# that directory is stronger anyway — per-service, mode 0700, root-owned, and
+# unreadable by any other unit.
+#
+#   sudo bodega apt key generate
+#   sudo chown root:root /etc/bodega/apt-signing.key
+#
+# Serving the repository unsigned is supported — signed and unsigned coexist at
+# the same URLs — but it takes two steps, not one. Commenting out LoadCredential=
+# only drops the key out of the search order's first position; /etc/bodega is
+# the second, and a root-owned 0600 key this service cannot open is an error
+# rather than an absence, logged as "apt signing key present but unusable" on
+# every start. Move the key aside as well:
+#
+#   sudo mv /etc/bodega/apt-signing.key /etc/bodega/apt-signing.key.disabled
+#
+LoadCredential=apt-signing.key:/etc/bodega/apt-signing.key
+
+Restart=on-failure
+RestartSec=5s
+
+# Generous start timeout: storage backend probing (S3 head on the
+# bucket) happens before READY=1, and a cold IAM/KMS path can take
+# a minute on occasion. Adjust down if you're running locally.
+TimeoutStartSec=180
+
+# Hardening. Safe defaults; relax only if your install has a reason.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/bodega /var/log/bodega
+
+[Install]
+WantedBy=multi-user.target

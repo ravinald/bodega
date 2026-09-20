@@ -1,0 +1,1 @@
+[{"name": "build", "version": "1.4.2"}, {"name": "certifi", "version": "2026.7.22"}, {"name": "ndiff", "version": "7.991"}, {"name": "packaging", "version": "26.0"}, {"name": "pillow", "version": "12.3.0"}, {"name": "pip", "version": "26.2.1"}, {"name": "pyproject_hooks", "version": "1.2.0"}, {"name": "ruff", "version": "0.15.8"}, {"name": "wheel", "version": "0.47.0"}]

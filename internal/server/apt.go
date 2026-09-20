@@ -1,0 +1,1775 @@
+package server
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"path"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+
+	"compress/gzip"
+	"net/http"
+
+	"github.com/ravinald/bodega/internal/aptsign"
+	"github.com/ravinald/bodega/internal/aptsources"
+	"github.com/ravinald/bodega/internal/entitle"
+	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/storage"
+)
+
+// ---- APT repository (dynamic index generation) ----------------------------
+
+// handleAptPool serves a .deb from the pool, from storage or from a mirrored
+// upstream.
+//
+// The pool tree is shared: a .deb bodega built from source and one cached from
+// an upstream archive land under the same key space, which is correct Debian
+// design and is why aptPoolIsLocal exists. A path a manifest entry owns is
+// never fetched — see that function for what caching over one would do to the
+// SHA256 the entry already published.
+func (s *Server) handleAptPool(w http.ResponseWriter, r *http.Request) {
+	p := r.PathValue("path")
+	if !isSafePath(p) {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+	poolPath := "pool/" + p
+	// The backstop, and the one route where the profile predicate is not the
+	// control: apt_profile.go states why the filtered index carries that
+	// weight for apt and this does not.
+	gated := s.aptGatesPool(r)
+	if gated && !s.aptPoolGate(w, r, poolPath) {
+		return
+	}
+	// Wrapped rather than set: the outcome is not known here, and a refusal
+	// that ships a year-long "immutable" outlives the policy change that would
+	// have corrected it. Covers handleAptMirrorPool below, which inherits w.
+	//
+	// Decided on a server fact, never on the requesting host's own profile.
+	// Every host is served the same .deb — the filtered index decides what a
+	// host is told exists, not which bytes it gets — but a shared cache holding
+	// a public copy answers a refused host out of somebody else's fetch, with
+	// the request never reaching the predicate above. Gated on the requester,
+	// the somebody else is an unidentified host: every host before it is bound,
+	// and every host whose profile states no apt rule, both of which keep
+	// reaching this route ungated by design. So the moment any profile on this
+	// instance governs apt, the whole route loses the shared grant. An instance
+	// where none does keeps it, because there is no refusal for a proxy to
+	// overturn.
+	// Not the filtered codenames served: every fail-closed path in
+	// apt_profile.go withdraws one and leaves the predicate refusing.
+	if s.aptScopedAnywhere() {
+		w = cachePrivateOn200(w, path.Base(p))
+	} else {
+		w = cacheSharedImmutableOn200(w, path.Base(p))
+	}
+	store, err := s.aptPoolStore(poolPath)
+	if err != nil {
+		s.logger.Error("storage backend recorded for pooled .deb is not configured",
+			"pool_path", p, "error", err)
+		http.Error(w, "storage backend error", http.StatusBadGateway)
+		return
+	}
+	if len(s.cfg.AptUpstreams) == 0 || s.aptPoolIsLocal(poolPath) {
+		s.proxyS3(w, r, store, manifest.AptKey(poolPath))
+		return
+	}
+	s.handleAptMirrorPool(w, r, poolPath, store)
+}
+
+// aptPoolStore resolves a pooled .deb to the backend recorded for its version.
+//
+// A .deb is addressed by pool path, so unlike every other artifact route there
+// is no package and version in the request to look the entry up by. The
+// snapshot carries the reverse mapping instead, built from the same
+// _pool_path metadata the Packages generator reads.
+func (s *Server) aptPoolStore(poolPath string) (storage.ObjectStore, error) {
+	if s.stores == nil {
+		return nil, nil
+	}
+	if snap := s.aptSnap.Load(); snap != nil {
+		if name := snap.poolStorage[poolPath]; name != "" {
+			return s.stores.ByName(name)
+		}
+	}
+	return s.stores.ForType(manifest.TypeApt), nil
+}
+
+// handleAptDists routes /apt/dists/{distpath...} to the appropriate handler
+// based on the path structure. Go's ServeMux doesn't support mid-segment
+// wildcards like "binary-{arch}", so we parse the path here.
+func (s *Server) handleAptDists(w http.ResponseWriter, r *http.Request) {
+	distpath := r.PathValue("distpath")
+	if !isSafePath(distpath) {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+	parts := strings.Split(distpath, "/")
+
+	// A mirrored codename is served entirely from upstream and never reaches
+	// the generated snapshot below. config.Load refuses a codename in both
+	// sets, so this branch cannot shadow a suite bodega signs.
+	if len(parts) >= 2 && s.cfg.MirrorsAptCodename(parts[0]) {
+		s.handleAptMirrorDists(w, r, parts[0], strings.Join(parts[1:], "/"))
+		return
+	}
+
+	if len(parts) == 2 {
+		switch parts[1] {
+		case "Release":
+			s.handleAptRelease(w, r, parts[0])
+			return
+		case "InRelease":
+			s.handleAptSigned(w, r, parts[0], "InRelease")
+			return
+		case "Release.gpg":
+			s.handleAptSigned(w, r, parts[0], "Release.gpg")
+			return
+		}
+	}
+
+	// <suite>/<component>/binary-<arch>/Packages[.gz]
+	if len(parts) == 4 && strings.HasPrefix(parts[2], "binary-") {
+		suite := parts[0]
+		component := parts[1]
+		arch := strings.TrimPrefix(parts[2], "binary-")
+		file := parts[3]
+		switch file {
+		case "Packages":
+			s.handleAptPackages(w, r, suite, component, arch)
+			return
+		case "Packages.gz":
+			s.handleAptPackagesGz(w, r, suite, component, arch)
+			return
+		}
+	}
+
+	http.NotFound(w, r)
+}
+
+// handleAptRelease serves the snapshot's Release for a suite.
+func (s *Server) handleAptRelease(w http.ResponseWriter, r *http.Request, suite string) {
+	idx, snap, ok := s.aptIndex(w, r, suite)
+	if !ok {
+		return
+	}
+
+	// A snapshot approaching Valid-Until means the refresh loop has stopped:
+	// nothing else lets it age. Past that instant every client fails apt
+	// update at once, including with [trusted=yes], because
+	// Acquire::Check-Valid-Until is independent of trust.
+	if remaining := time.Until(snap.validUntil); remaining < aptExpiryWarn {
+		s.logger.Warn("apt Release nears Valid-Until; the index refresh loop is not running",
+			"suite", suite,
+			"valid_until", snap.validUntil.Format(time.RFC1123Z),
+			"built_at", snap.builtAt.Format(time.RFC1123Z),
+			"remaining", remaining.Round(time.Minute).String())
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(idx.release)
+}
+
+// handleAptSigned serves InRelease or Release.gpg from the snapshot, and 404s
+// when the repository is unsigned.
+//
+// A 404 is the correct answer, not a placeholder: apt fetches InRelease first
+// and falls back to Release on 404, the ordinary path for every archive
+// predating InRelease. Serving unsigned bytes under a name that means signed
+// would put a malformed document at a well-known URL.
+func (s *Server) handleAptSigned(w http.ResponseWriter, r *http.Request, suite, file string) {
+	idx, _, ok := s.aptIndex(w, r, suite)
+	if !ok {
+		return
+	}
+	body := idx.inRelease
+	if file == "Release.gpg" {
+		body = idx.releaseGPG
+	}
+	if body == nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+// handleAptPublicKey serves the armored signing key for a human to read and
+// for `gpg --dearmor` to consume.
+func (s *Server) handleAptPublicKey(w http.ResponseWriter, r *http.Request) {
+	s.serveAptKey(w, r, s.aptSign.Load().pub())
+}
+
+// handleAptKeyring serves the dearmored keyring, which is what
+// /etc/apt/keyrings/ and signed-by= take directly.
+func (s *Server) handleAptKeyring(w http.ResponseWriter, r *http.Request) {
+	s.serveAptKey(w, r, s.aptSign.Load().ring())
+}
+
+// serveAptKey writes one rendering of the loaded public key. The first fetch
+// of this file is authenticated by TLS alone, which is why the fingerprint is
+// published out of band — see docs/usage.md.
+func (s *Server) serveAptKey(w http.ResponseWriter, r *http.Request, body []byte) {
+	if len(body) == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/pgp-keys")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+// handleAptPackages serves the snapshot's Packages index for one architecture.
+func (s *Server) handleAptPackages(w http.ResponseWriter, r *http.Request, suite, component, arch string) {
+	idx, _, ok := s.aptIndex(w, r, suite)
+	if !ok {
+		return
+	}
+	data, found := idx.packages[arch]
+	if component != "main" || !found {
+		http.NotFound(w, r)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+// handleAptPackagesGz serves the gzip-compressed Packages index.
+func (s *Server) handleAptPackagesGz(w http.ResponseWriter, r *http.Request, suite, component, arch string) {
+	idx, _, ok := s.aptIndex(w, r, suite)
+	if !ok {
+		return
+	}
+	data, found := idx.packagesGz[arch]
+	if component != "main" || !found {
+		http.NotFound(w, r)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/gzip")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+// aptIndex looks a suite up in the loaded snapshot, writing the response
+// itself and returning ok=false when it cannot. An unserved suite is a 404;
+// no snapshot at all is a 503, because the suite may well be served and the
+// operator's next step is to look at why the build failed, not at their
+// sources.list.
+//
+// A host bound to a profile that governs apt is answered from that profile's
+// view of the suite where one exists. This is the one dists/ route that varies
+// by requester, which is why all three handlers below it send no-store: a
+// shared cache holding one host's view and replaying it to the next would
+// re-publish what the profile subtracted, and route around the signature
+// question by never asking it.
+//
+// A suite with no view for this profile falls through to the unfiltered index.
+// That is a filtered codename, which is already one profile's view and carries
+// the base's packages for nobody else, and a mirrored codename, which bodega
+// does not generate at all — docs/threat-model.md states that the sources.list
+// a host reads is a scoping boundary rather than an authorizing one, and the
+// pool predicate is what refuses the fetch either way.
+func (s *Server) aptIndex(w http.ResponseWriter, r *http.Request, suite string) (*aptSuiteIndex, *aptSnapshot, bool) {
+	snap := s.aptSnap.Load()
+	if snap == nil {
+		s.logger.Error("apt index requested before any snapshot was built", "suite", suite)
+		http.Error(w, "apt index unavailable: no snapshot has been built", http.StatusServiceUnavailable)
+		return nil, nil, false
+	}
+	idx := snap.suites[suite]
+	if view := snap.profileViews[s.profileFor(r).Name()][suite]; view != nil {
+		idx = view
+	}
+	if idx == nil {
+		http.NotFound(w, r)
+		return nil, nil, false
+	}
+	return idx, snap, true
+}
+
+// ---- Index snapshot --------------------------------------------------------
+
+const (
+	// aptClockSkew backdates Date so a client running behind the server's
+	// clock does not reject a Release stamped in its own future.
+	aptClockSkew = 24 * time.Hour
+
+	// aptValidity is the Valid-Until window, measured from the backdated Date.
+	// It has to cover any plausible gap between rebuilds: the snapshot's
+	// expiry is fixed at build time while real time keeps moving, so a server
+	// whose refresh loop dies serves an expired Release from then on.
+	aptValidity = 14 * 24 * time.Hour
+
+	// aptRefreshInterval is how often the index is regenerated with no other
+	// trigger. Well inside aptValidity so a handful of missed ticks cost
+	// nothing.
+	aptRefreshInterval = time.Hour
+
+	// aptRetryInterval is the first interval used while no snapshot exists at
+	// all. Until one does every apt request is a 503, and the ordinary way to
+	// land there is transient: expired credentials, or a network that was not
+	// up when systemd started the unit. An hour of 503s is the wrong price for
+	// a backend that recovers in seconds.
+	aptRetryInterval = 15 * time.Second
+
+	// aptRetryFactor lengthens each failed retry, up to aptRefreshInterval.
+	// The transient failures aptRetryInterval is short for clear in seconds
+	// and are caught by the first few attempts; a wrong bucket, revoked
+	// credentials or a role that lost s3:ListBucket never clear at all, and
+	// each attempt costs a full manifest reload plus a pool listing against
+	// the dependency already returning errors. Flat, that is 240 of each an
+	// hour with 240 ERROR lines; doubling makes it 7.
+	aptRetryFactor = 2
+
+	// aptPoolRelistFloor is the shortest gap between two pool listings taken
+	// because a fallback entry resolved to nothing. The state that provokes
+	// them does not clear on its own — an entry staged before its .deb is
+	// uploaded stays unresolved for as long as the operator takes — so
+	// without a floor a bulk apt import pays a full listing per write, per
+	// backend, for the whole import. Seconds rather than minutes because the
+	// case on the other side is a .deb that has just landed and an operator
+	// waiting to see it in the index.
+	aptPoolRelistFloor = 15 * time.Second
+
+	// aptRebuildTimeout bounds a rebuild that no request is waiting on, so a
+	// wedged backend cannot pin the goroutine forever.
+	aptRebuildTimeout = 5 * time.Minute
+
+	// aptExpiryWarn is how long before Valid-Until the server starts logging
+	// at Warn, so a dead refresh loop surfaces while apt update still works.
+	aptExpiryWarn = 24 * time.Hour
+
+	// aptAuditLogLimit caps how many entries one audit warning names.
+	aptAuditLogLimit = 10
+)
+
+// aptSuiteIndex is one suite's generated dists/<suite>/ tree.
+type aptSuiteIndex struct {
+	release    []byte
+	inRelease  []byte            // nil when unsigned
+	releaseGPG []byte            // nil when unsigned
+	packages   map[string][]byte // arch -> Packages
+	packagesGz map[string][]byte // arch -> Packages.gz
+}
+
+// aptSnapshot is one internally consistent generation of every served suite's
+// index. Release carries SHA256 digests of the Packages bodies beside it and
+// apt fetches the two in separate requests, so they have to be generated
+// together and retired together: bytes from two generations are what a
+// client reports as "Hash Sum mismatch".
+type aptSnapshot struct {
+	suites     map[string]*aptSuiteIndex
+	builtAt    time.Time
+	validUntil time.Time
+
+	// profileSuites maps a filtered codename to the profile it was generated
+	// for. Recorded here rather than recomputed, because the status route is a
+	// per-request caller and resolving it from the profile tables would charge
+	// a query per profile to a question the rebuild already answered.
+	profileSuites map[string]string
+
+	// poolStorage maps a pool path to the backend name its version entry
+	// records, with an empty record stored as the default. A present entry
+	// and an absent one have to be distinguishable: present-but-empty means
+	// "default", while absent means there is no entry to have recorded
+	// anything and the type rule applies.
+	poolStorage map[string]string
+
+	// profilesScopeApt records whether any profile scoped apt at the moment
+	// this snapshot was built, before the withdrawals that decide
+	// profileSuites. A profile whose codename a rebuild withdrew still has
+	// its hosts refused at the pool, so the two are different questions.
+	profilesScopeApt bool
+
+	// profileViews holds one profile's view of every manifest-built suite,
+	// keyed profile then suite. A filtered codename is what a profile deriving
+	// from an upstream base reads; this is what its hosts read on the suites
+	// bodega builds from its own catalog, which derive from no base and so
+	// have no codename of their own to be served under.
+	//
+	// Generated at rebuild rather than per request for the reason
+	// apt_profile.go gives: Release carries the digests of the Packages beside
+	// it and is signed, so a per-request filter would put a key operation on
+	// the hottest cached path.
+	profileViews map[string]map[string]*aptSuiteIndex
+}
+
+// rebuildAptSnapshot regenerates the index and publishes it to every
+// subsequent request. On failure the previous snapshot keeps serving: a stale
+// index is a smaller problem than a truncated one, which would have clients
+// remove packages that are still published.
+func (s *Server) rebuildAptSnapshot(ctx context.Context) {
+	snap, err := s.buildAptSnapshot(ctx)
+	if err != nil {
+		s.logger.Error("apt index rebuild failed, previous snapshot still serving",
+			"error", err, "have_snapshot", s.aptSnap.Load() != nil)
+		return
+	}
+	s.aptSnap.Store(snap)
+	s.logger.Debug("apt index rebuilt",
+		"suites", len(snap.suites), "valid_until", snap.validUntil.Format(time.RFC1123Z))
+}
+
+// aptRefreshLoop rebuilds on a ticker until ctx is canceled. Valid-Until is
+// fixed when a snapshot is built, so without this the index expires in place.
+//
+// The interval is short until the first snapshot exists and settles to hourly
+// afterwards: with no snapshot every apt request is a 503, and the failures
+// that put it there are usually over in seconds.
+func (s *Server) aptRefreshLoop(ctx context.Context) {
+	s.aptRefreshLoopClock(ctx, time.After)
+}
+
+// aptRefreshLoopClock is aptRefreshLoop with the wait injected, so a test can
+// drive an hour of retries without spending one.
+func (s *Server) aptRefreshLoopClock(ctx context.Context, after func(time.Duration) <-chan time.Time) {
+	interval := s.aptNextInterval(0)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-after(interval):
+			s.reloadManifests(ctx)
+			s.rebuildAptSnapshot(ctx)
+			if want := s.aptNextInterval(interval); want != interval {
+				interval = want
+				s.logger.Info("apt index refresh interval changed", "interval", interval.String())
+			}
+		}
+	}
+}
+
+// aptNextInterval is the wait before the next rebuild: the refresh interval
+// once a snapshot exists, and aptRetryInterval doubling up to it while none
+// does. prev is the interval just served, or zero for the first wait.
+//
+// The first snapshot resets it, so a backend that arrives late is served at
+// the same cadence as one that was there from the start.
+func (s *Server) aptNextInterval(prev time.Duration) time.Duration {
+	if s.aptSnap.Load() != nil {
+		return aptRefreshInterval
+	}
+	if prev < aptRetryInterval {
+		return aptRetryInterval
+	}
+	if next := prev * aptRetryFactor; next < aptRefreshInterval {
+		return next
+	}
+	return aptRefreshInterval
+}
+
+// reloadManifests re-reads the manifest index from the backend so the tick
+// sees edits made outside the process.
+//
+// Without it the loop re-stamps Valid-Until from an unchanged in-memory cache
+// forever: GetPackage answers from that cache and only LoadIndex clears it, so
+// a package withdrawn on disk would stay published until someone sent SIGHUP.
+// A failure here is not fatal — the previous index is still coherent, and
+// refusing to re-stamp Valid-Until over it would eventually expire the whole
+// repository over a transient read error.
+func (s *Server) reloadManifests(ctx context.Context) {
+	if err := s.store.LoadIndex(ctx); err != nil {
+		s.logger.Error("could not reload manifests; rebuilding the apt index from the cached copy",
+			"error", err)
+		return
+	}
+	s.aptPool.Store(nil)
+}
+
+// buildAptSnapshot generates every served suite's index from current manifest
+// and pool state.
+func (s *Server) buildAptSnapshot(ctx context.Context) (*aptSnapshot, error) {
+	served := s.cfg.ServedAptSuites()
+	poolMap, sharedPool, err := s.aptPoolMapForIndex(ctx, served)
+	if err != nil {
+		return nil, fmt.Errorf("list apt pool keys: %w", err)
+	}
+
+	date := time.Now().UTC().Add(-aptClockSkew)
+	snap := &aptSnapshot{
+		suites:     make(map[string]*aptSuiteIndex),
+		builtAt:    time.Now().UTC(),
+		validUntil: date.Add(aptValidity),
+	}
+	snap.poolStorage = s.aptPoolStorage(ctx)
+	// Resolved before the suites are built, because a manifest-built suite is
+	// generated once per profile that governs apt as well as once unfiltered.
+	views := s.aptProfileViews(ctx)
+	snap.profilesScopeApt = len(views) > 0
+	for _, suite := range served {
+		base, perProfile := s.buildAptSuiteIndex(ctx, suite, views, poolMap, sharedPool, date, snap.validUntil)
+		snap.suites[suite] = base
+		for profile, idx := range perProfile {
+			if snap.profileViews == nil {
+				snap.profileViews = map[string]map[string]*aptSuiteIndex{}
+			}
+			if snap.profileViews[profile] == nil {
+				snap.profileViews[profile] = map[string]*aptSuiteIndex{}
+			}
+			snap.profileViews[profile][suite] = idx
+		}
+	}
+	// Filtered codenames join the same map, so every dists/ handler routes to
+	// them unchanged and one snapshot retires as a unit. A profile's Release
+	// and its Packages have to be generated together for the reason every
+	// suite's do: the first carries the digests of the second.
+	for _, ps := range s.aptProfileIndexes(ctx, views, date, snap.validUntil) {
+		snap.suites[ps.codename] = ps.index
+		if snap.profileSuites == nil {
+			snap.profileSuites = map[string]string{}
+		}
+		snap.profileSuites[ps.codename] = ps.profile
+	}
+	s.auditAptEntries(ctx, served, poolMap)
+	s.reportPinFeasibility(ctx)
+	return snap, nil
+}
+
+// aptFallback is one index entry with no _pool_path recorded, and the three
+// fields findDebInPool matches a pool object by.
+type aptFallback struct {
+	source  string
+	version string
+	arch    string
+}
+
+// aptFallbacks lists the entries a rebuild would have to resolve against a
+// pool listing. Everything PackageApt wrote carries _pool_path and addresses
+// its object directly; what lands here is what 'pkg create' and the mutation
+// API accept without one, plus manifests written before the field existed.
+//
+// The filters match the generator's, because an entry the generator drops for
+// some other reason is one a listing could not rescue.
+func (s *Server) aptFallbacks(ctx context.Context, served []string) []aptFallback {
+	var out []aptFallback
+	for _, name := range s.store.ListPackages(manifest.TypeApt) {
+		pm, _ := s.store.GetPackage(ctx, manifest.TypeApt, name)
+		if pm == nil || isPackageHidden(pm) {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			if ve.Hidden || ve.Version == "" || ve.Version == "*" {
+				continue
+			}
+			if ve.Metadata["_pool_path"] != "" || ve.Metadata["Architecture"] == "" {
+				continue
+			}
+			inServed := false
+			for _, suite := range served {
+				if ve.InSuite(suite, s.cfg.AptCodename) {
+					inServed = true
+					break
+				}
+			}
+			if !inServed {
+				continue
+			}
+			source := ve.SourceName
+			if source == "" {
+				source = pm.Name
+			}
+			out = append(out, aptFallback{
+				source: source, version: ve.Version, arch: ve.Metadata["Architecture"],
+			})
+		}
+	}
+	return out
+}
+
+// aptPoolMapForIndex resolves the pool listing a rebuild needs, and no more.
+//
+// No fallback entry means no listing at all: the whole pool is walked on every
+// rebuild otherwise, once per configured backend, and an index built entirely
+// from _pool_path never reads a byte of it. That bounds the per-write cost the
+// cache was added to bound, and bounds it at zero.
+//
+// With a fallback entry the cached listing answers, and one listing is taken
+// per call at most. An unresolved fallback is the one state where the cached
+// answer may be wrong in the direction that matters — a .deb reached the pool
+// after the listing was taken, uploaded out of band or written by a route
+// other than PackageApt — so the listing is retaken, but no more often than
+// aptPoolRelistFloor. Retaking on every unresolved entry instead charged a
+// full listing to every write for as long as one staged entry waited for its
+// .deb, which is the per-write bound the cache exists to hold.
+func (s *Server) aptPoolMapForIndex(ctx context.Context, served []string) (map[string]string, bool, error) {
+	fallbacks := s.aptFallbacks(ctx, served)
+	if len(fallbacks) == 0 {
+		return nil, false, nil
+	}
+	mirrored, err := s.aptMirroredPoolKeys(ctx)
+	if err != nil {
+		// Fallback resolution stops; the rest of the index does not. Entries
+		// that carry _pool_path address their object directly and are
+		// unaffected, and failing the whole snapshot over this would take a
+		// mirroring instance's apt repository down for a reason unrelated to
+		// any of its packages. auditAptEntries reports each dropped entry.
+		s.logger.Warn("cannot tell a mirrored .deb from a built one, so no apt entry without _pool_path reaches the index",
+			"error", err)
+		return nil, false, nil
+	}
+	// A pool that has held upstream bytes, or an instance still configured to
+	// put some there. Either way a filename match is no longer evidence of
+	// provenance, which is what generateAptPackages needs to know.
+	shared := len(mirrored) > 0 || len(s.cfg.AptUpstreams) > 0
+	if cached := s.aptCachedPoolMap(mirrored, fallbacks); cached != nil {
+		return cached, shared, nil
+	}
+	keys, err := s.aptPoolKeysFresh(ctx)
+	if err != nil {
+		return nil, shared, err
+	}
+	return aptPoolMap(keys, mirrored), shared, nil
+}
+
+// aptCachedPoolMap returns the map the cached listing yields when that listing
+// can still answer for these fallbacks, and nil when the caller has to list.
+//
+// Two clocks, because the cached listing is wrong in two different ways. Past
+// metadata_ttl it is stale for everything and is dropped. Inside the TTL it is
+// authoritative for every entry it resolves, and suspect only for one it does
+// not: an entry can go from unresolved to resolved without any manifest write,
+// so an unresolved fallback is the only evidence available that an object may
+// have landed since. aptPoolRelistFloor is what keeps that evidence from
+// costing a listing per write, and it is also what stops a listing taken
+// microseconds ago from being retaken by the same call — the cold-cache path
+// stores its result here before anything reads it back.
+func (s *Server) aptCachedPoolMap(mirrored map[string]bool, fallbacks []aptFallback) map[string]string {
+	ttl := s.cache.MetadataTTL
+	cached := s.aptPool.Load()
+	if cached == nil || ttl <= 0 || time.Since(cached.at) >= ttl {
+		return nil
+	}
+	poolMap := aptPoolMap(cached.keys, mirrored)
+	if s.aptAllResolve(poolMap, fallbacks) || time.Since(cached.at) < aptPoolRelistFloor {
+		return poolMap
+	}
+	return nil
+}
+
+// aptMirroredPoolKeys returns the pool keys a mirrored fetch wrote. A manifest
+// entry resolved by filename must never land on one of them: the bytes are the
+// archive's, and publishing them under bodega's own signature tells a host
+// that trusts the archive key it is installing the operator's build.
+//
+// The audit checksum table is the record. proxyOrCache stores a row per cached
+// artifact with source "computed" on first fetch, and under the apt prefix
+// nothing else writes that source — an entry bodega built carries its digest
+// in the manifest and never reaches verifyProxyChecksum.
+//
+// The record is consulted whenever it can be read, never gated on the current
+// config. pool/ outlives apt_upstreams: retiring the key leaves every cached
+// upstream .deb where it is and every checksum row where it is, so a rebuild
+// that trusts the config to answer "did this instance ever mirror" republishes
+// the archive's bytes under bodega's own signature (#201). The
+// query costs one indexed read per rebuild that has a fallback entry to
+// resolve, and returns nothing on an instance that never mirrored.
+//
+// With no audit database there is no record to read, and the config is all
+// that is left to reason from. An instance with upstreams configured cannot
+// tell the two apart, so every pool object counts as mirrored: the fallback
+// entry drops out of the index, which auditAptEntries already reports as
+// unpooled. One with none is the ordinary non-mirroring instance and resolves
+// normally. That last case is the residual hole: an instance that mirrored
+// with no audit database wrote no row anywhere, so dropping apt_upstreams
+// leaves nothing behind to exclude on.
+func (s *Server) aptMirroredPoolKeys(ctx context.Context) (map[string]bool, error) {
+	if s.auditDB == nil {
+		if len(s.cfg.AptUpstreams) == 0 {
+			return nil, nil
+		}
+		return nil, errors.New("apt upstreams are configured but no audit database is open, so a cached upstream .deb cannot be told from a built one; entries without _pool_path stay out of the index until the audit database is reachable")
+	}
+	rows, err := s.auditDB.ListChecksums(ctx, manifest.TypeApt, "")
+	if err != nil {
+		return nil, fmt.Errorf("list mirrored apt checksums: %w", err)
+	}
+	mirrored := make(map[string]bool)
+	for _, row := range rows {
+		if row.Source == "computed" {
+			mirrored[row.ObjectKey] = true
+		}
+	}
+	return mirrored, nil
+}
+
+// aptAllResolve reports whether every fallback entry finds an object in
+// poolMap.
+func (s *Server) aptAllResolve(poolMap map[string]string, fallbacks []aptFallback) bool {
+	for _, f := range fallbacks {
+		if s.findDebInPool(poolMap, f.source, f.version, f.arch) == "" {
+			return false
+		}
+	}
+	return true
+}
+
+// aptPoolMap indexes a pool listing by base filename, which is what
+// findDebInPool matches on, and carries the path a Filename field needs. Keys
+// in mirrored are left out; see aptMirroredPoolKeys for what they are.
+//
+// A nil map and an empty one are different answers here: nil means the caller
+// established there is nothing to exclude, empty means it established the
+// exclusion set is empty. Both leave every key in, which is why the caller
+// returns an error rather than an empty set when it cannot tell.
+func aptPoolMap(keys []string, mirrored map[string]bool) map[string]string {
+	poolMap := make(map[string]string, len(keys))
+	for _, key := range keys {
+		filename := path.Base(key)
+		if !strings.HasSuffix(filename, ".deb") {
+			continue
+		}
+		if mirrored[key] {
+			continue
+		}
+		poolMap[filename] = strings.TrimPrefix(key, manifest.AptPrefix)
+	}
+	return poolMap
+}
+
+// aptPoolStorage maps each pooled path to the backend its version entry names,
+// resolving an unrecorded name to the default rather than omitting it. Omitting
+// it would send a pre-existing .deb down the type rule, which is precisely the
+// hierarchy consultation the empty-means-default rule forbids.
+//
+// Built over every apt entry rather than inside the per-suite generator: a
+// hidden entry and an entry in an unserved suite are both absent from the
+// index and both still served from /apt/pool/, so filtering here would send
+// their reads to the wrong backend.
+func (s *Server) aptPoolStorage(ctx context.Context) map[string]string {
+	var out map[string]string
+	for _, name := range s.store.ListPackages(manifest.TypeApt) {
+		pm, _ := s.store.GetPackage(ctx, manifest.TypeApt, name)
+		if pm == nil {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			poolPath := ve.Metadata["_pool_path"]
+			if poolPath == "" {
+				continue
+			}
+			if out == nil {
+				out = make(map[string]string)
+			}
+			if ve.Storage == "" {
+				out[poolPath] = storage.DefaultName
+			} else {
+				out[poolPath] = ve.Storage
+			}
+		}
+	}
+	return out
+}
+
+// buildAptSuiteIndex generates one suite's Packages bodies and the Release
+// that vouches for them, unfiltered and once per profile that governs apt.
+//
+// Every view names the same architectures as the unfiltered index, including
+// the ones whose filtered body is empty. Dropping an architecture that
+// filtered to nothing would leave a Release naming fewer, which apt reports as
+// a suite that does not support the host — a profile decision worded as an
+// archive fact. An empty Packages is read as what it is, and the host reports
+// its packages as unavailable rather than the suite as wrong.
+func (s *Server) buildAptSuiteIndex(ctx context.Context, suite string, views []aptProfileView, poolMap map[string]string, sharedPool bool, date, validUntil time.Time) (*aptSuiteIndex, map[string]*aptSuiteIndex) {
+	// Collect unique architectures from manifest metadata.
+	arches := s.aptArchitectures(ctx, suite)
+	if len(arches) == 0 {
+		arches = []string{"amd64"}
+	}
+
+	stanzas := make(map[string][]aptStanza, len(arches))
+	packages := make(map[string][]byte, len(arches))
+	for _, arch := range arches {
+		stanzas[arch] = s.aptSuiteStanzas(ctx, suite, arch, poolMap, sharedPool)
+		packages[arch], _, _ = aptPackagesBody(stanzas[arch], nil)
+	}
+	if len(views) == 0 {
+		return s.aptIndexFrom(suite, packages, date, validUntil), nil
+	}
+	perProfile := make(map[string]*aptSuiteIndex, len(views))
+	for _, v := range views {
+		filtered := make(map[string][]byte, len(arches))
+		kept, dropped := 0, 0
+		for _, arch := range arches {
+			body, k, d := aptPackagesBody(stanzas[arch], v.permit)
+			filtered[arch], kept, dropped = body, kept+k, dropped+d
+		}
+		s.logger.Info("filtered a generated apt suite for a profile",
+			"profile", v.profile, "suite", suite, "kept", kept, "dropped", dropped)
+		perProfile[v.profile] = s.aptIndexFrom(suite, filtered, date, validUntil)
+	}
+	return s.aptIndexFrom(suite, packages, date, validUntil), perProfile
+}
+
+// aptIndexFrom assembles one generated suite from its Packages bodies: the
+// gzip variants, the Release that carries their digests, and the signature
+// over it.
+//
+// Shared with the filtered codenames a profile is served under, which differ
+// from a manifest-built suite in where the stanzas came from and in nothing
+// else. Two copies of this would be two answers to what a bodega-signed
+// Release says, and the one that drifted would fail as a hash mismatch on the
+// client rather than as anything visible here.
+func (s *Server) aptIndexFrom(suite string, packages map[string][]byte, date, validUntil time.Time) *aptSuiteIndex {
+	arches := make([]string, 0, len(packages))
+	for arch := range packages {
+		arches = append(arches, arch)
+	}
+	sort.Strings(arches)
+
+	idx := &aptSuiteIndex{
+		packages:   make(map[string][]byte, len(arches)),
+		packagesGz: make(map[string][]byte, len(arches)),
+	}
+	type indexEntry struct {
+		path string
+		data []byte
+	}
+	var entries []indexEntry
+	for _, arch := range arches {
+		pkgData := packages[arch]
+		entries = append(entries, indexEntry{
+			path: "main/binary-" + arch + "/Packages",
+			data: pkgData,
+		})
+		// Gzip variant.
+		var gz bytes.Buffer
+		gw := gzip.NewWriter(&gz)
+		_, _ = gw.Write(pkgData)
+		_ = gw.Close()
+		entries = append(entries, indexEntry{
+			path: "main/binary-" + arch + "/Packages.gz",
+			data: gz.Bytes(),
+		})
+		idx.packages[arch] = pkgData
+		idx.packagesGz[arch] = gz.Bytes()
+	}
+
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "Origin: bodega\n")
+	fmt.Fprintf(&buf, "Label: bodega\n")
+	fmt.Fprintf(&buf, "Suite: %s\n", suite)
+	fmt.Fprintf(&buf, "Codename: %s\n", suite)
+	fmt.Fprintf(&buf, "Components: main\n")
+	fmt.Fprintf(&buf, "Architectures: %s\n", strings.Join(arches, " "))
+	fmt.Fprintf(&buf, "Date: %s\n", date.Format(time.RFC1123Z))
+	fmt.Fprintf(&buf, "Valid-Until: %s\n", validUntil.Format(time.RFC1123Z))
+	fmt.Fprintf(&buf, "SHA256:\n")
+	for _, e := range entries {
+		h := sha256.Sum256(e.data)
+		fmt.Fprintf(&buf, " %s %d %s\n", hex.EncodeToString(h[:]), len(e.data), e.path)
+	}
+	idx.release = buf.Bytes()
+	s.signAptRelease(idx, suite)
+	return idx
+}
+
+// aptSigning is the loaded signing key and the two renderings of its public
+// half the keyring routes serve. The three are swapped as one value: a client
+// that fetched a keyring from one generation and an InRelease from another
+// reads a good archive as a forged one.
+//
+// The public forms are rendered at load rather than per request, so the key
+// clients fetch is by construction the key the running process signs with.
+type aptSigning struct {
+	signer     aptsign.Signer
+	pubArmored []byte
+	keyring    []byte
+}
+
+// pub and ring read through a nil *aptSigning, which is the unsigned
+// configuration, so the routes need no separate nil check.
+func (a *aptSigning) pub() []byte {
+	if a == nil {
+		return nil
+	}
+	return a.pubArmored
+}
+
+func (a *aptSigning) ring() []byte {
+	if a == nil {
+		return nil
+	}
+	return a.keyring
+}
+
+// aptStatus is what the running server knows about how apt clients reach it,
+// and nothing else in the tree can derive: whether an index signature exists,
+// which suites answer, and the URL in force. Every wrong sources line this
+// repository has shipped was an emitter guessing at one of those three.
+type aptStatus struct {
+	Signed        bool                 `json:"signed"`
+	Fingerprints  []string             `json:"fingerprints,omitempty"`
+	KeyringURL    string               `json:"keyring_url,omitempty"`
+	Suites        []string             `json:"suites"`
+	Mirrored      []string             `json:"mirrored,omitempty"`
+	Unserved      []aptUnservedEntry   `json:"unserved,omitempty"`
+	UnservedCount int                  `json:"unserved_count,omitempty"`
+	PublicURL     string               `json:"public_url"`
+	Sources       []aptsources.Sources `json:"sources"`
+
+	// Filtered names the codenames generated from a profile's view of a
+	// mirrored codename, in sorted order. They are generated suites in every way
+	// that matters to a client — bodega's key signs them and Signed-By: goes
+	// on the line — and separate from Suites because nothing in apt_suites
+	// produced them and an operator reading the config would not find them.
+	Filtered []string `json:"filtered,omitempty"`
+
+	// Profile is the profile bound to the request that asked, when one scopes
+	// apt for it, and Host is the single stanza that host should install.
+	//
+	// The server answers this rather than leaving a client to pick a block out
+	// of the list, for the reason this package exists at all: which codename a
+	// host reads is a fact only the server holds, and every emitter that
+	// guessed at one guessed wrong. Host is nil when the answer is the
+	// operator's — no profile scopes apt and this instance serves more than
+	// one codename — because a guess there is a host pointed at the wrong
+	// suite with nothing reporting it.
+	Profile string              `json:"profile,omitempty"`
+	Host    *aptsources.Sources `json:"host,omitempty"`
+}
+
+// aptUnservedEntry is one manifest entry that names no suite this server
+// answers for, which is the one way an apt entry disappears without anything
+// refusing it: the generator drops it, handleAptDists 404s the suite, and the
+// client reports "Unable to locate package" — the message a typo produces.
+//
+// Reported rather than refused. Staging an entry before adding its suite to
+// apt_suites is a legitimate order, so the only thing missing was somewhere to
+// see it that is not the server's log.
+type aptUnservedEntry struct {
+	Name    string   `json:"name"`
+	Version string   `json:"version"`
+	Suites  []string `json:"suites"`
+}
+
+// aptUnservedEntries lists them, capped, with the true count returned beside
+// it: a truncated array and no count reads as "these are all of them".
+func (s *Server) aptUnservedEntries(ctx context.Context) ([]aptUnservedEntry, int) {
+	served := s.cfg.ServedAptSuites()
+	servedSet := make(map[string]bool, len(served))
+	for _, suite := range served {
+		servedSet[suite] = true
+	}
+	var out []aptUnservedEntry
+	count := 0
+	for _, name := range s.store.ListPackages(manifest.TypeApt) {
+		pm, _ := s.store.GetPackage(ctx, manifest.TypeApt, name)
+		if pm == nil || isPackageHidden(pm) {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			if ve.Hidden || ve.Version == "" || ve.Version == "*" {
+				continue
+			}
+			suites := ve.EffectiveSuites(s.cfg.AptCodename)
+			if aptMatchesServed(suites, servedSet) {
+				continue
+			}
+			count++
+			if len(out) < aptAuditLogLimit {
+				out = append(out, aptUnservedEntry{Name: pm.Name, Version: ve.Version, Suites: suites})
+			}
+		}
+	}
+	return out, count
+}
+
+// aptMatchesServed is the one rule for "this entry reaches an index", shared
+// by the status row and the log line so the two cannot drift into disagreeing
+// about which entries are missing.
+func aptMatchesServed(suites []string, servedSet map[string]bool) bool {
+	for _, suite := range suites {
+		if servedSet[suite] {
+			return true
+		}
+	}
+	return false
+}
+
+// aptSourcesState reports the client-facing apt state, with the public URL
+// resolved for the request that asked.
+//
+// public_url wins when the operator set one: only they know the name a proxy
+// publishes this server under. With none set the request answers for itself,
+// which is right for the web UI running in a browser and honors
+// X-Forwarded-Proto, so it stays right behind a proxy that terminates TLS on
+// a different hostname. r may be nil for a caller with no request in hand,
+// such as the startup banner; the renderer then emits a placeholder host.
+func (s *Server) aptSourcesState(r *http.Request) aptsources.State {
+	st := aptsources.State{
+		PublicURL:   s.publicBase(r),
+		LocalScheme: s.localScheme(),
+		Suites:      s.cfg.ServedAptSuites(),
+	}
+	if sign := s.aptSign.Load(); sign != nil {
+		st.Signed = true
+		st.Fingerprints = sign.signer.Fingerprints()
+	}
+	return st
+}
+
+// aptStatusFor renders one sources block per served suite, so a caller holding
+// a package picks the block for that package's suite instead of composing a
+// line of its own.
+func (s *Server) aptStatusFor(r *http.Request) aptStatus {
+	st := s.aptSourcesState(r)
+	mirrored := s.cfg.MirroredAptCodenames()
+	ctx := context.Background()
+	if r != nil {
+		ctx = r.Context()
+	}
+	unserved, unservedCount := s.aptUnservedEntries(ctx)
+	filtered, _ := s.aptFilteredSuites()
+	out := aptStatus{
+		Signed:        st.Signed,
+		Fingerprints:  st.Fingerprints,
+		Suites:        st.Suites,
+		Mirrored:      mirrored,
+		Unserved:      unserved,
+		UnservedCount: unservedCount,
+		PublicURL:     st.PublicURL,
+		Filtered:      filtered,
+		Sources:       make([]aptsources.Sources, 0, len(st.Suites)+len(mirrored)+len(filtered)),
+	}
+	if st.Signed {
+		out.KeyringURL = aptsources.KeyringRoute
+	}
+	if len(st.Suites) == 0 && len(mirrored) == 0 && len(filtered) == 0 {
+		return aptStatus{Signed: out.Signed, Fingerprints: out.Fingerprints, KeyringURL: out.KeyringURL,
+			Suites: []string{}, Unserved: out.Unserved, UnservedCount: out.UnservedCount,
+			PublicURL: out.PublicURL, Sources: []aptsources.Sources{aptsources.Render(st)}}
+	}
+	for _, suite := range st.Suites {
+		one := st
+		one.Suites = []string{suite}
+		out.Sources = append(out.Sources, aptsources.Render(one))
+	}
+	// A mirrored codename gets its own block. It cannot share the generated
+	// one's stanza: those carry Signed-By: or Trusted:, and a mirrored codename
+	// must carry neither, so folding them onto one Suites: line would apply
+	// the wrong trust to half of it.
+	for _, codename := range mirrored {
+		one := st
+		one.Suites = []string{codename}
+		one.Mirrored = true
+		one.Components = s.cfg.AptComponentsFor(codename)
+		out.Sources = append(out.Sources, aptsources.Render(one))
+	}
+	// A filtered codename renders as what it is: a suite bodega generated and
+	// signed. Same stanza shape as an apt_suites codename, because from the
+	// client's side that is the only thing it is.
+	for _, codename := range out.Filtered {
+		one := st
+		one.Suites = []string{codename}
+		out.Sources = append(out.Sources, aptsources.Render(one))
+	}
+	out.Profile, out.Host = s.aptHostSources(r, st, out)
+	return out
+}
+
+// aptFilteredSuites names the filtered codenames the loaded snapshot carries,
+// sorted, and the profile each belongs to.
+func (s *Server) aptFilteredSuites() (names []string, byCodename map[string]string) {
+	snap := s.aptSnap.Load()
+	if snap == nil || len(snap.profileSuites) == 0 {
+		return nil, nil
+	}
+	names = make([]string, 0, len(snap.profileSuites))
+	for codename := range snap.profileSuites {
+		names = append(names, codename)
+	}
+	sort.Strings(names)
+	return names, snap.profileSuites
+}
+
+// aptHostSources picks the one stanza the requesting host should install.
+//
+// A host bound to a profile that scopes apt reads that profile's filtered
+// codename and nothing else: reading the base beside it would hand the same
+// client an unfiltered index for the same packages, and apt takes the highest
+// version it is offered from either.
+//
+// Everyone else gets an answer only when there is one codename to give. With
+// several served and no profile to choose between them, naming one would point
+// a host at a suite nobody decided on, and it would look authoritative.
+func (s *Server) aptHostSources(r *http.Request, st aptsources.State, out aptStatus) (string, *aptsources.Sources) {
+	if r != nil {
+		p := s.profileFor(r)
+		base, _ := p.AptScope()
+		if base != "" {
+			_, byCodename := s.aptFilteredSuites()
+			for codename, profile := range byCodename {
+				if profile != p.Name() {
+					continue
+				}
+				one := st
+				one.Suites = []string{codename}
+				rendered := aptsources.Render(one)
+				return p.Name(), &rendered
+			}
+			// The profile scopes apt and no codename answers for it: the
+			// rebuild refused the base or has not run since the profile was
+			// written. Naming the base instead would serve this host the
+			// unfiltered index its profile exists to narrow.
+			return p.Name(), nil
+		}
+	}
+	if len(out.Sources) == 1 {
+		one := out.Sources[0]
+		return "", &one
+	}
+	return "", nil
+}
+
+// publicBase returns the base URL clients reach this server at, with no
+// trailing slash: public_url when the operator set one, the request's own
+// origin otherwise. r may be nil for a caller with no request in hand, such as
+// the startup banner, which then gets "" and renders a placeholder.
+//
+// Every client-facing URL the server emits goes through here. Deriving one
+// from r.TLS instead is what handed cargo plaintext download URLs on a
+// deployment that was https everywhere a client could see.
+func (s *Server) publicBase(r *http.Request) string {
+	if base := s.cfg.ResolvePublicURL(""); base != "" {
+		return base
+	}
+	if r == nil {
+		return ""
+	}
+	return requestScheme(r) + "://" + r.Host
+}
+
+// publicScheme is the scheme half of public_url, empty when none is set. The
+// middleware chain holds no config, so it asks through this.
+func (s *Server) publicScheme() string {
+	base := s.cfg.ResolvePublicURL("")
+	if i := strings.Index(base, "://"); i > 0 {
+		return strings.ToLower(base[:i])
+	}
+	return ""
+}
+
+// localScheme is the scheme this process's own listener answers on. It is a
+// fallback for a caller with no request and no public_url, never a description
+// of how a client reaches the server: behind a proxy both TLS keys are empty
+// here and every client still speaks https.
+func (s *Server) localScheme() string {
+	if s.cfg.TLSCert != "" && s.cfg.TLSKey != "" {
+		return "https"
+	}
+	return "http"
+}
+
+// loadAptSigner installs the signing key, if one is present, and renders the
+// two public forms the keyring routes serve. It runs at startup and again on
+// every SIGHUP, which is what makes the published rotation runbook work.
+//
+// Absent key at startup: unsigned, and that is a configuration rather than a
+// fault, so it logs at Info. Present but unusable: loud, because the operator
+// installed a key and would otherwise have no way to learn the repository is
+// still unsigned — apt reports nothing, since a missing InRelease is
+// indistinguishable from an archive that never had one.
+//
+// A reload never takes signing away. Whatever went wrong — the key unreadable,
+// the mount gone, the file deleted — the previously loaded key keeps signing
+// and the fault goes to the journal, because a client configured with
+// Signed-By: has no unsigned fallback and would fail apt update outright.
+// Serving unsigned is a deliberate act and needs a restart.
+func (s *Server) loadAptSigner() {
+	loaded := s.aptSign.Load() != nil
+	paths := aptsign.DefaultKeyPaths(s.cfg.StoragePath)
+	kr, err := aptsign.Load(paths)
+	switch {
+	case errors.Is(err, aptsign.ErrNoKey) && loaded:
+		s.logger.Warn("apt signing key is gone from every search path; the loaded key keeps signing until a restart",
+			"searched", strings.Join(paths, ", "))
+		return
+	case errors.Is(err, aptsign.ErrNoKey):
+		s.logger.Info("no apt signing key installed; the apt repository is served unsigned",
+			"searched", strings.Join(paths, ", "))
+		return
+	case err != nil:
+		s.logger.Error("apt signing key present but unusable; the apt repository is signed with the previously loaded key, or not at all",
+			"error", err, "previously_loaded", loaded)
+		return
+	}
+	pub, err := kr.PublicKey()
+	if err != nil {
+		s.logger.Error("apt signing key loaded but its public half will not render; the key is not installed",
+			"path", kr.Path(), "error", err, "previously_loaded", loaded)
+		return
+	}
+	ring, err := kr.Keyring()
+	if err != nil {
+		s.logger.Error("apt signing key loaded but its keyring will not render; the key is not installed",
+			"path", kr.Path(), "error", err, "previously_loaded", loaded)
+		return
+	}
+	s.aptSign.Store(&aptSigning{signer: kr, pubArmored: pub, keyring: ring})
+	s.logger.Info("apt signing key loaded",
+		"path", kr.Path(), "keys", kr.Len(),
+		"fingerprints", strings.Join(kr.Fingerprints(), " "))
+}
+
+// signAptRelease attaches InRelease and Release.gpg to a freshly generated
+// suite index. Signing happens here, once per rebuild, rather than per
+// request: Release is what carries the digests of the Packages bodies beside
+// it, so a per-request signature would seal a different document every time
+// and re-sign on every apt update.
+//
+// A signing failure leaves both nil and logs. The suite keeps serving its
+// unsigned Release, which is the same shape a client sees before a key is
+// installed, rather than taking the repository down.
+func (s *Server) signAptRelease(idx *aptSuiteIndex, suite string) {
+	sign := s.aptSign.Load()
+	if sign == nil {
+		return
+	}
+	inRelease, err := sign.signer.ClearSign(idx.release)
+	if err != nil {
+		s.logger.Error("apt InRelease signing failed; suite serves unsigned Release only",
+			"suite", suite, "error", err)
+		return
+	}
+	releaseGPG, err := sign.signer.DetachSign(idx.release)
+	if err != nil {
+		s.logger.Error("apt Release.gpg signing failed; suite serves unsigned Release only",
+			"suite", suite, "error", err)
+		return
+	}
+	idx.inRelease = inRelease
+	idx.releaseGPG = releaseGPG
+}
+
+// auditAptEntries reports manifest entries the generator dropped. Every case
+// is silent to the client and produces "Unable to locate package", the same
+// message a typo in the package name produces, so without a log line the
+// operator has nothing to work from. None is an error: staging an entry
+// before adding its suite to apt_suites is a legitimate order, an unresolved
+// entry is a normal intermediate state, and an entry whose .deb has not been
+// uploaded yet is the ordinary gap between 'pkg create' and 'pkg build'.
+//
+// Runs once per rebuild rather than inside the per-suite, per-arch generator
+// loop, which would repeat every line N times.
+func (s *Server) auditAptEntries(ctx context.Context, served []string, poolMap map[string]string) {
+	servedSet := make(map[string]bool, len(served))
+	for _, suite := range served {
+		servedSet[suite] = true
+	}
+
+	var unserved, unresolved, unpooled, noarch []string
+	for _, name := range s.store.ListPackages(manifest.TypeApt) {
+		pm, _ := s.store.GetPackage(ctx, manifest.TypeApt, name)
+		if pm == nil || isPackageHidden(pm) {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			if ve.Hidden || ve.Version == "*" {
+				continue
+			}
+			if ve.Version == "" {
+				unresolved = append(unresolved, name)
+				continue
+			}
+			// An entry naming no suites belongs to apt_codename, which
+			// apt_suites can leave out. Testing the effective suites rather
+			// than the recorded ones is what keeps that entry from being
+			// counted as served and then reported for the wrong reason.
+			suites := ve.EffectiveSuites(s.cfg.AptCodename)
+			if !aptMatchesServed(suites, servedSet) {
+				unserved = append(unserved, name+"@"+ve.Version+" ["+strings.Join(suites, ",")+"]")
+				continue
+			}
+			// Reached a served suite, so the only thing left between it and
+			// the index is a pool object. An entry with _pool_path names one
+			// directly and the generator emits it either way; one without is
+			// matched by filename against the listing, and finding nothing
+			// drops it.
+			// The generator drops an entry with no Architecture before it
+			// looks at a pool path, so this test comes before the pool one:
+			// an entry carrying _pool_path and no Architecture still reaches
+			// no index, and counting it as pooled would leave it in no
+			// bucket at all. deb822 has no default architecture, so there is
+			// nothing to substitute — the field has to be filled in.
+			if ve.Metadata["Architecture"] == "" {
+				noarch = append(noarch, name+"@"+ve.Version)
+				continue
+			}
+			if ve.Metadata["_pool_path"] != "" {
+				continue
+			}
+			source := ve.SourceName
+			if source == "" {
+				source = pm.Name
+			}
+			if s.findDebInPool(poolMap, source, ve.Version, ve.Metadata["Architecture"]) == "" {
+				unpooled = append(unpooled, name+"@"+ve.Version+" ["+ve.Metadata["Architecture"]+"]")
+			}
+		}
+	}
+
+	if len(unserved) > 0 {
+		s.logger.Warn("apt entries name no served suite and reach no index; add the suite to apt_suites or correct the entry",
+			"count", len(unserved), "served", strings.Join(served, ","), "entries", capForLog(unserved))
+	}
+	if len(unresolved) > 0 {
+		s.logger.Warn("apt entries have no version and reach no index; no CLI verb can address a versionless entry, so run 'bodega repair' to clear them",
+			"count", len(unresolved), "packages", capForLog(unresolved))
+	}
+	if len(unpooled) > 0 {
+		s.logger.Warn("apt entries match no .deb in the pool and reach no index; upload the artifact or record its _pool_path",
+			"count", len(unpooled), "entries", capForLog(unpooled))
+	}
+	if len(noarch) > 0 {
+		s.logger.Warn("apt entries carry no Architecture metadata and reach no index; set it with 'bodega pkg edit' or re-run 'bodega build package'",
+			"count", len(noarch), "entries", capForLog(noarch))
+	}
+}
+
+// capForLog sorts and truncates a list for a single log field, so a hundred
+// staged entries do not produce a hundred-line record.
+func capForLog(items []string) string {
+	sort.Strings(items)
+	if len(items) > aptAuditLogLimit {
+		return strings.Join(items[:aptAuditLogLimit], " ") + fmt.Sprintf(" (+%d more)", len(items)-aptAuditLogLimit)
+	}
+	return strings.Join(items, " ")
+}
+
+// aptPoolListing is one cached pool listing and the moment it was taken.
+type aptPoolListing struct {
+	keys []string
+	at   time.Time
+}
+
+// aptPoolKeysFresh lists the pool and replaces the cache, skipping the cached
+// answer on the way in. It is for the caller that has already established the
+// cached listing cannot answer its question.
+//
+// The listing is unbounded and the whole pool is walked, once per configured
+// backend, so every call is a cost a write pays for. aptCachedPoolMap is what
+// bounds how often it is reached; reload clears the cache for the operator who
+// needs it gone sooner.
+func (s *Server) aptPoolKeysFresh(ctx context.Context) ([]string, error) {
+	if s.stores == nil {
+		return nil, nil
+	}
+	keys, err := s.listFanout(ctx, manifest.TypeApt, manifest.AptPoolPrefix)
+	if err != nil {
+		return nil, err
+	}
+	s.aptPool.Store(&aptPoolListing{keys: keys, at: time.Now()})
+	return keys, nil
+}
+
+// aptArchitectures returns sorted unique architectures from the apt manifest
+// entries published to suite.
+func (s *Server) aptArchitectures(ctx context.Context, suite string) []string {
+	seen := map[string]bool{}
+	for _, name := range s.store.ListPackages(manifest.TypeApt) {
+		pm, _ := s.store.GetPackage(ctx, manifest.TypeApt, name)
+		if pm == nil {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			if ve.Hidden || ve.Version == "*" || !ve.InSuite(suite, s.cfg.AptCodename) {
+				continue
+			}
+			if arch := ve.Metadata["Architecture"]; arch != "" && arch != "all" {
+				seen[arch] = true
+			}
+		}
+	}
+	var arches []string
+	for a := range seen {
+		arches = append(arches, a)
+	}
+	sort.Strings(arches)
+	return arches
+}
+
+// aptStanza is one generated Packages paragraph with the identity a profile
+// judges it by: the source package the pool path is laid out under, and the
+// version on the paragraph itself.
+//
+// The two are carried rather than re-derived because the paragraph is the only
+// place they are both known. Recovering the source from a rendered stanza
+// would mean parsing back what this file just wrote.
+type aptStanza struct {
+	source  string
+	version string
+	body    []byte
+}
+
+// generateAptPackages builds a Debian Packages file for the given suite and
+// architecture from manifest metadata, resolving entries that carry no
+// _pool_path against poolMap. poolMap is nil when no entry needed one.
+func (s *Server) generateAptPackages(ctx context.Context, suite, arch string, poolMap map[string]string, sharedPool bool) []byte {
+	body, _, _ := aptPackagesBody(s.aptSuiteStanzas(ctx, suite, arch, poolMap, sharedPool), nil)
+	return body
+}
+
+// aptPackagesBody concatenates the stanzas a profile permits, and every stanza
+// for the nil profile, which is the unfiltered index every unbound host reads.
+//
+// Membership is judged on the source package, matching filterAptPackages over
+// an upstream index and aptPoolGate over a pool path: one identity across the
+// index, the backstop and the operator's `bodega profile add`, because a
+// package the index offers and the pool refuses is the mid-transaction 403
+// this whole shape exists to avoid.
+func aptPackagesBody(stanzas []aptStanza, permit *entitle.Profile) (out []byte, kept, dropped int) {
+	var buf bytes.Buffer
+	for _, st := range stanzas {
+		if permit != nil && !permit.Permits(manifest.TypeApt, st.source, st.version).Permitted {
+			dropped++
+			continue
+		}
+		kept++
+		buf.Write(st.body)
+	}
+	return buf.Bytes(), kept, dropped
+}
+
+// aptSuiteStanzas renders one suite and architecture's paragraphs, in the
+// order ListPackages yields them.
+//
+// Rendered once and filtered per profile afterwards rather than regenerated
+// per profile: this walks every apt manifest entry and reads each one's
+// package document, so a fleet with a dozen profiles would otherwise pay a
+// dozen full walks of the catalog on every rebuild, and rebuilds run on the
+// hourly tick and again on every profile write.
+func (s *Server) aptSuiteStanzas(ctx context.Context, suite, arch string, poolMap map[string]string, sharedPool bool) []aptStanza {
+	var out []aptStanza
+	for _, name := range s.store.ListPackages(manifest.TypeApt) {
+		pm, _ := s.store.GetPackage(ctx, manifest.TypeApt, name)
+		if pm == nil || isPackageHidden(pm) {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			if ve.Hidden || ve.Version == "*" || !ve.InSuite(suite, s.cfg.AptCodename) {
+				continue
+			}
+			// An entry with no Version is unresolved. Its metadata may carry a
+			// Version that would produce a complete-looking stanza, but no CLI
+			// verb can address the entry to hide, freeze or remove it, so
+			// publishing it hands clients a package nobody can withdraw.
+			// auditAptEntries reports these once per rebuild.
+			if ve.Version == "" {
+				continue
+			}
+			veArch := ve.Metadata["Architecture"]
+			if veArch == "" {
+				continue
+			}
+			// Include if arch matches request or package is arch "all".
+			if veArch != arch && veArch != "all" {
+				continue
+			}
+
+			pkgName := ve.SourceName
+			if pkgName == "" {
+				pkgName = pm.Name
+			}
+
+			// Determine the pool path: prefer stored _pool_path, fall back to S3 lookup.
+			poolPath := ve.Metadata["_pool_path"]
+			matchedByFilename := poolPath == ""
+			if matchedByFilename {
+				poolPath = s.findDebInPool(poolMap, pkgName, ve.Version, veArch)
+			}
+			if poolPath == "" {
+				continue // no .deb uploaded yet
+			}
+
+			sha256Value := ve.Metadata["_sha256"]
+			if sha256Value == "" && ve.Checksum != nil && ve.Checksum.Algorithm == "sha256" {
+				sha256Value = ve.Checksum.Value
+			}
+			// On a pool that has held upstream bytes, a filename match plus no
+			// digest is unverifiable by construction: the client has nothing to
+			// check the substitution against, and the object may be a mirrored
+			// .deb the exclusion set failed to name — a row lost with the audit
+			// database, or one written before this instance had one (#170,
+			// #225). aptMirroredPoolKeys refuses the same way when it cannot
+			// read the record at all. Entries carrying _pool_path are bodega's
+			// own writes and unaffected; so is every entry on an instance that
+			// has never mirrored, where the pool holds only what the operator
+			// put in it.
+			if sharedPool && matchedByFilename && sha256Value == "" {
+				s.logger.Warn("apt entry matched a pool object by filename and carries no SHA256, so it stays out of an index whose pool has held upstream bytes; record the digest with `bodega pkg edit` or re-upload through bodega",
+					"package", pkgName, "version", ve.Version, "arch", veArch, "pool_path", poolPath)
+				continue
+			}
+
+			version := ve.Metadata["Version"]
+			if version == "" {
+				version = ve.Version
+			}
+
+			// Emit canonical apt fields from the manifest in Debian Policy §5.3
+			// order. Package/Version/Architecture fall back to manifest fields
+			// when metadata doesn't carry them (e.g., freshly edited entries).
+			var buf bytes.Buffer
+			if ve.Metadata["Package"] == "" {
+				writeDebField(&buf, "Package", pkgName)
+			} else {
+				writeDebField(&buf, "Package", ve.Metadata["Package"])
+			}
+			writeDebField(&buf, "Version", version)
+			writeDebField(&buf, "Architecture", veArch)
+
+			canonical := []string{
+				"Source", "Essential",
+				"Maintainer", "Original-Maintainer", "Installed-Size",
+				"Pre-Depends", "Depends", "Recommends", "Suggests", "Enhances",
+				"Breaks", "Conflicts", "Replaces", "Provides",
+				"Section", "Priority", "Multi-Arch", "Homepage",
+			}
+			// Fields the generator emits itself, from bodega's own record of
+			// the artifact. Suppressed in the extras loop below so a metadata
+			// copy scraped from upstream cannot land a second, contradictory
+			// occurrence in the stanza. deb822 does not define a repeated
+			// field, so which one a client keeps is a parser's choice.
+			// Origin belongs to Release and names the wrong repository when
+			// it arrives here from an upstream scrape.
+			seen := map[string]bool{
+				"Package": true, "Version": true, "Architecture": true,
+				"Description": true, "Filename": true, "Size": true,
+				"MD5sum": true, "SHA1": true, "SHA256": true, "Origin": true,
+			}
+			for _, f := range canonical {
+				seen[f] = true
+				writeDebField(&buf, f, ve.Metadata[f])
+			}
+
+			// Catch-all for less common fields (Built-Using, Python-Version, etc.)
+			// so rare-but-legal Debian fields survive the round-trip.
+			extras := make([]string, 0)
+			for k := range ve.Metadata {
+				if strings.HasPrefix(k, "_") || seen[k] {
+					continue
+				}
+				extras = append(extras, k)
+			}
+			sort.Strings(extras)
+			for _, k := range extras {
+				writeDebField(&buf, k, ve.Metadata[k])
+			}
+
+			writeDebField(&buf, "Filename", poolPath)
+			if ve.ArtifactSize > 0 {
+				fmt.Fprintf(&buf, "Size: %d\n", ve.ArtifactSize)
+			}
+			if md5 := ve.Metadata["_md5"]; md5 != "" {
+				fmt.Fprintf(&buf, "MD5sum: %s\n", md5)
+			}
+			if sha1 := ve.Metadata["_sha1"]; sha1 != "" {
+				fmt.Fprintf(&buf, "SHA1: %s\n", sha1)
+			}
+			writeDebField(&buf, "SHA256", sha256Value)
+
+			// Description goes last and re-introduces the continuation prefix
+			// that deb822.ParseSingle stripped. A manifest-level description
+			// is used only when metadata has none.
+			desc := ve.Metadata["Description"]
+			if desc == "" {
+				desc = ve.Description
+			}
+			if desc == "" {
+				desc = pm.Description
+			}
+			if desc != "" {
+				writeDebDescription(&buf, desc)
+			}
+			buf.WriteString("\n")
+			out = append(out, aptStanza{source: pkgName, version: version, body: buf.Bytes()})
+		}
+	}
+	return out
+}
+
+// findDebInPool resolves a manifest entry that carries no _pool_path to a pool
+// object, by the exact Debian binary package filename and nothing looser.
+//
+// There used to be a second pass matching on the "<pkg>_<version>" prefix. It
+// dropped the architecture, so an arm64 entry resolved to whatever amd64
+// object happened to sit in the pool, and it iterated a map, so which one it
+// picked changed between runs. Both mattered the moment pool/ started holding
+// artifacts bodega did not build: the resulting stanza carries no SHA256 —
+// that field comes from the same metadata _pool_path does — so a client has
+// nothing to check the substitution against.
+//
+// An entry whose object is named anything else now reaches no index, and
+// auditAptEntries names it as unpooled on every rebuild.
+func (s *Server) findDebInPool(poolMap map[string]string, pkgName, version, arch string) string {
+	return poolMap[pkgName+"_"+version+"_"+arch+".deb"]
+}
+
+// writeDebField writes a single "Key: Value" line to buf, sanitizing val to
+// prevent field injection via embedded newlines.
+func writeDebField(buf *bytes.Buffer, key, val string) {
+	if val == "" {
+		return
+	}
+	// Strip newlines and carriage returns to prevent field injection.
+	val = strings.ReplaceAll(val, "\n", " ")
+	val = strings.ReplaceAll(val, "\r", "")
+	fmt.Fprintf(buf, "%s: %s\n", key, val)
+}
+
+// writeDebDescription emits a multi-line Description field using Debian's
+// single-space continuation convention. Empty interior lines become " .",
+// preserving paragraph breaks in long descriptions.
+func writeDebDescription(buf *bytes.Buffer, val string) {
+	lines := strings.Split(val, "\n")
+	for i, line := range lines {
+		line = strings.TrimRight(line, "\r")
+		if i == 0 {
+			fmt.Fprintf(buf, "Description: %s\n", line)
+			continue
+		}
+		if line == "" {
+			buf.WriteString(" .\n")
+		} else {
+			buf.WriteString(" ")
+			buf.WriteString(line)
+			buf.WriteString("\n")
+		}
+	}
+}
+
+// isSafePath rejects path values that contain traversal sequences or encoded
+// traversal attempts. Use on any {path...} wildcard before constructing S3 keys.
+func isSafePath(p string) bool {
+	if strings.Contains(p, "..") {
+		return false
+	}
+	if strings.Contains(p, "%2e") || strings.Contains(p, "%2E") {
+		return false
+	}
+	return p != ""
+}
+
+// requireStorage returns true when a backend is available to serve from. If
+// not, it writes a 503 and returns false.
+//
+// The message names no driver on purpose: the old wording claimed S3 on a
+// local install whose storage_path simply could not be created, which sent
+// operators looking for a bucket the config never asked for. The reason the
+// backend is missing is known where it was constructed, so the message points
+// at the startup log rather than guessing.
+func (s *Server) requireStorage(w http.ResponseWriter, store storage.ObjectStore) bool {
+	if s.stores == nil || store == nil {
+		http.Error(w, "storage backend unavailable — package serving disabled; see the server startup log for the backend error", http.StatusServiceUnavailable)
+		return false
+	}
+	return true
+}
+
+// mirroredStanzas renders the mirrored codenames as stanzas, one per distinct
+// Components: line, in the order MirroredAptCodenames reports them.
+//
+// Grouped on the components rather than collapsed to one, because a stanza
+// carries a single Components: line for every suite on it: two codenames
+// mirrored from archives publishing different component sets cannot share one
+// without offering apt a path one of them 404s.
+//
+// The key is the effective set, ordered and deduplicated, rather than the
+// configured spelling: a codename that declares none renders the same line as
+// one declaring Ubuntu's four, and two codenames declaring the same components
+// in different order render the same line too. Grouping on the spelling split
+// all three into stanzas apt cannot tell apart. The line itself keeps the first
+// codename's configured order, so the output is stable across runs.
+func (s *Server) mirroredStanzas(st aptsources.State) []aptsources.Sources {
+	var order []string
+	byKey := map[string][]string{}
+	comps := map[string][]string{}
+	for _, codename := range s.cfg.MirroredAptCodenames() {
+		effective := aptsources.MirroredComponentList(s.cfg.AptComponentsFor(codename))
+		key := componentsKey(effective)
+		if _, seen := byKey[key]; !seen {
+			order = append(order, key)
+			comps[key] = effective
+		}
+		byKey[key] = append(byKey[key], codename)
+	}
+	out := make([]aptsources.Sources, 0, len(order))
+	for _, key := range order {
+		one := st
+		one.Suites = byKey[key]
+		one.Mirrored = true
+		one.Components = comps[key]
+		out = append(out, aptsources.Render(one))
+	}
+	return out
+}
+
+// componentsKey identifies a component set independently of the order and the
+// repetition its config carried. apt reads Components: as a set, so two
+// codenames whose upstreams declare the same components in different order
+// serve the same paths and belong on one stanza.
+func componentsKey(components []string) string {
+	sorted := slices.Clone(components)
+	slices.Sort(sorted)
+	return strings.Join(slices.Compact(sorted), " ")
+}
+
+// aptSourcesBanner renders the apt client stanza for the startup banner. It
+// runs after the signing key is loaded and the suites are resolved, so it
+// prints what this process will actually serve rather than the example the
+// command's help text used to carry.
+//
+// No request is in hand here, so a server with no public_url set prints a
+// placeholder host and the note that says so.
+func (s *Server) aptSourcesBanner() string {
+	st := s.aptSourcesState(nil)
+	blocks := []aptsources.Sources{aptsources.Render(st)}
+	// The mirrored codenames follow, grouped rather than one each: this is a
+	// file to paste, and four codenames printed as four stanzas is four sources
+	// entries where apt wants one. They stay out of the generated stanza above,
+	// which differs in the only line that matters here — what authenticates the
+	// suite — so folding them together would apply the wrong trust to half of
+	// it.
+	blocks = append(blocks, s.mirroredStanzas(st)...)
+	// And one per filtered codename. A profile's suite is not in apt_suites
+	// and not in apt_upstreams, so an operator reading the config file finds
+	// no trace of it; leaving it off the banner as well would mean the only
+	// place the name appears is the log line that built it.
+	filtered, _ := s.aptFilteredSuites()
+	for _, codename := range filtered {
+		one := st
+		one.Suites = []string{codename}
+		blocks = append(blocks, aptsources.Render(one))
+	}
+	var b strings.Builder
+	b.WriteString("\n/etc/apt/sources.list.d/bodega.sources:\n")
+	for i, src := range blocks {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		for _, line := range strings.Split(src.Deb822, "\n") {
+			b.WriteString("  " + line + "\n")
+		}
+		for _, note := range src.Notes {
+			b.WriteString("  # " + note + "\n")
+		}
+	}
+	b.WriteString("\n")
+	return b.String()
+}

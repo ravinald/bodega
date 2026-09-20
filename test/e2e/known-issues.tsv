@@ -1,0 +1,17 @@
+# check-id	issue	note
+#
+# A FAIL whose check id appears here is reported XFAIL, and a PASS is reported
+# XPASS. XPASS is the signal to close the issue and delete the row.
+#
+# Without this file every run re-files the same open caveats and the report
+# buries the new findings under the known ones. Add a row when an issue is
+# filed; delete it when the issue closes.
+#
+# A row whose check id no suite produces is reported at the end of a full run
+# as "known issues with no check yet". That is the coverage gap, listed rather
+# than discovered later: the id names the check somebody still has to write.
+#
+# Seeded from the open caveats on 2026-09-14.
+PIPE-APT-07	311	PackageApt writes pool paths under the binary name
+PROF-16	310	an apt pin cannot name a source version
+PIPE-APT-08	271	_pool_path is unconditional provenance, so no SHA256 when mirroring

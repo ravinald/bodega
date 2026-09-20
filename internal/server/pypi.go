@@ -1,0 +1,639 @@
+package server
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"html"
+	"net/url"
+	"path"
+	"regexp"
+	"strconv"
+	"strings"
+
+	"net/http"
+
+	"github.com/ravinald/bodega/internal/builder"
+	"github.com/ravinald/bodega/internal/manifest"
+)
+
+// ---- PyPI ------------------------------------------------------------------
+
+// handlePypiIndex generates a PEP 503 root index listing all packages found
+// under the pypi/wheels/ S3 prefix.
+func (s *Server) handlePypiIndex(w http.ResponseWriter, r *http.Request) {
+	noSharedCache(w)
+	if !s.requireStorage(w, s.typeStore(manifest.TypePypi)) {
+		return
+	}
+	keys, err := s.listFanout(r.Context(), manifest.TypePypi, manifest.PypiWheelPrefix)
+	if err != nil {
+		s.logger.Error("list wheels failed", "error", err)
+		http.Error(w, "upstream error", http.StatusBadGateway)
+		return
+	}
+
+	names := uniquePackageNames(keys)
+
+	// Filter out hidden packages, and the ones this host's profile does not
+	// cover. The root index names no version, so it is decided at the
+	// membership level alone.
+	prof := s.profileFor(r)
+	var visible []string
+	for _, n := range names {
+		pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, n)
+		if pkg != nil && isPackageHidden(pkg) {
+			continue
+		}
+		if !prof.Covers(manifest.TypePypi, n).Permitted {
+			continue
+		}
+		visible = append(visible, n)
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = fmt.Fprintf(w, "<!DOCTYPE html>\n<html>\n  <head><title>Simple Index</title></head>\n  <body>\n")
+	for _, n := range visible {
+		_, _ = fmt.Fprintf(w, "    <a href=\"/pypi/simple/%s/\">%s</a>\n", html.EscapeString(n), html.EscapeString(n))
+	}
+	_, _ = fmt.Fprintf(w, "  </body>\n</html>\n")
+}
+
+// pypiEntryVersionFilter permits only the versions a manifest entry names, and
+// is nil when nothing here constrains the set.
+//
+// The per-package index is generated from the keys in storage rather than from
+// the manifest, so a wheel the manifest stopped naming stays installable: a
+// re-pin from 1.17.0 to 1.16.0 leaves the old wheel under the same prefix, pip
+// reads both links off /pypi/simple/six/ and takes the newer one. No request in
+// that sequence is refused anywhere, and the version installed is one nobody
+// approved.
+//
+// nil for a distribution with no entry, or an entry naming no version: one that
+// only ever arrives as somebody else's transitive dependency is pinned by the
+// resolved closure rather than by an entry here, and filtering it against an
+// empty set would empty the index.
+func pypiEntryVersionFilter(pm *manifest.PackageManifest) func(string) bool {
+	if pm == nil {
+		return nil
+	}
+	type pin struct{ version, constraint string }
+	var pins []pin
+	for _, ve := range pm.Versions {
+		v := strings.TrimSpace(ve.Version)
+		if v == "" || v == "*" {
+			continue
+		}
+		pins = append(pins, pin{version: v, constraint: ve.VersionConstraint})
+	}
+	if len(pins) == 0 {
+		return nil
+	}
+	return func(v string) bool {
+		for _, p := range pins {
+			// Literal equality before the PEP 440 filter, which drops what it
+			// cannot parse: pytz shipped "2011k", and an entry may name it.
+			if v == p.version {
+				return true
+			}
+			if len(builder.FilterPypiVersions([]string{v}, p.constraint, p.version)) > 0 {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// handlePypiPackage generates a PEP 503 per-package index listing wheel files.
+func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
+	noSharedCache(w)
+	if !s.requireStorage(w, s.typeStore(manifest.TypePypi)) {
+		return
+	}
+	pkgName := r.PathValue("package")
+	pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, pkgName)
+	if pkg != nil && isPackageHidden(pkg) {
+		http.NotFound(w, r)
+		return
+	}
+	if !s.entitleGate(w, r, manifest.TypePypi, pkgName, "") {
+		return
+	}
+	permit := profileVersionFilter(s.profileFor(r), manifest.TypePypi, pkgName)
+	normalized := manifest.CanonicalPypiName(pkgName)
+
+	// Proxy the simple index from upstream PyPI, republished onto bodega's own
+	// wheel route. Served verbatim it hands pip absolute
+	// files.pythonhosted.org links, so every client resolves through bodega and
+	// then downloads around it: nothing is cached, the allow-list never sees
+	// the artifact, and no row records the bytes that got installed. The cached
+	// object stays the upstream document; the rewrite happens on the way out,
+	// so a hit and a miss republish identically.
+	//
+	// Ahead of the cache listing rather than as its fallback: a listing built
+	// from stored keys carries only what somebody has already fetched, so the
+	// first wheel cached under a proxy-mode distribution would otherwise become
+	// the only version of it that exists for every later client. The cached
+	// copy is not lost by republishing upstream — every href lands on
+	// /pypi/wheels/, which answers from storage before it reaches the network.
+	if pkg != nil && packageMode(pkg) == manifest.ModeProxy {
+		upstream := s.pypiSimpleURL(normalized)
+		rw := &pypiIndexWriter{ResponseWriter: w, indexURL: upstream, pkg: pkgName, permit: permit}
+		s.proxyOrCache(rw, r, s.typeStore(manifest.TypePypi),
+			"pypi/simple/"+normalized+"/index.html",
+			upstream, manifest.TypePypi, pkgName, pkgName, false, true)
+		if err := rw.flush(); err != nil {
+			s.logger.Warn("client read of a republished pypi index was cut short", "package", pkgName, "error", err)
+		}
+		return
+	}
+
+	if pkg == nil {
+		// The index read is where a pypi install first meets an uncataloged
+		// distribution: pip resolves through here and never composes a wheel
+		// URL, so the wheel route's recorder sees nothing and the documented
+		// bootstrap (observe, install, generate-manifests) returned an empty
+		// catalog on an empty store. The recorded URL is the simple index
+		// rather than an artifact, for the same reason it is there: a wheel URL
+		// is read out of this document, not composed.
+		//
+		// Ahead of the listing, and not conditional on it. `pkg delete pypi`
+		// leaves the wheels in storage on purpose, so a distribution with no
+		// manifest entry can still have cached bytes to list; recording only
+		// the empty listing made the observation depend on what the cache
+		// happened to hold rather than on what the catalog does not.
+		//
+		// An entry in some mode other than proxy reaches the same 404 and is
+		// deliberately not recorded — see recordNoManifest.
+		s.recordNoManifest(r.Context(), r, manifest.TypePypi, normalized, "", s.pypiSimpleURL(normalized))
+	}
+
+	keys, err := s.listFanout(r.Context(), manifest.TypePypi, manifest.PypiWheelPrefix)
+	if err != nil {
+		s.logger.Error("list wheels failed", "error", err)
+		http.Error(w, "upstream error", http.StatusBadGateway)
+		return
+	}
+
+	// Collect matching wheel paths. We keep the path relative to "pypi/wheels/"
+	// so links work with versioned subdirs (e.g. "0.4.6/examplesdk-1.35.0-py3-none-any.whl").
+	type wheelEntry struct {
+		relPath  string // relative to pypi/wheels/, e.g. "0.4.6/examplesdk-1.35.0.whl"
+		filename string // base filename for display
+	}
+	named := pypiEntryVersionFilter(pkg)
+	var wheels []wheelEntry
+	for _, key := range keys {
+		filename := path.Base(key)
+		if !strings.HasSuffix(filename, ".whl") {
+			continue
+		}
+		dist := wheelDistName(filename)
+		if manifest.CanonicalPypiName(dist) != normalized {
+			continue
+		}
+		if _, version := wheelIdentity(filename); version != "" {
+			if permit != nil && !permit(version) {
+				continue
+			}
+			if named != nil && !named(version) {
+				continue
+			}
+		}
+		relPath := strings.TrimPrefix(key, manifest.PypiWheelPrefix)
+		wheels = append(wheels, wheelEntry{relPath: relPath, filename: filename})
+	}
+
+	if len(wheels) == 0 {
+		http.NotFound(w, r)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	escapedName := html.EscapeString(pkgName)
+	_, _ = fmt.Fprintf(w, "<!DOCTYPE html>\n<html>\n  <head><title>Links for %s</title></head>\n  <body>\n", escapedName)
+	_, _ = fmt.Fprintf(w, "    <h1>Links for %s</h1>\n", escapedName)
+	for _, whl := range wheels {
+		_, _ = fmt.Fprintf(w, "    <a href=\"/pypi/wheels/%s\">%s</a>\n", html.EscapeString(whl.relPath), html.EscapeString(whl.filename))
+	}
+	_, _ = fmt.Fprintf(w, "  </body>\n</html>\n")
+}
+
+// handlePypiWheel proxies /pypi/wheels/{path...} → S3 pypi/wheels/{path...}
+// Supports versioned subdirs (e.g. pypi/wheels/0.4.6/examplesdk-1.26.0-py3-none-any.whl).
+// For proxy-mode packages, falls back to fetching from upstream PyPI.
+func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
+	p := r.PathValue("path")
+	if !isSafePath(p) {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+	key := manifest.PypiWheelPrefix + p
+	file := path.Base(p)
+	// Wrapped rather than set: proxyOrResolve and proxyVersion below can both
+	// answer 403 or 404, and http.Error leaves the header map alone.
+	w = cachePrivateOn200(w, file)
+
+	// Extract package name and version from the wheel filename
+	// (e.g. "examplesdk-1.26.0-py3-none-any.whl" → "examplesdk", "1.26.0").
+	dist, distVersion := wheelIdentity(file)
+
+	// A filename wheelIdentity cannot place still names an object key, which is
+	// composed from the client's path either way, so gating only the placeable
+	// ones serves "-x.whl" to a profile that permits nothing. The filename
+	// stands in for the package: no entry can name it, so a closed type answers
+	// it as the reach it is, and its version is as unreadable as its name.
+	// PEP 427 spells the distribution field of a wheel filename with
+	// underscores where PEP 503 spells the name with hyphens, so everything
+	// downstream of here addresses the manifest, the profile and the audit row
+	// under the canonical name. Reading the raw one is what served
+	// django-cors-headers its simple index and 404d every wheel that index
+	// listed: 40 of the 101 distributions in a widget install.
+	normalized := manifest.CanonicalPypiName(dist)
+	gateName, gateVersion := normalized, distVersion
+	if gateName == "" {
+		gateName, gateVersion = file, ""
+	}
+	if !s.entitleGate(w, r, manifest.TypePypi, gateName, gateVersion) {
+		return
+	}
+
+	if dist != "" {
+		pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, normalized)
+		if pkg != nil && packageMode(pkg) == manifest.ModeProxy {
+			resolve := func(ctx context.Context) (string, error) {
+				return s.resolvePypiWheel(ctx, normalized, file)
+			}
+			s.proxyOrResolve(w, r, s.typeStore(manifest.TypePypi), key, resolve, "", manifest.TypePypi, normalized, normalized, true, true)
+			return
+		}
+		if pkg == nil {
+			// The simple index, not the artifact: a wheel URL cannot be
+			// composed without reading the index, so the index is the only
+			// fetchable URL this branch knows. `discover promote --as manifest`
+			// stores it, and manifestURL trims it back to the registry root.
+			s.recordNoManifest(r.Context(), r, manifest.TypePypi, normalized, distVersion, s.pypiSimpleURL(normalized))
+
+			// pypi wheels stay catalog-only where npm tarballs proxy, and the
+			// index read is only half the reason. The other half is that no
+			// client is refused by it: /pypi/simple/{dist}/ republishes an
+			// upstream index for a proxy-mode distribution only, and lists
+			// stored wheels otherwise, so an uncatalogued distribution never
+			// acquires a wheel URL for anything to follow. Opening this route
+			// would pay a simple-index fetch per request for addresses only a
+			// guess produces, which is the opposite trade to npm's.
+			s.proxyVersionOrRefuse(w, r, manifest.TypePypi, normalized, distVersion, key,
+				"no manifest entry names pypi distribution "+normalized+", and a wheel URL cannot be composed without reading "+
+					s.pypiSimpleURL(normalized)+"; catalog it first: bodega pkg create pypi "+normalized)
+			return
+		}
+	}
+	s.proxyVersion(w, r, manifest.TypePypi, normalized, distVersion, key)
+}
+
+// pypiSimpleURL is the PEP 503 index URL for one distribution under the
+// configured index root.
+func (s *Server) pypiSimpleURL(normalized string) string {
+	return strings.TrimRight(s.cfg.PypiUpstream, "/") + "/simple/" + normalized + "/"
+}
+
+// pypiIndexWriter buffers a proxied simple index so its links can be pointed
+// back at bodega before the client sees them.
+//
+// Buffering rather than streaming, deliberately: an anchor cannot be rewritten
+// from a chunk that may have split it in half. What is held is one simple
+// index, which runs from a few kilobytes to a couple of megabytes for the
+// oldest distributions on pypi, and proxyOrCache has already spooled the same
+// bytes to disk before the first Write lands here. maxUpstreamBody is the
+// ceiling on that buffer, which bounds a hostile or broken upstream rather
+// than any real index. Wrapping the writer rather
+// than teaching proxyOrCache a transform hook keeps the cached object the
+// document the upstream actually served, which is what makes it evidence.
+//
+// It is not an http.Flusher and has no ReadFrom. Both would defeat the buffer.
+type pypiIndexWriter struct {
+	http.ResponseWriter
+	indexURL string
+	// pkg is the distribution this page is for, which is what lets the filter
+	// place a filename's version by stripping the name rather than guessing at
+	// where it ends.
+	pkg string
+	// permit is the profile's version rule for this distribution, nil when no
+	// profile governs it. Applied before the href rewrite so the two passes
+	// read the upstream filenames rather than one reading the other's output.
+	permit func(string) bool
+	status int
+	body   bytes.Buffer
+	// tooBig records that the upstream ran past maxUpstreamBody. B33 settled
+	// the same question for the npm packument: serving an unrewritten body is
+	// the bypass the rewrite exists to close, so refusing is the honest answer
+	// and a ceiling has to exist for refusing to be possible. Without one the
+	// only bound was spool_max_artifact_bytes on the miss path, and nothing at
+	// all on the cache-hit path where proxyS3 streams a stored object straight
+	// in.
+	tooBig bool
+}
+
+func (p *pypiIndexWriter) WriteHeader(code int) {
+	if p.status == 0 {
+		p.status = code
+	}
+}
+
+func (p *pypiIndexWriter) Write(b []byte) (int, error) {
+	if p.status == 0 {
+		p.status = http.StatusOK
+	}
+	if int64(p.body.Len()+len(b)) > maxUpstreamBody {
+		p.tooBig = true
+		p.body.Reset()
+		// An error rather than a silent discard: it stops the copy at the
+		// ceiling instead of reading the rest of a body nothing will use, and
+		// no status line has gone out yet, so flush can still refuse.
+		return 0, fmt.Errorf("simple index for %s exceeds bodega's %d-byte rewrite buffer", p.pkg, maxUpstreamBody)
+	}
+	return p.body.Write(b)
+}
+
+// flush rewrites a successful index and writes the buffered response through.
+// A refusal or an error passes untouched: those bodies carry no links, and a
+// 403 from the allow-list must reach the client as the handler wrote it.
+func (p *pypiIndexWriter) flush() error {
+	body := p.body.Bytes()
+	if p.status == 0 {
+		p.status = http.StatusOK
+	}
+	if p.status == http.StatusOK {
+		if p.tooBig {
+			err := fmt.Errorf("simple index for %s exceeds bodega's %d-byte rewrite buffer: serving it unrewritten would point the client at the upstream index", p.pkg, maxUpstreamBody)
+			http.Error(p.ResponseWriter, err.Error(), http.StatusBadGateway)
+			return err
+		}
+		body = rewritePypiIndex(filterPypiSimplePage(body, p.pkg, p.permit), p.indexURL)
+		// proxyS3 sets ETag from the stored object, which is the upstream
+		// document rather than what is going out. Left on, it labels the
+		// republished body with a validator for different bytes.
+		p.Header().Del("ETag")
+	}
+	p.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	p.ResponseWriter.WriteHeader(p.status)
+	_, err := p.ResponseWriter.Write(body)
+	return err
+}
+
+// pypiAnchorPattern matches one opening anchor tag and its attributes. A PEP
+// 503 index is generated HTML with one anchor per file and nothing nested
+// inside the tag, so rewriting the tag is safe without a parser.
+var pypiAnchorPattern = regexp.MustCompile(`<a\s[^>]*>`)
+
+// pypiMetadataAttrPattern matches the PEP 658 metadata attribute under both
+// spellings: data-dist-info-metadata is the provisional name pip 22 shipped,
+// data-core-metadata the one PEP 714 settled on.
+var pypiMetadataAttrPattern = regexp.MustCompile(`\s+data-(?:dist-info|core)-metadata="[^"]*"`)
+
+// rewritePypiIndex republishes an upstream simple index with every href on
+// bodega's /pypi/wheels/ route, resolved against the index URL it came from so
+// a relative href (which PEP 503 permits) lands on the same file an absolute
+// one would.
+//
+// The #sha256= fragment survives the rewrite: it is pip's integrity check on
+// the artifact, and dropping it would have clients install bytes they cannot
+// verify.
+//
+// The PEP 658 metadata attribute does not. pip reads it as a promise that
+// "<href>.metadata" is fetchable, and only files.pythonhosted.org publishes
+// that file — bodega resolves a wheel by filename against the index, which
+// lists no ".whl.metadata" entry to match. Carried forward beside a rewritten
+// href it points pip at a bodega path that does not exist, and pip does not
+// fall back: 26.2.1 against a republished six index answers
+//
+//	ERROR: 404 Client Error: Not Found for url:
+//	http://127.0.0.1:8137/pypi/wheels/six-1.16.0-py2.py3-none-any.whl.metadata
+//
+// and installs nothing. Dropped, the same client downloads the wheel through
+// the proxy, which is the fetch that fills the cache and reaches the
+// allow-list. Republishing the metadata file itself would change how a wheel is
+// resolved and belongs with that work, not with a rewrite of what is served.
+//
+// An anchor whose href names no file is left as it stands: a rewrite that
+// cannot name a target is a guess, and the wheel route would 404 it anyway.
+func rewritePypiIndex(body []byte, indexURL string) []byte {
+	base, err := url.Parse(indexURL)
+	if err != nil {
+		return body
+	}
+	return pypiAnchorPattern.ReplaceAllFunc(body, func(tag []byte) []byte {
+		m := pypiHrefPattern.FindSubmatch(tag)
+		if m == nil {
+			return tag
+		}
+		u, err := base.Parse(html.UnescapeString(string(m[1])))
+		if err != nil {
+			return tag
+		}
+		name, err := url.PathUnescape(path.Base(u.Path))
+		if err != nil || name == "" || name == "." || name == "/" {
+			return tag
+		}
+		href := "/" + manifest.PypiWheelPrefix + url.PathEscape(name)
+		if u.Fragment != "" {
+			href += "#" + u.Fragment
+		}
+		out := pypiHrefPattern.ReplaceAll(tag, []byte(`href="`+html.EscapeString(href)+`"`))
+		return pypiMetadataAttrPattern.ReplaceAll(out, nil)
+	})
+}
+
+// pypiHrefFilename recovers the filename one href names, unescaped. An href
+// that does not parse yields "", which every caller reads as "this anchor
+// names no file bodega can place".
+func pypiHrefFilename(href string) string {
+	u, err := url.Parse(html.UnescapeString(href))
+	if err != nil {
+		return ""
+	}
+	name, err := url.PathUnescape(path.Base(u.Path))
+	if err != nil || name == "." || name == "/" {
+		return ""
+	}
+	return name
+}
+
+// pypiHrefPattern pulls the link targets out of a PEP 503 index. The document
+// is generated HTML with one anchor per file and no nesting, so a full parser
+// buys nothing over this; the match is only a candidate, and the filename
+// comparison below is what decides.
+var pypiHrefPattern = regexp.MustCompile(`href="([^"]*)"`)
+
+// resolvePypiWheel returns the upstream URL for one wheel by reading the
+// simple index for its distribution.
+//
+// PyPI serves artifacts from files.pythonhosted.org under a path derived from
+// the file's content hash, which is not recoverable from the filename. The
+// index is the only document that carries the mapping, so resolution is a
+// lookup rather than a concatenation, and a filename the index does not list
+// is refused here instead of becoming a fetch of a URL nobody can check.
+func (s *Server) resolvePypiWheel(ctx context.Context, normalized, filename string) (string, error) {
+	indexURL := s.pypiSimpleURL(normalized)
+	body, _, err := fetchUpstream(ctx, indexURL)
+	if err != nil {
+		return "", fmt.Errorf("read the pypi simple index %s: %w", indexURL, err)
+	}
+	base, err := url.Parse(indexURL)
+	if err != nil {
+		return "", fmt.Errorf("parse the pypi simple index URL %s: %w", indexURL, err)
+	}
+
+	listed := 0
+	for _, m := range pypiHrefPattern.FindAllSubmatch(body, -1) {
+		href := html.UnescapeString(string(m[1]))
+		u, err := base.Parse(href)
+		if err != nil {
+			continue
+		}
+		listed++
+		name, err := url.PathUnescape(path.Base(u.Path))
+		if err != nil || name != filename {
+			continue
+		}
+		// The #sha256= fragment is the publisher's checksum, not part of the
+		// object; dropping it keeps the logged URL the thing that was fetched.
+		u.Fragment = ""
+		return u.String(), nil
+	}
+	return "", fmt.Errorf("%w: %s lists %d file(s) and none of them is %s — the index is authoritative for what pypi publishes, so check the filename and the version against it",
+		errUpstreamNotFound, indexURL, listed, filename)
+}
+
+// pypiSdistSuffixes are the archive extensions pypi publishes source
+// distributions under. setuptools writes .tar.gz, .zip on Windows, and the
+// other two survive in the older half of the index.
+var pypiSdistSuffixes = []string{".tar.gz", ".tar.bz2", ".tar.xz", ".zip", ".tgz"}
+
+// wheelIdentity splits a distribution filename into its project and version.
+// It yields an empty version for a name it cannot place, which every caller
+// reads as "decide this on membership alone" rather than as a version to hold
+// to a constraint, and an empty project too for an extension it does not know.
+//
+// A wheel is exact: PEP 427 fixes the first two hyphen-separated fields. An
+// sdist is not, because the project name may carry hyphens of its own
+// (PEP 625 normalizes them to underscores, and the files predating it are
+// still on the index), so the split is the last hyphen that begins a version.
+// Reading an sdist as a wheel is what refused django-5.0.0.tar.gz at the pin
+// that named 5.0.0: the version came back as "5.0.0.tar.gz", which matches no
+// constraint an operator can write.
+func wheelIdentity(filename string) (dist, version string) {
+	for _, ext := range pypiSdistSuffixes {
+		if base, ok := strings.CutSuffix(filename, ext); ok {
+			return sdistIdentity(base, filename)
+		}
+	}
+	base, ok := strings.CutSuffix(filename, ".whl")
+	if !ok {
+		// An extension bodega does not know is not a wheel, and the wheel
+		// split reads one anyway: msgpack-python-0.3.0.win-amd64-py2.7.exe, a
+		// bdist_wininst file pypi still publishes, comes back as msgpack at
+		// python — a package no profile lists and a version nobody wrote.
+		// Placing neither is what makes a closed type answer the file as the
+		// reach it is rather than decide about the wrong project.
+		return "", ""
+	}
+	parts := strings.Split(base, "-")
+	if len(parts) < 2 {
+		return wheelDistName(filename), ""
+	}
+	return parts[0], parts[1]
+}
+
+// sdistIdentity splits {name}-{version} by scanning hyphens right to left and
+// taking the first whose remainder opens with an all-digit release segment
+// (the run up to the next '.', '-' or '_'). That places backports-abc-0.5 as
+// backports-abc at 0.5, python-3parclient-4.2.10 as python-3parclient at
+// 4.2.10, and foo-1.0-beta1 as foo at 1.0-beta1.
+//
+// Right to left rather than left to right is what places sphinxcontrib-2048
+// at 0.1; scanning forward reads it as sphinxcontrib at 2048-0.1. Requiring a
+// whole numeric segment rather than a leading digit is what keeps
+// python-3parclient off the 3parclient-4.2.10 reading, which named the wrong
+// package in both the refusal and the audit row.
+//
+// {name}-{version} with hyphens legal on both sides has no unambiguous
+// reading, so the residual case is a post-release such as foo-1.0-1, which
+// comes back as foo-1.0 at 1. The filename does not settle it. The index
+// filter never has to guess, because it knows the distribution its page is
+// for: see pypiPageVersion.
+func sdistIdentity(base, filename string) (dist, version string) {
+	for i := len(base) - 2; i > 0; i-- {
+		if base[i] == '-' && opensOnRelease(base[i+1:]) {
+			return base[:i], base[i+1:]
+		}
+	}
+	return wheelDistName(filename), ""
+}
+
+// opensOnRelease reports whether a version candidate begins with a numeric
+// release segment, which PEP 440 requires of every version and which the tail
+// of a project name ("abc", "beta1") does not satisfy.
+func opensOnRelease(v string) bool {
+	n := strings.IndexAny(v, ".-_")
+	if n < 0 {
+		n = len(v)
+	}
+	if n == 0 {
+		return false
+	}
+	for i := 0; i < n; i++ {
+		if v[i] < '0' || v[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// pypiPageVersion places a file's version on a per-distribution index, where
+// the distribution is known and the filename does not have to be guessed at.
+// It strips the page's own name off the front, which is exact for every
+// project whose name carries a hyphen: python-3parclient-4.2.10.tar.gz splits
+// nowhere a filename alone settles, and the heuristic split refused the
+// pinned release and hid it from the page.
+//
+// A file that does not carry the page's name falls back to wheelIdentity. PEP
+// 503 permits such an entry and nothing here can place it better than the
+// artifact route will when the client comes back for it.
+func pypiPageVersion(pkg, filename string) string {
+	normalized := manifest.CanonicalPypiName(pkg)
+	for _, ext := range pypiSdistSuffixes {
+		if base, ok := strings.CutSuffix(filename, ext); ok {
+			if v, ok := versionAfterName(base, normalized); ok {
+				return v
+			}
+			_, v := sdistIdentity(base, filename)
+			return v
+		}
+	}
+	if base, ok := strings.CutSuffix(filename, ".whl"); ok {
+		if v, ok := versionAfterName(base, normalized); ok {
+			// PEP 427 puts the build and compatibility tags after the version,
+			// and none of them is part of it.
+			if i := strings.IndexByte(v, '-'); i >= 0 {
+				v = v[:i]
+			}
+			return v
+		}
+	}
+	_, v := wheelIdentity(filename)
+	return v
+}
+
+// versionAfterName returns what follows the shortest filename prefix that
+// normalizes to the distribution name. Normalizing the prefix is what makes it
+// match a file published under PEP 625 (python_3parclient-4.2.10.tar.gz) as
+// well as one predating it.
+func versionAfterName(base, normalized string) (string, bool) {
+	for i := 1; i < len(base)-1; i++ {
+		if base[i] == '-' && manifest.CanonicalPypiName(base[:i]) == normalized {
+			return base[i+1:], true
+		}
+	}
+	return "", false
+}

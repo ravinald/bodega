@@ -1,0 +1,2 @@
+matter_qrcode_generator v0.1.0 (https://github.com/thekuwayama/matter_qrcode_generator.git?branch=main#2834b6c2):
+    matter_qrcode_generator

@@ -1,0 +1,19 @@
+-- apt_base is the mirrored codename a profile's filtered apt index derives
+-- from. It has meaning for the apt row alone, which is why it is spelled with
+-- the type in the name: a value on the npm row would be read by nothing.
+--
+-- apt is the one type where the index filter is the enforcement rather than
+-- the legible half of it. Refusing a .deb at the pool leaves dpkg holding a
+-- half-applied transaction, so a package outside the profile has to be absent
+-- from the Packages index the client reads before it plans anything. Filtering
+-- Packages forces a matching Release, Release is signed, and one URL serves
+-- one Release — so a profile that scopes apt is served under a codename of its
+-- own, generated from a filtered view of this base and signed with bodega's
+-- key like any other generated suite.
+--
+-- Empty on every row 014 through 016 wrote, and empty means the profile does
+-- not scope apt: no synthetic codename is generated and the host reads the
+-- mirrored codename unchanged. That is the state every profile is in before an
+-- operator names a base, and generating a filtered suite for one that named
+-- none would invent a control nobody asked for.
+ALTER TABLE profile_types ADD COLUMN apt_base TEXT NOT NULL DEFAULT '';

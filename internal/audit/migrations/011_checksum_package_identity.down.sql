@@ -1,0 +1,5 @@
+-- Nothing to undo. The up migration adds no schema, and the identity its
+-- backfill wrote is a correction rather than a new column: blanking pkg_type
+-- and pkg_name on the way down would hand an older binary rows it never
+-- rewrites, leaving the recovery command as broken as before with no record
+-- of why.

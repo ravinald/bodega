@@ -1,0 +1,504 @@
+// Command bodega manages a centralized package repository. Artifact bytes live
+// in a storage backend named by the config ("local" or "s3"); the eight
+// artifact types are listed by `bodega --help` and enumerated in
+// manifest.AllTypes.
+//
+// Usage:
+//
+//	bootstrap [command] [flags]
+//	bodega shell   # interactive REPL
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"github.com/spf13/cobra"
+
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/builder"
+	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/manifest"
+	bos3 "github.com/ravinald/bodega/internal/s3"
+	"github.com/ravinald/bodega/internal/server"
+	"github.com/ravinald/bodega/internal/storage"
+)
+
+// breakGlassAll is the --break-glass-update-md5 argument that reaches the whole
+// store rather than one package type. index.json, graph.json and metrics.json
+// sit at the store root and belong to no type, so nothing narrower stamps them.
+const breakGlassAll = "all"
+
+// Build metadata baked in via -ldflags by both `make build` and GoReleaser.
+// Tag-driven version, full git SHA, and an RFC-3339 build timestamp.
+var (
+	version   = "dev"
+	commit    = "none"
+	buildDate = "unknown"
+)
+
+// -ldflags can only reach package main, and nothing under internal/ may import
+// it, so the builder is handed the version here rather than at each call site.
+// init rather than main: a command stamps an artifact through cobra, and the
+// tests that drive those commands never run main.
+func init() { builder.Version = version }
+
+// globalFlags holds values bound to the persistent root flags.
+type globalFlags struct {
+	bucket      string
+	region      string
+	buildRoot   string
+	manifestDir string
+	localConfig bool
+	verbose     bool
+	logLevel    int
+
+	// logLevelGiven answers "did the operator type --log-level". Every string
+	// flag here uses "" as its not-given sentinel, but 0 is a valid log level,
+	// so without this "--log-level 0" could not turn a config file's log_level
+	// of 3 back down.
+	logLevelGiven func() bool
+}
+
+func main() {
+	// Ensure config file and log directory exist on first run.
+	path, err := config.EnsureConfigAndLogDir()
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "Warning: could not initialise config: %v\n", err)
+	} else if path != "" {
+		fc, _ := os.ReadFile(path)
+		if len(fc) > 0 {
+			// A bucket is only missing when the config asked for S3. On the
+			// default local backend this nagged every command to configure
+			// storage it will never use.
+			var check struct {
+				Bucket         string `json:"bucket"`
+				StorageBackend string `json:"storage_backend"`
+			}
+			if json.Unmarshal(fc, &check) == nil && check.Bucket == "" && check.StorageBackend == "s3" {
+				_, _ = fmt.Fprintf(os.Stderr, "Config file created: %s\n", path)
+				_, _ = fmt.Fprintf(os.Stderr, "Edit it to set your bucket and region.\n\n")
+			}
+		}
+	}
+
+	if err := newRootCmd().Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+// newRootCmd constructs the root cobra.Command and attaches all sub-commands.
+func newRootCmd() *cobra.Command {
+	gf := &globalFlags{}
+
+	root := &cobra.Command{
+		Use:   "bodega",
+		Short: "Manage a centralized package repository",
+		Long: `bodega manages a centralized repository of package artifacts:
+  apt     Debian packages built from source or downloaded from apt
+  binary  Files downloaded directly from a URL
+  cargo   Rust crates from a sparse index
+  git     Git repositories bundled at a specific ref, or mirrored for clone
+  gomod   Go modules from a module proxy
+  helm    Helm charts from a chart repository
+  npm     npm packages from a registry
+  pypi    Python wheels built from a requirements set
+
+Artifact bytes live in a storage backend: "local" (a directory) or "s3".
+storage_backend picks the default and storage_by_type can send one type
+somewhere else, so the S3 flags below apply only where an s3 backend is
+configured.
+
+Configuration priority: flags > env vars (REPO_BUCKET, AWS_REGION) > config.json > defaults.`,
+		SilenceUsage: true,
+	}
+
+	// The one place every verb passes through on its way out. Cobra runs the
+	// nearest PersistentPostRun after a RunE that returned nil, and no other
+	// command in the tree defines one, so this hook sees every successful
+	// invocation and signals for the ones classified in the trees below.
+	root.PersistentPostRun = func(cmd *cobra.Command, _ []string) {
+		signalReloadNow(cmd, gf)
+	}
+
+	// Persistent flags apply to every sub-command.
+	pf := root.PersistentFlags()
+	pf.StringVar(&gf.bucket, "bucket", "", "Bucket name for an s3 storage backend (env: REPO_BUCKET)")
+	pf.StringVar(&gf.region, "region", "", "AWS region for an s3 storage backend (env: AWS_REGION)")
+	pf.StringVar(&gf.buildRoot, "build-root", "", "Local build directory (default: /opt/bodega)")
+	// Empty default, like --build-root: a non-empty one wins firstNonEmpty
+	// outright, so the flag would shadow $BODEGA_MANIFEST_DIR and the config's
+	// manifest_dir with a value nobody typed. The built-in lives at the tail of
+	// the chain in config.Load.
+	pf.StringVar(&gf.manifestDir, "manifest-dir", "", "Path to manifests/ directory (env: BODEGA_MANIFEST_DIR)")
+	pf.BoolVar(&gf.localConfig, "local-config", false, "Read/write manifests on the local filesystem instead of the configured backend")
+	pf.BoolVarP(&gf.verbose, "verbose", "v", false, "Show verbose output")
+	pf.IntVar(&gf.logLevel, "log-level", 0, "Logging verbosity: 0=errors, 1=warn, 2=info, 3=debug, 4=trace")
+	gf.logLevelGiven = func() bool { return pf.Changed("log-level") }
+
+	// -V / --version prints the version and exits.
+	var showVersion bool
+	root.Flags().BoolVarP(&showVersion, "version", "V", false, "Print version and exit")
+
+	// --break-glass-update-md5 is a top-level flag, not a sub-command.
+	var breakGlassType string
+	root.Flags().StringVar(&breakGlassType, "break-glass-update-md5", "",
+		"Recompute MD5 sidecars for the named manifest type, or "+breakGlassAll+" for the whole store, and exit")
+	root.RunE = func(cmd *cobra.Command, args []string) error {
+		if showVersion {
+			fmt.Printf("bodega %s (commit %s, built %s)\n", version, commit, buildDate)
+			return nil
+		}
+		if breakGlassType == "" {
+			return cmd.Help()
+		}
+		if breakGlassType != breakGlassAll && !isValidType(breakGlassType) {
+			return fmt.Errorf("unknown type %q — must be %s, or one of: %s", breakGlassType, breakGlassAll, strings.Join(manifest.AllTypes, ", "))
+		}
+		store, err := loadStore(gf)
+		if err != nil {
+			return err
+		}
+		scope := breakGlassType
+		if scope == breakGlassAll {
+			// index.json, graph.json and metrics.json sit at the store root
+			// and belong to no type, so nothing but the whole store reaches
+			// them. An empty prefix is that.
+			scope = ""
+		}
+		stamped, err := store.RestampMD5(backgroundCtx(), scope)
+		for _, name := range stamped {
+			fmt.Printf("Updated %s.md5\n", name)
+		}
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Re-stamped %d manifest(s) in %s.\n", len(stamped), store.Label())
+		return nil
+	}
+
+	// The root runs, so it is classified like any other verb. Quiet because
+	// ForceUpdateMD5 rewrites only the .md5 sidecar, and nothing the running
+	// server holds reads that — `bodega pkg verify` is its sole consumer. The
+	// classification covers this RunE alone, so it uses the self-only key: a
+	// root that spoke for its subtree would give every undeclared verb a
+	// default and the guard would pass on the next unclassified one.
+	noReloadSignalSelf(root)
+
+	// Build pipeline commands: bodega build {fetch,run,upload,sync,status}
+	buildParent := &cobra.Command{
+		Use:   "build",
+		Short: "Build pipeline operations (fetch, run, upload, sync, status)",
+	}
+	buildParent.AddCommand(
+		signalsReload(newFetchCmd(gf)),
+		signalsReload(newBuildRunCmd(gf)),
+		signalsReload(newUploadCmd(gf)),
+		signalsReload(newSyncCmd(gf)),
+		noReloadSignal(newStatusCmd(gf)),
+		noReloadSignal(newPackageCmd(gf)),
+	)
+
+	// Package management commands: bodega pkg {create,edit,import,convert,delete,freeze,hide,refresh,verify,checksum,storage,group,drift,move}
+	pkgParent := &cobra.Command{
+		Use:     "pkg",
+		Aliases: []string{"package"},
+		Short:   "Package management (create, edit, import, convert, delete, freeze, hide, refresh, verify, storage, group, drift, move)",
+	}
+	pkgParent.AddCommand(
+		signalsReload(newCreateCmd(gf)),
+		signalsReload(newEditCmd(gf)),
+		signalsReload(newImportCmd(gf)),
+		noReloadSignal(newExportCmd(gf)),
+		noReloadSignal(newConvertCmd(gf)),
+		signalsReload(newDeleteCmd(gf)),
+		signalsReload(newRemoveCmd(gf)),
+		signalsReload(newFreezeCmd(gf)),
+		signalsReload(newHideCmd(gf)),
+		signalsReload(newRefreshCmd(gf)),
+		noReloadSignal(newVerifyCmd(gf)),
+		noReloadSignal(newChecksumCmd(gf)),
+		noReloadSignal(newStorageCmd(gf)),
+		noReloadSignal(newGroupCmd(gf)),
+		noReloadSignal(newDriftCmd(gf)),
+		signalsReload(newMoveCmd(gf)),
+	)
+
+	// Audit commands: bodega audit {events,check}
+	auditParent := &cobra.Command{
+		Use:   "audit",
+		Short: "Audit trail and dependency checking",
+	}
+	auditParent.AddCommand(
+		newAuditEventsCmd(gf),
+		newAuditCheckCmd(gf),
+	)
+
+	// Top-level commands. A group classified here carries its whole subtree:
+	// apt, token, acl, policy and discover write state the server re-reads on
+	// its own cadence or on the reload their runbooks already name.
+	root.AddCommand(
+		buildParent,
+		pkgParent,
+		noReloadSignal(auditParent),
+		noReloadSignal(newAptCmd(gf)),
+		noReloadSignal(newTokenCmd(gf)),
+		noReloadSignal(newACLCmd(gf)),
+		noReloadSignal(newIdentityCmd(gf)),
+		noReloadSignal(newProfileCmd(gf)),
+		noReloadSignal(newPolicyCmd(gf)),
+		noReloadSignal(newDiscoverCmd(gf)),
+		noReloadSignal(newPinCmd(gf)),
+		noReloadSignal(newShowCmd(gf)),
+		noReloadSignal(newDashboardCmd(gf)),
+		noReloadSignal(newInitCmd(gf)),
+		noReloadSignal(newShellCmd(gf)),
+		noReloadSignal(newServeCmd(gf)),
+		signalsReload(newRepairCmd(gf)),
+		signalsReload(newResetCmd(gf)),
+		noReloadSignal(newDoctorCmd(gf)),
+	)
+
+	return root
+}
+
+// loadConfig resolves the runtime Config from the global flags.
+func loadConfig(gf *globalFlags) (*config.Config, error) {
+	cfg, err := config.Load(gf.manifestDir, gf.bucket, gf.region, gf.buildRoot, gf.localConfig, gf.verbose)
+	if err != nil {
+		return nil, err
+	}
+
+	// Resolve log level: flag > env > config file.
+	levelGiven := gf.logLevelGiven != nil && gf.logLevelGiven()
+	if levelGiven {
+		cfg.LogLevel = gf.logLevel
+	} else if env := os.Getenv(config.EnvLogLevel); env != "" {
+		if v, err := strconv.Atoi(env); err == nil {
+			cfg.LogLevel = v
+		}
+	}
+	// --verbose is equivalent to --log-level 2 when log-level is not set.
+	if cfg.Verbose && cfg.LogLevel == 0 && !levelGiven {
+		cfg.LogLevel = 2
+	}
+	// log_level is resolved here rather than in Load, so Load's baseline does
+	// not know about it. Without this, `bodega -v shell` plus one config save
+	// writes "log_level": 2 into the file as though the operator had set it.
+	cfg.MarkResolved()
+
+	return cfg, nil
+}
+
+// usesLocalManifests is the command layer's name for
+// config.Config.UsesLocalManifests. The answer lives on Config because the TUI
+// picks a manifest store too and cannot import this package.
+func usesLocalManifests(cfg *config.Config) bool {
+	return cfg.UsesLocalManifests()
+}
+
+// storageBackendName returns the effective backend name, applying the same
+// empty-means-local default that storage.New applies.
+func storageBackendName(cfg *config.Config) string {
+	if cfg.StorageBackend == "" {
+		return "local"
+	}
+	return cfg.StorageBackend
+}
+
+// loadStore returns a manifest Store loaded from the appropriate backend
+// (the local filesystem on a local install or with --local-config, the
+// configured object store otherwise).
+func loadStore(gf *globalFlags) (*manifest.Store, error) {
+	cfg, err := loadConfig(gf)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx := backgroundCtx()
+
+	var store *manifest.Store
+	if usesLocalManifests(cfg) {
+		store = manifest.NewLocalStore(cfg.ManifestDir)
+	} else {
+		objStore, err := newObjStore(cfg)
+		if err != nil {
+			return nil, err
+		}
+		backend := &manifest.S3Backend{
+			Prefix:   "manifests/",
+			GetFn:    objStore.Get,
+			PutFn:    objStore.Put,
+			DeleteFn: objStore.Delete,
+			ListFn:   objStore.List,
+			Label_:   objStore.Label() + "/manifests/",
+		}
+		store = manifest.NewStore(backend)
+	}
+
+	if err := store.LoadIndex(ctx); err != nil {
+		return nil, fmt.Errorf("load index: %w", err)
+	}
+	return store, nil
+}
+
+// openAuditDB opens the audit store from config, attaches the configured event
+// sink, and applies timezone and event filtering. Returns nil (not an error)
+// if the path is empty or the store cannot be opened -- a one-shot CLI write
+// is best-effort and says so on stderr. `bodega serve` takes the opposite
+// answer and refuses to start; see internal/server.Server.auditErr.
+func openAuditDB(gf *globalFlags) *audit.DB {
+	db, err := openAuditDBErr(gf)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
+		return nil
+	}
+	return db
+}
+
+// auditDBPath resolves where the embedded store lives, falling back to
+// <log_dir>/audit.db. Empty means no store is configured at all. Separate from
+// the opener because opening creates the file, and a command that only reports
+// on an install must not bring one into existence to do it.
+func auditDBPath(cfg *config.Config) string {
+	if cfg.AuditDB != "" {
+		return cfg.AuditDB
+	}
+	if cfg.LogDir != "" {
+		return filepath.Join(cfg.LogDir, "audit.db")
+	}
+	return ""
+}
+
+// openAuditDBErr is openAuditDB with the reason kept. Read commands use it so
+// "postgres refused the connection" does not arrive as "could not open audit
+// database". A nil *DB with a nil error means no audit store is configured.
+func openAuditDBErr(gf *globalFlags) (*audit.DB, error) {
+	cfg, err := loadConfig(gf)
+	if err != nil {
+		return nil, fmt.Errorf("could not load config: %w", err)
+	}
+	dbPath := auditDBPath(cfg)
+	if dbPath == "" {
+		return nil, nil
+	}
+	db, err := audit.OpenWithSink(dbPath, audit.SinkConfig{Kind: cfg.AuditSink, DSN: cfg.AuditSinkDSN})
+	if err != nil {
+		return nil, fmt.Errorf("could not open audit store at %s: %w", dbPath, err)
+	}
+	if cfg.Timezone != "" {
+		db.SetTimezone(cfg.Timezone)
+	}
+	if len(cfg.AuditEvents) > 0 {
+		db.SetEventFilter(cfg.AuditEvents)
+	}
+	return db, nil
+}
+
+// openQueryableAuditDB is the read path's opener: it refuses when the
+// configured sink keeps no table, so a discovery or event query says which
+// sink cannot answer instead of printing an empty result on a working server.
+// op names what was being read.
+func openQueryableAuditDB(gf *globalFlags, op string) (*audit.DB, error) {
+	db, err := openAuditDBErr(gf)
+	if err != nil {
+		return nil, err
+	}
+	if db == nil {
+		return nil, fmt.Errorf("no audit store is configured: set audit_db (or log_dir) in config.json")
+	}
+	if !db.EventsQueryable() {
+		defer func() { _ = db.Close() }()
+		return nil, &audit.UnqueryableSinkError{Sink: db.SinkName(), Op: op}
+	}
+	return db, nil
+}
+
+// notifyServer sends SIGHUP to the running bodega serve process (if any)
+// so it reloads manifests after CLI changes.
+func notifyServer(gf *globalFlags) {
+	cfg, err := loadConfig(gf)
+	if err != nil {
+		return
+	}
+	if err := server.NotifyReload(cfg.LogDir); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not notify server: %v\n", err)
+	}
+}
+
+// requireBucket returns an error when cfg.Bucket is empty.
+func requireBucket(cfg *config.Config) error {
+	if cfg.Bucket == "" {
+		return fmt.Errorf(
+			"S3 bucket is required: set --bucket, the REPO_BUCKET env var, or add \"bucket\" to config.json",
+		)
+	}
+	return nil
+}
+
+// isValidType returns true when t is a known manifest type.
+func isValidType(t string) bool {
+	for _, known := range manifest.AllTypes {
+		if t == known {
+			return true
+		}
+	}
+	return false
+}
+
+// typeOrderSentence renders the default type order for a help screen from
+// manifest.AllTypes. Three build subcommands carried the order as prose and all
+// three were stale — two at four types, one at seven, against eight — because
+// nothing tied the sentence to the list it described.
+//
+// Commas rather than arrows: the line is read in a terminal, where "binary >
+// git" reads as a redirection.
+func typeOrderSentence(verb string) string {
+	return fmt.Sprintf("If no types are given, all %d are %s in dependency order:\n  %s",
+		len(manifest.AllTypes), verb, strings.Join(manifest.AllTypes, ", "))
+}
+
+// resolveTypes expands an empty slice to AllTypes and validates each entry.
+func resolveTypes(args []string) ([]string, error) {
+	if len(args) == 0 {
+		return manifest.AllTypes, nil
+	}
+	for _, t := range args {
+		if !isValidType(t) {
+			return nil, fmt.Errorf("unknown type %q — must be one of: %s", t, strings.Join(manifest.AllTypes, ", "))
+		}
+	}
+	return args, nil
+}
+
+// backgroundCtx returns a context bound to the process lifetime.
+func backgroundCtx() context.Context {
+	return context.Background()
+}
+
+// newObjStore creates an ObjectStore from the resolved config.
+func newObjStore(cfg *config.Config) (storage.ObjectStore, error) {
+	ctx := backgroundCtx()
+	objStore, err := storage.New(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("connect to storage: %w", err)
+	}
+	return objStore, nil
+}
+
+// newS3Client creates a direct S3 client from the resolved config. This is
+// retained for callers that require the concrete *bos3.Client type (e.g.
+// the TUI, which has not yet been migrated to the storage abstraction).
+func newS3Client(cfg *config.Config) (*bos3.Client, error) {
+	ctx := backgroundCtx()
+	client, err := bos3.NewClient(ctx, cfg.Bucket, cfg.Region)
+	if err != nil {
+		return nil, fmt.Errorf("connect to AWS: %w", err)
+	}
+	return client, nil
+}

@@ -1,0 +1,401 @@
+package server
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"path"
+	"regexp"
+	"strconv"
+	"strings"
+
+	"github.com/ravinald/bodega/internal/builder"
+	"github.com/ravinald/bodega/internal/manifest"
+)
+
+// ---- Cargo sparse registry -------------------------------------------------
+//
+// Bodega serves cargo's sparse-HTTP registry protocol (default in cargo ≥ 1.70).
+// Three URL shapes flow through `/cargo/{path...}`:
+//
+//   /cargo/config.json                 — synthesized; tells cargo where downloads live.
+//   /cargo/<a>/<b>/<crate>             — sparse index NDJSON (mutable, TTL'd).
+//     plus the short-name special cases:
+//        /cargo/1/<crate>              — 1-character crate names
+//        /cargo/2/<crate>              — 2-character crate names
+//        /cargo/3/<first>/<crate>      — 3-character crate names
+//   /cargo/<crate>/<version>/download  — crate tarball (immutable, content-addressed).
+//
+// Crate names are lowercased by cargo before request; we reject any path that
+// contains uppercase or non-spec characters as a defense-in-depth measure.
+
+// cargoCrateNamePattern is the cargo registry constraint on crate names.
+// (https://doc.rust-lang.org/cargo/reference/manifest.html#the-name-field)
+var cargoCrateNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+
+// cargoVersionPattern is a permissive semver-ish check; cargo handles the
+// strict parsing client-side so we only need to refuse path-traversal.
+var cargoVersionPattern = regexp.MustCompile(`^[A-Za-z0-9._+-]{1,64}$`)
+
+// handleCargoConfig synthesizes the registry config endpoint that cargo
+// fetches on first contact. We point both the download and api URLs at our
+// own /cargo prefix so cargo never reaches upstream directly.
+//
+// The base comes from publicBase, not from r.TLS. cargo consumes these URLs
+// rather than displaying them, so a plaintext dl behind a terminating proxy is
+// not a cosmetic error: every crate download leaves TLS.
+func (s *Server) handleCargoConfig(w http.ResponseWriter, r *http.Request) {
+	base := s.publicBase(r) + "/cargo"
+	resp := struct {
+		DL  string `json:"dl"`
+		API string `json:"api"`
+	}{
+		DL:  base + "/{crate}/{version}/download",
+		API: base,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// handleCargo dispatches sparse-index and crate-download requests. The split
+// happens here rather than via separate routes because cargo's URL shapes
+// overlap on segment count for short crate names.
+func (s *Server) handleCargo(w http.ResponseWriter, r *http.Request) {
+	p := r.PathValue("path")
+	if p == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if p == "config.json" {
+		s.handleCargoConfig(w, r)
+		return
+	}
+
+	// Crate download: trailing /<version>/download (4+ segments).
+	if strings.HasSuffix(p, "/download") {
+		s.handleCargoDownload(w, r, p)
+		return
+	}
+
+	// Otherwise: sparse index lookup. The trailing path segment is the crate
+	// name regardless of which short-name shape we received.
+	s.handleCargoIndex(w, r, p)
+}
+
+func (s *Server) handleCargoIndex(w http.ResponseWriter, r *http.Request, p string) {
+	noSharedCache(w)
+	crate, ok := cargoCrateFromIndexPath(p)
+	if !ok {
+		http.Error(w, "invalid cargo index path", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+	pm, _ := s.store.GetPackage(ctx, manifest.TypeCargo, crate)
+	if pm != nil && isPackageHidden(pm) {
+		http.NotFound(w, r)
+		return
+	}
+
+	// The sparse index names no version, so it is decided at the membership
+	// level here and by version in the filter below.
+	if !s.entitleGate(w, r, manifest.TypeCargo, crate, "") {
+		return
+	}
+	permit := profileVersionFilter(s.profileFor(r), manifest.TypeCargo, crate)
+
+	// An entry is bodega's own claim about the crate, so the index line is
+	// generated from it rather than fetched. Proxied instead, every hosted
+	// crate 404s on the route cargo resolves through while its /download route
+	// serves the bytes to nobody who can find them.
+	//
+	// The entry decides, not its mode: mode records where a version's bytes
+	// come from and the download route reads it on its own, so excluding
+	// proxy-mode entries here left a pinned crate answering the upstream's
+	// failure on the route cargo resolves through.
+	if pm != nil {
+		s.serveManifestCargoIndex(w, r, crate, pm, permit)
+		return
+	}
+
+	upstream := strings.TrimRight(s.cfg.CargoUpstream, "/") + "/" + p
+	s3Key := manifest.CargoIndexKey(p)
+	if permit == nil {
+		s.proxyOrCache(w, r, s.typeStore(manifest.TypeCargo), s3Key, upstream, manifest.TypeCargo, crate, crate, false, false)
+		return
+	}
+	rw := &indexFilterWriter{
+		ResponseWriter: w,
+		subject:        "the cargo index for " + crate,
+		filter:         func(b []byte) []byte { return filterCargoIndex(b, permit) },
+	}
+	s.proxyOrCache(rw, r, s.typeStore(manifest.TypeCargo), s3Key, upstream, manifest.TypeCargo, crate, crate, false, false)
+	if err := rw.flush(); err != nil {
+		s.logger.Error("cargo index response failed", "crate", crate, "error", err)
+	}
+}
+
+// cargoIndexLine is one line of cargo's sparse-index document. The field
+// order is the one crates.io publishes: cargo reads by name, a person reading
+// a line does not.
+type cargoIndexLine struct {
+	Name string `json:"name"`
+	Vers string `json:"vers"`
+	// Deps is what the fetch stage recorded from the upstream index line for
+	// this version, and an empty list where it recorded nothing. Never null:
+	// cargo refuses to deserialize the document before it reaches the crate.
+	Deps     []cargoIndexDep     `json:"deps"`
+	Cksum    string              `json:"cksum"`
+	Features map[string][]string `json:"features"`
+	Yanked   bool                `json:"yanked"`
+}
+
+// cargoIndexDep is the dependency record cargo's sparse protocol defines.
+// Declared so deps serializes as a typed empty list rather than as null, which
+// cargo refuses to deserialize.
+type cargoIndexDep struct {
+	Name            string   `json:"name"`
+	Req             string   `json:"req"`
+	Features        []string `json:"features"`
+	Optional        bool     `json:"optional"`
+	DefaultFeatures bool     `json:"default_features"`
+	Target          *string  `json:"target"`
+	Kind            string   `json:"kind"`
+}
+
+// cargoIndexDeps renders recorded dependencies into the wire shape cargo's
+// sparse protocol defines, and an empty list for a version that recorded none.
+//
+// Empty rather than absent because deps is a required member of the record:
+// cargo fails to deserialize a line missing it, and would do so before
+// reaching the crate the line describes. An empty Target renders as cargo's
+// null, which is a dependency that applies everywhere, and an empty Kind
+// renders as "normal", which is the kind cargo assumes when a line omits it.
+func cargoIndexDeps(deps []manifest.Dependency) []cargoIndexDep {
+	out := make([]cargoIndexDep, 0, len(deps))
+	for _, d := range deps {
+		if d.Name == "" {
+			continue
+		}
+		dep := cargoIndexDep{
+			Name:            d.Name,
+			Req:             d.Req,
+			Features:        d.Features,
+			Optional:        d.Optional,
+			DefaultFeatures: d.DefaultFeatures,
+			Kind:            d.Kind,
+		}
+		if dep.Features == nil {
+			dep.Features = []string{}
+		}
+		if dep.Kind == "" {
+			dep.Kind = "normal"
+		}
+		if d.Target != "" {
+			target := d.Target
+			dep.Target = &target
+		}
+		out = append(out, dep)
+	}
+	return out
+}
+
+// serveManifestCargoIndex answers a sparse-index document out of the manifest
+// store, with no upstream in the path at all.
+//
+// A version is dropped when it is hidden, when the entry's constraint excludes
+// it, or when cargoCksum cannot establish one sha256 the stored crate and the
+// manifest agree on. The last is not caution: cargo verifies every download
+// against cksum and reports a mismatch as a corrupt crate, which sends whoever
+// hits it looking at their disk rather than at this registry.
+func (s *Server) serveManifestCargoIndex(w http.ResponseWriter, r *http.Request, crate string, pm *manifest.PackageManifest, permit func(string) bool) {
+	ctx := r.Context()
+	vc, baseVer := packageVersionConstraint(pm)
+	hasConstraint := vc != "" && vc != manifest.ConstraintAny && baseVer != ""
+
+	var out bytes.Buffer
+	for _, ve := range pm.Versions {
+		if ve.Version == "" || ve.Hidden {
+			continue
+		}
+		if hasConstraint && !versionAllowed(baseVer, ve.Version, vc) {
+			continue
+		}
+		cksum := s.cargoCksum(ctx, crate, ve)
+		if cksum == "" {
+			s.logger.Warn("cargo index line dropped: no sha256 for the crate",
+				"crate", crate, "version", ve.Version)
+			continue
+		}
+		line, err := json.Marshal(cargoIndexLine{
+			Name:     crate,
+			Vers:     ve.Version,
+			Deps:     cargoIndexDeps(ve.Dependencies),
+			Cksum:    cksum,
+			Features: map[string][]string{},
+		})
+		if err != nil {
+			s.logger.Error("cargo index line failed to marshal", "crate", crate, "version", ve.Version, "error", err)
+			continue
+		}
+		out.Write(line)
+		out.WriteByte('\n')
+	}
+
+	// The same profile filter that runs over a proxied index, through the same
+	// function. A generated document that skipped it would hand a scoped host
+	// the versions its profile excludes.
+	body := filterCargoIndex(out.Bytes(), permit)
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	//nolint:gosec // G705: body is the generated NDJSON index; Content-Type is set above.
+	_, _ = w.Write(body)
+}
+
+// cargoCksum is the sha256 cargo verifies a download against.
+//
+// The stored crate decides, not the recorded checksum. A recorded digest is a
+// claim about bytes this server may no longer hold: rebuilt, replaced or
+// uploaded out of band, the manifest keeps the old value while /download
+// serves the new bytes, and cargo reports that disagreement as a corrupt
+// crate, which sends whoever hits it to their disk rather than to this
+// registry. So the price is a read of the crate on a metadata request, paid so
+// the index and the download route cannot disagree.
+//
+// A recorded digest that contradicts the stored bytes drops the version
+// instead of choosing a winner: the two disagree about what this version is,
+// and nothing here knows which one an operator meant. It also covers a
+// proxy-mode entry, whose /download goes upstream — the stored copy is then a
+// stale cache and the recorded digest the upstream's, so publishing either
+// over the other's objection would break a fetch.
+//
+// With nothing stored, the recorded digest is all there is, and a missing
+// checksum is not made up from nothing.
+func (s *Server) cargoCksum(ctx context.Context, crate string, ve manifest.VersionEntry) string {
+	var recorded string
+	if cs := ve.Checksum; cs != nil && cs.Algorithm == "sha256" && isSHA256Hex(cs.Value) {
+		recorded = strings.ToLower(cs.Value)
+	}
+	stored := s.storedCargoCksum(ctx, crate, ve.Version)
+	if stored == "" {
+		return recorded
+	}
+	if recorded != "" && recorded != stored {
+		s.logger.Error("cargo index line dropped: the recorded sha256 is not the stored crate's",
+			"crate", crate, "version", ve.Version, "recorded", recorded, "stored", stored)
+		return ""
+	}
+	return stored
+}
+
+// storedCargoCksum is the digest of the crate as stored, or "" when this
+// server holds no bytes for the version.
+func (s *Server) storedCargoCksum(ctx context.Context, crate, version string) string {
+	store, err := s.versionStore(ctx, manifest.TypeCargo, crate, version)
+	if err != nil || store == nil {
+		return ""
+	}
+	data, err := store.Get(ctx, manifest.CargoCrateKey(crate, version))
+	if err != nil || data == nil {
+		return ""
+	}
+	return builder.ComputeBytesSHA256(data)
+}
+
+// isSHA256Hex reports whether v is a full hex sha256 digest. A truncated or
+// otherwise malformed value is not a checksum cargo can use.
+func isSHA256Hex(v string) bool {
+	raw, err := hex.DecodeString(v)
+	return err == nil && len(raw) == sha256.Size
+}
+
+func (s *Server) handleCargoDownload(w http.ResponseWriter, r *http.Request, p string) {
+	// Path shape: <crate>/<version>/download.
+	parts := strings.Split(p, "/")
+	if len(parts) != 3 || parts[2] != "download" {
+		http.Error(w, "invalid cargo download path", http.StatusBadRequest)
+		return
+	}
+	crate, version := parts[0], parts[1]
+	if !cargoCrateNamePattern.MatchString(crate) || !cargoVersionPattern.MatchString(version) {
+		http.Error(w, "invalid cargo crate or version", http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+	pm, _ := s.store.GetPackage(ctx, manifest.TypeCargo, crate)
+	if pm != nil {
+		if isPackageHidden(pm) {
+			http.NotFound(w, r)
+			return
+		}
+		if isVersionHidden(pm, version) {
+			http.NotFound(w, r)
+			return
+		}
+	}
+
+	if !s.entitleGate(w, r, manifest.TypeCargo, crate, version) {
+		return
+	}
+
+	w = cachePrivateOn200(w, path.Base(p))
+	// cargo_dl_upstream, not cargo_upstream: the sparse index host serves the
+	// index and nothing else, and crates.io names the download root separately
+	// in the index's own config.json.
+	upstream := strings.TrimRight(s.cfg.CargoDLUpstream, "/") + "/" + crate + "/" + version + "/download"
+	s3Key := manifest.CargoCrateKey(crate, version)
+	forceProxy := pm == nil || packageMode(pm) == manifest.ModeProxy
+	// A hosted crate reads from the backend its entry records; a proxied one
+	// has no entry to record anything, so it caches under the type rule.
+	store, err := s.versionStore(ctx, manifest.TypeCargo, crate, version)
+	if err != nil {
+		s.logger.Error("storage backend recorded for artifact is not configured",
+			"type", manifest.TypeCargo, "package", crate, "version", version, "error", err)
+		http.Error(w, "storage backend error", http.StatusBadGateway)
+		return
+	}
+	s.proxyOrCache(w, r, store, s3Key, upstream, manifest.TypeCargo, crate, crate, true, forceProxy)
+}
+
+// cargoCrateFromIndexPath validates the sparse-index path shape and returns
+// the crate name. Accepts the four spec-defined forms:
+//
+//	1/<crate>                  (1 char)
+//	2/<crate>                  (2 chars)
+//	3/<first-char>/<crate>     (3 chars)
+//	<aa>/<bb>/<crate>          (4+ chars, aa = first 2, bb = chars 3-4)
+func cargoCrateFromIndexPath(p string) (string, bool) {
+	parts := strings.Split(p, "/")
+	switch len(parts) {
+	case 2:
+		// "1/<crate>" or "2/<crate>"
+		if (parts[0] == "1" && len(parts[1]) == 1) || (parts[0] == "2" && len(parts[1]) == 2) {
+			if cargoCrateNamePattern.MatchString(parts[1]) {
+				return parts[1], true
+			}
+		}
+		return "", false
+	case 3:
+		crate := parts[2]
+		if !cargoCrateNamePattern.MatchString(crate) {
+			return "", false
+		}
+		// "3/<first-char>/<crate>"
+		if parts[0] == "3" && len(crate) == 3 && len(parts[1]) == 1 && parts[1] == string(crate[0]) {
+			return crate, true
+		}
+		// "<aa>/<bb>/<crate>" — 4+ char crates
+		if len(parts[0]) == 2 && len(parts[1]) == 2 && len(crate) >= 4 &&
+			parts[0] == crate[:2] && parts[1] == crate[2:4] {
+			return crate, true
+		}
+		return "", false
+	}
+	return "", false
+}

@@ -1,0 +1,963 @@
+// Package audit provides the audit trail for package operations: builds,
+// client fetches, CRUD mutations, proxy cache events, the server's own start
+// and stop, and every request the server refused.
+//
+// The package holds two things that look alike and are not.
+//
+// The append-only event stream — Record and RecordDiscovery — is written on
+// the hot path, read for reporting, and never read to make a decision. That is
+// the pluggable half: EventSink, selected by audit_sink, with four
+// implementations (sqlite, postgres, syslog, jsonl).
+//
+// Operational state — ACL lists, API tokens, cached checksums and the
+// age/OSV/upstream policies — is not pluggable and is not a candidate for it.
+// The request path reads it to decide: whether an address is permitted,
+// whether a Bearer token is live, whether an upstream is allowed. Those reads
+// need a transactional read-modify-write and a queryable store, so a sink that
+// can only append (syslog, jsonl) cannot hold them, and moving them somewhere
+// remote would put a network round trip inside every request bodega serves. It
+// stays in the embedded SQLite database at audit_db, which every install has
+// regardless of which sink the events go to.
+//
+// *DB is that embedded store. It also fronts the sink: Record and
+// RecordDiscovery delegate, and the read surface (Query, ListDiscovery,
+// AggregateDiscovery and their neighbours) either delegates to a sink that
+// implements EventReader or refuses with an UnqueryableSinkError naming the
+// configured sink. It never falls back to the local tables, because answering
+// a query from a store the events are no longer going to is the lie this
+// design is built to avoid.
+package audit
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/user"
+	"path/filepath"
+	"strings"
+	"time"
+
+	_ "modernc.org/sqlite" // pure-Go SQLite driver
+)
+
+// CurrentActor returns the human invoking the process. $SUDO_USER wins so
+// `sudo bodega ...` attributes to the human who escalated, not root. HTTP
+// callers leave Actor empty and rely on ClientIP instead.
+func CurrentActor() string {
+	if v := os.Getenv("SUDO_USER"); v != "" {
+		return v
+	}
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		return u.Username
+	}
+	if v := os.Getenv("USER"); v != "" {
+		return v
+	}
+	if v := os.Getenv("USERNAME"); v != "" {
+		return v
+	}
+	return "unknown"
+}
+
+// EventType classifies an audit event.
+type EventType string
+
+const (
+	// Admin/operator events (CLI commands).
+	EventInit    EventType = "init"    // bodega init
+	EventReset   EventType = "reset"   // bodega reset
+	EventStatus  EventType = "status"  // bodega status
+	EventFetch   EventType = "fetch"   // bodega build fetch (per entry)
+	EventBuild   EventType = "build"   // bodega build run (per entry)
+	EventPackage EventType = "package" // bodega build package (per entry)
+	EventUpload  EventType = "upload"  // bodega build upload (per entry)
+	EventSync    EventType = "sync"    // bodega build sync (per entry)
+	EventCreate  EventType = "create"  // bodega create
+	EventDelete  EventType = "delete"  // bodega delete
+	EventRepair  EventType = "repair"  // bodega repair
+	EventRefresh EventType = "refresh" // bodega refresh
+	EventHide    EventType = "hide"    // bodega hide
+	EventFreeze  EventType = "freeze"  // bodega freeze
+	EventEdit    EventType = "edit"    // bodega pkg edit / TUI edit — free-form manifest change
+	EventShow    EventType = "show"    // bodega show
+
+	// Server lifecycle events.
+	EventServeStart EventType = "serve_start" // bodega serve started
+	EventServeStop  EventType = "serve_stop"  // bodega serve shut down
+
+	// Client events (HTTP server).
+	EventServeFetch EventType = "serve_fetch" // client downloaded a package via HTTP
+	EventCache      EventType = "cache"       // proxy outcome: hit, miss, or a refusal on the way
+
+	// EventDenied is a request the server refused: a deny-listed IP, mutation
+	// auth, an admin-only read endpoint, a frozen entry, or a version outside
+	// its constraint. One type for the whole class because Filter has no OR
+	// and no status predicate, so splitting it per gate would make "who was
+	// turned away" five queries instead of one. Which gate refused is in
+	// Status; see the Denial* constants.
+	EventDenied EventType = "denied"
+)
+
+// Status values for EventCache. They name the proxy outcome, so an operator
+// asking which artifacts came from upstream can tell that from an artifact the
+// cache answered and from the two refusals that write the same type.
+//
+// A constant per outcome rather than a literal at the call site: EventCache
+// was defined and written only by the two refusals for as long as it existed,
+// because nothing on the serving path named a status it was obliged to pass.
+const (
+	CacheHit              = "cache_hit"         // served from storage, no upstream contact
+	CacheMiss             = "cache_miss"        // fetched from upstream and cached
+	CacheChecksumMismatch = "checksum_mismatch" // upstream bytes disagreed with the pinned digest
+	CachePolicyViolation  = "policy_violation"  // upstream allow-list refused the candidate
+)
+
+// Status values for EventDenied. They name the gate that refused, so an
+// operator can tell an address that was never permitted from a token that
+// simply aged out without reading the journal.
+const (
+	DenialDenyList       = "deny_list"            // client IP matched deny_list
+	DenialUnparseableIP  = "client_ip_unparsable" // ClientIP did not parse as an address
+	DenialIPNotPermitted = "ip_not_permitted"     // client IP outside admin_permit_cidr
+	//nolint:gosec // G101: an event status naming a gate, not a credential.
+	DenialNoTokens     = "no_tokens_configured" // remote mutation with no tokens in the DB
+	DenialTokenMissing = "token_missing"        // no Bearer credential presented
+	DenialTokenInvalid = "token_invalid"        // Bearer presented, matched no stored hash
+	DenialTokenExpired = "token_expired"        // Bearer matched a token past expires_at
+	DenialAdminOnly    = "admin_only"           // admin-gated read endpoint, IP not permitted
+
+	// Refusals decided inside a handler rather than by the middleware chain.
+	// They reach the same table because an operator asking "who was turned
+	// away" is asking one question, and a refusal that answers it only from
+	// the journal is a refusal that rotates away.
+	DenialFrozenEntry       = "entry_frozen"       // DELETE on a package whose every version is frozen
+	DenialVersionConstraint = "version_constraint" // requested version outside the entry's version_constraint
+	DenialPushRefused       = "push_refused"       // git smart-HTTP push against a read-only mirror
+
+	// Refusals by the host profile bound to the requesting identity. Two
+	// values rather than one, because the operator's repair is opposite in
+	// each case: a membership refusal is widened by adding the package to the
+	// profile, a constraint refusal by moving the pin. Collapsed into one
+	// status, the row says a profile said no and leaves which lever to pull to
+	// whoever decodes the details blob.
+	DenialProfileMembership = "profile_membership" // package outside a closed profile's set
+	DenialProfileConstraint = "profile_constraint" // version outside the profile's constraint
+
+	// Refusals that are about this host rather than about the client. They
+	// still belong in the denial table: the operator's question is "why did
+	// that fetch not happen", and an answer split across two channels is one
+	// nobody correlates. The two stay distinct because they call for opposite
+	// responses — one artifact is larger than the key allows, or the host is
+	// carrying more concurrent fetches than its spool volume was sized for.
+	DenialSpoolArtifactTooLarge = "spool_artifact_too_large" // artifact over spool_max_artifact_bytes
+	DenialSpoolBudget           = "spool_budget_exhausted"   // in-flight spools at spool_max_total_bytes
+)
+
+// Event is a single audit record.
+type Event struct {
+	EventType  EventType
+	PkgType    string
+	PkgName    string
+	PkgVersion string
+	ClientIP   string
+	UserAgent  string
+	Status     string // "success", "failure", "cache_hit", "cache_miss"; a Denial* reason on EventDenied
+	DurationMs int64
+	Details    string // JSON blob for extra context
+	Actor      string // OS user for CLI/TUI events; empty for HTTP events (use ClientIP instead)
+	// Identity is the host an identity binding resolved this request to, and
+	// is empty when nothing bound it. It sits alongside ClientIP rather than
+	// replacing it: the deny list matched on the address, and one identity can
+	// hold several.
+	Identity string
+}
+
+// StoredEvent is an Event with its database ID and timestamp.
+type StoredEvent struct {
+	ID        int64
+	Timestamp time.Time
+	Event
+}
+
+// Filter controls which events are returned by Query.
+type Filter struct {
+	EventType EventType // empty = all
+	PkgType   string    // empty = all
+	PkgName   string    // empty = all
+	ClientIP  string    // empty = all
+	Actor     string    // empty = all
+	Identity  string    // empty = all
+	Since     time.Time // zero = no lower bound
+	Until     time.Time // zero = no upper bound
+	Limit     int       // 0 = default (1000)
+}
+
+// DB is the embedded SQLite store that holds operational state, and the front
+// door to the configured event sink. See the package comment for why only one
+// of those two halves is pluggable.
+type DB struct {
+	db *sql.DB
+	// wdb is the write handle, capped at one connection. Nil on a read-only
+	// open, where writer() falls back to db — which is query_only, so the
+	// write is refused rather than quietly taken. See writer() for why there
+	// are two.
+	wdb      *sql.DB
+	sink     EventSink       // where events go; sqliteSink shares db when audit_sink is "sqlite"
+	filter   map[string]bool // nil = record all; otherwise only listed types
+	location *time.Location  // display timezone (storage is always UTC)
+	readOnly bool            // true when the backing file is not writable; Record becomes a no-op
+}
+
+// writer is the handle every write goes through, and it is separate from the
+// read pool on purpose.
+//
+// database/sql pools connections, and each SQLite connection is an independent
+// writer competing for the one write lock. Eight goroutines through one
+// unbounded pool are eight contenders, and the loser is refused unless
+// busy_timeout keeps it waiting — which made "no row is lost" a function of
+// whether the lock wait outlasted the load. Measured on Linux under -race with
+// only the timeout varied: 400 of 400 at 5s, 399 at 200ms, ~390 at 50ms, ~338
+// at 10ms. CI crossed that line occasionally and the suite reported it as the
+// regression B9 exists to prevent.
+//
+// Capping this handle at one connection moves the serialization from SQLite's
+// lock to Go's pool, so bodega's own writes queue instead of racing and the
+// write path cannot produce SQLITE_BUSY against itself at any timeout.
+//
+// The read pool stays unbounded, which is the half the busyTimeout comment
+// below is right about: SetMaxOpenConns(1) on a shared handle would put a
+// dashboard query behind every write, and WAL mode is turned on so that it is
+// not. Two handles keep both properties; one handle can only have either.
+//
+// That split holds only while exactly one of the two pools writes, so the read
+// pool is opened query_only and this accessor is how a write finds the other
+// one. A write that names a.db instead fails at SQLite.
+func (a *DB) writer() *sql.DB {
+	if a.wdb != nil {
+		return a.wdb
+	}
+	return a.db
+}
+
+// SinkName returns the configured sink kind, for error text and status output
+// that has to name where events are going.
+func (a *DB) SinkName() string { return a.sink.Name() }
+
+// EventsQueryable reports whether the configured sink can answer a read. False
+// for syslog and jsonl, which ship events out and keep no table.
+func (a *DB) EventsQueryable() bool {
+	_, ok := a.sink.(EventReader)
+	return ok
+}
+
+// reader returns the sink's read surface, or the refusal a write-only sink
+// owes the caller. op names what was being read so the message can say which
+// query went unanswered.
+func (a *DB) reader(op string) (EventReader, error) {
+	r, ok := a.sink.(EventReader)
+	if !ok {
+		return nil, &UnqueryableSinkError{Sink: a.sink.Name(), Op: op}
+	}
+	return r, nil
+}
+
+// SetEventFilter restricts which event types are recorded. Pass nil or empty
+// to record all events. Events not in the filter are silently dropped.
+func (a *DB) SetEventFilter(allowed []string) {
+	if len(allowed) == 0 {
+		a.filter = nil
+		return
+	}
+	a.filter = make(map[string]bool, len(allowed))
+	for _, t := range allowed {
+		a.filter[t] = true
+	}
+}
+
+// ShouldRecord returns true if the given event type passes the filter.
+func (a *DB) ShouldRecord(evType EventType) bool {
+	if a.filter == nil {
+		return true
+	}
+	return a.filter[string(evType)]
+}
+
+// SetTimezone sets the display timezone for query results. Stored timestamps
+// are always UTC; this only affects how they're presented.
+func (a *DB) SetTimezone(tz string) {
+	if tz == "" {
+		a.location = time.UTC
+		return
+	}
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		a.location = time.UTC
+		return
+	}
+	a.location = loc
+}
+
+// DisplayLocation returns the configured display timezone, defaulting to UTC.
+func (a *DB) DisplayLocation() *time.Location {
+	if a.location == nil {
+		return time.UTC
+	}
+	return a.location
+}
+
+// busyTimeout is how long a connection waits for the SQLite write lock before
+// giving up. database/sql pools connections, so two goroutines writing through
+// one *DB are two SQLite connections contending for that lock; with no timeout
+// the loser is refused immediately and the row is gone. Eight goroutines
+// writing fifty events each stored 30 of 400 without it.
+//
+// db.SetMaxOpenConns(1) would also stop the loss, by removing the contention:
+// one connection cannot race itself. It removes the concurrent reads too,
+// which is the thing WAL mode is turned on for — a dashboard query would then
+// queue behind every write. Waiting for the lock keeps both.
+const busyTimeout = 5 * time.Second
+
+// lockBudget is what dsn writes into the busy_timeout pragma. It is a variable
+// so a test can shrink it and drive the no-row-lost guarantee against a lock
+// wait it controls, rather than against however fast the machine happens to
+// be. Production never changes it.
+//
+// It stays at 5s even though the write path can no longer contend with itself:
+// busy_timeout still governs a writer outside this process. `sqlite3` on the
+// audit file, a second bodega on the same volume, or a backup holding a read
+// transaction while the WAL checkpoints are all real, and each is a wait this
+// process cannot serialize away.
+var lockBudget = busyTimeout
+
+// dsn attaches the busy_timeout pragma to a database path, and query_only
+// alongside it for a handle that must not write. An empty path is left alone:
+// the driver only strips a query string when it appears at index 1 or later,
+// so "?..." on its own would be taken as a filename.
+func dsn(path string, queryOnly bool) string {
+	if path == "" {
+		return path
+	}
+	out := fmt.Sprintf("%s?_pragma=busy_timeout(%d)", path, lockBudget.Milliseconds())
+	if queryOnly {
+		out += "&_pragma=query_only(true)"
+	}
+	return out
+}
+
+// Open opens (or creates) the audit database at path and runs migrations.
+//
+// If the backing file exists but isn't writable by this process (typical when
+// bodega is installed as a system service and a non-root user is running a
+// read-only command like `bodega audit events`), Open still returns a usable
+// handle: migrations are skipped, and Record becomes a silent no-op. Query
+// keeps working. This is the graceful path for "I'm logged in as ravi but
+// /var/log/bodega/audit.db is root:root 644."
+func Open(path string) (*DB, error) {
+	return OpenWithSink(path, SinkConfig{})
+}
+
+// OpenWithSink opens the embedded store at path and attaches the configured
+// event sink. The embedded store is opened either way: it holds the ACLs,
+// tokens, checksums and policies the request path reads, which no sink
+// replaces. A sink that cannot be reached is an error here rather than a
+// warning, so `bodega serve` can refuse to start on it.
+func OpenWithSink(path string, sc SinkConfig) (*DB, error) {
+	return openStore(path, sc, false)
+}
+
+// OpenReadOnly opens an existing store for reading and nothing else: no
+// directory creation, no migration, no backfill, no default posture.
+//
+// A command that reports on an install must not change the install to produce
+// the report. Opening read-write runs whatever migrations are pending, and on
+// a database that predates migration 012 that decides the default posture on
+// the operator's behalf, from a process the operator ran to be told what the
+// posture already was. query_only makes that a database error rather than a
+// convention, so a write added later to a read path fails loudly here.
+//
+// Queries against a store older than this binary's schema return "no such
+// table" rather than being migrated into range. That is the honest answer:
+// the caller reports it and the operator upgrades when they mean to.
+func OpenReadOnly(path string) (*DB, error) {
+	// query_only stops writes through the handle; it does not stop the driver
+	// creating an empty file for a path that is not there. Refusing here is
+	// what keeps a report on a host with no install from leaving one behind.
+	if path == "" {
+		return nil, fmt.Errorf("no audit db path")
+	}
+	if _, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("audit db %s: %w", path, err)
+	}
+	return openStore(path, SinkConfig{}, true)
+}
+
+func openStore(path string, sc SinkConfig, forceReadOnly bool) (*DB, error) {
+	readOnly := forceReadOnly
+	if path != "" && !forceReadOnly {
+		// A first run has log_dir but not the directory under it. That is a
+		// fixable condition, not a missing store, and since `bodega serve`
+		// now refuses to start without the audit store, leaving it unfixed
+		// would turn every fresh install into a startup failure. 0o750: the
+		// trail names client addresses and package requests.
+		if dir := filepath.Dir(path); dir != "" && dir != "." {
+			if err := os.MkdirAll(dir, 0o750); err != nil {
+				return nil, fmt.Errorf("create audit db directory %s: %w", dir, err)
+			}
+		}
+		if _, statErr := os.Stat(path); statErr == nil {
+			if f, err := os.OpenFile(path, os.O_WRONLY, 0); err != nil {
+				readOnly = true
+			} else {
+				_ = f.Close()
+			}
+		}
+	}
+
+	// The read pool, query_only on every open and not just the read-only
+	// ones. Two handles only keep their properties while exactly one of them
+	// writes, and the way that stops being true is a write added to a read
+	// path copying the handle its neighbour named. Through a writable read
+	// pool that write succeeds, silently restoring the two-contender shape
+	// busyTimeout was papering over; through this one it is a database error
+	// at the first call.
+	db, err := sql.Open("sqlite", dsn(path, true))
+	if err != nil {
+		return nil, fmt.Errorf("open audit db %s: %w", path, err)
+	}
+
+	// The write handle. One connection, so bodega's own writes queue in Go's
+	// pool rather than racing for SQLite's write lock; see DB.writer. A
+	// read-only open gets none, because query_only refuses the writes anyway
+	// and a second handle would only be a second thing to close.
+	var wdb *sql.DB
+	if !readOnly {
+		wdb, err = sql.Open("sqlite", dsn(path, false))
+		if err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("open audit db %s for writing: %w", path, err)
+		}
+		wdb.SetMaxOpenConns(1)
+	}
+	closeAll := func() {
+		if wdb != nil {
+			_ = wdb.Close()
+		}
+		_ = db.Close()
+	}
+
+	// WAL mode needs write access; skip on read-only handles (journal_mode
+	// returns the existing mode silently when write is denied, but we'd rather
+	// not even attempt the PRAGMA).
+	//
+	// Every statement here runs on the write handle. A migration racing the
+	// read pool is the one ordering that has to be impossible, and WAL is what
+	// the read pool needs set before it reads anything.
+	if !readOnly {
+		if _, err := wdb.Exec("PRAGMA journal_mode=WAL"); err != nil {
+			closeAll()
+			return nil, fmt.Errorf("set WAL mode: %w", err)
+		}
+		from, err := runMigrations(wdb)
+		if err != nil {
+			closeAll()
+			return nil, fmt.Errorf("migrate audit db: %w", err)
+		}
+		// Default posture. policy_seeds decides, not the emptiness of
+		// age_policy: an operator who removed every row chose no gate, and a
+		// re-seed would overrule them on the next restart. An install crossing
+		// migration 012 claims the marker with nothing behind it, so an
+		// upgrade never changes what a running fleet enforces.
+		//
+		// `from` is the only evidence that this open is the upgrade, and it
+		// lives in a local variable. Anything fallible between the migration
+		// and the claim is a path where Open aborts, the retry reads 12, and
+		// the marker gets written by nobody. The backfill below is such a
+		// path without needing a crash: it rewrites every mis-identified
+		// checksum row, and a store that refuses that write fails the open
+		// after 012 has already committed.
+		if from < policySeedVersion {
+			if err := claimPolicySeed(context.Background(), wdb, PolicySeedAge); err != nil {
+				closeAll()
+				return nil, fmt.Errorf("claim age policy default: %w", err)
+			}
+		}
+		// Migration 011 corrects identity the request-path parser got wrong on
+		// every cached artifact of seven of the eight ecosystems. It reads only
+		// the object key, so it runs here on the upgrade that crosses it rather
+		// than costing every open a full scan of a table that grows with the
+		// cache.
+		//
+		// It runs after runMigrations, so on an upgrade crossing 021 it reads
+		// the renamed column; backfillChecksumIdentity resolves the name rather
+		// than assuming either, because a store stepped between 011 and 021 by
+		// hand still spells it the old way.
+		if from < checksumIdentityVersion {
+			n, err := backfillChecksumIdentity(context.Background(), wdb)
+			if err != nil {
+				closeAll()
+				return nil, fmt.Errorf("backfill checksum package identity: %w", err)
+			}
+			if n > 0 {
+				slog.Info("checksum rows re-derived from their object key", "rows", n, "migration", checksumIdentityVersion)
+			}
+		}
+		seeded, err := seedDefaultAgePolicy(context.Background(), wdb)
+		if err != nil {
+			closeAll()
+			return nil, fmt.Errorf("seed default age policy: %w", err)
+		}
+		if len(seeded) > 0 {
+			slog.Info("fresh install: minimum publish age seeded",
+				"ecosystems", seeded, "min_age_seconds", DefaultAgeMinSeconds, "action", DefaultAgeAction)
+		}
+	}
+
+	sink, err := newSink(sc, db, wdb, readOnly)
+	if err != nil {
+		closeAll()
+		return nil, err
+	}
+	return &DB{db: db, wdb: wdb, sink: sink, readOnly: readOnly}, nil
+}
+
+// ReadOnly returns true when the backing file is not writable. Record silently
+// no-ops on a read-only handle; Query keeps working.
+func (a *DB) ReadOnly() bool { return a.readOnly }
+
+// Close closes the sink and then both embedded handles. The sqlite sink shares
+// them and its Close is a no-op, so each is closed once.
+func (a *DB) Close() error {
+	sinkErr := a.sink.Close()
+	var wErr error
+	if a.wdb != nil {
+		wErr = a.wdb.Close()
+	}
+	dbErr := a.db.Close()
+	switch {
+	case sinkErr != nil:
+		return sinkErr
+	case wErr != nil:
+		return wErr
+	}
+	return dbErr
+}
+
+// Record writes one event to the configured sink. It is silent on filtered
+// events and on a read-only sqlite handle. Callers that need hard-fail
+// semantics should check ReadOnly() themselves.
+func (a *DB) Record(ctx context.Context, ev Event) error {
+	if !a.ShouldRecord(ev.EventType) {
+		return nil
+	}
+	return a.sink.Record(ctx, ev)
+}
+
+// Query returns events matching the filter, ordered by timestamp descending,
+// with timestamps rendered in the display timezone. It refuses rather than
+// returning an empty page when the configured sink keeps no table.
+func (a *DB) Query(ctx context.Context, f Filter) ([]StoredEvent, error) {
+	r, err := a.reader("audit events")
+	if err != nil {
+		return nil, err
+	}
+	events, err := r.QueryEvents(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	if a.location != nil {
+		for i := range events {
+			events[i].Timestamp = events[i].Timestamp.In(a.location)
+		}
+	}
+	return events, nil
+}
+
+// Count returns the total number of events matching the filter.
+func (a *DB) Count(ctx context.Context, f Filter) (int64, error) {
+	r, err := a.reader("audit events")
+	if err != nil {
+		return 0, err
+	}
+	return r.CountEvents(ctx, f)
+}
+
+// StoredChecksum is a cached checksum record.
+type StoredChecksum struct {
+	ID         int64
+	PkgType    string
+	PkgName    string
+	PkgVersion string
+	ObjectKey  string
+	Algorithm  string
+	Value      string
+	Source     string // "computed", "upstream", "manifest"
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}
+
+// StoreChecksum inserts or updates a checksum record keyed by object key.
+func (a *DB) StoreChecksum(ctx context.Context, objectKey, pkgType, pkgName, pkgVersion, algorithm, value, source string) error {
+	_, err := a.writer().ExecContext(ctx,
+		`INSERT INTO checksums (object_key, pkg_type, pkg_name, pkg_version, algorithm, value, source)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(object_key) DO UPDATE SET
+		   value = excluded.value,
+		   algorithm = excluded.algorithm,
+		   source = excluded.source,
+		   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+		objectKey, pkgType, pkgName, pkgVersion, algorithm, value, source,
+	)
+	return err
+}
+
+// ObjectIdentity is what a store reports about one cached object, and it is
+// what binds a recorded origin to those bytes rather than to their key.
+//
+// Backend is the store's Label(), so an object moved between buckets stops
+// matching. Size with Modified is the identity every backend can produce;
+// ETag is preferred where the backend supplies one, because it survives a
+// rewrite that lands the same length in the same clock tick.
+type ObjectIdentity struct {
+	Backend  string
+	Size     int64
+	ETag     string
+	Modified string
+}
+
+// Known reports whether this identity names an object at all. A zero value is
+// what a caller with no store metadata in hand passes, and it must match
+// nothing.
+func (o ObjectIdentity) Known() bool {
+	return o.Backend != "" && (o.Size >= 0 || o.ETag != "")
+}
+
+// matches reports whether stored describes the same object as o.
+//
+// ETag decides where both sides have one: it is a content token, and the two
+// fields below are not. Size and Modified together are the fallback, which
+// costs a rewrite of identical length inside one filesystem timestamp tick —
+// narrow enough to accept, and it errs toward crediting bytes that are in fact
+// the same bytes.
+func (o ObjectIdentity) matches(stored ObjectIdentity) bool {
+	if !o.Known() || !stored.Known() || o.Backend != stored.Backend {
+		return false
+	}
+	if o.ETag != "" && stored.ETag != "" {
+		return o.ETag == stored.ETag
+	}
+	return o.Size == stored.Size && o.Modified == stored.Modified
+}
+
+// StoreCacheOrigin records which upstream supplied the bytes now cached at
+// objectKey, so a later hit can name it without a network round trip. obj is
+// what the store reported about those bytes once they landed.
+//
+// It lives in the embedded store rather than in the event stream because the
+// serving path reads it to compose a row, and syslog and jsonl sinks answer no
+// reads at all. Upserted: a mutable document refetched after its TTL may come
+// from a different archive than last time, and the row has to follow the bytes.
+func (a *DB) StoreCacheOrigin(ctx context.Context, objectKey, upstreamURL string, obj ObjectIdentity) error {
+	_, err := a.writer().ExecContext(ctx,
+		`INSERT INTO cache_origins (object_key, upstream_url, backend, object_size, object_etag, object_modified)
+		 VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(object_key) DO UPDATE SET
+		   upstream_url = excluded.upstream_url,
+		   backend = excluded.backend,
+		   object_size = excluded.object_size,
+		   object_etag = excluded.object_etag,
+		   object_modified = excluded.object_modified,
+		   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+		objectKey, upstreamURL, obj.Backend, obj.Size, obj.ETag, obj.Modified,
+	)
+	return err
+}
+
+// CacheOrigin returns the upstream recorded for the object obj identifies at
+// objectKey, or "" when nothing recorded one: an object cached before this
+// table existed, filled by a path that fetches nothing, or written over since
+// by one.
+// The caller says so in the row rather than substituting a current candidate.
+//
+// The identity check is here rather than at the call site so that a serving
+// path cannot read an origin without it. That is the shape the first version
+// got wrong: it trusted the key, and every writer that does not fetch — 'pkg
+// upload', a replaced object, a moved bucket — silently inherited the previous
+// tenant's attribution.
+func (a *DB) CacheOrigin(ctx context.Context, objectKey string, obj ObjectIdentity) (string, error) {
+	var (
+		upstreamURL string
+		stored      ObjectIdentity
+	)
+	err := a.db.QueryRowContext(ctx,
+		`SELECT upstream_url, backend, object_size, object_etag, object_modified
+		 FROM cache_origins WHERE object_key = ?`, objectKey,
+	).Scan(&upstreamURL, &stored.Backend, &stored.Size, &stored.ETag, &stored.Modified)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if !obj.matches(stored) {
+		return "", nil
+	}
+	return upstreamURL, nil
+}
+
+// GetChecksum returns the stored checksum for an object key, or nil if not found.
+func (a *DB) GetChecksum(ctx context.Context, objectKey string) (*StoredChecksum, error) {
+	var sc StoredChecksum
+	var createdAt, updatedAt string
+	err := a.db.QueryRowContext(ctx,
+		`SELECT id, pkg_type, pkg_name, pkg_version, object_key, algorithm, value, source, created_at, updated_at
+		 FROM checksums WHERE object_key = ?`, objectKey,
+	).Scan(&sc.ID, &sc.PkgType, &sc.PkgName, &sc.PkgVersion, &sc.ObjectKey,
+		&sc.Algorithm, &sc.Value, &sc.Source, &createdAt, &updatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	sc.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	sc.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	return &sc, nil
+}
+
+// ListChecksums returns all checksums matching the optional type and name filters.
+func (a *DB) ListChecksums(ctx context.Context, pkgType, pkgName string) ([]StoredChecksum, error) {
+	var where []string
+	var args []interface{}
+
+	if pkgType != "" {
+		where = append(where, "pkg_type = ?")
+		args = append(args, pkgType)
+	}
+	if pkgName != "" {
+		where = append(where, "pkg_name = ?")
+		args = append(args, pkgName)
+	}
+
+	query := "SELECT id, pkg_type, pkg_name, pkg_version, object_key, algorithm, value, source, created_at, updated_at FROM checksums"
+	if len(where) > 0 {
+		//nolint:gosec // G202: WHERE clause assembled from a fixed slice of internal predicates; values are bound via ? parameters in `args`.
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " ORDER BY pkg_type, pkg_name, pkg_version"
+
+	rows, err := a.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var checksums []StoredChecksum
+	for rows.Next() {
+		var sc StoredChecksum
+		var createdAt, updatedAt string
+		if err := rows.Scan(&sc.ID, &sc.PkgType, &sc.PkgName, &sc.PkgVersion, &sc.ObjectKey,
+			&sc.Algorithm, &sc.Value, &sc.Source, &createdAt, &updatedAt); err != nil {
+			return nil, err
+		}
+		sc.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+		sc.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+		checksums = append(checksums, sc)
+	}
+	return checksums, rows.Err()
+}
+
+// ClearChecksum blanks the stored digest for an object key, keeping the row.
+//
+// The row is two records in one. The digest is what verifyProxyChecksum
+// compares a re-fetch against, and clearing it is how an operator escapes an
+// upstream that republished different bytes. Its object_key and "computed" source
+// are also the only thing that tells a cached upstream .deb in pool/ from one
+// bodega built, which is what keeps the archive's bytes out of an index signed
+// with bodega's key (#225). Deleting the row cleared the first and destroyed
+// the second while the artifact stayed in pool/.
+//
+// A blank value reads as "no digest recorded": verifyProxyChecksum stores the
+// next computed one over it, exactly as it does for a key it has never seen.
+func (a *DB) ClearChecksum(ctx context.Context, objectKey string) error {
+	result, err := a.writer().ExecContext(ctx,
+		`UPDATE checksums SET value = '', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+		 WHERE object_key = ?`, objectKey)
+	if err != nil {
+		return err
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("no checksum found for key %q", objectKey)
+	}
+	return nil
+}
+
+// ClearChecksumsByPackage blanks the stored digest on every row for a package.
+// See ClearChecksum for why the rows stay.
+//
+// It returns two counts because the rows outlive their digests and the caller
+// is an operator escaping a checksum mismatch. cleared is how many digests went
+// — zero is not an error, and it is the whole signal that the remedy did
+// nothing. matched is how many rows carry the name at all, which separates a
+// package clear-run-twice from a package spelled wrong.
+func (a *DB) ClearChecksumsByPackage(ctx context.Context, pkgType, pkgName string) (cleared, matched int64, err error) {
+	if err := a.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM checksums WHERE pkg_type = ? AND pkg_name = ?",
+		pkgType, pkgName,
+	).Scan(&matched); err != nil {
+		return 0, 0, err
+	}
+	result, err := a.writer().ExecContext(ctx,
+		`UPDATE checksums SET value = '', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+		 WHERE pkg_type = ? AND pkg_name = ? AND value != ''`,
+		pkgType, pkgName,
+	)
+	if err != nil {
+		return 0, matched, err
+	}
+	cleared, err = result.RowsAffected()
+	if err != nil {
+		return 0, matched, err
+	}
+	return cleared, matched, nil
+}
+
+// ---- API Token Management ---------------------------------------------------
+
+// TokenInfo holds non-sensitive metadata about an API token.
+type TokenInfo struct {
+	ID        string
+	Label     string
+	Comment   string
+	CreatedAt time.Time
+	ExpiresAt *time.Time // nil = never expires
+	LastUsed  *time.Time // nil = never used
+}
+
+// TokenHash holds the hash and expiry for auth verification.
+type TokenHash struct {
+	ID        string
+	Hash      string
+	ExpiresAt *time.Time
+}
+
+// InsertToken stores a new hashed API token.
+func (a *DB) InsertToken(ctx context.Context, id, label, hash, comment string, expiresAt *time.Time) error {
+	var exp sql.NullString
+	if expiresAt != nil {
+		exp = sql.NullString{String: expiresAt.UTC().Format(time.RFC3339), Valid: true}
+	}
+	_, err := a.writer().ExecContext(ctx,
+		"INSERT INTO api_tokens (id, label, hash, comment, expires_at) VALUES (?, ?, ?, ?, ?)",
+		id, label, hash, comment, exp,
+	)
+	return err
+}
+
+// ListTokens returns metadata for all tokens (never the hash).
+func (a *DB) ListTokens(ctx context.Context) ([]TokenInfo, error) {
+	rows, err := a.db.QueryContext(ctx,
+		"SELECT id, label, comment, created_at, expires_at, last_used FROM api_tokens ORDER BY created_at DESC",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tokens []TokenInfo
+	for rows.Next() {
+		var t TokenInfo
+		var created, expires, lastUsed sql.NullString
+		if err := rows.Scan(&t.ID, &t.Label, &t.Comment, &created, &expires, &lastUsed); err != nil {
+			return nil, err
+		}
+		if created.Valid {
+			if parsed, err := time.Parse(time.RFC3339Nano, created.String); err == nil {
+				t.CreatedAt = parsed
+			}
+		}
+		if expires.Valid {
+			if parsed, err := time.Parse(time.RFC3339, expires.String); err == nil {
+				t.ExpiresAt = &parsed
+			}
+		}
+		if lastUsed.Valid {
+			if parsed, err := time.Parse(time.RFC3339, lastUsed.String); err == nil {
+				t.LastUsed = &parsed
+			}
+		}
+		tokens = append(tokens, t)
+	}
+	return tokens, rows.Err()
+}
+
+// GetTokenHashes returns all token hashes for auth verification.
+func (a *DB) GetTokenHashes(ctx context.Context) ([]TokenHash, error) {
+	rows, err := a.db.QueryContext(ctx,
+		"SELECT id, hash, expires_at FROM api_tokens",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var hashes []TokenHash
+	for rows.Next() {
+		var h TokenHash
+		var expires sql.NullString
+		if err := rows.Scan(&h.ID, &h.Hash, &expires); err != nil {
+			return nil, err
+		}
+		if expires.Valid {
+			if parsed, err := time.Parse(time.RFC3339, expires.String); err == nil {
+				h.ExpiresAt = &parsed
+			}
+		}
+		hashes = append(hashes, h)
+	}
+	return hashes, rows.Err()
+}
+
+// UpdateTokenLastUsed sets the last_used timestamp for a token.
+func (a *DB) UpdateTokenLastUsed(ctx context.Context, id string) error {
+	_, err := a.writer().ExecContext(ctx,
+		"UPDATE api_tokens SET last_used = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+		id,
+	)
+	return err
+}
+
+// DeleteToken removes a token by ID.
+// DeleteToken removes a token by ID. Returns an error if the token does not exist.
+func (a *DB) DeleteToken(ctx context.Context, id string) (bool, error) {
+	result, err := a.writer().ExecContext(ctx,
+		"DELETE FROM api_tokens WHERE id = ?",
+		id,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, _ := result.RowsAffected()
+	return n > 0, nil
+}
+
+// DeleteTokenByLabel removes a token by label.
+func (a *DB) DeleteTokenByLabel(ctx context.Context, label string) error {
+	_, err := a.writer().ExecContext(ctx,
+		"DELETE FROM api_tokens WHERE label = ?",
+		label,
+	)
+	return err
+}
+
+// TokenCount returns the number of active (non-expired) tokens.
+func (a *DB) TokenCount(ctx context.Context) (int, error) {
+	var count int
+	err := a.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM api_tokens WHERE expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+	).Scan(&count)
+	return count, err
+}

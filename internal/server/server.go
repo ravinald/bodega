@@ -1,0 +1,2062 @@
+// Package server implements the bodega HTTP package server.
+//
+// The server proxies stored package artifacts to standard package manager
+// clients (apt, pip) and exposes a REST API for manifest inspection. Which
+// backend holds the bytes is the manifest entry's business, not the handler's.
+package server
+
+import (
+	"context"
+	cryptoRand "crypto/rand"
+	"crypto/tls"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"path"
+	"path/filepath"
+	"slices"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/ravinald/bodega/internal/admit"
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/builder"
+	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
+	"github.com/ravinald/bodega/internal/storage"
+)
+
+// contentTypes maps file extensions to MIME types for proxied responses.
+var contentTypes = map[string]string{
+	".deb":    "application/vnd.debian.binary-package",
+	".whl":    "application/zip",
+	".bundle": "application/octet-stream",
+	".gz":     "application/gzip",
+	".bz2":    "application/x-bzip2",
+	".xz":     "application/x-xz",
+	".asc":    "text/plain; charset=utf-8",
+	".html":   "text/html; charset=utf-8",
+	".json":   "application/json",
+	".txt":    "text/plain; charset=utf-8",
+	".zip":    "application/zip",
+	".tgz":    "application/gzip",
+	".yaml":   "text/yaml; charset=utf-8",
+	".yml":    "text/yaml; charset=utf-8",
+	".mod":    "text/plain; charset=utf-8",
+	".info":   "application/json",
+}
+
+// Server is the bodega HTTP package server.
+type Server struct {
+	cfg    *config.Config
+	store  *manifest.Store
+	stores storage.Resolver
+	mux    *http.ServeMux
+	// routePatterns is every pattern registerRoutes put on the mux, in
+	// registration order. Read by the OpenAPI conformance test.
+	routePatterns []string
+	addr          string
+	logger        *slog.Logger
+	cache         CacheConfig
+	auditDB       *audit.DB
+	policy        *policy.Checker
+	discoverMode  string             // "" or "observe" — see internal/server/discovery.go
+	discovery     *DiscoveryRecorder // nil when discover_mode == "" or auditDB == nil
+	denyNets      []*net.IPNet
+	adminNets     []*net.IPNet // CIDRs allowed to reach the admin surface (admin_permit_cidr)
+	adminErr      error        // set when admin_permit_cidr parses to nothing; Start refuses on it
+	auditErr      error        // set when the configured audit sink will not record; Start refuses on it
+	pepperErr     error        // set when the pepper in force is unreadable; Start refuses on it
+	spool         *spoolLimiter
+	spoolErr      error // set when spool_dir cannot be created or written; Start refuses on it
+	// fills holds a proxied key from the moment its bytes reach the store
+	// until its origin row does, so a hit arriving inside that window can
+	// still name the fetch it is reading. See internal/server/proxy.go.
+	fills cacheFills
+	// trustedNets are the proxies whose forwarded headers are believed.
+	// trustedNetsSet distinguishes "operator wrote an empty list" from
+	// "operator wrote nothing": the first trusts no header from anyone, the
+	// second takes the built-in loopback + RFC1918 default. Collapsing them
+	// would silently restore header trust to a deployment that removed it.
+	trustedNets    []*net.IPNet
+	trustedNetsSet bool
+	pepper         string     // pepper for token hash verification
+	quiet          bool       // suppress stderr startup banner (slog output unaffected)
+	mu             sync.Mutex // protects store mutations (CRUD API)
+
+	// acl is the live answer for all three CIDR lists, resolved from the audit
+	// database over the three fields above. Held behind an atomic pointer and
+	// a TTL rather than rebuilt on the handler chain, because the chain is
+	// built once at Start and an operator changing a list on a running server
+	// has nothing to rebuild it. See internal/server/acl.go.
+	acl   atomic.Pointer[aclSet]
+	aclAt atomic.Int64 // UnixNano the cached set was resolved
+	aclMu sync.Mutex   // serializes refreshes so a stale cache costs one query
+
+	// identity is the live answer for the identity binding table, held the
+	// same way and on the same TTL as acl. See internal/server/identity.go.
+	identity   atomic.Pointer[identitySet]
+	identityAt atomic.Int64
+	identityMu sync.Mutex
+	// profiles is the live answer for the profile binding table, held the same
+	// way and on the same TTL as acl and identity. See
+	// internal/server/profile.go.
+	profiles   atomic.Pointer[profileSet]
+	profilesAt atomic.Int64
+	profileMu  sync.Mutex
+
+	// aptSign is the signing key and the two served renderings of its public
+	// half. nil when no key is installed, which is a supported configuration:
+	// signed and unsigned coexist at the same URLs, and the signature is
+	// metadata a client opts into checking.
+	//
+	// Atomic and swapped whole because SIGHUP re-reads the key while request
+	// handlers are reading it. Whole matters as much as atomic: a keyring
+	// route answering from the incoming key while InRelease still carried the
+	// outgoing signature is a client being told the archive is forged.
+	aptSign atomic.Pointer[aptSigning]
+
+	// aptSnap is the generated apt index. Held whole so Release and the
+	// Packages bodies it digests are always served from one generation.
+	aptSnap atomic.Pointer[aptSnapshot]
+
+	// gitTool is the resolved git toolchain the smart-HTTP path executes,
+	// or nil when git-http-backend could not be found at startup. Nil is what
+	// leaves POST /git/{namespace}/{path...} unregistered, so a clone fails
+	// with a method the mux never answers rather than per-request inside a
+	// handler that cannot work.
+	gitTool *gitTool
+	// gitClone serializes the first clone of each mirror, so concurrent first
+	// requests for one repository produce one `git clone --mirror`.
+	gitClone keyedMutex
+
+	// aptPool caches the pool listing behind metadata_ttl. Every apt-touching
+	// API write rebuilds the snapshot and the rebuild lists the whole pool, so
+	// a burst of writes paid for a full listing each — multiplied by the
+	// number of backends once the listing fans out.
+	aptPool atomic.Pointer[aptPoolListing]
+	// aptUpstreamIdx caches the upstream index documents a filtered codename
+	// is generated from, behind metadata_ttl. Every profile write signals a
+	// reload and a reload rebuilds the snapshot, so without it an operator
+	// adding twenty entries would refetch the base's Packages twenty times
+	// from an archive that republishes it daily.
+	aptUpstreamIdx sync.Map
+
+	// aptRoutes remembers which configured archive answered for each pool
+	// path, because a pool request carries no codename to resolve it by.
+	aptRoutes aptRouteCache
+	// aptMirror serializes concurrent misses for one mirrored object, so a
+	// fleet running `apt install` at the same minute makes one upstream fetch
+	// of a .deb rather than one per host.
+	aptMirror keyedMutex
+}
+
+// SetQuiet suppresses the human-facing stderr startup banner. Log-level
+// routed events are unaffected. Default is false.
+func (s *Server) SetQuiet(q bool) { s.quiet = q }
+
+// New constructs a Server and registers all routes.
+// stores may be nil — package-serving endpoints return 503 in that case.
+// logger may be nil — a no-op logger is used in that case.
+func New(cfg *config.Config, store *manifest.Store, stores storage.Resolver, addr string, logger *slog.Logger) *Server {
+	return newServer(cfg, store, stores, addr, logger)
+}
+
+func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolver, addr string, logger *slog.Logger) *Server {
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	s := &Server{
+		cfg:    cfg,
+		store:  store,
+		stores: stores,
+		mux:    http.NewServeMux(),
+		addr:   addr,
+		logger: logger,
+	}
+	// Wire proxy/cache config.
+	ttl, _ := time.ParseDuration(cfg.MetadataTTL)
+	if ttl == 0 {
+		ttl = time.Hour
+	}
+	s.cache = CacheConfig{
+		Enabled:     cfg.ProxyCacheEnabled,
+		MetadataTTL: ttl,
+	}
+	// Proxy spool. Resolved and probed here, refused in Start: the spool is
+	// disk the server spends on behalf of every proxy client, and the default
+	// location shares a filesystem with the audit database and the local
+	// store, so an operator who is going to be surprised by where it lands
+	// should be surprised at startup rather than at the first large fetch.
+	spoolDir := cfg.ResolveSpoolDir()
+	s.spool = newSpoolLimiter(spoolDir, cfg.SpoolMaxArtifactBytes, cfg.SpoolMaxTotalBytes)
+	if err := ensureSpoolDir(spoolDir); err != nil {
+		s.spoolErr = err
+	} else {
+		logger.Info("proxy spool ready", "spool_dir", spoolDir,
+			"spool_max_artifact_bytes", cfg.SpoolMaxArtifactBytes,
+			"spool_max_total_bytes", cfg.SpoolMaxTotalBytes)
+	}
+
+	if len(cfg.DenyList) > 0 {
+		nets, err := ParseDenyList(cfg.DenyList)
+		if err != nil {
+			logger.Error("invalid deny list entry", "error", err)
+		} else {
+			s.denyNets = nets
+			logger.Info("deny list loaded", "entries", len(nets))
+		}
+	}
+	// Parse admin permit CIDRs for the admin surface: the mutation verbs and
+	// the four admin read endpoints. Held for Start to refuse on rather than
+	// logged and discarded, because an admin list bodega cannot read is not a
+	// list it may substitute a default for.
+	if nets, err := parseAdminPermitCIDR(cfg.AdminPermitCIDR); err != nil {
+		s.adminErr = err
+	} else if len(nets) > 0 {
+		s.adminNets = nets
+		logger.Info("admin permit CIDRs loaded", "entries", len(nets))
+	}
+	// trusted_proxies. A non-nil slice, empty included, is an explicit answer.
+	if cfg.TrustedProxies != nil {
+		nets, err := ParseDenyList(cfg.TrustedProxies)
+		if err != nil {
+			logger.Error("invalid trusted_proxies entry", "error", err)
+		} else {
+			if nets == nil {
+				nets = []*net.IPNet{}
+			}
+			s.trustedNets = nets
+			s.trustedNetsSet = true
+			logger.Info("trusted proxies loaded", "entries", len(nets))
+		}
+	}
+	// Load or create pepper for token auth. An unreadable pepper is held for
+	// Start to refuse on rather than worked around: the server would otherwise
+	// hash against a second pepper while the admin mints against the first,
+	// and the only symptom is a 401 naming the credential.
+	pst, err := audit.LoadOrCreatePepper(audit.DefaultPepperPaths)
+	switch {
+	case err == nil:
+		s.pepper = pst.Pepper
+		if pst.Created {
+			logger.Info("pepper file created (first run)", "path", pst.Path)
+		}
+	case errors.As(err, new(*audit.PepperUnreadableError)):
+		s.pepperErr = err
+	case errors.As(err, new(*audit.PepperHandoffError)):
+		// This process wrote the pepper and can read it; what failed is the
+		// hand-off to the account the unit runs as. Refusing the start would
+		// take the repository down over a token path that works for whoever
+		// is serving now, so it is logged and `bodega token generate` is what
+		// refuses to mint against it.
+		s.pepper = pst.Pepper
+		logger.Error("pepper created but not handed to the service account; a token minted by another account will be refused",
+			"path", pst.Path, "error", err)
+	default:
+		logger.Error("could not load or create pepper file — token auth will not work", "error", err)
+	}
+	for _, c := range pst.Shadowed {
+		args := []any{"in_force", pst.Path, "ignored", c.Path}
+		if c.Err != nil {
+			args = append(args, "error", c.Err)
+		}
+		logger.Error("a second pepper is present and ignored; tokens minted against it are refused until it becomes the one in force",
+			args...)
+	}
+	// Open the audit store and attach the configured sink. Held for Start to
+	// refuse on, not logged and continued: a proxy that cannot record who it
+	// refused is a proxy whose refusals are unauditable, and an audit store
+	// that fails open silently is the defect this design exists to prevent.
+	// The same posture the plaintext listener already has — bodega would
+	// rather not start than serve something the operator did not ask for.
+	//
+	// An unset audit_db is not a failure. It is an install that asked for no
+	// audit trail, and it keeps serving with token auth and policy
+	// enforcement off, as it did before.
+	if dbPath := resolveAuditDBPath(cfg); dbPath != "" {
+		sc := audit.SinkConfig{Kind: cfg.AuditSink, DSN: cfg.AuditSinkDSN}
+		if db, err := audit.OpenWithSink(dbPath, sc); err != nil {
+			s.auditErr = fmt.Errorf("audit store unavailable: %w\n"+
+				"  audit_db:   %s\n"+
+				"  audit_sink: %s\n"+
+				"bodega refuses to serve without the store that records its refusals. "+
+				"Fix the destination, or clear audit_db to run with no audit trail at all",
+				err, dbPath, firstNonEmptySink(cfg.AuditSink))
+		} else {
+			// The same two config keys the CLI applies to its own handle.
+			// Without them audit_events limited nothing the server wrote and
+			// timezone never reached GET /api/v1/audit, with no way for an
+			// operator to tell which handle they were configuring.
+			db.SetTimezone(cfg.Timezone)
+			if len(cfg.AuditEvents) > 0 {
+				db.SetEventFilter(cfg.AuditEvents)
+				if !db.ShouldRecord(audit.EventDenied) {
+					logger.Error("audit_events omits \"denied\", so no refusal this server makes will be recorded; add it or clear the key",
+						"audit_events", strings.Join(cfg.AuditEvents, ","))
+				}
+			}
+			// SinkName reports what audit.newSink actually built, which is
+			// the sqlite sink for an empty audit_sink as much as for the
+			// explicit string. Comparing against cfg.AuditSink instead skipped
+			// the guard for every hand-built Config that leaves the key unset.
+			if db.ReadOnly() && db.SinkName() == audit.SinkSQLite {
+				// Record is a silent no-op on a read-only sqlite handle, so
+				// every denial, lifecycle and fetch row would be discarded
+				// without an error anywhere. Query still works, which is what
+				// made it invisible: /api/v1/audit answered, it just stopped
+				// growing. Same class as a sink that will not connect, so it
+				// gets the same refusal.
+				s.auditErr = fmt.Errorf("audit db %s is not writable by this process (uid %d): "+
+					"every denial, fetch and lifecycle row would be dropped with no error anywhere. "+
+					"Give the serving user write access, or point audit_db somewhere it has it",
+					dbPath, os.Getuid())
+			}
+			s.auditDB = db
+			s.policy = policy.NewChecker(db)
+			logger.Info("audit store opened", "path", dbPath, "sink", db.SinkName(), "queryable", db.EventsQueryable())
+			if !db.EventsQueryable() {
+				// Not a failure: the operator chose a write-only sink. It
+				// changes what the server answers, so it goes at Error, which
+				// the shipped default log_level prints.
+				logger.Error("audit_sink is write-only: GET /api/v1/audit answers 501, and `bodega discover list` and `bodega discover promote` refuse, rather than returning an empty page",
+					"sink", db.SinkName())
+			}
+		}
+	}
+	// Discover mode: only meaningful with both an audit DB (to write rows)
+	// and a non-empty mode. Validation of the mode value happens at config
+	// load time, so we trust cfg.DiscoverMode here.
+	s.discoverMode = cfg.DiscoverMode
+	if s.discoverMode != "" && s.auditDB != nil {
+		s.discovery = NewDiscoveryRecorder(s.auditDB, logger)
+	}
+	// Access control lists: copy the config file's values into the audit DB on
+	// first sight, then resolve the live set the middleware chain reads.
+	s.seedACLs(context.Background())
+	s.refreshACLs(context.Background())
+	s.refreshIdentities(context.Background())
+
+	// Resolve the git toolchain before routes are registered: whether
+	// git-http-backend exists decides which routes exist.
+	s.gitTool = resolveGitTool(cfg, logger)
+
+	s.loadAptSigner()
+	s.registerRoutes()
+
+	// Build the first apt index here rather than in Start, so a Server can
+	// never answer an apt request from an empty snapshot. loadStore has
+	// already run LoadIndex by this point, so the manifests are current.
+	s.rebuildAptSnapshot(context.Background())
+	return s
+}
+
+// firstNonEmptySink names the sink for an error message. config.Load defaults
+// the key, but newServer is also reachable from tests holding a hand-built
+// Config, and an error that says audit_sink is "" helps nobody.
+func firstNonEmptySink(sink string) string {
+	if sink == "" {
+		return audit.SinkSQLite
+	}
+	return sink
+}
+
+// agePolicyBanner names the minimum publish age this instance admits against.
+// A fresh install is seeded with one, and an operator who never reads
+// docs/usage.md still has to learn from somewhere that a gate is on and which
+// ecosystems it covers. An install with no gate says so for the same reason:
+// silence reads identically either way.
+//
+// Only rows the age gate can date are counted. A row for an uncovered
+// ecosystem changes no admission decision, so printing it would claim
+// enforcement on an install where every gate that runs is off.
+func (s *Server) agePolicyBanner() string {
+	if s.auditDB == nil {
+		return ""
+	}
+	rows, err := s.auditDB.ListAgePolicies(context.Background())
+	if err != nil {
+		return ""
+	}
+	covered := policy.AgeEcosystems()
+	active := make([]string, 0, len(rows))
+	for _, p := range rows {
+		if p.Action == policy.ActionIgnore || !slices.Contains(covered, p.Ecosystem) {
+			continue
+		}
+		active = append(active, fmt.Sprintf("%s %s (%s)",
+			p.Ecosystem, policy.ShortDuration(time.Duration(p.MinAgeSeconds)*time.Second), p.Action))
+	}
+	if len(active) == 0 {
+		return "minimum publish age: none enforced (bodega policy age set npm 7d warn)\n"
+	}
+	return "minimum publish age: " + strings.Join(active, ", ") + "\n"
+}
+
+// resolveAuditDBPath returns the audit database path from config, falling
+// back to <log_dir>/audit.db when AuditDB is unset.
+func resolveAuditDBPath(cfg *config.Config) string {
+	if cfg.AuditDB != "" {
+		return cfg.AuditDB
+	}
+	if cfg.LogDir != "" {
+		return filepath.Join(cfg.LogDir, "audit.db")
+	}
+	return ""
+}
+
+// Handler returns the root http.Handler (with middleware applied).
+// Useful for testing without starting a real TCP listener.
+func (s *Server) Handler() http.Handler {
+	return s.handler()
+}
+
+// handler builds the middleware chain around the mux.
+func (s *Server) handler() http.Handler {
+	var h http.Handler = s.mux
+	h = AuditMiddleware(s.auditDB)(h)
+	h = MutationAuthMiddleware(s.adminNetsFunc(), s.auditDB, s.pepper, s.logger)(h)
+	// Inside the deny list, so a refused address costs no token hash: a
+	// deny-listed peer is the one client that can flood this server on
+	// purpose. Outside everything that writes an audit row, so every row
+	// downstream — the fetch, the denial, the discovery observation — names
+	// the host and not only the address.
+	h = IdentityMiddleware(s.identityFunc())(h)
+	h = DenyListMiddleware(s.denyNetsFunc(), s.auditDB)(h)
+	h = RequestLogger(s.logger)(h)
+	h = SecurityHeadersMiddleware(s.publicScheme)(h)
+	// RealIPMiddleware is outermost so the trusted set it stashes is in the
+	// context before SecurityHeadersMiddleware asks requestScheme whether the
+	// peer may speak for the client. Inside out, trustedNetsFor would fall
+	// back to the built-in default and honor X-Forwarded-Proto from an RFC
+	// 1918 peer on an install that narrowed trusted_proxies.
+	h = RealIPMiddleware(s.trustedNetsFunc())(h)
+	return h
+}
+
+// guardPlaintext refuses to bind an unencrypted listener nobody requested.
+//
+// Three states arrive at the same hazard — half a certificate pair, an empty
+// pair, and an empty pair on the port every client reads as TLS — and all
+// three refuse through this one function. Two refusals for one hazard, worded
+// differently, is how an operator learns to route around the second.
+//
+// allow_plaintext is the request. An empty tls_cert is not one: Save marshals
+// the whole resolved Config back over the file, so a cert path cleared in the
+// TUI reaches this function with nothing else having noticed.
+func (s *Server) guardPlaintext() error {
+	// Re-checked after config.Load has already run it: --tls-cert and
+	// --tls-key are written into the Config afterwards, so a clean file plus
+	// one flag reaches here as a half pair.
+	if err := s.cfg.ValidateTLSPair(); err != nil {
+		return err
+	}
+	if s.cfg.TLSCert != "" && s.cfg.TLSKey != "" {
+		return nil
+	}
+	if s.cfg.AllowPlaintext {
+		if tlsPort(s.addr) {
+			// Error, not Warn: what this listener serves is unencrypted on the
+			// one port every client assumes is not, and the shipped default
+			// log_level maps to slog.LevelError, so a Warn here printed
+			// nothing on the installs it was written for.
+			s.logger.Error("serving plaintext HTTP on the port clients read as TLS; every request and response is in the clear",
+				"addr", s.addr, "authorized_by", "allow_plaintext")
+		}
+		return nil
+	}
+	if tlsPort(s.addr) {
+		return fmt.Errorf("refusing to serve plaintext HTTP on %s: tls_cert and tls_key are empty and clients reach that port expecting TLS; set both, or set allow_plaintext (--allow-plaintext) if something in front terminates TLS", s.addr)
+	}
+	return fmt.Errorf("refusing to serve plaintext HTTP on %s: tls_cert and tls_key are empty, which means nothing was configured rather than serve in the clear; set both, or set allow_plaintext (--allow-plaintext) to serve unencrypted on purpose", s.addr)
+}
+
+// tlsPort reports whether addr names the port clients read as TLS. A port is
+// not authorization, but it is the strongest evidence available that whoever
+// wrote listen_addr expected a certificate to be in play.
+func tlsPort(addr string) bool {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	return port == "443" || port == "https"
+}
+
+// Start binds to s.addr and blocks until ctx is cancelled. When the context is
+// done it initiates a graceful shutdown, giving in-flight requests up to 30
+// seconds to complete.
+func (s *Server) Start(ctx context.Context) error {
+	srv := &http.Server{
+		Addr:              s.addr,
+		Handler:           s.handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      5 * time.Minute, // generous for large file transfers
+		IdleTimeout:       120 * time.Second,
+	}
+
+	if s.adminErr != nil {
+		return s.adminErr
+	}
+
+	if s.auditErr != nil {
+		return s.auditErr
+	}
+
+	if s.pepperErr != nil {
+		return s.pepperErr
+	}
+
+	if s.spoolErr != nil {
+		return s.spoolErr
+	}
+
+	if err := s.guardPlaintext(); err != nil {
+		return err
+	}
+
+	// Configure TLS if cert/key are provided.
+	if s.cfg.TLSCert != "" && s.cfg.TLSKey != "" {
+		cert, err := tls.LoadX509KeyPair(s.cfg.TLSCert, s.cfg.TLSKey)
+		if err != nil {
+			return fmt.Errorf("load TLS certificate: %w", err)
+		}
+		minVer, err := s.cfg.ResolveTLSMinVersion()
+		if err != nil {
+			return err
+		}
+		srv.TLSConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   minVer,
+		}
+	}
+
+	// Write PID file so CLI commands can signal us to reload.
+	pidPath := filepath.Join(s.cfg.LogDir, "bodega.pid")
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err == nil {
+		if err := os.WriteFile(pidPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644); err == nil {
+			s.logger.Info("PID file written", "path", pidPath)
+			defer func() { _ = os.Remove(pidPath) }()
+		}
+	}
+
+	// Bind the listener synchronously so we can surface bind failures
+	// (port in use, privilege denied, bad address) before spawning the
+	// serve goroutine — and so the startup banner + sd_notify only fire
+	// once the socket is actually accepting.
+	ln, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", s.addr, err)
+	}
+	boundAddr := ln.Addr().String()
+
+	tlsMode := srv.TLSConfig != nil
+	if tlsMode {
+		ln = tls.NewListener(ln, srv.TLSConfig)
+	}
+
+	// User-facing startup banner on stderr. Bypasses log-level so a
+	// default-configured bodega serve gives immediate visual confirmation
+	// that binding succeeded. --quiet (see SetQuiet) silences it for
+	// scripting use; slog output is separately controlled by log_level.
+	if !s.quiet {
+		scheme := "http"
+		if tlsMode {
+			scheme = "https"
+		}
+		_, _ = fmt.Fprintf(os.Stderr, "bodega listening on %s://%s\n", scheme, boundAddr)
+		_, _ = fmt.Fprint(os.Stderr, s.agePolicyBanner())
+		_, _ = fmt.Fprint(os.Stderr, s.aptSourcesBanner())
+	}
+	if tlsMode {
+		s.logger.Info("bodega server listening (TLS)", "addr", boundAddr)
+	} else {
+		s.logger.Info("bodega server listening", "addr", boundAddr)
+	}
+
+	// Notify systemd we're ready. No-op outside systemd (NOTIFY_SOCKET unset).
+	sdNotifyReady()
+
+	// Lifecycle rows bracket every other row in the database, so a reader can
+	// tell "nothing happened" from "the server was not running". Recorded here
+	// rather than at the top of Start because a bind that failed never served
+	// anything; the deferred stop pairs with this one on every exit path,
+	// including the one where Serve returns an error.
+	s.recordLifecycle(audit.EventServeStart, boundAddr, tlsMode)
+	defer s.recordLifecycle(audit.EventServeStop, boundAddr, tlsMode)
+
+	// Apt index refresh. Valid-Until is stamped when a snapshot is built and
+	// does not move, so without this loop a long-running server eventually
+	// serves an expired Release and every client fails apt update at once.
+	go s.aptRefreshLoop(ctx)
+
+	// Discovery worker — drains the recorder's queue until ctx is cancelled.
+	if s.discovery != nil {
+		go s.discovery.Start(ctx)
+		s.logger.Info("upstream discovery enabled", "mode", s.discoverMode)
+	}
+
+	// Start the serve loop.
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.Serve(ln)
+	}()
+
+	// SIGHUP reloads the manifest index, the signing key, and the caches
+	// built from them.
+	sighupCh := make(chan os.Signal, 1)
+	signal.Notify(sighupCh, syscall.SIGHUP)
+	// Without this the handler goroutine outlives the server it belongs to and
+	// keeps reloading global state on every later SIGHUP, so a process that
+	// stops and restarts a server ends up with several of them racing.
+	defer func() {
+		signal.Stop(sighupCh)
+		close(sighupCh)
+	}()
+	//nolint:gosec // G118: signal handler is server-lifecycle, intentionally decoupled from any request context.
+	go func() {
+		for range sighupCh {
+			s.reload(context.Background())
+		}
+	}()
+
+	// Wait for shutdown signal or server error.
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		s.logger.Info("shutting down server...")
+		// Tell systemd we're intentionally stopping so it can distinguish
+		// a graceful shutdown from a crash.
+		sdNotifyStopping()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			s.logger.Error("graceful shutdown failed, forcing close", "error", err)
+			_ = srv.Close()
+			return err
+		}
+		s.logger.Info("server stopped")
+		return nil
+	}
+}
+
+// recordLifecycle writes a serve_start or serve_stop row. The context is
+// deliberately not the caller's: a stop is recorded while the shutdown context
+// is already cancelled, and a lifecycle row that vanishes precisely when the
+// server goes down is the one nobody can afford to lose.
+func (s *Server) recordLifecycle(ev audit.EventType, addr string, tlsMode bool) {
+	if s.auditDB == nil {
+		return
+	}
+	// The spool bounds ride on the lifecycle row so a reader of the denial
+	// table can tell a spool_budget_exhausted run from the one after someone
+	// raised the key, without a second channel to correlate against.
+	sp := s.spool.stats()
+	details, err := json.Marshal(map[string]any{
+		"addr":                     addr,
+		"tls":                      tlsMode,
+		"pid":                      os.Getpid(),
+		"spool_dir":                sp.Dir,
+		"spool_max_artifact_bytes": sp.MaxArtifactBytes,
+		"spool_max_total_bytes":    sp.BudgetBytes,
+	})
+	if err != nil {
+		details = []byte("{}")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.auditDB.Record(ctx, audit.Event{
+		EventType: ev,
+		Status:    "success",
+		Details:   string(details),
+		Actor:     audit.CurrentActor(),
+	}); err != nil {
+		s.logger.Error("could not record server lifecycle event",
+			"event", string(ev), "error", err)
+	}
+}
+
+// reload is what SIGHUP does: re-read everything the server holds outside its
+// own memory and rebuild what is derived from it.
+//
+// The CIDR access lists are re-read here as well as behind their own cache
+// TTL. The cache is what makes `bodega acl` land on a running server at all;
+// the call here is what keeps `systemctl reload bodega` honest, because a
+// reload that silently skipped the list an operator had just edited would be
+// worse than having no reload.
+//
+// The signing key is re-read here rather than only at startup because the
+// published rotation runbook has the operator write a key and reload. With
+// only a restart honoring it, `generate --rotate` would leave the served
+// keyring carrying the outgoing key alone while clients were being told to
+// re-fetch, and `retire` would leave the process signing with a key no longer
+// on disk until something restarted it and broke every client at once.
+//
+// Order matters twice. The key is installed before the rebuild, because the
+// rebuild is what signs. And a manifest read that fails does not abandon the
+// rest: the key half of a reload staying inert because the backend hiccuped is
+// the same trap in a rarer shape, and the hourly tick already treats a failed
+// manifest read as non-fatal and rebuilds anyway.
+func (s *Server) reload(ctx context.Context) {
+	s.logger.Info("reload requested, re-reading manifests, the apt signing key, the CIDR access lists, the identity bindings and the profile bindings")
+	s.reloadManifests(ctx)
+	s.loadAptSigner()
+	s.rebuildAptSnapshot(ctx)
+	s.refreshACLs(ctx)
+	s.refreshIdentities(ctx)
+	s.refreshProfiles(ctx)
+	s.logger.Info("reload complete")
+}
+
+// sd_notify: hand-rolled so bodega stays single-binary. No-op when
+// $NOTIFY_SOCKET is unset.
+func sdNotify(state string) {
+	sock := os.Getenv("NOTIFY_SOCKET")
+	if sock == "" {
+		return
+	}
+	if strings.HasPrefix(sock, "@") {
+		sock = "\x00" + sock[1:]
+	}
+	conn, err := net.DialUnix("unixgram", nil, &net.UnixAddr{Name: sock, Net: "unixgram"})
+	if err != nil {
+		return
+	}
+	defer func() { _ = conn.Close() }()
+	_, _ = conn.Write([]byte(state))
+}
+
+func sdNotifyReady()    { sdNotify("READY=1") }
+func sdNotifyStopping() { sdNotify("STOPPING=1") }
+
+// routeRecorder wires patterns into the mux and keeps the list. http.ServeMux
+// does not report what was registered on it, and the OpenAPI document is
+// hand-maintained: four operations were routed and undocumented because
+// nothing could compare the two. The conformance test reads this.
+type routeRecorder struct {
+	mux      *http.ServeMux
+	patterns []string
+}
+
+func (r *routeRecorder) HandleFunc(pattern string, h func(http.ResponseWriter, *http.Request)) {
+	r.patterns = append(r.patterns, pattern)
+	r.mux.HandleFunc(pattern, h)
+}
+
+// registerRoutes wires all URL patterns to their handler methods.
+// Requires Go 1.22+ enhanced ServeMux patterns.
+func (s *Server) registerRoutes() {
+	m := &routeRecorder{mux: s.mux}
+	defer func() { s.routePatterns = m.patterns }()
+
+	// Web UI
+	s.registerWebUI()
+
+	// Health probe
+	m.HandleFunc("GET /healthz", s.handleHealthz)
+
+	// APT repository: generated index, served from a snapshot.
+	// dists/{distpath...} carries Release, InRelease and Release.gpg;
+	// handleAptDists splits them, since ServeMux has no mid-segment wildcard
+	// for binary-{arch}. The keyring routes serve the loaded signing key and
+	// 404 when there is none; .gpg is the dearmored form signed-by= wants, so
+	// a client needs no gpg binary to consume it.
+	m.HandleFunc("GET /apt/dists/{distpath...}", s.handleAptDists)
+	m.HandleFunc("GET /apt/pool/{path...}", s.handleAptPool)
+	m.HandleFunc("GET /apt/bodega-archive-keyring.gpg", s.handleAptKeyring)
+	m.HandleFunc("GET /apt/bodega-archive-keyring.asc", s.handleAptPublicKey)
+
+	// PyPI simple index (PEP 503)
+	m.HandleFunc("GET /pypi/simple/", s.handlePypiIndex)
+	m.HandleFunc("GET /pypi/simple/{package}/", s.handlePypiPackage)
+
+	// PyPI wheels (path... to support versioned subdirs like pypi/wheels/0.4.6/foo.whl)
+	m.HandleFunc("GET /pypi/wheels/{path...}", s.handlePypiWheel)
+
+	// Git bundles, and the namespaced smart-HTTP form. The bundle pattern is
+	// the more specific of the two, so it keeps every path it already served;
+	// {path...} takes the deeper paths a clone URL carries.
+	m.HandleFunc("GET /git/{name}/{file}", s.handleGitBundle)
+	m.HandleFunc("GET /git/{namespace}/{path...}", s.handleGitNamespace)
+	if s.gitTool != nil {
+		// The POST half of smart-HTTP exists only when the CGI that answers it
+		// does. Without it a clone gets a 405 from the mux instead of reaching
+		// a handler with no backend to exec.
+		m.HandleFunc("POST /git/{namespace}/{path...}", s.handleGitNamespace)
+	}
+
+	// Binary downloads
+	m.HandleFunc("GET /binaries/{path...}", s.handleBinary)
+
+	// Go module proxy (GOPROXY protocol)
+	m.HandleFunc("GET /go/{path...}", s.handleGomod)
+
+	// Helm chart repository
+	m.HandleFunc("GET /helm/index.yaml", s.handleHelmIndex)
+	m.HandleFunc("GET /helm/charts/{file}", s.handleHelmChart)
+
+	// npm registry
+	m.HandleFunc("GET /npm/{path...}", s.handleNpm)
+
+	// cargo sparse registry (sparse+https://bodega/cargo/)
+	m.HandleFunc("GET /cargo/{path...}", s.handleCargo)
+
+	// REST API
+	m.HandleFunc("GET /api/v1/packages", s.handleAPIPackages)
+	m.HandleFunc("GET /api/v1/packages/{type}", s.handleAPIPackagesByType)
+	m.HandleFunc("GET /api/v1/packages/{type}/{name}", s.handleAPIPackage)
+	m.HandleFunc("GET /api/v1/packages/{type}/{name}/{version}", s.handleAPIPackageVersion)
+	m.HandleFunc("GET /api/v1/packages/{type}/{name}/{version}/attestation", s.handleAttestation)
+	m.HandleFunc("GET /api/v1/status", s.handleAPIStatus)
+	m.HandleFunc("GET /api/v1/config", s.handleAPIConfig)
+	m.HandleFunc("GET /api/v1/metrics", s.handleAPIMetrics)
+
+	// Mutation API
+	m.HandleFunc("POST /api/v1/packages/import", s.handleBulkImport)
+	m.HandleFunc("POST /api/v1/packages/{type}", s.handleCreateEntry)
+	m.HandleFunc("DELETE /api/v1/packages/{type}/{name}", s.handleDeleteEntry)
+	m.HandleFunc("PATCH /api/v1/packages/{type}/{name}/hide", s.handleToggleHidden)
+	m.HandleFunc("PATCH /api/v1/packages/{type}/{name}/hide/{version}", s.handleToggleHidden)
+	m.HandleFunc("PATCH /api/v1/packages/{type}/{name}/freeze", s.handleToggleFreeze)
+	m.HandleFunc("PATCH /api/v1/packages/{type}/{name}/freeze/{version}", s.handleToggleFreeze)
+
+	// Audit query
+	m.HandleFunc("GET /api/v1/audit", s.handleAPIAudit)
+
+	// Token management (mutation-gated)
+	m.HandleFunc("GET /api/v1/tokens", s.handleListTokens)
+	m.HandleFunc("POST /api/v1/tokens", s.handleCreateToken)
+	m.HandleFunc("DELETE /api/v1/tokens/{id}", s.handleRevokeToken)
+
+	// Host profiles
+	m.HandleFunc("GET /api/v1/profiles/{name}/pins", s.handleAPIProfilePins)
+
+	// Upstream allow-list policies (mutation-gated)
+	m.HandleFunc("GET /api/v1/policies", s.handleListPolicies)
+	m.HandleFunc("POST /api/v1/policies", s.handleCreatePolicy)
+	m.HandleFunc("DELETE /api/v1/policies/{id}", s.handleRevokePolicy)
+}
+
+// requireAdmin gates the sensitive read endpoints, writing the 403 and the
+// audit row when the caller is not permitted. It exists so that refusing a
+// read of the audit trail is itself in the audit trail: these handlers sit
+// behind the mutation middleware, not inside it, so nothing else would record
+// them.
+//
+// Returns true when the request may proceed.
+func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
+	if s.isAdminRequest(r) {
+		return true
+	}
+	s.logger.Warn("admin endpoint blocked: IP not in admin_permit_cidr",
+		"client_ip", ClientIP(r), "method", r.Method, "path", r.URL.Path)
+	recordDenial(s.auditDB, r, audit.DenialAdminOnly, nil)
+	http.Error(w, "Forbidden", http.StatusForbidden)
+	return false
+}
+
+// isAdminRequest checks whether the request originates from an IP in
+// admin_permit_cidr. Used to gate sensitive read endpoints (audit, tokens,
+// policies, config) that don't go through the mutation middleware, and it
+// answers with the same predicate that middleware uses.
+func (s *Server) isAdminRequest(r *http.Request) bool {
+	return AdminPermits(s.aclNow().admin, net.ParseIP(ClientIP(r)))
+}
+
+// ---- Health ----------------------------------------------------------------
+
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, "ok\n")
+}
+
+// ---- REST API --------------------------------------------------------------
+
+// packagesResponse is the JSON envelope for /api/v1/packages: one key per
+// manifest.AllTypes member, always present, empty array when the ecosystem
+// holds nothing. A struct with fixed fields cannot say that — a missing key
+// reads to a client as a type the server has never heard of, which is the
+// same answer it gives for a typo.
+type packagesResponse map[string][]*manifest.PackageManifest
+
+func (s *Server) handleAPIPackages(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	resp := make(packagesResponse, len(manifest.AllTypes))
+	for _, typ := range manifest.AllTypes {
+		resp[typ] = loadAllPackages(ctx, s.store, typ)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleAPIPackagesByType(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	t := r.PathValue("type")
+	if !manifest.IsKnownType(t) {
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"error": fmt.Sprintf("unknown type %q — must be one of: %s", t, strings.Join(manifest.AllTypes, ", ")),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, loadAllPackages(ctx, s.store, t))
+}
+
+func (s *Server) handleAPIPackage(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	t := r.PathValue("type")
+	name := r.PathValue("name")
+
+	if !manifest.IsKnownType(t) {
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"error": fmt.Sprintf("unknown type %q", t),
+		})
+		return
+	}
+	pm, err := s.store.GetPackage(ctx, t, name)
+	if err != nil {
+		s.logger.Error("get package failed", "type", t, "name", name, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if pm == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, pm)
+}
+
+// handleAPIPackageVersion returns a PackageManifest scoped to a single
+// version — all top-level fields intact, Versions containing only the
+// matching entry. The payload remains a valid PackageManifest so clients
+// can round-trip it through `pkg import` or the editor. 404s when the
+// package or the version is not found.
+func (s *Server) handleAPIPackageVersion(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	t := r.PathValue("type")
+	name := r.PathValue("name")
+	version := r.PathValue("version")
+
+	if !manifest.IsKnownType(t) {
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"error": fmt.Sprintf("unknown type %q", t),
+		})
+		return
+	}
+	pm, err := s.store.GetPackage(ctx, t, name)
+	if err != nil {
+		s.logger.Error("get package failed", "type", t, "name", name, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if pm == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "package not found"})
+		return
+	}
+	scoped := pm.ScopeToVersion(version)
+	if scoped == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"error": fmt.Sprintf("version %q not found in %s/%s", version, t, name),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, scoped)
+}
+
+// statusResponse is the JSON shape for /api/v1/status.
+type statusResponse struct {
+	Healthy bool `json:"healthy"`
+	// Version is the build stamp, omitted for a non-admin caller. A package
+	// repository answers the whole fleet, so its build number is a public
+	// statement of which advisories apply to it unless the field is gated the
+	// way spool.Dir is.
+	Version        string               `json:"version,omitempty"`
+	EntryCount     map[string]int       `json:"entry_count"`
+	Apt            aptStatus            `json:"apt"`
+	Spool          spoolStats           `json:"spool"`
+	BackendEntries []backendEntryStatus `json:"backend_entries,omitempty"`
+	Error          string               `json:"error,omitempty"`
+}
+
+// backendEntryStatus is one probe row, reported against the backend that
+// answered it. backend carries no omitempty: a row that names no backend is
+// the report this shape exists to replace, and a consumer cannot tell an
+// absent name from a local install by looking at the key.
+type backendEntryStatus struct {
+	Type    string `json:"type"`
+	Name    string `json:"name"`
+	Key     string `json:"key"`
+	Present bool   `json:"present"`
+	Frozen  bool   `json:"frozen,omitempty"`
+	Backend string `json:"backend"`
+	Error   string `json:"error,omitempty"`
+}
+
+func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
+	spool := s.spool.stats()
+	version := builder.Version
+	if !s.isAdminRequest(r) {
+		spool.Dir = ""
+		version = ""
+	}
+	entryCount := make(map[string]int, len(manifest.AllTypes))
+	for _, typ := range manifest.AllTypes {
+		entryCount[typ] = len(s.store.ListPackages(typ))
+	}
+	resp := statusResponse{
+		Healthy:    true,
+		Version:    version,
+		Apt:        s.aptStatusFor(r),
+		Spool:      spool,
+		EntryCount: entryCount,
+	}
+
+	if s.stores == nil {
+		resp.Healthy = false
+		resp.Error = "storage backend not configured"
+		writeJSON(w, http.StatusServiceUnavailable, resp)
+		return
+	}
+
+	// Probe the apt pool on every backend, one row each. dists/ is generated
+	// per request and never stored, so it cannot answer whether the object
+	// store holds anything; the pool is what upload writes, and its prefix
+	// names no codename.
+	//
+	// This is the inverse of the listing fan-out's policy, and deliberately.
+	// A package index fails the whole request on a backend error, because a
+	// short index is indistinguishable from packages having been withdrawn and
+	// apt acts on the difference. A diagnostic exists to say which backend is
+	// broken, so it reports every backend it could reach, marks the one it
+	// could not, and calls the server unhealthy.
+	for _, ns := range s.stores.All() {
+		row := backendEntryStatus{
+			Type:    manifest.TypeApt,
+			Name:    "apt-pool",
+			Key:     manifest.AptPoolPrefix,
+			Backend: ns.Name,
+		}
+		keys, err := ns.Store.List(r.Context(), manifest.AptPoolPrefix)
+		if err != nil {
+			resp.Healthy = false
+			resp.Error = "one or more storage backends failed to respond"
+			row.Error = err.Error()
+			s.logger.Error("object store probe failed", "backend", ns.Name, "prefix", manifest.AptPoolPrefix, "error", err)
+		} else {
+			row.Present = len(keys) > 0
+		}
+		resp.BackendEntries = append(resp.BackendEntries, row)
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// configResponse is the non-sensitive subset of Config for /api/v1/config.
+type configResponse struct {
+	Bucket      string `json:"bucket"`
+	Region      string `json:"region"`
+	ManifestDir string `json:"manifest_dir"`
+}
+
+func (s *Server) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	resp := configResponse{
+		Bucket:      s.cfg.Bucket,
+		Region:      s.cfg.Region,
+		ManifestDir: s.cfg.ManifestDir,
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleAPIMetrics(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	// Try cached metrics first (fast path).
+	m, err := s.store.LoadMetrics(ctx)
+	if err != nil || m == nil {
+		// Fallback: compute on demand.
+		m = s.store.ComputeMetrics(ctx)
+	}
+	writeJSON(w, http.StatusOK, m)
+}
+
+// ---- Mutation API ----------------------------------------------------------
+
+func (s *Server) handleCreateEntry(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	t := r.PathValue("type")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !manifest.IsKnownType(t) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": fmt.Sprintf("unknown type %q", t)})
+		return
+	}
+
+	// All types accept a PackageManifest with at least one VersionEntry.
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MiB ceiling
+	var pm manifest.PackageManifest
+	if err := json.NewDecoder(r.Body).Decode(&pm); err != nil {
+		if err.Error() == "http: request body too large" {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request body too large"})
+			return
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	pm.Type = t
+
+	// An HTTP caller is not the process owner, so the audit rows this writes
+	// carry no actor rather than the server's.
+	res := admit.Admit(ctx, s.policy, s.auditDB, s.cfg, &pm, "")
+	for _, warning := range res.Warnings {
+		s.logger.Warn("manifest accepted with a warning", "type", t, "name", pm.Name, "warning", warning)
+	}
+	switch res.Decision {
+	case admit.Invalid:
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": res.Reason})
+		return
+	case admit.PolicyBlocked:
+		s.logger.Warn("create rejected by policy", "type", t, "name", pm.Name, "reason", res.Reason)
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": res.Reason})
+		return
+	}
+
+	// Conflict is checked after admission so a manifest that is both refused
+	// and already present reports the refusal, which is the answer the caller
+	// can act on.
+	existing, _ := s.store.GetPackage(ctx, t, pm.Name)
+	if existing != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "package already exists"})
+		return
+	}
+
+	if err := s.store.SavePackage(ctx, &pm); err != nil {
+		s.logger.Error("save package failed", "type", t, "name", pm.Name, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if err := s.store.SaveIndex(ctx); err != nil {
+		s.logger.Error("save index failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	s.rebuildAptIndexAfterWrite(ctx, t)
+	writeJSON(w, http.StatusCreated, &pm)
+}
+
+func (s *Server) handleDeleteEntry(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	t := r.PathValue("type")
+	name := r.PathValue("name")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Check frozen status.
+	frozen, findErr := s.isFrozen(ctx, t, name)
+	if findErr != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": findErr.Error()})
+		return
+	}
+	if frozen {
+		// Freeze is a protection control, so this row answers "who tried to
+		// remove a pinned artifact". The middleware chain let the request
+		// through — the caller cleared the admin gate — which is what makes
+		// the attempt worth a record rather than noise.
+		recordDenial(s.auditDB, r, audit.DenialFrozenEntry,
+			map[string]string{"pkg_type": t, "pkg_name": name})
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "entry is frozen"})
+		return
+	}
+
+	if err := s.store.DeletePackage(ctx, t, name); err != nil {
+		s.logger.Error("delete package failed", "type", t, "name", name, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if err := s.store.SaveIndex(ctx); err != nil {
+		s.logger.Error("save index failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	s.rebuildAptIndexAfterWrite(ctx, t)
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "type": t, "name": name})
+}
+
+// rebuildAptIndexAfterWrite regenerates the apt snapshot when a mutation
+// touched apt. Without it the snapshot outlives the write that invalidated it,
+// which is the same stale-index defect the snapshot was introduced to fix,
+// only slower. Other package types have no generated index to go stale, and
+// the rebuild lists the pool, so it is not free.
+//
+// The request context is deliberately dropped. The write has already
+// committed by this point, so a client that hangs up mid-response would
+// otherwise cancel the pool listing and leave the index describing the state
+// before its own write — a 201 that is honest about the write and silent
+// about the index. The startup and SIGHUP paths detach for the same reason.
+func (s *Server) rebuildAptIndexAfterWrite(_ context.Context, t string) {
+	if t != manifest.TypeApt {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), aptRebuildTimeout)
+	defer cancel()
+	s.rebuildAptSnapshot(ctx)
+}
+
+// isFrozen returns whether all versions of a named package are frozen, or an error if not found.
+func (s *Server) isFrozen(ctx context.Context, t, name string) (bool, error) {
+	pm, err := s.store.GetPackage(ctx, t, name)
+	if err != nil {
+		return false, err
+	}
+	if pm == nil {
+		return false, fmt.Errorf("%s package %q not found", t, name)
+	}
+	// Consider the package frozen when all versions are frozen.
+	if len(pm.Versions) == 0 {
+		return false, nil
+	}
+	for _, ve := range pm.Versions {
+		if !ve.Frozen {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// ---- Hide / Freeze API -----------------------------------------------------
+
+func (s *Server) handleToggleHidden(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	t := r.PathValue("type")
+	name := r.PathValue("name")
+	version := r.PathValue("version") // empty if not in URL
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	pm, err := s.store.GetPackage(ctx, t, name)
+	if err != nil || pm == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	for i := range pm.Versions {
+		if version != "" && pm.Versions[i].Version != version {
+			continue
+		}
+		pm.Versions[i].Hidden = !pm.Versions[i].Hidden
+	}
+	if err := s.store.SavePackage(ctx, pm); err != nil {
+		s.logger.Error("save package failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	_ = s.store.SaveIndex(ctx)
+	s.rebuildAptIndexAfterWrite(ctx, t)
+	writeJSON(w, http.StatusOK, pm)
+}
+
+func (s *Server) handleToggleFreeze(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	t := r.PathValue("type")
+	name := r.PathValue("name")
+	version := r.PathValue("version")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	pm, err := s.store.GetPackage(ctx, t, name)
+	if err != nil || pm == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	for i := range pm.Versions {
+		if version != "" && pm.Versions[i].Version != version {
+			continue
+		}
+		pm.Versions[i].Frozen = !pm.Versions[i].Frozen
+	}
+	if err := s.store.SavePackage(ctx, pm); err != nil {
+		s.logger.Error("save package failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	_ = s.store.SaveIndex(ctx)
+	s.rebuildAptIndexAfterWrite(ctx, t)
+	writeJSON(w, http.StatusOK, pm)
+}
+
+// ---- Audit API -------------------------------------------------------------
+
+func (s *Server) handleAPIAudit(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if s.auditDB == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit database not configured"})
+		return
+	}
+	// 501 rather than 503: a write-only sink is a configuration this server
+	// will keep having, so "try again later" would be a lie. An empty 200 on a
+	// server that is recording everything is the worst available answer.
+	if !s.auditDB.EventsQueryable() {
+		writeJSON(w, http.StatusNotImplemented, map[string]string{
+			"error": (&audit.UnqueryableSinkError{Sink: s.auditDB.SinkName(), Op: "the audit events this endpoint returns"}).Error(),
+			"sink":  s.auditDB.SinkName(),
+		})
+		return
+	}
+	q := r.URL.Query()
+	f := audit.Filter{
+		EventType: audit.EventType(q.Get("type")),
+		PkgType:   q.Get("pkg_type"),
+		PkgName:   q.Get("name"),
+		ClientIP:  q.Get("client"),
+		Identity:  q.Get("identity"),
+		Limit:     50,
+	}
+	if since := q.Get("since"); since != "" {
+		if t, err := time.Parse("2006-01-02", since); err == nil {
+			f.Since = t
+		} else if t, err := time.Parse(time.RFC3339, since); err == nil {
+			f.Since = t
+		}
+	}
+	if limit := q.Get("limit"); limit != "" {
+		var n int
+		if _, err := fmt.Sscanf(limit, "%d", &n); err == nil && n > 0 {
+			f.Limit = n
+		}
+	}
+	const maxAuditLimit = 5000
+	if f.Limit > maxAuditLimit {
+		f.Limit = maxAuditLimit
+	}
+	events, err := s.auditDB.Query(r.Context(), f)
+	if err != nil {
+		s.logger.Error("audit query failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	writeJSON(w, http.StatusOK, events)
+}
+
+// ---- Token API -------------------------------------------------------------
+
+func (s *Server) handleListTokens(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if s.auditDB == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit database not configured"})
+		return
+	}
+	tokens, err := s.auditDB.ListTokens(r.Context())
+	if err != nil {
+		s.logger.Error("list tokens failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	writeJSON(w, http.StatusOK, tokens)
+}
+
+func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
+	if s.auditDB == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit database not configured"})
+		return
+	}
+	if s.pepper == "" {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "pepper not configured"})
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req struct {
+		Label   string `json:"label"`
+		Expiry  string `json:"expiry"`
+		Comment string `json:"comment"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if req.Label == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "label is required"})
+		return
+	}
+
+	// Generate token.
+	b := make([]byte, 32)
+	if _, err := cryptoRand.Read(b); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	token := "bodega_ak_" + hex.EncodeToString(b)
+
+	// Hash with pepper.
+	hash := audit.HashToken(token, s.pepper)
+
+	// Generate short ID.
+	idBytes := make([]byte, 16)
+	_, _ = cryptoRand.Read(idBytes)
+	id := hex.EncodeToString(idBytes)
+
+	// Parse expiry.
+	var expiresAt *time.Time
+	expiry := req.Expiry
+	if expiry == "" {
+		expiry = "365d"
+	}
+	if expiry != "never" {
+		t, err := parseTokenExpiry(expiry)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid expiry: " + err.Error()})
+			return
+		}
+		expiresAt = &t
+	}
+
+	ctx := r.Context()
+	if err := s.auditDB.InsertToken(ctx, id, req.Label, hash, req.Comment, expiresAt); err != nil {
+		s.logger.Error("insert token failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	resp := map[string]interface{}{
+		"token": token,
+		"id":    id,
+		"label": req.Label,
+	}
+	if expiresAt != nil {
+		resp["expires_at"] = expiresAt.Format(time.RFC3339)
+	}
+	writeJSON(w, http.StatusCreated, resp)
+}
+
+func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
+	if s.auditDB == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit database not configured"})
+		return
+	}
+	id := r.PathValue("id")
+	found, err := s.auditDB.DeleteToken(r.Context(), id)
+	if err != nil {
+		s.logger.Error("revoke token failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if !found {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "token not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked", "id": id})
+}
+
+// ---- Policy API ------------------------------------------------------------
+
+func (s *Server) handleListPolicies(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if s.auditDB == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit database not configured"})
+		return
+	}
+	typeFilter := r.URL.Query().Get("type")
+	var rules []audit.PolicyInfo
+	var err error
+	if typeFilter != "" {
+		rules, err = s.auditDB.GetPoliciesByType(r.Context(), typeFilter)
+	} else {
+		rules, err = s.auditDB.ListPolicies(r.Context())
+	}
+	if err != nil {
+		s.logger.Error("list policies failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	writeJSON(w, http.StatusOK, rules)
+}
+
+func (s *Server) handleCreatePolicy(w http.ResponseWriter, r *http.Request) {
+	if s.auditDB == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit database not configured"})
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req struct {
+		RegistryType string `json:"registry_type"`
+		Pattern      string `json:"pattern"`
+		Comment      string `json:"comment"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if err := policy.ValidateType(req.RegistryType); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if req.Pattern == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "pattern is required"})
+		return
+	}
+	kind := policy.RuleKindForType(req.RegistryType)
+
+	idBytes := make([]byte, 16)
+	if _, err := cryptoRand.Read(idBytes); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	id := hex.EncodeToString(idBytes)
+
+	rule := audit.PolicyInfo{
+		ID:           id,
+		RegistryType: req.RegistryType,
+		RuleKind:     kind,
+		Pattern:      req.Pattern,
+		Comment:      req.Comment,
+		CreatedBy:    "api",
+	}
+	ctx := r.Context()
+	if err := s.auditDB.InsertPolicy(ctx, rule); err != nil {
+		s.logger.Error("insert policy failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if s.policy != nil {
+		s.policy.Invalidate()
+	}
+	_ = s.auditDB.Record(ctx, audit.Event{
+		EventType: audit.EventCreate,
+		PkgType:   "policy",
+		PkgName:   req.RegistryType + ":" + req.Pattern,
+		ClientIP:  ClientIP(r),
+		Status:    "success",
+		Details:   fmt.Sprintf("id=%s kind=%s", id, kind),
+	})
+	writeJSON(w, http.StatusCreated, rule)
+}
+
+func (s *Server) handleRevokePolicy(w http.ResponseWriter, r *http.Request) {
+	if s.auditDB == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit database not configured"})
+		return
+	}
+	id := r.PathValue("id")
+	found, err := s.auditDB.DeletePolicyByID(r.Context(), id)
+	if err != nil {
+		s.logger.Error("revoke policy failed", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+	if !found {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "policy not found"})
+		return
+	}
+	if s.policy != nil {
+		s.policy.Invalidate()
+	}
+	_ = s.auditDB.Record(r.Context(), audit.Event{
+		EventType: audit.EventDelete,
+		PkgType:   "policy",
+		PkgName:   id,
+		ClientIP:  ClientIP(r),
+		Status:    "success",
+	})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked", "id": id})
+}
+
+// parseTokenExpiry converts an expiry string to a time. Accepts "30d", "1y", "2027-01-01".
+func parseTokenExpiry(s string) (time.Time, error) {
+	now := time.Now().UTC()
+	if strings.HasSuffix(s, "d") {
+		var days int
+		if _, err := fmt.Sscanf(s, "%dd", &days); err == nil && days > 0 {
+			return now.AddDate(0, 0, days), nil
+		}
+	}
+	if strings.HasSuffix(s, "y") {
+		var years int
+		if _, err := fmt.Sscanf(s, "%dy", &years); err == nil && years > 0 {
+			return now.AddDate(years, 0, 0), nil
+		}
+	}
+	if t, err := time.Parse("2006-01-02", s); err == nil {
+		return t, nil
+	}
+	return time.Time{}, fmt.Errorf("expected duration (30d, 1y), date (2027-01-01), or 'never'")
+}
+
+// ---- Storage resolution ----------------------------------------------------
+
+// typeStore returns the backend for regenerable, type-scoped objects:
+// generated indexes, proxy-cache entries, attestation blobs and artifacts
+// whose handler holds no manifest entry. Returns nil when no storage backend
+// was configured, which every caller reports as 503 via requireStorage.
+func (s *Server) typeStore(typ string) storage.ObjectStore {
+	if s.stores == nil {
+		return nil
+	}
+	return s.stores.ForType(typ)
+}
+
+// versionStore returns the backend recorded for one artifact.
+//
+// It reads the name on the version entry and never the config hierarchy. The
+// hierarchy decides where the next write goes; an artifact already written is
+// wherever it was written, so consulting it here would 404 everything placed
+// under the previous rule. An empty recorded name is the default backend —
+// see the contract on manifest.VersionEntry.Storage.
+//
+// A request whose manifest entry does not exist is not an error. Generated
+// indexes, proxy-cache entries and attestation blobs carry no version to
+// record a name against, and every one of them is regenerable, so
+// the type rule is safe for them at both read and write.
+func (s *Server) versionStore(ctx context.Context, typ, pkg, version string) (storage.ObjectStore, error) {
+	if s.stores == nil {
+		return nil, nil
+	}
+	if pkg == "" {
+		return s.stores.ForType(typ), nil
+	}
+	pm, err := s.store.GetPackage(ctx, typ, pkg)
+	if err != nil || pm == nil {
+		return s.stores.ForType(typ), nil
+	}
+	for _, ve := range pm.Versions {
+		if ve.Version == version || (version != "" && ve.Ref == version) {
+			return s.stores.ByName(ve.Storage)
+		}
+	}
+	return s.stores.ForType(typ), nil
+}
+
+// proxyVersion serves an artifact from the backend its manifest entry names.
+//
+// An unresolvable name is 502, not a fallback to another backend: the digest
+// generateAptPackages publishes is recorded against one specific backend, so
+// serving bytes from a different one is the signature the checksum machinery
+// exists to flag.
+func (s *Server) proxyVersion(w http.ResponseWriter, r *http.Request, typ, pkg, version, key string) {
+	store, err := s.versionStore(r.Context(), typ, pkg, version)
+	if err != nil {
+		s.logger.Error("storage backend recorded for artifact is not configured",
+			"type", typ, "package", pkg, "version", version, "key", key, "error", err)
+		http.Error(w, "storage backend error", http.StatusBadGateway)
+		return
+	}
+	s.proxyS3(w, r, store, key)
+}
+
+// proxyVersionOrRefuse serves the artifact its manifest entry names, and
+// answers reason instead of a bare 404 when no backend holds it.
+//
+// It exists for the two routes that cannot proxy an uncatalogued name: pypi,
+// where a wheel URL is read out of the simple index rather than composed, and
+// helm, where the chart repository is recorded per version entry so there is no
+// host to reach. A bare 404 on either reads as "no such artifact upstream",
+// which is a different problem with a different fix; what is actually missing
+// is the entry, and the operator needs to be told that and given the command.
+//
+// The Head is what separates the two answers, and a Head that errors falls
+// through to proxyS3 rather than refusing: a backend that cannot be read has
+// not established that the object is absent, and proxyS3 reports that as 502.
+func (s *Server) proxyVersionOrRefuse(w http.ResponseWriter, r *http.Request, typ, pkg, version, key, reason string) {
+	store, err := s.versionStore(r.Context(), typ, pkg, version)
+	if err != nil {
+		s.logger.Error("storage backend recorded for artifact is not configured",
+			"type", typ, "package", pkg, "version", version, "key", key, "error", err)
+		http.Error(w, "storage backend error", http.StatusBadGateway)
+		return
+	}
+	if !s.requireStorage(w, store) {
+		return
+	}
+	status, headErr := store.Head(r.Context(), key)
+	if headErr != nil {
+		s.logger.Error("s3 head check failed", "key", key, "error", headErr)
+	} else if status == nil || !status.Exists {
+		http.Error(w, reason, http.StatusNotFound)
+		return
+	}
+	s.proxyS3(w, r, store, key)
+}
+
+// listFanout unions List across every backend a read of typ may reach.
+//
+// One backend failing fails the whole call. A partial index is worse than an
+// error: a client cannot tell a short PEP 503 or Packages list from packages
+// having been withdrawn, and acts on the difference.
+//
+// The union is sorted here rather than merged: ObjectStore.List guarantees each
+// backend's own order, but concatenating two sorted lists is not sorted and
+// deduplication drops entries from either one. Packages.gz is gzipped per
+// request, so an unstable order changes the bytes and every client refetches.
+func (s *Server) listFanout(ctx context.Context, typ, prefix string) ([]string, error) {
+	if s.stores == nil {
+		return nil, nil
+	}
+	seen := map[string]struct{}{}
+	var keys []string
+	for _, ns := range s.stores.Fanout(ctx, typ, s.recordedBackends(ctx, typ)) {
+		got, err := ns.Store.List(ctx, prefix)
+		if err != nil {
+			return nil, fmt.Errorf("list %q on storage backend %q: %w", prefix, ns.Name, err)
+		}
+		for _, k := range got {
+			if _, dup := seen[k]; dup {
+				continue
+			}
+			seen[k] = struct{}{}
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	return keys, nil
+}
+
+// recordedBackends returns every backend name the manifests hold for this
+// type: the name on each version entry, plus each package's storage_policy for
+// the versions it has not been applied to yet.
+//
+// The fan-out needs this because config cannot answer it. A package moved with
+// 'bodega pkg move', or placed by its own policy, sits on a backend no
+// storage_by_type key for its type names, and an index built without it would
+// be short by exactly that package.
+func (s *Server) recordedBackends(ctx context.Context, typ string) []string {
+	seen := map[string]struct{}{}
+	var names []string
+	add := func(name string) {
+		if name == "" {
+			return
+		}
+		if _, dup := seen[name]; dup {
+			return
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	for _, pkg := range s.store.ListPackages(typ) {
+		pm, err := s.store.GetPackage(ctx, typ, pkg)
+		if err != nil || pm == nil {
+			continue
+		}
+		add(pm.StoragePolicy)
+		for _, ve := range pm.Versions {
+			add(ve.Storage)
+		}
+	}
+	return names
+}
+
+// ---- S3 proxy core ---------------------------------------------------------
+
+// proxyS3 streams an object to the HTTP response from the given backend.
+// It sets Content-Type from the file extension and Content-Length from the
+// store's metadata. Returns 404 when the key does not exist.
+//
+// The backend is a parameter rather than something resolved in here from
+// s3Key: a key carries the artifact's type but not its package or version, and
+// placement is recorded per version, so the key cannot answer which backend
+// holds it. Callers that hold a manifest entry resolve by its recorded name;
+// callers serving regenerable, type-scoped objects pass typeStore.
+func (s *Server) proxyS3(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, s3Key string) {
+	result, ok := s.openStored(w, r, store, s3Key)
+	if !ok {
+		return
+	}
+	defer func() { _ = result.Body.Close() }()
+	s.serveStored(w, s3Key, result)
+}
+
+// openStored opens s3Key for streaming and answers the client itself when the
+// backend errors or holds no such object; ok is false when it has, and the
+// caller is done. The caller closes Body.
+//
+// Split out of proxyS3 so that a caller recording what it served can take the
+// object's identity off this open rather than off an earlier Head. The two
+// describe different objects whenever a writer landed between them.
+func (s *Server) openStored(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, s3Key string) (*storage.StreamResult, bool) {
+	if !s.requireStorage(w, store) {
+		return nil, false
+	}
+	result, err := store.GetStream(r.Context(), s3Key)
+	if err != nil {
+		s.logger.Error("object proxy error", "key", s3Key, "error", err)
+		http.Error(w, "upstream error", http.StatusBadGateway)
+		return nil, false
+	}
+	if result == nil {
+		http.NotFound(w, r)
+		return nil, false
+	}
+	return result, true
+}
+
+// serveStored streams an already-open object to the response.
+func (s *Server) serveStored(w http.ResponseWriter, s3Key string, result *storage.StreamResult) {
+	// Set Content-Type from extension, falling back to the backend's stored value.
+	ct := contentTypeForKey(s3Key)
+	if ct == "" {
+		ct = result.ContentType
+	}
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", ct)
+
+	if result.ContentLength > 0 {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", result.ContentLength))
+	}
+	if result.ETag != "" {
+		w.Header().Set("ETag", `"`+result.ETag+`"`)
+	}
+
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.Copy(w, result.Body)
+}
+
+// ---- Helpers ---------------------------------------------------------------
+
+// isImmutableArtifact reports whether a filename names bytes that never change
+// under their own name.
+func isImmutableArtifact(filename string) bool {
+	switch path.Ext(filename) {
+	case ".whl", ".deb", ".bundle", ".tgz":
+		return true
+	}
+	return false
+}
+
+// Cache-Control directives, split by who is allowed to store the answer.
+//
+// A profile decides what the seven non-apt types return, so one URL answers
+// two hosts with two documents. A shared cache cannot evaluate a profile: it
+// stores the first answer and hands it to the next host, with no row written
+// and no error anywhere. That is the enforcement bypassed rather than a
+// refusal made illegible. Vary does not reach it either — a CIDR-identified
+// host sends no request header to vary on.
+//
+// Which directive a route sends never depends on whether a profile is bound.
+// Gated on that, a cache filled by an unidentified request would still answer
+// a profiled one.
+const (
+	// cacheSharedImmutable is for bytes every host gets the same copy of. apt
+	// is the one type bodega does not profile-enforce, so it keeps the shared
+	// grant; F16 is where that changes.
+	cacheSharedImmutable = "public, max-age=31536000, immutable"
+	// cachePrivateImmutable keeps the client-side year and withdraws the
+	// shared grant. RFC 9111 §3.5 would have withheld storage from a request
+	// carrying Authorization on its own; "public" is what opted back in.
+	cachePrivateImmutable = "private, max-age=31536000, immutable"
+	// cachePrivate is the floor for a profile-enforced artifact whose filename
+	// earns no freshness lifetime. Without it a shared cache may still store
+	// the response under heuristic freshness and serve it to another class of
+	// host.
+	cachePrivate = "private"
+	// cacheNoStore is for a filtered index: not merely unshared but unstored,
+	// because the document is valid, parseable and wrong about what any other
+	// host may install.
+	cacheNoStore = "no-cache, no-store, must-revalidate"
+)
+
+// cacheSharedImmutableOn200 defers the Cache-Control header to a response that
+// earns it, returning w unchanged for a filename that was never going to get
+// one.
+//
+// Setting it up front is wrong in a way nothing local reveals: http.Error does
+// not clear the header map, so a 403 from the allow-list and a 404 from an
+// archive that does not publish the path both shipped a year-long "immutable".
+// An operator who then runs "bodega policy add apt <host>" has fixed nothing
+// for any client behind a caching proxy that believed the first answer, and
+// has no way to reach into it.
+func cacheSharedImmutableOn200(w http.ResponseWriter, filename string) http.ResponseWriter {
+	if !isImmutableArtifact(filename) {
+		return w
+	}
+	return &cacheDirectiveWriter{ResponseWriter: w, directive: cacheSharedImmutable}
+}
+
+// cachePrivateOn200 is the same deferral for an artifact route a profile
+// gates. It always stamps something, because the question it answers is not
+// how long the bytes stay fresh but whether a proxy may hand them to a host
+// that asked with a different identity — and that is "no" for a cargo crate
+// and a namespaced binary as much as for a wheel.
+func cachePrivateOn200(w http.ResponseWriter, filename string) http.ResponseWriter {
+	directive := cachePrivate
+	if isImmutableArtifact(filename) {
+		directive = cachePrivateImmutable
+	}
+	return &cacheDirectiveWriter{ResponseWriter: w, directive: directive}
+}
+
+// noSharedCache marks a document whose content a profile decides. Set before
+// the handler writes anything, so a refusal on the same route carries it too.
+func noSharedCache(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", cacheNoStore)
+}
+
+// cacheDirectiveWriter sets Cache-Control on the way out, once, and only when
+// the status is 200.
+//
+// ReadFrom and Flush are forwarded explicitly. Embedding an interface promotes
+// only that interface's methods, so without them a wrapped writer loses the
+// sendfile path proxyS3's io.Copy takes and stops being an http.Flusher.
+type cacheDirectiveWriter struct {
+	http.ResponseWriter
+	directive string
+	started   bool
+}
+
+func (iw *cacheDirectiveWriter) WriteHeader(code int) {
+	iw.begin(code)
+	iw.ResponseWriter.WriteHeader(code)
+}
+
+func (iw *cacheDirectiveWriter) Write(b []byte) (int, error) {
+	iw.begin(http.StatusOK)
+	return iw.ResponseWriter.Write(b)
+}
+
+func (iw *cacheDirectiveWriter) ReadFrom(r io.Reader) (int64, error) {
+	iw.begin(http.StatusOK)
+	return io.Copy(iw.ResponseWriter, r)
+}
+
+func (iw *cacheDirectiveWriter) Flush() {
+	if f, ok := iw.ResponseWriter.(http.Flusher); ok {
+		iw.begin(http.StatusOK)
+		f.Flush()
+	}
+}
+
+func (iw *cacheDirectiveWriter) begin(code int) {
+	if iw.started {
+		return
+	}
+	iw.started = true
+	if code == http.StatusOK {
+		iw.ResponseWriter.Header().Set("Cache-Control", iw.directive)
+	}
+}
+
+// contentTypeForKey returns the MIME type for a given object key based on extension.
+func contentTypeForKey(key string) string {
+	return contentTypes[strings.ToLower(path.Ext(key))]
+}
+
+// writeJSON serialises v as JSON and writes it with the given status code.
+func writeJSON(w http.ResponseWriter, code int, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(v)
+}
+
+// wheelDistName extracts the distribution (package) name from a wheel filename.
+// Wheel format: {distribution}-{version}(-{build tag})?-{python tag}-{abi tag}-{platform tag}.whl
+func wheelDistName(filename string) string {
+	filename = strings.TrimSuffix(filename, ".whl")
+	parts := strings.SplitN(filename, "-", 2)
+	return parts[0]
+}
+
+// uniquePackageNames scans object keys under pypi/wheels/ and returns the sorted
+// list of unique normalised package names found.
+func uniquePackageNames(keys []string) []string {
+	seen := make(map[string]struct{})
+	var names []string
+	for _, key := range keys {
+		filename := path.Base(key)
+		if !strings.HasSuffix(filename, ".whl") {
+			continue
+		}
+		dist := wheelDistName(filename)
+		norm := manifest.CanonicalPypiName(dist)
+		if _, ok := seen[norm]; !ok {
+			seen[norm] = struct{}{}
+			names = append(names, norm)
+		}
+	}
+	// Return stable order.
+	sortStrings(names)
+	return names
+}
+
+// sortStrings sorts a string slice in place without importing sort
+// (uses a simple insertion sort — package index lists are small).
+func sortStrings(ss []string) {
+	for i := 1; i < len(ss); i++ {
+		key := ss[i]
+		j := i - 1
+		for j >= 0 && ss[j] > key {
+			ss[j+1] = ss[j]
+			j--
+		}
+		ss[j+1] = key
+	}
+}
+
+// ---- PackageManifest helpers -----------------------------------------------
+
+// loadAllPackages loads all PackageManifest entries for a given type from the store.
+func loadAllPackages(ctx context.Context, store *manifest.Store, typ string) []*manifest.PackageManifest {
+	names := store.ListPackages(typ)
+	out := make([]*manifest.PackageManifest, 0, len(names))
+	for _, name := range names {
+		pm, err := store.GetPackage(ctx, typ, name)
+		if err != nil || pm == nil {
+			continue
+		}
+		out = append(out, pm)
+	}
+	return out
+}
+
+// isPackageHidden returns true when any version of the package is marked hidden,
+// or when all versions are hidden. Uses first-version semantics for single-version packages.
+func isPackageHidden(pm *manifest.PackageManifest) bool {
+	if len(pm.Versions) == 0 {
+		return false
+	}
+	// For multi-version packages, treat as hidden only when ALL versions are hidden.
+	for _, ve := range pm.Versions {
+		if !ve.Hidden {
+			return false
+		}
+	}
+	return true
+}
+
+// packageMode returns the effective mode for a package, derived from the first version entry.
+// Defaults to ModeHosted when no versions are set.
+func packageMode(pm *manifest.PackageManifest) string {
+	for _, ve := range pm.Versions {
+		return ve.EffectiveMode()
+	}
+	return manifest.ModeHosted
+}
+
+// packageVersionConstraint returns the VersionConstraint and Version from the first version entry.
+func packageVersionConstraint(pm *manifest.PackageManifest) (constraint, version string) {
+	for _, ve := range pm.Versions {
+		return ve.VersionConstraint, ve.Version
+	}
+	return "", ""
+}

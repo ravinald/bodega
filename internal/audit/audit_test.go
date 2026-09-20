@@ -1,0 +1,607 @@
+package audit
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+func tempDB(t *testing.T) *DB {
+	t.Helper()
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "audit.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+func TestOpenCreatesDB(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("db file not created: %v", err)
+	}
+}
+
+// TestReadPoolRefusesWrites holds the two-handle split to its precondition:
+// exactly one pool writes. A write that reaches the read pool costs no error
+// and no row, it just puts a second unbounded set of connections back on the
+// write lock, which is the contention the single-connection write handle was
+// added to remove. query_only turns that into a failure at the first call.
+func TestReadPoolRefusesWrites(t *testing.T) {
+	db := tempDB(t)
+	ctx := context.Background()
+
+	const ins = `INSERT INTO acl_entries (list, cidr) VALUES ('deny', '203.0.113.0/24')`
+
+	_, err := db.db.ExecContext(ctx, ins)
+	if err == nil {
+		t.Fatal("the read pool accepted an INSERT; it must be opened query_only")
+	}
+	if !strings.Contains(err.Error(), "readonly") {
+		t.Errorf("read pool refused with %v, want SQLite's readonly-database error", err)
+	}
+
+	// Control: the same statement through the write handle. Without it the
+	// assertion above would also pass on a store where nothing can be written.
+	if _, err := db.writer().ExecContext(ctx, ins); err != nil {
+		t.Fatalf("write handle refused the same INSERT: %v", err)
+	}
+
+	// The sqlite sink reads through this very handle rather than opening the
+	// file a third time, so its reads inherit the refusal above.
+	if sink, ok := db.sink.(*sqliteSink); !ok {
+		t.Fatalf("default sink is %T, want *sqliteSink", db.sink)
+	} else if sink.rdb != db.db {
+		t.Error("the sqlite sink reads through a handle that is not the store's read pool")
+	}
+}
+
+func TestRecordAndQuery(t *testing.T) {
+	db := tempDB(t)
+	ctx := context.Background()
+
+	err := db.Record(ctx, Event{
+		EventType:  EventFetch,
+		PkgType:    "gomod",
+		PkgName:    "example.com/example-corp/widget-sdk",
+		PkgVersion: "v1.30.0",
+		ClientIP:   "10.0.0.5",
+		UserAgent:  "Go-http-client/2.0",
+		Status:     "cache_hit",
+		DurationMs: 15,
+	})
+	if err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+
+	events, err := db.Query(ctx, Filter{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+
+	ev := events[0]
+	if ev.EventType != EventFetch {
+		t.Errorf("event_type = %q, want %q", ev.EventType, EventFetch)
+	}
+	if ev.PkgName != "example.com/example-corp/widget-sdk" {
+		t.Errorf("pkg_name = %q, want example.com/example-corp/widget-sdk", ev.PkgName)
+	}
+	if ev.ClientIP != "10.0.0.5" {
+		t.Errorf("client_ip = %q, want 10.0.0.5", ev.ClientIP)
+	}
+	if ev.Status != "cache_hit" {
+		t.Errorf("status = %q, want cache_hit", ev.Status)
+	}
+	if ev.Timestamp.IsZero() {
+		t.Error("timestamp should not be zero")
+	}
+}
+
+func TestOpenReadOnlyDB(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.db")
+
+	// Seed the DB normally, write one row.
+	seed, err := Open(path)
+	if err != nil {
+		t.Fatalf("seed Open: %v", err)
+	}
+	if err := seed.Record(context.Background(), Event{
+		EventType: EventCreate, PkgType: "npm", PkgName: "lodash", Actor: "ravi",
+	}); err != nil {
+		t.Fatalf("seed Record: %v", err)
+	}
+	_ = seed.Close()
+
+	// Flip the file to read-only and re-open.
+	if err := os.Chmod(path, 0o444); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+
+	ro, err := Open(path)
+	if err != nil {
+		t.Fatalf("read-only Open: %v (expected graceful)", err)
+	}
+	defer ro.Close()
+
+	if !ro.ReadOnly() {
+		t.Error("ReadOnly() = false on a 0444 file; want true")
+	}
+
+	// Record must silently no-op.
+	if err := ro.Record(context.Background(), Event{
+		EventType: EventCreate, PkgType: "npm", PkgName: "chalk", Actor: "ravi",
+	}); err != nil {
+		t.Errorf("Record on RO should be nil, got %v", err)
+	}
+
+	// Query still works.
+	events, err := ro.Query(context.Background(), Filter{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(events) != 1 {
+		t.Errorf("got %d rows, want 1 (Record should not have added to RO DB)", len(events))
+	}
+}
+
+func TestRecordAndQueryActor(t *testing.T) {
+	db := tempDB(t)
+	ctx := context.Background()
+
+	if err := db.Record(ctx, Event{
+		EventType: EventEdit,
+		PkgType:   "npm",
+		PkgName:   "@example-corp/widget-cli",
+		Actor:     "ravi",
+		Status:    "success",
+	}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if err := db.Record(ctx, Event{
+		EventType: EventCreate,
+		PkgType:   "npm",
+		PkgName:   "lodash",
+		Actor:     "ops-bot",
+	}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+
+	// Round-trip: Actor is both persisted and returned.
+	all, err := db.Query(ctx, Filter{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	var seen []string
+	for _, e := range all {
+		seen = append(seen, e.Actor)
+	}
+	if len(all) != 2 || seen[0] == "" || seen[1] == "" {
+		t.Fatalf("expected both events to have non-empty Actor, got %+v", seen)
+	}
+
+	// Filtering by actor.
+	byActor, err := db.Query(ctx, Filter{Actor: "ravi"})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(byActor) != 1 || byActor[0].PkgName != "@example-corp/widget-cli" {
+		t.Fatalf("filter by actor ravi → %+v, want single edit event", byActor)
+	}
+}
+
+func TestCurrentActorFallbacks(t *testing.T) {
+	// Can't reliably unset os/user on all platforms, so just assert non-empty.
+	if got := CurrentActor(); got == "" {
+		t.Error("CurrentActor returned empty string")
+	}
+}
+
+func TestQueryByEventType(t *testing.T) {
+	db := tempDB(t)
+	ctx := context.Background()
+
+	_ = db.Record(ctx, Event{EventType: EventFetch, PkgType: "gomod", PkgName: "foo"})
+	_ = db.Record(ctx, Event{EventType: EventBuild, PkgType: "gomod", PkgName: "foo"})
+	_ = db.Record(ctx, Event{EventType: EventFetch, PkgType: "helm", PkgName: "bar"})
+
+	events, err := db.Query(ctx, Filter{EventType: EventFetch})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(events) != 2 {
+		t.Errorf("got %d events, want 2 fetches", len(events))
+	}
+}
+
+func TestQueryByPkgType(t *testing.T) {
+	db := tempDB(t)
+	ctx := context.Background()
+
+	_ = db.Record(ctx, Event{EventType: EventFetch, PkgType: "gomod", PkgName: "foo"})
+	_ = db.Record(ctx, Event{EventType: EventFetch, PkgType: "helm", PkgName: "bar"})
+
+	events, err := db.Query(ctx, Filter{PkgType: "helm"})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(events) != 1 {
+		t.Errorf("got %d events, want 1", len(events))
+	}
+	if events[0].PkgName != "bar" {
+		t.Errorf("pkg_name = %q, want bar", events[0].PkgName)
+	}
+}
+
+func TestQueryByClientIP(t *testing.T) {
+	db := tempDB(t)
+	ctx := context.Background()
+
+	_ = db.Record(ctx, Event{EventType: EventFetch, PkgType: "npm", PkgName: "lodash", ClientIP: "10.0.0.1"})
+	_ = db.Record(ctx, Event{EventType: EventFetch, PkgType: "npm", PkgName: "react", ClientIP: "10.0.0.2"})
+
+	events, err := db.Query(ctx, Filter{ClientIP: "10.0.0.1"})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(events) != 1 {
+		t.Errorf("got %d events, want 1", len(events))
+	}
+}
+
+func TestQuerySince(t *testing.T) {
+	db := tempDB(t)
+	ctx := context.Background()
+
+	_ = db.Record(ctx, Event{EventType: EventFetch, PkgType: "gomod", PkgName: "old"})
+
+	// Events inserted just now should be after a timestamp from an hour ago.
+	since := time.Now().Add(-1 * time.Hour)
+	events, err := db.Query(ctx, Filter{Since: since})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(events) != 1 {
+		t.Errorf("got %d events, want 1", len(events))
+	}
+
+	// Query with future Since should return nothing.
+	events, err = db.Query(ctx, Filter{Since: time.Now().Add(1 * time.Hour)})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(events) != 0 {
+		t.Errorf("got %d events, want 0", len(events))
+	}
+}
+
+func TestQueryLimit(t *testing.T) {
+	db := tempDB(t)
+	ctx := context.Background()
+
+	for i := 0; i < 10; i++ {
+		_ = db.Record(ctx, Event{EventType: EventFetch, PkgType: "gomod", PkgName: "pkg"})
+	}
+
+	events, err := db.Query(ctx, Filter{Limit: 3})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(events) != 3 {
+		t.Errorf("got %d events, want 3", len(events))
+	}
+}
+
+func TestQueryOrderDescending(t *testing.T) {
+	db := tempDB(t)
+	ctx := context.Background()
+
+	_ = db.Record(ctx, Event{EventType: EventFetch, PkgType: "gomod", PkgName: "first"})
+	_ = db.Record(ctx, Event{EventType: EventFetch, PkgType: "gomod", PkgName: "second"})
+
+	events, err := db.Query(ctx, Filter{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(events) < 2 {
+		t.Fatalf("got %d events, want >= 2", len(events))
+	}
+	// Most recent first.
+	if events[0].PkgName != "second" {
+		t.Errorf("first result = %q, want second (most recent)", events[0].PkgName)
+	}
+}
+
+func TestCount(t *testing.T) {
+	db := tempDB(t)
+	ctx := context.Background()
+
+	_ = db.Record(ctx, Event{EventType: EventFetch, PkgType: "gomod", PkgName: "a"})
+	_ = db.Record(ctx, Event{EventType: EventBuild, PkgType: "gomod", PkgName: "a"})
+	_ = db.Record(ctx, Event{EventType: EventFetch, PkgType: "helm", PkgName: "b"})
+
+	count, err := db.Count(ctx, Filter{})
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	if count != 3 {
+		t.Errorf("total count = %d, want 3", count)
+	}
+
+	count, err = db.Count(ctx, Filter{EventType: EventFetch})
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("fetch count = %d, want 2", count)
+	}
+}
+
+// ---- Checksum tests --------------------------------------------------------
+
+func TestStoreAndGetChecksum(t *testing.T) {
+	db := tempDB(t)
+	ctx := context.Background()
+
+	err := db.StoreChecksum(ctx, "gomod/example.com/example-corp/sdk/@v/v1.0.0.zip",
+		"gomod", "example.com/example-corp/sdk", "v1.0.0", "sha256",
+		"abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890", "computed")
+	if err != nil {
+		t.Fatalf("StoreChecksum: %v", err)
+	}
+
+	cs, err := db.GetChecksum(ctx, "gomod/example.com/example-corp/sdk/@v/v1.0.0.zip")
+	if err != nil {
+		t.Fatalf("GetChecksum: %v", err)
+	}
+	if cs == nil {
+		t.Fatal("expected checksum, got nil")
+	}
+	if cs.Algorithm != "sha256" {
+		t.Errorf("algorithm = %q, want sha256", cs.Algorithm)
+	}
+	if cs.Source != "computed" {
+		t.Errorf("source = %q, want computed", cs.Source)
+	}
+	if cs.PkgName != "example.com/example-corp/sdk" {
+		t.Errorf("pkg_name = %q, want example.com/example-corp/sdk", cs.PkgName)
+	}
+}
+
+func TestGetChecksumNotFound(t *testing.T) {
+	db := tempDB(t)
+	ctx := context.Background()
+
+	cs, err := db.GetChecksum(ctx, "nonexistent/key")
+	if err != nil {
+		t.Fatalf("GetChecksum: %v", err)
+	}
+	if cs != nil {
+		t.Errorf("expected nil for nonexistent key, got %+v", cs)
+	}
+}
+
+func TestStoreChecksumUpsert(t *testing.T) {
+	db := tempDB(t)
+	ctx := context.Background()
+
+	key := "charts/nginx-1.0.0.tgz"
+	_ = db.StoreChecksum(ctx, key, "helm", "nginx", "1.0.0", "sha256", "aaa", "computed")
+	_ = db.StoreChecksum(ctx, key, "helm", "nginx", "1.0.0", "sha256", "bbb", "upstream")
+
+	cs, _ := db.GetChecksum(ctx, key)
+	if cs.Value != "bbb" {
+		t.Errorf("value = %q, want bbb (upsert)", cs.Value)
+	}
+	if cs.Source != "upstream" {
+		t.Errorf("source = %q, want upstream (upsert)", cs.Source)
+	}
+}
+
+func TestListChecksums(t *testing.T) {
+	db := tempDB(t)
+	ctx := context.Background()
+
+	_ = db.StoreChecksum(ctx, "gomod/foo/@v/v1.zip", "gomod", "foo", "v1", "sha256", "aaa", "computed")
+	_ = db.StoreChecksum(ctx, "gomod/bar/@v/v2.zip", "gomod", "bar", "v2", "sha256", "bbb", "computed")
+	_ = db.StoreChecksum(ctx, "npm/lodash/lodash-4.tgz", "npm", "lodash", "4.17.21", "sha256", "ccc", "computed")
+
+	all, err := db.ListChecksums(ctx, "", "")
+	if err != nil {
+		t.Fatalf("ListChecksums: %v", err)
+	}
+	if len(all) != 3 {
+		t.Errorf("got %d checksums, want 3", len(all))
+	}
+
+	gomod, _ := db.ListChecksums(ctx, "gomod", "")
+	if len(gomod) != 2 {
+		t.Errorf("gomod checksums = %d, want 2", len(gomod))
+	}
+
+	specific, _ := db.ListChecksums(ctx, "gomod", "foo")
+	if len(specific) != 1 {
+		t.Errorf("gomod/foo checksums = %d, want 1", len(specific))
+	}
+}
+
+func TestClearChecksum(t *testing.T) {
+	db := tempDB(t)
+	ctx := context.Background()
+
+	key := "npm/lodash/lodash-4.tgz"
+	_ = db.StoreChecksum(ctx, key, "npm", "lodash", "4.17.21", "sha256", "aaa", "computed")
+
+	if err := db.ClearChecksum(ctx, key); err != nil {
+		t.Fatalf("ClearChecksum: %v", err)
+	}
+
+	// The digest goes, the row stays. For apt the row is also what keeps a
+	// cached upstream .deb out of the signed index, and the artifact outlives
+	// the clear (#225).
+	cs, _ := db.GetChecksum(ctx, key)
+	if cs == nil {
+		t.Fatal("the row went with the digest")
+	}
+	if cs.Value != "" {
+		t.Errorf("value = %q, want empty", cs.Value)
+	}
+	if cs.PkgName != "lodash" || cs.Source != "computed" {
+		t.Errorf("identity = %q/%q, want lodash/computed", cs.PkgName, cs.Source)
+	}
+}
+
+func TestClearChecksumNotFound(t *testing.T) {
+	db := tempDB(t)
+	ctx := context.Background()
+
+	err := db.ClearChecksum(ctx, "nonexistent")
+	if err == nil {
+		t.Error("expected error for nonexistent key")
+	}
+}
+
+func TestClearChecksumsByPackage(t *testing.T) {
+	db := tempDB(t)
+	ctx := context.Background()
+
+	_ = db.StoreChecksum(ctx, "npm/lodash/lodash-4.17.tgz", "npm", "lodash", "4.17.21", "sha256", "aaa", "computed")
+	_ = db.StoreChecksum(ctx, "npm/lodash/lodash-4.18.tgz", "npm", "lodash", "4.18.0", "sha256", "bbb", "computed")
+	_ = db.StoreChecksum(ctx, "npm/react/react-18.tgz", "npm", "react", "18.0.0", "sha256", "ccc", "computed")
+
+	cleared, matched, err := db.ClearChecksumsByPackage(ctx, "npm", "lodash")
+	if err != nil {
+		t.Fatalf("ClearChecksumsByPackage: %v", err)
+	}
+	if cleared != 2 || matched != 2 {
+		t.Errorf("cleared/matched = %d/%d, want 2/2 — the count is what the operator is told", cleared, matched)
+	}
+
+	lodash, _ := db.ListChecksums(ctx, "npm", "lodash")
+	if len(lodash) != 2 {
+		t.Fatalf("lodash rows = %d, want 2 — the rows outlive their digests (#225)", len(lodash))
+	}
+	for _, cs := range lodash {
+		if cs.Value != "" {
+			t.Errorf("lodash %s value = %q, want empty", cs.PkgVersion, cs.Value)
+		}
+	}
+
+	react, _ := db.ListChecksums(ctx, "npm", "react")
+	if len(react) != 1 || react[0].Value != "ccc" {
+		t.Errorf("react checksums = %+v, want one untouched row", react)
+	}
+
+	// Clearing twice is not an error, and the zero is the whole signal: an
+	// operator clearing a stale digest has to know it did nothing. matched
+	// separates that from a package name spelled wrong.
+	cleared, matched, err = db.ClearChecksumsByPackage(ctx, "npm", "lodash")
+	if err != nil {
+		t.Fatalf("second ClearChecksumsByPackage: %v", err)
+	}
+	if cleared != 0 || matched != 2 {
+		t.Errorf("cleared/matched = %d/%d on a second run, want 0/2", cleared, matched)
+	}
+
+	cleared, matched, err = db.ClearChecksumsByPackage(ctx, "npm", "lodahs")
+	if err != nil {
+		t.Fatalf("misspelled ClearChecksumsByPackage: %v", err)
+	}
+	if cleared != 0 || matched != 0 {
+		t.Errorf("cleared/matched = %d/%d on a name nothing recorded, want 0/0", cleared, matched)
+	}
+}
+
+func TestMultipleEventTypes(t *testing.T) {
+	db := tempDB(t)
+	ctx := context.Background()
+
+	for _, et := range []EventType{EventFetch, EventBuild, EventCreate, EventDelete, EventCache} {
+		err := db.Record(ctx, Event{EventType: et, PkgType: "gomod", PkgName: "test"})
+		if err != nil {
+			t.Fatalf("Record %s: %v", et, err)
+		}
+	}
+
+	events, err := db.Query(ctx, Filter{})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(events) != 5 {
+		t.Errorf("got %d events, want 5", len(events))
+	}
+}
+
+// Eight writers through one *DB, because that is the shape that lost rows:
+// database/sql hands each goroutine its own SQLite connection, and without a
+// busy_timeout the loser of the write lock is refused immediately rather than
+// made to wait. The assertion is the row count, not the error return — a
+// handle that reported no error and stored 30 of 400 is what this pins.
+//
+// It also reports sustained write throughput, which is the number E2 needs to
+// argue SQLite is or is not enough for a fleet.
+func TestConcurrentWritersKeepEveryRow(t *testing.T) {
+	const (
+		writers        = 8
+		eventsPerWrite = 50
+	)
+	db := tempDB(t)
+	ctx := context.Background()
+
+	start := time.Now()
+	var wg sync.WaitGroup
+	errs := make(chan error, writers*eventsPerWrite)
+	for w := range writers {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := range eventsPerWrite {
+				err := db.Record(ctx, Event{
+					EventType: EventFetch,
+					PkgType:   "gomod",
+					PkgName:   fmt.Sprintf("writer-%d/event-%d", w, i),
+					Status:    "cache_miss",
+				})
+				if err != nil {
+					errs <- err
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("Record: %v", err)
+	}
+
+	events, err := db.Query(ctx, Filter{Limit: writers * eventsPerWrite * 2})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if want := writers * eventsPerWrite; len(events) != want {
+		t.Fatalf("stored %d events, want %d — the handle dropped writes under contention", len(events), want)
+	}
+	t.Logf("%d events from %d concurrent writers in %s (%.0f writes/sec)",
+		len(events), writers, elapsed.Round(time.Millisecond),
+		float64(len(events))/elapsed.Seconds())
+}

@@ -1,0 +1,33 @@
+# Build artifacts
+dist/
+/bodega
+*.exe
+
+# Fetched/built artifacts (created by bodega build)
+manifests/
+widget-*/
+*.db
+/apt-repo/
+/sources/
+/wheels/
+/combined-requirements.txt
+
+# Local config (may contain tokens, bucket names)
+docs-internal/
+CLAUDE.md
+
+# OS
+.DS_Store
+*.swp
+
+# IDE
+.idea/
+.vscode/
+# BEGIN attic — managed by `attic`, do not edit between markers
+.drover.toml
+AGENTS.md
+docs-internal
+local.mk
+test/e2e/hosts.env
+# END attic
+test/e2e/results/

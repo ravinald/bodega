@@ -1,0 +1,98 @@
+package main
+
+import "github.com/spf13/cobra"
+
+// A command is classified by whether its success has to reach a running
+// bodega serve. The root's PersistentPostRun sends the signal for every
+// command that resolves to reloadSignal, so a verb states the fact once where
+// it is registered rather than remembering a notifyServer call on each return
+// path in its RunE. Four verbs (hide, freeze, refresh and remove) shipped
+// without that call, and a withdrawn package stayed published until someone
+// restarted the server.
+//
+// The classification is inherited, so a group carries its whole subtree and a
+// leaf overrides its parent. Nothing defaults: TestEveryRunnableCommandIsClassified
+// fails the build when a new verb joins the tree undeclared.
+const (
+	reloadAnnotation = "bodega.reload"
+	// reloadSelfAnnotation classifies one command and not its subtree. The
+	// root needs it: it is runnable in its own right, since
+	// --break-glass-update-md5 writes through Store.RestampMD5, and an
+	// inherited classification there would hand every undeclared verb in the
+	// tree a default. That is what the guard exists to refuse.
+	reloadSelfAnnotation = "bodega.reload.self"
+	reloadSignal         = "signal"
+	reloadQuiet          = "quiet"
+)
+
+// signalsReload marks a verb whose success changes what the server should be
+// serving.
+func signalsReload(cmd *cobra.Command) *cobra.Command {
+	return classifyReload(cmd, reloadSignal)
+}
+
+// noReloadSignal marks a verb that needs no signal, either because nothing the
+// server holds changed or because the change reaches it another way: the CIDR
+// access lists have their own 30s cache, and the apt signing key is published
+// as a `systemctl reload` runbook.
+func noReloadSignal(cmd *cobra.Command) *cobra.Command {
+	return classifyReload(cmd, reloadQuiet)
+}
+
+// suppressReload records that this invocation changed nothing, so a verb
+// classified as signaling stays quiet for this run. A dry run and a refresh
+// that discovered no versions use it.
+//
+// It fails in the cheap direction: forgetting it costs one redundant reload,
+// where forgetting to signal costs an index that keeps publishing a package
+// somebody withdrew.
+func suppressReload(cmd *cobra.Command) {
+	classifyReload(cmd, reloadQuiet)
+}
+
+// noReloadSignalSelf marks one command quiet without speaking for anything
+// registered under it. Only the root uses it.
+func noReloadSignalSelf(cmd *cobra.Command) *cobra.Command {
+	if cmd.Annotations == nil {
+		cmd.Annotations = map[string]string{}
+	}
+	cmd.Annotations[reloadSelfAnnotation] = reloadQuiet
+	return cmd
+}
+
+// signalReloadNow sends the signal from inside a RunE that is about to return
+// an error. Cobra runs PersistentPostRun only after a nil return, so a verb
+// that wrote part of what it set out to write and then failed would leave the
+// server answering from before the write. It reads the same classification the
+// hook does, so a quiet verb calling it still sends nothing.
+func signalReloadNow(cmd *cobra.Command, gf *globalFlags) {
+	if intent, ok := reloadIntent(cmd); ok && intent == reloadSignal {
+		notifyServer(gf)
+	}
+}
+
+func classifyReload(cmd *cobra.Command, intent string) *cobra.Command {
+	if cmd.Annotations == nil {
+		cmd.Annotations = map[string]string{}
+	}
+	cmd.Annotations[reloadAnnotation] = intent
+	return cmd
+}
+
+// reloadIntent resolves cmd's classification, walking up to its ancestors.
+// The second return is false when no command on the path declared one.
+func reloadIntent(cmd *cobra.Command) (string, bool) {
+	for c := cmd; c != nil; c = c.Parent() {
+		if intent, ok := c.Annotations[reloadAnnotation]; ok {
+			return intent, true
+		}
+		// Read on cmd itself and nowhere up the chain, which is the whole
+		// difference between the two keys.
+		if c == cmd {
+			if intent, ok := c.Annotations[reloadSelfAnnotation]; ok {
+				return intent, true
+			}
+		}
+	}
+	return "", false
+}
