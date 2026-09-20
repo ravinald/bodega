@@ -7,6 +7,7 @@ import (
 	"compress/bzip2"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -269,12 +270,61 @@ func freeBSDArchiveMember(archive, format, wantBase string, read func(io.Reader)
 		if path.Base(hdr.Name) != wantBase {
 			continue
 		}
-		if err := read(io.LimitReader(tr, freeBSDCatalogMemberCap)); err != nil {
+		if hdr.Size > freeBSDCatalogMemberCap {
+			return fmt.Errorf("%s: member %s is %d bytes, over the %d-byte cap, so the set of objects this repository publishes cannot be established and nothing was published. "+
+				"A pkg catalogue that size is either a repository far larger than any on pkg.freebsd.org or a decompression bomb; serve this entry in proxy mode, where the catalogue is never parsed",
+				archive, hdr.Name, hdr.Size, freeBSDCatalogMemberCap)
+		}
+		capped := &freeBSDCappedReader{r: tr, limit: freeBSDCatalogMemberCap, archive: archive, member: hdr.Name}
+		if err := read(capped); err != nil {
 			return fmt.Errorf("%s: %w", archive, err)
 		}
 		return nil
 	}
 	return fmt.Errorf("%s carries no %s member, so nothing in it says which objects this repository publishes", archive, wantBase)
+}
+
+// freeBSDCappedReader fails a read past the cap rather than reporting the end
+// of the stream at it.
+//
+// io.LimitReader is the wrong tool for a document whose end is the answer. It
+// reports EOF at the limit; the record readers below take that for the end of
+// the catalogue and return the prefix they read as the repository's object
+// list. The mirror then fetches that prefix's objects and publishes the whole
+// untruncated archive over them, with every transfer successful and both
+// archives valid, so nothing anywhere says the repository is short. The client
+// finds out, part way through an install. A cap is a refusal to enumerate,
+// never evidence that enumeration finished.
+type freeBSDCappedReader struct {
+	r       io.Reader
+	limit   int64
+	read    int64
+	archive string
+	member  string
+}
+
+func (c *freeBSDCappedReader) Read(p []byte) (int, error) {
+	// One byte of headroom past the cap, read on purpose: a member of exactly
+	// cap bytes is complete, and only an attempt to read further tells it
+	// apart from one that was cut there.
+	if room := c.limit + 1 - c.read; room < int64(len(p)) {
+		p = p[:room]
+	}
+	n, err := c.r.Read(p)
+	c.read += int64(n)
+	if c.read > c.limit {
+		return n, c.tooBig()
+	}
+	return n, err
+}
+
+// tooBig is unreachable through archive/tar, which never yields more than the
+// header declared. It is here so that what the readers below take for the end
+// of a document does not rest on that header being honest; the check in
+// freeBSDArchiveMember trusts it once, to name a size in the refusal.
+func (c *freeBSDCappedReader) tooBig() error {
+	return fmt.Errorf("member %s runs past the %d-byte cap though its tar header declared it smaller, so what was read of it is a prefix rather than %s's object list; nothing was published",
+		c.member, c.limit, c.archive)
 }
 
 // freeBSDDataPathsFrom reads repopaths out of the packages array of a data
@@ -302,7 +352,22 @@ func freeBSDDataPathsFrom(r io.Reader) ([]string, error) {
 			}
 			continue
 		}
+		// The rest of the object is left unread on purpose: the packages
+		// array is the only key that names bytes, and freeBSDDataPackages
+		// reads it to its own closing bracket, so what follows cannot make
+		// the object list any longer.
 		return freeBSDDataPackages(dec)
+	}
+	// The closing brace is required rather than inferred from the loop ending.
+	// encoding/json documents More as "whether there is another element",
+	// and says nothing about what it reports when the read under it fails;
+	// today it answers true and the error surfaces from Token above, but a
+	// reader whose completeness rests on that is one release from reading a
+	// cut document as a repository that publishes nothing, and an empty
+	// object list is a mirror that succeeds and then 404s every package its
+	// catalogue names.
+	if _, err := dec.Token(); err != nil {
+		return nil, fmt.Errorf("the data member ends without a closing brace, so it was cut before it named any packages: %w", err)
 	}
 	// A document naming no packages names no objects. groups and
 	// expired_packages are the other two keys, and both are lists of names
@@ -321,12 +386,14 @@ func freeBSDDataPackages(dec *json.Decoder) ([]string, error) {
 	}
 	var out []string
 	seen := make(map[string]bool)
-	for record := 1; dec.More(); record++ {
+	records := 0
+	for dec.More() {
+		records++
 		var rec freeBSDRecord
 		if err := dec.Decode(&rec); err != nil {
-			return nil, fmt.Errorf("data record %d is not a JSON record: %w", record, err)
+			return nil, fmt.Errorf("data record %d is not a JSON record: %w", records, err)
 		}
-		rel, err := freeBSDRecordPath(rec, fmt.Sprintf("data record %d", record))
+		rel, err := freeBSDRecordPath(rec, fmt.Sprintf("data record %d", records))
 		if err != nil {
 			return nil, err
 		}
@@ -335,6 +402,17 @@ func freeBSDDataPackages(dec *json.Decoder) ([]string, error) {
 		}
 		seen[rel] = true
 		out = append(out, rel)
+	}
+	// The closing bracket is what says the array ended, for the reason the
+	// closing brace is checked for above: More's answer on a failed read is
+	// not part of its contract, and a loop that ended for that reason would
+	// return the records read so far as the whole of what data.pkg names.
+	end, err := dec.Token()
+	if err != nil {
+		return nil, fmt.Errorf("the data member's packages array stops after %d records without a closing bracket, so it names more objects than could be read: %w", records, err)
+	}
+	if delim, ok := end.(json.Delim); !ok || delim != ']' {
+		return nil, fmt.Errorf("the data member's packages array ends with %v rather than a closing bracket, after %d records", end, records)
 	}
 	return out, nil
 }
@@ -406,6 +484,13 @@ func freeBSDRepoPathsFrom(r io.Reader) ([]string, error) {
 		out = append(out, rel)
 	}
 	if err := sc.Err(); err != nil {
+		// bufio reports its own limit as an error rather than as an end, which
+		// is the answer wanted here; it is reworded so the message names the
+		// cap that stopped the read and how much of the catalogue was left.
+		if errors.Is(err, bufio.ErrTooLong) {
+			return nil, fmt.Errorf("a packagesite.yaml record runs past the %d-byte record cap after %d records, so the rest of the catalogue was never read and nothing was published: %w",
+				freeBSDCatalogLineCap, len(out), err)
+		}
 		return nil, fmt.Errorf("read packagesite.yaml: %w", err)
 	}
 	return out, nil

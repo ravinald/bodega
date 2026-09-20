@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/klauspost/compress/zstd"
@@ -102,6 +104,78 @@ func fbPack(t *testing.T, pack string, body []byte) []byte {
 	return out.Bytes()
 }
 
+// fbOversizedHeader builds an archive whose member header declares size bytes
+// with no body behind it, which is enough to prove the refusal names the
+// member, its size and the cap without producing a gigabyte to say so.
+func fbOversizedHeader(t *testing.T, pack, member string, size int64) []byte {
+	t.Helper()
+	var body bytes.Buffer
+	tw := tar.NewWriter(&body)
+	if err := tw.WriteHeader(&tar.Header{Name: member, Mode: 0o644, Size: size}); err != nil {
+		t.Fatalf("tar header %s: %v", member, err)
+	}
+	// Deliberately not closed: the writer refuses a member whose body never
+	// arrived, and the header block it has already emitted is the fixture.
+	return fbPack(t, pack, body.Bytes())
+}
+
+// fbOversized caches the two archives below. Each costs about a second to
+// produce and four tests want them; the padding compresses to nothing, so
+// what is held is kilobytes.
+var fbOversized sync.Map
+
+// fbOversizedArchive builds an archive whose member runs past the cap with a
+// record on either side of it, and whose prefix parses cleanly.
+//
+// The prefix is the point. An archive that is merely truncated fails in the
+// tar reader and would let a mirror that stops at the cap and publishes
+// anyway pass this fixture; this one enumerates a.pkg, reads legal padding up
+// to the limit, and names b.pkg past it. Only refusing at the cap keeps b.pkg
+// from being an object the published catalogue names and nothing fetched.
+func fbOversizedArchive(t *testing.T, kind string) []byte {
+	t.Helper()
+	if cached, ok := fbOversized.Load(kind); ok {
+		return cached.([]byte)
+	}
+	var member, head, tail string
+	switch kind {
+	case "packagesite":
+		member, head, tail = "packagesite.yaml", `{"name":"a","version":"1","repopath":"a.pkg"}`+"\n", `{"name":"b","version":"1","repopath":"b.pkg"}`+"\n"
+	case "data":
+		member, head, tail = "data", `{"groups":[],"packages":[{"name":"a","version":"1","repopath":"a.pkg"}`, `,{"name":"b","version":"1","repopath":"b.pkg"}]}`
+	default:
+		t.Fatalf("fbOversizedArchive has no %q fixture", kind)
+	}
+
+	// Padding in lines rather than one run: a record over freeBSDCatalogLineCap
+	// is its own refusal, and this fixture is about the member cap.
+	line := strings.Repeat(" ", (1<<20)-1) + "\n"
+	var body bytes.Buffer
+	tw := tar.NewWriter(&body)
+	if err := tw.WriteHeader(&tar.Header{Name: member, Mode: 0o644, Size: int64(freeBSDCatalogMemberCap + len(tail))}); err != nil {
+		t.Fatalf("tar header %s: %v", member, err)
+	}
+	if _, err := io.WriteString(tw, head); err != nil {
+		t.Fatalf("tar body %s: %v", member, err)
+	}
+	for left := freeBSDCatalogMemberCap - len(head); left > 0; {
+		n := min(len(line), left)
+		if _, err := io.WriteString(tw, line[:n]); err != nil {
+			t.Fatalf("tar body %s: %v", member, err)
+		}
+		left -= n
+	}
+	if _, err := io.WriteString(tw, tail); err != nil {
+		t.Fatalf("tar body %s: %v", member, err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close tar: %v", err)
+	}
+	packed := fbPack(t, "tzst", body.Bytes())
+	fbOversized.Store(kind, packed)
+	return packed
+}
+
 // fbData builds a data.pkg in the shape upstream publishes it: data.sig,
 // data.pub and a data member holding one JSON document.
 //
@@ -116,8 +190,13 @@ func fbData(t *testing.T, pack string, repoPaths ...string) []byte {
 	for i, rel := range repoPaths {
 		records = append(records, `{"name":"data`+string(rune('a'+i))+`","origin":"misc/pkg","version":"1.0","repopath":"`+rel+`"}`)
 	}
-	doc := `{"groups":[],"expired_packages":[],"packages":[` + strings.Join(records, ",") + `]}`
+	return fbDataDoc(t, pack, `{"groups":[],"expired_packages":[],"packages":[`+strings.Join(records, ",")+`]}`)
+}
 
+// fbDataDoc packs one data document under the three members data.pkg
+// publishes, whatever the document says.
+func fbDataDoc(t *testing.T, pack, doc string) []byte {
+	t.Helper()
 	var body bytes.Buffer
 	tw := tar.NewWriter(&body)
 	for _, m := range []struct{ name, content string }{
@@ -849,5 +928,218 @@ func TestConcurrentMirrorsPublishOnlyTheArchivesTheyFetched(t *testing.T) {
 	}
 	if len(left) != 0 {
 		t.Errorf("%d staging directories outlived their mirrors: %v", len(left), left)
+	}
+}
+
+// R4, R5. The member cap is a refusal, not an end of file. io.LimitReader
+// reports the end of the stream at its limit, and a catalogue reader that took
+// that for the end of the document would hand back a prefix as the
+// repository's whole object list.
+func TestCatalogMemberCapRefusesRatherThanEndingTheStream(t *testing.T) {
+	read := func(src string, limit int64) (string, error) {
+		r := &freeBSDCappedReader{r: strings.NewReader(src), limit: limit, archive: "packagesite.pkg", member: "packagesite.yaml"}
+		b, err := io.ReadAll(r)
+		return string(b), err
+	}
+	// A member of exactly the cap is complete, and reads clean.
+	if got, err := read("12345678", 8); err != nil || got != "12345678" {
+		t.Errorf("a member of exactly the cap read (%q, %v), want it whole with no error", got, err)
+	}
+	got, err := read("123456789", 8)
+	if err == nil {
+		t.Fatalf("a member past the cap read %q and reported the end of the stream", got)
+	}
+	for _, want := range []string{"packagesite.pkg", "packagesite.yaml", "8"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q: %v", want, err)
+		}
+	}
+}
+
+// R4, R5. A member the archive itself declares over the cap is refused by
+// name, before anything reads a byte of it.
+func TestArchiveMemberOverTheCapIsRefusedByName(t *testing.T) {
+	oversize := int64(freeBSDCatalogMemberCap) + 1
+	for _, tc := range []struct {
+		name, file, member string
+		read               func(archive string) ([]string, error)
+	}{
+		{"packagesite.pkg", manifest.FreeBSDCatalogFile, "packagesite.yaml",
+			func(a string) ([]string, error) { return freeBSDCatalogRepoPaths(a, "tzst") }},
+		{"data.pkg", manifest.FreeBSDDataFile, "data",
+			func(a string) ([]string, error) { return freeBSDDataRepoPaths(a, "tzst", "data") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			archive := filepath.Join(t.TempDir(), tc.file)
+			if err := os.WriteFile(archive, fbOversizedHeader(t, "tzst", tc.member, oversize), 0o644); err != nil {
+				t.Fatalf("write %s: %v", tc.file, err)
+			}
+			paths, err := tc.read(archive)
+			if err == nil {
+				t.Fatalf("an oversized %s enumerated %d paths, want a refusal", tc.member, len(paths))
+			}
+			for _, want := range []string{tc.member, fmt.Sprint(oversize), fmt.Sprint(freeBSDCatalogMemberCap)} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("the refusal does not name %q: %v", want, err)
+				}
+			}
+		})
+	}
+}
+
+// R4, R5. A member over the cap fails the mirror before any repository-root
+// file is placed, and the object named past the cap is never published as one
+// this repository holds.
+//
+// The cap is legitimate. Reading the prefix it allows, fetching that prefix's
+// objects and then publishing the untruncated archive over them is not, and
+// nothing downstream reports it: every transfer succeeds, and the archive a
+// client validates against FreeBSD's fingerprint is the real one. The
+// repository is short by whatever sat past the limit, and only the client
+// finds out.
+func TestMirrorRefusesAnOversizedCatalogueMember(t *testing.T) {
+	for _, tc := range []struct{ kind, file, member string }{
+		{"packagesite", manifest.FreeBSDCatalogFile, "packagesite.yaml"},
+		{"data", manifest.FreeBSDDataFile, "data"},
+	} {
+		t.Run(tc.file, func(t *testing.T) {
+			bodies := map[string]string{
+				manifest.FreeBSDMetaFile:    "packing_format = \"tzst\";\ndata = \"data\";\n",
+				manifest.FreeBSDCatalogFile: string(fbCatalog(t, "tzst", "a.pkg")),
+				manifest.FreeBSDDataFile:    string(fbData(t, "tzst", "a.pkg")),
+				"a.pkg":                     "the object before the cap",
+				"b.pkg":                     "the object past it",
+			}
+			bodies[tc.file] = string(fbOversizedArchive(t, tc.kind))
+			up := newFBUpstream(t, bodies)
+			cfg, store := fbFixture(t, up.URL)
+
+			sum := FetchFreeBSD(cfg, store, "")
+			if sum.Failures != 1 {
+				t.Fatalf("an oversized %s reported %d failures, want 1: %+v", tc.member, sum.Failures, sum.Results)
+			}
+			if err := sum.Results[0].Err; err == nil || !strings.Contains(err.Error(), tc.member) {
+				t.Errorf("the failure does not name the member that could not be read: %v", err)
+			}
+			repoDir := filepath.Join(cfg.BuildRoot, "freebsd", fbABI, "latest")
+			for _, root := range manifest.FreeBSDCatalogFiles {
+				if fileExists(filepath.Join(repoDir, root)) {
+					t.Errorf("%s was published over an object list that stopped at the cap", root)
+				}
+			}
+			if fileExists(filepath.Join(repoDir, "b.pkg")) {
+				t.Error("b.pkg sits past the cap, so nothing should have enumerated it")
+			}
+		})
+	}
+}
+
+// R5. The refusal keeps the generation already published, and it reaches the
+// upload the same way: an archive whose object list cannot be read is one
+// neither half of this mirror publishes.
+func TestAnUnreadableCatalogueKeepsThePublishedGeneration(t *testing.T) {
+	good := string(fbCatalog(t, "tzst", fbHashedPath))
+	oversized := string(fbOversizedArchive(t, "packagesite"))
+	data := string(fbData(t, "tzst", fbHashedPath))
+
+	var mu sync.Mutex
+	catalog := good
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		served := catalog
+		mu.Unlock()
+		switch strings.TrimPrefix(r.URL.Path, "/") {
+		case manifest.FreeBSDMetaFile:
+			_, _ = io.WriteString(w, "packing_format = \"tzst\";\n")
+		case manifest.FreeBSDCatalogFile:
+			_, _ = io.WriteString(w, served)
+		case manifest.FreeBSDDataFile:
+			_, _ = io.WriteString(w, data)
+		case fbHashedPath, "a.pkg", "b.pkg":
+			_, _ = io.WriteString(w, "package bytes")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(up.Close)
+
+	cfg, store := fbFixture(t, up.URL)
+	if sum := FetchFreeBSD(cfg, store, ""); sum.Failures != 0 {
+		t.Fatalf("the first mirror reported %d failures: %+v", sum.Failures, sum.Results)
+	}
+	published := filepath.Join(cfg.BuildRoot, "freebsd", fbABI, "latest", manifest.FreeBSDCatalogFile)
+
+	mu.Lock()
+	catalog = oversized
+	mu.Unlock()
+	cfg.Force = true
+	if sum := FetchFreeBSD(cfg, store, ""); sum.Failures != 1 {
+		t.Fatalf("a forced refresh over an unreadable catalogue reported %d failures, want 1: %+v", sum.Failures, sum.Results)
+	}
+	if got, err := os.ReadFile(published); err != nil {
+		t.Fatalf("read the published catalogue: %v", err)
+	} else if string(got) != good {
+		t.Errorf("the forced refresh replaced the published catalogue with %d bytes; a refusal keeps the generation that works", len(got))
+	}
+
+	// The upload reads its pinned copy through the same reader, so an archive
+	// that fails enumeration fails the upload rather than being published off
+	// a list nothing established.
+	if err := os.WriteFile(published, []byte(oversized), 0o644); err != nil {
+		t.Fatalf("write the unreadable catalogue into the tree: %v", err)
+	}
+	paths, release, err := FreeBSDArtifactPaths(cfg, store, "")
+	release()
+	if err == nil {
+		t.Fatalf("the upload enumerated %d paths out of an archive whose object list could not be read", len(paths))
+	}
+	if !strings.Contains(err.Error(), "packagesite.yaml") {
+		t.Errorf("the upload refusal does not name the member that could not be read: %v", err)
+	}
+}
+
+// R4, R5. A data document cut part way through is refused rather than read as
+// a complete and smaller repository. Both cuts are covered: one inside the
+// packages array, one before the key appears at all.
+//
+// Which layer refuses is deliberately not asserted. Today the decoder errors
+// on the next read; the closing-delimiter checks in freeBSDDataPackages are
+// there because More's answer on a failed read is not part of its contract,
+// and this test holds whichever of the two catches it.
+func TestATruncatedDataDocumentIsRefused(t *testing.T) {
+	whole := `{"groups":[],"packages":[{"name":"a","version":"1","repopath":"a.pkg"},{"name":"b","version":"1","repopath":"b.pkg"}]}`
+	for _, tc := range []struct{ name, doc string }{
+		{"inside the packages array", whole[:strings.Index(whole, `,{"name":"b"`)]},
+		{"before the packages key", `{"groups":[],`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			archive := filepath.Join(t.TempDir(), manifest.FreeBSDDataFile)
+			if err := os.WriteFile(archive, fbDataDoc(t, "tzst", tc.doc), 0o644); err != nil {
+				t.Fatalf("write data.pkg: %v", err)
+			}
+			paths, err := freeBSDDataRepoPaths(archive, "tzst", "data")
+			if err == nil {
+				t.Fatalf("a document cut %s enumerated %v as the repository's whole object list", tc.name, paths)
+			}
+		})
+	}
+}
+
+// R4, R5. The record cap is the other limit in this reader. bufio already
+// reports it as an error rather than as an end; what it does not report is
+// which catalogue stopped or how much of it went unread.
+func TestARecordOverTheLineCapIsRefused(t *testing.T) {
+	archive := filepath.Join(t.TempDir(), manifest.FreeBSDCatalogFile)
+	if err := os.WriteFile(archive, fbCatalog(t, "tzst", fbHashedPath, strings.Repeat("x", freeBSDCatalogLineCap+1)), 0o644); err != nil {
+		t.Fatalf("write packagesite.pkg: %v", err)
+	}
+	paths, err := freeBSDCatalogRepoPaths(archive, "tzst")
+	if err == nil {
+		t.Fatalf("a record over the cap enumerated %d paths, want a refusal", len(paths))
+	}
+	for _, want := range []string{"packagesite.yaml", fmt.Sprint(freeBSDCatalogLineCap)} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q: %v", want, err)
+		}
 	}
 }
