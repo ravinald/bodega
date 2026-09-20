@@ -384,7 +384,11 @@ func TestFreeBSDArtifactPathsPutTheCatalogueLast(t *testing.T) {
 		t.Fatalf("mirror reported %d failures: %+v", sum.Failures, sum.Results)
 	}
 
-	paths := FreeBSDArtifactPaths(cfg, store, "")
+	paths, release, err := FreeBSDArtifactPaths(cfg, store, "")
+	if err != nil {
+		t.Fatalf("enumerate the upload set: %v", err)
+	}
+	defer release()
 	if len(paths) != 5 {
 		t.Fatalf("upload set = %d paths, want 5 (three root files, two packages): %+v", len(paths), paths)
 	}
@@ -436,7 +440,12 @@ func TestMirrorSkipsAProxyModeEntry(t *testing.T) {
 	if len(up.asked) != 0 {
 		t.Errorf("upstream was asked for %v on a proxy-mode entry", up.asked)
 	}
-	if len(FreeBSDArtifactPaths(cfg, store, "")) != 0 {
+	paths, release, err := FreeBSDArtifactPaths(cfg, store, "")
+	if err != nil {
+		t.Fatalf("enumerate the upload set: %v", err)
+	}
+	defer release()
+	if len(paths) != 0 {
 		t.Error("a proxy-mode entry produced upload paths")
 	}
 }
@@ -735,5 +744,110 @@ func TestDataArchiveNamesItsOwnObjects(t *testing.T) {
 		t.Error("an archive holding no such member was accepted")
 	} else if !strings.Contains(err.Error(), "records") {
 		t.Errorf("the refusal does not name the member: %v", err)
+	}
+}
+
+// R5. Two mirrors of one repository overlap — a scheduled run meeting a
+// manual one — and upstream rebuilds between them. Each publishes the
+// archives it fetched and parsed; neither publishes the other's.
+//
+// The failure this replaces was silent in every place anyone looks: both
+// transfers succeeded, both archives were valid, and the published catalogue
+// named a package that was still in flight for the other run. The client
+// found out, part way through an install.
+func TestConcurrentMirrorsPublishOnlyTheArchivesTheyFetched(t *testing.T) {
+	catA, catB := fbCatalog(t, "tzst", "a.pkg"), fbCatalog(t, "tzst", "b.pkg")
+	dataA, dataB := fbData(t, "tzst", "a.pkg"), fbData(t, "tzst", "b.pkg")
+
+	// The rebuild is pinned to the moment the first mirror starts fetching
+	// its object: from then on upstream serves the second generation, which
+	// is the window the shared staging path published into.
+	rebuilt, secondStarted := make(chan struct{}), make(chan struct{})
+	releaseA, releaseB := make(chan struct{}), make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cat, data := catA, dataA
+		select {
+		case <-rebuilt:
+			cat, data = catB, dataB
+		default:
+		}
+		switch strings.TrimPrefix(r.URL.Path, "/") {
+		case manifest.FreeBSDMetaFile:
+			_, _ = io.WriteString(w, "packing_format = \"tzst\";\n")
+		case manifest.FreeBSDDataFile:
+			_, _ = w.Write(data)
+		case manifest.FreeBSDCatalogFile:
+			_, _ = w.Write(cat)
+		case "a.pkg":
+			close(rebuilt)
+			<-releaseA
+			_, _ = io.WriteString(w, "a.pkg")
+		case "b.pkg":
+			close(secondStarted)
+			<-releaseB
+			_, _ = io.WriteString(w, "b.pkg")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer up.Close()
+
+	cfg, _ := fbFixture(t, up.URL)
+	d := buildDirs(cfg.BuildRoot)
+	ve := manifest.VersionEntry{Version: fbABI, URL: up.URL}
+	mirror := func(done chan<- error) {
+		_, _, err := mirrorFreeBSDRepo(cfg, d, "latest", ve)
+		done <- err
+	}
+
+	firstDone, secondDone := make(chan error, 1), make(chan error, 1)
+	go mirror(firstDone)
+	<-rebuilt
+	go mirror(secondDone)
+	<-secondStarted
+
+	close(releaseA)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("the first mirror failed: %v", err)
+	}
+
+	// The second mirror is still holding b.pkg open, so anything the first
+	// mirror published has to be the generation it fetched.
+	repoDir := filepath.Join(cfg.BuildRoot, "freebsd", fbABI, "latest")
+	published, err := os.ReadFile(filepath.Join(repoDir, manifest.FreeBSDCatalogFile))
+	if err != nil {
+		t.Fatalf("read the published catalogue: %v", err)
+	}
+	if !bytes.Equal(published, catA) {
+		t.Errorf("the first mirror published %d bytes, want the %d-byte catalogue it fetched; publishing the other run's names an object that is still in flight", len(published), len(catA))
+	}
+	if !fileExists(filepath.Join(repoDir, "a.pkg")) {
+		t.Error("the published catalogue names a.pkg, which is not on disk")
+	}
+
+	close(releaseB)
+	if err := <-secondDone; err != nil {
+		t.Fatalf("the second mirror failed: %v", err)
+	}
+	published, err = os.ReadFile(filepath.Join(repoDir, manifest.FreeBSDCatalogFile))
+	if err != nil {
+		t.Fatalf("read the published catalogue after the second mirror: %v", err)
+	}
+	if !bytes.Equal(published, catB) {
+		t.Errorf("the second mirror published %d bytes, want its own %d-byte catalogue", len(published), len(catB))
+	}
+	if !fileExists(filepath.Join(repoDir, "b.pkg")) {
+		t.Error("the second catalogue names b.pkg, which is not on disk")
+	}
+
+	// The scratch areas are the mirrors' own and end with them; a staging
+	// tree that accumulated them would be a growing copy of the repository.
+	staging := filepath.Join(cfg.BuildRoot, "freebsd", freeBSDStagingDir, fbABI, "latest")
+	left, err := os.ReadDir(staging)
+	if err != nil {
+		t.Fatalf("read the staging area: %v", err)
+	}
+	if len(left) != 0 {
+		t.Errorf("%d staging directories outlived their mirrors: %v", len(left), left)
 	}
 }

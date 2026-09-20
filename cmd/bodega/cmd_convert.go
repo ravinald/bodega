@@ -56,9 +56,10 @@ Sources per type:
   cargo   cargo install --list
   helm    helm list -o json
 
-git and binary have no importer. Nothing on a host records a clone or a
-downloaded binary, so those are cataloged with 'bodega pkg create' or found by
-running the server with discover_mode set to "observe".
+git, binary and freebsd have no importer. Nothing on the host bodega runs on
+records a clone, a downloaded binary or an upstream pkg repository, so those
+are cataloged with 'bodega pkg create' or found by running the server with
+discover_mode set to "observe".
 
 Examples:
   dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\t${source:Package}\n' | bodega pkg convert apt > catalog.json

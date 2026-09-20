@@ -18,7 +18,8 @@ import (
 // catalogue record's own repopath.
 //
 // Nothing here transforms a byte. packagesite.pkg and data.pkg are zstd
-// tarballs carrying packagesite.yaml.sig and packagesite.yaml.pub as members,
+// tarballs, each carrying its own signature and public key as members —
+// packagesite.yaml.sig and .pub in one, data.sig and data.pub in the other —
 // so the archive is its own attestation: copied intact it validates against
 // the stock fingerprint every FreeBSD host already ships, and bodega
 // configures no key and asks the client to trust none. Recompressing,

@@ -28,6 +28,7 @@ been completed yet.
   npm     No-op (the server generates the packument from the manifest entry)
   gomod   No-op (the downloaded module zip is already the artifact)
   cargo   No-op (the downloaded crate tarball is already the artifact)
+  freebsd No-op (fetch mirrors the repository; nothing here may touch its bytes)
 
 helm packages across the whole type rather than per entry, because index.yaml
 is repository metadata: naming one entry regenerates everything.

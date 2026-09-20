@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -31,9 +30,10 @@ import (
 // fingerprint onto every client, which is why nothing here re-tars or
 // recompresses.
 
-// freeBSDStagingDir is where a catalogue lands before its objects are
-// fetched. It sits beside the mirrored repositories rather than inside one, so
-// FreeBSDArtifactPaths cannot pick a half-fetched catalogue up off the tree.
+// freeBSDStagingDir holds the scratch areas a mirror and an upload own for
+// the length of one call. It sits beside the mirrored repositories rather
+// than inside one, so FreeBSDArtifactPaths cannot pick a half-fetched
+// catalogue up off the tree.
 const freeBSDStagingDir = ".staging"
 
 // freeBSDRepoDir is where one mirrored repository lives on disk. The layout is
@@ -43,9 +43,30 @@ func freeBSDRepoDir(d dirs, repo string, ve manifest.VersionEntry) string {
 	return filepath.Join(d.freebsd, ve.Version, repo)
 }
 
-// freeBSDStagingRepoDir is the same repository's staging area.
-func freeBSDStagingRepoDir(d dirs, repo string, ve manifest.VersionEntry) string {
-	return filepath.Join(d.freebsd, freeBSDStagingDir, ve.Version, repo)
+// freeBSDScratch creates a directory this call alone writes, under the
+// repository's staging area, and returns it with the remove that ends its
+// life.
+//
+// Unique per call rather than one path per repository. Two mirrors of the
+// same repository overlap whenever a scheduled run meets a manual one, and a
+// shared staging path gave both of them the same three filenames: the first
+// to finish renamed whichever bytes were there, which is the second run's
+// catalogue naming objects the second run has not fetched yet. Nothing
+// reports that — every transfer succeeded and both archives are valid — and
+// the client is the one that finds out, halfway through an install. A
+// directory nobody else can name is what makes "the archives this call
+// publishes are the archives this call parsed" true across processes as well
+// as goroutines, without a lock the CLI has nowhere to hold.
+func freeBSDScratch(d dirs, repo string, ve manifest.VersionEntry, prefix string) (string, func(), error) {
+	base := filepath.Join(d.freebsd, freeBSDStagingDir, ve.Version, repo)
+	if err := mkdirAll(base); err != nil {
+		return "", func() {}, err
+	}
+	dir, err := os.MkdirTemp(base, prefix+"-")
+	if err != nil {
+		return "", func() {}, fmt.Errorf("stage %s@%s under %s: %w", repo, ve.Version, base, err)
+	}
+	return dir, func() { _ = os.RemoveAll(dir) }, nil
 }
 
 // freeBSDCatalogPath is the local path of the catalogue archive, which is what
@@ -126,7 +147,7 @@ func FetchFreeBSD(cfg *Config, store *manifest.Store, entryFilter string) *Summa
 
 			result := Result{Type: manifest.TypeFreeBSD, Name: repo}
 			start := time.Now()
-			artifacts, err := mirrorFreeBSDRepo(cfg, d, repo, ve)
+			artifacts, digest, err := mirrorFreeBSDRepo(cfg, d, repo, ve)
 			result.Artifacts = artifacts
 			result.Err = err
 			result.Elapsed = time.Since(start)
@@ -136,9 +157,12 @@ func FetchFreeBSD(cfg *Config, store *manifest.Store, entryFilter string) *Summa
 				status = "failure"
 				summary.Failures++
 			} else {
-				catalog := freeBSDCatalogPath(d, repo, ve)
-				digest, _ := computeFileSHA256(catalog)
-				stampFetchRecord(ctx, store, manifest.TypeFreeBSD, repo, ve, catalog, digest, nil)
+				// The digest is the one mirrorFreeBSDRepo took of the bytes it
+				// published, not one read back off the tree: an overlapping
+				// run can have replaced the file by now, and a fetch record
+				// naming another run's catalogue is a record that verifies
+				// against nothing.
+				stampFetchRecord(ctx, store, manifest.TypeFreeBSD, repo, ve, freeBSDCatalogPath(d, repo, ve), digest, nil)
 			}
 			summary.Results = append(summary.Results, result)
 			summary.Total++
@@ -150,19 +174,20 @@ func FetchFreeBSD(cfg *Config, store *manifest.Store, entryFilter string) *Summa
 }
 
 // mirrorFreeBSDRepo copies one repository and returns every local file it
-// wrote, catalogue last.
-func mirrorFreeBSDRepo(cfg *Config, d dirs, repo string, ve manifest.VersionEntry) ([]string, error) {
+// wrote, catalogue last, with the SHA-256 of the catalogue it published.
+func mirrorFreeBSDRepo(cfg *Config, d dirs, repo string, ve manifest.VersionEntry) ([]string, string, error) {
 	base := freeBSDRepoURL(ve)
 	if base == "" {
-		return nil, fmt.Errorf("freebsd %s@%s records no url; set it to the repository root a pkg client would be pointed at, for example https://pkg.freebsd.org/%s/%s",
+		return nil, "", fmt.Errorf("freebsd %s@%s records no url; set it to the repository root a pkg client would be pointed at, for example https://pkg.freebsd.org/%s/%s",
 			repo, ve.Version, ve.Version, repo)
 	}
 	out := cfg.entryWriter(manifest.TypeFreeBSD, repo)
 	repoDir := freeBSDRepoDir(d, repo, ve)
-	staging := freeBSDStagingRepoDir(d, repo, ve)
-	if err := mkdirAll(staging); err != nil {
-		return nil, err
+	staging, releaseStaging, err := freeBSDScratch(d, repo, ve, "mirror")
+	if err != nil {
+		return nil, "", err
 	}
+	defer releaseStaging()
 
 	// The catalogue is fetched first because it is the only thing that says
 	// which objects exist, and staged rather than placed because nothing it
@@ -173,24 +198,9 @@ func mirrorFreeBSDRepo(cfg *Config, d dirs, repo string, ve manifest.VersionEntr
 		dest := filepath.Join(staging, name)
 		_, _ = fmt.Fprintf(out, "  [freebsd] %s@%s: fetching %s\n", repo, ve.Version, base+"/"+name)
 		if err := freeBSDDownload(ctx, dest, base+"/"+name); err != nil {
-			return nil, fmt.Errorf("fetch %s for %s@%s: %w", name, repo, ve.Version, err)
+			return nil, "", fmt.Errorf("fetch %s for %s@%s: %w", name, repo, ve.Version, err)
 		}
 		staged = append(staged, dest)
-	}
-
-	meta, err := os.ReadFile(filepath.Join(staging, manifest.FreeBSDMetaFile)) //nolint:gosec // G304: composed under the build root.
-	if err != nil {
-		return nil, fmt.Errorf("read staged meta.conf for %s@%s: %w", repo, ve.Version, err)
-	}
-	format, err := freeBSDPackingFormat(meta)
-	if err != nil {
-		return nil, fmt.Errorf("%s@%s: %w", repo, ve.Version, err)
-	}
-	_, _ = fmt.Fprintf(out, "  [freebsd] %s@%s: packing_format is %q\n", repo, ve.Version, format)
-
-	dataMember, err := freeBSDDataMember(meta)
-	if err != nil {
-		return nil, fmt.Errorf("%s@%s: %w", repo, ve.Version, err)
 	}
 
 	// Both archives, not the catalogue alone. data.pkg carries its own record
@@ -200,13 +210,12 @@ func mirrorFreeBSDRepo(cfg *Config, d dirs, repo string, ve manifest.VersionEntr
 	// what packagesite.pkg named leaves data.pkg describing a generation whose
 	// objects were never fetched, and the ordering rule does not help: copying
 	// it last still copies it.
-	repoPaths, err := freeBSDMirrorSet(
-		filepath.Join(staging, manifest.FreeBSDCatalogFile),
-		filepath.Join(staging, manifest.FreeBSDDataFile), format, dataMember)
+	repoPaths, format, err := freeBSDPublicationSet(staging)
 	if err != nil {
-		return nil, fmt.Errorf("%s@%s: %w", repo, ve.Version, err)
+		return nil, "", fmt.Errorf("%s@%s: %w", repo, ve.Version, err)
 	}
-	_, _ = fmt.Fprintf(out, "  [freebsd] %s@%s: the two catalogues name %d objects between them\n", repo, ve.Version, len(repoPaths))
+	_, _ = fmt.Fprintf(out, "  [freebsd] %s@%s: packing_format is %q; the two catalogues name %d objects between them\n",
+		repo, ve.Version, format, len(repoPaths))
 
 	written := make([]string, 0, len(repoPaths)+len(manifest.FreeBSDCatalogFiles))
 	for _, rel := range repoPaths {
@@ -216,27 +225,63 @@ func mirrorFreeBSDRepo(cfg *Config, d dirs, repo string, ve manifest.VersionEntr
 			continue
 		}
 		if err := mkdirAll(filepath.Dir(dest)); err != nil {
-			return written, err
+			return written, "", err
 		}
 		if err := freeBSDDownload(ctx, dest, base+"/"+rel); err != nil {
-			return written, fmt.Errorf("fetch %s for %s@%s: %w", rel, repo, ve.Version, err)
+			return written, "", fmt.Errorf("fetch %s for %s@%s: %w", rel, repo, ve.Version, err)
 		}
 		written = append(written, dest)
 	}
 
+	// Taken from the staged file rather than from the tree, and taken before
+	// the rename: after it, the catalogue at that path may be another run's.
+	digest, err := computeFileSHA256(filepath.Join(staging, manifest.FreeBSDCatalogFile))
+	if err != nil {
+		return written, "", fmt.Errorf("digest the staged catalogue for %s@%s: %w", repo, ve.Version, err)
+	}
+
 	// Every object is on disk, so the catalogue may now describe the tree.
 	if err := mkdirAll(repoDir); err != nil {
-		return written, err
+		return written, "", err
 	}
 	for i, name := range manifest.FreeBSDCatalogFiles {
 		dest := filepath.Join(repoDir, name)
 		if err := os.Rename(staged[i], dest); err != nil {
-			return written, fmt.Errorf("place %s for %s@%s: %w", name, repo, ve.Version, err)
+			return written, "", fmt.Errorf("place %s for %s@%s: %w", name, repo, ve.Version, err)
 		}
 		written = append(written, dest)
 	}
 	_, _ = fmt.Fprintf(out, "  [freebsd] %s@%s: ok\n", repo, ve.Version)
-	return written, nil
+	return written, digest, nil
+}
+
+// freeBSDPublicationSet is every object the three archives in dir name between
+// them: the codec and the data member come out of that directory's own
+// meta.conf, and both archives beside it are read.
+//
+// One directory in, one object list out. A mirror reads its staging area and
+// an upload reads its pinned copy, and neither can be handed a path a
+// concurrent run rewrites underneath it.
+func freeBSDPublicationSet(dir string) ([]string, string, error) {
+	meta, err := os.ReadFile(filepath.Join(dir, manifest.FreeBSDMetaFile)) //nolint:gosec // G304: composed by this package under the build root.
+	if err != nil {
+		return nil, "", fmt.Errorf("read %s: %w", filepath.Join(dir, manifest.FreeBSDMetaFile), err)
+	}
+	format, err := freeBSDPackingFormat(meta)
+	if err != nil {
+		return nil, "", err
+	}
+	dataMember, err := freeBSDDataMember(meta)
+	if err != nil {
+		return nil, "", err
+	}
+	paths, err := freeBSDMirrorSet(
+		filepath.Join(dir, manifest.FreeBSDCatalogFile),
+		filepath.Join(dir, manifest.FreeBSDDataFile), format, dataMember)
+	if err != nil {
+		return nil, "", err
+	}
+	return paths, format, nil
 }
 
 // freeBSDDownload copies one upstream file to dest, and either writes every
@@ -314,17 +359,39 @@ func freeBSDDownload(ctx context.Context, dest, url string) error {
 	return nil
 }
 
-// FreeBSDArtifactPaths returns local/object-key pairs ready for upload, every
-// mirrored object first and the catalogue files last.
+// FreeBSDArtifactPaths returns local/object-key pairs ready for upload — every
+// object the mirrored catalogue names first, the three repository-root files
+// last — together with the release that ends the returned paths' lives.
 //
-// UploadPaths writes the slice in order, so this ordering is what keeps the
-// published catalogue from ever naming an object the backend does not hold.
-// The reverse — an object uploaded ahead of the catalogue that names it — is
-// invisible to a client, which reads the catalogue first and will not ask for
-// what it has not been told about.
-func FreeBSDArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) []ArtifactPath {
+// The archives are pinned: copied out of the tree into a directory this call
+// owns, and the object list read back out of those copies rather than off a
+// walk of the repository. Enumeration and upload are separated by however long
+// the objects take to write, and a forced mirror landing in that window
+// replaces the catalogue under the very path the caller is still holding. The
+// upload then publishes a generation it never enumerated, whose new objects
+// are in nobody's list — with the catalogue-last ordering satisfied, every
+// transfer successful, and the repository broken. Sorting cannot fix a stale
+// list; only holding the bytes can.
+//
+// Reading the object list out of the pinned archives rather than off the tree
+// is the other half. A walk uploads what happens to be on disk, which is a
+// superset on a good day and a subset on a bad one; the pinned archives are
+// the document a client reads, so what they name is what has to be in the
+// backend before they are. An object they name that is not on disk fails the
+// call, because the alternative is publishing a catalogue that resolves an
+// install and then 404s.
+//
+// The caller must run release when the upload is over. Afterwards the
+// catalogue paths name nothing.
+func FreeBSDArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) ([]ArtifactPath, func(), error) {
 	ctx := context.Background()
 	d := buildDirs(cfg.rootFor(manifest.TypeFreeBSD))
+	var pins []func()
+	release := func() {
+		for _, remove := range pins {
+			remove()
+		}
+	}
 	var objects, catalog []ArtifactPath
 
 	for _, repo := range store.ListPackages(manifest.TypeFreeBSD) {
@@ -337,36 +404,96 @@ func FreeBSDArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string
 		}
 		for _, ve := range pm.Versions {
 			repoDir := freeBSDRepoDir(d, repo, ve)
-			_ = filepath.WalkDir(repoDir, func(p string, entry fs.DirEntry, err error) error {
-				if err != nil || entry.IsDir() {
-					return nil //nolint:nilerr // an unreadable subtree is nothing to upload, not a failed upload.
-				}
-				rel, relErr := filepath.Rel(repoDir, p)
-				if relErr != nil {
-					return nil
-				}
-				repoPath := filepath.ToSlash(rel)
-				ap := ArtifactPath{
-					Local:     p,
-					ObjectKey: manifest.FreeBSDKey(ve.Version, pm.Name, repoPath),
-					Package:   repo,
-					Version:   ve.Version,
-				}
-				if slices.Contains(manifest.FreeBSDCatalogFiles, repoPath) {
-					catalog = append(catalog, ap)
-					return nil
-				}
-				objects = append(objects, ap)
-				return nil
-			})
+			if !fileExists(filepath.Join(repoDir, manifest.FreeBSDCatalogFile)) {
+				// No catalogue is no snapshot: a proxy-mode entry, or one
+				// whose mirror failed before the catalogue was placed. Either
+				// way there is no generation to publish, and the objects
+				// beneath it belong to no document.
+				continue
+			}
+			pin, remove, err := freeBSDPin(d, repo, ve, repoDir)
+			if err != nil {
+				release()
+				return nil, func() {}, err
+			}
+			pins = append(pins, remove)
+
+			objs, roots, err := freeBSDUploadSet(pm.Name, repo, ve, repoDir, pin)
+			if err != nil {
+				release()
+				return nil, func() {}, err
+			}
+			objects = append(objects, objs...)
+			catalog = append(catalog, roots...)
 		}
 	}
 
 	// Sorted within each half so an upload is reproducible; the two halves
-	// stay in this order whatever the walk returned.
+	// stay in this order whatever the enumeration returned.
 	slices.SortFunc(objects, func(a, b ArtifactPath) int { return strings.Compare(a.ObjectKey, b.ObjectKey) })
 	freeBSDSortCatalog(catalog)
-	return append(objects, catalog...)
+	return append(objects, catalog...), release, nil
+}
+
+// freeBSDPin copies one repository's three root files into a directory this
+// call owns, and returns it with the remove that ends its life.
+//
+// Copied rather than linked or referenced: the point is bytes no other run can
+// replace, and a hard link to a path a rename is about to take over is the
+// same file under a different name only until the rename lands.
+//
+// The three are copied one at a time, so a mirror publishing mid-copy can
+// leave the pin holding two generations. That fails closed rather than
+// silently: the object check below is against whatever the pinned archives
+// name, so a mixed pin either names objects that are all on disk — both
+// generations placed theirs before publishing — or fails the enumeration by
+// name. A packing_format that differed between the two would fail in the
+// reader instead, which is the same answer arrived at earlier.
+func freeBSDPin(d dirs, repo string, ve manifest.VersionEntry, repoDir string) (string, func(), error) {
+	pin, remove, err := freeBSDScratch(d, repo, ve, "upload")
+	if err != nil {
+		return "", func() {}, err
+	}
+	for _, name := range manifest.FreeBSDCatalogFiles {
+		if err := copyFile(filepath.Join(repoDir, name), filepath.Join(pin, name)); err != nil {
+			remove()
+			return "", func() {}, fmt.Errorf("pin %s for freebsd %s@%s: %w. "+
+				"A mirrored repository holds all three root files; re-run `bodega build fetch freebsd %s`", name, repo, ve.Version, err, repo)
+		}
+	}
+	return pin, remove, nil
+}
+
+// freeBSDUploadSet is the object half and the repository-root half of one
+// entry's upload, read out of its pinned archives.
+func freeBSDUploadSet(name, repo string, ve manifest.VersionEntry, repoDir, pin string) (objects, roots []ArtifactPath, err error) {
+	repoPaths, _, err := freeBSDPublicationSet(pin)
+	if err != nil {
+		return nil, nil, fmt.Errorf("freebsd %s@%s: %w", repo, ve.Version, err)
+	}
+	for _, rel := range repoPaths {
+		local := filepath.Join(repoDir, filepath.FromSlash(rel))
+		if !fileExists(local) {
+			return nil, nil, fmt.Errorf("freebsd %s@%s: the mirrored catalogue names %s, but %s is not on disk. "+
+				"Uploading it would publish a repository whose client resolves that package and then 404s, so nothing was uploaded for this entry. "+
+				"Re-run `bodega build fetch freebsd %s force` and upload again", repo, ve.Version, rel, local, repo)
+		}
+		objects = append(objects, ArtifactPath{
+			Local:     local,
+			ObjectKey: manifest.FreeBSDKey(ve.Version, name, rel),
+			Package:   repo,
+			Version:   ve.Version,
+		})
+	}
+	for _, root := range manifest.FreeBSDCatalogFiles {
+		roots = append(roots, ArtifactPath{
+			Local:     filepath.Join(pin, root),
+			ObjectKey: manifest.FreeBSDKey(ve.Version, name, root),
+			Package:   repo,
+			Version:   ve.Version,
+		})
+	}
+	return objects, roots, nil
 }
 
 // freeBSDSortCatalog puts the repository-root files in manifest's own order,

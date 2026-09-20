@@ -416,7 +416,11 @@ func (p *Placer) UploadType(ctx context.Context, bcfg *builder.Config, typ strin
 		return n, nil
 	}
 
-	paths := ArtifactPaths(bcfg, p.store, typ, p.only)
+	paths, release, err := ArtifactPaths(bcfg, p.store, typ, p.only)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
 	if len(paths) == 0 {
 		// Naming the directory is what separates "nothing was built" from
 		// "this command resolved a different root than the build did".
@@ -428,29 +432,35 @@ func (p *Placer) UploadType(ctx context.Context, bcfg *builder.Config, typ strin
 }
 
 // ArtifactPaths returns every local artifact of one type that is ready to
-// upload, per version. entryFilter limits the walk to one package.
+// upload, per version, with the release the caller runs once the upload is
+// over. entryFilter limits the walk to one package.
 //
-// pypi is absent on purpose and returns nothing: its wheels have no
-// per-version object key, so they upload through ForType and SyncDir. Every
-// other type answers here, which is what lets one caller cover the rest.
-func ArtifactPaths(cfg *builder.Config, store *manifest.Store, typ, entryFilter string) []builder.ArtifactPath {
+// The release and the error are freebsd's. Its paths are not a plain walk of
+// the tree: the catalogue archives are pinned first, so that the upload writes
+// the generation it enumerated rather than whichever one a concurrent mirror
+// has published by the time PutFile opens the file. Every other type reads
+// files nothing rewrites underneath it, so each returns a no-op release and no
+// error. pypi is absent on purpose and returns nothing: its wheels have no
+// per-version object key, so they upload through ForType and SyncDir.
+func ArtifactPaths(cfg *builder.Config, store *manifest.Store, typ, entryFilter string) ([]builder.ArtifactPath, func(), error) {
+	noRelease := func() {}
 	switch typ {
 	case manifest.TypeBinary:
-		return builder.BinaryArtifactPaths(cfg, store, entryFilter)
+		return builder.BinaryArtifactPaths(cfg, store, entryFilter), noRelease, nil
 	case manifest.TypeGit:
-		return builder.GitArtifactPaths(cfg, store, entryFilter)
+		return builder.GitArtifactPaths(cfg, store, entryFilter), noRelease, nil
 	case manifest.TypeApt:
-		return builder.AptArtifactPaths(cfg, store, entryFilter)
+		return builder.AptArtifactPaths(cfg, store, entryFilter), noRelease, nil
 	case manifest.TypeGomod:
-		return builder.GomodArtifactPaths(cfg, store, entryFilter)
+		return builder.GomodArtifactPaths(cfg, store, entryFilter), noRelease, nil
 	case manifest.TypeHelm:
-		return builder.HelmArtifactPaths(cfg, store, entryFilter)
+		return builder.HelmArtifactPaths(cfg, store, entryFilter), noRelease, nil
 	case manifest.TypeNpm:
-		return builder.NpmArtifactPaths(cfg, store, entryFilter)
+		return builder.NpmArtifactPaths(cfg, store, entryFilter), noRelease, nil
 	case manifest.TypeCargo:
-		return builder.CargoArtifactPaths(cfg, store, entryFilter)
+		return builder.CargoArtifactPaths(cfg, store, entryFilter), noRelease, nil
 	case manifest.TypeFreeBSD:
 		return builder.FreeBSDArtifactPaths(cfg, store, entryFilter)
 	}
-	return nil
+	return nil, noRelease, nil
 }
