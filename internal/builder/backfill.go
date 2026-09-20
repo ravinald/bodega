@@ -93,8 +93,15 @@ func artifactPathForVersion(cfg *Config, typ, name string, ve manifest.VersionEn
 	case manifest.TypeNpm:
 		d := buildDirs(cfg.rootFor(typ))
 		return npmTarballPath(d, name, ve)
-	default:
-		// apt and pypi use globs / multiple files; skip for now.
+	case manifest.TypeCargo:
+		d := buildDirs(cfg.rootFor(typ))
+		return cargoCratePath(d, name, ve)
+	case manifest.TypeApt, manifest.TypePypi:
+		// One entry maps to several files matched by glob, so there is no
+		// single path to return. Named rather than left to a default: a type
+		// landing here by omission gets the same silent skip as one that
+		// belongs here, which is how cargo went unbackfilled.
 		return ""
 	}
+	return ""
 }

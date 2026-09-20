@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -70,4 +71,23 @@ func fieldLabels(fields []formField) string {
 		labels = append(labels, f.Label)
 	}
 	return strings.Join(labels, ",")
+}
+
+// The audit query's package-type filter was hardcoded to eight values and lost
+// cargo when cargo landed. Unlike the create form's list, nothing held it to
+// anything, so the filter silently returned no rows for the missing type.
+func TestAuditTypeOptionsCoverEveryType(t *testing.T) {
+	got := auditTypeOptions()
+	if len(got) == 0 || got[0] != "" {
+		t.Fatalf("auditTypeOptions()[0] = %q, want an empty first entry meaning any type", got[0])
+	}
+	for _, typ := range manifest.AllTypes {
+		if !slices.Contains(got, typ) {
+			t.Errorf("the audit type filter omits %q, so a query for it returns nothing", typ)
+		}
+	}
+	if len(got) != len(manifest.AllTypes)+1 {
+		t.Errorf("auditTypeOptions() has %d entries, want %d: AllTypes plus the any-type blank",
+			len(got), len(manifest.AllTypes)+1)
+	}
 }
