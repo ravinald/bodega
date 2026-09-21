@@ -255,6 +255,22 @@ func mirrorFreeBSDRepo(cfg *Config, d dirs, repo string, ve manifest.VersionEntr
 	return written, digest, nil
 }
 
+// FreeBSDRepoPaths is every object the three repository-root files in dir name
+// between them, read out of those files and nothing else.
+//
+// It exists for 'bodega pkg move', which republishes a mirrored repository
+// into another backend and so needs the same answer the mirror and the upload
+// already build from: what the archives about to be published name. A prefix
+// listing of the source cannot answer it, because a listing is a snapshot of
+// whatever the backend held at that instant rather than of the document that
+// is going to be served, and the two diverge the moment an upload lands
+// between them. The caller owns dir and must hold copies nobody else can
+// replace; see freeBSDPin for what that costs and why.
+func FreeBSDRepoPaths(dir string) ([]string, error) {
+	paths, _, err := freeBSDPublicationSet(dir)
+	return paths, err
+}
+
 // freeBSDPublicationSet is every object the three archives in dir name between
 // them: the codec and the data member come out of that directory's own
 // meta.conf, and both archives beside it are read.

@@ -718,7 +718,7 @@ bodega pkg move git widget@v4.5.5 --to bulk
 bodega pkg move gomod example.com/example-corp/widget-sdk@v1.30.0 --to archive --delete-source
 ```
 
-Movable types: `binary`, `npm`, `cargo`, `gomod`, `helm`, `apt`, `git`. See [pypi is not movable](#pypi-is-not-movable) for the one that is not.
+Movable types: `binary`, `npm`, `cargo`, `gomod`, `helm`, `apt`, `git`, `freebsd`. See [pypi is not movable](#pypi-is-not-movable) for the one that is not, and [a freebsd move is a republication](#a-freebsd-move-is-a-republication) for the one that does not follow the order above.
 
 Order is the design:
 
@@ -740,6 +740,20 @@ binary/example-tool-v2: backends "default" and "mirror" are the same location (f
 ```
 
 Both names are in the message because the configuration is deliberate: two names for one place is a documented way to stage a migration, so the operator needs to know which half to repoint. `Load` rejects a colliding name but not a colliding path, and does not warn about one either — see [Named backends](#named-backends-and-per-type-placement). Each object would be read and written at the same key, the verify would re-read what it had just overwritten and pass, and `--delete-source` would then remove the artifact the manifest points at. Both backends answer a missing object with "not found", so nothing afterwards could tell it had ever existed.
+
+#### a freebsd move is a republication
+
+A `freebsd` version is a whole mirrored repository, so the order above does not describe it. Every other type moves one artifact that stands on its own; a repository is two archives and everything they name, and a client reads the archives to find the rest. So the move copies the three repository-root files out of the source into `build_root` first, reads the object set out of **those copies**, writes and verifies every `repopath` they name at the destination, and publishes the root files last — `meta.conf`, `data.pkg`, `packagesite.pkg`, in the order a client reads them.
+
+It does not list the source prefix. A listing answers "what is under this prefix right now", which is the right question for `bodega build status` and for `pkg delete` and is not the set a document names. A `bodega build upload freebsd` landing between the listing and the copy gives the move one generation's object list and another generation's catalogue bytes, and nothing downstream can tell: a `freebsd` entry carries no `checksum`, two generations of one repository routinely have identical archive sizes, and both commands exit 0. Copies of the archives, taken before anything is enumerated, are the only version of them no concurrent writer can replace.
+
+Everything that can refuse runs before the first byte reaches the destination's repository root, including the `artifact_size` and `checksum` check against the copied `packagesite.pkg`. A refused move leaves the destination serving whatever generation it was already serving and the manifest still pointing at the source:
+
+```text
+latest@FreeBSD:14:amd64: the archives on "default" name All/Hashed/zogftw-2025.02.23_1~2$snxfrbid.pkg, which is not there. Publishing it on "bulk" would hand a client a repository that resolves that package and then 404s, so nothing was written to "bulk" and the manifest still points at "default". Re-run `bodega build fetch freebsd latest force` and `bodega build upload freebsd`, then move again
+```
+
+Objects on the source that neither archive names are not copied, for the same reason the upload does not upload them: no client can ask for them. `--delete-source` therefore removes what the move wrote and leaves those behind, and it removes `packagesite.pkg` first, so the window it opens on the source is a client told there is no such repository rather than one that resolves a package out of a live catalogue and cannot fetch it.
 
 #### pypi is not movable
 
@@ -3295,6 +3309,7 @@ A catalogue that lands ahead of the objects it names is a repository where `pkg 
 - `bodega build upload` copies the three repository-root files out of the tree first and uploads those copies, reading the object list out of them rather than off a directory walk. Enumerating the upload set and opening its files are separated by however long the objects take to write, and a mirror landing in that window replaces the catalogue under a path the upload is still holding: the bytes published would then be a generation whose new objects are in nobody's upload list, with the ordering below satisfied and the repository still broken.
 - Within that upload every object lands before any repository-root file, and `packagesite.pkg` last of all. An object the pinned catalogue names that is not on disk fails the enumeration with the entry, the object and the consequence in the message, and nothing is uploaded for that entry — the previously published generation stays the one clients read. Objects in the tree that the catalogue does not name are not uploaded: no client can ask for them.
 - That upload resolves its storage backend once per repository and ABI, and writes every object and all three root files there. Every other type resolves placement per artifact, which is right where an artifact stands alone; a pkg catalogue does not, so an operator repointing the entry with `--storage` or a manifest edit while an upload of it runs sees that upload finish where it started and the next one honor the new name. A catalogue published into a backend holding another run's objects is a repository whose every `repopath` resolves to a 404.
+- `bodega pkg move` republishes the repository rather than copying a key list: it copies the three root files out of the source backend first, enumerates the object set from those copies, writes every object to the destination, and publishes the root files last. See [a freebsd move is a republication](#a-freebsd-move-is-a-republication).
 - A **hosted** entry's catalogue is never fetched from upstream on a miss. Upstream's catalogue is by construction newer than this mirror's objects and names packages the store has never held, so a miss answers 404 and `pkg` reports the repository as unavailable rather than installing half a transaction. Objects on a hosted entry may still be proxied: an object arriving late can only complete an install, never break one.
 
 A **proxy**-mode entry holds no snapshot, so both halves come from upstream per request and are self-consistent; there is no skew for the ordering rule to prevent.
