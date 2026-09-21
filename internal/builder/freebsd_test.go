@@ -1421,3 +1421,96 @@ func TestEveryPathTheMirrorAdmitsIsOneTheRouteServes(t *testing.T) {
 		}
 	}
 }
+
+// fbUploadKeys is the repository-relative path of everything an upload of the
+// generated repository would place.
+func fbUploadKeys(t *testing.T, cfg *Config, store *manifest.Store) []string {
+	t.Helper()
+	paths, release, err := FreeBSDArtifactPaths(cfg, store, "")
+	if release != nil {
+		defer release()
+	}
+	if err != nil {
+		t.Fatalf("enumerate the upload set: %v", err)
+	}
+	var out []string
+	for _, ap := range paths {
+		out = append(out, strings.TrimPrefix(ap.ObjectKey, manifest.FreeBSDRepoPrefix(fbABI, "house")))
+	}
+	slices.Sort(out)
+	return out
+}
+
+// fbSymlink points rel at target inside the repository tree.
+func fbSymlink(t *testing.T, cfg *Config, rel, target string) {
+	t.Helper()
+	repoDir := filepath.Join(buildDirs(cfg.rootFor(manifest.TypeFreeBSD)).freebsd, fbABI, "house")
+	link := filepath.Join(repoDir, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+		t.Fatalf("create %s: %v", filepath.Dir(link), err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("link %s: %v", rel, err)
+	}
+}
+
+// R1: a second name for a package the upload already carries is skipped.
+//
+// poudriere publishes most of a tree twice — Latest/pkg.pkg, and an ordinary
+// name beside every hashed one — and WalkDir reports a link as an entry of its
+// own while PutFile stores the bytes it points at. Uploading both puts one
+// package under two keys, and the generated catalogue then carries two records
+// pkg hashes alike: `pkg update` fails on
+// "UNIQUE constraint failed: packages.manifestdigest" for the whole
+// repository. pkg's own walk skips the same links (2.8.2,
+// libpkg/pkg_repo_create.c:216).
+func TestGeneratedUploadSkipsASecondNameForAPackage(t *testing.T) {
+	cfg, store := fbGeneratedFixture(t, map[string]string{fbHashedPath: "a package"})
+	repoDir := filepath.Join(buildDirs(cfg.rootFor(manifest.TypeFreeBSD)).freebsd, fbABI, "house")
+	fbSymlink(t, cfg, "All/widget-2025.02.23_1.pkg", filepath.Join(repoDir, filepath.FromSlash(fbHashedPath)))
+	fbSymlink(t, cfg, "Latest/widget.pkg", filepath.Join(repoDir, filepath.FromSlash(fbHashedPath)))
+
+	if got := fbUploadKeys(t, cfg, store); !slices.Equal(got, []string{fbHashedPath}) {
+		t.Fatalf("upload set = %v, want the package alone: its two aliases are the same bytes under other names", got)
+	}
+}
+
+// The same link, reached through a relative target and through a build root
+// that is itself a symlink — /var is /private/var on macOS, and a tree
+// assembled with `ln -s` carries relative targets. Both resolve inside the
+// repository and neither may upload twice.
+func TestGeneratedUploadResolvesBothSidesBeforeComparing(t *testing.T) {
+	cfg, store := fbGeneratedFixture(t, map[string]string{"All/widget-1.2.0.pkg": "a package"})
+	fbSymlink(t, cfg, "All/widget.pkg", "widget-1.2.0.pkg")
+
+	if got := fbUploadKeys(t, cfg, store); !slices.Equal(got, []string{"All/widget-1.2.0.pkg"}) {
+		t.Fatalf("upload set = %v, want the package alone: a relative link into the repository is a second name for it", got)
+	}
+}
+
+// A link out of the tree is the only name those bytes have here, so it is
+// followed — which is what pkg's own walk does with one.
+func TestGeneratedUploadFollowsALinkOutOfTheRepository(t *testing.T) {
+	cfg, store := fbGeneratedFixture(t, nil)
+	outside := filepath.Join(t.TempDir(), "widget-1.2.0.pkg")
+	if err := os.WriteFile(outside, []byte("a package built elsewhere"), 0o644); err != nil {
+		t.Fatalf("write %s: %v", outside, err)
+	}
+	fbSymlink(t, cfg, "All/widget-1.2.0.pkg", outside)
+
+	if got := fbUploadKeys(t, cfg, store); !slices.Equal(got, []string{"All/widget-1.2.0.pkg"}) {
+		t.Fatalf("upload set = %v, want the linked package: nothing else in the repository names those bytes", got)
+	}
+}
+
+// A dead link is named and skipped rather than failing the upload. A
+// repository tree is whatever an operator rsynced into it, and one broken link
+// is not a reason to publish none of the packages beside it.
+func TestGeneratedUploadSkipsADeadLink(t *testing.T) {
+	cfg, store := fbGeneratedFixture(t, map[string]string{fbHashedPath: "a package"})
+	fbSymlink(t, cfg, "All/widget-gone.pkg", filepath.Join(t.TempDir(), "never-written.pkg"))
+
+	if got := fbUploadKeys(t, cfg, store); !slices.Equal(got, []string{fbHashedPath}) {
+		t.Fatalf("upload set = %v, want the package alone", got)
+	}
+}

@@ -337,7 +337,7 @@ func freeBSDObjectFingerprint(paths []string) string {
 // buildFreeBSDCatalog reads every package and renders the three root files.
 func (s *Server) buildFreeBSDCatalog(ctx context.Context, store storage.ObjectStore, abi, repo string, packages []string, sign *pkgSigning, objects string) (*freeBSDCatalog, error) {
 	prefix := manifest.FreeBSDRepoPrefix(abi, repo)
-	records := make([]json.RawMessage, 0, len(packages))
+	read := make([]freeBSDRecord, 0, len(packages))
 	for _, rel := range packages {
 		rec, err := freeBSDRecordFor(ctx, store, prefix+rel, rel)
 		if err != nil {
@@ -347,7 +347,18 @@ func (s *Server) buildFreeBSDCatalog(ctx context.Context, store storage.ObjectSt
 			// anywhere names the object that could not be read.
 			return nil, fmt.Errorf("freebsd %s@%s: %w. Nothing was generated; remove the object or re-upload it", repo, abi, err)
 		}
-		records = append(records, rec)
+		read = append(read, rec)
+	}
+	records, aliases, err := freeBSDDistinctRecords(read, prefix)
+	if err != nil {
+		return nil, fmt.Errorf("freebsd %s@%s: %w", repo, abi, err)
+	}
+	if len(aliases) > 0 {
+		// One line whatever the count, because a poudriere tree aliases most
+		// of what it holds and a line each would be the repository twice over
+		// in the journal on every rebuild.
+		s.logger.Info("freebsd: the same package is stored under more than one key; the catalogue names one of each",
+			"abi", abi, "repo", repo, "collapsed", len(aliases), "example", aliases[0])
 	}
 
 	cat := &freeBSDCatalog{objects: objects, builtAt: time.Now()}
@@ -355,7 +366,6 @@ func (s *Server) buildFreeBSDCatalog(ctx context.Context, store storage.ObjectSt
 		cat.key = sign.fingerprint
 	}
 
-	var err error
 	if cat.catalogue, err = s.freeBSDArchive(freeBSDCatalogDoc, freeBSDPackagesiteDoc(records), sign); err != nil {
 		return nil, fmt.Errorf("freebsd %s@%s: build %s: %w", repo, abi, manifest.FreeBSDCatalogFile, err)
 	}
@@ -482,6 +492,63 @@ type freeBSDMember struct {
 	data []byte
 }
 
+// freeBSDRecord is one catalogue record and the two things a catalogue must
+// keep straight about it: the bytes it points at, and the package pkg will
+// index it as.
+//
+// The two are not the same question and neither answers the other. One package
+// stored under two keys — a poudriere alias, a copy — is two objects with one
+// identity and one sum, and belongs in the catalogue once. Two builds of that
+// package are two objects with one identity and two sums, and belong in no
+// catalogue at all: pkg indexes both under one manifestdigest and refuses the
+// pair. See freeBSDPkgIdentity for what pkg counts as one package.
+type freeBSDRecord struct {
+	repoPath string
+	body     json.RawMessage
+	sum      string
+	identity string
+	label    string
+}
+
+// freeBSDDistinctRecords is the set of records a catalogue may publish, in the
+// order it was given them, with each package named once.
+//
+// The first record of an identity is the one kept, so the repopath a client
+// downloads is the lexicographically smallest key the package is stored under
+// and does not move while the store does not. An alias that appears or
+// disappears leaves the record it collapsed into untouched, which is what
+// keeps the catalogue's bytes — and therefore every client's refetch — tied to
+// the packages rather than to the paths.
+//
+// A second record of an identity over different bytes fails the build and
+// names both objects. Publishing either one would be choosing which package
+// an operator meant, and publishing both is not on offer: pkg creates
+// packages_digest UNIQUE after loading the records, so a catalogue carrying
+// the pair fails `pkg update` outright and the client keeps the catalogue it
+// had. A 500 naming the two objects is the same outage with the cause in it.
+func freeBSDDistinctRecords(records []freeBSDRecord, prefix string) ([]json.RawMessage, []string, error) {
+	bodies := make([]json.RawMessage, 0, len(records))
+	kept := make(map[string]freeBSDRecord, len(records))
+	var aliases []string
+	for _, rec := range records {
+		first, seen := kept[rec.identity]
+		if !seen {
+			kept[rec.identity] = rec
+			bodies = append(bodies, rec.body)
+			continue
+		}
+		if first.sum == rec.sum {
+			aliases = append(aliases, prefix+rec.repoPath+" (published as "+first.repoPath+")")
+			continue
+		}
+		return nil, nil, fmt.Errorf("%s%s and %s%s are two builds of one package (%s) and differ in their bytes (sha256 %s against %s). "+
+			"pkg indexes both under one manifestdigest and refuses a catalogue holding the pair, so nothing was generated and the repository serves the catalogue it was serving before. "+
+			"Remove the object that should not be published, or give one of the two a version of its own",
+			prefix, first.repoPath, prefix, rec.repoPath, rec.label, first.sum, rec.sum)
+	}
+	return bodies, aliases, nil
+}
+
 // freeBSDRecordFor builds one packagesite.yaml record from a stored package.
 //
 // The record is the package's own +COMPACT_MANIFEST plus the four fields only
@@ -490,16 +557,17 @@ type freeBSDMember struct {
 // rather than re-deriving it is what keeps a field pkg reads and bodega has
 // never heard of — an annotation, a new option group — from being dropped on
 // the way.
-func freeBSDRecordFor(ctx context.Context, store storage.ObjectStore, key, repoPath string) (json.RawMessage, error) {
+func freeBSDRecordFor(ctx context.Context, store storage.ObjectStore, key, repoPath string) (freeBSDRecord, error) {
+	var out freeBSDRecord
 	res, err := store.GetStream(ctx, key)
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", key, err)
+		return out, fmt.Errorf("read %s: %w", key, err)
 	}
 	if res == nil {
 		// Listed a moment ago and gone now: a delete landed between the
 		// listing and the read. Reported rather than skipped, because the
 		// next build lists again and the repository is correct then.
-		return nil, fmt.Errorf("%s was listed but is no longer in the store", key)
+		return out, fmt.Errorf("%s was listed but is no longer in the store", key)
 	}
 	defer func() { _ = res.Body.Close() }()
 
@@ -509,23 +577,31 @@ func freeBSDRecordFor(ctx context.Context, store storage.ObjectStore, key, repoP
 
 	compact, err := freeBSDCompactManifest(teed)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", key, err)
+		return out, fmt.Errorf("%s: %w", key, err)
 	}
 	// The rest of the object is drained without decompressing it, because the
 	// digest is over the whole .pkg file as a client downloads it and the
 	// manifest member is only its first few kilobytes.
 	if _, err := io.Copy(io.Discard, teed); err != nil {
-		return nil, fmt.Errorf("read %s to its end for a digest: %w", key, err)
+		return out, fmt.Errorf("read %s to its end for a digest: %w", key, err)
 	}
 
 	var fields map[string]json.RawMessage
 	dec := json.NewDecoder(bytes.NewReader(compact))
 	dec.UseNumber()
 	if err := dec.Decode(&fields); err != nil {
-		return nil, fmt.Errorf("%s: %s is not a JSON object: %w", key, freeBSDManifestMember, err)
+		return out, fmt.Errorf("%s: %s is not a JSON object: %w", key, freeBSDManifestMember, err)
 	}
 	if len(fields["name"]) == 0 || len(fields["version"]) == 0 {
-		return nil, fmt.Errorf("%s: %s names no package name and version, so no client could resolve it", key, freeBSDManifestMember)
+		return out, fmt.Errorf("%s: %s names no package name and version, so no client could resolve it", key, freeBSDManifestMember)
+	}
+
+	// Taken before the repository's own fields are written over the manifest,
+	// because none of them reaches pkg's digest and adding them here would
+	// make two names for one package look like two packages.
+	identity, err := freeBSDPkgIdentity(fields)
+	if err != nil {
+		return out, fmt.Errorf("%s: %s: %w", key, freeBSDManifestMember, err)
 	}
 
 	// repopath is what F19's serving path reads as the only authority on
@@ -535,14 +611,37 @@ func freeBSDRecordFor(ctx context.Context, store storage.ObjectStore, key, repoP
 	// after `pkg update` has already reported success.
 	rel, err := json.Marshal(repoPath)
 	if err != nil {
-		return nil, err
+		return out, err
 	}
+	sum := hex.EncodeToString(hasher.Sum(nil))
 	fields["repopath"] = rel
 	fields["path"] = rel
-	fields["sum"] = mustJSON(hex.EncodeToString(hasher.Sum(nil)))
+	fields["sum"] = mustJSON(sum)
 	fields["pkgsize"] = json.RawMessage(fmt.Sprintf("%d", size.n))
 
-	return json.Marshal(fields)
+	body, err := json.Marshal(fields)
+	if err != nil {
+		return out, err
+	}
+	return freeBSDRecord{
+		repoPath: repoPath,
+		body:     body,
+		sum:      sum,
+		identity: identity,
+		label:    freeBSDRecordLabel(fields),
+	}, nil
+}
+
+// freeBSDRecordLabel names a package the way an operator wrote it down, for
+// an error about two objects claiming to be it.
+func freeBSDRecordLabel(fields map[string]json.RawMessage) string {
+	var name, version string
+	_ = json.Unmarshal(fields["name"], &name)
+	_ = json.Unmarshal(fields["version"], &version)
+	if version == "" {
+		return name
+	}
+	return name + "-" + version
 }
 
 // mustJSON renders a string this package composed, where a marshalling error

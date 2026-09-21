@@ -3367,6 +3367,8 @@ bodega build upload freebsd        # place the .pkg files you put in the build t
 
 Put the packages under `<build_root>/freebsd/<ABI>/<repository>/`, in whatever layout you like — `All/`, hashed, or flat at the root. The upload takes every `.pkg` beneath that directory and nothing else; `meta.conf`, `data.pkg` and `packagesite.pkg` are bodega's own names there, and a file left under one of them is skipped with a line saying so.
 
+A symlink resolving back inside the repository is skipped too. poudriere publishes most of a tree twice, `Latest/pkg.pkg` and an ordinary name beside every hashed one, and the two names are one package: uploading both stores that package under two keys. `pkg repo` skips the same links for the same reason. A link out of the tree is the only name those bytes have here, so it is followed.
+
 #### What a bodega signature proves
 
 **That the catalogue came from this mirror. Nothing more.**
@@ -3374,6 +3376,23 @@ Put the packages under `<build_root>/freebsd/<ABI>/<repository>/`, in whatever l
 It says the records were served by the bodega instance holding that key, and that they have not been altered since. It says nothing about FreeBSD, about the ports tree a package was built from, or about the machine that built it. A mirrored repository carries a different claim entirely — FreeBSD signed that catalogue, and copying it byte for byte is what delivers the signature intact — and generating a catalogue is precisely the act that discards it. There is no configuration in which bodega re-attaches an upstream attestation to a document it produced, because a signature over bytes nobody upstream ever saw is not upstream's signature.
 
 So the two repository kinds carry two different trust stories to two differently configured clients, and the failure mode of confusing them is quiet: pkg reports a repository it will not read and names the signature, never the configuration that asked for the wrong one.
+
+#### One package, one record
+
+pkg loads a catalogue into SQLite and then creates a unique index over `manifestdigest`, so two records it hashes alike fail the whole repository rather than the duplicate. `pkg update` reports the entries processed, fails with `UNIQUE constraint failed: packages.manifestdigest`, and the client keeps the catalogue it already had.
+
+That digest is over a fixed field set: name, origin, version, arch, the vital flag, options, required and provided shlibs, users, groups, dependencies, provides and requires. The comment, the description, the sizes, the checksum and the key an object is stored under reach none of it.
+
+So bodega publishes one record per package pkg would index, and decides between two objects claiming to be one package by their bytes:
+
+- **Same package, same bytes.** One record, naming the lexicographically first key. That is an alias, and the document does not change when one appears or disappears beside the package, so no client refetches the catalogue over it.
+- **Same package, different bytes.** Nothing is generated, and the error names both objects. Two builds of one version are a repository pkg refuses to load whichever of them bodega published, and choosing would decide on a sort order which one every client installs.
+
+```text
+freebsd house@FreeBSD:14:amd64: freebsd/FreeBSD:14:amd64/house/All/Hashed/widget-1.2.0~2$abcdefgh.pkg and freebsd/FreeBSD:14:amd64/house/All/widget-1.2.0.pkg are two builds of one package (widget-1.2.0) and differ in their bytes (sha256 4f21… against 9ba0…). pkg indexes both under one manifestdigest and refuses a catalogue holding the pair, so nothing was generated and the repository serves the catalogue it was serving before. Remove the object that should not be published, or give one of the two a version of its own
+```
+
+Two versions of one package are two packages to that index, and so are two option builds of one version. Both are published.
 
 #### The signature is a member of the archive
 

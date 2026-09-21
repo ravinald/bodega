@@ -437,14 +437,17 @@ func keysOfBytes(m map[string][]byte) []string {
 func TestFreeBSDEveryPublishedRepoPathResolves(t *testing.T) {
 	s := hostedServer(t)
 	objects := map[string]string{}
-	for _, rel := range []string{
-		"All/Hashed/py311-foo-1.2.0_3~2$abcdefgh.pkg",
-		"All/gcc13-13.2.0_1.pkg",
-		"libx++-2.0.pkg",
-		"base/a/b/c/kernel-14.0.pkg",
-		"All/zsh-5.9_3.pkg",
+	// One package per path, because five names for one package is the alias
+	// case and the catalogue publishes it once: see
+	// TestFreeBSDGeneratedNamesAnAliasedPackageOnce.
+	for name, rel := range map[string]string{
+		"py311-foo": "All/Hashed/py311-foo-1.2.0_3~2$abcdefgh.pkg",
+		"gcc13":     "All/gcc13-13.2.0_1.pkg",
+		"libx++":    "libx++-2.0.pkg",
+		"kernel":    "base/a/b/c/kernel-14.0.pkg",
+		"zsh":       "All/zsh-5.9_3.pkg",
 	} {
-		objects[rel] = pkgArchive(t, `{"name":"p","version":"1","origin":"misc/p"}`)
+		objects[rel] = pkgArchive(t, `{"name":"`+name+`","version":"1","origin":"misc/`+name+`"}`)
 	}
 	generatedRepo(t, s, "house", objects)
 
@@ -621,5 +624,207 @@ func TestFreeBSDGeneratedFramesThePubMemberForItsSigner(t *testing.T) {
 				t.Errorf("the published .pub hashes to %s, and the operator installs %s", got, kr.Fingerprint())
 			}
 		})
+	}
+}
+
+// R1: one package stored under two keys is one record.
+//
+// This is what a poudriere tree looks like after an rsync that resolved its
+// symlinks, and what a store looks like after an upload that followed them.
+// pkg creates packages_digest UNIQUE over the records it loaded, so a
+// catalogue naming the package twice fails `pkg update` with
+// "UNIQUE constraint failed: packages.manifestdigest" and the client keeps the
+// catalogue it had — for the whole repository, not for the duplicate.
+func TestFreeBSDGeneratedNamesAnAliasedPackageOnce(t *testing.T) {
+	s := hostedServer(t)
+	widget := pkgArchive(t, `{"name":"widget","origin":"misc/widget","version":"1.2.0","comment":"a widget","arch":"freebsd:14:x86:64"}`)
+	generatedRepo(t, s, "house", map[string]string{
+		genHashedPath:          widget,
+		"All/widget-1.2.0.pkg": widget,
+	})
+
+	status, body := getStatusAndBody(t, s, freeBSDURL("house", manifest.FreeBSDCatalogFile))
+	if status != http.StatusOK {
+		t.Fatalf("GET the generated catalogue = %d, want 200: %s", status, body)
+	}
+	doc := archiveMembers(t, body)[freeBSDCatalogDoc]
+	records := packagesiteRecords(t, doc)
+	if len(records) != 1 {
+		t.Fatalf("the catalogue holds %d records over one package stored twice: %v", len(records), records)
+	}
+	// The smallest key, so the record does not move when an alias is added or
+	// removed beside it.
+	if got := records[0]["repopath"]; got != genHashedPath {
+		t.Errorf("repopath = %v, want the lexicographically first key %q", got, genHashedPath)
+	}
+	repoPath, _ := records[0]["repopath"].(string)
+	if status, served := getStatusAndBody(t, s, freeBSDURL("house", repoPath)); status != http.StatusOK || served != widget {
+		t.Errorf("GET %s = %d over %d bytes, want 200 and the package's %d", repoPath, status, len(served), len(widget))
+	}
+
+	// data.pkg describes the same set, because a client resolves out of one
+	// and downloads out of the other.
+	_, dataBody := getStatusAndBody(t, s, freeBSDURL("house", manifest.FreeBSDDataFile))
+	var data struct {
+		Packages []map[string]any `json:"packages"`
+	}
+	if err := json.Unmarshal(archiveMembers(t, dataBody)[freeBSDDataDoc], &data); err != nil {
+		t.Fatalf("read the data document: %v", err)
+	}
+	if len(data.Packages) != 1 {
+		t.Errorf("the data document holds %d packages over one package stored twice", len(data.Packages))
+	}
+}
+
+// The document a client refetches is tied to the packages, not to the paths.
+// A build that changed bytes when an alias appeared would have every client in
+// a fleet refetch the catalogue over a package nobody added.
+func TestFreeBSDGeneratedCatalogIsUnchangedByAnAlias(t *testing.T) {
+	s := hostedServer(t)
+	widget := pkgArchive(t, `{"name":"widget","origin":"misc/widget","version":"1.2.0","arch":"freebsd:14:x86:64"}`)
+	generatedRepo(t, s, "house", map[string]string{genHashedPath: widget})
+	_, before := getStatusAndBody(t, s, freeBSDURL("house", manifest.FreeBSDCatalogFile))
+
+	seed(t, s, manifest.TypeFreeBSD, map[string]string{
+		manifest.FreeBSDKey(freeBSDABI, "house", "All/widget-1.2.0.pkg"): widget,
+	})
+	status, after := getStatusAndBody(t, s, freeBSDURL("house", manifest.FreeBSDCatalogFile))
+	if status != http.StatusOK {
+		t.Fatalf("GET the catalogue after the alias landed = %d: %s", status, after)
+	}
+	if !bytes.Equal(archiveMembers(t, before)[freeBSDCatalogDoc], archiveMembers(t, after)[freeBSDCatalogDoc]) {
+		t.Error("adding a second name for a package changed the catalogue document, so every client refetches it")
+	}
+}
+
+// R1: two builds of one package are refused, with both objects named.
+//
+// They differ in bytes, so neither stands for the other, and they are one
+// package to pkg's index: description, size and stored path reach none of
+// pkg_checksum_generate's field set. Publishing either would be choosing which
+// package the operator meant; publishing both fails every client's update.
+func TestFreeBSDGeneratedRefusesTwoBuildsOfOnePackage(t *testing.T) {
+	s := hostedServer(t)
+	generatedRepo(t, s, "house", map[string]string{
+		genHashedPath: pkgArchive(t, `{"name":"widget","origin":"misc/widget","version":"1.2.0","arch":"freebsd:14:x86:64","desc":"built on Tuesday","flatsize":4096}`),
+		"All/widget-1.2.0.pkg": pkgArchive(t,
+			`{"name":"widget","origin":"misc/widget","version":"1.2.0","arch":"freebsd:14:x86:64","desc":"built on Wednesday","flatsize":8192}`),
+	})
+
+	status, body := getStatusAndBody(t, s, freeBSDURL("house", manifest.FreeBSDCatalogFile))
+	if status != http.StatusInternalServerError {
+		t.Fatalf("GET the catalogue = %d, want 500: two builds of one package were published as a catalogue pkg refuses whole", status)
+	}
+	for _, want := range []string{genHashedPath, "All/widget-1.2.0.pkg", "widget-1.2.0"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the refusal does not name %q, so nobody can tell which two objects to look at: %s", want, body)
+		}
+	}
+}
+
+// The other half of the refusal above: everything pkg indexes apart is
+// published. A rule that collapsed by name would drop a version, and one that
+// collapsed by name and version would drop an options build — both of which
+// pkg loads without complaint, because version and options are in the digest.
+func TestFreeBSDGeneratedPublishesEveryPackagePkgIndexesApart(t *testing.T) {
+	s := hostedServer(t)
+	generatedRepo(t, s, "house", map[string]string{
+		"All/widget-1.0.pkg":      pkgArchive(t, `{"name":"widget","origin":"misc/widget","version":"1.0","arch":"freebsd:14:x86:64"}`),
+		"All/widget-1.1.pkg":      pkgArchive(t, `{"name":"widget","origin":"misc/widget","version":"1.1","arch":"freebsd:14:x86:64"}`),
+		"All/widget-1.2-docs.pkg": pkgArchive(t, `{"name":"widget","origin":"misc/widget","version":"1.2","arch":"freebsd:14:x86:64","options":{"DOCS":"on"}}`),
+		"All/widget-1.2-bare.pkg": pkgArchive(t, `{"name":"widget","origin":"misc/widget","version":"1.2","arch":"freebsd:14:x86:64","options":{"DOCS":"off"}}`),
+	})
+
+	status, body := getStatusAndBody(t, s, freeBSDURL("house", manifest.FreeBSDCatalogFile))
+	if status != http.StatusOK {
+		t.Fatalf("GET the generated catalogue = %d, want 200: %s", status, body)
+	}
+	records := packagesiteRecords(t, archiveMembers(t, body)[freeBSDCatalogDoc])
+	if len(records) != 4 {
+		t.Fatalf("the catalogue holds %d records over four packages pkg gives four digests: %v", len(records), records)
+	}
+}
+
+// The field set pkg hashes into manifestdigest, from both sides: what it
+// covers has to separate two records, and what it does not has to fold them
+// together. Getting the second half wrong is the expensive one — it publishes
+// a pair the client refuses — so it is asserted field by field.
+func TestFreeBSDPkgIdentityFollowsPkgsFieldSet(t *testing.T) {
+	base := `{"name":"widget","origin":"misc/widget","version":"1.2.0","arch":"freebsd:14:x86:64",
+	          "options":{"DOCS":"on"},"deps":{"libfoo":{"origin":"devel/libfoo","version":"2.0"}},
+	          "shlibs_required":["libfoo.so.2"],"users":["widget"],"groups":["widget"],
+	          "provides":["widget"],"requires":["libfoo"],"vital":false}`
+
+	identity := func(t *testing.T, doc string) string {
+		t.Helper()
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(doc), &fields); err != nil {
+			t.Fatalf("read the manifest: %v", err)
+		}
+		id, err := freeBSDPkgIdentity(fields)
+		if err != nil {
+			t.Fatalf("identity: %v", err)
+		}
+		return id
+	}
+	want := identity(t, base)
+
+	// Outside the digest: pkg loads two records differing only in these under
+	// one manifestdigest, so bodega has to treat them as one package or
+	// publish a pair that takes the repository down.
+	for name, doc := range map[string]string{
+		"comment":    `{"name":"widget","origin":"misc/widget","version":"1.2.0","arch":"freebsd:14:x86:64","comment":"a widget"}`,
+		"desc":       `{"name":"widget","origin":"misc/widget","version":"1.2.0","arch":"freebsd:14:x86:64","desc":"at length"}`,
+		"maintainer": `{"name":"widget","origin":"misc/widget","version":"1.2.0","arch":"freebsd:14:x86:64","maintainer":"someone@example.invalid"}`,
+		"flatsize":   `{"name":"widget","origin":"misc/widget","version":"1.2.0","arch":"freebsd:14:x86:64","flatsize":99}`,
+		"pkgsize":    `{"name":"widget","origin":"misc/widget","version":"1.2.0","arch":"freebsd:14:x86:64","pkgsize":99}`,
+		"repopath":   `{"name":"widget","origin":"misc/widget","version":"1.2.0","arch":"freebsd:14:x86:64","repopath":"All/elsewhere.pkg"}`,
+		"sum":        `{"name":"widget","origin":"misc/widget","version":"1.2.0","arch":"freebsd:14:x86:64","sum":"0000"}`,
+		"abi":        `{"name":"widget","origin":"misc/widget","version":"1.2.0","arch":"freebsd:14:x86:64","abi":"FreeBSD:15:amd64"}`,
+	} {
+		bare := `{"name":"widget","origin":"misc/widget","version":"1.2.0","arch":"freebsd:14:x86:64"}`
+		if identity(t, doc) != identity(t, bare) {
+			t.Errorf("%s changed the identity, though pkg_checksum_generate never reads it", name)
+		}
+	}
+
+	// Inside the digest: each of these is a package pkg indexes on its own,
+	// and folding two of them together would drop one from the catalogue.
+	for name, doc := range map[string]string{
+		"name":            strings.Replace(base, `"name":"widget"`, `"name":"gadget"`, 1),
+		"origin":          strings.Replace(base, `"origin":"misc/widget"`, `"origin":"misc/gadget"`, 1),
+		"version":         strings.Replace(base, `"version":"1.2.0"`, `"version":"1.2.1"`, 1),
+		"arch":            strings.Replace(base, `"arch":"freebsd:14:x86:64"`, `"arch":"freebsd:14:aarch64"`, 1),
+		"vital":           strings.Replace(base, `"vital":false`, `"vital":true`, 1),
+		"options":         strings.Replace(base, `"DOCS":"on"`, `"DOCS":"off"`, 1),
+		"deps":            strings.Replace(base, `"origin":"devel/libfoo"`, `"origin":"devel/libbar"`, 1),
+		"shlibs_required": strings.Replace(base, `"libfoo.so.2"`, `"libfoo.so.3"`, 1),
+		"users":           strings.Replace(base, `"users":["widget"]`, `"users":["gadget"]`, 1),
+		"groups":          strings.Replace(base, `"groups":["widget"]`, `"groups":["gadget"]`, 1),
+		"provides":        strings.Replace(base, `"provides":["widget"]`, `"provides":["gadget"]`, 1),
+		"requires":        strings.Replace(base, `"requires":["libfoo"]`, `"requires":["libbar"]`, 1),
+	} {
+		if identity(t, doc) == want {
+			t.Errorf("%s left the identity alone, though pkg hashes it: two packages would be published as one", name)
+		}
+	}
+}
+
+// A manifest field of a type pkg could not read fails the build with the
+// object named. Read past instead, the field would be treated as absent, and
+// two packages that differ only there would look like one and be collapsed —
+// which is a package silently missing from the catalogue.
+func TestFreeBSDGeneratedRefusesAManifestItCannotIdentify(t *testing.T) {
+	s := hostedServer(t)
+	generatedRepo(t, s, "house", map[string]string{
+		genHashedPath: pkgArchive(t, `{"name":"widget","version":"1.2.0","options":["DOCS"]}`),
+	})
+
+	status, body := getStatusAndBody(t, s, freeBSDURL("house", manifest.FreeBSDCatalogFile))
+	if status != http.StatusInternalServerError {
+		t.Fatalf("GET the catalogue = %d, want 500 over a manifest whose options is a list", status)
+	}
+	if !strings.Contains(body, genHashedPath) || !strings.Contains(body, "options") {
+		t.Errorf("the refusal names neither the object nor the field: %s", body)
 	}
 }
