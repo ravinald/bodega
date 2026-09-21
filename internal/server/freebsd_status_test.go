@@ -114,6 +114,12 @@ func TestFreeBSDStatusRendersAGeneratedRepositoryAgainstBodegasKey(t *testing.T)
 // this list. Either one rendered instead is a stanza published for a
 // repository whose every path answers 500, with an empty refusal list beside
 // it saying nothing is wrong.
+//
+// The third row is the renderer's alone and the route does not share it: an
+// entry naming neither a url nor generated is served from the store and has
+// no trust store anybody can name. See
+// TestFreeBSDStatusStillServesTheEntryItRefusesToConfigure for the half that
+// keeps a later pass from closing the gap at the route.
 func TestFreeBSDStatusReportsARefusedEntryRatherThanDroppingIt(t *testing.T) {
 	for _, tc := range []struct {
 		repo  string
@@ -127,6 +133,7 @@ func TestFreeBSDStatusReportsARefusedEntryRatherThanDroppingIt(t *testing.T) {
 		{"drift", manifest.VersionEntry{
 			Version: "FreeBSD:14:amd64", Generated: true, Mode: manifest.ModeProxy,
 		}, "proxy"},
+		{"imported", manifest.VersionEntry{Version: "FreeBSD:14:amd64"}, "url"},
 	} {
 		t.Run(tc.repo, func(t *testing.T) {
 			s := hostedServer(t)
@@ -146,6 +153,39 @@ func TestFreeBSDStatusReportsARefusedEntryRatherThanDroppingIt(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The entry the renderer refuses is still served, and that asymmetry is the
+// design rather than a gap to close.
+//
+// The route asks whether it can serve these bytes and reads the store to do
+// it, which needs no url; pkgrepos.Render asks which trust store verifies
+// them, and the url is the only authority for that. Guarding
+// manifest.VersionEntry.FreeBSDGenerated to match the renderer would answer
+// 500 for every repository seeded the way internal/server/freebsd_test.go's
+// own mirrored() helper seeds one.
+func TestFreeBSDStatusStillServesTheEntryItRefusesToConfigure(t *testing.T) {
+	const repo = "imported"
+	s := hostedServer(t)
+	s.cfg.PublicURL = "https://bodega.internal"
+	addVersion(t, s, manifest.TypeFreeBSD, repo, manifest.VersionEntry{Version: freeBSDABI})
+	seed(t, s, manifest.TypeFreeBSD, map[string]string{
+		manifest.FreeBSDKey(freeBSDABI, repo, manifest.FreeBSDMetaFile): freeBSDMetaBytes,
+	})
+
+	st := statusFreeBSD(t, s)
+	if st.RepoFor(repo, freeBSDABI) != nil {
+		t.Fatalf("rendered configuration for an entry naming neither a url nor generated: %+v", st.Repos)
+	}
+	if len(st.Refused) != 1 {
+		t.Fatalf("Refused = %+v, want the one row a reader needs to fix the manifest", st.Refused)
+	}
+
+	status, body := getStatusAndBody(t, s, freeBSDURL(repo, manifest.FreeBSDMetaFile))
+	if status != http.StatusOK || body != freeBSDMetaBytes {
+		t.Fatalf("GET %s = %d %q, want 200 and the stored bytes: the route serves what the store holds and the refusal above is the emitter's alone",
+			manifest.FreeBSDMetaFile, status, body)
 	}
 }
 

@@ -149,6 +149,12 @@ func TestBootstrapAnswerFollowsWhatReachesUpstream(t *testing.T) {
 		want     pkgrepos.BootstrapAnswer
 		reaches  bool
 		conf     string
+
+		// refused is an entry Render will not emit for at all, which is a
+		// separate question from what reaches upstream: the predicate still
+		// has to answer, and the row is here because it is the one that
+		// proves the predicate reads the url rather than the two flags.
+		refused bool
 	}{
 		{
 			name:     "hosted ports mirror, cache off",
@@ -207,18 +213,20 @@ func TestBootstrapAnswerFollowsWhatReachesUpstream(t *testing.T) {
 		{
 			// No url, so there is nothing to fall through to whatever the
 			// mode and the toggle say. This row is why the predicate reads
-			// the url rather than trusting the two flags.
-			name:  "hosted repository with no upstream, cache on",
-			cache: true,
-			want:  pkgrepos.BootstrapAbsent,
-			conf:  "every request stops here",
+			// the url rather than trusting the two flags. No stanza comes
+			// out of it: an entry with no url and no generated flag names
+			// neither of the two things that decide a trust store, and
+			// Render refuses it rather than handing the reader the mirrored
+			// answer for a repository nobody mirrored.
+			name:    "hosted repository with no upstream, cache on",
+			cache:   true,
+			refused: true,
 		},
 		{
-			name:  "proxy mode with no upstream, cache on",
-			proxy: true,
-			cache: true,
-			want:  pkgrepos.BootstrapAbsent,
-			conf:  "every request stops here",
+			name:    "proxy mode with no upstream, cache on",
+			proxy:   true,
+			cache:   true,
+			refused: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -229,6 +237,12 @@ func TestBootstrapAnswerFollowsWhatReachesUpstream(t *testing.T) {
 			}
 			if got := st.ReachesUpstream(); got != tc.reaches {
 				t.Errorf("ReachesUpstream() = %v, want %v", got, tc.reaches)
+			}
+			if tc.refused {
+				if got, err := pkgrepos.Render(st); err == nil {
+					t.Fatalf("Render emitted a stanza for an entry with no url and no generated flag:\n%s", got.Conf)
+				}
+				return
 			}
 			got := render(t, st)
 			if got.Bootstrap != tc.want {
@@ -477,6 +491,92 @@ func TestGeneratedWithNoKeyIsUnsignedAndSaysSo(t *testing.T) {
 	}
 }
 
+// The conf for a generated repository claims what its own stanza renders, and
+// says how much of it leaves the host.
+//
+// Both halves were one arm's constants. "generated and signed by bodega" sat
+// in the prefix both signature cases share, so an unsigned repository read
+// "signed by bodega" three lines above "it carries no signature at all". That
+// is the first file an operator gets for every `bodega pkg create freebsd`
+// with a blank URL, because no key is loaded until somebody runs
+// `bodega freebsd key generate`. And the arm printed no reach paragraph at
+// all, which left the one repository class Render's own refusals make
+// unconditionally isolated as the only class never told so.
+func TestTheGeneratedConfMatchesItsOwnStanza(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		fingerprint string
+		wantSig     string
+		wantProse   []string
+		denyProse   []string
+	}{
+		{
+			name:      "no key loaded",
+			wantSig:   "none",
+			wantProse: []string{"carries no signature at all", "every request stops here"},
+			denyProse: []string{"signed by bodega", "bodega signs it"},
+		},
+		{
+			// The positive row, so the fix cannot be made by deleting the
+			// claim for everybody: a signed repository still names the key.
+			name:        "key loaded",
+			fingerprint: "SHA256:2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+			wantSig:     "fingerprints",
+			wantProse:   []string{"bodega signs it", "every request stops here"},
+			denyProse:   []string{"carries no signature at all"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := mirror()
+			st.Upstream, st.Generated, st.Fingerprint = "", true, tc.fingerprint
+			got := render(t, st)
+			if got.SignatureType != tc.wantSig {
+				t.Fatalf("SignatureType = %q, want %q", got.SignatureType, tc.wantSig)
+			}
+			prose := confProse(got.Conf)
+			for _, want := range tc.wantProse {
+				if !strings.Contains(prose, want) {
+					t.Errorf("the conf never says %q:\n%s", want, got.Conf)
+				}
+			}
+			for _, deny := range tc.denyProse {
+				if strings.Contains(prose, deny) {
+					t.Errorf("the conf says %q beside signature_type %q:\n%s", deny, got.SignatureType, got.Conf)
+				}
+			}
+			// The wire-level list and the file answer the same question, so
+			// a consumer with one line to spend gets the same claim.
+			if !strings.Contains(got.Note(), "stops at this server") {
+				t.Errorf("Note() never says how much of a generated repository leaves the host: %q", got.Note())
+			}
+		})
+	}
+}
+
+// An entry naming neither a url nor generated is refused, because nothing
+// here knows who signed its catalogue.
+//
+// Generated and Upstream are independent and manifest.VersionEntry requires
+// neither, so they are four cases rather than two: `bodega pkg import`
+// accepts the fourth and the route serves it from the store. Every switch in
+// the renderer keys off Generated alone, so before this refusal that entry
+// was told bodega copied its bytes from upstream, that upstream called it
+// something else, and to verify it against the ports trust store, which
+// checks whatever the operator uploaded only by luck.
+func TestRefusesAnEntryThatIsNeitherMirroredNorGenerated(t *testing.T) {
+	st := mirror()
+	st.Upstream, st.Generated = "", false
+	got, err := pkgrepos.Render(st)
+	if err == nil {
+		t.Fatalf("rendered a stanza for an entry with no upstream and no generated flag; the conf tells its reader FreeBSD signed bytes nobody mirrored:\n%s", got.Conf)
+	}
+	for _, want := range []string{"url", "generated", pkgrepos.StockFingerprints} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q, so the operator has to guess which field to set: %v", want, err)
+		}
+	}
+}
+
 // An entry claiming to be both is refused rather than resolved to a guess.
 // The two want opposite client configuration and the wrong one fails at pkg
 // update with an error naming the signature.
@@ -513,14 +613,22 @@ func TestRefusesAGeneratedRepositoryServedByProxy(t *testing.T) {
 	}
 }
 
-// Render refuses what the server refuses to route, and nothing more.
+// Render refuses every contradiction the server refuses to route, and one
+// more the server has no reason to.
 //
-// The server decides per request through manifest.VersionEntry.FreeBSDGenerated.
-// A contradiction that refuses there and renders here is published as
-// installable configuration with an empty refusal list beside it, and the
-// repository it names answers 500 on every path: neither artifact says so.
-// One that renders there and refuses here withholds a working repository's
-// configuration for no reason a reader can act on.
+// One direction is the invariant. The server decides per request through
+// manifest.VersionEntry.FreeBSDGenerated, and a contradiction that refuses
+// there and renders here is published as installable configuration with an
+// empty refusal list beside it, for a repository that answers 500 on every
+// path: neither artifact says so.
+//
+// The other direction is not, because the two answer different questions. The
+// route asks whether it can serve these bytes and reads the store to do it,
+// which needs no url; this asks which trust store verifies them, and the url
+// is the only authority for that. An entry with neither a url nor generated
+// serves whatever was uploaded and gets a refusal row rather than a stanza,
+// and a guard at the route would answer 500 for a repository that answers 200
+// today: internal/server/freebsd_test.go seeds exactly that entry.
 func TestRefusalsMatchTheServersOwn(t *testing.T) {
 	const (
 		abi = "FreeBSD:14:amd64"
@@ -529,14 +637,18 @@ func TestRefusalsMatchTheServersOwn(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		ve   manifest.VersionEntry
+
+		// emitterOnly is the asymmetric row: routed, and refused here.
+		emitterOnly bool
 	}{
-		{"mirrored", manifest.VersionEntry{Version: abi, URL: url}},
-		{"mirrored by proxy", manifest.VersionEntry{Version: abi, URL: url, Mode: manifest.ModeProxy}},
-		{"generated", manifest.VersionEntry{Version: abi, Generated: true}},
-		{"generated and hosted", manifest.VersionEntry{Version: abi, Generated: true, Mode: manifest.ModeHosted}},
-		{"generated with an upstream url", manifest.VersionEntry{Version: abi, URL: url, Generated: true}},
-		{"generated by proxy", manifest.VersionEntry{Version: abi, Generated: true, Mode: manifest.ModeProxy}},
-		{"generated by proxy with an upstream url", manifest.VersionEntry{Version: abi, URL: url, Generated: true, Mode: manifest.ModeProxy}},
+		{"mirrored", manifest.VersionEntry{Version: abi, URL: url}, false},
+		{"mirrored by proxy", manifest.VersionEntry{Version: abi, URL: url, Mode: manifest.ModeProxy}, false},
+		{"generated", manifest.VersionEntry{Version: abi, Generated: true}, false},
+		{"generated and hosted", manifest.VersionEntry{Version: abi, Generated: true, Mode: manifest.ModeHosted}, false},
+		{"generated with an upstream url", manifest.VersionEntry{Version: abi, URL: url, Generated: true}, false},
+		{"generated by proxy", manifest.VersionEntry{Version: abi, Generated: true, Mode: manifest.ModeProxy}, false},
+		{"generated by proxy with an upstream url", manifest.VersionEntry{Version: abi, URL: url, Generated: true, Mode: manifest.ModeProxy}, false},
+		{"neither mirrored nor generated", manifest.VersionEntry{Version: abi}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, routed := tc.ve.FreeBSDGenerated()
@@ -550,8 +662,10 @@ func TestRefusalsMatchTheServersOwn(t *testing.T) {
 			switch {
 			case routed != nil && rendered == nil:
 				t.Fatalf("the server refuses to route this entry (%v) and Render emits a stanza for it, which publishes installable configuration for a repository that answers 500", routed)
-			case routed == nil && rendered != nil:
+			case routed == nil && rendered != nil && !tc.emitterOnly:
 				t.Fatalf("the server routes this entry and Render refuses it (%v), which withholds the configuration for a repository that answers", rendered)
+			case tc.emitterOnly && rendered == nil:
+				t.Fatal("Render emitted a stanza for an entry naming neither the url that says who signed the catalogue nor the generated flag that says bodega did; the file would hand its reader the mirrored answer for a repository nobody mirrored")
 			}
 		})
 	}
@@ -867,6 +981,49 @@ func TestWithReleaseKeepsTheReachParagraph(t *testing.T) {
 	}
 	if !strings.Contains(got.Conf, "catalogue included") {
 		t.Errorf("re-rendering turned a proxy into a mirror that holds its own catalogue:\n%s", got.Conf)
+	}
+}
+
+// A generated repository's two claims survive the wire as well, and they are
+// decided by two different fields: Generated says bodega built the catalogue
+// and SignatureType says whether it signed it. Carried by one, doctor
+// --release would re-render the pair as agreeing when the server said they
+// did not.
+func TestWithReleaseKeepsTheGeneratedClaimsApart(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		fingerprint string
+		wantProse   string
+	}{
+		{"no key loaded", "", "carries no"},
+		{"key loaded", "SHA256:2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae", "bodega signs it"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := mirror()
+			st.Upstream, st.Generated, st.Fingerprint = "", true, tc.fingerprint
+			encoded, err := json.Marshal(render(t, st))
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			var decoded pkgrepos.Repo
+			if err := json.Unmarshal(encoded, &decoded); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			got, err := decoded.WithRelease(15)
+			if err != nil {
+				t.Fatalf("WithRelease(15) = %v", err)
+			}
+			prose := confProse(got.Conf)
+			if !strings.Contains(prose, tc.wantProse) {
+				t.Errorf("re-rendering lost %q:\n%s", tc.wantProse, got.Conf)
+			}
+			if !strings.Contains(prose, "every request stops here") {
+				t.Errorf("re-rendering dropped the reach paragraph, which Render's own refusals make unconditionally true of a generated repository:\n%s", got.Conf)
+			}
+			if strings.Contains(prose, "signed by bodega") {
+				t.Errorf("the re-rendered conf claims bodega signed a catalogue it renders signature_type %q for:\n%s", got.SignatureType, got.Conf)
+			}
+		})
 	}
 }
 

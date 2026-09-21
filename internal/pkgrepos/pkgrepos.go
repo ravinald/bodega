@@ -186,6 +186,16 @@ const (
 	// measured list is short, upstream adds repositories, and a note claiming
 	// bootstrap works reads as measured whether or not anybody measured it.
 	BootstrapUnknownNote = `"pkg bootstrap" may not work against this repository: it fetches Latest/pkg.pkg and Latest/pkg.pkg.sig, and upstream publishes that pair under some repositories and not others. Nobody measured this one, so try it rather than planning on it: a 404 or a 502 means bootstrapping the host from a ports repository first.`
+
+	// GeneratedBootstrapNote is the other reason the answer is unknown, and
+	// it is nothing to do with upstream: a generated repository has none, and
+	// serves whatever the build tree uploaded. poudriere publishes
+	// Latest/pkg.pkg as a symlink into All/ and the upload skips it
+	// (internal/builder/freebsd.go:632-644), so it is absent on an ordinary
+	// tree and present where somebody put a real file there. bodega cannot
+	// tell which from the manifest, and the emitted file says so rather than
+	// guessing.
+	GeneratedBootstrapNote = `"pkg bootstrap" reaches this repository only if the build tree published Latest/pkg.pkg under it as a real file. poudriere publishes that path as a symlink and the upload skips it, to keep one package out of the catalogue twice, so on an ordinary poudriere tree it is absent.`
 )
 
 // ReleaseSplit is the first FreeBSD major release whose base system defines
@@ -599,19 +609,36 @@ func UpstreamBootstrap(upstream string) BootstrapAnswer {
 // `pkg update` with an error naming the signature, which sends the reader to
 // the key rather than to the manifest. A generated entry served in proxy mode
 // is a repository the server answers 500 for on every path, so the stanza
-// describes something that never replies. A release nothing resolves means
-// the override would disable a tag the host does not define, which fails
-// nothing at all: the upstream repository stays enabled beside bodega's and
-// nothing reports it.
+// describes something that never replies. An entry claiming to be neither has
+// no answer at all: nothing here knows who signed a catalogue bodega did not
+// copy and did not build. A release nothing resolves means the override would
+// disable a tag the host does not define, which fails nothing at all: the
+// upstream repository stays enabled beside bodega's and nothing reports it.
 //
-// The contradictions are refused here as well as at
-// manifest.VersionEntry.FreeBSDGenerated, which refuses them for the server's
-// own routing, and the two sets have to stay equal: a contradiction the server
-// refuses to route and this renderer emits for is published as installable
-// configuration with an empty refusal list beside it, and neither artifact
-// says the repository answers 500. Two refusals rather than one call because
-// the artifacts outlive their producers differently: the server's decides a
-// request, and this one is pasted onto a host and read again in a year.
+// Generated and Upstream are independent, so they are four cases and not two,
+// and the fourth is the one that reads worst. manifest.VersionEntry
+// carries neither field as required, so an entry with no url and no generated
+// flag loads, imports and routes; every switch below that keys off Generated
+// alone would hand it the mirrored answer, which tells its reader FreeBSD
+// signed bytes nobody mirrored and points fingerprints at a store that
+// verifies whatever was uploaded only by luck. Refused here, Generated is a
+// sound selector for the three arms below it, and each of them may say
+// "upstream" and mean something.
+//
+// What this refuses is deliberately wider than what the server refuses to
+// route, and the direction matters. A contradiction the server will not route
+// and this renderer emits for is published as installable configuration with
+// an empty refusal list beside it, and neither artifact says the repository
+// answers 500: that set has to stay equal, and
+// manifest.VersionEntry.FreeBSDGenerated is the other half of it. The reverse
+// is not symmetrical, because the two answer different questions. The route
+// asks whether it can serve these bytes and needs no url to do it: it reads
+// the store and hands back what a mirror left there (internal/server/
+// freebsd.go:110,155). This asks which trust store verifies them, and the url
+// is the only authority for that. So an entry with neither field serves
+// whatever was uploaded and gets a row in freebsd.refused[] rather than a
+// stanza, which is the honest pair. Refusing it at the route as well would
+// answer 500 for a repository that answers 200 today.
 func Render(st State) (Repo, error) {
 	if st.Generated && strings.TrimSpace(st.Upstream) != "" {
 		return Repo{}, fmt.Errorf("freebsd %s@%s is marked generated and also records url %q, and the two want opposite client configuration: a mirrored repository verifies against %s and a generated one against bodega's own fingerprint. Drop the url to generate, or drop generated to mirror",
@@ -620,6 +647,10 @@ func Render(st State) (Repo, error) {
 	if st.Generated && st.Proxy {
 		return Repo{}, fmt.Errorf("freebsd %s@%s is marked generated and also served in proxy mode, and proxy keeps no snapshot for a generated catalogue to name: the server answers 500 on every path under it, so this stanza would configure a host for a repository that never replies. Drop the proxy mode to generate the catalogue here, or drop generated to proxy an upstream one",
 			st.Repo, st.ABI)
+	}
+	if !st.Generated && strings.TrimSpace(st.Upstream) == "" {
+		return Repo{}, fmt.Errorf("freebsd %s@%s records neither a url nor generated, so nothing here knows who signed its catalogue and a stanza would have to guess a trust store: a mirrored repository verifies against %s, a generated one against bodega's own fingerprint, and pkg reports the wrong guess as an empty repository rather than as a signature it could not check. Set url to the repository root this was mirrored from, or generated to build and sign the catalogue here from uploaded packages. To stop re-fetching a mirror while keeping the answer, set frozen rather than clearing the url",
+			st.Repo, st.ABI, StockFingerprints)
 	}
 
 	release := st.Release
@@ -719,9 +750,9 @@ func (r Repo) notes() []string {
 	case !r.Generated:
 		out = append(out, MirroredNote, reachNote(r), bootstrapNote(r))
 	case r.SignatureType != "none":
-		out = append(out, FingerprintNote)
+		out = append(out, FingerprintNote, reachNote(r), bootstrapNote(r))
 	default:
-		out = append(out, UnsignedNote)
+		out = append(out, UnsignedNote, reachNote(r), bootstrapNote(r))
 	}
 	// The placeholder cannot occur in a URL anything reported: it carries
 	// angle brackets, which no host may.
@@ -778,15 +809,17 @@ func reachNote(r Repo) string {
 	}
 }
 
-// bootstrapNote picks the true one. Four texts for three answers, because
-// absent has two reasons a reader acts on differently: a repository nothing
-// falls out of is bodega publishing no such path, and one something does is
-// upstream refusing it. A note that is right half the time is worse than
-// none: it reads as measured.
+// bootstrapNote picks the true one. Five texts for three answers, because two
+// of the answers have two reasons a reader acts on differently. Absent is
+// bodega publishing no such path where nothing falls out of the repository,
+// and upstream refusing it where something does. Unknown is an upstream
+// repository nobody measured, and, where there is no upstream at all, a
+// generated repository whose build tree decides. A note that is right half the
+// time is worse than none: it reads as measured.
 //
-// The split reads UpstreamFallthrough rather than Proxy, which is the same
-// term bootstrapAnswer decided on. Keyed off the mode, a hosted mirror of a
-// base repository on a cache-enabled server got the text blaming bodega's
+// The absent split reads UpstreamFallthrough rather than Proxy, which is the
+// same term bootstrapAnswer decided on. Keyed off the mode, a hosted mirror of
+// a base repository on a cache-enabled server got the text blaming bodega's
 // catalogue while the request 502'd out of upstream.
 func bootstrapNote(r Repo) string {
 	switch r.Bootstrap {
@@ -798,6 +831,9 @@ func bootstrapNote(r Repo) string {
 		}
 		return NoBootstrapNote
 	default:
+		if r.Generated {
+			return GeneratedBootstrapNote
+		}
 		return BootstrapUnknownNote
 	}
 }
@@ -816,6 +852,41 @@ func renderStanza(r Repo) string {
 		lines = append(lines, `  fingerprints: "`+r.Fingerprints+`",`)
 	}
 	return strings.Join(append(lines, "  enabled: yes", "}"), "\n")
+}
+
+// writeReachComment writes the paragraph answering how much of this
+// repository leaves the host, from the same two predicates reachNote reads.
+//
+// Both branches of renderConf call it, because the answer is not the mirror's
+// alone and the generated branch used to print nothing at all. Render refuses
+// a generated entry with a url and one served by proxy, so
+// UpstreamFallthrough is false there by construction and the first arm is the
+// one that fires. That makes a generated repository the one class this file
+// can call isolated without qualifying it, and the class that was never told.
+// Driving it off the predicate rather than writing that sentence into the arm
+// is what keeps it true if either refusal is ever lifted.
+func writeReachComment(b *strings.Builder, r Repo) {
+	switch {
+	case !r.UpstreamFallthrough:
+		b.WriteString("# This repository publishes the paths its catalogue names and this server\n")
+		b.WriteString("# fetches nothing under it from upstream: every request stops here, and a\n")
+		b.WriteString("# package it does not hold is a 404 rather than a fetch from the internet.\n")
+	case r.HoldsCatalogue():
+		b.WriteString("# This catalogue is served from what was published here, and a miss on\n")
+		b.WriteString("# meta.conf, packagesite.pkg or data.pkg is refused rather than fetched:\n")
+		b.WriteString("# upstream's catalogue names packages this mirror has never held. Every\n")
+		b.WriteString("# other path reaches the internet on a miss, because this server's proxy\n")
+		b.WriteString("# cache is on: a package the mirror does not hold is fetched from upstream,\n")
+		b.WriteString("# cached, and served under this repository's name, so an install can succeed\n")
+		b.WriteString("# here against a package nobody mirrored.\n")
+	default:
+		b.WriteString("# Every request this repository answers may reach the internet, the\n")
+		b.WriteString("# catalogue included. It is served in proxy mode: this server composes an\n")
+		b.WriteString("# upstream URL for each path and fetches it whenever it holds no fresh\n")
+		b.WriteString("# copy, so `pkg update` against this file contacts upstream. What is\n")
+		b.WriteString("# stored here is whatever earlier requests cached, not a copy of the\n")
+		b.WriteString("# repository.\n")
+	}
 }
 
 // renderConf wraps the stanza in the overrides that disable upstream and the
@@ -848,15 +919,22 @@ func renderConf(r Repo) string {
 	b.WriteString("# so: the host keeps fetching from the internet. Confirm with `pkg -vv`.\n")
 	if r.Generated {
 		b.WriteString("#\n")
-		b.WriteString("# This repository is generated and signed by bodega rather than mirrored, so\n")
+		b.WriteString("# This catalogue is built here from the packages uploaded to this\n")
+		b.WriteString("# repository rather than copied from upstream, so no signature of\n")
+		b.WriteString("# FreeBSD's reaches a client under it and the stock trust store every\n")
+		b.WriteString("# FreeBSD host ships verifies nothing in this path.\n")
 		if r.SignatureType == "none" {
-			b.WriteString("# it carries no signature at all and TLS is the only thing authenticating\n")
-			b.WriteString("# these packages. `bodega freebsd key generate` on the server fixes that.\n")
+			b.WriteString("# This server holds no pkg signing key, so the catalogue carries no\n")
+			b.WriteString("# signature at all and TLS is the only thing authenticating these\n")
+			b.WriteString("# packages. `bodega freebsd key generate` on the server fixes that.\n")
 		} else {
-			b.WriteString("# fingerprints points at bodega's own trust directory rather than the stock\n")
-			b.WriteString("# one. Install the fingerprint out of band before this file takes effect:\n")
+			b.WriteString("# bodega signs it with its own key, which is why fingerprints names\n")
+			b.WriteString("# bodega's trust directory. Install the fingerprint out of band before\n")
+			b.WriteString("# this file takes effect:\n")
 			b.WriteString("#   bodega freebsd key export --fingerprint > " + BodegaFingerprints + "/trusted/bodega\n")
 		}
+		b.WriteString("#\n")
+		writeReachComment(&b, r)
 		b.WriteString("#\n")
 		b.WriteString("# `pkg bootstrap` reaches this repository only if the build tree published\n")
 		b.WriteString("# Latest/pkg.pkg under it as a real file. poudriere publishes that as a\n")
@@ -898,27 +976,7 @@ func renderConf(r Repo) string {
 			b.WriteString("# signs against the pkgbase store; upstream calls this one something else.\n")
 		}
 		b.WriteString("#\n")
-		switch {
-		case !r.UpstreamFallthrough:
-			b.WriteString("# This repository publishes the paths its catalogue names and this server\n")
-			b.WriteString("# fetches nothing under it from upstream: every request stops here, and a\n")
-			b.WriteString("# package it does not hold is a 404 rather than a fetch from the internet.\n")
-		case r.HoldsCatalogue():
-			b.WriteString("# This catalogue is served from what was published here, and a miss on\n")
-			b.WriteString("# meta.conf, packagesite.pkg or data.pkg is refused rather than fetched:\n")
-			b.WriteString("# upstream's catalogue names packages this mirror has never held. Every\n")
-			b.WriteString("# other path reaches the internet on a miss, because this server's proxy\n")
-			b.WriteString("# cache is on: a package the mirror does not hold is fetched from upstream,\n")
-			b.WriteString("# cached, and served under this repository's name, so an install can succeed\n")
-			b.WriteString("# here against a package nobody mirrored.\n")
-		default:
-			b.WriteString("# Every request this repository answers may reach the internet, the\n")
-			b.WriteString("# catalogue included. It is served in proxy mode: this server composes an\n")
-			b.WriteString("# upstream URL for each path and fetches it whenever it holds no fresh\n")
-			b.WriteString("# copy, so `pkg update` against this file contacts upstream. What is\n")
-			b.WriteString("# stored here is whatever earlier requests cached, not a copy of the\n")
-			b.WriteString("# repository.\n")
-		}
+		writeReachComment(&b, r)
 		b.WriteString("#\n")
 		switch {
 		case r.Bootstrap == BootstrapWorks:
