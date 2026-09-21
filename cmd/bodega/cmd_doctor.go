@@ -119,8 +119,9 @@ carries; --release says otherwise for a host whose release is not the one
 the repository is named for. signature_type is the server's answer rather
 than a flag, and there are three of them: a mirror of a ports repository
 verifies against the stock trust store, a mirror of a base_release_<n> one
-against the pkgbase store beside it, and a generated repository against
-bodega's own fingerprint. Naming bodega's key for a mirror fails "pkg
+built for FreeBSD 15 or later against the pkgbase store beside it (no older
+release ships that store, so its base_release_<n> repositories verify against
+the stock one), and a generated repository against bodega's own fingerprint. Naming bodega's key for a mirror fails "pkg
 update" on the signature; naming the wrong one of FreeBSD's two fails
 nothing at all, and the repository installs empty.
 

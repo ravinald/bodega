@@ -677,6 +677,61 @@ func TestPkgbaseMirrorVerifiesAgainstThePkgbaseTrustStore(t *testing.T) {
 	}
 }
 
+// The trust store is right for a base_release_<n> mirror below ReleaseSplit
+// and the sentence above it used to say the repository was not one, which is
+// the pair that costs a reader something: they conclude bodega misread their
+// URL, move fingerprints to the pkgbase store, and land in the silent failure
+// the paragraph next door warns about. On 13 and 14 that directory does not
+// exist at all. Measured with pkg 2.7.5 against
+// FreeBSD:14:amd64/base_release_1: the ports store verifies the catalogue and
+// reaches the ABI check past verification, the pkgbase one prints "No trusted
+// public keys found" and processes nothing.
+func TestABaseReleaseMirrorBelowTheSplitIsNotToldItIsNotOne(t *testing.T) {
+	for _, abi := range []string{"FreeBSD:13:amd64", "FreeBSD:14:amd64"} {
+		t.Run(abi, func(t *testing.T) {
+			st := pkgbaseMirror()
+			st.ABI, st.Upstream = abi, "https://pkg.freebsd.org/"+abi+"/base_release_1"
+			got := render(t, st)
+			if got.Pkgbase {
+				t.Fatalf("Pkgbase = true: no release below %d ships a pkgbase trust store", pkgrepos.ReleaseSplit)
+			}
+			if !got.BaseRelease {
+				t.Fatalf("BaseRelease = false for a mirror of %s", st.Upstream)
+			}
+			if got.Fingerprints != pkgrepos.StockFingerprints {
+				t.Errorf("Fingerprints = %q, want %q", got.Fingerprints, pkgrepos.StockFingerprints)
+			}
+			prose := confProse(got.Conf)
+			if strings.Contains(prose, "this one something else") {
+				t.Errorf("the conf tells a base_release_1 mirror that upstream calls it something else:\n%s", got.Conf)
+			}
+			if !strings.Contains(prose, "installs no pkgbase directory") {
+				t.Errorf("the conf never says which term excused this repository from the pkgbase store:\n%s", got.Conf)
+			}
+		})
+	}
+}
+
+// The positive row, so the fix above cannot be made by deleting the sentence
+// for everybody: a base_release_<n> mirror at or above the split keeps the
+// pkgbase paragraph.
+func TestABaseReleaseMirrorAtTheSplitKeepsThePkgbaseParagraph(t *testing.T) {
+	got := render(t, pkgbaseMirror())
+	if !got.BaseRelease || !got.Pkgbase {
+		t.Fatalf("BaseRelease %v Pkgbase %v, want both true", got.BaseRelease, got.Pkgbase)
+	}
+	prose := confProse(got.Conf)
+	if !strings.Contains(prose, "pkgbase trust store") {
+		t.Errorf("the conf never names the pkgbase store:\n%s", got.Conf)
+	}
+	// Both terms of the predicate that selected this arm, so a reader on an
+	// older release cannot read the name alone and move their own file.
+	if !strings.Contains(prose, "base_release_<n>") ||
+		!strings.Contains(prose, "or later, whose base system") {
+		t.Errorf("the conf explains the pkgbase store with fewer terms than decided it:\n%s", got.Conf)
+	}
+}
+
 // Every other repository upstream publishes comes off the package builders'
 // key, base snapshots included, so "is it a base repository" is the wrong
 // question: answering it sends base_latest — the base repository bodega's own
@@ -761,8 +816,9 @@ func TestWithReleaseMovesTheOverridesAndNothingElse(t *testing.T) {
 		t.Errorf("re-rendering for another release changed the trust half: %q/%q became %q/%q",
 			fifteen.SignatureType, fifteen.Fingerprints, got.SignatureType, got.Fingerprints)
 	}
-	if got.URL != fifteen.URL || got.Tag != fifteen.Tag || got.Pkgbase != fifteen.Pkgbase {
-		t.Errorf("re-rendering changed url/tag/pkgbase: %+v against %+v", got, fifteen)
+	if got.URL != fifteen.URL || got.Tag != fifteen.Tag || got.Pkgbase != fifteen.Pkgbase ||
+		got.BaseRelease != fifteen.BaseRelease {
+		t.Errorf("re-rendering changed url/tag/pkgbase/base_release: %+v against %+v", got, fifteen)
 	}
 	if got.UpstreamFallthrough != fifteen.UpstreamFallthrough {
 		t.Errorf("re-rendering changed upstream_fallthrough: %v became %v; the cache toggle it comes from is the server's and does not cross",

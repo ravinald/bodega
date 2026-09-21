@@ -1214,9 +1214,20 @@ components:
           description: >-
             A mirror of a repository release engineering signed, which
             verifies against the pkgbase trust store rather than the ports
-            one. Carried because the upstream URL it is derived from does not
-            cross the wire, so a consumer re-rendering this configuration
-            cannot work it out again.
+            one. Two terms decide it: base_release below, and a repository
+            built for FreeBSD 15 or later, the first release whose base system
+            installs that store. Carried because the upstream URL it is
+            derived from does not cross the wire, so a consumer re-rendering
+            this configuration cannot work it out again.
+        base_release:
+          type: boolean
+          description: >-
+            Upstream calls this repository base_release_<n>, which is release
+            engineering's own. It is pkgbase's first term alone, and the two
+            differ on a mirror of base_release_<n> built for FreeBSD 13 or 14:
+            that one verifies against the ports store, and the emitted comment
+            says which term excused it rather than denying the repository its
+            name. Omitted when false.
         bootstrap:
           type: string
           description: >-
@@ -1240,9 +1251,11 @@ components:
           type: string
           description: >-
             "fingerprints" against the ports trust store for a mirror of a
-            ports repository, against the pkgbase one for a mirror of a base
-            repository, against bodega's own for a signed generated
-            repository; "none" for an unsigned one.
+            ports repository, against the pkgbase one for a mirror of a
+            base_release_<n> repository built for FreeBSD 15 or later, against
+            bodega's own for a signed generated repository; "none" for an
+            unsigned one. A base_release_<n> mirror for an older release takes
+            the ports store, because no older release installs the other.
           enum: [fingerprints, none]
         fingerprints:
           type: string

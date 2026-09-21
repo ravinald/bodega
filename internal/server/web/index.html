@@ -766,9 +766,12 @@ function getClientUrl(type, entry) {
     // the same copy. signature_type comes from the server too, and it is
     // three answers: the stock trust store for a mirror of a ports
     // repository, the pkgbase store beside it for a mirror of a
-    // base_release_<n> one, and bodega's own key for a generated repository.
-    // The server derives it from the entry's upstream URL, which is not on
-    // this response, so nothing here may work it out again.
+    // base_release_<n> one built for FreeBSD 15 or later, and bodega's own
+    // key for a generated repository. No older release installs the pkgbase
+    // store, so its base_release_<n> repositories take the stock one. The
+    // server derives it from the entry's upstream URL and the release the
+    // repository was built for, neither of which is on this response, so
+    // nothing here may work it out again.
     case 'freebsd': {
       const repo = freeBSDRepoFor(entry);
       return repo ? repo.conf : '';

@@ -371,6 +371,18 @@ type Repo struct {
 	// the fields it can see would resolve it back into the ports store.
 	Pkgbase bool `json:"pkgbase,omitempty"`
 
+	// BaseRelease is the first of Pkgbase's two terms: upstream calls this
+	// repository base_release_<n>. Pkgbase is that name and a release whose
+	// base system ships the pkgbase trust store, so the two part company on
+	// exactly one repository, a mirror of base_release_<n> built for a
+	// release below ReleaseSplit. That one verifies against the ports store
+	// like ports, and the comment saying so has to name the release rather
+	// than deny the repository its name.
+	//
+	// Carried for the reason Pkgbase is: it comes from the upstream URL,
+	// which is the server's fact and never crosses the wire.
+	BaseRelease bool `json:"base_release,omitempty"`
+
 	// Bootstrap is what `pkg bootstrap` does here. Never omitted: an absent
 	// value and "unknown" mean the same thing and both hedge, while a field
 	// that disappears on the common answer invites a consumer to read its
@@ -495,9 +507,30 @@ func ReleaseFromABI(abi string) (int, bool) {
 // while the URL is the repository root exactly as pkg.conf would spell it, so
 // its last path segment is what upstream calls it.
 func IsPkgbaseSigned(upstream string, release int) bool {
-	if release < ReleaseSplit {
-		return false
-	}
+	return release >= ReleaseSplit && IsBaseRelease(upstream)
+}
+
+// IsBaseRelease reports whether upstream calls this repository
+// base_release_<n>, which is release engineering's own rather than the
+// package builders'.
+//
+// It is the first of IsPkgbaseSigned's two terms and is exported because the
+// emitted configuration has to explain which of the two excused a repository
+// from the pkgbase store. Below ReleaseSplit the name holds and the trust
+// store still does not, and a file telling that operator their repository is
+// not a base_release_<n> one sends them to move fingerprints onto a directory
+// their host does not have.
+//
+// Measured with pkg 2.7.5 on 15.1-RELEASE, fetching
+// FreeBSD:14:amd64/base_release_1 under each of the host's two stores with
+// ABI and OSVERSION pinned to that release:
+//
+//	/usr/share/keys/pkg          525 packages processed, exit 0
+//	/usr/share/keys/pkgbase-15   "No trusted public keys found", 0, exit 0
+//
+// So the name alone decides nothing, and the store that verifies a 14
+// base_release repository is the same one that verifies ports.
+func IsBaseRelease(upstream string) bool {
 	return strings.HasPrefix(upstreamName(upstream), "base_release")
 }
 
@@ -620,7 +653,8 @@ func Render(st State) (Repo, error) {
 		// the key that signed a catalogue is a property of the catalogue.
 		// Release moves the overrides onto a host of another release and
 		// cannot move a signature.
-		Pkgbase: !st.Generated && IsPkgbaseSigned(st.Upstream, repoRelease),
+		Pkgbase:     !st.Generated && IsPkgbaseSigned(st.Upstream, repoRelease),
+		BaseRelease: !st.Generated && IsBaseRelease(st.Upstream),
 		// Two facts, not one. Whether a path outside the catalogue reaches
 		// upstream at all is the first, and which upstream repository it
 		// reaches decides whether there is anything there to fetch.
@@ -830,22 +864,38 @@ func renderConf(r Repo) string {
 		b.WriteString("# twice, so on an ordinary poudriere tree it is absent.\n")
 	} else {
 		b.WriteString("#\n")
-		if r.Pkgbase {
+		switch {
+		case r.Pkgbase:
 			b.WriteString("# fingerprints names the pkgbase trust store, not the ports one beside it\n")
-			b.WriteString("# on the same host. These bytes come from a repository release engineering\n")
-			b.WriteString("# signs, whose key is not in " + StockFingerprints + ": /etc/pkg/FreeBSD.conf\n")
-			b.WriteString("# gives FreeBSD-ports the ports store and FreeBSD-base this one. Pointed\n")
-			b.WriteString("# at the wrong one, `pkg update` prints \"No trusted public keys found\",\n")
-			b.WriteString("# exits 0 and processes no entries, and `pkg install` then reports every\n")
-			b.WriteString("# package as missing rather than as unverifiable. Confirm with `pkg -vv`,\n")
-			b.WriteString("# which prints the path after ${VERSION_MAJOR} resolves.\n")
-		} else {
+			b.WriteString("# on the same host. Two things put it there: upstream calls this repository\n")
+			b.WriteString("# base_release_<n>, which release engineering signs rather than the package\n")
+			b.WriteString("# builders, and it is built for FreeBSD " + strconv.Itoa(ReleaseSplit) + " or later, whose base system\n")
+			b.WriteString("# installs that second key set. It is not in " + StockFingerprints + ":\n")
+			b.WriteString("# /etc/pkg/FreeBSD.conf gives FreeBSD-ports the ports store and FreeBSD-base\n")
+			b.WriteString("# this one. Pointed at the wrong one, `pkg update` prints \"No trusted\n")
+			b.WriteString("# public keys found\", exits 0 and processes no entries, and `pkg install`\n")
+			b.WriteString("# then reports every package as missing rather than as unverifiable.\n")
+			b.WriteString("# Confirm with `pkg -vv`, which prints the path after ${VERSION_MAJOR}\n")
+			b.WriteString("# resolves.\n")
+		case r.BaseRelease:
+			b.WriteString("# fingerprints names the trust store every FreeBSD host already ships, and\n")
+			b.WriteString("# this repository's name is not a reason to move it. Upstream calls it\n")
+			b.WriteString("# base_release_<n>, which release engineering signs against the pkgbase\n")
+			b.WriteString("# store on FreeBSD " + strconv.Itoa(ReleaseSplit) + " and later; this one is built for an older release,\n")
+			b.WriteString("# whose base system installs no pkgbase directory to verify against, so its\n")
+			b.WriteString("# catalogue comes off the package builders' key like ports. Measured with\n")
+			b.WriteString("# pkg 2.7.5: FreeBSD:14:amd64/base_release_1 verifies under\n")
+			b.WriteString("# " + StockFingerprints + " and not under /usr/share/keys/pkgbase-15. bodega\n")
+			b.WriteString("# copies these bytes from upstream without transforming them, so FreeBSD's\n")
+			b.WriteString("# own signature arrives inside the catalogue archive and no key of bodega's\n")
+			b.WriteString("# is in this path.\n")
+		default:
 			b.WriteString("# fingerprints names the trust store every FreeBSD host already ships.\n")
 			b.WriteString("# bodega copies these bytes from upstream without transforming them, so\n")
 			b.WriteString("# FreeBSD's own signature arrives inside the catalogue archive and no key\n")
-			b.WriteString("# of bodega's is in this path. The base_release_<n> repositories are the\n")
-			b.WriteString("# exception and this is not one: release engineering signs those, and they\n")
-			b.WriteString("# verify against the pkgbase store.\n")
+			b.WriteString("# of bodega's is in this path. The exception is a base_release_<n>\n")
+			b.WriteString("# repository built for FreeBSD " + strconv.Itoa(ReleaseSplit) + " or later, which release engineering\n")
+			b.WriteString("# signs against the pkgbase store; upstream calls this one something else.\n")
 		}
 		b.WriteString("#\n")
 		switch {
