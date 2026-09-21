@@ -55,7 +55,13 @@ repository-root files are copied out of the source first, every repopath those
 copies name is written and verified at the destination, and the root files
 follow last. Nothing reaches the destination's repository root until the object
 set is established there, so a refusal leaves whatever generation it was
-already serving intact.`,
+already serving intact.
+
+A generated freebsd repository stores no root files — the catalogue is built
+per request from the backend the manifest names — so its packages are the whole
+move. The destination is refused if it already holds objects under the
+repository, because the generated catalogue is a listing and would publish them
+as packages nobody uploaded.`,
 		Example: `  bodega pkg move binary example-tool-v2 --to bulk
   bodega pkg move npm @example-corp/widget-cli@1.5.0 --to archive
   bodega pkg move git widget@v4.5.5 --to bulk

@@ -755,6 +755,18 @@ latest@FreeBSD:14:amd64: the archives on "default" name All/Hashed/zogftw-2025.0
 
 Objects on the source that neither archive names are not copied, for the same reason the upload does not upload them: no client can ask for them. `--delete-source` therefore removes what the move wrote and leaves those behind, and it removes `packagesite.pkg` first, so the window it opens on the source is a client told there is no such repository rather than one that resolves a package out of a live catalogue and cannot fetch it.
 
+#### a generated freebsd repository moves its packages
+
+A repository bodega generates the catalogue for stores no root files: `meta.conf`, `data.pkg` and `packagesite.pkg` are built per request from whichever backend the manifest names. The republication above has nothing to pin and nothing to publish last, so the move copies the packages alone, verifies each at the destination, and writes the manifest after them.
+
+The listing is the document here, which reverses one rule and adds one check. A mirror refuses to enumerate by listing the prefix, because a listing is not the set a catalogue names; a generated repository has nothing else that names anything, and its catalogue is built from the listing after the move lands. The destination is therefore asked first whether it holds objects under the repository that the source does not, since those would be served as packages nobody uploaded:
+
+```text
+latest@FreeBSD:14:amd64: "bulk" already holds 1 object(s) under freebsd/FreeBSD:14:amd64/latest/ that "default" does not, the first being freebsd/FreeBSD:14:amd64/latest/All/leftover-9.9.pkg. A generated catalogue is built from whatever is under the prefix, so the moved repository would publish them as packages nobody uploaded. Nothing was written to "bulk" and the manifest still points at "default": remove them, or move to a backend that is not already serving this repository
+```
+
+An upload landing while the move is copying is refused the same way, between the last copy and the manifest write. Committing would point the manifest at the destination while the packages that landed in between sit on the backend it is about to stop naming, and the catalogue is built from whichever one the manifest names.
+
 #### pypi is not movable
 
 `pypi` wheels upload as one local directory to one key prefix, and the PEP 503 index is generated from a listing over that whole tree. A package placed on another backend drops out of the index that finds it, so there is no per-version object to move:
