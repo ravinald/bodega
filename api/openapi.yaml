@@ -1193,10 +1193,13 @@ components:
           type: boolean
           description: >-
             Served from upstream on a miss rather than from a finished mirror.
-            Reported, not acted on: nothing else in this object is derived
-            from it, and a reader asking whether this repository reaches the
-            internet wants upstream_fallthrough below, which a hosted mirror
-            on a server with proxy_cache_enabled also carries.
+            It answers how much of this repository falls through rather than
+            whether any of it does: a catalogue file is fetched from upstream
+            in proxy mode and refused in a hosted one, so a proxied repository
+            holds nothing of its own. A reader asking whether this repository
+            reaches the internet at all wants upstream_fallthrough below,
+            which a hosted mirror on a server with proxy_cache_enabled also
+            carries. conf says which of the two this is in a paragraph.
         upstream_fallthrough:
           type: boolean
           description: >-

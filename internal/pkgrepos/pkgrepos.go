@@ -84,7 +84,7 @@ const (
 	// .sig and .pub as tar members, so FreeBSD's attestation reaches the
 	// client and the stock trust store checks it. No key of bodega's is in
 	// that path.
-	MirroredNote = `This repository is mirrored from upstream with its signature inside the catalogue archive, so pkg verifies it against ` + StockFingerprints + `, which every FreeBSD host already ships. Do not point fingerprints at a bodega key here: bodega signs nothing in this path, and the stanza would fail "pkg update" on a signature that is present and valid.`
+	MirroredNote = `bodega copies this repository's bytes from upstream without transforming them, so FreeBSD's own signature arrives inside the catalogue archive and pkg verifies it against ` + StockFingerprints + `, which every FreeBSD host already ships. Do not point fingerprints at a bodega key here: bodega signs nothing in this path, and the stanza would fail "pkg update" on a signature that is present and valid.`
 
 	// PkgbaseMirroredNote is MirroredNote's other half, and the reason a
 	// mirror is two cases rather than one. A release-engineered base
@@ -94,7 +94,7 @@ const (
 	// public keys found", exits 0, processes no entries, and the next
 	// `pkg install` says the package does not exist rather than that it could
 	// not be verified.
-	PkgbaseMirroredNote = `This mirrors one of FreeBSD's release-engineered base repositories, which release engineering signs with the pkgbase key set rather than the one the package builders use, so it verifies against ` + PkgbaseFingerprints + ` and not ` + StockFingerprints + `. Pointed at the ports store it fails silently: "pkg update" prints "No trusted public keys found", exits 0 and processes no entries, and "pkg install" then reports every package as missing.`
+	PkgbaseMirroredNote = `The repository these bytes come from is one of FreeBSD's release-engineered base repositories, which release engineering signs with the pkgbase key set rather than the one the package builders use, so it verifies against ` + PkgbaseFingerprints + ` and not ` + StockFingerprints + `. Pointed at the ports store it fails silently: "pkg update" prints "No trusted public keys found", exits 0 and processes no entries, and "pkg install" then reports every package as missing.`
 
 	// FingerprintNote is the out-of-band delivery a generated repository
 	// needs. The first fetch of any public key is authenticated by TLS alone;
@@ -108,6 +108,41 @@ const (
 	// Ansible template needs to read it before the paste.
 	UnsignedNote = `signature_type: none accepts whatever this server returns, with TLS as the only thing authenticating the packages, and it propagates into Ansible templates and image builds that outlive whatever made it necessary. Run "bodega freebsd key generate", reload the server, and re-read this stanza to get a verified one.`
 
+	// IsolatedNote, ProxyReachNote and MirrorReachNote answer how much of
+	// this repository leaves the host, which is the question an operator
+	// pastes the file to settle. Two facts decide it: State.ReachesUpstream
+	// says whether any path falls through, and Repo.HoldsCatalogue says
+	// whether the catalogue is one of them.
+	//
+	// One text used to cover all three, keyed off nothing: the bootstrap
+	// note ended on "unlike every other request this repository answers",
+	// which was true of the hosted mirror it was written for and printed for
+	// a proxy, where every request reaches upstream and the catalogue with
+	// them.
+
+	// IsolatedNote is the isolation claim, and it may be printed only where
+	// nothing falls through: no url on the entry, or neither the proxy mode
+	// nor the server's proxy cache.
+	IsolatedNote = `Every request this repository answers stops at this server: it publishes the paths its catalogue names and this server fetches nothing under it from upstream, so a package it does not hold is a 404 here rather than a fetch from the internet.`
+
+	// ProxyReachNote is the answer for a repository served in proxy mode,
+	// where the catalogue falls through with everything else and bodega holds
+	// no copy of the repository at all.
+	ProxyReachNote = `Every request this repository answers may reach the internet, the catalogue included: it is served in proxy mode, so this server composes an upstream URL for each path and fetches it whenever it holds no fresh copy. What is stored here is whatever earlier requests cached, not a copy of the repository.`
+
+	// MirrorReachNote is the mirror whose own catalogue is served from here
+	// and whose misses are not. Hosted and falling through means the server's
+	// proxy cache is on, since that is the only other term the route reads,
+	// and the cost is that an install can succeed against a package the
+	// mirror never held.
+	//
+	// The three files are named rather than called "the catalogue" because
+	// the route recognizes exactly those three (manifest.FreeBSDCatalogFiles)
+	// and a root file under any other spelling falls through like a package.
+	// TestTheMirrorNoteNamesEveryCatalogueFileTheRouteKnows holds the
+	// sentence and that list together.
+	MirrorReachNote = `This repository's catalogue is served from what was published here, and a miss on meta.conf, packagesite.pkg or data.pkg is refused rather than fetched, but every other path reaches the internet on a miss: this server's proxy cache is on, so a package the mirror does not hold is fetched from upstream, cached and served under this repository's name. An install can succeed here against a package nobody mirrored.`
+
 	// NoBootstrapNote is the answer when nothing under this repository is
 	// fetched from upstream. pkg's own bootstrapper (usr.sbin/pkg/pkg.c)
 	// fetches <repo>/Latest/pkg.pkg and its .sig and nothing else, and a
@@ -117,10 +152,10 @@ const (
 	// That a mirror publishes only its catalogue is the premise rather than
 	// the answer, and it is the whole answer only where State.ReachesUpstream
 	// is false: the route serves a path the catalogue does not name from
-	// upstream wherever it can. So this text carries the isolation claim as
-	// well, which is what an operator running a hosted mirror opens the file
-	// for.
-	NoBootstrapNote = `"pkg bootstrap" does not work against this repository: it fetches Latest/pkg.pkg and Latest/pkg.pkg.sig, this repository publishes only the paths its catalogue names, and this server fetches nothing under it from upstream. Install pkg on the host from upstream first, then switch it over.`
+	// upstream wherever it can. The isolation claim itself is IsolatedNote's,
+	// which reads the same fact and answers how much of this repository is
+	// here rather than what one command does.
+	NoBootstrapNote = `"pkg bootstrap" does not work against this repository: it fetches Latest/pkg.pkg and Latest/pkg.pkg.sig, a catalogue never names that pair, and nothing under this repository falls through to upstream to fetch it from. Install pkg on the host from upstream first, then switch it over.`
 
 	// BootstrapResolvesNote is the answer when a path outside the catalogue
 	// reaches upstream and upstream publishes the pair. Two facts decide it
@@ -134,7 +169,7 @@ const (
 	// credential-name pattern matches "pw" case-insensitively, the camelCase
 	// boundary in "BootstrapWorks" spells one, and the lint then fails on a
 	// string holding no secret.
-	BootstrapResolvesNote = `"pkg bootstrap" works against this repository: this server fetches a path outside its catalogue from the upstream the repository records, and upstream publishes Latest/pkg.pkg and Latest/pkg.pkg.sig under it. That one path reaches the internet, unlike every other request this repository answers.`
+	BootstrapResolvesNote = `"pkg bootstrap" works against this repository: this server fetches a path outside its catalogue from the upstream the repository records, and upstream publishes Latest/pkg.pkg and Latest/pkg.pkg.sig under it, so that path reaches the internet through this server.`
 
 	// NoBootstrapUpstreamNote is the repository whose paths reach upstream
 	// and whose upstream publishes no pkg package. The route resolves the
@@ -246,7 +281,9 @@ type State struct {
 	// Proxy marks a repository served from upstream on a miss rather than
 	// from a finished mirror. It contradicts Generated, which is the second
 	// pair Render refuses, and it is one of the three terms ReachesUpstream
-	// reads. On its own it decides nothing an emitted claim may rest on.
+	// reads. Whether any of the repository falls through is that predicate's
+	// question; how much of it does is this field's alone, read through
+	// Repo.HoldsCatalogue.
 	Proxy bool
 
 	// CacheEnabled is the server's proxy_cache_enabled toggle. It is here
@@ -307,10 +344,11 @@ type Repo struct {
 	Release   int    `json:"release"`
 	Generated bool   `json:"generated,omitempty"`
 
-	// Proxy is the serving mode, and it is reported rather than acted on: no
-	// claim in this struct is derived from it. UpstreamFallthrough is the
-	// question a reader means when they ask whether this repository is
-	// proxied, and the two disagree on a hosted mirror with the cache on.
+	// Proxy is the serving mode. One claim rests on it and it is not the one
+	// a reader expects: HoldsCatalogue reads it to say how much of this
+	// repository falls through to upstream, while whether any of it does is
+	// UpstreamFallthrough, and the two disagree on a hosted mirror with the
+	// cache on.
 	Proxy bool `json:"proxy,omitempty"`
 
 	// UpstreamFallthrough reports whether a request for a path outside this
@@ -369,6 +407,36 @@ type Repo struct {
 // Note joins the consequences of this form into one paragraph, for a consumer
 // with a single line to spend on them.
 func (r Repo) Note() string { return strings.Join(r.Notes, " ") }
+
+// HoldsCatalogue reports whether this repository's catalogue is served from
+// what was published here rather than fetched from upstream per request.
+//
+// State.ReachesUpstream answers whether any path falls through; this answers
+// how much, and the two disagree on exactly the catalogue.
+// internal/server/freebsd.go:128-140 zeroes the composed upstream URL for one
+// of manifest.FreeBSDCatalogFiles when the entry is not proxied, so a hosted
+// mirror answers a catalogue miss with 404 and never with upstream's bytes,
+// while a proxied repository fetches meta.conf, packagesite.pkg and data.pkg
+// from upstream the way it fetches everything else.
+//
+// The two questions were one sentence in the bootstrap paragraph, keyed off
+// nothing, and it told a proxy operator that a single path left the building.
+// Measured on 2026-09-21 against a bodega built from this tree, with
+// proxy_cache_enabled: true, a local backend holding no objects, and two
+// FreeBSD:15:aarch64 entries recording the same
+// pkg.FreeBSD.org/FreeBSD:15:aarch64/quarterly url, one at mode: proxy and one
+// hosted:
+//
+//	         meta.conf  packagesite.pkg  data.pkg  All/pv-1.9.31.pkg  Latest/pkg.pkg
+//	proxy    200 179    200 10878141     200 10877713  200 106010     200 5477177
+//	hosted   404 19     404 19           404 19        200 106010     200 5477177
+//
+// Latest/pkg.pkg.sig answers 200 727 on both rows. The two entries differ in
+// the mode and nothing else, so the catalogue is the whole of what the mode
+// decides. cache_origins names where the bytes came from: six rows under the
+// proxied entry, all pointing at pkg.FreeBSD.org, and three under the hosted
+// one, none of them a catalogue file.
+func (r Repo) HoldsCatalogue() bool { return !r.Proxy }
 
 // BaseURL returns the base URL a client fetches from, resolving the
 // placeholder when State reports no public URL.
@@ -613,9 +681,9 @@ func (r Repo) notes() []string {
 	var out []string
 	switch {
 	case r.Pkgbase:
-		out = append(out, PkgbaseMirroredNote, bootstrapNote(r))
+		out = append(out, PkgbaseMirroredNote, reachNote(r), bootstrapNote(r))
 	case !r.Generated:
-		out = append(out, MirroredNote, bootstrapNote(r))
+		out = append(out, MirroredNote, reachNote(r), bootstrapNote(r))
 	case r.SignatureType != "none":
 		out = append(out, FingerprintNote)
 	default:
@@ -653,6 +721,26 @@ func bootstrapAnswer(st State) BootstrapAnswer {
 		return BootstrapAbsent
 	default:
 		return UpstreamBootstrap(st.Upstream)
+	}
+}
+
+// reachNote says how much of this repository leaves the host, from the two
+// facts that decide it: whether anything falls through to upstream, and
+// whether the catalogue is one of the paths that does.
+//
+// Neither fact alone answers it, which is how one text came to be printed for
+// all three cases. A repository that falls through is not thereby proxied: a
+// hosted mirror on a cache-enabled server serves its own catalogue and fetches
+// everything else. A proxied one is not thereby reachable: with no url on the
+// entry there is nothing to compose.
+func reachNote(r Repo) string {
+	switch {
+	case !r.UpstreamFallthrough:
+		return IsolatedNote
+	case r.HoldsCatalogue():
+		return MirrorReachNote
+	default:
+		return ProxyReachNote
 	}
 }
 
@@ -703,9 +791,9 @@ func renderStanza(r Repo) string {
 // file is what somebody opens at 03:00, six months after whoever installed it
 // left. Each one answers a question the file provokes on its own: why the
 // scheme is not the pkg+https next door, why there are disable blocks for
-// repositories this file does not otherwise mention, which of the two trust
-// stores on the host this is and why, and why "pkg bootstrap" against this
-// URL returns nothing.
+// repositories this file does not otherwise mention, which of the trust
+// stores on the host this is and why, how much of this repository leaves the
+// host, and why "pkg bootstrap" against this URL returns nothing.
 func renderConf(r Repo) string {
 	var b strings.Builder
 	b.WriteString("# bodega pkg repository. Install as " + ClientConfPath + ".\n")
@@ -744,27 +832,49 @@ func renderConf(r Repo) string {
 		b.WriteString("#\n")
 		if r.Pkgbase {
 			b.WriteString("# fingerprints names the pkgbase trust store, not the ports one beside it\n")
-			b.WriteString("# on the same host. This mirrors a repository release engineering signs,\n")
-			b.WriteString("# and its key is not in " + StockFingerprints + ": /etc/pkg/FreeBSD.conf\n")
+			b.WriteString("# on the same host. These bytes come from a repository release engineering\n")
+			b.WriteString("# signs, whose key is not in " + StockFingerprints + ": /etc/pkg/FreeBSD.conf\n")
 			b.WriteString("# gives FreeBSD-ports the ports store and FreeBSD-base this one. Pointed\n")
 			b.WriteString("# at the wrong one, `pkg update` prints \"No trusted public keys found\",\n")
 			b.WriteString("# exits 0 and processes no entries, and `pkg install` then reports every\n")
 			b.WriteString("# package as missing rather than as unverifiable. Confirm with `pkg -vv`,\n")
 			b.WriteString("# which prints the path after ${VERSION_MAJOR} resolves.\n")
 		} else {
-			b.WriteString("# fingerprints names the trust store every FreeBSD host already ships. This\n")
-			b.WriteString("# repository is mirrored byte for byte, so FreeBSD's own signature arrives\n")
-			b.WriteString("# inside the catalogue archive and no key of bodega's is in this path. The\n")
-			b.WriteString("# base_release_<n> repositories are the exception and this is not one: they\n")
-			b.WriteString("# are signed by release engineering and verify against the pkgbase store.\n")
+			b.WriteString("# fingerprints names the trust store every FreeBSD host already ships.\n")
+			b.WriteString("# bodega copies these bytes from upstream without transforming them, so\n")
+			b.WriteString("# FreeBSD's own signature arrives inside the catalogue archive and no key\n")
+			b.WriteString("# of bodega's is in this path. The base_release_<n> repositories are the\n")
+			b.WriteString("# exception and this is not one: release engineering signs those, and they\n")
+			b.WriteString("# verify against the pkgbase store.\n")
+		}
+		b.WriteString("#\n")
+		switch {
+		case !r.UpstreamFallthrough:
+			b.WriteString("# This repository publishes the paths its catalogue names and this server\n")
+			b.WriteString("# fetches nothing under it from upstream: every request stops here, and a\n")
+			b.WriteString("# package it does not hold is a 404 rather than a fetch from the internet.\n")
+		case r.HoldsCatalogue():
+			b.WriteString("# This catalogue is served from what was published here, and a miss on\n")
+			b.WriteString("# meta.conf, packagesite.pkg or data.pkg is refused rather than fetched:\n")
+			b.WriteString("# upstream's catalogue names packages this mirror has never held. Every\n")
+			b.WriteString("# other path reaches the internet on a miss, because this server's proxy\n")
+			b.WriteString("# cache is on: a package the mirror does not hold is fetched from upstream,\n")
+			b.WriteString("# cached, and served under this repository's name, so an install can succeed\n")
+			b.WriteString("# here against a package nobody mirrored.\n")
+		default:
+			b.WriteString("# Every request this repository answers may reach the internet, the\n")
+			b.WriteString("# catalogue included. It is served in proxy mode: this server composes an\n")
+			b.WriteString("# upstream URL for each path and fetches it whenever it holds no fresh\n")
+			b.WriteString("# copy, so `pkg update` against this file contacts upstream. What is\n")
+			b.WriteString("# stored here is whatever earlier requests cached, not a copy of the\n")
+			b.WriteString("# repository.\n")
 		}
 		b.WriteString("#\n")
 		switch {
 		case r.Bootstrap == BootstrapWorks:
 			b.WriteString("# `pkg bootstrap` works here: this server fetches a path outside this\n")
 			b.WriteString("# catalogue from the upstream the repository records, and upstream publishes\n")
-			b.WriteString("# Latest/pkg.pkg and its .sig under it. That one path reaches the internet,\n")
-			b.WriteString("# unlike every other request this repository answers.\n")
+			b.WriteString("# Latest/pkg.pkg and its .sig under it.\n")
 		case r.Bootstrap == BootstrapAbsent && r.UpstreamFallthrough:
 			b.WriteString("# `pkg bootstrap` does not work against this repository. It fetches\n")
 			b.WriteString("# Latest/pkg.pkg and Latest/pkg.pkg.sig; this server fetches a path outside\n")
@@ -775,10 +885,9 @@ func renderConf(r Repo) string {
 			b.WriteString("# a ports repository, then switch it over.\n")
 		case r.Bootstrap == BootstrapAbsent:
 			b.WriteString("# `pkg bootstrap` does not work against this repository. It fetches\n")
-			b.WriteString("# Latest/pkg.pkg and Latest/pkg.pkg.sig and nothing else, this repository\n")
-			b.WriteString("# publishes only the paths its catalogue names, and this server fetches\n")
-			b.WriteString("# nothing under it from upstream: every request stops here. Install pkg from\n")
-			b.WriteString("# upstream before switching a host over.\n")
+			b.WriteString("# Latest/pkg.pkg and Latest/pkg.pkg.sig and nothing else, a catalogue\n")
+			b.WriteString("# never names that pair, and nothing here falls through to upstream to get\n")
+			b.WriteString("# from. Install pkg from upstream before switching a host over.\n")
 		default:
 			b.WriteString("# `pkg bootstrap` may not work against this repository. It fetches\n")
 			b.WriteString("# Latest/pkg.pkg and Latest/pkg.pkg.sig, upstream publishes that pair under\n")

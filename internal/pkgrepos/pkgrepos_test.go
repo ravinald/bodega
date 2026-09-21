@@ -21,6 +21,20 @@ func mirror() pkgrepos.State {
 	}
 }
 
+// confProse is the emitted file's comment block as one line. An assertion
+// about what the file says has to survive a rewrap of the paragraph that says
+// it, or the next person to reflow a comment is failing tests about a claim
+// they did not change.
+func confProse(conf string) string {
+	var out []string
+	for _, line := range strings.Split(conf, "\n") {
+		if trimmed := strings.TrimPrefix(line, "#"); trimmed != line {
+			out = append(out, strings.TrimSpace(trimmed))
+		}
+	}
+	return strings.Join(out, " ")
+}
+
 func render(t *testing.T, st pkgrepos.State) pkgrepos.Repo {
 	t.Helper()
 	got, err := pkgrepos.Render(st)
@@ -228,7 +242,7 @@ func TestBootstrapAnswerFollowsWhatReachesUpstream(t *testing.T) {
 				t.Errorf("the conf does not carry %q:\n%s", tc.conf, got.Conf)
 			}
 			if got.Proxy != tc.proxy {
-				t.Errorf("Proxy = %v, want %v: the serving mode is reported even though nothing is derived from it", got.Proxy, tc.proxy)
+				t.Errorf("Proxy = %v, want %v: the serving mode is what HoldsCatalogue reads, and it crosses the wire for that", got.Proxy, tc.proxy)
 			}
 		})
 	}
@@ -251,6 +265,122 @@ func TestOnlyAnIsolatedRepositoryClaimsToBeOne(t *testing.T) {
 		}
 		if got.UpstreamFallthrough && !strings.Contains(got.Note(), "reaches the internet") {
 			t.Errorf("proxy_cache_enabled=%v: a repository that fetches from upstream does not say so: %q", cache, got.Note())
+		}
+	}
+}
+
+// How much of this repository leaves the host is two facts, and a file that
+// answers it with one gets a whole case wrong.
+//
+// The sentence this covers was not in a switch at all. It was a constant at
+// the end of the bootstrap paragraph, "That one path reaches the internet,
+// unlike every other request this repository answers": true of the hosted
+// mirror it was written for, and printed unchanged for a proxy, where
+// "pkg update" itself comes off pkg.FreeBSD.org. Its neighbor claimed the
+// repository was mirrored byte for byte, which a proxy is not either.
+func TestTheConfSaysHowMuchOfTheRepositoryLeavesTheHost(t *testing.T) {
+	// Printed for the case each was written for and never for another.
+	const (
+		isolated = "every request stops here"
+		hosted   = "This catalogue is served from what was published here"
+		proxied  = "may reach the internet, the"
+	)
+	for _, tc := range []struct {
+		name         string
+		proxy, cache bool
+		holds        bool
+		want, absent []string
+	}{
+		{
+			name:   "hosted mirror, cache off",
+			holds:  true,
+			want:   []string{isolated, "a 404 rather than a fetch from the internet"},
+			absent: []string{hosted, proxied},
+		},
+		{
+			name:  "hosted mirror, cache on",
+			cache: true,
+			holds: true,
+			want: []string{
+				hosted,
+				"a miss on meta.conf, packagesite.pkg or data.pkg is refused rather than fetched",
+				"this server's proxy cache is on",
+				"an install can succeed here against a package nobody mirrored",
+			},
+			absent: []string{isolated, proxied},
+		},
+		{
+			name:  "proxied repository",
+			proxy: true,
+			want: []string{
+				proxied,
+				"catalogue included",
+				"served in proxy mode",
+				"whatever earlier requests cached, not a copy of the",
+			},
+			absent: []string{isolated, hosted},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := mirror()
+			st.Proxy, st.CacheEnabled = tc.proxy, tc.cache
+			got := render(t, st)
+			if got.HoldsCatalogue() != tc.holds {
+				t.Errorf("HoldsCatalogue() = %v, want %v: a proxied repository fetches meta.conf from upstream like any other path",
+					got.HoldsCatalogue(), tc.holds)
+			}
+			prose := confProse(got.Conf)
+			for _, want := range tc.want {
+				if !strings.Contains(prose, want) {
+					t.Errorf("the conf does not carry %q:\n%s", want, got.Conf)
+				}
+			}
+			for _, absent := range tc.absent {
+				if strings.Contains(prose, absent) {
+					t.Errorf("the conf carries %q, which describes another case:\n%s", absent, got.Conf)
+				}
+			}
+		})
+	}
+}
+
+// The mirror note names the catalogue files rather than saying "the
+// catalogue", because the route recognizes exactly three names
+// (manifest.FreeBSDCatalogFiles) and a repository-root file under any other
+// spelling falls through to upstream like a package does. A name added there
+// and not here is a file this claim silently stops covering.
+func TestTheMirrorNoteNamesEveryCatalogueFileTheRouteKnows(t *testing.T) {
+	st := mirror()
+	st.CacheEnabled = true
+	got := render(t, st)
+	for _, file := range manifest.FreeBSDCatalogFiles {
+		if !strings.Contains(pkgrepos.MirrorReachNote, file) {
+			t.Errorf("MirrorReachNote claims a refusal without naming %s: %q", file, pkgrepos.MirrorReachNote)
+		}
+		if !strings.Contains(confProse(got.Conf), file) {
+			t.Errorf("the emitted file does not name %s among the paths it refuses to fetch:\n%s", file, got.Conf)
+		}
+	}
+}
+
+// The two sentences that made the claim before anything derived it. Neither
+// may be printed for any repository: the first is false wherever a path falls
+// through, which is the only condition it was printed under, and the second
+// says bodega holds a copy of a repository it may hold nothing of.
+func TestTheConfNeverClaimsOnePathReachesUpstream(t *testing.T) {
+	for _, proxy := range []bool{false, true} {
+		for _, cache := range []bool{false, true} {
+			st := mirror()
+			st.Proxy, st.CacheEnabled = proxy, cache
+			got := render(t, st)
+			for _, claim := range []string{
+				"unlike every other request this repository answers",
+				"mirrored byte for byte",
+			} {
+				if strings.Contains(got.Conf+got.Note(), claim) {
+					t.Errorf("proxy=%v cache=%v: the file claims %q:\n%s", proxy, cache, claim, got.Conf)
+				}
+			}
 		}
 	}
 }
@@ -653,6 +783,34 @@ func TestWithReleaseMovesTheOverridesAndNothingElse(t *testing.T) {
 	}
 	if _, err := got.WithRelease(0); err == nil {
 		t.Errorf("WithRelease(0) returned a conf rather than refusing; the overrides would name no tag at all")
+	}
+}
+
+// The serving mode survives the wire, because the reach paragraph is derived
+// from it and doctor --release re-renders the whole file from what crossed.
+// Every fact this file lost in that round trip so far was one nothing carried.
+func TestWithReleaseKeepsTheReachParagraph(t *testing.T) {
+	st := mirror()
+	st.ABI, st.Proxy = "FreeBSD:15:amd64", true
+	proxied := render(t, st)
+
+	var decoded pkgrepos.Repo
+	encoded, err := json.Marshal(proxied)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	got, err := decoded.WithRelease(14)
+	if err != nil {
+		t.Fatalf("WithRelease(14) = %v", err)
+	}
+	if !got.Proxy || got.HoldsCatalogue() {
+		t.Fatalf("the serving mode did not survive the wire: proxy=%v, HoldsCatalogue=%v", got.Proxy, got.HoldsCatalogue())
+	}
+	if !strings.Contains(got.Conf, "catalogue included") {
+		t.Errorf("re-rendering turned a proxy into a mirror that holds its own catalogue:\n%s", got.Conf)
 	}
 }
 

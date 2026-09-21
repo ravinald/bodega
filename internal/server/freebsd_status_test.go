@@ -420,3 +420,117 @@ func TestFreeBSDHostedMirrorWithTheCacheOffIsIsolatedAndSaysSo(t *testing.T) {
 		t.Errorf("the conf withholds the isolation claim from a repository that is isolated:\n%s", repo.Conf)
 	}
 }
+
+// A proxied repository fetches its catalogue from upstream too, and the
+// emitted file may not tell its operator otherwise.
+//
+// The conf claimed one path left the building, which was written for a hosted
+// mirror whose bootstrap pair fell through and printed unchanged here, where
+// `pkg update` itself comes off pkg.FreeBSD.org. Both halves run against one
+// server for the reason the hosted pair below does: the defect is a
+// disagreement between what the route answers for meta.conf and what the
+// configuration says about it, and neither half alone shows it.
+func TestFreeBSDProxiedRepositoryDoesNotClaimOnlyOnePathLeavesTheHost(t *testing.T) {
+	const upstreamCatalog = "upstream's own meta.conf"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(upstreamCatalog))
+	}))
+	t.Cleanup(upstream.Close)
+
+	s := proxyingServer(t)
+	s.cfg.PublicURL = "https://bodega.internal"
+	addVersion(t, s, manifest.TypeFreeBSD, "quarterly", manifest.VersionEntry{
+		Version: freeBSDABI,
+		URL:     upstream.URL + "/quarterly",
+		Mode:    manifest.ModeProxy,
+	})
+
+	// The route half. Nothing was uploaded to this repository, and the
+	// catalogue answers anyway, with upstream's bytes.
+	status, body := getStatusAndBody(t, s, freeBSDURL("quarterly", manifest.FreeBSDMetaFile))
+	if status != http.StatusOK || body != upstreamCatalog {
+		t.Fatalf("GET %s on a proxied repository = %d %q, want 200 and upstream's bytes",
+			manifest.FreeBSDMetaFile, status, body)
+	}
+
+	// The configuration half, describing that same request.
+	st := statusFreeBSD(t, s)
+	repo := st.RepoFor("quarterly", freeBSDABI)
+	if repo == nil {
+		t.Fatalf("no rendered configuration for quarterly@%s, got %+v", freeBSDABI, st.Repos)
+	}
+	if repo.HoldsCatalogue() {
+		t.Errorf("HoldsCatalogue is true for an entry whose meta.conf this server just fetched from upstream")
+	}
+	if strings.Contains(confProse(repo.Conf), "unlike every other request this repository answers") {
+		t.Errorf("the conf claims one path reaches the internet on a repository where every path does:\n%s", repo.Conf)
+	}
+	if strings.Contains(confProse(repo.Conf), "mirrored byte for byte") {
+		t.Errorf("the conf calls a proxy a finished mirror; it holds what earlier requests cached and nothing else:\n%s", repo.Conf)
+	}
+	if !strings.Contains(confProse(repo.Conf), "catalogue included") {
+		t.Errorf("the conf does not say the catalogue is one of the paths that reaches upstream:\n%s", repo.Conf)
+	}
+}
+
+// A hosted mirror on a cache-enabled server fills a package it never held
+// from upstream and serves it under its own name, and the file says so.
+//
+// The pair above it drives Latest/pkg.pkg, which is the bootstrapper's path
+// and the one the old text carved out as the exception. This drives an
+// ordinary package, which is the half that exception left open: an operator
+// told that every request but one stops at bodega is told the mirror is
+// complete, and an install resolving against a package nobody mirrored is how
+// they find out otherwise.
+func TestFreeBSDHostedMirrorFillsAMissFromUpstreamAndSaysSo(t *testing.T) {
+	const pkg = "a package this mirror never held"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(pkg))
+	}))
+	t.Cleanup(upstream.Close)
+
+	s := proxyingServer(t)
+	s.cfg.PublicURL = "https://bodega.internal"
+	addVersion(t, s, manifest.TypeFreeBSD, "latest", manifest.VersionEntry{
+		Version: freeBSDABI,
+		URL:     upstream.URL + "/latest",
+	})
+
+	status, body := getStatusAndBody(t, s, freeBSDURL("latest", "All/pv-1.9.31.pkg"))
+	if status != http.StatusOK || body != pkg {
+		t.Fatalf("GET All/pv-1.9.31.pkg on a hosted mirror with the cache on = %d %q, want 200 and upstream's bytes", status, body)
+	}
+	// The catalogue is the half that does not fall through, which is what
+	// makes this case neither of the other two.
+	if catalogStatus, _ := getStatusAndBody(t, s, freeBSDURL("latest", manifest.FreeBSDMetaFile)); catalogStatus != http.StatusNotFound {
+		t.Fatalf("GET %s on a hosted mirror holding no catalogue = %d, want 404: a mirror's catalogue is refused rather than fetched",
+			manifest.FreeBSDMetaFile, catalogStatus)
+	}
+
+	st := statusFreeBSD(t, s)
+	repo := st.RepoFor("latest", freeBSDABI)
+	if repo == nil {
+		t.Fatalf("no rendered configuration for latest@%s, got %+v", freeBSDABI, st.Repos)
+	}
+	if !repo.HoldsCatalogue() {
+		t.Errorf("HoldsCatalogue is false for an entry whose catalogue this server refused to fetch")
+	}
+	if strings.Contains(confProse(repo.Conf), "unlike every other request this repository answers") {
+		t.Errorf("the conf tells an operator every package request stops here while this server just filled one from %s:\n%s", upstream.URL, repo.Conf)
+	}
+	if !strings.Contains(confProse(repo.Conf), "an install can succeed here against a package nobody mirrored") {
+		t.Errorf("the conf does not say a package the mirror lacks is served from upstream under its name:\n%s", repo.Conf)
+	}
+}
+
+// confProse is the emitted file's comment block as one line, so a claim
+// asserted here survives a rewrap of the paragraph carrying it.
+func confProse(conf string) string {
+	var out []string
+	for _, line := range strings.Split(conf, "\n") {
+		if trimmed := strings.TrimPrefix(line, "#"); trimmed != line {
+			out = append(out, strings.TrimSpace(trimmed))
+		}
+	}
+	return strings.Join(out, " ")
+}
