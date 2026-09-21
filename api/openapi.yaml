@@ -1195,6 +1195,14 @@ components:
             Served from upstream on a miss rather than from a finished mirror.
             It decides one thing a reader acts on: `pkg bootstrap` resolves
             against a proxy and 404s against a hosted mirror.
+        pkgbase:
+          type: boolean
+          description: >-
+            A mirror of a repository release engineering signed, which
+            verifies against the pkgbase trust store rather than the ports
+            one. Carried because the upstream URL it is derived from does not
+            cross the wire, so a consumer re-rendering this configuration
+            cannot work it out again.
         url:
           type: string
           description: >-
@@ -1204,13 +1212,19 @@ components:
         signature_type:
           type: string
           description: >-
-            "fingerprints" against the stock trust store for a mirror,
-            "fingerprints" against bodega's own for a signed generated
-            repository, "none" for an unsigned one.
+            "fingerprints" against the ports trust store for a mirror of a
+            ports repository, against the pkgbase one for a mirror of a base
+            repository, against bodega's own for a signed generated
+            repository; "none" for an unsigned one.
           enum: [fingerprints, none]
         fingerprints:
           type: string
-          description: Trust directory signature_type names. Absent when "none".
+          description: >-
+            Trust directory signature_type names, absent when "none". One of
+            /usr/share/keys/pkg, /usr/share/keys/pkgbase-${VERSION_MAJOR} with
+            the variable left for pkg to substitute, or bodega's own
+            directory. A stanza naming the wrong one of the first two fails
+            silently: pkg processes no entries and exits 0.
         disabled:
           type: array
           description: >-

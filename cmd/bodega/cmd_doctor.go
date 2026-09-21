@@ -499,30 +499,20 @@ func writePkgRepoFile(gf *globalFlags, token, baseURL, abi string, release int, 
 	if err != nil {
 		return err
 	}
-	conf := repo.Conf
 	if release > 0 && release != repo.Release {
-		// Re-rendered rather than patched, and through the server's own
-		// renderer over the server's own facts: the file is the overrides and
-		// the definition together, and editing the tag list out of one half
-		// is how a host ends up disabling a repository it does not define
-		// while the one it does stays enabled.
-		st := pkgrepos.State{
-			PublicURL: status.FreeBSD.PublicURL,
-			ABI:       repo.ABI,
-			Repo:      repo.Repo,
-			Release:   release,
-			Generated: repo.Generated,
-			Proxy:     repo.Proxy,
-		}
-		if repo.Generated {
-			st.Fingerprint = status.FreeBSD.Fingerprint
-		}
-		rerendered, err := pkgrepos.Render(st)
+		// Re-rendered rather than patched: the file is the overrides and the
+		// definition together, and editing the tag list out of one half is
+		// how a host ends up disabling a repository it does not define while
+		// the one it does stays enabled. WithRelease rather than a State
+		// rebuilt from these fields, because this side sees what crossed the
+		// wire and the server's own facts did not all cross it.
+		rerendered, err := repo.WithRelease(release)
 		if err != nil {
 			return err
 		}
-		conf = rerendered.Conf
+		repo = rerendered
 	}
+	conf := repo.Conf
 
 	wrote, err := host.WritePkgRepo("", pkgrepos.ClientConfPath, conf)
 	for _, p := range wrote {

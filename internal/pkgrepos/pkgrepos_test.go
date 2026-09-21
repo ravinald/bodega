@@ -1,6 +1,7 @@
 package pkgrepos_test
 
 import (
+	"encoding/json"
 	"slices"
 	"strings"
 	"testing"
@@ -338,5 +339,133 @@ func TestReleaseFromABI(t *testing.T) {
 		if got != tc.want || ok != tc.ok {
 			t.Errorf("ReleaseFromABI(%q) = %d, %v; want %d, %v", tc.abi, got, ok, tc.want, tc.ok)
 		}
+	}
+}
+
+// pkgbaseMirror is the second mirrored case: one of FreeBSD's
+// release-engineered base repositories, which release engineering signs with
+// a key set the ports trust store does not hold.
+func pkgbaseMirror() pkgrepos.State {
+	return pkgrepos.State{
+		PublicURL: "https://bodega.internal",
+		ABI:       "FreeBSD:15:amd64",
+		Repo:      "base",
+		Upstream:  "https://pkg.freebsd.org/FreeBSD:15:amd64/base_release_1",
+	}
+}
+
+// A mirror is two cases, not one, and the ports trust store is wrong for the
+// second. Measured on FreeBSD 15.1-RELEASE with pkg 2.7.5 against
+// FreeBSD:15:aarch64/base_release_1: /usr/share/keys/pkg fetched the
+// catalogue, printed "No trusted public keys found", processed 0 entries and
+// exited 0; /usr/share/keys/pkgbase-15 processed 502. Both exit 0, so the
+// wrong one leaves an empty repository behind and pkg install reports every
+// package as missing.
+func TestPkgbaseMirrorVerifiesAgainstThePkgbaseTrustStore(t *testing.T) {
+	got := render(t, pkgbaseMirror())
+	if !got.Pkgbase {
+		t.Fatalf("Pkgbase = false for a mirror of %s", pkgbaseMirror().Upstream)
+	}
+	if got.SignatureType != "fingerprints" || got.Fingerprints != pkgrepos.PkgbaseFingerprints {
+		t.Fatalf("signature_type %q fingerprints %q, want fingerprints against %q",
+			got.SignatureType, got.Fingerprints, pkgrepos.PkgbaseFingerprints)
+	}
+	if strings.Contains(got.Stanza, `"`+pkgrepos.StockFingerprints+`"`) {
+		t.Errorf("the stanza names the ports trust store, which processes no entries and reports nothing:\n%s", got.Stanza)
+	}
+	if !strings.Contains(got.Conf, "pkgbase trust store") {
+		t.Errorf("the conf never says which of the host's two trust stores this is:\n%s", got.Conf)
+	}
+}
+
+// Every other repository upstream publishes comes off the package builders'
+// key, base snapshots included, so "is it a base repository" is the wrong
+// question: answering it sends base_latest — the base repository bodega's own
+// prompts suggest — to a store that verifies nothing. Each row measured
+// against pkg 2.7.5 by fetching the upstream catalogue under both of the
+// host's trust stores.
+func TestIsPkgbaseSigned(t *testing.T) {
+	for _, tc := range []struct {
+		upstream string
+		release  int
+		want     bool
+	}{
+		{"https://pkg.freebsd.org/FreeBSD:15:amd64/base_release_1", 15, true},
+		{"https://pkg.freebsd.org/FreeBSD:15:amd64/base_release_0", 15, true},
+		{"https://mirror.internal/freebsd/base_release_1/", 15, true},
+		// Snapshot base repositories are built and signed like ports.
+		{"https://pkg.freebsd.org/FreeBSD:15:amd64/base_latest", 15, false},
+		{"https://pkg.freebsd.org/FreeBSD:15:amd64/base_weekly", 15, false},
+		// No release before 15 publishes a repository signed that way, and
+		// none installs the trust store either: share/keys in the base system
+		// lists pkg alone on stable/13 and stable/14.
+		{"https://pkg.freebsd.org/FreeBSD:14:amd64/base_release_1", 14, false},
+		{"https://pkg.freebsd.org/FreeBSD:15:amd64/latest", 15, false},
+		{"https://pkg.freebsd.org/FreeBSD:15:amd64/quarterly", 15, false},
+		{"https://pkg.freebsd.org/FreeBSD:15:amd64/kmods_quarterly_1", 15, false},
+		{"", 15, false},
+	} {
+		if got := pkgrepos.IsPkgbaseSigned(tc.upstream, tc.release); got != tc.want {
+			t.Errorf("IsPkgbaseSigned(%q, %d) = %v, want %v", tc.upstream, tc.release, got, tc.want)
+		}
+	}
+}
+
+// The trust store follows the repository, and --release follows the host.
+// An operator writing the file for a host of another release moves the
+// overrides; the key that signed the catalogue does not move with them.
+func TestTheTargetReleaseDoesNotMoveTheTrustStore(t *testing.T) {
+	st := pkgbaseMirror()
+	st.Release = 14
+	got := render(t, st)
+	if got.Fingerprints != pkgrepos.PkgbaseFingerprints {
+		t.Errorf("Fingerprints = %q for a 15 repository written for a 14 host, want %q",
+			got.Fingerprints, pkgrepos.PkgbaseFingerprints)
+	}
+	if !slices.Equal(got.Disabled, pkgrepos.UpstreamTags(14)) {
+		t.Errorf("Disabled = %v, want the 14 tags", got.Disabled)
+	}
+}
+
+// Re-rendering for another target release moves the overrides and nothing
+// else. The caller that does it — doctor --write-pkg-repo --release — holds
+// what crossed the wire, and the upstream URL the trust half was derived from
+// is not on it; rebuilding a State there is what pointed a pkgbase mirror at
+// the ports trust store.
+func TestWithReleaseMovesTheOverridesAndNothingElse(t *testing.T) {
+	fifteen := render(t, pkgbaseMirror())
+
+	// Through the wire shape, because that is the trip the caller makes.
+	var decoded pkgrepos.Repo
+	encoded, err := json.Marshal(fifteen)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	got, err := decoded.WithRelease(14)
+	if err != nil {
+		t.Fatalf("WithRelease(14) = %v", err)
+	}
+	if got.Fingerprints != fifteen.Fingerprints || got.SignatureType != fifteen.SignatureType {
+		t.Errorf("re-rendering for another release changed the trust half: %q/%q became %q/%q",
+			fifteen.SignatureType, fifteen.Fingerprints, got.SignatureType, got.Fingerprints)
+	}
+	if got.URL != fifteen.URL || got.Tag != fifteen.Tag || got.Pkgbase != fifteen.Pkgbase {
+		t.Errorf("re-rendering changed url/tag/pkgbase: %+v against %+v", got, fifteen)
+	}
+	if got.Note() != fifteen.Note() {
+		t.Errorf("re-rendering changed the notes: %q became %q", fifteen.Note(), got.Note())
+	}
+	if !slices.Equal(got.Disabled, pkgrepos.UpstreamTags(14)) {
+		t.Errorf("Disabled = %v, want the 14 tags", got.Disabled)
+	}
+	if !strings.Contains(got.Conf, "written for a\n# FreeBSD 14 host") {
+		t.Errorf("the conf still names the release it was first rendered for:\n%s", got.Conf)
+	}
+	if _, err := got.WithRelease(0); err == nil {
+		t.Errorf("WithRelease(0) returned a conf rather than refusing; the overrides would name no tag at all")
 	}
 }

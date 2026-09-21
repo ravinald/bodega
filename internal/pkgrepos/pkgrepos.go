@@ -39,6 +39,19 @@ const (
 	// verifies it.
 	StockFingerprints = "/usr/share/keys/pkg"
 
+	// PkgbaseFingerprints is the trust store FreeBSD's release-engineered
+	// base repositories verify against. It is a second key set in a second
+	// directory and both ship on the same host: /usr/share/keys/pkg holds
+	// pkg.freebsd.org.2013102301, /usr/share/keys/pkgbase-15 holds awskms-15
+	// and backup-signing-15, and neither verifies what the other signed.
+	//
+	// ${VERSION_MAJOR} stays literal for the reason ${ABI} does. pkg
+	// substitutes the running host's own release, the repository a client
+	// fetches is the one under its own ABI, and the keys are installed by the
+	// base system of that release. It is also how /etc/pkg/FreeBSD.conf
+	// spells its own FreeBSD-base entry, which is the authority here.
+	PkgbaseFingerprints = "/usr/share/keys/pkgbase-${VERSION_MAJOR}"
+
 	// BodegaFingerprints is where a client installs bodega's own fingerprint,
 	// and is what a generated repository's stanza names. pkg expects a
 	// directory holding trusted/ and revoked/, not a file, which is why
@@ -72,6 +85,16 @@ const (
 	// client and the stock trust store checks it. No key of bodega's is in
 	// that path.
 	MirroredNote = `This repository is mirrored from upstream with its signature inside the catalogue archive, so pkg verifies it against ` + StockFingerprints + `, which every FreeBSD host already ships. Do not point fingerprints at a bodega key here: bodega signs nothing in this path, and the stanza would fail "pkg update" on a signature that is present and valid.`
+
+	// PkgbaseMirroredNote is MirroredNote's other half, and the reason a
+	// mirror is two cases rather than one. A release-engineered base
+	// repository carries FreeBSD's signature the way any mirror does, signed
+	// by a key the ports trust store does not hold, and naming the wrong
+	// store fails no louder than an empty repository: pkg reports "No trusted
+	// public keys found", exits 0, processes no entries, and the next
+	// `pkg install` says the package does not exist rather than that it could
+	// not be verified.
+	PkgbaseMirroredNote = `This mirrors one of FreeBSD's release-engineered base repositories, which release engineering signs with the pkgbase key set rather than the one the package builders use, so it verifies against ` + PkgbaseFingerprints + ` and not ` + StockFingerprints + `. Pointed at the ports store it fails silently: "pkg update" prints "No trusted public keys found", exits 0 and processes no entries, and "pkg install" then reports every package as missing.`
 
 	// FingerprintNote is the out-of-band delivery a generated repository
 	// needs. The first fetch of any public key is authenticated by TLS alone;
@@ -189,7 +212,16 @@ type Repo struct {
 	Release   int    `json:"release"`
 	Generated bool   `json:"generated,omitempty"`
 	Proxy     bool   `json:"proxy,omitempty"`
-	URL       string `json:"url"`
+
+	// Pkgbase marks the second mirrored case: a repository release
+	// engineering signed, which verifies against the pkgbase trust store
+	// rather than the ports one. It is carried here rather than re-derived
+	// because the upstream URL it comes from is the server's fact and never
+	// crosses the wire, and a consumer re-rendering this configuration from
+	// the fields it can see would resolve it back into the ports store.
+	Pkgbase bool `json:"pkgbase,omitempty"`
+
+	URL string `json:"url"`
 
 	// SignatureType is the rendered signature_type value, lowercase as pkg's
 	// own configuration files spell it.
@@ -248,6 +280,49 @@ func ReleaseFromABI(abi string) (int, bool) {
 	return n, true
 }
 
+// IsPkgbaseSigned reports whether a mirror of this upstream repository, for a
+// repository built for this FreeBSD release, verifies against the pkgbase
+// trust store rather than the ports one.
+//
+// "A base repository" is the wrong question and answering it points working
+// configuration at a store that verifies nothing. What decides the key is who
+// built the repository, and only release engineering uses the pkgbase set:
+// /etc/pkg/FreeBSD.conf defines FreeBSD-base as base_release_${VERSION_MINOR}
+// against /usr/share/keys/pkgbase-${VERSION_MAJOR} and names no other base
+// repository at all. Measured against pkg 2.7.5 on 15.1-RELEASE, fetching
+// each upstream catalogue under each of the host's two trust stores:
+//
+//	FreeBSD:15:aarch64/base_release_0   pkgbase-15 verifies, pkg does not
+//	FreeBSD:15:aarch64/base_release_1   pkgbase-15 verifies, pkg does not
+//	FreeBSD:15:aarch64/base_latest      pkg verifies, pkgbase-15 does not
+//	FreeBSD:15:aarch64/base_weekly      pkg verifies, pkgbase-15 does not
+//	FreeBSD:14:amd64/base_release_1     pkg verifies, pkgbase-15 does not
+//	FreeBSD:15:aarch64/kmods_quarterly_1, latest, quarterly: pkg verifies
+//
+// So the snapshot repositories come off the package builders' key like ports,
+// and a pre-15 release has no pkgbase repository to mirror: share/keys in the
+// base system installs pkg alone on stable/13 and stable/14, and pkg plus
+// pkgbase-15 from stable/15.
+//
+// The upstream name is the authority and the local one says nothing: bodega
+// publishes a repository under whatever name the operator gave the entry,
+// while the URL is the repository root exactly as pkg.conf would spell it, so
+// its last path segment is what upstream calls it.
+func IsPkgbaseSigned(upstream string, release int) bool {
+	if release < ReleaseSplit {
+		return false
+	}
+	name := upstream
+	for _, cut := range []string{"?", "#"} {
+		if i := strings.Index(name, cut); i >= 0 {
+			name = name[:i]
+		}
+	}
+	name = strings.TrimRight(name, "/")
+	name = strings.ToLower(name[strings.LastIndex(name, "/")+1:])
+	return strings.HasPrefix(name, "base_release")
+}
+
 // Render produces the client configuration for one repository, or refuses.
 //
 // It refuses rather than picking a default in the cases where a stanza would
@@ -294,6 +369,11 @@ func Render(st State) (Repo, error) {
 		return Repo{}, fmt.Errorf("no repository name, so there is nothing to point a url at: a freebsd entry's name is the repository directory a client asks under, such as \"latest\"")
 	}
 
+	repoRelease := release
+	if n, ok := ReleaseFromABI(st.ABI); ok {
+		repoRelease = n
+	}
+
 	base := st.BaseURL()
 	out := Repo{
 		Tag:       TagPrefix + repo,
@@ -302,6 +382,11 @@ func Render(st State) (Repo, error) {
 		Release:   release,
 		Generated: st.Generated,
 		Proxy:     st.Proxy,
+		// The repository's own release decides this, not the target host's:
+		// the key that signed a catalogue is a property of the catalogue.
+		// Release moves the overrides onto a host of another release and
+		// cannot move a signature.
+		Pkgbase: !st.Generated && IsPkgbaseSigned(st.Upstream, repoRelease),
 		// ${ABI} stays literal. pkg substitutes the running host's own ABI,
 		// which is what makes one file correct across a fleet of mixed
 		// architectures, and it is the spelling every /etc/pkg/FreeBSD.conf
@@ -313,23 +398,64 @@ func Render(st State) (Repo, error) {
 	}
 
 	switch {
+	case out.Pkgbase:
+		out.SignatureType, out.Fingerprints = "fingerprints", PkgbaseFingerprints
 	case !st.Generated:
 		out.SignatureType, out.Fingerprints = "fingerprints", StockFingerprints
-		out.Notes = append(out.Notes, MirroredNote, bootstrapNote(st.Proxy))
 	case st.Fingerprint != "":
 		out.SignatureType, out.Fingerprints = "fingerprints", BodegaFingerprints
-		out.Notes = append(out.Notes, FingerprintNote)
 	default:
 		out.SignatureType = "none"
-		out.Notes = append(out.Notes, UnsignedNote)
 	}
-	if strings.TrimRight(st.PublicURL, "/") == "" {
-		out.Notes = append(out.Notes, UnknownURLNote)
-	}
+	return finish(out), nil
+}
 
-	out.Stanza = renderStanza(out)
-	out.Conf = renderConf(out)
-	return out, nil
+// WithRelease re-renders this configuration for a different target release,
+// which is what `bodega doctor --write-pkg-repo --release` asks for on a host
+// that is not the one the repository is named for.
+//
+// It changes the override list and the release the comments name, and nothing
+// else. Composing a fresh State from a rendered Repo is what the caller did
+// before, and every fact the wire shape does not carry was silently lost in
+// the trip: the upstream URL is one of them, so a mirror of a base repository
+// came back out of that round trip pointed at the ports trust store. The
+// trust half is the server's answer and is carried through verbatim here.
+func (r Repo) WithRelease(release int) (Repo, error) {
+	if release <= 0 {
+		return Repo{}, fmt.Errorf("cannot render pkg configuration for FreeBSD release %d: the overrides have to name the tags that release defines, and a release that is not a positive major number names none", release)
+	}
+	r.Release, r.Disabled = release, UpstreamTags(release)
+	return finish(r), nil
+}
+
+// finish fills in everything derived from the facts above it, so that Render
+// and WithRelease cannot disagree about what a set of facts renders as.
+func finish(r Repo) Repo {
+	r.Notes = r.notes()
+	r.Stanza = renderStanza(r)
+	r.Conf = renderConf(r)
+	return r
+}
+
+// notes lists the consequences of the form this repository rendered in.
+func (r Repo) notes() []string {
+	var out []string
+	switch {
+	case r.Pkgbase:
+		out = append(out, PkgbaseMirroredNote, bootstrapNote(r.Proxy))
+	case !r.Generated:
+		out = append(out, MirroredNote, bootstrapNote(r.Proxy))
+	case r.SignatureType != "none":
+		out = append(out, FingerprintNote)
+	default:
+		out = append(out, UnsignedNote)
+	}
+	// The placeholder cannot occur in a URL anything reported: it carries
+	// angle brackets, which no host may.
+	if strings.Contains(r.URL, PlaceholderHost) {
+		out = append(out, UnknownURLNote)
+	}
+	return out
 }
 
 // bootstrapNote picks the true one. Both are shipped because the answer is
@@ -366,8 +492,9 @@ func renderStanza(r Repo) string {
 // file is what somebody opens at 03:00, six months after whoever installed it
 // left. Each one answers a question the file provokes on its own: why the
 // scheme is not the pkg+https next door, why there are disable blocks for
-// repositories this file does not otherwise mention, and why "pkg bootstrap"
-// against this URL returns nothing.
+// repositories this file does not otherwise mention, which of the two trust
+// stores on the host this is and why, and why "pkg bootstrap" against this
+// URL returns nothing.
 func renderConf(r Repo) string {
 	var b strings.Builder
 	b.WriteString("# bodega pkg repository. Install as " + ClientConfPath + ".\n")
@@ -402,17 +529,35 @@ func renderConf(r Repo) string {
 		b.WriteString("# Latest/pkg.pkg under it as a real file. poudriere publishes that as a\n")
 		b.WriteString("# symlink, which the upload skips to keep one package out of the catalogue\n")
 		b.WriteString("# twice, so on an ordinary poudriere tree it is absent.\n")
-	} else if r.Proxy {
-		b.WriteString("#\n")
-		b.WriteString("# `pkg bootstrap` works here: this repository is proxied, so bodega fetches\n")
-		b.WriteString("# Latest/pkg.pkg and its .sig from upstream on demand. That one path reaches\n")
-		b.WriteString("# the internet, unlike every other request this repository answers.\n")
 	} else {
 		b.WriteString("#\n")
-		b.WriteString("# `pkg bootstrap` does not work against this repository. It fetches\n")
-		b.WriteString("# Latest/pkg.pkg and Latest/pkg.pkg.sig and nothing else, and a mirror\n")
-		b.WriteString("# publishes only the paths its catalogue names. Install pkg from upstream\n")
-		b.WriteString("# before switching a host over.\n")
+		if r.Pkgbase {
+			b.WriteString("# fingerprints names the pkgbase trust store, not the ports one beside it\n")
+			b.WriteString("# on the same host. This mirrors a repository release engineering signs,\n")
+			b.WriteString("# and its key is not in " + StockFingerprints + ": /etc/pkg/FreeBSD.conf\n")
+			b.WriteString("# gives FreeBSD-ports the ports store and FreeBSD-base this one. Pointed\n")
+			b.WriteString("# at the wrong one, `pkg update` prints \"No trusted public keys found\",\n")
+			b.WriteString("# exits 0 and processes no entries, and `pkg install` then reports every\n")
+			b.WriteString("# package as missing rather than as unverifiable. Confirm with `pkg -vv`,\n")
+			b.WriteString("# which prints the path after ${VERSION_MAJOR} resolves.\n")
+		} else {
+			b.WriteString("# fingerprints names the trust store every FreeBSD host already ships. This\n")
+			b.WriteString("# repository is mirrored byte for byte, so FreeBSD's own signature arrives\n")
+			b.WriteString("# inside the catalogue archive and no key of bodega's is in this path. The\n")
+			b.WriteString("# base_release_<n> repositories are the exception and this is not one: they\n")
+			b.WriteString("# are signed by release engineering and verify against the pkgbase store.\n")
+		}
+		b.WriteString("#\n")
+		if r.Proxy {
+			b.WriteString("# `pkg bootstrap` works here: this repository is proxied, so bodega fetches\n")
+			b.WriteString("# Latest/pkg.pkg and its .sig from upstream on demand. That one path reaches\n")
+			b.WriteString("# the internet, unlike every other request this repository answers.\n")
+		} else {
+			b.WriteString("# `pkg bootstrap` does not work against this repository. It fetches\n")
+			b.WriteString("# Latest/pkg.pkg and Latest/pkg.pkg.sig and nothing else, and a mirror\n")
+			b.WriteString("# publishes only the paths its catalogue names. Install pkg from upstream\n")
+			b.WriteString("# before switching a host over.\n")
+		}
 	}
 	b.WriteString("\n")
 	for _, tag := range r.Disabled {

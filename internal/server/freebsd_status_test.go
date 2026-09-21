@@ -240,3 +240,64 @@ func TestFreeBSDStatusReportsAnUnusableKeyToAdminsOnly(t *testing.T) {
 		t.Errorf("signed = %v for a non-admin caller and %v for an admin one; the gate is on the error text, not on whether the repository is signed", anon.Signed, st.Signed)
 	}
 }
+
+// A mirror of a release-engineered base repository is not handed the ports
+// trust store. Both key sets ship on a FreeBSD 15 host and only one of them
+// verifies what release engineering signed; the wrong one fetches the
+// catalogue, processes no entries and exits 0, so nothing between the client
+// and this response reports it.
+//
+// The upstream URL is what says which it is — the repository name is the
+// operator's — and it never crosses the wire, so this reads the endpoint
+// rather than the renderer.
+func TestFreeBSDStatusDoesNotHandAPkgbaseMirrorThePortsTrustStore(t *testing.T) {
+	s := hostedServer(t)
+	s.cfg.PublicURL = "https://bodega.internal"
+	addVersion(t, s, manifest.TypeFreeBSD, "house-base", manifest.VersionEntry{
+		Version: "FreeBSD:15:amd64",
+		URL:     "https://pkg.freebsd.org/FreeBSD:15:amd64/base_release_1",
+	})
+
+	st := statusFreeBSD(t, s)
+	repo := st.RepoFor("house-base", "FreeBSD:15:amd64")
+	if repo == nil {
+		t.Fatalf("no rendered configuration for house-base@FreeBSD:15:amd64, got %+v", st.Repos)
+	}
+	if repo.Fingerprints != pkgrepos.PkgbaseFingerprints {
+		t.Fatalf("fingerprints = %q, want %q: the ports store holds no key that signed this repository",
+			repo.Fingerprints, pkgrepos.PkgbaseFingerprints)
+	}
+	if !repo.Pkgbase {
+		t.Errorf("pkgbase is absent from the response, so a client re-rendering this configuration resolves it back to the ports store")
+	}
+	if strings.Contains(repo.Conf, `"`+pkgrepos.StockFingerprints+`"`) {
+		t.Errorf("the conf names the ports trust store:\n%s", repo.Conf)
+	}
+}
+
+// A mirror of a base snapshot repository keeps the ports trust store, which
+// is what verifies it: base_latest and base_weekly come off the package
+// builders' key like ports do. Deciding this on the name alone would point
+// the base repository bodega's own create prompt suggests at a store holding
+// nothing that signed it.
+func TestFreeBSDStatusKeepsTheStockStoreForABaseSnapshotMirror(t *testing.T) {
+	s := hostedServer(t)
+	s.cfg.PublicURL = "https://bodega.internal"
+	addVersion(t, s, manifest.TypeFreeBSD, "base_latest", manifest.VersionEntry{
+		Version: "FreeBSD:15:amd64",
+		URL:     "https://pkg.freebsd.org/FreeBSD:15:amd64/base_latest",
+	})
+
+	st := statusFreeBSD(t, s)
+	repo := st.RepoFor("base_latest", "FreeBSD:15:amd64")
+	if repo == nil {
+		t.Fatalf("no rendered configuration for base_latest@FreeBSD:15:amd64, got %+v", st.Repos)
+	}
+	if repo.Fingerprints != pkgrepos.StockFingerprints {
+		t.Fatalf("fingerprints = %q, want %q: base_latest is signed by the package builders' key",
+			repo.Fingerprints, pkgrepos.StockFingerprints)
+	}
+	if repo.Pkgbase {
+		t.Errorf("pkgbase is set for a snapshot repository the pkgbase key set never signed")
+	}
+}

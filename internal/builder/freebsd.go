@@ -25,8 +25,11 @@ import (
 //
 // The mirror copies bytes and never produces any. packagesite.pkg carries
 // FreeBSD's own signature as a member, so a byte-exact copy validates against
-// the stock fingerprint at /usr/share/keys/pkg/trusted/pkg.freebsd.org.2013102301
-// with no key of bodega's anywhere in the path. Regenerating the catalogue
+// whichever fingerprint signed it upstream — the ports key at
+// /usr/share/keys/pkg/trusted/pkg.freebsd.org.2013102301 for most
+// repositories, the pkgbase key set for the base_release_<n> ones — with no
+// key of bodega's anywhere in the path. internal/pkgrepos picks between them
+// for the client stanza. Regenerating the catalogue
 // with `pkg repo` would discard that attestation permanently and force a
 // fingerprint onto every client, which is why nothing here re-tars or
 // recompresses.
