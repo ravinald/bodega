@@ -814,6 +814,12 @@ func (s *Server) registerRoutes() {
 	// cargo sparse registry (sparse+https://bodega/cargo/)
 	m.HandleFunc("GET /cargo/{path...}", s.handleCargo)
 
+	// FreeBSD pkg repository mirror. One route for the whole tree: the path a
+	// pkg client composes is <abi>/<repo>/<rest>, and rest is a repository
+	// root file or a catalogue record's own repopath, which carries any
+	// number of segments.
+	m.HandleFunc("GET /freebsd/{path...}", s.handleFreeBSD)
+
 	// REST API
 	m.HandleFunc("GET /api/v1/packages", s.handleAPIPackages)
 	m.HandleFunc("GET /api/v1/packages/{type}", s.handleAPIPackagesByType)

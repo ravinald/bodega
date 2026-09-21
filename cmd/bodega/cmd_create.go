@@ -117,6 +117,12 @@ Examples:
 					return err
 				}
 
+			case manifest.TypeFreeBSD:
+				name, ve, err = collectFreeBSDVersion(r, name, "", "")
+				if err != nil {
+					return err
+				}
+
 			case manifest.TypePypi:
 				if name == "" {
 					if name, err = prompt(r, "Package name", ""); err != nil {
@@ -508,4 +514,34 @@ func collectCargoVersion(r *bufio.Reader, name, url, version string) (string, ma
 	}
 	url, _ = prompt(r, "Sparse registry URL (leave blank for index.crates.io)", url)
 	return name, manifest.VersionEntry{Version: version, URL: url}, nil
+}
+
+// collectFreeBSDVersion prompts for one mirrored pkg repository.
+//
+// A freebsd entry is a repository rather than a package, so the two prompts
+// are the two halves of the path a pkg client composes: the repository
+// directory and the ABI above it. The URL is required and is not composed
+// from the other two, because a private repository need not nest its ABIs the
+// way pkg.freebsd.org does and nothing in a URL says which it is.
+func collectFreeBSDVersion(r *bufio.Reader, name, url, abi string) (string, manifest.VersionEntry, error) {
+	var err error
+	if name, err = prompt(r, "Repository (e.g. latest, quarterly, base_latest)", name); err != nil {
+		return "", manifest.VersionEntry{}, err
+	}
+	if name == "" {
+		return "", manifest.VersionEntry{}, fmt.Errorf("repository is required")
+	}
+	if abi, err = prompt(r, "ABI (e.g. FreeBSD:14:amd64)", abi); err != nil {
+		return "", manifest.VersionEntry{}, err
+	}
+	if abi == "" {
+		return "", manifest.VersionEntry{}, fmt.Errorf("abi is required: it is what a pkg client substitutes for ${ABI} and what this entry is versioned by")
+	}
+	if url, err = prompt(r, "Repository root URL (e.g. https://pkg.freebsd.org/"+abi+"/"+name+")", url); err != nil {
+		return "", manifest.VersionEntry{}, err
+	}
+	if url == "" {
+		return "", manifest.VersionEntry{}, fmt.Errorf("url is required: it is the repository root with ${ABI} already substituted, and nothing else says where to mirror from")
+	}
+	return name, manifest.VersionEntry{Version: abi, URL: url}, nil
 }

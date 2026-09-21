@@ -1318,6 +1318,7 @@ var createTypeOptions = []string{
 	manifest.TypeApt,
 	manifest.TypeBinary,
 	manifest.TypeCargo,
+	manifest.TypeFreeBSD,
 	manifest.TypeGit,
 	manifest.TypeGomod,
 	manifest.TypeHelm,
@@ -1755,6 +1756,27 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 				Hint: "skip URL reachability check"},
 		})
 
+	case manifest.TypeFreeBSD:
+		// A freebsd entry is a repository, not a package, so the form asks
+		// for the two halves of the path a pkg client composes: the
+		// repository directory as the name, and the ABI above it as the
+		// version. Nothing here asks for a build command — bodega produces
+		// none of these bytes.
+		return restoreCursors([]formField{
+			typeField,
+			{Label: "Mode", Value: restore("Mode", "hosted"), Select: true,
+				Options: []string{"hosted", "proxy"},
+				Hint:    "hosted = mirror the repository into storage; proxy = fetch from upstream on cache miss"},
+			{Label: "Name", Value: restore("Name", ""),
+				Hint: "repository directory, e.g. latest, quarterly or base_latest"},
+			{Label: "ABI", Value: restore("ABI", ""),
+				Hint: "the ${ABI} directory above the repository, e.g. FreeBSD:14:amd64"},
+			{Label: "Source URL", Value: restore("Source URL", ""),
+				Hint: "repository root with ${ABI} already substituted, e.g. https://pkg.freebsd.org/FreeBSD:14:amd64/latest"},
+			{Label: "Skip validation", Value: restore("Skip validation", "no"), Checkbox: true,
+				Hint: "skip URL reachability check"},
+		})
+
 	default: // manifest.TypeApt
 		aptMode := restore("Apt Mode", "Package Name")
 		buildFrom := restore("Build From", "Git repo")
@@ -1969,6 +1991,24 @@ func validateCreateFields(fields []formField) string {
 	case manifest.TypeCargo:
 		if fieldValueFromSlice(fields, "Version") == "" {
 			return "Version is required for cargo entries"
+		}
+	case manifest.TypeFreeBSD:
+		// Both halves of the path a pkg client composes, checked against what
+		// the route will accept rather than against emptiness: an entry whose
+		// ABI the route refuses is one whose every request answers 400, and
+		// here is where that costs a keystroke instead of an incident.
+		abi := fieldValueFromSlice(fields, "ABI")
+		if abi == "" {
+			return "ABI is required for freebsd entries, e.g. FreeBSD:14:amd64"
+		}
+		if !manifest.FreeBSDValidABI(abi) {
+			return "ABI must be one path segment of letters, digits, '.', '_', '-' or ':', e.g. FreeBSD:14:amd64"
+		}
+		if !manifest.FreeBSDValidRepo(name) {
+			return "Name must be the repository directory, one path segment, e.g. latest or base_latest"
+		}
+		if fieldValueFromSlice(fields, "Source URL") == "" {
+			return "Source URL is required for freebsd entries: the repository root with ${ABI} substituted"
 		}
 	}
 	// Block save if checksum is present but invalid.
@@ -2227,6 +2267,16 @@ func saveCreateEntry(store *manifest.Store, fields []formField) error {
 	case manifest.TypeGomod, manifest.TypeNpm, manifest.TypeCargo:
 		// nothing extra
 
+	case manifest.TypeFreeBSD:
+		// The version of a freebsd entry is the ABI directory above the
+		// repository, and the form asks for it under that name because that
+		// is what a pkg client substitutes for ${ABI}. Nothing else on this
+		// form carries it: a save that read "Version" stored an empty one,
+		// and an entry with no version is a repository the route can never
+		// resolve a mode, a URL or a backend for.
+		ve.Version = fieldValueFromSlice(fields, "ABI")
+		ve.VersionConstraint = ""
+
 	default:
 		return fmt.Errorf("unknown entry type %q", entryType)
 	}
@@ -2267,6 +2317,11 @@ func (m *appModel) makeJSONApplyFn() func(buf string) string {
 		if len(pm.Versions) > 0 {
 			ve := pm.Versions[0]
 			setFieldValue(p.formFields, "Version", ve.Version)
+			if entryType == manifest.TypeFreeBSD {
+				// The freebsd form has no Version field; its version is the
+				// ABI, under the label a pkg client would recognize.
+				setFieldValue(p.formFields, "ABI", ve.Version)
+			}
 			setFieldValue(p.formFields, "Source URL", ve.URL)
 			if ve.Ref != "" {
 				setFieldValue(p.formFields, "Ref", ve.Ref)

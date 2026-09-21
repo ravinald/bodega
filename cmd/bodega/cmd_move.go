@@ -48,7 +48,14 @@ storage_by_type.pypi at the backend you want and re-upload instead.
 
 Two backend names resolving to one directory or bucket is refused too, before
 anything is copied. Each object would land on the one it was read from, and
---delete-source would then remove the only copy there is.`,
+--delete-source would then remove the only copy there is.
+
+A freebsd version is a whole repository and moves as a republication: the three
+repository-root files are copied out of the source first, every repopath those
+copies name is written and verified at the destination, and the root files
+follow last. Nothing reaches the destination's repository root until the object
+set is established there, so a refusal leaves whatever generation it was
+already serving intact.`,
 		Example: `  bodega pkg move binary example-tool-v2 --to bulk
   bodega pkg move npm @example-corp/widget-cli@1.5.0 --to archive
   bodega pkg move git widget@v4.5.5 --to bulk
@@ -260,6 +267,13 @@ func (m *mover) moveVersion(ctx context.Context, pm *manifest.PackageManifest, i
 		return fmt.Errorf("%s: %w", label, sameLocationError(srcName, m.dstName, m.dst.Label()))
 	}
 
+	// A freebsd version is a repository, and a repository is published rather
+	// than copied. See moveFreeBSDRepo for what the loop below cannot do for
+	// it: a prefix listing is not the set the archives it copies name.
+	if pm.Type == manifest.TypeFreeBSD {
+		return m.moveFreeBSDRepo(ctx, pm, i, src, srcName, label)
+	}
+
 	keys, err := inventory.ArtifactKeys(ctx, src, pm, ve)
 	if err != nil {
 		return fmt.Errorf("%s: %w", label, err)
@@ -296,8 +310,16 @@ func (m *mover) moveVersion(ctx context.Context, pm *manifest.PackageManifest, i
 		moved = append(moved, key)
 	}
 
-	// The manifest write commits the move. Everything above is a copy that can
-	// be repeated; nothing below may run before this line.
+	return m.commit(ctx, pm, i, label, srcName, src, moved)
+}
+
+// commit records the destination on the version entry and then, and only then,
+// considers the source. moved is the keys this move wrote, in the order they
+// should be removed.
+//
+// The manifest write is what commits the move. Everything before it is a copy
+// that can be repeated; nothing after it may run before it.
+func (m *mover) commit(ctx context.Context, pm *manifest.PackageManifest, i int, label, srcName string, src storage.ObjectStore, moved []string) error {
 	want := m.dstName
 	if want == storage.DefaultName {
 		want = ""

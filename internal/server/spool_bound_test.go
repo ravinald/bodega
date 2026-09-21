@@ -137,7 +137,7 @@ func TestConcurrentSpoolsStayUnderTheBudget(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			up, err := openUpstream(t.Context(), fmt.Sprintf("%s/%d/artifact.bin", ts.URL, i))
+			up, err := openUpstream(t.Context(), fmt.Sprintf("%s/%d/artifact.bin", ts.URL, i), false)
 			if err != nil {
 				t.Errorf("openUpstream: %v", err)
 				return
@@ -242,7 +242,7 @@ func TestDeclaredLengthOverTheArtifactCeilingIsRefusedBeforeTheCopy(t *testing.T
 	}))
 	defer ts.Close()
 
-	up, err := openUpstream(t.Context(), ts.URL)
+	up, err := openUpstream(t.Context(), ts.URL, false)
 	if err != nil {
 		t.Fatalf("openUpstream: %v", err)
 	}
@@ -282,7 +282,7 @@ func TestUndeclaredBodyOverTheArtifactCeilingIsRefusedDuringTheCopy(t *testing.T
 	}))
 	defer ts.Close()
 
-	up, err := openUpstream(t.Context(), ts.URL)
+	up, err := openUpstream(t.Context(), ts.URL, false)
 	if err != nil {
 		t.Fatalf("openUpstream: %v", err)
 	}

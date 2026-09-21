@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -210,7 +211,7 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
 	}
 
-	up, err := openUpstream(ctx, upstreamURL)
+	up, err := openUpstream(ctx, upstreamURL, requiresIdentityEncoding(regType))
 	if err != nil {
 		fail(err)
 		return
@@ -386,6 +387,19 @@ func validateUpstreamURL(rawURL string) error {
 // legitimately lacks.
 var errUpstreamNotFound = errors.New("the upstream does not publish this")
 
+// requiresIdentityEncoding reports whether a type's upstream bytes have to
+// arrive untransformed.
+//
+// freebsd is the one, and it is the type whose archives carry FreeBSD's own
+// signature as a tar member rather than beside it. A body the transport
+// decoded is not the body that was signed, and the client reports the
+// difference as a signature failure against bodega. Every other type verifies
+// against a digest bodega records after the decode, so an encoding negotiated
+// on the wire costs them nothing.
+func requiresIdentityEncoding(regType string) bool {
+	return regType == manifest.TypeFreeBSD
+}
+
 // maxUpstreamBody caps an upstream body a caller reads into memory whole.
 //
 // It covers the two metadata fetches that have to parse what they get — the
@@ -427,7 +441,7 @@ type upstreamStream struct {
 // openUpstream performs the fetch and maps its status, leaving the body for
 // the caller to read or to stream. It is the one place the SSRF guard and the
 // 404-versus-outage distinction live.
-func openUpstream(ctx context.Context, rawURL string) (*upstreamStream, error) {
+func openUpstream(ctx context.Context, rawURL string, identity bool) (*upstreamStream, error) {
 	if err := upstreamGuard(rawURL); err != nil {
 		return nil, err
 	}
@@ -436,11 +450,28 @@ func openUpstream(ctx context.Context, rawURL string) (*upstreamStream, error) {
 	if err != nil {
 		return nil, err
 	}
+	if identity {
+		// Go's transport adds "Accept-Encoding: gzip" on its own and decodes
+		// the answer transparently, so a caller that says nothing relays and
+		// caches whatever the transport produced rather than what the upstream
+		// served. Setting the header explicitly turns both halves off: net/http
+		// leaves a request that names its own encoding alone.
+		req.Header.Set("Accept-Encoding", "identity")
+	}
 
 	//nolint:gosec // G704: see comment on NewRequestWithContext above; URL is validated.
 	resp, err := upstreamClient.Do(req)
 	if err != nil {
 		return nil, err
+	}
+
+	if identity {
+		if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
+			resp.Body.Close()
+			return nil, fmt.Errorf("upstream answered with Content-Encoding %q after identity was asked for: %s — "+
+				"these bytes carry their own signature and decoding them would cache something the repository never signed. "+
+				"Point the entry at an origin rather than at a rewriting proxy", enc, rawURL)
+		}
 	}
 
 	if resp.StatusCode == http.StatusNotFound {
@@ -548,7 +579,7 @@ func (s *Server) spoolUpstream(up *upstreamStream) (*spooledUpstream, error) {
 // content type. For a caller that has to parse what it gets; an artifact goes
 // through openUpstream and spoolUpstream instead.
 func fetchUpstream(ctx context.Context, rawURL string) ([]byte, string, error) {
-	up, err := openUpstream(ctx, rawURL)
+	up, err := openUpstream(ctx, rawURL, false)
 	if err != nil {
 		return nil, "", err
 	}

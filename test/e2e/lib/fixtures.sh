@@ -26,11 +26,11 @@
 E2E_LIB_FIXTURES=1
 
 # manifest.AllTypes order, so a suite walking these reports in the order the
-# product builds them. Hosted entries, every one: the proxy-mode fixtures are
-# named apart below and deliberately absent here, because a suite walking this
-# list is walking the build pipeline and a proxy-mode entry builds nothing.
+# product builds them. All hosted: the proxy-mode fixtures are named apart
+# below and deliberately absent here, because a suite walking this list is
+# walking the build pipeline and a proxy-mode entry builds nothing.
 export E2E_FIXTURE_TYPES
-E2E_FIXTURE_TYPES="binary git apt pypi gomod helm npm cargo"
+E2E_FIXTURE_TYPES="binary git apt pypi gomod helm npm cargo freebsd"
 
 # e2e_fixture <type> [apt-version] — one PackageManifest on stdout.
 #
@@ -138,6 +138,38 @@ JSON
   }
 ]
 JSON
+	# Two repositories, one per repopath layout, against the fixture upstream
+	# lib/freebsd.sh builds on the guest. The real ones are 1.2 GB and 182.8
+	# GB and a hosted entry takes all of it, so what a run can actually copy
+	# and compare byte for byte is a repository built for the purpose.
+	freebsd) cat <<JSON ;;
+[
+  {
+    "config_version": 1,
+    "name": "latest",
+    "type": "freebsd",
+    "description": "e2e fixture: the All/Hashed layout, where a repopath carries ~ and \$",
+    "versions": [
+      {
+        "version": "FreeBSD:14:amd64",
+        "url": "${E2E_FREEBSD_URL:-http://127.0.0.1:8099}/latest"
+      }
+    ]
+  },
+  {
+    "config_version": 1,
+    "name": "base_latest",
+    "type": "freebsd",
+    "description": "e2e fixture: a catalogue spelling one repopath ./Hashed/ and one at the repository root",
+    "versions": [
+      {
+        "version": "FreeBSD:14:amd64",
+        "url": "${E2E_FREEBSD_URL:-http://127.0.0.1:8099}/base_latest"
+      }
+    ]
+  }
+]
+JSON
 	apt)
 		# The version is resolved on the guest rather than pinned here: an apt
 		# version is a property of the suite the guest tracks, and a constant
@@ -152,10 +184,10 @@ JSON
 		;;
 	# ---- proxy mode ---------------------------------------------------------
 	#
-	# The eight names above are hosted entries: none sets `mode`, so
+	# The nine names above are hosted entries: none sets `mode`, so
 	# EffectiveMode returns "hosted" for every one of them and every proxy
 	# check in the suite reaches the serving code through "no manifest names
-	# this". These three are the other half of that distinction — an entry a
+	# this". These four are the other half of that distinction — an entry a
 	# manifest does name, whose bytes come from upstream — and the serving code
 	# reads them on a different branch.
 	#
@@ -163,7 +195,7 @@ JSON
 	# second argument is already its version, and because a mode argument
 	# threaded through every call site would leave the mode of a given call
 	# readable only at the caller. `npm-proxy` says what it emits where it is
-	# written. E2E_FIXTURE_TYPES keeps naming exactly the eight the pipeline
+	# written. E2E_FIXTURE_TYPES keeps naming exactly the nine the pipeline
 	# suites walk, so nothing here changes what 30-pipeline imports.
 	#
 	# Each upstream is one 65-proxy.sh already depends on, so a proxy-mode
@@ -221,6 +253,7 @@ e2e_fixture_name() {
 	helm) printf 'podinfo' ;;
 	npm) printf 'color-convert' ;;
 	cargo) printf 'form_urlencoded' ;;
+	freebsd) printf 'latest' ;;
 	pypi-proxy) printf 'typing-extensions' ;;
 	npm-proxy) printf 'is-number' ;;
 	cargo-proxy) printf 'anyhow' ;;
@@ -239,6 +272,7 @@ e2e_fixture_version() {
 	helm) printf '6.7.0' ;;
 	npm) printf '2.0.1' ;;
 	cargo) printf '1.2.2' ;;
+	freebsd) printf 'FreeBSD:14:amd64' ;;
 	pypi-proxy) printf '4.12.2' ;;
 	npm-proxy) printf '7.0.0' ;;
 	cargo-proxy) printf '1.0.86' ;;

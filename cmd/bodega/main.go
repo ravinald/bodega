@@ -103,6 +103,7 @@ func newRootCmd() *cobra.Command {
   apt     Debian packages built from source or downloaded from apt
   binary  Files downloaded directly from a URL
   cargo   Rust crates from a sparse index
+  freebsd FreeBSD pkg repositories mirrored byte for byte
   git     Git repositories bundled at a specific ref, or mirrored for clone
   gomod   Go modules from a module proxy
   helm    Helm charts from a chart repository

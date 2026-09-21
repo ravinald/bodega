@@ -6,20 +6,21 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/ravinald/bodega.svg)](https://pkg.go.dev/github.com/ravinald/bodega)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-A self-hosted package repository manager backed by pluggable object storage. It fetches, builds, and serves eight package types to their native clients without leaving your network, so `apt-get`, `pip`, and `npm` keep working when the upstream registry is unreachable, compromised, or simply not where your hosts are allowed to go.
+A self-hosted package repository manager backed by pluggable object storage. It fetches, builds, and serves nine package types to their native clients without leaving your network, so `apt-get`, `pip`, and `npm` keep working when the upstream registry is unreachable, compromised, or simply not where your hosts are allowed to go.
 
 Every package is a manifest: a name, a type, and a list of version entries. An entry carries where the bytes came from, the checksum pinned on first fetch, and the lifecycle flags the server enforces at request time. Artifacts live in local storage or S3; the audit database records every fetch, mutation, and refusal.
 
-| Type   | Client         | Protocol              |
-| ------ | -------------- | --------------------- |
-| apt    | `apt-get`      | Debian repository     |
-| git    | `git clone`    | Git bundles           |
-| pypi   | `pip install`  | PEP 503 simple index  |
-| binary | `curl`         | Direct download       |
-| gomod  | `go get`       | GOPROXY               |
-| helm   | `helm install` | Chart repository      |
-| npm    | `npm install`  | npm registry          |
-| cargo  | `cargo`        | Sparse registry index |
+| Type    | Client         | Protocol              |
+| ------- | -------------- | --------------------- |
+| apt     | `apt-get`      | Debian repository     |
+| git     | `git clone`    | Git bundles           |
+| pypi    | `pip install`  | PEP 503 simple index  |
+| binary  | `curl`         | Direct download       |
+| gomod   | `go get`       | GOPROXY               |
+| helm    | `helm install` | Chart repository      |
+| npm     | `npm install`  | npm registry          |
+| cargo   | `cargo`        | Sparse registry index |
+| freebsd | `pkg`          | FreeBSD pkg mirror    |
 
 ## Install
 
@@ -94,7 +95,7 @@ bodega pkg import --server https://bodega.example.com catalog.json
 
 ## Status
 
-Pre-1.0. The CLI surface, the manifest schema, and the config format still move, and nothing here promises otherwise yet. All eight package types serve their native clients today, and the end-to-end suite drives every one of them against a running server.
+Pre-1.0. The CLI surface, the manifest schema, and the config format still move, and nothing here promises otherwise yet. All nine package types serve their native clients today, and the end-to-end suite drives every one of them against a running server.
 
 Two checksum gaps are known and stated rather than implied: pypi and clone-mode git have no per-version object key, so neither pins a digest on first fetch. [Threat model](docs/threat-model.md) covers both. That suite runs by hand against two hosts rather than in CI, so the automated gate is unit tests and linters.
 

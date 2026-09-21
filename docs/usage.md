@@ -31,7 +31,7 @@ Creates the S3 bucket with server-side encryption (AES-256), versioning enabled,
 
 ### `bodega build fetch [TYPE...] [NAME]`
 
-Downloads raw sources without building or packaging. If no types are given, all eight are fetched in dependency order: `binary, git, apt, pypi, gomod, helm, npm, cargo`.
+Downloads raw sources without building or packaging. If no types are given, all nine are fetched in dependency order: `binary, git, apt, pypi, gomod, helm, npm, cargo, freebsd`.
 
 When a name is given after the type, only that entry is fetched.
 
@@ -718,7 +718,7 @@ bodega pkg move git widget@v4.5.5 --to bulk
 bodega pkg move gomod example.com/example-corp/widget-sdk@v1.30.0 --to archive --delete-source
 ```
 
-Movable types: `binary`, `npm`, `cargo`, `gomod`, `helm`, `apt`, `git`. See [pypi is not movable](#pypi-is-not-movable) for the one that is not.
+Movable types: `binary`, `npm`, `cargo`, `gomod`, `helm`, `apt`, `git`, `freebsd`. See [pypi is not movable](#pypi-is-not-movable) for the one that is not, and [a freebsd move is a republication](#a-freebsd-move-is-a-republication) for the one that does not follow the order above.
 
 Order is the design:
 
@@ -740,6 +740,20 @@ binary/example-tool-v2: backends "default" and "mirror" are the same location (f
 ```
 
 Both names are in the message because the configuration is deliberate: two names for one place is a documented way to stage a migration, so the operator needs to know which half to repoint. `Load` rejects a colliding name but not a colliding path, and does not warn about one either — see [Named backends](#named-backends-and-per-type-placement). Each object would be read and written at the same key, the verify would re-read what it had just overwritten and pass, and `--delete-source` would then remove the artifact the manifest points at. Both backends answer a missing object with "not found", so nothing afterwards could tell it had ever existed.
+
+#### a freebsd move is a republication
+
+A `freebsd` version is a whole mirrored repository, so the order above does not describe it. Every other type moves one artifact that stands on its own; a repository is two archives and everything they name, and a client reads the archives to find the rest. So the move copies the three repository-root files out of the source into `build_root` first, reads the object set out of **those copies**, writes and verifies every `repopath` they name at the destination, and publishes the root files last — `meta.conf`, `data.pkg`, `packagesite.pkg`, in the order a client reads them.
+
+It does not list the source prefix. A listing answers "what is under this prefix right now", which is the right question for `bodega build status` and for `pkg delete` and is not the set a document names. A `bodega build upload freebsd` landing between the listing and the copy gives the move one generation's object list and another generation's catalogue bytes, and nothing downstream can tell: a `freebsd` entry carries no `checksum`, two generations of one repository routinely have identical archive sizes, and both commands exit 0. Copies of the archives, taken before anything is enumerated, are the only version of them no concurrent writer can replace.
+
+Everything that can refuse runs before the first byte reaches the destination's repository root, including the `artifact_size` and `checksum` check against the copied `packagesite.pkg`. A refused move leaves the destination serving whatever generation it was already serving and the manifest still pointing at the source:
+
+```text
+latest@FreeBSD:14:amd64: the archives on "default" name All/Hashed/zogftw-2025.02.23_1~2$snxfrbid.pkg, which is not there. Publishing it on "bulk" would hand a client a repository that resolves that package and then 404s, so nothing was written to "bulk" and the manifest still points at "default". Re-run `bodega build fetch freebsd latest force` and `bodega build upload freebsd`, then move again
+```
+
+Objects on the source that neither archive names are not copied, for the same reason the upload does not upload them: no client can ask for them. `--delete-source` therefore removes what the move wrote and leaves those behind, and it removes `packagesite.pkg` first, so the window it opens on the source is a client told there is no such repository rather than one that resolves a package out of a live catalogue and cannot fetch it.
 
 #### pypi is not movable
 
@@ -774,7 +788,7 @@ pypi    examplesdk           1.26.0            default  archive
   set storage_by_type.pypi to "archive" and re-run 'bodega build upload pypi --replace-placement' — pypi moves as a whole type or not at all
 ```
 
-A rule change moves nothing, which is the design: everything already uploaded stays where it is and stays readable. The cost is that the change is invisible afterwards. `upload` and `sync` keep writing to the backend each version records, and only `pypi` refuses, because only `pypi` uploads a whole directory and can be split by a rule. The other seven types wrote on and reported nothing. This is where they answer.
+A rule change moves nothing, which is the design: everything already uploaded stays where it is and stays readable. The cost is that the change is invisible afterwards. `upload` and `sync` keep writing to the backend each version records, and only `pypi` refuses, because only `pypi` uploads a whole directory and can be split by a rule. The other eight types wrote on and reported nothing. This is where they answer.
 
 `bodega pkg move` is what discharges a row, and the command is printed with its arguments so the line can be copied. A frozen version names the unfreeze first, because `pkg move` refuses the whole command when any selected version is frozen.
 
@@ -1216,7 +1230,7 @@ $EDITOR db.json
 bodega profile create db --from-file db.json
 ```
 
-`--from-file` reads the whole document before it writes anything, through the same checks `add` and `set` make: a package type outside the eight, an entry with no name and a constraint with no version are each refused with the offending line named. A key named twice is refused the same way, naming both lines: one type carries one marker and one package carries one entry, so the later row would replace the earlier and take its constraint, reason and review date with it. The profile, its markers and its entries then land in one transaction. A document rejected halfway would otherwise leave a bindable profile holding a subset of what was authored, which is not a failed create but a working access control permitting less than anyone wrote.
+`--from-file` reads the whole document before it writes anything, through the same checks `add` and `set` make: a package type bodega does not know, an entry with no name and a constraint with no version are each refused with the offending line named. A key named twice is refused the same way, naming both lines: one type carries one marker and one package carries one entry, so the later row would replace the earlier and take its constraint, reason and review date with it. The profile, its markers and its entries then land in one transaction. A document rejected halfway would otherwise leave a bindable profile holding a subset of what was authored, which is not a failed create but a working access control permitting less than anyone wrote.
 
 The round trip through a file is the review step, and `--out -` and `--from-file -` are both refused. A host's inventory holds its accidents alongside its requirements, and locking membership to it enshrines whatever was installed by hand at 03:00; a baseline piped straight from the command that produced it was never read by anyone.
 
@@ -1274,7 +1288,7 @@ $ bodega profile create dp --from-origin db01 --out dp.json --pin psycopg2 --pin
   Name it once:  --pin pypi/psycopg2
 ```
 
-A slash is read as the qualifier only when what precedes it names one of the eight types, none of which carries a slash. So `--pin @babel/core` and `--pin github.com/lib/pq` each name one npm or gomod package, and the qualified spellings for them are `npm/@babel/core` and `gomod/github.com/lib/pq`.
+A slash is read as the qualifier only when what precedes it names one of the package types, none of which carries a slash. So `--pin @babel/core` and `--pin github.com/lib/pq` each name one npm or gomod package, and the qualified spellings for them are `npm/@babel/core` and `gomod/github.com/lib/pq`.
 
 #### Binding hosts
 
@@ -2592,7 +2606,7 @@ Or clear the key and keep everything under `build_root`. `apt_root`, `git_root`,
 
 `custom_paths` used to sit in front of all of this and gated nothing: the build path reads each root directly through `builder.rootFor`, so a root left in the file stayed in force after the flag was turned off, and the TUI stopped showing the value that was still deciding where artifacts land. The key is gone. Nothing moves as a result, because the behavior it claimed to gate is the behavior that was already running; a file that still carries it loads unchanged and `bodega doctor` names it under `retired-config-keys`.
 
-**Gap:** the TUI's config form shows four of the eight roots — `apt_root`, `git_root`, `pypi_root`, `binary_root` — so `gomod_root`, `helm_root`, `npm_root` and `cargo_root` can only be set by editing the file. Ctrl+R clears the same four. Tracked as #227.
+**Gap:** the TUI's config form shows four of the nine roots — `apt_root`, `git_root`, `pypi_root`, `binary_root` — so `gomod_root`, `helm_root`, `npm_root`, `cargo_root` and `freebsd_root` can only be set by editing the file. Ctrl+R clears the same four. Tracked as #227.
 
 ### Audit database
 
@@ -2817,6 +2831,24 @@ The fetch opens the `.tgz` and reads `version:` from the `Chart.yaml` at its roo
 
 - **required_by**: list of packages that depend on this version
 
+### FreeBSD-specific fields
+
+```json
+{
+  "version": "FreeBSD:14:amd64",
+  "url": "https://pkg.freebsd.org/FreeBSD:14:amd64/latest",
+  "mode": "hosted"
+}
+```
+
+A `freebsd` entry is a **repository**, not a package. The name is the repository directory a pkg client asks under (`latest`, `quarterly`, `base_latest`) and the version is the ABI above it, which is the string pkg substitutes for `${ABI}` in the URL it was configured with. One entry per ABI, several versions per repository.
+
+- **version**: the ABI directory, e.g. `FreeBSD:14:amd64`. Required; nothing else says which tree of the repository an entry stands for.
+- **url**: the repository root with `${ABI}` already substituted. Required, and not composed from the other two fields: a private repository need not nest its ABIs the way `pkg.freebsd.org` does, and nothing in a URL says which convention it follows.
+- **mode**: `hosted` mirrors the whole repository into storage; `proxy` fetches from upstream on a cache miss and holds no snapshot.
+
+No checksum field. The catalogue carries FreeBSD's own signature and publishes a digest for every package, so the integrity claim is upstream's; see [Mirroring a FreeBSD pkg repository](#mirroring-a-freebsd-pkg-repository).
+
 ---
 
 ## Pipeline
@@ -2831,7 +2863,7 @@ Actually, the operations are more granular: fetch, build/run, sync, upload.
 
 **Stage cascading:** Each stage automatically runs its prerequisites if outputs are missing. Running `bodega build upload` on a fresh system will cascade through fetch and build stages first.
 
-**Build order:** `binary, git, apt, pypi, gomod, helm, npm, cargo`. This order reflects dependencies (e.g., pypi may reference git-cloned repos for its base requirements). It is `manifest.AllTypes`, and the three build subcommands render their help from it rather than restating it.
+**Build order:** `binary, git, apt, pypi, gomod, helm, npm, cargo, freebsd`. This order reflects dependencies (e.g., pypi may reference git-cloned repos for its base requirements). It is `manifest.AllTypes`, and the three build subcommands render their help from it rather than restating it.
 
 **Per-entry failures** are logged but do not abort the run. A non-zero exit code is returned if any entry failed.
 
@@ -2952,6 +2984,20 @@ bodega doctor --write-credentials --token bodega_ak_... --url https://bodega-hos
 ```
 
 The last line runs on the client and writes the token into the file each of its package managers reads. See [`bodega doctor`](#bodega-doctor---write-credentials---token-token---url-url---write-apt-sources) for what lands where, and [`bodega identity`](#bodega-identity-bindunbindlist) for the CIDR binding that covers a whole subnet with no credential to distribute.
+
+**FreeBSD pkg** (`/usr/local/etc/pkg/repos/bodega.conf`):
+
+```text
+bodega-latest: {
+  url: "https://bodega-host:8080/freebsd/${ABI}/latest",
+  signature_type: "fingerprints",
+  fingerprints: "/usr/share/keys/pkg",
+  enabled: yes
+}
+FreeBSD: { enabled: no }
+```
+
+`${ABI}` stays literal: pkg substitutes the running host's ABI, which is the string the matching manifest entry records as its version. `signature_type` is named because the catalogue is mirrored byte for byte precisely so FreeBSD's own signature reaches the client; a stanza that omits it defaults to `NONE` and throws that attestation away. The second line disables the stock repository, which is the point of pointing pkg at bodega at all. See [Mirroring a FreeBSD pkg repository](#mirroring-a-freebsd-pkg-repository).
 
 ### Git smart-HTTP
 
@@ -3218,6 +3264,73 @@ A `spool_max_artifact_bytes` above a non-zero `spool_max_total_bytes` is refused
 A cut transfer is still refused rather than cached: a body shorter than the `Content-Length` the upstream declared fails, the spool file is removed, and no checksum is recorded. Caching short bytes as authoritative is what made every later fetch of the real artifact fail verification against the truncated digest.
 
 The npm packument and the PyPI simple index are the two responses bodega parses rather than relays. A miss on either is spooled and cached like any other object, so the ceilings above still decide what upstream may send; the parse runs on the way out, on a copy read back into memory. For the packument that read is capped at 256 MB on every path it takes — the cache hit, the spooled miss, and the direct fetch the hidden-version filter uses — and a document over the cap is refused with a `502` rather than served with its upstream `dist.tarball` URLs intact.
+
+### Mirroring a FreeBSD pkg repository
+
+A `freebsd` entry mirrors a pkg repository **byte for byte**, and that constraint decides the whole design of the type. `packagesite.pkg` and `data.pkg` are zstd tarballs, and each carries three members: a 256-byte signature, a 451-byte public key and the document itself. The catalogue spells them `packagesite.yaml.sig`, `packagesite.yaml.pub` and `packagesite.yaml`; `data.pkg` spells them `data.sig`, `data.pub` and `data`. There is no `.sig` sidecar on the wire. So a byte-exact copy of those archives carries FreeBSD's own signature with it and validates against the stock fingerprint at `/usr/share/keys/pkg/trusted/pkg.freebsd.org.2013102301`, with no key of bodega's and no client-side signature configuration. Regenerating the catalogue with `pkg repo` would discard that attestation permanently and force a fingerprint onto every client.
+
+This is the opposite of what apt needs. bodega generates and re-signs Debian metadata for a generated suite because it has to; a pkg catalogue is never generated here.
+
+```bash
+bodega pkg create freebsd          # prompts for the repository, the ABI and the URL
+bodega build fetch freebsd         # mirror every repository the manifest names
+bodega build upload freebsd        # place what was mirrored
+```
+
+The client stanza is under [Client configuration](#client-configuration).
+
+#### The catalogue is the only authority on where packages live
+
+`packagesite.yaml` is newline-delimited compact JSON despite the name, and each record carries `repopath`. The two repositories on `pkg.freebsd.org` spell it differently, and neither form is derivable from a package name and version:
+
+| Repository    | Records | Bytes    | A repopath                                                     |
+| ------------- | ------- | -------- | -------------------------------------------------------------- |
+| `latest`      | 38,325  | 182.8 GB | `All/Hashed/zogftw-2025.02.23_1~2$snxfrbid.pkg`                |
+| `base_latest` | 535     | 1.2 GB   | `./Hashed/FreeBSD-telnet-14.snap20260920075547~2$ea5o6tyi.pkg` |
+
+There is no directory listing to crawl either: `All/` answers 403 upstream. So the mirrored object set is read out of the published archives and from nothing else.
+
+Both of them, not `packagesite.pkg` alone. `data.pkg` carries the same record per package in one JSON document, which `pkg_repo_fetch_data_fd` reads out of the member `meta.conf` names under `data`, and the two are fetched a moment apart from a repository that rebuilds continuously, so they can describe different generations. bodega mirrors the union of what they name, because it publishes both unchanged and cannot rewrite either. A `data.pkg` whose member cannot be read fails the mirror with the member named: publishing an archive whose object set is unknown is the one thing the ordering rule below cannot protect a client from.
+
+A leading `./` is dropped, because every HTTP client normalizes it out before the request leaves and keeping it would key an object under a path no request can spell. A `..` is refused rather than cleaned: the catalogue decides both the URL fetched and the path written, so a record resolving outside the repository is one this mirror must not touch.
+
+A record that resolves onto a repository-root file is refused as well: `meta.conf`, `data.pkg` and `packagesite.pkg`, and the legacy names `digests.pkg`, `digests.txz`, `packagesite.txz` and `repo.txz` that the route answers 404 by. The repository root is bodega's own namespace, and a package keyed there would land on the metadata a client reads to find every other package — during the mirror's object phase, in the object half of an upload, inside a move's object loop, each of them before the ordering rule below applies. The first path segment decides it, after `./` is dropped and with case folded, because the build tree and a local backend are filesystems: one name is a file or a directory and not both, and APFS answers `Data.pkg` with `data.pkg`. A package at the repository root is an ordinary layout and stays mirrored; only these names are not its to take.
+
+#### `packing_format`, not the extension
+
+`meta.conf` is plain unsigned UCL, 168 bytes upstream, and it is the first request every `pkg update` makes. The codec of `packagesite.pkg` is read from its `packing_format` key rather than inferred from the `.pkg` extension, which names the archive and not the codec: a repository built by pkg 1.16 serves `packing_format = "txz"` under files spelled `.pkg`.
+
+`tzst`, `tgz`, `tbz` and `tar` are read. `txz` is refused by name — Go ships no xz decoder — with the way out in the message: mirror a repository built by pkg 1.17 or later, or serve that one in proxy mode, where the catalogue is never parsed.
+
+#### Objects first, catalogue last
+
+A catalogue that lands ahead of the objects it names is a repository where `pkg install` resolves a package and then 404s partway through fetching it, and the upstream repositories rebuild continuously, so the window is not theoretical. The ordering holds at three layers:
+
+- The mirror stages `meta.conf`, `data.pkg` and `packagesite.pkg` outside the tree, fetches every object either archive names, and only then moves the three into place. The staging directory belongs to that one run: a scheduled mirror and a manual one overlap often enough, and a shared staging path had the first to finish publish whichever archives were there — the other run's catalogue, naming a package still in flight. Each run publishes the archives it fetched and parsed, and nothing else.
+- Every object lands through a temporary sibling and an atomic rename, and a body short of its declared `Content-Length` is discarded. A partial file left where a package belongs is indistinguishable from a mirrored one on the next run, which is how a catalogue gets published over 3 bytes of a 100-byte package; a forced refresh that fails keeps the copy that was already good.
+- `bodega build upload` copies the three repository-root files out of the tree first and uploads those copies, reading the object list out of them rather than off a directory walk. Enumerating the upload set and opening its files are separated by however long the objects take to write, and a mirror landing in that window replaces the catalogue under a path the upload is still holding: the bytes published would then be a generation whose new objects are in nobody's upload list, with the ordering below satisfied and the repository still broken.
+- Within that upload every object lands before any repository-root file, and `packagesite.pkg` last of all. An object the pinned catalogue names that is not on disk fails the enumeration with the entry, the object and the consequence in the message, and nothing is uploaded for that entry — the previously published generation stays the one clients read. Objects in the tree that the catalogue does not name are not uploaded: no client can ask for them.
+- That upload resolves its storage backend once per repository and ABI, and writes every object and all three root files there. Every other type resolves placement per artifact, which is right where an artifact stands alone; a pkg catalogue does not, so an operator repointing the entry with `--storage` or a manifest edit while an upload of it runs sees that upload finish where it started and the next one honor the new name. A catalogue published into a backend holding another run's objects is a repository whose every `repopath` resolves to a 404.
+- `bodega pkg move` republishes the repository rather than copying a key list: it copies the three root files out of the source backend first, enumerates the object set from those copies, writes every object to the destination, and publishes the root files last. See [a freebsd move is a republication](#a-freebsd-move-is-a-republication).
+- A **hosted** entry's catalogue is never fetched from upstream on a miss. Upstream's catalogue is by construction newer than this mirror's objects and names packages the store has never held, so a miss answers 404 and `pkg` reports the repository as unavailable rather than installing half a transaction. Objects on a hosted entry may still be proxied: an object arriving late can only complete an install, never break one.
+
+A **proxy**-mode entry holds no snapshot, so both halves come from upstream per request and are self-consistent; there is no skew for the ordering rule to prevent.
+
+#### One entry per ABI, and it answers for its own requests
+
+A `freebsd` package is a repository and its version entries are the ABI directories under it, each with its own mode, URL, storage backend and `hidden` flag. A request names the ABI in its path, so every one of those is read off the entry that ABI names: `FreeBSD:13:amd64` in proxy mode beside a mirrored `FreeBSD:14:amd64` serves each the way it was configured, and `bodega pkg hide` on one ABI stops it being served whatever the ABI beside it is doing.
+
+#### Identity bytes on the wire
+
+Every upstream fetch bodega makes for this type, the mirror's and the proxy's alike, asks for `Accept-Encoding: identity`, and a response that carries a `Content-Encoding` anyway is refused rather than decoded. Go's HTTP transport asks for gzip on its own and decodes the answer transparently, so a fetch that says nothing stores what the transport produced rather than what the repository signed. A refusal names the encoding and the URL: the usual cause is an entry pointed at a rewriting proxy rather than at an origin.
+
+#### What is deliberately not served
+
+`digests.pkg`, `digests.txz`, `packagesite.txz` and `repo.txz` all 404 on every current FreeBSD repository, and bodega refuses them by name rather than proxying them: a proxy would spend a round trip per client per update to cache somebody else's 404. `digests` was a `meta.conf` key whose own source comment at pkg 1.12 reads "Leave digests here so pkg will not complain", and it is gone from pkg 2.x.
+
+#### `mirror_type` and the allow-list
+
+`freebsd` is host-scoped in the upstream allow-list, the same as `apt`: `bodega policy add freebsd pkg.freebsd.org` names the archive host, because a request that reaches upstream carries a repopath and no package identity at all.
 
 ### APT index generation
 
@@ -3930,6 +4043,7 @@ A read-only audit database used to be the quieter version of the same loss: `Rec
 │ helm/              │                            │
 │ npm/               │                            │
 │ cargo/             │                            │
+│ freebsd/           │                            │
 ├─ Log ──────────────┴────────────────────────────┤
 │ [gomod] example.com/example-corp/sdk: fetching...         │
 │ [gomod] example.com/example-corp/sdk: checksum verified   │
@@ -4012,7 +4126,7 @@ The table sizes its columns from the rows it is showing, not from a fixed width,
 
 ### Build stages
 
-The build menu dispatches all eight entry types. Only `apt` and `pypi` have a build step and only `apt`, `git`, `pypi` and `helm` have a package step; the rest say which stage does not apply to them rather than reporting an empty success. `helm` packages across the whole type — `index.yaml` is repository metadata, not a per-entry archive — so that stage ignores the selected entry and regenerates everything.
+The build menu dispatches every entry type. Only `apt` and `pypi` have a build step and only `apt`, `git`, `pypi` and `helm` have a package step; the rest say which stage does not apply to them rather than reporting an empty success. `helm` packages across the whole type — `index.yaml` is repository metadata, not a per-entry archive — so that stage ignores the selected entry and regenerates everything.
 
 ---
 
@@ -4060,20 +4174,23 @@ The key layout is the same regardless of backend (local filesystem or S3). Every
 
 A name containing a slash is encoded to `--` for every type **except gomod**, which keeps its slashes: a Go client requests `GET /<module>/@v/<version>.zip` with the module path verbatim, and nothing on the wire can rewrite it back. So `@example-corp/widget-cli` stores as `npm/@example-corp--widget-cli/@example-corp--widget-cli-1.5.0.tgz` while `example.com/example-corp/widget` stores as `gomod/example.com/example-corp/widget/@v/...`.
 
-| Type      | S3 prefix       | Example key                                                          |
-| --------- | --------------- | -------------------------------------------------------------------- |
-| apt       | `packages/apt/` | `packages/apt/pool/main/h/hello/hello_2.10-3build1_amd64.deb`        |
-| git       | `repos/`        | `repos/widget/widget-v4.5.7.bundle`                                  |
-| pypi      | `pypi/wheels/`  | `pypi/wheels/examplesdk-1.35.0-py3-none-any.whl`                     |
-| binary    | `binaries/`     | `binaries/example-tool-v2/2.34.24/example-tool-exe-linux-x86_64.zip` |
-| gomod     | `gomod/`        | `gomod/example.com/example-corp/sdk/@v/v1.30.0.zip`                  |
-| helm      | `charts/`       | `charts/ingress-nginx-4.11.0.tgz`                                    |
-| npm       | `npm/`          | `npm/lodash/lodash-4.17.21.tgz`                                      |
-| cargo     | `cargo/crates/` | `cargo/crates/serde-1.0.200.crate`                                   |
-| manifests | `manifests/`    | `manifests/apt/python3/manifest.json`                                |
-| index     | `index.json`    | Fast startup without loading every manifest                          |
-| graph     | `graph.json`    | Dependency graph with typed edges                                    |
-| metrics   | `metrics.json`  | Dashboard metrics                                                    |
+`freebsd` keeps everything literal as well, for a different reason: the key is the path the upstream repository serves the object at, so an ABI's colons and a hashed filename's `~` and `$` all survive into it. S3 accepts all three in a key and every POSIX filesystem accepts them in a path, and encoding them would buy nothing while costing a decoder at four call sites — where a wrong decode serves the wrong bytes under a signature that still verifies.
+
+| Type      | S3 prefix       | Example key                                                                     |
+| --------- | --------------- | ------------------------------------------------------------------------------- |
+| apt       | `packages/apt/` | `packages/apt/pool/main/h/hello/hello_2.10-3build1_amd64.deb`                   |
+| git       | `repos/`        | `repos/widget/widget-v4.5.7.bundle`                                             |
+| pypi      | `pypi/wheels/`  | `pypi/wheels/examplesdk-1.35.0-py3-none-any.whl`                                |
+| binary    | `binaries/`     | `binaries/example-tool-v2/2.34.24/example-tool-exe-linux-x86_64.zip`            |
+| gomod     | `gomod/`        | `gomod/example.com/example-corp/sdk/@v/v1.30.0.zip`                             |
+| helm      | `charts/`       | `charts/ingress-nginx-4.11.0.tgz`                                               |
+| npm       | `npm/`          | `npm/lodash/lodash-4.17.21.tgz`                                                 |
+| cargo     | `cargo/crates/` | `cargo/crates/serde-1.0.200.crate`                                              |
+| freebsd   | `freebsd/`      | `freebsd/FreeBSD:14:amd64/latest/All/Hashed/zogftw-2025.02.23_1~2$snxfrbid.pkg` |
+| manifests | `manifests/`    | `manifests/apt/python3/manifest.json`                                           |
+| index     | `index.json`    | Fast startup without loading every manifest                                     |
+| graph     | `graph.json`    | Dependency graph with typed edges                                               |
+| metrics   | `metrics.json`  | Dashboard metrics                                                               |
 
 Git smart-HTTP mirrors are the one tree that is not a storage key. They are bare repositories under `{storage_path}/git/{namespace}/{org}/{repo}.git` on the local filesystem, never in a named backend and never in S3: `git-http-backend` reads a real directory, and `bodega pkg move` has nothing to move. Placement rules do not reach them.
 

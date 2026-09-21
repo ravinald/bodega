@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ravinald/bodega/schemas/freebsd.schema.json",
+  "title": "FreeBSD pkg Repository Manifest",
+  "description": "Defines FreeBSD pkg repositories to mirror byte for byte or proxy. An entry is a repository rather than a package: the catalogue inside packagesite.pkg decides which objects the repository holds, and it carries FreeBSD's own signature, so nothing here is ever regenerated.",
+  "type": "object",
+  "required": ["config_version", "entries"],
+  "properties": {
+    "config_version": {
+      "type": "integer",
+      "description": "Schema version. Current: 1.",
+      "const": 1
+    },
+    "entries": {
+      "type": "array",
+      "description": "List of repositories to mirror.",
+      "items": {
+        "type": "object",
+        "required": ["name", "version", "url"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Repository directory a pkg client asks under, e.g. latest, quarterly or base_latest. One path segment; it is not a package name.",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+          },
+          "version": {
+            "type": "string",
+            "description": "The ABI directory above the repository, e.g. FreeBSD:14:amd64. This is the string pkg substitutes for ${ABI}, and it is what an entry is versioned by: one entry per ABI.",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Repository root with ${ABI} already substituted, e.g. https://pkg.freebsd.org/FreeBSD:14:amd64/latest. Required, and never composed from name and version: a private repository need not nest its ABIs the way pkg.freebsd.org does, and nothing in a URL says which convention it follows."
+          },
+          "mode": {
+            "type": "string",
+            "enum": ["hosted", "proxy"],
+            "default": "hosted",
+            "description": "hosted mirrors the whole repository into storage, objects first and the catalogue last. proxy fetches from upstream on a cache miss and holds no snapshot, so the catalogue is never parsed."
+          },
+          "frozen": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, the entry cannot be built, edited, or deleted."
+          },
+          "hidden": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, the repository is not served to clients."
+          },
+          "storage": {
+            "type": "string",
+            "description": "Name of the storage backend holding this repository's objects. Absent means \"default\" — the backend defined by storage_backend/storage_path/bucket/region. It is not a placement rule: storage_by_type decides where the next write goes, this records where an already-written mirror is."
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

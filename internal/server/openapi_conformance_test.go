@@ -19,8 +19,8 @@ import (
 //
 // The registry proxy routes speak their ecosystems' own protocols — PEP 503,
 // GOPROXY, the npm registry API, the cargo sparse index, the Debian archive
-// layout, git smart-HTTP — and a client generator reading this document has no
-// use for them. /healthz and the web UI are not part of the API either.
+// layout, the FreeBSD pkg repository layout, git smart-HTTP — and a client
+// generator reading this document has no use for them. /healthz and the web UI are not part of the API either.
 var specPathsNotDocumented = map[string]string{
 	"/apt/":      "Debian archive layout, consumed by apt rather than by a generated client",
 	"/pypi/":     "PEP 503 simple index",
@@ -30,6 +30,7 @@ var specPathsNotDocumented = map[string]string{
 	"/helm/":     "helm chart repository protocol",
 	"/npm/":      "npm registry API",
 	"/cargo/":    "cargo sparse index protocol",
+	"/freebsd/":  "FreeBSD pkg repository layout, consumed by pkg rather than by a generated client",
 	"/healthz":   "liveness probe, not part of the API surface",
 	"/ui":        "web UI",
 	"/static/":   "web UI assets",

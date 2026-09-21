@@ -26,6 +26,7 @@ func newFetchCmd(gf *globalFlags) *cobra.Command {
   helm    Download chart archives to charts/
   npm     Download package tarballs to npm/
   cargo   Download crate tarballs to cargo/
+  freebsd Mirror a pkg repository byte for byte to freebsd/
 
 ` + typeOrderSentence("fetched") + `
 
@@ -107,6 +108,10 @@ When a name is given after the type, only that entry is fetched.`,
 				case manifest.TypeCargo:
 					allSummaries = append(allSummaries,
 						builder.FetchCargo(bcfg, store, entryFilter),
+					)
+				case manifest.TypeFreeBSD:
+					allSummaries = append(allSummaries,
+						builder.FetchFreeBSD(bcfg, store, entryFilter),
 					)
 				}
 			}

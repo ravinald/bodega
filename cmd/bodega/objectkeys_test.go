@@ -1,6 +1,8 @@
 package main
 
 import (
+	"archive/tar"
+	"bytes"
 	"errors"
 	"io"
 	"net/http"
@@ -93,6 +95,26 @@ func writeFile(t *testing.T, root, rel, body string) {
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatalf("write %s: %v", rel, err)
 	}
+}
+
+// fbTarArchive is one repository archive with one member, packed with
+// packing_format = "tar". Uncompressed on purpose: this test is about which
+// key an object lands under, and a codec between the fixture and the reader
+// would only be one more thing to get wrong.
+func fbTarArchive(t *testing.T, member, payload string) string {
+	t.Helper()
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	if err := tw.WriteHeader(&tar.Header{Name: member, Mode: 0o644, Size: int64(len(payload))}); err != nil {
+		t.Fatalf("write the %s header: %v", member, err)
+	}
+	if _, err := tw.Write([]byte(payload)); err != nil {
+		t.Fatalf("write %s: %v", member, err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close the archive: %v", err)
+	}
+	return buf.String()
 }
 
 func objectKeyCases(t *testing.T) []keyCase {
@@ -216,6 +238,35 @@ func objectKeyCases(t *testing.T) []keyCase {
 				return artifactPathUpload(builder.CargoArtifactPaths(bcfg, store, ""), dst, t)
 			},
 			url: "/cargo/serde/1.0.200/download",
+		},
+		{
+			// A mirrored repository: the name is the repository directory and
+			// the version is the ABI, so the local tree, the object key and
+			// the route are all the path a pkg client composes. The package
+			// under All/Hashed carries the "~" and "$" the real catalogue
+			// does, which is what makes this a test of the key scheme rather
+			// than of a fixture.
+			typ:  manifest.TypeFreeBSD,
+			pkg:  "latest",
+			ve:   manifest.VersionEntry{Version: "FreeBSD:14:amd64"},
+			body: fbTarArchive(t, "packagesite.yaml", `{"name":"zogftw","version":"2025.02.23_1","repopath":"All/Hashed/zogftw-2025.02.23_1~2$snx.pkg"}`+"\n"),
+			local: map[string]string{
+				"freebsd/FreeBSD:14:amd64/latest/packagesite.pkg": fbTarArchive(t, "packagesite.yaml",
+					`{"name":"zogftw","version":"2025.02.23_1","repopath":"All/Hashed/zogftw-2025.02.23_1~2$snx.pkg"}`+"\n"),
+				"freebsd/FreeBSD:14:amd64/latest/data.pkg": fbTarArchive(t, "data",
+					`{"packages":[{"name":"zogftw","version":"2025.02.23_1","repopath":"All/Hashed/zogftw-2025.02.23_1~2$snx.pkg"}]}`),
+				"freebsd/FreeBSD:14:amd64/latest/meta.conf":                                "packing_format = \"tar\";\n",
+				"freebsd/FreeBSD:14:amd64/latest/All/Hashed/zogftw-2025.02.23_1~2$snx.pkg": "one mirrored package",
+			},
+			upload: func(t *testing.T, bcfg *builder.Config, store *manifest.Store, dst storage.ObjectStore) []string {
+				paths, release, err := builder.FreeBSDArtifactPaths(bcfg, store, "")
+				if err != nil {
+					t.Fatalf("enumerate freebsd artifacts: %v", err)
+				}
+				defer release()
+				return artifactPathUpload(paths, dst, t)
+			},
+			url: "/freebsd/FreeBSD:14:amd64/latest/packagesite.pkg",
 		},
 	}
 }

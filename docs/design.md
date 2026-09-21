@@ -69,6 +69,9 @@ s3://<bucket>/
   npm/                       # npm tarballs and packument metadata
   cargo/crates/              # Rust .crate tarballs
   cargo/index/               # cached sparse-index entries
+  freebsd/                   # mirrored FreeBSD pkg repositories, keyed by the
+                             #   path the repository serves them at:
+                             #   freebsd/FreeBSD:14:amd64/latest/All/Hashed/<pkg>
 ```
 
 Every key is derived in one place: `manifest.ArtifactKeys` and its per-type helpers in `internal/manifest/keys.go`. The uploader, every server handler, `bodega build status`, `bodega pkg move` and the delete path all resolve through it. Three independent derivations existed before, and they disagreed.
@@ -87,7 +90,7 @@ Four levels decide where a write goes, most specific first: `storage_policy` on 
 
 One version can be directed past all four at write time, with `--storage` on `bodega build upload` and `bodega build sync`. It is a flag rather than another level, and the two differ on the next upload of the same package: the flag records a name on the version entry and stops deciding, where a level would outrank that record at every future upload — `--replace-placement` permanently on for one version. Per-version state has no place in config, which is the other half of the reason. `pypi` cannot take it.
 
-A rule change moves nothing, so the disagreement it opens between the rule and the record is invisible on every type whose upload does not refuse — seven of the eight, since only `pypi` uploads a directory a rule can split. `bodega pkg drift` reports that disagreement across the catalog and names the `bodega pkg move` that discharges each row. It reads both sides and resolves neither: it asks the hierarchy for a name and reads the name the entry holds, and never asks a backend where anything lives.
+A rule change moves nothing, so the disagreement it opens between the rule and the record is invisible on every type whose upload does not refuse — all but one, since only `pypi` uploads a directory a rule can split. `bodega pkg drift` reports that disagreement across the catalog and names the `bodega pkg move` that discharges each row. It reads both sides and resolves neither: it asks the hierarchy for a name and reads the name the entry holds, and never asks a backend where anything lives.
 
 Placement and resolution are separate questions and share no code path. The config decides where the **next** write goes. Where an artifact **already written** lives is the name recorded in `storage` on its version entry, and reads consult only that. So a rule change moves nothing and breaks nothing: everything already uploaded stays where it is and stays readable.
 
@@ -495,7 +498,7 @@ Both are re-read per request rather than captured when the handler chain is buil
 
 Every add and remove is recorded in the audit database as a `create` or `delete` event with `pkg_type=acl`, the list in `pkg_name`, the CIDR in `pkg_version` and the OS user in `actor`. Who changed the rule sits beside the record of who the rule turned away.
 
-Package-serving read endpoints remain unauthenticated. That is a policy, not a limitation: this document used to justify it by saying package-manager clients cannot send auth headers, and that was wrong for all eight of them. What they can send is described under **Read-path identity** below, and bodega now reads it to attribute a request. What may be fetched is a separate question, and **Host profiles** below is the model that answers it: the read path consults it on every package route for the seven non-apt types. The four admin reads above are the exception, and a refusal on one is itself recorded in the audit database.
+Package-serving read endpoints remain unauthenticated. That is a policy, not a limitation: this document used to justify it by saying package-manager clients cannot send auth headers, and that was wrong for all eight of them. What they can send is described under **Read-path identity** below, and bodega now reads it to attribute a request. What may be fetched is a separate question, and **Host profiles** below is the model that answers it: the read path consults it on every package route for the non-apt types. The four admin reads above are the exception, and a refusal on one is itself recorded in the audit database.
 
 ### Read-path identity
 

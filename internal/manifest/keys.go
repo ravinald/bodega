@@ -3,6 +3,7 @@ package manifest
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -54,6 +55,12 @@ const (
 	// per-version key BinaryKey builds.
 	BinaryPrefix = "binaries/"
 
+	// FreeBSDPrefix roots the mirrored pkg tree. Everything under it is a
+	// byte-exact copy of an upstream repository, keyed by the path that
+	// repository serves it at, so the whole subtree diffs against the
+	// upstream URL with no decoding step in between.
+	FreeBSDPrefix = "freebsd/"
+
 	gomodPrefix      = "gomod/"
 	helmPrefix       = "charts/"
 	npmPrefix        = "npm/"
@@ -76,6 +83,116 @@ var ErrPypiNoObjectKey = errors.New("pypi wheels upload as a directory and have 
 // its .deb can only be found by listing the pool. internal/inventory owns that
 // fallback; this package has no backend to ask.
 var ErrAptPoolPathUnknown = errors.New("apt entry records no _pool_path")
+
+// FreeBSD catalogue members, served at a repository's root. pkg asks for
+// meta.conf first on every update and reads packing_format out of it; the two
+// .pkg archives are zstd tarballs carrying FreeBSD's own detached signature
+// as members, which is why nothing here may be regenerated.
+const (
+	FreeBSDMetaFile    = "meta.conf"
+	FreeBSDCatalogFile = "packagesite.pkg"
+	FreeBSDDataFile    = "data.pkg"
+)
+
+// FreeBSDCatalogFiles is the repository root's whole served set, catalogue
+// last. Ordering is not cosmetic: a client that reads packagesite.pkg before
+// the objects it names installs half a package set, so the mirror writes
+// every object first and these afterwards. See FreeBSDArtifactPaths.
+var FreeBSDCatalogFiles = []string{FreeBSDMetaFile, FreeBSDDataFile, FreeBSDCatalogFile}
+
+// FreeBSDLegacyRootFiles are the repository-root paths pkg asks for on a
+// repository built before 1.17, and that no current one publishes. The route
+// answers them 404 by name rather than proxying somebody else's.
+//
+// They sit beside the served three because both halves state the same fact:
+// the repository root is the mirror's own namespace. An object stored under
+// one of these names is one no request can ever reach, whatever put it there.
+var FreeBSDLegacyRootFiles = []string{"digests.pkg", "digests.txz", "packagesite.txz", "repo.txz"}
+
+// FreeBSDReservedRoot reports whether a repository-relative path belongs to
+// the repository root rather than to a package, and names the file it lands on.
+//
+// A repopath is untrusted input: it decides an object key, a local path and an
+// upstream URL, and a catalogue naming one of these turns a package into
+// repository metadata. Every writer would then act on it before the ordering
+// that protects a client can apply — the mirror downloads a package over the
+// meta.conf in its tree, the upload puts one in the object half of its
+// publication and so replaces a served catalogue ahead of the object set, and
+// the move copies it out of the source root inside its object loop. Three
+// writers, one admission point: the catalogue reader refuses the record, and
+// the names live here because this is where the keys those writers collide in
+// are built.
+//
+// The first segment decides it, so "data.pkg/x.pkg" is refused as data.pkg. A
+// filesystem gives a name to a file or to a directory and not to both, and
+// storage.Local is a filesystem. Case folds for the same reason: APFS answers
+// "Meta.conf" with meta.conf, so the key scheme's case sensitivity is not what
+// decides whether two paths are one file. A package at the repository root is
+// an ordinary layout and stays admitted; these names alone are not its to take.
+func FreeBSDReservedRoot(repoPath string) (string, bool) {
+	first, _, _ := strings.Cut(repoPath, "/")
+	for _, name := range FreeBSDCatalogFiles {
+		if strings.EqualFold(first, name) {
+			return name, true
+		}
+	}
+	for _, name := range FreeBSDLegacyRootFiles {
+		if strings.EqualFold(first, name) {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+// FreeBSDRepoPrefix roots one mirrored repository: "freebsd/<abi>/<repo>/".
+//
+// abi is the ABI directory a pkg client substitutes for ${ABI}
+// ("FreeBSD:14:amd64") and is a version here; repo is the repository name
+// under it ("latest", "base_latest") and is the package name. Both go in
+// literally. An ABI carries colons and a catalogue's repopath carries "~" and
+// "$", all three of which S3 accepts in a key and every POSIX filesystem
+// accepts in a path, so encoding them would buy nothing and cost a decoder in
+// ParseKey, in the route, in the discovery row and in 'bodega pkg move' —
+// four places where a wrong decode serves the wrong bytes under a signature
+// that still verifies.
+func FreeBSDRepoPrefix(abi, repo string) string {
+	return FreeBSDPrefix + abi + "/" + repo + "/"
+}
+
+// freeBSDABIPattern matches an ABI directory. The colons are literal and are
+// the reason this is a pattern rather than a segment check: "FreeBSD:14:amd64"
+// is one path segment carrying two of them, and a scheme that rejected the
+// colon would fail against every real repository.
+var freeBSDABIPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$`)
+
+// freeBSDRepoPattern matches a repository directory. One segment, no
+// separators: "latest", "quarterly", "base_latest".
+var freeBSDRepoPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
+// FreeBSDValidABI reports whether abi is an ABI directory this mirror can key
+// and serve.
+//
+// It lives beside the key scheme rather than in the route, because the route
+// is not the only caller: an entry created with an ABI the route will refuse
+// is one whose every request 400s, and the form that created it is where that
+// is cheap to say.
+func FreeBSDValidABI(abi string) bool { return freeBSDABIPattern.MatchString(abi) }
+
+// FreeBSDValidRepo reports whether repo is a repository directory this mirror
+// can key and serve. It is the package name for this type.
+func FreeBSDValidRepo(repo string) bool { return freeBSDRepoPattern.MatchString(repo) }
+
+// FreeBSDKey returns the key one mirrored object is stored under. repoPath is
+// the record's own repopath from packagesite.yaml, or one of
+// FreeBSDCatalogFiles for a repository-root file.
+//
+// The layouts observed upstream differ and neither is derivable from a name
+// and a version: latest/ publishes at "All/Hashed/<name>-<version>~<hash>.pkg"
+// while base_latest/ publishes at the repository root. Only the catalogue
+// knows, which is why this takes the path rather than composing one.
+func FreeBSDKey(abi, repo, repoPath string) string {
+	return FreeBSDRepoPrefix(abi, repo) + repoPath
+}
 
 // BinaryKey returns the key for a binary artifact. A versioned entry gets its
 // own directory so multiple versions coexist; an entry with no version keeps
@@ -223,6 +340,21 @@ func ArtifactKeys(pm *PackageManifest, ve VersionEntry) ([]string, error) {
 	case TypeCargo:
 		return []string{CargoCrateKey(pm.Name, ve.Version)}, nil
 
+	case TypeFreeBSD:
+		// The repository root, catalogue first: these are the keys this
+		// package can name without asking a backend what it holds. The
+		// mirrored packages are whatever the catalogue lists, so they are
+		// enumerated by listing FreeBSDRepoPrefix — inventory.ArtifactKeys
+		// owns that, for the same reason it owns apt's pool listing.
+		if ve.Version == "" {
+			return nil, fmt.Errorf("freebsd %s records no ABI, so no repository prefix resolves for it", pm.Name)
+		}
+		return []string{
+			FreeBSDKey(ve.Version, pm.Name, FreeBSDCatalogFile),
+			FreeBSDKey(ve.Version, pm.Name, FreeBSDDataFile),
+			FreeBSDKey(ve.Version, pm.Name, FreeBSDMetaFile),
+		}, nil
+
 	case TypePypi:
 		return nil, ErrPypiNoObjectKey
 	}
@@ -349,6 +481,17 @@ func ParseKey(key string) (typ, name, version string) {
 		n, v := splitTrailingVersion(base)
 		// Returned as stored: a chart name holds no slash. See unsafeName.
 		return TypeHelm, n, v
+
+	case strings.HasPrefix(key, FreeBSDPrefix):
+		// "<abi>/<repo>/<repopath>". The first two segments are fixed by the
+		// route a pkg client composes from ${ABI} and its repository name;
+		// everything after them is the record's own repopath and may hold any
+		// number of segments.
+		segs := strings.SplitN(strings.TrimPrefix(key, FreeBSDPrefix), "/", 3)
+		if len(segs) < 3 || segs[0] == "" || segs[1] == "" {
+			return TypeFreeBSD, "", ""
+		}
+		return TypeFreeBSD, segs[1], segs[0]
 
 	case strings.HasPrefix(key, npmPrefix):
 		dir, file, ok := strings.Cut(strings.TrimPrefix(key, npmPrefix), "/")

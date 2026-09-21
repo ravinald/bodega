@@ -95,6 +95,29 @@ var keyRoundTrips = map[string][]roundTrip{
 			version: "1.2.3",
 		},
 	},
+	TypeFreeBSD: {
+		// latest/: the catalogue's repopath carries "~" and "$", and the ABI
+		// directory carries colons. All of it survives into the key, so a
+		// scheme that rejected any of the three would fail here rather than
+		// against pkg.freebsd.org.
+		{
+			key:     FreeBSDKey("FreeBSD:14:amd64", "latest", "All/Hashed/zogftw-2025.02.23_1~2$snxfrbid.pkg"),
+			name:    "latest",
+			version: "FreeBSD:14:amd64",
+		},
+		// base_latest/: packages sit at the repository root, so the repopath
+		// is one segment and the split must still find the ABI and the repo.
+		{
+			key:     FreeBSDKey("FreeBSD:14:amd64", "base_latest", "FreeBSD-kernel-generic-14.2.p1.pkg"),
+			name:    "base_latest",
+			version: "FreeBSD:14:amd64",
+		},
+		{
+			key:     FreeBSDKey("FreeBSD:14:amd64", "latest", FreeBSDCatalogFile),
+			name:    "latest",
+			version: "FreeBSD:14:amd64",
+		},
+	},
 }
 
 // TestParseKeyRoundTripsEveryType is the guard on the pair. A ninth type added
