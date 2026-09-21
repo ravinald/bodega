@@ -31,17 +31,18 @@ import (
 // re-signs Debian metadata because it must. Generating a pkg catalogue is a
 // separate job and applies only to packages an operator built themselves.
 
-// freeBSDGoneFiles are the three paths pkg asks for on an old repository and
-// no current one answers.
+// The paths pkg asks for on an old repository and no current one answers are
+// manifest.FreeBSDLegacyRootFiles, refused below by name.
 //
 // digests.pkg was a meta.conf key whose own source comment at pkg 1.12 reads
 // "Leave digests here so pkg will not complain"; it is gone from pkg 2.x.
-// packagesite.txz and repo.txz are the pre-1.17 spellings. All three 404 on
-// every current FreeBSD repository, so they are refused here by name rather
-// than proxied: proxying would spend a round trip per client per update to
-// cache somebody else's 404, and mirroring them would mean generating files
-// upstream does not publish.
-var freeBSDGoneFiles = []string{"digests.pkg", "digests.txz", "packagesite.txz", "repo.txz"}
+// packagesite.txz and repo.txz are the pre-1.17 spellings. All of them 404 on
+// every current FreeBSD repository, so they are refused rather than proxied:
+// proxying would spend a round trip per client per update to cache somebody
+// else's 404, and mirroring them would mean generating files upstream does not
+// publish. The list is in manifest because the catalogue reader refuses a
+// repopath landing on one, and a name refused here and mirrored there is an
+// object no request reaches.
 
 // handleFreeBSD serves one path under a mirrored repository.
 func (s *Server) handleFreeBSD(w http.ResponseWriter, r *http.Request) {
@@ -50,7 +51,7 @@ func (s *Server) handleFreeBSD(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid freebsd repository path: expected /freebsd/<abi>/<repo>/<path>, for example /freebsd/FreeBSD:14:amd64/latest/meta.conf", http.StatusBadRequest)
 		return
 	}
-	if slices.Contains(freeBSDGoneFiles, rest) {
+	if slices.Contains(manifest.FreeBSDLegacyRootFiles, rest) {
 		// Named in the log because the answer is a fact about pkg rather than
 		// about this repository: a client asking for one of these is old
 		// enough that the repository it wants has not existed for years.

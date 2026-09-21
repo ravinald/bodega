@@ -1143,3 +1143,153 @@ func TestARecordOverTheLineCapIsRefused(t *testing.T) {
 		}
 	}
 }
+
+// R4, R5. A repopath that lands on a repository-root file is refused where it
+// enters the mirror, in both documents.
+//
+// The repository root is this mirror's namespace: the three files a client
+// reads to find everything else, and the legacy names the route answers 404
+// by. A record claiming one of them is a package whose bytes would be written
+// over the metadata, or stored under a name no request ever reaches. Dot
+// segments normalize before the check because "./data.pkg" is the spelling
+// base_latest uses for everything it publishes, and case folds into it
+// because the build tree and storage.Local are filesystems: APFS answers
+// "Data.pkg" with data.pkg whatever the key scheme thinks.
+func TestCatalogRefusesARepoPathOntoARepositoryRootFile(t *testing.T) {
+	for _, bad := range []string{
+		manifest.FreeBSDMetaFile,
+		manifest.FreeBSDDataFile,
+		manifest.FreeBSDCatalogFile,
+		"./" + manifest.FreeBSDDataFile,
+		"Data.PKG",
+		// A directory under the name instead of a file. One filesystem entry
+		// cannot be both, so this collides with the root file just as surely.
+		manifest.FreeBSDCatalogFile + "/inside.pkg",
+		"digests.pkg",
+		"repo.txz",
+	} {
+		dir := t.TempDir()
+		catalog := filepath.Join(dir, manifest.FreeBSDCatalogFile)
+		if err := os.WriteFile(catalog, fbCatalog(t, "tzst", bad), 0o644); err != nil {
+			t.Fatalf("write catalogue: %v", err)
+		}
+		if _, err := freeBSDCatalogRepoPaths(catalog, "tzst"); err == nil {
+			t.Errorf("packagesite.yaml repopath %q was accepted", bad)
+		}
+		data := filepath.Join(dir, manifest.FreeBSDDataFile)
+		if err := os.WriteFile(data, fbData(t, "tzst", bad), 0o644); err != nil {
+			t.Fatalf("write data.pkg: %v", err)
+		}
+		if _, err := freeBSDDataRepoPaths(data, "tzst", "data"); err == nil {
+			t.Errorf("data repopath %q was accepted", bad)
+		}
+	}
+
+	// The boundary is the repository root itself, not the spelling of a name.
+	// A package at the root is an ordinary layout, and one nested under a
+	// directory that happens to share a root file's name keys somewhere no
+	// root file lives.
+	for _, ok := range []string{fbRootPath, fbHashedPath, "All/" + manifest.FreeBSDMetaFile} {
+		archive := filepath.Join(t.TempDir(), manifest.FreeBSDCatalogFile)
+		if err := os.WriteFile(archive, fbCatalog(t, "tzst", ok), 0o644); err != nil {
+			t.Fatalf("write catalogue: %v", err)
+		}
+		if _, err := freeBSDCatalogRepoPaths(archive, "tzst"); err != nil {
+			t.Errorf("repopath %q was refused: %v", ok, err)
+		}
+	}
+}
+
+// R5. The refusal reaches both writers on this side, and it lands before
+// either of them has written anything.
+//
+// A catalogue naming a root file is untrusted input rather than a repository
+// pkg.freebsd.org publishes, and what it costs is a served repository: the
+// mirror would fetch that package into the tree during the object phase,
+// which is the phase that runs before the archives are placed, and the upload
+// would put it in the object half of its publication — so the metadata a
+// client reads gets replaced ahead of the object set, and an object failing
+// after it leaves the repository serving a catalogue for packages that are
+// not there.
+func TestMirrorRefusesACatalogueNamingARepositoryRootFile(t *testing.T) {
+	good := string(fbCatalog(t, "tzst", fbHashedPath))
+	goodData := string(fbData(t, "tzst", fbHashedPath))
+	// Complete and valid in every other respect: both archives parse, both
+	// objects are upstream, and one record spells data.pkg the way
+	// base_latest spells every path it publishes.
+	poisoned := string(fbData(t, "tzst", fbHashedPath, "new.pkg", "./"+manifest.FreeBSDDataFile))
+
+	var mu sync.Mutex
+	data := goodData
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		served := data
+		mu.Unlock()
+		switch strings.TrimPrefix(r.URL.Path, "/") {
+		case manifest.FreeBSDMetaFile:
+			_, _ = io.WriteString(w, "packing_format = \"tzst\";\n")
+		case manifest.FreeBSDCatalogFile:
+			_, _ = io.WriteString(w, good)
+		case manifest.FreeBSDDataFile:
+			_, _ = io.WriteString(w, served)
+		case fbHashedPath, "new.pkg":
+			_, _ = io.WriteString(w, "package bytes")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(up.Close)
+
+	cfg, store := fbFixture(t, up.URL)
+	if sum := FetchFreeBSD(cfg, store, ""); sum.Failures != 0 {
+		t.Fatalf("the first mirror reported %d failures: %+v", sum.Failures, sum.Results)
+	}
+	repoDir := filepath.Join(cfg.BuildRoot, "freebsd", fbABI, "latest")
+	published := map[string]string{}
+	for _, name := range manifest.FreeBSDCatalogFiles {
+		body, err := os.ReadFile(filepath.Join(repoDir, name))
+		if err != nil {
+			t.Fatalf("read the published %s: %v", name, err)
+		}
+		published[name] = string(body)
+	}
+
+	mu.Lock()
+	data = poisoned
+	mu.Unlock()
+	cfg.Force = true
+	sum := FetchFreeBSD(cfg, store, "")
+	if sum.Failures != 1 {
+		t.Fatalf("a catalogue naming a repository-root file reported %d failures, want 1: %+v", sum.Failures, sum.Results)
+	}
+	if err := sum.Results[0].Err; err == nil || !strings.Contains(err.Error(), manifest.FreeBSDDataFile) {
+		t.Errorf("the refusal does not name the root file the record landed on: %v", err)
+	}
+	for name, want := range published {
+		got, err := os.ReadFile(filepath.Join(repoDir, name))
+		if err != nil {
+			t.Fatalf("read %s after the refusal: %v", name, err)
+		}
+		if string(got) != want {
+			t.Errorf("the refused mirror replaced the published %s", name)
+		}
+	}
+	if fileExists(filepath.Join(repoDir, "new.pkg")) {
+		t.Error("the refusal came after the object phase had already written to the tree")
+	}
+
+	// The upload reads its pinned copy through the same reader, so a
+	// repository mirrored by something else with such a record in it is one
+	// this uploader refuses rather than publishes.
+	if err := os.WriteFile(filepath.Join(repoDir, manifest.FreeBSDDataFile), []byte(poisoned), 0o644); err != nil {
+		t.Fatalf("write the poisoned data.pkg into the tree: %v", err)
+	}
+	paths, release, err := FreeBSDArtifactPaths(cfg, store, "")
+	release()
+	if err == nil {
+		t.Fatalf("the upload enumerated %d path(s) out of a catalogue naming a repository-root file", len(paths))
+	}
+	if !strings.Contains(err.Error(), manifest.FreeBSDDataFile) {
+		t.Errorf("the upload refusal does not name the root file the record landed on: %v", err)
+	}
+}

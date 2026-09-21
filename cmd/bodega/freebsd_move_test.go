@@ -397,3 +397,61 @@ func TestFreeBSDMoveRefusesAnEntryWithNoPublishedRepository(t *testing.T) {
 		t.Fatalf("the refusal came after %d write(s): %v", len(recorder.keys), recorder.keys)
 	}
 }
+
+// TestFreeBSDMoveRefusesACatalogueNamingARepositoryRootFile covers the third
+// writer against the same untrusted input.
+//
+// The move reads its pinned archives to learn what it owes the destination,
+// and a record landing on a root file would be copied inside the object loop —
+// ahead of the pinned root files, so the destination's previous catalogue is
+// replaced by a generation whose remaining objects have not been copied yet.
+// A source object going missing after that leaves the destination serving a
+// repository nobody can install from, and the move returns an error saying
+// nothing was written.
+//
+// data.pkg carries the record here so the refusal cannot come from the
+// catalogue digest the manifest records, which is checked over
+// packagesite.pkg before this.
+func TestFreeBSDMoveRefusesACatalogueNamingARepositoryRootFile(t *testing.T) {
+	ctx := t.Context()
+	store, cfg, src, dst, resolver := fbFixture(t)
+
+	prior := fbGenerate(t, cfg.BuildRoot, []string{"All/Hashed/x-1~2$xxx.pkg"}, []string{"All/Hashed/x-1~2$xxx.pkg"})
+	fbPublish(t, ctx, cfg, store, &testResolver{def: dst, bulk: dst})
+
+	fbGenerate(t, cfg.BuildRoot, []string{"All/Hashed/a-1~2$aaa.pkg"}, []string{"All/Hashed/a-1~2$aaa.pkg"})
+	fbPublish(t, ctx, cfg, store, resolver)
+
+	// Written straight to the backend: this uploader refuses such a record, so
+	// the way one reaches a source is an older bodega, another mirror, or a
+	// hand-placed file. The move's job is to refuse what it finds there.
+	poisoned := fbTarArchive(t, "data", `{"packages":[`+
+		`{"name":"p","version":"1","repopath":"./`+manifest.FreeBSDDataFile+`"},`+
+		`{"name":"p","version":"1","repopath":"All/Hashed/missing-1~2$mmm.pkg"}]}`)
+	if err := src.Put(ctx, fbKey(manifest.FreeBSDDataFile), []byte(poisoned)); err != nil {
+		t.Fatalf("write the poisoned data.pkg to the source: %v", err)
+	}
+
+	recorder := &putRecorder{ObjectStore: dst}
+	m, _ := fbMover(t, store, resolver, recorder, false)
+	pm := fbEntry(t, ctx, store)
+	pm.Versions[0].Storage = ""
+	err := m.moveVersion(ctx, pm, 0)
+	if err == nil {
+		t.Fatal("move published a catalogue naming a repository-root file as a package")
+	}
+	if len(recorder.keys) != 0 {
+		t.Fatalf("the refusal came after %d write(s) to the destination: %v", len(recorder.keys), recorder.keys)
+	}
+	roots := fbRoots(t, ctx, dst)
+	if roots[manifest.FreeBSDCatalogFile] != prior.catalog || roots[manifest.FreeBSDDataFile] != prior.data {
+		t.Fatal("the refused move replaced the repository the destination was already serving")
+	}
+	if !strings.Contains(err.Error(), manifest.FreeBSDDataFile) {
+		t.Fatalf("the refusal does not name the root file the record landed on: %v", err)
+	}
+	fbAssertComplete(t, ctx, dst, "destination")
+	if got := effectiveStorage(fbEntry(t, ctx, store).Versions[0].Storage); got != storage.DefaultName {
+		t.Fatalf("a refused move repointed the manifest at %q", got)
+	}
+}

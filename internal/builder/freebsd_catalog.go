@@ -15,6 +15,8 @@ import (
 	"strings"
 
 	"github.com/klauspost/compress/zstd"
+
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // ---- FreeBSD pkg catalogue -------------------------------------------------
@@ -515,6 +517,13 @@ func freeBSDRepoPathsFrom(r io.Reader) ([]string, error) {
 // back under a signed catalogue. Refused rather than cleaned, because
 // cleaning a traversal away turns a repository this must not touch into one
 // it silently accepts.
+//
+// A path that stays inside the repository and lands on one of its root files
+// is refused too, once normalized: manifest.FreeBSDReservedRoot says which
+// names those are and what each writer would otherwise do with one. Refusing
+// here rather than skipping the record is the same answer a missing repopath
+// gets — a list with a record quietly dropped is not the set the archive
+// names, and publishing it claims an enumeration nobody performed.
 func cleanFreeBSDRepoPath(p string) (string, error) {
 	switch {
 	case strings.HasPrefix(p, "/"):
@@ -545,5 +554,11 @@ func cleanFreeBSDRepoPath(p string) (string, error) {
 	if len(out) == 0 {
 		return "", fmt.Errorf("repopath %q resolves to the repository root, which names no object", p)
 	}
-	return strings.Join(out, "/"), nil
+	rel := strings.Join(out, "/")
+	if name, reserved := manifest.FreeBSDReservedRoot(rel); reserved {
+		return "", fmt.Errorf("repopath %q resolves onto %s, which is the repository's own root file rather than a package. "+
+			"Mirroring it would put a package's bytes where the metadata a client reads to find every other package lives, so nothing was published. "+
+			"No pkg.freebsd.org repository publishes such a record; serve this entry in proxy mode, where the catalogue is never parsed", p, name)
+	}
+	return rel, nil
 }

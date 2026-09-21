@@ -100,6 +100,50 @@ const (
 // every object first and these afterwards. See FreeBSDArtifactPaths.
 var FreeBSDCatalogFiles = []string{FreeBSDMetaFile, FreeBSDDataFile, FreeBSDCatalogFile}
 
+// FreeBSDLegacyRootFiles are the repository-root paths pkg asks for on a
+// repository built before 1.17, and that no current one publishes. The route
+// answers them 404 by name rather than proxying somebody else's.
+//
+// They sit beside the served three because both halves state the same fact:
+// the repository root is the mirror's own namespace. An object stored under
+// one of these names is one no request can ever reach, whatever put it there.
+var FreeBSDLegacyRootFiles = []string{"digests.pkg", "digests.txz", "packagesite.txz", "repo.txz"}
+
+// FreeBSDReservedRoot reports whether a repository-relative path belongs to
+// the repository root rather than to a package, and names the file it lands on.
+//
+// A repopath is untrusted input: it decides an object key, a local path and an
+// upstream URL, and a catalogue naming one of these turns a package into
+// repository metadata. Every writer would then act on it before the ordering
+// that protects a client can apply — the mirror downloads a package over the
+// meta.conf in its tree, the upload puts one in the object half of its
+// publication and so replaces a served catalogue ahead of the object set, and
+// the move copies it out of the source root inside its object loop. Three
+// writers, one admission point: the catalogue reader refuses the record, and
+// the names live here because this is where the keys those writers collide in
+// are built.
+//
+// The first segment decides it, so "data.pkg/x.pkg" is refused as data.pkg. A
+// filesystem gives a name to a file or to a directory and not to both, and
+// storage.Local is a filesystem. Case folds for the same reason: APFS answers
+// "Meta.conf" with meta.conf, so the key scheme's case sensitivity is not what
+// decides whether two paths are one file. A package at the repository root is
+// an ordinary layout and stays admitted; these names alone are not its to take.
+func FreeBSDReservedRoot(repoPath string) (string, bool) {
+	first, _, _ := strings.Cut(repoPath, "/")
+	for _, name := range FreeBSDCatalogFiles {
+		if strings.EqualFold(first, name) {
+			return name, true
+		}
+	}
+	for _, name := range FreeBSDLegacyRootFiles {
+		if strings.EqualFold(first, name) {
+			return name, true
+		}
+	}
+	return "", false
+}
+
 // FreeBSDRepoPrefix roots one mirrored repository: "freebsd/<abi>/<repo>/".
 //
 // abi is the ABI directory a pkg client substitutes for ${ABI}
