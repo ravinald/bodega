@@ -1002,6 +1002,8 @@ components:
             type: integer
         apt:
           $ref: "#/components/schemas/AptStatus"
+        freebsd:
+          $ref: "#/components/schemas/FreeBSDStatus"
         backend_entries:
           type: array
           description: >-
@@ -1104,6 +1106,127 @@ components:
         one_line:
           type: string
           description: The .list equivalent, carrying the single suite above.
+        notes:
+          type: array
+          description: Consequences of the form rendered, for display beside it.
+          items:
+            type: string
+
+    FreeBSDStatus:
+      type: object
+      description: >-
+        How pkg clients reach this server. Whether a repository is mirrored or
+        generated, and whether a catalogue signing key is loaded, are facts
+        only the running process holds, and they decide signature_type: the
+        wrong one fails `pkg update` with an error naming the signature.
+      properties:
+        signed:
+          type: boolean
+          description: >-
+            A pkg catalogue signing key is loaded. It applies to generated
+            repositories alone; a mirror carries FreeBSD's own signature
+            inside the catalogue archive and bodega signs nothing in that path.
+        fingerprint:
+          type: string
+          description: Fingerprint of the loaded signing key. Absent when none is loaded.
+        key_error:
+          type: string
+          description: >-
+            A key file that is present and will not load, which is not the
+            same state as no key: every generated catalogue refuses until it
+            does.
+        public_url:
+          type: string
+          description: >-
+            Base URL clients reach the server at, resolved the same way
+            AptStatus.public_url is.
+        repos:
+          type: array
+          description: >-
+            One rendered client configuration per repository and ABI, sorted
+            by repository then ABI. Hidden packages and hidden ABIs are absent.
+          items:
+            $ref: "#/components/schemas/FreeBSDRepo"
+        refused:
+          type: array
+          description: >-
+            Entries no configuration could be rendered for, with the reason.
+            Reported rather than dropped: an absent stanza and a refused one
+            look identical to a client reading `repos`.
+          items:
+            type: object
+            required: [repo, abi, error]
+            properties:
+              repo:
+                type: string
+              abi:
+                type: string
+              error:
+                type: string
+
+    FreeBSDRepo:
+      type: object
+      properties:
+        tag:
+          type: string
+          description: >-
+            The repository tag this definition uses, "bodega-<repo>". Namespaced
+            because pkg merges definitions by tag, so one named for a base
+            system repository would replace it rather than stand beside it.
+        abi:
+          type: string
+        repo:
+          type: string
+        release:
+          type: integer
+          description: >-
+            FreeBSD major release the overrides are named for, read out of the
+            ABI unless it was passed separately.
+        generated:
+          type: boolean
+          description: >-
+            The catalogue is built and signed by bodega rather than copied from
+            upstream, which changes what verifies it.
+        proxy:
+          type: boolean
+          description: >-
+            Served from upstream on a miss rather than from a finished mirror.
+            It decides one thing a reader acts on: `pkg bootstrap` resolves
+            against a proxy and 404s against a hosted mirror.
+        url:
+          type: string
+          description: >-
+            Plain https with ${ABI} left literal, never pkg+https: the pkg+
+            scheme means SRV mirror discovery against records bodega does not
+            publish.
+        signature_type:
+          type: string
+          description: >-
+            "fingerprints" against the stock trust store for a mirror,
+            "fingerprints" against bodega's own for a signed generated
+            repository, "none" for an unsigned one.
+          enum: [fingerprints, none]
+        fingerprints:
+          type: string
+          description: Trust directory signature_type names. Absent when "none".
+        disabled:
+          type: array
+          description: >-
+            Upstream repository tags the file turns off, in rendered order.
+            One that names the wrong tag leaves the upstream repository
+            enabled beside bodega's, and pkg reports nothing about it.
+          items:
+            type: string
+        stanza:
+          type: string
+          description: >-
+            The repository definition alone. Not installable on its own:
+            without the disabled overrides the host fetches from both.
+        conf:
+          type: string
+          description: >-
+            The whole file, comments and overrides included, ready to land at
+            /usr/local/etc/pkg/repos/bodega.conf.
         notes:
           type: array
           description: Consequences of the form rendered, for display beside it.

@@ -1013,6 +1013,7 @@ type statusResponse struct {
 	Version        string               `json:"version,omitempty"`
 	EntryCount     map[string]int       `json:"entry_count"`
 	Apt            aptStatus            `json:"apt"`
+	FreeBSD        freebsdStatus        `json:"freebsd"`
 	Spool          spoolStats           `json:"spool"`
 	BackendEntries []backendEntryStatus `json:"backend_entries,omitempty"`
 	Error          string               `json:"error,omitempty"`
@@ -1047,6 +1048,7 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 		Healthy:    true,
 		Version:    version,
 		Apt:        s.aptStatusFor(r),
+		FreeBSD:    s.freeBSDStatusFor(r),
 		Spool:      spool,
 		EntryCount: entryCount,
 	}

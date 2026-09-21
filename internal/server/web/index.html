@@ -374,6 +374,11 @@ let allData = null;
 // no sources line of its own — reading location.protocol and a literal "noble"
 // is what handed operators a suite this instance 404s.
 let serverApt = null;
+// serverFreeBSD is the freebsd block of /api/v1/status: one rendered pkg
+// repository configuration per repository and ABI. The page composes none of
+// its own — the stanza it used to write left the upstream repository enabled
+// beside bodega's, and pkg reports nothing about that.
+let serverFreeBSD = null;
 let selectedKey = null;
 let expandedGroups = new Set();
 let expandedPkgs = new Set();
@@ -390,6 +395,7 @@ async function load() {
     allData = await pkgRes.json();
     const status = await statusRes.json();
     serverApt = status.apt || null;
+    serverFreeBSD = status.freebsd || null;
     // /api/v1/status omits version for a caller outside admin_permit_cidr, so
     // the wordmark keeps whatever title it already had rather than announcing
     // an empty one.
@@ -690,6 +696,19 @@ function clientBase() {
   return (serverApt && serverApt.public_url) || location.origin;
 }
 
+// freeBSDRepoFor picks the server-rendered configuration for this entry's
+// repository and ABI. Both, because a repository carries one entry per ABI
+// and they are configured apart: matching on the name alone hands a
+// FreeBSD:13 host the FreeBSD:14 entry's answer, which is the same URL under
+// an override naming a repository tag that host does not define.
+function freeBSDRepoFor(entry) {
+  if (!serverFreeBSD || !serverFreeBSD.repos || !entry) return null;
+  for (const r of serverFreeBSD.repos) {
+    if (r.repo === entry.name && r.abi === entry.version) return r;
+  }
+  return null;
+}
+
 // aptSourcesFor picks the server-rendered block for the suite this entry is
 // actually published to. An entry naming no suites is in the server's default,
 // which is the first block.
@@ -740,32 +759,31 @@ function getClientUrl(type, entry) {
       return '[registries.bodega]\n'
         + 'index = "sparse+' + base + '/cargo/"\n'
         + '# cargo add --registry bodega ' + entry.name;
-    // FreeBSD hands back a pkg.conf stanza, and ${ABI} stays literal in it:
-    // pkg substitutes the running host's ABI, which is what this entry
-    // records as its version. fingerprints is named because the whole point
-    // of mirroring the catalogue byte for byte is that FreeBSD's own
-    // signature travels inside it — a stanza without this defaults to
-    // signature_type NONE and throws that attestation away at the client.
-    case 'freebsd':
-      return 'bodega-' + entry.name + ': {\n'
-        + '  url: "' + base + '/freebsd/${ABI}/' + entry.name + '",\n'
-        + '  signature_type: "fingerprints",\n'
-        + '  fingerprints: "/usr/share/keys/pkg",\n'
-        + '  enabled: yes\n'
-        + '}';
+    // FreeBSD hands back the whole /usr/local/etc/pkg/repos/ file the server
+    // rendered, not the repository block alone. The block on its own installs
+    // cleanly and leaves the upstream repository enabled beside bodega's,
+    // which pkg never mentions, so the overrides that disable it travel in
+    // the same copy. signature_type comes from the server too: it is
+    // fingerprints against the stock trust store for a mirror and bodega's
+    // own key for a generated repository, and the wrong one fails pkg update
+    // on an error naming the signature.
+    case 'freebsd': {
+      const repo = freeBSDRepoFor(entry);
+      return repo ? repo.conf : '';
+    }
   }
   return '';
 }
 
 // clientFieldLabel names the detail-pane row holding a type's client
 // instruction. Three hand back something other than a URL: apt a sources
-// line, cargo a registry stanza, freebsd a pkg.conf repository block. Calling
-// any of them a "Package URL" sends an operator looking for something to curl.
+// line, cargo a registry stanza, freebsd a whole pkg repos file. Calling any
+// of them a "Package URL" sends an operator looking for something to curl.
 function clientFieldLabel(type) {
   switch (type) {
     case 'apt': return 'Sources line';
     case 'cargo': return 'Registry stanza';
-    case 'freebsd': return 'Repository stanza';
+    case 'freebsd': return 'Repository conf';
   }
   return 'Package URL';
 }
