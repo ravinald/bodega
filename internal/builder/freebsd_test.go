@@ -1293,3 +1293,77 @@ func TestMirrorRefusesACatalogueNamingARepositoryRootFile(t *testing.T) {
 		t.Errorf("the upload refusal does not name the root file the record landed on: %v", err)
 	}
 }
+
+// fbGeneratedFixture seeds a repository bodega hosts rather than mirrors: an
+// entry with no URL, and packages in the build tree where whoever built them
+// put them.
+func fbGeneratedFixture(t *testing.T, packages map[string]string) (*Config, *manifest.Store) {
+	t.Helper()
+	cfg := &Config{BuildRoot: t.TempDir(), ManifestDir: t.TempDir(), Stdout: io.Discard}
+	store := manifest.NewLocalStore(cfg.ManifestDir)
+	if err := store.AddVersion(t.Context(), manifest.TypeFreeBSD, "house", manifest.VersionEntry{
+		Version:   fbABI,
+		Generated: true,
+	}); err != nil {
+		t.Fatalf("seed the manifest: %v", err)
+	}
+	repoDir := filepath.Join(buildDirs(cfg.rootFor(manifest.TypeFreeBSD)).freebsd, fbABI, "house")
+	for rel, body := range packages {
+		dest := filepath.Join(repoDir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+			t.Fatalf("create %s: %v", filepath.Dir(dest), err)
+		}
+		if err := os.WriteFile(dest, []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", dest, err)
+		}
+	}
+	return cfg, store
+}
+
+// A generated repository has no upstream, so the fetch stage has nothing to
+// do and must not fail on the URL it does not carry. Reported complete rather
+// than skipped-with-an-error, because the pipeline reads the stage to decide
+// whether to run it again.
+func TestGeneratedRepositoryHasNoFetchStage(t *testing.T) {
+	cfg, store := fbGeneratedFixture(t, map[string]string{fbHashedPath: "a package"})
+	if sum := FetchFreeBSD(cfg, store, ""); sum.Failures != 0 {
+		t.Fatalf("fetch reported %d failures over a repository with nothing to fetch: %+v", sum.Failures, sum.Results)
+	}
+	ve := manifest.VersionEntry{Version: fbABI, Generated: true}
+	if got := CheckFreeBSDStage(cfg, "house", ve); !got.Fetched {
+		t.Errorf("CheckFreeBSDStage = %+v, want complete: there is no fetch whose absence would mean it had not run", got)
+	}
+}
+
+// Every package in the tree uploads, and no repository-root file does. The
+// three root names are the generator's namespace — the route answers them
+// from the build — so an object stored under one is one no request reaches.
+func TestGeneratedRepositoryUploadsPackagesAndNoRootFile(t *testing.T) {
+	cfg, store := fbGeneratedFixture(t, map[string]string{
+		fbHashedPath:                "a hashed package",
+		fbRootPath:                  "a repository-root package",
+		manifest.FreeBSDMetaFile:    "left over from a mirror",
+		manifest.FreeBSDCatalogFile: "left over from a mirror",
+		"README":                    "not a package",
+	})
+
+	paths, release, err := FreeBSDArtifactPaths(cfg, store, "")
+	if err != nil {
+		t.Fatalf("enumerate the upload set: %v", err)
+	}
+	defer release()
+
+	var keys []string
+	for _, ap := range paths {
+		keys = append(keys, ap.ObjectKey)
+	}
+	want := []string{
+		manifest.FreeBSDKey(fbABI, "house", fbHashedPath),
+		manifest.FreeBSDKey(fbABI, "house", fbRootPath),
+	}
+	slices.Sort(keys)
+	slices.Sort(want)
+	if !slices.Equal(keys, want) {
+		t.Fatalf("upload set = %v, want exactly the two packages %v", keys, want)
+	}
+}

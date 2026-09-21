@@ -4,9 +4,11 @@ import (
 	"net/http"
 	"path"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 // ---- FreeBSD pkg repository mirror -----------------------------------------
@@ -29,7 +31,12 @@ import (
 //
 // This is the opposite of apt, where internal/server/apt.go generates and
 // re-signs Debian metadata because it must. Generating a pkg catalogue is a
-// separate job and applies only to packages an operator built themselves.
+// separate job and applies only to packages an operator built themselves: an
+// entry marked generated: true has no upstream to copy from, and
+// internal/server/freebsd_catalog.go builds and signs its three root files
+// here. The two never meet on one entry — manifest.VersionEntry.FreeBSDGenerated
+// refuses that — because a client configures for one or the other, and being
+// served the wrong one fails as a signature error that names neither.
 
 // The paths pkg asks for on an old repository and no current one answers are
 // manifest.FreeBSDLegacyRootFiles, refused below by name.
@@ -85,11 +92,35 @@ func (s *Server) handleFreeBSD(w http.ResponseWriter, r *http.Request) {
 	catalog := slices.Contains(manifest.FreeBSDCatalogFiles, rest)
 	proxied := !configured || ve.EffectiveMode() == manifest.ModeProxy
 
+	// Which of the two products this repository is, decided per request off
+	// the entry the ABI names. An operator runs both, and the two are
+	// configured for differently on the client: a mirror's client trusts
+	// FreeBSD's fingerprint and a generated repository's trusts bodega's key,
+	// so serving one where the other was configured fails as a signature
+	// error naming neither. The entry that claims to be both is refused here
+	// rather than resolved to a guess.
+	generated, err := ve.FreeBSDGenerated()
+	if err != nil {
+		s.logger.Error("freebsd: the entry contradicts itself about whether its catalogue is mirrored or generated",
+			"abi", abi, "repo", repo, "error", err)
+		http.Error(w, "freebsd "+repo+"@"+abi+": "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	store, err := s.versionStore(ctx, manifest.TypeFreeBSD, repo, abi)
 	if err != nil {
 		s.logger.Error("storage backend recorded for artifact is not configured",
 			"type", manifest.TypeFreeBSD, "package", repo, "version", abi, "error", err)
 		http.Error(w, "storage backend error", http.StatusBadGateway)
+		return
+	}
+
+	if generated && catalog {
+		// Built here, never read from the store and never fetched: a
+		// generated repository has no upstream, and the three root files are
+		// the generator's own namespace. The objects beneath them are served
+		// from the store by the path below, exactly as a mirror's are.
+		s.serveFreeBSDGenerated(w, r, store, abi, repo, rest, key)
 		return
 	}
 
@@ -191,4 +222,35 @@ func splitFreeBSDPath(p string) (abi, repo, rest string, ok bool) {
 		}
 	}
 	return abi, repo, rest, true
+}
+
+// serveFreeBSDGenerated answers one repository-root file for a generated
+// repository.
+//
+// A build failure is a 500 carrying its own reason rather than a 404. The
+// difference matters to whoever is reading the log at 03:00: 404 is what pkg
+// reports for a repository that was never published, and it would send an
+// operator to check the upload for a repository whose objects are all there
+// and one of which cannot be read.
+func (s *Server) serveFreeBSDGenerated(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, abi, repo, rest, key string) {
+	// Never shared-cached. The catalogue is regenerated whenever the object
+	// set moves, so an intermediary holding one is an intermediary serving a
+	// repository that no longer describes what bodega has.
+	noSharedCache(w)
+	body, err := s.freeBSDGeneratedCatalog(r.Context(), store, abi, repo, rest)
+	if err != nil {
+		s.logger.Error("freebsd: generating the catalogue failed; the repository serves nothing rather than a catalogue that names objects it cannot account for",
+			"abi", abi, "repo", repo, "file", rest, "error", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	ct := contentTypeForKey(key)
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	//nolint:gosec // G705: the body is the archive this process just built; Content-Type is set above.
+	_, _ = w.Write(body)
 }

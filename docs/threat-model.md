@@ -80,6 +80,16 @@ risk:
   one than pinning: it says the repository is FreeBSD's, and it says nothing
   about which point in time this mirror is holding.
 
+- **A generated FreeBSD pkg repository, whose attestation is this instance's.**
+  A `freebsd` entry marked `generated` holds packages the operator built, so
+  there is no upstream catalogue to copy and bodega produces one. It carries
+  bodega's signature or none, and the claim shrinks accordingly: the catalogue
+  came from this mirror and has not been altered since, and nothing at all is
+  said about who built the packages or from what. Generating the catalogue is
+  the act that discards FreeBSD's attestation, and no configuration puts it
+  back. The per-package digest in a generated catalogue is bodega's own, taken
+  over the object as it was stored.
+
 - **A malicious release inside its own withdrawal window.** A fresh install is
   seeded with a minimum publish age of `7d` on `npm` and `pypi`, action `warn`,
   and `bodega serve` names it at startup. The npm and PyPI campaigns of
