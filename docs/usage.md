@@ -755,6 +755,18 @@ latest@FreeBSD:14:amd64: the archives on "default" name All/Hashed/zogftw-2025.0
 
 Objects on the source that neither archive names are not copied, for the same reason the upload does not upload them: no client can ask for them. `--delete-source` therefore removes what the move wrote and leaves those behind, and it removes `packagesite.pkg` first, so the window it opens on the source is a client told there is no such repository rather than one that resolves a package out of a live catalogue and cannot fetch it.
 
+#### a generated freebsd repository moves its packages
+
+A repository bodega generates the catalogue for stores no root files: `meta.conf`, `data.pkg` and `packagesite.pkg` are built per request from whichever backend the manifest names. The republication above has nothing to pin and nothing to publish last, so the move copies the packages alone, verifies each at the destination, and writes the manifest after them.
+
+The listing is the document here, which reverses one rule and adds one check. A mirror refuses to enumerate by listing the prefix, because a listing is not the set a catalogue names; a generated repository has nothing else that names anything, and its catalogue is built from the listing after the move lands. The destination is therefore asked first whether it holds objects under the repository that the source does not, since those would be served as packages nobody uploaded:
+
+```text
+latest@FreeBSD:14:amd64: "bulk" already holds 1 object(s) under freebsd/FreeBSD:14:amd64/latest/ that "default" does not, the first being freebsd/FreeBSD:14:amd64/latest/All/leftover-9.9.pkg. A generated catalogue is built from whatever is under the prefix, so the moved repository would publish them as packages nobody uploaded. Nothing was written to "bulk" and the manifest still points at "default": remove them, or move to a backend that is not already serving this repository
+```
+
+An upload landing while the move is copying is refused the same way, between the last copy and the manifest write. Committing would point the manifest at the destination while the packages that landed in between sit on the backend it is about to stop naming, and the catalogue is built from whichever one the manifest names.
+
 #### pypi is not movable
 
 `pypi` wheels upload as one local directory to one key prefix, and the PEP 503 index is generated from a listing over that whole tree. A package placed on another backend drops out of the index that finds it, so there is no per-version object to move:
@@ -2844,10 +2856,18 @@ The fetch opens the `.tgz` and reads `version:` from the `Chart.yaml` at its roo
 A `freebsd` entry is a **repository**, not a package. The name is the repository directory a pkg client asks under (`latest`, `quarterly`, `base_latest`) and the version is the ABI above it, which is the string pkg substitutes for `${ABI}` in the URL it was configured with. One entry per ABI, several versions per repository.
 
 - **version**: the ABI directory, e.g. `FreeBSD:14:amd64`. Required; nothing else says which tree of the repository an entry stands for.
-- **url**: the repository root with `${ABI}` already substituted. Required, and not composed from the other two fields: a private repository need not nest its ABIs the way `pkg.freebsd.org` does, and nothing in a URL says which convention it follows.
-- **mode**: `hosted` mirrors the whole repository into storage; `proxy` fetches from upstream on a cache miss and holds no snapshot.
+- **url**: the repository root with `${ABI}` already substituted. Required unless `generated` is set, and not composed from the other two fields: a private repository need not nest its ABIs the way `pkg.freebsd.org` does, and nothing in a URL says which convention it follows.
+- **mode**: `hosted` holds the repository in storage; `proxy` fetches from upstream on a cache miss and holds no snapshot.
+- **generated**: `true` for a repository whose packages you built and whose catalogue bodega produces and signs. Refused together with `url` or with `mode: proxy`, and the refusal names the field: a mirror's client trusts FreeBSD's fingerprint and a generated repository's trusts bodega's key, so an entry claiming both says nothing about which signature a client should expect. See [Hosting your own pkg repository](#hosting-your-own-pkg-repository).
 
-No checksum field. The catalogue carries FreeBSD's own signature and publishes a digest for every package, so the integrity claim is upstream's; see [Mirroring a FreeBSD pkg repository](#mirroring-a-freebsd-pkg-repository).
+```json
+{
+  "version": "FreeBSD:14:amd64",
+  "generated": true
+}
+```
+
+No checksum field. A mirrored catalogue carries FreeBSD's own signature and publishes a digest for every package, so the integrity claim is upstream's; a generated one publishes a digest bodega took of the object it stored. See [Mirroring a FreeBSD pkg repository](#mirroring-a-freebsd-pkg-repository).
 
 ---
 
@@ -2998,6 +3018,19 @@ FreeBSD: { enabled: no }
 ```
 
 `${ABI}` stays literal: pkg substitutes the running host's ABI, which is the string the matching manifest entry records as its version. `signature_type` is named because the catalogue is mirrored byte for byte precisely so FreeBSD's own signature reaches the client; a stanza that omits it defaults to `NONE` and throws that attestation away. The second line disables the stock repository, which is the point of pointing pkg at bodega at all. See [Mirroring a FreeBSD pkg repository](#mirroring-a-freebsd-pkg-repository).
+
+That stanza is for a **mirrored** repository, and `fingerprints` points at FreeBSD's own trusted keys. A repository bodega generates is signed with bodega's key and needs a different one:
+
+```text
+bodega-house: {
+  url: "https://bodega-host:8080/freebsd/${ABI}/house",
+  signature_type: "fingerprints",
+  fingerprints: "/usr/local/etc/pkg/fingerprints/bodega",
+  enabled: yes
+}
+```
+
+The two are not interchangeable. Point a mirror's stanza at bodega's fingerprints and every `pkg update` fails on a signature it cannot check; point a generated repository's at FreeBSD's and the same. See [Hosting your own pkg repository](#hosting-your-own-pkg-repository) for what installs that fingerprint file.
 
 ### Git smart-HTTP
 
@@ -3267,9 +3300,11 @@ The npm packument and the PyPI simple index are the two responses bodega parses 
 
 ### Mirroring a FreeBSD pkg repository
 
-A `freebsd` entry mirrors a pkg repository **byte for byte**, and that constraint decides the whole design of the type. `packagesite.pkg` and `data.pkg` are zstd tarballs, and each carries three members: a 256-byte signature, a 451-byte public key and the document itself. The catalogue spells them `packagesite.yaml.sig`, `packagesite.yaml.pub` and `packagesite.yaml`; `data.pkg` spells them `data.sig`, `data.pub` and `data`. There is no `.sig` sidecar on the wire. So a byte-exact copy of those archives carries FreeBSD's own signature with it and validates against the stock fingerprint at `/usr/share/keys/pkg/trusted/pkg.freebsd.org.2013102301`, with no key of bodega's and no client-side signature configuration. Regenerating the catalogue with `pkg repo` would discard that attestation permanently and force a fingerprint onto every client.
+A `freebsd` entry does one of two jobs, and which one decides everything a client has to be configured for. It mirrors an upstream repository, which is this section; or it hosts packages you built, which is [the next one](#hosting-your-own-pkg-repository). An entry naming a `url` mirrors, an entry marked `generated` hosts, and an entry claiming both is refused rather than resolved.
 
-This is the opposite of what apt needs. bodega generates and re-signs Debian metadata for a generated suite because it has to; a pkg catalogue is never generated here.
+A mirror copies the repository **byte for byte**, and that constraint decides the whole design of the type. `packagesite.pkg` and `data.pkg` are zstd tarballs, and each carries three members: a 256-byte signature, a 451-byte public key and the document itself. The catalogue spells them `packagesite.yaml.sig`, `packagesite.yaml.pub` and `packagesite.yaml`; `data.pkg` spells them `data.sig`, `data.pub` and `data`. There is no `.sig` sidecar on the wire. So a byte-exact copy of those archives carries FreeBSD's own signature with it and validates against the stock fingerprint at `/usr/share/keys/pkg/trusted/pkg.freebsd.org.2013102301`, with no key of bodega's and no client-side signature configuration. Regenerating the catalogue with `pkg repo` would discard that attestation permanently and force a fingerprint onto every client.
+
+This is the opposite of what apt needs. bodega generates and re-signs Debian metadata for a generated suite because it has to; a mirrored pkg catalogue is never regenerated, because doing so would throw away the only thing that makes it worth mirroring exactly.
 
 ```bash
 bodega pkg create freebsd          # prompts for the repository, the ABI and the URL
@@ -3331,6 +3366,89 @@ Every upstream fetch bodega makes for this type, the mirror's and the proxy's al
 #### `mirror_type` and the allow-list
 
 `freebsd` is host-scoped in the upstream allow-list, the same as `apt`: `bodega policy add freebsd pkg.freebsd.org` names the archive host, because a request that reaches upstream carries a repopath and no package identity at all.
+
+### Hosting your own pkg repository
+
+An operator serving packages they built — out of poudriere, or by hand with `pkg create` — has no upstream catalogue to copy. bodega produces one for them: `meta.conf`, `packagesite.pkg` and `data.pkg`, built from the packages stored under the repository and served at the same paths a mirror serves them at.
+
+```bash
+bodega freebsd key generate        # RSA-4096, mode 0600, where the server searches
+bodega pkg create freebsd          # repository and ABI; leave the URL blank
+bodega build upload freebsd        # place the .pkg files you put in the build tree
+```
+
+Put the packages under `<build_root>/freebsd/<ABI>/<repository>/`, in whatever layout you like — `All/`, hashed, or flat at the root. The upload takes every `.pkg` beneath that directory and nothing else; `meta.conf`, `data.pkg` and `packagesite.pkg` are bodega's own names there, and a file left under one of them is skipped with a line saying so.
+
+A symlink resolving back inside the repository is skipped too. poudriere publishes most of a tree twice, `Latest/pkg.pkg` and an ordinary name beside every hashed one, and the two names are one package: uploading both stores that package under two keys. `pkg repo` skips the same links for the same reason. A link out of the tree is the only name those bytes have here, so it is followed.
+
+#### What a bodega signature proves
+
+**That the catalogue came from this mirror. Nothing more.**
+
+It says the records were served by the bodega instance holding that key, and that they have not been altered since. It says nothing about FreeBSD, about the ports tree a package was built from, or about the machine that built it. A mirrored repository carries a different claim entirely — FreeBSD signed that catalogue, and copying it byte for byte is what delivers the signature intact — and generating a catalogue is precisely the act that discards it. There is no configuration in which bodega re-attaches an upstream attestation to a document it produced, because a signature over bytes nobody upstream ever saw is not upstream's signature.
+
+So the two repository kinds carry two different trust stories to two differently configured clients, and the failure mode of confusing them is quiet: pkg reports a repository it will not read and names the signature, never the configuration that asked for the wrong one.
+
+#### One package, one record
+
+pkg loads a catalogue into SQLite and then creates a unique index over `manifestdigest`, so two records it hashes alike fail the whole repository rather than the duplicate. `pkg update` reports the entries processed, fails with `UNIQUE constraint failed: packages.manifestdigest`, and the client keeps the catalogue it already had.
+
+That digest is over a fixed field set: name, origin, version, arch, the vital flag, options, required and provided shlibs, users, groups, dependencies, provides and requires. The comment, the description, the sizes, the checksum and the key an object is stored under reach none of it.
+
+So bodega publishes one record per package pkg would index, and decides between two objects claiming to be one package by their bytes:
+
+- **Same package, same bytes.** One record, naming the lexicographically first key. That is an alias, and the document does not change when one appears or disappears beside the package, so no client refetches the catalogue over it.
+- **Same package, different bytes.** Nothing is generated, and the error names both objects. Two builds of one version are a repository pkg refuses to load whichever of them bodega published, and choosing would decide on a sort order which one every client installs.
+
+```text
+freebsd house@FreeBSD:14:amd64: freebsd/FreeBSD:14:amd64/house/All/Hashed/widget-1.2.0~2$abcdefgh.pkg and freebsd/FreeBSD:14:amd64/house/All/widget-1.2.0.pkg are two builds of one package (widget-1.2.0) and differ in their bytes (sha256 4f21… against 9ba0…). pkg indexes both under one manifestdigest and refuses a catalogue holding the pair, so nothing was generated and the repository serves the catalogue it was serving before. Remove the object that should not be published, or give one of the two a version of its own
+```
+
+Two versions of one package are two packages to that index, and so are two option builds of one version. Both are published.
+
+#### The signature is a member of the archive
+
+`packagesite.pkg` carries exactly three members when a key is installed — `packagesite.yaml.sig`, `packagesite.yaml.pub` and `packagesite.yaml` — and `data.pkg` carries `data.sig`, `data.pub` and `data`. That is the shape upstream publishes, and there is no `.sig` sidecar on the wire for a client to fetch. With no key installed each archive carries the document alone, which is a supported configuration: pkg's own `signature_type` defaults to `NONE`.
+
+Both members carry a `$PKGSIGN:<signer>$` frame ahead of their contents for an Ed25519 key, and neither does for RSA. pkg records the signer per member and keeps the last one it read, so an unframed `.pub` behind a framed `.sig` resets the choice to RSA and hands an Ed25519 key to the OpenSSL verifier; the client then reports `error reading public key` and never names the member that caused it. The frame is not part of the key, and a client strips it before hashing, so the fingerprint is taken over the bare key either way.
+
+The construction follows the key rather than the caller, and it is two hashes deep in both cases. pkg digests the catalogue to SHA-256 and renders that as 64 lowercase hex characters; an RSA key then signs the SHA-256 of those characters with PKCS#1 v1.5 and the SHA-256 DigestInfo, and an Ed25519 key signs the characters themselves. Pairing a key with the wrong construction produces a signature the client rejects without saying why, so the pairing is not a knob.
+
+**These archives are read by `signature_type: fingerprints`, and by nothing else.** The client reads the `.pub` member out of the archive, checks its SHA-256 against a trusted fingerprint file, and verifies the signature with that key. `pubkey` is a different archive layout — pkg looks for one member literally named `signature` and reads the public key off the local filesystem instead — and it finds no such member here, so a client configured that way fails `pkg update` however good the key is. Install the fingerprint file:
+
+```bash
+bodega freebsd key export --fingerprint \
+  > /usr/local/etc/pkg/fingerprints/bodega/trusted/bodega
+```
+
+Publish that fingerprint out of band — a configuration-management repository, an image build, a USB stick. A client's first fetch of a public key is authenticated by TLS alone, and the fingerprint is what turns that into a check somebody can actually make. `bodega freebsd key export` prints the public key itself, which is for inspecting or delivering the key rather than for any client setting.
+
+#### Key management
+
+The vocabulary is `bodega apt key`'s, deliberately: two commands managing keys two different ways is one more thing to get wrong at 03:00.
+
+```bash
+bodega freebsd key generate            # RSA-4096 by default
+bodega freebsd key generate --eddsa    # Ed25519; needs pkg 1.20 or later, where pkg's ecc signer arrived
+bodega freebsd key show                # algorithm, fingerprint, and the file it was read from
+bodega freebsd key export              # the public key, in the form its signer reads
+```
+
+`export` emits the key as the archive carries it: a PEM `SubjectPublicKeyInfo` for RSA, and pkg's own DER structure for Ed25519, which is what libecc parses and what `pkg key --public` writes. There is no PEM form of an Ed25519 pkg key for the same reason there is no OpenSSL verifier for one.
+
+The server only ever loads a key — it searches `$CREDENTIALS_DIRECTORY`, then `/etc/bodega/pkg-signing.key`, then `<storage_path>/pkg-signing.key` — and refuses one readable beyond its owner. A server that could create its own key would be a server that could mint one after being compromised.
+
+There is no `--rotate`, and that is a difference in the format rather than a missing feature. An apt `InRelease` carries as many signatures as you like, so a rotation window signs with both keys at once; a pkg archive carries exactly one `.sig` and one `.pub`. A pkg rotation happens on the client, which trusts two fingerprint files for as long as the window is open: install the new fingerprint everywhere first, then replace the key and reload bodega.
+
+#### What generation reads, and what it costs
+
+The catalogue is built from the objects stored under the repository, one record per `.pkg`. Each record is that package's own `+COMPACT_MANIFEST` — the same JSON `pkg repo` reads — with four fields added that only the repository knows: `repopath` and `path` from the key the object is stored under, `sum` from a SHA-256 of the whole archive, and `pkgsize` from its length. Copying the manifest through rather than re-deriving it is what keeps a field pkg reads and bodega has never heard of from being dropped on the way.
+
+`repopath` comes from the key and from nothing else, because that is what bodega's serving path reads to find an object. A catalogue whose `repopath` disagreed with the key would resolve an install and then 404, after `pkg update` had already reported success.
+
+Building reads every package in the repository, so the result is held until the object set changes or `metadata_ttl` expires, whichever comes first. A package that cannot be read fails the whole build with the object named, rather than being left out of the catalogue: a package silently missing answers `pkg install` with the message a typo produces, and nothing anywhere would name the file.
+
+The ordering rule the mirror spends most of its design on does not apply here. A generated catalogue is derived from the objects rather than fetched alongside them, so it can only name bytes the store already holds.
 
 ### APT index generation
 

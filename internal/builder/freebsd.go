@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -88,7 +89,16 @@ func freeBSDRepoURL(ve manifest.VersionEntry) string {
 
 // CheckFreeBSDStage reports whether a repository is already mirrored. The
 // catalogue is written last, so its presence is what says the mirror finished.
+//
+// A generated repository has no fetch stage at all and reports complete. Its
+// packages arrive in the build tree from wherever the operator built them —
+// poudriere, a hand-run `pkg create` — and its catalogue is produced by the
+// server from what the upload placed, so there is nothing on this side to do
+// and nothing whose absence would mean it had not been done.
 func CheckFreeBSDStage(cfg *Config, repo string, ve manifest.VersionEntry) StageStatus {
+	if generated, err := ve.FreeBSDGenerated(); err == nil && generated {
+		return StageStatus{Fetched: true, Built: true, Packaged: true}
+	}
 	d := buildDirs(cfg.rootFor(manifest.TypeFreeBSD))
 	if fileExists(freeBSDCatalogPath(d, repo, ve)) {
 		return StageStatus{Fetched: true, Built: true, Packaged: true}
@@ -124,6 +134,21 @@ func FetchFreeBSD(cfg *Config, store *manifest.Store, entryFilter string) *Summa
 		for _, ve := range pm.Versions {
 			if ve.Frozen {
 				cfg.logf("  [freebsd] %s@%s: SKIPPED (frozen)", repo, ve.Version)
+				continue
+			}
+			generated, err := ve.FreeBSDGenerated()
+			if err != nil {
+				cfg.logf("  [freebsd] %s@%s: REFUSED: %v", repo, ve.Version, err)
+				summary.Failures++
+				summary.Results = append(summary.Results, Result{Type: manifest.TypeFreeBSD, Name: repo, Err: err})
+				continue
+			}
+			if generated {
+				// No upstream, so no fetch. The packages are whatever the
+				// operator put in the build tree and the catalogue is the
+				// server's to produce; a fetch here would have nowhere to
+				// fetch from and nothing to overwrite.
+				cfg.logf("  [freebsd] %s@%s: generated repository, nothing to fetch", repo, ve.Version)
 				continue
 			}
 			if ve.EffectiveMode() == manifest.ModeProxy {
@@ -420,6 +445,20 @@ func FreeBSDArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string
 		}
 		for _, ve := range pm.Versions {
 			repoDir := freeBSDRepoDir(d, repo, ve)
+			generated, err := ve.FreeBSDGenerated()
+			if err != nil {
+				release()
+				return nil, func() {}, fmt.Errorf("freebsd %s@%s: %w", repo, ve.Version, err)
+			}
+			if generated {
+				objs, err := freeBSDGeneratedUploadSet(cfg, pm.Name, repo, ve, repoDir)
+				if err != nil {
+					release()
+					return nil, func() {}, err
+				}
+				objects = append(objects, objs...)
+				continue
+			}
 			if !fileExists(filepath.Join(repoDir, manifest.FreeBSDCatalogFile)) {
 				// No catalogue is no snapshot: a proxy-mode entry, or one
 				// whose mirror failed before the catalogue was placed. Either
@@ -520,4 +559,138 @@ func freeBSDSortCatalog(paths []ArtifactPath) {
 		return slices.Index(manifest.FreeBSDCatalogFiles, filepath.Base(a.Local)) -
 			slices.Index(manifest.FreeBSDCatalogFiles, filepath.Base(b.Local))
 	})
+}
+
+// freeBSDGeneratedUploadSet is every package in a generated repository's build
+// tree, as local/object-key pairs.
+//
+// A plain walk, which is the answer the mirror refuses and for a reason that
+// does not apply here. A mirror uploads what a published document names,
+// because the document is what a client reads and a walk would disagree with
+// it. A generated repository publishes no document until the server builds one
+// from the objects that land here, so the walk is upstream of the catalogue
+// rather than in competition with it: whatever this uploads is what the
+// catalogue will name, and nothing can name an object the store does not hold.
+//
+// No repository-root file is uploaded. meta.conf, data.pkg and packagesite.pkg
+// are the generator's namespace, and an object stored under one of those names
+// is one no request can ever reach — the route answers all three from the
+// build. One left in the tree by an entry that used to mirror is named in the
+// log rather than skipped in silence.
+//
+// A symlink resolving back inside the repository is skipped, which is the one
+// rule the walk cannot do without. poudriere publishes most of a tree twice —
+// Latest/pkg.pkg, and an ordinary name beside every hashed one — and
+// filepath.WalkDir reports a link as an entry of its own while PutFile reads
+// the bytes it points at, so following one stores the same package under two
+// keys. The catalogue then carries two records with one manifestdigest, and
+// pkg refuses the whole repository rather than the duplicate: `pkg update`
+// reports the entries processed and fails on
+// "UNIQUE constraint failed: packages.manifestdigest". pkg's own repository
+// walk skips the same links for the same reason (2.8.2,
+// libpkg/pkg_repo_create.c:216). A link out of the tree is the only name
+// those bytes have here, so it is followed.
+func freeBSDGeneratedUploadSet(cfg *Config, name, repo string, ve manifest.VersionEntry, repoDir string) ([]ArtifactPath, error) {
+	if info, err := os.Stat(repoDir); err != nil || !info.IsDir() {
+		// Not an error: an entry created but not yet populated is the
+		// ordinary state between `bodega pkg create` and the first build.
+		cfg.logf("  [freebsd] %s@%s: %s does not exist, so the generated repository publishes nothing yet", repo, ve.Version, repoDir)
+		return nil, nil
+	}
+	// Resolved once, because the comparison below is between two resolved
+	// paths and the build root itself is commonly reached through a link:
+	// /var is /private/var on macOS, and /home is often one too. Comparing a
+	// resolved target against an unresolved root calls every alias external
+	// and uploads the duplicates this exists to drop.
+	repoRoot, err := filepath.EvalSymlinks(repoDir)
+	if err != nil {
+		return nil, fmt.Errorf("freebsd %s@%s: resolve %s: %w", repo, ve.Version, repoDir, err)
+	}
+	var out []ArtifactPath
+	err = filepath.WalkDir(repoDir, func(p string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(repoDir, p)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if root, reserved := manifest.FreeBSDReservedRoot(rel); reserved {
+			cfg.logf("  [freebsd] %s@%s: skipping %s — %s is the generated catalogue's own name and an object stored under it is one no request reaches",
+				repo, ve.Version, rel, root)
+			return nil
+		}
+		if !strings.HasSuffix(rel, ".pkg") {
+			cfg.logf("  [freebsd] %s@%s: skipping %s — a generated catalogue names .pkg archives only", repo, ve.Version, rel)
+			return nil
+		}
+		switch {
+		case entry.Type()&fs.ModeSymlink != 0:
+			target, err := filepath.EvalSymlinks(p)
+			if err != nil {
+				// Dead, or a loop. Named rather than failed: a repository
+				// tree is whatever an operator rsynced into it, and one
+				// broken link is not a reason to publish none of the
+				// packages beside it.
+				cfg.logf("  [freebsd] %s@%s: skipping %s — it is a symlink that resolves to nothing: %v", repo, ve.Version, rel, err)
+				return nil
+			}
+			if inside, at := freeBSDInsideRepo(repoRoot, target); inside {
+				cfg.logf("  [freebsd] %s@%s: skipping %s — it is a second name for %s, which this upload already carries", repo, ve.Version, rel, at)
+				return nil
+			}
+			info, err := os.Stat(p)
+			if err != nil {
+				cfg.logf("  [freebsd] %s@%s: skipping %s — it is a symlink out of the repository that cannot be read: %v", repo, ve.Version, rel, err)
+				return nil
+			}
+			if !info.Mode().IsRegular() {
+				cfg.logf("  [freebsd] %s@%s: skipping %s — it points at %s, which is not a file", repo, ve.Version, rel, target)
+				return nil
+			}
+		case !entry.Type().IsRegular():
+			cfg.logf("  [freebsd] %s@%s: skipping %s — it is not a file", repo, ve.Version, rel)
+			return nil
+		}
+		// The same admission the generated catalogue applies, one stage
+		// earlier. Uploading an object whose name no request can spell puts
+		// bytes in the store that the next catalogue build then refuses,
+		// taking the whole repository down over one file; the walk is where
+		// the file still has a path an operator can rename.
+		if err := manifest.FreeBSDValidRepoPath(rel); err != nil {
+			return fmt.Errorf("%s: %w", p, err)
+		}
+		out = append(out, ArtifactPath{
+			Local:     p,
+			ObjectKey: manifest.FreeBSDKey(ve.Version, name, rel),
+			Package:   repo,
+			Version:   ve.Version,
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("freebsd %s@%s: walk %s: %w", repo, ve.Version, repoDir, err)
+	}
+	return out, nil
+}
+
+// freeBSDInsideRepo reports whether a resolved path is inside a resolved
+// repository root, and names it relative to that root when it is.
+//
+// Both sides must already be resolved. A prefix test alone would call
+// /srv/repo-old a child of /srv/repo, so the answer comes from
+// filepath.Rel rather than from strings.HasPrefix.
+func freeBSDInsideRepo(root, target string) (bool, string) {
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return false, ""
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false, ""
+	}
+	return true, filepath.ToSlash(rel)
 }

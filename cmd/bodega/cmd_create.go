@@ -516,13 +516,19 @@ func collectCargoVersion(r *bufio.Reader, name, url, version string) (string, ma
 	return name, manifest.VersionEntry{Version: version, URL: url}, nil
 }
 
-// collectFreeBSDVersion prompts for one mirrored pkg repository.
+// collectFreeBSDVersion prompts for one pkg repository.
 //
 // A freebsd entry is a repository rather than a package, so the two prompts
 // are the two halves of the path a pkg client composes: the repository
-// directory and the ABI above it. The URL is required and is not composed
-// from the other two, because a private repository need not nest its ABIs the
-// way pkg.freebsd.org does and nothing in a URL says which it is.
+// directory and the ABI above it. The URL is not composed from the other two,
+// because a private repository need not nest its ABIs the way pkg.freebsd.org
+// does and nothing in a URL says which it is.
+//
+// A blank URL is the one way to create the other kind of repository: one whose
+// packages the operator built and whose catalogue bodega generates and signs.
+// The prompt says so rather than refusing, because the alternative — a flag
+// the operator has to know exists — is how a poudriere repository ends up
+// configured as a mirror of nothing.
 func collectFreeBSDVersion(r *bufio.Reader, name, url, abi string) (string, manifest.VersionEntry, error) {
 	var err error
 	if name, err = prompt(r, "Repository (e.g. latest, quarterly, base_latest)", name); err != nil {
@@ -537,11 +543,14 @@ func collectFreeBSDVersion(r *bufio.Reader, name, url, abi string) (string, mani
 	if abi == "" {
 		return "", manifest.VersionEntry{}, fmt.Errorf("abi is required: it is what a pkg client substitutes for ${ABI} and what this entry is versioned by")
 	}
-	if url, err = prompt(r, "Repository root URL (e.g. https://pkg.freebsd.org/"+abi+"/"+name+")", url); err != nil {
+	if url, err = prompt(r, "Repository root URL to mirror (e.g. https://pkg.freebsd.org/"+abi+"/"+name+"), or blank to host and sign your own packages", url); err != nil {
 		return "", manifest.VersionEntry{}, err
 	}
 	if url == "" {
-		return "", manifest.VersionEntry{}, fmt.Errorf("url is required: it is the repository root with ${ABI} already substituted, and nothing else says where to mirror from")
+		fmt.Println("  No URL: bodega will generate and sign this repository's catalogue from")
+		fmt.Println("  the packages you upload. That carries bodega's signature and not")
+		fmt.Println("  FreeBSD's — see `bodega freebsd key generate`.")
+		return name, manifest.VersionEntry{Version: abi, Generated: true}, nil
 	}
 	return name, manifest.VersionEntry{Version: abi, URL: url}, nil
 }

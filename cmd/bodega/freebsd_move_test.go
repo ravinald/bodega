@@ -1,17 +1,26 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/klauspost/compress/zstd"
+
 	"github.com/ravinald/bodega/internal/builder"
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/placement"
+	"github.com/ravinald/bodega/internal/server"
 	"github.com/ravinald/bodega/internal/storage"
 )
 
@@ -453,5 +462,250 @@ func TestFreeBSDMoveRefusesACatalogueNamingARepositoryRootFile(t *testing.T) {
 	fbAssertComplete(t, ctx, dst, "destination")
 	if got := effectiveStorage(fbEntry(t, ctx, store).Versions[0].Storage); got != storage.DefaultName {
 		t.Fatalf("a refused move repointed the manifest at %q", got)
+	}
+}
+
+// ---- a repository bodega generates the catalogue for -----------------------
+//
+// Its packages are the whole of it: the three root files are built per request
+// from whatever backend the manifest names, so nothing is stored under them
+// and the listing under the prefix is the document. A move that demanded those
+// files refused every generated repository outright, with the fix it suggested
+// — upload again — unable to produce them.
+
+// fbGeneratedFixture seeds a generated entry, two packages and an alias of one
+// of them in the build tree, and publishes them through the production upload.
+func fbGeneratedFixture(t *testing.T) (*config.Config, *manifest.Store, storage.Resolver, map[string]string) {
+	t.Helper()
+	ctx := t.Context()
+	defaultRoot, bulkRoot, buildRoot := t.TempDir(), t.TempDir(), t.TempDir()
+	cfg := &config.Config{
+		ManifestDir:     "manifests",
+		StorageBackend:  "local",
+		StoragePath:     defaultRoot,
+		StorageBackends: map[string]config.StorageSpec{"bulk": {Driver: "local", Path: bulkRoot}},
+	}
+	store := manifest.NewLocalStore(t.TempDir())
+	if err := store.AddVersion(ctx, manifest.TypeFreeBSD, fbRepo, manifest.VersionEntry{
+		Version:   fbABI,
+		Generated: true,
+	}); err != nil {
+		t.Fatalf("AddVersion: %v", err)
+	}
+	packages := map[string]string{
+		"All/widget-1.2.0.pkg": fbTarArchive(t, "+COMPACT_MANIFEST", `{"name":"widget","origin":"misc/widget","version":"1.2.0"}`),
+		"All/tool-3.1.pkg":     fbTarArchive(t, "+COMPACT_MANIFEST", `{"name":"tool","origin":"misc/tool","version":"3.1"}`),
+	}
+	base := "freebsd/" + fbABI + "/" + fbRepo + "/"
+	for rel, body := range packages {
+		writeFile(t, buildRoot, base+rel, body)
+	}
+	if err := os.Symlink(filepath.Join(buildRoot, filepath.FromSlash(base+"All/widget-1.2.0.pkg")),
+		filepath.Join(buildRoot, filepath.FromSlash(base+"All/widget.pkg"))); err != nil {
+		t.Fatalf("link the alias: %v", err)
+	}
+
+	stores, err := storage.NewResolver(ctx, cfg)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	fbPublish(t, ctx, &builder.Config{BuildRoot: buildRoot, ManifestDir: "manifests", Stdout: io.Discard}, store, stores)
+	return cfg, store, stores, packages
+}
+
+func fbPrefixKeys(t *testing.T, ctx context.Context, store storage.ObjectStore) []string {
+	t.Helper()
+	keys, err := store.List(ctx, manifest.FreeBSDRepoPrefix(fbABI, fbRepo))
+	if err != nil {
+		t.Fatalf("list the repository prefix: %v", err)
+	}
+	slices.Sort(keys)
+	return keys
+}
+
+// The whole chain for a generated repository: upload, move to a named backend,
+// delete the source, then read the catalogue and a package the way pkg does.
+//
+// The serving half is the assertion that matters. A move that copied the
+// objects and stopped would pass a listing comparison and still leave `pkg
+// update` answering 404, because nothing but VersionEntry.Storage says which
+// backend the catalogue is built over.
+func TestFreeBSDGeneratedMoveServesFromTheDestination(t *testing.T) {
+	ctx := t.Context()
+	cfg, store, stores, packages := fbGeneratedFixture(t)
+	src, dst := stores.Default(), mustByName(t, stores, "bulk")
+	before := fbPrefixKeys(t, ctx, src)
+	if len(before) != len(packages) {
+		t.Fatalf("the upload placed %v, want one object per package", before)
+	}
+
+	m := &mover{stores: stores, dst: dst, dstName: "bulk", store: store, spool: t.TempDir(), out: &bytes.Buffer{}, del: true}
+	if err := m.moveVersion(ctx, fbEntry(t, ctx, store), 0); err != nil {
+		t.Fatalf("move the generated repository: %v", err)
+	}
+	if got := fbPrefixKeys(t, ctx, dst); !slices.Equal(got, before) {
+		t.Fatalf("%q holds %v after the move, want the source's %v", "bulk", got, before)
+	}
+	if got := fbPrefixKeys(t, ctx, src); len(got) != 0 {
+		t.Errorf("--delete-source left %v on the source", got)
+	}
+
+	ts := httptest.NewServer(server.New(cfg, store, stores, ":0", nil).Handler())
+	t.Cleanup(ts.Close)
+	body := fbGet(t, ts.URL+"/freebsd/"+fbABI+"/"+fbRepo+"/"+manifest.FreeBSDCatalogFile)
+	var names []string
+	for _, line := range strings.Split(strings.TrimSpace(fbArchiveMember(t, body, "packagesite.yaml")), "\n") {
+		var rec struct {
+			Name     string `json:"name"`
+			RepoPath string `json:"repopath"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("read a catalogue record: %v", err)
+		}
+		names = append(names, rec.Name)
+		if got := fbGet(t, ts.URL+"/freebsd/"+fbABI+"/"+fbRepo+"/"+rec.RepoPath); got != packages[rec.RepoPath] {
+			t.Errorf("GET %s served %d bytes, want the package's %d", rec.RepoPath, len(got), len(packages[rec.RepoPath]))
+		}
+	}
+	slices.Sort(names)
+	if !slices.Equal(names, []string{"tool", "widget"}) {
+		t.Errorf("the catalogue served from the destination names %v, want both packages once each", names)
+	}
+}
+
+// fbGet reads one URL that must answer 200.
+func fbGet(t *testing.T, url string) string {
+	t.Helper()
+	resp, err := http.Get(url) //nolint:gosec,noctx // the URL is this test's own httptest server
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read %s: %v", url, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s = %d: %s", url, resp.StatusCode, body)
+	}
+	return string(body)
+}
+
+// fbArchiveMember reads one member out of a generated zstd archive.
+func fbArchiveMember(t *testing.T, body, member string) string {
+	t.Helper()
+	dec, err := zstd.NewReader(strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("open a zstd reader: %v", err)
+	}
+	defer dec.Close()
+	tr := tar.NewReader(dec)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read the archive: %v", err)
+		}
+		if hdr.Name != member {
+			continue
+		}
+		data, err := io.ReadAll(tr)
+		if err != nil {
+			t.Fatalf("read %s: %v", member, err)
+		}
+		return string(data)
+	}
+	t.Fatalf("the archive carries no %s member", member)
+	return ""
+}
+
+// A destination already holding objects under this repository's prefix is
+// refused before anything is copied.
+//
+// This is the check a mirror does not need: its catalogue would simply not
+// name a stranger, while a generated catalogue is the listing, so the moved
+// repository would publish it as a package nobody uploaded.
+func TestFreeBSDGeneratedMoveRefusesADestinationHoldingAStranger(t *testing.T) {
+	ctx := t.Context()
+	_, store, stores, _ := fbGeneratedFixture(t)
+	dst := mustByName(t, stores, "bulk")
+	stranger := manifest.FreeBSDKey(fbABI, fbRepo, "All/leftover-9.9.pkg")
+	if err := dst.Put(ctx, stranger, []byte("from an older move")); err != nil {
+		t.Fatalf("seed the destination: %v", err)
+	}
+
+	m := &mover{stores: stores, dst: dst, dstName: "bulk", store: store, spool: t.TempDir(), out: &bytes.Buffer{}, del: true}
+	err := m.moveVersion(ctx, fbEntry(t, ctx, store), 0)
+	if err == nil {
+		t.Fatal("the move published a repository holding a package the source never had")
+	}
+	if !strings.Contains(err.Error(), stranger) {
+		t.Errorf("the refusal does not name the object to remove: %v", err)
+	}
+	if got := recordedStorage(t, store, manifest.TypeFreeBSD, fbRepo, fbABI); got != "" {
+		t.Errorf("recorded storage = %q, want the source: nothing was committed", got)
+	}
+	if got := fbPrefixKeys(t, ctx, stores.Default()); len(got) == 0 {
+		t.Error("the refusal removed the source copies")
+	}
+}
+
+// An upload landing while the move is copying is refused rather than
+// half-moved. Committing would point the manifest at the destination while the
+// packages that landed in between sit on the backend it is about to stop
+// naming — and the catalogue is built from whichever one the manifest names,
+// so those packages would vanish from it with both commands reporting success.
+func TestFreeBSDGeneratedMoveRefusesARepositoryThatChangedMidMove(t *testing.T) {
+	ctx := t.Context()
+	_, store, stores, _ := fbGeneratedFixture(t)
+	src, dst := stores.Default(), mustByName(t, stores, "bulk")
+	late := manifest.FreeBSDKey(fbABI, fbRepo, "All/gadget-0.1.pkg")
+	hooked := &headHook{ObjectStore: src, run: func() {
+		if err := src.Put(ctx, late, []byte("uploaded mid-move")); err != nil {
+			t.Errorf("seed the late upload: %v", err)
+		}
+	}}
+
+	m := &mover{
+		stores: &testResolver{def: hooked, bulk: dst}, dst: dst, dstName: "bulk",
+		store: store, spool: t.TempDir(), out: &bytes.Buffer{}, del: true,
+	}
+	err := m.moveVersion(ctx, fbEntry(t, ctx, store), 0)
+	if err == nil {
+		t.Fatal("the move committed a repository whose object set moved under it")
+	}
+	if !strings.Contains(err.Error(), "changed while the move was copying it") {
+		t.Errorf("the refusal does not say what happened: %v", err)
+	}
+	if got := recordedStorage(t, store, manifest.TypeFreeBSD, fbRepo, fbABI); got != "" {
+		t.Errorf("recorded storage = %q, want the source: nothing was committed", got)
+	}
+	if info, err := src.Head(ctx, late); err != nil || !info.Exists {
+		t.Error("the package that landed mid-move is gone from the source")
+	}
+}
+
+// An entry marked generated with nothing uploaded is refused by name. The
+// mirror's message here sends an operator to `bodega build upload`, which is
+// the right instruction for both, but only after saying which of the two
+// repositories is empty.
+func TestFreeBSDGeneratedMoveRefusesAnEmptyRepository(t *testing.T) {
+	ctx := t.Context()
+	store, _, _, dst, resolver := fbFixture(t)
+	pm := fbEntry(t, ctx, store)
+	pm.Versions[0].Generated = true
+	pm.Versions[0].URL = ""
+	if err := store.SavePackage(ctx, pm); err != nil {
+		t.Fatalf("SavePackage: %v", err)
+	}
+	m, _ := fbMover(t, store, resolver, dst, false)
+	err := m.moveVersion(ctx, fbEntry(t, ctx, store), 0)
+	if err == nil {
+		t.Fatal("the move reported success over a repository with no packages")
+	}
+	if !strings.Contains(err.Error(), "bodega build upload freebsd") {
+		t.Errorf("the refusal does not say how to fill it: %v", err)
 	}
 }

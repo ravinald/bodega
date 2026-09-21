@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/ravinald/bodega/schemas/freebsd.schema.json",
   "title": "FreeBSD pkg Repository Manifest",
-  "description": "Defines FreeBSD pkg repositories to mirror byte for byte or proxy. An entry is a repository rather than a package: the catalogue inside packagesite.pkg decides which objects the repository holds, and it carries FreeBSD's own signature, so nothing here is ever regenerated.",
+  "description": "Defines FreeBSD pkg repositories. An entry is a repository rather than a package. A mirrored entry names a url and is copied byte for byte: the catalogue inside packagesite.pkg carries FreeBSD's own signature and is never regenerated. A generated entry names no url and holds packages the operator built; bodega produces its catalogue from the objects stored under it and signs it with bodega's own key, which is what discards FreeBSD's attestation. The two are refused on one entry.",
   "type": "object",
   "required": ["config_version", "entries"],
   "properties": {
@@ -13,10 +13,10 @@
     },
     "entries": {
       "type": "array",
-      "description": "List of repositories to mirror.",
+      "description": "List of repositories, mirrored or generated.",
       "items": {
         "type": "object",
-        "required": ["name", "version", "url"],
+        "required": ["name", "version"],
         "properties": {
           "name": {
             "type": "string",
@@ -31,13 +31,18 @@
           "url": {
             "type": "string",
             "format": "uri",
-            "description": "Repository root with ${ABI} already substituted, e.g. https://pkg.freebsd.org/FreeBSD:14:amd64/latest. Required, and never composed from name and version: a private repository need not nest its ABIs the way pkg.freebsd.org does, and nothing in a URL says which convention it follows."
+            "description": "Repository root with ${ABI} already substituted, e.g. https://pkg.freebsd.org/FreeBSD:14:amd64/latest. Required unless generated is true, and never composed from name and version: a private repository need not nest its ABIs the way pkg.freebsd.org does, and nothing in a URL says which convention it follows."
+          },
+          "generated": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, bodega builds and signs this repository's catalogue from the objects stored under it instead of copying an upstream one. Refused together with url or with mode proxy: a mirror's client trusts FreeBSD's fingerprint and a generated repository's trusts bodega's key, so an entry claiming both says nothing about which signature a client should expect."
           },
           "mode": {
             "type": "string",
             "enum": ["hosted", "proxy"],
             "default": "hosted",
-            "description": "hosted mirrors the whole repository into storage, objects first and the catalogue last. proxy fetches from upstream on a cache miss and holds no snapshot, so the catalogue is never parsed."
+            "description": "hosted holds the repository in storage: a mirror places objects first and the catalogue last, and a generated repository holds the packages its catalogue is built from. proxy fetches from upstream on a cache miss and holds no snapshot, so the catalogue is never parsed."
           },
           "frozen": {
             "type": "boolean",
@@ -54,7 +59,27 @@
             "description": "Name of the storage backend holding this repository's objects. Absent means \"default\" — the backend defined by storage_backend/storage_path/bucket/region. It is not a placement rule: storage_by_type decides where the next write goes, this records where an already-written mirror is."
           }
         },
-        "additionalProperties": false
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": { "generated": { "const": true } },
+              "required": ["generated"]
+            },
+            "then": {
+              "not": {
+                "anyOf": [
+                  { "required": ["url"] },
+                  {
+                    "properties": { "mode": { "const": "proxy" } },
+                    "required": ["mode"]
+                  }
+                ]
+              }
+            },
+            "else": { "required": ["url"] }
+          }
+        ]
       }
     }
   },

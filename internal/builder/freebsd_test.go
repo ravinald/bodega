@@ -1293,3 +1293,224 @@ func TestMirrorRefusesACatalogueNamingARepositoryRootFile(t *testing.T) {
 		t.Errorf("the upload refusal does not name the root file the record landed on: %v", err)
 	}
 }
+
+// fbGeneratedFixture seeds a repository bodega hosts rather than mirrors: an
+// entry with no URL, and packages in the build tree where whoever built them
+// put them.
+func fbGeneratedFixture(t *testing.T, packages map[string]string) (*Config, *manifest.Store) {
+	t.Helper()
+	cfg := &Config{BuildRoot: t.TempDir(), ManifestDir: t.TempDir(), Stdout: io.Discard}
+	store := manifest.NewLocalStore(cfg.ManifestDir)
+	if err := store.AddVersion(t.Context(), manifest.TypeFreeBSD, "house", manifest.VersionEntry{
+		Version:   fbABI,
+		Generated: true,
+	}); err != nil {
+		t.Fatalf("seed the manifest: %v", err)
+	}
+	repoDir := filepath.Join(buildDirs(cfg.rootFor(manifest.TypeFreeBSD)).freebsd, fbABI, "house")
+	for rel, body := range packages {
+		dest := filepath.Join(repoDir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+			t.Fatalf("create %s: %v", filepath.Dir(dest), err)
+		}
+		if err := os.WriteFile(dest, []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", dest, err)
+		}
+	}
+	return cfg, store
+}
+
+// A generated repository has no upstream, so the fetch stage has nothing to
+// do and must not fail on the URL it does not carry. Reported complete rather
+// than skipped-with-an-error, because the pipeline reads the stage to decide
+// whether to run it again.
+func TestGeneratedRepositoryHasNoFetchStage(t *testing.T) {
+	cfg, store := fbGeneratedFixture(t, map[string]string{fbHashedPath: "a package"})
+	if sum := FetchFreeBSD(cfg, store, ""); sum.Failures != 0 {
+		t.Fatalf("fetch reported %d failures over a repository with nothing to fetch: %+v", sum.Failures, sum.Results)
+	}
+	ve := manifest.VersionEntry{Version: fbABI, Generated: true}
+	if got := CheckFreeBSDStage(cfg, "house", ve); !got.Fetched {
+		t.Errorf("CheckFreeBSDStage = %+v, want complete: there is no fetch whose absence would mean it had not run", got)
+	}
+}
+
+// Every package in the tree uploads, and no repository-root file does. The
+// three root names are the generator's namespace — the route answers them
+// from the build — so an object stored under one is one no request reaches.
+func TestGeneratedRepositoryUploadsPackagesAndNoRootFile(t *testing.T) {
+	cfg, store := fbGeneratedFixture(t, map[string]string{
+		fbHashedPath:                "a hashed package",
+		fbRootPath:                  "a repository-root package",
+		manifest.FreeBSDMetaFile:    "left over from a mirror",
+		manifest.FreeBSDCatalogFile: "left over from a mirror",
+		"README":                    "not a package",
+	})
+
+	paths, release, err := FreeBSDArtifactPaths(cfg, store, "")
+	if err != nil {
+		t.Fatalf("enumerate the upload set: %v", err)
+	}
+	defer release()
+
+	var keys []string
+	for _, ap := range paths {
+		keys = append(keys, ap.ObjectKey)
+	}
+	want := []string{
+		manifest.FreeBSDKey(fbABI, "house", fbHashedPath),
+		manifest.FreeBSDKey(fbABI, "house", fbRootPath),
+	}
+	slices.Sort(keys)
+	slices.Sort(want)
+	if !slices.Equal(keys, want) {
+		t.Fatalf("upload set = %v, want exactly the two packages %v", keys, want)
+	}
+}
+
+// A package whose name no request can spell is refused at the walk, where it
+// still has a path an operator can rename.
+//
+// Cheap precondition, expensive operation: the alternative is uploading it,
+// then having every catalogue build afterwards refuse the whole repository
+// over one file that is already in the store.
+func TestGeneratedRepositoryRefusesAnUnroutablePackageName(t *testing.T) {
+	cfg, store := fbGeneratedFixture(t, map[string]string{
+		fbHashedPath:       "a hashed package",
+		`All/bad\name.pkg`: "a package no route can reach",
+	})
+	_, release, err := FreeBSDArtifactPaths(cfg, store, "")
+	if release != nil {
+		defer release()
+	}
+	if err == nil {
+		t.Fatal("the upload set admitted a package name the serving route refuses")
+	}
+	if !strings.Contains(err.Error(), `bad\name.pkg`) {
+		t.Errorf("the refusal does not name the file to rename: %v", err)
+	}
+}
+
+// Whatever the mirror admits, the route serves. That is the invariant, and it
+// is not that the two predicates agree: cleanFreeBSDRepoPath normalizes as
+// well as admits, so it accepts "./Hashed/x.pkg" and stores it under the
+// normalized key the route then sees. What must hold is the composition —
+// every path the mirror returns passes the admission the generated catalogue
+// and the route share — because a mirrored object keyed where no request
+// reaches is the same outage as a generated record naming one.
+func TestEveryPathTheMirrorAdmitsIsOneTheRouteServes(t *testing.T) {
+	for _, p := range []string{
+		"All/zsh-5.9_3.pkg",
+		"All/Hashed/py311-foo-1.2.0_3~2$abcdefgh.pkg",
+		"./Hashed/FreeBSD-telnet-14.snap.pkg",
+		"libx++-2.0.pkg",
+		`All/bad\name.pkg`,
+		"/All/absolute.pkg",
+		"All//empty.pkg",
+		"../escape.pkg",
+		"All/../escape.pkg",
+		"All/ctrl\x01.pkg",
+		"",
+	} {
+		rel, err := cleanFreeBSDRepoPath(p)
+		if err != nil {
+			continue
+		}
+		if err := manifest.FreeBSDValidRepoPath(rel); err != nil {
+			t.Errorf("the mirror admits %q as %q, which the route refuses: %v", p, rel, err)
+		}
+	}
+}
+
+// fbUploadKeys is the repository-relative path of everything an upload of the
+// generated repository would place.
+func fbUploadKeys(t *testing.T, cfg *Config, store *manifest.Store) []string {
+	t.Helper()
+	paths, release, err := FreeBSDArtifactPaths(cfg, store, "")
+	if release != nil {
+		defer release()
+	}
+	if err != nil {
+		t.Fatalf("enumerate the upload set: %v", err)
+	}
+	var out []string
+	for _, ap := range paths {
+		out = append(out, strings.TrimPrefix(ap.ObjectKey, manifest.FreeBSDRepoPrefix(fbABI, "house")))
+	}
+	slices.Sort(out)
+	return out
+}
+
+// fbSymlink points rel at target inside the repository tree.
+func fbSymlink(t *testing.T, cfg *Config, rel, target string) {
+	t.Helper()
+	repoDir := filepath.Join(buildDirs(cfg.rootFor(manifest.TypeFreeBSD)).freebsd, fbABI, "house")
+	link := filepath.Join(repoDir, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+		t.Fatalf("create %s: %v", filepath.Dir(link), err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("link %s: %v", rel, err)
+	}
+}
+
+// R1: a second name for a package the upload already carries is skipped.
+//
+// poudriere publishes most of a tree twice — Latest/pkg.pkg, and an ordinary
+// name beside every hashed one — and WalkDir reports a link as an entry of its
+// own while PutFile stores the bytes it points at. Uploading both puts one
+// package under two keys, and the generated catalogue then carries two records
+// pkg hashes alike: `pkg update` fails on
+// "UNIQUE constraint failed: packages.manifestdigest" for the whole
+// repository. pkg's own walk skips the same links (2.8.2,
+// libpkg/pkg_repo_create.c:216).
+func TestGeneratedUploadSkipsASecondNameForAPackage(t *testing.T) {
+	cfg, store := fbGeneratedFixture(t, map[string]string{fbHashedPath: "a package"})
+	repoDir := filepath.Join(buildDirs(cfg.rootFor(manifest.TypeFreeBSD)).freebsd, fbABI, "house")
+	fbSymlink(t, cfg, "All/widget-2025.02.23_1.pkg", filepath.Join(repoDir, filepath.FromSlash(fbHashedPath)))
+	fbSymlink(t, cfg, "Latest/widget.pkg", filepath.Join(repoDir, filepath.FromSlash(fbHashedPath)))
+
+	if got := fbUploadKeys(t, cfg, store); !slices.Equal(got, []string{fbHashedPath}) {
+		t.Fatalf("upload set = %v, want the package alone: its two aliases are the same bytes under other names", got)
+	}
+}
+
+// The same link, reached through a relative target and through a build root
+// that is itself a symlink — /var is /private/var on macOS, and a tree
+// assembled with `ln -s` carries relative targets. Both resolve inside the
+// repository and neither may upload twice.
+func TestGeneratedUploadResolvesBothSidesBeforeComparing(t *testing.T) {
+	cfg, store := fbGeneratedFixture(t, map[string]string{"All/widget-1.2.0.pkg": "a package"})
+	fbSymlink(t, cfg, "All/widget.pkg", "widget-1.2.0.pkg")
+
+	if got := fbUploadKeys(t, cfg, store); !slices.Equal(got, []string{"All/widget-1.2.0.pkg"}) {
+		t.Fatalf("upload set = %v, want the package alone: a relative link into the repository is a second name for it", got)
+	}
+}
+
+// A link out of the tree is the only name those bytes have here, so it is
+// followed — which is what pkg's own walk does with one.
+func TestGeneratedUploadFollowsALinkOutOfTheRepository(t *testing.T) {
+	cfg, store := fbGeneratedFixture(t, nil)
+	outside := filepath.Join(t.TempDir(), "widget-1.2.0.pkg")
+	if err := os.WriteFile(outside, []byte("a package built elsewhere"), 0o644); err != nil {
+		t.Fatalf("write %s: %v", outside, err)
+	}
+	fbSymlink(t, cfg, "All/widget-1.2.0.pkg", outside)
+
+	if got := fbUploadKeys(t, cfg, store); !slices.Equal(got, []string{"All/widget-1.2.0.pkg"}) {
+		t.Fatalf("upload set = %v, want the linked package: nothing else in the repository names those bytes", got)
+	}
+}
+
+// A dead link is named and skipped rather than failing the upload. A
+// repository tree is whatever an operator rsynced into it, and one broken link
+// is not a reason to publish none of the packages beside it.
+func TestGeneratedUploadSkipsADeadLink(t *testing.T) {
+	cfg, store := fbGeneratedFixture(t, map[string]string{fbHashedPath: "a package"})
+	fbSymlink(t, cfg, "All/widget-gone.pkg", filepath.Join(t.TempDir(), "never-written.pkg"))
+
+	if got := fbUploadKeys(t, cfg, store); !slices.Equal(got, []string{fbHashedPath}) {
+		t.Fatalf("upload set = %v, want the package alone", got)
+	}
+}

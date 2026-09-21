@@ -128,6 +128,26 @@ type Server struct {
 	// outgoing signature is a client being told the archive is forged.
 	aptSign atomic.Pointer[aptSigning]
 
+	// pkgSign is the key a generated FreeBSD pkg catalogue is signed with,
+	// and the public half every archive carries as a member. nil when no key
+	// is installed, which is a supported configuration: pkg's own
+	// signature_type defaults to NONE.
+	//
+	// Held and swapped exactly as aptSign is, and for the same reason: SIGHUP
+	// re-reads the key while request handlers are reading it. A mirrored
+	// repository never reaches this — its archives carry FreeBSD's signature
+	// and bodega adds none.
+	pkgSign atomic.Pointer[pkgSigning]
+
+	// freeBSDCat holds each generated repository's three root files, keyed by
+	// ABI and repository. Building one reads every package object in the
+	// repository to digest it, and a fleet's `pkg update` cron would
+	// otherwise pay for that per host.
+	freeBSDCat sync.Map
+	// freeBSDBuild serializes rebuilds of one repository, so three root-file
+	// requests from one `pkg update` produce one build rather than three.
+	freeBSDBuild keyedMutex
+
 	// aptSnap is the generated apt index. Held whole so Release and the
 	// Packages bodies it digests are always served from one generation.
 	aptSnap atomic.Pointer[aptSnapshot]
@@ -354,6 +374,7 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 	s.gitTool = resolveGitTool(cfg, logger)
 
 	s.loadAptSigner()
+	s.loadPkgSigner()
 	s.registerRoutes()
 
 	// Build the first apt index here rather than in Start, so a Server can
@@ -711,9 +732,10 @@ func (s *Server) recordLifecycle(ev audit.EventType, addr string, tlsMode bool) 
 // the same trap in a rarer shape, and the hourly tick already treats a failed
 // manifest read as non-fatal and rebuilds anyway.
 func (s *Server) reload(ctx context.Context) {
-	s.logger.Info("reload requested, re-reading manifests, the apt signing key, the CIDR access lists, the identity bindings and the profile bindings")
+	s.logger.Info("reload requested, re-reading manifests, the apt and pkg signing keys, the CIDR access lists, the identity bindings and the profile bindings")
 	s.reloadManifests(ctx)
 	s.loadAptSigner()
+	s.loadPkgSigner()
 	s.rebuildAptSnapshot(ctx)
 	s.refreshACLs(ctx)
 	s.refreshIdentities(ctx)

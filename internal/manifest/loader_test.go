@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ravinald/bodega/internal/manifest"
@@ -423,5 +424,55 @@ func TestVersionEntry_EffectiveMode(t *testing.T) {
 	ve.Mode = manifest.ModeProxy
 	if got := ve.EffectiveMode(); got != manifest.ModeProxy {
 		t.Errorf("expected ModeProxy, got %q", got)
+	}
+}
+
+// One admission point for "is this repository's catalogue mirrored or built
+// here", because three callers ask and each would otherwise guess: the server
+// decides per request which catalogue to serve, the fetch stage decides
+// whether there is an upstream, and the upload decides whose the root files
+// are. A contradictory entry says nothing about which signature a client
+// should expect, so it is refused rather than resolved.
+func TestVersionEntry_FreeBSDGenerated(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		ve      manifest.VersionEntry
+		want    bool
+		wantErr string
+	}{
+		{name: "a mirror", ve: manifest.VersionEntry{URL: "https://pkg.freebsd.org/FreeBSD:14:amd64/latest"}},
+		{name: "generated", ve: manifest.VersionEntry{Generated: true}, want: true},
+		{
+			name:    "both",
+			ve:      manifest.VersionEntry{Generated: true, URL: "https://pkg.freebsd.org/FreeBSD:14:amd64/latest"},
+			wantErr: "url",
+		},
+		{
+			name:    "generated and proxied",
+			ve:      manifest.VersionEntry{Generated: true, Mode: manifest.ModeProxy},
+			wantErr: manifest.ModeProxy,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.ve.FreeBSDGenerated()
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("FreeBSDGenerated() = %v, nil; want a refusal naming %q", got, tc.wantErr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Errorf("the refusal does not name %q, so the operator has to guess which field to change: %v", tc.wantErr, err)
+				}
+				if got {
+					t.Error("a refused entry reported generated: true, which would regenerate a mirror's catalogue")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("FreeBSDGenerated() = %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("FreeBSDGenerated() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

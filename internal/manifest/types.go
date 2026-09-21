@@ -226,6 +226,24 @@ type VersionEntry struct {
 	// every listed suite: a flat pool/ is correct Debian layout.
 	Suites []string `json:"suites,omitempty"`
 
+	// --- freebsd-specific fields ---
+
+	// Generated marks a pkg repository whose catalogue bodega builds and
+	// signs from the objects stored under it, rather than copying one an
+	// upstream published.
+	//
+	// The two are different products and a client configures for one or the
+	// other. A mirrored repository carries FreeBSD's own signature inside
+	// packagesite.pkg and its clients set signature_type: FINGERPRINTS
+	// against the stock fingerprint; a generated one carries bodega's, and
+	// regenerating is what discarded upstream's. So the flag is explicit
+	// rather than inferred from an empty URL: an operator who forgets the
+	// URL on a mirror would otherwise be served a regenerated catalogue,
+	// and the failure a client reports names the signature rather than the
+	// configuration that caused it. FreeBSDGenerated refuses the two
+	// together for the same reason.
+	Generated bool `json:"generated,omitempty"`
+
 	// --- binary-specific fields ---
 
 	// Filename overrides the basename derived from URL when set.
@@ -362,6 +380,33 @@ func (ve VersionEntry) EffectiveMode() string {
 		return ModeHosted
 	}
 	return ve.Mode
+}
+
+// FreeBSDGenerated reports whether this pkg repository's catalogue is built
+// here, and refuses an entry that claims to be both generated and mirrored.
+//
+// One admission point, because three callers ask and each would act on a
+// different guess: the server decides per request whether to serve the stored
+// catalogue or the generated one, the fetch stage decides whether there is
+// anything upstream to mirror, and the upload decides whether the three root
+// files are its to publish. An entry carrying a URL and generated: true
+// contradicts itself about which of two signatures a client is meant to
+// trust, and nothing downstream can resolve that from the bytes.
+//
+// proxy is refused with it for the same reason: proxy holds no snapshot and
+// fetches every path from upstream on a miss, so a generated catalogue would
+// describe objects the store was never asked to keep.
+func (ve VersionEntry) FreeBSDGenerated() (bool, error) {
+	if !ve.Generated {
+		return false, nil
+	}
+	if ve.URL != "" {
+		return false, fmt.Errorf("the entry is marked generated and also records url %q; a generated repository has no upstream catalogue to copy and a mirrored one must not be regenerated — drop the url to generate, or drop generated to mirror", ve.URL)
+	}
+	if ve.EffectiveMode() == ModeProxy {
+		return false, fmt.Errorf("the entry is marked generated and also mode %q; proxy serves every path from upstream and keeps no snapshot, so there is nothing for a generated catalogue to name", ModeProxy)
+	}
+	return true, nil
 }
 
 // EffectiveSuites returns the apt suites this entry is published to, falling
