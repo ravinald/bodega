@@ -492,6 +492,11 @@ func freeBSDRepoConf(cfg *config.Config, pm *manifest.PackageManifest, fingerpri
 	st := pkgrepos.State{LocalScheme: clientScheme(cfg), Repo: pm.Name, Fingerprint: fingerprint}
 	if cfg != nil {
 		st.PublicURL = cfg.ResolvePublicURL("")
+		// Read here rather than per entry: the toggle is the server's, and it
+		// decides with the mode whether a path outside the catalogue is
+		// fetched from upstream. A pane that left it false told an operator a
+		// hosted mirror was isolated while the server proxied its misses.
+		st.CacheEnabled = cfg.ProxyCacheEnabled
 	}
 	for _, ve := range pm.Versions {
 		if ve.Hidden {

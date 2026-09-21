@@ -108,31 +108,43 @@ const (
 	// Ansible template needs to read it before the paste.
 	UnsignedNote = `signature_type: none accepts whatever this server returns, with TLS as the only thing authenticating the packages, and it propagates into Ansible templates and image builds that outlive whatever made it necessary. Run "bodega freebsd key generate", reload the server, and re-read this stanza to get a verified one.`
 
-	// NoBootstrapNote is what a hosted mirror costs. pkg's own bootstrapper
-	// (usr.sbin/pkg/pkg.c) fetches <repo>/Latest/pkg.pkg and its .sig and
-	// nothing else, and a hosted mirror publishes only the repopaths its
-	// catalogue names, which never include that pair. A host with no pkg
-	// installed cannot reach one through bodega.
-	NoBootstrapNote = `"pkg bootstrap" does not work against this repository: it fetches Latest/pkg.pkg and Latest/pkg.pkg.sig, and a mirror publishes only the paths its catalogue names. Install pkg on the host from upstream first, then switch it over.`
+	// NoBootstrapNote is the answer when nothing under this repository is
+	// fetched from upstream. pkg's own bootstrapper (usr.sbin/pkg/pkg.c)
+	// fetches <repo>/Latest/pkg.pkg and its .sig and nothing else, and a
+	// mirror publishes only the repopaths its catalogue names, which never
+	// include that pair.
+	//
+	// That a mirror publishes only its catalogue is the premise rather than
+	// the answer, and it is the whole answer only where State.ReachesUpstream
+	// is false: the route serves a path the catalogue does not name from
+	// upstream wherever it can. So this text carries the isolation claim as
+	// well, which is what an operator running a hosted mirror opens the file
+	// for.
+	NoBootstrapNote = `"pkg bootstrap" does not work against this repository: it fetches Latest/pkg.pkg and Latest/pkg.pkg.sig, this repository publishes only the paths its catalogue names, and this server fetches nothing under it from upstream. Install pkg on the host from upstream first, then switch it over.`
 
-	// BootstrapProxyNote is the answer when the repository is proxied and
-	// upstream publishes the pair. Both facts decide it. A proxy composes an
-	// upstream URL for any path outside the catalogue and serves what comes
-	// off it, so a proxied repository upstream keeps no pkg package under
-	// answers the bootstrapper with an error rather than a package. The cost
-	// of the working case is reaching pkg.FreeBSD.org, which a host the
-	// operator believes is isolated is not doing on any other path.
-	BootstrapProxyNote = `"pkg bootstrap" works against this repository: it is proxied and upstream publishes Latest/pkg.pkg and Latest/pkg.pkg.sig under it, so bodega fetches both on demand. That one path reaches the internet, unlike every other request this repository answers.`
+	// BootstrapResolvesNote is the answer when a path outside the catalogue
+	// reaches upstream and upstream publishes the pair. Two facts decide it
+	// and the serving mode is neither: State.ReachesUpstream is the first and
+	// UpstreamBootstrap the second. The cost of the working case is reaching
+	// pkg.FreeBSD.org, which a host the operator believes is isolated is not
+	// doing on any other path, so the note says so rather than leaving it to
+	// the server log.
+	//
+	// Not named BootstrapWorksNote, which would read better: gosec's G101
+	// credential-name pattern matches "pw" case-insensitively, the camelCase
+	// boundary in "BootstrapWorks" spells one, and the lint then fails on a
+	// string holding no secret.
+	BootstrapResolvesNote = `"pkg bootstrap" works against this repository: this server fetches a path outside its catalogue from the upstream the repository records, and upstream publishes Latest/pkg.pkg and Latest/pkg.pkg.sig under it. That one path reaches the internet, unlike every other request this repository answers.`
 
-	// NoBootstrapUpstreamNote is the proxied repository upstream publishes no
-	// pkg package under. The proxy resolves the path, upstream refuses it,
-	// and what the client sees depends on how: internal/server/proxy.go:477
-	// passes a 404 through and turns every other non-200 into a 502 whose
-	// body says "upstream fetch failed" and names nothing. Measured through a
-	// proxied FreeBSD:15:aarch64/base_release_1, where upstream answers 403
-	// for both paths: the client got 502 and the upstream URL stayed in
-	// bodega's log.
-	NoBootstrapUpstreamNote = `"pkg bootstrap" does not work against this repository: it fetches Latest/pkg.pkg and Latest/pkg.pkg.sig, and upstream publishes neither under a base or a kmods repository. The client sees upstream's 404, or a 502 where upstream answers 403, and the refusing URL is in bodega's log rather than in the error. Bootstrap the host from a ports repository first, then switch it over.`
+	// NoBootstrapUpstreamNote is the repository whose paths reach upstream
+	// and whose upstream publishes no pkg package. The route resolves the
+	// path, upstream refuses it, and what the client sees depends on how:
+	// internal/server/proxy.go:477 passes a 404 through and turns every other
+	// non-200 into a 502 whose body says "upstream fetch failed" and names
+	// nothing. Measured through a proxied FreeBSD:15:aarch64/base_release_1,
+	// where upstream answers 403 for both paths: the client got 502 and the
+	// upstream URL stayed in bodega's log.
+	NoBootstrapUpstreamNote = `"pkg bootstrap" does not work against this repository: it fetches Latest/pkg.pkg and Latest/pkg.pkg.sig, this server fetches a path outside the catalogue from the upstream the repository records, and upstream publishes that pair under neither a base nor a kmods repository. The client sees upstream's 404, or a 502 where upstream answers 403, and the refusing URL is in bodega's log rather than in the error. Bootstrap the host from a ports repository first, then switch it over.`
 
 	// BootstrapUnknownNote is the honest answer for a repository nobody drove
 	// the pair against, and it is the default rather than the exception: the
@@ -232,12 +244,56 @@ type State struct {
 	Fingerprint string
 
 	// Proxy marks a repository served from upstream on a miss rather than
-	// from a finished mirror. It changes one thing a reader acts on: the
-	// bootstrap paths resolve on a proxy and 404 on a hosted mirror, and
-	// getting that backwards sends an operator to rebuild a repository that
-	// was never going to answer. It also contradicts Generated, which is the
-	// second pair Render refuses.
+	// from a finished mirror. It contradicts Generated, which is the second
+	// pair Render refuses, and it is one of the three terms ReachesUpstream
+	// reads. On its own it decides nothing an emitted claim may rest on.
 	Proxy bool
+
+	// CacheEnabled is the server's proxy_cache_enabled toggle. It is here
+	// because it is the other half of the question the route asks before
+	// fetching a miss, and no emitter can see it: a consumer holding a
+	// rendered Repo has the repository's own fields and nothing about the
+	// server that rendered them.
+	CacheEnabled bool
+}
+
+// ReachesUpstream reports whether a request for a path outside this
+// repository's catalogue is fetched from upstream. Every claim the emitted
+// file makes about Latest/pkg.pkg rests on this and not on the serving mode.
+//
+// Three terms, because that is what the route evaluates.
+// internal/server/freebsd.go:127,188 composes an upstream URL whenever the
+// entry records a url, whatever its mode; :155 passes the mode to
+// proxyOrCache as forceProxy rather than as a gate; and
+// internal/server/proxy.go:116 fetches the miss when
+// cacheEnabled() || forceProxy. So a hosted mirror on a server with the proxy
+// cache on reaches upstream exactly as a proxied one does.
+//
+// Measured against a bodega with proxy_cache_enabled: true and three
+// FreeBSD:15:aarch64 entries, requesting Latest/pkg.pkg and its .sig on each:
+//
+//	ports        mode: proxy, url .../quarterly        200 5477177, 200 727
+//	portsmirror  hosted,      url .../quarterly        200 5477177, 200 727
+//	basemirror   hosted,      url .../base_release_1   502,         502
+//
+// portsmirror is byte-identical to ports on both paths and differs from it
+// only in carrying no mode. bodega's own cache_origins table names where the
+// bytes came from for the hosted entry:
+//
+//	freebsd/FreeBSD:15:aarch64/portsmirror/Latest/pkg.pkg
+//	  <- https://pkg.FreeBSD.org/FreeBSD:15:aarch64/quarterly/Latest/pkg.pkg
+//
+// Driven from the client as well, with fetch(1) on a 15.1-RELEASE host
+// running pkg 2.7.5 against that same hosted entry: both Latest paths OK, and
+// meta.conf and packagesite.pkg Not Found. So the two halves differ on one
+// repository, which is why the catalogue's own guard
+// (internal/server/freebsd.go:128) does not answer this question.
+//
+// Keying a claim off Proxy alone has been wrong twice in opposite directions,
+// which is why the predicate is named once here and read rather than
+// re-spelled at each claim.
+func (s State) ReachesUpstream() bool {
+	return strings.TrimSpace(s.Upstream) != "" && (s.Proxy || s.CacheEnabled)
 }
 
 // Repo is one rendered client configuration. The JSON tags are the wire shape
@@ -250,7 +306,24 @@ type Repo struct {
 	Repo      string `json:"repo"`
 	Release   int    `json:"release"`
 	Generated bool   `json:"generated,omitempty"`
-	Proxy     bool   `json:"proxy,omitempty"`
+
+	// Proxy is the serving mode, and it is reported rather than acted on: no
+	// claim in this struct is derived from it. UpstreamFallthrough is the
+	// question a reader means when they ask whether this repository is
+	// proxied, and the two disagree on a hosted mirror with the cache on.
+	Proxy bool `json:"proxy,omitempty"`
+
+	// UpstreamFallthrough reports whether a request for a path outside this
+	// repository's catalogue is fetched from upstream, which is
+	// State.ReachesUpstream carried across the wire. It is the isolation
+	// claim: false says every request this repository answers stops at
+	// bodega.
+	//
+	// It is here rather than re-derived because two of its three terms are
+	// the server's and neither crosses: the upstream URL is not on this wire
+	// and the cache toggle is a fact about the server, not the repository.
+	// Never omitted, because false is the claim a reader acts on.
+	UpstreamFallthrough bool `json:"upstream_fallthrough"`
 
 	// Pkgbase marks the second mirrored case: a repository release
 	// engineering signed, which verifies against the pkgbase trust store
@@ -480,11 +553,11 @@ func Render(st State) (Repo, error) {
 		// Release moves the overrides onto a host of another release and
 		// cannot move a signature.
 		Pkgbase: !st.Generated && IsPkgbaseSigned(st.Upstream, repoRelease),
-		// Two facts, not one. How the repository is served decides whether
-		// anything reaches upstream for a path outside the catalogue, and
-		// which upstream repository it is decides whether there is anything
-		// there to reach.
-		Bootstrap: bootstrapAnswer(st),
+		// Two facts, not one. Whether a path outside the catalogue reaches
+		// upstream at all is the first, and which upstream repository it
+		// reaches decides whether there is anything there to fetch.
+		UpstreamFallthrough: st.ReachesUpstream(),
+		Bootstrap:           bootstrapAnswer(st),
 		// ${ABI} stays literal. pkg substitutes the running host's own ABI,
 		// which is what makes one file correct across a fleet of mixed
 		// architectures, and it is the spelling every /etc/pkg/FreeBSD.conf
@@ -559,17 +632,24 @@ func (r Repo) notes() []string {
 // bootstrapAnswer decides what `pkg bootstrap` does here, from the facts that
 // decide it rather than from the one that correlates with them.
 //
-// A hosted mirror publishes only the repopaths its catalogue names, so the
-// pair is absent whatever upstream holds. A proxy passes the request through,
-// so upstream answers. A generated repository serves what the build tree
-// uploaded, and poudriere publishes Latest/pkg.pkg as a symlink the upload
-// skips (internal/builder/freebsd.go:632-644): usually absent, present if
-// somebody put a real file there, and bodega cannot tell from here.
+// A repository no request falls out of publishes only the repopaths its
+// catalogue names, so the pair is absent whatever upstream holds. One a
+// request does fall out of answers with whatever upstream answers, which is
+// the second fact and comes off the upstream name. A generated repository
+// serves what the build tree uploaded, and poudriere publishes
+// Latest/pkg.pkg as a symlink the upload skips
+// (internal/builder/freebsd.go:632-644): usually absent, present if somebody
+// put a real file there, and bodega cannot tell from here.
+//
+// The middle case is the predicate rather than the mode. Reading st.Proxy
+// there called a hosted mirror with the proxy cache on absent while the route
+// served both paths off pkg.FreeBSD.org, and reading it the other way told
+// every proxied base mirror that bootstrap works.
 func bootstrapAnswer(st State) BootstrapAnswer {
 	switch {
 	case st.Generated:
 		return BootstrapUnknown
-	case !st.Proxy:
+	case !st.ReachesUpstream():
 		return BootstrapAbsent
 	default:
 		return UpstreamBootstrap(st.Upstream)
@@ -577,16 +657,21 @@ func bootstrapAnswer(st State) BootstrapAnswer {
 }
 
 // bootstrapNote picks the true one. Four texts for three answers, because
-// absent has two reasons a reader acts on differently: a hosted mirror is
-// bodega refusing to publish the path, and a proxied one is upstream refusing
-// to. A note that is right half the time is worse than none: it reads as
-// measured.
+// absent has two reasons a reader acts on differently: a repository nothing
+// falls out of is bodega publishing no such path, and one something does is
+// upstream refusing it. A note that is right half the time is worse than
+// none: it reads as measured.
+//
+// The split reads UpstreamFallthrough rather than Proxy, which is the same
+// term bootstrapAnswer decided on. Keyed off the mode, a hosted mirror of a
+// base repository on a cache-enabled server got the text blaming bodega's
+// catalogue while the request 502'd out of upstream.
 func bootstrapNote(r Repo) string {
 	switch r.Bootstrap {
 	case BootstrapWorks:
-		return BootstrapProxyNote
+		return BootstrapResolvesNote
 	case BootstrapAbsent:
-		if r.Proxy {
+		if r.UpstreamFallthrough {
 			return NoBootstrapUpstreamNote
 		}
 		return NoBootstrapNote
@@ -676,22 +761,24 @@ func renderConf(r Repo) string {
 		b.WriteString("#\n")
 		switch {
 		case r.Bootstrap == BootstrapWorks:
-			b.WriteString("# `pkg bootstrap` works here: this repository is proxied and upstream\n")
-			b.WriteString("# publishes Latest/pkg.pkg and its .sig under it, so bodega fetches both on\n")
-			b.WriteString("# demand. That one path reaches the internet, unlike every other request\n")
-			b.WriteString("# this repository answers.\n")
-		case r.Bootstrap == BootstrapAbsent && r.Proxy:
-			b.WriteString("# `pkg bootstrap` does not work against this repository, proxied though it\n")
-			b.WriteString("# is. It fetches Latest/pkg.pkg and Latest/pkg.pkg.sig, and upstream\n")
-			b.WriteString("# publishes neither under a base or a kmods repository. The proxy passes\n")
-			b.WriteString("# upstream's 404 through; where upstream answers 403 the client gets a 502\n")
-			b.WriteString("# and the refusing URL is in bodega's log, not in the error. Bootstrap the\n")
-			b.WriteString("# host from a ports repository, then switch it over.\n")
+			b.WriteString("# `pkg bootstrap` works here: this server fetches a path outside this\n")
+			b.WriteString("# catalogue from the upstream the repository records, and upstream publishes\n")
+			b.WriteString("# Latest/pkg.pkg and its .sig under it. That one path reaches the internet,\n")
+			b.WriteString("# unlike every other request this repository answers.\n")
+		case r.Bootstrap == BootstrapAbsent && r.UpstreamFallthrough:
+			b.WriteString("# `pkg bootstrap` does not work against this repository. It fetches\n")
+			b.WriteString("# Latest/pkg.pkg and Latest/pkg.pkg.sig; this server fetches a path outside\n")
+			b.WriteString("# the catalogue from the upstream the repository records, and upstream\n")
+			b.WriteString("# publishes that pair under neither a base nor a kmods repository. A 404\n")
+			b.WriteString("# passes through; where upstream answers 403 the client gets a 502 and the\n")
+			b.WriteString("# refusing URL is in bodega's log, not in the error. Bootstrap the host from\n")
+			b.WriteString("# a ports repository, then switch it over.\n")
 		case r.Bootstrap == BootstrapAbsent:
 			b.WriteString("# `pkg bootstrap` does not work against this repository. It fetches\n")
-			b.WriteString("# Latest/pkg.pkg and Latest/pkg.pkg.sig and nothing else, and a mirror\n")
-			b.WriteString("# publishes only the paths its catalogue names. Install pkg from upstream\n")
-			b.WriteString("# before switching a host over.\n")
+			b.WriteString("# Latest/pkg.pkg and Latest/pkg.pkg.sig and nothing else, this repository\n")
+			b.WriteString("# publishes only the paths its catalogue names, and this server fetches\n")
+			b.WriteString("# nothing under it from upstream: every request stops here. Install pkg from\n")
+			b.WriteString("# upstream before switching a host over.\n")
 		default:
 			b.WriteString("# `pkg bootstrap` may not work against this repository. It fetches\n")
 			b.WriteString("# Latest/pkg.pkg and Latest/pkg.pkg.sig, upstream publishes that pair under\n")

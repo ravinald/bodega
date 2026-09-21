@@ -1193,9 +1193,19 @@ components:
           type: boolean
           description: >-
             Served from upstream on a miss rather than from a finished mirror.
-            It is half of the bootstrap answer below: a proxy resolves a path
-            outside the catalogue against upstream, and a hosted mirror 404s
-            it whatever upstream holds.
+            Reported, not acted on: nothing else in this object is derived
+            from it, and a reader asking whether this repository reaches the
+            internet wants upstream_fallthrough below, which a hosted mirror
+            on a server with proxy_cache_enabled also carries.
+        upstream_fallthrough:
+          type: boolean
+          description: >-
+            A request for a path outside this repository's catalogue is
+            fetched from upstream. Three terms decide it and the mode is one:
+            the entry records a url, and either the mode is proxy or the
+            server's proxy cache is on. false is the isolation claim, that
+            every request this repository answers stops at bodega, so the
+            field is never omitted.
         pkgbase:
           type: boolean
           description: >-
@@ -1208,12 +1218,14 @@ components:
           type: string
           description: >-
             What `pkg bootstrap` does against this repository: "works" and
-            "absent" are measured, "unknown" is not. It needs both the serving
-            mode and the upstream repository, because upstream publishes
-            Latest/pkg.pkg under the ports repositories and nowhere else, so
-            the bootstrapper gets a 404 or a 502 against a proxied base or
-            kmods mirror. Never omitted: an absent value means "unknown"
-            rather than either answer.
+            "absent" are measured, "unknown" is not. Two facts decide it and
+            neither is the serving mode: upstream_fallthrough above, and which
+            upstream repository this mirrors, because upstream publishes
+            Latest/pkg.pkg under the ports repositories and nowhere else. So a
+            base or kmods mirror the server does fetch misses for answers the
+            bootstrapper a 404 or a 502, and a hosted ports mirror on a
+            cache-enabled server answers it a package. Never omitted: an
+            absent value means "unknown" rather than either answer.
           enum: [works, absent, unknown]
         url:
           type: string

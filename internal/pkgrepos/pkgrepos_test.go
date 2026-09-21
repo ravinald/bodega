@@ -111,70 +111,147 @@ func TestMirrorVerifiesAgainstTheStockTrustStore(t *testing.T) {
 	}
 }
 
-// The bootstrap answer follows both facts that decide it: how the repository
-// is served, and which upstream repository a proxy would reach for the pair.
-// A hosted mirror publishes only the repopaths its catalogue names, so it
-// 404s them whatever upstream holds. A proxy passes the request through, and
-// what comes back is upstream's answer: measured against a proxied ports
-// repository, Latest/pkg.pkg came back 200 at 5,477,177 bytes and its .sig at
-// 727; measured against FreeBSD:15:aarch64/base_release_1, both are 403.
-func TestBootstrapNoteFollowsTheServingMode(t *testing.T) {
-	hosted := render(t, mirror())
-	if hosted.Bootstrap != pkgrepos.BootstrapAbsent {
-		t.Errorf("Bootstrap = %q for a hosted mirror, want %q", hosted.Bootstrap, pkgrepos.BootstrapAbsent)
+// The bootstrap answer follows both facts that decide it, and the serving
+// mode is neither of them.
+//
+// The first is whether a request for a path outside the catalogue is fetched
+// from upstream, which the route reads as three terms: the entry records a
+// url, and either the mode is proxy or the server's proxy cache is on
+// (internal/server/freebsd.go:127,155, internal/server/proxy.go:116). The
+// second is whether upstream publishes the pair, which comes off the upstream
+// repository's name.
+//
+// Every row here has been keyed off r.Proxy at some point and two of them
+// were wrong for it in opposite directions: "hosted ports mirror, cache on"
+// was called absent while the route served both paths 200 off
+// pkg.FreeBSD.org, and "proxied base mirror" was called working while
+// upstream answered 403.
+func TestBootstrapAnswerFollowsWhatReachesUpstream(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		upstream string
+		proxy    bool
+		cache    bool
+		want     pkgrepos.BootstrapAnswer
+		reaches  bool
+		conf     string
+	}{
+		{
+			name:     "hosted ports mirror, cache off",
+			upstream: "https://pkg.freebsd.org/FreeBSD:14:amd64/latest",
+			want:     pkgrepos.BootstrapAbsent,
+			conf:     "every request stops here",
+		},
+		{
+			name:     "hosted ports mirror, cache on",
+			upstream: "https://pkg.freebsd.org/FreeBSD:14:amd64/latest",
+			cache:    true,
+			want:     pkgrepos.BootstrapWorks,
+			reaches:  true,
+			conf:     "`pkg bootstrap` works here",
+		},
+		{
+			name:     "proxied ports mirror, cache off",
+			upstream: "https://pkg.freebsd.org/FreeBSD:14:amd64/latest",
+			proxy:    true,
+			want:     pkgrepos.BootstrapWorks,
+			reaches:  true,
+			conf:     "`pkg bootstrap` works here",
+		},
+		{
+			name:     "hosted base mirror, cache off",
+			upstream: "https://pkg.freebsd.org/FreeBSD:15:amd64/base_release_1",
+			want:     pkgrepos.BootstrapAbsent,
+			conf:     "every request stops here",
+		},
+		{
+			name:     "hosted base mirror, cache on",
+			upstream: "https://pkg.freebsd.org/FreeBSD:15:amd64/base_release_1",
+			cache:    true,
+			want:     pkgrepos.BootstrapAbsent,
+			reaches:  true,
+			conf:     "neither a base nor a kmods repository",
+		},
+		{
+			name:     "proxied base mirror",
+			upstream: "https://pkg.freebsd.org/FreeBSD:15:amd64/base_release_1",
+			proxy:    true,
+			want:     pkgrepos.BootstrapAbsent,
+			reaches:  true,
+			conf:     "neither a base nor a kmods repository",
+		},
+		{
+			// release_<n> publishes the pair on 15 and 404s on 14, so a name
+			// that looks like a ports repository is not enough to assert it.
+			name:     "proxied mirror of a repository nobody measured",
+			upstream: "https://pkg.freebsd.org/FreeBSD:14:amd64/release_1",
+			proxy:    true,
+			want:     pkgrepos.BootstrapUnknown,
+			reaches:  true,
+			conf:     "`pkg bootstrap` may not work",
+		},
+		{
+			// No url, so there is nothing to fall through to whatever the
+			// mode and the toggle say. This row is why the predicate reads
+			// the url rather than trusting the two flags.
+			name:  "hosted repository with no upstream, cache on",
+			cache: true,
+			want:  pkgrepos.BootstrapAbsent,
+			conf:  "every request stops here",
+		},
+		{
+			name:  "proxy mode with no upstream, cache on",
+			proxy: true,
+			cache: true,
+			want:  pkgrepos.BootstrapAbsent,
+			conf:  "every request stops here",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := mirror()
+			st.Upstream, st.Proxy, st.CacheEnabled = tc.upstream, tc.proxy, tc.cache
+			if strings.Contains(tc.upstream, "base_release") {
+				st.ABI, st.Repo = "FreeBSD:15:amd64", "base"
+			}
+			if got := st.ReachesUpstream(); got != tc.reaches {
+				t.Errorf("ReachesUpstream() = %v, want %v", got, tc.reaches)
+			}
+			got := render(t, st)
+			if got.Bootstrap != tc.want {
+				t.Errorf("Bootstrap = %q, want %q", got.Bootstrap, tc.want)
+			}
+			if got.UpstreamFallthrough != tc.reaches {
+				t.Errorf("upstream_fallthrough = %v, want %v: it is the isolation claim a consumer reads instead of parsing the conf",
+					got.UpstreamFallthrough, tc.reaches)
+			}
+			if !strings.Contains(got.Conf, tc.conf) {
+				t.Errorf("the conf does not carry %q:\n%s", tc.conf, got.Conf)
+			}
+			if got.Proxy != tc.proxy {
+				t.Errorf("Proxy = %v, want %v: the serving mode is reported even though nothing is derived from it", got.Proxy, tc.proxy)
+			}
+		})
 	}
-	if !strings.Contains(hosted.Conf, "`pkg bootstrap` does not work") {
-		t.Errorf("a hosted mirror's conf does not say bootstrap fails against it:\n%s", hosted.Conf)
-	}
-	if !strings.Contains(hosted.Note(), "only the paths its catalogue names") {
-		t.Errorf("a hosted mirror's note blames upstream rather than the mirror: %q", hosted.Note())
-	}
+}
 
-	st := mirror()
-	st.Proxy = true
-	proxied := render(t, st)
-	if !proxied.Proxy {
-		t.Error("Proxy did not survive into the rendered configuration")
-	}
-	if proxied.Bootstrap != pkgrepos.BootstrapWorks {
-		t.Errorf("Bootstrap = %q for a proxied mirror of %s, want %q", proxied.Bootstrap, st.Upstream, pkgrepos.BootstrapWorks)
-	}
-	if strings.Contains(proxied.Conf, "`pkg bootstrap` does not work") {
-		t.Errorf("a proxied repository's conf claims bootstrap fails, which sends an operator to rebuild a repository that already answers:\n%s", proxied.Conf)
-	}
-	if !strings.Contains(proxied.Note(), "reaches the internet") {
-		t.Errorf("the proxy note does not name what bootstrapping through a proxy costs: %q", proxied.Note())
-	}
-
-	// Proxying is not the whole answer. Upstream publishes no pkg package
-	// under a base repository, so the proxy resolves the path and hands back
-	// upstream's 403: a file telling the operator to run pkg bootstrap here
-	// names a command that cannot work.
-	base := pkgbaseMirror()
-	base.Proxy = true
-	proxiedBase := render(t, base)
-	if proxiedBase.Bootstrap != pkgrepos.BootstrapAbsent {
-		t.Errorf("Bootstrap = %q for a proxied mirror of %s, want %q", proxiedBase.Bootstrap, base.Upstream, pkgrepos.BootstrapAbsent)
-	}
-	if strings.Contains(proxiedBase.Conf, "`pkg bootstrap` works here") {
-		t.Errorf("a proxied base mirror's conf claims bootstrap works; upstream answers 403 for both paths and the client gets a 502:\n%s", proxiedBase.Conf)
-	}
-	if !strings.Contains(proxiedBase.Note(), "or a 502 where upstream answers 403") {
-		t.Errorf("the note does not say what the client actually gets: %q", proxiedBase.Note())
-	}
-
-	// A repository nobody drove the pair against hedges. release_<n>
-	// publishes it on 15 and 404s on 14, which is why a name that looks like
-	// a ports repository is not enough to assert it.
-	unmeasured := mirror()
-	unmeasured.Proxy = true
-	unmeasured.Upstream = "https://pkg.freebsd.org/FreeBSD:14:amd64/release_1"
-	hedged := render(t, unmeasured)
-	if hedged.Bootstrap != pkgrepos.BootstrapUnknown {
-		t.Errorf("Bootstrap = %q for a proxied mirror of %s, want %q", hedged.Bootstrap, unmeasured.Upstream, pkgrepos.BootstrapUnknown)
-	}
-	if !strings.Contains(hedged.Conf, "`pkg bootstrap` may not work") {
-		t.Errorf("an unmeasured repository's conf asserts an answer nobody measured:\n%s", hedged.Conf)
+// A file that says every request stops at bodega is the isolation claim, and
+// it may appear only where nothing reaches upstream. It was false for a
+// hosted mirror on a cache-enabled server, which is the form an operator
+// reaches for precisely because they believe it is finished and isolated.
+func TestOnlyAnIsolatedRepositoryClaimsToBeOne(t *testing.T) {
+	const isolation = "this server fetches nothing under it from upstream"
+	for _, cache := range []bool{false, true} {
+		st := mirror()
+		st.CacheEnabled = cache
+		got := render(t, st)
+		claims := strings.Contains(got.Note(), isolation) || strings.Contains(got.Conf, "every request stops here")
+		if claims == got.UpstreamFallthrough {
+			t.Errorf("proxy_cache_enabled=%v: the file claims isolation=%v while upstream_fallthrough=%v:\n%s",
+				cache, claims, got.UpstreamFallthrough, got.Conf)
+		}
+		if got.UpstreamFallthrough && !strings.Contains(got.Note(), "reaches the internet") {
+			t.Errorf("proxy_cache_enabled=%v: a repository that fetches from upstream does not say so: %q", cache, got.Note())
+		}
 	}
 }
 
@@ -525,7 +602,16 @@ func TestTheTargetReleaseDoesNotMoveTheTrustStore(t *testing.T) {
 // is not on it; rebuilding a State there is what pointed a pkgbase mirror at
 // the ports trust store.
 func TestWithReleaseMovesTheOverridesAndNothingElse(t *testing.T) {
-	fifteen := render(t, pkgbaseMirror())
+	// The cache is on, so this entry reaches upstream and the bootstrap note
+	// is the one blaming upstream rather than the catalogue. A wire shape that
+	// dropped upstream_fallthrough would re-render the other text, which is
+	// the round trip that already lost the trust half once.
+	base := pkgbaseMirror()
+	base.CacheEnabled = true
+	fifteen := render(t, base)
+	if !fifteen.UpstreamFallthrough {
+		t.Fatal("the fixture does not reach upstream, so this test cannot tell a dropped field from a zero one")
+	}
 
 	// Through the wire shape, because that is the trip the caller makes.
 	var decoded pkgrepos.Repo
@@ -547,6 +633,10 @@ func TestWithReleaseMovesTheOverridesAndNothingElse(t *testing.T) {
 	}
 	if got.URL != fifteen.URL || got.Tag != fifteen.Tag || got.Pkgbase != fifteen.Pkgbase {
 		t.Errorf("re-rendering changed url/tag/pkgbase: %+v against %+v", got, fifteen)
+	}
+	if got.UpstreamFallthrough != fifteen.UpstreamFallthrough {
+		t.Errorf("re-rendering changed upstream_fallthrough: %v became %v; the cache toggle it comes from is the server's and does not cross",
+			fifteen.UpstreamFallthrough, got.UpstreamFallthrough)
 	}
 	if got.Bootstrap != fifteen.Bootstrap {
 		t.Errorf("re-rendering changed the bootstrap answer: %q became %q; the upstream URL it was derived from is not on the wire",

@@ -329,3 +329,94 @@ func TestFreeBSDStatusDoesNotPromiseBootstrapOnAProxiedBaseMirror(t *testing.T) 
 		t.Errorf("the conf tells the operator to run a command that cannot resolve:\n%s", repo.Conf)
 	}
 }
+
+// A hosted mirror on a server with the proxy cache on does not claim to be
+// isolated, because it is not: the route composes an upstream URL for any
+// path outside the catalogue whenever the entry records a url, and fetches
+// the miss when the cache is enabled or the mode is proxy
+// (internal/server/freebsd.go:127,155, internal/server/proxy.go:116).
+//
+// Both halves run against one server on purpose. The defect this covers is a
+// disagreement between what the route answers for Latest/pkg.pkg and what the
+// emitted configuration claims about it, and neither half alone shows it: the
+// route served 200 off pkg.FreeBSD.org while the conf told the operator the
+// path was dead and that nothing under this repository reached the internet.
+func TestFreeBSDHostedMirrorWithTheCacheOnDoesNotClaimToBeIsolated(t *testing.T) {
+	const bootstrapPkg = "the pkg bootstrap package upstream publishes"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(bootstrapPkg))
+	}))
+	t.Cleanup(upstream.Close)
+
+	// No Mode, so this entry is hosted. proxyingServer is the cache-enabled
+	// one, which is the only other term the route reads. The url ends in
+	// "latest" because the second half of the bootstrap answer comes off the
+	// upstream repository's name, and a name nobody measured hedges.
+	s := proxyingServer(t)
+	s.cfg.PublicURL = "https://bodega.internal"
+	addVersion(t, s, manifest.TypeFreeBSD, "latest", manifest.VersionEntry{
+		Version: freeBSDABI,
+		URL:     upstream.URL + "/latest",
+	})
+
+	// The route half: the bootstrapper's path resolves, and the bytes came
+	// from upstream rather than from this store.
+	status, body := getStatusAndBody(t, s, freeBSDURL("latest", "Latest/pkg.pkg"))
+	if status != http.StatusOK || body != bootstrapPkg {
+		t.Fatalf("GET Latest/pkg.pkg on a hosted mirror with the cache on = %d %q, want 200 and upstream's bytes", status, body)
+	}
+
+	// The configuration half: it describes that same path.
+	st := statusFreeBSD(t, s)
+	repo := st.RepoFor("latest", freeBSDABI)
+	if repo == nil {
+		t.Fatalf("no rendered configuration for latest@%s, got %+v", freeBSDABI, st.Repos)
+	}
+	if !repo.UpstreamFallthrough {
+		t.Errorf("upstream_fallthrough is false for an entry whose Latest/pkg.pkg this server just fetched from upstream")
+	}
+	if repo.Bootstrap != pkgrepos.BootstrapWorks {
+		t.Errorf("bootstrap = %q, want %q: the path answered 200 through this server", repo.Bootstrap, pkgrepos.BootstrapWorks)
+	}
+	if strings.Contains(repo.Conf, "`pkg bootstrap` does not work") {
+		t.Errorf("the conf calls a path dead that answers 200, costing the operator a bootstrap by hand:\n%s", repo.Conf)
+	}
+	if strings.Contains(repo.Conf, "every request stops here") {
+		t.Errorf("the conf claims this repository reaches nothing upstream while the server fetches %s from it:\n%s", upstream.URL, repo.Conf)
+	}
+	if !strings.Contains(repo.Note(), "reaches the internet") {
+		t.Errorf("no note says the bootstrap path leaves the building: %q", repo.Note())
+	}
+}
+
+// The same entry on a server with the cache off is isolated, and says so.
+// This is the row that makes the test above an assertion about the toggle
+// rather than about hosted mirrors.
+func TestFreeBSDHostedMirrorWithTheCacheOffIsIsolatedAndSaysSo(t *testing.T) {
+	s := hostedServer(t)
+	s.cfg.PublicURL = "https://bodega.internal"
+	addVersion(t, s, manifest.TypeFreeBSD, "latest", manifest.VersionEntry{
+		Version: freeBSDABI,
+		URL:     "https://pkg.freebsd.org/" + freeBSDABI + "/latest",
+	})
+
+	status, body := getStatusAndBody(t, s, freeBSDURL("latest", "Latest/pkg.pkg"))
+	if status != http.StatusNotFound {
+		t.Fatalf("GET Latest/pkg.pkg with the proxy cache off = %d, want 404: %s", status, body)
+	}
+
+	st := statusFreeBSD(t, s)
+	repo := st.RepoFor("latest", freeBSDABI)
+	if repo == nil {
+		t.Fatalf("no rendered configuration for latest@%s, got %+v", freeBSDABI, st.Repos)
+	}
+	if repo.UpstreamFallthrough {
+		t.Errorf("upstream_fallthrough is true on a server that fetches no miss: the request 404'd")
+	}
+	if repo.Bootstrap != pkgrepos.BootstrapAbsent {
+		t.Errorf("bootstrap = %q, want %q", repo.Bootstrap, pkgrepos.BootstrapAbsent)
+	}
+	if !strings.Contains(repo.Conf, "every request stops here") {
+		t.Errorf("the conf withholds the isolation claim from a repository that is isolated:\n%s", repo.Conf)
+	}
+}

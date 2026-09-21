@@ -87,7 +87,15 @@ func (f freebsdStatus) RepoFor(repo, abi string) *pkgrepos.Repo {
 // operator configuration for a repository that answers nothing.
 func (s *Server) freeBSDStatusFor(r *http.Request) freebsdStatus {
 	out := freebsdStatus{PublicURL: s.publicBase(r), Repos: []pkgrepos.Repo{}}
-	base := pkgrepos.State{PublicURL: out.PublicURL, LocalScheme: s.localScheme()}
+	// The cache toggle is a fact about this server rather than about an
+	// entry, and it is half of whether a request for a path outside a
+	// catalogue leaves the building: proxy.go:116 fetches a miss when
+	// cacheEnabled() || forceProxy, and a hosted entry is forceProxy false.
+	base := pkgrepos.State{
+		PublicURL:    out.PublicURL,
+		LocalScheme:  s.localScheme(),
+		CacheEnabled: s.cache.Enabled,
+	}
 
 	if sign := s.pkgSign.Load(); sign != nil {
 		switch {
