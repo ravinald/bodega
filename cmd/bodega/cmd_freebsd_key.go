@@ -65,9 +65,11 @@ writable path the server searches.
 --eddsa produces an Ed25519 key instead. It is smaller and faster and needs
 pkg 1.20 or later, which is where the ecc signer arrived; RSA is the default
 because a repository being stood up has no way to know how old the oldest
-client in the fleet is. The hash follows the key — SHA-256 for RSA, BLAKE2b
-for Ed25519 — and is never a separate choice, because a key signing the wrong
-one produces a signature the client rejects without saying why.
+client in the fleet is. The construction follows the key and is never a
+separate choice: pkg renders the catalogue's SHA-256 as 64 hex characters,
+then an RSA key signs the SHA-256 of those characters and an Ed25519 key signs
+the characters themselves. A key paired with the wrong one produces a
+signature the client rejects without saying why.
 
 There is no --rotate, and the difference from 'bodega apt key generate' is the
 format rather than an omission. An apt InRelease carries as many signatures as
@@ -165,23 +167,29 @@ func newFreeBSDKeyExportCmd(gf *globalFlags) *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "export",
-		Short: "Print the public signing key, or the trusted fingerprint file",
-		Long: `export writes the PEM public key to stdout, or with --fingerprint the trusted
+		Short: "Print the trusted fingerprint file a client installs, or the public key",
+		Long: `export writes the public key to stdout, or with --fingerprint the trusted
 fingerprint file a client installs.
 
-The two answer the two ways pkg checks a signature. signature_type: PUBKEY
-names a PEM public key with pubkey= and ignores what the archive carries;
-signature_type: FINGERPRINTS reads the .pub member out of the archive and
-checks it against a fingerprint file first, which is how pkg.freebsd.org
-works. Either way this is the out-of-band delivery that does not trust the
-server's TLS — a configuration-management repository, an image build, a USB
-stick.
+--fingerprint is the one a client needs. A generated repository is read with
+signature_type: FINGERPRINTS, where pkg takes the .pub member out of the
+archive, checks its SHA-256 against a trusted fingerprint file, and verifies
+with that key. signature_type: PUBKEY is a different archive layout — pkg
+looks for a member named "signature" and reads the key off the local disk —
+and these archives carry no such member, so a client configured that way
+fails pkg update however good the key is.
 
-The archive already carries the public key as a member, so a client using
-FINGERPRINTS needs only the fingerprint file.`,
-		Example: `  bodega freebsd key export > /usr/local/etc/pkg/keys/bodega.pub
-  bodega freebsd key export --fingerprint \
-    > /usr/local/etc/pkg/fingerprints/bodega/trusted/bodega`,
+Without --fingerprint this prints the key itself, for inspecting it or
+handing it to somebody, not for any client setting. It comes out as the
+archive carries it: a PEM SubjectPublicKey for rsa, and pkg's own DER
+structure for eddsa, which is what libecc parses and what 'pkg key --public'
+writes.
+
+Either file is the out-of-band delivery that does not trust the server's TLS:
+a configuration-management repository, an image build, a USB stick.`,
+		Example: `  bodega freebsd key export --fingerprint \
+    > /usr/local/etc/pkg/fingerprints/bodega/trusted/bodega
+  bodega freebsd key export > bodega-pkg.pub`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig(gf)

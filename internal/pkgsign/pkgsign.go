@@ -32,8 +32,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"golang.org/x/crypto/blake2b"
 )
 
 // Signer is everything the catalogue generator needs from a signing key. Only
@@ -44,14 +42,17 @@ type Signer interface {
 	// over the hash Algorithm names rather than over a hash the caller
 	// picked.
 	Sign(doc []byte) ([]byte, error)
-	// PublicKey returns the PEM public key, which is both the .pub member
-	// and the file a client names in pubkey= under signature_type: PUBKEY.
+	// PublicKey returns the public key as the client hashes it for a
+	// fingerprint check, and as `bodega freebsd key export` prints it.
 	PublicKey() ([]byte, error)
+	// PublicKeyMember returns the bytes of the archive's .pub member, which
+	// is PublicKey behind the same signer frame the .sig member carries.
+	PublicKeyMember() ([]byte, error)
 	// Algorithm is pkg's own name for the signer: "rsa" or "eddsa".
 	Algorithm() string
-	// Fingerprint is the SHA-256 of the PEM public key, lowercase hex. It is
-	// the value a client writes into a trusted fingerprint file, and the only
-	// thing that authenticates the first key fetch beyond TLS.
+	// Fingerprint is the SHA-256 of PublicKey, lowercase hex. It is the value
+	// a client writes into a trusted fingerprint file, and the only thing
+	// that authenticates the first key fetch beyond TLS.
 	Fingerprint() string
 }
 
@@ -95,10 +96,20 @@ const CredentialsEnv = "CREDENTIALS_DIRECTORY"
 // key that is present and unusable.
 var ErrNoKey = errors.New("no pkg signing key found")
 
-// eddsaPrefix frames an ecc signature the way pkg's pkgsign_ecc writes it:
-// the magic, the signer name, and a "$" ahead of the raw signature, so a
-// client reading the .sig member knows which verifier to hand it to. RSA
-// carries no frame, which is what a pkg predating the ecc signer expects.
+// eddsaPrefix names the verifier a client hands the members to: the magic,
+// the signer name, and a "$".
+//
+// It goes on the .pub member as well as the .sig, which is not an obvious
+// symmetry and is not optional. pkg records the signer per member and keeps
+// the last one it reads, so an unframed .pub following a framed .sig resets
+// the choice to rsa and the ecc key reaches the OpenSSL verifier, which
+// reports "error reading public key" and never names the member that caused
+// it. pkg's own pack_command_sign writes the frame on both for this reason.
+//
+// The frame is not part of the key: a client strips it before hashing, so a
+// fingerprint is taken over the bare key and PublicKey returns that form.
+// RSA carries no frame at all, which is what a pkg predating the ecc signer
+// expects.
 const eddsaPrefix = "$PKGSIGN:eddsa$"
 
 // KeyRing is an in-process Signer over one private key.
@@ -261,20 +272,24 @@ func parseAnyPrivate(block *pem.Block) (crypto.Signer, error) {
 // decides the hash the signature is taken over.
 func newKeyRing(key crypto.Signer) (*KeyRing, error) {
 	kr := &KeyRing{key: key}
-	pub := key.Public()
-	switch pub.(type) {
+	switch pub := key.Public().(type) {
 	case *rsa.PublicKey:
 		kr.algo = KeyRSA
+		der, err := x509.MarshalPKIXPublicKey(pub)
+		if err != nil {
+			return nil, fmt.Errorf("render the public key: %w", err)
+		}
+		kr.pub = pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})
 	case ed25519.PublicKey:
 		kr.algo = KeyEd25519
+		der, err := eddsaPublicKey(pub)
+		if err != nil {
+			return nil, fmt.Errorf("render the public key: %w", err)
+		}
+		kr.pub = der
 	default:
 		return nil, fmt.Errorf("a %T signs no pkg catalogue; pkg reads rsa and eddsa", pub)
 	}
-	der, err := x509.MarshalPKIXPublicKey(key.Public())
-	if err != nil {
-		return nil, fmt.Errorf("render the public key: %w", err)
-	}
-	kr.pub = pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})
 	return kr, nil
 }
 
@@ -284,8 +299,9 @@ func (k *KeyRing) Path() string { return k.path }
 // Algorithm is pkg's name for this signer.
 func (k *KeyRing) Algorithm() string { return string(k.algo) }
 
-// PublicKey returns the PEM public key: the .pub member of every archive this
-// key signs, and the file a client names in pubkey=.
+// PublicKey returns the public key in the form its signer's verifier reads: a
+// PEM SubjectPublicKeyInfo for rsa, pkg's own DER structure for eddsa. It is
+// what a client hashes for a fingerprint, and what the CLI exports.
 func (k *KeyRing) PublicKey() ([]byte, error) {
 	if len(k.pub) == 0 {
 		return nil, errors.New("this key ring holds no public key")
@@ -293,9 +309,26 @@ func (k *KeyRing) PublicKey() ([]byte, error) {
 	return k.pub, nil
 }
 
-// Fingerprint is the SHA-256 of the PEM public key, lowercase hex — the value
-// that goes in a client's trusted fingerprint file under
+// PublicKeyMember is PublicKey framed for the archive's .pub member.
+func (k *KeyRing) PublicKeyMember() ([]byte, error) {
+	pub, err := k.PublicKey()
+	if err != nil {
+		return nil, err
+	}
+	if k.algo != KeyEd25519 {
+		return pub, nil
+	}
+	return append([]byte(eddsaPrefix), pub...), nil
+}
+
+// Fingerprint is the SHA-256 of the public key, lowercase hex: the value that
+// goes in a client's trusted fingerprint file under
 // /usr/local/etc/pkg/fingerprints/bodega/trusted/.
+//
+// Over PublicKey rather than over the .pub member, because pkg strips the
+// signer frame before hashing. A fingerprint taken over the framed bytes
+// matches nothing a client computes, and the mismatch reports as an untrusted
+// key rather than as a framing difference.
 func (k *KeyRing) Fingerprint() string {
 	sum := sha256.Sum256(k.pub)
 	return hex.EncodeToString(sum[:])
@@ -313,13 +346,19 @@ func (k *KeyRing) Info() KeyInfo {
 // Sign returns the signature bytes pkg expects in the .sig member.
 //
 // The hash comes from the algorithm and never from the caller, which is the
-// whole reason this is one method rather than a hash plus a sign. pkg's RSA
-// signer takes the SHA-256 of the document, renders it as a 64-character
-// lowercase hex string, and signs those characters with PKCS#1 v1.5 padding
-// and no DigestInfo — an interoperability quirk, and one a client reproduces
-// exactly. Its ecc signer takes a raw BLAKE2b-512 digest instead. An eddsa key
-// over a SHA-256 produces a signature the client rejects with no clue as to
-// why, so the pairing is not a caller's to choose.
+// whole reason this is one method rather than a hash plus a sign.
+//
+// The construction is pkgsign_ossl.c's ossl_verify_cert_cb, which is the
+// verifier a three-member archive reaches: pkg hashes the document to SHA-256,
+// renders that as 64 lowercase hex characters, takes the SHA-256 of those
+// characters, and verifies PKCS#1 v1.5 with the SHA-256 DigestInfo over the
+// resulting 32 bytes. Two hashes, and the second one is easy to miss because
+// the first already produced something that looks like a digest.
+//
+// pkg's other RSA verifier, ossl_verify_cb, is a different construction
+// reached only by signature_type: PUBKEY, which reads a member named
+// "signature" that this archive does not carry. Nothing bodega publishes goes
+// down that path.
 func (k *KeyRing) Sign(doc []byte) ([]byte, error) {
 	switch k.algo {
 	case KeyRSA:
@@ -327,7 +366,8 @@ func (k *KeyRing) Sign(doc []byte) ([]byte, error) {
 		if !ok {
 			return nil, fmt.Errorf("key is marked rsa but holds a %T", k.key)
 		}
-		sig, err := rsa.SignPKCS1v15(rand.Reader, rk, 0, rsaDigest(doc))
+		digest := rsaDigest(doc)
+		sig, err := rsa.SignPKCS1v15(rand.Reader, rk, crypto.SHA256, digest[:])
 		if err != nil {
 			return nil, fmt.Errorf("sign the catalogue with the rsa key: %w", err)
 		}
@@ -337,52 +377,71 @@ func (k *KeyRing) Sign(doc []byte) ([]byte, error) {
 		if !ok {
 			return nil, fmt.Errorf("key is marked eddsa but holds a %T", k.key)
 		}
-		digest := blake2b.Sum512(doc)
-		return append([]byte(eddsaPrefix), ed25519.Sign(ek, digest[:])...), nil
+		return eddsaSignature(ed25519.Sign(ek, eddsaDigest(doc)))
 	}
 	return nil, fmt.Errorf("no signer for key type %q", k.algo)
 }
 
-// rsaDigest is the message pkg's RSA signer actually signs: the hex rendering
-// of the document's SHA-256, as characters.
-func rsaDigest(doc []byte) []byte {
+// eddsaDigest is the message pkg's ecc fingerprint verifier signs over: the
+// document's SHA-256 rendered as 64 lowercase hex characters, signed as
+// characters. ecc_verify_cert_cb hands exactly that to libecc.
+//
+// pkg's other ecc callback, ecc_verify_cb, hashes differently and belongs to
+// an archive mode this generator does not produce.
+func eddsaDigest(doc []byte) []byte {
 	sum := sha256.Sum256(doc)
 	return []byte(hex.EncodeToString(sum[:]))
 }
 
-// Verify checks sig against doc under the PEM public key pubPEM, resolving the
-// algorithm from the key rather than from an argument.
+// rsaDigest is the 32 bytes pkg's fingerprint verifier hands to RSA: the
+// SHA-256 of the hex rendering of the document's SHA-256.
+func rsaDigest(doc []byte) [sha256.Size]byte {
+	sum := sha256.Sum256(doc)
+	return sha256.Sum256([]byte(hex.EncodeToString(sum[:])))
+}
+
+// Verify checks sig against doc under the public key as the archive carries
+// it, resolving the algorithm from the key's own encoding rather than from an
+// argument.
+//
+// The encoding is the discriminator because pkg made it one: an rsa .pub
+// member is a PEM SubjectPublicKeyInfo and an eddsa .pub member is pkg's own
+// DER structure, and no key is both.
 //
 // The generator calls it on every catalogue it builds, before serving one
 // byte. A signature nothing verified is a signature discovered to be wrong by
 // a client, days later, reported as a repository failure with no mention of
 // the key that produced it — and the check costs one public-key operation per
 // rebuild.
-func Verify(pubPEM, doc, sig []byte) error {
-	block, _ := pem.Decode(pubPEM)
-	if block == nil {
-		return errors.New("the public key is not PEM")
-	}
-	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
-	if err != nil {
-		return fmt.Errorf("parse the public key: %w", err)
-	}
-	switch pk := pub.(type) {
-	case *rsa.PublicKey:
-		if err := rsa.VerifyPKCS1v15(pk, 0, rsaDigest(doc), sig); err != nil {
+func Verify(pubKey, doc, sig []byte) error {
+	if block, _ := pem.Decode(pubKey); block != nil {
+		pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+		if err != nil {
+			return fmt.Errorf("parse the public key: %w", err)
+		}
+		rk, ok := pub.(*rsa.PublicKey)
+		if !ok {
+			return fmt.Errorf("a %T in a PEM block verifies no pkg signature; pkg reads a PEM public key for rsa only", pub)
+		}
+		digest := rsaDigest(doc)
+		if err := rsa.VerifyPKCS1v15(rk, crypto.SHA256, digest[:], sig); err != nil {
 			return fmt.Errorf("the rsa signature does not verify against this public key: %w", err)
 		}
 		return nil
-	case ed25519.PublicKey:
-		raw, ok := strings.CutPrefix(string(sig), eddsaPrefix)
-		if !ok {
-			return fmt.Errorf("the signature carries no %q frame, so it was not produced by an eddsa key", eddsaPrefix)
-		}
-		digest := blake2b.Sum512(doc)
-		if !ed25519.Verify(pk, digest[:], []byte(raw)) {
-			return errors.New("the eddsa signature does not verify against this public key")
-		}
-		return nil
 	}
-	return fmt.Errorf("a %T verifies no pkg signature", pub)
+	if framed, ok := bytesCutPrefix(pubKey, eddsaPrefix); ok {
+		pubKey = framed
+	}
+	pub, err := parseEdDSAPublicKey(pubKey)
+	if err != nil {
+		return err
+	}
+	raw, err := parseEdDSASignature(sig)
+	if err != nil {
+		return err
+	}
+	if !ed25519.Verify(pub, eddsaDigest(doc), raw) {
+		return errors.New("the eddsa signature does not verify against this public key")
+	}
+	return nil
 }

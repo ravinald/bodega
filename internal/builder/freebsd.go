@@ -606,6 +606,14 @@ func freeBSDGeneratedUploadSet(cfg *Config, name, repo string, ve manifest.Versi
 			cfg.logf("  [freebsd] %s@%s: skipping %s — a generated catalogue names .pkg archives only", repo, ve.Version, rel)
 			return nil
 		}
+		// The same admission the generated catalogue applies, one stage
+		// earlier. Uploading an object whose name no request can spell puts
+		// bytes in the store that the next catalogue build then refuses,
+		// taking the whole repository down over one file; the walk is where
+		// the file still has a path an operator can rename.
+		if err := manifest.FreeBSDValidRepoPath(rel); err != nil {
+			return fmt.Errorf("%s: %w", p, err)
+		}
 		out = append(out, ArtifactPath{
 			Local:     p,
 			ObjectKey: manifest.FreeBSDKey(ve.Version, name, rel),

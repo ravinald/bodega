@@ -3379,16 +3379,18 @@ So the two repository kinds carry two different trust stories to two differently
 
 `packagesite.pkg` carries exactly three members when a key is installed — `packagesite.yaml.sig`, `packagesite.yaml.pub` and `packagesite.yaml` — and `data.pkg` carries `data.sig`, `data.pub` and `data`. That is the shape upstream publishes, and there is no `.sig` sidecar on the wire for a client to fetch. With no key installed each archive carries the document alone, which is a supported configuration: pkg's own `signature_type` defaults to `NONE`.
 
-The hash follows the key rather than the caller. An RSA key signs the hex rendering of the catalogue's SHA-256 with PKCS#1 v1.5 padding and no DigestInfo, which is pkg's own interoperability quirk; an Ed25519 key signs a raw BLAKE2b digest instead. Pairing a key with the wrong hash produces a signature the client rejects without saying why, so the pairing is not a knob.
+Both members carry a `$PKGSIGN:<signer>$` frame ahead of their contents for an Ed25519 key, and neither does for RSA. pkg records the signer per member and keeps the last one it read, so an unframed `.pub` behind a framed `.sig` resets the choice to RSA and hands an Ed25519 key to the OpenSSL verifier; the client then reports `error reading public key` and never names the member that caused it. The frame is not part of the key, and a client strips it before hashing, so the fingerprint is taken over the bare key either way.
 
-Two ways for a client to check it, and they want different things installed:
+The construction follows the key rather than the caller, and it is two hashes deep in both cases. pkg digests the catalogue to SHA-256 and renders that as 64 lowercase hex characters; an RSA key then signs the SHA-256 of those characters with PKCS#1 v1.5 and the SHA-256 DigestInfo, and an Ed25519 key signs the characters themselves. Pairing a key with the wrong construction produces a signature the client rejects without saying why, so the pairing is not a knob.
 
-| `signature_type` | What the client needs                                                      | Command                                   |
-| ---------------- | -------------------------------------------------------------------------- | ----------------------------------------- |
-| `fingerprints`   | a fingerprint file under `/usr/local/etc/pkg/fingerprints/<name>/trusted/` | `bodega freebsd key export --fingerprint` |
-| `pubkey`         | the PEM public key at the path its `pubkey:` names                         | `bodega freebsd key export`               |
+**These archives are read by `signature_type: fingerprints`, and by nothing else.** The client reads the `.pub` member out of the archive, checks its SHA-256 against a trusted fingerprint file, and verifies the signature with that key. `pubkey` is a different archive layout — pkg looks for one member literally named `signature` and reads the public key off the local filesystem instead — and it finds no such member here, so a client configured that way fails `pkg update` however good the key is. Install the fingerprint file:
 
-`fingerprints` is what `pkg.freebsd.org` uses and what the client stanza above shows: pkg reads the `.pub` member out of the archive, checks its SHA-256 against the trusted file, and verifies the signature with that key. Publish the fingerprint out of band — a configuration-management repository, an image build, a USB stick. A client's first fetch of a public key is authenticated by TLS alone, and the fingerprint is what turns that into a check somebody can actually make.
+```bash
+bodega freebsd key export --fingerprint \
+  > /usr/local/etc/pkg/fingerprints/bodega/trusted/bodega
+```
+
+Publish that fingerprint out of band — a configuration-management repository, an image build, a USB stick. A client's first fetch of a public key is authenticated by TLS alone, and the fingerprint is what turns that into a check somebody can actually make. `bodega freebsd key export` prints the public key itself, which is for inspecting or delivering the key rather than for any client setting.
 
 #### Key management
 
@@ -3396,10 +3398,12 @@ The vocabulary is `bodega apt key`'s, deliberately: two commands managing keys t
 
 ```bash
 bodega freebsd key generate            # RSA-4096 by default
-bodega freebsd key generate --eddsa    # Ed25519; needs pkg 1.20 or later
+bodega freebsd key generate --eddsa    # Ed25519; needs pkg 1.20 or later, where pkg's ecc signer arrived
 bodega freebsd key show                # algorithm, fingerprint, and the file it was read from
-bodega freebsd key export              # the PEM public key
+bodega freebsd key export              # the public key, in the form its signer reads
 ```
+
+`export` emits the key as the archive carries it: a PEM `SubjectPublicKeyInfo` for RSA, and pkg's own DER structure for Ed25519, which is what libecc parses and what `pkg key --public` writes. There is no PEM form of an Ed25519 pkg key for the same reason there is no OpenSSL verifier for one.
 
 The server only ever loads a key — it searches `$CREDENTIALS_DIRECTORY`, then `/etc/bodega/pkg-signing.key`, then `<storage_path>/pkg-signing.key` — and refuses one readable beyond its owner. A server that could create its own key would be a server that could mint one after being compromised.
 

@@ -104,11 +104,23 @@ type freeBSDCatalog struct {
 // carries as its .pub member.
 //
 // Rendered at load rather than per signature, so the key inside an archive is
-// by construction the key that signed the document beside it.
+// by construction the key that signed the document beside it. pub is the bare
+// key a client hashes for its fingerprint; pubMember is the same key framed
+// for the archive, and the two differ for eddsa.
+//
+// err carries the third state, and it exists because the other two cannot
+// express it. A nil *pkgSigning means no key is installed anywhere the server
+// searches, which is a configuration an operator chose and which serves an
+// unsigned catalogue. A key file that is present and unusable is not that: the
+// operator installed a key and believes the repository is signed. Folding the
+// two together publishes an unsigned catalogue on a mode change nobody asked
+// for, so this is set instead and signer stays nil.
 type pkgSigning struct {
 	signer      pkgsign.Signer
 	pub         []byte
+	pubMember   []byte
 	fingerprint string
+	err         error
 }
 
 // loadPkgSigner installs the pkg catalogue signing key, if one is present.
@@ -123,30 +135,58 @@ type pkgSigning struct {
 // fallback and fails `pkg update` outright. Serving unsigned is a deliberate
 // act and needs a restart.
 func (s *Server) loadPkgSigner() {
-	loaded := s.pkgSign.Load() != nil
+	// Whether a usable key is loaded, rather than whether anything is stored:
+	// a stored failure is not something to keep signing with, and reporting
+	// it as one would tell an operator their old key is still covering them
+	// when nothing is.
+	prev := s.pkgSign.Load()
+	signing := prev != nil && prev.signer != nil
 	paths := pkgsign.DefaultKeyPaths(s.cfg.StoragePath)
+
+	fail := func(msg string, err error) {
+		if signing {
+			// A reload never takes signing away. Whatever went wrong, the
+			// key already in memory keeps signing and the fault goes to the
+			// journal, because a client configured with
+			// signature_type: FINGERPRINTS has no unsigned fallback.
+			s.logger.Error(msg+"; the previously loaded key keeps signing until a restart",
+				"error", err, "searched", strings.Join(paths, ", "))
+			return
+		}
+		s.logger.Error(msg+"; every generated pkg repository refuses its catalogue until the key loads",
+			"error", err, "searched", strings.Join(paths, ", "))
+		s.pkgSign.Store(&pkgSigning{err: err})
+	}
+
 	kr, err := pkgsign.Load(paths)
 	switch {
-	case errors.Is(err, pkgsign.ErrNoKey) && loaded:
+	case errors.Is(err, pkgsign.ErrNoKey) && signing:
 		s.logger.Warn("pkg signing key is gone from every search path; the loaded key keeps signing until a restart",
 			"searched", strings.Join(paths, ", "))
 		return
 	case errors.Is(err, pkgsign.ErrNoKey):
 		s.logger.Info("no pkg signing key installed; a generated pkg repository is served unsigned",
 			"searched", strings.Join(paths, ", "))
+		// Cleared rather than left as it was, so an operator who removes a
+		// key that would not load gets the unsigned repository they asked
+		// for instead of a refusal citing a file that is no longer there.
+		s.pkgSign.Store(nil)
 		return
 	case err != nil:
-		s.logger.Error("pkg signing key present but unusable; a generated pkg catalogue is signed with the previously loaded key, or not at all",
-			"error", err, "previously_loaded", loaded)
+		fail("pkg signing key present but unusable", err)
 		return
 	}
 	pub, err := kr.PublicKey()
 	if err != nil {
-		s.logger.Error("pkg signing key loaded but its public half will not render; the key is not installed",
-			"path", kr.Path(), "error", err, "previously_loaded", loaded)
+		fail("pkg signing key loaded but its public half will not render", err)
 		return
 	}
-	s.pkgSign.Store(&pkgSigning{signer: kr, pub: pub, fingerprint: kr.Fingerprint()})
+	member, err := kr.PublicKeyMember()
+	if err != nil {
+		fail("pkg signing key loaded but its archive member will not render", err)
+		return
+	}
+	s.pkgSign.Store(&pkgSigning{signer: kr, pub: pub, pubMember: member, fingerprint: kr.Fingerprint()})
 	s.logger.Info("pkg signing key loaded",
 		"path", kr.Path(), "algorithm", kr.Algorithm(), "fingerprint", kr.Fingerprint())
 }
@@ -173,6 +213,14 @@ func (s *Server) freeBSDGeneratedCatalog(ctx context.Context, store storage.Obje
 		return nil, err
 	}
 	sign := s.pkgSign.Load()
+	if sign != nil && sign.err != nil {
+		// Refused rather than served unsigned. The operator installed a key,
+		// so a client is configured to demand a signature; answering with an
+		// unsigned catalogue trades a 500 that names the key for a `pkg
+		// update` failure that names the signature and nothing else.
+		return nil, fmt.Errorf("freebsd %s@%s: a pkg signing key is installed but cannot be loaded, and a generated catalogue is not served unsigned once one is: %w. "+
+			"Fix the key and reload (systemctl reload bodega, or SIGHUP), or remove it from every searched path to publish this repository unsigned", repo, abi, sign.err)
+	}
 	fingerprint := ""
 	if sign != nil {
 		fingerprint = sign.fingerprint
@@ -255,6 +303,15 @@ func freeBSDGeneratedObjects(keys []string, prefix string) ([]string, error) {
 		}
 		if !strings.HasSuffix(rel, freeBSDPkgSuffix) {
 			continue
+		}
+		if err := manifest.FreeBSDValidRepoPath(rel); err != nil {
+			// Refused by name rather than skipped. The object is in the
+			// store and an operator put it there, so a catalogue quietly
+			// omitting it answers `pkg install` with "No packages available",
+			// which is what a typo produces. Publishing it instead is worse:
+			// the record resolves and the download 400s on the route that
+			// built it.
+			return nil, fmt.Errorf("the object at %s%s cannot be published: %w. Nothing was generated; rename the object or remove it", prefix, rel, err)
 		}
 		out = append(out, rel)
 	}
@@ -384,7 +441,7 @@ func (s *Server) freeBSDArchive(doc string, body []byte, sign *pkgSigning) ([]by
 		}
 		members = append(members,
 			freeBSDMember{name: doc + ".sig", data: sig},
-			freeBSDMember{name: doc + ".pub", data: sign.pub},
+			freeBSDMember{name: doc + ".pub", data: sign.pubMember},
 		)
 	}
 	members = append(members, freeBSDMember{name: doc, data: body})

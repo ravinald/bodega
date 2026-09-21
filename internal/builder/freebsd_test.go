@@ -1367,3 +1367,57 @@ func TestGeneratedRepositoryUploadsPackagesAndNoRootFile(t *testing.T) {
 		t.Fatalf("upload set = %v, want exactly the two packages %v", keys, want)
 	}
 }
+
+// A package whose name no request can spell is refused at the walk, where it
+// still has a path an operator can rename.
+//
+// Cheap precondition, expensive operation: the alternative is uploading it,
+// then having every catalogue build afterwards refuse the whole repository
+// over one file that is already in the store.
+func TestGeneratedRepositoryRefusesAnUnroutablePackageName(t *testing.T) {
+	cfg, store := fbGeneratedFixture(t, map[string]string{
+		fbHashedPath:       "a hashed package",
+		`All/bad\name.pkg`: "a package no route can reach",
+	})
+	_, release, err := FreeBSDArtifactPaths(cfg, store, "")
+	if release != nil {
+		defer release()
+	}
+	if err == nil {
+		t.Fatal("the upload set admitted a package name the serving route refuses")
+	}
+	if !strings.Contains(err.Error(), `bad\name.pkg`) {
+		t.Errorf("the refusal does not name the file to rename: %v", err)
+	}
+}
+
+// Whatever the mirror admits, the route serves. That is the invariant, and it
+// is not that the two predicates agree: cleanFreeBSDRepoPath normalizes as
+// well as admits, so it accepts "./Hashed/x.pkg" and stores it under the
+// normalized key the route then sees. What must hold is the composition —
+// every path the mirror returns passes the admission the generated catalogue
+// and the route share — because a mirrored object keyed where no request
+// reaches is the same outage as a generated record naming one.
+func TestEveryPathTheMirrorAdmitsIsOneTheRouteServes(t *testing.T) {
+	for _, p := range []string{
+		"All/zsh-5.9_3.pkg",
+		"All/Hashed/py311-foo-1.2.0_3~2$abcdefgh.pkg",
+		"./Hashed/FreeBSD-telnet-14.snap.pkg",
+		"libx++-2.0.pkg",
+		`All/bad\name.pkg`,
+		"/All/absolute.pkg",
+		"All//empty.pkg",
+		"../escape.pkg",
+		"All/../escape.pkg",
+		"All/ctrl\x01.pkg",
+		"",
+	} {
+		rel, err := cleanFreeBSDRepoPath(p)
+		if err != nil {
+			continue
+		}
+		if err := manifest.FreeBSDValidRepoPath(rel); err != nil {
+			t.Errorf("the mirror admits %q as %q, which the route refuses: %v", p, rel, err)
+		}
+	}
+}

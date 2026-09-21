@@ -191,13 +191,15 @@ func freeBSDUpstreamOf(ve manifest.VersionEntry, configured bool, rest string) s
 // splitFreeBSDPath validates a request path and splits it into the ABI, the
 // repository and the repository-relative path.
 //
-// The relative half is validated as strictly as the catalogue's own repopath
-// is at mirror time, and for the same reason: it composes an object key, and
-// a key that walked out of FreeBSDRepoPrefix would read one repository's
-// bytes under another's name. http.ServeMux already refuses a request whose
-// raw path holds a "..", but this route also composes a key for the proxy
-// fetch, so the check belongs where the key is built rather than upstream of
-// it.
+// The relative half is validated by manifest.FreeBSDValidRepoPath, which is
+// also what the generated catalogue admits a record against: what this route
+// will not serve is exactly what a catalogue must not publish, and two copies
+// of that rule drift into a repository whose own records 404. It composes an
+// object key, and a key that walked out of FreeBSDRepoPrefix would read one
+// repository's bytes under another's name. http.ServeMux already refuses a
+// request whose raw path holds a "..", but this route also composes a key for
+// the proxy fetch, so the check belongs where the key is built rather than
+// upstream of it.
 func splitFreeBSDPath(p string) (abi, repo, rest string, ok bool) {
 	segs := strings.SplitN(p, "/", 3)
 	if len(segs) != 3 {
@@ -207,19 +209,8 @@ func splitFreeBSDPath(p string) (abi, repo, rest string, ok bool) {
 	if !manifest.FreeBSDValidABI(abi) || !manifest.FreeBSDValidRepo(repo) {
 		return "", "", "", false
 	}
-	if rest == "" || strings.HasPrefix(rest, "/") || strings.Contains(rest, `\`) {
+	if manifest.FreeBSDValidRepoPath(rest) != nil {
 		return "", "", "", false
-	}
-	for _, seg := range strings.Split(rest, "/") {
-		switch seg {
-		case "", ".", "..":
-			return "", "", "", false
-		}
-	}
-	for _, r := range rest {
-		if r < 0x20 || r == 0x7f {
-			return "", "", "", false
-		}
 	}
 	return abi, repo, rest, true
 }

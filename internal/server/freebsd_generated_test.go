@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -423,4 +424,202 @@ func keysOfBytes(m map[string][]byte) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// R2, as a guarantee rather than as a case. Every path the catalogue
+// publishes resolves through the route that will be asked for it, including
+// the shapes a real build tree produces: a dotted version, a "~" and a "$"
+// from a hashed name, a plus in a port name, a deep directory.
+//
+// The predicate is shared with the route for this reason, so the interesting
+// half is not that these pass but that a path failing it never reaches a
+// record at all — TestFreeBSDGeneratedRefusesAnUnroutableObject is that side.
+func TestFreeBSDEveryPublishedRepoPathResolves(t *testing.T) {
+	s := hostedServer(t)
+	objects := map[string]string{}
+	for _, rel := range []string{
+		"All/Hashed/py311-foo-1.2.0_3~2$abcdefgh.pkg",
+		"All/gcc13-13.2.0_1.pkg",
+		"libx++-2.0.pkg",
+		"base/a/b/c/kernel-14.0.pkg",
+		"All/zsh-5.9_3.pkg",
+	} {
+		objects[rel] = pkgArchive(t, `{"name":"p","version":"1","origin":"misc/p"}`)
+	}
+	generatedRepo(t, s, "house", objects)
+
+	status, body := getStatusAndBody(t, s, freeBSDURL("house", manifest.FreeBSDCatalogFile))
+	if status != http.StatusOK {
+		t.Fatalf("GET the generated catalogue = %d, want 200: %s", status, body)
+	}
+	records := packagesiteRecords(t, archiveMembers(t, body)[freeBSDCatalogDoc])
+	if len(records) != len(objects) {
+		t.Fatalf("the catalogue holds %d records, want %d", len(records), len(objects))
+	}
+	for _, rec := range records {
+		repoPath, _ := rec["repopath"].(string)
+		if status, got := getStatusAndBody(t, s, freeBSDURL("house", repoPath)); status != http.StatusOK {
+			t.Errorf("GET %q = %d, want 200: the catalogue publishes a path its own route refuses (%s)", repoPath, status, got)
+		}
+	}
+}
+
+// R2: an object the route could never serve fails the build by name rather
+// than being published or skipped.
+//
+// A backslash is a legal byte in a Unix filename and every object store
+// accepts one, so an operator can put such a file in the build tree and the
+// walk can store it. The route refuses it — a request for it is a 400 before
+// any key is composed — so a record naming it resolves an install onto a path
+// no client can fetch. Skipping it instead would answer `pkg install` with
+// the message a typo produces, with nothing naming the file.
+func TestFreeBSDGeneratedRefusesAnUnroutableObject(t *testing.T) {
+	s := hostedServer(t)
+	generatedRepo(t, s, "house", map[string]string{
+		"All/widget-1.0.pkg": pkgArchive(t, `{"name":"widget","version":"1.0"}`),
+		`All/bad\name.pkg`:   pkgArchive(t, `{"name":"bad","version":"1.0"}`),
+	})
+	status, body := getStatusAndBody(t, s, freeBSDURL("house", manifest.FreeBSDCatalogFile))
+	if status == http.StatusOK {
+		t.Fatalf("the catalogue built over an object no request can reach; members %v", keysOfBytes(archiveMembers(t, body)))
+	}
+	if !strings.Contains(body, `bad\name.pkg`) {
+		t.Errorf("the refusal does not name the object that caused it: %q", body)
+	}
+}
+
+// R3, and the project's fail-closed posture: a key the operator installed and
+// bodega cannot use never degrades the repository to unsigned.
+//
+// An absent key is a configuration and serves unsigned. A key that is present
+// and rejected is not that: the operator installed one, so every client is
+// configured with signature_type: FINGERPRINTS and has no unsigned fallback.
+// Serving them an unsigned catalogue trades a 500 naming the key file for a
+// `pkg update` failure naming the signature and nothing else.
+func TestFreeBSDGeneratedRefusesWhenTheInstalledKeyIsUnusable(t *testing.T) {
+	t.Setenv(pkgsign.CredentialsEnv, "")
+	kr := installPkgKey(t, pkgsign.KeyRSA)
+	if err := os.Chmod(kr.Path(), 0o644); err != nil {
+		t.Fatalf("chmod the key: %v", err)
+	}
+	s := hostedServer(t)
+	generatedRepo(t, s, "house", map[string]string{"widget-1.0.pkg": pkgArchive(t, `{"name":"widget","version":"1.0"}`)})
+
+	status, body := getStatusAndBody(t, s, freeBSDURL("house", manifest.FreeBSDCatalogFile))
+	if status == http.StatusOK {
+		t.Fatalf("an installed but rejected key served an unsigned catalogue; members %v", keysOfBytes(archiveMembers(t, body)))
+	}
+	if !strings.Contains(body, kr.Path()) {
+		t.Errorf("the refusal does not name the key file an operator has to fix: %q", body)
+	}
+
+	// Fixing the key and reloading recovers, because a refusal that outlived
+	// its cause would need a restart to clear and nothing would say so.
+	if err := os.Chmod(kr.Path(), 0o600); err != nil {
+		t.Fatalf("chmod the key back: %v", err)
+	}
+	s.loadPkgSigner()
+	status, body = getStatusAndBody(t, s, freeBSDURL("house", manifest.FreeBSDCatalogFile))
+	if status != http.StatusOK {
+		t.Fatalf("after the key was fixed and reloaded, GET = %d, want 200: %s", status, body)
+	}
+	if members := keysOfBytes(archiveMembers(t, body)); len(members) != 3 {
+		t.Errorf("the recovered catalogue carries %v, want the signed three", members)
+	}
+}
+
+// Removing the key is how an operator asks for an unsigned repository, and it
+// has to clear a refusal the same key caused. A stored failure that outlived
+// the file would refuse every request citing a path that is no longer there.
+func TestFreeBSDGeneratedUnsignedAfterAnUnusableKeyIsRemoved(t *testing.T) {
+	t.Setenv(pkgsign.CredentialsEnv, "")
+	kr := installPkgKey(t, pkgsign.KeyRSA)
+	if err := os.Chmod(kr.Path(), 0o644); err != nil {
+		t.Fatalf("chmod the key: %v", err)
+	}
+	s := hostedServer(t)
+	generatedRepo(t, s, "house", map[string]string{"widget-1.0.pkg": pkgArchive(t, `{"name":"widget","version":"1.0"}`)})
+	if status, _ := getStatusAndBody(t, s, freeBSDURL("house", manifest.FreeBSDCatalogFile)); status == http.StatusOK {
+		t.Fatal("an installed but rejected key served a catalogue")
+	}
+	if err := os.Remove(kr.Path()); err != nil {
+		t.Fatalf("remove the key: %v", err)
+	}
+	s.loadPkgSigner()
+	status, body := getStatusAndBody(t, s, freeBSDURL("house", manifest.FreeBSDCatalogFile))
+	if status != http.StatusOK {
+		t.Fatalf("with no key installed anywhere, GET = %d, want an unsigned 200: %s", status, body)
+	}
+	if members := keysOfBytes(archiveMembers(t, body)); len(members) != 1 {
+		t.Errorf("the unsigned catalogue carries %v, want the document alone", members)
+	}
+}
+
+// A reload never takes signing away. The key already in memory keeps signing
+// and the fault goes to the journal, because a client configured with
+// FINGERPRINTS fails `pkg update` outright on an unsigned repository.
+func TestFreeBSDGeneratedKeepsSigningWhenAReloadFails(t *testing.T) {
+	t.Setenv(pkgsign.CredentialsEnv, "")
+	kr := installPkgKey(t, pkgsign.KeyRSA)
+	s := hostedServer(t)
+	generatedRepo(t, s, "house", map[string]string{"widget-1.0.pkg": pkgArchive(t, `{"name":"widget","version":"1.0"}`)})
+	if status, body := getStatusAndBody(t, s, freeBSDURL("house", manifest.FreeBSDCatalogFile)); status != http.StatusOK {
+		t.Fatalf("GET with a good key = %d, want 200: %s", status, body)
+	}
+	if err := os.Chmod(kr.Path(), 0o644); err != nil {
+		t.Fatalf("chmod the key: %v", err)
+	}
+	s.loadPkgSigner()
+	status, body := getStatusAndBody(t, s, freeBSDURL("house", manifest.FreeBSDCatalogFile))
+	if status != http.StatusOK {
+		t.Fatalf("a failed reload took signing away: GET = %d: %s", status, body)
+	}
+	if members := keysOfBytes(archiveMembers(t, body)); len(members) != 3 {
+		t.Errorf("the catalogue carries %v after a failed reload, want the signed three", members)
+	}
+}
+
+// R4: the .pub member carries the same signer frame as the .sig for eddsa,
+// and neither does for rsa.
+//
+// pkg records the signer per member and keeps the last one it reads, so an
+// unframed .pub behind a framed .sig resets the choice to rsa and hands an
+// Ed25519 key to the OpenSSL verifier. The client reports "error reading
+// public key" and names no member, which is a morning spent on the key.
+func TestFreeBSDGeneratedFramesThePubMemberForItsSigner(t *testing.T) {
+	const frame = "$PKGSIGN:eddsa$"
+	for _, tc := range []struct {
+		kt     pkgsign.KeyType
+		framed bool
+	}{{pkgsign.KeyRSA, false}, {pkgsign.KeyEd25519, true}} {
+		t.Run(string(tc.kt), func(t *testing.T) {
+			t.Setenv(pkgsign.CredentialsEnv, "")
+			kr := installPkgKey(t, tc.kt)
+			s := hostedServer(t)
+			generatedRepo(t, s, "house", map[string]string{"widget-1.0.pkg": pkgArchive(t, `{"name":"widget","version":"1.0"}`)})
+
+			status, body := getStatusAndBody(t, s, freeBSDURL("house", manifest.FreeBSDCatalogFile))
+			if status != http.StatusOK {
+				t.Fatalf("GET = %d, want 200: %s", status, body)
+			}
+			members := archiveMembers(t, body)
+			sig, pub := members[freeBSDCatalogDoc+".sig"], members[freeBSDCatalogDoc+".pub"]
+			if sig == nil || pub == nil {
+				t.Fatalf("the archive carries %v, want the signed three", keysOfBytes(members))
+			}
+			if got := bytes.HasPrefix(sig, []byte(frame)); got != tc.framed {
+				t.Errorf(".sig framed = %v, want %v", got, tc.framed)
+			}
+			if got := bytes.HasPrefix(pub, []byte(frame)); got != tc.framed {
+				t.Errorf(".pub framed = %v, want %v: pkg keeps the last signer it reads, so the two members must agree", got, tc.framed)
+			}
+			// The fingerprint is taken over the key a client sees after the
+			// frame is stripped, which is what it installs out of band.
+			bare := bytes.TrimPrefix(pub, []byte(frame))
+			sum := sha256.Sum256(bare)
+			if got := hex.EncodeToString(sum[:]); got != kr.Fingerprint() {
+				t.Errorf("the published .pub hashes to %s, and the operator installs %s", got, kr.Fingerprint())
+			}
+		})
+	}
 }

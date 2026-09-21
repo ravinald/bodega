@@ -182,6 +182,44 @@ func FreeBSDValidABI(abi string) bool { return freeBSDABIPattern.MatchString(abi
 // can key and serve. It is the package name for this type.
 func FreeBSDValidRepo(repo string) bool { return freeBSDRepoPattern.MatchString(repo) }
 
+// FreeBSDValidRepoPath reports why a repository-relative path is not one this
+// mirror can serve, or nil when it is.
+//
+// One predicate, because a path that fails it is unreachable whichever side
+// produced it. The route composes an object key from the request path, and a
+// generated catalogue publishes repopath as the only authority on where an
+// object lives; a generator admitting a name the route refuses publishes a
+// record whose download 400s after `pkg update` has already reported success.
+// The two halves have to agree by construction rather than by inspection.
+//
+// The reserved root files are not checked here, because the route does not
+// refuse them: it answers them from the catalogue instead. A caller that
+// stores objects checks FreeBSDReservedRoot as well.
+func FreeBSDValidRepoPath(repoPath string) error {
+	switch {
+	case repoPath == "":
+		return errors.New("the path is empty, so it names no object")
+	case strings.HasPrefix(repoPath, "/"):
+		return fmt.Errorf("%q is absolute; a repository path is relative to the repository root", repoPath)
+	case strings.Contains(repoPath, `\`):
+		return fmt.Errorf("%q holds a backslash, which no pkg repository publishes and no request can spell", repoPath)
+	}
+	for _, r := range repoPath {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("%q holds a control character at U+%04X", repoPath, r)
+		}
+	}
+	for i, seg := range strings.Split(repoPath, "/") {
+		switch seg {
+		case "":
+			return fmt.Errorf("%q holds an empty segment at position %d, so it names no object", repoPath, i)
+		case ".", "..":
+			return fmt.Errorf("%q holds a %q segment, which no request reaches and which resolves outside the repository", repoPath, seg)
+		}
+	}
+	return nil
+}
+
 // FreeBSDKey returns the key one mirrored object is stored under. repoPath is
 // the record's own repopath from packagesite.yaml, or one of
 // FreeBSDCatalogFiles for a repository-root file.

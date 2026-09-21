@@ -1,7 +1,8 @@
 package pkgsign_test
 
 import (
-	"crypto/ed25519"
+	"bytes"
+	"crypto"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
@@ -13,8 +14,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"golang.org/x/crypto/blake2b"
 
 	"github.com/ravinald/bodega/internal/pkgsign"
 )
@@ -81,44 +80,66 @@ func TestOneAlgorithmDoesNotVerifyAgainstAnother(t *testing.T) {
 	}
 }
 
-// The hash is the signer's, not the caller's. Checked against the primitive
-// rather than against Verify, which would pass on any self-consistent pair:
-// pkg's RSA path signs the hex rendering of a SHA-256 with no DigestInfo, and
-// its ecc path signs a raw BLAKE2b, so a refactor that unified them on one
-// hash would ship signatures no client accepts and no test here would notice.
-func TestEachAlgorithmSignsTheHashPkgReads(t *testing.T) {
-	t.Run("rsa signs the hex sha256", func(t *testing.T) {
-		kr := generate(t, pkgsign.KeyRSA)
-		sig, err := kr.Sign([]byte(catalogue))
-		if err != nil {
-			t.Fatalf("sign: %v", err)
-		}
-		sum := sha256.Sum256([]byte(catalogue))
-		hexed := []byte(hex.EncodeToString(sum[:]))
-		pub := rsaPublic(t, kr)
-		if err := rsa.VerifyPKCS1v15(pub, 0, hexed, sig); err != nil {
-			t.Fatalf("the signature is not PKCS#1 v1.5 over the hex sha256 pkg signs: %v", err)
-		}
-		if err := rsa.VerifyPKCS1v15(pub, 0, sum[:], sig); err == nil {
-			t.Error("the signature verified over the raw sha256; pkg signs the hex rendering of it")
-		}
-	})
+// The RSA signature as pkg's fingerprint verifier checks it, reimplemented
+// from pkgsign_ossl.c's ossl_verify_cert_cb rather than delegated to Verify,
+// which would pass on any self-consistent pair.
+//
+// Two hashes, and the second is the one that hides: pkg digests the catalogue
+// to SHA-256, renders that as 64 hex characters, digests *those characters*
+// to SHA-256, and verifies PKCS#1 v1.5 with the SHA-256 DigestInfo over the
+// result. Signing the hex characters directly is self-consistent, round-trips
+// through any verifier written the same way, and is rejected by every real
+// client — so the negative case below is the half that earns its keep.
+func TestRSASignsWhatPkgsFingerprintVerifierChecks(t *testing.T) {
+	kr := generate(t, pkgsign.KeyRSA)
+	sig, err := kr.Sign([]byte(catalogue))
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	pub := rsaPublic(t, kr)
 
-	t.Run("eddsa signs a raw blake2b", func(t *testing.T) {
-		kr := generate(t, pkgsign.KeyEd25519)
-		sig, err := kr.Sign([]byte(catalogue))
-		if err != nil {
-			t.Fatalf("sign: %v", err)
-		}
-		body, ok := strings.CutPrefix(string(sig), "$PKGSIGN:eddsa$")
-		if !ok {
-			t.Fatalf("the signature carries no $PKGSIGN:eddsa$ frame, which is what tells a client which verifier to use: %q", sig)
-		}
-		digest := blake2b.Sum512([]byte(catalogue))
-		if !ed25519.Verify(ed25519Public(t, kr), digest[:], []byte(body)) {
-			t.Error("the signature is not over a raw blake2b digest, which is what pkg's ecc signer reads")
-		}
-	})
+	sum := sha256.Sum256([]byte(catalogue))
+	hexed := []byte(hex.EncodeToString(sum[:]))
+	client := sha256.Sum256(hexed)
+	if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, client[:], sig); err != nil {
+		t.Fatalf("pkg's fingerprint verifier rejects this signature: %v", err)
+	}
+	if err := rsa.VerifyPKCS1v15(pub, 0, hexed, sig); err == nil {
+		t.Error("the signature verified as a bare PKCS#1 block over the hex characters, which is the construction no client accepts")
+	}
+	if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, sum[:], sig); err == nil {
+		t.Error("the signature verified over the document's own sha256; pkg hashes the hex rendering of it a second time")
+	}
+}
+
+// The .pub member is what a client hashes for its fingerprint, and for RSA it
+// is the PEM a client's PEM_read_bio_PUBKEY reads. Unframed, because pkg
+// defaults an unframed member to rsa and a frame here would name a signer
+// twice.
+func TestRSAPublishesAnUnframedPEMPublicKey(t *testing.T) {
+	kr := generate(t, pkgsign.KeyRSA)
+	member, err := kr.PublicKeyMember()
+	if err != nil {
+		t.Fatalf("render the public key member: %v", err)
+	}
+	pub, err := kr.PublicKey()
+	if err != nil {
+		t.Fatalf("render the public key: %v", err)
+	}
+	if !bytes.Equal(member, pub) {
+		t.Error("the rsa .pub member is framed; pkg reads an unframed member as rsa and a frame would contradict that")
+	}
+	block, _ := pem.Decode(member)
+	if block == nil || block.Type != "PUBLIC KEY" {
+		t.Fatalf("the rsa .pub member is not a PEM public key: %q", member[:min(len(member), 32)])
+	}
+	if _, err := x509.ParsePKIXPublicKey(block.Bytes); err != nil {
+		t.Errorf("the rsa .pub member is not SubjectPublicKeyInfo: %v", err)
+	}
+	sum := sha256.Sum256(member)
+	if got := hex.EncodeToString(sum[:]); got != kr.Fingerprint() {
+		t.Errorf("Fingerprint() = %s, but a client hashes the member to %s", kr.Fingerprint(), got)
+	}
 }
 
 // A key on disk the server would load, and the permissions it refuses. A key
@@ -205,25 +226,9 @@ func generate(t *testing.T, kt pkgsign.KeyType) *pkgsign.KeyRing {
 	return kr
 }
 
+// rsaPublic is the key a client parses out of the .pub member: PEM
+// SubjectPublicKeyInfo, which is what pkg's _load_public_key_buf reads.
 func rsaPublic(t *testing.T, kr *pkgsign.KeyRing) *rsa.PublicKey {
-	t.Helper()
-	pub, ok := parsePublic(t, kr).(*rsa.PublicKey)
-	if !ok {
-		t.Fatalf("the key ring's public half is not RSA")
-	}
-	return pub
-}
-
-func ed25519Public(t *testing.T, kr *pkgsign.KeyRing) ed25519.PublicKey {
-	t.Helper()
-	pub, ok := parsePublic(t, kr).(ed25519.PublicKey)
-	if !ok {
-		t.Fatalf("the key ring's public half is not Ed25519")
-	}
-	return pub
-}
-
-func parsePublic(t *testing.T, kr *pkgsign.KeyRing) any {
 	t.Helper()
 	raw, err := kr.PublicKey()
 	if err != nil {
@@ -231,13 +236,17 @@ func parsePublic(t *testing.T, kr *pkgsign.KeyRing) any {
 	}
 	block, _ := pem.Decode(raw)
 	if block == nil {
-		t.Fatalf("the public key is not PEM: %q", raw)
+		t.Fatalf("the rsa public key is not PEM: %q", raw)
 	}
 	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
 	if err != nil {
 		t.Fatalf("parse the public key: %v", err)
 	}
-	return pub
+	rk, ok := pub.(*rsa.PublicKey)
+	if !ok {
+		t.Fatalf("the key ring's public half is a %T, not RSA", pub)
+	}
+	return rk
 }
 
 func containsPath(paths []string, want string) bool {
