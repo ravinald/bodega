@@ -29,6 +29,13 @@ type freebsdStatus struct {
 	// same state as no key: the operator installed one and believes the
 	// repository is signed, and every generated catalogue refuses until it
 	// loads.
+	//
+	// It quotes a load failure that names the key file by path, so
+	// handleAPIStatus blanks it for a caller outside admin_permit_cidr,
+	// beside spool.Dir. The gate is there rather than here because
+	// freeBSDStatusFor composes this struct for callers holding no request
+	// at all, and one that read a nil request would have to assume an
+	// answer.
 	KeyError string `json:"key_error,omitempty"`
 
 	PublicURL string `json:"public_url"`

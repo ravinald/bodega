@@ -1134,7 +1134,9 @@ components:
           description: >-
             A key file that is present and will not load, which is not the
             same state as no key: every generated catalogue refuses until it
-            does.
+            does. Present for a caller in `admin_permit_cidr` alone: the text
+            is the load failure verbatim and names the key file by path.
+            `signed` and `fingerprint` answer everyone.
         public_url:
           type: string
           description: >-

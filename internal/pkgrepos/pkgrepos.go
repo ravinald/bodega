@@ -173,7 +173,8 @@ type State struct {
 	// from a finished mirror. It changes one thing a reader acts on: the
 	// bootstrap paths resolve on a proxy and 404 on a hosted mirror, and
 	// getting that backwards sends an operator to rebuild a repository that
-	// was never going to answer.
+	// was never going to answer. It also contradicts Generated, which is the
+	// second pair Render refuses.
 	Proxy bool
 }
 
@@ -249,25 +250,34 @@ func ReleaseFromABI(abi string) (int, bool) {
 
 // Render produces the client configuration for one repository, or refuses.
 //
-// It refuses rather than picking a default in the two cases where a stanza
-// would install cleanly and fail later against something the operator cannot
-// see from the file. An entry claiming to be both mirrored and generated has
-// two different right answers for signature_type and the wrong one fails
+// It refuses rather than picking a default in the cases where a stanza would
+// install cleanly and fail later against something the operator cannot see
+// from the file. An entry claiming to be both mirrored and generated has two
+// different right answers for signature_type and the wrong one fails
 // `pkg update` with an error naming the signature, which sends the reader to
-// the key rather than to the manifest. A release nothing resolves means the
-// override would disable a tag the host does not define, which fails nothing
-// at all: the upstream repository stays enabled beside bodega's and nothing
-// reports it.
+// the key rather than to the manifest. A generated entry served in proxy mode
+// is a repository the server answers 500 for on every path, so the stanza
+// describes something that never replies. A release nothing resolves means
+// the override would disable a tag the host does not define, which fails
+// nothing at all: the upstream repository stays enabled beside bodega's and
+// nothing reports it.
 //
-// The contradiction is refused here as well as at
-// manifest.VersionEntry.FreeBSDGenerated, which refuses it for the server's
-// own routing. Two refusals because the artifacts outlive their producers
-// differently: the server's decides one request, and this one is pasted onto
-// a host and read again in a year.
+// The contradictions are refused here as well as at
+// manifest.VersionEntry.FreeBSDGenerated, which refuses them for the server's
+// own routing, and the two sets have to stay equal: a contradiction the server
+// refuses to route and this renderer emits for is published as installable
+// configuration with an empty refusal list beside it, and neither artifact
+// says the repository answers 500. Two refusals rather than one call because
+// the artifacts outlive their producers differently: the server's decides a
+// request, and this one is pasted onto a host and read again in a year.
 func Render(st State) (Repo, error) {
 	if st.Generated && strings.TrimSpace(st.Upstream) != "" {
 		return Repo{}, fmt.Errorf("freebsd %s@%s is marked generated and also records url %q, and the two want opposite client configuration: a mirrored repository verifies against %s and a generated one against bodega's own fingerprint. Drop the url to generate, or drop generated to mirror",
 			st.Repo, st.ABI, st.Upstream, StockFingerprints)
+	}
+	if st.Generated && st.Proxy {
+		return Repo{}, fmt.Errorf("freebsd %s@%s is marked generated and also served in proxy mode, and proxy keeps no snapshot for a generated catalogue to name: the server answers 500 on every path under it, so this stanza would configure a host for a repository that never replies. Drop the proxy mode to generate the catalogue here, or drop generated to proxy an upstream one",
+			st.Repo, st.ABI)
 	}
 
 	release := st.Release

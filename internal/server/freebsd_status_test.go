@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,8 +20,18 @@ import (
 // field renamed in Go and not in its tag is a block nothing reads.
 func statusFreeBSD(t *testing.T, s *Server) freebsdStatus {
 	t.Helper()
+	return statusFreeBSDFrom(t, s, "192.0.2.1:1234")
+}
+
+// statusFreeBSDFrom is the same read from a named caller, for the fields this
+// block gates. A server built with no admin_permit_cidr permits nobody, so
+// the address statusFreeBSD leaves at httptest's default is a non-admin one.
+func statusFreeBSDFrom(t *testing.T, s *Server, remote string) freebsdStatus {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	req.RemoteAddr = remote
 	rec := httptest.NewRecorder()
-	s.mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/status", nil))
+	s.mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET /api/v1/status = %d", rec.Code)
 	}
@@ -94,26 +106,46 @@ func TestFreeBSDStatusRendersAGeneratedRepositoryAgainstBodegasKey(t *testing.T)
 	}
 }
 
-// An entry claiming to be both mirrored and generated is reported as refused
-// rather than dropped. Dropped, it is indistinguishable from an entry that is
-// not configured, and the manifest that caused it stays uncorrected.
+// An entry the server will not route is reported as refused rather than
+// dropped. Dropped, it is indistinguishable from an entry that is not
+// configured, and the manifest that caused it stays uncorrected.
+//
+// Both contradictions manifest.VersionEntry.FreeBSDGenerated refuses reach
+// this list. Either one rendered instead is a stanza published for a
+// repository whose every path answers 500, with an empty refusal list beside
+// it saying nothing is wrong.
 func TestFreeBSDStatusReportsARefusedEntryRatherThanDroppingIt(t *testing.T) {
-	s := hostedServer(t)
-	s.cfg.PublicURL = "https://bodega.internal"
-	addVersion(t, s, manifest.TypeFreeBSD, "muddle", manifest.VersionEntry{
-		Version: "FreeBSD:14:amd64", Generated: true,
-		URL: "https://pkg.freebsd.org/FreeBSD:14:amd64/latest",
-	})
+	for _, tc := range []struct {
+		repo  string
+		entry manifest.VersionEntry
+		names string
+	}{
+		{"muddle", manifest.VersionEntry{
+			Version: "FreeBSD:14:amd64", Generated: true,
+			URL: "https://pkg.freebsd.org/FreeBSD:14:amd64/latest",
+		}, "url"},
+		{"drift", manifest.VersionEntry{
+			Version: "FreeBSD:14:amd64", Generated: true, Mode: manifest.ModeProxy,
+		}, "proxy"},
+	} {
+		t.Run(tc.repo, func(t *testing.T) {
+			s := hostedServer(t)
+			s.cfg.PublicURL = "https://bodega.internal"
+			addVersion(t, s, manifest.TypeFreeBSD, tc.repo, tc.entry)
 
-	st := statusFreeBSD(t, s)
-	if len(st.Repos) != 0 {
-		t.Fatalf("a contradictory entry rendered a configuration: %+v", st.Repos)
-	}
-	if len(st.Refused) != 1 || st.Refused[0].Repo != "muddle" {
-		t.Fatalf("Refused = %+v, want one row naming muddle", st.Refused)
-	}
-	if !strings.Contains(st.Refused[0].Error, "generated") {
-		t.Errorf("the refusal does not name the field to change: %q", st.Refused[0].Error)
+			st := statusFreeBSD(t, s)
+			if len(st.Repos) != 0 {
+				t.Fatalf("a contradictory entry rendered a configuration: %+v", st.Repos)
+			}
+			if len(st.Refused) != 1 || st.Refused[0].Repo != tc.repo {
+				t.Fatalf("Refused = %+v, want one row naming %s", st.Refused, tc.repo)
+			}
+			for _, want := range []string{"generated", tc.names} {
+				if !strings.Contains(st.Refused[0].Error, want) {
+					t.Errorf("the refusal does not name %q, so the manifest field to change is a guess: %q", want, st.Refused[0].Error)
+				}
+			}
+		})
 	}
 }
 
@@ -171,19 +203,40 @@ func TestFreeBSDStatusRendersOnePerABI(t *testing.T) {
 // who installed one believes the repository is signed, and every generated
 // catalogue refuses until it loads, so the status says so rather than
 // reporting the unsigned configuration an absent key would produce.
-func TestFreeBSDStatusReportsAnUnusableKey(t *testing.T) {
+//
+// It says so to an admin caller alone. The text is a load failure verbatim,
+// and the one planted here is pkgsign's likeliest: it names the key file by
+// path and reports that the private key is readable beyond its owner. That is
+// the datum spool.Dir and the build stamp are already withheld for. signed
+// stays public on both sides, because a client that cannot tell a signed
+// repository from an unsigned one configures the wrong signature_type.
+func TestFreeBSDStatusReportsAnUnusableKeyToAdminsOnly(t *testing.T) {
 	t.Setenv(pkgsign.CredentialsEnv, "")
 	kr := installPkgKey(t, pkgsign.KeyRSA)
 	if err := os.Chmod(kr.Path(), 0o644); err != nil {
 		t.Fatalf("chmod the key readable beyond its owner: %v", err)
 	}
 	s := hostedServer(t)
+	_, admin, err := net.ParseCIDR("198.51.100.7/32")
+	if err != nil {
+		t.Fatalf("parse the admin cidr: %v", err)
+	}
+	s.adminNets = []*net.IPNet{admin}
+	s.refreshACLs(context.Background())
 
-	st := statusFreeBSD(t, s)
+	st := statusFreeBSDFrom(t, s, "198.51.100.7:40000")
 	if st.Signed {
 		t.Error("signed is true for a key the server could not load")
 	}
 	if !strings.Contains(st.KeyError, kr.Path()) {
 		t.Errorf("key_error = %q, want the load failure naming the file an operator has to fix", st.KeyError)
+	}
+
+	anon := statusFreeBSDFrom(t, s, "203.0.113.9:40000")
+	if anon.KeyError != "" {
+		t.Errorf("key_error = %q for a caller outside admin_permit_cidr, which hands anyone who can reach the listener the key's path and its mode", anon.KeyError)
+	}
+	if anon.Signed != st.Signed {
+		t.Errorf("signed = %v for a non-admin caller and %v for an admin one; the gate is on the error text, not on whether the repository is signed", anon.Signed, st.Signed)
 	}
 }
