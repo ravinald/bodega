@@ -111,15 +111,23 @@ func TestMirrorVerifiesAgainstTheStockTrustStore(t *testing.T) {
 	}
 }
 
-// The bootstrap answer follows how the repository is served, not what pkg is.
-// A proxy composes an upstream URL for any path outside the catalogue, so
-// both bootstrap paths resolve; a hosted mirror 404s them. Measured against
-// a proxied repository: Latest/pkg.pkg came back 200 at 5,477,177 bytes and
-// its .sig at 727.
+// The bootstrap answer follows both facts that decide it: how the repository
+// is served, and which upstream repository a proxy would reach for the pair.
+// A hosted mirror publishes only the repopaths its catalogue names, so it
+// 404s them whatever upstream holds. A proxy passes the request through, and
+// what comes back is upstream's answer: measured against a proxied ports
+// repository, Latest/pkg.pkg came back 200 at 5,477,177 bytes and its .sig at
+// 727; measured against FreeBSD:15:aarch64/base_release_1, both are 403.
 func TestBootstrapNoteFollowsTheServingMode(t *testing.T) {
 	hosted := render(t, mirror())
+	if hosted.Bootstrap != pkgrepos.BootstrapAbsent {
+		t.Errorf("Bootstrap = %q for a hosted mirror, want %q", hosted.Bootstrap, pkgrepos.BootstrapAbsent)
+	}
 	if !strings.Contains(hosted.Conf, "`pkg bootstrap` does not work") {
 		t.Errorf("a hosted mirror's conf does not say bootstrap fails against it:\n%s", hosted.Conf)
+	}
+	if !strings.Contains(hosted.Note(), "only the paths its catalogue names") {
+		t.Errorf("a hosted mirror's note blames upstream rather than the mirror: %q", hosted.Note())
 	}
 
 	st := mirror()
@@ -128,11 +136,95 @@ func TestBootstrapNoteFollowsTheServingMode(t *testing.T) {
 	if !proxied.Proxy {
 		t.Error("Proxy did not survive into the rendered configuration")
 	}
+	if proxied.Bootstrap != pkgrepos.BootstrapWorks {
+		t.Errorf("Bootstrap = %q for a proxied mirror of %s, want %q", proxied.Bootstrap, st.Upstream, pkgrepos.BootstrapWorks)
+	}
 	if strings.Contains(proxied.Conf, "`pkg bootstrap` does not work") {
 		t.Errorf("a proxied repository's conf claims bootstrap fails, which sends an operator to rebuild a repository that already answers:\n%s", proxied.Conf)
 	}
 	if !strings.Contains(proxied.Note(), "reaches the internet") {
 		t.Errorf("the proxy note does not name what bootstrapping through a proxy costs: %q", proxied.Note())
+	}
+
+	// Proxying is not the whole answer. Upstream publishes no pkg package
+	// under a base repository, so the proxy resolves the path and hands back
+	// upstream's 403: a file telling the operator to run pkg bootstrap here
+	// names a command that cannot work.
+	base := pkgbaseMirror()
+	base.Proxy = true
+	proxiedBase := render(t, base)
+	if proxiedBase.Bootstrap != pkgrepos.BootstrapAbsent {
+		t.Errorf("Bootstrap = %q for a proxied mirror of %s, want %q", proxiedBase.Bootstrap, base.Upstream, pkgrepos.BootstrapAbsent)
+	}
+	if strings.Contains(proxiedBase.Conf, "`pkg bootstrap` works here") {
+		t.Errorf("a proxied base mirror's conf claims bootstrap works; upstream answers 403 for both paths and the client gets a 502:\n%s", proxiedBase.Conf)
+	}
+	if !strings.Contains(proxiedBase.Note(), "or a 502 where upstream answers 403") {
+		t.Errorf("the note does not say what the client actually gets: %q", proxiedBase.Note())
+	}
+
+	// A repository nobody drove the pair against hedges. release_<n>
+	// publishes it on 15 and 404s on 14, which is why a name that looks like
+	// a ports repository is not enough to assert it.
+	unmeasured := mirror()
+	unmeasured.Proxy = true
+	unmeasured.Upstream = "https://pkg.freebsd.org/FreeBSD:14:amd64/release_1"
+	hedged := render(t, unmeasured)
+	if hedged.Bootstrap != pkgrepos.BootstrapUnknown {
+		t.Errorf("Bootstrap = %q for a proxied mirror of %s, want %q", hedged.Bootstrap, unmeasured.Upstream, pkgrepos.BootstrapUnknown)
+	}
+	if !strings.Contains(hedged.Conf, "`pkg bootstrap` may not work") {
+		t.Errorf("an unmeasured repository's conf asserts an answer nobody measured:\n%s", hedged.Conf)
+	}
+}
+
+// What a proxy reaches for the bootstrap pair, by upstream repository. Every
+// row measured with fetch(1) against pkg.FreeBSD.org, both paths per
+// repository, on 2026-09-21.
+func TestUpstreamBootstrap(t *testing.T) {
+	const host = "https://pkg.freebsd.org/"
+	for _, tc := range []struct {
+		upstream string
+		want     pkgrepos.BootstrapAnswer
+	}{
+		{host + "FreeBSD:15:aarch64/latest", pkgrepos.BootstrapWorks},
+		{host + "FreeBSD:15:aarch64/quarterly", pkgrepos.BootstrapWorks},
+		{host + "FreeBSD:14:amd64/latest/", pkgrepos.BootstrapWorks},
+		{host + "FreeBSD:14:amd64/quarterly", pkgrepos.BootstrapWorks},
+		// pkg.pkg 200 and the .sig the bootstrapper checks it against 403,
+		// which is absent as far as bootstrapping is concerned.
+		{host + "FreeBSD:15:aarch64/base_release_0", pkgrepos.BootstrapAbsent},
+		{host + "FreeBSD:15:aarch64/base_release_1", pkgrepos.BootstrapAbsent},
+		{host + "FreeBSD:15:aarch64/base_latest", pkgrepos.BootstrapAbsent},
+		{host + "FreeBSD:15:aarch64/base_weekly", pkgrepos.BootstrapAbsent},
+		{host + "FreeBSD:15:aarch64/kmods_quarterly_1", pkgrepos.BootstrapAbsent},
+		{host + "FreeBSD:15:aarch64/kmods_latest", pkgrepos.BootstrapAbsent},
+		{host + "FreeBSD:14:amd64/base_release_1", pkgrepos.BootstrapAbsent},
+		// 200 on 15 and 404 on 14, so the name alone cannot assert it.
+		{host + "FreeBSD:15:aarch64/release_1", pkgrepos.BootstrapUnknown},
+		{host + "FreeBSD:14:amd64/release_1", pkgrepos.BootstrapUnknown},
+		{"https://mirror.internal/freebsd/house/", pkgrepos.BootstrapUnknown},
+		{"", pkgrepos.BootstrapUnknown},
+	} {
+		if got := pkgrepos.UpstreamBootstrap(tc.upstream); got != tc.want {
+			t.Errorf("UpstreamBootstrap(%q) = %q, want %q", tc.upstream, got, tc.want)
+		}
+	}
+}
+
+// A generated repository serves what the build tree uploaded, and poudriere
+// publishes Latest/pkg.pkg as a symlink the upload skips. bodega cannot see
+// from here whether somebody put a real file there, so it says so rather than
+// picking the answer that is usually right.
+func TestGeneratedHedgesTheBootstrapAnswer(t *testing.T) {
+	st := mirror()
+	st.Upstream, st.Generated, st.Fingerprint = "", true, "SHA256:deadbeef"
+	got := render(t, st)
+	if got.Bootstrap != pkgrepos.BootstrapUnknown {
+		t.Errorf("Bootstrap = %q for a generated repository, want %q", got.Bootstrap, pkgrepos.BootstrapUnknown)
+	}
+	if !strings.Contains(got.Conf, "only if the build tree published") {
+		t.Errorf("the conf does not say what bootstrap depends on here:\n%s", got.Conf)
 	}
 }
 
@@ -456,6 +548,10 @@ func TestWithReleaseMovesTheOverridesAndNothingElse(t *testing.T) {
 	if got.URL != fifteen.URL || got.Tag != fifteen.Tag || got.Pkgbase != fifteen.Pkgbase {
 		t.Errorf("re-rendering changed url/tag/pkgbase: %+v against %+v", got, fifteen)
 	}
+	if got.Bootstrap != fifteen.Bootstrap {
+		t.Errorf("re-rendering changed the bootstrap answer: %q became %q; the upstream URL it was derived from is not on the wire",
+			fifteen.Bootstrap, got.Bootstrap)
+	}
 	if got.Note() != fifteen.Note() {
 		t.Errorf("re-rendering changed the notes: %q became %q", fifteen.Note(), got.Note())
 	}
@@ -467,5 +563,29 @@ func TestWithReleaseMovesTheOverridesAndNothingElse(t *testing.T) {
 	}
 	if _, err := got.WithRelease(0); err == nil {
 		t.Errorf("WithRelease(0) returned a conf rather than refusing; the overrides would name no tag at all")
+	}
+}
+
+// A Repo decoded without a bootstrap field hedges rather than asserting the
+// answer the field replaced. The wire shape is what a doctor on one release
+// reads off a server on another, so the two can differ in age, and the old
+// answer for a proxied repository was that bootstrap works.
+func TestABootstrapAnswerMissingFromTheWireHedges(t *testing.T) {
+	var decoded pkgrepos.Repo
+	wire := `{"tag":"bodega-base","abi":"FreeBSD:15:amd64","repo":"base","release":15,` +
+		`"proxy":true,"url":"https://bodega.internal/freebsd/${ABI}/base",` +
+		`"signature_type":"fingerprints","disabled":["FreeBSD-ports"]}`
+	if err := json.Unmarshal([]byte(wire), &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	got, err := decoded.WithRelease(15)
+	if err != nil {
+		t.Fatalf("WithRelease(15) = %v", err)
+	}
+	if strings.Contains(got.Conf, "`pkg bootstrap` works here") {
+		t.Errorf("a configuration re-rendered from a wire shape carrying no bootstrap answer claims one:\n%s", got.Conf)
+	}
+	if !strings.Contains(got.Conf, "`pkg bootstrap` may not work") {
+		t.Errorf("the conf neither asserts nor hedges the bootstrap answer:\n%s", got.Conf)
 	}
 }

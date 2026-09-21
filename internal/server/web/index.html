@@ -763,10 +763,12 @@ function getClientUrl(type, entry) {
     // rendered, not the repository block alone. The block on its own installs
     // cleanly and leaves the upstream repository enabled beside bodega's,
     // which pkg never mentions, so the overrides that disable it travel in
-    // the same copy. signature_type comes from the server too: it is
-    // fingerprints against the stock trust store for a mirror and bodega's
-    // own key for a generated repository, and the wrong one fails pkg update
-    // on an error naming the signature.
+    // the same copy. signature_type comes from the server too, and it is
+    // three answers: the stock trust store for a mirror of a ports
+    // repository, the pkgbase store beside it for a mirror of a
+    // base_release_<n> one, and bodega's own key for a generated repository.
+    // The server derives it from the entry's upstream URL, which is not on
+    // this response, so nothing here may work it out again.
     case 'freebsd': {
       const repo = freeBSDRepoFor(entry);
       return repo ? repo.conf : '';

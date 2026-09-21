@@ -1193,8 +1193,9 @@ components:
           type: boolean
           description: >-
             Served from upstream on a miss rather than from a finished mirror.
-            It decides one thing a reader acts on: `pkg bootstrap` resolves
-            against a proxy and 404s against a hosted mirror.
+            It is half of the bootstrap answer below: a proxy resolves a path
+            outside the catalogue against upstream, and a hosted mirror 404s
+            it whatever upstream holds.
         pkgbase:
           type: boolean
           description: >-
@@ -1203,6 +1204,17 @@ components:
             one. Carried because the upstream URL it is derived from does not
             cross the wire, so a consumer re-rendering this configuration
             cannot work it out again.
+        bootstrap:
+          type: string
+          description: >-
+            What `pkg bootstrap` does against this repository: "works" and
+            "absent" are measured, "unknown" is not. It needs both the serving
+            mode and the upstream repository, because upstream publishes
+            Latest/pkg.pkg under the ports repositories and nowhere else, so
+            the bootstrapper gets a 404 or a 502 against a proxied base or
+            kmods mirror. Never omitted: an absent value means "unknown"
+            rather than either answer.
+          enum: [works, absent, unknown]
         url:
           type: string
           description: >-

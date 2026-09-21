@@ -301,3 +301,31 @@ func TestFreeBSDStatusKeepsTheStockStoreForABaseSnapshotMirror(t *testing.T) {
 		t.Errorf("pkgbase is set for a snapshot repository the pkgbase key set never signed")
 	}
 }
+
+// A proxied mirror of a base repository does not tell an operator to run
+// `pkg bootstrap`. Proxying resolves the two paths pkg's bootstrapper fetches
+// and upstream publishes neither under a base repository, so the client gets
+// a 502: the claim is keyed off the upstream URL, which never
+// crosses the wire, so this reads the endpoint rather than the renderer.
+func TestFreeBSDStatusDoesNotPromiseBootstrapOnAProxiedBaseMirror(t *testing.T) {
+	s := hostedServer(t)
+	s.cfg.PublicURL = "https://bodega.internal"
+	addVersion(t, s, manifest.TypeFreeBSD, "house-base", manifest.VersionEntry{
+		Version: "FreeBSD:15:amd64",
+		URL:     "https://pkg.freebsd.org/FreeBSD:15:amd64/base_release_1",
+		Mode:    manifest.ModeProxy,
+	})
+
+	st := statusFreeBSD(t, s)
+	repo := st.RepoFor("house-base", "FreeBSD:15:amd64")
+	if repo == nil {
+		t.Fatalf("no rendered configuration for house-base@FreeBSD:15:amd64, got %+v", st.Repos)
+	}
+	if repo.Bootstrap != pkgrepos.BootstrapAbsent {
+		t.Errorf("bootstrap = %q, want %q: upstream answers 403 for both Latest/pkg.pkg paths under a base repository",
+			repo.Bootstrap, pkgrepos.BootstrapAbsent)
+	}
+	if strings.Contains(repo.Conf, "`pkg bootstrap` works here") {
+		t.Errorf("the conf tells the operator to run a command that cannot resolve:\n%s", repo.Conf)
+	}
+}
