@@ -1187,8 +1187,12 @@ components:
         generated:
           type: boolean
           description: >-
-            The catalogue is built and signed by bodega rather than copied from
-            upstream, which changes what verifies it.
+            The catalogue is built here from the packages uploaded to this
+            repository rather than copied from upstream, so no signature of
+            FreeBSD's reaches a client under it. It does not say bodega signed
+            it: a server holding no pkg catalogue signing key renders
+            signature_type none for a generated repository, and that field is
+            the one to read for the signing half.
         proxy:
           type: boolean
           description: >-
@@ -1232,14 +1236,19 @@ components:
           type: string
           description: >-
             What `pkg bootstrap` does against this repository: "works" and
-            "absent" are measured, "unknown" is not. Two facts decide it and
-            neither is the serving mode: upstream_fallthrough above, and which
-            upstream repository this mirrors, because upstream publishes
-            Latest/pkg.pkg under the ports repositories and nowhere else. So a
-            base or kmods mirror the server does fetch misses for answers the
-            bootstrapper a 404 or a 502, and a hosted ports mirror on a
-            cache-enabled server answers it a package. Never omitted: an
-            absent value means "unknown" rather than either answer.
+            "absent" are measured, "unknown" is not. A generated repository is
+            always "unknown", whatever upstream_fallthrough says: it has no
+            upstream and serves what the build tree uploaded, and poudriere
+            publishes Latest/pkg.pkg as a symlink the upload skips. For a
+            mirror two facts decide it and neither is the serving mode:
+            upstream_fallthrough above, and which upstream repository this
+            mirrors, because upstream publishes Latest/pkg.pkg under the ports
+            repositories and nowhere else. So a base or kmods mirror the
+            server does fetch misses for answers the bootstrapper a 404 or a
+            502, and a hosted ports mirror on a cache-enabled server answers
+            it a package. A mirror nobody measured is "unknown" too. Never
+            omitted: an absent value means "unknown" rather than either
+            answer.
           enum: [works, absent, unknown]
         url:
           type: string
