@@ -83,6 +83,10 @@ jobs:
       - run: go install mvdan.cc/sh/v3/cmd/shfmt@v3.14.0
       - run: make harness
 
+  # internal/server runs 497 test functions with three t.Parallel() calls among
+  # them, so it is serial and longer than the rest of the tree combined. The two
+  # jobs run side by side; one job running them end to end is what put a pull
+  # request over ten minutes.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -91,13 +95,32 @@ jobs:
         with:
           go-version-file: go.mod
           check-latest: true
-      - run: go test -race -count=1 -coverprofile=coverage.out ./...
+      - run: |
+          go list ./... | grep -v '/internal/server$' \
+            | xargs go test -race -count=1 -coverprofile=coverage.out
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -1
       - uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: coverage.out
+          retention-days: 14
+
+  test-server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - run: go test -race -count=1 -coverprofile=coverage-server.out ./internal/server/...
+      - name: Coverage summary
+        run: go tool cover -func=coverage-server.out | tail -1
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage-server
+          path: coverage-server.out
           retention-days: 14
 
   vuln:
@@ -121,6 +144,6 @@ jobs:
   # It runs nothing. The jobs it names are what branch protection requires.
   gate:
     runs-on: ubuntu-latest
-    needs: [vet, lint, fmt, tidy, test, harness]
+    needs: [vet, lint, fmt, tidy, test, test-server, harness]
     steps:
       - run: echo "every gate job passed"

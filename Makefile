@@ -23,7 +23,7 @@ LOCAL_DRIFT_CHECK ?= true
 # are both read against. `make ci-drift` fails when the two disagree, so a job
 # added to CI cannot reach main without also reaching the merge gate — which
 # is how gofmt drift shipped through a green gate once already.
-CI_GATE_JOBS := vet lint fmt tidy test harness
+CI_GATE_JOBS := vet lint fmt tidy test test-server harness
 
 # Each CI job paired with the `check` leg that runs it. The names differ by
 # convention (fmt > fmt-check), so without the pairing a job sits in
@@ -32,11 +32,11 @@ CI_GATE_JOBS := vet lint fmt tidy test harness
 # Written out rather than derived: deriving `check`'s prerequisites from
 # CI_GATE_JOBS runs them in that list's order, which puts lint ahead of
 # fmt-check and costs the cheapest-first ordering CHECK_LEGS holds.
-CI_GATE_TARGETS := vet=vet lint=lint fmt=fmt-check tidy=tidy-check test=test harness=harness
+CI_GATE_TARGETS := vet=vet lint=lint fmt=fmt-check tidy=tidy-check test=test test-server=test-server harness=harness
 
 # The legs `check` runs, in order. `check` has no prerequisites outside this
 # list, so it is what ran, and `ci-drift` reads CI_GATE_TARGETS against it.
-CHECK_LEGS := ci-drift fmt-check tidy-check harness vet build lint test
+CHECK_LEGS := ci-drift fmt-check tidy-check harness vet build lint test test-server
 
 # Every shell file in the tree. `shfmt -f` finds them by shebang and by
 # shell= directive, so a suite added without touching this line is still
@@ -179,9 +179,17 @@ uninstall:
 	fi; \
 	echo "Removed: $$target"
 
-## test: Run all tests with race detector
+# internal/server holds 497 test functions and three calls to t.Parallel(), so
+# it runs serially and takes longer than every other package put together.
+# Split so CI runs the two beside each other instead of end to end; a local
+# `check` still runs both, in sequence.
+## test: Run every package but internal/server, with the race detector
 test:
-	go test -race -count=1 ./...
+	go list ./... | grep -v '/internal/server$$' | xargs go test -race -count=1
+
+## test-server: Run internal/server with the race detector
+test-server:
+	go test -race -count=1 ./internal/server/...
 
 ## test-verbose: Run all tests with verbose output
 test-verbose:
