@@ -220,7 +220,7 @@ func (r *keyRepairer) repairVersion(ctx context.Context, pm *manifest.PackageMan
 				continue
 			}
 			fmt.Fprintf(r.out, "  %s: %s -> %s on %q\n", label, oldKey, newKey, backend)
-			size, err := copyObject(ctx, store, store, oldKey, newKey, r.spool)
+			size, _, err := copyObject(ctx, store, store, oldKey, newKey, r.spool)
 			if err != nil {
 				return fmt.Errorf("%s: %w", label, err)
 			}

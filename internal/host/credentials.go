@@ -393,6 +393,49 @@ func WriteAptSources(root, keyringPath, stanza string, keyring []byte) ([]string
 	return wrote, nil
 }
 
+// PkgRepoMode is the mode the pkg repository configuration is written with.
+// World-readable on purpose: it holds no secret, and pkg reads it as a user
+// that is not always root.
+const PkgRepoMode = os.FileMode(0o644)
+
+// WritePkgRepo installs the pkg repository configuration a bodega instance
+// said this host should read, at confPath, and reports what it wrote.
+//
+// The file is replaced whole rather than merged. It is bodega's own document
+// and /usr/local/etc/pkg/repos/ is a directory precisely so a second source
+// is a second file; merging would also mean parsing UCL to find out what was
+// already there, and getting that wrong leaves a host reading two
+// repositories where the operator asked for one.
+//
+// A conf that disables nothing is refused. pkg merges repository definitions
+// by tag, so a file that adds bodega without turning the upstream repository
+// off leaves the host fetching from both, and nothing in "pkg update" output
+// reports it: the operator believes the host is isolated and it is not.
+//
+// root prefixes confPath and is empty everywhere but a test. The path is
+// absolute and outside home, so without it the only way to exercise the guard
+// is to write the running host's real pkg configuration.
+func WritePkgRepo(root, confPath, conf string) ([]string, error) {
+	if strings.TrimSpace(conf) == "" {
+		return nil, fmt.Errorf("this bodega returned no pkg repository configuration for this host, so there is nothing to install")
+	}
+	if !strings.Contains(conf, "enabled: no") {
+		return nil, fmt.Errorf("the configuration this bodega returned disables no upstream repository, so installing it would leave this host fetching from pkg.FreeBSD.org beside bodega with nothing reporting it.\n" +
+			"  Check what the server rendered:  bodega doctor --write-pkg-repo --abi <abi>, or GET /api/v1/status")
+	}
+	target := filepath.Join(root, confPath)
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return nil, fmt.Errorf("create %s: %w", filepath.Dir(target), err)
+	}
+	if err := os.WriteFile(target, []byte(strings.TrimRight(conf, "\n")+"\n"), PkgRepoMode); err != nil {
+		return nil, fmt.Errorf("write %s: %w", target, err)
+	}
+	if err := os.Chmod(target, PkgRepoMode); err != nil {
+		return []string{target}, fmt.Errorf("chmod %s: %w", target, err)
+	}
+	return []string{target}, nil
+}
+
 // cutManaged splits existing around the fenced block and reports whether one
 // was there. An unterminated begin marker is an error rather than something to
 // guess at: writing past it would nest one block inside another and the next

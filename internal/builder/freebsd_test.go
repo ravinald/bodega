@@ -1503,6 +1503,60 @@ func TestGeneratedUploadFollowsALinkOutOfTheRepository(t *testing.T) {
 	}
 }
 
+// R1: a name is dropped only when something else publishes the same file.
+//
+// The rule that skips an in-repository link is not that rule, and this is the
+// tree where the two part company. A .pkg symlink at a .txz — what a tree
+// carries when it predates pkg 1.17 spelling them .pkg — has its target
+// skipped for the extension and itself skipped for resolving inside the
+// repository, so the package leaves the repository entirely with two log lines
+// and no error. The link is the only name those bytes have here.
+func TestGeneratedUploadKeepsALinkWhoseTargetItDoesNotPublish(t *testing.T) {
+	cfg, store := fbGeneratedFixture(t, map[string]string{"All/widget-1.2.0.txz": "a package"})
+	fbSymlink(t, cfg, "All/widget-1.2.0.pkg", "widget-1.2.0.txz")
+
+	if got := fbUploadKeys(t, cfg, store); !slices.Equal(got, []string{"All/widget-1.2.0.pkg"}) {
+		t.Fatalf("upload set = %v, want the link: nothing else in the repository publishes those bytes", got)
+	}
+}
+
+// The same parting, one directory over: the target is a staging name the walk
+// does not publish, and the package beside it must not be taken down with it.
+func TestGeneratedUploadKeepsALinkAtAnUnpublishedTarget(t *testing.T) {
+	cfg, store := fbGeneratedFixture(t, map[string]string{
+		"All/real-1.0.pkg":           "a package",
+		"spool/widget-1.2.0.pkg.tmp": "another package",
+	})
+	fbSymlink(t, cfg, "All/widget-1.2.0.pkg", "../spool/widget-1.2.0.pkg.tmp")
+
+	want := []string{"All/real-1.0.pkg", "All/widget-1.2.0.pkg"}
+	if got := fbUploadKeys(t, cfg, store); !slices.Equal(got, want) {
+		t.Fatalf("upload set = %v, want both packages %v", got, want)
+	}
+}
+
+// Two links at one file outside the tree are two names for one package, and
+// neither of them resolves inside anything. Publishing both is the duplicate
+// record pkg refuses the whole repository over, reached without a single
+// in-repository link.
+func TestGeneratedUploadPublishesOneNameForAFileOutsideTheTree(t *testing.T) {
+	cfg, store := fbGeneratedFixture(t, nil)
+	outside := filepath.Join(t.TempDir(), "widget-1.2.0.pkg")
+	if err := os.WriteFile(outside, []byte("a package built elsewhere"), 0o644); err != nil {
+		t.Fatalf("write %s: %v", outside, err)
+	}
+	fbSymlink(t, cfg, "All/widget-1.2.0.pkg", outside)
+	fbSymlink(t, cfg, "Latest/widget.pkg", outside)
+
+	// Walk order, which filepath.WalkDir makes lexical: two names of equal
+	// standing have to resolve the same way on the next build, or the
+	// catalogue's repopath moves and every client refetches a package that
+	// did not change.
+	if got := fbUploadKeys(t, cfg, store); !slices.Equal(got, []string{"All/widget-1.2.0.pkg"}) {
+		t.Fatalf("upload set = %v, want one name for one package", got)
+	}
+}
+
 // A dead link is named and skipped rather than failing the upload. A
 // repository tree is whatever an operator rsynced into it, and one broken link
 // is not a reason to publish none of the packages beside it.

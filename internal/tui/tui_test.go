@@ -1431,7 +1431,7 @@ func TestClientURLCoversEveryKnownType(t *testing.T) {
 
 	for _, e := range entries {
 		t.Run(e.typ, func(t *testing.T) {
-			if got := clientURL(cfg, store, e.typ, e.name); got == "" {
+			if got := clientURL(cfg, store, e.typ, e.name, ""); got == "" {
 				t.Errorf("clientURL returned \"\", so the details pane renders no client instruction for a stored %s package", e.typ)
 			}
 		})
@@ -1439,7 +1439,7 @@ func TestClientURLCoversEveryKnownType(t *testing.T) {
 
 	// The exemption is asserted, not assumed. apt renders through aptSources,
 	// and clientURL answering for it would put two instructions in one pane.
-	if got := clientURL(cfg, store, clientURLExemptType, clientURLSeeds[clientURLExemptType].name); got != "" {
+	if got := clientURL(cfg, store, clientURLExemptType, clientURLSeeds[clientURLExemptType].name, ""); got != "" {
 		t.Errorf("clientURL(%s) = %q, want \"\": aptSources renders the sources line", clientURLExemptType, got)
 	}
 }
@@ -1458,7 +1458,7 @@ func TestDetailsPaneRendersClientInstructionForEveryKnownType(t *testing.T) {
 		t.Run(typ, func(t *testing.T) {
 			leaf := firstVersionLeaf(t, roots, typ)
 
-			want := clientURL(cfg, store, typ, leaf.Name)
+			want := clientURL(cfg, store, typ, leaf.Name, "")
 			if typ == clientURLExemptType {
 				pm, err := store.GetPackage(t.Context(), typ, leaf.Name)
 				if err != nil {
@@ -1516,7 +1516,7 @@ func TestClientURLSchemeFollowsTLSConfig(t *testing.T) {
 
 	tlsCfg := &config.Config{TLSCert: "/etc/bodega/cert.pem", TLSKey: "/etc/bodega/key.pem"}
 	for _, e := range entries {
-		got := clientURL(tlsCfg, store, e.typ, e.name)
+		got := clientURL(tlsCfg, store, e.typ, e.name, "")
 		if got == "" {
 			t.Fatalf("%s: empty client URL", e.typ)
 		}
@@ -1530,7 +1530,7 @@ func TestClientURLSchemeFollowsTLSConfig(t *testing.T) {
 
 	plainCfg := &config.Config{}
 	for _, e := range entries {
-		got := clientURL(plainCfg, store, e.typ, e.name)
+		got := clientURL(plainCfg, store, e.typ, e.name, "")
 		if !strings.Contains(got, "http://") {
 			t.Errorf("%s without TLS: want http://, got %q", e.typ, got)
 		}
@@ -1539,7 +1539,7 @@ func TestClientURLSchemeFollowsTLSConfig(t *testing.T) {
 	// A cert with no key does not start a TLS listener, so it must not
 	// advertise one.
 	halfCfg := &config.Config{TLSCert: "/etc/bodega/cert.pem"}
-	if got := clientURL(halfCfg, store, manifest.TypePypi, "pkg-b"); !strings.Contains(got, "http://") {
+	if got := clientURL(halfCfg, store, manifest.TypePypi, "pkg-b", ""); !strings.Contains(got, "http://") {
 		t.Errorf("cert without key: want http://, got %q", got)
 	}
 
@@ -1548,7 +1548,7 @@ func TestClientURLSchemeFollowsTLSConfig(t *testing.T) {
 	// empty here and every client still speaks https.
 	proxiedCfg := &config.Config{PublicURL: "https://bodega.example.com"}
 	for _, e := range entries {
-		got := clientURL(proxiedCfg, store, e.typ, e.name)
+		got := clientURL(proxiedCfg, store, e.typ, e.name, "")
 		if !strings.Contains(got, "https://bodega.example.com/") {
 			t.Errorf("%s behind a proxy: want the public URL, got %q", e.typ, got)
 		}
@@ -1922,7 +1922,7 @@ func TestCargoStanzaSurvivesANarrowPane(t *testing.T) {
 
 	// An empty instruction splits to one empty string, which every pane
 	// contains: the guard would pass on the defect it exists to catch.
-	stanza := clientURL(cfg, store, manifest.TypeCargo, leaf.Name)
+	stanza := clientURL(cfg, store, manifest.TypeCargo, leaf.Name, "")
 	if stanza == "" {
 		t.Fatalf("no client instruction to render for %s", manifest.TypeCargo)
 	}

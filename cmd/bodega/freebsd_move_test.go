@@ -687,6 +687,64 @@ func TestFreeBSDGeneratedMoveRefusesARepositoryThatChangedMidMove(t *testing.T) 
 	}
 }
 
+// flipStore writes the bytes it was handed with one of them changed, keeping
+// the length. It stands in for the class of fault a size check cannot see: a
+// storage or transport error that preserves how much arrived.
+type flipStore struct {
+	storage.ObjectStore
+	key string
+}
+
+func (s *flipStore) PutFile(ctx context.Context, local, key string) error {
+	if key != s.key {
+		return s.ObjectStore.PutFile(ctx, local, key)
+	}
+	body, err := os.ReadFile(local) //nolint:gosec // G304: the spool file this move just wrote.
+	if err != nil {
+		return err
+	}
+	body[len(body)/2] ^= 0xff
+	return s.Put(ctx, key, body)
+}
+
+// A package whose bytes change in transit is refused before the manifest moves.
+//
+// This is the check a mirrored repository does not need, and the reason is the
+// whole difference between the two halves of this file. A mirror publishes
+// archives naming a sum for every package it carries, so a copy that arrived
+// wrong is refused by the client that downloads it. A generated catalogue takes
+// every sum from whatever is in the store when it builds, so the same fault is
+// written into the catalogue as the truth: pkg fetches the corrupted package,
+// checks it against the sum computed from the corrupted package, and installs
+// it. With --delete-source the copy that was right is already gone.
+func TestFreeBSDGeneratedMoveRefusesAPackageThatChangedInTransit(t *testing.T) {
+	ctx := t.Context()
+	_, store, stores, _ := fbGeneratedFixture(t)
+	src := stores.Default()
+	corrupt := manifest.FreeBSDKey(fbABI, fbRepo, "All/tool-3.1.pkg")
+	dst := &flipStore{ObjectStore: mustByName(t, stores, "bulk"), key: corrupt}
+
+	m := &mover{
+		stores: &testResolver{def: src, bulk: dst}, dst: dst, dstName: "bulk",
+		store: store, spool: t.TempDir(), out: &bytes.Buffer{}, del: true,
+	}
+	err := m.moveVersion(ctx, fbEntry(t, ctx, store), 0)
+	if err == nil {
+		t.Fatal("the move committed a repository holding a package whose bytes changed in transit")
+	}
+	if !strings.Contains(err.Error(), "changed in transit") || !strings.Contains(err.Error(), corrupt) {
+		t.Errorf("the refusal does not name the object and what happened to it: %v", err)
+	}
+	if got := recordedStorage(t, store, manifest.TypeFreeBSD, fbRepo, fbABI); got != "" {
+		t.Errorf("recorded storage = %q, want the source: nothing was committed", got)
+	}
+	// --delete-source runs only after the commit, so the good copy is still
+	// there to move again once the backend is fixed.
+	if info, err := src.Head(ctx, corrupt); err != nil || !info.Exists {
+		t.Error("the refusal deleted the source copy that was still correct")
+	}
+}
+
 // An entry marked generated with nothing uploaded is refused by name. The
 // mirror's message here sends an operator to `bodega build upload`, which is
 // the right instruction for both, but only after saying which of the two

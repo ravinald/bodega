@@ -413,7 +413,7 @@ func TestPaneRereadsTheKeyOnRefresh(t *testing.T) {
 		t.Fatal("no key installed but the pane reports signed")
 	}
 	writeKeyAt(t, filepath.Join(dir, aptsign.KeyFileName), 0o600)
-	d.refreshAptSigning()
+	d.refreshSigningKeys()
 	if !d.aptSigned {
 		t.Error("a key generated while the pane was open stayed invisible")
 	}

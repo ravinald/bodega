@@ -306,7 +306,7 @@ func (m *mover) moveVersion(ctx context.Context, pm *manifest.PackageManifest, i
 		}
 
 		fmt.Fprintf(m.out, "  %s: %s -> %s (%s)\n", label, srcName, m.dstName, key)
-		size, err := m.copyObject(ctx, src, key)
+		size, _, err := m.copyObject(ctx, src, key)
 		if err != nil {
 			return fmt.Errorf("%s: %w", label, err)
 		}
@@ -356,7 +356,7 @@ func (m *mover) commit(ctx context.Context, pm *manifest.PackageManifest, i int,
 	return nil
 }
 
-func (m *mover) copyObject(ctx context.Context, src storage.ObjectStore, key string) (int64, error) {
+func (m *mover) copyObject(ctx context.Context, src storage.ObjectStore, key string) (int64, string, error) {
 	return copyObject(ctx, src, m.dst, key, key, m.spool)
 }
 
@@ -364,9 +364,35 @@ func (m *mover) verify(ctx context.Context, key string, spooled int64, ve manife
 	return verifyCopy(ctx, m.dst, m.dstName, key, spooled, ve, primary)
 }
 
+// verifyBytes re-reads the object at the destination and checks it against the
+// sha256 of what was copied out of the source.
+//
+// verifyCopy asks whether the write landed and, for the one object the manifest
+// describes, whether it still matches what was recorded. This asks the question
+// neither of those covers: whether the bytes that arrived are the bytes that
+// left, for an object nothing anywhere records a digest for. A length-preserving
+// fault passes a size check, and a repository whose integrity is re-derived
+// after the move has nothing later that would notice.
+func (m *mover) verifyBytes(ctx context.Context, key, want string) error {
+	got, err := digestObject(ctx, m.dst, key, "sha256")
+	if err != nil {
+		return fmt.Errorf("verify the bytes of %s on %q: %w", key, m.dstName, err)
+	}
+	if !strings.EqualFold(got, want) {
+		return fmt.Errorf("verify the bytes of %s on %q: sha256 %s at the destination, %s at the source, so the copy changed in transit",
+			key, m.dstName, got, want)
+	}
+	return nil
+}
+
 // copyObject streams one object from src to dst through a temp file and
-// returns the spooled size. srcKey and dstKey differ when the copy repairs a
-// key rather than moving a backend.
+// returns the spooled size and the sha256 of what it read. srcKey and dstKey
+// differ when the copy repairs a key rather than moving a backend.
+//
+// The digest is taken on the way past rather than by a second read, so a
+// caller that has no recorded checksum to compare against still has something
+// to compare the destination with. A caller that does not need it discards it;
+// hashing a stream already being written costs nothing next to the copy.
 //
 // The spool is spool_dir, defaulting to {build_root}/tmp, rather than $TMPDIR:
 // build_root is the volume sized for artifacts, and a multi-gigabyte bundle
@@ -375,13 +401,13 @@ func (m *mover) verify(ctx context.Context, key string, spooled int64, ve manife
 // moves this one with it. ObjectStore has no streaming Put — only Put([]byte) and
 // PutFile — and adding a tenth interface method would mean touching both
 // implementations and every mock, so the file on disk is what bridges them.
-func copyObject(ctx context.Context, src, dst storage.ObjectStore, srcKey, dstKey, spool string) (int64, error) {
+func copyObject(ctx context.Context, src, dst storage.ObjectStore, srcKey, dstKey, spool string) (int64, string, error) {
 	if err := os.MkdirAll(spool, 0o755); err != nil {
-		return 0, fmt.Errorf("create spool dir %s: %w", spool, err)
+		return 0, "", fmt.Errorf("create spool dir %s: %w", spool, err)
 	}
 	f, err := os.CreateTemp(spool, "move-*.part")
 	if err != nil {
-		return 0, fmt.Errorf("create spool file: %w", err)
+		return 0, "", fmt.Errorf("create spool file: %w", err)
 	}
 	spoolPath := f.Name()
 	defer func() { _ = os.Remove(spoolPath) }()
@@ -389,26 +415,27 @@ func copyObject(ctx context.Context, src, dst storage.ObjectStore, srcKey, dstKe
 	stream, err := src.GetStream(ctx, srcKey)
 	if err != nil {
 		_ = f.Close()
-		return 0, fmt.Errorf("read %s from source: %w", srcKey, err)
+		return 0, "", fmt.Errorf("read %s from source: %w", srcKey, err)
 	}
 	if stream == nil {
 		_ = f.Close()
-		return 0, fmt.Errorf("read %s from source: object vanished between head and get", srcKey)
+		return 0, "", fmt.Errorf("read %s from source: object vanished between head and get", srcKey)
 	}
-	size, copyErr := io.Copy(f, stream.Body)
+	sum := sha256.New()
+	size, copyErr := io.Copy(io.MultiWriter(f, sum), stream.Body)
 	_ = stream.Body.Close()
 	closeErr := f.Close()
 	if copyErr != nil {
-		return 0, fmt.Errorf("spool %s: %w", srcKey, copyErr)
+		return 0, "", fmt.Errorf("spool %s: %w", srcKey, copyErr)
 	}
 	if closeErr != nil {
-		return 0, fmt.Errorf("close spool for %s: %w", srcKey, closeErr)
+		return 0, "", fmt.Errorf("close spool for %s: %w", srcKey, closeErr)
 	}
 
 	if err := dst.PutFile(ctx, spoolPath, dstKey); err != nil {
-		return 0, fmt.Errorf("write %s to %q: %w", dstKey, dst.Label(), err)
+		return 0, "", fmt.Errorf("write %s to %q: %w", dstKey, dst.Label(), err)
 	}
-	return size, nil
+	return size, hex.EncodeToString(sum.Sum(nil)), nil
 }
 
 // verifyCopy re-reads the object at the destination. Checking the spooled

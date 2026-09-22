@@ -97,12 +97,15 @@ func (m *mover) moveFreeBSDRepo(ctx context.Context, pm *manifest.PackageManifes
 				label, srcName, rel, m.dstName, m.dstName, srcName, pm.Name)
 		}
 		fmt.Fprintf(m.out, "  %s: %s -> %s (%s)\n", label, srcName, m.dstName, key)
-		size, err := m.copyObject(ctx, src, key)
+		size, _, err := m.copyObject(ctx, src, key)
 		if err != nil {
 			return fmt.Errorf("%s: %w", label, err)
 		}
 		// Never the primary: the manifest's size and digest describe the
 		// catalogue, and pinFreeBSDRoots has already checked it against them.
+		// The packages need no digest here either: the archives being
+		// published name a sum for every one of them, so a copy that changed
+		// in transit is refused by the client that downloads it.
 		if err := m.verify(ctx, key, size, ve, false); err != nil {
 			return fmt.Errorf("%s: %w", label, err)
 		}
@@ -336,7 +339,7 @@ func (m *mover) moveFreeBSDGenerated(ctx context.Context, pm *manifest.PackageMa
 				label, key, srcName, srcName)
 		}
 		fmt.Fprintf(m.out, "  %s: %s -> %s (%s)\n", label, srcName, m.dstName, key)
-		size, err := m.copyObject(ctx, src, key)
+		size, sum, err := m.copyObject(ctx, src, key)
 		if err != nil {
 			return fmt.Errorf("%s: %w", label, err)
 		}
@@ -345,6 +348,18 @@ func (m *mover) moveFreeBSDGenerated(ctx context.Context, pm *manifest.PackageMa
 		// for them to describe.
 		if err := m.verify(ctx, key, size, ve, false); err != nil {
 			return fmt.Errorf("%s: %w", label, err)
+		}
+		// And then the bytes, which is the check a mirror does not need and
+		// this cannot do without. A mirrored package is named by a published
+		// archive carrying its sum, so a copy that changed in transit is
+		// refused by the client that downloads it. A generated catalogue
+		// computes every sum from whatever is in the store when it builds, so
+		// the same fault here is written into the catalogue as the truth: pkg
+		// downloads the corrupted package, checks it against the sum taken
+		// from the corrupted package, and installs it. With --delete-source
+		// the copy that was right is gone by then.
+		if err := m.verifyBytes(ctx, key, sum); err != nil {
+			return fmt.Errorf("%s: %w. Nothing was committed and the manifest still points at %q", label, err, srcName)
 		}
 		moved = append(moved, key)
 	}
