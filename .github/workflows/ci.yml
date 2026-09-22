@@ -50,7 +50,10 @@ jobs:
         with:
           go-version-file: go.mod
           check-latest: true
-      - run: go install golang.org/x/tools/cmd/goimports@latest
+      # Pinned for the reason shfmt is pinned in `harness`: goimports changes
+      # its grouping between releases, so an unpinned install fails `make
+      # fmt-check` on a tool bump nobody made.
+      - run: go install golang.org/x/tools/cmd/goimports@v0.50.0
       - run: make fmt-check
 
   tidy:
@@ -106,8 +109,11 @@ jobs:
           go-version-file: go.mod
           check-latest: true
       - name: govulncheck
+        # Pinned so a failing run names an analyzer somebody can reproduce. The
+        # vulnerability data is fetched at run time either way, so this holds
+        # the tool still, not what it knows.
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
           govulncheck ./...
 
   build:

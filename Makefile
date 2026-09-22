@@ -248,7 +248,7 @@ fmt-check:
 	fi
 	@if ! command -v goimports >/dev/null 2>&1; then \
 		echo "goimports is not on PATH; CI runs it, so skipping here would make the gate weaker than the merge."; \
-		echo "install it: go install golang.org/x/tools/cmd/goimports@latest"; \
+		echo "install it: go install golang.org/x/tools/cmd/goimports@v0.50.0"; \
 		exit 1; \
 	fi
 	@out=$$(goimports -l .); \
