@@ -11,8 +11,11 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/ravinald/bodega/internal/aptsources"
+	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/pins"
+	"github.com/ravinald/bodega/internal/pkgrepos"
 )
 
 // specPathsNotDocumented lists routes the OpenAPI document deliberately does
@@ -207,63 +210,185 @@ func assertSameStrings(t *testing.T, what, wantLabel string, got, want []string)
 // reads first — it is what separates a codename bodega generates from one it
 // proxies.
 //
-// The table below is the coverage, and nothing derives it: a response struct
-// absent from it is one no test compares against the document, however
-// complete the rest of this file looks. Add the row when you add the struct.
-// It holds every type GET /api/v1/status can emit, transitively; the other
-// endpoints' schemas are not covered yet.
+// schemaStructs is the coverage, and TestOpenAPISchemaTableCoversTheDocument
+// holds it to the document: a component schema with no row here and no reason
+// in schemasWithoutStruct fails the gate, so a schema cannot be added without
+// naming what it documents.
+var schemaStructs = map[string]any{
+	"StatusResponse":     statusResponse{},
+	"SpoolStats":         spoolStats{},
+	"BackendEntryStatus": backendEntryStatus{},
+	"AptStatus":          aptStatus{},
+	"AptUnservedEntry":   aptUnservedEntry{},
+	"AptSources":         aptsources.Sources{},
+	"FreeBSDStatus":      freebsdStatus{},
+	"FreeBSDRepo":        pkgrepos.Repo{},
+	"ConfigResponse":     configResponse{},
+	"ImportResponse":     ImportResponse{},
+	"ImportResult":       ImportResult{},
+	"PackageManifest":    manifest.PackageManifest{},
+	"VersionEntry":       manifest.VersionEntry{},
+	"BuildEnv":           manifest.BuildEnv{},
+	"Dependency":         manifest.Dependency{},
+	"Checksum":           manifest.Checksum{},
+	"PolicyRule":         audit.PolicyInfo{},
+	"AuditEvent":         audit.StoredEvent{},
+	"TokenInfo":          audit.TokenInfo{},
+	"ProfilePin":         pins.Pin{},
+	"ProfilePinOSV":      pins.OSVState{},
+}
+
+var schemasWithoutStruct = map[string]string{
+	"Error":            "written as a map literal at each call site; no type carries it",
+	"PackagesResponse": "a map keyed by package type, held to manifest.AllTypes by TestOpenAPITypeListsMatchAllTypes",
+}
+
+func TestOpenAPISchemaTableCoversTheDocument(t *testing.T) {
+	doc := loadSpec(t)
+	for name := range doc.Components.Schemas {
+		_, row := schemaStructs[name]
+		_, exempt := schemasWithoutStruct[name]
+		switch {
+		case row && exempt:
+			t.Errorf("schema %s is in both schemaStructs and schemasWithoutStruct; keep one", name)
+		case !row && !exempt:
+			t.Errorf("schema %s documents no struct in schemaStructs; add the row, or a reason to schemasWithoutStruct", name)
+		}
+	}
+	for name := range schemaStructs {
+		if _, ok := doc.Components.Schemas[name]; !ok {
+			t.Errorf("schemaStructs names %s, which the document does not define", name)
+		}
+	}
+	for name := range schemasWithoutStruct {
+		if _, ok := doc.Components.Schemas[name]; !ok {
+			t.Errorf("schemasWithoutStruct names %s, which the document does not define", name)
+		}
+	}
+}
+
+// Property names alone pass a table row mapped to the wrong struct, and a
+// $ref pointing at a schema documenting some other type. So each property
+// that references a component is also held to the Go field carrying it: the
+// field's element type must be the one schemaStructs names for that schema.
 func TestOpenAPISchemasMatchResponseStructs(t *testing.T) {
 	doc := loadSpec(t)
 
-	for _, c := range []struct {
-		schema string
-		value  any
-	}{
-		{"StatusResponse", statusResponse{}},
-		{"SpoolStats", spoolStats{}},
-		{"BackendEntryStatus", backendEntryStatus{}},
-		{"AptStatus", aptStatus{}},
-		{"AptUnservedEntry", aptUnservedEntry{}},
-		{"AptSources", aptsources.Sources{}},
-	} {
-		props := doc.Components.Schemas[c.schema].Properties
+	documented := make(map[reflect.Type]string, len(schemaStructs))
+	for name, v := range schemaStructs {
+		documented[reflect.TypeOf(v)] = name
+	}
+
+	for schema, v := range schemaStructs {
+		props := doc.Components.Schemas[schema].Properties
 		if len(props) == 0 {
-			t.Errorf("schema %s has no properties; the spec moved and this test did not", c.schema)
+			t.Errorf("schema %s has no properties; the spec moved and this test did not", schema)
 			continue
 		}
+		rt := reflect.TypeOf(v)
+		fields := jsonFields(t, rt)
+
 		declared := make([]string, 0, len(props))
 		for k := range props {
 			declared = append(declared, k)
 		}
-		assertSameStrings(t, c.schema+" properties", reflect.TypeOf(c.value).Name()+" JSON fields",
-			declared, jsonFields(t, c.value))
+		wire := make([]string, 0, len(fields))
+		for k := range fields {
+			wire = append(wire, k)
+		}
+		assertSameStrings(t, schema+" properties", rt.String()+" JSON fields", declared, wire)
+
+		for prop, ft := range fields {
+			spec, ok := props[prop]
+			if !ok {
+				continue
+			}
+			elem := elemType(ft)
+			ref := schemaRef(spec)
+			switch want, isDoc := documented[elem]; {
+			case ref != "" && reflect.TypeOf(schemaStructs[ref]) != elem:
+				t.Errorf("%s.%s references %s, but %s carries %s", schema, prop, ref, rt, ft)
+			case ref == "" && isDoc:
+				t.Errorf("%s.%s is inline, but %s carries %s, which schema %s documents; use a $ref", schema, prop, rt, ft, want)
+			}
+		}
 	}
 }
 
-// jsonFields is the wire shape of v: the json tag of every exported field,
-// minus its options, skipping `json:"-"`. An embedded struct is a fatal error
-// rather than a skip, because flattening one silently would report a schema
-// that matches while the response carries fields nobody declared.
-func jsonFields(t *testing.T, v any) []string {
+// schemaRef names the component a property references directly, through
+// items or additionalProperties, or through a one-element allOf (the form
+// OpenAPI 3.0 needs to put a description beside a $ref). Empty when inline.
+func schemaRef(prop any) string {
+	m, _ := prop.(map[string]any)
+	if m == nil {
+		return ""
+	}
+	if ref, ok := m["$ref"].(string); ok {
+		return strings.TrimPrefix(ref, "#/components/schemas/")
+	}
+	for _, k := range []string{"items", "additionalProperties"} {
+		if ref := schemaRef(m[k]); ref != "" {
+			return ref
+		}
+	}
+	if all, ok := m["allOf"].([]any); ok && len(all) == 1 {
+		return schemaRef(all[0])
+	}
+	return ""
+}
+
+// elemType strips the pointers, slices and maps between a field and the
+// struct it carries, which is the type a $ref under items or
+// additionalProperties documents.
+func elemType(t reflect.Type) reflect.Type {
+	for {
+		switch t.Kind() {
+		case reflect.Pointer, reflect.Slice, reflect.Array, reflect.Map:
+			t = t.Elem()
+		default:
+			return t
+		}
+	}
+}
+
+// jsonFields is the wire shape of rt: the json name of every exported field,
+// minus its options, skipping `json:"-"`, with the type each carries. An
+// untagged embedded struct is walked, because encoding/json promotes its
+// fields to the top level. Two fields answering to one name is fatal rather
+// than resolved: encoding/json settles it by depth and tag rules this does not
+// model, and guessing would report a shape the server does not emit.
+func jsonFields(t *testing.T, rt reflect.Type) map[string]reflect.Type {
 	t.Helper()
-	rt := reflect.TypeOf(v)
-	out := make([]string, 0, rt.NumField())
+	out := make(map[string]reflect.Type, rt.NumField())
+	add := func(name string, ft reflect.Type) {
+		if _, dup := out[name]; dup {
+			t.Fatalf("%s emits %q twice; jsonFields does not resolve name collisions", rt, name)
+		}
+		out[name] = ft
+	}
 	for i := 0; i < rt.NumField(); i++ {
 		f := rt.Field(i)
-		if f.Anonymous {
-			t.Fatalf("%s embeds %s; jsonFields does not walk embedded structs", rt.Name(), f.Type)
+		name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+		if name == "-" {
+			continue
+		}
+		embedded := f.Type
+		if embedded.Kind() == reflect.Pointer {
+			embedded = embedded.Elem()
+		}
+		if f.Anonymous && name == "" && embedded.Kind() == reflect.Struct {
+			for k, ft := range jsonFields(t, embedded) {
+				add(k, ft)
+			}
+			continue
 		}
 		if !f.IsExported() {
 			continue
 		}
-		name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
-		switch name {
-		case "-":
-			continue
-		case "":
+		if name == "" {
 			name = f.Name
 		}
-		out = append(out, name)
+		add(name, f.Type)
 	}
 	return out
 }
