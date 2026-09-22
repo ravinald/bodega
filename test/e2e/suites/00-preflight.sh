@@ -115,7 +115,8 @@ done
 # establishes with /etc/hosts rather than something preflight can assume. What
 # preflight needs is the addresses, and this workstation is what resolves them.
 E2E_HOST=local
-for pair in "server:$E2E_SERVER_HOST" "client:$E2E_CLIENT_HOST"; do
+for pair in "server:$E2E_SERVER_HOST" "client:$E2E_CLIENT_HOST" \
+	"freebsd-server:$E2E_FREEBSD_SERVER_HOST" "freebsd-client:$E2E_FREEBSD_CLIENT_HOST"; do
 	alias="${pair%%:*}"
 	name="${pair#*:}"
 	addr="$(dscacheutil -q host -a name "$name" 2>/dev/null | awk '/^ip_address:/ {print $2; exit}')"

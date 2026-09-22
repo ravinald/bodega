@@ -61,18 +61,20 @@ E2E_ALLOWED_HOSTS="${E2E_ALLOWED_HOSTS:-}"
 
 assert_host_allowlist() {
 	local h
-	if [ -z "$E2E_SERVER_HOST" ] || [ -z "$E2E_CLIENT_HOST" ]; then
-		die "E2E_SERVER_HOST and E2E_CLIENT_HOST are unset. Copy test/e2e/hosts.env.example to test/e2e/hosts.env and name your dev guests." 3
-	fi
+	for h in $E2E_HOST_ALIASES; do
+		if [ -z "$(e2e_host_for "$h")" ]; then
+			die "no host is configured for the $h alias. Copy test/e2e/hosts.env.example to test/e2e/hosts.env and name all four dev guests." 3
+		fi
+	done
 	if [ -z "$E2E_ALLOWED_HOSTS" ]; then
-		die "E2E_ALLOWED_HOSTS is unset, so nothing would stop a destructive suite. Set it in test/e2e/hosts.env to the same two hosts." 3
+		die "E2E_ALLOWED_HOSTS is unset, so nothing would stop a destructive suite. Set it in test/e2e/hosts.env to the same four hosts." 3
 	fi
-	for h in "$E2E_SERVER_HOST" "$E2E_CLIENT_HOST"; do
+	while IFS= read -r h; do
 		case " $E2E_ALLOWED_HOSTS " in
 		*" $h "*) ;;
 		*) die "refusing to run: $h is not a dev guest. Edit E2E_ALLOWED_HOSTS deliberately, never to get past this." 3 ;;
 		esac
-	done
+	done < <(e2e_all_hosts)
 }
 
 assert_tooling() {
@@ -215,22 +217,25 @@ mkdir -p "$E2E_LOG_DIR" "$E2E_ARTIFACT_DIR"
 
 cleanup() {
 	local h opts=()
-	for h in "$E2E_SERVER_HOST" "$E2E_CLIENT_HOST"; do
+	while IFS= read -r h; do
+		[ -n "$h" ] || continue
 		opts=()
 		while IFS= read -r o; do opts+=("$o"); done < <(e2e_ssh_opts "$h")
 		ssh -O exit "${opts[@]}" >/dev/null 2>&1 || true
-	done
+	done < <(e2e_all_hosts)
 	rm -rf "$E2E_SSH_CTL_DIR"
 }
 trap cleanup EXIT
 
+export E2E_FREEBSD_SERVER_HOST E2E_FREEBSD_CLIENT_HOST E2E_HOST_ALIASES
 export E2E_DIR REPO_ROOT E2E_RUN_ID E2E_RUN_DIR E2E_LOG_DIR E2E_FINDINGS
 export E2E_COMMIT E2E_SSH_CTL_DIR E2E_KNOWN_FILE E2E_ARTIFACT_DIR
 export E2E_DRY_RUN E2E_DRY_PLAN
 
 [ "$E2E_DRY_RUN" = yes ] && printf 'DRY RUN — no guest is contacted and nothing is measured\n'
 printf 'bodega e2e  run=%s  commit=%s\n' "$E2E_RUN_ID" "$E2E_COMMIT"
-printf 'server=%s  client=%s\n\n' "$E2E_SERVER_HOST" "$E2E_CLIENT_HOST"
+printf 'server=%s  client=%s\n' "$E2E_SERVER_HOST" "$E2E_CLIENT_HOST"
+printf 'freebsd-server=%s  freebsd-client=%s\n\n' "$E2E_FREEBSD_SERVER_HOST" "$E2E_FREEBSD_CLIENT_HOST"
 
 # Defaults for a filtered run that skips 10-ship, which is what normally sets
 # these. A suite reading an empty base URL builds requests against "/healthz"
