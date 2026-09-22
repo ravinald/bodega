@@ -996,6 +996,13 @@ components:
       properties:
         healthy:
           type: boolean
+        version:
+          type: string
+          description: >-
+            Build stamp of the running server, present only for a caller inside
+            `admin_permit_cidr`. A package repository answers a whole fleet, so
+            its build number is a public statement of which advisories apply to
+            it.
         entry_count:
           type: object
           additionalProperties:
@@ -1004,6 +1011,8 @@ components:
           $ref: "#/components/schemas/AptStatus"
         freebsd:
           $ref: "#/components/schemas/FreeBSDStatus"
+        spool:
+          $ref: "#/components/schemas/SpoolStats"
         backend_entries:
           type: array
           description: >-
@@ -1018,37 +1027,105 @@ components:
             install keeps on disk, and neither is emitted now: read `key` and
             `present`, and `backend` for which store answered.
           items:
-            type: object
-            required: [type, name, key, present, backend]
-            properties:
-              type:
-                type: string
-                description: Package type the probe covers.
-              name:
-                type: string
-                description: Probe name within that type, e.g. `apt-pool`.
-              key:
-                type: string
-                description: Object key or prefix that was probed.
-              present:
-                type: boolean
-                description: Whether the backend holds anything under `key`.
-              frozen:
-                type: boolean
-              backend:
-                type: string
-                description: >-
-                  The configured backend name this row reports on. Always
-                  present; `default` is the backend described by the global
-                  storage_backend / storage_path / bucket / region keys.
-              error:
-                type: string
-                description: >-
-                  The backend's failure for this row. A probe that fails is
-                  reported here rather than dropping the row, and sets
-                  `healthy` to false.
+            $ref: "#/components/schemas/BackendEntryStatus"
         error:
           type: string
+
+    SpoolStats:
+      type: object
+      description: >-
+        The live gauge on the disk the proxy spends copying upstream artifacts.
+        An operator whose fetches start refusing reads which bound fired here,
+        and how close the spool is to it.
+      required:
+        - in_flight
+        - used_bytes
+        - peak_bytes
+        - budget_bytes
+        - max_artifact_bytes
+        - refused_too_large
+        - refused_budget
+      properties:
+        dir:
+          type: string
+          description: >-
+            Directory the spool files are written to, present only for a caller
+            inside `admin_permit_cidr`. A server filesystem path is a fact about
+            the host rather than about what it serves. The counters below carry
+            no such gate: a client acting on a 503 has to be able to see why it
+            got one.
+        in_flight:
+          type: integer
+          description: Fetches holding a reservation right now.
+        used_bytes:
+          type: integer
+          format: int64
+          description: Bytes those fetches hold between them.
+        peak_bytes:
+          type: integer
+          format: int64
+          description: >-
+            High-water mark of `used_bytes` since the process started, which is
+            what sizes the volume.
+        budget_bytes:
+          type: integer
+          format: int64
+          description: >-
+            The `spool_max_total_bytes` in force. `0` removes the shared budget.
+        max_artifact_bytes:
+          type: integer
+          format: int64
+          description: >-
+            The `spool_max_artifact_bytes` in force. `0` removes the
+            per-artifact ceiling.
+        refused_too_large:
+          type: integer
+          format: int64
+          description: >-
+            Fetches refused since the process started for declaring more than
+            `max_artifact_bytes`. Climbing means the ceiling sits below what
+            this archive publishes.
+        refused_budget:
+          type: integer
+          format: int64
+          description: >-
+            Fetches refused since the process started for arriving while
+            `budget_bytes` was already held. Climbing while `peak_bytes` sits at
+            the budget means the host carries more concurrent fetches than its
+            spool was sized for. The two counters are apart because they call
+            for opposite fixes.
+
+    BackendEntryStatus:
+      type: object
+      description: >-
+        One storage probe row, reported against the backend that answered it.
+      required: [type, name, key, present, backend]
+      properties:
+        type:
+          type: string
+          description: Package type the probe covers.
+        name:
+          type: string
+          description: Probe name within that type, e.g. `apt-pool`.
+        key:
+          type: string
+          description: Object key or prefix that was probed.
+        present:
+          type: boolean
+          description: Whether the backend holds anything under `key`.
+        frozen:
+          type: boolean
+        backend:
+          type: string
+          description: >-
+            The configured backend name this row reports on. Always present;
+            `default` is the backend described by the global storage_backend /
+            storage_path / bucket / region keys.
+        error:
+          type: string
+          description: >-
+            The backend's failure for this row. A probe that fails is reported
+            here rather than dropping the row, and sets `healthy` to false.
 
     AptStatus:
       type: object
@@ -1073,6 +1150,31 @@ components:
           description: Suites served under /apt/dists/.
           items:
             type: string
+        mirrored:
+          type: array
+          description: >-
+            Codenames proxied from an upstream archive rather than generated
+            here, sorted. Upstream's signature authenticates these, so a client
+            reading this tells the two kinds apart without parsing a stanza.
+          items:
+            type: string
+        unserved:
+          type: array
+          description: >-
+            Manifest entries naming no suite this server answers for, capped at
+            ten. Read the total off `unserved_count` rather than this array's
+            length: a truncated array on its own reads as "these are all of
+            them". Reported rather than refused: staging an entry before adding
+            its suite is a legitimate order, and with nothing reporting it the
+            package disappears behind apt's "Unable to locate package".
+          items:
+            $ref: "#/components/schemas/AptUnservedEntry"
+        unserved_count:
+          type: integer
+          description: >-
+            Every unserved entry, counted. Exceeds the length of `unserved`
+            once that array hits its cap of ten. Absent when every entry is
+            served.
         public_url:
           type: string
           description: >-
@@ -1084,12 +1186,57 @@ components:
           description: One rendered client configuration per served suite.
           items:
             $ref: "#/components/schemas/AptSources"
+        filtered:
+          type: array
+          description: >-
+            Codenames generated from a profile's view of a mirrored codename,
+            sorted. Clients treat these as generated suites — bodega's key signs
+            them and Signed-By: goes on the line — and they are separate from
+            `suites` because no apt_suites entry produced them.
+          items:
+            type: string
+        profile:
+          type: string
+          description: >-
+            Profile bound to the request that asked, when one scopes apt for it.
+            Absent otherwise.
+        host:
+          allOf:
+            - $ref: "#/components/schemas/AptSources"
+          description: >-
+            The one stanza the requesting host should install. Absent when the
+            answer is the operator's, meaning no profile scopes apt and this
+            instance serves more than one codename: a guess there points a host
+            at the wrong suite with nothing reporting it.
+
+    AptUnservedEntry:
+      type: object
+      description: >-
+        One manifest entry whose suites this server does not answer for.
+      required: [name, version, suites]
+      properties:
+        name:
+          type: string
+          description: Package name.
+        version:
+          type: string
+          description: Package version.
+        suites:
+          type: array
+          description: Suites the entry names, none of which is served.
+          items:
+            type: string
 
     AptSources:
       type: object
       properties:
         signed:
           type: boolean
+        mirrored:
+          type: boolean
+          description: >-
+            This codename is proxied from an upstream archive, so upstream's
+            signature authenticates it and `signed` says nothing about it.
         suite:
           type: string
         uri:

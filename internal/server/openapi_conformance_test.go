@@ -3,12 +3,14 @@ package server
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 )
@@ -184,11 +186,84 @@ func skipReason(path string) string {
 
 func assertSameSet(t *testing.T, what string, got, want []string) {
 	t.Helper()
+	assertSameStrings(t, what, "manifest.AllTypes", got, want)
+}
+
+func assertSameStrings(t *testing.T, what, wantLabel string, got, want []string) {
+	t.Helper()
 	g := append([]string(nil), got...)
 	w := append([]string(nil), want...)
 	sort.Strings(g)
 	sort.Strings(w)
 	if strings.Join(g, ",") != strings.Join(w, ",") {
-		t.Errorf("%s = [%s], manifest.AllTypes = [%s]", what, strings.Join(g, ", "), strings.Join(w, ", "))
+		t.Errorf("%s = [%s], %s = [%s]", what, strings.Join(g, ", "), wantLabel, strings.Join(w, ", "))
 	}
+}
+
+// A response schema drifts from the struct it documents in silence: the server
+// keeps answering with every field, and only a client generated from the
+// document is missing them. Six of aptStatus's twelve keys went undeclared
+// because nothing compared the two, and `mirrored` is the one an operator
+// reads first — it is what separates a codename bodega generates from one it
+// proxies.
+//
+// The table below is the coverage, and nothing derives it: a response struct
+// absent from it is one no test compares against the document, however
+// complete the rest of this file looks. Add the row when you add the struct.
+// It holds every type GET /api/v1/status can emit, transitively; the other
+// endpoints' schemas are not covered yet.
+func TestOpenAPISchemasMatchResponseStructs(t *testing.T) {
+	doc := loadSpec(t)
+
+	for _, c := range []struct {
+		schema string
+		value  any
+	}{
+		{"StatusResponse", statusResponse{}},
+		{"SpoolStats", spoolStats{}},
+		{"BackendEntryStatus", backendEntryStatus{}},
+		{"AptStatus", aptStatus{}},
+		{"AptUnservedEntry", aptUnservedEntry{}},
+		{"AptSources", aptsources.Sources{}},
+	} {
+		props := doc.Components.Schemas[c.schema].Properties
+		if len(props) == 0 {
+			t.Errorf("schema %s has no properties; the spec moved and this test did not", c.schema)
+			continue
+		}
+		declared := make([]string, 0, len(props))
+		for k := range props {
+			declared = append(declared, k)
+		}
+		assertSameStrings(t, c.schema+" properties", reflect.TypeOf(c.value).Name()+" JSON fields",
+			declared, jsonFields(t, c.value))
+	}
+}
+
+// jsonFields is the wire shape of v: the json tag of every exported field,
+// minus its options, skipping `json:"-"`. An embedded struct is a fatal error
+// rather than a skip, because flattening one silently would report a schema
+// that matches while the response carries fields nobody declared.
+func jsonFields(t *testing.T, v any) []string {
+	t.Helper()
+	rt := reflect.TypeOf(v)
+	out := make([]string, 0, rt.NumField())
+	for i := 0; i < rt.NumField(); i++ {
+		f := rt.Field(i)
+		if f.Anonymous {
+			t.Fatalf("%s embeds %s; jsonFields does not walk embedded structs", rt.Name(), f.Type)
+		}
+		if !f.IsExported() {
+			continue
+		}
+		name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+		switch name {
+		case "-":
+			continue
+		case "":
+			name = f.Name
+		}
+		out = append(out, name)
+	}
+	return out
 }
