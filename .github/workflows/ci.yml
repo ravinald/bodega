@@ -139,6 +139,31 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
           govulncheck ./...
 
+  # FreeBSD is compiled here and nowhere else. #12 dropped the linux and darwin
+  # loop because GoReleaser builds those pairs at tag time; .goreleaser.yaml's
+  # goos list does not carry freebsd, so nothing else ever compiles it, and
+  # internal/storage sat behind a `linux || darwin` constraint through a
+  # release with `bodega doctor --write-pkg-repo` written for a pkg host.
+  #
+  # It carries no needs: list. `make ci-drift` reads every needs: in this file
+  # against CI_GATE_JOBS, so a second one would report the whole gate as drift.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: Cross-compile
+        env:
+          CGO_ENABLED: 0
+        run: |
+          for target in freebsd/amd64 freebsd/arm64; do
+            GOOS=${target%%/*} GOARCH=${target##*/} go build ./... || exit 1
+            echo "built $target"
+          done
+
   # gate exists so `make ci-drift` has a needs: list to read: it compares that
   # list against CI_GATE_JOBS and maps each entry onto a leg of `make check`.
   # It runs nothing. The jobs it names are what branch protection requires.

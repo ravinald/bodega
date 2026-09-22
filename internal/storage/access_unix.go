@@ -1,4 +1,4 @@
-//go:build linux || darwin
+//go:build linux || darwin || freebsd
 
 package storage
 
@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 
 	"golang.org/x/sys/unix"
 )
@@ -165,40 +164,6 @@ func (a access) restoreXattrs(fd int, key string) error {
 	return nil
 }
 
-// listXattr returns the attribute names on fd. A filesystem that holds no
-// attributes at all reports that as an error rather than as an empty list, and
-// an object with nothing to preserve is not a failure to preserve it.
-func listXattr(fd int) ([]string, error) {
-	for range 10 {
-		size, err := unix.Flistxattr(fd, nil)
-		if unsupportedXattr(err) {
-			return nil, nil
-		}
-		if err != nil {
-			return nil, err
-		}
-		if size == 0 {
-			return nil, nil
-		}
-		buf := make([]byte, size)
-		n, err := unix.Flistxattr(fd, buf)
-		if errors.Is(err, unix.ERANGE) {
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		var names []string
-		for _, name := range strings.Split(string(buf[:n]), "\x00") {
-			if name != "" {
-				names = append(names, name)
-			}
-		}
-		return names, nil
-	}
-	return nil, fmt.Errorf("list extended attributes: the set kept changing under the read")
-}
-
 func getXattr(fd int, name string) ([]byte, error) {
 	for range 10 {
 		size, err := unix.Fgetxattr(fd, name, nil)
@@ -227,5 +192,5 @@ func unsupportedXattr(err error) bool {
 // missingXattr reports an attribute the file does not carry, which a list and
 // a read of the same file disagree about whenever another process is writing.
 func missingXattr(err error) bool {
-	return errors.Is(err, errNoAttr) || errors.Is(err, unix.ENODATA)
+	return errors.Is(err, errNoAttr)
 }
