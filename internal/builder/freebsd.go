@@ -578,18 +578,34 @@ func freeBSDSortCatalog(paths []ArtifactPath) {
 // build. One left in the tree by an entry that used to mirror is named in the
 // log rather than skipped in silence.
 //
-// A symlink resolving back inside the repository is skipped, which is the one
-// rule the walk cannot do without. poudriere publishes most of a tree twice —
-// Latest/pkg.pkg, and an ordinary name beside every hashed one — and
+// Every file the walk finds is published under exactly one name, which is the
+// one rule the walk cannot do without. poudriere publishes most of a tree
+// twice — Latest/pkg.pkg, and an ordinary name beside every hashed one — and
 // filepath.WalkDir reports a link as an entry of its own while PutFile reads
-// the bytes it points at, so following one stores the same package under two
+// the bytes it points at, so uploading both names stores one package under two
 // keys. The catalogue then carries two records with one manifestdigest, and
 // pkg refuses the whole repository rather than the duplicate: `pkg update`
 // reports the entries processed and fails on
 // "UNIQUE constraint failed: packages.manifestdigest". pkg's own repository
-// walk skips the same links for the same reason (2.8.2,
-// libpkg/pkg_repo_create.c:216). A link out of the tree is the only name
-// those bytes have here, so it is followed.
+// walk drops the extra names for the same reason (2.8.2,
+// libpkg/pkg_repo_create.c:216).
+//
+// The rule is stated over the file rather than over the link, because "skip a
+// link that resolves inside the repository" is not the same rule and gets two
+// trees wrong. A link whose target the walk does not itself publish — a
+// .txz beside it from before pkg 1.17 spelled them .pkg, a staging name, a
+// target under one of the reserved roots — is the only name those bytes have
+// here, and skipping it drops the package out of the repository with nothing
+// but a log line to say so. Two links at one file outside the tree are two
+// names for one package, and neither resolves inside anything. Grouping the
+// candidates by the file they resolve to answers all three, where a test on
+// the link answers only the tree it was written against.
+//
+// The name kept is the real file when one of the names is a real file, and
+// otherwise the first in walk order, which filepath.WalkDir makes lexical. A
+// repository whose object set did not change has to publish the same repopath
+// on the next build: the catalogue is keyed on it, and a name that moves is
+// every client refetching a package that did not change.
 func freeBSDGeneratedUploadSet(cfg *Config, name, repo string, ve manifest.VersionEntry, repoDir string) ([]ArtifactPath, error) {
 	if info, err := os.Stat(repoDir); err != nil || !info.IsDir() {
 		// Not an error: an entry created but not yet populated is the
@@ -606,7 +622,7 @@ func freeBSDGeneratedUploadSet(cfg *Config, name, repo string, ve manifest.Versi
 	if err != nil {
 		return nil, fmt.Errorf("freebsd %s@%s: resolve %s: %w", repo, ve.Version, repoDir, err)
 	}
-	var out []ArtifactPath
+	var found []freeBSDCandidate
 	err = filepath.WalkDir(repoDir, func(p string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -628,8 +644,14 @@ func freeBSDGeneratedUploadSet(cfg *Config, name, repo string, ve manifest.Versi
 			cfg.logf("  [freebsd] %s@%s: skipping %s — a generated catalogue names .pkg archives only", repo, ve.Version, rel)
 			return nil
 		}
+		link := entry.Type()&fs.ModeSymlink != 0
+		// The file these bytes live in, which is what decides whether two
+		// names are one package. A regular file is its own answer: WalkDir
+		// does not descend a directory symlink, so every component above it
+		// is a real directory and repoRoot is already resolved.
+		file := filepath.Join(repoRoot, filepath.FromSlash(rel))
 		switch {
-		case entry.Type()&fs.ModeSymlink != 0:
+		case link:
 			target, err := filepath.EvalSymlinks(p)
 			if err != nil {
 				// Dead, or a loop. Named rather than failed: a repository
@@ -639,19 +661,16 @@ func freeBSDGeneratedUploadSet(cfg *Config, name, repo string, ve manifest.Versi
 				cfg.logf("  [freebsd] %s@%s: skipping %s — it is a symlink that resolves to nothing: %v", repo, ve.Version, rel, err)
 				return nil
 			}
-			if inside, at := freeBSDInsideRepo(repoRoot, target); inside {
-				cfg.logf("  [freebsd] %s@%s: skipping %s — it is a second name for %s, which this upload already carries", repo, ve.Version, rel, at)
-				return nil
-			}
 			info, err := os.Stat(p)
 			if err != nil {
-				cfg.logf("  [freebsd] %s@%s: skipping %s — it is a symlink out of the repository that cannot be read: %v", repo, ve.Version, rel, err)
+				cfg.logf("  [freebsd] %s@%s: skipping %s — it is a symlink that cannot be read: %v", repo, ve.Version, rel, err)
 				return nil
 			}
 			if !info.Mode().IsRegular() {
 				cfg.logf("  [freebsd] %s@%s: skipping %s — it points at %s, which is not a file", repo, ve.Version, rel, target)
 				return nil
 			}
+			file = target
 		case !entry.Type().IsRegular():
 			cfg.logf("  [freebsd] %s@%s: skipping %s — it is not a file", repo, ve.Version, rel)
 			return nil
@@ -661,36 +680,76 @@ func freeBSDGeneratedUploadSet(cfg *Config, name, repo string, ve manifest.Versi
 		// bytes in the store that the next catalogue build then refuses,
 		// taking the whole repository down over one file; the walk is where
 		// the file still has a path an operator can rename.
+		//
+		// Checked before the grouping below drops a name, so a tree holding
+		// an unroutable package refuses whether or not something else names
+		// the same bytes.
 		if err := manifest.FreeBSDValidRepoPath(rel); err != nil {
 			return fmt.Errorf("%s: %w", p, err)
 		}
-		out = append(out, ArtifactPath{
-			Local:     p,
-			ObjectKey: manifest.FreeBSDKey(ve.Version, name, rel),
-			Package:   repo,
-			Version:   ve.Version,
-		})
+		found = append(found, freeBSDCandidate{rel: rel, local: p, file: file, link: link})
 		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("freebsd %s@%s: walk %s: %w", repo, ve.Version, repoDir, err)
 	}
+
+	var out []ArtifactPath
+	for _, c := range freeBSDOneNamePerFile(found) {
+		if c.alias != "" {
+			cfg.logf("  [freebsd] %s@%s: skipping %s — it is a second name for %s, which this upload already carries",
+				repo, ve.Version, c.rel, c.alias)
+			continue
+		}
+		out = append(out, ArtifactPath{
+			Local:     c.local,
+			ObjectKey: manifest.FreeBSDKey(ve.Version, name, c.rel),
+			Package:   repo,
+			Version:   ve.Version,
+		})
+	}
 	return out, nil
 }
 
-// freeBSDInsideRepo reports whether a resolved path is inside a resolved
-// repository root, and names it relative to that root when it is.
+// freeBSDCandidate is one admitted name in a build tree, and the file its bytes
+// actually live in.
 //
-// Both sides must already be resolved. A prefix test alone would call
-// /srv/repo-old a child of /srv/repo, so the answer comes from
-// filepath.Rel rather than from strings.HasPrefix.
-func freeBSDInsideRepo(root, target string) (bool, string) {
-	rel, err := filepath.Rel(root, target)
-	if err != nil {
-		return false, ""
+// alias is filled in by freeBSDOneNamePerFile: empty means this name is the one
+// published, and otherwise it names the one that was.
+type freeBSDCandidate struct {
+	rel   string
+	local string
+	file  string
+	link  bool
+	alias string
+}
+
+// freeBSDOneNamePerFile marks every candidate that is a second name for a file
+// another candidate already publishes, in the order it was given them.
+//
+// The name kept is a real file over a link, and otherwise the first in walk
+// order. Preferring the real file is what keeps a poudriere tree publishing
+// All/foo-1.0.pkg rather than Latest/foo.pkg, and keeps the repopath stable
+// against an alias appearing or disappearing; two names of equal standing fall
+// back to walk order, which is lexical and so does not move either.
+func freeBSDOneNamePerFile(found []freeBSDCandidate) []freeBSDCandidate {
+	keep := make(map[string]int, len(found))
+	for i, c := range found {
+		j, seen := keep[c.file]
+		if !seen {
+			keep[c.file] = i
+			continue
+		}
+		if found[j].link && !c.link {
+			keep[c.file] = i
+		}
 	}
-	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return false, ""
+	out := make([]freeBSDCandidate, 0, len(found))
+	for i, c := range found {
+		if j := keep[c.file]; j != i {
+			c.alias = found[j].rel
+		}
+		out = append(out, c)
 	}
-	return true, filepath.ToSlash(rel)
+	return out
 }

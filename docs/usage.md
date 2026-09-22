@@ -767,6 +767,12 @@ latest@FreeBSD:14:amd64: "bulk" already holds 1 object(s) under freebsd/FreeBSD:
 
 An upload landing while the move is copying is refused the same way, between the last copy and the manifest write. Committing would point the manifest at the destination while the packages that landed in between sit on the backend it is about to stop naming, and the catalogue is built from whichever one the manifest names.
 
+Every package is also checked by its bytes rather than by its length, which the republication above does not do and this cannot do without. A mirror publishes archives naming a `sum` for every package they carry, so a copy that arrived wrong is refused by the client that downloads it. A generated catalogue takes every `sum` from whatever is in the store when it builds, so the same fault is written into the catalogue as the truth: pkg fetches the corrupted package, checks it against the sum computed from the corrupted package, and installs it. `--delete-source` runs only after the manifest write, so the copy that was right is still there to move again.
+
+```text
+latest@FreeBSD:14:amd64: verify the bytes of freebsd/FreeBSD:14:amd64/latest/All/tool-3.1.pkg on "bulk": sha256 c1ccc03b… at the destination, 9aaef7cb… at the source, so the copy changed in transit. Nothing was committed and the manifest still points at "default"
+```
+
 #### pypi is not movable
 
 `pypi` wheels upload as one local directory to one key prefix, and the PEP 503 index is generated from a listing over that whole tree. A package placed on another backend drops out of the index that finds it, so there is no per-version object to move:
@@ -3379,7 +3385,9 @@ bodega build upload freebsd        # place the .pkg files you put in the build t
 
 Put the packages under `<build_root>/freebsd/<ABI>/<repository>/`, in whatever layout you like — `All/`, hashed, or flat at the root. The upload takes every `.pkg` beneath that directory and nothing else; `meta.conf`, `data.pkg` and `packagesite.pkg` are bodega's own names there, and a file left under one of them is skipped with a line saying so.
 
-A symlink resolving back inside the repository is skipped too. poudriere publishes most of a tree twice, `Latest/pkg.pkg` and an ordinary name beside every hashed one, and the two names are one package: uploading both stores that package under two keys. `pkg repo` skips the same links for the same reason. A link out of the tree is the only name those bytes have here, so it is followed.
+Each file in that tree uploads under one name. poudriere publishes most of a tree twice, `Latest/pkg.pkg` and an ordinary name beside every hashed one, and the two names are one package: uploading both stores that package under two keys, and the catalogue then carries two records pkg hashes alike. `pkg repo` drops the extra names for the same reason. The name kept is the real file where one of the names is a real file, and otherwise the first in lexical order, so the `repopath` a client downloads does not move when an alias appears or disappears beside the package.
+
+The rule is over the file rather than over the link, which matters in two trees. A link whose target the upload does not itself publish — a `.txz` beside it from before pkg 1.17 spelled them `.pkg`, a staging name, a target under one of the three reserved roots — is the only name those bytes have, so it uploads. And two links at one file outside the tree are two names for one package even though neither resolves inside anything, so one of them uploads.
 
 #### What a bodega signature proves
 
