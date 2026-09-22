@@ -3118,7 +3118,7 @@ What is on disk is inspected rather than counted. `git clone --mirror` creates t
 
 **Repointing `git_upstreams[ns].url` re-clones.** Every mirror records the URL its own clone used, and bodega compares it against the configured upstream before serving. A mismatch is a forge migration, a host swap or a typo correction, so the mirror is discarded and cloned from the new URL, with both URLs in a `WARN`. Budget for the transfer: repointing a namespace with fifty mirrors under it re-clones all fifty, one per first request after the change.
 
-`open` and `catalog` behave here as they do everywhere: a `catalog` namespace never clones a repository no manifest entry names, and answers 404 with a `no_manifest` discovery row instead. `bodega discover promote git <pattern> --as manifest` turns that row into the entry, after which the same clone succeeds. The allow-list runs before the clone, so a denied upstream is a 403 with nothing written to disk.
+`open` and `catalog` behave here as they do everywhere: a `catalog` namespace never clones a repository no manifest entry names, and answers 404 instead. With `discover_mode` set to `"observe"` the 404 also records a `no_manifest` discovery row, and `bodega discover promote git <pattern> --as manifest` turns that row into the entry, after which the same clone succeeds. With discovery off the 404 records nothing. The pattern is the upstream host and the first segment of its path (`github.com/freebsd/` for a namespace pointing there), not the `<org>/<repo>` the entry is named for; `bodega discover list git` prints it. The allow-list runs before the clone, so a denied upstream is a 403 with nothing written to disk.
 
 #### Refresh
 
@@ -3614,7 +3614,19 @@ fatal: expected 'packfile'
 
 The same clone from `github.com/freebsd/freebsd-ports` finished in 6m30s at 3.2 GB. A depth-1 clone straight from `git.FreeBSD.org` completed in 1m07s on the same guest, so the Handbook's own command does not meet this; only the full-history request did. The route composes the upstream as `url` plus the path after the namespace, so the clone URL is `/git/freebsd/freebsd-ports.git`.
 
-In `catalog` mode, which is the default, the repository also needs a manifest entry named `freebsd/freebsd-ports`; `bodega discover promote git freebsd/freebsd-ports --as manifest` writes it from the first refused clone.
+In `catalog` mode, which is the default, the repository also needs a manifest entry named `freebsd/freebsd-ports`, and until it has one every request answers 404. Discovery writes that entry from a refused request, but only a request that arrives while `discover_mode` is `"observe"`: with discovery off, which is the default, the 404 records nothing and there is nothing to promote. Set it in `config.json` and restart bodega before the refused request, not after.
+
+`discover promote` takes the discovery pattern, not the manifest name. A `git_upstreams` row is filed under the upstream host and the first segment of its path, `github.com/freebsd/` here, while the entry it writes is named for the request path, `freebsd/freebsd-ports`. Passing the manifest name fails with `no no_manifest observations for git "freebsd/freebsd-ports"`. The pattern covers every repository clients asked for under it, so read `discover show` first; anything else listed there is admitted by the same promote.
+
+```bash
+# discover_mode is "observe" and bodega has been restarted
+git ls-remote https://bodega-host:8080/git/freebsd/freebsd-ports.git   # 404, records a no_manifest row
+bodega discover list git                                               # PATTERN github.com/freebsd/
+bodega discover show git github.com/freebsd/
+bodega discover promote git github.com/freebsd/ --as manifest          # + git freebsd/freebsd-ports@any
+```
+
+The running server picks up the entry without a reload, so the next request starts the mirror clone; see **Prime the mirror** below for what that request sees.
 
 ```bash
 git clone --depth 1 --branch 2026Q3 https://bodega-host:8080/git/freebsd/freebsd-ports.git /usr/ports
