@@ -19,6 +19,8 @@
 . "${E2E_DIR:?}/lib/remote.sh"
 # shellcheck source=../lib/bodega.sh
 . "${E2E_DIR:?}/lib/bodega.sh"
+# shellcheck source=../lib/fixtures.sh
+. "${E2E_DIR:?}/lib/fixtures.sh"
 
 if [ "${E2E_DRY_RUN:-no}" != yes ] &&
 	{ [ "${E2E_SERVER_UP:-no}" != yes ] || [ "${E2E_CLIENT_UP:-no}" != yes ]; }; then
@@ -265,6 +267,41 @@ e2e_on client "curl -sS -o $CLIENT_ROOT/LICENSE -w '%{http_code} %{size_download
 	'$E2E_BASE_URL/binaries/hello-binary/1.0.0/LICENSE'" || true
 check_matches CLI-BIN-01 "curl downloads a hosted binary artifact" \
 	'^200 [0-9]{3,}$' "$E2E_OUT" "internal/server/binary.go:31" "curl $E2E_BASE_URL/binaries/..."
+
+# ---- FreeBSD ports tree ----------------------------------------------------
+#
+# ports.txz is what bsdinstall extracts, so it is the tree a freshly installed
+# host already has, and bodega serves it as an ordinary binary entry. Listed
+# rather than extracted: the tree is ~1.3 GB on ext4 and every claim below is
+# answered by the member list.
+
+ports_sha="$(printf '%s' "$(e2e_fixture ports-txz)" | jq -r '.versions[0].sha256')"
+E2E_HOST=server
+e2e_on server "cat > /tmp/e2e-fx-ports-txz.json <<'E2EFIXTURE'
+$(e2e_fixture ports-txz)
+E2EFIXTURE" || true
+# --merge because this suite runs on its own as often as after 30-pipeline's
+# reset, and a plain import of an entry already present exits 1.
+e2e_bodega server "pkg import --merge /tmp/e2e-fx-ports-txz.json && sudo bodega build upload binary freebsd-ports" || true
+check_eq CLI-PORTS-01 "the ports tarball builds as a binary entry" 0 "$E2E_RC" \
+	"docs/usage.md#serving-the-freebsd-ports-tree" "bodega build upload binary freebsd-ports" "$E2E_RC"
+
+E2E_HOST=client
+e2e_on client "curl -sS -o $CLIENT_ROOT/ports.txz '$E2E_BASE_URL/binaries/freebsd-ports/15.1-RELEASE/ports.txz' && \
+	sha256sum $CLIENT_ROOT/ports.txz | cut -d' ' -f1" || true
+check_eq CLI-PORTS-02 "the client receives the digest the release MANIFEST publishes" \
+	"$ports_sha" "$E2E_OUT" "internal/server/binary.go:31" \
+	"curl $E2E_BASE_URL/binaries/freebsd-ports/15.1-RELEASE/ports.txz | sha256sum" "$E2E_RC"
+
+# Members are rooted at usr/ports/, which is why the documented extraction is
+# `tar -xf ports.txz -C /`. The .git count is the claim the update-path docs
+# rest on: this tree cannot be `git pull`ed.
+e2e_on client "tar -tJf $CLIENT_ROOT/ports.txz | awk '\$0==\"usr/ports/Mk/bsd.port.mk\"{mk=1} /^usr\\/ports\\/\\.git(\\/|\$)/{g++} END{print (mk?\"mk\":\"no-mk\"), g+0}'" || true
+check_eq CLI-PORTS-03 "the tarball is a ports tree rooted at usr/ports with no .git" \
+	"mk 0" "$E2E_OUT" "docs/usage.md#serving-the-freebsd-ports-tree" \
+	"tar -tJf ports.txz" "$E2E_RC"
+e2e_on client "rm -f $CLIENT_ROOT/ports.txz" || true
+unset ports_sha
 
 # ---- gomod -----------------------------------------------------------------
 #

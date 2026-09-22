@@ -34,9 +34,10 @@ E2E_FIXTURE_TYPES="binary git apt pypi gomod helm npm cargo freebsd"
 
 # e2e_fixture <type> [apt-version] — one PackageManifest on stdout.
 #
-# <type> is one of E2E_FIXTURE_TYPES, or one of pypi-proxy, npm-proxy,
-# cargo-proxy and gomod-proxy for the proxy-mode entries at the bottom of the
-# case.
+# <type> is one of E2E_FIXTURE_TYPES, one of pypi-proxy, npm-proxy,
+# cargo-proxy and gomod-proxy for the proxy-mode entries, or ports-txz. Each of
+# the named-apart entries would turn a pipeline walk into something else, so
+# none is in the list.
 e2e_fixture() {
 	case "$1" in
 	binary) cat <<'JSON' ;;
@@ -236,6 +237,32 @@ JSON
   "versions": [{ "version": "v0.9.1", "mode": "proxy" }]
 }
 JSON
+	# ---- the FreeBSD ports tree --------------------------------------------
+	#
+	# The distribution set bsdinstall extracts, served as a plain binary entry
+	# rather than through a type of its own. Named apart for the same reason
+	# as the proxy entries: 30-pipeline walks E2E_FIXTURE_TYPES and has no
+	# business fetching 64 MB for every run of the build stages.
+	#
+	# The digest is the one the release's own MANIFEST publishes, and it is
+	# identical under amd64/amd64 and arm64/aarch64: the tree is
+	# architecture-independent and only the URL layout repeats it.
+	ports-txz) cat <<'JSON' ;;
+{
+  "config_version": 1,
+  "name": "freebsd-ports",
+  "type": "binary",
+  "description": "e2e fixture: the FreeBSD ports tree as the release distribution set ships it",
+  "versions": [
+    {
+      "version": "15.1-RELEASE",
+      "url": "https://download.freebsd.org/releases/amd64/amd64/15.1-RELEASE/ports.txz",
+      "filename": "ports.txz",
+      "sha256": "0429c42e496576596bad6826308c9e876b3e0e7bb98fb0d55966f827601c20c5"
+    }
+  ]
+}
+JSON
 	*)
 		printf 'e2e_fixture: no fixture for type %q\n' "$1" >&2
 		return 2
@@ -258,6 +285,7 @@ e2e_fixture_name() {
 	npm-proxy) printf 'is-number' ;;
 	cargo-proxy) printf 'anyhow' ;;
 	gomod-proxy) printf 'github.com/pkg/errors' ;;
+	ports-txz) printf 'freebsd-ports' ;;
 	*) return 2 ;;
 	esac
 }
@@ -277,6 +305,7 @@ e2e_fixture_version() {
 	npm-proxy) printf '7.0.0' ;;
 	cargo-proxy) printf '1.0.86' ;;
 	gomod-proxy) printf 'v0.9.1' ;;
+	ports-txz) printf '15.1-RELEASE' ;;
 	*) return 2 ;;
 	esac
 }
