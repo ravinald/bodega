@@ -198,7 +198,7 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case storeRefreshMsg:
 		m.store = msg.store
 		m.details.store = msg.store
-		m.details.refreshAptSigning()
+		m.details.refreshSigningKeys()
 		m.sources.Refresh(m.store, m.statuses)
 		m.syncDetails()
 		return m, m.fetchStorageStatus()

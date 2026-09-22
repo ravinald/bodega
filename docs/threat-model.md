@@ -72,9 +72,10 @@ risk:
   `freebsd` entry copies a repository byte for byte, and the attestation it
   carries is FreeBSD's rather than this instance's: `packagesite.pkg` holds
   `packagesite.yaml.sig` and `packagesite.yaml.pub` as tar members, so the
-  client verifies the catalogue against the stock fingerprint at
-  `/usr/share/keys/pkg/trusted/pkg.freebsd.org.2013102301` and every package
-  against the digest that catalogue publishes. bodega records a digest for the
+  client verifies the catalogue against the fingerprint of whoever signed it
+  upstream — `/usr/share/keys/pkg/trusted/pkg.freebsd.org.2013102301` for
+  ports, `/usr/share/keys/pkgbase-15/trusted/` for a `base_release_<n>`
+  repository — and every package against the digest that catalogue publishes. bodega records a digest for the
   catalogue archive it fetched and none for the packages under it. That is a
   stronger claim than bodega could make about the same bytes and a narrower
   one than pinning: it says the repository is FreeBSD's, and it says nothing

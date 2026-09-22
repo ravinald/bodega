@@ -1576,13 +1576,21 @@ Three limits, stated rather than left to be found:
 
 Filtered codenames appear in the startup banner and in `GET /api/v1/status` under `apt.filtered`, with a rendered stanza each in `apt.sources`. Nothing in the config file names them, so those are the two places to read them off. They are regenerated on the hourly index rebuild and on every `bodega profile` write, and the upstream indexes they are built from are cached behind `metadata_ttl`. A rebuild that cannot read or parse the upstream `Packages` withdraws the codename rather than serving the part of it that arrived, so `apt update` fails on a source line naming the instance; a truncated index would instead report every package past the break as kept back. An architecture the base's `Release` names and the archive answers 404 for is the exception: it is dropped from the filtered `Release` and the rest is served, because `archive.ubuntu.com` declares all seven and carries two, and the codename is withdrawn only when none survives.
 
-### `bodega doctor [--write-credentials --token TOKEN [--url URL]] [--write-apt-sources]`
+### `bodega doctor [--write-credentials --token TOKEN [--url URL]] [--write-apt-sources] [--write-pkg-repo [--abi ABI] [--release N]]`
 
-Without flags, `doctor` reports and changes nothing. It has two writes, and they run one at a time.
+Without flags, `doctor` reports and changes nothing. It has three writes, and they run one at a time.
 
 It exits 0 when every check is clean, 2 when one or more produced a finding, and 3 when one or more could not run at all. A check reports `SKIPPED` rather than `N/A` when the file or store it reads would not open, and the `Could not run:` block names what it needed: an unprivileged run against the root-owned `/etc/bodega/config.json` the service unit prescribes measures no policy posture, and three `N/A` rows beside the checks that passed said nothing about that. `N/A` keeps its meaning, which is a measurement: the subject is absent on this host.
 
 `--write-apt-sources` asks the server which apt suite this host should read and installs the keyring and the stanza; see [apt under a profile](#apt-under-a-profile).
+
+`--write-pkg-repo` is the FreeBSD half. It asks the server which pkg repository answers for this host's ABI and writes `/usr/local/etc/pkg/repos/bodega.conf`, which carries two things rather than one: bodega's repository, and the overrides that disable the repository `/etc/pkg/FreeBSD.conf` defines. A file with only the first leaves the host fetching from `pkg.FreeBSD.org` beside bodega, and `pkg update` says nothing about it, so the write refuses a document that disables nothing.
+
+```bash
+bodega doctor --write-pkg-repo --url https://bodega.internal
+```
+
+The ABI comes from `pkg config abi` on a FreeBSD host and from `--abi` anywhere else; nothing composes one from `runtime.GOARCH`, because the two spellings differ. The overrides follow the major release that ABI carries, and `--release` says otherwise for a host whose release is not the one the repository is named for. `signature_type` is the server's answer rather than a flag. A server serving several repositories for one ABI refuses and names them: which one a host reads is a decision, and a file naming one reads as authoritative. See [Client configuration](#client-configuration) for what lands in the file and why each line is there.
 
 With `--write-credentials` it writes one token into the file each of the eight clients reads its credential from, because a feature that costs eight hand edits does not get adopted:
 
@@ -2864,7 +2872,7 @@ A `freebsd` entry is a **repository**, not a package. The name is the repository
 - **version**: the ABI directory, e.g. `FreeBSD:14:amd64`. Required; nothing else says which tree of the repository an entry stands for.
 - **url**: the repository root with `${ABI}` already substituted. Required unless `generated` is set, and not composed from the other two fields: a private repository need not nest its ABIs the way `pkg.freebsd.org` does, and nothing in a URL says which convention it follows.
 - **mode**: `hosted` holds the repository in storage; `proxy` fetches from upstream on a cache miss and holds no snapshot.
-- **generated**: `true` for a repository whose packages you built and whose catalogue bodega produces and signs. Refused together with `url` or with `mode: proxy`, and the refusal names the field: a mirror's client trusts FreeBSD's fingerprint and a generated repository's trusts bodega's key, so an entry claiming both says nothing about which signature a client should expect. See [Hosting your own pkg repository](#hosting-your-own-pkg-repository).
+- **generated**: `true` for a repository whose packages you built and whose catalogue bodega produces and signs. Refused together with `url` or with `mode: proxy`, and the refusal names the field: a mirror's client trusts FreeBSD's fingerprint and a generated repository's trusts bodega's key, so an entry claiming both says nothing about which signature a client should expect. An entry setting neither is refused by the client-configuration renderer for the same reason from the other side, and goes on being served. See [Hosting your own pkg repository](#hosting-your-own-pkg-repository).
 
 ```json
 {
@@ -3009,34 +3017,81 @@ bodega identity bind token <id> devbox-3                                # on the
 bodega doctor --write-credentials --token bodega_ak_... --url https://bodega-host:8080
 ```
 
-The last line runs on the client and writes the token into the file each of its package managers reads. See [`bodega doctor`](#bodega-doctor---write-credentials---token-token---url-url---write-apt-sources) for what lands where, and [`bodega identity`](#bodega-identity-bindunbindlist) for the CIDR binding that covers a whole subnet with no credential to distribute.
+The last line runs on the client and writes the token into the file each of its package managers reads. See [`bodega doctor`](#bodega-doctor---write-credentials---token-token---url-url---write-apt-sources---write-pkg-repo---abi-abi---release-n) for what lands where, and [`bodega identity`](#bodega-identity-bindunbindlist) for the CIDR binding that covers a whole subnet with no credential to distribute.
 
-**FreeBSD pkg** (`/usr/local/etc/pkg/repos/bodega.conf`):
+**FreeBSD pkg** (`/usr/local/etc/pkg/repos/bodega.conf`). Do not hand-write this one; ask the server:
+
+```bash
+bodega doctor --write-pkg-repo --url https://bodega-host:8080
+```
+
+The server renders it, because two of the three things it has to get right are facts only the running instance holds. `GET /api/v1/status` carries the same document under `freebsd.repos[].conf` for a host with no bodega binary on it, and the TUI and web UI show it per entry. On a FreeBSD 15 host mirroring `latest` it comes out as:
 
 ```text
+FreeBSD-ports: { enabled: no }
+FreeBSD-ports-kmods: { enabled: no }
+FreeBSD-base: { enabled: no }
+
 bodega-latest: {
   url: "https://bodega-host:8080/freebsd/${ABI}/latest",
+  mirror_type: "none",
   signature_type: "fingerprints",
   fingerprints: "/usr/share/keys/pkg",
   enabled: yes
 }
-FreeBSD: { enabled: no }
 ```
 
-`${ABI}` stays literal: pkg substitutes the running host's ABI, which is the string the matching manifest entry records as its version. `signature_type` is named because the catalogue is mirrored byte for byte precisely so FreeBSD's own signature reaches the client; a stanza that omits it defaults to `NONE` and throws that attestation away. The second line disables the stock repository, which is the point of pointing pkg at bodega at all. See [Mirroring a FreeBSD pkg repository](#mirroring-a-freebsd-pkg-repository).
+Four things in it are not obvious and each has a failure behind it.
 
-That stanza is for a **mirrored** repository, and `fingerprints` points at FreeBSD's own trusted keys. A repository bodega generates is signed with bodega's key and needs a different one:
+**The overrides name the tags the target release defines, and the release moved.** FreeBSD 13 and 14 ship one repository, tagged `FreeBSD`. FreeBSD 15 split it into `FreeBSD-ports`, `FreeBSD-ports-kmods` and `FreeBSD-base`. pkg merges repository definitions by tag across `/etc/pkg/` and `/usr/local/etc/pkg/repos/`, so an override naming the wrong tag disables nothing: the upstream repository stays enabled beside bodega's and the host keeps fetching from the internet while the operator believes it is isolated. Nothing in `pkg update` output reports that; `pkg -vv` is where you see it. The release comes off the entry's own ABI, and `--release` overrides it for a host that is not the one the repository is named for.
+
+**`pkg+https` is not a spelling of `https`.** `/etc/pkg/FreeBSD.conf` uses it and the next reader of this file will wonder. The `pkg+` scheme means SRV mirror discovery: the client resolves `_https._tcp.<host>` and expects a record set. bodega is one host and publishes none, so the URL is plain and `mirror_type: none` says there is nothing to discover.
+
+**`${ABI}` stays literal.** pkg substitutes the running host's own ABI, so one file is correct across every architecture bodega mirrors.
+
+**`signature_type` follows what the repository is, and the three answers are not interchangeable.** A mirror is copied byte for byte precisely so FreeBSD's own signature reaches the client inside `packagesite.pkg`. Which key signed it depends on who built the repository: the package builders sign ports and the base snapshots with the key in `/usr/share/keys/pkg`, release engineering signs `base_release_<n>` with the key set in `/usr/share/keys/pkgbase-${VERSION_MAJOR}`, and both directories ship on a FreeBSD 15 host. `/etc/pkg/FreeBSD.conf` says the same: `FreeBSD-ports` and `FreeBSD-ports-kmods` name the first, `FreeBSD-base` names the second. bodega reads two things to tell them apart, the entry's upstream URL and the release the repository was built for: the repository name is the operator's and says nothing about who signed what is under it, and 15 is the first release whose base system installs the pkgbase store at all, so a mirror of `base_release_<n>` for 13 or 14 verifies against the ports store like ports. Measured with pkg 2.7.5: `FreeBSD:14:amd64/base_release_1` verifies under `/usr/share/keys/pkg` and not under `/usr/share/keys/pkgbase-15`. The emitted comment names whichever of the two terms excused a repository from the pkgbase store, because a file that told a `base_release_1` mirror it was not a `base_release_<n>` repository would send its operator to move `fingerprints` onto a directory their host does not have:
+
+```text
+bodega-base: {
+  url: "https://bodega-host:8080/freebsd/${ABI}/base",
+  mirror_type: "none",
+  signature_type: "fingerprints",
+  fingerprints: "/usr/share/keys/pkgbase-${VERSION_MAJOR}",
+  enabled: yes
+}
+```
+
+A repository bodega generated is signed with bodega's key and verifies against `/usr/local/etc/pkg/fingerprints/bodega`:
 
 ```text
 bodega-house: {
   url: "https://bodega-host:8080/freebsd/${ABI}/house",
+  mirror_type: "none",
   signature_type: "fingerprints",
   fingerprints: "/usr/local/etc/pkg/fingerprints/bodega",
   enabled: yes
 }
 ```
 
-The two are not interchangeable. Point a mirror's stanza at bodega's fingerprints and every `pkg update` fails on a signature it cannot check; point a generated repository's at FreeBSD's and the same. See [Hosting your own pkg repository](#hosting-your-own-pkg-repository) for what installs that fingerprint file.
+Point a mirror at bodega's fingerprints and every `pkg update` fails on a signature it cannot check; point a generated repository at FreeBSD's and the same. Mixing up FreeBSD's two stores is quieter and worse: measured against `FreeBSD:15:aarch64/base_release_1` on 15.1-RELEASE with pkg 2.7.5, the ports store fetches the catalogue, prints `No trusted public keys found`, processes 0 entries and exits 0, and the next `pkg install` reports the package as missing rather than as unverifiable. The same catalogue against `/usr/share/keys/pkgbase-15` processes 502. bodega derives it rather than taking a flag, and refuses to render at all for an entry that names both of the fields it derives from or neither. Both `generated` and a `url` is two right answers; neither is none, because a catalogue bodega did not copy and did not build is one nobody here knows the signer of, and the mirrored answer would point `fingerprints` at a store that checks whatever was uploaded only by luck. That refusal is the emitter's alone: the route serves such an entry from the store, so it gets a row in `freebsd.refused[]` and goes on answering. To stop re-fetching a mirror while keeping the answer, set `frozen` rather than clearing the `url`. A generated repository on a server holding no signing key renders `signature_type: none`, and its emitted comment says the catalogue carries no signature rather than that bodega signed it. See [Hosting your own pkg repository](#hosting-your-own-pkg-repository) for what installs the fingerprint file, and [Mirroring a FreeBSD pkg repository](#mirroring-a-freebsd-pkg-repository) for the mirror.
+
+**How much of this repository leaves the host is two facts, and the file answers with both.** Whether _any_ path falls through to upstream is the three terms above: the entry records a `url`, and either its mode is `proxy` or the server's `proxy_cache_enabled` is on. How much falls through is the serving mode alone. A proxied repository fetches its catalogue from upstream with everything else and holds nothing of its own; a hosted mirror serves the catalogue that was published to it and answers a miss on `meta.conf`, `packagesite.pkg` or `data.pkg` with 404 rather than fetching it, because upstream's catalogue names packages the mirror has never held. Those three names are what the route recognizes, and the emitted comment names them for that reason. Both facts reach the client configuration, and neither is enough on its own. Measured on 2026-09-21 against two `FreeBSD:15:aarch64` entries recording the same `pkg.FreeBSD.org/FreeBSD:15:aarch64/quarterly` URL on a server with `proxy_cache_enabled: true` and nothing uploaded to either, differing only in the mode:
+
+| Path                | `mode: proxy` | hosted |
+| ------------------- | ------------- | ------ |
+| `meta.conf`         | 200           | 404    |
+| `packagesite.pkg`   | 200           | 404    |
+| `data.pkg`          | 200           | 404    |
+| `All/pv-1.9.31.pkg` | 200           | 200    |
+| `Latest/pkg.pkg`    | 200           | 200    |
+
+Every 200 came off `pkg.FreeBSD.org` and `cache_origins` names the upstream URL for each. So the emitted comment says one of four things rather than the one it used to: every request may reach the internet including the catalogue, or the catalogue is served here and every other path falls through on a miss, or nothing falls through because there is no `url` to resolve a miss against, or nothing falls through because this repository is hosted and `proxy_cache_enabled` is off. The second is the one an operator is most likely to be wrong about, because a hosted mirror is what you reach for when you want a finished local copy, and an install against it can succeed on a package nobody mirrored.
+
+**The isolation claim names the term that would make it false, and the last two cases above do not have the same term.** A generated repository records no upstream, so no setting on the server can make a miss leave the host. A hosted mirror is isolated only while `proxy_cache_enabled` is off, and the file is installed on a client that never hears about that toggle again: turn it on and the stanza on disk goes on asserting isolation while `All/*.pkg` misses are fetched from `pkg.FreeBSD.org` and served under bodega's name. So the mirror's paragraph names both terms that put it there and says what flips them, and `bodega doctor --write-pkg-repo` is what re-reads the file after either changes. `upstream_fallthrough` on `GET /api/v1/status` answers the same question in one bit and cannot tell the two apart; the `conf` beside it can.
+
+**`pkg bootstrap` is the one thing this may not give you, and the mode is not what decides it.** pkg's bootstrapper fetches `<repo>/Latest/pkg.pkg` and `<repo>/Latest/pkg.pkg.sig` and nothing else, and a mirror publishes only the repopaths its catalogue names, which never include that pair. What decides the answer is whether bodega fetches a path outside the catalogue from upstream, and that is three terms rather than the mode alone: the entry records a `url`, and either its mode is `proxy` or the server's `proxy_cache_enabled` is on. So a hosted mirror on a server with the cache on resolves both paths against upstream exactly as a proxied one does, and only a repository where none of the three holds is isolated. Upstream publishes a pkg package under the ports repositories and nowhere else. Measured with `fetch` against `pkg.FreeBSD.org` on 2026-09-21, both paths per repository: `latest` and `quarterly` answer 200 on `FreeBSD:15:aarch64` and `FreeBSD:14:amd64`; every `base_*` and `kmods_*` repository answers 403 or 404 on both, including `base_release_0`, which serves `pkg.pkg` and 403s the signature the bootstrapper checks it against; `release_0` and `release_1` answer 200 on 15 and 404 on 14. What the client sees is not always what upstream said: bodega passes a 404 through and turns any other upstream refusal into a 502 whose body names nothing, with the refusing URL in the server log. So bodega renders three answers rather than two, and a repository nobody measured gets the hedge: the emitted comment says which case this file is, the `bootstrap` field on `GET /api/v1/status` says the same in one word, and `upstream_fallthrough` beside it answers the question a reader means by "is this repository proxied". Install pkg from upstream, or from a ports repository through bodega, before switching a host over.
+
+Verified against FreeBSD 15.1-RELEASE with pkg 2.7.5: the file above installs, `pkg -vv` reports all three upstream tags `enabled: no` and `mirror_type` absent from bodega's definition (pkg prints it only when it is not `NONE`), and `pkg update` followed by `pkg install` resolves from `[bodega-<repo>]`. The `base_release_<n>` form was proven the same way against a proxied `FreeBSD:15:aarch64/base_release_1`: `pkg -vv` resolves `${VERSION_MAJOR}` to `/usr/share/keys/pkgbase-15`, `pkg update` processes 502 packages and `pkg fetch FreeBSD-telnet` pulls the package through bodega.
 
 ### Git smart-HTTP
 
@@ -3308,7 +3363,7 @@ The npm packument and the PyPI simple index are the two responses bodega parses 
 
 A `freebsd` entry does one of two jobs, and which one decides everything a client has to be configured for. It mirrors an upstream repository, which is this section; or it hosts packages you built, which is [the next one](#hosting-your-own-pkg-repository). An entry naming a `url` mirrors, an entry marked `generated` hosts, and an entry claiming both is refused rather than resolved.
 
-A mirror copies the repository **byte for byte**, and that constraint decides the whole design of the type. `packagesite.pkg` and `data.pkg` are zstd tarballs, and each carries three members: a 256-byte signature, a 451-byte public key and the document itself. The catalogue spells them `packagesite.yaml.sig`, `packagesite.yaml.pub` and `packagesite.yaml`; `data.pkg` spells them `data.sig`, `data.pub` and `data`. There is no `.sig` sidecar on the wire. So a byte-exact copy of those archives carries FreeBSD's own signature with it and validates against the stock fingerprint at `/usr/share/keys/pkg/trusted/pkg.freebsd.org.2013102301`, with no key of bodega's and no client-side signature configuration. Regenerating the catalogue with `pkg repo` would discard that attestation permanently and force a fingerprint onto every client.
+A mirror copies the repository **byte for byte**, and that constraint decides the whole design of the type. `packagesite.pkg` and `data.pkg` are zstd tarballs, and each carries three members: a 256-byte signature, a 451-byte public key and the document itself. The catalogue spells them `packagesite.yaml.sig`, `packagesite.yaml.pub` and `packagesite.yaml`; `data.pkg` spells them `data.sig`, `data.pub` and `data`. There is no `.sig` sidecar on the wire. So a byte-exact copy of those archives carries FreeBSD's own signature with it and validates against the key that signed the repository upstream, with no key of bodega's and no client-side signature configuration: `/usr/share/keys/pkg/trusted/pkg.freebsd.org.2013102301` for ports and for the base snapshots, and `/usr/share/keys/pkgbase-15/trusted/` for the `base_release_<n>` repositories release engineering signs. Regenerating the catalogue with `pkg repo` would discard that attestation permanently and force a fingerprint onto every client.
 
 This is the opposite of what apt needs. bodega generates and re-signs Debian metadata for a generated suite because it has to; a mirrored pkg catalogue is never regenerated, because doing so would throw away the only thing that makes it worth mirroring exactly.
 

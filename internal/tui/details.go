@@ -16,6 +16,8 @@ import (
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/pkgrepos"
+	"github.com/ravinald/bodega/internal/pkgsign"
 	"github.com/ravinald/bodega/internal/storage"
 )
 
@@ -36,8 +38,13 @@ type detailsModel struct {
 	focused   bool
 
 	// aptSigned is whether this host holds a usable apt signing key, read
-	// outside the render path and refreshed by refreshAptSigning.
+	// outside the render path and refreshed by refreshSigningKeys.
 	aptSigned bool
+
+	// pkgFingerprint is the pkg catalogue signing key this host holds, empty
+	// for none. Same lifecycle as aptSigned and read beside it: both do file
+	// I/O and a key parse, which a render must not.
+	pkgFingerprint string
 }
 
 // aptDiskStateNote names whose signing state the pane is reporting. The TUI
@@ -50,15 +57,17 @@ const aptDiskStateNote = "This form comes from the signing key on this host's di
 // newDetailsModel creates the details pane.
 func newDetailsModel(store *manifest.Store, cfg *config.Config) detailsModel {
 	vp := viewport.New(80, 20)
-	return detailsModel{store: store, cfg: cfg, buildRoot: cfg.BuildRoot, viewport: vp, aptSigned: aptKeyLoaded(cfg)}
+	return detailsModel{store: store, cfg: cfg, buildRoot: cfg.BuildRoot, viewport: vp,
+		aptSigned: aptKeyLoaded(cfg), pkgFingerprint: pkgKeyFingerprint(cfg)}
 }
 
-// refreshAptSigning re-reads the on-disk signing key. Reading once at
+// refreshSigningKeys re-reads both on-disk signing keys. Reading once at
 // construction meant a key generated while the TUI was open stayed invisible
 // until restart, and the pane went on offering [trusted=yes] for a repository
 // that had started signing.
-func (m *detailsModel) refreshAptSigning() {
+func (m *detailsModel) refreshSigningKeys() {
 	m.aptSigned = aptKeyLoaded(m.cfg)
+	m.pkgFingerprint = pkgKeyFingerprint(m.cfg)
 }
 
 // SetNode updates the node whose metadata is displayed.
@@ -184,7 +193,7 @@ func (m detailsModel) storedAndClientFields(n *TreeNode) string {
 		}
 		return sb.String()
 	}
-	if url := clientURL(m.cfg, m.store, n.EntryType, n.Name); url != "" {
+	if url := clientURL(m.cfg, m.store, n.EntryType, n.Name, m.pkgFingerprint); url != "" {
 		label := clientFieldLabel(n.EntryType)
 		if strings.Contains(url, "\n") {
 			sb.WriteString(stanzaField(label, url))
@@ -470,6 +479,70 @@ func aptKeyLoaded(cfg *config.Config) bool {
 	return true
 }
 
+// freeBSDRepoConf renders one pkg repository's client configuration through
+// the one renderer the server and web UI also use.
+//
+// The first non-hidden ABI decides it. A repository carries one entry per ABI
+// and the pane names the package rather than an ABI, so there is one answer
+// to give; the ABI is in the rendered file and the URL keeps ${ABI} literal,
+// so a copy onto a host of a different architecture still resolves. A
+// contradictory entry renders nothing rather than a guess, which is the
+// refusal pkgrepos.Render exists to make.
+func freeBSDRepoConf(cfg *config.Config, pm *manifest.PackageManifest, fingerprint string) string {
+	st := pkgrepos.State{LocalScheme: clientScheme(cfg), Repo: pm.Name, Fingerprint: fingerprint}
+	if cfg != nil {
+		st.PublicURL = cfg.ResolvePublicURL("")
+		// Read here rather than per entry: the toggle is the server's, and it
+		// decides with the mode whether a path outside the catalogue is
+		// fetched from upstream. A pane that left it false told an operator a
+		// hosted mirror was isolated while the server proxied its misses.
+		st.CacheEnabled = cfg.ProxyCacheEnabled
+	}
+	for _, ve := range pm.Versions {
+		if ve.Hidden {
+			continue
+		}
+		st.ABI, st.Generated, st.Upstream = ve.Version, ve.Generated, ve.URL
+		st.Proxy = ve.EffectiveMode() == manifest.ModeProxy
+		rendered, err := pkgrepos.Render(st)
+		if err != nil {
+			continue
+		}
+		return rendered.Conf
+	}
+	return ""
+}
+
+// pkgKeyFingerprint is the pkg catalogue signing key this host holds, read
+// through pkgsign's own search order, or "" for none.
+//
+// It describes the key file rather than the running server, the way
+// aptKeyLoaded does, and for the same reason: the TUI holds no connection to
+// the process. The two disagree only between a key changing on disk and the
+// SIGHUP that loads it, and the alternative — assuming unsigned — is what
+// printed a stock-fingerprint stanza for a repository bodega had signed.
+func pkgKeyFingerprint(cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	kr, err := pkgsign.Load(pkgsign.DefaultKeyPaths(cfg.StoragePath))
+	if err != nil {
+		return ""
+	}
+	// Stopping at Load is not enough, for the reason aptKeyLoaded does not:
+	// the server stores a signer only once both public forms render, so a key
+	// that parses and will not serialize leaves the catalogue unsigned while
+	// a pane that stopped here names bodega's fingerprint. A client
+	// configured that way fails pkg update outright.
+	if _, err := kr.PublicKey(); err != nil {
+		return ""
+	}
+	if _, err := kr.PublicKeyMember(); err != nil {
+		return ""
+	}
+	return kr.Fingerprint()
+}
+
 // aptSourcesSuite picks the suite for a sources line: the first suite the
 // package is published to that this server also answers for, falling back to
 // the first served suite. A package in several suites needs one line per
@@ -510,7 +583,12 @@ func aptSourcesSuite(cfg *config.Config, pm *manifest.PackageManifest) string {
 // apt has no case here on purpose: a sources line is a configuration stanza
 // rather than a URL, and it needs the served suites and the signing state as
 // well as the base URL. aptSources renders it.
-func clientURL(cfg *config.Config, store *manifest.Store, entryType, name string) string {
+//
+// pkgFingerprint is the pkg catalogue signing key this host holds, empty when
+// it holds none, and it is a parameter for the reason aptSources takes signed:
+// resolving it means a key load off disk, and a render runs on every terminal
+// resize.
+func clientURL(cfg *config.Config, store *manifest.Store, entryType, name, pkgFingerprint string) string {
 	ctx := context.Background()
 	base := clientBase(cfg)
 	pm, err := store.GetPackage(ctx, entryType, name)
@@ -550,15 +628,15 @@ func clientURL(cfg *config.Config, store *manifest.Store, entryType, name string
 	case manifest.TypeNpm:
 		return fmt.Sprintf("npm install --registry %s/npm/ %s", base, name)
 	case manifest.TypeFreeBSD:
-		// A pkg.conf stanza, with ${ABI} left literal: pkg substitutes the
-		// running host's ABI, which is the string this entry records as its
-		// version. fingerprints is named because the catalogue is mirrored
-		// byte for byte precisely so FreeBSD's own signature reaches the
-		// client, and a stanza that omits it defaults to signature_type NONE
-		// and discards that attestation.
-		return fmt.Sprintf("bodega-%s: {\n  url: \"%s/freebsd/${ABI}/%s\",\n"+
-			"  signature_type: \"fingerprints\",\n  fingerprints: \"/usr/share/keys/pkg\",\n  enabled: yes\n}",
-			name, base, name)
+		// The whole /usr/local/etc/pkg/repos/ file rather than the repository
+		// block alone. The block on its own installs cleanly and leaves the
+		// upstream repository enabled beside bodega's, which nothing reports:
+		// the overrides that disable it are the same decision, so they travel
+		// in the same copy.
+		if err != nil || pm == nil || len(pm.Versions) == 0 {
+			return ""
+		}
+		return freeBSDRepoConf(cfg, pm, pkgFingerprint)
 	case manifest.TypeCargo:
 		// Cargo hands back no URL. A client reaches the sparse index only once
 		// .cargo/config.toml names it as a registry, so the stanza and the
@@ -574,8 +652,8 @@ func clientURL(cfg *config.Config, store *manifest.Store, entryType, name string
 
 // clientFieldLabel names the detail-pane row holding a type's client
 // instruction. Three hand back something other than a URL: apt a sources
-// line, cargo a registry stanza, freebsd a pkg.conf repository block. Calling
-// any of them a "Package URL" sends an operator looking for something to curl.
+// line, cargo a registry stanza, freebsd a whole pkg repos file. Calling any
+// of them a "Package URL" sends an operator looking for something to curl.
 func clientFieldLabel(entryType string) string {
 	switch entryType {
 	case manifest.TypeApt:
@@ -583,7 +661,7 @@ func clientFieldLabel(entryType string) string {
 	case manifest.TypeCargo:
 		return "Registry stanza"
 	case manifest.TypeFreeBSD:
-		return "Repository stanza"
+		return "Repository conf"
 	}
 	return "Package URL"
 }

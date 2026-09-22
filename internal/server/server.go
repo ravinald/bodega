@@ -1013,6 +1013,7 @@ type statusResponse struct {
 	Version        string               `json:"version,omitempty"`
 	EntryCount     map[string]int       `json:"entry_count"`
 	Apt            aptStatus            `json:"apt"`
+	FreeBSD        freebsdStatus        `json:"freebsd"`
 	Spool          spoolStats           `json:"spool"`
 	BackendEntries []backendEntryStatus `json:"backend_entries,omitempty"`
 	Error          string               `json:"error,omitempty"`
@@ -1035,9 +1036,18 @@ type backendEntryStatus struct {
 func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 	spool := s.spool.stats()
 	version := builder.Version
+	freebsd := s.freeBSDStatusFor(r)
 	if !s.isAdminRequest(r) {
 		spool.Dir = ""
 		version = ""
+		// key_error quotes a load failure, and pkgsign's likeliest one names
+		// the key file by path and reports that its mode leaves the private
+		// key readable beyond its owner. That is the storage root, the
+		// filename and how to use them, handed to a caller already denied
+		// spool.Dir. signed and fingerprint stay public: a fingerprint is
+		// published on purpose and no client can verify a catalogue without
+		// it.
+		freebsd.KeyError = ""
 	}
 	entryCount := make(map[string]int, len(manifest.AllTypes))
 	for _, typ := range manifest.AllTypes {
@@ -1047,6 +1057,7 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 		Healthy:    true,
 		Version:    version,
 		Apt:        s.aptStatusFor(r),
+		FreeBSD:    freebsd,
 		Spool:      spool,
 		EntryCount: entryCount,
 	}

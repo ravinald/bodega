@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"slices"
 	"strings"
 	"text/tabwriter"
@@ -20,6 +21,7 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/host"
+	"github.com/ravinald/bodega/internal/pkgrepos"
 	"github.com/ravinald/bodega/internal/policy"
 )
 
@@ -38,8 +40,9 @@ import (
 // The threat model and rationale for each check is documented in
 // docs/threat-model.md.
 func newDoctorCmd(gf *globalFlags) *cobra.Command {
-	var writeCreds, writeAptSources, allowPlaintext bool
-	var token, baseURL string
+	var writeCreds, writeAptSources, writePkgRepo, allowPlaintext bool
+	var token, baseURL, pkgABI string
+	var pkgRelease int
 	c := &cobra.Command{
 		Use:   "doctor",
 		Short: "Inspect the local host and this install's policy posture for gaps in bodega's controls",
@@ -100,6 +103,28 @@ writes that stanza to /etc/apt/sources.list.d/bodega.sources.
 identified by its address and needs none. A host bodega cannot identify gets
 told which codenames exist rather than handed one.
 
+--write-pkg-repo is the FreeBSD half. It asks bodega which pkg repositories
+answer for this host's ABI and writes ` + pkgrepos.ClientConfPath + `,
+which holds two things and not one: the bodega repository, and the overrides
+that disable the repository /etc/pkg/FreeBSD.conf defines. pkg merges
+definitions by tag, so a file carrying only the first leaves the host
+fetching from pkg.FreeBSD.org beside bodega and nothing in "pkg update"
+output says so.
+
+  bodega doctor --write-pkg-repo --url https://bodega.internal
+
+The ABI comes from "pkg config abi" on a FreeBSD host, or from --abi
+anywhere else. The tags the override names follow the major release the ABI
+carries; --release says otherwise for a host whose release is not the one
+the repository is named for. signature_type is the server's answer rather
+than a flag, and there are three of them: a mirror of a ports repository
+verifies against the stock trust store, a mirror of a base_release_<n> one
+built for FreeBSD 15 or later against the pkgbase store beside it (no older
+release ships that store, so its base_release_<n> repositories verify against
+the stock one), and a generated repository against bodega's own fingerprint. Naming bodega's key for a mirror fails "pkg
+update" on the signature; naming the wrong one of FreeBSD's two fails
+nothing at all, and the repository installs empty.
+
 Signed-By: goes on the line and names the keyring this command just installed.
 The alternative is [trusted=yes], which turns signature verification off for
 the source permanently and would discard the reason the filtered index is
@@ -110,15 +135,25 @@ codename, which is why the request predicate still runs at the pool.
 See docs/threat-model.md for the rationale behind each check.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if writeCreds && writeAptSources {
+			writes := 0
+			for _, on := range []bool{writeCreds, writeAptSources, writePkgRepo} {
+				if on {
+					writes++
+				}
+			}
+			if writes > 1 {
 				return fmt.Errorf("run one write at a time: --write-credentials places the token every client reads, " +
-					"--write-apt-sources asks the server which suite this host reads and installs it")
+					"--write-apt-sources asks the server which suite this host reads and installs it, " +
+					"--write-pkg-repo asks it which pkg repository this ABI reads and installs that")
 			}
 			if writeCreds {
 				return writeClientCredentials(gf, token, baseURL)
 			}
 			if writeAptSources {
 				return writeAptSourcesFile(gf, token, baseURL, allowPlaintext)
+			}
+			if writePkgRepo {
+				return writePkgRepoFile(gf, token, baseURL, pkgABI, pkgRelease, allowPlaintext)
 			}
 			findings := make([]host.Finding, 0, len(host.AllChecks())+len(postureChecks))
 			for _, fn := range host.AllChecks() {
@@ -157,6 +192,12 @@ See docs/threat-model.md for the rationale behind each check.`,
 		"Write a read-path credential into each client's own configuration file")
 	c.Flags().BoolVar(&writeAptSources, "write-apt-sources", false,
 		"Install the archive keyring and the apt sources stanza this server says the host should read")
+	c.Flags().BoolVar(&writePkgRepo, "write-pkg-repo", false,
+		"Install the pkg repository configuration this server says the host's ABI should read, and disable the upstream one")
+	c.Flags().StringVar(&pkgABI, "abi", "",
+		"The pkg ABI to configure for; defaults to what `pkg config abi` reports on this host")
+	c.Flags().IntVar(&pkgRelease, "release", 0,
+		"FreeBSD major release whose repository tags the override disables; defaults to the one the ABI names")
 	c.Flags().StringVar(&token, "token", "",
 		"The token to write (bodega token generate <label>)")
 	c.Flags().StringVar(&baseURL, "url", "",
@@ -399,6 +440,161 @@ func aptNoStanza(apt aptClientStatus) error {
 		"  Then give the profile a base:  bodega profile set <profile> apt --membership closed --base <codename>\n"+
 		"  Or write the stanza by hand from:  bodega status apt",
 		len(served), strings.Join(served, ", "))
+}
+
+// pkgClientConfig is the half of GET /api/v1/status this command reads. The
+// server composes each repository's configuration and this decodes it:
+// whether a repository is mirrored or generated, and whether a catalogue
+// signing key is loaded, are facts only the running instance holds.
+type pkgClientConfig struct {
+	FreeBSD pkgClientStatus `json:"freebsd"`
+}
+
+type pkgClientStatus struct {
+	Signed      bool             `json:"signed"`
+	Fingerprint string           `json:"fingerprint"`
+	KeyError    string           `json:"key_error"`
+	PublicURL   string           `json:"public_url"`
+	Repos       []pkgrepos.Repo  `json:"repos"`
+	Refused     []pkgRepoRefusal `json:"refused"`
+}
+
+type pkgRepoRefusal struct {
+	Repo  string `json:"repo"`
+	ABI   string `json:"abi"`
+	Error string `json:"error"`
+}
+
+// writePkgRepoFile installs what the server says this host's pkg
+// configuration is: one repository definition, and the overrides that turn
+// the upstream one off.
+//
+// --token is optional here for the reason it is optional on
+// --write-apt-sources: a host bound by "bodega identity bind cidr" sends no
+// header, and demanding a token would make one of the two identification
+// modes unusable from the command that configures it.
+func writePkgRepoFile(gf *globalFlags, token, baseURL, abi string, release int, allowPlaintext bool) error {
+	if baseURL == "" {
+		cfg, err := loadConfig(gf)
+		if err != nil {
+			return fmt.Errorf("load config: %w", err)
+		}
+		baseURL = cfg.PublicURL
+	}
+	if baseURL == "" {
+		return fmt.Errorf("--write-pkg-repo needs the base URL clients reach this bodega at.\n" +
+			"  Pass --url https://bodega.internal, or set public_url in the config file")
+	}
+	if abi == "" {
+		var err error
+		if abi, err = localPkgABI(); err != nil {
+			return err
+		}
+	}
+	client, err := NewClient(baseURL, token, allowPlaintext)
+	if err != nil {
+		return err
+	}
+	var status pkgClientConfig
+	if err := getJSON(client, "/api/v1/status", &status); err != nil {
+		return err
+	}
+	repo, err := pkgRepoForABI(status.FreeBSD, abi)
+	if err != nil {
+		return err
+	}
+	if release > 0 && release != repo.Release {
+		// Re-rendered rather than patched: the file is the overrides and the
+		// definition together, and editing the tag list out of one half is
+		// how a host ends up disabling a repository it does not define while
+		// the one it does stays enabled. WithRelease rather than a State
+		// rebuilt from these fields, because this side sees what crossed the
+		// wire and the server's own facts did not all cross it.
+		rerendered, err := repo.WithRelease(release)
+		if err != nil {
+			return err
+		}
+		repo = rerendered
+	}
+	conf := repo.Conf
+
+	wrote, err := host.WritePkgRepo("", pkgrepos.ClientConfPath, conf)
+	for _, p := range wrote {
+		fmt.Printf("wrote %s\n", p)
+	}
+	if err != nil {
+		return err
+	}
+	if status.FreeBSD.KeyError != "" {
+		fmt.Printf("\nThe server has a pkg signing key it cannot load (%s), so every generated\n", status.FreeBSD.KeyError)
+		fmt.Println("repository refuses its catalogue until that is fixed. A mirrored one is unaffected.")
+	}
+	for _, note := range repo.Notes {
+		fmt.Println()
+		fmt.Println(note)
+	}
+	fmt.Println("\nApply it:  pkg update")
+	fmt.Println("Confirm the upstream repository is off:  pkg -vv | grep -A2 -E '^  (FreeBSD|bodega)'")
+	return nil
+}
+
+// pkgRepoForABI picks the one configuration this host should install, or
+// explains a server that would not name one.
+//
+// Refusing beats guessing for the reason aptNoStanza refuses: a repository
+// named for this host by nobody is a host pointed somewhere nobody decided
+// on, and the file it lands in looks authoritative.
+func pkgRepoForABI(st pkgClientStatus, abi string) (pkgrepos.Repo, error) {
+	var match []pkgrepos.Repo
+	var others []string
+	for _, r := range st.Repos {
+		if r.ABI == abi {
+			match = append(match, r)
+			continue
+		}
+		others = append(others, r.Repo+"@"+r.ABI)
+	}
+	switch {
+	case len(match) == 1:
+		return match[0], nil
+	case len(match) > 1:
+		names := make([]string, 0, len(match))
+		for _, r := range match {
+			names = append(names, r.Repo)
+		}
+		return pkgrepos.Repo{}, fmt.Errorf("this bodega serves %d pkg repositories for %s, so which one this host should read is your decision rather than the server's: %s.\n"+
+			"  Hide the ones this host must not read (bodega pkg hide freebsd <repo>), or write the file by hand from GET /api/v1/status",
+			len(match), abi, strings.Join(names, ", "))
+	}
+	for _, r := range st.Refused {
+		if r.ABI == abi {
+			return pkgrepos.Repo{}, fmt.Errorf("this bodega serves %s for %s and will not render client configuration for it: %s", r.Repo, abi, r.Error)
+		}
+	}
+	if len(others) == 0 {
+		return pkgrepos.Repo{}, fmt.Errorf("this bodega serves no pkg repository, so there is no configuration to install")
+	}
+	return pkgrepos.Repo{}, fmt.Errorf("this bodega serves no pkg repository for %s. It serves %s.\n"+
+		"  Pass --abi with one of those, or add an entry for this ABI on the server:  bodega pkg create freebsd <repo>",
+		abi, strings.Join(others, ", "))
+}
+
+// localPkgABI asks pkg what ABI this host is, which is the only authority on
+// it: the ABI string carries the release and the architecture as pkg spells
+// them, and a value composed from runtime.GOARCH is wrong on every host where
+// those two spellings differ.
+func localPkgABI() (string, error) {
+	out, err := exec.Command("pkg", "config", "abi").Output()
+	if err != nil {
+		return "", fmt.Errorf("--write-pkg-repo needs the ABI to configure for, and `pkg config abi` did not answer on this host (%v).\n"+
+			"  Pass it:  --abi FreeBSD:14:amd64", err)
+	}
+	abi := strings.TrimSpace(string(out))
+	if abi == "" {
+		return "", fmt.Errorf("`pkg config abi` returned nothing on this host.\n" +
+			"  Pass it:  --abi FreeBSD:14:amd64")
+	}
+	return abi, nil
 }
 
 // getJSON reads one JSON document off the read API, treating any non-200 as
