@@ -1,9 +1,11 @@
 name: CodeQL
 
+# No pull_request trigger: security-and-quality takes ~147s and re-examines a
+# diff golangci-lint and govulncheck already read in CI, which an item going
+# several remand rounds pays for every round. Trunk and the weekly run still
+# catch it well before a tag.
 on:
   push:
-    branches: [main]
-  pull_request:
     branches: [main]
   schedule:
     - cron: '17 4 * * 1'   # weekly Monday 04:17 UTC
