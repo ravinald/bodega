@@ -1212,7 +1212,13 @@ components:
             the entry records a url, and either the mode is proxy or the
             server's proxy cache is on. false is the isolation claim, that
             every request this repository answers stops at bodega, so the
-            field is never omitted.
+            field is never omitted. It is false for two reasons this bit
+            cannot tell apart and conf can: a repository recording no url has
+            nothing to resolve a miss against and no server setting changes
+            that, while a hosted mirror is isolated only while
+            proxy_cache_enabled is off. The emitted paragraph names which of
+            the terms holds and what would flip it, because the file is
+            installed on a client that never hears about the toggle again.
         pkgbase:
           type: boolean
           description: >-

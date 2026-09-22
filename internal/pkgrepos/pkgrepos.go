@@ -108,22 +108,42 @@ const (
 	// Ansible template needs to read it before the paste.
 	UnsignedNote = `signature_type: none accepts whatever this server returns, with TLS as the only thing authenticating the packages, and it propagates into Ansible templates and image builds that outlive whatever made it necessary. Run "bodega freebsd key generate", reload the server, and re-read this stanza to get a verified one.`
 
-	// IsolatedNote, ProxyReachNote and MirrorReachNote answer how much of
-	// this repository leaves the host, which is the question an operator
-	// pastes the file to settle. Two facts decide it: State.ReachesUpstream
-	// says whether any path falls through, and Repo.HoldsCatalogue says
-	// whether the catalogue is one of them.
+	// NoUpstreamNote, IsolatedMirrorNote, ProxyReachNote and MirrorReachNote
+	// answer how much of this repository leaves the host, which is the
+	// question an operator pastes the file to settle. Three facts decide it,
+	// one per term of State.ReachesUpstream plus the serving mode:
+	// Repo.RecordsUpstream says whether there is an upstream at all,
+	// Repo.HoldsCatalogue says whether the catalogue is one of the paths that
+	// falls through, and Repo.UpstreamFallthrough says whether anything does.
 	//
-	// One text used to cover all three, keyed off nothing: the bootstrap
+	// One text used to cover all four, keyed off nothing: the bootstrap
 	// note ended on "unlike every other request this repository answers",
 	// which was true of the hosted mirror it was written for and printed for
 	// a proxy, where every request reaches upstream and the catalogue with
 	// them.
+	//
+	// The isolation claim is two texts rather than one because it is true for
+	// two different reasons and only one of them survives a server the
+	// operator never touches again. A repository with no upstream has nothing
+	// to compose a fetch against and no setting changes that; a hosted mirror
+	// is isolated because proxy_cache_enabled happens to be off, and the
+	// installed file goes on asserting isolation the moment somebody turns it
+	// on. So each names the term that would flip it, which is what the
+	// mirrored and proxied texts beside them already do.
 
-	// IsolatedNote is the isolation claim, and it may be printed only where
-	// nothing falls through: no url on the entry, or neither the proxy mode
-	// nor the server's proxy cache.
-	IsolatedNote = `Every request this repository answers stops at this server: it publishes the paths its catalogue names and this server fetches nothing under it from upstream, so a package it does not hold is a 404 here rather than a fetch from the internet.`
+	// NoUpstreamNote is the isolation claim for a repository that records no
+	// upstream: a generated one, since Render refuses every other way to have
+	// none. Nothing about the server can make a miss leave the host here,
+	// which is what separates it from IsolatedMirrorNote.
+	NoUpstreamNote = `Every request this repository answers stops at this server: it records no upstream, so this server fetches nothing under it from upstream whatever its serving mode and whatever proxy_cache_enabled is set to, and a package it does not hold is a 404 here rather than a fetch from the internet.`
+
+	// IsolatedMirrorNote is the isolation claim for a mirror that records an
+	// upstream nothing is currently fetched from: not served in proxy mode,
+	// on a server whose proxy cache is off. Both terms are named because both
+	// are outside this file and either one flips it, and the flip is silent:
+	// the installed stanza keeps claiming isolation while misses are served
+	// from pkg.FreeBSD.org under this repository's name.
+	IsolatedMirrorNote = `Every request this repository answers stops at this server: it publishes the paths its catalogue names and this server fetches nothing under it from upstream, so a package it does not hold is a 404 here rather than a fetch from the internet. Two terms decide that and neither is in this file: this repository is not served in proxy mode, and this server's proxy_cache_enabled is off. Change either and a package the mirror never held is fetched from upstream, cached and served under this repository's name, with this file still saying it is not.`
 
 	// ProxyReachNote is the answer for a repository served in proxy mode,
 	// where the catalogue falls through with everything else and bodega holds
@@ -152,9 +172,10 @@ const (
 	// That a mirror publishes only its catalogue is the premise rather than
 	// the answer, and it is the whole answer only where State.ReachesUpstream
 	// is false: the route serves a path the catalogue does not name from
-	// upstream wherever it can. The isolation claim itself is IsolatedNote's,
-	// which reads the same fact and answers how much of this repository is
-	// here rather than what one command does.
+	// upstream wherever it can. The isolation claim itself belongs to
+	// NoUpstreamNote and IsolatedMirrorNote, which read the same fact and
+	// answer how much of this repository is here rather than what one
+	// command does.
 	NoBootstrapNote = `"pkg bootstrap" does not work against this repository: it fetches Latest/pkg.pkg and Latest/pkg.pkg.sig, a catalogue never names that pair, and nothing under this repository falls through to upstream to fetch it from. Install pkg on the host from upstream first, then switch it over.`
 
 	// BootstrapResolvesNote is the answer when a path outside the catalogue
@@ -371,6 +392,12 @@ type Repo struct {
 	// the server's and neither crosses: the upstream URL is not on this wire
 	// and the cache toggle is a fact about the server, not the repository.
 	// Never omitted, because false is the claim a reader acts on.
+	//
+	// One bit for two cases, which is why the rendered paragraph says more
+	// than this field can. A repository recording no upstream has nothing to
+	// resolve a miss against and no server setting changes that; a hosted
+	// mirror is isolated only while proxy_cache_enabled is off. Repo.Conf
+	// names which of the terms holds; reachNote says the same in one line.
 	UpstreamFallthrough bool `json:"upstream_fallthrough"`
 
 	// Pkgbase marks the second mirrored case: a repository release
@@ -459,6 +486,22 @@ func (r Repo) Note() string { return strings.Join(r.Notes, " ") }
 // proxied entry, all pointing at pkg.FreeBSD.org, and three under the hosted
 // one, none of them a catalogue file.
 func (r Repo) HoldsCatalogue() bool { return !r.Proxy }
+
+// RecordsUpstream reports whether this repository was mirrored from an
+// upstream root. It is State.ReachesUpstream's first term carried across the
+// wire: the URL itself is the server's fact and never crosses, and Generated
+// is equal to its absence rather than correlated with it. Render refuses a
+// generated entry that records a url and refuses an entry that records
+// neither, so every configuration it returns has exactly one of the two, and
+// TestGeneratedIsExactlyTheAbsenceOfAnUpstream holds that pair.
+//
+// The reach claim reads this rather than Generated because what makes a
+// generated repository isolated is having no URL to compose a miss against,
+// not having been built here, and a paragraph explaining why an arm fired has
+// to name the term that would flip it. Nothing about the server flips this
+// one, which is the whole difference from a mirror that is isolated only
+// because proxy_cache_enabled is off.
+func (r Repo) RecordsUpstream() bool { return !r.Generated }
 
 // BaseURL returns the base URL a client fetches from, resolving the
 // placeholder when State reports no public URL.
@@ -789,23 +832,36 @@ func bootstrapAnswer(st State) BootstrapAnswer {
 	}
 }
 
-// reachNote says how much of this repository leaves the host, from the two
-// facts that decide it: whether anything falls through to upstream, and
-// whether the catalogue is one of the paths that does.
+// reachNote says how much of this repository leaves the host, from the three
+// facts that decide it: whether there is an upstream at all, whether the
+// catalogue is one of the paths that falls through, and whether anything
+// does.
 //
-// Neither fact alone answers it, which is how one text came to be printed for
-// all three cases. A repository that falls through is not thereby proxied: a
-// hosted mirror on a cache-enabled server serves its own catalogue and fetches
-// everything else. A proxied one is not thereby reachable: with no url on the
-// entry there is nothing to compose.
+// No fact alone answers it, which is how one text came to be printed for
+// every case. A repository that falls through is not thereby proxied: a
+// hosted mirror on a cache-enabled server serves its own catalogue and
+// fetches everything else. A proxied one is not thereby reachable: with no
+// url on the entry there is nothing to compose. And a repository nothing
+// currently falls out of is isolated for one of two reasons a reader acts on
+// differently, which is the arm this switch used to answer with a sentence
+// naming neither.
+//
+// The order is what keeps each arm's prose true of every Repo that reaches
+// it, including one decoded from a server that predates a field. A wire shape
+// carrying no upstream_fallthrough decodes it as false, so a proxied
+// repository from such a server would reach an isolation arm and be told
+// nothing leaves the host; reading the mode before that field puts it in the
+// arm the mode already proves.
 func reachNote(r Repo) string {
 	switch {
-	case !r.UpstreamFallthrough:
-		return IsolatedNote
-	case r.HoldsCatalogue():
+	case !r.RecordsUpstream():
+		return NoUpstreamNote
+	case !r.HoldsCatalogue():
+		return ProxyReachNote
+	case r.UpstreamFallthrough:
 		return MirrorReachNote
 	default:
-		return ProxyReachNote
+		return IsolatedMirrorNote
 	}
 }
 
@@ -855,23 +911,38 @@ func renderStanza(r Repo) string {
 }
 
 // writeReachComment writes the paragraph answering how much of this
-// repository leaves the host, from the same two predicates reachNote reads.
+// repository leaves the host, from the same three predicates reachNote reads
+// and in the same order.
 //
 // Both branches of renderConf call it, because the answer is not the mirror's
 // alone and the generated branch used to print nothing at all. Render refuses
-// a generated entry with a url and one served by proxy, so
-// UpstreamFallthrough is false there by construction and the first arm is the
-// one that fires. That makes a generated repository the one class this file
-// can call isolated without qualifying it, and the class that was never told.
-// Driving it off the predicate rather than writing that sentence into the arm
-// is what keeps it true if either refusal is ever lifted.
+// a generated entry with a url and one served by proxy, so a generated
+// repository is the one class this file can call isolated without naming a
+// server setting that would make the sentence false.
+//
+// A mirror is the other class, and its isolation lasts only as long as two
+// settings nobody changes with this file in mind: it reaches that arm because
+// it is not proxied and proxy_cache_enabled is off, and the file is installed
+// on a host that never hears about either moving. So that arm names both
+// terms and what a change to one costs, while the generated arm says there is
+// nothing to change. One sentence for both was the defect: written for a
+// mirror, printed for both, and naming no term at all while the mirrored and
+// proxied arms beside it each named theirs.
 func writeReachComment(b *strings.Builder, r Repo) {
 	switch {
-	case !r.UpstreamFallthrough:
-		b.WriteString("# This repository publishes the paths its catalogue names and this server\n")
-		b.WriteString("# fetches nothing under it from upstream: every request stops here, and a\n")
-		b.WriteString("# package it does not hold is a 404 rather than a fetch from the internet.\n")
-	case r.HoldsCatalogue():
+	case !r.RecordsUpstream():
+		b.WriteString("# This repository records no upstream for this server to fetch from: every\n")
+		b.WriteString("# request stops here, and a package it does not hold is a 404 rather than a\n")
+		b.WriteString("# fetch from the internet. No serving mode and no setting on this server\n")
+		b.WriteString("# changes that, because there is no URL to resolve a miss against.\n")
+	case !r.HoldsCatalogue():
+		b.WriteString("# Every request this repository answers may reach the internet, the\n")
+		b.WriteString("# catalogue included. It is served in proxy mode: this server composes an\n")
+		b.WriteString("# upstream URL for each path and fetches it whenever it holds no fresh\n")
+		b.WriteString("# copy, so `pkg update` against this file contacts upstream. What is\n")
+		b.WriteString("# stored here is whatever earlier requests cached, not a copy of the\n")
+		b.WriteString("# repository.\n")
+	case r.UpstreamFallthrough:
 		b.WriteString("# This catalogue is served from what was published here, and a miss on\n")
 		b.WriteString("# meta.conf, packagesite.pkg or data.pkg is refused rather than fetched:\n")
 		b.WriteString("# upstream's catalogue names packages this mirror has never held. Every\n")
@@ -880,12 +951,15 @@ func writeReachComment(b *strings.Builder, r Repo) {
 		b.WriteString("# cached, and served under this repository's name, so an install can succeed\n")
 		b.WriteString("# here against a package nobody mirrored.\n")
 	default:
-		b.WriteString("# Every request this repository answers may reach the internet, the\n")
-		b.WriteString("# catalogue included. It is served in proxy mode: this server composes an\n")
-		b.WriteString("# upstream URL for each path and fetches it whenever it holds no fresh\n")
-		b.WriteString("# copy, so `pkg update` against this file contacts upstream. What is\n")
-		b.WriteString("# stored here is whatever earlier requests cached, not a copy of the\n")
-		b.WriteString("# repository.\n")
+		b.WriteString("# This repository publishes the paths its catalogue names and this server\n")
+		b.WriteString("# fetches nothing under it from upstream: every request stops here, and a\n")
+		b.WriteString("# package it does not hold is a 404 rather than a fetch from the internet.\n")
+		b.WriteString("# Two terms decide that and neither is in this file: this repository is not\n")
+		b.WriteString("# served in proxy mode, and this server's proxy_cache_enabled is off.\n")
+		b.WriteString("# Change either and a miss outside meta.conf, packagesite.pkg and data.pkg\n")
+		b.WriteString("# is fetched from upstream, cached and served under this repository's name,\n")
+		b.WriteString("# while this file goes on saying it is not. Re-run `bodega doctor\n")
+		b.WriteString("# --write-pkg-repo` when one of them moves.\n")
 	}
 }
 

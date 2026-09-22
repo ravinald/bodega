@@ -358,6 +358,174 @@ func TestTheConfSaysHowMuchOfTheRepositoryLeavesTheHost(t *testing.T) {
 	}
 }
 
+// The isolation claim names the term that would make it false, and the two
+// repositories it is true of do not have the same term.
+//
+// A generated repository has no upstream to resolve a miss against and no
+// setting on the server changes that. A hosted mirror is isolated because
+// proxy_cache_enabled happens to be off, and the file is installed on a host
+// that never hears about that toggle again: turn it on and the installed
+// stanza goes on asserting isolation while All/*.pkg misses are fetched from
+// pkg.FreeBSD.org and served under this repository's name.
+//
+// One sentence covered both and named neither term, while the mirrored and
+// proxied paragraphs beside it each named theirs. That is the defect this
+// holds: an arm whose prose was written for a narrower case than its
+// predicate admits reads as measured and is not.
+func TestTheIsolationClaimNamesWhatWouldFlipIt(t *testing.T) {
+	const (
+		flip     = "Change either"
+		toggle   = "proxy_cache_enabled is off"
+		noUpstre = "records no upstream"
+	)
+	for _, tc := range []struct {
+		name         string
+		generated    bool
+		fingerprint  string
+		want, absent []string
+		wantNote     []string
+		absentNote   []string
+	}{
+		{
+			name:       "hosted mirror, cache off",
+			want:       []string{"every request stops here", toggle, "not served in proxy mode", flip},
+			absent:     []string{noUpstre},
+			wantNote:   []string{"stops at this server", toggle, "not served in proxy mode"},
+			absentNote: []string{noUpstre},
+		},
+		{
+			name:       "generated, no key",
+			generated:  true,
+			want:       []string{"every request stops here", noUpstre, "no URL to resolve a miss against"},
+			absent:     []string{flip, toggle},
+			wantNote:   []string{"stops at this server", noUpstre},
+			absentNote: []string{flip, toggle},
+		},
+		{
+			name:        "generated and signed",
+			generated:   true,
+			fingerprint: "SHA256:deadbeef",
+			want:        []string{"every request stops here", noUpstre},
+			absent:      []string{flip, toggle},
+			wantNote:    []string{"stops at this server", noUpstre},
+			absentNote:  []string{flip, toggle},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := mirror()
+			if tc.generated {
+				st.Upstream, st.Generated, st.Fingerprint = "", true, tc.fingerprint
+			}
+			got := render(t, st)
+			if got.UpstreamFallthrough {
+				t.Fatalf("upstream_fallthrough is true, so this row is not the isolated case at all")
+			}
+			prose := confProse(got.Conf)
+			for _, want := range tc.want {
+				if !strings.Contains(prose, want) {
+					t.Errorf("the conf claims isolation without saying %q:\n%s", want, got.Conf)
+				}
+			}
+			for _, absent := range tc.absent {
+				if strings.Contains(prose, absent) {
+					t.Errorf("the conf carries %q, which explains the other isolated case:\n%s", absent, got.Conf)
+				}
+			}
+			// The wire-level note answers the same question in one line, so
+			// a consumer that never renders the file reads the same terms.
+			for _, want := range tc.wantNote {
+				if !strings.Contains(got.Note(), want) {
+					t.Errorf("Note() claims isolation without saying %q: %q", want, got.Note())
+				}
+			}
+			for _, absent := range tc.absentNote {
+				if strings.Contains(got.Note(), absent) {
+					t.Errorf("Note() carries %q, which explains the other isolated case: %q", absent, got.Note())
+				}
+			}
+		})
+	}
+}
+
+// Generated is the absence of an upstream and not merely correlated with it,
+// which is what licenses Repo.RecordsUpstream reading one for the other.
+//
+// The reach claim is the caller that cares: what makes a generated repository
+// isolated is having no URL to resolve a miss against. Render refuses both
+// entries where the two part company, so the equality holds for every
+// configuration it returns, and this is the test that fails if either refusal
+// is lifted without the reach paragraph being revisited.
+func TestGeneratedIsExactlyTheAbsenceOfAnUpstream(t *testing.T) {
+	const upstream = "https://pkg.freebsd.org/FreeBSD:14:amd64/latest"
+	for _, tc := range []struct {
+		name      string
+		generated bool
+		upstream  string
+		refused   bool
+		records   bool
+	}{
+		{name: "mirror", upstream: upstream, records: true},
+		{name: "generated", generated: true},
+		{name: "both", generated: true, upstream: upstream, refused: true},
+		{name: "neither", refused: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := mirror()
+			st.Generated, st.Upstream = tc.generated, tc.upstream
+			got, err := pkgrepos.Render(st)
+			if tc.refused {
+				if err == nil {
+					t.Fatalf("Render emitted a stanza for generated=%v upstream=%q:\n%s", tc.generated, tc.upstream, got.Conf)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Render(%+v) = %v", st, err)
+			}
+			if got.RecordsUpstream() != tc.records {
+				t.Errorf("RecordsUpstream() = %v, want %v: the reach paragraph reads it as \"there is a URL to resolve a miss against\"",
+					got.RecordsUpstream(), tc.records)
+			}
+		})
+	}
+}
+
+// A wire shape carrying no upstream_fallthrough decodes it as false, and a
+// proxied repository re-rendered from one may not be called isolated.
+//
+// doctor reads a rendered Repo off /api/v1/status and re-renders it for
+// another release, so the two ends can differ in age: a server that predates
+// the field hands a proxy a Repo whose isolation bit reads false. Reading the
+// serving mode before that field puts it in the arm the mode already proves,
+// which is why the reach switch tests HoldsCatalogue above
+// UpstreamFallthrough rather than below it.
+func TestAProxyReRenderedFromAnOlderWireShapeIsNotCalledIsolated(t *testing.T) {
+	var decoded pkgrepos.Repo
+	wire := `{"tag":"bodega-latest","abi":"FreeBSD:14:amd64","repo":"latest","release":14,` +
+		`"proxy":true,"url":"https://bodega.internal/freebsd/${ABI}/latest",` +
+		`"signature_type":"fingerprints","fingerprints":"/usr/share/keys/pkg","disabled":["FreeBSD"]}`
+	if err := json.Unmarshal([]byte(wire), &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.UpstreamFallthrough {
+		t.Fatalf("this wire shape is supposed to omit upstream_fallthrough, so it decodes as false")
+	}
+	got, err := decoded.WithRelease(14)
+	if err != nil {
+		t.Fatalf("WithRelease(14) = %v", err)
+	}
+	prose := confProse(got.Conf)
+	if strings.Contains(prose, "every request stops here") {
+		t.Errorf("a proxy re-rendered from a wire shape with no upstream_fallthrough is told nothing leaves the host:\n%s", got.Conf)
+	}
+	if !strings.Contains(prose, "served in proxy mode") {
+		t.Errorf("the re-rendered conf never says the mode it carries reaches upstream:\n%s", got.Conf)
+	}
+	if !strings.Contains(got.Note(), "may reach the internet") {
+		t.Errorf("Note() withholds from a proxy what the conf says about it: %q", got.Note())
+	}
+}
+
 // The mirror note names the catalogue files rather than saying "the
 // catalogue", because the route recognizes exactly three names
 // (manifest.FreeBSDCatalogFiles) and a repository-root file under any other
