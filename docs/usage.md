@@ -3718,6 +3718,18 @@ All API responses are JSON. The full API is documented in [OpenAPI 3.0 format](.
 | GET    | `/api/v1/profiles/{name}/pins`             | One profile's pins, with their reason, review date and OSV state. `?stale=true` narrows to the overdue ones. Admin-gated. See [Pins as recorded decisions](#pins-as-recorded-decisions) |
 | GET    | `/healthz`                                 | Health probe (returns `ok`)                                                                                                                                                             |
 
+#### `version` on `/api/v1/status`
+
+`version` is the build stamp of the running server, the same string `bodega --version` prints first: `git describe --tags --always --dirty` of the tree it was built from, or `dev` for a binary built without the Makefile's flags.
+
+```json
+"version": "07c79c3"
+```
+
+It is present only for a caller inside `admin_permit_cidr` (see `bodega acl`), and every other caller gets the response without the key. A package repository answers a whole fleet, so its build number is a public statement of which advisories apply to it; the gate is the one `spool.dir` sits behind. An empty `admin_permit_cidr` permits nobody, so on such a server no caller sees `version` at all. Behind a reverse proxy the address tested is the one resolved through `trusted_proxies`: a forwarded header from a proxy outside that list is not believed, and the address tested is the proxy's own.
+
+An absent `version` therefore means one of two things, and the response cannot tell you which: the caller is outside `admin_permit_cidr`, or the server predates the field. Run `bodega --version` on the server host rather than reading the absence as either one.
+
 #### The `apt` block on `/api/v1/status`
 
 `/api/v1/status` carries an `apt` object reporting how apt clients reach this server. It is the answer to what an emitter would otherwise guess at, and the reason the banner, the TUI and the web UI agree.
