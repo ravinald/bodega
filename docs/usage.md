@@ -1547,7 +1547,7 @@ Components: main
 Signed-By: /etc/apt/keyrings/bodega-archive-keyring.gpg
 ```
 
-The server composes that stanza, because which codename a host reads is a fact only the running instance holds. Pass `--token` for a host identified by a token; a host bound with `bodega identity bind cidr` is identified by its address and needs none. A host bodega cannot identify is told which codenames exist rather than handed one.
+The server composes that stanza, because which codename a host reads is a fact only the running instance holds. Pass `--token` for a host identified by a token; a host bound with `bodega identity bind cidr` is identified by its address and needs none. A host bodega cannot identify is told which codenames exist rather than handed one, and `--suite` is how it is configured anyway.
 
 What the client then sees when a dependency is outside the baseline:
 
@@ -1576,13 +1576,21 @@ Three limits, stated rather than left to be found:
 
 Filtered codenames appear in the startup banner and in `GET /api/v1/status` under `apt.filtered`, with a rendered stanza each in `apt.sources`. Nothing in the config file names them, so those are the two places to read them off. They are regenerated on the hourly index rebuild and on every `bodega profile` write, and the upstream indexes they are built from are cached behind `metadata_ttl`. A rebuild that cannot read or parse the upstream `Packages` withdraws the codename rather than serving the part of it that arrived, so `apt update` fails on a source line naming the instance; a truncated index would instead report every package past the break as kept back. An architecture the base's `Release` names and the archive answers 404 for is the exception: it is dropped from the filtered `Release` and the rest is served, because `archive.ubuntu.com` declares all seven and carries two, and the codename is withdrawn only when none survives.
 
-### `bodega doctor [--write-credentials --token TOKEN [--url URL]] [--write-apt-sources] [--write-pkg-repo [--abi ABI] [--release N]]`
+### `bodega doctor [--write-credentials --token TOKEN [--url URL]] [--write-apt-sources [--suite CODENAME]] [--write-pkg-repo [--abi ABI] [--release N]]`
 
 Without flags, `doctor` reports and changes nothing. It has three writes, and they run one at a time.
 
 It exits 0 when every check is clean, 2 when one or more produced a finding, and 3 when one or more could not run at all. A check reports `SKIPPED` rather than `N/A` when the file or store it reads would not open, and the `Could not run:` block names what it needed: an unprivileged run against the root-owned `/etc/bodega/config.json` the service unit prescribes measures no policy posture, and three `N/A` rows beside the checks that passed said nothing about that. `N/A` keeps its meaning, which is a measurement: the subject is absent on this host.
 
 `--write-apt-sources` asks the server which apt suite this host should read and installs the keyring and the stanza; see [apt under a profile](#apt-under-a-profile).
+
+`--suite` names the codename when the server will not. An instance that mirrors serves a codename per upstream beside the one it generates, so several codenames is its ordinary state rather than a misconfiguration, and with no profile to choose between them the server names none:
+
+```bash
+bodega doctor --write-apt-sources --suite noble --url https://bodega.internal
+```
+
+The stanza is still the server's rendering of that codename, so this flag decides which block is installed and nothing about its contents. A mirrored codename installs the sources file alone, with no keyring and no trust line: bodega does not sign what it proxies, the archive's own signature reaches the client intact, and apt verifies it against the distro keyring the host already has. `Signed-By:` naming bodega's key there would fail every `apt update` on the signature, and `[trusted=yes]` would discard a signature that is present and valid, so the write refuses a stanza carrying either. A host whose profile scopes apt is refused too, and told to change the profile's base: the filtered codename is that profile's answer, and the unfiltered base it was built from is in the same list.
 
 `--write-pkg-repo` is the FreeBSD half. It asks the server which pkg repository answers for this host's ABI and writes `/usr/local/etc/pkg/repos/bodega.conf`, which carries two things rather than one: bodega's repository, and the overrides that disable the repository `/etc/pkg/FreeBSD.conf` defines. A file with only the first leaves the host fetching from `pkg.FreeBSD.org` beside bodega, and `pkg update` says nothing about it, so the write refuses a document that disables nothing.
 
@@ -3017,7 +3025,7 @@ bodega identity bind token <id> devbox-3                                # on the
 bodega doctor --write-credentials --token bodega_ak_... --url https://bodega-host:8080
 ```
 
-The last line runs on the client and writes the token into the file each of its package managers reads. See [`bodega doctor`](#bodega-doctor---write-credentials---token-token---url-url---write-apt-sources---write-pkg-repo---abi-abi---release-n) for what lands where, and [`bodega identity`](#bodega-identity-bindunbindlist) for the CIDR binding that covers a whole subnet with no credential to distribute.
+The last line runs on the client and writes the token into the file each of its package managers reads. See [`bodega doctor`](#bodega-doctor---write-credentials---token-token---url-url---write-apt-sources---suite-codename---write-pkg-repo---abi-abi---release-n) for what lands where, and [`bodega identity`](#bodega-identity-bindunbindlist) for the CIDR binding that covers a whole subnet with no credential to distribute.
 
 **FreeBSD pkg** (`/usr/local/etc/pkg/repos/bodega.conf`). Do not hand-write this one; ask the server:
 
@@ -3740,7 +3748,7 @@ All API responses are JSON. The full API is documented in [OpenAPI 3.0 format](.
 - `sources` carries one rendered block per served suite, so a caller holding a package selects the block for that package's suite rather than composing a line.
 - `mirrored` names the codenames proxied from an upstream archive rather than generated here, and it is what separates the two. Upstream's signature authenticates a mirrored codename, so `signed` says nothing about it and the `sources` block beside it renders differently.
 - `filtered` names the codenames generated from a profile's view of a mirrored codename. A client treats them as generated suites (bodega's key signs them and `Signed-By:` goes on the line); they are separate from `suites` because no `apt_suites` entry produced them.
-- `host` is the one stanza the host that asked should install, so a client installs it rather than picking a block out of `sources`. `profile` names the profile that scoped apt for that host, and is absent when none does — an instance serving a single codename answers `host` for every caller, profile or not. Both are absent when the answer is the operator's: no profile scopes apt and this instance serves more than one codename, and a guess there points a host at the wrong suite with nothing reporting it.
+- `host` is the one stanza the host that asked should install, so a client installs it rather than picking a block out of `sources`. `profile` names the profile that scoped apt for that host, and is absent when none does — an instance serving a single codename answers `host` for every caller, profile or not. Both are absent when the answer is the operator's: no profile scopes apt and this instance serves more than one codename, and a guess there points a host at the wrong suite with nothing reporting it. `bodega doctor --write-apt-sources --suite <codename>` is the operator giving that answer, and it installs the block `sources` carries for that codename.
 - `public_url` is the configured value when there is one. With none set it is the origin of the request that asked, resolved through `X-Forwarded-Proto` when the peer is trusted.
 - `notes` are the consequences of the form above them: the permanence of `[trusted=yes]`, or the fact that the first keyring fetch is authenticated by TLS alone.
 

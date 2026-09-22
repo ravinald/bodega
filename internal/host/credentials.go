@@ -359,26 +359,46 @@ const (
 // who wants a second source writes a second file, which is what the .list.d
 // directory is for.
 //
+// mirrored says the stanza is a codename bodega proxies rather than one it
+// generates, which is the one case that installs a sources file and no keyring
+// beside it: the archive's own signature reaches the client intact and apt
+// checks it against the distro keyring already on the host. It is the caller's
+// answer from the server rather than something inferred from the stanza here,
+// because the mirrored form is defined by what it does not carry — no
+// Signed-By:, no Trusted: — and a truncated or empty stanza looks identical.
+//
 // root prefixes both paths and is empty everywhere but a test. Both of them
 // are absolute and outside home — apt reads /etc/apt and nowhere else — so
 // without it the only way to exercise the guards and the ordering below is to
 // write the running host's real sources.
-func WriteAptSources(root, keyringPath, stanza string, keyring []byte) ([]string, error) {
-	if len(keyring) == 0 {
+func WriteAptSources(root, keyringPath, stanza string, mirrored bool, keyring []byte) ([]string, error) {
+	names := strings.Contains(stanza, keyringPath)
+	switch {
+	case mirrored && names:
+		return nil, fmt.Errorf("this stanza is a mirrored codename and names %s in a Signed-By: line, which would have apt verify upstream's bytes against bodega's key. Every "+
+			"apt update on this host would fail on the signature", keyringPath)
+	case mirrored && strings.Contains(stanza, "Trusted: yes"):
+		return nil, fmt.Errorf("this stanza is a mirrored codename and carries Trusted: yes, which would discard the upstream signature apt can check rather than install it")
+	case mirrored && strings.TrimSpace(stanza) == "":
+		return nil, fmt.Errorf("this bodega returned an empty stanza for a mirrored codename, so there is nothing to install")
+	case !mirrored && len(keyring) == 0:
 		return nil, fmt.Errorf("no keyring to install: this bodega serves its apt index unsigned, and a stanza with no Signed-By: would need [trusted=yes], which turns verification off for the source permanently.\n" +
 			"  Sign it on the server:  bodega apt key generate")
-	}
-	if !strings.Contains(stanza, keyringPath) {
+	case !mirrored && !names:
 		return nil, fmt.Errorf("the stanza this bodega returned does not name %s in a Signed-By: line, so installing the keyring there would leave it unread", keyringPath)
 	}
-	var wrote []string
-	for _, f := range []struct {
+	files := []struct {
 		path string
 		data []byte
 	}{
 		{filepath.Join(root, keyringPath), keyring},
 		{filepath.Join(root, AptSourcesPath), []byte(strings.TrimRight(stanza, "\n") + "\n")},
-	} {
+	}
+	if mirrored {
+		files = files[1:]
+	}
+	var wrote []string
+	for _, f := range files {
 		if err := os.MkdirAll(filepath.Dir(f.path), 0o755); err != nil {
 			return wrote, fmt.Errorf("create %s: %w", filepath.Dir(f.path), err)
 		}
