@@ -3071,13 +3071,13 @@ Point a mirror at bodega's fingerprints and every `pkg update` fails on a signat
 
 **How much of this repository leaves the host is two facts, and the file answers with both.** Whether _any_ path falls through to upstream is the three terms above: the entry records a `url`, and either its mode is `proxy` or the server's `proxy_cache_enabled` is on. How much falls through is the serving mode alone. A proxied repository fetches its catalogue from upstream with everything else and holds nothing of its own; a hosted mirror serves the catalogue that was published to it and answers a miss on `meta.conf`, `packagesite.pkg` or `data.pkg` with 404 rather than fetching it, because upstream's catalogue names packages the mirror has never held. Those three names are what the route recognizes, and the emitted comment names them for that reason. Both facts reach the client configuration, and neither is enough on its own. Measured on 2026-09-21 against two `FreeBSD:15:aarch64` entries recording the same `pkg.FreeBSD.org/FreeBSD:15:aarch64/quarterly` URL on a server with `proxy_cache_enabled: true` and nothing uploaded to either, differing only in the mode:
 
-| Path | `mode: proxy` | hosted |
-| --- | --- | --- |
-| `meta.conf` | 200 | 404 |
-| `packagesite.pkg` | 200 | 404 |
-| `data.pkg` | 200 | 404 |
-| `All/pv-1.9.31.pkg` | 200 | 200 |
-| `Latest/pkg.pkg` | 200 | 200 |
+| Path                | `mode: proxy` | hosted |
+| ------------------- | ------------- | ------ |
+| `meta.conf`         | 200           | 404    |
+| `packagesite.pkg`   | 200           | 404    |
+| `data.pkg`          | 200           | 404    |
+| `All/pv-1.9.31.pkg` | 200           | 200    |
+| `Latest/pkg.pkg`    | 200           | 200    |
 
 Every 200 came off `pkg.FreeBSD.org` and `cache_origins` names the upstream URL for each. So the emitted comment says one of four things rather than the one it used to: every request may reach the internet including the catalogue, or the catalogue is served here and every other path falls through on a miss, or nothing falls through because there is no `url` to resolve a miss against, or nothing falls through because this repository is hosted and `proxy_cache_enabled` is off. The second is the one an operator is most likely to be wrong about, because a hosted mirror is what you reach for when you want a finished local copy, and an install against it can succeed on a package nobody mirrored.
 
