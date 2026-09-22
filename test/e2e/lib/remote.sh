@@ -26,17 +26,39 @@ if [ -f "$E2E_HOSTS_ENV" ]; then
 fi
 E2E_SERVER_HOST="${E2E_SERVER_HOST:-}"
 E2E_CLIENT_HOST="${E2E_CLIENT_HOST:-}"
+E2E_FREEBSD_SERVER_HOST="${E2E_FREEBSD_SERVER_HOST:-}"
+E2E_FREEBSD_CLIENT_HOST="${E2E_FREEBSD_CLIENT_HOST:-}"
+
+# Every alias a suite may name, in one place, so the allowlist in run.sh has a
+# single list to disagree with.
+E2E_HOST_ALIASES="server client freebsd-server freebsd-client"
 
 # Resolve an alias to a hostname, or fail closed.
+#
+# The FreeBSD pair is two guests rather than one because the two halves fail
+# differently: a client answers whether pkg accepts what bodega signed, and a
+# server is the only place internal/storage's extattr and POSIX.1e ACL paths
+# ever execute. One guest doing both would run the server code as a side effect
+# of a client test, and a failure there names neither.
 e2e_host_for() {
 	case "$1" in
 	server) printf '%s' "$E2E_SERVER_HOST" ;;
 	client) printf '%s' "$E2E_CLIENT_HOST" ;;
+	freebsd-server) printf '%s' "$E2E_FREEBSD_SERVER_HOST" ;;
+	freebsd-client) printf '%s' "$E2E_FREEBSD_CLIENT_HOST" ;;
 	*)
-		printf 'e2e: unknown host alias %q; suites may name only "server" or "client"\n' "$1" >&2
+		printf 'e2e: unknown host alias %q; suites may name only: %s\n' "$1" "$E2E_HOST_ALIASES" >&2
 		return 2
 		;;
 	esac
+}
+
+# Every configured hostname, in alias order. run.sh checks each against the
+# allowlist and closes each one's ssh control socket, and both of those went
+# wrong by enumerating two hosts after a third existed.
+e2e_all_hosts() {
+	printf '%s\n' "$E2E_SERVER_HOST" "$E2E_CLIENT_HOST" \
+		"$E2E_FREEBSD_SERVER_HOST" "$E2E_FREEBSD_CLIENT_HOST"
 }
 
 # A control socket per run. A full pass makes several hundred ssh calls and a

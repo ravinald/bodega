@@ -914,6 +914,16 @@ components:
         dep_policy:
           type: string
           enum: [none, direct, transitive]
+        storage_policy:
+          type: string
+          description: >-
+            Backend the next version of this package is written to, overriding
+            storage_by_type. Setting it moves no stored bytes.
+        storage_groups:
+          type: array
+          description: Storage groups this package belongs to, resolved to a backend by storage_by_group.
+          items:
+            type: string
         versions:
           type: array
           items:
@@ -942,10 +952,28 @@ components:
         source_name:
           type: string
           description: Upstream apt package name
+        source_package:
+          type: string
+          description: >-
+            Debian source package this binary was built from. Absent when no
+            capture recorded it, which does not mean it equals the binary name.
+        capture_suite:
+          type: string
+          description: Distribution release the captured host ran, e.g. noble. Not a publishing field.
         build_cmd:
           type: string
         deb_glob:
           type: string
+        suites:
+          type: array
+          description: Apt suites this .deb is published to. Absent means the server's default suite.
+          items:
+            type: string
+        generated:
+          type: boolean
+          description: >-
+            FreeBSD repository whose catalogue bodega builds and signs, rather
+            than one copied from upstream.
         filename:
           type: string
           description: Binary filename override
@@ -966,10 +994,27 @@ components:
         platform:
           type: string
           description: Target platform (e.g. linux/amd64)
+        build_env:
+          $ref: "#/components/schemas/BuildEnv"
         artifact_size:
           type: integer
           format: int64
           description: Size in bytes
+        dependencies:
+          type: array
+          description: >-
+            What this version declares it needs, recorded at fetch time. Absent
+            means no fetch recorded any, not that the version has none.
+          items:
+            $ref: "#/components/schemas/Dependency"
+        artifact_digest:
+          type: string
+          description: >-
+            Hex SHA-256 of the bytes bodega stored. checksum is what this
+            version should be; this is what bodega has.
+        storage:
+          type: string
+          description: Backend holding this version's bytes. Absent means `default`.
         hidden:
           type: boolean
         frozen:
@@ -980,6 +1025,57 @@ components:
           type: object
           additionalProperties:
             type: string
+
+    BuildEnv:
+      type: object
+      description: The build server's environment when the artifact was produced.
+      properties:
+        platform:
+          type: string
+          example: linux/amd64
+        os_release:
+          type: string
+        python:
+          type: string
+        go:
+          type: string
+        rust:
+          type: string
+        bodega:
+          type: string
+          description: Build version of the bodega that produced the artifact
+        built_at:
+          type: string
+          format: date-time
+
+    Dependency:
+      type: object
+      description: >-
+        One dependency a version declares, in the form the registry protocol
+        publishes. name and req are every ecosystem's; the rest are cargo
+        sparse-index members.
+      required: [name, req]
+      properties:
+        name:
+          type: string
+        req:
+          type: string
+          description: Version requirement as the registry publishes it
+        features:
+          type: array
+          items:
+            type: string
+        optional:
+          type: boolean
+        default_features:
+          type: boolean
+        target:
+          type: string
+          description: cfg() expression or triple the dependency is conditional on
+        kind:
+          type: string
+          enum: [normal, build, dev]
+          description: Absent means normal
 
     Checksum:
       type: object
@@ -1463,30 +1559,45 @@ components:
 
     AuditEvent:
       type: object
+      description: |
+        One audit event. The field names are capitalized because
+        audit.StoredEvent carries no JSON tags, the same exception PolicyRule
+        documents.
       properties:
-        id:
+        ID:
           type: integer
-        timestamp:
+          format: int64
+        Timestamp:
           type: string
           format: date-time
-        event_type:
+        EventType:
           type: string
-        pkg_type:
+        PkgType:
           type: string
-        pkg_name:
+        PkgName:
           type: string
-        pkg_version:
+        PkgVersion:
           type: string
-        client_ip:
+        ClientIP:
           type: string
-        user_agent:
+        UserAgent:
           type: string
-        status:
+        Status:
           type: string
-        duration_ms:
+        DurationMs:
           type: integer
-        details:
+          format: int64
+        Details:
           type: string
+          description: JSON-encoded context, as a string
+        Actor:
+          type: string
+          description: OS user for CLI and TUI events; empty for HTTP events, which carry ClientIP
+        Identity:
+          type: string
+          description: >-
+            Host an identity binding resolved the request to. Empty when nothing
+            bound it; it sits beside ClientIP rather than replacing it.
 
     ProfilePin:
       type: object
@@ -1564,21 +1675,27 @@ components:
 
     TokenInfo:
       type: object
+      description: |
+        Token metadata. The field names are capitalized because
+        audit.TokenInfo carries no JSON tags, the same exception PolicyRule
+        documents.
       properties:
-        id:
+        ID:
           type: string
-        label:
+        Label:
           type: string
-        comment:
+        Comment:
           type: string
-        created_at:
-          type: string
-          format: date-time
-        expires_at:
+        CreatedAt:
           type: string
           format: date-time
-          nullable: true
-        last_used:
+        ExpiresAt:
           type: string
           format: date-time
           nullable: true
+          description: null when the token never expires
+        LastUsed:
+          type: string
+          format: date-time
+          nullable: true
+          description: null when the token has never been used
