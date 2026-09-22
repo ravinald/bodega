@@ -3,6 +3,7 @@ package storage
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"io"
 	"os"
 	"path/filepath"
@@ -785,5 +786,133 @@ func TestLabelIsOnePerLocation(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// FreeBSD's extended-attribute and ACL interfaces are covered here rather than
+// on a FreeBSD host, because no FreeBSD host exists in this project yet (E08
+// owns standing one up). What runs is the encoding and decoding between
+// bodega and the kernel, which is the layer the interface differences reach.
+// What does not run is the syscalls themselves: acl_freebsd.go's __acl_get_fd
+// and __acl_set_fd, and xattr_freebsd.go's extattr_list_fd, are unexercised.
+
+// extattrList builds the answer extattr_list_fd(2) gives: one byte of length
+// per name, then the name, and no terminator.
+func extattrList(names ...string) []byte {
+	var buf []byte
+	for _, name := range names {
+		//nolint:gosec // G115: every name below is far shorter than 255 bytes.
+		buf = append(buf, byte(len(name)))
+		buf = append(buf, name...)
+	}
+	return buf
+}
+
+// xattrNamespaceAccepts restates unix.xattrnamespace (x/sys/unix v0.48.0,
+// xattr_bsd.go), which is unexported and which every Fgetxattr, Fsetxattr and
+// Fremovexattr on FreeBSD runs its name through. A name it refuses comes back
+// ENOATTR, which readAccess hands to missingXattr and then skips.
+func xattrNamespaceAccepts(name string) bool {
+	ns, _, ok := strings.Cut(name, ".")
+	return ok && (ns == "user" || ns == "system")
+}
+
+func TestFreeBSDAttributeNamesDecodeFromLengthPrefixes(t *testing.T) {
+	t.Parallel()
+	buf := extattrList("bodega.sha256", "md5")
+	got, err := splitExtattrNames(buf, "user.")
+	if err != nil {
+		t.Fatalf("decode the user namespace: %v", err)
+	}
+	want := []string{"user.bodega.sha256", "user.md5"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("splitExtattrNames = %q, want %q", got, want)
+	}
+	// The same buffer read the way Linux and macOS answer: one run of bytes
+	// with no NUL in it, so the whole answer is a single name carrying a
+	// length prefix in place of its first character.
+	nul := strings.Split(string(buf), "\x00")
+	if len(nul) != 1 {
+		t.Fatalf("the FreeBSD answer split on NUL into %d names; it holds no NUL at all", len(nul))
+	}
+	if xattrNamespaceAccepts(nul[0]) {
+		t.Errorf("unix.Fgetxattr would accept %q, so splitting on NUL would have gone unnoticed", nul[0])
+	}
+}
+
+func TestEveryDecodedAttributeNameReadsBackThroughFgetxattr(t *testing.T) {
+	t.Parallel()
+	for _, ns := range []struct {
+		prefix string
+		buf    []byte
+	}{
+		{"user.", extattrList("bodega.sha256", "md5")},
+		{"system.", extattrList("posix1e.acl_access", "md5")},
+	} {
+		names, err := splitExtattrNames(ns.buf, ns.prefix)
+		if err != nil {
+			t.Fatalf("decode the %s namespace: %v", ns.prefix, err)
+		}
+		if len(names) == 0 {
+			t.Fatalf("decode the %s namespace: no names", ns.prefix)
+		}
+		for _, name := range names {
+			if !xattrNamespaceAccepts(name) {
+				t.Errorf("unix.Fgetxattr refuses %q, so the attribute is read as ENOATTR and dropped", name)
+			}
+		}
+	}
+	// Unqualified is what the kernel hands back and what a decoder that only
+	// fixed the length prefixes would return. "posix1e" is not a namespace, so
+	// the ACL every object on an ACL-enabled UFS carries is the first casualty.
+	if xattrNamespaceAccepts("posix1e.acl_access") {
+		t.Error("xattrNamespaceAccepts admits an unqualified name; the mirror of unix.xattrnamespace is wrong")
+	}
+}
+
+func TestSplitExtattrNamesRefusesAnAnswerThatRunsPastItsEnd(t *testing.T) {
+	t.Parallel()
+	if _, err := splitExtattrNames([]byte{9, 'm', 'd', '5'}, "user."); err == nil {
+		t.Error("splitExtattrNames accepted a 9-byte name in a 3-byte answer")
+	}
+}
+
+func TestMinimalACLIsTheModeBitsAndNothingNamed(t *testing.T) {
+	t.Parallel()
+	acl := minimalACL(0o640)
+	if err := checkStructACL(acl); err != nil {
+		t.Fatalf("minimalACL built a struct acl __acl_set_fd would refuse: %v", err)
+	}
+	if cnt := binary.NativeEndian.Uint32(acl[4:8]); cnt != 3 {
+		t.Errorf("acl_cnt = %d, want 3: the owner, the owning group and everyone else", cnt)
+	}
+	for i, want := range []struct{ tag, perm uint32 }{
+		{tagUserObj, 6},
+		{tagGroupObj, 4},
+		{tagOther, 0},
+	} {
+		off := aclEntryStart + i*aclEntrySize
+		tag := binary.NativeEndian.Uint32(acl[off : off+4])
+		id := binary.NativeEndian.Uint32(acl[off+4 : off+8])
+		perm := binary.NativeEndian.Uint32(acl[off+8 : off+12])
+		if tag != want.tag || perm != want.perm || id != undefinedID {
+			t.Errorf("entry %d = {tag %#x, id %#x, perm %d}, want {tag %#x, id %#x, perm %d}",
+				i, tag, id, perm, want.tag, undefinedID, want.perm)
+		}
+	}
+}
+
+func TestCheckStructACLRefusesABlobTheKernelWould(t *testing.T) {
+	t.Parallel()
+	if err := checkStructACL(make([]byte, aclSize)); err == nil {
+		t.Error("a struct acl with acl_maxcnt 0 was accepted; acl_copyout answers that one EINVAL")
+	}
+	if err := checkStructACL(minimalACL(0o644)[:aclSize-1]); err == nil {
+		t.Error("a short struct acl was accepted")
+	}
+	tooMany := blankACL()
+	binary.NativeEndian.PutUint32(tooMany[4:8], aclMaxEntries+1)
+	if err := checkStructACL(tooMany); err == nil {
+		t.Error("a struct acl claiming more entries than it holds was accepted")
 	}
 }
