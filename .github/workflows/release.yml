@@ -26,7 +26,10 @@ jobs:
 
       - uses: goreleaser/goreleaser-action@v7
         with:
-          version: latest
+          # This job signs and attests what people install, so the tool that
+          # builds it is a version somebody chose rather than whatever shipped
+          # the morning of the tag.
+          version: v2.18.2
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
