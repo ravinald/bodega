@@ -3521,6 +3521,149 @@ Building reads every package in the repository, so the result is held until the 
 
 The ordering rule the mirror spends most of its design on does not apply here. A generated catalogue is derived from the objects rather than fetched alongside them, so it can only name bytes the store already holds.
 
+### Serving the FreeBSD ports tree
+
+A FreeBSD host gets its ports tree in one of two ways, and bodega serves both with types it already has. There is no `ports` type.
+
+| Source      | How a host gets it                                                               | bodega serves it through                | Updates by                                     |
+| ----------- | -------------------------------------------------------------------------------- | --------------------------------------- | ---------------------------------------------- |
+| `ports.txz` | `bsdinstall` extracts it from the release distribution set                       | a `binary` entry                        | a newer tarball, or converting the tree to git |
+| git         | `git clone https://git.FreeBSD.org/ports.git /usr/ports`, as the Handbook prints | a `git_upstreams` namespace, smart-HTTP | `git pull`                                     |
+
+Find out which one a host has before telling it how to update: `test -d /usr/ports/.git`. A host installed from the boot media with the ports component selected has the tarball, and that is the common case rather than the exception.
+
+portsnap was the third way. It was removed in FreeBSD 14.0 and its servers went away at the end of 13, and bodega does not serve it.
+
+#### The tarball
+
+`ports.txz` is a plain file, so it is one `binary` entry. Take the digest from the release's own `MANIFEST`, which publishes a SHA-256 for every distribution set:
+
+```bash
+fetch -qo - https://download.freebsd.org/releases/amd64/amd64/15.1-RELEASE/MANIFEST | grep '^ports.txz'
+```
+
+```json
+{
+  "config_version": 1,
+  "name": "freebsd-ports",
+  "type": "binary",
+  "description": "FreeBSD ports tree, the release distribution set",
+  "versions": [
+    {
+      "version": "15.1-RELEASE",
+      "url": "https://download.freebsd.org/releases/amd64/amd64/15.1-RELEASE/ports.txz",
+      "filename": "ports.txz",
+      "sha256": "0429c42e496576596bad6826308c9e876b3e0e7bb98fb0d55966f827601c20c5"
+    }
+  ]
+}
+```
+
+```bash
+bodega pkg import freebsd-ports.json
+bodega build upload binary freebsd-ports
+```
+
+One entry serves every architecture. The tree is architecture-independent, and `amd64/amd64` and `arm64/aarch64` publish the same digest for 15.1-RELEASE: the per-architecture path repeats the file in the URL layout, not in the bytes. Add a version per release you serve.
+
+On the client, fetch it and extract at `/`, because the members are rooted at `usr/ports/`:
+
+```bash
+fetch -o /tmp/ports.txz https://bodega-host:8080/binaries/freebsd-ports/15.1-RELEASE/ports.txz
+sha256 /tmp/ports.txz        # compare against the entry's sha256
+tar -xf /tmp/ports.txz -C /
+```
+
+The 15.1-RELEASE file is 64,419,752 bytes. Extracted, it is about 530 MB of content across 215,208 files and directories (the third column of its `MANIFEST` line), so what it takes on disk depends on the filesystem's block size: 1.3 GB on the ext4 test guest.
+
+#### Updating a tarball tree
+
+**A tarball tree has no `.git`, and `git pull` inside it fails** with an error that names neither cause:
+
+```text
+fatal: not a git repository (or any of the parent directories): .git
+```
+
+The tree is pinned to the ports snapshot its release shipped, and nothing in it knows where it came from. There are two ways forward:
+
+- **A newer tarball.** Add the next release's `ports.txz` as a new version and extract it into an empty `/usr/ports`. Extracting over the old tree leaves every port the new one removed in place, and `make` will build them.
+- **Converting to git.** Move the tree aside and clone into the empty path, as below. `git clone` refuses a directory that is not empty (`fatal: destination path '/usr/ports' already exists and is not an empty directory.`), so a clone over the tarball tree fails rather than merging. `DISTDIR` defaults to `/usr/ports/distfiles`, so move that back afterwards if the host has fetched anything.
+
+```bash
+mv /usr/ports /usr/ports.txz-tree
+git clone --depth 1 --branch 2026Q3 https://bodega-host:8080/git/freebsd/freebsd-ports.git /usr/ports
+mv /usr/ports.txz-tree/distfiles /usr/ports/ 2>/dev/null
+```
+
+#### The git tree
+
+Map a namespace onto FreeBSD's GitHub mirror in `config.json`, not onto `git.FreeBSD.org`:
+
+```json
+"git_upstreams": {
+  "freebsd": { "url": "https://github.com/freebsd/", "mode": "open" }
+}
+```
+
+The two carry the same commits under the same branch names; `git ls-remote` against both returned identical heads for `main` and `2026Q3`. What differs is whether a full clone completes. bodega's mirror is `git clone --mirror`, which asks for the whole history, and `git.FreeBSD.org` answered that with `HTTP 504` after five minutes, twice, from two different networks, before sending any pack data:
+
+```text
+error: RPC failed; HTTP 504 curl 22 The requested URL returned error: 504
+fatal: expected 'packfile'
+```
+
+The same clone from `github.com/freebsd/freebsd-ports` finished in 6m30s at 3.2 GB. A depth-1 clone straight from `git.FreeBSD.org` completed in 1m07s on the same guest, so the Handbook's own command does not meet this; only the full-history request did. The route composes the upstream as `url` plus the path after the namespace, so the clone URL is `/git/freebsd/freebsd-ports.git`.
+
+In `catalog` mode, which is the default, the repository also needs a manifest entry named `freebsd/freebsd-ports`; `bodega discover promote git freebsd/freebsd-ports --as manifest` writes it from the first refused clone.
+
+```bash
+git clone --depth 1 --branch 2026Q3 https://bodega-host:8080/git/freebsd/freebsd-ports.git /usr/ports
+```
+
+**Every branch is served, and `--branch` selects one.** The mirror carries every ref upstream has, so the quarterly branches (`2026Q3` and its siblings) are served beside `main`. A host tracking the release its packages came from wants the quarterly branch matching its `pkg` repository's `quarterly` URL; `main` is what `latest` packages are built from. Without `--branch` the clone takes upstream's `HEAD`, which is `main`.
+
+**`--depth 1` works through smart-HTTP.** `git-upload-pack` makes the shallow cut against bodega's full mirror, so the client receives one commit whatever sits behind it: 131 MB of `.git` in 16 seconds on the test guests, against 2.9 GB in 7m33s for a full clone of the same repository through the same bodega.
+
+**A full clone has five minutes to transfer.** `git-http-backend` runs under a five-minute bound and the server's write timeout is the same five minutes, so the pack has to reach the client inside that window. The full ports history is 2.9 GB, which needs about 10 MB/s sustained. On the test guests' LAN it arrived in time; shaped to 40 Mbit/s, the same clone was cut off at exactly 5m00s:
+
+```text
+error: RPC failed; curl 18 transfer closed with outstanding read data remaining
+fatal: early EOF
+fatal: fetch-pack: invalid index-pack output
+```
+
+Use `--depth 1` on anything slower than that. The error names neither bodega nor a timeout.
+
+**`--depth 1` does not work against a bundle.** A `git` manifest entry with `"source": "clone"` produces a `.bundle` on the [legacy bundle route](#legacy-bundle-route), and `git clone --depth 1` against a bundle ignores the depth with no warning and exit status 0: the client receives the ref's full history. A bundle also carries one ref, so each quarterly branch would be its own entry and its own rebuild. Serve ports through `git_upstreams`, not through a bundle.
+
+**Prime the mirror before pointing hosts at it.** bodega clones upstream on the first request for the repository, bounded at 15 minutes. The clone runs detached from the request, but the request waits on it, and the ports mirror takes longer than the five-minute write timeout: when the clone finished, the waiting client got `curl: (52) Empty reply from server` rather than refs. The mirror is complete by then, and the next request is served from it. Trigger it yourself so no host is the one that waits:
+
+```bash
+curl -sS -o /dev/null --max-time 1000 'https://bodega-host:8080/git/freebsd/freebsd-ports.git/info/refs?service=git-upload-pack'
+```
+
+That curl ending in an empty reply is expected on a first run. `{storage_path}/git/freebsd/freebsd-ports.git/.bodega-fetched` appears when the mirror is complete.
+
+#### Updating a git tree
+
+```bash
+git -C /usr/ports pull
+```
+
+A shallow clone stays shallow across `pull`. Moving to the next quarterly branch on a shallow, single-branch clone needs the branch added to what the clone fetches:
+
+```bash
+git -C /usr/ports remote set-branches --add origin 2026Q4
+git -C /usr/ports fetch --depth 1 origin 2026Q4
+git -C /usr/ports switch 2026Q4
+```
+
+bodega refreshes its mirror from upstream at most once per `metadata_ttl` (default `1h`), and only when a client asks, so a `pull` can trail upstream by up to that interval. See [Refresh](#refresh).
+
+#### Distfiles
+
+The tree is half of a build. `make fetch` reaches the sites each port's `Makefile` names, and a ports tree from bodega does nothing to stop that. bodega does not mirror distfiles: a host building ports with no route to the internet has the recipes and none of the sources.
+
 ### APT index generation
 
 `dists/<suite>/Release` and the `Packages` bodies under it are generated together into one snapshot and served from memory until the next rebuild. Nothing is written to storage: the only stored part of the apt repository is `pool/`.
