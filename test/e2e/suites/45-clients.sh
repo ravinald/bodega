@@ -74,9 +74,27 @@ check_matches CLI-APT-01 "the server holds a signing key" '^[0-9A-F]{40}$' \
 	"${server_fpr:-none}" "cmd/bodega/cmd_apt.go:154" "bodega apt key show"
 
 E2E_HOST=client
-e2e_on client "sudo bodega doctor --write-apt-sources --url '$E2E_BASE_URL' --allow-plaintext" || true
+
+# The codename bodega generates, read off the instance rather than pinned. A
+# server that also mirrors serves a codename per upstream beside it, and with
+# no profile to choose between them the server names none: which one a host
+# reads is the operator's decision. --suite is this check making it, which is
+# what an operator on a mirroring instance does.
+e2e_body client /api/v1/status || true
+apt_suite="$(printf '%s' "$E2E_OUT" | jq -r '.apt.suites[0] // empty' 2>/dev/null || true)"
+apt_suite_flag=""
+if [ -n "$apt_suite" ]; then
+	apt_suite_flag="--suite $apt_suite"
+fi
+
+# Both files go before the write. Left in place they are an earlier run's, and
+# CLI-APT-03 through CLI-APT-08 then grade a sources file this run did not
+# write: every one of them passed that way on a run where CLI-APT-02 failed.
+e2e_on client "sudo rm -f /etc/apt/sources.list.d/bodega.sources /etc/apt/keyrings/bodega-archive-keyring.gpg" || true
+
+e2e_on client "sudo bodega doctor --write-apt-sources $apt_suite_flag --url '$E2E_BASE_URL' --allow-plaintext" || true
 check_eq CLI-APT-02 "doctor writes the client's apt sources" 0 "$E2E_RC" \
-	"cmd/bodega/cmd_doctor.go:87" "bodega doctor --write-apt-sources" "$E2E_RC"
+	"cmd/bodega/cmd_doctor.go:87" "bodega doctor --write-apt-sources $apt_suite_flag" "$E2E_RC"
 
 e2e_on client "cat /etc/apt/sources.list.d/bodega.sources 2>&1" || true
 check_contains CLI-APT-03 "the written source is signed-by the bodega keyring" \

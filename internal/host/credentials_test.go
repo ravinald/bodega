@@ -659,7 +659,7 @@ func testAptStanza() string {
 
 func TestWriteAptSourcesInstallsTheKeyringAndTheStanza(t *testing.T) {
 	root := t.TempDir()
-	wrote, err := WriteAptSources(root, testKeyringPath, testAptStanza(), []byte("keyring bytes"))
+	wrote, err := WriteAptSources(root, testKeyringPath, testAptStanza(), false, []byte("keyring bytes"))
 	if err != nil {
 		t.Fatalf("write the apt sources: %v", err)
 	}
@@ -704,7 +704,7 @@ func TestWriteAptSourcesLandsTheKeyringBeforeTheStanza(t *testing.T) {
 		t.Fatalf("prepare the blocked path: %v", err)
 	}
 
-	wrote, err := WriteAptSources(root, testKeyringPath, testAptStanza(), []byte("keyring bytes"))
+	wrote, err := WriteAptSources(root, testKeyringPath, testAptStanza(), false, []byte("keyring bytes"))
 	if err == nil {
 		t.Fatal("writing the stanza under a path that is a file reported success")
 	}
@@ -718,10 +718,11 @@ func TestWriteAptSourcesLandsTheKeyringBeforeTheStanza(t *testing.T) {
 
 func TestWriteAptSourcesRefusesWhatWouldNeedTrustedYes(t *testing.T) {
 	cases := []struct {
-		name    string
-		stanza  string
-		keyring []byte
-		want    string
+		name     string
+		stanza   string
+		mirrored bool
+		keyring  []byte
+		want     string
 	}{
 		{
 			name:    "no keyring to install",
@@ -735,11 +736,32 @@ func TestWriteAptSourcesRefusesWhatWouldNeedTrustedYes(t *testing.T) {
 			keyring: []byte("keyring bytes"),
 			want:    testKeyringPath,
 		},
+		{
+			// bodega signs what bodega generates. A mirrored codename
+			// pointed at bodega's keyring fails apt update on the
+			// signature, on a host whose sources were working.
+			name:     "a mirrored stanza naming bodega's keyring",
+			stanza:   testAptStanza(),
+			mirrored: true,
+			want:     testKeyringPath,
+		},
+		{
+			name:     "a mirrored stanza carrying Trusted: yes",
+			stanza:   "Types: deb\nURIs: https://bodega.internal/apt\nSuites: resolute\nComponents: main\nTrusted: yes",
+			mirrored: true,
+			want:     "Trusted: yes",
+		},
+		{
+			name:     "an empty mirrored stanza",
+			stanza:   "  \n",
+			mirrored: true,
+			want:     "nothing to install",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
-			wrote, err := WriteAptSources(root, testKeyringPath, tc.stanza, tc.keyring)
+			wrote, err := WriteAptSources(root, testKeyringPath, tc.stanza, tc.mirrored, tc.keyring)
 			if err == nil {
 				t.Fatal("a stanza apt could only read with [trusted=yes] was installed")
 			}
@@ -753,5 +775,38 @@ func TestWriteAptSourcesRefusesWhatWouldNeedTrustedYes(t *testing.T) {
 				t.Errorf("the stanza was installed anyway: %v", err)
 			}
 		})
+	}
+}
+
+// A mirrored codename is the one stanza that installs alone. bodega proxies
+// the upstream dists/ tree with the archive's signature intact, so apt
+// verifies it against the distro keyring the host already has, and a bodega
+// keyring written beside it would be a file nothing reads.
+func TestWriteAptSourcesInstallsAMirroredStanzaWithNoKeyring(t *testing.T) {
+	root := t.TempDir()
+	stanza := strings.Join([]string{
+		"Types: deb",
+		"URIs: https://bodega.internal/apt/",
+		"Suites: resolute",
+		"Components: main restricted universe multiverse",
+	}, "\n")
+
+	wrote, err := WriteAptSources(root, testKeyringPath, stanza, true, nil)
+	if err != nil {
+		t.Fatalf("write a mirrored stanza: %v", err)
+	}
+	want := filepath.Join(root, AptSourcesPath)
+	if len(wrote) != 1 || wrote[0] != want {
+		t.Fatalf("wrote %v, want %v alone", wrote, want)
+	}
+	if _, err := os.Stat(filepath.Join(root, testKeyringPath)); !os.IsNotExist(err) {
+		t.Errorf("a keyring landed beside a stanza that names none: %v", err)
+	}
+	body, err := os.ReadFile(want)
+	if err != nil {
+		t.Fatalf("read the stanza: %v", err)
+	}
+	if strings.Contains(string(body), "Signed-By") || strings.Contains(string(body), "Trusted") {
+		t.Errorf("the installed mirrored stanza carries a trust line:\n%s", body)
 	}
 }

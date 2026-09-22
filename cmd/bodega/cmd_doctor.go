@@ -41,7 +41,7 @@ import (
 // docs/threat-model.md.
 func newDoctorCmd(gf *globalFlags) *cobra.Command {
 	var writeCreds, writeAptSources, writePkgRepo, allowPlaintext bool
-	var token, baseURL, pkgABI string
+	var token, baseURL, pkgABI, aptSuite string
 	var pkgRelease int
 	c := &cobra.Command{
 		Use:   "doctor",
@@ -103,6 +103,22 @@ writes that stanza to /etc/apt/sources.list.d/bodega.sources.
 identified by its address and needs none. A host bodega cannot identify gets
 told which codenames exist rather than handed one.
 
+--suite is how that host gets configured anyway. An instance that mirrors
+serves a codename per upstream beside the one it generates, so several
+codenames is its ordinary state, and with no profile to choose between them
+the server names none: which one a host reads is the operator's decision.
+This flag is that decision, and the stanza is still the server's rendering
+of it.
+
+  bodega doctor --write-apt-sources --suite noble --url https://bodega.internal
+
+A mirrored codename installs the sources file alone. bodega does not sign
+what it proxies, so the archive's own signature reaches the client intact and
+apt verifies it against the distro keyring already on the host; a Signed-By:
+naming bodega's key there would fail every apt update on the signature. A
+host whose profile scopes apt is refused instead of served: that codename is
+the profile's answer, and the unfiltered base is in the same list.
+
 --write-pkg-repo is the FreeBSD half. It asks bodega which pkg repositories
 answer for this host's ABI and writes ` + pkgrepos.ClientConfPath + `,
 which holds two things and not one: the bodega repository, and the overrides
@@ -149,8 +165,12 @@ See docs/threat-model.md for the rationale behind each check.`,
 			if writeCreds {
 				return writeClientCredentials(gf, token, baseURL)
 			}
+			if aptSuite != "" && !writeAptSources {
+				return fmt.Errorf("--suite names the codename --write-apt-sources installs, and that flag is not set.\n"+
+					"  Add it:  bodega doctor --write-apt-sources --suite %s", aptSuite)
+			}
 			if writeAptSources {
-				return writeAptSourcesFile(gf, token, baseURL, allowPlaintext)
+				return writeAptSourcesFile(gf, token, baseURL, aptSuite, allowPlaintext)
 			}
 			if writePkgRepo {
 				return writePkgRepoFile(gf, token, baseURL, pkgABI, pkgRelease, allowPlaintext)
@@ -194,6 +214,8 @@ See docs/threat-model.md for the rationale behind each check.`,
 		"Install the archive keyring and the apt sources stanza this server says the host should read")
 	c.Flags().BoolVar(&writePkgRepo, "write-pkg-repo", false,
 		"Install the pkg repository configuration this server says the host's ABI should read, and disable the upstream one")
+	c.Flags().StringVar(&aptSuite, "suite", "",
+		"The apt codename to install, for an instance serving several and no profile to choose between them")
 	c.Flags().StringVar(&pkgABI, "abi", "",
 		"The pkg ABI to configure for; defaults to what `pkg config abi` reports on this host")
 	c.Flags().IntVar(&pkgRelease, "release", 0,
@@ -376,7 +398,15 @@ type aptClientStatus struct {
 // two identification modes unusable from the command that configures it. What
 // a host with neither gets is the fleet-wide answer, which aptNoStanza names
 // rather than installs.
-func writeAptSourcesFile(gf *globalFlags, token, baseURL string, allowPlaintext bool) error {
+//
+// suite is the operator answering the question the server refuses to: an
+// instance that mirrors serves a codename per upstream beside the one it
+// generates, so several codenames is its ordinary state rather than a
+// misconfiguration to clean up, and without this flag every host on such an
+// instance is configured by hand. The stanza still comes from the server's
+// own rendering — which components a codename carries, and whether bodega
+// signs it, are facts only the running instance holds.
+func writeAptSourcesFile(gf *globalFlags, token, baseURL, suite string, allowPlaintext bool) error {
 	if baseURL == "" {
 		cfg, err := loadConfig(gf)
 		if err != nil {
@@ -397,23 +427,39 @@ func writeAptSourcesFile(gf *globalFlags, token, baseURL string, allowPlaintext 
 		return err
 	}
 	apt := status.Apt
-	if apt.Host == nil {
+	stanza := apt.Host
+	if suite != "" {
+		if stanza, err = aptSuiteChoice(apt, suite); err != nil {
+			return err
+		}
+	}
+	if stanza == nil {
 		return aptNoStanza(apt)
 	}
-	keyring, err := getBody(client, aptsources.KeyringRoute)
-	if err != nil {
-		return err
+	// A mirrored codename is forwarded from its upstream with the archive's
+	// own signature intact, so apt verifies it against the distro keyring the
+	// host already has. Installing bodega's keyring beside a stanza that names
+	// it nowhere would leave a file on disk nothing reads.
+	var keyring []byte
+	if !stanza.Mirrored {
+		if keyring, err = getBody(client, aptsources.KeyringRoute); err != nil {
+			return err
+		}
 	}
-	wrote, err := host.WriteAptSources("", aptsources.ClientKeyringPath, apt.Host.Deb822, keyring)
+	wrote, err := host.WriteAptSources("", aptsources.ClientKeyringPath, stanza.Deb822, stanza.Mirrored, keyring)
 	for _, p := range wrote {
 		fmt.Printf("wrote %s\n", p)
 	}
 	if err != nil {
 		return err
 	}
+	if stanza.Mirrored {
+		fmt.Printf("\n%s reaches this host through bodega and is signed by its upstream, not by bodega.\n", stanza.Suite)
+		fmt.Println(aptsources.MirroredNote)
+	}
 	if apt.Profile != "" {
 		fmt.Printf("\nProfile %q: this host reads %s, a filtered view of what bodega mirrors.\n",
-			apt.Profile, apt.Host.Suite)
+			apt.Profile, stanza.Suite)
 		fmt.Println("The stanza scopes what this host is told exists. It authorizes nothing on")
 		fmt.Println("its own: a host that edits it reaches the unfiltered codename, and the")
 		fmt.Println("request predicate at /apt/pool/ is what refuses the artifacts behind it.")
@@ -436,10 +482,39 @@ func aptNoStanza(apt aptClientStatus) error {
 		return fmt.Errorf("this bodega serves no apt suite, so there is no stanza to install")
 	}
 	return fmt.Errorf("no profile scopes apt for this host and this bodega serves %d codenames, so which one this host should read is your decision rather than the server's: %s.\n"+
+		"  Name it:  bodega doctor --write-apt-sources --suite %s\n"+
 		"  This host may simply not be identified. Pass --token, or bind its address:  bodega identity bind cidr <cidr> <name>\n"+
-		"  Then give the profile a base:  bodega profile set <profile> apt --membership closed --base <codename>\n"+
-		"  Or write the stanza by hand from:  bodega status apt",
-		len(served), strings.Join(served, ", "))
+		"  Then give the profile a base:  bodega profile set <profile> apt --membership closed --base <codename>",
+		len(served), strings.Join(served, ", "), served[0])
+}
+
+// aptSuiteChoice resolves --suite against what the server reported, and
+// returns the stanza the server rendered for it.
+//
+// A host whose profile scopes apt is refused rather than served the codename
+// it named. The profile exists to narrow what that host is told exists, and
+// the unfiltered base sits in the same list: writing it here would hand the
+// host an unfiltered index for the same packages, which is the state
+// aptHostSources refuses to produce on the server's side.
+func aptSuiteChoice(apt aptClientStatus, suite string) (*aptsources.Sources, error) {
+	if apt.Profile != "" {
+		return nil, fmt.Errorf("profile %q scopes apt for this host, so the codename it reads is the profile's answer rather than this flag's.\n"+
+			"  Change what the profile is built from:  bodega profile set %s apt --base <codename>\n"+
+			"  Then re-run without --suite",
+			apt.Profile, apt.Profile)
+	}
+	for i := range apt.Sources {
+		if apt.Sources[i].Suite == suite {
+			return &apt.Sources[i], nil
+		}
+	}
+	served := slices.Concat(apt.Suites, apt.Mirrored, apt.Filtered)
+	if len(served) == 0 {
+		return nil, fmt.Errorf("this bodega serves no apt suite, so there is no stanza to install")
+	}
+	return nil, fmt.Errorf("this bodega serves no codename %q, so there is no stanza to install for it. It serves %s.\n"+
+		"  Pass one of those, or add the upstream this host needs to apt_upstreams and restart the server",
+		suite, strings.Join(served, ", "))
 }
 
 // pkgClientConfig is the half of GET /api/v1/status this command reads. The
