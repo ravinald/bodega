@@ -175,8 +175,10 @@ func TestPypiWheelResolvesThroughSimpleIndex(t *testing.T) {
 }
 
 // TestPypiWheelNotInIndexIsDiagnosable pins the refusal for a filename the
-// index does not list: a 404 naming the index that was consulted, not a 502
-// from a URL nobody can check.
+// index does not list: a 404 whose log line names the index that was
+// consulted, not a 502 from a URL nobody can check. The body names neither,
+// because the route takes no token and a manifest may write the upstream URL
+// with credentials in it.
 func TestPypiWheelNotInIndexIsDiagnosable(t *testing.T) {
 	s := proxyingServer(t)
 	up := newRecordingUpstream(t)
@@ -185,15 +187,19 @@ func TestPypiWheelNotInIndexIsDiagnosable(t *testing.T) {
 	s.cfg.PypiUpstream = up.ts.URL
 	seedProxyPypi(t, s, "six", up.ts.URL)
 
+	logged := captureErrorLog(s)
 	status, body := getStatusAndBody(t, s, "/pypi/wheels/"+testWheel)
 	if status != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404 for a wheel the index does not list (body %q)", status, body)
 	}
-	if !strings.Contains(body, up.ts.URL+"/simple/six/") {
-		t.Errorf("body = %q, want the index URL that was consulted", body)
+	if !strings.Contains(logged(), up.ts.URL+"/simple/six/") {
+		t.Errorf("log = %q, want the index URL that was consulted", logged())
 	}
-	if !strings.Contains(body, testWheel) {
-		t.Errorf("body = %q, want the filename that was not found", body)
+	if !strings.Contains(logged(), testWheel) {
+		t.Errorf("log = %q, want the filename that was not found", logged())
+	}
+	if leaked := withheldFrom(body, up.ts.URL, strings.TrimPrefix(up.ts.URL, "http://")); leaked != "" {
+		t.Errorf("the 404 body hands an anonymous caller the upstream %q: %q", leaked, body)
 	}
 }
 

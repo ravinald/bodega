@@ -215,14 +215,24 @@ func splitFreeBSDPath(p string) (abi, repo, rest string, ok bool) {
 	return abi, repo, rest, true
 }
 
+// freeBSDCatalogUnavailable is the whole body of a generated catalogue's 500.
+// It says the fault is the server's, so a pkg client that retries is doing
+// the right thing and one that edits its repository configuration is not.
+const freeBSDCatalogUnavailable = "this repository is not serving a catalogue right now; the server logged why, and retrying later is safe"
+
 // serveFreeBSDGenerated answers one repository-root file for a generated
 // repository.
 //
-// A build failure is a 500 carrying its own reason rather than a 404. The
-// difference matters to whoever is reading the log at 03:00: 404 is what pkg
-// reports for a repository that was never published, and it would send an
-// operator to check the upload for a repository whose objects are all there
-// and one of which cannot be read.
+// A build failure is a 500 rather than a 404. The difference matters to
+// whoever is reading the log at 03:00: 404 is what pkg reports for a
+// repository that was never published, and it would send an operator to check
+// the upload for a repository whose objects are all there and one of which
+// cannot be read.
+//
+// The reason goes to the log and never to the body. This route takes no token
+// and has no admin distinction to gate on, and the reason quotes the signing
+// key's path and mode, the storage root, or the bucket and prefix: the same
+// text /api/v1/status withholds from a caller outside admin_permit_cidr.
 func (s *Server) serveFreeBSDGenerated(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, abi, repo, rest, key string) {
 	// Never shared-cached. The catalogue is regenerated whenever the object
 	// set moves, so an intermediary holding one is an intermediary serving a
@@ -232,7 +242,7 @@ func (s *Server) serveFreeBSDGenerated(w http.ResponseWriter, r *http.Request, s
 	if err != nil {
 		s.logger.Error("freebsd: generating the catalogue failed; the repository serves nothing rather than a catalogue that names objects it cannot account for",
 			"abi", abi, "repo", repo, "file", rest, "error", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, freeBSDCatalogUnavailable, http.StatusInternalServerError)
 		return
 	}
 	ct := contentTypeForKey(key)

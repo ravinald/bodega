@@ -3,11 +3,17 @@ package server
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"io/fs"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +23,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/pkgsign"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 // The two package layouts F19 measured against pkg.freebsd.org, which a
@@ -383,12 +390,13 @@ func TestFreeBSDGeneratedRefusesAnUnreadablePackage(t *testing.T) {
 		genRootPath:   "not an archive at all",
 	})
 
+	logged := captureErrorLog(s)
 	status, body := getStatusAndBody(t, s, freeBSDURL("house", manifest.FreeBSDCatalogFile))
 	if status != http.StatusInternalServerError {
 		t.Fatalf("GET the catalogue over an unreadable package = %d, want 500: %s", status, body)
 	}
-	if !strings.Contains(body, genRootPath) {
-		t.Errorf("the refusal does not name the object that could not be read: %s", body)
+	if !strings.Contains(logged(), genRootPath) {
+		t.Errorf("the logged refusal does not name the object that could not be read: %s", logged())
 	}
 }
 
@@ -482,12 +490,13 @@ func TestFreeBSDGeneratedRefusesAnUnroutableObject(t *testing.T) {
 		"All/widget-1.0.pkg": pkgArchive(t, `{"name":"widget","version":"1.0"}`),
 		`All/bad\name.pkg`:   pkgArchive(t, `{"name":"bad","version":"1.0"}`),
 	})
+	logged := captureErrorLog(s)
 	status, body := getStatusAndBody(t, s, freeBSDURL("house", manifest.FreeBSDCatalogFile))
 	if status == http.StatusOK {
 		t.Fatalf("the catalogue built over an object no request can reach; members %v", keysOfBytes(archiveMembers(t, body)))
 	}
-	if !strings.Contains(body, `bad\name.pkg`) {
-		t.Errorf("the refusal does not name the object that caused it: %q", body)
+	if !strings.Contains(logged(), `bad\name.pkg`) {
+		t.Errorf("the logged refusal does not name the object that caused it: %q", logged())
 	}
 }
 
@@ -508,12 +517,19 @@ func TestFreeBSDGeneratedRefusesWhenTheInstalledKeyIsUnusable(t *testing.T) {
 	s := hostedServer(t)
 	generatedRepo(t, s, "house", map[string]string{"widget-1.0.pkg": pkgArchive(t, `{"name":"widget","version":"1.0"}`)})
 
+	logged := captureErrorLog(s)
 	status, body := getStatusAndBody(t, s, freeBSDURL("house", manifest.FreeBSDCatalogFile))
 	if status == http.StatusOK {
 		t.Fatalf("an installed but rejected key served an unsigned catalogue; members %v", keysOfBytes(archiveMembers(t, body)))
 	}
-	if !strings.Contains(body, kr.Path()) {
-		t.Errorf("the refusal does not name the key file an operator has to fix: %q", body)
+	if !strings.Contains(logged(), kr.Path()) {
+		t.Errorf("the logged refusal does not name the key file an operator has to fix: %q", logged())
+	}
+	// This route takes no token, so the body is what an anonymous poller
+	// reads: the key's path and the mode that exposes it would tell them
+	// which file on this host holds a readable private key.
+	if leaked := withheldFrom(body, kr.Path(), filepath.Dir(kr.Path()), "0644", "-rw-r--r--"); leaked != "" {
+		t.Errorf("the 500 body hands an anonymous caller %q: %q", leaked, body)
 	}
 
 	// Fixing the key and reloading recovers, because a refusal that outlived
@@ -711,13 +727,14 @@ func TestFreeBSDGeneratedRefusesTwoBuildsOfOnePackage(t *testing.T) {
 			`{"name":"widget","origin":"misc/widget","version":"1.2.0","arch":"freebsd:14:x86:64","desc":"built on Wednesday","flatsize":8192}`),
 	})
 
-	status, body := getStatusAndBody(t, s, freeBSDURL("house", manifest.FreeBSDCatalogFile))
+	logged := captureErrorLog(s)
+	status, _ := getStatusAndBody(t, s, freeBSDURL("house", manifest.FreeBSDCatalogFile))
 	if status != http.StatusInternalServerError {
 		t.Fatalf("GET the catalogue = %d, want 500: two builds of one package were published as a catalogue pkg refuses whole", status)
 	}
 	for _, want := range []string{genHashedPath, "All/widget-1.2.0.pkg", "widget-1.2.0"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("the refusal does not name %q, so nobody can tell which two objects to look at: %s", want, body)
+		if !strings.Contains(logged(), want) {
+			t.Errorf("the logged refusal does not name %q, so nobody can tell which two objects to look at: %s", want, logged())
 		}
 	}
 }
@@ -820,11 +837,130 @@ func TestFreeBSDGeneratedRefusesAManifestItCannotIdentify(t *testing.T) {
 		genHashedPath: pkgArchive(t, `{"name":"widget","version":"1.2.0","options":["DOCS"]}`),
 	})
 
-	status, body := getStatusAndBody(t, s, freeBSDURL("house", manifest.FreeBSDCatalogFile))
+	logged := captureErrorLog(s)
+	status, _ := getStatusAndBody(t, s, freeBSDURL("house", manifest.FreeBSDCatalogFile))
 	if status != http.StatusInternalServerError {
 		t.Fatalf("GET the catalogue = %d, want 500 over a manifest whose options is a list", status)
 	}
-	if !strings.Contains(body, genHashedPath) || !strings.Contains(body, "options") {
-		t.Errorf("the refusal names neither the object nor the field: %s", body)
+	if !strings.Contains(logged(), genHashedPath) || !strings.Contains(logged(), "options") {
+		t.Errorf("the logged refusal names neither the object nor the field: %s", logged())
+	}
+}
+
+// captureErrorLog points the server's logger at a buffer and returns the
+// "error" attribute of every record written since, decoded. Decoded rather than
+// matched against the handler's output, because a text or JSON handler escapes
+// a backslash in a key and the substring a test looks for is then not there.
+func captureErrorLog(s *Server) func() string {
+	var buf syncBuffer
+	s.logger = slog.New(slog.NewJSONHandler(&buf, nil))
+	return func() string {
+		var out []string
+		for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+			var rec struct {
+				Error string `json:"error"`
+			}
+			if json.Unmarshal([]byte(line), &rec) == nil && rec.Error != "" {
+				out = append(out, rec.Error)
+			}
+		}
+		return strings.Join(out, "\n")
+	}
+}
+
+// withheldFrom returns the first of secrets that body carries, or "" when it
+// carries none. The tests assert on the absence of what leaked rather than on
+// the presence of the replacement text, so rewording that text breaks nothing.
+func withheldFrom(body string, secrets ...string) string {
+	for _, sec := range secrets {
+		if sec != "" && strings.Contains(body, sec) {
+			return sec
+		}
+	}
+	return ""
+}
+
+// failingStore answers a generated repository's listing, or the read of one
+// of its packages, with the error text a real backend produces for that
+// failure. The text is built rather than provoked: a local store refuses a
+// listing only over a permission a test running as root does not have, and
+// an s3 store refuses only against a live bucket.
+type failingStore struct {
+	storage.ObjectStore
+	listErr, getErr error
+}
+
+func (f failingStore) List(ctx context.Context, prefix string) ([]string, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return f.ObjectStore.List(ctx, prefix)
+}
+
+func (f failingStore) GetStream(ctx context.Context, key string) (*storage.StreamResult, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	return f.ObjectStore.GetStream(ctx, key)
+}
+
+// A storage failure under a generated catalogue is a 500 whose body names
+// neither the storage root nor the bucket. The route takes no token, and the
+// wrapped error is a *PathError under storage_path for a local backend
+// (storage/local.go) or s3://<bucket>/<prefix> for an s3 one (s3/client.go):
+// where the packages live, handed to whoever polls. The log keeps all of it.
+func TestFreeBSDGeneratedRefusalWithholdsTheStorageLocation(t *testing.T) {
+	const (
+		root   = "/srv/bodega-private-root"
+		bucket = "bodega-private-bucket"
+	)
+	prefix := manifest.FreeBSDRepoPrefix(freeBSDABI, "house")
+	pkgKey := prefix + genRootPath
+	denied := errors.New("AccessDenied: Access Denied")
+
+	cases := []struct {
+		name    string
+		store   func(storage.ObjectStore) failingStore
+		secrets []string
+	}{
+		{"local listing", func(m storage.ObjectStore) failingStore {
+			return failingStore{ObjectStore: m, listErr: &fs.PathError{Op: "open", Path: filepath.Join(root, filepath.FromSlash(prefix)), Err: fs.ErrPermission}}
+		}, []string{root}},
+		{"s3 listing", func(m storage.ObjectStore) failingStore {
+			return failingStore{ObjectStore: m, listErr: fmt.Errorf("list objects s3://%s/%s: %w", bucket, prefix, denied)}
+		}, []string{bucket, "s3://"}},
+		{"local package read", func(m storage.ObjectStore) failingStore {
+			return failingStore{ObjectStore: m, getErr: &fs.PathError{Op: "open", Path: filepath.Join(root, filepath.FromSlash(pkgKey)), Err: fs.ErrPermission}}
+		}, []string{root}},
+		{"s3 package read", func(m storage.ObjectStore) failingStore {
+			return failingStore{ObjectStore: m, getErr: fmt.Errorf("get object stream s3://%s/%s: %w", bucket, pkgKey, denied)}
+		}, []string{bucket, "s3://"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := hostedServer(t)
+			generatedRepo(t, s, "house", map[string]string{genRootPath: pkgArchive(t, `{"name":"tool","version":"3.1"}`)})
+			logged := captureErrorLog(s)
+			store := tc.store(s.typeStore(manifest.TypeFreeBSD))
+
+			path := freeBSDURL("house", manifest.FreeBSDCatalogFile)
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, nil)
+			s.serveFreeBSDGenerated(rec, req, store, freeBSDABI, "house", manifest.FreeBSDCatalogFile,
+				manifest.FreeBSDKey(freeBSDABI, "house", manifest.FreeBSDCatalogFile))
+
+			body := rec.Body.String()
+			if rec.Code != http.StatusInternalServerError {
+				t.Fatalf("GET the catalogue over a failing store = %d, want 500: %s", rec.Code, body)
+			}
+			if leaked := withheldFrom(body, tc.secrets...); leaked != "" {
+				t.Errorf("the 500 body hands an anonymous caller %q: %q", leaked, body)
+			}
+			for _, want := range tc.secrets {
+				if !strings.Contains(logged(), want) {
+					t.Errorf("the log lost %q, which the operator needs to find the failing backend: %s", want, logged())
+				}
+			}
+		})
 	}
 }
