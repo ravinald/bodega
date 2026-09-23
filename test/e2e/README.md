@@ -17,18 +17,18 @@ It runs from a workstation against four scratch guests, described under
 [Host requirements](#host-requirements). It does not run in CI and never will:
 it needs several hosts, a real network between them, and several minutes.
 
-| Client                                           | Guest            | Suite               |
-| ------------------------------------------------ | ---------------- | ------------------- |
-| `apt-get`, `pip`, `helm`, `npm`, `cargo`         | `client`         | `45-clients`        |
-| `git`, `curl`, the portable `pkg` build          | `client`         | `45-clients`        |
-| `go`                                             | `server`         | `45-clients`        |
-| `pkg install` onto a FreeBSD root                | `freebsd-client` | `47-freebsd-client` |
-| `make fetch` and `make checksum` in a ports tree | `freebsd-client` | `47-freebsd-client` |
+| Client                                           | Guest     | Suite               |
+| ------------------------------------------------ | --------- | ------------------- |
+| `apt-get`, `pip`, `helm`, `npm`, `cargo`         | `client`  | `45-clients`        |
+| `git`, `curl`, the portable `pkg` build          | `client`  | `45-clients`        |
+| `go`                                             | `server`  | `45-clients`        |
+| `pkg install` onto a FreeBSD root                | `freebsd` | `47-freebsd-client` |
+| `make fetch` and `make checksum` in a ports tree | `freebsd` | `47-freebsd-client` |
 
 ## Host requirements
 
 Four guests, named in `test/e2e/hosts.env`: a Linux `server` and `client`, and a
-FreeBSD `freebsd-server` and `freebsd-client`. Copy `hosts.env.example` to
+FreeBSD `freebsd` client (`E2E_FREEBSD_HOST`) and `freebsd-server`. Copy `hosts.env.example` to
 create it; nothing in the repository names a host, and `run.sh` refuses to start
 until that file or the environment supplies all four.
 
@@ -53,7 +53,7 @@ needs and reports what it could not.
 
 Each FreeBSD guest needs a release with `pkg` bootstrapped, `curl`, the same
 `ssh` and `sudo` access, and room under `/var/tmp`. Suite 47 ships
-`dist/bodega-freebsd-arm64` to `freebsd-client`, so an amd64 guest needs that
+`dist/bodega-freebsd-arm64` to `freebsd`, so an amd64 guest needs that
 target changed. It points `pkg` at the Linux server through the stanza
 `bodega doctor --write-pkg-repo` writes, and removes the stanza again at the
 end; `freebsd-server` is resolved and guarded but no suite drives it yet.
@@ -163,11 +163,14 @@ recorded as a failure rather than as silence.
 **The host allowlist is declared, not flagged.** The suites call
 `bodega reset`, `pkg delete --remove-artifacts` and `userdel bodega`, and a
 production host commonly differs from a dev guest by one label.
-`e2e_host_for` resolves only the aliases `server`, `client`, `freebsd-server`
-and `freebsd-client`, so no suite can name a host however it is edited, and
+`e2e_host_for` resolves only the aliases `server`, `client`, `freebsd` and
+`freebsd-server`, and exits 2 on anything else, so no suite can name a host however it is edited, and
 `run.sh` checks the four resolved names against `E2E_ALLOWED_HOSTS` so a typo in
-either declaration stops the run. An alias with no host configured stops it by
-name before anything resolves.
+either declaration stops the run. An alias with no host configured stops it,
+naming the unset variable, before anything resolves. `freebsd` reads
+`E2E_FREEBSD_HOST` only: a `hosts.env` still setting the retired
+`E2E_FREEBSD_CLIENT_HOST` is refused with the rename spelled out rather than
+read under either name.
 Both live in `test/e2e/hosts.env`, which is not committed; copy
 `hosts.env.example` to create it.
 

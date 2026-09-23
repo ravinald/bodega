@@ -90,8 +90,8 @@ func TestFbsdAliasResolvesAndGoesNoFurther(t *testing.T) {
 	if !slices.Equal(got, []string{manifest.TypeFreeBSD}) {
 		t.Fatalf("resolveTypes(fbsd) = %v, want [%s]", got, manifest.TypeFreeBSD)
 	}
-	if !isTypeArg("fbsd") {
-		t.Error("isTypeArg(fbsd) is false, so 'bodega build fetch fbsd' filters for a package named fbsd instead")
+	if typeArgs, _ := splitTypeArgs([]string{"fbsd"}); !slices.Equal(typeArgs, []string{"fbsd"}) {
+		t.Error("bare fbsd is not a type argument, so 'bodega build fetch fbsd' filters for a package named fbsd instead")
 	}
 
 	if slices.Contains(manifest.AllTypes, "fbsd") {
@@ -139,5 +139,81 @@ func TestFbsdAliasResolvesAndGoesNoFurther(t *testing.T) {
 		if typ, _, _ := manifest.ParseKey(k); typ != manifest.TypeFreeBSD || strings.Contains(k, "fbsd") {
 			t.Errorf("key %q reads back as type %q; want %s with no alias in it", k, typ, manifest.TypeFreeBSD)
 		}
+	}
+}
+
+// An alias must never erase a package selector the operator wrote. With a
+// binary named fbsd in the catalog, 'build upload binary fbsd' selected that
+// one binary before the alias existed; reading fbsd as a type there widened it
+// to every binary and every freebsd repository with no selector at all.
+func TestFbsdAliasKeepsExplicitPackageScope(t *testing.T) {
+	store := manifest.NewLocalStore(t.TempDir())
+	ctx := context.Background()
+	for _, add := range []struct{ typ, name string }{
+		{manifest.TypeBinary, "fbsd"},
+		{manifest.TypeBinary, "unrelated"},
+		{manifest.TypeFreeBSD, "latest"},
+	} {
+		if err := store.AddVersion(ctx, add.typ, add.name, manifest.VersionEntry{Version: "1.0.0"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.SaveIndex(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, args := range [][]string{
+		{manifest.TypeBinary, "fbsd"},
+		{"fbsd", manifest.TypeBinary},
+		{manifest.TypeBinary, "fbsd@1.0.0"},
+	} {
+		types, selector, err := parseUploadArgs(args, store)
+		name, _ := splitVersionArg(selector)
+		if err != nil || !slices.Equal(types, []string{manifest.TypeBinary}) || name != "fbsd" {
+			t.Errorf("parseUploadArgs(%v) = %v, %q, %v; want [binary], fbsd", args, types, selector, err)
+		}
+	}
+
+	// fetch, build run and build package share the classifier; a type name
+	// beside the alias leaves it an entry filter there too.
+	typeArgs, rest := splitTypeArgs([]string{manifest.TypeBinary, "fbsd"})
+	if !slices.Equal(typeArgs, []string{manifest.TypeBinary}) || !slices.Equal(rest, []string{"fbsd"}) {
+		t.Errorf("splitTypeArgs(binary fbsd) = %v, %v; want [binary], [fbsd]", typeArgs, rest)
+	}
+
+	// Alone, fbsd would read as the freebsd type and drop the binary it also
+	// names. Neither reading is safe to guess, so both classifiers refuse.
+	if _, _, err := parseUploadArgs([]string{"fbsd"}, store); err == nil || !strings.Contains(err.Error(), "binary fbsd") {
+		t.Errorf("parseUploadArgs(fbsd) with a binary named fbsd = %v; want a refusal naming both readings", err)
+	}
+	typeArgs, _ = splitTypeArgs([]string{"fbsd"})
+	if err := refuseAliasCollision(typeArgs, store); err == nil {
+		t.Error("refuseAliasCollision passed a bare fbsd that also names a binary")
+	}
+}
+
+// Without a colliding package, bare fbsd selects the freebsd type and nothing
+// beside it.
+func TestFbsdAliasSelectsFreeBSDWhenNothingCollides(t *testing.T) {
+	store := manifest.NewLocalStore(t.TempDir())
+	ctx := context.Background()
+	for _, add := range []struct{ typ, name string }{
+		{manifest.TypeBinary, "unrelated"},
+		{manifest.TypeFreeBSD, "latest"},
+	} {
+		if err := store.AddVersion(ctx, add.typ, add.name, manifest.VersionEntry{Version: "1.0.0"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.SaveIndex(ctx); err != nil {
+		t.Fatal(err)
+	}
+	types, selector, err := parseUploadArgs([]string{"fbsd"}, store)
+	if err != nil || !slices.Equal(types, []string{manifest.TypeFreeBSD}) || selector != "" {
+		t.Errorf("parseUploadArgs(fbsd) = %v, %q, %v; want [freebsd] and no selector", types, selector, err)
+	}
+	types, selector, err = parseUploadArgs([]string{"fbsd", "latest"}, store)
+	if err != nil || !slices.Equal(types, []string{manifest.TypeFreeBSD}) || selector != "latest" {
+		t.Errorf("parseUploadArgs(fbsd latest) = %v, %q, %v; want [freebsd], latest", types, selector, err)
 	}
 }

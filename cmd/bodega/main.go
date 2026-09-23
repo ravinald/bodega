@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -494,13 +495,44 @@ func resolveTypes(args []string) ([]string, error) {
 	return out, nil
 }
 
-// isTypeArg reports whether a positional argument names a type, alias
-// included, for the commands that take types and a package name in one list.
-// It asks resolveTypes rather than isValidType so an alias is a type there too
-// instead of a package filter that matches nothing.
-func isTypeArg(a string) bool {
-	_, err := resolveTypes([]string{a})
-	return err == nil
+// splitTypeArgs separates the positional arguments of a command that takes
+// types and a package name in one list. A type name is always a type. An alias
+// is a type only when no type name appears beside it: 'build upload binary
+// fbsd' has already said which type it means, so fbsd there is the package it
+// was before the alias existed, and reading it as a type would widen one
+// binary into every binary and every freebsd repository.
+func splitTypeArgs(args []string) (typeArgs, rest []string) {
+	named := slices.ContainsFunc(args, isValidType)
+	for _, a := range args {
+		_, alias := typeAliases[a]
+		if isValidType(a) || (alias && !named) {
+			typeArgs = append(typeArgs, a)
+		} else {
+			rest = append(rest, a)
+		}
+	}
+	return typeArgs, rest
+}
+
+// refuseAliasCollision rejects an alias used as a type when the catalog also
+// holds a package by that name. Either reading selects something the other
+// does not, so guessing either one fetches, builds or publishes what the
+// operator did not name.
+func refuseAliasCollision(typeArgs []string, store *manifest.Store) error {
+	for _, a := range typeArgs {
+		canon, ok := typeAliases[a]
+		if !ok {
+			continue
+		}
+		for _, t := range manifest.AllTypes {
+			if slices.Contains(store.ListPackages(t), a) {
+				return fmt.Errorf("%q is both an alias for the %s type and a %s package; "+
+					"write %s to select the type, or %s %s to select the package",
+					a, canon, t, canon, t, a)
+			}
+		}
+	}
+	return nil
 }
 
 // backgroundCtx returns a context bound to the process lifetime.
