@@ -466,17 +466,41 @@ func typeOrderSentence(verb string) string {
 		len(manifest.AllTypes), verb, strings.Join(manifest.AllTypes, ", "))
 }
 
-// resolveTypes expands an empty slice to AllTypes and validates each entry.
+// typeAliases are spellings an operator types that name a type without being
+// one. They resolve here and nowhere else: not in AllTypes, not in help, and
+// never as a storage or manifest prefix. An alias reaching the store would give
+// one type two key prefixes, and whatever landed under the second is
+// unreachable from every reader that asks for the first.
+var typeAliases = map[string]string{
+	"fbsd": manifest.TypeFreeBSD,
+}
+
+// resolveTypes expands an empty slice to AllTypes, validates each entry, and
+// returns every alias as the type it names.
 func resolveTypes(args []string) ([]string, error) {
 	if len(args) == 0 {
 		return manifest.AllTypes, nil
 	}
+	out := make([]string, 0, len(args))
 	for _, t := range args {
+		if canon, ok := typeAliases[t]; ok {
+			t = canon
+		}
 		if !isValidType(t) {
 			return nil, fmt.Errorf("unknown type %q — must be one of: %s", t, strings.Join(manifest.AllTypes, ", "))
 		}
+		out = append(out, t)
 	}
-	return args, nil
+	return out, nil
+}
+
+// isTypeArg reports whether a positional argument names a type, alias
+// included, for the commands that take types and a package name in one list.
+// It asks resolveTypes rather than isValidType so an alias is a type there too
+// instead of a package filter that matches nothing.
+func isTypeArg(a string) bool {
+	_, err := resolveTypes([]string{a})
+	return err == nil
 }
 
 // backgroundCtx returns a context bound to the process lifetime.

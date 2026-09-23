@@ -43,7 +43,7 @@ When a name is given after the type, only that entry is fetched.`,
 			for _, a := range args {
 				if a == "force" {
 					force = true
-				} else if isValidType(a) {
+				} else if isTypeArg(a) {
 					typeArgs = append(typeArgs, a)
 				} else {
 					entryFilter = a

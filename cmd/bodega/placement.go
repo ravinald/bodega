@@ -66,7 +66,7 @@ func parseUploadArgs(args []string, store *manifest.Store) ([]string, string, er
 	var selector string
 	for _, a := range args {
 		switch {
-		case isValidType(a):
+		case isTypeArg(a):
 			typeArgs = append(typeArgs, a)
 		case selector != "":
 			return nil, "", fmt.Errorf("only one package may be named; got %q and %q", selector, a)

@@ -91,6 +91,24 @@ risk:
   back. The per-package digest in a generated catalogue is bodega's own, taken
   over the object as it was stored.
 
+- **FreeBSD distfiles, which carry neither attestation.** The digest that
+  protects a distfile is pinned in the client's own ports tree: a port's
+  `distinfo` records a SHA-256 and a size for each distfile, and `make checksum`
+  refuses bytes that disagree, wherever they came from. bodega has no distfiles
+  type. A distfile proxied through a `binary_upstreams` namespace is pinned on
+  first fetch like any other binary, which says only that later fetches match
+  the first. What the check is worth is what the tree is worth: `ports.txz`
+  served as a `binary` entry is pinned to the digest the release `MANIFEST`
+  publishes, and a tree cloned through a `git_upstreams` mirror is as
+  trustworthy as the forge it mirrors.
+
+  That makes three trust stories for one operating system, and a reader should
+  not assume one covers another. A mirrored pkg repository carries FreeBSD's
+  signature and bodega adds nothing to it. A generated repository carries
+  bodega's and nothing of FreeBSD's. Distfiles carry no signature from either:
+  they rest on the `distinfo` digest in the client's ports tree, and are as
+  sound as the route that tree arrived by.
+
 - **A malicious release inside its own withdrawal window.** A fresh install is
   seeded with a minimum publish age of `7d` on `npm` and `pypi`, action `warn`,
   and `bodega serve` names it at startup. The npm and PyPI campaigns of

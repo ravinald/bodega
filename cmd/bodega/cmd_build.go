@@ -38,7 +38,7 @@ When a name is given after the type, only that entry is built.`,
 			var typeArgs []string
 			var entryFilter string
 			for _, a := range args {
-				if isValidType(a) {
+				if isTypeArg(a) {
 					typeArgs = append(typeArgs, a)
 				} else {
 					entryFilter = a
