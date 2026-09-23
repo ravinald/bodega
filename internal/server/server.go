@@ -1028,7 +1028,11 @@ type statusResponse struct {
 // backendEntryStatus is one probe row, reported against the backend that
 // answered it. backend carries no omitempty: a row that names no backend is
 // the report this shape exists to replace, and a consumer cannot tell an
-// absent name from a local install by looking at the key.
+// absent name from a local install by looking at the key. healthy is this
+// row's own probe, so a caller that cannot see error still learns which
+// backend failed, and error is never omitted: an empty string there is a
+// withheld or absent failure, and a missing key would read as a server that
+// predates the field.
 type backendEntryStatus struct {
 	Type    string `json:"type"`
 	Name    string `json:"name"`
@@ -1036,14 +1040,16 @@ type backendEntryStatus struct {
 	Present bool   `json:"present"`
 	Frozen  bool   `json:"frozen,omitempty"`
 	Backend string `json:"backend"`
-	Error   string `json:"error,omitempty"`
+	Healthy bool   `json:"healthy"`
+	Error   string `json:"error"`
 }
 
 func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 	spool := s.spool.stats()
 	version := builder.Version
 	freebsd := s.freeBSDStatusFor(r)
-	if !s.isAdminRequest(r) {
+	admin := s.isAdminRequest(r)
+	if !admin {
 		spool.Dir = ""
 		version = ""
 		// key_error quotes a load failure, and pkgsign's likeliest one names
@@ -1097,9 +1103,17 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			resp.Healthy = false
 			resp.Error = "one or more storage backends failed to respond"
-			row.Error = err.Error()
+			// A local backend's List failure names the directory it could not
+			// walk, a path under storage_path; an s3 backend's names the
+			// bucket, which /api/v1/config keeps admin-only. healthy and backend
+			// stay public: they say which backend is broken without saying
+			// where it keeps its bytes.
+			if admin {
+				row.Error = err.Error()
+			}
 			s.logger.Error("object store probe failed", "backend", ns.Name, "prefix", manifest.AptPoolPrefix, "error", err)
 		} else {
+			row.Healthy = true
 			row.Present = len(keys) > 0
 		}
 		resp.BackendEntries = append(resp.BackendEntries, row)
