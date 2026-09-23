@@ -376,10 +376,10 @@ func pinDistfile(src, dst string, limit int64) error {
 	return out.Close()
 }
 
-// logUnowned names the restricted ports whose restriction may not reach every
-// distfile they read, so the operator learns it from bodega.
+// logUnowned names the restricted ports whose distinfo cannot be placed, which
+// is why every entry is refused, so the operator learns the cause from bodega.
 func logUnowned(cfg *Config, ix *distinfo.Index) {
 	if u := ix.Unowned(); len(u) > 0 {
-		cfg.logf("  [distfiles] WARNING: %d restricted ports read a distinfo bodega cannot place, so distfiles they share with another port are not refused on their account: %s", len(u), strings.Join(u, "; "))
+		cfg.logf("  [distfiles] WARNING: refusing every distfile: %d restricted ports read a distinfo bodega cannot place, and any of them may obtain any distfile in the tree: %s", len(u), strings.Join(u, "; "))
 	}
 }

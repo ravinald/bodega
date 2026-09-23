@@ -415,7 +415,6 @@ func TestRestrictionReachesTheDistinfoItReads(t *testing.T) {
 		{"master through another variable", "M=\tmaster\nMASTERDIR=\t${.CURDIR}/../${M}\n", []string{"shared.tar.gz"}},
 		{"either master", ".if ${FLAVOR} == a\nMASTERDIR=\t${.CURDIR}/../master\n.else\nMASTERDIR=\t${.CURDIR}/../other\n.endif\n", []string{"shared.tar.gz", "other.tar.gz"}},
 		{"distinfo named directly", "DISTINFO_FILE=\t${.CURDIR}/../master/distinfo\n", []string{"shared.tar.gz"}},
-		{"distinfo named per architecture", "DISTINFO_FILE=\t${PORTSDIR}/lang/master/distinfo.${ARCH:S/powerpc64/powerpc/}\n", []string{"shared.tar.gz"}},
 		{"distinfo set after the framework", ".include <bsd.port.pre.mk>\nDISTINFO_FILE=\t${PORTSDIR}/lang/master/distinfo\n", []string{"shared.tar.gz"}},
 		{"master set in an included file", ".include \"${.CURDIR}/../other/Makefile.slave\"\n", []string{"shared.tar.gz"}},
 	} {
@@ -449,18 +448,28 @@ func TestRestrictionReachesTheDistinfoItReads(t *testing.T) {
 	}
 }
 
-// A restricted port whose distinfo directory the reader cannot resolve is
-// reported, so the operator learns which restrictions may not reach the files
-// they cover.
-func TestUnownedRestrictionIsReported(t *testing.T) {
-	for name, makefile := range map[string]string{
-		"unread modifier":      "MASTERDIR=\t${.CURDIR}/../${M:C/x/master/}\n",
-		"computed name":        "${UNKNOWN}_FILE=\t${.CURDIR}/../master/distinfo\n",
-		"unfollowable include": ".include \"${UNKNOWN}/slave.mk\"\n",
+// A restricted port whose distinfo directory the reader cannot resolve may
+// read any distinfo in the tree, so every distfile is refused and the port is
+// reported as the reason. Only the whole path resolving places it: a value
+// after the last "/" can hold more of them, and "..".
+func TestUnownedRestrictionRefusesTheTree(t *testing.T) {
+	for name, tc := range map[string]struct {
+		makefile string
+		extra    map[string]string
+	}{
+		"unread modifier":        {makefile: "MASTERDIR=\t${.CURDIR}/../${M:C/x/master/}\n"},
+		"computed name":          {makefile: "${UNKNOWN}_FILE=\t${.CURDIR}/../master/distinfo\n"},
+		"unfollowable include":   {makefile: ".include \"${UNKNOWN}/slave.mk\"\n"},
+		"per-architecture name":  {makefile: "DISTINFO_FILE=\t${PORTSDIR}/lang/master/distinfo.${ARCH:S/powerpc64/powerpc/}\n"},
+		"master named by shell":  {makefile: "M!=\tprintf master\nDISTINFO_FILE=\t${.CURDIR}/../${M}/distinfo\n"},
+		"suffix leaves the port": {makefile: "TAIL!=\tprintf '/../../master/distinfo'\nDISTINFO_FILE=\t${.CURDIR}/stub${TAIL}\n", extra: map[string]string{"lang/probe/stub/placeholder": ""}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			root := portsTree(t)
-			write(t, root, "lang/probe/Makefile", "NO_CDROM=\tNo resale\n"+makefile+".include <bsd.port.mk>\n")
+			write(t, root, "lang/probe/Makefile", "NO_CDROM=\tNo resale\n"+tc.makefile+".include <bsd.port.mk>\n")
+			for rel, body := range tc.extra {
+				write(t, root, rel, body)
+			}
 			ix, err := Load(root)
 			if err != nil {
 				t.Fatal(err)
@@ -468,6 +477,28 @@ func TestUnownedRestrictionIsReported(t *testing.T) {
 			if u := ix.Unowned(); len(u) != 1 || !strings.Contains(u[0], "lang/probe") || !strings.Contains(u[0], "NO_CDROM") {
 				t.Errorf("Unowned() = %q, want lang/probe with its NO_CDROM and why", u)
 			}
+			for _, n := range ix.Names() {
+				if _, err := ix.Lookup(n); !errors.Is(err, ErrRestricted) && !errors.Is(err, ErrUnusable) {
+					t.Errorf("%s: %v, want every distfile refused", n, err)
+				}
+			}
 		})
+	}
+}
+
+// A port with no restriction reads to the end restricts nothing, wherever its
+// distinfo is, so an unplaceable one refuses nothing on its account.
+func TestUnownedUnrestrictedPortRefusesNothing(t *testing.T) {
+	root := portsTree(t)
+	write(t, root, "lang/probe/Makefile", "LICENSE=\tBSD2CLAUSE\nM!=\tprintf master\nDISTINFO_FILE=\t${.CURDIR}/../${M}/distinfo\n.include <bsd.port.mk>\n")
+	ix, err := Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u := ix.Unowned(); len(u) != 0 {
+		t.Errorf("Unowned() = %q, want none", u)
+	}
+	if _, err := ix.Lookup("pcpustat/1.6.tar.bz2"); err != nil {
+		t.Errorf("pcpustat/1.6.tar.bz2: %v, want admitted", err)
 	}
 }

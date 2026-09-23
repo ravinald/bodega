@@ -154,9 +154,11 @@ func TestDistfilesRefusesARestrictedDistfile(t *testing.T) {
 // it reads is reassigned, one file included twice under two values, a ?= after
 // an .undef that may run, a .for variable shadowing a global one, an
 // assignment whose name is computed, a path read through a variable an
-// assignment make skips leaves undefined, and a slave naming its master
-// through PORTSDIR. Base make on FreeBSD prints "No resale" for
-// `make -V NO_CDROM` in each; for the slave, run in the slave's directory.
+// assignment make skips leaves undefined, a slave naming its master through
+// PORTSDIR, and two slaves with no distinfo of their own that read the
+// master's through a value only a shell command sets. Base make on FreeBSD
+// prints "No resale" for `make -V NO_CDROM` in each; for a slave, run in the
+// slave's directory, where `make -V DISTINFO_FILE` names the master's.
 var makeOnlyRestrictions = map[string]map[string]string{
 	"conditional undef": {
 		"Makefile": "D=\tfiles/allowed.mk\n.if 1\n.undef D\n.endif\nD?=\tfiles/restricted.mk\n.include \"${D}\"\n",
@@ -183,13 +185,26 @@ var makeOnlyRestrictions = map[string]map[string]string{
 		"Makefile":          "PORTNAME=\tpcpustat\n",
 		"../slave/Makefile": "MASTERDIR=\t${PORTSDIR}/sysutils/pcpustat\nNO_CDROM=\tNo resale\n.include \"${MASTERDIR}/Makefile\"\n",
 	},
+	"slave whose master a shell command names": {
+		"Makefile":          "PORTNAME=\tpcpustat\n",
+		"../slave/Makefile": "NO_CDROM=\tNo resale\nM!=\tprintf pcpustat\nDISTINFO_FILE=\t${.CURDIR}/../${M}/distinfo\n",
+	},
+	"slave whose distinfo suffix climbs out of its directory": {
+		"Makefile":                  "PORTNAME=\tpcpustat\n",
+		"../slave/Makefile":         "NO_CDROM=\tNo resale\nTAIL!=\tprintf '/../../pcpustat/distinfo'\nDISTINFO_FILE=\t${.CURDIR}/stub${TAIL}\n",
+		"../slave/stub/placeholder": "",
+	},
 }
 
 // makeOnlyRefusal is what the refusal of a makeOnlyRestrictions case names:
-// the restriction, or for a path the reader cannot resolve, that it cannot.
+// the restriction, for a path the reader cannot resolve that it cannot, and
+// for a distinfo it cannot place that the whole tree is refused.
 func makeOnlyRefusal(name string) string {
-	if name == "undefined branch" {
+	switch {
+	case name == "undefined branch":
 		return "cannot be resolved"
+	case strings.HasPrefix(name, "slave whose"):
+		return "may obtain any distfile in the tree"
 	}
 	return "NO_CDROM"
 }

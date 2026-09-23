@@ -75,9 +75,8 @@ type Index struct {
 }
 
 // Unowned lists the restricted ports whose distinfo the reader could not
-// place, each with its restriction and why. Their own directory's distfiles
-// are refused; any they read from another port's distinfo are not, because
-// no reading of the tree short of make says which those are.
+// place, each with its restriction and why. Any of them may read any distinfo
+// in the tree, so while the list is not empty every distfile is refused.
 func (ix *Index) Unowned() []string { return ix.unowned }
 
 // Lookup returns the entry for name, or an error wrapping ErrNotListed,
@@ -718,34 +717,21 @@ func (r *makeReader) noteDistinfo() {
 	}
 }
 
-// expandDir resolves the directory part of a path: the whole path, then its
-// parent, or failing that the text before its last "/" outside a reference.
+// expandDir resolves the directory of every path v can take. The whole path
+// has to resolve: a reference after the last literal "/" may expand to more
+// separators and "..", so the text before it bounds nothing.
 func (r *makeReader) expandDir(v string, scope map[string][]string) ([]string, bool) {
 	if r.readsTainted(v, scope) {
 		return nil, false
 	}
-	if paths, ok := expandMakePath(v, scope, 0); ok {
-		for i, p := range paths {
-			paths[i] = filepath.Dir(p)
-		}
-		return paths, true
-	}
-	depth, cut := 0, -1
-	for i := 0; i < len(v); i++ {
-		switch {
-		case v[i] == '$' && i+1 < len(v) && (v[i+1] == '{' || v[i+1] == '('):
-			depth++
-			i++
-		case depth > 0 && (v[i] == '}' || v[i] == ')'):
-			depth--
-		case depth == 0 && v[i] == '/':
-			cut = i
-		}
-	}
-	if cut <= 0 {
+	paths, ok := expandMakePath(v, scope, 0)
+	if !ok {
 		return nil, false
 	}
-	return expandMakePath(v[:cut], scope, 0)
+	for i, p := range paths {
+		paths[i] = filepath.Dir(p)
+	}
+	return paths, true
 }
 
 // read reads file as make would reach it: conditional when some enclosing
@@ -1166,6 +1152,7 @@ func Load(portsTree string) (*Index, error) {
 	byPort := map[string][]string{}   // origin -> names its distinfo pins
 	restricted := map[string]string{} // origin -> reason
 	var unowned []string              // restricted ports whose distinfo cannot be placed
+	var unownedOrigins []string
 	for _, cat := range cats {
 		if !cat.IsDir() || strings.HasPrefix(cat.Name(), ".") || cat.Name() == "distfiles" || cat.Name() == "packages" {
 			continue
@@ -1207,6 +1194,7 @@ func Load(portsTree string) (*Index, error) {
 			}
 			if pr.ownerUnknown != "" {
 				unowned = append(unowned, fmt.Sprintf("%s (%s): %s", origin, why, pr.ownerUnknown))
+				unownedOrigins = append(unownedOrigins, origin)
 			}
 			for _, owner := range append([]string{origin}, portOrigins(portsTree, pr.owners)...) {
 				if _, ok := restricted[owner]; !ok {
@@ -1230,6 +1218,23 @@ func Load(portsTree string) (*Index, error) {
 		why := restricted[origin]
 		for _, name := range byPort[origin] {
 			if e, ok := ix.entries[name]; ok && e.Restricted == "" {
+				e.Restricted = why
+			}
+		}
+	}
+	// A distinfo nobody can place may be any distinfo in the tree: a value
+	// the reader cannot resolve may hold "/" and "..", and one set by a file
+	// outside the tree (the aspell dictionaries read ${LOCALBASE}/etc) is not
+	// fixed by the tree at all. Refusing only the port's own directory would
+	// refuse nothing for a slave with no distinfo of its own, so every name
+	// is refused rather than guessed at.
+	if len(unownedOrigins) > 0 {
+		why := fmt.Sprintf("%s is restricted or unreadable and reads a distinfo bodega cannot place, so it may obtain any distfile in the tree", unownedOrigins[0])
+		if n := len(unownedOrigins) - 1; n > 0 {
+			why = fmt.Sprintf("%s and %d more ports are restricted or unreadable and read a distinfo bodega cannot place, so any of them may obtain any distfile in the tree", unownedOrigins[0], n)
+		}
+		for _, e := range ix.entries {
+			if e.Restricted == "" {
 				e.Restricted = why
 			}
 		}
@@ -1354,7 +1359,7 @@ func (t *Tree) startLoadLocked() {
 		t.ix, t.loadErr = ix, nil
 		t.logf("distinfo: indexed %d distfiles from %s in %s", ix.Len(), t.root, time.Since(start).Round(time.Millisecond))
 		if u := ix.Unowned(); len(u) > 0 {
-			t.logf("distinfo: %d restricted ports read a distinfo bodega cannot place, so distfiles they share with another port are not refused on their account: %s", len(u), strings.Join(u, "; "))
+			t.logf("distinfo: refusing every distfile: %d restricted ports read a distinfo bodega cannot place, and any of them may obtain any distfile in the tree: %s", len(u), strings.Join(u, "; "))
 		}
 	}()
 }
