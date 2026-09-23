@@ -1030,3 +1030,190 @@ func TestGitBundleAndNamespaceMayShareAName(t *testing.T) {
 		t.Errorf("clone under the shared name = %q, want %q — the package shadowed the namespace", got, "first")
 	}
 }
+
+// writeScript writes an executable /bin/sh script. The CGI child runs with no
+// PATH, so every external command in body must be absolute.
+func writeScript(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "script")
+	if err := os.WriteFile(p, []byte("#!/bin/sh\n"+body), 0o700); err != nil { //nolint:gosec // test fixture must be executable
+		t.Fatalf("write script: %v", err)
+	}
+	return p
+}
+
+func lookPath(t *testing.T, name string) string {
+	t.Helper()
+	p, err := exec.LookPath(name)
+	if err != nil {
+		t.Skipf("%s not found: %v", name, err)
+	}
+	return p
+}
+
+// startGitTestServer serves s under a server-wide WriteTimeout far shorter
+// than the git response it is about to be handed, which is the production
+// arrangement with the durations shrunk.
+func startGitTestServer(t *testing.T, s *Server, writeTimeout time.Duration, http2 bool) *httptest.Server {
+	t.Helper()
+	ts := httptest.NewUnstartedServer(s.Handler())
+	ts.Config.WriteTimeout = writeTimeout
+	if http2 {
+		ts.EnableHTTP2 = true
+		ts.StartTLS()
+	} else {
+		ts.Start()
+	}
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+// A git response that keeps producing output outlives the server-wide write
+// timeout. A full clone of a large repository is minutes of pack, and the
+// route used to die at that bound with "curl 18 transfer closed with
+// outstanding read data remaining", naming neither bodega nor a timeout.
+func TestGitResponseOutlivesTheServerWriteTimeout(t *testing.T) {
+	sleep := lookPath(t, "sleep")
+	for _, h2 := range []bool{false, true} {
+		t.Run(fmt.Sprintf("http2=%v", h2), func(t *testing.T) {
+			s := newGitServer(t, newGitUpstream(t))
+			s.gitTool.backendStall = time.Second
+			s.gitTool.backend = writeScript(t, `printf 'Content-Type: application/x-git-upload-pack-advertisement\r\n\r\n'
+i=0
+while [ $i -lt 12 ]; do printf 'chunk%02d\n' $i; `+sleep+` 0.1; i=$((i+1)); done
+`)
+			ts := startGitTestServer(t, s, 300*time.Millisecond, h2)
+
+			resp, err := ts.Client().Get(ts.URL + "/git/corp/" + gitTestRepo + "/info/refs?service=git-upload-pack")
+			if err != nil {
+				t.Fatalf("GET info/refs: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if h2 && resp.ProtoMajor != 2 {
+				t.Fatalf("negotiated %s, want HTTP/2", resp.Proto)
+			}
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read body after %d bytes: %v", len(body), err)
+			}
+			if resp.StatusCode != http.StatusOK || !strings.HasSuffix(string(body), "chunk11\n") {
+				t.Errorf("status %d, body %q; want 200 and all twelve chunks", resp.StatusCode, body)
+			}
+		})
+	}
+}
+
+// Output that lands inside the window where the write deadline is not moved
+// still counts: every gap below is shorter than the stall, so the response
+// completes. "progress" arrives about halfway into the two-second coalescing
+// window, and "finished" half a second before one stall after it and half a
+// second after one stall from the deadline set before it; both margins exist
+// so scheduling jitter can neither mask the bug nor fake it.
+func TestGitResponseStallCountsFromTheLastOutput(t *testing.T) {
+	sleep := lookPath(t, "sleep")
+	for _, h2 := range []bool{false, true} {
+		t.Run(fmt.Sprintf("http2=%v", h2), func(t *testing.T) {
+			t.Parallel()
+			s := newGitServer(t, newGitUpstream(t))
+			s.gitTool.backendStall = 8 * time.Second
+			s.gitTool.backend = writeScript(t, `printf 'Content-Type: text/plain\r\n\r\nstarted\n'
+`+sleep+` 0.8
+printf 'progress\n'
+`+sleep+` 7.5
+printf 'finished\n'
+`)
+			ts := startGitTestServer(t, s, time.Minute, h2)
+
+			resp, err := ts.Client().Get(ts.URL + "/git/corp/" + gitTestRepo + "/info/refs?service=git-upload-pack")
+			if err != nil {
+				t.Fatalf("GET info/refs: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil || string(body) != "started\nprogress\nfinished\n" {
+				t.Errorf("every gap between outputs is below the %s stall: body %q, error %v", s.gitTool.backendStall, body, err)
+			}
+		})
+	}
+}
+
+// A child that stops producing output is killed one stall later, well inside
+// both the ceiling and the server-wide bound. This is what keeps the per-route
+// hour from being an hour for a wedged child.
+func TestGitResponseStallKillsTheChild(t *testing.T) {
+	sleep := lookPath(t, "sleep")
+	s := newGitServer(t, newGitUpstream(t))
+	s.gitTool.backendStall = time.Second
+	s.gitTool.backend = writeScript(t, `printf 'Content-Type: application/x-git-upload-pack-advertisement\r\n\r\nstarted\n'
+exec `+sleep+` 30
+`)
+	ts := startGitTestServer(t, s, time.Minute, false)
+
+	start := time.Now()
+	resp, err := ts.Client().Get(ts.URL + "/git/corp/" + gitTestRepo + "/info/refs?service=git-upload-pack")
+	if err != nil {
+		t.Fatalf("GET info/refs: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("a silent child held the response %s; want it cut at the %s stall", elapsed, s.gitTool.backendStall)
+	}
+	if string(body) != "started\n" {
+		t.Errorf("body = %q, want what the child wrote before it went quiet", body)
+	}
+}
+
+// A first mirror that outlives the request's wait answers 503 with
+// Retry-After and a message naming the mirror, rather than holding the
+// connection past the server-wide write bound and closing it with nothing.
+// The clone carries on, and the next request is served from it.
+func TestGitFirstMirrorOutlivingTheWaitAnswers503(t *testing.T) {
+	sleep := lookPath(t, "sleep")
+	s := newGitServer(t, newGitUpstream(t))
+	s.gitTool.mirrorWait = 200 * time.Millisecond
+	s.gitTool.git = writeScript(t, `if [ "$1" = clone ]; then `+sleep+` 1.5; fi
+exec `+s.gitTool.git+` "$@"
+`)
+	ts := startGitTestServer(t, s, 500*time.Millisecond, false)
+	url := ts.URL + "/git/corp/" + gitTestRepo
+
+	resp, err := ts.Client().Get(url + "/info/refs?service=git-upload-pack")
+	if err != nil {
+		t.Fatalf("GET info/refs during the first mirror: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read 503 body: %v", err)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body %q", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("Retry-After"); got != "60" {
+		t.Errorf("Retry-After = %q, want %q", got, "60")
+	}
+	if !strings.Contains(string(body), "mirroring corp/"+gitTestRepo) {
+		t.Errorf("body = %q, want it to name the mirror in progress", body)
+	}
+	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/plain") {
+		t.Errorf("Content-Type = %q; git shows the client only a text/plain body", resp.Header.Get("Content-Type"))
+	}
+
+	stamp := filepath.Join(mirrorDir(s, "corp"), gitFetchStamp)
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if _, err := os.Stat(stamp); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the mirror never completed after the 503: %s absent", stamp)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	dest := filepath.Join(t.TempDir(), "clone")
+	runGitCLI(t, t.TempDir(), "clone", "-q", url, dest)
+	if got := runGitCLI(t, dest, "log", "-1", "--format=%s"); got != "first" {
+		t.Errorf("clone after the mirror finished: HEAD subject = %q, want %q", got, "first")
+	}
+}

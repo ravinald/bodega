@@ -3112,9 +3112,9 @@ POST /git/{namespace}/{org}/{repo}.git/git-upload-pack
 
 Those two suffixes are the whole served surface. Every other path under a namespace is a 404, including `HEAD` and `objects/info/packs`: bodega does not serve the dumb-HTTP protocol. The clone URL must end in `.git`, which is what a client types anyway.
 
-On the first request bodega runs `git clone --mirror` into `{storage_path}/git/{namespace}/{org}/{repo}.git` and serves from that mirror afterwards. Concurrent first requests for one repository collapse into one clone. A clone that fails takes its directory with it — a partial mirror would answer later requests with a truncated history — and the client gets a 502 that names no path; the git error is in the server log.
+On the first request bodega runs `git clone --mirror` into `{storage_path}/git/{namespace}/{org}/{repo}.git` and serves from that mirror afterwards. Concurrent first requests for one repository collapse into one clone. The clone runs detached from the request, bounded at 15 minutes, and a request waits on it for 30 seconds: a repository that mirrors inside that is served on the same request, and one that does not gets `503` with `Retry-After: 60` and a plain-text body git prints as `remote: bodega is mirroring <namespace>/<repo> from its upstream for the first time; ...`. The clone keeps running after the 503, and a retry once it finishes is served from the mirror. A clone that fails takes its directory with it — a partial mirror would answer later requests with a truncated history — and the client gets a 502 that names no path; the git error is in the server log.
 
-What is on disk is inspected rather than counted. `git clone --mirror` creates the destination at the start of the transfer, so a restart, an OOM kill, or a removal that lost to a permission error leaves a directory holding `config`, `description`, `hooks/` and `info/` and nothing else. bodega treats a directory with neither `HEAD` nor its own `.bodega-fetched` stamp as an interrupted clone: it is removed and cloned again on the next request, and both legs of the protocol do it, so the `git-upload-pack` POST that arrives while the `info/refs` clone is still running blocks on the same lock rather than answering 404 with an empty body. A removal that fails is a 502 naming the reason in the log, not a mirror that 404s forever with nothing retrying.
+What is on disk is inspected rather than counted. `git clone --mirror` creates the destination at the start of the transfer, so a restart, an OOM kill, or a removal that lost to a permission error leaves a directory holding `config`, `description`, `hooks/` and `info/` and nothing else. bodega treats a directory with neither `HEAD` nor its own `.bodega-fetched` stamp as an interrupted clone: it is removed and cloned again on the next request, and both legs of the protocol do it, so the `git-upload-pack` POST that arrives while the `info/refs` clone is still running waits on the same clone rather than answering 404 with an empty body. A removal that fails is a 502 naming the reason in the log, not a mirror that 404s forever with nothing retrying.
 
 **Repointing `git_upstreams[ns].url` re-clones.** Every mirror records the URL its own clone used, and bodega compares it against the configured upstream before serving. A mismatch is a forge migration, a host swap or a typo correction, so the mirror is discarded and cloned from the new URL, with both URLs in a `WARN`. Budget for the transfer: repointing a namespace with fifty mirrors under it re-clones all fifty, one per first request after the change.
 
@@ -3138,7 +3138,8 @@ The handler checks every occurrence of the `service` parameter, not the first. `
 - **When it is missing**, bodega logs an `ERROR` at startup naming every path it searched, and does not register the smart-HTTP route. `ERROR` because the route is gone: the shipped `log_level` prints nothing below it, so a lower level would announce a disabled feature to nobody. A clone then gets a 404 on `info/refs` and a 405 on `git-upload-pack`. The legacy bundle route keeps working; nothing else about the server changes.
 - **The bodega user must own `{storage_path}/git`.** The mirror clone, the periodic refresh and the CGI child all run as the server's user. Do not run bodega as root to work around a permission error on that tree; fix the ownership.
 - **Upstreams are public and unauthenticated only.** No credential is read from the config or the environment, and the child process is given neither. A private repository answers bodega as an anonymous client, so the operator sees a failed clone, not an auth prompt.
-- **The child process gets an explicit environment**: `GIT_PROJECT_ROOT`, `GIT_HTTP_EXPORT_ALL`, and the CGI variables for the request. No `PATH`, no `HOME`, no inherited `GIT_*`. It is bounded to five minutes and dies with the request.
+- **The child process gets an explicit environment**: `GIT_PROJECT_ROOT`, `GIT_HTTP_EXPORT_ALL`, and the CGI variables for the request. No `PATH`, no `HOME`, no inherited `GIT_*`. It dies with the request, and with its response: see **Response bounds**.
+- **Response bounds.** A git response does not run under the server's five-minute write timeout, which still bounds every other route. It gets its own deadline, at least one minute from the last output `git-http-backend` produced, and never more than one hour in total. A child that goes silent for a minute is sent `SIGTERM` (and `SIGKILL` ten seconds after that). A client that stops reading loses the connection between 60 and 75 seconds after the last output, because the socket deadline is moved at most every 15 seconds and set 15 seconds past the minute to cover that. Only a transfer that keeps moving gets the hour. `git` sends a progress line or keepalive at least every five seconds while it builds a pack, so a minute of silence means something is stuck. The `WARN git-http-backend failed` line carries a `cause` naming which bound fired.
 
 #### Legacy bundle route
 
@@ -3636,7 +3637,7 @@ git clone --depth 1 --branch 2026Q3 https://bodega-host:8080/git/freebsd/freebsd
 
 **`--depth 1` works through smart-HTTP.** `git-upload-pack` makes the shallow cut against bodega's full mirror, so the client receives one commit whatever sits behind it: 131 MB of `.git` in 16 seconds on the test guests, against 2.9 GB in 7m33s for a full clone of the same repository through the same bodega.
 
-**A full clone has five minutes to transfer.** `git-http-backend` runs under a five-minute bound and the server's write timeout is the same five minutes, so the pack has to reach the client inside that window. The full ports history is 2.9 GB, which needs about 10 MB/s sustained. On the test guests' LAN it arrived in time; shaped to 40 Mbit/s, the same clone was cut off at exactly 5m00s:
+**A full clone has an hour, as long as it keeps moving.** The response is bounded at one hour in total and one minute without output (see **Response bounds** under [Operational requirements](#operational-requirements)), so a full clone of the ports history, 2.9 GB, needs about 6.5 Mbit/s sustained. Before that bound existed the route shared the server's five-minute write timeout, and a full clone shaped to 40 Mbit/s was cut off at exactly 5m00s with an error naming neither bodega nor a timeout:
 
 ```text
 error: RPC failed; curl 18 transfer closed with outstanding read data remaining
@@ -3644,17 +3645,24 @@ fatal: early EOF
 fatal: fetch-pack: invalid index-pack output
 ```
 
-Use `--depth 1` on anything slower than that. The error names neither bodega nor a timeout.
+A link below 6.5 Mbit/s still fails the same way, at one hour instead of five minutes. Use `--depth 1` unless the host needs the history: 131 MB against 2.9 GB is the better trade on any link, not only a slow one.
 
 **`--depth 1` does not work against a bundle.** A `git` manifest entry with `"source": "clone"` produces a `.bundle` on the [legacy bundle route](#legacy-bundle-route), and `git clone --depth 1` against a bundle ignores the depth with no warning and exit status 0: the client receives the ref's full history. A bundle also carries one ref, so each quarterly branch would be its own entry and its own rebuild. Serve ports through `git_upstreams`, not through a bundle.
 
-**Prime the mirror before pointing hosts at it.** bodega clones upstream on the first request for the repository, bounded at 15 minutes. The clone runs detached from the request, but the request waits on it, and the ports mirror takes longer than the five-minute write timeout: when the clone finished, the waiting client got `curl: (52) Empty reply from server` rather than refs. The mirror is complete by then, and the next request is served from it. Trigger it yourself so no host is the one that waits:
+**Prime the mirror before pointing hosts at it.** bodega clones upstream on the first request for the repository, bounded at 15 minutes, and the ports mirror takes longer than the 30 seconds a request waits on it: `github.com/freebsd/freebsd-ports` took 6m30s. Every request in that window gets `503` with `Retry-After: 60`, and `git` shows the message:
 
-```bash
-curl -sS -o /dev/null --max-time 1000 'https://bodega-host:8080/git/freebsd/freebsd-ports.git/info/refs?service=git-upload-pack'
+```text
+remote: bodega is mirroring freebsd/freebsd-ports.git from its upstream for the first time; the clone is still running and continues after this response. Retry in a minute or two.
+fatal: unable to access 'https://bodega-host:8080/git/freebsd/freebsd-ports.git/': The requested URL returned error: 503
 ```
 
-That curl ending in an empty reply is expected on a first run. `{storage_path}/git/freebsd/freebsd-ports.git/.bodega-fetched` appears when the mirror is complete.
+Trigger the clone yourself so no host is the one that sees it:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' 'https://bodega-host:8080/git/freebsd/freebsd-ports.git/info/refs?service=git-upload-pack'   # 503 while the clone runs
+```
+
+`{storage_path}/git/freebsd/freebsd-ports.git/.bodega-fetched` appears when the mirror is complete, and the same `curl` then answers `200`.
 
 #### Updating a git tree
 
