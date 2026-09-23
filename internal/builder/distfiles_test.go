@@ -104,6 +104,52 @@ func TestFetchDistfilesWritesADistdir(t *testing.T) {
 	}
 }
 
+// makeOnlyRestrictions are pcpustat Makefiles that set NO_CDROM only through
+// a make construct a lexical read gets wrong: a := taken before the variable
+// it reads is reassigned, and one file included twice under two values.
+var makeOnlyRestrictions = map[string]map[string]string{
+	"immediate assignment": {
+		"Makefile": "D=\tfiles/restricted.mk\nP:=\t${D}\nD=\tfiles/allowed.mk\n.include \"${P}\"\n",
+	},
+	"repeated include": {
+		"Makefile":          "D=\tfiles/allowed.mk\n.include \"files/dispatch.mk\"\nD=\tfiles/restricted.mk\n.include \"files/dispatch.mk\"\n",
+		"files/dispatch.mk": ".include \"${.CURDIR}/${D}\"\n",
+	},
+}
+
+func writeMakeOnlyRestriction(t *testing.T, tree string, files map[string]string) {
+	t.Helper()
+	dir := filepath.Join(tree, "sysutils", "pcpustat")
+	all := map[string]string{"files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "PORTNAME=\tpcpustat\n"}
+	for rel, body := range files {
+		all[rel] = body
+	}
+	for rel, body := range all {
+		p := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A restriction only make's own reading of the Makefiles reaches fails the
+// entry before any upstream is contacted.
+func TestFetchDistfilesRefusesARestrictionMakeReaches(t *testing.T) {
+	for name, files := range makeOnlyRestrictions {
+		t.Run(name, func(t *testing.T) {
+			cfg, store, hits := distfilesRun(t, distfileBody)
+			writeMakeOnlyRestriction(t, cfg.DistfilesPortsTree, files)
+			s := FetchDistfiles(cfg, store, "pcpustat/1.6.tar.bz2")
+			if s.Failures != 1 || hits.Load() != 0 || !strings.Contains(s.Results[0].Err.Error(), "NO_CDROM") {
+				t.Fatalf("results %+v after %d upstream fetches, want one refusal naming NO_CDROM after none", s.Results, hits.Load())
+			}
+		})
+	}
+}
+
 // Bytes distinfo did not pin never reach DISTDIR, under their own name or a
 // temporary one. do-fetch.sh skips any file already present, so a wrong file
 // left there is one the client would never re-fetch.
@@ -233,8 +279,15 @@ func TestDistfilesArtifactPathsAdmitsOnlyWhatDistinfoPins(t *testing.T) {
 	if b, _ := os.ReadFile(paths[0].Local); string(b) != distfileBody || paths[0].ObjectKey != "distfiles/pcpustat/1.6.tar.bz2" {
 		t.Errorf("pinned %q at key %q", b, paths[0].ObjectKey)
 	}
-	// Replacing the DISTDIR file after enumeration does not change what is uploaded.
+	// Rewriting the DISTDIR file in place, or replacing it, after enumeration
+	// does not change what is uploaded.
 	dest := filepath.Join(cfg.BuildRoot, "distfiles", "pcpustat", "1.6.tar.bz2")
+	if err := os.WriteFile(dest, []byte("PCPUSTAT SOURCE BYTES"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(paths[0].Local); string(b) != distfileBody {
+		t.Errorf("pinned copy changed to %q when the DISTDIR file was rewritten in place", b)
+	}
 	tmp := dest + ".new"
 	if err := os.WriteFile(tmp, []byte("PCPUSTAT SOURCE BYTES"), 0o644); err != nil {
 		t.Fatal(err)
@@ -254,9 +307,25 @@ func TestDistfilesArtifactPathsAdmitsOnlyWhatDistinfoPins(t *testing.T) {
 	if _, _, err := DistfilesArtifactPaths(cfg, store, ""); err == nil || !strings.Contains(err.Error(), "pcpustat/1.6.tar.bz2") {
 		t.Fatalf("err=%v, want a refusal naming the file", err)
 	}
+	tree := cfg.DistfilesPortsTree
 	cfg.DistfilesPortsTree = ""
 	if _, _, err := DistfilesArtifactPaths(cfg, store, ""); err == nil || !strings.Contains(err.Error(), "distfiles_ports_tree") {
 		t.Fatalf("err=%v, want a refusal naming the missing setting", err)
+	}
+	cfg.DistfilesPortsTree = tree
+	// A symlink in the DISTDIR is not followed, even to the pinned bytes.
+	good := filepath.Join(t.TempDir(), "good")
+	if err := os.WriteFile(good, []byte(distfileBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(dest); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(good, dest); err != nil {
+		t.Fatal(err)
+	}
+	if paths, _, err := DistfilesArtifactPaths(cfg, store, ""); err != nil || len(paths) != 0 {
+		t.Fatalf("paths=%v err=%v, want the symlink skipped as not present", paths, err)
 	}
 	if left, _ := filepath.Glob(filepath.Join(cfg.BuildRoot, ".bodega-distfiles-upload-*")); len(left) != 0 {
 		t.Errorf("refusals left pin directories: %v", left)

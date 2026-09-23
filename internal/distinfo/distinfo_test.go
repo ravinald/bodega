@@ -2,6 +2,7 @@ package distinfo
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -257,13 +258,28 @@ func TestRestrictionFailsClosedOnWhatItCannotRead(t *testing.T) {
 		{"include leaving the tree", map[string]string{"Makefile": ".include \"${PORTSDIR}/../outside.mk\"\n"}, "leaves the ports tree"},
 		{"optional missing include", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.sinclude \"${.CURDIR}/absent.mk\"\n.-include \"absent.mk\"\n"}, ""},
 		{"framework include", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.include \"${PORTSDIR}/Mk/bsd.port.mk\"\n.include <bsd.port.mk>\n"}, ""},
-		{"include cycle", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.include \"a.mk\"\n", "a.mk": ".include \"Makefile\"\n"}, ""},
+		{"include cycle", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.include \"a.mk\"\n", "a.mk": ".include \"Makefile\"\n"}, "includes itself"},
 		{"trailing comment", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE # only\n"}, ""},
 		{"commented-out restriction", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n#RESTRICTED=\tonce\n"}, ""},
 		{"either branch's master", map[string]string{"Makefile": ".if ${FLAVOR} == a\nMASTERDIR=\t${.CURDIR}/../../lang/master\n.else\nMASTERDIR=\t${.CURDIR}/../../lang/other\n.endif\n.include \"${MASTERDIR}/Makefile.common\"\n"}, "RESTRICTED"},
 		{"master's ?= yields to the slave", map[string]string{"Makefile": "MASTERDIR=\t${.CURDIR}/../../lang/master\nMASTERDIR?=\t${.CURDIR}/../../lang/nowhere\n.include \"${MASTERDIR}/Makefile.common\"\n"}, "RESTRICTED"},
 		{"reassigned between includes", map[string]string{"Makefile": "D=\t${.CURDIR}/../../lang/other\n.include \"${D}/Makefile.common\"\nD=\t${.CURDIR}/../../lang/master\n.include \"${D}/Makefile.common\"\n"}, "RESTRICTED"},
 		{"guarded missing include", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.if exists(${.CURDIR}/opt.mk)\n.include \"${.CURDIR}/opt.mk\"\n.endif\n"}, ""},
+		{"immediate assignment", map[string]string{"Makefile": "D=\tfiles/restricted.mk\nP:=\t${D}\nD=\tfiles/allowed.mk\n.include \"${P}\"\n", "files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "NO_CDROM"},
+		{"immediate assignment of an unknown", map[string]string{"Makefile": "P:=\t${WHERE}\n.include \"${.CURDIR}/${P}x.mk\"\n"}, "cannot be resolved"},
+		{"repeated include", map[string]string{"Makefile": "D=\tfiles/allowed.mk\n.include \"files/dispatch.mk\"\nD=\tfiles/restricted.mk\n.include \"files/dispatch.mk\"\n", "files/dispatch.mk": ".include \"${.CURDIR}/${D}\"\n", "files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "NO_CDROM"},
+		{"assignment in a conditionally included file", map[string]string{"Makefile": "D=\tfiles/restricted.mk\n.if ${X} == y\n.include \"files/set.mk\"\n.endif\n.include \"${.CURDIR}/${D}\"\n", "files/set.mk": "D=\tfiles/allowed.mk\n", "files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "NO_CDROM"},
+		{"?= over a conditional value", map[string]string{"Makefile": ".if ${X} == y\nD=\tfiles/restricted.mk\n.endif\nD?=\tfiles/allowed.mk\n.include \"${.CURDIR}/${D}\"\n", "files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "NO_CDROM"},
+		{"append in a loop", map[string]string{"Makefile": ".for i in a b\nD+=\t${i}\n.endfor\n.include \"${.CURDIR}/${D}.mk\"\n"}, "cannot be resolved"},
+		{"computed name", map[string]string{"Makefile": "D=\tfiles/allowed.mk\nN=\tD\n${N}=\tfiles/restricted.mk\n.include \"${.CURDIR}/${D}\"\n", "files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "NO_CDROM"},
+		{"unresolvable computed name", map[string]string{"Makefile": "D=\tfiles/allowed.mk\n.for n in D\n${n}=\tfiles/restricted.mk\n.endfor\n.include \"${.CURDIR}/${D}\"\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "cannot be followed"},
+		{"computed name elsewhere", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.for o in A B\n${o}_DESC=\tx\n.endfor\nD=\tfiles/allowed.mk\n.include \"${.CURDIR}/${D}\"\n", "files/allowed.mk": ""}, ""},
+		{"modifier assignment", map[string]string{"Makefile": "D=\tfiles/allowed.mk\n.if ${D::=files/restricted.mk}\n.endif\n.include \"${.CURDIR}/${D}\"\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "cannot be followed"},
+		{"undef", map[string]string{"Makefile": "D=\tfiles/allowed.mk\n.undef D\n.include \"${.CURDIR}/${D}\"\n"}, "cannot be resolved"},
+		{"slave with an if/else master", map[string]string{"Makefile": ".if defined(DEVEL)\nMASTERDIR=\t${.CURDIR}/../../lang/other\n.else\nMASTERDIR=\t${.CURDIR}/../../lang/other\n.endif\n.include \"${MASTERDIR}/Makefile.common\"\n"}, ""},
+		{"slave with a ?= master", map[string]string{"Makefile": "MASTERDIR?=\t${.CURDIR}/../../lang/other\n.include \"${MASTERDIR}/Makefile.common\"\n"}, ""},
+		{"framework default", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.include <bsd.port.options.mk>\n.include \"${FILESDIR}/extra.mk\"\n", "files/extra.mk": "RESTRICTED=\tno\n"}, "RESTRICTED"},
+		{"include fan-out", fanOut(10), "more than"},
 		{"shell-assigned path", map[string]string{"Makefile": "V!=\techo x\n.include \"${V}.mk\"\n"}, "cannot be resolved"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -292,4 +308,16 @@ func TestRestrictionFailsClosedOnWhatItCannotRead(t *testing.T) {
 			}
 		})
 	}
+}
+
+// fanOut is a port whose every file includes the next one twice, which make
+// reads 2^depth times and the reader has to stop well before.
+func fanOut(depth int) map[string]string {
+	files := map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.include \"f0.mk\"\n.include \"f0.mk\"\n"}
+	for i := range depth {
+		next := fmt.Sprintf("f%d.mk", i+1)
+		files[fmt.Sprintf("f%d.mk", i)] = fmt.Sprintf(".include %q\n.include %q\n", next, next)
+	}
+	files[fmt.Sprintf("f%d.mk", depth)] = ""
+	return files
 }

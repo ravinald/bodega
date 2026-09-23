@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
@@ -261,12 +262,12 @@ func fetchDistfile(ctx context.Context, src, dest string, entry distinfo.Entry) 
 // than being dropped from the list where nobody would see it go.
 //
 // The check has to cover the bytes PutFile later reads, not the path. Each
-// file is hard-linked into a private directory beside the DISTDIR, and the
-// link is what is hashed and uploaded: fetchDistfile and a client's
-// `make fetch` both replace a file by writing a new one, which leaves the
-// linked inode as it was. A filesystem that refuses the link gets a copy.
-// A writer that rewrites the same inode in place is not stopped by either;
-// the server holds every stored object to distinfo again before serving it.
+// file is copied into a private directory beside the DISTDIR, created 0700 and
+// written O_EXCL, and that copy is what is hashed and uploaded, so no other
+// writer can change it between the check and the upload. A hard link would
+// share the inode with the DISTDIR, where another process may rewrite the file
+// in place after it passed. The copy stops at one byte past the pinned size,
+// so a source that grows while it is read cannot fill the disk.
 func DistfilesArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) ([]ArtifactPath, func(), error) {
 	noRelease := func() {}
 	ctx := context.Background()
@@ -316,7 +317,7 @@ func DistfilesArtifactPaths(cfg *Config, store *manifest.Store, entryFilter stri
 			continue
 		}
 		pinned := filepath.Join(pinDir, filepath.FromSlash(c.name))
-		if err := pinDistfile(c.local, pinned); err != nil {
+		if err := pinDistfile(c.local, pinned, entry.Size); err != nil {
 			refused = append(refused, fmt.Sprintf("%s: %v", c.name, err))
 			continue
 		}
@@ -344,25 +345,29 @@ func DistfilesArtifactPaths(cfg *Config, store *manifest.Store, entryFilter stri
 	return paths, release, nil
 }
 
-// pinDistfile makes dst a hard link to src, or a copy where the filesystem
-// refuses the link.
-func pinDistfile(src, dst string) error {
+// pinDistfile copies at most limit+1 bytes of src into dst, a file it creates.
+// The extra byte lets the size check that follows see a source longer than
+// its pin. src is opened without following a symlink, and must be a regular
+// file once open.
+func pinDistfile(src, dst string, limit int64) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return err
 	}
-	if err := os.Link(src, dst); err == nil {
-		return nil
-	}
-	in, err := os.Open(src) //nolint:gosec // G304: a DISTDIR path built from a validated distinfo name.
+	in, err := os.OpenFile(src, os.O_RDONLY|syscall.O_NOFOLLOW, 0) //nolint:gosec // G304: a DISTDIR path built from a validated distinfo name.
 	if err != nil {
 		return err
 	}
 	defer in.Close()
+	if fi, err := in.Stat(); err != nil {
+		return err
+	} else if !fi.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", src)
+	}
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // G304: under a directory this call created.
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(out, in); err != nil {
+	if _, err := io.CopyN(out, in, limit+1); err != nil && !errors.Is(err, io.EOF) {
 		_ = out.Close()
 		return err
 	}

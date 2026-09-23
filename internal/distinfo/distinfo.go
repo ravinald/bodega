@@ -342,164 +342,395 @@ func stripComments(b []byte) []byte {
 // it includes, not only in files named Makefile*, and a slave port's
 // restrictions usually live in the master it includes. Lines are read in
 // order, as make reads them, so an include sees the assignments above it.
-// Conditionals are not evaluated. An assignment inside one adds a possible
-// value rather than replacing the current one, and an include whose path has
-// several possible values reads every one that exists, so a restriction in any
-// branch is seen. Only .CURDIR, .PARSEDIR, PORTSDIR, variables the port
-// assigns and the :H modifier are understood.
+//
+// The property the reader keeps is that at every include, the values it holds
+// for each variable in the path include every value make could give it there.
+// Conditionals are not evaluated, so an assignment under one, or in a file
+// included under one, adds a possible value rather than replacing the current
+// one, and an include whose path has several possible values reads every one
+// that exists. A := is expanded where it stands, as make does. A file included
+// twice is read twice, each time with the variables in force at that include,
+// because the second read can reach a different file. Wherever the reader
+// cannot keep the property it makes the variable unreadable instead: a !=, a
+// += or := inside a .for whose iterations it does not count, an assignment to
+// a name built from variables, an .undef it cannot place, and a ::= modifier,
+// which assigns while it expands. Only .CURDIR, .PARSEDIR, PORTSDIR, variables
+// the port assigns and the :H modifier are understood.
 //
 // The port is unresolved, and so refused, when an include path holds anything
-// else, leaves the tree, or names no file where the include is unconditional.
-// A missing file under a conditional include is skipped: make reaches that
-// line only when its guard, usually exists(), holds. Angle-bracket includes
-// and anything under Mk/ are the framework, whose license handling the
-// database read models.
+// else, reads an unreadable variable, leaves the tree, includes itself, reaches
+// more than maxIncludeReads files, or names no file where the include is
+// unconditional. A missing file under a conditional include is skipped: make
+// reaches that line only when its guard, usually exists(), holds.
+// Angle-bracket includes and anything under Mk/ are the framework, whose
+// license handling the database read models.
 func portText(tree, dir string, own []string) (text []byte, unresolved string) {
 	if realTree, err := filepath.EvalSymlinks(tree); err == nil {
 		tree = realTree
 	}
-	visited := map[string]bool{}
-	vars := map[string][]string{
-		".CURDIR":   {dir},
-		"PORTSDIR":  {tree},
-		"MASTERDIR": {"${.CURDIR}"},
-		"FILESDIR":  {"${MASTERDIR}/files"},
+	r := &makeReader{
+		tree:  tree,
+		dir:   dir,
+		texts: map[string][]byte{},
+		open:  map[string]bool{},
+		vars: map[string][]string{
+			".CURDIR":  {dir},
+			"PORTSDIR": {tree},
+		},
+		definite: map[string]bool{".CURDIR": true, "PORTSDIR": true},
 	}
+	for _, f := range own {
+		real := f
+		if rf, err := filepath.EvalSymlinks(f); err == nil {
+			real = rf
+		}
+		// A Makefile.* another Makefile already included was read in the
+		// context make reads it in; reading it again from the top would
+		// apply its assignments a second time with nothing to justify it.
+		if _, reached := r.texts[real]; reached {
+			continue
+		}
+		if why := r.read(real, 0, false, false); why != "" {
+			return r.buf, why
+		}
+	}
+	return r.buf, ""
+}
+
+// maxIncludeReads bounds how many files one port's includes may read, counting
+// a file once per include that reaches it. The deepest port in the tree reads
+// a handful; a tree built so that every file includes the next one twice would
+// otherwise read 2^maxIncludeDepth.
+const maxIncludeReads = 256
+
+// unreadable is the value of a variable the reader cannot follow. It holds a
+// "$" no reference matches, so expandMakePath refuses any path that reads it.
+const unreadable = "$(unreadable)"
+
+var (
+	computedAssignment = regexp.MustCompile(`^[ \t]*([^ \t=]*\$[^ \t=]*?)[ \t]*([?:+!]?)=`)
+	undefDirective     = regexp.MustCompile(`^[ \t]*\.[ \t]*undef[ \t]+(.*?)[ \t]*$`)
+	modifierAssignment = regexp.MustCompile(`::[?+!]?=`)
+	frameworkInclude   = regexp.MustCompile(`^[ \t]*\.[ \t]*(-?include|sinclude|dinclude)[ \t]+<`)
+	anyReference       = regexp.MustCompile(`\$\{[^{}$]*\}|\$\([^()$]*\)`)
+)
+
+// makeReader holds one port's walk through its Makefiles: the variables as
+// far as the walk has read, and the text every file contributed.
+type makeReader struct {
+	tree, dir string
+	buf       []byte
+	texts     map[string][]byte // file -> its text, read once however often it is included
+	open      map[string]bool   // files being read now, which an include of would recurse
+	reads     int
+
+	vars map[string][]string
 	// definite records variables some unconditional assignment has set, which
-	// is what makes a later ?= a no-op. The two defaults above are ?= in
-	// bsd.port.mk and so are not definite.
-	definite := map[string]bool{".CURDIR": true, "PORTSDIR": true}
-	var buf []byte
+	// is what makes a later ?= a no-op.
+	definite map[string]bool
+	// tainted matches names some assignment may have written without the
+	// reader knowing which: a computed name, or a ::= modifier.
+	tainted []*regexp.Regexp
+}
 
-	assign := func(name, op, val string, conditional bool) {
-		if op == "!" {
-			val = "$(shell)" // a command's output: never resolvable here
+func (r *makeReader) set(name string, vals []string, conditional bool) {
+	if conditional {
+		r.vars[name] = capValues(dedupe(append(r.vars[name], vals...)))
+		return
+	}
+	r.vars[name] = capValues(dedupe(vals))
+	r.definite[name] = true
+}
+
+// assign applies one assignment. conditional is whether make may skip it,
+// looping whether make may run it more than once.
+func (r *makeReader) assign(name, op, val, parseDir string, conditional, looping bool) {
+	_, defined := r.vars[name]
+	switch {
+	case op == "!":
+		r.set(name, []string{unreadable}, conditional)
+	case looping && (op == "+" || op == ":"):
+		r.set(name, []string{unreadable}, conditional)
+	case op == "+":
+		cur := r.vars[name]
+		if len(cur) == 0 {
+			cur = []string{""}
 		}
-		switch {
-		case op == "+":
-			cur := vars[name]
-			if len(cur) == 0 {
-				cur = []string{""}
-			}
-			out := make([]string, 0, len(cur))
-			for _, c := range cur {
-				out = append(out, strings.TrimSpace(c+" "+val))
-			}
-			if conditional {
-				out = append(out, cur...)
-			}
-			vars[name] = capValues(dedupe(out))
-		case op == "?" && definite[name]:
-		case conditional:
-			vars[name] = capValues(dedupe(append(vars[name], val)))
-		default:
-			vars[name] = []string{val}
-			definite[name] = true
+		out := make([]string, 0, len(cur))
+		for _, c := range cur {
+			out = append(out, strings.TrimSpace(c+" "+val))
+		}
+		if conditional {
+			out = append(out, cur...)
+			r.vars[name] = capValues(dedupe(out))
+			return
+		}
+		r.vars[name] = capValues(dedupe(out))
+	case op == ":":
+		r.set(name, r.expandNow(val, parseDir), conditional)
+	case op == "?" && r.definite[name]:
+	case op == "?" && defined:
+		// Set only on some path so far: on those it stays, on the rest
+		// this value takes it.
+		r.set(name, []string{val}, true)
+	default:
+		r.set(name, []string{val}, conditional)
+	}
+}
+
+// expandNow is a := right-hand side as make holds it after the assignment:
+// expanded against the variables in force now, or unreadable where the
+// reader cannot do that.
+func (r *makeReader) expandNow(val, parseDir string) []string {
+	if !strings.Contains(val, "$") {
+		return []string{val}
+	}
+	scope := r.scope(parseDir)
+	if r.readsTainted(val, scope) {
+		return []string{unreadable}
+	}
+	vals, ok := expandMakePath(val, scope, 0)
+	if !ok {
+		return []string{unreadable}
+	}
+	return vals
+}
+
+func (r *makeReader) scope(parseDir string) map[string][]string {
+	scope := make(map[string][]string, len(r.vars)+1)
+	for k, v := range r.vars {
+		scope[k] = v
+	}
+	scope[".PARSEDIR"] = []string{parseDir}
+	// Nothing but the framework sets these, so before it is included make
+	// holds them undefined and expands them to nothing. Any other variable
+	// the reader has no value for may come from Mk/ or make.conf, and stays
+	// unresolvable.
+	for _, name := range []string{"MASTERDIR", "FILESDIR"} {
+		if _, ok := scope[name]; !ok {
+			scope[name] = []string{""}
 		}
 	}
+	return scope
+}
 
-	var read func(file string, depth int) string
-	read = func(file string, depth int) string {
-		if visited[file] {
-			return ""
+// taint records that name, which may be built from variables, was written to
+// with a value the reader does not follow.
+func (r *makeReader) taint(name string) {
+	literal := anyReference.ReplaceAllString(name, "\x00")
+	if strings.Contains(literal, "$") {
+		r.tainted = append(r.tainted, regexp.MustCompile(`.*`))
+		return
+	}
+	parts := strings.Split(literal, "\x00")
+	for i, p := range parts {
+		parts[i] = regexp.QuoteMeta(p)
+	}
+	r.tainted = append(r.tainted, regexp.MustCompile(`^`+strings.Join(parts, `.*`)+`$`))
+}
+
+// readsTainted reports whether s reads, directly or through the values of the
+// variables it reads, any variable a tainted pattern matches.
+func (r *makeReader) readsTainted(s string, vars map[string][]string) bool {
+	if len(r.tainted) == 0 {
+		return false
+	}
+	seen := map[string]bool{}
+	var walk func(string, int) bool
+	walk = func(s string, depth int) bool {
+		if depth > 8 {
+			return true
 		}
-		visited[file] = true
-		b, err := os.ReadFile(file) //nolint:gosec // G304: resolved and confined under the configured ports tree.
+		for _, m := range varReference.FindAllStringSubmatch(s, -1) {
+			name := m[1]
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			for _, t := range r.tainted {
+				if t.MatchString(name) {
+					return true
+				}
+			}
+			for _, v := range vars[name] {
+				if walk(v, depth+1) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return walk(s, 0)
+}
+
+// framework applies the defaults bsd.port.mk gives a port's own directories
+// with ?=, which is when make applies them: at the framework include, not
+// before it. A slave that sets MASTERDIR under .if and .else would otherwise
+// appear to include itself.
+func (r *makeReader) framework(conditional bool) {
+	r.assign("MASTERDIR", "?", "${.CURDIR}", "", conditional, false)
+	r.assign("FILESDIR", "?", "${MASTERDIR}/files", "", conditional, false)
+}
+
+// read reads file as make would reach it: conditional when some enclosing
+// .if or .for in an including file may skip it, looping when an enclosing
+// .for may read it more than once.
+func (r *makeReader) read(file string, depth int, conditional, looping bool) string {
+	if r.open[file] {
+		return fmt.Sprintf("%s includes itself, which cannot be resolved without make", file)
+	}
+	if r.reads++; r.reads > maxIncludeReads {
+		return fmt.Sprintf("%s is one of more than %d files its includes reach", file, maxIncludeReads)
+	}
+	b, seen := r.texts[file]
+	if !seen {
+		raw, err := os.ReadFile(file) //nolint:gosec // G304: resolved and confined under the configured ports tree.
 		if err != nil {
 			return fmt.Sprintf("cannot read %s: %v", file, err)
 		}
-		b = stripComments(joinContinuations(b))
-		buf = append(append(buf, b...), '\n')
-		nesting := 0
-		for _, line := range strings.Split(string(b), "\n") {
-			directive := strings.HasPrefix(strings.TrimLeft(line, " \t"), ".")
-			if !directive && !strings.Contains(line, "=") {
+		b = stripComments(joinContinuations(raw))
+		r.texts[file] = b
+		r.buf = append(append(r.buf, b...), '\n')
+	}
+	r.open[file] = true
+	defer delete(r.open, file)
+	parseDir := filepath.Dir(file)
+
+	var blocks []string // "if" or "for", innermost last
+	inFor := func() bool {
+		for _, k := range blocks {
+			if k == "for" {
+				return true
+			}
+		}
+		return false
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if modifierAssignment.MatchString(line) {
+			r.taint("${}")
+		}
+		directive := strings.HasPrefix(strings.TrimLeft(line, " \t"), ".")
+		if !directive && !strings.Contains(line, "=") {
+			continue
+		}
+		cond := conditional || len(blocks) > 0
+		loop := looping || inFor()
+		if directive {
+			if m := conditionalOpen.FindStringSubmatch(line); m != nil {
+				kind := "if"
+				if m[1] == "for" {
+					kind = "for"
+				}
+				blocks = append(blocks, kind)
 				continue
 			}
-			switch {
-			case directive && conditionalOpen.MatchString(line):
-				nesting++
-				continue
-			case directive && conditionalClose.MatchString(line):
-				if nesting > 0 {
-					nesting--
+			if conditionalClose.MatchString(line) {
+				if len(blocks) > 0 {
+					blocks = blocks[:len(blocks)-1]
 				}
 				continue
 			}
-			if !directive {
-				if m := assignment.FindStringSubmatch(line); m != nil {
-					assign(m[1], m[2], m[3], nesting > 0)
-				}
-				continue
-			}
-			m := includeDirective.FindStringSubmatch(line)
-			if m == nil {
-				continue
-			}
-			optional := m[1] != "include" || nesting > 0
-			raw := m[2]
-			if depth >= maxIncludeDepth {
-				return fmt.Sprintf("%s includes %q past a depth of %d", file, raw, maxIncludeDepth)
-			}
-			scope := make(map[string][]string, len(vars)+1)
-			for k, v := range vars {
-				scope[k] = v
-			}
-			scope[".PARSEDIR"] = []string{filepath.Dir(file)}
-			paths, ok := expandMakePath(raw, scope, 0)
-			if !ok {
-				return fmt.Sprintf("%s includes %q, which cannot be resolved without make", file, raw)
-			}
-			var found []string
-			for _, p := range paths {
-				candidates := []string{p}
-				if !filepath.IsAbs(p) {
-					candidates = []string{filepath.Join(filepath.Dir(file), p), filepath.Join(dir, p)}
-				}
-				for _, c := range candidates {
-					c = filepath.Clean(c)
-					if fi, err := os.Stat(c); err == nil && fi.Mode().IsRegular() {
-						found = append(found, c)
-						break
+			if m := undefDirective.FindStringSubmatch(line); m != nil {
+				for _, name := range strings.Fields(m[1]) {
+					switch {
+					case strings.Contains(name, "$"):
+						r.taint(name)
+					case cond:
+						r.set(name, []string{""}, true)
+					default:
+						delete(r.vars, name)
+						delete(r.definite, name)
 					}
 				}
+				continue
 			}
-			if len(found) == 0 {
-				if optional {
-					continue
-				}
-				return fmt.Sprintf("%s includes %q, which does not exist", file, raw)
+			if why := r.include(file, line, depth, cond, loop); why != "" {
+				return why
 			}
-			for _, f := range found {
-				real, err := filepath.EvalSymlinks(f)
-				if err != nil {
-					return fmt.Sprintf("%s includes %q: %v", file, raw, err)
-				}
-				rel, err := filepath.Rel(tree, real)
-				if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
-					return fmt.Sprintf("%s includes %q, which leaves the ports tree", file, raw)
-				}
-				if rel == "Mk" || strings.HasPrefix(rel, "Mk"+string(filepath.Separator)) {
-					continue
-				}
-				if why := read(real, depth+1); why != "" {
-					return why
-				}
+			continue
+		}
+		if m := assignment.FindStringSubmatch(line); m != nil {
+			r.assign(m[1], m[2], m[3], parseDir, cond, loop)
+			continue
+		}
+		if m := computedAssignment.FindStringSubmatch(line); m != nil {
+			names, ok := expandMakePath(m[1], r.scope(parseDir), 0)
+			if !ok || r.readsTainted(m[1], r.vars) {
+				r.taint(m[1])
+				continue
+			}
+			for _, name := range names {
+				r.assign(name, m[2], strings.TrimSpace(line[len(m[0]):]), parseDir, cond || len(names) > 1, loop)
 			}
 		}
+	}
+	return ""
+}
+
+// include follows one .include line of file, if it is a quoted one.
+func (r *makeReader) include(file, line string, depth int, conditional, looping bool) string {
+	if frameworkInclude.MatchString(line) {
+		r.framework(conditional)
 		return ""
 	}
-
-	for _, f := range own {
-		real := f
-		if r, err := filepath.EvalSymlinks(f); err == nil {
-			real = r
+	m := includeDirective.FindStringSubmatch(line)
+	if m == nil {
+		return ""
+	}
+	optional := m[1] != "include" || conditional
+	raw := m[2]
+	if depth >= maxIncludeDepth {
+		return fmt.Sprintf("%s includes %q past a depth of %d", file, raw, maxIncludeDepth)
+	}
+	scope := r.scope(filepath.Dir(file))
+	if r.readsTainted(raw, scope) {
+		return fmt.Sprintf("%s includes %q, which reads a variable assigned in a way that cannot be followed without make", file, raw)
+	}
+	paths, ok := expandMakePath(raw, scope, 0)
+	if !ok {
+		return fmt.Sprintf("%s includes %q, which cannot be resolved without make", file, raw)
+	}
+	var found []string
+	for _, p := range paths {
+		candidates := []string{p}
+		if !filepath.IsAbs(p) {
+			candidates = []string{filepath.Join(filepath.Dir(file), p), filepath.Join(r.dir, p)}
 		}
-		if why := read(real, 0); why != "" {
-			return buf, why
+		for _, c := range candidates {
+			c = filepath.Clean(c)
+			if fi, err := os.Stat(c); err == nil && fi.Mode().IsRegular() {
+				found = append(found, c)
+				break
+			}
 		}
 	}
-	return buf, ""
+	if len(found) == 0 {
+		if optional {
+			return ""
+		}
+		return fmt.Sprintf("%s includes %q, which does not exist", file, raw)
+	}
+	// Several candidates means make reads one of them, so each is read as
+	// something make may skip.
+	conditional = conditional || len(found) > 1
+	for _, f := range found {
+		real, err := filepath.EvalSymlinks(f)
+		if err != nil {
+			return fmt.Sprintf("%s includes %q: %v", file, raw, err)
+		}
+		rel, err := filepath.Rel(r.tree, real)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+			return fmt.Sprintf("%s includes %q, which leaves the ports tree", file, raw)
+		}
+		if rel == "Mk" || strings.HasPrefix(rel, "Mk"+string(filepath.Separator)) {
+			r.framework(conditional)
+			continue
+		}
+		if why := r.read(real, depth+1, conditional, looping); why != "" {
+			return why
+		}
+	}
+	return ""
 }
 
 // capValues replaces a value set past maxPathValues with one value no path

@@ -149,6 +149,53 @@ func TestDistfilesRefusesARestrictedDistfile(t *testing.T) {
 	}
 }
 
+// makeOnlyRestrictions are pcpustat Makefiles that set NO_CDROM only through
+// a make construct a lexical read gets wrong: a := taken before the variable
+// it reads is reassigned, and one file included twice under two values.
+var makeOnlyRestrictions = map[string]map[string]string{
+	"immediate assignment": {
+		"Makefile": "D=\tfiles/restricted.mk\nP:=\t${D}\nD=\tfiles/allowed.mk\n.include \"${P}\"\n",
+	},
+	"repeated include": {
+		"Makefile":          "D=\tfiles/allowed.mk\n.include \"files/dispatch.mk\"\nD=\tfiles/restricted.mk\n.include \"files/dispatch.mk\"\n",
+		"files/dispatch.mk": ".include \"${.CURDIR}/${D}\"\n",
+	},
+}
+
+func writeMakeOnlyRestriction(t *testing.T, tree string, files map[string]string) {
+	t.Helper()
+	dir := filepath.Join(tree, "sysutils", "pcpustat")
+	all := map[string]string{"files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "PORTNAME=\tpcpustat\n"}
+	for rel, body := range files {
+		all[rel] = body
+	}
+	for rel, body := range all {
+		p := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A restriction only make's own reading of the Makefiles reaches is refused
+// before any upstream is contacted.
+func TestDistfilesRefusesARestrictionMakeReaches(t *testing.T) {
+	for name, files := range makeOnlyRestrictions {
+		t.Run(name, func(t *testing.T) {
+			tree := distfilesPortsTree(t)
+			writeMakeOnlyRestriction(t, tree, files)
+			ts, _, hits := distfilesFixture(t, tree, distfileBody)
+			code, body := getBody(t, ts.URL+"/distfiles/pcpustat/1.6.tar.bz2")
+			if code != http.StatusUnavailableForLegalReasons || !strings.Contains(body, "NO_CDROM") || hits.Load() != 0 {
+				t.Fatalf("GET = %d %q after %d upstream fetches, want 451 naming NO_CDROM after none", code, body, hits.Load())
+			}
+		})
+	}
+}
+
 // A restriction added after a file was cached still applies: distinfo decides
 // before the cache does.
 func TestDistfilesRestrictionOutranksTheCache(t *testing.T) {
