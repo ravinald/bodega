@@ -106,8 +106,20 @@ func TestFetchDistfilesWritesADistdir(t *testing.T) {
 
 // makeOnlyRestrictions are pcpustat Makefiles that set NO_CDROM only through
 // a make construct a lexical read gets wrong: a := taken before the variable
-// it reads is reassigned, and one file included twice under two values.
+// it reads is reassigned, one file included twice under two values, a ?= after
+// an .undef that may run, a .for variable shadowing a global one, and an
+// assignment whose name is computed. Base make on FreeBSD prints "No resale"
+// for `make -V NO_CDROM` in each.
 var makeOnlyRestrictions = map[string]map[string]string{
+	"conditional undef": {
+		"Makefile": "D=\tfiles/allowed.mk\n.if 1\n.undef D\n.endif\nD?=\tfiles/restricted.mk\n.include \"${D}\"\n",
+	},
+	"loop shadow": {
+		"Makefile": "D=\tfiles/allowed.mk\n.for D in files/restricted.mk\n.include \"${D}\"\n.endfor\n",
+	},
+	"computed restriction": {
+		"Makefile": "N=\tNO_CDROM\n${N}=\tNo resale\n",
+	},
 	"immediate assignment": {
 		"Makefile": "D=\tfiles/restricted.mk\nP:=\t${D}\nD=\tfiles/allowed.mk\n.include \"${P}\"\n",
 	},
@@ -145,6 +157,24 @@ func TestFetchDistfilesRefusesARestrictionMakeReaches(t *testing.T) {
 			s := FetchDistfiles(cfg, store, "pcpustat/1.6.tar.bz2")
 			if s.Failures != 1 || hits.Load() != 0 || !strings.Contains(s.Results[0].Err.Error(), "NO_CDROM") {
 				t.Fatalf("results %+v after %d upstream fetches, want one refusal naming NO_CDROM after none", s.Results, hits.Load())
+			}
+		})
+	}
+}
+
+// A file already in DISTDIR whose port make restricts is not uploaded, and
+// the whole upload is refused.
+func TestDistfilesArtifactPathsRefusesARestrictionMakeReaches(t *testing.T) {
+	for name, files := range makeOnlyRestrictions {
+		t.Run(name, func(t *testing.T) {
+			cfg, store, _ := distfilesRun(t, distfileBody)
+			if s := FetchDistfiles(cfg, store, "pcpustat/1.6.tar.bz2"); s.HasFailures() {
+				t.Fatalf("fetch: %+v", s.Results)
+			}
+			writeMakeOnlyRestriction(t, cfg.DistfilesPortsTree, files)
+			paths, _, err := DistfilesArtifactPaths(cfg, store, "")
+			if err == nil || !strings.Contains(err.Error(), "NO_CDROM") {
+				t.Fatalf("paths=%v err=%v, want a refusal naming NO_CDROM", paths, err)
 			}
 		})
 	}

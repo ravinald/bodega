@@ -353,9 +353,19 @@ func stripComments(b []byte) []byte {
 // because the second read can reach a different file. Wherever the reader
 // cannot keep the property it makes the variable unreadable instead: a !=, a
 // += or := inside a .for whose iterations it does not count, an assignment to
-// a name built from variables, an .undef it cannot place, and a ::= modifier,
-// which assigns while it expands. Only .CURDIR, .PARSEDIR, PORTSDIR, variables
-// the port assigns and the :H modifier are understood.
+// a name built from variables it cannot expand, an .undef it cannot place, and
+// a ::= or :_= modifier, which assigns while it expands. Only .CURDIR,
+// .PARSEDIR, PORTSDIR, variables the port assigns, .for variables and the :H
+// modifier are understood.
+//
+// Three states have to match make's for that property to hold. A variable an
+// .undef may have removed is no longer definitely set, so a later ?= may take
+// effect. A .for variable is substituted into the loop body's text, as make
+// does, holding every word of the loop's list, so it shadows an outer variable
+// of the same name inside the body and nowhere else. And an assignment whose
+// name is computed reaches the restriction decision, not only later includes:
+// a resolved name is appended to the text restriction reads, and one that
+// cannot be resolved but could name a restriction variable refuses the port.
 //
 // The port is unresolved, and so refused, when an include path holds anything
 // else, reads an unreadable variable, leaves the tree, includes itself, reaches
@@ -394,7 +404,7 @@ func portText(tree, dir string, own []string) (text []byte, unresolved string) {
 			return r.buf, why
 		}
 	}
-	return r.buf, ""
+	return r.buf, r.taintedRestriction()
 }
 
 // maxIncludeReads bounds how many files one port's includes may read, counting
@@ -408,11 +418,12 @@ const maxIncludeReads = 256
 const unreadable = "$(unreadable)"
 
 var (
-	computedAssignment = regexp.MustCompile(`^[ \t]*([^ \t=]*\$[^ \t=]*?)[ \t]*([?:+!]?)=`)
 	undefDirective     = regexp.MustCompile(`^[ \t]*\.[ \t]*undef[ \t]+(.*?)[ \t]*$`)
+	forDirective       = regexp.MustCompile(`^[ \t]*\.[ \t]*for[ \t]+(.*?)[ \t]+in\b[ \t]*(.*)$`)
 	modifierAssignment = regexp.MustCompile(`::[?+!]?=`)
+	underscoreModifier = regexp.MustCompile(`:_(?:=([^:}]*))?[:}]`)
 	frameworkInclude   = regexp.MustCompile(`^[ \t]*\.[ \t]*(-?include|sinclude|dinclude)[ \t]+<`)
-	anyReference       = regexp.MustCompile(`\$\{[^{}$]*\}|\$\([^()$]*\)`)
+	anyReference       = regexp.MustCompile(`\$\{[^{}$]*\}|\$\([^()$]*\)|\$[A-Za-z0-9_.]`)
 )
 
 // makeReader holds one port's walk through its Makefiles: the variables as
@@ -423,6 +434,7 @@ type makeReader struct {
 	texts     map[string][]byte // file -> its text, read once however often it is included
 	open      map[string]bool   // files being read now, which an include of would recurse
 	reads     int
+	loops     int // .for directives read, which keeps each one's bound names distinct
 
 	vars map[string][]string
 	// definite records variables some unconditional assignment has set, which
@@ -430,7 +442,12 @@ type makeReader struct {
 	definite map[string]bool
 	// tainted matches names some assignment may have written without the
 	// reader knowing which: a computed name, or a ::= modifier.
-	tainted []*regexp.Regexp
+	tainted []taintedName
+}
+
+type taintedName struct {
+	re   *regexp.Regexp
+	name string // as the Makefile spells it
 }
 
 func (r *makeReader) set(name string, vals []string, conditional bool) {
@@ -517,16 +534,44 @@ func (r *makeReader) scope(parseDir string) map[string][]string {
 // taint records that name, which may be built from variables, was written to
 // with a value the reader does not follow.
 func (r *makeReader) taint(name string) {
-	literal := anyReference.ReplaceAllString(name, "\x00")
+	// Innermost references first, so ${"${A}":?B:C} is one reference.
+	literal := strings.ReplaceAll(name, "$$", "\x01")
+	for prev := ""; prev != literal; {
+		prev = literal
+		literal = anyReference.ReplaceAllString(literal, "\x00")
+	}
+	literal = strings.ReplaceAll(literal, "\x01", "$")
 	if strings.Contains(literal, "$") {
-		r.tainted = append(r.tainted, regexp.MustCompile(`.*`))
+		r.tainted = append(r.tainted, taintedName{regexp.MustCompile(`.*`), name})
 		return
 	}
 	parts := strings.Split(literal, "\x00")
 	for i, p := range parts {
 		parts[i] = regexp.QuoteMeta(p)
 	}
-	r.tainted = append(r.tainted, regexp.MustCompile(`^`+strings.Join(parts, `.*`)+`$`))
+	r.tainted = append(r.tainted, taintedName{regexp.MustCompile(`^` + strings.Join(parts, `.*`) + `$`), name})
+}
+
+// taintedRestriction names a write the reader could not follow that may have
+// been to a variable restriction reads, or returns "". It runs once the port
+// is read, because which LICENSE_PERMS_<lic> the framework reads depends on a
+// LICENSE the port may set after the write. Such a write refuses the port
+// whether or not anything later reads it: it may be the restriction itself.
+func (r *makeReader) taintedRestriction() string {
+	names := []string{"RESTRICTED", "NO_CDROM", "LICENSE", "LICENSE_PERMS"}
+	for _, m := range licenseVar.FindAllSubmatch(r.buf, -1) {
+		for _, lic := range strings.Fields(string(m[1])) {
+			names = append(names, "LICENSE_PERMS_"+lic)
+		}
+	}
+	for _, t := range r.tainted {
+		for _, n := range names {
+			if t.re.MatchString(n) {
+				return fmt.Sprintf("an assignment to %q may set %s, and cannot be followed without make", t.name, n)
+			}
+		}
+	}
+	return ""
 }
 
 // readsTainted reports whether s reads, directly or through the values of the
@@ -548,7 +593,7 @@ func (r *makeReader) readsTainted(s string, vars map[string][]string) bool {
 			}
 			seen[name] = true
 			for _, t := range r.tainted {
-				if t.MatchString(name) {
+				if t.re.MatchString(name) {
 					return true
 				}
 			}
@@ -596,18 +641,19 @@ func (r *makeReader) read(file string, depth int, conditional, looping bool) str
 	defer delete(r.open, file)
 	parseDir := filepath.Dir(file)
 
-	var blocks []string // "if" or "for", innermost last
+	var blocks []block // innermost last
 	inFor := func() bool {
 		for _, k := range blocks {
-			if k == "for" {
+			if k.loop {
 				return true
 			}
 		}
 		return false
 	}
 	for _, line := range strings.Split(string(b), "\n") {
-		if modifierAssignment.MatchString(line) {
-			r.taint("${}")
+		line = bindLoopVars(line, blocks)
+		for _, name := range modifierTargets(line) {
+			r.taint(name)
 		}
 		directive := strings.HasPrefix(strings.TrimLeft(line, " \t"), ".")
 		if !directive && !strings.Contains(line, "=") {
@@ -616,12 +662,15 @@ func (r *makeReader) read(file string, depth int, conditional, looping bool) str
 		cond := conditional || len(blocks) > 0
 		loop := looping || inFor()
 		if directive {
+			if m := forDirective.FindStringSubmatch(line); m != nil {
+				blocks = append(blocks, r.bindFor(m[1], m[2], parseDir))
+				continue
+			}
 			if m := conditionalOpen.FindStringSubmatch(line); m != nil {
-				kind := "if"
 				if m[1] == "for" {
-					kind = "for"
+					return fmt.Sprintf("%s has a .for the reader cannot parse: %q", file, strings.TrimSpace(line))
 				}
-				blocks = append(blocks, kind)
+				blocks = append(blocks, block{})
 				continue
 			}
 			if conditionalClose.MatchString(line) {
@@ -636,7 +685,10 @@ func (r *makeReader) read(file string, depth int, conditional, looping bool) str
 					case strings.Contains(name, "$"):
 						r.taint(name)
 					case cond:
+						// Undefined on some path and not on others: a
+						// later ?= takes effect on the first.
 						r.set(name, []string{""}, true)
+						delete(r.definite, name)
 					default:
 						delete(r.vars, name)
 						delete(r.definite, name)
@@ -653,18 +705,173 @@ func (r *makeReader) read(file string, depth int, conditional, looping bool) str
 			r.assign(m[1], m[2], m[3], parseDir, cond, loop)
 			continue
 		}
-		if m := computedAssignment.FindStringSubmatch(line); m != nil {
-			names, ok := expandMakePath(m[1], r.scope(parseDir), 0)
-			if !ok || r.readsTainted(m[1], r.vars) {
-				r.taint(m[1])
+		if name, op, val, ok := computedAssignment(line); ok {
+			names, ok := expandMakePath(name, r.scope(parseDir), 0)
+			if !ok || r.readsTainted(name, r.vars) {
+				r.taint(name)
 				continue
 			}
-			for _, name := range names {
-				r.assign(name, m[2], strings.TrimSpace(line[len(m[0]):]), parseDir, cond || len(names) > 1, loop)
+			for _, n := range names {
+				r.assign(n, op, val, parseDir, cond || len(names) > 1, loop)
+				r.buf = append(r.buf, n+op+"=\t"+val+"\n"...)
 			}
 		}
 	}
 	return ""
+}
+
+// block is one open .if or .for. A .for maps each variable it binds to the
+// name its words are held under in the reader's variables.
+type block struct {
+	loop  bool
+	bound map[string]string
+}
+
+// bindFor opens a .for. Its variables are bound under names no Makefile can
+// write, to every word the list can hold: a superset of what any one
+// iteration substitutes. A list the reader cannot expand binds them to
+// unreadable, so a path or name built from one refuses.
+func (r *makeReader) bindFor(vars, list, parseDir string) block {
+	var words []string
+	switch {
+	case !strings.Contains(list, "$"):
+		words = strings.Fields(list)
+	case r.readsTainted(list, r.scope(parseDir)):
+	default:
+		if vals, ok := expandMakePath(list, r.scope(parseDir), 0); ok {
+			for _, v := range vals {
+				words = append(words, strings.Fields(v)...)
+			}
+		}
+	}
+	words = capValues(dedupe(words))
+	if len(words) == 0 {
+		words = []string{unreadable}
+	}
+	r.loops++
+	b := block{loop: true, bound: map[string]string{}}
+	for _, v := range strings.Fields(vars) {
+		name := fmt.Sprintf(".bodega.for%d.%s", r.loops, v)
+		r.vars[name] = words
+		b.bound[v] = name
+	}
+	return b
+}
+
+// bindLoopVars substitutes each ${var} and ${var:...} a .for binds with the
+// name its words are held under. make substitutes a loop's variables into the
+// text of its whole body, nested loops included, before reading it: so the
+// outermost loop binds first and wins over an inner one of the same name, and
+// a variable the body reaches only through another variable's value is the
+// global one. A one-character variable is also substituted where it is
+// written $v, as make does. $(var) is left as it is: the path expansion does
+// not follow it, so it refuses.
+func bindLoopVars(line string, blocks []block) string {
+	if !strings.Contains(line, "$") {
+		return line
+	}
+	for i := range blocks {
+		for v, name := range blocks[i].bound {
+			line = strings.ReplaceAll(line, "${"+v+"}", "${"+name+"}")
+			line = strings.ReplaceAll(line, "${"+v+":", "${"+name+":")
+			if len(v) == 1 {
+				line = substituteShort(line, v[0], "${"+name+"}")
+			}
+		}
+	}
+	return line
+}
+
+// substituteShort replaces each $c reference with ref, leaving $$, which make
+// reads as a literal dollar, alone.
+func substituteShort(line string, c byte, ref string) string {
+	var b strings.Builder
+	for i := 0; i < len(line); i++ {
+		if line[i] == '$' && i+1 < len(line) {
+			if line[i+1] == '$' {
+				b.WriteString("$$")
+				i++
+				continue
+			}
+			if line[i+1] == c {
+				b.WriteString(ref)
+				i++
+				continue
+			}
+		}
+		b.WriteByte(line[i])
+	}
+	return b.String()
+}
+
+// computedAssignment splits a line assigning to a name built from variable
+// references. The name is read with its braces balanced, because a modifier
+// inside one may hold spaces or an "=" and still be part of the name.
+func computedAssignment(line string) (name, op, val string, ok bool) {
+	i := len(line) - len(strings.TrimLeft(line, " \t"))
+	start, depth, sawRef := i, 0, false
+	for ; i < len(line); i++ {
+		c := line[i]
+		if c == '$' && i+1 < len(line) && (line[i+1] == '{' || line[i+1] == '(') {
+			depth++
+			sawRef = true
+			i++
+			continue
+		}
+		if c == '$' {
+			sawRef = true
+		}
+		if depth > 0 {
+			if c == '}' || c == ')' {
+				depth--
+			}
+			continue
+		}
+		if strings.ContainsRune(" \t=?:+!", rune(c)) {
+			break
+		}
+	}
+	if !sawRef || depth > 0 || i == start {
+		return "", "", "", false
+	}
+	name = line[start:i]
+	rest := strings.TrimLeft(line[i:], " \t")
+	if len(rest) > 0 && strings.ContainsRune("?:+!", rune(rest[0])) {
+		op, rest = rest[:1], rest[1:]
+	}
+	if !strings.HasPrefix(rest, "=") {
+		return "", "", "", false
+	}
+	return name, op, strings.TrimSpace(rest[1:]), true
+}
+
+// modifierTargets names every variable a ::=, ::?=, ::+=, ::!= or :_=
+// modifier on line assigns to. A target the reader cannot name comes back as
+// "${}", which taints every name.
+func modifierTargets(line string) []string {
+	if !strings.Contains(line, "::") && !strings.Contains(line, ":_") {
+		return nil
+	}
+	var out []string
+	for _, m := range modifierAssignment.FindAllStringSubmatchIndex(line, -1) {
+		open := strings.LastIndex(line[:m[0]], "${")
+		if open < 0 || strings.ContainsAny(line[open+2:m[0]], "${}:") {
+			out = append(out, "${}")
+			continue
+		}
+		out = append(out, line[open+2:m[0]])
+	}
+	for _, m := range underscoreModifier.FindAllStringSubmatch(line, -1) {
+		switch {
+		case m[1] == "":
+			out = append(out, "_")
+		case strings.Contains(m[1], "$"):
+			out = append(out, "${}")
+		default:
+			out = append(out, m[1])
+		}
+	}
+	return out
 }
 
 // include follows one .include line of file, if it is a quoted one.

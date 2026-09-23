@@ -151,8 +151,20 @@ func TestDistfilesRefusesARestrictedDistfile(t *testing.T) {
 
 // makeOnlyRestrictions are pcpustat Makefiles that set NO_CDROM only through
 // a make construct a lexical read gets wrong: a := taken before the variable
-// it reads is reassigned, and one file included twice under two values.
+// it reads is reassigned, one file included twice under two values, a ?= after
+// an .undef that may run, a .for variable shadowing a global one, and an
+// assignment whose name is computed. Base make on FreeBSD prints "No resale"
+// for `make -V NO_CDROM` in each.
 var makeOnlyRestrictions = map[string]map[string]string{
+	"conditional undef": {
+		"Makefile": "D=\tfiles/allowed.mk\n.if 1\n.undef D\n.endif\nD?=\tfiles/restricted.mk\n.include \"${D}\"\n",
+	},
+	"loop shadow": {
+		"Makefile": "D=\tfiles/allowed.mk\n.for D in files/restricted.mk\n.include \"${D}\"\n.endfor\n",
+	},
+	"computed restriction": {
+		"Makefile": "N=\tNO_CDROM\n${N}=\tNo resale\n",
+	},
 	"immediate assignment": {
 		"Makefile": "D=\tfiles/restricted.mk\nP:=\t${D}\nD=\tfiles/allowed.mk\n.include \"${P}\"\n",
 	},

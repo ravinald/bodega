@@ -272,7 +272,8 @@ func TestRestrictionFailsClosedOnWhatItCannotRead(t *testing.T) {
 		{"?= over a conditional value", map[string]string{"Makefile": ".if ${X} == y\nD=\tfiles/restricted.mk\n.endif\nD?=\tfiles/allowed.mk\n.include \"${.CURDIR}/${D}\"\n", "files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "NO_CDROM"},
 		{"append in a loop", map[string]string{"Makefile": ".for i in a b\nD+=\t${i}\n.endfor\n.include \"${.CURDIR}/${D}.mk\"\n"}, "cannot be resolved"},
 		{"computed name", map[string]string{"Makefile": "D=\tfiles/allowed.mk\nN=\tD\n${N}=\tfiles/restricted.mk\n.include \"${.CURDIR}/${D}\"\n", "files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "NO_CDROM"},
-		{"unresolvable computed name", map[string]string{"Makefile": "D=\tfiles/allowed.mk\n.for n in D\n${n}=\tfiles/restricted.mk\n.endfor\n.include \"${.CURDIR}/${D}\"\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "cannot be followed"},
+		{"computed name from a loop", map[string]string{"Makefile": "D=\tfiles/allowed.mk\n.for n in D\n${n}=\tfiles/restricted.mk\n.endfor\n.include \"${.CURDIR}/${D}\"\n", "files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "NO_CDROM"},
+		{"unresolvable computed name", map[string]string{"Makefile": "D=\tfiles/allowed.mk\n.for n in ${LIST:O}\n${n}=\tfiles/restricted.mk\n.endfor\n.include \"${.CURDIR}/${D}\"\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "cannot be followed"},
 		{"computed name elsewhere", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.for o in A B\n${o}_DESC=\tx\n.endfor\nD=\tfiles/allowed.mk\n.include \"${.CURDIR}/${D}\"\n", "files/allowed.mk": ""}, ""},
 		{"modifier assignment", map[string]string{"Makefile": "D=\tfiles/allowed.mk\n.if ${D::=files/restricted.mk}\n.endif\n.include \"${.CURDIR}/${D}\"\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "cannot be followed"},
 		{"undef", map[string]string{"Makefile": "D=\tfiles/allowed.mk\n.undef D\n.include \"${.CURDIR}/${D}\"\n"}, "cannot be resolved"},
@@ -305,6 +306,73 @@ func TestRestrictionFailsClosedOnWhatItCannotRead(t *testing.T) {
 			}
 			if !errors.Is(err, ErrRestricted) || !strings.Contains(e.Restricted, tc.refused) {
 				t.Fatalf("got %q, %v; want ErrRestricted naming %q", e.Restricted, err, tc.refused)
+			}
+		})
+	}
+}
+
+// makeMeaning are Makefiles whose meaning base make on FreeBSD 15.1 settles:
+// `make -V NO_CDROM` prints "No resale" for every case with want "NO_CDROM"
+// and nothing for every case with want "". Each is a state the reader has to
+// hold as make does, or refuse: definedness after an .undef that may not run,
+// a .for variable shadowing an outer one only in the loop's own text, and an
+// assignment whose name is computed reaching the restriction decision. The
+// rest refuse because the reader cannot establish what make would do.
+var makeMeaning = []struct {
+	name, makefile, want string
+}{
+	{"conditional undef", "D=files/allowed.mk\n.if 1\n.undef D\n.endif\nD?=files/restricted.mk\n.include \"${D}\"\n", "NO_CDROM"},
+	{"conditional undef in an included file", "D=files/allowed.mk\n.include \"files/drop.mk\"\nD?=files/restricted.mk\n.include \"${D}\"\n", "NO_CDROM"},
+	{"undef in a loop", "D=files/allowed.mk\n.for i in 1\n.undef D\n.endfor\nD?=files/restricted.mk\n.include \"${D}\"\n", "NO_CDROM"},
+	{"empty is still defined", "D=\nD?=files/restricted.mk\n.include \"files/allowed.mk\"\n", ""},
+	{"loop shadow", "D=files/allowed.mk\n.for D in files/restricted.mk\n.include \"${D}\"\n.endfor\n", "NO_CDROM"},
+	{"loop variable with a modifier", "D=files/allowed.mk\n.for D in files/x/restricted.mk\n.include \"${D:H:H}/restricted.mk\"\n.endfor\n", "NO_CDROM"},
+	{"loop list from a variable", "L=files/allowed.mk files/restricted.mk\n.for D in ${L}\n.include \"${D}\"\n.endfor\n", "NO_CDROM"},
+	{"loop variable kept past the loop", ".for D in files/restricted.mk\nX=${D}\n.endfor\n.include \"${X}\"\n", "NO_CDROM"},
+	{"nested loop shadow", "D=files/allowed.mk\n.for D in files/restricted.mk\n.for D in files/allowed.mk\n.include \"${D}\"\n.endfor\n.endfor\n", "NO_CDROM"},
+	{"nested loop shadowed by the outer", "D=files/restricted.mk\n.for D in files/allowed.mk\n.for D in files/restricted.mk\n.include \"${D}\"\n.endfor\n.endfor\n", ""},
+	{"two loop variables", ".for A D in files/allowed.mk files/restricted.mk\n.include \"${D}\"\n.endfor\n", "NO_CDROM"},
+	{"outer variable through another", "D=files/allowed.mk\nX=${D}\n.for D in files/missing.mk\n.include \"${X}\"\n.endfor\n", ""},
+	{"computed restriction", "N=NO_CDROM\n${N}=No resale\n", "NO_CDROM"},
+	{"computed restriction from a loop", ".for N in NO_CDROM\n${N}=No resale\n.endfor\n", "NO_CDROM"},
+	{"computed name with a spaced modifier", "N=NO_X\n${N:S/X/CDROM/:S/ / /}=No resale\n", "may set"},
+	{"computed name in an included file", ".include \"files/computed.mk\"\n", "NO_CDROM"},
+	{"unresolvable computed prefix", "NO_${UNKNOWN}=No resale\n", "may set"},
+	{"unresolvable computed name", "${UNKNOWN}=No resale\n", "may set"},
+	{"unresolvable computed license permissions", "LICENSE_PERMS_${UNKNOWN}=dist-mirror dist-sell pkg-mirror pkg-sell\n", "may set"},
+	{"unresolvable computed name set before the license it matches", "${UNKNOWN}_BSD2CLAUSE=dist-mirror\nLICENSE+=BSD2CLAUSE\n", "may set LICENSE_PERMS_BSD2CLAUSE"},
+	{"unresolvable computed suffix elsewhere", "${UNKNOWN}_DESC=x\n", ""},
+	{"nested computed suffix elsewhere", "CMAKE_${\"${FLAVOR:Mx}\":?ON:OFF}=\tX\n", ""},
+	{"one-letter loop variable", ".for o in NO_CDROM\n$o=No resale\n.endfor\n", "NO_CDROM"},
+	{"one-letter loop variable elsewhere", ".for o in A B\n$o_DESC=x\n.endfor\n", ""},
+	{"escaped dollar is not a loop variable", "D=files/allowed.mk\n.for D in files/restricted.mk\nX=$$D\n.endfor\n.include \"${D}\"\n", ""},
+	{"modifier assignment to a restriction", "X:=${NO_CDROM::=No resale}\n", "may set NO_CDROM"},
+	{"underscore modifier", "D=files/allowed.mk\n.if ${:Ufiles/restricted.mk:_=D}\n.endif\n.include \"${D}\"\n", "cannot be followed"},
+}
+
+// A restriction make reaches is one the reader reaches, or the port refuses.
+func TestRestrictionHoldsMakesMeaning(t *testing.T) {
+	for _, tc := range makeMeaning {
+		t.Run(tc.name, func(t *testing.T) {
+			root := portsTree(t)
+			write(t, root, "sysutils/pcpustat/Makefile", "LICENSE=\tBSD2CLAUSE\n"+tc.makefile)
+			write(t, root, "sysutils/pcpustat/files/restricted.mk", "NO_CDROM=No resale\n")
+			write(t, root, "sysutils/pcpustat/files/allowed.mk", "PORTNAME=pcpustat\n")
+			write(t, root, "sysutils/pcpustat/files/drop.mk", ".if 1\n.undef D\n.endif\n")
+			write(t, root, "sysutils/pcpustat/files/computed.mk", "N=NO_CDROM\n${N}=No resale\n")
+			ix, err := Load(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			e, err := ix.Lookup("pcpustat/1.6.tar.bz2")
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("refused a port make does not restrict: %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrRestricted) || !strings.Contains(e.Restricted, tc.want) {
+				t.Fatalf("got %q, %v; want ErrRestricted naming %q", e.Restricted, err, tc.want)
 			}
 		})
 	}
