@@ -149,7 +149,8 @@ func runBuildStage(buf *bytes.Buffer, bc *builder.Config, store *manifest.Store,
 		s.Print(buf)
 		totalFail += s.Failures
 	case manifest.TypeGit, manifest.TypeBinary, manifest.TypeGomod,
-		manifest.TypeHelm, manifest.TypeNpm, manifest.TypeCargo, manifest.TypeFreeBSD:
+		manifest.TypeHelm, manifest.TypeNpm, manifest.TypeCargo, manifest.TypeFreeBSD,
+		manifest.TypeDistfiles:
 		fmt.Fprintf(buf, "No separate build step for %s — fetch retrieves what ships.\n", entryType)
 	default:
 		return fmt.Errorf("build: no build stage for entry type %q", entryType)
@@ -195,6 +196,8 @@ func runPackageStage(buf *bytes.Buffer, bc *builder.Config, store *manifest.Stor
 		fmt.Fprintf(buf, "No separate package step for cargo — clients read the proxied sparse index.\n")
 	case manifest.TypeFreeBSD:
 		fmt.Fprintf(buf, "No separate package step for freebsd — the mirrored catalogue carries FreeBSD's own signature and must not be regenerated.\n")
+	case manifest.TypeDistfiles:
+		fmt.Fprintf(buf, "No separate package step for distfiles — the DISTDIR is the artifact and distinfo is its metadata.\n")
 	default:
 		return fmt.Errorf("package: no package stage for entry type %q", entryType)
 	}
@@ -340,6 +343,8 @@ func runFetch(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, audi
 			sum = builder.FetchCargo(bc, store, entryFilter)
 		case manifest.TypeFreeBSD:
 			sum = builder.FetchFreeBSD(bc, store, entryFilter)
+		case manifest.TypeDistfiles:
+			sum = builder.FetchDistfiles(bc, store, entryFilter)
 		default:
 			return fmt.Errorf("fetch: no fetcher for entry type %q", t)
 		}

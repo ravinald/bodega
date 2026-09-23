@@ -3,6 +3,7 @@ package manifest
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 )
@@ -60,6 +61,10 @@ const (
 	// repository serves it at, so the whole subtree diffs against the
 	// upstream URL with no decoding step in between.
 	FreeBSDPrefix = "freebsd/"
+
+	// DistfilesPrefix roots the ports distfiles tree. What follows it is a
+	// DISTDIR, byte for byte: see DistfilesKey.
+	DistfilesPrefix = "distfiles/"
 
 	gomodPrefix      = "gomod/"
 	helmPrefix       = "charts/"
@@ -232,6 +237,66 @@ func FreeBSDKey(abi, repo, repoPath string) string {
 	return FreeBSDRepoPrefix(abi, repo) + repoPath
 }
 
+// DistfilesKey returns the key one distfile is stored under. name is the
+// string inside a distinfo line's parentheses, which is
+// "${DIST_SUBDIR}/<file>" when the port sets DIST_SUBDIR and "<file>" when it
+// does not.
+//
+// The name goes in whole and literally, so the tree under DistfilesPrefix is
+// laid out the way ${DISTDIR} is, and the path a client composes from
+// MASTER_SITE_OVERRIDE=<base>/${DIST_SUBDIR}/ is the key with the prefix
+// taken off. Dropping the subdirectory would key the file under a name no
+// distinfo line carries, and the digest check that is the reason for this
+// type would find nothing to compare against and never fire.
+//
+// There is no version: a distfile's version is part of its filename, and two
+// ports that name the same file name the same bytes.
+func DistfilesKey(name string) string {
+	return DistfilesPrefix + name
+}
+
+// DistfilesURLPath escapes each segment of a distinfo name for a URL path,
+// keeping the separators, so it can be appended to an upstream base. A
+// distfile name may hold characters a URL path cannot carry literally, "#",
+// "?" and "%" among them.
+func DistfilesURLPath(name string) string {
+	segs := strings.Split(name, "/")
+	for i, seg := range segs {
+		segs[i] = url.PathEscape(seg)
+	}
+	return strings.Join(segs, "/")
+}
+
+// DistfilesValidName reports why name is not a distfile this mirror can key,
+// or nil when it is. The name is untrusted twice over: it arrives on a request
+// path, and it becomes both an object key and a path under a DISTDIR.
+func DistfilesValidName(name string) error {
+	switch {
+	case name == "":
+		return errors.New("the distfile name is empty")
+	case len(name) > 1024:
+		return fmt.Errorf("the distfile name is %d bytes, over the 1024 this mirror keys", len(name))
+	case strings.HasPrefix(name, "/"):
+		return fmt.Errorf("%q is absolute; a distfile name is relative to DISTDIR", name)
+	case strings.Contains(name, `\`):
+		return fmt.Errorf("%q holds a backslash, which no distinfo line carries", name)
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("%q holds a control character at U+%04X", name, r)
+		}
+	}
+	for i, seg := range strings.Split(name, "/") {
+		switch seg {
+		case "":
+			return fmt.Errorf("%q holds an empty segment at position %d", name, i)
+		case ".", "..":
+			return fmt.Errorf("%q holds a %q segment, which resolves outside DISTDIR", name, seg)
+		}
+	}
+	return nil
+}
+
 // BinaryKey returns the key for a binary artifact. A versioned entry gets its
 // own directory so multiple versions coexist; an entry with no version keeps
 // the two-segment layout it was uploaded under.
@@ -393,6 +458,16 @@ func ArtifactKeys(pm *PackageManifest, ve VersionEntry) ([]string, error) {
 			FreeBSDKey(ve.Version, pm.Name, FreeBSDMetaFile),
 		}, nil
 
+	case TypeDistfiles:
+		// The entry's name is the distinfo name, subdirectory included, and
+		// that is the whole key. ve.Filename and ve.URL do not enter it: a
+		// name that disagreed with the distinfo line would store bytes where
+		// no client looks.
+		if err := DistfilesValidName(pm.Name); err != nil {
+			return nil, fmt.Errorf("distfiles %s: %w", pm.Name, err)
+		}
+		return []string{DistfilesKey(pm.Name)}, nil
+
 	case TypePypi:
 		return nil, ErrPypiNoObjectKey
 	}
@@ -530,6 +605,18 @@ func ParseKey(key string) (typ, name, version string) {
 			return TypeFreeBSD, "", ""
 		}
 		return TypeFreeBSD, segs[1], segs[0]
+
+	case strings.HasPrefix(key, DistfilesPrefix):
+		// "<distinfo name>", which is "[<DIST_SUBDIR>/]<file>". The name
+		// keeps its slashes, as gomod's module path does, and there is no
+		// version to split off: splitTrailingVersion would read
+		// "zsh-5.9.2.tar.xz" as the package "zsh", which is not what any
+		// distinfo line or manifest entry is called.
+		name := strings.TrimPrefix(key, DistfilesPrefix)
+		if DistfilesValidName(name) != nil {
+			return TypeDistfiles, "", ""
+		}
+		return TypeDistfiles, name, ""
 
 	case strings.HasPrefix(key, npmPrefix):
 		dir, file, ok := strings.Cut(strings.TrimPrefix(key, npmPrefix), "/")

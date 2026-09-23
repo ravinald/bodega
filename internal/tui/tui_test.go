@@ -1393,6 +1393,9 @@ var clientURLSeeds = map[string]struct {
 		Version: "FreeBSD:14:amd64",
 		URL:     "https://pkg.freebsd.org/FreeBSD:14:amd64/latest",
 	}},
+	// The name carries DIST_SUBDIR, and no version: both are what the
+	// distinfo line spells.
+	manifest.TypeDistfiles: {"pcpustat/1.6.tar.bz2", manifest.VersionEntry{}},
 }
 
 // seedClientURLTypes stores one package per member of manifest.AllTypes and

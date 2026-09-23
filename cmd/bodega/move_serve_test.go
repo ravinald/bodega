@@ -44,6 +44,9 @@ func TestMovedPackagesStillServeOverHTTP(t *testing.T) {
 				StoragePath:     defaultRoot,
 				StorageBackends: map[string]config.StorageSpec{"bulk": {Driver: "local", Path: bulkRoot}},
 			}
+			if c.configure != nil {
+				c.configure(t, cfg)
+			}
 
 			store := manifest.NewLocalStore(t.TempDir())
 			if err := store.AddVersion(ctx, c.typ, c.pkg, c.ve); err != nil {

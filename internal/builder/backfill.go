@@ -96,6 +96,12 @@ func artifactPathForVersion(cfg *Config, typ, name string, ve manifest.VersionEn
 	case manifest.TypeCargo:
 		d := buildDirs(cfg.rootFor(typ))
 		return cargoCratePath(d, name, ve)
+	case manifest.TypeDistfiles:
+		d := buildDirs(cfg.rootFor(typ))
+		if manifest.DistfilesValidName(name) != nil {
+			return ""
+		}
+		return distfilesDestPath(d, name)
 	case manifest.TypeFreeBSD:
 		// The catalogue archive, which is the entry's own artifact. The
 		// mirrored packages under the same prefix are the catalogue's, not

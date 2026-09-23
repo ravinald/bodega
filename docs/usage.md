@@ -2301,6 +2301,9 @@ A default config is created on first run. All fields are optional.
   "pypi_upstream": "https://pypi.org",
   "cargo_upstream": "https://index.crates.io",
   "cargo_dl_upstream": "https://static.crates.io/crates",
+  "distfiles_upstream": "http://distcache.FreeBSD.org/ports-distfiles/",
+  "distfiles_ports_tree": "",
+  "distfiles_root": "",
   "spool_dir": "",
   "spool_max_artifact_bytes": 8589934592,
   "spool_max_total_bytes": 34359738368,
@@ -3684,7 +3687,130 @@ bodega refreshes its mirror from upstream at most once per `metadata_ttl` (defau
 
 #### Distfiles
 
-The tree is half of a build. `make fetch` reaches the sites each port's `Makefile` names, and a ports tree from bodega does nothing to stop that. bodega does not mirror distfiles: a host building ports with no route to the internet has the recipes and none of the sources.
+The tree is half of a build. `make fetch` reaches the sites each port's `Makefile` names, and a ports tree from bodega does nothing to stop that on its own. The other half, the sources, is the `distfiles` type: see [Mirroring ports distfiles](#mirroring-ports-distfiles).
+
+### Mirroring ports distfiles
+
+A distfile is the source archive a port's `fetch` target downloads into `DISTDIR`. Every one is pinned before bodega sees it: the port's `distinfo` records its SHA-256 and byte size, and the client's own `make checksum` compares against the same line.
+
+```text
+SHA256 (pcpustat/1.6.tar.bz2) = 3bc1906f8d4865bb02c59f2f752e79b08433bc1aa447d78ea3de1a0d02c45e64
+SIZE (pcpustat/1.6.tar.bz2) = 5135
+```
+
+bodega admits a distfile only when the bytes it fetched match that line, and refuses one no `distinfo` lists. That is the difference from a `binary` entry, which pins whatever its first fetch returned and serves a poisoned first fetch faithfully afterwards. Here the digest comes from a ports tree bodega did not write, so there is no first fetch to poison.
+
+It needs a ports tree on the server to read `distinfo` from. Keep it at the revision your clients build from: a name the client's tree pins to different bytes than the server's is refused on the server, or served and then failed by the client's `make checksum`.
+
+```json
+"distfiles_ports_tree": "/usr/ports",
+"distfiles_upstream": "http://distcache.FreeBSD.org/ports-distfiles/",
+"distfiles_root": ""
+```
+
+| Key                    | Default                                         | What it does                                                                                                                                                                             |
+| ---------------------- | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `distfiles_ports_tree` | unset                                           | Root of the ports tree whose `distinfo` files decide what is admitted. Unset, `/distfiles/` answers every request 404 and `build fetch distfiles` refuses every entry. Must be absolute. |
+| `distfiles_upstream`   | `http://distcache.FreeBSD.org/ports-distfiles/` | Where a miss is fetched from. The distinfo name is appended to it. `http` or `https`, ending in `/`.                                                                                     |
+| `distfiles_root`       | `build_root`                                    | Root of the DISTDIR `build fetch distfiles` writes, at `<distfiles_root>/distfiles/`.                                                                                                    |
+
+The default upstream is plain `http`, as `bsd.port.mk`'s own `MASTER_SITE_BACKUP` is. `distcache.FreeBSD.org` answers `https` with a certificate naming only `pkg.freebsd.org` and `pkgmir.geo.freebsd.org`, so an `https` URL for it fails verification. The transport carries no trust for this type: an attacker on the path can make a fetch fail the digest check and cannot make one pass it. `distfiles_upstream` is the only upstream bodega fetches over plain `http`, and the address check still applies to it: loopback, private and link-local hosts are refused over either scheme.
+
+The server reads the tree in the background at startup, because a cold walk of a full tree takes the better part of a minute (0.8s warm, 43s cold, on the 15.1 test guest). A request arriving before the first read finishes waits up to 5 seconds, then answers `503` with `Retry-After: 30`. The tree is re-read in the background every 10 minutes after that, so a `git pull` under a running server is picked up without a restart.
+
+#### Two deployments, and only one of them is a wall
+
+| Deployment | Client setting                                                                    | bodega side                                                       | What it guarantees                                                                              |
+| ---------- | --------------------------------------------------------------------------------- | ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| HTTP       | `MASTER_SITE_OVERRIDE` and `MASTER_SITE_BACKUP` in `/etc/make.conf`               | `GET /distfiles/<name>`, pull-through                             | bodega is tried first. Preempted, not enforced: any miss falls through to the port's own sites. |
+| `DISTDIR`  | `DISTDIR` (or poudriere's `DISTFILES_CACHE`) pointing at a directory bodega wrote | `bodega build fetch distfiles` into `<distfiles_root>/distfiles/` | No site is contacted at all. The one deployment that stops a build reaching the internet.       |
+
+**HTTP preempts; it does not enforce.** `Mk/Scripts/do-fetch.sh` tries `MASTER_SITE_OVERRIDE`, then the port's own `MASTER_SITES`, then `MASTER_SITE_BACKUP`. Any answer from bodega other than the bytes (a 404 for a name it cannot pin, a 451 for a restricted file, a 502 for a failed or refused fetch, an unreachable server) sends the client on to the port's own sites. No `bsd.port.mk` knob empties `MASTER_SITES`. Use this deployment to take load off the internet and to serve checked bytes first; do not use it to isolate a build.
+
+**`DISTDIR` isolates.** `do-fetch.sh` tests whether each distfile is already present in `DISTDIR` before it builds any site list, and skips it if so. A distfile bodega wrote there is never fetched, from anywhere. How the directory reaches the client is yours: an NFS export, a copy, or a poudriere builder on the bodega host with `DISTFILES_CACHE` set to it.
+
+#### Client side, HTTP
+
+```make
+# /etc/make.conf
+MASTER_SITE_OVERRIDE?=	https://bodega-host:8080/distfiles/${DIST_SUBDIR}/
+MASTER_SITE_BACKUP?=	https://bodega-host:8080/distfiles/${DIST_SUBDIR}/
+```
+
+Set both. `MASTER_SITE_OVERRIDE` puts bodega ahead of every port's own sites. `MASTER_SITE_BACKUP` is the last site tried, and its default is `distcache.FreeBSD.org`; `bsd.port.mk` says it "should _not_ be changed". Changing it here is deliberate: left alone, the last site a client falls back to is the internet's distfile cache rather than bodega.
+
+`${DIST_SUBDIR}` is expanded per port. `do-fetch.sh` appends the bare filename to each site, so the override has to carry the subdirectory itself, and the path it composes is then the distinfo name. A port with no `DIST_SUBDIR` composes `/distfiles//<file>`; the server answers the doubled slash with a redirect to the single-slash path, which `fetch(1)` follows.
+
+`make fetch-url-list` in a port directory prints the URLs in the order they will be tried:
+
+```text
+http://bodega-host:8080/distfiles/pcpustat/1.6.tar.bz2
+https://bitbucket.org/sterlingcamden/pcpustat/get/1.6.tar.bz2
+http://bodega-host:8080/distfiles/pcpustat/1.6.tar.bz2
+```
+
+#### Client side, `DISTDIR`
+
+On the bodega host, name each distfile to mirror by its distinfo name and fetch them:
+
+```bash
+bodega pkg create distfiles pcpustat/1.6.tar.bz2
+bodega build fetch distfiles
+```
+
+Each lands at `<distfiles_root>/distfiles/pcpustat/1.6.tar.bz2` after its size and SHA-256 match `distinfo`, written under a temporary name and renamed into place, so a partial or wrong file never sits under a name `do-fetch.sh` would skip. A file already present is re-hashed and replaced if it no longer matches. Point the client at that directory:
+
+```make
+# /etc/make.conf, or poudriere.conf's DISTFILES_CACHE
+DISTDIR=	/net/bodega-host/distfiles
+```
+
+`bodega build upload distfiles` copies the same files into storage, so the HTTP route serves them without a pull-through.
+
+#### Key and layout
+
+| Where          | Form                                                        | Example                                                |
+| -------------- | ----------------------------------------------------------- | ------------------------------------------------------ |
+| distinfo name  | `[<DIST_SUBDIR>/]<file>`, the string inside the parentheses | `pcpustat/1.6.tar.bz2`, `zsh-5.9.tar.xz`               |
+| manifest entry | name is the distinfo name; no version                       | `distfiles/pcpustat/1.6.tar.bz2`                       |
+| object key     | `distfiles/<distinfo name>`                                 | `distfiles/pcpustat/1.6.tar.bz2`                       |
+| storage path   | `{storage_path}/distfiles/<distinfo name>`, a DISTDIR       | `/var/lib/bodega/distfiles/pcpustat/1.6.tar.bz2`       |
+| local DISTDIR  | `<distfiles_root>/distfiles/<distinfo name>`                | `/var/lib/bodega/build/distfiles/pcpustat/1.6.tar.bz2` |
+| route          | `GET /distfiles/<distinfo name>`                            | `/distfiles/pcpustat/1.6.tar.bz2`                      |
+| `ParseKey`     | type `distfiles`, name the distinfo name, version empty     | `(distfiles, pcpustat/1.6.tar.bz2, "")`                |
+
+The subdirectory is part of the name everywhere, and nothing is encoded: slashes stay slashes, as they do for `gomod`. A distfile has no version apart from its filename, so the key has no version segment and `ParseKey` does not split one out; reading `zsh-5.9.tar.xz` as the package `zsh` at `5.9` names nothing any distinfo line or manifest entry is called. The object tree under `distfiles/` and the local one under `<distfiles_root>/distfiles/` are both laid out as a `DISTDIR`, which is what lets either be handed to a client as one.
+
+#### Pull-through, not a full copy
+
+The route fetches a distfile the first time a client asks for it, rather than bodega copying the set up front. The complete set runs to roughly two terabytes, `distcache.FreeBSD.org` answers `403` to a directory listing, and there is no manifest of it short of walking every `*/*/distinfo` in a ports tree. A pull-through is also open by nature, and is safe here only because of the digest: a client can make bodega fetch a file some `distinfo` in its tree pins, and nothing else, and the bytes have to match.
+
+#### Restricted distfiles
+
+A port forbids redistribution in three spellings, and bodega reads all three:
+
+- `RESTRICTED` or `NO_CDROM`, set directly.
+- `LICENSE_PERMS` (or `LICENSE_PERMS_<license>`) lacking `dist-mirror` or `dist-sell`. `Mk/bsd.licenses.mk` is default-deny, and says a port with `dist-mirror` "is not RESTRICTED" and one with `dist-sell` "does not need to set NO_CDROM".
+- `LICENSE` naming a license whose default permissions in `Mk/bsd.licenses.db.mk` lack either, such as the `CC-BY-NC` family.
+
+The second is the common one: on the 15.1 test tree, 2 ports set `RESTRICTED` or `NO_CDROM` literally, and 3,535 of 75,349 distfiles are refused across all three. A restricted distfile is answered `451` before any upstream is contacted, is never cached, and is recorded in the audit trail as a `denied` row with status `distfile_license`, naming the port and the variable. `build fetch distfiles` refuses the entry with the same reason. The client's HTTP fetch moves on to the port's own sites, which is where a restricted file has to come from; a `DISTDIR` deployment has to be given the file by hand.
+
+The scan is lexical, because evaluating a port needs `make` and the whole of `Mk/`. It over-refuses rather than under-refuses: an assignment inside an `.if` counts whether or not the condition holds, a value holding a make variable is treated as withholding, and a slave port that is restricted restricts the names in its master's `distinfo`. `multimedia/ffmpeg4`, which sets `LICENSE_PERMS_NONFREE` for an optional component, loses every distfile to it. A restriction set in a file outside the port's own directory, other than through `MASTERDIR`, is not seen.
+
+#### What the route answers
+
+| Status | When                                                                                                                                                                             |
+| ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `200`  | The bytes match `distinfo`, from the cache or from a pull-through                                                                                                                |
+| `400`  | The path is not a legal distinfo name                                                                                                                                            |
+| `404`  | No `distfiles_ports_tree` is configured, no `distinfo` lists the name, the tree pins it ambiguously, or the upstream does not carry it                                           |
+| `451`  | The port forbids redistributing it                                                                                                                                               |
+| `502`  | The upstream's bytes disagree with `distinfo`, or the upstream failed. A disagreement is recorded as a `cache` row with status `checksum_mismatch` naming both digests and sizes |
+| `503`  | The ports tree is still being read, or the spool is at its bound                                                                                                                 |
+
+"Ambiguously" means two `distinfo` files pinning one name to different bytes, which happens when a tree is read partway through an update, or a `distinfo` line that does not parse. `graphics/epsonscan2-non-free-plugin` on the 15.1 tree ships a `SIZE` line with no `=`; that one file is refused and the rest of the tree is not.
+
+A cached distfile is served without re-hashing it, as long as its size still matches `distinfo`. A tree update that repins a name to a file of a different size makes the next request a miss; one that repins it to a file of the same size is served the old bytes, and the client's `make checksum` refuses them.
 
 ### APT index generation
 
@@ -4161,15 +4287,16 @@ Which upstreams may be reached at all is the allow-list's decision, not this swi
 
 ### Upstream hosts
 
-Five flat keys name the registries a proxying instance fetches from. They are not interchangeable, and two ecosystems need two keys each because the registry that answers "which versions exist" is not the one that serves the bytes.
+Six flat keys name the registries a proxying instance fetches from. They are not interchangeable, and two ecosystems need two keys each because the registry that answers "which versions exist" is not the one that serves the bytes.
 
-| Key                 | Default                           | What that host serves                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| ------------------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `gomod_upstream`    | `https://proxy.golang.org`        | The whole module proxy protocol: `@v/list`, `@v/{version}.info`, `.mod` and `.zip`, all on one host                                                                                                                                                                                                                                                                                                                                                                                      |
-| `npm_upstream`      | `https://registry.npmjs.org`      | Packuments and tarballs, both on one host                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `pypi_upstream`     | `https://pypi.org`                | The PEP 503 index root. bodega reads `/simple/{dist}/` under it and fetches the artifact URL that page lists, which is on `files.pythonhosted.org` under a content-hash path. A wheel URL cannot be composed from a filename, so a request for a file the index does not list is a 404, and the log line beside it names the index that was read. The body does not, because the route takes no token and the URL may carry credentials. What bodega serves at its own `/pypi/simple/{dist}/` is that document republished, not relayed: see [Republishing a proxied index](#republishing-a-proxied-index) |
-| `cargo_upstream`    | `https://index.crates.io`         | The sparse index, and nothing else. A crate tarball request to this host is a 404                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `cargo_dl_upstream` | `https://static.crates.io/crates` | Crate tarballs. bodega appends `/{crate}/{version}/download`                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Key                  | Default                                         | What that host serves                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| -------------------- | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gomod_upstream`     | `https://proxy.golang.org`                      | The whole module proxy protocol: `@v/list`, `@v/{version}.info`, `.mod` and `.zip`, all on one host                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `npm_upstream`       | `https://registry.npmjs.org`                    | Packuments and tarballs, both on one host                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `pypi_upstream`      | `https://pypi.org`                              | The PEP 503 index root. bodega reads `/simple/{dist}/` under it and fetches the artifact URL that page lists, which is on `files.pythonhosted.org` under a content-hash path. A wheel URL cannot be composed from a filename, so a request for a file the index does not list is a 404, and the log line beside it names the index that was read. The body does not, because the route takes no token and the URL may carry credentials. What bodega serves at its own `/pypi/simple/{dist}/` is that document republished, not relayed: see [Republishing a proxied index](#republishing-a-proxied-index) |
+| `cargo_upstream`     | `https://index.crates.io`                       | The sparse index, and nothing else. A crate tarball request to this host is a 404                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `cargo_dl_upstream`  | `https://static.crates.io/crates`               | Crate tarballs. bodega appends `/{crate}/{version}/download`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `distfiles_upstream` | `http://distcache.FreeBSD.org/ports-distfiles/` | Ports distfiles, by distinfo name. Plain `http` on purpose; see [Mirroring ports distfiles](#mirroring-ports-distfiles)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
 crates.io names its own download root in `https://index.crates.io/config.json`, and bodega does not read it. Fetching that document at startup would make `bodega serve` fail to bind because a registry was unreachable, and an operator mirroring the index is not thereby mirroring the tarballs: point the two keys wherever each actually lives.
 

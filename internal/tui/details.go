@@ -637,6 +637,11 @@ func clientURL(cfg *config.Config, store *manifest.Store, entryType, name, pkgFi
 			return ""
 		}
 		return freeBSDRepoConf(cfg, pm, pkgFingerprint)
+	case manifest.TypeDistfiles:
+		// The name is the distinfo name, DIST_SUBDIR included, so it is the
+		// path under /distfiles/ as it stands; MASTER_SITE_OVERRIDE composes
+		// this same URL per port.
+		return fmt.Sprintf("%s/distfiles/%s", base, name)
 	case manifest.TypeCargo:
 		// Cargo hands back no URL. A client reaches the sparse index only once
 		// .cargo/config.toml names it as a registry, so the stanza and the
@@ -988,6 +993,17 @@ func (m detailsModel) renderEntryDetails() string {
 			sb.WriteString(field("Source URL", ve.URL))
 			sb.WriteByte('\n')
 		}
+		sb.WriteString(boolField("Frozen", ve.Frozen))
+		sb.WriteByte('\n')
+		sb.WriteString(boolField("Hidden", ve.Hidden))
+		sb.WriteByte('\n')
+		sb.WriteString(m.storedAndClientFields(n))
+
+	case manifest.TypeDistfiles:
+		sb.WriteString(field("Distfile", pm.Name))
+		sb.WriteByte('\n')
+		sb.WriteString(field("Digest", "the ports tree's distinfo, read when fetched"))
+		sb.WriteByte('\n')
 		sb.WriteString(boolField("Frozen", ve.Frozen))
 		sb.WriteByte('\n')
 		sb.WriteString(boolField("Hidden", ve.Hidden))

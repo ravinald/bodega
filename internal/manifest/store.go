@@ -355,7 +355,7 @@ func (s *Store) MisnamedPackages(ctx context.Context) ([]MisnamedPackage, error)
 // canonical, and a manifest no route can reach is reported as correctly named.
 func nameCarriesSlash(typ string) bool {
 	switch typ {
-	case TypeNpm, TypeGit, TypeBinary, TypeGomod:
+	case TypeNpm, TypeGit, TypeBinary, TypeGomod, TypeDistfiles:
 		return true
 	}
 	return false

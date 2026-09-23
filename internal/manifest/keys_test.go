@@ -118,6 +118,20 @@ var keyRoundTrips = map[string][]roundTrip{
 			version: "FreeBSD:14:amd64",
 		},
 	},
+	TypeDistfiles: {
+		// A port with no DIST_SUBDIR: the name is the bare file, and the
+		// version inside it stays in the name.
+		{
+			key:  DistfilesKey("zsh-5.9.2.tar.xz"),
+			name: "zsh-5.9.2.tar.xz",
+		},
+		// A port that sets DIST_SUBDIR: the subdirectory survives the round
+		// trip, because it is part of the name distinfo records.
+		{
+			key:  DistfilesKey("pcpustat/1.6.tar.bz2"),
+			name: "pcpustat/1.6.tar.bz2",
+		},
+	},
 }
 
 // TestParseKeyRoundTripsEveryType is the guard on the pair. A ninth type added

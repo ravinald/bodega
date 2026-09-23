@@ -123,6 +123,20 @@ Examples:
 					return err
 				}
 
+			case manifest.TypeDistfiles:
+				// The name is the distinfo name, DIST_SUBDIR included, and it
+				// is the whole identity: the version lives in the filename and
+				// the digest lives in the ports tree, not here.
+				if name == "" {
+					if name, err = prompt(r, "Distfile, as distinfo names it ([DIST_SUBDIR/]file)", ""); err != nil {
+						return err
+					}
+				}
+				if err := manifest.DistfilesValidName(name); err != nil {
+					return err
+				}
+				ve = manifest.VersionEntry{}
+
 			case manifest.TypePypi:
 				if name == "" {
 					if name, err = prompt(r, "Package name", ""); err != nil {

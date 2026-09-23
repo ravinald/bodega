@@ -3,7 +3,9 @@ package main
 import (
 	"archive/tar"
 	"bytes"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -51,6 +53,10 @@ type keyCase struct {
 
 	// url is the path a client of this ecosystem requests.
 	url string
+
+	// configure adjusts the server's config for a type that needs more than
+	// the shared one, given the temporary directory the case may write into.
+	configure func(t *testing.T, cfg *config.Config)
 
 	// noVersionKey marks a type whose artifacts are not addressable one
 	// version at a time. pypi is the only one, and the agreement to assert is
@@ -268,6 +274,30 @@ func objectKeyCases(t *testing.T) []keyCase {
 			},
 			url: "/freebsd/FreeBSD:14:amd64/latest/packagesite.pkg",
 		},
+		{
+			// DIST_SUBDIR in the name is the hazard: the key, the DISTDIR
+			// path and the route all have to keep it, or the server's
+			// distinfo lookup finds no digest for the file it was handed.
+			typ:  manifest.TypeDistfiles,
+			pkg:  "pcpustat/1.6.tar.bz2",
+			body: "distfile-bytes",
+			local: map[string]string{
+				"distfiles/pcpustat/1.6.tar.bz2": "distfile-bytes",
+			},
+			upload: func(t *testing.T, bcfg *builder.Config, store *manifest.Store, dst storage.ObjectStore) []string {
+				return artifactPathUpload(builder.DistfilesArtifactPaths(bcfg, store, ""), dst, t)
+			},
+			configure: func(t *testing.T, cfg *config.Config) {
+				tree := t.TempDir()
+				sum := sha256.Sum256([]byte("distfile-bytes"))
+				writeFile(t, tree, "Mk/bsd.licenses.db.mk", "")
+				writeFile(t, tree, "sysutils/pcpustat/Makefile", "PORTNAME=\tpcpustat\nDIST_SUBDIR=\tpcpustat\n")
+				writeFile(t, tree, "sysutils/pcpustat/distinfo", fmt.Sprintf(
+					"SHA256 (pcpustat/1.6.tar.bz2) = %x\nSIZE (pcpustat/1.6.tar.bz2) = %d\n", sum, len("distfile-bytes")))
+				cfg.DistfilesPortsTree = tree
+			},
+			url: "/distfiles/pcpustat/1.6.tar.bz2",
+		},
 	}
 }
 
@@ -296,6 +326,9 @@ func TestObjectKeysAgreeAcrossUploaderServerInventoryAndDelete(t *testing.T) {
 			// 2. The server handler, reached over the wire the way a client of
 			// this ecosystem reaches it.
 			cfg := &config.Config{StorageBackend: "local", ManifestDir: "manifests", AptCodename: "noble"}
+			if c.configure != nil {
+				c.configure(t, cfg)
+			}
 			stores := storage.NewSingle(mem)
 			ts := httptest.NewServer(server.New(cfg, store, stores, ":0", nil).Handler())
 			t.Cleanup(ts.Close)

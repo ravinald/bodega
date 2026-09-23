@@ -334,6 +334,26 @@ func ensurePackagedPypi(bcfg *builder.Config, store *manifest.Store) *builder.Su
 // ensureMirroredFreeBSD mirrors any repository whose catalogue is not on disk
 // yet. There is no build or package step: the whole point of the type is that
 // bodega produces none of these bytes, so fetch is the entire cascade.
+// ensureFetchedDistfiles fetches every distfiles entry missing from the
+// DISTDIR. FetchDistfiles reads the whole ports tree's distinfo once per call,
+// so it runs once for all of them rather than once per entry.
+func ensureFetchedDistfiles(bcfg *builder.Config, store *manifest.Store, entryFilter string) *builder.Summary {
+	ctx := context.Background()
+	for _, safeName := range store.ListPackages(manifest.TypeDistfiles) {
+		pm, err := store.GetPackage(ctx, manifest.TypeDistfiles, safeName)
+		if err != nil || pm == nil {
+			continue
+		}
+		if entryFilter != "" && pm.Name != entryFilter {
+			continue
+		}
+		if !builder.CheckDistfilesStage(bcfg, pm.Name).Fetched {
+			return builder.FetchDistfiles(bcfg, store, entryFilter)
+		}
+	}
+	return &builder.Summary{}
+}
+
 func ensureMirroredFreeBSD(bcfg *builder.Config, store *manifest.Store, entryFilter string) *builder.Summary {
 	if len(store.ListPackages(manifest.TypeFreeBSD)) == 0 {
 		fmt.Println("    No freebsd entries in manifest — skipping")
@@ -386,6 +406,8 @@ func ensureUploadable(t string, bcfg *builder.Config, store *manifest.Store) err
 		s = ensureFetchedCargo(bcfg, store, "")
 	case manifest.TypeFreeBSD:
 		s = ensureMirroredFreeBSD(bcfg, store, "")
+	case manifest.TypeDistfiles:
+		s = ensureFetchedDistfiles(bcfg, store, "")
 	default:
 		// s stays nil and HasFailures has no nil guard, so a tenth type added
 		// to manifest.AllTypes without an arm here panics the upload rather

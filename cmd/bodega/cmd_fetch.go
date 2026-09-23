@@ -113,6 +113,10 @@ When a name is given after the type, only that entry is fetched.`,
 					allSummaries = append(allSummaries,
 						builder.FetchFreeBSD(bcfg, store, entryFilter),
 					)
+				case manifest.TypeDistfiles:
+					allSummaries = append(allSummaries,
+						builder.FetchDistfiles(bcfg, store, entryFilter),
+					)
 				}
 			}
 

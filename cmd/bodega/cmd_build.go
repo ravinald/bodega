@@ -145,6 +145,14 @@ When a name is given after the type, only that entry is built.`,
 					allSummaries = append(allSummaries,
 						builder.FetchFreeBSD(bcfg, store, entryFilter),
 					)
+
+				case manifest.TypeDistfiles:
+					// distfiles has no build step: the port builds from the
+					// distfile on the client, which is the point of mirroring
+					// the source rather than a package.
+					allSummaries = append(allSummaries,
+						ensureFetchedDistfiles(bcfg, store, entryFilter),
+					)
 				}
 			}
 

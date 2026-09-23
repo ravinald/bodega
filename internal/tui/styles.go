@@ -97,6 +97,8 @@ func typeIcon(t string) string {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("130")).Render("C")
 	case "freebsd":
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("124")).Render("F")
+	case "distfiles":
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("172")).Render("D")
 	default:
 		return " "
 	}

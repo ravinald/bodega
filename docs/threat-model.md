@@ -100,6 +100,15 @@ risk:
   matches the first one, so a compromised _first_ fetch is served faithfully
   and forever with `checksum_verified` beside it. The cooldown is what makes
   the first fetch late enough to be safe.
+- **A poisoned first fetch of a ports distfile.** The `distfiles` type does
+  not pin what it first fetched. Every distfile's SHA-256 and size are already
+  in the ports tree's `distinfo`, which bodega did not write, and a fetch is
+  admitted only when both match; a name no `distinfo` lists is refused rather
+  than pinned. That is why its default upstream can be plain `http`: an
+  attacker on the path can make a fetch fail the check and cannot make one
+  pass it. The trust anchor moves to the ports tree the server reads, so a
+  tampered tree on the server is served faithfully. Keep it at the revision
+  the clients build from, from the same source they take it from.
 - **Compromised upstream releases.** When an upstream package is replaced with
   a malicious version (the canonical example being the npm or PyPI account
   takeovers of recent years), bodega's `pkg hide` and `pkg freeze` operations
@@ -171,6 +180,13 @@ defence against:
   candidate, and the OSV gate has no rows until an operator adds one. An
   install created before the seed shipped gains nothing on upgrade, by
   design: a new default must not change what a running fleet enforces.
+- **A ports build reaching the internet through `MASTER_SITE_OVERRIDE`.**
+  Serving distfiles over HTTP preempts a port's own sites; it does not replace
+  them. `do-fetch.sh` falls through to the port's `MASTER_SITES` on any answer
+  other than the bytes, including bodega's refusals, and no `bsd.port.mk`
+  setting stops it. Only a `DISTDIR` bodega wrote isolates a build, because
+  `do-fetch.sh` skips a file already present before it consults any site. See
+  [Mirroring ports distfiles](usage.md#mirroring-ports-distfiles).
 - **Build-time code execution by trusted packages.** A `setup.py` that
   `os.system`s out, an `npm install` lifecycle script, a `cargo build` script
   — all of these run with the build user's privileges and can do anything

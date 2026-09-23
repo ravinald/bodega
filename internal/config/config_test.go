@@ -147,6 +147,10 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 	// and the driver has to be non-empty.
 	overrides := map[string]any{
 		"discover_mode": "observe",
+		// Both validated by Load: the tree must be absolute and the upstream
+		// an https base ending in "/".
+		"distfiles_ports_tree": "/usr/ports",
+		"distfiles_upstream":   "https://distfiles.example/",
 		// Load validates this one, so the reflective "value-<tag>" filler
 		// cannot reach it. 1.2 rather than the 1.3 default, so the round trip
 		// would still catch a Save that dropped the key and let the default

@@ -1318,6 +1318,7 @@ var createTypeOptions = []string{
 	manifest.TypeApt,
 	manifest.TypeBinary,
 	manifest.TypeCargo,
+	manifest.TypeDistfiles,
 	manifest.TypeFreeBSD,
 	manifest.TypeGit,
 	manifest.TypeGomod,
@@ -1777,6 +1778,18 @@ func rebuildCreateFields(entryType string, prev []formField) []formField {
 				Hint: "skip URL reachability check"},
 		})
 
+	case manifest.TypeDistfiles:
+		// A distfile is named, not versioned: the name is the distinfo name
+		// with DIST_SUBDIR in it, and the digest comes from the ports tree
+		// when it is fetched, so there is no version, URL or checksum to ask
+		// for. Asking for a checksum here would invite the operator to type
+		// the value this type exists to read from distinfo instead.
+		return restoreCursors([]formField{
+			typeField,
+			{Label: "Name", Value: restore("Name", ""),
+				Hint: "the name inside a distinfo line's parentheses, e.g. pcpustat/1.6.tar.bz2"},
+		})
+
 	default: // manifest.TypeApt
 		aptMode := restore("Apt Mode", "Package Name")
 		buildFrom := restore("Build From", "Git repo")
@@ -2009,6 +2022,10 @@ func validateCreateFields(fields []formField) string {
 		}
 		if fieldValueFromSlice(fields, "Source URL") == "" {
 			return "Source URL is required for freebsd entries: the repository root with ${ABI} substituted"
+		}
+	case manifest.TypeDistfiles:
+		if err := manifest.DistfilesValidName(name); err != nil {
+			return "Name must be a distinfo name, [DIST_SUBDIR/]file: " + err.Error()
 		}
 	}
 	// Block save if checksum is present but invalid.
@@ -2275,6 +2292,12 @@ func saveCreateEntry(store *manifest.Store, fields []formField) error {
 		// and an entry with no version is a repository the route can never
 		// resolve a mode, a URL or a backend for.
 		ve.Version = fieldValueFromSlice(fields, "ABI")
+		ve.VersionConstraint = ""
+
+	case manifest.TypeDistfiles:
+		// No version: it is part of the filename, and the digest the entry
+		// is fetched against lives in the ports tree.
+		ve.Version = ""
 		ve.VersionConstraint = ""
 
 	default:

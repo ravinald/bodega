@@ -136,6 +136,7 @@ const (
 	DenialFrozenEntry       = "entry_frozen"       // DELETE on a package whose every version is frozen
 	DenialVersionConstraint = "version_constraint" // requested version outside the entry's version_constraint
 	DenialPushRefused       = "push_refused"       // git smart-HTTP push against a read-only mirror
+	DenialDistfileLicense   = "distfile_license"   // a port forbids redistributing the distfile
 
 	// Refusals by the host profile bound to the requesting identity. Two
 	// values rather than one, because the operator's repair is opposite in

@@ -519,6 +519,8 @@ func ArtifactPaths(cfg *builder.Config, store *manifest.Store, typ, entryFilter 
 		return builder.CargoArtifactPaths(cfg, store, entryFilter), noRelease, nil
 	case manifest.TypeFreeBSD:
 		return builder.FreeBSDArtifactPaths(cfg, store, entryFilter)
+	case manifest.TypeDistfiles:
+		return builder.DistfilesArtifactPaths(cfg, store, entryFilter), noRelease, nil
 	}
 	return nil, noRelease, nil
 }
