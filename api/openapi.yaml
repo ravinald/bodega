@@ -1311,10 +1311,15 @@ components:
           allOf:
             - $ref: "#/components/schemas/AptSources"
           description: >-
-            The one stanza the requesting host should install. Absent when the
-            answer is the operator's, meaning no profile scopes apt and this
-            instance serves more than one codename: a guess there points a host
-            at the wrong suite with nothing reporting it.
+            The one stanza the requesting host should install. Absent in two
+            states. When a profile scopes apt for the host but no codename has
+            been generated for it, because the rebuild refused the base or has
+            not run since the profile was written, `profile` is present and
+            `host` is not: naming the base instead would serve the unfiltered
+            index the profile exists to narrow. When no profile scopes apt and
+            this instance serves more than one codename, the answer is the
+            operator's and both are absent: a guess there points a host at the
+            wrong suite with nothing reporting it.
 
     AptUnservedEntry:
       type: object
