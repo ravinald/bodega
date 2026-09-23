@@ -71,7 +71,14 @@ var ErrNotReady = errors.New("the distinfo index is not loaded yet")
 type Index struct {
 	entries map[string]*Entry
 	refused map[string]string // name -> why ErrUnusable
+	unowned []string
 }
+
+// Unowned lists the restricted ports whose distinfo the reader could not
+// place, each with its restriction and why. Their own directory's distfiles
+// are refused; any they read from another port's distinfo are not, because
+// no reading of the tree short of make says which those are.
+func (ix *Index) Unowned() []string { return ix.unowned }
 
 // Lookup returns the entry for name, or an error wrapping ErrNotListed,
 // ErrUnusable or ErrRestricted. A restricted entry is returned alongside its
@@ -214,11 +221,6 @@ var (
 	licenseDBList   = regexp.MustCompile(`(?m)^_LICENSE_LIST[ \t]*\+?=[ \t]*(.*)$`)
 	varReference    = regexp.MustCompile(`\$\{([A-Za-z_.][A-Za-z0-9_.]*)((?::H)*)\}`)
 )
-
-// masterDirVar matches a slave port naming its master relative to itself,
-// which is how nearly every slave in the tree spells it. A slave reads the
-// master's distinfo, so a slave that is restricted restricts those names.
-var masterDirVar = regexp.MustCompile(`(?m)^[ \t]*MASTERDIR[ \t]*[?:]?=[ \t]*\$\{\.CURDIR\}/(\S+)`)
 
 // withholdsDistfiles reports whether a permission list, as bsd.licenses.mk
 // reads one, fails to grant both dist-mirror and dist-sell.
@@ -374,7 +376,18 @@ func stripComments(b []byte) []byte {
 // reaches that line only when its guard, usually exists(), holds.
 // Angle-bracket includes and anything under Mk/ are the framework, whose
 // license handling the database read models.
-func portText(tree, dir string, own []string) (text []byte, unresolved string) {
+//
+// A port's restriction covers every distinfo its fetch may read, which is
+// ${DISTINFO_FILE}, by default ${MASTERDIR}/distinfo. A slave's names sit in
+// its master's distinfo, and a port may point DISTINFO_FILE at any other
+// port's. Both are resolved from the variables the walk holds, at every
+// framework include and at the end, because a port may reassign either after
+// including bsd.port.mk and make reads them lazily. Only the directory has to
+// resolve: Load restricts every distinfo* in it, so a file named
+// distinfo.${ARCH} is covered by its directory. owners lists those directories;
+// ownerUnknown is non-empty when one of them cannot be resolved, or when the
+// read stopped before the end, and says which.
+func portText(tree, dir string, own []string) (p portRead) {
 	if realTree, err := filepath.EvalSymlinks(tree); err == nil {
 		tree = realTree
 	}
@@ -387,7 +400,7 @@ func portText(tree, dir string, own []string) (text []byte, unresolved string) {
 			".CURDIR":  {dir},
 			"PORTSDIR": {tree},
 		},
-		definite: map[string]bool{".CURDIR": true, "PORTSDIR": true},
+		distinfo: map[string]bool{},
 	}
 	for _, f := range own {
 		real := f
@@ -401,10 +414,30 @@ func portText(tree, dir string, own []string) (text []byte, unresolved string) {
 			continue
 		}
 		if why := r.read(real, 0, false, false); why != "" {
-			return r.buf, why
+			p.unresolved = why
+			r.ownerUnknown = "its Makefiles were not read to the end, so where its distinfo is set cannot be established"
+			break
 		}
 	}
-	return r.buf, r.taintedRestriction()
+	if p.unresolved == "" {
+		p.unresolved = r.taintedRestriction()
+	}
+	r.framework(false)
+	p.text = r.buf
+	p.ownerUnknown = r.ownerUnknown
+	for d := range r.distinfo {
+		p.owners = append(p.owners, d)
+	}
+	sort.Strings(p.owners)
+	return p
+}
+
+// portRead is what portText learns about one port.
+type portRead struct {
+	text         []byte
+	unresolved   string
+	owners       []string
+	ownerUnknown string
 }
 
 // maxIncludeReads bounds how many files one port's includes may read, counting
@@ -416,6 +449,15 @@ const maxIncludeReads = 256
 // unreadable is the value of a variable the reader cannot follow. It holds a
 // "$" no reference matches, so expandMakePath refuses any path that reads it.
 const unreadable = "$(unreadable)"
+
+// undefined stands among a variable's values for the paths on which make holds
+// it undefined: before an assignment make may skip, or after an .undef make may
+// run. It is kept apart from "" because ?= assigns on those paths and not on
+// one where the variable is set to nothing, and apart from unreadable because
+// ?= resolves it. A path reading it refuses, as one reading a variable the
+// port never set does: make would expand it to nothing unless make.conf or the
+// environment set it, and the reader sees neither.
+const undefined = "$(undefined)"
 
 var (
 	undefDirective     = regexp.MustCompile(`^[ \t]*\.[ \t]*undef[ \t]+(.*?)[ \t]*$`)
@@ -436,13 +478,15 @@ type makeReader struct {
 	reads     int
 	loops     int // .for directives read, which keeps each one's bound names distinct
 
+	// vars holds every value each variable may have at the line being read.
+	// A variable absent here is undefined on every path.
 	vars map[string][]string
-	// definite records variables some unconditional assignment has set, which
-	// is what makes a later ?= a no-op.
-	definite map[string]bool
 	// tainted matches names some assignment may have written without the
 	// reader knowing which: a computed name, or a ::= modifier.
 	tainted []taintedName
+
+	distinfo     map[string]bool // every directory DISTINFO_FILE may name a file in
+	ownerUnknown string
 }
 
 type taintedName struct {
@@ -452,44 +496,63 @@ type taintedName struct {
 
 func (r *makeReader) set(name string, vals []string, conditional bool) {
 	if conditional {
-		r.vars[name] = capValues(dedupe(append(r.vars[name], vals...)))
-		return
+		vals = append(r.prior(name), vals...)
 	}
 	r.vars[name] = capValues(dedupe(vals))
-	r.definite[name] = true
+}
+
+// prior is every value name may hold on a path that skips the assignment
+// being read: undefined when nothing has set it yet.
+func (r *makeReader) prior(name string) []string {
+	cur, ok := r.vars[name]
+	if !ok {
+		return []string{undefined}
+	}
+	return append([]string(nil), cur...)
 }
 
 // assign applies one assignment. conditional is whether make may skip it,
 // looping whether make may run it more than once.
 func (r *makeReader) assign(name, op, val, parseDir string, conditional, looping bool) {
-	_, defined := r.vars[name]
 	switch {
 	case op == "!":
 		r.set(name, []string{unreadable}, conditional)
 	case looping && (op == "+" || op == ":"):
 		r.set(name, []string{unreadable}, conditional)
 	case op == "+":
-		cur := r.vars[name]
-		if len(cur) == 0 {
-			cur = []string{""}
-		}
+		cur := r.prior(name)
 		out := make([]string, 0, len(cur))
 		for _, c := range cur {
+			if c == undefined {
+				out = append(out, val)
+				continue
+			}
 			out = append(out, strings.TrimSpace(c+" "+val))
 		}
 		if conditional {
 			out = append(out, cur...)
-			r.vars[name] = capValues(dedupe(out))
-			return
 		}
 		r.vars[name] = capValues(dedupe(out))
 	case op == ":":
 		r.set(name, r.expandNow(val, parseDir), conditional)
-	case op == "?" && r.definite[name]:
-	case op == "?" && defined:
-		// Set only on some path so far: on those it stays, on the rest
-		// this value takes it.
-		r.set(name, []string{val}, true)
+	case op == "?":
+		// Assigns on the paths where name is undefined, and only those.
+		cur := r.prior(name)
+		out := make([]string, 0, len(cur)+1)
+		took := false
+		for _, c := range cur {
+			if c == undefined {
+				took = true
+				if !conditional {
+					continue
+				}
+			}
+			out = append(out, c)
+		}
+		if took {
+			out = append(out, val)
+		}
+		r.vars[name] = capValues(dedupe(out))
 	default:
 		r.set(name, []string{val}, conditional)
 	}
@@ -519,14 +582,18 @@ func (r *makeReader) scope(parseDir string) map[string][]string {
 		scope[k] = v
 	}
 	scope[".PARSEDIR"] = []string{parseDir}
-	// Nothing but the framework sets these, so before it is included make
-	// holds them undefined and expands them to nothing. Any other variable
-	// the reader has no value for may come from Mk/ or make.conf, and stays
-	// unresolvable.
+	// Nothing but the port and the framework sets these, so where neither has
+	// make holds them undefined and expands them to nothing. Any other
+	// variable the reader has no value for may come from Mk/ or make.conf,
+	// and stays unresolvable.
 	for _, name := range []string{"MASTERDIR", "FILESDIR"} {
-		if _, ok := scope[name]; !ok {
-			scope[name] = []string{""}
+		vals := r.prior(name)
+		for i, v := range vals {
+			if v == undefined {
+				vals[i] = ""
+			}
 		}
+		scope[name] = dedupe(vals)
 	}
 	return scope
 }
@@ -615,6 +682,70 @@ func (r *makeReader) readsTainted(s string, vars map[string][]string) bool {
 func (r *makeReader) framework(conditional bool) {
 	r.assign("MASTERDIR", "?", "${.CURDIR}", "", conditional, false)
 	r.assign("FILESDIR", "?", "${MASTERDIR}/files", "", conditional, false)
+	r.assign("PKGDIR", "?", "${MASTERDIR}", "", conditional, false)
+	r.assign("DISTINFO_FILE", "?", "${MASTERDIR}/distinfo", "", conditional, false)
+	r.noteDistinfo()
+}
+
+// noteDistinfo records every directory DISTINFO_FILE may name a file in now,
+// or why it cannot say. A path on which DISTINFO_FILE is still undefined names
+// nothing yet: a later framework include, or the end of the read, gives it
+// the default.
+func (r *makeReader) noteDistinfo() {
+	if r.ownerUnknown != "" {
+		return
+	}
+	scope := r.scope(r.dir)
+	if r.readsTainted("${DISTINFO_FILE}", scope) {
+		r.ownerUnknown = "an assignment the reader cannot follow may set DISTINFO_FILE or a variable it reads"
+		return
+	}
+	for _, v := range r.vars["DISTINFO_FILE"] {
+		if v == undefined {
+			continue
+		}
+		dirs, ok := r.expandDir(v, scope)
+		if !ok {
+			r.ownerUnknown = fmt.Sprintf("DISTINFO_FILE=%s names a directory that cannot be resolved without make", v)
+			return
+		}
+		for _, d := range dirs {
+			if !filepath.IsAbs(d) {
+				d = filepath.Join(r.dir, d)
+			}
+			r.distinfo[filepath.Clean(d)] = true
+		}
+	}
+}
+
+// expandDir resolves the directory part of a path: the whole path, then its
+// parent, or failing that the text before its last "/" outside a reference.
+func (r *makeReader) expandDir(v string, scope map[string][]string) ([]string, bool) {
+	if r.readsTainted(v, scope) {
+		return nil, false
+	}
+	if paths, ok := expandMakePath(v, scope, 0); ok {
+		for i, p := range paths {
+			paths[i] = filepath.Dir(p)
+		}
+		return paths, true
+	}
+	depth, cut := 0, -1
+	for i := 0; i < len(v); i++ {
+		switch {
+		case v[i] == '$' && i+1 < len(v) && (v[i+1] == '{' || v[i+1] == '('):
+			depth++
+			i++
+		case depth > 0 && (v[i] == '}' || v[i] == ')'):
+			depth--
+		case depth == 0 && v[i] == '/':
+			cut = i
+		}
+	}
+	if cut <= 0 {
+		return nil, false
+	}
+	return expandMakePath(v[:cut], scope, 0)
 }
 
 // read reads file as make would reach it: conditional when some enclosing
@@ -650,6 +781,14 @@ func (r *makeReader) read(file string, depth int, conditional, looping bool) str
 		}
 		return false
 	}
+	skippable := func() bool {
+		for _, k := range blocks {
+			if !k.loop || k.mayBeEmpty {
+				return true
+			}
+		}
+		return false
+	}
 	for _, line := range strings.Split(string(b), "\n") {
 		line = bindLoopVars(line, blocks)
 		for _, name := range modifierTargets(line) {
@@ -659,7 +798,7 @@ func (r *makeReader) read(file string, depth int, conditional, looping bool) str
 		if !directive && !strings.Contains(line, "=") {
 			continue
 		}
-		cond := conditional || len(blocks) > 0
+		cond := conditional || skippable()
 		loop := looping || inFor()
 		if directive {
 			if m := forDirective.FindStringSubmatch(line); m != nil {
@@ -685,13 +824,9 @@ func (r *makeReader) read(file string, depth int, conditional, looping bool) str
 					case strings.Contains(name, "$"):
 						r.taint(name)
 					case cond:
-						// Undefined on some path and not on others: a
-						// later ?= takes effect on the first.
-						r.set(name, []string{""}, true)
-						delete(r.definite, name)
+						r.set(name, []string{undefined}, true)
 					default:
 						delete(r.vars, name)
-						delete(r.definite, name)
 					}
 				}
 				continue
@@ -721,10 +856,13 @@ func (r *makeReader) read(file string, depth int, conditional, looping bool) str
 }
 
 // block is one open .if or .for. A .for maps each variable it binds to the
-// name its words are held under in the reader's variables.
+// name its words are held under in the reader's variables. A .for whose list
+// cannot be empty runs its body at least once, so only one that may be empty
+// makes what its body does conditional.
 type block struct {
-	loop  bool
-	bound map[string]string
+	loop       bool
+	mayBeEmpty bool
+	bound      map[string]string
 }
 
 // bindFor opens a .for. Its variables are bound under names no Makefile can
@@ -733,14 +871,19 @@ type block struct {
 // unreadable, so a path or name built from one refuses.
 func (r *makeReader) bindFor(vars, list, parseDir string) block {
 	var words []string
+	mayBeEmpty := true
 	switch {
 	case !strings.Contains(list, "$"):
 		words = strings.Fields(list)
+		mayBeEmpty = len(words) == 0
 	case r.readsTainted(list, r.scope(parseDir)):
 	default:
 		if vals, ok := expandMakePath(list, r.scope(parseDir), 0); ok {
+			mayBeEmpty = false
 			for _, v := range vals {
-				words = append(words, strings.Fields(v)...)
+				fields := strings.Fields(v)
+				mayBeEmpty = mayBeEmpty || len(fields) == 0
+				words = append(words, fields...)
 			}
 		}
 	}
@@ -749,7 +892,7 @@ func (r *makeReader) bindFor(vars, list, parseDir string) block {
 		words = []string{unreadable}
 	}
 	r.loops++
-	b := block{loop: true, bound: map[string]string{}}
+	b := block{loop: true, mayBeEmpty: mayBeEmpty, bound: map[string]string{}}
 	for _, v := range strings.Fields(vars) {
 		name := fmt.Sprintf(".bodega.for%d.%s", r.loops, v)
 		r.vars[name] = words
@@ -1022,6 +1165,7 @@ func Load(portsTree string) (*Index, error) {
 	ix := &Index{entries: map[string]*Entry{}, refused: map[string]string{}}
 	byPort := map[string][]string{}   // origin -> names its distinfo pins
 	restricted := map[string]string{} // origin -> reason
+	var unowned []string              // restricted ports whose distinfo cannot be placed
 	for _, cat := range cats {
 		if !cat.IsDir() || strings.HasPrefix(cat.Name(), ".") || cat.Name() == "distfiles" || cat.Name() == "packages" {
 			continue
@@ -1053,22 +1197,20 @@ func Load(portsTree string) (*Index, error) {
 					own = append(own, filepath.Join(dir, n))
 				}
 			}
-			makefiles, unresolved := portText(portsTree, dir, own)
-			why := restriction(origin, makefiles, db)
-			if why == "" && unresolved != "" {
-				why = fmt.Sprintf("%s: %s, so its redistribution terms cannot be established", origin, unresolved)
+			pr := portText(portsTree, dir, own)
+			why := restriction(origin, pr.text, db)
+			if why == "" && pr.unresolved != "" {
+				why = fmt.Sprintf("%s: %s, so its redistribution terms cannot be established", origin, pr.unresolved)
 			}
-			if why != "" {
-				restricted[origin] = why
-				// A slave reads its master's distinfo, so its restriction
-				// has to reach the names filed under the master.
-				if mm := masterDirVar.FindSubmatch(makefiles); mm != nil {
-					master := path.Clean(origin + "/" + string(mm[1]))
-					if !strings.HasPrefix(master, "..") && strings.Count(master, "/") == 1 {
-						if _, ok := restricted[master]; !ok {
-							restricted[master] = why
-						}
-					}
+			if why == "" {
+				continue
+			}
+			if pr.ownerUnknown != "" {
+				unowned = append(unowned, fmt.Sprintf("%s (%s): %s", origin, why, pr.ownerUnknown))
+			}
+			for _, owner := range append([]string{origin}, portOrigins(portsTree, pr.owners)...) {
+				if _, ok := restricted[owner]; !ok {
+					restricted[owner] = why
 				}
 			}
 		}
@@ -1076,6 +1218,7 @@ func Load(portsTree string) (*Index, error) {
 	if ix.Len() == 0 {
 		return nil, fmt.Errorf("%s holds no <category>/<port>/distinfo; distfiles_ports_tree must name the root of a FreeBSD ports tree", portsTree)
 	}
+	ix.unowned = unowned
 	// Sorted, so a distfile two restricted ports share names the same one on
 	// every read.
 	origins := make([]string, 0, len(restricted))
@@ -1092,6 +1235,29 @@ func Load(portsTree string) (*Index, error) {
 		}
 	}
 	return ix, nil
+}
+
+// portOrigins maps each directory to the <category>/<port> origin it names in
+// tree, dropping any that is not one: Load indexes no distinfo anywhere else.
+func portOrigins(tree string, dirs []string) []string {
+	if real, err := filepath.EvalSymlinks(tree); err == nil {
+		tree = real
+	}
+	var out []string
+	for _, d := range dirs {
+		if real, err := filepath.EvalSymlinks(d); err == nil {
+			d = real
+		}
+		rel, err := filepath.Rel(tree, d)
+		if err != nil {
+			continue
+		}
+		rel = filepath.ToSlash(rel)
+		if strings.Count(rel, "/") == 1 && !strings.HasPrefix(rel, ".") {
+			out = append(out, rel)
+		}
+	}
+	return out
 }
 
 func (ix *Index) addDistinfo(file, origin string, byPort map[string][]string) error {
@@ -1187,6 +1353,9 @@ func (t *Tree) startLoadLocked() {
 		}
 		t.ix, t.loadErr = ix, nil
 		t.logf("distinfo: indexed %d distfiles from %s in %s", ix.Len(), t.root, time.Since(start).Round(time.Millisecond))
+		if u := ix.Unowned(); len(u) > 0 {
+			t.logf("distinfo: %d restricted ports read a distinfo bodega cannot place, so distfiles they share with another port are not refused on their account: %s", len(u), strings.Join(u, "; "))
+		}
 	}()
 }
 

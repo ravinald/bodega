@@ -116,6 +116,7 @@ func FetchDistfiles(cfg *Config, store *manifest.Store, entryFilter string) *Sum
 		}
 		return summary
 	}
+	logUnowned(cfg, ix)
 	if err := mkdirAll(d.distfiles); err != nil {
 		err = fmt.Errorf("create the DISTDIR %s: %w; nothing was fetched", d.distfiles, err)
 		for _, name := range names {
@@ -302,6 +303,7 @@ func DistfilesArtifactPaths(cfg *Config, store *manifest.Store, entryFilter stri
 	if err != nil {
 		return nil, noRelease, fmt.Errorf("distfiles cannot be uploaded without their distinfo: %w", err)
 	}
+	logUnowned(cfg, ix)
 	pinDir, err := os.MkdirTemp(filepath.Dir(d.distfiles), ".bodega-distfiles-upload-*")
 	if err != nil {
 		return nil, noRelease, fmt.Errorf("create a directory to pin distfiles for upload beside %s: %w", d.distfiles, err)
@@ -372,4 +374,12 @@ func pinDistfile(src, dst string, limit int64) error {
 		return err
 	}
 	return out.Close()
+}
+
+// logUnowned names the restricted ports whose restriction may not reach every
+// distfile they read, so the operator learns it from bodega.
+func logUnowned(cfg *Config, ix *distinfo.Index) {
+	if u := ix.Unowned(); len(u) > 0 {
+		cfg.logf("  [distfiles] WARNING: %d restricted ports read a distinfo bodega cannot place, so distfiles they share with another port are not refused on their account: %s", len(u), strings.Join(u, "; "))
+	}
 }

@@ -107,9 +107,11 @@ func TestFetchDistfilesWritesADistdir(t *testing.T) {
 // makeOnlyRestrictions are pcpustat Makefiles that set NO_CDROM only through
 // a make construct a lexical read gets wrong: a := taken before the variable
 // it reads is reassigned, one file included twice under two values, a ?= after
-// an .undef that may run, a .for variable shadowing a global one, and an
-// assignment whose name is computed. Base make on FreeBSD prints "No resale"
-// for `make -V NO_CDROM` in each.
+// an .undef that may run, a .for variable shadowing a global one, an
+// assignment whose name is computed, a path read through a variable an
+// assignment make skips leaves undefined, and a slave naming its master
+// through PORTSDIR. Base make on FreeBSD prints "No resale" for
+// `make -V NO_CDROM` in each; for the slave, run in the slave's directory.
 var makeOnlyRestrictions = map[string]map[string]string{
 	"conditional undef": {
 		"Makefile": "D=\tfiles/allowed.mk\n.if 1\n.undef D\n.endif\nD?=\tfiles/restricted.mk\n.include \"${D}\"\n",
@@ -127,6 +129,24 @@ var makeOnlyRestrictions = map[string]map[string]string{
 		"Makefile":          "D=\tfiles/allowed.mk\n.include \"files/dispatch.mk\"\nD=\tfiles/restricted.mk\n.include \"files/dispatch.mk\"\n",
 		"files/dispatch.mk": ".include \"${.CURDIR}/${D}\"\n",
 	},
+	"undefined branch": {
+		"Makefile":                    ".if 0\nD=\tfiles/allowed/\n.endif\n.include \"${D}restricted.mk\"\n",
+		"restricted.mk":               "NO_CDROM=\tNo resale\n",
+		"files/allowed/restricted.mk": "PORTNAME=\tpcpustat\n",
+	},
+	"slave with a master under PORTSDIR": {
+		"Makefile":          "PORTNAME=\tpcpustat\n",
+		"../slave/Makefile": "MASTERDIR=\t${PORTSDIR}/sysutils/pcpustat\nNO_CDROM=\tNo resale\n.include \"${MASTERDIR}/Makefile\"\n",
+	},
+}
+
+// makeOnlyRefusal is what the refusal of a makeOnlyRestrictions case names:
+// the restriction, or for a path the reader cannot resolve, that it cannot.
+func makeOnlyRefusal(name string) string {
+	if name == "undefined branch" {
+		return "cannot be resolved"
+	}
+	return "NO_CDROM"
 }
 
 func writeMakeOnlyRestriction(t *testing.T, tree string, files map[string]string) {
@@ -155,8 +175,9 @@ func TestFetchDistfilesRefusesARestrictionMakeReaches(t *testing.T) {
 			cfg, store, hits := distfilesRun(t, distfileBody)
 			writeMakeOnlyRestriction(t, cfg.DistfilesPortsTree, files)
 			s := FetchDistfiles(cfg, store, "pcpustat/1.6.tar.bz2")
-			if s.Failures != 1 || hits.Load() != 0 || !strings.Contains(s.Results[0].Err.Error(), "NO_CDROM") {
-				t.Fatalf("results %+v after %d upstream fetches, want one refusal naming NO_CDROM after none", s.Results, hits.Load())
+			want := makeOnlyRefusal(name)
+			if s.Failures != 1 || hits.Load() != 0 || !strings.Contains(s.Results[0].Err.Error(), want) {
+				t.Fatalf("results %+v after %d upstream fetches, want one refusal naming %q after none", s.Results, hits.Load(), want)
 			}
 		})
 	}
@@ -173,8 +194,8 @@ func TestDistfilesArtifactPathsRefusesARestrictionMakeReaches(t *testing.T) {
 			}
 			writeMakeOnlyRestriction(t, cfg.DistfilesPortsTree, files)
 			paths, _, err := DistfilesArtifactPaths(cfg, store, "")
-			if err == nil || !strings.Contains(err.Error(), "NO_CDROM") {
-				t.Fatalf("paths=%v err=%v, want a refusal naming NO_CDROM", paths, err)
+			if want := makeOnlyRefusal(name); err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("paths=%v err=%v, want a refusal naming %q", paths, err, want)
 			}
 		})
 	}

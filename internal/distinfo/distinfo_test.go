@@ -315,9 +315,10 @@ func TestRestrictionFailsClosedOnWhatItCannotRead(t *testing.T) {
 // `make -V NO_CDROM` prints "No resale" for every case with want "NO_CDROM"
 // and nothing for every case with want "". Each is a state the reader has to
 // hold as make does, or refuse: definedness after an .undef that may not run,
-// a .for variable shadowing an outer one only in the loop's own text, and an
-// assignment whose name is computed reaching the restriction decision. The
-// rest refuse because the reader cannot establish what make would do.
+// a .for variable shadowing an outer one only in the loop's own text, an
+// assignment whose name is computed reaching the restriction decision, and a
+// variable an assignment make may skip leaves undefined. The rest refuse
+// because the reader cannot establish what make would do.
 var makeMeaning = []struct {
 	name, makefile, want string
 }{
@@ -348,6 +349,12 @@ var makeMeaning = []struct {
 	{"escaped dollar is not a loop variable", "D=files/allowed.mk\n.for D in files/restricted.mk\nX=$$D\n.endfor\n.include \"${D}\"\n", ""},
 	{"modifier assignment to a restriction", "X:=${NO_CDROM::=No resale}\n", "may set NO_CDROM"},
 	{"underscore modifier", "D=files/allowed.mk\n.if ${:Ufiles/restricted.mk:_=D}\n.endif\n.include \"${D}\"\n", "cannot be followed"},
+	{"conditional first assignment", ".if 0\nD=files/allowed/\n.endif\n.include \"${D}restricted.mk\"\n", "cannot be resolved"},
+	{"conditional first assignment in an included file", ".include \"files/maybe.mk\"\n.include \"${D}restricted.mk\"\n", "cannot be resolved"},
+	{"assignment in a loop that may not run", "L=\n.for i in ${L}\nD=files/allowed/\n.endfor\n.include \"${D}restricted.mk\"\n", "cannot be resolved"},
+	{"conditional append to an undefined variable", ".if 0\nD+=files/allowed/\n.endif\n.include \"${D}restricted.mk\"\n", "cannot be resolved"},
+	{"?= after a conditional first assignment", ".if 0\nD=files/allowed.mk\n.endif\nD?=files/restricted.mk\n.include \"${D}\"\n", "NO_CDROM"},
+	{"assignment in a loop that runs", ".for i in 1\nD=files/allowed/\n.endfor\n.include \"${D}restricted.mk\"\n", ""},
 }
 
 // A restriction make reaches is one the reader reaches, or the port refuses.
@@ -360,6 +367,9 @@ func TestRestrictionHoldsMakesMeaning(t *testing.T) {
 			write(t, root, "sysutils/pcpustat/files/allowed.mk", "PORTNAME=pcpustat\n")
 			write(t, root, "sysutils/pcpustat/files/drop.mk", ".if 1\n.undef D\n.endif\n")
 			write(t, root, "sysutils/pcpustat/files/computed.mk", "N=NO_CDROM\n${N}=No resale\n")
+			write(t, root, "sysutils/pcpustat/files/maybe.mk", ".if 0\nD=files/allowed/\n.endif\n")
+			write(t, root, "sysutils/pcpustat/restricted.mk", "NO_CDROM=No resale\n")
+			write(t, root, "sysutils/pcpustat/files/allowed/restricted.mk", "PORTNAME=pcpustat\n")
 			ix, err := Load(root)
 			if err != nil {
 				t.Fatal(err)
@@ -388,4 +398,76 @@ func fanOut(depth int) map[string]string {
 	}
 	files[fmt.Sprintf("f%d.mk", depth)] = ""
 	return files
+}
+
+// A port's restriction reaches every distinfo make would check its fetch
+// against: ${DISTINFO_FILE}, by default ${MASTERDIR}/distinfo, however the
+// port spells either. Base make on FreeBSD 15.1 prints lang/master's path for
+// `make -V DISTINFO_FILE` in each case but the two alternatives, which print
+// one of lang/master and lang/other.
+func TestRestrictionReachesTheDistinfoItReads(t *testing.T) {
+	for _, tc := range []struct {
+		name, makefile string
+		restricted     []string // names refused on lang/probe's account
+	}{
+		{"master under PORTSDIR", "MASTERDIR=\t${PORTSDIR}/lang/master\n", []string{"shared.tar.gz"}},
+		{"master two levels up", "MASTERDIR=\t${.CURDIR:H:H}/lang/master\n", []string{"shared.tar.gz"}},
+		{"master through another variable", "M=\tmaster\nMASTERDIR=\t${.CURDIR}/../${M}\n", []string{"shared.tar.gz"}},
+		{"either master", ".if ${FLAVOR} == a\nMASTERDIR=\t${.CURDIR}/../master\n.else\nMASTERDIR=\t${.CURDIR}/../other\n.endif\n", []string{"shared.tar.gz", "other.tar.gz"}},
+		{"distinfo named directly", "DISTINFO_FILE=\t${.CURDIR}/../master/distinfo\n", []string{"shared.tar.gz"}},
+		{"distinfo named per architecture", "DISTINFO_FILE=\t${PORTSDIR}/lang/master/distinfo.${ARCH:S/powerpc64/powerpc/}\n", []string{"shared.tar.gz"}},
+		{"distinfo set after the framework", ".include <bsd.port.pre.mk>\nDISTINFO_FILE=\t${PORTSDIR}/lang/master/distinfo\n", []string{"shared.tar.gz"}},
+		{"master set in an included file", ".include \"${.CURDIR}/../other/Makefile.slave\"\n", []string{"shared.tar.gz"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := portsTree(t)
+			if err := os.RemoveAll(filepath.Join(root, "lang", "slave")); err != nil {
+				t.Fatal(err)
+			}
+			write(t, root, "lang/other/Makefile", "PORTNAME=\tother\n")
+			write(t, root, "lang/other/distinfo", distinfoFor("other.tar.gz", sumA, 11))
+			write(t, root, "lang/other/Makefile.slave", "MASTERDIR=\t${.CURDIR}/../master\n")
+			write(t, root, "lang/probe/Makefile", "NO_CDROM=\tNo resale\n"+tc.makefile+".include <bsd.port.mk>\n")
+			ix, err := Load(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range tc.restricted {
+				if e, err := ix.Lookup(name); !errors.Is(err, ErrRestricted) || !strings.Contains(e.Restricted, "lang/probe") {
+					t.Errorf("%s: %q, %v; want ErrRestricted naming lang/probe", name, e.Restricted, err)
+				}
+			}
+			if len(tc.restricted) == 1 {
+				if _, err := ix.Lookup("other.tar.gz"); err != nil && tc.restricted[0] != "other.tar.gz" {
+					t.Errorf("other.tar.gz: %v; lang/probe does not read lang/other's distinfo", err)
+				}
+			}
+			if u := ix.Unowned(); len(u) != 0 {
+				t.Errorf("Unowned() = %v, want none", u)
+			}
+		})
+	}
+}
+
+// A restricted port whose distinfo directory the reader cannot resolve is
+// reported, so the operator learns which restrictions may not reach the files
+// they cover.
+func TestUnownedRestrictionIsReported(t *testing.T) {
+	for name, makefile := range map[string]string{
+		"unread modifier":      "MASTERDIR=\t${.CURDIR}/../${M:C/x/master/}\n",
+		"computed name":        "${UNKNOWN}_FILE=\t${.CURDIR}/../master/distinfo\n",
+		"unfollowable include": ".include \"${UNKNOWN}/slave.mk\"\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := portsTree(t)
+			write(t, root, "lang/probe/Makefile", "NO_CDROM=\tNo resale\n"+makefile+".include <bsd.port.mk>\n")
+			ix, err := Load(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if u := ix.Unowned(); len(u) != 1 || !strings.Contains(u[0], "lang/probe") || !strings.Contains(u[0], "NO_CDROM") {
+				t.Errorf("Unowned() = %q, want lang/probe with its NO_CDROM and why", u)
+			}
+		})
+	}
 }
