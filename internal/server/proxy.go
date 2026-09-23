@@ -168,8 +168,11 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 		// request that named it would be absent from discovery entirely.
 		s.recordUpstreamAttempt(r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key, decision)
 		if errors.Is(err, errUpstreamNotFound) {
+			// The reason names the upstream URL, which a manifest may write
+			// with userinfo in it, so it stays in the log: this route takes no
+			// token.
 			s.logger.Info("upstream publishes no such artifact", "key", s3Key, "error", err)
-			http.Error(w, err.Error(), http.StatusNotFound)
+			http.Error(w, errUpstreamNotFound.Error(), http.StatusNotFound)
 			return
 		}
 		s.logger.Error("upstream resolution failed", "key", s3Key, "error", err)

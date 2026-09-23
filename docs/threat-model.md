@@ -122,6 +122,24 @@ risk:
   edit, not an attacker, because whoever can rewrite the manifest can rewrite
   the sidecar beside it. It catches a hand-edit, a partial restore and a
   half-finished write; it is not a signature.
+- **Operator detail in an error body on an unauthenticated route.** The
+  package routes a client reads without a token answer a failure with a fixed
+  body and write the reason to the log. The reason is written for an operator,
+  so it names what an operator needs: the pkg signing key's path and the mode
+  that leaves it readable, the `storage_path` root, the s3 bucket and prefix,
+  or an upstream URL a manifest may have written with credentials in it. A
+  generated FreeBSD catalogue's 500 and a proxied artifact's "upstream does
+  not publish this" 404 both follow this rule. `GET /api/v1/status` draws the
+  same line with a gate instead: `spool.dir`, `version`, `freebsd.key_error`
+  and `backend_entries[].error` are withheld from a caller outside
+  `admin_permit_cidr` (see [usage.md](usage.md)). A package route has no admin
+  caller to gate for, so its body is fixed for everyone. Three items have
+  needed this fix separately, which makes it a class: any handler writing
+  `err.Error()` into a response on a route that takes no token reopens it.
+  Two bodies still carry error text. A spool refusal's 503 quotes byte counts
+  and the config key that bounds them, all of which `/api/v1/status` already
+  publishes to every caller. A FreeBSD entry marked both `generated` and
+  mirrored answers with a 500 quoting its `url`, which is not yet fixed.
 - **Opaque CI fetches.** A `bodega serve` instance is the single place to look
   when answering "what did our build pull from the internet?" The audit DB
   records every fetch event with client IP, package name, version, and
