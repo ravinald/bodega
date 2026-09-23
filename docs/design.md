@@ -112,6 +112,8 @@ Placement decides which backend answers. This decides what answering means, and 
 
 **Publication replaces bytes, never who may read them.** Where a backend carries access state, a replacement restates all of it, and where it cannot, the write fails and leaves the previous object exactly as it was.
 
+The order is owner, extended attributes, mode, ACL. The ACL goes last because `chmod` rewrites an NFSv4 ACL: ZFS at its default `aclmode=discard` drops every entry the mode cannot express on any `chmod`, the same mode included, and `restricted` refuses the `chmod` instead. `cp -p` orders them the same way for the same reason. On FreeBSD the ACL is read as whichever type `fpathconf(_PC_ACL_NFS4)` and `fpathconf(_PC_ACL_EXTENDED)` say the filesystem keeps, never inferred from a refusal: ZFS answers a POSIX.1e request with the `EINVAL` a filesystem without ACLs gives, and reading that as "no ACL" published every replaced ZFS object without its deny entries. A filesystem that names a type and then refuses to hand it over fails the write, and so does an ACL whose type the destination does not keep: NFSv4 and POSIX.1e do not translate into each other without deciding something the object's owner never decided.
+
 | Backend  | Atomic              | Snapshot        | Crash-safe | Access preserved                     | Bytes on disk on return           |
 | -------- | ------------------- | --------------- | ---------- | ------------------------------------ | --------------------------------- |
 | `local`  | yes, rename         | yes, new inode  | yes        | yes: mode, owner, group, ACL, xattrs | **no**                            |

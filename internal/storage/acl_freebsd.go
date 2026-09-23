@@ -23,40 +23,81 @@ import (
 // FreeBSD spells it ENOATTR, as macOS does, and has no ENODATA at all.
 const errNoAttr = unix.ENOATTR
 
+// fpathconf names FreeBSD answers "which ACL does this filesystem keep" with,
+// from sys/unistd.h. x/sys/unix carries neither.
 const (
-	aclTypeAccess  = 0x2 // ACL_TYPE_ACCESS
-	aclTypeDefault = 0x3 // ACL_TYPE_DEFAULT
+	pcACLExtended = 59 // _PC_ACL_EXTENDED
+	pcACLNFS4     = 64 // _PC_ACL_NFS4
 )
 
-// readACL returns the object's access ACL as the kernel's own struct acl, or
-// nil where there is none to carry. A filesystem that keeps no POSIX.1e ACL
-// answers the question with a refusal rather than with an empty ACL, and an
-// object that cannot hold one has none to lose.
+// readACL returns the object's ACL, tagged with its type, or nil where the
+// filesystem keeps none.
+//
+// The filesystem is asked which type it keeps before the ACL is read, because
+// a refusal cannot answer that. ZFS answers a request for a POSIX.1e ACL with
+// EINVAL, the errno a UFS mounted without acls gives, and reading that as "no
+// ACL" published every ZFS object with the staging file's trivial ACL in place
+// of its own. Once the filesystem has named a type, any failure to read it is
+// a failure.
 func readACL(fd int) ([]byte, error) {
-	acl := blankACL()
-	if err := aclSyscall(unix.SYS___ACL_GET_FD, fd, aclTypeAccess, acl); err != nil {
-		if unsupportedACL(err) {
-			return nil, nil
-		}
+	aclType, err := aclTypeOfFd(fd)
+	if err != nil {
 		return nil, fmt.Errorf("read the ACL: %w", err)
 	}
-	return acl, nil
+	if aclType == 0 {
+		return nil, nil
+	}
+	acl := blankACL()
+	if err := aclSyscall(unix.SYS___ACL_GET_FD, fd, int(aclType), acl); err != nil {
+		return nil, fmt.Errorf("read the %s ACL: %w", aclTypeName(aclType), err)
+	}
+	return tagACL(aclType, acl), nil
 }
 
 // applyACL puts acl on fd, or reduces fd's ACL to its mode bits when acl is
 // nil. The second case is the one a directory carrying a default ACL creates:
 // the staging file is born with an ACL the object being replaced never had.
-func applyACL(fd int, acl []byte) error {
-	if acl == nil {
+//
+// An ACL whose type the staging file's filesystem does not keep is refused
+// rather than dropped. A replacement lands on the filesystem of the object it
+// replaces, so a mismatch means the ACL was read from somewhere the object no
+// longer is: an NFSv4 ACL carried onto a UFS holding POSIX.1e, or onto one
+// holding none. Neither type translates into the other without deciding
+// something the object's owner never decided, and landing the object without
+// it hands it to whoever the ACL denied.
+func applyACL(fd int, blob []byte) error {
+	if blob == nil {
 		return clearACL(fd)
 	}
-	if err := checkStructACL(acl); err != nil {
+	aclType, acl, err := untagACL(blob)
+	if err != nil {
 		return fmt.Errorf("write the ACL: %w", err)
 	}
-	if err := aclSyscall(unix.SYS___ACL_SET_FD, fd, aclTypeAccess, acl); err != nil && !unsupportedACL(err) {
+	holds, err := aclTypeOfFd(fd)
+	if err != nil {
 		return fmt.Errorf("write the ACL: %w", err)
+	}
+	if holds != aclType {
+		return fmt.Errorf("the object's %s ACL cannot travel to a filesystem that keeps %s ACLs",
+			aclTypeName(aclType), aclTypeName(holds))
+	}
+	if err := aclSyscall(unix.SYS___ACL_SET_FD, fd, int(aclType), acl); err != nil {
+		return fmt.Errorf("write the %s ACL: %w", aclTypeName(aclType), err)
 	}
 	return nil
+}
+
+// aclTypeOfFd asks the filesystem holding fd which ACL type it keeps.
+func aclTypeOfFd(fd int) (uint32, error) {
+	nfs4, err := unix.Fpathconf(fd, pcACLNFS4)
+	if err != nil {
+		return 0, fmt.Errorf("ask the filesystem whether it keeps NFSv4 ACLs: %w", err)
+	}
+	posix1e, err := unix.Fpathconf(fd, pcACLExtended)
+	if err != nil {
+		return 0, fmt.Errorf("ask the filesystem whether it keeps POSIX.1e ACLs: %w", err)
+	}
+	return aclTypeFor(nfs4, posix1e)
 }
 
 // clearACL takes away an ACL an inode inherited from the directory it was
@@ -88,8 +129,10 @@ func clearACL(fd int) error {
 
 // unsupportedACL reports a filesystem that keeps no POSIX.1e ACL: UFS mounted
 // without acls, and ZFS, which keeps an NFSv4 ACL instead and refuses the
-// POSIX.1e types outright. An object that cannot carry one has none to lose
-// and none to strip, so a publication there is not a failed publication.
+// POSIX.1e types outright. Only clearACL may read it that way, since a staging
+// inode that cannot carry a POSIX.1e ACL has none to strip. It cannot tell a
+// filesystem with no ACL from one keeping the other type, so reading or
+// carrying an object's ACL asks aclTypeOfFd instead.
 func unsupportedACL(err error) bool {
 	return errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EINVAL)
 }

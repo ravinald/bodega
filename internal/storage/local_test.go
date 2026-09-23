@@ -462,8 +462,14 @@ func requirePOSIXACL(t *testing.T, target, name string, acl []byte) {
 // not read past would stop publication before it reached the part under test.
 func denyNamedReader(t *testing.T, target string) {
 	t.Helper()
-	if runtime.GOOS == "darwin" {
+	switch runtime.GOOS {
+	case "darwin":
 		chmodACL(t, target, "group:_guest deny read")
+		return
+	case "freebsd":
+		// The entry E8 measured disappearing on ZFS, and its POSIX.1e
+		// counterpart for a UFS mounted -o acls.
+		setfacl(t, target, []string{"-a0", "user:nobody:r::deny"}, []string{"-m", "user:nobody:---,mask::r--"})
 		return
 	}
 	requirePOSIXACL(t, target, accessACL, posixACL(
@@ -481,8 +487,12 @@ func denyNamedReader(t *testing.T, target string) {
 // object it replaces never had.
 func denyInheritedReader(t *testing.T, dir string) {
 	t.Helper()
-	if runtime.GOOS == "darwin" {
+	switch runtime.GOOS {
+	case "darwin":
 		chmodACL(t, dir, "group:_guest deny read,file_inherit")
+		return
+	case "freebsd":
+		setfacl(t, dir, []string{"-a0", "user:nobody:r:f:deny"}, []string{"-d", "-m", "user::rw-,group::---,other::---,mask::rw-,user:nobody:---"})
 		return
 	}
 	// A named entry keeps the inherited ACL from being equivalent to the mode
@@ -497,6 +507,28 @@ func denyInheritedReader(t *testing.T, dir string) {
 	))
 }
 
+// setfacl sets an ACL on a FreeBSD object in whichever of the two forms its
+// filesystem keeps, and skips where it keeps neither. getfacl names the
+// NFSv4 form by its owner@ entry, which POSIX.1e has no spelling for.
+func setfacl(t *testing.T, target string, nfs4, posix1e []string) {
+	t.Helper()
+	current, err := exec.Command("/bin/getfacl", "-q", target).CombinedOutput()
+	if err != nil {
+		t.Skipf("getfacl %s: %v: %s", target, err, current)
+	}
+	args := posix1e
+	if strings.Contains(string(current), "owner@") {
+		args = nfs4
+	}
+	out, err := exec.Command("/bin/setfacl", append(args, target)...).CombinedOutput()
+	if err != nil && strings.Contains(string(out), "not supported") {
+		t.Skipf("the filesystem holding %s keeps no ACL: %s", target, out)
+	}
+	if err != nil {
+		t.Fatalf("setfacl %q %s: %v: %s", args, target, err, out)
+	}
+}
+
 func chmodACL(t *testing.T, target, entry string) {
 	t.Helper()
 	if out, err := exec.Command("/bin/chmod", "+a", entry, target).CombinedOutput(); err != nil {
@@ -508,13 +540,29 @@ func chmodACL(t *testing.T, target, entry string) {
 // platform will show one, and returns an empty string where it carries none.
 func objectACL(t *testing.T, target string) string {
 	t.Helper()
-	if runtime.GOOS == "darwin" {
+	switch runtime.GOOS {
+	case "darwin":
 		listing, err := exec.Command("/bin/ls", "-led", target).Output()
 		if err != nil {
 			t.Fatalf("ls -led %s: %v", target, err)
 		}
 		_, acl, _ := strings.Cut(string(listing), "\n")
 		return acl
+	case "freebsd":
+		// getfacl prints the ACL the mode implies on every object, so the
+		// trailing + ls puts on the mode is what says there is one to carry.
+		listing, err := exec.Command("/bin/ls", "-ld", target).Output()
+		if err != nil {
+			t.Fatalf("ls -ld %s: %v", target, err)
+		}
+		if mode, _, _ := strings.Cut(string(listing), " "); !strings.HasSuffix(mode, "+") {
+			return ""
+		}
+		acl, err := exec.Command("/bin/getfacl", "-qn", target).Output()
+		if err != nil {
+			t.Fatalf("getfacl %s: %v", target, err)
+		}
+		return string(acl)
 	}
 	acl, err := readXattr(t, target, accessACL)
 	if err != nil {

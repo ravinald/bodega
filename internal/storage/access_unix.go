@@ -104,10 +104,14 @@ func readAccess(f *os.File) (a access, err error) {
 
 // applyTo gives the staging handle the access state of the object it is about
 // to replace, and refuses the publication when it cannot. Order matters:
-// chown drops the attributes the kernel treats as privileged, and chmod is the
-// only step that widens anything, so it goes last. The staging file reaches
-// the mode of the object it replaces with that object's owner and ACL already
-// on it, and never before.
+// chown drops the attributes the kernel treats as privileged, so it goes
+// first, and the ACL goes last because chmod rewrites an NFSv4 ACL. ZFS at its
+// default aclmode=discard drops every entry the mode cannot express on any
+// chmod, the same mode included, so a deny entry applied before the mode is
+// gone by the time the object lands; restricted refuses the chmod instead.
+// cp -p puts the mode on before the ACL for the same reason. The staging file
+// sits in an enclosure nothing else can traverse while it holds the object's
+// mode without its ACL, and the rename out of it happens after both.
 func (a access) applyTo(f *os.File, key string) error {
 	fd := int(f.Fd())
 	var st unix.Stat_t
@@ -123,11 +127,11 @@ func (a access) applyTo(f *os.File, key string) error {
 	if err := a.restoreXattrs(fd, key); err != nil {
 		return err
 	}
-	if err := applyACL(fd, a.acl); err != nil {
-		return fmt.Errorf("publish %s: the replacement cannot carry the object's ACL (%w); the previous object is unchanged", key, err)
-	}
 	if err := unix.Fchmod(fd, a.perm); err != nil {
 		return fmt.Errorf("publish %s: the replacement cannot be set to the object's mode %04o (%w); the previous object is unchanged", key, a.perm, err)
+	}
+	if err := applyACL(fd, a.acl); err != nil {
+		return fmt.Errorf("publish %s: the replacement cannot carry the object's ACL (%w); the previous object is unchanged", key, err)
 	}
 	return nil
 }

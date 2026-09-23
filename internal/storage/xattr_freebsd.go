@@ -23,15 +23,17 @@ var xattrNamespaces = [...]struct {
 	{unix.EXTATTR_NAMESPACE_SYSTEM, "system."},
 }
 
-// aclXattrs is where UFS keeps a POSIX.1e ACL, and publication does not move
-// it as an attribute. acl_freebsd.go carries it through __acl_get_fd and
-// __acl_set_fd, which validate what they are given and need no privilege past
-// ownership of the file; copying the same bytes a second time would need
+// aclXattrs is where UFS keeps an ACL, POSIX.1e under -o acls and NFSv4 under
+// -o nfsv4acls, and publication does not move either as an attribute.
+// acl_freebsd.go carries it through __acl_get_fd and __acl_set_fd, which
+// validate what they are given and need no privilege past ownership of the
+// file; copying the same bytes a second time would need
 // PRIV_VFS_EXTATTR_SYSTEM to write them back and could only disagree with the
 // first copy.
 var aclXattrs = map[string]bool{
 	"system.posix1e.acl_access":  true,
 	"system.posix1e.acl_default": true,
+	"system.nfs4.acl":            true,
 }
 
 // listXattr returns the attribute names on fd, each qualified by the namespace

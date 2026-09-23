@@ -880,7 +880,7 @@ func TestSplitExtattrNamesRefusesAnAnswerThatRunsPastItsEnd(t *testing.T) {
 func TestMinimalACLIsTheModeBitsAndNothingNamed(t *testing.T) {
 	t.Parallel()
 	acl := minimalACL(0o640)
-	if err := checkStructACL(acl); err != nil {
+	if err := checkStructACL(aclTypeAccess, acl); err != nil {
 		t.Fatalf("minimalACL built a struct acl __acl_set_fd would refuse: %v", err)
 	}
 	if cnt := binary.NativeEndian.Uint32(acl[4:8]); cnt != 3 {
@@ -904,15 +904,130 @@ func TestMinimalACLIsTheModeBitsAndNothingNamed(t *testing.T) {
 
 func TestCheckStructACLRefusesABlobTheKernelWould(t *testing.T) {
 	t.Parallel()
-	if err := checkStructACL(make([]byte, aclSize)); err == nil {
+	if err := checkStructACL(aclTypeAccess, make([]byte, aclSize)); err == nil {
 		t.Error("a struct acl with acl_maxcnt 0 was accepted; acl_copyout answers that one EINVAL")
 	}
-	if err := checkStructACL(minimalACL(0o644)[:aclSize-1]); err == nil {
+	if err := checkStructACL(aclTypeAccess, minimalACL(0o644)[:aclSize-1]); err == nil {
 		t.Error("a short struct acl was accepted")
 	}
 	tooMany := blankACL()
 	binary.NativeEndian.PutUint32(tooMany[4:8], aclMaxEntries+1)
-	if err := checkStructACL(tooMany); err == nil {
+	if err := checkStructACL(aclTypeNFS4, tooMany); err == nil {
 		t.Error("a struct acl claiming more entries than it holds was accepted")
+	}
+	if err := checkStructACL(aclTypeDefault, minimalACL(0o644)); err == nil {
+		t.Error("a default ACL was accepted; publication carries an object's ACL, and an object has no default")
+	}
+}
+
+// nfs4Entry is one row of a struct acl in the NFSv4 layout.
+type nfs4Entry struct {
+	tag, id, perm uint32
+	kind, flags   uint16
+}
+
+func nfs4ACL(entries ...nfs4Entry) []byte {
+	acl := blankACL()
+	binary.NativeEndian.PutUint32(acl[4:8], uint32(len(entries))) //nolint:gosec // G115: a handful of test entries.
+	for i, e := range entries {
+		off := aclEntryStart + i*aclEntrySize
+		binary.NativeEndian.PutUint32(acl[off:off+4], e.tag)
+		binary.NativeEndian.PutUint32(acl[off+4:off+8], e.id)
+		binary.NativeEndian.PutUint32(acl[off+8:off+12], e.perm)
+		binary.NativeEndian.PutUint16(acl[off+12:off+14], e.kind)
+		binary.NativeEndian.PutUint16(acl[off+14:off+16], e.flags)
+	}
+	return acl
+}
+
+// deniedNobody is what getfacl printed on a ZFS object after
+// setfacl -a0 user:nobody:r::deny: the named deny ahead of the three entries
+// every NFSv4 object carries. ACL_READ_DATA is 0x8, and 65534 is nobody.
+func deniedNobody() []byte {
+	return nfs4ACL(
+		nfs4Entry{tagUser, 65534, 0x8, entryDeny, 0},
+		nfs4Entry{tagUserObj, undefinedID, 0x1f0bf, entryAllow, 0},
+		nfs4Entry{tagGroupObj, undefinedID, 0x12089, entryAllow, 0},
+		nfs4Entry{tagEveryone, undefinedID, 0x12089, entryAllow, 0},
+	)
+}
+
+// ZFS answers fpathconf(_PC_ACL_NFS4) with 1 and _PC_ACL_EXTENDED with 0, and
+// refuses ACL_TYPE_ACCESS with the EINVAL a filesystem with no ACL gives.
+// Asking for ACL_TYPE_ACCESS alone and reading the refusal as "no ACL" landed
+// every replaced ZFS object without the deny entries it carried.
+func TestACLTypeForAsksTheFilesystemWhichACLItKeeps(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		fs            string
+		nfs4, posix1e int
+		want          uint32
+	}{
+		{"ZFS, and UFS mounted -o nfsv4acls", 1, 0, aclTypeNFS4},
+		{"UFS mounted -o acls", 0, 1, aclTypeAccess},
+		{"a filesystem with no ACL", 0, 0, 0},
+	} {
+		got, err := aclTypeFor(c.nfs4, c.posix1e)
+		if err != nil || got != c.want {
+			t.Errorf("%s: aclTypeFor(%d, %d) = %s (%v), want %s", c.fs, c.nfs4, c.posix1e, aclTypeName(got), err, aclTypeName(c.want))
+		}
+	}
+	if _, err := aclTypeFor(1, 1); err == nil {
+		t.Error("a filesystem claiming both types was given one of them")
+	}
+}
+
+func TestTaggedACLCarriesItsTypeAndItsEntries(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name    string
+		aclType uint32
+		acl     []byte
+	}{
+		{"NFSv4 with a deny entry", aclTypeNFS4, deniedNobody()},
+		{"POSIX.1e", aclTypeAccess, minimalACL(0o640)},
+	} {
+		gotType, got, err := untagACL(tagACL(c.aclType, c.acl))
+		if err != nil {
+			t.Fatalf("%s: untagACL: %v", c.name, err)
+		}
+		if gotType != c.aclType || !bytes.Equal(got, c.acl) {
+			t.Errorf("%s: round trip gave a %s ACL of %d bytes, want %s and the %d bytes it was given",
+				c.name, aclTypeName(gotType), len(got), aclTypeName(c.aclType), len(c.acl))
+		}
+	}
+	if _, _, err := untagACL([]byte{4, 0}); err == nil {
+		t.Error("untagACL accepted a blob too short to name its type")
+	}
+}
+
+// The two layouts share one struct, so a blob handed to the kernel under the
+// other type is either refused with the EINVAL a filesystem without ACLs gives
+// or read as an ACL nobody wrote.
+func TestCheckStructACLHoldsEachLayoutToItsOwnType(t *testing.T) {
+	t.Parallel()
+	if err := checkStructACL(aclTypeAccess, deniedNobody()); err == nil {
+		t.Error("an NFSv4 ACL naming everyone@ was accepted as POSIX.1e")
+	}
+	if err := checkStructACL(aclTypeNFS4, minimalACL(0o644)); err == nil {
+		t.Error("a POSIX.1e ACL naming other, with no allow or deny, was accepted as NFSv4")
+	}
+	if err := checkStructACL(aclTypeNFS4, blankACL()); err == nil {
+		t.Error("an NFSv4 ACL with no entries was accepted; ZFS refuses one")
+	}
+
+	// UFS keeps a POSIX.1e ACL as struct oldacl, 32 entries at most. NFSv4
+	// has the whole struct.
+	var many []nfs4Entry
+	for i := range posix1eMaxEntries + 1 {
+		many = append(many, nfs4Entry{tagUser, uint32(1000 + i), 0x8, entryDeny, 0}) //nolint:gosec // G115: small.
+	}
+	if err := checkStructACL(aclTypeNFS4, nfs4ACL(many...)); err != nil {
+		t.Errorf("an NFSv4 ACL of %d entries was refused: %v", len(many), err)
+	}
+	longPOSIX := minimalACL(0o644)
+	binary.NativeEndian.PutUint32(longPOSIX[4:8], posix1eMaxEntries+1)
+	if err := checkStructACL(aclTypeAccess, longPOSIX); err == nil {
+		t.Errorf("a POSIX.1e ACL of %d entries was accepted", posix1eMaxEntries+1)
 	}
 }
