@@ -35,14 +35,10 @@ When a name is given after the type, only that entry is built.`,
   bodega build run apt
   bodega build run apt python3`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			var typeArgs []string
+			typeArgs, rest := splitTypeArgs(args)
 			var entryFilter string
-			for _, a := range args {
-				if isTypeArg(a) {
-					typeArgs = append(typeArgs, a)
-				} else {
-					entryFilter = a
-				}
+			if len(rest) > 0 {
+				entryFilter = rest[len(rest)-1]
 			}
 			types, err := resolveTypes(typeArgs)
 			if err != nil {
@@ -57,6 +53,9 @@ When a name is given after the type, only that entry is built.`,
 			store, err := loadStore(gf)
 			if err != nil {
 				return fmt.Errorf("load manifests: %w", err)
+			}
+			if err := refuseAliasCollision(typeArgs, store); err != nil {
+				return err
 			}
 
 			// Set up the build logger. Output is teed to both stdout and the

@@ -148,6 +148,58 @@ rc=$?
 set -e
 t_ok "a hostname is not an alias" 2 "$rc"
 
+E2E_FREEBSD_HOST="freebsd.example.com"
+E2E_FREEBSD_SERVER_HOST="freebsd-server.example.com"
+t_ok "freebsd alias resolves E2E_FREEBSD_HOST" "freebsd.example.com" "$(e2e_host_for freebsd)"
+t_ok "freebsd-server alias resolves its own variable" "freebsd-server.example.com" "$(e2e_host_for freebsd-server)"
+
+# freebsd-client was the FreeBSD client's alias before freebsd replaced it. A
+# suite still naming it must fail closed, not reach whatever it used to mean.
+set +e
+e2e_host_for freebsd-client >/dev/null 2>&1
+rc=$?
+set -e
+t_ok "the retired freebsd-client alias is refused" 2 "$rc"
+
+# run.sh's guards, driven end to end. ssh and every resolver are stubbed to
+# leave a mark, so a guard that lets the run reach a host shows up as a mark
+# rather than as whatever that host happens to answer.
+mkdir -p "$work/bin"
+for tool in ssh scp dig host getent dscacheutil; do
+	printf '#!/bin/sh\ntouch "%s/contacted"\nexit 1\n' "$work" >"$work/bin/$tool"
+	chmod +x "$work/bin/$tool"
+done
+
+# run_guard <expected-substring> [VAR=value ...] — runs run.sh --dry-run with
+# only the named hosts configured and echoes "<rc>|<matched>|<contacted>".
+run_guard() {
+	local want="$1" out rc
+	shift
+	rm -f "$work/contacted"
+	set +e
+	out="$(env -u E2E_SERVER_HOST -u E2E_CLIENT_HOST -u E2E_FREEBSD_HOST \
+		-u E2E_FREEBSD_SERVER_HOST -u E2E_FREEBSD_CLIENT_HOST -u E2E_ALLOWED_HOSTS \
+		-u E2E_LIB_REMOTE -u E2E_LIB_ASSERT -u E2E_LIB_REPORT \
+		E2E_HOSTS_ENV=/dev/null PATH="$work/bin:$PATH" "$@" \
+		bash "$E2E_DIR/run.sh" --dry-run 2>&1)"
+	rc=$?
+	set -e
+	printf '%s|%s|%s' "$rc" \
+		"$(case "$out" in *"$want"*) echo matched ;; *) echo "missing: $out" ;; esac)" \
+		"$([ -e "$work/contacted" ] && echo contacted || echo untouched)"
+}
+
+three=(E2E_SERVER_HOST=s.example E2E_CLIENT_HOST=c.example E2E_FREEBSD_SERVER_HOST=fs.example)
+t_ok "an unset E2E_FREEBSD_HOST refuses by name before contact" "3|matched|untouched" \
+	"$(run_guard "E2E_FREEBSD_HOST is unset" "${three[@]}" \
+		E2E_ALLOWED_HOSTS="s.example c.example fs.example")"
+t_ok "the retired variable name is refused with the rename" "3|matched|untouched" \
+	"$(run_guard "the freebsd-client alias is now freebsd" "${three[@]}" \
+		E2E_FREEBSD_CLIENT_HOST=f.example E2E_ALLOWED_HOSTS="s.example c.example fs.example f.example")"
+t_ok "an unlisted freebsd host is refused before contact" "3|matched|untouched" \
+	"$(run_guard "refusing to run: prod.example is not a dev guest" "${three[@]}" \
+		E2E_FREEBSD_HOST=prod.example E2E_ALLOWED_HOSTS="s.example c.example fs.example f.example")"
+
 # ---- counters --------------------------------------------------------------
 
 t_ok "PASS counter agrees with the file" \
