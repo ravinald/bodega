@@ -513,6 +513,11 @@ func (r *responseRecorder) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// Unwrap lets http.ResponseController reach the connection underneath. The
+// git smart-HTTP route sets its own write deadline through one, and without
+// this the call fails and the route falls back to the server-wide bound.
+func (r *responseRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
 // Flush implements http.Flusher for streaming responses.
 func (r *responseRecorder) Flush() {
 	if f, ok := r.ResponseWriter.(http.Flusher); ok {

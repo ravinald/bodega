@@ -161,6 +161,9 @@ type Server struct {
 	// gitClone serializes the first clone of each mirror, so concurrent first
 	// requests for one repository produce one `git clone --mirror`.
 	gitClone keyedMutex
+	// gitMirrors lets a request stop waiting on a first mirror without
+	// stopping the clone, and lets the requests behind it find the same one.
+	gitMirrors gitMirrorJobs
 
 	// aptPool caches the pool listing behind metadata_ttl. Every apt-touching
 	// API write rebuilds the snapshot and the rebuild lists the whole pool, so
@@ -524,8 +527,11 @@ func (s *Server) Start(ctx context.Context) error {
 		Handler:           s.handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      5 * time.Minute, // generous for large file transfers
-		IdleTimeout:       120 * time.Second,
+		// Every route but git smart-HTTP, which sets its own deadline per
+		// response (gitBackendTimeout). This bounds how long any caller,
+		// authenticated or not, holds a connection open while being answered.
+		WriteTimeout: 5 * time.Minute,
+		IdleTimeout:  120 * time.Second,
 	}
 
 	if s.adminErr != nil {

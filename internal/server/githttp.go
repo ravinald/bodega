@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
@@ -42,14 +44,57 @@ const (
 // have nothing to do with the upstream — so the stamp is bodega's own.
 const gitFetchStamp = ".bodega-fetched"
 
-// gitBackendTimeout is the hard ceiling on one git-http-backend child.
-// exec.CommandContext already ties the child to the request, so a client that
-// hangs up kills it; this bound covers the other direction, where the client
-// waits patiently while the child does not finish. Five minutes is longer than
-// any healthy upload-pack negotiation against a local mirror (the expensive
-// half, cloning from the real upstream, happens before the exec and is bounded
-// separately) and short enough that a wedged child cannot outlive a deploy.
-const gitBackendTimeout = 5 * time.Minute
+// gitBackendTimeout and gitBackendStall bound one git-http-backend child and
+// the response it streams.
+//
+// The response gets its own write deadline instead of the server-wide
+// WriteTimeout, which caps every route for every anonymous caller: a full
+// clone of a large forge repository is gigabytes of pack, and raising the
+// global bound to fit it would let any request hold a connection that long.
+// The deadline starts at gitBackendStall and moves forward each time the child
+// produces output, never past gitBackendTimeout from the start of the
+// response. So a child that goes quiet is killed one stall after its last
+// output, a client that stops reading loses the connection between one stall
+// and a stall and a quarter after it (see gitResponseClock), and only a
+// transfer that keeps moving gets the full hour: 2.9 GB of pack in an hour is
+// about 6.5 Mbit/s sustained.
+//
+// git sends a sideband progress line or a keepalive at least every five
+// seconds while it computes a pack, so a minute of silence is a wedge, not a
+// slow repository.
+const (
+	gitBackendTimeout = time.Hour
+	gitBackendStall   = time.Minute
+)
+
+// gitBackendKillGrace is how long a canceled child has to exit after SIGTERM
+// before it is killed and its pipes closed. SIGTERM rather than SIGKILL
+// because git-http-backend runs upload-pack as a child of its own and kills
+// it only on a signal it can catch; a SIGKILLed backend leaves upload-pack
+// writing into a pipe the response is still reading.
+const gitBackendKillGrace = 10 * time.Second
+
+// gitMirrorWait is how long a request waits on a first mirror before it is
+// answered 503 with Retry-After. Most repositories mirror inside it and are
+// served on the same request. A large one does not, and a client holding a
+// silent connection for the length of a 15-minute clone gets cut off by the
+// server-wide write bound when the clone finishes, with an empty reply that
+// names nothing. The clone keeps running after the 503.
+const (
+	gitMirrorWait       = 30 * time.Second
+	gitMirrorRetryAfter = 60
+)
+
+// errGitMirrorPending reports a first mirror still running when gitMirrorWait
+// ran out.
+var errGitMirrorPending = errors.New("the first mirror of this repository is still running")
+
+// The causes a git-http-backend child is canceled with, so the log line says
+// which bound fired rather than "signal: terminated".
+var (
+	errGitBackendTimeout = errors.New("git response reached the ceiling on one response's total time")
+	errGitBackendStalled = errors.New("git-http-backend produced no output within the stall bound")
+)
 
 // gitCloneTimeout and gitFetchTimeout bound the two git(1) invocations that
 // reach the network. A first mirror of a large forge repository is minutes of
@@ -100,6 +145,12 @@ type gitTool struct {
 	git     string // git(1), for the mirror clone and refresh
 	backend string // git-http-backend, the CGI that speaks the protocol
 	root    string // GIT_PROJECT_ROOT: <storage_path>/git
+
+	// The bounds each request runs under, carried here so a test can shrink
+	// them for one server without racing every other test's.
+	mirrorWait     time.Duration // gitMirrorWait
+	backendTimeout time.Duration // gitBackendTimeout
+	backendStall   time.Duration // gitBackendStall
 }
 
 // gitBackendCandidates are the fixed locations git-http-backend ships in when
@@ -175,7 +226,12 @@ func resolveGitTool(cfg *config.Config, logger *slog.Logger) *gitTool {
 
 	root := filepath.Join(firstNonEmpty(cfg.StoragePath, config.DefaultStoragePath), "git")
 	logger.Info("git smart-HTTP enabled", "git", gitPath, "git_http_backend", backend, "git_project_root", root)
-	return &gitTool{git: gitPath, backend: backend, root: root}
+	return &gitTool{
+		git: gitPath, backend: backend, root: root,
+		mirrorWait:     gitMirrorWait,
+		backendTimeout: gitBackendTimeout,
+		backendStall:   gitBackendStall,
+	}
 }
 
 // firstNonEmpty returns the first non-empty argument, or "".
@@ -278,11 +334,22 @@ func (s *Server) handleGitSmart(w http.ResponseWriter, r *http.Request, ns, rest
 	}
 
 	if err := s.ensureGitMirror(ctx, ns+"/"+repo, dir, upstream); err != nil {
-		// The git error carries the upstream URL and local paths, so it goes
-		// to the log and never to the client.
-		s.logger.Error("git mirror clone failed",
-			"namespace", ns, "repo", repo, "dir", dir, "upstream", upstream, "error", err)
-		http.Error(w, "could not mirror this repository from its upstream — check the bodega server log for the git error, and confirm the upstream exists and is public", http.StatusBadGateway)
+		switch {
+		case errors.Is(err, errGitMirrorPending):
+			// text/plain on purpose: git prints a plain-text error body to
+			// the user prefixed "remote:", which is the only channel that
+			// reaches whoever typed the clone.
+			s.logger.Info("first git mirror still running; answering 503 with Retry-After",
+				"namespace", ns, "repo", repo, "upstream", upstream, "waited", s.gitTool.mirrorWait)
+			w.Header().Set("Retry-After", strconv.Itoa(gitMirrorRetryAfter))
+			http.Error(w, fmt.Sprintf("bodega is mirroring %s/%s from its upstream for the first time; the clone is still running and continues after this response. Retry in a minute or two.", ns, repo), http.StatusServiceUnavailable)
+		case ctx.Err() != nil:
+			// The client left while waiting; the mirror carries on without it.
+		default:
+			// The git error carries the upstream URL and local paths, so the
+			// clone logs it and the client gets neither.
+			http.Error(w, "could not mirror this repository from its upstream — check the bodega server log for the git error, and confirm the upstream exists and is public", http.StatusBadGateway)
+		}
 		return
 	}
 	if service == gitServiceInfoRefs {
@@ -410,25 +477,50 @@ func gitSmartService(rest string) (repo, service string, ok bool) {
 // ensureGitMirror clones the upstream on first request and does nothing on
 // every request after.
 //
-// The clone is serialized per repository so twenty concurrent first clones
-// produce one `git clone --mirror`. It runs on its own deadline rather than
-// the request's: the clients queued behind the lock all lose the mirror if the
-// first one hangs up, and the next request would start the same clone over.
-//
-// What is on disk is inspected rather than counted. `git clone --mirror`
-// creates the destination at the start of the transfer, so a restart, an OOM
-// kill or a RemoveAll that lost to a permission error leaves a directory that
-// exists, holds no refs and answers every later request with a 404 forever.
+// The clone runs on its own goroutine and its own deadline rather than the
+// request's, and concurrent first requests for one repository share it, so
+// twenty of them produce one `git clone --mirror`. The clients queued on it
+// would all lose the mirror if the first one hung up, and the next request
+// would start the same clone over. Each request waits at most mirrorWait and
+// then gets errGitMirrorPending, while the clone carries on.
 func (s *Server) ensureGitMirror(ctx context.Context, key, dir, upstream string) error {
 	if ok, _ := s.gitMirrorUsable(ctx, dir, upstream); ok {
 		return nil
 	}
 
+	job := s.gitMirrors.start(key, func() error {
+		err := s.cloneGitMirror(key, dir, upstream)
+		if err != nil {
+			s.logger.Error("git mirror clone failed", "repo", key, "dir", dir, "upstream", upstream, "error", err)
+		}
+		return err
+	})
+	wait := time.NewTimer(s.gitTool.mirrorWait)
+	defer wait.Stop()
+	select {
+	case <-job.done:
+		return job.err
+	case <-wait.C:
+		return errGitMirrorPending
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// cloneGitMirror makes dir a complete mirror of upstream, discarding whatever
+// unusable directory is there first.
+//
+// What is on disk is inspected rather than counted. `git clone --mirror`
+// creates the destination at the start of the transfer, so a restart, an OOM
+// kill or a RemoveAll that lost to a permission error leaves a directory that
+// exists, holds no refs and answers every later request with a 404 forever.
+func (s *Server) cloneGitMirror(key, dir, upstream string) error {
+	ctx := context.Background()
 	unlock := s.gitClone.lock(key)
 	defer unlock()
-	// The second look is what covers the git-upload-pack POST that arrives
-	// while the info/refs clone is still running: it blocks here rather than
-	// racing past a half-written directory into a 404 with an empty body.
+	// The second look is what makes a clone started just after another
+	// finished a no-op, and what keeps a refresh holding the lock from being
+	// raced by a clone into the same directory.
 	ok, why := s.gitMirrorUsable(ctx, dir, upstream)
 	if ok {
 		return nil
@@ -445,7 +537,7 @@ func (s *Server) ensureGitMirror(ctx context.Context, key, dir, upstream string)
 	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
 		return fmt.Errorf("create mirror parent directory %s: %w", filepath.Dir(dir), err)
 	}
-	cloneCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), gitCloneTimeout)
+	cloneCtx, cancel := context.WithTimeout(ctx, gitCloneTimeout)
 	defer cancel()
 
 	// http.receivepack=false is the first of the two push refusals, written
@@ -465,6 +557,42 @@ func (s *Server) ensureGitMirror(ctx context.Context, key, dir, upstream string)
 	}
 	s.stampGitFetch(dir)
 	return nil
+}
+
+// gitMirrorJobs holds the first-mirror clones in flight, one per repository,
+// and forgets each one when it finishes.
+type gitMirrorJobs struct {
+	mu   sync.Mutex
+	jobs map[string]*gitMirrorJob
+}
+
+// gitMirrorJob is one clone in flight. err is written before done closes and
+// read only after.
+type gitMirrorJob struct {
+	done chan struct{}
+	err  error
+}
+
+// start returns the clone in flight for key, or starts run as that clone.
+func (j *gitMirrorJobs) start(key string, run func() error) *gitMirrorJob {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if job, ok := j.jobs[key]; ok {
+		return job
+	}
+	if j.jobs == nil {
+		j.jobs = make(map[string]*gitMirrorJob)
+	}
+	job := &gitMirrorJob{done: make(chan struct{})}
+	j.jobs[key] = job
+	go func() {
+		job.err = run()
+		j.mu.Lock()
+		delete(j.jobs, key)
+		j.mu.Unlock()
+		close(job.done)
+	}()
+	return job
 }
 
 // gitMirrorUsable reports whether dir holds a mirror this request may serve
@@ -618,10 +746,23 @@ func (s *Server) runGit(ctx context.Context, dir string, args ...string) (string
 // PATH decides which helpers it runs, neither of which shows up in a diff, so
 // gitCGIEnv builds the list rather than appending to os.Environ.
 func (s *Server) runGitBackend(w http.ResponseWriter, r *http.Request, ns, repo, pathInfo, query string) {
-	ctx, cancel := context.WithTimeout(r.Context(), gitBackendTimeout)
-	defer cancel()
+	ctx, cancelTimeout := context.WithTimeoutCause(r.Context(), s.gitTool.backendTimeout, errGitBackendTimeout)
+	defer cancelTimeout()
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
+	clock := newGitResponseClock(w, s.gitTool.backendStall, s.gitTool.backendTimeout, cancel)
+	defer clock.stop()
+	if err := clock.extend(); err != nil {
+		// Only a ResponseWriter wrapper that hides the connection gets here,
+		// and the response then falls back to the server-wide WriteTimeout.
+		s.logger.Warn("could not set a write deadline for this git response; the server-wide write timeout bounds it instead",
+			"namespace", ns, "repo", repo, "error", err)
+	}
 
 	cmd := exec.CommandContext(ctx, s.gitTool.backend)
+	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	cmd.WaitDelay = gitBackendKillGrace
 	cmd.Env = s.gitCGIEnv(r, pathInfo, query)
 	cmd.Dir = s.gitTool.root
 	cmd.Stdin = r.Body
@@ -641,10 +782,12 @@ func (s *Server) runGitBackend(w http.ResponseWriter, r *http.Request, ns, repo,
 		return
 	}
 
-	wrote, copyErr := writeCGIResponse(w, stdout)
+	wrote, copyErr := writeCGIResponse(w, clock.watch(stdout))
 	if copyErr != nil {
-		// Drain the rest so the child is not blocked writing into a pipe
-		// nobody reads while Wait blocks on it.
+		// The client is gone or the response is malformed, so nothing the
+		// child writes from here reaches anyone. Stop it, then drain so it is
+		// not blocked writing into a pipe nobody reads while Wait blocks on it.
+		cancel(copyErr)
 		_, _ = io.Copy(io.Discard, stdout)
 	}
 	waitErr := cmd.Wait()
@@ -655,12 +798,94 @@ func (s *Server) runGitBackend(w http.ResponseWriter, r *http.Request, ns, repo,
 		// written to the response.
 		s.logger.Warn("git-http-backend failed",
 			"namespace", ns, "repo", repo, "path_info", pathInfo,
-			"git_stderr", stderr.String(), "exit_error", waitErr, "response_error", copyErr)
+			"git_stderr", stderr.String(), "exit_error", waitErr, "response_error", copyErr,
+			"cause", context.Cause(ctx))
 	}
 	if !wrote {
 		http.Error(w, "the git backend produced no response — see the bodega server log for the git error", http.StatusBadGateway)
 	}
 }
+
+// gitResponseClock is the per-response write bound described at
+// gitBackendTimeout. It moves the connection's write deadline forward each
+// time the child produces output, and cancels the child when it produces
+// none for a whole stall.
+//
+// Neither bound may fall due earlier than one stall after the latest output,
+// capped at the ceiling. The write deadline is coalesced (see extend) and so
+// runs up to a quarter stall past that; the watchdog is not, because it reads
+// the latest output time when it fires rather than being reset per read.
+type gitResponseClock struct {
+	rc       *http.ResponseController
+	stall    time.Duration
+	end      time.Time
+	watchdog *time.Timer
+	stopped  atomic.Bool
+	output   atomic.Int64 // UnixNano of the latest output, read by the watchdog
+	setAt    time.Time    // when the write deadline was last moved
+}
+
+func newGitResponseClock(w http.ResponseWriter, stall, ceiling time.Duration, cancel context.CancelCauseFunc) *gitResponseClock {
+	now := time.Now()
+	c := &gitResponseClock{
+		rc:    http.NewResponseController(w),
+		stall: stall,
+		end:   now.Add(ceiling),
+	}
+	c.output.Store(now.UnixNano())
+	c.watchdog = time.AfterFunc(stall, func() {
+		if c.stopped.Load() {
+			return
+		}
+		if quiet := time.Since(time.Unix(0, c.output.Load())); quiet < c.stall {
+			c.watchdog.Reset(c.stall - quiet)
+			return
+		}
+		cancel(errGitBackendStalled)
+	})
+	return c
+}
+
+// extend records output now and pushes the write deadline past it, capped at
+// the ceiling. The deadline moves at most once per quarter stall, because a
+// 2.9 GB pack arrives in some 700,000 reads and on HTTP/2 each move is a
+// message to the connection's serve goroutine. Setting it a quarter stall
+// beyond now+stall is what keeps output skipped inside that window from
+// leaving the deadline short of its own now+stall.
+func (c *gitResponseClock) extend() error {
+	now := time.Now()
+	c.output.Store(now.UnixNano())
+	window := c.stall / 4
+	if !c.setAt.IsZero() && now.Sub(c.setAt) < window {
+		return nil
+	}
+	c.setAt = now
+	deadline := now.Add(c.stall + window)
+	if deadline.After(c.end) {
+		deadline = c.end
+	}
+	return c.rc.SetWriteDeadline(deadline)
+}
+
+func (c *gitResponseClock) stop() {
+	c.stopped.Store(true)
+	c.watchdog.Stop()
+}
+
+// watch returns r with every read that yields bytes counted as progress.
+func (c *gitResponseClock) watch(r io.Reader) io.Reader {
+	return readerFunc(func(p []byte) (int, error) {
+		n, err := r.Read(p)
+		if n > 0 {
+			_ = c.extend()
+		}
+		return n, err
+	})
+}
+
+type readerFunc func([]byte) (int, error)
+
+func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
 
 // gitCGIEnv is the complete environment of the git-http-backend child. Every
 // variable is listed here; nothing is inherited. Assert this list in a test,
