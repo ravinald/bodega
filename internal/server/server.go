@@ -1037,7 +1037,8 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 	spool := s.spool.stats()
 	version := builder.Version
 	freebsd := s.freeBSDStatusFor(r)
-	if !s.isAdminRequest(r) {
+	admin := s.isAdminRequest(r)
+	if !admin {
 		spool.Dir = ""
 		version = ""
 		// key_error quotes a load failure, and pkgsign's likeliest one names
@@ -1091,7 +1092,14 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			resp.Healthy = false
 			resp.Error = "one or more storage backends failed to respond"
-			row.Error = err.Error()
+			// A local backend's List failure names the directory it could not
+			// walk, a path under storage_path; an s3 backend's names the
+			// bucket, which /api/v1/config keeps admin-only. healthy and backend
+			// stay public: they say which backend is broken without saying
+			// where it keeps its bytes.
+			if admin {
+				row.Error = err.Error()
+			}
 			s.logger.Error("object store probe failed", "backend", ns.Name, "prefix", manifest.AptPoolPrefix, "error", err)
 		} else {
 			row.Present = len(keys) > 0

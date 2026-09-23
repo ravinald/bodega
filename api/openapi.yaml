@@ -1222,6 +1222,11 @@ components:
           description: >-
             The backend's failure for this row. A probe that fails is reported
             here rather than dropping the row, and sets `healthy` to false.
+            Present for a caller in `admin_permit_cidr` alone. The text is the
+            failure verbatim: a `local` backend's names a directory under
+            `storage_path`, and an `s3` backend's names the bucket. Every other
+            caller gets the row with this field absent, and `healthy` and
+            `backend` still say which backend failed.
 
     AptStatus:
       type: object
