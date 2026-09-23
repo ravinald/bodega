@@ -124,7 +124,10 @@ for pair in "server:$E2E_SERVER_HOST" "client:$E2E_CLIENT_HOST" \
 	check_matches "PRE-10-$alias" "this workstation resolves $name" \
 		'^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' "${addr:-unresolved}" \
 		"test/e2e/README.md" "dscacheutil -q host -a name $name"
-	if [ "$alias" = server ]; then E2E_SERVER_ADDR="$addr"; else E2E_CLIENT_ADDR="$addr"; fi
+	case "$alias" in
+	server) E2E_SERVER_ADDR="$addr" ;;
+	client) E2E_CLIENT_ADDR="$addr" ;;
+	esac
 done
 export E2E_SERVER_ADDR E2E_CLIENT_ADDR
 
