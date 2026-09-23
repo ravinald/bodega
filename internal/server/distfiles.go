@@ -13,6 +13,7 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/distinfo"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 // ---- Ports distfiles --------------------------------------------------------
@@ -156,13 +157,17 @@ func (s *Server) handleDistfiles(w http.ResponseWriter, r *http.Request) {
 
 	key := manifest.DistfilesKey(name)
 	if info, _ := store.Head(ctx, key); info != nil && info.Exists && info.Size == entry.Size {
-		s.serveCacheHit(w, r, store, key, func(obj cachedObject) {
-			s.recordCacheServed(r, manifest.TypeDistfiles, name, name, key, obj)
-		})
-		return
+		if s.serveVerifiedDistfile(w, r, store, name, key, entry) {
+			return
+		}
 	}
 
 	upstream := s.cfg.DistfilesUpstream + manifest.DistfilesURLPath(name)
+	// A digest says the bytes are right; it does not say the operator agreed
+	// to contact the host that would supply them.
+	if !s.enforceUpstreamPolicyRecording(w, r, manifest.TypeDistfiles, upstream, upstream, name, key, true) {
+		return
+	}
 	s.logger.Info("distfiles: cache miss, fetching upstream", "name", name, "upstream", upstream)
 	// Identity encoding, because the digest is over the file as distinfo
 	// describes it and a transport that decoded a gzip-encoded response would
@@ -221,6 +226,68 @@ func (s *Server) handleDistfiles(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// serveVerifiedDistfile serves a stored distfile only once the bytes it is
+// about to send have matched entry, and reports whether it wrote a response.
+// False means the caller should treat the request as a miss.
+//
+// A stored object is not evidence of admission. It may have been admitted
+// under an older tree that has since repinned the name to other bytes of the
+// same length, uploaded from a DISTDIR some other tool wrote, or copied in
+// by 'pkg move' or by hand. So the object is spooled while it is hashed, and
+// the spool is what gets served: hashing the object and then streaming it a
+// second time would verify one read and serve another, which is a different
+// object whenever a writer lands in between. The cost is one spool copy per
+// hit; a distfile is fetched once per port build, and serving bytes the
+// client's `make checksum` then refuses is what the digest exists to prevent.
+//
+// A mismatch is recorded and falls through to the miss path, whose verified
+// fetch replaces the object. A spool bound, like a miss, answers 503.
+func (s *Server) serveVerifiedDistfile(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, name, key string, entry distinfo.Entry) bool {
+	res, err := store.GetStream(r.Context(), key)
+	if err != nil || res == nil {
+		// Gone since the Head, or unreadable: a miss fetches and replaces it.
+		if err != nil {
+			s.logger.Warn("distfiles: stored object could not be opened, fetching upstream instead", "name", name, "key", key, "error", err)
+		}
+		return false
+	}
+	obj := cachedObject{store: store, id: streamIdentity(store, res)}
+	spool, err := s.spoolUpstream(&upstreamStream{url: store.Label() + ":" + key, body: res.Body, contentLength: res.ContentLength})
+	_ = res.Body.Close()
+	if err != nil {
+		if reason := spoolDenialReason(err); reason != "" {
+			s.recordSpoolRefusal(r, manifest.TypeDistfiles, name, key, reason, err)
+			w.Header().Set("Retry-After", spoolRetryAfter)
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return true
+		}
+		s.logger.Warn("distfiles: stored object could not be read, fetching upstream instead", "name", name, "key", key, "error", err)
+		return false
+	}
+	defer spool.close()
+	if spool.size != entry.Size || spool.sha256 != entry.SHA256 {
+		s.logger.Error("distfiles: stored bytes disagree with distinfo, fetching upstream to replace them",
+			"name", name, "key", key, "backend", store.Label(), "want_sha256", entry.SHA256, "want_size", entry.Size,
+			"got_sha256", spool.sha256, "got_size", spool.size, "ports", strings.Join(entry.Ports, ","))
+		s.recordDistfileMismatch(r, name, key, entry, spool.sha256, spool.size, store.Label()+":"+key)
+		return false
+	}
+	if _, err := spool.file.Seek(0, io.SeekStart); err != nil {
+		s.logger.Error("distfiles: could not rewind the spooled distfile", "name", name, "error", err)
+		http.Error(w, "storage read failed", http.StatusBadGateway)
+		return true
+	}
+	s.recordCacheServed(r, manifest.TypeDistfiles, name, name, key, obj)
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", spool.size))
+	w.WriteHeader(http.StatusOK)
+	//nolint:gosec // G705: the body is a distfile whose digest matched distinfo; Content-Type is set above.
+	if _, err := io.Copy(w, spool.file); err != nil {
+		s.logger.Warn("distfiles: client read was cut short", "name", name, "error", err)
+	}
+	return true
+}
+
 // refuseDistfile answers a fetch whose bytes disagree with distinfo. Nothing
 // is cached. computed is empty when the refusal came off the declared length
 // alone.
@@ -228,25 +295,33 @@ func (s *Server) refuseDistfile(w http.ResponseWriter, r *http.Request, name, ke
 	s.logger.Error("distfiles: upstream bytes disagree with distinfo, refusing them",
 		"name", name, "upstream", from, "want_sha256", entry.SHA256, "want_size", entry.Size,
 		"got_sha256", computed, "got_size", size, "ports", strings.Join(entry.Ports, ","))
-	if s.auditDB != nil {
-		ctx, cancel := auditContext(r)
-		defer cancel()
-		details, _ := json.Marshal(map[string]string{
-			"expected":      entry.SHA256,
-			"computed":      computed,
-			"expected_size": fmt.Sprintf("%d", entry.Size),
-			"size":          fmt.Sprintf("%d", size),
-			"object_key":    key,
-			"upstream_url":  from,
-			"ports":         strings.Join(entry.Ports, ","),
-		})
-		_ = s.auditDB.Record(ctx, audit.Event{
-			EventType: audit.EventCache,
-			PkgType:   manifest.TypeDistfiles,
-			PkgName:   name,
-			Status:    audit.CacheChecksumMismatch,
-			Details:   string(details),
-		})
-	}
+	s.recordDistfileMismatch(r, name, key, entry, computed, size, from)
 	http.Error(w, "upstream bytes for "+name+" do not match the ports tree's distinfo, so they were not cached or served", http.StatusBadGateway)
+}
+
+// recordDistfileMismatch writes the checksum_mismatch cache row for bytes
+// that disagree with distinfo. from is the upstream URL for a fetch, or
+// "<backend>:<key>" for a stored object.
+func (s *Server) recordDistfileMismatch(r *http.Request, name, key string, entry distinfo.Entry, computed string, size int64, from string) {
+	if s.auditDB == nil {
+		return
+	}
+	ctx, cancel := auditContext(r)
+	defer cancel()
+	details, _ := json.Marshal(map[string]string{
+		"expected":      entry.SHA256,
+		"computed":      computed,
+		"expected_size": fmt.Sprintf("%d", entry.Size),
+		"size":          fmt.Sprintf("%d", size),
+		"object_key":    key,
+		"upstream_url":  from,
+		"ports":         strings.Join(entry.Ports, ","),
+	})
+	_ = s.auditDB.Record(ctx, audit.Event{
+		EventType: audit.EventCache,
+		PkgType:   manifest.TypeDistfiles,
+		PkgName:   name,
+		Status:    audit.CacheChecksumMismatch,
+		Details:   string(details),
+	})
 }

@@ -285,7 +285,12 @@ func objectKeyCases(t *testing.T) []keyCase {
 				"distfiles/pcpustat/1.6.tar.bz2": "distfile-bytes",
 			},
 			upload: func(t *testing.T, bcfg *builder.Config, store *manifest.Store, dst storage.ObjectStore) []string {
-				return artifactPathUpload(builder.DistfilesArtifactPaths(bcfg, store, ""), dst, t)
+				paths, release, err := builder.DistfilesArtifactPaths(bcfg, store, "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer release()
+				return artifactPathUpload(paths, dst, t)
 			},
 			configure: func(t *testing.T, cfg *config.Config) {
 				tree := t.TempDir()
@@ -295,6 +300,9 @@ func objectKeyCases(t *testing.T) []keyCase {
 				writeFile(t, tree, "sysutils/pcpustat/distinfo", fmt.Sprintf(
 					"SHA256 (pcpustat/1.6.tar.bz2) = %x\nSIZE (pcpustat/1.6.tar.bz2) = %d\n", sum, len("distfile-bytes")))
 				cfg.DistfilesPortsTree = tree
+				// A cache hit is spooled while it is hashed, and an unstarted
+				// server never creates the default spool under storage_path.
+				cfg.SpoolDir = t.TempDir()
 			},
 			url: "/distfiles/pcpustat/1.6.tar.bz2",
 		},
@@ -318,17 +326,17 @@ func TestObjectKeysAgreeAcrossUploaderServerInventoryAndDelete(t *testing.T) {
 
 			// 1. The uploader. Everything below compares against what this
 			// wrote; nothing here asserts a literal key.
+			cfg := &config.Config{StorageBackend: "local", ManifestDir: "manifests", AptCodename: "noble"}
+			if c.configure != nil {
+				c.configure(t, cfg)
+			}
 			mem := storage.NewMemory()
-			bcfg := &builder.Config{BuildRoot: buildRoot, ManifestDir: "manifests"}
+			bcfg := &builder.Config{BuildRoot: buildRoot, ManifestDir: "manifests", DistfilesPortsTree: cfg.DistfilesPortsTree}
 			written := c.upload(t, bcfg, store, mem)
 			primary := primaryKeyFor(t, mem, c.body, written)
 
 			// 2. The server handler, reached over the wire the way a client of
 			// this ecosystem reaches it.
-			cfg := &config.Config{StorageBackend: "local", ManifestDir: "manifests", AptCodename: "noble"}
-			if c.configure != nil {
-				c.configure(t, cfg)
-			}
 			stores := storage.NewSingle(mem)
 			ts := httptest.NewServer(server.New(cfg, store, stores, ":0", nil).Handler())
 			t.Cleanup(ts.Close)

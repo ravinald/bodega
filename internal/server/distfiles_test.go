@@ -12,8 +12,11 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/distinfo"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 	"github.com/ravinald/bodega/internal/storage"
 )
 
@@ -189,5 +192,123 @@ func TestDistfilesGuardAdmitsHTTPAndNothingElse(t *testing.T) {
 	}
 	if err := upstreamGuard("http://distcache.FreeBSD.org/ports-distfiles/x"); err == nil {
 		t.Error("upstreamGuard admitted plain http; the relaxation belongs to distfiles alone")
+	}
+}
+
+// A stored object is not evidence of admission. One whose bytes disagree with
+// the current pin, uploaded from a DISTDIR nobody checked or left from an
+// older tree that pinned other bytes of the same length, is never served: the
+// hit falls through to a verified fetch that replaces it.
+func TestDistfilesCacheHitIsHeldToDistinfo(t *testing.T) {
+	const stale = "PCPUSTAT SOURCE BYTES" // same length as distfileBody
+	ts, mem, hits := distfilesFixture(t, distfilesPortsTree(t), distfileBody)
+	mem.Seed(manifest.DistfilesKey("pcpustat/1.6.tar.bz2"), stale)
+
+	code, body := getBody(t, ts.URL+"/distfiles/pcpustat/1.6.tar.bz2")
+	if code != http.StatusOK || body != distfileBody || hits.Load() != 1 {
+		t.Fatalf("GET = %d %q after %d upstream fetches, want the pinned bytes fetched once", code, body, hits.Load())
+	}
+	if got, _ := mem.Get(t.Context(), manifest.DistfilesKey("pcpustat/1.6.tar.bz2")); string(got) != distfileBody {
+		t.Errorf("cache still holds %q, want it replaced by the verified fetch", got)
+	}
+
+	// With an upstream that cannot supply the pinned bytes either, nothing is
+	// served at all rather than the stale object.
+	ts2, mem2, _ := distfilesFixture(t, distfilesPortsTree(t), stale)
+	mem2.Seed(manifest.DistfilesKey("pcpustat/1.6.tar.bz2"), stale)
+	if code, body := getBody(t, ts2.URL+"/distfiles/pcpustat/1.6.tar.bz2"); code == http.StatusOK {
+		t.Errorf("GET = 200 %q, served bytes neither the cache nor the upstream could match to distinfo", body)
+	}
+}
+
+// A tree update that repins a name to other bytes of the same length reaches
+// the cache: the object admitted under the old pin is replaced, not served.
+func TestDistfilesSameSizeRepinReplacesTheCachedObject(t *testing.T) {
+	const v1, v2 = "pcpustat source bytes", "pcpustat SOURCE bytes"
+	tree := func(body string) string {
+		root := t.TempDir()
+		sum := sha256.Sum256([]byte(body))
+		for rel, b := range map[string]string{
+			"Mk/bsd.licenses.db.mk":      "",
+			"sysutils/pcpustat/Makefile": "DIST_SUBDIR=\tpcpustat\n",
+			"sysutils/pcpustat/distinfo": fmt.Sprintf("SHA256 (pcpustat/1.6.tar.bz2) = %x\nSIZE (pcpustat/1.6.tar.bz2) = %d\n", sum, len(body)),
+		} {
+			p := filepath.Join(root, filepath.FromSlash(rel))
+			if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, []byte(b), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return root
+	}
+	ts1, mem, _ := distfilesFixture(t, tree(v1), v1)
+	if code, body := getBody(t, ts1.URL+"/distfiles/pcpustat/1.6.tar.bz2"); code != http.StatusOK || body != v1 {
+		t.Fatalf("first tree: %d %q", code, body)
+	}
+	cached, _ := mem.Get(t.Context(), manifest.DistfilesKey("pcpustat/1.6.tar.bz2"))
+
+	ts2, mem2, hits := distfilesFixture(t, tree(v2), v2)
+	mem2.Seed(manifest.DistfilesKey("pcpustat/1.6.tar.bz2"), string(cached))
+	code, body := getBody(t, ts2.URL+"/distfiles/pcpustat/1.6.tar.bz2")
+	if code != http.StatusOK || body != v2 || hits.Load() != 1 {
+		t.Fatalf("after repin: %d %q after %d fetches, want the newly pinned bytes", code, body, hits.Load())
+	}
+}
+
+// The upstream allow-list applies to this type like any other: a digest says
+// the bytes are right, not that the operator agreed to contact the host.
+func TestDistfilesMissHonorsTheUpstreamAllowList(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		pattern string // "" means the upstream's own host
+		want    int
+		fetches int
+	}{
+		{"matching host", "", http.StatusOK, 1},
+		{"other host", "allowed.example", http.StatusForbidden, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newDiscoveryServer(t)
+			s.distinfo = distinfo.NewTree(distfilesPortsTree(t), 0, nil)
+			var hits atomic.Int32
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				hits.Add(1)
+				_, _ = io.WriteString(w, distfileBody)
+			}))
+			defer up.Close()
+			s.cfg.DistfilesUpstream = up.URL + "/"
+			saved := distfilesGuard
+			distfilesGuard = func(string) error { return nil }
+			defer func() { distfilesGuard = saved }()
+
+			pattern := tc.pattern
+			if pattern == "" {
+				pattern = "127.0.0.1"
+			}
+			if err := s.auditDB.InsertPolicy(t.Context(), audit.PolicyInfo{ID: "p", RegistryType: manifest.TypeDistfiles, RuleKind: policy.KindHost, Pattern: pattern}); err != nil {
+				t.Fatal(err)
+			}
+			ts := httptest.NewServer(s.Handler())
+			defer ts.Close()
+			code, body := getBody(t, ts.URL+"/distfiles/pcpustat/1.6.tar.bz2")
+			if code != tc.want || int(hits.Load()) != tc.fetches {
+				t.Fatalf("GET = %d %q after %d upstream fetches, want %d after %d", code, body, hits.Load(), tc.want, tc.fetches)
+			}
+			if tc.want != http.StatusForbidden {
+				return
+			}
+			rows, err := s.auditDB.Query(t.Context(), audit.Filter{EventType: audit.EventCache})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, row := range rows {
+				if row.Status == audit.CachePolicyViolation && row.PkgType == manifest.TypeDistfiles {
+					return
+				}
+			}
+			t.Errorf("no policy_violation row for the refused distfile: %+v", rows)
+		})
 	}
 }

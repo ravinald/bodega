@@ -331,29 +331,19 @@ func ensurePackagedPypi(bcfg *builder.Config, store *manifest.Store) *builder.Su
 	return builder.MergeSummaries(ss...)
 }
 
+// ensureFetchedDistfiles runs FetchDistfiles whenever an entry is selected,
+// not only when a file is missing. A file already in the DISTDIR may have been
+// written by another tool or admitted under an older tree, and FetchDistfiles
+// is what re-hashes it against the current distinfo, replaces it when it no
+// longer matches, and fails an entry whose port has since become restricted.
+// It reads the ports tree once per call, so it runs once for all entries.
+func ensureFetchedDistfiles(bcfg *builder.Config, store *manifest.Store, entryFilter string) *builder.Summary {
+	return builder.FetchDistfiles(bcfg, store, entryFilter)
+}
+
 // ensureMirroredFreeBSD mirrors any repository whose catalogue is not on disk
 // yet. There is no build or package step: the whole point of the type is that
 // bodega produces none of these bytes, so fetch is the entire cascade.
-// ensureFetchedDistfiles fetches every distfiles entry missing from the
-// DISTDIR. FetchDistfiles reads the whole ports tree's distinfo once per call,
-// so it runs once for all of them rather than once per entry.
-func ensureFetchedDistfiles(bcfg *builder.Config, store *manifest.Store, entryFilter string) *builder.Summary {
-	ctx := context.Background()
-	for _, safeName := range store.ListPackages(manifest.TypeDistfiles) {
-		pm, err := store.GetPackage(ctx, manifest.TypeDistfiles, safeName)
-		if err != nil || pm == nil {
-			continue
-		}
-		if entryFilter != "" && pm.Name != entryFilter {
-			continue
-		}
-		if !builder.CheckDistfilesStage(bcfg, pm.Name).Fetched {
-			return builder.FetchDistfiles(bcfg, store, entryFilter)
-		}
-	}
-	return &builder.Summary{}
-}
-
 func ensureMirroredFreeBSD(bcfg *builder.Config, store *manifest.Store, entryFilter string) *builder.Summary {
 	if len(store.ListPackages(manifest.TypeFreeBSD)) == 0 {
 		fmt.Println("    No freebsd entries in manifest — skipping")

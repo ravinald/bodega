@@ -27,6 +27,7 @@ func newFetchCmd(gf *globalFlags) *cobra.Command {
   npm     Download package tarballs to npm/
   cargo   Download crate tarballs to cargo/
   freebsd Mirror a pkg repository byte for byte to freebsd/
+  distfiles Download ports distfiles matching the ports tree's distinfo to distfiles/
 
 ` + typeOrderSentence("fetched") + `
 

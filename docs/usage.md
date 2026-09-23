@@ -1649,15 +1649,16 @@ Lists configured upstream allow-list rules. Without `--type`, shows every rule g
 
 Adds an allow-list rule. The rule kind is determined by type:
 
-| Type   | Kind         | Pattern example                               |
-| ------ | ------------ | --------------------------------------------- |
-| apt    | host         | `archive.ubuntu.com`                          |
-| git    | org (prefix) | `example.com/example-corp/`                   |
-| pypi   | package      | `django`                                      |
-| npm    | package      | `lodash` or `@example-cloud/*`                |
-| gomod  | prefix       | `example.com/example-corp/`                   |
-| helm   | prefix       | `https://kubernetes.github.io/ingress-nginx/` |
-| binary | prefix       | `https://downloads.example.com/`              |
+| Type      | Kind         | Pattern example                               |
+| --------- | ------------ | --------------------------------------------- |
+| apt       | host         | `archive.ubuntu.com`                          |
+| git       | org (prefix) | `example.com/example-corp/`                   |
+| pypi      | package      | `django`                                      |
+| npm       | package      | `lodash` or `@example-cloud/*`                |
+| gomod     | prefix       | `example.com/example-corp/`                   |
+| helm      | prefix       | `https://kubernetes.github.io/ingress-nginx/` |
+| binary    | prefix       | `https://downloads.example.com/`              |
+| distfiles | host         | `distcache.FreeBSD.org`                       |
 
 ```bash
 bodega policy add pypi django
@@ -3714,9 +3715,11 @@ It needs a ports tree on the server to read `distinfo` from. Keep it at the revi
 | `distfiles_upstream`   | `http://distcache.FreeBSD.org/ports-distfiles/` | Where a miss is fetched from. The distinfo name is appended to it. `http` or `https`, ending in `/`.                                                                                     |
 | `distfiles_root`       | `build_root`                                    | Root of the DISTDIR `build fetch distfiles` writes, at `<distfiles_root>/distfiles/`.                                                                                                    |
 
+`distfiles` is host-scoped in the upstream allow-list, the same as `apt` and `freebsd`: `bodega policy add distfiles distcache.FreeBSD.org` names the host. A digest establishes that the bytes are right, not that the operator agreed to contact the host, so both the route and `build fetch distfiles` check the allow-list before any upstream request. A denied miss answers `403` and records a `policy_violation` row.
+
 The default upstream is plain `http`, as `bsd.port.mk`'s own `MASTER_SITE_BACKUP` is. `distcache.FreeBSD.org` answers `https` with a certificate naming only `pkg.freebsd.org` and `pkgmir.geo.freebsd.org`, so an `https` URL for it fails verification. The transport carries no trust for this type: an attacker on the path can make a fetch fail the digest check and cannot make one pass it. `distfiles_upstream` is the only upstream bodega fetches over plain `http`, and the address check still applies to it: loopback, private and link-local hosts are refused over either scheme.
 
-The server reads the tree in the background at startup, because a cold walk of a full tree takes the better part of a minute (0.8s warm, 43s cold, on the 15.1 test guest). A request arriving before the first read finishes waits up to 5 seconds, then answers `503` with `Retry-After: 30`. The tree is re-read in the background every 10 minutes after that, so a `git pull` under a running server is picked up without a restart.
+The server reads the tree in the background at startup, because a cold walk of a full tree takes the better part of a minute (about 8s warm on the 15.1 test guest, twice what it took before the restriction scan followed includes; 43s cold was measured before that). A request arriving before the first read finishes waits up to 5 seconds, then answers `503` with `Retry-After: 30`. The tree is re-read in the background every 10 minutes after that, so a `git pull` under a running server is picked up without a restart.
 
 #### Two deployments, and only one of them is a wall
 
@@ -3765,7 +3768,7 @@ Each lands at `<distfiles_root>/distfiles/pcpustat/1.6.tar.bz2` after its size a
 DISTDIR=	/net/bodega-host/distfiles
 ```
 
-`bodega build upload distfiles` copies the same files into storage, so the HTTP route serves them without a pull-through.
+`bodega build upload distfiles` copies the same files into storage, so the HTTP route serves them without a pull-through. It re-runs the fetch first, which re-hashes every file already present and replaces one that no longer matches, then holds every file to the current `distinfo` again before any is uploaded. A file that is not listed, is restricted, or does not match fails the command with each one named, and nothing is uploaded; so does an unset `distfiles_ports_tree`. A file in the `DISTDIR` is not evidence of admission: another tool may have written it, or a tree update may have repinned or restricted it since. Each file is hard-linked into a private directory beside the `DISTDIR` and uploaded from there, so a file replaced after the check does not change what is uploaded.
 
 #### Key and layout
 
@@ -3793,9 +3796,17 @@ A port forbids redistribution in three spellings, and bodega reads all three:
 - `LICENSE_PERMS` (or `LICENSE_PERMS_<license>`) lacking `dist-mirror` or `dist-sell`. `Mk/bsd.licenses.mk` is default-deny, and says a port with `dist-mirror` "is not RESTRICTED" and one with `dist-sell` "does not need to set NO_CDROM".
 - `LICENSE` naming a license whose default permissions in `Mk/bsd.licenses.db.mk` lack either, such as the `CC-BY-NC` family.
 
-The second is the common one: on the 15.1 test tree, 2 ports set `RESTRICTED` or `NO_CDROM` literally, and 3,535 of 75,349 distfiles are refused across all three. A restricted distfile is answered `451` before any upstream is contacted, is never cached, and is recorded in the audit trail as a `denied` row with status `distfile_license`, naming the port and the variable. `build fetch distfiles` refuses the entry with the same reason. The client's HTTP fetch moves on to the port's own sites, which is where a restricted file has to come from; a `DISTDIR` deployment has to be given the file by hand.
+The second is the common one: on the 15.1 test tree, 2 ports set `RESTRICTED` or `NO_CDROM` literally, and 4,499 of 75,349 distfiles are refused in all. 632 of those are refused because the scan could not read the port's terms rather than because it read a restriction: 619 behind 98 includes whose paths need `make` (the aspell dictionaries' `${LOCALBASE}/etc/aspell.ver`, `${NODEJS_VERSION}` in the node consumers), and 13 with a variable `LICENSE` (the PyQt and Pandora ports). A restricted distfile is answered `451` before any upstream is contacted, is never cached, and is recorded in the audit trail as a `denied` row with status `distfile_license`, naming the port and the variable. `build fetch distfiles` refuses the entry with the same reason. The client's HTTP fetch moves on to the port's own sites, which is where a restricted file has to come from; a `DISTDIR` deployment has to be given the file by hand.
 
-The scan is lexical, because evaluating a port needs `make` and the whole of `Mk/`. It over-refuses rather than under-refuses: an assignment inside an `.if` counts whether or not the condition holds, a value holding a make variable is treated as withholding, and a slave port that is restricted restricts the names in its master's `distinfo`. `multimedia/ffmpeg4`, which sets `LICENSE_PERMS_NONFREE` for an optional component, loses every distfile to it. A restriction set in a file outside the port's own directory, other than through `MASTERDIR`, is not seen.
+The scan is lexical, because evaluating a port needs `make` and the whole of `Mk/`. Where it cannot read what a port declares, it refuses the port rather than admitting it:
+
+- An assignment inside an `.if` counts whether or not the condition holds. `multimedia/ffmpeg4`, which sets `LICENSE_PERMS_NONFREE` for an optional component, loses every distfile to it.
+- A `LICENSE` or `LICENSE_PERMS` value holding a make variable (`LICENSE=${PORT_LICENSE}`), or a `LICENSE_PERMS_${...}` name, is refused as unreadable.
+- A license `Mk/bsd.licenses.db.mk` does not define is refused unless the port gives it a `LICENSE_PERMS` that grants both permissions.
+- Quoted `.include` lines are followed, from the Makefile and every file it reaches, so a `NO_CDROM` in an included file counts. A path is resolved from `${.CURDIR}`, `${.PARSEDIR}`, `${PORTSDIR}`, the `:H` modifier and any variable the port assigns exactly once, `MASTERDIR` included. A path that does not resolve, leaves the ports tree, or names a missing file under a plain `.include` refuses the port; a missing `.sinclude` or `.-include` does not. Angle-bracket includes and anything under `Mk/` are the framework and are not read.
+- A slave port that is restricted restricts the names in its master's `distinfo`.
+
+None of this is a make evaluator. A restriction set through `USES`, or by a framework file the port does not include by a quoted path, is not seen.
 
 #### What the route answers
 
@@ -3803,14 +3814,15 @@ The scan is lexical, because evaluating a port needs `make` and the whole of `Mk
 | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `200`  | The bytes match `distinfo`, from the cache or from a pull-through                                                                                                                |
 | `400`  | The path is not a legal distinfo name                                                                                                                                            |
+| `403`  | A miss whose upstream host the allow-list does not name                                                                                                                          |
 | `404`  | No `distfiles_ports_tree` is configured, no `distinfo` lists the name, the tree pins it ambiguously, or the upstream does not carry it                                           |
-| `451`  | The port forbids redistributing it                                                                                                                                               |
+| `451`  | The port forbids redistributing it, or its terms cannot be read without `make`                                                                                                   |
 | `502`  | The upstream's bytes disagree with `distinfo`, or the upstream failed. A disagreement is recorded as a `cache` row with status `checksum_mismatch` naming both digests and sizes |
 | `503`  | The ports tree is still being read, or the spool is at its bound                                                                                                                 |
 
 "Ambiguously" means two `distinfo` files pinning one name to different bytes, which happens when a tree is read partway through an update, or a `distinfo` line that does not parse. `graphics/epsonscan2-non-free-plugin` on the 15.1 tree ships a `SIZE` line with no `=`; that one file is refused and the rest of the tree is not.
 
-A cached distfile is served without re-hashing it, as long as its size still matches `distinfo`. A tree update that repins a name to a file of a different size makes the next request a miss; one that repins it to a file of the same size is served the old bytes, and the client's `make checksum` refuses them.
+A cached distfile is hashed on every hit before any of it is sent. The stored object is copied into the spool while it is hashed, and the spool is what the client receives, so the bytes checked are the bytes served. An object that does not match the current `distinfo`, whether admitted under an older tree that repinned the name, uploaded from a `DISTDIR` nobody checked, or copied in by hand, is recorded as a `cache` row with status `checksum_mismatch` naming the backend and key, and the request becomes a miss whose verified fetch replaces it. The cost is one spool copy per hit, bounded by `spool_max_artifact_bytes` and `spool_max_total_bytes` like a miss.
 
 ### APT index generation
 

@@ -116,7 +116,10 @@ func FetchDistfiles(cfg *Config, store *manifest.Store, entryFilter string) *Sum
 		return summary
 	}
 	if err := mkdirAll(d.distfiles); err != nil {
-		cfg.logf("ERROR: %v", err)
+		err = fmt.Errorf("create the DISTDIR %s: %w; nothing was fetched", d.distfiles, err)
+		for _, name := range names {
+			fail(name, err, 0)
+		}
 		return summary
 	}
 
@@ -140,6 +143,12 @@ func FetchDistfiles(cfg *Config, store *manifest.Store, entryFilter string) *Sum
 			}
 		}
 		src := cfg.DistfilesUpstream + manifest.DistfilesURLPath(name)
+		// A digest says the bytes are right; it does not say the operator
+		// agreed to contact the host that would supply them.
+		if err := cfg.EnforcePolicy(ctx, manifest.TypeDistfiles, name, "", src); err != nil {
+			fail(name, fmt.Errorf("%w; allow the host with 'bodega policy add distfiles <host>'", err), time.Since(start))
+			continue
+		}
 		_, _ = fmt.Fprintf(out, "    URL: %s\n    Destination: %s\n", src, dest)
 		if err := fetchDistfile(ctx, src, dest, entry); err != nil {
 			fail(name, err, time.Since(start))
@@ -240,13 +249,30 @@ func fetchDistfile(ctx context.Context, src, dest string, entry distinfo.Entry) 
 }
 
 // DistfilesArtifactPaths returns every distfile present in the DISTDIR, keyed
-// for upload. Uploading them prepopulates what the HTTP route would otherwise
-// fetch on a miss. Each was admitted against distinfo on its way in, and the
-// server still checks distinfo before it serves one.
-func DistfilesArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) []ArtifactPath {
+// for upload, with the release the caller runs once the upload is over.
+// Uploading them prepopulates what the HTTP route would otherwise fetch on a
+// miss.
+//
+// Presence in the DISTDIR is not admission. The directory is one other tools
+// write into, a file may predate a tree update that repinned or restricted it,
+// and an entry may be frozen so FetchDistfiles never re-checked it. So every
+// file is held to the current distinfo here, and any one that is restricted,
+// unlisted or wrong refuses the whole upload with an error naming each, rather
+// than being dropped from the list where nobody would see it go.
+//
+// The check has to cover the bytes PutFile later reads, not the path. Each
+// file is hard-linked into a private directory beside the DISTDIR, and the
+// link is what is hashed and uploaded: fetchDistfile and a client's
+// `make fetch` both replace a file by writing a new one, which leaves the
+// linked inode as it was. A filesystem that refuses the link gets a copy.
+// A writer that rewrites the same inode in place is not stopped by either;
+// the server holds every stored object to distinfo again before serving it.
+func DistfilesArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) ([]ArtifactPath, func(), error) {
+	noRelease := func() {}
 	ctx := context.Background()
 	d := buildDirs(cfg.rootFor(manifest.TypeDistfiles))
-	var paths []ArtifactPath
+	type candidate struct{ name, local, version string }
+	var found []candidate
 	for _, safe := range store.ListPackages(manifest.TypeDistfiles) {
 		pm, err := store.GetPackage(ctx, manifest.TypeDistfiles, safe)
 		if err != nil || pm == nil || manifest.DistfilesValidName(pm.Name) != nil {
@@ -256,19 +282,89 @@ func DistfilesArtifactPaths(cfg *Config, store *manifest.Store, entryFilter stri
 			continue
 		}
 		local := distfilesDestPath(d, pm.Name)
-		if fi, err := os.Stat(local); err != nil || !fi.Mode().IsRegular() {
+		if fi, err := os.Lstat(local); err != nil || !fi.Mode().IsRegular() {
 			continue
 		}
 		version := ""
 		if len(pm.Versions) > 0 {
 			version = pm.Versions[0].Version
 		}
+		found = append(found, candidate{pm.Name, local, version})
+	}
+	if len(found) == 0 {
+		return nil, noRelease, nil
+	}
+	if cfg.DistfilesPortsTree == "" {
+		return nil, noRelease, fmt.Errorf("%d distfile(s) under %s cannot be uploaded: distfiles_ports_tree is not set, so there is no distinfo to hold them to", len(found), d.distfiles)
+	}
+	ix, err := distinfo.Load(cfg.DistfilesPortsTree)
+	if err != nil {
+		return nil, noRelease, fmt.Errorf("distfiles cannot be uploaded without their distinfo: %w", err)
+	}
+	pinDir, err := os.MkdirTemp(filepath.Dir(d.distfiles), ".bodega-distfiles-upload-*")
+	if err != nil {
+		return nil, noRelease, fmt.Errorf("create a directory to pin distfiles for upload beside %s: %w", d.distfiles, err)
+	}
+	release := func() { _ = os.RemoveAll(pinDir) }
+
+	var paths []ArtifactPath
+	var refused []string
+	for _, c := range found {
+		entry, err := ix.Lookup(c.name)
+		if err != nil {
+			refused = append(refused, err.Error())
+			continue
+		}
+		pinned := filepath.Join(pinDir, filepath.FromSlash(c.name))
+		if err := pinDistfile(c.local, pinned); err != nil {
+			refused = append(refused, fmt.Sprintf("%s: %v", c.name, err))
+			continue
+		}
+		if ok, err := distfileMatches(pinned, entry); err != nil || !ok {
+			why := "does not match distinfo"
+			if err != nil {
+				why = err.Error()
+			}
+			refused = append(refused, fmt.Sprintf("%s: %s %s (want %d bytes with SHA256 %s from %s); 'bodega build fetch distfiles' replaces it",
+				c.name, c.local, why, entry.Size, entry.SHA256, strings.Join(entry.Ports, ", ")))
+			continue
+		}
 		paths = append(paths, ArtifactPath{
-			Local:     local,
-			ObjectKey: manifest.DistfilesKey(pm.Name),
-			Package:   pm.Name,
-			Version:   version,
+			Local:     pinned,
+			ObjectKey: manifest.DistfilesKey(c.name),
+			Package:   c.name,
+			Version:   c.version,
 		})
 	}
-	return paths
+	if len(refused) > 0 {
+		release()
+		return nil, noRelease, fmt.Errorf("refusing to upload distfiles the ports tree at %s does not admit, and uploading none:\n  %s",
+			cfg.DistfilesPortsTree, strings.Join(refused, "\n  "))
+	}
+	return paths, release, nil
+}
+
+// pinDistfile makes dst a hard link to src, or a copy where the filesystem
+// refuses the link.
+func pinDistfile(src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		return err
+	}
+	if err := os.Link(src, dst); err == nil {
+		return nil
+	}
+	in, err := os.Open(src) //nolint:gosec // G304: a DISTDIR path built from a validated distinfo name.
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // G304: under a directory this call created.
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
 }

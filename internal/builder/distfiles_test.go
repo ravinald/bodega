@@ -12,7 +12,9 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
 )
 
 const distfileBody = "pcpustat source bytes"
@@ -151,5 +153,112 @@ func TestFetchDistfilesRefusesWithoutAPortsTree(t *testing.T) {
 	}
 	if !strings.Contains(s.Results[0].Err.Error(), "distfiles_ports_tree") {
 		t.Errorf("error %q does not name the setting to fix", s.Results[0].Err)
+	}
+}
+
+// A DISTDIR that cannot be created fails every selected entry, naming the path
+// and the filesystem error, rather than returning an empty summary.
+func TestFetchDistfilesFailsWhenTheDistdirCannotBeCreated(t *testing.T) {
+	cfg, store, hits := distfilesRun(t, distfileBody)
+	if err := os.WriteFile(filepath.Join(cfg.BuildRoot, "distfiles"), []byte("not a directory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := FetchDistfiles(cfg, store, "pcpustat/1.6.tar.bz2")
+	if !s.HasFailures() || s.Total != 1 || hits.Load() != 0 {
+		t.Fatalf("total=%d failures=%d fetches=%d, want the entry failed before any fetch", s.Total, s.Failures, hits.Load())
+	}
+	if msg := s.Results[0].Err.Error(); !strings.Contains(msg, filepath.Join(cfg.BuildRoot, "distfiles")) {
+		t.Errorf("error %q does not name the DISTDIR", msg)
+	}
+}
+
+// The upstream allow-list applies before a fetch: a denied host is never
+// contacted, and an allowed one is.
+func TestFetchDistfilesHonorsTheUpstreamAllowList(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		pattern string
+		denied  bool
+	}{
+		{"matching host", "127.0.0.1", false},
+		{"other host", "allowed.example", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, store, hits := distfilesRun(t, distfileBody)
+			db, err := audit.Open(filepath.Join(t.TempDir(), "audit.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if err := db.InsertPolicy(t.Context(), audit.PolicyInfo{ID: "p", RegistryType: manifest.TypeDistfiles, RuleKind: policy.KindHost, Pattern: tc.pattern}); err != nil {
+				t.Fatal(err)
+			}
+			cfg.policyChecker = policy.NewChecker(db)
+			cfg.AuditDB = db
+			s := FetchDistfiles(cfg, store, "pcpustat/1.6.tar.bz2")
+			if tc.denied {
+				if !s.HasFailures() || hits.Load() != 0 || !policy.IsViolation(s.Results[0].Err) {
+					t.Fatalf("failures=%d fetches=%d err=%v, want a policy refusal before any fetch", s.Failures, hits.Load(), s.Results)
+				}
+				rows, err := db.Query(t.Context(), audit.Filter{EventType: audit.EventFetch})
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, r := range rows {
+					if r.Status == "policy_violation" && r.PkgType == manifest.TypeDistfiles {
+						return
+					}
+				}
+				t.Errorf("no policy_violation row: %+v", rows)
+				return
+			}
+			if s.HasFailures() || hits.Load() != 1 {
+				t.Fatalf("failures=%d fetches=%d, want the allowed host fetched once", s.Failures, hits.Load())
+			}
+		})
+	}
+}
+
+// Enumerating for upload holds every file to the current distinfo, uploads
+// from a pinned copy, and refuses the lot when any one is not admitted.
+func TestDistfilesArtifactPathsAdmitsOnlyWhatDistinfoPins(t *testing.T) {
+	cfg, store, _ := distfilesRun(t, distfileBody)
+	if s := FetchDistfiles(cfg, store, "pcpustat/1.6.tar.bz2"); s.HasFailures() {
+		t.Fatalf("fetch: %+v", s.Results)
+	}
+	paths, release, err := DistfilesArtifactPaths(cfg, store, "pcpustat/1.6.tar.bz2")
+	if err != nil || len(paths) != 1 {
+		t.Fatalf("paths=%v err=%v", paths, err)
+	}
+	if b, _ := os.ReadFile(paths[0].Local); string(b) != distfileBody || paths[0].ObjectKey != "distfiles/pcpustat/1.6.tar.bz2" {
+		t.Errorf("pinned %q at key %q", b, paths[0].ObjectKey)
+	}
+	// Replacing the DISTDIR file after enumeration does not change what is uploaded.
+	dest := filepath.Join(cfg.BuildRoot, "distfiles", "pcpustat", "1.6.tar.bz2")
+	tmp := dest + ".new"
+	if err := os.WriteFile(tmp, []byte("PCPUSTAT SOURCE BYTES"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, dest); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(paths[0].Local); string(b) != distfileBody {
+		t.Errorf("pinned copy changed to %q when the DISTDIR file was replaced", b)
+	}
+	release()
+	if _, err := os.Stat(paths[0].Local); !os.IsNotExist(err) {
+		t.Errorf("release left the pinned copy: %v", err)
+	}
+
+	// The DISTDIR now holds bytes distinfo does not pin: refused, by name.
+	if _, _, err := DistfilesArtifactPaths(cfg, store, ""); err == nil || !strings.Contains(err.Error(), "pcpustat/1.6.tar.bz2") {
+		t.Fatalf("err=%v, want a refusal naming the file", err)
+	}
+	cfg.DistfilesPortsTree = ""
+	if _, _, err := DistfilesArtifactPaths(cfg, store, ""); err == nil || !strings.Contains(err.Error(), "distfiles_ports_tree") {
+		t.Fatalf("err=%v, want a refusal naming the missing setting", err)
+	}
+	if left, _ := filepath.Glob(filepath.Join(cfg.BuildRoot, ".bodega-distfiles-upload-*")); len(left) != 0 {
+		t.Errorf("refusals left pin directories: %v", left)
 	}
 }

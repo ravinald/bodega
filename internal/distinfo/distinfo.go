@@ -199,15 +199,20 @@ func isSHA256(s string) bool {
 //
 // All three are read lexically, at any indentation, so an assignment inside
 // an .if counts. That over-refuses a port that sets one only under a
-// condition, and a value holding a make variable is refused because it cannot
-// be evaluated here. Both are the right direction to be wrong in: evaluating a
-// port needs make and the whole of Mk/, which a Linux server has neither of,
-// and a mirror that under-refuses redistributes something it may not.
+// condition. Evaluating a port needs make and the whole of Mk/, which a Linux
+// server has neither of, so wherever the lexical read cannot say what a port
+// declares, the port is refused rather than admitted: a LICENSE or
+// LICENSE_PERMS value holding a make variable, a license the database does not
+// know that no LICENSE_PERMS describes, and a quoted .include whose path does
+// not resolve. A mirror that under-refuses redistributes something it may
+// not; one that over-refuses sends that client to the port's own sites.
 var (
 	restrictionVar  = regexp.MustCompile(`(?m)^[ \t]*(RESTRICTED|NO_CDROM)[ \t]*[?:+!]?=[ \t]*(.*)$`)
-	licensePermsVar = regexp.MustCompile(`(?m)^[ \t]*(LICENSE_PERMS(?:_[A-Za-z0-9.+-]+)?)[ \t]*[?:+!]?=[ \t]*(.*)$`)
+	licensePermsVar = regexp.MustCompile(`(?m)^[ \t]*(LICENSE_PERMS\S*?)[ \t]*[?:+!]?=[ \t]*(.*)$`)
 	licenseVar      = regexp.MustCompile(`(?m)^[ \t]*LICENSE[ \t]*[?:+!]?=[ \t]*(.*)$`)
 	licenseDBPerms  = regexp.MustCompile(`(?m)^_LICENSE_PERMS_([A-Za-z0-9.+-]+)[ \t]*[?:]?=[ \t]*(.*)$`)
+	licenseDBList   = regexp.MustCompile(`(?m)^_LICENSE_LIST[ \t]*\+?=[ \t]*(.*)$`)
+	varReference    = regexp.MustCompile(`\$\{([A-Za-z_.][A-Za-z0-9_.]*)((?::H)*)\}`)
 )
 
 // masterDirVar matches a slave port naming its master relative to itself,
@@ -228,24 +233,40 @@ func withholdsDistfiles(perms string) bool {
 	return !have["dist-mirror"] || !have["dist-sell"] || have["no-dist-mirror"] || have["no-dist-sell"]
 }
 
-// loadLicenseDB reads the license names whose default permissions withhold
-// redistribution.
-func loadLicenseDB(portsTree string) (map[string]bool, error) {
+// licenseDB is what Mk/bsd.licenses.db.mk says about each license it knows.
+type licenseDB struct {
+	known  map[string]bool
+	denied map[string]bool // default permissions withhold redistribution
+}
+
+// loadLicenseDB reads the license names bsd.licenses.db.mk defines, and which
+// of them withhold redistribution by default. A license is known by being on
+// _LICENSE_LIST; only those whose permissions differ from
+// _LICENSE_PERMS_DEFAULT carry a _LICENSE_PERMS_<lic> line of their own, and
+// a .for loop gives the rest the default.
+func loadLicenseDB(portsTree string) (licenseDB, error) {
 	file := filepath.Join(portsTree, "Mk", "bsd.licenses.db.mk")
 	b, err := os.ReadFile(file) //nolint:gosec // G304: a fixed file under the configured ports tree.
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w; distfiles_ports_tree must name the root of a FreeBSD ports tree", file, err)
+		return licenseDB{}, fmt.Errorf("read %s: %w; distfiles_ports_tree must name the root of a FreeBSD ports tree", file, err)
 	}
-	out := map[string]bool{}
-	for _, m := range licenseDBPerms.FindAllSubmatch(joinContinuations(b), -1) {
+	db := licenseDB{known: map[string]bool{}, denied: map[string]bool{}}
+	b = joinContinuations(b)
+	for _, m := range licenseDBList.FindAllSubmatch(b, -1) {
+		for _, lic := range strings.Fields(string(m[1])) {
+			db.known[lic] = true
+		}
+	}
+	for _, m := range licenseDBPerms.FindAllSubmatch(b, -1) {
 		if string(m[1]) == "DEFAULT" {
 			continue
 		}
+		db.known[string(m[1])] = true
 		if withholdsDistfiles(string(m[2])) {
-			out[string(m[1])] = true
+			db.denied[string(m[1])] = true
 		}
 	}
-	return out, nil
+	return db, nil
 }
 
 func joinContinuations(b []byte) []byte {
@@ -253,24 +274,299 @@ func joinContinuations(b []byte) []byte {
 }
 
 // restriction names why a port's Makefiles forbid redistributing its
-// distfiles, or returns "".
-func restriction(origin string, makefile []byte, deniedLicenses map[string]bool) string {
+// distfiles, or cannot be read to say that they do not, or returns "".
+func restriction(origin string, makefile []byte, db licenseDB) string {
 	if m := restrictionVar.FindSubmatch(makefile); m != nil {
 		return fmt.Sprintf("%s sets %s=%s", origin, m[1], strings.TrimSpace(string(m[2])))
 	}
+	perms := map[string]bool{}
 	for _, m := range licensePermsVar.FindAllSubmatch(makefile, -1) {
+		perms[string(m[1])] = true
 		if withholdsDistfiles(string(m[2])) {
-			return fmt.Sprintf("%s sets %s=%s, which withholds dist-mirror or dist-sell", origin, m[1], strings.TrimSpace(string(m[2])))
+			return fmt.Sprintf("%s sets %s=%s, which withholds dist-mirror or dist-sell, or cannot be read without make", origin, m[1], strings.TrimSpace(string(m[2])))
 		}
 	}
 	for _, m := range licenseVar.FindAllSubmatch(makefile, -1) {
 		for _, lic := range strings.Fields(string(m[1])) {
-			if deniedLicenses[lic] {
+			switch {
+			case strings.Contains(lic, "$"):
+				return fmt.Sprintf("%s sets LICENSE=%s, which cannot be evaluated without make, so its redistribution terms cannot be established", origin, strings.TrimSpace(string(m[1])))
+			case db.denied[lic]:
 				return fmt.Sprintf("%s is licensed %s, whose default permissions in Mk/bsd.licenses.db.mk withhold dist-mirror or dist-sell", origin, lic)
+			case !db.known[lic] && !perms["LICENSE_PERMS_"+lic] && !perms["LICENSE_PERMS"]:
+				return fmt.Sprintf("%s is licensed %s, which Mk/bsd.licenses.db.mk does not define and no LICENSE_PERMS describes, so its redistribution terms cannot be established", origin, lic)
 			}
 		}
 	}
 	return ""
+}
+
+// maxIncludeDepth bounds how far quoted includes are followed. The deepest
+// chain in the tree is a handful of files; anything past this is a cycle
+// the visited set did not catch or a tree built to exhaust the reader.
+const maxIncludeDepth = 16
+
+// maxPathValues bounds how many values one include path may expand to before
+// it is treated as unresolvable.
+const maxPathValues = 16
+
+var (
+	conditionalOpen  = regexp.MustCompile(`^[ \t]*\.[ \t]*(if|ifdef|ifndef|ifmake|ifnmake|for)\b`)
+	conditionalClose = regexp.MustCompile(`^[ \t]*\.[ \t]*(endif|endfor)\b`)
+	assignment       = regexp.MustCompile(`^[ \t]*([A-Za-z_.][A-Za-z0-9_.]*)[ \t]*([?:+!]?)=[ \t]*(.*?)[ \t]*$`)
+	includeDirective = regexp.MustCompile(`^[ \t]*\.[ \t]*(-?include|sinclude|dinclude)[ \t]+"([^"]*)"`)
+)
+
+// stripComments removes make comments: from an unescaped '#' to the end of
+// the line. A trailing comment on `LICENSE= GPLv2 # only` would otherwise be
+// read as a second license named "#".
+func stripComments(b []byte) []byte {
+	lines := strings.Split(string(b), "\n")
+	for i, l := range lines {
+		for j := 0; j < len(l); j++ {
+			if l[j] == '#' && (j == 0 || l[j-1] != '\\') {
+				lines[i] = l[:j]
+				break
+			}
+		}
+	}
+	return []byte(strings.Join(lines, "\n"))
+}
+
+// portText is the text a port's restriction is read from: every Makefile and
+// Makefile.* in its directory, and every file those reach through a quoted
+// .include, with continuations joined and comments removed. unresolved is
+// non-empty when an include could not be followed, and names it.
+//
+// Includes are followed because a port can set NO_CDROM or LICENSE in any file
+// it includes, not only in files named Makefile*, and a slave port's
+// restrictions usually live in the master it includes. Lines are read in
+// order, as make reads them, so an include sees the assignments above it.
+// Conditionals are not evaluated. An assignment inside one adds a possible
+// value rather than replacing the current one, and an include whose path has
+// several possible values reads every one that exists, so a restriction in any
+// branch is seen. Only .CURDIR, .PARSEDIR, PORTSDIR, variables the port
+// assigns and the :H modifier are understood.
+//
+// The port is unresolved, and so refused, when an include path holds anything
+// else, leaves the tree, or names no file where the include is unconditional.
+// A missing file under a conditional include is skipped: make reaches that
+// line only when its guard, usually exists(), holds. Angle-bracket includes
+// and anything under Mk/ are the framework, whose license handling the
+// database read models.
+func portText(tree, dir string, own []string) (text []byte, unresolved string) {
+	if realTree, err := filepath.EvalSymlinks(tree); err == nil {
+		tree = realTree
+	}
+	visited := map[string]bool{}
+	vars := map[string][]string{
+		".CURDIR":   {dir},
+		"PORTSDIR":  {tree},
+		"MASTERDIR": {"${.CURDIR}"},
+		"FILESDIR":  {"${MASTERDIR}/files"},
+	}
+	// definite records variables some unconditional assignment has set, which
+	// is what makes a later ?= a no-op. The two defaults above are ?= in
+	// bsd.port.mk and so are not definite.
+	definite := map[string]bool{".CURDIR": true, "PORTSDIR": true}
+	var buf []byte
+
+	assign := func(name, op, val string, conditional bool) {
+		if op == "!" {
+			val = "$(shell)" // a command's output: never resolvable here
+		}
+		switch {
+		case op == "+":
+			cur := vars[name]
+			if len(cur) == 0 {
+				cur = []string{""}
+			}
+			out := make([]string, 0, len(cur))
+			for _, c := range cur {
+				out = append(out, strings.TrimSpace(c+" "+val))
+			}
+			if conditional {
+				out = append(out, cur...)
+			}
+			vars[name] = capValues(dedupe(out))
+		case op == "?" && definite[name]:
+		case conditional:
+			vars[name] = capValues(dedupe(append(vars[name], val)))
+		default:
+			vars[name] = []string{val}
+			definite[name] = true
+		}
+	}
+
+	var read func(file string, depth int) string
+	read = func(file string, depth int) string {
+		if visited[file] {
+			return ""
+		}
+		visited[file] = true
+		b, err := os.ReadFile(file) //nolint:gosec // G304: resolved and confined under the configured ports tree.
+		if err != nil {
+			return fmt.Sprintf("cannot read %s: %v", file, err)
+		}
+		b = stripComments(joinContinuations(b))
+		buf = append(append(buf, b...), '\n')
+		nesting := 0
+		for _, line := range strings.Split(string(b), "\n") {
+			directive := strings.HasPrefix(strings.TrimLeft(line, " \t"), ".")
+			if !directive && !strings.Contains(line, "=") {
+				continue
+			}
+			switch {
+			case directive && conditionalOpen.MatchString(line):
+				nesting++
+				continue
+			case directive && conditionalClose.MatchString(line):
+				if nesting > 0 {
+					nesting--
+				}
+				continue
+			}
+			if !directive {
+				if m := assignment.FindStringSubmatch(line); m != nil {
+					assign(m[1], m[2], m[3], nesting > 0)
+				}
+				continue
+			}
+			m := includeDirective.FindStringSubmatch(line)
+			if m == nil {
+				continue
+			}
+			optional := m[1] != "include" || nesting > 0
+			raw := m[2]
+			if depth >= maxIncludeDepth {
+				return fmt.Sprintf("%s includes %q past a depth of %d", file, raw, maxIncludeDepth)
+			}
+			scope := make(map[string][]string, len(vars)+1)
+			for k, v := range vars {
+				scope[k] = v
+			}
+			scope[".PARSEDIR"] = []string{filepath.Dir(file)}
+			paths, ok := expandMakePath(raw, scope, 0)
+			if !ok {
+				return fmt.Sprintf("%s includes %q, which cannot be resolved without make", file, raw)
+			}
+			var found []string
+			for _, p := range paths {
+				candidates := []string{p}
+				if !filepath.IsAbs(p) {
+					candidates = []string{filepath.Join(filepath.Dir(file), p), filepath.Join(dir, p)}
+				}
+				for _, c := range candidates {
+					c = filepath.Clean(c)
+					if fi, err := os.Stat(c); err == nil && fi.Mode().IsRegular() {
+						found = append(found, c)
+						break
+					}
+				}
+			}
+			if len(found) == 0 {
+				if optional {
+					continue
+				}
+				return fmt.Sprintf("%s includes %q, which does not exist", file, raw)
+			}
+			for _, f := range found {
+				real, err := filepath.EvalSymlinks(f)
+				if err != nil {
+					return fmt.Sprintf("%s includes %q: %v", file, raw, err)
+				}
+				rel, err := filepath.Rel(tree, real)
+				if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+					return fmt.Sprintf("%s includes %q, which leaves the ports tree", file, raw)
+				}
+				if rel == "Mk" || strings.HasPrefix(rel, "Mk"+string(filepath.Separator)) {
+					continue
+				}
+				if why := read(real, depth+1); why != "" {
+					return why
+				}
+			}
+		}
+		return ""
+	}
+
+	for _, f := range own {
+		real := f
+		if r, err := filepath.EvalSymlinks(f); err == nil {
+			real = r
+		}
+		if why := read(real, 0); why != "" {
+			return buf, why
+		}
+	}
+	return buf, ""
+}
+
+// capValues replaces a value set past maxPathValues with one value no path
+// can resolve. Each conditional += doubles a set, and ports append to
+// CONFIGURE_ARGS under dozens of conditionals; nothing includes a path built
+// from one, and a path that did would be refused rather than enumerated.
+func capValues(vals []string) []string {
+	if len(vals) > maxPathValues {
+		return []string{"$(too many values)"}
+	}
+	return vals
+}
+
+func dedupe(vals []string) []string {
+	seen := map[string]bool{}
+	out := vals[:0]
+	for _, v := range vals {
+		if !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// expandMakePath substitutes ${VAR} and ${VAR:H} references in an include
+// path, returning every value the path can take. It reports false for a
+// reference to a variable with no value here, for any "$" left that is not
+// one of those two forms, and for a path with more than maxPathValues values.
+func expandMakePath(s string, vars map[string][]string, depth int) ([]string, bool) {
+	if depth > 8 {
+		return nil, false
+	}
+	loc := varReference.FindStringSubmatchIndex(s)
+	if loc == nil {
+		if strings.Contains(s, "$") {
+			return nil, false
+		}
+		return []string{s}, true
+	}
+	name := s[loc[2]:loc[3]]
+	heads := strings.Count(s[loc[4]:loc[5]], ":H")
+	vals, ok := vars[name]
+	if !ok || len(vals) == 0 {
+		return nil, false
+	}
+	var out []string
+	for _, v := range vals {
+		expanded, ok := expandMakePath(v, vars, depth+1)
+		if !ok {
+			return nil, false
+		}
+		for _, e := range expanded {
+			for range heads {
+				e = path.Dir(filepath.ToSlash(e))
+			}
+			rest, ok := expandMakePath(s[:loc[0]]+filepath.FromSlash(e)+s[loc[1]:], vars, depth+1)
+			if !ok {
+				return nil, false
+			}
+			out = append(out, rest...)
+			if len(out) > maxPathValues {
+				return nil, false
+			}
+		}
+	}
+	return dedupe(out), true
 }
 
 // Load walks <portsTree>/<category>/<port>/distinfo* and returns the index.
@@ -281,7 +577,7 @@ func Load(portsTree string) (*Index, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read ports tree %s: %w", portsTree, err)
 	}
-	denied, err := loadLicenseDB(portsTree)
+	db, err := loadLicenseDB(portsTree)
 	if err != nil {
 		return nil, err
 	}
@@ -306,7 +602,7 @@ func Load(portsTree string) (*Index, error) {
 			if err != nil {
 				return nil, fmt.Errorf("read port %s: %w", origin, err)
 			}
-			var makefiles []byte
+			var own []string
 			for _, f := range files {
 				n := f.Name()
 				switch {
@@ -316,14 +612,15 @@ func Load(portsTree string) (*Index, error) {
 						return nil, err
 					}
 				case n == "Makefile" || strings.HasPrefix(n, "Makefile."):
-					b, err := os.ReadFile(filepath.Join(dir, n)) //nolint:gosec // G304: a Makefile under the configured ports tree.
-					if err != nil {
-						return nil, fmt.Errorf("read %s/%s: %w", origin, n, err)
-					}
-					makefiles = append(append(makefiles, joinContinuations(b)...), '\n')
+					own = append(own, filepath.Join(dir, n))
 				}
 			}
-			if why := restriction(origin, makefiles, denied); why != "" {
+			makefiles, unresolved := portText(portsTree, dir, own)
+			why := restriction(origin, makefiles, db)
+			if why == "" && unresolved != "" {
+				why = fmt.Sprintf("%s: %s, so its redistribution terms cannot be established", origin, unresolved)
+			}
+			if why != "" {
 				restricted[origin] = why
 				// A slave reads its master's distinfo, so its restriction
 				// has to reach the names filed under the master.
@@ -341,7 +638,15 @@ func Load(portsTree string) (*Index, error) {
 	if ix.Len() == 0 {
 		return nil, fmt.Errorf("%s holds no <category>/<port>/distinfo; distfiles_ports_tree must name the root of a FreeBSD ports tree", portsTree)
 	}
-	for origin, why := range restricted {
+	// Sorted, so a distfile two restricted ports share names the same one on
+	// every read.
+	origins := make([]string, 0, len(restricted))
+	for origin := range restricted {
+		origins = append(origins, origin)
+	}
+	sort.Strings(origins)
+	for _, origin := range origins {
+		why := restricted[origin]
 		for _, name := range byPort[origin] {
 			if e, ok := ix.entries[name]; ok && e.Restricted == "" {
 				e.Restricted = why

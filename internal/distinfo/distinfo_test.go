@@ -235,3 +235,61 @@ func TestTreeReportsAFailedFirstRead(t *testing.T) {
 		t.Errorf("Lookup: %v, want ErrNotReady naming the path", err)
 	}
 }
+
+// Where the lexical read cannot establish what a port declares, it refuses:
+// an unresolved LICENSE, a restriction in a file the Makefile includes, and an
+// include it cannot follow all fail closed. What it can read still admits.
+func TestRestrictionFailsClosedOnWhatItCannotRead(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		files   map[string]string
+		refused string // substring of the reason; "" means admitted
+	}{
+		{"variable license", map[string]string{"Makefile": "PORT_LICENSE=\tCC-BY-NC-4.0\nLICENSE=\t${PORT_LICENSE}\n"}, "cannot be evaluated"},
+		{"variable perms name", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\nLICENSE_PERMS_${LICENSE}=\tdist-mirror pkg-mirror\n"}, "LICENSE_PERMS_${LICENSE}"},
+		{"unknown license", map[string]string{"Makefile": "LICENSE=\tVENDOR\n"}, "does not define"},
+		{"unknown license with full perms", map[string]string{"Makefile": "LICENSE=\tVENDOR\nLICENSE_PERMS_VENDOR=\tdist-mirror dist-sell pkg-mirror pkg-sell\n"}, ""},
+		{"relative include", map[string]string{"Makefile": ".include \"redistribution.mk\"\n", "redistribution.mk": "NO_CDROM=\tNo resale\n"}, "NO_CDROM"},
+		{"curdir include", map[string]string{"Makefile": ".include \"${.CURDIR}/files/extra.mk\"\n", "files/extra.mk": "RESTRICTED=\tno\n"}, "RESTRICTED"},
+		{"sibling port include", map[string]string{"Makefile": ".include \"${.CURDIR:H:H}/lang/master/Makefile.common\"\n"}, "RESTRICTED"},
+		{"unresolvable include", map[string]string{"Makefile": ".include \"${WHERE}/x.mk\"\n"}, "cannot be resolved"},
+		{"missing include", map[string]string{"Makefile": ".include \"${.CURDIR}/absent.mk\"\n"}, "does not exist"},
+		{"include leaving the tree", map[string]string{"Makefile": ".include \"${PORTSDIR}/../outside.mk\"\n"}, "leaves the ports tree"},
+		{"optional missing include", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.sinclude \"${.CURDIR}/absent.mk\"\n.-include \"absent.mk\"\n"}, ""},
+		{"framework include", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.include \"${PORTSDIR}/Mk/bsd.port.mk\"\n.include <bsd.port.mk>\n"}, ""},
+		{"include cycle", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.include \"a.mk\"\n", "a.mk": ".include \"Makefile\"\n"}, ""},
+		{"trailing comment", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE # only\n"}, ""},
+		{"commented-out restriction", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n#RESTRICTED=\tonce\n"}, ""},
+		{"either branch's master", map[string]string{"Makefile": ".if ${FLAVOR} == a\nMASTERDIR=\t${.CURDIR}/../../lang/master\n.else\nMASTERDIR=\t${.CURDIR}/../../lang/other\n.endif\n.include \"${MASTERDIR}/Makefile.common\"\n"}, "RESTRICTED"},
+		{"master's ?= yields to the slave", map[string]string{"Makefile": "MASTERDIR=\t${.CURDIR}/../../lang/master\nMASTERDIR?=\t${.CURDIR}/../../lang/nowhere\n.include \"${MASTERDIR}/Makefile.common\"\n"}, "RESTRICTED"},
+		{"reassigned between includes", map[string]string{"Makefile": "D=\t${.CURDIR}/../../lang/other\n.include \"${D}/Makefile.common\"\nD=\t${.CURDIR}/../../lang/master\n.include \"${D}/Makefile.common\"\n"}, "RESTRICTED"},
+		{"guarded missing include", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.if exists(${.CURDIR}/opt.mk)\n.include \"${.CURDIR}/opt.mk\"\n.endif\n"}, ""},
+		{"shell-assigned path", map[string]string{"Makefile": "V!=\techo x\n.include \"${V}.mk\"\n"}, "cannot be resolved"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := portsTree(t)
+			write(t, root, "lang/master/Makefile.common", "RESTRICTED=\tshared terms\n")
+			write(t, root, "lang/other/Makefile.common", "LICENSE=\tBSD2CLAUSE\n")
+			write(t, root, "Mk/bsd.port.mk", ".include \"${UNDEFINED}/whatever.mk\"\nRESTRICTED=\tframework text is not the port's\n")
+			write(t, filepath.Dir(root), "outside.mk", "")
+			for rel, body := range tc.files {
+				write(t, root, "misc/probe/"+rel, body)
+			}
+			write(t, root, "misc/probe/distinfo", distinfoFor("probe.tar.gz", sumA, 10))
+			ix, err := Load(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			e, err := ix.Lookup("probe.tar.gz")
+			if tc.refused == "" {
+				if err != nil {
+					t.Fatalf("refused a port whose terms are readable: %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrRestricted) || !strings.Contains(e.Restricted, tc.refused) {
+				t.Fatalf("got %q, %v; want ErrRestricted naming %q", e.Restricted, err, tc.refused)
+			}
+		})
+	}
+}

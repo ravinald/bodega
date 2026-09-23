@@ -493,7 +493,7 @@ func (p *Placer) UploadType(ctx context.Context, bcfg *builder.Config, typ strin
 // upload, per version, with the release the caller runs once the upload is
 // over. entryFilter limits the walk to one package.
 //
-// The release and the error are freebsd's. Its paths are not a plain walk of
+// The release and the error are freebsd's and distfiles'. freebsd's paths are not a plain walk of
 // the tree: the catalogue archives are pinned first, so that the upload writes
 // the generation it enumerated rather than whichever one a concurrent mirror
 // has published by the time PutFile opens the file. Every other type reads
@@ -520,7 +520,7 @@ func ArtifactPaths(cfg *builder.Config, store *manifest.Store, typ, entryFilter 
 	case manifest.TypeFreeBSD:
 		return builder.FreeBSDArtifactPaths(cfg, store, entryFilter)
 	case manifest.TypeDistfiles:
-		return builder.DistfilesArtifactPaths(cfg, store, entryFilter), noRelease, nil
+		return builder.DistfilesArtifactPaths(cfg, store, entryFilter)
 	}
 	return nil, noRelease, nil
 }

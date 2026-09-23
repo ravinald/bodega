@@ -94,6 +94,10 @@ func TestMatchers(t *testing.T) {
 		// binary (prefix)
 		{"binary prefix match", []Rule{rule("binary", "https://downloads.example.com/")}, "binary", "https://downloads.example.com/widget-tool/1.7.0/widget-tool_1.7.0_darwin_amd64.zip", true},
 		{"binary prefix wrong host", []Rule{rule("binary", "https://downloads.example.com/")}, "binary", "https://mirror.example.com/widget-tool.zip", false},
+
+		// distfiles (host)
+		{"distfiles host match", []Rule{rule("distfiles", "distcache.FreeBSD.org")}, "distfiles", "http://distcache.freebsd.org/ports-distfiles/pcpustat/1.6.tar.bz2", true},
+		{"distfiles host mismatch", []Rule{rule("distfiles", "distcache.FreeBSD.org")}, "distfiles", "https://mirror.example.com/ports-distfiles/pcpustat/1.6.tar.bz2", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -136,6 +140,20 @@ func TestRuleKindForType(t *testing.T) {
 	for typ, want := range cases {
 		if got := RuleKindForType(typ); got != want {
 			t.Errorf("RuleKindForType(%q): want %q got %q", typ, want, got)
+		}
+	}
+}
+
+// ValidateType admits every manifest type, so a type with no rule kind is one
+// `bodega policy add` accepts by name and then refuses, and whose fetchers the
+// allow-list can never reach.
+func TestEveryTypeHasARuleKind(t *testing.T) {
+	for _, typ := range manifest.AllTypes {
+		if RuleKindForType(typ) == "" {
+			t.Errorf("%s has no rule kind: register it in RuleKindForType, matchRule and SuggestPattern", typ)
+		}
+		if SuggestPattern(typ, "host.example", "/a/b", "name") == "" {
+			t.Errorf("%s has no suggested pattern", typ)
 		}
 	}
 }
