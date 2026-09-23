@@ -1195,7 +1195,7 @@ components:
       type: object
       description: >-
         One storage probe row, reported against the backend that answered it.
-      required: [type, name, key, present, backend]
+      required: [type, name, key, present, backend, healthy, error]
       properties:
         type:
           type: string
@@ -1217,16 +1217,22 @@ components:
             The configured backend name this row reports on. Always present;
             `default` is the backend described by the global storage_backend /
             storage_path / bucket / region keys.
+        healthy:
+          type: boolean
+          description: >-
+            Whether this backend answered its probe. False on a failure, true
+            on a successful listing including an empty one, so `present:
+            false` beside `healthy: true` is a backend holding nothing, not a
+            broken one. Every caller receives it, and it is how a caller
+            outside `admin_permit_cidr` tells which backend failed.
         error:
           type: string
           description: >-
-            The backend's failure for this row. A probe that fails is reported
-            here rather than dropping the row, and sets `healthy` to false.
-            Present for a caller in `admin_permit_cidr` alone. The text is the
-            failure verbatim: a `local` backend's names a directory under
-            `storage_path`, and an `s3` backend's names the bucket. Every other
-            caller gets the row with this field absent, and `healthy` and
-            `backend` still say which backend failed.
+            The backend's failure for this row, verbatim, for a caller in
+            `admin_permit_cidr`. A `local` backend's names a directory under
+            `storage_path`, and an `s3` backend's names the bucket, so every
+            other caller receives an empty string here. Always present; empty
+            on a healthy row for every caller.
 
     AptStatus:
       type: object

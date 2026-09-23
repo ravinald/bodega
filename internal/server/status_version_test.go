@@ -74,14 +74,16 @@ func TestStatusVersionIsAdminOnly(t *testing.T) {
 // A local backend that cannot walk its pool reports the directory it failed
 // on, which is a path under storage_path: the datum spool.Dir is withheld for.
 // The failure is planted on a real Local rather than a stub, so the text under
-// test is the one an operator's server would put on the wire. healthy and
-// backend stay public on both sides, because a monitor reading this endpoint
-// anonymously acts on which backend is broken.
+// test is the one an operator's server would put on the wire. A second backend
+// holds an empty, readable pool, because the monitor reading this endpoint
+// anonymously has to tell the broken backend from one that merely holds
+// nothing, and without a per-row healthy the two rows read the same. Rows are
+// decoded as raw JSON: a struct cannot tell an absent error from an empty one.
 func TestStatusBackendErrorIsAdminOnly(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root walks a mode-0 directory, so the probe would not fail")
 	}
-	dir := t.TempDir()
+	dir, emptyRoot := t.TempDir(), t.TempDir()
 	pool := filepath.Join(dir, filepath.FromSlash(manifest.AptPoolPrefix))
 	if err := os.MkdirAll(pool, 0o755); err != nil {
 		t.Fatalf("create the pool: %v", err)
@@ -94,54 +96,89 @@ func TestStatusBackendErrorIsAdminOnly(t *testing.T) {
 	cfg := &config.Config{
 		AptCodename:     "noble",
 		LogDir:          dir,
+		StorageBackend:  "local",
 		StoragePath:     dir,
+		StorageBackends: map[string]config.StorageSpec{"empty": {Driver: "local", Path: emptyRoot}},
 		AuditDB:         filepath.Join(dir, "audit.db"),
 		AdminPermitCIDR: []string{"127.0.0.0/8"},
 	}
-	s := newServer(cfg, manifest.NewLocalStore(t.TempDir()), storage.NewSingle(storage.NewLocal(dir)),
+	stores, err := storage.NewResolver(t.Context(), cfg)
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+	s := newServer(cfg, manifest.NewLocalStore(t.TempDir()), stores,
 		"127.0.0.1:0", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if s.auditDB != nil {
 		t.Cleanup(func() { _ = s.auditDB.Close() })
 	}
 
-	probe := func(remote string) (bool, backendEntryStatus) {
+	type row struct {
+		healthy bool
+		err     string
+	}
+	probe := func(who, remote string) (string, map[string]row) {
 		t.Helper()
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
 		req.RemoteAddr = remote
 		rec := httptest.NewRecorder()
 		s.Handler().ServeHTTP(rec, req)
+		body := rec.Body.String()
 		var got struct {
-			Healthy        bool                 `json:"healthy"`
-			BackendEntries []backendEntryStatus `json:"backend_entries"`
+			Healthy        bool                         `json:"healthy"`
+			BackendEntries []map[string]json.RawMessage `json:"backend_entries"`
 		}
 		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-			t.Fatalf("decode %q: %v", rec.Body.String(), err)
+			t.Fatalf("%s: decode %q: %v", who, body, err)
 		}
-		if len(got.BackendEntries) != 1 {
-			t.Fatalf("backend_entries = %+v, want one probe row", got.BackendEntries)
+		if got.Healthy {
+			t.Errorf("%s: healthy = true with a backend that failed its probe", who)
 		}
-		return got.Healthy, got.BackendEntries[0]
+		rows := make(map[string]row, len(got.BackendEntries))
+		for _, raw := range got.BackendEntries {
+			var name string
+			var r row
+			for key, dst := range map[string]any{"backend": &name, "healthy": &r.healthy, "error": &r.err} {
+				v, ok := raw[key]
+				if !ok {
+					t.Errorf("%s: row %v has no %q key; a monitor reads a missing key as a server that predates it", who, raw, key)
+					continue
+				}
+				if err := json.Unmarshal(v, dst); err != nil {
+					t.Errorf("%s: row key %q = %s: %v", who, key, v, err)
+				}
+			}
+			rows[name] = r
+		}
+		if len(rows) != 2 {
+			t.Fatalf("%s: backend_entries = %s, want one row each for %q and \"empty\"", who, body, storage.DefaultName)
+		}
+		return body, rows
 	}
 
-	adminHealthy, admin := probe("127.0.0.1:40000")
-	if !strings.Contains(admin.Error, pool) {
-		t.Errorf("error = %q for an admin caller, want the failure naming %s", admin.Error, pool)
+	_, admin := probe("admin", "127.0.0.1:40000")
+	if !strings.Contains(admin[storage.DefaultName].err, pool) {
+		t.Errorf("admin: error = %q, want the failure naming %s", admin[storage.DefaultName].err, pool)
 	}
 
-	anonHealthy, anon := probe("203.0.113.9:40000")
-	if anon.Error != "" {
-		t.Errorf("error = %q for a caller outside admin_permit_cidr, which hands anyone who can reach the listener a path under storage_path", anon.Error)
+	anonBody, anon := probe("anonymous", "203.0.113.9:40000")
+	if anon[storage.DefaultName].err != "" {
+		t.Errorf("anonymous: error = %q, which hands anyone who can reach the listener a path under storage_path", anon[storage.DefaultName].err)
 	}
-	for _, side := range []struct {
-		who     string
-		healthy bool
-		row     backendEntryStatus
-	}{{"admin", adminHealthy, admin}, {"anonymous", anonHealthy, anon}} {
-		if side.healthy {
-			t.Errorf("%s: healthy = true with a backend that failed its probe", side.who)
+	for _, root := range []string{dir, emptyRoot} {
+		if strings.Contains(anonBody, root) {
+			t.Errorf("anonymous: body names storage root %s: %s", root, anonBody)
 		}
-		if side.row.Backend != storage.DefaultName {
-			t.Errorf("%s: backend = %q, want %q: the gate is on the error text, not on which backend failed", side.who, side.row.Backend, storage.DefaultName)
+	}
+
+	for who, rows := range map[string]map[string]row{"admin": admin, "anonymous": anon} {
+		if rows[storage.DefaultName].healthy {
+			t.Errorf("%s: %s row healthy = true, but its pool could not be walked", who, storage.DefaultName)
+		}
+		if !rows["empty"].healthy {
+			t.Errorf("%s: empty row healthy = false, but an empty pool is a probe that answered", who)
+		}
+		if rows["empty"].err != "" {
+			t.Errorf("%s: empty row error = %q, want \"\" for a probe that succeeded", who, rows["empty"].err)
 		}
 	}
 }
