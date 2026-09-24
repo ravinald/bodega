@@ -359,22 +359,28 @@ func TestFreeBSDMirroredIsNeverRegenerated(t *testing.T) {
 
 // R5, the other half: an entry claiming both is refused rather than resolved.
 // Guessing either way publishes a repository whose signature contradicts the
-// one its client was configured for.
+// one its client was configured for. The refusal quotes the url, and a url
+// can carry upstream credentials, so it reaches the log and never the body
+// of a route that takes no token.
 func TestFreeBSDEntryClaimingBothIsRefused(t *testing.T) {
 	s := hostedServer(t)
 	addVersion(t, s, manifest.TypeFreeBSD, "muddle", manifest.VersionEntry{
 		Version:   freeBSDABI,
-		URL:       "https://pkg.freebsd.org/" + freeBSDABI + "/latest",
+		URL:       "https://audit-user:audit-secret@private-upstream.example/" + freeBSDABI + "/latest",
 		Generated: true,
 	})
 
+	logged := captureErrorLog(s)
 	status, body := getStatusAndBody(t, s, freeBSDURL("muddle", manifest.FreeBSDCatalogFile))
 	if status != http.StatusInternalServerError {
 		t.Fatalf("GET a contradictory entry's catalogue = %d, want 500: %s", status, body)
 	}
-	for _, want := range []string{"generated", "url"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("the refusal does not name %q, so the operator has to guess which field to change: %s", want, body)
+	if leaked := withheldFrom(body, "audit-secret", "audit-user", "private-upstream.example"); leaked != "" {
+		t.Errorf("the anonymous 500 carries %q from the manifest url: %s", leaked, body)
+	}
+	for _, want := range []string{"generated", "private-upstream.example"} {
+		if !strings.Contains(logged(), want) {
+			t.Errorf("the logged refusal does not name %q, so the operator has to guess which field to change: %s", want, logged())
 		}
 	}
 }
