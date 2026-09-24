@@ -3,14 +3,19 @@ package server
 import (
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
 // TestReadAPIAnswersEveryKnownType pins the read API's four type surfaces to
@@ -452,6 +457,264 @@ func TestBinaryDownloadLinksSurviveManifestEdits(t *testing.T) {
 					t.Errorf("after the edit, published link %s = %d %q", link, code, got)
 				}
 			}
+		})
+	}
+}
+
+// pageClientURL runs the embedded page's own getClientUrl on one entry of a
+// captured read-API response, which is the link the web UI offers for it.
+func pageClientURL(t *testing.T, typ string, entry map[string]any) string {
+	t.Helper()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatal("node not on PATH; the page's own JavaScript went unexercised on a CI runner")
+		}
+		t.Skip("node not on PATH; the page's own JavaScript cannot be executed here")
+	}
+	src := webIndex(t)
+	start, end := strings.Index(src, "<script>"), strings.LastIndex(src, "</script>")
+	if start < 0 || end < 0 {
+		t.Fatal("web/index.html: no <script> block found")
+	}
+	script := strings.Replace(src[start+len("<script>"):end], "\ninit();\n", "\n", 1)
+	probe := "\nconsole.log(getClientUrl(process.env.PROBE_TYPE, JSON.parse(process.env.PROBE_ENTRY)));\n"
+	path := filepath.Join(t.TempDir(), "client-url.cjs")
+	if err := os.WriteFile(path, []byte(domStub+script+probe), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entryJSON, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(node, path)
+	cmd.Env = append(os.Environ(), "PROBE_TYPE="+typ, "PROBE_ENTRY="+string(entryJSON))
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("run getClientUrl: %v", err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// A url whose raw last segment ends in something shaped like an alias tag is
+// still the raw authority, so the filename published in its place is built
+// from the public url. The entry is fetched for real from an upstream that
+// demands exactly this username and password, read from outside every admin
+// range with no token, linked by the page's own JavaScript, and downloaded.
+func TestBinaryAliasCarriesNoUserinfoWhateverTheURLEndsIn(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, password, ok := r.BasicAuth()
+		if !ok || user != "audit-user" || password != "audit-secret" {
+			http.Error(w, "bad credentials", http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte("AUTHENTICATED-ELF"))
+	}))
+	defer upstream.Close()
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	for _, suffix := range []string{"#~0123456789abcdef", "#~" + strings.Repeat("0123456789abcdef", 2), "?x=~" + strings.Repeat("0123456789abcdef", 2)} {
+		t.Run(suffix, func(t *testing.T) {
+			s := hostedServer(t)
+			raw := "http://audit-user:audit-secret@" + host + suffix
+			pm := &manifest.PackageManifest{Type: manifest.TypeBinary, Name: "tool", Versions: []manifest.VersionEntry{{Version: "1.0.0", URL: raw}}}
+			if err := s.store.SavePackage(t.Context(), pm); err != nil {
+				t.Fatal(err)
+			}
+			cfg := &builder.Config{BuildRoot: t.TempDir(), BuildEnvInfo: &manifest.BuildEnv{Platform: "linux/arm64"}}
+			if sum := builder.FetchBinaries(cfg, s.store, "tool"); sum.Total != 1 || sum.Failures != 0 {
+				t.Fatalf("fetch: %+v", sum)
+			}
+			for _, p := range builder.BinaryArtifactPaths(cfg, s.store, "tool") {
+				data, err := os.ReadFile(p.Local)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := s.typeStore(manifest.TypeBinary).Put(t.Context(), p.ObjectKey, data); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			var entry map[string]any
+			for _, route := range []string{"/api/v1/packages", "/api/v1/packages/binary", "/api/v1/packages/binary/tool", "/api/v1/packages/binary/tool/1.0.0"} {
+				req := httptest.NewRequest(http.MethodGet, route, nil)
+				req.RemoteAddr = "203.0.113.9:40000"
+				rr := httptest.NewRecorder()
+				s.Handler().ServeHTTP(rr, req)
+				body := rr.Body.String()
+				if rr.Code != http.StatusOK {
+					t.Fatalf("%s: %d %s", route, rr.Code, body)
+				}
+				if strings.Contains(body, "audit-secret") {
+					t.Errorf("%s publishes the password: %s", route, body)
+				}
+				if strings.Contains(body, "audit-user") {
+					t.Errorf("%s publishes the username: %s", route, body)
+				}
+				if route == "/api/v1/packages/binary/tool/1.0.0" {
+					entry = decodeJSON(t, body)["versions"].([]any)[0].(map[string]any)
+					entry["name"], entry["version"] = "tool", "1.0.0"
+				}
+			}
+
+			link := pageClientURL(t, manifest.TypeBinary, entry)
+			if strings.Contains(link, "audit-user") || strings.Contains(link, "audit-secret") {
+				t.Fatalf("the web UI links to %s", link)
+			}
+			_, path, ok := strings.Cut(link, "/binaries/")
+			if !ok {
+				t.Fatalf("the web UI links to %s, not a binary download", link)
+			}
+			if code, got := getStatusAndBody(t, s, "/binaries/"+path); code != http.StatusOK || got != "AUTHENTICATED-ELF" {
+				t.Errorf("GET /binaries/%s = %d %q, want the fetched bytes", path, code, got)
+			}
+			if stored, err := s.store.GetPackage(t.Context(), manifest.TypeBinary, "tool"); err != nil || stored.Versions[0].URL != raw {
+				t.Fatalf("the stored url changed: %v", err)
+			}
+		})
+	}
+}
+
+// A saved alias names one entry for as long as the server can authenticate it
+// and nothing afterwards. The original is fetched for real from an upstream
+// demanding its credentials, linked by the page's own JavaScript, and then
+// copied: a second entry of the same version stores different bytes under the
+// alias as an explicit filename, the way an import of a public manifest does.
+// While the original is present the saved link reaches it; once it is removed
+// the link is a 404, and it stays a 404 on a server built afresh after the
+// pepper file changes and on one with no pepper at all. The copy is reachable
+// throughout at the link the public manifest gives it.
+func TestBinaryAliasNeverBecomesAStoredName(t *testing.T) {
+	pepper := filepath.Join(t.TempDir(), "pepper")
+	prev := audit.DefaultPepperPaths
+	audit.DefaultPepperPaths = []string{pepper}
+	t.Cleanup(func() { audit.DefaultPepperPaths = prev })
+
+	serve := func(body string, user, password string) string {
+		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if u, p, _ := r.BasicAuth(); u != user || p != password {
+				http.Error(w, "bad credentials", http.StatusUnauthorized)
+				return
+			}
+			_, _ = w.Write([]byte(body))
+		}))
+		t.Cleanup(up.Close)
+		return strings.TrimPrefix(up.URL, "http://")
+	}
+	original := manifest.VersionEntry{Version: "1.0.0", URL: "http://audit-user:audit-secret@" + serve("ORIGINAL-ELF", "audit-user", "audit-secret")}
+	copyHost := serve("COPIED-ELF", "", "")
+
+	for _, tc := range []struct {
+		label   string
+		keyless bool
+	}{{"keyed", false}, {"keyless", true}} {
+		t.Run(tc.label, func(t *testing.T) {
+			if err := os.WriteFile(pepper, []byte(strings.Repeat("a", 64)), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			s := hostedServer(t)
+			if tc.keyless {
+				s.pepper = ""
+			}
+			objects := s.typeStore(manifest.TypeBinary)
+			fetch := func(versions ...manifest.VersionEntry) {
+				t.Helper()
+				if err := s.store.SavePackage(t.Context(), &manifest.PackageManifest{Type: manifest.TypeBinary, Name: "tool", Versions: versions}); err != nil {
+					t.Fatal(err)
+				}
+				cfg := &builder.Config{BuildRoot: t.TempDir(), BuildEnvInfo: &manifest.BuildEnv{Platform: "linux/arm64"}}
+				if sum := builder.FetchBinaries(cfg, s.store, "tool"); sum.Failures != 0 {
+					t.Fatalf("fetch: %+v", sum)
+				}
+				for _, p := range builder.BinaryArtifactPaths(cfg, s.store, "tool") {
+					data, err := os.ReadFile(p.Local)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := objects.Put(t.Context(), p.ObjectKey, data); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			// links reads every entry as the web UI does, from outside every
+			// admin range with no token, and returns the page's own link for
+			// each in manifest order.
+			links := func(srv *Server) []string {
+				t.Helper()
+				req := httptest.NewRequest(http.MethodGet, "/api/v1/packages/binary/tool", nil)
+				req.RemoteAddr = "203.0.113.9:40000"
+				rr := httptest.NewRecorder()
+				srv.Handler().ServeHTTP(rr, req)
+				if rr.Code != http.StatusOK {
+					t.Fatalf("read: %d %s", rr.Code, rr.Body)
+				}
+				if withheldFrom(rr.Body.String(), "audit-secret", "audit-user") != "" {
+					t.Fatalf("the manifest the UI reads publishes userinfo: %s", rr.Body)
+				}
+				var out []string
+				for _, v := range decodeJSON(t, rr.Body.String())["versions"].([]any) {
+					entry := v.(map[string]any)
+					entry["name"] = "tool"
+					_, path, ok := strings.Cut(pageClientURL(t, manifest.TypeBinary, entry), "/binaries/")
+					if !ok {
+						t.Fatalf("the web UI offers no binary link for %v", entry)
+					}
+					out = append(out, "/binaries/"+path)
+				}
+				return out
+			}
+			// expect requests path from srv and wants body, or a 404 when
+			// body is empty.
+			expect := func(srv *Server, when, path, body string) {
+				t.Helper()
+				rr := httptest.NewRecorder()
+				srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+				switch {
+				case body == "" && rr.Code != http.StatusNotFound:
+					t.Errorf("%s: %s = %d %q, want 404", when, path, rr.Code, rr.Body)
+				case body != "" && (rr.Code != http.StatusOK || rr.Body.String() != body):
+					t.Errorf("%s: %s = %d %q, want %q", when, path, rr.Code, rr.Body, body)
+				}
+			}
+			// A server with no pepper publishes aliases that resolve nowhere.
+			keyed := func(body string) string {
+				if tc.keyless {
+					return ""
+				}
+				return body
+			}
+
+			fetch(original)
+			saved := links(s)[0]
+			published := strings.TrimPrefix(saved, "/binaries/tool/1.0.0/")
+			if !manifest.IsBinaryAlias(published) {
+				t.Fatalf("the original is published as %q, not an alias", published)
+			}
+			expect(s, "original alone", saved, keyed("ORIGINAL-ELF"))
+
+			copied := manifest.VersionEntry{Version: "1.0.0", URL: "http://" + copyHost + "/copy", Filename: published}
+			fetch(copied, original)
+			expect(s, "copy ahead of the original", saved, keyed("ORIGINAL-ELF"))
+			expect(s, "copy ahead of the original, the copy's own link", links(s)[0], keyed("COPIED-ELF"))
+
+			fetch(copied)
+			expect(s, "original removed", saved, "")
+			expect(s, "original removed, the copy's own link", links(s)[0], keyed("COPIED-ELF"))
+
+			if err := os.WriteFile(pepper, []byte(strings.Repeat("b", 64)), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg := *s.cfg
+			cfg.AuditDB = filepath.Join(t.TempDir(), "audit.db")
+			rotated := newServer(&cfg, s.store, storage.NewSingle(objects), "127.0.0.1:0", slog.New(slog.NewTextHandler(io.Discard, nil)))
+			t.Cleanup(func() { _ = rotated.auditDB.Close() })
+			if rotated.pepper == "" || rotated.pepper == s.pepper {
+				t.Fatalf("the rebuilt server did not load the rotated pepper")
+			}
+			expect(rotated, "after rotation", saved, "")
+			expect(rotated, "after rotation, the copy's own link", links(rotated)[0], "COPIED-ELF")
+			fetch(copied, original)
+			expect(rotated, "after rotation with the original back", saved, "")
+			expect(rotated, "after rotation with the original back, its new link", links(rotated)[1], "ORIGINAL-ELF")
 		})
 	}
 }

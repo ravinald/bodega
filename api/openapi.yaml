@@ -982,9 +982,11 @@ components:
           type: string
           description: >-
             Binary filename override. On the read routes, a binary entry whose
-            url has no path and carries userinfo is published with a filename
-            of its own that carries none; `/binaries/` serves it from the
-            entry's stored object.
+            stored name carries userinfo or a "/" is published with a
+            download alias instead, `~/<tag>/<display>`, which carries no
+            userinfo; `/binaries/{name}/{version}/~/<tag>/<display>` serves
+            the entry's stored object, or 404 once the entry is gone or the
+            server's pepper has changed.
         sha256:
           type: string
           description: Expected SHA-256 for binary downloads

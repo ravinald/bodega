@@ -147,15 +147,21 @@ func (s *Server) handleBinaryUpstream(w http.ResponseWriter, r *http.Request, ns
 // binaryPathIdentity recovers the manifest entry that owns a binaries/ key.
 // The uploader writes <name>/<version>/<file>, dropping the version segment
 // for an entry that has none, so a two-segment path yields an empty version
-// rather than mistaking the filename for one. Any other segment count names
-// nothing and returns an empty package.
+// rather than mistaking the filename for one. A download alias adds three
+// segments after the version, "~/<tag>/<display>", and comes back whole as
+// the filename for BinaryStoredFilename to resolve. Any other segment count
+// names nothing and returns an empty package.
 func binaryPathIdentity(p string) (pkg, version, filename string) {
 	parts := strings.Split(p, "/")
-	switch len(parts) {
-	case 2:
+	switch {
+	case len(parts) == 2:
 		return parts[0], "", parts[1]
-	case 3:
+	case len(parts) == 3:
 		return parts[0], parts[1], parts[2]
+	case len(parts) == 4 && parts[1] == manifest.BinaryAliasDir:
+		return parts[0], "", strings.Join(parts[1:], "/")
+	case len(parts) == 5 && parts[2] == manifest.BinaryAliasDir:
+		return parts[0], parts[1], strings.Join(parts[2:], "/")
 	}
 	return "", "", ""
 }

@@ -188,11 +188,15 @@ risk:
     whose url has no path is stored under an object key built from the
     authority, userinfo included, so anyone who can list that bucket or
     directory reads the credential in the key name. The read routes publish
-    such an entry with a `filename` of its own, `<host>~<tag>`, where the tag
-    is an HMAC of the stored name keyed by the server's token pepper, and
+    such an entry with a download alias of its own, `~/<tag>/<display>`,
+    where the display part comes from the published url and the tag is an
+    HMAC of the stored name keyed by the server's token pepper, and
     `/binaries/` maps it back to the key without publishing the key. The key
     is there so that the published name cannot be used to confirm a guessed
-    username and password offline.
+    username and password offline. An alias spans three path segments and a
+    stored name is one, so the route never reads either as the other: an
+    alias whose entry is gone, or whose pepper has been rotated away, is a
+    404, never a request for an object stored under that spelling.
 
   A manifest read from the API and pushed back through an import arrives
   without its credential. Userinfo is the only credential form this covers: a

@@ -614,6 +614,12 @@ func clientURL(cfg *config.Config, store *manifest.Store, entryType, name, pkgFi
 			parts := strings.Split(ve.URL, "/")
 			fn = parts[len(parts)-1]
 		}
+		// The server reads this spelling as another entry's download alias,
+		// and the alias for this one is keyed by the token pepper, which the
+		// TUI does not hold. No link beats a link to the wrong bytes.
+		if manifest.IsBinaryAlias(fn) {
+			return ""
+		}
 		return fmt.Sprintf("%s/binaries/%s/%s/%s", base, pm.Name, ve.Version, fn)
 	case manifest.TypePypi:
 		return fmt.Sprintf("pip install --index-url %s/pypi/simple/ %s", base, name)

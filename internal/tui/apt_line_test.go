@@ -14,6 +14,8 @@ import (
 
 	"github.com/ravinald/bodega/internal/aptsign"
 	"github.com/ravinald/bodega/internal/aptsources"
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/server"
@@ -461,5 +463,205 @@ func TestPaneNamesOnlyAServedSuite(t *testing.T) {
 	bare := &config.Config{PublicURL: "https://bodega.example.com", StoragePath: t.TempDir()}
 	if got := aptSources(bare, nil, false).Suite; got != aptsources.PlaceholderSuite {
 		t.Errorf("suite = %q, want the placeholder", got)
+	}
+}
+
+// The TUI links a binary to its stored name, and the server has to keep
+// serving that name whatever it looks like: one ending in "~" and hex digits,
+// whether it came from the url or an explicit filename, and one carrying the
+// url's userinfo, which the read API publishes under an alias instead. Each is
+// fetched for real, then requested at the TUI's own link through the server's
+// own handler, beside the link the public manifest gives the web UI.
+func TestBinaryClientURLReachesTheFetchedArtifact(t *testing.T) {
+	prev := audit.DefaultPepperPaths
+	audit.DefaultPepperPaths = []string{filepath.Join(t.TempDir(), "pepper")}
+	t.Cleanup(func() { audit.DefaultPepperPaths = prev })
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if user, password, ok := r.BasicAuth(); ok && (user != "audit-user" || password != "audit-secret") {
+			http.Error(w, "bad credentials", http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte("FETCHED-ELF"))
+	}))
+	defer upstream.Close()
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	tag32 := strings.Repeat("0123456789abcdef", 2)
+	for label, ve := range map[string]manifest.VersionEntry{
+		"url-derived":    {Version: "1.0.0", URL: upstream.URL + "/tool~0123456789abcdef"},
+		"explicit":       {Version: "1.0.0", URL: upstream.URL + "/download", Filename: "tool~0123456789abcdef"},
+		"url-derived-32": {Version: "1.0.0", URL: upstream.URL + "/tool~" + tag32},
+		"explicit-32":    {Version: "1.0.0", URL: upstream.URL + "/download", Filename: "tool~" + tag32},
+		"userinfo":       {Version: "1.0.0", URL: "http://audit-user:audit-secret@" + host},
+	} {
+		t.Run(label, func(t *testing.T) {
+			cfg := aptLineConfig(t)
+			store := manifest.NewLocalStore(t.TempDir())
+			objects := storage.NewMemory()
+			if err := store.AddVersion(t.Context(), manifest.TypeBinary, "tool", ve); err != nil {
+				t.Fatal(err)
+			}
+			buildCfg := &builder.Config{BuildRoot: t.TempDir(), BuildEnvInfo: &manifest.BuildEnv{Platform: "linux/arm64"}}
+			if sum := builder.FetchBinaries(buildCfg, store, "tool"); sum.Total != 1 || sum.Failures != 0 {
+				t.Fatalf("fetch: %+v", sum)
+			}
+			for _, p := range builder.BinaryArtifactPaths(buildCfg, store, "tool") {
+				data, err := os.ReadFile(p.Local)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := objects.Put(t.Context(), p.ObjectKey, data); err != nil {
+					t.Fatal(err)
+				}
+			}
+			srv := server.New(cfg, store, storage.NewSingle(objects), ":0", nil)
+			get := func(target string) (int, string) {
+				rr := httptest.NewRecorder()
+				srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, target, nil))
+				return rr.Code, rr.Body.String()
+			}
+
+			link := clientURL(cfg, store, manifest.TypeBinary, "tool", "")
+			if code, body := get(link); code != http.StatusOK || body != "FETCHED-ELF" {
+				t.Errorf("TUI link %s = %d %q, want the fetched bytes", link, code, body)
+			}
+
+			code, body := get("/api/v1/packages/binary/tool/1.0.0")
+			if code != http.StatusOK {
+				t.Fatalf("read: %d %s", code, body)
+			}
+			var pm manifest.PackageManifest
+			if err := json.Unmarshal([]byte(body), &pm); err != nil {
+				t.Fatal(err)
+			}
+			fn := pm.Versions[0].Filename
+			if fn == "" {
+				parts := strings.Split(pm.Versions[0].URL, "/")
+				fn = parts[len(parts)-1]
+			}
+			if code, body := get("/binaries/tool/1.0.0/" + fn); code != http.StatusOK || body != "FETCHED-ELF" {
+				t.Errorf("public manifest link %s = %d %q, want the fetched bytes", fn, code, body)
+			}
+		})
+	}
+}
+
+// An operator who copies a published alias into another entry's explicit
+// filename stores that entry under a spelling the server reads as the first
+// entry's alias. The TUI cannot mint the copy's own alias without the token
+// pepper, so it offers no link for it rather than one that downloads the
+// original; the original's link, and the copy's link from the public manifest,
+// keep reaching their own bytes whichever entry comes first and after the
+// original is removed.
+func TestBinaryClientURLNeverReachesAnotherEntry(t *testing.T) {
+	prev := audit.DefaultPepperPaths
+	audit.DefaultPepperPaths = []string{filepath.Join(t.TempDir(), "pepper")}
+	t.Cleanup(func() { audit.DefaultPepperPaths = prev })
+
+	serve := func(body string) string {
+		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(body))
+		}))
+		t.Cleanup(up.Close)
+		return up.URL
+	}
+	original := manifest.VersionEntry{Version: "1.0.0", URL: serve("ORIGINAL-ELF") + "/tool"}
+	copyURL := serve("COPIED-ELF") + "/copy"
+
+	cfg := aptLineConfig(t)
+	store := manifest.NewLocalStore(t.TempDir())
+	objects := storage.NewMemory()
+	srv := server.New(cfg, store, storage.NewSingle(objects), ":0", nil)
+	get := func(target string) (int, string) {
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, target, nil))
+		return rr.Code, rr.Body.String()
+	}
+	fetch := func(versions ...manifest.VersionEntry) {
+		t.Helper()
+		if err := store.SavePackage(t.Context(), &manifest.PackageManifest{Type: manifest.TypeBinary, Name: "tool", Versions: versions}); err != nil {
+			t.Fatal(err)
+		}
+		buildCfg := &builder.Config{BuildRoot: t.TempDir(), BuildEnvInfo: &manifest.BuildEnv{Platform: "linux/arm64"}}
+		if sum := builder.FetchBinaries(buildCfg, store, "tool"); sum.Failures != 0 {
+			t.Fatalf("fetch: %+v", sum)
+		}
+		for _, p := range builder.BinaryArtifactPaths(buildCfg, store, "tool") {
+			data, err := os.ReadFile(p.Local)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := objects.Put(t.Context(), p.ObjectKey, data); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// published returns the public manifest's link for every entry, as the
+	// web UI builds it.
+	published := func() []string {
+		t.Helper()
+		code, body := get("/api/v1/packages/binary/tool")
+		if code != http.StatusOK {
+			t.Fatalf("read: %d %s", code, body)
+		}
+		var pm manifest.PackageManifest
+		if err := json.Unmarshal([]byte(body), &pm); err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, ve := range pm.Versions {
+			fn := ve.Filename
+			if fn == "" {
+				parts := strings.Split(ve.URL, "/")
+				fn = parts[len(parts)-1]
+			}
+			out = append(out, "/binaries/tool/1.0.0/"+fn)
+		}
+		return out
+	}
+
+	// The original is published under its stored name, so an alias has to
+	// come from an entry that needs one: a url with userinfo and no path.
+	aliased := manifest.VersionEntry{Version: "1.0.0", URL: strings.Replace(serve("ALIASED-ELF"), "http://", "http://audit-user:audit-secret@", 1)}
+	fetch(aliased, original)
+	alias := strings.TrimPrefix(published()[0], "/binaries/tool/1.0.0/")
+	if !manifest.IsBinaryAlias(alias) {
+		t.Fatalf("a url with no path is published as %q, not an alias", alias)
+	}
+	copied := manifest.VersionEntry{Version: "1.0.0", URL: copyURL, Filename: alias}
+
+	for _, tc := range []struct {
+		label    string
+		versions []manifest.VersionEntry
+		want     []string
+	}{
+		{"copy first", []manifest.VersionEntry{copied, aliased, original}, []string{"COPIED-ELF", "ALIASED-ELF", "ORIGINAL-ELF"}},
+		{"copy last", []manifest.VersionEntry{original, aliased, copied}, []string{"ORIGINAL-ELF", "ALIASED-ELF", "COPIED-ELF"}},
+		{"aliased entry removed", []manifest.VersionEntry{copied, original}, []string{"COPIED-ELF", "ORIGINAL-ELF"}},
+	} {
+		t.Run(tc.label, func(t *testing.T) {
+			fetch(tc.versions...)
+			link := clientURL(cfg, store, manifest.TypeBinary, "tool", "")
+			if link != "" {
+				if code, body := get(strings.TrimPrefix(link, "https://bodega.example.com")); code != http.StatusOK || body != tc.want[0] {
+					t.Errorf("TUI link %s = %d %q, want %q", link, code, body, tc.want[0])
+				}
+			} else if tc.versions[0].Filename != alias {
+				t.Errorf("the TUI offers no link for %+v", tc.versions[0])
+			}
+			for i, path := range published() {
+				if code, body := get(path); code != http.StatusOK || body != tc.want[i] {
+					t.Errorf("public link %s = %d %q, want %q", path, code, body, tc.want[i])
+				}
+			}
+			code, body := get("/binaries/tool/1.0.0/" + alias)
+			if tc.label == "aliased entry removed" {
+				if code != http.StatusNotFound {
+					t.Errorf("the removed entry's alias = %d %q, want 404", code, body)
+				}
+			} else if body != "ALIASED-ELF" {
+				t.Errorf("the alias = %d %q, want the entry it was minted for", code, body)
+			}
+		})
 	}
 }
