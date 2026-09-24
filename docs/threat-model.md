@@ -188,9 +188,11 @@ risk:
     whose url has no path is stored under an object key built from the
     authority, userinfo included, so anyone who can list that bucket or
     directory reads the credential in the key name. The read routes publish
-    such an entry with a `filename` of its own, `<host>-<tag>`, which no other
-    entry of that version is stored under or published as, and `/binaries/`
-    maps it back to the key without publishing the key.
+    such an entry with a `filename` of its own, `<host>~<tag>`, where the tag
+    is an HMAC of the stored name keyed by the server's token pepper, and
+    `/binaries/` maps it back to the key without publishing the key. The key
+    is there so that the published name cannot be used to confirm a guessed
+    username and password offline.
 
   A manifest read from the API and pushed back through an import arrives
   without its credential. Userinfo is the only credential form this covers: a

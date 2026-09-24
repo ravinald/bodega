@@ -931,7 +931,7 @@ func (s *Server) handleAPIPackages(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	resp := make(packagesResponse, len(manifest.AllTypes))
 	for _, typ := range manifest.AllTypes {
-		resp[typ] = loadPublicPackages(ctx, s.store, typ)
+		resp[typ] = loadPublicPackages(ctx, s.store, typ, []byte(s.pepper))
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -945,7 +945,7 @@ func (s *Server) handleAPIPackagesByType(w http.ResponseWriter, r *http.Request)
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, loadPublicPackages(ctx, s.store, t))
+	writeJSON(w, http.StatusOK, loadPublicPackages(ctx, s.store, t, []byte(s.pepper)))
 }
 
 func (s *Server) handleAPIPackage(w http.ResponseWriter, r *http.Request) {
@@ -969,7 +969,7 @@ func (s *Server) handleAPIPackage(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 		return
 	}
-	writeJSON(w, http.StatusOK, pm.Public())
+	writeJSON(w, http.StatusOK, pm.Public([]byte(s.pepper)))
 }
 
 // handleAPIPackageVersion returns a PackageManifest scoped to a single
@@ -999,9 +999,7 @@ func (s *Server) handleAPIPackageVersion(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "package not found"})
 		return
 	}
-	// Public before scoping: a binary download name is chosen against every
-	// entry of the manifest, and the scoped copy holds one.
-	scoped := pm.Public().ScopeToVersion(version)
+	scoped := pm.Public([]byte(s.pepper)).ScopeToVersion(version)
 	if scoped == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{
 			"error": fmt.Sprintf("version %q not found in %s/%s", version, t, name),
@@ -2083,9 +2081,9 @@ func sortStrings(ss []string) {
 // ---- PackageManifest helpers -----------------------------------------------
 
 // loadPublicPackages loads every PackageManifest of one type from the store,
-// each as manifest.PackageManifest.Public returns it: the read routes take no
-// token.
-func loadPublicPackages(ctx context.Context, store *manifest.Store, typ string) []*manifest.PackageManifest {
+// each as manifest.PackageManifest.Public returns it under key: the read
+// routes take no token.
+func loadPublicPackages(ctx context.Context, store *manifest.Store, typ string, key []byte) []*manifest.PackageManifest {
 	names := store.ListPackages(typ)
 	out := make([]*manifest.PackageManifest, 0, len(names))
 	for _, name := range names {
@@ -2093,7 +2091,7 @@ func loadPublicPackages(ctx context.Context, store *manifest.Store, typ string) 
 		if err != nil || pm == nil {
 			continue
 		}
-		out = append(out, pm.Public())
+		out = append(out, pm.Public(key))
 	}
 	return out
 }

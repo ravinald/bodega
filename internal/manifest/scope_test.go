@@ -2,6 +2,7 @@ package manifest
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -178,7 +179,7 @@ func TestPublicURL(t *testing.T) {
 func TestPublicLeavesTheManifestAlone(t *testing.T) {
 	raw := "https://u:" + "p@private.example/x"
 	pm := &PackageManifest{Versions: []VersionEntry{{Version: "1", URL: raw}}}
-	if got := pm.Public().Versions[0].URL; got != "https://private.example/x" {
+	if got := pm.Public(nil).Versions[0].URL; got != "https://private.example/x" {
 		t.Errorf("Public() url = %q", got)
 	}
 	if pm.Versions[0].URL != raw {
@@ -186,13 +187,28 @@ func TestPublicLeavesTheManifestAlone(t *testing.T) {
 	}
 }
 
-// Every binary entry's published download name, filename when the public copy
-// sets one and the url's last segment otherwise as the web UI reads it,
-// resolves to that entry's own stored name, carries no userinfo, and is shared
-// with no other entry of its version. The manifest holds each collision the
-// shared unversioned directory allows: a redacted name another entry is
-// explicitly stored under, two urls that redact alike, and a name that would
-// collide with the tagged name itself.
+// publishedBinaryNames returns, for every binary entry of pm, the name the web
+// UI links to in pm's public copy: filename when set, the url's last segment
+// otherwise.
+func publishedBinaryNames(pm *PackageManifest, key []byte) []string {
+	var names []string
+	for _, ve := range pm.Public(key).Versions {
+		name := ve.Filename
+		if name == "" {
+			name = lastSegment(ve.URL)
+		}
+		names = append(names, name)
+	}
+	return names
+}
+
+var aliasTestKey = []byte("alias-test-key")
+
+// Every binary entry's published download name resolves to that entry's own
+// stored name, carries no userinfo, and is shared with no other entry of its
+// version. The manifest holds each collision the shared unversioned directory
+// allows: a redacted name another entry is explicitly stored under, two urls
+// that redact alike, and an explicit filename already shaped like an alias.
 func TestBinaryDownloadNamesResolveToTheirOwnEntry(t *testing.T) {
 	pm := &PackageManifest{Type: TypeBinary, Name: "tool", Versions: []VersionEntry{
 		{Version: "1.0.0", URL: "https://u:" + "s@private.example"},
@@ -200,45 +216,99 @@ func TestBinaryDownloadNamesResolveToTheirOwnEntry(t *testing.T) {
 		{URL: "https://audit-user:" + "audit-secret@shared.example"},
 		{URL: "https://public.example/other", Filename: "shared.example"},
 		{URL: "https://other-user@shared.example"},
-		{URL: "https://public.example/x", Filename: "shared.example-3"},
-		{URL: "https://digest-user@shared.example", ArtifactDigest: "0123456789abcdef0123"},
+		{URL: "https://public.example/x", Filename: "shared.example~0123456789abcdef"},
 		{URL: "audit-user#audit-secret@shared.example"},
+		{URL: "https://q-user@shared.example?x=1"},
 	}}
-	pub := pm.Public()
 	seen := map[string]int{}
-	for i, ve := range pub.Versions {
-		name := ve.Filename
-		if name == "" {
-			name = lastSegment(ve.URL)
-		}
-		for _, secret := range []string{"audit-user", "audit-secret", "other-user", "digest-user", "u:s"} {
-			if strings.Contains(name, secret) || strings.Contains(ve.URL, secret) {
-				t.Errorf("entry %d publishes %q in %q / %q", i, secret, name, ve.URL)
+	for i, name := range publishedBinaryNames(pm, aliasTestKey) {
+		ve := pm.Versions[i]
+		for _, secret := range []string{"audit-user", "audit-secret", "other-user", "q-user", "u:s"} {
+			if strings.Contains(name, secret) {
+				t.Errorf("entry %d publishes %q in %q", i, secret, name)
 			}
+		}
+		if strings.ContainsAny(name, "?#/") {
+			t.Errorf("entry %d publishes %q, which a link cannot carry as one segment", i, name)
 		}
 		key := ve.Version + "/" + name
 		if j, dup := seen[key]; dup {
 			t.Errorf("entries %d and %d both publish %q", j, i, key)
 		}
 		seen[key] = i
-		if got, want := pm.BinaryStoredFilename(ve.Version, name), binaryStoredName(pm.Versions[i]); got != want {
-			t.Errorf("entry %d: published %q resolves to %q, want its own %q", i, name, got, want)
+		got, ok := pm.BinaryStoredFilename(aliasTestKey, ve.Version, name)
+		if want := binaryStoredName(ve); !ok || got != want {
+			t.Errorf("entry %d: published %q resolves to %q, %v, want its own %q", i, name, got, ok, want)
 		}
-	}
-	if got := pub.Versions[6].Filename; got != "shared.example-0123456789ab" {
-		t.Errorf("a fetched entry's name = %q, want its digest as the tag", got)
 	}
 	if pm.Versions[2].Filename != "" {
 		t.Errorf("Public() set a filename on the manifest it was handed")
 	}
-	for _, tc := range []struct{ version, requested, want string }{
-		{"1.0.0", "u:s@private.example", "u:s@private.example"},
-		{"1.0.0", "private.example", "private.example"},
-		{"", "shared.example", "shared.example"},
-		{"3.0.0", "private.example-1", "private.example-1"},
+	for _, tc := range []struct {
+		version, requested, want string
+		ok                       bool
+	}{
+		{"1.0.0", "u:s@private.example", "u:s@private.example", true},
+		{"1.0.0", "private.example", "private.example", true},
+		{"", "shared.example", "shared.example", true},
+		{"", "shared.example~0123456789abcdef", "", false},
+		{"3.0.0", "private.example~0123456789abcdef", "", false},
 	} {
-		if got := pm.BinaryStoredFilename(tc.version, tc.requested); got != tc.want {
-			t.Errorf("BinaryStoredFilename(%q, %q) = %q, want %q", tc.version, tc.requested, got, tc.want)
+		got, ok := pm.BinaryStoredFilename(aliasTestKey, tc.version, tc.requested)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("BinaryStoredFilename(%q, %q) = %q, %v, want %q, %v", tc.version, tc.requested, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+// A published alias keeps naming the entry it was published for across every
+// manifest edit, or names nothing: removing, reordering and adding entries,
+// including one whose explicit filename copies the alias, never hands it to
+// another entry's stored name.
+func TestBinaryDownloadNamesSurviveManifestEdits(t *testing.T) {
+	entries := []VersionEntry{
+		{URL: "https://first-user:" + "audit-secret@shared.example"},
+		{URL: "https://second-user:" + "audit-secret@shared.example"},
+		{URL: "https://public.example/other", Filename: "shared.example"},
+		{Version: "1.0.0", URL: "https://third-user@shared.example"},
+	}
+	pm := &PackageManifest{Type: TypeBinary, Name: "tool", Versions: entries}
+	published := publishedBinaryNames(pm, aliasTestKey)
+
+	edits := map[string][]VersionEntry{
+		"reversed":   {entries[3], entries[2], entries[1], entries[0]},
+		"added":      append([]VersionEntry{{URL: "https://new-user@shared.example"}}, entries...),
+		"copied":     append([]VersionEntry{{URL: "https://public.example/copy", Filename: published[0]}}, entries[1:]...),
+		"copied-url": append([]VersionEntry{{URL: "https://public.example/" + published[1]}}, entries[0], entries[2], entries[3]),
+	}
+	for i := range entries {
+		edits["without "+strconv.Itoa(i)] = append(append([]VersionEntry{}, entries[:i]...), entries[i+1:]...)
+	}
+	for label, versions := range edits {
+		edited := &PackageManifest{Type: TypeBinary, Name: "tool", Versions: versions}
+		for i, name := range published {
+			ve := entries[i]
+			got, ok := edited.BinaryStoredFilename(aliasTestKey, ve.Version, name)
+			if ok && got != binaryStoredName(ve) {
+				t.Errorf("%s: entry %d's link %q now resolves to %q, not its own %q", label, i, name, got, binaryStoredName(ve))
+			}
+		}
+	}
+}
+
+// With no key there is nothing to tag an alias with that a reader could not
+// reproduce, so the name published resolves nowhere rather than to a guess.
+func TestBinaryDownloadNamesFailClosedWithoutAKey(t *testing.T) {
+	pm := &PackageManifest{Type: TypeBinary, Name: "tool", Versions: []VersionEntry{
+		{URL: "https://audit-user:" + "audit-secret@shared.example"},
+	}}
+	name := publishedBinaryNames(pm, nil)[0]
+	if strings.Contains(name, "audit") {
+		t.Fatalf("published %q", name)
+	}
+	for _, key := range [][]byte{nil, aliasTestKey} {
+		if got, ok := pm.BinaryStoredFilename(key, "", name); ok {
+			t.Errorf("key %q: unkeyed name %q resolves to %q", key, name, got)
 		}
 	}
 }

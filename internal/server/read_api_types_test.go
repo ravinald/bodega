@@ -5,9 +5,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
+	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/manifest"
 )
 
@@ -330,5 +332,126 @@ func TestBinaryDownloadLinksReachTheirOwnBytes(t *testing.T) {
 		if code, got := getStatusAndBody(t, s, path); code != http.StatusOK || got != want {
 			t.Errorf("stored path %s = %d %q, want %q", path, code, got, want)
 		}
+	}
+}
+
+// A download link read from the public manifest keeps reaching the bytes it
+// was published for after the manifest changes, or answers 404. The artifacts
+// come from builder.FetchBinaries against an upstream that serves each entry
+// different bytes by its basic-auth username, since the binary fetch records
+// nothing on the entry that tells two such entries apart; the links come from
+// the read API as the web UI builds them.
+func TestBinaryDownloadLinksSurviveManifestEdits(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, _, _ := r.BasicAuth()
+		body, ok := map[string]string{"first": "FIRST-ELF", "second": "SECOND-ELF", "third": "THIRD-ELF"}[user]
+		if !ok {
+			http.Error(w, "unknown user", http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	defer upstream.Close()
+	host := strings.TrimPrefix(upstream.URL, "http://")
+	entry := func(user string) manifest.VersionEntry {
+		return manifest.VersionEntry{URL: "http://" + user + ":audit-secret@" + host}
+	}
+	original := []manifest.VersionEntry{entry("first"), entry("second"), {URL: "https://public.example/" + host, Filename: host}}
+	want := []string{"FIRST-ELF", "SECOND-ELF", "EXPLICIT-ELF"}
+
+	links := func(t *testing.T, s *Server) []string {
+		t.Helper()
+		code, body := getStatusAndBody(t, s, "/api/v1/packages/binary/tool")
+		if code != http.StatusOK {
+			t.Fatalf("read: %d %s", code, body)
+		}
+		if withheldFrom(body, "audit-secret", "first", "second", "third") != "" {
+			t.Fatalf("the manifest the UI reads publishes userinfo: %s", body)
+		}
+		var out []string
+		for _, v := range decodeJSON(t, body)["versions"].([]any) {
+			e := v.(map[string]any)
+			name, _ := e["filename"].(string)
+			if name == "" {
+				parts := strings.Split(e["url"].(string), "/")
+				name = parts[len(parts)-1]
+			}
+			out = append(out, "/binaries/tool/"+name)
+		}
+		return out
+	}
+	// fetch saves versions, runs the real fetch, and uploads what it produced
+	// under the keys the uploader derives. An entry the fetch cannot reach is
+	// put by hand: the explicit filename, and an edit's copied name.
+	fetch := func(t *testing.T, s *Server, versions []manifest.VersionEntry, byHand map[string]string) {
+		t.Helper()
+		pm := &manifest.PackageManifest{Type: manifest.TypeBinary, Name: "tool", Versions: versions}
+		if err := s.store.SavePackage(t.Context(), pm); err != nil {
+			t.Fatal(err)
+		}
+		cfg := &builder.Config{BuildRoot: t.TempDir(), BuildEnvInfo: &manifest.BuildEnv{Platform: "linux/arm64"}}
+		builder.FetchBinaries(cfg, s.store, "tool")
+		for _, p := range builder.BinaryArtifactPaths(cfg, s.store, "tool") {
+			content, err := os.ReadFile(p.Local)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.typeStore(manifest.TypeBinary).Put(t.Context(), p.ObjectKey, content); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for name, content := range byHand {
+			if err := s.typeStore(manifest.TypeBinary).Put(t.Context(), manifest.BinaryKey("tool", "", name), []byte(content)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	for _, tc := range []struct {
+		label string
+		edit  func(published []string) ([]manifest.VersionEntry, map[string]string)
+	}{
+		{"remove first", func([]string) ([]manifest.VersionEntry, map[string]string) {
+			return original[1:], nil
+		}},
+		{"remove second", func([]string) ([]manifest.VersionEntry, map[string]string) {
+			return []manifest.VersionEntry{original[0], original[2]}, nil
+		}},
+		{"reverse", func([]string) ([]manifest.VersionEntry, map[string]string) {
+			return []manifest.VersionEntry{original[2], original[1], original[0]}, nil
+		}},
+		{"add a third credential ahead", func([]string) ([]manifest.VersionEntry, map[string]string) {
+			return append([]manifest.VersionEntry{entry("third")}, original...), nil
+		}},
+		{"copy the first link as an explicit filename, then remove the first", func(published []string) ([]manifest.VersionEntry, map[string]string) {
+			copied := strings.TrimPrefix(published[0], "/binaries/tool/")
+			return []manifest.VersionEntry{{URL: "https://public.example/copy", Filename: copied}, original[1], original[2]},
+				map[string]string{copied: "COPIED-ELF"}
+		}},
+	} {
+		t.Run(tc.label, func(t *testing.T) {
+			s := hostedServer(t)
+			fetch(t, s, original, map[string]string{host: "EXPLICIT-ELF"})
+			published := links(t, s)
+			for i, link := range published {
+				if code, got := getStatusAndBody(t, s, link); code != http.StatusOK || got != want[i] {
+					t.Fatalf("entry %d's link %s = %d %q before the edit, want %q", i, link, code, got, want[i])
+				}
+			}
+
+			versions, byHand := tc.edit(published)
+			fetch(t, s, versions, byHand)
+			for i, link := range published {
+				code, got := getStatusAndBody(t, s, link)
+				if code == http.StatusOK && got != want[i] {
+					t.Errorf("entry %d's saved link %s now serves %q, want %q or a 404", i, link, got, want[i])
+				}
+			}
+			for _, link := range links(t, s) {
+				if code, got := getStatusAndBody(t, s, link); code != http.StatusOK || !strings.HasSuffix(got, "-ELF") {
+					t.Errorf("after the edit, published link %s = %d %q", link, code, got)
+				}
+			}
+		})
 	}
 }
