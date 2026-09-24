@@ -30,8 +30,8 @@
 # neither was ever driven.
 #
 # This suite mutates freebsd-server: it creates and destroys a swap-backed
-# memory disk and a ZFS dataset, and writes under /var/tmp. It checks that
-# both are gone.
+# memory disk, a ZFS dataset and a user account, and writes under /var/tmp.
+# It checks that all three are gone.
 
 # shellcheck source=../lib/assert.sh
 . "${E2E_DIR:?run.sh sets E2E_DIR}/lib/assert.sh"
@@ -73,6 +73,20 @@ FSRV_PT_TESTS=(
 	TestZFSPassthroughPublishedDenyEntryDeniesItsPrincipal
 )
 
+# The passthrough cells grant and deny a scratch account the suite creates and
+# removes. Not nobody: FreeBSD's ZFS never matches a named-user entry against
+# UID_NOBODY (zfs_zaccess_aces_check in zfs_acl.c, measured at kernel revision
+# 96841ea08dcf), because it maps every FUID it cannot resolve to that uid. A
+# user:nobody deny reads back from getfacl and denies nothing on any dataset,
+# so a read as nobody grades the mode bits. Not a base-system account either:
+# the entry has to name someone no other rule on the guest already governs.
+# The comment field marks the account as this suite's, and nothing deletes an
+# account with that name unless the mark is there.
+FSRV_PRINCIPAL=bodega-e2e-deny
+FSRV_PRINCIPAL_MARK="bodega e2e suite 48 scratch principal"
+fsrv_principal_drop="[ \"\$(sudo pw usershow -n $FSRV_PRINCIPAL 2>/dev/null | cut -d: -f8)\" = '$FSRV_PRINCIPAL_MARK' ] && \
+	sudo pw userdel -n $FSRV_PRINCIPAL;"
+
 # ---- ship ------------------------------------------------------------------
 #
 # The test binary rather than a bodega binary: what runs here is the package's
@@ -110,7 +124,7 @@ FSRV_PT_DATASET=""
 fsrv_pt_stale=""
 if e2e_freebsd_zfs_dataset_of freebsd-server "$(dirname "$FSRV_ROOT")"; then
 	FSRV_PT_DATASET="$E2E_OUT/bodega-e2e-passthrough"
-	fsrv_pt_stale="sudo zfs destroy -f '$FSRV_PT_DATASET' 2>/dev/null;"
+	fsrv_pt_stale="sudo zfs destroy -f '$FSRV_PT_DATASET' 2>/dev/null; $fsrv_principal_drop"
 else
 	fsrv_pt_err="$E2E_ERR"
 	fsrv_pt_rc="$E2E_RC"
@@ -135,6 +149,11 @@ if [ -n "$FSRV_PT_DATASET" ]; then
 	check_eq FSRV-07 "a scratch ZFS dataset is mounted with aclmode and aclinherit passthrough" \
 		"passthrough passthrough $FSRV_PT_MNT" "$E2E_OUT" \
 		"test/e2e/suites/48-freebsd-server.sh" "zfs create -o aclmode=passthrough -o aclinherit=passthrough $FSRV_PT_DATASET" "$E2E_RC"
+	e2e_on freebsd-server "sudo pw useradd -n $FSRV_PRINCIPAL -c '$FSRV_PRINCIPAL_MARK' -d /nonexistent -s /usr/sbin/nologin && \
+		sudo pw usershow -n $FSRV_PRINCIPAL | cut -d: -f8" || true
+	check_eq FSRV-09 "a scratch account for the passthrough cells to deny is created" \
+		"$FSRV_PRINCIPAL_MARK" "$E2E_OUT" \
+		"test/e2e/suites/48-freebsd-server.sh" "pw useradd -n $FSRV_PRINCIPAL" "$E2E_RC"
 else
 	e2e_record FSRV-07 FAIL "a scratch ZFS dataset is mounted with aclmode and aclinherit passthrough" \
 		"a dataset holding $(dirname "$FSRV_ROOT")" "$fsrv_pt_err" \
@@ -206,7 +225,7 @@ for fs in zfs ufs; do
 done
 if [ -n "$FSRV_PT_DATASET" ]; then
 	for who in user root; do
-		fsrv_cell zfspt "$who" guest.test "$FSRV_PT_MNT" "BODEGA_FREEBSD_GUEST_ZFS_ACL=passthrough/passthrough" "${FSRV_PT_TESTS[@]}"
+		fsrv_cell zfspt "$who" guest.test "$FSRV_PT_MNT" "BODEGA_FREEBSD_GUEST_ZFS_ACL=passthrough/passthrough BODEGA_FREEBSD_GUEST_PRINCIPAL=$FSRV_PRINCIPAL" "${FSRV_PT_TESTS[@]}"
 	done
 else
 	e2e_block FSRV-BLOCK-ZFSPT "passthrough cells" "no ZFS dataset holds $(dirname "$FSRV_ROOT"): $fsrv_pt_err"
@@ -221,10 +240,13 @@ if [ -n "$FSRV_PT_DATASET" ]; then
 	e2e_on freebsd-server "sudo zfs destroy '$FSRV_PT_DATASET'; zfs list -H -o name '$FSRV_PT_DATASET' 2>/dev/null || echo gone" || true
 	check_eq FSRV-08 "the passthrough dataset is destroyed again" "gone" "$E2E_OUT" \
 		"test/e2e/suites/48-freebsd-server.sh" "zfs destroy $FSRV_PT_DATASET" "$E2E_RC"
+	e2e_on freebsd-server "$fsrv_principal_drop id $FSRV_PRINCIPAL >/dev/null 2>&1 && echo present || echo gone" || true
+	check_eq FSRV-10 "the scratch account is removed again" "gone" "$E2E_OUT" \
+		"test/e2e/suites/48-freebsd-server.sh" "pw userdel -n $FSRV_PRINCIPAL" "$E2E_RC"
 fi
 e2e_on freebsd-server "sudo umount '$FSRV_ROOT/ufs'; sudo mdconfig -d -u $FSRV_MD; sudo rm -rf '$FSRV_ROOT'; \
 	sudo mdconfig -l | awk -v u=md$FSRV_MD '{for (i = 1; i <= NF; i++) if (\$i == u) f = 1} END {print (f ? \"present\" : \"gone\")}'" || true
 check_eq FSRV-05 "the memory disk is destroyed again" "gone" "$E2E_OUT" \
 	"test/e2e/suites/48-freebsd-server.sh" "umount; mdconfig -d -u $FSRV_MD; mdconfig -l" "$E2E_RC"
 
-unset FSRV_ROOT FSRV_MD FSRV_BIN FSRV_GUEST_BIN FSRV_TESTS FSRV_PT_TESTS FSRV_PT_DATASET FSRV_PT_MNT fsrv_pt_stale fsrv_pt_err fsrv_pt_rc fsrv_build_rc fsrv_guest_rc
+unset FSRV_PRINCIPAL FSRV_PRINCIPAL_MARK fsrv_principal_drop FSRV_ROOT FSRV_MD FSRV_BIN FSRV_GUEST_BIN FSRV_TESTS FSRV_PT_TESTS FSRV_PT_DATASET FSRV_PT_MNT fsrv_pt_stale fsrv_pt_err fsrv_pt_rc fsrv_build_rc fsrv_guest_rc

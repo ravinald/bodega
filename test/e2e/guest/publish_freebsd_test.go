@@ -27,12 +27,14 @@ import (
 // a test that detected it would pass on whichever dataset it landed on.
 const zfsACLEnv = "BODEGA_FREEBSD_GUEST_ZFS_ACL"
 
-// principalName is who every fixture here grants or denies. Not nobody: ZFS on
-// FreeBSD 15.1 ignores an ACL entry naming uid 65534, so a deny for nobody
-// leaves a 0644 file readable by nobody and an allow grants a 0600 file to
-// nobody nothing. A read as nobody measures the mode bits and nothing else.
-// www is in the base system and is neither the test process nor root.
-const principalName = "www"
+// principalEnv names the account every fixture here grants or denies.
+// test/e2e/suites/48-freebsd-server.sh creates it for the run and removes it
+// afterwards, and explains why it is not nobody.
+const principalEnv = "BODEGA_FREEBSD_GUEST_PRINCIPAL"
+
+// uidNobody is UID_NOBODY in FreeBSD's sys/sys/conf.h. ZFS never matches a
+// named-user entry against it, so a read as that uid grades the mode bits.
+const uidNobody = 65534
 
 type principal struct {
 	name string
@@ -62,16 +64,20 @@ func requireZFSACL(t *testing.T, aclmode, aclinherit string) {
 
 func lookupPrincipal(t *testing.T) principal {
 	t.Helper()
-	u, err := user.Lookup(principalName)
+	name := os.Getenv(principalEnv)
+	if name == "" {
+		t.Fatalf("%s is unset; test/e2e/suites/48-freebsd-server.sh creates the account and sets it", principalEnv)
+	}
+	u, err := user.Lookup(name)
 	if err != nil {
-		t.Fatalf("look up %s: %v", principalName, err)
+		t.Fatalf("look up %s=%s: %v", principalEnv, name, err)
 	}
 	uid, err := strconv.Atoi(u.Uid)
 	if err != nil {
-		t.Fatalf("uid of %s is %q: %v", principalName, u.Uid, err)
+		t.Fatalf("uid of %s is %q: %v", name, u.Uid, err)
 	}
-	if uid == os.Geteuid() || uid == 0 {
-		t.Fatalf("%s is uid %d, which is this process or root: a read as it proves nothing", principalName, uid)
+	if uid == os.Geteuid() || uid == 0 || uid == uidNobody {
+		t.Fatalf("%s is uid %d, which is this process, root or nobody: a read as it proves nothing about the ACL", name, uid)
 	}
 	return principal{name: u.Username, uid: uid}
 }

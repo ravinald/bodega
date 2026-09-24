@@ -246,7 +246,7 @@ t_ok "a dry run of suite 48 reaches all 32 cells" 32 \
 t_ok "a dry run of suite 48 reaches its last check" yes \
 	"$(printf '%s\n' "$dry_ids" | awk '$0 == "FSRV-05" {f = 1} END {print (f ? "yes" : "no")}')"
 for want in 'local: rm -f' 'local: env GOOS=freebsd' 'mdconfig -a -t swap' \
-	'storage.test -test.run' 'umount'; do
+	'storage.test -test.run' 'pw useradd' 'pw userdel' 'umount'; do
 	t_ok "the suite 48 plan lists $want" yes \
 		"$(case "$dry_plan" in *"$want"*) echo yes ;; *) echo no ;; esac)"
 done
