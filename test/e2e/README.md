@@ -17,13 +17,19 @@ It runs from a workstation against four scratch guests, described under
 [Host requirements](#host-requirements). It does not run in CI and never will:
 it needs several hosts, a real network between them, and several minutes.
 
-| Client                                           | Guest     | Suite               |
-| ------------------------------------------------ | --------- | ------------------- |
-| `apt-get`, `pip`, `helm`, `npm`, `cargo`         | `client`  | `45-clients`        |
-| `git`, `curl`, the portable `pkg` build          | `client`  | `45-clients`        |
-| `go`                                             | `server`  | `45-clients`        |
-| `pkg install` onto a FreeBSD root                | `freebsd` | `47-freebsd-client` |
-| `make fetch` and `make checksum` in a ports tree | `freebsd` | `47-freebsd-client` |
+| Client                                              | Guest            | Suite               |
+| --------------------------------------------------- | ---------------- | ------------------- |
+| `apt-get`, `pip`, `helm`, `npm`, `cargo`            | `client`         | `45-clients`        |
+| `git`, `curl`, the portable `pkg` build             | `client`         | `45-clients`        |
+| `go`                                                | `server`         | `45-clients`        |
+| `pkg install` onto a FreeBSD root                   | `freebsd`        | `47-freebsd-client` |
+| `make fetch` and `make checksum` in a ports tree    | `freebsd`        | `47-freebsd-client` |
+| none: `internal/storage`'s ACL and extattr syscalls | `freebsd-server` | `48-freebsd-server` |
+
+`48-freebsd-server` drives no client. It runs `internal/storage`'s own tests on
+`freebsd-server`, because the FreeBSD ACL and extended-attribute syscalls
+compile into no binary the Linux guests run: on ZFS and on a UFS memory disk
+mounted `-o acls`, each as an unprivileged user and as root.
 
 ## Host requirements
 
@@ -56,7 +62,10 @@ Each FreeBSD guest needs a release with `pkg` bootstrapped, `curl`, the same
 `dist/bodega-freebsd-arm64` to `freebsd`, so an amd64 guest needs that
 target changed. It points `pkg` at the Linux server through the stanza
 `bodega doctor --write-pkg-repo` writes, and removes the stanza again at the
-end; `freebsd-server` is resolved and guarded but no suite drives it yet.
+end. Suite 48 ships an `internal/storage` test binary to `freebsd-server`,
+compiles a `sys/acl.h` probe with the base system's `cc`, and creates and
+destroys a swap-backed memory disk (`md48`, override with
+`E2E_FREEBSD_MD_UNIT`) under `/var/tmp/bodega-e2e-storage`.
 
 ## Running it
 
@@ -217,8 +226,8 @@ Rules the harness enforces or depends on:
 - **Check ids are unique across every suite.** `run.sh` fails the run on a
   duplicate: two suites sharing an id make the known-issue map ambiguous.
 - **Prefix ids by area** (`PRE-`, `SHIP-`, `PIPE-`, `SRV-`, `CLI-`, `FBSD-`,
-  `POL-`, `PROF-`, `ACC-`, `PXY-`, `AUD-`, `INT-`, `SYS-`, `GAT-`, `UI-`,
-  `DST-`, `JSON-`) and keep them stable. A filed issue cites one.
+  `FSRV-`, `POL-`, `PROF-`, `ACC-`, `PXY-`, `AUD-`, `INT-`, `SYS-`, `GAT-`,
+  `UI-`, `DST-`, `JSON-`) and keep them stable. A filed issue cites one.
 - **Never let a suite exit on a failed command.** `|| true` after every
   `e2e_on`; the check reads `$E2E_RC`.
 - **A suite that needs a value another suite produced must tolerate its
