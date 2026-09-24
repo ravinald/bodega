@@ -622,3 +622,21 @@ func TestPathsLeavingTheTreeRefuse(t *testing.T) {
 		})
 	}
 }
+
+// A restricted port whose DISTINFO_FILE sits in a directory that does not
+// exist has no distinfo to check its fetch against, and so may fetch any name.
+// Resolving the path as the kernel does finds nothing there, which must leave
+// ownership unknown rather than restrict nothing; a lexical clean of
+// ${.CURDIR}/gone/../../../sysutils/pcpustat would have named pcpustat.
+func TestDistinfoInAMissingDirectoryIsUnowned(t *testing.T) {
+	root := portsTree(t)
+	write(t, root, "misc/probe/Makefile", "NO_CDROM=probe\nDISTINFO_FILE=${.CURDIR}/gone/../../../sysutils/pcpustat/distinfo\n")
+	ix, err := Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = ix.Lookup("pcpustat/1.6.tar.bz2")
+	if u := strings.Join(ix.Unowned(), "\n"); !errors.Is(err, ErrRestricted) || !strings.Contains(u, "is in no directory of the tree") {
+		t.Fatalf("pcpustat: %v, unowned %q; want every name refused for a distinfo in no directory", err, u)
+	}
+}

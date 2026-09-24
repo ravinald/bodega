@@ -842,8 +842,10 @@ func (r *makeReader) noteDistinfo() {
 // which directory the ".." leaves, so the path is never cleaned first. The
 // directory is recorded, because Load restricts every distinfo* in it; so is
 // the directory of the file a final symlink names; and a file Load does not
-// index by its name is recorded itself. A directory that does not exist holds
-// no distinfo on any host sharing the tree, and names nothing.
+// index by its name is recorded itself. A missing file in a directory that
+// exists restricts that directory's names, as the default distinfo of a port
+// with none does. A missing directory holds no port whose names could carry
+// the restriction, so it leaves ownership unknown.
 func (r *makeReader) noteDistinfoPath(p string) string {
 	if !filepath.IsAbs(p) {
 		p = r.dir + "/" + p
@@ -859,7 +861,9 @@ func (r *makeReader) noteDistinfoPath(p string) string {
 	case why != "":
 		return why
 	case !exists:
-		return ""
+		// No directory, so no port of the tree whose names to restrict,
+		// and a fetch that finds no distinfo checks no name against one.
+		return fmt.Sprintf("%s is in no directory of the tree", p)
 	}
 	r.distinfo[realDir] = true
 	realFile, exists, why := resolveInTree(r.roots(), p)
