@@ -151,6 +151,7 @@ e2e_freebsd_zfs_dataset_of() {
 		E2E_OUT="dry-run-dataset-of$path"
 		return 0
 	fi
+	# shellcheck disable=SC2034  # the caller reads E2E_ERR and E2E_RC, as it does after e2e_on
 	case "$E2E_OUT" in
 	'' | /* | *[!A-Za-z0-9_.:/-]*)
 		E2E_ERR="zfs list named no single dataset for $path: ${E2E_OUT:-empty output}"
