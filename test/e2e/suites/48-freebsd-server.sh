@@ -68,14 +68,16 @@ fsrv_run="^($(
 # own assertions against unexported functions, which no CLI command reaches.
 
 E2E_HOST=local
-rm -f "$FSRV_BIN"
+fsrv_build_rc=0
+e2e_local rm -f "$FSRV_BIN" || fsrv_build_rc=$E2E_RC
 e2e_local env GOOS=freebsd GOARCH=arm64 CGO_ENABLED=0 \
-	go test -C "$REPO_ROOT" -c -o "$FSRV_BIN" ./internal/storage || true
-check_eq FSRV-01 "the internal/storage test binary builds for freebsd/arm64" 0 "$E2E_RC" \
-	"internal/storage/guest_freebsd_test.go" "GOOS=freebsd GOARCH=arm64 go test -c ./internal/storage" "$E2E_RC"
+	go test -C "$REPO_ROOT" -c -o "$FSRV_BIN" ./internal/storage || fsrv_build_rc=$E2E_RC
+check_eq FSRV-01 "the internal/storage test binary builds for freebsd/arm64" 0 "$fsrv_build_rc" \
+	"internal/storage/guest_freebsd_test.go" "GOOS=freebsd GOARCH=arm64 go test -c ./internal/storage" "$fsrv_build_rc"
 # A binary left by an earlier build would run the code as it was then, and
-# every cell below would grade that instead of this tree.
-if [ ! -x "$FSRV_BIN" ]; then
+# every cell below would grade that instead of this tree. A dry run built
+# nothing and deleted nothing, so there is no binary to hold it to.
+if [ "${E2E_DRY_RUN:-no}" != yes ] && { [ "$fsrv_build_rc" -ne 0 ] || [ ! -x "$FSRV_BIN" ]; }; then
 	e2e_block FSRV-BLOCK-BUILD "internal/storage on FreeBSD" "the freebsd/arm64 test binary did not build: $(e2e_excerpt "$E2E_ERR")"
 	return 0
 fi
@@ -148,4 +150,4 @@ e2e_on freebsd-server "sudo umount '$FSRV_ROOT/ufs'; sudo mdconfig -d -u $FSRV_M
 check_eq FSRV-05 "the memory disk is destroyed again" "gone" "$E2E_OUT" \
 	"test/e2e/suites/48-freebsd-server.sh" "umount; mdconfig -d -u $FSRV_MD; mdconfig -l" "$E2E_RC"
 
-unset FSRV_ROOT FSRV_MD FSRV_BIN FSRV_TESTS fsrv_run
+unset FSRV_ROOT FSRV_MD FSRV_BIN FSRV_TESTS fsrv_run fsrv_build_rc

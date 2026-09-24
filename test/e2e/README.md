@@ -81,7 +81,8 @@ destroys a swap-backed memory disk (`md48`, override with
 Run the first three before an unattended pass. `--validate` catches a typo in a
 late suite in under a second; `--dry-run` proves every suite reaches its last
 check and writes `dry-run-plan.txt`, which is every command the real run will
-issue, in order.
+issue, in order. A dry run changes nothing outside its results directory:
+builds and deletions go into the plan, not the tree.
 
 Other flags: `--suite <prefix>` runs a subset (00-preflight always runs
 regardless, because it sets the reachability flags the others read),
