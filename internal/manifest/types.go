@@ -332,9 +332,10 @@ type VersionEntry struct {
 	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
-// Public returns a copy of pm fit for a caller that presented no token: every
-// version's URL loses its userinfo. pm is not modified, since the store may
-// hand the same pointer to the next reader.
+// Public returns a copy of pm fit for the open read routes, which answer every
+// caller the same way whatever its address or token: every version's URL loses
+// its userinfo. pm is not modified, since the store may hand the same pointer
+// to the next reader.
 func (pm *PackageManifest) Public() *PackageManifest {
 	if pm == nil {
 		return nil
@@ -356,20 +357,59 @@ func (pm *PackageManifest) Public() *PackageManifest {
 // rather than through url.Parse, which reads "user:secret@host/path" as the
 // scheme "user" with an opaque remainder and reports no userinfo at all, and
 // which refuses the scp form git accepts.
+//
+// Where readers disagree about where the authority ends, the cut takes the
+// widest reading. A browser strips leading spaces and every tab and newline,
+// treats a "\" after the scheme as "/", and finds an authority after "https:"
+// with no slashes at all; curl reads a later "\" as part of the authority, and
+// git finds one before the first ":" of "user@host:path". Over-cutting
+// costs a display string, while under-cutting publishes the credential, so a
+// scheme followed by no slash is dropped with the userinfo: "user:secret@host"
+// has the same form and nothing tells the two apart.
 func PublicURL(raw string) string {
-	start := 0
-	if i := strings.Index(raw, "://"); i >= 0 {
-		start = i + len("://")
+	s := strings.Map(func(r rune) rune {
+		if r == '\t' || r == '\n' || r == '\r' {
+			return -1
+		}
+		return r
+	}, raw)
+	s = strings.TrimLeftFunc(s, func(r rune) bool { return r <= ' ' })
+
+	afterScheme := schemeLen(s)
+	start := afterScheme
+	for start < len(s) && (s[start] == '/' || s[start] == '\\') {
+		start++
 	}
-	end := len(raw)
-	if i := strings.IndexAny(raw[start:], "/?#"); i >= 0 {
+	slashes := start > afterScheme
+	end := len(s)
+	if i := strings.IndexAny(s[start:], "/?#"); i >= 0 {
 		end = start + i
 	}
-	at := strings.LastIndex(raw[start:end], "@")
-	if at <= 0 {
+	at := strings.LastIndex(s[:end], "@")
+	if at < 0 {
 		return raw
 	}
-	return raw[:start] + raw[start+at+1:]
+	if slashes {
+		return s[:start] + s[at+1:]
+	}
+	return s[at+1:]
+}
+
+// schemeLen returns the length of s's leading "scheme:", or 0 when s opens
+// with none (RFC 3986: a letter, then letters, digits, "+", "-" or ".").
+func schemeLen(s string) int {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z':
+		case i > 0 && ('0' <= c && c <= '9' || c == '+' || c == '-' || c == '.'):
+		case i > 0 && c == ':':
+			return i + 1
+		default:
+			return 0
+		}
+	}
+	return 0
 }
 
 // ScopeToVersion returns pm with Versions narrowed to the single entry

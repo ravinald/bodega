@@ -71,6 +71,9 @@ func (s *Server) handleBinary(w http.ResponseWriter, r *http.Request) {
 	if !s.entitleGate(w, r, manifest.TypeBinary, pkg, version) {
 		return
 	}
+	if pm, _ := s.store.GetPackage(r.Context(), manifest.TypeBinary, pkg); pm != nil {
+		filename = pm.BinaryStoredFilename(version, filename)
+	}
 	s.proxyVersion(w, r, manifest.TypeBinary, pkg, version, manifest.BinaryKey(pkg, version, filename))
 }
 

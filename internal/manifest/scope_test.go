@@ -126,9 +126,10 @@ func TestScopeToVersionDoesNotMutate(t *testing.T) {
 }
 
 // PublicURL drops the whole userinfo, username included, in every form a
-// manifest url is written: with a scheme, without one (where url.Parse finds
-// no userinfo at all), and git's scp form (which url.Parse refuses). An "@"
-// past the authority is path, and stays.
+// manifest url is written: with a scheme, scheme-relative, without one (where
+// url.Parse finds no userinfo at all), git's scp form (which url.Parse
+// refuses), and the forms only a browser or curl reads an authority into. An
+// "@" past the authority is path, and stays.
 func TestPublicURL(t *testing.T) {
 	for _, tc := range []struct{ raw, want string }{
 		{"https://audit-user:audit-secret@private.example/FreeBSD:14:amd64/latest", "https://private.example/FreeBSD:14:amd64/latest"},
@@ -140,6 +141,17 @@ func TestPublicURL(t *testing.T) {
 		{"https://private.example/x?who=a@b", "https://private.example/x?who=a@b"},
 		{"https://private.example", "https://private.example"},
 		{"", ""},
+		{"//audit-user:audit-secret@private.example/x", "//private.example/x"},
+		{"//audit-user@private.example/x", "//private.example/x"},
+		{"//private.example/x@y", "//private.example/x@y"},
+		{"https://audit-user@private.example", "https://private.example"},
+		{"https:audit-user:audit-secret@private.example/x", "private.example/x"},
+		{"https:\\\\audit-user:audit-secret@private.example/x", "https:\\\\private.example/x"},
+		{"https:///audit-user:audit-secret@private.example/x", "https:///private.example/x"},
+		{"https://private.example\\audit-user:audit-secret@evil.example/x", "https://evil.example/x"},
+		{"  https://audit-user:audit-secret@private.example/x", "https://private.example/x"},
+		{"ht\ttps://audit-user:audit-\nsecret@private.example/x", "https://private.example/x"},
+		{"ssh://git@private.example:22/x", "ssh://private.example:22/x"},
 	} {
 		if got := PublicURL(tc.raw); got != tc.want {
 			t.Errorf("PublicURL(%q) = %q, want %q", tc.raw, got, tc.want)
@@ -157,5 +169,29 @@ func TestPublicLeavesTheManifestAlone(t *testing.T) {
 	}
 	if pm.Versions[0].URL != raw {
 		t.Errorf("Public() rewrote the manifest it was handed: %q", pm.Versions[0].URL)
+	}
+}
+
+// A root url stores its object under the authority, userinfo included; the
+// public name maps back to it. A name another entry is stored under is never
+// remapped, which matters in the shared directory unversioned entries use.
+func TestBinaryStoredFilename(t *testing.T) {
+	pm := &PackageManifest{Type: TypeBinary, Name: "tool", Versions: []VersionEntry{
+		{Version: "1.0.0", URL: "https://u:" + "s@private.example"},
+		{Version: "2.0.0", URL: "https://private.example/dl/tool"},
+		{URL: "https://u:" + "s@shared.example"},
+		{Filename: "shared.example", URL: "https://private.example/other"},
+	}}
+	for _, tc := range []struct{ version, requested, want string }{
+		{"1.0.0", "private.example", "u:s@private.example"},
+		{"1.0.0", "u:s@private.example", "u:s@private.example"},
+		{"1.0.0", "other", "other"},
+		{"2.0.0", "tool", "tool"},
+		{"3.0.0", "private.example", "private.example"},
+		{"", "shared.example", "shared.example"},
+	} {
+		if got := pm.BinaryStoredFilename(tc.version, tc.requested); got != tc.want {
+			t.Errorf("BinaryStoredFilename(%q, %q) = %q, want %q", tc.version, tc.requested, got, tc.want)
+		}
 	}
 }

@@ -281,6 +281,46 @@ func BinaryKey(name, version, filename string) string {
 	return BinaryPrefix + SafeName(name) + "/" + version + "/" + filename
 }
 
+// BinaryStoredFilename maps the filename a client requested under one binary
+// version to the filename its object is stored under.
+//
+// An entry with no explicit filename is stored under its url's last segment,
+// and for a url with no path that segment is the authority, userinfo and all:
+// https://user:secret@host is stored as "user:secret@host". The public read
+// API withholds the userinfo, so the web UI derives "host" from the same url
+// and asks for that. Renaming the object would strand every copy an existing
+// install already holds, so the request is mapped here instead. A requested
+// name some entry is stored under is never remapped, so the public name cannot
+// shadow another entry's object in the shared directory an unversioned entry
+// uses.
+func (pm *PackageManifest) BinaryStoredFilename(version, requested string) string {
+	if pm == nil {
+		return requested
+	}
+	for _, ve := range pm.Versions {
+		if ve.Version == version && binaryStoredName(ve) == requested {
+			return requested
+		}
+	}
+	for _, ve := range pm.Versions {
+		if ve.Version != version || ve.Filename != "" {
+			continue
+		}
+		stored := lastSegment(ve.URL)
+		if public := lastSegment(PublicURL(ve.URL)); public != "" && public == requested && public != stored {
+			return stored
+		}
+	}
+	return requested
+}
+
+func binaryStoredName(ve VersionEntry) string {
+	if ve.Filename != "" {
+		return ve.Filename
+	}
+	return lastSegment(ve.URL)
+}
+
 // GitKey returns the key for a git bundle or release archive. release selects
 // the extension: a cloned repo ships as a bundle, a tagged release as the
 // upstream tarball.
@@ -373,10 +413,7 @@ func ArtifactKeys(pm *PackageManifest, ve VersionEntry) ([]string, error) {
 	}
 	switch pm.Type {
 	case TypeBinary:
-		filename := ve.Filename
-		if filename == "" {
-			filename = lastSegment(ve.URL)
-		}
+		filename := binaryStoredName(ve)
 		if filename == "" {
 			return nil, fmt.Errorf("binary %s@%s has neither filename nor URL to derive one from", pm.Name, ve.Version)
 		}

@@ -938,8 +938,8 @@ components:
           type: string
           description: >-
             The upstream this version is fetched from. Published without its
-            userinfo, username included, because the read routes take no
-            token; the stored manifest keeps it.
+            userinfo, username included, to every caller whatever its
+            address or token; the stored manifest keeps it.
         mode:
           type: string
           enum: [hosted, proxy]
