@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -109,6 +110,30 @@ var FreeBSDCatalogFiles = []string{FreeBSDMetaFile, FreeBSDDataFile, FreeBSDCata
 // one of these names is one no request can ever reach, whatever put it there.
 var FreeBSDLegacyRootFiles = []string{"digests.pkg", "digests.txz", "packagesite.txz", "repo.txz"}
 
+// FreeBSDFallbackRootFiles are the repository-root paths pkg asks for when the
+// served three are missing, and that a real repository may still publish.
+//
+// pkg 2.7.5 (libpkg/pkg_repo.c, pkg_repo_fetch_meta and
+// pkg_repo_fetch_extract_to_fd) asks for meta.conf and then meta.txz, and for
+// each of data and packagesite asks for <name>.pkg and then
+// <name>.<packing_format>, where packing_format is whatever meta.conf says
+// (tzst, txz, tbz, tgz or tar) and tzst when there is no meta.conf. A mirrored
+// repository serves only FreeBSDCatalogFiles, so a request for any of these
+// means its catalogue is not there yet, and fetching one from upstream would
+// serve upstream's catalogue over this mirror's objects. They are not on
+// FreeBSDLegacyRootFiles because pkg 1.17 through 1.20 publish the .tzst pair
+// for real, and a proxy-mode entry in front of such a repository needs them
+// fetched. packagesite.txz is on that list already and stays refused there.
+//
+// The data and packagesite names are pkg's defaults. A meta.conf naming other
+// archives sends a client elsewhere, and a mirror of that repository cannot
+// be built at all, because the mirror fetches the served three by name.
+var FreeBSDFallbackRootFiles = []string{
+	"meta.txz",
+	"data.tzst", "data.txz", "data.tbz", "data.tgz", "data.tar",
+	"packagesite.tzst", "packagesite.tbz", "packagesite.tgz", "packagesite.tar",
+}
+
 // FreeBSDReservedRoot reports whether a repository-relative path belongs to
 // the repository root rather than to a package, and names the file it lands on.
 //
@@ -136,7 +161,7 @@ func FreeBSDReservedRoot(repoPath string) (string, bool) {
 			return name, true
 		}
 	}
-	for _, name := range FreeBSDLegacyRootFiles {
+	for _, name := range slices.Concat(FreeBSDLegacyRootFiles, FreeBSDFallbackRootFiles) {
 		if strings.EqualFold(first, name) {
 			return name, true
 		}

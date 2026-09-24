@@ -238,6 +238,33 @@ defence against:
   turned off. `--from-origin` writes source names and `bodega profile check`
   reports the divergence; neither is a runtime gate, so an entry hand-written
   under a binary name is caught at `check` time or not at all.
+- **What a cache miss tells the upstream.** `proxy_cache_enabled: true` makes
+  bodega a cache, and a miss is a request from bodega's egress address to the
+  entry's `url` with the missing path appended. Whoever runs that host learns
+  what this instance asked for and when. For `freebsd` the `url` is a
+  repository root with the ABI already in it, so a miss on
+  `https://pkg.FreeBSD.org/FreeBSD:15:aarch64/base_release_1` discloses this
+  instance's ABI, the repository name and the package path. What reaches
+  upstream depends on the entry's mode:
+  - A `proxy` entry fetches every miss, with or without
+    `proxy_cache_enabled`: the catalogue on every `pkg update` once
+    `metadata_ttl` lapses, and each package on first install.
+  - A hosted `freebsd` entry, mirrored or generated, never fetches its
+    repository root. `meta.conf`, `data.pkg` and `packagesite.pkg` come from
+    the store or answer 404, and so do the names pkg falls back to when they
+    are missing (`meta.txz`, and `data` or `packagesite` under a
+    `packing_format` extension). A `pkg update` against a hosted entry sends
+    nothing upstream, finished mirror or not. A package the store does not
+    hold is still fetched on a miss when `proxy_cache_enabled` is `true`,
+    which sends the ABI, the repository and that package's path.
+  - With `proxy_cache_enabled: false`, a hosted entry sends nothing upstream
+    at request time. The mirror run that fills it (`bodega build fetch`) still
+    fetches the catalogue and every object it names, on the operator's
+    schedule rather than a client's.
+
+  An operator who wants a mirror no client request can make phone home sets
+  `proxy_cache_enabled: false` and accepts that a package the mirror lacks is
+  a 404.
 
 ## Out-of-scope distribution formats
 

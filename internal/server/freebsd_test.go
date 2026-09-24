@@ -207,6 +207,70 @@ func TestFreeBSDRefusesPathsNoCurrentRepositoryPublishes(t *testing.T) {
 	}
 }
 
+// pkg 2.7.5 asks for these after meta.conf, data.pkg and packagesite.pkg 404,
+// which is what a mirror that has not finished answers. Upstream serves every
+// one of them here, as a repository built by pkg 1.17 through 1.20 does for
+// the .tzst pair, so the assertion is about bodega not asking rather than
+// about upstream having nothing to give.
+func TestFreeBSDMirroredEntryNeverFetchesCatalogueFallbacks(t *testing.T) {
+	for _, file := range manifest.FreeBSDFallbackRootFiles {
+		t.Run(file, func(t *testing.T) {
+			var reached int
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				reached++
+				_, _ = w.Write([]byte("upstream catalogue, naming packages this mirror does not hold"))
+			}))
+			t.Cleanup(upstream.Close)
+
+			s := proxyingServer(t)
+			addVersion(t, s, manifest.TypeFreeBSD, "latest", manifest.VersionEntry{
+				Version: freeBSDABI,
+				URL:     upstream.URL,
+			})
+			seed(t, s, manifest.TypeFreeBSD, map[string]string{
+				manifest.FreeBSDKey(freeBSDABI, "latest", freeBSDHashedPath): "one mirrored package",
+			})
+
+			status, body := getStatusAndBody(t, s, freeBSDURL("latest", file))
+			if reached != 0 {
+				t.Fatalf("GET %s reached upstream %d times on a mirrored repository", file, reached)
+			}
+			if status != http.StatusNotFound {
+				t.Errorf("GET %s = %d, want 404: %s", file, status, body)
+			}
+			if !strings.Contains(body, "packagesite.pkg") {
+				t.Errorf("the refusal does not name what this repository serves: %q", body)
+			}
+		})
+	}
+}
+
+// The proxy half of the same names: a proxy-mode entry holds no catalogue of
+// its own, so a repository that publishes packagesite.tzst and no .pkg is
+// served the way pkg would read it directly.
+func TestFreeBSDProxyModeStillFetchesCatalogueFallbacks(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/packagesite.tzst" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(freeBSDCatalogBytes))
+	}))
+	t.Cleanup(upstream.Close)
+
+	s := proxyingServer(t)
+	addVersion(t, s, manifest.TypeFreeBSD, "latest", manifest.VersionEntry{
+		Version: freeBSDABI,
+		URL:     upstream.URL,
+		Mode:    manifest.ModeProxy,
+	})
+
+	status, body := getStatusAndBody(t, s, freeBSDURL("latest", "packagesite.tzst"))
+	if status != http.StatusOK || body != freeBSDCatalogBytes {
+		t.Errorf("GET packagesite.tzst on a proxy-mode entry = %d %q, want 200 and the upstream bytes", status, body)
+	}
+}
+
 // R7, the hosted half: an entry whose mode is hosted is served out of the
 // store and never reaches upstream, which is what makes the mirror a mirror
 // rather than a cache.
