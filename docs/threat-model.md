@@ -155,8 +155,9 @@ risk:
     password alone and a GitHub or GitLab token written as
     `https://<token>@host/` is a bare username to it. Where URL readers
     disagree about where the authority ends (a scheme-relative `//user@host`,
-    a browser reading `https:\\user@host`, curl reading past a `\`), it cuts
-    at the widest reading. The package routes (`/apt/`, `/freebsd/`,
+    a browser reading `https:\\user@host`, curl reading past a `\`, git
+    handing ssh everything before the host of `ssh://a#b@host/` or
+    `a?b@host:repo`, and decoding `%40` first), it cuts at the widest reading. The package routes (`/apt/`, `/freebsd/`,
     `/binaries/` and the rest) answer a failure with a fixed body and put the
     reason, url included, in the log. The error a manifest check returns
     quotes the manifest's fields verbatim for the operator at the CLI, so any
@@ -186,8 +187,10 @@ risk:
     backend permissions are the boundary. A binary entry with no `filename`
     whose url has no path is stored under an object key built from the
     authority, userinfo included, so anyone who can list that bucket or
-    directory reads the credential in the key name. `/binaries/` maps the
-    public name the web UI derives to that key without publishing it.
+    directory reads the credential in the key name. The read routes publish
+    such an entry with a `filename` of its own, `<host>-<tag>`, which no other
+    entry of that version is stored under or published as, and `/binaries/`
+    maps it back to the key without publishing the key.
 
   A manifest read from the API and pushed back through an import arrives
   without its credential. Userinfo is the only credential form this covers: a

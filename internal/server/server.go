@@ -999,14 +999,16 @@ func (s *Server) handleAPIPackageVersion(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "package not found"})
 		return
 	}
-	scoped := pm.ScopeToVersion(version)
+	// Public before scoping: a binary download name is chosen against every
+	// entry of the manifest, and the scoped copy holds one.
+	scoped := pm.Public().ScopeToVersion(version)
 	if scoped == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{
 			"error": fmt.Sprintf("version %q not found in %s/%s", version, t, name),
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, scoped.Public())
+	writeJSON(w, http.StatusOK, scoped)
 }
 
 // statusResponse is the JSON shape for /api/v1/status.

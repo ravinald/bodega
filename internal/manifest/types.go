@@ -334,7 +334,8 @@ type VersionEntry struct {
 
 // Public returns a copy of pm fit for the open read routes, which answer every
 // caller the same way whatever its address or token: every version's URL loses
-// its userinfo. pm is not modified, since the store may hand the same pointer
+// its userinfo, and a binary entry stored under its userinfo gets the filename
+// binaryDownloadNames gives it. pm is not modified, since the store may hand the same pointer
 // to the next reader.
 func (pm *PackageManifest) Public() *PackageManifest {
 	if pm == nil {
@@ -342,8 +343,12 @@ func (pm *PackageManifest) Public() *PackageManifest {
 	}
 	out := *pm
 	out.Versions = make([]VersionEntry, len(pm.Versions))
+	names := pm.binaryDownloadNames()
 	for i, ve := range pm.Versions {
 		ve.URL = PublicURL(ve.URL)
+		if name, ok := names[i]; ok {
+			ve.Filename = name
+		}
 		out.Versions[i] = ve
 	}
 	return &out
@@ -358,14 +363,19 @@ func (pm *PackageManifest) Public() *PackageManifest {
 // scheme "user" with an opaque remainder and reports no userinfo at all, and
 // which refuses the scp form git accepts.
 //
-// Where readers disagree about where the authority ends, the cut takes the
-// widest reading. A browser strips leading spaces and every tab and newline,
-// treats a "\" after the scheme as "/", and finds an authority after "https:"
-// with no slashes at all; curl reads a later "\" as part of the authority, and
-// git finds one before the first ":" of "user@host:path". Over-cutting
-// costs a display string, while under-cutting publishes the credential, so a
-// scheme followed by no slash is dropped with the userinfo: "user:secret@host"
-// has the same form and nothing tells the two apart.
+// The readers of a manifest url disagree about where its authority ends, and
+// the cut takes the widest of them. A browser strips leading spaces and every
+// tab and newline, treats a "\" after the scheme as "/", and finds an
+// authority after "https:" with no slashes at all; curl reads a later "\" as
+// part of the authority. git's ssh transport ends the host of "ssh://..." at
+// the first "/" alone, after percent-decoding it, and the host of the scp form
+// "user@host:path" at the first ":", so "?" and "#" end no authority there:
+// ssh is handed "a#b@host" and logs in as "a#b". So an authority after slashes,
+// or in a string with no scheme, ends at the first "/", and an "@" spelled
+// "%40" counts as one. Over-cutting costs a display string, while
+// under-cutting publishes the credential, so a scheme followed by no slash is
+// dropped with the userinfo: "user:secret@host" has the same form and nothing
+// tells the two apart.
 func PublicURL(raw string) string {
 	s := strings.Map(func(r rune) rune {
 		if r == '\t' || r == '\n' || r == '\r' {
@@ -381,18 +391,46 @@ func PublicURL(raw string) string {
 		start++
 	}
 	slashes := start > afterScheme
-	end := len(s)
-	if i := strings.IndexAny(s[start:], "/?#"); i >= 0 {
-		end = start + i
+
+	end := indexOrLen(s, start, "/")
+	if !slashes && afterScheme > 0 {
+		end = indexOrLen(s, start, "/?#")
 	}
-	at := strings.LastIndex(s[:end], "@")
-	if at < 0 {
+	cut := afterUserinfo(s[start:end])
+	if cut < 0 {
 		return raw
 	}
+	cut += start
+	prefix := ""
 	if slashes {
-		return s[:start] + s[at+1:]
+		prefix = s[:start]
 	}
-	return s[at+1:]
+	if s[start] == '[' && strings.IndexByte(s[start:cut], ']') < 0 {
+		prefix += "["
+	}
+	return prefix + s[cut:]
+}
+
+// indexOrLen returns the index of the first byte of s at or past from that is
+// in chars, or len(s) when none is.
+func indexOrLen(s string, from int, chars string) int {
+	if i := strings.IndexAny(s[from:], chars); i >= 0 {
+		return from + i
+	}
+	return len(s)
+}
+
+// afterUserinfo returns the offset in authority just past its last "@" or
+// "%40", or -1 when it holds neither.
+func afterUserinfo(authority string) int {
+	at := strings.LastIndexByte(authority, '@')
+	if at >= 0 {
+		at++
+	}
+	if enc := strings.LastIndex(strings.ToLower(authority), "%40"); enc >= 0 && enc+3 > at {
+		at = enc + 3
+	}
+	return at
 }
 
 // schemeLen returns the length of s's leading "scheme:", or 0 when s opens

@@ -2,6 +2,7 @@ package manifest
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -152,6 +153,19 @@ func TestPublicURL(t *testing.T) {
 		{"  https://audit-user:audit-secret@private.example/x", "https://private.example/x"},
 		{"ht\ttps://audit-user:audit-\nsecret@private.example/x", "https://private.example/x"},
 		{"ssh://git@private.example:22/x", "ssh://private.example:22/x"},
+		{"audit-user#audit-secret@private.example:repo.git", "private.example:repo.git"},
+		{"audit-user?audit-secret@private.example:repo.git", "private.example:repo.git"},
+		{"audit-user#audit-secret@private.example:org/repo.git", "private.example:org/repo.git"},
+		{"[audit-user#audit-secret@private.example:22]:repo.git", "[private.example:22]:repo.git"},
+		{"git@github.com:org/repo@v1.git", "github.com:org/repo@v1.git"},
+		{"ssh://audit-user#audit-secret@private.example/repo.git", "ssh://private.example/repo.git"},
+		{"ssh://audit-user?audit-secret@private.example/repo.git", "ssh://private.example/repo.git"},
+		{"ssh://[audit-user@private.example:22]/repo.git", "ssh://[private.example:22]/repo.git"},
+		{"ssh://audit-user%40audit-secret/repo.git", "ssh://audit-secret/repo.git"},
+		{"ssh://audit-user%40private.example/repo.git", "ssh://private.example/repo.git"},
+		{"https://private.example/x#frag@y", "https://private.example/x#frag@y"},
+		{"audit-user#audit-secret@private.example", "private.example"},
+		{"private.example/x?who=a@b", "private.example/x?who=a@b"},
 	} {
 		if got := PublicURL(tc.raw); got != tc.want {
 			t.Errorf("PublicURL(%q) = %q, want %q", tc.raw, got, tc.want)
@@ -172,23 +186,56 @@ func TestPublicLeavesTheManifestAlone(t *testing.T) {
 	}
 }
 
-// A root url stores its object under the authority, userinfo included; the
-// public name maps back to it. A name another entry is stored under is never
-// remapped, which matters in the shared directory unversioned entries use.
-func TestBinaryStoredFilename(t *testing.T) {
+// Every binary entry's published download name, filename when the public copy
+// sets one and the url's last segment otherwise as the web UI reads it,
+// resolves to that entry's own stored name, carries no userinfo, and is shared
+// with no other entry of its version. The manifest holds each collision the
+// shared unversioned directory allows: a redacted name another entry is
+// explicitly stored under, two urls that redact alike, and a name that would
+// collide with the tagged name itself.
+func TestBinaryDownloadNamesResolveToTheirOwnEntry(t *testing.T) {
 	pm := &PackageManifest{Type: TypeBinary, Name: "tool", Versions: []VersionEntry{
 		{Version: "1.0.0", URL: "https://u:" + "s@private.example"},
 		{Version: "2.0.0", URL: "https://private.example/dl/tool"},
-		{URL: "https://u:" + "s@shared.example"},
-		{Filename: "shared.example", URL: "https://private.example/other"},
+		{URL: "https://audit-user:" + "audit-secret@shared.example"},
+		{URL: "https://public.example/other", Filename: "shared.example"},
+		{URL: "https://other-user@shared.example"},
+		{URL: "https://public.example/x", Filename: "shared.example-3"},
+		{URL: "https://digest-user@shared.example", ArtifactDigest: "0123456789abcdef0123"},
+		{URL: "audit-user#audit-secret@shared.example"},
 	}}
+	pub := pm.Public()
+	seen := map[string]int{}
+	for i, ve := range pub.Versions {
+		name := ve.Filename
+		if name == "" {
+			name = lastSegment(ve.URL)
+		}
+		for _, secret := range []string{"audit-user", "audit-secret", "other-user", "digest-user", "u:s"} {
+			if strings.Contains(name, secret) || strings.Contains(ve.URL, secret) {
+				t.Errorf("entry %d publishes %q in %q / %q", i, secret, name, ve.URL)
+			}
+		}
+		key := ve.Version + "/" + name
+		if j, dup := seen[key]; dup {
+			t.Errorf("entries %d and %d both publish %q", j, i, key)
+		}
+		seen[key] = i
+		if got, want := pm.BinaryStoredFilename(ve.Version, name), binaryStoredName(pm.Versions[i]); got != want {
+			t.Errorf("entry %d: published %q resolves to %q, want its own %q", i, name, got, want)
+		}
+	}
+	if got := pub.Versions[6].Filename; got != "shared.example-0123456789ab" {
+		t.Errorf("a fetched entry's name = %q, want its digest as the tag", got)
+	}
+	if pm.Versions[2].Filename != "" {
+		t.Errorf("Public() set a filename on the manifest it was handed")
+	}
 	for _, tc := range []struct{ version, requested, want string }{
-		{"1.0.0", "private.example", "u:s@private.example"},
 		{"1.0.0", "u:s@private.example", "u:s@private.example"},
-		{"1.0.0", "other", "other"},
-		{"2.0.0", "tool", "tool"},
-		{"3.0.0", "private.example", "private.example"},
+		{"1.0.0", "private.example", "private.example"},
 		{"", "shared.example", "shared.example"},
+		{"3.0.0", "private.example-1", "private.example-1"},
 	} {
 		if got := pm.BinaryStoredFilename(tc.version, tc.requested); got != tc.want {
 			t.Errorf("BinaryStoredFilename(%q, %q) = %q, want %q", tc.version, tc.requested, got, tc.want)

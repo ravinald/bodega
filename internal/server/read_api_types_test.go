@@ -233,3 +233,102 @@ func TestBinaryDownloadLinkFromThePublicManifest(t *testing.T) {
 		})
 	}
 }
+
+// git reads an authority where a browser does not: the scp form ends its host
+// at the first ":" and "ssh://" at the first "/", so "#" and "?" are part of
+// the username ssh is handed. Each marker is asserted on its own, on every
+// route, from outside every admin range with no Authorization header.
+func TestReadAPIWithholdsGitUserinfo(t *testing.T) {
+	for _, raw := range []string{
+		"audit-user#audit-secret@private-upstream.example:repo.git",
+		"audit-user?audit-secret@private-upstream.example:repo.git",
+		"audit-user@private-upstream.example:repo.git",
+		"ssh://audit-user#audit-secret@private-upstream.example/repo.git",
+		"ssh://audit-user%40private-upstream.example/repo.git",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			s := hostedServer(t)
+			addVersion(t, s, manifest.TypeGit, "private", manifest.VersionEntry{Ref: "v1", URL: raw})
+			for _, path := range []string{
+				"/api/v1/packages",
+				"/api/v1/packages/" + manifest.TypeGit,
+				"/api/v1/packages/" + manifest.TypeGit + "/private",
+				"/api/v1/packages/" + manifest.TypeGit + "/private/v1",
+			} {
+				req := httptest.NewRequest(http.MethodGet, path, nil)
+				req.RemoteAddr = "203.0.113.9:40000"
+				rr := httptest.NewRecorder()
+				s.Handler().ServeHTTP(rr, req)
+				body := rr.Body.String()
+				if rr.Code != http.StatusOK {
+					t.Fatalf("GET %s = %d, want 200: %s", path, rr.Code, body)
+				}
+				if withheldFrom(body, "audit-secret") != "" {
+					t.Errorf("GET %s publishes the password half of %q: %s", path, raw, body)
+				}
+				if withheldFrom(body, "audit-user") != "" {
+					t.Errorf("GET %s publishes the username of %q: %s", path, raw, body)
+				}
+			}
+		})
+	}
+}
+
+// Unversioned binary entries share one directory, so a download name derived
+// from a redacted url can land on another entry's object. Starting from the
+// manifest the UI reads, every entry's link has to return that entry's own
+// bytes, with no credential in the manifest or the link. The fixture holds the
+// redacted name as another entry's explicit filename, and two urls that redact
+// to the same host.
+func TestBinaryDownloadLinksReachTheirOwnBytes(t *testing.T) {
+	s := hostedServer(t)
+	pm := &manifest.PackageManifest{Type: manifest.TypeBinary, Name: "tool", Versions: []manifest.VersionEntry{
+		{URL: "https://audit-user:" + "audit-secret@private-upstream.example"},
+		{URL: "https://public.example/other", Filename: "private-upstream.example"},
+		{URL: "https://other-user@private-upstream.example"},
+		{URL: "audit-user#audit-secret@private-upstream.example"},
+	}}
+	if err := s.store.SavePackage(t.Context(), pm); err != nil {
+		t.Fatal(err)
+	}
+	payloads := []string{"PRIVATE-ELF", "OTHER-ELF", "SECOND-PRIVATE-ELF", "SCHEMELESS-ELF"}
+	for i, ve := range pm.Versions {
+		keys, err := manifest.ArtifactKeys(pm, ve)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.typeStore(manifest.TypeBinary).Put(t.Context(), keys[0], []byte(payloads[i])); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	code, body := getStatusAndBody(t, s, "/api/v1/packages/binary/tool")
+	if code != http.StatusOK {
+		t.Fatalf("read: %d %s", code, body)
+	}
+	if withheldFrom(body, "audit-secret", "audit-user", "other-user") != "" {
+		t.Fatalf("the manifest the UI reads publishes userinfo: %s", body)
+	}
+	for i, v := range decodeJSON(t, body)["versions"].([]any) {
+		entry := v.(map[string]any)
+		filename, _ := entry["filename"].(string)
+		if filename == "" {
+			parts := strings.Split(entry["url"].(string), "/")
+			filename = parts[len(parts)-1]
+		}
+		path := "/binaries/tool/" + filename
+		code, got := getStatusAndBody(t, s, path)
+		if code != http.StatusOK || got != payloads[i] {
+			t.Errorf("entry %d's UI link %s = %d %q, want 200 %q", i, path, code, got, payloads[i])
+		}
+	}
+
+	for path, want := range map[string]string{
+		"/binaries/tool/private-upstream.example":                         "OTHER-ELF",
+		"/binaries/tool/audit-user:audit-secret@private-upstream.example": "PRIVATE-ELF",
+	} {
+		if code, got := getStatusAndBody(t, s, path); code != http.StatusOK || got != want {
+			t.Errorf("stored path %s = %d %q, want %q", path, code, got, want)
+		}
+	}
+}

@@ -980,7 +980,11 @@ components:
             than one copied from upstream.
         filename:
           type: string
-          description: Binary filename override
+          description: >-
+            Binary filename override. On the read routes, a binary entry whose
+            url has no path and carries userinfo is published with a filename
+            of its own that carries none; `/binaries/` serves it from the
+            entry's stored object.
         sha256:
           type: string
           description: Expected SHA-256 for binary downloads

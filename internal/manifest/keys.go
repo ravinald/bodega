@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -282,17 +283,9 @@ func BinaryKey(name, version, filename string) string {
 }
 
 // BinaryStoredFilename maps the filename a client requested under one binary
-// version to the filename its object is stored under.
-//
-// An entry with no explicit filename is stored under its url's last segment,
-// and for a url with no path that segment is the authority, userinfo and all:
-// https://user:secret@host is stored as "user:secret@host". The public read
-// API withholds the userinfo, so the web UI derives "host" from the same url
-// and asks for that. Renaming the object would strand every copy an existing
-// install already holds, so the request is mapped here instead. A requested
-// name some entry is stored under is never remapped, so the public name cannot
-// shadow another entry's object in the shared directory an unversioned entry
-// uses.
+// version to the filename its object is stored under: a name some entry of
+// that version is stored under is served as asked, and a name
+// binaryDownloadNames gave an entry is served from that entry's object.
 func (pm *PackageManifest) BinaryStoredFilename(version, requested string) string {
 	if pm == nil {
 		return requested
@@ -302,16 +295,72 @@ func (pm *PackageManifest) BinaryStoredFilename(version, requested string) strin
 			return requested
 		}
 	}
-	for _, ve := range pm.Versions {
-		if ve.Version != version || ve.Filename != "" {
-			continue
-		}
-		stored := lastSegment(ve.URL)
-		if public := lastSegment(PublicURL(ve.URL)); public != "" && public == requested && public != stored {
-			return stored
+	for i, name := range pm.binaryDownloadNames() {
+		if name == requested && pm.Versions[i].Version == version {
+			return binaryStoredName(pm.Versions[i])
 		}
 	}
 	return requested
+}
+
+// binaryDownloadNames returns, by index into pm.Versions, the filename the
+// read API publishes for each binary entry whose stored name carries
+// userinfo: one with no filename whose url has no path, so the object is
+// stored under the authority, https://user:secret@host as "user:secret@host".
+// The web UI links to filename when one is set and to the url's last segment
+// otherwise, and the published url has lost its userinfo, so without a name
+// here the link would be "host": another entry of the same version may be
+// stored under that name, or redact to it too.
+//
+// Each name is the redacted segment plus a tag, is stored under by no entry of
+// its version, and names no other entry. The tag is the start of the entry's
+// artifact_digest, which the read API already publishes, so a link read before
+// the manifest changed either reaches the same bytes or none. An entry never
+// fetched has no digest, and its tag is its position in pm.Versions, which
+// shifts when an earlier entry is removed. The object keeps its stored key, so
+// every install's existing copy and its old path still answer.
+func (pm *PackageManifest) binaryDownloadNames() map[int]string {
+	if pm == nil || pm.Type != TypeBinary {
+		return nil
+	}
+	var names map[int]string
+	for i, ve := range pm.Versions {
+		if ve.Filename != "" {
+			continue
+		}
+		base := lastSegment(PublicURL(ve.URL))
+		if base == lastSegment(ve.URL) {
+			continue
+		}
+		if base == "" {
+			base = "download"
+		}
+		tag := strconv.Itoa(i + 1)
+		if len(ve.ArtifactDigest) >= 12 {
+			tag = ve.ArtifactDigest[:12]
+		}
+		name := base + "-" + tag
+		for n := 2; pm.binaryNameTaken(ve.Version, name, names); n++ {
+			name = base + "-" + tag + "-" + strconv.Itoa(n)
+		}
+		if names == nil {
+			names = make(map[int]string)
+		}
+		names[i] = name
+	}
+	return names
+}
+
+func (pm *PackageManifest) binaryNameTaken(version, name string, given map[int]string) bool {
+	for j, ve := range pm.Versions {
+		if ve.Version != version {
+			continue
+		}
+		if binaryStoredName(ve) == name || given[j] == name {
+			return true
+		}
+	}
+	return false
 }
 
 func binaryStoredName(ve VersionEntry) string {
