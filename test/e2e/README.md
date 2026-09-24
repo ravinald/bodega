@@ -77,7 +77,7 @@ rather than guessing a dataset when `zfs list` names none. The cells on that
 dataset read published objects as a scratch account, `bodega-e2e-deny`, which
 the suite creates with `pw useradd` and removes at the end. It removes a
 leftover account of that name only when the comment field marks it as the
-suite's, and fails rather than reuse one that is not.
+suite's; one that is not stays in place and fails the run.
 
 ## Running it
 

@@ -74,12 +74,12 @@ FSRV_PT_TESTS=(
 )
 
 # The passthrough cells grant and deny a scratch account the suite creates and
-# removes. Not nobody: FreeBSD's ZFS never matches a named-user entry against
-# UID_NOBODY (zfs_zaccess_aces_check in zfs_acl.c, measured at kernel revision
-# 96841ea08dcf), because it maps every FUID it cannot resolve to that uid. A
-# user:nobody deny reads back from getfacl and denies nothing on any dataset,
-# so a read as nobody grades the mode bits. Not a base-system account either:
-# the entry has to name someone no other rule on the guest already governs.
+# removes. Not nobody: on this guest a user:nobody deny does not deny. A 0644
+# file in a traversable directory given `setfacl -a0 user:nobody:r::deny FILE`
+# reads back as user:65534:r-------------:-------:deny, yet
+# `sudo -n -u nobody /bin/cat FILE` prints the body and exits 0; the same
+# fixture naming www exits 1. The cause has not been established, so a read as
+# nobody proves nothing about the entry.
 # The comment field marks the account as this suite's, and nothing deletes an
 # account with that name unless the mark is there.
 FSRV_PRINCIPAL=bodega-e2e-deny

@@ -32,8 +32,9 @@ const zfsACLEnv = "BODEGA_FREEBSD_GUEST_ZFS_ACL"
 // afterwards, and explains why it is not nobody.
 const principalEnv = "BODEGA_FREEBSD_GUEST_PRINCIPAL"
 
-// uidNobody is UID_NOBODY in FreeBSD's sys/sys/conf.h. ZFS never matches a
-// named-user entry against it, so a read as that uid grades the mode bits.
+// uidNobody is nobody's uid on FreeBSD. A user:nobody deny entry does not stop
+// nobody reading the file on freebsd-server, so a read as that uid proves
+// nothing about the ACL.
 const uidNobody = 65534
 
 type principal struct {
