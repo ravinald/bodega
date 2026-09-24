@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"slices"
 	"strings"
 )
 
@@ -125,9 +124,15 @@ var FreeBSDLegacyRootFiles = []string{"digests.pkg", "digests.txz", "packagesite
 // for real, and a proxy-mode entry in front of such a repository needs them
 // fetched. packagesite.txz is on that list already and stays refused there.
 //
-// The data and packagesite names are pkg's defaults. A meta.conf naming other
-// archives sends a client elsewhere, and a mirror of that repository cannot
-// be built at all, because the mirror fetches the served three by name.
+// The data and packagesite names are pkg's defaults. meta.conf's data and
+// manifests keys rename them, and pkg asks for <renamed>.pkg and then
+// <renamed>.<packing_format>, so a client of a mirror whose meta.conf renames
+// them asks for names on no list here, and a hosted entry with
+// proxy_cache_enabled fetches those from upstream like any package.
+//
+// Unlike FreeBSDCatalogFiles, nothing ever writes a file under one of these
+// names, so only the name itself is reserved: a package under a directory
+// called data.tzst collides with no file this repository serves.
 var FreeBSDFallbackRootFiles = []string{
 	"meta.txz",
 	"data.tzst", "data.txz", "data.tbz", "data.tgz", "data.tar",
@@ -148,12 +153,16 @@ var FreeBSDFallbackRootFiles = []string{
 // the names live here because this is where the keys those writers collide in
 // are built.
 //
-// The first segment decides it, so "data.pkg/x.pkg" is refused as data.pkg. A
-// filesystem gives a name to a file or to a directory and not to both, and
-// storage.Local is a filesystem. Case folds for the same reason: APFS answers
-// "Meta.conf" with meta.conf, so the key scheme's case sensitivity is not what
-// decides whether two paths are one file. A package at the repository root is
-// an ordinary layout and stays admitted; these names alone are not its to take.
+// For the served and legacy names the first segment decides it, so
+// "data.pkg/x.pkg" is refused as data.pkg. A filesystem gives a name to a file
+// or to a directory and not to both, and storage.Local is a filesystem. Case
+// folds for the same reason: APFS answers "Meta.conf" with meta.conf, so the
+// key scheme's case sensitivity is not what decides whether two paths are one
+// file. A fallback name is refused as the whole path only, case folded, since
+// no file is ever written under it for a directory to collide with; an object
+// stored there is still one the route never serves from a hosted entry. A
+// package at the repository root is an ordinary layout and stays admitted;
+// these names alone are not its to take.
 func FreeBSDReservedRoot(repoPath string) (string, bool) {
 	first, _, _ := strings.Cut(repoPath, "/")
 	for _, name := range FreeBSDCatalogFiles {
@@ -161,8 +170,13 @@ func FreeBSDReservedRoot(repoPath string) (string, bool) {
 			return name, true
 		}
 	}
-	for _, name := range slices.Concat(FreeBSDLegacyRootFiles, FreeBSDFallbackRootFiles) {
+	for _, name := range FreeBSDLegacyRootFiles {
 		if strings.EqualFold(first, name) {
+			return name, true
+		}
+	}
+	for _, name := range FreeBSDFallbackRootFiles {
+		if strings.EqualFold(repoPath, name) {
 			return name, true
 		}
 	}

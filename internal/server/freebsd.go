@@ -119,7 +119,7 @@ func (s *Server) handleFreeBSD(w http.ResponseWriter, r *http.Request) {
 		// store's objects and tell upstream this host's ABI and repository.
 		s.logger.Debug("freebsd: refusing a catalogue fallback name on a repository that serves its own catalogue",
 			"abi", abi, "repo", repo, "file", rest)
-		http.Error(w, rest+" is not served by this repository: a mirrored or generated freebsd repository publishes meta.conf, data.pkg and packagesite.pkg at its root and fetches nothing else there from upstream; if those 404 too, the mirror has not finished", http.StatusNotFound)
+		http.Error(w, rest+" is not served by this repository: a mirrored or generated freebsd repository serves meta.conf, data.pkg and packagesite.pkg from its own store and never fetches a catalogue from upstream; if those 404 too, the mirror has not finished", http.StatusNotFound)
 		return
 	}
 

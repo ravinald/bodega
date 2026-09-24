@@ -3,6 +3,7 @@ package server
 import (
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -242,6 +243,44 @@ func TestFreeBSDMirroredEntryNeverFetchesCatalogueFallbacks(t *testing.T) {
 				t.Errorf("the refusal does not name what this repository serves: %q", body)
 			}
 		})
+	}
+}
+
+// The refusal is the fallback file, not the directory of the same name. A
+// package under data.tzst/ is served from the store and named by the
+// generated catalogue, while data.tzst itself still reaches nobody.
+func TestFreeBSDFallbackNamedDirectoryHoldsOrdinaryPackages(t *testing.T) {
+	const rel = "data.tzst/example.pkg"
+	prefix := manifest.FreeBSDRepoPrefix(freeBSDABI, "latest")
+	objects, err := freeBSDGeneratedObjects([]string{prefix + "data.tzst", prefix + rel}, prefix)
+	if err != nil {
+		t.Fatalf("list generated objects: %v", err)
+	}
+	if !slices.Equal(objects, []string{rel}) {
+		t.Errorf("generated catalogue names %v, want only %s", objects, rel)
+	}
+
+	var reached int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached++
+		_, _ = w.Write([]byte("upstream bytes"))
+	}))
+	t.Cleanup(upstream.Close)
+	s := proxyingServer(t)
+	addVersion(t, s, manifest.TypeFreeBSD, "latest", manifest.VersionEntry{
+		Version: freeBSDABI,
+		URL:     upstream.URL,
+	})
+	seed(t, s, manifest.TypeFreeBSD, map[string]string{prefix + rel: "package bytes"})
+
+	if status, body := getStatusAndBody(t, s, freeBSDURL("latest", rel)); status != http.StatusOK || body != "package bytes" {
+		t.Errorf("GET %s = %d %q, want 200 and the stored bytes", rel, status, body)
+	}
+	if status, _ := getStatusAndBody(t, s, freeBSDURL("latest", "data.tzst")); status != http.StatusNotFound {
+		t.Errorf("GET data.tzst = %d, want 404", status)
+	}
+	if reached != 0 {
+		t.Errorf("reached upstream %d times", reached)
 	}
 }
 
