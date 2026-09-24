@@ -4,30 +4,45 @@
 
 Everything that gates a merge in this repository is a unit test. `make check`
 runs seven legs, CI runs six jobs, and every one of them is `go test` or a
-linter. bodega serves eight package types to eight real clients, and until this
+linter. bodega serves nine package types to their native clients, and until this
 harness existed nothing automated had ever pointed `apt-get`, `pip`, `helm`,
-`npm`, `cargo`, `go`, `git` or `curl` at a running server and checked what came
-back.
+`npm`, `cargo`, `go`, `git`, `curl`, `pkg` or the ports tree's `make fetch` at a
+running server and checked what came back.
 
 This harness answers one question: **does a bodega built from this commit serve
-its eight package types to their native clients, enforce its access controls
+its nine package types to their native clients, enforce its access controls
 against a request that is not from loopback, and record what it did?**
 
-It runs from a workstation against two scratch guests, described under
+It runs from a workstation against four scratch guests, described under
 [Host requirements](#host-requirements). It does not run in CI and never will:
-it needs two hosts, a real network between them, and several minutes.
+it needs several hosts, a real network between them, and several minutes.
+
+| Client                                              | Guest            | Suite               |
+| --------------------------------------------------- | ---------------- | ------------------- |
+| `apt-get`, `pip`, `helm`, `npm`, `cargo`            | `client`         | `45-clients`        |
+| `git`, `curl`, the portable `pkg` build             | `client`         | `45-clients`        |
+| `go`                                                | `server`         | `45-clients`        |
+| `pkg install` onto a FreeBSD root                   | `freebsd`        | `47-freebsd-client` |
+| `make fetch` and `make checksum` in a ports tree    | `freebsd`        | `47-freebsd-client` |
+| none: `internal/storage`'s ACL and extattr syscalls | `freebsd-server` | `48-freebsd-server` |
+
+`48-freebsd-server` drives no client. It runs `internal/storage`'s own tests on
+`freebsd-server`, because the FreeBSD ACL and extended-attribute syscalls
+compile into no binary the Linux guests run: on ZFS and on a UFS memory disk
+mounted `-o acls`, each as an unprivileged user and as root.
 
 ## Host requirements
 
-Two guests, named in `test/e2e/hosts.env`. Copy `hosts.env.example` to create
-it; nothing in the repository names a host, and `run.sh` refuses to start until
-that file or the environment supplies both.
+Four guests, named in `test/e2e/hosts.env`: a Linux `server` and `client`, and a
+FreeBSD `freebsd` client (`E2E_FREEBSD_HOST`) and `freebsd-server`. Copy `hosts.env.example` to
+create it; nothing in the repository names a host, and `run.sh` refuses to start
+until that file or the environment supplies all four.
 
-Treat both as disposable. The suites run `bodega reset`,
+Treat all four as disposable. The suites run `bodega reset`,
 `pkg delete --remove-artifacts` and `userdel bodega`, and the last suite is
 destructive by design.
 
-Each guest needs:
+Each Linux guest needs:
 
 - A current Ubuntu or Debian release, on any architecture. The harness builds
   for the guest's own `GOARCH`, so an arm64 guest needs an arm64 build.
@@ -41,6 +56,16 @@ Each guest needs:
 The client guest also installs `npm`, `python3-pip`, `cargo` and `helm` during
 suite 45. Nothing else is required in advance: the harness installs what it
 needs and reports what it could not.
+
+Each FreeBSD guest needs a release with `pkg` bootstrapped, `curl`, the same
+`ssh` and `sudo` access, and room under `/var/tmp`. Suite 47 ships
+`dist/bodega-freebsd-arm64` to `freebsd`, so an amd64 guest needs that
+target changed. It points `pkg` at the Linux server through the stanza
+`bodega doctor --write-pkg-repo` writes, and removes the stanza again at the
+end. Suite 48 ships an `internal/storage` test binary to `freebsd-server`,
+compiles a `sys/acl.h` probe with the base system's `cc`, and creates and
+destroys a swap-backed memory disk (`md48`, override with
+`E2E_FREEBSD_MD_UNIT`) under `/var/tmp/bodega-e2e-storage`.
 
 ## Running it
 
@@ -56,7 +81,8 @@ needs and reports what it could not.
 Run the first three before an unattended pass. `--validate` catches a typo in a
 late suite in under a second; `--dry-run` proves every suite reaches its last
 check and writes `dry-run-plan.txt`, which is every command the real run will
-issue, in order.
+issue, in order. A dry run changes nothing outside its results directory:
+builds and deletions go into the plan, not the tree.
 
 Other flags: `--suite <prefix>` runs a subset (00-preflight always runs
 regardless, because it sets the reachability flags the others read),
@@ -147,9 +173,14 @@ recorded as a failure rather than as silence.
 **The host allowlist is declared, not flagged.** The suites call
 `bodega reset`, `pkg delete --remove-artifacts` and `userdel bodega`, and a
 production host commonly differs from a dev guest by one label.
-`e2e_host_for` resolves only the aliases `server` and `client`, so no suite can
-name a host however it is edited, and `run.sh` checks the two resolved names
-against `E2E_ALLOWED_HOSTS` so a typo in either declaration stops the run.
+`e2e_host_for` resolves only the aliases `server`, `client`, `freebsd` and
+`freebsd-server`, and exits 2 on anything else, so no suite can name a host however it is edited, and
+`run.sh` checks the four resolved names against `E2E_ALLOWED_HOSTS` so a typo in
+either declaration stops the run. An alias with no host configured stops it,
+naming the unset variable, before anything resolves. `freebsd` reads
+`E2E_FREEBSD_HOST` only: a `hosts.env` still setting the retired
+`E2E_FREEBSD_CLIENT_HOST` is refused with the rename spelled out rather than
+read under either name.
 Both live in `test/e2e/hosts.env`, which is not committed; copy
 `hosts.env.example` to create it.
 
@@ -195,9 +226,9 @@ Rules the harness enforces or depends on:
 
 - **Check ids are unique across every suite.** `run.sh` fails the run on a
   duplicate: two suites sharing an id make the known-issue map ambiguous.
-- **Prefix ids by area** (`PRE-`, `SHIP-`, `PIPE-`, `SRV-`, `CLI-`, `POL-`,
-  `PROF-`, `ACC-`, `PXY-`, `AUD-`, `INT-`, `SYS-`, `GAT-`, `UI-`, `DST-`,
-  `JSON-`) and keep them stable. A filed issue cites one.
+- **Prefix ids by area** (`PRE-`, `SHIP-`, `PIPE-`, `SRV-`, `CLI-`, `FBSD-`,
+  `FSRV-`, `POL-`, `PROF-`, `ACC-`, `PXY-`, `AUD-`, `INT-`, `SYS-`, `GAT-`,
+  `UI-`, `DST-`, `JSON-`) and keep them stable. A filed issue cites one.
 - **Never let a suite exit on a failed command.** `|| true` after every
   `e2e_on`; the check reads `$E2E_RC`.
 - **A suite that needs a value another suite produced must tolerate its
