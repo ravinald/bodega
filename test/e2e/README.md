@@ -70,7 +70,10 @@ compiles a `sys/acl.h` probe with the base system's `cc`, and creates and
 destroys a swap-backed memory disk (`md48`, override with
 `E2E_FREEBSD_MD_UNIT`) under `/var/tmp/bodega-e2e-storage`. It also creates
 and destroys a ZFS dataset, `bodega-e2e-passthrough`, as a child of whichever
-dataset holds `/var/tmp`, so `/var/tmp` has to be on ZFS. The cells on that
+dataset holds the storage root's parent (`/var/tmp` unless
+`E2E_FREEBSD_STORAGE_ROOT` moves it), so that parent has to be on ZFS. The
+suite creates the parent if it is missing, and blocks the passthrough cells
+rather than guessing a dataset when `zfs list` names none. The cells on that
 dataset read published objects as the base system's `www` account through
 `sudo -u www`.
 

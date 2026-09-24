@@ -255,6 +255,47 @@ t_ok "a dry run leaves an existing build output alone" 'an earlier build' \
 t_ok "a dry run contacts no guest" untouched \
 	"$([ -e "$work/contacted" ] && echo contacted || echo untouched)"
 
+# Suite 48 names its scratch dataset from `zfs list` of the storage root's
+# parent. The command runs here in a real shell, with sudo and zfs stubbed and
+# zfs refusing a path that does not exist the way the guest's does, so a lookup
+# ordered before the mkdir fails here as it did there.
+# shellcheck source=freebsd.sh
+. "$E2E_DIR/lib/freebsd.sh"
+mkdir -p "$work/zfsbin"
+printf '#!/bin/sh\nexec "$@"\n' >"$work/zfsbin/sudo"
+# shellcheck disable=SC2016  # expands in the stub, not here
+printf '#!/bin/sh\nfor a; do p="$a"; done\n[ -d "$p" ] || { echo "cannot open '"'"'$p'"'"'" >&2; exit 1; }\nprintf "%%s\\n" "${ZFS_STUB_OUT-zroot/var/tmp}"\n' \
+	>"$work/zfsbin/zfs"
+chmod +x "$work/zfsbin/sudo" "$work/zfsbin/zfs"
+# zfs_of <path> [ZFS_STUB_OUT] echoes "<rc>|<dataset or error>".
+zfs_of() {
+	(
+		# shellcheck disable=SC2329  # invoked by e2e_freebsd_zfs_dataset_of
+		e2e_on() {
+			shift
+			set +e
+			E2E_OUT="$(PATH="$work/zfsbin:$PATH" sh -c "$*" 2>"$work/zfs.err")"
+			E2E_RC=$?
+			set -e
+			E2E_ERR="$(cat "$work/zfs.err")"
+			return "$E2E_RC"
+		}
+		[ "$#" -gt 1 ] && export ZFS_STUB_OUT="$2"
+		rc=0
+		e2e_freebsd_zfs_dataset_of freebsd-server "$1" || rc=$?
+		if [ "$rc" -eq 0 ]; then printf '0|%s' "$E2E_OUT"; else printf '%s|%s' "$rc" "$E2E_ERR"; fi
+	)
+}
+t_ok "a storage root under an absent parent still names its dataset" "0|zroot/var/tmp" \
+	"$(zfs_of "$work/absent/nested")"
+t_ok "the absent parent exists after the lookup" yes \
+	"$([ -d "$work/absent/nested" ] && echo yes || echo no)"
+t_ok "an existing parent names its dataset" "0|zroot/var/tmp" "$(zfs_of "$work/absent/nested")"
+t_ok "empty zfs output names no dataset" "1|zfs list named no single dataset for $work/e: empty output" \
+	"$(zfs_of "$work/e" "")"
+t_ok "a leading slash names no dataset" 1 "$(zfs_of "$work/s" "/bodega" | awk -F"|" 'NR == 1 {print $1}')"
+t_ok "two lines name no dataset" 1 "$(zfs_of "$work/t" "$(printf 'a\nb')" | awk -F"|" 'NR == 1 {print $1}')"
+
 # ---- counters --------------------------------------------------------------
 
 t_ok "PASS counter agrees with the file" \

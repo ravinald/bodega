@@ -37,6 +37,8 @@
 . "${E2E_DIR:?run.sh sets E2E_DIR}/lib/assert.sh"
 # shellcheck source=../lib/remote.sh
 . "${E2E_DIR:?}/lib/remote.sh"
+# shellcheck source=../lib/freebsd.sh
+. "${E2E_DIR:?}/lib/freebsd.sh"
 
 # Preflight gates on the Linux pair only, and nothing here needs it.
 E2E_HOST=freebsd-server
@@ -100,15 +102,23 @@ fi
 
 # The passthrough dataset is a child of whichever dataset holds the storage
 # root's parent, so no pool name is assumed. Its name is fixed rather than
-# configurable because the teardown destroys it.
+# configurable because the teardown destroys it. When no dataset can be named,
+# every step that would create or destroy one is left out.
 E2E_HOST=freebsd-server
-e2e_on freebsd-server "zfs list -H -o name '${FSRV_ROOT%/*}'" || true
-FSRV_PT_DATASET="$E2E_OUT/bodega-e2e-passthrough"
 FSRV_PT_MNT="$FSRV_ROOT/zfspt"
+FSRV_PT_DATASET=""
+fsrv_pt_stale=""
+if e2e_freebsd_zfs_dataset_of freebsd-server "$(dirname "$FSRV_ROOT")"; then
+	FSRV_PT_DATASET="$E2E_OUT/bodega-e2e-passthrough"
+	fsrv_pt_stale="sudo zfs destroy -f '$FSRV_PT_DATASET' 2>/dev/null;"
+else
+	fsrv_pt_err="$E2E_ERR"
+	fsrv_pt_rc="$E2E_RC"
+fi
 
 # A memory disk or dataset left by a run that died is torn down first, so the
 # newfs below formats this run's disk and not a stale mount under it.
-e2e_on freebsd-server "sudo zfs destroy -f '$FSRV_PT_DATASET' 2>/dev/null; \
+e2e_on freebsd-server "$fsrv_pt_stale \
 	sudo umount '$FSRV_ROOT/ufs' 2>/dev/null; sudo mdconfig -d -u $FSRV_MD 2>/dev/null; \
 	sudo rm -rf '$FSRV_ROOT' && sudo mkdir -p '$FSRV_ROOT/zfs' '$FSRV_ROOT/ufs' && \
 	sudo mdconfig -a -t swap -s 64m -u $FSRV_MD && sudo newfs -U /dev/md$FSRV_MD >/dev/null && \
@@ -118,12 +128,19 @@ e2e_on freebsd-server "sudo zfs destroy -f '$FSRV_PT_DATASET' 2>/dev/null; \
 check_eq FSRV-02 "a UFS memory disk is mounted with POSIX.1e ACLs" "ufs rw,acls" "$E2E_OUT" \
 	"test/e2e/suites/48-freebsd-server.sh" "mdconfig -a -t swap; newfs -U; mount -o acls" "$E2E_RC"
 
-e2e_on freebsd-server "sudo zfs create -o aclmode=passthrough -o aclinherit=passthrough \
-	-o mountpoint='$FSRV_PT_MNT' '$FSRV_PT_DATASET' && sudo chown \"\$(id -un)\" '$FSRV_PT_MNT' && \
-	zfs get -H -o value aclmode,aclinherit,mountpoint '$FSRV_PT_DATASET' | paste -sd ' ' -" || true
-check_eq FSRV-07 "a scratch ZFS dataset is mounted with aclmode and aclinherit passthrough" \
-	"passthrough passthrough $FSRV_PT_MNT" "$E2E_OUT" \
-	"test/e2e/suites/48-freebsd-server.sh" "zfs create -o aclmode=passthrough -o aclinherit=passthrough $FSRV_PT_DATASET" "$E2E_RC"
+if [ -n "$FSRV_PT_DATASET" ]; then
+	e2e_on freebsd-server "sudo zfs create -o aclmode=passthrough -o aclinherit=passthrough \
+		-o mountpoint='$FSRV_PT_MNT' '$FSRV_PT_DATASET' && sudo chown \"\$(id -un)\" '$FSRV_PT_MNT' && \
+		zfs get -H -o value aclmode,aclinherit,mountpoint '$FSRV_PT_DATASET' | paste -sd ' ' -" || true
+	check_eq FSRV-07 "a scratch ZFS dataset is mounted with aclmode and aclinherit passthrough" \
+		"passthrough passthrough $FSRV_PT_MNT" "$E2E_OUT" \
+		"test/e2e/suites/48-freebsd-server.sh" "zfs create -o aclmode=passthrough -o aclinherit=passthrough $FSRV_PT_DATASET" "$E2E_RC"
+else
+	e2e_record FSRV-07 FAIL "a scratch ZFS dataset is mounted with aclmode and aclinherit passthrough" \
+		"a dataset holding $(dirname "$FSRV_ROOT")" "$fsrv_pt_err" \
+		"zfs list -H -o name $(dirname "$FSRV_ROOT")" "$fsrv_pt_rc" \
+		"test/e2e/lib/freebsd.sh; the storage root's parent has to be on ZFS"
+fi
 
 if e2e_put freebsd-server "$FSRV_BIN" /tmp/bodega-storage.test &&
 	e2e_put freebsd-server "$FSRV_GUEST_BIN" /tmp/bodega-guest.test &&
@@ -187,21 +204,27 @@ for fs in zfs ufs; do
 		fsrv_cell "$fs" "$who" storage.test "$FSRV_ROOT/$fs" "BODEGA_FREEBSD_GUEST_FS=$fs" "${FSRV_TESTS[@]}"
 	done
 done
-for who in user root; do
-	fsrv_cell zfspt "$who" guest.test "$FSRV_PT_MNT" "BODEGA_FREEBSD_GUEST_ZFS_ACL=passthrough/passthrough" "${FSRV_PT_TESTS[@]}"
-done
+if [ -n "$FSRV_PT_DATASET" ]; then
+	for who in user root; do
+		fsrv_cell zfspt "$who" guest.test "$FSRV_PT_MNT" "BODEGA_FREEBSD_GUEST_ZFS_ACL=passthrough/passthrough" "${FSRV_PT_TESTS[@]}"
+	done
+else
+	e2e_block FSRV-BLOCK-ZFSPT "passthrough cells" "no ZFS dataset holds $(dirname "$FSRV_ROOT"): $fsrv_pt_err"
+fi
 unset fs who
 unset -f fsrv_cell
 
 # ---- restore ---------------------------------------------------------------
 
 E2E_HOST=freebsd-server
-e2e_on freebsd-server "sudo zfs destroy '$FSRV_PT_DATASET'; zfs list -H -o name '$FSRV_PT_DATASET' 2>/dev/null || echo gone" || true
-check_eq FSRV-08 "the passthrough dataset is destroyed again" "gone" "$E2E_OUT" \
-	"test/e2e/suites/48-freebsd-server.sh" "zfs destroy $FSRV_PT_DATASET" "$E2E_RC"
+if [ -n "$FSRV_PT_DATASET" ]; then
+	e2e_on freebsd-server "sudo zfs destroy '$FSRV_PT_DATASET'; zfs list -H -o name '$FSRV_PT_DATASET' 2>/dev/null || echo gone" || true
+	check_eq FSRV-08 "the passthrough dataset is destroyed again" "gone" "$E2E_OUT" \
+		"test/e2e/suites/48-freebsd-server.sh" "zfs destroy $FSRV_PT_DATASET" "$E2E_RC"
+fi
 e2e_on freebsd-server "sudo umount '$FSRV_ROOT/ufs'; sudo mdconfig -d -u $FSRV_MD; sudo rm -rf '$FSRV_ROOT'; \
 	sudo mdconfig -l | awk -v u=md$FSRV_MD '{for (i = 1; i <= NF; i++) if (\$i == u) f = 1} END {print (f ? \"present\" : \"gone\")}'" || true
 check_eq FSRV-05 "the memory disk is destroyed again" "gone" "$E2E_OUT" \
 	"test/e2e/suites/48-freebsd-server.sh" "umount; mdconfig -d -u $FSRV_MD; mdconfig -l" "$E2E_RC"
 
-unset FSRV_ROOT FSRV_MD FSRV_BIN FSRV_GUEST_BIN FSRV_TESTS FSRV_PT_TESTS FSRV_PT_DATASET FSRV_PT_MNT fsrv_build_rc fsrv_guest_rc
+unset FSRV_ROOT FSRV_MD FSRV_BIN FSRV_GUEST_BIN FSRV_TESTS FSRV_PT_TESTS FSRV_PT_DATASET FSRV_PT_MNT fsrv_pt_stale fsrv_pt_err fsrv_pt_rc fsrv_build_rc fsrv_guest_rc

@@ -136,3 +136,26 @@ e2e_freebsd_upstream_stop() {
 	e2e_on "$1" "sudo systemctl stop $E2E_FREEBSD_UNIT 2>/dev/null; \
 		sudo systemctl reset-failed $E2E_FREEBSD_UNIT 2>/dev/null; true"
 }
+
+# e2e_freebsd_zfs_dataset_of <alias> <path>
+#
+# Sets E2E_OUT to the ZFS dataset holding <path> on the guest, creating <path>
+# first: `zfs list` names a dataset only for a path that exists, and a caller
+# building a child name from its empty output asks zfs to create "/child".
+# Anything other than one well-formed name returns 1 with the reason in
+# E2E_ERR, so no caller can go on to create or destroy a dataset it guessed.
+e2e_freebsd_zfs_dataset_of() {
+	local alias="$1" path="$2"
+	e2e_on "$alias" "sudo mkdir -p '$path' && zfs list -H -o name '$path'" || return 1
+	if [ "${E2E_DRY_RUN:-no}" = yes ]; then
+		E2E_OUT="dry-run-dataset-of$path"
+		return 0
+	fi
+	case "$E2E_OUT" in
+	'' | /* | *[!A-Za-z0-9_.:/-]*)
+		E2E_ERR="zfs list named no single dataset for $path: ${E2E_OUT:-empty output}"
+		E2E_RC=1
+		return 1
+		;;
+	esac
+}
