@@ -109,6 +109,36 @@ var FreeBSDCatalogFiles = []string{FreeBSDMetaFile, FreeBSDDataFile, FreeBSDCata
 // one of these names is one no request can ever reach, whatever put it there.
 var FreeBSDLegacyRootFiles = []string{"digests.pkg", "digests.txz", "packagesite.txz", "repo.txz"}
 
+// FreeBSDFallbackRootFiles are the repository-root paths pkg asks for when the
+// served three are missing, and that a real repository may still publish.
+//
+// pkg 2.7.5 (libpkg/pkg_repo.c, pkg_repo_fetch_meta and
+// pkg_repo_fetch_extract_to_fd) asks for meta.conf and then meta.txz, and for
+// each of data and packagesite asks for <name>.pkg and then
+// <name>.<packing_format>, where packing_format is whatever meta.conf says
+// (tzst, txz, tbz, tgz or tar) and tzst when there is no meta.conf. A mirrored
+// repository serves only FreeBSDCatalogFiles, so a request for any of these
+// means its catalogue is not there yet, and fetching one from upstream would
+// serve upstream's catalogue over this mirror's objects. They are not on
+// FreeBSDLegacyRootFiles because pkg 1.17 through 1.20 publish the .tzst pair
+// for real, and a proxy-mode entry in front of such a repository needs them
+// fetched. packagesite.txz is on that list already and stays refused there.
+//
+// The data and packagesite names are pkg's defaults. meta.conf's data and
+// manifests keys rename them, and pkg asks for <renamed>.pkg and then
+// <renamed>.<packing_format>, so a client of a mirror whose meta.conf renames
+// them asks for names on no list here, and a hosted entry with
+// proxy_cache_enabled fetches those from upstream like any package.
+//
+// Unlike FreeBSDCatalogFiles, nothing ever writes a file under one of these
+// names, so only the name itself is reserved: a package under a directory
+// called data.tzst collides with no file this repository serves.
+var FreeBSDFallbackRootFiles = []string{
+	"meta.txz",
+	"data.tzst", "data.txz", "data.tbz", "data.tgz", "data.tar",
+	"packagesite.tzst", "packagesite.tbz", "packagesite.tgz", "packagesite.tar",
+}
+
 // FreeBSDReservedRoot reports whether a repository-relative path belongs to
 // the repository root rather than to a package, and names the file it lands on.
 //
@@ -123,12 +153,16 @@ var FreeBSDLegacyRootFiles = []string{"digests.pkg", "digests.txz", "packagesite
 // the names live here because this is where the keys those writers collide in
 // are built.
 //
-// The first segment decides it, so "data.pkg/x.pkg" is refused as data.pkg. A
-// filesystem gives a name to a file or to a directory and not to both, and
-// storage.Local is a filesystem. Case folds for the same reason: APFS answers
-// "Meta.conf" with meta.conf, so the key scheme's case sensitivity is not what
-// decides whether two paths are one file. A package at the repository root is
-// an ordinary layout and stays admitted; these names alone are not its to take.
+// For the served and legacy names the first segment decides it, so
+// "data.pkg/x.pkg" is refused as data.pkg. A filesystem gives a name to a file
+// or to a directory and not to both, and storage.Local is a filesystem. Case
+// folds for the same reason: APFS answers "Meta.conf" with meta.conf, so the
+// key scheme's case sensitivity is not what decides whether two paths are one
+// file. A fallback name is refused as the whole path only, case folded, since
+// no file is ever written under it for a directory to collide with; an object
+// stored there is still one the route never serves from a hosted entry. A
+// package at the repository root is an ordinary layout and stays admitted;
+// these names alone are not its to take.
 func FreeBSDReservedRoot(repoPath string) (string, bool) {
 	first, _, _ := strings.Cut(repoPath, "/")
 	for _, name := range FreeBSDCatalogFiles {
@@ -138,6 +172,11 @@ func FreeBSDReservedRoot(repoPath string) (string, bool) {
 	}
 	for _, name := range FreeBSDLegacyRootFiles {
 		if strings.EqualFold(first, name) {
+			return name, true
+		}
+	}
+	for _, name := range FreeBSDFallbackRootFiles {
+		if strings.EqualFold(repoPath, name) {
 			return name, true
 		}
 	}

@@ -256,6 +256,45 @@ defence against:
   turned off. `--from-origin` writes source names and `bodega profile check`
   reports the divergence; neither is a runtime gate, so an entry hand-written
   under a binary name is caught at `check` time or not at all.
+- **What a cache miss tells the upstream.** `proxy_cache_enabled: true` makes
+  bodega a cache, and a miss is a request from bodega's egress address to the
+  entry's `url` with the missing path appended. Whoever runs that host learns
+  what this instance asked for and when. For `freebsd` the `url` is a
+  repository root with the ABI already in it, so a miss on
+  `https://pkg.FreeBSD.org/FreeBSD:15:aarch64/base_release_1` discloses this
+  instance's ABI, the repository name and the package path. What reaches
+  upstream depends on the entry's mode:
+  - A `proxy` entry fetches every miss, with or without
+    `proxy_cache_enabled`: the catalogue on every `pkg update` once
+    `metadata_ttl` lapses, and each package on first install.
+  - A hosted `freebsd` entry, mirrored or generated, never fetches the
+    repository-root names pkg asks for by default. `meta.conf`, `data.pkg`
+    and `packagesite.pkg` come from the store, or from the build for a
+    generated entry, or answer 404, and so do the names pkg falls back to when
+    they are missing (`meta.txz`, and `data` or `packagesite` under a
+    `packing_format` extension). A `pkg update` that asks only for those
+    names sends nothing upstream, finished mirror or not. A package the store
+    does not hold is still fetched on a miss when `proxy_cache_enabled` is
+    `true`, which sends the ABI, the repository and that package's path.
+  - The names are pkg's defaults, not fixed. pkg asks for its catalogue
+    archives by the `data` and `manifests` keys of the `meta.conf` it read,
+    as `<name>.pkg` then `<name>.<packing_format>`. A generated entry writes
+    the defaults, so its clients ask for nothing else. A mirrored entry serves
+    upstream's `meta.conf` as stored, so a mirror of a repository whose
+    `meta.conf` renames either archive sends its clients to names bodega does
+    not guard. With `proxy_cache_enabled: true` each of those is a cache miss:
+    it discloses the ABI and repository on every `pkg update`, and if
+    upstream serves the name, the client reads upstream's catalogue rather
+    than the mirror's. No `pkg.FreeBSD.org` repository renames either
+    archive; a private one might.
+  - With `proxy_cache_enabled: false`, a hosted entry sends nothing upstream
+    at request time. The mirror run that fills it (`bodega build fetch`) still
+    fetches the catalogue and every object it names, on the operator's
+    schedule rather than a client's.
+
+  An operator who wants a mirror no client request can make phone home sets
+  `proxy_cache_enabled: false` and accepts that a package the mirror lacks is
+  a 404.
 
 ## Out-of-scope distribution formats
 
