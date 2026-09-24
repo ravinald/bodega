@@ -289,7 +289,7 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 		logger.Error("pepper created but not handed to the service account; a token minted by another account will be refused",
 			"path", pst.Path, "error", err)
 	default:
-		logger.Error("could not load or create pepper file — token auth will not work", "error", err)
+		logger.Error("could not load or create pepper file — token auth will not work and the read API publishes no binary download links", "error", err)
 	}
 	for _, c := range pst.Shadowed {
 		args := []any{"in_force", pst.Path, "ignored", c.Path}

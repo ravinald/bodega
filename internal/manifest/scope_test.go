@@ -310,6 +310,10 @@ func TestBinaryDownloadNamesFailClosedAcrossKeys(t *testing.T) {
 	pm := &PackageManifest{Type: TypeBinary, Name: "tool", Versions: entries}
 	unkeyed := publishedBinaryNames(pm, nil)[0]
 	keyed := publishedBinaryNames(pm, aliasTestKey)[0]
+	if !IsWithheldBinaryAlias(unkeyed) || IsWithheldBinaryAlias(keyed) {
+		t.Errorf("withheld: unkeyed %q = %v, keyed %q = %v; want only the unkeyed name withheld",
+			unkeyed, IsWithheldBinaryAlias(unkeyed), keyed, IsWithheldBinaryAlias(keyed))
+	}
 	for _, name := range []string{unkeyed, keyed} {
 		if strings.Contains(name, "audit") {
 			t.Fatalf("published %q", name)
@@ -409,8 +413,8 @@ func TestBinaryAliasBindsTheBackend(t *testing.T) {
 	a := VersionEntry{Version: "1.0.0", URL: "https://" + authority}
 	b := VersionEntry{Version: "1.0.0", URL: "https://other/x", Filename: authority, Storage: "other"}
 	pm := &PackageManifest{Type: TypeBinary, Name: "tool", Versions: []VersionEntry{b, a}}
-	aliasA, _ := pm.binaryAliasName(aliasTestKey, a)
-	aliasB, _ := pm.binaryAliasName(aliasTestKey, b)
+	aliasA := pm.binaryAliasName(aliasTestKey, a)
+	aliasB := pm.binaryAliasName(aliasTestKey, b)
 	if aliasA == aliasB {
 		t.Fatalf("entries on two backends share the alias %q", aliasA)
 	}

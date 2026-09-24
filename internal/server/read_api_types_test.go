@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -582,8 +583,9 @@ func TestBinaryAliasCarriesNoUserinfoWhateverTheURLEndsIn(t *testing.T) {
 // alias as an explicit filename, the way an import of a public manifest does.
 // While the original is present the saved link reaches it; once it is removed
 // the link is a 404, and it stays a 404 on a server built afresh after the
-// pepper file changes and on one with no pepper at all. The copy is reachable
-// throughout at the link the public manifest gives it.
+// pepper file changes and on one that finds no pepper at all, which publishes
+// no link for either entry. The copy is reachable throughout at the link the
+// public manifest gives it.
 func TestBinaryAliasNeverBecomesAStoredName(t *testing.T) {
 	pepper := filepath.Join(t.TempDir(), "pepper")
 	prev := audit.DefaultPepperPaths
@@ -604,120 +606,106 @@ func TestBinaryAliasNeverBecomesAStoredName(t *testing.T) {
 	original := manifest.VersionEntry{Version: "1.0.0", URL: "http://audit-user:audit-secret@" + serve("ORIGINAL-ELF", "audit-user", "audit-secret")}
 	copyHost := serve("COPIED-ELF", "", "")
 
-	for _, tc := range []struct {
-		label   string
-		keyless bool
-	}{{"keyed", false}, {"keyless", true}} {
-		t.Run(tc.label, func(t *testing.T) {
-			if err := os.WriteFile(pepper, []byte(strings.Repeat("a", 64)), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			s := hostedServer(t)
-			if tc.keyless {
-				s.pepper = ""
-			}
-			objects := s.typeStore(manifest.TypeBinary)
-			fetch := func(versions ...manifest.VersionEntry) {
-				t.Helper()
-				if err := s.store.SavePackage(t.Context(), &manifest.PackageManifest{Type: manifest.TypeBinary, Name: "tool", Versions: versions}); err != nil {
-					t.Fatal(err)
-				}
-				cfg := &builder.Config{BuildRoot: t.TempDir(), BuildEnvInfo: &manifest.BuildEnv{Platform: "linux/arm64"}}
-				if sum := builder.FetchBinaries(cfg, s.store, "tool"); sum.Failures != 0 {
-					t.Fatalf("fetch: %+v", sum)
-				}
-				for _, p := range builder.BinaryArtifactPaths(cfg, s.store, "tool") {
-					data, err := os.ReadFile(p.Local)
-					if err != nil {
-						t.Fatal(err)
-					}
-					if err := objects.Put(t.Context(), p.ObjectKey, data); err != nil {
-						t.Fatal(err)
-					}
-				}
-			}
-			// links reads every entry as the web UI does, from outside every
-			// admin range with no token, and returns the page's own link for
-			// each in manifest order.
-			links := func(srv *Server) []string {
-				t.Helper()
-				req := httptest.NewRequest(http.MethodGet, "/api/v1/packages/binary/tool", nil)
-				req.RemoteAddr = "203.0.113.9:40000"
-				rr := httptest.NewRecorder()
-				srv.Handler().ServeHTTP(rr, req)
-				if rr.Code != http.StatusOK {
-					t.Fatalf("read: %d %s", rr.Code, rr.Body)
-				}
-				if withheldFrom(rr.Body.String(), "audit-secret", "audit-user") != "" {
-					t.Fatalf("the manifest the UI reads publishes userinfo: %s", rr.Body)
-				}
-				var out []string
-				for _, v := range decodeJSON(t, rr.Body.String())["versions"].([]any) {
-					entry := v.(map[string]any)
-					entry["name"] = "tool"
-					_, path, ok := strings.Cut(pageClientURL(t, manifest.TypeBinary, entry), "/binaries/")
-					if !ok {
-						t.Fatalf("the web UI offers no binary link for %v", entry)
-					}
-					out = append(out, "/binaries/"+path)
-				}
-				return out
-			}
-			// expect requests path from srv and wants body, or a 404 when
-			// body is empty.
-			expect := func(srv *Server, when, path, body string) {
-				t.Helper()
-				rr := httptest.NewRecorder()
-				srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
-				switch {
-				case body == "" && rr.Code != http.StatusNotFound:
-					t.Errorf("%s: %s = %d %q, want 404", when, path, rr.Code, rr.Body)
-				case body != "" && (rr.Code != http.StatusOK || rr.Body.String() != body):
-					t.Errorf("%s: %s = %d %q, want %q", when, path, rr.Code, rr.Body, body)
-				}
-			}
-			// A server with no pepper publishes aliases that resolve nowhere.
-			keyed := func(body string) string {
-				if tc.keyless {
-					return ""
-				}
-				return body
-			}
-
-			fetch(original)
-			saved := links(s)[0]
-			published := strings.TrimPrefix(saved, "/binaries/tool/1.0.0/")
-			if !manifest.IsBinaryAlias(published) {
-				t.Fatalf("the original is published as %q, not an alias", published)
-			}
-			expect(s, "original alone", saved, keyed("ORIGINAL-ELF"))
-
-			copied := manifest.VersionEntry{Version: "1.0.0", URL: "http://" + copyHost + "/copy", Filename: published}
-			fetch(copied, original)
-			expect(s, "copy ahead of the original", saved, keyed("ORIGINAL-ELF"))
-			expect(s, "copy ahead of the original, the copy's own link", links(s)[0], keyed("COPIED-ELF"))
-
-			fetch(copied)
-			expect(s, "original removed", saved, "")
-			expect(s, "original removed, the copy's own link", links(s)[0], keyed("COPIED-ELF"))
-
-			if err := os.WriteFile(pepper, []byte(strings.Repeat("b", 64)), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			cfg := *s.cfg
-			cfg.AuditDB = filepath.Join(t.TempDir(), "audit.db")
-			rotated := newServer(&cfg, s.store, storage.NewSingle(objects), "127.0.0.1:0", slog.New(slog.NewTextHandler(io.Discard, nil)))
-			t.Cleanup(func() { _ = rotated.auditDB.Close() })
-			if rotated.pepper == "" || rotated.pepper == s.pepper {
-				t.Fatalf("the rebuilt server did not load the rotated pepper")
-			}
-			expect(rotated, "after rotation", saved, "")
-			expect(rotated, "after rotation, the copy's own link", links(rotated)[0], "COPIED-ELF")
-			fetch(copied, original)
-			expect(rotated, "after rotation with the original back", saved, "")
-			expect(rotated, "after rotation with the original back, its new link", links(rotated)[1], "ORIGINAL-ELF")
-		})
+	if err := os.WriteFile(pepper, []byte(strings.Repeat("a", 64)), 0o600); err != nil {
+		t.Fatal(err)
 	}
+	s := hostedServer(t)
+	objects := s.typeStore(manifest.TypeBinary)
+	fetch := func(versions ...manifest.VersionEntry) {
+		t.Helper()
+		if err := s.store.SavePackage(t.Context(), &manifest.PackageManifest{Type: manifest.TypeBinary, Name: "tool", Versions: versions}); err != nil {
+			t.Fatal(err)
+		}
+		cfg := &builder.Config{BuildRoot: t.TempDir(), BuildEnvInfo: &manifest.BuildEnv{Platform: "linux/arm64"}}
+		if sum := builder.FetchBinaries(cfg, s.store, "tool"); sum.Failures != 0 {
+			t.Fatalf("fetch: %+v", sum)
+		}
+		for _, p := range builder.BinaryArtifactPaths(cfg, s.store, "tool") {
+			data, err := os.ReadFile(p.Local)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := objects.Put(t.Context(), p.ObjectKey, data); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// links reads every entry as the web UI does, from outside every
+	// admin range with no token, and returns the page's own link for
+	// each in manifest order.
+	links := func(srv *Server) []string {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/packages/binary/tool", nil)
+		req.RemoteAddr = "203.0.113.9:40000"
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("read: %d %s", rr.Code, rr.Body)
+		}
+		if withheldFrom(rr.Body.String(), "audit-secret", "audit-user") != "" {
+			t.Fatalf("the manifest the UI reads publishes userinfo: %s", rr.Body)
+		}
+		var out []string
+		for _, v := range decodeJSON(t, rr.Body.String())["versions"].([]any) {
+			entry := v.(map[string]any)
+			entry["name"] = "tool"
+			_, path, ok := strings.Cut(pageClientURL(t, manifest.TypeBinary, entry), "/binaries/")
+			if !ok {
+				t.Fatalf("the web UI offers no binary link for %v", entry)
+			}
+			out = append(out, "/binaries/"+path)
+		}
+		return out
+	}
+	// expect requests path from srv and wants body, or a 404 when
+	// body is empty.
+	expect := func(srv *Server, when, path, body string) {
+		t.Helper()
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+		switch {
+		case body == "" && rr.Code != http.StatusNotFound:
+			t.Errorf("%s: %s = %d %q, want 404", when, path, rr.Code, rr.Body)
+		case body != "" && (rr.Code != http.StatusOK || rr.Body.String() != body):
+			t.Errorf("%s: %s = %d %q, want %q", when, path, rr.Code, rr.Body, body)
+		}
+	}
+	fetch(original)
+	saved := links(s)[0]
+	published := strings.TrimPrefix(saved, "/binaries/tool/1.0.0/")
+	if !manifest.IsBinaryAlias(published) {
+		t.Fatalf("the original is published as %q, not an alias", published)
+	}
+	expect(s, "original alone", saved, "ORIGINAL-ELF")
+
+	copied := manifest.VersionEntry{Version: "1.0.0", URL: "http://" + copyHost + "/copy", Filename: published}
+	fetch(copied, original)
+	expect(s, "copy ahead of the original", saved, "ORIGINAL-ELF")
+	expect(s, "copy ahead of the original, the copy's own link", links(s)[0], "COPIED-ELF")
+
+	fetch(copied)
+	expect(s, "original removed", saved, "")
+	expect(s, "original removed, the copy's own link", links(s)[0], "COPIED-ELF")
+
+	if err := os.WriteFile(pepper, []byte(strings.Repeat("b", 64)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := *s.cfg
+	cfg.AuditDB = filepath.Join(t.TempDir(), "audit.db")
+	rotated := newServer(&cfg, s.store, storage.NewSingle(objects), "127.0.0.1:0", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(func() { _ = rotated.auditDB.Close() })
+	if rotated.pepper == "" || rotated.pepper == s.pepper {
+		t.Fatalf("the rebuilt server did not load the rotated pepper")
+	}
+	expect(rotated, "after rotation", saved, "")
+	expect(rotated, "after rotation, the copy's own link", links(rotated)[0], "COPIED-ELF")
+	fetch(copied, original)
+	expect(rotated, "after rotation with the original back", saved, "")
+	expect(rotated, "after rotation with the original back, its new link", links(rotated)[1], "ORIGINAL-ELF")
+
+	keyless := keylessServer(t, &cfg, s.store, storage.NewSingle(objects))
+	expect(keyless, "with no pepper", saved, "")
+	assertNoPublishedBinaryLinks(t, keyless, "with no pepper")
 }
 
 // A saved alias names one entry on one backend. The original, a url with
@@ -940,4 +928,180 @@ func TestPublicBinaryLinkKeepsItsEntryAcrossBackends(t *testing.T) {
 
 	save(other)
 	expect("original removed", saved, "")
+}
+
+// keylessServer builds a server through newServer as bodega serve does, on a
+// host where the pepper cannot be loaded or created: the only candidate path
+// holds an empty, read-only file, which the resolver treats as absent and the
+// creator cannot overwrite. That is a state the server logs and keeps serving
+// in, not one Start refuses.
+func keylessServer(t *testing.T, cfg *config.Config, store *manifest.Store, stores storage.Resolver) *Server {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("root writes a read-only pepper file, so no keyless server can be built here")
+	}
+	dir := filepath.Join(t.TempDir(), "private")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pepper := filepath.Join(dir, "pepper")
+	if err := os.WriteFile(pepper, nil, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	prev := audit.DefaultPepperPaths
+	audit.DefaultPepperPaths = []string{pepper}
+	t.Cleanup(func() { audit.DefaultPepperPaths = prev })
+
+	c := *cfg
+	c.LogDir = t.TempDir()
+	c.AuditDB = filepath.Join(t.TempDir(), "audit.db")
+	s := newServer(&c, store, stores, "127.0.0.1:0", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(func() {
+		if s.auditDB != nil {
+			_ = s.auditDB.Close()
+		}
+	})
+	if s.pepper != "" || s.pepperErr != nil {
+		t.Fatalf("the server loaded a pepper (%q) or refused one (%v); the fixture meant it to find none", s.pepper, s.pepperErr)
+	}
+	return s
+}
+
+// assertNoPublishedBinaryLinks reads every binary package from s as the web
+// UI does and fails on any entry the page would offer a download link for, or
+// whose published filename resolves.
+func assertNoPublishedBinaryLinks(t *testing.T, s *Server, when string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/packages/binary", nil)
+	req.RemoteAddr = "203.0.113.9:40000"
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("%s: read: %d %s", when, rr.Code, rr.Body)
+	}
+	if withheldFrom(rr.Body.String(), "audit-secret", "audit-user") != "" {
+		t.Fatalf("%s: the manifest the UI reads publishes userinfo: %s", when, rr.Body)
+	}
+	var pkgs []map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &pkgs); err != nil {
+		t.Fatal(err)
+	}
+	for _, pkg := range pkgs {
+		for _, v := range pkg["versions"].([]any) {
+			entry := v.(map[string]any)
+			entry["name"] = pkg["name"]
+			filename, _ := entry["filename"].(string)
+			if !manifest.IsWithheldBinaryAlias(filename) {
+				t.Errorf("%s: entry %v is published as %q, not the withheld alias", when, entry, filename)
+			}
+			if link := pageClientURL(t, manifest.TypeBinary, entry); link != "" {
+				t.Errorf("%s: the web UI offers %s for an entry the server cannot publish a link for", when, link)
+			}
+			path := "/binaries/" + pkg["name"].(string) + "/"
+			if ver, _ := entry["version"].(string); ver != "" {
+				path += ver + "/"
+			}
+			rr := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path+filename, nil))
+			if rr.Code != http.StatusNotFound {
+				t.Errorf("%s: withheld alias %s%s = %d %q, want 404", when, path, filename, rr.Code, rr.Body)
+			}
+		}
+	}
+}
+
+// A server that finds no pepper cannot mint an alias that names one entry,
+// and a stored name is served from whichever entry of its version comes first,
+// so any link it published would pass to an entry added ahead of the original
+// on another backend, and stay with it once the original is removed. It
+// publishes none: the read API gives every binary entry the withheld alias,
+// the page offers no link, and that alias answers 404, through insertion
+// ahead, insertion behind and removal. The original is fetched for real with
+// its credential onto the default backend and has no filename; the other
+// entry holds the same key on another backend.
+func TestKeylessServerPublishesNoBinaryLink(t *testing.T) {
+	serve := func(body, user string) string {
+		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if u, _, _ := r.BasicAuth(); u != user {
+				http.Error(w, "bad credentials", http.StatusUnauthorized)
+				return
+			}
+			_, _ = w.Write([]byte(body))
+		}))
+		t.Cleanup(up.Close)
+		return strings.TrimPrefix(up.URL, "http://")
+	}
+	allowLoopbackUpstreams(t)
+	original := manifest.VersionEntry{Version: "1.0.0", URL: "http://audit-user:audit-secret@" + serve("ORIGINAL-ELF", "audit-user") + "/tool"}
+	other := manifest.VersionEntry{Version: "1.0.0", URL: "http://" + serve("OTHER-BACKEND-ELF", "") + "/other", Filename: "tool", Storage: "other"}
+
+	cfg := &config.Config{
+		AptCodename:     "noble",
+		AllowPlaintext:  true,
+		AdminPermitCIDR: []string{"127.0.0.0/8", "::1/128"},
+		StorageBackend:  "local",
+		StoragePath:     t.TempDir(),
+		StorageBackends: map[string]config.StorageSpec{"other": {Driver: "local", Path: t.TempDir()}},
+	}
+	stores, err := storage.NewResolver(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := keylessServer(t, cfg, manifest.NewLocalStore(t.TempDir()), stores)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- s.Start(ctx) }()
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Start refused a server with no pepper (%v); the fixture meant to cover one that serves", err)
+	}
+
+	save := func(versions ...manifest.VersionEntry) {
+		t.Helper()
+		if err := s.store.SavePackage(t.Context(), &manifest.PackageManifest{Type: manifest.TypeBinary, Name: "tool", Versions: versions}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fetch := func(ve manifest.VersionEntry) {
+		t.Helper()
+		save(ve)
+		bcfg := &builder.Config{BuildRoot: t.TempDir(), BuildEnvInfo: &manifest.BuildEnv{Platform: "linux/arm64"}}
+		if sum := builder.FetchBinaries(bcfg, s.store, "tool"); sum.Total != 1 || sum.Failures != 0 {
+			t.Fatalf("fetch: %+v", sum)
+		}
+		backend, err := stores.ByName(ve.Storage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range builder.BinaryArtifactPaths(bcfg, s.store, "tool") {
+			data, err := os.ReadFile(p.Local)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := backend.Put(t.Context(), p.ObjectKey, data); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	fetch(other)
+	fetch(original)
+	assertNoPublishedBinaryLinks(t, s, "original alone")
+	save(other, original)
+	assertNoPublishedBinaryLinks(t, s, "other backend's entry added ahead")
+	save(original, other)
+	assertNoPublishedBinaryLinks(t, s, "other backend's entry added behind")
+	save(other)
+	assertNoPublishedBinaryLinks(t, s, "original removed")
+
+	for _, backend := range []string{"", "other"} {
+		st, err := stores.ByName(backend)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.Get(t.Context(), manifest.BinaryKey("tool", "1.0.0", "tool")); err != nil {
+			t.Errorf("backend %q lost its object, so the checks above prove nothing about it: %v", backend, err)
+		}
+	}
 }

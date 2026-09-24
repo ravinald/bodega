@@ -201,6 +201,9 @@ risk:
     whose entry is gone or has moved backend, or whose pepper has been
     rotated away, is a 404, never a request for an object stored under that
     spelling or for another entry holding the same key on another backend.
+    A server with no pepper publishes no binary download link: every entry
+    gets the all-zero withheld alias, which is a 404, because a stored name
+    would follow the order of the manifest rather than the entry.
     The TUI links by the same alias, so it reads the pepper file as well as
     the manifest store; where it cannot, it links a stored name only when the
     route serves that name from the entry's own backend, and otherwise shows

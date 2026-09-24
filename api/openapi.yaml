@@ -987,9 +987,11 @@ components:
             `/binaries/{name}/{version}/~/<tag>/<display>` serves that
             entry's stored object from the backend it records, or 404 once
             the entry is gone or has moved backend, or the server's pepper
-            has changed. A server with no pepper publishes the stored name
-            where the route serves it from the entry's own backend, and an
-            alias that answers 404 otherwise.
+            has changed. A server with no pepper publishes every binary
+            entry as the withheld alias,
+            `~/00000000000000000000000000000000/<display>`, which answers 404:
+            read it as no download link published. A request for a stored
+            name is still served from the first entry of its version.
         sha256:
           type: string
           description: Expected SHA-256 for binary downloads
