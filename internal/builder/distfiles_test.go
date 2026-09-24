@@ -37,6 +37,7 @@ func distfilesRun(t *testing.T, body string) (*Config, *manifest.Store, *atomic.
 	}
 	sum := sha256.Sum256([]byte(distfileBody))
 	put(tree, "Mk/bsd.licenses.db.mk", "")
+	put(tree, "Mk/bsd.port.mk", "LOCALBASE?=\t/usr/local\n")
 	put(tree, "sysutils/pcpustat/Makefile", "DIST_SUBDIR=\tpcpustat\n")
 	put(tree, "sysutils/pcpustat/distinfo", fmt.Sprintf("SHA256 (pcpustat/1.6.tar.bz2) = %x\nSIZE (pcpustat/1.6.tar.bz2) = %d\n", sum, len(distfileBody)))
 	put(tree, "games/adom/Makefile", "RESTRICTED=\tno redistribution\n")
@@ -173,7 +174,7 @@ func makeOnlyRefusal(name string) string {
 	case name == "conditional undef":
 		// D?= with D undeclared: make.conf may set D first, so the port
 		// refuses and names what to declare rather than reading NO_CDROM.
-		return "it reads D, which the port sets with ?="
+		return "it reads D, which make.conf"
 	case strings.HasPrefix(name, "slave whose"):
 		return "may obtain any distfile in the tree"
 	}
@@ -546,14 +547,23 @@ func TestDistfilesBuilderHoldsItsFirstEnvironment(t *testing.T) {
 	}
 }
 
-// The F25 audit fixture through the builder: ${P:tA} reads the symlink
-// target's NO_CDROM, so the fetch writes nothing, and bytes some other tool put
-// in the DISTDIR are refused on upload rather than skipped.
+// The F25 audit fixtures through the builder: ${P:tA} and ${P:H} both read the
+// symlink target's NO_CDROM, so the fetch writes nothing, and bytes some other
+// tool put in the DISTDIR are refused on upload rather than skipped.
 func TestDistfilesBuilderSymlinkBeforeParentIsRestricted(t *testing.T) {
+	for name, makefile := range map[string]string{
+		":tA": "P=${.CURDIR}/link/../restricted/terms.mk\n.include \"${P:tA}\"\n",
+		":H":  "P=${.CURDIR}/link/../restricted/leaf\n.include \"${P:H}/terms.mk\"\n",
+	} {
+		t.Run(name, func(t *testing.T) { symlinkBeforeParentBuilder(t, makefile) })
+	}
+}
+
+func symlinkBeforeParentBuilder(t *testing.T, makefile string) {
 	cfg, store, hits := distfilesRun(t, distfileBody)
 	tree := cfg.DistfilesPortsTree
 	for rel, body := range map[string]string{
-		"misc/probe/Makefile":            "P=${.CURDIR}/link/../restricted/terms.mk\n.include \"${P:tA}\"\nDISTINFO_FILE=${PORTSDIR}/sysutils/pcpustat/distinfo\n",
+		"misc/probe/Makefile":            makefile + "DISTINFO_FILE=${PORTSDIR}/sysutils/pcpustat/distinfo\n",
 		"misc/probe/restricted/terms.mk": "OK=yes\n",
 		"lang/restricted/terms.mk":       "NO_CDROM=symlink target terms\n",
 	} {

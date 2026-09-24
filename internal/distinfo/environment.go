@@ -69,7 +69,7 @@ var (
 
 // clientCheckVersion is hashed into every digest, so a client check written
 // under different rules never names an environment this one admits against.
-const clientCheckVersion = "bodega distfiles client check 1"
+const clientCheckVersion = "bodega distfiles client check 2"
 
 // reservedEnvVars are the variables the reader derives itself, or reads as a
 // port's own declaration. A client make.conf that set one would change every
@@ -208,10 +208,22 @@ var clientReserved = []string{"DISTINFO_FILE", "FILESDIR", "LICENSE", "LICENSE_P
 //     command line;
 //   - every declared variable make.conf, the environment or the command line
 //     sets, and every one make holds a value for when the fetch expands its
-//     sites, holds a declared value.
+//     sites, holds a declared value;
+//   - the command line sets no variable but a declared one or one the
+//     framework passes on (frameworkPinned), because a command-line variable
+//     overrides every assignment a port makes to it;
+//   - make runs without -e or -I, from .CURDIR, with .PATH and .SYSPATH as a
+//     stock host has them, so a relative include is looked for where the
+//     reader looks for it;
+//   - no makefile make.conf reads changes how make parses (.MAKEFLAGS, .PATH,
+//     .READONLY and the like) or sets a license, and every makefile read after
+//     make.conf is under /usr/share/mk, under the ports tree, or declared.
 //
-// The files are measured by the make that reads the port, as it starts, so
-// what is measured is what that make includes moments later. Each delivery is
+// The inputs are measured twice: as make.conf is read, before the port, and
+// again wherever BODEGA_DISTFILES_ENV is expanded, which is when the fetch
+// builds its site list or its DISTDIR, after every include of the port. So a
+// file that changes while make reads the port is seen by the second
+// measurement unless it is changed back before the fetch. Each delivery is
 // keyed by the name this sets: the HTTP route admits only under the digest the
 // server admitted against, and the builder writes its DISTDIR under a directory
 // named by it. A client that has drifted names "unsupported", which neither
@@ -230,8 +242,8 @@ func (e *Environment) ClientCheck() []byte {
 #
 # BODEGA_DISTFILES_ENV is "unsupported" when this host no longer holds what
 # bodega admitted against, and bodega serves nothing under that name.
-# BODEGA_DISTFILES_DRIFT names what differed, as far as it is known before the
-# port is read: make -V BODEGA_DISTFILES_ENV -V BODEGA_DISTFILES_DRIFT.
+# BODEGA_DISTFILES_DRIFT names what differed:
+# make -V BODEGA_DISTFILES_ENV -V BODEGA_DISTFILES_DRIFT.
 BODEGA_DISTFILES_DRIFT=
 `, e.digest)
 
@@ -241,24 +253,44 @@ BODEGA_DISTFILES_DRIFT=
 	}
 	sort.Strings(undefined)
 	fmt.Fprintf(&b, ".for _bodega_v in %s\n.  if defined(${_bodega_v})\nBODEGA_DISTFILES_DRIFT+=\t${_bodega_v}\n.  endif\n.endfor\n", strings.Join(undefined, " "))
-	// A license's permissions may be set under a name built from it, which
-	// no list can enumerate: refuse any spelling of one outside the tree.
-	b.WriteString(`_BODEGA_DISTFILES_ENVIRON!=	/usr/bin/env
-.if !empty(.MAKEOVERRIDES:MLICENSE_PERMS_*) || !empty(_BODEGA_DISTFILES_ENVIRON:MLICENSE_PERMS_*=*)
-BODEGA_DISTFILES_DRIFT+=	LICENSE_PERMS_*
-.endif
-_BODEGA_DISTFILES_CONF!=	/usr/bin/grep -l LICENSE ${.MAKE.MAKEFILES:N/usr/share/mk/*:N${.PARSEDIR}/${.PARSEFILE}} /dev/null 2>/dev/null || :
-.if !empty(_BODEGA_DISTFILES_CONF)
-BODEGA_DISTFILES_DRIFT+=	${_BODEGA_DISTFILES_CONF}
-.endif
-`)
 
 	names := make([]string, 0, len(e.vars))
 	for name := range e.vars {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	late := []string{"1"}
+	var allowed strings.Builder
+	for _, name := range append(append([]string(nil), names...), frameworkPinned...) {
+		allowed.WriteString(":N" + name)
+	}
+	// A license's permissions may be set under a name built from it, which
+	// no list can enumerate: refuse any spelling of one outside the tree.
+	fmt.Fprintf(&b, `_BODEGA_DISTFILES_ENVIRON!=	/usr/bin/env
+.if !empty(_BODEGA_DISTFILES_ENVIRON:MLICENSE_PERMS_*=*)
+BODEGA_DISTFILES_DRIFT+=	LICENSE_PERMS_*
+.endif
+_BODEGA_DISTFILES_ARGS:=	${.MAKEOVERRIDES:O:u%s}
+.if !empty(_BODEGA_DISTFILES_ARGS)
+BODEGA_DISTFILES_DRIFT+=	${_BODEGA_DISTFILES_ARGS}
+.endif
+_BODEGA_DISTFILES_FLAGS:=	${.MAKEFLAGS:M-[eI]*}
+.if !empty(_BODEGA_DISTFILES_FLAGS)
+BODEGA_DISTFILES_DRIFT+=	${_BODEGA_DISTFILES_FLAGS}
+.endif
+_BODEGA_DISTFILES_CONF!=	/usr/bin/grep -lE '%s' ${.MAKE.MAKEFILES:N/usr/share/mk/*:N${.PARSEDIR}/${.PARSEFILE}} /dev/null 2>/dev/null || :
+.if !empty(_BODEGA_DISTFILES_CONF)
+BODEGA_DISTFILES_DRIFT+=	${_BODEGA_DISTFILES_CONF}
+.endif
+_BODEGA_DISTFILES_READ:=	${.MAKE.MAKEFILES:@_bodega_f@N${_bodega_f}@:ts:}
+`, allowed.String(), confPattern)
+
+	// .MAKEFLAGS is read above, once: it holds each -V argument unexpanded,
+	// and -V '${BODEGA_DISTFILES_ENV}' would make a later read recursive.
+	late := []string{
+		`${"${.SYSPATH}" == "` + clientSysPath + `":?:.SYSPATH}`,
+		`${"${.PATH}" == ". ${.CURDIR}":?:.PATH}`,
+		`${"${.OBJDIR}" == "${.CURDIR}":?:.OBJDIR}`,
+	}
 	for i, name := range names {
 		var eq []string
 		for j, v := range e.vars[name] {
@@ -267,7 +299,7 @@ BODEGA_DISTFILES_DRIFT+=	${_BODEGA_DISTFILES_CONF}
 			eq = append(eq, fmt.Sprintf(`"${%s}" == "${%s}"`, name, ref))
 		}
 		fmt.Fprintf(&b, ".if defined(%s) && !(%s)\nBODEGA_DISTFILES_DRIFT+=\t%s\n.endif\n", name, strings.Join(eq, " || "), name)
-		late = append(late, fmt.Sprintf("(!defined(%s) || %s)", name, strings.Join(eq, " || ")))
+		late = append(late, fmt.Sprintf("${(!defined(%s) || %s):?:%s}", name, strings.Join(eq, " || "), name))
 	}
 
 	paths := make([]string, 0, len(e.files))
@@ -275,31 +307,42 @@ BODEGA_DISTFILES_DRIFT+=	${_BODEGA_DISTFILES_CONF}
 		paths = append(paths, p)
 	}
 	sort.Strings(paths)
+	var declared strings.Builder
 	for i, p := range paths {
 		f := e.files[p]
-		fmt.Fprintf(&b, ".if exists(%s)\n", p)
-		if len(f.sums) == 0 {
-			fmt.Fprintf(&b, "BODEGA_DISTFILES_DRIFT+=\t%s\n", p)
-		} else {
-			ref := fmt.Sprintf("_BODEGA_DISTFILES_F%d", i)
-			var ne []string
+		declared.WriteString(":N" + p)
+		// A file is hashed only while it is a regular one: a FIFO or a device
+		// at a declared path would hold every make on the client open.
+		measure := fmt.Sprintf("if [ -f %[1]s ]; then /usr/bin/timeout 10 /sbin/sha256 -q %[1]s 2>/dev/null || echo unreadable; elif [ -e %[1]s ]; then echo irregular; else echo absent; fi", p)
+		holds := func(ref string) string {
+			var eq []string
 			for _, sum := range f.sums {
-				ne = append(ne, fmt.Sprintf(`"${%s}" != "%s"`, ref, sum))
+				eq = append(eq, fmt.Sprintf(`"${%s}" == "%s"`, ref, sum))
 			}
-			fmt.Fprintf(&b, "%s!=\t/sbin/sha256 -q %s 2>/dev/null || echo unreadable\n.  if %s\nBODEGA_DISTFILES_DRIFT+=\t%s\n.  endif\n", ref, p, strings.Join(ne, " && "), p)
+			if f.absent {
+				eq = append(eq, fmt.Sprintf(`"${%s}" == "absent"`, ref))
+			}
+			return strings.Join(eq, " || ")
 		}
-		if !f.absent {
-			fmt.Fprintf(&b, ".else\nBODEGA_DISTFILES_DRIFT+=\t%s\n", p)
-		}
-		b.WriteString(".endif\n")
+		early, again := fmt.Sprintf("_BODEGA_DISTFILES_F%d", i), fmt.Sprintf("_BODEGA_DISTFILES_L%d", i)
+		fmt.Fprintf(&b, "%s!=\t%s\n.if !(%s)\nBODEGA_DISTFILES_DRIFT+=\t%s\n.endif\n", early, measure, holds(early), p)
+		fmt.Fprintf(&b, "%s=\t${:!%s!}\n", again, measure)
+		late = append(late, fmt.Sprintf("${(%s):?:%s}", holds(again), p))
 	}
+	late = append(late, fmt.Sprintf("${.MAKE.MAKEFILES:M/*:N%s/*:N${PORTSDIR:U/usr/ports}/*%s:${_BODEGA_DISTFILES_READ}}", clientSysPath, declared.String()))
 
-	// The declared variables are compared again where the fetch expands its
-	// sites, after the framework has set the ones make.conf does not.
-	fmt.Fprintf(&b, "BODEGA_DISTFILES_ENV=\t${\"${BODEGA_DISTFILES_DRIFT}\" != \"\":?%s:${%s:?%s:%s}}\n",
-		ClientUnsupported, strings.Join(late, " && "), e.digest, ClientUnsupported)
+	// Everything above that reads a variable, a file or the makefile list
+	// is expanded again wherever BODEGA_DISTFILES_ENV is, after the port has
+	// been read: += does not expand what it appends.
+	fmt.Fprintf(&b, "BODEGA_DISTFILES_DRIFT+=\t%s\n", strings.Join(late, " "))
+	fmt.Fprintf(&b, "BODEGA_DISTFILES_ENV=\t${\"${BODEGA_DISTFILES_DRIFT:M*}\" == \"\":?%s:%s}\n", e.digest, ClientUnsupported)
 	return []byte(b.String())
 }
+
+// confPattern is what the check refuses in a makefile make.conf reads: a
+// license setting, which would change every port's terms at once, and a
+// special target or variable that changes how make parses the port after it.
+const confPattern = `LICENSE|^[[:space:]]*\.[[:space:]]*(MAKEFLAGS|MFLAGS|READONLY|NOREADONLY|PATH|OBJDIR|POSIX|SYSPATH|CURDIR|PARSEDIR|PARSEFILE|MAKEOVERRIDES)`
 
 // ClientUnsupported is the environment a client check names when the client
 // no longer holds what admission assumed.

@@ -1,10 +1,14 @@
 package distinfo
 
 import (
+	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -277,9 +281,47 @@ func TestEnvironmentEmptySnapshotIsNotTheServerFile(t *testing.T) {
 	}
 }
 
+// A declared variable is what make.conf, the environment or the command line
+// hold, and a stock client holds LOCALBASE in none of them: above
+// bsd.port.pre.mk base make expands it to nothing. Below it the framework's
+// default applies, and a default the declaration does not list reaches no
+// client the check admits, unless the port assigns the variable after it.
+func TestDeclaredVariablesAroundTheFramework(t *testing.T) {
+	localbase := map[string][]string{"LOCALBASE": {"/opt/local"}}
+	for name, tc := range map[string]struct {
+		makefile string
+		files    map[string][]string
+		want     string // "" admits pcpustat
+	}{
+		"above the framework, unset":         {".include \"${LOCALBASE}/etc/x.mk\"\n.include <bsd.port.pre.mk>\n", map[string][]string{"/opt/local/etc/x.mk": {snapshot(t, "")}}, "/etc/x.mk leaves the ports tree"},
+		"above the framework, both declared": {".include \"${LOCALBASE}/etc/x.mk\"\n.include <bsd.port.pre.mk>\n", map[string][]string{"/opt/local/etc/x.mk": {snapshot(t, "")}, "/etc/x.mk": {Absent}}, ""},
+		"below the framework":                {".include <bsd.port.pre.mk>\n.include \"${LOCALBASE}/etc/x.mk\"\n", map[string][]string{"/opt/local/etc/x.mk": {snapshot(t, "")}}, ""},
+		// java/bootstrap-openjdk8/Makefile.update.
+		"defaulted again below the framework": {".include <bsd.port.pre.mk>\n.include \"${LOCALBASE}/etc/x.mk\"\nLOCALBASE?=\t/usr/local\n", map[string][]string{"/opt/local/etc/x.mk": {snapshot(t, "")}}, ""},
+		"assigned below the framework":        {".include <bsd.port.pre.mk>\n.include \"${LOCALBASE}/etc/x.mk\"\nLOCALBASE=\t/opt/local\n", map[string][]string{"/opt/local/etc/x.mk": {snapshot(t, "")}}, "assigns LOCALBASE below a framework include"},
+		// The command line wins over the port's own assignment.
+		"assigned by the port":                      {"LOCALBASE=\t${.CURDIR}\n.include \"${LOCALBASE}/etc/x.mk\"\n", map[string][]string{"/opt/local/etc/x.mk": {Absent}}, ""},
+		"assigned by the port, command line unread": {"LOCALBASE=\t${.CURDIR}\n.include \"${LOCALBASE}/etc/x.mk\"\n", nil, "/opt/local/etc/x.mk leaves the ports tree"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := portsTree(t)
+			write(t, root, "sysutils/pcpustat/Makefile", "LICENSE=\tBSD2CLAUSE\n"+tc.makefile)
+			write(t, root, "sysutils/pcpustat/etc/x.mk", "")
+			ix := loadWith(t, root, EnvironmentSpec{Variables: localbase, Files: tc.files})
+			e, err := ix.Lookup("pcpustat/1.6.tar.bz2")
+			switch {
+			case tc.want == "" && err != nil:
+				t.Fatalf("pcpustat: %v, want admitted", err)
+			case tc.want != "" && (!errors.Is(err, ErrRestricted) || !strings.Contains(e.Restricted, tc.want)):
+				t.Fatalf("pcpustat: %v (reason %q), want refused naming %q", err, e.Restricted, tc.want)
+			}
+		})
+	}
+}
+
 // The client check names every input admission assumed, so a client that
-// holds anything else names "unsupported". Its behavior under base FreeBSD
-// make is measured on a live client; this pins what it is written to test.
+// holds anything else names "unsupported". TestClientCheckUnderBaseMake runs
+// it; this pins what it is written to test on any host.
 func TestClientCheckNamesEveryDeclaredInput(t *testing.T) {
 	snap := snapshot(t, "PERL5_DEFAULT=5.42\n")
 	env, err := EnvironmentSpec{
@@ -294,19 +336,24 @@ func TestClientCheckNamesEveryDeclaredInput(t *testing.T) {
 		"for environment " + env.Digest(),
 		// Reserved and declared-undefined names, set anywhere outside the tree.
 		".for _bodega_v in DISTINFO_FILE FILESDIR LICENSE LICENSE_PERMS MASTERDIR NO_CDROM PKGDIR PKGNAMESUFFIX RESTRICTED\n",
-		"!empty(.MAKEOVERRIDES:MLICENSE_PERMS_*) || !empty(_BODEGA_DISTFILES_ENVIRON:MLICENSE_PERMS_*=*)",
-		"/usr/bin/grep -l LICENSE ${.MAKE.MAKEFILES:N/usr/share/mk/*:N${.PARSEDIR}/${.PARSEFILE}}",
+		"!empty(_BODEGA_DISTFILES_ENVIRON:MLICENSE_PERMS_*=*)",
+		// A command-line variable is declared or one the framework passes on.
+		"${.MAKEOVERRIDES:O:u:NLOCALBASE:NUSESDIR:NARCH:",
+		"/usr/bin/grep -lE '" + confPattern + "' ${.MAKE.MAKEFILES:N/usr/share/mk/*:N${.PARSEDIR}/${.PARSEFILE}}",
 		// Declared values, where make.conf sets them and where the fetch reads them.
 		"_BODEGA_DISTFILES_V0_0=\t/usr/local\n.if defined(LOCALBASE) && !(\"${LOCALBASE}\" == \"${_BODEGA_DISTFILES_V0_0}\")",
 		"_BODEGA_DISTFILES_V1_0=\t${PORTSDIR}/Mk/Uses\n",
 		// A file declared absent alone may not exist; one with a snapshot
-		// alone must exist and match it.
-		".if exists(/usr/local/etc/aspell.ver)\nBODEGA_DISTFILES_DRIFT+=\t/usr/local/etc/aspell.ver\n.endif\n",
-		"/sbin/sha256 -q /tmp/PERL5_DEFAULT",
-		"\" != \"348d182711a2886bc0a8eb38c2df85032e593d133971389f2563befc7cbbcb1c\"",
-		".else\nBODEGA_DISTFILES_DRIFT+=\t/etc/present.mk\n.endif\n",
-		"(!defined(LOCALBASE) || \"${LOCALBASE}\" == \"${_BODEGA_DISTFILES_V0_0}\")",
-		":?" + env.Digest() + ":unsupported}}\n",
+		// alone must exist, be a regular file and match it.
+		".if !(\"${_BODEGA_DISTFILES_F2}\" == \"absent\")\nBODEGA_DISTFILES_DRIFT+=\t/usr/local/etc/aspell.ver\n.endif\n",
+		"if [ -f /tmp/PERL5_DEFAULT ]; then /usr/bin/timeout 10 /sbin/sha256 -q /tmp/PERL5_DEFAULT 2>/dev/null || echo unreadable; elif [ -e /tmp/PERL5_DEFAULT ]; then echo irregular; else echo absent; fi",
+		".if !(\"${_BODEGA_DISTFILES_F0}\" == \"348d182711a2886bc0a8eb38c2df85032e593d133971389f2563befc7cbbcb1c\")\nBODEGA_DISTFILES_DRIFT+=\t/etc/present.mk\n",
+		// Measured again where the fetch expands the digest.
+		"${(!defined(LOCALBASE) || \"${LOCALBASE}\" == \"${_BODEGA_DISTFILES_V0_0}\"):?:LOCALBASE}",
+		"${(\"${_BODEGA_DISTFILES_L1}\" == \"348d182711a2886bc0a8eb38c2df85032e593d133971389f2563befc7cbbcb1c\" || \"${_BODEGA_DISTFILES_L1}\" == \"absent\"):?:/tmp/PERL5_DEFAULT}",
+		"_BODEGA_DISTFILES_FLAGS:=\t${.MAKEFLAGS:M-[eI]*}\n",
+		":N/etc/present.mk:N/tmp/PERL5_DEFAULT:N/usr/local/etc/aspell.ver:${_BODEGA_DISTFILES_READ}}",
+		":?" + env.Digest() + ":unsupported}\n",
 	} {
 		if !strings.Contains(check, want) {
 			t.Errorf("the check does not carry %q:\n%s", want, check)
@@ -314,6 +361,121 @@ func TestClientCheckNamesEveryDeclaredInput(t *testing.T) {
 	}
 	if strings.Contains(check, "PKGNAMESUFFIX}\" ==") {
 		t.Error("a variable declared undefined is compared at fetch time, where the port may set it itself")
+	}
+}
+
+// TestClientCheckUnderBaseMake installs the check at the end of a make.conf and
+// asks base FreeBSD make, in one port, which environment it names. Every case
+// but the first changes one input the reader's decision rests on, without
+// touching the port or the declaration, and must name "unsupported".
+func TestClientCheckUnderBaseMake(t *testing.T) {
+	if runtime.GOOS != "freebsd" {
+		t.Skip("the check is written for base FreeBSD make")
+	}
+	scratch := t.TempDir()
+	client := filepath.Join(scratch, "client")
+	tree := filepath.Join(scratch, "ports")
+	snap := snapshot(t, "OK=snapshot\n")
+	declared := filepath.Join(client, "snap.mk")
+	absent := filepath.Join(client, "aspell.ver")
+	write(t, scratch, "client/snap.mk", "OK=snapshot\n")
+	write(t, scratch, "ports/misc/probe/Makefile", "P=\t${.CURDIR}/allowed.mk\n.include \"${P}\"\n.if exists("+absent+")\n.include \""+absent+"\"\n.endif\nall:\n")
+	write(t, scratch, "ports/misc/probe/allowed.mk", "OK=yes\n")
+	write(t, scratch, "ports/misc/probe/restricted.mk", "NO_CDROM=command line terms\n")
+	env, err := EnvironmentSpec{
+		Variables: map[string][]string{"LOCALBASE": {"/usr/local"}},
+		Files:     map[string][]string{declared: {snap}, absent: {Absent}},
+	}.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkPath := filepath.Join(scratch, "environment.mk")
+	if err := os.WriteFile(checkPath, env.ClientCheck(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	conf := func(extra string) string {
+		p := filepath.Join(t.TempDir(), "make.conf")
+		if err := os.WriteFile(p, []byte(extra+"PORTSDIR=\t"+tree+"\n.include \""+checkPath+"\"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	extra := filepath.Join(scratch, "extra.mk")
+	write(t, scratch, "extra.mk", "P=\t"+tree+"/misc/probe/restricted.mk\n")
+	port := filepath.Join(tree, "misc/probe")
+	for _, tc := range []struct {
+		name  string
+		conf  string
+		env   []string
+		args  []string
+		setup func()
+		want  string // the digest, or "unsupported"
+	}{
+		{name: "stock", want: env.Digest()},
+		// -V keeps its argument unexpanded in .MAKEFLAGS, where a check that
+		// read .MAKEFLAGS while expanding the digest would recurse.
+		{name: "-V naming the digest as an expression", args: []string{"-V", "${BODEGA_DISTFILES_ENV}"}, want: env.Digest()},
+		{name: "a declared variable at a declared value", args: []string{"LOCALBASE=/usr/local"}, want: env.Digest()},
+		{name: "a variable the framework passes on", args: []string{"OSVERSION=1501000"}, want: env.Digest()},
+		{name: "a declared variable at another value", args: []string{"LOCALBASE=/opt"}},
+		{name: "an undeclared command-line variable", args: []string{"P=" + port + "/restricted.mk"}},
+		{name: "an undeclared variable through MAKEFLAGS", env: []string{"MAKEFLAGS=P=" + port + "/restricted.mk"}},
+		{name: "-e", args: []string{"-e"}},
+		{name: "-I", args: []string{"-I", scratch}},
+		{name: "-m", args: []string{"-m", scratch, "-m", "/usr/share/mk"}},
+		{name: ".MAKEFLAGS in make.conf", conf: ".MAKEFLAGS: P=" + port + "/restricted.mk\n"},
+		{name: ".READONLY in make.conf", conf: "P=\t" + port + "/restricted.mk\n.READONLY: P\n"},
+		{name: "a makefile read after make.conf", args: []string{"-f", extra, "-f", "Makefile"}},
+		{name: "a declared snapshot changed", setup: func() { write(t, scratch, "client/snap.mk", "NO_CDROM=changed\n") }},
+		{name: "a file declared absent, present before make", setup: func() { write(t, scratch, "client/aspell.ver", "NO_CDROM=host\n") }},
+		// The port writes the file itself once make.conf has been read, as a
+		// concurrent writer would: only the second measurement can see it.
+		{name: "a file declared absent, written while make reads the port", setup: func() {
+			write(t, scratch, "ports/misc/probe/Makefile", "_W!=\tprintf 'NO_CDROM=host\\n' > "+absent+"\n.if exists("+absent+")\n.include \""+absent+"\"\n.endif\nall:\n")
+		}},
+		// A FIFO no writer holds open: reading it would block make forever.
+		{name: "a FIFO where a snapshot is declared", setup: func() {
+			if err := os.Remove(declared); err != nil {
+				t.Fatal(err)
+			}
+			if err := syscall.Mkfifo(declared, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "an obj directory", setup: func() {
+			if err := os.MkdirAll(filepath.Join(port, "obj"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_ = os.RemoveAll(filepath.Join(port, "obj"))
+			_ = os.Remove(absent)
+			_ = os.Remove(declared)
+			write(t, scratch, "client/snap.mk", "OK=snapshot\n")
+			write(t, scratch, "ports/misc/probe/Makefile", "P=\t${.CURDIR}/allowed.mk\n.include \"${P}\"\n.if exists("+absent+")\n.include \""+absent+"\"\n.endif\nall:\n")
+			if tc.setup != nil {
+				tc.setup()
+			}
+			want := tc.want
+			if want == "" {
+				want = ClientUnsupported
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, "make", append(append([]string{"-C", port}, tc.args...), "-V", "BODEGA_DISTFILES_ENV", "-V", "BODEGA_DISTFILES_DRIFT")...)
+			cmd.WaitDelay = time.Second
+			cmd.Env = append(append(os.Environ(), "__MAKE_CONF="+conf(tc.conf)), tc.env...)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("make: %v\n%s", err, out)
+			}
+			lines := strings.SplitN(string(out), "\n", 2)
+			t.Logf("%s", strings.TrimSpace(string(out)))
+			if lines[0] != want {
+				t.Errorf("the check names %q, want %q", lines[0], want)
+			}
+		})
 	}
 }
 

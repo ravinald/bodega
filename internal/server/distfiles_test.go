@@ -38,6 +38,7 @@ func distfilesPortsTree(t *testing.T) string {
 	}
 	sum := sha256.Sum256([]byte(distfileBody))
 	put("Mk/bsd.licenses.db.mk", "")
+	put("Mk/bsd.port.mk", "LOCALBASE?=\t/usr/local\n")
 	put("sysutils/pcpustat/Makefile", "DIST_SUBDIR=\tpcpustat\n")
 	put("sysutils/pcpustat/distinfo", fmt.Sprintf("SHA256 (pcpustat/1.6.tar.bz2) = %x\nSIZE (pcpustat/1.6.tar.bz2) = %d\n", sum, len(distfileBody)))
 	put("graphics/nonfree/Makefile", "LICENSE_PERMS=\tno-dist-mirror no-dist-sell auto-accept\n")
@@ -241,7 +242,7 @@ func makeOnlyRefusal(name string) string {
 	case name == "conditional undef":
 		// D?= with D undeclared: make.conf may set D first, so the port
 		// refuses and names what to declare rather than reading NO_CDROM.
-		return "it reads D, which the port sets with ?="
+		return "it reads D, which make.conf"
 	case strings.HasPrefix(name, "slave whose"):
 		return "may obtain any distfile in the tree"
 	}
@@ -540,12 +541,22 @@ func TestDistfilesRefusesAClientOutsideTheEnvironment(t *testing.T) {
 	}
 }
 
-// The F25 audit fixture through HTTP: ${P:tA} resolves link/.. after the
-// symlink, as realpath(3) does, and reads the NO_CDROM base make reads.
+// The F25 audit fixtures through HTTP: ${P:tA} resolves link/.. after the
+// symlink, as realpath(3) does, and ${P:H} leaves it for open(2) to, so both
+// read the NO_CDROM base make reads.
 func TestDistfilesSymlinkBeforeParentIsRestricted(t *testing.T) {
+	for name, makefile := range map[string]string{
+		":tA": "P=${.CURDIR}/link/../restricted/terms.mk\n.include \"${P:tA}\"\n",
+		":H":  "P=${.CURDIR}/link/../restricted/leaf\n.include \"${P:H}/terms.mk\"\n",
+	} {
+		t.Run(name, func(t *testing.T) { symlinkBeforeParentHTTP(t, makefile) })
+	}
+}
+
+func symlinkBeforeParentHTTP(t *testing.T, makefile string) {
 	tree := distfilesPortsTree(t)
 	for rel, body := range map[string]string{
-		"misc/probe/Makefile":            "P=${.CURDIR}/link/../restricted/terms.mk\n.include \"${P:tA}\"\nDISTINFO_FILE=${PORTSDIR}/sysutils/pcpustat/distinfo\n",
+		"misc/probe/Makefile":            makefile + "DISTINFO_FILE=${PORTSDIR}/sysutils/pcpustat/distinfo\n",
 		"misc/probe/restricted/terms.mk": "OK=yes\n",
 		"lang/restricted/terms.mk":       "NO_CDROM=symlink target terms\n",
 	} {

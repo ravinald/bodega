@@ -107,6 +107,9 @@ func portsTree(t *testing.T) string {
 	write(t, root, "Mk/bsd.licenses.db.mk", "_LICENSE_PERMS_DEFAULT=\tdist-mirror dist-sell pkg-mirror pkg-sell auto-accept\n"+
 		"_LICENSE_PERMS_CC-BY-NC-4.0=\tdist-mirror pkg-mirror auto-accept\n"+
 		"_LICENSE_PERMS_BSD2CLAUSE=\tdist-mirror dist-sell pkg-mirror pkg-sell auto-accept\n")
+	// The two unconditional defaults of the stock framework a declaration
+	// here names, so a declared variable is defined below a framework include.
+	write(t, root, "Mk/bsd.port.mk", "LOCALBASE?=\t\t/usr/local\n.if defined(X)\nUSESDIR?=\t/elsewhere\n.endif\nUSESDIR?=\t\t${PORTSDIR}/Mk/Uses\n")
 
 	write(t, root, "sysutils/pcpustat/Makefile", "PORTNAME=\tpcpustat\nDIST_SUBDIR=\tpcpustat\nLICENSE=\tBSD2CLAUSE\n")
 	write(t, root, "sysutils/pcpustat/distinfo", distinfoFor("pcpustat/1.6.tar.bz2", sumA, 5135))
@@ -256,7 +259,28 @@ func TestRestrictionFailsClosedOnWhatItCannotRead(t *testing.T) {
 		{"unresolvable include", map[string]string{"Makefile": ".include \"${WHERE}/x.mk\"\n"}, "cannot be resolved"},
 		{"missing include", map[string]string{"Makefile": ".include \"${.CURDIR}/absent.mk\"\n"}, "does not exist"},
 		{"include leaving the tree", map[string]string{"Makefile": ".include \"${PORTSDIR}/../outside.mk\"\n"}, "leaves the ports tree"},
-		{"optional missing include", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.sinclude \"${.CURDIR}/absent.mk\"\n.-include \"absent.mk\"\n"}, ""},
+		{"optional missing include", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.sinclude \"${.CURDIR}/absent.mk\"\n"}, ""},
+		// Base make looks for a relative name it finds nowhere in the tree
+		// in the client's /usr/share/mk: .sinclude "sys.mk" reads sys.mk.
+		{"relative optional include missing from the tree", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.-include \"absent.mk\"\n"}, "/usr/share/mk/absent.mk leaves the ports tree"},
+		{"empty include path", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\nE=\n.sinclude \"${E}\"\n"}, ""},
+		// Base make honors each of these in a port Makefile.
+		{".MAKEFLAGS pins a variable", map[string]string{"Makefile": ".MAKEFLAGS:\tD=files/restricted.mk\nD=\tfiles/allowed.mk\n.include \"${.CURDIR}/${D}\"\n", "files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "NO_CDROM"},
+		{".MAKEFLAGS sets a restriction", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.MAKEFLAGS:\tNO_CDROM=\"no resale\"\n"}, "NO_CDROM=no resale"},
+		{".MAKEFLAGS appends, as devel/godot does", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\nOPTIONS_DEFINE=\tA B\n.MAKEFLAGS:\tWITH=\"${OPTIONS_DEFINE}\" OPTIONS_EXCLUDE=\n.MAKEFLAGS:\t\tWITH+=C\n"}, ""},
+		{".MAKEFLAGS with a flag", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.MAKEFLAGS:\t-e\n"}, "does not model"},
+		{".READONLY", map[string]string{"Makefile": "D=\tfiles/restricted.mk\n.READONLY: D\nD=\tfiles/allowed.mk\n.include \"${.CURDIR}/${D}\"\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "does not model"},
+		{".CURDIR assignment", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.CURDIR=\t${PORTSDIR}/lang/master\n.include \"${.CURDIR}/Makefile.common\"\n"}, "does not model"},
+		{".PATH", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.PATH: ${.CURDIR}/../../lang/master\n.sinclude \"Makefile.common\"\n"}, "does not model"},
+		{"an unknown directive", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.frobnicate x\n"}, "is a directive"},
+		{"an include the reader cannot parse", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.include ${X}\n"}, "cannot parse"},
+		{"inert targets and directives", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.PHONY: x\n.ORDER: a b\n.export LICENSE\n.c.o:\n\t. ${WRKSRC}/env.sh\n.O.install:\n.info x\n"}, ""},
+		// Appending to a variable the port never set appends to whatever the
+		// environment holds.
+		{"append to the environment", map[string]string{"Makefile": "D+=\tfiles/allowed.mk\n.include \"${.CURDIR}/${D}\"\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "it reads D"},
+		// The framework passes OSVERSION to every make it starts on the
+		// command line, where the port's own value does not take effect.
+		{"a variable the framework pins", map[string]string{"Makefile": "OSVERSION=\t1\n.include \"${.CURDIR}/v${OSVERSION}.mk\"\n", "v1.mk": "LICENSE=\tBSD2CLAUSE\n"}, "it reads OSVERSION"},
 		{"framework include", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.include \"${PORTSDIR}/Mk/bsd.port.mk\"\n.include <bsd.port.mk>\n"}, ""},
 		{"include cycle", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.include \"a.mk\"\n", "a.mk": ".include \"Makefile\"\n"}, "includes itself"},
 		{"trailing comment", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE # only\n"}, ""},
@@ -269,7 +293,7 @@ func TestRestrictionFailsClosedOnWhatItCannotRead(t *testing.T) {
 		{"immediate assignment of an unknown", map[string]string{"Makefile": "P:=\t${WHERE}\n.include \"${.CURDIR}/${P}x.mk\"\n"}, "cannot be resolved"},
 		{"repeated include", map[string]string{"Makefile": "D=\tfiles/allowed.mk\n.include \"files/dispatch.mk\"\nD=\tfiles/restricted.mk\n.include \"files/dispatch.mk\"\n", "files/dispatch.mk": ".include \"${.CURDIR}/${D}\"\n", "files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "NO_CDROM"},
 		{"assignment in a conditionally included file", map[string]string{"Makefile": "D=\tfiles/restricted.mk\n.if ${X} == y\n.include \"files/set.mk\"\n.endif\n.include \"${.CURDIR}/${D}\"\n", "files/set.mk": "D=\tfiles/allowed.mk\n", "files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "NO_CDROM"},
-		{"?= over a conditional value", map[string]string{"Makefile": ".if ${X} == y\nD=\tfiles/restricted.mk\n.endif\nD?=\tfiles/allowed.mk\n.include \"${.CURDIR}/${D}\"\n", "files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "it reads D, which the port sets with ?="},
+		{"?= over a conditional value", map[string]string{"Makefile": ".if ${X} == y\nD=\tfiles/restricted.mk\n.endif\nD?=\tfiles/allowed.mk\n.include \"${.CURDIR}/${D}\"\n", "files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "it reads D, which make.conf"},
 		{"append in a loop", map[string]string{"Makefile": ".for i in a b\nD+=\t${i}\n.endfor\n.include \"${.CURDIR}/${D}.mk\"\n"}, "cannot be resolved"},
 		{"computed name", map[string]string{"Makefile": "D=\tfiles/allowed.mk\nN=\tD\n${N}=\tfiles/restricted.mk\n.include \"${.CURDIR}/${D}\"\n", "files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "NO_CDROM"},
 		{"computed name from a loop", map[string]string{"Makefile": "D=\tfiles/allowed.mk\n.for n in D\n${n}=\tfiles/restricted.mk\n.endfor\n.include \"${.CURDIR}/${D}\"\n", "files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "NO_CDROM"},
@@ -563,7 +587,11 @@ func symlinkTree(t *testing.T, makefile string) string {
 func TestPathsResolveSymlinksBeforeParent(t *testing.T) {
 	const pin = "DISTINFO_FILE=${PORTSDIR}/sysutils/pcpustat/distinfo\n"
 	for name, tc := range map[string]struct{ makefile, want string }{
-		":tA":                       {"P=${.CURDIR}/link/../restricted/terms.mk\n.include \"${P:tA}\"\n" + pin, "symlink target terms"},
+		":tA": {"P=${.CURDIR}/link/../restricted/terms.mk\n.include \"${P:tA}\"\n" + pin, "symlink target terms"},
+		// make's :H cuts at the last "/" and cleans nothing, so the ".."
+		// survives to be applied after the symlink.
+		":H":                        {"P=${.CURDIR}/link/../restricted/leaf\n.include \"${P:H}/terms.mk\"\n" + pin, "symlink target terms"},
+		":H of a distinfo":          {"NO_CDROM=probe\nP=${.CURDIR}/link/../../sysutils/pcpustat/distinfo\nDISTINFO_FILE=${P:H}/distinfo\n", "misc/probe sets NO_CDROM"},
 		"plain include":             {".include \"${.CURDIR}/link/../restricted/terms.mk\"\n" + pin, "symlink target terms"},
 		"relative to PARSEDIR":      {".include \"${.CURDIR}/link/../restricted/terms.mk\"\n" + pin, "symlink target terms"},
 		"optional include":          {".sinclude \"${.CURDIR}/link/../restricted/terms.mk\"\n" + pin, "symlink target terms"},

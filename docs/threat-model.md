@@ -120,17 +120,25 @@ risk:
   path or a variable the declaration does not cover is refused, and when its
   `distinfo` then cannot be placed, every distfile is refused. That includes a
   `?=` default on an undeclared variable, which a client's `make.conf` may
-  preempt. The server's own filesystem never stands in for a client's, and a
-  path missing on the server is not evidence that it is missing on a client.
-  Paths inside the tree are resolved as the kernel resolves them, symlink
-  before `..`, and one that leaves the tree on the way refuses the port. The
-  declaration is bound to the client by a check the client runs: bodega
-  generates a `make` fragment from it (`/distfiles/@environment.mk`), the
+  preempt, a relative include the tree does not hold, which base `make` looks
+  for in the client's `/usr/share/mk`, and a line such as `.READONLY`, `.PATH`
+  or `.CURDIR=` that changes how `make` reads the rest of the port. The
+  server's own filesystem never stands in for a client's, and a path missing
+  on the server is not evidence that it is missing on a client. Paths inside
+  the tree are resolved as the kernel resolves them, symlink before `..`,
+  whether `:tA` resolves them or `:H` leaves the `..` for `open(2)`, and one
+  that leaves the tree on the way refuses the port. The declaration is bound
+  to the client by a check the client runs: bodega generates a `make`
+  fragment from it (`/distfiles/@environment.mk`), the
   client includes it at the end of `/etc/make.conf`, and it names the
   declaration's digest only while every declared file and variable holds a
-  declared value and no restriction or ownership variable is set outside the
-  tree. The HTTP route serves only `/distfiles/@<digest>/<name>` for the
-  digest the server admitted against, answering anything else `451` before
+  declared value, no restriction or ownership variable is set outside the
+  tree, the command line carries no undeclared variable, `make` looks for
+  includes where the scan does, and every makefile it reads is under
+  `/usr/share/mk`, in the tree, or declared. It measures the files again after
+  the port has been read, where the fetch expands the digest. The HTTP route
+  serves only `/distfiles/@<digest>/<name>` for the digest the server
+  admitted against, answering anything else `451` before
   storage or upstream is touched, and the builder writes each environment's
   `DISTDIR` under `@<digest>`. A client that drifts names `unsupported` and is
   served by neither. The server holds the first digest it read for its life,
@@ -224,21 +232,29 @@ defence against:
   environment by hand, and is served as if it held it. What it can obtain that
   way is only what bodega admitted for the declared environment, which the
   operator decided may be redistributed under the declared terms. The check
-  trusts the client's own `/sbin/sha256`, `/usr/bin/env`, `/usr/bin/grep` and
-  base system makefiles under `/usr/share/mk`.
-- **What the check measures, and when.** It reads the declared files as
-  `make` starts, in the process that includes them moments later; a writer
-  racing that process on the client is not caught. It compares a declared
-  variable where `make.conf`, the environment or the command line sets it and
-  where the fetch expands its sites. A port that reads one before the
-  framework sets it, and so sees a value neither point shows, is read by bodega
-  with the declared value. It forbids `LICENSE_PERMS_<license>` in the
-  environment and on the command line by name, and in `make.conf` and what it
-  includes by any mention of `LICENSE`, which also refuses a `make.conf` that
-  mentions `LICENSES_ACCEPTED`. Variables the declaration does not name, set
-  outside the tree, are not checked: a port whose include, master or
-  `distinfo` reads one through `?=` is refused on the server instead, and one
-  that reads one with no default already was.
+  trusts the client's own `/bin/sh`, `/sbin/sha256`, `/usr/bin/timeout`,
+  `/usr/bin/env`, `/usr/bin/grep` and base system makefiles under
+  `/usr/share/mk`.
+- **What the check measures, and when.** It measures the declared files as
+  `make` starts and again where the fetch expands the digest, after the
+  port's includes have opened them. A file changed after the include and
+  changed back before the fetch is not caught; neither measurement sees the
+  bytes `make` read in between. It compares a declared variable where
+  `make.conf`, the environment or the command line sets it and where the fetch
+  expands its sites; bodega reads one as possibly unset above the framework,
+  so what a port sees there is covered. It forbids `LICENSE_PERMS_<license>`
+  in the environment by name, on the command line with every other undeclared
+  variable, and in `make.conf` and what it includes by any mention of
+  `LICENSE`, which also refuses a `make.conf` that mentions
+  `LICENSES_ACCEPTED`. Variables the declaration does not name, set in
+  `make.conf` or the environment, are not checked: a port whose include,
+  master or `distinfo` reads one through `?=` or `+=` is refused on the server
+  instead, and one that reads one with no default already was. The variables
+  the framework passes on its own command line (`OSVERSION` and the rest of
+  `_EXPORTED_VARS`) are allowed there unchecked, and a port reading one
+  undeclared is refused. It trusts `/usr/share/mk` to be the base system's,
+  because the framework and every relative include the tree does not hold
+  reach it.
 - **A declaration that does not describe the fleet.** The declaration covers
   the fleet only if the operator makes it: a value or an alternative left out
   is one bodega never reads, and a client holding it names `unsupported` and
@@ -414,7 +430,8 @@ instance, the recommended posture is:
   distfiles from a stock tree; the empty declaration refuses all of them.
   Start from it, read the unplaced ports bodega logs, confirm each named value
   on a client with base `make -V`, and declare every value and every
-  alternative your clients hold. Install the client check from
+  alternative your clients hold, including every variable a client passes on
+  the command line. Install the client check from
   `/distfiles/@environment.mk` as the last line of every client's
   `/etc/make.conf`, and key `MASTER_SITE_OVERRIDE` and `DISTDIR` on
   `${BODEGA_DISTFILES_ENV}`, never on a digest written by hand. Revisit the
