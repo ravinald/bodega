@@ -29,7 +29,10 @@ it needs several hosts, a real network between them, and several minutes.
 `48-freebsd-server` drives no client. It runs `internal/storage`'s own tests on
 `freebsd-server`, because the FreeBSD ACL and extended-attribute syscalls
 compile into no binary the Linux guests run: on ZFS and on a UFS memory disk
-mounted `-o acls`, each as an unprivileged user and as root.
+mounted `-o acls`, each as an unprivileged user and as root. It also runs
+`test/e2e/guest` on a ZFS dataset with `aclmode` and `aclinherit` set to
+`passthrough`, where it checks what a reader other than the owner can do with a
+published object rather than what its ACL says.
 
 ## Host requirements
 
@@ -65,7 +68,11 @@ target changed. It points `pkg` at the Linux server through the stanza
 end. Suite 48 ships an `internal/storage` test binary to `freebsd-server`,
 compiles a `sys/acl.h` probe with the base system's `cc`, and creates and
 destroys a swap-backed memory disk (`md48`, override with
-`E2E_FREEBSD_MD_UNIT`) under `/var/tmp/bodega-e2e-storage`.
+`E2E_FREEBSD_MD_UNIT`) under `/var/tmp/bodega-e2e-storage`. It also creates
+and destroys a ZFS dataset, `bodega-e2e-passthrough`, as a child of whichever
+dataset holds `/var/tmp`, so `/var/tmp` has to be on ZFS. The cells on that
+dataset read published objects as the base system's `www` account through
+`sudo -u www`.
 
 ## Running it
 
