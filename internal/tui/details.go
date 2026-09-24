@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/ravinald/bodega/internal/aptsign"
 	"github.com/ravinald/bodega/internal/aptsources"
+	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -608,19 +609,22 @@ func clientURL(cfg *config.Config, store *manifest.Store, entryType, name, pkgFi
 		if err != nil || pm == nil || len(pm.Versions) == 0 {
 			return ""
 		}
-		ve := pm.Versions[0]
-		fn := ve.Filename
-		if fn == "" && ve.URL != "" {
-			parts := strings.Split(ve.URL, "/")
-			fn = parts[len(parts)-1]
+		// A stored name the route would not read back as this entry's own
+		// object is linked by its download alias, which is keyed by the
+		// server's token pepper. The pepper is read only then, and a host
+		// that cannot read it gets no link rather than a link to the wrong
+		// bytes.
+		p, ok := pm.BinaryLinkName(nil, 0)
+		if !ok {
+			pst, err := audit.ResolvePepper(audit.DefaultPepperPaths)
+			if err != nil {
+				return ""
+			}
+			if p, ok = pm.BinaryLinkName([]byte(pst.Pepper), 0); !ok {
+				return ""
+			}
 		}
-		// The server reads this spelling as another entry's download alias,
-		// and the alias for this one is keyed by the token pepper, which the
-		// TUI does not hold. No link beats a link to the wrong bytes.
-		if manifest.IsBinaryAlias(fn) {
-			return ""
-		}
-		return fmt.Sprintf("%s/binaries/%s/%s/%s", base, pm.Name, ve.Version, fn)
+		return base + "/binaries/" + p
 	case manifest.TypePypi:
 		return fmt.Sprintf("pip install --index-url %s/pypi/simple/ %s", base, name)
 	case manifest.TypeGomod:

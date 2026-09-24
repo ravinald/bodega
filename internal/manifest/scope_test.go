@@ -240,7 +240,7 @@ func TestBinaryDownloadNamesResolveToTheirOwnEntry(t *testing.T) {
 			t.Errorf("entries %d and %d both publish %q", j, i, key)
 		}
 		seen[key] = i
-		got, ok := pm.BinaryStoredFilename(aliasTestKey, ve.Version, name)
+		got, _, ok := pm.BinaryStoredFilename(aliasTestKey, ve.Version, name)
 		if want := binaryStoredName(ve); !ok || got != want {
 			t.Errorf("entry %d: published %q resolves to %q, %v, want its own %q", i, name, got, ok, want)
 		}
@@ -258,7 +258,7 @@ func TestBinaryDownloadNamesResolveToTheirOwnEntry(t *testing.T) {
 		{"", "shared.example~0123456789abcdef", "shared.example~0123456789abcdef", true},
 		{"1.0.0", "private.example~0123456789abcdef0123456789abcdef", "private.example~0123456789abcdef0123456789abcdef", true},
 	} {
-		got, ok := pm.BinaryStoredFilename(aliasTestKey, tc.version, tc.requested)
+		got, _, ok := pm.BinaryStoredFilename(aliasTestKey, tc.version, tc.requested)
 		if got != tc.want || ok != tc.ok {
 			t.Errorf("BinaryStoredFilename(%q, %q) = %q, %v, want %q, %v", tc.version, tc.requested, got, ok, tc.want, tc.ok)
 		}
@@ -292,7 +292,7 @@ func TestBinaryDownloadNamesSurviveManifestEdits(t *testing.T) {
 		edited := &PackageManifest{Type: TypeBinary, Name: "tool", Versions: versions}
 		for i, name := range published {
 			ve := entries[i]
-			got, ok := edited.BinaryStoredFilename(aliasTestKey, ve.Version, name)
+			got, _, ok := edited.BinaryStoredFilename(aliasTestKey, ve.Version, name)
 			if ok && got != binaryStoredName(ve) {
 				t.Errorf("%s: entry %d's link %q now resolves to %q, not its own %q", label, i, name, got, binaryStoredName(ve))
 			}
@@ -317,12 +317,12 @@ func TestBinaryDownloadNamesFailClosedAcrossKeys(t *testing.T) {
 		squatted := &PackageManifest{Type: TypeBinary, Name: "tool", Versions: append(entries[:1:1],
 			VersionEntry{URL: "https://public.example/copy", Filename: name})}
 		for _, key := range [][]byte{nil, []byte("rotated-key")} {
-			if got, ok := squatted.BinaryStoredFilename(key, "", name); ok {
+			if got, _, ok := squatted.BinaryStoredFilename(key, "", name); ok {
 				t.Errorf("key %q: %q resolves to %q", key, name, got)
 			}
 		}
 	}
-	if got, ok := pm.BinaryStoredFilename(aliasTestKey, "", keyed); !ok || got != binaryStoredName(entries[0]) {
+	if got, _, ok := pm.BinaryStoredFilename(aliasTestKey, "", keyed); !ok || got != binaryStoredName(entries[0]) {
 		t.Errorf("under its own key %q resolves to %q, %v", keyed, got, ok)
 	}
 }
@@ -345,7 +345,7 @@ func TestBinaryDownloadNamesNeverDisplayTheRawURL(t *testing.T) {
 			}
 		}
 		ve := pm.Versions[i]
-		if got, ok := pm.BinaryStoredFilename(aliasTestKey, ve.Version, name); !ok || got != binaryStoredName(ve) {
+		if got, _, ok := pm.BinaryStoredFilename(aliasTestKey, ve.Version, name); !ok || got != binaryStoredName(ve) {
 			t.Errorf("entry %d: published %q resolves to %q, %v, want its own stored name", i, name, got, ok)
 		}
 	}
@@ -369,7 +369,7 @@ func TestBinaryStoredNamesShapedLikeAliases(t *testing.T) {
 		if want := binaryStoredName(pm.Versions[i]); names[i] != want {
 			t.Errorf("entry %d publishes %q, want its stored name %q", i, names[i], want)
 		}
-		if got, ok := pm.BinaryStoredFilename(aliasTestKey, "1.0.0", names[i]); !ok || got != names[i] {
+		if got, _, ok := pm.BinaryStoredFilename(aliasTestKey, "1.0.0", names[i]); !ok || got != names[i] {
 			t.Errorf("stored name %q resolves to %q, %v", names[i], got, ok)
 		}
 	}
@@ -380,18 +380,103 @@ func TestBinaryStoredNamesShapedLikeAliases(t *testing.T) {
 	}
 	copied := &PackageManifest{Type: TypeBinary, Name: "tool", Versions: append(pm.Versions,
 		VersionEntry{Version: "1.0.0", URL: "https://public.example/copy", Filename: minted})}
-	if got, ok := copied.BinaryStoredFilename(aliasTestKey, "1.0.0", minted); !ok || got != binaryStoredName(pm.Versions[3]) {
+	if got, _, ok := copied.BinaryStoredFilename(aliasTestKey, "1.0.0", minted); !ok || got != binaryStoredName(pm.Versions[3]) {
 		t.Errorf("minted %q resolves to %q, %v, want the entry it was minted for", minted, got, ok)
 	}
 	copyName := publishedBinaryNames(copied, aliasTestKey)[4]
 	if copyName == minted {
 		t.Fatalf("the copy publishes the alias it copied")
 	}
-	if got, ok := copied.BinaryStoredFilename(aliasTestKey, "1.0.0", copyName); !ok || got != minted {
+	if got, _, ok := copied.BinaryStoredFilename(aliasTestKey, "1.0.0", copyName); !ok || got != minted {
 		t.Errorf("the copy's own alias %q resolves to %q, %v", copyName, got, ok)
 	}
 	copied.Versions = append(copied.Versions[:3:3], copied.Versions[4])
-	if got, ok := copied.BinaryStoredFilename(aliasTestKey, "1.0.0", minted); ok {
+	if got, _, ok := copied.BinaryStoredFilename(aliasTestKey, "1.0.0", minted); ok {
 		t.Errorf("minted %q resolves to %q after its entry is gone", minted, got)
+	}
+}
+
+// An alias identifies its entry's backend as well as its key: two entries of
+// one version sharing a stored name on different backends get different
+// aliases, each resolves to its own entry, and moving an entry to another
+// backend retires the alias it had. "default" and the empty name are one
+// backend.
+func TestBinaryAliasBindsTheBackend(t *testing.T) {
+	const authority = "u:p@host"
+	a := VersionEntry{Version: "1.0.0", URL: "https://" + authority}
+	b := VersionEntry{Version: "1.0.0", URL: "https://other/x", Filename: authority, Storage: "other"}
+	pm := &PackageManifest{Type: TypeBinary, Name: "tool", Versions: []VersionEntry{b, a}}
+	aliasA, _ := pm.binaryAliasName(aliasTestKey, a)
+	aliasB, _ := pm.binaryAliasName(aliasTestKey, b)
+	if aliasA == aliasB {
+		t.Fatalf("entries on two backends share the alias %q", aliasA)
+	}
+	for alias, want := range map[string]string{aliasA: "", aliasB: "other"} {
+		_, entry, ok := pm.BinaryStoredFilename(aliasTestKey, "1.0.0", alias)
+		if !ok || entry == nil || entry.Storage != want {
+			t.Errorf("alias %q resolved to %+v, %v, want the entry on %q", alias, entry, ok, want)
+		}
+	}
+	moved := &PackageManifest{Type: TypeBinary, Name: "tool", Versions: []VersionEntry{{Version: "1.0.0", URL: a.URL, Storage: "other"}}}
+	if _, _, ok := moved.BinaryStoredFilename(aliasTestKey, "1.0.0", aliasA); ok {
+		t.Error("an alias survives its entry moving backend")
+	}
+	spelled := &PackageManifest{Type: TypeBinary, Name: "tool", Versions: []VersionEntry{{Version: "1.0.0", URL: a.URL, Storage: "default"}}}
+	if _, _, ok := spelled.BinaryStoredFilename(aliasTestKey, "1.0.0", aliasA); !ok {
+		t.Error(`Storage "default" gives a different alias from the empty name`)
+	}
+}
+
+// BinaryLinkName links by stored name exactly when the route reads that
+// spelling back as the entry's own object on its own backend, and by alias
+// otherwise; the alias needs a key.
+func TestBinaryLinkNameAgreesWithTheRoute(t *testing.T) {
+	const authority = "u:p@h"
+	for _, tc := range []struct {
+		label    string
+		versions []VersionEntry
+		literal  string
+	}{
+		{"plain", []VersionEntry{{Version: "1.0.0", URL: "https://h/tool"}}, "tool/1.0.0/tool"},
+		{"no version", []VersionEntry{{URL: "https://h/tool"}}, "tool/tool"},
+		{"tilde name, no version", []VersionEntry{{URL: "https://h/tool", Filename: "~/tool"}}, "tool/~/tool"},
+		{"userinfo authority", []VersionEntry{{Version: "1.0.0", URL: "https://" + authority}}, "tool/1.0.0/" + authority},
+		{"copied alias", []VersionEntry{{Version: "1.0.0", URL: "https://h/x", Filename: "~/" + strings.Repeat("0", 32) + "/x"}}, ""},
+		{"nested name", []VersionEntry{{Version: "1.0.0", URL: "https://h/x", Filename: "a/b"}}, ""},
+		{"query mark", []VersionEntry{{Version: "1.0.0", URL: "https://h/x", Filename: "a?b"}}, ""},
+		{"percent", []VersionEntry{{Version: "1.0.0", URL: "https://h/x", Filename: "a%2eb"}}, ""},
+		{"dot dot", []VersionEntry{{Version: "1.0.0", URL: "https://h/x", Filename: "a..b"}}, ""},
+		{"earlier entry on the same backend", []VersionEntry{{Version: "1.0.0", URL: "https://h/one"}, {Version: "1.0.0", URL: "https://h/tool"}}, "tool/1.0.0/tool"},
+		{"earlier entry on another backend", []VersionEntry{{Version: "1.0.0", URL: "https://h/one", Storage: "other"}, {Version: "1.0.0", URL: "https://h/tool"}}, ""},
+	} {
+		t.Run(tc.label, func(t *testing.T) {
+			pm := &PackageManifest{Type: TypeBinary, Name: "tool", Versions: tc.versions}
+			i := len(tc.versions) - 1
+			keyless, ok := pm.BinaryLinkName(nil, i)
+			if tc.literal != "" {
+				if !ok || keyless != tc.literal {
+					t.Fatalf("BinaryLinkName = %q, %v, want %q", keyless, ok, tc.literal)
+				}
+				return
+			}
+			if ok {
+				t.Fatalf("BinaryLinkName with no key = %q, want no link", keyless)
+			}
+			link, ok := pm.BinaryLinkName(aliasTestKey, i)
+			if !ok {
+				t.Fatal("BinaryLinkName with a key offers no link")
+			}
+			if strings.Contains(link, "..") {
+				t.Errorf("link %q is refused by the route's path check", link)
+			}
+			pkg, version, name := BinaryPathIdentity(link)
+			if pkg != "tool" || version != tc.versions[i].Version || !IsBinaryAlias(name) {
+				t.Fatalf("link %q routes as %q %q %q, not an alias", link, pkg, version, name)
+			}
+			stored, entry, ok := pm.BinaryStoredFilename(aliasTestKey, version, name)
+			if !ok || entry == nil || stored != binaryStoredName(tc.versions[i]) || entry.Storage != tc.versions[i].Storage {
+				t.Errorf("link %q resolves to %q %+v %v", link, stored, entry, ok)
+			}
+		})
 	}
 }

@@ -548,11 +548,11 @@ func TestBinaryClientURLReachesTheFetchedArtifact(t *testing.T) {
 
 // An operator who copies a published alias into another entry's explicit
 // filename stores that entry under a spelling the server reads as the first
-// entry's alias. The TUI cannot mint the copy's own alias without the token
-// pepper, so it offers no link for it rather than one that downloads the
-// original; the original's link, and the copy's link from the public manifest,
-// keep reaching their own bytes whichever entry comes first and after the
-// original is removed.
+// entry's alias. The TUI links the copy by its own alias instead, minted with
+// the server's pepper, so the link reaches the copy and never the original;
+// the original's link, and the copy's link from the public manifest, keep
+// reaching their own bytes whichever entry comes first and after the original
+// is removed.
 func TestBinaryClientURLNeverReachesAnotherEntry(t *testing.T) {
 	prev := audit.DefaultPepperPaths
 	audit.DefaultPepperPaths = []string{filepath.Join(t.TempDir(), "pepper")}
@@ -642,12 +642,10 @@ func TestBinaryClientURLNeverReachesAnotherEntry(t *testing.T) {
 		t.Run(tc.label, func(t *testing.T) {
 			fetch(tc.versions...)
 			link := clientURL(cfg, store, manifest.TypeBinary, "tool", "")
-			if link != "" {
-				if code, body := get(strings.TrimPrefix(link, "https://bodega.example.com")); code != http.StatusOK || body != tc.want[0] {
-					t.Errorf("TUI link %s = %d %q, want %q", link, code, body, tc.want[0])
-				}
-			} else if tc.versions[0].Filename != alias {
+			if link == "" {
 				t.Errorf("the TUI offers no link for %+v", tc.versions[0])
+			} else if code, body := get(strings.TrimPrefix(link, "https://bodega.example.com")); code != http.StatusOK || body != tc.want[0] {
+				t.Errorf("TUI link %s = %d %q, want %q", link, code, body, tc.want[0])
 			}
 			for i, path := range published() {
 				if code, body := get(path); code != http.StatusOK || body != tc.want[i] {
@@ -663,5 +661,53 @@ func TestBinaryClientURLNeverReachesAnotherEntry(t *testing.T) {
 				t.Errorf("the alias = %d %q, want the entry it was minted for", code, body)
 			}
 		})
+	}
+}
+
+// An entry with no version whose explicit filename starts "~/" is stored as
+// binaries/tool/~/tool, and the route reads /binaries/tool/~/tool, three
+// segments, as a request for that key rather than as an alias. The TUI links
+// it by its stored name, which needs no pepper, so a host that cannot read
+// one still gets the link.
+func TestBinaryClientURLKeepsATildeStoredName(t *testing.T) {
+	prev := audit.DefaultPepperPaths
+	audit.DefaultPepperPaths = []string{filepath.Join(t.TempDir(), "pepper")}
+	t.Cleanup(func() { audit.DefaultPepperPaths = prev })
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("FETCHED-ELF"))
+	}))
+	defer upstream.Close()
+
+	cfg := aptLineConfig(t)
+	store := manifest.NewLocalStore(t.TempDir())
+	objects := storage.NewMemory()
+	if err := store.AddVersion(t.Context(), manifest.TypeBinary, "tool", manifest.VersionEntry{URL: upstream.URL + "/tool", Filename: "~/tool"}); err != nil {
+		t.Fatal(err)
+	}
+	buildCfg := &builder.Config{BuildRoot: t.TempDir(), BuildEnvInfo: &manifest.BuildEnv{Platform: "linux/arm64"}}
+	if sum := builder.FetchBinaries(buildCfg, store, "tool"); sum.Total != 1 || sum.Failures != 0 {
+		t.Fatalf("fetch: %+v", sum)
+	}
+	for _, p := range builder.BinaryArtifactPaths(buildCfg, store, "tool") {
+		data, err := os.ReadFile(p.Local)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := objects.Put(t.Context(), p.ObjectKey, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv := server.New(cfg, store, storage.NewSingle(objects), ":0", nil)
+	audit.DefaultPepperPaths = []string{filepath.Join(t.TempDir(), "absent")}
+
+	link := clientURL(cfg, store, manifest.TypeBinary, "tool", "")
+	if link == "" {
+		t.Fatal("the TUI offers no link for an entry stored as ~/tool")
+	}
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, strings.TrimPrefix(link, "https://bodega.example.com"), nil))
+	if rr.Code != http.StatusOK || rr.Body.String() != "FETCHED-ELF" {
+		t.Errorf("TUI link %s = %d %q, want the fetched bytes", link, rr.Code, rr.Body)
 	}
 }

@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
+	"path"
 	"regexp"
 	"strings"
 )
@@ -289,50 +291,134 @@ func BinaryKey(name, version, filename string) string {
 // the request names nothing that may be served.
 //
 // A request under BinaryAliasDir is a download alias and nothing else: it
-// resolves to the entry of that version whose stored name its tag identifies
-// under key, or to nothing. Every other request is served as asked. The two
-// never share a spelling, because the route splits a request into segments
-// and an alias spans three of them, so a stored name, which is one segment,
+// resolves to the entry of that version whose package, version, backend and
+// stored name its tag identifies under key, or to nothing, and that entry
+// comes back so the caller reads its bytes from the backend it records. Two
+// entries of one version can share a stored name on different backends, so
+// the object key alone does not say which entry an alias was minted for, and
+// selecting a backend again by version would hand the alias to whichever of
+// them comes first. Every other request is served as asked and returns no
+// entry. The two never share a spelling, because BinaryPathIdentity splits a
+// request into segments and an alias spans three of them, so a stored name
 // is never read as an alias, and an alias is never read as a stored name,
-// whatever key is in force. An alias whose entry is gone, or whose key has
-// been rotated away, therefore answers 404 rather than reaching an object
-// later stored under its spelling.
-func (pm *PackageManifest) BinaryStoredFilename(key []byte, version, requested string) (string, bool) {
+// whatever key is in force. An alias whose entry is gone, has moved backend,
+// or whose key has been rotated away, therefore answers 404 rather than
+// reaching an object later stored under its spelling.
+func (pm *PackageManifest) BinaryStoredFilename(key []byte, version, requested string) (string, *VersionEntry, bool) {
 	rest, isAlias := strings.CutPrefix(requested, BinaryAliasDir+"/")
 	if !isAlias {
-		return requested, true
+		return requested, nil, true
 	}
 	tag, _, _ := strings.Cut(rest, "/")
 	if pm == nil || len(key) == 0 || len(tag) != binaryAliasTagLen {
-		return "", false
+		return "", nil, false
 	}
 	for _, ve := range pm.Versions {
 		if ve.Version != version {
 			continue
 		}
 		stored := binaryStoredName(ve)
-		if hmac.Equal([]byte(pm.binaryAliasTag(key, version, stored)), []byte(tag)) {
-			return stored, true
+		if hmac.Equal([]byte(pm.binaryAliasTag(key, ve)), []byte(tag)) {
+			return stored, &ve, true
 		}
 	}
-	return "", false
+	return "", nil, false
 }
 
 // BinaryAliasDir is the path segment every download alias starts with:
 // /binaries/<name>[/<version>]/~/<tag>/<display>.
 const BinaryAliasDir = "~"
 
-// IsBinaryAlias reports whether a filename, joined into a /binaries/ link,
-// would be read as a download alias rather than as the stored name it is. A
-// producer that links by stored name has no link to offer for such a name:
-// its only spelling belongs to whichever entry the tag identifies.
+// IsBinaryAlias reports whether a filename BinaryPathIdentity returned is a
+// download alias rather than a stored name.
 func IsBinaryAlias(filename string) bool {
 	return strings.HasPrefix(filename, BinaryAliasDir+"/")
 }
 
+// BinaryPathIdentity recovers the manifest entry that owns a /binaries/
+// request path. The uploader writes <name>/<version>/<file>, dropping the
+// version segment for an entry that has none, so a two-segment path yields an
+// empty version rather than mistaking the filename for one. A download alias
+// adds three segments after the version, "~/<tag>/<display>", and comes back
+// whole as the filename for BinaryStoredFilename to resolve. Any other segment
+// count names nothing and returns an empty package.
+//
+// The server routes by it and BinaryLinkName predicts the route with it, so a
+// link producer and the handler cannot disagree about which spelling is an
+// alias.
+func BinaryPathIdentity(p string) (pkg, version, filename string) {
+	parts := strings.Split(p, "/")
+	switch {
+	case len(parts) == 2:
+		return parts[0], "", parts[1]
+	case len(parts) == 3:
+		return parts[0], parts[1], parts[2]
+	case len(parts) == 4 && parts[1] == BinaryAliasDir:
+		return parts[0], "", strings.Join(parts[1:], "/")
+	case len(parts) == 5 && parts[2] == BinaryAliasDir:
+		return parts[0], parts[1], strings.Join(parts[2:], "/")
+	}
+	return "", "", ""
+}
+
+// BinaryLinkName returns the path under /binaries/ that reaches
+// pm.Versions[i]: its stored name when the route reads that spelling back as
+// a request for this entry's own object on this entry's own backend, and its
+// download alias under key otherwise, the name the read API publishes for it.
+// It reports false when neither reaches the entry, which is an alias with no
+// key to mint it.
+//
+// A stored name can fail to come back as itself several ways: it holds a "/"
+// or a "~/" prefix and reads as another shape or as an alias, it carries a "?",
+// "#", "%" or ".." the URL parser or the route's safety check rewrites or
+// refuses, or an earlier entry of the same version on another backend is the
+// one a literal request is served from.
+func (pm *PackageManifest) BinaryLinkName(key []byte, i int) (string, bool) {
+	ve := pm.Versions[i]
+	if p, ok := pm.binaryLiteralPath(i); ok {
+		return p, true
+	}
+	if len(key) == 0 {
+		return "", false
+	}
+	name, _ := pm.binaryAliasName(key, ve)
+	return binaryVersionPath(pm.Name, ve.Version, name), true
+}
+
+func (pm *PackageManifest) binaryLiteralPath(i int) (string, bool) {
+	ve := pm.Versions[i]
+	stored := binaryStoredName(ve)
+	p := binaryVersionPath(pm.Name, ve.Version, stored)
+	u, err := url.Parse("/binaries/" + p)
+	if err != nil || u.Path != "/binaries/"+p || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" ||
+		path.Clean(u.Path) != u.Path || strings.Contains(p, "..") {
+		return "", false
+	}
+	pkg, version, filename := BinaryPathIdentity(p)
+	if pkg == "" || IsBinaryAlias(filename) || BinaryKey(pkg, version, filename) != BinaryKey(pm.Name, ve.Version, stored) {
+		return "", false
+	}
+	// The literal route serves from the backend of the first entry of the
+	// requested version, and from the type's backend when none matches, as it
+	// did before aliases existed.
+	for j, other := range pm.Versions {
+		if other.Version == version || (version != "" && other.Ref == version) {
+			return p, j == i || binaryStorageName(other) == binaryStorageName(ve)
+		}
+	}
+	return p, true
+}
+
+func binaryVersionPath(name, version, filename string) string {
+	if version == "" {
+		return name + "/" + filename
+	}
+	return name + "/" + version + "/" + filename
+}
+
 // binaryAliasTagLen is the length in hex digits of a download alias's tag:
-// 128 bits, so two stored names of one version sharing a tag is not a case
-// the resolver has to answer.
+// 128 bits, so two entries of one version sharing a tag is not a case the
+// resolver has to answer.
 const binaryAliasTagLen = 32
 
 // binaryDownloadName returns the filename the read API publishes for a binary
@@ -342,27 +428,32 @@ const binaryAliasTagLen = 32
 // "user:secret@host", which the public url no longer carries; and a name
 // holding a "/", which no single link segment can carry and which, when it
 // starts with BinaryAliasDir, would be read as an alias.
-//
-// The alias is "~/<tag>/<display>". display comes from the explicit filename
-// or the public url and never from the raw url, so no spelling of the stored
-// name can put its userinfo back, and the resolver ignores it. tag is an HMAC
-// under key of the package, version and stored name, and depends on nothing
-// else, so removing, reordering or adding entries never hands it to another
-// entry. It is keyed because an unkeyed hash of the stored name would let
-// anyone holding the published name confirm a guessed username and password
-// offline. With no key the tag is zeros, which no server resolves.
 func (pm *PackageManifest) binaryDownloadName(key []byte, ve VersionEntry) (string, bool) {
 	if pm.Type != TypeBinary {
 		return "", false
 	}
+	return pm.binaryAliasName(key, ve)
+}
+
+// binaryAliasName returns ve's download alias, and whether its stored name
+// needs one for the read API to publish it.
+//
+// The alias is "~/<tag>/<display>". display comes from the explicit filename
+// or the public url and never from the raw url, so no spelling of the stored
+// name can put its userinfo back, and the resolver ignores it. tag is an HMAC
+// under key of the package, version, backend and stored name, and depends on
+// nothing else, so removing, reordering or adding entries never hands it to
+// another entry, including one holding the same key on another backend. It is
+// keyed because an unkeyed hash of the stored name would let anyone holding
+// the published name confirm a guessed username and password offline. With no
+// key the tag is zeros, which no server resolves.
+func (pm *PackageManifest) binaryAliasName(key []byte, ve VersionEntry) (string, bool) {
 	stored := binaryStoredName(ve)
 	display := ve.Filename
 	if display == "" {
 		display = lastSegment(PublicURL(ve.URL))
 	}
-	if display == stored && !strings.Contains(stored, "/") {
-		return "", false
-	}
+	needed := display != stored || strings.Contains(stored, "/")
 	display = strings.Map(func(r rune) rune {
 		if r < 0x80 && (r == '.' || r == '-' || r == '_' || r == ':' ||
 			'0' <= r && r <= '9' || 'a' <= r && r <= 'z' || 'A' <= r && r <= 'Z') {
@@ -370,19 +461,33 @@ func (pm *PackageManifest) binaryDownloadName(key []byte, ve VersionEntry) (stri
 		}
 		return '_'
 	}, display)
+	for strings.Contains(display, "..") {
+		display = strings.ReplaceAll(display, "..", "._")
+	}
 	if strings.Trim(display, ".") == "" {
 		display = "download"
 	}
-	return BinaryAliasDir + "/" + pm.binaryAliasTag(key, ve.Version, stored) + "/" + display, true
+	return BinaryAliasDir + "/" + pm.binaryAliasTag(key, ve) + "/" + display, needed
 }
 
-func (pm *PackageManifest) binaryAliasTag(key []byte, version, stored string) string {
+func (pm *PackageManifest) binaryAliasTag(key []byte, ve VersionEntry) string {
 	if len(key) == 0 {
 		return strings.Repeat("0", binaryAliasTagLen)
 	}
 	mac := hmac.New(sha256.New, key)
-	mac.Write([]byte("bodega binary download alias\x00" + pm.Name + "\x00" + version + "\x00" + stored))
+	mac.Write([]byte("bodega binary download alias\x00" + pm.Name + "\x00" + ve.Version + "\x00" +
+		binaryStorageName(ve) + "\x00" + binaryStoredName(ve)))
 	return hex.EncodeToString(mac.Sum(nil))[:binaryAliasTagLen]
+}
+
+// binaryStorageName is the backend ve records, with the "default" a hand edit
+// may spell out folded into the empty name every writer records for it, so
+// the two spellings of one backend give one alias.
+func binaryStorageName(ve VersionEntry) string {
+	if ve.Storage == "default" {
+		return ""
+	}
+	return ve.Storage
 }
 
 func binaryStoredName(ve VersionEntry) string {
