@@ -31,6 +31,12 @@ const Absent = "absent"
 // alternatives is read as every one of them, the way a conditional include is.
 // The snapshots are read once, here, and the digest covers every declared
 // byte, so a reload can tell the environment it admits against has not moved.
+//
+// A declaration binds nothing by itself: bodega cannot see a client, and a
+// client whose file changes after the declaration would otherwise be served
+// against terms it no longer holds. ClientCheck is what binds it. The client's
+// own make measures every declared input and names the digest only when all of
+// them hold, and both deliveries are keyed by that name.
 type Environment struct {
 	vars      map[string][]string
 	undefined map[string]bool
@@ -42,6 +48,7 @@ type envFile struct {
 	absent  bool
 	sources []string // snapshot paths, in declared order
 	texts   [][]byte
+	sums    []string // SHA256 of each text, which is what a client's check compares
 }
 
 // EnvironmentSpec is the operator's declaration, as configuration spells it.
@@ -52,7 +59,17 @@ type EnvironmentSpec struct {
 	Files     map[string][]string
 }
 
-var makeVarName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+var (
+	makeVarName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	// clientPath is what ClientCheck can write into a make conditional and a
+	// shell argument without quoting: no space, quote, "$", "#", ":", glob or
+	// parenthesis.
+	clientPath = regexp.MustCompile(`^/[A-Za-z0-9._/+@%,=-]+$`)
+)
+
+// clientCheckVersion is hashed into every digest, so a client check written
+// under different rules never names an environment this one admits against.
+const clientCheckVersion = "bodega distfiles client check 1"
 
 // reservedEnvVars are the variables the reader derives itself, or reads as a
 // port's own declaration. A client make.conf that set one would change every
@@ -85,6 +102,7 @@ func (s EnvironmentSpec) Load() (*Environment, error) { return s.load(true) }
 func (s EnvironmentSpec) load(read bool) (*Environment, error) {
 	env := &Environment{vars: map[string][]string{}, undefined: map[string]bool{}, files: map[string]envFile{}}
 	h := sha256.New()
+	fmt.Fprintf(h, "%s\n", clientCheckVersion)
 	names := make([]string, 0, len(s.Variables))
 	for name := range s.Variables {
 		names = append(names, name)
@@ -94,6 +112,9 @@ func (s EnvironmentSpec) load(read bool) (*Environment, error) {
 		vals := s.Variables[name]
 		if !makeVarName.MatchString(name) {
 			return nil, fmt.Errorf("distfiles_environment_variables: %q is not a make variable name bodega can declare", name)
+		}
+		if strings.HasPrefix(name, "_BODEGA_") || strings.HasPrefix(name, "BODEGA_DISTFILES_") {
+			return nil, fmt.Errorf("distfiles_environment_variables: %s cannot be declared: the client check bodega generates uses that name", name)
 		}
 		if why, ok := reservedEnvVars[name]; ok || strings.HasPrefix(name, "LICENSE_PERMS") {
 			if !ok {
@@ -110,8 +131,8 @@ func (s EnvironmentSpec) load(read bool) (*Environment, error) {
 			continue
 		}
 		for _, v := range vals {
-			if strings.ContainsAny(v, "\n") {
-				return nil, fmt.Errorf("distfiles_environment_variables: %s has a value holding a newline", name)
+			if strings.ContainsAny(v, "\n#\\") || strings.TrimSpace(v) != v {
+				return nil, fmt.Errorf("distfiles_environment_variables: %s has the value %q, which holds a newline, \"#\", a backslash or surrounding space; make would not read it back as written in the client check", name, v)
 			}
 			fmt.Fprintf(h, "\t%q\n", v)
 		}
@@ -125,8 +146,8 @@ func (s EnvironmentSpec) load(read bool) (*Environment, error) {
 	sort.Strings(paths)
 	for _, p := range paths {
 		alts := s.Files[p]
-		if !filepath.IsAbs(p) || filepath.Clean(p) != p {
-			return nil, fmt.Errorf("distfiles_environment_files: %q must be an absolute, clean path on the client host", p)
+		if !filepath.IsAbs(p) || filepath.Clean(p) != p || !clientPath.MatchString(p) {
+			return nil, fmt.Errorf("distfiles_environment_files: %q must be an absolute, clean path on the client host, spelled with letters, digits and ._/+@%%,=- alone so the client check can test it unquoted", p)
 		}
 		if len(alts) == 0 {
 			return nil, fmt.Errorf("distfiles_environment_files: %s lists no alternative; declare %q or the path of a snapshot of the file", p, Absent)
@@ -153,6 +174,7 @@ func (s EnvironmentSpec) load(read bool) (*Environment, error) {
 			fmt.Fprintf(h, "\t%s\n", hex.EncodeToString(sum[:]))
 			f.sources = append(f.sources, alt)
 			f.texts = append(f.texts, b)
+			f.sums = append(f.sums, hex.EncodeToString(sum[:]))
 		}
 		env.files[p] = f
 	}
@@ -168,3 +190,117 @@ func emptyEnvironment() *Environment {
 	env, _ := EnvironmentSpec{}.Load() // an empty spec reads nothing and cannot fail
 	return env
 }
+
+// clientReserved are the variables every port is read with unset outside the
+// tree: the reserved names a declaration may not carry, bar PORTSDIR, which a
+// client may point at its own copy of the tree.
+var clientReserved = []string{"DISTINFO_FILE", "FILESDIR", "LICENSE", "LICENSE_PERMS", "MASTERDIR", "NO_CDROM", "PKGDIR", "RESTRICTED"}
+
+// ClientCheck is the make fragment that binds a client to this environment.
+// A client includes it at the end of /etc/make.conf, and it sets
+// BODEGA_DISTFILES_ENV to Digest only while that client holds what admission
+// assumed, and to "unsupported" otherwise:
+//
+//   - every declared file is absent where the declaration allows it, or holds
+//     the bytes of one of its snapshots;
+//   - no reserved variable, no variable declared undefined, and no
+//     LICENSE_PERMS_<license> is set by make.conf, the environment or the
+//     command line;
+//   - every declared variable make.conf, the environment or the command line
+//     sets, and every one make holds a value for when the fetch expands its
+//     sites, holds a declared value.
+//
+// The files are measured by the make that reads the port, as it starts, so
+// what is measured is what that make includes moments later. Each delivery is
+// keyed by the name this sets: the HTTP route admits only under the digest the
+// server admitted against, and the builder writes its DISTDIR under a directory
+// named by it. A client that has drifted names "unsupported", which neither
+// serves, and falls through to the port's own sites.
+func (e *Environment) ClientCheck() []byte {
+	var b strings.Builder
+	fmt.Fprintf(&b, `# bodega distfiles client check for environment %s.
+#
+# Generated by bodega from distfiles_environment_variables and
+# distfiles_environment_files; fetch it again whenever either changes. Include
+# it as the last line of /etc/make.conf and key the delivery you use on the
+# environment it measures:
+#
+#   MASTER_SITE_OVERRIDE?=	https://<bodega>/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/
+#   DISTDIR=	<distfiles_root>/distfiles/@${BODEGA_DISTFILES_ENV}
+#
+# BODEGA_DISTFILES_ENV is "unsupported" when this host no longer holds what
+# bodega admitted against, and bodega serves nothing under that name.
+# BODEGA_DISTFILES_DRIFT names what differed, as far as it is known before the
+# port is read: make -V BODEGA_DISTFILES_ENV -V BODEGA_DISTFILES_DRIFT.
+BODEGA_DISTFILES_DRIFT=
+`, e.digest)
+
+	undefined := append([]string(nil), clientReserved...)
+	for name := range e.undefined {
+		undefined = append(undefined, name)
+	}
+	sort.Strings(undefined)
+	fmt.Fprintf(&b, ".for _bodega_v in %s\n.  if defined(${_bodega_v})\nBODEGA_DISTFILES_DRIFT+=\t${_bodega_v}\n.  endif\n.endfor\n", strings.Join(undefined, " "))
+	// A license's permissions may be set under a name built from it, which
+	// no list can enumerate: refuse any spelling of one outside the tree.
+	b.WriteString(`_BODEGA_DISTFILES_ENVIRON!=	/usr/bin/env
+.if !empty(.MAKEOVERRIDES:MLICENSE_PERMS_*) || !empty(_BODEGA_DISTFILES_ENVIRON:MLICENSE_PERMS_*=*)
+BODEGA_DISTFILES_DRIFT+=	LICENSE_PERMS_*
+.endif
+_BODEGA_DISTFILES_CONF!=	/usr/bin/grep -l LICENSE ${.MAKE.MAKEFILES:N/usr/share/mk/*:N${.PARSEDIR}/${.PARSEFILE}} /dev/null 2>/dev/null || :
+.if !empty(_BODEGA_DISTFILES_CONF)
+BODEGA_DISTFILES_DRIFT+=	${_BODEGA_DISTFILES_CONF}
+.endif
+`)
+
+	names := make([]string, 0, len(e.vars))
+	for name := range e.vars {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	late := []string{"1"}
+	for i, name := range names {
+		var eq []string
+		for j, v := range e.vars[name] {
+			ref := fmt.Sprintf("_BODEGA_DISTFILES_V%d_%d", i, j)
+			fmt.Fprintf(&b, "%s=\t%s\n", ref, v)
+			eq = append(eq, fmt.Sprintf(`"${%s}" == "${%s}"`, name, ref))
+		}
+		fmt.Fprintf(&b, ".if defined(%s) && !(%s)\nBODEGA_DISTFILES_DRIFT+=\t%s\n.endif\n", name, strings.Join(eq, " || "), name)
+		late = append(late, fmt.Sprintf("(!defined(%s) || %s)", name, strings.Join(eq, " || ")))
+	}
+
+	paths := make([]string, 0, len(e.files))
+	for p := range e.files {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	for i, p := range paths {
+		f := e.files[p]
+		fmt.Fprintf(&b, ".if exists(%s)\n", p)
+		if len(f.sums) == 0 {
+			fmt.Fprintf(&b, "BODEGA_DISTFILES_DRIFT+=\t%s\n", p)
+		} else {
+			ref := fmt.Sprintf("_BODEGA_DISTFILES_F%d", i)
+			var ne []string
+			for _, sum := range f.sums {
+				ne = append(ne, fmt.Sprintf(`"${%s}" != "%s"`, ref, sum))
+			}
+			fmt.Fprintf(&b, "%s!=\t/sbin/sha256 -q %s 2>/dev/null || echo unreadable\n.  if %s\nBODEGA_DISTFILES_DRIFT+=\t%s\n.  endif\n", ref, p, strings.Join(ne, " && "), p)
+		}
+		if !f.absent {
+			fmt.Fprintf(&b, ".else\nBODEGA_DISTFILES_DRIFT+=\t%s\n", p)
+		}
+		b.WriteString(".endif\n")
+	}
+
+	// The declared variables are compared again where the fetch expands its
+	// sites, after the framework has set the ones make.conf does not.
+	fmt.Fprintf(&b, "BODEGA_DISTFILES_ENV=\t${\"${BODEGA_DISTFILES_DRIFT}\" != \"\":?%s:${%s:?%s:%s}}\n",
+		ClientUnsupported, strings.Join(late, " && "), e.digest, ClientUnsupported)
+	return []byte(b.String())
+}
+
+// ClientUnsupported is the environment a client check names when the client
+// no longer holds what admission assumed.
+const ClientUnsupported = "unsupported"

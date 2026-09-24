@@ -40,14 +40,20 @@ type Config struct {
 	FreeBSDRoot string
 
 	// DistfilesRoot roots the DISTDIR FetchDistfiles writes, at
-	// <root>/distfiles/. DistfilesPortsTree is the ports tree whose distinfo
-	// admits each file, and DistfilesUpstream is where a file is fetched from.
+	// <root>/distfiles/@<environment digest>/. DistfilesPortsTree is the ports
+	// tree whose distinfo admits each file, and DistfilesUpstream is where a
+	// file is fetched from.
 	DistfilesRoot      string
 	DistfilesPortsTree string
 	DistfilesUpstream  string
 	// DistfilesEnvironment is the supported client environment every port
 	// is read against; see distinfo.Environment.
 	DistfilesEnvironment distinfo.EnvironmentSpec
+	// distfilesEnv is the environment the first distfiles stage of this
+	// Config read, which every later stage must find unchanged; see
+	// distfilesEnvironment.
+	distfilesEnvMu sync.Mutex
+	distfilesEnv   *distinfo.Environment
 	// Stdout is where builder output is written; defaults to os.Stdout.
 	Stdout io.Writer
 	// Force re-fetches even if artifacts already exist on disk.
@@ -265,6 +271,9 @@ func ArtifactDir(cfg *Config, typ string) string {
 	case manifest.TypeFreeBSD:
 		return d.freebsd
 	case manifest.TypeDistfiles:
+		if dir, err := distdir(cfg, d); err == nil {
+			return dir
+		}
 		return d.distfiles
 	}
 	return cfg.rootFor(typ)

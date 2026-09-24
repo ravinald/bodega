@@ -638,10 +638,11 @@ func clientURL(cfg *config.Config, store *manifest.Store, entryType, name, pkgFi
 		}
 		return freeBSDRepoConf(cfg, pm, pkgFingerprint)
 	case manifest.TypeDistfiles:
-		// The name is the distinfo name, DIST_SUBDIR included, so it is the
-		// path under /distfiles/ as it stands; MASTER_SITE_OVERRIDE composes
-		// this same URL per port.
-		return fmt.Sprintf("%s/distfiles/%s", base, name)
+		// The name is the distinfo name, DIST_SUBDIR included, under the
+		// environment the client's check measured; MASTER_SITE_OVERRIDE
+		// composes this same URL per port, and the check it includes from
+		// /distfiles/@environment.mk fills the digest in.
+		return fmt.Sprintf("%s/distfiles/@${BODEGA_DISTFILES_ENV}/%s", base, name)
 	case manifest.TypeCargo:
 		// Cargo hands back no URL. A client reaches the sparse index only once
 		// .cargo/config.toml names it as a registry, so the stanza and the

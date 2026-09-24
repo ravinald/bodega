@@ -187,6 +187,14 @@ func TestEnvironmentSpecRefusesWhatItCannotModel(t *testing.T) {
 		"unclean file":             {Files: map[string][]string{"/usr/local/../etc/x": {Absent}}},
 		"no alternative":           {Files: map[string][]string{"/etc/x": {}}},
 		"relative snapshot":        {Files: map[string][]string{"/etc/x": {"snap"}}},
+		// What the client check cannot write back into make.conf unquoted.
+		"path with a space":       {Files: map[string][]string{"/etc/a b": {Absent}}},
+		"path with a colon":       {Files: map[string][]string{"/etc/a:b": {Absent}}},
+		"path with a reference":   {Files: map[string][]string{"/etc/${X}": {Absent}}},
+		"value with a comment":    {Variables: map[string][]string{"LOCALBASE": {"/usr/local#x"}}},
+		"value with a backslash":  {Variables: map[string][]string{"LOCALBASE": {`/usr\local`}}},
+		"value with space around": {Variables: map[string][]string{"LOCALBASE": {" /usr/local"}}},
+		"the check's own name":    {Variables: map[string][]string{"BODEGA_DISTFILES_ENV": {"x"}}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := spec.Validate(); err == nil {
@@ -266,5 +274,74 @@ func TestEnvironmentEmptySnapshotIsNotTheServerFile(t *testing.T) {
 	})
 	if _, err := ix.Lookup("aspell6-ar-1.2-0.tar.bz2"); err != nil {
 		t.Fatalf("%v, want admitted against the empty snapshot", err)
+	}
+}
+
+// The client check names every input admission assumed, so a client that
+// holds anything else names "unsupported". Its behavior under base FreeBSD
+// make is measured on a live client; this pins what it is written to test.
+func TestClientCheckNamesEveryDeclaredInput(t *testing.T) {
+	snap := snapshot(t, "PERL5_DEFAULT=5.42\n")
+	env, err := EnvironmentSpec{
+		Variables: map[string][]string{"LOCALBASE": {"/usr/local"}, "USESDIR": {"${PORTSDIR}/Mk/Uses"}, "PKGNAMESUFFIX": {}},
+		Files:     map[string][]string{"/usr/local/etc/aspell.ver": {Absent}, "/tmp/PERL5_DEFAULT": {Absent, snap}, "/etc/present.mk": {snap}},
+	}.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := string(env.ClientCheck())
+	for _, want := range []string{
+		"for environment " + env.Digest(),
+		// Reserved and declared-undefined names, set anywhere outside the tree.
+		".for _bodega_v in DISTINFO_FILE FILESDIR LICENSE LICENSE_PERMS MASTERDIR NO_CDROM PKGDIR PKGNAMESUFFIX RESTRICTED\n",
+		"!empty(.MAKEOVERRIDES:MLICENSE_PERMS_*) || !empty(_BODEGA_DISTFILES_ENVIRON:MLICENSE_PERMS_*=*)",
+		"/usr/bin/grep -l LICENSE ${.MAKE.MAKEFILES:N/usr/share/mk/*:N${.PARSEDIR}/${.PARSEFILE}}",
+		// Declared values, where make.conf sets them and where the fetch reads them.
+		"_BODEGA_DISTFILES_V0_0=\t/usr/local\n.if defined(LOCALBASE) && !(\"${LOCALBASE}\" == \"${_BODEGA_DISTFILES_V0_0}\")",
+		"_BODEGA_DISTFILES_V1_0=\t${PORTSDIR}/Mk/Uses\n",
+		// A file declared absent alone may not exist; one with a snapshot
+		// alone must exist and match it.
+		".if exists(/usr/local/etc/aspell.ver)\nBODEGA_DISTFILES_DRIFT+=\t/usr/local/etc/aspell.ver\n.endif\n",
+		"/sbin/sha256 -q /tmp/PERL5_DEFAULT",
+		"\" != \"348d182711a2886bc0a8eb38c2df85032e593d133971389f2563befc7cbbcb1c\"",
+		".else\nBODEGA_DISTFILES_DRIFT+=\t/etc/present.mk\n.endif\n",
+		"(!defined(LOCALBASE) || \"${LOCALBASE}\" == \"${_BODEGA_DISTFILES_V0_0}\")",
+		":?" + env.Digest() + ":unsupported}}\n",
+	} {
+		if !strings.Contains(check, want) {
+			t.Errorf("the check does not carry %q:\n%s", want, check)
+		}
+	}
+	if strings.Contains(check, "PKGNAMESUFFIX}\" ==") {
+		t.Error("a variable declared undefined is compared at fetch time, where the port may set it itself")
+	}
+}
+
+// LookupIn answers only a client whose check named the digest the index was
+// admitted against. A drifted client, one checking another declaration, and
+// one with no check are refused, whatever the name.
+func TestTreeLookupInBindsTheClient(t *testing.T) {
+	root := aspellTree(t)
+	spec := EnvironmentSpec{Variables: map[string][]string{"LOCALBASE": {"/usr/local"}}, Files: map[string][]string{"/usr/local/etc/aspell.ver": {Absent}}}
+	env, err := spec.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := NewTreeIn(root, spec, 0, nil)
+	if err := tr.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	other, _ := EnvironmentSpec{}.Load()
+	for _, digest := range []string{"", ClientUnsupported, other.Digest(), strings.ToUpper(env.Digest())} {
+		if _, err := tr.LookupIn(digest, "pcpustat/1.6.tar.bz2"); !errors.Is(err, ErrEnvironment) {
+			t.Errorf("LookupIn(%q): %v, want ErrEnvironment", digest, err)
+		}
+	}
+	if e, err := tr.LookupIn(env.Digest(), "pcpustat/1.6.tar.bz2"); err != nil || e.SHA256 != sumA {
+		t.Errorf("LookupIn(the admitted digest): %+v, %v", e, err)
+	}
+	check, err := tr.ClientCheck()
+	if err != nil || !strings.Contains(string(check), ":?"+env.Digest()+":") {
+		t.Errorf("ClientCheck names another environment than LookupIn admits: %v\n%s", err, check)
 	}
 }

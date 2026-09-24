@@ -778,11 +778,12 @@ function getClientUrl(type, entry) {
       const repo = freeBSDRepoFor(entry);
       return repo ? repo.conf : '';
     }
-    // The entry's name is the distinfo name, DIST_SUBDIR included, so it is
-    // the path under /distfiles/ as it stands. A client does not fetch it by
-    // hand: MASTER_SITE_OVERRIDE composes this same URL per port.
+    // The entry's name is the distinfo name, DIST_SUBDIR included, under the
+    // environment the client's check measured. A client does not fetch it by
+    // hand: MASTER_SITE_OVERRIDE composes this same URL per port, and the
+    // check it includes from /distfiles/@environment.mk fills the digest in.
     case 'distfiles':
-      return base + '/distfiles/' + entry.name;
+      return base + '/distfiles/@${BODEGA_DISTFILES_ENV}/' + entry.name;
   }
   return '';
 }

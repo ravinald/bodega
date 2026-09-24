@@ -864,8 +864,9 @@ func (s *Server) registerRoutes() {
 	// number of segments.
 	m.HandleFunc("GET /freebsd/{path...}", s.handleFreeBSD)
 
-	// Ports distfiles, by distinfo name: the path is what a client composes
-	// from MASTER_SITE_OVERRIDE=<base>/distfiles/${DIST_SUBDIR}/.
+	// Ports distfiles, by distinfo name under the environment the client's
+	// check measured: the path is what a client composes from
+	// MASTER_SITE_OVERRIDE=<base>/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/.
 	m.HandleFunc("GET /distfiles/{name...}", s.handleDistfiles)
 
 	// REST API

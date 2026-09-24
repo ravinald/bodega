@@ -21,9 +21,17 @@ import (
 )
 
 // This is the DISTDIR deployment: every distfiles entry is fetched into
-// <distfiles_root>/distfiles/<distinfo name>, which is a DISTDIR in layout, and
-// a client that reads that directory (NFS, a copy, poudriere's
-// DISTFILES_CACHE) never contacts a site at all. do-fetch.sh skips a distfile
+// <distfiles_root>/distfiles/@<environment>/<distinfo name>, which is a DISTDIR
+// in layout, and a client that reads that directory (NFS, a copy, poudriere's
+// DISTFILES_CACHE) never contacts a site at all.
+//
+// <environment> is the digest of the declared client environment the files
+// were admitted in, and the client check written beside it as
+// <distfiles_root>/distfiles/@environment.mk is what names it on a client:
+// a client sets DISTDIR=<mount>/distfiles/@${BODEGA_DISTFILES_ENV}, and a
+// client that no longer holds the declared environment names "unsupported",
+// a directory bodega never writes. A DISTDIR shared by every environment
+// would hand a drifted client files admitted under terms it no longer holds. do-fetch.sh skips a distfile
 // already present in DISTDIR before it consults any site list, which makes this
 // the one deployment that stops a build reaching the internet. The HTTP route
 // in internal/server only preempts the port's own sites.
@@ -44,8 +52,22 @@ var distfilesClient = &http.Client{
 	},
 }
 
-func distfilesDestPath(d dirs, name string) string {
-	return filepath.Join(d.distfiles, filepath.FromSlash(name))
+func distfilesDestPath(distdir, name string) string {
+	return filepath.Join(distdir, filepath.FromSlash(name))
+}
+
+// clientCheckFile is where FetchDistfiles writes the client check, beside the
+// environments' DISTDIRs, so a client mounting <distfiles_root>/distfiles can
+// include the check for whatever environment the builder last admitted in.
+const clientCheckFile = "@environment.mk"
+
+// distdir is the DISTDIR for the environment this Config admits against.
+func distdir(cfg *Config, d dirs) (string, error) {
+	env, err := cfg.distfilesEnvironment()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d.distfiles, "@"+env.Digest()), nil
 }
 
 // CheckDistfilesStage reports whether a distfile is present in the DISTDIR.
@@ -54,8 +76,11 @@ func CheckDistfilesStage(cfg *Config, name string) StageStatus {
 	if manifest.DistfilesValidName(name) != nil {
 		return StageStatus{}
 	}
-	d := buildDirs(cfg.rootFor(manifest.TypeDistfiles))
-	if fi, err := os.Stat(distfilesDestPath(d, name)); err == nil && fi.Mode().IsRegular() {
+	dir, err := distdir(cfg, buildDirs(cfg.rootFor(manifest.TypeDistfiles)))
+	if err != nil {
+		return StageStatus{}
+	}
+	if fi, err := os.Stat(distfilesDestPath(dir, name)); err == nil && fi.Mode().IsRegular() {
 		return StageStatus{Fetched: true, Built: true, Packaged: true}
 	}
 	return StageStatus{}
@@ -109,7 +134,7 @@ func FetchDistfiles(cfg *Config, store *manifest.Store, entryFilter string) *Sum
 		return summary
 	}
 	cfg.logf("  [distfiles] reading distinfo under %s", cfg.DistfilesPortsTree)
-	ix, err := cfg.loadDistinfo()
+	ix, env, err := cfg.loadDistinfoIn()
 	if err != nil {
 		for _, name := range names {
 			fail(name, err, 0)
@@ -117,8 +142,13 @@ func FetchDistfiles(cfg *Config, store *manifest.Store, entryFilter string) *Sum
 		return summary
 	}
 	logUnowned(cfg, ix)
-	if err := mkdirAll(d.distfiles); err != nil {
-		err = fmt.Errorf("create the DISTDIR %s: %w; nothing was fetched", d.distfiles, err)
+	dir := filepath.Join(d.distfiles, "@"+env.Digest())
+	err = mkdirAll(dir)
+	if err == nil {
+		err = writeClientCheck(filepath.Join(d.distfiles, clientCheckFile), env.ClientCheck())
+	}
+	if err != nil {
+		err = fmt.Errorf("create the DISTDIR %s: %w; nothing was fetched", dir, err)
 		for _, name := range names {
 			fail(name, err, 0)
 		}
@@ -137,7 +167,7 @@ func FetchDistfiles(cfg *Config, store *manifest.Store, entryFilter string) *Sum
 			fail(name, err, time.Since(start))
 			continue
 		}
-		dest := distfilesDestPath(d, name)
+		dest := distfilesDestPath(dir, name)
 		if !cfg.Force {
 			if ok, err := distfileMatches(dest, entry); err == nil && ok {
 				cfg.logf("  [distfiles] %s: present and matches distinfo, skipping (use 'force' to re-fetch)", name)
@@ -250,10 +280,10 @@ func fetchDistfile(ctx context.Context, src, dest string, entry distinfo.Entry) 
 	return nil
 }
 
-// DistfilesArtifactPaths returns every distfile present in the DISTDIR, keyed
-// for upload, with the release the caller runs once the upload is over.
-// Uploading them prepopulates what the HTTP route would otherwise fetch on a
-// miss.
+// DistfilesArtifactPaths returns every distfile present in the DISTDIR of the
+// environment this Config admits against, keyed for upload, with the release
+// the caller runs once the upload is over. Uploading them prepopulates what
+// the HTTP route would otherwise fetch on a miss.
 //
 // Presence in the DISTDIR is not admission. The directory is one other tools
 // write into, a file may predate a tree update that repinned or restricted it,
@@ -274,7 +304,7 @@ func DistfilesArtifactPaths(cfg *Config, store *manifest.Store, entryFilter stri
 	ctx := context.Background()
 	d := buildDirs(cfg.rootFor(manifest.TypeDistfiles))
 	type candidate struct{ name, local, version string }
-	var found []candidate
+	var entries []candidate
 	for _, safe := range store.ListPackages(manifest.TypeDistfiles) {
 		pm, err := store.GetPackage(ctx, manifest.TypeDistfiles, safe)
 		if err != nil || pm == nil || manifest.DistfilesValidName(pm.Name) != nil {
@@ -283,25 +313,63 @@ func DistfilesArtifactPaths(cfg *Config, store *manifest.Store, entryFilter stri
 		if entryFilter != "" && pm.Name != entryFilter && safe != entryFilter {
 			continue
 		}
-		local := distfilesDestPath(d, pm.Name)
-		if fi, err := os.Lstat(local); err != nil || !fi.Mode().IsRegular() {
-			continue
-		}
 		version := ""
 		if len(pm.Versions) > 0 {
 			version = pm.Versions[0].Version
 		}
-		found = append(found, candidate{pm.Name, local, version})
+		entries = append(entries, candidate{name: pm.Name, version: version})
 	}
-	if len(found) == 0 {
+	// A file is looked for under every environment's DISTDIR, and in
+	// <distfiles_root>/distfiles itself, where a builder before environments
+	// wrote, not only in the one this run admits in: presence anywhere is not
+	// admission, so each is held to this run's index, and one it refuses
+	// refuses the upload rather than going unmentioned because it sat
+	// somewhere else.
+	var envDirs []string
+	if ents, err := os.ReadDir(d.distfiles); err == nil {
+		for _, e := range ents {
+			if e.IsDir() && strings.HasPrefix(e.Name(), "@") {
+				envDirs = append(envDirs, filepath.Join(d.distfiles, e.Name()))
+			}
+		}
+	}
+	envDirs = append(envDirs, d.distfiles)
+	locate := func(dirs []string, name string) string {
+		for _, dir := range dirs {
+			local := distfilesDestPath(dir, name)
+			if fi, err := os.Lstat(local); err == nil && fi.Mode().IsRegular() {
+				return local
+			}
+		}
+		return ""
+	}
+	present := 0
+	for _, c := range entries {
+		if locate(envDirs, c.name) != "" {
+			present++
+		}
+	}
+	// Nothing on disk is nothing to upload, and needs neither a tree nor a
+	// declaration to say so.
+	if present == 0 {
 		return nil, noRelease, nil
 	}
 	if cfg.DistfilesPortsTree == "" {
-		return nil, noRelease, fmt.Errorf("%d distfile(s) under %s cannot be uploaded: distfiles_ports_tree is not set, so there is no distinfo to hold them to", len(found), d.distfiles)
+		return nil, noRelease, fmt.Errorf("%d distfile(s) under %s cannot be uploaded: distfiles_ports_tree is not set, so there is no distinfo to hold them to", present, d.distfiles)
 	}
-	ix, err := cfg.loadDistinfo()
+	ix, env, err := cfg.loadDistinfoIn()
 	if err != nil {
-		return nil, noRelease, fmt.Errorf("distfiles cannot be uploaded without their distinfo: %w", err)
+		return nil, noRelease, fmt.Errorf("%d distfile(s) under %s cannot be uploaded without their distinfo: %w", present, d.distfiles, err)
+	}
+	search := append([]string{filepath.Join(d.distfiles, "@"+env.Digest())}, envDirs...)
+	var found []candidate
+	for _, c := range entries {
+		if c.local = locate(search, c.name); c.local != "" {
+			found = append(found, c)
+		}
+	}
+	if len(found) == 0 {
+		return nil, noRelease, nil
 	}
 	logUnowned(cfg, ix)
 	pinDir, err := os.MkdirTemp(filepath.Dir(d.distfiles), ".bodega-distfiles-upload-*")
@@ -376,17 +444,75 @@ func pinDistfile(src, dst string, limit int64) error {
 	return out.Close()
 }
 
-// loadDistinfo reads the ports tree against the declared client environment.
-// A snapshot that cannot be read refuses the whole run: admitting against a
-// declaration with a file missing from it would read that file as absent, and
-// nobody declared it so.
+// loadDistinfo is loadDistinfoIn without the environment.
 func (cfg *Config) loadDistinfo() (*distinfo.Index, error) {
-	env, err := cfg.DistfilesEnvironment.Load()
+	ix, _, err := cfg.loadDistinfoIn()
+	return ix, err
+}
+
+// loadDistinfoIn reads the ports tree against the environment this Config
+// admits against. The tree is read again every time, as a server reload does;
+// the environment is not. See distfilesEnvironment.
+func (cfg *Config) loadDistinfoIn() (*distinfo.Index, *distinfo.Environment, error) {
+	env, err := cfg.distfilesEnvironment()
 	if err != nil {
-		return nil, fmt.Errorf("the declared client environment cannot be read, so no distfile is admitted: %w", err)
+		return nil, nil, err
 	}
 	cfg.logf("  [distfiles] reading ports as a client in environment %s", env.Digest())
-	return distinfo.LoadIn(cfg.DistfilesPortsTree, env)
+	ix, err := distinfo.LoadIn(cfg.DistfilesPortsTree, env)
+	return ix, env, err
+}
+
+// distfilesEnvironment is the environment every distfiles stage of this
+// Config admits against: the one its first stage read. Each later stage reads
+// the declaration again and refuses when a snapshot changed or cannot be read,
+// rather than admitting under bytes the earlier stage never saw. A fetch and
+// the upload after it in one invocation therefore answer for one environment,
+// and write and read one DISTDIR. A new invocation, which builds a new Config,
+// adopts the declaration as it then stands.
+//
+// A snapshot that cannot be read refuses the stage: admitting against a
+// declaration with a file missing from it would read that file as absent, and
+// nobody declared it so.
+func (cfg *Config) distfilesEnvironment() (*distinfo.Environment, error) {
+	env, err := cfg.DistfilesEnvironment.Load()
+	cfg.distfilesEnvMu.Lock()
+	defer cfg.distfilesEnvMu.Unlock()
+	pinned := cfg.distfilesEnv
+	switch {
+	case err != nil && pinned != nil:
+		return nil, fmt.Errorf("the declared client environment this run admitted against (%s) can no longer be read, so nothing more is admitted: %w; run the command again to admit against the declaration as it now stands", pinned.Digest(), err)
+	case err != nil:
+		return nil, fmt.Errorf("the declared client environment cannot be read, so no distfile is admitted: %w", err)
+	case pinned == nil:
+		cfg.distfilesEnv = env
+		return env, nil
+	case env.Digest() != pinned.Digest():
+		return nil, fmt.Errorf("the declared client environment changed during this run: it admitted against %s and a snapshot now makes it %s, so nothing more is admitted; run the command again to admit against the new bytes", pinned.Digest(), env.Digest())
+	}
+	return pinned, nil
+}
+
+// writeClientCheck replaces path with text, whole, so a client including it
+// over a shared mount never reads half of one check and half of another.
+func writeClientCheck(path string, text []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".bodega-environment-*")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	if _, err := tmp.Write(text); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	// Read by every client's make, often as another user.
+	if err := os.Chmod(tmp.Name(), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 // logUnowned names the restricted ports whose distinfo cannot be placed, which

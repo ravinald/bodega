@@ -269,7 +269,7 @@ func TestRestrictionFailsClosedOnWhatItCannotRead(t *testing.T) {
 		{"immediate assignment of an unknown", map[string]string{"Makefile": "P:=\t${WHERE}\n.include \"${.CURDIR}/${P}x.mk\"\n"}, "cannot be resolved"},
 		{"repeated include", map[string]string{"Makefile": "D=\tfiles/allowed.mk\n.include \"files/dispatch.mk\"\nD=\tfiles/restricted.mk\n.include \"files/dispatch.mk\"\n", "files/dispatch.mk": ".include \"${.CURDIR}/${D}\"\n", "files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "NO_CDROM"},
 		{"assignment in a conditionally included file", map[string]string{"Makefile": "D=\tfiles/restricted.mk\n.if ${X} == y\n.include \"files/set.mk\"\n.endif\n.include \"${.CURDIR}/${D}\"\n", "files/set.mk": "D=\tfiles/allowed.mk\n", "files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "NO_CDROM"},
-		{"?= over a conditional value", map[string]string{"Makefile": ".if ${X} == y\nD=\tfiles/restricted.mk\n.endif\nD?=\tfiles/allowed.mk\n.include \"${.CURDIR}/${D}\"\n", "files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "NO_CDROM"},
+		{"?= over a conditional value", map[string]string{"Makefile": ".if ${X} == y\nD=\tfiles/restricted.mk\n.endif\nD?=\tfiles/allowed.mk\n.include \"${.CURDIR}/${D}\"\n", "files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "it reads D, which the port sets with ?="},
 		{"append in a loop", map[string]string{"Makefile": ".for i in a b\nD+=\t${i}\n.endfor\n.include \"${.CURDIR}/${D}.mk\"\n"}, "cannot be resolved"},
 		{"computed name", map[string]string{"Makefile": "D=\tfiles/allowed.mk\nN=\tD\n${N}=\tfiles/restricted.mk\n.include \"${.CURDIR}/${D}\"\n", "files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "NO_CDROM"},
 		{"computed name from a loop", map[string]string{"Makefile": "D=\tfiles/allowed.mk\n.for n in D\n${n}=\tfiles/restricted.mk\n.endfor\n.include \"${.CURDIR}/${D}\"\n", "files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "NO_CDROM"},
@@ -397,6 +397,18 @@ func TestRestrictionHoldsMakesMeaning(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if strings.Contains(tc.makefile, "?=") {
+				// Undeclared, D may be set by make.conf before a ?= that
+				// takes, so the port may refuse where make would not; it may
+				// never admit where make restricts. Declared unset, which the
+				// client check verifies, the ?= is read as make reads it.
+				if _, err := ix.Lookup("pcpustat/1.6.tar.bz2"); err == nil && tc.want != "" {
+					t.Fatalf("undeclared: admitted a port make restricts")
+				} else if err != nil && !errors.Is(err, ErrRestricted) {
+					t.Fatalf("undeclared: %v, want admitted or ErrRestricted", err)
+				}
+				ix = loadWith(t, root, EnvironmentSpec{Variables: map[string][]string{"D": {}}})
+			}
 			e, err := ix.Lookup("pcpustat/1.6.tar.bz2")
 			if tc.want == "" {
 				if err != nil {
@@ -523,5 +535,90 @@ func TestUnownedUnrestrictedPortRefusesNothing(t *testing.T) {
 	}
 	if _, err := ix.Lookup("pcpustat/1.6.tar.bz2"); err != nil {
 		t.Errorf("pcpustat/1.6.tar.bz2: %v, want admitted", err)
+	}
+}
+
+// symlinkTree is the F25 audit fixture: misc/probe/link points into lang/master,
+// so ${.CURDIR}/link/../restricted names lang/restricted to the kernel and
+// misc/probe/restricted to a reader that cleans the path first. Base FreeBSD
+// make reads the former, where NO_CDROM is set.
+func symlinkTree(t *testing.T, makefile string) string {
+	t.Helper()
+	root := portsTree(t)
+	write(t, root, "misc/probe/Makefile", makefile)
+	write(t, root, "misc/probe/restricted/terms.mk", "OK=yes\n")
+	write(t, root, "misc/probe/restricted/rel.mk", "OK=probe side\n")
+	write(t, root, "lang/restricted/terms.mk", "NO_CDROM=symlink target terms\n")
+	write(t, root, "lang/restricted/rel.mk", "NO_CDROM=relative to the link's directory\n")
+	write(t, root, "misc/probe/files/pinned", distinfoFor("pcpustat/1.6.tar.bz2", sumA, 5135))
+	if err := os.Symlink("../../lang/master", filepath.Join(root, "misc/probe/link")); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+// Every path the reader resolves is resolved as the kernel and realpath(3)
+// resolve it, a symlink before the ".." after it. Each case reaches NO_CDROM
+// only through that order, and pcpustat has to be refused on its account.
+func TestPathsResolveSymlinksBeforeParent(t *testing.T) {
+	const pin = "DISTINFO_FILE=${PORTSDIR}/sysutils/pcpustat/distinfo\n"
+	for name, tc := range map[string]struct{ makefile, want string }{
+		":tA":                       {"P=${.CURDIR}/link/../restricted/terms.mk\n.include \"${P:tA}\"\n" + pin, "symlink target terms"},
+		"plain include":             {".include \"${.CURDIR}/link/../restricted/terms.mk\"\n" + pin, "symlink target terms"},
+		"relative to PARSEDIR":      {".include \"${.CURDIR}/link/../restricted/terms.mk\"\n" + pin, "symlink target terms"},
+		"optional include":          {".sinclude \"${.CURDIR}/link/../restricted/terms.mk\"\n" + pin, "symlink target terms"},
+		"distinfo through the link": {"NO_CDROM=probe\nDISTINFO_FILE=${.CURDIR}/link/../../sysutils/pcpustat/distinfo\n", "misc/probe sets NO_CDROM"},
+		"distinfo by another name":  {"NO_CDROM=probe\nDISTINFO_FILE=${.CURDIR}/files/pinned\n", "misc/probe sets NO_CDROM"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := symlinkTree(t, tc.makefile)
+			if name == "relative to PARSEDIR" {
+				// terms.mk includes rel.mk relative to .PARSEDIR, which make
+				// holds as .../link/../restricted, so it reads lang's rel.mk.
+				write(t, root, "lang/restricted/terms.mk", ".include \"rel.mk\"\n")
+				tc.want = "relative to the link's directory"
+			}
+			ix, err := Load(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			e, err := ix.Lookup("pcpustat/1.6.tar.bz2")
+			if !errors.Is(err, ErrRestricted) || !strings.Contains(e.Restricted, tc.want) {
+				t.Fatalf("pcpustat: %v (reason %q), want refused naming %q; unowned %q", err, e.Restricted, tc.want, ix.Unowned())
+			}
+		})
+	}
+}
+
+// A path whose resolution leaves the tree, through ".." or a symlink, is on a
+// host the server cannot see. The port is refused as unreadable, never read
+// from the server's own filesystem, and a restriction it may carry is not
+// dropped: pcpustat, which the port pins, is refused with it.
+func TestPathsLeavingTheTreeRefuse(t *testing.T) {
+	const pin = "LICENSE=BSD2CLAUSE\nDISTINFO_FILE=${PORTSDIR}/sysutils/pcpustat/distinfo\n"
+	outside := t.TempDir()
+	write(t, outside, "terms.mk", "OK=server host\n")
+	for name, makefile := range map[string]string{
+		"parent past the root": ".include \"${.CURDIR}/link/../../../../x.mk\"\n" + pin,
+		":tA past the root":    "P=${.CURDIR}/../../..\n.include \"${P:tA}/x.mk\"\n" + pin,
+		"symlink out":          ".include \"${.CURDIR}/out/terms.mk\"\n" + pin,
+		"unclean outside":      ".include \"" + outside + "/../" + filepath.Base(outside) + "/terms.mk\"\n" + pin,
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := symlinkTree(t, makefile)
+			if err := os.Symlink(outside, filepath.Join(root, "misc/probe/out")); err != nil {
+				t.Fatal(err)
+			}
+			ix, err := Load(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The read stopped, so where its distinfo is set is unknown too,
+			// and every name is refused on its account.
+			_, err = ix.Lookup("pcpustat/1.6.tar.bz2")
+			if u := strings.Join(ix.Unowned(), "\n"); !errors.Is(err, ErrRestricted) || !strings.Contains(u, "misc/probe (misc/probe: ") {
+				t.Fatalf("pcpustat: %v, unowned %q; want refused with misc/probe unreadable", err, u)
+			}
+		})
 	}
 }

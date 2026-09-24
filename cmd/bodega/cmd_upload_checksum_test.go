@@ -275,7 +275,7 @@ func TestUploadDistfilesHoldsTheDistdirToDistinfo(t *testing.T) {
 				t.Fatal(err)
 			}
 			e.seed(t, &manifest.PackageManifest{Type: manifest.TypeDistfiles, Name: "pcpustat/1.6.tar.bz2", Versions: []manifest.VersionEntry{{Frozen: tc.frozen}}})
-			writeFile(t, e.buildRoot, "distfiles/pcpustat/1.6.tar.bz2", tc.onDisk)
+			writeFile(t, e.buildRoot, "distfiles/@"+emptyEnvironmentDigest(t)+"/pcpustat/1.6.tar.bz2", tc.onDisk)
 
 			out, err := runUploadResult(t, manifest.TypeDistfiles)
 			stored := filepath.Join(filepath.Dir(e.buildRoot), "storage", "distfiles", "pcpustat", "1.6.tar.bz2")

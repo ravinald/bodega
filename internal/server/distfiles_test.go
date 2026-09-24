@@ -88,10 +88,35 @@ func distfilesFixtureIn(t *testing.T, tree, body string, set func(*config.Config
 		set(cfg)
 	}
 	store := manifest.NewLocalStore(t.TempDir())
-	ts := httptest.NewServer(New(cfg, store, storage.NewSingle(mem), ":0", nil).Handler())
+	h := New(cfg, store, storage.NewSingle(mem), ":0", nil).Handler()
+	ts := httptest.NewServer(conformingClient(t, cfg, h))
 	t.Cleanup(ts.Close)
 	return ts, mem, &hits
 }
+
+// conformingClient is h as a client whose check measured the declared
+// environment sees it: a request for /distfiles/<name> carries the digest the
+// check names, as MASTER_SITE_OVERRIDE spells it. A path already naming an
+// environment, and the check itself, pass through, so a test can still send
+// what a drifted or unconfigured client would.
+func conformingClient(t *testing.T, cfg *config.Config, h http.Handler) http.Handler {
+	t.Helper()
+	env, err := cfg.DistfilesEnvironment().Load()
+	if err != nil {
+		return h
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if rest, ok := strings.CutPrefix(r.URL.Path, "/distfiles/"); ok && !strings.HasPrefix(rest, "@") && r.Header.Get(unconfiguredClient) == "" {
+			r.URL.Path = "/distfiles/@" + env.Digest() + "/" + rest
+			r.URL.RawPath = ""
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// unconfiguredClient is a request header conformingClient passes through
+// untouched, for a test sending what a client with no check sends.
+const unconfiguredClient = "X-Test-Unconfigured-Client"
 
 func getBody(t *testing.T, url string) (int, string) {
 	t.Helper()
@@ -213,6 +238,10 @@ func makeOnlyRefusal(name string) string {
 	switch {
 	case name == "undefined branch":
 		return "cannot be resolved"
+	case name == "conditional undef":
+		// D?= with D undeclared: make.conf may set D first, so the port
+		// refuses and names what to declare rather than reading NO_CDROM.
+		return "it reads D, which the port sets with ?="
 	case strings.HasPrefix(name, "slave whose"):
 		return "may obtain any distfile in the tree"
 	}
@@ -395,7 +424,7 @@ func TestDistfilesMissHonorsTheUpstreamAllowList(t *testing.T) {
 			if err := s.auditDB.InsertPolicy(t.Context(), audit.PolicyInfo{ID: "p", RegistryType: manifest.TypeDistfiles, RuleKind: policy.KindHost, Pattern: pattern}); err != nil {
 				t.Fatal(err)
 			}
-			ts := httptest.NewServer(s.Handler())
+			ts := httptest.NewServer(conformingClient(t, &config.Config{}, s.Handler()))
 			defer ts.Close()
 			code, body := getBody(t, ts.URL+"/distfiles/pcpustat/1.6.tar.bz2")
 			if code != tc.want || int(hits.Load()) != tc.fetches {
@@ -464,5 +493,79 @@ func TestDistfilesHTTPHoldsTheDeclaredEnvironment(t *testing.T) {
 				t.Fatalf("GET = %d %q after %d upstream fetches, want %d after %d", code, body, hits.Load(), tc.code, tc.hits)
 			}
 		})
+	}
+}
+
+// The F24 witness after admission: a client that adds the witness file, or
+// runs no check, or checks another declaration, is refused before storage or
+// upstream is touched, for a name the index admits. Only the digest the index
+// was admitted against is served, and the check that names it is served too.
+func TestDistfilesRefusesAClientOutsideTheEnvironment(t *testing.T) {
+	ts, mem, hits := distfilesFixture(t, distfilesPortsTree(t), distfileBody)
+	env, err := distinfo.EnvironmentSpec{}.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := distinfo.EnvironmentSpec{Variables: map[string][]string{"LOCALBASE": {"/usr/local"}}}.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, path := range map[string]string{
+		"drifted client":    "/distfiles/@" + distinfo.ClientUnsupported + "/pcpustat/1.6.tar.bz2",
+		"other declaration": "/distfiles/@" + other.Digest() + "/pcpustat/1.6.tar.bz2",
+		"no check":          "/distfiles/pcpustat/1.6.tar.bz2",
+		"empty environment": "/distfiles/@/pcpustat/1.6.tar.bz2",
+	} {
+		req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+path, nil)
+		req.Header.Set(unconfiguredClient, "1")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusUnavailableForLegalReasons || hits.Load() != 0 || !strings.Contains(string(body), "did not measure the environment") {
+			t.Errorf("%s: GET %s = %d %q after %d upstream fetches, want 451 before any", name, path, resp.StatusCode, body, hits.Load())
+		}
+	}
+	if info, _ := mem.Head(t.Context(), manifest.DistfilesKey("pcpustat/1.6.tar.bz2")); info != nil && info.Exists {
+		t.Error("cached a distfile for a client outside the environment")
+	}
+	if code, body := getBody(t, ts.URL+"/distfiles/@"+env.Digest()+"/pcpustat/1.6.tar.bz2"); code != http.StatusOK || body != distfileBody || hits.Load() != 1 {
+		t.Fatalf("GET under the admitted digest = %d %q after %d upstream fetches, want 200 after 1", code, body, hits.Load())
+	}
+	code, check := getBody(t, ts.URL+"/distfiles/@environment.mk")
+	if code != http.StatusOK || !strings.Contains(check, ":?"+env.Digest()+":unsupported") {
+		t.Fatalf("GET /distfiles/@environment.mk = %d %q, want the check naming %s", code, check, env.Digest())
+	}
+}
+
+// The F25 audit fixture through HTTP: ${P:tA} resolves link/.. after the
+// symlink, as realpath(3) does, and reads the NO_CDROM base make reads.
+func TestDistfilesSymlinkBeforeParentIsRestricted(t *testing.T) {
+	tree := distfilesPortsTree(t)
+	for rel, body := range map[string]string{
+		"misc/probe/Makefile":            "P=${.CURDIR}/link/../restricted/terms.mk\n.include \"${P:tA}\"\nDISTINFO_FILE=${PORTSDIR}/sysutils/pcpustat/distinfo\n",
+		"misc/probe/restricted/terms.mk": "OK=yes\n",
+		"lang/restricted/terms.mk":       "NO_CDROM=symlink target terms\n",
+	} {
+		p := filepath.Join(tree, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(tree, "lang/master"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../../lang/master", filepath.Join(tree, "misc/probe/link")); err != nil {
+		t.Fatal(err)
+	}
+	ts, _, hits := distfilesFixture(t, tree, distfileBody)
+	code, body := getBody(t, ts.URL+"/distfiles/pcpustat/1.6.tar.bz2")
+	if code != http.StatusUnavailableForLegalReasons || hits.Load() != 0 || !strings.Contains(body, "symlink target terms") {
+		t.Fatalf("GET = %d %q after %d upstream fetches, want 451 naming the symlink target's NO_CDROM before any", code, body, hits.Load())
 	}
 }

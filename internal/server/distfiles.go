@@ -61,13 +61,30 @@ var distfilesUpstreamClient = &http.Client{
 	},
 }
 
-// handleDistfiles serves GET /distfiles/{name...}: one distfile by its distinfo name, which is
-// "[${DIST_SUBDIR}/]<file>". This is the HTTP deployment: a client sets
+// clientCheckPath is the name, under /distfiles/, of the make fragment a
+// client includes to measure its environment. "@" starts no distinfo name a
+// client of this route can request, so it cannot shadow a distfile.
+const clientCheckPath = "@environment.mk"
+
+// handleDistfiles serves GET /distfiles/@{environment}/{name...}: one distfile
+// by its distinfo name, which is "[${DIST_SUBDIR}/]<file>", for a client whose
+// check measured environment. This is the HTTP deployment: a client includes
+// the fragment GET /distfiles/@environment.mk returns at the end of
+// /etc/make.conf, sets
 //
-//	MASTER_SITE_OVERRIDE?=	https://<bodega>/distfiles/${DIST_SUBDIR}/
+//	MASTER_SITE_OVERRIDE?=	https://<bodega>/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/
 //
-// in /etc/make.conf and do-fetch.sh requests <override><file>, which is this
-// route with the distinfo name as its path.
+// and do-fetch.sh requests <override><file>, which is this route.
+//
+// The environment segment is what binds the admission to the client. The index
+// was read against a declared client environment, and nothing on this side can
+// see whether a client still holds it: a file the client adds under
+// ${LOCALBASE}/etc can move a restricted port's DISTINFO_FILE onto another
+// port's distfiles. The fragment measures those inputs in the make that reads
+// the port and names the environment's digest only when all of them hold, so
+// a request is answered only when its segment is the digest the index was
+// admitted against. "unsupported", another digest, or no segment at all is
+// refused before storage or upstream is touched.
 //
 // The HTTP deployment preempts the port's own sites; it does not enforce
 // anything. do-fetch.sh tries the override, then the port's MASTER_SITES,
@@ -87,15 +104,25 @@ var distfilesUpstreamClient = &http.Client{
 // internal/distinfo for why the two must stay apart.
 func (s *Server) handleDistfiles(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	if err := manifest.DistfilesValidName(name); err != nil || !isSafePath(name) {
-		http.Error(w, "invalid distfile path: expected /distfiles/[<DIST_SUBDIR>/]<file>, the name as a distinfo line spells it", http.StatusBadRequest)
-		return
+	measured := ""
+	if rest, ok := strings.CutPrefix(name, "@"); ok && name != clientCheckPath {
+		measured, name, _ = strings.Cut(rest, "/")
+	}
+	if name != clientCheckPath {
+		if err := manifest.DistfilesValidName(name); err != nil || !isSafePath(name) {
+			http.Error(w, "invalid distfile path: expected /distfiles/@<environment>/[<DIST_SUBDIR>/]<file>, the name as a distinfo line spells it", http.StatusBadRequest)
+			return
+		}
 	}
 	if s.distinfo == nil {
 		// 404 rather than 503: this is configuration, not an outage, and a
 		// client configured against this host falls through to the port's
 		// own sites on a 404 at once.
 		http.Error(w, "this server has no distfiles_ports_tree configured, so it has no distinfo to admit a distfile against", http.StatusNotFound)
+		return
+	}
+	if name == clientCheckPath {
+		s.serveClientCheck(w)
 		return
 	}
 	// A distfile whose manifest entry records a backend lives there, which is
@@ -131,8 +158,25 @@ func (s *Server) handleDistfiles(w http.ResponseWriter, r *http.Request) {
 	// The distinfo decides before the cache does. A file cached before its
 	// port was marked RESTRICTED, or before a tree update repinned its name,
 	// must not keep being served on the strength of having been admitted once.
-	entry, err := s.distinfo.Lookup(name)
+	entry, err := s.distinfo.LookupIn(measured, name)
 	switch {
+	case errors.Is(err, distinfo.ErrEnvironment):
+		s.logger.Info("distfiles: refusing a client that did not measure the admitted environment", "name", name, "environment", measured, "reason", err)
+		recordDenialFor(s.auditDB, r, manifest.TypeDistfiles, name, "", audit.DenialDistfileClient, map[string]string{"environment": measured, "reason": err.Error()})
+		// 451 for the reason a restricted file gets it: the terms this client
+		// holds are not the ones admission read, so bodega cannot say it may
+		// redistribute the file to it. The client moves on to the port's own
+		// sites.
+		msg := err.Error()
+		switch measured {
+		case "":
+			msg += "; include /distfiles/" + clientCheckPath + " at the end of the client's /etc/make.conf and request /distfiles/@${BODEGA_DISTFILES_ENV}/<name>"
+		case distinfo.ClientUnsupported:
+		default:
+			msg += "; fetch /distfiles/" + clientCheckPath + " to the client again"
+		}
+		http.Error(w, msg+"; until then fetch it from the port's own MASTER_SITES", http.StatusUnavailableForLegalReasons)
+		return
 	case errors.Is(err, distinfo.ErrRestricted):
 		s.logger.Info("distfiles: refusing a distfile its port forbids redistributing", "name", name, "reason", err)
 		recordDenialFor(s.auditDB, r, manifest.TypeDistfiles, name, "", audit.DenialDistfileLicense, map[string]string{"reason": entry.Restricted})
@@ -224,6 +268,22 @@ func (s *Server) handleDistfiles(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.Copy(w, spool.file); err != nil {
 		s.logger.Warn("distfiles: client read was cut short", "name", name, "error", err)
 	}
+}
+
+// serveClientCheck answers /distfiles/@environment.mk with the fragment that
+// measures the environment the index was admitted against. It names file paths
+// and snapshot digests from the server's configuration, and nothing a client
+// could not already read in its own make.conf.
+func (s *Server) serveClientCheck(w http.ResponseWriter) {
+	text, err := s.distinfo.ClientCheck()
+	if err != nil {
+		w.Header().Set("Retry-After", "30")
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(text)
 }
 
 // serveVerifiedDistfile serves a stored distfile only once the bytes it is

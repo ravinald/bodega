@@ -16,6 +16,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/distinfo"
 	"github.com/ravinald/bodega/internal/inventory"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/server"
@@ -282,7 +283,7 @@ func objectKeyCases(t *testing.T) []keyCase {
 			pkg:  "pcpustat/1.6.tar.bz2",
 			body: "distfile-bytes",
 			local: map[string]string{
-				"distfiles/pcpustat/1.6.tar.bz2": "distfile-bytes",
+				"distfiles/@" + emptyEnvironmentDigest(t) + "/pcpustat/1.6.tar.bz2": "distfile-bytes",
 			},
 			upload: func(t *testing.T, bcfg *builder.Config, store *manifest.Store, dst storage.ObjectStore) []string {
 				paths, release, err := builder.DistfilesArtifactPaths(bcfg, store, "")
@@ -304,9 +305,22 @@ func objectKeyCases(t *testing.T) []keyCase {
 				// server never creates the default spool under storage_path.
 				cfg.SpoolDir = t.TempDir()
 			},
-			url: "/distfiles/pcpustat/1.6.tar.bz2",
+			// The digest a client's check names when it holds the declared
+			// environment, empty here, as MASTER_SITE_OVERRIDE spells it.
+			url: "/distfiles/@" + emptyEnvironmentDigest(t) + "/pcpustat/1.6.tar.bz2",
 		},
 	}
+}
+
+// emptyEnvironmentDigest is the digest of a declaration naming nothing, which
+// is the environment a config without distfiles_environment_* admits in.
+func emptyEnvironmentDigest(t *testing.T) string {
+	t.Helper()
+	env, err := distinfo.EnvironmentSpec{}.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return env.Digest()
 }
 
 func TestObjectKeysAgreeAcrossUploaderServerInventoryAndDelete(t *testing.T) {

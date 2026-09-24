@@ -3715,7 +3715,7 @@ It needs a ports tree on the server to read `distinfo` from. Keep it at the revi
 | --------------------------------- | ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `distfiles_ports_tree`            | unset                                           | Root of the ports tree whose `distinfo` files decide what is admitted. Unset, `/distfiles/` answers every request 404 and `build fetch distfiles` refuses every entry. Must be absolute.                                                           |
 | `distfiles_upstream`              | `http://distcache.FreeBSD.org/ports-distfiles/` | Where a miss is fetched from. The distinfo name is appended to it. `http` or `https`, ending in `/`.                                                                                                                                               |
-| `distfiles_root`                  | `build_root`                                    | Root of the DISTDIR `build fetch distfiles` writes, at `<distfiles_root>/distfiles/`.                                                                                                                                                              |
+| `distfiles_root`                  | `build_root`                                    | Root of the DISTDIRs `build fetch distfiles` writes, one per declared environment at `<distfiles_root>/distfiles/@<environment digest>/`, with the client check beside them. See [The client check](#the-client-check).                            |
 | `distfiles_environment_variables` | empty                                           | The supported client environment's make variables: each name maps to every value it may hold where a port reads it. `[]` declares it undefined on every client. See [The client environment](#the-client-environment).                             |
 | `distfiles_environment_files`     | empty                                           | The supported client environment's files outside the ports tree: each absolute client-host path maps to its alternatives, `"absent"` or the absolute path of a snapshot on the bodega host. See [The client environment](#the-client-environment). |
 
@@ -3733,9 +3733,10 @@ bodega cannot see a client, so it reads every port against a declared environmen
 
 - A path the scan reaches outside the ports tree is looked up in `distfiles_environment_files`. Each alternative declared for it is read, the way every branch of a conditional is; `"absent"` is one alternative. A path with no declaration refuses the port, including a path under `.sinclude` or `exists()` that is missing on the server. The server's own files are never read in its place.
 - A variable in `distfiles_environment_variables` holds its declared values from the port's first line, as a `make.conf` assignment does: the port's own `=` replaces them and its `?=` does not. A variable declared `[]` is undefined and expands to nothing. A variable no declaration names and nothing in the port sets stays unresolvable, and a path reading it refuses the port.
+- A `?=` on a variable the declaration does not name may not take on a client: `make.conf`, the environment or the command line may have set it first. So its default is one value and "set outside the tree" is another, and a path reading it refuses the port with a message naming the variable to declare. `databases/postgresql14-docs` names its master as `postgresql${WANT_PGSQL_VER}-server` after `WANT_PGSQL_VER?=14`; a client setting `WANT_PGSQL_VER=16` in `make.conf` builds against a different master.
 - `PORTSDIR`, `MASTERDIR`, `FILESDIR`, `PKGDIR`, `DISTINFO_FILE`, `RESTRICTED`, `NO_CDROM`, `LICENSE` and `LICENSE_PERMS*` cannot be declared. A client setting one for every port is not modeled, and the configuration is refused at load.
 
-The empty declaration is the default, and it refuses every distfile on a stock tree: 111 ports read something outside the tree or a variable only the client sets, and their `distinfo` cannot be placed. This is the declaration the 15.1 test tree was measured with, for a stock `arm64` client with no `/etc/make.conf` and no aspell installed:
+The empty declaration is the default, and it refuses every distfile on a stock tree: 137 ports read something outside the tree or a variable only the client sets, and their `distinfo` cannot be placed. This is the declaration the 15.1 test tree was measured with, for a stock `arm64` client with no aspell installed and no `/etc/make.conf` beyond the lines [The client check](#the-client-check) adds:
 
 ```json
 "distfiles_environment_variables": {
@@ -3745,7 +3746,13 @@ The empty declaration is the default, and it refuses every distfile on a stock t
   "NODEJS_VERSION": ["24"],
   "LLVM_DEFAULT": ["19"],
   "PKGNAMESUFFIX": [],
-  "WANTEDPORTSCFG": []
+  "WANTEDPORTSCFG": [],
+  "CFENGINE_VERSION": [],
+  "CFGFILE": [],
+  "KRB5_VERSION": [],
+  "LLVM_SUFFIX": [],
+  "WANT_PGSQL_VER": [],
+  "XPDF_VERSION": []
 },
 "distfiles_environment_files": {
   "/usr/local/etc/aspell.ver": ["absent"],
@@ -3755,24 +3762,51 @@ The empty declaration is the default, and it refuses every distfile on a stock t
 }
 ```
 
-With it, no port is left unplaced, `pcpustat/1.6.tar.bz2` is admitted against its own `distinfo` line, and 3,881 of 75,349 distfiles are refused on their own port's account. `/Makefile.common` is not a typo: `sysutils/bacula13-server` includes `${MASTERDIR}/Makefile.common` in an `.else` branch where `MASTERDIR` is undefined, so base `make` would open that path on the client, and only the declaration can say nothing is there.
+With it, no port is left unplaced, `pcpustat/1.6.tar.bz2` is admitted against its own `distinfo` line, and 3,881 of 75,349 distfiles are refused on their own port's account. The last six variables are declared unset because 28 stock ports default them with `?=` where they decide a master or an include; declaring them unset is what lets the client check refuse a client that sets one. `/Makefile.common` is not a typo: `sysutils/bacula13-server` includes `${MASTERDIR}/Makefile.common` in an `.else` branch where `MASTERDIR` is undefined, so base `make` would open that path on the client, and only the declaration can say nothing is there.
 
 To build one for your clients, start from the empty declaration and read what bodega refuses. `bodega serve` logs every unplaced port after each read of the tree, and `build fetch distfiles` prints the same list; each entry names the path outside the tree or the variable it could not resolve. Confirm each value on a client you support with base `make`, for example `make -C /usr/ports/www/node -V NODEJS_VERSION`, and declare it. Where your clients differ (two architectures, aspell installed on some of them), declare every value or alternative they hold: bodega reads each one, and a restriction reached through any of them refuses the file. A snapshot is the file's bytes as a client holds them, kept on the bodega host.
 
-The declaration is bound to what bodega admits:
+The declaration's digest, SHA-256 over every declared value and snapshot byte, is what the rest of the design keys on:
 
-- The server and the builder log the declaration's SHA-256, snapshot bytes included, at every read of the tree (`distinfo: indexed N distfiles from <tree> against environment <digest>`).
-- Snapshots are read at every read of the tree and held to the digest of the first. A snapshot that changes, or can no longer be read, refuses every distfile with `503` until the original bytes are back or bodega restarts and adopts the new ones; `build fetch distfiles` and a distfiles upload refuse the whole run. This is the opposite of a failed read of the tree, which keeps the previous index.
-- A request carries only a distinfo name. What a client's own `make` would compute never reaches admission, so a client cannot widen what bodega releases.
+- The server and the builder log it at every read of the tree (`distinfo: indexed N distfiles from <tree> against environment <digest>`).
+- The server holds the digest of the first read for its life. Snapshots are read again at every read of the tree, and one that changes, or can no longer be read, drops the index and refuses every distfile with `503` until the original bytes are back or bodega restarts and adopts the new ones. This is the opposite of a failed read of the tree, which keeps the previous index. The re-read runs in the background when a request finds the index older than 10 minutes, and until it finishes, requests are answered from the index admitted against the original bytes. That index is still the one the digest names, so the window admits nothing the digest does not.
+- The builder holds the environment its first distfiles stage read for the life of the command, or in the shell, of the stage it runs. A later stage of the same command, such as the upload `build upload distfiles` runs after its fetch, reads the declaration again and refuses the whole stage if a snapshot changed or cannot be read, naming both digests. The next command adopts the declaration as it then stands.
+- Every delivery is keyed by it, and only a client whose check names it is served. See [The client check](#the-client-check).
 
-What bodega cannot do is check that a client matches the declaration. A client whose host differs is outside the supported environment, and bodega's answer to it is the declaration's answer. See [the threat model](threat-model.md) for what that leaves open.
+#### The client check
+
+bodega cannot see a client, so the client measures itself. bodega generates a `make` fragment from the declaration, the client includes it as the last line of `/etc/make.conf`, and every `make` the client runs sets `BODEGA_DISTFILES_ENV` to the declaration's digest while the client holds what admission assumed, and to `unsupported` otherwise. Both deliveries are keyed by that name: the HTTP route serves `/distfiles/@<digest>/<name>` for the digest the server admitted against and refuses anything else with `451`, and the builder writes each environment's `DISTDIR` under `@<digest>`, so a client naming `unsupported` points at a directory bodega never writes.
+
+The check tests, in the `make` that reads the port:
+
+- Every declared file: absent where the declaration allows it, or holding the bytes of one of its snapshots, by `sha256(1)`. A file declared `"absent"` alone that exists, a file declared by snapshot alone that is missing, and any other bytes all name `unsupported`. It runs as `make` starts, moments before the port's own `.include` opens the same path.
+- `DISTINFO_FILE`, `FILESDIR`, `LICENSE`, `LICENSE_PERMS`, `MASTERDIR`, `NO_CDROM`, `PKGDIR`, `RESTRICTED` and every variable declared `[]`: none may be set by `make.conf`, the environment or the command line. `LICENSE_PERMS_<license>` may not be set in the environment or on the command line, and a makefile read before the check (`/etc/make.conf` and what it includes) may not mention `LICENSE` at all, because a per-license name can be built from pieces no list can match.
+- Every other declared variable: where `make.conf`, the environment or the command line sets it, and again where the fetch expands its sites, after the framework has set `ARCH`, `LOCALBASE` and the rest, it holds a declared value.
+
+Fetch it once per client, and again whenever the declaration changes:
+
+```sh
+fetch -o /usr/local/etc/bodega-distfiles.mk https://bodega-host:8080/distfiles/@environment.mk
+```
+
+`build fetch distfiles` also writes it to `<distfiles_root>/distfiles/@environment.mk`, so a client that mounts that directory can include it from the mount and follow the builder's declaration without copying anything. A client still running a check for an older declaration names that declaration's digest, which the server refuses until the client fetches the check again.
+
+When a client is refused, ask its `make` why, in the port's directory:
+
+```sh
+make -C /usr/ports/sysutils/pcpustat -V BODEGA_DISTFILES_ENV -V BODEGA_DISTFILES_DRIFT
+```
+
+`BODEGA_DISTFILES_DRIFT` names each file or variable that differed as `make` started. When it is empty and the environment still reads `unsupported`, a declared variable holds an undeclared value where the fetch reads it; `make -V <name>` in the same directory shows which.
+
+What the check cannot do is stop a client that does not run it. A client that hard-codes a digest into `MASTER_SITE_OVERRIDE` or `DISTDIR` instead of `${BODEGA_DISTFILES_ENV}` asserts the environment by hand, and bodega believes it. See [the threat model](threat-model.md) for the rest of what that leaves open.
 
 #### Two deployments, and only one of them is a wall
 
-| Deployment | Client setting                                                                    | bodega side                                                       | What it guarantees                                                                              |
-| ---------- | --------------------------------------------------------------------------------- | ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| HTTP       | `MASTER_SITE_OVERRIDE` and `MASTER_SITE_BACKUP` in `/etc/make.conf`               | `GET /distfiles/<name>`, pull-through                             | bodega is tried first. Preempted, not enforced: any miss falls through to the port's own sites. |
-| `DISTDIR`  | `DISTDIR` (or poudriere's `DISTFILES_CACHE`) pointing at a directory bodega wrote | `bodega build fetch distfiles` into `<distfiles_root>/distfiles/` | No site is contacted at all. The one deployment that stops a build reaching the internet.       |
+| Deployment | Client setting                                                                    | bodega side                                                                      | What it guarantees                                                                              |
+| ---------- | --------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| HTTP       | `MASTER_SITE_OVERRIDE` and `MASTER_SITE_BACKUP` in `/etc/make.conf`               | `GET /distfiles/@<environment>/<name>`, pull-through                             | bodega is tried first. Preempted, not enforced: any miss falls through to the port's own sites. |
+| `DISTDIR`  | `DISTDIR` (or poudriere's `DISTFILES_CACHE`) pointing at a directory bodega wrote | `bodega build fetch distfiles` into `<distfiles_root>/distfiles/@<environment>/` | No site is contacted at all. The one deployment that stops a build reaching the internet.       |
 
 **HTTP preempts; it does not enforce.** `Mk/Scripts/do-fetch.sh` tries `MASTER_SITE_OVERRIDE`, then the port's own `MASTER_SITES`, then `MASTER_SITE_BACKUP`. Any answer from bodega other than the bytes (a 404 for a name it cannot pin, a 451 for a restricted file, a 502 for a failed or refused fetch, an unreachable server) sends the client on to the port's own sites. No `bsd.port.mk` knob empties `MASTER_SITES`. Use this deployment to take load off the internet and to serve checked bytes first; do not use it to isolate a build.
 
@@ -3782,21 +3816,24 @@ What bodega cannot do is check that a client matches the declaration. A client w
 
 ```make
 # /etc/make.conf
-MASTER_SITE_OVERRIDE?=	https://bodega-host:8080/distfiles/${DIST_SUBDIR}/
-MASTER_SITE_BACKUP?=	https://bodega-host:8080/distfiles/${DIST_SUBDIR}/
+MASTER_SITE_OVERRIDE?=	https://bodega-host:8080/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/
+MASTER_SITE_BACKUP?=	https://bodega-host:8080/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/
+.include "/usr/local/etc/bodega-distfiles.mk"
 ```
 
-Set both. `MASTER_SITE_OVERRIDE` puts bodega ahead of every port's own sites. `MASTER_SITE_BACKUP` is the last site tried, and its default is `distcache.FreeBSD.org`; `bsd.port.mk` says it "should _not_ be changed". Changing it here is deliberate: left alone, the last site a client falls back to is the internet's distfile cache rather than bodega.
+The last line is [the client check](#the-client-check), and it has to stay last so it sees everything above it. Set both sites. `MASTER_SITE_OVERRIDE` puts bodega ahead of every port's own sites. `MASTER_SITE_BACKUP` is the last site tried, and its default is `distcache.FreeBSD.org`; `bsd.port.mk` says it "should _not_ be changed". Changing it here is deliberate: left alone, the last site a client falls back to is the internet's distfile cache rather than bodega.
 
-`${DIST_SUBDIR}` is expanded per port. `do-fetch.sh` appends the bare filename to each site, so the override has to carry the subdirectory itself, and the path it composes is then the distinfo name. A port with no `DIST_SUBDIR` composes `/distfiles//<file>`; the server answers the doubled slash with a redirect to the single-slash path, which `fetch(1)` follows.
+`${DIST_SUBDIR}` is expanded per port. `do-fetch.sh` appends the bare filename to each site, so the override has to carry the subdirectory itself, and the path it composes after the environment is then the distinfo name. A port with no `DIST_SUBDIR` composes `/distfiles/@<environment>//<file>`; the server answers the doubled slash with a redirect to the single-slash path, which `fetch(1)` follows.
 
 `make fetch-url-list` in a port directory prints the URLs in the order they will be tried:
 
 ```text
-http://bodega-host:8080/distfiles/pcpustat/1.6.tar.bz2
+http://bodega-host:8080/distfiles/@1dc9b4dd25600c36e62f8ee80383eb213bd36758b04913efb054713202decc44/pcpustat/1.6.tar.bz2
 https://bitbucket.org/sterlingcamden/pcpustat/get/1.6.tar.bz2
-http://bodega-host:8080/distfiles/pcpustat/1.6.tar.bz2
+http://bodega-host:8080/distfiles/@1dc9b4dd25600c36e62f8ee80383eb213bd36758b04913efb054713202decc44/pcpustat/1.6.tar.bz2
 ```
+
+On a client that has drifted from the declaration, both bodega lines read `@unsupported`, the route answers `451`, and the port's own site is the only one that can answer.
 
 #### Client side, `DISTDIR`
 
@@ -3807,28 +3844,32 @@ bodega pkg create distfiles pcpustat/1.6.tar.bz2
 bodega build fetch distfiles
 ```
 
-Each lands at `<distfiles_root>/distfiles/pcpustat/1.6.tar.bz2` after its size and SHA-256 match `distinfo`, written under a temporary name and renamed into place, so a partial or wrong file never sits under a name `do-fetch.sh` would skip. A file already present is re-hashed and replaced if it no longer matches. Point the client at that directory:
+Each lands at `<distfiles_root>/distfiles/@<environment>/pcpustat/1.6.tar.bz2` after its size and SHA-256 match `distinfo`, written under a temporary name and renamed into place, so a partial or wrong file never sits under a name `do-fetch.sh` would skip. A file already present is re-hashed and replaced if it no longer matches. `<environment>` is the digest of the declaration the command admitted against, and the check naming it is written beside the directories as `@environment.mk`. Point the client at the directory its own check names:
 
 ```make
-# /etc/make.conf, or poudriere.conf's DISTFILES_CACHE
-DISTDIR=	/net/bodega-host/distfiles
+# /etc/make.conf
+DISTDIR=	/net/bodega-host/distfiles/@${BODEGA_DISTFILES_ENV}
+.include "/net/bodega-host/distfiles/@environment.mk"
 ```
 
-`bodega build upload distfiles` copies the same files into storage, so the HTTP route serves them without a pull-through. It re-runs the fetch first, which re-hashes every file already present and replaces one that no longer matches, then holds every file to the current `distinfo` again before any is uploaded. A file that is not listed, is restricted, or does not match fails the command with each one named, and nothing is uploaded; so does an unset `distfiles_ports_tree`. A file in the `DISTDIR` is not evidence of admission: another tool may have written it, or a tree update may have repinned or restricted it since. Each file is copied into a private directory beside the `DISTDIR`, and that copy is checked and uploaded, so a file rewritten or replaced after the check does not change what is uploaded. Every copy is held until the upload finishes, so the filesystem holding the `DISTDIR` needs free space for all the files one upload selects.
+A client that has drifted names `/net/bodega-host/distfiles/@unsupported`, which bodega never writes, so its fetch fails or goes to the port's own sites rather than reading a file admitted under terms that client no longer holds. For poudriere, `DISTFILES_CACHE` is mounted as the jail's `DISTDIR`; point it at the environment's directory and include the check in the jail's `make.conf` so a jail that differs is refused rather than served. A directory for an older declaration stays until you remove it, and keeps serving a client that still measures that declaration.
+
+`bodega build upload distfiles` copies the same files into storage, so the HTTP route serves them without a pull-through. It re-runs the fetch first, which re-hashes every file already present and replaces one that no longer matches, then holds every file to the current `distinfo` again before any is uploaded. It reads files from every environment's directory and from `<distfiles_root>/distfiles/` itself, where a builder before environments wrote them, and holds each to the index of the environment the command admits in; the object key carries no environment, because the route checks the client's environment before it reads storage. A file that is not listed, is restricted, or does not match fails the command with each one named, and nothing is uploaded; so does an unset `distfiles_ports_tree`. A file in the `DISTDIR` is not evidence of admission: another tool may have written it, or a tree update may have repinned or restricted it since. Each file is copied into a private directory beside the `DISTDIR`, and that copy is checked and uploaded, so a file rewritten or replaced after the check does not change what is uploaded. Every copy is held until the upload finishes, so the filesystem holding the `DISTDIR` needs free space for all the files one upload selects.
 
 #### Key and layout
 
-| Where          | Form                                                        | Example                                                |
-| -------------- | ----------------------------------------------------------- | ------------------------------------------------------ |
-| distinfo name  | `[<DIST_SUBDIR>/]<file>`, the string inside the parentheses | `pcpustat/1.6.tar.bz2`, `zsh-5.9.tar.xz`               |
-| manifest entry | name is the distinfo name; no version                       | `distfiles/pcpustat/1.6.tar.bz2`                       |
-| object key     | `distfiles/<distinfo name>`                                 | `distfiles/pcpustat/1.6.tar.bz2`                       |
-| storage path   | `{storage_path}/distfiles/<distinfo name>`, a DISTDIR       | `/var/lib/bodega/distfiles/pcpustat/1.6.tar.bz2`       |
-| local DISTDIR  | `<distfiles_root>/distfiles/<distinfo name>`                | `/var/lib/bodega/build/distfiles/pcpustat/1.6.tar.bz2` |
-| route          | `GET /distfiles/<distinfo name>`                            | `/distfiles/pcpustat/1.6.tar.bz2`                      |
-| `ParseKey`     | type `distfiles`, name the distinfo name, version empty     | `(distfiles, pcpustat/1.6.tar.bz2, "")`                |
+| Where          | Form                                                        | Example                                                          |
+| -------------- | ----------------------------------------------------------- | ---------------------------------------------------------------- |
+| distinfo name  | `[<DIST_SUBDIR>/]<file>`, the string inside the parentheses | `pcpustat/1.6.tar.bz2`, `zsh-5.9.tar.xz`                         |
+| manifest entry | name is the distinfo name; no version                       | `distfiles/pcpustat/1.6.tar.bz2`                                 |
+| object key     | `distfiles/<distinfo name>`                                 | `distfiles/pcpustat/1.6.tar.bz2`                                 |
+| storage path   | `{storage_path}/distfiles/<distinfo name>`, a DISTDIR       | `/var/lib/bodega/distfiles/pcpustat/1.6.tar.bz2`                 |
+| local DISTDIR  | `<distfiles_root>/distfiles/@<environment>/<distinfo name>` | `/var/lib/bodega/build/distfiles/@<digest>/pcpustat/1.6.tar.bz2` |
+| route          | `GET /distfiles/@<environment>/<distinfo name>`             | `/distfiles/@<digest>/pcpustat/1.6.tar.bz2`                      |
+| client check   | `GET /distfiles/@environment.mk`, and beside the DISTDIRs   | `/var/lib/bodega/build/distfiles/@environment.mk`                |
+| `ParseKey`     | type `distfiles`, name the distinfo name, version empty     | `(distfiles, pcpustat/1.6.tar.bz2, "")`                          |
 
-The subdirectory is part of the name everywhere, and nothing is encoded: slashes stay slashes, as they do for `gomod`. A distfile has no version apart from its filename, so the key has no version segment and `ParseKey` does not split one out; reading `zsh-5.9.tar.xz` as the package `zsh` at `5.9` names nothing any distinfo line or manifest entry is called. The object tree under `distfiles/` and the local one under `<distfiles_root>/distfiles/` are both laid out as a `DISTDIR`, which is what lets either be handed to a client as one.
+The subdirectory is part of the name everywhere, and nothing is encoded: slashes stay slashes, as they do for `gomod`. A distfile has no version apart from its filename, so the key has no version segment and `ParseKey` does not split one out; reading `zsh-5.9.tar.xz` as the package `zsh` at `5.9` names nothing any distinfo line or manifest entry is called. The object tree under `distfiles/` and each local one under `<distfiles_root>/distfiles/@<environment>/` are laid out as a `DISTDIR`, which is what lets either be handed to a client as one. A distinfo name never starts with `@`, which is what keeps the environment segment and the check apart from the names.
 
 #### Pull-through, not a full copy
 
@@ -3849,27 +3890,27 @@ The scan is lexical, because evaluating a port needs `make` and the whole of `Mk
 - An assignment inside an `.if` counts whether or not the condition holds. `multimedia/ffmpeg4`, which sets `LICENSE_PERMS_NONFREE` for an optional component, loses every distfile to it.
 - A `LICENSE` or `LICENSE_PERMS` value holding a make variable (`LICENSE=${PORT_LICENSE}`), or a `LICENSE_PERMS_${...}` name, is refused as unreadable.
 - A license `Mk/bsd.licenses.db.mk` does not define is refused unless the port gives it a `LICENSE_PERMS` that grants both permissions.
-- Quoted `.include` lines are followed, from the Makefile and every file it reaches, so a `NO_CDROM` in an included file counts. Lines are read in make's order, and a path is resolved from `${.CURDIR}`, `${.PARSEDIR}`, `${PORTSDIR}`, the declared environment, the variables the port assigns, and the `:H`, `:tl`, `:tu`, `:tA` and `:C` modifiers. `:tA` is answered only for a path inside the tree. A `:C` pattern is refused where Go's POSIX regular expressions could read it differently from `regcomp(3)`: a backslash inside brackets or before a letter or digit, a `$`, a back-reference, or a pattern matching the empty string. Any other modifier refuses the path. `:=` takes its value where it stands, a file included twice is read twice with the values in force at each include, and `MASTERDIR` and `FILESDIR` take the framework's defaults at the framework include. Conditions are not evaluated, and every branch is read. Each branch of an `.if`/`.elif`/`.else` chain starts from the values in force at the `.if`, and at `.endif` the values every branch left are combined, with the values from before the `.if` as one more branch when there is no `.else`. So an assignment and an include after it in one branch see that assignment alone, and a variable both sides of an `.if`/`.else` set is not left possibly undefined. A variable no assignment has set is undefined, as is one some branch, a `.for` whose list may be empty, or an `.undef` leaves unset. A path reading a possibly undefined variable refuses the port, because make expands it to nothing where the scan sees only the assigned value; a `?=` assigns only on the paths where it may be undefined. A `.for` whose list cannot be empty runs its body at least once, so an assignment there is not one make may skip. A `.for` variable takes every word of the loop's list, and is substituted into the loop's own text as make does, so inside the loop it shadows a variable of the same name and outside it does not. A path refuses the port when it does not resolve, reads a variable set by `!=`, by `+=` or `:=` inside `.for`, through a variable-built name that does not resolve, or by a `::=` or `:_=` modifier, leaves the ports tree without a declaration (see [The client environment](#the-client-environment)), leaves it through a symlink, includes the file that includes it, reaches more than 256 file reads, or names a missing file under a plain `.include`; a missing `.sinclude` or `.-include` in the tree, or any include under a conditional, does not. An `.else`, `.elif` or `.endif` the scan cannot match to its `.if` refuses the port. Angle-bracket includes and anything under `Mk/` are the framework and are not read.
+- Quoted `.include` lines are followed, from the Makefile and every file it reaches, so a `NO_CDROM` in an included file counts. Lines are read in make's order, and a path is resolved from `${.CURDIR}`, `${.PARSEDIR}`, `${PORTSDIR}`, the declared environment, the variables the port assigns, and the `:H`, `:tl`, `:tu`, `:tA` and `:C` modifiers. Every path is resolved as the kernel and `realpath(3)` resolve it, a component at a time, so a symlink before a `..` decides where the `..` leads, and `.PARSEDIR` is the directory as the include named it rather than where a symlink led; cleaning `${.CURDIR}/link/../restricted` first would read a different file than base `make` does. `:tA` is answered only for a path whose every step stays inside the tree, and leaves a path with a missing component unchanged, as `realpath(3)` failing does. A path outside the tree has to be written clean, because which client file a `..` there reaches depends on symlinks on the client. A `:C` pattern is refused where Go's POSIX regular expressions could read it differently from `regcomp(3)`: a backslash inside brackets or before a letter or digit, a `$`, a back-reference, or a pattern matching the empty string. Any other modifier refuses the path. `:=` takes its value where it stands, a file included twice is read twice with the values in force at each include, and `MASTERDIR` and `FILESDIR` take the framework's defaults at the framework include. Conditions are not evaluated, and every branch is read. Each branch of an `.if`/`.elif`/`.else` chain starts from the values in force at the `.if`, and at `.endif` the values every branch left are combined, with the values from before the `.if` as one more branch when there is no `.else`. So an assignment and an include after it in one branch see that assignment alone, and a variable both sides of an `.if`/`.else` set is not left possibly undefined. A variable no assignment has set is undefined, as is one some branch, a `.for` whose list may be empty, or an `.undef` leaves unset. A path reading a possibly undefined variable refuses the port, because make expands it to nothing where the scan sees only the assigned value; a `?=` assigns only on the paths where it may be undefined. A `.for` whose list cannot be empty runs its body at least once, so an assignment there is not one make may skip. A `.for` variable takes every word of the loop's list, and is substituted into the loop's own text as make does, so inside the loop it shadows a variable of the same name and outside it does not. A path refuses the port when it does not resolve, reads a variable an undeclared `?=` defaults (see [The client environment](#the-client-environment)), reads a variable set by `!=`, by `+=` or `:=` inside `.for`, through a variable-built name that does not resolve, or by a `::=` or `:_=` modifier, leaves the ports tree without a declaration (see [The client environment](#the-client-environment)), leaves it through a symlink or a `..`, includes the file that includes it, reaches more than 256 file reads, or names a missing file under a plain `.include`; a missing `.sinclude` or `.-include` in the tree, or any include under a conditional, does not. An `.else`, `.elif` or `.endif` the scan cannot match to its `.if` refuses the port. Angle-bracket includes and anything under `Mk/` are the framework and are not read.
 - An assignment whose name is built from variables (`${N}=`, `$o_DESC=` inside a `.for`) counts as an assignment to every name it resolves to, so `N=NO_CDROM` then `${N}=No resale` restricts the port. When the name does not resolve, or a `::=` or `:_=` modifier assigns to one, the port is refused if that name could be `RESTRICTED`, `NO_CDROM`, `LICENSE`, `LICENSE_PERMS` or `LICENSE_PERMS_<lic>` for a license the port names, whether or not anything later reads it. `${UNKNOWN}_DESC=` could not, and is ignored.
 - A `.for` line the scan cannot parse refuses the port.
-- A restricted port restricts the names in every `distinfo` its fetch may check against: `${DISTINFO_FILE}`, which defaults to `${MASTERDIR}/distinfo`, resolved from the same variables at each framework include and at the end of the read. So a slave restricts its master's names however it spells `MASTERDIR` (`${.CURDIR}/..`, `${.CURDIR:H:H}/...`, `${PORTSDIR}/...`, in an included file, or on either side of an `.if`), and a port pointing `DISTINFO_FILE` at another port's directory restricts that one, including from a declared snapshot. Every `distinfo*` in a placed directory is restricted, not only the one the path names. A directory that is not a `<category>/<port>` of the tree bodega reads (outside it, or deeper in it) holds no `distinfo` bodega indexes, so the port counts as unplaced rather than restricting nothing.
+- A restricted port restricts the names in every `distinfo` its fetch may check against: `${DISTINFO_FILE}`, which defaults to `${MASTERDIR}/distinfo`, resolved from the same variables at each framework include and at the end of the read. So a slave restricts its master's names however it spells `MASTERDIR` (`${.CURDIR}/..`, `${.CURDIR:H:H}/...`, `${PORTSDIR}/...`, in an included file, or on either side of an `.if`), and a port pointing `DISTINFO_FILE` at another port's directory restricts that one, including from a declared snapshot. Every `distinfo*` in a placed directory is restricted, not only the one the path names. The path is resolved as the kernel resolves it; a final symlink places the directory it leads to as well, and a file named other than `distinfo*` is read itself, so the names it pins are restricted wherever else they are pinned. A directory that is not a `<category>/<port>` of the tree bodega reads (outside it, or deeper in it) holds no `distinfo` bodega indexes, so the port counts as unplaced rather than restricting nothing.
 - Only the whole path places a directory. A reference after the last `/` can expand to more separators and `..`, so `${.CURDIR}/stub${TAIL}` with `TAIL` set by `!=` is not placed under `stub`, and `distinfo.${ARCH:S/...}` is not placed under its directory either.
 - Where a restricted port's directory cannot be placed, that port may read any `distinfo` in the tree, so **every distfile is refused** with a reason naming it (`<origin> is restricted or unreadable and reads a distinfo bodega cannot place, so it may obtain any distfile in the tree`). A slave with no `distinfo` of its own would otherwise restrict nothing. `bodega serve` logs the ports after every read of the tree (`distinfo: refusing every distfile: N restricted ports read a distinfo bodega cannot place`), and `build fetch distfiles` and a distfiles upload print the same list as a warning. A port whose terms read cleanly and carry no restriction refuses nothing, wherever its `distinfo` is.
-- **On a stock ports tree with no declared environment, this refuses everything.** The 15.1 test tree has 111 such ports under the empty declaration: 91 aspell dictionaries reading `${LOCALBASE}/etc/aspell.ver`, 4 Perl ports reading `/tmp/PERL5_DEFAULT`, and the rest reading `ARCH`, `NODEJS_VERSION`, `LLVM_DEFAULT`, `USESDIR`, `PKGNAMESUFFIX` or `WANTEDPORTSCFG`, or reaching `/Makefile.common` through an undefined `MASTERDIR`. Under the stock declaration in [The client environment](#the-client-environment) it has none.
+- **On a stock ports tree with no declared environment, this refuses everything.** The 15.1 test tree has 137 such ports under the empty declaration: 91 aspell dictionaries reading `${LOCALBASE}/etc/aspell.ver`, 4 Perl ports reading `/tmp/PERL5_DEFAULT`, the PostgreSQL, CFEngine and four other ports whose master or include a `?=` default decides, and the rest reading `ARCH`, `NODEJS_VERSION`, `LLVM_DEFAULT`, `USESDIR`, `PKGNAMESUFFIX` or `WANTEDPORTSCFG`, or reaching `/Makefile.common` through an undefined `MASTERDIR`. Under the stock declaration in [The client environment](#the-client-environment) it has none.
 
 None of this is a make evaluator. A restriction set through `USES`, or by a framework file the port does not include by a quoted path, is not seen.
 
 #### What the route answers
 
-| Status | When                                                                                                                                                                             |
-| ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `200`  | The bytes match `distinfo`, from the cache or from a pull-through                                                                                                                |
-| `400`  | The path is not a legal distinfo name                                                                                                                                            |
-| `403`  | A miss whose upstream host the allow-list does not name                                                                                                                          |
-| `404`  | No `distfiles_ports_tree` is configured, no `distinfo` lists the name, the tree pins it ambiguously, or the upstream does not carry it                                           |
-| `451`  | The port forbids redistributing it, or its terms cannot be read without `make`                                                                                                   |
-| `502`  | The upstream's bytes disagree with `distinfo`, or the upstream failed. A disagreement is recorded as a `cache` row with status `checksum_mismatch` naming both digests and sizes |
-| `503`  | The ports tree is still being read, the declared environment's snapshots cannot be read or changed since startup, or the spool is at its bound                                  |
+| Status | When                                                                                                                                                                                                                                                  |
+| ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `200`  | The bytes match `distinfo`, from the cache or from a pull-through; or the path is `/distfiles/@environment.mk` and the body is the client check                                                                                                       |
+| `400`  | The path is not a legal distinfo name                                                                                                                                                                                                                 |
+| `403`  | A miss whose upstream host the allow-list does not name                                                                                                                                                                                               |
+| `404`  | No `distfiles_ports_tree` is configured, no `distinfo` lists the name, the tree pins it ambiguously, or the upstream does not carry it                                                                                                                |
+| `451`  | The port forbids redistributing it, or its terms cannot be read without `make`; or the path names no environment, `unsupported`, or a digest other than the one the server admitted against, recorded as a `denied` row with status `distfile_client` |
+| `502`  | The upstream's bytes disagree with `distinfo`, or the upstream failed. A disagreement is recorded as a `cache` row with status `checksum_mismatch` naming both digests and sizes                                                                      |
+| `503`  | The ports tree is still being read, the declared environment's snapshots cannot be read or changed since startup, or the spool is at its bound                                                                                                        |
 
 "Ambiguously" means two `distinfo` files pinning one name to different bytes, which happens when a tree is read partway through an update, or a `distinfo` line that does not parse. `graphics/epsonscan2-non-free-plugin` on the 15.1 tree ships a `SIZE` line with no `=`; that one file is refused and the rest of the tree is not.
 

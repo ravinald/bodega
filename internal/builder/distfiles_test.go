@@ -67,6 +67,17 @@ func distfilesRun(t *testing.T, body string) (*Config, *manifest.Store, *atomic.
 	return cfg, store, &hits
 }
 
+// rerun is the next invocation over cfg's tree and DISTDIR, under spec.
+func rerun(cfg *Config, spec distinfo.EnvironmentSpec) *Config {
+	return &Config{
+		BuildRoot:            cfg.BuildRoot,
+		Stdout:               cfg.Stdout,
+		DistfilesPortsTree:   cfg.DistfilesPortsTree,
+		DistfilesUpstream:    cfg.DistfilesUpstream,
+		DistfilesEnvironment: spec,
+	}
+}
+
 func distdirFiles(t *testing.T, cfg *Config) []string {
 	t.Helper()
 	root := ArtifactDir(cfg, manifest.TypeDistfiles)
@@ -159,6 +170,10 @@ func makeOnlyRefusal(name string) string {
 	switch {
 	case name == "undefined branch":
 		return "cannot be resolved"
+	case name == "conditional undef":
+		// D?= with D undeclared: make.conf may set D first, so the port
+		// refuses and names what to declare rather than reading NO_CDROM.
+		return "it reads D, which the port sets with ?="
 	case strings.HasPrefix(name, "slave whose"):
 		return "may obtain any distfile in the tree"
 	}
@@ -348,7 +363,7 @@ func TestDistfilesArtifactPathsAdmitsOnlyWhatDistinfoPins(t *testing.T) {
 	}
 	// Rewriting the DISTDIR file in place, or replacing it, after enumeration
 	// does not change what is uploaded.
-	dest := filepath.Join(cfg.BuildRoot, "distfiles", "pcpustat", "1.6.tar.bz2")
+	dest := filepath.Join(ArtifactDir(cfg, manifest.TypeDistfiles), "pcpustat", "1.6.tar.bz2")
 	if err := os.WriteFile(dest, []byte("PCPUSTAT SOURCE BYTES"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -444,16 +459,132 @@ func TestDistfilesBuilderHoldsTheDeclaredEnvironment(t *testing.T) {
 				t.Fatalf("fetch: %+v after %d upstream fetches, files %v; want refused before any", s.Results, hits.Load(), distdirFiles(t, cfg))
 			}
 
-			cfg.DistfilesEnvironment = absent
+			// Each declaration is its own invocation: a Config holds the
+			// environment its first stage read.
+			cfg = rerun(cfg, absent)
 			if s := FetchDistfiles(cfg, store, "pcpustat/1.6.tar.bz2"); s.HasFailures() || hits.Load() != 1 {
 				t.Fatalf("fetch declared absent: %+v after %d upstream fetches, want admitted", s.Results, hits.Load())
 			}
-			cfg.DistfilesEnvironment = spec
+			cfg = rerun(cfg, spec)
 			paths, release, err := DistfilesArtifactPaths(cfg, store, "pcpustat/1.6.tar.bz2")
 			defer release()
 			if err == nil || len(paths) != 0 {
 				t.Fatalf("upload: %d paths, err %v; want the bytes already in DISTDIR refused", len(paths), err)
 			}
 		})
+	}
+}
+
+// The DISTDIR a client reads is the one named by the environment it measured:
+// files land under @<digest>, and the check that names that digest sits
+// beside it for a client mounting the directory to include.
+func TestFetchDistfilesKeysTheDistdirByEnvironment(t *testing.T) {
+	cfg, store, _ := distfilesRun(t, distfileBody)
+	if s := FetchDistfiles(cfg, store, "pcpustat/1.6.tar.bz2"); s.HasFailures() {
+		t.Fatalf("fetch: %+v", s.Results)
+	}
+	env, err := distinfo.EnvironmentSpec{}.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(cfg.BuildRoot, "distfiles")
+	if fi, err := os.Stat(filepath.Join(root, "@"+env.Digest(), "pcpustat", "1.6.tar.bz2")); err != nil || !fi.Mode().IsRegular() {
+		t.Fatalf("the distfile is not under @%s: %v", env.Digest(), err)
+	}
+	fi, err := os.Stat(filepath.Join(root, "@environment.mk"))
+	if err != nil || fi.Mode().Perm() != 0o644 {
+		t.Fatalf("the client check is not readable beside the DISTDIR: %v %v", fi, err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(root, "@environment.mk")); !strings.Contains(string(b), ":?"+env.Digest()+":unsupported") {
+		t.Errorf("the check beside the DISTDIR names another environment:\n%s", b)
+	}
+}
+
+// One Config admits against one environment. A snapshot that changes or
+// disappears between the fetch and the upload refuses the upload and every
+// later read, rather than holding the bytes the fetch admitted to bytes it
+// never saw; a new Config adopts the declaration as it then stands.
+func TestDistfilesBuilderHoldsItsFirstEnvironment(t *testing.T) {
+	for name, change := range map[string]func(snap string) error{
+		"changed": func(snap string) error { return os.WriteFile(snap, []byte("NO_CDROM=changed snapshot\n"), 0o600) },
+		"removed": os.Remove,
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg, store, _ := distfilesRun(t, distfileBody)
+			snap := filepath.Join(t.TempDir(), "terms.mk")
+			if err := os.WriteFile(snap, []byte("OK=original snapshot\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(cfg.DistfilesPortsTree, "sysutils/pcpustat/Makefile"), []byte("DIST_SUBDIR=pcpustat\n.include \"/client/terms.mk\"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			spec := distinfo.EnvironmentSpec{Files: map[string][]string{"/client/terms.mk": {snap}}}
+			cfg.DistfilesEnvironment = spec
+			if s := FetchDistfiles(cfg, store, "pcpustat/1.6.tar.bz2"); s.HasFailures() {
+				t.Fatalf("fetch under the original snapshot: %+v", s.Results)
+			}
+			if err := change(snap); err != nil {
+				t.Fatal(err)
+			}
+			paths, release, err := DistfilesArtifactPaths(cfg, store, "pcpustat/1.6.tar.bz2")
+			defer release()
+			if err == nil || len(paths) != 0 || !strings.Contains(err.Error(), "this run admitted against") && !strings.Contains(err.Error(), "changed during this run") {
+				t.Fatalf("upload after the snapshot %s: %d paths, %v; want refused naming the environment the fetch admitted against", name, len(paths), err)
+			}
+			if s := FetchDistfiles(cfg, store, "pcpustat/1.6.tar.bz2"); s.Failures != 1 {
+				t.Fatalf("a later fetch on the same Config: %+v, want refused", s.Results)
+			}
+			if ix, err := cfg.loadDistinfo(); err == nil {
+				t.Fatalf("a later read of the index on the same Config admitted against the changed declaration: %d names", ix.Len())
+			}
+			if name == "changed" {
+				if s := FetchDistfiles(rerun(cfg, spec), store, "pcpustat/1.6.tar.bz2"); s.Failures != 1 || !strings.Contains(fmt.Sprint(s.Results[0].Err), "changed snapshot") {
+					t.Fatalf("a new run under the changed snapshot: %+v, want it adopted and pcpustat refused for its NO_CDROM", s.Results)
+				}
+			}
+		})
+	}
+}
+
+// The F25 audit fixture through the builder: ${P:tA} reads the symlink
+// target's NO_CDROM, so the fetch writes nothing, and bytes some other tool put
+// in the DISTDIR are refused on upload rather than skipped.
+func TestDistfilesBuilderSymlinkBeforeParentIsRestricted(t *testing.T) {
+	cfg, store, hits := distfilesRun(t, distfileBody)
+	tree := cfg.DistfilesPortsTree
+	for rel, body := range map[string]string{
+		"misc/probe/Makefile":            "P=${.CURDIR}/link/../restricted/terms.mk\n.include \"${P:tA}\"\nDISTINFO_FILE=${PORTSDIR}/sysutils/pcpustat/distinfo\n",
+		"misc/probe/restricted/terms.mk": "OK=yes\n",
+		"lang/restricted/terms.mk":       "NO_CDROM=symlink target terms\n",
+	} {
+		p := filepath.Join(tree, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(tree, "lang/master"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../../lang/master", filepath.Join(tree, "misc/probe/link")); err != nil {
+		t.Fatal(err)
+	}
+	s := FetchDistfiles(cfg, store, "pcpustat/1.6.tar.bz2")
+	if s.Failures != 1 || hits.Load() != 0 || len(distdirFiles(t, cfg)) != 0 || !strings.Contains(fmt.Sprint(s.Results[0].Err), "symlink target terms") {
+		t.Fatalf("fetch: %+v after %d upstream fetches, files %v; want refused for the symlink target's NO_CDROM", s.Results, hits.Load(), distdirFiles(t, cfg))
+	}
+	dest := filepath.Join(ArtifactDir(cfg, manifest.TypeDistfiles), "pcpustat", "1.6.tar.bz2")
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dest, []byte(distfileBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	paths, release, err := DistfilesArtifactPaths(cfg, store, "pcpustat/1.6.tar.bz2")
+	defer release()
+	if err == nil || len(paths) != 0 || !strings.Contains(err.Error(), "symlink target terms") {
+		t.Fatalf("upload: %d paths, %v; want refused for the symlink target's NO_CDROM", len(paths), err)
 	}
 }

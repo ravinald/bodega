@@ -63,6 +63,12 @@ var ErrRestricted = errors.New("the port forbids redistributing this distfile")
 // parse. Neither case says which bytes a client holds, so neither is admitted.
 var ErrUnusable = errors.New("the ports tree does not pin this distfile to one digest")
 
+// ErrEnvironment reports a request from a client whose check did not name the
+// environment the index was admitted against: one that has drifted from it
+// ("unsupported"), one checking an older or newer declaration, or one that ran
+// no check at all.
+var ErrEnvironment = errors.New("the client did not measure the environment bodega admits against")
+
 // ErrNotReady reports that the first read of the ports tree has not finished,
 // or has failed. A cold walk of a full tree takes the better part of a minute.
 var ErrNotReady = errors.New("the distinfo index is not loaded yet")
@@ -413,9 +419,10 @@ func portText(tree, dir string, own []string, env *Environment) (p portRead) {
 		vars: map[string][]string{
 			".CURDIR":   {dir},
 			"PORTSDIR":  {tree},
-			treeVarName: dedupe([]string{tree, given}),
+			treeVarName: {tree, given},
 		},
-		distinfo: map[string]bool{},
+		distinfo:      map[string]bool{},
+		distinfoFiles: map[string]bool{},
 	}
 	// A declared variable is set before the port's first line, as make.conf
 	// sets one: an assignment in the port replaces it and a ?= does not.
@@ -423,17 +430,22 @@ func portText(tree, dir string, own []string, env *Environment) (p portRead) {
 		r.vars[name] = append([]string(nil), vals...)
 	}
 	for _, f := range own {
-		real := f
-		if rf, err := filepath.EvalSymlinks(f); err == nil {
-			real = rf
+		srcs, _, why := r.lookup(f)
+		if why == "" && len(srcs) != 1 {
+			why = fmt.Sprintf("%s is not a regular file", f)
+		}
+		if why != "" {
+			p.unresolved = why
+			r.ownerUnknown = "its Makefiles were not read to the end, so where its distinfo is set cannot be established"
+			break
 		}
 		// A Makefile.* another Makefile already included was read in the
 		// context make reads it in; reading it again from the top would
 		// apply its assignments a second time with nothing to justify it.
-		if _, reached := r.texts[real]; reached {
+		if _, reached := r.texts[srcs[0].key]; reached {
 			continue
 		}
-		if why := r.read(source{path: real, key: real}, 0, false, false, false); why != "" {
+		if why := r.read(srcs[0], 0, false, false, false); why != "" {
 			p.unresolved = why
 			r.ownerUnknown = "its Makefiles were not read to the end, so where its distinfo is set cannot be established"
 			break
@@ -449,6 +461,10 @@ func portText(tree, dir string, own []string, env *Environment) (p portRead) {
 		p.owners = append(p.owners, d)
 	}
 	sort.Strings(p.owners)
+	for f := range r.distinfoFiles {
+		p.files = append(p.files, f)
+	}
+	sort.Strings(p.files)
 	return p
 }
 
@@ -457,6 +473,7 @@ type portRead struct {
 	text         []byte
 	unresolved   string
 	owners       []string
+	files        []string // distinfo files Load indexes under no owner, by their real path
 	ownerUnknown string
 }
 
@@ -478,6 +495,51 @@ const unreadable = "$(unreadable)"
 // port never set does: make would expand it to nothing unless make.conf or the
 // environment set it, and the reader sees neither.
 const undefined = "$(undefined)"
+
+// setOutside is the value of a variable a ?= defaults that make.conf, the
+// environment or the command line may already have set. Like unreadable, it
+// holds a "$" no reference matches; unlike it, it names the variable, so a
+// refusal can say which one to declare.
+func setOutside(name string) string { return "$(set outside the tree: " + name + ")" }
+
+// outsideNames lists the variables s reads, directly or through the values it
+// reads, that a client may set outside the tree unchecked.
+func outsideNames(s string, vars map[string][]string) []string {
+	var out []string
+	seen := map[string]bool{}
+	var walk func(string, int)
+	walk = func(s string, depth int) {
+		if depth > 8 {
+			return
+		}
+		for _, m := range refName.FindAllStringSubmatch(s, -1) {
+			if seen[m[1]] {
+				continue
+			}
+			seen[m[1]] = true
+			for _, v := range vars[m[1]] {
+				if v == setOutside(m[1]) {
+					out = append(out, m[1])
+					continue
+				}
+				walk(v, depth+1)
+			}
+		}
+	}
+	walk(s, 0)
+	sort.Strings(out)
+	return out
+}
+
+// declareHint names what to declare when s cannot be resolved because it
+// reads a variable a client may set unchecked, or returns "".
+func declareHint(s string, vars map[string][]string) string {
+	names := outsideNames(s, vars)
+	if len(names) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(": it reads %s, which the port sets with ?= and make.conf or the environment may set first; declare it in distfiles_environment_variables", strings.Join(names, ", "))
+}
 
 var (
 	undefDirective     = regexp.MustCompile(`^[ \t]*\.[ \t]*undef[ \t]+(.*?)[ \t]*$`)
@@ -507,8 +569,9 @@ type makeReader struct {
 	// reader knowing which: a computed name, or a ::= modifier.
 	tainted []taintedName
 
-	distinfo     map[string]bool // every directory DISTINFO_FILE may name a file in
-	ownerUnknown string
+	distinfo      map[string]bool // every directory DISTINFO_FILE may name a file in, resolved
+	distinfoFiles map[string]bool // every file it may name whose basename Load does not index
+	ownerUnknown  string
 }
 
 type taintedName struct {
@@ -573,11 +636,33 @@ func (r *makeReader) assign(name, op, val, parseDir string, conditional, looping
 		}
 		if took {
 			out = append(out, val)
+			if !r.checkedOutside(name) {
+				out = append(out, setOutside(name))
+			}
 		}
 		r.vars[name] = capValues(dedupe(out))
 	default:
 		r.set(name, []string{val}, conditional)
 	}
+}
+
+// checkedOutside reports whether the client check establishes what make.conf,
+// the environment and the command line may set name to: a declared variable,
+// or one the check requires unset. Anything else may be set there to a value
+// the reader cannot know, which a ?= then leaves in place, so a ?= on it holds
+// setOutside(name) beside its default and a path that reads it refuses. The
+// postgresql*-docs ports name their master through WANT_PGSQL_VER?=, which a
+// client's make.conf commonly sets.
+func (r *makeReader) checkedOutside(name string) bool {
+	if _, ok := r.env.vars[name]; ok || r.env.undefined[name] {
+		return true
+	}
+	for _, n := range clientReserved {
+		if n == name {
+			return true
+		}
+	}
+	return false
 }
 
 // expandNow is a := right-hand side as make holds it after the assignment:
@@ -731,35 +816,64 @@ func (r *makeReader) noteDistinfo() {
 		if v == undefined {
 			continue
 		}
-		dirs, ok := r.expandDir(v, scope)
+		// The whole path has to resolve: a reference after the last literal
+		// "/" may expand to more separators and "..", so the text before it
+		// bounds nothing.
+		var paths []string
+		ok := !r.readsTainted(v, scope)
+		if ok {
+			paths, ok = expandMakePath(v, scope, 0)
+		}
 		if !ok {
-			r.ownerUnknown = fmt.Sprintf("DISTINFO_FILE=%s names a directory that cannot be resolved without make", v)
+			r.ownerUnknown = fmt.Sprintf("DISTINFO_FILE=%s names a directory that cannot be resolved without make%s", v, declareHint(v, scope))
 			return
 		}
-		for _, d := range dirs {
-			if !filepath.IsAbs(d) {
-				d = filepath.Join(r.dir, d)
+		for _, p := range paths {
+			if why := r.noteDistinfoPath(p); why != "" {
+				r.ownerUnknown = fmt.Sprintf("DISTINFO_FILE=%s: %s", v, why)
+				return
 			}
-			r.distinfo[filepath.Clean(d)] = true
 		}
 	}
 }
 
-// expandDir resolves the directory of every path v can take. The whole path
-// has to resolve: a reference after the last literal "/" may expand to more
-// separators and "..", so the text before it bounds nothing.
-func (r *makeReader) expandDir(v string, scope map[string][]string) ([]string, bool) {
-	if r.readsTainted(v, scope) {
-		return nil, false
+// noteDistinfoPath records where one value of DISTINFO_FILE reads, resolved
+// the way the kernel resolves it for make: a symlink before a ".." decides
+// which directory the ".." leaves, so the path is never cleaned first. The
+// directory is recorded, because Load restricts every distinfo* in it; so is
+// the directory of the file a final symlink names; and a file Load does not
+// index by its name is recorded itself. A directory that does not exist holds
+// no distinfo on any host sharing the tree, and names nothing.
+func (r *makeReader) noteDistinfoPath(p string) string {
+	if !filepath.IsAbs(p) {
+		p = r.dir + "/" + p
 	}
-	paths, ok := expandMakePath(v, scope, 0)
-	if !ok {
-		return nil, false
+	if !r.inTree(p) {
+		// A distinfo on the client host, outside the tree: Load indexes
+		// nothing there, and the stray refuses every name.
+		r.distinfo[rawDir(p)] = true
+		return ""
 	}
-	for i, p := range paths {
-		paths[i] = filepath.Dir(p)
+	realDir, exists, why := resolveInTree(r.roots(), rawDir(p))
+	switch {
+	case why != "":
+		return why
+	case !exists:
+		return ""
 	}
-	return paths, true
+	r.distinfo[realDir] = true
+	realFile, exists, why := resolveInTree(r.roots(), p)
+	switch {
+	case why != "":
+		return why
+	case !exists:
+		return ""
+	}
+	r.distinfo[filepath.Dir(realFile)] = true
+	if name := filepath.Base(realFile); name != "distinfo" && !strings.HasPrefix(name, "distinfo.") {
+		r.distinfoFiles[realFile] = true
+	}
+	return ""
 }
 
 // source is one file make may read at an include: a file in the tree, read
@@ -810,7 +924,7 @@ func (r *makeReader) read(src source, depth int, conditional, guarded, looping b
 	}
 	r.open[src.key] = true
 	defer delete(r.open, src.key)
-	parseDir := filepath.Dir(file)
+	parseDir := rawDir(file)
 
 	var blocks []block // innermost last
 	inFor := func() bool {
@@ -1149,20 +1263,20 @@ func (r *makeReader) include(file, line string, depth int, conditional, guarded,
 	if depth >= maxIncludeDepth {
 		return fmt.Sprintf("%s includes %q past a depth of %d", file, raw, maxIncludeDepth)
 	}
-	scope := r.scope(filepath.Dir(file))
+	scope := r.scope(rawDir(file))
 	if r.readsTainted(raw, scope) {
 		return fmt.Sprintf("%s includes %q, which reads a variable assigned in a way that cannot be followed without make", file, raw)
 	}
 	paths, ok := expandMakePath(raw, scope, 0)
 	if !ok {
-		return fmt.Sprintf("%s includes %q, which cannot be resolved without make", file, raw)
+		return fmt.Sprintf("%s includes %q, which cannot be resolved without make%s", file, raw, declareHint(raw, scope))
 	}
 	var found []source
 	maybeNone := false // some value of the path reads no file
 	for _, p := range paths {
 		candidates := []string{p}
 		if !filepath.IsAbs(p) {
-			candidates = []string{filepath.Join(filepath.Dir(file), p), filepath.Join(r.dir, p)}
+			candidates = []string{rawDir(file) + "/" + p, r.dir + "/" + p}
 		}
 		srcs, none, why := r.locate(candidates)
 		if why != "" {
@@ -1199,7 +1313,7 @@ func (r *makeReader) include(file, line string, depth int, conditional, guarded,
 // reports that every candidate may be missing.
 func (r *makeReader) locate(candidates []string) (srcs []source, none bool, why string) {
 	for _, c := range candidates {
-		got, absent, why := r.lookup(filepath.Clean(c))
+		got, absent, why := r.lookup(c)
 		if why != "" {
 			return nil, false, why
 		}
@@ -1216,8 +1330,18 @@ func (r *makeReader) locate(candidates []string) (srcs []source, none bool, why 
 // share. Outside it only the environment answers, and a path it does not
 // declare cannot be answered at all: the server's own filesystem says nothing
 // about a client's.
+//
+// p is the path as make passes it to open(2), and it is resolved the way the
+// kernel resolves it: a component at a time, each symlink followed before the
+// ".." after it is applied. Cleaning it first would read a different file
+// wherever a symlink precedes a "..". The source keeps p as its path, because
+// .PARSEDIR and the includes relative to it see the name make opened, not the
+// file it reached.
 func (r *makeReader) lookup(p string) (srcs []source, absent bool, why string) {
 	if !r.inTree(p) {
+		if filepath.Clean(p) != p {
+			return nil, false, fmt.Sprintf("%s leaves the ports tree and is not a clean path, so which client file make opens depends on symlinks on the client", p)
+		}
 		f, ok := r.env.files[p]
 		if !ok {
 			return nil, false, fmt.Sprintf("%s leaves the ports tree, and the supported environment does not declare it, so what a client reads there cannot be established", p)
@@ -1227,55 +1351,134 @@ func (r *makeReader) lookup(p string) (srcs []source, absent bool, why string) {
 		}
 		return srcs, f.absent, ""
 	}
-	fi, err := os.Stat(p)
-	if err != nil || !fi.Mode().IsRegular() {
-		// Missing in the tree, unless a symlink on the way out of it means
-		// the client resolves the name somewhere the tree does not cover.
-		if real, ok := r.resolveExisting(p); ok && !r.underReal(real) {
-			return nil, false, fmt.Sprintf("%s leaves the ports tree", p)
-		}
+	real, exists, why := resolveInTree(r.roots(), p)
+	if why != "" {
+		return nil, false, why
+	}
+	if !exists {
 		return nil, true, ""
 	}
-	real, err := filepath.EvalSymlinks(p)
-	if err != nil {
-		return nil, false, fmt.Sprintf("%s: %v", p, err)
-	}
-	if !r.underReal(real) {
-		return nil, false, fmt.Sprintf("%s leaves the ports tree", p)
+	if fi, err := os.Stat(real); err != nil || !fi.Mode().IsRegular() {
+		return nil, true, ""
 	}
 	rel, _ := filepath.Rel(r.tree, real)
 	fw := rel == "Mk" || strings.HasPrefix(rel, "Mk"+string(filepath.Separator))
-	return []source{{path: real, key: real, framework: fw}}, false, ""
+	return []source{{path: p, key: real, framework: fw}}, false, ""
 }
 
-// inTree reports whether p names a path under the tree as configured or as
-// resolved, before any symlink below it is followed.
+// roots is the tree resolved, then each other spelling a path may start with.
+func (r *makeReader) roots() []string { return []string{r.tree, r.treeGiven} }
+
+// inTree reports whether p starts, as written, with the tree's root.
 func (r *makeReader) inTree(p string) bool {
-	return within(r.tree, p) || within(r.treeGiven, p)
+	_, ok := treeRest(r.roots(), p)
+	return ok
 }
 
-func (r *makeReader) underReal(p string) bool { return within(r.tree, p) }
-
-func within(root, p string) bool {
-	rel, err := filepath.Rel(root, p)
-	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
-}
-
-// resolveExisting resolves the symlinks of the longest prefix of p that
-// exists, and appends the rest.
-func (r *makeReader) resolveExisting(p string) (string, bool) {
-	rest := ""
-	for dir := p; ; {
-		if real, err := filepath.EvalSymlinks(dir); err == nil {
-			return filepath.Join(real, rest), true
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return "", false
-		}
-		rest = filepath.Join(filepath.Base(dir), rest)
-		dir = parent
+// rawDir is p up to its last "/", uncleaned: what make holds as the directory
+// of a file it opened by that name.
+func rawDir(p string) string {
+	i := strings.LastIndexByte(p, '/')
+	switch {
+	case i < 0:
+		return "."
+	case i == 0:
+		return "/"
 	}
+	return p[:i]
+}
+
+// treeRest returns the components of p after the root it starts with, as
+// written. roots[0] is the tree resolved; the rest are other spellings of it.
+func treeRest(roots []string, p string) ([]string, bool) {
+	if !strings.HasPrefix(p, "/") {
+		return nil, false
+	}
+	comps := strings.Split(p, "/")[1:]
+	for _, root := range roots {
+		rc := strings.Split(strings.TrimPrefix(filepath.Clean(root), "/"), "/")
+		if root == "/" {
+			rc = nil
+		}
+		if len(comps) < len(rc) {
+			continue
+		}
+		match := true
+		for i, c := range rc {
+			if comps[i] != c {
+				match = false
+				break
+			}
+		}
+		if match {
+			return comps[len(rc):], true
+		}
+	}
+	return nil, false
+}
+
+// maxSymlinks is how many symlinks one resolution follows, as the kernel
+// bounds it, so a loop in the tree refuses rather than spins.
+const maxSymlinks = 32
+
+// resolveInTree resolves p as the kernel would open it, a component at a
+// time, with every step held inside the tree: the resolved path of a symlink,
+// and each "..", must stay under roots[0]. Anything that leaves it reads a
+// host bodega cannot see and refuses with why. exists is false when a
+// component is missing or a file stands where a directory must, which make
+// sees as a file that is not there. p must start with one of roots as written.
+func resolveInTree(roots []string, p string) (real string, exists bool, why string) {
+	rest, ok := treeRest(roots, p)
+	if !ok {
+		return "", false, fmt.Sprintf("%s leaves the ports tree", p)
+	}
+	root := roots[0]
+	cur, isDir, hops := root, true, 0
+	for len(rest) > 0 {
+		c := rest[0]
+		rest = rest[1:]
+		if !isDir {
+			return "", false, ""
+		}
+		switch c {
+		case "", ".":
+			continue
+		case "..":
+			if cur == root {
+				return "", false, fmt.Sprintf("%s leaves the ports tree through \"..\"", p)
+			}
+			cur = filepath.Dir(cur)
+			continue
+		}
+		next := filepath.Join(cur, c)
+		fi, err := os.Lstat(next)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			return "", false, ""
+		case err != nil:
+			return "", false, fmt.Sprintf("%s: %v", p, err)
+		case fi.Mode()&os.ModeSymlink != 0:
+			if hops++; hops > maxSymlinks {
+				return "", false, fmt.Sprintf("%s follows more than %d symlinks", p, maxSymlinks)
+			}
+			target, err := os.Readlink(next)
+			if err != nil {
+				return "", false, fmt.Sprintf("%s: %v", p, err)
+			}
+			if strings.HasPrefix(target, "/") {
+				tr, ok := treeRest(roots, target)
+				if !ok {
+					return "", false, fmt.Sprintf("%s reaches %s through a symlink, which leaves the ports tree", p, target)
+				}
+				cur, rest = root, append(tr, rest...)
+				continue
+			}
+			rest = append(strings.Split(target, "/"), rest...)
+		default:
+			cur, isDir = next, fi.IsDir()
+		}
+	}
+	return cur, true, ""
 }
 
 // capValues replaces a value set past maxPathValues with one value no path
@@ -1588,36 +1791,26 @@ func (m modifier) substitute(w string) (string, bool) {
 }
 
 // realpathInTree is :tA, which make answers with realpath(3) relative to the
-// directory it runs in, leaving the value alone when that fails. It is
-// answered only for a path inside the tree: anywhere else realpath would read
-// the server's filesystem in place of the client's.
+// directory it runs in, leaving the value alone when that fails. realpath
+// resolves a component at a time, so a symlink before a ".." decides where
+// the ".." leads, and fails when any component is missing. It is answered only
+// for a path whose every step stays inside the tree: anywhere else realpath
+// would read the server's filesystem in place of the client's.
 func realpathInTree(v string, vars map[string][]string) (string, bool) {
 	cur, roots := vars[".CURDIR"], vars[treeVarName]
 	if len(cur) != 1 || len(roots) == 0 || strings.ContainsAny(v, " \t") {
 		return "", false
 	}
-	inside := func(p string) bool {
-		for _, root := range roots {
-			if within(root, p) {
-				return true
-			}
-		}
-		return false
-	}
 	p := v
-	if !filepath.IsAbs(p) {
-		p = filepath.Join(cur[0], p)
+	if !strings.HasPrefix(p, "/") {
+		p = cur[0] + "/" + p
 	}
-	p = filepath.Clean(p)
-	if !inside(p) {
+	real, exists, why := resolveInTree(roots, p)
+	switch {
+	case why != "":
 		return "", false
-	}
-	real, err := filepath.EvalSymlinks(p)
-	if err != nil {
+	case !exists:
 		return v, true
-	}
-	if !inside(real) {
-		return "", false
 	}
 	return real, true
 }
@@ -1645,6 +1838,7 @@ func LoadIn(portsTree string, env *Environment) (*Index, error) {
 	ix := &Index{entries: map[string]*Entry{}, refused: map[string]string{}}
 	byPort := map[string][]string{}   // origin -> names its distinfo pins
 	restricted := map[string]string{} // origin -> reason
+	byFile := map[string]string{}     // distinfo indexed under no owner -> reason
 	var unowned []string              // restricted ports whose distinfo cannot be placed
 	var unownedOrigins []string
 	for _, cat := range cats {
@@ -1699,6 +1893,11 @@ func LoadIn(portsTree string, env *Environment) (*Index, error) {
 					restricted[owner] = why
 				}
 			}
+			for _, f := range pr.files {
+				if _, ok := byFile[f]; !ok {
+					byFile[f] = why
+				}
+			}
 		}
 	}
 	if ix.Len() == 0 {
@@ -1717,6 +1916,32 @@ func LoadIn(portsTree string, env *Environment) (*Index, error) {
 		for _, name := range byPort[origin] {
 			if e, ok := ix.entries[name]; ok && e.Restricted == "" {
 				e.Restricted = why
+			}
+		}
+	}
+	// A DISTINFO_FILE whose name Load does not index is read here, so the
+	// names it pins are restricted wherever else they are pinned.
+	files := make([]string, 0, len(byFile))
+	for f := range byFile {
+		files = append(files, f)
+	}
+	sort.Strings(files)
+	for _, f := range files {
+		fh, err := os.Open(f) //nolint:gosec // G304: resolved and confined under the configured ports tree.
+		if err != nil {
+			return nil, fmt.Errorf("open %s: %w", f, err)
+		}
+		parsed, unusable, err := Parse(fh)
+		_ = fh.Close()
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", f, err)
+		}
+		for name := range unusable {
+			parsed[name] = Entry{}
+		}
+		for name := range parsed {
+			if e, ok := ix.entries[name]; ok && e.Restricted == "" {
+				e.Restricted = byFile[f]
 			}
 		}
 	}
@@ -1814,13 +2039,19 @@ func (ix *Index) addDistinfo(file, origin string, byPort map[string][]string) er
 // index admitted against bytes that are no longer the declared ones is not the
 // declared environment's decision, and the operator changing a snapshot in
 // place is the case where refusing is cheap and admitting is not.
+//
+// That holds for the life of the process: a reload re-reads the tree, never
+// the declaration. Between a snapshot changing and the background read that
+// notices it, lookups still answer from the index admitted against the first
+// bytes, which remain the ones LookupIn matches a client's check against.
 type Tree struct {
 	root string
 	env  EnvironmentSpec
 	ttl  time.Duration
 	logf func(format string, args ...any)
 
-	envDigest string // of the first environment read, which every later one must match
+	envDigest string       // of the first environment read, which every later one must match
+	envFirst  *Environment // that read, whose ClientCheck clients measure against
 
 	mu      sync.Mutex
 	ix      *Index
@@ -1865,7 +2096,7 @@ func (t *Tree) startLoadLocked() {
 		if err == nil {
 			t.mu.Lock()
 			if t.envDigest == "" {
-				t.envDigest = env.Digest()
+				t.envDigest, t.envFirst = env.Digest(), env
 			}
 			if env.Digest() != t.envDigest {
 				err = fmt.Errorf("the declared environment is no longer the one bodega started with: its digest was %s and is now %s, because a snapshot changed; restart bodega to admit against the new bytes", t.envDigest, env.Digest())
@@ -1940,6 +2171,44 @@ func (t *Tree) Lookup(name string) (Entry, error) {
 		return Entry{}, fmt.Errorf("%w: still reading %s", ErrNotReady, t.root)
 	}
 	return ix.Lookup(name)
+}
+
+// LookupIn is Lookup for a client whose check named digest. Only the digest
+// of the environment the index was admitted against is answered; anything
+// else wraps ErrEnvironment. The digest is fixed by the first read and every
+// index the tree keeps was admitted against it, so a match here cannot pair a
+// client with an index read in some other environment.
+func (t *Tree) LookupIn(digest, name string) (Entry, error) {
+	select {
+	case <-t.ready:
+	case <-time.After(firstReadWait):
+	}
+	t.mu.Lock()
+	want := t.envDigest
+	t.mu.Unlock()
+	switch {
+	case want == "":
+		return Entry{}, fmt.Errorf("%w: the declared client environment has not been read", ErrNotReady)
+	case digest == "":
+		return Entry{}, fmt.Errorf("%w: the request names no environment, and this server admits against %s", ErrEnvironment, want)
+	case digest == ClientUnsupported:
+		return Entry{}, fmt.Errorf("%w: the client's check found it no longer holds environment %s; run make -V BODEGA_DISTFILES_DRIFT in the port's directory on the client to see what differs", ErrEnvironment, want)
+	case digest != want:
+		return Entry{}, fmt.Errorf("%w: the client's check names environment %q and this server admits against %s", ErrEnvironment, digest, want)
+	}
+	return t.Lookup(name)
+}
+
+// ClientCheck is the fragment a client includes to measure the environment
+// this tree admits against: the first one read, for the life of the process.
+func (t *Tree) ClientCheck() ([]byte, error) {
+	t.mu.Lock()
+	env := t.envFirst
+	t.mu.Unlock()
+	if env == nil {
+		return nil, fmt.Errorf("%w: the declared client environment has not been read", ErrNotReady)
+	}
+	return env.ClientCheck(), nil
 }
 
 // Names lists every distfile the index can answer for, sorted.
