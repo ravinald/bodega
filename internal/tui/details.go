@@ -609,20 +609,22 @@ func clientURL(cfg *config.Config, store *manifest.Store, entryType, name, pkgFi
 		if err != nil || pm == nil || len(pm.Versions) == 0 {
 			return ""
 		}
-		// A stored name the route would not read back as this entry's own
-		// object is linked by its download alias, which is keyed by the
-		// server's token pepper. The pepper is read only then, and a host
-		// that cannot read it gets no link rather than a link to the wrong
-		// bytes.
-		p, ok := pm.BinaryLinkName(nil, 0)
+		// The link is the download alias the read API publishes, keyed by
+		// the server's token pepper, so the TUI and the web UI print the same
+		// link and it stays bound to this entry. A host that cannot read the
+		// pepper gets the stored name only when the route serves it from this
+		// entry's own backend, and no link otherwise.
+		var key []byte
+		if pst, err := audit.ResolvePepper(audit.DefaultPepperPaths); err == nil {
+			key = []byte(pst.Pepper)
+		}
+		var typeBackend string
+		if cfg != nil {
+			typeBackend = cfg.StorageByType[manifest.TypeBinary]
+		}
+		p, ok := pm.BinaryLinkName(key, typeBackend, 0)
 		if !ok {
-			pst, err := audit.ResolvePepper(audit.DefaultPepperPaths)
-			if err != nil {
-				return ""
-			}
-			if p, ok = pm.BinaryLinkName([]byte(pst.Pepper), 0); !ok {
-				return ""
-			}
+			return ""
 		}
 		return base + "/binaries/" + p
 	case manifest.TypePypi:

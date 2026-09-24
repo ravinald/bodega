@@ -188,8 +188,10 @@ risk:
     whose url has no path is stored under an object key built from the
     authority, userinfo included, so anyone who can list that bucket or
     directory reads the credential in the key name. The read routes publish
-    such an entry with a download alias of its own, `~/<tag>/<display>`,
-    where the display part comes from the published url and the tag is an
+    every binary entry with a download alias of its own, `~/<tag>/<display>`,
+    since a stored name is served from whichever entry of its version comes
+    first and so does not stay with one entry. The display part comes from the
+    published url and the tag is an
     HMAC of the version, the recorded backend and the stored name keyed by
     the server's token pepper, and `/binaries/` maps it back to that entry's
     key on that entry's backend without publishing the key. The key is there
@@ -199,8 +201,10 @@ risk:
     whose entry is gone or has moved backend, or whose pepper has been
     rotated away, is a 404, never a request for an object stored under that
     spelling or for another entry holding the same key on another backend.
-    The TUI mints the same alias when it links such an entry, so it reads
-    the pepper file as well as the manifest store.
+    The TUI links by the same alias, so it reads the pepper file as well as
+    the manifest store; where it cannot, it links a stored name only when the
+    route serves that name from the entry's own backend, and otherwise shows
+    no link.
 
   A manifest read from the API and pushed back through an import arrives
   without its credential. Userinfo is the only credential form this covers: a

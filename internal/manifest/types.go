@@ -334,8 +334,8 @@ type VersionEntry struct {
 
 // Public returns a copy of pm fit for the open read routes, which answer every
 // caller the same way whatever its address or token: every version's URL loses
-// its userinfo, and a binary entry whose stored name the public copy cannot
-// carry gets the filename binaryDownloadName gives it under key. pm is not
+// its userinfo, and a binary entry gets the filename binaryDownloadName gives
+// it under key, its download alias whenever there is a key. pm is not
 // modified, since the store may hand the same pointer to the next reader.
 func (pm *PackageManifest) Public(key []byte) *PackageManifest {
 	if pm == nil {
@@ -344,7 +344,7 @@ func (pm *PackageManifest) Public(key []byte) *PackageManifest {
 	out := *pm
 	out.Versions = make([]VersionEntry, len(pm.Versions))
 	for i, ve := range pm.Versions {
-		if name, ok := pm.binaryDownloadName(key, ve); ok {
+		if name, ok := pm.binaryDownloadName(key, i); ok {
 			ve.Filename = name
 		}
 		ve.URL = PublicURL(ve.URL)

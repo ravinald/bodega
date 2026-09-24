@@ -362,30 +362,36 @@ func BinaryPathIdentity(p string) (pkg, version, filename string) {
 }
 
 // BinaryLinkName returns the path under /binaries/ that reaches
-// pm.Versions[i]: its stored name when the route reads that spelling back as
-// a request for this entry's own object on this entry's own backend, and its
-// download alias under key otherwise, the name the read API publishes for it.
-// It reports false when neither reaches the entry, which is an alias with no
-// key to mint it.
+// pm.Versions[i]. With a key that is its download alias, the name the read
+// API publishes for it, because only an alias names the entry itself: a
+// stored name is served from whichever entry of the version comes first, so
+// an entry added ahead of it on another backend later takes the link over.
+// With no key it is the stored name when the route reads that spelling back,
+// today, as a request for this entry's own object on this entry's own
+// backend. It reports false when neither holds.
 //
-// A stored name can fail to come back as itself several ways: it holds a "/"
-// or a "~/" prefix and reads as another shape or as an alias, it carries a "?",
-// "#", "%" or ".." the URL parser or the route's safety check rewrites or
-// refuses, or an earlier entry of the same version on another backend is the
-// one a literal request is served from.
-func (pm *PackageManifest) BinaryLinkName(key []byte, i int) (string, bool) {
+// typeBackend is the backend the route serves a stored name from when no
+// entry of the version it parses matches, storage_by_type's binary backend or
+// the default. A stored name can fail to come back as itself several ways: it
+// holds a "/" or a "~/" prefix and reads as another version or as an alias,
+// it carries a "?", "#", "%" or ".." the URL parser or the route's safety
+// check rewrites or refuses, or the entry that answers for its version records
+// another backend.
+func (pm *PackageManifest) BinaryLinkName(key []byte, typeBackend string, i int) (string, bool) {
 	ve := pm.Versions[i]
-	if p, ok := pm.binaryLiteralPath(i); ok {
-		return p, true
+	if len(key) > 0 {
+		name, _ := pm.binaryAliasName(key, ve)
+		return binaryVersionPath(pm.Name, ve.Version, name), true
 	}
-	if len(key) == 0 {
-		return "", false
-	}
-	name, _ := pm.binaryAliasName(key, ve)
-	return binaryVersionPath(pm.Name, ve.Version, name), true
+	tb := normalizeStorageName(typeBackend)
+	return pm.binaryLiteralPath(i, &tb)
 }
 
-func (pm *PackageManifest) binaryLiteralPath(i int) (string, bool) {
+// binaryLiteralPath returns the stored-name path of pm.Versions[i] and
+// whether the route would serve that path from the entry's own object on its
+// own backend. typeBackend nil means the caller cannot say which backend the
+// route falls back to, so a path matching no entry proves nothing.
+func (pm *PackageManifest) binaryLiteralPath(i int, typeBackend *string) (string, bool) {
 	ve := pm.Versions[i]
 	stored := binaryStoredName(ve)
 	p := binaryVersionPath(pm.Name, ve.Version, stored)
@@ -399,14 +405,13 @@ func (pm *PackageManifest) binaryLiteralPath(i int) (string, bool) {
 		return "", false
 	}
 	// The literal route serves from the backend of the first entry of the
-	// requested version, and from the type's backend when none matches, as it
-	// did before aliases existed.
+	// requested version, and from the type's backend when none matches.
 	for j, other := range pm.Versions {
 		if other.Version == version || (version != "" && other.Ref == version) {
 			return p, j == i || binaryStorageName(other) == binaryStorageName(ve)
 		}
 	}
-	return p, true
+	return p, typeBackend != nil && *typeBackend == binaryStorageName(ve)
 }
 
 func binaryVersionPath(name, version, filename string) string {
@@ -421,18 +426,28 @@ func binaryVersionPath(name, version, filename string) string {
 // resolver has to answer.
 const binaryAliasTagLen = 32
 
-// binaryDownloadName returns the filename the read API publishes for a binary
-// entry in place of its stored name, and false when the stored name is
-// published as it is. Two stored names need one: a url with no path and no
-// filename is stored under its authority, https://user:secret@host as
-// "user:secret@host", which the public url no longer carries; and a name
-// holding a "/", which no single link segment can carry and which, when it
-// starts with BinaryAliasDir, would be read as an alias.
-func (pm *PackageManifest) binaryDownloadName(key []byte, ve VersionEntry) (string, bool) {
+// binaryDownloadName returns the filename the read API publishes for
+// pm.Versions[i] in place of its stored name, and false when the stored name
+// is published as it is.
+//
+// With a key every entry is published by its alias, since a stored name stays
+// bound to whichever entry of its version comes first rather than to this
+// one. With none, no alias resolves, so the stored name is published only
+// when the web UI's reading of the public entry rebuilds it and the route
+// reads it back as this entry's object on its own backend; any other entry
+// gets an alias that answers 404 rather than a link to other bytes.
+func (pm *PackageManifest) binaryDownloadName(key []byte, i int) (string, bool) {
 	if pm.Type != TypeBinary {
 		return "", false
 	}
-	return pm.binaryAliasName(key, ve)
+	name, needed := pm.binaryAliasName(key, pm.Versions[i])
+	if len(key) > 0 || needed {
+		return name, true
+	}
+	if _, ok := pm.binaryLiteralPath(i, nil); !ok {
+		return name, true
+	}
+	return "", false
 }
 
 // binaryAliasName returns ve's download alias, and whether its stored name
@@ -484,10 +499,14 @@ func (pm *PackageManifest) binaryAliasTag(key []byte, ve VersionEntry) string {
 // may spell out folded into the empty name every writer records for it, so
 // the two spellings of one backend give one alias.
 func binaryStorageName(ve VersionEntry) string {
-	if ve.Storage == "default" {
+	return normalizeStorageName(ve.Storage)
+}
+
+func normalizeStorageName(name string) string {
+	if name == "default" {
 		return ""
 	}
-	return ve.Storage
+	return name
 }
 
 func binaryStoredName(ve VersionEntry) string {

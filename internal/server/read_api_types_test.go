@@ -831,3 +831,113 @@ func TestBinaryAliasKeepsItsEntrysBackend(t *testing.T) {
 	save(other)
 	expect("original removed", saved, "")
 }
+
+// A link the web UI builds from the read API stays with its entry when
+// another entry of the same version and stored name is added on another
+// backend, ahead of it or behind, and answers 404 once its entry is gone. The
+// original records no filename, so its stored name is the one the literal
+// route would hand to whichever entry of the version comes first.
+func TestPublicBinaryLinkKeepsItsEntryAcrossBackends(t *testing.T) {
+	serve := func(body, user string) string {
+		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if u, _, _ := r.BasicAuth(); u != user {
+				http.Error(w, "bad credentials", http.StatusUnauthorized)
+				return
+			}
+			_, _ = w.Write([]byte(body))
+		}))
+		t.Cleanup(up.Close)
+		return strings.TrimPrefix(up.URL, "http://")
+	}
+	original := manifest.VersionEntry{Version: "1.0.0", URL: "http://audit-user:audit-secret@" + serve("ORIGINAL-ELF", "audit-user") + "/tool"}
+	stored := "tool"
+	other := manifest.VersionEntry{Version: "1.0.0", URL: "http://" + serve("OTHER-BACKEND-ELF", "") + "/other", Filename: stored, Storage: "other"}
+
+	s := hostedServer(t)
+	cfg := &config.Config{
+		StorageBackend:  "local",
+		StoragePath:     t.TempDir(),
+		StorageBackends: map[string]config.StorageSpec{"other": {Driver: "local", Path: t.TempDir()}},
+	}
+	stores, err := storage.NewResolver(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.stores = stores
+
+	save := func(versions ...manifest.VersionEntry) {
+		t.Helper()
+		if err := s.store.SavePackage(t.Context(), &manifest.PackageManifest{Type: manifest.TypeBinary, Name: "tool", Versions: versions}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// fetch runs the real fetch for one entry and uploads it to the backend
+	// the entry records, as the uploader does.
+	fetch := func(ve manifest.VersionEntry) {
+		t.Helper()
+		save(ve)
+		bcfg := &builder.Config{BuildRoot: t.TempDir(), BuildEnvInfo: &manifest.BuildEnv{Platform: "linux/arm64"}}
+		if sum := builder.FetchBinaries(bcfg, s.store, "tool"); sum.Total != 1 || sum.Failures != 0 {
+			t.Fatalf("fetch: %+v", sum)
+		}
+		backend, err := stores.ByName(ve.Storage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range builder.BinaryArtifactPaths(bcfg, s.store, "tool") {
+			data, err := os.ReadFile(p.Local)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := backend.Put(t.Context(), p.ObjectKey, data); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	links := func() []string {
+		t.Helper()
+		code, body := getStatusAndBody(t, s, "/api/v1/packages/binary/tool")
+		if code != http.StatusOK {
+			t.Fatalf("read: %d %s", code, body)
+		}
+		var out []string
+		for _, v := range decodeJSON(t, body)["versions"].([]any) {
+			entry := v.(map[string]any)
+			entry["name"] = "tool"
+			_, path, ok := strings.Cut(pageClientURL(t, manifest.TypeBinary, entry), "/binaries/")
+			if !ok {
+				t.Fatalf("the web UI offers no binary link for %v", entry)
+			}
+			out = append(out, "/binaries/"+path)
+		}
+		return out
+	}
+	expect := func(when, path, body string) {
+		t.Helper()
+		code, got := getStatusAndBody(t, s, path)
+		switch {
+		case body == "" && code != http.StatusNotFound:
+			t.Errorf("%s: %s = %d %q, want 404", when, path, code, got)
+		case body != "" && (code != http.StatusOK || got != body):
+			t.Errorf("%s: %s = %d %q, want %q", when, path, code, got, body)
+		}
+	}
+
+	fetch(other)
+	fetch(original)
+	saved := links()[0]
+	t.Logf("saved actual page link: %s", saved)
+	expect("original alone", saved, "ORIGINAL-ELF")
+
+	save(other, original)
+	expect("other backend's entry added ahead", saved, "ORIGINAL-ELF")
+	expect("other entry own current link", links()[0], "OTHER-BACKEND-ELF")
+	expect("other backend's entry added ahead, the original's current link", links()[1], "ORIGINAL-ELF")
+
+	save(original, other)
+	expect("other backend's entry added behind", saved, "ORIGINAL-ELF")
+	expect("other entry behind own current link", links()[1], "OTHER-BACKEND-ELF")
+
+	save(other)
+	expect("original removed", saved, "")
+}

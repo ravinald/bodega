@@ -666,9 +666,9 @@ func TestBinaryClientURLNeverReachesAnotherEntry(t *testing.T) {
 
 // An entry with no version whose explicit filename starts "~/" is stored as
 // binaries/tool/~/tool, and the route reads /binaries/tool/~/tool, three
-// segments, as a request for that key rather than as an alias. The TUI links
-// it by its stored name, which needs no pepper, so a host that cannot read
-// one still gets the link.
+// segments, as a request for that key rather than as an alias. The entry sits
+// on the backend the route falls back to, so a TUI that cannot read the
+// pepper links it by its stored name and still gets the link.
 func TestBinaryClientURLKeepsATildeStoredName(t *testing.T) {
 	prev := audit.DefaultPepperPaths
 	audit.DefaultPepperPaths = []string{filepath.Join(t.TempDir(), "pepper")}
@@ -709,5 +709,71 @@ func TestBinaryClientURLKeepsATildeStoredName(t *testing.T) {
 	srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, strings.TrimPrefix(link, "https://bodega.example.com"), nil))
 	if rr.Code != http.StatusOK || rr.Body.String() != "FETCHED-ELF" {
 		t.Errorf("TUI link %s = %d %q, want the fetched bytes", link, rr.Code, rr.Body)
+	}
+}
+
+// The same stored name recorded on another backend. /binaries/tool/~/tool
+// parses as version "~", which no entry has, so the route serves it from the
+// type's backend, where other bytes sit under that key. The TUI links the
+// entry by the alias the read API publishes when it can read the pepper, and
+// offers no link when it cannot, rather than the stored name.
+func TestBinaryClientURLKeepsATildeStoredNameOnItsBackend(t *testing.T) {
+	prev := audit.DefaultPepperPaths
+	pepper := filepath.Join(t.TempDir(), "pepper")
+	audit.DefaultPepperPaths = []string{pepper}
+	t.Cleanup(func() { audit.DefaultPepperPaths = prev })
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("FETCHED-ELF"))
+	}))
+	defer upstream.Close()
+
+	cfg := aptLineConfig(t)
+	cfg.StorageBackend = "local"
+	cfg.StoragePath = t.TempDir()
+	cfg.StorageBackends = map[string]config.StorageSpec{"other": {Driver: "local", Path: t.TempDir()}}
+	stores, err := storage.NewResolver(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects, err := stores.ByName("other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := manifest.NewLocalStore(t.TempDir())
+	if err := store.AddVersion(t.Context(), manifest.TypeBinary, "tool", manifest.VersionEntry{URL: upstream.URL + "/tool", Filename: "~/tool", Storage: "other"}); err != nil {
+		t.Fatal(err)
+	}
+	buildCfg := &builder.Config{BuildRoot: t.TempDir(), BuildEnvInfo: &manifest.BuildEnv{Platform: "linux/arm64"}}
+	if sum := builder.FetchBinaries(buildCfg, store, "tool"); sum.Total != 1 || sum.Failures != 0 {
+		t.Fatalf("fetch: %+v", sum)
+	}
+	for _, p := range builder.BinaryArtifactPaths(buildCfg, store, "tool") {
+		data, err := os.ReadFile(p.Local)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := objects.Put(t.Context(), p.ObjectKey, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := stores.Default().Put(t.Context(), "binaries/tool/~/tool", []byte("WRONG-BACKEND-ELF")); err != nil {
+		t.Fatal(err)
+	}
+	srv := server.New(cfg, store, stores, ":0", nil)
+
+	link := clientURL(cfg, store, manifest.TypeBinary, "tool", "")
+	if link == "" {
+		t.Fatal("the TUI offers no link for an entry stored as ~/tool on another backend")
+	}
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, strings.TrimPrefix(link, "https://bodega.example.com"), nil))
+	if rr.Code != http.StatusOK || rr.Body.String() != "FETCHED-ELF" {
+		t.Errorf("TUI link %s = %d %q, want the fetched bytes", link, rr.Code, rr.Body)
+	}
+
+	audit.DefaultPepperPaths = []string{filepath.Join(t.TempDir(), "absent")}
+	if link := clientURL(cfg, store, manifest.TypeBinary, "tool", ""); link != "" {
+		t.Errorf("with no pepper the TUI links %s, want no link", link)
 	}
 }

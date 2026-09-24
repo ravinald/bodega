@@ -351,8 +351,10 @@ func TestBinaryDownloadNamesNeverDisplayTheRawURL(t *testing.T) {
 	}
 }
 
-// A stored name is served as itself however it is spelled: the TUI and any
-// link saved before aliases existed request it by that name. An alias bodega
+// A stored name is served as itself however it is spelled: a link saved
+// before aliases existed, or printed by a TUI with no pepper, requests it by
+// that name. The read API publishes each entry by its alias, which resolves to
+// that entry's stored name. An alias bodega
 // minted and an operator then copied into an explicit filename is not a
 // stored name the route can reach: the alias keeps reaching the entry it was
 // minted for, that entry's absence is a 404 rather than the copy's bytes, and
@@ -366,11 +368,12 @@ func TestBinaryStoredNamesShapedLikeAliases(t *testing.T) {
 	}}
 	names := publishedBinaryNames(pm, aliasTestKey)
 	for i := range 3 {
-		if want := binaryStoredName(pm.Versions[i]); names[i] != want {
-			t.Errorf("entry %d publishes %q, want its stored name %q", i, names[i], want)
+		stored := binaryStoredName(pm.Versions[i])
+		if got, entry, ok := pm.BinaryStoredFilename(aliasTestKey, "1.0.0", names[i]); !IsBinaryAlias(names[i]) || !ok || got != stored || entry == nil {
+			t.Errorf("entry %d publishes %q, resolving to %q, %v; want an alias of %q", i, names[i], got, ok, stored)
 		}
-		if got, _, ok := pm.BinaryStoredFilename(aliasTestKey, "1.0.0", names[i]); !ok || got != names[i] {
-			t.Errorf("stored name %q resolves to %q, %v", names[i], got, ok)
+		if got, _, ok := pm.BinaryStoredFilename(aliasTestKey, "1.0.0", stored); !ok || got != stored {
+			t.Errorf("stored name %q resolves to %q, %v", stored, got, ok)
 		}
 	}
 
@@ -427,42 +430,44 @@ func TestBinaryAliasBindsTheBackend(t *testing.T) {
 	}
 }
 
-// BinaryLinkName links by stored name exactly when the route reads that
-// spelling back as the entry's own object on its own backend, and by alias
-// otherwise; the alias needs a key.
+// BinaryLinkName links by alias whenever it has a key, and with none by
+// stored name exactly when the route reads that spelling back as the entry's
+// own object on its own backend.
 func TestBinaryLinkNameAgreesWithTheRoute(t *testing.T) {
 	const authority = "u:p@h"
 	for _, tc := range []struct {
-		label    string
-		versions []VersionEntry
-		literal  string
+		label       string
+		versions    []VersionEntry
+		typeBackend string
+		literal     string
 	}{
-		{"plain", []VersionEntry{{Version: "1.0.0", URL: "https://h/tool"}}, "tool/1.0.0/tool"},
-		{"no version", []VersionEntry{{URL: "https://h/tool"}}, "tool/tool"},
-		{"tilde name, no version", []VersionEntry{{URL: "https://h/tool", Filename: "~/tool"}}, "tool/~/tool"},
-		{"userinfo authority", []VersionEntry{{Version: "1.0.0", URL: "https://" + authority}}, "tool/1.0.0/" + authority},
-		{"copied alias", []VersionEntry{{Version: "1.0.0", URL: "https://h/x", Filename: "~/" + strings.Repeat("0", 32) + "/x"}}, ""},
-		{"nested name", []VersionEntry{{Version: "1.0.0", URL: "https://h/x", Filename: "a/b"}}, ""},
-		{"query mark", []VersionEntry{{Version: "1.0.0", URL: "https://h/x", Filename: "a?b"}}, ""},
-		{"percent", []VersionEntry{{Version: "1.0.0", URL: "https://h/x", Filename: "a%2eb"}}, ""},
-		{"dot dot", []VersionEntry{{Version: "1.0.0", URL: "https://h/x", Filename: "a..b"}}, ""},
-		{"earlier entry on the same backend", []VersionEntry{{Version: "1.0.0", URL: "https://h/one"}, {Version: "1.0.0", URL: "https://h/tool"}}, "tool/1.0.0/tool"},
-		{"earlier entry on another backend", []VersionEntry{{Version: "1.0.0", URL: "https://h/one", Storage: "other"}, {Version: "1.0.0", URL: "https://h/tool"}}, ""},
+		{"plain", []VersionEntry{{Version: "1.0.0", URL: "https://h/tool"}}, "", "tool/1.0.0/tool"},
+		{"no version", []VersionEntry{{URL: "https://h/tool"}}, "", "tool/tool"},
+		{"tilde name, no version", []VersionEntry{{URL: "https://h/tool", Filename: "~/tool"}}, "", "tool/~/tool"},
+		{"tilde name, no version, type backend spelled default", []VersionEntry{{URL: "https://h/tool", Filename: "~/tool"}}, "default", "tool/~/tool"},
+		{"tilde name, no version, recorded on another backend", []VersionEntry{{URL: "https://h/tool", Filename: "~/tool", Storage: "other"}}, "", ""},
+		{"tilde name, no version, type backend elsewhere", []VersionEntry{{URL: "https://h/tool", Filename: "~/tool"}}, "bulk", ""},
+		{"tilde name, no version, on the type backend", []VersionEntry{{URL: "https://h/tool", Filename: "~/tool", Storage: "bulk"}}, "bulk", "tool/~/tool"},
+		{"userinfo authority", []VersionEntry{{Version: "1.0.0", URL: "https://" + authority}}, "", "tool/1.0.0/" + authority},
+		{"copied alias", []VersionEntry{{Version: "1.0.0", URL: "https://h/x", Filename: "~/" + strings.Repeat("0", 32) + "/x"}}, "", ""},
+		{"nested name", []VersionEntry{{Version: "1.0.0", URL: "https://h/x", Filename: "a/b"}}, "", ""},
+		{"query mark", []VersionEntry{{Version: "1.0.0", URL: "https://h/x", Filename: "a?b"}}, "", ""},
+		{"percent", []VersionEntry{{Version: "1.0.0", URL: "https://h/x", Filename: "a%2eb"}}, "", ""},
+		{"dot dot", []VersionEntry{{Version: "1.0.0", URL: "https://h/x", Filename: "a..b"}}, "", ""},
+		{"earlier entry on the same backend", []VersionEntry{{Version: "1.0.0", URL: "https://h/one"}, {Version: "1.0.0", URL: "https://h/tool"}}, "", "tool/1.0.0/tool"},
+		{"earlier entry on another backend", []VersionEntry{{Version: "1.0.0", URL: "https://h/one", Storage: "other"}, {Version: "1.0.0", URL: "https://h/tool"}}, "", ""},
 	} {
 		t.Run(tc.label, func(t *testing.T) {
 			pm := &PackageManifest{Type: TypeBinary, Name: "tool", Versions: tc.versions}
 			i := len(tc.versions) - 1
-			keyless, ok := pm.BinaryLinkName(nil, i)
-			if tc.literal != "" {
-				if !ok || keyless != tc.literal {
-					t.Fatalf("BinaryLinkName = %q, %v, want %q", keyless, ok, tc.literal)
-				}
-				return
-			}
-			if ok {
+			keyless, ok := pm.BinaryLinkName(nil, tc.typeBackend, i)
+			switch {
+			case tc.literal != "" && (!ok || keyless != tc.literal):
+				t.Fatalf("BinaryLinkName with no key = %q, %v, want %q", keyless, ok, tc.literal)
+			case tc.literal == "" && ok:
 				t.Fatalf("BinaryLinkName with no key = %q, want no link", keyless)
 			}
-			link, ok := pm.BinaryLinkName(aliasTestKey, i)
+			link, ok := pm.BinaryLinkName(aliasTestKey, tc.typeBackend, i)
 			if !ok {
 				t.Fatal("BinaryLinkName with a key offers no link")
 			}
