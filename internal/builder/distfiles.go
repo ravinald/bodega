@@ -109,7 +109,7 @@ func FetchDistfiles(cfg *Config, store *manifest.Store, entryFilter string) *Sum
 		return summary
 	}
 	cfg.logf("  [distfiles] reading distinfo under %s", cfg.DistfilesPortsTree)
-	ix, err := distinfo.Load(cfg.DistfilesPortsTree)
+	ix, err := cfg.loadDistinfo()
 	if err != nil {
 		for _, name := range names {
 			fail(name, err, 0)
@@ -299,7 +299,7 @@ func DistfilesArtifactPaths(cfg *Config, store *manifest.Store, entryFilter stri
 	if cfg.DistfilesPortsTree == "" {
 		return nil, noRelease, fmt.Errorf("%d distfile(s) under %s cannot be uploaded: distfiles_ports_tree is not set, so there is no distinfo to hold them to", len(found), d.distfiles)
 	}
-	ix, err := distinfo.Load(cfg.DistfilesPortsTree)
+	ix, err := cfg.loadDistinfo()
 	if err != nil {
 		return nil, noRelease, fmt.Errorf("distfiles cannot be uploaded without their distinfo: %w", err)
 	}
@@ -374,6 +374,19 @@ func pinDistfile(src, dst string, limit int64) error {
 		return err
 	}
 	return out.Close()
+}
+
+// loadDistinfo reads the ports tree against the declared client environment.
+// A snapshot that cannot be read refuses the whole run: admitting against a
+// declaration with a file missing from it would read that file as absent, and
+// nobody declared it so.
+func (cfg *Config) loadDistinfo() (*distinfo.Index, error) {
+	env, err := cfg.DistfilesEnvironment.Load()
+	if err != nil {
+		return nil, fmt.Errorf("the declared client environment cannot be read, so no distfile is admitted: %w", err)
+	}
+	cfg.logf("  [distfiles] reading ports as a client in environment %s", env.Digest())
+	return distinfo.LoadIn(cfg.DistfilesPortsTree, env)
 }
 
 // logUnowned names the restricted ports whose distinfo cannot be placed, which

@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/distinfo"
 )
 
 const (
@@ -215,6 +216,17 @@ type Config struct {
 	DistfilesPortsTree string `json:"distfiles_ports_tree,omitempty"`
 	DistfilesUpstream  string `json:"distfiles_upstream,omitempty"`
 
+	// The supported client environment: what a client's make holds that the
+	// ports tree does not, and the only thing admission believes about it.
+	// distfiles_environment_variables maps a make variable to every value it
+	// may hold where a port reads it ([] declares it undefined);
+	// distfiles_environment_files maps an absolute client-host path to its
+	// alternatives, "absent" or the absolute path of a snapshot on this host.
+	// Anything a port reads outside the tree that is not declared here
+	// refuses that port. See docs/threat-model.md.
+	DistfilesEnvironmentVariables map[string][]string `json:"distfiles_environment_variables,omitempty"`
+	DistfilesEnvironmentFiles     map[string][]string `json:"distfiles_environment_files,omitempty"`
+
 	// GitUpstreams maps a namespace under /git/ onto an upstream forge. It
 	// exists because one flat gomod_upstream-style key cannot express two
 	// forges at once, and a corporate GitLab and github.com are the same
@@ -281,11 +293,23 @@ var legacyKeyAliases = map[string]string{"shell_height": "logwindow_height"}
 // attacker on the path can make a fetch fail and cannot make one succeed.
 const DefaultDistfilesUpstream = "http://distcache.FreeBSD.org/ports-distfiles/"
 
+// DistfilesEnvironment is the declared client environment distfiles admission
+// reads ports against.
+func (cfg *Config) DistfilesEnvironment() distinfo.EnvironmentSpec {
+	return distinfo.EnvironmentSpec{Variables: cfg.DistfilesEnvironmentVariables, Files: cfg.DistfilesEnvironmentFiles}
+}
+
 // validateDistfiles refuses a distfiles configuration that would fail on the
-// first request rather than at startup.
+// first request rather than at startup. Snapshots are not read here: every
+// command loads this file, and one missing snapshot would lock the operator
+// out of the command that fixes it. The server and the builder read them, and
+// refuse every distfile when they cannot.
 func (cfg *Config) validateDistfiles() error {
 	if cfg.DistfilesPortsTree != "" && !filepath.IsAbs(cfg.DistfilesPortsTree) {
 		return fmt.Errorf("distfiles_ports_tree %q must be an absolute path to the root of a FreeBSD ports tree, such as /usr/ports", cfg.DistfilesPortsTree)
+	}
+	if err := cfg.DistfilesEnvironment().Validate(); err != nil {
+		return err
 	}
 	up := cfg.DistfilesUpstream
 	u, err := url.Parse(up)

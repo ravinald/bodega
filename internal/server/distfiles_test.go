@@ -49,6 +49,13 @@ func distfilesPortsTree(t *testing.T) string {
 // requests it answers, and a bodega in front of it reading tree.
 func distfilesFixture(t *testing.T, tree, body string) (*httptest.Server, *storage.Memory, *atomic.Int32) {
 	t.Helper()
+	return distfilesFixtureIn(t, tree, body, nil)
+}
+
+// distfilesFixtureIn is distfilesFixture with the config adjusted by set
+// before the server is built.
+func distfilesFixtureIn(t *testing.T, tree, body string, set func(*config.Config)) (*httptest.Server, *storage.Memory, *atomic.Int32) {
+	t.Helper()
 	saved := distfilesGuard
 	distfilesGuard = func(rawURL string) error {
 		if strings.HasPrefix(rawURL, "http://127.0.0.1:") {
@@ -76,6 +83,9 @@ func distfilesFixture(t *testing.T, tree, body string) (*httptest.Server, *stora
 		DistfilesPortsTree: tree,
 		DistfilesUpstream:  up.URL + "/",
 		SpoolDir:           filepath.Join(t.TempDir(), "spool"),
+	}
+	if set != nil {
+		set(cfg)
 	}
 	store := manifest.NewLocalStore(t.TempDir())
 	ts := httptest.NewServer(New(cfg, store, storage.NewSingle(mem), ":0", nil).Handler())
@@ -404,6 +414,55 @@ func TestDistfilesMissHonorsTheUpstreamAllowList(t *testing.T) {
 				}
 			}
 			t.Errorf("no policy_violation row for the refused distfile: %+v", rows)
+		})
+	}
+}
+
+// The F24 witness through HTTP: arabic/aspell reads ${LOCALBASE}/etc/aspell.ver
+// on the client host, which base make shows can point its DISTINFO_FILE at
+// pcpustat's and set NO_CDROM. pcpustat is served only when the declared
+// environment says what that file holds, and refused, with nothing fetched,
+// when the declaration carries the witness, alone or as one alternative.
+func TestDistfilesHTTPHoldsTheDeclaredEnvironment(t *testing.T) {
+	witness := filepath.Join(t.TempDir(), "aspell.ver")
+	if err := os.WriteFile(witness, []byte("DISTINFO_FILE=${PORTSDIR}/sysutils/pcpustat/distinfo\nNO_CDROM=host file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	localbase := map[string][]string{"LOCALBASE": {"/usr/local"}}
+	for name, tc := range map[string]struct {
+		vars  map[string][]string
+		files map[string][]string
+		code  int
+		hits  int32
+	}{
+		"nothing declared":           {nil, nil, http.StatusUnavailableForLegalReasons, 0},
+		"file undeclared":            {localbase, nil, http.StatusUnavailableForLegalReasons, 0},
+		"declared absent":            {localbase, map[string][]string{"/usr/local/etc/aspell.ver": {"absent"}}, http.StatusOK, 1},
+		"declared as the witness":    {localbase, map[string][]string{"/usr/local/etc/aspell.ver": {witness}}, http.StatusUnavailableForLegalReasons, 0},
+		"witness as one alternative": {localbase, map[string][]string{"/usr/local/etc/aspell.ver": {"absent", witness}}, http.StatusUnavailableForLegalReasons, 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tree := distfilesPortsTree(t)
+			for rel, body := range map[string]string{
+				"textproc/aspell/Makefile.inc": ".include <bsd.port.pre.mk>\n.if exists(${LOCALBASE}/etc/aspell.ver)\n. include \"${LOCALBASE}/etc/aspell.ver\"\n.endif\n",
+				"arabic/aspell/Makefile":       ".include \"${.CURDIR}/../../textproc/aspell/Makefile.inc\"\n",
+			} {
+				p := filepath.Join(tree, filepath.FromSlash(rel))
+				if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ts, _, hits := distfilesFixtureIn(t, tree, distfileBody, func(cfg *config.Config) {
+				cfg.DistfilesEnvironmentVariables = tc.vars
+				cfg.DistfilesEnvironmentFiles = tc.files
+			})
+			code, body := getBody(t, ts.URL+"/distfiles/pcpustat/1.6.tar.bz2")
+			if code != tc.code || hits.Load() != tc.hits {
+				t.Fatalf("GET = %d %q after %d upstream fetches, want %d after %d", code, body, hits.Load(), tc.code, tc.hits)
+			}
 		})
 	}
 }

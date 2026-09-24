@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/distinfo"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
@@ -395,5 +396,64 @@ func TestDistfilesArtifactPathsAdmitsOnlyWhatDistinfoPins(t *testing.T) {
 	}
 	if left, _ := filepath.Glob(filepath.Join(cfg.BuildRoot, ".bodega-distfiles-upload-*")); len(left) != 0 {
 		t.Errorf("refusals left pin directories: %v", left)
+	}
+}
+
+// writeAspell adds arabic/aspell as the stock tree has it: a dictionary that
+// includes ${LOCALBASE}/etc/aspell.ver from the client host.
+func writeAspell(t *testing.T, tree string) {
+	t.Helper()
+	for rel, body := range map[string]string{
+		"textproc/aspell/Makefile.inc": ".include <bsd.port.pre.mk>\n.if exists(${LOCALBASE}/etc/aspell.ver)\n. include \"${LOCALBASE}/etc/aspell.ver\"\n.endif\n",
+		"arabic/aspell/Makefile":       ".include \"${.CURDIR}/../../textproc/aspell/Makefile.inc\"\n",
+	} {
+		p := filepath.Join(tree, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// The F24 witness through the DISTDIR and upload consumers. The same tree
+// fetches pcpustat when the declared environment says the client has no
+// aspell.ver, and refuses both the fetch and the upload of the bytes that
+// fetch wrote once the declaration carries the witness file.
+func TestDistfilesBuilderHoldsTheDeclaredEnvironment(t *testing.T) {
+	witness := filepath.Join(t.TempDir(), "aspell.ver")
+	if err := os.WriteFile(witness, []byte("DISTINFO_FILE=${PORTSDIR}/sysutils/pcpustat/distinfo\nNO_CDROM=host file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	localbase := map[string][]string{"LOCALBASE": {"/usr/local"}}
+	absent := distinfo.EnvironmentSpec{Variables: localbase, Files: map[string][]string{"/usr/local/etc/aspell.ver": {distinfo.Absent}}}
+
+	for name, spec := range map[string]distinfo.EnvironmentSpec{
+		"nothing declared":           {},
+		"file undeclared":            {Variables: localbase},
+		"declared as the witness":    {Variables: localbase, Files: map[string][]string{"/usr/local/etc/aspell.ver": {witness}}},
+		"witness as one alternative": {Variables: localbase, Files: map[string][]string{"/usr/local/etc/aspell.ver": {distinfo.Absent, witness}}},
+		"snapshot unreadable":        {Variables: localbase, Files: map[string][]string{"/usr/local/etc/aspell.ver": {filepath.Join(t.TempDir(), "gone")}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg, store, hits := distfilesRun(t, distfileBody)
+			writeAspell(t, cfg.DistfilesPortsTree)
+			cfg.DistfilesEnvironment = spec
+			if s := FetchDistfiles(cfg, store, "pcpustat/1.6.tar.bz2"); s.Failures != 1 || hits.Load() != 0 || len(distdirFiles(t, cfg)) != 0 {
+				t.Fatalf("fetch: %+v after %d upstream fetches, files %v; want refused before any", s.Results, hits.Load(), distdirFiles(t, cfg))
+			}
+
+			cfg.DistfilesEnvironment = absent
+			if s := FetchDistfiles(cfg, store, "pcpustat/1.6.tar.bz2"); s.HasFailures() || hits.Load() != 1 {
+				t.Fatalf("fetch declared absent: %+v after %d upstream fetches, want admitted", s.Results, hits.Load())
+			}
+			cfg.DistfilesEnvironment = spec
+			paths, release, err := DistfilesArtifactPaths(cfg, store, "pcpustat/1.6.tar.bz2")
+			defer release()
+			if err == nil || len(paths) != 0 {
+				t.Fatalf("upload: %d paths, err %v; want the bytes already in DISTDIR refused", len(paths), err)
+			}
+		})
 	}
 }

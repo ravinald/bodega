@@ -387,7 +387,7 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 	// finished would take every other type down with it. The route answers
 	// 503 until the first read lands.
 	if cfg.DistfilesPortsTree != "" {
-		s.distinfo = distinfo.NewTree(cfg.DistfilesPortsTree, distinfoRefresh, func(format string, args ...any) {
+		s.distinfo = distinfo.NewTreeIn(cfg.DistfilesPortsTree, cfg.DistfilesEnvironment(), distinfoRefresh, func(format string, args ...any) {
 			logger.Info(fmt.Sprintf(format, args...))
 		})
 	}

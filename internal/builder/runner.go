@@ -15,6 +15,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/distinfo"
 	"github.com/ravinald/bodega/internal/logging"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
@@ -44,6 +45,9 @@ type Config struct {
 	DistfilesRoot      string
 	DistfilesPortsTree string
 	DistfilesUpstream  string
+	// DistfilesEnvironment is the supported client environment every port
+	// is read against; see distinfo.Environment.
+	DistfilesEnvironment distinfo.EnvironmentSpec
 	// Stdout is where builder output is written; defaults to os.Stdout.
 	Stdout io.Writer
 	// Force re-fetches even if artifacts already exist on disk.
@@ -228,8 +232,9 @@ func NewConfig(app *config.Config, pol *policy.Checker) *Config {
 		CargoDLUpstream: app.CargoDLUpstream,
 		CargoUpstream:   app.CargoUpstream,
 
-		DistfilesPortsTree: app.DistfilesPortsTree,
-		DistfilesUpstream:  app.DistfilesUpstream,
+		DistfilesPortsTree:   app.DistfilesPortsTree,
+		DistfilesUpstream:    app.DistfilesUpstream,
+		DistfilesEnvironment: app.DistfilesEnvironment(),
 	}
 }
 

@@ -218,7 +218,10 @@ var (
 	licenseVar      = regexp.MustCompile(`(?m)^[ \t]*LICENSE[ \t]*[?:+!]?=[ \t]*(.*)$`)
 	licenseDBPerms  = regexp.MustCompile(`(?m)^_LICENSE_PERMS_([A-Za-z0-9.+-]+)[ \t]*[?:]?=[ \t]*(.*)$`)
 	licenseDBList   = regexp.MustCompile(`(?m)^_LICENSE_LIST[ \t]*\+?=[ \t]*(.*)$`)
-	varReference    = regexp.MustCompile(`\$\{([A-Za-z_.][A-Za-z0-9_.]*)((?::H)*)\}`)
+	// refName finds the name of every ${...} reference, whatever follows the
+	// name. It matches more than expandMakePath will expand, which is the
+	// direction readsTainted needs.
+	refName = regexp.MustCompile(`\$\{([A-Za-z_.][A-Za-z0-9_.]*)`)
 )
 
 // withholdsDistfiles reports whether a permission list, as bsd.licenses.mk
@@ -314,6 +317,7 @@ const maxPathValues = 16
 var (
 	conditionalOpen  = regexp.MustCompile(`^[ \t]*\.[ \t]*(if|ifdef|ifndef|ifmake|ifnmake|for)\b`)
 	conditionalClose = regexp.MustCompile(`^[ \t]*\.[ \t]*(endif|endfor)\b`)
+	conditionalElse  = regexp.MustCompile(`^[ \t]*\.[ \t]*(else|elif[a-z]*)\b`)
 	assignment       = regexp.MustCompile(`^[ \t]*([A-Za-z_.][A-Za-z0-9_.]*)[ \t]*([?:+!]?)=[ \t]*(.*?)[ \t]*$`)
 	includeDirective = regexp.MustCompile(`^[ \t]*\.[ \t]*(-?include|sinclude|dinclude)[ \t]+"([^"]*)"`)
 )
@@ -356,8 +360,9 @@ func stripComments(b []byte) []byte {
 // += or := inside a .for whose iterations it does not count, an assignment to
 // a name built from variables it cannot expand, an .undef it cannot place, and
 // a ::= or :_= modifier, which assigns while it expands. Only .CURDIR,
-// .PARSEDIR, PORTSDIR, variables the port assigns, .for variables and the :H
-// modifier are understood.
+// .PARSEDIR, PORTSDIR, variables the port assigns, variables the supported
+// environment declares, .for variables, and the :H, :tl, :tu, :tA and :C
+// modifiers are understood.
 //
 // Three states have to match make's for that property to hold. A variable an
 // .undef may have removed is no longer definitely set, so a later ?= may take
@@ -369,37 +374,53 @@ func stripComments(b []byte) []byte {
 // cannot be resolved but could name a restriction variable refuses the port.
 //
 // The port is unresolved, and so refused, when an include path holds anything
-// else, reads an unreadable variable, leaves the tree, includes itself, reaches
-// more than maxIncludeReads files, or names no file where the include is
-// unconditional. A missing file under a conditional include is skipped: make
-// reaches that line only when its guard, usually exists(), holds.
-// Angle-bracket includes and anything under Mk/ are the framework, whose
-// license handling the database read models.
+// else, reads an unreadable variable, includes itself, reaches more than
+// maxIncludeReads files, or names no file where the include is unconditional.
+// A missing file under a conditional include is skipped: make reaches that
+// line only when its guard, usually exists(), holds. That holds inside the
+// tree only, because the tree is the one input the server and the client
+// share. A path outside it is on the client host, and whether it exists there
+// is something only env can say: a file env declares is read as each of its
+// alternatives, and one it does not declare refuses the port, whether or not
+// the server happens to hold a file at that path. A path the server finds
+// through a symlink out of the tree refuses as well. Angle-bracket includes and
+// anything under Mk/ are the framework, whose license handling the database
+// read models.
 //
 // A port's restriction covers every distinfo its fetch may read, which is
 // ${DISTINFO_FILE}, by default ${MASTERDIR}/distinfo. A slave's names sit in
 // its master's distinfo, and a port may point DISTINFO_FILE at any other
 // port's. Both are resolved from the variables the walk holds, at every
 // framework include and at the end, because a port may reassign either after
-// including bsd.port.mk and make reads them lazily. Only the directory has to
-// resolve: Load restricts every distinfo* in it, so a file named
-// distinfo.${ARCH} is covered by its directory. owners lists those directories;
-// ownerUnknown is non-empty when one of them cannot be resolved, or when the
-// read stopped before the end, and says which.
-func portText(tree, dir string, own []string) (p portRead) {
+// including bsd.port.mk and make reads them lazily. The whole path has to
+// resolve, because a reference after the last "/" may expand to more
+// separators and "..", and Load then restricts every distinfo* in its
+// directory. owners lists those directories; ownerUnknown is non-empty when
+// one of them cannot be resolved, or when the read stopped before the end, and
+// says which.
+func portText(tree, dir string, own []string, env *Environment) (p portRead) {
+	given := tree
 	if realTree, err := filepath.EvalSymlinks(tree); err == nil {
 		tree = realTree
 	}
 	r := &makeReader{
-		tree:  tree,
-		dir:   dir,
-		texts: map[string][]byte{},
-		open:  map[string]bool{},
+		tree:      tree,
+		treeGiven: given,
+		dir:       dir,
+		env:       env,
+		texts:     map[string][]byte{},
+		open:      map[string]bool{},
 		vars: map[string][]string{
-			".CURDIR":  {dir},
-			"PORTSDIR": {tree},
+			".CURDIR":   {dir},
+			"PORTSDIR":  {tree},
+			treeVarName: dedupe([]string{tree, given}),
 		},
 		distinfo: map[string]bool{},
+	}
+	// A declared variable is set before the port's first line, as make.conf
+	// sets one: an assignment in the port replaces it and a ?= does not.
+	for name, vals := range env.vars {
+		r.vars[name] = append([]string(nil), vals...)
 	}
 	for _, f := range own {
 		real := f
@@ -412,7 +433,7 @@ func portText(tree, dir string, own []string) (p portRead) {
 		if _, reached := r.texts[real]; reached {
 			continue
 		}
-		if why := r.read(real, 0, false, false); why != "" {
+		if why := r.read(source{path: real, key: real}, 0, false, false, false); why != "" {
 			p.unresolved = why
 			r.ownerUnknown = "its Makefiles were not read to the end, so where its distinfo is set cannot be established"
 			break
@@ -471,9 +492,11 @@ var (
 // far as the walk has read, and the text every file contributed.
 type makeReader struct {
 	tree, dir string
+	treeGiven string // tree as configured, before its symlinks were resolved
+	env       *Environment
 	buf       []byte
-	texts     map[string][]byte // file -> its text, read once however often it is included
-	open      map[string]bool   // files being read now, which an include of would recurse
+	texts     map[string][]byte // source key -> its text, read once however often it is included
+	open      map[string]bool   // source keys being read now, which an include of would recurse
 	reads     int
 	loops     int // .for directives read, which keeps each one's bound names distinct
 
@@ -582,10 +605,15 @@ func (r *makeReader) scope(parseDir string) map[string][]string {
 	}
 	scope[".PARSEDIR"] = []string{parseDir}
 	// Nothing but the port and the framework sets these, so where neither has
-	// make holds them undefined and expands them to nothing. Any other
-	// variable the reader has no value for may come from Mk/ or make.conf,
-	// and stays unresolvable.
-	for _, name := range []string{"MASTERDIR", "FILESDIR"} {
+	// make holds them undefined and expands them to nothing. The same holds
+	// for a variable the environment declares undefined. Any other variable
+	// the reader has no value for may come from Mk/ or make.conf, and stays
+	// unresolvable.
+	names := []string{"MASTERDIR", "FILESDIR"}
+	for name := range r.env.undefined {
+		names = append(names, name)
+	}
+	for _, name := range names {
 		vals := r.prior(name)
 		for i, v := range vals {
 			if v == undefined {
@@ -652,7 +680,7 @@ func (r *makeReader) readsTainted(s string, vars map[string][]string) bool {
 		if depth > 8 {
 			return true
 		}
-		for _, m := range varReference.FindAllStringSubmatch(s, -1) {
+		for _, m := range refName.FindAllStringSubmatch(s, -1) {
 			name := m[1]
 			if seen[name] {
 				continue
@@ -734,28 +762,54 @@ func (r *makeReader) expandDir(v string, scope map[string][]string) ([]string, b
 	return paths, true
 }
 
-// read reads file as make would reach it: conditional when some enclosing
-// .if or .for in an including file may skip it, looping when an enclosing
-// .for may read it more than once.
-func (r *makeReader) read(file string, depth int, conditional, looping bool) string {
-	if r.open[file] {
+// source is one file make may read at an include: a file in the tree, read
+// from disk, or one alternative the environment declares for a client-host
+// path, whose text is the operator's snapshot. key tells two alternatives for
+// one path apart.
+type source struct {
+	path      string // as make names it, which is what .PARSEDIR and relative includes see
+	key       string
+	declared  bool   // text is a snapshot; path is on the client and is never opened here
+	text      []byte // the snapshot, when declared
+	framework bool   // under Mk/
+}
+
+// read reads src as make would reach it: conditional when make may skip it
+// on some path the reader has not forked, guarded when some enclosing .if in
+// an including file decides whether make reaches it at all, looping when an
+// enclosing .for may read it more than once.
+//
+// An .if chain forks the variables rather than marking what it holds as
+// conditional: each branch starts from the values in force at the .if, and at
+// the .endif every branch's values are merged, with the values from before
+// the .if as one more branch when there is no .else. So an assignment and the
+// include after it in one branch see the assignment alone, and an exhaustive
+// .if/.else leaves no path on which a variable both branches set is still
+// undefined. Conditions are still not evaluated: every branch is read.
+func (r *makeReader) read(src source, depth int, conditional, guarded, looping bool) string {
+	file := src.path
+	if r.open[src.key] {
 		return fmt.Sprintf("%s includes itself, which cannot be resolved without make", file)
 	}
 	if r.reads++; r.reads > maxIncludeReads {
 		return fmt.Sprintf("%s is one of more than %d files its includes reach", file, maxIncludeReads)
 	}
-	b, seen := r.texts[file]
+	b, seen := r.texts[src.key]
 	if !seen {
-		raw, err := os.ReadFile(file) //nolint:gosec // G304: resolved and confined under the configured ports tree.
-		if err != nil {
-			return fmt.Sprintf("cannot read %s: %v", file, err)
+		raw := src.text
+		if !src.declared {
+			var err error
+			raw, err = os.ReadFile(file) //nolint:gosec // G304: resolved and confined under the configured ports tree.
+			if err != nil {
+				return fmt.Sprintf("cannot read %s: %v", file, err)
+			}
 		}
 		b = stripComments(joinContinuations(raw))
-		r.texts[file] = b
+		r.texts[src.key] = b
 		r.buf = append(append(r.buf, b...), '\n')
 	}
-	r.open[file] = true
-	defer delete(r.open, file)
+	r.open[src.key] = true
+	defer delete(r.open, src.key)
 	parseDir := filepath.Dir(file)
 
 	var blocks []block // innermost last
@@ -767,9 +821,19 @@ func (r *makeReader) read(file string, depth int, conditional, looping bool) str
 		}
 		return false
 	}
+	inIf := func() bool {
+		for _, k := range blocks {
+			if k.chain != nil {
+				return true
+			}
+		}
+		return false
+	}
+	// Only a .for that may run no iteration makes what its body does
+	// conditional; an .if chain forks instead.
 	skippable := func() bool {
 		for _, k := range blocks {
-			if !k.loop || k.mayBeEmpty {
+			if k.loop && k.mayBeEmpty {
 				return true
 			}
 		}
@@ -785,6 +849,7 @@ func (r *makeReader) read(file string, depth int, conditional, looping bool) str
 			continue
 		}
 		cond := conditional || skippable()
+		guard := guarded || cond || inIf()
 		loop := looping || inFor()
 		if directive {
 			if m := forDirective.FindStringSubmatch(line); m != nil {
@@ -795,13 +860,38 @@ func (r *makeReader) read(file string, depth int, conditional, looping bool) str
 				if m[1] == "for" {
 					return fmt.Sprintf("%s has a .for the reader cannot parse: %q", file, strings.TrimSpace(line))
 				}
-				blocks = append(blocks, block{})
+				blocks = append(blocks, block{chain: &ifChain{before: copyVars(r.vars)}})
 				continue
 			}
-			if conditionalClose.MatchString(line) {
-				if len(blocks) > 0 {
-					blocks = blocks[:len(blocks)-1]
+			if m := conditionalElse.FindStringSubmatch(line); m != nil {
+				if len(blocks) == 0 || blocks[len(blocks)-1].chain == nil {
+					return fmt.Sprintf("%s has a .%s the reader cannot match to an .if", file, m[1])
 				}
+				c := blocks[len(blocks)-1].chain
+				if c.sawElse {
+					return fmt.Sprintf("%s has a .%s after an .else", file, m[1])
+				}
+				c.branches = append(c.branches, r.vars)
+				r.vars = copyVars(c.before)
+				c.sawElse = m[1] == "else"
+				continue
+			}
+			if m := conditionalClose.FindStringSubmatch(line); m != nil {
+				if len(blocks) == 0 {
+					return fmt.Sprintf("%s has an .%s the reader cannot match", file, m[1])
+				}
+				top := blocks[len(blocks)-1]
+				if (m[1] == "endif") != (top.chain != nil) {
+					return fmt.Sprintf("%s closes a block with an .%s that does not match it", file, m[1])
+				}
+				if c := top.chain; c != nil {
+					branches := append(c.branches, r.vars)
+					if !c.sawElse {
+						branches = append(branches, c.before)
+					}
+					r.vars = mergeVars(branches)
+				}
+				blocks = blocks[:len(blocks)-1]
 				continue
 			}
 			if m := undefDirective.FindStringSubmatch(line); m != nil {
@@ -817,7 +907,7 @@ func (r *makeReader) read(file string, depth int, conditional, looping bool) str
 				}
 				continue
 			}
-			if why := r.include(file, line, depth, cond, loop); why != "" {
+			if why := r.include(file, line, depth, cond, guard, loop); why != "" {
 				return why
 			}
 			continue
@@ -849,6 +939,47 @@ type block struct {
 	loop       bool
 	mayBeEmpty bool
 	bound      map[string]string
+	chain      *ifChain // an .if and the .elif and .else that follow it
+}
+
+// ifChain is what an open .if chain has seen: the variables when it opened,
+// and each branch's variables as that branch ended.
+type ifChain struct {
+	before   map[string][]string
+	branches []map[string][]string
+	sawElse  bool
+}
+
+func copyVars(vars map[string][]string) map[string][]string {
+	out := make(map[string][]string, len(vars))
+	for k, v := range vars {
+		out[k] = append([]string(nil), v...)
+	}
+	return out
+}
+
+// mergeVars is every value each variable may hold after one of branches has
+// run. A variable some branch leaves undefined is undefined on that path.
+func mergeVars(branches []map[string][]string) map[string][]string {
+	names := map[string]bool{}
+	for _, b := range branches {
+		for k := range b {
+			names[k] = true
+		}
+	}
+	out := make(map[string][]string, len(names))
+	for k := range names {
+		var vals []string
+		for _, b := range branches {
+			v, ok := b[k]
+			if !ok {
+				v = []string{undefined}
+			}
+			vals = append(vals, v...)
+		}
+		out[k] = capValues(dedupe(vals))
+	}
+	return out
 }
 
 // bindFor opens a .for. Its variables are bound under names no Makefile can
@@ -1004,7 +1135,7 @@ func modifierTargets(line string) []string {
 }
 
 // include follows one .include line of file, if it is a quoted one.
-func (r *makeReader) include(file, line string, depth int, conditional, looping bool) string {
+func (r *makeReader) include(file, line string, depth int, conditional, guarded, looping bool) string {
 	if frameworkInclude.MatchString(line) {
 		r.framework(conditional)
 		return ""
@@ -1013,7 +1144,7 @@ func (r *makeReader) include(file, line string, depth int, conditional, looping 
 	if m == nil {
 		return ""
 	}
-	optional := m[1] != "include" || conditional
+	optional := m[1] != "include" || guarded
 	raw := m[2]
 	if depth >= maxIncludeDepth {
 		return fmt.Sprintf("%s includes %q past a depth of %d", file, raw, maxIncludeDepth)
@@ -1026,19 +1157,19 @@ func (r *makeReader) include(file, line string, depth int, conditional, looping 
 	if !ok {
 		return fmt.Sprintf("%s includes %q, which cannot be resolved without make", file, raw)
 	}
-	var found []string
+	var found []source
+	maybeNone := false // some value of the path reads no file
 	for _, p := range paths {
 		candidates := []string{p}
 		if !filepath.IsAbs(p) {
 			candidates = []string{filepath.Join(filepath.Dir(file), p), filepath.Join(r.dir, p)}
 		}
-		for _, c := range candidates {
-			c = filepath.Clean(c)
-			if fi, err := os.Stat(c); err == nil && fi.Mode().IsRegular() {
-				found = append(found, c)
-				break
-			}
+		srcs, none, why := r.locate(candidates)
+		if why != "" {
+			return fmt.Sprintf("%s includes %q: %s", file, raw, why)
 		}
+		found = append(found, srcs...)
+		maybeNone = maybeNone || none
 	}
 	if len(found) == 0 {
 		if optional {
@@ -1046,27 +1177,105 @@ func (r *makeReader) include(file, line string, depth int, conditional, looping 
 		}
 		return fmt.Sprintf("%s includes %q, which does not exist", file, raw)
 	}
-	// Several candidates means make reads one of them, so each is read as
-	// something make may skip.
-	conditional = conditional || len(found) > 1
+	// Several sources means make reads one of them, and an optional include
+	// that may find nothing reads none, so each is read as something make may
+	// skip. A mandatory include that finds nothing stops make, so that path
+	// reaches no fetch and asks nothing of the ones that do.
+	conditional = conditional || len(found) > 1 || (optional && maybeNone)
 	for _, f := range found {
-		real, err := filepath.EvalSymlinks(f)
-		if err != nil {
-			return fmt.Sprintf("%s includes %q: %v", file, raw, err)
-		}
-		rel, err := filepath.Rel(r.tree, real)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
-			return fmt.Sprintf("%s includes %q, which leaves the ports tree", file, raw)
-		}
-		if rel == "Mk" || strings.HasPrefix(rel, "Mk"+string(filepath.Separator)) {
+		if f.framework {
 			r.framework(conditional)
 			continue
 		}
-		if why := r.read(real, depth+1, conditional, looping); why != "" {
+		if why := r.read(f, depth+1, conditional, guarded, looping); why != "" {
 			return why
 		}
 	}
 	return ""
+}
+
+// locate is what make may read for one include path: the first candidate
+// that exists, trying the next only where this one may be missing. none
+// reports that every candidate may be missing.
+func (r *makeReader) locate(candidates []string) (srcs []source, none bool, why string) {
+	for _, c := range candidates {
+		got, absent, why := r.lookup(filepath.Clean(c))
+		if why != "" {
+			return nil, false, why
+		}
+		srcs = append(srcs, got...)
+		if !absent {
+			return srcs, false, ""
+		}
+	}
+	return srcs, true, ""
+}
+
+// lookup says what make finds at path p on a supported client. Inside the
+// tree the server's copy answers, because the tree is the input both sides
+// share. Outside it only the environment answers, and a path it does not
+// declare cannot be answered at all: the server's own filesystem says nothing
+// about a client's.
+func (r *makeReader) lookup(p string) (srcs []source, absent bool, why string) {
+	if !r.inTree(p) {
+		f, ok := r.env.files[p]
+		if !ok {
+			return nil, false, fmt.Sprintf("%s leaves the ports tree, and the supported environment does not declare it, so what a client reads there cannot be established", p)
+		}
+		for i, text := range f.texts {
+			srcs = append(srcs, source{path: p, key: fmt.Sprintf("%s\x00%d", p, i), declared: true, text: text})
+		}
+		return srcs, f.absent, ""
+	}
+	fi, err := os.Stat(p)
+	if err != nil || !fi.Mode().IsRegular() {
+		// Missing in the tree, unless a symlink on the way out of it means
+		// the client resolves the name somewhere the tree does not cover.
+		if real, ok := r.resolveExisting(p); ok && !r.underReal(real) {
+			return nil, false, fmt.Sprintf("%s leaves the ports tree", p)
+		}
+		return nil, true, ""
+	}
+	real, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		return nil, false, fmt.Sprintf("%s: %v", p, err)
+	}
+	if !r.underReal(real) {
+		return nil, false, fmt.Sprintf("%s leaves the ports tree", p)
+	}
+	rel, _ := filepath.Rel(r.tree, real)
+	fw := rel == "Mk" || strings.HasPrefix(rel, "Mk"+string(filepath.Separator))
+	return []source{{path: real, key: real, framework: fw}}, false, ""
+}
+
+// inTree reports whether p names a path under the tree as configured or as
+// resolved, before any symlink below it is followed.
+func (r *makeReader) inTree(p string) bool {
+	return within(r.tree, p) || within(r.treeGiven, p)
+}
+
+func (r *makeReader) underReal(p string) bool { return within(r.tree, p) }
+
+func within(root, p string) bool {
+	rel, err := filepath.Rel(root, p)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
+}
+
+// resolveExisting resolves the symlinks of the longest prefix of p that
+// exists, and appends the rest.
+func (r *makeReader) resolveExisting(p string) (string, bool) {
+	rest := ""
+	for dir := p; ; {
+		if real, err := filepath.EvalSymlinks(dir); err == nil {
+			return filepath.Join(real, rest), true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", false
+		}
+		rest = filepath.Join(filepath.Base(dir), rest)
+		dir = parent
+	}
 }
 
 // capValues replaces a value set past maxPathValues with one value no path
@@ -1092,23 +1301,28 @@ func dedupe(vals []string) []string {
 	return out
 }
 
-// expandMakePath substitutes ${VAR} and ${VAR:H} references in an include
-// path, returning every value the path can take. It reports false for a
-// reference to a variable with no value here, for any "$" left that is not
-// one of those two forms, and for a path with more than maxPathValues values.
+// treeVarName holds the tree root, resolved and as configured, among a
+// reader's variables, under a name no Makefile can write, for :tA to confine
+// itself to.
+const treeVarName = ".bodega.tree"
+
+// expandMakePath substitutes ${VAR} references in an include path, with the
+// modifiers modifier understands, returning every value the path can take. It
+// reports false for a reference to a variable with no value here, for any "$"
+// that does not start one of those references, and for a path with more than
+// maxPathValues values.
 func expandMakePath(s string, vars map[string][]string, depth int) ([]string, bool) {
 	if depth > 8 {
 		return nil, false
 	}
-	loc := varReference.FindStringSubmatchIndex(s)
-	if loc == nil {
-		if strings.Contains(s, "$") {
-			return nil, false
-		}
+	start := strings.IndexByte(s, '$')
+	if start < 0 {
 		return []string{s}, true
 	}
-	name := s[loc[2]:loc[3]]
-	heads := strings.Count(s[loc[4]:loc[5]], ":H")
+	name, mods, end, ok := parseRef(s, start)
+	if !ok {
+		return nil, false
+	}
 	vals, ok := vars[name]
 	if !ok || len(vals) == 0 {
 		return nil, false
@@ -1120,10 +1334,12 @@ func expandMakePath(s string, vars map[string][]string, depth int) ([]string, bo
 			return nil, false
 		}
 		for _, e := range expanded {
-			for range heads {
-				e = path.Dir(filepath.ToSlash(e))
+			for _, m := range mods {
+				if e, ok = m.apply(e, vars); !ok {
+					return nil, false
+				}
 			}
-			rest, ok := expandMakePath(s[:loc[0]]+filepath.FromSlash(e)+s[loc[1]:], vars, depth+1)
+			rest, ok := expandMakePath(s[:start]+e+s[end:], vars, depth+1)
 			if !ok {
 				return nil, false
 			}
@@ -1136,10 +1352,288 @@ func expandMakePath(s string, vars map[string][]string, depth int) ([]string, bo
 	return dedupe(out), true
 }
 
-// Load walks <portsTree>/<category>/<port>/distinfo* and returns the index.
-// A tree with no distinfo at all fails, because it is not a ports tree and
-// every request would 404 with nothing saying why.
-func Load(portsTree string) (*Index, error) {
+// modifier is one variable modifier the reader applies as make does. Any other
+// modifier refuses the reference: :M, :N and :S would each need their own
+// model, and :sh, ::= and :_= run or assign things.
+type modifier struct {
+	op                 string // "H", "tl", "tu", "tA" or "C"
+	re                 *regexp.Regexp
+	repl               string
+	global, one, whole bool
+}
+
+// parseRef reads the ${NAME:mod:...} reference at s[i], returning the index
+// just past it. ok is false for anything else.
+func parseRef(s string, i int) (name string, mods []modifier, end int, ok bool) {
+	if !strings.HasPrefix(s[i:], "${") {
+		return "", nil, 0, false
+	}
+	j := i + 2
+	k := j
+	for k < len(s) && (s[k] == '_' || s[k] == '.' || isAlpha(s[k]) || (k > j && isDigit(s[k]))) {
+		k++
+	}
+	if k == j {
+		return "", nil, 0, false
+	}
+	name = s[j:k]
+	for k < len(s) {
+		switch s[k] {
+		case '}':
+			return name, mods, k + 1, true
+		case ':':
+			m, next, ok := parseModifier(s, k+1)
+			if !ok {
+				return "", nil, 0, false
+			}
+			mods = append(mods, m)
+			k = next
+		default:
+			return "", nil, 0, false
+		}
+	}
+	return "", nil, 0, false
+}
+
+func isAlpha(c byte) bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }
+func isDigit(c byte) bool { return c >= '0' && c <= '9' }
+
+// parseModifier reads one modifier starting at s[k], just past its ":", and
+// returns the index of the ":" or "}" that ends it.
+func parseModifier(s string, k int) (modifier, int, bool) {
+	ends := func(at int) bool { return at < len(s) && (s[at] == ':' || s[at] == '}') }
+	for _, op := range []string{"tA", "tl", "tu", "H"} {
+		if strings.HasPrefix(s[k:], op) && ends(k+len(op)) {
+			return modifier{op: op}, k + len(op), true
+		}
+	}
+	if k+1 >= len(s) || s[k] != 'C' {
+		return modifier{}, 0, false
+	}
+	delim := s[k+1]
+	if isAlpha(delim) || isDigit(delim) || strings.IndexByte("\\${}(): \t", delim) >= 0 {
+		return modifier{}, 0, false
+	}
+	pat, next, ok := modifierPart(s, k+2, delim)
+	if !ok {
+		return modifier{}, 0, false
+	}
+	repl, next, ok := modifierPart(s, next, delim)
+	if !ok {
+		return modifier{}, 0, false
+	}
+	m := modifier{op: "C", repl: repl}
+	for ; next < len(s) && strings.IndexByte("1gW", s[next]) >= 0; next++ {
+		switch s[next] {
+		case '1':
+			m.one = true
+		case 'g':
+			m.global = true
+		case 'W':
+			m.whole = true
+		}
+	}
+	if !ends(next) {
+		return modifier{}, 0, false
+	}
+	if m.re, ok = compileERE(pat); !ok {
+		return modifier{}, 0, false
+	}
+	// A reference to a group the pattern does not have is an error in make.
+	for i := 0; i+1 < len(repl); i++ {
+		if repl[i] == '\\' {
+			if isDigit(repl[i+1]) && int(repl[i+1]-'0') > m.re.NumSubexp() {
+				return modifier{}, 0, false
+			}
+			i++
+		}
+	}
+	return m, next, true
+}
+
+// modifierPart reads a :C pattern or replacement up to an unescaped delim. A
+// backslash before delim yields delim; any other backslash is kept for the
+// pattern or the replacement to read. A "$" refuses: make expands it first.
+func modifierPart(s string, k int, delim byte) (string, int, bool) {
+	var b strings.Builder
+	for ; k < len(s); k++ {
+		switch c := s[k]; {
+		case c == delim:
+			return b.String(), k + 1, true
+		case c == '$':
+			return "", 0, false
+		case c == '\\' && k+1 < len(s) && s[k+1] == delim:
+			b.WriteByte(delim)
+			k++
+		case c == '\\' && k+1 < len(s):
+			b.WriteByte(c)
+			b.WriteByte(s[k+1])
+			k++
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return "", 0, false
+}
+
+// compileERE compiles a :C pattern where Go's POSIX mode is known to read it as
+// make's regcomp(3) does, and refuses it otherwise. Go reads a backslash inside
+// a bracket, and before a letter or digit, where POSIX does not; and a pattern
+// matching the empty string substitutes between characters, which the two
+// libraries place differently.
+func compileERE(pat string) (*regexp.Regexp, bool) {
+	inBracket := false
+	for i := 0; i < len(pat); i++ {
+		c := pat[i]
+		switch {
+		case inBracket && c == '\\':
+			return nil, false
+		case inBracket && c == '[' && i+1 < len(pat) && strings.IndexByte(":.=", pat[i+1]) >= 0:
+			j := strings.Index(pat[i+2:], string(pat[i+1])+"]")
+			if j < 0 {
+				return nil, false
+			}
+			i += j + 3
+		case inBracket && c == ']':
+			inBracket = false
+		case c == '\\':
+			if i+1 >= len(pat) || isAlpha(pat[i+1]) || isDigit(pat[i+1]) {
+				return nil, false
+			}
+			i++
+		case c == '[':
+			inBracket = true
+			if i+1 < len(pat) && pat[i+1] == '^' {
+				i++
+			}
+			if i+1 < len(pat) && pat[i+1] == ']' {
+				i++
+			}
+		}
+	}
+	if inBracket {
+		return nil, false
+	}
+	re, err := regexp.CompilePOSIX(pat)
+	if err != nil || re.MatchString("") {
+		return nil, false
+	}
+	return re, true
+}
+
+// apply is m applied to one value, as make applies it.
+func (m modifier) apply(v string, vars map[string][]string) (string, bool) {
+	switch m.op {
+	case "H":
+		return filepath.FromSlash(path.Dir(filepath.ToSlash(v))), true
+	case "tl":
+		return strings.ToLower(v), true
+	case "tu":
+		return strings.ToUpper(v), true
+	case "tA":
+		return realpathInTree(v, vars)
+	}
+	if m.whole {
+		out, _ := m.substitute(v)
+		return out, true
+	}
+	words := strings.Fields(v)
+	done := false
+	for i, w := range words {
+		if done {
+			break
+		}
+		var changed bool
+		words[i], changed = m.substitute(w)
+		done = m.one && changed
+	}
+	return strings.Join(words, " "), true
+}
+
+// substitute replaces the first match in w, or every one under g.
+func (m modifier) substitute(w string) (string, bool) {
+	matches := m.re.FindAllStringSubmatchIndex(w, -1)
+	if len(matches) == 0 {
+		return w, false
+	}
+	if !m.global {
+		matches = matches[:1]
+	}
+	var b strings.Builder
+	last := 0
+	for _, loc := range matches {
+		b.WriteString(w[last:loc[0]])
+		for i := 0; i < len(m.repl); i++ {
+			c := m.repl[i]
+			switch {
+			case c == '&':
+				b.WriteString(w[loc[0]:loc[1]])
+			case c == '\\' && i+1 < len(m.repl) && isDigit(m.repl[i+1]):
+				n := int(m.repl[i+1] - '0')
+				if loc[2*n] >= 0 {
+					b.WriteString(w[loc[2*n]:loc[2*n+1]])
+				}
+				i++
+			case c == '\\' && i+1 < len(m.repl):
+				b.WriteByte(m.repl[i+1])
+				i++
+			default:
+				b.WriteByte(c)
+			}
+		}
+		last = loc[1]
+	}
+	b.WriteString(w[last:])
+	return b.String(), true
+}
+
+// realpathInTree is :tA, which make answers with realpath(3) relative to the
+// directory it runs in, leaving the value alone when that fails. It is
+// answered only for a path inside the tree: anywhere else realpath would read
+// the server's filesystem in place of the client's.
+func realpathInTree(v string, vars map[string][]string) (string, bool) {
+	cur, roots := vars[".CURDIR"], vars[treeVarName]
+	if len(cur) != 1 || len(roots) == 0 || strings.ContainsAny(v, " \t") {
+		return "", false
+	}
+	inside := func(p string) bool {
+		for _, root := range roots {
+			if within(root, p) {
+				return true
+			}
+		}
+		return false
+	}
+	p := v
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(cur[0], p)
+	}
+	p = filepath.Clean(p)
+	if !inside(p) {
+		return "", false
+	}
+	real, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		return v, true
+	}
+	if !inside(real) {
+		return "", false
+	}
+	return real, true
+}
+
+// Load is LoadIn with the empty environment: no variable declared and no file
+// outside the tree readable.
+func Load(portsTree string) (*Index, error) { return LoadIn(portsTree, nil) }
+
+// LoadIn walks <portsTree>/<category>/<port>/distinfo* and returns the index,
+// reading every port as a client in env would. A tree with no distinfo at all
+// fails, because it is not a ports tree and every request would 404 with
+// nothing saying why.
+func LoadIn(portsTree string, env *Environment) (*Index, error) {
+	if env == nil {
+		env = emptyEnvironment()
+	}
 	cats, err := os.ReadDir(portsTree)
 	if err != nil {
 		return nil, fmt.Errorf("read ports tree %s: %w", portsTree, err)
@@ -1184,7 +1678,7 @@ func Load(portsTree string) (*Index, error) {
 					own = append(own, filepath.Join(dir, n))
 				}
 			}
-			pr := portText(portsTree, dir, own)
+			pr := portText(portsTree, dir, own, env)
 			why := restriction(origin, pr.text, db)
 			if why == "" && pr.unresolved != "" {
 				why = fmt.Sprintf("%s: %s, so its redistribution terms cannot be established", origin, pr.unresolved)
@@ -1192,11 +1686,15 @@ func Load(portsTree string) (*Index, error) {
 			if why == "" {
 				continue
 			}
+			owners, strays := portOrigins(portsTree, pr.owners)
+			if pr.ownerUnknown == "" && len(strays) > 0 {
+				pr.ownerUnknown = fmt.Sprintf("its DISTINFO_FILE may name a file in %s, which is not a <category>/<port> directory of the tree, so bodega indexes nothing there to restrict", strings.Join(strays, ", "))
+			}
 			if pr.ownerUnknown != "" {
 				unowned = append(unowned, fmt.Sprintf("%s (%s): %s", origin, why, pr.ownerUnknown))
 				unownedOrigins = append(unownedOrigins, origin)
 			}
-			for _, owner := range append([]string{origin}, portOrigins(portsTree, pr.owners)...) {
+			for _, owner := range append([]string{origin}, owners...) {
 				if _, ok := restricted[owner]; !ok {
 					restricted[owner] = why
 				}
@@ -1224,10 +1722,10 @@ func Load(portsTree string) (*Index, error) {
 	}
 	// A distinfo nobody can place may be any distinfo in the tree: a value
 	// the reader cannot resolve may hold "/" and "..", and one set by a file
-	// outside the tree (the aspell dictionaries read ${LOCALBASE}/etc) is not
-	// fixed by the tree at all. Refusing only the port's own directory would
-	// refuse nothing for a slave with no distinfo of its own, so every name
-	// is refused rather than guessed at.
+	// outside the tree (the aspell dictionaries read ${LOCALBASE}/etc) is
+	// fixed only by what the environment declares for that file. Refusing
+	// only the port's own directory would refuse nothing for a slave with no
+	// distinfo of its own, so every name is refused rather than guessed at.
 	if len(unownedOrigins) > 0 {
 		why := fmt.Sprintf("%s is restricted or unreadable and reads a distinfo bodega cannot place, so it may obtain any distfile in the tree", unownedOrigins[0])
 		if n := len(unownedOrigins) - 1; n > 0 {
@@ -1243,26 +1741,27 @@ func Load(portsTree string) (*Index, error) {
 }
 
 // portOrigins maps each directory to the <category>/<port> origin it names in
-// tree, dropping any that is not one: Load indexes no distinfo anywhere else.
-func portOrigins(tree string, dirs []string) []string {
+// tree. Load indexes no distinfo anywhere else, so any other directory comes
+// back in strays: a restricted port reading a distinfo there may list names a
+// port Load does index also lists, and dropping the directory would drop the
+// restriction from them.
+func portOrigins(tree string, dirs []string) (origins, strays []string) {
 	if real, err := filepath.EvalSymlinks(tree); err == nil {
 		tree = real
 	}
-	var out []string
 	for _, d := range dirs {
 		if real, err := filepath.EvalSymlinks(d); err == nil {
 			d = real
 		}
 		rel, err := filepath.Rel(tree, d)
-		if err != nil {
+		rel = filepath.ToSlash(rel)
+		if err == nil && strings.Count(rel, "/") == 1 && !strings.HasPrefix(rel, ".") {
+			origins = append(origins, rel)
 			continue
 		}
-		rel = filepath.ToSlash(rel)
-		if strings.Count(rel, "/") == 1 && !strings.HasPrefix(rel, ".") {
-			out = append(out, rel)
-		}
+		strays = append(strays, d)
 	}
-	return out
+	return origins, strays
 }
 
 func (ix *Index) addDistinfo(file, origin string, byPort map[string][]string) error {
@@ -1304,12 +1803,24 @@ func (ix *Index) addDistinfo(file, origin string, byPort map[string][]string) er
 // Tree is an Index over one ports tree, read in the background and re-read
 // once it is older than ttl, so a server neither waits out a cold walk at
 // startup nor holds a request while a stale index reloads. A reload that fails
-// keeps the previous index: a server that refused every distfile because a
-// `git pull` was halfway through would turn a transient state into an outage.
+// to read the tree keeps the previous index: a server that refused every
+// distfile because a `git pull` was halfway through would turn a transient
+// state into an outage.
+//
+// The environment is the opposite case. Its snapshots are read at every load
+// and held to the digest of the first read, and a load that cannot read them,
+// or finds them changed, drops the index and refuses everything until a load
+// finds the first bytes again or bodega restarts and adopts the new ones. An
+// index admitted against bytes that are no longer the declared ones is not the
+// declared environment's decision, and the operator changing a snapshot in
+// place is the case where refusing is cheap and admitting is not.
 type Tree struct {
 	root string
+	env  EnvironmentSpec
 	ttl  time.Duration
 	logf func(format string, args ...any)
+
+	envDigest string // of the first environment read, which every later one must match
 
 	mu      sync.Mutex
 	ix      *Index
@@ -1321,13 +1832,18 @@ type Tree struct {
 	readyOnce sync.Once
 }
 
-// NewTree starts the first read of root and returns at once. logf receives
-// one line per completed or failed read; nil discards them.
+// NewTree is NewTreeIn with the empty environment.
 func NewTree(root string, ttl time.Duration, logf func(format string, args ...any)) *Tree {
+	return NewTreeIn(root, EnvironmentSpec{}, ttl, logf)
+}
+
+// NewTreeIn starts the first read of root against env and returns at once.
+// logf receives one line per completed or failed read; nil discards them.
+func NewTreeIn(root string, env EnvironmentSpec, ttl time.Duration, logf func(format string, args ...any)) *Tree {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	t := &Tree{root: root, ttl: ttl, logf: logf, ready: make(chan struct{})}
+	t := &Tree{root: root, env: env, ttl: ttl, logf: logf, ready: make(chan struct{})}
 	t.mu.Lock()
 	t.startLoadLocked()
 	t.mu.Unlock()
@@ -1345,7 +1861,28 @@ func (t *Tree) startLoadLocked() {
 	t.loaded = time.Now()
 	go func() {
 		start := time.Now()
-		ix, err := Load(t.root)
+		env, err := t.env.Load()
+		if err == nil {
+			t.mu.Lock()
+			if t.envDigest == "" {
+				t.envDigest = env.Digest()
+			}
+			if env.Digest() != t.envDigest {
+				err = fmt.Errorf("the declared environment is no longer the one bodega started with: its digest was %s and is now %s, because a snapshot changed; restart bodega to admit against the new bytes", t.envDigest, env.Digest())
+			}
+			t.mu.Unlock()
+		}
+		if err != nil {
+			t.mu.Lock()
+			defer t.mu.Unlock()
+			defer t.readyOnce.Do(func() { close(t.ready) })
+			t.loading = false
+			t.loaded = time.Now()
+			t.ix, t.loadErr = nil, err
+			t.logf("distinfo: refusing every distfile: %v", err)
+			return
+		}
+		ix, err := LoadIn(t.root, env)
 		t.mu.Lock()
 		defer t.mu.Unlock()
 		defer t.readyOnce.Do(func() { close(t.ready) })
@@ -1357,7 +1894,7 @@ func (t *Tree) startLoadLocked() {
 			return
 		}
 		t.ix, t.loadErr = ix, nil
-		t.logf("distinfo: indexed %d distfiles from %s in %s", ix.Len(), t.root, time.Since(start).Round(time.Millisecond))
+		t.logf("distinfo: indexed %d distfiles from %s against environment %s in %s", ix.Len(), t.root, env.Digest(), time.Since(start).Round(time.Millisecond))
 		if u := ix.Unowned(); len(u) > 0 {
 			t.logf("distinfo: refusing every distfile: %d restricted ports read a distinfo bodega cannot place, and any of them may obtain any distfile in the tree: %s", len(u), strings.Join(u, "; "))
 		}

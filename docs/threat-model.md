@@ -109,6 +109,23 @@ risk:
   pass it. The trust anchor moves to the ports tree the server reads, so a
   tampered tree on the server is served faithfully. Keep it at the revision
   the clients build from, from the same source they take it from.
+- **A restricted distfile served on a guess about the client.** A port's
+  redistribution terms, and the `distinfo` its fetch checks against, can
+  depend on files and variables on the client host rather than in the ports
+  tree: the aspell dictionaries include `${LOCALBASE}/etc/aspell.ver`, and
+  base `make` lets that file move `DISTINFO_FILE` to another port's `distinfo`
+  and set `NO_CDROM`. bodega reads every port against the environment the
+  operator declares in `distfiles_environment_variables` and
+  `distfiles_environment_files`, and against nothing else. A port that reads a
+  path or a variable the declaration does not cover is refused, and when its
+  `distinfo` then cannot be placed, every distfile is refused. The server's
+  own filesystem never stands in for a client's, and a path missing on the
+  server is not evidence that it is missing on a client. A request carries
+  only a distinfo name, so what a client's `make` computes never reaches
+  admission and cannot widen what bodega releases. The snapshots are held to
+  the digest bodega started with; one that changes or cannot be read refuses
+  every distfile until its bytes are back or bodega restarts. See [The client
+  environment](usage.md#the-client-environment).
 - **Compromised upstream releases.** When an upstream package is replaced with
   a malicious version (the canonical example being the npm or PyPI account
   takeovers of recent years), bodega's `pkg hide` and `pkg freeze` operations
@@ -187,6 +204,17 @@ defence against:
   setting stops it. Only a `DISTDIR` bodega wrote isolates a build, because
   `do-fetch.sh` skips a file already present before it consults any site. See
   [Mirroring ports distfiles](usage.md#mirroring-ports-distfiles).
+- **A ports client that differs from the declared environment.** bodega has no
+  view of a client host. It answers every distfiles request as it would answer
+  a client in the declared environment, so a client whose `make.conf`,
+  environment or files outside the ports tree differ is outside what bodega
+  vouches for. That client's own `make` may attribute a file bodega admitted
+  to a port whose terms, as its host defines them, forbid redistribution, and
+  bodega does not learn of it. Keeping clients inside the declaration is the
+  job of configuration management. The declaration covers the fleet only if
+  the operator makes it: a value or an alternative left out is one bodega
+  never reads. The scan does not evaluate conditions, so where it errs it
+  refuses a file a client could have had, not the reverse.
 - **Build-time code execution by trusted packages.** A `setup.py` that
   `os.system`s out, an `npm install` lifecycle script, a `cargo build` script
   — all of these run with the build user's privileges and can do anything
@@ -353,6 +381,13 @@ instance, the recommended posture is:
   an account that cannot read `/etc/bodega/config.json` or `/var/lib/bodega`
   reads `SKIPPED` with the privilege it needs, rather than `N/A` beside the
   checks that genuinely passed.
+- **Declare the environment your ports clients build in** before serving
+  distfiles from a stock tree; the empty declaration refuses all of them.
+  Start from it, read the unplaced ports bodega logs, confirm each named value
+  on a client with base `make -V`, and declare every value and every
+  alternative your clients hold. Revisit it when a client's `make.conf`
+  changes, an architecture is added, or a package installs a file a port
+  includes, such as aspell's `etc/aspell.ver`.
 - **Harden the seeded cooldown and add an allow-list.** `bodega policy age
 set npm 7d block` turns the shipped `warn` into a refusal once you have
   watched it for a release cycle; `bodega policy add <type> <pattern>`

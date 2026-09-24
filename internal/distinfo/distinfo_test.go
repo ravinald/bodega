@@ -282,6 +282,29 @@ func TestRestrictionFailsClosedOnWhatItCannotRead(t *testing.T) {
 		{"framework default", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.include <bsd.port.options.mk>\n.include \"${FILESDIR}/extra.mk\"\n", "files/extra.mk": "RESTRICTED=\tno\n"}, "RESTRICTED"},
 		{"include fan-out", fanOut(10), "more than"},
 		{"shell-assigned path", map[string]string{"Makefile": "V!=\techo x\n.include \"${V}.mk\"\n"}, "cannot be resolved"},
+		// devel/subversion/Makefile.addons: the include follows the
+		// assignment in one branch, so it reads that branch's value alone.
+		{"assignment and include in one branch", map[string]string{"Makefile": ".if ${V} == latest\nMASTERDIR=\t${.CURDIR}/../../lang/master\n.include \"${MASTERDIR}/Makefile.common\"\n.elif ${V} == lts\nMASTERDIR=\t${.CURDIR}/../../lang/other\n.include \"${MASTERDIR}/Makefile.common\"\n.else\n.include <bsd.port.pre.mk>\n.endif\n"}, "RESTRICTED"},
+		// sysutils/bacula13-server: in the .else, MASTERDIR is undefined and
+		// make reads /Makefile.common on the client host.
+		{"undefined in an else branch", map[string]string{"Makefile": ".if ${S} == x\nLICENSE=\tBSD2CLAUSE\n.else\n.include \"${MASTERDIR}/Makefile.common\"\n.endif\n"}, "leaves the ports tree"},
+		{"else with no if", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.else\n"}, "cannot match"},
+		{"elif after else", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.if 1\n.else\n.elif 2\n.endif\n"}, "after an .else"},
+		{"endfor closing an if", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.if 1\n.endfor\n"}, "does not match"},
+		// databases/mariadb106-client.
+		{":C", map[string]string{"Makefile": "PKGNAMESUFFIX=\t-client\nMASTERDIR=\t${.CURDIR}/../../lang/${PKGNAMESUFFIX:C/-client/master/}\n.include \"${MASTERDIR}/Makefile.common\"\n"}, "RESTRICTED"},
+		{":C with groups", map[string]string{"Makefile": "V=\tlang-retsam\nD=\t${V:C/^([a-z]+)-(.*)/\\1/}\n.include \"${.CURDIR}/../../${D}/master/Makefile.common\"\n"}, "RESTRICTED"},
+		{"$ in a pattern", map[string]string{"Makefile": "V=\tlang-retsam\nD=\t${V:C/^([a-z]+)-(.*)$$/\\1/}\n.include \"${.CURDIR}/../../${D}/master/Makefile.common\"\n"}, "cannot be resolved"},
+		{":C, first word only, then the whole value", map[string]string{"Makefile": "V=\tx x\nD=\t${V:C/x/master/1:C/ .*//W}\n.include \"${.CURDIR}/../../lang/${D}/Makefile.common\"\n"}, "RESTRICTED"},
+		// security/ossec-hids-local-config.
+		{":tl on a loop variable", map[string]string{"Makefile": ".for g in MASTER\n.include \"${.CURDIR}/../../lang/${g:tl}/Makefile.common\"\n.endfor\n"}, "RESTRICTED"},
+		// x11-servers/xlibre-server/Makefile.common.
+		{":tA", map[string]string{"Makefile": "_R=\t../../lang/master/\nX=\t${_R:tA}\n.include \"${X}/Makefile.common\"\n"}, "RESTRICTED"},
+		{":tA out of the tree", map[string]string{"Makefile": "_R=\t../../../elsewhere\nX=\t${_R:tA}\n.include \"${X}/x.mk\"\n"}, "cannot be resolved"},
+		{"unsupported modifier", map[string]string{"Makefile": "D=\tmaster\n.include \"${.CURDIR}/../../lang/${D:S/a/a/}/Makefile.common\"\n"}, "cannot be resolved"},
+		{"pattern POSIX reads differently", map[string]string{"Makefile": "D=\tmaster1\n.include \"${.CURDIR}/../../lang/${D:C/\\d//}/Makefile.common\"\n"}, "cannot be resolved"},
+		{"pattern matching nothing", map[string]string{"Makefile": "D=\tmaster\n.include \"${.CURDIR}/../../lang/${D:C/x*//}/Makefile.common\"\n"}, "cannot be resolved"},
+		{"backreference in the pattern", map[string]string{"Makefile": "D=\tmaster\n.include \"${.CURDIR}/../../lang/${D:C/(a)\\1//}/Makefile.common\"\n"}, "cannot be resolved"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := portsTree(t)
