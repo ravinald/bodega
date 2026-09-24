@@ -931,7 +931,7 @@ func (s *Server) handleAPIPackages(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	resp := make(packagesResponse, len(manifest.AllTypes))
 	for _, typ := range manifest.AllTypes {
-		resp[typ] = loadAllPackages(ctx, s.store, typ)
+		resp[typ] = loadPublicPackages(ctx, s.store, typ)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -945,7 +945,7 @@ func (s *Server) handleAPIPackagesByType(w http.ResponseWriter, r *http.Request)
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, loadAllPackages(ctx, s.store, t))
+	writeJSON(w, http.StatusOK, loadPublicPackages(ctx, s.store, t))
 }
 
 func (s *Server) handleAPIPackage(w http.ResponseWriter, r *http.Request) {
@@ -969,7 +969,7 @@ func (s *Server) handleAPIPackage(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 		return
 	}
-	writeJSON(w, http.StatusOK, pm)
+	writeJSON(w, http.StatusOK, pm.Public())
 }
 
 // handleAPIPackageVersion returns a PackageManifest scoped to a single
@@ -1006,7 +1006,7 @@ func (s *Server) handleAPIPackageVersion(w http.ResponseWriter, r *http.Request)
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, scoped)
+	writeJSON(w, http.StatusOK, scoped.Public())
 }
 
 // statusResponse is the JSON shape for /api/v1/status.
@@ -1060,6 +1060,12 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 		// published on purpose and no client can verify a catalogue without
 		// it.
 		freebsd.KeyError = ""
+		// A refusal quotes the entry's url, and the url may carry upstream
+		// credentials. repo and abi stay public so a client can tell a
+		// refused repository from an absent one.
+		for i := range freebsd.Refused {
+			freebsd.Refused[i].Error = ""
+		}
 	}
 	entryCount := make(map[string]int, len(manifest.AllTypes))
 	for _, typ := range manifest.AllTypes {
@@ -2074,8 +2080,10 @@ func sortStrings(ss []string) {
 
 // ---- PackageManifest helpers -----------------------------------------------
 
-// loadAllPackages loads all PackageManifest entries for a given type from the store.
-func loadAllPackages(ctx context.Context, store *manifest.Store, typ string) []*manifest.PackageManifest {
+// loadPublicPackages loads every PackageManifest of one type from the store,
+// each as manifest.PackageManifest.Public returns it: the read routes take no
+// token.
+func loadPublicPackages(ctx context.Context, store *manifest.Store, typ string) []*manifest.PackageManifest {
 	names := store.ListPackages(typ)
 	out := make([]*manifest.PackageManifest, 0, len(names))
 	for _, name := range names {
@@ -2083,7 +2091,7 @@ func loadAllPackages(ctx context.Context, store *manifest.Store, typ string) []*
 		if err != nil || pm == nil {
 			continue
 		}
-		out = append(out, pm)
+		out = append(out, pm.Public())
 	}
 	return out
 }

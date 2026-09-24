@@ -936,6 +936,10 @@ components:
           type: string
         url:
           type: string
+          description: >-
+            The upstream this version is fetched from. Published without its
+            userinfo, username included, because the read routes take no
+            token; the stored manifest keeps it.
         mode:
           type: string
           enum: [hosted, proxy]
@@ -1424,6 +1428,11 @@ components:
                 type: string
               error:
                 type: string
+                description: >-
+                  Why the entry was refused. It quotes the entry's `url`,
+                  which may carry upstream credentials, so it is empty for a
+                  caller outside `admin_permit_cidr`. `repo` and `abi` answer
+                  everyone.
 
     FreeBSDRepo:
       type: object

@@ -124,3 +124,38 @@ func TestScopeToVersionDoesNotMutate(t *testing.T) {
 		t.Errorf("source mutated: %+v", pm.Versions)
 	}
 }
+
+// PublicURL drops the whole userinfo, username included, in every form a
+// manifest url is written: with a scheme, without one (where url.Parse finds
+// no userinfo at all), and git's scp form (which url.Parse refuses). An "@"
+// past the authority is path, and stays.
+func TestPublicURL(t *testing.T) {
+	for _, tc := range []struct{ raw, want string }{
+		{"https://audit-user:audit-secret@private.example/FreeBSD:14:amd64/latest", "https://private.example/FreeBSD:14:amd64/latest"},
+		{"https://ghp_token@github.com/org/repo.git", "https://github.com/org/repo.git"},
+		{"https://u:p@ss@private.example/x", "https://private.example/x"},
+		{"audit-user:audit-secret@private.example/x", "private.example/x"},
+		{"git@github.com:org/repo.git", "github.com:org/repo.git"},
+		{"https://registry.npmjs.org/@scope/pkg", "https://registry.npmjs.org/@scope/pkg"},
+		{"https://private.example/x?who=a@b", "https://private.example/x?who=a@b"},
+		{"https://private.example", "https://private.example"},
+		{"", ""},
+	} {
+		if got := PublicURL(tc.raw); got != tc.want {
+			t.Errorf("PublicURL(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+}
+
+// Public copies: the store may hand the same pointer to the next reader, and a
+// redaction written through it would strip the credential the next fetch needs.
+func TestPublicLeavesTheManifestAlone(t *testing.T) {
+	raw := "https://u:" + "p@private.example/x"
+	pm := &PackageManifest{Versions: []VersionEntry{{Version: "1", URL: raw}}}
+	if got := pm.Public().Versions[0].URL; got != "https://private.example/x" {
+		t.Errorf("Public() url = %q", got)
+	}
+	if pm.Versions[0].URL != raw {
+		t.Errorf("Public() rewrote the manifest it was handed: %q", pm.Versions[0].URL)
+	}
+}

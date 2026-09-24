@@ -3907,6 +3907,21 @@ It is present only for a caller inside `admin_permit_cidr` (see `bodega acl`), a
 
 An absent `version` therefore means one of two things, and the response cannot tell you which: the caller is outside `admin_permit_cidr`, or the server predates the field. Run `bodega --version` on the server host rather than reading the absence as either one.
 
+#### Credentials in a manifest `url`
+
+A version entry's `url` may carry userinfo, `https://user:secret@host/path`, and the builder and the proxy routes fetch with it: Go's HTTP client and `git` both send it as basic auth. bodega has no other place to configure a credential per upstream, so the form is supported rather than refused.
+
+The four `GET /api/v1/packages` routes take no token, so they publish every `url` with the userinfo removed, username included: `https://audit-user:audit-secret@private.example/latest` is served as `https://private.example/latest`. The username goes too because a GitHub or GitLab token written as `https://<token>@host/` is a bare username, and masking the password alone would publish it whole. The web UI reads these routes, so it shows the same form. The stored manifest is untouched, and `bodega show pkg`, the TUI and the builder's output, which read the store on the server host rather than the API, still print the url as written.
+
+`freebsd.refused[].error` on `/api/v1/status` quotes an entry's url, so it is empty for a caller outside `admin_permit_cidr`. `repo` and `abi` stay public on every row, so a client can still tell a refused repository from an absent one.
+
+**Upgrading.** Nothing refuses to start and no entry is refused: a manifest that already carries a credential keeps serving and fetching as before, and only what the read API and the status refusal publish changes. Two consequences follow:
+
+- A manifest fetched from the read API and pushed back through `bodega pkg import` or `POST /api/v1/packages/{type}` arrives without its credential, and the next fetch from that upstream goes out anonymous. Import from the manifest file under `manifest_dir` instead.
+- A credential the read API published before this change has been readable by anyone who could reach the server. Rotate it at the upstream; withholding it now does not recall a copy already taken.
+
+A query-string token (`?token=...`) is not userinfo and is still published. Put a credential in the userinfo or nowhere.
+
 #### The `apt` block on `/api/v1/status`
 
 `/api/v1/status` carries an `apt` object reporting how apt clients reach this server. It is the answer to what an emitter would otherwise guess at, and the reason the banner, the TUI and the web UI agree.

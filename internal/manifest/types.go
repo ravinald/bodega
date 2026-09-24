@@ -332,6 +332,46 @@ type VersionEntry struct {
 	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
+// Public returns a copy of pm fit for a caller that presented no token: every
+// version's URL loses its userinfo. pm is not modified, since the store may
+// hand the same pointer to the next reader.
+func (pm *PackageManifest) Public() *PackageManifest {
+	if pm == nil {
+		return nil
+	}
+	out := *pm
+	out.Versions = make([]VersionEntry, len(pm.Versions))
+	for i, ve := range pm.Versions {
+		ve.URL = PublicURL(ve.URL)
+		out.Versions[i] = ve
+	}
+	return &out
+}
+
+// PublicURL returns raw without the userinfo in its authority.
+//
+// The username goes too, not only the password url.URL.Redacted masks: a
+// GitHub or GitLab token written as https://<token>@host/ is a bare username
+// to that method, which returns it unchanged. The authority is cut by hand
+// rather than through url.Parse, which reads "user:secret@host/path" as the
+// scheme "user" with an opaque remainder and reports no userinfo at all, and
+// which refuses the scp form git accepts.
+func PublicURL(raw string) string {
+	start := 0
+	if i := strings.Index(raw, "://"); i >= 0 {
+		start = i + len("://")
+	}
+	end := len(raw)
+	if i := strings.IndexAny(raw[start:], "/?#"); i >= 0 {
+		end = start + i
+	}
+	at := strings.LastIndex(raw[start:end], "@")
+	if at <= 0 {
+		return raw
+	}
+	return raw[:start] + raw[start+at+1:]
+}
+
 // ScopeToVersion returns pm with Versions narrowed to the single entry
 // matching v. Result is still a valid PackageManifest so it round-trips
 // through import/export. nil for unknown or empty v.

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/ravinald/bodega/internal/manifest"
@@ -94,5 +95,51 @@ func TestReadAPIAnswersEveryKnownType(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The read routes take no token, and a manifest url may carry the credential
+// its upstream wants. The entry is an ordinary one: no generated, no
+// contradiction, a 200 on every route. The password and the username are
+// asserted apart because the username is withheld on purpose: a token written
+// as https://<token>@host/ is a username to url.URL.Redacted.
+func TestReadAPIWithholdsManifestURLUserinfo(t *testing.T) {
+	const (
+		user   = "audit-user"
+		secret = "audit-secret"
+		abi    = "FreeBSD:14:amd64"
+	)
+	s := hostedServer(t)
+	addVersion(t, s, manifest.TypeFreeBSD, "private", manifest.VersionEntry{
+		Version: abi,
+		URL:     "https://" + user + ":" + secret + "@private-upstream.example/" + abi + "/latest",
+	})
+
+	for _, path := range []string{
+		"/api/v1/packages",
+		"/api/v1/packages/" + manifest.TypeFreeBSD,
+		"/api/v1/packages/" + manifest.TypeFreeBSD + "/private",
+		"/api/v1/packages/" + manifest.TypeFreeBSD + "/private/" + abi,
+	} {
+		t.Run(path, func(t *testing.T) {
+			code, body := getStatusAndBody(t, s, path)
+			if code != http.StatusOK {
+				t.Fatalf("GET %s = %d, want 200: %s", path, code, body)
+			}
+			if withheldFrom(body, secret) != "" {
+				t.Errorf("GET %s publishes the url's password to a caller with no token: %s", path, body)
+			}
+			if withheldFrom(body, user) != "" {
+				t.Errorf("GET %s publishes the url's username to a caller with no token: %s", path, body)
+			}
+			if !strings.Contains(body, "private-upstream.example/"+abi+"/latest") {
+				t.Errorf("GET %s drops the url's host and path, which carry no credential and say where the entry comes from: %s", path, body)
+			}
+		})
+	}
+
+	pm, err := s.store.GetPackage(t.Context(), manifest.TypeFreeBSD, "private")
+	if err != nil || pm == nil || !strings.Contains(pm.Versions[0].URL, secret) {
+		t.Errorf("the stored url lost its credential after the reads, so the next fetch goes out anonymous: %+v, %v", pm, err)
 	}
 }
