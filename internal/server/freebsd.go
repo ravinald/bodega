@@ -108,7 +108,7 @@ func (s *Server) handleFreeBSD(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.logger.Error("freebsd: the entry contradicts itself about whether its catalogue is mirrored or generated",
 			"abi", abi, "repo", repo, "error", err)
-		http.Error(w, "freebsd "+repo+"@"+abi+": "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, freeBSDEntryMisconfigured, http.StatusInternalServerError)
 		return
 	}
 
@@ -235,6 +235,13 @@ func splitFreeBSDPath(p string) (abi, repo, rest string, ok bool) {
 // It says the fault is the server's, so a pkg client that retries is doing
 // the right thing and one that edits its repository configuration is not.
 const freeBSDCatalogUnavailable = "this repository is not serving a catalogue right now; the server logged why, and retrying later is safe"
+
+// freeBSDEntryMisconfigured is the whole body of the 500 for an entry that
+// claims to be both generated and mirrored. The refusal quotes the entry's
+// url, which may carry upstream credentials, so it goes to the log only. It
+// says the fault is the server's and that retrying will not clear it, since
+// nothing changes until an operator edits the manifest.
+const freeBSDEntryMisconfigured = "this repository is misconfigured on the server and serves nothing until an operator corrects it; the server logged why"
 
 // serveFreeBSDGenerated answers one repository-root file for a generated
 // repository.
