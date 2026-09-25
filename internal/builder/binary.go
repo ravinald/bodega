@@ -3,8 +3,10 @@ package builder
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -52,17 +54,35 @@ func binaryDestPath(d dirs, name string, ve manifest.VersionEntry) (string, erro
 	return filepath.Join(d.binaries, name, ve.Version, filename), nil
 }
 
-// confineWrite refuses a destination that a symlink would carry outside root.
+// binaryLocalPath returns the on-disk path of a binary version entry, refusing
+// one that a symlink would carry outside the configured binary root. Every
+// reader and writer of a binary artifact resolves its path here, so a link
+// that fails the fetch also hides a file from the stage check, the upload walk
+// and the checksum lookup rather than letting them read through it.
+func binaryLocalPath(cfg *Config, name string, ve manifest.VersionEntry) (string, error) {
+	root := cfg.rootFor(manifest.TypeBinary)
+	dest, err := binaryDestPath(buildDirs(root), name, ve)
+	if err != nil {
+		return "", err
+	}
+	if err := confinePath(root, dest); err != nil {
+		return "", err
+	}
+	return dest, nil
+}
+
+// confinePath refuses a destination that a symlink would carry outside root.
 //
-// binaryDestPath confines the path as text; this confines it on disk. The
-// deepest existing ancestor of dest is resolved and must sit under the
-// resolved root, so a symlinked build root is honored and a symlink inside it
-// is not, and dest itself must not be a symlink, since curl -o follows one.
-// It runs before the directories are created, so mkdir cannot follow a link
-// out either. Something racing to plant a link between this check and the
-// write already has write access to the build root, and with it every
-// artifact the build root holds.
-func confineWrite(root, dest string) error {
+// binaryDestPath confines the path as text; this confines it on disk. root is
+// the configured root, not a directory under it, because the operator chose
+// the root and nobody chose what sits below it: a symlinked root is honored,
+// and a link at binaries/ or deeper is not. The deepest existing ancestor of
+// dest is resolved and must sit under the resolved root, and dest itself must
+// not be a symlink, since curl -o follows one. The fetch runs this before it
+// creates any directory, so mkdir cannot follow a link out either. Something
+// racing to plant a link between this check and the write already has write
+// access to the build root, and with it every artifact the build root holds.
+func confinePath(root, dest string) error {
 	realRoot, err := filepath.EvalSymlinks(root)
 	if err != nil {
 		return fmt.Errorf("resolve build root %s: %w", root, err)
@@ -95,8 +115,7 @@ func confineWrite(root, dest string) error {
 // have completed for the given binary package version. For binary entries the
 // download IS the final artifact; Fetched, Built, and Packaged are all set together.
 func CheckBinaryStage(cfg *Config, name string, ve manifest.VersionEntry) StageStatus {
-	d := buildDirs(cfg.rootFor(manifest.TypeBinary))
-	dest, err := binaryDestPath(d, name, ve)
+	dest, err := binaryLocalPath(cfg, name, ve)
 	if err != nil {
 		return StageStatus{}
 	}
@@ -115,9 +134,7 @@ func CheckBinaryStage(cfg *Config, name string, ve manifest.VersionEntry) StageS
 func FetchBinaries(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 	ctx := context.Background()
 	summary := &Summary{}
-	d := buildDirs(cfg.rootFor(manifest.TypeBinary))
-
-	if err := mkdirAll(d.binaries); err != nil {
+	if err := mkdirAll(cfg.rootFor(manifest.TypeBinary)); err != nil {
 		cfg.logf("ERROR: %v", err)
 		return summary
 	}
@@ -164,10 +181,7 @@ func FetchBinaries(cfg *Config, store *manifest.Store, entryFilter string) *Summ
 			_, _ = fmt.Fprintf(out, "\n>>> [binary] fetch %s\n", name)
 			_, _ = fmt.Fprintf(out, "    URL: %s\n", ve.URL)
 
-			destPath, err := binaryDestPath(d, name, ve)
-			if err == nil {
-				err = confineWrite(d.binaries, destPath)
-			}
+			destPath, err := binaryLocalPath(cfg, name, ve)
 			if err == nil {
 				// Ensure the versioned sub-directory exists.
 				if mkErr := mkdirAll(filepath.Dir(destPath)); mkErr != nil {
@@ -265,7 +279,6 @@ func FetchBinaries(cfg *Config, store *manifest.Store, entryFilter string) *Summ
 // package version whose artifact exists on disk. Used by the upload and sync commands.
 func BinaryArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string) []ArtifactPath {
 	ctx := context.Background()
-	d := buildDirs(cfg.rootFor(manifest.TypeBinary))
 	var paths []ArtifactPath
 
 	for _, name := range store.ListPackages(manifest.TypeBinary) {
@@ -282,7 +295,10 @@ func BinaryArtifactPaths(cfg *Config, store *manifest.Store, entryFilter string)
 			if ve.Frozen {
 				continue
 			}
-			local, err := binaryDestPath(d, name, ve)
+			local, err := binaryLocalPath(cfg, name, ve)
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
 			if err != nil {
 				cfg.logf("  [binary] %s: SKIPPED: %v", name, err)
 				continue

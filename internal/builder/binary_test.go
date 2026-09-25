@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -190,5 +191,113 @@ func TestBinaryDestPathRefusesEveryEscapingComponent(t *testing.T) {
 	}
 	if _, err := binaryDestPath(d, "tool", manifest.VersionEntry{Filename: "~/tool"}); err != nil {
 		t.Errorf("a filename with a subdirectory is confined and was refused: %v", err)
+	}
+}
+
+// TestBinaryPathsRefuseLinksBelowTheRoot plants a link at each depth under the
+// configured root. The binaries directory is the case that needs no ".." and no
+// race: confining to it instead of the root trusted whatever it pointed at. An
+// artifact already sitting at the link target must not read as fetched either,
+// or the fetch skips, reports success and upload publishes the outside file.
+func TestBinaryPathsRefuseLinksBelowTheRoot(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "OUTSIDE-BUILD")
+	}))
+	defer up.Close()
+
+	for _, tc := range []struct {
+		label string
+		plant func(t *testing.T, build, outside string) string
+	}{
+		{"binaries directory", func(t *testing.T, build, outside string) string {
+			mustMkdir(t, build)
+			mustSymlink(t, outside, filepath.Join(build, "binaries"))
+			return filepath.Join(outside, "tool", "1.0.0", "tool.bin")
+		}},
+		{"version directory", func(t *testing.T, build, outside string) string {
+			mustMkdir(t, filepath.Join(build, "binaries", "tool"))
+			mustSymlink(t, outside, filepath.Join(build, "binaries", "tool", "1.0.0"))
+			return filepath.Join(outside, "tool.bin")
+		}},
+		{"leaf file", func(t *testing.T, build, outside string) string {
+			dir := filepath.Join(build, "binaries", "tool", "1.0.0")
+			mustMkdir(t, dir)
+			mustSymlink(t, filepath.Join(outside, "tool.bin"), filepath.Join(dir, "tool.bin"))
+			return filepath.Join(outside, "tool.bin")
+		}},
+	} {
+		for _, preexisting := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/target exists %v", tc.label, preexisting), func(t *testing.T) {
+				build := filepath.Join(t.TempDir(), "build")
+				outside := t.TempDir()
+				target := tc.plant(t, build, outside)
+				if preexisting {
+					mustMkdir(t, filepath.Dir(target))
+					if err := os.WriteFile(target, []byte("SECRET"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				store := manifest.NewLocalStore(t.TempDir())
+				ve := manifest.VersionEntry{Version: "1.0.0", URL: up.URL + "/payload", Filename: "tool.bin"}
+				if err := store.AddVersion(t.Context(), manifest.TypeBinary, "tool", ve); err != nil {
+					t.Fatal(err)
+				}
+				cfg := &Config{BuildRoot: build, BuildEnvInfo: &manifest.BuildEnv{Platform: "linux/arm64"}, Stdout: io.Discard}
+
+				sum := FetchBinaries(cfg, store, "tool")
+
+				if got, err := os.ReadFile(target); err == nil && string(got) == "OUTSIDE-BUILD" {
+					t.Errorf("fetch wrote %s through the link", target)
+				}
+				if sum.Failures != 1 || len(sum.Results) != 1 || sum.Results[0].Err == nil {
+					t.Fatalf("fetch through a link reported failures=%d results=%+v, want one failed entry", sum.Failures, sum.Results)
+				}
+				if got := BinaryArtifactPaths(cfg, store, "tool"); len(got) != 0 {
+					t.Errorf("upload walk returned %+v through the link", got)
+				}
+			})
+		}
+	}
+}
+
+func TestFetchBinariesThroughSymlinkedRoot(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "PAYLOAD")
+	}))
+	defer up.Close()
+
+	real := t.TempDir()
+	link := filepath.Join(t.TempDir(), "build")
+	mustSymlink(t, real, link)
+	store := manifest.NewLocalStore(t.TempDir())
+	ve := manifest.VersionEntry{Version: "1.0.0", URL: up.URL + "/payload", Filename: "tool.bin"}
+	if err := store.AddVersion(t.Context(), manifest.TypeBinary, "tool", ve); err != nil {
+		t.Fatal(err)
+	}
+	var log strings.Builder
+	cfg := &Config{BuildRoot: link, BuildEnvInfo: &manifest.BuildEnv{Platform: "linux/arm64"}, Stdout: &log}
+
+	if sum := FetchBinaries(cfg, store, "tool"); sum.Failures != 0 || sum.Total != 1 {
+		t.Fatalf("fetch under a symlinked configured root reported failures=%d total=%d\n%s", sum.Failures, sum.Total, log.String())
+	}
+	if got, err := os.ReadFile(filepath.Join(real, "binaries", "tool", "1.0.0", "tool.bin")); err != nil || string(got) != "PAYLOAD" {
+		t.Errorf("artifact under the resolved root = %q, %v", got, err)
+	}
+	if got := BinaryArtifactPaths(cfg, store, "tool"); len(got) != 1 {
+		t.Errorf("upload walk under a symlinked root returned %+v, want one path", got)
+	}
+}
+
+func mustMkdir(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustSymlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
 	}
 }

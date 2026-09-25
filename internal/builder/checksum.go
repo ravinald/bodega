@@ -209,7 +209,7 @@ func (c *Config) fetchedArtifact(typ, name string, ve manifest.VersionEntry) str
 	d := buildDirs(c.rootFor(typ))
 	switch typ {
 	case manifest.TypeBinary:
-		path, _ := binaryDestPath(d, name, ve)
+		path, _ := binaryLocalPath(c, name, ve)
 		return path
 	case manifest.TypeCargo:
 		return cargoCratePath(d, name, ve)

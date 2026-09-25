@@ -152,7 +152,7 @@ risk:
   move derives refuse it again for a manifest written before the check. The
   fetch also refuses a version that is not one directory, a package name that
   is not a clean relative path, and a destination that resolves through a
-  symlink to outside the build root. Unchecked, a `filename` of
+  symlink to outside the configured build root, a link at `binaries/` included. Unchecked, a `filename` of
   `../../../../escaped` writes outside the build root and reports success, and
   planting one takes manifest-write access: an operator's token, or write
   access to the store itself. See [usage.md](usage.md#binary-specific-fields)
