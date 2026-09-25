@@ -230,7 +230,12 @@ risk:
   `zfs get aclmode,aclinherit <dataset>` shows what a dataset has. The
   property still decides what a published object carries: under
   `aclinherit=passthrough` a fresh object keeps what its directory hands down,
-  as a file created there by hand would.
+  as a file created there by hand would. On FreeBSD a filesystem that keeps
+  no ACL at all, a UFS mounted without `acls` or `nfsv4acls`, gives that
+  read-back nothing to confirm, so every replacement there fails before its
+  body is written and leaves the previous object in place; a fresh object
+  still lands. Keep a FreeBSD storage root on ZFS or on a UFS mounted with
+  either option.
 - **Opaque CI fetches.** A `bodega serve` instance is the single place to look
   when answering "what did our build pull from the internet?" The audit DB
   records every fetch event with client IP, package name, version, and

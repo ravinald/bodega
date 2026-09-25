@@ -442,6 +442,67 @@ func TestFreeBSDGuestRestrictStagedLeavesNoNamedEntry(t *testing.T) {
 	}
 }
 
+// guestNoACLEnv names the filesystem the no-ACL test runs on, which the ACL
+// tests above refuse: a UFS mounted without acls or nfsv4acls.
+const guestNoACLEnv = "ufs-noacl"
+
+// A filesystem that reports neither ACL type gives clearACL nothing to read
+// back, so it refuses, and a replacement there fails before its body is
+// written. The previous object is what the failure leaves, byte for byte and
+// mode for mode, and no staging enclosure outlives it. A fresh object is not
+// staged in an enclosure and still publishes.
+func TestFreeBSDGuestNoACLFilesystemRefusesAReplacement(t *testing.T) {
+	if fs := os.Getenv(guestFSEnv); fs != guestNoACLEnv {
+		t.Skipf("%s=%q; this test runs where test/e2e/suites/48-freebsd-server.sh sets it to %s", guestFSEnv, fs, guestNoACLEnv)
+	}
+	dir := t.TempDir()
+	var sfs unix.Statfs_t
+	if err := unix.Statfs(dir, &sfs); err != nil {
+		t.Fatalf("statfs %s: %v", dir, err)
+	}
+	if got := unix.ByteSliceToString(sfs.Fstypename[:]); got != "ufs" {
+		t.Fatalf("TMPDIR (%s) is on %s; %s=%s names ufs", dir, got, guestFSEnv, guestNoACLEnv)
+	}
+	f := guestFile(t, dir, "probe")
+	if got, err := aclTypeOfFd(int(f.Fd())); err != nil || got != 0 {
+		t.Fatalf("aclTypeOfFd = %s (%v); this test needs a UFS mounted without acls or nfsv4acls", aclTypeName(got), err)
+	}
+	if err := clearACL(int(f.Fd())); err == nil {
+		t.Error("clearACL returned nil on a filesystem that reports neither ACL type")
+	}
+
+	root := filepath.Join(dir, "store")
+	l := NewLocal(root)
+	ctx := t.Context()
+	if err := l.Put(ctx, "obj", []byte("PRIOR BODY\n")); err != nil {
+		t.Fatalf("a fresh object on a filesystem without ACLs: %v", err)
+	}
+	obj := filepath.Join(root, "obj")
+	if err := os.Chmod(obj, 0o640); err != nil {
+		t.Fatalf("chmod %s: %v", obj, err)
+	}
+	if err := l.Put(ctx, "obj", []byte("REPLACEMENT BODY\n")); err == nil {
+		t.Error("a replacement published on a filesystem whose staging inode cannot be confirmed free of inherited grants")
+	} else {
+		t.Logf("replacement refused: %v", err)
+	}
+	if got, err := os.ReadFile(obj); err != nil || string(got) != "PRIOR BODY\n" {
+		t.Errorf("after the refused replacement the object reads %q (%v), want the prior body", got, err)
+	}
+	if fi, err := os.Stat(obj); err != nil || fi.Mode().Perm() != 0o640 {
+		t.Errorf("after the refused replacement the object is %v (%v), want 0640", fi.Mode().Perm(), err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("read %s: %v", root, err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), tmpPrefix) {
+			t.Errorf("the refused replacement left %s behind", e.Name())
+		}
+	}
+}
+
 // extattr_list_fd answers with one length byte per name, the name, no
 // terminator and no namespace. The names here span a length byte above 0x7f,
 // and the answer is checked twice: raw, against that format, and through

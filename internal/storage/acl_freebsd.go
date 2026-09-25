@@ -119,14 +119,21 @@ func aclTypeOfFd(fd int) (uint32, error) {
 // Either way the ACL is read back afterwards. A strip that returned success
 // and left a grant behind is the failure this exists to prevent, and the
 // syscall's answer alone has already been wrong about that once.
+//
+// A filesystem that reports neither type is refused rather than passed. The
+// strip is only as good as the read-back that confirms it, and there is
+// nothing to read back: a filesystem that keeps no ACL and one whose answer
+// to fpathconf is wrong look the same from here, and passing the second is
+// the silent no-op this function replaced.
 func clearACL(fd int) error {
 	aclType, err := aclTypeOfFd(fd)
 	if err != nil {
 		return fmt.Errorf("remove the inherited ACL: %w", err)
 	}
 	if aclType == 0 {
-		// Nothing can be inherited on a filesystem that keeps no ACL.
-		return nil
+		return fmt.Errorf("the filesystem reports that it keeps neither NFSv4 nor POSIX.1e ACLs, so a staging inode on it " +
+			"cannot be read back to confirm it inherited no grant; the write is refused and the previous object is unchanged. " +
+			"Keep the storage root on ZFS, or on UFS mounted with -o acls or -o nfsv4acls")
 	}
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
