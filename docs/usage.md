@@ -25,9 +25,25 @@ Comprehensive documentation for the bodega package repository manager.
 
 ## Commands
 
-### `bodega init`
+### `bodega init [BACKEND]`
 
-Creates the S3 bucket with server-side encryption (AES-256), versioning enabled, and all public access blocked. Idempotent. Only needed when `storage_backend` is `"s3"`. Local storage requires no initialization.
+Creates and configures the bucket behind an `s3` backend: the default backend, or the `storage_backends` entry named as the argument. It refuses a backend on the `local` driver, which needs no initialization, even when the config carries a `bucket` key. Idempotent: each step prints lowercase when the bucket was already correct and UPPERCASE when this run changed it.
+
+```text
+Initializing bucket s3://example-bodega-artifacts in us-west-2 (backend "default")...
+  bucket:     CREATED s3://example-bodega-artifacts
+  public acl: CONFIGURED (all blocked)
+  versioning: ENABLED
+  encryption: CONFIGURED (AES-256)
+  lifecycle:  CONFIGURED (abort multipart after 7d, noncurrent versions after 30d, manifests/ kept)
+  binaries/              CREATED
+  ...
+```
+
+It sets SSE-S3 (AES-256) encryption, versioning, a full public access block and two lifecycle rules, then writes a zero-byte marker under each prefix in [Storage Layout](#storage-layout). Versioning is on because it is the only protection a manifest has against whoever can already write it: a rewrite leaves the previous version in place, and the runtime policy withholds the one action that removes it. See [S3 setup](#s3-setup) for the policies, the lifecycle rules and their retention.
+
+- `bodega init --print-policy` prints the two IAM policies, setup and runtime, and changes nothing. `--print-policy=setup` or `--print-policy=runtime` prints one as bare JSON, ready to redirect into a file.
+- `bodega init check [BACKEND]` asks the bucket whether the current credentials hold the runtime policy, and names each action the API refused. It changes nothing.
 
 ### `bodega build fetch [TYPE...] [NAME]`
 
@@ -2424,7 +2440,7 @@ bodega supports two storage backends:
 
 - **`local`** (default): Stores artifacts on the local filesystem. Set `storage_path` to change the root directory (default: `/var/lib/bodega`). No initialization needed, and no bucket: every command that touches storage runs without one.
   It is the only backend that carries per-object access state, and the only one on which a `chmod`, a `chgrp` or a `setfacl` you applied to a single artifact survives the next refill. See [Publication and access](#publication-and-access).
-- **`s3`**: Stores artifacts in an S3 bucket. Set `bucket` and `region`, then run `bodega init` to create the bucket with encryption and versioning.
+- **`s3`**: Stores artifacts in an S3 bucket. Set `bucket` and `region`, then run `bodega init` to create the bucket with encryption, versioning and lifecycle rules. Versioning is what a rewritten manifest's previous version survives in, so do not switch it off as a cost; the lifecycle rules already bound what it costs. See [S3 setup](#s3-setup).
 
 Manifests follow the backend. On `s3` they live under the `manifests/` prefix in the bucket; on `local` they live in `manifest_dir` on disk, which is also what `--local-config` selects against any backend.
 
@@ -2434,6 +2450,105 @@ A backend that fails to construct is not fatal for `bodega serve`. The server st
 ERROR storage backend unavailable — package routes will answer 503; the API and /healthz still serve
   backend=local config=/etc/bodega/config.json error=create storage root /dev/null/nope: mkdir /dev/null: not a directory
 ```
+
+#### S3 setup
+
+**Credentials** come from the AWS default chain: `AWS_ACCESS_KEY_ID` and its siblings in the environment, `AWS_PROFILE` naming a profile in the shared config (SSO profiles included), or an instance or task role. bodega holds no AWS credential of its own. `region` in the config (or `AWS_REGION`) must be the bucket's region; a bucket in another region answers with a redirect that reads like a permissions failure, and `bodega init check` names it instead. A `storage_backends` entry with no `region` does not inherit the global one: the AWS SDK resolves it from `AWS_REGION`, `AWS_DEFAULT_REGION` or the profile's `region`, in the service and in every `bodega init` verb alike, and each verb prints the region it resolved. When none of those names a region, `bodega init` refuses the entry rather than guess.
+
+**Two policies, because there are two people.** Whoever creates buckets and IAM policies is often not whoever runs bodega, so `bodega init --print-policy` prints one policy for each. Both are derived from the SDK calls bodega makes, not written by hand, so a call added to bodega is a policy line added to the output.
+
+The setup policy is for whoever runs `bodega init`. It creates and configures the bucket and writes the prefix markers, and it cannot delete the bucket:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Bucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:CreateBucket",
+        "s3:GetBucketPublicAccessBlock",
+        "s3:GetBucketVersioning",
+        "s3:GetEncryptionConfiguration",
+        "s3:GetLifecycleConfiguration",
+        "s3:ListBucket",
+        "s3:PutBucketPublicAccessBlock",
+        "s3:PutBucketVersioning",
+        "s3:PutEncryptionConfiguration",
+        "s3:PutLifecycleConfiguration"
+      ],
+      "Resource": "arn:aws:s3:::example-bodega-artifacts"
+    },
+    {
+      "Sid": "Objects",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject"],
+      "Resource": "arn:aws:s3:::example-bodega-artifacts/*"
+    }
+  ]
+}
+```
+
+The runtime policy is for the service:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Bucket",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::example-bodega-artifacts"
+    },
+    {
+      "Sid": "Objects",
+      "Effect": "Allow",
+      "Action": ["s3:AbortMultipartUpload", "s3:DeleteObject", "s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::example-bodega-artifacts/*"
+    }
+  ]
+}
+```
+
+It carries no bucket-configuration action, so a compromised service cannot switch off the public access block or versioning. It carries `s3:DeleteObject` and not `s3:DeleteObjectVersion`, so a compromised service can remove the current object and cannot remove the versions before it. That gap is deliberate and a test holds it: [the threat model](threat-model.md) concedes that the MD5 sidecar beside a manifest detects an edit and not an attacker, and the earlier version is what survives one. `s3:AbortMultipartUpload` is there for uploads above 16 MiB, which go up in parts.
+
+Two SDK calls are authorized by an action with a different name, which is where a policy written by hand usually goes wrong: `HeadBucket` needs `s3:ListBucket`, and `HeadObject` needs `s3:GetObject`.
+
+**`bodega init check`** answers "can the service start with these credentials". It probes listing (`s3:ListBucket`) and reading (`s3:GetObject`) directly, and writing (`s3:PutObject`) with a conditional `PUT` against the empty `manifests/` marker, which S3 authorizes and then refuses with `412` without storing anything. Deleting cannot be proven without deleting, so `check` reports it as not checked. Each refused action is printed with the resource to grant it on, and the command exits non-zero:
+
+```text
+Checking s3://example-bodega-artifacts in us-west-2 (backend "default") with the current AWS credentials...
+  list:       allowed (s3:ListBucket)
+  read:       allowed (s3:GetObject)
+  write:      refused by the API (AccessDenied); grant s3:PutObject on arn:aws:s3:::example-bodega-artifacts/*
+  delete:     not checked: s3:DeleteObject and s3:AbortMultipartUpload cannot be proven without a write
+Error: these credentials lack s3:PutObject; `bodega init --print-policy=runtime` prints the policy that grants them. If it was attached in the last minute, re-run this check once before changing it
+```
+
+A run with nothing refused exits 0 and closes on what it proved, not on a claim that the service will work, because deleting always goes unprobed:
+
+```text
+On s3://example-bodega-artifacts these credentials were allowed s3:ListBucket, s3:GetObject, s3:PutObject; not checked: s3:DeleteObject, s3:AbortMultipartUpload.
+```
+
+Without the empty `manifests/` marker `bodega init` creates, the write probe has nothing to test against, so `s3:PutObject` joins the not-checked list and a second line says to run `bodega init` and check again.
+
+Two things make a correct policy look broken. A policy attached in the last few seconds may not have propagated, so re-run once before editing it. And an error raised before a request reaches the API (no credentials resolved, an expired SSO session, a dead network) is not a refusal: `check` reports it as "no answer from the S3 API" and draws no conclusion about the policy.
+
+**Lifecycle.** `bodega init` keeps two kinds of rule on the bucket, each with an ID starting `bodega-`:
+
+| Rule                               | Scope                                                                                     | Retention                           |
+| ---------------------------------- | ----------------------------------------------------------------------------------------- | ----------------------------------- |
+| Abort incomplete multipart uploads | the whole bucket                                                                          | 7 days after the upload began       |
+| Expire noncurrent versions         | each prefix in [Storage Layout](#storage-layout) except `manifests/`, one rule per prefix | 30 days after a version is replaced |
+
+A multipart upload that dies partway leaves parts that are billed, appear in no listing and serve nothing; the first rule clears them. The second bounds what versioning costs where history is worth nothing: under an artifact prefix, a noncurrent version is a byte-identical replacement or a catalogue upstream has since replaced. `manifests/` keeps every version, for the reason the runtime policy withholds `s3:DeleteObjectVersion`. S3 lifecycle filters take a prefix and no wildcard, so "everything except `manifests/`" is one rule per prefix.
+
+Rules whose ID does not start with `bodega-` are yours, and `bodega init` writes them back unchanged. A `bodega-` rule edited on the bucket is drift, and the next `bodega init` rewrites it; the retention periods are `AbortIncompleteMultipartDays` and `NoncurrentVersionDays` in `internal/s3/init.go`. A named backend with a `prefix` gets its rules and markers at the bucket root, not under the prefix, so its noncurrent versions do not expire.
+
+**S3-compatible stores** (SeaweedFS, Garage and the like) are untested, not unsupported. bodega speaks S3 through the AWS SDK, so the endpoint comes from the SDK's own settings: `AWS_ENDPOINT_URL_S3` or `AWS_ENDPOINT_URL` in the environment, or `endpoint_url` in the shared config profile. bodega has no endpoint key of its own, and it sets no path-style addressing option, which some of those stores need.
 
 ### Publication and access
 
@@ -2478,7 +2593,7 @@ What differs per backend is access, and it differs in the direction that matters
 }
 ```
 
-Per backend: `driver` is required and is one of the same values `storage_backend` takes. `path` is read by `local`; `bucket` and `region` by `s3`; `prefix` roots every key under it, on either driver.
+Per backend: `driver` is required and is one of the same values `storage_backend` takes. `path` is read by `local`; `bucket` and `region` by `s3`; `prefix` roots every key under it, on either driver. An `s3` entry without `region` takes the one the AWS SDK resolves, not the global `region`; see [S3 setup](#s3-setup).
 
 A `prefix` must be spelled canonically. A leading and a trailing `/` are stripped, so `cold/x`, `/cold/x` and `cold/x/` are one prefix and all three load. An empty segment or a `.` segment is refused, because they are a second spelling of a directory rather than a second directory:
 
@@ -4868,6 +4983,8 @@ A name containing a slash is encoded to `--` for every type **except gomod**, wh
 | helm      | `charts/`       | `charts/ingress-nginx-4.11.0.tgz`                                               |
 | npm       | `npm/`          | `npm/lodash/lodash-4.17.21.tgz`                                                 |
 | cargo     | `cargo/crates/` | `cargo/crates/serde-1.0.200.crate`                                              |
+| cargo     | `cargo/index/`  | `cargo/index/se/rd/serde`                                                       |
+| distfiles | `distfiles/`    | `distfiles/zsh-5.9.2.tar.xz`                                                    |
 | freebsd   | `freebsd/`      | `freebsd/FreeBSD:14:amd64/latest/All/Hashed/zogftw-2025.02.23_1~2$snxfrbid.pkg` |
 | manifests | `manifests/`    | `manifests/apt/python3/manifest.json`                                           |
 | index     | `index.json`    | Fast startup without loading every manifest                                     |

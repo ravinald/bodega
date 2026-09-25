@@ -253,14 +253,8 @@ func NewResolver(ctx context.Context, cfg *config.Config) (Resolver, error) {
 	}
 	sort.Strings(named)
 	for _, name := range named {
-		spec := cfg.StorageBackends[name]
-		store, err := NewFromSpec(ctx, Spec{
-			Driver: spec.Driver,
-			Path:   spec.Path,
-			Bucket: spec.Bucket,
-			Region: spec.Region,
-			Prefix: spec.Prefix,
-		})
+		spec, _ := SpecFor(cfg, name)
+		store, err := NewFromSpec(ctx, spec)
 		if err != nil {
 			return nil, fmt.Errorf("storage backend %q: %w", name, err)
 		}

@@ -86,7 +86,7 @@ A name containing a slash encodes to `--` for every type except gomod, which kee
 
 Each package gets its own manifest file at `manifests/{type}/{safeName}/manifest.json`. This replaces the old monolithic per-type JSON files and enables parallel operations without lock contention.
 
-One bucket. Versioning enabled. KMS encryption. Public access blocked.
+One bucket. Versioning enabled, because a rewritten manifest's previous version is the only copy an attacker who can write the manifest cannot also rewrite. SSE-S3 (AES-256) encryption, with no KMS option: a bucket policy that requires KMS refuses every write bodega makes. Public access blocked.
 
 ### Storage placement
 

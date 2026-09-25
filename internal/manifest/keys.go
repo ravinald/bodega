@@ -89,7 +89,9 @@ func StoragePrefixes() []string {
 	return []string{
 		BinaryPrefix,
 		cargoCratePrefix,
+		cargoIndexPrefix,
 		helmPrefix,
+		DistfilesPrefix,
 		FreeBSDPrefix,
 		gomodPrefix,
 		ManifestsPrefix,

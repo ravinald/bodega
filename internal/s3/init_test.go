@@ -14,6 +14,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+
+	"github.com/ravinald/bodega/internal/manifest"
 )
 
 // fakeBucket answers each SDK call from its fields and records the writes.
@@ -35,15 +37,20 @@ type fakeBucket struct {
 	encGetErr  error
 	encPutErr  error
 
+	lifecycle       []types.LifecycleRule
+	lifecycleGetErr error
+	lifecyclePutErr error
+
 	missing   map[string]bool
 	listErr   error
 	putObjErr error
 
-	created    *s3.CreateBucketInput
-	pabPut     bool
-	versionPut bool
-	encPut     bool
-	markers    []string
+	created     *s3.CreateBucketInput
+	pabPut      bool
+	versionPut  bool
+	encPut      bool
+	lifecycleIn *types.BucketLifecycleConfiguration
+	markers     []string
 }
 
 func newFake() *fakeBucket {
@@ -62,7 +69,8 @@ func newFake() *fakeBucket {
 				},
 			}},
 		},
-		missing: map[string]bool{},
+		lifecycle: LifecycleRules(),
+		missing:   map[string]bool{},
 	}
 }
 
@@ -109,6 +117,18 @@ func (f *fakeBucket) GetBucketEncryption(context.Context, *s3.GetBucketEncryptio
 func (f *fakeBucket) PutBucketEncryption(context.Context, *s3.PutBucketEncryptionInput, ...func(*s3.Options)) (*s3.PutBucketEncryptionOutput, error) {
 	f.encPut = true
 	return &s3.PutBucketEncryptionOutput{}, f.encPutErr
+}
+
+func (f *fakeBucket) GetBucketLifecycleConfiguration(context.Context, *s3.GetBucketLifecycleConfigurationInput, ...func(*s3.Options)) (*s3.GetBucketLifecycleConfigurationOutput, error) {
+	if f.lifecycleGetErr != nil {
+		return nil, f.lifecycleGetErr
+	}
+	return &s3.GetBucketLifecycleConfigurationOutput{Rules: f.lifecycle}, nil
+}
+
+func (f *fakeBucket) PutBucketLifecycleConfiguration(_ context.Context, in *s3.PutBucketLifecycleConfigurationInput, _ ...func(*s3.Options)) (*s3.PutBucketLifecycleConfigurationOutput, error) {
+	f.lifecycleIn = in.LifecycleConfiguration
+	return &s3.PutBucketLifecycleConfigurationOutput{}, f.lifecyclePutErr
 }
 
 func (f *fakeBucket) ListObjectsV2(_ context.Context, in *s3.ListObjectsV2Input, _ ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
@@ -277,6 +297,98 @@ func TestEnsureEncryption(t *testing.T) {
 				t.Errorf("PutBucketEncryption called = %v, want %v", f.encPut, tc.wantPut)
 			}
 		})
+	}
+}
+
+func TestEnsureLifecycle(t *testing.T) {
+	const changed = "  lifecycle:  CONFIGURED (abort multipart after 7d, noncurrent versions after 30d, manifests/ kept)\n"
+	operatorRule := types.LifecycleRule{
+		ID:         aws.String("operator-tmp"),
+		Status:     types.ExpirationStatusEnabled,
+		Filter:     &types.LifecycleRuleFilter{Prefix: aws.String("tmp/")},
+		Expiration: &types.LifecycleExpiration{Days: aws.Int32(1)},
+	}
+	edited := LifecycleRules()
+	edited[1].NoncurrentVersionExpiration = &types.NoncurrentVersionExpiration{NoncurrentDays: aws.Int32(3650)}
+	stale := append(LifecycleRules(), types.LifecycleRule{
+		ID: aws.String("bodega-expire-noncurrent-services"), Status: types.ExpirationStatusEnabled,
+		Filter:                      &types.LifecycleRuleFilter{Prefix: aws.String("services/")},
+		NoncurrentVersionExpiration: &types.NoncurrentVersionExpiration{NoncurrentDays: aws.Int32(30)},
+	})
+	cases := []struct {
+		name     string
+		mutate   func(*fakeBucket)
+		wantOut  string
+		wantPut  bool
+		wantErr  string
+		wantKept bool
+	}{
+		{name: "already configured", mutate: func(*fakeBucket) {}, wantOut: "  lifecycle:  configured\n"},
+		{name: "already configured beside an operator rule", mutate: func(f *fakeBucket) { f.lifecycle = append(f.lifecycle, operatorRule) }, wantOut: "  lifecycle:  configured\n"},
+		{name: "no configuration", mutate: func(f *fakeBucket) {
+			f.lifecycleGetErr = &smithy.GenericAPIError{Code: "NoSuchLifecycleConfiguration"}
+		}, wantOut: changed, wantPut: true},
+		{name: "operator rule survives the rewrite", mutate: func(f *fakeBucket) { f.lifecycle = []types.LifecycleRule{operatorRule} }, wantOut: changed, wantPut: true, wantKept: true},
+		{name: "a hand-edited bodega rule is drift", mutate: func(f *fakeBucket) { f.lifecycle = edited }, wantOut: changed, wantPut: true},
+		{name: "a rule for a retired prefix is drift", mutate: func(f *fakeBucket) { f.lifecycle = stale }, wantOut: changed, wantPut: true},
+		{name: "read fails refuses rather than overwrite unseen rules", mutate: func(f *fakeBucket) { f.lifecycleGetErr = errBoom }, wantErr: "read lifecycle configuration on b"},
+		{name: "write fails", mutate: func(f *fakeBucket) { f.lifecycle = nil; f.lifecyclePutErr = errBoom }, wantPut: true, wantErr: "put lifecycle configuration on b"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFake()
+			tc.mutate(f)
+			var out bytes.Buffer
+			err := ensureLifecycle(context.Background(), f, &out, "b")
+			checkStep(t, err, tc.wantErr != "", tc.wantErr, &out, tc.wantOut)
+			if (f.lifecycleIn != nil) != tc.wantPut {
+				t.Fatalf("PutBucketLifecycleConfiguration called = %v, want %v", f.lifecycleIn != nil, tc.wantPut)
+			}
+			if f.lifecycleIn == nil || tc.wantErr != "" {
+				return
+			}
+			if !lifecycleSatisfied(f.lifecycleIn.Rules, LifecycleRules()) {
+				t.Errorf("written rules do not satisfy LifecycleRules(): %+v", f.lifecycleIn.Rules)
+			}
+			kept := slices.ContainsFunc(f.lifecycleIn.Rules, func(r types.LifecycleRule) bool { return aws.ToString(r.ID) == "operator-tmp" })
+			if kept != tc.wantKept {
+				t.Errorf("operator rule kept = %v, want %v", kept, tc.wantKept)
+			}
+		})
+	}
+}
+
+// TestLifecycleKeepsManifestHistory pins the split: every artifact prefix
+// expires its noncurrent versions and manifests/ never does, because that
+// history is what survives whoever can rewrite a manifest.
+func TestLifecycleKeepsManifestHistory(t *testing.T) {
+	var abort int
+	expiring := map[string]bool{}
+	for _, r := range LifecycleRules() {
+		if r.Status != types.ExpirationStatusEnabled || r.Filter == nil {
+			t.Fatalf("rule %s is not an enabled prefix rule", aws.ToString(r.ID))
+		}
+		prefix := aws.ToString(r.Filter.Prefix)
+		if r.AbortIncompleteMultipartUpload != nil {
+			abort++
+			if prefix != "" || aws.ToInt32(r.AbortIncompleteMultipartUpload.DaysAfterInitiation) != AbortIncompleteMultipartDays {
+				t.Errorf("abort rule = prefix %q, %d days; want the bucket root", prefix, aws.ToInt32(r.AbortIncompleteMultipartUpload.DaysAfterInitiation))
+			}
+		}
+		if r.NoncurrentVersionExpiration != nil {
+			expiring[prefix] = true
+		}
+	}
+	if abort != 1 {
+		t.Errorf("%d abort-multipart rules, want 1", abort)
+	}
+	if expiring["manifests/"] || expiring[""] {
+		t.Errorf("noncurrent versions expire under manifests/ (or the whole bucket): %v", expiring)
+	}
+	for _, p := range manifest.StoragePrefixes() {
+		if p != manifest.ManifestsPrefix && !expiring[p] {
+			t.Errorf("artifact prefix %s keeps noncurrent versions forever", p)
+		}
 	}
 }
 

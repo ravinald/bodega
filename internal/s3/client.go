@@ -20,30 +20,52 @@ import (
 	"github.com/aws/smithy-go"
 )
 
+// ObjectAPI is every SDK call a running bodega makes against its bucket, and
+// RuntimePolicy grants exactly what these methods need. Client reaches the
+// SDK through nothing else, so a call added to client.go does not compile
+// until it is named here, and a method named here fails TestEveryCallMapsToAnAction
+// until it maps to an IAM action.
+//
+// The four multipart methods are manager.UploadAPIClient's, called by the
+// uploader above uploadPartSize rather than by this file.
+type ObjectAPI interface {
+	HeadObject(ctx context.Context, in *awss3.HeadObjectInput, optFns ...func(*awss3.Options)) (*awss3.HeadObjectOutput, error)
+	GetObject(ctx context.Context, in *awss3.GetObjectInput, optFns ...func(*awss3.Options)) (*awss3.GetObjectOutput, error)
+	PutObject(ctx context.Context, in *awss3.PutObjectInput, optFns ...func(*awss3.Options)) (*awss3.PutObjectOutput, error)
+	DeleteObject(ctx context.Context, in *awss3.DeleteObjectInput, optFns ...func(*awss3.Options)) (*awss3.DeleteObjectOutput, error)
+	ListObjectsV2(ctx context.Context, in *awss3.ListObjectsV2Input, optFns ...func(*awss3.Options)) (*awss3.ListObjectsV2Output, error)
+	CreateMultipartUpload(ctx context.Context, in *awss3.CreateMultipartUploadInput, optFns ...func(*awss3.Options)) (*awss3.CreateMultipartUploadOutput, error)
+	UploadPart(ctx context.Context, in *awss3.UploadPartInput, optFns ...func(*awss3.Options)) (*awss3.UploadPartOutput, error)
+	CompleteMultipartUpload(ctx context.Context, in *awss3.CompleteMultipartUploadInput, optFns ...func(*awss3.Options)) (*awss3.CompleteMultipartUploadOutput, error)
+	AbortMultipartUpload(ctx context.Context, in *awss3.AbortMultipartUploadInput, optFns ...func(*awss3.Options)) (*awss3.AbortMultipartUploadOutput, error)
+}
+
 // Client wraps the AWS S3 client with bootstrap-specific helpers.
 type Client struct {
-	s3     *awss3.Client
+	s3     ObjectAPI
+	raw    *awss3.Client
 	bucket string
 	region string
 }
 
-// NewClient creates an S3 Client using the default credential chain.
+// NewClient creates an S3 Client using the default credential chain. An
+// empty region is left to that chain (AWS_REGION, AWS_DEFAULT_REGION, the
+// profile's region), and Region reports what it resolved to, which may still
+// be empty.
 func NewClient(ctx context.Context, bucket, region string) (*Client, error) {
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
 		return nil, fmt.Errorf("load AWS config: %w", err)
 	}
-	return &Client{
-		s3:     awss3.NewFromConfig(cfg),
-		bucket: bucket,
-		region: region,
-	}, nil
+	return NewClientFromConfig(cfg, bucket, cfg.Region), nil
 }
 
 // NewClientFromConfig returns an S3 Client from a pre-built aws.Config.
 func NewClientFromConfig(cfg aws.Config, bucket, region string) *Client {
+	raw := awss3.NewFromConfig(cfg)
 	return &Client{
-		s3:     awss3.NewFromConfig(cfg),
+		s3:     raw,
+		raw:    raw,
 		bucket: bucket,
 		region: region,
 	}
@@ -51,10 +73,13 @@ func NewClientFromConfig(cfg aws.Config, bucket, region string) *Client {
 
 // S3Client exposes the underlying SDK client for commands that need direct
 // access (e.g. InitBucket).
-func (c *Client) S3Client() *awss3.Client { return c.s3 }
+func (c *Client) S3Client() *awss3.Client { return c.raw }
 
 // Bucket returns the configured bucket name.
 func (c *Client) Bucket() string { return c.bucket }
+
+// Region returns the region the client dials.
+func (c *Client) Region() string { return c.region }
 
 // ObjectStatus describes whether a key exists in S3.
 type ObjectStatus struct {
