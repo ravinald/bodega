@@ -3,6 +3,7 @@ package manifest
 import (
 	"context"
 	"crypto/md5" //nolint:gosec // MD5 used for manifest integrity, not cryptographic security.
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -171,6 +172,28 @@ func (s *Store) VerifyIntegrity(ctx context.Context) ([]IntegrityResult, error) 
 
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out, nil
+}
+
+// ReadPackageObject parses the package manifest stored at a store-relative
+// object name such as VerifyIntegrity returns. It reads the backend directly,
+// past the index and the cache, so a check over it covers the objects the store
+// holds rather than the ones the index lists: a manifest saved without an index
+// update, or restored by hand, is still read. It returns nil, nil for an object
+// that has gone since it was listed.
+func (s *Store) ReadPackageObject(ctx context.Context, name string) (*PackageManifest, error) {
+	b := s.resolveBackend()
+	data, err := b.Read(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("read %s from %s: %w", name, b.Label(), err)
+	}
+	if data == nil {
+		return nil, nil
+	}
+	var pm PackageManifest
+	if err := json.Unmarshal(data, &pm); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", name, err)
+	}
+	return &pm, nil
 }
 
 // RestampMD5 recomputes the sidecar for every manifest of one package type,

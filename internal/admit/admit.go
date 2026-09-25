@@ -117,6 +117,9 @@ func validate(cfg *config.Config, pm *manifest.PackageManifest, res *Result) err
 	if !manifest.IsKnownType(pm.Type) {
 		return fmt.Errorf("unknown type %q — must be one of: %s", pm.Type, strings.Join(manifest.AllTypes, ", "))
 	}
+	if err := manifest.ValidateBinaryFilenames(pm); err != nil {
+		return err
+	}
 	// A storage_policy naming nothing fails at the next upload, long after the
 	// edit that introduced it and with no obvious connection back to it.
 	if err := CheckBackendName(cfg, pm.StoragePolicy); err != nil {

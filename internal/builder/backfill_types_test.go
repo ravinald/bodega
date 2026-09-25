@@ -18,7 +18,7 @@ var globTypes = []string{manifest.TypeApt, manifest.TypePypi}
 // never had a size backfilled and nothing said so.
 func TestArtifactPathForVersionCoversEveryType(t *testing.T) {
 	cfg := &Config{}
-	ve := manifest.VersionEntry{Version: "1.0.0", Ref: "v1.0.0"}
+	ve := manifest.VersionEntry{Version: "1.0.0", Ref: "v1.0.0", URL: "https://example.com/example-pkg-1.0.0.tgz"}
 
 	for _, typ := range manifest.AllTypes {
 		got := artifactPathForVersion(cfg, typ, "example-pkg", ve)

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 
@@ -12,13 +14,20 @@ import (
 func newVerifyCmd(gf *globalFlags) *cobra.Command {
 	return &cobra.Command{
 		Use:   "verify",
-		Short: "Verify every manifest against its .md5 sidecar",
+		Short: "Verify every manifest against its .md5 sidecar, and every binary filename",
 		Long: `verify reads each manifest object in the store and checks that its companion
 .md5 file contains the correct MD5 digest.
 
 A manifest with no sidecar is UNVERIFIABLE, not a pass: nothing was compared,
 so an edit to it would go unnoticed. verify exits non-zero when any manifest
-fails or cannot be verified.`,
+fails or cannot be verified.
+
+It then reads every binary manifest the store holds, listed in the index or
+not, and checks each version's filename override, which must be a clean
+relative path. A manifest it cannot parse is UNCHECKED. One carrying a parent reference, an absolute path, an
+empty or "." segment, a backslash or a NUL is INVALID:
+the fetch refuses that version and any write of its manifest is refused until
+the filename is corrected.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store, err := loadStore(gf)
 			if err != nil {
@@ -35,7 +44,7 @@ fails or cannot be verified.`,
 				return nil
 			}
 
-			return reportIntegrity(out, results)
+			return errors.Join(reportIntegrity(out, results), reportBinaryFilenames(backgroundCtx(), out, store, results))
 		},
 	}
 }
@@ -96,4 +105,47 @@ func restampArg(typ string) string {
 		return breakGlassAll
 	}
 	return typ
+}
+
+// reportBinaryFilenames prints one row per binary version whose filename
+// override manifest.ValidateBinaryFilename refuses, and returns a non-nil error
+// when there is any. The store's writers refuse such a filename, so a row here
+// is a manifest written before they did, or edited by hand.
+//
+// It reads the objects the integrity pass listed, not the index, so both
+// passes cover the same set: a manifest missing from the index is one re-index
+// away from being fetched, and its valid sidecar says nothing about its
+// filename. A manifest it cannot parse is reported rather than skipped, since
+// the integrity pass compares bytes and never parses them.
+func reportBinaryFilenames(ctx context.Context, out io.Writer, store *manifest.Store, results []manifest.IntegrityResult) error {
+	var invalid int
+	row := func(status, subject string, err error) {
+		if invalid == 0 {
+			fmt.Fprintf(out, "\nBinary filenames:\n")
+		}
+		invalid++
+		fmt.Fprintf(out, "  %-12s %s  (%v)\n", status, subject, err)
+	}
+	for _, r := range results {
+		if r.Type != manifest.TypeBinary {
+			continue
+		}
+		pm, err := store.ReadPackageObject(ctx, r.Path)
+		if err != nil {
+			row("UNCHECKED", r.Path, err)
+			continue
+		}
+		if pm == nil {
+			continue
+		}
+		for _, ve := range pm.Versions {
+			if err := manifest.ValidateBinaryFilename(ve.Filename); err != nil {
+				row("INVALID", fmt.Sprintf("%s/%s@%s", manifest.TypeBinary, pm.Name, ve.Version), err)
+			}
+		}
+	}
+	if invalid > 0 {
+		return fmt.Errorf("%d binary version(s) carry a filename the fetch refuses, or could not be checked", invalid)
+	}
+	return nil
 }

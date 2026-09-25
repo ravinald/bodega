@@ -74,8 +74,8 @@ func BackfillArtifactSizes(cfg *Config, store *manifest.Store, out io.Writer) in
 func artifactPathForVersion(cfg *Config, typ, name string, ve manifest.VersionEntry) string {
 	switch typ {
 	case manifest.TypeBinary:
-		d := buildDirs(cfg.rootFor(typ))
-		return binaryDestPath(d, name, ve)
+		path, _ := binaryLocalPath(cfg, name, ve)
+		return path
 	case manifest.TypeGit:
 		d := buildDirs(cfg.rootFor(typ))
 		if ve.IsRelease() {
