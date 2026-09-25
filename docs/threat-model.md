@@ -212,6 +212,22 @@ risk:
   from the body, and a test of a redirect asserts it on the `Location`
   header separately, since that is a different code path carrying the same
   string.
+- **A secret an operator writes into configuration.** `gomod_upstream`,
+  `npm_upstream`, `pypi_upstream`, `cargo_upstream`, `cargo_dl_upstream`
+  and each `apt_upstreams` `url` accept userinfo, so a private index can be
+  configured as `https://user:secret@pypi.internal`, and bodega fetches with
+  it as written. `git_upstreams` and `binary_upstreams` refuse userinfo, a
+  query and a fragment when the config loads. The manifest `url` rule
+  applies unchanged: a response a caller with no token can reach names a
+  configured upstream only through `manifest.PublicURL`. One route quotes
+  one today: a pypi wheel no manifest names answers 404 naming the simple
+  index bodega would have read, cut, and logs the refusal with the index
+  through `url.Redacted`, which masks the password and keeps the username.
+  Every other configured upstream reaches the operator log (the fetch
+  failure lines carry it as written), the discovery row and the audit
+  record, and no response body. `/api/v1/audit` and `/api/v1/config`
+  answer inside `admin_permit_cidr` only, so the stored URL is behind the
+  same boundary as a stored manifest `url`.
 
   What a caller sees depends on which of four boundaries the response sits
   behind, and a bearer token decides only the last of them:
