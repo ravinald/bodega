@@ -213,6 +213,24 @@ risk:
   without its credential. Userinfo is the only credential form this covers: a
   query-string token in a `url`, or a credential in a version's `metadata`
   such as an `attestation_uri`, is published as written.
+- **A replacement read while it is being written.** On a `local` backend a
+  replacement is written to a staging file inside a directory of its own, and
+  both are reduced to their mode bits before the first byte lands: every ACL
+  entry the storage root handed down is taken away, so the body is readable by
+  the server's own user and nobody else until the rename publishes it under
+  the object's own access state. On ZFS a `chmod` alone does that only at some
+  settings of the dataset's `aclmode`, which bodega's config does not set and
+  no error reports: `discard`, the default, drops the inherited entries,
+  `restricted` refuses the `chmod`, and `passthrough` keeps them, which would
+  let `www` read a replacement mid-write from a root carrying
+  `user:www:rx:fd:allow`, including one whose object denies `www`. Bodega
+  therefore sets the trivial NFSv4 ACL itself and reads it back, whatever the
+  property says, and a staging inode that still carries a named or inheritable
+  entry fails the write and leaves the previous object as it was.
+  `zfs get aclmode,aclinherit <dataset>` shows what a dataset has. The
+  property still decides what a published object carries: under
+  `aclinherit=passthrough` a fresh object keeps what its directory hands down,
+  as a file created there by hand would.
 - **Opaque CI fetches.** A `bodega serve` instance is the single place to look
   when answering "what did our build pull from the internet?" The audit DB
   records every fetch event with client IP, package name, version, and

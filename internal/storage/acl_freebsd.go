@@ -3,7 +3,6 @@
 package storage
 
 import (
-	"errors"
 	"fmt"
 	"unsafe"
 
@@ -101,40 +100,60 @@ func aclTypeOfFd(fd int) (uint32, error) {
 }
 
 // clearACL takes away an ACL an inode inherited from the directory it was
-// created in. A new file is born with the parent's default ACL as its own
-// access ACL, and a new directory is born with both.
+// created in, in whichever type the filesystem keeps.
 //
-// The access ACL is reduced to the three entries the mode bits already grant
-// rather than deleted: a minimal ACL is what every POSIX.1e implementation
-// holds for a file with no entries past the mode, while __acl_delete_fd's
-// answer for ACL_TYPE_ACCESS is the filesystem's to decide. The default ACL
-// exists only on a directory and has no minimal form, so that one is deleted.
+// An NFSv4 inode (ZFS, UFS mounted -o nfsv4acls) is born carrying every
+// inheritable entry of its parent, and a chmod does not take them away
+// everywhere: ZFS at aclmode=passthrough keeps them, so a mode of 0600 still
+// lets a named user in. The ACL is set to its trivial form rather than
+// deleted, because __acl_delete_fd(ACL_TYPE_NFS4) on ZFS returns success and
+// leaves every entry in place.
+//
+// A POSIX.1e access ACL is reduced to the three entries the mode bits already
+// grant rather than deleted: a minimal ACL is what every POSIX.1e
+// implementation holds for a file with no entries past the mode, while
+// __acl_delete_fd's answer for ACL_TYPE_ACCESS is the filesystem's to decide.
+// The default ACL exists only on a directory and has no minimal form, so that
+// one is deleted.
+//
+// Either way the ACL is read back afterwards. A strip that returned success
+// and left a grant behind is the failure this exists to prevent, and the
+// syscall's answer alone has already been wrong about that once.
 func clearACL(fd int) error {
+	aclType, err := aclTypeOfFd(fd)
+	if err != nil {
+		return fmt.Errorf("remove the inherited ACL: %w", err)
+	}
+	if aclType == 0 {
+		// Nothing can be inherited on a filesystem that keeps no ACL.
+		return nil
+	}
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
 		return err
 	}
-	if err := aclSyscall(unix.SYS___ACL_SET_FD, fd, aclTypeAccess, minimalACL(uint32(st.Mode))); err != nil && !unsupportedACL(err) {
-		return fmt.Errorf("remove the inherited ACL: %w", err)
+	name := aclTypeName(aclType)
+	strip := minimalACL(uint32(st.Mode))
+	if aclType == aclTypeNFS4 {
+		strip = trivialNFS4ACL(uint32(st.Mode))
 	}
-	if st.Mode&unix.S_IFMT != unix.S_IFDIR {
-		return nil
+	if err := aclSyscall(unix.SYS___ACL_SET_FD, fd, int(aclType), strip); err != nil {
+		return fmt.Errorf("remove the inherited %s ACL: %w", name, err)
 	}
-	_, _, errno := unix.Syscall(unix.SYS___ACL_DELETE_FD, uintptr(fd), uintptr(aclTypeDefault), 0)
-	if errno != 0 && !unsupportedACL(errno) {
-		return fmt.Errorf("remove the inherited default ACL: %w", errno)
+	if aclType == aclTypeAccess && st.Mode&unix.S_IFMT == unix.S_IFDIR {
+		if _, _, errno := unix.Syscall(unix.SYS___ACL_DELETE_FD, uintptr(fd), uintptr(aclTypeDefault), 0); errno != 0 {
+			return fmt.Errorf("remove the inherited default ACL: %w", errno)
+		}
+	}
+	got := blankACL()
+	if err := aclSyscall(unix.SYS___ACL_GET_FD, fd, int(aclType), got); err != nil {
+		return fmt.Errorf("read back the %s ACL after removing what it inherited: %w", name, err)
+	}
+	if i, ok := grantBeyondMode(got); ok {
+		return fmt.Errorf("the %s ACL still carries a named or inheritable entry (entry %d) after the filesystem accepted a trivial one; "+
+			"the staging inode would be readable past its mode, so the write is refused", name, i)
 	}
 	return nil
-}
-
-// unsupportedACL reports a filesystem that keeps no POSIX.1e ACL: UFS mounted
-// without acls, and ZFS, which keeps an NFSv4 ACL instead and refuses the
-// POSIX.1e types outright. Only clearACL may read it that way, since a staging
-// inode that cannot carry a POSIX.1e ACL has none to strip. It cannot tell a
-// filesystem with no ACL from one keeping the other type, so reading or
-// carrying an object's ACL asks aclTypeOfFd instead.
-func unsupportedACL(err error) bool {
-	return errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EINVAL)
 }
 
 func aclSyscall(trap uintptr, fd, aclType int, acl []byte) error {

@@ -48,8 +48,9 @@ const (
 //
 // Fchmod alone does not strip one. A macOS ACE carrying file_inherit or
 // directory_inherit is copied onto the new inode and grants regardless of the
-// mode bits, and a Linux default ACL arrives as an access ACL the new inode
-// owns. Either one hands a reader the replacement body while it is being
+// mode bits, a Linux default ACL arrives as an access ACL the new inode owns,
+// and ZFS at aclmode=passthrough keeps every inherited NFSv4 entry through a
+// chmod. Each one hands a reader the replacement body while it is being
 // written, under a grant the object being replaced never gave.
 func restrictStaged(f *os.File, perm uint32) error {
 	fd := int(f.Fd())

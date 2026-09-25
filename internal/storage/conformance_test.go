@@ -902,6 +902,51 @@ func TestMinimalACLIsTheModeBitsAndNothingNamed(t *testing.T) {
 	}
 }
 
+func TestTrivialNFS4ACLIsTheModeBitsAndNothingNamed(t *testing.T) {
+	t.Parallel()
+	acl := trivialNFS4ACL(0o751)
+	if err := checkStructACL(aclTypeNFS4, acl); err != nil {
+		t.Fatalf("trivialNFS4ACL built a struct acl __acl_set_fd would refuse: %v", err)
+	}
+	if i, ok := grantBeyondMode(acl); ok {
+		t.Errorf("entry %d of trivialNFS4ACL grants past the mode", i)
+	}
+	// getfacl -n on a ZFS directory chmod'd 0751: rwxp--aARWcCos, r-x---a-R-c--s
+	// and --x---a-R-c--s, every one an allow with no flags.
+	for i, want := range []struct{ tag, perm uint32 }{
+		{tagUserObj, 0xF6F9},
+		{tagGroupObj, 0x9249},
+		{tagEveryone, 0x9241},
+	} {
+		off := aclEntryStart + i*aclEntrySize
+		tag := binary.NativeEndian.Uint32(acl[off : off+4])
+		perm := binary.NativeEndian.Uint32(acl[off+8 : off+12])
+		kind := binary.NativeEndian.Uint16(acl[off+12 : off+14])
+		flags := binary.NativeEndian.Uint16(acl[off+14 : off+16])
+		if tag != want.tag || perm != want.perm || kind != entryAllow || flags != 0 {
+			t.Errorf("entry %d = {tag %#x, perm %#x, type %#x, flags %#x}, want {tag %#x, perm %#x, allow, no flags}",
+				i, tag, perm, kind, flags, want.tag, want.perm)
+		}
+	}
+}
+
+func TestGrantBeyondModeFindsANamedOrInheritableEntry(t *testing.T) {
+	t.Parallel()
+	named := trivialNFS4ACL(0o600)
+	binary.NativeEndian.PutUint32(named[aclEntryStart+aclEntrySize:], tagUser)
+	if i, ok := grantBeyondMode(named); !ok || i != 1 {
+		t.Errorf("grantBeyondMode on a named entry at 1 = %d, %v", i, ok)
+	}
+	inheritable := trivialNFS4ACL(0o700)
+	binary.NativeEndian.PutUint16(inheritable[aclEntryStart+2*aclEntrySize+14:], 0x0080)
+	if i, ok := grantBeyondMode(inheritable); !ok || i != 2 {
+		t.Errorf("grantBeyondMode on an inherited everyone@ at 2 = %d, %v", i, ok)
+	}
+	if _, ok := grantBeyondMode(minimalACL(0o640)); ok {
+		t.Error("grantBeyondMode flagged a minimal POSIX.1e ACL")
+	}
+}
+
 func TestCheckStructACLRefusesABlobTheKernelWould(t *testing.T) {
 	t.Parallel()
 	if err := checkStructACL(aclTypeAccess, make([]byte, aclSize)); err == nil {

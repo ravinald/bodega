@@ -30,6 +30,14 @@ const guestFSEnv = "BODEGA_FREEBSD_GUEST_FS"
 
 // nobodyUID is the named principal every fixture here grants or denies. It is
 // never the test process, as root or as the unprivileged user the suite runs.
+//
+// These tests compare ACL structure: what the kernel stored, and what it reads
+// back. They say nothing about access, and on ZFS they could not: ZFS on
+// FreeBSD 15.1 ignores entries naming uid 65534 in both directions, so a deny
+// for nobody on a 0644 file leaves it readable and an allow on a 0600 file
+// grants nothing. Structure is all these need, and nobody exists on every
+// FreeBSD host without the suite creating an account. Whether an entry grants
+// or denies a read is test/e2e/guest's to prove, as a principal ZFS honors.
 const nobodyUID = 65534
 
 // guestACLType returns the acl_type_t the filesystem under TMPDIR must keep,
@@ -195,6 +203,19 @@ int main(void) {
 	P("ACL_ENTRY_TYPE_DENY", ACL_ENTRY_TYPE_DENY);
 	P("ACL_ENTRY_TYPE_AUDIT", ACL_ENTRY_TYPE_AUDIT);
 	P("ACL_ENTRY_TYPE_ALARM", ACL_ENTRY_TYPE_ALARM);
+	P("ACL_EXECUTE", ACL_EXECUTE);
+	P("ACL_READ_DATA", ACL_READ_DATA);
+	P("ACL_WRITE_DATA", ACL_WRITE_DATA);
+	P("ACL_APPEND_DATA", ACL_APPEND_DATA);
+	P("ACL_READ_NAMED_ATTRS", ACL_READ_NAMED_ATTRS);
+	P("ACL_WRITE_NAMED_ATTRS", ACL_WRITE_NAMED_ATTRS);
+	P("ACL_READ_ATTRIBUTES", ACL_READ_ATTRIBUTES);
+	P("ACL_WRITE_ATTRIBUTES", ACL_WRITE_ATTRIBUTES);
+	P("ACL_READ_ACL", ACL_READ_ACL);
+	P("ACL_WRITE_ACL", ACL_WRITE_ACL);
+	P("ACL_WRITE_OWNER", ACL_WRITE_OWNER);
+	P("ACL_SYNCHRONIZE", ACL_SYNCHRONIZE);
+	P("ACL_ENTRY_INHERIT_FLAGS", ACL_ENTRY_FILE_INHERIT | ACL_ENTRY_DIRECTORY_INHERIT | ACL_ENTRY_NO_PROPAGATE_INHERIT | ACL_ENTRY_INHERIT_ONLY | ACL_ENTRY_INHERITED);
 	P("_PC_ACL_EXTENDED", _PC_ACL_EXTENDED);
 	P("_PC_ACL_NFS4", _PC_ACL_NFS4);
 	return 0;
@@ -224,35 +245,48 @@ int main(void) {
 		got[name] = n
 	}
 	want := map[string]int64{
-		"sizeof_acl":           aclSize,
-		"acl_maxcnt":           0,
-		"acl_cnt":              4,
-		"acl_entry":            aclEntryStart,
-		"sizeof_entry":         aclEntrySize,
-		"ae_tag":               0,
-		"ae_id":                4,
-		"ae_perm":              8,
-		"ae_entry_type":        12,
-		"ae_flags":             14,
-		"ACL_MAX_ENTRIES":      aclMaxEntries,
-		"OLDACL_MAX_ENTRIES":   posix1eMaxEntries,
-		"ACL_TYPE_ACCESS":      aclTypeAccess,
-		"ACL_TYPE_DEFAULT":     aclTypeDefault,
-		"ACL_TYPE_NFS4":        aclTypeNFS4,
-		"ACL_USER_OBJ":         tagUserObj,
-		"ACL_USER":             tagUser,
-		"ACL_GROUP_OBJ":        tagGroupObj,
-		"ACL_GROUP":            tagGroup,
-		"ACL_MASK":             tagMask,
-		"ACL_OTHER":            tagOther,
-		"ACL_EVERYONE":         tagEveryone,
-		"ACL_UNDEFINED_ID":     undefinedID,
-		"ACL_ENTRY_TYPE_ALLOW": entryAllow,
-		"ACL_ENTRY_TYPE_DENY":  entryDeny,
-		"ACL_ENTRY_TYPE_AUDIT": entryAudit,
-		"ACL_ENTRY_TYPE_ALARM": entryAlarm,
-		"_PC_ACL_EXTENDED":     pcACLExtended,
-		"_PC_ACL_NFS4":         pcACLNFS4,
+		"sizeof_acl":              aclSize,
+		"acl_maxcnt":              0,
+		"acl_cnt":                 4,
+		"acl_entry":               aclEntryStart,
+		"sizeof_entry":            aclEntrySize,
+		"ae_tag":                  0,
+		"ae_id":                   4,
+		"ae_perm":                 8,
+		"ae_entry_type":           12,
+		"ae_flags":                14,
+		"ACL_MAX_ENTRIES":         aclMaxEntries,
+		"OLDACL_MAX_ENTRIES":      posix1eMaxEntries,
+		"ACL_TYPE_ACCESS":         aclTypeAccess,
+		"ACL_TYPE_DEFAULT":        aclTypeDefault,
+		"ACL_TYPE_NFS4":           aclTypeNFS4,
+		"ACL_USER_OBJ":            tagUserObj,
+		"ACL_USER":                tagUser,
+		"ACL_GROUP_OBJ":           tagGroupObj,
+		"ACL_GROUP":               tagGroup,
+		"ACL_MASK":                tagMask,
+		"ACL_OTHER":               tagOther,
+		"ACL_EVERYONE":            tagEveryone,
+		"ACL_UNDEFINED_ID":        undefinedID,
+		"ACL_ENTRY_TYPE_ALLOW":    entryAllow,
+		"ACL_ENTRY_TYPE_DENY":     entryDeny,
+		"ACL_ENTRY_TYPE_AUDIT":    entryAudit,
+		"ACL_ENTRY_TYPE_ALARM":    entryAlarm,
+		"ACL_EXECUTE":             nfs4Execute,
+		"ACL_READ_DATA":           nfs4ReadData,
+		"ACL_WRITE_DATA":          nfs4WriteData,
+		"ACL_APPEND_DATA":         nfs4AppendData,
+		"ACL_READ_NAMED_ATTRS":    nfs4ReadNamedAttrs,
+		"ACL_WRITE_NAMED_ATTRS":   nfs4WriteNamedAttrs,
+		"ACL_READ_ATTRIBUTES":     nfs4ReadAttributes,
+		"ACL_WRITE_ATTRIBUTES":    nfs4WriteAttributes,
+		"ACL_READ_ACL":            nfs4ReadACL,
+		"ACL_WRITE_ACL":           nfs4WriteACL,
+		"ACL_WRITE_OWNER":         nfs4WriteOwner,
+		"ACL_SYNCHRONIZE":         nfs4Synchronize,
+		"ACL_ENTRY_INHERIT_FLAGS": nfs4InheritFlags,
+		"_PC_ACL_EXTENDED":        pcACLExtended,
+		"_PC_ACL_NFS4":            pcACLNFS4,
 	}
 	if !reflect.DeepEqual(got, want) {
 		for name, w := range want {
@@ -317,31 +351,50 @@ func TestFreeBSDGuestKernelTakesTheStructACLThisPackageBuilds(t *testing.T) {
 	}
 }
 
-// clearACL treats EINVAL from __acl_set_fd(ACL_TYPE_ACCESS) as a filesystem
-// that keeps no POSIX.1e ACL, and EINVAL is also what a malformed struct acl
-// gets. The two are told apart by the filesystem: where it keeps POSIX.1e, the
-// minimal ACL clearACL builds must be taken, so the tolerance is never what
-// answers there; where it keeps NFSv4, the refusal is the filesystem's.
-func TestFreeBSDGuestClearACLToleratesEINVALOnlyWhereNoPOSIX1eIsKept(t *testing.T) {
+// clearACL strips on its own, without the chmod restrictStaged follows it
+// with. On ZFS at its default aclmode=discard the chmod would strip an NFSv4
+// ACL anyway, so a test of restrictStaged there passes whether clearACL did
+// anything or not; at aclmode=passthrough the chmod keeps every inherited
+// entry, and clearACL is all that stands between them and the staging inode.
+func TestFreeBSDGuestClearACLStripsWithoutAChmod(t *testing.T) {
 	aclType := guestACLType(t)
-	f := guestFile(t, t.TempDir(), "staged")
-	err := aclSyscall(unix.SYS___ACL_SET_FD, int(f.Fd()), aclTypeAccess, minimalACL(0o640))
-	switch aclType {
-	case aclTypeAccess:
-		if err != nil {
-			t.Fatalf("a filesystem keeping POSIX.1e ACLs refused minimalACL: %v; clearACL swallows this as unsupported", err)
-		}
-		entries := guestEntries(t, guestGetACL(t, int(f.Fd()), aclTypeAccess))
-		if len(entries) != 3 || len(namedEntries(entries)) != 0 {
-			t.Errorf("minimalACL read back as %+v, want the three mode entries", entries)
-		}
-	case aclTypeNFS4:
-		if !errors.Is(err, unix.EINVAL) || !unsupportedACL(err) {
-			t.Fatalf("__acl_set_fd(ACL_TYPE_ACCESS) on an NFSv4 filesystem = %v, want the EINVAL unsupportedACL tolerates", err)
+	parent := t.TempDir()
+	grantInheritedNobody(t, parent, aclType)
+
+	f := guestFile(t, parent, "staged")
+	sub := filepath.Join(parent, "enclosure")
+	if err := os.Mkdir(sub, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	d, err := os.Open(sub)
+	if err != nil {
+		t.Fatalf("open %s: %v", sub, err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+
+	if aclType == aclTypeNFS4 {
+		plain := guestFile(t, t.TempDir(), "plain")
+		want := guestEntries(t, guestGetACL(t, int(plain.Fd()), aclTypeNFS4))
+		if got := guestEntries(t, trivialNFS4ACL(0o640)); !reflect.DeepEqual(got, want) {
+			t.Errorf("trivialNFS4ACL(0640) = %+v; the kernel gives a 0640 file with nothing to inherit %+v", got, want)
 		}
 	}
-	if err := clearACL(int(f.Fd())); err != nil {
-		t.Errorf("clearACL on %s: %v", aclTypeName(aclType), err)
+
+	for _, h := range []*os.File{f, d} {
+		fd := int(h.Fd())
+		if !hasNobody(guestEntries(t, guestGetACL(t, fd, aclType))) {
+			t.Fatalf("the fixture did not reach %s: its directory's inherited grant to %d is missing", h.Name(), nobodyUID)
+		}
+		if err := clearACL(fd); err != nil {
+			t.Fatalf("clearACL on %s: %v", h.Name(), err)
+		}
+		entries := guestEntries(t, guestGetACL(t, fd, aclType))
+		if named := namedEntries(entries); len(named) != 0 {
+			t.Errorf("%s kept named entries after clearACL alone: %+v", h.Name(), named)
+		}
+		if i, ok := grantBeyondMode(guestGetACL(t, fd, aclType)); ok {
+			t.Errorf("%s kept an entry past its mode after clearACL alone: entry %d of %+v", h.Name(), i, entries)
+		}
 	}
 }
 

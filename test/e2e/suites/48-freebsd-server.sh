@@ -25,9 +25,10 @@
 # Two more cells run test/e2e/guest on a scratch ZFS dataset created with
 # aclmode=passthrough and aclinherit=passthrough, again as the user and as
 # root: a named entry inherited from a parent directory survives publication,
-# and a published deny entry denies a read made as the principal it names. The
-# guest's own datasets carry the defaults, discard and restricted, under which
-# neither was ever driven.
+# a published deny entry denies a read made as the principal it names, and a
+# replacement's staging file refuses that principal for as long as the write
+# is open. The guest's own datasets carry the defaults, discard and
+# restricted, under which none of the three was ever driven.
 #
 # This suite mutates freebsd-server: it creates and destroys a swap-backed
 # memory disk, a ZFS dataset and a user account, and writes under /var/tmp.
@@ -61,7 +62,7 @@ FSRV_GUEST_BIN="$REPO_ROOT/dist/guest-freebsd-arm64.test"
 FSRV_TESTS=(
 	TestFreeBSDGuestStructACLMatchesSysACLH
 	TestFreeBSDGuestKernelTakesTheStructACLThisPackageBuilds
-	TestFreeBSDGuestClearACLToleratesEINVALOnlyWhereNoPOSIX1eIsKept
+	TestFreeBSDGuestClearACLStripsWithoutAChmod
 	TestFreeBSDGuestRestrictStagedLeavesNoNamedEntry
 	TestFreeBSDGuestExtattrListIsLengthPrefixedAndUnqualified
 	TestFreeBSDGuestListXattrLeavesTheACLToTheACLCalls
@@ -71,6 +72,7 @@ FSRV_TESTS=(
 FSRV_PT_TESTS=(
 	TestZFSPassthroughPublishKeepsANamedInheritedEntry
 	TestZFSPassthroughPublishedDenyEntryDeniesItsPrincipal
+	TestZFSPassthroughStagingFileIsNotReadableDuringTheWrite
 )
 
 # The passthrough cells grant and deny a scratch account the suite creates and
