@@ -319,6 +319,9 @@ func (pm *PackageManifest) BinaryStoredFilename(key []byte, version, requested s
 		}
 		stored := binaryStoredName(ve)
 		if hmac.Equal([]byte(pm.binaryAliasTag(key, ve)), []byte(tag)) {
+			if ValidateBinaryFilename(ve.Filename) != nil {
+				return "", nil, false
+			}
 			return stored, &ve, true
 		}
 	}
@@ -605,6 +608,9 @@ func ArtifactKeys(pm *PackageManifest, ve VersionEntry) ([]string, error) {
 	}
 	switch pm.Type {
 	case TypeBinary:
+		if err := ValidateBinaryFilename(ve.Filename); err != nil {
+			return nil, fmt.Errorf("binary %s@%s: %w", pm.Name, ve.Version, err)
+		}
 		filename := binaryStoredName(ve)
 		if filename == "" {
 			return nil, fmt.Errorf("binary %s@%s has neither filename nor URL to derive one from", pm.Name, ve.Version)

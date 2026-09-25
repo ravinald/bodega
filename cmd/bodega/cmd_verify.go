@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 
@@ -12,13 +14,19 @@ import (
 func newVerifyCmd(gf *globalFlags) *cobra.Command {
 	return &cobra.Command{
 		Use:   "verify",
-		Short: "Verify every manifest against its .md5 sidecar",
+		Short: "Verify every manifest against its .md5 sidecar, and every binary filename",
 		Long: `verify reads each manifest object in the store and checks that its companion
 .md5 file contains the correct MD5 digest.
 
 A manifest with no sidecar is UNVERIFIABLE, not a pass: nothing was compared,
 so an edit to it would go unnoticed. verify exits non-zero when any manifest
-fails or cannot be verified.`,
+fails or cannot be verified.
+
+It then checks every binary version's filename override, which must be a
+clean relative path. One carrying a parent reference, an absolute path, an
+empty or "." segment, a backslash or a NUL is INVALID:
+the fetch refuses that version and any write of its manifest is refused until
+the filename is corrected.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store, err := loadStore(gf)
 			if err != nil {
@@ -35,7 +43,7 @@ fails or cannot be verified.`,
 				return nil
 			}
 
-			return reportIntegrity(out, results)
+			return errors.Join(reportIntegrity(out, results), reportBinaryFilenames(backgroundCtx(), out, store))
 		},
 	}
 }
@@ -96,4 +104,32 @@ func restampArg(typ string) string {
 		return breakGlassAll
 	}
 	return typ
+}
+
+// reportBinaryFilenames prints one row per binary version whose filename
+// override manifest.ValidateBinaryFilename refuses, and returns a non-nil error
+// when there is any. The store's writers refuse such a filename, so a row here
+// is a manifest written before they did, or edited by hand.
+func reportBinaryFilenames(ctx context.Context, out io.Writer, store *manifest.Store) error {
+	var invalid int
+	for _, name := range store.ListPackages(manifest.TypeBinary) {
+		pm, err := store.GetPackage(ctx, manifest.TypeBinary, name)
+		if err != nil || pm == nil {
+			// The integrity pass has already reported a manifest it could not read.
+			continue
+		}
+		for _, ve := range pm.Versions {
+			if err := manifest.ValidateBinaryFilename(ve.Filename); err != nil {
+				if invalid == 0 {
+					fmt.Fprintf(out, "\nBinary filenames:\n")
+				}
+				invalid++
+				fmt.Fprintf(out, "  %-12s %s/%s@%s  (%v)\n", "INVALID", manifest.TypeBinary, pm.Name, ve.Version, err)
+			}
+		}
+	}
+	if invalid > 0 {
+		return fmt.Errorf("%d binary version(s) carry a filename the fetch refuses", invalid)
+	}
+	return nil
 }

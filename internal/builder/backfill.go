@@ -75,7 +75,8 @@ func artifactPathForVersion(cfg *Config, typ, name string, ve manifest.VersionEn
 	switch typ {
 	case manifest.TypeBinary:
 		d := buildDirs(cfg.rootFor(typ))
-		return binaryDestPath(d, name, ve)
+		path, _ := binaryDestPath(d, name, ve)
+		return path
 	case manifest.TypeGit:
 		d := buildDirs(cfg.rootFor(typ))
 		if ve.IsRelease() {

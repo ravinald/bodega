@@ -254,6 +254,9 @@ func (s *Store) SavePackage(ctx context.Context, pm *PackageManifest) error {
 	if err := ValidatePackageName(pm.Name); err != nil {
 		return fmt.Errorf("SavePackage: %w", err)
 	}
+	if err := ValidateBinaryFilenames(pm); err != nil {
+		return fmt.Errorf("SavePackage: %w", err)
+	}
 	// After the refusal, not before: "." and ".." canonicalize to "-" for pypi,
 	// and a name the check exists to reject would slip through as an ordinary
 	// one.

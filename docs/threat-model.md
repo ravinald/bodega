@@ -140,6 +140,23 @@ risk:
   edit, not an attacker, because whoever can rewrite the manifest can rewrite
   the sidecar beside it. It catches a hand-edit, a partial restore and a
   half-finished write; it is not a signature.
+- **A manifest field that becomes a path.** A manifest is written by an
+  operator, through `pkg create`, `pkg edit`, `pkg import` or the mutation API
+  behind its token, or by hand in the store. No anonymous route writes one.
+  It is trusted to name what to fetch and where to serve it from, and not
+  trusted to choose where on disk or in storage a write lands. A binary
+  entry's `filename` override is joined into the build root and the object
+  key, so it must be a clean relative path: every manifest write refuses one
+  with a `..` or `.` segment, an empty segment, a leading `/`, a `\` or a
+  NUL, and the fetch, the upload, the download alias and the key a delete or
+  move derives refuse it again for a manifest written before the check. The
+  fetch also refuses a version that is not one directory, a package name that
+  is not a clean relative path, and a destination that resolves through a
+  symlink to outside the build root. Unchecked, a `filename` of
+  `../../../../escaped` writes outside the build root and reports success, and
+  planting one takes manifest-write access: an operator's token, or write
+  access to the store itself. See [usage.md](usage.md#binary-specific-fields)
+  for what an upgrade does with a manifest that already carries one.
 - **A secret an operator writes into a manifest.** A version entry's `url`
   may carry userinfo, because bodega has no other place to configure a
   credential per upstream and the builder and the proxy routes fetch with it

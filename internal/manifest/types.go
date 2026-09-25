@@ -7,6 +7,7 @@ package manifest
 
 import (
 	"fmt"
+	"path"
 	"strings"
 )
 
@@ -645,6 +646,41 @@ func CanonicalName(typ, name string) string {
 func ValidatePackageName(name string) error {
 	if name == "." || name == ".." {
 		return fmt.Errorf("invalid package name %q: it is path syntax, not a name — %q resolves to a manifest path outside its own type directory", name, name)
+	}
+	return nil
+}
+
+// ValidateBinaryFilename rejects a binary entry's filename override unless it
+// is a clean relative path. Empty is allowed and means the URL's basename.
+//
+// The filename is joined into the build root the fetch writes to and into the
+// object key the upload writes and the /binaries/ route serves, so a parent
+// reference or an absolute path moves a write. Subdirectories stay legal: a
+// stored name such as "~/tool" is served today, and a basename-only rule would
+// refuse manifests that fetch and serve correctly. "." and empty segments are
+// refused too, since they spell one key two ways.
+func ValidateBinaryFilename(filename string) error {
+	if filename == "" {
+		return nil
+	}
+	if strings.ContainsAny(filename, "\\\x00") || path.IsAbs(filename) || path.Clean(filename) != filename ||
+		filename == "." || filename == ".." || strings.HasPrefix(filename, "../") {
+		return fmt.Errorf("invalid binary filename %q: it is joined into the build root and the object key, so it must be a clean relative path with no \"..\" or \".\" segment, no empty segment, no leading '/', and no '\\' or NUL; set it to a name such as the URL's basename, or remove it to use that", filename)
+	}
+	return nil
+}
+
+// ValidateBinaryFilenames applies ValidateBinaryFilename to every version of a
+// binary manifest and names the first offending version. Other types carry no
+// filename override and pass.
+func ValidateBinaryFilenames(pm *PackageManifest) error {
+	if pm == nil || pm.Type != TypeBinary {
+		return nil
+	}
+	for _, ve := range pm.Versions {
+		if err := ValidateBinaryFilename(ve.Filename); err != nil {
+			return fmt.Errorf("binary %s@%s: %w", pm.Name, ve.Version, err)
+		}
 	}
 	return nil
 }

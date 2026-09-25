@@ -127,3 +127,38 @@ func TestVerifyDoesNotPassAnUnverifiableManifest(t *testing.T) {
 		t.Errorf("a manifest on disk was reported MISSING:\n%s", out)
 	}
 }
+
+// TestVerifyReportsAnEscapingBinaryFilename is the upgrade path for B93: a
+// manifest written before filenames were checked still carries one the fetch
+// now refuses, and verify is where an operator finds it before a fetch does.
+func TestVerifyReportsAnEscapingBinaryFilename(t *testing.T) {
+	dir := verifyEnv(t)
+	store := manifest.NewLocalStore(dir)
+	pm := &manifest.PackageManifest{
+		Type:     manifest.TypeBinary,
+		Name:     "tool",
+		Versions: []manifest.VersionEntry{{Version: "1.0.0", URL: "https://example.invalid/tool", Filename: "placeholder"}},
+	}
+	if err := store.SavePackage(t.Context(), pm); err != nil {
+		t.Fatalf("SavePackage: %v", err)
+	}
+	if err := store.SaveIndex(t.Context()); err != nil {
+		t.Fatalf("SaveIndex: %v", err)
+	}
+	mpath := filepath.Join(dir, manifest.TypeBinary, "tool", "manifest.json")
+	data, err := os.ReadFile(mpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mpath, []byte(strings.Replace(string(data), `"placeholder"`, `"../../../../escaped"`, 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runVerify(t)
+	if err == nil {
+		t.Fatalf("verify exited 0 on an escaping binary filename:\n%s", out)
+	}
+	if !strings.Contains(out, "INVALID") || !strings.Contains(out, "binary/tool@1.0.0") {
+		t.Errorf("verify did not name the version carrying the filename:\n%s", out)
+	}
+}
