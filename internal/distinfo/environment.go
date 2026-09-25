@@ -69,7 +69,7 @@ var (
 
 // clientCheckVersion is hashed into every digest, so a client check written
 // under different rules never names an environment this one admits against.
-const clientCheckVersion = "bodega distfiles client check 2"
+const clientCheckVersion = "bodega distfiles client check 3"
 
 // reservedEnvVars are the variables the reader derives itself, or reads as a
 // port's own declaration. A client make.conf that set one would change every
@@ -217,13 +217,17 @@ var clientReserved = []string{"DISTINFO_FILE", "FILESDIR", "LICENSE", "LICENSE_P
 //     reader looks for it;
 //   - no makefile make.conf reads changes how make parses (.MAKEFLAGS, .PATH,
 //     .READONLY and the like) or sets a license, and every makefile read after
-//     make.conf is under /usr/share/mk, under the ports tree, or declared.
+//     make.conf is under /usr/share/mk, under the ports tree as make.conf left
+//     PORTSDIR, or declared with a snapshot.
 //
-// The inputs are measured twice: as make.conf is read, before the port, and
-// again wherever BODEGA_DISTFILES_ENV is expanded, which is when the fetch
-// builds its site list or its DISTDIR, after every include of the port. So a
-// file that changes while make reads the port is seen by the second
-// measurement unless it is changed back before the fetch. Each delivery is
+// The inputs are measured as make.conf is read, before the port, and again
+// wherever BODEGA_DISTFILES_ENV is expanded, which is when the fetch builds
+// its site list or its DISTDIR. Neither sees bytes make read in between that
+// were written and put back, so neither binds them. A path declared absent is
+// bound by .MAKE.MAKEFILES, make's own list of what it read, which nothing
+// undoes. A snapshot path is bound by its writers (see writers) and by the
+// reader, which refuses one read after a command could have run. The port is
+// read after this fragment, so every variable it sets is .READONLY. Each delivery is
 // keyed by the name this sets: the HTTP route admits only under the digest the
 // server admitted against, and the builder writes its DISTDIR under a directory
 // named by it. A client that has drifted names "unsupported", which neither
@@ -282,6 +286,7 @@ _BODEGA_DISTFILES_CONF!=	/usr/bin/grep -lE '%s' ${.MAKE.MAKEFILES:N/usr/share/mk
 BODEGA_DISTFILES_DRIFT+=	${_BODEGA_DISTFILES_CONF}
 .endif
 _BODEGA_DISTFILES_READ:=	${.MAKE.MAKEFILES:@_bodega_f@N${_bodega_f}@:ts:}
+_BODEGA_DISTFILES_TREE:=	${PORTSDIR:U/usr/ports}
 `, allowed.String(), confPattern)
 
 	// .MAKEFLAGS is read above, once: it holds each -V argument unexpanded,
@@ -310,7 +315,13 @@ _BODEGA_DISTFILES_READ:=	${.MAKE.MAKEFILES:@_bodega_f@N${_bodega_f}@:ts:}
 	var declared strings.Builder
 	for i, p := range paths {
 		f := e.files[p]
-		declared.WriteString(":N" + p)
+		// make's own list of what it read is the one record a change undone
+		// before the fetch cannot erase, so a path declared absent alone may
+		// not appear on it. A path with a snapshot may, and which bytes make
+		// read there rests on writers: see writers below.
+		if len(f.sums) > 0 {
+			declared.WriteString(":N" + p)
+		}
 		// A file is hashed only while it is a regular one: a FIFO or a device
 		// at a declared path would hold every make on the client open.
 		measure := fmt.Sprintf("if [ -f %[1]s ]; then /usr/bin/timeout 10 /sbin/sha256 -q %[1]s 2>/dev/null || echo unreadable; elif [ -e %[1]s ]; then echo irregular; else echo absent; fi", p)
@@ -326,17 +337,55 @@ _BODEGA_DISTFILES_READ:=	${.MAKE.MAKEFILES:@_bodega_f@N${_bodega_f}@:ts:}
 		}
 		early, again := fmt.Sprintf("_BODEGA_DISTFILES_F%d", i), fmt.Sprintf("_BODEGA_DISTFILES_L%d", i)
 		fmt.Fprintf(&b, "%s!=\t%s\n.if !(%s)\nBODEGA_DISTFILES_DRIFT+=\t%s\n.endif\n", early, measure, holds(early), p)
+		if len(f.sums) > 0 {
+			w := fmt.Sprintf("_BODEGA_DISTFILES_W%d", i)
+			fmt.Fprintf(&b, "%s!=\t%s\n.if !empty(%s)\nBODEGA_DISTFILES_DRIFT+=\t${%s:@_bodega_w@writable:${_bodega_w}@}\n.endif\n", w, writers(p), w, w)
+		}
 		fmt.Fprintf(&b, "%s=\t${:!%s!}\n", again, measure)
 		late = append(late, fmt.Sprintf("${(%s):?:%s}", holds(again), p))
 	}
-	late = append(late, fmt.Sprintf("${.MAKE.MAKEFILES:M/*:N%s/*:N${PORTSDIR:U/usr/ports}/*%s:${_BODEGA_DISTFILES_READ}}", clientSysPath, declared.String()))
+	late = append(late, fmt.Sprintf("${.MAKE.MAKEFILES:M/*:N%s/*:N${_BODEGA_DISTFILES_TREE}/*%s:${_BODEGA_DISTFILES_READ}}", clientSysPath, declared.String()))
 
 	// Everything above that reads a variable, a file or the makefile list
 	// is expanded again wherever BODEGA_DISTFILES_ENV is, after the port has
 	// been read: += does not expand what it appends.
 	fmt.Fprintf(&b, "BODEGA_DISTFILES_DRIFT+=\t%s\n", strings.Join(late, " "))
 	fmt.Fprintf(&b, "BODEGA_DISTFILES_ENV=\t${\"${BODEGA_DISTFILES_DRIFT:M*}\" == \"\":?%s:%s}\n", e.digest, ClientUnsupported)
+	// The port is read after this, and a port that assigned any of these
+	// could name the digest whatever it read. .READONLY holds against every
+	// assignment form base make has, .MAKEFLAGS included, and the reader
+	// refuses a port that lifts it with .NOREADONLY.
+	fmt.Fprintf(&b, ".READONLY:\t%s\n", strings.Join(checkVariables(b.String()), " "))
 	return []byte(b.String())
+}
+
+// writers is the shell command that prints each component of p, the file
+// and every directory above it, that someone other than root and the user
+// running make may change: one owned by another user, one writable by its
+// group or by everyone, and a symlink, whose target's directories the walk
+// would not see. Both measurements read a declared snapshot path by name, so
+// neither sees bytes make read in between that were written and put back;
+// only a path no third party can write makes the two a statement about those
+// bytes. Root and the user running make can change it unmeasured, and are the
+// parties a check run on their own host already trusts. A command in the port
+// runs as that user too, which is why the reader refuses a port that runs one
+// before an include. A path declared absent alone needs none of this: make
+// lists every file it reads in .MAKE.MAKEFILES, and nothing a writer undoes
+// takes a name off that list.
+func writers(p string) string {
+	return fmt.Sprintf(`u=$$(/usr/bin/id -u); d=%s; while :; do if [ -L "$$d" ]; then echo "$$d"; elif [ -e "$$d" ]; then /usr/bin/find "$$d" -maxdepth 0 \( \( ! -user 0 ! -user "$$u" \) -o -perm -020 -o -perm -002 \) -print; fi; [ "$$d" = / ] && break; d=$${d%%/*}; d=$${d:-/}; done`, p)
+}
+
+var checkAssignment = regexp.MustCompile(`(?m)^(_?BODEGA_DISTFILES_[A-Za-z0-9_]+)[ \t]*[!:+]?=`)
+
+// checkVariables lists every variable the check text assigns, sorted.
+func checkVariables(check string) []string {
+	var out []string
+	for _, m := range checkAssignment.FindAllStringSubmatch(check, -1) {
+		out = append(out, m[1])
+	}
+	sort.Strings(out)
+	return dedupe(out)
 }
 
 // confPattern is what the check refuses in a makefile make.conf reads: a

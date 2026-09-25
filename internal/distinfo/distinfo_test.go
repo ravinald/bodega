@@ -269,6 +269,12 @@ func TestRestrictionFailsClosedOnWhatItCannotRead(t *testing.T) {
 		{".MAKEFLAGS sets a restriction", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.MAKEFLAGS:\tNO_CDROM=\"no resale\"\n"}, "NO_CDROM=no resale"},
 		{".MAKEFLAGS appends, as devel/godot does", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\nOPTIONS_DEFINE=\tA B\n.MAKEFLAGS:\tWITH=\"${OPTIONS_DEFINE}\" OPTIONS_EXCLUDE=\n.MAKEFLAGS:\t\tWITH+=C\n"}, ""},
 		{".MAKEFLAGS with a flag", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.MAKEFLAGS:\t-e\n"}, "does not model"},
+		// make expands the whole line, then splits it: P=${ARGS} sets D too,
+		// and D's command-line value beats the port's later assignment.
+		{".MAKEFLAGS expansion carries another assignment", map[string]string{"Makefile": "ARGS=\tunused D=files/restricted.mk\n.MAKEFLAGS:\tP=${ARGS}\nD=\tfiles/allowed.mk\n.include \"${.CURDIR}/${D}\"\n", "files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "NO_CDROM"},
+		{".MAKEFLAGS expansion carries a restriction", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\nARGS=\tunused NO_CDROM=expanded\n.MAKEFLAGS:\tP=${ARGS}\n"}, "NO_CDROM=expanded"},
+		{".MAKEFLAGS expansion carries a flag", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\nF=\t-e\n.MAKEFLAGS:\t${F}\n"}, "does not model"},
+		{".MAKEFLAGS the reader cannot expand", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.MAKEFLAGS:\tP=${WHERE}\n"}, "cannot be expanded"},
 		{".READONLY", map[string]string{"Makefile": "D=\tfiles/restricted.mk\n.READONLY: D\nD=\tfiles/allowed.mk\n.include \"${.CURDIR}/${D}\"\n", "files/allowed.mk": "LICENSE=\tBSD2CLAUSE\n"}, "does not model"},
 		{".CURDIR assignment", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.CURDIR=\t${PORTSDIR}/lang/master\n.include \"${.CURDIR}/Makefile.common\"\n"}, "does not model"},
 		{".PATH", map[string]string{"Makefile": "LICENSE=\tBSD2CLAUSE\n.PATH: ${.CURDIR}/../../lang/master\n.sinclude \"Makefile.common\"\n"}, "does not model"},

@@ -145,7 +145,13 @@ risk:
   on the server is not evidence that it is missing on a client. Paths inside
   the tree are resolved as the kernel resolves them, symlink before `..`,
   whether `:tA` resolves them or `:H` leaves the `..` for `open(2)`, and one
-  that leaves the tree on the way refuses the port. The declaration is bound
+  that leaves the tree on the way refuses the port. A `.MAKEFLAGS:` line is
+  expanded whole before it is split, as base `make` splits it, so an
+  assignment its expansion carries is read. A command `make` runs while it
+  parses (`!=`, `:sh`, `:!cmd!`) may write any file, so a port that runs one
+  before it includes a client-host path is refused; the framework runs
+  commands a port chooses at every framework include, so a snapshot read
+  after one is refused as well. The declaration is bound
   to the client by a check the client runs: bodega generates a `make`
   fragment from it (`/distfiles/@environment.mk`), the
   client includes it at the end of `/etc/make.conf`, and it names the
@@ -407,13 +413,24 @@ defence against:
   way is only what bodega admitted for the declared environment, which the
   operator decided may be redistributed under the declared terms. The check
   trusts the client's own `/bin/sh`, `/sbin/sha256`, `/usr/bin/timeout`,
-  `/usr/bin/env`, `/usr/bin/grep` and base system makefiles under
-  `/usr/share/mk`.
+  `/usr/bin/env`, `/usr/bin/grep`, `/usr/bin/find`, `/usr/bin/id` and base
+  system makefiles under `/usr/share/mk`.
 - **What the check measures, and when.** It measures the declared files as
-  `make` starts and again where the fetch expands the digest, after the
-  port's includes have opened them. A file changed after the include and
-  changed back before the fetch is not caught; neither measurement sees the
-  bytes `make` read in between. It compares a declared variable where
+  `make` starts and again where the fetch expands the digest. Two measurements
+  cannot see bytes `make` read in between that someone wrote and put back, so
+  neither is what binds them. A path declared absent is bound by
+  `.MAKE.MAKEFILES`, the list `make` keeps of every makefile it read: a
+  declared-absent path on it names `unsupported`, and nothing a writer undoes
+  takes a name off it. A path declared with a snapshot is bound by who can
+  write it: it and every directory above it must be owned by root or the user
+  running `make`, writable by neither group nor others, and not a symlink, so
+  only the parties the check already trusts can change it unmeasured. A
+  command in the port runs as that user, which is why the scan refuses a
+  snapshot read after any command, the framework's included. The check marks
+  every variable it sets `.READONLY`, which base `make` holds against every
+  assignment form a port has, and captures `PORTSDIR` before the port can move
+  it; the scan refuses `.NOREADONLY` and any write to a variable `make` sets
+  itself, such as `.MAKE.MAKEFILES`. It compares a declared variable where
   `make.conf`, the environment or the command line sets it and where the fetch
   expands its sites; bodega reads one as possibly unset above the framework,
   so what a port sees there is covered. It forbids `LICENSE_PERMS_<license>`
@@ -422,13 +439,30 @@ defence against:
   `LICENSE`, which also refuses a `make.conf` that mentions
   `LICENSES_ACCEPTED`. Variables the declaration does not name, set in
   `make.conf` or the environment, are not checked: a port whose include,
-  master or `distinfo` reads one through `?=` or `+=` is refused on the server
-  instead, and one that reads one with no default already was. The variables
-  the framework passes on its own command line (`OSVERSION` and the rest of
-  `_EXPORTED_VARS`) are allowed there unchecked, and a port reading one
-  undeclared is refused. It trusts `/usr/share/mk` to be the base system's,
-  because the framework and every relative include the tree does not hold
-  reach it.
+  master, `distinfo` or `.MAKEFLAGS` line reads one through `?=` or `+=` is
+  refused on the server instead, and one that reads one with no default
+  already was. The variables the framework passes on its own command line
+  (`OSVERSION` and the rest of `_EXPORTED_VARS`) are allowed there unchecked,
+  and a port reading one undeclared is refused. It trusts `/usr/share/mk` to
+  be the base system's, because the framework and every relative include the
+  tree does not hold reach it.
+- **A port that rewrites its own tree while `make` reads it.** bodega reads
+  the server's copy of the tree and believes the client's holds the same
+  bytes; nothing in the check measures the tree. A port that runs a command
+  while it parses (its own, or one it chooses through the variables a
+  framework command is built from) can write a file under the client's
+  `/usr/ports` and include it, and bodega reads the server's copy of that path
+  instead. Keeping the client's tree equal to the one bodega reads is the
+  operator's, as it was before any environment was declared; the scan does not
+  refuse in-tree includes after a command, because the stock framework runs
+  commands before nearly every port's first include.
+- **A client that holds a file only a snapshot could describe.** A snapshot is
+  read only where nothing can have changed it first: before the port's first
+  framework include and before any command. The stock ports that read
+  client-host files (`textproc/aspell/Makefile.inc`, `lang/perl5.*`) read them
+  after a framework include, so a declaration that describes a client holding
+  one refuses every distfile. Such a client can be served only by declaring
+  the file absent, and then names `unsupported` itself until the file is gone.
 - **A declaration that does not describe the fleet.** The declaration covers
   the fleet only if the operator makes it: a value or an alternative left out
   is one bodega never reads, and a client holding it names `unsupported` and
