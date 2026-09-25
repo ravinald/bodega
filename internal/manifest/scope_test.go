@@ -131,7 +131,7 @@ func TestScopeToVersionDoesNotMutate(t *testing.T) {
 // manifest url is written: with a scheme, scheme-relative, without one (where
 // url.Parse finds no userinfo at all), git's scp form (which url.Parse
 // refuses), and the forms only a browser or curl reads an authority into. An
-// "@" past the authority is path, and stays.
+// "@" past the authority is path, and stays; the query and fragment go whole.
 func TestPublicURL(t *testing.T) {
 	for _, tc := range []struct{ raw, want string }{
 		{"https://audit-user:audit-secret@private.example/FreeBSD:14:amd64/latest", "https://private.example/FreeBSD:14:amd64/latest"},
@@ -140,7 +140,7 @@ func TestPublicURL(t *testing.T) {
 		{"audit-user:audit-secret@private.example/x", "private.example/x"},
 		{"git@github.com:org/repo.git", "github.com:org/repo.git"},
 		{"https://registry.npmjs.org/@scope/pkg", "https://registry.npmjs.org/@scope/pkg"},
-		{"https://private.example/x?who=a@b", "https://private.example/x?who=a@b"},
+		{"https://private.example/x?who=a@b", "https://private.example/x"},
 		{"https://private.example", "https://private.example"},
 		{"", ""},
 		{"//audit-user:audit-secret@private.example/x", "//private.example/x"},
@@ -164,12 +164,39 @@ func TestPublicURL(t *testing.T) {
 		{"ssh://[audit-user@private.example:22]/repo.git", "ssh://[private.example:22]/repo.git"},
 		{"ssh://audit-user%40audit-secret/repo.git", "ssh://audit-secret/repo.git"},
 		{"ssh://audit-user%40private.example/repo.git", "ssh://private.example/repo.git"},
-		{"https://private.example/x#frag@y", "https://private.example/x#frag@y"},
+		{"https://private.example/x#frag@y", "https://private.example/x"},
 		{"audit-user#audit-secret@private.example", "private.example"},
-		{"private.example/x?who=a@b", "private.example/x?who=a@b"},
+		{"private.example/x?who=a@b", "private.example/x"},
+		{"https://private.example/x?token=audit-secret", "https://private.example/x"},
+		{"https://private.example/x#access_token=audit-secret", "https://private.example/x"},
+		{"https://audit-user@private.example/x?token=audit-secret", "https://private.example/x"},
+		{"ht\ttps://private.example/x\n?token=audit-secret", "ht\ttps://private.example/x\n"},
 	} {
 		if got := PublicURL(tc.raw); got != tc.want {
 			t.Errorf("PublicURL(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+}
+
+// A metadata value is cut only when it is written as a URL. Text that happens
+// to hold "@", "?" or "#" is not an authority or a query and stays whole.
+func TestPublicMetadataValue(t *testing.T) {
+	for _, tc := range []struct{ raw, want string }{
+		{"https://audit-user:audit-secret@attest.example/e.json", "https://attest.example/e.json"},
+		{"https://attest.example/e.json?token=audit-secret", "https://attest.example/e.json"},
+		{"HTTPS://attest.example/e.json#audit-secret", "HTTPS://attest.example/e.json"},
+		{"https:audit-user:audit-secret@attest.example/e.json", "attest.example/e.json"},
+		{"//audit-user@attest.example/e.json", "//attest.example/e.json"},
+		{"s3://bucket/e.json?versionId=audit-secret", "s3://bucket/e.json"},
+		{"Jane Doe <jane@example.org>", "Jane Doe <jane@example.org>"},
+		{"mailto:jane@example.org", "mailto:jane@example.org"},
+		{"FreeBSD:14:amd64", "FreeBSD:14:amd64"},
+		{"a C# binding, is it?", "a C# binding, is it?"},
+		{"libc6 (>= 2.34)", "libc6 (>= 2.34)"},
+		{"", ""},
+	} {
+		if got := PublicMetadataValue(tc.raw); got != tc.want {
+			t.Errorf("PublicMetadataValue(%q) = %q, want %q", tc.raw, got, tc.want)
 		}
 	}
 }

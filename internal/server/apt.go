@@ -1529,9 +1529,9 @@ func (s *Server) aptSuiteStanzas(ctx context.Context, suite, arch string, poolMa
 			if ve.Metadata["Package"] == "" {
 				writeDebField(&buf, "Package", pkgName)
 			} else {
-				writeDebField(&buf, "Package", ve.Metadata["Package"])
+				writeDebField(&buf, "Package", manifest.PublicMetadataValue(ve.Metadata["Package"]))
 			}
-			writeDebField(&buf, "Version", version)
+			writeDebField(&buf, "Version", manifest.PublicMetadataValue(version))
 			writeDebField(&buf, "Architecture", veArch)
 
 			canonical := []string{
@@ -1555,7 +1555,7 @@ func (s *Server) aptSuiteStanzas(ctx context.Context, suite, arch string, poolMa
 			}
 			for _, f := range canonical {
 				seen[f] = true
-				writeDebField(&buf, f, ve.Metadata[f])
+				writeDebField(&buf, f, manifest.PublicMetadataValue(ve.Metadata[f]))
 			}
 
 			// Catch-all for less common fields (Built-Using, Python-Version, etc.)
@@ -1569,7 +1569,7 @@ func (s *Server) aptSuiteStanzas(ctx context.Context, suite, arch string, poolMa
 			}
 			sort.Strings(extras)
 			for _, k := range extras {
-				writeDebField(&buf, k, ve.Metadata[k])
+				writeDebField(&buf, k, manifest.PublicMetadataValue(ve.Metadata[k]))
 			}
 
 			writeDebField(&buf, "Filename", poolPath)
@@ -1595,7 +1595,7 @@ func (s *Server) aptSuiteStanzas(ctx context.Context, suite, arch string, poolMa
 				desc = pm.Description
 			}
 			if desc != "" {
-				writeDebDescription(&buf, desc)
+				writeDebDescription(&buf, manifest.PublicMetadataValue(desc))
 			}
 			buf.WriteString("\n")
 			out = append(out, aptStanza{source: pkgName, version: version, body: buf.Bytes()})

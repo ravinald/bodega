@@ -454,3 +454,28 @@ func TestAdmitWarnsAboutAGroupOnADirectoryPlacedType(t *testing.T) {
 		t.Errorf("apt places per package, so its group is honored and needs no warning: %v", res.Warnings)
 	}
 }
+
+// An http(s) attestation_uri is handed to every caller in a redirect, so a
+// credential in one cannot be withheld without breaking the fetch. Admission
+// refuses it on every write path; a plain uri and an s3:// one, which bodega
+// reads with its own credentials, still pass.
+func TestAdmitRefusesACredentialInAnAttestationURI(t *testing.T) {
+	for uri, ok := range map[string]bool{
+		"https://attest-user:attest-secret@attest.example/e.json": false,
+		"https://attest-user@attest.example/e.json":               false,
+		"https://attest.example/e.json?token=attest-secret":       false,
+		"http://attest.example/e.json#attest-secret":              false,
+		"https://attest.example/e.json":                           true,
+		"s3://bucket/e.json":                                      true,
+	} {
+		pm := aptPkg("attested", "1.0")
+		pm.Versions[0].Metadata = map[string]string{manifest.MetaAttestationURI: uri}
+		res := Admit(t.Context(), nil, nil, &config.Config{}, pm, "")
+		if res.OK() != ok {
+			t.Errorf("Admit(attestation_uri %q).OK() = %v, want %v: %s", uri, res.OK(), ok, res.Reason)
+		}
+		if !ok && strings.Contains(res.Reason, "attest-secret") {
+			t.Errorf("the refusal echoes the secret it refused: %q", res.Reason)
+		}
+	}
+}

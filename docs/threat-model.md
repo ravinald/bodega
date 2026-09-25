@@ -140,41 +140,64 @@ risk:
   edit, not an attacker, because whoever can rewrite the manifest can rewrite
   the sidecar beside it. It catches a hand-edit, a partial restore and a
   half-finished write; it is not a signature.
-- **A secret an operator writes into a manifest.** A version entry's `url`
-  may carry userinfo, because bodega has no other place to configure a
-  credential per upstream and the builder and the proxy routes fetch with it
-  as written. The manifest store keeps it as written, and the rule is enforced
-  where each response is built rather than where the manifest is loaded. What
-  a caller sees depends on which of four boundaries the response sits behind,
-  and a bearer token decides only the last of them:
+- **A secret an operator writes into a manifest.** The rule, in every field:
 
-  - **Public: every caller, redacted.** The four `/api/v1/packages` read
-    routes and the web UI that reads them pass every `url` through
-    `manifest.PublicURL`, whatever the caller's address or token. It drops the
-    username as well as the password, because `url.URL.Redacted` masks the
-    password alone and a GitHub or GitLab token written as
-    `https://<token>@host/` is a bare username to it. Where URL readers
-    disagree about where the authority ends (a scheme-relative `//user@host`,
-    a browser reading `https:\\user@host`, curl reading past a `\`, git
-    handing ssh everything before the host of `ssh://a#b@host/` or
-    `a?b@host:repo`, and decoding `%40` first), it cuts at the widest reading. The package routes (`/apt/`, `/freebsd/`,
-    `/binaries/` and the rest) answer a failure with a fixed body and put the
-    reason, url included, in the log. The error a manifest check returns
-    quotes the manifest's fields verbatim for the operator at the CLI, so any
-    handler writing `err.Error()` into a public response is a new instance of
-    this class; a test for one asserts the secret is absent from the body
-    rather than that the fixed wording is present.
-  - **Admin range: no token needed.** `/api/v1/status` blanks
-    `freebsd.refused[].error`, which quotes the url, for a caller outside
-    `admin_permit_cidr`, alongside `spool.dir`, `version`,
-    `freebsd.key_error` and `backend_entries[].error` (see
-    [usage.md](usage.md)). Inside that range it returns them in full with no
-    `Authorization` header. `/api/v1/audit` is gated the same way and returns
-    the before and after manifest JSON a mutation recorded, url as written;
-    `/api/v1/config`, `/api/v1/tokens`, `/api/v1/policies` and
-    `/api/v1/profiles/{name}/pins` share the gate and emit no version `url`.
-    `admin_permit_cidr` is therefore the boundary for the stored credential
-    on reads, not the token.
+  - **`url` is the one field bodega holds a credential in.** bodega has no
+    other place to configure one per upstream, so a `url` may carry userinfo
+    or a query-string token, and the builder and the proxy routes fetch with
+    it as written. The store keeps it as written. Every response a caller
+    with no token can reach carries it through `manifest.PublicURL`, which
+    removes the userinfo, username included, and the whole query and
+    fragment. The query goes whole because no parameter name says whether
+    its value is a secret. Where URL readers disagree about where the
+    authority ends (a scheme-relative `//user@host`, a browser reading
+    `https:\\user@host`, curl reading past a `\`, git handing ssh
+    everything before the host of `ssh://a#b@host/` or `a?b@host:repo`,
+    and decoding `%40` first), it cuts at the widest reading.
+  - **`metadata` is public by contract.** bodega never fetches with a
+    metadata value. Every value is published, except that a value written
+    as a URL (a scheme followed by `/` or `\`, `http:` or `https:`, or
+    `//host`) goes through the same cut as `url`, whatever its key. A
+    secret that is not part of a URL is published as written.
+  - **`metadata.attestation_uri` takes no credential.** Its endpoint answers
+    an `http(s)` uri with a 302 whose `Location` the client follows, so the
+    uri cannot be cut without breaking the fetch. Admission refuses one
+    carrying userinfo, a query or a fragment, and the endpoint answers one
+    already stored with a 502 rather than a redirect. An `s3://` uri is read
+    by bodega with its own backend credentials and never reaches the client.
+  - **Every other field is public by contract**: names, versions,
+    descriptions, dependencies, checksums, suites and storage names.
+
+  The rule is enforced where each response is built, not where the manifest
+  is loaded, so a manifest stored before the rule existed is covered without
+  being rewritten. A handler writing `err.Error()` into a public response
+  is a new instance of this class, because a manifest check quotes fields
+  verbatim for the operator; a test for one asserts the secret is absent
+  from the body, and a test of a redirect asserts it on the `Location`
+  header separately, since that is a different code path carrying the same
+  string.
+
+  What a caller sees depends on which of four boundaries the response sits
+  behind, and a bearer token decides only the last of them:
+
+  - **Anonymous: every caller.** The four `/api/v1/packages` read routes and
+    the web UI that reads them; the attestation route; the apt `Packages`
+    stanza, which copies every metadata key; `/api/v1/status`, which blanks
+    `freebsd.refused[].error` (it quotes the url), `spool.dir`, `version`,
+    `freebsd.key_error` and `backend_entries[].error` outside
+    `admin_permit_cidr` (see [usage.md](usage.md)); and the package routes
+    (`/apt/`, `/freebsd/`, `/binaries/` and the rest), which answer a
+    failure with a fixed body and put the reason, url included, in the log.
+    npm, cargo and helm indexes are built from bodega's own base URL and
+    carry no manifest `url` or metadata.
+  - **Admin range: no token needed.** Inside `admin_permit_cidr` the
+    `/api/v1/status` fields above are returned in full with no
+    `Authorization` header. `/api/v1/audit` is gated the same way and
+    returns the before and after manifest JSON a mutation recorded, as
+    written; `/api/v1/config`, `/api/v1/tokens`, `/api/v1/policies` and
+    `/api/v1/profiles/{name}/pins` share the gate and emit no version
+    `url`. `admin_permit_cidr` is therefore the boundary for the stored
+    credential on reads, not the token.
   - **Mutations: the existing CIDR and token rules.** Create and the hide and
     freeze toggles return the whole manifest as stored. A mutation needs an
     address in `admin_permit_cidr`, and a bearer token only once that range
@@ -182,37 +205,34 @@ risk:
     localhost with no token.
   - **Operator host and backend.** `bodega show pkg`, `pkg export`,
     `pkg edit`, the TUI, the builder's output, repair and validation
-    diagnostics and the server log print or serialize the url as written.
-    They read the manifest store or the log directly, so filesystem and
+    diagnostics and the server log print or serialize the manifest as
+    written. They read the store or the log directly, so filesystem and
     backend permissions are the boundary. A binary entry with no `filename`
-    whose url has no path is stored under an object key built from the
-    authority, userinfo included, so anyone who can list that bucket or
-    directory reads the credential in the key name. The read routes publish
+    is stored under its url's last segment, so for a url with no path, or a
+    query-string token, the object key carries the credential and anyone who
+    can list that bucket or directory reads it. The read routes publish
     every binary entry with a download alias of its own, `~/<tag>/<display>`,
     since a stored name is served from whichever entry of its version comes
-    first and so does not stay with one entry. The display part comes from the
-    published url and the tag is an
-    HMAC of the version, the recorded backend and the stored name keyed by
-    the server's token pepper, and `/binaries/` maps it back to that entry's
-    key on that entry's backend without publishing the key. The key is there
-    so that the published name cannot be used to confirm a guessed username
-    and password offline. An alias spans three path segments and a stored
-    name is one, so the route never reads either as the other: an alias
-    whose entry is gone or has moved backend, or whose pepper has been
-    rotated away, is a 404, never a request for an object stored under that
-    spelling or for another entry holding the same key on another backend.
-    A server with no pepper publishes no binary download link: every entry
-    gets the all-zero withheld alias, which is a 404, because a stored name
-    would follow the order of the manifest rather than the entry.
-    The TUI links by the same alias, so it reads the pepper file as well as
-    the manifest store; where it cannot, it links a stored name only when the
-    route serves that name from the entry's own backend, and otherwise shows
-    no link.
+    first and so does not stay with one entry. The display part comes from
+    the published url and the tag is an HMAC of the version, the recorded
+    backend and the stored name keyed by the server's token pepper, and
+    `/binaries/` maps it back to that entry's key on that entry's backend
+    without publishing the key. The key is there so that the published name
+    cannot be used to confirm a guessed credential offline. An alias spans
+    three path segments and a stored name is one, so the route never reads
+    either as the other: an alias whose entry is gone or has moved backend,
+    or whose pepper has been rotated away, is a 404, never a request for an
+    object stored under that spelling or for another entry holding the same
+    key on another backend. A server with no pepper publishes no binary
+    download link: every entry gets the all-zero withheld alias, which is a
+    404, because a stored name would follow the order of the manifest rather
+    than the entry. The TUI links by the same alias, so it reads the pepper
+    file as well as the manifest store; where it cannot, it links a stored
+    name only when the route serves that name from the entry's own backend,
+    and otherwise shows no link.
 
   A manifest read from the API and pushed back through an import arrives
-  without its credential. Userinfo is the only credential form this covers: a
-  query-string token in a `url`, or a credential in a version's `metadata`
-  such as an `attestation_uri`, is published as written.
+  without the userinfo, query and fragment of its `url`.
 - **A replacement read while it is being written.** On a `local` backend a
   replacement is written to a staging file inside a directory of its own, and
   both are reduced to their mode bits before the first byte lands: every ACL

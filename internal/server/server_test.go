@@ -1271,3 +1271,46 @@ func TestAptStanzaFieldsAreNotDuplicated(t *testing.T) {
 		t.Errorf("SHA256 is not bodega's recorded digest:\n%s", packages)
 	}
 }
+
+// The Packages stanza is the other place metadata reaches a caller with no
+// token, with every extra key copied through. A URL in any of them loses its
+// userinfo, query and fragment there as it does on the read routes.
+func TestAptPackagesWithholdsCredentialsInMetadataURLs(t *testing.T) {
+	store := manifest.NewLocalStore(t.TempDir())
+	_ = store.AddVersion(context.Background(), manifest.TypeApt, "odd-pkg", manifest.VersionEntry{
+		Version:    "1.0",
+		SourceName: "odd-pkg",
+		Metadata: map[string]string{
+			"Architecture": "amd64",
+			"Homepage":     "https://home-user:" + "home-secret@home.example/p?token=home-query",
+			"X-Mirror":     "https://mirror.example/p#mirror-secret",
+			"Maintainer":   "Jane Doe <jane@example.org>",
+		},
+	})
+	mock := memStore(map[string]string{
+		"packages/apt/pool/main/o/odd-pkg/odd-pkg_1.0_amd64.deb": "fake",
+	})
+	cfg := &config.Config{Bucket: "test", Region: "us-west-2", ManifestDir: "manifests", AptCodename: "noble"}
+	srv := server.New(cfg, store, storage.NewSingle(mock), ":0", nil)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/apt/dists/noble/main/binary-amd64/Packages")
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	s := string(body)
+	if !strings.Contains(s, "Package: odd-pkg") {
+		t.Fatalf("Packages has no odd-pkg stanza, so nothing below is asserted:\n%s", s)
+	}
+	for _, sec := range []string{"home-user", "home-secret", "home-query", "mirror-secret"} {
+		if strings.Contains(s, sec) {
+			t.Errorf("Packages publishes %q from a metadata URL:\n%s", sec, s)
+		}
+	}
+	if !strings.Contains(s, "Maintainer: Jane Doe <jane@example.org>") {
+		t.Errorf("Packages cut a metadata value that is not a URL:\n%s", s)
+	}
+}

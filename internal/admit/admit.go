@@ -142,6 +142,13 @@ func validate(cfg *config.Config, pm *manifest.PackageManifest, res *Result) err
 		if err := CheckBackendName(cfg, ve.Storage); err != nil {
 			return fmt.Errorf("version %s: %w", versionLabel(ve), err)
 		}
+		// The attestation endpoint answers an http(s) uri with a redirect
+		// whose Location any caller reads, so a credential written into one
+		// is published by the only thing the field exists for.
+		if manifest.AttestationURIWithheld(ve.Metadata[manifest.MetaAttestationURI]) {
+			return fmt.Errorf("version %s: metadata.%s carries userinfo, a query or a fragment, which its redirect would hand to every caller; host the envelope where a plain URL reaches it, or on s3:// where bodega reads it with its own credentials",
+				versionLabel(ve), manifest.MetaAttestationURI)
+		}
 	}
 	// An apt entry with no version reaches no index and no verb: the generator
 	// refuses to publish it, and remove, delete, hide and freeze all address a
