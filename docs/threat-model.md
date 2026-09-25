@@ -156,7 +156,7 @@ risk:
   includes, and the scan reads the server's copy of that path, so the tree is
   held still instead: the client check names no environment unless the ports
   tree and `/usr/share/mk` each sit on a read-only mount that `make` cannot
-  lift. A command a port runs then fails to write either, and `make` reads
+  lift and no writable path reaches. A command a port runs then fails to write either, and `make` reads
   the bytes the scan read. The declaration is bound to the client by a check
   the client runs: bodega generates a `make` fragment from it
   (`/distfiles/@environment.mk`), the client includes it at the end of
@@ -458,17 +458,40 @@ defence against:
   through the variables they are built from, so refusing every include after
   a command refuses most of the tree (34,282 ports went unplaced when that
   was tried). The check holds the tree instead: `/sbin/mount -p` must show the
-  ports tree, as `make.conf` left `PORTSDIR`, and `/usr/share/mk` each on a
-  read-only mount with no writable mount beneath it, and `make` must be
-  unable to lift one: not root, unless jailed without `allow.mount`, and
-  `vfs.usermount` off. Anything else names `unsupported` (`remountable:root`,
-  `writable:<mount>`). A root `make` outside a jail is refused however the
-  tree is mounted, because a command it runs could remount it. Measuring
-  files would not do: a file written, read and removed between two
-  measurements looks unchanged to both. The cost falls on the client: mount
-  both read-only (a `nullfs` mount over itself does it), keep `DISTDIR`,
+  ports tree, as `make.conf` left `PORTSDIR`, and `/usr/share/mk` each
+  served by a read-only mount that no path the fetch user can write reaches,
+  with no writable mount beneath it, and `make` must be unable to lift one:
+  not root, unless jailed without `allow.mount`, and `vfs.usermount` off. A
+  read-only mount says nothing about its source, so the check reads the
+  whole mount table and refuses (`aliased:<source>`) when a writable mount
+  anywhere takes its source at, under or above the tree, when a `nullfs`
+  covering the tree takes its source from another directory (a read-only
+  view of `/home/u/ports` leaves `/home/u/ports` writable, and a `nullfs`
+  over itself serves whatever it covers), and when a `unionfs` covers it at
+  all. The store under the `nullfs` layers must be `ufs`, `zfs`, `cd9660` or
+  `tmpfs` (`fstype:<type>` otherwise: the mount table cannot say who writes
+  an `nfs` export), and neither an `md` device, whose backing file it does
+  not show, nor a device the fetch user can write (`device:<source>`).
+  Anything else names `unsupported` (`remountable:root`, `writable:<mount>`).
+  A root `make` outside a jail is refused however the tree is mounted,
+  because a command it runs could remount it. Measuring files would not do:
+  a file written, read and removed between two measurements looks unchanged
+  to both. The cost falls on the client: serve both from a `nullfs` over
+  itself or a read-only `ufs` or `zfs` mount, keep `DISTDIR`,
   `WRKDIRPREFIX` and `PACKAGES` outside the tree, and run `make fetch` as an
-  unprivileged user or in a jail.
+  unprivileged user or in a jail. A jail that receives the tree as a
+  `nullfs` of a host directory is refused, because the source the jail sees
+  is not its mount point; give it a read-only `zfs` dataset instead.
+- **What the stable-view check cannot see.** It reads the mount table and
+  the fetch user's uid. A privilege held outside that uid, such as a `sudo`
+  or `doas` grant or a `zfs allow` delegation of `readonly` or `mount`, can
+  lift the view, and a hard link made to a tree file before the view was
+  mounted still reaches it; keep the tree's files owned by root and grant
+  the fetch user nothing that mounts. A `mount -p` source is the name the
+  directory had when the mount was made, so a directory renamed afterwards
+  is compared under its old name. Another device node for the same disk
+  (a GPT label beside the partition) is not compared with the one mounted;
+  the base system leaves disk nodes writable by root alone.
 - **A client tree that differs from the server's before `make` starts.**
   bodega reads the server's copy of the tree and believes the client's holds
   the same bytes. The check holds the client's tree still while `make` runs;

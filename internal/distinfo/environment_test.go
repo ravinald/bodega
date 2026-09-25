@@ -522,18 +522,17 @@ func TestClientCheckUnderBaseMake(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(scratch) })
 	client := filepath.Join(scratch, "client")
-	// Every write goes to src; make reads the tree through a read-only
-	// nullfs view of it, and /usr/share/mk through another, which is the
-	// stable view the check requires.
+	// Each case writes its port into src, then serves src through a
+	// read-only nullfs over itself, which leaves no other name for the files
+	// behind it, and /usr/share/mk through another. The other directories
+	// are where the aliasing cases put a second view of the tree.
 	src := filepath.Join(scratch, "ports")
-	tree := filepath.Join(scratch, "ro")
-	if err := os.MkdirAll(filepath.Join(src, "distfiles"), 0o755); err != nil {
-		t.Fatal(err)
+	view, alias := filepath.Join(scratch, "ro"), filepath.Join(scratch, "alias")
+	for _, d := range []string{filepath.Join(src, "distfiles"), view, alias} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := os.Mkdir(tree, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	mount(t, "ro", src, tree)
 	if out, _ := exec.Command("/sbin/mount", "-p").Output(); !strings.Contains(string(out), "/usr/share/mk\t\t/usr/share/mk\t\tnullfs\tro") {
 		mount(t, "ro", clientSysPath, clientSysPath)
 	}
@@ -565,21 +564,35 @@ func TestClientCheckUnderBaseMake(t *testing.T) {
 		return p
 	}
 	extra := filepath.Join(scratch, "extra.mk")
-	write(t, scratch, "extra.mk", "P=\t"+tree+"/misc/probe/restricted.mk\n")
-	port := filepath.Join(tree, "misc/probe")
+	write(t, scratch, "extra.mk", "P=\t"+src+"/misc/probe/restricted.mk\n")
+	port := filepath.Join(src, "misc/probe")
 	inTree := func(root string) string {
 		f := root + "/misc/probe/terms.mk"
 		return "_W!=\tprintf 'NO_CDROM=in-tree terms\\n' > " + f + "\n.sinclude \"" + f + "\"\n_R!=\trm -f " + f + "\nall:\n"
 	}
+	// through writes the port's terms at f, which names the port's own
+	// directory under another path, and includes them from the directory
+	// make is reading.
+	through := func(f string) func() {
+		return setPort("_W!=\tprintf 'NO_CDROM=aliased terms\\n' > " + f + "\n.sinclude \"${.CURDIR}/terms.mk\"\n_R!=\trm -f " + f + "\nall:\n")
+	}
+	// A port needs no knowledge of the host to find the source of a nullfs
+	// view: mount -p names it.
+	discovered := setPort("_S=\ts=$$(/sbin/mount -p | /usr/bin/awk -v t=${PORTSDIR} '$$2 == t { print $$1 }')\n" +
+		"_W!=\t${_S}; printf 'NO_CDROM=discovered terms\\n' > $$s/misc/probe/terms.mk\n.sinclude \"${.CURDIR}/terms.mk\"\n_R!=\t${_S}; rm -f $$s/misc/probe/terms.mk\nall:\n")
 	for _, tc := range []struct {
 		name  string
 		conf  string
-		tree  string // PORTSDIR, when not the read-only view
+		tree  string // PORTSDIR, when not src
+		bare  bool   // leave src writable rather than serving it read-only
 		root  bool   // run make as root
 		env   []string
 		args  []string
 		setup func()
-		want  string // the digest, or "unsupported"
+		// before mounts ahead of the read-only view of src, after mounts
+		// once it is in place.
+		before, after func(t *testing.T)
+		want          string // the digest, or "unsupported"
 	}{
 		{name: "stock", want: env.Digest()},
 		// -V keeps its argument unexpanded in .MAKEFLAGS, where a check that
@@ -645,9 +658,30 @@ func TestClientCheckUnderBaseMake(t *testing.T) {
 		// make reads the restriction and the check names no environment.
 		// On the read-only view the write fails, make reads what the
 		// reader read, and the digest stands.
-		{name: "the in-tree witness on a tree make can write", tree: src, setup: setPort(inTree(src))},
-		{name: "the in-tree witness on the read-only tree", setup: setPort(inTree(tree)), want: env.Digest()},
-		{name: "a writable mount beneath the tree", setup: func() { mount(t, "rw", client, filepath.Join(tree, "distfiles")) }},
+		{name: "the in-tree witness on a tree make can write", bare: true, setup: setPort(inTree(src))},
+		{name: "the in-tree witness on the read-only tree", setup: setPort(inTree(src)), want: env.Digest()},
+		{name: "a writable mount beneath the tree", after: func(t *testing.T) { mount(t, "rw", client, filepath.Join(src, "distfiles")) }},
+		// The F25 audit's aliased view: the tree make reads is read-only,
+		// and the directory it shows stays writable at its own path.
+		{name: "a read-only view of a writable source", bare: true, tree: view, setup: through(src + "/misc/probe/terms.mk"),
+			before: func(t *testing.T) { mount(t, "ro", src, view) }},
+		{name: "a read-only view whose source the port finds through mount -p", bare: true, tree: view, setup: discovered,
+			before: func(t *testing.T) { mount(t, "ro", src, view) }},
+		// A second, writable name for the tree's files, whichever order the
+		// two mounts were made in, and whether it shows the tree, a
+		// directory above it or one inside it.
+		{name: "a writable view of the tree made before the read-only one", setup: through(alias + "/misc/probe/terms.mk"),
+			before: func(t *testing.T) { mount(t, "rw", src, alias) }},
+		{name: "a writable view of the tree made after the read-only one", setup: through(alias + "/misc/probe/terms.mk"),
+			after: func(t *testing.T) { mount(t, "rw", src, alias) }},
+		{name: "a writable view of a directory above the tree", setup: through(alias + "/ports/misc/probe/terms.mk"),
+			before: func(t *testing.T) { mount(t, "rw", scratch, alias) }},
+		{name: "a writable view of a directory inside the tree", setup: through(alias + "/probe/terms.mk"),
+			before: func(t *testing.T) { mount(t, "rw", filepath.Join(src, "misc"), alias) }},
+		// A nullfs over itself serves whatever it covers, here a writable
+		// view of another directory.
+		{name: "a read-only view over itself stacked on a writable view", bare: true, tree: view, setup: through(src + "/misc/probe/terms.mk"),
+			before: func(t *testing.T) { mount(t, "rw", src, view); mount(t, "ro", view, view) }},
 		{name: "make run as root outside a jail", root: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -663,11 +697,20 @@ func TestClientCheckUnderBaseMake(t *testing.T) {
 			if tc.setup != nil {
 				tc.setup()
 			}
+			if tc.before != nil {
+				tc.before(t)
+			}
+			if !tc.bare {
+				mount(t, "ro", src, src)
+			}
+			if tc.after != nil {
+				tc.after(t)
+			}
 			want := tc.want
 			if want == "" {
 				want = ClientUnsupported
 			}
-			portsdir, dir := tree, port
+			portsdir, dir := src, port
 			if tc.tree != "" {
 				portsdir, dir = tc.tree, filepath.Join(tc.tree, "misc/probe")
 			}

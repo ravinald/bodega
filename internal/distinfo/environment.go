@@ -371,21 +371,35 @@ BODEGA_DISTFILES_DRIFT+=	${_BODEGA_DISTFILES_STABLE_NOW}
 
 // stableView is the shell command that prints why the ports tree or
 // clientSysPath could change while make reads a port, and nothing when
-// neither can. Each must sit on a read-only mount with no writable mount
-// beneath it, and make must be unable to lift one: not root unless jailed
-// without mount privilege, and vfs.usermount off. A command a port runs,
-// which runs as that user, then cannot create or replace a file make
-// includes later there, and the bytes make reads are the ones the reader
-// read. Measuring the files instead would not do: a file written, read and
-// removed between two measurements looks unchanged to both.
+// neither can. Each must be served read-only by a mount no path the fetch
+// user can write reaches, with no writable mount beneath it, and make must be
+// unable to lift one: not root unless jailed without mount privilege, and
+// vfs.usermount off. A command a port runs, which runs as that user, then
+// cannot create or replace a file make includes later there, and the bytes
+// make reads are the ones the reader read. Measuring the files instead would
+// not do: a file written, read and removed between two measurements looks
+// unchanged to both.
 //
 // mount -p lists mounts in the order they were made, and a mount hides every
 // earlier one at or below its mount point, so the last mount whose point is a
 // prefix of the path is the one that serves it, and only a writable mount
-// beneath the path made after that one is reachable. A path outside
-// clientPath's characters is refused rather than matched against mount -p,
-// which encodes them.
-const stableView = `if [ "$$(/sbin/sysctl -n security.jail.jailed)" = 1 ]; then [ "$$(/sbin/sysctl -n security.jail.mount_allowed)" = 0 ] || echo remountable:jail; elif [ "$$(/usr/bin/id -u)" = 0 ]; then echo remountable:root; fi; [ "$$(/sbin/sysctl -n vfs.usermount)" = 0 ] || echo remountable:usermount; for p in "${_BODEGA_DISTFILES_TREE}" ` + clientSysPath + `; do t=$$(/bin/realpath "$$p" 2>/dev/null) || t=; case "$$t" in ""|/|*[!A-Za-z0-9._/+@%,=-]*) echo "writable:$$p"; continue;; esac; /sbin/mount -p | /usr/bin/awk -v t="$$t" '{ ro = ("," $$4 ",") ~ /,ro,/ } $$2 == "/" || $$2 == t || index(t, $$2 "/") == 1 { cover = ro; w = ""; next } index($$2, t "/") == 1 && ro == 0 { w = w " writable:" $$2 } END { if (cover == 0) w = w " writable:" t; if (w != "") print w }'; done`
+// beneath the path made after that one is reachable. The serving mount's
+// flags say nothing about its source, so the files are also refused when:
+//   - any writable mount takes its source at, under or above the path, since
+//     that mount is the same files under a second name, in whichever order
+//     the two were made;
+//   - any nullfs mount covering the path takes its source from another
+//     directory, or any unionfs covers it at all: a nullfs over itself
+//     stacks on whatever it covers, so an aliased mount it hides is still
+//     what it serves;
+//   - the store under the nullfs layers is not ufs, zfs, cd9660 or tmpfs,
+//     whose writers the mount table cannot name (nfs, fusefs and the rest);
+//   - that store is a device the user may write, or an md(4), whose backing
+//     file mount -p does not show.
+//
+// A path outside clientPath's characters is refused rather than matched
+// against mount -p, which encodes them.
+const stableView = `if [ "$$(/sbin/sysctl -n security.jail.jailed)" = 1 ]; then [ "$$(/sbin/sysctl -n security.jail.mount_allowed)" = 0 ] || echo remountable:jail; elif [ "$$(/usr/bin/id -u)" = 0 ]; then echo remountable:root; fi; [ "$$(/sbin/sysctl -n vfs.usermount)" = 0 ] || echo remountable:usermount; for p in "${_BODEGA_DISTFILES_TREE}" ` + clientSysPath + `; do t=$$(/bin/realpath "$$p" 2>/dev/null) || t=; case "$$t" in ""|/|*[!A-Za-z0-9._/+@%,=-]*) echo "writable:$$p"; continue;; esac; /sbin/mount -p | /usr/bin/awk -v t="$$t" '{ ro = ("," $$4 ",") ~ /,ro,/ } ro == 0 && ($$1 == "/" || $$1 == t || index(t, $$1 "/") == 1 || index($$1, t "/") == 1) { a = a " aliased:" $$1 } $$2 == "/" || $$2 == t || index(t, $$2 "/") == 1 { cover = ro; w = ""; if ($$3 == "unionfs" || ($$3 == "nullfs" && $$1 != $$2)) { a = a " aliased:" $$1 } else if ($$3 != "nullfs") { fs = $$3; src = $$1 }; next } index($$2, t "/") == 1 && ro == 0 { w = w " writable:" $$2 } END { if (cover == 0) w = w " writable:" t; if (fs != "ufs" && fs != "zfs" && fs != "cd9660" && fs != "tmpfs") a = a " fstype:" fs; if (index(src, "/dev/") == 1 && (index(src, "/dev/md") == 1 || src ~ "[^-A-Za-z0-9._/]" || system("/bin/test -w " src) == 0)) a = a " device:" src; if (a w != "") print a w }'; done`
 
 // writers is the shell command that prints each component of p, the file
 // and every directory above it, that someone other than root and the user
