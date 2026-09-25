@@ -127,3 +127,101 @@ func TestVerifyDoesNotPassAnUnverifiableManifest(t *testing.T) {
 		t.Errorf("a manifest on disk was reported MISSING:\n%s", out)
 	}
 }
+
+// TestVerifyReportsAnEscapingBinaryFilename is the upgrade path for B93: a
+// manifest written before filenames were checked still carries one the fetch
+// now refuses, and verify is where an operator finds it before a fetch does.
+func TestVerifyReportsAnEscapingBinaryFilename(t *testing.T) {
+	dir := verifyEnv(t)
+	store := manifest.NewLocalStore(dir)
+	pm := &manifest.PackageManifest{
+		Type:     manifest.TypeBinary,
+		Name:     "tool",
+		Versions: []manifest.VersionEntry{{Version: "1.0.0", URL: "https://example.invalid/tool", Filename: "placeholder"}},
+	}
+	if err := store.SavePackage(t.Context(), pm); err != nil {
+		t.Fatalf("SavePackage: %v", err)
+	}
+	if err := store.SaveIndex(t.Context()); err != nil {
+		t.Fatalf("SaveIndex: %v", err)
+	}
+	mpath := filepath.Join(dir, manifest.TypeBinary, "tool", "manifest.json")
+	data, err := os.ReadFile(mpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mpath, []byte(strings.Replace(string(data), `"placeholder"`, `"../../../../escaped"`, 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runVerify(t)
+	if err == nil {
+		t.Fatalf("verify exited 0 on an escaping binary filename:\n%s", out)
+	}
+	if !strings.Contains(out, "INVALID") || !strings.Contains(out, "binary/tool@1.0.0") {
+		t.Errorf("verify did not name the version carrying the filename:\n%s", out)
+	}
+}
+
+// TestVerifyReportsUnindexedBinaryFilename stores a manifest the index does
+// not list, with a matching sidecar so an MD5 mismatch cannot stand in for the
+// filename check. Walking the index skipped it and verify exited 0.
+func TestVerifyReportsUnindexedBinaryFilename(t *testing.T) {
+	dir := verifyEnv(t)
+	store := manifest.NewLocalStore(dir)
+	if err := store.SaveIndex(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	pm := &manifest.PackageManifest{
+		Type:     manifest.TypeBinary,
+		Name:     "tool",
+		Versions: []manifest.VersionEntry{{Version: "1.0.0", URL: "https://example.invalid/tool", Filename: "placeholder"}},
+	}
+	if err := store.SavePackage(t.Context(), pm); err != nil {
+		t.Fatalf("SavePackage: %v", err)
+	}
+	mpath := filepath.Join(dir, manifest.TypeBinary, "tool", "manifest.json")
+	data, err := os.ReadFile(mpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mpath, []byte(strings.Replace(string(data), `"placeholder"`, `"../../../../escaped"`, 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RestampMD5(t.Context(), ""); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runVerify(t)
+	if err == nil {
+		t.Fatalf("verify exited 0 on an unindexed escaping binary filename:\n%s", out)
+	}
+	if !strings.Contains(out, "INVALID") || !strings.Contains(out, "binary/tool@1.0.0") {
+		t.Errorf("verify did not name the version carrying the filename:\n%s", out)
+	}
+}
+
+func TestVerifyReportsUnparseableBinaryManifest(t *testing.T) {
+	dir := verifyEnv(t)
+	store := manifest.NewLocalStore(dir)
+	if err := store.SaveIndex(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, manifest.TypeBinary, "tool"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, manifest.TypeBinary, "tool", "manifest.json"), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RestampMD5(t.Context(), ""); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runVerify(t)
+	if err == nil {
+		t.Fatalf("verify exited 0 on a binary manifest it could not parse:\n%s", out)
+	}
+	if !strings.Contains(out, "UNCHECKED") || !strings.Contains(out, "binary/tool/manifest.json") {
+		t.Errorf("verify did not name the manifest it could not check:\n%s", out)
+	}
+}

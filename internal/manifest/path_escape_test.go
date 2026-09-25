@@ -122,3 +122,42 @@ func TestDotNamesAreRefusedBeforeTheyCollide(t *testing.T) {
 		t.Fatalf("a dot name reached above the manifest root (%q), which would make this a traversal", resolved)
 	}
 }
+
+// TestBinaryFilenameIsRefusedWhereverItReachesAKey covers the consumers of a
+// binary filename outside the builder, for a manifest that predates the check:
+// the object key a delete, move or repair derives, and the stored name a
+// download alias resolves to. Each would otherwise hand the storage layer a
+// key whose ".." lands on another package's object.
+func TestBinaryFilenameIsRefusedWhereverItReachesAKey(t *testing.T) {
+	const hostile = "../../other/1.0.0/other.bin"
+	pm := &PackageManifest{Type: TypeBinary, Name: "tool", Versions: []VersionEntry{
+		{Version: "1.0.0", URL: "https://example.invalid/tool.bin", Filename: hostile},
+	}}
+
+	if err := ValidateBinaryFilenames(pm); err == nil {
+		t.Errorf("ValidateBinaryFilenames passed %q", hostile)
+	}
+	if err := NewLocalStore(t.TempDir()).SavePackage(t.Context(), pm); err == nil {
+		t.Errorf("SavePackage wrote a binary filename of %q", hostile)
+	}
+	if keys, err := ArtifactKeys(pm, pm.Versions[0]); err == nil {
+		t.Errorf("ArtifactKeys derived %q from filename %q", keys, hostile)
+	}
+
+	key := []byte("pepper")
+	alias := pm.binaryAliasName(key, pm.Versions[0])
+	if stored, _, ok := pm.BinaryStoredFilename(key, "1.0.0", alias); ok {
+		t.Errorf("alias %q resolved to stored name %q", alias, stored)
+	}
+
+	for _, ok := range []string{"", "tool.bin", "..tool", "tool..", "~/tool", "~/0123abcd/tool.bin"} {
+		if err := ValidateBinaryFilename(ok); err != nil {
+			t.Errorf("ValidateBinaryFilename(%q) refused a confined relative path: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{".", "..", "../x", "a/../../x", "/etc/passwd", "a//b", "a/./b", "a/", `..\x`, "a\x00b"} {
+		if err := ValidateBinaryFilename(bad); err == nil {
+			t.Errorf("ValidateBinaryFilename(%q) passed", bad)
+		}
+	}
+}
