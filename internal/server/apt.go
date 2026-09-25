@@ -567,7 +567,7 @@ func (s *Server) aptFallbacks(ctx context.Context, served []string) []aptFallbac
 			if ve.Hidden || ve.Version == "" || ve.Version == "*" {
 				continue
 			}
-			if ve.Metadata["_pool_path"] != "" || ve.Metadata["Architecture"] == "" {
+			if ve.Metadata["_pool_path"] != "" || ve.Metadata["Architecture"] == "" || manifest.AptIdentityWithheld(ve.Metadata) != "" {
 				continue
 			}
 			inServed := false
@@ -1273,7 +1273,7 @@ func (s *Server) auditAptEntries(ctx context.Context, served []string, poolMap m
 		servedSet[suite] = true
 	}
 
-	var unserved, unresolved, unpooled, noarch []string
+	var unserved, unresolved, unpooled, noarch, withheld []string
 	for _, name := range s.store.ListPackages(manifest.TypeApt) {
 		pm, _ := s.store.GetPackage(ctx, manifest.TypeApt, name)
 		if pm == nil || isPackageHidden(pm) {
@@ -1307,6 +1307,11 @@ func (s *Server) auditAptEntries(ctx context.Context, served []string, poolMap m
 			// no index, and counting it as pooled would leave it in no
 			// bucket at all. deb822 has no default architecture, so there is
 			// nothing to substitute — the field has to be filled in.
+			// Named by key and never by value: the value is the credential.
+			if k := manifest.AptIdentityWithheld(ve.Metadata); k != "" {
+				withheld = append(withheld, name+"@"+ve.Version+" ["+k+"]")
+				continue
+			}
 			if ve.Metadata["Architecture"] == "" {
 				noarch = append(noarch, name+"@"+ve.Version)
 				continue
@@ -1339,6 +1344,10 @@ func (s *Server) auditAptEntries(ctx context.Context, served []string, poolMap m
 	if len(noarch) > 0 {
 		s.logger.Warn("apt entries carry no Architecture metadata and reach no index; set it with 'bodega pkg edit' or re-run 'bodega build package'",
 			"count", len(noarch), "entries", capForLog(noarch))
+	}
+	if len(withheld) > 0 {
+		s.logger.Warn("apt entries carry a URL with userinfo, a query or a fragment in an architecture, pool path or digest, which the index would publish as written, so they reach no index; record the value itself with 'bodega pkg edit' and rotate the credential",
+			"count", len(withheld), "entries", capForLog(withheld))
 	}
 }
 
@@ -1389,6 +1398,9 @@ func (s *Server) aptArchitectures(ctx context.Context, suite string) []string {
 		}
 		for _, ve := range pm.Versions {
 			if ve.Hidden || ve.Version == "*" || !ve.InSuite(suite, s.cfg.AptCodename) {
+				continue
+			}
+			if manifest.AptIdentityWithheld(ve.Metadata) != "" {
 				continue
 			}
 			if arch := ve.Metadata["Architecture"]; arch != "" && arch != "all" {
@@ -1471,6 +1483,12 @@ func (s *Server) aptSuiteStanzas(ctx context.Context, suite, arch string, poolMa
 			// publishing it hands clients a package nobody can withdraw.
 			// auditAptEntries reports these once per rebuild.
 			if ve.Version == "" {
+				continue
+			}
+			// The index publishes these values as written, and cutting one
+			// would rename an index or publish a digest nothing matches.
+			// auditAptEntries reports these once per rebuild.
+			if manifest.AptIdentityWithheld(ve.Metadata) != "" {
 				continue
 			}
 			veArch := ve.Metadata["Architecture"]

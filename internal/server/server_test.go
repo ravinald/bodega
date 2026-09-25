@@ -1314,3 +1314,89 @@ func TestAptPackagesWithholdsCredentialsInMetadataURLs(t *testing.T) {
 		t.Errorf("Packages cut a metadata value that is not a URL:\n%s", s)
 	}
 }
+
+// Architecture, _pool_path and the digests reach the apt index as what they
+// are, so a credential in one cannot be cut out the way a text field's is:
+// Architecture names index paths in Release and InRelease, and the rest are
+// the Filename and checksums apt acts on. An entry already stored with one
+// stays out of every index instead, and the rest of the suite still serves.
+func TestAptIndexWithholdsAnEntryWithACredentialInAnIdentityField(t *testing.T) {
+	installTestSigningKey(t, 1)
+	for _, key := range []string{"Architecture", "_pool_path", "_md5", "_sha1", "_sha256"} {
+		for _, value := range []string{
+			"https://ident-user:ident-secret@ident.example/x",
+			"https://ident.example/x?token=ident-secret",
+		} {
+			t.Run(key+"/"+value, func(t *testing.T) {
+				store := manifest.NewLocalStore(t.TempDir())
+				md := map[string]string{
+					"Architecture": "amd64",
+					"_pool_path":   "pool/main/p/probe/probe_1.0_amd64.deb",
+				}
+				md[key] = value
+				// Written past admission, which refuses this, as a manifest
+				// stored before the rule existed would be.
+				if err := store.AddVersion(t.Context(), manifest.TypeApt, "probe", manifest.VersionEntry{Version: "1.0", Metadata: md}); err != nil {
+					t.Fatal(err)
+				}
+				if err := store.AddVersion(t.Context(), manifest.TypeApt, "plain", manifest.VersionEntry{Version: "2.0", Metadata: map[string]string{
+					"Architecture": "amd64",
+					"_pool_path":   "pool/main/p/plain/plain_2.0_amd64.deb",
+					"_sha256":      strings.Repeat("ab", 32),
+				}}); err != nil {
+					t.Fatal(err)
+				}
+				mock := memStore(map[string]string{
+					"packages/apt/pool/main/p/probe/probe_1.0_amd64.deb": "probe",
+					"packages/apt/pool/main/p/plain/plain_2.0_amd64.deb": "plain",
+				})
+				cfg := &config.Config{Bucket: "test", Region: "us-west-2", ManifestDir: t.TempDir(), AptCodename: "noble"}
+				h := server.New(cfg, store, storage.NewSingle(mock), ":0", nil).Handler()
+
+				get := func(path string) string {
+					req := httptest.NewRequest(http.MethodGet, path, nil)
+					req.RemoteAddr = "203.0.113.9:40000"
+					rr := httptest.NewRecorder()
+					h.ServeHTTP(rr, req)
+					if rr.Code != http.StatusOK {
+						t.Fatalf("GET %s: %d %s", path, rr.Code, rr.Body.String())
+					}
+					if !strings.HasSuffix(path, ".gz") {
+						return rr.Body.String()
+					}
+					z, err := gzip.NewReader(rr.Body)
+					if err != nil {
+						t.Fatalf("GET %s: %v", path, err)
+					}
+					raw, err := io.ReadAll(z)
+					if err != nil {
+						t.Fatalf("GET %s: %v", path, err)
+					}
+					return string(raw)
+				}
+
+				bodies := map[string]string{}
+				for _, path := range []string{
+					"/apt/dists/noble/main/binary-amd64/Packages",
+					"/apt/dists/noble/main/binary-amd64/Packages.gz",
+					"/apt/dists/noble/Release",
+					"/apt/dists/noble/InRelease",
+				} {
+					bodies[path] = get(path)
+					for _, secret := range []string{"ident-user", "ident-secret"} {
+						if strings.Contains(bodies[path], secret) {
+							t.Errorf("GET %s publishes %q from metadata[%s]:\n%s", path, secret, key, bodies[path])
+						}
+					}
+				}
+				packages := bodies["/apt/dists/noble/main/binary-amd64/Packages"]
+				if !strings.Contains(packages, "Package: plain\n") || strings.Contains(packages, "Package: probe\n") {
+					t.Errorf("Packages should carry plain and not probe:\n%s", packages)
+				}
+				if !strings.Contains(bodies["/apt/dists/noble/Release"], "Architectures: amd64\n") {
+					t.Errorf("Release lost the ordinary architecture:\n%s", bodies["/apt/dists/noble/Release"])
+				}
+			})
+		}
+	}
+}

@@ -168,6 +168,10 @@ func validate(cfg *config.Config, pm *manifest.PackageManifest, res *Result) err
 					return fmt.Errorf("apt/%s version %s: %w", pm.Name, versionLabel(ve), err)
 				}
 			}
+			if k := manifest.AptIdentityWithheld(ve.Metadata); k != "" {
+				return fmt.Errorf("apt/%s version %s: metadata.%s is a URL carrying userinfo, a query or a fragment, and the apt index publishes it to every caller as written; record the architecture, pool path or digest itself",
+					pm.Name, versionLabel(ve), k)
+			}
 		}
 	}
 	return nil

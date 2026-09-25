@@ -375,6 +375,26 @@ func AttestationURIWithheld(uri string) bool {
 	return redirected && PublicURL(uri) != uri
 }
 
+// aptIdentityKeys are the apt metadata values the index publishes as what they
+// are rather than as text: Architecture names the Packages index and appears in
+// Release, _pool_path is the Filename apt fetches, and the digests are what apt
+// checks the bytes against. Cutting a credential out of one would rename an
+// index, point a client at other bytes or publish a checksum nothing matches.
+var aptIdentityKeys = []string{"Architecture", "_pool_path", "_md5", "_sha1", "_sha256"}
+
+// AptIdentityWithheld returns the first apt identity key in md whose value
+// carries a part PublicMetadataValue withholds, or "" when none does. Such an
+// entry is refused at admission and left out of the index, never published
+// through the cut.
+func AptIdentityWithheld(md map[string]string) string {
+	for _, k := range aptIdentityKeys {
+		if v := md[k]; PublicMetadataValue(v) != v {
+			return k
+		}
+	}
+	return ""
+}
+
 // PublicMetadataValue returns v as a caller with no token may see it: through
 // PublicURL when v is written as a URL, and unchanged otherwise.
 //

@@ -22,6 +22,15 @@ import (
 // to it says.
 func signedTestServer(t *testing.T, keys int) (*httptest.Server, *aptsign.KeyRing) {
 	t.Helper()
+	kr := installTestSigningKey(t, keys)
+	ts, _ := newTestServer(t)
+	return ts, kr
+}
+
+// installTestSigningKey writes a keyring of the given size where a server
+// built after it searches first, and returns it.
+func installTestSigningKey(t *testing.T, keys int) *aptsign.KeyRing {
+	t.Helper()
 	dir := t.TempDir()
 	t.Setenv(aptsign.CredentialsEnv, dir)
 
@@ -39,9 +48,7 @@ func signedTestServer(t *testing.T, keys int) (*httptest.Server, *aptsign.KeyRin
 	if err := kr.WritePrivate(filepath.Join(dir, aptsign.KeyFileName)); err != nil {
 		t.Fatalf("WritePrivate: %v", err)
 	}
-
-	ts, _ := newTestServer(t)
-	return ts, kr
+	return kr
 }
 
 // TestInReleaseWrapsReleaseUnchanged is the property apt depends on: the

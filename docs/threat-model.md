@@ -157,16 +157,35 @@ risk:
   - **`metadata` is public by contract.** bodega never fetches with a
     metadata value. Every value is published, except that a value written
     as a URL (a scheme followed by `/` or `\`, `http:` or `https:`, or
-    `//host`) goes through the same cut as `url`, whatever its key. A
-    secret that is not part of a URL is published as written.
+    `//host`) goes through the same cut as `url`, whatever its key, except
+    the five apt keys below, which are refused rather than cut. The test is
+    on the whole value: a URL inside longer text (`see
+    https://user:secret@host/`), a schemeless `user:secret@host/x` and a
+    secret that is not part of a URL are published as written.
   - **`metadata.attestation_uri` takes no credential.** Its endpoint answers
     an `http(s)` uri with a 302 whose `Location` the client follows, so the
     uri cannot be cut without breaking the fetch. Admission refuses one
     carrying userinfo, a query or a fragment, and the endpoint answers one
     already stored with a 502 rather than a redirect. An `s3://` uri is read
     by bodega with its own backend credentials and never reaches the client.
+  - **An apt entry's `Architecture`, `_pool_path`, `_md5`, `_sha1` and
+    `_sha256` take no credential.** The apt index publishes them as what
+    they are: `Architecture` names the index paths and the `Architectures`
+    line in `Release` and the signed `InRelease`, `_pool_path` is the
+    `Filename` apt fetches, and the digests are what apt checks the bytes
+    against. Cutting a credential out of one would rename an index or
+    publish a checksum nothing matches, so admission refuses a URL with
+    userinfo, a query or a fragment in any of them, and an entry already
+    stored with one reaches no index. Each rebuild logs it by key, never by
+    value.
   - **Every other field is public by contract**: names, versions,
-    descriptions, dependencies, checksums, suites and storage names.
+    descriptions, dependencies (an npm `git+https://token@host/` spec
+    included), checksums, suites, storage names, metadata keys,
+    `build_cmd` and `build_env`. The read routes return each as written,
+    and the npm packument, the cargo index, `index.yaml`, the apt stanza
+    and `/api/v1/status` carry the names, versions, descriptions and
+    dependencies among them. A token in a `build_cmd` is published to
+    every caller.
 
   The rule is enforced where each response is built, not where the manifest
   is loaded, so a manifest stored before the rule existed is covered without
@@ -182,14 +201,18 @@ risk:
 
   - **Anonymous: every caller.** The four `/api/v1/packages` read routes and
     the web UI that reads them; the attestation route; the apt `Packages`
-    stanza, which copies every metadata key; `/api/v1/status`, which blanks
+    stanza, which copies every metadata key, and `Release` and `InRelease`,
+    which name every architecture; `/api/v1/status`, which blanks
     `freebsd.refused[].error` (it quotes the url), `spool.dir`, `version`,
     `freebsd.key_error` and `backend_entries[].error` outside
     `admin_permit_cidr` (see [usage.md](usage.md)); and the package routes
     (`/apt/`, `/freebsd/`, `/binaries/` and the rest), which answer a
     failure with a fixed body and put the reason, url included, in the log.
     npm, cargo and helm indexes are built from bodega's own base URL and
-    carry no manifest `url` or metadata.
+    carry no manifest `url` or metadata. One anonymous body quotes a
+    config value rather than a manifest one: the pypi 404 for a
+    distribution no manifest names prints `pypi_upstream` as written, which
+    is open as B95.
   - **Admin range: no token needed.** Inside `admin_permit_cidr` the
     `/api/v1/status` fields above are returned in full with no
     `Authorization` header. `/api/v1/audit` is gated the same way and
