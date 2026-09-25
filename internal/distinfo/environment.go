@@ -69,7 +69,7 @@ var (
 
 // clientCheckVersion is hashed into every digest, so a client check written
 // under different rules never names an environment this one admits against.
-const clientCheckVersion = "bodega distfiles client check 3"
+const clientCheckVersion = "bodega distfiles client check 4"
 
 // reservedEnvVars are the variables the reader derives itself, or reads as a
 // port's own declaration. A client make.conf that set one would change every
@@ -218,14 +218,18 @@ var clientReserved = []string{"DISTINFO_FILE", "FILESDIR", "LICENSE", "LICENSE_P
 //   - no makefile make.conf reads changes how make parses (.MAKEFLAGS, .PATH,
 //     .READONLY and the like) or sets a license, and every makefile read after
 //     make.conf is under /usr/share/mk, under the ports tree as make.conf left
-//     PORTSDIR, or declared with a snapshot.
+//     PORTSDIR, or declared with a snapshot;
+//   - the ports tree and /usr/share/mk each sit on a read-only mount that make
+//     cannot lift (see stableView), so no command a port runs changes a file
+//     make includes from either after the reader read it.
 //
 // The inputs are measured as make.conf is read, before the port, and again
 // wherever BODEGA_DISTFILES_ENV is expanded, which is when the fetch builds
 // its site list or its DISTDIR. Neither sees bytes make read in between that
-// were written and put back, so neither binds them. A path declared absent is
-// bound by .MAKE.MAKEFILES, make's own list of what it read, which nothing
-// undoes. A snapshot path is bound by its writers (see writers) and by the
+// were written and put back, so neither binds them. The tree and /usr/share/mk
+// are bound by their read-only mounts, which nothing in the run can write
+// through. A path declared absent is bound by .MAKE.MAKEFILES, make's own
+// list of what it read, which nothing undoes. A snapshot path is bound by its writers (see writers) and by the
 // reader, which refuses one read after a command could have run. The port is
 // read after this fragment, so every variable it sets is .READONLY. Each delivery is
 // keyed by the name this sets: the HTTP route admits only under the digest the
@@ -287,11 +291,17 @@ BODEGA_DISTFILES_DRIFT+=	${_BODEGA_DISTFILES_CONF}
 .endif
 _BODEGA_DISTFILES_READ:=	${.MAKE.MAKEFILES:@_bodega_f@N${_bodega_f}@:ts:}
 _BODEGA_DISTFILES_TREE:=	${PORTSDIR:U/usr/ports}
-`, allowed.String(), confPattern)
+_BODEGA_DISTFILES_STABLE=	%s
+_BODEGA_DISTFILES_STABLE_NOW:=	${_BODEGA_DISTFILES_STABLE:sh}
+.if !empty(_BODEGA_DISTFILES_STABLE_NOW)
+BODEGA_DISTFILES_DRIFT+=	${_BODEGA_DISTFILES_STABLE_NOW}
+.endif
+`, allowed.String(), confPattern, stableView)
 
 	// .MAKEFLAGS is read above, once: it holds each -V argument unexpanded,
 	// and -V '${BODEGA_DISTFILES_ENV}' would make a later read recursive.
 	late := []string{
+		"${_BODEGA_DISTFILES_STABLE:sh}",
 		`${"${.SYSPATH}" == "` + clientSysPath + `":?:.SYSPATH}`,
 		`${"${.PATH}" == ". ${.CURDIR}":?:.PATH}`,
 		`${"${.OBJDIR}" == "${.CURDIR}":?:.OBJDIR}`,
@@ -358,6 +368,24 @@ _BODEGA_DISTFILES_TREE:=	${PORTSDIR:U/usr/ports}
 	fmt.Fprintf(&b, ".READONLY:\t%s\n", strings.Join(checkVariables(b.String()), " "))
 	return []byte(b.String())
 }
+
+// stableView is the shell command that prints why the ports tree or
+// clientSysPath could change while make reads a port, and nothing when
+// neither can. Each must sit on a read-only mount with no writable mount
+// beneath it, and make must be unable to lift one: not root unless jailed
+// without mount privilege, and vfs.usermount off. A command a port runs,
+// which runs as that user, then cannot create or replace a file make
+// includes later there, and the bytes make reads are the ones the reader
+// read. Measuring the files instead would not do: a file written, read and
+// removed between two measurements looks unchanged to both.
+//
+// mount -p lists mounts in the order they were made, and a mount hides every
+// earlier one at or below its mount point, so the last mount whose point is a
+// prefix of the path is the one that serves it, and only a writable mount
+// beneath the path made after that one is reachable. A path outside
+// clientPath's characters is refused rather than matched against mount -p,
+// which encodes them.
+const stableView = `if [ "$$(/sbin/sysctl -n security.jail.jailed)" = 1 ]; then [ "$$(/sbin/sysctl -n security.jail.mount_allowed)" = 0 ] || echo remountable:jail; elif [ "$$(/usr/bin/id -u)" = 0 ]; then echo remountable:root; fi; [ "$$(/sbin/sysctl -n vfs.usermount)" = 0 ] || echo remountable:usermount; for p in "${_BODEGA_DISTFILES_TREE}" ` + clientSysPath + `; do t=$$(/bin/realpath "$$p" 2>/dev/null) || t=; case "$$t" in ""|/|*[!A-Za-z0-9._/+@%,=-]*) echo "writable:$$p"; continue;; esac; /sbin/mount -p | /usr/bin/awk -v t="$$t" '{ ro = ("," $$4 ",") ~ /,ro,/ } $$2 == "/" || $$2 == t || index(t, $$2 "/") == 1 { cover = ro; w = ""; next } index($$2, t "/") == 1 && ro == 0 { w = w " writable:" $$2 } END { if (cover == 0) w = w " writable:" t; if (w != "") print w }'; done`
 
 // writers is the shell command that prints each component of p, the file
 // and every directory above it, that someone other than root and the user

@@ -148,21 +148,27 @@ risk:
   that leaves the tree on the way refuses the port. A `.MAKEFLAGS:` line is
   expanded whole before it is split, as base `make` splits it, so an
   assignment its expansion carries is read. A command `make` runs while it
-  parses (`!=`, `:sh`, `:!cmd!`) may write any file, so a port that runs one
-  before it includes a client-host path is refused; the framework runs
-  commands a port chooses at every framework include, so a snapshot read
-  after one is refused as well. The declaration is bound
-  to the client by a check the client runs: bodega generates a `make`
-  fragment from it (`/distfiles/@environment.mk`), the
-  client includes it at the end of `/etc/make.conf`, and it names the
-  declaration's digest only while every declared file and variable holds a
-  declared value, no restriction or ownership variable is set outside the
-  tree, the command line carries no undeclared variable, `make` looks for
-  includes where the scan does, and every makefile it reads is under
-  `/usr/share/mk`, in the tree, or declared. It measures the files again after
-  the port has been read, where the fetch expands the digest. The HTTP route
-  serves only `/distfiles/@<digest>/<name>` for the digest the server
-  admitted against, answering anything else `451` before
+  parses (`!=` under any name, a computed one such as `_${N}!=` included,
+  `:sh`, `:!cmd!`) may write any file, so a port that runs one before it
+  includes a client-host path is refused; the framework runs commands a port
+  chooses at every framework include, so a snapshot read after one is refused
+  as well. Inside the tree the same command could write a file the port then
+  includes, and the scan reads the server's copy of that path, so the tree is
+  held still instead: the client check names no environment unless the ports
+  tree and `/usr/share/mk` each sit on a read-only mount that `make` cannot
+  lift. A command a port runs then fails to write either, and `make` reads
+  the bytes the scan read. The declaration is bound to the client by a check
+  the client runs: bodega generates a `make` fragment from it
+  (`/distfiles/@environment.mk`), the client includes it at the end of
+  `/etc/make.conf`, and it names the declaration's digest only while every
+  declared file and variable holds a declared value, no restriction or
+  ownership variable is set outside the tree, the command line carries no
+  undeclared variable, `make` looks for includes where the scan does, every
+  makefile it reads is under `/usr/share/mk`, in the tree, or declared, and
+  both of those directories are read-only to it. It measures all of that
+  again after the port has been read, where the fetch expands the digest.
+  The HTTP route serves only `/distfiles/@<digest>/<name>` for the digest the
+  server admitted against, answering anything else `451` before
   storage or upstream is touched, and the builder writes each environment's
   `DISTDIR` under `@<digest>`. A client that drifts names `unsupported` and is
   served by neither. The server holds the first digest it read for its life,
@@ -413,7 +419,8 @@ defence against:
   way is only what bodega admitted for the declared environment, which the
   operator decided may be redistributed under the declared terms. The check
   trusts the client's own `/bin/sh`, `/sbin/sha256`, `/usr/bin/timeout`,
-  `/usr/bin/env`, `/usr/bin/grep`, `/usr/bin/find`, `/usr/bin/id` and base
+  `/usr/bin/env`, `/usr/bin/grep`, `/usr/bin/find`, `/usr/bin/id`,
+  `/sbin/sysctl`, `/sbin/mount`, `/bin/realpath`, `/usr/bin/awk` and base
   system makefiles under `/usr/share/mk`.
 - **What the check measures, and when.** It measures the declared files as
   `make` starts and again where the fetch expands the digest. Two measurements
@@ -446,16 +453,29 @@ defence against:
   and a port reading one undeclared is refused. It trusts `/usr/share/mk` to
   be the base system's, because the framework and every relative include the
   tree does not hold reach it.
-- **A port that rewrites its own tree while `make` reads it.** bodega reads
-  the server's copy of the tree and believes the client's holds the same
-  bytes; nothing in the check measures the tree. A port that runs a command
-  while it parses (its own, or one it chooses through the variables a
-  framework command is built from) can write a file under the client's
-  `/usr/ports` and include it, and bodega reads the server's copy of that path
-  instead. Keeping the client's tree equal to the one bodega reads is the
-  operator's, as it was before any environment was declared; the scan does not
-  refuse in-tree includes after a command, because the stock framework runs
-  commands before nearly every port's first include.
+- **What holds the tree still, and what it costs.** The stock framework runs
+  commands before nearly every port's first include, and a port chooses them
+  through the variables they are built from, so refusing every include after
+  a command refuses most of the tree (34,282 ports went unplaced when that
+  was tried). The check holds the tree instead: `/sbin/mount -p` must show the
+  ports tree, as `make.conf` left `PORTSDIR`, and `/usr/share/mk` each on a
+  read-only mount with no writable mount beneath it, and `make` must be
+  unable to lift one: not root, unless jailed without `allow.mount`, and
+  `vfs.usermount` off. Anything else names `unsupported` (`remountable:root`,
+  `writable:<mount>`). A root `make` outside a jail is refused however the
+  tree is mounted, because a command it runs could remount it. Measuring
+  files would not do: a file written, read and removed between two
+  measurements looks unchanged to both. The cost falls on the client: mount
+  both read-only (a `nullfs` mount over itself does it), keep `DISTDIR`,
+  `WRKDIRPREFIX` and `PACKAGES` outside the tree, and run `make fetch` as an
+  unprivileged user or in a jail.
+- **A client tree that differs from the server's before `make` starts.**
+  bodega reads the server's copy of the tree and believes the client's holds
+  the same bytes. The check holds the client's tree still while `make` runs;
+  it measures no file in it, so it cannot tell a tree at another revision, or
+  one edited before it was mounted, from the one bodega read. Keeping the
+  client's tree equal to the server's is the operator's, as it was before any
+  environment was declared.
 - **A client that holds a file only a snapshot could describe.** A snapshot is
   read only where nothing can have changed it first: before the port's first
   framework include and before any command. The stock ports that read
@@ -681,7 +701,10 @@ instance, the recommended posture is:
   the command line. Install the client check from
   `/distfiles/@environment.mk` as the last line of every client's
   `/etc/make.conf`, and key `MASTER_SITE_OVERRIDE` and `DISTDIR` on
-  `${BODEGA_DISTFILES_ENV}`, never on a digest written by hand. Revisit the
+  `${BODEGA_DISTFILES_ENV}`, never on a digest written by hand. Mount the
+  ports tree and `/usr/share/mk` read-only on every client and run the fetch
+  as an unprivileged user or in a jail, or the check names `unsupported`.
+  Revisit the
   declaration when a client's `make.conf` changes, an architecture is added,
   or a package installs a file a port includes, such as aspell's
   `etc/aspell.ver`, and fetch the check again on every client when it

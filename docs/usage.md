@@ -3757,7 +3757,7 @@ bodega cannot see a client, so it reads every port against a declared environmen
 - A relative `.include` that exists nowhere the port's own files are is looked for in the client's `/usr/share/mk`, as base `make` looks for it, and that path is answered by the declaration like any other outside the tree. `german/webalizer2` and `japanese/webalizer` `.sinclude "Makefile.local"`.
 - `PORTSDIR`, `MASTERDIR`, `FILESDIR`, `PKGDIR`, `DISTINFO_FILE`, `RESTRICTED`, `NO_CDROM`, `LICENSE` and `LICENSE_PERMS*` cannot be declared. A client setting one for every port is not modeled, and the configuration is refused at load.
 - A `.MAKEFLAGS:` or `.MFLAGS:` line is expanded whole before it is split into arguments, as base `make` does, so `.MAKEFLAGS: P=${ARGS}` with `ARGS=x Q=y` sets `Q` on the command line as well as `P`. A line whose expansion reads a variable the client may set, or one the scan cannot expand, refuses the port: `multimedia/x264` passes `WITH="${OPTIONS_DEFINE}"` after `OPTIONS_DEFINE+=`, and a `make.conf` value holding a quote would add an assignment of its own. Declare `OPTIONS_DEFINE` unset to admit it.
-- A command `make` runs while it reads the port (a `!=` assignment, or a `:sh`, `:!cmd!` or `::!=` modifier outside a recipe) may write any file. A port that runs one and then includes a path outside the tree is refused, whatever the declaration says about that path.
+- A command `make` runs while it reads the port (a `!=` assignment under any name, a computed one such as `_${N}!=` included, or a `:sh`, `:!cmd!` or `::!=` modifier outside a recipe) may write any file. `make` runs a `!=` command when it reads the line, whether or not anything reads the variable. A port that runs one and then includes a path outside the tree is refused, whatever the declaration says about that path. A line such as `.${N}!= cmd`, which base `make` reads as an assignment to a name opening with `.`, is refused outright. Inside the tree the same command could write a file the port then includes; the client check holds the tree read-only instead of the scan refusing (see [The client check](#the-client-check)).
 
 A file declared with a snapshot is harder to bind than one declared absent, and it is read only where nothing can have changed it first:
 
@@ -3818,7 +3818,22 @@ The check tests, in the `make` that reads the port:
 - The command line: every variable on it, including one passed through `MAKEFLAGS` in the environment, is a declared one or one the framework passes on itself (`OSVERSION` and the rest of `_EXPORTED_VARS`). A command-line variable overrides every assignment a port makes, so `make fetch BATCH=yes` names `unsupported` until `BATCH` is declared with the value you pass.
 - How `make` looks for files: no `-e`, which lets the environment override a port's assignments, and no `-I`; `.SYSPATH` is `/usr/share/mk`, `.PATH` is `.` and `.CURDIR`, and `.OBJDIR` is `.CURDIR`, so no `obj` directory or `MAKEOBJDIRPREFIX` moves the search for a relative include. A makefile read before the check may not use `.MAKEFLAGS`, `.MFLAGS`, `.READONLY`, `.NOREADONLY`, `.PATH`, `.OBJDIR`, `.POSIX`, `.SYSPATH` or assign `.CURDIR`, `.PARSEDIR`, `.PARSEFILE` or `.MAKEOVERRIDES`.
 - Every makefile `make` reads after `make.conf` is under `/usr/share/mk`, under `${PORTSDIR}` as `make.conf` left it, relative to the port's directory, or declared with a snapshot. A `-f` file, and a saved options file under `/var/db/ports` that nobody declared, names `unsupported`.
+- The ports tree, as `make.conf` left `PORTSDIR`, and `/usr/share/mk` each sit on a read-only mount with no writable mount beneath it, and `make` cannot lift one: it is not root, unless jailed without `allow.mount`, and `vfs.usermount` is 0. A command a port runs while `make` reads it then cannot create or replace a file `make` includes later from either, so what `make` reads there is what the scan read. Measuring the files would not bind them: one written, read and removed again looks unchanged to both measurements. A writable tree names `unsupported` with `writable:<mount>`, and a root `make` outside a jail with `remountable:root`, however the tree is mounted.
 - The port is read after the check, so the check marks every variable it sets `.READONLY`. A port that assigns `BODEGA_DISTFILES_ENV` or `BODEGA_DISTFILES_DRIFT`, directly, through a computed name, a modifier or `.MAKEFLAGS`, changes nothing; one that uses `.NOREADONLY`, or assigns or undefines a variable `make` sets itself such as `.MAKE.MAKEFILES`, is refused by the scan.
+
+Mount the tree and the base makefiles read-only on each client before you include the check. A `nullfs` mount over itself does it without moving anything, and `/etc/fstab` keeps it across a reboot:
+
+```sh
+mount -t nullfs -o ro /usr/ports /usr/ports
+mount -t nullfs -o ro /usr/share/mk /usr/share/mk
+```
+
+```text
+/usr/ports      /usr/ports      nullfs  ro  0  0
+/usr/share/mk   /usr/share/mk   nullfs  ro  0  0
+```
+
+Nothing can then be written under the tree, so keep `WRKDIRPREFIX`, `PACKAGES` and `DISTDIR` outside it (the `DISTDIR` below already is), and update the tree between fetches with the read-only mount lifted (`umount /usr/ports`). Run `make fetch` as an unprivileged user, or as root inside a jail that does not allow mounting, which is how `poudriere` builds. A root shell outside a jail names `unsupported` for every port, including when you ask it why.
 
 Fetch it once per client, and again whenever the declaration changes:
 
@@ -3828,7 +3843,7 @@ fetch -o /usr/local/etc/bodega-distfiles.mk https://bodega-host:8080/distfiles/@
 
 `build fetch distfiles` also writes it to `<distfiles_root>/distfiles/@environment.mk`, so a client that mounts that directory can include it from the mount and follow the builder's declaration without copying anything. A client still running a check for an older declaration names that declaration's digest, which the server refuses until the client fetches the check again.
 
-When a client is refused, ask its `make` why, in the port's directory:
+When a client is refused, ask its `make` why, in the port's directory, as the user that runs the fetch:
 
 ```sh
 make -C /usr/ports/sysutils/pcpustat -V BODEGA_DISTFILES_ENV -V BODEGA_DISTFILES_DRIFT

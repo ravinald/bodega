@@ -212,6 +212,15 @@ func TestEnvironmentSnapshotAfterACommand(t *testing.T) {
 		"an include before a command in one loop":     {".for i in a b\n.sinclude \"" + host + "\"\n_W!=\ttrue\n.endfor\n", []string{Absent}, "next iteration"},
 		"a snapshot before the framework in one loop": {".for i in a b\n.sinclude \"" + host + "\"\n.include <bsd.port.options.mk>\n.endfor\n", []string{snapshot(t, "OK=yes\n")}, "next iteration reads " + host},
 		"a snapshot after an included command":        {".include \"${.CURDIR}/run.mk\"\n.sinclude \"" + host + "\"\n", []string{snapshot(t, "OK=yes\n")}, "run.mk runs a command"},
+		// make runs a != command under a computed name as it reads the line,
+		// whether or not anything reads the variable: the F25 audit wrote
+		// the snapshot path, included it and wrote it back, all under _${N}.
+		"a computed-name command before a snapshot":             {"N=W\n_${N}!= printf 'NO_CDROM=computed terms\\n' > " + host + "\n.sinclude \"" + host + "\"\nN=R\n_${N}!= printf 'OK=yes\\n' > " + host + "\n", []string{snapshot(t, "OK=yes\n")}, "runs a command while make parses it"},
+		"a computed-name command before an absent path":         {"N=W\n_${N} !=\ttrue\n.sinclude \"" + host + "\"\n", []string{Absent}, "runs a command while make parses it"},
+		"an include before a computed-name command in one loop": {"N=W\n.for i in a b\n.sinclude \"" + host + "\"\n_${N}${i}!=\ttrue\n.endfor\n", []string{Absent}, "next iteration"},
+		"a computed-name command in a loop before a snapshot":   {"N=W\n.for i in a b\n_${N}!=\ttrue\n.endfor\n.sinclude \"" + host + "\"\n", []string{snapshot(t, "OK=yes\n")}, "runs a command while make parses it"},
+		// base make reads ".${N}!=" as an assignment to .W, running the command.
+		"a computed name opening with a dot": {"N=W\n.${N}!=\ttrue\n", []string{Absent}, "assigns a name built from a variable"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			root := portsTree(t)
@@ -478,6 +487,11 @@ func TestClientCheckNamesEveryDeclaredInput(t *testing.T) {
 		// the makefile list exempts by setting PORTSDIR.
 		"_BODEGA_DISTFILES_TREE:=\t${PORTSDIR:U/usr/ports}\n",
 		":N${_BODEGA_DISTFILES_TREE}/*",
+		// The tree and /usr/share/mk sit on read-only mounts make cannot
+		// lift, as make.conf is read and again where the fetch reads the digest.
+		"_BODEGA_DISTFILES_STABLE=\t" + stableView + "\n",
+		"_BODEGA_DISTFILES_STABLE_NOW:=\t${_BODEGA_DISTFILES_STABLE:sh}\n.if !empty(_BODEGA_DISTFILES_STABLE_NOW)\nBODEGA_DISTFILES_DRIFT+=\t${_BODEGA_DISTFILES_STABLE_NOW}\n",
+		"BODEGA_DISTFILES_DRIFT+=\t${_BODEGA_DISTFILES_STABLE:sh} ",
 		".READONLY:\tBODEGA_DISTFILES_DRIFT BODEGA_DISTFILES_ENV _BODEGA_DISTFILES_ARGS _BODEGA_DISTFILES_CONF ",
 	} {
 		if !strings.Contains(check, want) {
@@ -508,7 +522,21 @@ func TestClientCheckUnderBaseMake(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(scratch) })
 	client := filepath.Join(scratch, "client")
-	tree := filepath.Join(scratch, "ports")
+	// Every write goes to src; make reads the tree through a read-only
+	// nullfs view of it, and /usr/share/mk through another, which is the
+	// stable view the check requires.
+	src := filepath.Join(scratch, "ports")
+	tree := filepath.Join(scratch, "ro")
+	if err := os.MkdirAll(filepath.Join(src, "distfiles"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(tree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mount(t, "ro", src, tree)
+	if out, _ := exec.Command("/sbin/mount", "-p").Output(); !strings.Contains(string(out), "/usr/share/mk\t\t/usr/share/mk\t\tnullfs\tro") {
+		mount(t, "ro", clientSysPath, clientSysPath)
+	}
 	snap := snapshot(t, "OK=snapshot\n")
 	declared := filepath.Join(client, "snap.mk")
 	absent := filepath.Join(client, "aspell.ver")
@@ -529,9 +557,9 @@ func TestClientCheckUnderBaseMake(t *testing.T) {
 	if err := os.WriteFile(checkPath, env.ClientCheck(), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	conf := func(extra string) string {
+	conf := func(extra, portsdir string) string {
 		p := filepath.Join(t.TempDir(), "make.conf")
-		if err := os.WriteFile(p, []byte(extra+"PORTSDIR=\t"+tree+"\n.include \""+checkPath+"\"\n"), 0o644); err != nil {
+		if err := os.WriteFile(p, []byte(extra+"PORTSDIR=\t"+portsdir+"\n.include \""+checkPath+"\"\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		return p
@@ -539,9 +567,15 @@ func TestClientCheckUnderBaseMake(t *testing.T) {
 	extra := filepath.Join(scratch, "extra.mk")
 	write(t, scratch, "extra.mk", "P=\t"+tree+"/misc/probe/restricted.mk\n")
 	port := filepath.Join(tree, "misc/probe")
+	inTree := func(root string) string {
+		f := root + "/misc/probe/terms.mk"
+		return "_W!=\tprintf 'NO_CDROM=in-tree terms\\n' > " + f + "\n.sinclude \"" + f + "\"\n_R!=\trm -f " + f + "\nall:\n"
+	}
 	for _, tc := range []struct {
 		name  string
 		conf  string
+		tree  string // PORTSDIR, when not the read-only view
+		root  bool   // run make as root
 		env   []string
 		args  []string
 		setup func()
@@ -594,14 +628,31 @@ func TestClientCheckUnderBaseMake(t *testing.T) {
 				t.Fatal(err)
 			}
 		}},
-		{name: "an obj directory", setup: func() {
-			if err := os.MkdirAll(filepath.Join(port, "obj"), 0o755); err != nil {
+		// make moves .OBJDIR only to a directory it can write, which an obj
+		// directory in the read-only tree is not.
+		{name: "an obj directory in the read-only tree", setup: func() {
+			if err := os.MkdirAll(filepath.Join(src, "misc/probe/obj"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}, want: env.Digest()},
+		{name: "an obj directory under MAKEOBJDIRPREFIX", env: []string{"MAKEOBJDIRPREFIX=" + filepath.Join(scratch, "obj")}, setup: func() {
+			if err := os.MkdirAll(filepath.Join(scratch, "obj", port), 0o755); err != nil {
 				t.Fatal(err)
 			}
 		}},
+		// The F25 audit's in-tree witness: the port writes a file into its
+		// own tree, includes it and removes it. On a tree make can write,
+		// make reads the restriction and the check names no environment.
+		// On the read-only view the write fails, make reads what the
+		// reader read, and the digest stands.
+		{name: "the in-tree witness on a tree make can write", tree: src, setup: setPort(inTree(src))},
+		{name: "the in-tree witness on the read-only tree", setup: setPort(inTree(tree)), want: env.Digest()},
+		{name: "a writable mount beneath the tree", setup: func() { mount(t, "rw", client, filepath.Join(tree, "distfiles")) }},
+		{name: "make run as root outside a jail", root: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_ = os.RemoveAll(filepath.Join(port, "obj"))
+			_ = os.RemoveAll(filepath.Join(src, "misc/probe/obj"))
+			_ = os.RemoveAll(filepath.Join(scratch, "obj"))
 			_ = os.Remove(absent)
 			_ = os.Remove(declared)
 			if err := os.Chmod(filepath.Join(scratch, "client"), 0o755); err != nil {
@@ -616,22 +667,50 @@ func TestClientCheckUnderBaseMake(t *testing.T) {
 			if want == "" {
 				want = ClientUnsupported
 			}
+			portsdir, dir := tree, port
+			if tc.tree != "" {
+				portsdir, dir = tc.tree, filepath.Join(tc.tree, "misc/probe")
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			cmd := exec.CommandContext(ctx, "make", append(append([]string{"-C", port}, tc.args...), "-V", "BODEGA_DISTFILES_ENV", "-V", "BODEGA_DISTFILES_DRIFT")...)
+			argv := append(append([]string{"make", "-C", dir}, tc.args...), "-V", "BODEGA_DISTFILES_ENV", "-V", "BODEGA_DISTFILES_DRIFT", "-V", "${NO_CDROM:S/^/NO_CDROM=/}")
+			if tc.root {
+				argv = append([]string{"sudo", "-n", "env", "__MAKE_CONF=" + conf(tc.conf, portsdir)}, argv...)
+			}
+			cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 			cmd.WaitDelay = time.Second
-			cmd.Env = append(append(os.Environ(), "__MAKE_CONF="+conf(tc.conf)), tc.env...)
-			out, err := cmd.CombinedOutput()
+			cmd.Env = append(append(os.Environ(), "__MAKE_CONF="+conf(tc.conf, portsdir)), tc.env...)
+			var stderr strings.Builder
+			cmd.Stderr = &stderr
+			out, err := cmd.Output()
 			if err != nil {
-				t.Fatalf("make: %v\n%s", err, out)
+				t.Fatalf("make: %v\n%s%s", err, out, stderr.String())
 			}
 			lines := strings.SplitN(string(out), "\n", 2)
 			t.Logf("%s", strings.TrimSpace(string(out)))
 			if lines[0] != want {
 				t.Errorf("the check names %q, want %q", lines[0], want)
 			}
+			if want != ClientUnsupported && strings.Contains(string(out), "NO_CDROM=") {
+				t.Errorf("the check names the digest while make read a restriction:\n%s", out)
+			}
 		})
 	}
+}
+
+// mount puts a nullfs view of src at dst, read-only or read-write, for the
+// rest of the test. The check's stable view is a property of mounts, so a
+// test of it needs one, and only root can make one.
+func mount(t *testing.T, mode, src, dst string) {
+	t.Helper()
+	if out, err := exec.Command("sudo", "-n", "mount", "-t", "nullfs", "-o", mode, src, dst).CombinedOutput(); err != nil {
+		t.Skipf("mounting %s at %s needs passwordless sudo: %v: %s", src, dst, err, out)
+	}
+	t.Cleanup(func() {
+		if out, err := exec.Command("sudo", "-n", "umount", dst).CombinedOutput(); err != nil {
+			t.Errorf("unmount %s: %v: %s", dst, err, out)
+		}
+	})
 }
 
 // LookupIn answers only a client whose check named the digest the index was

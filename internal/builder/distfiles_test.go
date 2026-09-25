@@ -598,3 +598,40 @@ func symlinkBeforeParentBuilder(t *testing.T, makefile string) {
 		t.Fatalf("upload: %d paths, %v; want refused for the symlink target's NO_CDROM", len(paths), err)
 	}
 }
+
+// The F25 audit's computed-name fixture through the builder: the fetch writes
+// nothing and asks no upstream, and pcpustat's bytes seeded into the DISTDIR
+// are refused on upload rather than released.
+func TestDistfilesBuilderRefusesAComputedNameCommandBeforeASnapshot(t *testing.T) {
+	cfg, store, hits := distfilesRun(t, distfileBody)
+	host := "/client/terms.mk"
+	snap := filepath.Join(t.TempDir(), "terms.mk")
+	if err := os.WriteFile(snap, []byte("OK=yes\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(cfg.DistfilesPortsTree, "misc/probe/Makefile")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	makefile := "N=W\n_${N}!= printf 'NO_CDROM=computed terms\\n' > " + host + "\n.sinclude \"" + host + "\"\nN=R\n_${N}!= printf 'OK=yes\\n' > " + host + "\nDISTINFO_FILE=${PORTSDIR}/sysutils/pcpustat/distinfo\n"
+	if err := os.WriteFile(p, []byte(makefile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg.DistfilesEnvironment = distinfo.EnvironmentSpec{Files: map[string][]string{host: {snap}}}
+	s := FetchDistfiles(cfg, store, "pcpustat/1.6.tar.bz2")
+	if s.Failures != 1 || hits.Load() != 0 || len(distdirFiles(t, cfg)) != 0 || !strings.Contains(fmt.Sprint(s.Results[0].Err), "misc/probe is restricted or unreadable") {
+		t.Fatalf("fetch: %+v after %d upstream fetches, files %v; want refused naming misc/probe", s.Results, hits.Load(), distdirFiles(t, cfg))
+	}
+	dest := filepath.Join(ArtifactDir(cfg, manifest.TypeDistfiles), "pcpustat", "1.6.tar.bz2")
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dest, []byte(distfileBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	paths, release, err := DistfilesArtifactPaths(cfg, store, "pcpustat/1.6.tar.bz2")
+	defer release()
+	if err == nil || len(paths) != 0 {
+		t.Fatalf("upload: %d paths, %v; want the seeded bytes refused", len(paths), err)
+	}
+}

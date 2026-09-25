@@ -580,3 +580,33 @@ func symlinkBeforeParentHTTP(t *testing.T, makefile string) {
 		t.Fatalf("GET = %d %q after %d upstream fetches, want 451 naming the symlink target's NO_CDROM before any", code, body, hits.Load())
 	}
 }
+
+// The F25 audit's computed-name fixture through HTTP: _${N}!= writes the
+// declared snapshot path, the port includes it, and a second _${N}!= puts the
+// snapshot's bytes back. make reads NO_CDROM there, so the reader refuses the
+// port, and pcpustat's distinfo, which it names, with it: even a cached copy
+// is not served and upstream is never asked.
+func TestDistfilesRefusesAComputedNameCommandBeforeASnapshot(t *testing.T) {
+	host := "/client/terms.mk"
+	snap := filepath.Join(t.TempDir(), "terms.mk")
+	if err := os.WriteFile(snap, []byte("OK=yes\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tree := distfilesPortsTree(t)
+	p := filepath.Join(tree, "misc/probe/Makefile")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	makefile := "N=W\n_${N}!= printf 'NO_CDROM=computed terms\\n' > " + host + "\n.sinclude \"" + host + "\"\nN=R\n_${N}!= printf 'OK=yes\\n' > " + host + "\nDISTINFO_FILE=${PORTSDIR}/sysutils/pcpustat/distinfo\n"
+	if err := os.WriteFile(p, []byte(makefile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ts, mem, hits := distfilesFixtureIn(t, tree, distfileBody, func(cfg *config.Config) {
+		cfg.DistfilesEnvironmentFiles = map[string][]string{host: {snap}}
+	})
+	mem.Seed(manifest.DistfilesKey("pcpustat/1.6.tar.bz2"), distfileBody)
+	code, body := getBody(t, ts.URL+"/distfiles/pcpustat/1.6.tar.bz2")
+	if code != http.StatusUnavailableForLegalReasons || hits.Load() != 0 || !strings.Contains(body, "misc/probe is restricted or unreadable") {
+		t.Fatalf("GET = %d %q after %d upstream fetches, want 451 naming misc/probe before any", code, body, hits.Load())
+	}
+}

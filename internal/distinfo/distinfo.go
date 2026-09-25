@@ -380,14 +380,20 @@ func frameworkIncludeTails(portsTree string) []string {
 var shellModifier = regexp.MustCompile(`:(?:sh[:})]|!|:!=)`)
 
 // runsShell reports whether make may run a command while it parses line: a
-// != assignment, or a :sh, :! or ::!= modifier, which runs wherever make
-// expands it, a .if or a dependency line included.
+// != assignment under any name the reader reads as one, a computed name
+// included, or a :sh, :! or ::!= modifier, which runs wherever make expands
+// it, a .if or a dependency line included. make runs a != command when it
+// reads the line, so whether anything later reads the variable it assigns
+// does not enter into it.
 func runsShell(line string) bool {
 	if shellModifier.MatchString(line) {
 		return true
 	}
-	m := assignment.FindStringSubmatch(line)
-	return m != nil && m[2] == "!"
+	if m := assignment.FindStringSubmatch(line); m != nil {
+		return m[2] == "!"
+	}
+	_, op, _, ok := computedAssignment(line)
+	return ok && op == "!"
 }
 
 func joinContinuations(b []byte) []byte {
@@ -1617,10 +1623,10 @@ func (r *makeReader) include(file, line string, depth int, conditional, guarded,
 		found = append(found, srcs...)
 		maybeNone = maybeNone || none
 	}
-	// Inside the tree, what the client's make reads is the tree's bytes: that
-	// is the premise every read here rests on, and a port that rewrites its
-	// own tree breaks it wherever it does so (see docs/threat-model.md). A
-	// client-host path is bound by the check instead. One declared absent is
+	// Inside the tree, what the client's make reads is the bytes the reader
+	// read, whatever ran before: the client check names no environment unless
+	// the tree sits on a read-only mount make cannot lift (see stableView). A
+	// client-host path is bound by the check otherwise. One declared absent is
 	// bound whatever runs before it, because the check refuses any client whose
 	// make lists it among the files it read. One declared with a snapshot is
 	// bound only while nothing but root and the user running make can write it
@@ -1725,6 +1731,11 @@ func (r *makeReader) otherDirective(file, line, parseDir string, conditional boo
 	}
 	if dotAssign.MatchString(line) {
 		return refuse("assigns a variable make itself sets")
+	}
+	// make reads ".${X}= v" as an assignment to a name opening with ".",
+	// which may be one it sets itself, and runs a != command there.
+	if _, _, _, ok := computedAssignment(line); ok {
+		return refuse("assigns a name built from a variable, which may be one make itself sets")
 	}
 	if m := specialLine.FindStringSubmatch(line); m != nil {
 		switch {
