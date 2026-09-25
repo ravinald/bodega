@@ -331,6 +331,16 @@ func ensurePackagedPypi(bcfg *builder.Config, store *manifest.Store) *builder.Su
 	return builder.MergeSummaries(ss...)
 }
 
+// ensureFetchedDistfiles runs FetchDistfiles whenever an entry is selected,
+// not only when a file is missing. A file already in the DISTDIR may have been
+// written by another tool or admitted under an older tree, and FetchDistfiles
+// is what re-hashes it against the current distinfo, replaces it when it no
+// longer matches, and fails an entry whose port has since become restricted.
+// It reads the ports tree once per call, so it runs once for all entries.
+func ensureFetchedDistfiles(bcfg *builder.Config, store *manifest.Store, entryFilter string) *builder.Summary {
+	return builder.FetchDistfiles(bcfg, store, entryFilter)
+}
+
 // ensureMirroredFreeBSD mirrors any repository whose catalogue is not on disk
 // yet. There is no build or package step: the whole point of the type is that
 // bodega produces none of these bytes, so fetch is the entire cascade.
@@ -386,6 +396,8 @@ func ensureUploadable(t string, bcfg *builder.Config, store *manifest.Store) err
 		s = ensureFetchedCargo(bcfg, store, "")
 	case manifest.TypeFreeBSD:
 		s = ensureMirroredFreeBSD(bcfg, store, "")
+	case manifest.TypeDistfiles:
+		s = ensureFetchedDistfiles(bcfg, store, "")
 	default:
 		// s stays nil and HasFailures has no nil guard, so a tenth type added
 		// to manifest.AllTypes without an arm here panics the upload rather

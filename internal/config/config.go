@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/distinfo"
 )
 
 const (
@@ -117,6 +118,7 @@ type Config struct {
 	NpmRoot           string   `json:"npm_root,omitempty"`
 	CargoRoot         string   `json:"cargo_root,omitempty"`
 	FreeBSDRoot       string   `json:"freebsd_root,omitempty"`
+	DistfilesRoot     string   `json:"distfiles_root,omitempty"` // the DISTDIR 'bodega build fetch distfiles' writes; see DistfilesPortsTree
 	AuditDB           string   `json:"audit_db,omitempty"`
 	DenyList          []string `json:"deny_list,omitempty"`
 	Timezone          string   `json:"timezone,omitempty"`          // display timezone, e.g. "America/Los_Angeles"; default UTC
@@ -202,6 +204,29 @@ type Config struct {
 	// what it belongs to next to everything else it declares.
 	StorageByGroup map[string]string `json:"storage_by_group,omitempty"`
 
+	// Ports distfiles. distfiles_ports_tree is the FreeBSD ports tree whose
+	// distinfo files decide what the mirror admits: a distfile is fetched
+	// only when a distinfo there pins its SHA256 and size, and stored only
+	// when the fetched bytes match both. Unset, /distfiles/ serves nothing
+	// and the builder refuses every distfiles entry, because there is no
+	// digest to hold the bytes to. distfiles_upstream is where a miss is
+	// fetched from and defaults to DefaultDistfilesUpstream. It carries no
+	// trust: the digest decides, so any host serving the ports distfile
+	// layout will do, over http or https.
+	DistfilesPortsTree string `json:"distfiles_ports_tree,omitempty"`
+	DistfilesUpstream  string `json:"distfiles_upstream,omitempty"`
+
+	// The supported client environment: what a client's make holds that the
+	// ports tree does not, and the only thing admission believes about it.
+	// distfiles_environment_variables maps a make variable to every value it
+	// may hold where a port reads it ([] declares it undefined);
+	// distfiles_environment_files maps an absolute client-host path to its
+	// alternatives, "absent" or the absolute path of a snapshot on this host.
+	// Anything a port reads outside the tree that is not declared here
+	// refuses that port. See docs/threat-model.md.
+	DistfilesEnvironmentVariables map[string][]string `json:"distfiles_environment_variables,omitempty"`
+	DistfilesEnvironmentFiles     map[string][]string `json:"distfiles_environment_files,omitempty"`
+
 	// GitUpstreams maps a namespace under /git/ onto an upstream forge. It
 	// exists because one flat gomod_upstream-style key cannot express two
 	// forges at once, and a corporate GitLab and github.com are the same
@@ -256,6 +281,56 @@ type fileSnapshot struct {
 // file carrying an alias is migrated by the next Save rather than keeping the
 // old key alive forever, so the promotion Load already performs is recorded.
 var legacyKeyAliases = map[string]string{"shell_height": "logwindow_height"}
+
+// DefaultDistfilesUpstream is the FreeBSD project's own distfile cache, the
+// same host bsd.port.mk names as MASTER_SITE_BACKUP. It is laid out as
+// <DIST_SUBDIR>/<file>, which is the distinfo name, so a miss appends that
+// name and nothing else.
+//
+// It is http:// on purpose, as bsd.port.mk's own default is: the host answers
+// https with a certificate that does not name it. A distfile is admitted
+// against the ports tree's distinfo rather than against the transport, so an
+// attacker on the path can make a fetch fail and cannot make one succeed.
+const DefaultDistfilesUpstream = "http://distcache.FreeBSD.org/ports-distfiles/"
+
+// DistfilesEnvironment is the declared client environment distfiles admission
+// reads ports against.
+func (cfg *Config) DistfilesEnvironment() distinfo.EnvironmentSpec {
+	return distinfo.EnvironmentSpec{Variables: cfg.DistfilesEnvironmentVariables, Files: cfg.DistfilesEnvironmentFiles}
+}
+
+// validateDistfiles refuses a distfiles configuration that would fail on the
+// first request rather than at startup. Snapshots are not read here: every
+// command loads this file, and one missing snapshot would lock the operator
+// out of the command that fixes it. The server and the builder read them, and
+// refuse every distfile when they cannot.
+func (cfg *Config) validateDistfiles() error {
+	if cfg.DistfilesPortsTree != "" && !filepath.IsAbs(cfg.DistfilesPortsTree) {
+		return fmt.Errorf("distfiles_ports_tree %q must be an absolute path to the root of a FreeBSD ports tree, such as /usr/ports", cfg.DistfilesPortsTree)
+	}
+	if err := cfg.DistfilesEnvironment().Validate(); err != nil {
+		return err
+	}
+	up := cfg.DistfilesUpstream
+	u, err := url.Parse(up)
+	switch {
+	case up == "":
+		return nil
+	case err != nil:
+		return fmt.Errorf("distfiles_upstream %q does not parse: %v", up, err)
+	case u.Scheme != "https" && u.Scheme != "http":
+		return fmt.Errorf("distfiles_upstream %q must use http or https; plain http is accepted here alone, because distinfo rather than the transport decides what is admitted", up)
+	case u.Host == "":
+		return fmt.Errorf("distfiles_upstream %q names no host", up)
+	case !strings.HasSuffix(up, "/"):
+		return fmt.Errorf("distfiles_upstream %q must end in \"/\" — the distinfo name is appended to it", up)
+	case u.User != nil:
+		return fmt.Errorf("distfiles_upstream carries userinfo before the host — bodega reads no credential from this file and would copy it into logs and error messages. Remove everything between \"//\" and %q", u.Host)
+	case u.RawQuery != "" || u.Fragment != "":
+		return fmt.Errorf("distfiles_upstream %q carries a query or fragment — the distinfo name is appended to it, which would land after it", up)
+	}
+	return nil
+}
 
 // Namespaced-upstream modes. An absent or empty mode loads as
 // UpstreamModeCatalog: an operator who adds a namespace without reading the
@@ -776,6 +851,7 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	cfg.NpmUpstream = firstNonEmpty(cfg.NpmUpstream, "https://registry.npmjs.org")
 	cfg.PypiUpstream = firstNonEmpty(cfg.PypiUpstream, "https://pypi.org")
 	cfg.CargoUpstream = firstNonEmpty(cfg.CargoUpstream, "https://index.crates.io")
+	cfg.DistfilesUpstream = firstNonEmpty(cfg.DistfilesUpstream, DefaultDistfilesUpstream)
 
 	// crates.io publishes the index and the tarballs on separate hosts, and
 	// the index's own config.json is where the download root is named. Reading
@@ -874,6 +950,10 @@ func Load(manifestDir, flagBucket, flagRegion, flagBuildRoot string, localConfig
 	}
 
 	if err := validateUpstreams("binary_upstreams", "/binaries/", cfg.BinaryUpstreams); err != nil {
+		return nil, err
+	}
+
+	if err := cfg.validateDistfiles(); err != nil {
 		return nil, err
 	}
 

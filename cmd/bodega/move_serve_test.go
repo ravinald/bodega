@@ -44,6 +44,9 @@ func TestMovedPackagesStillServeOverHTTP(t *testing.T) {
 				StoragePath:     defaultRoot,
 				StorageBackends: map[string]config.StorageSpec{"bulk": {Driver: "local", Path: bulkRoot}},
 			}
+			if c.configure != nil {
+				c.configure(t, cfg)
+			}
 
 			store := manifest.NewLocalStore(t.TempDir())
 			if err := store.AddVersion(ctx, c.typ, c.pkg, c.ve); err != nil {
@@ -58,7 +61,7 @@ func TestMovedPackagesStillServeOverHTTP(t *testing.T) {
 				t.Fatalf("NewResolver: %v", err)
 			}
 			def, bulk := stores.Default(), mustByName(t, stores, "bulk")
-			bcfg := &builder.Config{BuildRoot: buildRoot, ManifestDir: "manifests"}
+			bcfg := &builder.Config{BuildRoot: buildRoot, ManifestDir: "manifests", DistfilesPortsTree: cfg.DistfilesPortsTree}
 			if keys := c.upload(t, bcfg, store, def); len(keys) == 0 {
 				t.Fatal("the uploader wrote nothing; the local artifact is not where the builder looks")
 			}

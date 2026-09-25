@@ -1,0 +1,612 @@
+package server
+
+import (
+	"crypto/sha256"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/distinfo"
+	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/policy"
+	"github.com/ravinald/bodega/internal/storage"
+)
+
+const distfileBody = "pcpustat source bytes"
+
+// distfilesPortsTree writes a ports tree pinning pcpustat's distfile to
+// distfileBody, beside a port whose license withholds dist-mirror.
+func distfilesPortsTree(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	put := func(rel, body string) {
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sum := sha256.Sum256([]byte(distfileBody))
+	put("Mk/bsd.licenses.db.mk", "")
+	put("Mk/bsd.port.mk", "LOCALBASE?=\t/usr/local\n")
+	put("sysutils/pcpustat/Makefile", "DIST_SUBDIR=\tpcpustat\n")
+	put("sysutils/pcpustat/distinfo", fmt.Sprintf("SHA256 (pcpustat/1.6.tar.bz2) = %x\nSIZE (pcpustat/1.6.tar.bz2) = %d\n", sum, len(distfileBody)))
+	put("graphics/nonfree/Makefile", "LICENSE_PERMS=\tno-dist-mirror no-dist-sell auto-accept\n")
+	put("graphics/nonfree/distinfo", fmt.Sprintf("SHA256 (nonfree.tar.gz) = %x\nSIZE (nonfree.tar.gz) = %d\n", sum, len(distfileBody)))
+	return root
+}
+
+// distfilesFixture is an upstream serving body for every path, counting the
+// requests it answers, and a bodega in front of it reading tree.
+func distfilesFixture(t *testing.T, tree, body string) (*httptest.Server, *storage.Memory, *atomic.Int32) {
+	t.Helper()
+	return distfilesFixtureIn(t, tree, body, nil)
+}
+
+// distfilesFixtureIn is distfilesFixture with the config adjusted by set
+// before the server is built.
+func distfilesFixtureIn(t *testing.T, tree, body string, set func(*config.Config)) (*httptest.Server, *storage.Memory, *atomic.Int32) {
+	t.Helper()
+	saved := distfilesGuard
+	distfilesGuard = func(rawURL string) error {
+		if strings.HasPrefix(rawURL, "http://127.0.0.1:") {
+			return nil
+		}
+		return saved(rawURL)
+	}
+	t.Cleanup(func() { distfilesGuard = saved })
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.URL.Path != "/pcpustat/1.6.tar.bz2" && r.URL.Path != "/nonfree.tar.gz" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(up.Close)
+
+	mem := storage.NewMemory()
+	cfg := &config.Config{
+		StorageBackend:     "local",
+		ManifestDir:        "manifests",
+		AptCodename:        "noble",
+		DistfilesPortsTree: tree,
+		DistfilesUpstream:  up.URL + "/",
+		SpoolDir:           filepath.Join(t.TempDir(), "spool"),
+	}
+	if set != nil {
+		set(cfg)
+	}
+	store := manifest.NewLocalStore(t.TempDir())
+	h := New(cfg, store, storage.NewSingle(mem), ":0", nil).Handler()
+	ts := httptest.NewServer(conformingClient(t, cfg, h))
+	t.Cleanup(ts.Close)
+	return ts, mem, &hits
+}
+
+// conformingClient is h as a client whose check measured the declared
+// environment sees it: a request for /distfiles/<name> carries the digest the
+// check names, as MASTER_SITE_OVERRIDE spells it. A path already naming an
+// environment, and the check itself, pass through, so a test can still send
+// what a drifted or unconfigured client would.
+func conformingClient(t *testing.T, cfg *config.Config, h http.Handler) http.Handler {
+	t.Helper()
+	env, err := cfg.DistfilesEnvironment().Load()
+	if err != nil {
+		return h
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if rest, ok := strings.CutPrefix(r.URL.Path, "/distfiles/"); ok && !strings.HasPrefix(rest, "@") && r.Header.Get(unconfiguredClient) == "" {
+			r.URL.Path = "/distfiles/@" + env.Digest() + "/" + rest
+			r.URL.RawPath = ""
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// unconfiguredClient is a request header conformingClient passes through
+// untouched, for a test sending what a client with no check sends.
+const unconfiguredClient = "X-Test-Unconfigured-Client"
+
+func getBody(t *testing.T, url string) (int, string) {
+	t.Helper()
+	resp, err := http.Get(url) //nolint:gosec // httptest URL built in this test
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b)
+}
+
+// A miss is fetched, held to the distinfo line, cached under the key that
+// keeps DIST_SUBDIR, and the next request is served from the cache.
+func TestDistfilesAdmitsBytesMatchingDistinfo(t *testing.T) {
+	ts, mem, hits := distfilesFixture(t, distfilesPortsTree(t), distfileBody)
+
+	code, body := getBody(t, ts.URL+"/distfiles/pcpustat/1.6.tar.bz2")
+	if code != http.StatusOK || body != distfileBody {
+		t.Fatalf("GET = %d %q, want 200 with the distfile", code, body)
+	}
+	if got, err := mem.Get(t.Context(), manifest.DistfilesKey("pcpustat/1.6.tar.bz2")); err != nil || string(got) != distfileBody {
+		t.Fatalf("cached %q (err %v) under the DIST_SUBDIR key, want the distfile", got, err)
+	}
+	code, _ = getBody(t, ts.URL+"/distfiles/pcpustat/1.6.tar.bz2")
+	if code != http.StatusOK || hits.Load() != 1 {
+		t.Errorf("second GET = %d after %d upstream fetches, want 200 served from the cache after one", code, hits.Load())
+	}
+}
+
+// The property this type exists for: bytes the ports tree did not pin are
+// neither served nor cached, however the upstream presents them. binary would
+// have pinned them on first sight.
+func TestDistfilesRefusesBytesDistinfoDidNotPin(t *testing.T) {
+	for name, body := range map[string]string{
+		"same size, other bytes": "PCPUSTAT SOURCE BYTES",
+		"other size":             distfileBody + " and a trailer",
+	} {
+		t.Run(name, func(t *testing.T) {
+			ts, mem, _ := distfilesFixture(t, distfilesPortsTree(t), body)
+			code, got := getBody(t, ts.URL+"/distfiles/pcpustat/1.6.tar.bz2")
+			if code != http.StatusBadGateway || !strings.Contains(got, "do not match the ports tree's distinfo") {
+				t.Fatalf("GET = %d %q, want 502 naming the distinfo mismatch", code, got)
+			}
+			if info, _ := mem.Head(t.Context(), manifest.DistfilesKey("pcpustat/1.6.tar.bz2")); info != nil && info.Exists {
+				t.Error("cached bytes that disagree with distinfo")
+			}
+		})
+	}
+}
+
+// A port that withholds dist-mirror is refused before any upstream is
+// contacted, with a status that says why.
+func TestDistfilesRefusesARestrictedDistfile(t *testing.T) {
+	ts, mem, hits := distfilesFixture(t, distfilesPortsTree(t), distfileBody)
+	code, body := getBody(t, ts.URL+"/distfiles/nonfree.tar.gz")
+	if code != http.StatusUnavailableForLegalReasons {
+		t.Fatalf("GET = %d %q, want 451", code, body)
+	}
+	if hits.Load() != 0 {
+		t.Errorf("upstream contacted %d times for a file bodega may not redistribute", hits.Load())
+	}
+	if info, _ := mem.Head(t.Context(), manifest.DistfilesKey("nonfree.tar.gz")); info != nil && info.Exists {
+		t.Error("cached a restricted distfile")
+	}
+}
+
+// makeOnlyRestrictions are pcpustat Makefiles that set NO_CDROM only through
+// a make construct a lexical read gets wrong: a := taken before the variable
+// it reads is reassigned, one file included twice under two values, a ?= after
+// an .undef that may run, a .for variable shadowing a global one, an
+// assignment whose name is computed, a path read through a variable an
+// assignment make skips leaves undefined, a slave naming its master through
+// PORTSDIR, and two slaves with no distinfo of their own that read the
+// master's through a value only a shell command sets. Base make on FreeBSD
+// prints "No resale" for `make -V NO_CDROM` in each; for a slave, run in the
+// slave's directory, where `make -V DISTINFO_FILE` names the master's.
+var makeOnlyRestrictions = map[string]map[string]string{
+	"conditional undef": {
+		"Makefile": "D=\tfiles/allowed.mk\n.if 1\n.undef D\n.endif\nD?=\tfiles/restricted.mk\n.include \"${D}\"\n",
+	},
+	"loop shadow": {
+		"Makefile": "D=\tfiles/allowed.mk\n.for D in files/restricted.mk\n.include \"${D}\"\n.endfor\n",
+	},
+	"computed restriction": {
+		"Makefile": "N=\tNO_CDROM\n${N}=\tNo resale\n",
+	},
+	"immediate assignment": {
+		"Makefile": "D=\tfiles/restricted.mk\nP:=\t${D}\nD=\tfiles/allowed.mk\n.include \"${P}\"\n",
+	},
+	"repeated include": {
+		"Makefile":          "D=\tfiles/allowed.mk\n.include \"files/dispatch.mk\"\nD=\tfiles/restricted.mk\n.include \"files/dispatch.mk\"\n",
+		"files/dispatch.mk": ".include \"${.CURDIR}/${D}\"\n",
+	},
+	"undefined branch": {
+		"Makefile":                    ".if 0\nD=\tfiles/allowed/\n.endif\n.include \"${D}restricted.mk\"\n",
+		"restricted.mk":               "NO_CDROM=\tNo resale\n",
+		"files/allowed/restricted.mk": "PORTNAME=\tpcpustat\n",
+	},
+	"slave with a master under PORTSDIR": {
+		"Makefile":          "PORTNAME=\tpcpustat\n",
+		"../slave/Makefile": "MASTERDIR=\t${PORTSDIR}/sysutils/pcpustat\nNO_CDROM=\tNo resale\n.include \"${MASTERDIR}/Makefile\"\n",
+	},
+	"slave whose master a shell command names": {
+		"Makefile":          "PORTNAME=\tpcpustat\n",
+		"../slave/Makefile": "NO_CDROM=\tNo resale\nM!=\tprintf pcpustat\nDISTINFO_FILE=\t${.CURDIR}/../${M}/distinfo\n",
+	},
+	"slave whose distinfo suffix climbs out of its directory": {
+		"Makefile":                  "PORTNAME=\tpcpustat\n",
+		"../slave/Makefile":         "NO_CDROM=\tNo resale\nTAIL!=\tprintf '/../../pcpustat/distinfo'\nDISTINFO_FILE=\t${.CURDIR}/stub${TAIL}\n",
+		"../slave/stub/placeholder": "",
+	},
+}
+
+// makeOnlyRefusal is what the refusal of a makeOnlyRestrictions case names:
+// the restriction, for a path the reader cannot resolve that it cannot, and
+// for a distinfo it cannot place that the whole tree is refused.
+func makeOnlyRefusal(name string) string {
+	switch {
+	case name == "undefined branch":
+		return "cannot be resolved"
+	case name == "conditional undef":
+		// D?= with D undeclared: make.conf may set D first, so the port
+		// refuses and names what to declare rather than reading NO_CDROM.
+		return "it reads D, which make.conf"
+	case strings.HasPrefix(name, "slave whose"):
+		return "may obtain any distfile in the tree"
+	}
+	return "NO_CDROM"
+}
+
+func writeMakeOnlyRestriction(t *testing.T, tree string, files map[string]string) {
+	t.Helper()
+	dir := filepath.Join(tree, "sysutils", "pcpustat")
+	all := map[string]string{"files/restricted.mk": "NO_CDROM=\tNo resale\n", "files/allowed.mk": "PORTNAME=\tpcpustat\n"}
+	for rel, body := range files {
+		all[rel] = body
+	}
+	for rel, body := range all {
+		p := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A restriction only make's own reading of the Makefiles reaches is refused
+// before any upstream is contacted.
+func TestDistfilesRefusesARestrictionMakeReaches(t *testing.T) {
+	for name, files := range makeOnlyRestrictions {
+		t.Run(name, func(t *testing.T) {
+			tree := distfilesPortsTree(t)
+			writeMakeOnlyRestriction(t, tree, files)
+			ts, _, hits := distfilesFixture(t, tree, distfileBody)
+			code, body := getBody(t, ts.URL+"/distfiles/pcpustat/1.6.tar.bz2")
+			want := makeOnlyRefusal(name)
+			if code != http.StatusUnavailableForLegalReasons || !strings.Contains(body, want) || hits.Load() != 0 {
+				t.Fatalf("GET = %d %q after %d upstream fetches, want 451 naming %q after none", code, body, hits.Load(), want)
+			}
+		})
+	}
+}
+
+// A restriction added after a file was cached still applies: distinfo decides
+// before the cache does.
+func TestDistfilesRestrictionOutranksTheCache(t *testing.T) {
+	ts, mem, _ := distfilesFixture(t, distfilesPortsTree(t), distfileBody)
+	mem.Seed(manifest.DistfilesKey("nonfree.tar.gz"), distfileBody)
+	if code, _ := getBody(t, ts.URL+"/distfiles/nonfree.tar.gz"); code != http.StatusUnavailableForLegalReasons {
+		t.Errorf("GET = %d, want 451 for a restricted file already in the cache", code)
+	}
+}
+
+// A name no distinfo lists has no digest to hold it to, so the upstream is
+// never asked, and a server with no ports tree configured admits nothing.
+func TestDistfilesRefusesWithoutADigest(t *testing.T) {
+	ts, _, hits := distfilesFixture(t, distfilesPortsTree(t), distfileBody)
+	if code, _ := getBody(t, ts.URL+"/distfiles/pcpustat/9.9.tar.bz2"); code != http.StatusNotFound || hits.Load() != 0 {
+		t.Errorf("unlisted name: %d after %d upstream fetches, want 404 after none", code, hits.Load())
+	}
+	// The subdirectory is part of the name: the bare file is not listed.
+	if code, _ := getBody(t, ts.URL+"/distfiles/1.6.tar.bz2"); code != http.StatusNotFound || hits.Load() != 0 {
+		t.Errorf("name without DIST_SUBDIR: %d after %d upstream fetches, want 404 after none", code, hits.Load())
+	}
+
+	unconfigured, _, _ := distfilesFixture(t, "", distfileBody)
+	if code, _ := getBody(t, unconfigured.URL+"/distfiles/pcpustat/1.6.tar.bz2"); code != http.StatusNotFound {
+		t.Errorf("no distfiles_ports_tree: %d, want 404", code)
+	}
+}
+
+// Plain http is admitted for the distfiles upstream, and nothing else about
+// the guard is relaxed: a host on this network is refused over either scheme.
+func TestDistfilesGuardAdmitsHTTPAndNothingElse(t *testing.T) {
+	for raw, ok := range map[string]bool{
+		"http://127.0.0.1/ports-distfiles/x":  false,
+		"https://127.0.0.1/ports-distfiles/x": false,
+		"http://10.0.0.1/ports-distfiles/x":   false,
+		"ftp://ftp.freebsd.org/x":             false,
+	} {
+		if err := distfilesGuard(raw); (err == nil) != ok {
+			t.Errorf("distfilesGuard(%q) = %v, want admitted=%v", raw, err, ok)
+		}
+	}
+	if err := upstreamGuard("http://distcache.FreeBSD.org/ports-distfiles/x"); err == nil {
+		t.Error("upstreamGuard admitted plain http; the relaxation belongs to distfiles alone")
+	}
+}
+
+// A stored object is not evidence of admission. One whose bytes disagree with
+// the current pin, uploaded from a DISTDIR nobody checked or left from an
+// older tree that pinned other bytes of the same length, is never served: the
+// hit falls through to a verified fetch that replaces it.
+func TestDistfilesCacheHitIsHeldToDistinfo(t *testing.T) {
+	const stale = "PCPUSTAT SOURCE BYTES" // same length as distfileBody
+	ts, mem, hits := distfilesFixture(t, distfilesPortsTree(t), distfileBody)
+	mem.Seed(manifest.DistfilesKey("pcpustat/1.6.tar.bz2"), stale)
+
+	code, body := getBody(t, ts.URL+"/distfiles/pcpustat/1.6.tar.bz2")
+	if code != http.StatusOK || body != distfileBody || hits.Load() != 1 {
+		t.Fatalf("GET = %d %q after %d upstream fetches, want the pinned bytes fetched once", code, body, hits.Load())
+	}
+	if got, _ := mem.Get(t.Context(), manifest.DistfilesKey("pcpustat/1.6.tar.bz2")); string(got) != distfileBody {
+		t.Errorf("cache still holds %q, want it replaced by the verified fetch", got)
+	}
+
+	// With an upstream that cannot supply the pinned bytes either, nothing is
+	// served at all rather than the stale object.
+	ts2, mem2, _ := distfilesFixture(t, distfilesPortsTree(t), stale)
+	mem2.Seed(manifest.DistfilesKey("pcpustat/1.6.tar.bz2"), stale)
+	if code, body := getBody(t, ts2.URL+"/distfiles/pcpustat/1.6.tar.bz2"); code == http.StatusOK {
+		t.Errorf("GET = 200 %q, served bytes neither the cache nor the upstream could match to distinfo", body)
+	}
+}
+
+// A tree update that repins a name to other bytes of the same length reaches
+// the cache: the object admitted under the old pin is replaced, not served.
+func TestDistfilesSameSizeRepinReplacesTheCachedObject(t *testing.T) {
+	const v1, v2 = "pcpustat source bytes", "pcpustat SOURCE bytes"
+	tree := func(body string) string {
+		root := t.TempDir()
+		sum := sha256.Sum256([]byte(body))
+		for rel, b := range map[string]string{
+			"Mk/bsd.licenses.db.mk":      "",
+			"sysutils/pcpustat/Makefile": "DIST_SUBDIR=\tpcpustat\n",
+			"sysutils/pcpustat/distinfo": fmt.Sprintf("SHA256 (pcpustat/1.6.tar.bz2) = %x\nSIZE (pcpustat/1.6.tar.bz2) = %d\n", sum, len(body)),
+		} {
+			p := filepath.Join(root, filepath.FromSlash(rel))
+			if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, []byte(b), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return root
+	}
+	ts1, mem, _ := distfilesFixture(t, tree(v1), v1)
+	if code, body := getBody(t, ts1.URL+"/distfiles/pcpustat/1.6.tar.bz2"); code != http.StatusOK || body != v1 {
+		t.Fatalf("first tree: %d %q", code, body)
+	}
+	cached, _ := mem.Get(t.Context(), manifest.DistfilesKey("pcpustat/1.6.tar.bz2"))
+
+	ts2, mem2, hits := distfilesFixture(t, tree(v2), v2)
+	mem2.Seed(manifest.DistfilesKey("pcpustat/1.6.tar.bz2"), string(cached))
+	code, body := getBody(t, ts2.URL+"/distfiles/pcpustat/1.6.tar.bz2")
+	if code != http.StatusOK || body != v2 || hits.Load() != 1 {
+		t.Fatalf("after repin: %d %q after %d fetches, want the newly pinned bytes", code, body, hits.Load())
+	}
+}
+
+// The upstream allow-list applies to this type like any other: a digest says
+// the bytes are right, not that the operator agreed to contact the host.
+func TestDistfilesMissHonorsTheUpstreamAllowList(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		pattern string // "" means the upstream's own host
+		want    int
+		fetches int
+	}{
+		{"matching host", "", http.StatusOK, 1},
+		{"other host", "allowed.example", http.StatusForbidden, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newDiscoveryServer(t)
+			s.distinfo = distinfo.NewTree(distfilesPortsTree(t), 0, nil)
+			var hits atomic.Int32
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				hits.Add(1)
+				_, _ = io.WriteString(w, distfileBody)
+			}))
+			defer up.Close()
+			s.cfg.DistfilesUpstream = up.URL + "/"
+			saved := distfilesGuard
+			distfilesGuard = func(string) error { return nil }
+			defer func() { distfilesGuard = saved }()
+
+			pattern := tc.pattern
+			if pattern == "" {
+				pattern = "127.0.0.1"
+			}
+			if err := s.auditDB.InsertPolicy(t.Context(), audit.PolicyInfo{ID: "p", RegistryType: manifest.TypeDistfiles, RuleKind: policy.KindHost, Pattern: pattern}); err != nil {
+				t.Fatal(err)
+			}
+			ts := httptest.NewServer(conformingClient(t, &config.Config{}, s.Handler()))
+			defer ts.Close()
+			code, body := getBody(t, ts.URL+"/distfiles/pcpustat/1.6.tar.bz2")
+			if code != tc.want || int(hits.Load()) != tc.fetches {
+				t.Fatalf("GET = %d %q after %d upstream fetches, want %d after %d", code, body, hits.Load(), tc.want, tc.fetches)
+			}
+			if tc.want != http.StatusForbidden {
+				return
+			}
+			rows, err := s.auditDB.Query(t.Context(), audit.Filter{EventType: audit.EventCache})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, row := range rows {
+				if row.Status == audit.CachePolicyViolation && row.PkgType == manifest.TypeDistfiles {
+					return
+				}
+			}
+			t.Errorf("no policy_violation row for the refused distfile: %+v", rows)
+		})
+	}
+}
+
+// The F24 witness through HTTP: arabic/aspell reads ${LOCALBASE}/etc/aspell.ver
+// on the client host, which base make shows can point its DISTINFO_FILE at
+// pcpustat's and set NO_CDROM. pcpustat is served only when the declared
+// environment says what that file holds, and refused, with nothing fetched,
+// when the declaration carries the witness, alone or as one alternative.
+func TestDistfilesHTTPHoldsTheDeclaredEnvironment(t *testing.T) {
+	witness := filepath.Join(t.TempDir(), "aspell.ver")
+	if err := os.WriteFile(witness, []byte("DISTINFO_FILE=${PORTSDIR}/sysutils/pcpustat/distinfo\nNO_CDROM=host file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	localbase := map[string][]string{"LOCALBASE": {"/usr/local"}}
+	for name, tc := range map[string]struct {
+		vars  map[string][]string
+		files map[string][]string
+		code  int
+		hits  int32
+	}{
+		"nothing declared":           {nil, nil, http.StatusUnavailableForLegalReasons, 0},
+		"file undeclared":            {localbase, nil, http.StatusUnavailableForLegalReasons, 0},
+		"declared absent":            {localbase, map[string][]string{"/usr/local/etc/aspell.ver": {"absent"}}, http.StatusOK, 1},
+		"declared as the witness":    {localbase, map[string][]string{"/usr/local/etc/aspell.ver": {witness}}, http.StatusUnavailableForLegalReasons, 0},
+		"witness as one alternative": {localbase, map[string][]string{"/usr/local/etc/aspell.ver": {"absent", witness}}, http.StatusUnavailableForLegalReasons, 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tree := distfilesPortsTree(t)
+			for rel, body := range map[string]string{
+				"textproc/aspell/Makefile.inc": ".include <bsd.port.pre.mk>\n.if exists(${LOCALBASE}/etc/aspell.ver)\n. include \"${LOCALBASE}/etc/aspell.ver\"\n.endif\n",
+				"arabic/aspell/Makefile":       ".include \"${.CURDIR}/../../textproc/aspell/Makefile.inc\"\n",
+			} {
+				p := filepath.Join(tree, filepath.FromSlash(rel))
+				if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ts, _, hits := distfilesFixtureIn(t, tree, distfileBody, func(cfg *config.Config) {
+				cfg.DistfilesEnvironmentVariables = tc.vars
+				cfg.DistfilesEnvironmentFiles = tc.files
+			})
+			code, body := getBody(t, ts.URL+"/distfiles/pcpustat/1.6.tar.bz2")
+			if code != tc.code || hits.Load() != tc.hits {
+				t.Fatalf("GET = %d %q after %d upstream fetches, want %d after %d", code, body, hits.Load(), tc.code, tc.hits)
+			}
+		})
+	}
+}
+
+// The F24 witness after admission: a client that adds the witness file, or
+// runs no check, or checks another declaration, is refused before storage or
+// upstream is touched, for a name the index admits. Only the digest the index
+// was admitted against is served, and the check that names it is served too.
+func TestDistfilesRefusesAClientOutsideTheEnvironment(t *testing.T) {
+	ts, mem, hits := distfilesFixture(t, distfilesPortsTree(t), distfileBody)
+	env, err := distinfo.EnvironmentSpec{}.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := distinfo.EnvironmentSpec{Variables: map[string][]string{"LOCALBASE": {"/usr/local"}}}.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, path := range map[string]string{
+		"drifted client":    "/distfiles/@" + distinfo.ClientUnsupported + "/pcpustat/1.6.tar.bz2",
+		"other declaration": "/distfiles/@" + other.Digest() + "/pcpustat/1.6.tar.bz2",
+		"no check":          "/distfiles/pcpustat/1.6.tar.bz2",
+		"empty environment": "/distfiles/@/pcpustat/1.6.tar.bz2",
+	} {
+		req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+path, nil)
+		req.Header.Set(unconfiguredClient, "1")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusUnavailableForLegalReasons || hits.Load() != 0 || !strings.Contains(string(body), "did not measure the environment") {
+			t.Errorf("%s: GET %s = %d %q after %d upstream fetches, want 451 before any", name, path, resp.StatusCode, body, hits.Load())
+		}
+	}
+	if info, _ := mem.Head(t.Context(), manifest.DistfilesKey("pcpustat/1.6.tar.bz2")); info != nil && info.Exists {
+		t.Error("cached a distfile for a client outside the environment")
+	}
+	if code, body := getBody(t, ts.URL+"/distfiles/@"+env.Digest()+"/pcpustat/1.6.tar.bz2"); code != http.StatusOK || body != distfileBody || hits.Load() != 1 {
+		t.Fatalf("GET under the admitted digest = %d %q after %d upstream fetches, want 200 after 1", code, body, hits.Load())
+	}
+	code, check := getBody(t, ts.URL+"/distfiles/@environment.mk")
+	if code != http.StatusOK || !strings.Contains(check, ":?"+env.Digest()+":unsupported") {
+		t.Fatalf("GET /distfiles/@environment.mk = %d %q, want the check naming %s", code, check, env.Digest())
+	}
+}
+
+// The F25 audit fixtures through HTTP: ${P:tA} resolves link/.. after the
+// symlink, as realpath(3) does, and ${P:H} leaves it for open(2) to, so both
+// read the NO_CDROM base make reads.
+func TestDistfilesSymlinkBeforeParentIsRestricted(t *testing.T) {
+	for name, makefile := range map[string]string{
+		":tA": "P=${.CURDIR}/link/../restricted/terms.mk\n.include \"${P:tA}\"\n",
+		":H":  "P=${.CURDIR}/link/../restricted/leaf\n.include \"${P:H}/terms.mk\"\n",
+	} {
+		t.Run(name, func(t *testing.T) { symlinkBeforeParentHTTP(t, makefile) })
+	}
+}
+
+func symlinkBeforeParentHTTP(t *testing.T, makefile string) {
+	tree := distfilesPortsTree(t)
+	for rel, body := range map[string]string{
+		"misc/probe/Makefile":            makefile + "DISTINFO_FILE=${PORTSDIR}/sysutils/pcpustat/distinfo\n",
+		"misc/probe/restricted/terms.mk": "OK=yes\n",
+		"lang/restricted/terms.mk":       "NO_CDROM=symlink target terms\n",
+	} {
+		p := filepath.Join(tree, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(tree, "lang/master"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../../lang/master", filepath.Join(tree, "misc/probe/link")); err != nil {
+		t.Fatal(err)
+	}
+	ts, _, hits := distfilesFixture(t, tree, distfileBody)
+	code, body := getBody(t, ts.URL+"/distfiles/pcpustat/1.6.tar.bz2")
+	if code != http.StatusUnavailableForLegalReasons || hits.Load() != 0 || !strings.Contains(body, "symlink target terms") {
+		t.Fatalf("GET = %d %q after %d upstream fetches, want 451 naming the symlink target's NO_CDROM before any", code, body, hits.Load())
+	}
+}
+
+// The F25 audit's computed-name fixture through HTTP: _${N}!= writes the
+// declared snapshot path, the port includes it, and a second _${N}!= puts the
+// snapshot's bytes back. make reads NO_CDROM there, so the reader refuses the
+// port, and pcpustat's distinfo, which it names, with it: even a cached copy
+// is not served and upstream is never asked.
+func TestDistfilesRefusesAComputedNameCommandBeforeASnapshot(t *testing.T) {
+	host := "/client/terms.mk"
+	snap := filepath.Join(t.TempDir(), "terms.mk")
+	if err := os.WriteFile(snap, []byte("OK=yes\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tree := distfilesPortsTree(t)
+	p := filepath.Join(tree, "misc/probe/Makefile")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	makefile := "N=W\n_${N}!= printf 'NO_CDROM=computed terms\\n' > " + host + "\n.sinclude \"" + host + "\"\nN=R\n_${N}!= printf 'OK=yes\\n' > " + host + "\nDISTINFO_FILE=${PORTSDIR}/sysutils/pcpustat/distinfo\n"
+	if err := os.WriteFile(p, []byte(makefile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ts, mem, hits := distfilesFixtureIn(t, tree, distfileBody, func(cfg *config.Config) {
+		cfg.DistfilesEnvironmentFiles = map[string][]string{host: {snap}}
+	})
+	mem.Seed(manifest.DistfilesKey("pcpustat/1.6.tar.bz2"), distfileBody)
+	code, body := getBody(t, ts.URL+"/distfiles/pcpustat/1.6.tar.bz2")
+	if code != http.StatusUnavailableForLegalReasons || hits.Load() != 0 || !strings.Contains(body, "misc/probe is restricted or unreadable") {
+		t.Fatalf("GET = %d %q after %d upstream fetches, want 451 naming misc/probe before any", code, body, hits.Load())
+	}
+}

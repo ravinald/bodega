@@ -3,12 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ravinald/bodega/internal/audit"
@@ -95,6 +98,16 @@ func (e *uploadEnv) checksums(t *testing.T, typ, name string) []audit.StoredChec
 // because the cascade prints there rather than to the command's own writer.
 func runUpload(t *testing.T, args ...string) string {
 	t.Helper()
+	got, err := runUploadResult(t, args...)
+	if err != nil {
+		t.Fatalf("bodega build upload: %v\n%s", err, got)
+	}
+	return got
+}
+
+// runUploadResult is runUpload for a caller that expects the command to fail.
+func runUploadResult(t *testing.T, args ...string) (string, error) {
+	t.Helper()
 	cmd := newUploadCmd(&globalFlags{})
 	cmd.SetArgs(args)
 	var out bytes.Buffer
@@ -114,11 +127,7 @@ func runUpload(t *testing.T, args ...string) string {
 	var printed bytes.Buffer
 	_, _ = printed.ReadFrom(r)
 
-	got := printed.String() + out.String()
-	if execErr != nil {
-		t.Fatalf("bodega build upload: %v\n%s", execErr, got)
-	}
-	return got
+	return printed.String() + out.String(), execErr
 }
 
 // TestUploadCascadePinsAFirstFetch covers the route a fresh install actually
@@ -220,5 +229,108 @@ func writeUploadDeb(t *testing.T, dest, name, version string) {
 	}
 	if out, err := exec.Command("dpkg-deb", "--build", "--root-owner-group", staging, dest).CombinedOutput(); err != nil {
 		t.Fatalf("dpkg-deb --build: %v\n%s", err, out)
+	}
+}
+
+// A file in the DISTDIR is not evidence of admission. Upload holds each one to
+// the current distinfo and fails the command, uploading nothing, when any is
+// unlisted, wrong, repinned or restricted, or when there is no tree at all.
+func TestUploadDistfilesHoldsTheDistdirToDistinfo(t *testing.T) {
+	const good, wrong = "pcpustat source bytes", "PCPUSTAT SOURCE BYTES"
+	for _, tc := range []struct {
+		name     string
+		tree     bool
+		pinned   string // bytes the tree pins
+		onDisk   string
+		frozen   bool
+		makefile string
+		wantErr  string // "" means the upload succeeds
+	}{
+		{name: "no ports tree", onDisk: good, wantErr: "cascade for distfiles failed"},
+		{name: "wrong body, refetch fails", tree: true, pinned: good, onDisk: wrong, wantErr: "cascade for distfiles failed"},
+		{name: "wrong body, frozen", tree: true, pinned: good, onDisk: wrong, frozen: true, wantErr: "does not match distinfo"},
+		{name: "tree repinned, frozen", tree: true, pinned: wrong, onDisk: good, frozen: true, wantErr: "does not match distinfo"},
+		{name: "restricted since the fetch", tree: true, pinned: good, onDisk: good, makefile: "RESTRICTED=\tno\n", wantErr: "cascade for distfiles failed"},
+		{name: "restricted since the fetch, frozen", tree: true, pinned: good, onDisk: good, frozen: true, makefile: "RESTRICTED=\tno\n", wantErr: "forbids redistributing"},
+		{name: "admitted", tree: true, pinned: good, onDisk: good},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newUploadEnv(t)
+			cfgPath := os.Getenv(config.EnvConfigFile)
+			b, err := os.ReadFile(cfgPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			extra := `"distfiles_upstream": "http://127.0.0.1:1/",`
+			if tc.tree {
+				tree := t.TempDir()
+				sum := sha256.Sum256([]byte(tc.pinned))
+				writeFile(t, tree, "Mk/bsd.licenses.db.mk", "")
+				writeFile(t, tree, "sysutils/pcpustat/Makefile", "DIST_SUBDIR=\tpcpustat\n"+tc.makefile)
+				writeFile(t, tree, "sysutils/pcpustat/distinfo", fmt.Sprintf("SHA256 (pcpustat/1.6.tar.bz2) = %x\nSIZE (pcpustat/1.6.tar.bz2) = %d\n", sum, len(tc.pinned)))
+				extra += fmt.Sprintf(" %q: %q,", "distfiles_ports_tree", tree)
+			}
+			b = bytes.Replace(b, []byte(`"apt_codename"`), []byte(extra+` "apt_codename"`), 1)
+			if err := os.WriteFile(cfgPath, b, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			e.seed(t, &manifest.PackageManifest{Type: manifest.TypeDistfiles, Name: "pcpustat/1.6.tar.bz2", Versions: []manifest.VersionEntry{{Frozen: tc.frozen}}})
+			writeFile(t, e.buildRoot, "distfiles/@"+emptyEnvironmentDigest(t)+"/pcpustat/1.6.tar.bz2", tc.onDisk)
+
+			out, err := runUploadResult(t, manifest.TypeDistfiles)
+			stored := filepath.Join(filepath.Dir(e.buildRoot), "storage", "distfiles", "pcpustat", "1.6.tar.bz2")
+			got, readErr := os.ReadFile(stored)
+			if tc.wantErr == "" {
+				if err != nil || string(got) != good {
+					t.Fatalf("upload: %v, stored %q (%v)\n%s", err, got, readErr, out)
+				}
+				leftovers, _ := filepath.Glob(filepath.Join(e.buildRoot, ".bodega-distfiles-upload-*"))
+				if len(leftovers) != 0 {
+					t.Errorf("pin directory left behind: %v", leftovers)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error()+out, tc.wantErr) {
+				t.Fatalf("upload: %v, want an error naming %q\n%s", err, tc.wantErr, out)
+			}
+			if readErr == nil {
+				t.Fatalf("stored %q after the command refused", got)
+			}
+		})
+	}
+}
+
+// A DISTDIR that cannot be created fails every selected entry, and the command
+// exits nonzero rather than reporting zero failures for work it never did.
+func TestFetchDistfilesFailsTheCommandWhenTheDistdirCannotBeCreated(t *testing.T) {
+	e := newUploadEnv(t)
+	e.seed(t, &manifest.PackageManifest{Type: manifest.TypeDistfiles, Name: "pcpustat/1.6.tar.bz2", Versions: []manifest.VersionEntry{{}}})
+	cfgPath := os.Getenv(config.EnvConfigFile)
+	b, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree := t.TempDir()
+	writeFile(t, tree, "Mk/bsd.licenses.db.mk", "")
+	writeFile(t, tree, "sysutils/pcpustat/distinfo", "SHA256 (pcpustat/1.6.tar.bz2) = 3bc1906f8d4865bb02c59f2f752e79b08433bc1aa447d78ea3de1a0d02c45e64\nSIZE (pcpustat/1.6.tar.bz2) = 5135\n")
+	b = bytes.Replace(b, []byte(`"apt_codename"`), []byte(fmt.Sprintf(`"distfiles_upstream": "http://127.0.0.1:1/", "distfiles_ports_tree": %q, "apt_codename"`, tree)), 1)
+	if err := os.WriteFile(cfgPath, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, e.buildRoot, "distfiles", "a regular file where the DISTDIR belongs")
+
+	cmd := newFetchCmd(&globalFlags{})
+	cmd.SetArgs([]string{manifest.TypeDistfiles})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SilenceUsage, cmd.SilenceErrors = true, true
+	stdout := os.Stdout
+	devnull, _ := os.Open(os.DevNull)
+	os.Stdout = devnull
+	err = cmd.Execute()
+	os.Stdout = stdout
+	_ = devnull.Close()
+	if err == nil || !strings.Contains(err.Error(), "1 fetch(es) failed") {
+		t.Fatalf("build fetch distfiles: %v, want it to fail naming one failed fetch", err)
 	}
 }

@@ -15,6 +15,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/distinfo"
 	"github.com/ravinald/bodega/internal/logging"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
@@ -37,6 +38,22 @@ type Config struct {
 	NpmRoot     string
 	CargoRoot   string
 	FreeBSDRoot string
+
+	// DistfilesRoot roots the DISTDIR FetchDistfiles writes, at
+	// <root>/distfiles/@<environment digest>/. DistfilesPortsTree is the ports
+	// tree whose distinfo admits each file, and DistfilesUpstream is where a
+	// file is fetched from.
+	DistfilesRoot      string
+	DistfilesPortsTree string
+	DistfilesUpstream  string
+	// DistfilesEnvironment is the supported client environment every port
+	// is read against; see distinfo.Environment.
+	DistfilesEnvironment distinfo.EnvironmentSpec
+	// distfilesEnv is the environment the first distfiles stage of this
+	// Config read, which every later stage must find unchanged; see
+	// distfilesEnvironment.
+	distfilesEnvMu sync.Mutex
+	distfilesEnv   *distinfo.Environment
 	// Stdout is where builder output is written; defaults to os.Stdout.
 	Stdout io.Writer
 	// Force re-fetches even if artifacts already exist on disk.
@@ -163,6 +180,10 @@ func (c *Config) rootFor(typ string) string {
 		if c.FreeBSDRoot != "" {
 			return c.FreeBSDRoot
 		}
+	case "distfiles":
+		if c.DistfilesRoot != "" {
+			return c.DistfilesRoot
+		}
 	}
 	return c.BuildRoot
 }
@@ -209,12 +230,17 @@ func NewConfig(app *config.Config, pol *policy.Checker) *Config {
 		NpmRoot:        app.NpmRoot,
 		CargoRoot:      app.CargoRoot,
 		FreeBSDRoot:    app.FreeBSDRoot,
+		DistfilesRoot:  app.DistfilesRoot,
 		AutoImportDeps: true,
 		BodegaVersion:  Version,
 		policyChecker:  pol,
 
 		CargoDLUpstream: app.CargoDLUpstream,
 		CargoUpstream:   app.CargoUpstream,
+
+		DistfilesPortsTree:   app.DistfilesPortsTree,
+		DistfilesUpstream:    app.DistfilesUpstream,
+		DistfilesEnvironment: app.DistfilesEnvironment(),
 	}
 }
 
@@ -244,6 +270,11 @@ func ArtifactDir(cfg *Config, typ string) string {
 		return d.cargo
 	case manifest.TypeFreeBSD:
 		return d.freebsd
+	case manifest.TypeDistfiles:
+		if dir, err := distdir(cfg, d); err == nil {
+			return dir
+		}
+		return d.distfiles
 	}
 	return cfg.rootFor(typ)
 }
@@ -362,6 +393,10 @@ type dirs struct {
 	npm      string
 	cargo    string
 	freebsd  string
+
+	// distfiles is a DISTDIR: <DIST_SUBDIR>/<file> beneath it, exactly as
+	// a client's ports tree lays out its own.
+	distfiles string
 }
 
 func buildDirs(root string) dirs {
@@ -377,6 +412,8 @@ func buildDirs(root string) dirs {
 		npm:      filepath.Join(root, "npm"),
 		cargo:    filepath.Join(root, "cargo"),
 		freebsd:  filepath.Join(root, "freebsd"),
+
+		distfiles: filepath.Join(root, "distfiles"),
 	}
 }
 

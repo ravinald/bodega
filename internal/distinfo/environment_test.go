@@ -1,0 +1,858 @@
+package distinfo
+
+import (
+	"context"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+)
+
+// aspellTree adds the shape of textproc/aspell/Makefile.inc at the stock 15.1
+// tree: a dictionary port that includes the framework, then a file on the
+// client host under ${LOCALBASE}, guarded by exists().
+func aspellTree(t *testing.T) string {
+	t.Helper()
+	root := portsTree(t)
+	write(t, root, "textproc/aspell/Makefile.inc", "LICENSE=\tBSD2CLAUSE\n.include <bsd.port.pre.mk>\n.if exists(${LOCALBASE}/etc/aspell.ver)\n. include \"${LOCALBASE}/etc/aspell.ver\"\n.endif\n")
+	write(t, root, "arabic/aspell/Makefile", "PORTNAME=\taspell\n.include \"${.CURDIR}/../../textproc/aspell/Makefile.inc\"\n.include <bsd.port.post.mk>\n")
+	write(t, root, "arabic/aspell/distinfo", distinfoFor("aspell6-ar-1.2-0.tar.bz2", sumA, 10))
+	return root
+}
+
+// aspellTreeEarly is aspellTree with the host file included before the
+// framework, the one place a snapshot can still be read: nothing has run a
+// command that could have changed it. The ownership cases need a snapshot to
+// be read at all.
+func aspellTreeEarly(t *testing.T, host string) string {
+	t.Helper()
+	root := portsTree(t)
+	write(t, root, "textproc/aspell/Makefile.inc", "LICENSE=\tBSD2CLAUSE\n.if exists("+host+")\n. include \""+host+"\"\n.endif\n.include <bsd.port.pre.mk>\n")
+	write(t, root, "arabic/aspell/Makefile", "PORTNAME=\taspell\n.include \"${.CURDIR}/../../textproc/aspell/Makefile.inc\"\n.include <bsd.port.post.mk>\n")
+	write(t, root, "arabic/aspell/distinfo", distinfoFor("aspell6-ar-1.2-0.tar.bz2", sumA, 10))
+	return root
+}
+
+func snapshot(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "aspell.ver")
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func loadWith(t *testing.T, root string, spec EnvironmentSpec) *Index {
+	t.Helper()
+	env, err := spec.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ix, err := LoadIn(root, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ix
+}
+
+// The F24 witness: base make on the stock arabic/aspell reads its own distinfo
+// with no host file, and pcpustat's distinfo and NO_CDROM once
+// ${LOCALBASE}/etc/aspell.ver holds two lines. The tree is the same in both.
+// Only a declared environment may admit pcpustat, and a declaration carrying
+// that file, alone or as one alternative, must restrict pcpustat's name.
+func TestEnvironmentDecidesTheAspellWitness(t *testing.T) {
+	stock := aspellTree(t)
+	early := aspellTreeEarly(t, "/usr/local/etc/aspell.ver")
+	hostile := func(distinfo string) string {
+		return "DISTINFO_FILE=" + distinfo + "\nNO_CDROM=host file\n"
+	}
+	localbase := map[string][]string{"LOCALBASE": {"/usr/local"}}
+	for name, tc := range map[string]struct {
+		root string
+		spec EnvironmentSpec
+		want string // "" admits pcpustat
+	}{
+		"nothing declared":                 {stock, EnvironmentSpec{}, "cannot be resolved"},
+		"LOCALBASE declared, the file not": {stock, EnvironmentSpec{Variables: localbase}, "does not declare it"},
+		"file declared absent":             {stock, EnvironmentSpec{Variables: localbase, Files: map[string][]string{"/usr/local/etc/aspell.ver": {Absent}}}, ""},
+		// The stock port reads the file after bsd.port.pre.mk, whose commands
+		// the port chooses, so no snapshot describes what make reads there.
+		"file declared as the witness": {stock, EnvironmentSpec{Variables: localbase, Files: map[string][]string{
+			"/usr/local/etc/aspell.ver": {snapshot(t, hostile("${PORTSDIR}/sysutils/pcpustat/distinfo"))},
+		}}, "declared with a snapshot, after the framework include"},
+		"a harmless snapshot": {stock, EnvironmentSpec{Variables: localbase, Files: map[string][]string{
+			"/usr/local/etc/aspell.ver": {snapshot(t, "ASPELL_VER=0.60\n")},
+		}}, "declared with a snapshot, after the framework include"},
+		"witness read before the framework": {early, EnvironmentSpec{Files: map[string][]string{
+			"/usr/local/etc/aspell.ver": {snapshot(t, hostile("${PORTSDIR}/sysutils/pcpustat/distinfo"))},
+		}}, "arabic/aspell sets NO_CDROM=host file"},
+		"witness as one alternative": {early, EnvironmentSpec{Files: map[string][]string{
+			"/usr/local/etc/aspell.ver": {Absent, snapshot(t, hostile("${PORTSDIR}/sysutils/pcpustat/distinfo"))},
+		}}, "arabic/aspell sets NO_CDROM=host file"},
+		"witness naming the tree by its absolute path": {early, EnvironmentSpec{Files: map[string][]string{
+			"/usr/local/etc/aspell.ver": {snapshot(t, hostile(filepath.Join(early, "sysutils/pcpustat/distinfo")))},
+		}}, "arabic/aspell sets NO_CDROM=host file"},
+		// The client's tree is at /usr/ports and this one is not, so the
+		// path names nothing Load indexes. It must not name nothing at all.
+		"witness naming a tree bodega does not read": {early, EnvironmentSpec{Files: map[string][]string{
+			"/usr/local/etc/aspell.ver": {snapshot(t, hostile("/nonexistent/ports/sysutils/pcpustat/distinfo"))},
+		}}, "not a <category>/<port> directory"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ix := loadWith(t, tc.root, tc.spec)
+			e, err := ix.Lookup("pcpustat/1.6.tar.bz2")
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("pcpustat: %v, want admitted", err)
+				}
+				if e.SHA256 != sumA || e.Size != 5135 {
+					t.Fatalf("pcpustat = %+v, want its own pin", e)
+				}
+				if _, err := ix.Lookup("aspell6-ar-1.2-0.tar.bz2"); err != nil {
+					t.Errorf("aspell's own distfile: %v, want admitted", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrRestricted) || !strings.Contains(err.Error()+" "+strings.Join(ix.Unowned(), " "), tc.want) {
+				t.Fatalf("pcpustat: %v (unowned %q), want ErrRestricted naming %q", err, ix.Unowned(), tc.want)
+			}
+		})
+	}
+}
+
+// The server's own filesystem is never the client's. A file at the path the
+// port includes, present on the server, is not read in place of a declaration
+// and does not stand in for one.
+func TestEnvironmentNeverReadsTheServerHost(t *testing.T) {
+	root := aspellTree(t)
+	host := t.TempDir()
+	write(t, host, "etc/aspell.ver", "NO_CDROM=server host file\n")
+	vars := map[string][]string{"LOCALBASE": {host}}
+
+	ix := loadWith(t, root, EnvironmentSpec{Variables: vars})
+	if _, err := ix.Lookup("pcpustat/1.6.tar.bz2"); !errors.Is(err, ErrRestricted) || strings.Contains(err.Error(), "server host file") {
+		t.Fatalf("undeclared: %v, want refused without reading the server's file", err)
+	}
+
+	ix = loadWith(t, root, EnvironmentSpec{Variables: vars, Files: map[string][]string{filepath.Join(host, "etc/aspell.ver"): {Absent}}})
+	if _, err := ix.Lookup("aspell6-ar-1.2-0.tar.bz2"); err != nil {
+		t.Fatalf("declared absent: %v, want admitted: the declaration, not the server's file, decides", err)
+	}
+}
+
+// The audit11 witness: a literal client-host path, missing on the server,
+// under .sinclude and under exists(). Server-side absence was read as
+// harmless; only a declaration may say it is.
+func TestEnvironmentLiteralHostInclude(t *testing.T) {
+	outside := filepath.Join(t.TempDir(), "client-input", "terms.mk")
+	for name, makefile := range map[string]string{
+		"sinclude":       ".sinclude \"" + outside + "\"\n",
+		"exists guarded": ".if exists(" + outside + ")\n.include \"" + outside + "\"\n.endif\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := portsTree(t)
+			write(t, root, "lang/probe/Makefile", "LICENSE=\tBSD2CLAUSE\n"+makefile+"DISTINFO_FILE=\t${.CURDIR}/../../sysutils/pcpustat/distinfo\n.include <bsd.port.mk>\n")
+			ix := loadWith(t, root, EnvironmentSpec{})
+			if _, err := ix.Lookup("pcpustat/1.6.tar.bz2"); !errors.Is(err, ErrRestricted) {
+				t.Fatalf("undeclared: %v, want refused", err)
+			}
+			ix = loadWith(t, root, EnvironmentSpec{Files: map[string][]string{outside: {Absent}}})
+			if _, err := ix.Lookup("pcpustat/1.6.tar.bz2"); err != nil {
+				t.Fatalf("declared absent: %v, want admitted", err)
+			}
+			ix = loadWith(t, root, EnvironmentSpec{Files: map[string][]string{outside: {Absent, snapshot(t, "NO_CDROM=client host terms\n")}}})
+			if _, err := ix.Lookup("pcpustat/1.6.tar.bz2"); !errors.Is(err, ErrRestricted) || !strings.Contains(err.Error(), "client host terms") {
+				t.Fatalf("declared as a restriction: %v, want refused naming it", err)
+			}
+		})
+	}
+}
+
+// The review's transient witness: the port writes a file declared absent,
+// includes it, and removes it again, so both measurements see it absent while
+// make reads a restriction. The reader cannot know those bytes, so it refuses
+// every name rather than admit pcpustat, whose distinfo the port names.
+func TestEnvironmentCommandBeforeAHostInclude(t *testing.T) {
+	host := filepath.Join(t.TempDir(), "terms.mk")
+	root := portsTree(t)
+	write(t, root, "misc/probe/Makefile", "_W!= printf 'NO_CDROM=transient terms\\n' > "+host+"\n.sinclude \""+host+"\"\n_R!= rm "+host+"\nDISTINFO_FILE=${PORTSDIR}/sysutils/pcpustat/distinfo\n")
+	ix := loadWith(t, root, EnvironmentSpec{Files: map[string][]string{host: {Absent}}})
+	if _, err := ix.Lookup("pcpustat/1.6.tar.bz2"); !errors.Is(err, ErrRestricted) {
+		t.Fatalf("pcpustat: %v, want refused", err)
+	}
+	if u := strings.Join(ix.Unowned(), " "); !strings.Contains(u, "runs a command while make parses it") {
+		t.Errorf("unowned %q does not say the command is why", u)
+	}
+}
+
+// The framework runs commands a port chooses: bsd.port.mk runs
+// ARCH!= ${UNAME} -p, and a port may set UNAME. So a snapshot read after any
+// framework include, or after a command in the port, describes bytes nothing
+// measured, and refuses. A path declared absent after the framework is the
+// client check's to bind, through make's own list of what it read.
+func TestEnvironmentSnapshotAfterACommand(t *testing.T) {
+	host := "/usr/local/etc/terms.mk"
+	for name, tc := range map[string]struct {
+		makefile string
+		alts     []string
+		want     string // "" admits pcpustat
+	}{
+		"a snapshot after the framework":              {".include <bsd.port.pre.mk>\n.sinclude \"" + host + "\"\n", []string{snapshot(t, "OK=yes\n")}, "declared with a snapshot, after the framework include"},
+		"a snapshot after a port command":             {"_V!=\ttrue\n.sinclude \"" + host + "\"\n", []string{snapshot(t, "OK=yes\n")}, "runs a command while make parses it"},
+		"a snapshot before either":                    {".sinclude \"" + host + "\"\n.include <bsd.port.pre.mk>\n_V!=\ttrue\n", []string{snapshot(t, "OK=yes\n")}, ""},
+		"absent after the framework":                  {".include <bsd.port.pre.mk>\n.sinclude \"" + host + "\"\n", []string{Absent}, ""},
+		"absent after a port command":                 {"_V!=\ttrue\n.sinclude \"" + host + "\"\n", []string{Absent}, "runs a command while make parses it"},
+		"a :sh modifier before a snapshot":            {"_V=\t${CMD:sh}\n.sinclude \"" + host + "\"\n", []string{snapshot(t, "OK=yes\n")}, "runs a command while make parses it"},
+		"a command in a recipe":                       {"post-patch:\n\t@${ECHO} ${X:sh} $$(a != b)\n.sinclude \"" + host + "\"\n", []string{snapshot(t, "OK=yes\n")}, ""},
+		"an include before a command in one loop":     {".for i in a b\n.sinclude \"" + host + "\"\n_W!=\ttrue\n.endfor\n", []string{Absent}, "next iteration"},
+		"a snapshot before the framework in one loop": {".for i in a b\n.sinclude \"" + host + "\"\n.include <bsd.port.options.mk>\n.endfor\n", []string{snapshot(t, "OK=yes\n")}, "next iteration reads " + host},
+		"a snapshot after an included command":        {".include \"${.CURDIR}/run.mk\"\n.sinclude \"" + host + "\"\n", []string{snapshot(t, "OK=yes\n")}, "run.mk runs a command"},
+		// make runs a != command under a computed name as it reads the line,
+		// whether or not anything reads the variable: the F25 audit wrote
+		// the snapshot path, included it and wrote it back, all under _${N}.
+		"a computed-name command before a snapshot":             {"N=W\n_${N}!= printf 'NO_CDROM=computed terms\\n' > " + host + "\n.sinclude \"" + host + "\"\nN=R\n_${N}!= printf 'OK=yes\\n' > " + host + "\n", []string{snapshot(t, "OK=yes\n")}, "runs a command while make parses it"},
+		"a computed-name command before an absent path":         {"N=W\n_${N} !=\ttrue\n.sinclude \"" + host + "\"\n", []string{Absent}, "runs a command while make parses it"},
+		"an include before a computed-name command in one loop": {"N=W\n.for i in a b\n.sinclude \"" + host + "\"\n_${N}${i}!=\ttrue\n.endfor\n", []string{Absent}, "next iteration"},
+		"a computed-name command in a loop before a snapshot":   {"N=W\n.for i in a b\n_${N}!=\ttrue\n.endfor\n.sinclude \"" + host + "\"\n", []string{snapshot(t, "OK=yes\n")}, "runs a command while make parses it"},
+		// base make reads ".${N}!=" as an assignment to .W, running the command.
+		"a computed name opening with a dot": {"N=W\n.${N}!=\ttrue\n", []string{Absent}, "assigns a name built from a variable"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := portsTree(t)
+			write(t, root, "misc/probe/run.mk", "X=\t${:!true!}\n")
+			write(t, root, "misc/probe/Makefile", "LICENSE=\tBSD2CLAUSE\n"+tc.makefile+"DISTINFO_FILE=\t${PORTSDIR}/sysutils/pcpustat/distinfo\n")
+			ix := loadWith(t, root, EnvironmentSpec{Files: map[string][]string{host: tc.alts}})
+			_, err := ix.Lookup("pcpustat/1.6.tar.bz2")
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("pcpustat: %v, want admitted", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrRestricted) || !strings.Contains(strings.Join(ix.Unowned(), " "), tc.want) {
+				t.Fatalf("pcpustat: %v (unowned %q), want refused naming %q", err, ix.Unowned(), tc.want)
+			}
+		})
+	}
+}
+
+// Mk/ builds include paths from variables a port sets (Uses/php.mk reads
+// ${PHPBASE}/etc/php.conf), after running commands the port may choose. A
+// snapshot at a path a framework include can end in refuses every port that
+// includes the framework; one no framework include can reach does not.
+func TestEnvironmentSnapshotReachedThroughTheFramework(t *testing.T) {
+	for name, tc := range map[string]struct {
+		path, alt, want string
+	}{
+		"a path the framework includes":    {"/usr/local/etc/php.conf", "snapshot", "may read /usr/local/etc/php.conf"},
+		"through a variable's value":       {"/usr/local/share/x/y.mk", "snapshot", "may read /usr/local/share/x/y.mk"},
+		"declared absent":                  {"/usr/local/etc/php.conf", Absent, ""},
+		"a path no framework include ends": {"/usr/local/etc/other.conf", "snapshot", ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := portsTree(t)
+			write(t, root, "Mk/Uses/php.mk", ".include \"${PHPBASE}/etc/php.conf\"\n_usefile=\t${udir}/${f}.mk\n.include \"${_usefile}\"\n")
+			write(t, root, "misc/probe/Makefile", "LICENSE=\tBSD2CLAUSE\nDISTINFO_FILE=\t${PORTSDIR}/sysutils/pcpustat/distinfo\n.include <bsd.port.mk>\n")
+			alt := tc.alt
+			if alt == "snapshot" {
+				alt = snapshot(t, "PHP_VER=\t84\n")
+			}
+			ix := loadWith(t, root, EnvironmentSpec{Files: map[string][]string{tc.path: {alt}}})
+			_, err := ix.Lookup("pcpustat/1.6.tar.bz2")
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("pcpustat: %v, want admitted", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrRestricted) || !strings.Contains(strings.Join(ix.Unowned(), " "), tc.want) {
+				t.Fatalf("pcpustat: %v (unowned %q), want refused naming %q", err, ix.Unowned(), tc.want)
+			}
+		})
+	}
+}
+
+// A variable declared undefined expands to nothing, as make expands it, and
+// one the environment does not mention still refuses.
+func TestEnvironmentVariables(t *testing.T) {
+	for name, tc := range map[string]struct {
+		vars map[string][]string
+		want string
+	}{
+		"undeclared":         {nil, "cannot be resolved"},
+		"declared undefined": {map[string][]string{"SUFFIX": {}}, ""},
+		"declared values":    {map[string][]string{"SUFFIX": {"", "-restricted"}}, "RESTRICTED"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := portsTree(t)
+			write(t, root, "lang/restricted/Makefile.common", "RESTRICTED=\tshared terms\n")
+			write(t, root, "lang/probe/Makefile", "LICENSE=\tBSD2CLAUSE\n.sinclude \"${.CURDIR}/../${SUFFIX:C/-//}/Makefile.common\"\n")
+			write(t, root, "lang/probe/distinfo", distinfoFor("probe.tar.gz", sumA, 11))
+			ix := loadWith(t, root, EnvironmentSpec{Variables: tc.vars})
+			_, err := ix.Lookup("probe.tar.gz")
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("%v, want admitted", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrRestricted) || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("%v, want refused naming %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestEnvironmentSpecRefusesWhatItCannotModel(t *testing.T) {
+	for name, spec := range map[string]EnvironmentSpec{
+		"reserved variable":        {Variables: map[string][]string{"DISTINFO_FILE": {"/x"}}},
+		"a restriction everywhere": {Variables: map[string][]string{"NO_CDROM": {"yes"}}},
+		"per-license permissions":  {Variables: map[string][]string{"LICENSE_PERMS_GPLv2": {"dist-mirror"}}},
+		"not a variable name":      {Variables: map[string][]string{"A B": {"x"}}},
+		"relative file":            {Files: map[string][]string{"etc/aspell.ver": {Absent}}},
+		"unclean file":             {Files: map[string][]string{"/usr/local/../etc/x": {Absent}}},
+		"no alternative":           {Files: map[string][]string{"/etc/x": {}}},
+		"relative snapshot":        {Files: map[string][]string{"/etc/x": {"snap"}}},
+		// What the client check cannot write back into make.conf unquoted.
+		"path with a space":       {Files: map[string][]string{"/etc/a b": {Absent}}},
+		"path with a colon":       {Files: map[string][]string{"/etc/a:b": {Absent}}},
+		"path with a reference":   {Files: map[string][]string{"/etc/${X}": {Absent}}},
+		"value with a comment":    {Variables: map[string][]string{"LOCALBASE": {"/usr/local#x"}}},
+		"value with a backslash":  {Variables: map[string][]string{"LOCALBASE": {`/usr\local`}}},
+		"value with space around": {Variables: map[string][]string{"LOCALBASE": {" /usr/local"}}},
+		"the check's own name":    {Variables: map[string][]string{"BODEGA_DISTFILES_ENV": {"x"}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := spec.Validate(); err == nil {
+				t.Fatal("Validate accepted it")
+			}
+		})
+	}
+	missing := EnvironmentSpec{Files: map[string][]string{"/etc/x": {filepath.Join(t.TempDir(), "gone")}}}
+	if err := missing.Validate(); err != nil {
+		t.Fatalf("Validate reads no snapshot, so a missing one is Load's to refuse: %v", err)
+	}
+	if _, err := missing.Load(); err == nil {
+		t.Fatal("Load admitted against a snapshot it could not read")
+	}
+}
+
+// A snapshot that changes or disappears after the first read drops the index:
+// the index was admitted against the old bytes, which are no longer the
+// declared environment. The tree failing to read keeps it; that is the other
+// case, covered by TestTreeReadsInTheBackgroundAndRefreshes.
+func TestTreeRefusesAChangedEnvironment(t *testing.T) {
+	root := aspellTreeEarly(t, "/usr/local/etc/aspell.ver")
+	snap := snapshot(t, "ASPELL_VER=0.60\n")
+	spec := EnvironmentSpec{Files: map[string][]string{"/usr/local/etc/aspell.ver": {snap}}}
+	for name, change := range map[string]func(){
+		"changed": func() {
+			if err := os.WriteFile(snap, []byte("NO_CDROM=later\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"removed": func() {
+			if err := os.Remove(snap); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := os.WriteFile(snap, []byte("ASPELL_VER=0.60\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			tr := NewTreeIn(root, spec, time.Nanosecond, nil)
+			if err := tr.Wait(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tr.Lookup("pcpustat/1.6.tar.bz2"); err != nil {
+				t.Fatalf("before: %v", err)
+			}
+			change()
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				_, err := tr.Lookup("pcpustat/1.6.tar.bz2")
+				if errors.Is(err, ErrNotReady) {
+					return
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("after the snapshot %s: %v, want ErrNotReady", name, err)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
+	}
+}
+
+// An empty snapshot is a declared empty file, not a missing one: the path it
+// stands for is on the client and is never opened on the server, even when
+// the server has a file there.
+func TestEnvironmentEmptySnapshotIsNotTheServerFile(t *testing.T) {
+	host := t.TempDir()
+	write(t, host, "etc/aspell.ver", "NO_CDROM=server host file\n")
+	root := aspellTreeEarly(t, filepath.Join(host, "etc/aspell.ver"))
+	ix := loadWith(t, root, EnvironmentSpec{
+		Files: map[string][]string{filepath.Join(host, "etc/aspell.ver"): {snapshot(t, "")}},
+	})
+	if _, err := ix.Lookup("aspell6-ar-1.2-0.tar.bz2"); err != nil {
+		t.Fatalf("%v, want admitted against the empty snapshot", err)
+	}
+}
+
+// A declared variable is what make.conf, the environment or the command line
+// hold, and a stock client holds LOCALBASE in none of them: above
+// bsd.port.pre.mk base make expands it to nothing. Below it the framework's
+// default applies, and a default the declaration does not list reaches no
+// client the check admits, unless the port assigns the variable after it.
+func TestDeclaredVariablesAroundTheFramework(t *testing.T) {
+	localbase := map[string][]string{"LOCALBASE": {"/opt/local"}}
+	for name, tc := range map[string]struct {
+		makefile string
+		files    map[string][]string
+		want     string // "" admits pcpustat
+	}{
+		"above the framework, unset":         {".include \"${LOCALBASE}/etc/x.mk\"\n.include <bsd.port.pre.mk>\n", map[string][]string{"/opt/local/etc/x.mk": {snapshot(t, "")}}, "/etc/x.mk leaves the ports tree"},
+		"above the framework, both declared": {".include \"${LOCALBASE}/etc/x.mk\"\n.include <bsd.port.pre.mk>\n", map[string][]string{"/opt/local/etc/x.mk": {snapshot(t, "")}, "/etc/x.mk": {Absent}}, ""},
+		"below the framework":                {".include <bsd.port.pre.mk>\n.sinclude \"${LOCALBASE}/etc/x.mk\"\n", map[string][]string{"/opt/local/etc/x.mk": {Absent}}, ""},
+		// java/bootstrap-openjdk8/Makefile.update.
+		"defaulted again below the framework": {".include <bsd.port.pre.mk>\n.sinclude \"${LOCALBASE}/etc/x.mk\"\nLOCALBASE?=\t/usr/local\n", map[string][]string{"/opt/local/etc/x.mk": {Absent}}, ""},
+		"assigned below the framework":        {".include <bsd.port.pre.mk>\n.sinclude \"${LOCALBASE}/etc/x.mk\"\nLOCALBASE=\t/opt/local\n", map[string][]string{"/opt/local/etc/x.mk": {Absent}}, "assigns LOCALBASE below a framework include"},
+		// The command line wins over the port's own assignment.
+		"assigned by the port":                      {"LOCALBASE=\t${.CURDIR}\n.include \"${LOCALBASE}/etc/x.mk\"\n", map[string][]string{"/opt/local/etc/x.mk": {Absent}}, ""},
+		"assigned by the port, command line unread": {"LOCALBASE=\t${.CURDIR}\n.include \"${LOCALBASE}/etc/x.mk\"\n", nil, "/opt/local/etc/x.mk leaves the ports tree"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := portsTree(t)
+			write(t, root, "sysutils/pcpustat/Makefile", "LICENSE=\tBSD2CLAUSE\n"+tc.makefile)
+			write(t, root, "sysutils/pcpustat/etc/x.mk", "")
+			ix := loadWith(t, root, EnvironmentSpec{Variables: localbase, Files: tc.files})
+			e, err := ix.Lookup("pcpustat/1.6.tar.bz2")
+			switch {
+			case tc.want == "" && err != nil:
+				t.Fatalf("pcpustat: %v, want admitted", err)
+			case tc.want != "" && (!errors.Is(err, ErrRestricted) || !strings.Contains(e.Restricted, tc.want)):
+				t.Fatalf("pcpustat: %v (reason %q), want refused naming %q", err, e.Restricted, tc.want)
+			}
+		})
+	}
+}
+
+// The client check names every input admission assumed, so a client that
+// holds anything else names "unsupported". TestClientCheckUnderBaseMake runs
+// it; this pins what it is written to test on any host.
+func TestClientCheckNamesEveryDeclaredInput(t *testing.T) {
+	snap := snapshot(t, "PERL5_DEFAULT=5.42\n")
+	env, err := EnvironmentSpec{
+		Variables: map[string][]string{"LOCALBASE": {"/usr/local"}, "USESDIR": {"${PORTSDIR}/Mk/Uses"}, "PKGNAMESUFFIX": {}},
+		Files:     map[string][]string{"/usr/local/etc/aspell.ver": {Absent}, "/tmp/PERL5_DEFAULT": {Absent, snap}, "/etc/present.mk": {snap}},
+	}.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := string(env.ClientCheck())
+	for _, want := range []string{
+		"for environment " + env.Digest(),
+		// Reserved and declared-undefined names, set anywhere outside the tree.
+		".for _bodega_v in DISTINFO_FILE FILESDIR LICENSE LICENSE_PERMS MASTERDIR NO_CDROM PKGDIR PKGNAMESUFFIX RESTRICTED\n",
+		"!empty(_BODEGA_DISTFILES_ENVIRON:MLICENSE_PERMS_*=*)",
+		// A command-line variable is declared or one the framework passes on.
+		"${.MAKEOVERRIDES:O:u:NLOCALBASE:NUSESDIR:NARCH:",
+		"/usr/bin/grep -lE '" + confPattern + "' ${.MAKE.MAKEFILES:N/usr/share/mk/*:N${.PARSEDIR}/${.PARSEFILE}}",
+		// Declared values, where make.conf sets them and where the fetch reads them.
+		"_BODEGA_DISTFILES_V0_0=\t/usr/local\n.if defined(LOCALBASE) && !(\"${LOCALBASE}\" == \"${_BODEGA_DISTFILES_V0_0}\")",
+		"_BODEGA_DISTFILES_V1_0=\t${PORTSDIR}/Mk/Uses\n",
+		// A file declared absent alone may not exist; one with a snapshot
+		// alone must exist, be a regular file and match it.
+		".if !(\"${_BODEGA_DISTFILES_F2}\" == \"absent\")\nBODEGA_DISTFILES_DRIFT+=\t/usr/local/etc/aspell.ver\n.endif\n",
+		"if [ -f /tmp/PERL5_DEFAULT ]; then /usr/bin/timeout 10 /sbin/sha256 -q /tmp/PERL5_DEFAULT 2>/dev/null || echo unreadable; elif [ -e /tmp/PERL5_DEFAULT ]; then echo irregular; else echo absent; fi",
+		".if !(\"${_BODEGA_DISTFILES_F0}\" == \"348d182711a2886bc0a8eb38c2df85032e593d133971389f2563befc7cbbcb1c\")\nBODEGA_DISTFILES_DRIFT+=\t/etc/present.mk\n",
+		// Measured again where the fetch expands the digest.
+		"${(!defined(LOCALBASE) || \"${LOCALBASE}\" == \"${_BODEGA_DISTFILES_V0_0}\"):?:LOCALBASE}",
+		"${(\"${_BODEGA_DISTFILES_L1}\" == \"348d182711a2886bc0a8eb38c2df85032e593d133971389f2563befc7cbbcb1c\" || \"${_BODEGA_DISTFILES_L1}\" == \"absent\"):?:/tmp/PERL5_DEFAULT}",
+		"_BODEGA_DISTFILES_FLAGS:=\t${.MAKEFLAGS:M-[eI]*}\n",
+		// A path declared absent alone is not exempt from make's list of
+		// what it read: make reading it at all is drift.
+		":N${_BODEGA_DISTFILES_TREE}/*:N/etc/present.mk:N/tmp/PERL5_DEFAULT:${_BODEGA_DISTFILES_READ}}",
+		// Only root and the user running make may write a declared path.
+		"_BODEGA_DISTFILES_W1!=\tu=$$(/usr/bin/id -u); d=/tmp/PERL5_DEFAULT; while :;",
+		"-maxdepth 0 \\( \\( ! -user 0 ! -user \"$$u\" \\) -o -perm -020 -o -perm -002 \\) -print",
+		"BODEGA_DISTFILES_DRIFT+=\t${_BODEGA_DISTFILES_W1:@_bodega_w@writable:${_bodega_w}@}\n",
+		":?" + env.Digest() + ":unsupported}\n",
+		// The port cannot assign what the check measured, nor widen the tree
+		// the makefile list exempts by setting PORTSDIR.
+		"_BODEGA_DISTFILES_TREE:=\t${PORTSDIR:U/usr/ports}\n",
+		":N${_BODEGA_DISTFILES_TREE}/*",
+		// The tree and /usr/share/mk sit on read-only mounts make cannot
+		// lift, as make.conf is read and again where the fetch reads the digest.
+		"_BODEGA_DISTFILES_STABLE=\t" + stableView + "\n",
+		"_BODEGA_DISTFILES_STABLE_NOW:=\t${_BODEGA_DISTFILES_STABLE:sh}\n.if !empty(_BODEGA_DISTFILES_STABLE_NOW)\nBODEGA_DISTFILES_DRIFT+=\t${_BODEGA_DISTFILES_STABLE_NOW}\n",
+		"BODEGA_DISTFILES_DRIFT+=\t${_BODEGA_DISTFILES_STABLE:sh} ",
+		".READONLY:\tBODEGA_DISTFILES_DRIFT BODEGA_DISTFILES_ENV _BODEGA_DISTFILES_ARGS _BODEGA_DISTFILES_CONF ",
+	} {
+		if !strings.Contains(check, want) {
+			t.Errorf("the check does not carry %q:\n%s", want, check)
+		}
+	}
+	if strings.Contains(check, "_BODEGA_DISTFILES_W2") {
+		t.Error("a path declared absent alone is held to its writers, which make's own list of what it read already makes unnecessary")
+	}
+	if strings.Contains(check, "PKGNAMESUFFIX}\" ==") {
+		t.Error("a variable declared undefined is compared at fetch time, where the port may set it itself")
+	}
+}
+
+// TestClientCheckUnderBaseMake installs the check at the end of a make.conf and
+// asks base FreeBSD make, in one port, which environment it names. Every case
+// but the first changes one input the reader's decision rests on, without
+// touching the port or the declaration, and must name "unsupported".
+func TestClientCheckUnderBaseMake(t *testing.T) {
+	if runtime.GOOS != "freebsd" {
+		t.Skip("the check is written for base FreeBSD make")
+	}
+	// Not t.TempDir: /tmp is writable by everyone, which the check refuses
+	// for a path declared with a snapshot.
+	scratch, err := os.MkdirTemp(os.Getenv("HOME"), "bodega-check-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(scratch) })
+	client := filepath.Join(scratch, "client")
+	// Each case writes its port into src, then serves src through a
+	// read-only nullfs over itself, which leaves no other name for the files
+	// behind it, and /usr/share/mk through another. The other directories
+	// are where the aliasing cases put a second view of the tree.
+	src := filepath.Join(scratch, "ports")
+	view, alias := filepath.Join(scratch, "ro"), filepath.Join(scratch, "alias")
+	for _, d := range []string{filepath.Join(src, "distfiles"), view, alias} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if out, _ := exec.Command("/sbin/mount", "-p").Output(); !strings.Contains(string(out), "/usr/share/mk\t\t/usr/share/mk\t\tnullfs\tro") {
+		mount(t, "ro", clientSysPath, clientSysPath)
+	}
+	snap := snapshot(t, "OK=snapshot\n")
+	declared := filepath.Join(client, "snap.mk")
+	absent := filepath.Join(client, "aspell.ver")
+	write(t, scratch, "client/snap.mk", "OK=snapshot\n")
+	write(t, scratch, "ports/misc/probe/Makefile", "P=\t${.CURDIR}/allowed.mk\n.include \"${P}\"\n.if exists("+absent+")\n.include \""+absent+"\"\n.endif\nall:\n")
+	write(t, scratch, "ports/misc/probe/allowed.mk", "OK=yes\n")
+	write(t, scratch, "ports/misc/probe/restricted.mk", "NO_CDROM=command line terms\n")
+	env, err := EnvironmentSpec{
+		Variables: map[string][]string{"LOCALBASE": {"/usr/local"}},
+		Files:     map[string][]string{declared: {snap}, absent: {Absent}},
+	}.Load()
+	stock := "P=\t${.CURDIR}/allowed.mk\n.include \"${P}\"\n.if exists(" + absent + ")\n.include \"" + absent + "\"\n.endif\nall:\n"
+	setPort := func(body string) func() { return func() { write(t, scratch, "ports/misc/probe/Makefile", body) } }
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkPath := filepath.Join(scratch, "environment.mk")
+	if err := os.WriteFile(checkPath, env.ClientCheck(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	conf := func(extra, portsdir string) string {
+		p := filepath.Join(t.TempDir(), "make.conf")
+		if err := os.WriteFile(p, []byte(extra+"PORTSDIR=\t"+portsdir+"\n.include \""+checkPath+"\"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	extra := filepath.Join(scratch, "extra.mk")
+	write(t, scratch, "extra.mk", "P=\t"+src+"/misc/probe/restricted.mk\n")
+	port := filepath.Join(src, "misc/probe")
+	inTree := func(root string) string {
+		f := root + "/misc/probe/terms.mk"
+		return "_W!=\tprintf 'NO_CDROM=in-tree terms\\n' > " + f + "\n.sinclude \"" + f + "\"\n_R!=\trm -f " + f + "\nall:\n"
+	}
+	// through writes the port's terms at f, which names the port's own
+	// directory under another path, and includes them from the directory
+	// make is reading.
+	through := func(f string) func() {
+		return setPort("_W!=\tprintf 'NO_CDROM=aliased terms\\n' > " + f + "\n.sinclude \"${.CURDIR}/terms.mk\"\n_R!=\trm -f " + f + "\nall:\n")
+	}
+	// beneath copies src/misc to a scratch directory and mounts the copy
+	// read-only over src/misc.
+	beneath := func(t *testing.T, name string) {
+		b := filepath.Join(scratch, name)
+		if out, err := exec.Command("cp", "-Rp", filepath.Join(src, "misc")+"/", b).CombinedOutput(); err != nil {
+			t.Fatalf("cp: %v: %s", err, out)
+		}
+		mount(t, "ro", b, filepath.Join(src, "misc"))
+	}
+	// A port needs no knowledge of the host to find the source of a nullfs
+	// view: mount -p names it.
+	discovered := setPort("_S=\ts=$$(/sbin/mount -p | /usr/bin/awk -v t=${PORTSDIR} '$$2 == t { print $$1 }')\n" +
+		"_W!=\t${_S}; printf 'NO_CDROM=discovered terms\\n' > $$s/misc/probe/terms.mk\n.sinclude \"${.CURDIR}/terms.mk\"\n_R!=\t${_S}; rm -f $$s/misc/probe/terms.mk\nall:\n")
+	for _, tc := range []struct {
+		name  string
+		conf  string
+		tree  string // PORTSDIR, when not src
+		bare  bool   // leave src writable rather than serving it read-only
+		root  bool   // run make as root
+		env   []string
+		args  []string
+		setup func()
+		// before mounts ahead of the read-only view of src, after mounts
+		// once it is in place.
+		before, after func(t *testing.T)
+		want          string // the digest, or "unsupported"
+	}{
+		{name: "stock", want: env.Digest()},
+		// -V keeps its argument unexpanded in .MAKEFLAGS, where a check that
+		// read .MAKEFLAGS while expanding the digest would recurse.
+		{name: "-V naming the digest as an expression", args: []string{"-V", "${BODEGA_DISTFILES_ENV}"}, want: env.Digest()},
+		{name: "a declared variable at a declared value", args: []string{"LOCALBASE=/usr/local"}, want: env.Digest()},
+		{name: "a variable the framework passes on", args: []string{"OSVERSION=1501000"}, want: env.Digest()},
+		{name: "a declared variable at another value", args: []string{"LOCALBASE=/opt"}},
+		{name: "an undeclared command-line variable", args: []string{"P=" + port + "/restricted.mk"}},
+		{name: "an undeclared variable through MAKEFLAGS", env: []string{"MAKEFLAGS=P=" + port + "/restricted.mk"}},
+		{name: "-e", args: []string{"-e"}},
+		{name: "-I", args: []string{"-I", scratch}},
+		{name: "-m", args: []string{"-m", scratch, "-m", "/usr/share/mk"}},
+		{name: ".MAKEFLAGS in make.conf", conf: ".MAKEFLAGS: P=" + port + "/restricted.mk\n"},
+		{name: ".READONLY in make.conf", conf: "P=\t" + port + "/restricted.mk\n.READONLY: P\n"},
+		{name: "a makefile read after make.conf", args: []string{"-f", extra, "-f", "Makefile"}},
+		{name: "a declared snapshot changed", setup: func() { write(t, scratch, "client/snap.mk", "NO_CDROM=changed\n") }},
+		{name: "a file declared absent, present before make", setup: func() { write(t, scratch, "client/aspell.ver", "NO_CDROM=host\n") }},
+		// The port writes the file itself once make.conf has been read, as a
+		// concurrent writer would: only the second measurement can see it.
+		{name: "a file declared absent, written while make reads the port", setup: func() {
+			write(t, scratch, "ports/misc/probe/Makefile", "_W!=\tprintf 'NO_CDROM=host\\n' > "+absent+"\n.if exists("+absent+")\n.include \""+absent+"\"\n.endif\nall:\n")
+		}},
+		// The review's transient witness: written, read and removed again
+		// between the two measurements. make's own list of what it read
+		// still names it.
+		{name: "a file declared absent, written and removed while make reads the port", setup: setPort("_W!=\tprintf 'NO_CDROM=host\\n' > " + absent + "\n.sinclude \"" + absent + "\"\n_R!=\trm " + absent + "\nall:\n")},
+		// The port is read after the check, so it may assign what the check
+		// measured, or widen the tree the makefile list exempts.
+		{name: "the port clears the drift", setup: func() {
+			write(t, scratch, "client/aspell.ver", "NO_CDROM=host\n")
+			setPort("BODEGA_DISTFILES_DRIFT=\nBODEGA_DISTFILES_ENV=\t" + env.Digest() + "\nN=\tBODEGA_DISTFILES_DRIFT\n${N}=\n.MAKEFLAGS: BODEGA_DISTFILES_DRIFT=\n" + stock)()
+		}},
+		{name: "the port moves PORTSDIR over the file it reads", setup: setPort("PORTSDIR=\t/\n_W!=\tprintf 'NO_CDROM=host\\n' > " + absent + "\n.sinclude \"" + absent + "\"\n_R!=\trm " + absent + "\nall:\n")},
+		{name: "a snapshot in a directory everyone may write", setup: func() {
+			if err := os.Chmod(filepath.Join(scratch, "client"), 0o777); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		// A FIFO no writer holds open: reading it would block make forever.
+		{name: "a FIFO where a snapshot is declared", setup: func() {
+			if err := os.Remove(declared); err != nil {
+				t.Fatal(err)
+			}
+			if err := syscall.Mkfifo(declared, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		// make moves .OBJDIR only to a directory it can write, which an obj
+		// directory in the read-only tree is not.
+		{name: "an obj directory in the read-only tree", setup: func() {
+			if err := os.MkdirAll(filepath.Join(src, "misc/probe/obj"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}, want: env.Digest()},
+		{name: "an obj directory under MAKEOBJDIRPREFIX", env: []string{"MAKEOBJDIRPREFIX=" + filepath.Join(scratch, "obj")}, setup: func() {
+			if err := os.MkdirAll(filepath.Join(scratch, "obj", port), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		// The F25 audit's in-tree witness: the port writes a file into its
+		// own tree, includes it and removes it. On a tree make can write,
+		// make reads the restriction and the check names no environment.
+		// On the read-only view the write fails, make reads what the
+		// reader read, and the digest stands.
+		{name: "the in-tree witness on a tree make can write", bare: true, setup: setPort(inTree(src))},
+		{name: "the in-tree witness on the read-only tree", setup: setPort(inTree(src)), want: env.Digest()},
+		{name: "a writable mount beneath the tree", after: func(t *testing.T) { mount(t, "rw", client, filepath.Join(src, "distfiles")) }},
+		// The F25 audit's aliased view: the tree make reads is read-only,
+		// and the directory it shows stays writable at its own path.
+		{name: "a read-only view of a writable source", bare: true, tree: view, setup: through(src + "/misc/probe/terms.mk"),
+			before: func(t *testing.T) { mount(t, "ro", src, view) }},
+		{name: "a read-only view whose source the port finds through mount -p", bare: true, tree: view, setup: discovered,
+			before: func(t *testing.T) { mount(t, "ro", src, view) }},
+		// A second, writable name for the tree's files, whichever order the
+		// two mounts were made in, and whether it shows the tree, a
+		// directory above it or one inside it.
+		{name: "a writable view of the tree made before the read-only one", setup: through(alias + "/misc/probe/terms.mk"),
+			before: func(t *testing.T) { mount(t, "rw", src, alias) }},
+		{name: "a writable view of the tree made after the read-only one", setup: through(alias + "/misc/probe/terms.mk"),
+			after: func(t *testing.T) { mount(t, "rw", src, alias) }},
+		{name: "a writable view of a directory above the tree", setup: through(alias + "/ports/misc/probe/terms.mk"),
+			before: func(t *testing.T) { mount(t, "rw", scratch, alias) }},
+		{name: "a writable view of a directory inside the tree", setup: through(alias + "/probe/terms.mk"),
+			before: func(t *testing.T) { mount(t, "rw", filepath.Join(src, "misc"), alias) }},
+		// A nullfs over itself serves whatever it covers, here a writable
+		// view of another directory.
+		{name: "a read-only view over itself stacked on a writable view", bare: true, tree: view, setup: through(src + "/misc/probe/terms.mk"),
+			before: func(t *testing.T) { mount(t, "rw", src, view); mount(t, "ro", view, view) }},
+		// A mount beneath the tree serves its files as surely as the one
+		// covering it: a read-only view there of a copy the fetch user
+		// writes at its own path.
+		{name: "a read-only view beneath the tree of a writable source", setup: through(filepath.Join(scratch, "beneath") + "/probe/terms.mk"),
+			after: func(t *testing.T) { beneath(t, "beneath") }},
+		{name: "a read-only view beneath the tree whose source the port finds through mount -p", setup: setPort("_S=\ts=$$(/sbin/mount -p | /usr/bin/awk -v t=${.CURDIR:H} '$$2 == t { print $$1 }')\n" +
+			"_W!=\t${_S}; printf 'NO_CDROM=discovered beneath\\n' > $$s/probe/terms.mk\n.sinclude \"${.CURDIR}/terms.mk\"\n_R!=\t${_S}; rm -f $$s/probe/terms.mk\nall:\n"),
+			after: func(t *testing.T) { beneath(t, "beneath2") }},
+		{name: "a read-only view beneath the tree over itself", setup: setPort(inTree(src)), want: env.Digest(),
+			after: func(t *testing.T) { mount(t, "ro", filepath.Join(src, "misc"), filepath.Join(src, "misc")) }},
+		{name: "make run as root outside a jail", root: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_ = os.RemoveAll(filepath.Join(src, "misc/probe/obj"))
+			_ = os.RemoveAll(filepath.Join(scratch, "obj"))
+			_ = os.Remove(absent)
+			_ = os.Remove(declared)
+			if err := os.Chmod(filepath.Join(scratch, "client"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			write(t, scratch, "client/snap.mk", "OK=snapshot\n")
+			write(t, scratch, "ports/misc/probe/Makefile", "P=\t${.CURDIR}/allowed.mk\n.include \"${P}\"\n.if exists("+absent+")\n.include \""+absent+"\"\n.endif\nall:\n")
+			if tc.setup != nil {
+				tc.setup()
+			}
+			if tc.before != nil {
+				tc.before(t)
+			}
+			if !tc.bare {
+				mount(t, "ro", src, src)
+			}
+			if tc.after != nil {
+				tc.after(t)
+			}
+			want := tc.want
+			if want == "" {
+				want = ClientUnsupported
+			}
+			portsdir, dir := src, port
+			if tc.tree != "" {
+				portsdir, dir = tc.tree, filepath.Join(tc.tree, "misc/probe")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			argv := append(append([]string{"make", "-C", dir}, tc.args...), "-V", "BODEGA_DISTFILES_ENV", "-V", "BODEGA_DISTFILES_DRIFT", "-V", "${NO_CDROM:S/^/NO_CDROM=/}")
+			if tc.root {
+				argv = append([]string{"sudo", "-n", "env", "__MAKE_CONF=" + conf(tc.conf, portsdir)}, argv...)
+			}
+			cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+			cmd.WaitDelay = time.Second
+			cmd.Env = append(append(os.Environ(), "__MAKE_CONF="+conf(tc.conf, portsdir)), tc.env...)
+			var stderr strings.Builder
+			cmd.Stderr = &stderr
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("make: %v\n%s%s", err, out, stderr.String())
+			}
+			lines := strings.SplitN(string(out), "\n", 2)
+			t.Logf("%s", strings.TrimSpace(string(out)))
+			if lines[0] != want {
+				t.Errorf("the check names %q, want %q", lines[0], want)
+			}
+			if want != ClientUnsupported && strings.Contains(string(out), "NO_CDROM=") {
+				t.Errorf("the check names the digest while make read a restriction:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestStableViewMountTable drives the check's mount-table program with
+// synthetic mount -p output, so every host runs the rules the base-make test
+// can only exercise where it may mount. Every mount that serves a file under
+// the tree is judged, not only the one covering it.
+func TestStableViewMountTable(t *testing.T) {
+	if _, err := os.Stat("/usr/bin/awk"); err != nil {
+		t.Skip("no /usr/bin/awk")
+	}
+	start := strings.Index(stableView, `awk -v t="$$t" '`)
+	end := strings.LastIndex(stableView, `'; done`)
+	if start < 0 || end < start {
+		t.Fatal("stableView no longer runs one awk program per path")
+	}
+	prog := strings.ReplaceAll(stableView[start+len(`awk -v t="$$t" '`):end], "$$", "$")
+	const base = "zroot/usr/ports /usr/ports zfs rw 0 0\n/usr/ports /usr/ports nullfs ro 0 0\n"
+	for _, tc := range []struct {
+		name, table string
+		want        string // empty when admitted
+	}{
+		{"the tree on its own store, read-only", "zroot/usr/ports /usr/ports zfs ro 0 0\n", ""},
+		{"a nullfs over the writable store", base, ""},
+		{"the store alone, writable", "zroot/usr/ports /usr/ports zfs rw 0 0\n", " writable:/usr/ports"},
+		{"a read-only view of another directory", base + "/home/u/ports /usr/ports nullfs ro 0 0\n", " aliased:/home/u/ports"},
+		{"a view over itself of an aliased view", "/home/u/ports /usr/ports nullfs rw 0 0\n/usr/ports /usr/ports nullfs ro 0 0\n", " aliased:/home/u/ports"},
+		{"a unionfs over the tree", base + "/home/u/ports /usr/ports unionfs ro 0 0\n", " aliased:/home/u/ports"},
+		{"an nfs tree", "host:/export /usr/ports nfs ro 0 0\n", " fstype:nfs"},
+		{"a writable mount beneath", base + "/home/u/misc /usr/ports/misc nullfs rw 0 0\n", " aliased:/home/u/misc writable:/usr/ports/misc"},
+		{"a read-only nullfs beneath of another directory", base + "/home/u/misc /usr/ports/misc nullfs ro 0 0\n", " aliased:/home/u/misc"},
+		{"a read-only unionfs beneath", base + "/home/u/misc /usr/ports/misc nullfs ro 0 0\n/home/u/misc /usr/ports/misc unionfs ro 0 0\n", " aliased:/home/u/misc aliased:/home/u/misc"},
+		{"an md device beneath", base + "/dev/md0 /usr/ports/misc ufs ro 0 0\n", " device:/dev/md0"},
+		{"an nfs export beneath", base + "host:/export /usr/ports/misc nfs ro 0 0\n", " fstype:nfs"},
+		{"a nullfs beneath over itself", base + "/usr/ports/misc /usr/ports/misc nullfs ro 0 0\n", ""},
+		{"a nullfs beneath over itself stacked on an nfs export", base + "host:/export /usr/ports/misc nfs ro 0 0\n/usr/ports/misc /usr/ports/misc nullfs ro 0 0\n", " fstype:nfs fstype:nfs"},
+		{"a nullfs beneath over itself stacked on an aliased view", base + "/home/u/misc /usr/ports/misc nullfs ro 0 0\n/usr/ports/misc /usr/ports/misc nullfs ro 0 0\n", " aliased:/home/u/misc aliased:/home/u/misc"},
+		{"a mount beneath two levels down", base + "host:/export /usr/ports/misc/probe nfs ro 0 0\n", " fstype:nfs"},
+		// The cover hides a mount beneath the path made before it.
+		{"a mount beneath made before the cover", "zroot/usr/ports /usr/ports zfs rw 0 0\nhost:/export /usr/ports/misc nfs ro 0 0\n/usr/ports /usr/ports nullfs ro 0 0\n", ""},
+		{"a mount beside the tree", base + "host:/export /usr/portsx nfs ro 0 0\n", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command("/usr/bin/awk", "-v", "t=/usr/ports", prog)
+			cmd.Stdin = strings.NewReader(strings.ReplaceAll(tc.table, `\n`, "\n"))
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("awk: %v", err)
+			}
+			if got := strings.TrimSuffix(string(out), "\n"); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// mount puts a nullfs view of src at dst, read-only or read-write, for the
+// rest of the test. The check's stable view is a property of mounts, so a
+// test of it needs one, and only root can make one.
+func mount(t *testing.T, mode, src, dst string) {
+	t.Helper()
+	if out, err := exec.Command("sudo", "-n", "mount", "-t", "nullfs", "-o", mode, src, dst).CombinedOutput(); err != nil {
+		t.Skipf("mounting %s at %s needs passwordless sudo: %v: %s", src, dst, err, out)
+	}
+	t.Cleanup(func() {
+		if out, err := exec.Command("sudo", "-n", "umount", dst).CombinedOutput(); err != nil {
+			t.Errorf("unmount %s: %v: %s", dst, err, out)
+		}
+	})
+}
+
+// LookupIn answers only a client whose check named the digest the index was
+// admitted against. A drifted client, one checking another declaration, and
+// one with no check are refused, whatever the name.
+func TestTreeLookupInBindsTheClient(t *testing.T) {
+	root := aspellTree(t)
+	spec := EnvironmentSpec{Variables: map[string][]string{"LOCALBASE": {"/usr/local"}}, Files: map[string][]string{"/usr/local/etc/aspell.ver": {Absent}}}
+	env, err := spec.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := NewTreeIn(root, spec, 0, nil)
+	if err := tr.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	other, _ := EnvironmentSpec{}.Load()
+	for _, digest := range []string{"", ClientUnsupported, other.Digest(), strings.ToUpper(env.Digest())} {
+		if _, err := tr.LookupIn(digest, "pcpustat/1.6.tar.bz2"); !errors.Is(err, ErrEnvironment) {
+			t.Errorf("LookupIn(%q): %v, want ErrEnvironment", digest, err)
+		}
+	}
+	if e, err := tr.LookupIn(env.Digest(), "pcpustat/1.6.tar.bz2"); err != nil || e.SHA256 != sumA {
+		t.Errorf("LookupIn(the admitted digest): %+v, %v", e, err)
+	}
+	check, err := tr.ClientCheck()
+	if err != nil || !strings.Contains(string(check), ":?"+env.Digest()+":") {
+		t.Errorf("ClientCheck names another environment than LookupIn admits: %v\n%s", err, check)
+	}
+}

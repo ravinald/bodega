@@ -147,6 +147,16 @@ func fillConfig(t *testing.T, cfg *config.Config) {
 	// and the driver has to be non-empty.
 	overrides := map[string]any{
 		"discover_mode": "observe",
+		// Both validated by Load: the tree must be absolute and the upstream
+		// an https base ending in "/".
+		"distfiles_ports_tree": "/usr/ports",
+		"distfiles_upstream":   "https://distfiles.example/",
+		// Validated by Load: a variable name, and an absolute client-host
+		// path whose alternatives are "absent" or an absolute snapshot. An
+		// empty list is the declaration of an undefined variable, so the
+		// round trip has to keep it apart from a missing key.
+		"distfiles_environment_variables": map[string][]string{"LOCALBASE": {"/usr/local"}, "PKGNAMESUFFIX": {}},
+		"distfiles_environment_files":     map[string][]string{"/usr/local/etc/aspell.ver": {"absent", "/etc/bodega/aspell.ver"}},
 		// Load validates this one, so the reflective "value-<tag>" filler
 		// cannot reach it. 1.2 rather than the 1.3 default, so the round trip
 		// would still catch a Save that dropped the key and let the default

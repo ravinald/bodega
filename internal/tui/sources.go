@@ -298,6 +298,10 @@ func BuildTree(store *manifest.Store, statuses []inventory.EntryStatus) []TreeNo
 	freebsdEntries := collectEntries(manifest.TypeFreeBSD, func(ve manifest.VersionEntry) string { return ve.Version })
 	roots = append(roots, buildGroup(manifest.TypeFreeBSD, freebsdEntries))
 
+	// distfiles — no version; the distinfo name carries it.
+	distfilesEntries := collectEntries(manifest.TypeDistfiles, func(ve manifest.VersionEntry) string { return ve.Version })
+	roots = append(roots, buildGroup(manifest.TypeDistfiles, distfilesEntries))
+
 	return roots
 }
 

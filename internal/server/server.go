@@ -33,6 +33,7 @@ import (
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/distinfo"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 	"github.com/ravinald/bodega/internal/storage"
@@ -151,6 +152,11 @@ type Server struct {
 	// aptSnap is the generated apt index. Held whole so Release and the
 	// Packages bodies it digests are always served from one generation.
 	aptSnap atomic.Pointer[aptSnapshot]
+
+	// distinfo is the ports tree's digest index, or nil when
+	// distfiles_ports_tree is unset. Nil is what makes /distfiles/ answer
+	// every request 404 rather than admit a file against nothing.
+	distinfo *distinfo.Tree
 
 	// gitTool is the resolved git toolchain the smart-HTTP path executes,
 	// or nil when git-http-backend could not be found at startup. Nil is what
@@ -375,6 +381,16 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 	// Resolve the git toolchain before routes are registered: whether
 	// git-http-backend exists decides which routes exist.
 	s.gitTool = resolveGitTool(cfg, logger)
+
+	// Read in the background: a cold walk of a full ports tree takes the
+	// better part of a minute, and a server that would not bind until it
+	// finished would take every other type down with it. The route answers
+	// 503 until the first read lands.
+	if cfg.DistfilesPortsTree != "" {
+		s.distinfo = distinfo.NewTreeIn(cfg.DistfilesPortsTree, cfg.DistfilesEnvironment(), distinfoRefresh, func(format string, args ...any) {
+			logger.Info(fmt.Sprintf(format, args...))
+		})
+	}
 
 	s.loadAptSigner()
 	s.loadPkgSigner()
@@ -847,6 +863,11 @@ func (s *Server) registerRoutes() {
 	// root file or a catalogue record's own repopath, which carries any
 	// number of segments.
 	m.HandleFunc("GET /freebsd/{path...}", s.handleFreeBSD)
+
+	// Ports distfiles, by distinfo name under the environment the client's
+	// check measured: the path is what a client composes from
+	// MASTER_SITE_OVERRIDE=<base>/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/.
+	m.HandleFunc("GET /distfiles/{name...}", s.handleDistfiles)
 
 	// REST API
 	m.HandleFunc("GET /api/v1/packages", s.handleAPIPackages)

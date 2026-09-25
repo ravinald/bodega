@@ -357,7 +357,12 @@ func validateUpstreamURL(rawURL string) error {
 	if u.Scheme != "https" {
 		return fmt.Errorf("upstream URL must use https, got %q", u.Scheme)
 	}
-	host := u.Hostname()
+	return checkUpstreamHost(u.Hostname())
+}
+
+// checkUpstreamHost is the address half of validateUpstreamURL: it refuses a
+// host that resolves to a loopback, private or link-local address.
+func checkUpstreamHost(host string) error {
 	//nolint:gosec // G704: this lookup IS the SSRF defense — we resolve the host to inspect IPs and reject loopback / private / link-local before returning.
 	ips, err := net.LookupHost(host)
 	if err != nil {
@@ -445,7 +450,14 @@ type upstreamStream struct {
 // the caller to read or to stream. It is the one place the SSRF guard and the
 // 404-versus-outage distinction live.
 func openUpstream(ctx context.Context, rawURL string, identity bool) (*upstreamStream, error) {
-	if err := upstreamGuard(rawURL); err != nil {
+	return openUpstreamVia(ctx, upstreamClient, upstreamGuard, rawURL, identity)
+}
+
+// openUpstreamVia is openUpstream with the client and guard named, for the one
+// route whose upstream is held to a different scheme rule. See
+// distfilesGuard.
+func openUpstreamVia(ctx context.Context, client *http.Client, guard func(string) error, rawURL string, identity bool) (*upstreamStream, error) {
+	if err := guard(rawURL); err != nil {
 		return nil, err
 	}
 	//nolint:gosec // G704: rawURL was just validated by validateUpstreamURL above (https-only, non-loopback, non-private).
@@ -463,7 +475,7 @@ func openUpstream(ctx context.Context, rawURL string, identity bool) (*upstreamS
 	}
 
 	//nolint:gosec // G704: see comment on NewRequestWithContext above; URL is validated.
-	resp, err := upstreamClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}

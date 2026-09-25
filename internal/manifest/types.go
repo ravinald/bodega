@@ -30,6 +30,12 @@ const (
 	// and `bodega pkg create pkg nginx` is a sentence nobody should have to
 	// parse.
 	TypeFreeBSD = "freebsd"
+
+	// TypeDistfiles is a mirror of FreeBSD ports distfiles, the source
+	// archives a port's fetch target downloads into DISTDIR. It is not a
+	// binary entry with a nicer name: see internal/distinfo for why the
+	// digest it admits against is one bodega did not produce.
+	TypeDistfiles = "distfiles"
 )
 
 // Mode constants control how an entry is served.
@@ -47,7 +53,7 @@ const (
 )
 
 // AllTypes is the canonical build order across all supported ecosystems.
-var AllTypes = []string{TypeBinary, TypeGit, TypeApt, TypePypi, TypeGomod, TypeHelm, TypeNpm, TypeCargo, TypeFreeBSD}
+var AllTypes = []string{TypeBinary, TypeGit, TypeApt, TypePypi, TypeGomod, TypeHelm, TypeNpm, TypeCargo, TypeFreeBSD, TypeDistfiles}
 
 // Dependency is one dependency a version declares, recorded in the shape the
 // registry protocol publishes rather than the shape the ecosystem's build file

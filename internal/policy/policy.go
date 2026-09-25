@@ -32,10 +32,12 @@ type Rule = audit.PolicyInfo
 // empty string for unknown types.
 func RuleKindForType(registryType string) string {
 	switch registryType {
-	case manifest.TypeApt, manifest.TypeFreeBSD:
-		// Both are archive mirrors: what an operator trusts is the archive
-		// host, not a package name, because the request that reaches upstream
-		// carries a pool path or a repopath and no package identity at all.
+	case manifest.TypeApt, manifest.TypeFreeBSD, manifest.TypeDistfiles:
+		// All three are archive mirrors: what an operator trusts is the
+		// archive host, not a package name, because the request that reaches
+		// upstream carries a pool path, a repopath or a distinfo name and no
+		// package identity at all. A distfile's digest says the bytes are
+		// right; it does not say the operator agreed to contact the host.
 		return KindHost
 	case manifest.TypeGit:
 		return KindOrg
@@ -122,6 +124,7 @@ func (c *Checker) Invalidate() {
 //   - gomod:  module path, e.g. "example.com/example-corp/widget-sdk"
 //   - helm:   upstream URL
 //   - binary: upstream URL
+//   - distfiles: upstream URL (hostname is extracted internally)
 func (c *Checker) Check(ctx context.Context, registryType, candidate string) error {
 	if c == nil {
 		return nil // nil checker = policy disabled entirely (test/dev convenience)
@@ -170,7 +173,7 @@ func (c *Checker) rulesFor(ctx context.Context, registryType string) ([]Rule, er
 
 func matchRule(registryType string, r Rule, candidate string) bool {
 	switch registryType {
-	case manifest.TypeApt, manifest.TypeFreeBSD:
+	case manifest.TypeApt, manifest.TypeFreeBSD, manifest.TypeDistfiles:
 		return strings.EqualFold(hostFromURL(candidate), r.Pattern)
 	case manifest.TypeGit:
 		return strings.HasPrefix(stripScheme(candidate), stripScheme(r.Pattern))
@@ -239,7 +242,7 @@ func (c *Checker) HasRules(ctx context.Context, registryType string) (bool, erro
 // RuleKindForType(regType).
 func SuggestPattern(regType, host, fullPath, pkgName string) string {
 	switch regType {
-	case manifest.TypeApt, manifest.TypeFreeBSD:
+	case manifest.TypeApt, manifest.TypeFreeBSD, manifest.TypeDistfiles:
 		return host
 	case manifest.TypeGit:
 		return host + "/" + firstSegment(fullPath) + "/"

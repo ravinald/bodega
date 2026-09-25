@@ -318,6 +318,7 @@ body {
 .type-npm { color: #ff005f; }
 .type-cargo { color: #d75fd7; }
 .type-freebsd { color: #af0000; }
+.type-distfiles { color: #d78700; }
 </style>
 </head>
 <body>
@@ -343,7 +344,7 @@ body {
 </div>
 
 <script>
-const typeIcons = {apt:'A', git:'G', pypi:'P', binary:'B', gomod:'M', helm:'H', npm:'N', cargo:'C', freebsd:'F'};
+const typeIcons = {apt:'A', git:'G', pypi:'P', binary:'B', gomod:'M', helm:'H', npm:'N', cargo:'C', freebsd:'F', distfiles:'D'};
 // typeOrder decides the order types render in and never which types render.
 // apt leads this page deliberately, which manifest.AllTypes build order (binary
 // first) would undo, so the preference is written out rather than derived.
@@ -780,6 +781,12 @@ function getClientUrl(type, entry) {
       const repo = freeBSDRepoFor(entry);
       return repo ? repo.conf : '';
     }
+    // The entry's name is the distinfo name, DIST_SUBDIR included, under the
+    // environment the client's check measured. A client does not fetch it by
+    // hand: MASTER_SITE_OVERRIDE composes this same URL per port, and the
+    // check it includes from /distfiles/@environment.mk fills the digest in.
+    case 'distfiles':
+      return base + '/distfiles/@${BODEGA_DISTFILES_ENV}/' + entry.name;
   }
   return '';
 }
@@ -828,7 +835,7 @@ async function showDashboard() {
     html += '<div class="dash-section"><h3>Packages by Type</h3>';
     var maxPkg = 0;
     for (var t in m.by_type) { if (m.by_type[t].packages > maxPkg) maxPkg = m.by_type[t].packages; }
-    var barColors = {apt:'#ffaf00', git:'#8787ff', pypi:'#b8860b', binary:'#00d787', gomod:'#5fd7ff', helm:'#0087ff', npm:'#ff005f', cargo:'#d75fd7', freebsd:'#af0000'};
+    var barColors = {apt:'#ffaf00', git:'#8787ff', pypi:'#b8860b', binary:'#00d787', gomod:'#5fd7ff', helm:'#0087ff', npm:'#ff005f', cargo:'#d75fd7', freebsd:'#af0000', distfiles:'#d78700'};
     for (var t of renderTypes(Object.keys(m.by_type || {}))) {
       var bt = m.by_type[t] || {packages:0};
       var w = maxPkg > 0 ? Math.round(bt.packages * 100 / maxPkg) : 0;

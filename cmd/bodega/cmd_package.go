@@ -134,6 +134,13 @@ When a name is given after the type, only that entry is packaged.`,
 					allSummaries = append(allSummaries,
 						ensureMirroredFreeBSD(bcfg, store, entryFilter),
 					)
+
+				case manifest.TypeDistfiles:
+					// distfiles has no package stage: the DISTDIR is the
+					// artifact, and distinfo is the metadata.
+					allSummaries = append(allSummaries,
+						ensureFetchedDistfiles(bcfg, store, entryFilter),
+					)
 				}
 			}
 
