@@ -3,7 +3,10 @@ package storage
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -12,20 +15,31 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
+
+	bos3 "github.com/ravinald/bodega/internal/s3"
 )
 
 // backends is the set every ObjectStore implementation is held to. A new
-// backend joins by adding one line here.
+// backend joins by adding one line here, and one to requireReachable if it
+// needs something the machine running the tests may not have.
 //
-// S3 is absent and stays absent: every case below writes and reads, so running
-// them means a live bucket, credentials and a region in the merge gate, and a
-// gate that needs an AWS account is a gate that stops blocking the day the
-// account is unavailable. So s3.go is held to the write contract by reading,
-// and heldByReading names what that costs.
+// S3 runs against a live bucket, which a gate that needs an AWS account can
+// only do while the account is available. So it runs when credentials
+// resolve, and skips when none do unless s3ConformanceEnv promises them, in
+// which case their absence fails the run: a skip nothing forces is a gate that
+// stops blocking without anyone deciding it should.
 func conformanceBackends() map[string]func(t *testing.T) ObjectStore {
 	return map[string]func(t *testing.T) ObjectStore{
 		"local":  func(t *testing.T) ObjectStore { return NewLocal(rootWithDecoySibling(t)) },
 		"memory": func(t *testing.T) ObjectStore { return NewMemory() },
+		"s3":     newConformanceS3,
 		// prefixed is a wrapper rather than a driver, and it was absent long
 		// enough for Label() to grow a second spelling of one directory that
 		// TestLabelIsOnePerLocation would have caught (#189).
@@ -53,27 +67,177 @@ func rootWithDecoySibling(t *testing.T) string {
 	return root
 }
 
-// heldByReading is the set of registered drivers no case in this file runs
-// against, each with the argument standing in for a run.
-//
-// Reading buys the ordering promises and not the access one. The S3 API
-// document says a PUT replaces an object atomically and that a GET in flight
-// keeps the version it opened, so the first three clauses of the write
-// contract are somebody else's tested behavior rather than an untested claim
-// of ours. The fourth is the one reading cannot cover, and the reason it does
-// not have to is that S3 carries no per-object access state for a replacement
-// to lose: there is no mode, owner or ACL on the path this backend writes. See
-// the contract block on the S3 type.
-//
-// What it costs is the wrapper. A Put that silently drops a key, a GetStream
-// that returns a closed body, a ValidateKey call left off a method: each is
-// caught by nothing until an operator with an s3 backend meets it.
-// Every case below pins behavior that lives in this package rather than in the
-// service, so that gap is this file's, not AWS's.
-var heldByReading = map[string]string{
-	"s3": "replacement atomicity and read-during-write are the service's, " +
-		"and there is no per-object access state for a replacement to restate",
+// s3ConformanceEnv promises this run an S3 endpoint. Set to anything, it turns
+// "no AWS credentials resolved" from a skip into a failure, so a pipeline that
+// is meant to exercise S3 cannot pass by quietly not doing so.
+const s3ConformanceEnv = "BODEGA_S3_CONFORMANCE"
+
+// conformanceBucketPrefix is the name every bucket this file creates starts
+// with. The development account's test role may create and delete only
+// buckets under it, and a crashed run is cleaned by one sweep over it.
+const conformanceBucketPrefix = "bodega-conf-"
+
+var (
+	s3ConfOnce sync.Once
+	s3Conf     aws.Config
+	s3ConfErr  error
+)
+
+// liveS3Config resolves the AWS default chain once per test binary. Retrieving
+// is what proves credentials exist: loading succeeds with none, and the first
+// request would fail instead.
+func liveS3Config() (aws.Config, error) {
+	s3ConfOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		s3Conf, s3ConfErr = awsconfig.LoadDefaultConfig(ctx)
+		if s3ConfErr != nil {
+			return
+		}
+		if s3Conf.Region == "" {
+			s3Conf.Region = "us-west-2"
+		}
+		_, s3ConfErr = s3Conf.Credentials.Retrieve(ctx)
+	})
+	return s3Conf, s3ConfErr
 }
+
+// requireReachable skips or fails a backend's subtest before any case runs,
+// so the decision is made once per backend on the goroutine that owns it.
+func requireReachable(t *testing.T, name string) {
+	t.Helper()
+	if name != "s3" {
+		return
+	}
+	if _, err := liveS3Config(); err != nil {
+		if os.Getenv(s3ConformanceEnv) != "" {
+			t.Fatalf("%s is set, so this run was promised an S3 endpoint, and no AWS credentials resolved: %v", s3ConformanceEnv, err)
+		}
+		t.Skipf("no AWS credentials resolved (%v); set %s to make that a failure", err, s3ConformanceEnv)
+	}
+}
+
+// liveS3Bucket names a fresh bucket and registers its teardown. Each store
+// gets its own because S3.Label() is s3://<bucket>, and
+// TestLabelDistinguishesTwoStores is only meaningful if two stores are two
+// buckets rather than one bucket under a wrapper this file would then be
+// testing instead of s3.go.
+func liveS3Bucket(t *testing.T) (aws.Config, *bos3.Client) {
+	t.Helper()
+	cfg, err := liveS3Config()
+	if err != nil {
+		t.Fatalf("requireReachable did not run before the s3 factory: %v", err)
+	}
+	var raw [12]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		t.Fatal(err)
+	}
+	bucket := conformanceBucketPrefix + hex.EncodeToString(raw[:])
+	client := bos3.NewClientFromConfig(cfg, bucket, cfg.Region)
+	t.Cleanup(func() { dropLiveBucket(t, client) })
+	return cfg, client
+}
+
+func newConformanceS3(t *testing.T) ObjectStore {
+	t.Helper()
+	cfg, client := liveS3Bucket(t)
+	// CreateBucket rather than InitBucket: versioning would make teardown walk
+	// delete markers, and an InitBucket defect would fail every case here
+	// instead of the one test that is about it.
+	in := &awss3.CreateBucketInput{Bucket: aws.String(client.Bucket())}
+	if cfg.Region != "us-east-1" {
+		in.CreateBucketConfiguration = &s3types.CreateBucketConfiguration{
+			LocationConstraint: s3types.BucketLocationConstraint(cfg.Region),
+		}
+	}
+	if _, err := client.S3Client().CreateBucket(t.Context(), in); err != nil {
+		t.Fatalf("create s3://%s in %s: %v", client.Bucket(), cfg.Region, err)
+	}
+	return NewS3(client)
+}
+
+// dropLiveBucket empties and deletes a bucket this file created. It is
+// best-effort: a leaked bucket costs a sweep, and failing the case over it
+// would report a teardown problem as a contract violation. It runs on its own
+// context because t.Context() is already canceled when cleanup runs.
+func dropLiveBucket(t *testing.T, client *bos3.Client) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	api, bucket := client.S3Client(), aws.String(client.Bucket())
+
+	var objects []s3types.ObjectIdentifier
+	versions := awss3.NewListObjectVersionsPaginator(api, &awss3.ListObjectVersionsInput{Bucket: bucket})
+	for versions.HasMorePages() {
+		page, err := versions.NextPage(ctx)
+		if err != nil {
+			if isNoSuchBucket(err) {
+				return
+			}
+			t.Logf("teardown: list s3://%s: %v; sweep %s* by hand", *bucket, err, conformanceBucketPrefix)
+			return
+		}
+		for _, v := range page.Versions {
+			objects = append(objects, s3types.ObjectIdentifier{Key: v.Key, VersionId: v.VersionId})
+		}
+		for _, m := range page.DeleteMarkers {
+			objects = append(objects, s3types.ObjectIdentifier{Key: m.Key, VersionId: m.VersionId})
+		}
+	}
+	for len(objects) > 0 {
+		n := min(len(objects), 1000)
+		if _, err := api.DeleteObjects(ctx, &awss3.DeleteObjectsInput{
+			Bucket: bucket, Delete: &s3types.Delete{Objects: objects[:n], Quiet: aws.Bool(true)},
+		}); err != nil {
+			t.Logf("teardown: empty s3://%s: %v", *bucket, err)
+		}
+		objects = objects[n:]
+	}
+	if _, err := api.DeleteBucket(ctx, &awss3.DeleteBucketInput{Bucket: bucket}); err != nil && !isNoSuchBucket(err) {
+		t.Logf("teardown: delete s3://%s: %v; sweep %s* by hand", *bucket, err, conformanceBucketPrefix)
+	}
+}
+
+func isNoSuchBucket(err error) bool {
+	var ae smithy.APIError
+	return errors.As(err, &ae) && ae.ErrorCode() == "NoSuchBucket"
+}
+
+// TestInitBucketAgainstALiveBucket runs InitBucket where the conformance
+// cases do not: a versioned, encrypted, lifecycle-configured bucket, created
+// by the code an operator runs. The second pass is the idempotence claim, and
+// it must report every step as already correct.
+func TestInitBucketAgainstALiveBucket(t *testing.T) {
+	requireReachable(t, "s3")
+	cfg, client := liveS3Bucket(t)
+	for pass, wantChange := range []bool{true, false} {
+		var out bytes.Buffer
+		if err := bos3.InitBucket(t.Context(), client.S3Client(), &out, client.Bucket(), cfg.Region); err != nil {
+			t.Fatalf("pass %d: %v\n%s", pass+1, err, out.String())
+		}
+		changed := strings.Contains(out.String(), "CREATED") || strings.Contains(out.String(), "CONFIGURED") || strings.Contains(out.String(), "ENABLED")
+		if changed != wantChange {
+			t.Errorf("pass %d reported a change = %v, want %v:\n%s", pass+1, changed, wantChange, out.String())
+		}
+	}
+	lc, err := client.S3Client().GetBucketLifecycleConfiguration(t.Context(), &awss3.GetBucketLifecycleConfigurationInput{Bucket: aws.String(client.Bucket())})
+	if err != nil {
+		t.Fatalf("read back lifecycle: %v", err)
+	}
+	if got, want := len(lc.Rules), len(bos3.LifecycleRules()); got != want {
+		t.Errorf("bucket holds %d lifecycle rules, want %d", got, want)
+	}
+}
+
+// heldByReading is the set of registered drivers no case in this file runs
+// against, each with the argument standing in for a run. It is empty, and
+// stays declared for the next driver that cannot run here.
+//
+// Reading is the weaker substitute and the argument has to say what it costs.
+// It can lean on a service's documented guarantees for the ordering promises
+// of the write contract; it cannot catch the wrapper: a Put that silently
+// drops a key, a GetStream that returns a closed body, a ValidateKey call left
+// off a method. Each is caught by nothing until an operator meets it.
+var heldByReading = map[string]string{}
 
 // A backend satisfies ObjectStore as documented while keeping less than the
 // write contract says, and the only thing standing between that and a
@@ -99,7 +263,8 @@ func TestEveryRegisteredDriverIsHeldToTheContract(t *testing.T) {
 func TestObjectStoreConformance(t *testing.T) {
 	for name, mk := range conformanceBackends() {
 		t.Run(name, func(t *testing.T) {
-			testObjectStore(t, func() ObjectStore { return mk(t) })
+			requireReachable(t, name)
+			testObjectStore(t, mk)
 		})
 	}
 }
@@ -107,7 +272,12 @@ func TestObjectStoreConformance(t *testing.T) {
 // testObjectStore runs the ObjectStore contract against one implementation.
 // Each case gets a fresh store so an assertion never depends on the order the
 // table happens to run in.
-func testObjectStore(t *testing.T, mk func() ObjectStore) {
+//
+// mk takes the per-case *testing.T, not the one the backend's subtest holds.
+// A factory that fails or registers cleanup does so on the goroutine running
+// the case; handed the parent's, a t.Fatal inside it would call Goexit on the
+// wrong goroutine and a store's cleanup would outlive the case that used it.
+func testObjectStore(t *testing.T, mk func(t *testing.T) ObjectStore) {
 	t.Helper()
 
 	cases := []struct {
@@ -661,7 +831,7 @@ func testObjectStore(t *testing.T, mk func() ObjectStore) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			tc.run(t, t.Context(), mk())
+			tc.run(t, t.Context(), mk(t))
 		})
 	}
 }
@@ -701,6 +871,7 @@ func assertKeyRefused(t *testing.T, ctx context.Context, s ObjectStore, key stri
 func TestLabelDistinguishesTwoStores(t *testing.T) {
 	for name, mk := range conformanceBackends() {
 		t.Run(name, func(t *testing.T) {
+			requireReachable(t, name)
 			if a, b := mk(t).Label(), mk(t).Label(); a == b {
 				t.Fatalf("two independent stores both report Label() = %q", a)
 			}
@@ -756,6 +927,16 @@ func sameLocationSpellings(t *testing.T) map[string][]ObjectStore {
 			withPrefix(NewLocal(root), "cold//x"),
 			withPrefix(NewLocal(root), "./cold/x"),
 			withPrefix(NewLocal(root), "cold/y/../x"),
+		},
+		// A bucket name is global, so a region is not part of the location
+		// and two clients spelling it differently name one bucket. The prefix
+		// spellings that would need cleaning are refused at load, and s3
+		// takes no prefix of its own: s3://<bucket> is one string per bucket.
+		// Label reads no network, so this entry needs no credentials.
+		"s3": {
+			NewS3(bos3.NewClientFromConfig(aws.Config{Region: "us-west-2"}, "bodega-conf-label", "us-west-2")),
+			NewS3(bos3.NewClientFromConfig(aws.Config{Region: "us-east-1"}, "bodega-conf-label", "us-east-1")),
+			NewS3(bos3.NewClientFromConfig(aws.Config{}, "bodega-conf-label", "")),
 		},
 	}
 }

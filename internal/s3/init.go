@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -30,6 +31,8 @@ type BucketAPI interface {
 	PutBucketVersioning(ctx context.Context, in *s3.PutBucketVersioningInput, optFns ...func(*s3.Options)) (*s3.PutBucketVersioningOutput, error)
 	GetBucketEncryption(ctx context.Context, in *s3.GetBucketEncryptionInput, optFns ...func(*s3.Options)) (*s3.GetBucketEncryptionOutput, error)
 	PutBucketEncryption(ctx context.Context, in *s3.PutBucketEncryptionInput, optFns ...func(*s3.Options)) (*s3.PutBucketEncryptionOutput, error)
+	GetBucketLifecycleConfiguration(ctx context.Context, in *s3.GetBucketLifecycleConfigurationInput, optFns ...func(*s3.Options)) (*s3.GetBucketLifecycleConfigurationOutput, error)
+	PutBucketLifecycleConfiguration(ctx context.Context, in *s3.PutBucketLifecycleConfigurationInput, optFns ...func(*s3.Options)) (*s3.PutBucketLifecycleConfigurationOutput, error)
 	ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input, optFns ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
 	PutObject(ctx context.Context, in *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)
 }
@@ -55,6 +58,9 @@ func InitBucket(ctx context.Context, client BucketAPI, out io.Writer, bucket, re
 		return err
 	}
 	if err := ensureEncryption(ctx, client, out, bucket); err != nil {
+		return err
+	}
+	if err := ensureLifecycle(ctx, client, out, bucket); err != nil {
 		return err
 	}
 	if err := ensurePrefixes(ctx, client, out, bucket); err != nil {
@@ -180,6 +186,142 @@ func ensureEncryption(ctx context.Context, client BucketAPI, out io.Writer, buck
 	}
 	fmt.Fprintf(out, "  encryption: CONFIGURED (AES-256)\n")
 	return nil
+}
+
+// Lifecycle retention. Both are stated in `bodega init --help` and
+// docs/usage.md, which is where an operator who disagrees looks for them.
+const (
+	AbortIncompleteMultipartDays = 7
+	NoncurrentVersionDays        = 30
+)
+
+// lifecycleRulePrefix marks the rules InitBucket owns. A lifecycle PUT
+// replaces the whole configuration, so every rule without it is the
+// operator's and is written back unchanged.
+const lifecycleRulePrefix = "bodega-"
+
+// LifecycleRules are the rules InitBucket keeps on the bucket.
+//
+// Abandoned multipart parts are billed, appear in no listing and serve
+// nothing, so the abort rule covers the bucket root unconditionally.
+//
+// Noncurrent versions expire under every artifact prefix and never under
+// manifests/: versioning is what a manifest has against whoever can already
+// write it, and RuntimePolicy withholds s3:DeleteObjectVersion so that history
+// outlives a compromised service. Elsewhere a noncurrent version is a
+// byte-identical replacement or a catalogue upstream has since replaced. S3
+// filters take a prefix and no wildcard, hence one rule per prefix.
+func LifecycleRules() []types.LifecycleRule {
+	rules := []types.LifecycleRule{{
+		ID:     aws.String(lifecycleRulePrefix + "abort-incomplete-multipart"),
+		Status: types.ExpirationStatusEnabled,
+		Filter: &types.LifecycleRuleFilter{Prefix: aws.String("")},
+		AbortIncompleteMultipartUpload: &types.AbortIncompleteMultipartUpload{
+			DaysAfterInitiation: aws.Int32(AbortIncompleteMultipartDays),
+		},
+	}}
+	for _, prefix := range expectedPrefixes {
+		if prefix == manifest.ManifestsPrefix {
+			continue
+		}
+		rules = append(rules, types.LifecycleRule{
+			ID:     aws.String(lifecycleRulePrefix + "expire-noncurrent-" + strings.TrimSuffix(prefix, "/")),
+			Status: types.ExpirationStatusEnabled,
+			Filter: &types.LifecycleRuleFilter{Prefix: aws.String(prefix)},
+			NoncurrentVersionExpiration: &types.NoncurrentVersionExpiration{
+				NoncurrentDays: aws.Int32(NoncurrentVersionDays),
+			},
+		})
+	}
+	return rules
+}
+
+func ensureLifecycle(ctx context.Context, client BucketAPI, out io.Writer, bucket string) error {
+	want := LifecycleRules()
+
+	var current []types.LifecycleRule
+	resp, err := client.GetBucketLifecycleConfiguration(ctx, &s3.GetBucketLifecycleConfigurationInput{
+		Bucket: aws.String(bucket),
+	})
+	var ae smithy.APIError
+	switch {
+	case err == nil:
+		current = resp.Rules
+	case errors.As(err, &ae) && ae.ErrorCode() == "NoSuchLifecycleConfiguration":
+	default:
+		// Refusing here rather than writing blind: the PUT below replaces
+		// every rule on the bucket, and rules this run could not read are
+		// rules it would delete.
+		return fmt.Errorf("read lifecycle configuration on %s: %w", bucket, err)
+	}
+
+	if lifecycleSatisfied(current, want) {
+		fmt.Fprintf(out, "  lifecycle:  configured\n")
+		return nil
+	}
+
+	var kept []types.LifecycleRule
+	for _, r := range current {
+		if !strings.HasPrefix(aws.ToString(r.ID), lifecycleRulePrefix) {
+			kept = append(kept, r)
+		}
+	}
+	_, err = client.PutBucketLifecycleConfiguration(ctx, &s3.PutBucketLifecycleConfigurationInput{
+		Bucket:                 aws.String(bucket),
+		LifecycleConfiguration: &types.BucketLifecycleConfiguration{Rules: append(kept, want...)},
+	})
+	if err != nil {
+		return fmt.Errorf("put lifecycle configuration on %s: %w", bucket, err)
+	}
+	fmt.Fprintf(out, "  lifecycle:  CONFIGURED (abort multipart after %dd, noncurrent versions after %dd, manifests/ kept)\n",
+		AbortIncompleteMultipartDays, NoncurrentVersionDays)
+	return nil
+}
+
+// lifecycleSatisfied reports whether current holds exactly the bodega rules
+// in want. A bodega rule edited by hand, or one left over for a prefix that
+// no longer exists, is drift and gets rewritten.
+func lifecycleSatisfied(current, want []types.LifecycleRule) bool {
+	have := map[string]types.LifecycleRule{}
+	for _, r := range current {
+		if id := aws.ToString(r.ID); strings.HasPrefix(id, lifecycleRulePrefix) {
+			have[id] = r
+		}
+	}
+	if len(have) != len(want) {
+		return false
+	}
+	for _, w := range want {
+		h, ok := have[aws.ToString(w.ID)]
+		if !ok || !sameLifecycleRule(h, w) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameLifecycleRule(a, b types.LifecycleRule) bool {
+	if a.Status != b.Status || a.Filter == nil || b.Filter == nil ||
+		aws.ToString(a.Filter.Prefix) != aws.ToString(b.Filter.Prefix) ||
+		a.Filter.Tag != nil || a.Filter.And != nil ||
+		a.Filter.ObjectSizeGreaterThan != nil || a.Filter.ObjectSizeLessThan != nil ||
+		a.Expiration != nil || len(a.Transitions) > 0 || len(a.NoncurrentVersionTransitions) > 0 {
+		return false
+	}
+	if (a.AbortIncompleteMultipartUpload == nil) != (b.AbortIncompleteMultipartUpload == nil) ||
+		(a.NoncurrentVersionExpiration == nil) != (b.NoncurrentVersionExpiration == nil) {
+		return false
+	}
+	if a.AbortIncompleteMultipartUpload != nil &&
+		aws.ToInt32(a.AbortIncompleteMultipartUpload.DaysAfterInitiation) != aws.ToInt32(b.AbortIncompleteMultipartUpload.DaysAfterInitiation) {
+		return false
+	}
+	if a.NoncurrentVersionExpiration != nil &&
+		(aws.ToInt32(a.NoncurrentVersionExpiration.NoncurrentDays) != aws.ToInt32(b.NoncurrentVersionExpiration.NoncurrentDays) ||
+			a.NoncurrentVersionExpiration.NewerNoncurrentVersions != nil) {
+		return false
+	}
+	return true
 }
 
 func ensurePrefixes(ctx context.Context, client BucketAPI, out io.Writer, bucket string) error {
