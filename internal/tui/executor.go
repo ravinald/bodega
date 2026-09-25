@@ -398,7 +398,7 @@ func runInit(buf *bytes.Buffer, cfg *config.Config, s3client *bos3.Client) error
 		return fmt.Errorf("init requires a configured S3 bucket")
 	}
 	fmt.Fprintf(buf, "Initialising bucket s3://%s ...\n", cfg.Bucket)
-	return bos3.InitBucket(context.Background(), s3client.S3Client(), cfg.Bucket, cfg.Region)
+	return bos3.InitBucket(context.Background(), s3client.S3Client(), buf, cfg.Bucket, cfg.Region)
 }
 
 func runDelete(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, entryType, name string, auditDB *audit.DB) error {

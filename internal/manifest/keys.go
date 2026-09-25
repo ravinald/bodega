@@ -70,12 +70,35 @@ const (
 	// DISTDIR, byte for byte: see DistfilesKey.
 	DistfilesPrefix = "distfiles/"
 
+	// ManifestsPrefix roots the manifest tree on an object store backend.
+	ManifestsPrefix = "manifests/"
+
 	gomodPrefix      = "gomod/"
 	helmPrefix       = "charts/"
 	npmPrefix        = "npm/"
 	cargoCratePrefix = "cargo/crates/"
 	cargoIndexPrefix = "cargo/index/"
 )
+
+// StoragePrefixes returns the top-level key prefixes documented in the
+// "Storage Layout" table of docs/usage.md, sorted, as a fresh slice callers
+// may modify. A test in internal/s3 holds the two together, so a prefix added
+// here without a row there (or the reverse) fails the build rather than
+// drifting.
+func StoragePrefixes() []string {
+	return []string{
+		BinaryPrefix,
+		cargoCratePrefix,
+		helmPrefix,
+		FreeBSDPrefix,
+		gomodPrefix,
+		ManifestsPrefix,
+		npmPrefix,
+		AptPrefix,
+		PypiWheelPrefix,
+		GitPrefix,
+	}
+}
 
 // ErrPypiNoObjectKey reports that a pypi entry has no per-version object.
 // Callers that delete or move an artifact must surface this rather than treat
