@@ -1741,7 +1741,11 @@ func (s *Server) proxyVersion(w http.ResponseWriter, r *http.Request, typ, pkg, 
 // The Head is what separates the two answers, and a Head that errors falls
 // through to proxyS3 rather than refusing: a backend that cannot be read has
 // not established that the object is absent, and proxyS3 reports that as 502.
-func (s *Server) proxyVersionOrRefuse(w http.ResponseWriter, r *http.Request, typ, pkg, version, key, reason string) {
+//
+// reason reaches every caller, token or not, so a URL in it is cut the way a
+// published manifest url is. logArgs carry what the operator needs and the
+// caller does not.
+func (s *Server) proxyVersionOrRefuse(w http.ResponseWriter, r *http.Request, typ, pkg, version, key, reason string, logArgs ...any) {
 	store, err := s.versionStore(r.Context(), typ, pkg, version)
 	if err != nil {
 		s.logger.Error("storage backend recorded for artifact is not configured",
@@ -1756,6 +1760,8 @@ func (s *Server) proxyVersionOrRefuse(w http.ResponseWriter, r *http.Request, ty
 	if headErr != nil {
 		s.logger.Error("s3 head check failed", "key", key, "error", headErr)
 	} else if status == nil || !status.Exists {
+		s.logger.Info("refused an artifact no manifest entry names and no backend holds",
+			append([]any{"type", typ, "package", pkg, "version", version, "key", key}, logArgs...)...)
 		http.Error(w, reason, http.StatusNotFound)
 		return
 	}
