@@ -576,6 +576,15 @@ func TestClientCheckUnderBaseMake(t *testing.T) {
 	through := func(f string) func() {
 		return setPort("_W!=\tprintf 'NO_CDROM=aliased terms\\n' > " + f + "\n.sinclude \"${.CURDIR}/terms.mk\"\n_R!=\trm -f " + f + "\nall:\n")
 	}
+	// beneath copies src/misc to a scratch directory and mounts the copy
+	// read-only over src/misc.
+	beneath := func(t *testing.T, name string) {
+		b := filepath.Join(scratch, name)
+		if out, err := exec.Command("cp", "-Rp", filepath.Join(src, "misc")+"/", b).CombinedOutput(); err != nil {
+			t.Fatalf("cp: %v: %s", err, out)
+		}
+		mount(t, "ro", b, filepath.Join(src, "misc"))
+	}
 	// A port needs no knowledge of the host to find the source of a nullfs
 	// view: mount -p names it.
 	discovered := setPort("_S=\ts=$$(/sbin/mount -p | /usr/bin/awk -v t=${PORTSDIR} '$$2 == t { print $$1 }')\n" +
@@ -682,6 +691,16 @@ func TestClientCheckUnderBaseMake(t *testing.T) {
 		// view of another directory.
 		{name: "a read-only view over itself stacked on a writable view", bare: true, tree: view, setup: through(src + "/misc/probe/terms.mk"),
 			before: func(t *testing.T) { mount(t, "rw", src, view); mount(t, "ro", view, view) }},
+		// A mount beneath the tree serves its files as surely as the one
+		// covering it: a read-only view there of a copy the fetch user
+		// writes at its own path.
+		{name: "a read-only view beneath the tree of a writable source", setup: through(filepath.Join(scratch, "beneath") + "/probe/terms.mk"),
+			after: func(t *testing.T) { beneath(t, "beneath") }},
+		{name: "a read-only view beneath the tree whose source the port finds through mount -p", setup: setPort("_S=\ts=$$(/sbin/mount -p | /usr/bin/awk -v t=${.CURDIR:H} '$$2 == t { print $$1 }')\n" +
+			"_W!=\t${_S}; printf 'NO_CDROM=discovered beneath\\n' > $$s/probe/terms.mk\n.sinclude \"${.CURDIR}/terms.mk\"\n_R!=\t${_S}; rm -f $$s/probe/terms.mk\nall:\n"),
+			after: func(t *testing.T) { beneath(t, "beneath2") }},
+		{name: "a read-only view beneath the tree over itself", setup: setPort(inTree(src)), want: env.Digest(),
+			after: func(t *testing.T) { mount(t, "ro", filepath.Join(src, "misc"), filepath.Join(src, "misc")) }},
 		{name: "make run as root outside a jail", root: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -736,6 +755,59 @@ func TestClientCheckUnderBaseMake(t *testing.T) {
 			}
 			if want != ClientUnsupported && strings.Contains(string(out), "NO_CDROM=") {
 				t.Errorf("the check names the digest while make read a restriction:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestStableViewMountTable drives the check's mount-table program with
+// synthetic mount -p output, so every host runs the rules the base-make test
+// can only exercise where it may mount. Every mount that serves a file under
+// the tree is judged, not only the one covering it.
+func TestStableViewMountTable(t *testing.T) {
+	if _, err := os.Stat("/usr/bin/awk"); err != nil {
+		t.Skip("no /usr/bin/awk")
+	}
+	start := strings.Index(stableView, `awk -v t="$$t" '`)
+	end := strings.LastIndex(stableView, `'; done`)
+	if start < 0 || end < start {
+		t.Fatal("stableView no longer runs one awk program per path")
+	}
+	prog := strings.ReplaceAll(stableView[start+len(`awk -v t="$$t" '`):end], "$$", "$")
+	const base = "zroot/usr/ports /usr/ports zfs rw 0 0\n/usr/ports /usr/ports nullfs ro 0 0\n"
+	for _, tc := range []struct {
+		name, table string
+		want        string // empty when admitted
+	}{
+		{"the tree on its own store, read-only", "zroot/usr/ports /usr/ports zfs ro 0 0\n", ""},
+		{"a nullfs over the writable store", base, ""},
+		{"the store alone, writable", "zroot/usr/ports /usr/ports zfs rw 0 0\n", " writable:/usr/ports"},
+		{"a read-only view of another directory", base + "/home/u/ports /usr/ports nullfs ro 0 0\n", " aliased:/home/u/ports"},
+		{"a view over itself of an aliased view", "/home/u/ports /usr/ports nullfs rw 0 0\n/usr/ports /usr/ports nullfs ro 0 0\n", " aliased:/home/u/ports"},
+		{"a unionfs over the tree", base + "/home/u/ports /usr/ports unionfs ro 0 0\n", " aliased:/home/u/ports"},
+		{"an nfs tree", "host:/export /usr/ports nfs ro 0 0\n", " fstype:nfs"},
+		{"a writable mount beneath", base + "/home/u/misc /usr/ports/misc nullfs rw 0 0\n", " aliased:/home/u/misc writable:/usr/ports/misc"},
+		{"a read-only nullfs beneath of another directory", base + "/home/u/misc /usr/ports/misc nullfs ro 0 0\n", " aliased:/home/u/misc"},
+		{"a read-only unionfs beneath", base + "/home/u/misc /usr/ports/misc nullfs ro 0 0\n/home/u/misc /usr/ports/misc unionfs ro 0 0\n", " aliased:/home/u/misc aliased:/home/u/misc"},
+		{"an md device beneath", base + "/dev/md0 /usr/ports/misc ufs ro 0 0\n", " device:/dev/md0"},
+		{"an nfs export beneath", base + "host:/export /usr/ports/misc nfs ro 0 0\n", " fstype:nfs"},
+		{"a nullfs beneath over itself", base + "/usr/ports/misc /usr/ports/misc nullfs ro 0 0\n", ""},
+		{"a nullfs beneath over itself stacked on an nfs export", base + "host:/export /usr/ports/misc nfs ro 0 0\n/usr/ports/misc /usr/ports/misc nullfs ro 0 0\n", " fstype:nfs fstype:nfs"},
+		{"a nullfs beneath over itself stacked on an aliased view", base + "/home/u/misc /usr/ports/misc nullfs ro 0 0\n/usr/ports/misc /usr/ports/misc nullfs ro 0 0\n", " aliased:/home/u/misc aliased:/home/u/misc"},
+		{"a mount beneath two levels down", base + "host:/export /usr/ports/misc/probe nfs ro 0 0\n", " fstype:nfs"},
+		// The cover hides a mount beneath the path made before it.
+		{"a mount beneath made before the cover", "zroot/usr/ports /usr/ports zfs rw 0 0\nhost:/export /usr/ports/misc nfs ro 0 0\n/usr/ports /usr/ports nullfs ro 0 0\n", ""},
+		{"a mount beside the tree", base + "host:/export /usr/portsx nfs ro 0 0\n", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command("/usr/bin/awk", "-v", "t=/usr/ports", prog)
+			cmd.Stdin = strings.NewReader(strings.ReplaceAll(tc.table, `\n`, "\n"))
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("awk: %v", err)
+			}
+			if got := strings.TrimSuffix(string(out), "\n"); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
 			}
 		})
 	}

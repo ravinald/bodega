@@ -463,15 +463,20 @@ defence against:
   with no writable mount beneath it, and `make` must be unable to lift one:
   not root, unless jailed without `allow.mount`, and `vfs.usermount` off. A
   read-only mount says nothing about its source, so the check reads the
-  whole mount table and refuses (`aliased:<source>`) when a writable mount
-  anywhere takes its source at, under or above the tree, when a `nullfs`
-  covering the tree takes its source from another directory (a read-only
-  view of `/home/u/ports` leaves `/home/u/ports` writable, and a `nullfs`
-  over itself serves whatever it covers), and when a `unionfs` covers it at
-  all. The store under the `nullfs` layers must be `ufs`, `zfs`, `cd9660` or
-  `tmpfs` (`fstype:<type>` otherwise: the mount table cannot say who writes
-  an `nfs` export), and neither an `md` device, whose backing file it does
-  not show, nor a device the fetch user can write (`device:<source>`).
+  whole mount table. The rules below hold for every mount that serves a file
+  at or beneath the tree or `/usr/share/mk`: the one covering the path and
+  every mount beneath it made after that one. A read-only view of
+  `/home/u/misc` at `/usr/ports/misc` serves those files as surely as a view
+  of `/home/u/ports` at `/usr/ports`. The check refuses (`aliased:<source>`)
+  when a writable mount anywhere takes its source at, under or above the
+  tree, when a serving `nullfs` takes its source from another directory (a
+  read-only view of `/home/u/ports` leaves `/home/u/ports` writable, and a
+  `nullfs` over itself serves whatever it covers), and when any serving
+  mount is a `unionfs`. The store under each serving mount must be `ufs`,
+  `zfs`, `cd9660` or `tmpfs` (`fstype:<type>` otherwise: the mount table
+  cannot say who writes an `nfs` export), and neither an `md` device, whose
+  backing file it does not show, nor a device the fetch user can write
+  (`device:<source>`).
   Anything else names `unsupported` (`remountable:root`, `writable:<mount>`).
   A root `make` outside a jail is refused however the tree is mounted,
   because a command it runs could remount it. Measuring files would not do:
