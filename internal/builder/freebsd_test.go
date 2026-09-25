@@ -498,6 +498,33 @@ func TestFreeBSDArtifactPathsPutTheCatalogueLast(t *testing.T) {
 	}
 }
 
+// A package under a directory named for one of pkg's catalogue fallbacks is
+// an ordinary package. Nothing writes a file under that name, so there is no
+// catalogue for the directory to collide with, and refusing it would fail the
+// mirror of a repository whose every package the route can serve.
+func TestAPackageUnderAFallbackNamedDirectoryIsMirrored(t *testing.T) {
+	const rel = "data.tzst/example.pkg"
+	up := newFBUpstream(t, map[string]string{
+		manifest.FreeBSDMetaFile:    "version = 2;\npacking_format = \"tzst\";\n",
+		manifest.FreeBSDCatalogFile: string(fbCatalog(t, "tzst", rel)),
+		manifest.FreeBSDDataFile:    string(fbData(t, "tzst", rel)),
+		rel:                         "package bytes",
+	})
+	cfg, store := fbFixture(t, up.URL)
+	if sum := FetchFreeBSD(cfg, store, ""); sum.Failures != 0 {
+		t.Fatalf("the mirror refused a package under %s: %+v", rel, sum.Results)
+	}
+	paths, release, err := FreeBSDArtifactPaths(cfg, store, "")
+	if err != nil {
+		t.Fatalf("enumerate the upload set: %v", err)
+	}
+	defer release()
+	want := manifest.FreeBSDKey(fbABI, "latest", rel)
+	if !slices.ContainsFunc(paths, func(ap ArtifactPath) bool { return ap.ObjectKey == want }) {
+		t.Errorf("the upload set has no %s: %+v", want, paths)
+	}
+}
+
 // A proxy-mode entry holds no snapshot, so the mirror places nothing for it
 // and contacts nobody. Running it anyway would fetch a whole repository
 // nothing serves out of the store.
@@ -1167,6 +1194,10 @@ func TestCatalogRefusesARepoPathOntoARepositoryRootFile(t *testing.T) {
 		manifest.FreeBSDCatalogFile + "/inside.pkg",
 		"digests.pkg",
 		"repo.txz",
+		// A fallback name is refused as the file pkg asks for, not as a
+		// directory: see TestAPackageUnderAFallbackNamedDirectoryIsMirrored.
+		"data.tzst",
+		"Meta.TXZ",
 	} {
 		dir := t.TempDir()
 		catalog := filepath.Join(dir, manifest.FreeBSDCatalogFile)
@@ -1189,7 +1220,7 @@ func TestCatalogRefusesARepoPathOntoARepositoryRootFile(t *testing.T) {
 	// A package at the root is an ordinary layout, and one nested under a
 	// directory that happens to share a root file's name keys somewhere no
 	// root file lives.
-	for _, ok := range []string{fbRootPath, fbHashedPath, "All/" + manifest.FreeBSDMetaFile} {
+	for _, ok := range []string{fbRootPath, fbHashedPath, "All/" + manifest.FreeBSDMetaFile, "data.tzst/example.pkg", "Packagesite.tgz/All/x.pkg"} {
 		archive := filepath.Join(t.TempDir(), manifest.FreeBSDCatalogFile)
 		if err := os.WriteFile(archive, fbCatalog(t, "tzst", ok), 0o644); err != nil {
 			t.Fatalf("write catalogue: %v", err)
@@ -1345,6 +1376,8 @@ func TestGeneratedRepositoryUploadsPackagesAndNoRootFile(t *testing.T) {
 		manifest.FreeBSDMetaFile:    "left over from a mirror",
 		manifest.FreeBSDCatalogFile: "left over from a mirror",
 		"README":                    "not a package",
+		"meta.txz":                  "a catalogue fallback name",
+		"packagesite.tzst/x.pkg":    "a package under a fallback-named directory",
 	})
 
 	paths, release, err := FreeBSDArtifactPaths(cfg, store, "")
@@ -1360,11 +1393,12 @@ func TestGeneratedRepositoryUploadsPackagesAndNoRootFile(t *testing.T) {
 	want := []string{
 		manifest.FreeBSDKey(fbABI, "house", fbHashedPath),
 		manifest.FreeBSDKey(fbABI, "house", fbRootPath),
+		manifest.FreeBSDKey(fbABI, "house", "packagesite.tzst/x.pkg"),
 	}
 	slices.Sort(keys)
 	slices.Sort(want)
 	if !slices.Equal(keys, want) {
-		t.Fatalf("upload set = %v, want exactly the two packages %v", keys, want)
+		t.Fatalf("upload set = %v, want exactly the three packages %v", keys, want)
 	}
 }
 

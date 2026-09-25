@@ -91,6 +91,24 @@ risk:
   back. The per-package digest in a generated catalogue is bodega's own, taken
   over the object as it was stored.
 
+- **FreeBSD distfiles, which carry neither attestation.** The digest that
+  protects a distfile is pinned in the client's own ports tree: a port's
+  `distinfo` records a SHA-256 and a size for each distfile, and `make checksum`
+  refuses bytes that disagree, wherever they came from. bodega has no distfiles
+  type. A distfile proxied through a `binary_upstreams` namespace is pinned on
+  first fetch like any other binary, which says only that later fetches match
+  the first. What the check is worth is what the tree is worth: `ports.txz`
+  served as a `binary` entry is pinned to the digest the release `MANIFEST`
+  publishes, and a tree cloned through a `git_upstreams` mirror is as
+  trustworthy as the forge it mirrors.
+
+  That makes three trust stories for one operating system, and a reader should
+  not assume one covers another. A mirrored pkg repository carries FreeBSD's
+  signature and bodega adds nothing to it. A generated repository carries
+  bodega's and nothing of FreeBSD's. Distfiles carry no signature from either:
+  they rest on the `distinfo` digest in the client's ports tree, and are as
+  sound as the route that tree arrived by.
+
 - **A malicious release inside its own withdrawal window.** A fresh install is
   seeded with a minimum publish age of `7d` on `npm` and `pypi`, action `warn`,
   and `bodega serve` names it at startup. The npm and PyPI campaigns of
@@ -168,24 +186,180 @@ risk:
   edit, not an attacker, because whoever can rewrite the manifest can rewrite
   the sidecar beside it. It catches a hand-edit, a partial restore and a
   half-finished write; it is not a signature.
-- **Operator detail in an error body on an unauthenticated route.** The
-  package routes a client reads without a token answer a failure with a fixed
-  body and write the reason to the log. The reason is written for an operator,
-  so it names what an operator needs: the pkg signing key's path and the mode
-  that leaves it readable, the `storage_path` root, the s3 bucket and prefix,
-  or an upstream URL a manifest may have written with credentials in it. A
-  generated FreeBSD catalogue's 500 and a proxied artifact's "upstream does
-  not publish this" 404 both follow this rule. `GET /api/v1/status` draws the
-  same line with a gate instead: `spool.dir`, `version`, `freebsd.key_error`
-  and `backend_entries[].error` are withheld from a caller outside
-  `admin_permit_cidr` (see [usage.md](usage.md)). A package route has no admin
-  caller to gate for, so its body is fixed for everyone. Three items have
-  needed this fix separately, which makes it a class: any handler writing
-  `err.Error()` into a response on a route that takes no token reopens it.
-  Two bodies still carry error text. A spool refusal's 503 quotes byte counts
-  and the config key that bounds them, all of which `/api/v1/status` already
-  publishes to every caller. A FreeBSD entry marked both `generated` and
-  mirrored answers with a 500 quoting its `url`, which is not yet fixed.
+- **A manifest field that becomes a path.** A manifest is written by an
+  operator, through `pkg create`, `pkg edit`, `pkg import` or the mutation API
+  behind its token, or by hand in the store. No anonymous route writes one.
+  It is trusted to name what to fetch and where to serve it from, and not
+  trusted to choose where on disk or in storage a write lands. A binary
+  entry's `filename` override is joined into the build root and the object
+  key, so it must be a clean relative path: every manifest write refuses one
+  with a `..` or `.` segment, an empty segment, a leading `/`, a `\` or a
+  NUL, and the fetch, the upload, the download alias and the key a delete or
+  move derives refuse it again for a manifest written before the check. The
+  fetch also refuses a version that is not one directory, a package name that
+  is not a clean relative path, and a destination that resolves through a
+  symlink to outside the configured build root, a link at `binaries/` included. Unchecked, a `filename` of
+  `../../../../escaped` writes outside the build root and reports success, and
+  planting one takes manifest-write access: an operator's token, or write
+  access to the store itself. See [usage.md](usage.md#binary-specific-fields)
+  for what an upgrade does with a manifest that already carries one.
+- **A secret an operator writes into a manifest.** The rule, in every field:
+
+  - **`url` is the one field bodega holds a credential in.** bodega has no
+    other place to configure one per upstream, so a `url` may carry userinfo
+    or a query-string token, and the builder and the proxy routes fetch with
+    it as written. The store keeps it as written. Every response a caller
+    with no token can reach carries it through `manifest.PublicURL`, which
+    removes the userinfo, username included, and the whole query and
+    fragment. The query goes whole because no parameter name says whether
+    its value is a secret. Where URL readers disagree about where the
+    authority ends (a scheme-relative `//user@host`, a browser reading
+    `https:\\user@host`, curl reading past a `\`, git handing ssh
+    everything before the host of `ssh://a#b@host/` or `a?b@host:repo`,
+    and decoding `%40` first), it cuts at the widest reading.
+  - **`metadata` is public by contract.** bodega never fetches with a
+    metadata value. Every value is published, except that a value written
+    as a URL (a scheme followed by `/` or `\`, `http:` or `https:`, or
+    `//host`) goes through the same cut as `url`, whatever its key, except
+    the five apt keys below, which are refused rather than cut. The test is
+    on the whole value: a URL inside longer text (`see
+    https://user:secret@host/`), a schemeless `user:secret@host/x` and a
+    secret that is not part of a URL are published as written.
+  - **`metadata.attestation_uri` takes no credential.** Its endpoint answers
+    an `http(s)` uri with a 302 whose `Location` the client follows, so the
+    uri cannot be cut without breaking the fetch. Admission refuses one
+    carrying userinfo, a query or a fragment, and the endpoint answers one
+    already stored with a 502 rather than a redirect. An `s3://` uri is read
+    by bodega with its own backend credentials and never reaches the client.
+  - **An apt entry's `Architecture`, `_pool_path`, `_md5`, `_sha1` and
+    `_sha256` take no credential.** The apt index publishes them as what
+    they are: `Architecture` names the index paths and the `Architectures`
+    line in `Release` and the signed `InRelease`, `_pool_path` is the
+    `Filename` apt fetches, and the digests are what apt checks the bytes
+    against. Cutting a credential out of one would rename an index or
+    publish a checksum nothing matches, so admission refuses a URL with
+    userinfo, a query or a fragment in any of them, and an entry already
+    stored with one reaches no index. Each rebuild logs it by key, never by
+    value.
+  - **Every other field is public by contract**: names, versions,
+    descriptions, dependencies (an npm `git+https://token@host/` spec
+    included), checksums, suites, storage names, metadata keys,
+    `build_cmd` and `build_env`. The read routes return each as written,
+    and the npm packument, the cargo index, `index.yaml`, the apt stanza
+    and `/api/v1/status` carry the names, versions, descriptions and
+    dependencies among them. A token in a `build_cmd` is published to
+    every caller.
+
+  The rule is enforced where each response is built, not where the manifest
+  is loaded, so a manifest stored before the rule existed is covered without
+  being rewritten. A handler writing `err.Error()` into a public response
+  is a new instance of this class, because a manifest check quotes fields
+  verbatim for the operator; a test for one asserts the secret is absent
+  from the body, and a test of a redirect asserts it on the `Location`
+  header separately, since that is a different code path carrying the same
+  string.
+- **A secret an operator writes into configuration.** `gomod_upstream`,
+  `npm_upstream`, `pypi_upstream`, `cargo_upstream`, `cargo_dl_upstream`
+  and each `apt_upstreams` `url` accept userinfo, so a private index can be
+  configured as `https://user:secret@pypi.internal`, and bodega fetches with
+  it as written. `git_upstreams` and `binary_upstreams` refuse userinfo, a
+  query and a fragment when the config loads. The manifest `url` rule
+  applies unchanged: a response a caller with no token can reach names a
+  configured upstream only through `manifest.PublicURL`. One route quotes
+  one today: a pypi wheel no manifest names answers 404 naming the simple
+  index bodega would have read, cut, and logs the refusal with the index
+  through `url.Redacted`, which masks the password and keeps the username.
+  Every other configured upstream reaches the operator log (the fetch
+  failure lines carry it as written), the discovery row and the audit
+  record, and no response body. `/api/v1/audit` and `/api/v1/config`
+  answer inside `admin_permit_cidr` only, so the stored URL is behind the
+  same boundary as a stored manifest `url`.
+
+  What a caller sees depends on which of four boundaries the response sits
+  behind, and a bearer token decides only the last of them:
+
+  - **Anonymous: every caller.** The four `/api/v1/packages` read routes and
+    the web UI that reads them; the attestation route; the apt `Packages`
+    stanza, which copies every metadata key, and `Release` and `InRelease`,
+    which name every architecture; `/api/v1/status`, which blanks
+    `freebsd.refused[].error` (it quotes the url), `spool.dir`, `version`,
+    `freebsd.key_error` and `backend_entries[].error` outside
+    `admin_permit_cidr` (see [usage.md](usage.md)); and the package routes
+    (`/apt/`, `/freebsd/`, `/binaries/` and the rest), which answer a
+    failure with a fixed body and put the reason, url included, in the log.
+    npm, cargo and helm indexes are built from bodega's own base URL and
+    carry no manifest `url` or metadata. One anonymous body quotes a
+    config value rather than a manifest one: the pypi 404 for a
+    distribution no manifest names prints the distribution and the simple
+    index under `pypi_upstream`, cut through `manifest.PublicURL`, so a
+    private index's userinfo, query and fragment never reach the body; the
+    refusal log names the index with the password masked.
+  - **Admin range: no token needed.** Inside `admin_permit_cidr` the
+    `/api/v1/status` fields above are returned in full with no
+    `Authorization` header. `/api/v1/audit` is gated the same way and
+    returns the before and after manifest JSON a mutation recorded, as
+    written; `/api/v1/config`, `/api/v1/tokens`, `/api/v1/policies` and
+    `/api/v1/profiles/{name}/pins` share the gate and emit no version
+    `url`. `admin_permit_cidr` is therefore the boundary for the stored
+    credential on reads, not the token.
+  - **Mutations: the existing CIDR and token rules.** Create and the hide and
+    freeze toggles return the whole manifest as stored. A mutation needs an
+    address in `admin_permit_cidr`, and a bearer token only once that range
+    reaches past loopback; a loopback-only server takes mutations from
+    localhost with no token.
+  - **Operator host and backend.** `bodega show pkg`, `pkg export`,
+    `pkg edit`, the TUI, the builder's output, repair and validation
+    diagnostics and the server log print or serialize the manifest as
+    written. They read the store or the log directly, so filesystem and
+    backend permissions are the boundary. A binary entry with no `filename`
+    is stored under its url's last segment, so for a url with no path, or a
+    query-string token, the object key carries the credential and anyone who
+    can list that bucket or directory reads it. The read routes publish
+    every binary entry with a download alias of its own, `~/<tag>/<display>`,
+    since a stored name is served from whichever entry of its version comes
+    first and so does not stay with one entry. The display part comes from
+    the published url and the tag is an HMAC of the version, the recorded
+    backend and the stored name keyed by the server's token pepper, and
+    `/binaries/` maps it back to that entry's key on that entry's backend
+    without publishing the key. The key is there so that the published name
+    cannot be used to confirm a guessed credential offline. An alias spans
+    three path segments and a stored name is one, so the route never reads
+    either as the other: an alias whose entry is gone or has moved backend,
+    or whose pepper has been rotated away, is a 404, never a request for an
+    object stored under that spelling or for another entry holding the same
+    key on another backend. A server with no pepper publishes no binary
+    download link: every entry gets the all-zero withheld alias, which is a
+    404, because a stored name would follow the order of the manifest rather
+    than the entry. The TUI links by the same alias, so it reads the pepper
+    file as well as the manifest store; where it cannot, it links a stored
+    name only when the route serves that name from the entry's own backend,
+    and otherwise shows no link.
+
+  A manifest read from the API and pushed back through an import arrives
+  without the userinfo, query and fragment of its `url`.
+- **A replacement read while it is being written.** On a `local` backend a
+  replacement is written to a staging file inside a directory of its own, and
+  both are reduced to their mode bits before the first byte lands: every ACL
+  entry the storage root handed down is taken away, so the body is readable by
+  the server's own user and nobody else until the rename publishes it under
+  the object's own access state. On ZFS a `chmod` alone does that only at some
+  settings of the dataset's `aclmode`, which bodega's config does not set and
+  no error reports: `discard`, the default, drops the inherited entries,
+  `restricted` refuses the `chmod`, and `passthrough` keeps them, which would
+  let `www` read a replacement mid-write from a root carrying
+  `user:www:rx:fd:allow`, including one whose object denies `www`. Bodega
+  therefore sets the trivial NFSv4 ACL itself and reads it back, whatever the
+  property says, and a staging inode that still carries a named or inheritable
+  entry fails the write and leaves the previous object as it was.
+  `zfs get aclmode,aclinherit <dataset>` shows what a dataset has. The
+  property still decides what a published object carries: under
+  `aclinherit=passthrough` a fresh object keeps what its directory hands down,
+  as a file created there by hand would. On FreeBSD a filesystem that keeps
+  no ACL at all, a UFS mounted without `acls` or `nfsv4acls`, gives that
+  read-back nothing to confirm, so every replacement there fails before its
+  body is written and leaves the previous object in place; a fresh object
+  still lands. Keep a FreeBSD storage root on ZFS or on a UFS mounted with
+  either option.
 - **Opaque CI fetches.** A `bodega serve` instance is the single place to look
   when answering "what did our build pull from the internet?" The audit DB
   records every fetch event with client IP, package name, version, and
@@ -327,6 +501,45 @@ defence against:
   turned off. `--from-origin` writes source names and `bodega profile check`
   reports the divergence; neither is a runtime gate, so an entry hand-written
   under a binary name is caught at `check` time or not at all.
+- **What a cache miss tells the upstream.** `proxy_cache_enabled: true` makes
+  bodega a cache, and a miss is a request from bodega's egress address to the
+  entry's `url` with the missing path appended. Whoever runs that host learns
+  what this instance asked for and when. For `freebsd` the `url` is a
+  repository root with the ABI already in it, so a miss on
+  `https://pkg.FreeBSD.org/FreeBSD:15:aarch64/base_release_1` discloses this
+  instance's ABI, the repository name and the package path. What reaches
+  upstream depends on the entry's mode:
+  - A `proxy` entry fetches every miss, with or without
+    `proxy_cache_enabled`: the catalogue on every `pkg update` once
+    `metadata_ttl` lapses, and each package on first install.
+  - A hosted `freebsd` entry, mirrored or generated, never fetches the
+    repository-root names pkg asks for by default. `meta.conf`, `data.pkg`
+    and `packagesite.pkg` come from the store, or from the build for a
+    generated entry, or answer 404, and so do the names pkg falls back to when
+    they are missing (`meta.txz`, and `data` or `packagesite` under a
+    `packing_format` extension). A `pkg update` that asks only for those
+    names sends nothing upstream, finished mirror or not. A package the store
+    does not hold is still fetched on a miss when `proxy_cache_enabled` is
+    `true`, which sends the ABI, the repository and that package's path.
+  - The names are pkg's defaults, not fixed. pkg asks for its catalogue
+    archives by the `data` and `manifests` keys of the `meta.conf` it read,
+    as `<name>.pkg` then `<name>.<packing_format>`. A generated entry writes
+    the defaults, so its clients ask for nothing else. A mirrored entry serves
+    upstream's `meta.conf` as stored, so a mirror of a repository whose
+    `meta.conf` renames either archive sends its clients to names bodega does
+    not guard. With `proxy_cache_enabled: true` each of those is a cache miss:
+    it discloses the ABI and repository on every `pkg update`, and if
+    upstream serves the name, the client reads upstream's catalogue rather
+    than the mirror's. No `pkg.FreeBSD.org` repository renames either
+    archive; a private one might.
+  - With `proxy_cache_enabled: false`, a hosted entry sends nothing upstream
+    at request time. The mirror run that fills it (`bodega build fetch`) still
+    fetches the catalogue and every object it names, on the operator's
+    schedule rather than a client's.
+
+  An operator who wants a mirror no client request can make phone home sets
+  `proxy_cache_enabled: false` and accepts that a package the mirror lacks is
+  a 404.
 
 ## Out-of-scope distribution formats
 

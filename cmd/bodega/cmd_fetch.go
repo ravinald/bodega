@@ -39,16 +39,18 @@ When a name is given after the type, only that entry is fetched.`,
   bodega build fetch force`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			force := false
-			var typeArgs []string
-			var entryFilter string
+			var positional []string
 			for _, a := range args {
 				if a == "force" {
 					force = true
-				} else if isValidType(a) {
-					typeArgs = append(typeArgs, a)
 				} else {
-					entryFilter = a
+					positional = append(positional, a)
 				}
+			}
+			typeArgs, rest := splitTypeArgs(positional)
+			var entryFilter string
+			if len(rest) > 0 {
+				entryFilter = rest[len(rest)-1]
 			}
 			types, err := resolveTypes(typeArgs)
 			if err != nil {
@@ -63,6 +65,9 @@ When a name is given after the type, only that entry is fetched.`,
 			store, err := loadStore(gf)
 			if err != nil {
 				return fmt.Errorf("load manifests: %w", err)
+			}
+			if err := refuseAliasCollision(typeArgs, store); err != nil {
+				return err
 			}
 
 			auditDB := openAuditDB(gf)

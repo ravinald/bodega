@@ -7,6 +7,7 @@ package manifest
 
 import (
 	"fmt"
+	"path"
 	"strings"
 )
 
@@ -338,6 +339,219 @@ type VersionEntry struct {
 	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
+// Public returns a copy of pm fit for the open read routes, which answer every
+// caller the same way whatever its address or token: every version's URL, and
+// every metadata value written as a URL, goes out through PublicURL, and a
+// binary entry gets the filename binaryDownloadName gives it under key, its
+// download alias whenever there is a key. pm is not modified, since the store
+// may hand the same pointer to the next reader.
+func (pm *PackageManifest) Public(key []byte) *PackageManifest {
+	if pm == nil {
+		return nil
+	}
+	out := *pm
+	out.Versions = make([]VersionEntry, len(pm.Versions))
+	for i, ve := range pm.Versions {
+		if name, ok := pm.binaryDownloadName(key, i); ok {
+			ve.Filename = name
+		}
+		ve.URL = PublicURL(ve.URL)
+		if ve.Metadata != nil {
+			md := make(map[string]string, len(ve.Metadata))
+			for k, v := range ve.Metadata {
+				md[k] = PublicMetadataValue(v)
+			}
+			ve.Metadata = md
+		}
+		out.Versions[i] = ve
+	}
+	return &out
+}
+
+// MetaAttestationURI is the metadata key naming a version's attestation
+// envelope, which GET .../attestation redirects an http(s) value to.
+const MetaAttestationURI = "attestation_uri"
+
+// AttestationURIWithheld reports whether uri is one the attestation endpoint
+// would redirect to while carrying something PublicURL withholds. The redirect
+// hands its Location to the caller as written and cannot withhold part of it
+// without breaking the fetch it exists for, so such a uri is refused at
+// admission and never redirected to.
+func AttestationURIWithheld(uri string) bool {
+	redirected := strings.HasPrefix(uri, "http://") || strings.HasPrefix(uri, "https://")
+	return redirected && PublicURL(uri) != uri
+}
+
+// aptIdentityKeys are the apt metadata values the index publishes as what they
+// are rather than as text: Architecture names the Packages index and appears in
+// Release, _pool_path is the Filename apt fetches, and the digests are what apt
+// checks the bytes against. Cutting a credential out of one would rename an
+// index, point a client at other bytes or publish a checksum nothing matches.
+var aptIdentityKeys = []string{"Architecture", "_pool_path", "_md5", "_sha1", "_sha256"}
+
+// AptIdentityWithheld returns the first apt identity key in md whose value
+// carries a part PublicMetadataValue withholds, or "" when none does. Such an
+// entry is refused at admission and left out of the index, never published
+// through the cut.
+func AptIdentityWithheld(md map[string]string) string {
+	for _, k := range aptIdentityKeys {
+		if v := md[k]; PublicMetadataValue(v) != v {
+			return k
+		}
+	}
+	return ""
+}
+
+// PublicMetadataValue returns v as a caller with no token may see it: through
+// PublicURL when v is written as a URL, and unchanged otherwise.
+//
+// Metadata is public by contract, since bodega never fetches with a metadata
+// value and so has no use for a credential in one. The URL form is the
+// exception because it is the one a credential arrives in by accident, pasted
+// with the link it authorizes. A value only counts as a URL when a scheme is
+// followed by a slash or backslash, or the scheme is http or https, which
+// browsers read without one: PublicURL on "Name <a@b>" or "C#" would cut text
+// that was never an authority or a query.
+func PublicMetadataValue(v string) string {
+	if !isURLForm(v) {
+		return v
+	}
+	return PublicURL(v)
+}
+
+func isURLForm(v string) bool {
+	s := browserTrim(v)
+	n := schemeLen(s)
+	if n == 0 {
+		return strings.HasPrefix(s, "//") || strings.HasPrefix(s, "\\\\")
+	}
+	if rest := s[n:]; strings.HasPrefix(rest, "/") || strings.HasPrefix(rest, "\\") {
+		return true
+	}
+	scheme := strings.ToLower(s[:n-1])
+	return scheme == "http" || scheme == "https"
+}
+
+// PublicURL returns raw without the userinfo in its authority and without its
+// query or fragment.
+//
+// A query string is where a token goes when the upstream will not take one in
+// the authority (?token=, ?access_token=, a presigned signature), and nothing
+// about a parameter's name says whether its value is a secret, so the whole
+// query goes rather than a list of names that misses the next spelling. The
+// fragment goes with it: no fetch sends one, so nothing bodega does needs it,
+// and a value there is no safer to publish than one before it. The cut is at
+// the first "?" or "#" after the userinfo is gone, which in a git scp path
+// over-cuts a display string and never under-cuts.
+//
+// The username goes too, not only the password url.URL.Redacted masks: a
+// GitHub or GitLab token written as https://<token>@host/ is a bare username
+// to that method, which returns it unchanged. The authority is cut by hand
+// rather than through url.Parse, which reads "user:secret@host/path" as the
+// scheme "user" with an opaque remainder and reports no userinfo at all, and
+// which refuses the scp form git accepts.
+//
+// The readers of a manifest url disagree about where its authority ends, and
+// the cut takes the widest of them. A browser strips leading spaces and every
+// tab and newline, treats a "\" after the scheme as "/", and finds an
+// authority after "https:" with no slashes at all; curl reads a later "\" as
+// part of the authority. git's ssh transport ends the host of "ssh://..." at
+// the first "/" alone, after percent-decoding it, and the host of the scp form
+// "user@host:path" at the first ":", so "?" and "#" end no authority there:
+// ssh is handed "a#b@host" and logs in as "a#b". So an authority after slashes,
+// or in a string with no scheme, ends at the first "/", and an "@" spelled
+// "%40" counts as one. Over-cutting costs a display string, while
+// under-cutting publishes the credential, so a scheme followed by no slash is
+// dropped with the userinfo: "user:secret@host" has the same form and nothing
+// tells the two apart.
+func PublicURL(raw string) string {
+	s := withoutUserinfo(raw)
+	if i := strings.IndexAny(s, "?#"); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+func withoutUserinfo(raw string) string {
+	s := browserTrim(raw)
+
+	afterScheme := schemeLen(s)
+	start := afterScheme
+	for start < len(s) && (s[start] == '/' || s[start] == '\\') {
+		start++
+	}
+	slashes := start > afterScheme
+
+	end := indexOrLen(s, start, "/")
+	if !slashes && afterScheme > 0 {
+		end = indexOrLen(s, start, "/?#")
+	}
+	cut := afterUserinfo(s[start:end])
+	if cut < 0 {
+		return raw
+	}
+	cut += start
+	prefix := ""
+	if slashes {
+		prefix = s[:start]
+	}
+	if s[start] == '[' && strings.IndexByte(s[start:cut], ']') < 0 {
+		prefix += "["
+	}
+	return prefix + s[cut:]
+}
+
+// browserTrim drops what a browser drops from a URL before reading it: every
+// tab and newline, and leading spaces and control characters.
+func browserTrim(raw string) string {
+	s := strings.Map(func(r rune) rune {
+		if r == '\t' || r == '\n' || r == '\r' {
+			return -1
+		}
+		return r
+	}, raw)
+	return strings.TrimLeftFunc(s, func(r rune) bool { return r <= ' ' })
+}
+
+// indexOrLen returns the index of the first byte of s at or past from that is
+// in chars, or len(s) when none is.
+func indexOrLen(s string, from int, chars string) int {
+	if i := strings.IndexAny(s[from:], chars); i >= 0 {
+		return from + i
+	}
+	return len(s)
+}
+
+// afterUserinfo returns the offset in authority just past its last "@" or
+// "%40", or -1 when it holds neither.
+func afterUserinfo(authority string) int {
+	at := strings.LastIndexByte(authority, '@')
+	if at >= 0 {
+		at++
+	}
+	if enc := strings.LastIndex(strings.ToLower(authority), "%40"); enc >= 0 && enc+3 > at {
+		at = enc + 3
+	}
+	return at
+}
+
+// schemeLen returns the length of s's leading "scheme:", or 0 when s opens
+// with none (RFC 3986: a letter, then letters, digits, "+", "-" or ".").
+func schemeLen(s string) int {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z':
+		case i > 0 && ('0' <= c && c <= '9' || c == '+' || c == '-' || c == '.'):
+		case i > 0 && c == ':':
+			return i + 1
+		default:
+			return 0
+		}
+	}
+	return 0
+}
+
 // ScopeToVersion returns pm with Versions narrowed to the single entry
 // matching v. Result is still a valid PackageManifest so it round-trips
 // through import/export. nil for unknown or empty v.
@@ -534,6 +748,41 @@ func CanonicalName(typ, name string) string {
 func ValidatePackageName(name string) error {
 	if name == "." || name == ".." {
 		return fmt.Errorf("invalid package name %q: it is path syntax, not a name — %q resolves to a manifest path outside its own type directory", name, name)
+	}
+	return nil
+}
+
+// ValidateBinaryFilename rejects a binary entry's filename override unless it
+// is a clean relative path. Empty is allowed and means the URL's basename.
+//
+// The filename is joined into the build root the fetch writes to and into the
+// object key the upload writes and the /binaries/ route serves, so a parent
+// reference or an absolute path moves a write. Subdirectories stay legal: a
+// stored name such as "~/tool" is served today, and a basename-only rule would
+// refuse manifests that fetch and serve correctly. "." and empty segments are
+// refused too, since they spell one key two ways.
+func ValidateBinaryFilename(filename string) error {
+	if filename == "" {
+		return nil
+	}
+	if strings.ContainsAny(filename, "\\\x00") || path.IsAbs(filename) || path.Clean(filename) != filename ||
+		filename == "." || filename == ".." || strings.HasPrefix(filename, "../") {
+		return fmt.Errorf("invalid binary filename %q: it is joined into the build root and the object key, so it must be a clean relative path with no \"..\" or \".\" segment, no empty segment, no leading '/', and no '\\' or NUL; set it to a name such as the URL's basename, or remove it to use that", filename)
+	}
+	return nil
+}
+
+// ValidateBinaryFilenames applies ValidateBinaryFilename to every version of a
+// binary manifest and names the first offending version. Other types carry no
+// filename override and pass.
+func ValidateBinaryFilenames(pm *PackageManifest) error {
+	if pm == nil || pm.Type != TypeBinary {
+		return nil
+	}
+	for _, ve := range pm.Versions {
+		if err := ValidateBinaryFilename(ve.Filename); err != nil {
+			return fmt.Errorf("binary %s@%s: %w", pm.Name, ve.Version, err)
+		}
 	}
 	return nil
 }

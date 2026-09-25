@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -151,6 +153,48 @@ func TestPypiWheelRefusalNamesTheIndexItWouldHaveRead(t *testing.T) {
 	rows := waitForDiscovery(t, s, 1)
 	if rows[0].UpstreamURL != "https://pypi.org/simple/six/" {
 		t.Errorf("no_manifest upstream_url = %q, want the simple index", rows[0].UpstreamURL)
+	}
+}
+
+// TestPypiWheelRefusalCutsTheConfiguredCredential holds the refusal to the rule
+// a published manifest url follows. The GET takes no token, so a private index
+// configured with userinfo would otherwise hand its credential to any caller.
+// The username is asserted apart from the password because url.Redacted keeps
+// it as user:xxxxx@, which a match on user@ misses. The body is held to
+// absence rather than to replacement wording.
+func TestPypiWheelRefusalCutsTheConfiguredCredential(t *testing.T) {
+	s := proxyingServer(t)
+	s.cfg.PypiUpstream = "https://user:secret@pypi.internal"
+	var logged bytes.Buffer
+	s.logger = slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/pypi/wheels/six-1.16.0-py2.py3-none-any.whl", nil)
+	s.Handler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("GET an uncatalogued wheel = %d, want 404 (%s)", rec.Code, body)
+	}
+	if strings.Contains(body, "secret") {
+		t.Errorf("anonymous refusal body carries the password from pypi_upstream: %q", body)
+	}
+	if strings.Contains(body, "user") {
+		t.Errorf("anonymous refusal body carries the username from pypi_upstream: %q", body)
+	}
+	if strings.Contains(body, "@") {
+		t.Errorf("anonymous refusal body carries a userinfo component: %q", body)
+	}
+	if !strings.Contains(body, "pypi.internal") {
+		t.Errorf("refusal no longer names the index host: %q", body)
+	}
+
+	// The operator still learns which index, and which account on it.
+	log := logged.String()
+	if !strings.Contains(log, "https://user:xxxxx@pypi.internal/simple/six/") {
+		t.Errorf("refusal log line does not name the configured index: %q", log)
+	}
+	if strings.Contains(log, "secret") {
+		t.Errorf("refusal log line carries the password: %q", log)
 	}
 }
 

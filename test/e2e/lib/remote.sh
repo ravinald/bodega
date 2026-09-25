@@ -4,8 +4,8 @@
 # which captures stdout, stderr and the exit code separately and keeps a full
 # transcript on disk.
 #
-# The alias -> hostname map is the safety boundary. Suites name "server" and
-# "client"; nothing in a suite can name a host, so no suite can reach a
+# The alias -> hostname map is the safety boundary. Suites name an alias such
+# as "server" or "freebsd"; nothing in a suite can name a host, so no suite can reach a
 # production box however it is edited. e2e_reset and the destructive suite make
 # that boundary the difference between a scratch guest and a real one.
 #
@@ -26,26 +26,29 @@ if [ -f "$E2E_HOSTS_ENV" ]; then
 fi
 E2E_SERVER_HOST="${E2E_SERVER_HOST:-}"
 E2E_CLIENT_HOST="${E2E_CLIENT_HOST:-}"
+E2E_FREEBSD_HOST="${E2E_FREEBSD_HOST:-}"
 E2E_FREEBSD_SERVER_HOST="${E2E_FREEBSD_SERVER_HOST:-}"
-E2E_FREEBSD_CLIENT_HOST="${E2E_FREEBSD_CLIENT_HOST:-}"
 
 # Every alias a suite may name, in one place, so the allowlist in run.sh has a
 # single list to disagree with.
-E2E_HOST_ALIASES="server client freebsd-server freebsd-client"
+E2E_HOST_ALIASES="server client freebsd freebsd-server"
 
-# Resolve an alias to a hostname, or fail closed.
+# Name the variable an alias reads, or fail closed. The alias -> variable map
+# lives here alone, so the resolver and run.sh's unset guard cannot disagree
+# about which variable a missing host is missing from.
 #
-# The FreeBSD pair is two guests rather than one because the two halves fail
-# differently: a client answers whether pkg accepts what bodega signed, and a
-# server is the only place internal/storage's extattr and POSIX.1e ACL paths
-# ever execute. One guest doing both would run the server code as a side effect
-# of a client test, and a failure there names neither.
-e2e_host_for() {
+# freebsd is the FreeBSD client guest, and freebsd-server a second one. The
+# two halves fail differently: a client answers whether pkg and make accept
+# what bodega serves, and a server is the only place internal/storage's
+# extattr and POSIX.1e ACL paths ever execute. One guest doing both would run
+# the server code as a side effect of a client test, and a failure there names
+# neither.
+e2e_host_var_for() {
 	case "$1" in
-	server) printf '%s' "$E2E_SERVER_HOST" ;;
-	client) printf '%s' "$E2E_CLIENT_HOST" ;;
-	freebsd-server) printf '%s' "$E2E_FREEBSD_SERVER_HOST" ;;
-	freebsd-client) printf '%s' "$E2E_FREEBSD_CLIENT_HOST" ;;
+	server) printf '%s' E2E_SERVER_HOST ;;
+	client) printf '%s' E2E_CLIENT_HOST ;;
+	freebsd) printf '%s' E2E_FREEBSD_HOST ;;
+	freebsd-server) printf '%s' E2E_FREEBSD_SERVER_HOST ;;
 	*)
 		printf 'e2e: unknown host alias %q; suites may name only: %s\n' "$1" "$E2E_HOST_ALIASES" >&2
 		return 2
@@ -53,12 +56,22 @@ e2e_host_for() {
 	esac
 }
 
+# Resolve an alias to a hostname, or fail closed with 2.
+e2e_host_for() {
+	local var
+	var="$(e2e_host_var_for "$1")" || return 2
+	printf '%s' "${!var}"
+}
+
 # Every configured hostname, in alias order. run.sh checks each against the
 # allowlist and closes each one's ssh control socket, and both of those went
 # wrong by enumerating two hosts after a third existed.
 e2e_all_hosts() {
-	printf '%s\n' "$E2E_SERVER_HOST" "$E2E_CLIENT_HOST" \
-		"$E2E_FREEBSD_SERVER_HOST" "$E2E_FREEBSD_CLIENT_HOST"
+	local a
+	for a in $E2E_HOST_ALIASES; do
+		e2e_host_for "$a"
+		printf '\n'
+	done
 }
 
 # A control socket per run. A full pass makes several hundred ssh calls and a

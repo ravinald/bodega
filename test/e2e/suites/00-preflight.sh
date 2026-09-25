@@ -116,7 +116,7 @@ done
 # preflight needs is the addresses, and this workstation is what resolves them.
 E2E_HOST=local
 for pair in "server:$E2E_SERVER_HOST" "client:$E2E_CLIENT_HOST" \
-	"freebsd-server:$E2E_FREEBSD_SERVER_HOST" "freebsd-client:$E2E_FREEBSD_CLIENT_HOST"; do
+	"freebsd:$E2E_FREEBSD_HOST" "freebsd-server:$E2E_FREEBSD_SERVER_HOST"; do
 	alias="${pair%%:*}"
 	name="${pair#*:}"
 	addr="$(dscacheutil -q host -a name "$name" 2>/dev/null | awk '/^ip_address:/ {print $2; exit}')"
@@ -124,7 +124,10 @@ for pair in "server:$E2E_SERVER_HOST" "client:$E2E_CLIENT_HOST" \
 	check_matches "PRE-10-$alias" "this workstation resolves $name" \
 		'^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' "${addr:-unresolved}" \
 		"test/e2e/README.md" "dscacheutil -q host -a name $name"
-	if [ "$alias" = server ]; then E2E_SERVER_ADDR="$addr"; else E2E_CLIENT_ADDR="$addr"; fi
+	case "$alias" in
+	server) E2E_SERVER_ADDR="$addr" ;;
+	client) E2E_CLIENT_ADDR="$addr" ;;
+	esac
 done
 export E2E_SERVER_ADDR E2E_CLIENT_ADDR
 

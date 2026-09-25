@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -466,17 +467,72 @@ func typeOrderSentence(verb string) string {
 		len(manifest.AllTypes), verb, strings.Join(manifest.AllTypes, ", "))
 }
 
-// resolveTypes expands an empty slice to AllTypes and validates each entry.
+// typeAliases are spellings an operator types that name a type without being
+// one. They resolve here and nowhere else: not in AllTypes, not in help, and
+// never as a storage or manifest prefix. An alias reaching the store would give
+// one type two key prefixes, and whatever landed under the second is
+// unreachable from every reader that asks for the first.
+var typeAliases = map[string]string{
+	"fbsd": manifest.TypeFreeBSD,
+}
+
+// resolveTypes expands an empty slice to AllTypes, validates each entry, and
+// returns every alias as the type it names.
 func resolveTypes(args []string) ([]string, error) {
 	if len(args) == 0 {
 		return manifest.AllTypes, nil
 	}
+	out := make([]string, 0, len(args))
 	for _, t := range args {
+		if canon, ok := typeAliases[t]; ok {
+			t = canon
+		}
 		if !isValidType(t) {
 			return nil, fmt.Errorf("unknown type %q — must be one of: %s", t, strings.Join(manifest.AllTypes, ", "))
 		}
+		out = append(out, t)
 	}
-	return args, nil
+	return out, nil
+}
+
+// splitTypeArgs separates the positional arguments of a command that takes
+// types and a package name in one list. A type name is always a type. An alias
+// is a type only when no type name appears beside it: 'build upload binary
+// fbsd' has already said which type it means, so fbsd there is the package it
+// was before the alias existed, and reading it as a type would widen one
+// binary into every binary and every freebsd repository.
+func splitTypeArgs(args []string) (typeArgs, rest []string) {
+	named := slices.ContainsFunc(args, isValidType)
+	for _, a := range args {
+		_, alias := typeAliases[a]
+		if isValidType(a) || (alias && !named) {
+			typeArgs = append(typeArgs, a)
+		} else {
+			rest = append(rest, a)
+		}
+	}
+	return typeArgs, rest
+}
+
+// refuseAliasCollision rejects an alias used as a type when the catalog also
+// holds a package by that name. Either reading selects something the other
+// does not, so guessing either one fetches, builds or publishes what the
+// operator did not name.
+func refuseAliasCollision(typeArgs []string, store *manifest.Store) error {
+	for _, a := range typeArgs {
+		canon, ok := typeAliases[a]
+		if !ok {
+			continue
+		}
+		for _, t := range manifest.AllTypes {
+			if slices.Contains(store.ListPackages(t), a) {
+				return fmt.Errorf("%q is both an alias for the %s type and a %s package; "+
+					"write %s to select the type, or %s %s to select the package",
+					a, canon, t, canon, t, a)
+			}
+		}
+	}
+	return nil
 }
 
 // backgroundCtx returns a context bound to the process lifetime.

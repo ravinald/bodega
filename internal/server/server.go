@@ -295,7 +295,7 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 		logger.Error("pepper created but not handed to the service account; a token minted by another account will be refused",
 			"path", pst.Path, "error", err)
 	default:
-		logger.Error("could not load or create pepper file — token auth will not work", "error", err)
+		logger.Error("could not load or create pepper file — token auth will not work and the read API publishes no binary download links", "error", err)
 	}
 	for _, c := range pst.Shadowed {
 		args := []any{"in_force", pst.Path, "ignored", c.Path}
@@ -952,7 +952,7 @@ func (s *Server) handleAPIPackages(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	resp := make(packagesResponse, len(manifest.AllTypes))
 	for _, typ := range manifest.AllTypes {
-		resp[typ] = loadAllPackages(ctx, s.store, typ)
+		resp[typ] = loadPublicPackages(ctx, s.store, typ, []byte(s.pepper))
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -966,7 +966,7 @@ func (s *Server) handleAPIPackagesByType(w http.ResponseWriter, r *http.Request)
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, loadAllPackages(ctx, s.store, t))
+	writeJSON(w, http.StatusOK, loadPublicPackages(ctx, s.store, t, []byte(s.pepper)))
 }
 
 func (s *Server) handleAPIPackage(w http.ResponseWriter, r *http.Request) {
@@ -990,7 +990,7 @@ func (s *Server) handleAPIPackage(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 		return
 	}
-	writeJSON(w, http.StatusOK, pm)
+	writeJSON(w, http.StatusOK, pm.Public([]byte(s.pepper)))
 }
 
 // handleAPIPackageVersion returns a PackageManifest scoped to a single
@@ -1020,7 +1020,7 @@ func (s *Server) handleAPIPackageVersion(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "package not found"})
 		return
 	}
-	scoped := pm.ScopeToVersion(version)
+	scoped := pm.Public([]byte(s.pepper)).ScopeToVersion(version)
 	if scoped == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{
 			"error": fmt.Sprintf("version %q not found in %s/%s", version, t, name),
@@ -1081,6 +1081,12 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 		// published on purpose and no client can verify a catalogue without
 		// it.
 		freebsd.KeyError = ""
+		// A refusal quotes the entry's url, and the url may carry upstream
+		// credentials. repo and abi stay public so a client can tell a
+		// refused repository from an absent one.
+		for i := range freebsd.Refused {
+			freebsd.Refused[i].Error = ""
+		}
 	}
 	entryCount := make(map[string]int, len(manifest.AllTypes))
 	for _, typ := range manifest.AllTypes {
@@ -1756,7 +1762,11 @@ func (s *Server) proxyVersion(w http.ResponseWriter, r *http.Request, typ, pkg, 
 // The Head is what separates the two answers, and a Head that errors falls
 // through to proxyS3 rather than refusing: a backend that cannot be read has
 // not established that the object is absent, and proxyS3 reports that as 502.
-func (s *Server) proxyVersionOrRefuse(w http.ResponseWriter, r *http.Request, typ, pkg, version, key, reason string) {
+//
+// reason reaches every caller, token or not, so a URL in it is cut the way a
+// published manifest url is. logArgs carry what the operator needs and the
+// caller does not.
+func (s *Server) proxyVersionOrRefuse(w http.ResponseWriter, r *http.Request, typ, pkg, version, key, reason string, logArgs ...any) {
 	store, err := s.versionStore(r.Context(), typ, pkg, version)
 	if err != nil {
 		s.logger.Error("storage backend recorded for artifact is not configured",
@@ -1771,6 +1781,8 @@ func (s *Server) proxyVersionOrRefuse(w http.ResponseWriter, r *http.Request, ty
 	if headErr != nil {
 		s.logger.Error("s3 head check failed", "key", key, "error", headErr)
 	} else if status == nil || !status.Exists {
+		s.logger.Info("refused an artifact no manifest entry names and no backend holds",
+			append([]any{"type", typ, "package", pkg, "version", version, "key", key}, logArgs...)...)
 		http.Error(w, reason, http.StatusNotFound)
 		return
 	}
@@ -2095,8 +2107,10 @@ func sortStrings(ss []string) {
 
 // ---- PackageManifest helpers -----------------------------------------------
 
-// loadAllPackages loads all PackageManifest entries for a given type from the store.
-func loadAllPackages(ctx context.Context, store *manifest.Store, typ string) []*manifest.PackageManifest {
+// loadPublicPackages loads every PackageManifest of one type from the store,
+// each as manifest.PackageManifest.Public returns it under key: the read
+// routes take no token.
+func loadPublicPackages(ctx context.Context, store *manifest.Store, typ string, key []byte) []*manifest.PackageManifest {
 	names := store.ListPackages(typ)
 	out := make([]*manifest.PackageManifest, 0, len(names))
 	for _, name := range names {
@@ -2104,7 +2118,7 @@ func loadAllPackages(ctx context.Context, store *manifest.Store, typ string) []*
 		if err != nil || pm == nil {
 			continue
 		}
-		out = append(out, pm)
+		out = append(out, pm.Public(key))
 	}
 	return out
 }

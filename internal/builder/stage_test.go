@@ -77,7 +77,10 @@ func TestBinaryDestPath_NoVersion(t *testing.T) {
 	root := t.TempDir()
 	d := buildDirs(root)
 	ve := manifest.VersionEntry{URL: "https://example.com/tool.tar.gz"}
-	got := binaryDestPath(d, "tool", ve)
+	got, err := binaryDestPath(d, "tool", ve)
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := filepath.Join(d.binaries, "tool", "tool.tar.gz")
 	if got != want {
 		t.Errorf("binaryDestPath (no version) = %q, want %q", got, want)
@@ -88,7 +91,10 @@ func TestBinaryDestPath_WithVersion(t *testing.T) {
 	root := t.TempDir()
 	d := buildDirs(root)
 	ve := manifest.VersionEntry{Version: "v1.2", URL: "https://example.com/tool.tar.gz"}
-	got := binaryDestPath(d, "tool", ve)
+	got, err := binaryDestPath(d, "tool", ve)
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := filepath.Join(d.binaries, "tool", "v1.2", "tool.tar.gz")
 	if got != want {
 		t.Errorf("binaryDestPath (versioned) = %q, want %q", got, want)
@@ -99,7 +105,10 @@ func TestBinaryDestPath_FilenameOverride(t *testing.T) {
 	root := t.TempDir()
 	d := buildDirs(root)
 	ve := manifest.VersionEntry{Filename: "custom-name.bin", URL: "https://example.com/original.bin"}
-	got := binaryDestPath(d, "tool", ve)
+	got, err := binaryDestPath(d, "tool", ve)
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := filepath.Join(d.binaries, "tool", "custom-name.bin")
 	if got != want {
 		t.Errorf("binaryDestPath (filename override) = %q, want %q", got, want)

@@ -272,7 +272,8 @@ func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
 			// composed without reading the index, so the index is the only
 			// fetchable URL this branch knows. `discover promote --as manifest`
 			// stores it, and manifestURL trims it back to the registry root.
-			s.recordNoManifest(r.Context(), r, manifest.TypePypi, normalized, distVersion, s.pypiSimpleURL(normalized))
+			index := s.pypiSimpleURL(normalized)
+			s.recordNoManifest(r.Context(), r, manifest.TypePypi, normalized, distVersion, index)
 
 			// pypi wheels stay catalog-only where npm tarballs proxy, and the
 			// index read is only half the reason. The other half is that no
@@ -282,9 +283,15 @@ func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
 			// acquires a wheel URL for anything to follow. Opening this route
 			// would pay a simple-index fetch per request for addresses only a
 			// guess produces, which is the opposite trade to npm's.
+			//
+			// The body goes to any caller, token or not, so it names the index
+			// the way a manifest url is published: pypi_upstream may carry a
+			// private index's credential in its userinfo. The log line is the
+			// operator's and keeps the username.
 			s.proxyVersionOrRefuse(w, r, manifest.TypePypi, normalized, distVersion, key,
 				"no manifest entry names pypi distribution "+normalized+", and a wheel URL cannot be composed without reading "+
-					s.pypiSimpleURL(normalized)+"; catalog it first: bodega pkg create pypi "+normalized)
+					manifest.PublicURL(index)+"; catalog it first: bodega pkg create pypi "+normalized,
+				"index", redactedURL(index))
 			return
 		}
 	}
@@ -295,6 +302,17 @@ func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
 // configured index root.
 func (s *Server) pypiSimpleURL(normalized string) string {
 	return strings.TrimRight(s.cfg.PypiUpstream, "/") + "/simple/" + normalized + "/"
+}
+
+// redactedURL masks a URL's password for the operator log and keeps the rest,
+// username included, since the username is what tells two accounts on one
+// private index apart.
+func redactedURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return manifest.PublicURL(raw)
+	}
+	return u.Redacted()
 }
 
 // pypiIndexWriter buffers a proxied simple index so its links can be pointed

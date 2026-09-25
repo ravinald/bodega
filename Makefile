@@ -40,8 +40,9 @@ CHECK_LEGS := ci-drift fmt-check tidy-check harness vet build lint test test-ser
 
 # Every shell file in the tree. `shfmt -f` finds them by shebang and by
 # shell= directive, so a suite added without touching this line is still
-# linted.
-E2E_SHELL := $(shell shfmt -f test/e2e 2>/dev/null)
+# linted. test/e2e/results is gitignored run output, and a run or a review may
+# leave a script there that sources files relative to where it was written.
+E2E_SHELL := $(filter-out test/e2e/results/%,$(shell shfmt -f test/e2e 2>/dev/null))
 
 # ---- Install paths ---------------------------------------------------------
 # `make install` writes to $(DESTDIR)$(BINDIR). Defaults are auto-detected

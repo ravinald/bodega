@@ -735,6 +735,9 @@ function getClientUrl(type, entry) {
     }
     case 'binary': {
       const fn = entry.filename || (entry.url ? entry.url.split('/').pop() : entry.name);
+      // A server with no pepper publishes every binary under an alias whose
+      // tag is all zeros. It resolves nowhere, so there is no link to offer.
+      if (/^~\/0{32}\//.test(fn)) return '';
       if (entry.version) return base + '/binaries/' + entry.name + '/' + entry.version + '/' + fn;
       return base + '/binaries/' + entry.name + '/' + fn;
     }

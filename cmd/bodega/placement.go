@@ -62,20 +62,19 @@ func versionLabel(ve manifest.VersionEntry) string { return placement.VersionLab
 // and would otherwise start filtering for a package nothing is named, upload
 // nothing, and exit 0.
 func parseUploadArgs(args []string, store *manifest.Store) ([]string, string, error) {
-	var typeArgs []string
+	typeArgs, rest := splitTypeArgs(args)
+	if len(rest) > 1 {
+		return nil, "", fmt.Errorf("only one package may be named; got %q and %q", rest[0], rest[1])
+	}
 	var selector string
-	for _, a := range args {
-		switch {
-		case isValidType(a):
-			typeArgs = append(typeArgs, a)
-		case selector != "":
-			return nil, "", fmt.Errorf("only one package may be named; got %q and %q", selector, a)
-		default:
-			selector = a
-		}
+	if len(rest) == 1 {
+		selector = rest[0]
 	}
 	types, err := resolveTypes(typeArgs)
 	if err != nil {
+		return nil, "", err
+	}
+	if err := refuseAliasCollision(typeArgs, store); err != nil {
 		return nil, "", err
 	}
 	if selector == "" {

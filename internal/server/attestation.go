@@ -13,7 +13,7 @@ import (
 // promoting a version from an external authority; bodega exposes the
 // envelope as a sidecar URL alongside the package.
 const (
-	MetaAttestationURI   = "attestation_uri"
+	MetaAttestationURI   = manifest.MetaAttestationURI
 	MetaAttestationAlg   = "attestation_alg"
 	MetaAttestationKeyID = "attestation_keyid"
 )
@@ -21,7 +21,9 @@ const (
 // handleAttestation returns the DSSE envelope (or a redirect to it) for a
 // given version. 404 when the VersionEntry has no attestation_uri set.
 //
-// http(s) URIs become a 302 redirect so the client fetches them directly.
+// http(s) URIs become a 302 redirect so the client fetches them directly,
+// unless the uri carries a part the read routes withhold: the Location would
+// publish it, so that answer is a 502 instead.
 // s3:// URIs are read by the bodega host, which already has the bucket
 // credentials the client does not.
 func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
@@ -53,6 +55,10 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
+	case manifest.AttestationURIWithheld(uri):
+		s.logger.Warn("attestation_uri carries userinfo, a query or a fragment, and a redirect would hand it to the caller; rewrite it without them or serve the envelope from s3://",
+			"type", t, "package", name, "version", version)
+		http.Error(w, "attestation_uri is not redirectable: it carries userinfo, a query or a fragment", http.StatusBadGateway)
 	case strings.HasPrefix(uri, "http://"), strings.HasPrefix(uri, "https://"):
 		//nolint:gosec // G710: uri comes from operator-controlled manifest, not from request input.
 		http.Redirect(w, r, uri, http.StatusFound)

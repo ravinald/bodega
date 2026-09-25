@@ -2,7 +2,6 @@ package server
 
 import (
 	"net/http"
-	"strings"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
@@ -57,7 +56,7 @@ func (s *Server) handleBinary(w http.ResponseWriter, r *http.Request) {
 	if !s.requireStorage(w, s.typeStore(manifest.TypeBinary)) {
 		return
 	}
-	pkg, version, filename := binaryPathIdentity(p)
+	pkg, version, filename := manifest.BinaryPathIdentity(p)
 	if pkg == "" {
 		// Not a shape the uploader writes, so no key can be derived for it.
 		http.NotFound(w, r)
@@ -71,7 +70,28 @@ func (s *Server) handleBinary(w http.ResponseWriter, r *http.Request) {
 	if !s.entitleGate(w, r, manifest.TypeBinary, pkg, version) {
 		return
 	}
-	s.proxyVersion(w, r, manifest.TypeBinary, pkg, version, manifest.BinaryKey(pkg, version, filename))
+	pm, _ := s.store.GetPackage(r.Context(), manifest.TypeBinary, pkg)
+	filename, entry, ok := pm.BinaryStoredFilename([]byte(s.pepper), version, filename)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	key := manifest.BinaryKey(pkg, version, filename)
+	if entry == nil {
+		s.proxyVersion(w, r, manifest.TypeBinary, pkg, version, key)
+		return
+	}
+	// An alias names one entry, and another entry of the same version may
+	// hold the same key on a different backend, so the backend comes from the
+	// entry the alias resolved to rather than from a second lookup by version.
+	store, err := s.stores.ByName(entry.Storage)
+	if err != nil {
+		s.logger.Error("storage backend recorded for artifact is not configured",
+			"type", manifest.TypeBinary, "package", pkg, "version", version, "key", key, "error", err)
+		http.Error(w, "storage backend error", http.StatusBadGateway)
+		return
+	}
+	s.proxyS3(w, r, store, key)
 }
 
 // handleBinaryUpstream serves one request against a configured namespace.
@@ -136,20 +156,4 @@ func (s *Server) handleBinaryUpstream(w http.ResponseWriter, r *http.Request, ns
 	// allow-list matches a URL prefix. discoveryPkgName is <namespace>/<rest>,
 	// which is what 'discover promote --as manifest' writes the entry under.
 	s.proxyOrCache(w, r, store, key, upstream, manifest.TypeBinary, upstream, pkgName, true, true)
-}
-
-// binaryPathIdentity recovers the manifest entry that owns a binaries/ key.
-// The uploader writes <name>/<version>/<file>, dropping the version segment
-// for an entry that has none, so a two-segment path yields an empty version
-// rather than mistaking the filename for one. Any other segment count names
-// nothing and returns an empty package.
-func binaryPathIdentity(p string) (pkg, version, filename string) {
-	parts := strings.Split(p, "/")
-	switch len(parts) {
-	case 2:
-		return parts[0], "", parts[1]
-	case 3:
-		return parts[0], parts[1], parts[2]
-	}
-	return "", "", ""
 }

@@ -60,10 +60,14 @@ usage() {
 E2E_ALLOWED_HOSTS="${E2E_ALLOWED_HOSTS:-}"
 
 assert_host_allowlist() {
-	local h
+	local h var
 	for h in $E2E_HOST_ALIASES; do
-		if [ -z "$(e2e_host_for "$h")" ]; then
-			die "no host is configured for the $h alias. Copy test/e2e/hosts.env.example to test/e2e/hosts.env and name all four dev guests." 3
+		var="$(e2e_host_var_for "$h")" || die "run.sh: $h is in E2E_HOST_ALIASES with no variable behind it" 3
+		if [ -z "${!var}" ]; then
+			if [ "$var" = E2E_FREEBSD_HOST ] && [ -n "${E2E_FREEBSD_CLIENT_HOST:-}" ]; then
+				die "$var is unset, and E2E_FREEBSD_CLIENT_HOST is set: the freebsd-client alias is now freebsd. Rename the variable in test/e2e/hosts.env; the old name is not read." 3
+			fi
+			die "$var is unset, so the $h alias names no host. Copy test/e2e/hosts.env.example to test/e2e/hosts.env and name all four dev guests." 3
 		fi
 	done
 	if [ -z "$E2E_ALLOWED_HOSTS" ]; then
@@ -227,7 +231,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-export E2E_FREEBSD_SERVER_HOST E2E_FREEBSD_CLIENT_HOST E2E_HOST_ALIASES
+export E2E_FREEBSD_HOST E2E_FREEBSD_SERVER_HOST E2E_HOST_ALIASES
 export E2E_DIR REPO_ROOT E2E_RUN_ID E2E_RUN_DIR E2E_LOG_DIR E2E_FINDINGS
 export E2E_COMMIT E2E_SSH_CTL_DIR E2E_KNOWN_FILE E2E_ARTIFACT_DIR
 export E2E_DRY_RUN E2E_DRY_PLAN
@@ -235,7 +239,7 @@ export E2E_DRY_RUN E2E_DRY_PLAN
 [ "$E2E_DRY_RUN" = yes ] && printf 'DRY RUN — no guest is contacted and nothing is measured\n'
 printf 'bodega e2e  run=%s  commit=%s\n' "$E2E_RUN_ID" "$E2E_COMMIT"
 printf 'server=%s  client=%s\n' "$E2E_SERVER_HOST" "$E2E_CLIENT_HOST"
-printf 'freebsd-server=%s  freebsd-client=%s\n\n' "$E2E_FREEBSD_SERVER_HOST" "$E2E_FREEBSD_CLIENT_HOST"
+printf 'freebsd=%s  freebsd-server=%s\n\n' "$E2E_FREEBSD_HOST" "$E2E_FREEBSD_SERVER_HOST"
 
 # Defaults for a filtered run that skips 10-ship, which is what normally sets
 # these. A suite reading an empty base URL builds requests against "/healthz"

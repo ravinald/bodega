@@ -148,6 +148,154 @@ rc=$?
 set -e
 t_ok "a hostname is not an alias" 2 "$rc"
 
+E2E_FREEBSD_HOST="freebsd.example.com"
+E2E_FREEBSD_SERVER_HOST="freebsd-server.example.com"
+t_ok "freebsd alias resolves E2E_FREEBSD_HOST" "freebsd.example.com" "$(e2e_host_for freebsd)"
+t_ok "freebsd-server alias resolves its own variable" "freebsd-server.example.com" "$(e2e_host_for freebsd-server)"
+
+# freebsd-client was the FreeBSD client's alias before freebsd replaced it. A
+# suite still naming it must fail closed, not reach whatever it used to mean.
+set +e
+e2e_host_for freebsd-client >/dev/null 2>&1
+rc=$?
+set -e
+t_ok "the retired freebsd-client alias is refused" 2 "$rc"
+
+# run.sh's guards, driven end to end. ssh and every resolver are stubbed to
+# leave a mark, so a guard that lets the run reach a host shows up as a mark
+# rather than as whatever that host happens to answer.
+mkdir -p "$work/bin"
+for tool in ssh scp dig host getent dscacheutil; do
+	printf '#!/bin/sh\ntouch "%s/contacted"\nexit 1\n' "$work" >"$work/bin/$tool"
+	chmod +x "$work/bin/$tool"
+done
+
+# run_guard <expected-substring> [VAR=value ...] — runs run.sh --dry-run with
+# only the named hosts configured and echoes "<rc>|<matched>|<contacted>".
+run_guard() {
+	local want="$1" out rc
+	shift
+	rm -f "$work/contacted"
+	set +e
+	out="$(env -u E2E_SERVER_HOST -u E2E_CLIENT_HOST -u E2E_FREEBSD_HOST \
+		-u E2E_FREEBSD_SERVER_HOST -u E2E_FREEBSD_CLIENT_HOST -u E2E_ALLOWED_HOSTS \
+		-u E2E_LIB_REMOTE -u E2E_LIB_ASSERT -u E2E_LIB_REPORT \
+		E2E_HOSTS_ENV=/dev/null PATH="$work/bin:$PATH" "$@" \
+		bash "$E2E_DIR/run.sh" --dry-run 2>&1)"
+	rc=$?
+	set -e
+	printf '%s|%s|%s' "$rc" \
+		"$(case "$out" in *"$want"*) echo matched ;; *) echo "missing: $out" ;; esac)" \
+		"$([ -e "$work/contacted" ] && echo contacted || echo untouched)"
+}
+
+three=(E2E_SERVER_HOST=s.example E2E_CLIENT_HOST=c.example E2E_FREEBSD_SERVER_HOST=fs.example)
+t_ok "an unset E2E_FREEBSD_HOST refuses by name before contact" "3|matched|untouched" \
+	"$(run_guard "E2E_FREEBSD_HOST is unset" "${three[@]}" \
+		E2E_ALLOWED_HOSTS="s.example c.example fs.example")"
+t_ok "the retired variable name is refused with the rename" "3|matched|untouched" \
+	"$(run_guard "the freebsd-client alias is now freebsd" "${three[@]}" \
+		E2E_FREEBSD_CLIENT_HOST=f.example E2E_ALLOWED_HOSTS="s.example c.example fs.example f.example")"
+t_ok "an unlisted freebsd host is refused before contact" "3|matched|untouched" \
+	"$(run_guard "refusing to run: prod.example is not a dev guest" "${three[@]}" \
+		E2E_FREEBSD_HOST=prod.example E2E_ALLOWED_HOSTS="s.example c.example fs.example f.example")"
+
+# A dry run walks every suite to its last check and changes nothing on this
+# workstation. Suite 48 once deleted its build output and then blocked on the
+# missing file, so its plan stopped before the guest was touched and still
+# exited 0. It runs from a copy under a scratch repo root, so the results it
+# writes and the binary it must leave alone are both inside $work.
+dry_root="$work/dry-repo"
+mkdir -p "$dry_root/test" "$dry_root/dist" "$work/drybin"
+(cd "$E2E_DIR" && tar --exclude ./results --exclude ./hosts.env -cf - .) |
+	(mkdir -p "$dry_root/test/e2e" && cd "$dry_root/test/e2e" && tar -xf -)
+printf 'an earlier build\n' >"$dry_root/dist/storage-freebsd-arm64.test"
+chmod +x "$dry_root/dist/storage-freebsd-arm64.test"
+printf '#!/bin/sh\necho deadbee\n' >"$work/drybin/git"
+# run.sh's exit trap closes each host's control socket with `ssh -O exit`,
+# which reaches a local socket and never a guest.
+# shellcheck disable=SC2016  # $a expands in the stub, not here
+printf '#!/bin/sh\nfor a; do [ "$a" = -O ] && exit 1; done\ntouch "%s/contacted"\nexit 1\n' \
+	"$work" >"$work/drybin/ssh"
+# Preflight resolves each name on this workstation even in a dry run. A lookup
+# is not contact with a guest, so here it fails quietly instead of marking.
+for tool in dig host getent dscacheutil; do
+	printf '#!/bin/sh\nexit 1\n' >"$work/drybin/$tool"
+	chmod +x "$work/drybin/$tool"
+done
+chmod +x "$work/drybin/git" "$work/drybin/ssh"
+rm -f "$work/contacted"
+set +e
+env -u E2E_LIB_REMOTE -u E2E_LIB_ASSERT -u E2E_LIB_REPORT -u E2E_FREEBSD_CLIENT_HOST \
+	E2E_HOSTS_ENV=/dev/null PATH="$work/drybin:$work/bin:$PATH" \
+	E2E_SERVER_HOST=s.example E2E_CLIENT_HOST=c.example \
+	E2E_FREEBSD_HOST=f.example E2E_FREEBSD_SERVER_HOST=fs.example \
+	E2E_ALLOWED_HOSTS="s.example c.example f.example fs.example" \
+	bash "$dry_root/test/e2e/run.sh" --dry-run --suite 48- >/dev/null 2>&1
+dry_rc=$?
+set -e
+dry_dir="$(find "$dry_root/test/e2e/results" -mindepth 1 -maxdepth 1 -type d | head -1)"
+dry_plan="$(cat "$dry_dir/dry-run-plan.txt" 2>/dev/null || true)"
+dry_ids="$(jq -r 'select(.suite=="48-freebsd-server") | .id' "$dry_dir/findings.jsonl" 2>/dev/null || true)"
+t_ok "a dry run of suite 48 exits 0" 0 "$dry_rc"
+# A dry run records a block as DRY, so the id is what shows the suite stopped.
+t_ok "a dry run of suite 48 blocks nothing" none \
+	"$(printf '%s\n' "$dry_ids" | awk '/^FSRV-BLOCK-/ {b = b $0 " "} END {print (b ? b : "none")}')"
+t_ok "a dry run of suite 48 reaches all 32 cells" 32 \
+	"$(printf '%s\n' "$dry_ids" | awk '/^FSRV-(ZFS|UFS)-(USER|ROOT)-0[1-8]$/' | wc -l | tr -d ' ')"
+t_ok "a dry run of suite 48 reaches its last check" yes \
+	"$(printf '%s\n' "$dry_ids" | awk '$0 == "FSRV-05" {f = 1} END {print (f ? "yes" : "no")}')"
+for want in 'local: rm -f' 'local: env GOOS=freebsd' 'mdconfig -a -t swap' \
+	'storage.test -test.run' 'pw useradd' 'pw userdel' 'umount'; do
+	t_ok "the suite 48 plan lists $want" yes \
+		"$(case "$dry_plan" in *"$want"*) echo yes ;; *) echo no ;; esac)"
+done
+t_ok "a dry run leaves an existing build output alone" 'an earlier build' \
+	"$(cat "$dry_root/dist/storage-freebsd-arm64.test" 2>/dev/null || echo deleted)"
+t_ok "a dry run contacts no guest" untouched \
+	"$([ -e "$work/contacted" ] && echo contacted || echo untouched)"
+
+# Suite 48 names its scratch dataset from `zfs list` of the storage root's
+# parent. The command runs here in a real shell, with sudo and zfs stubbed and
+# zfs refusing a path that does not exist the way the guest's does, so a lookup
+# ordered before the mkdir fails here as it did there.
+# shellcheck source=freebsd.sh
+. "$E2E_DIR/lib/freebsd.sh"
+mkdir -p "$work/zfsbin"
+printf '#!/bin/sh\nexec "$@"\n' >"$work/zfsbin/sudo"
+# shellcheck disable=SC2016  # expands in the stub, not here
+printf '#!/bin/sh\nfor a; do p="$a"; done\n[ -d "$p" ] || { echo "cannot open '"'"'$p'"'"'" >&2; exit 1; }\nprintf "%%s\\n" "${ZFS_STUB_OUT-zroot/var/tmp}"\n' \
+	>"$work/zfsbin/zfs"
+chmod +x "$work/zfsbin/sudo" "$work/zfsbin/zfs"
+# zfs_of <path> [ZFS_STUB_OUT] echoes "<rc>|<dataset or error>".
+zfs_of() {
+	(
+		# shellcheck disable=SC2329  # invoked by e2e_freebsd_zfs_dataset_of
+		e2e_on() {
+			shift
+			set +e
+			E2E_OUT="$(PATH="$work/zfsbin:$PATH" sh -c "$*" 2>"$work/zfs.err")"
+			E2E_RC=$?
+			set -e
+			E2E_ERR="$(cat "$work/zfs.err")"
+			return "$E2E_RC"
+		}
+		[ "$#" -gt 1 ] && export ZFS_STUB_OUT="$2"
+		rc=0
+		e2e_freebsd_zfs_dataset_of freebsd-server "$1" || rc=$?
+		if [ "$rc" -eq 0 ]; then printf '0|%s' "$E2E_OUT"; else printf '%s|%s' "$rc" "$E2E_ERR"; fi
+	)
+}
+t_ok "a storage root under an absent parent still names its dataset" "0|zroot/var/tmp" \
+	"$(zfs_of "$work/absent/nested")"
+t_ok "the absent parent exists after the lookup" yes \
+	"$([ -d "$work/absent/nested" ] && echo yes || echo no)"
+t_ok "an existing parent names its dataset" "0|zroot/var/tmp" "$(zfs_of "$work/absent/nested")"
+t_ok "empty zfs output names no dataset" "1|zfs list named no single dataset for $work/e: empty output" \
+	"$(zfs_of "$work/e" "")"
+t_ok "a leading slash names no dataset" 1 "$(zfs_of "$work/s" "/bodega" | awk -F"|" 'NR == 1 {print $1}')"
+t_ok "two lines name no dataset" 1 "$(zfs_of "$work/t" "$(printf 'a\nb')" | awk -F"|" 'NR == 1 {print $1}')"
+
 # ---- counters --------------------------------------------------------------
 
 t_ok "PASS counter agrees with the file" \
