@@ -244,8 +244,10 @@ risk:
     npm, cargo and helm indexes are built from bodega's own base URL and
     carry no manifest `url` or metadata. One anonymous body quotes a
     config value rather than a manifest one: the pypi 404 for a
-    distribution no manifest names prints `pypi_upstream` as written, which
-    is open as B95.
+    distribution no manifest names prints the distribution and the simple
+    index under `pypi_upstream`, cut through `manifest.PublicURL`, so a
+    private index's userinfo, query and fragment never reach the body; the
+    refusal log names the index with the password masked.
   - **Admin range: no token needed.** Inside `admin_permit_cidr` the
     `/api/v1/status` fields above are returned in full with no
     `Authorization` header. `/api/v1/audit` is gated the same way and
