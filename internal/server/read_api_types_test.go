@@ -1105,3 +1105,89 @@ func TestKeylessServerPublishesNoBinaryLink(t *testing.T) {
 		}
 	}
 }
+
+// A token the upstream takes in the query string, or one pasted into the
+// fragment, is as much a credential as userinfo. The binary entry is here
+// because its download alias is named from the url's last segment, which is
+// where a query string sits. Each secret is asserted absent on every route
+// rather than a replacement asserted present.
+func TestReadAPIWithholdsURLQueryAndFragment(t *testing.T) {
+	const abi = "FreeBSD:14:amd64"
+	for _, tc := range []struct {
+		typ string
+		ve  manifest.VersionEntry
+	}{
+		{manifest.TypeFreeBSD, manifest.VersionEntry{Version: abi, URL: "https://private-upstream.example/" + abi + "/latest?token=query-secret#frag-secret"}},
+		{manifest.TypeFreeBSD, manifest.VersionEntry{Version: abi, URL: "https://private-upstream.example/" + abi + "/latest#access_token=frag-secret"}},
+		{manifest.TypeBinary, manifest.VersionEntry{Version: abi, URL: "https://private-upstream.example/tool?token=query-secret#frag-secret"}},
+	} {
+		t.Run(tc.typ+" "+tc.ve.URL, func(t *testing.T) {
+			s := hostedServer(t)
+			addVersion(t, s, tc.typ, "private", tc.ve)
+			for _, path := range []string{
+				"/api/v1/packages",
+				"/api/v1/packages/" + tc.typ,
+				"/api/v1/packages/" + tc.typ + "/private",
+				"/api/v1/packages/" + tc.typ + "/private/" + abi,
+			} {
+				req := httptest.NewRequest(http.MethodGet, path, nil)
+				req.RemoteAddr = "203.0.113.9:40000"
+				rr := httptest.NewRecorder()
+				s.Handler().ServeHTTP(rr, req)
+				body := rr.Body.String()
+				if rr.Code != http.StatusOK {
+					t.Fatalf("GET %s = %d, want 200: %s", path, rr.Code, body)
+				}
+				if sec := withheldFrom(body, "query-secret", "frag-secret"); sec != "" {
+					t.Errorf("GET %s publishes %q from the url to a caller with no token: %s", path, sec, body)
+				}
+			}
+			pm, err := s.store.GetPackage(t.Context(), tc.typ, "private")
+			if err != nil || pm == nil || pm.Versions[0].URL != tc.ve.URL {
+				t.Errorf("the stored url changed after the reads, so the next fetch goes out without its token: %+v, %v", pm, err)
+			}
+		})
+	}
+}
+
+// Metadata goes out whole on the read routes, so a URL written into any key
+// carries whatever credential was pasted with it. attestation_uri is one key;
+// homepage stands for every name an operator might use next. Text that is not
+// a URL is public by contract and keeps its "@".
+func TestReadAPIWithholdsCredentialsInMetadataURLs(t *testing.T) {
+	s := hostedServer(t)
+	addVersion(t, s, manifest.TypeNpm, "private", manifest.VersionEntry{
+		Version: "1.0.0",
+		Metadata: map[string]string{
+			manifest.MetaAttestationURI: "https://attest-user:" + "attest-secret@attest.example/e.json?sig=attest-query",
+			"homepage":                  "https://docs.example/p?access_token=home-secret#home-frag",
+			"mirror":                    "//mirror-user@mirror.example/p",
+			"maintainer":                "Jane Doe <jane@example.org>",
+		},
+	})
+	for _, path := range []string{
+		"/api/v1/packages",
+		"/api/v1/packages/npm",
+		"/api/v1/packages/npm/private",
+		"/api/v1/packages/npm/private/1.0.0",
+	} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.RemoteAddr = "203.0.113.9:40000"
+		rr := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rr, req)
+		body := rr.Body.String()
+		if rr.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d, want 200: %s", path, rr.Code, body)
+		}
+		if sec := withheldFrom(body, "attest-user", "attest-secret", "attest-query", "home-secret", "home-frag", "mirror-user"); sec != "" {
+			t.Errorf("GET %s publishes %q from a metadata URL to a caller with no token: %s", path, sec, body)
+		}
+		if !strings.Contains(body, "jane@example.org") {
+			t.Errorf("GET %s cut a metadata value that is not a URL: %s", path, body)
+		}
+	}
+	pm, err := s.store.GetPackage(t.Context(), manifest.TypeNpm, "private")
+	if err != nil || pm == nil || !strings.Contains(pm.Versions[0].Metadata["homepage"], "home-secret") {
+		t.Errorf("the read wrote its projection through to the stored metadata: %+v, %v", pm, err)
+	}
+}

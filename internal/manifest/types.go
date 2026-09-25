@@ -334,10 +334,11 @@ type VersionEntry struct {
 }
 
 // Public returns a copy of pm fit for the open read routes, which answer every
-// caller the same way whatever its address or token: every version's URL loses
-// its userinfo, and a binary entry gets the filename binaryDownloadName gives
-// it under key, its download alias whenever there is a key. pm is not
-// modified, since the store may hand the same pointer to the next reader.
+// caller the same way whatever its address or token: every version's URL, and
+// every metadata value written as a URL, goes out through PublicURL, and a
+// binary entry gets the filename binaryDownloadName gives it under key, its
+// download alias whenever there is a key. pm is not modified, since the store
+// may hand the same pointer to the next reader.
 func (pm *PackageManifest) Public(key []byte) *PackageManifest {
 	if pm == nil {
 		return nil
@@ -349,12 +350,93 @@ func (pm *PackageManifest) Public(key []byte) *PackageManifest {
 			ve.Filename = name
 		}
 		ve.URL = PublicURL(ve.URL)
+		if ve.Metadata != nil {
+			md := make(map[string]string, len(ve.Metadata))
+			for k, v := range ve.Metadata {
+				md[k] = PublicMetadataValue(v)
+			}
+			ve.Metadata = md
+		}
 		out.Versions[i] = ve
 	}
 	return &out
 }
 
-// PublicURL returns raw without the userinfo in its authority.
+// MetaAttestationURI is the metadata key naming a version's attestation
+// envelope, which GET .../attestation redirects an http(s) value to.
+const MetaAttestationURI = "attestation_uri"
+
+// AttestationURIWithheld reports whether uri is one the attestation endpoint
+// would redirect to while carrying something PublicURL withholds. The redirect
+// hands its Location to the caller as written and cannot withhold part of it
+// without breaking the fetch it exists for, so such a uri is refused at
+// admission and never redirected to.
+func AttestationURIWithheld(uri string) bool {
+	redirected := strings.HasPrefix(uri, "http://") || strings.HasPrefix(uri, "https://")
+	return redirected && PublicURL(uri) != uri
+}
+
+// aptIdentityKeys are the apt metadata values the index publishes as what they
+// are rather than as text: Architecture names the Packages index and appears in
+// Release, _pool_path is the Filename apt fetches, and the digests are what apt
+// checks the bytes against. Cutting a credential out of one would rename an
+// index, point a client at other bytes or publish a checksum nothing matches.
+var aptIdentityKeys = []string{"Architecture", "_pool_path", "_md5", "_sha1", "_sha256"}
+
+// AptIdentityWithheld returns the first apt identity key in md whose value
+// carries a part PublicMetadataValue withholds, or "" when none does. Such an
+// entry is refused at admission and left out of the index, never published
+// through the cut.
+func AptIdentityWithheld(md map[string]string) string {
+	for _, k := range aptIdentityKeys {
+		if v := md[k]; PublicMetadataValue(v) != v {
+			return k
+		}
+	}
+	return ""
+}
+
+// PublicMetadataValue returns v as a caller with no token may see it: through
+// PublicURL when v is written as a URL, and unchanged otherwise.
+//
+// Metadata is public by contract, since bodega never fetches with a metadata
+// value and so has no use for a credential in one. The URL form is the
+// exception because it is the one a credential arrives in by accident, pasted
+// with the link it authorizes. A value only counts as a URL when a scheme is
+// followed by a slash or backslash, or the scheme is http or https, which
+// browsers read without one: PublicURL on "Name <a@b>" or "C#" would cut text
+// that was never an authority or a query.
+func PublicMetadataValue(v string) string {
+	if !isURLForm(v) {
+		return v
+	}
+	return PublicURL(v)
+}
+
+func isURLForm(v string) bool {
+	s := browserTrim(v)
+	n := schemeLen(s)
+	if n == 0 {
+		return strings.HasPrefix(s, "//") || strings.HasPrefix(s, "\\\\")
+	}
+	if rest := s[n:]; strings.HasPrefix(rest, "/") || strings.HasPrefix(rest, "\\") {
+		return true
+	}
+	scheme := strings.ToLower(s[:n-1])
+	return scheme == "http" || scheme == "https"
+}
+
+// PublicURL returns raw without the userinfo in its authority and without its
+// query or fragment.
+//
+// A query string is where a token goes when the upstream will not take one in
+// the authority (?token=, ?access_token=, a presigned signature), and nothing
+// about a parameter's name says whether its value is a secret, so the whole
+// query goes rather than a list of names that misses the next spelling. The
+// fragment goes with it: no fetch sends one, so nothing bodega does needs it,
+// and a value there is no safer to publish than one before it. The cut is at
+// the first "?" or "#" after the userinfo is gone, which in a git scp path
+// over-cuts a display string and never under-cuts.
 //
 // The username goes too, not only the password url.URL.Redacted masks: a
 // GitHub or GitLab token written as https://<token>@host/ is a bare username
@@ -377,13 +459,15 @@ func (pm *PackageManifest) Public(key []byte) *PackageManifest {
 // dropped with the userinfo: "user:secret@host" has the same form and nothing
 // tells the two apart.
 func PublicURL(raw string) string {
-	s := strings.Map(func(r rune) rune {
-		if r == '\t' || r == '\n' || r == '\r' {
-			return -1
-		}
-		return r
-	}, raw)
-	s = strings.TrimLeftFunc(s, func(r rune) bool { return r <= ' ' })
+	s := withoutUserinfo(raw)
+	if i := strings.IndexAny(s, "?#"); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+func withoutUserinfo(raw string) string {
+	s := browserTrim(raw)
 
 	afterScheme := schemeLen(s)
 	start := afterScheme
@@ -409,6 +493,18 @@ func PublicURL(raw string) string {
 		prefix += "["
 	}
 	return prefix + s[cut:]
+}
+
+// browserTrim drops what a browser drops from a URL before reading it: every
+// tab and newline, and leading spaces and control characters.
+func browserTrim(raw string) string {
+	s := strings.Map(func(r rune) rune {
+		if r == '\t' || r == '\n' || r == '\r' {
+			return -1
+		}
+		return r
+	}, raw)
+	return strings.TrimLeftFunc(s, func(r rune) bool { return r <= ' ' })
 }
 
 // indexOrLen returns the index of the first byte of s at or past from that is

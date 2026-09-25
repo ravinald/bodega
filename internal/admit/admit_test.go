@@ -454,3 +454,66 @@ func TestAdmitWarnsAboutAGroupOnADirectoryPlacedType(t *testing.T) {
 		t.Errorf("apt places per package, so its group is honored and needs no warning: %v", res.Warnings)
 	}
 }
+
+// An http(s) attestation_uri is handed to every caller in a redirect, so a
+// credential in one cannot be withheld without breaking the fetch. Admission
+// refuses it on every write path; a plain uri and an s3:// one, which bodega
+// reads with its own credentials, still pass.
+func TestAdmitRefusesACredentialInAnAttestationURI(t *testing.T) {
+	for uri, ok := range map[string]bool{
+		"https://attest-user:attest-secret@attest.example/e.json": false,
+		"https://attest-user@attest.example/e.json":               false,
+		"https://attest.example/e.json?token=attest-secret":       false,
+		"http://attest.example/e.json#attest-secret":              false,
+		"https://attest.example/e.json":                           true,
+		"s3://bucket/e.json":                                      true,
+	} {
+		pm := aptPkg("attested", "1.0")
+		pm.Versions[0].Metadata = map[string]string{manifest.MetaAttestationURI: uri}
+		res := Admit(t.Context(), nil, nil, &config.Config{}, pm, "")
+		if res.OK() != ok {
+			t.Errorf("Admit(attestation_uri %q).OK() = %v, want %v: %s", uri, res.OK(), ok, res.Reason)
+		}
+		if !ok && strings.Contains(res.Reason, "attest-secret") {
+			t.Errorf("the refusal echoes the secret it refused: %q", res.Reason)
+		}
+	}
+}
+
+// The apt index publishes an architecture, pool path or digest as written,
+// since cutting one renames an index or breaks a checksum, so admission
+// refuses a credential-bearing URL in any of them and names the key, never
+// the value.
+func TestAdmitRefusesACredentialInAnAptIdentityField(t *testing.T) {
+	for _, key := range []string{"Architecture", "_pool_path", "_md5", "_sha1", "_sha256"} {
+		for _, value := range []string{
+			"https://ident-user:ident-secret@ident.example/x",
+			"https://ident.example/x?token=ident-secret",
+			"https://ident.example/x#ident-secret",
+		} {
+			pm := aptPkg("probe", "1.0")
+			pm.Versions[0].Metadata = map[string]string{
+				"Architecture": "amd64",
+				"_pool_path":   "pool/main/p/probe/probe_1.0_amd64.deb",
+			}
+			pm.Versions[0].Metadata[key] = value
+			res := Admit(t.Context(), nil, nil, &config.Config{}, pm, "")
+			if res.OK() {
+				t.Errorf("Admit(metadata.%s %q) passed", key, value)
+			}
+			if strings.Contains(res.Reason, "ident-") {
+				t.Errorf("the refusal echoes the value it refused: %q", res.Reason)
+			}
+		}
+	}
+	pm := aptPkg("probe", "1.0")
+	pm.Versions[0].Metadata = map[string]string{
+		"Architecture": "amd64",
+		"_pool_path":   "pool/main/p/probe/probe_1.0_amd64.deb",
+		"_sha256":      strings.Repeat("ab", 32),
+		"Homepage":     "https://home.example/p?token=home-secret",
+	}
+	if res := Admit(t.Context(), nil, nil, &config.Config{}, pm, ""); !res.OK() {
+		t.Errorf("an ordinary apt entry was refused: %s", res.Reason)
+	}
+}

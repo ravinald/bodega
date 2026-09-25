@@ -184,3 +184,43 @@ func TestAttestation_S3URIFallsBackToTheTypeRule(t *testing.T) {
 		t.Errorf("status = %d, want 404", resp.StatusCode)
 	}
 }
+
+// The 302 is a different code path from the read routes' JSON: its Location
+// is the stored uri, so the metadata projection does nothing for it. A uri
+// carrying userinfo, a query or a fragment is answered without a redirect, and
+// neither the Location header nor the body names the secret.
+func TestAttestation_RedirectWithholdsCredentials(t *testing.T) {
+	for _, uri := range []string{
+		"https://attest-user:attest-secret@attest.example.com/e.json",
+		"https://attest-user@attest.example.com/e.json",
+		"https://attest.example.com/e.json?token=attest-secret",
+		"https://attest.example.com/e.json#attest-secret",
+		"http://attest.example.com/e.json?X-Amz-Signature=attest-secret",
+	} {
+		t.Run(uri, func(t *testing.T) {
+			ts := attestationServer(t, manifest.VersionEntry{
+				Version:  "1.0.0",
+				Metadata: map[string]string{server.MetaAttestationURI: uri},
+			})
+			client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+			resp, err := client.Get(ts.URL + "/api/v1/packages/npm/sample/1.0.0/attestation")
+			if err != nil {
+				t.Fatalf("GET: %v", err)
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			loc := resp.Header.Get("Location")
+			for _, sec := range []string{"attest-user", "attest-secret"} {
+				if strings.Contains(loc, sec) {
+					t.Errorf("Location hands %q to a caller with no token: %q", sec, loc)
+				}
+				if strings.Contains(string(body), sec) {
+					t.Errorf("body hands %q to a caller with no token: %s", sec, body)
+				}
+			}
+			if resp.StatusCode != http.StatusBadGateway {
+				t.Errorf("status = %d, want 502", resp.StatusCode)
+			}
+		})
+	}
+}
