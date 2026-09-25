@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/spf13/cobra"
 
@@ -37,7 +38,7 @@ The command is idempotent: running it against an existing bucket is safe.`,
 			}
 
 			fmt.Printf("Initializing bucket s3://%s in %s...\n", cfg.Bucket, cfg.Region)
-			if err := bos3.InitBucket(ctx, client.S3Client(), cfg.Bucket, cfg.Region); err != nil {
+			if err := bos3.InitBucket(ctx, client.S3Client(), os.Stdout, cfg.Bucket, cfg.Region); err != nil {
 				return err
 			}
 			fmt.Printf("\nBucket s3://%s is ready.\n", cfg.Bucket)

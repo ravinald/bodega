@@ -2,18 +2,22 @@ package s3
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 )
 
 // Client wraps the AWS S3 client with bootstrap-specific helpers.
@@ -269,51 +273,41 @@ func (c *Client) SyncDir(ctx context.Context, out io.Writer, localDir, keyPrefix
 	return uploaded, err
 }
 
-// isNotFound checks if an AWS error represents a 404 / NoSuchKey.
+// isNotFound reports whether err says the object is absent. The checks run
+// in order and the order is not interchangeable:
+//
+//   - NoSuchBucket answers false, and runs first because S3 reports a missing
+//     bucket with a 404 too. Checked by status alone, every key in a mistyped
+//     bucket reads as an absent object and the backend looks empty instead of
+//     misconfigured. GetObject does not model NoSuchBucket, so it arrives as a
+//     generic API error and is matched on its code as well as its type.
+//   - NoSuchKey is the modeled GetObject answer.
+//   - NotFound is HeadObject's: a HEAD response has no body, so its 404 never
+//     deserializes to NoSuchKey. For the same reason a HeadObject against a
+//     missing bucket is indistinguishable from a missing key here.
+//   - Any other response error carrying status 404.
 func isNotFound(err error) bool {
 	if err == nil {
 		return false
 	}
+	var nsb *types.NoSuchBucket
+	if errors.As(err, &nsb) {
+		return false
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode() == "NoSuchBucket" {
+		return false
+	}
 	var nsk *types.NoSuchKey
-	if ok := isErrorType(err, &nsk); ok {
+	if errors.As(err, &nsk) {
 		return true
 	}
-	// HeadObject returns a generic HTTP 404 that doesn't unwrap to NoSuchKey.
-	return strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "NoSuchKey")
-}
-
-// isErrorType is a type-assertion helper compatible with errors.As.
-func isErrorType(err error, target interface{}) bool {
-	switch t := target.(type) {
-	case **types.NoSuchKey:
-		var v *types.NoSuchKey
-		if ok := asError(err, &v); ok {
-			*t = v
-			return true
-		}
+	var nf *types.NotFound
+	if errors.As(err, &nf) {
+		return true
 	}
-	return false
-}
-
-func asError(err error, target interface{}) bool {
-	switch t := target.(type) {
-	case **types.NoSuchKey:
-		var nsk *types.NoSuchKey
-		for err != nil {
-			if v, ok := err.(*types.NoSuchKey); ok {
-				*t = v
-				_ = nsk
-				return true
-			}
-			type unwrapper interface{ Unwrap() error }
-			if u, ok := err.(unwrapper); ok {
-				err = u.Unwrap()
-			} else {
-				break
-			}
-		}
-	}
-	return false
+	var re *awshttp.ResponseError
+	return errors.As(err, &re) && re.HTTPStatusCode() == http.StatusNotFound
 }
 
 // humanBytesS3 is a copy of the builder helper to avoid a circular import.
