@@ -29,7 +29,10 @@ it needs several hosts, a real network between them, and several minutes.
 `48-freebsd-server` drives no client. It runs `internal/storage`'s own tests on
 `freebsd-server`, because the FreeBSD ACL and extended-attribute syscalls
 compile into no binary the Linux guests run: on ZFS and on a UFS memory disk
-mounted `-o acls`, each as an unprivileged user and as root.
+mounted `-o acls`, each as an unprivileged user and as root. It also runs
+`test/e2e/guest` on a ZFS dataset with `aclmode` and `aclinherit` set to
+`passthrough`, where it checks what a reader other than the owner can do with a
+published object rather than what its ACL says.
 
 ## Host requirements
 
@@ -65,7 +68,16 @@ target changed. It points `pkg` at the Linux server through the stanza
 end. Suite 48 ships an `internal/storage` test binary to `freebsd-server`,
 compiles a `sys/acl.h` probe with the base system's `cc`, and creates and
 destroys a swap-backed memory disk (`md48`, override with
-`E2E_FREEBSD_MD_UNIT`) under `/var/tmp/bodega-e2e-storage`.
+`E2E_FREEBSD_MD_UNIT`) under `/var/tmp/bodega-e2e-storage`. It also creates
+and destroys a ZFS dataset, `bodega-e2e-passthrough`, as a child of whichever
+dataset holds the storage root's parent (`/var/tmp` unless
+`E2E_FREEBSD_STORAGE_ROOT` moves it), so that parent has to be on ZFS. The
+suite creates the parent if it is missing, and blocks the passthrough cells
+rather than guessing a dataset when `zfs list` names none. The cells on that
+dataset read published objects as a scratch account, `bodega-e2e-deny`, which
+the suite creates with `pw useradd` and removes at the end. It removes a
+leftover account of that name only when the comment field marks it as the
+suite's; one that is not stays in place and fails the run.
 
 ## Running it
 
