@@ -160,7 +160,8 @@ func TestPypiWheelRefusalNamesTheIndexItWouldHaveRead(t *testing.T) {
 // a published manifest url follows. The GET takes no token, so a private index
 // configured with userinfo would otherwise hand its credential to any caller.
 // The username is asserted apart from the password because url.Redacted keeps
-// it, and the body is held to absence rather than to replacement wording.
+// it as user:xxxxx@, which a match on user@ misses. The body is held to
+// absence rather than to replacement wording.
 func TestPypiWheelRefusalCutsTheConfiguredCredential(t *testing.T) {
 	s := proxyingServer(t)
 	s.cfg.PypiUpstream = "https://user:secret@pypi.internal"
@@ -177,8 +178,11 @@ func TestPypiWheelRefusalCutsTheConfiguredCredential(t *testing.T) {
 	if strings.Contains(body, "secret") {
 		t.Errorf("anonymous refusal body carries the password from pypi_upstream: %q", body)
 	}
-	if strings.Contains(body, "user@") {
+	if strings.Contains(body, "user") {
 		t.Errorf("anonymous refusal body carries the username from pypi_upstream: %q", body)
+	}
+	if strings.Contains(body, "@") {
+		t.Errorf("anonymous refusal body carries a userinfo component: %q", body)
 	}
 	if !strings.Contains(body, "pypi.internal") {
 		t.Errorf("refusal no longer names the index host: %q", body)
