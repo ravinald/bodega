@@ -12,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/ravinald/bodega/internal/storage"
 )
@@ -248,4 +249,110 @@ func TestZFSPassthroughPublishedDenyEntryDeniesItsPrincipal(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "Permission denied") {
 		t.Errorf("%s's read of %s failed as %v; want the kernel's Permission denied", who.name, deniedPath, err)
 	}
+}
+
+// A replacement's body sits in a staging file inside an enclosure for as long
+// as the write takes, and nothing but the server may reach it there. Under
+// aclmode=passthrough a chmod keeps what the storage root's inheritable
+// entries handed the enclosure and the file, so the principal those entries
+// name could read the body mid-write, even with the object being replaced
+// denying it. The write is held open on a FIFO so the read lands during it.
+//
+// Two reads, because the enclosure refusing traversal would hide a staging
+// file that still granted the read: the second grants the principal
+// traversal of the enclosure, as its owner, and reads again. The control
+// object beside the one being replaced is readable by the same principal
+// under the same inherited grant, so a refusal here is the strip and not the
+// path.
+func TestZFSPassthroughStagingFileIsNotReadableDuringTheWrite(t *testing.T) {
+	requireZFSACL(t, "passthrough", "passthrough")
+	who := lookupPrincipal(t)
+	root := storeRoot(t)
+	setfacl(t, root, "-a0", fmt.Sprintf("user:%d:rx:fd:allow", who.uid))
+
+	store := storage.NewLocal(root)
+	const key, control = "pool/obj", "pool/control"
+	for _, k := range []string{key, control} {
+		if err := store.Put(context.Background(), k, []byte("first body\n")); err != nil {
+			t.Fatalf("Put %s (fresh): %v", k, err)
+		}
+	}
+	obj := filepath.Join(root, filepath.FromSlash(key))
+	setfacl(t, obj, "-a0", fmt.Sprintf("user:%d:r::deny", who.uid))
+	if _, err := readAs(who, filepath.Join(root, filepath.FromSlash(control))); err != nil {
+		t.Fatalf("%s cannot read the control object (%v), so a refused read below would prove nothing about the staging file", who.name, err)
+	}
+
+	fifo := filepath.Join(t.TempDir(), "body")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatalf("mkfifo %s: %v", fifo, err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- store.PutFile(context.Background(), fifo, key) }()
+	w, err := os.OpenFile(fifo, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open %s for writing: %v", fifo, err)
+	}
+	defer w.Close()
+	body := []byte("SECRET REPLACEMENT BODY\n")
+	if _, err := w.Write(body); err != nil {
+		t.Fatalf("write %s: %v", fifo, err)
+	}
+
+	staged := waitForStaged(t, filepath.Dir(obj), len(body), done)
+	enclosure := filepath.Dir(staged)
+	if got, err := readAs(who, staged); err == nil {
+		t.Errorf("%s read %q from %s during the write", who.name, got, staged)
+	} else if !strings.Contains(err.Error(), "Permission denied") {
+		t.Errorf("%s's read of %s failed as %v; want the kernel's Permission denied", who.name, staged, err)
+	}
+	for _, p := range []string{enclosure, staged} {
+		if got := entriesFor(t, p, who.uid); len(got) != 0 {
+			t.Errorf("%s carries %v for %s during the write; want nothing inherited from %s", p, got, who.name, root)
+		}
+	}
+	setfacl(t, enclosure, "-a0", fmt.Sprintf("user:%d:x::allow", who.uid))
+	if got, err := readAs(who, staged); err == nil {
+		t.Errorf("%s read %q from %s once let through the enclosure; the staging file itself grants it", who.name, got, staged)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("close %s: %v", fifo, err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("PutFile (replacement): %v", err)
+	}
+	if got, err := os.ReadFile(obj); err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("the published object reads %q (%v), want %q", got, err, body)
+	}
+	if got, err := readAs(who, obj); err == nil {
+		t.Errorf("%s read %q from the published object, whose ACL denies it", who.name, got)
+	}
+}
+
+// waitForStaged returns the staging file a replacement in dir is being
+// written to, once it holds size bytes. It fails if the write ends first,
+// because then nothing was read during it.
+func waitForStaged(t *testing.T, dir string, size int, done <-chan error) string {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-done:
+			t.Fatalf("PutFile returned (%v) while its source was still open", err)
+		default:
+		}
+		matches, err := filepath.Glob(filepath.Join(dir, ".bodega-tmp-*", ".bodega-tmp-*"))
+		if err != nil {
+			t.Fatalf("glob: %v", err)
+		}
+		for _, m := range matches {
+			if fi, err := os.Stat(m); err == nil && fi.Size() >= int64(size) {
+				return m
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("no staging file under %s reached %d bytes within 10s", dir, size)
+	return ""
 }

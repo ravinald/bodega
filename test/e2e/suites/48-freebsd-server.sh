@@ -7,16 +7,18 @@
 # against a reading of the interface rather than against the interface. This
 # suite ships the package's test binary to freebsd-server and runs the tests in
 # internal/storage/guest_freebsd_test.go, plus the two publication tests that
-# set a FreeBSD ACL, in four cells:
+# set a FreeBSD ACL, in six cells:
 #
 #   ZFS (the guest's root, NFSv4 ACLs)        x  an unprivileged user and root
 #   UFS on a memory disk mounted -o acls      x  an unprivileged user and root
+#   UFS on a second memory disk, no ACLs      x  an unprivileged user and root
 #
 # Both filesystems because each keeps a different ACL type and each reaches a
 # different branch of clearACL and listXattr. Both users because the system
 # extended-attribute namespace needs PRIV_VFS_EXTATTR_SYSTEM: the unprivileged
 # cell is the one where listXattr skips EPERM, and the root cell is the only
 # one where UFS lists an ACL as system.posix1e.* for aclXattrs to leave out.
+# The no-ACL disk is where clearACL has nothing to read back, and refuses.
 #
 # A skipped test is a FAIL here. The guest tests fail rather than skip when the
 # filesystem is not the one named, and a test that went missing from the run
@@ -25,12 +27,13 @@
 # Two more cells run test/e2e/guest on a scratch ZFS dataset created with
 # aclmode=passthrough and aclinherit=passthrough, again as the user and as
 # root: a named entry inherited from a parent directory survives publication,
-# and a published deny entry denies a read made as the principal it names. The
-# guest's own datasets carry the defaults, discard and restricted, under which
-# neither was ever driven.
+# a published deny entry denies a read made as the principal it names, and a
+# replacement's staging file refuses that principal for as long as the write
+# is open. The guest's own datasets carry the defaults, discard and
+# restricted, under which none of the three was ever driven.
 #
-# This suite mutates freebsd-server: it creates and destroys a swap-backed
-# memory disk, a ZFS dataset and a user account, and writes under /var/tmp.
+# This suite mutates freebsd-server: it creates and destroys two swap-backed
+# memory disks, a ZFS dataset and a user account, and writes under /var/tmp.
 # It checks that all three are gone.
 
 # shellcheck source=../lib/assert.sh
@@ -54,6 +57,7 @@ fi
 # on the filesystem it names, and the Go test refuses one that is not ZFS.
 FSRV_ROOT="${E2E_FREEBSD_STORAGE_ROOT:-/var/tmp/bodega-e2e-storage}"
 FSRV_MD="${E2E_FREEBSD_MD_UNIT:-48}"
+FSRV_MD_NOACL=$((FSRV_MD + 1))
 FSRV_BIN="$REPO_ROOT/dist/storage-freebsd-arm64.test"
 FSRV_GUEST_BIN="$REPO_ROOT/dist/guest-freebsd-arm64.test"
 
@@ -61,7 +65,7 @@ FSRV_GUEST_BIN="$REPO_ROOT/dist/guest-freebsd-arm64.test"
 FSRV_TESTS=(
 	TestFreeBSDGuestStructACLMatchesSysACLH
 	TestFreeBSDGuestKernelTakesTheStructACLThisPackageBuilds
-	TestFreeBSDGuestClearACLToleratesEINVALOnlyWhereNoPOSIX1eIsKept
+	TestFreeBSDGuestClearACLStripsWithoutAChmod
 	TestFreeBSDGuestRestrictStagedLeavesNoNamedEntry
 	TestFreeBSDGuestExtattrListIsLengthPrefixedAndUnqualified
 	TestFreeBSDGuestListXattrLeavesTheACLToTheACLCalls
@@ -71,6 +75,10 @@ FSRV_TESTS=(
 FSRV_PT_TESTS=(
 	TestZFSPassthroughPublishKeepsANamedInheritedEntry
 	TestZFSPassthroughPublishedDenyEntryDeniesItsPrincipal
+	TestZFSPassthroughStagingFileIsNotReadableDuringTheWrite
+)
+FSRV_NOACL_TESTS=(
+	TestFreeBSDGuestNoACLFilesystemRefusesAReplacement
 )
 
 # The passthrough cells grant and deny a scratch account the suite creates and
@@ -134,13 +142,20 @@ fi
 # newfs below formats this run's disk and not a stale mount under it.
 e2e_on freebsd-server "$fsrv_pt_stale \
 	sudo umount '$FSRV_ROOT/ufs' 2>/dev/null; sudo mdconfig -d -u $FSRV_MD 2>/dev/null; \
-	sudo rm -rf '$FSRV_ROOT' && sudo mkdir -p '$FSRV_ROOT/zfs' '$FSRV_ROOT/ufs' && \
+	sudo umount '$FSRV_ROOT/ufsnoacl' 2>/dev/null; sudo mdconfig -d -u $FSRV_MD_NOACL 2>/dev/null; \
+	sudo rm -rf '$FSRV_ROOT' && sudo mkdir -p '$FSRV_ROOT/zfs' '$FSRV_ROOT/ufs' '$FSRV_ROOT/ufsnoacl' && \
 	sudo mdconfig -a -t swap -s 64m -u $FSRV_MD && sudo newfs -U /dev/md$FSRV_MD >/dev/null && \
 	sudo mount -o acls /dev/md$FSRV_MD '$FSRV_ROOT/ufs' && \
 	sudo chown \"\$(id -un)\" '$FSRV_ROOT' '$FSRV_ROOT/zfs' '$FSRV_ROOT/ufs' && \
 	mount -p | awk -v m='$FSRV_ROOT/ufs' '\$2 == m {print \$3, \$4}'" || true
 check_eq FSRV-02 "a UFS memory disk is mounted with POSIX.1e ACLs" "ufs rw,acls" "$E2E_OUT" \
 	"test/e2e/suites/48-freebsd-server.sh" "mdconfig -a -t swap; newfs -U; mount -o acls" "$E2E_RC"
+
+e2e_on freebsd-server "sudo mdconfig -a -t swap -s 32m -u $FSRV_MD_NOACL && sudo newfs -U /dev/md$FSRV_MD_NOACL >/dev/null && \
+	sudo mount /dev/md$FSRV_MD_NOACL '$FSRV_ROOT/ufsnoacl' && sudo chown \"\$(id -un)\" '$FSRV_ROOT/ufsnoacl' && \
+	mount -p | awk -v m='$FSRV_ROOT/ufsnoacl' '\$2 == m {print \$3, \$4}'" || true
+check_eq FSRV-11 "a second UFS memory disk is mounted with no ACLs" "ufs rw" "$E2E_OUT" \
+	"test/e2e/suites/48-freebsd-server.sh" "mdconfig -a -t swap; newfs -U; mount" "$E2E_RC"
 
 if [ -n "$FSRV_PT_DATASET" ]; then
 	e2e_on freebsd-server "sudo zfs create -o aclmode=passthrough -o aclinherit=passthrough \
@@ -223,6 +238,9 @@ for fs in zfs ufs; do
 		fsrv_cell "$fs" "$who" storage.test "$FSRV_ROOT/$fs" "BODEGA_FREEBSD_GUEST_FS=$fs" "${FSRV_TESTS[@]}"
 	done
 done
+for who in user root; do
+	fsrv_cell ufsnoacl "$who" storage.test "$FSRV_ROOT/ufsnoacl" "BODEGA_FREEBSD_GUEST_FS=ufs-noacl" "${FSRV_NOACL_TESTS[@]}"
+done
 if [ -n "$FSRV_PT_DATASET" ]; then
 	for who in user root; do
 		fsrv_cell zfspt "$who" guest.test "$FSRV_PT_MNT" "BODEGA_FREEBSD_GUEST_ZFS_ACL=passthrough/passthrough BODEGA_FREEBSD_GUEST_PRINCIPAL=$FSRV_PRINCIPAL" "${FSRV_PT_TESTS[@]}"
@@ -244,9 +262,10 @@ if [ -n "$FSRV_PT_DATASET" ]; then
 	check_eq FSRV-10 "the scratch account is removed again" "gone" "$E2E_OUT" \
 		"test/e2e/suites/48-freebsd-server.sh" "pw userdel -n $FSRV_PRINCIPAL" "$E2E_RC"
 fi
-e2e_on freebsd-server "sudo umount '$FSRV_ROOT/ufs'; sudo mdconfig -d -u $FSRV_MD; sudo rm -rf '$FSRV_ROOT'; \
-	sudo mdconfig -l | awk -v u=md$FSRV_MD '{for (i = 1; i <= NF; i++) if (\$i == u) f = 1} END {print (f ? \"present\" : \"gone\")}'" || true
-check_eq FSRV-05 "the memory disk is destroyed again" "gone" "$E2E_OUT" \
-	"test/e2e/suites/48-freebsd-server.sh" "umount; mdconfig -d -u $FSRV_MD; mdconfig -l" "$E2E_RC"
+e2e_on freebsd-server "sudo umount '$FSRV_ROOT/ufs'; sudo mdconfig -d -u $FSRV_MD; \
+	sudo umount '$FSRV_ROOT/ufsnoacl'; sudo mdconfig -d -u $FSRV_MD_NOACL; sudo rm -rf '$FSRV_ROOT'; \
+	sudo mdconfig -l | awk -v u=md$FSRV_MD -v v=md$FSRV_MD_NOACL '{for (i = 1; i <= NF; i++) if (\$i == u || \$i == v) f = 1} END {print (f ? \"present\" : \"gone\")}'" || true
+check_eq FSRV-05 "both memory disks are destroyed again" "gone" "$E2E_OUT" \
+	"test/e2e/suites/48-freebsd-server.sh" "umount; mdconfig -d -u $FSRV_MD; mdconfig -d -u $FSRV_MD_NOACL; mdconfig -l" "$E2E_RC"
 
-unset FSRV_PRINCIPAL FSRV_PRINCIPAL_MARK fsrv_principal_drop FSRV_ROOT FSRV_MD FSRV_BIN FSRV_GUEST_BIN FSRV_TESTS FSRV_PT_TESTS FSRV_PT_DATASET FSRV_PT_MNT fsrv_pt_stale fsrv_pt_err fsrv_pt_rc fsrv_build_rc fsrv_guest_rc
+unset FSRV_PRINCIPAL FSRV_PRINCIPAL_MARK fsrv_principal_drop FSRV_ROOT FSRV_MD FSRV_MD_NOACL FSRV_BIN FSRV_GUEST_BIN FSRV_TESTS FSRV_PT_TESTS FSRV_NOACL_TESTS FSRV_PT_DATASET FSRV_PT_MNT fsrv_pt_stale fsrv_pt_err fsrv_pt_rc fsrv_build_rc fsrv_guest_rc

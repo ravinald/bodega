@@ -56,6 +56,25 @@ const (
 	entryDeny  = 0x0200 // ACL_ENTRY_TYPE_DENY
 	entryAudit = 0x0400 // ACL_ENTRY_TYPE_AUDIT
 	entryAlarm = 0x0800 // ACL_ENTRY_TYPE_ALARM
+
+	// NFSv4 ae_perm bits a trivial ACL uses.
+	nfs4Execute         = 0x0001 // ACL_EXECUTE
+	nfs4ReadData        = 0x0008 // ACL_READ_DATA
+	nfs4WriteData       = 0x0010 // ACL_WRITE_DATA
+	nfs4AppendData      = 0x0020 // ACL_APPEND_DATA
+	nfs4ReadNamedAttrs  = 0x0040 // ACL_READ_NAMED_ATTRS
+	nfs4WriteNamedAttrs = 0x0080 // ACL_WRITE_NAMED_ATTRS
+	nfs4ReadAttributes  = 0x0200 // ACL_READ_ATTRIBUTES
+	nfs4WriteAttributes = 0x0400 // ACL_WRITE_ATTRIBUTES
+	nfs4ReadACL         = 0x1000 // ACL_READ_ACL
+	nfs4WriteACL        = 0x2000 // ACL_WRITE_ACL
+	nfs4WriteOwner      = 0x4000 // ACL_WRITE_OWNER
+	nfs4Synchronize     = 0x8000 // ACL_SYNCHRONIZE
+
+	// ACL_ENTRY_FILE_INHERIT through ACL_ENTRY_INHERIT_ONLY, and
+	// ACL_ENTRY_INHERITED: every ae_flags bit that says an entry came from a
+	// parent or will go to a child.
+	nfs4InheritFlags = 0x000F | 0x0080
 )
 
 // blankACL is a struct acl sized for the kernel to copy one out into.
@@ -83,6 +102,56 @@ func minimalACL(mode uint32) []byte {
 		binary.NativeEndian.PutUint32(acl[off+8:off+12], e.perm)
 	}
 	return acl
+}
+
+// trivialNFS4ACL is the NFSv4 ACL equivalent to a set of mode bits, in the
+// three-entry form FreeBSD's kernel and ZFS write for a file whose ACL is its
+// mode: owner@, group@ and everyone@, each an allow, nothing named and nothing
+// inherited. Every entry may read the attributes and the ACL; the owner may
+// also write them, as chmod and chown already let it.
+func trivialNFS4ACL(mode uint32) []byte {
+	acl := blankACL()
+	binary.NativeEndian.PutUint32(acl[4:8], 3)
+	const always = nfs4ReadAttributes | nfs4ReadNamedAttrs | nfs4ReadACL | nfs4Synchronize
+	const owner = nfs4WriteAttributes | nfs4WriteNamedAttrs | nfs4WriteACL | nfs4WriteOwner
+	for i, e := range [...]struct{ tag, triad, extra uint32 }{
+		{tagUserObj, (mode >> 6) & 7, always | owner},
+		{tagGroupObj, (mode >> 3) & 7, always},
+		{tagEveryone, mode & 7, always},
+	} {
+		perm := e.extra
+		if e.triad&4 != 0 {
+			perm |= nfs4ReadData
+		}
+		if e.triad&2 != 0 {
+			perm |= nfs4WriteData | nfs4AppendData
+		}
+		if e.triad&1 != 0 {
+			perm |= nfs4Execute
+		}
+		off := aclEntryStart + i*aclEntrySize
+		binary.NativeEndian.PutUint32(acl[off:off+4], e.tag)
+		binary.NativeEndian.PutUint32(acl[off+4:off+8], undefinedID)
+		binary.NativeEndian.PutUint32(acl[off+8:off+12], perm)
+		binary.NativeEndian.PutUint16(acl[off+12:off+14], entryAllow)
+	}
+	return acl
+}
+
+// grantBeyondMode returns the first entry of acl that grants or denies past
+// what the mode bits say: one naming a user or group, or one carrying an
+// inheritance flag. A struct acl that has none is the mode and nothing else.
+func grantBeyondMode(acl []byte) (int, bool) {
+	cnt := min(binary.NativeEndian.Uint32(acl[4:8]), aclMaxEntries)
+	for i := range int(cnt) {
+		off := aclEntryStart + i*aclEntrySize
+		tag := binary.NativeEndian.Uint32(acl[off : off+4])       //nolint:gosec // G602: cnt is at most aclMaxEntries, and blankACL sizes every struct acl for that many.
+		flags := binary.NativeEndian.Uint16(acl[off+14 : off+16]) //nolint:gosec // G602: as above.
+		if tag == tagUser || tag == tagGroup || flags&nfs4InheritFlags != 0 {
+			return i, true
+		}
+	}
+	return 0, false
 }
 
 // aclTypeFor names the one ACL type a filesystem keeps, from its answers to
