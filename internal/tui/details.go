@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/ravinald/bodega/internal/aptsign"
 	"github.com/ravinald/bodega/internal/aptsources"
+	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -608,13 +609,24 @@ func clientURL(cfg *config.Config, store *manifest.Store, entryType, name, pkgFi
 		if err != nil || pm == nil || len(pm.Versions) == 0 {
 			return ""
 		}
-		ve := pm.Versions[0]
-		fn := ve.Filename
-		if fn == "" && ve.URL != "" {
-			parts := strings.Split(ve.URL, "/")
-			fn = parts[len(parts)-1]
+		// The link is the download alias the read API publishes, keyed by
+		// the server's token pepper, so the TUI and the web UI print the same
+		// link and it stays bound to this entry. A host that cannot read the
+		// pepper gets the stored name only when the route serves it from this
+		// entry's own backend, and no link otherwise.
+		var key []byte
+		if pst, err := audit.ResolvePepper(audit.DefaultPepperPaths); err == nil {
+			key = []byte(pst.Pepper)
 		}
-		return fmt.Sprintf("%s/binaries/%s/%s/%s", base, pm.Name, ve.Version, fn)
+		var typeBackend string
+		if cfg != nil {
+			typeBackend = cfg.StorageByType[manifest.TypeBinary]
+		}
+		p, ok := pm.BinaryLinkName(key, typeBackend, 0)
+		if !ok {
+			return ""
+		}
+		return base + "/binaries/" + p
 	case manifest.TypePypi:
 		return fmt.Sprintf("pip install --index-url %s/pypi/simple/ %s", base, name)
 	case manifest.TypeGomod:

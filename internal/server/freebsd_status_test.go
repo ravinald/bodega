@@ -120,6 +120,9 @@ func TestFreeBSDStatusRendersAGeneratedRepositoryAgainstBodegasKey(t *testing.T)
 // no trust store anybody can name. See
 // TestFreeBSDStatusStillServesTheEntryItRefusesToConfigure for the half that
 // keeps a later pass from closing the gap at the route.
+//
+// The reason is the admin caller's. TestFreeBSDStatusWithholdsARefusalFromAnonymousCallers
+// covers what everyone else sees.
 func TestFreeBSDStatusReportsARefusedEntryRatherThanDroppingIt(t *testing.T) {
 	for _, tc := range []struct {
 		repo  string
@@ -140,7 +143,7 @@ func TestFreeBSDStatusReportsARefusedEntryRatherThanDroppingIt(t *testing.T) {
 			s.cfg.PublicURL = "https://bodega.internal"
 			addVersion(t, s, manifest.TypeFreeBSD, tc.repo, tc.entry)
 
-			st := statusFreeBSD(t, s)
+			st := statusFreeBSDFrom(t, s, adminCaller(t, s))
 			if len(st.Repos) != 0 {
 				t.Fatalf("a contradictory entry rendered a configuration: %+v", st.Repos)
 			}
@@ -153,6 +156,49 @@ func TestFreeBSDStatusReportsARefusedEntryRatherThanDroppingIt(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// adminCaller admits one address through admin_permit_cidr and returns it as a
+// RemoteAddr.
+func adminCaller(t *testing.T, s *Server) string {
+	t.Helper()
+	_, admin, err := net.ParseCIDR("198.51.100.7/32")
+	if err != nil {
+		t.Fatalf("parse the admin cidr: %v", err)
+	}
+	s.adminNets = []*net.IPNet{admin}
+	s.refreshACLs(context.Background())
+	return "198.51.100.7:40000"
+}
+
+// A refusal quotes the entry's url, and a url may carry the credential its
+// upstream wants, so the reason reaches an admin caller alone. repo and abi
+// stay public: without them a client cannot tell a refused repository from an
+// absent one.
+func TestFreeBSDStatusWithholdsARefusalFromAnonymousCallers(t *testing.T) {
+	s := hostedServer(t)
+	s.cfg.PublicURL = "https://bodega.internal"
+	addVersion(t, s, manifest.TypeFreeBSD, "muddle", manifest.VersionEntry{
+		Version: "FreeBSD:14:amd64", Generated: true,
+		URL: "https://audit-user:audit-secret@private-upstream.example/" + freeBSDABI + "/latest",
+	})
+	adminAddr := adminCaller(t, s)
+
+	anon := statusFreeBSDFrom(t, s, "203.0.113.9:40000")
+	if len(anon.Refused) != 1 || anon.Refused[0].Repo != "muddle" || anon.Refused[0].ABI != "FreeBSD:14:amd64" {
+		t.Fatalf("Refused = %+v for a non-admin caller, want one row naming muddle@FreeBSD:14:amd64", anon.Refused)
+	}
+	if leaked := withheldFrom(anon.Refused[0].Error, "audit-secret"); leaked != "" {
+		t.Errorf("refused[].error hands a caller with no token the url's password: %q", anon.Refused[0].Error)
+	}
+	if leaked := withheldFrom(anon.Refused[0].Error, "audit-user"); leaked != "" {
+		t.Errorf("refused[].error hands a caller with no token the url's username: %q", anon.Refused[0].Error)
+	}
+
+	admin := statusFreeBSDFrom(t, s, adminAddr)
+	if len(admin.Refused) != 1 || !strings.Contains(admin.Refused[0].Error, "generated") {
+		t.Errorf("Refused = %+v for an admin caller, want the reason naming the field to change", admin.Refused)
 	}
 }
 

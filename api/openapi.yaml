@@ -936,6 +936,10 @@ components:
           type: string
         url:
           type: string
+          description: >-
+            The upstream this version is fetched from. Published without its
+            userinfo, username included, to every caller whatever its
+            address or token; the stored manifest keeps it.
         mode:
           type: string
           enum: [hosted, proxy]
@@ -976,7 +980,18 @@ components:
             than one copied from upstream.
         filename:
           type: string
-          description: Binary filename override
+          description: >-
+            Binary filename override. On the read routes, every binary entry
+            is published with a download alias instead, `~/<tag>/<display>`,
+            which carries no userinfo;
+            `/binaries/{name}/{version}/~/<tag>/<display>` serves that
+            entry's stored object from the backend it records, or 404 once
+            the entry is gone or has moved backend, or the server's pepper
+            has changed. A server with no pepper publishes every binary
+            entry as the withheld alias,
+            `~/00000000000000000000000000000000/<display>`, which answers 404:
+            read it as no download link published. A request for a stored
+            name is still served from the first entry of its version.
         sha256:
           type: string
           description: Expected SHA-256 for binary downloads
@@ -1424,6 +1439,11 @@ components:
                 type: string
               error:
                 type: string
+                description: >-
+                  Why the entry was refused. It quotes the entry's `url`,
+                  which may carry upstream credentials, so it is empty for a
+                  caller outside `admin_permit_cidr`. `repo` and `abi` answer
+                  everyone.
 
     FreeBSDRepo:
       type: object
