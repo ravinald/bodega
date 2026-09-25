@@ -48,13 +48,16 @@ type Client struct {
 	region string
 }
 
-// NewClient creates an S3 Client using the default credential chain.
+// NewClient creates an S3 Client using the default credential chain. An
+// empty region is left to that chain (AWS_REGION, AWS_DEFAULT_REGION, the
+// profile's region), and Region reports what it resolved to, which may still
+// be empty.
 func NewClient(ctx context.Context, bucket, region string) (*Client, error) {
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
 		return nil, fmt.Errorf("load AWS config: %w", err)
 	}
-	return NewClientFromConfig(cfg, bucket, region), nil
+	return NewClientFromConfig(cfg, bucket, cfg.Region), nil
 }
 
 // NewClientFromConfig returns an S3 Client from a pre-built aws.Config.
@@ -74,6 +77,9 @@ func (c *Client) S3Client() *awss3.Client { return c.raw }
 
 // Bucket returns the configured bucket name.
 func (c *Client) Bucket() string { return c.bucket }
+
+// Region returns the region the client dials.
+func (c *Client) Region() string { return c.region }
 
 // ObjectStatus describes whether a key exists in S3.
 type ObjectStatus struct {

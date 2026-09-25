@@ -1,20 +1,25 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/manifest"
 	bos3 "github.com/ravinald/bodega/internal/s3"
+	"github.com/ravinald/bodega/internal/storage"
 )
 
-// s3Target is the one s3 backend an init verb acts on.
+// s3Target is the one s3 backend an init verb acts on. region is as
+// configured and may be empty; dialS3Target reports the one the SDK resolves.
 type s3Target struct {
 	name   string
 	bucket string
@@ -23,33 +28,27 @@ type s3Target struct {
 }
 
 // resolveS3Target names the backend an init verb reaches: the default one, or
-// a storage_backends entry. It refuses a backend whose driver is not s3 rather
-// than falling back to the bucket key, which an install on the local driver
-// may still carry, so init never dials AWS for a backend that stores nothing
-// there.
+// a storage_backends entry, read through the same storage.SpecFor the
+// service's resolver builds its stores from. It refuses a backend whose driver
+// is not s3 rather than falling back to the bucket key, which an install on
+// the local driver may still carry, so init never dials AWS for a backend that
+// stores nothing there.
 func resolveS3Target(cfg *config.Config, args []string) (s3Target, error) {
 	name := config.DefaultStorageName
 	if len(args) > 0 {
 		name = args[0]
 	}
-	var t s3Target
-	var driver string
-	if name == config.DefaultStorageName {
-		driver = cfg.StorageBackend
-		t = s3Target{name: name, bucket: cfg.Bucket, region: cfg.Region}
-	} else {
-		spec, ok := cfg.StorageBackends[name]
-		if !ok {
-			names := []string{config.DefaultStorageName}
-			for n := range cfg.StorageBackends {
-				names = append(names, n)
-			}
-			sort.Strings(names[1:])
-			return t, fmt.Errorf("unknown storage backend %q (configured: %s)", name, strings.Join(names, ", "))
+	spec, ok := storage.SpecFor(cfg, name)
+	if !ok {
+		names := []string{config.DefaultStorageName}
+		for n := range cfg.StorageBackends {
+			names = append(names, n)
 		}
-		driver = spec.Driver
-		t = s3Target{name: name, bucket: spec.Bucket, region: spec.Region, prefix: spec.Prefix}
+		sort.Strings(names[1:])
+		return s3Target{}, fmt.Errorf("unknown storage backend %q (configured: %s)", name, strings.Join(names, ", "))
 	}
+	t := s3Target{name: name, bucket: spec.Bucket, region: spec.Region, prefix: spec.Prefix}
+	driver := spec.Driver
 	if driver == "" {
 		driver = "local"
 	}
@@ -63,10 +62,24 @@ func resolveS3Target(cfg *config.Config, args []string) (s3Target, error) {
 		}
 		return t, fmt.Errorf("storage_backends[%q] uses the s3 driver and names no bucket; add \"bucket\" to that entry", name)
 	}
-	if t.region == "" {
-		t.region = cfg.Region // defaulted at load
-	}
 	return t, nil
+}
+
+// dialS3Target builds the client the service would build for t, through the
+// same bos3.NewClient call, so an entry with no region resolves through the
+// SDK's chain here exactly as it does there. It refuses when that chain names
+// no region, because every call would fail, in the service as well.
+func dialS3Target(ctx context.Context, t s3Target) (*bos3.Client, error) {
+	client, err := bos3.NewClient(ctx, t.bucket, t.region)
+	if err != nil {
+		return nil, fmt.Errorf("storage backend %q: %w", t.name, err)
+	}
+	if client.Region() == "" {
+		return nil, fmt.Errorf("storage backend %q has no AWS region: storage_backends[%q] sets no \"region\", and neither AWS_REGION, "+
+			"AWS_DEFAULT_REGION nor the AWS profile names one, so the service could not reach s3://%s either; add \"region\" to that entry",
+			t.name, t.name, t.bucket)
+	}
+	return client, nil
 }
 
 func newInitCmd(gf *globalFlags) *cobra.Command {
@@ -117,21 +130,20 @@ AWS_PROFILE and the shared config, SSO, or an instance role.`, bos3.AbortIncompl
 			if err != nil {
 				return err
 			}
-			if printPolicy != "" {
-				return printPolicies(cmd.OutOrStdout(), target, printPolicy)
-			}
-
 			ctx := backgroundCtx()
-			client, err := bos3.NewClient(ctx, target.bucket, target.region)
+			client, err := dialS3Target(ctx, target)
 			if err != nil {
-				return fmt.Errorf("connect to AWS: %w", err)
+				return err
+			}
+			if printPolicy != "" {
+				return printPolicies(cmd.OutOrStdout(), target, client.Region(), printPolicy)
 			}
 
-			fmt.Printf("Initializing bucket s3://%s in %s (backend %q)...\n", target.bucket, target.region, target.name)
+			fmt.Printf("Initializing bucket s3://%s in %s (backend %q)...\n", target.bucket, client.Region(), target.name)
 			if target.prefix != "" {
 				fmt.Printf("  prefix:     %s is not applied; markers and lifecycle rules sit at the bucket root\n", target.prefix)
 			}
-			if err := bos3.InitBucket(ctx, client.S3Client(), os.Stdout, target.bucket, target.region); err != nil {
+			if err := bos3.InitBucket(ctx, client.S3Client(), os.Stdout, target.bucket, client.Region()); err != nil {
 				return err
 			}
 			fmt.Printf("\nBucket s3://%s is ready.\n", target.bucket)
@@ -148,12 +160,12 @@ AWS_PROFILE and the shared config, SSO, or an instance role.`, bos3.AbortIncompl
 // printPolicies writes the requested policy documents. One policy prints as
 // bare JSON so it can be redirected into a file an IAM tool reads; both print
 // with a line naming who each is for.
-func printPolicies(w io.Writer, t s3Target, which string) error {
-	setup, err := bos3.SetupPolicy(t.bucket, t.region)
+func printPolicies(w io.Writer, t s3Target, region, which string) error {
+	setup, err := bos3.SetupPolicy(t.bucket, region)
 	if err != nil {
 		return err
 	}
-	runtime, err := bos3.RuntimePolicy(t.bucket, t.region)
+	runtime, err := bos3.RuntimePolicy(t.bucket, region)
 	if err != nil {
 		return err
 	}
@@ -185,7 +197,7 @@ func writePolicy(w io.Writer, p bos3.Policy) error {
 func newInitCheckCmd(gf *globalFlags) *cobra.Command {
 	return &cobra.Command{
 		Use:   "check [backend]",
-		Short: "Check that the current AWS credentials can run bodega against an s3 backend",
+		Short: "Check which runtime-policy actions the current AWS credentials hold on an s3 backend",
 		Long: `check asks the bucket whether the credentials the AWS default chain resolves
 hold what the runtime policy grants, and names each action the API refused.
 It changes nothing, so it runs under credentials that cannot write.
@@ -193,7 +205,9 @@ It changes nothing, so it runs under credentials that cannot write.
 Listing and reading are probed directly. Writing is probed with a conditional
 PUT against the empty manifests/ marker, which S3 authorizes and then refuses
 without storing anything. Deleting cannot be proven without deleting, so it is
-reported as not checked.
+reported as not checked. With nothing refused, the last line names what was
+allowed and what was not checked; without the manifests/ marker, writing is
+among the not checked.
 
 Only a refusal the API returned counts. A policy attached in the last few
 seconds may not have propagated yet: re-run once before changing it.`,
@@ -210,25 +224,37 @@ seconds may not have propagated yet: re-run once before changing it.`,
 				return err
 			}
 			ctx := backgroundCtx()
-			client, err := bos3.NewClient(ctx, target.bucket, target.region)
-			if err != nil {
-				return fmt.Errorf("connect to AWS: %w", err)
-			}
-
-			out := cmd.OutOrStdout()
-			fmt.Fprintf(out, "Checking s3://%s in %s (backend %q) with the current AWS credentials...\n", target.bucket, target.region, target.name)
-			missing, err := bos3.CheckAccess(ctx, client.S3Client(), out, target.bucket, target.region)
+			client, err := dialS3Target(ctx, target)
 			if err != nil {
 				return err
 			}
-			if len(missing) > 0 {
+
+			out := cmd.OutOrStdout()
+			fmt.Fprintf(out, "Checking s3://%s in %s (backend %q) with the current AWS credentials...\n", target.bucket, client.Region(), target.name)
+			report, err := bos3.CheckAccess(ctx, client.S3Client(), out, target.bucket, client.Region())
+			if err != nil {
+				return err
+			}
+			if len(report.Missing) > 0 {
 				return fmt.Errorf("these credentials lack %s; `bodega init %s--print-policy=runtime` prints the policy that grants them. "+
 					"If it was attached in the last minute, re-run this check once before changing it",
-					strings.Join(missing, ", "), argPrefix(args))
+					strings.Join(report.Missing, ", "), argPrefix(args))
 			}
-			fmt.Fprintf(out, "\nThese credentials can run bodega against s3://%s.\n", target.bucket)
+			writeCheckVerdict(out, target, args, report)
 			return nil
 		},
+	}
+}
+
+// writeCheckVerdict closes a check that found nothing refused. It names what
+// was proven and what was not, because "nothing refused" is not "can run
+// bodega" while delete, and sometimes write, went unprobed.
+func writeCheckVerdict(w io.Writer, t s3Target, args []string, r bos3.AccessReport) {
+	fmt.Fprintf(w, "\nOn s3://%s these credentials were allowed %s; not checked: %s.\n",
+		t.bucket, strings.Join(r.Allowed, ", "), strings.Join(r.Unchecked, ", "))
+	if slices.Contains(r.Unchecked, "s3:PutObject") {
+		fmt.Fprintf(w, "Writing was not proven: the probe needs the empty %s marker; run `%s`, then check again.\n",
+			manifest.ManifestsPrefix, strings.TrimSpace("bodega init "+argPrefix(args)))
 	}
 }
 

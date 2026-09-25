@@ -228,15 +228,18 @@ func TestCheckAccess(t *testing.T) {
 		name        string
 		f           fakeObjects
 		wantMissing []string
-		wantErr     string
-		wantLines   []string
-		wantPut     bool
+		// wantUnchecked is compared only when set.
+		wantUnchecked []string
+		wantErr       string
+		wantLines     []string
+		wantPut       bool
 	}{
 		{
-			name:      "runtime policy passes",
-			f:         fakeObjects{putErr: precondition},
-			wantLines: []string{"  list:       allowed (s3:ListBucket)", "  read:       allowed (s3:GetObject)", "  write:      allowed (s3:PutObject)", "  delete:     not checked"},
-			wantPut:   true,
+			name:          "runtime policy passes",
+			f:             fakeObjects{putErr: precondition},
+			wantUnchecked: []string{"s3:DeleteObject", "s3:AbortMultipartUpload"},
+			wantLines:     []string{"  list:       allowed (s3:ListBucket)", "  read:       allowed (s3:GetObject)", "  write:      allowed (s3:PutObject)", "  delete:     not checked"},
+			wantPut:       true,
 		},
 		{
 			name:        "list refused leaves a 403 on read ambiguous",
@@ -258,9 +261,10 @@ func TestCheckAccess(t *testing.T) {
 			wantPut:     true,
 		},
 		{
-			name:      "an absent marker is read access, and no write is attempted",
-			f:         fakeObjects{headErr: sdkErr("HeadObject", 404, &types.NotFound{})},
-			wantLines: []string{"  read:       allowed (s3:GetObject)", "  write:      not checked: no empty manifests/ marker"},
+			name:          "an absent marker is read access, and no write is attempted",
+			f:             fakeObjects{headErr: sdkErr("HeadObject", 404, &types.NotFound{})},
+			wantUnchecked: []string{"s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"},
+			wantLines:     []string{"  read:       allowed (s3:GetObject)", "  write:      not checked: no empty manifests/ marker"},
 		},
 		{
 			name:      "a non-empty object at the marker key is never written",
@@ -288,7 +292,7 @@ func TestCheckAccess(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var out bytes.Buffer
-			missing, err := CheckAccess(context.Background(), &tc.f, &out, "b-b", "us-west-2")
+			report, err := CheckAccess(context.Background(), &tc.f, &out, "b-b", "us-west-2")
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("err = %v, want %q", err, tc.wantErr)
@@ -298,8 +302,20 @@ func TestCheckAccess(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !slices.Equal(missing, tc.wantMissing) {
-				t.Errorf("missing = %v, want %v", missing, tc.wantMissing)
+			if !slices.Equal(report.Missing, tc.wantMissing) {
+				t.Errorf("missing = %v, want %v", report.Missing, tc.wantMissing)
+			}
+			if tc.wantUnchecked != nil && !slices.Equal(report.Unchecked, tc.wantUnchecked) {
+				t.Errorf("unchecked = %v, want %v", report.Unchecked, tc.wantUnchecked)
+			}
+			seen := map[string]string{}
+			for list, actions := range map[string][]string{"allowed": report.Allowed, "missing": report.Missing, "unchecked": report.Unchecked} {
+				for _, a := range actions {
+					if prev, dup := seen[a]; dup {
+						t.Errorf("%s reported both %s and %s", a, prev, list)
+					}
+					seen[a] = list
+				}
 			}
 			for _, line := range tc.wantLines {
 				if !strings.Contains(out.String(), line) {

@@ -152,24 +152,34 @@ func partition(region string) string {
 	return "aws"
 }
 
+// AccessReport is what CheckAccess proved, per IAM action. The three lists
+// are disjoint, and an action in none of them was never reached: a probe
+// before it returned an error.
+type AccessReport struct {
+	Allowed   []string // the API answered without refusing
+	Missing   []string // the API refused
+	Unchecked []string // no probe can answer without writing, or an earlier refusal hid the answer
+}
+
 // CheckAccess asks the bucket whether the current credentials hold what
-// RuntimePolicy grants, writing one line per probe to out, and returns the
-// actions the API refused. It writes nothing to the bucket: s3:PutObject is
-// proven with a conditional PUT against the manifests/ marker, which S3
-// authorizes before it evaluates the condition and then refuses with 412.
+// RuntimePolicy grants, writing one line per probe to out, and reports each
+// action as allowed, refused or not checked. It writes nothing to the bucket:
+// s3:PutObject is proven with a conditional PUT against the manifests/
+// marker, which S3 authorizes before it evaluates the condition and then
+// refuses with 412.
 // s3:DeleteObject and s3:AbortMultipartUpload cannot be proven without a
 // write, and the output says so rather than claiming them.
 //
 // A refusal counts only when the API returned it. An error raised before a
 // request was signed, or one the network returned, says nothing about the
 // policy, and CheckAccess returns it as an error instead of a missing action.
-func CheckAccess(ctx context.Context, api ObjectAPI, out io.Writer, bucket, region string) ([]string, error) {
+func CheckAccess(ctx context.Context, api ObjectAPI, out io.Writer, bucket, region string) (AccessReport, error) {
 	if out == nil {
 		out = io.Discard
 	}
-	var missing []string
+	var r AccessReport
 	refused := func(step, action string, err error) {
-		missing = append(missing, action)
+		r.Missing = append(r.Missing, action)
 		fmt.Fprintf(out, "  %-11s refused by the API (%s); grant %s on %s\n", step+":", apiCode(err), action, resourceFor(bucket, region, action))
 	}
 
@@ -179,17 +189,18 @@ func CheckAccess(ctx context.Context, api ObjectAPI, out io.Writer, bucket, regi
 	})
 	switch {
 	case err == nil:
+		r.Allowed = append(r.Allowed, "s3:ListBucket")
 		fmt.Fprintf(out, "  list:       allowed (s3:ListBucket)\n")
 	case apiCode(err) == "NoSuchBucket":
 		fmt.Fprintf(out, "  bucket:     does not exist; run `bodega init` with the setup policy first\n")
-		return nil, fmt.Errorf("bucket %s does not exist", bucket)
+		return r, fmt.Errorf("bucket %s does not exist", bucket)
 	case isRedirect(err):
 		fmt.Fprintf(out, "  bucket:     lives in another region; set region to the bucket's own\n")
-		return nil, fmt.Errorf("bucket %s is not in the configured region: %w", bucket, err)
+		return r, fmt.Errorf("bucket %s is not in the configured region: %w", bucket, err)
 	case isRefusal(err):
 		refused("list", "s3:ListBucket", err)
 	default:
-		return nil, notFromAPI("list", err)
+		return r, notFromAPI("list", err)
 	}
 
 	// The manifests/ marker is the one key InitBucket guarantees, and a
@@ -202,19 +213,22 @@ func CheckAccess(ctx context.Context, api ObjectAPI, out io.Writer, bucket, regi
 		Key:    aws.String(marker),
 	})
 	markerPresent := false
-	listRefused := slices.Contains(missing, "s3:ListBucket")
+	listRefused := slices.Contains(r.Missing, "s3:ListBucket")
 	switch {
 	case err == nil:
 		markerPresent = aws.ToInt64(head.ContentLength) == 0
+		r.Allowed = append(r.Allowed, "s3:GetObject")
 		fmt.Fprintf(out, "  read:       allowed (s3:GetObject)\n")
 	case isNotFound(err):
+		r.Allowed = append(r.Allowed, "s3:GetObject")
 		fmt.Fprintf(out, "  read:       allowed (s3:GetObject)\n")
 	case isRefusal(err) && listRefused:
+		r.Unchecked = append(r.Unchecked, "s3:GetObject")
 		fmt.Fprintf(out, "  read:       not checked: without s3:ListBucket, S3 answers 403 for a missing key as well as a refused one\n")
 	case isRefusal(err):
 		refused("read", "s3:GetObject", err)
 	default:
-		return missing, notFromAPI("read", err)
+		return r, notFromAPI("read", err)
 	}
 
 	if markerPresent {
@@ -227,20 +241,24 @@ func CheckAccess(ctx context.Context, api ObjectAPI, out io.Writer, bucket, regi
 		case err == nil:
 			// Only a store that ignores If-None-Match reaches this, and it
 			// rewrote a zero-byte marker with zero bytes.
+			r.Allowed = append(r.Allowed, "s3:PutObject")
 			fmt.Fprintf(out, "  write:      allowed (s3:PutObject); this store ignored If-None-Match and rewrote the empty %s marker\n", marker)
 		case isPreconditionFailed(err):
+			r.Allowed = append(r.Allowed, "s3:PutObject")
 			fmt.Fprintf(out, "  write:      allowed (s3:PutObject)\n")
 		case isRefusal(err):
 			refused("write", "s3:PutObject", err)
 		default:
-			return missing, notFromAPI("write", err)
+			return r, notFromAPI("write", err)
 		}
 	} else {
+		r.Unchecked = append(r.Unchecked, "s3:PutObject")
 		fmt.Fprintf(out, "  write:      not checked: no empty %s marker to test against without writing; run `bodega init`\n", marker)
 	}
 
+	r.Unchecked = append(r.Unchecked, "s3:DeleteObject", "s3:AbortMultipartUpload")
 	fmt.Fprintf(out, "  delete:     not checked: s3:DeleteObject and s3:AbortMultipartUpload cannot be proven without a write\n")
-	return missing, nil
+	return r, nil
 }
 
 func resourceFor(bucket, region, action string) string {

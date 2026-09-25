@@ -2453,7 +2453,7 @@ ERROR storage backend unavailable — package routes will answer 503; the API an
 
 #### S3 setup
 
-**Credentials** come from the AWS default chain: `AWS_ACCESS_KEY_ID` and its siblings in the environment, `AWS_PROFILE` naming a profile in the shared config (SSO profiles included), or an instance or task role. bodega holds no AWS credential of its own. `region` in the config (or `AWS_REGION`) must be the bucket's region; a bucket in another region answers with a redirect that reads like a permissions failure, and `bodega init check` names it instead.
+**Credentials** come from the AWS default chain: `AWS_ACCESS_KEY_ID` and its siblings in the environment, `AWS_PROFILE` naming a profile in the shared config (SSO profiles included), or an instance or task role. bodega holds no AWS credential of its own. `region` in the config (or `AWS_REGION`) must be the bucket's region; a bucket in another region answers with a redirect that reads like a permissions failure, and `bodega init check` names it instead. A `storage_backends` entry with no `region` does not inherit the global one: the AWS SDK resolves it from `AWS_REGION`, `AWS_DEFAULT_REGION` or the profile's `region`, in the service and in every `bodega init` verb alike, and each verb prints the region it resolved. When none of those names a region, `bodega init` refuses the entry rather than guess.
 
 **Two policies, because there are two people.** Whoever creates buckets and IAM policies is often not whoever runs bodega, so `bodega init --print-policy` prints one policy for each. Both are derived from the SDK calls bodega makes, not written by hand, so a call added to bodega is a policy line added to the output.
 
@@ -2527,6 +2527,14 @@ Checking s3://example-bodega-artifacts in us-west-2 (backend "default") with the
 Error: these credentials lack s3:PutObject; `bodega init --print-policy=runtime` prints the policy that grants them. If it was attached in the last minute, re-run this check once before changing it
 ```
 
+A run with nothing refused exits 0 and closes on what it proved, not on a claim that the service will work, because deleting always goes unprobed:
+
+```text
+On s3://example-bodega-artifacts these credentials were allowed s3:ListBucket, s3:GetObject, s3:PutObject; not checked: s3:DeleteObject, s3:AbortMultipartUpload.
+```
+
+Without the empty `manifests/` marker `bodega init` creates, the write probe has nothing to test against, so `s3:PutObject` joins the not-checked list and a second line says to run `bodega init` and check again.
+
 Two things make a correct policy look broken. A policy attached in the last few seconds may not have propagated, so re-run once before editing it. And an error raised before a request reaches the API (no credentials resolved, an expired SSO session, a dead network) is not a refusal: `check` reports it as "no answer from the S3 API" and draws no conclusion about the policy.
 
 **Lifecycle.** `bodega init` keeps two kinds of rule on the bucket, each with an ID starting `bodega-`:
@@ -2540,7 +2548,7 @@ A multipart upload that dies partway leaves parts that are billed, appear in no 
 
 Rules whose ID does not start with `bodega-` are yours, and `bodega init` writes them back unchanged. A `bodega-` rule edited on the bucket is drift, and the next `bodega init` rewrites it; the retention periods are `AbortIncompleteMultipartDays` and `NoncurrentVersionDays` in `internal/s3/init.go`. A named backend with a `prefix` gets its rules and markers at the bucket root, not under the prefix, so its noncurrent versions do not expire.
 
-**S3-compatible stores** (SeaweedFS, Garage and the like) are untested, not unsupported. bodega speaks S3 through the AWS SDK and has no endpoint override today, so nothing points it at one yet.
+**S3-compatible stores** (SeaweedFS, Garage and the like) are untested, not unsupported. bodega speaks S3 through the AWS SDK, so the endpoint comes from the SDK's own settings: `AWS_ENDPOINT_URL_S3` or `AWS_ENDPOINT_URL` in the environment, or `endpoint_url` in the shared config profile. bodega has no endpoint key of its own, and it sets no path-style addressing option, which some of those stores need.
 
 ### Publication and access
 
@@ -2585,7 +2593,7 @@ What differs per backend is access, and it differs in the direction that matters
 }
 ```
 
-Per backend: `driver` is required and is one of the same values `storage_backend` takes. `path` is read by `local`; `bucket` and `region` by `s3`; `prefix` roots every key under it, on either driver.
+Per backend: `driver` is required and is one of the same values `storage_backend` takes. `path` is read by `local`; `bucket` and `region` by `s3`; `prefix` roots every key under it, on either driver. An `s3` entry without `region` takes the one the AWS SDK resolves, not the global `region`; see [S3 setup](#s3-setup).
 
 A `prefix` must be spelled canonically. A leading and a trailing `/` are stripped, so `cold/x`, `/cold/x` and `cold/x/` are one prefix and all three load. An empty segment or a `.` segment is refused, because they are a second spelling of a directory rather than a second directory:
 

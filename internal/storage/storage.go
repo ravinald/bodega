@@ -356,6 +356,29 @@ func SpecFromConfig(cfg *config.Config) Spec {
 	}
 }
 
+// SpecFor derives the Spec for the backend called name, the default or a
+// storage_backends entry, and reports whether that name is configured. The
+// resolver builds every store from it and `bodega init` builds its client
+// from it, so the bucket init prepares and the region it dials are the ones
+// the service will use. A named entry's empty region stays empty: the AWS
+// SDK's own chain fills it, and init reports what that chain resolved.
+func SpecFor(cfg *config.Config, name string) (Spec, bool) {
+	if name == DefaultName {
+		return SpecFromConfig(cfg), true
+	}
+	spec, ok := cfg.StorageBackends[name]
+	if !ok {
+		return Spec{}, false
+	}
+	return Spec{
+		Driver: spec.Driver,
+		Path:   spec.Path,
+		Bucket: spec.Bucket,
+		Region: spec.Region,
+		Prefix: spec.Prefix,
+	}, true
+}
+
 // New creates the default ObjectStore described by the global config.
 func New(ctx context.Context, cfg *config.Config) (ObjectStore, error) {
 	return NewFromSpec(ctx, SpecFromConfig(cfg))

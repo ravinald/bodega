@@ -2,11 +2,14 @@ package storage
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
 
 	"github.com/ravinald/bodega/internal/config"
+	bos3 "github.com/ravinald/bodega/internal/s3"
 )
 
 // TestDriverRegistryIsWiredIntoConfig proves the hook config.Load reads is
@@ -299,5 +302,57 @@ func TestStorageByGroupAloneStillBuildsMulti(t *testing.T) {
 	}
 	if got := r.Placement("apt", "", []string{"mirror-set"}); got.Level != LevelGroup || got.Name != DefaultName {
 		t.Errorf("Placement(apt, mirror-set) = %+v, want %q at LevelGroup", got, DefaultName)
+	}
+}
+
+// awsProfileRegion points the SDK at a shared config whose only region comes
+// from the selected profile, so a region that reaches a client from anywhere
+// else shows up as the wrong answer.
+func awsProfileRegion(t *testing.T, region string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(path, []byte("[profile p]\nregion = "+region+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AWS_CONFIG_FILE", path)
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "absent"))
+	t.Setenv("AWS_PROFILE", "p")
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "")
+}
+
+// TestResolverDialsTheRegionSpecForDescribes holds the service to the same
+// region `bodega init` reports: both build their client with bos3.NewClient
+// from SpecFor, so a named s3 entry with no region resolves through the SDK
+// chain in each, and the default backend keeps the global region.
+func TestResolverDialsTheRegionSpecForDescribes(t *testing.T) {
+	awsProfileRegion(t, "eu-west-1")
+	cfg := &config.Config{
+		StorageBackend: "s3", Bucket: "main-bucket", Region: "us-west-2",
+		StorageBackends: map[string]config.StorageSpec{
+			"nearby": {Driver: "s3", Bucket: "nearby-bucket"},
+			"pinned": {Driver: "s3", Bucket: "pinned-bucket", Region: "ap-south-1"},
+		},
+	}
+	r, err := NewResolver(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]string{DefaultName: "us-west-2", "nearby": "eu-west-1", "pinned": "ap-south-1"} {
+		store, err := r.ByName(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := store.(*S3).client.Region(); got != want {
+			t.Errorf("%s: service dials %q, want %q", name, got, want)
+		}
+		spec, _ := SpecFor(cfg, name)
+		viaSpec, err := bos3.NewClient(context.Background(), spec.Bucket, spec.Region)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if viaSpec.Region() != want {
+			t.Errorf("%s: SpecFor resolves %q, want %q", name, viaSpec.Region(), want)
+		}
 	}
 }
