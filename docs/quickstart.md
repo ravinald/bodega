@@ -4,7 +4,7 @@ This guide walks you through setting up bodega, adding your first packages, and 
 
 ## Prerequisites
 
-- Go 1.22+ (or run `make depend` to install it)
+- Go at the version `go.mod` names (1.26 today), on Linux, FreeBSD, or macOS
 
 ## 1. Build and install
 
@@ -13,11 +13,21 @@ make build                    # builds to ./dist/bodega
 sudo make install             # installs to /usr/local/bin/bodega
 ```
 
+The server runs on FreeBSD as well as Linux. The Makefile uses GNU make syntax, and FreeBSD's default `go` package trails the version `go.mod` requires, so install both by name:
+
+```bash
+sudo pkg install gmake go126
+export PATH=/usr/local/go126/bin:$PATH
+gmake build                   # builds to ./dist/bodega
+```
+
 Cross-compile for Linux from macOS:
 
 ```bash
 make cross                    # builds ./dist/bodega-linux-amd64 and -linux-arm64
 ```
+
+FreeBSD has no release archive, `make cross` target, or rc.d script yet; [Platforms](usage.md#platforms) lists what each platform gets today.
 
 ## 2. Configure
 
@@ -33,15 +43,20 @@ For S3-backed storage, set the backend and bucket:
 }
 ```
 
-Then initialize the bucket:
+Credentials come from the AWS default chain: environment variables, `AWS_PROFILE`, SSO, or an instance role. Print the IAM policies bodega needs, create the bucket, and confirm the service's credentials hold the runtime policy:
 
 ```bash
+bodega init --print-policy=setup     # attach to whoever runs init
+bodega init --print-policy=runtime   # attach to the service
 bodega init
+bodega init check
 ```
+
+[S3 setup](usage.md#s3-setup) covers the two policies, the lifecycle rules `init` writes, and named backends.
 
 For local storage, no initialization is needed. Artifacts are stored at `/var/lib/bodega` by default (configurable via `storage_path`).
 
-## 4. Add packages
+## 3. Add packages
 
 ### Git repository
 
@@ -69,9 +84,9 @@ bodega pkg create npm lodash             # prompts for version
 
 All fields are prompted interactively. For automation, use `bodega pkg import` with a JSON manifest file. See [usage.md](usage.md#bodega-pkg-import-file-file) for details.
 
-## 5. Fetch and upload
+## 4. Fetch and upload
 
-Fetch all sources, build, and upload to S3:
+Fetch all sources, build, and upload to storage:
 
 ```bash
 bodega build upload
@@ -84,16 +99,18 @@ bodega build fetch                       # download sources only
 bodega build fetch git                   # download git sources only
 bodega build fetch git widget            # download only the widget entry
 bodega build run                         # compile/prepare (cascades fetch if needed)
-bodega build sync                        # push to S3 (cascades all stages)
+bodega build sync                        # push local artifacts to storage, no pipeline stages
 ```
 
-## 6. Start the HTTP server
+## 5. Start the server
 
 ```bash
-bodega serve
+bodega serve --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
 ```
 
-The server listens on `:8080` by default. Clients configure their package managers:
+The server listens on `:8080` by default and refuses to start without a TLS pair unless you pass `--allow-plaintext`, which suits a loopback trial or a reverse proxy that terminates TLS. Every client example below is `https://`.
+
+Clients configure their package managers:
 
 **APT**: sign the repository, then point a client at the key:
 
@@ -163,7 +180,26 @@ git clone widget.bundle widget
 
 The clone lands on the ref the manifest entry pins. For a tag that is a detached HEAD, the same place `git clone --branch v4.5.7` puts you; `git switch -c work` when you want a branch.
 
-## 7. Launch the TUI
+**FreeBSD pkg**: on the client, with the `bodega` binary installed, ask the server which repository answers for this host's ABI and write it, together with the overrides that disable `FreeBSD.conf`:
+
+```bash
+sudo bodega doctor --write-pkg-repo --url https://bodega-host:8080
+sudo pkg update
+```
+
+**FreeBSD distfiles**: point `make fetch` at bodega in `/etc/make.conf`. The include is the client check, and it stays last:
+
+```make
+MASTER_SITE_OVERRIDE?= https://bodega-host:8080/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/
+MASTER_SITE_BACKUP?= https://bodega-host:8080/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/
+.include "/usr/local/etc/bodega-distfiles.mk"
+```
+
+[Mirroring ports distfiles](usage.md#mirroring-ports-distfiles) covers the server side and the client check.
+
+Only apt and FreeBSD pkg have a client file the server composes today, and writing either takes the `bodega` binary on the client. The rest are set by hand as shown. [Client configuration](usage.md#client-configuration) describes the served setup script that will configure a chosen set of these without the binary.
+
+## 6. Launch the TUI
 
 ```bash
 bodega shell
@@ -171,13 +207,13 @@ bodega shell
 
 Three-pane interface:
 
-- **Sources** (left): tree view of all packages, expand/collapse with Enter
-- **Details** (right): metadata for the selected entry
-- **Log** (bottom): command output
+- **Sources** (left): tree of every package, grouped by type, then name, then version
+- **Details** (right): the selected entry's metadata, checksum, storage state, and the line a client uses to fetch it
+- **Log** (bottom): what each action did, searchable with `/`
 
 Press `Tab` to switch focus, `?` for help, `q` to quit.
 
-## 8. Supply chain scenario: handling a bad dependency
+## 7. Supply chain scenario: handling a bad dependency
 
 When a dependency like `libssl3` has a security issue or checksum mismatch:
 
@@ -193,24 +229,16 @@ If you want to allow new versions to be auto-resolved in the future, leave the `
 
 See [Usage](usage.md) for the full supply chain section.
 
-## 9. Check status
+## 8. Check status
 
 ```bash
-bodega status                  # compare all entries against S3
+bodega build status            # compare every entry against the backend holding it
 bodega pkg verify                  # verify manifest MD5 integrity
 bodega audit events --limit 10        # view recent audit events
 bodega pkg checksum list           # view cached checksums
 ```
 
-## 10. Enable HTTPS
-
-With manual certificates:
-
-```bash
-bodega serve --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
-```
-
-## 11. Enable proxy/cache
+## 9. Enable proxy/cache
 
 Edit config to enable upstream proxy caching for gomod, helm, and npm:
 
@@ -221,9 +249,9 @@ Edit config to enable upstream proxy caching for gomod, helm, and npm:
 }
 ```
 
-With proxy enabled, when a client requests a package not in S3, bodega fetches it from upstream (proxy.golang.org, registry.npmjs.org, etc.), caches it in S3, and serves it. Subsequent requests are served from cache. Checksums are verified automatically.
+With proxy enabled, when a client requests a package not in storage, bodega fetches it from upstream (proxy.golang.org, registry.npmjs.org, and so on), caches it, and serves it. Subsequent requests are served from cache. Checksums are verified automatically.
 
-## 12. Mutation API access
+## 10. Mutation API access
 
 The REST API's create and delete endpoints are restricted to localhost by default. If you need to create or delete entries from another host (e.g., CI), generate a token and then widen the allow-list, in that order:
 
@@ -242,7 +270,7 @@ The `admin_permit_cidr` key in `config.json` seeds the list on first start and i
 
 Manage tokens with `bodega token list` and `bodega token revoke`. In the TUI, press `T` to open the token manager. See [usage.md](usage.md#rest-api) for full details.
 
-## 13. What a fresh install enforces
+## 11. What a fresh install enforces
 
 One control, on by default: a minimum publish age of `7d` on `npm` and `pypi`, action `warn`. A version published less than a week ago is admitted and flagged rather than refused, and `bodega serve` names the gate in its startup banner.
 
@@ -256,7 +284,7 @@ That cooldown is the control the 2025-2026 npm and PyPI campaigns turned on: the
 
 What it does not cover:
 
-- **Only `npm` and `pypi`.** `gomod` and `cargo` can be dated too and get no seed; `apt`, `binary`, `git`, `helm` and `freebsd` have no upstream publish timestamp at all, and `bodega policy age set` refuses them.
+- **Only `npm` and `pypi`.** `gomod` and `cargo` can be dated too and get no seed; `apt`, `binary`, `git`, `helm`, `freebsd`, and `distfiles` have no upstream publish timestamp at all, and `bodega policy age set` refuses them.
 - **`warn`, not `block`.** A version inside the window is admitted and recorded as `policy_warn`. Hardening it is `bodega policy age set <ecosystem> 7d block`.
 - **Nothing else is on.** The upstream allow-list is empty, which accepts every candidate, and the OSV gate has no rows. Add them with `bodega policy add <type> <pattern>` and `bodega policy osv set npm warn`.
 - **Upgrades gain nothing.** An install created before this default keeps enforcing exactly what it enforced. bodega records the seed as a one-time decision, so it also never returns after `bodega policy age remove`.
@@ -265,7 +293,7 @@ What it does not cover:
 
 ## Next steps
 
-- Set up a systemd service for `bodega serve`
+- Run `bodega serve` as a service: [bodega.service](bodega.service) on Linux; FreeBSD's rc.d script is pending
 - Put nginx in front for TLS termination and caching at scale
 - Use the REST API for CI/CD integration (`POST /api/v1/packages/{type}`)
 - Query the audit trail to track package usage (`bodega audit events --type fetch`)
