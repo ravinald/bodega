@@ -5027,6 +5027,28 @@ with no leg fails the gate rather than passing it.
 `make fmt-check` requires `goimports` on `PATH` rather than skipping it, because
 a check that skips is weaker than the merge it stands in for.
 
+### The S3 conformance suite
+
+Every `ObjectStore` driver is held to one contract by `TestObjectStoreConformance` in `internal/storage/conformance_test.go`. `local`, `memory` and `prefixed` run on any laptop. The `s3` driver talks to real AWS, so it has a gate.
+
+```bash
+BODEGA_S3_CONFORMANCE=1 go test ./internal/storage/ -run 'TestObjectStoreConformance|TestInitBucketAgainstALiveBucket|TestLabel'
+```
+
+**Unset, the s3 backend skips. Set to anything, "no AWS credentials resolved" becomes a failure.** Those are two different promises and the second is the one that matters: a gate needing an AWS account is a gate that stops blocking the day the account goes away, and a suite that quietly skips the only driver it was run for reports the same green as one that passed. Set the variable in any pipeline meant to exercise S3.
+
+Credentials come from the AWS default chain, the same one the service reads. `AWS_REGION` decides where the buckets land.
+
+**Each store gets its own bucket**, named `bodega-conf-` plus 24 hex characters. `S3.Label()` is `s3://<bucket>`, so `TestLabelDistinguishesTwoStores` compares two labels and two stores sharing one bucket would collide; a prefix wrapper would satisfy the test by testing the wrapper. The credentials therefore need `s3:CreateBucket` and `s3:DeleteBucket`, which no condition can scope to a name, so the containment is the prefix: grant them on `arn:aws:s3:::bodega-conf-*` and nothing wider. Teardown also enumerates versions, which needs `s3:ListBucketVersions` on the bucket and `s3:DeleteObjectVersion` on its objects. Note that `ListObjectVersions` is authorized by `s3:ListBucketVersions`, one of three SDK calls in this codebase whose IAM action is spelled differently; the others are `HeadBucket` (`s3:ListBucket`) and `HeadObject` (`s3:GetObject`).
+
+**Teardown is best-effort per bucket and fatal in aggregate.** One abandoned bucket is a sweep and not a contract violation, so `dropLiveBucket` logs and moves on. A permission the role never held is a different thing: it leaks one bucket per store while every case passes. The binary counts what survived and exits non-zero at the end, naming each bucket and the query that finds them:
+
+```bash
+aws s3api list-buckets --query 'length(Buckets[?starts_with(Name, `bodega-conf-`)])'
+```
+
+Run that after a crashed suite. `TestInitBucketAgainstALiveBucket` sits behind the same gate and is the only case that calls `InitBucket`; the conformance factory uses a plain `CreateBucket`, because versioning makes teardown walk delete markers and an `InitBucket` defect would fail all 27 cases instead of the one test about it.
+
 ### Project structure
 
 ```text
