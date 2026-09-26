@@ -159,9 +159,10 @@ unset fbsd_abi
 #
 # The tree comes from bodega (the ports-txz binary entry 45-clients builds) and
 # the distfile comes from bodega too, through an open binary_upstreams
-# namespace over FreeBSD's distfile cache. bodega has no distfiles type; this
-# is the proxy every binary namespace already is, pointed at the cache
-# MASTER_SITE_BACKUP names.
+# namespace over FreeBSD's distfile cache. That proves a binary namespace can
+# serve a distfile, and nothing more: internal/server/binary.go pins whatever
+# its first fetch returned and reads no distinfo, RESTRICTED or NO_CDROM. The
+# distfiles type, which does, is driven by 49-freebsd-distfiles.
 #
 # pkg.freebsd.org rather than distcache.FreeBSD.org, which the ports framework
 # uses over plain http: its https answers with a certificate for another name,
@@ -218,9 +219,9 @@ e2e_on freebsd "$fbsd_make MASTER_SITE_OVERRIDE='$E2E_BASE_URL/binaries/distfile
 	'/Attempting to fetch/{n++; u=\$NF} END{print n+0, (index(u, p) == 1 ? \"bodega\" : u)}'" || true
 fbsd_fetch="$E2E_OUT"
 check_eq FBSD-PORTS-03 "make fetch succeeds against bodega" 0 "$E2E_RC" \
-	"docs/usage.md#distfiles" "make fetch MASTER_SITE_OVERRIDE=$E2E_BASE_URL/binaries/distfiles/..." "$E2E_RC"
+	"internal/server/binary.go" "make fetch MASTER_SITE_OVERRIDE=$E2E_BASE_URL/binaries/distfiles/..." "$E2E_RC"
 check_eq FBSD-PORTS-04 "make fetch takes the distfile from bodega on the first and only attempt" \
-	"1 bodega" "$fbsd_fetch" "docs/usage.md#distfiles" "make fetch | grep 'Attempting to fetch'"
+	"1 bodega" "$fbsd_fetch" "internal/server/binary.go" "make fetch | grep 'Attempting to fetch'"
 
 e2e_on freebsd "$fbsd_make checksum 2>&1 | tail -1" || true
 check_contains FBSD-PORTS-05 "make checksum accepts the bytes against the tree's own distinfo" \
