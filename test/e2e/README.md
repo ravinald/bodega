@@ -17,14 +17,15 @@ It runs from a workstation against four scratch guests, described under
 [Host requirements](#host-requirements). It does not run in CI and never will:
 it needs several hosts, a real network between them, and several minutes.
 
-| Client                                              | Guest            | Suite               |
-| --------------------------------------------------- | ---------------- | ------------------- |
-| `apt-get`, `pip`, `helm`, `npm`, `cargo`            | `client`         | `45-clients`        |
-| `git`, `curl`, the portable `pkg` build             | `client`         | `45-clients`        |
-| `go`                                                | `server`         | `45-clients`        |
-| `pkg install` onto a FreeBSD root                   | `freebsd`        | `47-freebsd-client` |
-| `make fetch` and `make checksum` in a ports tree    | `freebsd`        | `47-freebsd-client` |
-| none: `internal/storage`'s ACL and extattr syscalls | `freebsd-server` | `48-freebsd-server` |
+| Client                                              | Guest            | Suite                  |
+| --------------------------------------------------- | ---------------- | ---------------------- |
+| `apt-get`, `pip`, `helm`, `npm`, `cargo`            | `client`         | `45-clients`           |
+| `git`, `curl`, the portable `pkg` build             | `client`         | `45-clients`           |
+| `go`                                                | `server`         | `45-clients`           |
+| `pkg install` onto a FreeBSD root                   | `freebsd`        | `47-freebsd-client`    |
+| `make fetch` and `make checksum` in a ports tree    | `freebsd`        | `47-freebsd-client`    |
+| none: `internal/storage`'s ACL and extattr syscalls | `freebsd-server` | `48-freebsd-server`    |
+| `make fetch` through the `distfiles` type           | `freebsd`        | `49-freebsd-distfiles` |
 
 `48-freebsd-server` drives no client. It runs `internal/storage`'s own tests on
 `freebsd-server`, because the FreeBSD ACL and extended-attribute syscalls
@@ -65,7 +66,10 @@ Each FreeBSD guest needs a release with `pkg` bootstrapped, `curl`, the same
 `dist/bodega-freebsd-arm64` to `freebsd`, so an amd64 guest needs that
 target changed. It points `pkg` at the Linux server through the stanza
 `bodega doctor --write-pkg-repo` writes, and removes the stanza again at the
-end. Suite 48 ships an `internal/storage` test binary to `freebsd-server`,
+end. Suite 49 mounts its scratch ports tree and `/usr/share/mk` read-only
+with `nullfs` on `freebsd` and unmounts both at the end; on the Linux server it
+extracts the ports tree to `/usr/ports`, and refuses to start if a tree it did
+not write is already there. Suite 48 ships an `internal/storage` test binary to `freebsd-server`,
 compiles a `sys/acl.h` probe with the base system's `cc`, and creates and
 destroys a swap-backed memory disk (`md48`, override with
 `E2E_FREEBSD_MD_UNIT`) under `/var/tmp/bodega-e2e-storage`. It also creates
