@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -82,6 +84,44 @@ var (
 	s3Conf     aws.Config
 	s3ConfErr  error
 )
+
+// leaked records every bucket dropLiveBucket could not remove, so TestMain can
+// fail the binary once at the end. Teardown stays best-effort per bucket
+// because one abandoned bucket is a sweep and not a contract violation, but a
+// permission the role never held leaks one per store while every case passes:
+// the first live run leaked thirty and exited 0.
+var leaked struct {
+	sync.Mutex
+	names []string
+}
+
+// leakedCount is read without the lock by TestMain's fast path.
+var leakedCount atomic.Int64
+
+func recordLeak(bucket string) {
+	leaked.Lock()
+	leaked.names = append(leaked.names, bucket)
+	leaked.Unlock()
+	leakedCount.Add(1)
+}
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if n := leakedCount.Load(); n > 0 && code == 0 {
+		leaked.Lock()
+		names := leaked.names
+		leaked.Unlock()
+		fmt.Fprintf(os.Stderr, "\n%d live bucket(s) survived teardown and are still billing:\n", n)
+		for _, b := range names {
+			fmt.Fprintf(os.Stderr, "  s3://%s\n", b)
+		}
+		fmt.Fprintf(os.Stderr, "Every case passed, so the cause is the role rather than the contract. "+
+			"Sweep with: aws s3api list-buckets --query 'Buckets[?starts_with(Name, `%s`)].Name'\n",
+			conformanceBucketPrefix)
+		code = 1
+	}
+	os.Exit(code)
+}
 
 // liveS3Config resolves the AWS default chain once per test binary. Retrieving
 // is what proves credentials exist: loading succeeds with none, and the first
@@ -174,6 +214,7 @@ func dropLiveBucket(t *testing.T, client *bos3.Client) {
 				return
 			}
 			t.Logf("teardown: list s3://%s: %v; sweep %s* by hand", *bucket, err, conformanceBucketPrefix)
+			recordLeak(*bucket)
 			return
 		}
 		for _, v := range page.Versions {
@@ -189,11 +230,13 @@ func dropLiveBucket(t *testing.T, client *bos3.Client) {
 			Bucket: bucket, Delete: &s3types.Delete{Objects: objects[:n], Quiet: aws.Bool(true)},
 		}); err != nil {
 			t.Logf("teardown: empty s3://%s: %v", *bucket, err)
+			recordLeak(*bucket)
 		}
 		objects = objects[n:]
 	}
 	if _, err := api.DeleteBucket(ctx, &awss3.DeleteBucketInput{Bucket: bucket}); err != nil && !isNoSuchBucket(err) {
 		t.Logf("teardown: delete s3://%s: %v; sweep %s* by hand", *bucket, err, conformanceBucketPrefix)
+		recordLeak(*bucket)
 	}
 }
 
