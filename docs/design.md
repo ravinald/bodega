@@ -806,7 +806,7 @@ Frozen entries cannot be deleted through the API.
 
 ## Deployment
 
-Bodega is a single static binary, and the server runs on Linux or FreeBSD. Linux has a systemd unit, [`bodega.service`](bodega.service). FreeBSD has no rc.d script or release archive yet, so a FreeBSD server is built from source and supervised by hand. A typical deployment on S3:
+Bodega is a single static binary, and the server runs on Linux or FreeBSD. Linux has a systemd unit, [`bodega.service`](bodega.service). FreeBSD has no rc.d script or release archive yet ([#48](https://github.com/ravinald/bodega/issues/48)), so a FreeBSD server is built from source and supervised by hand. A typical deployment on S3:
 
 1. An infrastructure-as-code tool creates a host with an IAM role. `bodega init --print-policy` prints the two policies that role and the setup principal need, runtime and setup, rather than broad S3 read/write.
 2. `bodega init` creates the bucket with encryption, versioning, lifecycle rules and public access blocked, and `bodega init check`, run under the service's credentials, asks the bucket whether they hold the runtime policy.

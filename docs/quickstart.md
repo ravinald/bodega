@@ -27,7 +27,7 @@ Cross-compile for Linux from macOS:
 make cross                    # builds ./dist/bodega-linux-amd64 and -linux-arm64
 ```
 
-FreeBSD has no release archive, `make cross` target, or rc.d script yet; [Platforms](usage.md#platforms) lists what each platform gets today.
+FreeBSD has no release archive, `make cross` target, or rc.d script yet ([#48](https://github.com/ravinald/bodega/issues/48)); [Platforms](usage.md#platforms) lists what each platform gets today.
 
 ## 2. Configure
 
@@ -197,7 +197,7 @@ MASTER_SITE_BACKUP?= https://bodega-host:8080/distfiles/@${BODEGA_DISTFILES_ENV}
 
 [Mirroring ports distfiles](usage.md#mirroring-ports-distfiles) covers the server side and the client check.
 
-Only apt and FreeBSD pkg have a client file the server composes today, and writing either takes the `bodega` binary on the client. The rest are set by hand as shown. [Client configuration](usage.md#client-configuration) describes the served setup script that will configure a chosen set of these without the binary.
+Only apt and FreeBSD pkg have a client file the server composes today, and writing either takes the `bodega` binary on the client. The rest are set by hand as shown. A served setup script that configures a chosen set of these without the binary is planned ([#51](https://github.com/ravinald/bodega/issues/51), [#52](https://github.com/ravinald/bodega/issues/52)); [Client configuration](usage.md#client-configuration) describes it.
 
 ## 6. Launch the TUI
 
@@ -293,7 +293,7 @@ What it does not cover:
 
 ## Next steps
 
-- Run `bodega serve` as a service: [bodega.service](bodega.service) on Linux; FreeBSD's rc.d script is pending
+- Run `bodega serve` as a service: [bodega.service](bodega.service) on Linux; FreeBSD's rc.d script is pending ([#48](https://github.com/ravinald/bodega/issues/48))
 - Put nginx in front for TLS termination and caching at scale
 - Use the REST API for CI/CD integration (`POST /api/v1/packages/{type}`)
 - Query the audit trail to track package usage (`bodega audit events --type fetch`)

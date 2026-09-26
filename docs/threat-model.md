@@ -710,7 +710,8 @@ instance, the recommended posture is:
   should point at. Re-run `bodega doctor` after rewriting to confirm exit 0.
   On FreeBSD it does not yet check the pkg repository configuration or
   `/etc/make.conf`, so inspect `/usr/local/etc/pkg/repos/` and
-  `MASTER_SITE_OVERRIDE` by hand.
+  `MASTER_SITE_OVERRIDE` by hand
+  ([#49](https://github.com/ravinald/bodega/issues/49)).
 - **Set `GOPROXY` to `http://<bodega>/go,off`**, never `,direct`. The
   `,off` form makes cache misses fail loudly; `,direct` silently falls
   through to public VCS, defeating the chokepoint.

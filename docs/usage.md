@@ -941,7 +941,7 @@ What it removes:
 
 What it keeps: the config file, and every artifact in storage. Stored artifacts with no manifest left are unreachable until re-imported; `bodega pkg delete --remove-artifacts` before the reset is the way to remove them.
 
-**Gap:** the build-directory list predates the per-type roots and the newer types. A tree under `cargo_root`, `freebsd_root` or `distfiles_root`, or under any per-type root set apart from `build_root`, is left in place, and so are `<build_root>/cargo`, `<build_root>/freebsd` and `<build_root>/distfiles`. Remove those by hand.
+**Gap:** the build-directory list predates the per-type roots and the newer types. A tree under `cargo_root`, `freebsd_root` or `distfiles_root`, or under any per-type root set apart from `build_root`, is left in place, and so are `<build_root>/cargo`, `<build_root>/freebsd` and `<build_root>/distfiles`. Remove those by hand. [#55](https://github.com/ravinald/bodega/issues/55) tracks the fix.
 
 ### `bodega pkg checksum list [--type TYPE] [--name NAME]`
 
@@ -2174,7 +2174,7 @@ These are not observed yet. A quiet discovery log for one of them means the hook
 - **git mirror refreshes**: a smart-HTTP request records one row per request, but the periodic `git remote update` it triggers is not separately logged. The row says a client asked; it does not say whether that request also refreshed the mirror.
 - **binary outside a namespace, with `binary_upstreams` empty**: `/binaries/...` reads storage exactly as it did before the block existed, and records nothing — an install that has not opted in. Once any entry exists, a first segment naming no key is not this case: it 404s without touching storage and records a `no_namespace` row, which is in the table above.
 - **helm `index.yaml`** and the generated apt indexes: regenerated locally, never fetched.
-- **distfiles cache hits**: a distfile already in storage is served with an audit row and no discovery row, so an observe window counts only the first fetch of each name.
+- **distfiles cache hits**: a distfile already in storage is served with an audit row and no discovery row, so an observe window counts only the first fetch of each name ([#53](https://github.com/ravinald/bodega/issues/53)).
 - **apt pool hits with several archives configured**: a pool path names no archive, so bodega probes on the first miss and remembers the answer for an hour. A cached `.deb` is served without that probe. With one entry in `apt_upstreams` the archive is unambiguous and the hit is recorded; with several and no remembered route, the row is skipped rather than filed under a pattern that is not the host, which would split one archive's traffic across two buckets. The next miss for that path repopulates the route and hits start counting again.
 
 #### `bodega discover list [type]`
@@ -2698,12 +2698,12 @@ The prefix is the other half of that label, and it was still concatenated verbat
 
 Four levels decide where the next write goes, most specific first — two for `pypi`, which reaches neither the package level nor the group level:
 
-| Level   | Where it lives                                                                       | Reason                                                                                                                                 |
-| ------- | ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
-| Package | `storage_policy` on the package manifest                                             | One package whose bytes must live in a specific bucket while its type is shared with packages that must not |
-| Group   | `storage_by_group.<group>` in the config, joined by `storage_groups` on the manifest | A set of packages that belong together and are not a whole type: forty `apt` packages a customer entitles, an air-gapped mirror set    |
-| Type    | `storage_by_type.<type>` in the config                                               | A whole ecosystem on a separate volume                                                                                                 |
-| Global  | `storage_backend`/`storage_path`/`bucket`/`region`                                   | Everything else                                                                                                                        |
+| Level   | Where it lives                                                                       | Reason                                                                                                                              |
+| ------- | ------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| Package | `storage_policy` on the package manifest                                             | One package whose bytes must live in a specific bucket while its type is shared with packages that must not                         |
+| Group   | `storage_by_group.<group>` in the config, joined by `storage_groups` on the manifest | A set of packages that belong together and are not a whole type: forty `apt` packages a customer entitles, an air-gapped mirror set |
+| Type    | `storage_by_type.<type>` in the config                                               | A whole ecosystem on a separate volume                                                                                              |
+| Global  | `storage_backend`/`storage_path`/`bucket`/`region`                                   | Everything else                                                                                                                     |
 
 One version can be directed past all four at write time with [`--storage`](#placing-one-version-at-write-time) on `upload` or `sync`. That is not a fifth level: it records a name on the version entry and stops deciding, where a level would re-decide at every future upload. `pypi` cannot take it, for the same reason it never reaches the package level.
 
@@ -2892,6 +2892,7 @@ bodega treats Linux and FreeBSD as peers. Both run the server, both are clients 
 | Client of the server                            | apt, and every language client                       | `pkg`, ports distfiles (`make fetch`), and every language client                                                                |
 | Client configuration written by `bodega doctor` | apt sources and keyring, credentials                 | `pkg` repository configuration, credentials                                                                                     |
 | Host checks in `bodega doctor`                  | apt sources, snap, flatpak, pip, npm, cargo, GOPROXY | pip, npm, cargo, GOPROXY; the pip and npm checks read Linux paths only                                                          |
+| Profile rules                                   | per package; apt hosts read a filtered codename      | per repository and ABI; the catalog is not filtered per package ([#54](https://github.com/ravinald/bodega/issues/54))           |
 | Release archive                                 | amd64, arm64                                         | not yet                                                                                                                         |
 | Distribution package                            | `.deb` and `.rpm`, with the systemd unit             | not yet                                                                                                                         |
 | Service definition                              | [bodega.service](bodega.service) (systemd)           | not yet: no rc.d script                                                                                                         |
@@ -2903,10 +2904,11 @@ macOS builds and has release archives for amd64 and arm64. It is supported for d
 
 The FreeBSD gaps, stated so none of them is discovered by surprise:
 
-- **No release archive, distribution package or rc.d script.** Build from source on the host: the Makefile needs GNU make and the stock `go` package trails `go.mod`, so `pkg install gmake go126`, put `/usr/local/go126/bin` first on `PATH`, and run `gmake build`. Or cross-compile with the `CROSS_TARGETS` override in the table, and supervise the binary with `daemon(8)` under a service script of your own.
-- **No unit tests run on FreeBSD in CI.** The FreeBSD storage code is exercised by the end-to-end suite, which runs by hand.
-- **`bodega doctor` has no FreeBSD host checks.** It writes the `pkg` repository configuration but does not read `/etc/pkg/FreeBSD.conf`, `/usr/local/etc/pkg/repos/` or `/etc/make.conf` to report a host that still reaches upstream, and its pip and npm checks do not read `/usr/local/etc/pip.conf` or `/usr/local/etc/npmrc`.
-- **`bodega pkg convert` has no FreeBSD importer**, so a FreeBSD host is cataloged with `bodega pkg create` or by running the server with `discover_mode` set to `"observe"`.
+- **No release archive, distribution package or rc.d script** ([#48](https://github.com/ravinald/bodega/issues/48)). Build from source on the host: the Makefile needs GNU make and the stock `go` package trails `go.mod`, so `pkg install gmake go126`, put `/usr/local/go126/bin` first on `PATH`, and run `gmake build`. Or cross-compile with the `CROSS_TARGETS` override in the table, and supervise the binary with `daemon(8)` under a service script of your own.
+- **No unit tests run on FreeBSD in CI** ([#48](https://github.com/ravinald/bodega/issues/48)). The FreeBSD storage code is exercised by the end-to-end suite, which runs by hand.
+- **`bodega doctor` has no FreeBSD host checks** ([#49](https://github.com/ravinald/bodega/issues/49)). It writes the `pkg` repository configuration but does not read `/etc/pkg/FreeBSD.conf`, `/usr/local/etc/pkg/repos/` or `/etc/make.conf` to report a host that still reaches upstream, and its pip and npm checks do not read `/usr/local/etc/pip.conf` or `/usr/local/etc/npmrc`.
+- **`bodega pkg convert` has no FreeBSD importer** ([#53](https://github.com/ravinald/bodega/issues/53)), so a FreeBSD host is cataloged with `bodega pkg create` or by running the server with `discover_mode` set to `"observe"`.
+- **Profile rules stop at the pkg repository** ([#54](https://github.com/ravinald/bodega/issues/54)). A profile admits or refuses a whole repository for an ABI; the catalog a host reads is not filtered per package the way apt's filtered codenames are.
 
 The build requires the Go version `go.mod` names on either system.
 
@@ -3182,7 +3184,7 @@ Each client reads its own configuration file, and this section shows what to put
 | pip, npm, cargo, Go, helm, git | hand, from the stanzas below                                       | the client line shown in the TUI and web dashboard; `--write-credentials` places the token each one reads, and for helm also registers the repository |
 | FreeBSD ports (`make.conf`)    | hand, from [Mirroring ports distfiles](#mirroring-ports-distfiles) | the client check at `/distfiles/@environment.mk`                                                                                                      |
 
-Both writers need the `bodega` binary on the client, and each run performs one write. **Planned, not built yet:** the server serving each client's rendered file and a plan of which ones a host should use, worked out from the host's identity and profile, plus a setup script served by bodega that applies a chosen subset of that plan on a host without the binary. Until then, a fleet without the binary copies these files through its own configuration management.
+Both writers need the `bodega` binary on the client, and each run performs one write. **Planned, not built yet** ([#50](https://github.com/ravinald/bodega/issues/50), [#51](https://github.com/ravinald/bodega/issues/51), [#52](https://github.com/ravinald/bodega/issues/52)): the server serving each client's rendered file and a plan of which ones a host should use, worked out from the host's identity and profile, plus a setup script served by bodega that applies a chosen subset of that plan on a host without the binary. Until then, a fleet without the binary copies these files through its own configuration management.
 
 **APT** (`/etc/apt/sources.list.d/bodega.sources`), against a signed repository:
 
