@@ -30,13 +30,11 @@ For a flag-only change, toggling hide or freeze, the `PATCH` endpoints are safe,
 
 Under the default configuration, mutations from `127.0.0.0/8` are unauthenticated, which is convenient for operator shells on the bodega host itself. Any client outside the localhost range needs:
 
-1. Its source IP in `admin_permit_cidr` (set in `config.json`).
+1. Its source IP in the admin access list. `admin_permit_cidr` in `config.json` seeds that list the first time bodega sees an audit database without it; after that `bodega acl admin add <cidr>` owns it and the config key is inert.
 2. A valid Bearer token, created via:
 
 ```bash
-bodega token create my-automation \
-  --comment "ticketing integration" \
-  --expires 2026-07-01
+bodega token generate my-automation expiry 2026-07-01 "ticketing integration"
 ```
 
 That command prints the token once. Keep it; you can't retrieve it again. Then pass it on every mutating call:
@@ -234,7 +232,7 @@ curl -s "https://bodega.internal:8080/api/v1/audit?since=$(date +%F)&limit=200" 
 curl -s "https://bodega.internal:8080/api/v1/audit?name=%40example-corp%2Fwidget-cli" | jq .
 ```
 
-Mutations through the API are attributed by `client_ip` rather than `actor`, which is reserved for OS-user attribution on CLI and TUI operations. If you need human-level attribution for API calls, put it in the request path: issue a dedicated token per automation identity (`bodega token create ticketing`, `bodega token create gitops-reconciler`) and query the audit log by the client IP those tokens are used from.
+Mutations through the API are attributed by `client_ip` rather than `actor`, which is reserved for OS-user attribution on CLI and TUI operations. If you need human-level attribution for API calls, put it in the request path: issue a dedicated token per automation identity (`bodega token generate ticketing`, `bodega token generate gitops-reconciler`) and query the audit log by the client IP those tokens are used from.
 
 ## Rollback
 

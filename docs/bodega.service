@@ -130,6 +130,15 @@ ExecReload=/bin/kill -HUP $MAINPID
 # inside that file so this unit doesn't need to know about them.
 Environment=BODEGA_CONFIG_FILE=/etc/bodega/config.json
 
+# S3 credentials come from the AWS SDK's default chain; bodega has no
+# credential key of its own. On EC2 an instance role needs nothing here.
+# Elsewhere, pass them through an EnvironmentFile readable by this service
+# alone. ProtectHome=true below hides home directories, so a profile has to
+# live outside one: point AWS_CONFIG_FILE at it. Grant the role only what
+# `bodega init --print-policy=runtime` prints.
+#EnvironmentFile=/etc/bodega/aws.env
+#Environment=AWS_CONFIG_FILE=/etc/bodega/aws-config AWS_PROFILE=bodega
+
 # APT repository signing key. systemd copies the source file into a
 # per-service tmpfs at $CREDENTIALS_DIRECTORY, mode 0400, owned by this
 # service: the unit cannot write it back and no other service can read it.
@@ -160,9 +169,9 @@ LoadCredential=apt-signing.key:/etc/bodega/apt-signing.key
 Restart=on-failure
 RestartSec=5s
 
-# Generous start timeout: storage backend probing (S3 head on the
-# bucket) happens before READY=1, and a cold IAM/KMS path can take
-# a minute on occasion. Adjust down if you're running locally.
+# Generous start timeout: serve loads the manifests and opens the storage
+# backend before it binds, and READY=1 fires only once the socket accepts.
+# Adjust down if you're running locally.
 TimeoutStartSec=180
 
 # Hardening. Safe defaults; relax only if your install has a reason.

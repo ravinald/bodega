@@ -94,10 +94,13 @@ risk:
 - **FreeBSD distfiles, which carry neither attestation.** The digest that
   protects a distfile is pinned in the client's own ports tree: a port's
   `distinfo` records a SHA-256 and a size for each distfile, and `make checksum`
-  refuses bytes that disagree, wherever they came from. bodega has no distfiles
-  type. A distfile proxied through a `binary_upstreams` namespace is pinned on
-  first fetch like any other binary, which says only that later fetches match
-  the first. What the check is worth is what the tree is worth: `ports.txz`
+  refuses bytes that disagree, wherever they came from. The `distfiles` type
+  admits a fetch against that same `distinfo`, read from a ports tree on the
+  server, so bodega and the client check one digest from two copies of the
+  tree; the poisoned-first-fetch entry below covers the admission. A distfile
+  proxied through a `binary_upstreams` namespace instead is pinned on first
+  fetch like any other binary, which says only that later fetches match the
+  first. What the check is worth is what the tree is worth: `ports.txz`
   served as a `binary` entry is pinned to the digest the release `MANIFEST`
   publishes, and a tree cloned through a `git_upstreams` mirror is as
   trustworthy as the forge it mirrors.
@@ -197,7 +200,12 @@ risk:
   worth stating plainly: MD5 and a sidecar in the same directory detect an
   edit, not an attacker, because whoever can rewrite the manifest can rewrite
   the sidecar beside it. It catches a hand-edit, a partial restore and a
-  half-finished write; it is not a signature.
+  half-finished write; it is not a signature. On an S3 backend the earlier
+  version is what survives an attacker: `bodega init` turns on bucket
+  versioning, and the runtime policy that `bodega init --print-policy=runtime`
+  prints grants `s3:DeleteObject` without `s3:DeleteObjectVersion`, so a
+  compromised service can overwrite a manifest and its sidecar but cannot
+  remove the versions before them. The local backend has no equivalent.
 - **A manifest field that becomes a path.** A manifest is written by an
   operator, through `pkg create`, `pkg edit`, `pkg import` or the mutation API
   behind its token, or by hand in the store. No anonymous route writes one.
@@ -387,8 +395,10 @@ defence against:
   Bodega's controls assume the host itself is trustworthy.
 - **Bodega-server compromise.** A compromised bodega instance can serve any
   artifact it likes. Operate the server like any other piece of internal
-  infrastructure: principle of least privilege on the bucket IAM role,
-  short-lived credentials, audit-log forwarding off-box.
+  infrastructure: principle of least privilege on the bucket IAM role (the
+  [runtime policy](usage.md#s3-setup) `bodega init --print-policy=runtime`
+  prints is the minimum), short-lived credentials, audit-log forwarding
+  off-box.
 - **Anything inside an opaque distribution bundle.** When a package format
   bundles its own dependencies in a way bodega cannot inspect (see below),
   the contents of that bundle are outside bodega's allow-list. Bodega may
@@ -696,10 +706,12 @@ instance, the recommended posture is:
   profile (`/etc/environment` or `/etc/profile.d/`). Audit casks separately
   — they are not covered by this flag.
 - **Configure each package manager to talk to bodega exclusively.**
-  `bodega doctor` enumerates every file that needs editing and the bodega
-  endpoint each should point at. Re-run `bodega doctor` after rewriting to
-  confirm exit 0.
-- **Set `GOPROXY` to `http://<bodega>/gomod,off`**, never `,direct`. The
+  `bodega doctor` enumerates the files it checks and the bodega endpoint each
+  should point at. Re-run `bodega doctor` after rewriting to confirm exit 0.
+  On FreeBSD it does not yet check the pkg repository configuration or
+  `/etc/make.conf`, so inspect `/usr/local/etc/pkg/repos/` and
+  `MASTER_SITE_OVERRIDE` by hand.
+- **Set `GOPROXY` to `http://<bodega>/go,off`**, never `,direct`. The
   `,off` form makes cache misses fail loudly; `,direct` silently falls
   through to public VCS, defeating the chokepoint.
 - **Run `bodega doctor` in CI** as a gate step. Exit 0 is clean, exit 2 is a
