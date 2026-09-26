@@ -14,8 +14,11 @@
 #
 # This suite mutates both ends. The server gets a ports tree at /usr/ports,
 # distfiles_* keys in config.json and a distfiles manifest entry, all removed
-# at the end. The freebsd guest gets two read-only nullfs mounts, over the
-# scratch tree and over /usr/share/mk, unmounted at the end and checked.
+# at the end, and whatever 47 cached under binaries/distfiles is moved aside
+# in storage and put back. The freebsd guest gets two read-only nullfs mounts,
+# over the scratch tree and over /usr/share/mk, and a fetch user with no sudo
+# grant; the mounts are lifted and the user removed at the end, and both are
+# checked.
 
 # shellcheck source=../lib/assert.sh
 . "${E2E_DIR:?run.sh sets E2E_DIR}/lib/assert.sh"
@@ -88,9 +91,20 @@ FD_SERVER_TREE=/usr/ports
 FD_STAMP="$FD_SERVER_TREE/.bodega-e2e-49"
 FD_SERVER_ROOT=/var/tmp/bodega-e2e-distfiles-server
 
+# make runs as an account the suite creates, because a make that can sudo can
+# lift the read-only mounts stableView reads, and stableView cannot see a
+# grant (docs/usage.md#the-client-check). ravi's grant is passwordless. The
+# comment field marks the account as this suite's, so cleanup never removes
+# one it did not create.
+FD_USER=bodega-e2e-fetch
+FD_USER_MARK="bodega e2e suite 49 fetch user"
+fd_user_drop="[ \"\$(sudo -n pw usershow -n $FD_USER 2>/dev/null | cut -d: -f8)\" = '$FD_USER_MARK' ] \
+	&& sudo -n pw userdel -n $FD_USER; true"
+fd_as="sudo -n -u $FD_USER env -i PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin HOME=/nonexistent"
+
 ports_sha="$(printf '%s' "$(e2e_fixture ports-txz)" | jq -r '.versions[0].sha256')"
 ports_url="$E2E_BASE_URL/binaries/freebsd-ports/15.1-RELEASE/ports.txz"
-fd_make="env __MAKE_CONF=$FD_ROOT/make.conf make -C $FD_PORTS/$FD_PORT WRKDIRPREFIX=$FD_WRK"
+fd_make="$fd_as __MAKE_CONF=$FD_ROOT/make.conf make -C $FD_PORTS/$FD_PORT WRKDIRPREFIX=$FD_WRK"
 fd_make_http="$fd_make DISTDIR=$FD_DISTDIR"
 
 # The declaration a stock 15.1 arm64 client needs, measured against this
@@ -170,9 +184,20 @@ fd_wait_index "$fd_digest" || true
 check_eq FDIST-04 "the server finishes reading the tree and answers a name no distinfo lists" "404" \
 	"$E2E_OUT" "internal/server/distfiles.go:193" "curl /distfiles/@<env>/bodega-e2e/..." "$E2E_RC"
 
+# An empty binary_upstreams still reads storage (internal/server/binary.go),
+# so an object 47's open namespace cached there answers the name. It moves
+# aside under the storage root rather than to /tmp, which the unit keeps
+# private, and cleanup puts it back. A stash an aborted run left is restored
+# before anything moves, and one that would overwrite a live tree stays put.
+fd_bin="$fd_storage/binaries/distfiles"
+fd_bin_stash="$fd_storage/.bodega-e2e-49-binaries-distfiles"
+e2e_on server "if sudo test -e $fd_bin_stash; then \
+	if sudo test -e $fd_bin; then echo conflict; exit 3; fi; sudo mv $fd_bin_stash $fd_bin; fi; \
+	if sudo test -e $fd_bin; then sudo mv $fd_bin $fd_bin_stash && echo moved; else echo none; fi" || true
+fd_bin_moved="$E2E_OUT"
 e2e_http server "/binaries/distfiles/$fd_name" || true
 check_ne FDIST-05 "no binary namespace answers the distfile" "200" "$E2E_OUT" \
-	"internal/server/binary.go" "curl /binaries/distfiles/$fd_name"
+	"internal/server/binary.go" "mv $fd_bin aside ($fd_bin_moved); curl /binaries/distfiles/$fd_name"
 
 # ---- client ----------------------------------------------------------------
 #
@@ -188,11 +213,27 @@ curl -sS -o /dev/null -w '%{http_code}' --max-time 10 '$E2E_BASE_URL/healthz'" |
 check_eq FDIST-06 "the freebsd guest reaches the server by name" "200" "$E2E_OUT" \
 	"test/e2e/suites/10-ship-install.sh" "curl $E2E_BASE_URL/healthz" "$E2E_RC"
 
+fd_sh "$fd_user_drop
+sudo -n pw useradd -n $FD_USER -c '$FD_USER_MARK' -d /nonexistent -s /usr/sbin/nologin &&
+sudo -n pw usershow -n $FD_USER | cut -d: -f8" || true
+check_eq FDIST-07 "a fetch user for make is created" "$FD_USER_MARK" "$E2E_OUT" \
+	"test/e2e/suites/49-freebsd-distfiles.sh" "pw useradd -n $FD_USER" "$E2E_RC"
+
+# Asked from both sides: sudoers lists nothing for the user, and the user's
+# own sudo and doas both refuse.
+fd_sh "sudo -n -l -U $FD_USER | grep -q 'is not allowed to run sudo' && echo sudoers:none || echo sudoers:granted
+$fd_as sudo -n true >/dev/null 2>&1 && echo sudo:granted || echo sudo:refused
+if [ -x /usr/local/bin/doas ]; then $fd_as /usr/local/bin/doas -n true >/dev/null 2>&1 && echo doas:granted || echo doas:refused; else echo doas:absent; fi" || true
+check_eq FDIST-08 "the fetch user holds no grant that could lift the mounts" \
+	"sudoers:none|sudo:refused|doas:absent" "$(printf '%s' "$E2E_OUT" | tr '\n' '|')" \
+	"docs/usage.md#the-client-check" "sudo -l -U $FD_USER; sudo -u $FD_USER sudo -n true" "$E2E_RC"
+
 fd_unmount="for p in $FD_PORTS $FD_SYSMK; do \
 	/sbin/mount -p | awk -v p=\"\$p\" '\$2 == p && \$3 == \"nullfs\" {f=1} END {exit !f}' && sudo -n umount \"\$p\"; \
 done; true"
 fd_sh "$fd_unmount
-rm -rf $FD_ROOT && mkdir -p $FD_DISTDIR $FD_WRK $FD_MIRROR &&
+sudo -n rm -rf $FD_ROOT && mkdir -p $FD_DISTDIR $FD_WRK $FD_MIRROR &&
+sudo -n chown $FD_USER $FD_DISTDIR $FD_WRK &&
 curl -sS -o $FD_ROOT/ports.txz '$ports_url' &&
 tar -xf $FD_ROOT/ports.txz -C $FD_ROOT usr/ports/Mk usr/ports/Templates usr/ports/Keywords \
 	usr/ports/$FD_PORT usr/ports/$FD_RPORT &&
@@ -220,12 +261,14 @@ MASTER_SITE_OVERRIDE?=	$E2E_BASE_URL/distfiles/@\${BODEGA_DISTFILES_ENV}/\${DIST
 EOF
 e2e_put freebsd "$fd_check_file" "$FD_ROOT/bodega-distfiles.mk" || true
 e2e_put freebsd "$fd_conf" "$FD_ROOT/make.conf" || true
+fd_sh "chmod 0644 $FD_ROOT/bodega-distfiles.mk $FD_ROOT/make.conf" || true
 
 # The client check refuses a tree or /usr/share/mk that make could change
 # while it reads a port: a nullfs over itself, read-only, leaves no second
-# name for the files, and make runs as ravi because a root make could lift
-# the mount and names "unsupported" however the tree is mounted.
-fd_sh "sudo -n mount -t nullfs -o ro $FD_PORTS $FD_PORTS && sudo -n mount -t nullfs -o ro $FD_SYSMK $FD_SYSMK &&
+# name for the files, and make runs as the fetch user, who can lift neither.
+# The tree is root's, as the client check's documentation asks, so the mount
+# is not the only thing between the fetch user and its files.
+fd_sh "sudo -n chown -R root:wheel $FD_PORTS && sudo -n mount -t nullfs -o ro $FD_PORTS $FD_PORTS && sudo -n mount -t nullfs -o ro $FD_SYSMK $FD_SYSMK &&
 /sbin/mount -p | awk '(\$2 == \"$FD_PORTS\" || \$2 == \"$FD_SYSMK\") && \$1 == \$2 && \$3 == \"nullfs\" && \$4 ~ /(^|,)ro(,|\$)/ {n++} END {print n+0}'" || true
 check_eq FDIST-12 "the tree and /usr/share/mk sit on read-only nullfs mounts" "2" "$E2E_OUT" \
 	"internal/distinfo/environment.go:372" "mount -t nullfs -o ro; mount -p" "$E2E_RC"
@@ -233,7 +276,8 @@ check_eq FDIST-12 "the tree and /usr/share/mk sit on read-only nullfs mounts" "2
 # The assertion everything below depends on.
 fd_sh "$fd_make_http -V BODEGA_DISTFILES_ENV -V BODEGA_DISTFILES_DRIFT" || true
 fd_env="$(printf '%s\n' "$E2E_OUT" | sed -n 1p)"
-fd_drift="$(printf '%s\n' "$E2E_OUT" | sed -n 2p)"
+# The drift list keeps a separator for every term that expanded to nothing.
+fd_drift="$(printf '%s\n' "$E2E_OUT" | awk 'NR == 2 {$1 = $1; print}')"
 check_eq FDIST-13 "the guest's check names the environment the server admitted against" \
 	"$fd_digest" "$fd_env${fd_drift:+ (drift: $fd_drift)}" "internal/distinfo/environment.go:239" \
 	"make -V BODEGA_DISTFILES_ENV -V BODEGA_DISTFILES_DRIFT" "$E2E_RC"
@@ -261,7 +305,7 @@ if [ "${E2E_DRY_RUN:-no}" = yes ] || { [ -n "$fd_digest" ] && [ "$fd_env" = "$fd
 	# Read on the guest under the declared environment first: a 451 for a port
 	# whose terms the reader could not read would pass the status check for
 	# the wrong reason.
-	fd_sh "env __MAKE_CONF=$FD_ROOT/make.conf make -C $FD_PORTS/$FD_RPORT WRKDIRPREFIX=$FD_WRK DISTDIR=$FD_DISTDIR \
+	fd_sh "$fd_as __MAKE_CONF=$FD_ROOT/make.conf make -C $FD_PORTS/$FD_RPORT WRKDIRPREFIX=$FD_WRK DISTDIR=$FD_DISTDIR \
 		-V BODEGA_DISTFILES_ENV -V NO_CDROM -V '\${RESTRICTED:Uunset}'" || true
 	check_eq FDIST-30 "the guest reads games/adom's terms under the declared environment" \
 		"$fd_digest|Copy of CD must be sent to author|unset" "$(printf '%s' "$E2E_OUT" | tr '\n' '|')" \
@@ -348,7 +392,7 @@ E2E_HOST=freebsd
 e2e_put freebsd "$fd_conf" "$FD_ROOT/make.conf" || true
 fd_sh "$fd_make -V BODEGA_DISTFILES_ENV -V BODEGA_DISTFILES_DRIFT" || true
 fd_env2="$(printf '%s\n' "$E2E_OUT" | sed -n 1p)"
-fd_drift2="$(printf '%s\n' "$E2E_OUT" | sed -n 2p)"
+fd_drift2="$(printf '%s\n' "$E2E_OUT" | awk 'NR == 2 {$1 = $1; print}')"
 check_eq FDIST-52 "the guest's check, read from the builder's copy, names the DISTDIR's environment" \
 	"$fd_digest2" "$fd_env2${fd_drift2:+ (drift: $fd_drift2)}" "docs/usage.md#client-side-distdir" \
 	"tar | tar $FD_MIRROR (rc $fd_copy_rc); make -V BODEGA_DISTFILES_ENV" "$E2E_RC"
@@ -372,7 +416,10 @@ fd_sh "$fd_unmount
 /sbin/mount -p | awk '\$2 == \"$FD_PORTS\" || \$2 == \"$FD_SYSMK\" {n++} END {print n+0}'" || true
 check_eq FDIST-90 "both nullfs mounts are lifted again" "0" "$E2E_OUT" \
 	"test/e2e/suites/49-freebsd-distfiles.sh" "umount; mount -p" "$E2E_RC"
-fd_sh "rm -rf $FD_ROOT" || true
+fd_sh "sudo -n rm -rf $FD_ROOT; $fd_user_drop
+sudo -n pw usershow -n $FD_USER >/dev/null 2>&1 && echo present || echo absent" || true
+check_eq FDIST-92 "the fetch user is removed again" "absent" "$E2E_OUT" \
+	"test/e2e/suites/49-freebsd-distfiles.sh" "pw userdel -n $FD_USER" "$E2E_RC"
 
 E2E_HOST=server
 e2e_bodega server "pkg delete distfiles '$fd_name'" || true
@@ -384,9 +431,14 @@ e2e_config_get server '[.distfiles_ports_tree, .distfiles_environment_variables]
 check_eq FDIST-91 "the distfiles configuration is removed again" "0" "$E2E_OUT" \
 	"test/e2e/suites/49-freebsd-distfiles.sh" "jq distfiles_* config.json"
 
+e2e_on server "if sudo test -e $fd_bin_stash; then \
+	if sudo test -e $fd_bin; then echo conflict; exit 3; fi; sudo mv $fd_bin_stash $fd_bin && echo moved; else echo none; fi" || true
+check_eq FDIST-93 "what 47 cached under binaries/distfiles is put back" "$([ "${fd_bin_moved:-none}" = none ] && echo none || echo moved)" "$E2E_OUT" \
+	"test/e2e/suites/49-freebsd-distfiles.sh" "mv $fd_bin_stash $fd_bin" "$E2E_RC"
+
 rm -f "$fd_conf" "$fd_check_file"
 unset FD_ROOT FD_PORTS FD_DISTDIR FD_WRK FD_MIRROR FD_SYSMK FD_PORT FD_SUBDIR FD_RPORT FD_SERVER_TREE \
-	FD_STAMP FD_SERVER_ROOT ports_sha ports_url fd_make fd_make_http fd_decl_files fd_decl_stock fd_decl_http \
+	FD_STAMP FD_SERVER_ROOT FD_USER FD_USER_MARK fd_user_drop fd_as fd_bin fd_bin_stash fd_bin_moved ports_sha ports_url fd_make fd_make_http fd_decl_files fd_decl_stock fd_decl_http \
 	fd_decl_distdir fd_storage fd_name fd_rname fd_check fd_digest fd_unmount fd_server_pins fd_conf \
 	fd_check_file fd_env fd_drift fd_route fd_fetch fd_rstatus fd_rbody fd_pstatus fd_pbody fd_art fd_digest2 \
 	fd_distroot fd_copy_rc fd_sopts fd_fopts fd_env2 fd_drift2
