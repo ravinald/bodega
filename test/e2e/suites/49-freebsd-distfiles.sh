@@ -81,7 +81,9 @@ FD_PORT=databases/sqlite-ext-pcre
 FD_SUBDIR=sqlite-ext
 FD_RPORT=games/adom
 
-FD_SERVER_ROOT=/var/tmp/bodega-e2e-distfiles-server
+# Not under /tmp or /var/tmp: the unit's PrivateTmp gives the server its own
+# copy of both, so a tree extracted there is one the server cannot see.
+FD_SERVER_ROOT=/srv/bodega-e2e-distfiles-server
 FD_SERVER_TREE="$FD_SERVER_ROOT/usr/ports"
 
 # make runs as an account the suite creates, because a make that can sudo can
@@ -144,8 +146,8 @@ fi
 # The server reads distinfo from the tarball the guest builds from, byte for
 # byte: a name the two trees pin differently is refused by one side or the
 # other, and a suite that skews them proves neither.
-e2e_on server "sudo rm -rf $FD_SERVER_ROOT && mkdir -p $FD_SERVER_ROOT && \
-	curl -sSf -o $FD_SERVER_ROOT/ports.txz '$ports_url' && \
+e2e_on server "sudo rm -rf $FD_SERVER_ROOT && sudo mkdir -p $FD_SERVER_ROOT && \
+	sudo curl -sSf -o $FD_SERVER_ROOT/ports.txz '$ports_url' && \
 	sudo tar -xf $FD_SERVER_ROOT/ports.txz -C $FD_SERVER_ROOT usr/ports && \
 	sha256sum $FD_SERVER_ROOT/ports.txz | cut -d' ' -f1" || true
 check_eq FDIST-01 "the server's ports tree comes from the tarball the release MANIFEST names" \
