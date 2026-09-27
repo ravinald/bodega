@@ -674,3 +674,119 @@ func TestDistinfoInAMissingDirectoryIsUnowned(t *testing.T) {
 		t.Fatalf("pcpustat: %v, unowned %q; want every name refused for a distinfo in no directory", err, u)
 	}
 }
+
+// stockSpec is the declaration docs/usage.md#the-client-environment gives for
+// a stock 15.1 arm64 client.
+func stockSpec() EnvironmentSpec {
+	return EnvironmentSpec{
+		Variables: map[string][]string{
+			"LOCALBASE": {"/usr/local"}, "ARCH": {"aarch64"}, "USESDIR": {"${PORTSDIR}/Mk/Uses"},
+			"NODEJS_VERSION": {"24"}, "LLVM_DEFAULT": {"19"},
+			"PKGNAMESUFFIX": {}, "WANTEDPORTSCFG": {}, "CFENGINE_VERSION": {}, "CFGFILE": {}, "KRB5_VERSION": {},
+			"LLVM_SUFFIX": {}, "WANT_PGSQL_VER": {}, "XPDF_VERSION": {}, "OPTIONS_DEFINE": {},
+		},
+		Files: map[string][]string{
+			"/usr/local/etc/aspell.ver": {Absent}, "/var/db/wanted-ports.conf": {Absent}, "/tmp/PERL5_DEFAULT": {Absent},
+			"/Makefile.common": {Absent}, "/usr/share/mk/Makefile.local": {Absent},
+		},
+	}
+}
+
+// bootstrapJDKTree carries java/bootstrap-openjdk8 as the 15.1 tree has it:
+// Makefile.update falls back to PORTSDIR=/usr/ports only where the JDK port
+// beside it is missing. The Makefile sets JDK_PORT before Makefile.update's
+// ?= is read; without it the ?= would leave a value make.conf may set, and
+// the exists() reading it could not be decided. The port is restricted, so a
+// Makefile.* the reader cannot place refuses every distfile in the tree.
+func bootstrapJDKTree(t *testing.T) string {
+	t.Helper()
+	root := portsTree(t)
+	write(t, root, "Mk/bsd.commands.mk", "")
+	write(t, root, "java/openjdk8/Makefile", "PORTNAME=\topenjdk\n")
+	write(t, root, "java/bootstrap-openjdk8/Makefile", "PORTNAME=\topenjdk8\nPKGNAMEPREFIX=\tbootstrap-\nNO_CDROM=\tbinary bootstrap\n"+
+		"JDK_ARCH=\t${ARCH:C/armv.*/arm/:S/powerpc/ppc/}\nJDK_PORT=\topenjdk8\n.include <bsd.port.pre.mk>\n")
+	write(t, root, "java/bootstrap-openjdk8/Makefile.update", "JDK_ARCH?=\t${ARCH:C/armv.*/arm/:S/powerpc/ppc/}\n"+
+		"JDK_PORT?=\topenjdk8\n"+
+		"JDK_ROOT?=\tbootstrap-${JDK_PORT}\n"+
+		"\n"+
+		".if !defined(PORTSDIR)\n"+
+		".if exists(${.CURDIR}/../${JDK_PORT}/Makefile)\n"+
+		"PORTSDIR=\t${.CURDIR}/../..\n"+
+		".else\n"+
+		"PORTSDIR=\t/usr/ports\n"+
+		".endif\n"+
+		".endif\n"+
+		"\n"+
+		"LOCALBASE?=\t/usr/local\n"+
+		"\n"+
+		".include \"${PORTSDIR}/Mk/bsd.commands.mk\"\n")
+	return root
+}
+
+// B97: a tree anywhere but /usr/ports admitted nothing, because the reader
+// read the .else the tree rules out and followed /usr/ports out of the tree.
+func TestExistsInTheTreeDecidesTheBranch(t *testing.T) {
+	ix := loadWith(t, bootstrapJDKTree(t), stockSpec())
+	if u := ix.Unowned(); len(u) != 0 {
+		t.Fatalf("Unowned() = %q, want none: java/openjdk8/Makefile exists, so no client reads the /usr/ports branch", u)
+	}
+	if _, err := ix.Lookup("pcpustat/1.6.tar.bz2"); err != nil {
+		t.Errorf("pcpustat/1.6.tar.bz2: %v, want admitted", err)
+	}
+}
+
+// Where the tree selects the /usr/ports branch, that branch is read and its
+// include leaves the tree, so the port is unplaced as before.
+func TestExistsInTheTreeReadsTheBranchItSelects(t *testing.T) {
+	root := bootstrapJDKTree(t)
+	if err := os.Remove(filepath.Join(root, "java/openjdk8/Makefile")); err != nil {
+		t.Fatal(err)
+	}
+	ix := loadWith(t, root, stockSpec())
+	if u := ix.Unowned(); len(u) != 1 || !strings.Contains(u[0], "java/bootstrap-openjdk8") {
+		t.Fatalf("Unowned() = %q, want java/bootstrap-openjdk8 alone", u)
+	}
+	if e, err := ix.Lookup("pcpustat/1.6.tar.bz2"); !errors.Is(err, ErrRestricted) || !strings.Contains(e.Restricted, "java/bootstrap-openjdk8") {
+		t.Errorf("pcpustat/1.6.tar.bz2: %v (reason %q), want refused on bootstrap-openjdk8's account", err, e.Restricted)
+	}
+}
+
+// Each condition either rules out the branch holding an include that leaves
+// the tree, and the port reads to the end, or is forked, and the include
+// unplaces the port.
+func TestExistsDecidesOnlyInsideTheTree(t *testing.T) {
+	const out = ".include \"/nonexistent-bodega/x.mk\"\n"
+	for name, tc := range map[string]struct {
+		makefile string
+		forked   bool
+	}{
+		"exists":               {makefile: ".if exists(${.CURDIR}/Makefile)\n.else\n" + out + ".endif\n"},
+		"negated":              {makefile: ".if ! exists(${.CURDIR}/Makefile)\n" + out + ".endif\n"},
+		"missing":              {makefile: ".if exists(${.CURDIR}/missing)\n" + out + ".endif\n"},
+		"elif":                 {makefile: ".if exists(${.CURDIR}/missing)\n.elif exists(${PORTSDIR}/lang/probe/Makefile)\n.else\n" + out + ".endif\n"},
+		"after a taken one":    {makefile: ".if exists(${.CURDIR}/Makefile)\n.elif defined(X)\n" + out + ".else\n" + out + ".endif\n"},
+		"nested in skipped":    {makefile: ".if exists(${.CURDIR}/missing)\n.if defined(X)\n" + out + ".else\n" + out + ".endif\n.for f in a\n" + out + ".endfor\n.endif\n"},
+		"a directory":          {makefile: ".if !exists(${PORTSDIR}/lang)\n" + out + ".endif\n"},
+		"outside the tree":     {makefile: ".if exists(/usr/local/etc)\n.else\n" + out + ".endif\n", forked: true},
+		"leaves through ..":    {makefile: ".if !exists(${PORTSDIR}/../x)\n" + out + ".endif\n", forked: true},
+		"unresolvable":         {makefile: ".if !exists(${UNKNOWN}/Makefile)\n" + out + ".endif\n", forked: true},
+		"values disagree":      {makefile: ".if defined(Y)\nD=\tmissing\n.else\nD=\tMakefile\n.endif\n.if exists(${.CURDIR}/${D})\n.else\n" + out + ".endif\n", forked: true},
+		"compound":             {makefile: ".if exists(${.CURDIR}/Makefile) && defined(X)\n.else\n" + out + ".endif\n", forked: true},
+		"set outside the tree": {makefile: "V?=\tprobe\n.if !exists(${.CURDIR}/../${V}/Makefile)\n" + out + ".endif\n", forked: true},
+		"trailing slash":       {makefile: ".if !exists(${.CURDIR}/Makefile/)\n" + out + ".endif\n", forked: true},
+		"other condition":      {makefile: ".if defined(X)\n.else\n" + out + ".endif\n", forked: true},
+		"undecided then else":  {makefile: ".if defined(X)\n.elif exists(${.CURDIR}/Makefile)\n.else\n" + out + ".endif\n"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := portsTree(t)
+			write(t, root, "lang/probe/Makefile", "NO_CDROM=\tprobe\n"+tc.makefile)
+			ix, err := Load(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if u := ix.Unowned(); tc.forked != (len(u) == 1 && strings.Contains(u[0], "lang/probe")) {
+				t.Errorf("Unowned() = %q, want forked=%v", u, tc.forked)
+			}
+		})
+	}
+}

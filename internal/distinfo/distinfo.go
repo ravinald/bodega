@@ -441,6 +441,7 @@ var (
 	conditionalOpen  = regexp.MustCompile(`^[ \t]*\.[ \t]*(if|ifdef|ifndef|ifmake|ifnmake|for)\b`)
 	conditionalClose = regexp.MustCompile(`^[ \t]*\.[ \t]*(endif|endfor)\b`)
 	conditionalElse  = regexp.MustCompile(`^[ \t]*\.[ \t]*(else|elif[a-z]*)\b`)
+	existsCondition  = regexp.MustCompile(`^[ \t]*\.[ \t]*(?:el)?if\b[ \t]*(!?)[ \t]*exists[ \t]*\(`)
 	assignment       = regexp.MustCompile(`^[ \t]*([A-Za-z_.][A-Za-z0-9_.]*)[ \t]*([?:+!]?)=[ \t]*(.*?)[ \t]*$`)
 	includeDirective = regexp.MustCompile(`^[ \t]*\.[ \t]*(-?include|sinclude|dinclude)[ \t]+"([^"]*)"`)
 )
@@ -1139,7 +1140,18 @@ type source struct {
 // the .if as one more branch when there is no .else. So an assignment and the
 // include after it in one branch see the assignment alone, and an exhaustive
 // .if/.else leaves no path on which a variable both branches set is still
-// undefined. Conditions are still not evaluated: every branch is read.
+// undefined.
+//
+// One condition is decided rather than forked: .if or .elif exists(X), or its
+// negation, where every value X can take resolves inside the tree. The
+// server's copy of the tree answers whether a path in it exists exactly as it
+// answers what an include there reads (see lookup), so the branch it selects
+// is the branch every supported client takes, and the others are skipped. No
+// other condition has that property: defined(), make() and comparisons read
+// state set outside the tree, and exists() of a path outside it asks about a
+// client's filesystem. So each of those forks, as does an exists() whose
+// argument leaves the tree, reads a value the reader cannot resolve, or names
+// paths that disagree about whether they exist.
 func (r *makeReader) read(src source, depth int, conditional, guarded, looping bool) string {
 	file := src.path
 	if r.open[src.key] {
@@ -1194,6 +1206,23 @@ func (r *makeReader) read(src source, depth int, conditional, guarded, looping b
 		return false
 	}
 	for _, line := range strings.Split(string(b), "\n") {
+		// A branch the tree rules out is not read. Only the directives that
+		// open and close blocks are followed, to find where the branch ends.
+		if n := len(blocks); n > 0 && blocks[n-1].chain != nil && blocks[n-1].chain.skipping {
+			c := blocks[n-1].chain
+			closes := conditionalClose.MatchString(line)
+			switch {
+			case conditionalOpen.MatchString(line):
+				c.nested++
+				continue
+			case closes && c.nested > 0:
+				c.nested--
+				continue
+			case closes, c.nested == 0 && conditionalElse.MatchString(line):
+			default:
+				continue
+			}
+		}
 		line = bindLoopVars(line, blocks)
 		for _, name := range modifierTargets(line) {
 			if strings.HasPrefix(name, ".") {
@@ -1222,7 +1251,13 @@ func (r *makeReader) read(src source, depth int, conditional, guarded, looping b
 				if m[1] == "for" {
 					return fmt.Sprintf("%s has a .for the reader cannot parse: %q", file, strings.TrimSpace(line))
 				}
-				blocks = append(blocks, block{chain: &ifChain{before: copyVars(r.vars)}})
+				c := &ifChain{before: copyVars(r.vars)}
+				if m[1] == "if" {
+					c.enter(r.decide(line, parseDir))
+				} else {
+					c.enter(false, false)
+				}
+				blocks = append(blocks, block{chain: c})
 				continue
 			}
 			if m := conditionalElse.FindStringSubmatch(line); m != nil {
@@ -1233,9 +1268,20 @@ func (r *makeReader) read(src source, depth int, conditional, guarded, looping b
 				if c.sawElse {
 					return fmt.Sprintf("%s has a .%s after an .else", file, m[1])
 				}
-				c.branches = append(c.branches, r.vars)
+				if !c.skipping {
+					c.branches = append(c.branches, r.vars)
+				}
 				r.vars = copyVars(c.before)
 				c.sawElse = m[1] == "else"
+				c.nested = 0
+				switch {
+				case c.sawElse:
+					c.enter(true, true)
+				case m[1] == "elif" && !c.covered:
+					c.enter(r.decide(line, parseDir))
+				default:
+					c.enter(false, false)
+				}
 				continue
 			}
 			if m := conditionalClose.FindStringSubmatch(line); m != nil {
@@ -1247,8 +1293,11 @@ func (r *makeReader) read(src source, depth int, conditional, guarded, looping b
 					return fmt.Sprintf("%s closes a block with an .%s that does not match it", file, m[1])
 				}
 				if c := top.chain; c != nil {
-					branches := append(c.branches, r.vars)
-					if !c.sawElse {
+					branches := c.branches
+					if !c.skipping {
+						branches = append(branches, r.vars)
+					}
+					if !c.covered {
 						branches = append(branches, c.before)
 					}
 					r.vars = mergeVars(branches)
@@ -1378,11 +1427,77 @@ type block struct {
 }
 
 // ifChain is what an open .if chain has seen: the variables when it opened,
-// and each branch's variables as that branch ended.
+// and each read branch's variables as that branch ended. covered is whether
+// some branch so far is certain to run when none before it did, which rules
+// out every branch after it and the path through none of them. skipping is
+// whether the current branch is ruled out, and nested counts the blocks
+// opened inside it while it is skipped.
 type ifChain struct {
 	before   map[string][]string
 	branches []map[string][]string
 	sawElse  bool
+	covered  bool
+	skipping bool
+	nested   int
+}
+
+// enter starts a branch whose condition, if known, holds or not.
+func (c *ifChain) enter(known, holds bool) {
+	c.skipping = c.covered || (known && !holds)
+	c.covered = c.covered || (known && holds)
+}
+
+// decide evaluates an .if or .elif line that is exists(X) or !exists(X) alone,
+// and known is false for any other condition. It is known only when every
+// value X takes is an absolute path inside the tree that resolves there, and
+// the tree answers the same for all of them. A value ending in "/" is left
+// undecided: make's stat(2) needs a directory there, and resolveInTree does
+// not ask.
+func (r *makeReader) decide(line, parseDir string) (known, holds bool) {
+	m := existsCondition.FindStringSubmatchIndex(line)
+	if m == nil {
+		return false, false
+	}
+	negated := m[3] > m[2]
+	rest := strings.TrimLeft(line[m[1]:], " \t")
+	end := 0
+	for end < len(rest) && rest[end] != ')' {
+		switch c := rest[end]; {
+		case c == '$':
+			_, _, next, ok := parseRef(rest, end)
+			if !ok {
+				return false, false
+			}
+			end = next
+		case strings.IndexByte(" \t(){}&|\"\\", c) >= 0:
+			return false, false
+		default:
+			end++
+		}
+	}
+	if end == 0 || end == len(rest) || strings.TrimSpace(rest[end+1:]) != "" {
+		return false, false
+	}
+	arg := rest[:end]
+	scope := r.scope(parseDir)
+	if r.readsTainted(arg, scope) {
+		return false, false
+	}
+	vals, ok := expandMakePath(arg, scope, 0)
+	if !ok || len(vals) == 0 {
+		return false, false
+	}
+	for i, v := range vals {
+		if strings.HasSuffix(v, "/") || !r.inTree(v) {
+			return false, false
+		}
+		_, exists, why := resolveInTree(r.roots(), v)
+		if why != "" || (i > 0 && exists != holds) {
+			return false, false
+		}
+		holds = exists
+	}
+	return true, holds != negated
 }
 
 func copyVars(vars map[string][]string) map[string][]string {
