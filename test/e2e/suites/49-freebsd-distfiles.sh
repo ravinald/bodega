@@ -12,8 +12,8 @@
 # check names "unsupported" falls through to the port's own sites, so make
 # fetch still succeeds and a passing fetch alone says nothing about this route.
 #
-# This suite mutates both ends. The server gets a ports tree at /usr/ports,
-# distfiles_* keys in config.json and a distfiles manifest entry, all removed
+# This suite mutates both ends. The server gets a ports tree in a scratch
+# root, distfiles_* keys in config.json and a distfiles manifest entry, all removed
 # at the end, and whatever 47 cached under binaries/distfiles is moved aside
 # in storage and put back. The freebsd guest gets two read-only nullfs mounts,
 # over the scratch tree and over /usr/share/mk, and a fetch user with no sudo
@@ -81,15 +81,10 @@ FD_PORT=databases/sqlite-ext-pcre
 FD_SUBDIR=sqlite-ext
 FD_RPORT=games/adom
 
-# The server's tree sits at /usr/ports rather than in a scratch directory.
-# java/bootstrap-openjdk8/Makefile.update sets PORTSDIR=/usr/ports in one
-# branch of an .if, the reader reads every branch, and anywhere else that
-# include leaves the tree: the port goes unplaced and every distfile in the
-# tree is refused on its account. The Linux server has no ports tree of its
-# own, and the stamp keeps this suite from removing one it did not write.
-FD_SERVER_TREE=/usr/ports
-FD_STAMP="$FD_SERVER_TREE/.bodega-e2e-49"
-FD_SERVER_ROOT=/var/tmp/bodega-e2e-distfiles-server
+# Not under /tmp or /var/tmp: the unit's PrivateTmp gives the server its own
+# copy of both, so a tree extracted there is one the server cannot see.
+FD_SERVER_ROOT=/srv/bodega-e2e-distfiles-server
+FD_SERVER_TREE="$FD_SERVER_ROOT/usr/ports"
 
 # make runs as an account the suite creates, because a make that can sudo can
 # lift the read-only mounts stableView reads, and stableView cannot see a
@@ -151,14 +146,13 @@ fi
 # The server reads distinfo from the tarball the guest builds from, byte for
 # byte: a name the two trees pin differently is refused by one side or the
 # other, and a suite that skews them proves neither.
-e2e_on server "if [ -e $FD_SERVER_TREE ] && [ ! -e $FD_STAMP ]; then echo 'foreign tree'; exit 3; fi; \
-	sudo rm -rf $FD_SERVER_ROOT $FD_SERVER_TREE && mkdir -p $FD_SERVER_ROOT && \
-	curl -sSf -o $FD_SERVER_ROOT/ports.txz '$ports_url' && \
-	sudo tar -xf $FD_SERVER_ROOT/ports.txz -C / usr/ports && sudo touch $FD_STAMP && \
+e2e_on server "sudo rm -rf $FD_SERVER_ROOT && sudo mkdir -p $FD_SERVER_ROOT && \
+	sudo curl -sSf -o $FD_SERVER_ROOT/ports.txz '$ports_url' && \
+	sudo tar -xf $FD_SERVER_ROOT/ports.txz -C $FD_SERVER_ROOT usr/ports && \
 	sha256sum $FD_SERVER_ROOT/ports.txz | cut -d' ' -f1" || true
 check_eq FDIST-01 "the server's ports tree comes from the tarball the release MANIFEST names" \
 	"$ports_sha" "$E2E_OUT" "docs/usage.md#mirroring-ports-distfiles" \
-	"curl $ports_url | sha256; tar -xf -C / usr/ports" "$E2E_RC"
+	"curl $ports_url | sha256; tar -xf -C $FD_SERVER_ROOT usr/ports" "$E2E_RC"
 
 e2e_on server "awk -F'[()]' '/^SHA256/{print \$2; exit}' $FD_SERVER_TREE/$FD_PORT/distinfo" || true
 fd_name="$E2E_OUT"
@@ -423,8 +417,7 @@ check_eq FDIST-92 "the fetch user is removed again" "absent" "$E2E_OUT" \
 
 E2E_HOST=server
 e2e_bodega server "pkg delete distfiles '$fd_name'" || true
-e2e_on server "sudo rm -rf $fd_storage/distfiles $FD_SERVER_ROOT ${fd_distroot:-/nonexistent-e2e}; \
-	[ -e $FD_STAMP ] && sudo rm -rf $FD_SERVER_TREE; true" || true
+e2e_on server "sudo rm -rf $fd_storage/distfiles $FD_SERVER_ROOT ${fd_distroot:-/nonexistent-e2e}" || true
 e2e_config_set server 'del(.distfiles_ports_tree, .distfiles_upstream, .distfiles_environment_variables, .distfiles_environment_files)' || true
 e2e_restart server || true
 e2e_config_get server '[.distfiles_ports_tree, .distfiles_environment_variables] | map(select(. != null)) | length' || true
@@ -438,7 +431,7 @@ check_eq FDIST-93 "what 47 cached under binaries/distfiles is put back" "$([ "${
 
 rm -f "$fd_conf" "$fd_check_file"
 unset FD_ROOT FD_PORTS FD_DISTDIR FD_WRK FD_MIRROR FD_SYSMK FD_PORT FD_SUBDIR FD_RPORT FD_SERVER_TREE \
-	FD_STAMP FD_SERVER_ROOT FD_USER FD_USER_MARK fd_user_drop fd_as fd_bin fd_bin_stash fd_bin_moved ports_sha ports_url fd_make fd_make_http fd_decl_files fd_decl_stock fd_decl_http \
+	FD_SERVER_ROOT FD_USER FD_USER_MARK fd_user_drop fd_as fd_bin fd_bin_stash fd_bin_moved ports_sha ports_url fd_make fd_make_http fd_decl_files fd_decl_stock fd_decl_http \
 	fd_decl_distdir fd_storage fd_name fd_rname fd_check fd_digest fd_unmount fd_server_pins fd_conf \
 	fd_check_file fd_env fd_drift fd_route fd_fetch fd_rstatus fd_rbody fd_pstatus fd_pbody fd_art fd_digest2 \
 	fd_distroot fd_copy_rc fd_sopts fd_fopts fd_env2 fd_drift2
