@@ -239,17 +239,24 @@ bench:
 vet:
 	go vet ./...
 
+# The Go files a clone would hold once committed: tracked, plus untracked but
+# not ignored, so a new file is formatted before its first commit. Walking `.`
+# instead reaches ignored trees CI never sees, such as review evidence saved
+# as .go files, and a gate that checks more than CI does fails on work CI
+# would pass.
+GO_SOURCES = git ls-files -z --cached --others --exclude-standard -- '*.go'
+
 ## fmt: Format all Go source files (goimports if available, else gofmt)
 fmt:
 	@if command -v goimports >/dev/null 2>&1; then \
-		goimports -w .; \
+		$(GO_SOURCES) | xargs -0 goimports -w; \
 	else \
-		gofmt -w .; \
+		$(GO_SOURCES) | xargs -0 gofmt -w; \
 	fi
 
 ## fmt-check: Fail if gofmt or goimports would rewrite a file (CI's fmt job)
 fmt-check:
-	@out=$$(gofmt -l .); \
+	@out=$$($(GO_SOURCES) | xargs -0 gofmt -l); \
 	if [ -n "$$out" ]; then \
 		echo "gofmt drift in:"; echo "$$out"; \
 		echo "run 'make fmt'"; \
@@ -260,7 +267,7 @@ fmt-check:
 		echo "install it: go install golang.org/x/tools/cmd/goimports@v0.50.0"; \
 		exit 1; \
 	fi
-	@out=$$(goimports -l .); \
+	@out=$$($(GO_SOURCES) | xargs -0 goimports -l); \
 	if [ -n "$$out" ]; then \
 		echo "goimports drift in:"; echo "$$out"; \
 		echo "run 'make fmt'"; \
