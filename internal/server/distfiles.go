@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -183,19 +184,21 @@ func (s *Server) handleDistfiles(w http.ResponseWriter, r *http.Request) {
 		// 451 names the reason a 404 would hide. The client moves on to the
 		// port's own sites either way, which is where a restricted file has
 		// to come from.
-		http.Error(w, err.Error()+"; fetch it from the port's own MASTER_SITES", http.StatusUnavailableForLegalReasons)
+		http.Error(w, s.withoutTreeRoot(err.Error())+"; fetch it from the port's own MASTER_SITES", http.StatusUnavailableForLegalReasons)
 		return
 	case errors.Is(err, distinfo.ErrNotReady):
+		// The error names the tree's path and, after a failed read, the cause.
+		// Both are for the operator's log; a client can only retry.
 		s.logger.Warn("distfiles: request arrived before the ports tree was indexed", "name", name, "error", err)
 		w.Header().Set("Retry-After", "30")
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		http.Error(w, "the distinfo index is not loaded yet: the server is still reading its ports tree, or its last read failed; retry after the Retry-After interval", http.StatusServiceUnavailable)
 		return
 	case err != nil:
 		// Not listed, or listed ambiguously: either way there is no digest to
 		// hold the bytes to, and pinning the first fetch is what binary does
 		// and what this type exists not to do.
-		s.logger.Info("distfiles: no distinfo digest to admit against", "name", name, "error", err)
-		http.Error(w, err.Error()+" under "+s.distinfo.Root()+"; update the server's ports tree to the client's revision", http.StatusNotFound)
+		s.logger.Info("distfiles: no distinfo digest to admit against", "name", name, "root", s.distinfo.Root(), "error", err)
+		http.Error(w, err.Error()+"; update the server's ports tree to the client's revision", http.StatusNotFound)
 		return
 	}
 
@@ -268,6 +271,16 @@ func (s *Server) handleDistfiles(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.Copy(w, spool.file); err != nil {
 		s.logger.Warn("distfiles: client read was cut short", "name", name, "error", err)
 	}
+}
+
+// withoutTreeRoot is msg with the server's ports tree path cut from every
+// path under it. A restriction the reader could not resolve names the file it
+// stopped in, and the client needs that file's place in its own tree, not
+// where the server keeps its copy.
+func (s *Server) withoutTreeRoot(msg string) string {
+	root := filepath.Clean(s.distinfo.Root())
+	msg = strings.ReplaceAll(msg, root+"/", "")
+	return strings.ReplaceAll(msg, root, "the server's ports tree")
 }
 
 // serveClientCheck answers /distfiles/@environment.mk with the fragment that

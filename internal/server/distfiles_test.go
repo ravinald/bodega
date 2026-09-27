@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 
 	"github.com/ravinald/bodega/internal/audit"
@@ -608,5 +609,112 @@ func TestDistfilesRefusesAComputedNameCommandBeforeASnapshot(t *testing.T) {
 	code, body := getBody(t, ts.URL+"/distfiles/pcpustat/1.6.tar.bz2")
 	if code != http.StatusUnavailableForLegalReasons || hits.Load() != 0 || !strings.Contains(body, "misc/probe is restricted or unreadable") {
 		t.Fatalf("GET = %d %q after %d upstream fetches, want 451 naming misc/probe before any", code, body, hits.Load())
+	}
+}
+
+// Every refusal on this route reaches any client that can connect, so none
+// may say where the server keeps its ports tree or its storage: the operator
+// reads those in the log. The tree sits under a name no body has any other
+// reason to carry.
+func TestDistfilesRefusalsNameNoServerPath(t *testing.T) {
+	tree := func(t *testing.T) string {
+		t.Helper()
+		root := filepath.Join(t.TempDir(), "b98-server-ports-tree")
+		if err := os.Rename(distfilesPortsTree(t), root); err != nil {
+			t.Fatal(err)
+		}
+		return root
+	}
+	put := func(t *testing.T, root, rel, body string) {
+		t.Helper()
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		name  string
+		path  string
+		code  int
+		body  string // served by the upstream
+		setup func(t *testing.T, root string)
+		set   func(*config.Config)
+	}{
+		{name: "unlisted", path: "/distfiles/pcpustat/9.9.tar.bz2", code: http.StatusNotFound},
+		{name: "ambiguous digest", path: "/distfiles/pcpustat/1.6.tar.bz2", code: http.StatusNotFound,
+			setup: func(t *testing.T, root string) {
+				put(t, root, "sysutils/pcpustat-devel/distinfo", fmt.Sprintf("SHA256 (pcpustat/1.6.tar.bz2) = %064d\nSIZE (pcpustat/1.6.tar.bz2) = %d\n", 0, len(distfileBody)))
+			}},
+		{name: "unusable digest", path: "/distfiles/pcpustat/2.0.tar.bz2", code: http.StatusNotFound,
+			setup: func(t *testing.T, root string) {
+				put(t, root, "sysutils/pcpustat-devel/distinfo", "SHA256 (pcpustat/2.0.tar.bz2) = not-hex\nSIZE (pcpustat/2.0.tar.bz2) = 1\n")
+			}},
+		{name: "restricted", path: "/distfiles/nonfree.tar.gz", code: http.StatusUnavailableForLegalReasons},
+		{name: "restriction make reaches", path: "/distfiles/pcpustat/1.6.tar.bz2", code: http.StatusUnavailableForLegalReasons,
+			setup: func(t *testing.T, root string) {
+				writeMakeOnlyRestriction(t, root, makeOnlyRestrictions["undefined branch"])
+			}},
+		{name: "environment mismatch", path: "/distfiles/@" + distinfo.ClientUnsupported + "/pcpustat/1.6.tar.bz2", code: http.StatusUnavailableForLegalReasons},
+		{name: "not ready after a failed read", path: "/distfiles/pcpustat/1.6.tar.bz2", code: http.StatusServiceUnavailable,
+			setup: func(t *testing.T, root string) {
+				if err := os.Remove(filepath.Join(root, "Mk", "bsd.licenses.db.mk")); err != nil {
+					t.Fatal(err)
+				}
+			}},
+		{name: "not ready while loading", path: "/distfiles/pcpustat/1.6.tar.bz2", code: http.StatusServiceUnavailable,
+			// The read blocks opening a FIFO nobody writes until cleanup, so
+			// the lookup outwaits its first-read budget.
+			setup: func(t *testing.T, root string) {
+				fifo := filepath.Join(root, "Mk", "bsd.licenses.db.mk")
+				if err := os.Remove(fifo); err != nil {
+					t.Fatal(err)
+				}
+				if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					if f, err := os.OpenFile(fifo, os.O_WRONLY, 0); err == nil {
+						_ = f.Close()
+					}
+				})
+			}},
+		{name: "upstream lacks it", path: "/distfiles/pcpustat/1.6.tar.bz2", code: http.StatusNotFound,
+			set: func(cfg *config.Config) { cfg.DistfilesUpstream += "elsewhere/" }},
+		{name: "upstream unreachable", path: "/distfiles/pcpustat/1.6.tar.bz2", code: http.StatusBadGateway,
+			set: func(cfg *config.Config) { cfg.DistfilesUpstream = "http://127.0.0.1:1/" }},
+		{name: "upstream bytes disagree", path: "/distfiles/pcpustat/1.6.tar.bz2", code: http.StatusBadGateway, body: "PCPUSTAT SOURCE BYTES"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := tree(t)
+			if tc.setup != nil {
+				tc.setup(t, root)
+			}
+			body := tc.body
+			if body == "" {
+				body = distfileBody
+			}
+			ts, mem, _ := distfilesFixtureIn(t, root, body, tc.set)
+			req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+tc.path, nil)
+			if strings.HasPrefix(tc.path, "/distfiles/@") {
+				req.Header.Set(unconfiguredClient, "1")
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode != tc.code {
+				t.Fatalf("GET %s = %d %q, want %d", tc.path, resp.StatusCode, got, tc.code)
+			}
+			for _, secret := range []string{root, mem.Label()} {
+				if strings.Contains(string(got), secret) {
+					t.Errorf("GET %s = %d %q, names %s", tc.path, resp.StatusCode, got, secret)
+				}
+			}
+		})
 	}
 }
