@@ -4973,31 +4973,31 @@ A read-only audit database used to be the quieter version of the same loss: `Rec
 
 With the Sources pane focused:
 
-| Key                     | Action                                                             |
-| ----------------------- | ------------------------------------------------------------------ |
-| `Tab`                   | Move focus to the next pane                                        |
-| `Up`/`Down` or `j`/`k`  | Navigate                                                           |
-| `Enter`                 | Expand or collapse a group                                         |
-| `Right`/`l`, `Left`/`h` | Move to the first child, or to the parent                          |
-| `/`                     | Filter the tree                                                    |
-| `Space` or `m`          | Mark the entry under the cursor, and everything beneath it         |
-| `Ctrl+A`                | Mark or unmark every entry                                         |
-| `?`                     | Show help                                                          |
-| `q`                     | Quit, after a confirmation                                         |
-| `c`                     | Create a package: pick a type, then fill in that type's form       |
-| `C`                     | Open the config editor                                             |
-| `E`                     | Edit the selected package, or a single version, as raw JSON        |
-| `b` / `B`               | Open the build menu for the marked entries                         |
-| `S`                     | Sync every local artifact to storage                               |
-| `v`                     | Verify every manifest against its `.md5` sidecar                   |
-| `H`                     | Toggle hidden on the marked entries                                |
-| `F`                     | Toggle frozen on the marked entries                                |
-| `d` / `D`               | Delete the marked entries from the manifests, after a confirmation |
-| `R`                     | Remove the marked entries' stored artifacts, after a confirmation  |
-| `I`                     | Initialize the S3 bucket, after a confirmation                     |
-| `L`                     | Query the audit log                                                |
-| `T`                     | Open the token manager                                             |
-| `Ctrl+R`                | Reload the manifests (any pane)                                    |
+| Key                     | Action                                                                                                                                                                                            |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Tab`                   | Move focus to the next pane                                                                                                                                                                       |
+| `Up`/`Down` or `j`/`k`  | Navigate                                                                                                                                                                                          |
+| `Enter`                 | Expand or collapse a group                                                                                                                                                                        |
+| `Right`/`l`, `Left`/`h` | Move to the first child, or to the parent                                                                                                                                                         |
+| `/`                     | Filter the tree                                                                                                                                                                                   |
+| `Space` or `m`          | Mark the entry under the cursor, and everything beneath it                                                                                                                                        |
+| `Ctrl+A`                | Mark or unmark every entry                                                                                                                                                                        |
+| `?`                     | Show help                                                                                                                                                                                         |
+| `q`                     | Quit, after a confirmation                                                                                                                                                                        |
+| `c`                     | Create a package: pick a type, then fill in that type's form                                                                                                                                      |
+| `C`                     | Open the config editor                                                                                                                                                                            |
+| `E`                     | Edit the selected package, or a single version, as raw JSON                                                                                                                                       |
+| `b` / `B`               | Open the build menu for the marked entries                                                                                                                                                        |
+| `S`                     | Sync every local artifact to storage                                                                                                                                                              |
+| `v`                     | Verify every manifest against its `.md5` sidecar                                                                                                                                                  |
+| `H`                     | Toggle hidden on the marked entries                                                                                                                                                               |
+| `F`                     | Toggle frozen on the marked entries                                                                                                                                                               |
+| `d` / `D`               | Delete the marked entries from the manifests, after a confirmation                                                                                                                                |
+| `R`                     | Remove the marked entries' stored artifacts, after a confirmation                                                                                                                                 |
+| `I`                     | Initialize an s3 backend's bucket, as `bodega init` does, after a confirmation naming the backend, bucket and region. It acts on s3 backends only, and asks which one when several are configured |
+| `L`                     | Query the audit log                                                                                                                                                                               |
+| `T`                     | Open the token manager                                                                                                                                                                            |
+| `Ctrl+R`                | Reload the manifests (any pane)                                                                                                                                                                   |
 
 An action on "the marked entries" acts on the entry under the cursor when nothing is marked.
 

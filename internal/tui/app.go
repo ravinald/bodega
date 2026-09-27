@@ -76,6 +76,10 @@ type appModel struct {
 	stores   storage.Resolver
 	auditDB  *audit.DB
 
+	// dialS3 and initBucket are the two steps of the I action that reach AWS.
+	dialS3     storage.S3Dialer
+	initBucket initBucketFunc
+
 	width     int
 	height    int
 	logHeight int    // configurable log pane height
@@ -112,6 +116,9 @@ func newAppModel(cfg *config.Config, store *manifest.Store, s3client *bos3.Clien
 		auditDB:   auditDB,
 		focus:     focusSources,
 		logHeight: logH,
+
+		dialS3:     bos3.NewClient,
+		initBucket: bos3.InitBucket,
 	}
 	m.sources = newSourcesModel(nil) // populated once the storage status arrives
 	m.sources.focused = true
@@ -192,6 +199,15 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.sources.Refresh(m.store, m.statuses)
 		if m.sources.cursor == 0 && len(m.sources.flatList) > 0 {
 			m.syncDetails()
+		}
+		return m, nil
+
+	case initTargetMsg:
+		m.popup = popupModel{
+			kind: popupConfirm,
+			message: fmt.Sprintf("Initialize storage backend %q: bucket s3://%s in %s — are you sure?",
+				msg.target.Name, msg.target.Bucket, msg.client.Region()),
+			pendingAsyncCmd: executeInit(msg.target, msg.client, m.initBucket),
 		}
 		return m, nil
 
@@ -308,6 +324,14 @@ func (m appModel) handlePopupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 
 	switch m.popup.kind {
+	case popupChoice:
+		if m.popup.HandleChoiceKey(key) {
+			cmd := m.popup.pendingAsyncCmd
+			m.popup.pendingAsyncCmd = nil
+			return m, cmd
+		}
+		return m, nil
+
 	case popupBuildMenu:
 		dismissed := m.popup.HandleBuildMenuKey(key)
 		if dismissed {
@@ -738,14 +762,24 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, executeSyncAll(nil, m.cfg, m.store, m.stores, m.auditDB)
 
 	case "I":
-		if m.s3client == nil {
-			m.log.appendLog(errorStyle.Render("init requires a configured S3 bucket"))
-			return m, nil
+		names := storage.S3TargetNames(m.cfg)
+		if len(names) <= 1 {
+			// With nothing to choose between, the default is resolved so a
+			// local-driver install hears the refusal `bodega init` prints.
+			name := storage.DefaultName
+			if len(names) == 1 {
+				name = names[0]
+			}
+			return m, resolveInitTarget(m.cfg, name, m.dialS3)
 		}
+		cfg, dial := m.cfg, m.dialS3
 		m.popup = popupModel{
-			kind:            popupConfirm,
-			message:         fmt.Sprintf("Initialise S3 bucket s3://%s — are you sure?", m.cfg.Bucket),
-			pendingAsyncCmd: executeInit(m.cfg, m.s3client),
+			kind:        popupChoice,
+			choiceTitle: "Initialize which s3 backend?",
+			choices:     names,
+			onChoose: func(name string) tea.Cmd {
+				return resolveInitTarget(cfg, name, dial)
+			},
 		}
 		return m, nil
 

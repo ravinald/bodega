@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -18,8 +17,8 @@ import (
 	"github.com/ravinald/bodega/internal/storage"
 )
 
-// s3Target is the one s3 backend an init verb acts on. region is as
-// configured and may be empty; dialS3Target reports the one the SDK resolves.
+// s3Target is storage.S3Target under the names this package's verbs and
+// tests use.
 type s3Target struct {
 	name   string
 	bucket string
@@ -27,59 +26,19 @@ type s3Target struct {
 	prefix string
 }
 
-// resolveS3Target names the backend an init verb reaches: the default one, or
-// a storage_backends entry, read through the same storage.SpecFor the
-// service's resolver builds its stores from. It refuses a backend whose driver
-// is not s3 rather than falling back to the bucket key, which an install on
-// the local driver may still carry, so init never dials AWS for a backend that
-// stores nothing there.
+// resolveS3Target resolves the backend named by args, or the default, through
+// storage.ResolveS3Target, the same resolution the TUI's init action uses.
 func resolveS3Target(cfg *config.Config, args []string) (s3Target, error) {
 	name := config.DefaultStorageName
 	if len(args) > 0 {
 		name = args[0]
 	}
-	spec, ok := storage.SpecFor(cfg, name)
-	if !ok {
-		names := []string{config.DefaultStorageName}
-		for n := range cfg.StorageBackends {
-			names = append(names, n)
-		}
-		sort.Strings(names[1:])
-		return s3Target{}, fmt.Errorf("unknown storage backend %q (configured: %s)", name, strings.Join(names, ", "))
-	}
-	t := s3Target{name: name, bucket: spec.Bucket, region: spec.Region, prefix: spec.Prefix}
-	driver := spec.Driver
-	if driver == "" {
-		driver = "local"
-	}
-	if driver != "s3" {
-		return t, fmt.Errorf("storage backend %q uses the %s driver, which keeps artifacts in a directory and needs no init; "+
-			"init prepares s3 backends only (set storage_backend to \"s3\", or name an s3 entry from storage_backends)", name, driver)
-	}
-	if t.bucket == "" {
-		if name == config.DefaultStorageName {
-			return t, requireBucket(cfg)
-		}
-		return t, fmt.Errorf("storage_backends[%q] uses the s3 driver and names no bucket; add \"bucket\" to that entry", name)
-	}
-	return t, nil
+	t, err := storage.ResolveS3Target(cfg, name)
+	return s3Target{name: t.Name, bucket: t.Bucket, region: t.Region, prefix: t.Prefix}, err
 }
 
-// dialS3Target builds the client the service would build for t, through the
-// same bos3.NewClient call, so an entry with no region resolves through the
-// SDK's chain here exactly as it does there. It refuses when that chain names
-// no region, because every call would fail, in the service as well.
 func dialS3Target(ctx context.Context, t s3Target) (*bos3.Client, error) {
-	client, err := bos3.NewClient(ctx, t.bucket, t.region)
-	if err != nil {
-		return nil, fmt.Errorf("storage backend %q: %w", t.name, err)
-	}
-	if client.Region() == "" {
-		return nil, fmt.Errorf("storage backend %q has no AWS region: storage_backends[%q] sets no \"region\", and neither AWS_REGION, "+
-			"AWS_DEFAULT_REGION nor the AWS profile names one, so the service could not reach s3://%s either; add \"region\" to that entry",
-			t.name, t.name, t.bucket)
-	}
-	return client, nil
+	return storage.DialS3Target(ctx, storage.S3Target{Name: t.name, Bucket: t.bucket, Region: t.region, Prefix: t.prefix})
 }
 
 func newInitCmd(gf *globalFlags) *cobra.Command {

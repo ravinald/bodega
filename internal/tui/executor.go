@@ -239,11 +239,40 @@ func executeSyncAll(types []string, cfg *config.Config, store *manifest.Store, s
 	}
 }
 
-// executeInit initialises the S3 bucket structure and returns a tea.Cmd.
-func executeInit(cfg *config.Config, s3client *bos3.Client) tea.Cmd {
+// initBucketFunc is bos3.InitBucket's signature, so a test can stand in for
+// the calls that would otherwise reach AWS.
+type initBucketFunc func(ctx context.Context, api bos3.BucketAPI, out io.Writer, bucket, region string) error
+
+// initTargetMsg carries a resolved and dialed init target back to the event
+// loop, which asks for confirmation before anything touches the bucket.
+type initTargetMsg struct {
+	target storage.S3Target
+	client *bos3.Client
+}
+
+// resolveInitTarget resolves and dials the backend called name through the
+// same storage.ResolveS3Target and DialS3TargetWith `bodega init` uses. A
+// refusal comes back as a cmdOutputMsg, and a backend that is not s3 is
+// refused before dial is reached.
+func resolveInitTarget(cfg *config.Config, name string, dial storage.S3Dialer) tea.Cmd {
+	return func() tea.Msg {
+		target, err := storage.ResolveS3Target(cfg, name)
+		if err != nil {
+			return cmdOutputMsg{err: err}
+		}
+		client, err := storage.DialS3TargetWith(context.Background(), target, dial)
+		if err != nil {
+			return cmdOutputMsg{err: err}
+		}
+		return initTargetMsg{target: target, client: client}
+	}
+}
+
+// executeInit initializes the bucket of a dialed s3 backend and returns a tea.Cmd.
+func executeInit(target storage.S3Target, client *bos3.Client, initBucket initBucketFunc) tea.Cmd {
 	return func() tea.Msg {
 		var buf bytes.Buffer
-		err := runInit(&buf, cfg, s3client)
+		err := runInit(&buf, target, client, initBucket)
 		return cmdOutputMsg{output: buf.String(), refresh: false, err: err}
 	}
 }
@@ -393,12 +422,19 @@ func runVerify(buf *bytes.Buffer, cfg *config.Config) error {
 	return nil
 }
 
-func runInit(buf *bytes.Buffer, cfg *config.Config, s3client *bos3.Client) error {
-	if s3client == nil {
-		return fmt.Errorf("init requires a configured S3 bucket")
+func runInit(buf *bytes.Buffer, target storage.S3Target, client *bos3.Client, initBucket initBucketFunc) error {
+	if client == nil {
+		return fmt.Errorf("storage backend %q has no S3 client; press I again to resolve it", target.Name)
 	}
-	fmt.Fprintf(buf, "Initialising bucket s3://%s ...\n", cfg.Bucket)
-	return bos3.InitBucket(context.Background(), s3client.S3Client(), buf, cfg.Bucket, cfg.Region)
+	region := client.Region()
+	if err := storage.RequireS3Region(target, region); err != nil {
+		return err
+	}
+	fmt.Fprintf(buf, "Initializing bucket s3://%s in %s (backend %q)...\n", target.Bucket, region, target.Name)
+	if target.Prefix != "" {
+		fmt.Fprintf(buf, "  prefix:     %s is not applied; markers and lifecycle rules sit at the bucket root\n", target.Prefix)
+	}
+	return initBucket(context.Background(), client.S3Client(), buf, target.Bucket, region)
 }
 
 func runDelete(buf *bytes.Buffer, cfg *config.Config, store *manifest.Store, entryType, name string, auditDB *audit.DB) error {

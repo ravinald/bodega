@@ -21,6 +21,7 @@ const (
 	popupTokenManager           // T key — API token management
 	popupJSONEdit               // E key — raw-JSON editor for a package or a single version
 	popupAuditTable             // results table for an audit-log query
+	popupChoice                 // pick one of several named options
 )
 
 // popupModel holds the state for the overlay popup.
@@ -43,6 +44,14 @@ type popupModel struct {
 	// an option from the build menu. It returns the tea.Cmd to execute;
 	// HandleBuildMenuKey assigns the result to pendingAsyncCmd on the receiver.
 	onBuildSelect func(stage BuildStage, force bool) tea.Cmd
+
+	// --- choice popup ---
+	choiceTitle  string
+	choices      []string
+	choiceCursor int
+	// onChoose returns the tea.Cmd for the chosen option; HandleChoiceKey
+	// assigns it to pendingAsyncCmd on the receiver.
+	onChoose func(choice string) tea.Cmd
 
 	// --- form popup ---
 	formTitle string
@@ -180,7 +189,7 @@ Build pipeline:
                F=Fetch   P=Package  Esc=Cancel
 
 Storage operations:
-  I          Initialise S3 bucket (with confirmation)
+  I          Initialize an s3 backend's bucket (asks which when several; with confirmation)
   R          Remove stored artifact from its backend (with confirmation)
   S          Upload all local artifacts to their backends
   v          Verify manifest checksums
@@ -336,6 +345,9 @@ func (p *popupModel) View(screenWidth, screenHeight int) string {
 	case popupBuildMenu:
 		content = p.renderBuildMenu()
 
+	case popupChoice:
+		content = p.renderChoice()
+
 	case popupForm:
 		content = p.renderForm()
 
@@ -373,6 +385,23 @@ func (p *popupModel) View(screenWidth, screenHeight int) string {
 		sb.WriteString(l)
 		sb.WriteByte('\n')
 	}
+	return sb.String()
+}
+
+// renderChoice renders the option list with the cursor row marked.
+func (p *popupModel) renderChoice() string {
+	var sb strings.Builder
+	sb.WriteString(buildMenuTitleStyle.Render(p.choiceTitle))
+	sb.WriteString("\n\n")
+	for i, c := range p.choices {
+		marker := "  "
+		if i == p.choiceCursor {
+			marker = buildMenuKeyStyle.Render("> ")
+		}
+		sb.WriteString("  " + marker + c + "\n")
+	}
+	sb.WriteString("\n")
+	sb.WriteString(dimStyle.Render("  Up/Down to move, Enter to choose, Esc to cancel"))
 	return sb.String()
 }
 
@@ -1038,6 +1067,35 @@ func jsonTemplateForType(entryType string) string {
   "url": ""
 }`
 	}
+}
+
+// HandleChoiceKey moves the cursor or chooses the option under it. Returns
+// true when the popup is dismissed, with the chosen option's command in
+// pendingAsyncCmd.
+func (p *popupModel) HandleChoiceKey(key string) (dismiss bool) {
+	switch key {
+	case "up", "k":
+		if p.choiceCursor > 0 {
+			p.choiceCursor--
+		}
+		return false
+	case "down", "j":
+		if p.choiceCursor < len(p.choices)-1 {
+			p.choiceCursor++
+		}
+		return false
+	case "esc":
+		p.dismiss()
+		return true
+	case "enter":
+		var cmd tea.Cmd
+		if p.onChoose != nil && p.choiceCursor < len(p.choices) {
+			cmd = p.onChoose(p.choices[p.choiceCursor])
+		}
+		*p = popupModel{pendingAsyncCmd: cmd}
+		return true
+	}
+	return false
 }
 
 // HandleBuildMenuKey maps a key press to a BuildStage and calls onBuildSelect.
