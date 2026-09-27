@@ -243,28 +243,39 @@ func executeSyncAll(types []string, cfg *config.Config, store *manifest.Store, s
 // the calls that would otherwise reach AWS.
 type initBucketFunc func(ctx context.Context, api bos3.BucketAPI, out io.Writer, bucket, region string) error
 
-// initTargetMsg carries a resolved and dialed init target back to the event
-// loop, which asks for confirmation before anything touches the bucket.
+// initTargetMsg carries the outcome of dialing init request seq back to the
+// event loop, which asks for confirmation before anything touches the bucket.
 type initTargetMsg struct {
+	seq    uint64
 	target storage.S3Target
 	client *bos3.Client
+	err    error
 }
 
-// resolveInitTarget resolves and dials the backend called name through the
-// same storage.ResolveS3Target and DialS3TargetWith `bodega init` uses. A
-// refusal comes back as a cmdOutputMsg, and a backend that is not s3 is
-// refused before dial is reached.
-func resolveInitTarget(cfg *config.Config, name string, dial storage.S3Dialer) tea.Cmd {
-	return func() tea.Msg {
-		target, err := storage.ResolveS3Target(cfg, name)
-		if err != nil {
-			return cmdOutputMsg{err: err}
-		}
-		client, err := storage.DialS3TargetWith(context.Background(), target, dial)
-		if err != nil {
-			return cmdOutputMsg{err: err}
-		}
-		return initTargetMsg{target: target, client: client}
+// beginInit resolves the backend called name through the same
+// storage.ResolveS3Target `bodega init` uses, then dials it through
+// DialS3TargetWith. Resolution reads config alone, so a refusal is reported
+// here and nothing dials. The dial runs off the event loop behind a pending
+// popup that owns the screen until its own result arrives or Esc cancels it:
+// without that, a slow dial let the operator open another editor, and the
+// late confirmation replaced it with the edits unsaved.
+func (m appModel) beginInit(name string) (appModel, tea.Cmd) {
+	target, err := storage.ResolveS3Target(m.cfg, name)
+	if err != nil {
+		return m, func() tea.Msg { return cmdOutputMsg{err: err} }
+	}
+	m.initSeq++
+	seq, dial := m.initSeq, m.dialS3
+	ctx, cancel := context.WithCancel(context.Background())
+	m.popup = popupModel{
+		kind:       popupInitPending,
+		message:    fmt.Sprintf("Resolving storage backend %q: bucket s3://%s ...", target.Name, target.Bucket),
+		initSeq:    seq,
+		initCancel: cancel,
+	}
+	return m, func() tea.Msg {
+		client, err := storage.DialS3TargetWith(ctx, target, dial)
+		return initTargetMsg{seq: seq, target: target, client: client, err: err}
 	}
 }
 

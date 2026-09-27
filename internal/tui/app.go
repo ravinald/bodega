@@ -79,6 +79,7 @@ type appModel struct {
 	// dialS3 and initBucket are the two steps of the I action that reach AWS.
 	dialS3     storage.S3Dialer
 	initBucket initBucketFunc
+	initSeq    uint64 // numbers each I request; see popupModel.initSeq
 
 	width     int
 	height    int
@@ -203,6 +204,15 @@ func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case initTargetMsg:
+		if m.popup.kind != popupInitPending || m.popup.initSeq != msg.seq {
+			return m, nil
+		}
+		m.popup.initCancel()
+		if msg.err != nil {
+			m.popup.dismiss()
+			m.log.appendLog(errorStyle.Render("Error: " + msg.err.Error()))
+			return m, nil
+		}
 		m.popup = popupModel{
 			kind: popupConfirm,
 			message: fmt.Sprintf("Initialize storage backend %q: bucket s3://%s in %s — are you sure?",
@@ -325,10 +335,21 @@ func (m appModel) handlePopupKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch m.popup.kind {
 	case popupChoice:
+		// I is the only action that offers a choice.
 		if m.popup.HandleChoiceKey(key) {
-			cmd := m.popup.pendingAsyncCmd
-			m.popup.pendingAsyncCmd = nil
-			return m, cmd
+			chosen := m.popup.chosen
+			m.popup.dismiss()
+			if chosen != "" {
+				return m.beginInit(chosen)
+			}
+		}
+		return m, nil
+
+	case popupInitPending:
+		if key == "esc" {
+			m.popup.initCancel()
+			m.popup.dismiss()
+			m.log.appendLog(dimStyle.Render("Init canceled"))
 		}
 		return m, nil
 
@@ -770,16 +791,12 @@ func (m appModel) handleSourcesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if len(names) == 1 {
 				name = names[0]
 			}
-			return m, resolveInitTarget(m.cfg, name, m.dialS3)
+			return m.beginInit(name)
 		}
-		cfg, dial := m.cfg, m.dialS3
 		m.popup = popupModel{
 			kind:        popupChoice,
 			choiceTitle: "Initialize which s3 backend?",
 			choices:     names,
-			onChoose: func(name string) tea.Cmd {
-				return resolveInitTarget(cfg, name, dial)
-			},
 		}
 		return m, nil
 

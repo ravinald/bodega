@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/table"
@@ -22,6 +23,7 @@ const (
 	popupJSONEdit               // E key — raw-JSON editor for a package or a single version
 	popupAuditTable             // results table for an audit-log query
 	popupChoice                 // pick one of several named options
+	popupInitPending            // I key — waiting on a backend's dial
 )
 
 // popupModel holds the state for the overlay popup.
@@ -49,9 +51,16 @@ type popupModel struct {
 	choiceTitle  string
 	choices      []string
 	choiceCursor int
-	// onChoose returns the tea.Cmd for the chosen option; HandleChoiceKey
-	// assigns it to pendingAsyncCmd on the receiver.
-	onChoose func(choice string) tea.Cmd
+	// chosen is the option Enter picked, left on the dismissed popup for the
+	// app to act on in the same Update, before any other key can open a popup.
+	chosen string
+
+	// --- init pending popup ---
+	// initSeq names the I request this popup is waiting on. A resolution
+	// carrying any other number belongs to a request the operator already
+	// left, and must not replace whatever is showing now.
+	initSeq    uint64
+	initCancel context.CancelFunc
 
 	// --- form popup ---
 	formTitle string
@@ -347,6 +356,9 @@ func (p *popupModel) View(screenWidth, screenHeight int) string {
 
 	case popupChoice:
 		content = p.renderChoice()
+
+	case popupInitPending:
+		content = p.message + "\n\n" + dimStyle.Render("Esc to cancel")
 
 	case popupForm:
 		content = p.renderForm()
@@ -1070,8 +1082,8 @@ func jsonTemplateForType(entryType string) string {
 }
 
 // HandleChoiceKey moves the cursor or chooses the option under it. Returns
-// true when the popup is dismissed, with the chosen option's command in
-// pendingAsyncCmd.
+// true when the popup is dismissed, with the option Enter picked in chosen,
+// or chosen empty when Esc canceled.
 func (p *popupModel) HandleChoiceKey(key string) (dismiss bool) {
 	switch key {
 	case "up", "k":
@@ -1088,11 +1100,11 @@ func (p *popupModel) HandleChoiceKey(key string) (dismiss bool) {
 		p.dismiss()
 		return true
 	case "enter":
-		var cmd tea.Cmd
-		if p.onChoose != nil && p.choiceCursor < len(p.choices) {
-			cmd = p.onChoose(p.choices[p.choiceCursor])
+		var chosen string
+		if p.choiceCursor < len(p.choices) {
+			chosen = p.choices[p.choiceCursor]
 		}
-		*p = popupModel{pendingAsyncCmd: cmd}
+		*p = popupModel{chosen: chosen}
 		return true
 	}
 	return false

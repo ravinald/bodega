@@ -176,3 +176,165 @@ func TestRunInitRefusesAnEmptyResolvedRegion(t *testing.T) {
 		t.Errorf("InitBucket ran with no region: %v", calls)
 	}
 }
+
+func key(m appModel, k string) appModel {
+	msg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)}
+	switch k {
+	case "esc":
+		msg = tea.KeyMsg{Type: tea.KeyEsc}
+	case "enter":
+		msg = tea.KeyMsg{Type: tea.KeyEnter}
+	}
+	next, _ := m.Update(msg)
+	return next.(appModel)
+}
+
+// blockingDial holds every dial until release is closed, so a test controls
+// when a resolution reaches the event loop relative to the keys around it.
+func blockingDial(started chan<- string, release <-chan struct{}) storage.S3Dialer {
+	return func(ctx context.Context, bucket, region string) (*bos3.Client, error) {
+		started <- bucket
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		if region == "" {
+			region = chainRegion
+		}
+		return bos3.NewClientFromConfig(aws.Config{Region: region}, bucket, region), nil
+	}
+}
+
+func runAsync(cmd tea.Cmd) <-chan tea.Msg {
+	out := make(chan tea.Msg, 1)
+	go func() { out <- cmd() }()
+	return out
+}
+
+// TestInitPendingHoldsTheScreen is the review's reproduction: I, then C while
+// the dial is pending. The pending popup takes the C, so there is no form for
+// the late confirmation to replace.
+func TestInitPendingHoldsTheScreen(t *testing.T) {
+	cfg := &config.Config{StorageBackend: "s3", Bucket: "main-bucket", Region: "us-west-2"}
+	m := newAppModel(cfg, nil, nil, nil, nil)
+	started, release := make(chan string, 1), make(chan struct{})
+	m.dialS3 = blockingDial(started, release)
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("I")})
+	m = next.(appModel)
+	result := runAsync(cmd)
+	<-started
+	for _, k := range []string{"C", "x", "I"} {
+		m = key(m, k)
+		if m.popup.kind != popupInitPending {
+			t.Fatalf("after %q popup kind = %d, want the pending init to keep the screen", k, m.popup.kind)
+		}
+	}
+	close(release)
+	next, _ = m.Update(<-result)
+	m = next.(appModel)
+	if m.popup.kind != popupConfirm || !strings.Contains(m.popup.message, "s3://main-bucket") {
+		t.Fatalf("popup kind = %d message %q, want the main-bucket confirmation", m.popup.kind, m.popup.message)
+	}
+}
+
+// TestCanceledInitLeavesLaterEditsAlone cancels a pending init, opens the
+// config form and edits it; the canceled dial finishing afterwards must not
+// touch the form.
+func TestCanceledInitLeavesLaterEditsAlone(t *testing.T) {
+	cfg := &config.Config{StorageBackend: "s3", Bucket: "main-bucket", Region: "us-west-2"}
+	m := newAppModel(cfg, nil, nil, nil, nil)
+	started := make(chan string, 1)
+	m.dialS3 = blockingDial(started, make(chan struct{}))
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("I")})
+	m = next.(appModel)
+	result := runAsync(cmd)
+	<-started
+	m = key(m, "esc")
+	if m.popup.Active() {
+		t.Fatalf("Esc left popup kind %d", m.popup.kind)
+	}
+	// The dial only returns because Esc canceled its context.
+	late := <-result
+
+	m = key(m, "C")
+	m = key(m, "x")
+	before := fieldValue(m.popup.formFields, "Bucket")
+	if m.popup.kind != popupForm || before == cfg.Bucket {
+		t.Fatal("setup did not open and edit the config form")
+	}
+	next, _ = m.Update(late)
+	m = next.(appModel)
+	if after := fieldValue(m.popup.formFields, "Bucket"); m.popup.kind != popupForm || after != before {
+		t.Fatalf("canceled init replaced the form: before %q; after kind=%d bucket=%q message=%q",
+			before, m.popup.kind, after, m.popup.message)
+	}
+}
+
+// TestStaleInitDoesNotRetarget chooses one backend, cancels, chooses another,
+// and delivers the first dial last and first: neither order may put the
+// abandoned backend on the confirmation.
+func TestStaleInitDoesNotRetarget(t *testing.T) {
+	cfg := &config.Config{
+		StorageBackend: "s3", Bucket: "main-bucket", Region: "us-west-2",
+		StorageBackends: map[string]config.StorageSpec{
+			"nearby": {Driver: "s3", Bucket: "nearby-bucket"},
+		},
+	}
+	for _, staleLast := range []bool{false, true} {
+		m := newAppModel(cfg, nil, nil, nil, nil)
+		started, release := make(chan string, 2), make(chan struct{})
+		m.dialS3 = blockingDial(started, release)
+
+		m = key(m, "I")
+		m = key(m, "j")
+		next, stale := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		m = next.(appModel)
+		staleResult := runAsync(stale)
+		if b := <-started; b != "nearby-bucket" {
+			t.Fatalf("first dial reached %s, want nearby-bucket", b)
+		}
+		m = key(m, "esc")
+		m = key(m, "I")
+		next, fresh := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		m = next.(appModel)
+		freshResult := runAsync(fresh)
+		<-started
+		close(release)
+
+		staleMsg, freshMsg := <-staleResult, <-freshResult
+		order := []tea.Msg{staleMsg, freshMsg}
+		if staleLast {
+			order = []tea.Msg{freshMsg, staleMsg}
+		}
+		for _, msg := range order {
+			next, _ = m.Update(msg)
+			m = next.(appModel)
+		}
+		if m.popup.kind != popupConfirm || !strings.Contains(m.popup.message, `"default"`) ||
+			strings.Contains(m.popup.message, "nearby") {
+			t.Fatalf("staleLast=%v: popup kind=%d message %q, want the default confirmation alone",
+				staleLast, m.popup.kind, m.popup.message)
+		}
+	}
+}
+
+func TestInitDialFailureClosesThePendingPopup(t *testing.T) {
+	cfg := &config.Config{StorageBackend: "s3", Bucket: "main-bucket"}
+	m := newAppModel(cfg, nil, nil, nil, nil)
+	m.dialS3 = func(context.Context, string, string) (*bos3.Client, error) {
+		return bos3.NewClientFromConfig(aws.Config{}, "main-bucket", ""), nil
+	}
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("I")})
+	m = next.(appModel)
+	next, _ = m.Update(cmd())
+	m = next.(appModel)
+	if m.popup.Active() {
+		t.Fatalf("popup kind %d stayed open after the dial was refused", m.popup.kind)
+	}
+	last := m.log.outputLines[len(m.log.outputLines)-1]
+	if !strings.Contains(last, "has no AWS region") {
+		t.Errorf("log ends %q, want the missing-region refusal", last)
+	}
+}
