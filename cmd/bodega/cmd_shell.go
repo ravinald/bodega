@@ -5,6 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	bos3 "github.com/ravinald/bodega/internal/s3"
 	"github.com/ravinald/bodega/internal/storage"
 	"github.com/ravinald/bodega/internal/tui"
 )
@@ -34,30 +35,26 @@ Press ? for keybinding help, q to quit.`,
 				return fmt.Errorf("load manifests: %w", err)
 			}
 
-			// The S3 client is optional. When no bucket is configured all local
-			// commands (build, fetch, package, verify, freeze, delete) still work;
-			// only S3-touching commands (status, upload, sync, remove, init) will
-			// report an error when executed from the shell pane.
 			auditDB := openAuditDB(gf)
 			if auditDB != nil {
 				defer auditDB.Close()
 			}
 
 			// The status pane resolves each entry to the backend its manifest
-			// records, so it works on a local-only install; the S3 client above
-			// stays for the commands that genuinely need a bucket.
+			// records, so it works on a local-only install.
 			stores, err := storage.NewResolver(backgroundCtx(), cfg)
 			if err != nil {
 				return fmt.Errorf("connect to storage: %w", err)
 			}
 
-			if cfg.Bucket == "" {
-				return tui.Run(cfg, store, nil, stores, auditDB)
-			}
-
-			s3client, err := newS3Client(cfg)
-			if err != nil {
-				return fmt.Errorf("connect to AWS: %w", err)
+			// The client is for reloading manifests kept in S3 and nothing
+			// else: a bucket key left on a local-driver install dials nothing,
+			// and the I action dials the backend it resolves.
+			var s3client *bos3.Client
+			if !cfg.UsesLocalManifests() {
+				if s3client, err = newS3Client(cfg); err != nil {
+					return fmt.Errorf("connect to AWS: %w", err)
+				}
 			}
 			return tui.Run(cfg, store, s3client, stores, auditDB)
 		},

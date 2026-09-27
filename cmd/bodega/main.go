@@ -435,16 +435,6 @@ func notifyServer(gf *globalFlags) {
 	}
 }
 
-// requireBucket returns an error when cfg.Bucket is empty.
-func requireBucket(cfg *config.Config) error {
-	if cfg.Bucket == "" {
-		return fmt.Errorf(
-			"S3 bucket is required: set --bucket, the REPO_BUCKET env var, or add \"bucket\" to config.json",
-		)
-	}
-	return nil
-}
-
 // isValidType returns true when t is a known manifest type.
 func isValidType(t string) bool {
 	for _, known := range manifest.AllTypes {
