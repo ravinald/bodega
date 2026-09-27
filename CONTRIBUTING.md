@@ -40,9 +40,9 @@ Run a leg on its own with `make test`, `make lint`, `make vet`, `make fmt`, or `
 
 ## End-to-end tests
 
-`make check` is unit tests and linters. `test/e2e/` is the other half: it ships a build to two hosts and drives `apt-get`, `pip`, `helm`, `npm`, `cargo`, `go`, `git`, and `curl` against a running server, then writes a findings file.
+`make check` is unit tests and linters. `test/e2e/` is the other half: it ships a build to four hosts, a Linux pair and a FreeBSD pair, and drives `apt-get`, `pip`, `helm`, `npm`, `cargo`, `go`, `git`, `curl`, `pkg`, and `make fetch` against a running server, then writes a findings file. The FreeBSD server guest is the only place the storage layer's extattr and ACL calls run against a real kernel.
 
-It needs two scratch guests and several minutes, so it runs by hand rather than in CI:
+It needs four scratch guests and several minutes, so it runs by hand rather than in CI:
 
 ```bash
 make e2e
