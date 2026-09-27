@@ -1224,17 +1224,23 @@ func (r *makeReader) read(src source, depth int, conditional, guarded, looping b
 			}
 		}
 		line = bindLoopVars(line, blocks)
-		for _, name := range modifierTargets(line) {
-			if strings.HasPrefix(name, ".") {
-				return fmt.Sprintf("%s assigns %s, a variable make itself sets, through a modifier, and the reader does not model it", file, name)
-			}
-			r.taint(name)
-		}
+		// make evaluates no .elif after a branch it took, so a covered one
+		// runs nothing and assigns nothing, whatever its expression holds.
+		n := len(blocks)
+		unevaluated := n > 0 && blocks[n-1].chain != nil && blocks[n-1].chain.covered && conditionalElse.MatchString(line)
 		directive := strings.HasPrefix(strings.TrimLeft(line, " \t"), ".")
 		loop := looping || inFor()
-		if runsShell(line) && !isRecipe(line, directive) {
-			if why := r.ranShell(file, line, loop); why != "" {
-				return why
+		if !unevaluated {
+			for _, name := range modifierTargets(line) {
+				if strings.HasPrefix(name, ".") {
+					return fmt.Sprintf("%s assigns %s, a variable make itself sets, through a modifier, and the reader does not model it", file, name)
+				}
+				r.taint(name)
+			}
+			if runsShell(line) && !isRecipe(line, directive) {
+				if why := r.ranShell(file, line, loop); why != "" {
+					return why
+				}
 			}
 		}
 		if !directive && !strings.Contains(line, "=") {
@@ -1448,7 +1454,9 @@ func (c *ifChain) enter(known, holds bool) {
 }
 
 // decide evaluates an .if or .elif line that is exists(X) or !exists(X) alone,
-// and known is false for any other condition. It is known only when every
+// and known is false for any other condition. X is one word, as make parses
+// it: blanks may pad it inside the parentheses, and a blank within it is a
+// parse error in make, so it is not decided. It is known only when every
 // value X takes is an absolute path inside the tree that resolves there, and
 // the tree answers the same for all of them. A value ending in "/" is left
 // undecided: make's stat(2) needs a directory there, and resolveInTree does
@@ -1461,7 +1469,7 @@ func (r *makeReader) decide(line, parseDir string) (known, holds bool) {
 	negated := m[3] > m[2]
 	rest := strings.TrimLeft(line[m[1]:], " \t")
 	end := 0
-	for end < len(rest) && rest[end] != ')' {
+	for end < len(rest) && strings.IndexByte(") \t", rest[end]) < 0 {
 		switch c := rest[end]; {
 		case c == '$':
 			_, _, next, ok := parseRef(rest, end)
@@ -1469,16 +1477,17 @@ func (r *makeReader) decide(line, parseDir string) (known, holds bool) {
 				return false, false
 			}
 			end = next
-		case strings.IndexByte(" \t(){}&|\"\\", c) >= 0:
+		case strings.IndexByte("(){}&|\"\\", c) >= 0:
 			return false, false
 		default:
 			end++
 		}
 	}
-	if end == 0 || end == len(rest) || strings.TrimSpace(rest[end+1:]) != "" {
+	arg := rest[:end]
+	rest = strings.TrimLeft(rest[end:], " \t")
+	if arg == "" || !strings.HasPrefix(rest, ")") || strings.TrimSpace(rest[1:]) != "" {
 		return false, false
 	}
-	arg := rest[:end]
 	scope := r.scope(parseDir)
 	if r.readsTainted(arg, scope) {
 		return false, false

@@ -776,6 +776,12 @@ func TestExistsDecidesOnlyInsideTheTree(t *testing.T) {
 		"trailing slash":       {makefile: ".if !exists(${.CURDIR}/Makefile/)\n" + out + ".endif\n", forked: true},
 		"other condition":      {makefile: ".if defined(X)\n.else\n" + out + ".endif\n", forked: true},
 		"undecided then else":  {makefile: ".if defined(X)\n.elif exists(${.CURDIR}/Makefile)\n.else\n" + out + ".endif\n"},
+		"blank before )":       {makefile: ".if exists(${.CURDIR}/Makefile )\n.else\n" + out + ".endif\n"},
+		"tabs around":          {makefile: ".if exists(\t${.CURDIR}/Makefile\t)\n.else\n" + out + ".endif\n"},
+		"negated padded":       {makefile: ".if !exists( ${.CURDIR}/Makefile )\n" + out + ".endif\n"},
+		"elif padded":          {makefile: ".if exists(${.CURDIR}/missing)\n.elif exists(${.CURDIR}/Makefile\t)\n.else\n" + out + ".endif\n"},
+		"negated elif padded":  {makefile: ".if exists(${.CURDIR}/missing)\n.elif !exists( ${.CURDIR}/missing )\n.else\n" + out + ".endif\n"},
+		"two words":            {makefile: ".if !exists(${.CURDIR}/Makefile x)\n" + out + ".endif\n", forked: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			root := portsTree(t)
@@ -786,6 +792,45 @@ func TestExistsDecidesOnlyInsideTheTree(t *testing.T) {
 			}
 			if u := ix.Unowned(); tc.forked != (len(u) == 1 && strings.Contains(u[0], "lang/probe")) {
 				t.Errorf("Unowned() = %q, want forked=%v", u, tc.forked)
+			}
+		})
+	}
+}
+
+// make evaluates no .elif once a branch before it was taken, so a command or
+// modifier there does nothing; one make may reach still counts.
+func TestCoveredElifHasNoSideEffects(t *testing.T) {
+	const (
+		command = ".elif ${:!echo x!}\n"
+		assigns = ".elif ${D::=/elsewhere}\n"
+		after   = ".endif\n.sinclude \"/b97-absent.mk\"\n.include \"${D}/Makefile.inc\"\n"
+	)
+	for name, tc := range map[string]struct {
+		makefile string
+		forked   bool
+	}{
+		"first covered command":        {makefile: ".if exists(${.CURDIR}/Makefile)\n" + command + after},
+		"later covered command":        {makefile: ".if exists(${.CURDIR}/Makefile)\n.elif defined(X)\n" + command + after},
+		"covered after a skipped one":  {makefile: ".if exists(${.CURDIR}/missing)\n.elif exists(${.CURDIR}/Makefile)\n" + command + ".else\n" + after},
+		"first covered modifier":       {makefile: ".if exists(${.CURDIR}/Makefile)\n" + assigns + after},
+		"later covered modifier":       {makefile: ".if exists(${.CURDIR}/Makefile)\n.elif defined(X)\n" + assigns + after},
+		"command after undecided":      {makefile: ".if defined(X)\n" + command + after, forked: true},
+		"command after ruled out":      {makefile: ".if exists(${.CURDIR}/missing)\n" + command + after, forked: true},
+		"modifier after undecided":     {makefile: ".if defined(X)\n" + assigns + after, forked: true},
+		"modifier after ruled out":     {makefile: ".if exists(${.CURDIR}/missing)\n" + assigns + after, forked: true},
+		"command in the taken branch":  {makefile: ".if exists(${.CURDIR}/Makefile)\nV!=\techo x\n.elif defined(X)\n" + after, forked: true},
+		"modifier in the taken branch": {makefile: ".if exists(${.CURDIR}/Makefile)\n${D::=/elsewhere}\n.elif defined(X)\n" + after, forked: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := portsTree(t)
+			write(t, root, "lang/probe/Makefile", "NO_CDROM=\tprobe\nD=\t${.CURDIR}\n"+tc.makefile)
+			write(t, root, "lang/probe/Makefile.inc", "")
+			ix := loadWith(t, root, EnvironmentSpec{Files: map[string][]string{"/b97-absent.mk": {Absent}}})
+			if u := ix.Unowned(); tc.forked != (len(u) == 1 && strings.Contains(u[0], "lang/probe")) {
+				t.Fatalf("Unowned() = %q, want forked=%v", u, tc.forked)
+			}
+			if _, err := ix.Lookup("pcpustat/1.6.tar.bz2"); (err == nil) == tc.forked {
+				t.Errorf("pcpustat/1.6.tar.bz2: %v, want admitted=%v", err, !tc.forked)
 			}
 		})
 	}
