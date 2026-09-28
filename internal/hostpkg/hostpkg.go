@@ -40,12 +40,13 @@ type Result struct {
 // A raw curl of a tarball into /usr/local/bin leaves no record any manager
 // keeps, which is the gap discover_mode's observe still covers.
 var parsers = map[string]Parser{
-	manifest.TypeApt:   ParseApt,
-	manifest.TypePypi:  ParsePip,
-	manifest.TypeNpm:   ParseNpm,
-	manifest.TypeGomod: ParseGomod,
-	manifest.TypeCargo: ParseCargo,
-	manifest.TypeHelm:  ParseHelm,
+	manifest.TypeApt:     ParseApt,
+	manifest.TypePypi:    ParsePip,
+	manifest.TypeNpm:     ParseNpm,
+	manifest.TypeGomod:   ParseGomod,
+	manifest.TypeCargo:   ParseCargo,
+	manifest.TypeHelm:    ParseHelm,
+	manifest.TypeFreeBSD: ParseFreeBSD,
 }
 
 // For returns the parser for a package type.
