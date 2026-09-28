@@ -865,6 +865,9 @@ func (s *Server) registerRoutes() {
 	// root file or a catalogue record's own repopath, which carries any
 	// number of segments.
 	m.HandleFunc("GET /freebsd/{path...}", s.handleFreeBSD)
+	// The same tree filtered for one profile: <abi>/<repo>/<rest> below the
+	// profile name, so a record's repopath resolves under either root.
+	m.HandleFunc("GET /freebsd-profile/{profile}/{path...}", s.handleFreeBSDProfile)
 
 	// Ports distfiles, by distinfo name under the environment the client's
 	// check measured: the path is what a client composes from
@@ -1174,7 +1177,9 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 		// credentials. repo and abi stay public so a client can tell a
 		// refused repository from an absent one.
 		for i := range freebsd.Refused {
-			freebsd.Refused[i].Error = ""
+			if !freebsd.Refused[i].public {
+				freebsd.Refused[i].Error = ""
+			}
 		}
 	}
 	entryCount := make(map[string]int, len(manifest.AllTypes))

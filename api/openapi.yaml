@@ -1522,6 +1522,14 @@ components:
             it: a server holding no pkg catalogue signing key renders
             signature_type none for a generated repository, and that field is
             the one to read for the signing half.
+        profile:
+          type: string
+          description: >-
+            The profile the requesting host is bound to, when that profile
+            states a freebsd rule. url then names the catalogue bodega filtered for
+            that profile, re-signed with bodega's pkg key, and signature_type
+            and fingerprints trust that key rather than FreeBSD's. Absent for
+            a host no such profile binds.
         proxy:
           type: boolean
           description: >-

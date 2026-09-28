@@ -127,9 +127,10 @@ for pair in "server:$E2E_SERVER_HOST" "client:$E2E_CLIENT_HOST" \
 	case "$alias" in
 	server) E2E_SERVER_ADDR="$addr" ;;
 	client) E2E_CLIENT_ADDR="$addr" ;;
+	freebsd) E2E_FREEBSD_ADDR="$addr" ;;
 	esac
 done
-export E2E_SERVER_ADDR E2E_CLIENT_ADDR
+export E2E_SERVER_ADDR E2E_CLIENT_ADDR E2E_FREEBSD_ADDR
 
 # Loopback only. Whether the client can reach the listener depends on the
 # address it is bound to, which the ship suite sets; asserting it here would
