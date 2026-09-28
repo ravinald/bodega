@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/ravinald/bodega/internal/manifest"
@@ -182,5 +183,100 @@ func ParseCargo(r io.Reader) (Result, error) {
 			"skipped %d crate(s) installed from a git or path source; the registry has no such version to serve", gitSourced))
 	}
 	sortPackages(res.Packages)
+	return res, nil
+}
+
+// freeBSDUnknownRepo is what pkg records for a package installed from a file
+// or a ports build rather than from a configured repository.
+const freeBSDUnknownRepo = "unknown-repository"
+
+// ParseFreeBSD converts "pkg query '%R\t%q'": the repository each installed
+// package came from, and the ABI it was built for.
+//
+// A freebsd entry is a repository and its versions are ABIs, so the packages
+// themselves are not cataloged: every row collapses to the (repository, ABI)
+// pair it names. A noarch package reports its ABI with the architecture as
+// "*", which is not a directory a pkg client ever substitutes for ${ABI}, so
+// those rows add nothing; a repository that shows only noarch rows is
+// reported rather than guessed at.
+//
+// The name is the host's own label for the repository ("FreeBSD-ports"), and
+// the URL is empty. pkg records the label on every package and the address
+// nowhere a query reaches, so the entry arrives the way a helm one does, with
+// a warning naming the command that answers it. Entries import as proxy for
+// the reason every registry entry does: hosted would commit the server to
+// mirroring a whole FreeBSD repository for each host imported.
+func ParseFreeBSD(r io.Reader) (Result, error) {
+	var res Result
+	type repoABI struct{ repo, abi string }
+	seen := map[repoABI]bool{}
+	noarchOnly := map[string]bool{}
+	unknown, invalid := 0, 0
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		f := strings.Split(line, "\t")
+		if len(f) != 2 {
+			return Result{}, fmt.Errorf("parse pkg query line %q: want 2 tab-separated fields, got %d\nexpected: pkg query '%%R\\t%%q'", line, len(f))
+		}
+		repo, abi := strings.TrimSpace(f[0]), strings.TrimSpace(f[1])
+		switch {
+		case repo == "" || repo == freeBSDUnknownRepo:
+			unknown++
+			continue
+		case strings.HasSuffix(abi, ":*"):
+			if _, ok := noarchOnly[repo]; !ok {
+				noarchOnly[repo] = true
+			}
+			continue
+		case !manifest.FreeBSDValidRepo(repo) || !manifest.FreeBSDValidABI(abi):
+			invalid++
+			continue
+		}
+		noarchOnly[repo] = false
+		key := repoABI{repo, abi}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		res.Packages = append(res.Packages, pkg(manifest.TypeFreeBSD, repo, abi, "", registryMode))
+	}
+	if err := sc.Err(); err != nil {
+		return Result{}, fmt.Errorf("scan pkg query output: %w", err)
+	}
+	res.Packages = mergeSameName(res.Packages)
+	sortPackages(res.Packages)
+
+	if unknown > 0 {
+		res.Warnings = append(res.Warnings, fmt.Sprintf(
+			"skipped %d package(s) installed from a file or a ports build; they name no repository to mirror", unknown))
+	}
+	if invalid > 0 {
+		res.Warnings = append(res.Warnings, fmt.Sprintf(
+			"skipped %d package(s) whose repository or ABI is not a directory name bodega can key a mirror under", invalid))
+	}
+	var bare []string
+	for repo, only := range noarchOnly {
+		if only {
+			bare = append(bare, repo)
+		}
+	}
+	if len(bare) > 0 {
+		sort.Strings(bare)
+		res.Warnings = append(res.Warnings, fmt.Sprintf(
+			"skipped repositor(ies) %s: every package from them is noarch (ABI ending in \":*\"), which names no ABI a client requests; "+
+				"catalog them with 'bodega pkg create freebsd' and the host's 'pkg config ABI'", strings.Join(bare, ", ")))
+	}
+	if len(res.Packages) > 0 {
+		res.Warnings = append(res.Warnings, fmt.Sprintf(
+			"%d freebsd entr(ies) have no url: pkg records which repository a package came from, not its address. "+
+				"Fill each url in from 'pkg -vv' on the host (${ABI} substituted) before importing; "+
+				"a repository the host already reads through bodega is one to drop, not import",
+			len(res.Packages)))
+	}
 	return res, nil
 }
