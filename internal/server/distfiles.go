@@ -212,13 +212,13 @@ func (s *Server) handleDistfiles(w http.ResponseWriter, r *http.Request) {
 	}
 
 	key := manifest.DistfilesKey(name)
+	upstream := s.cfg.DistfilesUpstream + manifest.DistfilesURLPath(name)
 	if info, _ := store.Head(ctx, key); info != nil && info.Exists && info.Size == entry.Size {
-		if s.serveVerifiedDistfile(w, r, store, name, key, entry) {
+		if s.serveVerifiedDistfile(w, r, store, name, key, upstream, entry) {
 			return
 		}
 	}
 
-	upstream := s.cfg.DistfilesUpstream + manifest.DistfilesURLPath(name)
 	// A digest says the bytes are right; it does not say the operator agreed
 	// to contact the host that would supply them.
 	if !s.enforceUpstreamPolicyRecording(w, r, manifest.TypeDistfiles, upstream, upstream, name, key, true) {
@@ -336,7 +336,7 @@ func (s *Server) serveClientCheck(w http.ResponseWriter) {
 //
 // A mismatch is recorded and falls through to the miss path, whose verified
 // fetch replaces the object. A spool bound, like a miss, answers 503.
-func (s *Server) serveVerifiedDistfile(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, name, key string, entry distinfo.Entry) bool {
+func (s *Server) serveVerifiedDistfile(w http.ResponseWriter, r *http.Request, store storage.ObjectStore, name, key, upstream string, entry distinfo.Entry) bool {
 	res, err := store.GetStream(r.Context(), key)
 	if err != nil || res == nil {
 		// Gone since the Head, or unreadable: a miss fetches and replaces it.
@@ -372,6 +372,10 @@ func (s *Server) serveVerifiedDistfile(w http.ResponseWriter, r *http.Request, s
 		return true
 	}
 	s.recordCacheServed(r, manifest.TypeDistfiles, name, name, key, obj)
+	// The miss path records discovery under the upstream URL and the audit row
+	// under the name, so the two halves are called apart: recordCacheHit would
+	// give both the same candidate and put the hit on a row the miss never wrote.
+	s.recordCacheHitDiscovery(r.Context(), r, manifest.TypeDistfiles, upstream, upstream, name, key)
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", spool.size))
 	w.WriteHeader(http.StatusOK)

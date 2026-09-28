@@ -271,6 +271,7 @@ func TestEveryImportIsAdmissible(t *testing.T) {
 		{manifest.TypeGomod, "gomod-go-list-m-all.txt"},
 		{manifest.TypeGomod, "gomod-go-version-m.txt"},
 		{manifest.TypeHelm, "helm-list.json"},
+		{manifest.TypeFreeBSD, "freebsd-pkg-query.txt"},
 	} {
 		t.Run(tc.file, func(t *testing.T) {
 			parse, err := For(tc.typ)
@@ -299,6 +300,7 @@ func TestConversionIsDeterministic(t *testing.T) {
 		{manifest.TypeApt, "apt-dpkg-query-ubuntu2604.txt"},
 		{manifest.TypeNpm, "npm-ls-global.json"},
 		{manifest.TypeGomod, "gomod-go-list-m-all.txt"},
+		{manifest.TypeFreeBSD, "freebsd-pkg-query.txt"},
 	} {
 		parse, err := For(tc.typ)
 		if err != nil {
@@ -467,5 +469,72 @@ func TestAptCaptureRecordsItsRelease(t *testing.T) {
 		if got := pm.Versions[0].CaptureSuite; got != "jammy" {
 			t.Fatalf("%s: capture_suite = %q, want jammy", pm.Name, got)
 		}
+	}
+}
+
+// TestParseFreeBSDCollapsesToRepositories reads a FreeBSD 15.1 host with 34
+// packages from three repositories. A freebsd entry is a repository keyed by
+// ABI, so 34 rows become three entries, and the 7 noarch rows ("FreeBSD:15:*")
+// add no version: no pkg client substitutes that for ${ABI}.
+func TestParseFreeBSDCollapsesToRepositories(t *testing.T) {
+	res, err := ParseFreeBSD(fixture(t, "freebsd-pkg-query.txt"))
+	if err != nil {
+		t.Fatalf("ParseFreeBSD: %v", err)
+	}
+	want := map[string]string{
+		"FreeBSD-ports":    "FreeBSD:15:aarch64",
+		"bodega-latest":    "FreeBSD:15:aarch64",
+		"bodega-quarterly": "FreeBSD:15:aarch64",
+	}
+	if got := names(res.Packages); len(got) != len(want) {
+		t.Fatalf("got entries %v, want %v", got, want)
+	}
+	for _, pm := range res.Packages {
+		if pm.Type != manifest.TypeFreeBSD {
+			t.Errorf("%s: type %q", pm.Name, pm.Type)
+		}
+		if len(pm.Versions) != 1 || pm.Versions[0].Version != want[pm.Name] {
+			t.Errorf("%s: versions %+v, want the one ABI %s", pm.Name, pm.Versions, want[pm.Name])
+			continue
+		}
+		ve := pm.Versions[0]
+		if ve.URL != "" || ve.Generated {
+			t.Errorf("%s: url %q generated %v; the query records neither", pm.Name, ve.URL, ve.Generated)
+		}
+		if ve.EffectiveMode() != manifest.ModeProxy {
+			t.Errorf("%s: mode %q; hosted would mirror the whole repository on import", pm.Name, ve.EffectiveMode())
+		}
+	}
+	if !strings.Contains(strings.Join(res.Warnings, "\n"), "pkg -vv") {
+		t.Errorf("entries import with no url and no warning names where to find one: %v", res.Warnings)
+	}
+}
+
+// TestParseFreeBSDReportsWhatItSkips covers the rows the fixture host lacks: a
+// package built from ports, a repository holding only noarch packages, and a
+// host upgraded across a major version whose packages still carry both ABIs.
+func TestParseFreeBSDReportsWhatItSkips(t *testing.T) {
+	res, err := ParseFreeBSD(strings.NewReader(strings.Join([]string{
+		"unknown-repository\tFreeBSD:15:aarch64",
+		"fonts\tFreeBSD:15:*",
+		"FreeBSD-ports\tFreeBSD:14:aarch64",
+		"FreeBSD-ports\tFreeBSD:15:aarch64",
+		"FreeBSD-ports\tFreeBSD:15:*",
+	}, "\n")))
+	if err != nil {
+		t.Fatalf("ParseFreeBSD: %v", err)
+	}
+	if len(res.Packages) != 1 || len(res.Packages[0].Versions) != 2 {
+		t.Fatalf("want FreeBSD-ports with both ABIs, got %+v", res.Packages)
+	}
+	warned := strings.Join(res.Warnings, "\n")
+	for _, want := range []string{"ports build", "fonts"} {
+		if !strings.Contains(warned, want) {
+			t.Errorf("no warning mentions %q: %v", want, res.Warnings)
+		}
+	}
+
+	if _, err := ParseFreeBSD(strings.NewReader("FreeBSD-ports FreeBSD:15:aarch64\n")); err == nil {
+		t.Error("a line with no tab parsed; a capture taken with the wrong format would import nothing and say nothing")
 	}
 }

@@ -315,7 +315,7 @@ A manifest entry is what makes a package servable, so how entries get written is
 
 It also settles an ordering problem. Catalog mode returns 404 against an empty store, so a fleet pointed at a fresh bodega breaks until the catalog exists. Importing fills the catalog before any client is repointed.
 
-`git`, `binary` and `freebsd` have no importer, because nothing on a host records a clone, a downloaded binary or the upstream pkg repository a package came from. Those two are what discovery still covers: run with `discover_mode` set to `"observe"`, let catalog mode record the misses as `no_manifest` and `no_namespace` rows, and promote them.
+`git` and `binary` have no importer, because nothing on a host records a clone or a downloaded binary. Those two are what discovery still covers: run with `discover_mode` set to `"observe"`, let catalog mode record the misses as `no_manifest` and `no_namespace` rows, and promote them.
 
 Every path runs the same admission checks (`internal/admit`): structural validation, the upstream allow-list, then the age and OSV version checks. A manifest's fate does not depend on which surface it arrived through.
 
