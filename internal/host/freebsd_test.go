@@ -1349,3 +1349,247 @@ func TestMakeConfRecipeLines(t *testing.T) {
 		assertFinding(t, checkMakeConf(root, "freebsd", func(string) string { return "" }), StatusWarn, "shell command rather than an .include")
 	})
 }
+
+// A byte libucl may read as structure is refused in every unquoted token,
+// whatever depth or file it sits in; the same bytes quoted are text.
+func TestPkgBareTokensHoldNoStructure(t *testing.T) {
+	upstream := `FreeBSD: { url: "https://pkg.FreeBSD.org/x", enabled: yes }`
+	bodega := ` bodega: { url: "https://b/freebsd/x/latest" }`
+	for _, tok := range []string{`abc{`, `abc[`, `a"b"`, `a'b'`, `a\b`, `a/*b*/`} {
+		for name, body := range map[string]string{
+			"field":  `FreeBSD: { enabled: no, ignored: ` + tok + ` }` + bodega,
+			"nested": `FreeBSD: { enabled: no, ignored: { deeper: [ ` + tok + ` ] } }` + bodega,
+			"key":    `FreeBSD: { enabled: no, ` + tok + `: x }` + bodega,
+			"scalar": `stray ` + tok + "\n" + `FreeBSD: { enabled: no }` + bodega,
+		} {
+			t.Run(name+"/"+tok, func(t *testing.T) {
+				root := writeTree(t, map[string]string{
+					"/etc/pkg/FreeBSD.conf":                upstream,
+					"/usr/local/etc/pkg/repos/bodega.conf": body,
+				})
+				if got := checkPkgRepos(root, "freebsd"); got.Status == StatusOK {
+					t.Fatalf("OK over %q: %s", body, got.Detail)
+				}
+			})
+		}
+		t.Run("included/"+tok, func(t *testing.T) {
+			root := writeTree(t, map[string]string{
+				"/etc/pkg/FreeBSD.conf":                upstream,
+				"/usr/local/etc/pkg/repos/bodega.conf": ".include \"/usr/local/etc/pkg/off.inc\"\n" + bodega,
+				"/usr/local/etc/pkg/off.inc":           `FreeBSD: { enabled: no, ignored: ` + tok + ` }`,
+			})
+			if got := checkPkgRepos(root, "freebsd"); got.Status == StatusOK {
+				t.Fatalf("OK: %s", got.Detail)
+			}
+		})
+	}
+	for _, tok := range []string{`"abc{"`, `'a[b'`, `abc`, `"a/*b"`} {
+		t.Run("quoted/"+tok, func(t *testing.T) {
+			root := writeTree(t, map[string]string{
+				"/etc/pkg/FreeBSD.conf":                upstream,
+				"/usr/local/etc/pkg/repos/bodega.conf": `FreeBSD: { enabled: no, ignored: ` + tok + ` }` + bodega,
+			})
+			assertFinding(t, checkPkgRepos(root, "freebsd"), StatusOK)
+		})
+	}
+}
+
+// An expression make evaluates may assign, whatever line carries it and
+// however indirectly it is reached. Each case is make.conf's bodega sites
+// followed by the lines given, then the client check.
+func TestMakeConfExpressionEffects(t *testing.T) {
+	site := "https://b/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/"
+	safe := "MASTER_SITE_OVERRIDE=" + site + "\nMASTER_SITE_BACKUP=" + site + "\nMIRROR=https://mirror.example/\n"
+	effects := map[string]string{
+		"assign":            "${MASTER_SITE_OVERRIDE::=${MIRROR}}",
+		"assign-if-unset":   "${MASTER_SITE_OVERRIDE::?=${MIRROR}}",
+		"append":            "${MASTER_SITE_OVERRIDE::+=${MIRROR}}",
+		"assign-shell":      "${MASTER_SITE_OVERRIDE::!=echo x}",
+		"underscore":        "${MIRROR:_=MASTER_SITE_OVERRIDE}",
+		"loop-deletes-site": "${MIRROR:@MASTER_SITE_OVERRIDE@x@}",
+		"loop-control":      "${MIRROR:@.MAKEFLAGS@x@}",
+		"indirect-modifier": "${MIRROR:${MODS}}",
+		"computed-name":     "${${NAME}}",
+		"paren-form":        "$(MASTER_SITE_OVERRIDE::=${MIRROR})",
+	}
+	sites := map[string]func(expr string) string{
+		"immediate":      func(e string) string { return "UNRELATED:= " + e + "\n" },
+		"indirect":       func(e string) string { return "EFFECT=" + e + "\nUNRELATED:= ${EFFECT}\n" },
+		"two-hops":       func(e string) string { return "E1=" + e + "\nE2=${E1}\nUNRELATED:= ${E2}\n" },
+		"defined-later":  func(e string) string { return "E2=${E1}\nE1=" + e + "\nUNRELATED:= ${E2}\n" },
+		"info":           func(e string) string { return "EFFECT=" + e + "\n.info ${EFFECT}\n" },
+		"warning":        func(e string) string { return ".warning " + e + "\n" },
+		"condition":      func(e string) string { return "EFFECT=" + e + "\n.if \"${EFFECT}\" == \" \"\n.endif\n" },
+		"empty-function": func(e string) string { return "EFFECT=" + e + "\n.if empty(EFFECT)\n.endif\n" },
+		"elif":           func(e string) string { return ".if 0\n.elif \"" + e + "\" == \"\"\n.endif\n" },
+		"for-list":       func(e string) string { return ".for _x in " + e + "\n.endfor\n" },
+		"shell-command":  func(e string) string { return "UNRELATED!= echo " + e + "\n" },
+		"dependency":     func(e string) string { return "foo: " + e + "\n" },
+		"recipe":         func(e string) string { return ".BEGIN:\n\t@: " + e + "\n" },
+		"undef":          func(e string) string { return ".undef " + e + "\n" },
+		"deferred-only":  func(e string) string { return "FETCH_ENV=" + e + "\n" },
+		"unknown-branch": func(e string) string { return ".if ${OPSYS} == FreeBSD\nUNRELATED:= " + e + "\n.endif\n" },
+	}
+	for sname, wrap := range sites {
+		for ename, expr := range effects {
+			t.Run(sname+"/"+ename, func(t *testing.T) {
+				root := writeTree(t, map[string]string{
+					"/etc/make.conf":                     safe + wrap(expr) + ".include \"/usr/local/etc/bodega-distfiles.mk\"\n",
+					"/usr/local/etc/bodega-distfiles.mk": "BODEGA_DISTFILES_ENV=abc\n",
+				})
+				if got := checkMakeConf(root, "freebsd", func(string) string { return "" }); got.Status == StatusOK {
+					t.Fatalf("OK: %s", got.Detail)
+				}
+			})
+		}
+	}
+
+	// Text that reaches make again after one expansion is syntax there.
+	for name, lines := range map[string]string{
+		"dollars-through-:=":     "HIDDEN:= $${MASTER_SITE_OVERRIDE::=x}\nUNRELATED:= ${HIDDEN}\n",
+		"shell-output-expanded":  "HIDDEN!= echo x\n.if !empty(HIDDEN:M*)\n.endif\n",
+		"for-substitutes-dollar": "LIST=$$x\n.for _x in ${LIST}\n.endfor\n",
+		"loop-over-dollars":      "HIDDEN!= echo x\nUNRELATED:= ${HIDDEN:@w@${w}@}\n",
+		"in-included-file":       ".include \"/etc/more.mk\"\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := writeTree(t, map[string]string{
+				"/etc/make.conf":                     safe + lines + ".include \"/usr/local/etc/bodega-distfiles.mk\"\n",
+				"/etc/more.mk":                       "UNRELATED:= ${MASTER_SITE_BACKUP::=${MIRROR}}\n",
+				"/usr/local/etc/bodega-distfiles.mk": "BODEGA_DISTFILES_ENV=abc\n",
+			})
+			if got := checkMakeConf(root, "freebsd", func(string) string { return "" }); got.Status == StatusOK {
+				t.Fatalf("OK: %s", got.Detail)
+			}
+		})
+	}
+
+	// An effect in the client check itself counts as one in make.conf.
+	t.Run("in-client-check", func(t *testing.T) {
+		root := writeTree(t, map[string]string{
+			"/etc/make.conf":                     safe + ".include \"/usr/local/etc/bodega-distfiles.mk\"\n",
+			"/usr/local/etc/bodega-distfiles.mk": "BODEGA_DISTFILES_ENV=abc\n.info ${MASTER_SITE_OVERRIDE::=x}\n",
+		})
+		if got := checkMakeConf(root, "freebsd", func(string) string { return "" }); got.Status == StatusOK {
+			t.Fatalf("OK: %s", got.Detail)
+		}
+	})
+
+	// The environment's values are make syntax wherever make expands them.
+	t.Run("environment-value", func(t *testing.T) {
+		root := writeTree(t, map[string]string{
+			"/etc/make.conf":                     safe + "UNRELATED:= ${FROM_ENV}\n.include \"/usr/local/etc/bodega-distfiles.mk\"\n",
+			"/usr/local/etc/bodega-distfiles.mk": "BODEGA_DISTFILES_ENV=abc\n",
+		})
+		env := map[string]string{"FROM_ENV": "${MASTER_SITE_OVERRIDE::=x}"}
+		lookup := func(n string) (string, bool) { v, ok := env[n]; return v, ok }
+		if got := checkMakeConfEnviron(root, "freebsd", lookup, []string{"FROM_ENV=" + env["FROM_ENV"]}); got.Status == StatusOK {
+			t.Fatalf("OK: %s", got.Detail)
+		}
+	})
+
+	// Pure expressions stay certifiable.
+	for name, lines := range map[string]string{
+		"filters":        "UNRELATED:= ${MIRROR:M*:N*.org:S/a/b/:tu}\n",
+		"condition-form": "UNRELATED:= ${\"${MIRROR}\" == \"\":?yes:no}\n",
+		"info":           ".info ${MIRROR:Q}\n",
+		"condition":      ".if !empty(MIRROR:M*) && defined(MIRROR)\n.endif\n",
+		"safe-loop":      "UNRELATED:= ${MIRROR:@w@<${w}>@}\n",
+		"shell-compared": ".if \"${:!echo hi!}\" == \"hi\"\n.endif\n",
+	} {
+		t.Run("pure/"+name, func(t *testing.T) {
+			root := writeTree(t, map[string]string{
+				"/etc/make.conf":                     safe + lines + ".include \"/usr/local/etc/bodega-distfiles.mk\"\n",
+				"/usr/local/etc/bodega-distfiles.mk": "BODEGA_DISTFILES_ENV=abc\n",
+			})
+			assertFinding(t, checkMakeConf(root, "freebsd", func(string) string { return "" }), StatusOK)
+		})
+	}
+}
+
+// The served client check runs commands whose output make expands again;
+// doctor models what each one prints, for every environment bodega can
+// declare, and certifies it only while those inputs hold no effect.
+func TestCheckMakeConfServedCheckCommands(t *testing.T) {
+	snap := filepath.Join(t.TempDir(), "snap")
+	if err := os.WriteFile(snap, []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	spec := distinfo.EnvironmentSpec{
+		Variables: map[string][]string{"WITH_DEBUG": {"yes"}, "NO_X11": {}},
+		Files:     map[string][]string{"/etc/src.conf": {distinfo.Absent}, "/usr/local/etc/declared.conf": {snap, distinfo.Absent}},
+	}
+	env, err := spec.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{clientconf.DistfilesCheckPath, "/net/b/distfiles/@environment.mk"} {
+		conf := strings.ReplaceAll(clientconf.MakeConf("https://b").Content, clientconf.DistfilesCheckPath, path)
+		files := map[string]string{"/etc/make.conf": conf, path: string(env.ClientCheck())}
+		t.Run(path, func(t *testing.T) {
+			lookup := func(string) (string, bool) { return "", false }
+			assertFinding(t, checkMakeConfEnviron(writeTree(t, files), "freebsd", lookup, []string{"PS1=\\u@\\h\\$ ", "HOME=/root"}), StatusOK)
+		})
+		t.Run(path+"/environment-effect", func(t *testing.T) {
+			lookup := func(string) (string, bool) { return "", false }
+			got := checkMakeConfEnviron(writeTree(t, files), "freebsd", lookup, []string{"LC_X=${MASTER_SITE_OVERRIDE::=https://mirror.example/}"})
+			assertFinding(t, got, StatusWarn, "may assign a variable")
+		})
+		t.Run(path+"/ports-tree-dollar", func(t *testing.T) {
+			lookup := func(n string) (string, bool) {
+				if n == "PORTSDIR" {
+					return "/usr/ports$${X}", true
+				}
+				return "", false
+			}
+			assertFinding(t, checkMakeConfLookup(writeTree(t, files), "freebsd", lookup), StatusWarn, "may assign a variable")
+		})
+	}
+}
+
+// A missing first candidate proves an include absent only where make looks
+// nowhere else.
+func TestMakeConfIncludeSearch(t *testing.T) {
+	site := "https://b/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/"
+	safe := "MASTER_SITE_OVERRIDE=" + site + "\nMASTER_SITE_BACKUP=" + site + "\n"
+	check := ".include \"/usr/local/etc/bodega-distfiles.mk\"\n"
+	for _, tc := range []struct {
+		name, line string
+		extra      map[string]string
+		env        map[string]string
+		want       Status
+	}{
+		{"relative soft, missing beside", ".sinclude \"other.mk\"\n", nil, nil, StatusWarn},
+		{"relative -include, missing beside", ".-include \"other.mk\"\n", nil, nil, StatusWarn},
+		{"relative dinclude, missing beside", ".dinclude \"other.mk\"\n", nil, nil, StatusWarn},
+		{"relative hard, missing beside", ".include \"other.mk\"\n", nil, nil, StatusWarn},
+		{"relative, found beside", ".sinclude \"other.mk\"\n", map[string]string{"/etc/other.mk": "UNRELATED=1\n"}, nil, StatusOK},
+		{"relative, found beside with an override", ".sinclude \"other.mk\"\n", map[string]string{"/etc/other.mk": "MASTER_SITE_OVERRIDE=https://mirror.example/\n"}, nil, StatusWarn},
+		{"absolute soft, absent", ".sinclude \"/nonexistent/other.mk\"\n", nil, nil, StatusOK},
+		{"system soft, absent", ".sinclude <nonexistent.mk>\n", nil, nil, StatusOK},
+		{"system soft, MAKESYSPATH set", ".sinclude <nonexistent.mk>\n", nil, map[string]string{"MAKESYSPATH": "/elsewhere"}, StatusWarn},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := map[string]string{
+				"/etc/make.conf":                     safe + tc.line + check,
+				"/usr/local/etc/bodega-distfiles.mk": "BODEGA_DISTFILES_ENV=abc\n",
+			}
+			for p, b := range tc.extra {
+				files[p] = b
+			}
+			lookup := func(n string) (string, bool) { v, ok := tc.env[n]; return v, ok }
+			assertFinding(t, checkMakeConfLookup(writeTree(t, files), "freebsd", lookup), tc.want)
+		})
+	}
+}
+
+func TestMakeConfLoopDoctorCannotParse(t *testing.T) {
+	site := "https://b/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/"
+	root := writeTree(t, map[string]string{
+		"/etc/make.conf":                     "MASTER_SITE_OVERRIDE=" + site + "\nMASTER_SITE_BACKUP=" + site + "\nUNRELATED:= ${A:@v@${B:@MASTER_SITE_OVERRIDE@x@}@}\n.include \"/usr/local/etc/bodega-distfiles.mk\"\n",
+		"/usr/local/etc/bodega-distfiles.mk": "BODEGA_DISTFILES_ENV=abc\n",
+	})
+	if got := checkMakeConf(root, "freebsd", func(string) string { return "" }); got.Status == StatusOK {
+		t.Fatalf("OK: %s", got.Detail)
+	}
+}

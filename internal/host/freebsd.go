@@ -12,8 +12,10 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/ravinald/bodega/internal/clientconf"
+	"github.com/ravinald/bodega/internal/distinfo"
 	"github.com/ravinald/bodega/internal/pkgrepos"
 )
 
@@ -815,7 +817,27 @@ func (p *uclParser) key() (string, error) {
 	if p.pos == start {
 		return "", fmt.Errorf("line %d: expected a key, found %q", p.line(), p.peek())
 	}
-	return p.src[start:p.pos], nil
+	k := p.src[start:p.pos]
+	if why := uclBareToken(k); why != "" {
+		return "", pkgUnmodeled{fmt.Sprintf("line %d: the key %s %s", p.line(), k, why)}
+	}
+	if c := p.peek(); c == '"' || c == '\'' || c == '{' || c == '[' {
+		return "", pkgUnmodeled{fmt.Sprintf("line %d: the key %s runs into %q with no space, which doctor does not lex", p.line(), k, c)}
+	}
+	return k, nil
+}
+
+// uclBareToken returns why doctor does not read an unquoted key or value as
+// the text it spells, or "". A quote, an opener or a backslash inside one is
+// a byte libucl may read as structure or an escape rather than as text, and
+// "/*" may open a comment: libucl discarded a whole file over "abc{" where
+// the same bytes quoted parsed, measured with pkg 2.8.4 on 15.1. doctor
+// refuses the token at every depth rather than guess which it is.
+func uclBareToken(s string) string {
+	if strings.ContainsAny(s, "\"'{[\\") || strings.Contains(s, "/*") {
+		return "holds a quote, an opener, a backslash or /* outside quotes, which libucl may read as structure"
+	}
+	return ""
 }
 
 // value returns a scalar, or an empty one of its kind after passing a
@@ -842,6 +864,9 @@ func (p *uclParser) value() (uclScalar, error) {
 	s := p.src[start:p.pos]
 	if s == "" {
 		p.fail(fmt.Errorf("line %d: string value must not be empty", p.line()))
+	}
+	if why := uclBareToken(s); why != "" {
+		return uclScalar{}, pkgUnmodeled{fmt.Sprintf("line %d: the value %s %s", p.line(), s, why)}
 	}
 	return uclScalar{s: s, kind: bareKind(s)}, nil
 }
@@ -886,9 +911,9 @@ const uclNestDepth = 32
 // libucl accepts "{ a x }", "{ a: x b: y }", "[a b]", trailing separators
 // and comments inside either, and rejects an empty value, a closer that does
 // not match its opener, and "[ , ]" while accepting "[a,,b]". doctor keeps
-// to the forms it measured: a bare value holding a quote or an opener, and
-// any separator where an array element belongs, are refused as unmodeled
-// rather than guessed at.
+// to the forms it measured: a separator where an array element belongs is
+// refused as unmodeled rather than guessed at, and value refuses a bare
+// token it does not lex at this depth as at every other.
 func (p *uclParser) nested() error {
 	open, start := p.peek(), p.line()
 	closer := byte('}')
@@ -925,14 +950,8 @@ func (p *uclParser) nested() error {
 			}
 			p.sep()
 		}
-		c := p.peek()
-		bare := c != '"' && c != '\'' && c != '{' && c != '['
-		v, err := p.value()
-		if err != nil {
+		if _, err := p.value(); err != nil {
 			return err
-		}
-		if bare && strings.ContainsAny(v.s, "\"'{[") {
-			return pkgUnmodeled{fmt.Sprintf("line %d: the nested value %s holds a quote or an opener, which doctor does not lex", p.line(), v.s)}
 		}
 		p.term()
 	}
@@ -962,7 +981,7 @@ const distfilesEnvVar = "BODEGA_DISTFILES_ENV"
 const distSubdirVar = "DIST_SUBDIR"
 
 var (
-	makeAssign    = regexp.MustCompile(`^([^\s:?!+=]+)\s*([:?!+]?=)\s*(.*)$`)
+	makeAssign    = regexp.MustCompile(`^([^\s:?!+=]+)\s*(::=|[:?!+]?=)\s*(.*)$`)
 	makeDirective = regexp.MustCompile(`^\.\s*([a-z-]+)\s*(.*)$`)
 	makeReadonly  = regexp.MustCompile(`^\.(NO)?READONLY\s*:(.*)$`)
 	// makeExportCompat is bmake's "export name=value" without the dot.
@@ -976,13 +995,22 @@ var (
 
 // CheckMakeConf reports whether ports on this FreeBSD host fetch distfiles
 // through bodega, comparing make.conf with what clientconf.MakeConf renders.
-func CheckMakeConf() Finding { return checkMakeConfLookup("", runtime.GOOS, os.LookupEnv) }
+func CheckMakeConf() Finding {
+	return checkMakeConfEnviron("", runtime.GOOS, os.LookupEnv, os.Environ())
+}
 
 func checkMakeConf(root, goos string, getenv func(string) string) Finding {
 	return checkMakeConfLookup(root, goos, nonEmpty(getenv))
 }
 
 func checkMakeConfLookup(root, goos string, lookup func(string) (string, bool)) Finding {
+	return checkMakeConfEnviron(root, goos, lookup, nil)
+}
+
+// checkMakeConfEnviron is the check with the whole environment as well,
+// which the served client check hands to make as text: its "env" output is
+// expanded again, so every value in it is make syntax make may evaluate.
+func checkMakeConfEnviron(root, goos string, lookup func(string) (string, bool), environ []string) Finding {
 	f := Finding{Check: "make-conf"}
 	if goos != "freebsd" {
 		f.Status = StatusNA
@@ -1042,7 +1070,8 @@ func checkMakeConfLookup(root, goos string, lookup func(string) (string, bool)) 
 		return f
 	}
 
-	w := &makeWalk{root: root, sites: map[string]*siteValue{}, env: map[string]string{}}
+	w := &makeWalk{root: root, sites: map[string]*siteValue{}, env: map[string]string{},
+		vars: map[string]*makeVar{}, lookup: lookup, environ: environ, read: []string{path}}
 	for _, n := range append([]string{distfilesEnvVar, distSubdirVar}, names...) {
 		if v, ok := lookup(n); ok {
 			w.env[n] = v
@@ -1058,6 +1087,7 @@ func checkMakeConfLookup(root, goos string, lookup func(string) (string, bool)) 
 		f.Remediation = "run doctor as a user that can read " + path + " and every file it includes"
 		return f
 	}
+	w.settleExpansions()
 	w.settleEnv()
 
 	failed := append([]string(nil), w.problems...)
@@ -1150,6 +1180,14 @@ type makeWalk struct {
 	// envChanged says, per tracked variable, why the environment make
 	// consults may no longer hold what env recorded at the start.
 	envChanged map[string]string
+	// vars is every value any variable may hold, tracked or not, for
+	// classifying what expanding it does. lookup and environ are the
+	// environment make starts with, and read every file doctor read, in the
+	// spelling make lists it in .MAKE.MAKEFILES.
+	vars    map[string]*makeVar
+	lookup  func(string) (string, bool)
+	environ []string
+	read    []string
 }
 
 // fromEnv is a tracked variable with no makefile value: the environment's,
@@ -1183,35 +1221,45 @@ type condFrame struct {
 	loop        bool
 }
 
+// condActive is 1, 0 or -1 as for condFrame, across every frame given and
+// the include that led here.
+func condActive(frames []condFrame, unknown bool) int {
+	active := 1
+	if unknown {
+		active = -1
+	}
+	for _, fr := range frames {
+		if fr.state == 0 {
+			return 0
+		}
+		if fr.state == -1 {
+			active = -1
+		}
+	}
+	return active
+}
+
 func (w *makeWalk) file(path string, stmts []makeStmt, unknown bool, stack []string) error {
 	stack = append(stack, path)
 	var frames []condFrame
 	for i, stmt := range stmts {
 		st := stmt.text
-		// active is 1, 0 or -1 as for condFrame, across every open frame and
-		// the include that led here.
-		active := 1
-		if unknown {
-			active = -1
-		}
-		for _, fr := range frames {
-			if fr.state == 0 {
-				active = 0
-				break
-			}
-			if fr.state == -1 {
-				active = -1
-			}
-		}
+		active := condActive(frames, unknown)
 
 		if stmt.recipe {
 			w.recipe(st, path, active)
+			if active != 0 {
+				w.evaluate(st, "a command in "+path)
+			}
 			continue
 		}
 		if m := makeDirective.FindStringSubmatch(st); m != nil {
 			dir, arg := m[1], strings.TrimSpace(m[2])
 			switch dir {
 			case "if", "ifdef", "ifndef", "ifmake", "ifnmake":
+				if active != 0 {
+					w.evaluate(makeCondText(arg), "."+dir+" in "+path)
+				}
 				fr := condFrame{state: -1}
 				if dir == "if" && makeIntCond.MatchString(arg) {
 					fr.state = 0
@@ -1228,6 +1276,9 @@ func (w *makeWalk) file(path string, stmts []makeStmt, unknown bool, stack []str
 					continue
 				}
 				fr := &frames[len(frames)-1]
+				if fr.seen != 1 && dir != "else" && condActive(frames[:len(frames)-1], unknown) != 0 {
+					w.evaluate(makeCondText(arg), "."+dir+" in "+path)
+				}
 				switch {
 				case fr.seen == 1:
 					fr.state = 0
@@ -1255,12 +1306,21 @@ func (w *makeWalk) file(path string, stmts []makeStmt, unknown bool, stack []str
 				frames = frames[:len(frames)-1]
 				continue
 			case "for":
+				if active != 0 {
+					// .for substitutes each word of its list into the body,
+					// which make then parses: a "$" in a word is syntax.
+					_, list, _ := strings.Cut(arg, " in ")
+					if e := w.evaluate(list, ".for in "+path); e.dollar != "" {
+						w.unsettled(".for in " + path + " substitutes words that may hold " + e.dollar + " into its body")
+					}
+				}
 				frames = append(frames, condFrame{state: -1, seen: -1, loop: true})
 				continue
 			}
 			if active == 0 {
 				continue
 			}
+			w.evaluate(arg, "."+dir+" in "+path)
 			switch dir {
 			case "include", "sinclude", "-include", "dinclude":
 				// checkInclude reports the final include of make.conf itself.
@@ -1289,21 +1349,27 @@ func (w *makeWalk) file(path string, stmts []makeStmt, unknown bool, stack []str
 		}
 
 		if m := makeExportCompat.FindStringSubmatch(st); m != nil {
+			w.evaluate(st, "export in "+path)
 			w.exportCompat(st, m[1], path)
 			continue
 		}
 		if ro := makeReadonly.FindStringSubmatch(st); ro != nil {
+			w.evaluate(st, path)
 			w.setGroup(1, active)
 			w.readonly(st, path, ro[1] == "", strings.Fields(ro[2]), active == -1)
 			continue
 		}
 		m := makeAssign.FindStringSubmatch(st)
 		if m == nil {
+			w.evaluate(st, "a dependency line in "+path)
 			w.dependency(st, path, active)
 			continue
 		}
 		w.setGroup(0, active)
 		name, op, val := m[1], m[2], m[3]
+		if !strings.Contains(name, "$") {
+			w.record(name, op, val, path)
+		}
 		switch {
 		case strings.Contains(name, "$"):
 			// The name may expand to one of make's own controls, the export
@@ -1746,6 +1812,10 @@ func (w *makeWalk) include(from, dir, arg string, unknown, report bool, stack []
 	}
 	data, err := os.ReadFile(filepath.Join(w.root, inc))
 	if errors.Is(err, fs.ErrNotExist) {
+		if further := w.includeSearch(arg); further != "" {
+			w.pinAll(from + " includes " + arg + ", which is not at " + inc + ", and make " + further)
+			return nil
+		}
 		if dir == "include" && report && !unknown {
 			w.problems = append(w.problems, from+" includes "+inc+", which does not exist")
 		}
@@ -1754,7 +1824,30 @@ func (w *makeWalk) include(from, dir, arg string, unknown, report bool, stack []
 	if err != nil {
 		return fmt.Errorf("read %s, which %s includes: %w", inc, from, err)
 	}
+	w.read = append(w.read, inc)
 	return w.file(inc, makeStatements(string(data)), unknown, stack)
+}
+
+// includeSearch returns where else make looks for an include whose first
+// candidate is missing, or "" when there is nowhere: a missing first
+// candidate proves the include absent only then. make looks for a relative
+// "file" beside the including makefile, then in each -I directory and the
+// system makefile directory, and a run from another directory finds it
+// there as well, measured with bmake on 15.1; doctor knows neither the -I
+// list nor where make runs. A <file> is looked for in the system directory
+// alone, which MAKESYSPATH replaces.
+func (w *makeWalk) includeSearch(arg string) string {
+	inc := arg[1 : len(arg)-1]
+	switch {
+	case filepath.IsAbs(inc):
+		return ""
+	case arg[0] == '"':
+		return "goes on to search the -I directories, the system makefile directory and the directory it runs in, so doctor cannot establish which file it reads"
+	}
+	if v, ok := w.lookup("MAKESYSPATH"); ok {
+		return "searches MAKESYSPATH=" + v + " for it, which doctor does not follow"
+	}
+	return ""
 }
 
 // makeIncludePath resolves an include argument, or returns why doctor does
@@ -1916,3 +2009,442 @@ func stripMakeComment(s string) string {
 	}
 	return s
 }
+
+// makeEffect is what expanding a piece of make text may do besides produce
+// a string. effect names why it may assign, append to or delete a variable,
+// which can reach a tracked value or one of make's controls whatever the
+// line it sits on assigns. dollar names why its result may hold a "$":
+// harmless where the result is compared or printed, and syntax again
+// wherever make expands it a second time, which a := or != value, a .for
+// list and a :@ loop variable each are.
+type makeEffect struct{ effect, dollar string }
+
+func (e *makeEffect) add(o makeEffect) {
+	if e.effect == "" {
+		e.effect = o.effect
+	}
+	if e.dollar == "" {
+		e.dollar = o.dollar
+	}
+}
+
+// makeVar is every value one variable may hold, from every assignment make
+// may have read. raw values are expanded on each lookup: what =, ?= and +=
+// store, and the modeled output of a command the served check runs. stored
+// is what := and any other != leave: text expanded once already, whose "$"
+// make evaluates on the next lookup (.MAKE.SAVE_DOLLARS is false by
+// default, so := turns "$$" into one). patterns marks a variable only ever
+// set to the served check's list of :N patterns built from .MAKE.MAKEFILES.
+type makeVar struct {
+	raw      []string
+	stored   []makeEffect
+	patterns bool
+	set      bool
+}
+
+var (
+	// makeLoopMod is ":@var@body@". The body is text make expands once per
+	// word, not modifiers, so the modifier scans below skip it.
+	makeLoopMod     = regexp.MustCompile(`:@([^@]*)@[^@]*@`)
+	makeIndirectMod = regexp.MustCompile(`^:\$\{([A-Za-z0-9_.]+)\}(:|$)`)
+	makeShellMod    = regexp.MustCompile(`:(sh(:|$)|!)`)
+	makeEmptyCall   = regexp.MustCompile(`empty\s*\(`)
+	// makeCleanPath is a makefile path that, joined into a modifier list,
+	// holds no separator, expression or escape.
+	makeCleanPath = regexp.MustCompile(`^/[A-Za-z0-9._/+@%,=-]+$`)
+)
+
+// record keeps what one assignment may leave in a variable, and evaluates
+// the text := and != expand as they are read.
+func (w *makeWalk) record(name, op, val, path string) {
+	v := w.vars[name]
+	if v == nil {
+		v = &makeVar{}
+		w.vars[name] = v
+	}
+	first := !v.set
+	v.set = true
+	where := "the assignment to " + name + " in " + path
+	patterns := false
+	switch op {
+	case ":=", "::=":
+		e := w.evaluate(val, where)
+		v.stored = append(v.stored, makeEffect{dollar: e.dollar})
+		patterns = servedModel().read != "" && val == servedModel().read
+	case "!=":
+		w.evaluate(val, where)
+		if out, ok := w.commandOutput(val); ok {
+			v.raw = append(v.raw, out...)
+		} else {
+			v.stored = append(v.stored, makeEffect{dollar: "the output of a shell command doctor does not run, assigned in " + path})
+		}
+	default:
+		v.raw = append(v.raw, val)
+	}
+	v.patterns = patterns && (first || v.patterns)
+}
+
+// evaluate classifies text make expands where it is read, and leaves every
+// tracked value and its precedence unsettled when the expansion may assign.
+func (w *makeWalk) evaluate(text, where string) makeEffect {
+	e := w.classify(text, &makeExpansion{seen: map[string]bool{}})
+	if e.effect != "" {
+		w.unsettled(where + " expands an expression that may assign a variable: " + e.effect)
+	}
+	return e
+}
+
+// unsettled records an operation doctor does not replay that may have
+// changed any tracked value, its precedence, or the environment.
+func (w *makeWalk) unsettled(why string) {
+	w.pinAll(why)
+	w.envMayChange(why)
+}
+
+// settleExpansions classifies what a lookup of every variable make.conf
+// leaves a value for would do, and every value in the environment. The ports
+// framework expands the ones it reads in an order doctor does not model,
+// some of them before it builds the site list.
+func (w *makeWalk) settleExpansions() {
+	names := make([]string, 0, len(w.vars))
+	for n := range w.vars {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		if e := w.expandVar(n, &makeExpansion{seen: map[string]bool{}}); e.effect != "" {
+			w.unsettled("expanding " + n + " may assign a variable: " + e.effect)
+			return
+		}
+	}
+	for _, kv := range w.environ {
+		n, val, _ := strings.Cut(kv, "=")
+		if e := w.classify(val, &makeExpansion{seen: map[string]bool{}}); e.effect != "" {
+			w.unsettled("the environment's " + n + " may assign a variable wherever make expands it: " + e.effect)
+			return
+		}
+	}
+}
+
+// makeExpansion carries one classification: the variables being expanded,
+// which make refuses to re-enter, and what each finished one does.
+type makeExpansion struct {
+	seen map[string]bool
+	done map[string]makeEffect
+}
+
+// classify reads text the way make expands it and never runs any of it.
+// doctor models a subset: plain references, literal names, and modifiers
+// that only filter or rewrite the value. An assignment modifier (::=, ::?=,
+// ::+=, ::!=, :_), a :@ loop over a tracked or control variable or over
+// words that may hold "$", a modifier list computed from a value doctor
+// cannot establish, and a lookup by a computed name are effects; the served
+// check's own :N list and its commands are modeled by what they read.
+func (w *makeWalk) classify(s string, x *makeExpansion) makeEffect {
+	var e makeEffect
+	for i := 0; i < len(s); {
+		if s[i] != '$' {
+			i++
+			continue
+		}
+		sub, next := w.dollarExpr(s, i, x)
+		e.add(sub)
+		i = next
+	}
+	return e
+}
+
+// dollarExpr classifies the expression starting at s[i], a "$", and returns
+// the index after it.
+func (w *makeWalk) dollarExpr(s string, i int, x *makeExpansion) (makeEffect, int) {
+	if i+1 >= len(s) {
+		return makeEffect{}, len(s)
+	}
+	switch c := s[i+1]; c {
+	case '$':
+		return makeEffect{dollar: `"$$", which expands to "$"`}, i + 2
+	case '{', '(':
+		return w.braced(s, i, x)
+	default:
+		return w.expandVar(string(c), x), i + 2
+	}
+}
+
+func (w *makeWalk) braced(s string, i int, x *makeExpansion) (makeEffect, int) {
+	open, closer := s[i+1], byte('}')
+	if open == '(' {
+		closer = ')'
+	}
+	var e makeEffect
+	computed := false
+	j := i + 2
+	for j < len(s) && s[j] != closer && s[j] != ':' {
+		if s[j] == '$' {
+			sub, next := w.dollarExpr(s, j, x)
+			e.add(sub)
+			computed, j = true, next
+			continue
+		}
+		j++
+	}
+	name, modStart, depth := s[i+2:j], j, 0
+	for j < len(s) {
+		if s[j] == '$' {
+			sub, next := w.dollarExpr(s, j, x)
+			e.add(sub)
+			j = next
+			continue
+		}
+		if s[j] == open {
+			depth++
+		} else if s[j] == closer {
+			if depth == 0 {
+				break
+			}
+			depth--
+		}
+		j++
+	}
+	if j >= len(s) {
+		e.add(makeEffect{effect: "the expression " + s[i:] + " is not closed"})
+		return e, len(s)
+	}
+	mods, text := s[modStart:j], s[i:j+1]
+
+	// ${cond:?a:b} evaluates its name as a condition and looks nothing up.
+	cond := strings.HasPrefix(mods, ":?")
+	var val makeEffect
+	switch {
+	case cond:
+		e.add(makeEffect{effect: w.classify(makeCondText(name), x).effect})
+	case computed:
+		e.add(makeEffect{effect: text + " looks up a variable by a name doctor does not expand"})
+	case name != "":
+		val = w.expandVar(name, x)
+		e.add(makeEffect{effect: val.effect})
+	}
+	res := val.dollar
+
+	chain := makeLoopMod.ReplaceAllString(mods, ":@")
+	if strings.Contains(chain, "::") || strings.Contains(chain, ":_") {
+		e.add(makeEffect{effect: text + " holds an assignment modifier"})
+	}
+	loops := makeLoopMod.FindAllStringSubmatch(mods, -1)
+	if strings.Count(mods, ":@") > len(loops) {
+		e.add(makeEffect{effect: text + " holds a :@ loop doctor does not parse"})
+	}
+	for _, m := range loops {
+		switch v := m[1]; {
+		case v == "" || strings.Contains(v, "$") || strings.HasPrefix(v, ".") || w.sites[v] != nil:
+			e.add(makeEffect{effect: text + " binds and then deletes the loop variable " + v + ", which doctor tracks or make reads as a control"})
+		case res != "":
+			e.add(makeEffect{effect: text + " binds " + v + " to words that may hold " + res + ", which make expands again"})
+		}
+	}
+	for k := 0; ; k++ {
+		at := strings.Index(chain[k:], ":$")
+		if at < 0 {
+			break
+		}
+		k += at
+		if m := makeIndirectMod.FindStringSubmatch(chain[k:]); m == nil || !w.patternsSafe(m[1]) {
+			e.add(makeEffect{effect: text + " applies modifiers computed from a value doctor cannot establish"})
+			break
+		}
+	}
+	switch {
+	case mods == ":sh" && w.stableView(name):
+		// The served check's view of its mounts prints fixed words, mount
+		// names from the table root keeps, and the ports tree path it read.
+		res = w.expandVar("_BODEGA_DISTFILES_TREE", x).dollar
+	case makeShellMod.MatchString(chain):
+		res = "the output of the shell command in " + text
+	case cond:
+		res = ""
+	}
+	e.add(makeEffect{dollar: res})
+	return e, j + 1
+}
+
+// expandVar classifies one lookup: every value the variable may hold in a
+// makefile, and the environment's.
+func (w *makeWalk) expandVar(name string, x *makeExpansion) makeEffect {
+	if e, ok := x.done[name]; ok {
+		return e
+	}
+	if x.seen[name] {
+		return makeEffect{effect: name + " expands itself, which make refuses"}
+	}
+	x.seen[name] = true
+	defer delete(x.seen, name)
+	var e makeEffect
+	if v := w.vars[name]; v != nil {
+		for _, r := range v.raw {
+			e.add(w.classify(r, x))
+		}
+		for _, st := range v.stored {
+			if st.dollar != "" {
+				e.add(makeEffect{effect: name + " holds " + st.dollar + ", which make evaluates when it looks " + name + " up", dollar: st.dollar})
+			}
+		}
+	}
+	if w.lookup != nil {
+		if ev, ok := w.lookup(name); ok {
+			e.add(w.classify(ev, x))
+		}
+	}
+	if x.done == nil {
+		x.done = map[string]makeEffect{}
+	}
+	x.done[name] = e
+	return e
+}
+
+// patternsSafe reports whether a variable used as a modifier list holds the
+// served check's :N patterns and nothing else, over makefile paths that
+// cannot split into further modifiers. make lists every file it read: the
+// ones doctor read, and those under /usr/share/mk that sys.mk reads.
+func (w *makeWalk) patternsSafe(name string) bool {
+	v := w.vars[name]
+	if v == nil || !v.patterns {
+		return false
+	}
+	for _, p := range w.read {
+		if !makeCleanPath.MatchString(p) {
+			return false
+		}
+	}
+	return true
+}
+
+// stableView reports whether a variable holds the served check's view of
+// its mounts and nothing else.
+func (w *makeWalk) stableView(name string) bool {
+	v, stable := w.vars[name], servedModel().stable
+	if v == nil || stable == "" || len(v.stored) > 0 || len(v.raw) == 0 {
+		return false
+	}
+	for _, r := range v.raw {
+		if r != stable {
+			return false
+		}
+	}
+	return true
+}
+
+// commandOutput models what a command the served check assigns with !=
+// prints, as text make expands on lookup, or reports that doctor does not.
+func (w *makeWalk) commandOutput(cmd string) ([]string, bool) {
+	m := servedModel()
+	switch cmd {
+	case "":
+		return nil, false
+	case m.env:
+		return w.environ, true
+	case m.conf:
+		// grep -l prints the names of makefiles make read.
+		return w.read, true
+	}
+	if _, ok := m.measure.path(cmd); ok {
+		return nil, true // a digest or one of three fixed words
+	}
+	if p, ok := m.writers.path(cmd); ok {
+		return []string{p}, true // components of the declared path
+	}
+	return nil, false
+}
+
+// makeCondText rewrites each empty(...) in a condition as the expression it
+// expands, so classify reads it.
+func makeCondText(s string) string {
+	var b strings.Builder
+	for {
+		loc := makeEmptyCall.FindStringIndex(s)
+		if loc == nil {
+			b.WriteString(s)
+			return b.String()
+		}
+		b.WriteString(s[:loc[0]])
+		depth, j := 0, loc[1]
+		for ; j < len(s); j++ {
+			if s[j] == '(' {
+				depth++
+			} else if s[j] == ')' {
+				if depth == 0 {
+					break
+				}
+				depth--
+			}
+		}
+		b.WriteString("${" + s[loc[1]:j] + "}")
+		if j >= len(s) {
+			return b.String()
+		}
+		s = s[j+1:]
+	}
+}
+
+// servedCommands is the served client check's commands, read from a check
+// distinfo renders for a sentinel environment so doctor and the generator
+// cannot disagree about their text.
+type servedCommands struct {
+	env, conf, stable, read string
+	measure, writers        pathTemplate
+}
+
+// pathTemplate matches a per-file command with the declared path in each
+// place the sentinel sat.
+type pathTemplate struct{ re *regexp.Regexp }
+
+func newPathTemplate(cmd, sentinel string) pathTemplate {
+	quoted := strings.ReplaceAll(regexp.QuoteMeta(cmd), regexp.QuoteMeta(sentinel), `(/[A-Za-z0-9._/+@%,=-]+)`)
+	return pathTemplate{regexp.MustCompile("^" + quoted + "$")}
+}
+
+// path returns the declared path cmd was rendered for, when it matches and
+// names one path throughout.
+func (t pathTemplate) path(cmd string) (string, bool) {
+	if t.re == nil {
+		return "", false
+	}
+	m := t.re.FindStringSubmatch(cmd)
+	if len(m) < 2 {
+		return "", false
+	}
+	for _, p := range m[2:] {
+		if p != m[1] {
+			return "", false
+		}
+	}
+	return m[1], true
+}
+
+var servedModel = sync.OnceValue(func() servedCommands {
+	var m servedCommands
+	const sentinel = "/bodega-doctor/sentinel"
+	env, err := distinfo.EnvironmentSpec{Files: map[string][]string{sentinel: {os.DevNull}}}.Load()
+	if err != nil {
+		return m
+	}
+	for _, st := range makeStatements(string(env.ClientCheck())) {
+		a := makeAssign.FindStringSubmatch(st.text)
+		if a == nil {
+			continue
+		}
+		switch a[1] + a[2] {
+		case "_BODEGA_DISTFILES_ENVIRON!=":
+			m.env = a[3]
+		case "_BODEGA_DISTFILES_CONF!=":
+			m.conf = a[3]
+		case "_BODEGA_DISTFILES_STABLE=":
+			m.stable = a[3]
+		case "_BODEGA_DISTFILES_READ:=":
+			m.read = a[3]
+		case "_BODEGA_DISTFILES_F0!=":
+			m.measure = newPathTemplate(a[3], sentinel)
+		case "_BODEGA_DISTFILES_W0!=":
+			m.writers = newPathTemplate(a[3], sentinel)
+		}
+	}
+	return m
+})
