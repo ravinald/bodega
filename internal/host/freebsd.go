@@ -1141,7 +1141,7 @@ func checkMakeConfEnviron(root, goos string, lookup func(string) (string, bool),
 	}
 
 	w := &makeWalk{root: root, sites: map[string]*siteValue{}, env: map[string]string{},
-		vars: map[string]*makeVar{}, lookup: lookup, environ: environ, read: []string{path}}
+		vars: map[string]*makeVar{}, lookup: lookup, environ: environ, read: []string{path}, cmdline: map[string]*makeVar{}}
 	for _, n := range append([]string{distfilesEnvVar, distSubdirVar}, names...) {
 		if v, ok := lookup(n); ok {
 			w.env[n] = v
@@ -1149,6 +1149,24 @@ func checkMakeConfEnviron(root, goos string, lookup func(string) (string, bool),
 		v := w.fromEnv(n)
 		w.sites[n] = &v
 	}
+	defined := func(n string) bool {
+		_, ok := lookup(n)
+		return ok || slices.Contains(flags.assigns, n) || slices.ContainsFunc(flags.defines, func(d string) bool { dn, _, _ := strings.Cut(d, "="); return dn == n })
+	}
+	sys, why, err := loadMakeSystem(root, w.sites, defined)
+	switch {
+	case err != nil:
+		f.Status = StatusSkip
+		f.Detail = err.Error()
+		f.Remediation = "run doctor as a user that can read " + makeStockSysPath
+		return f
+	case why != "":
+		f.Status = StatusWarn
+		f.Detail = why + ", so doctor cannot establish what the system makefiles leave in " + strings.Join(names, " and ")
+		f.Remediation = "restore the stock files under " + makeStockSysPath + " from the FreeBSD base system; then run doctor again"
+		return f
+	}
+	w.sys = sys
 	w.applyFlags(flags, "the environment's MAKEFLAGS", false)
 	stmts := makeStatements(string(data))
 	if err := w.file(path, stmts, false, nil); err != nil {
@@ -1258,6 +1276,10 @@ type makeWalk struct {
 	lookup  func(string) (string, bool)
 	environ []string
 	read    []string
+	// cmdline is every value a command-line assignment or -D may give a
+	// variable, and sys what the stock system makefiles may.
+	cmdline map[string]*makeVar
+	sys     *makeSystem
 }
 
 // fromEnv is a tracked variable with no makefile value: the environment's,
@@ -1718,11 +1740,16 @@ func (w *makeWalk) pinAll(why string) {
 // the subset doctor models. unmodeled names the first word or flag outside
 // it.
 type makeFlags struct {
-	envFirst  bool
-	defines   []string
-	assigns   []string
+	envFirst bool
+	defines  []string
+	assigns  []string
+	// values holds each assignment in assigns, at the same index, as the
+	// operator and the text after it.
+	values    []makeFlagValue
 	unmodeled string
 }
+
+type makeFlagValue struct{ op, val string }
 
 // makeInertFlags take no argument and change no variable's value or
 // precedence; makeInertArgFlags do the same and take one. Every other flag
@@ -1748,7 +1775,9 @@ func parseMakeFlags(s string, bare bool) makeFlags {
 			return fl
 		}
 		if eq := strings.IndexByte(word, '='); eq > 0 && (dashDash || word[0] != '-') {
-			fl.assigns = append(fl.assigns, strings.TrimRight(word[:eq], "+:?!"))
+			name := strings.TrimRight(word[:eq], "+:?!")
+			fl.assigns = append(fl.assigns, name)
+			fl.values = append(fl.values, makeFlagValue{op: word[len(name):eq], val: word[eq+1:]})
 			continue
 		}
 		var cluster string
@@ -1812,15 +1841,18 @@ func (w *makeWalk) applyFlags(fl makeFlags, from string, unknown bool) {
 			w.envMayChange(why)
 		}
 	}
-	for _, n := range fl.assigns {
+	for i, n := range fl.assigns {
 		if v := w.sites[n]; v != nil {
 			v.pin(from + " names it")
 		}
+		w.flagValue(n, fl.values[i].op, fl.values[i].val, from)
 	}
-	for _, n := range fl.defines {
+	for _, d := range fl.defines {
+		n, _, _ := strings.Cut(d, "=")
 		if v := w.sites[n]; v != nil {
 			w.assign(v, "=", "1", "-D in "+from, unknown)
 		}
+		w.flagValue(n, "", "1", "-D in "+from)
 	}
 	switch {
 	case !fl.envFirst || w.envFirst == 1:
@@ -1830,6 +1862,27 @@ func (w *makeWalk) applyFlags(fl makeFlags, from string, unknown bool) {
 		}
 	default:
 		w.envFirst, w.envFirstWhy = 1, from+" passes -e"
+	}
+}
+
+// flagValue keeps what a command-line assignment or -D may leave in a
+// variable, for classifying lookups of it. parseMakeFlags refuses a word
+// holding "$", so the text is literal, but it can still be a modifier list
+// or a name that another expression looks up; != runs it as a command.
+func (w *makeWalk) flagValue(name, op, val, from string) {
+	v := w.cmdline[name]
+	if v == nil {
+		v = &makeVar{}
+		w.cmdline[name] = v
+	}
+	switch op {
+	case "!":
+		v.stored = append(v.stored, makeEffect{dollar: "the output of a shell command " + from + " runs"})
+	case "+":
+		v.raw = append(v.raw, val)
+		v.appended = true
+	default:
+		v.raw = append(v.raw, val)
 	}
 }
 
@@ -2080,6 +2133,314 @@ func makeSysModeWhy(lookup func(string) (string, bool), fl makeFlags) string {
 	return ""
 }
 
+// makeSystem is what the stock system makefiles may leave for effect
+// analysis: every value they may assign, by name or by a name they compute,
+// and the text make expands while it reads them. make reads them around
+// make.conf, some before and some after, with the environment and the
+// command line as they stand, so doctor classifies all of it once the walk
+// ends, over every value any source may give.
+type makeSystem struct {
+	vars  map[string]*makeVar
+	globs []makeSysGlob
+	eval  []makeSysText
+	read  []string
+	// skipped names each list a .for iterated over no word of, which holds
+	// only while nothing doctor reads later assigns one.
+	skipped []string
+}
+
+// makeSysGlob is an assignment to a computed name, such as bsd.mkopt.mk's
+// MK_${var}: every name re matches may hold what v does.
+type makeSysGlob struct {
+	re *regexp.Regexp
+	v  *makeVar
+}
+
+// makeSysText is text make expands as it reads a system makefile. stores
+// marks text whose result make keeps and expands again: a := value or a
+// .for list.
+type makeSysText struct {
+	text, where string
+	stores      bool
+}
+
+// makeSysControls are the variables with a leading dot the stock system
+// makefiles assign. None of them changes a variable's value or precedence:
+// .FreeBSD is an ordinary variable, and the rest steer meta mode, which
+// makefile a directory reads, how expansions print and job tokens.
+var makeSysControls = map[string]bool{
+	".FreeBSD": true, ".MAKE.MODE": true, ".MAKE.META.IGNORE_PATHS": true,
+	".MAKE.EXPAND_VARIABLES": true, ".MAKE.MAKEFILE_PREFERENCE": true, ".MAKE.ALWAYS_PASS_JOB_QUEUE": true,
+}
+
+// makeSysTargets are the special targets the stock system makefiles name.
+// .SUFFIXES lists suffixes and .SHELL picks the recipe shell; neither
+// touches a variable.
+var makeSysTargets = map[string]bool{".SUFFIXES": true, ".SHELL": true}
+
+// makeDirectives are the words bmake reads as a directive after a leading
+// dot. Anything else there, a suffix rule such as .c.o: among them, is a
+// dependency line or an assignment.
+var makeDirectives = map[string]bool{}
+
+func init() {
+	for _, d := range strings.Fields("include sinclude -include dinclude if ifdef ifndef ifmake ifnmake " +
+		"elif elifdef elifndef elifmake elifnmake else endif for endfor break undef " +
+		"export export-env export-literal export-all unexport unexport-env info warning error") {
+		makeDirectives[d] = true
+	}
+}
+
+var (
+	makeSpecialTarget = regexp.MustCompile(`^\.[A-Z][A-Z_]+$`)
+	makeNameExpr      = regexp.MustCompile(`\$(\{[^{}]*\}|\([^()]*\)|.)`)
+)
+
+// loadMakeSystem reads the system makefiles make reads on FreeBSD with the
+// stock search and no optional mode, starting at sys.mk. It follows every
+// branch, since doctor does not evaluate their conditions, and includes
+// bsd.cpu.mk, which sys.mk reads in a ports tree. It skips what the earlier
+// checks settled: the mode files, which they proved off, the hooks, which
+// they proved absent, and make.conf, which the walk reads. A .for over
+// lists nothing defines iterates nothing, and its body is skipped: defined
+// reports whether the environment or the command line defines a name, and
+// the stage's own assignments count wherever they sit. It returns why
+// doctor cannot establish the stage, or an error reading a file there.
+// tracked is the variables the check follows; the stage may assign none of
+// them, and __MAKE_CONF only as the default sys.mk gives it.
+func loadMakeSystem(root string, tracked map[string]*siteValue, defined func(string) bool) (*makeSystem, string, error) {
+	skip := map[string]bool{}
+	for _, m := range makeSysModeIncludes {
+		skip[m.file] = true
+	}
+	for _, h := range makeSysHooks {
+		skip[h] = true
+	}
+	type sysFile struct {
+		path  string
+		stmts []makeStmt
+	}
+	var files []sysFile
+	assigned := map[string]bool{}
+	queue, seen := []string{"sys.mk"}, map[string]bool{"sys.mk": true}
+	for len(queue) > 0 {
+		p := filepath.Join(makeStockSysPath, queue[0])
+		queue = queue[1:]
+		data, err := os.ReadFile(filepath.Join(root, p))
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, p + " does not exist, and make reads it before make.conf", nil
+		}
+		if err != nil {
+			return nil, "", fmt.Errorf("read %s, which make reads before make.conf: %w", p, err)
+		}
+		f := sysFile{p, makeStatements(string(data))}
+		files = append(files, f)
+		for _, st := range f.stmts {
+			if a := makeAssign.FindStringSubmatch(st.text); a != nil && !st.recipe {
+				assigned[a[1]] = true
+			}
+			inc, soft, why := makeSysInclude(st)
+			if why != "" {
+				return nil, p + " " + why, nil
+			}
+			if inc == "" || skip[inc] || seen[inc] {
+				continue
+			}
+			if _, err := os.Stat(filepath.Join(root, makeStockSysPath, inc)); soft && errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			seen[inc] = true
+			queue = append(queue, inc)
+		}
+	}
+	s := &makeSystem{vars: map[string]*makeVar{}}
+	empty := func(list string) bool {
+		var names []string
+		for _, word := range strings.Fields(list) {
+			m := makeListRef.FindStringSubmatch(word)
+			if m == nil || assigned[m[1]] || defined(m[1]) {
+				return false
+			}
+			for n := range assigned {
+				if strings.Contains(n, "$") && makeNameGlob(n).MatchString(m[1]) {
+					return false
+				}
+			}
+			names = append(names, m[1])
+		}
+		s.skipped = append(s.skipped, names...)
+		return true
+	}
+	for _, f := range files {
+		s.read = append(s.read, f.path)
+		depth := 0
+		for _, st := range f.stmts {
+			if d := makeDirective.FindStringSubmatch(st.text); d != nil && !st.recipe {
+				switch {
+				case depth > 0 && d[1] == "for":
+					depth++
+					continue
+				case depth > 0 && d[1] == "endfor":
+					depth--
+					continue
+				case depth == 0 && d[1] == "for":
+					if _, list, _ := strings.Cut(d[2], " in "); empty(list) {
+						depth = 1
+						continue
+					}
+				}
+			}
+			if depth > 0 {
+				continue
+			}
+			if why := s.statement(st, f.path, tracked); why != "" {
+				return nil, why, nil
+			}
+		}
+	}
+	return s, "", nil
+}
+
+// makeNameGlob matches every name a computed name may expand to: its
+// literal parts in order, with anything between them.
+func makeNameGlob(name string) *regexp.Regexp {
+	lit := makeNameExpr.Split(name, -1)
+	for i := range lit {
+		lit[i] = regexp.QuoteMeta(lit[i])
+	}
+	return regexp.MustCompile("^" + strings.Join(lit, ".*") + "$")
+}
+
+// makeListRef is a .for list word that is one plain reference.
+var makeListRef = regexp.MustCompile(`^\$\{([A-Za-z0-9_.]+)(:[^${}]*)?\}$`)
+
+// makeSysInclude returns the file a system makefile statement includes and
+// whether make tolerates it missing, or why doctor does not follow it.
+// make.conf itself is the walk's, so its include returns nothing.
+func makeSysInclude(st makeStmt) (inc string, soft bool, why string) {
+	m := makeDirective.FindStringSubmatch(st.text)
+	if st.recipe || m == nil {
+		return "", false, ""
+	}
+	dir, arg := m[1], strings.TrimSpace(m[2])
+	switch dir {
+	case "include", "sinclude", "-include":
+	case "dinclude":
+		return "", false, "holds " + st.text + ", which doctor does not model"
+	default:
+		return "", false, ""
+	}
+	if arg == `"${__MAKE_CONF}"` {
+		return "", false, ""
+	}
+	if len(arg) < 2 || strings.ContainsAny(arg, "$/") || !(arg[0] == '<' && arg[len(arg)-1] == '>' || arg[0] == '"' && arg[len(arg)-1] == '"') {
+		return "", false, "holds " + st.text + ", which doctor does not model"
+	}
+	return arg[1 : len(arg)-1], dir != "include", ""
+}
+
+// statement records one statement of a system makefile, and returns why
+// doctor does not model it.
+func (s *makeSystem) statement(st makeStmt, path string, tracked map[string]*siteValue) string {
+	t := st.text
+	eval := func(text string, stores bool) { s.eval = append(s.eval, makeSysText{text, path, stores}) }
+	if st.recipe {
+		eval(t, false)
+		return ""
+	}
+	unmodeled := path + " holds " + t + ", which doctor does not model"
+	if m := makeDirective.FindStringSubmatch(t); m != nil && makeDirectives[m[1]] {
+		dir, arg := m[1], strings.TrimSpace(m[2])
+		switch dir {
+		case "if", "ifdef", "ifndef", "ifmake", "ifnmake", "elif", "elifdef", "elifndef", "elifmake", "elifnmake":
+			eval(makeCondText(arg), false)
+		case "else", "endif", "endfor":
+		case "for":
+			_, list, _ := strings.Cut(arg, " in ")
+			eval(list, true)
+		case "include", "sinclude", "-include":
+		case "undef", "export", "unexport":
+			for _, n := range strings.Fields(arg) {
+				if strings.Contains(n, "$") || tracked[n] != nil {
+					return unmodeled
+				}
+			}
+		case "info", "warning", "error":
+			eval(arg, false)
+		default:
+			return unmodeled
+		}
+		return ""
+	}
+	if makeExportCompat.MatchString(t) || makeReadonly.MatchString(t) {
+		return unmodeled
+	}
+	m := makeAssign.FindStringSubmatch(t)
+	if m == nil {
+		targets, _, _ := strings.Cut(t, ":")
+		for _, tg := range strings.Fields(targets) {
+			if makeSpecialTarget.MatchString(tg) && !makeSysTargets[tg] {
+				return unmodeled
+			}
+		}
+		eval(t, false)
+		return ""
+	}
+	name, op, val := m[1], m[2], m[3]
+	switch {
+	case op == "!=":
+		return unmodeled
+	case name == "__MAKE_CONF":
+		if op != "?=" || val != "/etc/make.conf" {
+			return unmodeled
+		}
+	case name == "%POSIX" || tracked[name] != nil:
+		return path + " assigns " + name + ", which the check follows"
+	case strings.HasPrefix(name, ".") && !makeSysControls[name]:
+		return unmodeled
+	case strings.Contains(name, "$"):
+		if lit := makeNameExpr.Split(name, -1)[0]; lit == "" || strings.HasPrefix(lit, ".") || strings.HasPrefix(lit, "%") {
+			return path + " assigns the computed name " + name + ", which may be one of make's controls"
+		}
+		re := makeNameGlob(name)
+		for n := range tracked {
+			if re.MatchString(n) {
+				return path + " assigns the computed name " + name + ", which may be " + n
+			}
+		}
+		g := makeSysGlob{re: re, v: &makeVar{}}
+		s.globs = append(s.globs, g)
+		sysValue(g.v, op, val)
+		eval(name, false)
+	default:
+		v := s.vars[name]
+		if v == nil {
+			v = &makeVar{}
+			s.vars[name] = v
+		}
+		sysValue(v, op, val)
+	}
+	if op == ":=" || op == "::=" {
+		eval(val, true)
+	}
+	return ""
+}
+
+// sysValue keeps what one system assignment leaves for a lookup. make
+// expands a := value as it reads it, which settleExpansions classifies with
+// the rest of the stage's text, so a lookup finds text that holds no
+// expression unless that check fails; which text is not known, so it counts
+// as a stored value. Every other value is expanded on each lookup.
+func sysValue(v *makeVar, op, val string) {
+	switch op {
+	case ":=", "::=":
+		v.stored = append(v.stored, makeEffect{})
+	default:
+		v.raw = append(v.raw, val)
+		v.appended = v.appended || op == "+="
+	}
+}
+
 // makeSysHooks are the files the stock sys.mk reads from its own directory
 // when they exist, one before make.conf and one after. FreeBSD ships
 // neither, and doctor does not read them, so either can change the fetch
@@ -2321,6 +2682,9 @@ type makeVar struct {
 	stored   []makeEffect
 	patterns bool
 	set      bool
+	// appended marks a += whose text make joins to another value, so no
+	// raw value alone is what a lookup returns.
+	appended bool
 }
 
 var (
@@ -2382,17 +2746,14 @@ func (w *makeWalk) unsettled(why string) {
 	w.envMayChange(why)
 }
 
-// settleExpansions classifies what a lookup of every variable make.conf
-// leaves a value for would do, and every value in the environment. The ports
+// settleExpansions classifies what a lookup of every variable any source
+// gives a value would do, and every value in the environment. The ports
 // framework expands the ones it reads in an order doctor does not model,
-// some of them before it builds the site list.
+// some of them before it builds the site list. Then it classifies the text
+// the system makefiles expand as make reads them, which runs with every
+// value in place: some of it before make.conf and some after.
 func (w *makeWalk) settleExpansions() {
-	names := make([]string, 0, len(w.vars))
-	for n := range w.vars {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	for _, n := range names {
+	for _, n := range w.names() {
 		if e := w.expandVar(n, &makeExpansion{seen: map[string]bool{}}); e.effect != "" {
 			w.unsettled("expanding " + n + " may assign a variable: " + e.effect)
 			return
@@ -2405,6 +2766,26 @@ func (w *makeWalk) settleExpansions() {
 			return
 		}
 	}
+	if w.sys == nil {
+		return
+	}
+	for _, n := range w.sys.skipped {
+		if w.vars[n] != nil {
+			w.unsettled("a system makefile loops over " + n + ", which make.conf or an include assigns, and doctor skipped that loop as empty")
+			return
+		}
+	}
+	for _, t := range w.sys.eval {
+		e := w.classify(t.text, &makeExpansion{seen: map[string]bool{}, relaxed: true})
+		switch {
+		case e.effect != "":
+			w.unsettled(t.where + " expands " + t.text + ", which may assign a variable: " + e.effect)
+			return
+		case t.stores && e.dollar != "":
+			w.unsettled(t.where + " keeps the expansion of " + t.text + ", which may hold " + e.dollar + ", and make expands it again")
+			return
+		}
+	}
 }
 
 // makeExpansion carries one classification: the variables being expanded,
@@ -2412,6 +2793,9 @@ func (w *makeWalk) settleExpansions() {
 type makeExpansion struct {
 	seen map[string]bool
 	done map[string]makeEffect
+	// relaxed marks text from the stock system makefiles, where a lookup
+	// by a computed name is followed rather than refused.
+	relaxed bool
 }
 
 // classify reads text the way make expands it and never runs any of it.
@@ -2498,6 +2882,9 @@ func (w *makeWalk) braced(s string, i int, x *makeExpansion) (makeEffect, int) {
 	switch {
 	case cond:
 		e.add(makeEffect{effect: w.classify(makeCondText(name), x).effect})
+	case computed && x.relaxed && w.sys != nil:
+		val = w.sysComputed(name, x)
+		e.add(makeEffect{effect: val.effect})
 	case computed:
 		e.add(makeEffect{effect: text + " looks up a variable by a name doctor does not expand"})
 	case name != "":
@@ -2528,7 +2915,7 @@ func (w *makeWalk) braced(s string, i int, x *makeExpansion) (makeEffect, int) {
 			break
 		}
 		k += at
-		if m := makeIndirectMod.FindStringSubmatch(chain[k:]); m == nil || !w.patternsSafe(m[1]) {
+		if m := makeIndirectMod.FindStringSubmatch(chain[k:]); m == nil || !w.patternsSafe(m[1]) && !w.literalMods(m[1]) {
 			e.add(makeEffect{effect: text + " applies modifiers computed from a value doctor cannot establish"})
 			break
 		}
@@ -2547,8 +2934,12 @@ func (w *makeWalk) braced(s string, i int, x *makeExpansion) (makeEffect, int) {
 	return e, j + 1
 }
 
-// expandVar classifies one lookup: every value the variable may hold in a
-// makefile, and the environment's.
+// expandVar classifies one lookup: every value the variable may hold from
+// each source make takes one from. Those are the makefiles doctor read, the
+// command line, the stock system makefiles, and the environment. A name none
+// of them gives a value is undefined, or one of make's own variables, whose
+// values make derives from the host and the command line and never holds an
+// expression. System text is classified relaxed: see sysComputed.
 func (w *makeWalk) expandVar(name string, x *makeExpansion) makeEffect {
 	if e, ok := x.done[name]; ok {
 		return e
@@ -2558,8 +2949,14 @@ func (w *makeWalk) expandVar(name string, x *makeExpansion) makeEffect {
 	}
 	x.seen[name] = true
 	defer delete(x.seen, name)
+	relaxed := x.relaxed
+	defer func() { x.relaxed = relaxed }()
 	var e makeEffect
-	if v := w.vars[name]; v != nil {
+	add := func(v *makeVar, sys bool) {
+		if v == nil {
+			return
+		}
+		x.relaxed = sys
 		for _, r := range v.raw {
 			e.add(w.classify(r, x))
 		}
@@ -2569,8 +2966,19 @@ func (w *makeWalk) expandVar(name string, x *makeExpansion) makeEffect {
 			}
 		}
 	}
+	add(w.vars[name], false)
+	add(w.cmdline[name], false)
+	if w.sys != nil {
+		add(w.sys.vars[name], true)
+		for _, g := range w.sys.globs {
+			if g.re.MatchString(name) {
+				add(g.v, true)
+			}
+		}
+	}
 	if w.lookup != nil {
 		if ev, ok := w.lookup(name); ok {
+			x.relaxed = false
 			e.add(w.classify(ev, x))
 		}
 	}
@@ -2581,13 +2989,140 @@ func (w *makeWalk) expandVar(name string, x *makeExpansion) makeEffect {
 	return e
 }
 
+// names is every variable some source gives a value: the makefiles doctor
+// read, the command line, the stock system makefiles and the environment.
+func (w *makeWalk) names() []string {
+	set := map[string]bool{}
+	for n := range w.vars {
+		set[n] = true
+	}
+	for n := range w.cmdline {
+		set[n] = true
+	}
+	if w.sys != nil {
+		for n := range w.sys.vars {
+			set[n] = true
+		}
+	}
+	for _, kv := range w.environ {
+		n, _, _ := strings.Cut(kv, "=")
+		set[n] = true
+	}
+	out := make([]string, 0, len(set))
+	for n := range set {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// sysComputed classifies a lookup by a computed name in the stock system
+// makefiles, such as bsd.mkopt.mk's ${MK_${var}}. make can only reach a
+// variable whose name matches what the name's literal parts leave, so the
+// lookup does what one of those may do, or what a computed assignment may
+// leave. Makefiles doctor read get no such
+// allowance: a computed lookup there stays an effect.
+func (w *makeWalk) sysComputed(name string, x *makeExpansion) makeEffect {
+	re := makeNameGlob(name)
+	key := "\x00" + re.String()
+	if x.seen[key] {
+		return makeEffect{}
+	}
+	x.seen[key] = true
+	defer delete(x.seen, key)
+	var e makeEffect
+	for _, n := range w.names() {
+		if re.MatchString(n) {
+			e.add(w.expandVar(n, x))
+		}
+	}
+	// Two computed names can match the same variable without either
+	// matching the other's pattern, so every computed assignment counts.
+	relaxed := x.relaxed
+	x.relaxed = true
+	for _, g := range w.sys.globs {
+		for _, r := range g.v.raw {
+			e.add(w.classify(r, x))
+		}
+	}
+	x.relaxed = relaxed
+	return e
+}
+
+// sourced reports whether any source but the makefiles doctor read gives
+// name a value: the command line, the system makefiles or the environment.
+func (w *makeWalk) sourced(name string) bool {
+	if w.cmdline[name] != nil {
+		return true
+	}
+	if w.sys != nil {
+		if w.sys.vars[name] != nil {
+			return true
+		}
+		for _, g := range w.sys.globs {
+			if g.re.MatchString(name) {
+				return true
+			}
+		}
+	}
+	if w.lookup != nil {
+		if _, ok := w.lookup(name); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// makeLiteralMods is a modifier list make applies without assigning,
+// running or looking anything up: :C and :S with a slash delimiter, :M and
+// :N patterns, and letter modifiers that only reorder or reshape words.
+var makeLiteralMods = regexp.MustCompile(`^(([CS]/[^/:$\\{}]*/[^/:$\\{}]*/[1gW]*|[MN][^:$\\{}]*|[EHTRQuO])(:|$))*$`)
+
+// literalMods reports whether every value a variable used as a modifier
+// list may hold, from every source, is a literal list that assigns nothing.
+func (w *makeWalk) literalMods(name string) bool {
+	var vals []*makeVar
+	vals = append(vals, w.vars[name], w.cmdline[name])
+	if w.sys != nil {
+		vals = append(vals, w.sys.vars[name])
+		for _, g := range w.sys.globs {
+			if g.re.MatchString(name) {
+				vals = append(vals, g.v)
+			}
+		}
+	}
+	if w.lookup != nil {
+		if ev, ok := w.lookup(name); ok {
+			vals = append(vals, &makeVar{raw: []string{ev}})
+		}
+	}
+	// A name no source gives a value may still be one the ports framework
+	// assigns before a deferred value is expanded, which doctor does not read.
+	known := false
+	for _, v := range vals {
+		if v == nil {
+			continue
+		}
+		known = true
+		if len(v.stored) > 0 || v.appended {
+			return false
+		}
+		for _, r := range v.raw {
+			if !makeLiteralMods.MatchString(r) {
+				return false
+			}
+		}
+	}
+	return known
+}
+
 // patternsSafe reports whether a variable used as a modifier list holds the
 // served check's :N patterns and nothing else, over makefile paths that
 // cannot split into further modifiers. make lists every file it read: the
 // ones doctor read, and those under /usr/share/mk that sys.mk reads.
 func (w *makeWalk) patternsSafe(name string) bool {
 	v := w.vars[name]
-	if v == nil || !v.patterns {
+	if v == nil || !v.patterns || w.sourced(name) {
 		return false
 	}
 	for _, p := range w.read {
@@ -2602,7 +3137,7 @@ func (w *makeWalk) patternsSafe(name string) bool {
 // its mounts and nothing else.
 func (w *makeWalk) stableView(name string) bool {
 	v, stable := w.vars[name], servedModel().stable
-	if v == nil || stable == "" || len(v.stored) > 0 || len(v.raw) == 0 {
+	if v == nil || stable == "" || len(v.stored) > 0 || len(v.raw) == 0 || w.sourced(name) {
 		return false
 	}
 	for _, r := range v.raw {

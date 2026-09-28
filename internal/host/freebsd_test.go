@@ -51,9 +51,18 @@ bodega-latest: {
 }
 `
 
+// stockSysMk is FreeBSD 15.1-RELEASE's /usr/share/mk: the system makefiles
+// make reads around make.conf, copied from the guest.
+const stockSysMk = "testdata/freebsd-15.1"
+
+// writeTree builds a host root holding files, over the stock system
+// makefiles every FreeBSD host carries.
 func writeTree(t *testing.T, files map[string]string) string {
 	t.Helper()
 	root := t.TempDir()
+	if err := os.CopyFS(root, os.DirFS(stockSysMk)); err != nil {
+		t.Fatal(err)
+	}
 	for p, body := range files {
 		full := filepath.Join(root, p)
 		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
@@ -1735,7 +1744,10 @@ func TestMakeConfSystemPath(t *testing.T) {
 		{"MAKEFLAGS defines another name", nil, map[string]string{"MAKEFLAGS": "-DPOSIX -D%POSIXLY"}, StatusOK},
 		{"local.sys.env.mk", map[string]string{"/usr/share/mk/local.sys.env.mk": "MASTER_SITE_OVERRIDE=https://mirror.example/\n"}, nil, StatusWarn},
 		{"local.sys.mk", map[string]string{"/usr/share/mk/local.sys.mk": "MASTER_SITE_OVERRIDE=https://mirror.example/\n"}, nil, StatusWarn},
-		{"other stock system makefiles", map[string]string{"/usr/share/mk/sys.mk": sysmk, "/usr/share/mk/bsd.port.mk": "\n"}, nil, StatusOK},
+		{"other stock system makefiles", map[string]string{"/usr/share/mk/bsd.port.mk": "\n"}, nil, StatusOK},
+		{"sys.mk assigns a site", map[string]string{"/usr/share/mk/sys.mk": "MASTER_SITE_OVERRIDE=https://mirror.example/\n"}, nil, StatusWarn},
+		{"sys.mk assigns a site by a computed name", map[string]string{"/usr/share/mk/sys.mk": "_S=OVERRIDE\nMASTER_SITE_${_S}=https://mirror.example/\n"}, nil, StatusWarn},
+		{"sys.mk includes a file doctor does not read", map[string]string{"/usr/share/mk/sys.mk": ".include \"/custom/site.mk\"\n"}, nil, StatusWarn},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			files := map[string]string{
@@ -1833,4 +1845,62 @@ func TestMakeConfSystemModes(t *testing.T) {
 			})
 		}
 	}
+}
+
+// A variable make.conf, the client check and the environment leave alone
+// can still hold a value: the stock system makefiles and MAKEFLAGS supply
+// them. sys.mk's MACHINE_CPUARCH applies __TO_CPUARCH as a modifier list,
+// and sys.mk expands CFLAGS before it reads make.conf, so a command-line
+// __TO_CPUARCH turns a plain reference into an assignment. On the 15.1
+// guest, bmake confirms each unsafe case below: the first selects another
+// make.conf, the second skips it, and the third and fourth leave
+// MASTER_SITE_OVERRIDE at the mirror while backup stays at bodega.
+func TestMakeConfSystemDefinitions(t *testing.T) {
+	for _, tc := range []struct {
+		name, flags, cflags, extra string
+		want                       Status
+	}{
+		{name: "default", want: StatusOK},
+		{name: "plain reference", cflags: "${MACHINE_CPUARCH}", want: StatusOK},
+		{name: "literal command-line modifiers", flags: "__TO_CPUARCH=C/arm64/arm/", cflags: "${MACHINE_CPUARCH}", want: StatusOK},
+		{name: "selector", flags: "MACHINE_ARCH=/etc/unsafe.conf __TO_CPUARCH=_=__MAKE_CONF", cflags: "${MACHINE_CPUARCH}", want: StatusWarn},
+		{name: "skip control", flags: "__TO_CPUARCH=_=%POSIX", cflags: "${MACHINE_CPUARCH}", want: StatusWarn},
+		{name: "from the check", flags: "MACHINE_ARCH=https://mirror.example/ __TO_CPUARCH=_=MASTER_SITE_OVERRIDE", extra: "UNRELATED:= ${MACHINE_CPUARCH}\n", want: StatusWarn},
+		// The ports framework and bsd.cpu.mk expand MACHINE_CPUARCH themselves.
+		{name: "no reference", flags: "MACHINE_ARCH=https://mirror.example/ __TO_CPUARCH=_=MASTER_SITE_OVERRIDE", want: StatusWarn},
+		{name: "-D modifier list", flags: "-D__TO_CPUARCH", cflags: "${MACHINE_CPUARCH}", want: StatusWarn},
+		{name: "appended modifiers", flags: "__TO_CPUARCH+=C/a/b/", cflags: "${MACHINE_CPUARCH}", want: StatusWarn},
+		{name: "shell modifiers", flags: "__TO_CPUARCH!=echo", cflags: "${MACHINE_CPUARCH}", want: StatusWarn},
+	} {
+		for _, path := range []string{clientconf.DistfilesCheckPath, "/net/b/distfiles/@environment.mk"} {
+			t.Run(tc.name+path, func(t *testing.T) {
+				env := map[string]string{"__MAKE_CONF": "/etc/make.conf", "MAKEFLAGS": tc.flags}
+				if tc.cflags != "" {
+					env["CFLAGS"] = tc.cflags
+				}
+				conf := strings.ReplaceAll(strings.ReplaceAll(clientconf.MakeConf("https://b").Content, "?=", "="), clientconf.DistfilesCheckPath, path)
+				root := writeTree(t, map[string]string{"/etc/make.conf": conf, "/etc/unsafe.conf": "# empty\n", path: "BODEGA_DISTFILES_ENV=abc\n" + tc.extra})
+				lookup := func(k string) (string, bool) { v, ok := env[k]; return v, ok }
+				var environ []string
+				for k, v := range env {
+					environ = append(environ, k+"="+v)
+				}
+				assertFinding(t, checkMakeConfEnviron(root, "freebsd", lookup, environ), tc.want)
+			})
+		}
+	}
+}
+
+// make refuses to run without sys.mk, and doctor cannot model a stage it
+// cannot read.
+func TestMakeConfWithoutSysMk(t *testing.T) {
+	site := "https://b/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/"
+	root := writeTree(t, map[string]string{
+		"/etc/make.conf":                     "MASTER_SITE_OVERRIDE=" + site + "\nMASTER_SITE_BACKUP=" + site + "\n.include \"/usr/local/etc/bodega-distfiles.mk\"\n",
+		"/usr/local/etc/bodega-distfiles.mk": "BODEGA_DISTFILES_ENV=abc\n",
+	})
+	if err := os.Remove(filepath.Join(root, "/usr/share/mk/sys.mk")); err != nil {
+		t.Fatal(err)
+	}
+	assertFinding(t, checkMakeConf(root, "freebsd", func(string) string { return "" }), StatusWarn, "/usr/share/mk/sys.mk does not exist")
 }

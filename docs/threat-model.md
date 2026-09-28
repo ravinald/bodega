@@ -710,9 +710,10 @@ instance, the recommended posture is:
   should point at. Re-run `bodega doctor` after rewriting to confirm exit 0.
   On FreeBSD the `pkg-repos` check reads `/etc/pkg/`,
   `/usr/local/etc/pkg/repos/` and `/var/db/pkg/repos_state/` for an enabled
-  upstream repository, and `make-conf` reads `/etc/make.conf` and the files
-  it includes for distfiles sites that are not bodega's and for the client
-  check included last. Neither reports OK for a file it cannot evaluate the
+  upstream repository, and `make-conf` reads `/etc/make.conf`, the files it
+  includes and the stock system makefiles make reads around it for
+  distfiles sites that are not bodega's and for the client check included
+  last. Neither reports OK for a file it cannot evaluate the
   way pkg or make would, nor when `pkg.conf` or the environment moves what
   pkg or make reads away from those files.
 - **Set `GOPROXY` to `http://<bodega>/go`**, with no `direct` entry after
