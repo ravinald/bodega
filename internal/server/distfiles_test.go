@@ -481,7 +481,17 @@ func TestDistfilesHitCountsInDiscovery(t *testing.T) {
 	if got := hits.Load(); got != 1 {
 		t.Fatalf("upstream fetched %d times, want 1: the second GET has to be a cache hit for this to test anything", got)
 	}
+	// waitForPoolRow returns at a count of at least 2, so a hit recorded twice
+	// would pass it. Close waits out both handlers, so every observation they
+	// make is queued; the worker writes the queue in order, so once a sentinel
+	// queued after them is visible, so is every one of theirs.
+	ts.Close()
+	s.discovery.Record(audit.DiscoveryRow{RegistryType: manifest.TypeDistfiles, Host: "sentinel.invalid", PkgName: "sentinel", Decision: audit.DecisionAllowed})
+	waitForPoolRow(t, s, "sentinel", 1)
 	row := waitForPoolRow(t, s, "pcpustat/1.6.tar.bz2", 2)
+	if row.RequestCount != 2 {
+		t.Errorf("request_count = %d, want 2: one miss and one hit", row.RequestCount)
+	}
 	if row.RegistryType != manifest.TypeDistfiles || row.Decision != audit.DecisionAllowed {
 		t.Errorf("row = %+v, want a distfiles row the allow-list permits", row)
 	}
