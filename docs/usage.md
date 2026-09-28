@@ -930,18 +930,33 @@ Every configured backend is probed, `local` and `s3` alike. Under an `audit_sink
 
 Deletes every manifest and the local build artifacts, keeping the config file. It is the fastest way back to an empty repository on a development host, and the most destructive command bodega has.
 
-Before deleting anything it prints what will be cleared and what is kept, asks whether to clear the audit database as well (default no), and then asks you to type a randomly generated word such as `purge-417`. Anything else aborts with nothing removed.
+Before deleting anything it prints every path it will clear and what is kept, asks whether to clear the audit database as well (default no), and then asks you to type a randomly generated word such as `purge-417`. Anything else aborts with nothing removed.
 
 What it removes:
 
 - the manifest directory (`manifest_dir`)
 - when the config names a `bucket`, every object under `manifests/` on the default backend
-- the build directories under `build_root`: `sources`, `repos`, `bundles`, `wheels`, `binaries`, `apt-repo`, `gomod`, `charts` and `npm`
+- every build path a package type writes, under that type's `*_root` override when one is set and under `build_root` otherwise (see the table below)
 - the audit database, only when you answered yes. A line naming the user and the database goes to syslog first (or to `audit-failsafe.log` beside the database when syslog is unavailable), so wiping the audit trail leaves a record outside it
 
 What it keeps: the config file, and every artifact in storage. Stored artifacts with no manifest left are unreachable until re-imported; `bodega pkg delete --remove-artifacts` before the reset is the way to remove them.
 
-**Gap:** the build-directory list predates the per-type roots and the newer types. A tree under `cargo_root`, `freebsd_root` or `distfiles_root`, or under any per-type root set apart from `build_root`, is left in place, and so are `<build_root>/cargo`, `<build_root>/freebsd` and `<build_root>/distfiles`. Remove those by hand. [#55](https://github.com/ravinald/bodega/issues/55) tracks the fix.
+| Type        | Root key         | Paths cleared under that root                                                                                              |
+| ----------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `binary`    | `binary_root`    | `binaries`                                                                                                                 |
+| `git`       | `git_root`       | `repos`, `sources`, `bundles`                                                                                              |
+| `apt`       | `apt_root`       | `sources`, `apt-repo`                                                                                                      |
+| `pypi`      | `pypi_root`      | `wheels`, `wheelhouse`, `build-venv`, `combined-requirements.txt`, `combined-constraints.txt`, `resolved-requirements.txt` |
+| `gomod`     | `gomod_root`     | `gomod`                                                                                                                    |
+| `helm`      | `helm_root`      | `charts`                                                                                                                   |
+| `npm`       | `npm_root`       | `npm`                                                                                                                      |
+| `cargo`     | `cargo_root`     | `cargo`                                                                                                                    |
+| `freebsd`   | `freebsd_root`   | `freebsd`                                                                                                                  |
+| `distfiles` | `distfiles_root` | `distfiles`, every environment digest under it                                                                             |
+
+A path an override puts outside `build_root` is listed on its own under "Outside build_root, set by a `*_root` override", with the key that put it there, because that directory was chosen by hand and may sit beside something else. Check that list before typing the confirmation word.
+
+`reset` prints `Removed <path>` for each path it deletes and says nothing about one that was already absent. A path it cannot remove is named on stderr with the error, "Build artifacts cleared." is withheld, and the command exits non-zero after the audit step. A running `bodega serve` is still told to reload, because the manifests are already gone. Fix the cause (usually permissions under the path) and run `bodega reset` again.
 
 ### `bodega pkg checksum list [--type TYPE] [--name NAME]`
 
