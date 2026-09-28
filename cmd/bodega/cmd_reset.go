@@ -140,6 +140,9 @@ What is preserved:
 
 			fmt.Println()
 			if failed > 0 {
+				// The manifests are already gone, and an error return skips the
+				// root's post-run reload.
+				signalReloadNow(cmd, gf)
 				return fmt.Errorf("reset incomplete: %d of %d build paths could not be removed (named above); fix the cause and run 'bodega reset' again", failed, len(targets))
 			}
 			fmt.Println("Reset complete. Config preserved. Run 'bodega init' to re-initialize.")

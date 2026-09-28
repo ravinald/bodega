@@ -295,9 +295,13 @@ func typeResetPaths(cfg *Config, typ string) []string {
 		return []string{d.sources, d.aptRepo}
 	case manifest.TypePypi:
 		// The combined and resolved requirement files sit at the root itself,
-		// and CheckPypiStage reads them to decide the fetch stage ran.
+		// and CheckPypiStage reads them to decide the fetch stage ran. The
+		// wheelhouse and the build venv sit there too, outside dirs: the build
+		// reads the one and reuses the other.
 		return []string{
 			d.wheels,
+			pypiWheelhouseDir(root),
+			pypiVenvDir(root),
 			filepath.Join(root, "combined-requirements.txt"),
 			filepath.Join(root, "combined-constraints.txt"),
 			pypiLockPath(root),

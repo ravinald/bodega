@@ -941,22 +941,22 @@ What it removes:
 
 What it keeps: the config file, and every artifact in storage. Stored artifacts with no manifest left are unreachable until re-imported; `bodega pkg delete --remove-artifacts` before the reset is the way to remove them.
 
-| Type        | Root key         | Paths cleared under that root                                                                  |
-| ----------- | ---------------- | ---------------------------------------------------------------------------------------------- |
-| `binary`    | `binary_root`    | `binaries`                                                                                     |
-| `git`       | `git_root`       | `repos`, `sources`, `bundles`                                                                  |
-| `apt`       | `apt_root`       | `sources`, `apt-repo`                                                                          |
-| `pypi`      | `pypi_root`      | `wheels`, `combined-requirements.txt`, `combined-constraints.txt`, `resolved-requirements.txt` |
-| `gomod`     | `gomod_root`     | `gomod`                                                                                        |
-| `helm`      | `helm_root`      | `charts`                                                                                       |
-| `npm`       | `npm_root`       | `npm`                                                                                          |
-| `cargo`     | `cargo_root`     | `cargo`                                                                                        |
-| `freebsd`   | `freebsd_root`   | `freebsd`                                                                                      |
-| `distfiles` | `distfiles_root` | `distfiles`, every environment digest under it                                                 |
+| Type        | Root key         | Paths cleared under that root                                                                                              |
+| ----------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `binary`    | `binary_root`    | `binaries`                                                                                                                 |
+| `git`       | `git_root`       | `repos`, `sources`, `bundles`                                                                                              |
+| `apt`       | `apt_root`       | `sources`, `apt-repo`                                                                                                      |
+| `pypi`      | `pypi_root`      | `wheels`, `wheelhouse`, `build-venv`, `combined-requirements.txt`, `combined-constraints.txt`, `resolved-requirements.txt` |
+| `gomod`     | `gomod_root`     | `gomod`                                                                                                                    |
+| `helm`      | `helm_root`      | `charts`                                                                                                                   |
+| `npm`       | `npm_root`       | `npm`                                                                                                                      |
+| `cargo`     | `cargo_root`     | `cargo`                                                                                                                    |
+| `freebsd`   | `freebsd_root`   | `freebsd`                                                                                                                  |
+| `distfiles` | `distfiles_root` | `distfiles`, every environment digest under it                                                                             |
 
 A path an override puts outside `build_root` is listed on its own under "Outside build_root, set by a `*_root` override", with the key that put it there, because that directory was chosen by hand and may sit beside something else. Check that list before typing the confirmation word.
 
-`reset` prints `Removed <path>` for each path it deletes and says nothing about one that was already absent. A path it cannot remove is named on stderr with the error, "Build artifacts cleared." is withheld, and the command exits non-zero after the audit step. Fix the cause (usually permissions under the path) and run `bodega reset` again.
+`reset` prints `Removed <path>` for each path it deletes and says nothing about one that was already absent. A path it cannot remove is named on stderr with the error, "Build artifacts cleared." is withheld, and the command exits non-zero after the audit step. A running `bodega serve` is still told to reload, because the manifests are already gone. Fix the cause (usually permissions under the path) and run `bodega reset` again.
 
 ### `bodega pkg checksum list [--type TYPE] [--name NAME]`
 
