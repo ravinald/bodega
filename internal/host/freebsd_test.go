@@ -1046,3 +1046,154 @@ func TestMakeConfFinalIncludeProvenance(t *testing.T) {
 		})
 	}
 }
+
+// Each file follows an enabled upstream in a.conf as z.conf, and was given
+// to pkg 2.8.4 on 15.1 with pkg -o REPOS_DIR=<dir> -vv. pkg discards a file
+// it cannot lex whole, objects before the error included, so the upstream
+// stays enabled. OK means pkg applied the file and doctor certifies it; a
+// file pkg accepts but doctor does not lex the way libucl does is declined.
+func TestPkgLexicalMatchesPkg(t *testing.T) {
+	const b = `bodega: { url: "https://b/freebsd/x/latest" }`
+	for _, tc := range []struct {
+		name, body string
+		want       Status
+	}{
+		{"a closed comment", `FreeBSD: { enabled: no } ` + b + ` /* closed */`, StatusOK},
+		{"an unfinished comment after the disabling object", `FreeBSD: { enabled: no } ` + b + ` /* unclosed`, StatusSkip},
+		{"a nested comment, which pkg accepts", `FreeBSD: { enabled: no } /* a /* b */ c */ ` + b, StatusWarn},
+		{"a quote inside a comment, which pkg rejects", `FreeBSD: { enabled: no } /* " */ ` + b, StatusWarn},
+		{"a newline in a double-quoted string", "FreeBSD: { enabled: no, pubkey: \"a\nb\" }\n" + b, StatusSkip},
+		{"a tab in a double-quoted string", "FreeBSD: { enabled: no, pubkey: \"a\tb\" } " + b, StatusSkip},
+		{"an unclosed string", `FreeBSD: { enabled: no } bodega: { url: "https://b/freebsd/x/latest }`, StatusSkip},
+		{"a closing brace with nothing open", `FreeBSD: { enabled: no } ` + b + ` }`, StatusSkip},
+		{"an empty bare value", `FreeBSD: { enabled: no, pubkey: , } ` + b, StatusSkip},
+		{"an escape in a key doctor ignores", `FreeBSD: { enabled: no, pubkey: "a\qb" } ` + b, StatusOK},
+		{"a newline in a single-quoted string", "FreeBSD: { enabled: no, pubkey: 'a\nb' } " + b, StatusOK},
+		{"an escape in a url", `FreeBSD: { enabled: no } bodega: { url: "https:\/\/b/freebsd/x/latest" }`, StatusWarn},
+		{"an escape in a repository name", `"Free\BSD": { enabled: no } ` + b, StatusWarn},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := writeTree(t, map[string]string{
+				"/usr/local/etc/pkg/repos/a.conf": `FreeBSD: { url: "https://pkg.FreeBSD.org/x", enabled: yes }` + "\n",
+				"/usr/local/etc/pkg/repos/z.conf": tc.body + "\n",
+			})
+			assertFinding(t, checkPkgRepos(root, "freebsd"), tc.want)
+		})
+	}
+	t.Run("an unfinished comment in an included file", func(t *testing.T) {
+		root := writeTree(t, map[string]string{
+			"/etc/pkg/FreeBSD.conf":                `FreeBSD: { url: "https://pkg.FreeBSD.org/x", enabled: yes }` + "\n",
+			"/usr/local/etc/pkg/repos/bodega.conf": "FreeBSD: { enabled: no }\n" + b + "\n.include \"/tmp/tail.inc\"\n",
+			"/tmp/tail.inc":                        "x: { enabled: no } /* unclosed\n",
+		})
+		assertFinding(t, checkPkgRepos(root, "freebsd"), StatusSkip, "unfinished multiline comment")
+	})
+}
+
+// pkg 2.8.4 on 15.1 given each url on the FreeBSD override that disables
+// upstream, with bodega's repository beside it. pkg validates every url
+// after merging, disabled repositories included, and exits 1 on the first it
+// refuses.
+func TestPkgURLValidationMatchesPkg(t *testing.T) {
+	const b = `bodega: { url: "https://b/freebsd/x/latest" }`
+	for _, tc := range []struct {
+		name, body string
+		want       Status
+		detail     []string
+	}{
+		{"absent keeps the earlier url", `FreeBSD: { enabled: no } ` + b, StatusOK, nil},
+		{"empty", `FreeBSD: { enabled: no, url: "" } ` + b, StatusWarn, []string{"pkg refuses to start", "invalid url"}},
+		{"https", `FreeBSD: { enabled: no, url: "https://c/freebsd/x" } ` + b, StatusOK, nil},
+		{"pkg+https", `FreeBSD: { enabled: no, url: "pkg+https://c/freebsd/x" } ` + b, StatusOK, nil},
+		{"file", `FreeBSD: { enabled: no, url: "file:///srv/x" } ` + b, StatusOK, nil},
+		{"an unsupported scheme", `FreeBSD: { enabled: no, url: "gopher://c/x" } ` + b, StatusWarn, []string{"invalid scheme gopher"}},
+		{"an upper-case scheme", `FreeBSD: { enabled: no, url: "HTTPS://c/x" } ` + b, StatusWarn, []string{"invalid scheme HTTPS"}},
+		{"no scheme", `FreeBSD: { enabled: no, url: "c/x" } ` + b, StatusWarn, []string{"invalid url"}},
+		{"a scheme a valid one begins with", `FreeBSD: { enabled: no, url: "htt://c/x" } ` + b, StatusOK, nil},
+		{"an empty scheme", `FreeBSD: { enabled: no, url: ":/c/x" } ` + b, StatusOK, nil},
+		{"an empty url on a new disabled repository", `FreeBSD: { enabled: no } ` + b + ` z: { url: "", enabled: no }`, StatusWarn, []string{"repository z", "invalid url"}},
+		{"a variable in the scheme", `FreeBSD: { enabled: no, url: "${S}://c/x" } ` + b, StatusWarn, []string{"cannot establish that pkg starts"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := writeTree(t, map[string]string{
+				"/usr/local/etc/pkg/repos/a.conf": `FreeBSD: { url: "https://pkg.FreeBSD.org/x", enabled: yes }` + "\n",
+				"/usr/local/etc/pkg/repos/z.conf": tc.body + "\n",
+			})
+			assertFinding(t, checkPkgRepos(root, "freebsd"), tc.want, tc.detail...)
+		})
+	}
+}
+
+// Export directives change the environment while make reads makefiles, so
+// the one doctor started with no longer says what a recipe under -e reads,
+// or what .undef falls back to. Measured with bmake on 15.1: .unexport-env
+// and .export-literal of make.conf's mirror sites leave a recipe under -e
+// fetching from the mirror, though the environment named bodega.
+func TestMakeConfExportDirectives(t *testing.T) {
+	site := "https://b/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/"
+	mirror := strings.ReplaceAll(strings.ReplaceAll(clientconf.MakeConf("https://b").Content, "?=", "="), site, "https://mirror.example/")
+	assigned := strings.ReplaceAll(clientconf.MakeConf("https://b").Content, "?=", "=")
+	eSafe := map[string]string{"MAKEFLAGS": "-e", "MASTER_SITE_OVERRIDE": site, "MASTER_SITE_BACKUP": site}
+	before := func(conf, lines string) string { return strings.Replace(conf, ".include", lines+".include", 1) }
+	for _, tc := range []struct {
+		name, conf string
+		inc        string
+		env        map[string]string
+		want       Status
+		detail     []string
+	}{
+		{"-e with no directive takes the environment's sites", mirror, "", eSafe, StatusOK, nil},
+		{".unexport-env under -e", before(mirror, ".unexport-env\n"), "", eSafe, StatusWarn, []string{"MASTER_SITE_OVERRIDE cannot be established: .unexport-env in /etc/make.conf changes the environment"}},
+		{".export-literal under -e", before(mirror, ".export-literal MASTER_SITE_OVERRIDE MASTER_SITE_BACKUP\n"), "", eSafe, StatusWarn, []string{"MASTER_SITE_BACKUP cannot be established: .export-literal"}},
+		{".export-env under -e", before(mirror, ".export-env MASTER_SITE_OVERRIDE\n"), "", eSafe, StatusWarn, []string{"MASTER_SITE_OVERRIDE cannot be established"}},
+		{".export with no names under -e", before(mirror, ".export\n"), "", eSafe, StatusWarn, []string{"MASTER_SITE_BACKUP cannot be established"}},
+		{".unexport of a name doctor does not expand under -e", before(mirror, ".unexport ${X}\n"), "", eSafe, StatusWarn, []string{"cannot be established"}},
+		{".unexport-env under .if 0", before(mirror, ".if 0\n.unexport-env\n.endif\n"), "", eSafe, StatusOK, nil},
+		{".unexport-env under a condition doctor does not evaluate", before(mirror, ".if defined(X)\n.unexport-env\n.endif\n"), "", eSafe, StatusWarn, []string{"cannot be established"}},
+		{".unexport-env in an earlier include", ".include \"/etc/local.mk\"\n" + mirror, "", eSafe, StatusWarn, []string{".unexport-env in /etc/local.mk"}},
+		{".unexport-env in the final include", mirror, ".unexport-env\n", eSafe, StatusWarn, []string{"cannot be established"}},
+		{"an export naming another variable", before(mirror, ".export-literal OTHER\n"), "", eSafe, StatusOK, nil},
+		// Without -e a makefile assignment still shadows the environment.
+		{".unexport-env without -e, sites assigned after", ".unexport-env\n" + assigned, "", nil, StatusOK, nil},
+		{".undef back to a changed environment", ".unexport-env\n" + assigned + ".undef MASTER_SITE_OVERRIDE\n", "", map[string]string{"MASTER_SITE_OVERRIDE": site}, StatusWarn, []string{"MASTER_SITE_OVERRIDE cannot be established: .unexport-env"}},
+		{".export-env of DIST_SUBDIR from the environment", ".export-env DIST_SUBDIR\n" + assigned, "", map[string]string{"DIST_SUBDIR": ""}, StatusWarn, []string{"DIST_SUBDIR, which the route expands, may be set"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := map[string]string{
+				"/etc/make.conf":              tc.conf,
+				"/etc/local.mk":               ".unexport-env\n",
+				clientconf.DistfilesCheckPath: "BODEGA_DISTFILES_ENV=abc\n" + tc.inc,
+			}
+			lookup := func(k string) (string, bool) { v, ok := tc.env[k]; return v, ok }
+			assertFinding(t, checkMakeConfLookup(writeTree(t, files), "freebsd", lookup), tc.want, tc.detail...)
+		})
+	}
+}
+
+// -D __MAKE_CONF in MAKEFLAGS sets a global of 1 that sys.mk's ?= keeps, so
+// bmake on 15.1 reads no make.conf at all, or under -e the environment's.
+// Either way doctor has not established the file it would be certifying.
+func TestMakeConfDefineSelectsFile(t *testing.T) {
+	assigned := strings.ReplaceAll(clientconf.MakeConf("https://b").Content, "?=", "=")
+	for _, mf := range []string{"-D__MAKE_CONF", "-D __MAKE_CONF", "-e -D__MAKE_CONF", "-kD __MAKE_CONF"} {
+		for _, envConf := range []string{"", "/etc/make.conf"} {
+			t.Run(mf+" __MAKE_CONF="+envConf, func(t *testing.T) {
+				env := map[string]string{"MAKEFLAGS": mf}
+				if envConf != "" {
+					env["__MAKE_CONF"] = envConf
+				}
+				root := writeTree(t, map[string]string{"/etc/make.conf": assigned, clientconf.DistfilesCheckPath: "BODEGA_DISTFILES_ENV=abc\n"})
+				lookup := func(k string) (string, bool) { v, ok := env[k]; return v, ok }
+				assertFinding(t, checkMakeConfLookup(root, "freebsd", lookup), StatusWarn, "defines __MAKE_CONF with -D", "cannot establish which make.conf")
+			})
+		}
+	}
+	t.Run("-D of another variable leaves the selection alone", func(t *testing.T) {
+		root := writeTree(t, map[string]string{"/etc/make.conf": assigned, clientconf.DistfilesCheckPath: "BODEGA_DISTFILES_ENV=abc\n"})
+		lookup := func(k string) (string, bool) {
+			v, ok := map[string]string{"MAKEFLAGS": "-D__MAKE_CONFX"}[k]
+			return v, ok
+		}
+		assertFinding(t, checkMakeConfLookup(root, "freebsd", lookup), StatusOK)
+	})
+}

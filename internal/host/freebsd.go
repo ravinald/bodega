@@ -119,6 +119,22 @@ func checkPkgReposLookup(root, goos string, lookup func(string) (string, bool)) 
 		return f
 	}
 
+	for _, r := range repos {
+		why, unknown := pkgURLInvalid(r.URL)
+		switch {
+		case unknown:
+			f.Status = StatusWarn
+			f.Detail = fmt.Sprintf("repository %s (set in %s) has url %q, %s, so doctor cannot establish that pkg starts", r.Name, r.From, r.URL, why)
+			f.Remediation = "write the url's scheme literally; " + remediation
+			return f
+		case why != "":
+			f.Status = StatusWarn
+			f.Detail = fmt.Sprintf("pkg refuses to start: repository %s (set in %s) has url %q, %s; pkg checks every repository, disabled ones included, and every pkg command exits 1", r.Name, r.From, r.URL, why)
+			f.Remediation = "give every repository a url with one of pkg's schemes (" + strings.Join(pkgValidURLSchemes, ", ") + "), or remove the object that sets this one; " + remediation
+			return f
+		}
+	}
+
 	var upstream, bodega, unresolved []string
 	for _, r := range repos {
 		if !r.Enabled {
@@ -162,6 +178,29 @@ func checkPkgReposLookup(root, goos string, lookup func(string) (string, bool)) 
 	return f
 }
 
+// pkgValidURLSchemes is pkg's default VALID_URL_SCHEME.
+var pkgValidURLSchemes = []string{"pkg+http", "pkg+https", "https", "http", "file", "ssh", "tcp"}
+
+// pkgURLInvalid returns why pkg refuses to start with a repository of this
+// url, or "". After merging every file and applying repos_state, pkg checks
+// each repository's url, disabled ones included: it must hold ":/", and one
+// valid scheme must begin with what precedes it, because pkg compares with
+// strncmp over that length. So "htt://" and ":/" pass and "HTTPS://" and ""
+// fail, measured with pkg 2.8.4 on 15.1. unknown is set when pkg expands a
+// variable before the ":/" that doctor does not.
+func pkgURLInvalid(raw string) (why string, unknown bool) {
+	scheme, _, found := strings.Cut(raw, ":/")
+	switch {
+	case strings.Contains(scheme, "$"):
+		return "whose scheme holds a variable pkg expands", true
+	case !found:
+		return `which pkg rejects as an invalid url: it holds no ":/"`, false
+	case !slices.ContainsFunc(pkgValidURLSchemes, func(v string) bool { return strings.HasPrefix(v, scheme) }):
+		return "which pkg rejects as an invalid scheme " + scheme, false
+	}
+	return "", false
+}
+
 // pkgURLUnresolved reports whether a repository URL's host is not a literal
 // doctor can compare: one holding a UCL variable, or one that does not parse.
 func pkgURLUnresolved(raw string) bool {
@@ -198,10 +237,10 @@ const (
 )
 
 // pkgConfOverrides are the pkg.conf keys, and the environment variables of
-// the same name, that change which repositories pkg reads or where it keeps
-// repos_state. doctor reads only the defaults, so any of them set leaves the
-// repository set unknown.
-var pkgConfOverrides = []string{"REPOS_DIR", "REPOSITORIES", "PKG_DBDIR"}
+// the same name, that change which repositories pkg reads, where it keeps
+// repos_state, or which repository urls it starts with. doctor reads only
+// the defaults, so any of them set leaves the repository set unknown.
+var pkgConfOverrides = []string{"REPOS_DIR", "REPOSITORIES", "PKG_DBDIR", "VALID_URL_SCHEME"}
 
 // loadPkgRepos returns the repositories pkg reads, merged the way pkg 2.8.4
 // does in libpkg/pkg_config.c, measured with pkg -vv on 15.1: directories in
@@ -410,6 +449,9 @@ func (o uclObject) accept(exists bool) (uclAccepted, error) {
 			a.rejected = kv.key + " must be " + want.String() + ", not " + kv.val.kind.String()
 			return a, nil
 		}
+		if kv.val.escaped && (k == "url" || k == "signature_type") {
+			return a, pkgUnmodeled{fmt.Sprintf("%s: %s of %q holds an escape libucl decodes and doctor does not", o.from, kv.key, o.name)}
+		}
 		switch k {
 		case "url":
 			u := kv.val.s
@@ -521,6 +563,9 @@ func (k uclKind) String() string {
 type uclScalar struct {
 	s    string
 	kind uclKind
+	// escaped marks a quoted value holding an escape, whose decoded text
+	// doctor does not claim to know.
+	escaped bool
 }
 
 var uclIntLit = regexp.MustCompile(`^-?[0-9]+$`)
@@ -594,9 +639,18 @@ type uclStmt struct {
 // comments, quoted or bare scalars, ':' or '=' or nothing between key and
 // value, and ',' or ';' between pairs. A top-level key starting with '.' is
 // a directive and is returned for the caller to follow or refuse; one inside
-// an object is refused here.
+// an object is refused here. A lexical error anywhere fails the whole file,
+// as it does in libucl, however many objects parsed cleanly before it.
 func parseUCL(src string) ([]uclStmt, error) {
 	p := &uclParser{src: src}
+	out, err := p.stmts()
+	if p.err != nil {
+		return nil, p.err
+	}
+	return out, err
+}
+
+func (p *uclParser) stmts() ([]uclStmt, error) {
 	var out []uclStmt
 	for {
 		p.skip()
@@ -613,9 +667,12 @@ func parseUCL(src string) ([]uclStmt, error) {
 			if c := p.peek(); c != '"' && c != '\'' {
 				return nil, pkgUnmodeled{fmt.Sprintf("line %d: %s is a UCL directive doctor does not evaluate", line, name)}
 			}
-			arg, err := p.quoted()
+			arg, escaped, err := p.quoted()
 			if err != nil {
 				return nil, err
+			}
+			if escaped {
+				return nil, pkgUnmodeled{fmt.Sprintf("line %d: the path %s names holds an escape doctor does not decode", line, name)}
 			}
 			p.term()
 			out = append(out, uclStmt{directive: name, arg: arg, line: line})
@@ -669,6 +726,8 @@ func parseUCL(src string) ([]uclStmt, error) {
 type uclParser struct {
 	src string
 	pos int
+	// err is the first lexical error, which skip cannot return.
+	err error
 }
 
 func (p *uclParser) eof() bool { return p.pos >= len(p.src) }
@@ -696,15 +755,29 @@ func (p *uclParser) skip() {
 				p.pos = len(p.src)
 			}
 		case strings.HasPrefix(rest, "/*"):
-			if i := strings.Index(rest[2:], "*/"); i >= 0 {
+			i := strings.Index(rest[2:], "*/")
+			switch {
+			case i < 0:
+				p.fail(fmt.Errorf("line %d: unfinished multiline comment", p.line()))
+			case strings.Contains(rest[2:2+i], "/*") || strings.Contains(rest[2:2+i], `"`):
+				// libucl nests comments and reads a quote inside one as the
+				// start of a string that can hide the */.
+				p.fail(pkgUnmodeled{fmt.Sprintf("line %d: a comment holding /* or a quote, which libucl nests or reads as a string", p.line())})
+			default:
 				p.pos += i + 4
-			} else {
-				p.pos = len(p.src)
 			}
 		default:
 			return
 		}
 	}
+}
+
+// fail records the first lexical error and ends the input there.
+func (p *uclParser) fail(err error) {
+	if p.err == nil {
+		p.err = err
+	}
+	p.pos = len(p.src)
 }
 
 // sep passes the optional ':' or '=' between a key and its value.
@@ -726,7 +799,12 @@ func (p *uclParser) term() {
 
 func (p *uclParser) key() (string, error) {
 	if c := p.peek(); c == '"' || c == '\'' {
-		return p.quoted()
+		line := p.line()
+		k, escaped, err := p.quoted()
+		if err == nil && escaped {
+			err = pkgUnmodeled{fmt.Sprintf("line %d: the key %q holds an escape doctor does not decode", line, k)}
+		}
+		return k, err
 	}
 	start := p.pos
 	for !p.eof() && !strings.ContainsRune(" \t\r\n:={}[],;#\"'", rune(p.peek())) {
@@ -743,8 +821,8 @@ func (p *uclParser) key() (string, error) {
 func (p *uclParser) value() (uclScalar, error) {
 	switch c := p.peek(); c {
 	case '"', '\'':
-		s, err := p.quoted()
-		return uclScalar{s: s, kind: uclString}, err
+		s, escaped, err := p.quoted()
+		return uclScalar{s: s, kind: uclString, escaped: escaped}, err
 	case '{':
 		return uclScalar{kind: uclObjectKind}, p.nested()
 	case '[':
@@ -760,10 +838,18 @@ func (p *uclParser) value() (uclScalar, error) {
 		p.pos++
 	}
 	s := p.src[start:p.pos]
+	if s == "" {
+		p.fail(fmt.Errorf("line %d: string value must not be empty", p.line()))
+	}
 	return uclScalar{s: s, kind: bareKind(s)}, nil
 }
 
-func (p *uclParser) quoted() (string, error) {
+// quoted returns a quoted string and whether it held an escape. libucl
+// decodes escapes differently in the two quote styles and accepts ones it
+// does not define, measured with pkg 2.8.4, so a string holding one has a
+// value doctor does not claim to know. A double-quoted string may not hold a
+// control character, newline included; libucl rejects the file.
+func (p *uclParser) quoted() (s string, escaped bool, err error) {
 	q, start := p.peek(), p.line()
 	p.pos++
 	var b strings.Builder
@@ -772,23 +858,33 @@ func (p *uclParser) quoted() (string, error) {
 		p.pos++
 		switch {
 		case c == q:
-			return b.String(), nil
+			return b.String(), escaped, nil
 		case c == '\\' && !p.eof():
+			escaped = true
 			b.WriteByte(p.src[p.pos])
 			p.pos++
+		case c < 0x20 && q == '"':
+			return "", false, fmt.Errorf("line %d: control character %#02x in a string", p.line(), c)
+		case c < 0x20 && c != '\n':
+			escaped = true
+			b.WriteByte(c)
 		default:
 			b.WriteByte(c)
 		}
 	}
-	return "", fmt.Errorf("line %d: string is not closed", start)
+	return "", false, fmt.Errorf("line %d: string is not closed", start)
 }
 
 func (p *uclParser) nested() error {
 	start, depth := p.line(), 0
 	for !p.eof() {
+		rest := p.src[p.pos:]
+		if rest[0] == '#' || strings.HasPrefix(rest, "//") || strings.HasPrefix(rest, "/*") {
+			return pkgUnmodeled{fmt.Sprintf("line %d: a comment or // inside a nested value, which doctor does not skip", p.line())}
+		}
 		switch p.peek() {
 		case '"', '\'':
-			if _, err := p.quoted(); err != nil {
+			if _, _, err := p.quoted(); err != nil {
 				return err
 			}
 			continue
@@ -875,6 +971,13 @@ func checkMakeConfLookup(root, goos string, lookup func(string) (string, bool)) 
 		f.Status = StatusWarn
 		f.Detail = "the environment's MAKEFLAGS assigns __MAKE_CONF, so doctor cannot establish which make.conf make reads"
 		f.Remediation = "remove __MAKE_CONF from MAKEFLAGS and run doctor again"
+		return f
+	case slices.ContainsFunc(flags.defines, func(d string) bool { n, _, _ := strings.Cut(d, "="); return n == "__MAKE_CONF" }):
+		// -D sets a global of 1 that sys.mk's ?= keeps, so make reads a file
+		// named 1 in its working directory, or the environment's under -e.
+		f.Status = StatusWarn
+		f.Detail = "the environment's MAKEFLAGS defines __MAKE_CONF with -D, which replaces the path sys.mk would read, so doctor cannot establish which make.conf make reads"
+		f.Remediation = "remove -D __MAKE_CONF from MAKEFLAGS and run doctor again"
 		return f
 	case path == "":
 		f.Status = StatusWarn
@@ -1001,11 +1104,17 @@ type makeWalk struct {
 	// envFirstWhy names what passed it.
 	envFirst    int
 	envFirstWhy string
+	// envChanged says, per tracked variable, why the environment make
+	// consults may no longer hold what env recorded at the start.
+	envChanged map[string]string
 }
 
 // fromEnv is a tracked variable with no makefile value: the environment's,
 // or unset.
 func (w *makeWalk) fromEnv(n string) siteValue {
+	if why, ok := w.envChanged[n]; ok {
+		return siteValue{unknown: why}
+	}
 	if v, ok := w.env[n]; ok {
 		return siteValue{val: v, from: "the environment", set: true, env: true}
 	}
@@ -1119,7 +1228,9 @@ func (w *makeWalk) file(path string, stmts []string, unknown bool, stack []strin
 				}
 			case "undef":
 				w.undef(arg, path, active == -1)
-			case "export", "export-env", "export-literal", "unexport", "unexport-env", "info", "warning", "error":
+			case "export", "export-env", "export-literal", "unexport", "unexport-env":
+				w.export(dir, arg, path)
+			case "info", "warning", "error":
 			default:
 				w.touch(st, "."+dir+" in "+path+" is a directive doctor does not evaluate")
 			}
@@ -1232,6 +1343,34 @@ func (w *makeWalk) undef(arg, path string, unknown bool) {
 			continue
 		}
 		*v = w.fromEnv(n)
+	}
+}
+
+// export applies an export-family directive, read or maybe read. Each one
+// changes the process environment while make reads makefiles: .unexport-env
+// clears it, .export-env and .export-literal write a value that later
+// assignments do not follow, and .export writes one they do. A recipe under
+// -e, and any lookup a makefile value no longer shadows, reads that
+// environment rather than the one doctor started with, measured with bmake on
+// 15.1. doctor does not replay the changes; every variable the directive can
+// reach has an environment value it no longer knows.
+func (w *makeWalk) export(dir, arg, path string) {
+	why := "." + strings.TrimSpace(dir+" "+arg) + " in " + path + " changes the environment make reads"
+	names := strings.Fields(arg)
+	all := dir == "unexport-env" || len(names) == 0 || strings.Contains(arg, "$")
+	if w.envChanged == nil {
+		w.envChanged = map[string]string{}
+	}
+	for n, v := range w.sites {
+		if !all && !slices.Contains(names, n) {
+			continue
+		}
+		if _, ok := w.envChanged[n]; !ok {
+			w.envChanged[n] = why
+		}
+		if v.env {
+			v.undetermined(why)
+		}
 	}
 }
 
@@ -1411,8 +1550,15 @@ func (w *makeWalk) applyFlags(fl makeFlags, from string, unknown bool) {
 // that decides where fetch goes, so the environment's is the one checked.
 func (w *makeWalk) settleEnv() {
 	for n, v := range w.sites {
+		if v.pinned != "" || w.envFirst == 0 {
+			continue
+		}
+		if why, ok := w.envChanged[n]; ok {
+			v.pin(why + ", and " + w.envFirstWhy + ", which would put the environment above make.conf")
+			continue
+		}
 		ev, ok := w.env[n]
-		if !ok || v.pinned != "" {
+		if !ok {
 			continue
 		}
 		switch w.envFirst {
