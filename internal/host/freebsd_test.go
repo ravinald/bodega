@@ -696,7 +696,13 @@ func TestPkgAcceptMatchesPkg(t *testing.T) {
 		{"a url that is a number is rejected", []string{upstream, "FreeBSD: { enabled: no, url: 5 }\n" + bodegaRepo}, StatusWarn, []string{"url must be a string, not an integer"}},
 		{"a quoted rwhich_database is rejected", []string{upstream, "FreeBSD: { enabled: no, rwhich_database: \"yes\" }\n" + bodegaRepo}, StatusWarn, []string{"rwhich_database must be a boolean"}},
 		{"an env that is not an object is rejected", []string{upstream, "FreeBSD: { enabled: no, env: \"x\" }\n" + bodegaRepo}, StatusWarn, []string{"env must be an object"}},
-		{"an unknown signature_type is rejected", []string{upstream, "FreeBSD: { enabled: no, signature_type: \"bogus\" }\n" + bodegaRepo}, StatusWarn, []string{"signature_type bogus is not"}},
+		{"an unknown signature_type is rejected", []string{upstream, "FreeBSD: { enabled: no, signature_type: \"bogus\" }\n" + bodegaRepo}, StatusWarn, []string{`signature_type "bogus" is not`}},
+		{"an empty signature_type is rejected, not read as absent", []string{upstream, "FreeBSD: { enabled: no, signature_type: \"\" }\n" + bodegaRepo}, StatusWarn, []string{"FreeBSD (", `signature_type "" is not`}},
+		{"a signature_type with a leading space is rejected", []string{upstream, "FreeBSD: { enabled: no, signature_type: \" none\" }\n" + bodegaRepo}, StatusWarn, []string{"FreeBSD ("}},
+		{"a sole bodega object with an empty signature_type creates nothing", []string{"bodega: { url: \"https://b/freebsd/x/latest\", signature_type: \"\" }\n"}, StatusWarn, []string{"no enabled repository points at a bodega", "pkg rejects and ignores bodega"}},
+		{"an absent signature_type applies the override", []string{upstream, "FreeBSD: { enabled: no }\n" + bodegaRepo}, StatusOK, nil},
+		{"signature_type none applies the override", []string{upstream, "FreeBSD: { enabled: no, signature_type: \"none\" }\n" + bodegaRepo}, StatusOK, nil},
+		{"signature_type NONE applies the override", []string{upstream, "FreeBSD: { enabled: no, signature_type: \"NONE\" }\n" + bodegaRepo}, StatusOK, nil},
 		{"a disable with no url on a new name creates nothing", []string{"FreeBSD: { enabled: no }\n", upstream + bodegaRepo}, StatusWarn, []string{"FreeBSD ("}},
 		{"enabled carries over to a later object that leaves it unset", []string{"FreeBSD: { url: \"https://pkg.FreeBSD.org/x\", enabled: no }\n", "FreeBSD: { url: \"https://pkg.FreeBSD.org/y\" }\n" + bodegaRepo}, StatusOK, nil},
 		{"the first object of a name in one file wins", []string{bodegaRepo + "bodega: { enabled: no }\n"}, StatusOK, nil},
@@ -884,4 +890,159 @@ func TestPkgScalarAndObjectOfOneName(t *testing.T) {
 		"/usr/local/etc/pkg/repos/bodega.conf": "FreeBSD = \"x\";\nFreeBSD: { url: \"https://pkg.FreeBSD.org/x\" }\nbodega: { url: \"https://b/freebsd/x/latest\" }\n",
 	})
 	assertFinding(t, checkPkgRepos(root, "freebsd"), StatusWarn, "both a scalar and an object", "cannot establish")
+}
+
+// pkg tests each override variable for presence, so one set and empty
+// replaces the default like any other value: with REPOS_DIR empty, pkg 2.8.4
+// on 15.1 lists no repositories at all.
+func TestPkgConfOverrideSetEmpty(t *testing.T) {
+	root := writeTree(t, map[string]string{"/usr/local/etc/pkg/repos/bodega.conf": bodegaRepos15})
+	lookup := func(k string) (string, bool) { return "", k == "REPOS_DIR" }
+	assertFinding(t, checkPkgReposLookup(root, "freebsd", lookup), StatusWarn, `the environment sets REPOS_DIR=""`, "cannot establish")
+}
+
+// Where make on 15.1 takes each value from when flags, the environment and
+// inputs doctor does not read decide precedence rather than the value
+// written. Every expectation was measured with a recipe that echoes the
+// expanded site, which is what fetch uses: make -V prints the makefile's
+// value even under -e.
+func TestMakeConfPrecedence(t *testing.T) {
+	check := "BODEGA_DISTFILES_ENV=abc\n"
+	rendered := clientconf.MakeConf("https://b").Content
+	assigned := strings.ReplaceAll(rendered, "?=", "=")
+	site := "https://b/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/"
+	mirrors := map[string]string{"MASTER_SITE_OVERRIDE": "https://mirror.example/", "MASTER_SITE_BACKUP": "https://mirror.example/"}
+	with := func(m map[string]string, kv ...string) map[string]string {
+		out := maps.Clone(m)
+		if out == nil {
+			out = map[string]string{}
+		}
+		for i := 0; i < len(kv); i += 2 {
+			out[kv[i]] = kv[i+1]
+		}
+		return out
+	}
+	for _, tc := range []struct {
+		name, conf string
+		files      map[string]string
+		env        map[string]string
+		want       Status
+		detail     []string
+	}{
+		// -e from the environment, in each form bmake reads it.
+		{"MAKEFLAGS=-e puts the environment's sites above =", assigned, nil, with(mirrors, "MAKEFLAGS", "-e"), StatusWarn,
+			[]string{"MASTER_SITE_OVERRIDE=https://mirror.example/ (set in the environment, above make.conf because the environment's MAKEFLAGS passes -e)", "MASTER_SITE_BACKUP=https://mirror.example/"}},
+		{"a bare first word in MAKEFLAGS is flags", assigned, nil, with(mirrors, "MAKEFLAGS", "e"), StatusWarn, []string{"passes -e"}},
+		{"-e inside a cluster", assigned, nil, with(mirrors, "MAKEFLAGS", "-j 4 -ke"), StatusWarn, []string{"passes -e"}},
+		{"MAKEFLAGS without -e leaves = above the environment", assigned, nil, with(mirrors, "MAKEFLAGS", "-j 4 -k"), StatusOK, nil},
+		{"-e with no site in the environment", assigned, nil, map[string]string{"MAKEFLAGS": "-e"}, StatusOK, nil},
+		{"-e with bodega's sites in the environment", assigned, nil, with(nil, "MAKEFLAGS", "-e", "MASTER_SITE_OVERRIDE", site, "MASTER_SITE_BACKUP", site), StatusOK, nil},
+		{"-e takes BODEGA_DISTFILES_ENV from the environment", assigned, nil, with(nil, "MAKEFLAGS", "-e", distfilesEnvVar, "abc"), StatusWarn, []string{"its value comes from the environment"}},
+		// -e from make.conf, which applies to every recipe however late it
+		// is read.
+		{".MAKEFLAGS: -e in make.conf", ".MAKEFLAGS: -e\n" + assigned, nil, mirrors, StatusWarn, []string{"above make.conf because .MAKEFLAGS in /etc/make.conf passes -e"}},
+		{".MFLAGS: -e in the final include", assigned, map[string]string{clientconf.DistfilesCheckPath: check + ".MFLAGS: -e\n"}, mirrors, StatusWarn, []string{"passes -e"}},
+		{".MAKEFLAGS: -e under a condition doctor does not evaluate", ".if defined(X)\n.MAKEFLAGS: -e\n.endif\n" + assigned, nil, mirrors, StatusWarn,
+			[]string{"MASTER_SITE_OVERRIDE cannot be established: the environment sets it, and .MAKEFLAGS in /etc/make.conf may pass -e"}},
+		{".MAKEFLAGS: -e under .if 0", ".if 0\n.MAKEFLAGS: -e\n.endif\n" + assigned, nil, mirrors, StatusOK, nil},
+		// Other flags and words.
+		{"a flag doctor does not model", assigned, nil, map[string]string{"MAKEFLAGS": "-I /tmp/mk"}, StatusWarn, []string{"the environment's MAKEFLAGS passes -I, which doctor does not model"}},
+		{"a target in .MAKEFLAGS", ".MAKEFLAGS: all\n" + assigned, nil, nil, StatusWarn, []string{"passes all, which doctor does not model"}},
+		{".MAKEFLAGS alongside another target", ".MAKEFLAGS .PHONY: -e\n" + assigned, nil, nil, StatusWarn, []string{"passes make flags on .MAKEFLAGS .PHONY: -e"}},
+		{"-D is a global ?= keeps", rendered, nil, map[string]string{"MAKEFLAGS": "-D MASTER_SITE_OVERRIDE"}, StatusWarn, []string{"MASTER_SITE_OVERRIDE=1 (set in -D in the environment's MAKEFLAGS)"}},
+		{"-D is a global = replaces", assigned, nil, map[string]string{"MAKEFLAGS": "-DMASTER_SITE_OVERRIDE"}, StatusOK, nil},
+		{"-D beats the environment", rendered, nil, with(nil, "MAKEFLAGS", "-DDIST_SUBDIR", "DIST_SUBDIR", ""), StatusWarn, []string{"DIST_SUBDIR=1 is set in -D in the environment's MAKEFLAGS"}},
+		{"a command-line assignment in .MAKEFLAGS", ".MAKEFLAGS: MASTER_SITE_BACKUP=https://mirror.example/\n" + assigned, nil, nil, StatusWarn,
+			[]string{"MASTER_SITE_BACKUP cannot be established: .MAKEFLAGS in /etc/make.conf names it"}},
+		{"a command-line assignment after --", assigned, nil, map[string]string{"MAKEFLAGS": "-- MASTER_SITE_BACKUP=https://mirror.example/"}, StatusWarn, []string{"MASTER_SITE_BACKUP cannot be established"}},
+		{"MAKEFLAGS assigns __MAKE_CONF", rendered, nil, map[string]string{"MAKEFLAGS": "__MAKE_CONF=/tmp/other.conf"}, StatusWarn, []string{"cannot establish which make.conf"}},
+		// Absent and empty are different to make.
+		{"?= keeps an empty site from the environment", rendered, nil, map[string]string{"MASTER_SITE_OVERRIDE": ""}, StatusWarn, []string{"MASTER_SITE_OVERRIDE= (set in the environment)"}},
+		{"= replaces an empty site from the environment", assigned, nil, map[string]string{"MASTER_SITE_OVERRIDE": ""}, StatusOK, nil},
+		{"__MAKE_CONF set and empty", rendered, nil, map[string]string{"__MAKE_CONF": ""}, StatusWarn, []string{"__MAKE_CONF is set and empty"}},
+		{"__MAKE_CONF relative", rendered, nil, map[string]string{"__MAKE_CONF": "make.conf"}, StatusWarn, []string{"is relative"}},
+		// .undef removes a makefile value, not the environment's.
+		{".undef leaves the environment's value", ".undef DIST_SUBDIR\n" + rendered, nil, map[string]string{"DIST_SUBDIR": "x"}, StatusWarn, []string{"DIST_SUBDIR=x is set in the environment"}},
+		{".undef of a name doctor does not expand", assigned + "", map[string]string{clientconf.DistfilesCheckPath: check + ".undef ${X}\n"}, nil, StatusWarn, []string{"MASTER_SITE_OVERRIDE cannot be established: .undef ${X}"}},
+		{"a later = after an unexpanded .undef", ".undef ${X}\n" + assigned, nil, nil, StatusOK, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := with(tc.files, "/etc/make.conf", tc.conf)
+			if _, ok := files[clientconf.DistfilesCheckPath]; !ok {
+				files[clientconf.DistfilesCheckPath] = check
+			}
+			lookup := func(k string) (string, bool) { v, ok := tc.env[k]; return v, ok }
+			assertFinding(t, checkMakeConfLookup(writeTree(t, files), "freebsd", lookup), tc.want, tc.detail...)
+		})
+	}
+}
+
+// An input doctor did not read may have made a site read-only or a
+// command-line variable, so no assignment or .undef after it proves the
+// value make uses. An unknown branch holding only an ordinary assignment is
+// different: a later unconditional one replaces it.
+func TestMakeConfUnreadInputsPinSites(t *testing.T) {
+	check := map[string]string{clientconf.DistfilesCheckPath: "BODEGA_DISTFILES_ENV=abc\n"}
+	assigned := strings.ReplaceAll(clientconf.MakeConf("https://b").Content, "?=", "=")
+	for _, tc := range []struct {
+		name, conf string
+		files      map[string]string
+		want       Status
+		detail     []string
+	}{
+		{"an unresolved include, then safe assignments", "LOCALBASE=/usr/local\n.include \"${LOCALBASE}/etc/sites.mk\"\n" + assigned, nil, StatusWarn,
+			[]string{"MASTER_SITE_OVERRIDE cannot be established: /etc/make.conf includes ${LOCALBASE}/etc/sites.mk", "MASTER_SITE_BACKUP cannot be established"}},
+		{"an unresolved include, then .undef", ".include \"${LOCALBASE}/etc/sites.mk\"\n.undef MASTER_SITE_OVERRIDE MASTER_SITE_BACKUP DIST_SUBDIR\n" + assigned, nil, StatusWarn,
+			[]string{"MASTER_SITE_OVERRIDE cannot be established", "MASTER_SITE_BACKUP cannot be established"}},
+		{"a self-include, then safe assignments", ".include \"/etc/make.conf\"\n" + assigned, nil, StatusWarn, []string{"MASTER_SITE_OVERRIDE cannot be established: /etc/make.conf includes /etc/make.conf, which is already being read"}},
+		{".READONLY of a name doctor does not expand", "MASTER_SITE_OVERRIDE=https://mirror.example/\n.READONLY: ${X}\n" + assigned, nil, StatusWarn, []string{".READONLY in /etc/make.conf names variables doctor does not expand"}},
+		{".READONLY under an unknown branch, then =", "MASTER_SITE_OVERRIDE=https://mirror.example/\n.if defined(X)\n.READONLY: MASTER_SITE_OVERRIDE\n.endif\n" + assigned, nil, StatusWarn, []string{"MASTER_SITE_OVERRIDE cannot be established"}},
+		{".NOREADONLY under an unknown branch, then =", strings.Replace(clientconf.MakeConf("https://b").Content, ".include", ".READONLY: MASTER_SITE_OVERRIDE\n.if defined(X)\n.NOREADONLY:\n.endif\nMASTER_SITE_OVERRIDE=https://mirror.example/\n.include", 1), nil, StatusWarn,
+			[]string{"MASTER_SITE_OVERRIDE cannot be established: .NOREADONLY under a conditional"}},
+		{"a known .NOREADONLY, then =", "MASTER_SITE_OVERRIDE=https://mirror.example/\n.READONLY: MASTER_SITE_OVERRIDE\n.NOREADONLY: MASTER_SITE_OVERRIDE\n" + assigned, nil, StatusOK, nil},
+		{"an unknown branch with an ordinary assignment, then =", ".if defined(X)\nMASTER_SITE_OVERRIDE=https://mirror.example/\n.endif\n" + assigned, nil, StatusOK, nil},
+		{"an include doctor reads, then =", ".include \"/etc/sites.mk\"\n" + assigned, map[string]string{"/etc/sites.mk": "MASTER_SITE_OVERRIDE=https://mirror.example/\n"}, StatusOK, nil},
+		{"an include doctor reads that pins, then =", ".include \"/etc/sites.mk\"\n" + assigned, map[string]string{"/etc/sites.mk": "MASTER_SITE_OVERRIDE=https://mirror.example/\n.READONLY: MASTER_SITE_OVERRIDE\n"}, StatusWarn,
+			[]string{"MASTER_SITE_OVERRIDE=https://mirror.example/ (set in /etc/sites.mk) does not end every site"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := maps.Clone(check)
+			maps.Copy(files, tc.files)
+			files["/etc/make.conf"] = tc.conf
+			assertFinding(t, checkMakeConf(writeTree(t, files), "freebsd", func(string) string { return "" }), tc.want, tc.detail...)
+		})
+	}
+}
+
+// Whether BODEGA_DISTFILES_ENV came from the client check is a property of
+// the whole subtree the last include of make.conf reads, and returning from
+// a child include inside it leaves the check's own later lines final.
+func TestMakeConfFinalIncludeProvenance(t *testing.T) {
+	conf := clientconf.MakeConf("https://b").Content
+	for _, tc := range []struct {
+		name  string
+		files map[string]string
+		want  Status
+		// detail is what the finding names; for WARN, why.
+		detail []string
+	}{
+		{"defined by a child of the check", map[string]string{clientconf.DistfilesCheckPath: ".include \"/usr/local/etc/env.mk\"\n", "/usr/local/etc/env.mk": "BODEGA_DISTFILES_ENV=abc\n"}, StatusOK, nil},
+		{"defined after an unrelated child", map[string]string{clientconf.DistfilesCheckPath: ".include \"/usr/local/etc/helper.mk\"\nBODEGA_DISTFILES_ENV=abc\n", "/usr/local/etc/helper.mk": "HELPER=1\n"}, StatusOK, nil},
+		{"defined between two unrelated children", map[string]string{clientconf.DistfilesCheckPath: ".include \"/usr/local/etc/helper.mk\"\nBODEGA_DISTFILES_ENV=abc\n.include \"/usr/local/etc/helper.mk\"\n", "/usr/local/etc/helper.mk": "HELPER=1\n"}, StatusOK, nil},
+		{"a child definition under .if 0", map[string]string{clientconf.DistfilesCheckPath: ".include \"/usr/local/etc/env.mk\"\n", "/usr/local/etc/env.mk": ".if 0\nBODEGA_DISTFILES_ENV=abc\n.endif\n"}, StatusWarn, []string{"does not define BODEGA_DISTFILES_ENV on any line make reads"}},
+		{"a child definition the check then removes", map[string]string{clientconf.DistfilesCheckPath: ".include \"/usr/local/etc/env.mk\"\n.undef BODEGA_DISTFILES_ENV\n", "/usr/local/etc/env.mk": "BODEGA_DISTFILES_ENV=abc\n"}, StatusWarn, []string{"does not define BODEGA_DISTFILES_ENV"}},
+		{"defined by an earlier include of make.conf", map[string]string{
+			"/etc/make.conf":              ".include \"/usr/local/etc/env.mk\"\n" + conf,
+			"/usr/local/etc/env.mk":       "BODEGA_DISTFILES_ENV=abc\n",
+			clientconf.DistfilesCheckPath: "HELPER=1\n",
+		}, StatusWarn, []string{"its value comes from /usr/local/etc/env.mk"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := maps.Clone(tc.files)
+			if _, ok := files["/etc/make.conf"]; !ok {
+				files["/etc/make.conf"] = conf
+			}
+			assertFinding(t, checkMakeConf(writeTree(t, files), "freebsd", func(string) string { return "" }), tc.want, tc.detail...)
+		})
+	}
 }

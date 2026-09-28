@@ -77,13 +77,26 @@ func pkgURLHost(raw string) string {
 
 // CheckPkgRepos reports whether pkg on this FreeBSD host can fetch from
 // FreeBSD's own repositories, and whether it reads a bodega one at all.
-func CheckPkgRepos() Finding { return checkPkgReposEnv("", runtime.GOOS, os.Getenv) }
+func CheckPkgRepos() Finding { return checkPkgReposLookup("", runtime.GOOS, os.LookupEnv) }
 
 func checkPkgRepos(root, goos string) Finding {
 	return checkPkgReposEnv(root, goos, func(string) string { return "" })
 }
 
 func checkPkgReposEnv(root, goos string, getenv func(string) string) Finding {
+	return checkPkgReposLookup(root, goos, nonEmpty(getenv))
+}
+
+// nonEmpty adapts a getenv that cannot tell an unset variable from an empty
+// one, treating empty as unset.
+func nonEmpty(getenv func(string) string) func(string) (string, bool) {
+	return func(k string) (string, bool) {
+		v := getenv(k)
+		return v, v != ""
+	}
+}
+
+func checkPkgReposLookup(root, goos string, lookup func(string) (string, bool)) Finding {
 	f := Finding{Check: "pkg-repos"}
 	if goos != "freebsd" {
 		f.Status = StatusNA
@@ -91,7 +104,7 @@ func checkPkgReposEnv(root, goos string, getenv func(string) string) Finding {
 		return f
 	}
 	remediation := "bodega doctor --write-pkg-repo --url <bodega> writes " + pkgrepos.ClientConfPath + " with the bodega repository and the overrides that disable upstream; confirm with pkg -vv"
-	repos, rejected, err := loadPkgRepos(root, getenv)
+	repos, rejected, err := loadPkgRepos(root, lookup)
 	var unmodeled pkgUnmodeled
 	if errors.As(err, &unmodeled) {
 		f.Status = StatusWarn
@@ -201,8 +214,8 @@ var pkgConfOverrides = []string{"REPOS_DIR", "REPOSITORIES", "PKG_DBDIR"}
 // nothing to read; an unreadable or unparseable file is an error, because
 // the repositories in it are exactly the ones in question. rejected names
 // each object pkg refuses, for the detail.
-func loadPkgRepos(root string, getenv func(string) string) (repos []pkgRepo, rejected []string, err error) {
-	if err := pkgConfDefaults(root, getenv); err != nil {
+func loadPkgRepos(root string, lookup func(string) (string, bool)) (repos []pkgRepo, rejected []string, err error) {
+	if err := pkgConfDefaults(root, lookup); err != nil {
 		return nil, nil, err
 	}
 	byName := map[string]*pkgRepo{}
@@ -292,11 +305,12 @@ func pkgConfigFile(name string) bool {
 // pkgConfDefaults returns an error unless pkg reads its default REPOS_DIR,
 // defines no repository in pkg.conf, and keeps repos_state at its default
 // path. pkg upper-cases pkg.conf keys before matching them, and lets an
-// environment variable of the same name replace each.
-func pkgConfDefaults(root string, getenv func(string) string) error {
+// environment variable of the same name replace each, empty included: pkg
+// tests getenv for NULL, not for an empty string.
+func pkgConfDefaults(root string, lookup func(string) (string, bool)) error {
 	for _, k := range pkgConfOverrides {
-		if v := getenv(k); v != "" {
-			return pkgUnmodeled{"the environment sets " + k + "=" + v + ", which pkg reads in place of its default"}
+		if v, ok := lookup(k); ok {
+			return pkgUnmodeled{fmt.Sprintf("the environment sets %s=%q, which pkg reads in place of its default", k, v)}
 		}
 	}
 	objs, err := readUCLFile(root, pkgConfPath, nil)
@@ -375,7 +389,9 @@ var pkgRepoKeyKinds = map[string]uclKind{
 // applies the object.
 func (o uclObject) accept(exists bool) (uclAccepted, error) {
 	var a uclAccepted
-	var sigType string
+	// sigType is nil when the object sets no signature_type: pkg checks
+	// presence, and rejects a present empty string like any other value.
+	var sigType *string
 	for _, kv := range o.keys {
 		k := strings.ToLower(kv.key)
 		if k == "enabled" {
@@ -399,14 +415,15 @@ func (o uclObject) accept(exists bool) (uclAccepted, error) {
 			u := kv.val.s
 			a.url = &u
 		case "signature_type":
-			sigType = kv.val.s
+			st := kv.val.s
+			sigType = &st
 		}
 	}
 	if !exists && a.url == nil {
 		return a, nil
 	}
-	if sigType != "" && !slices.ContainsFunc([]string{"pubkey", "fingerprints", "none"}, func(s string) bool { return strings.EqualFold(s, sigType) }) {
-		a.rejected = "signature_type " + sigType + " is not pubkey, fingerprints or none"
+	if sigType != nil && !slices.ContainsFunc([]string{"pubkey", "fingerprints", "none"}, func(s string) bool { return strings.EqualFold(s, *sigType) }) {
+		a.rejected = fmt.Sprintf("signature_type %q is not pubkey, fingerprints or none", *sigType)
 		return a, nil
 	}
 	a.apply = true
@@ -824,24 +841,52 @@ var (
 
 // CheckMakeConf reports whether ports on this FreeBSD host fetch distfiles
 // through bodega, comparing make.conf with what clientconf.MakeConf renders.
-func CheckMakeConf() Finding { return checkMakeConf("", runtime.GOOS, os.Getenv) }
+func CheckMakeConf() Finding { return checkMakeConfLookup("", runtime.GOOS, os.LookupEnv) }
 
 func checkMakeConf(root, goos string, getenv func(string) string) Finding {
+	return checkMakeConfLookup(root, goos, nonEmpty(getenv))
+}
+
+func checkMakeConfLookup(root, goos string, lookup func(string) (string, bool)) Finding {
 	f := Finding{Check: "make-conf"}
 	if goos != "freebsd" {
 		f.Status = StatusNA
 		f.Detail = "make.conf is read by FreeBSD's ports framework; check not applicable on this platform"
 		return f
 	}
-	// sys.mk reads ${__MAKE_CONF} in place of /etc/make.conf when it is set,
-	// so the one it names is the only one make reads.
+	names, route := makeConfSites()
+	// make reads MAKEFLAGS from the environment before any makefile: its
+	// assignments are command-line variables, which beat every makefile
+	// assignment, and its flags hold for the whole run.
+	mfEnv, _ := lookup("MAKEFLAGS")
+	flags := parseMakeFlags(mfEnv, true)
+
+	// sys.mk assigns __MAKE_CONF?=/etc/make.conf and includes it only when it
+	// exists, so an environment value replaces the default, an empty one
+	// names no file, and a command-line one replaces both.
 	path, shown := "/etc/make.conf", "/etc/make.conf"
-	if env := getenv("__MAKE_CONF"); env != "" {
+	if env, ok := lookup("__MAKE_CONF"); ok {
 		path, shown = env, env+" (named by __MAKE_CONF)"
 	}
-	names, route := makeConfSites()
 	f.Remediation = "end " + shown + " with the FreeBSD ports lines under Client configuration in docs/usage.md: " +
 		strings.Join(names, " and ") + " set to <bodega>" + route + ", then .include of " + clientconf.DistfilesCheckPath
+	switch {
+	case slices.Contains(flags.assigns, "__MAKE_CONF"):
+		f.Status = StatusWarn
+		f.Detail = "the environment's MAKEFLAGS assigns __MAKE_CONF, so doctor cannot establish which make.conf make reads"
+		f.Remediation = "remove __MAKE_CONF from MAKEFLAGS and run doctor again"
+		return f
+	case path == "":
+		f.Status = StatusWarn
+		f.Detail = "__MAKE_CONF is set and empty, so make reads no make.conf and " + strings.Join(names, ", ") + " stay at the ports' own sites"
+		f.Remediation = "unset __MAKE_CONF, or point it at a make.conf; then " + f.Remediation
+		return f
+	case !filepath.IsAbs(path):
+		f.Status = StatusWarn
+		f.Detail = "__MAKE_CONF=" + path + " is relative, and make resolves it against whatever directory it runs in"
+		f.Remediation = "set __MAKE_CONF to an absolute path and run doctor again"
+		return f
+	}
 	data, err := os.ReadFile(filepath.Join(root, path))
 	if errors.Is(err, fs.ErrNotExist) {
 		f.Status = StatusWarn
@@ -855,20 +900,15 @@ func checkMakeConf(root, goos string, getenv func(string) string) Finding {
 		return f
 	}
 
-	w := &makeWalk{root: root, sites: map[string]*siteValue{}}
+	w := &makeWalk{root: root, sites: map[string]*siteValue{}, env: map[string]string{}}
 	for _, n := range append([]string{distfilesEnvVar, distSubdirVar}, names...) {
-		w.sites[n] = &siteValue{}
-		// make reads the environment as a scope below the file's own
-		// assignments: = replaces it, and ?= keeps it.
-		if v := getenv(n); v != "" {
-			w.sites[n] = &siteValue{val: v, from: "the environment", set: true, env: true}
+		if v, ok := lookup(n); ok {
+			w.env[n] = v
 		}
+		v := w.fromEnv(n)
+		w.sites[n] = &v
 	}
-	// Assignments in MAKEFLAGS are command-line variables, which beat every
-	// assignment in a makefile.
-	if mf := getenv("MAKEFLAGS"); mf != "" {
-		w.touch(mf, "the environment's MAKEFLAGS names it")
-	}
+	w.applyFlags(flags, "the environment's MAKEFLAGS", false)
 	stmts := makeStatements(string(data))
 	if err := w.file(path, stmts, false, nil); err != nil {
 		f.Status = StatusSkip
@@ -876,6 +916,7 @@ func checkMakeConf(root, goos string, getenv func(string) string) Finding {
 		f.Remediation = "run doctor as a user that can read " + path + " and every file it includes"
 		return f
 	}
+	w.settleEnv()
 
 	failed := append([]string(nil), w.problems...)
 	for _, n := range names {
@@ -884,8 +925,8 @@ func checkMakeConf(root, goos string, getenv func(string) string) Finding {
 		}
 	}
 	switch sub := w.sites[distSubdirVar]; {
-	case sub.unknown != "":
-		failed = append(failed, distSubdirVar+", which the route expands, may be set: "+sub.unknown)
+	case sub.why() != "":
+		failed = append(failed, distSubdirVar+", which the route expands, may be set: "+sub.why())
 	case sub.set:
 		failed = append(failed, distSubdirVar+"="+sub.val+" is set in "+sub.from+", and the route expands it for every port that does not set its own")
 	}
@@ -905,26 +946,39 @@ func checkMakeConf(root, goos string, getenv func(string) string) Finding {
 }
 
 // siteValue is what doctor knows of one tracked variable at a point in the
-// read. unknown, when set, says why the value cannot be established, and a
-// plain assignment later clears it; sticky keeps it, for a variable a line
-// doctor does not evaluate may have pinned. readonly is .READONLY, under
-// which make ignores every assignment and .undef, measured with bmake on
-// 15.1. env marks a value from the environment, and final one assigned while
-// reading the last include of make.conf.
+// read, with two kinds of uncertainty kept apart. unknown says why the value
+// cannot be established, and an assignment that later takes effect clears
+// it. pinned says why doctor cannot establish that a later assignment or
+// .undef takes effect at all: an input it did not read may have made the
+// variable read-only or a command-line variable. Nothing clears pinned.
+// readonly is a .READONLY doctor read, under which make ignores every
+// assignment and .undef, measured with bmake on 15.1. env marks a value from
+// the environment, and final one assigned while reading the last include of
+// make.conf or anything that include reads.
 type siteValue struct {
 	val, from string
 	set       bool
 	unknown   string
-	sticky    bool
+	pinned    string
 	readonly  bool
 	env       bool
 	final     bool
 }
 
-func (v *siteValue) undetermined(why string) {
-	if v.unknown == "" || !v.sticky {
-		v.unknown = why
+func (v *siteValue) undetermined(why string) { v.unknown = why }
+
+func (v *siteValue) pin(why string) {
+	if v.pinned == "" {
+		v.pinned = why
 	}
+}
+
+// why returns why the value cannot be established, or "".
+func (v *siteValue) why() string {
+	if v.pinned != "" {
+		return v.pinned
+	}
+	return v.unknown
 }
 
 // makeWalk follows make.conf the way make reads it: statement by statement,
@@ -934,12 +988,28 @@ func (v *siteValue) undetermined(why string) {
 // assignment to a site variable inside one leaves that variable undetermined
 // rather than taken or skipped.
 type makeWalk struct {
-	root     string
-	sites    map[string]*siteValue
+	root  string
+	sites map[string]*siteValue
+	// env holds the environment's value of each tracked variable it sets,
+	// empty included: make treats an empty one as defined.
+	env      map[string]string
 	problems []string
 	// final is set while reading the last include of make.conf and every
 	// file it includes.
 	final bool
+	// envFirst is whether make runs with -e: 1 yes, -1 maybe, 0 no.
+	// envFirstWhy names what passed it.
+	envFirst    int
+	envFirstWhy string
+}
+
+// fromEnv is a tracked variable with no makefile value: the environment's,
+// or unset.
+func (w *makeWalk) fromEnv(n string) siteValue {
+	if v, ok := w.env[n]; ok {
+		return siteValue{val: v, from: "the environment", set: true, env: true}
+	}
+	return siteValue{}
 }
 
 // makeIncludeDepth bounds include nesting, so a file including itself is
@@ -947,6 +1017,11 @@ type makeWalk struct {
 const makeIncludeDepth = 16
 
 var makeIntCond = regexp.MustCompile(`^\d+$`)
+
+var (
+	makeFlagsLine   = regexp.MustCompile(`^\.(MAKEFLAGS|MFLAGS)\s*:(.*)$`)
+	makeFlagsTarget = regexp.MustCompile(`(^|\s)\.(MAKEFLAGS|MFLAGS)(\s|:|$)`)
+)
 
 // condFrame is one open .if or .for. state is the branch being read: 1 taken,
 // 0 skipped, -1 unknown. seen records whether an earlier branch was taken
@@ -1032,23 +1107,18 @@ func (w *makeWalk) file(path string, stmts []string, unknown bool, stack []strin
 			switch dir {
 			case "include", "sinclude", "-include", "dinclude":
 				// checkInclude reports the final include of make.conf itself.
+				// Everything read beneath it is final too, and the flag is the
+				// parent's again once the include returns.
 				final := len(stack) == 1 && i == len(stmts)-1
-				w.final = final
+				parent := w.final
+				w.final = parent || final
 				err := w.include(path, dir, arg, active == -1, !final, stack)
-				w.final = w.final && !final
+				w.final = parent
 				if err != nil {
 					return err
 				}
 			case "undef":
-				for _, n := range strings.Fields(arg) {
-					if v := w.sites[n]; v != nil && !v.readonly {
-						if active == -1 {
-							v.undetermined(".undef under a conditional doctor does not evaluate in " + path)
-						} else if v.unknown == "" || !v.sticky {
-							*v = siteValue{}
-						}
-					}
-				}
+				w.undef(arg, path, active == -1)
 			case "export", "export-env", "export-literal", "unexport", "unexport-env", "info", "warning", "error":
 			default:
 				w.touch(st, "."+dir+" in "+path+" is a directive doctor does not evaluate")
@@ -1065,59 +1135,29 @@ func (w *makeWalk) file(path string, stmts []string, unknown bool, stack []strin
 		}
 		m := makeAssign.FindStringSubmatch(st)
 		if m == nil {
-			// A dependency line: .READONLY, .MAKEFLAGS and .NOREADONLY can pin
-			// or release a variable for every line after them.
-			w.touch(st, "a line in "+path+" doctor does not evaluate names it: "+st)
+			switch mf := makeFlagsLine.FindStringSubmatch(st); {
+			case mf != nil:
+				w.applyFlags(parseMakeFlags(mf[2], false), "."+mf[1]+" in "+path, active == -1)
+			case makeFlagsTarget.MatchString(st):
+				w.pinAll(path + " passes make flags on " + st + ", which doctor does not read")
+			default:
+				// A dependency line: .READONLY, .MAKEFLAGS and .NOREADONLY can
+				// pin or release a variable for every line after them.
+				w.touch(st, "a line in "+path+" doctor does not evaluate names it: "+st)
+			}
 			continue
 		}
 		name, op, val := m[1], m[2], m[3]
 		if strings.Contains(name, "$") {
 			for _, v := range w.sites {
-				v.undetermined(path + " assigns the computed name " + name + ", which doctor does not expand")
+				if !v.readonly {
+					v.undetermined(path + " assigns the computed name " + name + ", which doctor does not expand")
+				}
 			}
 			continue
 		}
-		v := w.sites[name]
-		if v == nil {
-			continue
-		}
-		if v.sticky || v.readonly {
-			continue
-		}
-		if active == -1 {
-			v.undetermined("assigned under a conditional or loop doctor does not evaluate in " + path)
-			continue
-		}
-		switch op {
-		case "?=":
-			if v.unknown != "" {
-				continue
-			}
-			if !v.set {
-				*v = siteValue{val: val, from: path, set: true, final: w.final}
-			}
-		case "+=":
-			if v.unknown != "" {
-				continue
-			}
-			if v.env {
-				v.undetermined(path + " appends to a value from the environment")
-				continue
-			}
-			if v.set {
-				val = v.val + " " + val
-			}
-			*v = siteValue{val: val, from: path, set: true, final: w.final}
-		case "!=":
-			v.undetermined("set in " + path + " from a shell command doctor does not run")
-		case ":=", "::=":
-			if strings.Contains(val, "$") {
-				v.undetermined("set in " + path + " with :=, which expands variables doctor does not")
-				continue
-			}
-			*v = siteValue{val: val, from: path, set: true, final: w.final}
-		default:
-			*v = siteValue{val: val, from: path, set: true, final: w.final}
+		if v := w.sites[name]; v != nil {
+			w.assign(v, op, val, path, active == -1)
 		}
 	}
 	if len(frames) > 0 {
@@ -1126,14 +1166,97 @@ func (w *makeWalk) file(path string, stmts []string, unknown bool, stack []strin
 	return nil
 }
 
+// assign applies one assignment to a tracked variable. from names where it
+// was made; unknown is whether make may not have read it.
+func (w *makeWalk) assign(v *siteValue, op, val, from string, unknown bool) {
+	if v.pinned != "" || v.readonly {
+		return
+	}
+	if unknown {
+		v.undetermined("assigned under a conditional or loop doctor does not evaluate in " + from)
+		return
+	}
+	switch op {
+	case "?=":
+		if v.unknown != "" {
+			return
+		}
+		if !v.set {
+			*v = siteValue{val: val, from: from, set: true, final: w.final}
+		}
+	case "+=":
+		if v.unknown != "" {
+			return
+		}
+		if v.env {
+			v.undetermined(from + " appends to a value from the environment")
+			return
+		}
+		if v.set {
+			val = v.val + " " + val
+		}
+		*v = siteValue{val: val, from: from, set: true, final: w.final}
+	case "!=":
+		v.undetermined("set in " + from + " from a shell command doctor does not run")
+	case ":=", "::=":
+		if strings.Contains(val, "$") {
+			v.undetermined("set in " + from + " with :=, which expands variables doctor does not")
+			return
+		}
+		*v = siteValue{val: val, from: from, set: true, final: w.final}
+	default:
+		*v = siteValue{val: val, from: from, set: true, final: w.final}
+	}
+}
+
+// undef applies .undef. It removes a makefile's value and leaves the
+// environment's visible, measured with bmake on 15.1, and bmake expands its
+// argument, so a name doctor cannot expand may have removed any makefile
+// value.
+func (w *makeWalk) undef(arg, path string, unknown bool) {
+	if strings.Contains(arg, "$") {
+		for _, v := range w.sites {
+			if v.set && !v.env && !v.readonly {
+				v.undetermined(".undef " + arg + " in " + path + " names variables doctor does not expand")
+			}
+		}
+		return
+	}
+	for _, n := range strings.Fields(arg) {
+		v := w.sites[n]
+		if v == nil || v.pinned != "" || v.readonly {
+			continue
+		}
+		if unknown {
+			v.undetermined(".undef under a conditional doctor does not evaluate in " + path)
+			continue
+		}
+		*v = w.fromEnv(n)
+	}
+}
+
 // readonly applies a .READONLY or .NOREADONLY line (on is which) to the
 // tracked variables it names. Measured with bmake on 15.1, .READONLY with
-// no sources pins nothing. Under a conditional doctor does not evaluate,
-// either may or may not have happened, so the variables it names are
-// undetermined for the rest of the read.
+// no sources pins nothing and .NOREADONLY with none releases everything.
+// Under a conditional doctor does not evaluate, either may or may not have
+// happened, so whether a later assignment takes effect is unknown for every
+// variable it could have changed.
 func (w *makeWalk) readonly(line, path string, on bool, names []string, unknown bool) {
+	directive := map[bool]string{true: ".READONLY", false: ".NOREADONLY"}[on]
+	if slices.ContainsFunc(names, func(n string) bool { return strings.Contains(n, "$") }) {
+		w.pinAll(directive + " in " + path + " names variables doctor does not expand")
+		return
+	}
 	if unknown {
-		w.touch(line, "."+map[bool]string{true: "READONLY", false: "NOREADONLY"}[on]+" under a conditional doctor does not evaluate in "+path)
+		if !on && len(names) == 0 {
+			for _, v := range w.sites {
+				if v.readonly {
+					v.pin(directive + " under a conditional doctor does not evaluate in " + path)
+				}
+			}
+			return
+		}
+		w.touch(line, directive+" under a conditional doctor does not evaluate in "+path)
 		return
 	}
 	if !on && len(names) == 0 {
@@ -1148,44 +1271,178 @@ func (w *makeWalk) readonly(line, path string, on bool, names []string, unknown 
 	}
 }
 
-// touch marks every site variable a line names as undetermined for the rest
-// of the read: a line doctor does not evaluate may have pinned it.
+// touch pins every site variable a line names: a line doctor does not
+// evaluate may have assigned it, made it read-only or made it a command-line
+// variable.
 func (w *makeWalk) touch(line, why string) {
 	words := strings.FieldsFunc(line, func(r rune) bool {
 		return !(r == '_' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9')
 	})
 	for n, v := range w.sites {
 		if slices.Contains(words, n) {
-			v.undetermined(why)
-			v.sticky = true
+			v.pin(why)
 		}
 	}
 }
 
-// include follows one include directive. A path doctor cannot resolve
-// leaves every site variable undetermined, since the file could assign any
-// of them. A missing file is a problem for .include, which make treats as
-// fatal, and nothing for the soft forms or a branch make may not take.
+// pinAll pins every site variable, for an input doctor did not read that
+// could have done anything to any of them.
+func (w *makeWalk) pinAll(why string) {
+	for _, v := range w.sites {
+		v.pin(why)
+	}
+}
+
+// makeFlags is what one MAKEFLAGS value or .MAKEFLAGS line passes make, in
+// the subset doctor models. unmodeled names the first word or flag outside
+// it.
+type makeFlags struct {
+	envFirst  bool
+	defines   []string
+	assigns   []string
+	unmodeled string
+}
+
+// makeInertFlags take no argument and change no variable's value or
+// precedence; makeInertArgFlags do the same and take one. Every other flag
+// is outside what doctor models: -I, -m and -r move or drop the files make
+// reads, and -C and -f add or relocate makefiles.
+const (
+	makeInertFlags    = "BNSWXiknqstw"
+	makeInertArgFlags = "JTVdjv"
+)
+
+// parseMakeFlags reads words the way bmake reads MAKEFLAGS and .MAKEFLAGS,
+// measured on 15.1: clusters of flags after a dash, name=value assignments,
+// and "--". bmake reads a first word with no dash as flags only in the
+// environment's MAKEFLAGS (bare); anywhere else it is a target.
+func parseMakeFlags(s string, bare bool) makeFlags {
+	var fl makeFlags
+	words := strings.Fields(s)
+	dashDash := false
+	for i := 0; i < len(words); i++ {
+		word := words[i]
+		if strings.ContainsAny(word, "$\"'\\") {
+			fl.unmodeled = word
+			return fl
+		}
+		if eq := strings.IndexByte(word, '='); eq > 0 && (dashDash || word[0] != '-') {
+			fl.assigns = append(fl.assigns, strings.TrimRight(word[:eq], "+:?!"))
+			continue
+		}
+		var cluster string
+		switch {
+		case !dashDash && word == "--":
+			dashDash = true
+			continue
+		case !dashDash && len(word) > 1 && word[0] == '-':
+			cluster = word[1:]
+		case !dashDash && i == 0 && bare:
+			cluster = word
+		default:
+			fl.unmodeled = word
+			return fl
+		}
+		for j := 0; j < len(cluster); j++ {
+			c := cluster[j]
+			switch {
+			case c == 'e':
+				fl.envFirst = true
+			case strings.IndexByte(makeInertFlags, c) >= 0:
+			case c == 'D' || strings.IndexByte(makeInertArgFlags, c) >= 0:
+				arg := cluster[j+1:]
+				if arg == "" {
+					if i+1 >= len(words) {
+						fl.unmodeled = "-" + string(c) + " with no argument"
+						return fl
+					}
+					i++
+					arg = words[i]
+				}
+				if c == 'D' {
+					if strings.ContainsAny(arg, "$\"'\\") {
+						fl.unmodeled = "-D " + arg
+						return fl
+					}
+					fl.defines = append(fl.defines, arg)
+				}
+				j = len(cluster)
+			default:
+				fl.unmodeled = "-" + string(c)
+				return fl
+			}
+		}
+	}
+	return fl
+}
+
+// applyFlags applies what one MAKEFLAGS value or .MAKEFLAGS line passes.
+// from names it; unknown is whether make may not have read it. -D sets a
+// global, which a later assignment replaces and which beats the environment;
+// an assignment is a command-line variable, which nothing after it replaces.
+func (w *makeWalk) applyFlags(fl makeFlags, from string, unknown bool) {
+	if fl.unmodeled != "" {
+		w.pinAll(from + " passes " + fl.unmodeled + ", which doctor does not model")
+	}
+	for _, n := range fl.assigns {
+		if v := w.sites[n]; v != nil {
+			v.pin(from + " names it")
+		}
+	}
+	for _, n := range fl.defines {
+		if v := w.sites[n]; v != nil {
+			w.assign(v, "=", "1", "-D in "+from, unknown)
+		}
+	}
+	switch {
+	case !fl.envFirst || w.envFirst == 1:
+	case unknown:
+		if w.envFirst == 0 {
+			w.envFirst, w.envFirstWhy = -1, from+" may pass -e"
+		}
+	default:
+		w.envFirst, w.envFirstWhy = 1, from+" passes -e"
+	}
+}
+
+// settleEnv applies -e, under which a recipe expands a variable from the
+// environment ahead of any makefile assignment. make -V prints the makefile's
+// value either way, measured with bmake on 15.1, and it is the recipe's value
+// that decides where fetch goes, so the environment's is the one checked.
+func (w *makeWalk) settleEnv() {
+	for n, v := range w.sites {
+		ev, ok := w.env[n]
+		if !ok || v.pinned != "" {
+			continue
+		}
+		switch w.envFirst {
+		case 1:
+			*v = siteValue{val: ev, from: "the environment, above make.conf because " + w.envFirstWhy, set: true, env: true}
+		case -1:
+			v.pin("the environment sets it, and " + w.envFirstWhy + ", which would put the environment above make.conf")
+		}
+	}
+}
+
+// include follows one include directive. A path doctor cannot resolve pins
+// every site variable, since the file could assign any of them, make it
+// read-only or pass it on a .MAKEFLAGS line. A missing file is a problem for
+// .include, which make treats as fatal, and nothing for the soft forms or a
+// branch make may not take.
 func (w *makeWalk) include(from, dir, arg string, unknown, report bool, stack []string) error {
 	inc, why := makeIncludePath(from, arg)
 	if why != "" {
-		for _, v := range w.sites {
-			v.undetermined(from + " includes " + why)
-		}
+		w.pinAll(from + " includes " + why)
 		return nil
 	}
 	for _, s := range stack {
 		if s == inc {
-			for _, v := range w.sites {
-				v.undetermined(from + " includes " + inc + ", which is already being read")
-			}
+			w.pinAll(from + " includes " + inc + ", which is already being read")
 			return nil
 		}
 	}
 	if len(stack) >= makeIncludeDepth {
-		for _, v := range w.sites {
-			v.undetermined(from + " includes " + inc + " past " + fmt.Sprint(makeIncludeDepth) + " levels of nesting")
-		}
+		w.pinAll(from + " includes " + inc + " past " + fmt.Sprint(makeIncludeDepth) + " levels of nesting")
 		return nil
 	}
 	data, err := os.ReadFile(filepath.Join(w.root, inc))
@@ -1229,8 +1486,8 @@ func makeIncludePath(from, arg string) (path, why string) {
 // doctor sees would not be the sites make uses.
 func siteProblem(name string, v *siteValue, route string) string {
 	switch {
-	case v.unknown != "":
-		return name + " cannot be established: " + v.unknown
+	case v.why() != "":
+		return name + " cannot be established: " + v.why()
 	case !v.set:
 		return name + " is not set"
 	}
@@ -1290,8 +1547,8 @@ func checkInclude(root, confPath string, stmts []string, env *siteValue) string 
 	}
 	notCheck := "the last line includes " + inc + ", which "
 	switch {
-	case env.unknown != "":
-		return notCheck + "doctor cannot establish defines " + distfilesEnvVar + ": " + env.unknown
+	case env.why() != "":
+		return notCheck + "doctor cannot establish defines " + distfilesEnvVar + ": " + env.why()
 	case !env.set:
 		return notCheck + "does not define " + distfilesEnvVar + " on any line make reads, and so is not the client check"
 	case !env.final:
