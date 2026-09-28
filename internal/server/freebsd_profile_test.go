@@ -208,6 +208,9 @@ func TestFreeBSDProfileRefusesAPackageTheCatalogueDoesNotList(t *testing.T) {
 		if status != http.StatusForbidden || !strings.HasPrefix(body, entitle.RefusalMembership+":") {
 			t.Errorf("GET %s = %d %q, want 403 opening on %q", root(fbsdTreePath), status, body, entitle.RefusalMembership)
 		}
+		if strings.Contains(body, "--membership open") {
+			t.Errorf("the freebsd refusal offers --membership open, which bodega profile set refuses for freebsd:\n%s", body)
+		}
 		status, body = f.get(t, root(fbsdCurlPath))
 		if status != http.StatusForbidden || !strings.HasPrefix(body, entitle.RefusalConstraint+":") {
 			t.Errorf("GET %s = %d %q, want 403 opening on %q", root(fbsdCurlPath), status, body, entitle.RefusalConstraint)

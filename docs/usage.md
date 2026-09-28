@@ -1702,20 +1702,22 @@ web freebsd: membership=closed version_default=floating expansion=block
 **What a refused package looks like to pkg.** It is not in the catalogue, so `pkg search` does not find it and `pkg install` stops before fetching anything:
 
 ```text
+$ sudo pkg update -f
+bodega-latest repository update completed. 2 packages processed.
 $ pkg search -r bodega-latest -q -x '.*'
 pv-1.9.31
-tree-2.2.1
+tree-2.3.2
 $ sudo pkg install -y -r bodega-latest nano
+bodega-latest is up to date.
 pkg: No packages available to install matching 'nano' have been found in the repositories
 ```
 
-A `.pkg` fetched by hand is refused by name and version, read off its filename, with the same text every other type returns:
+A `.pkg` fetched by hand is refused with 403, by the name and version its filename carries, in the vocabulary every other type uses. A membership refusal offers one repair, since opening a freebsd rule is the one `set` refuses:
 
 ```text
-$ curl http://bodega.internal/freebsd/FreeBSD:15:aarch64/latest/All/Hashed/nano-8.4~a1b2c3.pkg
-membership: profile "web" does not list freebsd/nano at 8.4.
-  Add it:      bodega profile add web freebsd nano
-  Or open it:  bodega profile set web freebsd --membership open
+$ curl 'https://bodega.internal/freebsd/FreeBSD:15:aarch64/latest/All/Hashed/nano-9.2~2$3mdm1utt.pkg'
+membership: profile "web" does not list freebsd/nano at 9.2.
+  Add it:  bodega profile add web freebsd nano
 ```
 
 The bound host is also refused the published catalogue at `/freebsd/<abi>/<repo>/`, with a 403 naming its view. A host whose stanza predates its binding fails `pkg update` there rather than reading every record its profile refuses. The limit is apt's: a dependency the profile does not list is filtered out with the rest, so `pkg install` of a listed package whose dependency is refused fails on the missing dependency. List the closure.
