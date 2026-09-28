@@ -4,7 +4,10 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"log/syslog"
 	"math/big"
 	"os"
@@ -15,6 +18,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/ravinald/bodega/internal/builder"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/storage"
 )
@@ -32,7 +36,9 @@ generated confirmation word before anything is deleted.
 
 What gets deleted:
   - All manifest JSON files (apt.json, git.json, pypi.json, etc.)
-  - All local build artifacts (sources, repos, bundles, wheels, etc.)
+  - Every build directory each package type writes, under build_root or
+    under that type's *_root override. Each one is named before the
+    confirmation, and one outside build_root is marked as such.
   - The audit database
 
 What is preserved:
@@ -56,10 +62,11 @@ What is preserved:
 			fmt.Println()
 			fmt.Println("The following will be cleared:")
 			fmt.Printf("  Manifests:  %s\n", cfg.ManifestDir)
-			fmt.Printf("  Build root: %s\n", cfg.BuildRoot)
 			if cfg.Bucket != "" {
 				fmt.Printf("  S3 bucket:  s3://%s/manifests/\n", cfg.Bucket)
 			}
+			targets := resetTargets(cfg)
+			printResetTargets(os.Stdout, cfg.BuildRoot, targets)
 			fmt.Println()
 			fmt.Println("The following is preserved:")
 			fmt.Printf("  Config:     %s\n", config.ConfigPath())
@@ -116,18 +123,7 @@ What is preserved:
 				}
 			}
 
-			// Clear build artifacts.
-			artifactDirs := []string{
-				"sources", "repos", "bundles", "wheels", "binaries",
-				"apt-repo", "gomod", "charts", "npm",
-			}
-			for _, dir := range artifactDirs {
-				path := filepath.Join(cfg.BuildRoot, dir)
-				if err := os.RemoveAll(path); err != nil {
-					fmt.Fprintf(os.Stderr, "  warning: could not remove %s: %v\n", path, err)
-				}
-			}
-			fmt.Println("  Build artifacts cleared.")
+			failed := clearResetTargets(os.Stdout, os.Stderr, targets)
 
 			// Remove audit database if user opted in.
 			if resetAudit {
@@ -143,6 +139,9 @@ What is preserved:
 			}
 
 			fmt.Println()
+			if failed > 0 {
+				return fmt.Errorf("reset incomplete: %d of %d build paths could not be removed (named above); fix the cause and run 'bodega reset' again", failed, len(targets))
+			}
 			fmt.Println("Reset complete. Config preserved. Run 'bodega init' to re-initialize.")
 			return nil
 		},
@@ -195,4 +194,69 @@ func auditFailsafe(action, dbPath string) {
 	}
 	defer func() { _ = f.Close() }()
 	fmt.Fprintln(f, msg)
+}
+
+// resetTarget is a build path reset removes. Outside marks one a *_root
+// override put beyond build_root: that path was chosen by hand and may share a
+// parent with something else, so the prompt names it on its own line.
+type resetTarget struct {
+	builder.ResetPath
+	Outside bool
+}
+
+func resetTargets(cfg *config.Config) []resetTarget {
+	buildRoot, _ := filepath.Abs(cfg.BuildRoot)
+	var out []resetTarget
+	for _, rp := range builder.ResetPaths(builder.NewConfig(cfg, nil)) {
+		abs, _ := filepath.Abs(rp.Path)
+		rel, err := filepath.Rel(buildRoot, abs)
+		out = append(out, resetTarget{ResetPath: rp, Outside: err != nil || !filepath.IsLocal(rel)})
+	}
+	return out
+}
+
+func printResetTargets(w io.Writer, buildRoot string, targets []resetTarget) {
+	_, _ = fmt.Fprintf(w, "  Build root: %s\n", buildRoot)
+	var outside []resetTarget
+	for _, t := range targets {
+		if t.Outside {
+			outside = append(outside, t)
+			continue
+		}
+		_, _ = fmt.Fprintf(w, "    %s\n", t.Path)
+	}
+	if len(outside) == 0 {
+		return
+	}
+	_, _ = fmt.Fprintln(w, "  Outside build_root, set by a *_root override:")
+	for _, t := range outside {
+		keys := make([]string, len(t.Types))
+		for i, typ := range t.Types {
+			keys[i] = typ + "_root"
+		}
+		_, _ = fmt.Fprintf(w, "    %s  (%s)\n", t.Path, strings.Join(keys, ", "))
+	}
+}
+
+// clearResetTargets removes every target, naming each one removed and each one
+// it could not remove, and returns how many it could not.
+func clearResetTargets(stdout, stderr io.Writer, targets []resetTarget) int {
+	failed := 0
+	for _, t := range targets {
+		if _, err := os.Lstat(t.Path); errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err := os.RemoveAll(t.Path); err != nil {
+			_, _ = fmt.Fprintf(stderr, "  could not remove %s: %v\n", t.Path, err)
+			failed++
+			continue
+		}
+		_, _ = fmt.Fprintf(stdout, "  Removed %s\n", t.Path)
+	}
+	if failed > 0 {
+		_, _ = fmt.Fprintf(stderr, "  Build artifacts NOT cleared: %d of %d paths remain.\n", failed, len(targets))
+		return failed
+	}
+	_, _ = fmt.Fprintln(stdout, "  Build artifacts cleared.")
+	return 0
 }
