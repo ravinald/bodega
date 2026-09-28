@@ -1,0 +1,156 @@
+#!/bin/sh
+# rc.subr reads every variable this script assigns, and lives on the host.
+# shellcheck disable=SC1091,SC2034
+#
+# PROVIDE: bodega
+# REQUIRE: LOGIN NETWORKING
+# KEYWORD: shutdown
+#
+# rc.d script for bodega on FreeBSD
+#
+# Install it as /usr/local/etc/rc.d/bodega, mode 0555, and the binary as
+# /usr/local/bin/bodega. The service account and the two writable directories
+# have to exist first; nothing here creates them:
+#
+#   pw useradd -n bodega -d /var/lib/bodega -s /usr/sbin/nologin -c "bodega server"
+#   mkdir -p /etc/bodega /var/lib/bodega /var/log/bodega
+#
+# Write the config and any signing key, then hand both trees to the service
+# account last, for the reason docs/bodega.service gives: a bodega command run
+# as root leaves config.json and audit.db owned by root.
+#
+#   chown -R bodega:bodega /var/lib/bodega /var/log/bodega
+#   chown root:bodega /etc/bodega/config.json
+#   chmod 0640 /etc/bodega/config.json
+#
+#   sysrc bodega_enable=YES
+#   service bodega start
+#   tail -f /var/log/bodega/bodega.log
+#
+# Variables, set with sysrc(8):
+#
+#   bodega_enable          YES to start at boot. Default NO.
+#   bodega_user            Account the server runs as. Default bodega. Its
+#                          primary group is the group /etc/bodega/pepper is
+#                          handed to, as Group= is under systemd.
+#   bodega_config          Exported as BODEGA_CONFIG_FILE.
+#                          Default /etc/bodega/config.json.
+#   bodega_flags           Appended to `bodega serve`, never to daemon(8).
+#   bodega_chdir           Working directory. Default /var/lib/bodega.
+#   bodega_logfile         stdout and stderr. Default /var/log/bodega/bodega.log.
+#   bodega_restart_delay   Seconds before daemon(8) restarts an exited server.
+#                          Default 5.
+#   bodega_env, bodega_env_file
+#                          rc.subr's own: S3 credentials go here, since bodega
+#                          reads them from the AWS SDK's default chain.
+#
+# daemon(8) supervises: -P records its own pid, which is what `service bodega
+# stop` signals and what it forwards SIGTERM from. The server's pid is in
+# /var/run/bodega_child.pid, and `service bodega reload` sends it SIGHUP, which
+# rereads manifests, the signing keys and the CIDR access lists exactly as
+# `systemctl reload` does. Signalling the supervisor instead would only reopen
+# the log file (-H), which is what newsyslog(8) wants from it.
+#
+# Every directive in docs/bodega.service and what stands in for it here:
+#
+#   Type=notify           None. rc.subr returns once daemon(8) has forked, so
+#                         `service bodega start` succeeds before the listener
+#                         binds. A refused start shows in bodega_logfile and in
+#                         the restart loop, not in the exit status.
+#   User=, Group=         daemon -u bodega_user. The group is that account's
+#                         primary group; daemon(8) has no separate group option.
+#   WorkingDirectory=     bodega_chdir, applied by rc.subr before daemon(8)
+#                         starts. daemon runs without -c so it is kept.
+#   ExecStart=            command_args below.
+#   ExecReload=           reload_cmd: SIGHUP to the child pid.
+#   Environment=          bodega_config, exported as BODEGA_CONFIG_FILE.
+#   EnvironmentFile=      bodega_env_file.
+#   LoadCredential=       None. FreeBSD has no per-service credential store,
+#                         so the apt and pkg signing keys are read from
+#                         /etc/bodega, where they must be owned by bodega_user
+#                         and mode 0600: bodega refuses a key readable beyond
+#                         its owner, and root:root 0600 is one it cannot open.
+#   Restart=on-failure    daemon -R bodega_restart_delay. daemon(8) restarts on
+#   RestartSec=5s         any exit, a clean one included; stop the service to
+#                         keep it down.
+#   TimeoutStartSec=180   None. Nothing here waits for readiness to time it.
+#   NoNewPrivileges=true  proccontrol -m nonewprivs, which sets
+#                         PROC_NO_NEW_PRIVS_CTL before exec: setuid and setgid
+#                         bits are ignored for the server and its children.
+#   ProtectSystem=strict  None. FreeBSD has no per-service read-only view of the
+#                         filesystem. File permissions are the whole boundary:
+#                         bodega_user owns /var/lib/bodega and /var/log/bodega
+#                         and nothing else. Run bodega in a jail(8) with those
+#                         two nullfs-mounted read-write to get the equivalent.
+#   ReadWritePaths=       The same two directories, by ownership rather than by
+#                         mount. The equivalent is the jail above.
+#   ProtectHome=true      None. A jail with no /home in it is the equivalent;
+#                         outside one, home directories are as readable to
+#                         bodega_user as their modes allow.
+#   PrivateTmp=true       Partial. TMPDIR is bodega_chdir/tmp, created 0700 and
+#                         owned by bodega_user on every start, so bodega's own
+#                         temporary files are private to it. /tmp itself stays
+#                         shared.
+#   After=, Wants=        REQUIRE: LOGIN NETWORKING above.
+#   network-online.target
+#   WantedBy=             bodega_enable.
+#   multi-user.target
+
+. /etc/rc.subr
+
+name=bodega
+rcvar=bodega_enable
+desc="bodega package repository server"
+
+load_rc_config $name
+
+: "${bodega_enable:=NO}"
+: "${bodega_user:=bodega}"
+: "${bodega_config:=/etc/bodega/config.json}"
+: "${bodega_flags:=}"
+: "${bodega_chdir:=/var/lib/bodega}"
+: "${bodega_logfile:=/var/log/bodega/bodega.log}"
+: "${bodega_restart_delay:=5}"
+
+pidfile="/var/run/${name}.pid"
+child_pidfile="/var/run/${name}_child.pid"
+procname="/usr/sbin/daemon"
+command="/usr/sbin/daemon"
+command_args="-f -H -P ${pidfile} -p ${child_pidfile} -R ${bodega_restart_delay} \
+    -u ${bodega_user} -o ${bodega_logfile} \
+    /usr/bin/proccontrol -m nonewprivs -s enable \
+    /usr/local/bin/bodega serve ${bodega_flags}"
+# rc.subr acts on both of these itself: the flags go on daemon(8)'s command
+# line, and a user wraps daemon in su(1), which leaves it unable to write its
+# pidfiles or drop to the account on its own. command_args carries both.
+bodega_account="${bodega_user}"
+bodega_flags=""
+bodega_user=""
+
+extra_commands="reload"
+start_precmd="bodega_prestart"
+reload_cmd="bodega_reload"
+
+bodega_prestart()
+{
+	if [ ! -f "${bodega_config}" ]; then
+		err 1 "${bodega_config} does not exist; write it or set bodega_config"
+	fi
+	if ! id "${bodega_account}" >/dev/null 2>&1; then
+		err 1 "account ${bodega_account} does not exist; create it with pw useradd (see the header of this script) or set bodega_user"
+	fi
+	install -d -o "${bodega_account}" -m 0700 "${bodega_chdir}/tmp" || return 1
+	export BODEGA_CONFIG_FILE="${bodega_config}"
+	export TMPDIR="${bodega_chdir}/tmp"
+}
+
+bodega_reload()
+{
+	_pid=$(check_pidfile "${child_pidfile}" /usr/local/bin/bodega)
+	if [ -z "${_pid}" ]; then
+		err 1 "${name} is not running (no live pid in ${child_pidfile})"
+	fi
+	kill -HUP "${_pid}"
+}
+
+run_rc_command "$1"

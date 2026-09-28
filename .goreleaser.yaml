@@ -22,7 +22,7 @@ builds:
     # Windows is intentionally omitted: cmd/bodega/cmd_reset.go imports
     # log/syslog (Unix-only). Add windows/amd64 once that usage is guarded
     # behind build tags.
-    goos: [linux, darwin]
+    goos: [linux, darwin, freebsd]
     goarch: [amd64, arm64]
 
 archives:
@@ -36,6 +36,7 @@ archives:
       - docs/quickstart.md
       - docs/usage.md
       - docs/bodega.service
+      - docs/bodega.rc
 
 nfpms:
   - id: linux-packages
