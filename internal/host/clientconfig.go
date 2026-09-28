@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -27,11 +28,21 @@ var publicUpstreams = map[string][]string{
 // CheckAptSources scans /etc/apt/sources.list and /etc/apt/sources.list.d
 // for references to public Debian/Ubuntu mirrors. A locked-down host should
 // have these rewritten to point at a bodega apt endpoint.
-func CheckAptSources() Finding {
-	f := Finding{Check: "apt-sources"}
+func CheckAptSources() Finding { return checkAptSources("", runtime.GOOS) }
 
-	paths := []string{"/etc/apt/sources.list"}
-	if entries, err := os.ReadDir("/etc/apt/sources.list.d"); err == nil {
+// root prefixes every path the check reads and goos stands in for
+// runtime.GOOS, so a test can drive both systems against a fixture tree.
+func checkAptSources(root, goos string) Finding {
+	f := Finding{Check: "apt-sources"}
+	if goos != "linux" {
+		f.Status = StatusNA
+		f.Detail = "apt is Linux-only; check not applicable on this platform"
+		return f
+	}
+
+	dir := filepath.Join(root, "/etc/apt/sources.list.d")
+	paths := []string{filepath.Join(root, "/etc/apt/sources.list")}
+	if entries, err := os.ReadDir(dir); err == nil {
 		for _, e := range entries {
 			if e.IsDir() {
 				continue
@@ -40,7 +51,7 @@ func CheckAptSources() Finding {
 			if !strings.HasSuffix(n, ".list") && !strings.HasSuffix(n, ".sources") {
 				continue
 			}
-			paths = append(paths, filepath.Join("/etc/apt/sources.list.d", n))
+			paths = append(paths, filepath.Join(dir, n))
 		}
 	}
 
@@ -58,10 +69,20 @@ func CheckAptSources() Finding {
 
 // CheckPipConfig scans pip's config files for direct PyPI references.
 func CheckPipConfig() Finding {
-	f := Finding{Check: "pip-config"}
 	home, _ := os.UserHomeDir()
-	paths := []string{
-		"/etc/pip.conf",
+	return checkPipConfig("", runtime.GOOS, home)
+}
+
+// pipPaths lists the files pip reads, system-wide first. On FreeBSD pip's
+// global search is /etc/xdg/pip/pip.conf, /etc/pip.conf and
+// sys.prefix/pip.conf (measured with `pip config debug`, py312-pip 23.3.2 on
+// 15.1-RELEASE). /usr/local/etc/pip.conf is read by nothing, and is scanned
+// anyway because it is where the ports convention puts a file, so an operator
+// who wrote one there is shown it rather than told the host is clean.
+func pipPaths(goos, home string) []string {
+	paths := []string{"/etc/pip.conf"}
+	if goos == "freebsd" {
+		paths = append(paths, "/etc/xdg/pip/pip.conf", "/usr/local/pip.conf", "/usr/local/etc/pip.conf")
 	}
 	if home != "" {
 		paths = append(paths,
@@ -70,8 +91,12 @@ func CheckPipConfig() Finding {
 			filepath.Join(home, "Library", "Application Support", "pip", "pip.conf"),
 		)
 	}
+	return paths
+}
 
-	hit := firstHit(paths, publicUpstreams["pip"])
+func checkPipConfig(root, goos, home string) Finding {
+	f := Finding{Check: "pip-config"}
+	hit := firstHit(rooted(root, pipPaths(goos, home)), publicUpstreams["pip"])
 	if hit.path == "" {
 		f.Status = StatusOK
 		f.Detail = "no pip config references public PyPI"
@@ -109,14 +134,26 @@ func CheckCargoConfig() Finding {
 
 // CheckNpmConfig scans .npmrc files for direct registry.npmjs.org references.
 func CheckNpmConfig() Finding {
-	f := Finding{Check: "npm-config"}
 	home, _ := os.UserHomeDir()
+	return checkNpmConfig("", runtime.GOOS, home)
+}
+
+// npmPaths lists the npmrc files npm reads. The global one is
+// $PREFIX/etc/npmrc, and the FreeBSD package's prefix is /usr/local.
+func npmPaths(goos, home string) []string {
 	paths := []string{"/etc/npmrc"}
+	if goos == "freebsd" {
+		paths = append(paths, "/usr/local/etc/npmrc")
+	}
 	if home != "" {
 		paths = append(paths, filepath.Join(home, ".npmrc"))
 	}
+	return paths
+}
 
-	hit := firstHit(paths, publicUpstreams["npm"])
+func checkNpmConfig(root, goos, home string) Finding {
+	f := Finding{Check: "npm-config"}
+	hit := firstHit(rooted(root, npmPaths(goos, home)), publicUpstreams["npm"])
 	if hit.path == "" {
 		f.Status = StatusOK
 		f.Detail = "no .npmrc references public registry.npmjs.org"
@@ -126,6 +163,19 @@ func CheckNpmConfig() Finding {
 	f.Detail = "npm configured to fetch from " + hit.marker + " (in " + hit.path + "); bypasses bodega's npm proxy"
 	f.Remediation = "set registry= in " + hit.path + " to the bodega /npm endpoint"
 	return f
+}
+
+// rooted prefixes each path with root, and returns paths unchanged when root
+// is empty.
+func rooted(root string, paths []string) []string {
+	if root == "" {
+		return paths
+	}
+	out := make([]string, len(paths))
+	for i, p := range paths {
+		out[i] = filepath.Join(root, p)
+	}
+	return out
 }
 
 // CheckGoproxyEnv reports whether the GOPROXY the go command will use

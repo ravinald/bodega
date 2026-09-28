@@ -73,6 +73,8 @@ func AllChecks() []CheckFunc {
 		CheckFlatpak,
 		CheckHomebrew,
 		CheckAptSources,
+		CheckPkgRepos,
+		CheckMakeConf,
 		CheckPipConfig,
 		CheckCargoConfig,
 		CheckNpmConfig,
