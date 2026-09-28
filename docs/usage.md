@@ -1712,7 +1712,7 @@ bodega-latest is up to date.
 pkg: No packages available to install matching 'nano' have been found in the repositories
 ```
 
-A `.pkg` fetched by hand is refused with 403 in the vocabulary every other type uses, on either root. The gate judges the package by the name and version of the catalogue record whose `repopath` names the object, not by its filename, because a generated repository takes a package's identity from its own manifest and stores it wherever it was uploaded:
+A `.pkg` fetched by hand is refused with 403 in the vocabulary every other type uses, on either root. The gate judges the package by the name and version of the catalogue record whose `repopath` names the object, not by its filename, because a generated repository takes a package's identity from its own manifest and stores it wherever it was uploaded. The record comes from the catalogue as published at the moment of the fetch, so an object replaced under a name it already had is judged by what the rebuilt catalogue says it is:
 
 ```text
 $ curl 'https://bodega.internal/freebsd/FreeBSD:15:aarch64/latest/All/Hashed/nano-9.2~2$3mdm1utt.pkg'
@@ -1742,7 +1742,7 @@ bodega-latest: {
 }
 ```
 
-`GET /api/v1/status` answers per host: its `freebsd.repos` carry `profile` and the view's URL for a host bound to a profile with a freebsd rule, and the published repository for any other. The profile name is one percent-encoded path segment of that URL, so a profile named `web#prod` is served at `/freebsd-profile/web%23prod/`; `$` is encoded too, since pkg expands `${...}` in a repository URL. A profile named `.` or `..` cannot be a URL segment at all, and status refuses its stanza, naming why. A host bound by `bodega identity bind cidr` needs no token, which is the ordinary case, since pkg sends no bodega credential.
+`GET /api/v1/status` answers per host: its `freebsd.repos` carry `profile` and the view's URL for a host bound to a profile with a freebsd rule, and the published repository for any other. The profile name is one percent-encoded path segment of that URL, so a profile named `web#prod` is served at `/freebsd-profile/web%23prod/`; `$` is encoded too, since pkg expands `${...}` in a repository URL. A profile named `.` or `..` is encoded whole, as `%2E` and `%2E%2E`, since a client resolves a literal dot segment away before it sends the request. A host bound by `bodega identity bind cidr` needs no token, which is the ordinary case, since pkg sends no bodega credential.
 
 ### `bodega doctor [--write-credentials --token TOKEN [--url URL]] [--write-apt-sources [--suite CODENAME]] [--write-pkg-repo [--abi ABI] [--release N]]`
 

@@ -469,10 +469,62 @@ func TestFreeBSDProfileFiltersEveryRuleShape(t *testing.T) {
 	}
 }
 
+// R3: a record remembered from an earlier catalogue authorizes nothing. A
+// generated repository takes any filename and replaces an object under a key
+// it already had, so a fetch warmed before the replacement must be decided by
+// the catalogue published after it, on both roots.
+func TestFreeBSDProfileGateFollowsACatalogueRebuild(t *testing.T) {
+	const object = "All/current.pkg"
+	for _, tc := range []struct {
+		name        string
+		replacement string
+		entry       audit.ProfileEntry
+		refusal     string
+	}{
+		{"another package", `{"name":"tree","origin":"sysutils/tree","version":"2.0"}`,
+			audit.ProfileEntry{Type: manifest.TypeFreeBSD, Name: "nginx"}, entitle.RefusalMembership},
+		{"a version past the pin", `{"name":"nginx","origin":"www/nginx","version":"2.0"}`,
+			audit.ProfileEntry{Type: manifest.TypeFreeBSD, Name: "nginx", Constraint: manifest.ConstraintExact, Version: "1.0"}, entitle.RefusalConstraint},
+		{"a permitted version", `{"name":"nginx","origin":"www/nginx","version":"1.1"}`,
+			audit.ProfileEntry{Type: manifest.TypeFreeBSD, Name: "nginx"}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			installPkgKey(t, pkgsign.KeyRSA)
+			s := proxyingServer(t)
+			s.loadPkgSigner()
+			old := pkgArchive(t, `{"name":"nginx","origin":"www/nginx","version":"1.0"}`)
+			generatedRepo(t, s, "house", map[string]string{object: old})
+			f := bindProfile(t, s, "web", "web-host",
+				[]audit.ProfileTypeRule{closedRule(manifest.TypeFreeBSD, audit.VersionFloating, audit.ExpansionBlock)},
+				[]audit.ProfileEntry{tc.entry})
+			if status, body := f.get(t, freeBSDURL("house", object)); status != http.StatusOK || body != old {
+				t.Fatalf("warming fetch = %d, want the permitted nginx 1.0", status)
+			}
+
+			replacement := pkgArchive(t, tc.replacement)
+			seed(t, s, manifest.TypeFreeBSD, map[string]string{
+				manifest.FreeBSDKey(freeBSDABI, "house", object):          replacement,
+				manifest.FreeBSDKey(freeBSDABI, "house", "All/extra.pkg"): pkgArchive(t, `{"name":"extra","origin":"misc/extra","version":"1.0"}`),
+			})
+
+			for _, path := range []string{freeBSDURL("house", object), profileURL("web", "house", object)} {
+				status, body := f.get(t, path)
+				switch {
+				case tc.refusal == "" && (status != http.StatusOK || body != replacement):
+					t.Errorf("GET %s = %d, want the replacement served", path, status)
+				case tc.refusal != "" && (status != http.StatusForbidden || !strings.HasPrefix(body, tc.refusal+":")):
+					t.Errorf("GET %s = %d %.80q, want 403 %s", path, status, body, tc.refusal)
+				}
+			}
+		})
+	}
+}
+
 // R4: any name a profile accepts becomes a URL that routes back to the same
 // profile. Each of these is valid for bodega profile create and each breaks a
 // URL written by concatenation: '#' ends the path, '?' starts a query, '%'
-// begins an escape, '$' is expanded by pkg, and a dot segment is resolved away.
+// begins an escape, '$' is expanded by pkg, and a dot segment is resolved away
+// by the client unless it is escaped.
 func TestFreeBSDProfileURLRoutesEveryValidName(t *testing.T) {
 	installPkgKey(t, pkgsign.KeyRSA)
 	s := proxyingServer(t)
@@ -481,7 +533,7 @@ func TestFreeBSDProfileURLRoutesEveryValidName(t *testing.T) {
 	rule := []audit.ProfileTypeRule{closedRule(manifest.TypeFreeBSD, audit.VersionFloating, audit.ExpansionBlock)}
 	entries := []audit.ProfileEntry{{Type: manifest.TypeFreeBSD, Name: "nginx"}}
 
-	for i, name := range []string{"web#prod", "web?prod", "50%off", "${ABI}", "a.b", "ünï", "a+b=c@d:e&f"} {
+	for i, name := range []string{"web#prod", "web?prod", "50%off", "${ABI}", "a.b", "ünï", "a+b=c@d:e&f", ".", "..", "..."} {
 		f := bindProfile(t, s, name, "host-"+strconv.Itoa(i), rule, entries)
 		repo := boundStatus(t, s, f.token).RepoFor("latest", freeBSDABI)
 		if repo == nil {
@@ -505,16 +557,6 @@ func TestFreeBSDProfileURLRoutesEveryValidName(t *testing.T) {
 		again, err := repo.WithRelease(14)
 		if err != nil || again.URL != repo.URL {
 			t.Errorf("%q: WithRelease changed the url to %q (%v)", name, again.URL, err)
-		}
-	}
-
-	// A dot segment has no escaped form a server will route, so the stanza is
-	// refused with a reason the bound host is allowed to read.
-	for i, name := range []string{".", ".."} {
-		f := bindProfile(t, s, name, "dot-host-"+strconv.Itoa(i), rule, entries)
-		st := boundStatus(t, s, f.token)
-		if st.RepoFor("latest", freeBSDABI) != nil || len(st.Refused) != 1 || !strings.Contains(st.Refused[0].Error, "cannot be one segment of a URL") {
-			t.Errorf("%q: status = %+v, want the stanza refused naming why", name, st)
 		}
 	}
 }

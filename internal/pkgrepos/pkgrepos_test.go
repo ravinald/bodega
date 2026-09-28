@@ -2,7 +2,6 @@ package pkgrepos_test
 
 import (
 	"encoding/json"
-	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -1264,16 +1263,12 @@ func TestAProfileNameIsEscapedIntoOneSegment(t *testing.T) {
 		"50%off":   "/freebsd-profile/50%25off",
 		"${ABI}":   "/freebsd-profile/%24%7BABI%7D",
 		"a\"b":     "/freebsd-profile/a%22b",
+		".":        "/freebsd-profile/%2E",
+		"..":       "/freebsd-profile/%2E%2E",
+		"...":      "/freebsd-profile/...",
 	} {
 		if got := pkgrepos.ProfilePath(name); got != want {
 			t.Errorf("ProfilePath(%q) = %q, want %q", name, got, want)
-		}
-	}
-	for _, name := range []string{".", ".."} {
-		st := mirror()
-		st.Profile, st.Fingerprint = name, "abc123"
-		if _, err := pkgrepos.Render(st); !errors.Is(err, pkgrepos.ErrProfileUnroutable) {
-			t.Errorf("Render with profile %q = %v, want ErrProfileUnroutable", name, err)
 		}
 	}
 }

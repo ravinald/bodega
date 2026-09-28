@@ -732,10 +732,6 @@ func Render(st State) (Repo, error) {
 		return Repo{}, fmt.Errorf("freebsd %s@%s is served to this host filtered for profile %q: %w",
 			st.Repo, st.ABI, st.Profile, ErrProfileUnsigned)
 	}
-	if st.Profile == "." || st.Profile == ".." {
-		return Repo{}, fmt.Errorf("freebsd %s@%s is served to this host filtered for profile %q: %w",
-			st.Repo, st.ABI, st.Profile, ErrProfileUnroutable)
-	}
 
 	repoRelease := release
 	if n, ok := ReleaseFromABI(st.ABI); ok {
@@ -798,11 +794,6 @@ func Render(st State) (Repo, error) {
 // hand it to the host it refuses rather than blanking it with the rest.
 var ErrProfileUnsigned = errors.New("a filtered catalog carries bodega's signature or none: FreeBSD's cannot survive the filter, and bodega does not serve a catalog it filtered unsigned. Run \"bodega freebsd key generate\" on the server and reload it")
 
-// ErrProfileUnroutable is Render's refusal of a profile whose name is a dot
-// segment. Escaping cannot carry one: the server decodes %2E before it cleans
-// the path, so the request is redirected away from the view it names.
-var ErrProfileUnroutable = errors.New("a profile named . or .. cannot be one segment of a URL, because every HTTP server resolves it as a directory step. Serve this host under a profile with any other name")
-
 // ProfilePath is the route prefix a profile's filtered repositories are served
 // under: <ProfilePath>/<abi>/<repo>/ mirrors /freebsd/<abi>/<repo>/ path for
 // path. The server routes it and Render points a stanza at it, so the two are
@@ -811,9 +802,16 @@ var ErrProfileUnroutable = errors.New("a profile named . or .. cannot be one seg
 // The name is one escaped path segment. Profile names admit '#', '?' and '%',
 // which would end the path, start a query or begin an escape, and '$', which
 // url.PathEscape leaves alone and pkg expands as a variable in a repository
-// url.
+// url. A name of . or .. is escaped whole, because url.PathEscape leaves dots
+// literal and a literal dot segment is resolved away by the client before the
+// request is sent; %2E is not a dot segment to a resolver, and the server's
+// router decodes it back to the name.
 func ProfilePath(profile string) string {
-	return "/freebsd-profile/" + strings.ReplaceAll(url.PathEscape(profile), "$", "%24")
+	seg := strings.ReplaceAll(url.PathEscape(profile), "$", "%24")
+	if profile == "." || profile == ".." {
+		seg = strings.ReplaceAll(profile, ".", "%2E")
+	}
+	return "/freebsd-profile/" + seg
 }
 
 // WithRelease re-renders this configuration for a different target release,

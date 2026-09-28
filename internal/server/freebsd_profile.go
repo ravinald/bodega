@@ -188,18 +188,19 @@ type freeBSDIdentity struct{ name, version string }
 // request against whichever profile the host is bound to now.
 type freeBSDCatalogIndex struct {
 	digest  string
-	builtAt time.Time
 	objects map[string]freeBSDIdentity
 }
 
 // freeBSDObjectRecord finds the record naming rest, or the .pkg a .sig sits
 // beside, in the repository's published catalogue.
 //
-// An index younger than the metadata TTL answers a hit without reading the
-// catalogue: a repopath is content-addressed or version-named, so the record
-// that named it still describes the object. A miss, or an older index, reads
-// the catalogue and rebuilds when its digest moved, so a package published
-// since the last build is found rather than refused until the TTL runs out.
+// The catalogue is read on every call, and the index answers only for the
+// catalogue whose digest it was built from. An identity authorizes an object
+// only while the record it came from is in the catalogue this route publishes
+// now: a generated repository accepts any filename and may replace an object
+// under a key it already had, so a record remembered past a rebuild can vouch
+// for bytes the current catalogue withholds. The index saves the walk, not
+// the read.
 func (s *Server) freeBSDObjectRecord(r *http.Request, src freeBSDCatalogSource, rest string) (freeBSDIdentity, bool, int, string) {
 	cacheKey := "index\x00" + src.abi + "\x00" + src.repo
 	lookup := func(idx *freeBSDCatalogIndex) (freeBSDIdentity, bool) {
@@ -220,12 +221,6 @@ func (s *Server) freeBSDObjectRecord(r *http.Request, src freeBSDCatalogSource, 
 		}
 		return nil
 	}
-	if idx := cached(); idx != nil && s.cache.MetadataTTL > 0 && time.Since(idx.builtAt) < s.cache.MetadataTTL {
-		if id, ok := lookup(idx); ok {
-			return id, true, http.StatusOK, ""
-		}
-	}
-
 	body, status, errBody := s.freeBSDPublishedCatalog(r, src.store, src.abi, src.repo, src.generated, src.ve, src.configured, src.proxied)
 	if status != http.StatusOK {
 		return freeBSDIdentity{}, false, status, errBody
@@ -233,23 +228,27 @@ func (s *Server) freeBSDObjectRecord(r *http.Request, src freeBSDCatalogSource, 
 	sum := sha256.Sum256(body)
 	digest := hex.EncodeToString(sum[:])
 
+	if idx := cached(); idx != nil && idx.digest == digest {
+		id, ok := lookup(idx)
+		return id, ok, http.StatusOK, ""
+	}
 	unlock := s.freeBSDBuild.lock(cacheKey)
 	defer unlock()
-	idx := cached()
-	if idx == nil || idx.digest != digest {
-		objects := map[string]freeBSDIdentity{}
-		err := walkFreeBSDCatalog(body, func(_ []byte, name, version, repopath string) {
-			if repopath != "" {
-				objects[repopath] = freeBSDIdentity{name: name, version: version}
-			}
-		})
-		if err != nil {
-			return freeBSDIdentity{}, false, http.StatusInternalServerError,
-				fmt.Sprintf("index the published %s for %s@%s: %v", manifest.FreeBSDCatalogFile, src.repo, src.abi, err)
-		}
-		idx = &freeBSDCatalogIndex{digest: digest, objects: objects}
+	if idx := cached(); idx != nil && idx.digest == digest {
+		id, ok := lookup(idx)
+		return id, ok, http.StatusOK, ""
 	}
-	idx = &freeBSDCatalogIndex{digest: idx.digest, objects: idx.objects, builtAt: time.Now()}
+	objects := map[string]freeBSDIdentity{}
+	err := walkFreeBSDCatalog(body, func(_ []byte, name, version, repopath string) {
+		if repopath != "" {
+			objects[repopath] = freeBSDIdentity{name: name, version: version}
+		}
+	})
+	if err != nil {
+		return freeBSDIdentity{}, false, http.StatusInternalServerError,
+			fmt.Sprintf("index the published %s for %s@%s: %v", manifest.FreeBSDCatalogFile, src.repo, src.abi, err)
+	}
+	idx := &freeBSDCatalogIndex{digest: digest, objects: objects}
 	s.freeBSDCat.Store(cacheKey, idx)
 	id, ok := lookup(idx)
 	return id, ok, http.StatusOK, ""

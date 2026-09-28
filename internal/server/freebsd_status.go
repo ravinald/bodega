@@ -147,7 +147,7 @@ func (s *Server) freeBSDStatusFor(r *http.Request) freebsdStatus {
 			if err != nil {
 				out.Refused = append(out.Refused, freebsdRefused{
 					Repo: pm.Name, ABI: ve.Version, Error: err.Error(),
-					public: errors.Is(err, pkgrepos.ErrProfileUnsigned) || errors.Is(err, pkgrepos.ErrProfileUnroutable),
+					public: errors.Is(err, pkgrepos.ErrProfileUnsigned),
 				})
 				continue
 			}
