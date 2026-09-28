@@ -178,11 +178,11 @@ e2e_body server /distfiles/@environment.mk || true
 fd_check="$E2E_OUT"
 fd_digest="$(printf '%s\n' "$fd_check" | sed -n '1s/^# bodega distfiles client check for environment \([0-9a-f]*\)\.$/\1/p')"
 check_matches FDIST-03 "the server serves a client check naming its environment" '^[0-9a-f]{64}$' \
-	"${fd_digest:-none}" "internal/server/distfiles.go:277" "curl /distfiles/@environment.mk"
+	"${fd_digest:-none}" "internal/server/distfiles.go:290" "curl /distfiles/@environment.mk"
 
 fd_wait_index "$fd_digest" || true
 check_eq FDIST-04 "the server finishes reading the tree and answers a name no distinfo lists" "404" \
-	"$E2E_OUT" "internal/server/distfiles.go:194" "curl /distfiles/@<env>/bodega-e2e/..." "$E2E_RC"
+	"$E2E_OUT" "internal/server/distfiles.go:196" "curl /distfiles/@<env>/bodega-e2e/..." "$E2E_RC"
 
 # An empty binary_upstreams still reads storage (internal/server/binary.go),
 # so an object 47's open namespace cached there answers the name. It moves
@@ -295,7 +295,7 @@ if [ "${E2E_DRY_RUN:-no}" = yes ] || { [ -n "$fd_digest" ] && [ "$fd_env" = "$fd
 	check_eq FDIST-20 "make fetch succeeds against the distfiles route" 0 "$E2E_RC" \
 		"docs/usage.md#client-side-http" "make fetch MASTER_SITE_OVERRIDE=$fd_route/..." "$E2E_RC"
 	check_eq FDIST-21 "make fetch takes the distfile from /distfiles/ on the first and only attempt" \
-		"1 bodega" "$fd_fetch" "internal/server/distfiles.go:105" "make fetch | grep 'Attempting to fetch'"
+		"1 bodega" "$fd_fetch" "internal/server/distfiles.go:106" "make fetch | grep 'Attempting to fetch'"
 	fd_sh "$fd_make_http checksum 2>&1 | tail -1" || true
 	check_contains FDIST-22 "make checksum accepts the bytes the route admitted" \
 		"Checksum OK" "$E2E_OUT" "docs/usage.md#mirroring-ports-distfiles" "make checksum"
@@ -314,15 +314,15 @@ if [ "${E2E_DRY_RUN:-no}" = yes ] || { [ -n "$fd_digest" ] && [ "$fd_env" = "$fd
 	fd_rstatus="$(printf '%s\n' "$E2E_OUT" | tail -1)"
 	fd_rbody="$(printf '%s\n' "$E2E_OUT" | sed '$d')"
 	check_eq FDIST-31 "a NO_CDROM distfile is refused with 451" "451" "$fd_rstatus" \
-		"internal/server/distfiles.go:180" "curl $fd_route/$fd_rname" "$E2E_RC"
+		"internal/server/distfiles.go:181" "curl $fd_route/$fd_rname" "$E2E_RC"
 	check_contains FDIST-32 "the refusal names the port's own term" "$FD_RPORT sets NO_CDROM" "$fd_rbody" \
-		"internal/server/distfiles.go:186" "curl $fd_route/$fd_rname"
+		"internal/server/distfiles.go:187" "curl $fd_route/$fd_rname"
 	check_lacks FDIST-33 "the refusal does not name the upstream" "distcache.FreeBSD.org" "$fd_rbody" \
-		"internal/server/distfiles.go:186" "curl $fd_route/$fd_rname"
+		"internal/server/distfiles.go:187" "curl $fd_route/$fd_rname"
 	check_lacks FDIST-34 "the refusal names no path on the server" "$FD_SERVER_TREE" "$fd_rbody" \
-		"internal/server/distfiles.go:186" "curl $fd_route/$fd_rname"
+		"internal/server/distfiles.go:187" "curl $fd_route/$fd_rname"
 	check_lacks FDIST-35 "the refusal does not name the server's storage" "$fd_storage" "$fd_rbody" \
-		"internal/server/distfiles.go:186" "curl $fd_route/$fd_rname"
+		"internal/server/distfiles.go:187" "curl $fd_route/$fd_rname"
 
 	# ---- refusals that used to name the tree -----------------------------------
 	#
@@ -373,9 +373,9 @@ if [ "${E2E_DRY_RUN:-no}" = yes ] || { [ -n "$fd_digest" ] && [ "$fd_env" = "$fd
 	fd_pstatus="$(printf '%s\n' "$E2E_OUT" | tail -1)"
 	fd_pbody="$(printf '%s\n' "$E2E_OUT" | sed '$d')"
 	check_eq FDIST-40 "the server refuses bytes its distinfo no longer pins" "502" "$fd_pstatus" \
-		"internal/server/distfiles.go:251" "curl $fd_route/$fd_name after repinning it on the server" "$E2E_RC"
+		"internal/server/distfiles.go:254" "curl $fd_route/$fd_name after repinning it on the server" "$E2E_RC"
 	check_contains FDIST-41 "the refusal says the bytes disagree with distinfo" \
-		"do not match the ports tree's distinfo" "$fd_pbody" "internal/server/distfiles.go:359" "curl $fd_route/$fd_name"
+		"do not match the ports tree's distinfo" "$fd_pbody" "internal/server/distfiles.go:372" "curl $fd_route/$fd_name"
 	E2E_HOST=server
 	e2e_on server "sudo install -m 0644 $FD_SERVER_ROOT/distinfo.orig $FD_SERVER_TREE/$FD_PORT/distinfo" || true
 else
