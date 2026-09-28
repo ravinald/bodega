@@ -51,7 +51,8 @@
 #   bodega_logfile         stdout and stderr. Default /var/log/bodega.log.
 #                          daemon(8) opens it as root, so every directory on
 #                          the way to it must be root's alone; start refuses
-#                          one bodega_user could write, such as /var/log/bodega.
+#                          one bodega_user could write, such as /var/log/bodega,
+#                          and one carrying any ACL entry beyond its mode bits.
 #   bodega_restart_delay   Seconds before daemon(8) restarts an exited server.
 #                          Default 5.
 #   bodega_env, bodega_env_file
@@ -148,11 +149,14 @@ reload_cmd="bodega_reload"
 
 # Succeeds when root alone decides which file $1 names: an absolute path with
 # no . or .. component, every directory above it real (not a symlink), owned by
-# root and writable by nobody else. The last test asks the account itself,
-# which catches a write an ACL grants and the mode bits do not show. Nothing
-# unprivileged can change a directory that passes, so the answer still holds
-# when daemon(8) opens the file, and when -H reopens it. On failure _unsafe
-# names what failed.
+# root, with no group or other write bit, no ACL entry beyond the ones the mode
+# bits imply, and not writable by bodega_account. The ACL test covers every
+# other account a named entry could grant; the account test catches anything
+# neither of the others shows. Nothing unprivileged can change a directory that
+# passes, so the answer still holds when daemon(8) opens the file, and when -H
+# reopens it. The file itself, if present, must be a regular file with one link:
+# a symlink or hard link planted while a directory was still writable outlives
+# the permission that let it in. On failure _unsafe names what failed.
 bodega_root_only_parent()
 {
 	_unsafe=$1
@@ -169,12 +173,22 @@ bodega_root_only_parent()
 		0\ d????-??-?) ;;
 		*) return 1 ;;
 		esac
+		# getfacl -s prints only a nontrivial ACL; a read error refuses too.
+		_acl=$(getfacl -h -s -q "${_unsafe}") || return 1
+		[ -z "${_acl}" ] || return 1
 		# An su that fails outright must not read as "cannot write".
 		_w=$(su -m "${bodega_account}" -c "if test -w '${_unsafe}'; then echo yes; else echo no; fi")
 		[ "${_w}" = no ] || return 1
-		[ -n "${_dir}" ] || return 0
+		[ -n "${_dir}" ] || break
 		_dir=${_dir%/*}
 	done
+	_unsafe=$1
+	if [ -L "$1" ]; then
+		return 1
+	elif [ -e "$1" ]; then
+		[ "$(stat -f '%HT %l' "$1")" = "Regular File 1" ] || return 1
+	fi
+	return 0
 }
 
 bodega_prestart()
@@ -189,7 +203,7 @@ bodega_prestart()
 	*"'"*) err 1 "bodega_chdir and bodega_logfile may not contain a single quote" ;;
 	esac
 	if ! bodega_root_only_parent "${bodega_logfile}"; then
-		err 1 "bodega_logfile ${bodega_logfile}: ${_unsafe} is not a directory only root can write (a symlink, not root's, writable by group, others or ${bodega_account}, or a relative, . or .. path), and daemon(8) opens the log as root, so it could be pointed at any file on the host. Set bodega_logfile under a root-owned directory such as /var/log"
+		err 1 "bodega_logfile ${bodega_logfile}: ${_unsafe} is not a directory only root can write, or a log file only root placed (a symlink, not root's, writable by group, others or ${bodega_account}, an ACL entry beyond the mode bits, an existing log that is not a regular file with one link, or a relative, . or .. path), and daemon(8) opens the log as root, so it could be pointed at any file on the host. Set bodega_logfile under a root-owned directory such as /var/log"
 	fi
 	# As the account, not root: root following a symlink the account planted
 	# here would hand the account whatever the link names. chmod rather than
