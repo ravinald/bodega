@@ -226,6 +226,23 @@ func (p *Profile) Lists(typ string) bool {
 	return len(p.entries[typ]) > 0
 }
 
+// Excludes returns why p admits no package of typ at all, or "" when some
+// fetch of typ can succeed. Only one rule reaches that answer: a closed set
+// that lists nothing and blocks what it does not list. Every other marker
+// leaves at least one package Covers permits, so a client configured for the
+// type has something to fetch.
+func (p *Profile) Excludes(typ string) string {
+	if p == nil {
+		return ""
+	}
+	r, ok := p.types[typ]
+	if !ok || r.Membership != audit.MembershipClosed || r.Expansion != audit.ExpansionBlock || len(p.entries[typ]) > 0 {
+		return ""
+	}
+	return fmt.Sprintf("profile %q is closed for %s, lists no %s package and blocks the rest, so every %s fetch is refused",
+		p.name, typ, typ, typ)
+}
+
 // Name returns the profile's name, empty for the nil profile.
 func (p *Profile) Name() string {
 	if p == nil {

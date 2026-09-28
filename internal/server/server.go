@@ -874,6 +874,12 @@ func (s *Server) registerRoutes() {
 	// MASTER_SITE_OVERRIDE=<base>/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/.
 	m.HandleFunc("GET /distfiles/{name...}", s.handleDistfiles)
 
+	// Client configuration: the plan a host reads to learn which files it
+	// installs, and each file rendered for that host.
+	m.HandleFunc("GET /client/plan", s.handleClientPlan)
+	m.HandleFunc("GET /client/plan.txt", s.handleClientPlanText)
+	m.HandleFunc("GET /client/{system}", s.handleClientSystem)
+
 	// REST API
 	m.HandleFunc("GET /api/v1/packages", s.handleAPIPackages)
 	m.HandleFunc("GET /api/v1/packages/{type}", s.handleAPIPackagesByType)
