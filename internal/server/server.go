@@ -470,6 +470,7 @@ func (s *Server) handler() http.Handler {
 	var h http.Handler = s.mux
 	h = AuditMiddleware(s.auditDB)(h)
 	h = MutationAuthMiddleware(s.adminNetsFunc(), s.auditDB, s.pepper, s.logger)(h)
+	h = s.clientAuditMiddleware(h)
 	// Inside the deny list, so a refused address costs no token hash: a
 	// deny-listed peer is the one client that can flood this server on
 	// purpose. Outside everything that writes an audit row, so every row

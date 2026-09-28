@@ -3607,15 +3607,25 @@ bodega's pkg fingerprint is not in the plan. The FreeBSD stanza names it and say
 
 A host bound to a profile that governs freebsd gets the stanza for that profile's filtered catalogue, the same one [pkg under a profile](#pkg-under-a-profile) describes; a host bound to a profile that scopes apt gets its filtered codename. `GET /client/{system}` renders from the same decision, so the file at a record's `url` is the file whose SHA-256 the record carries.
 
-**`plan.txt`.** One record per line, fields separated by one tab, no header. An empty field is written as `-`, because `read` treats a tab as white space and collapses two in a row, which would shift every later column left. The reason is last, so it may carry spaces. Read it with:
+**`plan.txt`.** One record per line, fields separated by one tab, no header. The reason is last, so it may carry spaces. Each field decodes by one rule:
+
+- `-` alone is an empty field. `read` treats a tab as white space and collapses two in a row, so an empty field written as nothing would shift every later column left.
+- A field holding a backslash decodes with `printf '%b'`. The server escapes a backslash as `\\`, a tab as `\t`, a newline as `\n` and a carriage return as `\r`, and a value that is a single `-` (a profile may be named that) as `\0055`.
+- Anything else is the value as written.
+
+Identity names are free text, which is why the escapes exist. `system`, `action`, `path`, `url` and `sha256` come from the server and never need decoding, so a loop that reads only those can skip the step. Read `-r` either way, or `read` eats the backslashes first:
 
 ```sh
 tab=$(printf '\t')
+dec() { case $1 in -) v= ;; *\\*) v=$(printf '%bx' "$1"); v=${v%x} ;; *) v=$1 ;; esac; }
 curl -fsS "https://bodega-host:8080/client/plan.txt?os=freebsd&abi=$(pkg config abi)" |
 while IFS=$tab read -r identity profile match system action path url sha256 reason; do
-  echo "$system $action $path"
+  dec "$profile"; profile=$v
+  echo "$system $action $path (profile: ${profile:-none})"
 done
 ```
+
+The trailing `x` keeps command substitution from stripping a newline the value ends in.
 
 For a FreeBSD host bound to profile `web`, which lists only `nginx` for freebsd and closes npm with nothing listed:
 
@@ -3636,7 +3646,7 @@ web01	web	token:tok-web	distfiles	skip	-	-	-	this server has no distfiles_ports_
 
 <!-- markdownlint-enable MD010 -->
 
-**JSON.** The same records under `records`, with empty fields as `""`. A test reads `plan.txt` through the `sh` loop above and fails if any record differs from the JSON one. Two of the ten from the plan above:
+**JSON.** The same records under `records`, with empty fields as `""` and every value unescaped. A test reads `plan.txt` through the `sh` loop above, decodes each field by the rule above in `sh` itself, and fails if any record differs from the JSON one, including a profile named `-`, a host with no profile and an identity holding a tab and a backslash. Two of the ten from the plan above:
 
 ```json
 {
@@ -3669,12 +3679,12 @@ web01	web	token:tok-web	distfiles	skip	-	-	-	this server has no distfiles_ports_
 
 `\u0026` is `&`, escaped by the JSON encoder; any JSON parser returns the plain URL.
 
-**Refusals.** Every error body is plain text naming the next step:
+**Refusals.** Every error body is plain text naming the next step. The identity check comes first: a host no binding names gets the `403` below on every `/client/` path whatever else is wrong with the request, so an unknown address learns the command that admits it and not which `os` values or system names this server takes.
 
 | Status | When                                                                                            | Body                                                                                                                                                                  |
 | ------ | ----------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `400`  | `os` is missing or not `linux`/`freebsd`, or `abi`/`codename` is malformed                      | the accepted values                                                                                                                                                   |
-| `403`  | no identity binding names the host, on every `/client/` route                                   | the `bodega identity bind` command for its address, and `bodega acl proxies add` first when the address came from a forwarded header this server does not yet believe |
+| `403`  | no identity binding names the host, on every `/client/` path, before any other check            | the `bodega identity bind` command for its address, and `bodega acl proxies add` first when the address came from a forwarded header this server does not yet believe |
 | `403`  | `GET /client/{system}` for a system the host's profile excludes                                 | the profile's reason, the same text as the plan's `refuse` record                                                                                                     |
 | `404`  | `GET /client/{system}` for a system that is a `skip` here, or a name that is not one of the ten | the skip's reason, or the ten names                                                                                                                                   |
 
@@ -3688,7 +3698,7 @@ this host (192.0.2.1) resolves to no identity, and /client/ configures only a ho
 
 An unidentified host is refused rather than handed the unprofiled plan, because the plan names the profile and every path the fleet writes.
 
-**Audit.** Every `/client/` response writes one row. A served plan or file is a `serve_fetch` row with type `client`, the name `plan`, `plan.txt` or the system, and the stated `os` in the version column, so `bodega audit events --type serve_fetch` answers which hosts pulled which plan. A `403` is a `denied` row, `client_unidentified` or `client_excluded`. A `400` or `404` is a `serve_fetch` row with status `failure` and the reason in `details`.
+**Audit.** Every `/client/` response writes one row. A served plan or file is a `serve_fetch` row with type `client`, the name `plan`, `plan.txt` or the system, and the stated `os` in the version column, so `bodega audit events --type serve_fetch` answers which hosts pulled which plan. A `403` is a `denied` row, `client_unidentified` or `client_excluded`. A `400` or `404` is a `serve_fetch` row with status `failure` and the reason in `details`. The row is written around the router rather than inside the handlers, so a response the router gives itself is a row too: a `405` for a method the route does not take, a `404` for `/client/plan/`, a `307` for `/client//plan`. Those are `serve_fetch` rows with status `failure`, the method and path in `details`, and the name taken from the path. A refusal the deny list or the mutation gate writes its own `denied` row for is not written a second time.
 
 ### Git smart-HTTP
 

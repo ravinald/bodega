@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -40,6 +41,18 @@ var planColumns = []string{"identity", "profile", "match", "system", "action", "
 // every column after an empty one would shift left.
 const planEmpty = "-"
 
+// planLiteralDash is a field whose value is planEmpty itself: a profile may be
+// named "-", and a host bound to it must not read as a host with no profile.
+// It is the octal escape printf %b decodes, so one decoding rule covers it and
+// every other escape planEscaper writes.
+const planLiteralDash = `\0055`
+
+// planEscaper writes the characters that would end a plan.txt field or line
+// as the escapes printf %b reads back. A backslash is escaped too, so a
+// value that already holds one survives the round trip. Identity names are free
+// text, so a tab or newline in one is an accepted value, not a malformed one.
+var planEscaper = strings.NewReplacer(`\`, `\\`, "\t", `\t`, "\n", `\n`, "\r", `\r`)
+
 // planRecord is one line of a client plan: one file for one system, or the
 // reason a system has none. The host's identity rides on every record rather
 // than on a header line, so a loop reading plan.txt needs one case, not two.
@@ -73,26 +86,24 @@ func planTSV(records []planRecord) string {
 			if i > 0 {
 				sb.WriteByte('\t')
 			}
-			if f == "" {
-				f = planEmpty
-			}
-			sb.WriteString(f)
+			sb.WriteString(planTSVField(f))
 		}
 		sb.WriteByte('\n')
 	}
 	return sb.String()
 }
 
-// planField strips what would break a plan.txt line. Every value is the
-// server's own, but an identity or a reason quoting an operator's config is
-// not something this route gets to trust to be one line.
-func planField(s string) string {
-	return strings.Map(func(r rune) rune {
-		if r == '\t' || r == '\n' || r == '\r' {
-			return ' '
-		}
-		return r
-	}, s)
+// planTSVField encodes one plan.txt field so a reader recovers the JSON
+// value exactly: planEmpty alone is empty, and anything else holding a
+// backslash decodes through printf %b.
+func planTSVField(f string) string {
+	switch f {
+	case "":
+		return planEmpty
+	case planEmpty:
+		return planLiteralDash
+	}
+	return planEscaper.Replace(f)
 }
 
 // clientQuery is what a host states about itself because the server cannot
@@ -164,31 +175,34 @@ type planFile struct {
 	reason  string
 }
 
-// resolveClient answers the two questions every /client/ route asks first,
-// and writes the response itself when either answer is no: are the stated
-// host facts well formed, and does this host resolve to an identity.
+// admitClient is the first question every /client/ route asks, and writes
+// the refusal itself when the answer is no: does this host resolve to an
+// identity. It runs before the query or the system name is read, so an
+// unknown address learns the command that admits it and nothing about which
+// values this server accepts.
 //
 // An unidentified host is refused outright rather than handed the
 // unprofiled plan. The plan names the profile and every path it writes, and
 // the fleet-wide answer is the one a host outside the binding table would
 // reach anyway by reading the docs; serving it here would make /client/ the
 // route that tells an unknown address which profiles exist.
-func (s *Server) resolveClient(w http.ResponseWriter, r *http.Request, subject string) (*clientHost, bool) {
+func (s *Server) admitClient(w http.ResponseWriter, r *http.Request, subject string) (identityMatch, bool) {
+	m := identityMatchOf(r)
+	if m.Identity == "" {
+		s.writeClientError(w, r, subject, http.StatusForbidden, audit.DenialClientUnidentified, unidentifiedText(r))
+		return m, false
+	}
+	return m, true
+}
+
+// clientHostFor reads the host facts an admitted request states, and writes
+// the 400 itself when they are malformed. m is the binding IdentityMiddleware
+// resolved, the same one profileFor reads the identity from, so the plan's
+// profile and the rule it reports describe one resolution.
+func (s *Server) clientHostFor(w http.ResponseWriter, r *http.Request, subject string, m identityMatch) (*clientHost, bool) {
 	q, err := parseClientQuery(r)
 	if err != nil {
 		s.writeClientError(w, r, subject, http.StatusBadRequest, "", err.Error())
-		return nil, false
-	}
-	m := s.identityMatchFor(r)
-	if id := Identity(r); m.Identity != id {
-		// The binding table reloaded between the middleware and here. The
-		// middleware's answer decided the profile, so it decides the plan,
-		// and the match is left unnamed rather than reported as a row that no
-		// longer names this host.
-		m = identityMatch{Identity: id}
-	}
-	if m.Identity == "" {
-		s.writeClientError(w, r, subject, http.StatusForbidden, audit.DenialClientUnidentified, unidentifiedText(r))
 		return nil, false
 	}
 	return &clientHost{q: q, match: m, profile: s.profileFor(r), base: s.publicBase(r)}, true
@@ -451,16 +465,16 @@ func (h *clientHost) records(files []planFile) []planRecord {
 	out := make([]planRecord, 0, len(files))
 	for _, f := range files {
 		rec := planRecord{
-			Identity: planField(h.match.Identity),
-			Profile:  planField(h.profile.Name()),
-			Match:    planField(h.match.String()),
+			Identity: h.match.Identity,
+			Profile:  h.profile.Name(),
+			Match:    h.match.String(),
 			System:   f.system,
 			Action:   f.action,
-			Reason:   planField(f.reason),
+			Reason:   f.reason,
 		}
 		if f.action == planInstall {
 			sum := sha256.Sum256(f.content)
-			rec.Path = planField(f.path)
+			rec.Path = f.path
 			rec.SHA256 = hex.EncodeToString(sum[:])
 			rec.URL = f.url
 			if rec.URL == "" {
@@ -484,7 +498,11 @@ func (s *Server) handleClientPlanText(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveClientPlan(w http.ResponseWriter, r *http.Request, subject string, text bool) {
-	h, ok := s.resolveClient(w, r, subject)
+	m, ok := s.admitClient(w, r, subject)
+	if !ok {
+		return
+	}
+	h, ok := s.clientHostFor(w, r, subject, m)
 	if !ok {
 		return
 	}
@@ -497,7 +515,7 @@ func (s *Server) serveClientPlan(w http.ResponseWriter, r *http.Request, subject
 	} else {
 		writeJSON(w, http.StatusOK, clientPlan{Records: records})
 	}
-	s.recordClient(r, subject, h, http.StatusOK, "", "")
+	noteClient(r, subject, h, "", "")
 }
 
 // handleClientSystem serves GET /client/{system}: that system's file,
@@ -505,6 +523,10 @@ func (s *Server) serveClientPlan(w http.ResponseWriter, r *http.Request, subject
 // distfiles check) keep the routes that already serve them.
 func (s *Server) handleClientSystem(w http.ResponseWriter, r *http.Request) {
 	sys := r.PathValue("system")
+	m, ok := s.admitClient(w, r, sys)
+	if !ok {
+		return
+	}
 	known := false
 	for _, t := range clientSystems() {
 		known = known || t == sys
@@ -514,7 +536,7 @@ func (s *Server) handleClientSystem(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("no client system named %q. Systems: %s\n", sys, strings.Join(clientSystems(), ", ")))
 		return
 	}
-	h, ok := s.resolveClient(w, r, sys)
+	h, ok := s.clientHostFor(w, r, sys, m)
 	if !ok {
 		return
 	}
@@ -532,7 +554,7 @@ func (s *Server) handleClientSystem(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(f.content)
-	s.recordClient(r, sys, h, http.StatusOK, "", "")
+	noteClient(r, sys, h, "", "")
 }
 
 func (s *Server) writeClientError(w http.ResponseWriter, r *http.Request, subject string, status int, denial, body string) {
@@ -542,7 +564,69 @@ func (s *Server) writeClientError(w http.ResponseWriter, r *http.Request, subjec
 func (s *Server) writeClientErrorFor(w http.ResponseWriter, r *http.Request, subject string, h *clientHost, status int, denial, body string) {
 	w.Header().Set("Cache-Control", "no-store")
 	http.Error(w, strings.TrimRight(body, "\n"), status)
-	s.recordClient(r, subject, h, status, denial, body)
+	noteClient(r, subject, h, denial, body)
+}
+
+// clientAudit is what a /client/ handler knows about its own response and
+// the router does not: the subject, the host it resolved, and why it
+// refused. clientAuditMiddleware writes the row from it once the response is
+// out. A response nothing annotated came from the router itself (a method
+// the route does not take, a path it cannot match, a path it cleaned and
+// redirected), and is recorded all the same.
+type clientAudit struct {
+	subject string
+	host    *clientHost
+	denial  string
+	reason  string
+	// recorded is set when a middleware between this one and the mux wrote
+	// its own denied row for the response, so it is not written twice.
+	recorded bool
+}
+
+func clientAuditOf(r *http.Request) *clientAudit {
+	n, _ := r.Context().Value(clientAuditKey).(*clientAudit)
+	return n
+}
+
+// noteClient hands the response's audit facts to clientAuditMiddleware. A
+// request that did not come through it (a test driving the mux directly)
+// has nowhere to put them, and records nothing.
+func noteClient(r *http.Request, subject string, h *clientHost, denial, reason string) {
+	if n := clientAuditOf(r); n != nil {
+		n.subject, n.host, n.denial, n.reason = subject, h, denial, reason
+	}
+}
+
+// isClientPath reports whether path is one clientAuditMiddleware answers
+// for. It is the raw request path, before the mux cleans it, so /client//plan
+// counts as the /client/ request it was sent as.
+func isClientPath(path string) bool {
+	return path == "/client" || strings.HasPrefix(path, "/client/")
+}
+
+// clientAuditMiddleware writes one audit row per /client/ response. It sits
+// inside IdentityMiddleware, so the row names the host, and outside the
+// mutation gate and the mux, so their answers are rows too rather than
+// responses that left no trace. The deny list is further out and writes its
+// own row.
+//
+// AuditMiddleware cannot do this: it records a 2xx alone and parses a
+// package out of the path, and neither fits a route whose refusals are the
+// half an operator is looking for.
+func (s *Server) clientAuditMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.auditDB == nil || !isClientPath(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		n := &clientAudit{}
+		rec := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
+		r = r.WithContext(context.WithValue(r.Context(), clientAuditKey, n))
+		next.ServeHTTP(rec, r)
+		if !n.recorded {
+			s.recordClient(r, n, rec.statusCode)
+		}
+	})
 }
 
 // recordClient writes the audit row for one /client/ response. A served plan
@@ -552,12 +636,15 @@ func (s *Server) writeClientErrorFor(w http.ResponseWriter, r *http.Request, sub
 // serve_fetch row with status failure and the reason in details, because a
 // host that asked and got nothing is still a host that asked.
 //
-// Written here rather than by AuditMiddleware, which records a 2xx alone and
-// parses a package out of the path; neither fits a route whose refusals are
-// the half an operator is looking for.
-func (s *Server) recordClient(r *http.Request, subject string, h *clientHost, status int, denial, reason string) {
-	if s.auditDB == nil {
-		return
+// No header is copied into the row, the Authorization header least of all.
+func (s *Server) recordClient(r *http.Request, n *clientAudit, status int) {
+	details := map[string]string{}
+	subject, reason := n.subject, n.reason
+	if subject == "" {
+		subject = truncateField(strings.TrimPrefix(r.URL.Path, "/client/"), 64)
+		reason = fmt.Sprintf("the router answered %d %s before any /client/ handler ran", status, http.StatusText(status))
+		details["method"] = r.Method
+		details["path"] = truncateField(r.URL.Path, maxDetailField)
 	}
 	// The stated os rides in the version column, so one query separates the
 	// FreeBSD hosts' plans from the Linux ones.
@@ -571,25 +658,22 @@ func (s *Server) recordClient(r *http.Request, subject string, h *clientHost, st
 		UserAgent:  truncateField(r.UserAgent(), maxDetailField),
 		Status:     "success",
 	}
-	details := map[string]string{}
-	if h != nil && h.profile != nil {
+	if h := n.host; h != nil && h.profile != nil {
 		details["profile"] = h.profile.Name()
 	}
-	if h != nil && h.match.Kind != "" {
+	if h := n.host; h != nil && h.match.Kind != "" {
 		details["match"] = h.match.String()
 	}
 	if status != http.StatusOK {
 		details["http_status"] = fmt.Sprint(status)
 		details["reason"] = truncateField(strings.TrimSpace(reason), maxDetailField)
 		ev.Status = "failure"
-		if denial != "" {
-			ev.EventType, ev.Status = audit.EventDenied, denial
+		if n.denial != "" {
+			ev.EventType, ev.Status = audit.EventDenied, n.denial
 		}
 	}
-	if len(details) > 0 {
-		if b, err := json.Marshal(details); err == nil {
-			ev.Details = string(b)
-		}
+	if b, err := json.Marshal(details); err == nil {
+		ev.Details = string(b)
 	}
 	ctx, cancel := auditContext(r)
 	defer cancel()

@@ -28,6 +28,7 @@ const (
 	trustedNetsKey
 	trustedNetsConfiguredKey
 	identityKey
+	clientAuditKey
 )
 
 // ClientIP returns the resolved client IP from the request context, falling
@@ -275,6 +276,11 @@ func recordDenial(db *audit.DB, r *http.Request, reason string, extra map[string
 // parseAPIPackagePath would leave the subject columns empty on exactly the
 // refusals an operator would filter by package to find.
 func recordDenialFor(db *audit.DB, r *http.Request, pkgType, pkgName, pkgVersion, reason string, extra map[string]string) {
+	// Before the ShouldRecord check: a denial this server's audit_events
+	// leaves out is still one the /client/ row must not stand in for.
+	if n := clientAuditOf(r); n != nil {
+		n.recorded = true
+	}
 	// ShouldRecord before the bound, not just inside Record: a server whose
 	// audit_events leaves out "denied" would otherwise serialize every 403 on
 	// denialWriteSlots to reach a write that returns immediately.

@@ -18,10 +18,16 @@ import (
 // matched on the address, and an audit row that dropped it would lose which of
 // an identity's addresses asked.
 func Identity(r *http.Request) string {
-	if id, ok := r.Context().Value(identityKey).(string); ok {
-		return id
-	}
-	return ""
+	return identityMatchOf(r).Identity
+}
+
+// identityMatchOf is the binding IdentityMiddleware resolved this request
+// through. A handler reporting which rule matched reads it here rather than
+// resolving again: a binding table reloaded in between would answer for a
+// different generation than the one that decided the request's identity.
+func identityMatchOf(r *http.Request) identityMatch {
+	m, _ := r.Context().Value(identityKey).(identityMatch)
+	return m
 }
 
 // credentialForm names how a request carried its credential. It is recorded on
@@ -243,18 +249,18 @@ func (s *identitySet) identityForToken(cred, pepper string, now time.Time) (iden
 // It admits nothing and refuses nothing. A request with no credential, an
 // unknown credential or an expired one reaches the next handler exactly as it
 // did before this middleware existed; all that changes is what the row says.
-func IdentityMiddleware(resolve func(*http.Request) string) func(http.Handler) http.Handler {
+func IdentityMiddleware(resolve func(*http.Request) identityMatch) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		if resolve == nil {
 			return next
 		}
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			id := resolve(r)
-			if id == "" {
+			m := resolve(r)
+			if m.Identity == "" {
 				next.ServeHTTP(w, r)
 				return
 			}
-			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), identityKey, id)))
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), identityKey, m)))
 		})
 	}
 }
@@ -337,8 +343,8 @@ func hasTokenBinding(bindings []audit.IdentityBinding) bool {
 }
 
 // identityFunc hands the middleware a live view of the binding table.
-func (s *Server) identityFunc() func(*http.Request) string {
-	return func(r *http.Request) string { return s.identityMatchFor(r).Identity }
+func (s *Server) identityFunc() func(*http.Request) identityMatch {
+	return s.identityMatchFor
 }
 
 // identityMatchFor resolves r against the current binding table.
