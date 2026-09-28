@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/ravinald/bodega/internal/clientconf"
 )
 
 // Credential writing. The checks in this package report; this file is the one
@@ -157,7 +159,7 @@ func CredentialTargets(home string) []CredentialTarget {
 			Mode:   0o600,
 			body:   cargoEntry,
 			owned:  cargoOwned,
-			Note:   "point cargo at the registry too: [registries.bodega] index = \"sparse+<base>/cargo/\" in config.toml",
+			Note:   cargoNote(),
 		},
 		{
 			Client:      "helm",
@@ -219,6 +221,13 @@ func npmEntry(base *url.URL, token string) string {
 	return fmt.Sprintf("//%s/npm/:_authToken=%s", base.Host, token)
 }
 
+// cargoNote names the source replacement the token is useless without,
+// flattened onto the one line the doctor table prints it on.
+func cargoNote() string {
+	return "redirect crates.io to bodega in ~/.cargo/config.toml too: " +
+		strings.Join(strings.Fields(clientconf.Cargo("http://<bodega>").Content), " ")
+}
+
 func cargoEntry(_ *url.URL, token string) string {
 	// Bare, with no scheme: cargo sends the stored token as the whole
 	// Authorization header value, which is the credential form the serve path
@@ -227,8 +236,8 @@ func cargoEntry(_ *url.URL, token string) string {
 }
 
 func helmEntry(base *url.URL, token string) string {
-	return fmt.Sprintf("- name: bodega\n  url: %s/helm\n  username: bodega\n  password: %s\n  insecure_skip_tls_verify: false",
-		strings.TrimSuffix(base.String(), "/"), token)
+	return strings.TrimSuffix(clientconf.HelmRepository(base.String(),
+		"username: bodega", "password: "+token, "insecure_skip_tls_verify: false"), "\n")
 }
 
 // Render returns the file contents this target lands on a host that has none.
@@ -484,12 +493,8 @@ func cutManaged(existing string) (before, after string, found bool, err error) {
 // partial file it tolerates: it is rejected whole, and every later
 // `helm repo add` fails with it until someone deletes the file. The entry
 // needs the top-level keys around it, which is the same rule helmAppendable
-// enforces on a file that already exists. The zero timestamp keeps a second
-// --write-credentials run byte-identical; helm rewrites it on its own next
-// write.
-func helmDocument(block string) string {
-	return "apiVersion: \"\"\ngenerated: \"0001-01-01T00:00:00Z\"\nrepositories:\n" + block
-}
+// enforces on a file that already exists.
+func helmDocument(block string) string { return clientconf.HelmDocument(block) }
 
 // helmAppendable refuses to append a repository under a repositories.yaml
 // whose shape would not carry it. helm's own file ends with the repositories

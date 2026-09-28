@@ -3255,16 +3255,19 @@ FreeBSD is not an exception to `/etc`. pip reads `/etc/xdg/pip/pip.conf`, `/etc/
 GOPROXY=https://bodega-host:8080/go
 ```
 
-That is the file `go env -w GOPROXY=https://bodega-host:8080/go` writes, and the toolchain reads it on every run, so no shell profile has to export anything. The value has no `direct` entry after it: with one, a module bodega does not hold is fetched straight from its VCS host, and `bodega doctor` reports that as a bypass.
+That is the file `go env -w GOPROXY=https://bodega-host:8080/go` writes, and the toolchain reads it on every run, so no shell profile has to export anything. The value has no `direct` entry after it: with one, a module bodega does not hold is fetched straight from its VCS host, and `bodega doctor` reports that as a bypass. doctor resolves the value the way the go command does: a non-empty `GOPROXY` in the environment first, then this file (at `$GOENV` when that is set, and not at all under `GOENV=off`), so a host configured with the file alone passes, and an environment override that brings `direct` back still warns. A file doctor cannot read is reported `SKIPPED` rather than as a fallback it did not observe.
 
-**Helm** (the `repositories:` list in `~/.config/helm/repositories.yaml` on Linux and FreeBSD, `~/Library/Preferences/helm/repositories.yaml` on macOS):
+**Helm** (`~/.config/helm/repositories.yaml` on Linux and FreeBSD, `~/Library/Preferences/helm/repositories.yaml` on macOS):
 
 ```yaml
+apiVersion: ""
+generated: "0001-01-01T00:00:00Z"
+repositories:
 - name: bodega
   url: https://bodega-host:8080/helm
 ```
 
-`helm repo add bodega https://bodega-host:8080/helm` writes the same entry. The paths are helm's defaults and move with `HELM_REPOSITORY_CONFIG` or `XDG_CONFIG_HOME`.
+helm unmarshals the whole file, so the list item alone is not something to install: `helm repo list` over a file holding only the `- name: bodega` entry answers `Error: no repositories to show`. On a host that already has the file, `helm repo add bodega https://bodega-host:8080/helm` adds the same entry to it. `bodega doctor --write-credentials` writes this document with the credential added to the entry. The paths are helm's defaults and move with `HELM_REPOSITORY_CONFIG` or `XDG_CONFIG_HOME`.
 
 **npm** (`~/.npmrc`):
 
@@ -5097,7 +5100,7 @@ The form edits no ACL. `deny_list`, `admin_permit_cidr` and `trusted_proxies` ar
 
 Two fields report where an entry's bytes are. **Stored** answers whether the probe found the primary artifact and names the backend it looked on (`yes (backend default)`); **Object** prints that object's URI, prefixed with the backend's own label — `file://<storage_path>` for a local backend, `s3://<bucket>` for an s3 one. Both read the backend the manifest entry records, so a local-only install reports its own disk rather than a bucket it never configured. Neither field is derived from `bucket`: an install carrying a leftover `bucket` key alongside `"storage_backend": "local"` printed an `s3://` URI over bytes on its own disk through v1.
 
-The last fields of an entry are its client configuration: the file a client of that type installs, as [Client configuration](#client-configuration) shows it, with a **Path** row under it naming where the file goes on each operating system. The label names the file rather than assuming a URL: **pip.conf**, **.npmrc**, **Cargo config**, **Go env**, **Helm repository**, **Git config**, **make.conf**, **Sources** for apt, **Repository conf** for freebsd. A binary, and a git entry's stored bundle, get a **Package URL** instead, which has no path. The pane renders through the same package as `client_config` on `GET /api/v1/packages/{type}/{name}` and the web dashboard, and every value carries the base URL `public_url` and the TLS pair resolve to, so a pane behind a terminating proxy prints what a client outside it reaches. A type with several variants shows one: the suite described below for apt, the first ABI that renders for freebsd, the first version for a binary or a git bundle.
+The last fields of an entry are its client configuration: the file a client of that type installs, as [Client configuration](#client-configuration) shows it, with a **Path** row under it naming where the file goes on each operating system. The label names the file rather than assuming a URL: **pip.conf**, **.npmrc**, **Cargo config**, **Go env**, **repositories.yaml** for helm, **Git config**, **make.conf**, **Sources** for apt, **Repository conf** for freebsd. A binary, and a git entry's stored bundle, get a **Package URL** instead, which has no path. The pane renders through the same package as `client_config` on `GET /api/v1/packages/{type}/{name}` and the web dashboard, and every value carries the base URL `public_url` and the TLS pair resolve to, so a pane behind a terminating proxy prints what a client outside it reaches. A type with several variants shows one: the suite described below for apt, the first ABI that renders for freebsd, the first version for a binary or a git bundle.
 
 A multi-line value is rendered one source line per row and never reflowed, so a pane too narrow for a line cuts it at the right edge instead of wrapping it. The pane offers nothing to copy, so what an operator reads is what they retype: a wrapped `registry = "..."` is a TOML parse error, and cargo reports it against their config file rather than against the pane. Widening the terminal is the fix. Do not count on the cut announcing itself: it can take a closing quote and nothing else, leaving a line that reads as finished and parses as an unterminated string.
 

@@ -262,6 +262,22 @@ type probeResult struct {
 // hash fragment and canned envelopes, and reports what rendered.
 func runPage(t *testing.T, hash string, canned map[string]any) probeResult {
 	t.Helper()
+	cannedJSON, err := json.Marshal(canned)
+	if err != nil {
+		t.Fatalf("marshal canned envelopes: %v", err)
+	}
+	out := runScript(t, harnessProbe, "HARNESS_HASH="+hash, "HARNESS_CANNED="+string(cannedJSON))
+	var got probeResult
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("decode probe output %q: %v", out, err)
+	}
+	return got
+}
+
+// runScript evaluates the embedded page's script under domStub, then probe in
+// the same scope, and returns what probe printed.
+func runScript(t *testing.T, probe string, env ...string) []byte {
+	t.Helper()
 	node, err := exec.LookPath("node")
 	if err != nil {
 		// A developer without node still gets the rest of the suite. CI is the
@@ -285,16 +301,12 @@ func runPage(t *testing.T, hash string, canned map[string]any) probeResult {
 	script = strings.Replace(script, "\ninit();\n", "\n", 1)
 
 	path := filepath.Join(t.TempDir(), "page.cjs")
-	if err := os.WriteFile(path, []byte(domStub+script+harnessProbe), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(domStub+script+probe), 0o600); err != nil {
 		t.Fatalf("write harness: %v", err)
 	}
 
-	cannedJSON, err := json.Marshal(canned)
-	if err != nil {
-		t.Fatalf("marshal canned envelopes: %v", err)
-	}
 	cmd := exec.Command(node, path)
-	cmd.Env = append(os.Environ(), "HARNESS_HASH="+hash, "HARNESS_CANNED="+string(cannedJSON))
+	cmd.Env = append(os.Environ(), env...)
 	out, err := cmd.Output()
 	if err != nil {
 		stderr := ""
@@ -303,12 +315,73 @@ func runPage(t *testing.T, hash string, canned map[string]any) probeResult {
 		}
 		t.Fatalf("run page: %v\n%s", err, stderr)
 	}
+	return out
+}
 
-	var got probeResult
-	if err := json.Unmarshal(out, &got); err != nil {
-		t.Fatalf("decode probe output %q: %v", out, err)
+// staleDetailProbe selects packages in order, holding every fetch open, then
+// answers them in the order given and reports what the detail pane shows.
+// Each answer carries the index of the selection that asked for it, so a
+// stale one is identifiable wherever it lands. The pane's elements persist
+// across renders, as the one live element a real querySelector finds does.
+const staleDetailProbe = `
+const __d = document.getElementById('detail');
+const __client = {innerHTML: ''}, __pre = {textContent: ''}, __copy = {};
+__d.querySelector = s => ({'.client-config': __client, '.json-pre': __pre, '.copy-json': __copy})[s] || null;
+const __pending = [];
+globalThis.fetch = url => new Promise(resolve => __pending.push({url, resolve}));
+const __answer = i => ({ok: true, json: async () => ({
+  name: 'sel-' + i,
+  client_config: [{label: 'Package URL', content: 'https://bodega.example.com/binaries/sel-' + i}],
+})});
+const __flush = () => new Promise(setImmediate);
+(async () => {
+  const names = JSON.parse(process.env.HARNESS_SELECT);
+  const order = JSON.parse(process.env.HARNESS_ANSWER);
+  names.forEach(n => showDetail('binary', {name: n}));
+  for (const i of order) { __pending[i].resolve(__answer(i)); await __flush(); await __flush(); }
+  console.log(JSON.stringify({client: __client.innerHTML, json: __pre.textContent, copy: __copy._jsonData || ''}));
+})().catch(e => { console.error(e); process.exit(1); });
+`
+
+// TestShowDetailDropsStaleResponses drives showDetail with responses held open
+// and answered out of order. The pane is reused across selections, so a late
+// answer for a package the operator has left would put that package's
+// download link and copy target under the current package's heading. A>B and
+// A>B>A both, because a check keyed on the package name passes the first and
+// fails the second.
+func TestShowDetailDropsStaleResponses(t *testing.T) {
+	cases := []struct {
+		name   string
+		picks  []string
+		answer []int
+		want   int
+	}{
+		{name: "older answers last", picks: []string{"a", "b"}, answer: []int{1, 0}, want: 1},
+		{name: "older answers first", picks: []string{"a", "b"}, answer: []int{0, 1}, want: 1},
+		{name: "return to the first", picks: []string{"a", "b", "a"}, answer: []int{2, 1, 0}, want: 2},
 	}
-	return got
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sel, _ := json.Marshal(tc.picks)
+			ans, _ := json.Marshal(tc.answer)
+			out := runScript(t, staleDetailProbe, "HARNESS_SELECT="+string(sel), "HARNESS_ANSWER="+string(ans))
+			var got struct{ Client, JSON, Copy string }
+			if err := json.Unmarshal(out, &got); err != nil {
+				t.Fatalf("decode probe output %q: %v", out, err)
+			}
+			want := fmt.Sprintf("sel-%d", tc.want)
+			for field, v := range map[string]string{"client config": got.Client, "JSON pane": got.JSON, "JSON copy target": got.Copy} {
+				if !strings.Contains(v, want) {
+					t.Errorf("%s does not show the current selection %s: %q", field, want, v)
+				}
+				for i := range tc.picks {
+					if other := fmt.Sprintf("sel-%d", i); i != tc.want && strings.Contains(v, other) {
+						t.Errorf("%s carries stale answer %s: %q", field, other, v)
+					}
+				}
+			}
+		})
+	}
 }
 
 // cannedEnvelopes builds the three responses the page fetches, one key per

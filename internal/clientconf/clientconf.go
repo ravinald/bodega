@@ -133,21 +133,41 @@ func Gomod(base string) File {
 	}
 }
 
-// Helm renders bodega's entry in helm's repositories.yaml, at the path helm
-// uses when neither HELM_REPOSITORY_CONFIG nor XDG_CONFIG_HOME is set. The
-// entry goes under the file's repositories: key; `bodega doctor
-// --write-credentials` writes it with the credential attached.
+// Helm renders a whole repositories.yaml registering bodega, at the path helm
+// uses when neither HELM_REPOSITORY_CONFIG nor XDG_CONFIG_HOME is set. helm
+// unmarshals the file into a struct, so the entry alone is not a file it
+// reads: `helm repo list` over a bare sequence reports no repositories.
 func Helm(base string) File {
 	return File{
 		System: manifest.TypeHelm,
-		Label:  "Helm repository",
+		Label:  "repositories.yaml",
 		Paths: map[string]string{
 			OSLinux:   "~/.config/helm/repositories.yaml",
 			OSFreeBSD: "~/.config/helm/repositories.yaml",
 			OSDarwin:  "~/Library/Preferences/helm/repositories.yaml",
 		},
-		Content: fmt.Sprintf("- name: bodega\n  url: %s/helm\n", trim(base)),
+		Content: HelmDocument(HelmRepository(base)),
 	}
+}
+
+// HelmRepository renders bodega's item in the repositories list. extra are
+// further keys of the same item, one "key: value" each, which is how `bodega
+// doctor --write-credentials` attaches the credential without a second copy
+// of the name and URL.
+func HelmRepository(base string, extra ...string) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "- name: bodega\n  url: %s/helm\n", trim(base))
+	for _, kv := range extra {
+		sb.WriteString("  " + kv + "\n")
+	}
+	return sb.String()
+}
+
+// HelmDocument wraps repository items in the keys helm's parser requires
+// around them. The zero timestamp keeps two renders byte-identical; helm
+// rewrites it on its own next write.
+func HelmDocument(repositories string) string {
+	return "apiVersion: \"\"\ngenerated: \"0001-01-01T00:00:00Z\"\nrepositories:\n" + repositories
 }
 
 // Git renders one url.<base>/git/<namespace>/.insteadOf per git_upstreams

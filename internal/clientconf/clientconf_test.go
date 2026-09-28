@@ -10,6 +10,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/config"
@@ -72,9 +75,10 @@ func TestRenderers(t *testing.T) {
 			},
 		},
 		{
-			name:    "helm",
-			got:     Helm(testBase),
-			content: "- name: bodega\n  url: https://bodega.example.com/helm\n",
+			name: "helm",
+			got:  Helm(testBase),
+			content: "apiVersion: \"\"\ngenerated: \"0001-01-01T00:00:00Z\"\nrepositories:\n" +
+				"- name: bodega\n  url: https://bodega.example.com/helm\n",
 			paths: map[string]string{
 				OSLinux:   "~/.config/helm/repositories.yaml",
 				OSFreeBSD: "~/.config/helm/repositories.yaml",
@@ -155,9 +159,55 @@ func TestAptCarriesNotes(t *testing.T) {
 	}
 }
 
+// helmRepoFile mirrors helm's repo.File, the struct helm unmarshals
+// repositories.yaml into, with the entry fields bodega writes.
+type helmRepoFile struct {
+	APIVersion   string    `yaml:"apiVersion"`
+	Generated    time.Time `yaml:"generated"`
+	Repositories []struct {
+		Name                  string `yaml:"name"`
+		URL                   string `yaml:"url"`
+		Username              string `yaml:"username"`
+		Password              string `yaml:"password"`
+		InsecureSkipTLSverify bool   `yaml:"insecure_skip_tls_verify"`
+	} `yaml:"repositories"`
+}
+
+// parseHelmFile decodes a rendered repositories.yaml the way helm does,
+// strict about keys.
+func parseHelmFile(t *testing.T, doc string) helmRepoFile {
+	t.Helper()
+	dec := yaml.NewDecoder(strings.NewReader(doc))
+	dec.KnownFields(true)
+	var f helmRepoFile
+	if err := dec.Decode(&f); err != nil {
+		t.Fatalf("helm could not read this repositories.yaml: %v\n%s", err, doc)
+	}
+	return f
+}
+
+// TestHelmIsARepositoryFile parses what Helm renders as the file helm reads,
+// rather than comparing bytes: the bare list item this renderer used to
+// return passed a byte comparison and `helm repo list` read no repository
+// from it. The credential-bearing entry goes through the same parse, because
+// it is the same document with keys added to the one item.
+func TestHelmIsARepositoryFile(t *testing.T) {
+	for name, doc := range map[string]string{
+		"public":     Helm(testBase + "/").Content,
+		"credential": HelmDocument(HelmRepository(testBase, "username: bodega", "password: tok")),
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := parseHelmFile(t, doc)
+			if len(f.Repositories) != 1 || f.Repositories[0].Name != "bodega" || f.Repositories[0].URL != testBase+"/helm" {
+				t.Fatalf("no bodega repository at %s/helm in:\n%s", testBase, doc)
+			}
+		})
+	}
+}
+
 // TestNoDirectFallback holds the GOPROXY value to what doctor accepts. Both
-// earlier copies appended ",direct", which doctor's goproxy-env check reports
-// as a bypass of the server that handed the value out.
+// earlier copies appended a direct fallback, which doctor's goproxy-env check
+// reports as a bypass of the server that handed the value out.
 func TestNoDirectFallback(t *testing.T) {
 	if got := GoProxy(testBase + "/"); got != testBase+"/go" {
 		t.Errorf("GoProxy = %q, want %q", got, testBase+"/go")

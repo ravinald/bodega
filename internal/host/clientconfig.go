@@ -1,6 +1,8 @@
 package host
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -125,31 +127,107 @@ func CheckNpmConfig() Finding {
 	return f
 }
 
-// CheckGoproxyEnv reports whether GOPROXY is set to a value that includes a
-// direct or off-bodega upstream. The Go toolchain's default GOPROXY of
-// "https://proxy.golang.org,direct" bypasses bodega entirely.
+// CheckGoproxyEnv reports whether the GOPROXY the go command will use
+// includes a direct or off-bodega upstream. The Go toolchain's default GOPROXY
+// of "https://proxy.golang.org,direct" bypasses bodega entirely.
+//
+// The value is resolved the way the go command resolves it, not read from the
+// environment alone: a non-empty GOPROXY in the environment wins, then the go
+// env file (`go env -w`), which is the form bodega's clientconf hands out and
+// which no shell exports.
 func CheckGoproxyEnv() Finding {
+	return checkGoproxy(os.Getenv, os.UserConfigDir)
+}
+
+func checkGoproxy(getenv func(string) string, configDir func() (string, error)) Finding {
 	f := Finding{Check: "goproxy-env"}
 
-	val := os.Getenv("GOPROXY")
+	val, source := getenv("GOPROXY"), "the environment"
+	if val == "" {
+		file, err := goEnvFile(getenv, configDir)
+		if err != nil {
+			f.Status = StatusSkip
+			f.Detail = "GOPROXY unset in the environment and the go env file could not be located: " + err.Error()
+			f.Remediation = "set GOENV to the go env file's path, or HOME, and run doctor again"
+			return f
+		}
+		if file != "" {
+			fileVal, found, err := readGoEnvFile(file, "GOPROXY")
+			if err != nil {
+				f.Status = StatusSkip
+				f.Detail = "GOPROXY unset in the environment and " + file + " could not be read: " + err.Error()
+				f.Remediation = "run doctor as the user whose go env file that is, or check its permissions"
+				return f
+			}
+			if found {
+				val, source = fileVal, file
+			}
+		}
+	}
+
 	switch {
 	case val == "":
 		f.Status = StatusWarn
-		f.Detail = "GOPROXY unset; Go falls back to proxy.golang.org,direct which bypasses bodega"
-		f.Remediation = "export GOPROXY=" + clientconf.GoProxy("http://<bodega>")
+		f.Detail = "GOPROXY unset in the environment and the go env file; Go falls back to proxy.golang.org,direct which bypasses bodega"
+		f.Remediation = "go env -w GOPROXY=" + clientconf.GoProxy("http://<bodega>")
 	case strings.Contains(val, "proxy.golang.org"):
 		f.Status = StatusWarn
-		f.Detail = "GOPROXY=" + val + " references proxy.golang.org directly"
+		f.Detail = "GOPROXY=" + val + " (from " + source + ") references proxy.golang.org directly"
 		f.Remediation = "remove proxy.golang.org from GOPROXY; keep only the bodega endpoint and ,off (not ,direct)"
 	case strings.Contains(val, ",direct"):
 		f.Status = StatusWarn
-		f.Detail = "GOPROXY=" + val + " ends in ,direct; Go will fall through to upstream VCS on cache miss"
+		f.Detail = "GOPROXY=" + val + " (from " + source + ") ends in ,direct; Go will fall through to upstream VCS on cache miss"
 		f.Remediation = "replace ,direct with ,off so cache misses fail loudly instead of bypassing bodega"
 	default:
 		f.Status = StatusOK
-		f.Detail = "GOPROXY=" + val + " (no fall-through to public upstreams)"
+		f.Detail = "GOPROXY=" + val + " (from " + source + "; no fall-through to public upstreams)"
 	}
 	return f
+}
+
+// goEnvFile is the file `go env -w` writes: $GOENV, or go/env under the user
+// config directory. "" means GOENV=off, where the go command reads no file.
+func goEnvFile(getenv func(string) string, configDir func() (string, error)) (string, error) {
+	switch file := getenv("GOENV"); file {
+	case "off":
+		return "", nil
+	case "":
+	default:
+		return file, nil
+	}
+	dir, err := configDir()
+	if err != nil {
+		return "", err
+	}
+	if dir == "" {
+		return "", errors.New("no user config directory")
+	}
+	return filepath.Join(dir, "go", "env"), nil
+}
+
+// readGoEnvFile returns key's value from a go env file, parsed as the go
+// command parses it: KEY=VALUE lines, untrimmed, the last assignment winning,
+// anything not opening with an uppercase letter skipped. A file that does not
+// exist is no value rather than an error, because that is what the go command
+// makes of it.
+func readGoEnvFile(path, key string) (string, bool, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	var val string
+	var found bool
+	for _, line := range strings.Split(string(data), "\n") {
+		k, v, ok := strings.Cut(line, "=")
+		if !ok || line[0] < 'A' || line[0] > 'Z' || k != key {
+			continue
+		}
+		val, found = v, true
+	}
+	return val, found, nil
 }
 
 // scanHit records the first config file that contains a public-upstream

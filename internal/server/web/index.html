@@ -555,7 +555,14 @@ function render() {
   }
 }
 
+// detailGen counts what #detail has been asked to show. Every fetch a render
+// starts checks it before writing, so a response for a selection the operator
+// has since left, including one they later return to, cannot land under the
+// current heading: a stale client file there is a wrong download.
+var detailGen = 0;
+
 function showDetail(type, entry) {
+  const gen = ++detailGen;
   const d = document.getElementById('detail');
   const ver = entryVersion(type, entry);
   location.hash = encodeURIComponent(type + '/' + entry.name + (ver ? '/' + ver : ''));
@@ -649,6 +656,7 @@ function showDetail(type, entry) {
     .then(function(r) { return r.ok ? r.json() : null; })
     .catch(function() { return null; });
   pkg.then(function(p) {
+    if (gen !== detailGen) return;
     var el = d.querySelector('.client-config');
     if (el) el.innerHTML = clientConfigHtml(type, entry, (p && p.client_config) || []);
   });
@@ -660,6 +668,7 @@ function showDetail(type, entry) {
     : pkg.then(function(p) { return p || entry; });
   manifestReq
     .then(function(manifest) {
+      if (gen !== detailGen) return;
       if (manifest && manifest.client_config) {
         manifest = Object.assign({}, manifest);
         delete manifest.client_config;
@@ -747,6 +756,7 @@ function clientConfigHtml(type, entry, files) {
 }
 
 async function showDashboard() {
+  detailGen++;
   selectedKey = null;
   render();
   var d = document.getElementById('detail');
