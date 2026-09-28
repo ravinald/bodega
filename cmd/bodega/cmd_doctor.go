@@ -54,6 +54,8 @@ outside bodega's allow-list. Common findings:
   - Homebrew with auto-update enabled
   - pip / cargo / npm / apt configured to talk to public registries directly
   - GOPROXY unset or falling through to proxy.golang.org
+  - on FreeBSD, a pkg repository still enabled at pkg.FreeBSD.org, or a
+    make.conf that does not send distfiles through bodega
 
 Where this machine holds a bodega install, doctor also reports the server's
 own posture: an install with no allow-list rule and no publish-age or OSV

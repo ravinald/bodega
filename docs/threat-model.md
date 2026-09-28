@@ -708,10 +708,10 @@ instance, the recommended posture is:
 - **Configure each package manager to talk to bodega exclusively.**
   `bodega doctor` enumerates the files it checks and the bodega endpoint each
   should point at. Re-run `bodega doctor` after rewriting to confirm exit 0.
-  On FreeBSD it does not yet check the pkg repository configuration or
-  `/etc/make.conf`, so inspect `/usr/local/etc/pkg/repos/` and
-  `MASTER_SITE_OVERRIDE` by hand
-  ([#49](https://github.com/ravinald/bodega/issues/49)).
+  On FreeBSD the `pkg-repos` check reads `/etc/pkg/` and
+  `/usr/local/etc/pkg/repos/` for an enabled upstream repository, and
+  `make-conf` reads `/etc/make.conf` for distfiles sites that are not
+  bodega's and for the client check included last.
 - **Set `GOPROXY` to `http://<bodega>/go`**, with no `direct` entry after
   it. A cache miss then fails loudly; a `direct` entry silently falls
   through to public VCS, defeating the chokepoint.
