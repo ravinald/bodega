@@ -182,7 +182,7 @@ jobs:
           release: "15.1"
           copyback: false
           prepare: |
-            pkg install -y go126 git
+            pkg install -y go126 git node
             pw useradd -n bodega-ci -m -s /bin/sh
             install -d -o bodega-ci -g bodega-ci -m 0700 /home/bodega-ci/tmp
             chown -R bodega-ci "$GITHUB_WORKSPACE"
