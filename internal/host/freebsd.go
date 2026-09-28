@@ -77,9 +77,13 @@ func pkgURLHost(raw string) string {
 
 // CheckPkgRepos reports whether pkg on this FreeBSD host can fetch from
 // FreeBSD's own repositories, and whether it reads a bodega one at all.
-func CheckPkgRepos() Finding { return checkPkgRepos("", runtime.GOOS) }
+func CheckPkgRepos() Finding { return checkPkgReposEnv("", runtime.GOOS, os.Getenv) }
 
 func checkPkgRepos(root, goos string) Finding {
+	return checkPkgReposEnv(root, goos, func(string) string { return "" })
+}
+
+func checkPkgReposEnv(root, goos string, getenv func(string) string) Finding {
 	f := Finding{Check: "pkg-repos"}
 	if goos != "freebsd" {
 		f.Status = StatusNA
@@ -87,29 +91,33 @@ func checkPkgRepos(root, goos string) Finding {
 		return f
 	}
 	remediation := "bodega doctor --write-pkg-repo --url <bodega> writes " + pkgrepos.ClientConfPath + " with the bodega repository and the overrides that disable upstream; confirm with pkg -vv"
-	repos, err := loadPkgRepos(root)
+	repos, rejected, err := loadPkgRepos(root, getenv)
 	var unmodeled pkgUnmodeled
 	if errors.As(err, &unmodeled) {
 		f.Status = StatusWarn
 		f.Detail = unmodeled.Error() + ", so doctor cannot establish which repositories pkg reads"
-		f.Remediation = "replace it with plain repository objects; " + remediation
+		f.Remediation = "replace it with plain repository objects in the default REPOS_DIR; " + remediation
 		return f
 	}
 	if err != nil {
 		f.Status = StatusSkip
 		f.Detail = err.Error()
-		f.Remediation = "run doctor as a user that can read /etc/pkg and " + pkgrepos.ClientReposDir + ", or fix the file pkg would also fail to parse"
+		f.Remediation = "run doctor as a user that can read /etc/pkg, " + pkgrepos.ClientReposDir + ", " + pkgConfPath + " and " + pkgReposState + ", or fix the file pkg would also fail to parse"
 		return f
 	}
 
-	var upstream, bodega []string
+	var upstream, bodega, unresolved []string
 	for _, r := range repos {
 		if !r.Enabled {
 			continue
 		}
 		// A base tag redefined with a bodega URL is a bodega repository:
-		// the URL decides where pkg fetches from, not the name.
+		// the URL decides where pkg fetches from, not the name. A host pkg
+		// fills in from a variable (pkg.${OSNAME}.org is pkg.FreeBSD.org)
+		// decides neither way.
 		switch {
+		case pkgURLUnresolved(r.URL):
+			unresolved = append(unresolved, fmt.Sprintf("%s (%s, set in %s)", r.Name, r.URL, r.From))
 		case r.bodega():
 			bodega = append(bodega, r.Name)
 		case r.upstream():
@@ -121,10 +129,16 @@ func checkPkgRepos(root, goos string) Finding {
 	if len(upstream) > 0 {
 		problems = append(problems, "upstream repository enabled: "+strings.Join(upstream, ", "))
 	}
+	if len(unresolved) > 0 {
+		problems = append(problems, "enabled repository whose host doctor cannot resolve: "+strings.Join(unresolved, ", "))
+	}
 	if len(bodega) == 0 {
 		problems = append(problems, "no enabled repository points at a bodega /freebsd/ URL")
 	}
 	if len(problems) > 0 {
+		if len(rejected) > 0 {
+			problems = append(problems, "pkg rejects and ignores "+strings.Join(rejected, ", "))
+		}
 		f.Status = StatusWarn
 		f.Detail = strings.Join(problems, "; ")
 		f.Remediation = remediation
@@ -133,6 +147,21 @@ func checkPkgRepos(root, goos string) Finding {
 	f.Status = StatusOK
 	f.Detail = "pkg reads only bodega repositories: " + strings.Join(bodega, ", ")
 	return f
+}
+
+// pkgURLUnresolved reports whether a repository URL's host is not a literal
+// doctor can compare: one holding a UCL variable, or one that does not parse.
+func pkgURLUnresolved(raw string) bool {
+	rest := strings.TrimPrefix(raw, "pkg+")
+	if _, after, ok := strings.Cut(rest, "://"); ok {
+		rest = after
+	}
+	host, _, _ := strings.Cut(rest, "/")
+	if strings.Contains(host, "$") {
+		return true
+	}
+	_, err := url.Parse(strings.TrimPrefix(raw, "pkg+"))
+	return err != nil
 }
 
 // pkgUnmodeled is a repository file doctor cannot read the way pkg does: a
@@ -146,15 +175,36 @@ func (e pkgUnmodeled) Error() string { return e.msg }
 // reported instead of recursing.
 const uclIncludeDepth = 16
 
-// loadPkgRepos reads every *.conf under pkgReposDirs and merges the
-// repositories the way pkg 2.8 does, measured with pkg -vv on 15.1:
-// directories in order, files within one in lexical order, and each later
-// file's keys replacing earlier ones per repository name, compared
-// case-sensitively. Within one file and the files it includes, libucl keeps
+const (
+	// pkgConfPath is pkg's own configuration, which can move REPOS_DIR and
+	// PKG_DBDIR or define repositories inline.
+	pkgConfPath = "/usr/local/etc/pkg.conf"
+	// pkgReposState holds one empty file per repository name under enable/
+	// and disable/, which pkg applies after every repository file.
+	pkgReposState = "/var/db/pkg/repos_state"
+)
+
+// pkgConfOverrides are the pkg.conf keys, and the environment variables of
+// the same name, that change which repositories pkg reads or where it keeps
+// repos_state. doctor reads only the defaults, so any of them set leaves the
+// repository set unknown.
+var pkgConfOverrides = []string{"REPOS_DIR", "REPOSITORIES", "PKG_DBDIR"}
+
+// loadPkgRepos returns the repositories pkg reads, merged the way pkg 2.8.4
+// does in libpkg/pkg_config.c, measured with pkg -vv on 15.1: directories in
+// order, the files pkg's configfile() selects within one in lexical order,
+// then the repos_state overrides. A later object with a known name updates
+// that repository with the keys it sets, compared case-sensitively; an
+// object add_repo rejects changes nothing, and a new name with no url
+// creates nothing. Within one file and the files it includes, libucl keeps
 // the first object of a name and drops later ones. A missing directory is
-// nothing to read; an unreadable or unparseable file is an error, because the
-// repositories in it are exactly the ones in question.
-func loadPkgRepos(root string) ([]pkgRepo, error) {
+// nothing to read; an unreadable or unparseable file is an error, because
+// the repositories in it are exactly the ones in question. rejected names
+// each object pkg refuses, for the detail.
+func loadPkgRepos(root string, getenv func(string) string) (repos []pkgRepo, rejected []string, err error) {
+	if err := pkgConfDefaults(root, getenv); err != nil {
+		return nil, nil, err
+	}
 	byName := map[string]*pkgRepo{}
 	var order []string
 	for _, dir := range pkgReposDirs {
@@ -164,11 +214,11 @@ func loadPkgRepos(root string) ([]pkgRepo, error) {
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", dir, err)
+			return nil, nil, fmt.Errorf("read %s: %w", dir, err)
 		}
 		names := make([]string, 0, len(entries))
 		for _, e := range entries {
-			if !e.IsDir() && strings.HasSuffix(e.Name(), ".conf") {
+			if !e.IsDir() && pkgConfigFile(e.Name()) {
 				names = append(names, e.Name())
 			}
 		}
@@ -176,15 +226,35 @@ func loadPkgRepos(root string) ([]pkgRepo, error) {
 		for _, n := range names {
 			objs, err := readUCLFile(root, filepath.Join(dir, n), nil)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
+			// seen holds whether the kept entry of each name was a scalar.
+			// libucl keeps the first of two objects, measured; a scalar and
+			// an object under one name become an implicit array nobody
+			// measured, so that is refused rather than guessed at.
 			seen := map[string]bool{}
 			for _, o := range objs {
-				if seen[o.name] {
+				if scalar, dup := seen[o.name]; dup {
+					if scalar || o.scalar {
+						return nil, nil, pkgUnmodeled{o.from + ": " + o.name + " is both a scalar and an object in one file, which doctor does not merge"}
+					}
 					continue
 				}
-				seen[o.name] = true
+				seen[o.name] = o.scalar
+				if o.scalar {
+					continue
+				}
 				r, ok := byName[o.name]
+				acc, err := o.accept(ok)
+				if err != nil {
+					return nil, nil, err
+				}
+				if acc.rejected != "" {
+					rejected = append(rejected, o.name+" in "+o.from+" ("+acc.rejected+")")
+				}
+				if !acc.apply {
+					continue
+				}
 				if !ok {
 					r = &pkgRepo{Name: o.name, Enabled: true}
 					byName[o.name] = r
@@ -194,24 +264,153 @@ func loadPkgRepos(root string) ([]pkgRepo, error) {
 					r.Base = true
 				}
 				r.From = o.from
-				// pkg matches key names case-insensitively, in the order
-				// libucl kept them, so a later spelling wins.
-				for _, kv := range o.keys {
-					switch strings.ToLower(kv.key) {
-					case "url":
-						r.URL = kv.val.s
-					case "enabled":
-						r.Enabled = kv.val.enables()
-					}
+				if acc.url != nil {
+					r.URL = *acc.url
+				}
+				if acc.enabled != nil {
+					r.Enabled = *acc.enabled
 				}
 			}
 		}
 	}
-	out := make([]pkgRepo, 0, len(order))
 	for _, n := range order {
-		out = append(out, *byName[n])
+		if err := applyReposState(root, byName[n]); err != nil {
+			return nil, nil, err
+		}
+		repos = append(repos, *byName[n])
 	}
-	return out, nil
+	return repos, rejected, nil
+}
+
+// pkgConfigFile is pkg's configfile(): a name ending in .conf, longer than
+// that suffix, and not starting with a dot. pkg never opens a hidden file,
+// though one named by an .include is read like any other.
+func pkgConfigFile(name string) bool {
+	return !strings.HasPrefix(name, ".") && len(name) > len(".conf") && strings.HasSuffix(name, ".conf")
+}
+
+// pkgConfDefaults returns an error unless pkg reads its default REPOS_DIR,
+// defines no repository in pkg.conf, and keeps repos_state at its default
+// path. pkg upper-cases pkg.conf keys before matching them, and lets an
+// environment variable of the same name replace each.
+func pkgConfDefaults(root string, getenv func(string) string) error {
+	for _, k := range pkgConfOverrides {
+		if v := getenv(k); v != "" {
+			return pkgUnmodeled{"the environment sets " + k + "=" + v + ", which pkg reads in place of its default"}
+		}
+	}
+	objs, err := readUCLFile(root, pkgConfPath, nil)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, o := range objs {
+		if slices.Contains(pkgConfOverrides, strings.ToUpper(o.name)) {
+			return pkgUnmodeled{o.from + " sets " + o.name + ", which doctor does not follow"}
+		}
+	}
+	return nil
+}
+
+// applyReposState applies pkg's per-repository override: a file of the
+// repository's name under enable/ turns it on, else one under disable/
+// turns it off, whatever the repository files said. pkg tests each with
+// faccessat(F_OK), which follows symlinks.
+func applyReposState(root string, r *pkgRepo) error {
+	for _, st := range []struct {
+		dir string
+		on  bool
+	}{{"enable", true}, {"disable", false}} {
+		p := filepath.Join(pkgReposState, st.dir, r.Name)
+		_, err := os.Stat(filepath.Join(root, p))
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("stat %s: %w", p, err)
+		}
+		r.Enabled, r.From = st.on, p
+		return nil
+	}
+	return nil
+}
+
+// uclAccepted is what pkg's add_repo does with one object: apply it or not,
+// and which of the two keys doctor reads it sets.
+type uclAccepted struct {
+	apply bool
+	// url and enabled are nil when the object leaves them unset, which
+	// keeps what an earlier file set.
+	url      *string
+	enabled  *bool
+	rejected string
+}
+
+// pkgRepoKeyKinds are the keys add_repo type-checks, matched without regard
+// to case, and the one UCL type each must have. A key of any other type
+// makes add_repo return before it applies anything, enabled included.
+// enabled itself takes any type and is true only as a boolean true; keys
+// not listed are ignored.
+var pkgRepoKeyKinds = map[string]uclKind{
+	"url":             uclString,
+	"pubkey":          uclString,
+	"mirror_type":     uclString,
+	"signature_type":  uclString,
+	"fingerprints":    uclString,
+	"type":            uclString,
+	"ssh_args":        uclString,
+	"ip_version":      uclInt,
+	"priority":        uclInt,
+	"env":             uclObjectKind,
+	"rwhich_database": uclBool,
+}
+
+// accept decides the object the way add_repo does. exists is whether pkg
+// already holds a repository of this name. add_repo matches key names
+// without regard to case, in the order libucl kept them, so of two
+// spellings of one key the later wins. A value whose UCL type doctor
+// cannot assign is an error, since the type alone decides whether pkg
+// applies the object.
+func (o uclObject) accept(exists bool) (uclAccepted, error) {
+	var a uclAccepted
+	var sigType string
+	for _, kv := range o.keys {
+		k := strings.ToLower(kv.key)
+		if k == "enabled" {
+			e := kv.val.enables()
+			a.enabled = &e
+			continue
+		}
+		want, ok := pkgRepoKeyKinds[k]
+		if !ok {
+			continue
+		}
+		if kv.val.kind == uclUnknown {
+			return a, pkgUnmodeled{fmt.Sprintf("%s: %s: %s is a value libucl may type as a number or a string, and pkg applies %q only when it is %s", o.from, kv.key, kv.val.s, o.name, want)}
+		}
+		if kv.val.kind != want {
+			a.rejected = kv.key + " must be " + want.String() + ", not " + kv.val.kind.String()
+			return a, nil
+		}
+		switch k {
+		case "url":
+			u := kv.val.s
+			a.url = &u
+		case "signature_type":
+			sigType = kv.val.s
+		}
+	}
+	if !exists && a.url == nil {
+		return a, nil
+	}
+	if sigType != "" && !slices.ContainsFunc([]string{"pubkey", "fingerprints", "none"}, func(s string) bool { return strings.EqualFold(s, sigType) }) {
+		a.rejected = "signature_type " + sigType + " is not pubkey, fingerprints or none"
+		return a, nil
+	}
+	a.apply = true
+	return a, nil
 }
 
 // readUCLFile parses one repository file and splices in what its .include
@@ -280,19 +479,63 @@ func uclIncludePath(st uclStmt) (string, error) {
 	}
 }
 
-// uclScalar is a scalar as written, keeping whether it was quoted: libucl
-// types an unquoted yes as a boolean and a quoted "yes" as a string, and pkg
-// treats the two differently.
+// uclKind is the UCL type libucl gives a value, which is what add_repo
+// checks. uclUnknown is a bare value libucl's number lexer may or may not
+// accept (1k, 0x10, 1.5, 1e3, +1): doctor does not reproduce that lexer.
+type uclKind int
+
+const (
+	uclString uclKind = iota
+	uclInt
+	uclBool
+	uclNull
+	uclObjectKind
+	uclArray
+	uclUnknown
+)
+
+func (k uclKind) String() string {
+	return [...]string{"a string", "an integer", "a boolean", "null", "an object", "an array", "an untyped value"}[k]
+}
+
+// uclScalar is a value as written, with the type libucl gives it: an
+// unquoted yes is a boolean and a quoted "yes" a string, and pkg treats the
+// two differently.
 type uclScalar struct {
-	s      string
-	quoted bool
+	s    string
+	kind uclKind
+}
+
+var uclIntLit = regexp.MustCompile(`^-?[0-9]+$`)
+
+// bareKind types an unquoted value: a boolean word in any case, null, a
+// plain decimal integer, or a string when it cannot start a number.
+func bareKind(s string) uclKind {
+	if s == "" {
+		return uclUnknown
+	}
+	switch strings.ToLower(s) {
+	case "yes", "no", "true", "false", "on", "off":
+		return uclBool
+	}
+	switch {
+	case s == "null":
+		return uclNull
+	case strings.EqualFold(s, "null"):
+		return uclUnknown
+	case uclIntLit.MatchString(s):
+		return uclInt
+	case strings.ContainsRune("0123456789-+.", rune(s[0])):
+		return uclUnknown
+	}
+	return uclString
 }
 
 // enables reports how pkg reads a present enabled key. Measured on pkg 2.8.4:
 // only an unquoted yes, true or on in any case enables; no, false, off, every
 // number (1 included), and every quoted or other bare string disables.
 func (v uclScalar) enables() bool {
-	if v.quoted {
+	if v.kind != uclBool {
 		return false
 	}
 	switch strings.ToLower(v.s) {
@@ -307,13 +550,17 @@ type uclKV struct {
 	val uclScalar
 }
 
-// uclObject is one top-level object in a pkg repository file. keys holds
+// uclObject is one top-level entry in a pkg repository file. keys holds
 // each key spelling once, first value kept, in the order libucl stores them.
-// Nested values are kept as empty scalars: no key doctor reads is one.
+// Nested values are kept as empty scalars of their kind: no key doctor reads
+// the content of is one. scalar marks an entry that is not an object, which
+// pkg ignores in a repository file and doctor needs only the name of in
+// pkg.conf.
 type uclObject struct {
-	name string
-	keys []uclKV
-	from string
+	name   string
+	keys   []uclKV
+	from   string
+	scalar bool
 }
 
 // uclStmt is one top-level statement: an object, or a directive and the
@@ -363,6 +610,7 @@ func parseUCL(src string) ([]uclStmt, error) {
 				return nil, err
 			}
 			p.term()
+			out = append(out, uclStmt{obj: uclObject{name: name, scalar: true}, line: line})
 			continue
 		}
 		p.pos++
@@ -473,23 +721,29 @@ func (p *uclParser) key() (string, error) {
 	return p.src[start:p.pos], nil
 }
 
-// value returns a scalar, or an empty one after passing a nested object or
-// array.
+// value returns a scalar, or an empty one of its kind after passing a
+// nested object or array.
 func (p *uclParser) value() (uclScalar, error) {
 	switch c := p.peek(); c {
 	case '"', '\'':
 		s, err := p.quoted()
-		return uclScalar{s: s, quoted: true}, err
-	case '{', '[':
-		return uclScalar{quoted: true}, p.nested()
+		return uclScalar{s: s, kind: uclString}, err
+	case '{':
+		return uclScalar{kind: uclObjectKind}, p.nested()
+	case '[':
+		return uclScalar{kind: uclArray}, p.nested()
 	case 0:
 		return uclScalar{}, fmt.Errorf("line %d: expected a value, found end of file", p.line())
+	}
+	if strings.HasPrefix(p.src[p.pos:], "<<") {
+		return uclScalar{}, pkgUnmodeled{fmt.Sprintf("line %d: a heredoc value is UCL syntax doctor does not read", p.line())}
 	}
 	start := p.pos
 	for !p.eof() && !strings.ContainsRune(" \t\r\n,;}]#", rune(p.peek())) {
 		p.pos++
 	}
-	return uclScalar{s: p.src[start:p.pos]}, nil
+	s := p.src[start:p.pos]
+	return uclScalar{s: s, kind: bareKind(s)}, nil
 }
 
 func (p *uclParser) quoted() (string, error) {
@@ -553,10 +807,19 @@ func makeConfSites() (names []string, route string) {
 // included file is recognized as that check wherever it was installed.
 const distfilesEnvVar = "BODEGA_DISTFILES_ENV"
 
+// distSubdirVar is the other variable the route expands. A port that does
+// not set it takes whatever make.conf or the environment gave it.
+const distSubdirVar = "DIST_SUBDIR"
+
 var (
 	makeAssign    = regexp.MustCompile(`^([^\s:?!+=]+)\s*([:?!+]?=)\s*(.*)$`)
 	makeDirective = regexp.MustCompile(`^\.\s*([a-z-]+)\s*(.*)$`)
-	definesEnv    = regexp.MustCompile(`(?m)^\s*` + distfilesEnvVar + `\s*[:?!+]?=`)
+	makeReadonly  = regexp.MustCompile(`^\.(NO)?READONLY\s*:(.*)$`)
+	makeVarRef    = regexp.MustCompile(`\$(\{[^}]*\}?|\([^)]*\)?|.?)`)
+	// servedEnvValue is the value the client check bodega serves gives
+	// distfilesEnvVar: one of two literal words whatever the drift is.
+	// TestCheckMakeConfWalksTheServedClientCheck holds it to distinfo.
+	servedEnvValue = regexp.MustCompile(`^\$\{"\$\{BODEGA_DISTFILES_DRIFT:M\*\}" == "":\?[0-9a-f]+:unsupported\}$`)
 )
 
 // CheckMakeConf reports whether ports on this FreeBSD host fetch distfiles
@@ -593,8 +856,18 @@ func checkMakeConf(root, goos string, getenv func(string) string) Finding {
 	}
 
 	w := &makeWalk{root: root, sites: map[string]*siteValue{}}
-	for _, n := range names {
+	for _, n := range append([]string{distfilesEnvVar, distSubdirVar}, names...) {
 		w.sites[n] = &siteValue{}
+		// make reads the environment as a scope below the file's own
+		// assignments: = replaces it, and ?= keeps it.
+		if v := getenv(n); v != "" {
+			w.sites[n] = &siteValue{val: v, from: "the environment", set: true, env: true}
+		}
+	}
+	// Assignments in MAKEFLAGS are command-line variables, which beat every
+	// assignment in a makefile.
+	if mf := getenv("MAKEFLAGS"); mf != "" {
+		w.touch(mf, "the environment's MAKEFLAGS names it")
 	}
 	stmts := makeStatements(string(data))
 	if err := w.file(path, stmts, false, nil); err != nil {
@@ -606,17 +879,17 @@ func checkMakeConf(root, goos string, getenv func(string) string) Finding {
 
 	failed := append([]string(nil), w.problems...)
 	for _, n := range names {
-		v := w.sites[n]
-		switch {
-		case v.unknown != "":
-			failed = append(failed, n+" cannot be established: "+v.unknown)
-		case !v.set:
-			failed = append(failed, n+" is not set")
-		case !sitesAt(v.val, route):
-			failed = append(failed, n+"="+v.val+" (set in "+v.from+") does not end every site in "+route)
+		if msg := siteProblem(n, w.sites[n], route); msg != "" {
+			failed = append(failed, msg)
 		}
 	}
-	if msg := checkInclude(root, path, stmts); msg != "" {
+	switch sub := w.sites[distSubdirVar]; {
+	case sub.unknown != "":
+		failed = append(failed, distSubdirVar+", which the route expands, may be set: "+sub.unknown)
+	case sub.set:
+		failed = append(failed, distSubdirVar+"="+sub.val+" is set in "+sub.from+", and the route expands it for every port that does not set its own")
+	}
+	if msg := checkInclude(root, path, stmts, w.sites[distfilesEnvVar]); msg != "" {
 		failed = append(failed, msg)
 	}
 
@@ -631,15 +904,21 @@ func checkMakeConf(root, goos string, getenv func(string) string) Finding {
 	return f
 }
 
-// siteValue is what doctor knows of one site variable at a point in the
+// siteValue is what doctor knows of one tracked variable at a point in the
 // read. unknown, when set, says why the value cannot be established, and a
 // plain assignment later clears it; sticky keeps it, for a variable a line
-// doctor does not evaluate may have pinned.
+// doctor does not evaluate may have pinned. readonly is .READONLY, under
+// which make ignores every assignment and .undef, measured with bmake on
+// 15.1. env marks a value from the environment, and final one assigned while
+// reading the last include of make.conf.
 type siteValue struct {
 	val, from string
 	set       bool
 	unknown   string
 	sticky    bool
+	readonly  bool
+	env       bool
+	final     bool
 }
 
 func (v *siteValue) undetermined(why string) {
@@ -658,6 +937,9 @@ type makeWalk struct {
 	root     string
 	sites    map[string]*siteValue
 	problems []string
+	// final is set while reading the last include of make.conf and every
+	// file it includes.
+	final bool
 }
 
 // makeIncludeDepth bounds include nesting, so a file including itself is
@@ -751,12 +1033,15 @@ func (w *makeWalk) file(path string, stmts []string, unknown bool, stack []strin
 			case "include", "sinclude", "-include", "dinclude":
 				// checkInclude reports the final include of make.conf itself.
 				final := len(stack) == 1 && i == len(stmts)-1
-				if err := w.include(path, dir, arg, active == -1, !final, stack); err != nil {
+				w.final = final
+				err := w.include(path, dir, arg, active == -1, !final, stack)
+				w.final = w.final && !final
+				if err != nil {
 					return err
 				}
 			case "undef":
 				for _, n := range strings.Fields(arg) {
-					if v := w.sites[n]; v != nil {
+					if v := w.sites[n]; v != nil && !v.readonly {
 						if active == -1 {
 							v.undetermined(".undef under a conditional doctor does not evaluate in " + path)
 						} else if v.unknown == "" || !v.sticky {
@@ -774,6 +1059,10 @@ func (w *makeWalk) file(path string, stmts []string, unknown bool, stack []strin
 			continue
 		}
 
+		if ro := makeReadonly.FindStringSubmatch(st); ro != nil {
+			w.readonly(st, path, ro[1] == "", strings.Fields(ro[2]), active == -1)
+			continue
+		}
 		m := makeAssign.FindStringSubmatch(st)
 		if m == nil {
 			// A dependency line: .READONLY, .MAKEFLAGS and .NOREADONLY can pin
@@ -792,7 +1081,7 @@ func (w *makeWalk) file(path string, stmts []string, unknown bool, stack []strin
 		if v == nil {
 			continue
 		}
-		if v.sticky {
+		if v.sticky || v.readonly {
 			continue
 		}
 		if active == -1 {
@@ -805,16 +1094,20 @@ func (w *makeWalk) file(path string, stmts []string, unknown bool, stack []strin
 				continue
 			}
 			if !v.set {
-				*v = siteValue{val: val, from: path, set: true}
+				*v = siteValue{val: val, from: path, set: true, final: w.final}
 			}
 		case "+=":
 			if v.unknown != "" {
 				continue
 			}
+			if v.env {
+				v.undetermined(path + " appends to a value from the environment")
+				continue
+			}
 			if v.set {
 				val = v.val + " " + val
 			}
-			*v = siteValue{val: val, from: path, set: true}
+			*v = siteValue{val: val, from: path, set: true, final: w.final}
 		case "!=":
 			v.undetermined("set in " + path + " from a shell command doctor does not run")
 		case ":=", "::=":
@@ -822,15 +1115,37 @@ func (w *makeWalk) file(path string, stmts []string, unknown bool, stack []strin
 				v.undetermined("set in " + path + " with :=, which expands variables doctor does not")
 				continue
 			}
-			*v = siteValue{val: val, from: path, set: true}
+			*v = siteValue{val: val, from: path, set: true, final: w.final}
 		default:
-			*v = siteValue{val: val, from: path, set: true}
+			*v = siteValue{val: val, from: path, set: true, final: w.final}
 		}
 	}
 	if len(frames) > 0 {
 		w.problems = append(w.problems, path+" ends with a conditional or loop still open, which make refuses")
 	}
 	return nil
+}
+
+// readonly applies a .READONLY or .NOREADONLY line (on is which) to the
+// tracked variables it names. Measured with bmake on 15.1, .READONLY with
+// no sources pins nothing. Under a conditional doctor does not evaluate,
+// either may or may not have happened, so the variables it names are
+// undetermined for the rest of the read.
+func (w *makeWalk) readonly(line, path string, on bool, names []string, unknown bool) {
+	if unknown {
+		w.touch(line, "."+map[bool]string{true: "READONLY", false: "NOREADONLY"}[on]+" under a conditional doctor does not evaluate in "+path)
+		return
+	}
+	if !on && len(names) == 0 {
+		for _, v := range w.sites {
+			v.readonly = false
+		}
+	}
+	for _, n := range names {
+		if v := w.sites[n]; v != nil {
+			v.readonly = on
+		}
+	}
 }
 
 // touch marks every site variable a line names as undetermined for the rest
@@ -908,15 +1223,40 @@ func makeIncludePath(from, arg string) (path, why string) {
 	}
 }
 
-// sitesAt reports whether every site in a make value ends with route. One
-// site that does not is a fallback do-fetch.sh will try.
+// siteProblem returns why one site variable does not send every fetch to
+// bodega, or "". The only variables its value may reference are the two the
+// route itself holds; any other could expand to more sites, so the words
+// doctor sees would not be the sites make uses.
+func siteProblem(name string, v *siteValue, route string) string {
+	switch {
+	case v.unknown != "":
+		return name + " cannot be established: " + v.unknown
+	case !v.set:
+		return name + " is not set"
+	}
+	rest := v.val
+	for _, ph := range makeVarRef.FindAllString(route, -1) {
+		rest = strings.ReplaceAll(rest, ph, "")
+	}
+	if refs := makeVarRef.FindAllString(rest, -1); len(refs) > 0 {
+		return name + "=" + v.val + " (set in " + v.from + ") references " + strings.Join(refs, ", ") +
+			", which doctor does not expand, so the sites it holds cannot be established"
+	}
+	if !sitesAt(v.val, route) {
+		return name + "=" + v.val + " (set in " + v.from + ") does not end every site in " + route
+	}
+	return ""
+}
+
+// sitesAt reports whether every site in a make value is a host part
+// followed by route. One site that is not is a fallback do-fetch.sh will try.
 func sitesAt(v, route string) bool {
 	sites := strings.Fields(v)
 	if len(sites) == 0 {
 		return false
 	}
 	for _, s := range sites {
-		if !strings.HasSuffix(s, route) {
+		if len(s) <= len(route) || !strings.HasSuffix(s, route) {
 			return false
 		}
 	}
@@ -924,12 +1264,15 @@ func sitesAt(v, route string) bool {
 }
 
 // checkInclude inspects the last statement of make.conf. It returns the
-// failed condition, or "" when the last statement includes a file defining
-// distfilesEnvVar. The file is recognized by what it defines rather than
-// where it lives, since the check is delivered both as a copy and from a
-// distfiles mount. makeWalk has already read it, so an unreadable one has
-// already been reported.
-func checkInclude(root, confPath string, stmts []string) string {
+// failed condition, or "" when the last statement includes the client
+// check: a file whose own active lines set distfilesEnvVar, to a value that
+// expands to one word. The file is recognized by what it defines rather
+// than where it lives, since the check is delivered both as a copy and from
+// a distfiles mount. env is that variable's state after makeWalk read the
+// whole of make.conf, so an assignment in a branch make skips, one it may
+// skip, and one a later .undef removed all fail here. makeWalk has already
+// read the file, so an unreadable one has already been reported.
+func checkInclude(root, confPath string, stmts []string, env *siteValue) string {
 	if len(stmts) == 0 {
 		return "the file is empty, so it includes no client check"
 	}
@@ -942,14 +1285,31 @@ func checkInclude(root, confPath string, stmts []string) string {
 	if why != "" {
 		return "the last line includes " + why
 	}
-	data, err := os.ReadFile(filepath.Join(root, inc))
-	if errors.Is(err, fs.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(root, inc)); errors.Is(err, fs.ErrNotExist) {
 		return "the last line includes " + inc + ", which does not exist"
 	}
-	if err != nil || !definesEnv.Match(data) {
-		return "the last line includes " + inc + ", which does not define " + distfilesEnvVar + " and so is not the client check"
+	notCheck := "the last line includes " + inc + ", which "
+	switch {
+	case env.unknown != "":
+		return notCheck + "doctor cannot establish defines " + distfilesEnvVar + ": " + env.unknown
+	case !env.set:
+		return notCheck + "does not define " + distfilesEnvVar + " on any line make reads, and so is not the client check"
+	case !env.final:
+		return notCheck + "does not set " + distfilesEnvVar + "; its value comes from " + env.from + ", so the included file is not the client check"
+	case !oneWord(env.val):
+		return notCheck + "sets " + distfilesEnvVar + "=" + env.val + ", which doctor cannot establish expands to one word"
 	}
 	return ""
+}
+
+// oneWord reports whether a value of distfilesEnvVar expands to exactly one
+// word: a literal with no space or variable, or the value the served check
+// computes.
+func oneWord(v string) bool {
+	if servedEnvValue.MatchString(v) {
+		return true
+	}
+	return v != "" && !strings.ContainsAny(v, " \t$")
 }
 
 // makeStatements splits a makefile into logical lines: continuations

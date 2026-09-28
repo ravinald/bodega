@@ -1,6 +1,8 @@
 package host
 
 import (
+	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -308,7 +310,7 @@ func TestCheckPkgRepos(t *testing.T) {
 
 func TestCheckMakeConf(t *testing.T) {
 	rendered := clientconf.MakeConf("https://bodega.internal").Content
-	check := "_BODEGA_DISTFILES_DRIFT=\nBODEGA_DISTFILES_ENV=\t${\"${_BODEGA_DISTFILES_DRIFT:M*}\" == \"\":?abc:unsupported}\n"
+	check := "BODEGA_DISTFILES_DRIFT=\nBODEGA_DISTFILES_ENV=\t${\"${BODEGA_DISTFILES_DRIFT:M*}\" == \"\":?abc:unsupported}\n"
 	site := "https://bodega.internal/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/"
 
 	tests := []struct {
@@ -475,7 +477,7 @@ func TestCheckMakeConf(t *testing.T) {
 				clientconf.DistfilesCheckPath: check,
 			},
 			want:   StatusWarn,
-			detail: []string{"MASTER_SITE_OVERRIDE cannot be established", ".READONLY"},
+			detail: []string{"MASTER_SITE_OVERRIDE=https://mirror.example/ (set in /etc/make.conf) does not end every site"},
 		},
 		{
 			name: "the final include overrides a site",
@@ -672,4 +674,214 @@ func TestMakeConfUnreadableInclude(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertFinding(t, checkMakeConf(root, "freebsd", func(string) string { return "" }), StatusSkip, "read /etc/local.mk, which /etc/make.conf includes")
+}
+
+// Repository files pkg 2.8.4 was given on 15.1 with pkg -o REPOS_DIR=<dir>
+// -vv, each named for the repositories pkg -vv then listed as enabled.
+// Every object sorts into a.conf, b.conf, and so on, in the order listed.
+func TestPkgAcceptMatchesPkg(t *testing.T) {
+	const bodegaRepo = "bodega: { url: \"https://b/freebsd/x/latest\" }\n"
+	const upstream = "FreeBSD: { url: \"https://pkg.FreeBSD.org/x\" }\n"
+	tests := []struct {
+		name  string
+		files []string
+		want  Status
+		// detail is what the finding names; for WARN, why.
+		detail []string
+	}{
+		{"an override with a mistyped priority is rejected whole", []string{upstream, "FreeBSD: { enabled: no, priority: \"bad\" }\n" + bodegaRepo}, StatusWarn,
+			[]string{"FreeBSD (", "pkg rejects and ignores FreeBSD in /usr/local/etc/pkg/repos/b.conf (priority must be an integer, not a string)"}},
+		{"a rejected sole bodega object creates nothing", []string{"bodega: { url: \"https://b/freebsd/x/latest\", priority: \"bad\" }\n"}, StatusWarn,
+			[]string{"no enabled repository points at a bodega", "pkg rejects and ignores bodega"}},
+		{"a url that is a number is rejected", []string{upstream, "FreeBSD: { enabled: no, url: 5 }\n" + bodegaRepo}, StatusWarn, []string{"url must be a string, not an integer"}},
+		{"a quoted rwhich_database is rejected", []string{upstream, "FreeBSD: { enabled: no, rwhich_database: \"yes\" }\n" + bodegaRepo}, StatusWarn, []string{"rwhich_database must be a boolean"}},
+		{"an env that is not an object is rejected", []string{upstream, "FreeBSD: { enabled: no, env: \"x\" }\n" + bodegaRepo}, StatusWarn, []string{"env must be an object"}},
+		{"an unknown signature_type is rejected", []string{upstream, "FreeBSD: { enabled: no, signature_type: \"bogus\" }\n" + bodegaRepo}, StatusWarn, []string{"signature_type bogus is not"}},
+		{"a disable with no url on a new name creates nothing", []string{"FreeBSD: { enabled: no }\n", upstream + bodegaRepo}, StatusWarn, []string{"FreeBSD ("}},
+		{"enabled carries over to a later object that leaves it unset", []string{"FreeBSD: { url: \"https://pkg.FreeBSD.org/x\", enabled: no }\n", "FreeBSD: { url: \"https://pkg.FreeBSD.org/y\" }\n" + bodegaRepo}, StatusOK, nil},
+		{"the first object of a name in one file wins", []string{bodegaRepo + "bodega: { enabled: no }\n"}, StatusOK, nil},
+		{"the first url in one object wins", []string{"bodega: { url: \"https://b/freebsd/x/latest\", url: \"https://pkg.FreeBSD.org/x\" }\n"}, StatusOK, nil},
+		{"a bare url is a string", []string{"bodega: { url: https://b/freebsd/x/latest }\n"}, StatusOK, nil},
+		{"Enabled matches without regard to case", []string{"FreeBSD: { url: \"https://pkg.FreeBSD.org/x\", Enabled: no }\n" + bodegaRepo}, StatusOK, nil},
+		{"a host pkg fills in from a variable", []string{"x: { url: \"https://pkg.${OSNAME}.org/x\" }\n" + bodegaRepo}, StatusWarn, []string{"host doctor cannot resolve: x ("}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			files := map[string]string{}
+			for i, body := range tt.files {
+				files[fmt.Sprintf("/usr/local/etc/pkg/repos/%c.conf", 'a'+i)] = body
+			}
+			assertFinding(t, checkPkgRepos(writeTree(t, files), "freebsd"), tt.want, tt.detail...)
+		})
+	}
+}
+
+// Every key add_repo type-checks, given a value of the right type and one of
+// the wrong type in the override that disables upstream. The right type
+// applies the disable; the wrong one rejects the object and leaves upstream
+// enabled.
+func TestPkgRepoKeyKinds(t *testing.T) {
+	good := map[uclKind]string{uclString: `"none"`, uclInt: "4", uclBool: "yes", uclObjectKind: "{ A: b }"}
+	bad := map[uclKind]string{uclString: "5", uclInt: `"4"`, uclBool: `"yes"`, uclObjectKind: `"A=b"`}
+	for key, kind := range pkgRepoKeyKinds {
+		for _, tc := range []struct {
+			val  string
+			want Status
+		}{{good[kind], StatusOK}, {bad[kind], StatusWarn}} {
+			val := tc.val
+			if key == "signature_type" && tc.want == StatusOK {
+				val = `"fingerprints"`
+			}
+			if key == "url" && tc.want == StatusOK {
+				val = `"https://b/freebsd/y/latest"`
+			}
+			t.Run(key+"="+val, func(t *testing.T) {
+				root := writeTree(t, map[string]string{
+					"/etc/pkg/FreeBSD.conf":                "FreeBSD: { url: \"https://pkg.FreeBSD.org/x\", enabled: yes }\n",
+					"/usr/local/etc/pkg/repos/bodega.conf": "FreeBSD: { enabled: no, " + key + ": " + val + " }\nbodega: { url: \"https://b/freebsd/x/latest\" }\n",
+				})
+				assertFinding(t, checkPkgRepos(root, "freebsd"), tc.want)
+			})
+		}
+	}
+	for _, v := range []string{"10k", "0x4", "1.5", "+4", "NULL"} {
+		t.Run("priority="+v, func(t *testing.T) {
+			root := writeTree(t, map[string]string{
+				"/usr/local/etc/pkg/repos/bodega.conf": "bodega: { url: \"https://b/freebsd/x/latest\", priority: " + v + " }\n",
+			})
+			assertFinding(t, checkPkgRepos(root, "freebsd"), StatusWarn, "cannot establish")
+		})
+	}
+}
+
+// pkg's configfile() skips a name starting with a dot, but an .include
+// naming one reads it.
+func TestPkgHiddenFiles(t *testing.T) {
+	assertFinding(t, checkPkgRepos(writeTree(t, map[string]string{
+		"/usr/local/etc/pkg/repos/.bodega.conf": "bodega: { url: \"https://b/freebsd/x/latest\" }\n",
+	}), "freebsd"), StatusWarn, "no enabled repository points at a bodega")
+	assertFinding(t, checkPkgRepos(writeTree(t, map[string]string{
+		"/etc/pkg/FreeBSD.conf":                 stockFreeBSD15,
+		"/usr/local/etc/pkg/repos/.off.conf":    "FreeBSD-ports: { enabled: no }\nFreeBSD-ports-kmods: { enabled: no }\n",
+		"/usr/local/etc/pkg/repos/bodega.conf":  "bodega: { url: \"https://b/freebsd/x/latest\" }\n",
+		"/usr/local/etc/pkg/repos/.conf":        "FreeBSD-ports: { enabled: no }\n",
+		"/usr/local/etc/pkg/repos/off.conf.bak": "FreeBSD-ports: { enabled: no }\n",
+	}), "freebsd"), StatusWarn, "FreeBSD-ports (", "FreeBSD-ports-kmods (")
+	assertFinding(t, checkPkgRepos(writeTree(t, map[string]string{
+		"/usr/local/etc/pkg/repos/bodega.conf":  ".include \"/usr/local/etc/pkg/repos/.bodega.conf\"\n",
+		"/usr/local/etc/pkg/repos/.bodega.conf": "bodega: { url: \"https://b/freebsd/x/latest\" }\n",
+	}), "freebsd"), StatusOK)
+}
+
+func TestPkgReposState(t *testing.T) {
+	base := map[string]string{
+		"/etc/pkg/FreeBSD.conf":                stockFreeBSD15,
+		"/usr/local/etc/pkg/repos/bodega.conf": bodegaRepos15,
+	}
+	with := func(extra ...string) map[string]string {
+		m := maps.Clone(base)
+		for _, p := range extra {
+			m[p] = ""
+		}
+		return m
+	}
+	assertFinding(t, checkPkgRepos(writeTree(t, with()), "freebsd"), StatusOK)
+	assertFinding(t, checkPkgRepos(writeTree(t, with("/var/db/pkg/repos_state/enable/FreeBSD-ports")), "freebsd"),
+		StatusWarn, "FreeBSD-ports (pkg+https://pkg.FreeBSD.org/${ABI}/quarterly, set in /var/db/pkg/repos_state/enable/FreeBSD-ports)")
+	assertFinding(t, checkPkgRepos(writeTree(t, with("/var/db/pkg/repos_state/disable/bodega-latest")), "freebsd"),
+		StatusWarn, "no enabled repository points at a bodega")
+	// enable/ wins over disable/, as pkg tests it first.
+	assertFinding(t, checkPkgRepos(writeTree(t, with("/var/db/pkg/repos_state/disable/FreeBSD-base", "/var/db/pkg/repos_state/enable/FreeBSD-base")), "freebsd"),
+		StatusWarn, "FreeBSD-base (")
+}
+
+func TestPkgConfOverrides(t *testing.T) {
+	good := map[string]string{"/usr/local/etc/pkg/repos/bodega.conf": bodegaRepos15}
+	conf := func(body string) map[string]string {
+		m := maps.Clone(good)
+		m["/usr/local/etc/pkg.conf"] = body
+		return m
+	}
+	assertFinding(t, checkPkgRepos(writeTree(t, conf("# REPOS_DIR: [\"/x\"]\nASSUME_ALWAYS_YES: no\nALIAS: { ls: \"query %n\" }\n")), "freebsd"), StatusOK)
+	for _, body := range []string{"repos_dir: [\"/etc/pkg/\"]\n", "REPOSITORIES: { FreeBSD: { url: \"https://pkg.FreeBSD.org/x\" } }\n", "PKG_DBDIR = /tmp/db\n"} {
+		assertFinding(t, checkPkgRepos(writeTree(t, conf(body)), "freebsd"), StatusWarn, "/usr/local/etc/pkg.conf sets", "cannot establish")
+	}
+	for _, k := range pkgConfOverrides {
+		env := func(n string) string { return map[string]string{k: "/elsewhere"}[n] }
+		assertFinding(t, checkPkgReposEnv(writeTree(t, good), "freebsd", env), StatusWarn, "the environment sets "+k)
+	}
+}
+
+// What make on 15.1 expands each site to decides; the words doctor reads
+// before expansion do not.
+func TestMakeConfExpandedSites(t *testing.T) {
+	check := map[string]string{clientconf.DistfilesCheckPath: "BODEGA_DISTFILES_ENV=abc\n"}
+	for name, conf := range map[string]string{
+		"a variable holding a second site": "MIRRORS=https://mirror.example/ https://b\n" + clientconf.MakeConf("${MIRRORS}").Content,
+		"a parenthesized reference":        clientconf.MakeConf("$(MIRRORS)").Content,
+		"a single-letter reference":        clientconf.MakeConf("https://b$M").Content,
+	} {
+		t.Run(name, func(t *testing.T) {
+			files := maps.Clone(check)
+			files["/etc/make.conf"] = conf
+			assertFinding(t, checkMakeConf(writeTree(t, files), "freebsd", func(string) string { return "" }),
+				StatusWarn, "MASTER_SITE_OVERRIDE=", "MASTER_SITE_BACKUP=", "which doctor does not expand")
+		})
+	}
+}
+
+func TestMakeConfEnvDefinition(t *testing.T) {
+	conf := clientconf.MakeConf("https://b").Content
+	for _, tc := range []struct {
+		name, check, conf string
+		want              Status
+		detail            []string
+	}{
+		{"only under .if 0", ".if 0\nBODEGA_DISTFILES_ENV=abc\n.endif\n", conf, StatusWarn, []string{"does not define BODEGA_DISTFILES_ENV on any line make reads"}},
+		{"under .if 1", ".if 1\nBODEGA_DISTFILES_ENV=abc\n.endif\n", conf, StatusOK, nil},
+		{"under a condition doctor does not evaluate", ".if defined(X)\nBODEGA_DISTFILES_ENV=abc\n.endif\n", conf, StatusWarn, []string{"cannot establish defines BODEGA_DISTFILES_ENV"}},
+		{"removed by .undef", "BODEGA_DISTFILES_ENV=abc\n.undef BODEGA_DISTFILES_ENV\n", conf, StatusWarn, []string{"does not define BODEGA_DISTFILES_ENV"}},
+		{"kept by .READONLY through .undef", "BODEGA_DISTFILES_ENV=abc\n.READONLY: BODEGA_DISTFILES_ENV\n.undef BODEGA_DISTFILES_ENV\n", conf, StatusOK, nil},
+		{"set in make.conf, not in the include", "X=1\n", "BODEGA_DISTFILES_ENV=abc\n" + conf, StatusWarn, []string{"its value comes from /etc/make.conf"}},
+		{"to more than one word", "BODEGA_DISTFILES_ENV=abc https://mirror.example/\n", conf, StatusWarn, []string{"expands to one word"}},
+		{"to a variable", "BODEGA_DISTFILES_ENV=${X}\n", conf, StatusWarn, []string{"expands to one word"}},
+		{"empty", "BODEGA_DISTFILES_ENV=\n", conf, StatusWarn, []string{"expands to one word"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := writeTree(t, map[string]string{"/etc/make.conf": tc.conf, clientconf.DistfilesCheckPath: tc.check})
+			assertFinding(t, checkMakeConf(root, "freebsd", func(string) string { return "" }), tc.want, tc.detail...)
+		})
+	}
+}
+
+// make reads the environment below a makefile's own assignments: ?= keeps
+// an environment value and = replaces it, measured with bmake on 15.1.
+func TestMakeConfEnvironment(t *testing.T) {
+	check := "BODEGA_DISTFILES_ENV=abc\n"
+	rendered := clientconf.MakeConf("https://b").Content
+	for _, tc := range []struct {
+		name, conf string
+		env        map[string]string
+		want       Status
+		detail     []string
+	}{
+		{"?= keeps the environment's site", rendered, map[string]string{"MASTER_SITE_OVERRIDE": "https://env.example/"}, StatusWarn, []string{"MASTER_SITE_OVERRIDE=https://env.example/ (set in the environment)"}},
+		{"= replaces it", strings.ReplaceAll(rendered, "?=", "="), map[string]string{"MASTER_SITE_OVERRIDE": "https://env.example/"}, StatusOK, nil},
+		{"+= onto it", strings.ReplaceAll(rendered, "?=", "+="), map[string]string{"MASTER_SITE_BACKUP": "https://env.example/"}, StatusWarn, []string{"appends to a value from the environment"}},
+		{"MAKEFLAGS names a site", rendered, map[string]string{"MAKEFLAGS": "MASTER_SITE_BACKUP=https://env.example/"}, StatusWarn, []string{"MASTER_SITE_BACKUP cannot be established: the environment's MAKEFLAGS"}},
+		{"DIST_SUBDIR from the environment", rendered, map[string]string{"DIST_SUBDIR": "x https://env.example"}, StatusWarn, []string{"DIST_SUBDIR=x https://env.example is set in the environment"}},
+		{"DIST_SUBDIR in make.conf", "DIST_SUBDIR=x\n" + rendered, nil, StatusWarn, []string{"DIST_SUBDIR=x is set in /etc/make.conf"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := writeTree(t, map[string]string{"/etc/make.conf": tc.conf, clientconf.DistfilesCheckPath: check})
+			assertFinding(t, checkMakeConf(root, "freebsd", func(k string) string { return tc.env[k] }), tc.want, tc.detail...)
+		})
+	}
+}
+
+func TestPkgScalarAndObjectOfOneName(t *testing.T) {
+	root := writeTree(t, map[string]string{
+		"/usr/local/etc/pkg/repos/bodega.conf": "FreeBSD = \"x\";\nFreeBSD: { url: \"https://pkg.FreeBSD.org/x\" }\nbodega: { url: \"https://b/freebsd/x/latest\" }\n",
+	})
+	assertFinding(t, checkPkgRepos(root, "freebsd"), StatusWarn, "both a scalar and an object", "cannot establish")
 }
