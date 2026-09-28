@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -11,8 +12,10 @@ import (
 	"runtime"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/ravinald/bodega/internal/clientconf"
 	"github.com/ravinald/bodega/internal/distinfo"
@@ -541,8 +544,9 @@ func uclIncludePath(st uclStmt) (string, error) {
 }
 
 // uclKind is the UCL type libucl gives a value, which is what add_repo
-// checks. uclUnknown is a bare value libucl's number lexer may or may not
-// accept (1k, 0x10, 1.5, 1e3, +1): doctor does not reproduce that lexer.
+// checks. uclUnknown is a bare number libucl accepts in a form whose type
+// doctor does not assign (1.5, 1e3); uclNumber refuses the forms whose
+// acceptance doctor cannot decide (1k, 0x10, +1).
 type uclKind int
 
 const (
@@ -868,7 +872,52 @@ func (p *uclParser) value() (uclScalar, error) {
 	if why := uclBareToken(s); why != "" {
 		return uclScalar{}, pkgUnmodeled{fmt.Sprintf("line %d: the value %s %s", p.line(), s, why)}
 	}
+	switch why, fatal := uclNumber(s); {
+	case fatal:
+		return uclScalar{}, fmt.Errorf("line %d: the value %s %s", p.line(), s, why)
+	case why != "":
+		return uclScalar{}, pkgUnmodeled{fmt.Sprintf("line %d: the value %s %s", p.line(), s, why)}
+	}
 	return uclScalar{s: s, kind: bareKind(s)}, nil
+}
+
+var uclFloatLit = regexp.MustCompile(`^-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$`)
+
+// uclNumber decides whether libucl accepts a bare token that may start a
+// number, whatever key it sits under. libucl converts the digits it lexes
+// with strtoimax or strtod and discards the whole file when either reports
+// ERANGE, before it looks at what follows the digits, measured with pkg
+// 2.8.4 on 15.1: 9223372036854775808 and 1e999 each discarded a file where
+// 9223372036854775807 and 1e3 parsed. doctor checks the range of a plain
+// decimal integer or float and returns pkgUnmodeled for every other form
+// (hex, time and size suffixes, a sign it does not lex), since the prefix
+// libucl converts in those is one doctor does not reproduce. Validity is
+// separate from type: a valid float is still a value whose type pkg's key
+// checks doctor does not claim. fatal marks a token libucl rejects; a why
+// without it is one doctor cannot decide.
+func uclNumber(s string) (why string, fatal bool) {
+	if s == "" || !strings.ContainsRune("0123456789-+.", rune(s[0])) {
+		return "", false
+	}
+	switch {
+	case uclIntLit.MatchString(s):
+		if _, err := strconv.ParseInt(s, 10, 64); err != nil {
+			return "is out of range for libucl's integers, and libucl discards the file", true
+		}
+		return "", false
+	case uclFloatLit.MatchString(s):
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return "is out of range for libucl's floats, and libucl discards the file", true
+		}
+		// strtod reports ERANGE on underflow as well, which Go's parser
+		// rounds away without an error.
+		if mant, _, _ := strings.Cut(strings.ToLower(s), "e"); (f == 0 && strings.Trim(mant, "-0.") != "") || (f != 0 && math.Abs(f) < 0x1p-1022) {
+			return "underflows a double, which strtod may report as out of range", false
+		}
+		return "", false
+	}
+	return "may start a number in a form doctor does not lex, and libucl discards the file when that number is out of range", false
 }
 
 // quoted returns a quoted string and whether it held an escape. libucl
@@ -1033,7 +1082,12 @@ func checkMakeConfEnviron(root, goos string, lookup func(string) (string, bool),
 	}
 	f.Remediation = "end " + shown + " with the FreeBSD ports lines under Client configuration in docs/usage.md: " +
 		strings.Join(names, " and ") + " set to <bodega>" + route + ", then .include of " + clientconf.DistfilesCheckPath
-	switch {
+	switch sys := makeSysPathWhy(root, lookup, flags); {
+	case sys != "":
+		f.Status = StatusWarn
+		f.Detail = sys + ", and a sys.mk other than /usr/share/mk/sys.mk can select a different make.conf and change the fetch sites before or after it, so doctor cannot establish what ports fetch from"
+		f.Remediation = "unset MAKESYSPATH, remove it from MAKEFLAGS and move any share/mk out of the ports tree; then run doctor again"
+		return f
 	case slices.Contains(flags.assigns, "__MAKE_CONF"):
 		f.Status = StatusWarn
 		f.Detail = "the environment's MAKEFLAGS assigns __MAKE_CONF, so doctor cannot establish which make.conf make reads"
@@ -1828,6 +1882,76 @@ func (w *makeWalk) include(from, dir, arg string, unknown, report bool, stack []
 	return w.file(inc, makeStatements(string(data)), unknown, stack)
 }
 
+// makeStockSysPath is where FreeBSD's make finds sys.mk when nothing
+// replaces its search.
+const makeStockSysPath = "/usr/share/mk"
+
+// makeSysPathWhy returns why doctor cannot establish that make reads the
+// stock sys.mk, which is what reads make.conf, or "". MAKESYSPATH replaces
+// the search, and so does a MAKESYSPATH assignment in MAKEFLAGS, which make
+// exports. Unset, FreeBSD's make searches ".../share/mk:/usr/share/mk": the
+// first share/mk in the working directory or any parent comes first. That
+// was measured with bmake on 15.1, where a share/mk/sys.mk in a parent of
+// the working directory replaced the stock one. doctor cannot know every
+// directory make runs in, so it checks the one fetch runs in: each port
+// directory under PORTSDIR, /usr/ports by default, its category and the
+// tree itself, and every parent up to the one holding /usr/share/mk.
+// -m in MAKEFLAGS is refused later with every flag doctor does not model.
+func makeSysPathWhy(root string, lookup func(string) (string, bool), fl makeFlags) string {
+	if v, ok := lookup("MAKESYSPATH"); ok && v != makeStockSysPath {
+		return "MAKESYSPATH=" + v + " replaces the directories make searches for sys.mk"
+	}
+	if slices.Contains(fl.assigns, "MAKESYSPATH") {
+		return "the environment's MAKEFLAGS assigns MAKESYSPATH, which make exports and searches for sys.mk"
+	}
+	ports := "/usr/ports"
+	if v, ok := lookup("PORTSDIR"); ok {
+		ports = v
+	}
+	if !filepath.IsAbs(ports) {
+		return "PORTSDIR=" + ports + " is relative, so doctor cannot establish which directories make searches for sys.mk"
+	}
+	ports = filepath.Clean(ports)
+	var dirs []string
+	for d := ports; d != "/usr"; d = filepath.Dir(d) {
+		dirs = append(dirs, filepath.Join(d, "share/mk"))
+		if d == "/" {
+			break
+		}
+	}
+	unreadable := func(dir string, err error) string {
+		if err == nil || errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			return ""
+		}
+		return "doctor cannot read " + dir + " (" + err.Error() + "), where make run in the ports tree may find a share/mk ahead of " + makeStockSysPath
+	}
+	cats, err := os.ReadDir(filepath.Join(root, ports))
+	if why := unreadable(ports, err); why != "" {
+		return why
+	}
+	for _, c := range cats {
+		cat := filepath.Join(ports, c.Name())
+		dirs = append(dirs, filepath.Join(cat, "share/mk"))
+		ents, err := os.ReadDir(filepath.Join(root, cat))
+		if why := unreadable(cat, err); why != "" {
+			return why
+		}
+		for _, e := range ents {
+			dirs = append(dirs, filepath.Join(cat, e.Name(), "share/mk"))
+		}
+	}
+	for _, d := range dirs {
+		fi, err := os.Stat(filepath.Join(root, d))
+		if why := unreadable(d, err); why != "" {
+			return why
+		}
+		if err == nil && fi.IsDir() {
+			return "make run in the ports tree finds " + d + " through its default search .../share/mk ahead of " + makeStockSysPath
+		}
+	}
+	return ""
+}
+
 // includeSearch returns where else make looks for an include whose first
 // candidate is missing, or "" when there is nowhere: a missing first
 // candidate proves the include absent only then. make looks for a relative
@@ -1976,16 +2100,24 @@ type makeStmt struct {
 
 // makeStatements splits a makefile into logical lines: continuations
 // joined, comments and blank lines dropped, a tab-led line marked before
-// its indentation is trimmed. Conditionals are kept as statements and not
-// evaluated.
+// its indentation is trimmed. A tab-led command keeps its "#": make
+// expands the whole command, comment and continuations included, before the
+// shell sees it, so a comment there can hold live expressions. A tab-led
+// line whose text opens with "#" is dropped whole, inside a target or not.
+// Both measured with bmake on 15.1. Conditionals are kept as statements and
+// not evaluated.
 func makeStatements(src string) []makeStmt {
 	var out []makeStmt
 	var cur strings.Builder
 	flush := func() {
 		raw := cur.String()
 		cur.Reset()
-		if s := strings.TrimSpace(stripMakeComment(raw)); s != "" {
-			out = append(out, makeStmt{text: s, recipe: strings.HasPrefix(raw, "\t")})
+		recipe := strings.HasPrefix(raw, "\t")
+		if !recipe || strings.HasPrefix(strings.TrimLeft(raw, " \t"), "#") {
+			raw = stripMakeComment(raw)
+		}
+		if s := strings.TrimSpace(raw); s != "" {
+			out = append(out, makeStmt{text: s, recipe: recipe})
 		}
 	}
 	for _, l := range strings.Split(src, "\n") {

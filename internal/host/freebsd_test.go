@@ -1593,3 +1593,145 @@ func TestMakeConfLoopDoctorCannotParse(t *testing.T) {
 		t.Fatalf("OK: %s", got.Detail)
 	}
 }
+
+// libucl discards a whole file over a number out of range, whatever key or
+// depth it sits under, so no object in that file may disable upstream.
+// Measured with pkg 2.8.4 on 15.1 for the integer bounds, 1e3 and 1e999.
+func TestPkgNumericAcceptance(t *testing.T) {
+	for _, tc := range []struct {
+		field string
+		ok    bool
+	}{
+		{"priority: 9223372036854775807", true},
+		{"priority: -9223372036854775808", true},
+		{"ignored: 1e3", true},
+		{"ignored: 1.5", true},
+		{"ignored: { a: [ 1e308, -12 ] }", true},
+		{`ignored: "9223372036854775808"`, true},
+		{"priority: 9223372036854775808", false},
+		{"priority: -9223372036854775809", false},
+		{"ignored: 9223372036854775808", false},
+		{"ignored: { a: { b: [ -9223372036854775809 ] } }", false},
+		{"ignored: 1e999", false},
+		{"ignored: -1e999", false},
+		{"ignored: 1e-400", false},
+		{"ignored: 0x10", false},
+		{"ignored: 10k", false},
+		{"ignored: +1", false},
+		{"ignored: .5", false},
+		{"priority: 1e3", false},
+	} {
+		t.Run(tc.field, func(t *testing.T) {
+			root := writeTree(t, map[string]string{
+				"/etc/pkg/FreeBSD.conf":                `FreeBSD: { url: "https://pkg.FreeBSD.org/x", enabled: yes }`,
+				"/usr/local/etc/pkg/repos/bodega.conf": "FreeBSD: { enabled: no, " + tc.field + " }\nbodega: { url: \"https://b/freebsd/x/latest\" }\n",
+			})
+			got := checkPkgRepos(root, "freebsd")
+			if tc.ok {
+				assertFinding(t, got, StatusOK)
+			} else if got.Status == StatusOK {
+				t.Fatalf("OK: %s", got.Detail)
+			}
+		})
+	}
+	t.Run("top-level scalar", func(t *testing.T) {
+		root := writeTree(t, map[string]string{
+			"/etc/pkg/FreeBSD.conf":                `FreeBSD: { url: "https://pkg.FreeBSD.org/x", enabled: yes }`,
+			"/usr/local/etc/pkg/repos/bodega.conf": "x: 99999999999999999999\nFreeBSD: { enabled: no }\nbodega: { url: \"https://b/freebsd/x/latest\" }\n",
+		})
+		if got := checkPkgRepos(root, "freebsd"); got.Status == StatusOK {
+			t.Fatalf("OK: %s", got.Detail)
+		}
+	})
+	t.Run("included file", func(t *testing.T) {
+		root := writeTree(t, map[string]string{
+			"/etc/pkg/FreeBSD.conf":                `FreeBSD: { url: "https://pkg.FreeBSD.org/x", enabled: yes }`,
+			"/usr/local/etc/pkg/repos/bodega.conf": "FreeBSD: { enabled: no }\nbodega: { url: \"https://b/freebsd/x/latest\" }\n.include \"/usr/local/etc/pkg/extra.inc\"\n",
+			"/usr/local/etc/pkg/extra.inc":         "other: { ignored: [ 1e999 ] }\n",
+		})
+		if got := checkPkgRepos(root, "freebsd"); got.Status == StatusOK {
+			t.Fatalf("OK: %s", got.Detail)
+		}
+	})
+}
+
+// make expands a tab-led command whole before the shell reads its comment,
+// and drops a tab-led line whose text opens with "#". Both measured with
+// bmake on 15.1.
+func TestMakeConfRecipeComments(t *testing.T) {
+	site := "https://b/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/"
+	safe := "MASTER_SITE_OVERRIDE=" + site + "\nMASTER_SITE_BACKUP=" + site + "\n"
+	check := ".include \"/usr/local/etc/bodega-distfiles.mk\"\n"
+	mutate := "${MASTER_SITE_OVERRIDE::=https://mirror.example/}"
+	for _, tc := range []struct {
+		name, extra string
+		inc         string
+		ok          bool
+	}{
+		{"comment after a command", ".BEGIN:\n\t@true # " + mutate + "\n", "", false},
+		{"continued comment", ".BEGIN:\n\t@true # \\\n" + mutate + "\n", "", false},
+		{"continued tab-led comment", ".BEGIN:\n\t@true # \\\n\t" + mutate + "\n", "", false},
+		{"included recipe", ".include \"/etc/rules.mk\"\n", ".BEGIN:\n\t@true # " + mutate + "\n", false},
+		{"ordinary comment", "# " + mutate + "\n", "", true},
+		{"ordinary continued comment", "# a \\\n" + mutate + "\n", "", true},
+		{"comment-only tab line", ".BEGIN:\n\t# " + mutate + "\n", "", true},
+		{"comment-only tab line continued", ".BEGIN:\n\t# a \\\n\t@true " + mutate + "\n", "", true},
+		{"inline recipe comment", ".BEGIN: ; @true # " + mutate + "\n", "", true},
+		{"plain recipe comment", ".BEGIN:\n\t@true # ordinary\n", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := map[string]string{
+				"/etc/make.conf":                     safe + tc.extra + check,
+				"/usr/local/etc/bodega-distfiles.mk": "BODEGA_DISTFILES_ENV=abc\n",
+			}
+			if tc.inc != "" {
+				files["/etc/rules.mk"] = tc.inc
+			}
+			got := checkMakeConf(writeTree(t, files), "freebsd", func(string) string { return "" })
+			if tc.ok {
+				assertFinding(t, got, StatusOK)
+			} else if got.Status == StatusOK {
+				t.Fatalf("OK: %s", got.Detail)
+			}
+		})
+	}
+}
+
+// sys.mk reads make.conf, so doctor certifies nothing until it knows which
+// sys.mk make reads. FreeBSD's make searches .../share/mk ahead of
+// /usr/share/mk, measured with bmake on 15.1.
+func TestMakeConfSystemPath(t *testing.T) {
+	site := "https://b/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/"
+	sysmk := ".include \"/usr/share/mk/sys.mk\"\nMASTER_SITE_OVERRIDE=https://mirror.example/\n"
+	for _, tc := range []struct {
+		name  string
+		extra map[string]string
+		env   map[string]string
+		want  Status
+	}{
+		{"default", nil, nil, StatusOK},
+		{"ports tree without share/mk", map[string]string{"/usr/ports/www/nginx/Makefile": "PORTNAME=nginx\n"}, nil, StatusOK},
+		{"MAKESYSPATH is the stock path", nil, map[string]string{"MAKESYSPATH": "/usr/share/mk"}, StatusOK},
+		{"MAKESYSPATH", map[string]string{"/custom/mk/sys.mk": sysmk}, map[string]string{"MAKESYSPATH": "/custom/mk:/usr/share/mk"}, StatusWarn},
+		{"MAKESYSPATH naming no sys.mk", nil, map[string]string{"MAKESYSPATH": "/nonexistent"}, StatusWarn},
+		{"MAKEFLAGS assigns MAKESYSPATH", nil, map[string]string{"MAKEFLAGS": "MAKESYSPATH=/custom/mk"}, StatusWarn},
+		{"MAKEFLAGS passes -m", nil, map[string]string{"MAKEFLAGS": "-m /custom/mk"}, StatusWarn},
+		{"share/mk in a port", map[string]string{"/usr/ports/www/nginx/share/mk/sys.mk": sysmk}, nil, StatusWarn},
+		{"share/mk in a category", map[string]string{"/usr/ports/www/share/mk/sys.mk": sysmk}, nil, StatusWarn},
+		{"share/mk in the tree", map[string]string{"/usr/ports/share/mk/sys.mk": sysmk}, nil, StatusWarn},
+		{"share/mk above PORTSDIR", map[string]string{"/home/share/mk/sys.mk": sysmk}, map[string]string{"PORTSDIR": "/home/ports"}, StatusWarn},
+		{"relative PORTSDIR", nil, map[string]string{"PORTSDIR": "ports"}, StatusWarn},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := map[string]string{
+				"/etc/make.conf":                     "MASTER_SITE_OVERRIDE=" + site + "\nMASTER_SITE_BACKUP=" + site + "\n.include \"/usr/local/etc/bodega-distfiles.mk\"\n",
+				"/usr/local/etc/bodega-distfiles.mk": "BODEGA_DISTFILES_ENV=abc\n",
+			}
+			for p, b := range tc.extra {
+				files[p] = b
+			}
+			lookup := func(n string) (string, bool) { v, ok := tc.env[n]; return v, ok }
+			assertFinding(t, checkMakeConfLookup(writeTree(t, files), "freebsd", lookup), tc.want)
+		})
+	}
+}
