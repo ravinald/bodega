@@ -1,0 +1,227 @@
+#!/bin/sh
+# rc.subr reads every variable this script assigns, and lives on the host.
+# shellcheck disable=SC1091,SC2034
+#
+# PROVIDE: bodega
+# REQUIRE: LOGIN NETWORKING
+# KEYWORD: shutdown
+#
+# rc.d script for bodega on FreeBSD
+#
+# Install it as /usr/local/etc/rc.d/bodega, mode 0555, and the binary as
+# /usr/local/bin/bodega. The service account and the two directories it
+# writes have to exist first; nothing here creates them:
+#
+#   pw useradd -n bodega -d /var/lib/bodega -s /usr/sbin/nologin -c "bodega server"
+#   mkdir -p /etc/bodega /var/lib/bodega /var/log/bodega
+#
+# Write the config and any signing key, then hand both trees to the service
+# account last, for the reason docs/bodega.service gives: a bodega command run
+# as root leaves config.json and audit.db owned by root.
+#
+#   chown -R bodega:bodega /var/lib/bodega /var/log/bodega
+#   chown root:bodega /etc/bodega/config.json
+#   chmod 0640 /etc/bodega/config.json
+#
+#   sysrc bodega_enable=YES
+#   service bodega start
+#   tail -f /var/log/bodega.log
+#
+# Mint tokens as root with BODEGA_SERVICE_USER naming bodega_user, so the pepper
+# a first mint writes is root:<that account's group> 0640 and the server can
+# read it. Without it bodega finds no service account (it reads systemd units,
+# not rc.conf) and writes the pepper root:wheel 0600:
+#
+#   env BODEGA_SERVICE_USER=bodega bodega token generate ci expiry 90d
+#
+# A pepper already written 0600 stays that way; hand it to bodega_user's group:
+#
+#   chown root:$(id -gn bodega) /etc/bodega/pepper
+#   chmod 0640 /etc/bodega/pepper
+#
+# Variables, set with sysrc(8):
+#
+#   bodega_enable          YES to start at boot. Default NO.
+#   bodega_user            Account the server runs as. Default bodega. Name
+#                          the same account in BODEGA_SERVICE_USER to mint.
+#   bodega_config          Exported as BODEGA_CONFIG_FILE.
+#                          Default /etc/bodega/config.json.
+#   bodega_flags           Appended to `bodega serve`, never to daemon(8).
+#   bodega_chdir           Working directory. Default /var/lib/bodega.
+#   bodega_logfile         stdout and stderr. Default /var/log/bodega.log.
+#                          daemon(8) opens it as root, so every directory on
+#                          the way to it must be root's alone; start refuses
+#                          one bodega_user could write, such as /var/log/bodega,
+#                          and one carrying any ACL entry beyond its mode bits.
+#   bodega_restart_delay   Seconds before daemon(8) restarts an exited server.
+#                          Default 5.
+#   bodega_env, bodega_env_file
+#                          rc.subr's own: S3 credentials go here, since bodega
+#                          reads them from the AWS SDK's default chain.
+#
+# daemon(8) supervises: -P records its own pid, which is what `service bodega
+# stop` signals and what it forwards SIGTERM from. The server's pid is in
+# /var/run/bodega_child.pid, and `service bodega reload` sends it SIGHUP, which
+# rereads manifests, the signing keys and the CIDR access lists exactly as
+# `systemctl reload` does. Signalling the supervisor instead would only reopen
+# the log file (-H), which is what newsyslog(8) wants from it.
+#
+# Every directive in docs/bodega.service and what stands in for it here:
+#
+#   Type=notify           None. rc.subr returns once daemon(8) has forked, so
+#                         `service bodega start` succeeds before the listener
+#                         binds. A refused start shows in bodega_logfile and in
+#                         the restart loop, not in the exit status.
+#   User=, Group=         daemon -u bodega_user. The group is that account's
+#                         primary group; daemon(8) has no separate group option.
+#   WorkingDirectory=     bodega_chdir, applied by rc.subr before daemon(8)
+#                         starts. daemon runs without -c so it is kept.
+#   ExecStart=            command_args below.
+#   ExecReload=           reload_cmd: SIGHUP to the child pid.
+#   Environment=          bodega_config, exported as BODEGA_CONFIG_FILE.
+#   EnvironmentFile=      bodega_env_file.
+#   LoadCredential=       None. FreeBSD has no per-service credential store,
+#                         so the apt and pkg signing keys are read from
+#                         /etc/bodega, where they must be owned by bodega_user
+#                         and mode 0600: bodega refuses a key readable beyond
+#                         its owner, and root:root 0600 is one it cannot open.
+#   Restart=on-failure    daemon -R bodega_restart_delay. daemon(8) restarts on
+#   RestartSec=5s         any exit, a clean one included; stop the service to
+#                         keep it down.
+#   TimeoutStartSec=180   None. Nothing here waits for readiness to time it.
+#   NoNewPrivileges=true  proccontrol -m nonewprivs, which sets
+#                         PROC_NO_NEW_PRIVS_CTL before exec: setuid and setgid
+#                         bits are ignored for the server and its children.
+#   ProtectSystem=strict  None. FreeBSD has no per-service read-only view of the
+#                         filesystem. File permissions are the whole boundary:
+#                         bodega_user owns /var/lib/bodega and /var/log/bodega
+#                         and nothing else, and nothing here runs as root on a
+#                         path under either. Run bodega in a jail(8) with those
+#                         two nullfs-mounted read-write to get the equivalent.
+#   ReadWritePaths=       The same two directories, by ownership rather than by
+#                         mount. The equivalent is the jail above.
+#   ProtectHome=true      None. A jail with no /home in it is the equivalent;
+#                         outside one, home directories are as readable to
+#                         bodega_user as their modes allow.
+#   PrivateTmp=true       Partial. TMPDIR is bodega_chdir/tmp, created 0700 by
+#                         bodega_user itself on every start, so bodega's own
+#                         temporary files are private to it. /tmp itself stays
+#                         shared.
+#   After=, Wants=        REQUIRE: LOGIN NETWORKING above.
+#   network-online.target
+#   WantedBy=             bodega_enable.
+#   multi-user.target
+
+. /etc/rc.subr
+
+name=bodega
+rcvar=bodega_enable
+desc="bodega package repository server"
+
+load_rc_config $name
+
+: "${bodega_enable:=NO}"
+: "${bodega_user:=bodega}"
+: "${bodega_config:=/etc/bodega/config.json}"
+: "${bodega_flags:=}"
+: "${bodega_chdir:=/var/lib/bodega}"
+: "${bodega_logfile:=/var/log/bodega.log}"
+: "${bodega_restart_delay:=5}"
+
+pidfile="/var/run/${name}.pid"
+child_pidfile="/var/run/${name}_child.pid"
+procname="/usr/sbin/daemon"
+command="/usr/sbin/daemon"
+command_args="-f -H -P ${pidfile} -p ${child_pidfile} -R ${bodega_restart_delay} \
+    -u ${bodega_user} -o ${bodega_logfile} \
+    /usr/bin/proccontrol -m nonewprivs -s enable \
+    /usr/local/bin/bodega serve ${bodega_flags}"
+# rc.subr acts on both of these itself: the flags go on daemon(8)'s command
+# line, and a user wraps daemon in su(1), which leaves it unable to write its
+# pidfiles or drop to the account on its own. command_args carries both.
+bodega_account="${bodega_user}"
+bodega_flags=""
+bodega_user=""
+
+extra_commands="reload"
+start_precmd="bodega_prestart"
+reload_cmd="bodega_reload"
+
+# Succeeds when root alone decides which file $1 names: an absolute path with
+# no . or .. component, every directory above it real (not a symlink), owned by
+# root, with no group or other write bit, no ACL entry beyond the ones the mode
+# bits imply, and not writable by bodega_account. The ACL test covers every
+# other account a named entry could grant; the account test catches anything
+# neither of the others shows. Nothing unprivileged can change a directory that
+# passes, so the answer still holds when daemon(8) opens the file, and when -H
+# reopens it. The file itself, if present, must be a regular file with one link:
+# a symlink or hard link planted while a directory was still writable outlives
+# the permission that let it in. On failure _unsafe names what failed.
+bodega_root_only_parent()
+{
+	_unsafe=$1
+	case $1 in
+	*//* | */./* | */../* | */. | */.. | */) return 1 ;;
+	/*) ;;
+	*) return 1 ;;
+	esac
+	_dir=${1%/*}
+	while :; do
+		_unsafe=${_dir:-/}
+		_st=$(stat -f '%u %Sp' "${_unsafe}") || return 1
+		case ${_st} in
+		0\ d????-??-?) ;;
+		*) return 1 ;;
+		esac
+		# getfacl -s prints only a nontrivial ACL; a read error refuses too.
+		_acl=$(getfacl -h -s -q "${_unsafe}") || return 1
+		[ -z "${_acl}" ] || return 1
+		# An su that fails outright must not read as "cannot write".
+		_w=$(su -m "${bodega_account}" -c "if test -w '${_unsafe}'; then echo yes; else echo no; fi")
+		[ "${_w}" = no ] || return 1
+		[ -n "${_dir}" ] || break
+		_dir=${_dir%/*}
+	done
+	_unsafe=$1
+	if [ -L "$1" ]; then
+		return 1
+	elif [ -e "$1" ]; then
+		[ "$(stat -f '%HT %l' "$1")" = "Regular File 1" ] || return 1
+	fi
+	return 0
+}
+
+bodega_prestart()
+{
+	if [ ! -f "${bodega_config}" ]; then
+		err 1 "${bodega_config} does not exist; write it or set bodega_config"
+	fi
+	if ! id "${bodega_account}" >/dev/null 2>&1; then
+		err 1 "account ${bodega_account} does not exist; create it with pw useradd (see the header of this script) or set bodega_user"
+	fi
+	case "${bodega_chdir}${bodega_logfile}" in
+	*"'"*) err 1 "bodega_chdir and bodega_logfile may not contain a single quote" ;;
+	esac
+	if ! bodega_root_only_parent "${bodega_logfile}"; then
+		err 1 "bodega_logfile ${bodega_logfile}: ${_unsafe} is not a directory only root can write, or a log file only root placed (a symlink, not root's, writable by group, others or ${bodega_account}, an ACL entry beyond the mode bits, an existing log that is not a regular file with one link, or a relative, . or .. path), and daemon(8) opens the log as root, so it could be pointed at any file on the host. Set bodega_logfile under a root-owned directory such as /var/log"
+	fi
+	# As the account, not root: root following a symlink the account planted
+	# here would hand the account whatever the link names. chmod rather than
+	# install -d -m, which only warns when the chmod fails and exits 0.
+	if ! su -m "${bodega_account}" -c "mkdir -p '${bodega_chdir}/tmp' && chmod 0700 '${bodega_chdir}/tmp'"; then
+		err 1 "${bodega_account} could not create ${bodega_chdir}/tmp mode 0700; ${bodega_account} must own ${bodega_chdir}, and ${bodega_chdir}/tmp, if present, must be a directory it owns"
+	fi
+	export BODEGA_CONFIG_FILE="${bodega_config}"
+	export TMPDIR="${bodega_chdir}/tmp"
+}
+
+bodega_reload()
+{
+	_pid=$(check_pidfile "${child_pidfile}" /usr/local/bin/bodega)
+	if [ -z "${_pid}" ]; then
+		err 1 "${name} is not running (no live pid in ${child_pidfile})"
+	fi
+	kill -HUP "${_pid}"
+}
+
+run_rc_command "$1"

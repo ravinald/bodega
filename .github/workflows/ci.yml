@@ -139,11 +139,11 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
           govulncheck ./...
 
-  # FreeBSD is compiled here and nowhere else. #12 dropped the linux and darwin
-  # loop because GoReleaser builds those pairs at tag time; .goreleaser.yaml's
-  # goos list does not carry freebsd, so nothing else ever compiles it, and
-  # internal/storage sat behind a `linux || darwin` constraint through a
-  # release with `bodega doctor --write-pkg-repo` written for a pkg host.
+  # FreeBSD arm64 is compiled on a pull request here and nowhere else:
+  # GoReleaser builds every release pair, but only at tag time, and
+  # test-freebsd runs amd64. internal/storage once sat behind a
+  # `linux || darwin` constraint through a release because nothing compiled
+  # FreeBSD before a tag.
   #
   # It carries no needs: list. `make ci-drift` reads every needs: in this file
   # against CI_GATE_JOBS, so a second one would report the whole gate as drift.
@@ -164,11 +164,54 @@ jobs:
             echo "built $target"
           done
 
-  # gate exists so `make ci-drift` has a needs: list to read: it compares that
-  # list against CI_GATE_JOBS and maps each entry onto a leg of `make check`.
-  # It runs nothing. The jobs it names are what branch protection requires.
-  gate:
+  # The FreeBSD syscall paths (internal/storage's ACL and extattr code) compile
+  # into no Linux binary, so the Linux test jobs never reach them. This runs the
+  # whole tree on a FreeBSD kernel in a VM. No `make check` leg can boot one,
+  # which is why the Makefile lists it in CI_ONLY_GATE_JOBS.
+  #
+  # go126 rather than the stock go package, which trails go.mod; the toolchain
+  # line in go.mod then fetches the exact patch release. No -race: the Linux
+  # jobs carry it, and here it would double a run already inside a VM.
+  test-freebsd:
     runs-on: ubuntu-latest
-    needs: [vet, lint, fmt, tidy, test, test-server, harness]
+    timeout-minutes: 45
     steps:
-      - run: echo "every gate job passed"
+      - uses: actions/checkout@v7
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          release: "15.1"
+          copyback: false
+          prepare: |
+            pkg install -y go126 git node
+            pw useradd -n bodega-ci -m -s /bin/sh
+            install -d -o bodega-ci -g bodega-ci -m 0700 /home/bodega-ci/tmp
+            chown -R bodega-ci "$GITHUB_WORKSPACE"
+          # Unprivileged, as the Linux jobs run: as root, a 0444 audit.db
+          # stays writable, a test binary in root's 0700 build dir cannot be
+          # re-executed as nobody, and the distfiles client check sees a root
+          # that can remount the tree.
+          #
+          # TMPDIR is the account's own because FreeBSD gives a new file its
+          # directory's group, not its creator's: under /tmp every t.TempDir()
+          # file is wheel, which a one-group account cannot set setgid on, and
+          # the storage tests that restate a group find nothing to restate.
+          run: |
+            su -m bodega-ci -c 'env HOME=/home/bodega-ci TMPDIR=/home/bodega-ci/tmp PATH=/usr/local/go126/bin:$PATH sh -c "go version && go test -count=1 ./..."'
+
+  # Branch protection requires gate alone, so gate has to fail whenever any job
+  # it names did not succeed. Without always(), a failed job skips gate, and
+  # GitHub counts a skipped required check as passing. `make ci-drift` reads
+  # the needs: list against CI_GATE_JOBS and refuses a gate without always().
+  gate:
+    if: always()
+    runs-on: ubuntu-latest
+    needs: [vet, lint, fmt, tidy, test, test-server, harness, test-freebsd]
+    steps:
+      - name: Every gate job succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        # jq -e exits nonzero on a false answer and on input it cannot parse,
+        # so a malformed needs object fails the gate rather than passing it.
+        run: |
+          printf '%s\n' "$NEEDS" | jq -r 'to_entries[] | "\(.value.result)\t\(.key)"'
+          printf '%s\n' "$NEEDS" | jq -e 'length > 0 and all(.[]; .result == "success")' > /dev/null

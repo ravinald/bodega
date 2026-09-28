@@ -35,7 +35,7 @@ make build          # ./dist/bodega
 
 There are no published releases yet, and `go install github.com/ravinald/bodega/cmd/bodega@latest` resolves to a cached `v0.1.0` that predates this tree. Build from source until a tagged release lands.
 
-The server runs on Linux and FreeBSD, and builds from source on both; FreeBSD needs `gmake` and the `go126` package, as [Quick start](docs/quickstart.md) shows. FreeBSD does not yet get release archives, an rc.d script, or CI test runs ([#48](https://github.com/ravinald/bodega/issues/48)); [Platforms](docs/usage.md#platforms) lists every gap.
+The server runs on Linux and FreeBSD, and builds from source on both; FreeBSD needs `gmake` and the `go126` package, as [Quick start](docs/quickstart.md) shows. A tagged release publishes `tar.gz` archives for `linux`, `darwin` and `freebsd` on `amd64` and `arm64`, each carrying the systemd unit and the rc.d script, and `make cross` builds the linux and freebsd pairs from a checkout. CI runs the unit tests on a FreeBSD kernel as well as on Linux. [Platforms](docs/usage.md#platforms) lists what each platform gets and what it still lacks.
 
 Storage defaults to the local filesystem at `/var/lib/bodega`. For S3, set `storage_backend` to `"s3"` in the config file and run `bodega init` to create the bucket with encryption, versioning, lifecycle rules, and public access blocked. Credentials come from the AWS default chain. `bodega init --print-policy` prints the IAM policies for setup and for the running service, and `bodega init check` confirms the current credentials hold the runtime one. [S3 setup](docs/usage.md#s3-setup) has the details.
 

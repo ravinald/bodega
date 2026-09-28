@@ -8,10 +8,12 @@ The build needs Go at the version `go.mod` names and nothing else:
 
 ```bash
 make build      # ./dist/bodega for this host
-make cross      # linux/amd64 and linux/arm64
+make cross      # linux/amd64, linux/arm64, freebsd/amd64 and freebsd/arm64
 ```
 
 `make install` puts the binary on `PATH`; `make uninstall` takes it off again.
+
+Release archives come from GoReleaser at tag time, not from the Makefile: `.goreleaser.yaml` builds `tar.gz` archives for `linux`, `darwin` and `freebsd` on `amd64` and `arm64`, with the same ldflags `make build` stamps, and the `.deb` and `.rpm` packages for Linux. `goreleaser release --snapshot --clean --skip=sign` reproduces them in `dist/` without a tag; the signing stage signs keyless through GitHub's OIDC issuer and only completes in CI.
 
 ## The gate
 
@@ -36,11 +38,13 @@ It runs a leg per CI job, cheapest first, so a gofmt slip costs two seconds rath
 
 Run a leg on its own with `make test`, `make lint`, `make vet`, `make fmt`, or `make tidy`.
 
+**One gate job has no leg: `test-freebsd`.** It runs `go test ./...` on a FreeBSD 15.1 kernel in a VM, which no workstation or Linux runner can boot, so `make check` passing says nothing about it. The Makefile lists it in `CI_ONLY_GATE_JOBS`, and `make ci-drift` accepts it in the gate without a leg on that basis alone. A FreeBSD failure fails `gate`, the one check branch protection requires, so it holds the merge; `gate` runs under `if: always()` and passes only when every job it names succeeded, because GitHub counts a skipped required check as passing. Reproduce a failure on a FreeBSD host as an unprivileged user with `TMPDIR` set to a directory that user's own group owns, the way the job runs it.
+
 **Tool versions differ between this gate and CI.** `shfmt` is pinned in `.github/workflows/ci.yml`; `shellcheck` comes from the GitHub runner image and is not. A shell change that passes `make harness` locally can still fail in CI on a rule your build does not carry, so read the job log rather than assuming the local run settled it.
 
 ## End-to-end tests
 
-`make check` is unit tests and linters. `test/e2e/` is the other half: it ships a build to four hosts, a Linux pair and a FreeBSD pair, and drives `apt-get`, `pip`, `helm`, `npm`, `cargo`, `go`, `git`, `curl`, `pkg`, and `make fetch` against a running server, then writes a findings file. The FreeBSD server guest is the only place the storage layer's extattr and ACL calls run against a real kernel.
+`make check` is unit tests and linters. `test/e2e/` is the other half: it ships a build to four hosts, a Linux pair and a FreeBSD pair, and drives `apt-get`, `pip`, `helm`, `npm`, `cargo`, `go`, `git`, `curl`, `pkg`, and `make fetch` against a running server, then writes a findings file. The FreeBSD server guest is the only place the storage layer's extattr and ACL calls run on both ZFS and UFS with ACLs, as root and unprivileged; the `test-freebsd` CI job runs them once, unprivileged, on whatever filesystem its VM image carries.
 
 It needs four scratch guests and several minutes, so it runs by hand rather than in CI:
 

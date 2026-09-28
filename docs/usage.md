@@ -9,6 +9,7 @@ Comprehensive documentation for the bodega package repository manager.
 - [Configuration](#configuration)
 - [Platforms](#platforms)
 - [Running under systemd](#running-under-systemd)
+- [Running under rc.d](#running-under-rcd)
 - [Manifest Structure](#manifest-structure)
 - [Pipeline](#pipeline)
 - [HTTP Server](#http-server)
@@ -2965,7 +2966,7 @@ Settings resolve in priority order: CLI flags, then environment variables, then 
 
 ## Platforms
 
-bodega treats Linux and FreeBSD as peers. Both run the server, both are clients of it, and each package type serves the same way whichever operating system the server runs on. They are not yet equal in how bodega ships to them, and the following table states where each stands today:
+bodega treats Linux and FreeBSD as peers. Both run the server, both are clients of it, and each package type serves the same way whichever operating system the server runs on. They differ in how bodega ships to them in one place, the distribution package, and the following table states where each stands today:
 
 |                                                 | Linux                                                | FreeBSD                                                                                                                         |
 | ----------------------------------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
@@ -2974,20 +2975,20 @@ bodega treats Linux and FreeBSD as peers. Both run the server, both are clients 
 | Client of the server                            | apt, and every language client                       | `pkg`, ports distfiles (`make fetch`), and every language client                                                                |
 | Client configuration written by `bodega doctor` | apt sources and keyring, credentials                 | `pkg` repository configuration, credentials                                                                                     |
 | Host checks in `bodega doctor`                  | apt sources, snap, flatpak, pip, npm, cargo, GOPROXY | pip, npm, cargo, GOPROXY; the pip and npm checks read Linux paths only                                                          |
-| Profile rules                                   | per package; apt hosts read a filtered codename      | per package; pkg hosts read a filtered catalogue signed by bodega ([#54](https://github.com/ravinald/bodega/issues/54))         |
-| Release archive                                 | amd64, arm64                                         | not yet                                                                                                                         |
+| Profile rules                                   | per package; apt hosts read a filtered codename      | per package; pkg hosts read a filtered catalog signed by bodega ([#54](https://github.com/ravinald/bodega/issues/54))         |
+| Release archive                                 | amd64, arm64                                         | amd64, arm64                                                                                                                    |
 | Distribution package                            | `.deb` and `.rpm`, with the systemd unit             | not yet                                                                                                                         |
-| Service definition                              | [bodega.service](bodega.service) (systemd)           | not yet: no rc.d script                                                                                                         |
-| `make cross` default targets                    | amd64, arm64                                         | not yet; `make cross CROSS_TARGETS="freebsd/amd64 freebsd/arm64"` builds them                                                   |
-| CI                                              | builds, vets, lints and runs every unit test         | compiles for amd64 and arm64; runs no tests                                                                                     |
+| Service definition                              | [bodega.service](bodega.service) (systemd)           | [bodega.rc](bodega.rc) (rc.d, supervised by `daemon(8)`)                                                                        |
+| `make cross` default targets                    | amd64, arm64                                         | amd64, arm64                                                                                                                    |
+| CI                                              | builds, vets, lints and runs every unit test         | runs every unit test on amd64 in a FreeBSD 15.1 VM (`test-freebsd`), and compiles arm64                                         |
 | End-to-end suite                                | a server and a client guest                          | a client guest (`pkg`, ports, distfiles) and a server guest that runs `internal/storage`'s FreeBSD syscall tests on ZFS and UFS |
 
 macOS builds and has release archives for amd64 and arm64. It is supported for development and for running the CLI against a remote server, and has no service definition.
 
 The FreeBSD gaps, stated so none of them is discovered by surprise:
 
-- **No release archive, distribution package or rc.d script** ([#48](https://github.com/ravinald/bodega/issues/48)). Build from source on the host: the Makefile needs GNU make and the stock `go` package trails `go.mod`, so `pkg install gmake go126`, put `/usr/local/go126/bin` first on `PATH`, and run `gmake build`. Or cross-compile with the `CROSS_TARGETS` override in the table, and supervise the binary with `daemon(8)` under a service script of your own.
-- **No unit tests run on FreeBSD in CI** ([#48](https://github.com/ravinald/bodega/issues/48)). The FreeBSD storage code is exercised by the end-to-end suite, which runs by hand.
+- **No distribution package.** There is no `pkg` package or port. Install from the release archive, or build on the host: the Makefile needs GNU make and the stock `go` package trails `go.mod`, so `pkg install gmake go126`, put `/usr/local/go126/bin` first on `PATH`, and run `gmake build`. [Running under rc.d](#running-under-rcd) covers the rest.
+- **CI tests one FreeBSD architecture.** `test-freebsd` runs amd64, unprivileged, on whatever filesystem its VM image carries; arm64 is compiled and never tested in CI. The storage layer's ACL and extended-attribute paths on both ZFS and UFS, as root, run only in the end-to-end suite, by hand.
 - **`bodega doctor` has no FreeBSD host checks** ([#49](https://github.com/ravinald/bodega/issues/49)). It writes the `pkg` repository configuration but does not read `/etc/pkg/FreeBSD.conf`, `/usr/local/etc/pkg/repos/` or `/etc/make.conf` to report a host that still reaches upstream, and its pip and npm checks do not read `/usr/local/etc/pip.conf` or `/usr/local/etc/npmrc`.
 - **`bodega pkg convert freebsd` records no repository URL.** `pkg query` names the repository each package came from and not its address, so every converted entry needs its URL filled in from `pkg -vv` before the import: see [What convert does and does not resolve](#what-convert-does-and-does-not-resolve).
 - **Profile rules are per package, and cost FreeBSD's signature** ([#54](https://github.com/ravinald/bodega/issues/54)). A bound host reads a catalog filtered for its profile, the way apt hosts read a filtered codename, and it is signed by bodega's pkg key rather than FreeBSD's, so the host trusts bodega's fingerprint for it. `bodega profile check` does not resolve freebsd entries against a repository's catalog. See [pkg under a profile](#pkg-under-a-profile).
@@ -3022,6 +3023,91 @@ journalctl -u bodega -f
 ```
 
 For an interactive background run without systemd, `nohup bodega serve > /tmp/bodega.log 2>&1 &` works. Bodega does not self-daemonize: systemd, launchd, and supervisord all want the server in the foreground, and a process that forks out from under its supervisor reports its own readiness wrong.
+
+---
+
+## Running under rc.d
+
+A FreeBSD rc.d script ships at [bodega.rc](bodega.rc), in every release archive beside the systemd unit. It runs `bodega serve` in the foreground under `daemon(8)`, which restarts the server when it exits and writes its output to a log file. The script's header maps every directive in the systemd unit to what stands in for it on FreeBSD, and names the ones with no equivalent: `ProtectSystem`, `ProtectHome` and `ReadWritePaths` have none outside a jail, and there is no readiness notification.
+
+### Installing the script
+
+Create the account and the directories, install the binary and the script, and hand the writable trees to the account last:
+
+```bash
+sudo pw useradd -n bodega -d /var/lib/bodega -s /usr/sbin/nologin -c "bodega server"
+sudo mkdir -p /etc/bodega /var/lib/bodega /var/log/bodega
+sudo install -m 0555 bodega /usr/local/bin/bodega
+sudo install -m 0555 docs/bodega.rc /usr/local/etc/rc.d/bodega
+# write /etc/bodega/config.json, and generate any signing key, here
+sudo chown -R bodega:bodega /var/lib/bodega /var/log/bodega
+sudo chown root:bodega /etc/bodega/config.json
+sudo chmod 0640 /etc/bodega/config.json
+sudo service bodega enable
+sudo service bodega start
+```
+
+The ownership pass comes last for the reason the systemd unit's header gives: a bodega command run as root leaves `config.json` and `audit.db` owned by root, and the service will not start on either.
+
+The server's own log is the exception. `daemon(8)` opens it as root, so it lives at `/var/log/bodega.log`, in a directory only root can write, and not under `/var/log/bodega` with the audit database: there the account could replace the name with a symlink and have root append to any file on the host. The script refuses to start unless every directory above `bodega_logfile` is owned by root, carries no group or other write bit and no ACL entry beyond the ones its mode implies (`getfacl -s` prints nothing for it), and is not writable by the account. An existing log file must be a regular file with one link, so a symlink or hard link left behind by a grant since withdrawn is refused too. Clear an extra entry with `setfacl -b <dir>`.
+
+Mint tokens as root with `BODEGA_SERVICE_USER` naming the account the server runs as. bodega finds its service account in that variable or in a systemd unit, never in `rc.conf`, so without it the first `token generate` writes `/etc/bodega/pepper` as `root:wheel 0600` and the server exits on start because it cannot read it. With it, the pepper is `root:<account's primary group> 0640`:
+
+```bash
+sudo env BODEGA_SERVICE_USER=bodega bodega token generate ci-pipeline expiry 90d
+```
+
+Set it, and the account in the repair below, to whatever `bodega_user` names. A pepper already written `0600` is not rewritten by a later mint; hand it over once:
+
+```bash
+sudo chown root:$(id -gn bodega) /etc/bodega/pepper
+sudo chmod 0640 /etc/bodega/pepper
+```
+
+A signing key is the one file that differs from the systemd install. FreeBSD has no counterpart to `LoadCredential=`, so bodega reads the apt and pkg keys from `/etc/bodega`, and it refuses a key readable by anyone but its owner. The owner therefore has to be the service account:
+
+```bash
+sudo chown bodega:bodega /etc/bodega/apt-signing.key
+sudo chmod 0600 /etc/bodega/apt-signing.key
+```
+
+### Configuring the service
+
+The script reads these from `/etc/rc.conf`; set them with `sysrc`:
+
+| Variable               | Default                      | Meaning                                                                                       |
+| ---------------------- | ---------------------------- | --------------------------------------------------------------------------------------------- |
+| `bodega_enable`        | `NO`                         | Start at boot. `service bodega enable` sets it.                                               |
+| `bodega_user`          | `bodega`                     | The account the server runs as. Name it in `BODEGA_SERVICE_USER` when minting tokens.         |
+| `bodega_config`        | `/etc/bodega/config.json`    | Exported to the server as `BODEGA_CONFIG_FILE`.                                               |
+| `bodega_flags`         | empty                        | Appended to `bodega serve`, for example `--allow-plaintext=false`.                            |
+| `bodega_chdir`         | `/var/lib/bodega`            | Working directory. A relative `manifest_dir` resolves against it.                             |
+| `bodega_logfile`       | `/var/log/bodega.log`        | Where the server's stdout and stderr go. Every directory above it must be root's alone.       |
+| `bodega_restart_delay` | `5`                          | Seconds `daemon(8)` waits before restarting a server that exited.                             |
+| `bodega_env_file`      | unset                        | A file of `VAR=value` lines for the server's environment, such as S3 credentials.             |
+
+`bodega_flags` reaches `bodega serve`, not `daemon(8)`. The server's temporary files go to `tmp/` under `bodega_chdir`, which the account itself creates mode 0700 on every start; the script never runs as root on a path the account can write.
+
+`service bodega start` returns once `daemon(8)` has forked, before the listener binds, so a start that bodega refuses (an unreadable config, no TLS posture) shows up in the log and in a restart every `bodega_restart_delay` seconds rather than in the exit status. Read the log after a first start.
+
+`daemon(8)` restarts the server after any exit, a clean one included. `service bodega stop` is how to keep it down.
+
+### Reloading and reading logs
+
+```bash
+sudo service bodega reload          # SIGHUP to the server; rereads manifests, keys and access lists
+sudo service bodega status
+sudo tail -f /var/log/bodega.log
+```
+
+`reload` does what `systemctl reload` does: manifests, the signing keys and the CIDR access lists are reread in place, and every other `config.json` key still needs a restart. `status` reports the `daemon(8)` supervisor's pid, from `/var/run/bodega.pid`; the server's own is in `/var/run/bodega_child.pid`.
+
+The log file belongs to root, mode 0600, because the supervisor that writes it runs as root. It is not rotated by default. `daemon(8)` reopens it on SIGHUP to the supervisor, so a `newsyslog` entry naming the supervisor's pidfile rotates it without restarting the server:
+
+```text
+# /etc/newsyslog.conf.d/bodega.conf
+/var/log/bodega.log  root:wheel  600  7  *  @T00  JC  /var/run/bodega.pid
+```
 
 ---
 
@@ -5268,7 +5354,7 @@ Git smart-HTTP mirrors are the one tree that is not a storage key. They are bare
 ```bash
 make check          # every job CI blocks on, cheapest leg first
 make build          # compile to ./dist/bodega
-make cross          # cross-compile for every pair in CROSS_TARGETS (linux/amd64, linux/arm64 by default)
+make cross          # cross-compile for every pair in CROSS_TARGETS (linux and freebsd, amd64 and arm64, by default)
 make test           # run tests with race detector
 make test-verbose   # verbose test output
 make bench          # run benchmarks
@@ -5290,6 +5376,11 @@ agree and `make ci-drift` reads all three: `needs:` in
 each CI job with the make target that runs it. That target must appear in
 `CHECK_LEGS`, which is `check`'s own prerequisite list, so a job added to CI
 with no leg fails the gate rather than passing it.
+The one exception is `CI_ONLY_GATE_JOBS`: gate jobs no local leg can run, each
+named with its reason. Today that is `test-freebsd`, which runs `go test ./...`
+on a FreeBSD kernel in a VM, so `make check` passing says nothing about it.
+Release archives are GoReleaser's, at tag time: `.goreleaser.yaml` builds
+`linux`, `darwin` and `freebsd` on `amd64` and `arm64`.
 `make fmt-check` requires `goimports` on `PATH` rather than skipping it, because
 a check that skips is weaker than the merge it stands in for.
 

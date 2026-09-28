@@ -34,6 +34,14 @@ CI_GATE_JOBS := vet lint fmt tidy test test-server harness
 # fmt-check and costs the cheapest-first ordering CHECK_LEGS holds.
 CI_GATE_TARGETS := vet=vet lint=lint fmt=fmt-check tidy=tidy-check test=test test-server=test-server harness=harness
 
+# CI gate jobs no leg of `check` can run, each with the reason. ci-drift accepts
+# these in ci.yml's needs: without a CI_GATE_TARGETS entry, and refuses one that
+# also has a leg, so the exemption cannot outlive the reason for it.
+#
+#   test-freebsd  boots a FreeBSD VM to run `go test ./...` on a FreeBSD kernel;
+#                 a workstation or a Linux runner has no such kernel to offer.
+CI_ONLY_GATE_JOBS := test-freebsd
+
 # The legs `check` runs, in order. `check` has no prerequisites outside this
 # list, so it is what ran, and `ci-drift` reads CI_GATE_TARGETS against it.
 CHECK_LEGS := ci-drift fmt-check tidy-check harness vet build lint test test-server
@@ -125,12 +133,13 @@ build:
 	go build $(GOFLAGS) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY) $(CMD_PKG)
 	@echo "Built: $(BUILD_DIR)/$(BINARY) (version: $(VERSION))"
 
-# CROSS_TARGETS is every linux pair a bodega host might be. arm64 is here
-# because both development guests are aarch64 and the amd64-only target failed
-# on them as "cannot execute binary file", which reads as a broken upload
-# rather than as the wrong architecture. Override to narrow it:
-#   make cross CROSS_TARGETS=linux/amd64
-CROSS_TARGETS ?= linux/amd64 linux/arm64
+# CROSS_TARGETS is every server platform bodega ships a release archive for,
+# minus darwin, which `make build` already covers on the workstation. arm64 is
+# here because every development guest is arm64, and an amd64-only target
+# failed on them as "cannot execute binary file", which reads as a broken
+# upload rather than as the wrong architecture. Override to narrow it:
+#   make cross CROSS_TARGETS=freebsd/arm64
+CROSS_TARGETS ?= linux/amd64 linux/arm64 freebsd/amd64 freebsd/arm64
 
 ## cross: Cross-compile for every pair in CROSS_TARGETS (run on macOS workstation)
 cross:
@@ -310,15 +319,28 @@ tidy-check:
 ## ci-drift: Fail if `check` and ci.yml no longer gate on the same jobs
 #
 # The two lists that must not diverge: the jobs ci.yml's build stage needs, and
-# CI_GATE_JOBS, which is what `make check` runs a leg for. Adding a job to CI
-# without adding it here fails the gate on the very branch that added it.
+# CI_GATE_JOBS, which is what `make check` runs a leg for, plus the
+# CI_ONLY_GATE_JOBS no leg can run. Adding a job to CI without adding it here
+# fails the gate on the very branch that added it.
 ci-drift:
+	@for job in $(CI_ONLY_GATE_JOBS); do \
+		case " $(CI_GATE_JOBS) " in \
+			*" $$job "*) echo "'$$job' is in both CI_GATE_JOBS and CI_ONLY_GATE_JOBS; a job with a local leg is not CI-only"; \
+			   exit 1;; \
+		esac; \
+	done
 	@ci=$$(sed -n 's/^ *needs: *\[\(.*\)\].*$$/\1/p' .github/workflows/ci.yml | tr -d ' ' | tr ',' '\n' | sort | tr '\n' ' '); \
-	mine=$$(printf '%s\n' $(CI_GATE_JOBS) | sort | tr '\n' ' '); \
+	mine=$$(printf '%s\n' $(CI_GATE_JOBS) $(CI_ONLY_GATE_JOBS) | sort | tr '\n' ' '); \
 	if [ "$$ci" != "$$mine" ]; then \
-		echo ".github/workflows/ci.yml gates on: $$ci"; \
-		echo "Makefile CI_GATE_JOBS:            $$mine"; \
+		echo ".github/workflows/ci.yml gates on:         $$ci"; \
+		echo "Makefile CI_GATE_JOBS + CI_ONLY_GATE_JOBS: $$mine"; \
 		echo "a job in one and not the other is a green gate that CI rejects; reconcile both"; \
+		exit 1; \
+	fi
+	@# Branch protection requires gate alone. Without always(), a failed job
+	@# skips gate and GitHub counts the skip as a pass.
+	@if ! sed -n '/^  gate:/,$$p' .github/workflows/ci.yml | grep -q '^    if: always()$$'; then \
+		echo ".github/workflows/ci.yml: the gate job lacks 'if: always()'; a failed gate job would skip it, and branch protection accepts a skipped gate"; \
 		exit 1; \
 	fi
 	@# CI_GATE_JOBS names CI jobs, `check` runs make targets, and the two name

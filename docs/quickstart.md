@@ -21,13 +21,13 @@ export PATH=/usr/local/go126/bin:$PATH
 gmake build                   # builds to ./dist/bodega
 ```
 
-Cross-compile for Linux from macOS:
+Cross-compile for Linux and FreeBSD from macOS:
 
 ```bash
-make cross                    # builds ./dist/bodega-linux-amd64 and -linux-arm64
+make cross                    # builds ./dist/bodega-{linux,freebsd}-{amd64,arm64}
 ```
 
-FreeBSD has no release archive, `make cross` target, or rc.d script yet ([#48](https://github.com/ravinald/bodega/issues/48)); [Platforms](usage.md#platforms) lists what each platform gets today.
+[Platforms](usage.md#platforms) lists what each platform gets today.
 
 ## 2. Configure
 
@@ -293,7 +293,7 @@ What it does not cover:
 
 ## Next steps
 
-- Run `bodega serve` as a service: [bodega.service](bodega.service) on Linux; FreeBSD's rc.d script is pending ([#48](https://github.com/ravinald/bodega/issues/48))
+- Run `bodega serve` as a service: [bodega.service](bodega.service) under systemd on Linux, [bodega.rc](bodega.rc) under rc.d on FreeBSD
 - Put nginx in front for TLS termination and caching at scale
 - Use the REST API for CI/CD integration (`POST /api/v1/packages/{type}`)
 - Query the audit trail to track package usage (`bodega audit events --type fetch`)
