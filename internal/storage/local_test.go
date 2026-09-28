@@ -911,7 +911,7 @@ func TestLocalPublishKeepsWhoCanReadTheObject(t *testing.T) {
 func grantInheritedReader(t *testing.T, dir string) {
 	t.Helper()
 	if runtime.GOOS == "darwin" {
-		chmodACL(t, dir, "group:everyone allow read,file_inherit,directory_inherit")
+		chmodACL(t, dir, "group:everyone allow directory_inherit,file_inherit,read")
 		return
 	}
 	requirePOSIXACL(t, dir, defaultACL, posixACL(

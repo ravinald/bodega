@@ -153,7 +153,7 @@ A fresh object gets none of this, deliberately. It _is_ the staging file, so it 
 | git    | GitHub release tarball or bare clone      | .tar.gz or .bundle         | `curl https://bodega/git/<name>/<file>`               |
 | pypi   | Wheel build from requirements.txt         | .whl files                 | `pip install --index-url https://bodega/pypi/simple/` |
 | binary | Direct URL download                       | Original file              | `curl https://bodega/binaries/<name>/<ver>/<file>`    |
-| gomod  | GOPROXY upstream or local build           | .zip, .mod, .info          | `GOPROXY=https://bodega/go,direct go get <module>`    |
+| gomod  | GOPROXY upstream or local build           | .zip, .mod, .info          | `GOPROXY=https://bodega/go go get <module>`           |
 | helm   | Chart repo or direct URL                  | .tgz                       | `helm repo add bodega https://bodega/helm`            |
 | npm    | Registry upstream or local                | .tgz                       | `npm install --registry https://bodega/npm/`          |
 

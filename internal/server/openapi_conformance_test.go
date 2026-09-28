@@ -12,6 +12,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/clientconf"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/pins"
@@ -228,6 +229,7 @@ var schemaStructs = map[string]any{
 	"ImportResponse":     ImportResponse{},
 	"ImportResult":       ImportResult{},
 	"PackageManifest":    manifest.PackageManifest{},
+	"ClientConfigFile":   clientconf.File{},
 	"VersionEntry":       manifest.VersionEntry{},
 	"BuildEnv":           manifest.BuildEnv{},
 	"Dependency":         manifest.Dependency{},
