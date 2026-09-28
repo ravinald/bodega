@@ -16,6 +16,7 @@
 package pkgrepos
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -727,8 +728,8 @@ func Render(st State) (Repo, error) {
 	}
 
 	if st.Profile != "" && st.Fingerprint == "" {
-		return Repo{}, fmt.Errorf("freebsd %s@%s is served to this host filtered for profile %q, and a filtered catalog carries bodega's signature or none: FreeBSD's cannot survive the filter, and bodega does not serve a catalog it filtered unsigned. Run \"bodega freebsd key generate\" on the server and reload it",
-			st.Repo, st.ABI, st.Profile)
+		return Repo{}, fmt.Errorf("freebsd %s@%s is served to this host filtered for profile %q: %w",
+			st.Repo, st.ABI, st.Profile, ErrProfileUnsigned)
 	}
 
 	repoRelease := release
@@ -786,6 +787,11 @@ func Render(st State) (Repo, error) {
 	}
 	return finish(out), nil
 }
+
+// ErrProfileUnsigned is Render's refusal of a profile's view on a server with
+// no pkg key. It quotes no upstream URL, which is what lets the status API
+// hand it to the host it refuses rather than blanking it with the rest.
+var ErrProfileUnsigned = errors.New("a filtered catalog carries bodega's signature or none: FreeBSD's cannot survive the filter, and bodega does not serve a catalog it filtered unsigned. Run \"bodega freebsd key generate\" on the server and reload it")
 
 // ProfilePath is the route prefix a profile's filtered repositories are served
 // under: <ProfilePath>/<abi>/<repo>/ mirrors /freebsd/<abi>/<repo>/ path for

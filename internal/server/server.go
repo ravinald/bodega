@@ -1177,7 +1177,9 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 		// credentials. repo and abi stay public so a client can tell a
 		// refused repository from an absent one.
 		for i := range freebsd.Refused {
-			freebsd.Refused[i].Error = ""
+			if !freebsd.Refused[i].public {
+				freebsd.Refused[i].Error = ""
+			}
 		}
 	}
 	entryCount := make(map[string]int, len(manifest.AllTypes))

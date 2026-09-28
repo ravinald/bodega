@@ -177,14 +177,18 @@ check_matches FBSD-PROF-00 "the published catalogue names the third package's ob
 	"${fbsd_third:-none}" "internal/server/freebsd.go" "curl packagesite.pkg | tar -xOf - packagesite.yaml | grep nano"
 
 # bodega signs a filtered catalogue with its pkg key or refuses to serve one,
-# so the server needs a key. One an earlier run generated is kept.
+# so the server needs a key. One an earlier run generated is kept. It goes
+# under the storage root, which e2e_bodega hands to the service user: the
+# default path is /etc/bodega, where root would own a 0600 key the service
+# cannot read.
 E2E_HOST=server
-e2e_bodega server "freebsd key show >/dev/null 2>&1 || bodega freebsd key generate" || true
+e2e_bodega server "freebsd key show >/dev/null 2>&1 || sudo bodega freebsd key generate --path /var/lib/bodega/pkg-signing.key" || true
 e2e_reload server || true
 e2e_bodega server "freebsd key export --fingerprint" || true
 fbsd_fpr="$E2E_OUT"
-check_contains FBSD-PROF-01 "the server has a pkg signing key to re-sign a filtered catalogue with" \
-	"fingerprint" "$fbsd_fpr" "cmd/bodega/cmd_freebsd_key.go" "bodega freebsd key export --fingerprint" "$E2E_RC"
+e2e_on server "sleep 2; curl -s --max-time 10 '$E2E_BASE_URL/api/v1/status' | jq -r '.freebsd.signed'" || true
+check_eq FBSD-PROF-01 "the server loaded a pkg signing key to re-sign a filtered catalogue with" \
+	"true" "$E2E_OUT" "internal/server/freebsd_catalog.go" "bodega freebsd key generate; GET /api/v1/status | jq .freebsd.signed" "$E2E_RC"
 
 e2e_bodega server "profile create $FBSD_PROFILE --description 'e2e run'" >/dev/null 2>&1 || true
 e2e_bodega server "profile add $FBSD_PROFILE freebsd tree && sudo bodega profile add $FBSD_PROFILE freebsd pv && \

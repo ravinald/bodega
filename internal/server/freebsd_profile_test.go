@@ -303,3 +303,33 @@ func TestFreeBSDObjectIdentity(t *testing.T) {
 		}
 	}
 }
+
+// R4: with no pkg key, the bound host's stanza is refused, and the reason
+// reaches the host itself. It quotes no upstream URL, so the blanking the
+// other refusals get for a caller outside admin_permit_cidr would only take
+// away the one sentence that names the fix.
+func TestFreeBSDStatusTellsABoundHostWhyItHasNoStanza(t *testing.T) {
+	s := proxyingServer(t)
+	s.pkgSign.Store(nil)
+	addVersion(t, s, manifest.TypeFreeBSD, "latest", manifest.VersionEntry{
+		Version: freeBSDABI, URL: "https://audit-user:audit-secret@pkg.example.org/" + freeBSDABI + "/latest", Mode: manifest.ModeProxy,
+	})
+	f := webProfile(t, s)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	req.Header.Set("Authorization", "Bearer "+f.token)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if strings.Contains(rec.Body.String(), "audit-secret") {
+		t.Fatalf("status handed a non-admin caller the entry's credentials:\n%s", rec.Body.String())
+	}
+	var out struct {
+		FreeBSD freebsdStatus `json:"freebsd"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("parse status: %v", err)
+	}
+	if len(out.FreeBSD.Refused) != 1 || !strings.Contains(out.FreeBSD.Refused[0].Error, "freebsd key generate") {
+		t.Errorf("refused = %+v, want one row naming the key to generate", out.FreeBSD.Refused)
+	}
+}
