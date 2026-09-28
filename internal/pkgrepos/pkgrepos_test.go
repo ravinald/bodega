@@ -1218,3 +1218,36 @@ func TestABootstrapAnswerMissingFromTheWireHedges(t *testing.T) {
 		t.Errorf("the conf neither asserts nor hedges the bootstrap answer:\n%s", got.Conf)
 	}
 }
+
+// A host bound to a profile that scopes freebsd is pointed at the filtered
+// view and trusts bodega's key, whatever signed the repository it was filtered
+// from, pkgbase included; with no key loaded there is no stanza to render.
+func TestAProfileMovesTheURLAndTheTrustOntoBodega(t *testing.T) {
+	for _, upstream := range []string{
+		"https://pkg.freebsd.org/FreeBSD:15:amd64/latest",
+		"https://pkg.freebsd.org/FreeBSD:15:amd64/base_release_1",
+	} {
+		st := mirror()
+		st.ABI, st.Upstream, st.Profile, st.Fingerprint = "FreeBSD:15:amd64", upstream, "web", "abc123"
+		got := render(t, st)
+		if got.Profile != "web" || got.URL != "https://bodega.internal/freebsd-profile/web/${ABI}/latest" {
+			t.Errorf("%s: profile %q url %q, want the web view", upstream, got.Profile, got.URL)
+		}
+		if got.SignatureType != "fingerprints" || got.Fingerprints != pkgrepos.BodegaFingerprints || got.Pkgbase {
+			t.Errorf("%s: %s %q pkgbase=%v, want bodega's trust directory", upstream, got.SignatureType, got.Fingerprints, got.Pkgbase)
+		}
+		if prose := confProse(got.Conf); !strings.Contains(prose, "bound to profile web") || !strings.Contains(prose, "key export --fingerprint") {
+			t.Errorf("%s: the conf does not say why it trusts bodega:\n%s", upstream, got.Conf)
+		}
+		// WithRelease re-renders from the carried fields and must keep the view.
+		if again, err := got.WithRelease(14); err != nil || again.URL != got.URL || again.Fingerprints != got.Fingerprints {
+			t.Errorf("%s: WithRelease lost the profile view: %+v %v", upstream, again, err)
+		}
+	}
+
+	st := mirror()
+	st.Profile = "web"
+	if _, err := pkgrepos.Render(st); err == nil || !strings.Contains(err.Error(), "freebsd key generate") {
+		t.Errorf("a profile view with no key rendered, or its refusal names no repair: %v", err)
+	}
+}

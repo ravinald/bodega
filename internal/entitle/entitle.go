@@ -5,7 +5,10 @@
 package entitle
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"sort"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/builder"
@@ -164,6 +167,58 @@ func (p *Profile) AptScope() (base, refused string) {
 		return "", fmt.Sprintf("its apt expansion is %s, which permits a package the profile does not list, so the filtered index would carry every upstream paragraph", audit.ExpansionOrDefault(r.Expansion))
 	}
 	return r.AptBase, ""
+}
+
+// FreeBSDScope reports whether this profile's freebsd hosts read a catalog
+// filtered for it, and refused names the rule that disqualifies one when the
+// profile governs freebsd and gets none.
+//
+// It is AptScope's rule with no base to opt in by: pkg reads a catalog before
+// it fetches anything, so a filtered catalog is the only way a profile
+// subtracts anything a host is told exists, and every closed-and-block rule
+// gets one. Open membership and an expansion other than block are the two
+// roads to a filtered catalog that filters nothing by membership, served under
+// bodega's signature in place of FreeBSD's. checkProfileFreeBSDRule refuses
+// both at the write; a rule stored before that check existed still reaches
+// here and is reported rather than served.
+func (p *Profile) FreeBSDScope() (scoped bool, refused string) {
+	if p == nil {
+		return false, ""
+	}
+	r, ok := p.types[manifest.TypeFreeBSD]
+	if !ok {
+		return false, ""
+	}
+	switch {
+	case r.Membership != audit.MembershipClosed:
+		return false, fmt.Sprintf("its freebsd membership is %s, which admits every package the repository publishes", r.Membership)
+	case r.Expansion != audit.ExpansionBlock:
+		return false, fmt.Sprintf("its freebsd expansion is %s, which permits a package the profile does not list, so the filtered catalog would carry every upstream record", audit.ExpansionOrDefault(r.Expansion))
+	}
+	return true, ""
+}
+
+// Fingerprint identifies everything this profile says about typ: the marker
+// and every entry of that type. A catalog built for the profile is stale the
+// moment it changes, and a binding refresh builds a new Profile for an
+// unchanged one, so pointer identity would rebuild on every refresh.
+func (p *Profile) Fingerprint(typ string) string {
+	if p == nil {
+		return ""
+	}
+	h := sha256.New()
+	r := p.types[typ]
+	fmt.Fprintf(h, "%s\x00%s\x00%s\x00%s\x00%s\x00", p.name, r.Type, r.Membership, r.VersionDefault, r.Expansion)
+	keys := make([]string, 0, len(p.entries[typ]))
+	for k := range p.entries[typ] {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		e := p.entries[typ][k]
+		fmt.Fprintf(h, "%s\x00%s\x00%s\x00", k, e.Constraint, e.Version)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // Governs reports whether the profile states a rule for typ at all.

@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/ravinald/bodega/internal/entitle"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/storage"
 )
@@ -28,6 +29,13 @@ import (
 // re-tarring or negotiating a content encoding over these would break that
 // signature, and the client would report the failure against bytes bodega
 // changed on purpose — with nothing on this side calling it a bodega fault.
+//
+// A host bound to a profile that scopes freebsd is the exception, and it reads
+// a different URL: internal/server/freebsd_profile.go filters the catalogue
+// for that profile and re-signs it with bodega's key, because a filtered
+// catalogue cannot carry FreeBSD's signature. The published path refuses that
+// host its catalogue, and every host's package fetch is decided per package
+// by freeBSDObjectGate.
 //
 // This is the opposite of apt, where internal/server/apt.go generates and
 // re-signs Debian metadata because it must. Generating a pkg catalogue is a
@@ -63,6 +71,15 @@ func (s *Server) handleFreeBSD(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid freebsd repository path: expected /freebsd/<abi>/<repo>/<path>, for example /freebsd/FreeBSD:14:amd64/latest/meta.conf", http.StatusBadRequest)
 		return
 	}
+	s.serveFreeBSD(w, r, abi, repo, rest, nil)
+}
+
+// serveFreeBSD answers one repository path, for the repository as published
+// when view is nil and for one profile's filtered view of it otherwise. The
+// two share everything below the catalogue: a record's repopath is relative to
+// whichever root the client was pointed at, so the view serves the same
+// objects under the same keys, gated the same way.
+func (s *Server) serveFreeBSD(w http.ResponseWriter, r *http.Request, abi, repo, rest string, view *entitle.Profile) {
 	if slices.Contains(manifest.FreeBSDLegacyRootFiles, rest) {
 		// Named in the log because the answer is a fact about pkg rather than
 		// about this repository: a client asking for one of these is old
@@ -89,13 +106,19 @@ func (s *Server) handleFreeBSD(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if !s.entitleGate(w, r, manifest.TypeFreeBSD, repo, abi) {
-		return
-	}
 
 	key := manifest.FreeBSDKey(abi, repo, rest)
 	catalog := slices.Contains(manifest.FreeBSDCatalogFiles, rest)
+	fallback := slices.Contains(manifest.FreeBSDFallbackRootFiles, rest)
 	proxied := !configured || ve.EffectiveMode() == manifest.ModeProxy
+
+	if catalog || fallback {
+		if !s.freeBSDCatalogGate(w, r, abi, repo, rest, view) {
+			return
+		}
+	} else if !s.freeBSDObjectGate(w, r, rest) {
+		return
+	}
 
 	// Which of the two products this repository is, decided per request off
 	// the entry the ABI names. An operator runs both, and the two are
@@ -112,7 +135,7 @@ func (s *Server) handleFreeBSD(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !proxied && slices.Contains(manifest.FreeBSDFallbackRootFiles, rest) {
+	if !proxied && fallback {
 		// pkg asks for these only after the served name 404'd, so on a
 		// mirrored or generated repository they mean the catalogue is not
 		// there yet. Fetching one would serve upstream's catalogue over this
@@ -128,6 +151,11 @@ func (s *Server) handleFreeBSD(w http.ResponseWriter, r *http.Request) {
 		s.logger.Error("storage backend recorded for artifact is not configured",
 			"type", manifest.TypeFreeBSD, "package", repo, "version", abi, "error", err)
 		http.Error(w, "storage backend error", http.StatusBadGateway)
+		return
+	}
+
+	if view != nil && catalog {
+		s.serveFreeBSDProfileCatalog(w, r, store, view, abi, repo, rest, key, generated, ve, configured, proxied)
 		return
 	}
 

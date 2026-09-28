@@ -1456,7 +1456,7 @@ Two enforcement points, and the order matters.
 
 **The index filter is what makes the refusal legible.** A resolver told "no such version" picks another one; a resolver handed an opaque 403 halfway through an install stops with a stack trace and leaves the environment half-built. Six documents are filtered: the pypi simple root and its per-distribution pages, the npm packument's `versions` map (with the `time` entries and `dist-tags` that point at dropped versions), the gomod `@v/list`, the cargo sparse index, and the helm `index.yaml` (which answers 200 with the refused charts absent rather than 403, because a refused index fails `helm repo add` itself). git and binary publish no index, so the predicate is the whole story there.
 
-**apt inverts the two.** For apt the filtered index is the control and the request predicate is the backstop, because refusing an apt fetch at the pool is worse than having no control at all: apt has already resolved the transaction by then, takes the 403 mid-run and aborts everything, including the security updates in the same invocation. Filtered out of the index instead, apt reports the package kept back and upgrades the rest. See [apt under a profile](#apt-under-a-profile).
+**apt inverts the two.** For apt the filtered index is the control and the request predicate is the backstop, because refusing an apt fetch at the pool is worse than having no control at all: apt has already resolved the transaction by then, takes the 403 mid-run and aborts everything, including the security updates in the same invocation. Filtered out of the index instead, apt reports the package kept back and upgrades the rest. See [apt under a profile](#apt-under-a-profile). pkg reads a catalogue the same way and gets the same arrangement: see [pkg under a profile](#pkg-under-a-profile).
 
 No filtered index is stored. Each one is produced by running the profile's filter over the response on the way out, so what sits in the cache is the document the upstream served and one cached object answers every host class correctly. An install with no profiles pays nothing, and a fleet with twenty profiles pays one copy and one upstream fetch per index rather than twenty. A cache hit filters identically to a miss, so a `bodega profile` edit lands within the binding cache TTL rather than at the next upstream refresh. The helm `index.yaml` is generated into storage by `bodega build` rather than cached, and is filtered the same way on the way out.
 
@@ -1677,6 +1677,67 @@ Three limits, stated rather than left to be found:
 - **One component, `main`**, matching every other generated suite. A base publishing more is named in the server log, and packages outside `main` are not served under the profile.
 
 Filtered codenames appear in the startup banner and in `GET /api/v1/status` under `apt.filtered`, with a rendered stanza each in `apt.sources`. Nothing in the config file names them, so those are the two places to read them off. They are regenerated on the hourly index rebuild and on every `bodega profile` write, and the upstream indexes they are built from are cached behind `metadata_ttl`. A rebuild that cannot read or parse the upstream `Packages` withdraws the codename rather than serving the part of it that arrived, so `apt update` fails on a source line naming the instance; a truncated index would instead report every package past the break as kept back. An architecture the base's `Release` names and the archive answers 404 for is the exception: it is dropped from the filtered `Release` and the rest is served, because `archive.ubuntu.com` declares all seven and carries two, and the codename is withdrawn only when none survives.
+
+#### pkg under a profile
+
+A freebsd rule names packages inside a pkg repository, with the vocabulary every other type uses: closed or open membership, the three expansion actions, and a constraint per entry. A profile that states one is served its own catalogue for every repository and ABI bodega serves, filtered for that profile:
+
+```bash
+bodega profile add web freebsd tree
+bodega profile add web freebsd pv
+bodega profile set web freebsd --membership closed --expansion block
+```
+
+```text
+web freebsd: membership=closed version_default=floating expansion=block
+  filtered catalogue: /freebsd-profile/web/<abi>/<repo>/, signed with bodega's pkg key; install it on a bound host with bodega doctor --write-pkg-repo
+```
+
+`set` refuses two shapes, and each refusal says why. An open membership, or a closed one whose expansion is `warn` or `ignore`, keeps every record in the repository, so the host would be served FreeBSD's whole catalogue re-signed by bodega instead of by FreeBSD: a trust downgrade with nothing filtered in return. The same rule `--base` enforces for apt, reached without a base to opt in by. `compatible` and `patch` are refused on an entry, because a pkg version carries a port revision and an epoch (`1.26.2_1,3`) and neither can compare one; `exact` and `any` both work, and `bodega profile pin web freebsd nginx 1.26.2_1,3 --reason ...` holds one. `bodega profile check` reports freebsd entries as unchecked rather than failing on them, since the manifest store holds the repository and not the packages inside it.
+
+**How the catalogue is built.** bodega reads the repository's published `packagesite.pkg` the way the route would serve it (from the store for a hosted mirror, through the cache for a proxied one, from the build for a generated one), keeps the `packagesite.yaml` records the profile permits as upstream's own bytes, and writes `data.pkg` from the same kept records so the two documents cannot disagree. `meta.conf` is bodega's own and names the two archives it builds. The result is cached per profile, repository and ABI, and rebuilt when the published catalogue, the profile's freebsd rules or the signing key moves. Nothing is stored. A profile that lists nothing a repository publishes gets an empty catalogue for it, which is correct for a profile scoped to `latest/` reading `kmods/`.
+
+**How it is signed.** A filtered catalogue cannot carry FreeBSD's signature, so bodega signs it with its own pkg key, proxied and mirrored upstreams alike, and the stanza a bound host installs names `/usr/local/etc/pkg/fingerprints/bodega` rather than `/usr/share/keys/pkg`. That changes what the host trusts: bodega reads the upstream catalogue over TLS and does not verify FreeBSD's signature on it before re-signing, so the chain of trust ends at the upstream's certificate, as it does for apt's filtered codenames (see [Threat model](threat-model.md)). With no pkg key loaded the view answers 500 and `/api/v1/status` refuses the stanza rather than serving an unsigned catalogue: `bodega freebsd key generate`, then reload.
+
+**What a refused package looks like to pkg.** It is not in the catalogue, so `pkg search` does not find it and `pkg install` stops before fetching anything:
+
+```text
+$ pkg search -r bodega-latest -q -x '.*'
+pv-1.9.31
+tree-2.2.1
+$ sudo pkg install -y -r bodega-latest nano
+pkg: No packages available to install matching 'nano' have been found in the repositories
+```
+
+A `.pkg` fetched by hand is refused by name and version, read off its filename, with the same text every other type returns:
+
+```text
+$ curl http://bodega.internal/freebsd/FreeBSD:15:aarch64/latest/All/Hashed/nano-8.4~a1b2c3.pkg
+membership: profile "web" does not list freebsd/nano at 8.4.
+  Add it:      bodega profile add web freebsd nano
+  Or open it:  bodega profile set web freebsd --membership open
+```
+
+The bound host is also refused the published catalogue at `/freebsd/<abi>/<repo>/`, with a 403 naming its view. A host whose stanza predates its binding fails `pkg update` there rather than reading every record its profile refuses. The limit is apt's: a dependency the profile does not list is filtered out with the rest, so `pkg install` of a listed package whose dependency is refused fails on the missing dependency. List the closure.
+
+**How the host is pointed at it.** Install bodega's fingerprint out of band, then let the server compose the stanza:
+
+```bash
+bodega freebsd key export --fingerprint > /usr/local/etc/pkg/fingerprints/bodega/trusted/bodega
+bodega doctor --write-pkg-repo --url https://bodega.internal
+```
+
+```text
+bodega-latest: {
+  url: "https://bodega.internal/freebsd-profile/web/${ABI}/latest",
+  mirror_type: "none",
+  signature_type: "fingerprints",
+  fingerprints: "/usr/local/etc/pkg/fingerprints/bodega",
+  enabled: yes
+}
+```
+
+`GET /api/v1/status` answers per host: its `freebsd.repos` carry `profile` and the view's URL for a host bound to a profile that scopes freebsd, and the published repository for any other. A host bound by `bodega identity bind cidr` needs no token, which is the ordinary case, since pkg sends no bodega credential.
 
 ### `bodega doctor [--write-credentials --token TOKEN [--url URL]] [--write-apt-sources [--suite CODENAME]] [--write-pkg-repo [--abi ABI] [--release N]]`
 
@@ -2907,7 +2968,7 @@ bodega treats Linux and FreeBSD as peers. Both run the server, both are clients 
 | Client of the server                            | apt, and every language client                       | `pkg`, ports distfiles (`make fetch`), and every language client                                                                |
 | Client configuration written by `bodega doctor` | apt sources and keyring, credentials                 | `pkg` repository configuration, credentials                                                                                     |
 | Host checks in `bodega doctor`                  | apt sources, snap, flatpak, pip, npm, cargo, GOPROXY | pip, npm, cargo, GOPROXY; the pip and npm checks read Linux paths only                                                          |
-| Profile rules                                   | per package; apt hosts read a filtered codename      | per repository and ABI; the catalog is not filtered per package ([#54](https://github.com/ravinald/bodega/issues/54))           |
+| Profile rules                                   | per package; apt hosts read a filtered codename      | per package; pkg hosts read a filtered catalogue signed by bodega ([#54](https://github.com/ravinald/bodega/issues/54))         |
 | Release archive                                 | amd64, arm64                                         | not yet                                                                                                                         |
 | Distribution package                            | `.deb` and `.rpm`, with the systemd unit             | not yet                                                                                                                         |
 | Service definition                              | [bodega.service](bodega.service) (systemd)           | not yet: no rc.d script                                                                                                         |
@@ -2923,7 +2984,7 @@ The FreeBSD gaps, stated so none of them is discovered by surprise:
 - **No unit tests run on FreeBSD in CI** ([#48](https://github.com/ravinald/bodega/issues/48)). The FreeBSD storage code is exercised by the end-to-end suite, which runs by hand.
 - **`bodega doctor` has no FreeBSD host checks** ([#49](https://github.com/ravinald/bodega/issues/49)). It writes the `pkg` repository configuration but does not read `/etc/pkg/FreeBSD.conf`, `/usr/local/etc/pkg/repos/` or `/etc/make.conf` to report a host that still reaches upstream, and its pip and npm checks do not read `/usr/local/etc/pip.conf` or `/usr/local/etc/npmrc`.
 - **`bodega pkg convert` has no FreeBSD importer** ([#53](https://github.com/ravinald/bodega/issues/53)), so a FreeBSD host is cataloged with `bodega pkg create` or by running the server with `discover_mode` set to `"observe"`.
-- **Profile rules stop at the pkg repository** ([#54](https://github.com/ravinald/bodega/issues/54)). A profile admits or refuses a whole repository for an ABI; the catalog a host reads is not filtered per package the way apt's filtered codenames are.
+- **Profile rules are per package, and cost FreeBSD's signature** ([#54](https://github.com/ravinald/bodega/issues/54)). A bound host reads a catalogue filtered for its profile, the way apt hosts read a filtered codename, and it is signed by bodega's pkg key rather than FreeBSD's, so the host trusts bodega's fingerprint for it. `bodega profile check` does not resolve freebsd entries against a repository's catalogue. See [pkg under a profile](#pkg-under-a-profile).
 
 The build requires the Go version `go.mod` names on either system.
 

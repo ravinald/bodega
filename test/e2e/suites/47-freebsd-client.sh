@@ -13,8 +13,9 @@
 # client request reaches.
 #
 # This suite mutates the freebsd guest: it installs a bodega binary, appends to
-# /etc/hosts, and installs and removes one package. It restores the pkg
-# repository configuration it wrote and checks the restore.
+# /etc/hosts, installs and removes one package twice, and trusts bodega's pkg
+# fingerprint while a profile binds it. It restores the pkg repository
+# configuration and the fingerprint it wrote and checks the restore.
 
 # shellcheck source=../lib/assert.sh
 . "${E2E_DIR:?run.sh sets E2E_DIR}/lib/assert.sh"
@@ -150,10 +151,120 @@ e2e_on freebsd "sudo pkg delete -y tree >/dev/null && sudo rm -f /usr/local/etc/
 check_eq FBSD-PKG-07 "removing the stanza gives the host its upstream repository back" "yes" "$E2E_OUT" \
 	"test/e2e/suites/47-freebsd-client.sh" "rm bodega.conf; pkg -vv" "$E2E_RC"
 
+# ---- pkg under a profile ---------------------------------------------------
+#
+# The same proxied repository, read by a host bound to a profile that lists two
+# packages. The catalogue the host reads is filtered for that profile and
+# re-signed with bodega's pkg key, so the guest trusts bodega's fingerprint for
+# this stanza and not /usr/share/keys/pkg. tree and pv are listed; nano is the
+# third, present upstream and refused here.
+#
+# The guest is bound by its address, which is the binding a pkg host carries:
+# pkg sends no bodega credential.
+
+FBSD_PROFILE=e2e-fbsd
+FBSD_CIDR="${E2E_FREEBSD_ADDR:-127.0.0.1}/32"
+fbsd_repo_url="$E2E_BASE_URL/freebsd/$fbsd_abi/e2e-latest"
+
+# The third package's repopath, read off the published catalogue while the
+# guest is still unbound and may read it: the hand-composed fetch below is of a
+# real object, not a path the gate would refuse for being malformed.
+E2E_HOST=freebsd
+e2e_on freebsd "curl -sS --max-time 120 '$fbsd_repo_url/packagesite.pkg' | tar -xOf - packagesite.yaml | \
+	grep '\"name\":\"nano\"' | head -1 | sed -E 's/.*\"repopath\":\"([^\"]*)\".*/\1/'" || true
+fbsd_third="$E2E_OUT"
+check_matches FBSD-PROF-00 "the published catalogue names the third package's object" '^All/.*nano-.*\.pkg$' \
+	"${fbsd_third:-none}" "internal/server/freebsd.go" "curl packagesite.pkg | tar -xOf - packagesite.yaml | grep nano"
+
+# bodega signs a filtered catalogue with its pkg key or refuses to serve one,
+# so the server needs a key. One an earlier run generated is kept.
 E2E_HOST=server
+e2e_bodega server "freebsd key show >/dev/null 2>&1 || bodega freebsd key generate" || true
+e2e_reload server || true
+e2e_bodega server "freebsd key export --fingerprint" || true
+fbsd_fpr="$E2E_OUT"
+check_contains FBSD-PROF-01 "the server has a pkg signing key to re-sign a filtered catalogue with" \
+	"fingerprint" "$fbsd_fpr" "cmd/bodega/cmd_freebsd_key.go" "bodega freebsd key export --fingerprint" "$E2E_RC"
+
+e2e_bodega server "profile create $FBSD_PROFILE --description 'e2e run'" >/dev/null 2>&1 || true
+e2e_bodega server "profile add $FBSD_PROFILE freebsd tree && sudo bodega profile add $FBSD_PROFILE freebsd pv && \
+	sudo bodega profile set $FBSD_PROFILE freebsd --membership closed --expansion block" || true
+check_eq FBSD-PROF-02 "a profile takes freebsd rules keyed by package name" 0 "$E2E_RC" \
+	"cmd/bodega/cmd_profile.go" "bodega profile add $FBSD_PROFILE freebsd tree; ... set --membership closed --expansion block" "$E2E_RC"
+
+e2e_bodega server "profile set $FBSD_PROFILE freebsd --membership closed --expansion warn" || true
+check_contains FBSD-PROF-03 "a freebsd rule that would filter nothing is refused, naming why" \
+	"re-signed by bodega" "$E2E_OUT$E2E_ERR" "cmd/bodega/cmd_profile.go" \
+	"bodega profile set $FBSD_PROFILE freebsd --expansion warn"
+
+e2e_bodega server "profile unbind e2e-fbsd-host" >/dev/null 2>&1 || true
+e2e_bodega server "identity unbind cidr $FBSD_CIDR" >/dev/null 2>&1 || true
+e2e_bodega server "identity bind cidr $FBSD_CIDR e2e-fbsd-host --comment 'e2e run' && \
+	sudo bodega profile bind $FBSD_PROFILE e2e-fbsd-host --force" || true
+check_eq FBSD-PROF-04 "the freebsd guest's address binds to the profile" 0 "$E2E_RC" \
+	"cmd/bodega/cmd_profile.go" "bodega identity bind cidr $FBSD_CIDR; bodega profile bind $FBSD_PROFILE" "$E2E_RC"
+e2e_reload server || true
+sleep 3
+
+E2E_HOST=freebsd
+e2e_on freebsd "sudo mkdir -p /usr/local/etc/pkg/fingerprints/bodega/trusted /usr/local/etc/pkg/fingerprints/bodega/revoked && \
+	printf '%s\n' '$fbsd_fpr' | sudo tee /usr/local/etc/pkg/fingerprints/bodega/trusted/bodega >/dev/null && \
+	sudo bodega doctor --write-pkg-repo --url '$E2E_BASE_URL' --allow-plaintext >/dev/null && \
+	grep -E '^  (url|fingerprints):' /usr/local/etc/pkg/repos/bodega.conf" || true
+check_contains FBSD-PROF-05 "doctor --write-pkg-repo points a bound host at its profile's catalogue" \
+	"/freebsd-profile/$FBSD_PROFILE/\${ABI}/e2e-latest" "$E2E_OUT" \
+	"internal/server/freebsd_status.go" "bodega doctor --write-pkg-repo; grep url bodega.conf"
+check_contains FBSD-PROF-06 "the stanza trusts bodega's key rather than FreeBSD's" \
+	"/usr/local/etc/pkg/fingerprints/bodega" "$E2E_OUT" \
+	"internal/pkgrepos" "grep fingerprints bodega.conf"
+
+e2e_on freebsd "sudo pkg update -f 2>&1 | tail -3" || true
+check_contains FBSD-PROF-07 "pkg update verifies the filtered catalogue against bodega's key" \
+	"bodega-e2e-latest repository update completed" "$E2E_OUT" \
+	"internal/server/freebsd_profile.go" "pkg update -f"
+
+e2e_on freebsd "pkg search -r bodega-e2e-latest -q -x '.*' | sed -E 's/-[^-]+\$//' | sort | tr '\n' ' '" || true
+check_eq FBSD-PROF-08 "pkg search finds the two listed packages and nothing else" "pv tree " "$E2E_OUT" \
+	"internal/server/freebsd_profile.go" "pkg search -r bodega-e2e-latest -x '.*'"
+
+e2e_on freebsd "sudo pkg install -y -r bodega-e2e-latest tree 2>&1 | tail -2 && pkg query '%n %R' tree" || true
+check_contains FBSD-PROF-09 "a listed package installs through the filtered catalogue" \
+	"tree bodega-e2e-latest" "$E2E_OUT" "internal/server/freebsd_profile.go" "pkg install -r bodega-e2e-latest tree"
+
+e2e_on freebsd "sudo pkg install -y -r bodega-e2e-latest nano 2>&1 | tail -2" || true
+fbsd_install_rc="$E2E_RC"
+check_contains FBSD-PROF-10 "pkg install of an unlisted package fails at the catalogue" \
+	"No packages available to install matching 'nano'" "$E2E_OUT" \
+	"internal/server/freebsd_profile.go" "pkg install -r bodega-e2e-latest nano" "$fbsd_install_rc"
+check_ne FBSD-PROF-11 "the failed install exits non-zero" 0 "$fbsd_install_rc" \
+	"internal/server/freebsd_profile.go" "pkg install -r bodega-e2e-latest nano" "$fbsd_install_rc"
+
+e2e_on freebsd "curl -sS --max-time 60 -w '\n%{http_code}' '$fbsd_repo_url/$fbsd_third'" || true
+check_contains FBSD-PROF-12 "a hand-composed fetch of the unlisted package is refused in the profile's vocabulary" \
+	"membership: profile \"$FBSD_PROFILE\" does not list freebsd/nano" "$E2E_OUT" \
+	"internal/server/freebsd_profile.go" "curl $fbsd_repo_url/$fbsd_third" "$E2E_RC"
+check_matches FBSD-PROF-13 "the refusal is a 403" '403$' "$E2E_OUT" \
+	"internal/server/freebsd_profile.go" "curl -w %{http_code} $fbsd_repo_url/$fbsd_third" "$E2E_RC"
+
+e2e_on freebsd "curl -sS --max-time 60 -o /dev/null -w '%{http_code}' '$fbsd_repo_url/packagesite.pkg'" || true
+check_eq FBSD-PROF-14 "the bound host is refused the unfiltered catalogue" "403" "$E2E_OUT" \
+	"internal/server/freebsd_profile.go" "curl $fbsd_repo_url/packagesite.pkg" "$E2E_RC"
+
+# Restore: the package, the stanza and bodega's fingerprint off the guest, then
+# the binding off the server. The profile stays, as 55-profile's does, because
+# there is no profile delete.
+e2e_on freebsd "sudo pkg delete -y tree >/dev/null 2>&1; sudo rm -f /usr/local/etc/pkg/repos/bodega.conf && \
+	sudo rm -rf /usr/local/etc/pkg/fingerprints/bodega && \
+	pkg -vv | awk '/^  FreeBSD-ports:/{r=1} r && /enabled/{v=\$NF; gsub(/[^a-z]/, \"\", v); print v; exit}'" || true
+check_eq FBSD-PROF-15 "the guest's pkg configuration is restored" "yes" "$E2E_OUT" \
+	"test/e2e/suites/47-freebsd-client.sh" "rm bodega.conf fingerprints/bodega; pkg -vv" "$E2E_RC"
+
+E2E_HOST=server
+e2e_bodega server "profile unbind e2e-fbsd-host" || true
+e2e_bodega server "identity unbind cidr $FBSD_CIDR" || true
 e2e_bodega server "pkg delete freebsd e2e-latest" || true
 e2e_reload server || true
-unset fbsd_abi
+unset fbsd_abi FBSD_PROFILE FBSD_CIDR fbsd_repo_url fbsd_third fbsd_fpr fbsd_install_rc
 
 # ---- ports -----------------------------------------------------------------
 #
