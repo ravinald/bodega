@@ -79,6 +79,10 @@ type Index struct {
 	entries map[string]*Entry
 	refused map[string]string // name -> why ErrUnusable
 	unowned []string
+	// roots is every path the tree root resolved to while a port was read.
+	// A port's messages name its files under that path, and a symlink
+	// retargeted during the read gives different ports different ones.
+	roots map[string]bool
 }
 
 // Unowned lists the restricted ports whose distinfo the reader could not
@@ -559,6 +563,7 @@ func portText(tree, dir string, own []string, env *Environment, fw frameworkMode
 		pinned:        map[string][]string{},
 		settled:       map[string]bool{},
 	}
+	p.tree = tree
 	// A declared variable may be set by make.conf, the environment or the
 	// command line, or by none of them until the framework sets it: base make
 	// on a stock client holds LOCALBASE undefined above bsd.port.pre.mk. So it
@@ -628,6 +633,7 @@ type portRead struct {
 	owners       []string
 	files        []string // distinfo files Load indexes under no owner, by their real path
 	ownerUnknown string
+	tree         string // the root with its symlinks resolved, as this read named its files
 }
 
 // maxIncludeReads bounds how many files one port's includes may read, counting
@@ -2398,7 +2404,7 @@ func LoadIn(portsTree string, env *Environment) (*Index, error) {
 		return nil, err
 	}
 	fw := frameworkModel{defaults: loadFrameworkDefaults(portsTree), includeTails: frameworkIncludeTails(portsTree)}
-	ix := &Index{entries: map[string]*Entry{}, refused: map[string]string{}}
+	ix := &Index{entries: map[string]*Entry{}, refused: map[string]string{}, roots: map[string]bool{}}
 	byPort := map[string][]string{}   // origin -> names its distinfo pins
 	restricted := map[string]string{} // origin -> reason
 	byFile := map[string]string{}     // distinfo indexed under no owner -> reason
@@ -2436,6 +2442,7 @@ func LoadIn(portsTree string, env *Environment) (*Index, error) {
 				}
 			}
 			pr := portText(portsTree, dir, own, env, fw)
+			ix.roots[pr.tree] = true
 			why := restriction(origin, pr.text, db)
 			if why == "" && pr.unresolved != "" {
 				why = fmt.Sprintf("%s: %s, so its redistribution terms cannot be established", origin, pr.unresolved)
@@ -2621,9 +2628,9 @@ type Tree struct {
 	loadErr error
 	loaded  time.Time
 	loading bool
-	// resolved is every path root resolved to around a read, so a caller can
-	// recognize the root in a message from an index read before the symlink
-	// it runs through was retargeted.
+	// resolved is every path a read has resolved root to, so a caller can
+	// recognize the root in a message from any index this tree has served,
+	// including one read while the symlink it runs through was retargeted.
 	resolved map[string]bool
 
 	ready     chan struct{} // closed when the first read finishes, either way
@@ -2652,10 +2659,8 @@ func NewTreeIn(root string, env EnvironmentSpec, ttl time.Duration, logf func(fo
 func (t *Tree) Root() string { return t.root }
 
 // RootSpellings is every absolute spelling of the root a path in this tree's
-// errors may start with: as configured, cleaned, and each path it resolved to
-// at the start or end of any read so far. The walk resolves the root once per
-// port, so a symlink retargeted more than once inside a single read can leave
-// a port holding a spelling this does not list.
+// errors may start with: as configured, cleaned, and each path any port's read
+// resolved it to, recorded where the reader resolves it.
 func (t *Tree) RootSpellings() []string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -2699,17 +2704,10 @@ func (t *Tree) startLoadLocked() {
 			t.logf("distinfo: refusing every distfile: %v", err)
 			return
 		}
-		before, _ := filepath.EvalSymlinks(t.root)
 		ix, err := LoadIn(t.root, env)
-		after, _ := filepath.EvalSymlinks(t.root)
 		t.mu.Lock()
 		defer t.mu.Unlock()
 		defer t.readyOnce.Do(func() { close(t.ready) })
-		for _, p := range []string{before, after} {
-			if p != "" {
-				t.resolved[p] = true
-			}
-		}
 		t.loading = false
 		t.loaded = time.Now()
 		if err != nil {
@@ -2717,6 +2715,7 @@ func (t *Tree) startLoadLocked() {
 			t.logf("distinfo: reading %s failed after %s, keeping the previous index: %v", t.root, time.Since(start).Round(time.Millisecond), err)
 			return
 		}
+		maps.Copy(t.resolved, ix.roots)
 		t.ix, t.loadErr = ix, nil
 		t.logf("distinfo: indexed %d distfiles from %s against environment %s in %s", ix.Len(), t.root, env.Digest(), time.Since(start).Round(time.Millisecond))
 		if u := ix.Unowned(); len(u) > 0 {

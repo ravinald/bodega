@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -666,6 +667,15 @@ func TestDistfilesRefusalsNameNoServerPath(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	failRewind := func(t *testing.T) {
+		saved := rewindSpool
+		rewindSpool = func(*os.File) error { return errors.New("seek " + marker + ": injected") }
+		t.Cleanup(func() { rewindSpool = saved })
+	}
+	// moving is the three trees a symlink points at in turn while one read
+	// runs: sysutils/pcpustat is read while it names the second, so only the
+	// reader saw that one.
+	var moving []string
 	const pcpustat = "/distfiles/pcpustat/1.6.tar.bz2"
 	for _, tc := range []struct {
 		name     string
@@ -730,6 +740,53 @@ func TestDistfilesRefusalsNameNoServerPath(t *testing.T) {
 					t.Fatal(err)
 				}
 			}},
+		{name: "restriction read while the root moved twice", path: pcpustat, code: http.StatusUnavailableForLegalReasons, logsRoot: true,
+			root: func(t *testing.T) string {
+				moving = nil
+				for _, n := range []string{"-a", "-b", "-c"} {
+					root := tree(t, marker+n)
+					includeUnresolved(t, root)
+					for _, cat := range []string{"aaa", "zzz"} {
+						fifo := filepath.Join(root, cat, "hold", "distinfo")
+						if err := os.MkdirAll(filepath.Dir(fifo), 0o755); err != nil {
+							t.Fatal(err)
+						}
+						if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+							t.Fatal(err)
+						}
+					}
+					moving = append(moving, root)
+				}
+				return alias(t, moving[0])
+			},
+			// Opening each FIFO's writer waits for the loader to open it, so
+			// the retargets land before and after sysutils/ is read. The
+			// request runs once the read has finished.
+			setup: func(t *testing.T, f *fixture) {
+				retarget := func(target string) {
+					t.Helper()
+					next := f.root + ".next"
+					if err := os.Symlink(target, next); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Rename(next, f.root); err != nil {
+						t.Fatal(err)
+					}
+				}
+				for i, fifo := range []string{filepath.Join(moving[0], "aaa", "hold", "distinfo"), filepath.Join(moving[1], "zzz", "hold", "distinfo")} {
+					w, err := os.OpenFile(fifo, os.O_WRONLY, 0)
+					if err != nil {
+						t.Fatal(err)
+					}
+					retarget(moving[i+1])
+					if err := w.Close(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := f.s.distinfo.Wait(); err != nil {
+					t.Fatal(err)
+				}
+			}},
 		{name: "environment mismatch", path: "/distfiles/@" + distinfo.ClientUnsupported + "/pcpustat/1.6.tar.bz2", code: http.StatusUnavailableForLegalReasons, raw: true},
 		{name: "environment another digest", path: "/distfiles/@0000/pcpustat/1.6.tar.bz2", code: http.StatusUnavailableForLegalReasons, raw: true},
 		{name: "environment not measured", path: pcpustat, code: http.StatusUnavailableForLegalReasons, raw: true},
@@ -780,6 +837,13 @@ func TestDistfilesRefusalsNameNoServerPath(t *testing.T) {
 			upstream: func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Length", fmt.Sprint(len(distfileBody)))
 				_, _ = io.WriteString(w, distfileBody[:5])
+			}},
+		{name: "upstream spool rewind fails", path: pcpustat, code: http.StatusBadGateway,
+			setup: func(t *testing.T, _ *fixture) { failRewind(t) }},
+		{name: "cached object spool rewind fails", path: pcpustat, code: http.StatusBadGateway,
+			setup: func(t *testing.T, f *fixture) {
+				f.mem.Seed(manifest.DistfilesKey("pcpustat/1.6.tar.bz2"), distfileBody)
+				failRewind(t)
 			}},
 		{name: "upstream over the spool ceiling", path: pcpustat, code: http.StatusServiceUnavailable,
 			setup: func(t *testing.T, f *fixture) { f.s.spool = newSpoolLimiter(t.TempDir(), 4, 0) }},

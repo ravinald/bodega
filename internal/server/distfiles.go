@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -48,6 +49,14 @@ var distfilesGuard = func(rawURL string) error {
 		return fmt.Errorf("distfiles upstream URL must use http or https, got %q", u.Scheme)
 	}
 	return checkUpstreamHost(u.Hostname())
+}
+
+// rewindSpool returns a spooled distfile to its start before it is served. A
+// variable so a test can make it fail: no real file on a working disk refuses
+// a seek to 0.
+var rewindSpool = func(f *os.File) error {
+	_, err := f.Seek(0, io.SeekStart)
+	return err
 }
 
 // distfilesUpstreamClient is upstreamClient with distfilesGuard on every
@@ -259,7 +268,7 @@ func (s *Server) handleDistfiles(w http.ResponseWriter, r *http.Request) {
 	s.fillCache(ctx, store, key, spool.path(), up.url, spool.sha256, spool.size)
 	s.recordCacheEvent(r, audit.CacheMiss, manifest.TypeDistfiles, up.url, name, name, key)
 
-	if _, err := spool.file.Seek(0, io.SeekStart); err != nil {
+	if err := rewindSpool(spool.file); err != nil {
 		s.logger.Error("distfiles: could not rewind the spooled distfile", "name", name, "error", err)
 		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
 		return
@@ -357,7 +366,7 @@ func (s *Server) serveVerifiedDistfile(w http.ResponseWriter, r *http.Request, s
 		s.recordDistfileMismatch(r, name, key, entry, spool.sha256, spool.size, store.Label()+":"+key)
 		return false
 	}
-	if _, err := spool.file.Seek(0, io.SeekStart); err != nil {
+	if err := rewindSpool(spool.file); err != nil {
 		s.logger.Error("distfiles: could not rewind the spooled distfile", "name", name, "error", err)
 		http.Error(w, "storage read failed", http.StatusBadGateway)
 		return true
