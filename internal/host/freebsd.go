@@ -1082,12 +1082,17 @@ func checkMakeConfEnviron(root, goos string, lookup func(string) (string, bool),
 	}
 	f.Remediation = "end " + shown + " with the FreeBSD ports lines under Client configuration in docs/usage.md: " +
 		strings.Join(names, " and ") + " set to <bodega>" + route + ", then .include of " + clientconf.DistfilesCheckPath
-	posix, hook := makeSysSkipsConfWhy(lookup, flags), makeSysHookWhy(root)
+	posix, hook, mode := makeSysSkipsConfWhy(lookup, flags), makeSysHookWhy(root), makeSysModeWhy(lookup, flags)
 	switch sys := makeSysPathWhy(root, lookup, flags); {
 	case sys != "":
 		f.Status = StatusWarn
 		f.Detail = sys + ", and a sys.mk other than /usr/share/mk/sys.mk can select a different make.conf and change the fetch sites before or after it, so doctor cannot establish what ports fetch from"
 		f.Remediation = "unset MAKESYSPATH, remove it from MAKEFLAGS and move any share/mk out of the ports tree; then run doctor again"
+		return f
+	case mode != "":
+		f.Status = StatusWarn
+		f.Detail = mode + ", so doctor cannot establish which make.conf make reads, whether it reads one, or what ports fetch from"
+		f.Remediation = "unset the DIRDEPS_BUILD, META_MODE and AUTO_OBJ controls (MK_, WITH_ and WITHOUT_ forms) and bsd.mkopt.mk's option lists in the environment and MAKEFLAGS; then run doctor again"
 		return f
 	case posix != "":
 		f.Status = StatusWarn
@@ -1980,6 +1985,97 @@ func makeSysSkipsConfWhy(lookup func(string) (string, bool), fl makeFlags) strin
 	}
 	if slices.ContainsFunc(fl.defines, func(d string) bool { n, _, _ := strings.Cut(d, "="); return n == posix }) {
 		return "the environment's MAKEFLAGS defines " + posix + " with -D"
+	}
+	return ""
+}
+
+// makeSysModeIncludes are the stock files sys.mk includes ahead of make.conf
+// when bsd.mkopt.mk turns the option on. doctor models none of them:
+// sys.dirdeps.mk assigns to names it reads from TARGET_SPEC_VARS, which can
+// be __MAKE_CONF or %POSIX, and the other two carry their own includes and
+// hooks. So the system stage doctor certifies is the one where all three
+// resolve to "no", which is FreeBSD's default.
+var makeSysModeIncludes = []struct{ opt, file string }{
+	{"DIRDEPS_BUILD", "sys.dirdeps.mk"},
+	{"META_MODE", "meta.sys.mk"},
+	{"AUTO_OBJ", "auto.obj.mk"},
+}
+
+// makeSysOptionLists are what bsd.mkopt.mk loops over to assign MK_ names.
+// A value from outside, in the environment or MAKEFLAGS, can turn on an
+// option the stock lists leave off, so any definition of one leaves the
+// modes undetermined.
+var makeSysOptionLists = []string{
+	"__DEFAULT_YES_OPTIONS", "__DEFAULT_NO_OPTIONS", "__DEFAULT_DEPENDENT_OPTIONS",
+	"__REQUIRED_OPTIONS", "__SINGLE_OPTIONS", "BROKEN_OPTIONS", "BROKEN_SINGLE_OPTIONS",
+}
+
+// makeSysModeWhy returns why sys.mk may include a system makefile doctor
+// does not model before make.conf, or "". It follows bsd.mkopt.mk as the
+// stock sys.mk lists the options, measured with bmake on 15.1: a defined
+// MK_ name wins, DIRDEPS_BUILD is on when WITH_ is defined and WITHOUT_ is
+// not, and META_MODE and AUTO_OBJ are off when WITHOUT_ is defined, on when
+// only WITH_ is, and follow DIRDEPS_BUILD otherwise. defined() counts an
+// empty environment entry, -D in any flag form and a command-line
+// assignment. A command-line MK_ value is one doctor does not read, and an
+// environment MK_ value other than "no" either turns the option on or stops
+// make at bsd.mkopt.mk's check, so both warn.
+func makeSysModeWhy(lookup func(string) (string, bool), fl makeFlags) string {
+	flagged := func(n string) string {
+		if slices.Contains(fl.assigns, n) {
+			return "the environment's MAKEFLAGS assigns " + n
+		}
+		if slices.ContainsFunc(fl.defines, func(d string) bool { dn, _, _ := strings.Cut(d, "="); return dn == n }) {
+			return "the environment's MAKEFLAGS defines " + n + " with -D"
+		}
+		return ""
+	}
+	defined := func(n string) (string, bool) {
+		if why := flagged(n); why != "" {
+			return why, true
+		}
+		if _, ok := lookup(n); ok {
+			return "the environment defines " + n, true
+		}
+		return "", false
+	}
+	for _, n := range makeSysOptionLists {
+		if why, ok := defined(n); ok {
+			return why + ", which bsd.mkopt.mk reads to decide the MK_ options sys.mk includes system makefiles on"
+		}
+	}
+	type mode struct {
+		on  bool
+		why string
+	}
+	resolve := func(opt string, dflt mode) mode {
+		mk := "MK_" + opt
+		if why := flagged(mk); why != "" {
+			return mode{true, why}
+		}
+		if v, ok := lookup(mk); ok {
+			return mode{v != "no", "the environment sets " + mk + "=" + v}
+		}
+		with, hasWith := defined("WITH_" + opt)
+		without, hasWithout := defined("WITHOUT_" + opt)
+		switch {
+		case hasWithout:
+			return mode{false, without}
+		case hasWith:
+			return mode{true, with}
+		}
+		return dflt
+	}
+	dirdeps := resolve("DIRDEPS_BUILD", mode{})
+	for _, m := range makeSysModeIncludes {
+		got := dirdeps
+		if m.opt != "DIRDEPS_BUILD" {
+			got = resolve(m.opt, dirdeps)
+		}
+		if got.on {
+			return got.why + ", which turns on MK_" + m.opt + ", so sys.mk includes " +
+				filepath.Join(makeStockSysPath, m.file) + " ahead of make.conf, and doctor does not model what that file assigns or includes"
+		}
 	}
 	return ""
 }

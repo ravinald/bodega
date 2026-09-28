@@ -1750,3 +1750,87 @@ func TestMakeConfSystemPath(t *testing.T) {
 		})
 	}
 }
+
+// The stock sys.mk includes sys.dirdeps.mk, meta.sys.mk and auto.obj.mk
+// ahead of make.conf when bsd.mkopt.mk turns their options on, and
+// sys.dirdeps.mk assigns to whatever names TARGET_SPEC_VARS lists. The four
+// dirdeps cases each made real make on 15.1 read no bodega site while an
+// earlier doctor reported OK; the rows after them walk bsd.mkopt.mk's
+// derivation. Both served-check delivery paths are held to the controls.
+func TestMakeConfSystemModes(t *testing.T) {
+	env, err := distinfo.EnvironmentSpec{Variables: map[string][]string{"WITH_DEBUG": {"yes"}}}.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	modesOff := map[string]string{"MK_AUTO_OBJ": "no", "MK_META_MODE": "no"}
+	spec := func(vars, spec string, extra map[string]string) map[string]string {
+		m := map[string]string{"TARGET_SPEC_VARS": vars, "TARGET_SPEC": spec}
+		for k, v := range extra {
+			m[k] = v
+		}
+		return m
+	}
+	with := func(base map[string]string, k, v string) map[string]string {
+		m := map[string]string{k: v}
+		for bk, bv := range base {
+			m[bk] = bv
+		}
+		return m
+	}
+	selectUnsafe := spec("__MAKE_CONF OTHER", "/etc/unsafe.conf,x", modesOff)
+	for _, tc := range []struct {
+		name string
+		env  map[string]string
+		want Status
+	}{
+		{"default", nil, StatusOK},
+		{"dirdeps off with TARGET_SPEC", with(selectUnsafe, "MK_DIRDEPS_BUILD", "no"), StatusOK},
+		{"dirdeps selects make.conf", with(selectUnsafe, "MK_DIRDEPS_BUILD", "yes"), StatusWarn},
+		{"dirdeps through MAKEFLAGS", spec("__MAKE_CONF OTHER", "/etc/unsafe.conf,x", map[string]string{"MAKEFLAGS": "MK_DIRDEPS_BUILD=yes MK_AUTO_OBJ=no MK_META_MODE=no"}), StatusWarn},
+		{"dirdeps through WITH_", with(selectUnsafe, "WITH_DIRDEPS_BUILD", "1"), StatusWarn},
+		{"dirdeps defines %POSIX", spec("%POSIX OTHER", "1,x", with(modesOff, "MK_DIRDEPS_BUILD", "yes")), StatusWarn},
+		{"WITH_ and WITHOUT_ dirdeps", with(with(selectUnsafe, "WITH_DIRDEPS_BUILD", "1"), "WITHOUT_DIRDEPS_BUILD", "1"), StatusOK},
+		{"WITHOUT_ dirdeps", map[string]string{"WITHOUT_DIRDEPS_BUILD": ""}, StatusOK},
+		{"WITH_ dirdeps empty", map[string]string{"WITH_DIRDEPS_BUILD": ""}, StatusWarn},
+		{"WITH_ dirdeps, WITHOUT_ the dependents", map[string]string{"WITH_DIRDEPS_BUILD": "1", "WITHOUT_META_MODE": "1", "WITHOUT_AUTO_OBJ": "1"}, StatusWarn},
+		{"MK_ dirdeps no beats WITH_", map[string]string{"MK_DIRDEPS_BUILD": "no", "WITH_DIRDEPS_BUILD": "1"}, StatusOK},
+		{"MK_ dirdeps empty", map[string]string{"MK_DIRDEPS_BUILD": ""}, StatusWarn},
+		{"MK_ dirdeps yes, dependents off", with(modesOff, "MK_DIRDEPS_BUILD", "yes"), StatusWarn},
+		{"MK_ dirdeps yes alone", map[string]string{"MK_DIRDEPS_BUILD": "yes"}, StatusWarn},
+		{"WITH_ meta mode", map[string]string{"WITH_META_MODE": "yes"}, StatusWarn},
+		{"MK_ meta mode", map[string]string{"MK_META_MODE": "yes"}, StatusWarn},
+		{"WITH_ and WITHOUT_ meta mode", map[string]string{"WITH_META_MODE": "1", "WITHOUT_META_MODE": "1"}, StatusOK},
+		{"WITH_ auto obj", map[string]string{"WITH_AUTO_OBJ": "1"}, StatusWarn},
+		{"MK_ auto obj", map[string]string{"MK_AUTO_OBJ": "yes"}, StatusWarn},
+		{"MAKEFLAGS -D WITH_ meta mode", map[string]string{"MAKEFLAGS": "-D WITH_META_MODE"}, StatusWarn},
+		{"MAKEFLAGS -DWITH_ dirdeps", map[string]string{"MAKEFLAGS": "-DWITH_DIRDEPS_BUILD"}, StatusWarn},
+		{"MAKEFLAGS WITH_ dirdeps empty", map[string]string{"MAKEFLAGS": "WITH_DIRDEPS_BUILD="}, StatusWarn},
+		{"MAKEFLAGS MK_ dirdeps no", map[string]string{"MAKEFLAGS": "MK_DIRDEPS_BUILD=no"}, StatusWarn},
+		{"MAKEFLAGS -DWITHOUT_ dirdeps", map[string]string{"MAKEFLAGS": "-DWITHOUT_DIRDEPS_BUILD"}, StatusOK},
+		{"environment option list", map[string]string{"__DEFAULT_YES_OPTIONS": "DIRDEPS_BUILD"}, StatusWarn},
+		{"MAKEFLAGS option list", map[string]string{"MAKEFLAGS": "__REQUIRED_OPTIONS=META_MODE"}, StatusWarn},
+		{"environment BROKEN_OPTIONS", map[string]string{"BROKEN_OPTIONS": ""}, StatusWarn},
+		{"unrelated option", map[string]string{"WITH_DIRDEPS_CACHE": "1", "MK_STAGING": "yes"}, StatusOK},
+	} {
+		for _, path := range []string{clientconf.DistfilesCheckPath, "/net/b/distfiles/@environment.mk"} {
+			t.Run(tc.name+" "+path, func(t *testing.T) {
+				conf := strings.ReplaceAll(clientconf.MakeConf("https://b").Content, clientconf.DistfilesCheckPath, path)
+				root := writeTree(t, map[string]string{
+					"/etc/make.conf":   strings.ReplaceAll(conf, "?=", "="),
+					"/etc/unsafe.conf": "# intentionally empty\n",
+					path:               string(env.ClientCheck()),
+				})
+				all := map[string]string{"__MAKE_CONF": "/etc/make.conf", "MAKEFLAGS": ""}
+				for k, v := range tc.env {
+					all[k] = v
+				}
+				lookup := func(k string) (string, bool) { v, ok := all[k]; return v, ok }
+				var environ []string
+				for k, v := range all {
+					environ = append(environ, k+"="+v)
+				}
+				assertFinding(t, checkMakeConfEnviron(root, "freebsd", lookup, environ), tc.want)
+			})
+		}
+	}
+}
