@@ -1082,11 +1082,22 @@ func checkMakeConfEnviron(root, goos string, lookup func(string) (string, bool),
 	}
 	f.Remediation = "end " + shown + " with the FreeBSD ports lines under Client configuration in docs/usage.md: " +
 		strings.Join(names, " and ") + " set to <bodega>" + route + ", then .include of " + clientconf.DistfilesCheckPath
+	posix, hook := makeSysSkipsConfWhy(lookup, flags), makeSysHookWhy(root)
 	switch sys := makeSysPathWhy(root, lookup, flags); {
 	case sys != "":
 		f.Status = StatusWarn
 		f.Detail = sys + ", and a sys.mk other than /usr/share/mk/sys.mk can select a different make.conf and change the fetch sites before or after it, so doctor cannot establish what ports fetch from"
 		f.Remediation = "unset MAKESYSPATH, remove it from MAKEFLAGS and move any share/mk out of the ports tree; then run doctor again"
+		return f
+	case posix != "":
+		f.Status = StatusWarn
+		f.Detail = posix + ", and " + makeStockSysPath + "/sys.mk reads make.conf only when %POSIX is undefined, so make reads no make.conf and " + strings.Join(names, ", ") + " stay at the ports' own sites"
+		f.Remediation = "unset %POSIX and remove it from MAKEFLAGS; then run doctor again"
+		return f
+	case hook != "":
+		f.Status = StatusWarn
+		f.Detail = hook + ", so doctor cannot establish what ports fetch from"
+		f.Remediation = "move the local sys.mk hooks out of " + makeStockSysPath + ", or carry their settings in make.conf; then run doctor again"
 		return f
 	case slices.Contains(flags.assigns, "__MAKE_CONF"):
 		f.Status = StatusWarn
@@ -1947,6 +1958,48 @@ func makeSysPathWhy(root string, lookup func(string) (string, bool), fl makeFlag
 		}
 		if err == nil && fi.IsDir() {
 			return "make run in the ports tree finds " + d + " through its default search .../share/mk ahead of " + makeStockSysPath
+		}
+	}
+	return ""
+}
+
+// makeSysSkipsConfWhy returns why the stock sys.mk may skip make.conf, or
+// "". It includes make.conf only in the branch taken when %POSIX is
+// undefined, and make defines a variable from an environment entry of any
+// value, an empty one included, from -D in any flag form and from a
+// command-line assignment, measured with bmake on 15.1. A -D argument is cut
+// at its first = so that a spelling make might read as a different name
+// still warns.
+func makeSysSkipsConfWhy(lookup func(string) (string, bool), fl makeFlags) string {
+	const posix = "%POSIX"
+	if _, ok := lookup(posix); ok {
+		return "the environment defines " + posix
+	}
+	if slices.Contains(fl.assigns, posix) {
+		return "the environment's MAKEFLAGS assigns " + posix
+	}
+	if slices.ContainsFunc(fl.defines, func(d string) bool { n, _, _ := strings.Cut(d, "="); return n == posix }) {
+		return "the environment's MAKEFLAGS defines " + posix + " with -D"
+	}
+	return ""
+}
+
+// makeSysHooks are the files the stock sys.mk reads from its own directory
+// when they exist, one before make.conf and one after. FreeBSD ships
+// neither, and doctor does not read them, so either can change the fetch
+// sites or their precedence.
+var makeSysHooks = []string{"local.sys.env.mk", "local.sys.mk"}
+
+// makeSysHookWhy returns why a local sys.mk hook stands in the way, or "".
+func makeSysHookWhy(root string) string {
+	for _, h := range makeSysHooks {
+		p := filepath.Join(makeStockSysPath, h)
+		_, err := os.Stat(filepath.Join(root, p))
+		switch {
+		case err == nil:
+			return "sys.mk reads " + p + ", which doctor does not inspect"
+		case !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR):
+			return "doctor cannot stat " + p + " (" + err.Error() + "), which sys.mk reads when it exists"
 		}
 	}
 	return ""

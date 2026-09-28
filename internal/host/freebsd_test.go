@@ -1698,8 +1698,9 @@ func TestMakeConfRecipeComments(t *testing.T) {
 }
 
 // sys.mk reads make.conf, so doctor certifies nothing until it knows which
-// sys.mk make reads. FreeBSD's make searches .../share/mk ahead of
-// /usr/share/mk, measured with bmake on 15.1.
+// sys.mk make reads and that it reads make.conf at all. FreeBSD's make
+// searches .../share/mk ahead of /usr/share/mk, and its sys.mk skips
+// make.conf whenever %POSIX is defined, measured with bmake on 15.1.
 func TestMakeConfSystemPath(t *testing.T) {
 	site := "https://b/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/"
 	sysmk := ".include \"/usr/share/mk/sys.mk\"\nMASTER_SITE_OVERRIDE=https://mirror.example/\n"
@@ -1721,6 +1722,20 @@ func TestMakeConfSystemPath(t *testing.T) {
 		{"share/mk in the tree", map[string]string{"/usr/ports/share/mk/sys.mk": sysmk}, nil, StatusWarn},
 		{"share/mk above PORTSDIR", map[string]string{"/home/share/mk/sys.mk": sysmk}, map[string]string{"PORTSDIR": "/home/ports"}, StatusWarn},
 		{"relative PORTSDIR", nil, map[string]string{"PORTSDIR": "ports"}, StatusWarn},
+		{"environment defines %POSIX", nil, map[string]string{"%POSIX": "1"}, StatusWarn},
+		{"environment defines %POSIX empty", nil, map[string]string{"%POSIX": ""}, StatusWarn},
+		{"MAKEFLAGS -D%POSIX", nil, map[string]string{"MAKEFLAGS": "-D%POSIX"}, StatusWarn},
+		{"MAKEFLAGS -D %POSIX", nil, map[string]string{"MAKEFLAGS": "-D %POSIX"}, StatusWarn},
+		{"MAKEFLAGS -eD%POSIX", nil, map[string]string{"MAKEFLAGS": "-eD%POSIX"}, StatusWarn},
+		{"MAKEFLAGS bare D%POSIX", nil, map[string]string{"MAKEFLAGS": "D%POSIX"}, StatusWarn},
+		{"MAKEFLAGS -D%POSIX=x", nil, map[string]string{"MAKEFLAGS": "-D%POSIX=x"}, StatusWarn},
+		{"MAKEFLAGS %POSIX=1", nil, map[string]string{"MAKEFLAGS": "%POSIX=1"}, StatusWarn},
+		{"MAKEFLAGS %POSIX empty", nil, map[string]string{"MAKEFLAGS": "%POSIX="}, StatusWarn},
+		{"MAKEFLAGS %POSIX+=", nil, map[string]string{"MAKEFLAGS": "-- %POSIX+=x"}, StatusWarn},
+		{"MAKEFLAGS defines another name", nil, map[string]string{"MAKEFLAGS": "-DPOSIX -D%POSIXLY"}, StatusOK},
+		{"local.sys.env.mk", map[string]string{"/usr/share/mk/local.sys.env.mk": "MASTER_SITE_OVERRIDE=https://mirror.example/\n"}, nil, StatusWarn},
+		{"local.sys.mk", map[string]string{"/usr/share/mk/local.sys.mk": "MASTER_SITE_OVERRIDE=https://mirror.example/\n"}, nil, StatusWarn},
+		{"other stock system makefiles", map[string]string{"/usr/share/mk/sys.mk": sysmk, "/usr/share/mk/bsd.port.mk": "\n"}, nil, StatusOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			files := map[string]string{
