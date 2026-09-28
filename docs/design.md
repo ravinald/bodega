@@ -153,7 +153,7 @@ A fresh object gets none of this, deliberately. It _is_ the staging file, so it 
 | git    | GitHub release tarball or bare clone      | .tar.gz or .bundle         | `curl https://bodega/git/<name>/<file>`               |
 | pypi   | Wheel build from requirements.txt         | .whl files                 | `pip install --index-url https://bodega/pypi/simple/` |
 | binary | Direct URL download                       | Original file              | `curl https://bodega/binaries/<name>/<ver>/<file>`    |
-| gomod  | GOPROXY upstream or local build           | .zip, .mod, .info          | `GOPROXY=https://bodega/go,direct go get <module>`    |
+| gomod  | GOPROXY upstream or local build           | .zip, .mod, .info          | `GOPROXY=https://bodega/go go get <module>`           |
 | helm   | Chart repo or direct URL                  | .tgz                       | `helm repo add bodega https://bodega/helm`            |
 | npm    | Registry upstream or local                | .tgz                       | `npm install --registry https://bodega/npm/`          |
 
@@ -315,7 +315,7 @@ A manifest entry is what makes a package servable, so how entries get written is
 
 It also settles an ordering problem. Catalog mode returns 404 against an empty store, so a fleet pointed at a fresh bodega breaks until the catalog exists. Importing fills the catalog before any client is repointed.
 
-`git`, `binary` and `freebsd` have no importer, because nothing on a host records a clone, a downloaded binary or the upstream pkg repository a package came from. Those two are what discovery still covers: run with `discover_mode` set to `"observe"`, let catalog mode record the misses as `no_manifest` and `no_namespace` rows, and promote them.
+`git` and `binary` have no importer, because nothing on a host records a clone or a downloaded binary. Those two are what discovery still covers: run with `discover_mode` set to `"observe"`, let catalog mode record the misses as `no_manifest` and `no_namespace` rows, and promote them.
 
 Every path runs the same admission checks (`internal/admit`): structural validation, the upstream allow-list, then the age and OSV version checks. A manifest's fate does not depend on which surface it arrived through.
 

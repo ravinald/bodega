@@ -16,20 +16,21 @@ import (
 	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/builder"
+	"github.com/ravinald/bodega/internal/clientconf"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/server"
 	"github.com/ravinald/bodega/internal/storage"
 )
 
-// The three emitters an operator copies from, on one non-default suite, in
-// both signing states. Every wrong sources line this repository shipped passed
-// a test that injected the value the emitter got wrong: the scheme, the suite,
-// the trust option. So these assert the finished string, character for
-// character, and nothing here injects one.
+// The four places an operator copies the apt stanza from, on one non-default
+// suite, in both signing states. Every wrong sources line this repository
+// shipped passed a test that injected the value the emitter got wrong: the
+// scheme, the suite, the trust option. So these assert the finished string,
+// character for character, and nothing here injects one.
 const (
-	wantUnsignedLine = "deb [trusted=yes] https://bodega.example.com/apt/ jammy main"
-	wantSignedLine   = "deb [signed-by=/etc/apt/keyrings/bodega-archive-keyring.gpg] https://bodega.example.com/apt/ jammy main"
+	wantUnsignedStanza = "Types: deb\nURIs: https://bodega.example.com/apt/\nSuites: jammy\nComponents: main\nTrusted: yes"
+	wantSignedStanza   = "Types: deb\nURIs: https://bodega.example.com/apt/\nSuites: jammy\nComponents: main\nSigned-By: /etc/apt/keyrings/bodega-archive-keyring.gpg"
 )
 
 // aptLineConfig is the one deployment all six strings describe: published at a
@@ -74,78 +75,105 @@ func installKey(t *testing.T) {
 	}
 }
 
-// statusOneLine is the string /api/v1/status hands the web page and any other
-// API consumer. The status handler answers 503 without a storage backend and
-// still renders the apt block, so the body is read whatever the code.
-func statusOneLine(t *testing.T, cfg *config.Config, store *manifest.Store) string {
+// getJSON reads one API route off a server built on cfg and store. The status
+// handler answers 503 without a storage backend and still renders the apt
+// block, so the body is read whatever the code.
+func getJSON(t *testing.T, cfg *config.Config, store *manifest.Store, route string, into any) string {
 	t.Helper()
 	srv := server.New(cfg, store, storage.NewSingle(storage.NewMemory()), ":0", nil)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
-
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+"/api/v1/status", nil)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+route, nil)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("GET /api/v1/status: %v", err)
+		t.Fatalf("GET %s: %v", route, err)
 	}
 	defer resp.Body.Close()
-	var body struct {
-		Apt json.RawMessage `json:"apt"`
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read %s: %v", route, err)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("decode status: %v", err)
+	if err := json.Unmarshal(body, into); err != nil {
+		t.Fatalf("decode %s: %v\n%s", route, err, body)
 	}
-	var apt struct {
-		Sources []struct {
-			Suite   string `json:"suite"`
-			OneLine string `json:"one_line"`
-		} `json:"sources"`
-	}
-	if err := json.Unmarshal(body.Apt, &apt); err != nil {
-		t.Fatalf("decode apt block: %v", err)
-	}
-	if len(apt.Sources) == 0 {
-		t.Fatal("/api/v1/status carries no sources block")
-	}
-	return apt.Sources[0].OneLine
+	return string(body)
 }
 
-// The key column wraps a two-word label onto its own row, so the line is
-// anchored on "line:" rather than the whole label.
-var paneSourcesLine = regexp.MustCompile(`line: *(deb [^\n]*)`)
+// statusStanza is the stanza /api/v1/status hands any API consumer.
+func statusStanza(t *testing.T, cfg *config.Config, store *manifest.Store) string {
+	t.Helper()
+	var body struct {
+		Apt struct {
+			Sources []struct {
+				Deb822 string `json:"deb822"`
+			} `json:"sources"`
+		} `json:"apt"`
+	}
+	getJSON(t, cfg, store, "/api/v1/status", &body)
+	if len(body.Apt.Sources) == 0 {
+		t.Fatal("/api/v1/status carries no sources block")
+	}
+	return body.Apt.Sources[0].Deb822
+}
 
-// paneOneLine renders the details pane for the apt entry and reads the line
+// packageClientConfig is client_config off the package route, which is what
+// the web page renders, and the raw body for a caller that hands it to the
+// page's own script.
+func packageClientConfig(t *testing.T, cfg *config.Config, store *manifest.Store, typ, name string) ([]clientconf.File, string) {
+	t.Helper()
+	var body struct {
+		ClientConfig []clientconf.File `json:"client_config"`
+	}
+	raw := getJSON(t, cfg, store, "/api/v1/packages/"+typ+"/"+name, &body)
+	return body.ClientConfig, raw
+}
+
+// paneStanza renders the details pane for the apt entry and reads the stanza
 // back out of it, rather than calling the renderer directly: the pane is what
 // the operator selects text from, and a correct renderer wired to the wrong
-// argument is one of the defects this covers.
-func paneOneLine(t *testing.T, cfg *config.Config, store *manifest.Store) string {
+// argument is one of the defects this covers. stanzaField writes the first
+// line after the label and each further line on a row of its own.
+func paneStanza(t *testing.T, cfg *config.Config, store *manifest.Store) string {
 	t.Helper()
 	d := newDetailsModel(store, cfg)
 	d.SetSize(200, 40)
 	d.SetNode(&TreeNode{Name: "pkg-a", EntryType: manifest.TypeApt, Version: "1.0"})
-	m := paneSourcesLine.FindStringSubmatch(stripANSI(d.View()))
-	if m == nil {
-		t.Fatalf("details pane rendered no sources line:\n%s", stripANSI(d.View()))
+	lines := strings.Split(stripANSI(d.View()), "\n")
+	for i, l := range lines {
+		at := strings.Index(l, "Types: deb")
+		if at < 0 || !strings.Contains(l[:at], "Sources:") {
+			continue
+		}
+		out := []string{strings.TrimSpace(l[at:])}
+		for _, next := range lines[i+1:] {
+			v := strings.TrimSpace(next)
+			if len(next) <= at || strings.TrimSpace(next[:at]) != "" || v == "" {
+				break
+			}
+			out = append(out, v)
+		}
+		return strings.Join(out, "\n")
 	}
-	return strings.TrimSpace(m[1])
+	t.Fatalf("details pane rendered no sources stanza:\n%s", stripANSI(d.View()))
+	return ""
 }
 
 var ansiEscape = regexp.MustCompile("\x1b\\[[0-9;]*m")
 
 func stripANSI(s string) string { return ansiEscape.ReplaceAllString(s, "") }
 
-// TestSourcesLineIsTheSameStringEverywhere pins all six.
+// TestSourcesLineIsTheSameStringEverywhere pins all four.
 func TestSourcesLineIsTheSameStringEverywhere(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		sign bool
 		want string
 	}{
-		{"unsigned", false, wantUnsignedLine},
-		{"signed", true, wantSignedLine},
+		{"unsigned", false, wantUnsignedStanza},
+		{"signed", true, wantSignedStanza},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// An absent credentials directory is what makes the unsigned case
@@ -157,35 +185,41 @@ func TestSourcesLineIsTheSameStringEverywhere(t *testing.T) {
 			cfg := aptLineConfig(t)
 			store := aptLineStore(t)
 
-			if got := statusOneLine(t, cfg, store); got != tc.want {
-				t.Errorf("/api/v1/status one_line:\n got %q\nwant %q", got, tc.want)
+			if got := statusStanza(t, cfg, store); got != tc.want {
+				t.Errorf("/api/v1/status deb822:\n got %q\nwant %q", got, tc.want)
 			}
-			if got := paneOneLine(t, cfg, store); got != tc.want {
-				t.Errorf("TUI pane sources line:\n got %q\nwant %q", got, tc.want)
+			if got := paneStanza(t, cfg, store); got != tc.want {
+				t.Errorf("TUI pane sources stanza:\n got %q\nwant %q", got, tc.want)
 			}
-			if got := pageOneLine(t, cfg, store); got != tc.want {
-				t.Errorf("web page sources line:\n got %q\nwant %q", got, tc.want)
+			files, _ := packageClientConfig(t, cfg, store, manifest.TypeApt, "pkg-a")
+			if len(files) == 0 {
+				t.Fatal("GET /api/v1/packages/apt/pkg-a carries no client_config")
+			}
+			if got := strings.TrimRight(files[0].Content, "\n"); got != tc.want {
+				t.Errorf("package client_config:\n got %q\nwant %q", got, tc.want)
+			}
+			if got := pageStanza(t, cfg, store); got != tc.want {
+				t.Errorf("web page sources stanza:\n got %q\nwant %q", got, tc.want)
 			}
 		})
 	}
 }
 
-// pageFuncs are the page's whole contribution to the apt line: which
-// server-rendered block an entry uses, and reading one_line off it. Everything
-// else in the stanza is composed on the server, which is the point — the page
-// printed a literal "noble" and derived a scheme from location.protocol for as
-// long as it composed its own.
-var pageFuncs = []string{"clientBase", "aptSourcesFor", "getClientUrl"}
+// pageFuncs are the page's whole contribution to a client line: which of the
+// server-rendered files an entry shows. Everything in the file is composed on
+// the server, which is the point: the page printed a literal "noble" and
+// derived a scheme from location.protocol for as long as it composed its own.
+var pageFuncs = []string{"entryScopes", "pickClientFiles"}
 
 // extractJSFunc pulls one top-level function out of the served page by
 // matching braces from its declaration. Running the whole script is not an
 // option: it ends in init() and two document.addEventListener calls, so it
-// needs a DOM before it will reach the four lines under test.
+// needs a DOM before it will reach the lines under test.
 func extractJSFunc(t *testing.T, page, name string) string {
 	t.Helper()
 	start := strings.Index(page, "function "+name+"(")
 	if start < 0 {
-		t.Fatalf("served page defines no %s(); the apt line is composed somewhere this test cannot see", name)
+		t.Fatalf("served page defines no %s(); the client line is picked somewhere this test cannot see", name)
 	}
 	depth := 0
 	for i := start; i < len(page); i++ {
@@ -224,91 +258,68 @@ func servedPage(t *testing.T, ts *httptest.Server) string {
 	return string(body)
 }
 
-// pageOneLine runs the page's own selection against the server's own status
-// body and returns the string it would put in the Sources line field.
+// pageStanza runs the page's own selection against the package route's own
+// body and returns the content it would put in the Sources field.
 //
 // It needs a JS engine, and the gate has none: adding one to go.mod to
-// exercise four lines costs more than it settles. Where node is on PATH — this
-// project's CI image and any machine with a front-end toolchain — the string
-// is asserted like the other two. Where it is not, TestPageComposesNoLine
-// still holds the page to emitting the server's string verbatim, which is the
-// property that makes the assertion transitive.
-func pageOneLine(t *testing.T, cfg *config.Config, store *manifest.Store) string {
+// exercise a dozen lines costs more than it settles. Where node is on PATH,
+// this project's CI image and any machine with a front-end toolchain, the
+// string is asserted like the other three. Where it is not,
+// TestPageComposesNoLine still holds the page to rendering the server's
+// content verbatim, which is the property that makes the assertion transitive.
+func pageStanza(t *testing.T, cfg *config.Config, store *manifest.Store) string {
 	t.Helper()
 	node, err := exec.LookPath("node")
 	if err != nil {
-		t.Skip("node is not on PATH; the page's rendered string is unasserted here — see TestPageComposesNoLine")
+		t.Skip("node is not on PATH; the page's rendered string is unasserted here, see TestPageComposesNoLine")
 	}
 
 	srv := server.New(cfg, store, storage.NewSingle(storage.NewMemory()), ":0", nil)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
-
 	page := servedPage(t, ts)
-	statusJSON := rawStatus(t, ts)
+	_, raw := packageClientConfig(t, cfg, store, manifest.TypeApt, "pkg-a")
 
 	var script strings.Builder
-	script.WriteString("const location = {origin: 'http://unused.invalid'};\n")
-	script.WriteString("const serverApt = " + statusJSON + ".apt;\n")
 	for _, fn := range pageFuncs {
 		script.WriteString(extractJSFunc(t, page, fn) + "\n")
 	}
-	script.WriteString("process.stdout.write(getClientUrl('apt', {name: 'pkg-a', suites: ['jammy']}));\n")
+	script.WriteString("const files = (" + raw + ").client_config;\n")
+	script.WriteString("process.stdout.write(pickClientFiles('apt', {name: 'pkg-a', version: '1.0', suites: ['jammy']}, files)[0].content.replace(/\\n$/, ''));\n")
 
-	dir := t.TempDir()
-	path := filepath.Join(dir, "page.js")
+	path := filepath.Join(t.TempDir(), "page.js")
 	if err := os.WriteFile(path, []byte(script.String()), 0o600); err != nil {
 		t.Fatalf("write script: %v", err)
 	}
-	cmd := exec.CommandContext(t.Context(), node, path)
-	out, err := cmd.CombinedOutput()
+	out, err := exec.CommandContext(t.Context(), node, path).CombinedOutput()
 	if err != nil {
 		t.Fatalf("node: %v\n%s", err, out)
 	}
 	return string(out)
 }
 
-func rawStatus(t *testing.T, ts *httptest.Server) string {
-	t.Helper()
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+"/api/v1/status", nil)
-	if err != nil {
-		t.Fatalf("build request: %v", err)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("GET /api/v1/status: %v", err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read status: %v", err)
-	}
-	return string(body)
-}
-
-// TestPageComposesNoLine holds the page to reading the server's string rather
-// than building one, which is what makes the status assertion above cover the
-// page on a machine with no JS engine. Each literal named here was in the page
-// and each produced a command that fails: "noble" on a jammy instance, http://
-// behind a TLS-terminating proxy, and [trusted=yes] against a signed archive.
+// TestPageComposesNoLine holds the page to rendering the server's content
+// rather than building its own, which is what makes the API assertion above
+// cover the page on a machine with no JS engine. Each literal named here was
+// in the page and each produced a command that fails: "noble" on a jammy
+// instance, http:// behind a TLS-terminating proxy, and [trusted=yes] against
+// a signed archive.
 func TestPageComposesNoLine(t *testing.T) {
 	srv := server.New(aptLineConfig(t), aptLineStore(t), storage.NewSingle(storage.NewMemory()), ":0", nil)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 	page := servedPage(t, ts)
 
-	// The comment above aptSourcesFor names all three; strip comments so the
-	// history does not read as a live literal.
 	code := regexp.MustCompile(`(?m)^\s*//.*$`).ReplaceAllString(page, "")
-	for _, banned := range []string{"trusted=yes", "signed-by=", "location.protocol", "'noble'", `"noble"`} {
+	for _, banned := range []string{"trusted=yes", "signed-by=", "location.protocol", "'noble'", `"noble"`, "getClientUrl"} {
 		if strings.Contains(code, banned) {
-			t.Errorf("served page composes %q of its own; the line must come from /api/v1/status", banned)
+			t.Errorf("served page composes %q of its own; client lines come from client_config", banned)
 		}
 	}
 
-	apt := extractJSFunc(t, page, "getClientUrl")
-	if !strings.Contains(apt, "src.one_line") {
-		t.Error("getClientUrl no longer returns the server-rendered one_line for apt")
+	render := extractJSFunc(t, page, "clientConfigHtml")
+	if !strings.Contains(render, "f.content") {
+		t.Error("clientConfigHtml no longer renders the server's content")
 	}
 }
 
@@ -344,19 +355,19 @@ func TestPaneFollowsTheKeyOnDisk(t *testing.T) {
 		{
 			name:  "no key installed",
 			setup: func(*testing.T, string) {},
-			want:  wantUnsignedLine,
+			want:  wantUnsignedStanza,
 		},
 		{
 			name:  "usable key",
 			setup: func(t *testing.T, p string) { writeKeyAt(t, p, 0o600) },
-			want:  wantSignedLine,
+			want:  wantSignedStanza,
 		},
 		{
 			// aptsign refuses a key any other account can copy. The server is
 			// then unsigned, so the pane must be too.
 			name:  "key readable beyond its owner",
 			setup: func(t *testing.T, p string) { writeKeyAt(t, p, 0o644) },
-			want:  wantUnsignedLine,
+			want:  wantUnsignedStanza,
 		},
 		{
 			// The public half alone signs nothing. It parses, which is what
@@ -372,7 +383,7 @@ func TestPaneFollowsTheKeyOnDisk(t *testing.T) {
 					t.Fatalf("write public key: %v", err)
 				}
 			},
-			want: wantUnsignedLine,
+			want: wantUnsignedStanza,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -380,8 +391,8 @@ func TestPaneFollowsTheKeyOnDisk(t *testing.T) {
 			t.Setenv(aptsign.CredentialsEnv, dir)
 			tc.setup(t, filepath.Join(dir, aptsign.KeyFileName))
 
-			if got := paneOneLine(t, aptLineConfig(t), aptLineStore(t)); got != tc.want {
-				t.Errorf("pane line:\n got %q\nwant %q", got, tc.want)
+			if got := paneStanza(t, aptLineConfig(t), aptLineStore(t)); got != tc.want {
+				t.Errorf("pane stanza:\n got %q\nwant %q", got, tc.want)
 			}
 		})
 	}
@@ -521,9 +532,21 @@ func TestBinaryClientURLReachesTheFetchedArtifact(t *testing.T) {
 				return rr.Code, rr.Body.String()
 			}
 
-			link := clientURL(cfg, store, manifest.TypeBinary, "tool", "")
+			link := clientLine(cfg, store, manifest.TypeBinary, "tool")
 			if code, body := get(link); code != http.StatusOK || body != "FETCHED-ELF" {
 				t.Errorf("TUI link %s = %d %q, want the fetched bytes", link, code, body)
+			}
+
+			// The web page renders client_config off the package route.
+			pcode, pbody := get("/api/v1/packages/binary/tool")
+			var pkg struct {
+				ClientConfig []clientconf.File `json:"client_config"`
+			}
+			if err := json.Unmarshal([]byte(pbody), &pkg); pcode != http.StatusOK || err != nil || len(pkg.ClientConfig) == 0 {
+				t.Fatalf("package route: %d %v %s", pcode, err, pbody)
+			}
+			if web := pkg.ClientConfig[0].Content; web != link {
+				t.Errorf("web link %q differs from the TUI link %q", web, link)
 			}
 
 			code, body := get("/api/v1/packages/binary/tool/1.0.0")
@@ -641,7 +664,7 @@ func TestBinaryClientURLNeverReachesAnotherEntry(t *testing.T) {
 	} {
 		t.Run(tc.label, func(t *testing.T) {
 			fetch(tc.versions...)
-			link := clientURL(cfg, store, manifest.TypeBinary, "tool", "")
+			link := clientLine(cfg, store, manifest.TypeBinary, "tool")
 			if link == "" {
 				t.Errorf("the TUI offers no link for %+v", tc.versions[0])
 			} else if code, body := get(strings.TrimPrefix(link, "https://bodega.example.com")); code != http.StatusOK || body != tc.want[0] {
@@ -701,7 +724,7 @@ func TestBinaryClientURLKeepsATildeStoredName(t *testing.T) {
 	srv := server.New(cfg, store, storage.NewSingle(objects), ":0", nil)
 	audit.DefaultPepperPaths = []string{filepath.Join(t.TempDir(), "absent")}
 
-	link := clientURL(cfg, store, manifest.TypeBinary, "tool", "")
+	link := clientLine(cfg, store, manifest.TypeBinary, "tool")
 	if link == "" {
 		t.Fatal("the TUI offers no link for an entry stored as ~/tool")
 	}
@@ -762,7 +785,7 @@ func TestBinaryClientURLKeepsATildeStoredNameOnItsBackend(t *testing.T) {
 	}
 	srv := server.New(cfg, store, stores, ":0", nil)
 
-	link := clientURL(cfg, store, manifest.TypeBinary, "tool", "")
+	link := clientLine(cfg, store, manifest.TypeBinary, "tool")
 	if link == "" {
 		t.Fatal("the TUI offers no link for an entry stored as ~/tool on another backend")
 	}
@@ -773,7 +796,7 @@ func TestBinaryClientURLKeepsATildeStoredNameOnItsBackend(t *testing.T) {
 	}
 
 	audit.DefaultPepperPaths = []string{filepath.Join(t.TempDir(), "absent")}
-	if link := clientURL(cfg, store, manifest.TypeBinary, "tool", ""); link != "" {
+	if link := clientLine(cfg, store, manifest.TypeBinary, "tool"); link != "" {
 		t.Errorf("with no pepper the TUI links %s, want no link", link)
 	}
 }

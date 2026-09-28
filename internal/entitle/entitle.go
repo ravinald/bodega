@@ -5,7 +5,10 @@
 package entitle
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"sort"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/builder"
@@ -164,6 +167,29 @@ func (p *Profile) AptScope() (base, refused string) {
 		return "", fmt.Sprintf("its apt expansion is %s, which permits a package the profile does not list, so the filtered index would carry every upstream paragraph", audit.ExpansionOrDefault(r.Expansion))
 	}
 	return r.AptBase, ""
+}
+
+// Fingerprint identifies everything this profile says about typ: the marker
+// and every entry of that type. A catalog built for the profile is stale the
+// moment it changes, and a binding refresh builds a new Profile for an
+// unchanged one, so pointer identity would rebuild on every refresh.
+func (p *Profile) Fingerprint(typ string) string {
+	if p == nil {
+		return ""
+	}
+	h := sha256.New()
+	r := p.types[typ]
+	fmt.Fprintf(h, "%s\x00%s\x00%s\x00%s\x00%s\x00", p.name, r.Type, r.Membership, r.VersionDefault, r.Expansion)
+	keys := make([]string, 0, len(p.entries[typ]))
+	for k := range p.entries[typ] {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		e := p.entries[typ][k]
+		fmt.Fprintf(h, "%s\x00%s\x00%s\x00", k, e.Constraint, e.Version)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // Governs reports whether the profile states a rule for typ at all.

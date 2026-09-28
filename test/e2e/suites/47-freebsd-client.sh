@@ -13,8 +13,11 @@
 # client request reaches.
 #
 # This suite mutates the freebsd guest: it installs a bodega binary, appends to
-# /etc/hosts, and installs and removes one package. It restores the pkg
-# repository configuration it wrote and checks the restore.
+# /etc/hosts, installs and removes one package twice, and trusts bodega's pkg
+# fingerprint while a profile binds it. It saves /usr/local/etc/pkg's bodega
+# stanza and fingerprint directory before its first write, restores them on
+# the way out (early exit included), and checks the restore against the saved
+# state rather than against a stock default.
 
 # shellcheck source=../lib/assert.sh
 . "${E2E_DIR:?run.sh sets E2E_DIR}/lib/assert.sh"
@@ -81,6 +84,114 @@ e2e_on freebsd "sudo sed -i '' '/# bodega-e2e\$/d' /etc/hosts && \
 e2e_on freebsd "curl -sS -o /dev/null -w '%{http_code}' --max-time 10 '$E2E_BASE_URL/healthz'" || true
 check_eq FBSD-04 "the freebsd guest reaches the server by name" "200" "$E2E_OUT" \
 	"test/e2e/suites/10-ship-install.sh" "curl $E2E_BASE_URL/healthz" "$E2E_RC"
+
+# ---- the guest's pkg configuration ------------------------------------------
+#
+# The two paths this suite writes, saved before the first write and restored
+# from that copy: present bytes come back byte for byte, absence comes back as
+# absence, and the unrelated fingerprints beside bodega's are never touched.
+# The helper runs on the guest because it is FreeBSD's tar, stat and sha256
+# that have to agree with what pkg reads.
+#
+# A clean guest proves nothing about restoring, so the suite first seeds one
+# pre-existing stanza (only where none is) and one revoked fingerprint, runs
+# against that, checks it came back, and then restores the guest as found.
+
+FBSD_PKGCONF=/tmp/bodega-e2e-pkgconf.sh
+fbsd_pkgconf_local="$(mktemp "${TMPDIR:-/tmp}/e2e-pkgconf.XXXXXX")"
+cat >"$fbsd_pkgconf_local" <<'E2EPKGCONF'
+#!/bin/sh
+# save <slot> | restore <slot> | drop | seed | state
+set -eu
+root="${FBSD_PKGCONF_ROOT:-}"
+dir="$root/var/tmp/bodega-e2e-pkgconf"
+paths="usr/local/etc/pkg/repos/bodega.conf usr/local/etc/pkg/fingerprints/bodega"
+parents="usr/local/etc/pkg/repos usr/local/etc/pkg/fingerprints usr/local/etc/pkg"
+slot="$dir/${2:-none}"
+case "$1" in
+save)
+	rm -rf "$slot"
+	mkdir -p "$slot"
+	: >"$slot/present"
+	: >"$slot/parents"
+	for p in $parents; do
+		if [ -d "$root/$p" ]; then echo "$p" >>"$slot/parents"; fi
+	done
+	for p in $paths; do
+		if [ -e "$root/$p" ] || [ -L "$root/$p" ]; then echo "$p" >>"$slot/present"; fi
+	done
+	if [ -s "$slot/present" ]; then
+		# shellcheck disable=SC2046 # one word per saved path
+		tar -cpf "$slot/saved.tar" -C "${root:-/}" $(cat "$slot/present")
+	fi
+	: >"$slot/complete"
+	;;
+restore)
+	# Nothing is removed without a complete copy to put back.
+	if [ ! -f "$slot/complete" ]; then
+		echo "no complete save at $slot, so nothing was removed" >&2
+		exit 1
+	fi
+	for p in $paths; do rm -rf "$root/$p"; done
+	if [ -s "$slot/present" ]; then tar -xpf "$slot/saved.tar" -C "${root:-/}"; fi
+	for p in $parents; do
+		grep -qx "$p" "$slot/parents" || rmdir "$root/$p" 2>/dev/null || true
+	done
+	;;
+drop)
+	rm -rf "$dir"
+	;;
+seed)
+	mkdir -p "$root/usr/local/etc/pkg/repos" "$root/usr/local/etc/pkg/fingerprints/bodega/revoked"
+	if [ ! -e "$root/usr/local/etc/pkg/repos/bodega.conf" ]; then
+		printf '# bodega e2e: a stanza that predates suite 47, which it must restore\n' \
+			>"$root/usr/local/etc/pkg/repos/bodega.conf"
+	fi
+	printf 'function: "sha256";\nfingerprint: "%064d";\n' 0 \
+		>"$root/usr/local/etc/pkg/fingerprints/bodega/revoked/bodega-e2e-sentinel"
+	;;
+state)
+	p=usr/local/etc/pkg
+	if [ ! -e "$root/$p" ]; then
+		echo "$p absent"
+		exit 0
+	fi
+	find "$root/$p" | sort | while IFS= read -r f; do
+		m="$(stat -f '%Sp %Su:%Sg' "$f")"
+		if [ -f "$f" ]; then m="$m $(sha256 -q "$f")"; fi
+		echo "${f#"$root"/} $m"
+	done
+	;;
+*)
+	echo "usage: $0 save <slot> | restore <slot> | drop | seed | state" >&2
+	exit 2
+	;;
+esac
+E2EPKGCONF
+
+E2E_HOST=freebsd
+e2e_put freebsd "$fbsd_pkgconf_local" "$FBSD_PKGCONF" || true
+rm -f "$fbsd_pkgconf_local"
+e2e_on freebsd "sudo sh $FBSD_PKGCONF state" || true
+fbsd_conf_found="$E2E_OUT"
+e2e_on freebsd "sudo sh $FBSD_PKGCONF save found" || true
+check_eq FBSD-CONF-00 "the guest's pkg configuration is saved before the suite writes it" 0 "$E2E_RC" \
+	"test/e2e/suites/47-freebsd-client.sh" "sh $FBSD_PKGCONF save found" "$E2E_RC"
+
+# From here on, leaving by any road restores the guest as found. cleanup is
+# run.sh's own exit trap, which this one wraps rather than replaces.
+fbsd_pkgconf_on_exit() {
+	e2e_on freebsd "sudo sh $FBSD_PKGCONF restore found" >/dev/null 2>&1 || true
+	cleanup
+}
+trap fbsd_pkgconf_on_exit EXIT
+trap 'exit 130' INT TERM
+
+e2e_on freebsd "sudo sh $FBSD_PKGCONF seed && sudo sh $FBSD_PKGCONF save seeded && sudo sh $FBSD_PKGCONF state" || true
+fbsd_conf_seeded="$E2E_OUT"
+check_contains FBSD-CONF-01 "the guest carries a pre-existing bodega fingerprint for the suite to restore" \
+	"fingerprints/bodega/revoked/bodega-e2e-sentinel" "$fbsd_conf_seeded" \
+	"test/e2e/suites/47-freebsd-client.sh" "sh $FBSD_PKGCONF seed; save seeded"
 
 # ---- pkg -------------------------------------------------------------------
 #
@@ -150,10 +261,135 @@ e2e_on freebsd "sudo pkg delete -y tree >/dev/null && sudo rm -f /usr/local/etc/
 check_eq FBSD-PKG-07 "removing the stanza gives the host its upstream repository back" "yes" "$E2E_OUT" \
 	"test/e2e/suites/47-freebsd-client.sh" "rm bodega.conf; pkg -vv" "$E2E_RC"
 
+# ---- pkg under a profile ---------------------------------------------------
+#
+# The same proxied repository, read by a host bound to a profile that lists two
+# packages. The catalogue the host reads is filtered for that profile and
+# re-signed with bodega's pkg key, so the guest trusts bodega's fingerprint for
+# this stanza and not /usr/share/keys/pkg. tree and pv are listed; nano is the
+# third, present upstream and refused here.
+#
+# The guest is bound by its address, which is the binding a pkg host carries:
+# pkg sends no bodega credential.
+
+FBSD_PROFILE=e2e-fbsd
+FBSD_CIDR="${E2E_FREEBSD_ADDR:-127.0.0.1}/32"
+fbsd_repo_url="$E2E_BASE_URL/freebsd/$fbsd_abi/e2e-latest"
+
+# The third package's repopath, read off the published catalogue while the
+# guest is still unbound and may read it: the hand-composed fetch below is of a
+# real object, not a path the gate would refuse for being malformed.
+E2E_HOST=freebsd
+e2e_on freebsd "curl -sS --max-time 120 '$fbsd_repo_url/packagesite.pkg' | tar -xOf - packagesite.yaml | \
+	grep '\"name\":\"nano\"' | head -1 | sed -E 's/.*\"repopath\":\"([^\"]*)\".*/\1/'" || true
+fbsd_third="$E2E_OUT"
+check_matches FBSD-PROF-00 "the published catalogue names the third package's object" '^All/.*nano-.*\.pkg$' \
+	"${fbsd_third:-none}" "internal/server/freebsd.go" "curl packagesite.pkg | tar -xOf - packagesite.yaml | grep nano"
+
+# bodega signs a filtered catalogue with its pkg key or refuses to serve one,
+# so the server needs a key. One an earlier run generated is kept. It goes
+# under the storage root, which e2e_bodega hands to the service user: the
+# default path is /etc/bodega, where root would own a 0600 key the service
+# cannot read.
 E2E_HOST=server
+e2e_bodega server "freebsd key show >/dev/null 2>&1 || sudo bodega freebsd key generate --path /var/lib/bodega/pkg-signing.key" || true
+e2e_reload server || true
+e2e_bodega server "freebsd key export --fingerprint" || true
+fbsd_fpr="$E2E_OUT"
+e2e_on server "sleep 2; curl -s --max-time 10 '$E2E_BASE_URL/api/v1/status' | jq -r '.freebsd.signed'" || true
+check_eq FBSD-PROF-01 "the server loaded a pkg signing key to re-sign a filtered catalogue with" \
+	"true" "$E2E_OUT" "internal/server/freebsd_catalog.go" "bodega freebsd key generate; GET /api/v1/status | jq .freebsd.signed" "$E2E_RC"
+
+e2e_bodega server "profile create $FBSD_PROFILE --description 'e2e run'" >/dev/null 2>&1 || true
+e2e_bodega server "profile add $FBSD_PROFILE freebsd tree && sudo bodega profile add $FBSD_PROFILE freebsd pv && \
+	sudo bodega profile set $FBSD_PROFILE freebsd --membership closed --expansion block" || true
+check_eq FBSD-PROF-02 "a profile takes freebsd rules keyed by package name" 0 "$E2E_RC" \
+	"cmd/bodega/cmd_profile.go" "bodega profile add $FBSD_PROFILE freebsd tree; ... set --membership closed --expansion block" "$E2E_RC"
+
+# warn is stored like any other shape and filtered by the whole predicate; set
+# back to block so the checks below see the two listed packages alone.
+e2e_bodega server "profile set $FBSD_PROFILE freebsd --membership closed --expansion warn" || true
+fbsd_warn="$E2E_OUT"
+e2e_bodega server "profile set $FBSD_PROFILE freebsd --membership closed --expansion block" || true
+check_contains FBSD-PROF-03 "a freebsd rule under warn is stored, and set says unlisted packages stay in the catalogue" \
+	"drops only versions" "$fbsd_warn" "cmd/bodega/cmd_profile.go" \
+	"bodega profile set $FBSD_PROFILE freebsd --expansion warn"
+
+e2e_bodega server "profile unbind e2e-fbsd-host" >/dev/null 2>&1 || true
+e2e_bodega server "identity unbind cidr $FBSD_CIDR" >/dev/null 2>&1 || true
+e2e_bodega server "identity bind cidr $FBSD_CIDR e2e-fbsd-host --comment 'e2e run' && \
+	sudo bodega profile bind $FBSD_PROFILE e2e-fbsd-host --force" || true
+check_eq FBSD-PROF-04 "the freebsd guest's address binds to the profile" 0 "$E2E_RC" \
+	"cmd/bodega/cmd_profile.go" "bodega identity bind cidr $FBSD_CIDR; bodega profile bind $FBSD_PROFILE" "$E2E_RC"
+e2e_reload server || true
+sleep 3
+
+E2E_HOST=freebsd
+e2e_on freebsd "sudo mkdir -p /usr/local/etc/pkg/fingerprints/bodega/trusted /usr/local/etc/pkg/fingerprints/bodega/revoked && \
+	printf '%s\n' '$fbsd_fpr' | sudo tee /usr/local/etc/pkg/fingerprints/bodega/trusted/bodega >/dev/null && \
+	sudo bodega doctor --write-pkg-repo --url '$E2E_BASE_URL' --allow-plaintext >/dev/null && \
+	grep -E '^  (url|fingerprints):' /usr/local/etc/pkg/repos/bodega.conf" || true
+check_contains FBSD-PROF-05 "doctor --write-pkg-repo points a bound host at its profile's catalogue" \
+	"/freebsd-profile/$FBSD_PROFILE/\${ABI}/e2e-latest" "$E2E_OUT" \
+	"internal/server/freebsd_status.go" "bodega doctor --write-pkg-repo; grep url bodega.conf"
+check_contains FBSD-PROF-06 "the stanza trusts bodega's key rather than FreeBSD's" \
+	"/usr/local/etc/pkg/fingerprints/bodega" "$E2E_OUT" \
+	"internal/pkgrepos" "grep fingerprints bodega.conf"
+
+e2e_on freebsd "sudo pkg update -f 2>&1 | tail -3" || true
+check_contains FBSD-PROF-07 "pkg update verifies the filtered catalogue against bodega's key" \
+	"bodega-e2e-latest repository update completed" "$E2E_OUT" \
+	"internal/server/freebsd_profile.go" "pkg update -f"
+
+e2e_on freebsd "pkg search -r bodega-e2e-latest -q -x '.*' | sed -E 's/-[^-]+\$//' | sort | tr '\n' ' '" || true
+check_eq FBSD-PROF-08 "pkg search finds the two listed packages and nothing else" "pv tree " "$E2E_OUT" \
+	"internal/server/freebsd_profile.go" "pkg search -r bodega-e2e-latest -x '.*'"
+
+e2e_on freebsd "sudo pkg install -y -r bodega-e2e-latest tree 2>&1 | tail -2 && pkg query '%n %R' tree" || true
+check_contains FBSD-PROF-09 "a listed package installs through the filtered catalogue" \
+	"tree bodega-e2e-latest" "$E2E_OUT" "internal/server/freebsd_profile.go" "pkg install -r bodega-e2e-latest tree"
+
+e2e_on freebsd "sudo pkg install -y -r bodega-e2e-latest nano 2>&1 | tail -2" || true
+fbsd_install_rc="$E2E_RC"
+check_contains FBSD-PROF-10 "pkg install of an unlisted package fails at the catalogue" \
+	"No packages available to install matching 'nano'" "$E2E_OUT" \
+	"internal/server/freebsd_profile.go" "pkg install -r bodega-e2e-latest nano" "$fbsd_install_rc"
+check_ne FBSD-PROF-11 "the failed install exits non-zero" 0 "$fbsd_install_rc" \
+	"internal/server/freebsd_profile.go" "pkg install -r bodega-e2e-latest nano" "$fbsd_install_rc"
+
+e2e_on freebsd "curl -sS --max-time 60 -w '\n%{http_code}' '$fbsd_repo_url/$fbsd_third'" || true
+check_contains FBSD-PROF-12 "a hand-composed fetch of the unlisted package is refused in the profile's vocabulary" \
+	"membership: profile \"$FBSD_PROFILE\" does not list freebsd/nano" "$E2E_OUT" \
+	"internal/server/freebsd_profile.go" "curl $fbsd_repo_url/$fbsd_third" "$E2E_RC"
+check_matches FBSD-PROF-13 "the refusal is a 403" '403$' "$E2E_OUT" \
+	"internal/server/freebsd_profile.go" "curl -w %{http_code} $fbsd_repo_url/$fbsd_third" "$E2E_RC"
+
+e2e_on freebsd "curl -sS --max-time 60 -o /dev/null -w '%{http_code}' '$fbsd_repo_url/packagesite.pkg'" || true
+check_eq FBSD-PROF-14 "the bound host is refused the unfiltered catalogue" "403" "$E2E_OUT" \
+	"internal/server/freebsd_profile.go" "curl $fbsd_repo_url/packagesite.pkg" "$E2E_RC"
+
+# Restore: the package off the guest, then its pkg configuration from the
+# seeded copy, compared against that copy's state, then from the copy taken
+# before the suite wrote anything, compared the same way. Then the binding off
+# the server. The profile stays, as 55-profile's does, because there is no
+# profile delete.
+e2e_on freebsd "sudo pkg delete -y tree >/dev/null 2>&1; sudo sh $FBSD_PKGCONF restore seeded && sudo sh $FBSD_PKGCONF state" || true
+check_eq FBSD-PROF-15 "a pre-existing stanza and fingerprint directory come back byte for byte" \
+	"$fbsd_conf_seeded" "$E2E_OUT" "test/e2e/suites/47-freebsd-client.sh" "sh $FBSD_PKGCONF restore seeded; state" "$E2E_RC"
+e2e_on freebsd "sudo sh $FBSD_PKGCONF restore found && sudo sh $FBSD_PKGCONF state" || true
+check_eq FBSD-PROF-16 "the guest's pkg configuration is restored as the suite found it" \
+	"$fbsd_conf_found" "$E2E_OUT" "test/e2e/suites/47-freebsd-client.sh" "sh $FBSD_PKGCONF restore found; state" "$E2E_RC"
+trap cleanup EXIT
+trap - INT TERM
+e2e_on freebsd "sudo sh $FBSD_PKGCONF drop; rm -f $FBSD_PKGCONF" || true
+
+E2E_HOST=server
+e2e_bodega server "profile unbind e2e-fbsd-host" || true
+e2e_bodega server "identity unbind cidr $FBSD_CIDR" || true
 e2e_bodega server "pkg delete freebsd e2e-latest" || true
 e2e_reload server || true
-unset fbsd_abi
+unset fbsd_abi FBSD_PROFILE FBSD_CIDR fbsd_repo_url fbsd_third fbsd_fpr fbsd_install_rc fbsd_warn \
+	FBSD_PKGCONF fbsd_pkgconf_local fbsd_conf_found fbsd_conf_seeded
 
 # ---- ports -----------------------------------------------------------------
 #

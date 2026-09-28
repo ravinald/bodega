@@ -1363,17 +1363,18 @@ func TestFieldValueFromSlice(t *testing.T) {
 	}
 }
 
-// clientURLExemptType is the one member of manifest.AllTypes clientURL answers
-// "" for by design: a sources line needs the served suites and the signing
-// state as well as the base URL, so aptSources renders it instead. See the
-// comment on clientURL and TestAptSourcesFollowsServerState.
-//
-// Held as a single identity rather than a set so a new ecosystem added to
-// AllTypes fails the tests below rather than joining a growing skip list.
-const clientURLExemptType = manifest.TypeApt
+// clientLine is the first file the details pane renders for an entry, as the
+// operator reads it: what clientFiles hands the pane, trailing newline aside.
+func clientLine(cfg *config.Config, store *manifest.Store, typ, name string) string {
+	files := clientFiles(cfg, store, typ, name, false, "")
+	if len(files) == 0 {
+		return ""
+	}
+	return strings.TrimRight(files[0].Content, "\n")
+}
 
 // clientURLSeeds carries one package per member of manifest.AllTypes. The
-// version entries differ because clientURL reads different fields off them:
+// version entries differ because clientFiles reads different fields off them:
 // git wants a ref, binary a filename, helm a version.
 var clientURLSeeds = map[string]struct {
 	name  string
@@ -1399,8 +1400,8 @@ var clientURLSeeds = map[string]struct {
 }
 
 // seedClientURLTypes stores one package per member of manifest.AllTypes and
-// returns the store alongside the types clientURL is expected to answer for.
-// The list used to be six literals in the test body, which is why clientURL
+// returns the store alongside the types clientFiles is expected to answer for.
+// The list used to be six literals in the test body, which is why the pane
 // returning "" for cargo stayed green from the day cargo landed.
 func seedClientURLTypes(t *testing.T) (*manifest.Store, []struct{ typ, name string }) {
 	t.Helper()
@@ -1415,41 +1416,31 @@ func seedClientURLTypes(t *testing.T) (*manifest.Store, []struct{ typ, name stri
 		if err := store.AddVersion(ctx, typ, seed.name, seed.entry); err != nil {
 			t.Fatalf("seed %s/%s: %v", typ, seed.name, err)
 		}
-		if typ == clientURLExemptType {
-			continue
-		}
 		entries = append(entries, struct{ typ, name string }{typ, seed.name})
 	}
 	return store, entries
 }
 
-// TestClientURLCoversEveryKnownType asserts every type but the one exemption
-// hands an operator something to copy. clientURL falls through to "" for a
-// type it has no arm for, and renderEntryDetails drops the row when the string
-// is empty, so an uncovered type shows a detail panel with no instruction at
-// all rather than a wrong one.
+// TestClientURLCoversEveryKnownType asserts every type hands an operator
+// something to copy. clientFiles renders nothing for a type it has no arm
+// for, and renderEntryDetails drops the row, so an uncovered type shows a
+// detail panel with no instruction at all rather than a wrong one.
 func TestClientURLCoversEveryKnownType(t *testing.T) {
 	store, entries := seedClientURLTypes(t)
 	cfg := &config.Config{}
 
 	for _, e := range entries {
 		t.Run(e.typ, func(t *testing.T) {
-			if got := clientURL(cfg, store, e.typ, e.name, ""); got == "" {
-				t.Errorf("clientURL returned \"\", so the details pane renders no client instruction for a stored %s package", e.typ)
+			if got := clientLine(cfg, store, e.typ, e.name); got == "" {
+				t.Errorf("clientFiles rendered nothing, so the details pane renders no client instruction for a stored %s package", e.typ)
 			}
 		})
-	}
-
-	// The exemption is asserted, not assumed. apt renders through aptSources,
-	// and clientURL answering for it would put two instructions in one pane.
-	if got := clientURL(cfg, store, clientURLExemptType, clientURLSeeds[clientURLExemptType].name, ""); got != "" {
-		t.Errorf("clientURL(%s) = %q, want \"\": aptSources renders the sources line", clientURLExemptType, got)
 	}
 }
 
 // TestDetailsPaneRendersClientInstructionForEveryKnownType drives the whole
 // path an operator walks: BuildTree produces the node, the pane renders it.
-// clientURL answering for a type proves nothing on its own — renderEntryDetails
+// clientFiles answering for a type proves nothing on its own — renderEntryDetails
 // dispatches on EntryType too, and a type missing there renders a pane that
 // never calls s3AndClientFields, so a correct instruction reaches nobody.
 func TestDetailsPaneRendersClientInstructionForEveryKnownType(t *testing.T) {
@@ -1461,14 +1452,7 @@ func TestDetailsPaneRendersClientInstructionForEveryKnownType(t *testing.T) {
 		t.Run(typ, func(t *testing.T) {
 			leaf := firstVersionLeaf(t, roots, typ)
 
-			want := clientURL(cfg, store, typ, leaf.Name, "")
-			if typ == clientURLExemptType {
-				pm, err := store.GetPackage(t.Context(), typ, leaf.Name)
-				if err != nil {
-					t.Fatalf("get %s/%s: %v", typ, leaf.Name, err)
-				}
-				want = aptSources(cfg, pm, aptKeyLoaded(cfg)).OneLine
-			}
+			want := clientLine(cfg, store, typ, leaf.Name)
 			if want == "" {
 				t.Fatalf("no client instruction to render for %s", typ)
 			}
@@ -1519,7 +1503,7 @@ func TestClientURLSchemeFollowsTLSConfig(t *testing.T) {
 
 	tlsCfg := &config.Config{TLSCert: "/etc/bodega/cert.pem", TLSKey: "/etc/bodega/key.pem"}
 	for _, e := range entries {
-		got := clientURL(tlsCfg, store, e.typ, e.name, "")
+		got := clientLine(tlsCfg, store, e.typ, e.name)
 		if got == "" {
 			t.Fatalf("%s: empty client URL", e.typ)
 		}
@@ -1533,7 +1517,7 @@ func TestClientURLSchemeFollowsTLSConfig(t *testing.T) {
 
 	plainCfg := &config.Config{}
 	for _, e := range entries {
-		got := clientURL(plainCfg, store, e.typ, e.name, "")
+		got := clientLine(plainCfg, store, e.typ, e.name)
 		if !strings.Contains(got, "http://") {
 			t.Errorf("%s without TLS: want http://, got %q", e.typ, got)
 		}
@@ -1542,7 +1526,7 @@ func TestClientURLSchemeFollowsTLSConfig(t *testing.T) {
 	// A cert with no key does not start a TLS listener, so it must not
 	// advertise one.
 	halfCfg := &config.Config{TLSCert: "/etc/bodega/cert.pem"}
-	if got := clientURL(halfCfg, store, manifest.TypePypi, "pkg-b", ""); !strings.Contains(got, "http://") {
+	if got := clientLine(halfCfg, store, manifest.TypePypi, "pkg-b"); !strings.Contains(got, "http://") {
 		t.Errorf("cert without key: want http://, got %q", got)
 	}
 
@@ -1551,7 +1535,7 @@ func TestClientURLSchemeFollowsTLSConfig(t *testing.T) {
 	// empty here and every client still speaks https.
 	proxiedCfg := &config.Config{PublicURL: "https://bodega.example.com"}
 	for _, e := range entries {
-		got := clientURL(proxiedCfg, store, e.typ, e.name, "")
+		got := clientLine(proxiedCfg, store, e.typ, e.name)
 		if !strings.Contains(got, "https://bodega.example.com/") {
 			t.Errorf("%s behind a proxy: want the public URL, got %q", e.typ, got)
 		}
@@ -1925,7 +1909,7 @@ func TestCargoStanzaSurvivesANarrowPane(t *testing.T) {
 
 	// An empty instruction splits to one empty string, which every pane
 	// contains: the guard would pass on the defect it exists to catch.
-	stanza := clientURL(cfg, store, manifest.TypeCargo, leaf.Name, "")
+	stanza := clientLine(cfg, store, manifest.TypeCargo, leaf.Name)
 	if stanza == "" {
 		t.Fatalf("no client instruction to render for %s", manifest.TypeCargo)
 	}

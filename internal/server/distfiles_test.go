@@ -451,6 +451,52 @@ func TestDistfilesMissHonorsTheUpstreamAllowList(t *testing.T) {
 	}
 }
 
+// A hit is a request like a miss, so discover_mode counts it: an observe
+// window over two `make fetch` runs of one port reports 2, on the one row the
+// miss wrote, rather than the 1 that described how cold the cache was.
+func TestDistfilesHitCountsInDiscovery(t *testing.T) {
+	s := newDiscoveryServer(t)
+	s.distinfo = distinfo.NewTree(distfilesPortsTree(t), 0, nil)
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_, _ = io.WriteString(w, distfileBody)
+	}))
+	defer up.Close()
+	s.cfg.DistfilesUpstream = up.URL + "/"
+	saved := distfilesGuard
+	distfilesGuard = func(string) error { return nil }
+	defer func() { distfilesGuard = saved }()
+	if err := s.auditDB.InsertPolicy(t.Context(), audit.PolicyInfo{ID: "p", RegistryType: manifest.TypeDistfiles, RuleKind: policy.KindHost, Pattern: "127.0.0.1"}); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(conformingClient(t, &config.Config{}, s.Handler()))
+	defer ts.Close()
+
+	for i := range 2 {
+		if code, body := getBody(t, ts.URL+"/distfiles/pcpustat/1.6.tar.bz2"); code != http.StatusOK {
+			t.Fatalf("GET %d = %d %q, want 200", i+1, code, body)
+		}
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("upstream fetched %d times, want 1: the second GET has to be a cache hit for this to test anything", got)
+	}
+	// waitForPoolRow returns at a count of at least 2, so a hit recorded twice
+	// would pass it. Close waits out both handlers, so every observation they
+	// make is queued; the worker writes the queue in order, so once a sentinel
+	// queued after them is visible, so is every one of theirs.
+	ts.Close()
+	s.discovery.Record(audit.DiscoveryRow{RegistryType: manifest.TypeDistfiles, Host: "sentinel.invalid", PkgName: "sentinel", Decision: audit.DecisionAllowed})
+	waitForPoolRow(t, s, "sentinel", 1)
+	row := waitForPoolRow(t, s, "pcpustat/1.6.tar.bz2", 2)
+	if row.RequestCount != 2 {
+		t.Errorf("request_count = %d, want 2: one miss and one hit", row.RequestCount)
+	}
+	if row.RegistryType != manifest.TypeDistfiles || row.Decision != audit.DecisionAllowed {
+		t.Errorf("row = %+v, want a distfiles row the allow-list permits", row)
+	}
+}
+
 // The F24 witness through HTTP: arabic/aspell reads ${LOCALBASE}/etc/aspell.ver
 // on the client host, which base make shows can point its DISTINFO_FILE at
 // pcpustat's and set NO_CDROM. pcpustat is served only when the declared

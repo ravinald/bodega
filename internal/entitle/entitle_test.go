@@ -393,3 +393,25 @@ func TestKeyCanonicalizesEverySpellingOfOneDistribution(t *testing.T) {
 		}
 	}
 }
+
+// Fingerprint moves with anything that changes what a filtered catalogue
+// holds, and with nothing on another type.
+func TestFingerprintTracksOneType(t *testing.T) {
+	types := []audit.ProfileTypeRule{blocking(rule(manifest.TypeFreeBSD, audit.MembershipClosed, audit.VersionFloating))}
+	base := profile("web", types, []audit.ProfileEntry{{Type: manifest.TypeFreeBSD, Name: "nginx"}}).Fingerprint(manifest.TypeFreeBSD)
+	if again := profile("web", types, []audit.ProfileEntry{{Type: manifest.TypeFreeBSD, Name: "nginx"}}).Fingerprint(manifest.TypeFreeBSD); again != base {
+		t.Error("two profiles saying the same thing fingerprint differently, so every binding refresh rebuilds the catalogue")
+	}
+	for name, entries := range map[string][]audit.ProfileEntry{
+		"an added entry": {{Type: manifest.TypeFreeBSD, Name: "nginx"}, {Type: manifest.TypeFreeBSD, Name: "curl"}},
+		"a pin":          {{Type: manifest.TypeFreeBSD, Name: "nginx", Constraint: manifest.ConstraintExact, Version: "1.26.2"}},
+	} {
+		if profile("web", types, entries).Fingerprint(manifest.TypeFreeBSD) == base {
+			t.Errorf("%s left the fingerprint where it was", name)
+		}
+	}
+	other := append([]audit.ProfileEntry{{Type: manifest.TypeFreeBSD, Name: "nginx"}}, audit.ProfileEntry{Type: manifest.TypeNpm, Name: "left-pad"})
+	if profile("web", types, other).Fingerprint(manifest.TypeFreeBSD) != base {
+		t.Error("an npm entry moved the freebsd fingerprint")
+	}
+}

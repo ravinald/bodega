@@ -187,11 +187,22 @@ paths:
         - $ref: "#/components/parameters/PackageName"
       responses:
         "200":
-          description: Package manifest
+          description: Package manifest, with the client configuration for it
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/PackageManifest"
+                allOf:
+                  - $ref: "#/components/schemas/PackageManifest"
+                  - type: object
+                    properties:
+                      client_config:
+                        type: array
+                        description: |
+                          What a client of this package installs, rendered by the
+                          server through internal/clientconf. Empty for a hidden
+                          package. The version-scoped route does not carry it.
+                        items:
+                          $ref: "#/components/schemas/ClientConfigFile"
         "404":
           description: Package not found
     delete:
@@ -900,6 +911,41 @@ components:
           items:
             $ref: "#/components/schemas/ImportResult"
 
+    ClientConfigFile:
+      type: object
+      required: [system, label, content]
+      properties:
+        system:
+          type: string
+          description: Package type the file configures a client for
+        label:
+          type: string
+          example: Cargo config
+        scope:
+          type: string
+          description: |
+            The variant of the package this file configures: the apt suite, the
+            FreeBSD ABI, the git ref, or the filename the read API publishes for
+            a binary entry. Absent when the file is the same for every version.
+        paths:
+          type: object
+          description: |
+            Where the file belongs, keyed by operating system (linux, freebsd,
+            darwin). Holds only the systems the client runs on. Absent for a
+            download link, which is no file.
+          additionalProperties:
+            type: string
+          example:
+            linux: /etc/pip.conf
+            freebsd: /etc/pip.conf
+            darwin: /Library/Application Support/pip/pip.conf
+        content:
+          type: string
+          description: The file's content, or the URL for a download link
+        notes:
+          type: array
+          items:
+            type: string
     PackageManifest:
       type: object
       required: [name, type]
@@ -1476,6 +1522,14 @@ components:
             it: a server holding no pkg catalogue signing key renders
             signature_type none for a generated repository, and that field is
             the one to read for the signing half.
+        profile:
+          type: string
+          description: >-
+            The profile the requesting host is bound to, when that profile
+            states a freebsd rule. url then names the catalogue bodega filtered for
+            that profile, re-signed with bodega's pkg key, and signature_type
+            and fingerprints trust that key rather than FreeBSD's. Absent for
+            a host no such profile binds.
         proxy:
           type: boolean
           description: >-

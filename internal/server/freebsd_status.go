@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sort"
 
@@ -56,6 +57,11 @@ type freebsdRefused struct {
 	Repo  string `json:"repo"`
 	ABI   string `json:"abi"`
 	Error string `json:"error"`
+
+	// public marks a refusal that quotes no entry field, so handleAPIStatus
+	// may leave it for a caller outside admin_permit_cidr: the host doctor
+	// runs on is that caller, and an empty reason sends its operator nowhere.
+	public bool
 }
 
 // RepoFor returns the rendered configuration for one repository and ABI.
@@ -81,6 +87,11 @@ func (f freebsdStatus) RepoFor(repo, abi string) *pkgrepos.Repo {
 // own mode, URL and generated flag: reading any of those off the first entry
 // would hand a FreeBSD:13 client the FreeBSD:14 entry's answer, and the two
 // are configured apart precisely so they can differ.
+//
+// Per host as well as per entry: a host bound to a profile that governs
+// freebsd is handed the stanza for that profile's filtered view, and a
+// server with no pkg key refuses it by name rather than rendering one the
+// view would answer 500 under.
 //
 // A hidden package or ABI is left out. hide is the quarantine control and the
 // route already 404s it, so publishing a stanza for one would hand an
@@ -111,6 +122,13 @@ func (s *Server) freeBSDStatusFor(r *http.Request) freebsdStatus {
 	ctx := context.Background()
 	if r != nil {
 		ctx = r.Context()
+		// The requesting host's own configuration, which is the question
+		// doctor --write-pkg-repo asks: a host whose profile governs freebsd
+		// reads that profile's filtered view, signed by bodega, and a stanza
+		// pointing it at the published catalogue is one the route refuses.
+		if p := s.profileFor(r); p.Governs(manifest.TypeFreeBSD) {
+			base.Profile = p.Name()
+		}
 	}
 	for _, name := range s.store.ListPackages(manifest.TypeFreeBSD) {
 		pm, _ := s.store.GetPackage(ctx, manifest.TypeFreeBSD, name)
@@ -127,8 +145,10 @@ func (s *Server) freeBSDStatusFor(r *http.Request) freebsdStatus {
 			one.Proxy = ve.EffectiveMode() == manifest.ModeProxy
 			rendered, err := pkgrepos.Render(one)
 			if err != nil {
-				out.Refused = append(out.Refused,
-					freebsdRefused{Repo: pm.Name, ABI: ve.Version, Error: err.Error()})
+				out.Refused = append(out.Refused, freebsdRefused{
+					Repo: pm.Name, ABI: ve.Version, Error: err.Error(),
+					public: errors.Is(err, pkgrepos.ErrProfileUnsigned),
+				})
 				continue
 			}
 			out.Repos = append(out.Repos, rendered)

@@ -55,16 +55,22 @@ Sources per type:
   gomod   go list -m all   |   go version -m <binary>
   cargo   cargo install --list
   helm    helm list -o json
+  freebsd pkg query '%R\t%q'
 
-git, binary and freebsd have no importer. Nothing on the host bodega runs on
-records a clone, a downloaded binary or an upstream pkg repository, so those
-are cataloged with 'bodega pkg create' or found by running the server with
-discover_mode set to "observe".
+A freebsd entry is a repository, one version per ABI, so convert collapses the
+packages to the repositories they came from. pkg records each repository's
+name on the package and its address nowhere a query reaches, so the entries
+arrive with no url: fill it in from 'pkg -vv' before importing.
+
+git and binary have no importer. Nothing on the host bodega runs on records a
+clone or a downloaded binary, so those are cataloged with 'bodega pkg create'
+or found by running the server with discover_mode set to "observe".
 
 Examples:
   dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\t${source:Package}\n' | bodega pkg convert apt > catalog.json
   apt list --installed | bodega pkg convert apt -o catalog.json
   pip list --format=json | bodega pkg convert pypi | bodega pkg import -
+  pkg query '%R\t%q' | bodega pkg convert freebsd -o catalog.json
   bodega pkg convert apt installed.txt
   bodega pkg convert apt --origin db01 --suite noble db01-installed.txt`,
 		Args: cobra.RangeArgs(1, 2),

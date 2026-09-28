@@ -12,6 +12,7 @@ import (
 
 	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/clientconf"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/pins"
@@ -27,19 +28,20 @@ import (
 // layout, the FreeBSD pkg repository layout, git smart-HTTP — and a client
 // generator reading this document has no use for them. /healthz and the web UI are not part of the API either.
 var specPathsNotDocumented = map[string]string{
-	"/apt/":       "Debian archive layout, consumed by apt rather than by a generated client",
-	"/pypi/":      "PEP 503 simple index",
-	"/git/":       "git smart-HTTP and bundle downloads",
-	"/binaries/":  "raw artifact downloads",
-	"/go/":        "GOPROXY protocol",
-	"/helm/":      "helm chart repository protocol",
-	"/npm/":       "npm registry API",
-	"/cargo/":     "cargo sparse index protocol",
-	"/freebsd/":   "FreeBSD pkg repository layout, consumed by pkg rather than by a generated client",
-	"/distfiles/": "ports DISTDIR layout, consumed by do-fetch.sh through MASTER_SITE_OVERRIDE",
-	"/healthz":    "liveness probe, not part of the API surface",
-	"/ui":         "web UI",
-	"/static/":    "web UI assets",
+	"/apt/":             "Debian archive layout, consumed by apt rather than by a generated client",
+	"/pypi/":            "PEP 503 simple index",
+	"/git/":             "git smart-HTTP and bundle downloads",
+	"/binaries/":        "raw artifact downloads",
+	"/go/":              "GOPROXY protocol",
+	"/helm/":            "helm chart repository protocol",
+	"/npm/":             "npm registry API",
+	"/cargo/":           "cargo sparse index protocol",
+	"/freebsd/":         "FreeBSD pkg repository layout, consumed by pkg rather than by a generated client",
+	"/freebsd-profile/": "the same pkg repository layout, filtered for one profile",
+	"/distfiles/":       "ports DISTDIR layout, consumed by do-fetch.sh through MASTER_SITE_OVERRIDE",
+	"/healthz":          "liveness probe, not part of the API surface",
+	"/ui":               "web UI",
+	"/static/":          "web UI assets",
 }
 
 type openAPIDoc struct {
@@ -228,6 +230,7 @@ var schemaStructs = map[string]any{
 	"ImportResponse":     ImportResponse{},
 	"ImportResult":       ImportResult{},
 	"PackageManifest":    manifest.PackageManifest{},
+	"ClientConfigFile":   clientconf.File{},
 	"VersionEntry":       manifest.VersionEntry{},
 	"BuildEnv":           manifest.BuildEnv{},
 	"Dependency":         manifest.Dependency{},

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -277,6 +278,81 @@ func ArtifactDir(cfg *Config, typ string) string {
 		return d.distfiles
 	}
 	return cfg.rootFor(typ)
+}
+
+// typeResetPaths lists every path under a type's resolved root that the
+// type's builders write and a later build reads back. An unknown type returns
+// nil, which TestResetPathsCoverEveryType turns into a failure.
+func typeResetPaths(cfg *Config, typ string) []string {
+	root := cfg.rootFor(typ)
+	d := buildDirs(root)
+	switch typ {
+	case manifest.TypeBinary:
+		return []string{d.binaries}
+	case manifest.TypeGit:
+		return []string{d.repos, d.sources, d.bundles}
+	case manifest.TypeApt:
+		return []string{d.sources, d.aptRepo}
+	case manifest.TypePypi:
+		// The combined and resolved requirement files sit at the root itself,
+		// and CheckPypiStage reads them to decide the fetch stage ran. The
+		// wheelhouse and the build venv sit there too, outside dirs: the build
+		// reads the one and reuses the other.
+		return []string{
+			d.wheels,
+			pypiWheelhouseDir(root),
+			pypiVenvDir(root),
+			filepath.Join(root, "combined-requirements.txt"),
+			filepath.Join(root, "combined-constraints.txt"),
+			pypiLockPath(root),
+		}
+	case manifest.TypeGomod:
+		return []string{d.gomod}
+	case manifest.TypeHelm:
+		return []string{d.charts}
+	case manifest.TypeNpm:
+		return []string{d.npm}
+	case manifest.TypeCargo:
+		return []string{d.cargo}
+	case manifest.TypeFreeBSD:
+		return []string{d.freebsd}
+	case manifest.TypeDistfiles:
+		// The whole tree, not the @<digest> DISTDIR ArtifactDir names: a
+		// changed environment declaration leaves the old digest's files beside
+		// the new one.
+		return []string{d.distfiles}
+	}
+	return nil
+}
+
+// ResetPath is one path `bodega reset` removes, with the types that write it.
+// Two types share a path when neither overrides its root, as apt and git do
+// with sources/.
+type ResetPath struct {
+	Path  string
+	Types []string
+}
+
+// ResetPaths returns the union of every path each type in manifest.AllTypes
+// writes, resolved through the per-type root overrides, sorted by path.
+func ResetPaths(cfg *Config) []ResetPath {
+	byPath := map[string]*ResetPath{}
+	for _, typ := range manifest.AllTypes {
+		for _, p := range typeResetPaths(cfg, typ) {
+			p = filepath.Clean(p)
+			if rp, ok := byPath[p]; ok {
+				rp.Types = append(rp.Types, typ)
+				continue
+			}
+			byPath[p] = &ResetPath{Path: p, Types: []string{typ}}
+		}
+	}
+	out := make([]ResetPath, 0, len(byPath))
+	for _, rp := range byPath {
+		out = append(out, *rp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
 }
 
 // stdout returns the configured output writer, falling back to os.Stdout.

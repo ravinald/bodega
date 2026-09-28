@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/ravinald/bodega/internal/clientconf"
 )
 
 // scratchHome is a home directory with helm's two path overrides cleared, so
@@ -270,6 +272,16 @@ func TestHelmCreatesAParseableDocument(t *testing.T) {
 	repos := strings.Index(created, "\nrepositories:\n")
 	if repos < 0 || entry < repos {
 		t.Fatalf("the entry does not sit under a top-level repositories: key:\n%s", created)
+	}
+
+	// The document and the entry's name and URL are the ones clientconf hands
+	// every other surface, so the file the dashboard shows and the file doctor
+	// writes register the same repository.
+	if !strings.HasPrefix(created, clientconf.HelmDocument("")) {
+		t.Fatalf("the document does not open with clientconf.HelmDocument's keys:\n%s", created)
+	}
+	if public := clientconf.HelmRepository(testBase(t).String()); !strings.Contains(created, public) {
+		t.Fatalf("the entry is not clientconf.HelmRepository's %q:\n%s", public, created)
 	}
 
 	// helm's own file is the shape the second run has to land in, and a
@@ -808,5 +820,21 @@ func TestWriteAptSourcesInstallsAMirroredStanzaWithNoKeyring(t *testing.T) {
 	}
 	if strings.Contains(string(body), "Signed-By") || strings.Contains(string(body), "Trusted") {
 		t.Errorf("the installed mirrored stanza carries a trust line:\n%s", body)
+	}
+}
+
+// cargo reads the token only for a registry its config.toml names, and the
+// form that redirects crates.io is clientconf's source replacement. The
+// [registries.bodega] index this note used to recommend names a second
+// registry and leaves every crates.io dependency fetching from crates.io.
+func TestCargoNoteNamesTheSourceReplacement(t *testing.T) {
+	note := targetFor(t, scratchHome(t), "cargo").Note
+	for _, line := range strings.Split(strings.TrimSpace(clientconf.Cargo("http://<bodega>").Content), "\n") {
+		if line = strings.TrimSpace(line); line != "" && !strings.Contains(note, line) {
+			t.Errorf("cargo note lacks %q from clientconf.Cargo: %q", line, note)
+		}
+	}
+	if strings.Contains(note, "index =") {
+		t.Errorf("cargo note still recommends a [registries] index: %q", note)
 	}
 }

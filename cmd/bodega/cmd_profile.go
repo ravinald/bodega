@@ -19,6 +19,7 @@ import (
 	"github.com/ravinald/bodega/internal/entitle"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/pins"
+	"github.com/ravinald/bodega/internal/pkgrepos"
 )
 
 func newProfileCmd(gf *globalFlags) *cobra.Command {
@@ -561,6 +562,9 @@ func validateDoc(doc *profileDoc) error {
 		if err := requireConstraintVersion(e.Constraint, e.Version); err != nil {
 			return fmt.Errorf("entries[%d] (%s/%s): %w", i, e.Type, e.Name, err)
 		}
+		if err := requireFreeBSDConstraint(e.Type, e.Constraint); err != nil {
+			return fmt.Errorf("entries[%d] (%s/%s): %w", i, e.Type, e.Name, err)
+		}
 		// Refused here rather than at the write: createFromDoc reaches
 		// CreateProfileWith as one transaction, and a document rejected halfway
 		// is what that path exists to avoid.
@@ -935,6 +939,19 @@ abort an apt transaction the client had already planned.
   bodega profile set web apt --membership closed --base noble
   bodega doctor --write-apt-sources --token ... --url https://bodega.internal
 
+freebsd rules name packages inside a pkg repository, and a profile that
+states one is served a catalogue bodega filters and re-signs with its own pkg
+key, at /freebsd-profile/<profile>/<abi>/<repo>/. Every rule shape filters by
+the same predicate a fetch is judged by: closed with block keeps the listed
+packages alone, and open membership, warn and ignore keep unlisted packages
+while still dropping every version an entry's constraint refuses. Entries take
+exact or any: pkg versions carry a port revision (1.26.2_1,1), which
+compatible and patch cannot compare.
+
+  bodega profile add web freebsd nginx
+  bodega profile set web freebsd --membership closed --expansion block
+  bodega doctor --write-pkg-repo --url https://bodega.internal
+
 --expansion defaults to warn and applies to a closed type alone, because an
 open type lists nothing to be outside of. warn rather than block: a new
 transitive dependency is ordinary upstream maintenance, and the cost of
@@ -1022,6 +1039,12 @@ name keeps the value it has.`,
 			fmt.Printf("%s %s: membership=%s version_default=%s expansion=%s\n",
 				profile, typ, rule.Membership, rule.VersionDefault, rule.Expansion)
 			switch {
+			case typ == manifest.TypeFreeBSD:
+				fmt.Printf("  filtered catalogue: %s/<abi>/<repo>/, signed with bodega's pkg key; install it on a bound host with bodega doctor --write-pkg-repo\n",
+					pkgrepos.ProfilePath(profile))
+				if rule.Membership != audit.MembershipClosed || !refusesUnlisted(rule.Expansion) {
+					fmt.Println("  this rule permits packages the profile does not list, so the catalogue keeps them and drops only versions an entry's constraint refuses")
+				}
 			case rule.AptBase != "":
 				fmt.Printf("  filtered codename: %s (from %s), served after the next index rebuild\n",
 					config.ProfileAptCodename(rule.AptBase, profile), rule.AptBase)
@@ -1675,6 +1698,9 @@ func putProfileEntry(gf *globalFlags, profile, typ, name string, e audit.Profile
 	if err := requireConstraintVersion(e.Constraint, e.Version); err != nil {
 		return err
 	}
+	if err := requireFreeBSDConstraint(typ, e.Constraint); err != nil {
+		return err
+	}
 
 	e.Profile, e.Type, e.Name = profile, typ, name
 	e.Actor = audit.CurrentActor()
@@ -1745,6 +1771,26 @@ func requireConstraintVersion(kind, version string) error {
 		return nil
 	}
 	return fmt.Errorf("constraint %s is measured against a version and none was given: --version <v>", kind)
+}
+
+// requireFreeBSDConstraint refuses the two constraint kinds pkg versions
+// cannot be placed under. A pkg version carries a port revision and an epoch,
+// 1.26.2_1,1, and compatible and patch compare semantic versions: every
+// version a freebsd repository publishes would fail to parse and be refused,
+// which reads to the host as a profile that lists the package and serves none
+// of it.
+func requireFreeBSDConstraint(typ, kind string) error {
+	if typ != manifest.TypeFreeBSD {
+		return nil
+	}
+	switch kind {
+	case manifest.ConstraintCompatible, manifest.ConstraintPatch:
+		return fmt.Errorf("constraint %s cannot hold a freebsd package: pkg versions carry a port revision and an epoch (1.26.2_1,1), "+
+			"which is not a semantic version, so %s would place none of them and the package would vanish from the host's catalogue.\n"+
+			"  Hold one version:  --constraint exact --version <pkg version, as pkg rquery %%v prints it>\n"+
+			"  Or float it:       --constraint any", kind, kind)
+	}
+	return nil
 }
 
 func constraintSuffix(e audit.ProfileEntry) string {
@@ -1970,7 +2016,7 @@ version it holds is one nothing can serve.`,
 				return fmt.Errorf("load manifests: %w", err)
 			}
 
-			var violations int
+			var violations, unchecked int
 			var notes []string
 			var srcIndex aptSourceIndex
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
@@ -1987,6 +2033,10 @@ version it holds is one nothing can serve.`,
 					}
 				}
 				for _, e := range d.Entries {
+					if e.Type == manifest.TypeFreeBSD {
+						unchecked++
+						continue
+					}
 					reason, note, err := entryResolves(ctx, store, resolved, e, srcIndex)
 					if err != nil {
 						_ = w.Flush()
@@ -2012,6 +2062,14 @@ version it holds is one nothing can serve.`,
 				// would leave deleting the pin as the only way to green.
 				fmt.Printf("%d apt pin(s) permit part of their own source's binaries:\n%s\n",
 					len(notes), strings.Join(notes, "\n"))
+			}
+			if unchecked > 0 {
+				// A freebsd entry names a package inside a repository's
+				// catalogue, and the manifest store holds the repository
+				// alone. Reported as a count rather than as a violation, for
+				// the reason the apt note above is.
+				fmt.Printf("%d freebsd entr%s not checked: each names a package inside a pkg repository's catalogue, which the manifest store does not hold. "+
+					"On a bound host, pkg search lists what resolves.\n", unchecked, plural(unchecked, "y", "ies"))
 			}
 			if violations == 0 {
 				fmt.Printf("OK: every entry in %d profile(s) resolves in the catalog.\n", len(names))
