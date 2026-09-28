@@ -825,6 +825,13 @@ func TestDistfilesRefusalsNameNoServerPath(t *testing.T) {
 					t.Fatal(err)
 				}
 			}},
+		{name: "policy database unavailable", path: pcpustat, code: http.StatusInternalServerError,
+			setup: func(t *testing.T, f *fixture) {
+				f.s.policy.Invalidate()
+				if err := f.s.auditDB.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}},
 		{name: "upstream lacks it", path: pcpustat, code: http.StatusNotFound,
 			upstream: http.NotFound},
 		{name: "upstream unreachable", path: pcpustat, code: http.StatusBadGateway,
