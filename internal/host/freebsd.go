@@ -728,6 +728,8 @@ type uclParser struct {
 	pos int
 	// err is the first lexical error, which skip cannot return.
 	err error
+	// depth is how many nested values enclose pos.
+	depth int
 }
 
 func (p *uclParser) eof() bool { return p.pos >= len(p.src) }
@@ -875,30 +877,65 @@ func (p *uclParser) quoted() (s string, escaped bool, err error) {
 	return "", false, fmt.Errorf("line %d: string is not closed", start)
 }
 
+// uclNestDepth bounds how deep doctor follows nested values.
+const uclNestDepth = 32
+
+// nested parses an object or array value with the grammar the top level
+// uses, whatever key it sits under: libucl rejects the whole file over a
+// malformed value pkg would never read. Measured with pkg 2.8.4 on 15.1,
+// libucl accepts "{ a x }", "{ a: x b: y }", "[a b]", trailing separators
+// and comments inside either, and rejects an empty value, a closer that does
+// not match its opener, and "[ , ]" while accepting "[a,,b]". doctor keeps
+// to the forms it measured: a bare value holding a quote or an opener, and
+// any separator where an array element belongs, are refused as unmodeled
+// rather than guessed at.
 func (p *uclParser) nested() error {
-	start, depth := p.line(), 0
-	for !p.eof() {
-		rest := p.src[p.pos:]
-		if rest[0] == '#' || strings.HasPrefix(rest, "//") || strings.HasPrefix(rest, "/*") {
-			return pkgUnmodeled{fmt.Sprintf("line %d: a comment or // inside a nested value, which doctor does not skip", p.line())}
+	open, start := p.peek(), p.line()
+	closer := byte('}')
+	if open == '[' {
+		closer = ']'
+	}
+	p.depth++
+	defer func() { p.depth-- }()
+	if p.depth > uclNestDepth {
+		return pkgUnmodeled{fmt.Sprintf("line %d: values nested past %d levels", start, uclNestDepth)}
+	}
+	p.pos++
+	for {
+		p.skip()
+		switch c := p.peek(); {
+		case p.eof():
+			return fmt.Errorf("line %d: object or array is not closed", start)
+		case c == closer:
+			p.pos++
+			return nil
+		case c == '}' || c == ']':
+			return fmt.Errorf("line %d: %q closes a value opened with %q", p.line(), c, open)
+		case open == '[' && (c == ',' || c == ';'):
+			return pkgUnmodeled{fmt.Sprintf("line %d: an array holds an empty element, which libucl accepts or rejects by position", p.line())}
 		}
-		switch p.peek() {
-		case '"', '\'':
-			if _, _, err := p.quoted(); err != nil {
+		if open == '{' {
+			kline := p.line()
+			k, err := p.key()
+			if err != nil {
 				return err
 			}
-			continue
-		case '{', '[':
-			depth++
-		case '}', ']':
-			depth--
+			if strings.HasPrefix(k, ".") {
+				return pkgUnmodeled{fmt.Sprintf("line %d: %s inside a nested object is a UCL directive doctor does not evaluate", kline, k)}
+			}
+			p.sep()
 		}
-		p.pos++
-		if depth == 0 {
-			return nil
+		c := p.peek()
+		bare := c != '"' && c != '\'' && c != '{' && c != '['
+		v, err := p.value()
+		if err != nil {
+			return err
 		}
+		if bare && strings.ContainsAny(v.s, "\"'{[") {
+			return pkgUnmodeled{fmt.Sprintf("line %d: the nested value %s holds a quote or an opener, which doctor does not lex", p.line(), v.s)}
+		}
+		p.term()
 	}
-	return fmt.Errorf("line %d: object or array is not closed", start)
 }
 
 // makeConfSites are the variables clientconf.MakeConf assigns and the route
@@ -928,7 +965,9 @@ var (
 	makeAssign    = regexp.MustCompile(`^([^\s:?!+=]+)\s*([:?!+]?=)\s*(.*)$`)
 	makeDirective = regexp.MustCompile(`^\.\s*([a-z-]+)\s*(.*)$`)
 	makeReadonly  = regexp.MustCompile(`^\.(NO)?READONLY\s*:(.*)$`)
-	makeVarRef    = regexp.MustCompile(`\$(\{[^}]*\}?|\([^)]*\)?|.?)`)
+	// makeExportCompat is bmake's "export name=value" without the dot.
+	makeExportCompat = regexp.MustCompile(`^export\s+([^\s:?!+=]+\s*[:?!+]?=.*)$`)
+	makeVarRef       = regexp.MustCompile(`\$(\{[^}]*\}?|\([^)]*\)?|.?)`)
 	// servedEnvValue is the value the client check bodega serves gives
 	// distfilesEnvVar: one of two literal words whatever the drift is.
 	// TestCheckMakeConfWalksTheServedClientCheck holds it to distinfo.
@@ -1104,6 +1143,10 @@ type makeWalk struct {
 	// envFirstWhy names what passed it.
 	envFirst    int
 	envFirstWhy string
+	// group is whether a dependency line has opened a group that tab-led
+	// lines attach to: 1 yes, 0 no, -1 maybe. Only an assignment closes
+	// one; directives and includes, in either direction, leave it open.
+	group int
 	// envChanged says, per tracked variable, why the environment make
 	// consults may no longer hold what env recorded at the start.
 	envChanged map[string]string
@@ -1140,10 +1183,11 @@ type condFrame struct {
 	loop        bool
 }
 
-func (w *makeWalk) file(path string, stmts []string, unknown bool, stack []string) error {
+func (w *makeWalk) file(path string, stmts []makeStmt, unknown bool, stack []string) error {
 	stack = append(stack, path)
 	var frames []condFrame
-	for i, st := range stmts {
+	for i, stmt := range stmts {
+		st := stmt.text
 		// active is 1, 0 or -1 as for condFrame, across every open frame and
 		// the include that led here.
 		active := 1
@@ -1160,6 +1204,10 @@ func (w *makeWalk) file(path string, stmts []string, unknown bool, stack []strin
 			}
 		}
 
+		if stmt.recipe {
+			w.recipe(st, path, active)
+			continue
+		}
 		if m := makeDirective.FindStringSubmatch(st); m != nil {
 			dir, arg := m[1], strings.TrimSpace(m[2])
 			switch dir {
@@ -1228,11 +1276,11 @@ func (w *makeWalk) file(path string, stmts []string, unknown bool, stack []strin
 				}
 			case "undef":
 				w.undef(arg, path, active == -1)
-			case "export", "export-env", "export-literal", "unexport", "unexport-env":
+			case "export", "export-env", "export-literal", "export-all", "unexport", "unexport-env":
 				w.export(dir, arg, path)
 			case "info", "warning", "error":
 			default:
-				w.touch(st, "."+dir+" in "+path+" is a directive doctor does not evaluate")
+				w.pinAll("." + dir + " in " + path + " is a directive doctor does not evaluate")
 			}
 			continue
 		}
@@ -1240,35 +1288,37 @@ func (w *makeWalk) file(path string, stmts []string, unknown bool, stack []strin
 			continue
 		}
 
+		if m := makeExportCompat.FindStringSubmatch(st); m != nil {
+			w.exportCompat(st, m[1], path)
+			continue
+		}
 		if ro := makeReadonly.FindStringSubmatch(st); ro != nil {
+			w.setGroup(1, active)
 			w.readonly(st, path, ro[1] == "", strings.Fields(ro[2]), active == -1)
 			continue
 		}
 		m := makeAssign.FindStringSubmatch(st)
 		if m == nil {
-			switch mf := makeFlagsLine.FindStringSubmatch(st); {
-			case mf != nil:
-				w.applyFlags(parseMakeFlags(mf[2], false), "."+mf[1]+" in "+path, active == -1)
-			case makeFlagsTarget.MatchString(st):
-				w.pinAll(path + " passes make flags on " + st + ", which doctor does not read")
-			default:
-				// A dependency line: .READONLY, .MAKEFLAGS and .NOREADONLY can
-				// pin or release a variable for every line after them.
-				w.touch(st, "a line in "+path+" doctor does not evaluate names it: "+st)
-			}
+			w.dependency(st, path, active)
 			continue
 		}
+		w.setGroup(0, active)
 		name, op, val := m[1], m[2], m[3]
-		if strings.Contains(name, "$") {
-			for _, v := range w.sites {
-				if !v.readonly {
-					v.undetermined(path + " assigns the computed name " + name + ", which doctor does not expand")
-				}
+		switch {
+		case strings.Contains(name, "$"):
+			// The name may expand to one of make's own controls, the export
+			// list among them, so both a value and its precedence are open.
+			why := path + " assigns the computed name " + name + ", which doctor does not expand"
+			w.pinAll(why)
+			w.envMayChange(why)
+		case name == ".MAKE.EXPORTED":
+			w.envMayChange(path + " assigns .MAKE.EXPORTED, make's list of exported variables")
+		case strings.HasPrefix(name, "."):
+			w.pinAll(path + " assigns " + name + ", a variable make reads as a control doctor does not model")
+		default:
+			if v := w.sites[name]; v != nil {
+				w.assign(v, op, val, path, active == -1)
 			}
-			continue
-		}
-		if v := w.sites[name]; v != nil {
-			w.assign(v, op, val, path, active == -1)
 		}
 	}
 	if len(frames) > 0 {
@@ -1357,12 +1407,23 @@ func (w *makeWalk) undef(arg, path string, unknown bool) {
 func (w *makeWalk) export(dir, arg, path string) {
 	why := "." + strings.TrimSpace(dir+" "+arg) + " in " + path + " changes the environment make reads"
 	names := strings.Fields(arg)
-	all := dir == "unexport-env" || len(names) == 0 || strings.Contains(arg, "$")
+	all := dir == "unexport-env" || dir == "export-all" || len(names) == 0 || strings.Contains(arg, "$")
+	w.envChangedFor(why, func(n string) bool { return all || slices.Contains(names, n) })
+}
+
+// envMayChange records that an operation doctor does not replay may have
+// written any tracked variable into the environment: an assignment to the
+// export list, or to a name doctor cannot expand.
+func (w *makeWalk) envMayChange(why string) {
+	w.envChangedFor(why, func(string) bool { return true })
+}
+
+func (w *makeWalk) envChangedFor(why string, reaches func(string) bool) {
 	if w.envChanged == nil {
 		w.envChanged = map[string]string{}
 	}
 	for n, v := range w.sites {
-		if !all && !slices.Contains(names, n) {
+		if !reaches(n) {
 			continue
 		}
 		if _, ok := w.envChanged[n]; !ok {
@@ -1371,6 +1432,91 @@ func (w *makeWalk) export(dir, arg, path string) {
 		if v.env {
 			v.undetermined(why)
 		}
+	}
+}
+
+// exportCompat applies "export name=value", which bmake accepts for other
+// makes' sake: it assigns and exports, and leaves the dependency group as
+// it was, measured with bmake on 15.1. doctor does not model the assignment
+// half, so every variable it names is pinned, and a name doctor cannot
+// expand could be any of them.
+func (w *makeWalk) exportCompat(line, arg, path string) {
+	why := "export in " + path + " assigns and exports in a form doctor does not evaluate: " + line
+	if name, _, _ := strings.Cut(arg, "="); strings.Contains(name, "$") {
+		w.pinAll(why)
+	} else {
+		w.touch(line, why)
+	}
+	w.envMayChange(why)
+}
+
+// makeInertTargets are the special targets that attach attributes or
+// commands to other targets and change no variable, precedence or included
+// file. Every other special target (.OBJDIR, .PATH, .POSIX, .SHELL,
+// .SYSPATH and any bmake adds) is a control doctor does not model.
+var makeInertTargets = map[string]bool{
+	".BEGIN": true, ".DEFAULT": true, ".DELETE_ON_ERROR": true, ".END": true,
+	".ERROR": true, ".IGNORE": true, ".INTERRUPT": true, ".MAIN": true,
+	".NOPATH": true, ".NOTPARALLEL": true, ".NO_PARALLEL": true, ".ORDER": true,
+	".PHONY": true, ".PRECIOUS": true, ".SILENT": true, ".STALE": true,
+	".SUFFIXES": true, ".WAIT": true,
+}
+
+// dependency applies a line that is neither an assignment nor a directive.
+// bmake refuses one with no dependency operator ("Invalid line"). One with
+// an operator opens a dependency group, and its targets may be controls: a
+// target list doctor cannot expand, or a special target it does not model,
+// may have changed any tracked variable.
+func (w *makeWalk) dependency(line, path string, active int) {
+	targets, _, found := strings.Cut(line, ":")
+	if bang, _, ok := strings.Cut(line, "!"); ok && len(bang) < len(targets) {
+		targets, found = bang, true
+	}
+	switch {
+	case strings.Contains(targets, "$"):
+		w.pinAll(path + " has a dependency line whose targets doctor does not expand: " + line)
+	case !found:
+		w.problems = append(w.problems, path+" has a line make refuses as invalid: "+line)
+		return
+	}
+	w.setGroup(1, active)
+	if mf := makeFlagsLine.FindStringSubmatch(line); mf != nil {
+		w.applyFlags(parseMakeFlags(mf[2], false), "."+mf[1]+" in "+path, active == -1)
+		return
+	}
+	if makeFlagsTarget.MatchString(line) {
+		w.pinAll(path + " passes make flags on " + line + ", which doctor does not read")
+		return
+	}
+	for _, t := range strings.Fields(targets) {
+		if strings.HasPrefix(t, ".") && !makeInertTargets[t] {
+			w.pinAll(path + " names the special target " + t + ", a control doctor does not model: " + line)
+			return
+		}
+	}
+	w.touch(line, "a line in "+path+" doctor does not evaluate names it: "+line)
+}
+
+// setGroup records a line that opens (1) or closes (0) the dependency group
+// under a branch that is taken (active 1) or may be (-1).
+func (w *makeWalk) setGroup(to, active int) {
+	switch {
+	case active == 1:
+		w.group = to
+	case active == -1 && w.group != to:
+		w.group = -1
+	}
+}
+
+// recipe applies a tab-led line: a shell command, which assigns nothing, or
+// a fatal error when no dependency group is open.
+func (w *makeWalk) recipe(line, path string, active int) {
+	switch {
+	case active == 0 || w.group == 1:
+	case active == 1 && w.group == 0:
+		w.problems = append(w.problems, path+" has a tab-led line outside any target, which make refuses as an unassociated shell command: "+line)
+	default:
+		w.problems = append(w.problems, path+" has a tab-led line doctor cannot establish follows a target, and make refuses it if none is open: "+line)
 	}
 }
 
@@ -1522,6 +1668,13 @@ func parseMakeFlags(s string, bare bool) makeFlags {
 func (w *makeWalk) applyFlags(fl makeFlags, from string, unknown bool) {
 	if fl.unmodeled != "" {
 		w.pinAll(from + " passes " + fl.unmodeled + ", which doctor does not model")
+	}
+	for _, d := range append(append([]string(nil), fl.assigns...), fl.defines...) {
+		if n, _, _ := strings.Cut(d, "="); strings.HasPrefix(n, ".") {
+			why := from + " sets " + n + ", a variable make reads as a control doctor does not model"
+			w.pinAll(why)
+			w.envMayChange(why)
+		}
 	}
 	for _, n := range fl.assigns {
 		if v := w.sites[n]; v != nil {
@@ -1675,11 +1828,14 @@ func sitesAt(v, route string) bool {
 // whole of make.conf, so an assignment in a branch make skips, one it may
 // skip, and one a later .undef removed all fail here. makeWalk has already
 // read the file, so an unreadable one has already been reported.
-func checkInclude(root, confPath string, stmts []string, env *siteValue) string {
+func checkInclude(root, confPath string, stmts []makeStmt, env *siteValue) string {
 	if len(stmts) == 0 {
 		return "the file is empty, so it includes no client check"
 	}
-	last := stmts[len(stmts)-1]
+	last := stmts[len(stmts)-1].text
+	if stmts[len(stmts)-1].recipe {
+		return "the last line is " + last + ", which is tab-led, so make reads it as a shell command rather than an .include"
+	}
 	m := makeDirective.FindStringSubmatch(last)
 	if m == nil || (m[1] != "include" && m[1] != "sinclude" && m[1] != "-include" && m[1] != "dinclude") {
 		return "the last line is " + last + ", not an .include of the client check"
@@ -1715,12 +1871,30 @@ func oneWord(v string) bool {
 	return v != "" && !strings.ContainsAny(v, " \t$")
 }
 
+// makeStmt is one logical line of a makefile. recipe marks a line whose
+// first byte is a tab: bmake reads it as a shell command of the open
+// dependency group, or refuses the makefile when none is open, and never as
+// an assignment or a directive, measured with bmake on 15.1. A line indented
+// with a space, even one followed by a tab, is read like an unindented one.
+type makeStmt struct {
+	text   string
+	recipe bool
+}
+
 // makeStatements splits a makefile into logical lines: continuations
-// joined, comments and blank lines dropped. Conditionals are kept as
-// statements and not evaluated.
-func makeStatements(src string) []string {
-	var out []string
+// joined, comments and blank lines dropped, a tab-led line marked before
+// its indentation is trimmed. Conditionals are kept as statements and not
+// evaluated.
+func makeStatements(src string) []makeStmt {
+	var out []makeStmt
 	var cur strings.Builder
+	flush := func() {
+		raw := cur.String()
+		cur.Reset()
+		if s := strings.TrimSpace(stripMakeComment(raw)); s != "" {
+			out = append(out, makeStmt{text: s, recipe: strings.HasPrefix(raw, "\t")})
+		}
+	}
 	for _, l := range strings.Split(src, "\n") {
 		l = strings.TrimRight(l, "\r")
 		if strings.HasSuffix(l, "\\") {
@@ -1728,15 +1902,9 @@ func makeStatements(src string) []string {
 			continue
 		}
 		cur.WriteString(l)
-		s := stripMakeComment(cur.String())
-		cur.Reset()
-		if s = strings.TrimSpace(s); s != "" {
-			out = append(out, s)
-		}
+		flush()
 	}
-	if s := strings.TrimSpace(stripMakeComment(cur.String())); s != "" {
-		out = append(out, s)
-	}
+	flush()
 	return out
 }
 

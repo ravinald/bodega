@@ -1197,3 +1197,155 @@ func TestMakeConfDefineSelectsFile(t *testing.T) {
 		assertFinding(t, checkMakeConfLookup(root, "freebsd", lookup), StatusOK)
 	})
 }
+
+// Nested values pkg 2.8.4 was given on 15.1 under a key add_repo ignores,
+// in a file that also disables FreeBSD, with what pkg -vv reported: pkg
+// discards the whole file over a malformed nested value, leaving FreeBSD
+// enabled. doctor may decline a form pkg accepts, but never certify one pkg
+// rejects.
+func TestPkgNestedValuesMatchPkg(t *testing.T) {
+	for value, pkgAccepts := range map[string]bool{
+		`{ a: "x" }`: true, `{ a = x; b = y }`: true, `{ a x }`: true, `{ a: x, }`: true,
+		`{}`: true, "{ a: x\nb: y }": true, `{ a: x b: y }`: true, `[a, b]`: true, `[a b]`: true,
+		"[a\nb]": true, `[a, b,]`: true, `[a; b]`: true, `[]`: true, `{ a: [ { b: c } ] }`: true,
+		"{ a: b # c\n}": true, `{ a: /* c */ b }`: true, `{ a: { } }`: true, `[ { } ]`: true,
+		`{ "a": "b" }`: true, `{ a: "" }`: true, `[ "" ]`: true, `{ a { b: c } }`: true,
+		`[ , ]`: false, `{ a: b ]`: false, `[ a }`: false, `{ bad: }`: false, `{ garbage }`: false,
+		`{ bad: , }`: false, `{ bad: [ }`: false, `[ }`: false, `{ a: { b: } }`: false, `[ [ ] ]]`: false,
+	} {
+		for _, key := range []string{"ignored", "env"} {
+			t.Run(key+" "+value, func(t *testing.T) {
+				root := writeTree(t, map[string]string{
+					"/etc/pkg/FreeBSD.conf":                `FreeBSD: { url: "https://pkg.FreeBSD.org/x", enabled: yes }`,
+					"/usr/local/etc/pkg/repos/bodega.conf": "FreeBSD: { enabled: no, " + key + ": " + value + " }\nbodega: { url: \"https://b/freebsd/x/latest\" }\n",
+				})
+				got := checkPkgRepos(root, "freebsd")
+				// env must be an object, or add_repo refuses the override.
+				certify := pkgAccepts && (key != "env" || strings.HasPrefix(value, "{"))
+				switch {
+				case !certify && got.Status == StatusOK:
+					t.Fatalf("status = OK (%s); pkg leaves FreeBSD enabled", got.Detail)
+				case certify && got.Status != StatusOK:
+					t.Fatalf("status = %s (%s); pkg reads the disabling override", got.Status, got.Detail)
+				}
+			})
+		}
+	}
+	t.Run("malformed nested value in an included file", func(t *testing.T) {
+		root := writeTree(t, map[string]string{
+			"/etc/pkg/FreeBSD.conf":                `FreeBSD: { url: "https://pkg.FreeBSD.org/x", enabled: yes }`,
+			"/usr/local/etc/pkg/repos/bodega.conf": "bodega: { url: \"https://b/freebsd/x/latest\" }\n.include \"/usr/local/etc/pkg/off.inc\"\n",
+			"/usr/local/etc/pkg/off.inc":           "FreeBSD: { enabled: no, env: { bad: } }\n",
+		})
+		if got := checkPkgRepos(root, "freebsd"); got.Status == StatusOK {
+			t.Fatalf("status = OK (%s); pkg rejects bodega.conf with its include", got.Detail)
+		}
+	})
+	t.Run("forms doctor declines", func(t *testing.T) {
+		for _, value := range []string{`[a,,b]`, `{ a: b"c }`, `{ a: <<EOD` + "\nx\nEOD\n}", `{ .include "/x" }`} {
+			root := writeTree(t, map[string]string{
+				"/usr/local/etc/pkg/repos/bodega.conf": "bodega: { url: \"https://b/freebsd/x/latest\", other: " + value + " }\n",
+			})
+			assertFinding(t, checkPkgRepos(root, "freebsd"), StatusWarn, "doctor cannot establish which repositories pkg reads")
+		}
+	})
+}
+
+// Operations that write the environment without naming a site variable,
+// each measured with bmake on 15.1 or documented in its make(1): under -e a
+// recipe expands the environment, so a site exported from make.conf is what
+// fetch uses. The environment starts at bodega's route and make.conf sets
+// the mirror; doctor may certify only where nothing exported the mirror.
+func TestMakeConfEnvironmentControls(t *testing.T) {
+	site := "https://b/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/"
+	mirror := "MASTER_SITE_OVERRIDE=https://mirror.example/\nMASTER_SITE_BACKUP=https://mirror.example/\n"
+	for _, tc := range []struct {
+		name, conf, local, flags string
+		want                     Status
+	}{
+		{name: "no export", conf: mirror, flags: "-e", want: StatusOK},
+		{name: ".export-all", conf: mirror + ".export-all\n", flags: "-e", want: StatusWarn},
+		{name: ".MAKE.EXPORTED=", conf: mirror + ".MAKE.EXPORTED=MASTER_SITE_OVERRIDE MASTER_SITE_BACKUP\n", flags: "-e", want: StatusWarn},
+		{name: ".MAKE.EXPORTED+=", conf: mirror + ".MAKE.EXPORTED+=MASTER_SITE_OVERRIDE MASTER_SITE_BACKUP\n", flags: "-e", want: StatusWarn},
+		{name: ".MAKE.EXPORTED:=", conf: mirror + ".MAKE.EXPORTED:=MASTER_SITE_OVERRIDE MASTER_SITE_BACKUP\n", flags: "-e", want: StatusWarn},
+		{name: "computed export list", conf: "SITES=MASTER_SITE_OVERRIDE MASTER_SITE_BACKUP\n" + mirror + ".MAKE.EXPORTED=${SITES}\n", flags: "-e", want: StatusWarn},
+		{name: "computed variable name", conf: "L=.MAKE.EXPORTED\n" + mirror + "${L}=MASTER_SITE_OVERRIDE MASTER_SITE_BACKUP\n", flags: "-e", want: StatusWarn},
+		{name: "export name=value", conf: "export MASTER_SITE_OVERRIDE=https://mirror.example/\nexport MASTER_SITE_BACKUP=https://mirror.example/\n", flags: "-e", want: StatusWarn},
+		{name: ".export-all under an unknown conditional", conf: mirror + ".if defined(X)\n.export-all\n.endif\n", flags: "-e", want: StatusWarn},
+		{name: ".export-all under a skipped conditional", conf: mirror + ".if 0\n.export-all\n.endif\n", flags: "-e", want: StatusOK},
+		{name: ".export-all in an included file", conf: mirror + ".include \"/etc/local.mk\"\n", local: ".export-all\n", flags: "-e", want: StatusWarn},
+		{name: ".MAKE.EXPORTED in MAKEFLAGS", conf: mirror, flags: "-e .MAKE.EXPORTED=MASTER_SITE_OVERRIDE", want: StatusWarn},
+		{name: "another control variable", conf: mirror + ".MAKE.SAVE_DOLLARS=no\n", flags: "-e", want: StatusWarn},
+		{name: "a special target doctor does not model", conf: mirror + ".SHELL: name=sh\n", flags: "-e", want: StatusWarn},
+		{name: "a computed target", conf: "T=.MAKEFLAGS\n" + mirror + "${T}: -X\n", flags: "-e", want: StatusWarn},
+		{name: "an attribute target", conf: mirror + ".PHONY: fetch\n", flags: "-e", want: StatusOK},
+		{name: ".export-all without -e", conf: "MASTER_SITE_OVERRIDE=" + site + "\nMASTER_SITE_BACKUP=" + site + "\n.export-all\n", want: StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := writeTree(t, map[string]string{
+				"/etc/make.conf":              tc.conf + ".include \"" + clientconf.DistfilesCheckPath + "\"\n",
+				"/etc/local.mk":               tc.local,
+				clientconf.DistfilesCheckPath: "BODEGA_DISTFILES_ENV=abc\n",
+			})
+			env := map[string]string{"MAKEFLAGS": tc.flags, "MASTER_SITE_OVERRIDE": site, "MASTER_SITE_BACKUP": site}
+			lookup := func(k string) (string, bool) { v, ok := env[k]; return v, ok }
+			assertFinding(t, checkMakeConfLookup(root, "freebsd", lookup), tc.want)
+		})
+	}
+}
+
+// A tab-led line is a shell command of the open dependency group, whatever
+// it looks like, and bmake on 15.1 refuses one when no group is open. Only
+// an assignment closes a group; a leading space, even before a tab, makes an
+// ordinary line.
+func TestMakeConfRecipeLines(t *testing.T) {
+	site := "https://b/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/"
+	mirror := "MASTER_SITE_OVERRIDE=https://mirror.example/\nMASTER_SITE_BACKUP=https://mirror.example/\n"
+	safe := "MASTER_SITE_OVERRIDE=" + site + "\nMASTER_SITE_BACKUP=" + site + "\n"
+	indent := func(prefix, s string) string {
+		return prefix + strings.ReplaceAll(strings.TrimSuffix(s, "\n"), "\n", "\n"+prefix) + "\n"
+	}
+	check := "BODEGA_DISTFILES_ENV=abc\n"
+	for _, tc := range []struct {
+		name, conf, local, check string
+		want                     Status
+		detail                   string
+	}{
+		{name: "global assignments", conf: safe, want: StatusOK},
+		{name: "recipe assignments in make.conf", conf: mirror + "unused:\n" + indent("\t", safe), want: StatusWarn, detail: "mirror.example"},
+		{name: "recipe assignments in an included file", conf: mirror + "unused:\n.include \"/etc/local.mk\"\n", local: indent("\t", safe), want: StatusWarn, detail: "mirror.example"},
+		{name: "recipe assignments across an include's return", conf: mirror + ".include \"/etc/local.mk\"\n" + indent("\t", safe), local: "unused:\n", want: StatusWarn, detail: "mirror.example"},
+		{name: "recipe assignments under a conditional", conf: mirror + "unused:\n.if 1\n" + indent("\t", safe) + ".endif\n", want: StatusWarn, detail: "mirror.example"},
+		{name: "tab-led line with no target", conf: indent("\t", safe), want: StatusWarn, detail: "unassociated shell command"},
+		{name: "tab-led line after an assignment closed the group", conf: "unused:\nX=1\n" + indent("\t", safe), want: StatusWarn, detail: "unassociated shell command"},
+		{name: "tab-led line after a target make may skip", conf: ".if defined(X)\nunused:\n.endif\n" + indent("\t", safe), want: StatusWarn, detail: "cannot establish follows a target"},
+		{name: "space-led assignments after a target", conf: mirror + "unused:\n" + indent("  ", safe), want: StatusOK},
+		{name: "space then tab after a target", conf: mirror + "unused:\n" + indent(" \t", safe), want: StatusOK},
+		{name: "recipe-only client check definition", conf: safe, check: "unused:\n\tBODEGA_DISTFILES_ENV=abc\n", want: StatusWarn, detail: "does not define BODEGA_DISTFILES_ENV"},
+		{name: "a line with no operator", conf: safe + "foo bar\n", want: StatusWarn, detail: "refuses as invalid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := check
+			if tc.check != "" {
+				c = tc.check
+			}
+			root := writeTree(t, map[string]string{
+				"/etc/make.conf":              tc.conf + ".include \"" + clientconf.DistfilesCheckPath + "\"\n",
+				"/etc/local.mk":               tc.local,
+				clientconf.DistfilesCheckPath: c,
+			})
+			var detail []string
+			if tc.detail != "" {
+				detail = append(detail, tc.detail)
+			}
+			assertFinding(t, checkMakeConf(root, "freebsd", func(string) string { return "" }), tc.want, detail...)
+		})
+	}
+	t.Run("tab-led final include", func(t *testing.T) {
+		root := writeTree(t, map[string]string{
+			"/etc/make.conf":              safe + "unused:\n\t.include \"" + clientconf.DistfilesCheckPath + "\"\n",
+			clientconf.DistfilesCheckPath: check,
+		})
+		assertFinding(t, checkMakeConf(root, "freebsd", func(string) string { return "" }), StatusWarn, "shell command rather than an .include")
+	})
+}
