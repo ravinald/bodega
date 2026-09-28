@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/ravinald/bodega/internal/clientconf"
@@ -165,24 +166,60 @@ func checkGoproxy(getenv func(string) string, configDir func() (string, error)) 
 		}
 	}
 
+	reached := reachableProxies(val)
+	public, direct := "", false
+	for _, entry := range reached {
+		switch {
+		case entry == "direct":
+			direct = true
+		case public == "" && strings.Contains(entry, "proxy.golang.org"):
+			public = entry
+		}
+	}
+
 	switch {
 	case val == "":
 		f.Status = StatusWarn
 		f.Detail = "GOPROXY unset in the environment and the go env file; Go falls back to proxy.golang.org,direct which bypasses bodega"
 		f.Remediation = "go env -w GOPROXY=" + clientconf.GoProxy("http://<bodega>")
-	case strings.Contains(val, "proxy.golang.org"):
+	case len(reached) == 0:
 		f.Status = StatusWarn
-		f.Detail = "GOPROXY=" + val + " (from " + source + ") references proxy.golang.org directly"
+		f.Detail = "GOPROXY=" + strconv.Quote(val) + " (from " + source + ") lists no proxy; the go command refuses every module download"
+		f.Remediation = "go env -w GOPROXY=" + clientconf.GoProxy("http://<bodega>")
+	case public != "":
+		f.Status = StatusWarn
+		f.Detail = "GOPROXY=" + val + " (from " + source + ") reaches " + public + " directly"
 		f.Remediation = "remove proxy.golang.org from GOPROXY; keep only the bodega endpoint and ,off (not ,direct)"
-	case strings.Contains(val, ",direct"):
+	case direct:
 		f.Status = StatusWarn
-		f.Detail = "GOPROXY=" + val + " (from " + source + ") ends in ,direct; Go will fall through to upstream VCS on cache miss"
-		f.Remediation = "replace ,direct with ,off so cache misses fail loudly instead of bypassing bodega"
+		f.Detail = "GOPROXY=" + val + " (from " + source + ") reaches direct; Go fetches from upstream VCS instead of bodega"
+		f.Remediation = "replace direct with off so cache misses fail loudly instead of bypassing bodega"
 	default:
 		f.Status = StatusOK
 		f.Detail = "GOPROXY=" + val + " (from " + source + "; no fall-through to public upstreams)"
 	}
 	return f
+}
+
+// reachableProxies returns the GOPROXY entries the go command can reach, in
+// order, walking the list as cmd/go/internal/modfetch does: entries separated
+// by ',' or '|', each trimmed, empties skipped, and the walk ending at "off" or
+// "direct" inclusive, since nothing after either is ever consulted. The
+// separator only decides which errors fall through, and a fall-through to
+// direct or proxy.golang.org bypasses bodega either way.
+func reachableProxies(val string) []string {
+	var reached []string
+	for _, entry := range strings.FieldsFunc(val, func(r rune) bool { return r == ',' || r == '|' }) {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		reached = append(reached, entry)
+		if entry == "off" || entry == "direct" {
+			break
+		}
+	}
+	return reached
 }
 
 // goEnvFile is the file `go env -w` writes: $GOENV, or go/env under the user

@@ -89,6 +89,10 @@ func TestCheckGoproxyEnv(t *testing.T) {
 	lastWins := write("last", "GOPROXY=https://proxy.golang.org\nGOPROXY=http://bodega/go\n")
 	indented := write("indented", " GOPROXY=http://bodega/go\n")
 	emptied := write("emptied", "GOPROXY=\n")
+	fileDirect := write("direct", "GOPROXY=direct\n")
+	filePipe := write("pipe", "GOPROXY=http://bodega/go|direct\n")
+	fileSpaced := write("spaced", "GOPROXY=http://bodega/go , direct\n")
+	fileOffFirst := write("offfirst", "GOPROXY=http://bodega/go,off,direct\n")
 	cfgDir := filepath.Join(dir, "cfg")
 	if err := os.MkdirAll(filepath.Join(cfgDir, "go"), 0o700); err != nil {
 		t.Fatal(err)
@@ -108,6 +112,20 @@ func TestCheckGoproxyEnv(t *testing.T) {
 		{name: "direct fallthrough", env: map[string]string{"GOPROXY": "http://bodega/go,direct"}, want: StatusWarn},
 		{name: "references proxy.golang.org", env: map[string]string{"GOPROXY": "https://proxy.golang.org,direct"}, want: StatusWarn},
 		{name: "bodega-only with off", env: map[string]string{"GOPROXY": "http://bodega/go,off"}, want: StatusOK},
+		{name: "standalone direct", env: map[string]string{"GOPROXY": "direct"}, want: StatusWarn},
+		{name: "pipe fallback to direct", env: map[string]string{"GOPROXY": "http://bodega/go|direct"}, want: StatusWarn},
+		{name: "whitespace around direct", env: map[string]string{"GOPROXY": "http://bodega/go ,\tdirect "}, want: StatusWarn},
+		{name: "pipe fallback to proxy.golang.org", env: map[string]string{"GOPROXY": "http://bodega/go|https://proxy.golang.org"}, want: StatusWarn},
+		{name: "off stops the walk before direct", env: map[string]string{"GOPROXY": "http://bodega/go,off,direct"}, want: StatusOK},
+		{name: "off stops the walk before proxy.golang.org", env: map[string]string{"GOPROXY": "http://bodega/go|off|https://proxy.golang.org"}, want: StatusOK},
+		{name: "list with no entries", env: map[string]string{"GOPROXY": " , | "}, want: StatusWarn},
+		{name: "file: standalone direct", env: map[string]string{"GOENV": fileDirect}, want: StatusWarn},
+		{name: "file: pipe fallback to direct", env: map[string]string{"GOENV": filePipe}, want: StatusWarn},
+		{name: "file: whitespace around direct", env: map[string]string{"GOENV": fileSpaced}, want: StatusWarn},
+		{name: "file: off stops the walk before direct", env: map[string]string{"GOENV": fileOffFirst}, want: StatusOK},
+		{name: "environment direct overrides a safe file", env: map[string]string{"GOENV": good, "GOPROXY": "direct"}, want: StatusWarn},
+		{name: "environment pipe fallback overrides a safe file", env: map[string]string{"GOENV": good, "GOPROXY": "http://bodega/go|direct"}, want: StatusWarn},
+		{name: "safe environment overrides an unsafe file", env: map[string]string{"GOENV": fileDirect, "GOPROXY": "http://bodega/go"}, want: StatusOK},
 		{name: "env file via GOENV", env: map[string]string{"GOENV": good}, want: StatusOK},
 		{name: "env file at the default path", configDir: cfgDir, want: StatusOK},
 		{name: "environment overrides a safe file", env: map[string]string{"GOENV": good, "GOPROXY": "https://proxy.golang.org"}, want: StatusWarn},
@@ -159,9 +177,11 @@ func TestGoproxyCheckAcceptsTheRenderedEnvFile(t *testing.T) {
 		}
 	}
 
-	t.Setenv("GOPROXY", clientconf.GoProxy(base)+",direct")
-	if got := CheckGoproxyEnv(); got.Status != StatusWarn {
-		t.Errorf("unsafe environment override: got %v, want WARN (detail=%q)", got.Status, got.Detail)
+	for _, override := range []string{clientconf.GoProxy(base) + ",direct", clientconf.GoProxy(base) + "|direct", "direct"} {
+		t.Setenv("GOPROXY", override)
+		if got := CheckGoproxyEnv(); got.Status != StatusWarn {
+			t.Errorf("unsafe environment override %q: got %v, want WARN (detail=%q)", override, got.Status, got.Detail)
+		}
 	}
 }
 
