@@ -33,10 +33,6 @@ var (
 	reBarColors = regexp.MustCompile(`(?s)var barColors = \{(.*?)\}`)
 	reObjectKey = regexp.MustCompile(`(\w+)\s*:`)
 	reTypeRule  = regexp.MustCompile(`\.type-([a-z0-9_-]+)\s*\{`)
-	// getClientUrl's body, up to the first closing brace in column 0. Every
-	// brace inside the function is indented, so that is its end.
-	reClientURLFn = regexp.MustCompile(`(?s)\nfunction getClientUrl\(.*?\n\}`)
-	reSwitchCase  = regexp.MustCompile(`case '([a-z0-9_-]+)':`)
 	// The .field .val rule, excluding its .yes/.no/.url modifiers.
 	reFieldValRule = regexp.MustCompile(`(?s)\.field \.val\s*\{(.*?)\}`)
 )
@@ -455,54 +451,70 @@ func equalStrings(got, want []string) bool {
 	return true
 }
 
-// TestWebClientInstructionCoversEveryKnownType pins getClientUrl's switch to
-// manifest.AllTypes. The function shipped with seven arms and fell through to
-// "" for the eighth, and showEntry drops the row when the string is empty, so
-// a crate's detail panel was the one panel of eight with nothing to copy. The
-// switch is read out of the embedded asset for the same reason the tables
-// above are: //go:embed compiles the page without inspecting it.
-func TestWebClientInstructionCoversEveryKnownType(t *testing.T) {
-	src := webIndex(t)
-
-	body := reClientURLFn.FindString(src)
-	if body == "" {
-		t.Fatal("web/index.html: no getClientUrl function found; the test's regexp and the page have drifted")
+// TestPackageRouteRendersClientConfigForEveryKnownType pins the field the web
+// page renders to manifest.AllTypes. The page's own switch shipped with seven
+// arms and fell through to "" for the eighth, and the page drops the row when
+// there is nothing to show, so a crate's detail panel was the one panel of
+// eight with nothing to copy. The switch is gone and the server renders every
+// type through internal/clientconf; this holds it to answering for each one.
+func TestPackageRouteRendersClientConfigForEveryKnownType(t *testing.T) {
+	seeds := map[string]manifest.VersionEntry{
+		manifest.TypeApt:       {Version: "1.0"},
+		manifest.TypePypi:      {Version: "1.0"},
+		manifest.TypeGomod:     {Version: "v1.0.0"},
+		manifest.TypeNpm:       {Version: "1.0.0"},
+		manifest.TypeHelm:      {Version: "1.0.0"},
+		manifest.TypeGit:       {Ref: "v1.0.0"},
+		manifest.TypeBinary:    {Version: "1.0.0", Filename: "tool"},
+		manifest.TypeCargo:     {Version: "0.3.36"},
+		manifest.TypeFreeBSD:   {Version: "FreeBSD:14:amd64", URL: "https://pkg.freebsd.org/FreeBSD:14:amd64/latest"},
+		manifest.TypeDistfiles: {},
 	}
-	cases := map[string]bool{}
-	for _, m := range reSwitchCase.FindAllStringSubmatch(body, -1) {
-		cases[m[1]] = true
-	}
-	if len(cases) == 0 {
-		t.Fatal("web/index.html: getClientUrl has no case labels; the test's regexp and the page have drifted")
-	}
-
+	s := hostedServer(t)
 	for _, typ := range manifest.AllTypes {
-		if !cases[typ] {
-			t.Errorf("getClientUrl has no case for %q, so it falls through to \"\" and the detail panel drops the client-instruction row entirely", typ)
+		ve, ok := seeds[typ]
+		if !ok {
+			t.Fatalf("%s is in manifest.AllTypes with no seed here, so nothing asserts the page can render it", typ)
 		}
+		addVersion(t, s, typ, "pkg", ve)
+	}
+	for _, typ := range manifest.AllTypes {
+		t.Run(typ, func(t *testing.T) {
+			code, body := getStatusAndBody(t, s, "/api/v1/packages/"+typ+"/pkg")
+			if code != http.StatusOK {
+				t.Fatalf("read: %d %s", code, body)
+			}
+			files, _ := decodeJSON(t, body)["client_config"].([]any)
+			if len(files) == 0 {
+				t.Fatalf("client_config is empty for %s, so the detail panel drops the client row: %s", typ, body)
+			}
+			first := files[0].(map[string]any)
+			if first["content"] == "" || first["label"] == "" {
+				t.Errorf("client_config[0] for %s carries no content or no label: %v", typ, first)
+			}
+		})
+	}
+
+	// The version-scoped route is a manifest an operator copies back into
+	// pkg import, and carries no client_config.
+	code, body := getStatusAndBody(t, s, "/api/v1/packages/pypi/pkg/1.0")
+	if code != http.StatusOK {
+		t.Fatalf("read: %d %s", code, body)
+	}
+	if _, ok := decodeJSON(t, body)["client_config"]; ok {
+		t.Errorf("the version-scoped manifest carries client_config: %s", body)
 	}
 }
 
-// TestWebMultiLineClientInstructionWraps guards the CSS the moment a client
-// instruction stops being one line. cargo's is a three-line registry stanza,
-// and .field .val shipped with no white-space declaration, so the browser
-// collapsed it to a single line: the copy affordance handed over legal TOML
-// while the text on screen was a parse error, which is the worse half to get
-// wrong because retyping it is what docs/usage.md invites. text-align comes
-// with it because #detail computes to center, which every one-line value in
-// the pane's history hid. Conditional on a newline actually being in a case
-// body, so a page whose instructions are all single lines needs neither.
+// TestWebMultiLineClientInstructionWraps guards the CSS every client_config
+// value depends on. Most are whole files, and .field .val shipped with no
+// white-space declaration, so the browser collapsed cargo's stanza to a single
+// line: the copy affordance handed over legal TOML while the text on screen
+// was a parse error, which is the worse half to get wrong because retyping it
+// is what docs/usage.md invites. text-align comes with it because #detail
+// computes to center, which every one-line value in the pane's history hid.
 func TestWebMultiLineClientInstructionWraps(t *testing.T) {
 	src := webIndex(t)
-
-	body := reClientURLFn.FindString(src)
-	if body == "" {
-		t.Fatal("web/index.html: no getClientUrl function found; the test's regexp and the page have drifted")
-	}
-	if !strings.Contains(body, `\n`) {
-		t.Skip("no getClientUrl case emits a newline, so the pane has no multi-line value to wrap")
-	}
-
 	m := reFieldValRule.FindStringSubmatch(src)
 	if m == nil {
 		t.Fatal("web/index.html: no .field .val rule found; the test's regexp and the page have drifted")

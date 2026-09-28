@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/ravinald/bodega/internal/clientconf"
 )
 
 // publicUpstreams maps each package-manager check to the substrings that, if
@@ -134,7 +136,7 @@ func CheckGoproxyEnv() Finding {
 	case val == "":
 		f.Status = StatusWarn
 		f.Detail = "GOPROXY unset; Go falls back to proxy.golang.org,direct which bypasses bodega"
-		f.Remediation = "export GOPROXY=http://<bodega>/gomod"
+		f.Remediation = "export GOPROXY=" + clientconf.GoProxy("http://<bodega>")
 	case strings.Contains(val, "proxy.golang.org"):
 		f.Status = StatusWarn
 		f.Detail = "GOPROXY=" + val + " references proxy.golang.org directly"

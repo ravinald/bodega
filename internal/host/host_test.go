@@ -78,7 +78,7 @@ func TestCheckGoproxyEnv(t *testing.T) {
 		want  Status
 	}{
 		{name: "unset", unset: true, want: StatusWarn},
-		{name: "direct fallthrough", value: "http://bodega/gomod,direct", want: StatusWarn},
+		{name: "direct fallthrough", value: "http://bodega/go,direct", want: StatusWarn},
 		{name: "references proxy.golang.org", value: "https://proxy.golang.org,direct", want: StatusWarn},
 		{name: "bodega-only with off", value: "http://bodega/gomod,off", want: StatusOK},
 	}

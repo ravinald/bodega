@@ -197,7 +197,7 @@ func TestReadAPIWithholdsUserinfoInEveryForm(t *testing.T) {
 // API publishes. For a url with no path that segment was the authority, and the
 // object is still stored under it, so the link built from the public url has
 // to reach the stored object without the credential appearing anywhere the UI
-// reads. getClientUrl in web/index.html is reproduced here: entry.filename,
+// reads. The link is built the way the page used to build it: entry.filename,
 // else entry.url.split('/').pop().
 func TestBinaryDownloadLinkFromThePublicManifest(t *testing.T) {
 	for _, raw := range []string{
@@ -463,9 +463,10 @@ func TestBinaryDownloadLinksSurviveManifestEdits(t *testing.T) {
 	}
 }
 
-// pageClientURL runs the embedded page's own getClientUrl on one entry of a
-// captured read-API response, which is the link the web UI offers for it.
-func pageClientURL(t *testing.T, typ string, entry map[string]any) string {
+// pageClientURL runs the embedded page's own pickClientFiles on the
+// client_config h serves for entry's package, which is the link the web UI
+// offers for that entry, or "" for none.
+func pageClientURL(t *testing.T, h http.Handler, typ string, entry map[string]any) string {
 	t.Helper()
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -474,13 +475,19 @@ func pageClientURL(t *testing.T, typ string, entry map[string]any) string {
 		}
 		t.Skip("node not on PATH; the page's own JavaScript cannot be executed here")
 	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/v1/packages/"+typ+"/"+entry["name"].(string), nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("package route: %d %s", rr.Code, rr.Body)
+	}
 	src := webIndex(t)
 	start, end := strings.Index(src, "<script>"), strings.LastIndex(src, "</script>")
 	if start < 0 || end < 0 {
 		t.Fatal("web/index.html: no <script> block found")
 	}
 	script := strings.Replace(src[start+len("<script>"):end], "\ninit();\n", "\n", 1)
-	probe := "\nconsole.log(getClientUrl(process.env.PROBE_TYPE, JSON.parse(process.env.PROBE_ENTRY)));\n"
+	probe := "\nconst picked = pickClientFiles(process.env.PROBE_TYPE, JSON.parse(process.env.PROBE_ENTRY), JSON.parse(process.env.PROBE_PACKAGE).client_config);\n" +
+		"console.log(picked.length ? picked[0].content : '');\n"
 	path := filepath.Join(t.TempDir(), "client-url.cjs")
 	if err := os.WriteFile(path, []byte(domStub+script+probe), 0o600); err != nil {
 		t.Fatal(err)
@@ -490,10 +497,10 @@ func pageClientURL(t *testing.T, typ string, entry map[string]any) string {
 		t.Fatal(err)
 	}
 	cmd := exec.Command(node, path)
-	cmd.Env = append(os.Environ(), "PROBE_TYPE="+typ, "PROBE_ENTRY="+string(entryJSON))
+	cmd.Env = append(os.Environ(), "PROBE_TYPE="+typ, "PROBE_ENTRY="+string(entryJSON), "PROBE_PACKAGE="+rr.Body.String())
 	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("run getClientUrl: %v", err)
+		t.Fatalf("run pickClientFiles: %v", err)
 	}
 	return strings.TrimSpace(string(out))
 }
@@ -558,7 +565,7 @@ func TestBinaryAliasCarriesNoUserinfoWhateverTheURLEndsIn(t *testing.T) {
 				}
 			}
 
-			link := pageClientURL(t, manifest.TypeBinary, entry)
+			link := pageClientURL(t, s.Handler(), manifest.TypeBinary, entry)
 			if strings.Contains(link, "audit-user") || strings.Contains(link, "audit-secret") {
 				t.Fatalf("the web UI links to %s", link)
 			}
@@ -649,7 +656,7 @@ func TestBinaryAliasNeverBecomesAStoredName(t *testing.T) {
 		for _, v := range decodeJSON(t, rr.Body.String())["versions"].([]any) {
 			entry := v.(map[string]any)
 			entry["name"] = "tool"
-			_, path, ok := strings.Cut(pageClientURL(t, manifest.TypeBinary, entry), "/binaries/")
+			_, path, ok := strings.Cut(pageClientURL(t, srv.Handler(), manifest.TypeBinary, entry), "/binaries/")
 			if !ok {
 				t.Fatalf("the web UI offers no binary link for %v", entry)
 			}
@@ -782,7 +789,7 @@ func TestBinaryAliasKeepsItsEntrysBackend(t *testing.T) {
 		for _, v := range decodeJSON(t, body)["versions"].([]any) {
 			entry := v.(map[string]any)
 			entry["name"] = "tool"
-			_, path, ok := strings.Cut(pageClientURL(t, manifest.TypeBinary, entry), "/binaries/")
+			_, path, ok := strings.Cut(pageClientURL(t, s.Handler(), manifest.TypeBinary, entry), "/binaries/")
 			if !ok {
 				t.Fatalf("the web UI offers no binary link for %v", entry)
 			}
@@ -892,7 +899,7 @@ func TestPublicBinaryLinkKeepsItsEntryAcrossBackends(t *testing.T) {
 		for _, v := range decodeJSON(t, body)["versions"].([]any) {
 			entry := v.(map[string]any)
 			entry["name"] = "tool"
-			_, path, ok := strings.Cut(pageClientURL(t, manifest.TypeBinary, entry), "/binaries/")
+			_, path, ok := strings.Cut(pageClientURL(t, s.Handler(), manifest.TypeBinary, entry), "/binaries/")
 			if !ok {
 				t.Fatalf("the web UI offers no binary link for %v", entry)
 			}
@@ -994,7 +1001,7 @@ func assertNoPublishedBinaryLinks(t *testing.T, s *Server, when string) {
 			if !manifest.IsWithheldBinaryAlias(filename) {
 				t.Errorf("%s: entry %v is published as %q, not the withheld alias", when, entry, filename)
 			}
-			if link := pageClientURL(t, manifest.TypeBinary, entry); link != "" {
+			if link := pageClientURL(t, s.Handler(), manifest.TypeBinary, entry); link != "" {
 				t.Errorf("%s: the web UI offers %s for an entry the server cannot publish a link for", when, link)
 			}
 			path := "/binaries/" + pkg["name"].(string) + "/"

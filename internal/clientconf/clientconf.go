@@ -1,0 +1,327 @@
+// Package clientconf renders the configuration each package client reads to
+// reach a bodega instance: the file's content, and where that file lives on
+// each operating system a client runs.
+//
+// One renderer, for the reason internal/aptsources and internal/pkgrepos are
+// one renderer each. The TUI built its client lines in Go and the web page
+// built them again in JavaScript, and the two copies drifted together away
+// from everything else: both appended a direct fallback to GOPROXY, which
+// doctor flags as a bypass, and a [registries.bodega] cargo table that names a
+// registry without redirecting crates.io to it. apt and FreeBSD pkg delegate
+// to their own packages here rather than being rendered twice.
+package clientconf
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/ravinald/bodega/internal/aptsources"
+	"github.com/ravinald/bodega/internal/config"
+	"github.com/ravinald/bodega/internal/manifest"
+	"github.com/ravinald/bodega/internal/pkgrepos"
+)
+
+// Operating systems a path is given for. A client of bodega runs on one of
+// these, and each is a GOOS value so a caller can index by runtime.GOOS.
+const (
+	OSLinux   = "linux"
+	OSFreeBSD = "freebsd"
+	OSDarwin  = "darwin"
+)
+
+// File is one client configuration file.
+//
+// Paths maps an operating system to where the file belongs there, and holds
+// only the systems the client runs on: apt has no darwin path, make.conf has
+// only a freebsd one. A download link (a binary, a stored git bundle) is no
+// file at all, so its Paths is empty and Content is the URL.
+type File struct {
+	System string `json:"system"`
+
+	// Label names what Content is, for the row a pane shows it in. Most of
+	// these are not URLs, and a row reading "Package URL" over a TOML table
+	// sends an operator looking for something to curl.
+	Label string `json:"label"`
+
+	// Scope says which variant of a package this file configures, when a
+	// package has several: the apt suite, the FreeBSD ABI, the git ref, the
+	// filename the read API publishes for a binary entry. Empty when the file
+	// is the same for every version.
+	Scope string `json:"scope,omitempty"`
+
+	Paths   map[string]string `json:"paths,omitempty"`
+	Content string            `json:"content"`
+
+	// Notes are the consequences of the form Content took, which an operator
+	// has to read before installing it: apt's trust option, a placeholder
+	// host standing in for an unset public_url.
+	Notes []string `json:"notes,omitempty"`
+}
+
+// Path returns where the file belongs on goos, or "" when this client does
+// not run there.
+func (f File) Path(goos string) string { return f.Paths[goos] }
+
+// everywhere is a Paths map naming one path for every client OS.
+func everywhere(p string) map[string]string {
+	return map[string]string{OSLinux: p, OSFreeBSD: p, OSDarwin: p}
+}
+
+// GoProxy is the GOPROXY value for base, with no direct entry after it: that
+// fallback sends a module bodega does not hold straight to its VCS host,
+// which is the bypass doctor's goproxy-env check exists to report.
+func GoProxy(base string) string { return strings.TrimRight(base, "/") + "/go" }
+
+// Pip renders pip's global index-url.
+//
+// /etc/pip.conf on FreeBSD too. pip's global search there is
+// /etc/xdg/pip/pip.conf, /etc/pip.conf and sys.prefix/pip.conf, measured with
+// `pip config debug` from py312-pip 23.3.2 on 15.1-RELEASE; nothing reads
+// /usr/local/etc/pip.conf, so a file written there by the ports convention is
+// silently ignored.
+func Pip(base string) File {
+	return File{
+		System: manifest.TypePypi,
+		Label:  "pip.conf",
+		Paths: map[string]string{
+			OSLinux:   "/etc/pip.conf",
+			OSFreeBSD: "/etc/pip.conf",
+			OSDarwin:  "/Library/Application Support/pip/pip.conf",
+		},
+		Content: fmt.Sprintf("[global]\nindex-url = %s/pypi/simple/\n", trim(base)),
+	}
+}
+
+// Npm renders the registry line of a user .npmrc, the file `bodega doctor
+// --write-credentials` writes the path-scoped token into. The trailing slash
+// is what makes the registry match that token's //host/npm/ key.
+func Npm(base string) File {
+	return File{
+		System:  manifest.TypeNpm,
+		Label:   ".npmrc",
+		Paths:   everywhere("~/.npmrc"),
+		Content: fmt.Sprintf("registry=%s/npm/\n", trim(base)),
+	}
+}
+
+// Cargo renders the source replacement that redirects crates.io to bodega's
+// sparse index. A [registries.bodega] table alone names a second registry
+// and leaves every crates.io dependency fetching from crates.io.
+func Cargo(base string) File {
+	return File{
+		System: manifest.TypeCargo,
+		Label:  "Cargo config",
+		Paths:  everywhere("~/.cargo/config.toml"),
+		Content: fmt.Sprintf("[source.crates-io]\nreplace-with = \"bodega\"\n\n[source.bodega]\nregistry = \"sparse+%s/cargo/\"\n",
+			trim(base)),
+	}
+}
+
+// Gomod renders the go env file `go env -w` writes, which the toolchain reads
+// on every invocation, so no shell profile has to export anything.
+func Gomod(base string) File {
+	return File{
+		System: manifest.TypeGomod,
+		Label:  "Go env",
+		Paths: map[string]string{
+			OSLinux:   "~/.config/go/env",
+			OSFreeBSD: "~/.config/go/env",
+			OSDarwin:  "~/Library/Application Support/go/env",
+		},
+		Content: "GOPROXY=" + GoProxy(base) + "\n",
+	}
+}
+
+// Helm renders bodega's entry in helm's repositories.yaml, at the path helm
+// uses when neither HELM_REPOSITORY_CONFIG nor XDG_CONFIG_HOME is set. The
+// entry goes under the file's repositories: key; `bodega doctor
+// --write-credentials` writes it with the credential attached.
+func Helm(base string) File {
+	return File{
+		System: manifest.TypeHelm,
+		Label:  "Helm repository",
+		Paths: map[string]string{
+			OSLinux:   "~/.config/helm/repositories.yaml",
+			OSFreeBSD: "~/.config/helm/repositories.yaml",
+			OSDarwin:  "~/Library/Preferences/helm/repositories.yaml",
+		},
+		Content: fmt.Sprintf("- name: bodega\n  url: %s/helm\n", trim(base)),
+	}
+}
+
+// Git renders one url.<base>/git/<namespace>/.insteadOf per git_upstreams
+// entry, sorted by namespace so two renders of one config are byte-identical.
+// A clone of the upstream URL is then rewritten onto bodega's smart-HTTP
+// route with nothing else in the client changed. Content is empty when no
+// namespace is configured: there is no route to rewrite onto.
+func Git(base string, upstreams map[string]config.GitUpstream) File {
+	names := make([]string, 0, len(upstreams))
+	for ns := range upstreams {
+		names = append(names, ns)
+	}
+	sort.Strings(names)
+	var sb strings.Builder
+	for _, ns := range names {
+		fmt.Fprintf(&sb, "[url \"%s/git/%s/\"]\n\tinsteadOf = %s\n", trim(base), ns, upstreams[ns].URL)
+	}
+	return File{
+		System:  manifest.TypeGit,
+		Label:   "Git config",
+		Paths:   everywhere("~/.gitconfig"),
+		Content: sb.String(),
+	}
+}
+
+// DistfilesCheckPath is where the client check fetched from
+// /distfiles/@environment.mk is installed, and what MakeConf includes.
+const DistfilesCheckPath = "/usr/local/etc/bodega-distfiles.mk"
+
+// MakeConf renders the ports distfiles sites. Both, because MASTER_SITE_BACKUP
+// defaults to distcache.FreeBSD.org and is the last site do-fetch.sh tries.
+// The .include is last so the check sees every assignment above it.
+func MakeConf(base string) File {
+	site := trim(base) + "/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/"
+	return File{
+		System: manifest.TypeDistfiles,
+		Label:  "make.conf",
+		Paths:  map[string]string{OSFreeBSD: "/etc/make.conf"},
+		Content: "MASTER_SITE_OVERRIDE?= " + site + "\n" +
+			"MASTER_SITE_BACKUP?= " + site + "\n" +
+			".include \"" + DistfilesCheckPath + "\"\n",
+	}
+}
+
+// AptSourcesPath is where a client installs the deb822 stanza.
+const AptSourcesPath = "/etc/apt/sources.list.d/bodega.sources"
+
+// Apt wraps a stanza aptsources rendered, with its notes. The caller renders
+// it because only the caller knows the suite, the signing state and whether
+// the codename is mirrored.
+func Apt(src aptsources.Sources) File {
+	return File{
+		System:  manifest.TypeApt,
+		Label:   "Sources",
+		Scope:   src.Suite,
+		Paths:   map[string]string{OSLinux: AptSourcesPath},
+		Content: src.Deb822 + "\n",
+		Notes:   src.Notes,
+	}
+}
+
+// FreeBSD wraps a repository file pkgrepos rendered, overrides included.
+func FreeBSD(repo pkgrepos.Repo) File {
+	return File{
+		System:  manifest.TypeFreeBSD,
+		Label:   "Repository conf",
+		Scope:   repo.ABI,
+		Paths:   map[string]string{OSFreeBSD: pkgrepos.ClientConfPath},
+		Content: repo.Conf,
+	}
+}
+
+// BinaryLink is one binary entry's path under /binaries/, as
+// manifest.BinaryLinkName resolves it. Filename is the name the read API
+// publishes for the entry and becomes the file's Scope: two entries of one
+// version on different backends share the version, and scoping by it would
+// hand one entry's page the other's bytes.
+type BinaryLink struct {
+	Filename string
+	Path     string
+}
+
+// Binary renders a binary's download URL. A binary is fetched, not
+// configured, so its File carries no path.
+func Binary(base string, link BinaryLink) File {
+	return File{
+		System:  manifest.TypeBinary,
+		Label:   "Package URL",
+		Scope:   link.Filename,
+		Content: trim(base) + "/binaries/" + link.Path,
+	}
+}
+
+// GitBundle is one git entry version that `bodega build fetch git` stored.
+type GitBundle struct {
+	Name    string
+	Ref     string
+	Release bool
+}
+
+// GitBundleURL renders the download URL of a stored git entry: a bundle, or a
+// tarball for a release. It sits beside Git rather than replacing it, because
+// the bundle is served with no git_upstreams configured and the insteadOf
+// rewrite is not.
+func GitBundleURL(base string, b GitBundle) File {
+	ext := ".bundle"
+	if b.Release {
+		ext = ".tar.gz"
+	}
+	sn := strings.ReplaceAll(b.Name, "/", "--")
+	return File{
+		System:  manifest.TypeGit,
+		Label:   "Package URL",
+		Scope:   b.Ref,
+		Content: fmt.Sprintf("%s/git/%s/%s-%s%s", trim(base), sn, sn, b.Ref, ext),
+	}
+}
+
+// Inputs are the facts a type's rendering needs beyond the base URL. Apt and
+// FreeBSD arrive rendered, because their state differs between the running
+// server and the TUI's view of the key files, and each resolves its own.
+type Inputs struct {
+	Base         string
+	GitUpstreams map[string]config.GitUpstream
+	GitBundles   []GitBundle
+	Apt          []aptsources.Sources
+	FreeBSD      []pkgrepos.Repo
+	Binary       []BinaryLink
+}
+
+// ForType renders every file a client of entryType installs. It is the one
+// mapping from a package type to its renderer, so the TUI and the server
+// cannot disagree about which file a type gets. A file with no content is
+// left out.
+func ForType(entryType string, in Inputs) []File {
+	var out []File
+	switch entryType {
+	case manifest.TypePypi:
+		out = append(out, Pip(in.Base))
+	case manifest.TypeNpm:
+		out = append(out, Npm(in.Base))
+	case manifest.TypeCargo:
+		out = append(out, Cargo(in.Base))
+	case manifest.TypeGomod:
+		out = append(out, Gomod(in.Base))
+	case manifest.TypeHelm:
+		out = append(out, Helm(in.Base))
+	case manifest.TypeGit:
+		out = append(out, Git(in.Base, in.GitUpstreams))
+		for _, b := range in.GitBundles {
+			out = append(out, GitBundleURL(in.Base, b))
+		}
+	case manifest.TypeDistfiles:
+		out = append(out, MakeConf(in.Base))
+	case manifest.TypeApt:
+		for _, src := range in.Apt {
+			out = append(out, Apt(src))
+		}
+	case manifest.TypeFreeBSD:
+		for _, repo := range in.FreeBSD {
+			out = append(out, FreeBSD(repo))
+		}
+	case manifest.TypeBinary:
+		for _, l := range in.Binary {
+			out = append(out, Binary(in.Base, l))
+		}
+	}
+	kept := out[:0]
+	for _, f := range out {
+		if f.Content != "" {
+			kept = append(kept, f)
+		}
+	}
+	return kept
+}
+
+func trim(base string) string { return strings.TrimRight(base, "/") }

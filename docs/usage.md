@@ -3190,16 +3190,16 @@ fetch > run > package > upload
 
 ### Client configuration
 
-Each client reads its own configuration file, and this section shows what to put in each one. Two of them can be written for you today, both by `bodega doctor` on the client host (see [`bodega doctor`](#bodega-doctor---write-credentials---token-token---url-url---write-apt-sources---suite-codename---write-pkg-repo---abi-abi---release-n)):
+Each client reads its own configuration file, and this section shows each one as bodega renders it, with `https://bodega-host:8080` standing in for your `public_url`. The TUI and the web dashboard show the file for a selected package, and `GET /api/v1/packages/{type}/{name}` serves it as [`client_config`](#client_config-on-get-apiv1packagestypename); all three render through one package, so they cannot disagree. Two of them can be written for you today, both by `bodega doctor` on the client host (see [`bodega doctor`](#bodega-doctor---write-credentials---token-token---url-url---write-apt-sources---suite-codename---write-pkg-repo---abi-abi---release-n)):
 
 | Client                         | Written by                                                         | What bodega composes                                                                                                                                  |
 | ------------------------------ | ------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
 | apt                            | `doctor --write-apt-sources`                                       | the keyring and a `bodega.sources` stanza for the suite this host's profile reads                                                                     |
 | FreeBSD `pkg`                  | `doctor --write-pkg-repo`                                          | `/usr/local/etc/pkg/repos/bodega.conf`, including the overrides that disable upstream                                                                 |
-| pip, npm, cargo, Go, helm, git | hand, from the stanzas below                                       | the client line shown in the TUI and web dashboard; `--write-credentials` places the token each one reads, and for helm also registers the repository |
-| FreeBSD ports (`make.conf`)    | hand, from [Mirroring ports distfiles](#mirroring-ports-distfiles) | the client check at `/distfiles/@environment.mk`                                                                                                      |
+| pip, npm, cargo, Go, helm, git | hand, from the files below                                         | each file below; `--write-credentials` places the token each one reads, and for helm also registers the repository                                    |
+| FreeBSD ports (`make.conf`)    | hand, from the lines below                                         | the sites, and the client check at `/distfiles/@environment.mk`; see [Mirroring ports distfiles](#mirroring-ports-distfiles)                          |
 
-Both writers need the `bodega` binary on the client, and each run performs one write. **Planned, not built yet** ([#50](https://github.com/ravinald/bodega/issues/50), [#51](https://github.com/ravinald/bodega/issues/51), [#52](https://github.com/ravinald/bodega/issues/52)): the server serving each client's rendered file and a plan of which ones a host should use, worked out from the host's identity and profile, plus a setup script served by bodega that applies a chosen subset of that plan on a host without the binary. Until then, a fleet without the binary copies these files through its own configuration management.
+Both writers need the `bodega` binary on the client, and each run performs one write. **Planned, not built yet** ([#51](https://github.com/ravinald/bodega/issues/51), [#52](https://github.com/ravinald/bodega/issues/52)): the server serving each client's rendered file and a plan of which ones a host should use, worked out from the host's identity and profile, plus a setup script served by bodega that applies a chosen subset of that plan on a host without the binary. Until then, a fleet without the binary copies these files through its own configuration management.
 
 **APT** (`/etc/apt/sources.list.d/bodega.sources`), against a signed repository:
 
@@ -3211,7 +3211,7 @@ Components: main
 Signed-By: /etc/apt/keyrings/bodega-archive-keyring.gpg
 ```
 
-The stanza above is the template, not the values. Your instance prints its own on the `bodega serve` startup banner and serves it on `GET /api/v1/status`, filled in from what the running process holds: the suites it answers for, the URL from `public_url`, and `Signed-By:` or the `[trusted=yes]` fallback according to whether a signing key is loaded. Copy that one. The web UI shows the block it read from this endpoint, so it cannot disagree with the server. The TUI renders through the same renderer but supplies the signing state from the key file rather than the process, which is the one axis where the two can differ — see [Details pane](#details-pane).
+The stanza above is the template, not the values. Your instance prints its own on the `bodega serve` startup banner and serves it on `GET /api/v1/status`, filled in from what the running process holds: the suites it answers for, the URL from `public_url`, and `Signed-By:` or the `[trusted=yes]` fallback according to whether a signing key is loaded. Copy that one. The web UI shows the block `client_config` carries for the package, which the server picks from the same list, so it cannot disagree with the server. The TUI renders through the same renderer but supplies the signing state from the key file rather than the process, which is the one axis where the two can differ — see [Details pane](#details-pane).
 
 Install the keyring first. The `.gpg` route serves the dearmored form `Signed-By:` takes directly, so the client needs no `gpg` binary:
 
@@ -3238,32 +3238,41 @@ No `Signed-By:`, no `Trusted: yes`. bodega proxies the upstream `dists/` tree un
 
 See [Signing the apt repository](#signing-the-apt-repository) below for creating the key, rotating it, what the signature does and does not prove, and the `[trusted=yes]` fallback for a repository with no key of its own.
 
-**pip** (per-command or `pip.conf`):
+**pip** (`/etc/pip.conf` on Linux and FreeBSD, `/Library/Application Support/pip/pip.conf` on macOS):
 
-```bash
-pip install --index-url https://bodega-host:8080/pypi/simple/ <package>
+```ini
+[global]
+index-url = https://bodega-host:8080/pypi/simple/
 ```
+
+FreeBSD is not an exception to `/etc`. pip reads `/etc/xdg/pip/pip.conf`, `/etc/pip.conf` and `/usr/local/pip.conf` there, and nothing reads `/usr/local/etc/pip.conf`, where the ports convention would put it (measured with `pip config debug`, `py312-pip` 23.3.2 on 15.1-RELEASE). For one command, `pip install --index-url https://bodega-host:8080/pypi/simple/ <package>` does the same.
 
 `/pypi/simple/<name>/` lists the wheels in storage, filtered to the versions the manifest entry names under its `version_constraint`. A distribution with no entry of its own is listed unfiltered: it arrives as somebody else's transitive dependency and the resolved closure is what pins it.
 
-**Go modules**:
+**Go modules** (`~/.config/go/env` on Linux and FreeBSD, `~/Library/Application Support/go/env` on macOS):
 
-```bash
-export GOPROXY=https://bodega-host:8080/go
-go get example.com/example-corp/widget-sdk@v1.30.0
+```text
+GOPROXY=https://bodega-host:8080/go
 ```
 
-**Helm**:
+That is the file `go env -w GOPROXY=https://bodega-host:8080/go` writes, and the toolchain reads it on every run, so no shell profile has to export anything. The value has no `direct` entry after it: with one, a module bodega does not hold is fetched straight from its VCS host, and `bodega doctor` reports that as a bypass.
 
-```bash
-helm repo add bodega https://bodega-host:8080/helm
+**Helm** (the `repositories:` list in `~/.config/helm/repositories.yaml` on Linux and FreeBSD, `~/Library/Preferences/helm/repositories.yaml` on macOS):
+
+```yaml
+- name: bodega
+  url: https://bodega-host:8080/helm
 ```
 
-**npm** (per-command or `.npmrc`):
+`helm repo add bodega https://bodega-host:8080/helm` writes the same entry. The paths are helm's defaults and move with `HELM_REPOSITORY_CONFIG` or `XDG_CONFIG_HOME`.
 
-```bash
-npm install --registry https://bodega-host:8080/npm <package>
+**npm** (`~/.npmrc`):
+
+```ini
+registry=https://bodega-host:8080/npm/
 ```
+
+The trailing slash matters: it is what matches the `//bodega-host:8080/npm/:_authToken=` line `bodega doctor --write-credentials` writes into the same file. For one command, `npm install --registry https://bodega-host:8080/npm/ <package>`.
 
 bodega rewrites every `dist.tarball` in a packument onto its own `/npm/` route before serving it. Relayed as upstream wrote them, those URLs name `registry.npmjs.org`, and npm's resolver replaces the origin while keeping the upstream path — so the client asks for `/<package>/-/<file>.tgz` with the `/npm` prefix dropped and gets a 404. On a deployment where that path happened to resolve it would get the tarball from a request bodega never sees, past the hidden-package and hidden-version checks, the version constraint, the audit row, the checksum and the cache.
 
@@ -3275,7 +3284,7 @@ Each version's `dependencies` come from `package/package.json` inside the tarbal
 
 `dist.integrity` is the sha256 of the bytes the fetch stage stored, which is what npm verifies the download against. The digest an entry's `checksum` declares answers a different question — what upstream or the operator said the version should be — so where the two records disagree the key is omitted and both are logged at error. The version stays resolvable and installable: npm installs one carrying no `integrity`, and that is the difference between an operator reading a log line and a user meeting `EINTEGRITY` on a download that was not corrupt.
 
-**cargo** (`.cargo/config.toml`, since a sparse registry is named in a file rather than on the command line):
+**cargo** (`~/.cargo/config.toml`, since a sparse registry is named in a file rather than on the command line):
 
 ```toml
 [source.crates-io]
@@ -3291,13 +3300,28 @@ A crate an entry names gets the same treatment as npm, on the same terms: the sp
 
 **Gap:** a generated index line declares `features: {}`. bodega records no cargo feature table, so a crate whose dependency needs a named feature resolves and downloads but may not compile. Recording the feature map is the same mechanism as `deps` and waits on nothing but the work.
 
-**git** (a `git_upstreams` namespace, clone URL ending in `.git`):
+**git** (`~/.gitconfig`), one `insteadOf` per [`git_upstreams`](design.md#git-upstreams) namespace:
 
-```bash
-git clone https://bodega-host:8080/git/github/octocat/Hello-World.git
+```ini
+[url "https://bodega-host:8080/git/github/"]
+	insteadOf = https://github.com/
 ```
 
-See [Git smart-HTTP](#git-smart-http) for what bodega does with that request.
+git rewrites any URL starting with the `insteadOf` value onto the `url` before it connects, so `git clone https://github.com/octocat/Hello-World.git` clones from `https://bodega-host:8080/git/github/octocat/Hello-World.git` with nothing else changed. `git config --global url.https://bodega-host:8080/git/github/.insteadOf https://github.com/` writes the same entry. bodega renders one section per namespace, sorted by name, and none when `git_upstreams` is empty. The clone URL still has to end in `.git`, as it does against a forge. See [Git smart-HTTP](#git-smart-http) for what bodega does with that request.
+
+A git entry `bodega build fetch git` stored is also a download: `https://bodega-host:8080/git/<name>/<name>-<ref>.bundle`, or `.tar.gz` for a release, with each `/` in the name written `--`. The TUI and the web UI show that link beside the `insteadOf` file.
+
+**FreeBSD ports** (`/etc/make.conf`):
+
+```make
+MASTER_SITE_OVERRIDE?= https://bodega-host:8080/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/
+MASTER_SITE_BACKUP?= https://bodega-host:8080/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/
+.include "/usr/local/etc/bodega-distfiles.mk"
+```
+
+The `.include` is the client check fetched from `/distfiles/@environment.mk`, and it stays last so it sees every line above it. See [Client side, HTTP](#client-side-http) for why both sites are set and what the check measures.
+
+**Binaries** are downloaded rather than configured. The TUI and the web UI show each entry's link, `https://bodega-host:8080/binaries/<name>/<version>/~/<tag>/<display>`; see [Credentials in a manifest](#credentials-in-a-manifest) for the alias.
 
 #### Naming the host in the audit trail
 
@@ -4427,7 +4451,7 @@ All API responses are JSON. The full API is documented in [OpenAPI 3.0 format](.
 | ------ | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | GET    | `/api/v1/packages`                         | All entries across all types                                                                                                                                                            |
 | GET    | `/api/v1/packages/{type}`                  | Entries for one type                                                                                                                                                                    |
-| GET    | `/api/v1/packages/{type}/{name}`           | Single entry details                                                                                                                                                                    |
+| GET    | `/api/v1/packages/{type}/{name}`           | Single entry details, with `client_config`: what a client of the package installs. See [`client_config`](#client_config-on-get-apiv1packagestypename)                               |
 | GET    | `/api/v1/packages/{type}/{name}/{version}` | One version, as a manifest scoped to it. Carries the `vetting.osv.*` keys on `metadata`                                                                                                 |
 | GET    | `/api/v1/status`                           | Health check with entry counts, one storage probe row per backend, and the apt client state                                                                                             |
 | GET    | `/api/v1/config`                           | Non-sensitive config (bucket, region, manifest_dir)                                                                                                                                     |
@@ -4472,6 +4496,33 @@ An apt entry's `Architecture`, `_pool_path`, `_md5`, `_sha1` and `_sha256` do no
 `metadata.attestation_uri` does not take a credential. `GET /api/v1/packages/{type}/{name}/{version}/attestation` answers an `http://` or `https://` uri with a 302 whose `Location` is the uri as written, and the client, not bodega, makes the fetch, so a credential in it would go to every caller, and cutting it out would break the fetch the endpoint exists for. `bodega pkg import`, `bodega pkg edit` and `POST /api/v1/packages` refuse an `http(s)` `attestation_uri` carrying userinfo, a query or a fragment, and the endpoint answers one already stored with `502 attestation_uri is not redirectable` and logs `attestation_uri carries userinfo, a query or a fragment` with the type, package and version, never the uri. Host the envelope where a plain URL reaches it, or on a backend bodega configures and name it `s3://<bucket>/<key>`: bodega reads that with its own credentials and returns the bytes, and the client never sees a credential.
 
 **Upgrading past the query and metadata cut.** Nothing refuses to start. The one package that stops being served is an apt entry whose `Architecture`, `_pool_path`, `_md5`, `_sha1` or `_sha256` is a URL carrying userinfo, a query or a fragment: that version leaves the apt index at the first rebuild after the upgrade, so clients see it as absent, and the rebuild log names it. Correct it with `bodega pkg edit`, which refuses to save the package until it is gone, and rotate the credential. A `url` carrying a query-string token keeps fetching as before; the read routes and the web UI now show it without the query, and a binary entry's published `<display>` name loses the query it used to carry. Its alias tag does not change, so a saved alias link keeps resolving. A URL in `metadata` is published cut on the read routes and in the apt `Packages` stanza, so the next index rebuild changes any stanza with such a value, `Homepage` fragments included. An entry whose `attestation_uri` is an `http(s)` uri with userinfo, a query or a fragment keeps serving its package; only its attestation route answers 502 until the uri is rewritten, and `bodega pkg edit` of that package refuses to save any change until it is. A manifest re-imported from the read API arrives without the query of its `url`, so an upstream that wants a query-string token gets an anonymous fetch; import from `manifest_dir` instead. A query-string token or metadata credential the read API published before this change has been readable by anyone who could reach the server: rotate it at the upstream.
+
+#### `client_config` on `GET /api/v1/packages/{type}/{name}`
+
+The package route carries the client configuration for the package beside the manifest's own keys: one object per file a client installs, rendered by the server through the renderer the TUI also uses (`internal/clientconf`). The web UI shows these objects and builds no client line of its own. For a `pypi` package:
+
+```json
+"client_config": [
+  {
+    "system": "pypi",
+    "label": "pip.conf",
+    "paths": {
+      "linux": "/etc/pip.conf",
+      "freebsd": "/etc/pip.conf",
+      "darwin": "/Library/Application Support/pip/pip.conf"
+    },
+    "content": "[global]\nindex-url = https://bodega.example.com/pypi/simple/\n"
+  }
+]
+```
+
+- `content` is the file, or the lines to add to it, as [Client configuration](#client-configuration) shows each one. For a binary, and for a stored git bundle, it is the download URL instead, and `paths` is absent.
+- `paths` maps an operating system (`linux`, `freebsd`, `darwin`) to where the file belongs there. A system the client does not run on has no key: `apt` has `linux` alone, `freebsd` and `make.conf` have `freebsd` alone. A path starting `~/` is in the home directory of the user who runs the client.
+- `scope` names the variant a file configures when a package has several: one object per served suite the apt package is published to, per FreeBSD ABI, per git ref, per binary entry (by the `filename` this route publishes for it). It is absent for a file that is the same for every version.
+- `notes` are the consequences of the form `content` took, the same list the `apt` block below carries for the stanza.
+- The base URL is the one `public_url` names, or the origin of the request when none is set, the same rule every other client-facing URL follows.
+- A hidden package gets an empty list: its routes answer 404, so configuration for it points a client at nothing. A server with no pepper publishes no binary download link, for the reason given under [Credentials in a manifest](#credentials-in-a-manifest).
+- `GET /api/v1/packages/{type}/{name}/{version}` does not carry `client_config`. Its body is a manifest scoped to one version, and an operator copies it back into `bodega pkg import`.
 
 #### The `apt` block on `/api/v1/status`
 
@@ -5046,24 +5097,14 @@ The form edits no ACL. `deny_list`, `admin_permit_cidr` and `trusted_proxies` ar
 
 Two fields report where an entry's bytes are. **Stored** answers whether the probe found the primary artifact and names the backend it looked on (`yes (backend default)`); **Object** prints that object's URI, prefixed with the backend's own label — `file://<storage_path>` for a local backend, `s3://<bucket>` for an s3 one. Both read the backend the manifest entry records, so a local-only install reports its own disk rather than a bucket it never configured. Neither field is derived from `bucket`: an install carrying a leftover `bucket` key alongside `"storage_backend": "local"` printed an `s3://` URI over bytes on its own disk through v1.
 
-The last field of an entry is the client instruction, and its label names the format rather than assuming a URL: **Sources line** for apt, **Registry stanza** for cargo, **Repository conf** for freebsd, **Package URL** for the other seven. All three carry the base URL `public_url` and the TLS pair resolve to, so a pane behind a terminating proxy prints what a client outside it reaches.
+The last fields of an entry are its client configuration: the file a client of that type installs, as [Client configuration](#client-configuration) shows it, with a **Path** row under it naming where the file goes on each operating system. The label names the file rather than assuming a URL: **pip.conf**, **.npmrc**, **Cargo config**, **Go env**, **Helm repository**, **Git config**, **make.conf**, **Sources** for apt, **Repository conf** for freebsd. A binary, and a git entry's stored bundle, get a **Package URL** instead, which has no path. The pane renders through the same package as `client_config` on `GET /api/v1/packages/{type}/{name}` and the web dashboard, and every value carries the base URL `public_url` and the TLS pair resolve to, so a pane behind a terminating proxy prints what a client outside it reaches. A type with several variants shows one: the suite described below for apt, the first ABI that renders for freebsd, the first version for a binary or a git bundle.
 
-cargo is the one type whose instruction is a file rather than a command. A client reaches the sparse index only once `.cargo/config.toml` names it as a registry, so the field carries the stanza and the command that uses it as one value:
+A multi-line value is rendered one source line per row and never reflowed, so a pane too narrow for a line cuts it at the right edge instead of wrapping it. The pane offers nothing to copy, so what an operator reads is what they retype: a wrapped `registry = "..."` is a TOML parse error, and cargo reports it against their config file rather than against the pane. Widening the terminal is the fix. Do not count on the cut announcing itself: it can take a closing quote and nothing else, leaving a line that reads as finished and parses as an unterminated string.
 
-```toml
-[registries.bodega]
-index = "sparse+https://bodega.example.com/cargo/"
-# cargo add --registry bodega <crate>
-```
-
-The command is a TOML comment because the web dashboard's copy affordance copies the field verbatim and its destination is that config file: a bare shell line pasted there fails the parse. Uncomment it, or retype it at a prompt.
-
-In the TUI the stanza's three lines are rendered one per row and never reflowed, so a pane too narrow to hold `index = "..."` cuts the line at the right edge instead of wrapping it. The pane offers nothing to copy, so what an operator reads is what they retype: a wrapped `index =` is a TOML parse error, and cargo reports it against their config file rather than against the pane. Widening the terminal is the fix, and the floor is around 85 columns for a loopback base, rising with the length of `public_url`: `https://bodega.example.com` needs 92. Do not count on the cut announcing itself. At 84 columns with bodega's default port it takes the closing quote and nothing else, leaving a line that reads as finished and parses as an unterminated string, so the row to check is the one ending `/cargo/"`.
-
-The **Sources line** field for an apt entry is a command an operator pastes into `/etc/apt/sources.list.d/`, so it is rendered by the server-side renderer every other emitter uses ([Client configuration](#client-configuration)) rather than composed in the pane. Two things it does that are not obvious:
+The **Sources** field for an apt entry is the deb822 stanza an operator installs at `/etc/apt/sources.list.d/bodega.sources`, so it is rendered by the server-side renderer every other emitter uses ([Client configuration](#client-configuration)) rather than composed in the pane. Two things it does that are not obvious:
 
 - **The suite is intersected against the served set.** The pane names the first suite the entry is published to that `apt_suites` (or `apt_codename`) also answers for. An entry naming a suite outside that set reaches no index, and a line pointing at it 404s the whole `dists/` path, which apt reports as "Unable to locate package" — the message a misspelled name produces. The fallback is the first served suite. `GET /api/v1/status` lists such entries under `apt.unserved`.
-- **The signing state comes from the key file, not the running server.** The pane applies the same acceptance test `bodega serve` does — the key must load, and both its armored and dearmored public forms must render — but it reads the file. A server that already loaded a key keeps signing after the file is deleted, because a reload never takes signing away (see [Rotation](#rotation)), so the two disagree until a restart. A note beside the line says so and points at `GET /api/v1/status`, which reports what the server is actually doing.
+- **The signing state comes from the key file, not the running server.** The pane applies the same acceptance test `bodega serve` does — the key must load, and both its armored and dearmored public forms must render — but it reads the file. A server that already loaded a key keeps signing after the file is deleted, because a reload never takes signing away (see [Rotation](#rotation)), so the two disagree until a restart. A note beside the stanza says so and points at `GET /api/v1/status`, which reports what the server is actually doing.
 
 ### Audit log
 
@@ -5090,7 +5131,7 @@ Access the dashboard at `https://bodega-host:8080/` when the server is running.
 
 - **Live metrics**: package counts by type, total artifact size, version statistics
 - **Status view**: per-package build and upload status
-- **Copy utilities**: one-click copy for the client instruction (Package URL, Sources line or Registry stanza, per type) and Package JSON Config
+- **Copy utilities**: one-click copy for each client configuration file the server renders for the package (`client_config` on `GET /api/v1/packages/{type}/{name}`) and for the Package JSON Config, which leaves `client_config` out so it stays a manifest `bodega pkg import` accepts
 - **Browser-based browsing**: explore packages by type and version
 
 The type list is the server's, not the page's. The tree, the per-type bars and both expand-all loops render one group per key in the `/api/v1/packages` envelope, which carries every ecosystem the server knows with an empty array for the ones holding nothing. The page keeps a preferred order (apt first, then git, pypi, binary, gomod, helm, npm) and anything outside it renders after, sorted. So an ecosystem added to the server shows up in a browser with no change to the page, and a stored package can never be missing from the tree while the header counts it.

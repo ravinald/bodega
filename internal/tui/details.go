@@ -15,6 +15,7 @@ import (
 	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/builder"
+	"github.com/ravinald/bodega/internal/clientconf"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/pkgrepos"
@@ -183,25 +184,21 @@ func (m detailsModel) storedAndClientFields(n *TreeNode) string {
 		sb.WriteString(field("Object", m.objectURI(n.Backend, key)))
 		sb.WriteByte('\n')
 	}
-	if n.EntryType == manifest.TypeApt {
-		pm, _ := m.store.GetPackage(context.Background(), manifest.TypeApt, n.Name)
-		src := aptSources(m.cfg, pm, m.aptSigned)
-		sb.WriteString(field(clientFieldLabel(manifest.TypeApt), src.OneLine))
+	for _, f := range clientFiles(m.cfg, m.store, n.EntryType, n.Name, m.aptSigned, m.pkgFingerprint) {
+		sb.WriteString(stanzaField(f.Label, strings.TrimRight(f.Content, "\n")))
 		sb.WriteByte('\n')
-		for _, note := range append(src.Notes, aptDiskStateNote) {
+		if p := pathSummary(f.Paths); p != "" {
+			sb.WriteString(field("Path", p))
+			sb.WriteByte('\n')
+		}
+		notes := f.Notes
+		if f.System == manifest.TypeApt {
+			notes = append(append([]string(nil), notes...), aptDiskStateNote)
+		}
+		for _, note := range notes {
 			sb.WriteString(noteField("Note", note, m.width))
 			sb.WriteByte('\n')
 		}
-		return sb.String()
-	}
-	if url := clientURL(m.cfg, m.store, n.EntryType, n.Name, m.pkgFingerprint); url != "" {
-		label := clientFieldLabel(n.EntryType)
-		if strings.Contains(url, "\n") {
-			sb.WriteString(stanzaField(label, url))
-		} else {
-			sb.WriteString(field(label, url))
-		}
-		sb.WriteByte('\n')
 	}
 	return sb.String()
 }
@@ -480,7 +477,7 @@ func aptKeyLoaded(cfg *config.Config) bool {
 	return true
 }
 
-// freeBSDRepoConf renders one pkg repository's client configuration through
+// freeBSDRepo renders one pkg repository's client configuration through
 // the one renderer the server and web UI also use.
 //
 // The first non-hidden ABI decides it. A repository carries one entry per ABI
@@ -489,7 +486,7 @@ func aptKeyLoaded(cfg *config.Config) bool {
 // so a copy onto a host of a different architecture still resolves. A
 // contradictory entry renders nothing rather than a guess, which is the
 // refusal pkgrepos.Render exists to make.
-func freeBSDRepoConf(cfg *config.Config, pm *manifest.PackageManifest, fingerprint string) string {
+func freeBSDRepo(cfg *config.Config, pm *manifest.PackageManifest, fingerprint string) (pkgrepos.Repo, bool) {
 	st := pkgrepos.State{LocalScheme: clientScheme(cfg), Repo: pm.Name, Fingerprint: fingerprint}
 	if cfg != nil {
 		st.PublicURL = cfg.ResolvePublicURL("")
@@ -509,9 +506,9 @@ func freeBSDRepoConf(cfg *config.Config, pm *manifest.PackageManifest, fingerpri
 		if err != nil {
 			continue
 		}
-		return rendered.Conf
+		return rendered, true
 	}
-	return ""
+	return pkgrepos.Repo{}, false
 }
 
 // pkgKeyFingerprint is the pkg catalogue signing key this host holds, read
@@ -578,36 +575,42 @@ func aptSourcesSuite(cfg *config.Config, pm *manifest.PackageManifest) string {
 	return ""
 }
 
-// clientURL returns the URL a client would use to fetch the artifact from the
-// bodega server.
+// clientFiles renders what a client of this entry installs, through the one
+// renderer the server and the web UI also use. The pane shows one variant:
+// the suite aptSourcesSuite picks, the first ABI freeBSDRepo renders, the
+// first version of a binary or a git bundle.
 //
-// apt has no case here on purpose: a sources line is a configuration stanza
-// rather than a URL, and it needs the served suites and the signing state as
-// well as the base URL. aptSources renders it.
-//
-// pkgFingerprint is the pkg catalogue signing key this host holds, empty when
-// it holds none, and it is a parameter for the reason aptSources takes signed:
-// resolving it means a key load off disk, and a render runs on every terminal
-// resize.
-func clientURL(cfg *config.Config, store *manifest.Store, entryType, name, pkgFingerprint string) string {
-	ctx := context.Background()
-	base := clientBase(cfg)
-	pm, err := store.GetPackage(ctx, entryType, name)
+// aptSigned and pkgFingerprint are parameters rather than read here because
+// resolving either means a key load off disk, and a render runs on every
+// terminal resize.
+func clientFiles(cfg *config.Config, store *manifest.Store, entryType, name string, aptSigned bool, pkgFingerprint string) []clientconf.File {
+	in := clientconf.Inputs{Base: clientBase(cfg)}
+	if cfg != nil {
+		in.GitUpstreams = cfg.GitUpstreams
+	}
+	pm, err := store.GetPackage(context.Background(), entryType, name)
+	if err != nil {
+		pm = nil
+	}
+	hasVersion := pm != nil && len(pm.Versions) > 0
 	switch entryType {
+	case manifest.TypeApt:
+		in.Apt = []aptsources.Sources{aptSources(cfg, pm, aptSigned)}
+	case manifest.TypeFreeBSD:
+		if !hasVersion {
+			return nil
+		}
+		if repo, ok := freeBSDRepo(cfg, pm, pkgFingerprint); ok {
+			in.FreeBSD = []pkgrepos.Repo{repo}
+		}
 	case manifest.TypeGit:
-		if err != nil || pm == nil || len(pm.Versions) == 0 {
-			return ""
+		if hasVersion {
+			ve := pm.Versions[0]
+			in.GitBundles = []clientconf.GitBundle{{Name: pm.Name, Ref: ve.Ref, Release: ve.IsRelease()}}
 		}
-		ve := pm.Versions[0]
-		ext := ".bundle"
-		if ve.IsRelease() {
-			ext = ".tar.gz"
-		}
-		sn := strings.ReplaceAll(pm.Name, "/", "--")
-		return fmt.Sprintf("%s/git/%s/%s-%s%s", base, sn, sn, ve.Ref, ext)
 	case manifest.TypeBinary:
-		if err != nil || pm == nil || len(pm.Versions) == 0 {
-			return ""
+		if !hasVersion {
+			return nil
 		}
 		// The link is the download alias the read API publishes, keyed by
 		// the server's token pepper, so the TUI and the web UI print the same
@@ -622,66 +625,33 @@ func clientURL(cfg *config.Config, store *manifest.Store, entryType, name, pkgFi
 		if cfg != nil {
 			typeBackend = cfg.StorageByType[manifest.TypeBinary]
 		}
-		p, ok := pm.BinaryLinkName(key, typeBackend, 0)
-		if !ok {
-			return ""
+		if p, ok := pm.BinaryLinkName(key, typeBackend, 0); ok {
+			in.Binary = []clientconf.BinaryLink{{Filename: pm.Public(key).Versions[0].Filename, Path: p}}
 		}
-		return base + "/binaries/" + p
-	case manifest.TypePypi:
-		return fmt.Sprintf("pip install --index-url %s/pypi/simple/ %s", base, name)
-	case manifest.TypeGomod:
-		return fmt.Sprintf("GOPROXY=%s/go,direct go get %s", base, name)
-	case manifest.TypeHelm:
-		if err != nil || pm == nil || len(pm.Versions) == 0 {
-			return ""
-		}
-		ve := pm.Versions[0]
-		return fmt.Sprintf("%s/helm/charts/%s-%s.tgz", base, pm.Name, ve.Version)
-	case manifest.TypeNpm:
-		return fmt.Sprintf("npm install --registry %s/npm/ %s", base, name)
-	case manifest.TypeFreeBSD:
-		// The whole /usr/local/etc/pkg/repos/ file rather than the repository
-		// block alone. The block on its own installs cleanly and leaves the
-		// upstream repository enabled beside bodega's, which nothing reports:
-		// the overrides that disable it are the same decision, so they travel
-		// in the same copy.
-		if err != nil || pm == nil || len(pm.Versions) == 0 {
-			return ""
-		}
-		return freeBSDRepoConf(cfg, pm, pkgFingerprint)
-	case manifest.TypeDistfiles:
-		// The name is the distinfo name, DIST_SUBDIR included, under the
-		// environment the client's check measured; MASTER_SITE_OVERRIDE
-		// composes this same URL per port, and the check it includes from
-		// /distfiles/@environment.mk fills the digest in.
-		return fmt.Sprintf("%s/distfiles/@${BODEGA_DISTFILES_ENV}/%s", base, name)
-	case manifest.TypeCargo:
-		// Cargo hands back no URL. A client reaches the sparse index only once
-		// .cargo/config.toml names it as a registry, so the stanza and the
-		// command that uses it travel together as one string. The command is a
-		// TOML comment because the web copies this field verbatim and its
-		// destination is that config file: a bare shell line pasted there
-		// fails the parse, and the stanza alone never names the --registry
-		// flag.
-		return fmt.Sprintf("[registries.bodega]\nindex = \"sparse+%s/cargo/\"\n# cargo add --registry bodega %s", base, name)
 	}
-	return ""
+	return clientconf.ForType(entryType, in)
 }
 
-// clientFieldLabel names the detail-pane row holding a type's client
-// instruction. Three hand back something other than a URL: apt a sources
-// line, cargo a registry stanza, freebsd a whole pkg repos file. Calling any
-// of them a "Package URL" sends an operator looking for something to curl.
-func clientFieldLabel(entryType string) string {
-	switch entryType {
-	case manifest.TypeApt:
-		return "Sources line"
-	case manifest.TypeCargo:
-		return "Registry stanza"
-	case manifest.TypeFreeBSD:
-		return "Repository conf"
+// pathSummary names where a file belongs, grouping the operating systems
+// that agree: "linux, freebsd: /etc/pip.conf; darwin: /Library/...".
+func pathSummary(paths map[string]string) string {
+	var order []string
+	byPath := map[string][]string{}
+	for _, goos := range []string{clientconf.OSLinux, clientconf.OSFreeBSD, clientconf.OSDarwin} {
+		p, ok := paths[goos]
+		if !ok {
+			continue
+		}
+		if _, seen := byPath[p]; !seen {
+			order = append(order, p)
+		}
+		byPath[p] = append(byPath[p], goos)
 	}
-	return "Package URL"
+	parts := make([]string, 0, len(order))
+	for _, p := range order {
+		parts = append(parts, strings.Join(byPath[p], ", ")+": "+p)
+	}
+	return strings.Join(parts, "; ")
 }
 
 func (m detailsModel) renderGroupDetails() string {

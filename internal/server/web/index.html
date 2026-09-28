@@ -186,10 +186,10 @@ body {
   flex-shrink: 0;
   text-align: right;
 }
-/* cargo's client instruction is the only field value carrying newlines: a
-   registry stanza, not a URL. Without pre-wrap the browser collapses it to one
-   line and an operator who selects the text rather than clicking copy gets a
-   TOML parse error. #detail computes to text-align: center, which every
+/* Client configuration values are whole files: a cargo table, an apt
+   stanza, a pkg repository file. Without pre-wrap the browser collapses one
+   to a single line and an operator who selects the text rather than clicking
+   copy gets a parse error. #detail computes to text-align: center, which every
    one-line value hides, so the override is needed for the lines to align. */
 .field .val { word-break: break-all; white-space: pre-wrap; text-align: left; }
 .field .val.yes { color: var(--green); }
@@ -370,16 +370,6 @@ function typeIcon(type) {
   return typeIcons[type] || (type ? type.charAt(0).toUpperCase() : '?');
 }
 let allData = null;
-// serverApt is the apt block of /api/v1/status: the sources line rendered by
-// the server, one per served suite, plus the URL in force. The page composes
-// no sources line of its own — reading location.protocol and a literal "noble"
-// is what handed operators a suite this instance 404s.
-let serverApt = null;
-// serverFreeBSD is the freebsd block of /api/v1/status: one rendered pkg
-// repository configuration per repository and ABI. The page composes none of
-// its own — the stanza it used to write left the upstream repository enabled
-// beside bodega's, and pkg reports nothing about that.
-let serverFreeBSD = null;
 let selectedKey = null;
 let expandedGroups = new Set();
 let expandedPkgs = new Set();
@@ -395,8 +385,6 @@ async function load() {
     ]);
     allData = await pkgRes.json();
     const status = await statusRes.json();
-    serverApt = status.apt || null;
-    serverFreeBSD = status.freebsd || null;
     // /api/v1/status omits version for a caller outside admin_permit_cidr, so
     // the wordmark keeps whatever title it already had rather than announcing
     // an empty one.
@@ -571,7 +559,6 @@ function showDetail(type, entry) {
   const d = document.getElementById('detail');
   const ver = entryVersion(type, entry);
   location.hash = encodeURIComponent(type + '/' + entry.name + (ver ? '/' + ver : ''));
-  const clientUrl = getClientUrl(type, entry);
   const permalink = location.origin + '/#' + encodeURIComponent(type + '/' + entry.name + (ver ? '/' + ver : ''));
   let html = '<div class="detail-title">' +
     '<span class="type-badge">' + escapeHtml(type) + '</span> ' +
@@ -619,13 +606,7 @@ function showDetail(type, entry) {
   if (entry.version_constraint)
     fields.push(['Constraint', entry.version_constraint]);
   fields.push(['Frozen', entry.frozen ? 'yes' : 'no', entry.frozen ? 'yes' : 'no']);
-  if (clientUrl && !isPolicyEntry) {
-    fields.push([clientFieldLabel(type), clientUrl, 'url']);
-    if (type === 'apt') {
-      const src = aptSourcesFor(entry);
-      for (const note of (src && src.notes) || []) fields.push(['Note', note]);
-    }
-  }
+  if (!isPolicyEntry) fields.push(['__client__']);
 
   // Render metadata map if present, with a section header.
   if (entry.metadata && typeof entry.metadata === 'object') {
@@ -643,16 +624,12 @@ function showDetail(type, entry) {
       html += '<div style="margin-top:12px;margin-bottom:4px;color:var(--fg);font-size:12px;font-weight:bold;text-align:left">' + escapeHtml(v) + '</div>';
       continue;
     }
-    var valHtml = escapeHtml(v || '');
-    if (cls === 'url' && v && v.startsWith('http')) {
-      valHtml = '<a href="' + escapeHtml(v) + '" target="_blank" style="color:var(--cyan)">' + escapeHtml(v) + '</a>';
+    // The client configuration arrives with the package fetch below.
+    if (k === '__client__') {
+      html += '<div class="client-config"></div>';
+      continue;
     }
-    var copyIcon = '';
-    if (cls === 'url' && v) {
-      copyIcon = ' <span class="copy-link" title="Copy ' + escapeHtml(k) + '" data-url="' + escapeHtml(v).replace(/"/g,'&quot;') + '">\u{1F517}</span>';
-    }
-    html += '<div class="field"><span class="key">' + escapeHtml(k) + ':</span>' +
-      '<span class="val' + (cls ? ' ' + cls : '') + '">' + valHtml + '</span>' + copyIcon + '</div>';
+    html += fieldHtml(k, v, cls);
   }
 
   html += '<div class="json-section"><h3>Package JSON Config ' +
@@ -661,20 +638,32 @@ function showDetail(type, entry) {
 
   d.innerHTML = html;
 
-  // Fetch the PackageManifest for JSON display. When a specific version is
-  // selected, fetch the version-scoped endpoint — the response is still a
-  // valid PackageManifest (config_version, name, type, description, plus a
-  // single-entry versions array), so it's copy-paste ready for re-import.
-  // Package-header selection (no version) keeps the full-manifest fetch.
+  // The package endpoint carries client_config, rendered by the server
+  // through internal/clientconf, so this page composes no client line of its
+  // own. The JSON pane shows the version-scoped manifest when a version is
+  // selected: it is a valid PackageManifest with a single-entry versions
+  // array, copy-paste ready for re-import. client_config is not part of a
+  // manifest and is dropped from the package-header copy for the same reason.
   var url = '/api/v1/packages/' + type + '/' + encodeURIComponent(entry.name);
+  var pkg = fetch(url)
+    .then(function(r) { return r.ok ? r.json() : null; })
+    .catch(function() { return null; });
+  pkg.then(function(p) {
+    var el = d.querySelector('.client-config');
+    if (el) el.innerHTML = clientConfigHtml(type, entry, (p && p.client_config) || []);
+  });
   var scopedVer = entryVersion(type, entry);
-  if (scopedVer && scopedVer !== '*') {
-    url += '/' + encodeURIComponent(scopedVer);
-  }
-  fetch(url)
-    .then(function(r) { return r.ok ? r.json() : entry; })
-    .catch(function() { return entry; })
+  var manifestReq = (scopedVer && scopedVer !== '*')
+    ? fetch(url + '/' + encodeURIComponent(scopedVer))
+        .then(function(r) { return r.ok ? r.json() : entry; })
+        .catch(function() { return entry; })
+    : pkg.then(function(p) { return p || entry; });
+  manifestReq
     .then(function(manifest) {
+      if (manifest && manifest.client_config) {
+        manifest = Object.assign({}, manifest);
+        delete manifest.client_config;
+      }
       var jsonStr = JSON.stringify(manifest, null, 2);
       var pre = d.querySelector('.json-pre');
       if (pre) pre.textContent = jsonStr;
@@ -688,120 +677,73 @@ function escapeHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
-// clientBase is the base URL a client reaches this server at. The server
-// resolves it: public_url when the operator set one, otherwise the origin of
-// this request with X-Forwarded-Proto honored. location.origin is the fallback
-// for a page whose status fetch failed — it is the browser's own view, which
-// is right only while nothing terminates on a different hostname.
-function clientBase() {
-  return (serverApt && serverApt.public_url) || location.origin;
+// fieldHtml renders one detail row. A 'url' value gets a copy affordance, and
+// a link when it is one.
+function fieldHtml(k, v, cls) {
+  var valHtml = escapeHtml(v || '');
+  if (cls === 'url' && v && v.startsWith('http')) {
+    valHtml = '<a href="' + escapeHtml(v) + '" target="_blank" style="color:var(--cyan)">' + escapeHtml(v) + '</a>';
+  }
+  var copyIcon = '';
+  if (cls === 'url' && v) {
+    copyIcon = ' <span class="copy-link" title="Copy ' + escapeHtml(k) + '" data-url="' + escapeHtml(v).replace(/"/g,'&quot;') + '">\u{1F517}</span>';
+  }
+  return '<div class="field"><span class="key">' + escapeHtml(k) + ':</span>' +
+    '<span class="val' + (cls ? ' ' + cls : '') + '">' + valHtml + '</span>' + copyIcon + '</div>';
 }
 
-// freeBSDRepoFor picks the server-rendered configuration for this entry's
-// repository and ABI. Both, because a repository carries one entry per ABI
-// and they are configured apart: matching on the name alone hands a
-// FreeBSD:13 host the FreeBSD:14 entry's answer, which is the same URL under
-// an override naming a repository tag that host does not define.
-function freeBSDRepoFor(entry) {
-  if (!serverFreeBSD || !serverFreeBSD.repos || !entry) return null;
-  for (const r of serverFreeBSD.repos) {
-    if (r.repo === entry.name && r.abi === entry.version) return r;
-  }
-  return null;
+// entryScopes names the variants a version row is: the apt suites it is
+// published to, the FreeBSD ABI, the git ref, the filename the read API
+// publishes for a binary entry.
+function entryScopes(entry) {
+  var out = [];
+  if (entry.suites) out = out.concat(entry.suites);
+  if (entry.version) out.push(entry.version);
+  if (entry.ref) out.push(entry.ref);
+  if (entry.filename) out.push(entry.filename);
+  return out;
 }
 
-// aptSourcesFor picks the server-rendered block for the suite this entry is
-// actually published to. An entry naming no suites is in the server's default,
-// which is the first block.
-function aptSourcesFor(entry) {
-  if (!serverApt || !serverApt.sources || !serverApt.sources.length) return null;
-  const want = (entry && entry.suites) || [];
-  for (const suite of want) {
-    for (const src of serverApt.sources) {
-      if (src.suite === suite) return src;
-    }
-  }
-  return serverApt.sources[0];
+// pickClientFiles keeps every file the server rendered for the whole package
+// and, of the per-variant ones, those scoped to this entry. A package header
+// gets the first variant. So does an apt entry naming no served suite, which
+// is in the default the server lists first; any other entry with no variant
+// of its own gets none, because another version's link would download the
+// wrong bytes.
+function pickClientFiles(type, entry, files) {
+  var scopes = entryScopes(entry);
+  var shared = files.filter(function(f) { return !f.scope; });
+  var scoped = files.filter(function(f) { return f.scope; });
+  var mine = scoped.filter(function(f) { return scopes.indexOf(f.scope) >= 0; });
+  var header = !entry.version && !entry.ref;
+  if (!mine.length && scoped.length && (header || type === 'apt')) mine = [scoped[0]];
+  return shared.concat(mine);
 }
 
-function getClientUrl(type, entry) {
-  const base = clientBase();
-  switch (type) {
-    case 'git': {
-      const ext = entry.source === 'clone' ? '.bundle' : '.tar.gz';
-      const ref = entry.ref || '';
-      const sn = entry.name.replace(/\//g, '--');
-      return base + '/git/' + sn + '/' + sn + '-' + ref + ext;
-    }
-    case 'binary': {
-      const fn = entry.filename || (entry.url ? entry.url.split('/').pop() : entry.name);
-      // A server with no pepper publishes every binary under an alias whose
-      // tag is all zeros. It resolves nowhere, so there is no link to offer.
-      if (/^~\/0{32}\//.test(fn)) return '';
-      if (entry.version) return base + '/binaries/' + entry.name + '/' + entry.version + '/' + fn;
-      return base + '/binaries/' + entry.name + '/' + fn;
-    }
-    case 'apt': {
-      const src = aptSourcesFor(entry);
-      return src ? src.one_line : '';
-    }
-    case 'pypi':
-      return 'pip install --index-url ' + base + '/pypi/simple/ ' + entry.name;
-    case 'gomod':
-      return 'GOPROXY=' + base + '/go,direct go get ' + entry.name;
-    case 'helm':
-      return base + '/helm/charts/' + entry.name + '-' + (entry.version || '') + '.tgz';
-    case 'npm':
-      return 'npm install --registry ' + base + '/npm/ ' + entry.name;
-    // Cargo hands back no URL. A client reaches the sparse index only once
-    // .cargo/config.toml names it as a registry, so the stanza and the command
-    // that uses it travel together as one string. The command is a TOML
-    // comment because the copy affordance copies this field verbatim and its
-    // destination is that config file: a bare shell line pasted there fails
-    // the parse, and the stanza alone never names the --registry flag.
-    case 'cargo':
-      return '[registries.bodega]\n'
-        + 'index = "sparse+' + base + '/cargo/"\n'
-        + '# cargo add --registry bodega ' + entry.name;
-    // FreeBSD hands back the whole /usr/local/etc/pkg/repos/ file the server
-    // rendered, not the repository block alone. The block on its own installs
-    // cleanly and leaves the upstream repository enabled beside bodega's,
-    // which pkg never mentions, so the overrides that disable it travel in
-    // the same copy. signature_type comes from the server too, and it is
-    // three answers: the stock trust store for a mirror of a ports
-    // repository, the pkgbase store beside it for a mirror of a
-    // base_release_<n> one built for FreeBSD 15 or later, and bodega's own
-    // key for a generated repository. No older release installs the pkgbase
-    // store, so its base_release_<n> repositories take the stock one. The
-    // server derives it from two terms and only one of them reaches this
-    // page: the release the repository was built for is the ABI's middle
-    // field, and the upstream URL is on no response the page reads, so
-    // nothing here may work the answer out again.
-    case 'freebsd': {
-      const repo = freeBSDRepoFor(entry);
-      return repo ? repo.conf : '';
-    }
-    // The entry's name is the distinfo name, DIST_SUBDIR included, under the
-    // environment the client's check measured. A client does not fetch it by
-    // hand: MASTER_SITE_OVERRIDE composes this same URL per port, and the
-    // check it includes from /distfiles/@environment.mk fills the digest in.
-    case 'distfiles':
-      return base + '/distfiles/@${BODEGA_DISTFILES_ENV}/' + entry.name;
+// pathSummary groups the operating systems that agree on a file's path.
+function pathSummary(paths) {
+  var order = [], byPath = {};
+  for (const os of ['linux', 'freebsd', 'darwin']) {
+    var p = paths && paths[os];
+    if (!p) continue;
+    if (!byPath[p]) { byPath[p] = []; order.push(p); }
+    byPath[p].push(os);
   }
-  return '';
+  return order.map(function(p) { return byPath[p].join(', ') + ': ' + p; }).join('; ');
 }
 
-// clientFieldLabel names the detail-pane row holding a type's client
-// instruction. Three hand back something other than a URL: apt a sources
-// line, cargo a registry stanza, freebsd a whole pkg repos file. Calling any
-// of them a "Package URL" sends an operator looking for something to curl.
-function clientFieldLabel(type) {
-  switch (type) {
-    case 'apt': return 'Sources line';
-    case 'cargo': return 'Registry stanza';
-    case 'freebsd': return 'Repository conf';
+// clientConfigHtml renders the files as the server sent them. Content is
+// shown verbatim, trailing newline aside, because every one of them is copied
+// into a file whose parser rejects an edited line.
+function clientConfigHtml(type, entry, files) {
+  var html = '';
+  for (const f of pickClientFiles(type, entry, files)) {
+    html += fieldHtml(f.label, f.content.replace(/\n$/, ''), 'url');
+    var where = pathSummary(f.paths);
+    if (where) html += fieldHtml('Path', where);
+    for (const note of f.notes || []) html += fieldHtml('Note', note);
   }
-  return 'Package URL';
+  return html;
 }
 
 async function showDashboard() {

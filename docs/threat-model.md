@@ -712,8 +712,8 @@ instance, the recommended posture is:
   `/etc/make.conf`, so inspect `/usr/local/etc/pkg/repos/` and
   `MASTER_SITE_OVERRIDE` by hand
   ([#49](https://github.com/ravinald/bodega/issues/49)).
-- **Set `GOPROXY` to `http://<bodega>/go,off`**, never `,direct`. The
-  `,off` form makes cache misses fail loudly; `,direct` silently falls
+- **Set `GOPROXY` to `http://<bodega>/go`**, with no `direct` entry after
+  it. A cache miss then fails loudly; a `direct` entry silently falls
   through to public VCS, defeating the chokepoint.
 - **Run `bodega doctor` in CI** as a gate step. Exit 0 is clean, exit 2 is a
   finding, and exit 3 is a run that could not finish: a check whose config or

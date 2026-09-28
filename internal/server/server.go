@@ -30,8 +30,10 @@ import (
 	"time"
 
 	"github.com/ravinald/bodega/internal/admit"
+	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/builder"
+	"github.com/ravinald/bodega/internal/clientconf"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/distinfo"
 	"github.com/ravinald/bodega/internal/manifest"
@@ -990,7 +992,94 @@ func (s *Server) handleAPIPackage(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 		return
 	}
-	writeJSON(w, http.StatusOK, pm.Public([]byte(s.pepper)))
+	writeJSON(w, http.StatusOK, packageResponse{
+		PackageManifest: pm.Public([]byte(s.pepper)),
+		ClientConfig:    s.clientFiles(r, t, pm),
+	})
+}
+
+// packageResponse is GET /api/v1/packages/{type}/{name}: the manifest the
+// read API publishes, with the client configuration for it beside the
+// manifest's own keys. The version-scoped route leaves it off, because its
+// body is a manifest an operator copies back into `pkg import`.
+type packageResponse struct {
+	*manifest.PackageManifest
+	ClientConfig []clientconf.File `json:"client_config"`
+}
+
+// clientFiles renders what a client of pm installs, one file per variant the
+// route serves: every served suite the package is published to, every ABI,
+// every binary version. A hidden package gets none, since its routes 404 and
+// configuration for it points a client at nothing.
+func (s *Server) clientFiles(r *http.Request, t string, pm *manifest.PackageManifest) []clientconf.File {
+	out := []clientconf.File{}
+	if isPackageHidden(pm) {
+		return out
+	}
+	in := clientconf.Inputs{Base: s.publicBase(r), GitUpstreams: s.cfg.GitUpstreams}
+	switch t {
+	case manifest.TypeApt:
+		in.Apt = s.aptSourcesForPackage(r, pm)
+	case manifest.TypeFreeBSD:
+		for _, repo := range s.freeBSDStatusFor(r).Repos {
+			if repo.Repo == pm.Name {
+				in.FreeBSD = append(in.FreeBSD, repo)
+			}
+		}
+	case manifest.TypeGit:
+		for _, ve := range pm.Versions {
+			if !ve.Hidden {
+				in.GitBundles = append(in.GitBundles, clientconf.GitBundle{Name: pm.Name, Ref: ve.Ref, Release: ve.IsRelease()})
+			}
+		}
+	case manifest.TypeBinary:
+		// No pepper, no link: the read API publishes the withheld alias for
+		// every entry then, and a stored-name link would reach whichever
+		// entry of the version comes first rather than this one.
+		if s.pepper == "" {
+			break
+		}
+		key := []byte(s.pepper)
+		public := pm.Public(key)
+		typeBackend := s.cfg.StorageByType[manifest.TypeBinary]
+		for i, ve := range pm.Versions {
+			if ve.Hidden {
+				continue
+			}
+			if p, ok := pm.BinaryLinkName(key, typeBackend, i); ok {
+				in.Binary = append(in.Binary, clientconf.BinaryLink{Filename: public.Versions[i].Filename, Path: p})
+			}
+		}
+	}
+	return append(out, clientconf.ForType(t, in)...)
+}
+
+// aptSourcesForPackage picks the rendered blocks for the served suites pm is
+// published to, in the order /api/v1/status lists them, and the first block
+// when it names none: an entry with no suites of its own is in the default.
+// Picking from the status blocks keeps the mirrored and filtered codenames'
+// trust forms, which a stanza rendered here from the suite alone would lose.
+func (s *Server) aptSourcesForPackage(r *http.Request, pm *manifest.PackageManifest) []aptsources.Sources {
+	blocks := s.aptStatusFor(r).Sources
+	want := map[string]bool{}
+	for _, ve := range pm.Versions {
+		if ve.Hidden {
+			continue
+		}
+		for _, suite := range ve.EffectiveSuites(s.cfg.AptCodename) {
+			want[suite] = true
+		}
+	}
+	var out []aptsources.Sources
+	for _, b := range blocks {
+		if want[b.Suite] {
+			out = append(out, b)
+		}
+	}
+	if len(out) == 0 && len(blocks) > 0 {
+		out = blocks[:1]
+	}
+	return out
 }
 
 // handleAPIPackageVersion returns a PackageManifest scoped to a single
