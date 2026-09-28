@@ -1,6 +1,8 @@
 package host
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -2201,7 +2203,9 @@ var (
 // branch, since doctor does not evaluate their conditions, and includes
 // bsd.cpu.mk, which sys.mk reads in a ports tree. It skips what the earlier
 // checks settled: the mode files, which they proved off, the hooks, which
-// they proved absent, and make.conf, which the walk reads. A .for over
+// they proved absent, and make.conf, which the walk reads. Those proofs,
+// and that sys.mk includes make.conf, hold for the makeSysStock bytes
+// alone, so any other file there leaves the stage unestablished. A .for over
 // lists nothing defines iterates nothing, and its body is skipped: defined
 // reports whether the environment or the command line defines a name, and
 // the stage's own assignments count wherever they sit. It returns why
@@ -2224,7 +2228,8 @@ func loadMakeSystem(root string, tracked map[string]*siteValue, defined func(str
 	assigned := map[string]bool{}
 	queue, seen := []string{"sys.mk"}, map[string]bool{"sys.mk": true}
 	for len(queue) > 0 {
-		p := filepath.Join(makeStockSysPath, queue[0])
+		queue0 := queue[0]
+		p := filepath.Join(makeStockSysPath, queue0)
 		queue = queue[1:]
 		data, err := os.ReadFile(filepath.Join(root, p))
 		if errors.Is(err, fs.ErrNotExist) {
@@ -2232,6 +2237,9 @@ func loadMakeSystem(root string, tracked map[string]*siteValue, defined func(str
 		}
 		if err != nil {
 			return nil, "", fmt.Errorf("read %s, which make reads before make.conf: %w", p, err)
+		}
+		if sum := sha256.Sum256(data); hex.EncodeToString(sum[:]) != makeSysStock[queue0] {
+			return nil, p + " is not the " + makeSysRelease + " file doctor models, so doctor cannot establish that make reads make.conf or which system makefiles make reads with it", nil
 		}
 		f := sysFile{p, makeStatements(string(data))}
 		files = append(files, f)
@@ -2299,6 +2307,24 @@ func loadMakeSystem(root string, tracked map[string]*siteValue, defined func(str
 		}
 	}
 	return s, "", nil
+}
+
+// makeSysRelease is the base system whose makefiles doctor models, and
+// makeSysStock their SHA-256 by name under makeStockSysPath. Reading every
+// branch of a system makefile bounds what it may do to make.conf's values,
+// but not that make reaches the .include of make.conf at all or which mode
+// files it pulls in: those follow from the conditional structure around
+// them, which the checks ahead of loadMakeSystem model for these bytes
+// alone. A file whose bytes differ, a comment-only sys.mk or one that
+// sets a mode control itself among them, has a structure nothing modeled.
+const makeSysRelease = "FreeBSD 15.1-RELEASE"
+
+var makeSysStock = map[string]string{
+	"sys.mk":                "977339d1710b07a7a6bb90165a912a985eb0823b753f8e1100230fc592b4dcd3",
+	"bsd.mkopt.mk":          "1518591c055e281c3a49a07f2ca6d0c4d7e64785751b63c74fc09f503476bfd0",
+	"bsd.suffixes.mk":       "be29c60e72966c223b109545302b2e5fdb5fbe3b502276f72e84f8ad60e6353a",
+	"bsd.suffixes-posix.mk": "1a50f8d59d04952cc4c0cbfc81b2d06fe9b62ff845e6e6e14cabd8ce865a4b27",
+	"bsd.cpu.mk":            "068115dbfb416f45673866042c65060fd1495ee3be731a0857ddcd4281b6e40f",
 }
 
 // makeNameGlob matches every name a computed name may expand to: its

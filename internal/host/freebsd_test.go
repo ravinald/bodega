@@ -1,10 +1,14 @@
 package host
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -1903,4 +1907,99 @@ func TestMakeConfWithoutSysMk(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertFinding(t, checkMakeConf(root, "freebsd", func(string) string { return "" }), StatusWarn, "/usr/share/mk/sys.mk does not exist")
+}
+
+func TestMakeSysStockMatchesFixtures(t *testing.T) {
+	for name, want := range makeSysStock {
+		data, err := os.ReadFile(filepath.Join(stockSysMk, makeStockSysPath, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sum := sha256.Sum256(data); hex.EncodeToString(sum[:]) != want {
+			t.Errorf("%s: fixture does not match makeSysStock", name)
+		}
+	}
+}
+
+// TestMakeConfSystemConsumption holds doctor to what make actually does
+// with each system stage: OK only where the stage demonstrably includes the
+// configured make.conf. On FreeBSD it runs the real make with -m over the
+// same bytes and checks that its recipe values agree.
+func TestMakeConfSystemConsumption(t *testing.T) {
+	stock, err := os.ReadFile(filepath.Join(stockSysMk, "usr/share/mk/sys.mk"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mkopt, err := os.ReadFile(filepath.Join(stockSysMk, "usr/share/mk/bsd.mkopt.mk"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name  string
+		files map[string]string
+		clean bool
+	}{
+		{"stock", nil, true},
+		{"comment-only sys.mk", map[string]string{"/usr/share/mk/sys.mk": "# valid system file, no make.conf include\n"}, false},
+		{"unreachable include", map[string]string{"/usr/share/mk/sys.mk": strings.Replace(string(stock), ".if exists(${__MAKE_CONF})", ".if 0", 1)}, false},
+		{"computed selector", map[string]string{"/usr/share/mk/sys.mk": "_SELECTOR=MAKE_CONF\n__${_SELECTOR}=/dev/null\n" + string(stock)}, false},
+		{"mode set in sys.mk", map[string]string{"/usr/share/mk/sys.mk": "WITH_DIRDEPS_BUILD=1\n" + string(stock)}, false},
+		{"mode set in bsd.mkopt.mk", map[string]string{"/usr/share/mk/bsd.mkopt.mk": "WITH_DIRDEPS_BUILD=1\n" + string(mkopt)}, false},
+	}
+	for _, tc := range tests {
+		for _, path := range []string{clientconf.DistfilesCheckPath, "/net/b/distfiles/@environment.mk"} {
+			t.Run(tc.name+path, func(t *testing.T) {
+				files := map[string]string{"/usr/share/mk/sys.dirdeps.mk": "__MAKE_CONF=/dev/null\n"}
+				maps.Copy(files, tc.files)
+				root := writeTree(t, files)
+				put := func(p, s string) {
+					t.Helper()
+					if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(p, []byte(s), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				// The real make reads absolute paths on this host; the rooted
+				// doctor reads the same bytes at those paths below its root.
+				checkPath := filepath.Join(root, path)
+				conf := strings.ReplaceAll(strings.ReplaceAll(clientconf.MakeConf("https://b").Content, "?=", "="), clientconf.DistfilesCheckPath, checkPath)
+				confPath := filepath.Join(root, "make.conf")
+				for _, p := range []string{confPath, filepath.Join(root, confPath)} {
+					put(p, conf)
+				}
+				for _, p := range []string{checkPath, filepath.Join(root, checkPath)} {
+					put(p, "BODEGA_DISTFILES_ENV=abc\n")
+				}
+				env := map[string]string{"__MAKE_CONF": confPath, "MAKEFLAGS": ""}
+				lookup := func(k string) (string, bool) { v, ok := env[k]; return v, ok }
+				got := checkMakeConfEnviron(root, "freebsd", lookup, []string{"__MAKE_CONF=" + confPath, "MAKEFLAGS="})
+				if runtime.GOOS == "freebsd" {
+					fetch := filepath.Join(root, "fetch.mk")
+					put(fetch, "MASTER_SITE_OVERRIDE?=https://mirror.example/\nMASTER_SITE_BACKUP?=https://mirror.example/\nall:\n\t@echo 'override: ${MASTER_SITE_OVERRIDE}'\n\t@echo 'backup: ${MASTER_SITE_BACKUP}'\n")
+					cmd := exec.Command("make", "-m", filepath.Join(root, "usr/share/mk"), "-f", fetch, "all")
+					cmd.Dir = root
+					cmd.Env = []string{"PATH=/bin:/usr/bin", "__MAKE_CONF=" + confPath}
+					out, err := cmd.CombinedOutput()
+					t.Logf("real make: err=%v\n%sdoctor: %s %s", err, out, got.Status, got.Detail)
+					if err != nil {
+						t.Fatalf("make failed: %v", err)
+					}
+					want := "override: https://mirror.example/"
+					if tc.clean {
+						want = "override: https://b/distfiles/@abc//"
+					}
+					if !strings.Contains(string(out), want) {
+						t.Fatalf("make did not reproduce the case: want %s", want)
+					}
+				}
+				if tc.clean {
+					assertFinding(t, got, StatusOK)
+				} else {
+					assertFinding(t, got, StatusWarn, "FreeBSD 15.1-RELEASE file doctor models")
+				}
+			})
+		}
+	}
 }
