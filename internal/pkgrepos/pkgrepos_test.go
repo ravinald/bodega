@@ -2,6 +2,7 @@ package pkgrepos_test
 
 import (
 	"encoding/json"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -1219,7 +1220,7 @@ func TestABootstrapAnswerMissingFromTheWireHedges(t *testing.T) {
 	}
 }
 
-// A host bound to a profile that scopes freebsd is pointed at the filtered
+// A host bound to a profile that governs freebsd is pointed at the filtered
 // view and trusts bodega's key, whatever signed the repository it was filtered
 // from, pkgbase included; with no key loaded there is no stanza to render.
 func TestAProfileMovesTheURLAndTheTrustOntoBodega(t *testing.T) {
@@ -1236,7 +1237,7 @@ func TestAProfileMovesTheURLAndTheTrustOntoBodega(t *testing.T) {
 		if got.SignatureType != "fingerprints" || got.Fingerprints != pkgrepos.BodegaFingerprints || got.Pkgbase {
 			t.Errorf("%s: %s %q pkgbase=%v, want bodega's trust directory", upstream, got.SignatureType, got.Fingerprints, got.Pkgbase)
 		}
-		if prose := confProse(got.Conf); !strings.Contains(prose, "bound to profile web") || !strings.Contains(prose, "key export --fingerprint") {
+		if prose := confProse(got.Conf); !strings.Contains(prose, `bound to profile "web"`) || !strings.Contains(prose, "key export --fingerprint") {
 			t.Errorf("%s: the conf does not say why it trusts bodega:\n%s", upstream, got.Conf)
 		}
 		// WithRelease re-renders from the carried fields and must keep the view.
@@ -1249,5 +1250,30 @@ func TestAProfileMovesTheURLAndTheTrustOntoBodega(t *testing.T) {
 	st.Profile = "web"
 	if _, err := pkgrepos.Render(st); err == nil || !strings.Contains(err.Error(), "freebsd key generate") {
 		t.Errorf("a profile view with no key rendered, or its refusal names no repair: %v", err)
+	}
+}
+
+// The profile name is one path segment of the url whatever it holds, and pkg
+// finds nothing in it to expand. The server's routing half is
+// TestFreeBSDProfileURLRoutesEveryValidName.
+func TestAProfileNameIsEscapedIntoOneSegment(t *testing.T) {
+	for name, want := range map[string]string{
+		"web":      "/freebsd-profile/web",
+		"web#prod": "/freebsd-profile/web%23prod",
+		"web?prod": "/freebsd-profile/web%3Fprod",
+		"50%off":   "/freebsd-profile/50%25off",
+		"${ABI}":   "/freebsd-profile/%24%7BABI%7D",
+		"a\"b":     "/freebsd-profile/a%22b",
+	} {
+		if got := pkgrepos.ProfilePath(name); got != want {
+			t.Errorf("ProfilePath(%q) = %q, want %q", name, got, want)
+		}
+	}
+	for _, name := range []string{".", ".."} {
+		st := mirror()
+		st.Profile, st.Fingerprint = name, "abc123"
+		if _, err := pkgrepos.Render(st); !errors.Is(err, pkgrepos.ErrProfileUnroutable) {
+			t.Errorf("Render with profile %q = %v, want ErrProfileUnroutable", name, err)
+		}
 	}
 }

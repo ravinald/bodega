@@ -302,14 +302,6 @@ func profileRefusalText(p *entitle.Profile, typ, name, version string, d entitle
 	}
 	switch d.Refusal {
 	case entitle.RefusalMembership:
-		if typ == manifest.TypeFreeBSD {
-			// Opening a freebsd rule is the one repair `bodega profile set`
-			// refuses: an open rule keeps every record in the catalogue a
-			// bound host reads, under bodega's signature rather than FreeBSD's.
-			return fmt.Sprintf("%s: profile %q does not list %s.\n"+
-				"  Add it:  bodega profile add %s %s %s\n",
-				entitle.RefusalMembership, p.Name(), subject, p.Name(), typ, name)
-		}
 		return fmt.Sprintf("%s: profile %q does not list %s.\n"+
 			"  Add it:      bodega profile add %s %s %s\n"+
 			"  Or open it:  bodega profile set %s %s --membership open\n",

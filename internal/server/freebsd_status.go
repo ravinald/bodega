@@ -88,7 +88,7 @@ func (f freebsdStatus) RepoFor(repo, abi string) *pkgrepos.Repo {
 // would hand a FreeBSD:13 client the FreeBSD:14 entry's answer, and the two
 // are configured apart precisely so they can differ.
 //
-// Per host as well as per entry: a host bound to a profile that scopes
+// Per host as well as per entry: a host bound to a profile that governs
 // freebsd is handed the stanza for that profile's filtered view, and a
 // server with no pkg key refuses it by name rather than rendering one the
 // view would answer 500 under.
@@ -123,13 +123,11 @@ func (s *Server) freeBSDStatusFor(r *http.Request) freebsdStatus {
 	if r != nil {
 		ctx = r.Context()
 		// The requesting host's own configuration, which is the question
-		// doctor --write-pkg-repo asks: a host whose profile scopes freebsd
+		// doctor --write-pkg-repo asks: a host whose profile governs freebsd
 		// reads that profile's filtered view, signed by bodega, and a stanza
 		// pointing it at the published catalogue is one the route refuses.
-		if p := s.profileFor(r); p != nil {
-			if scoped, _ := p.FreeBSDScope(); scoped {
-				base.Profile = p.Name()
-			}
+		if p := s.profileFor(r); p.Governs(manifest.TypeFreeBSD) {
+			base.Profile = p.Name()
 		}
 	}
 	for _, name := range s.store.ListPackages(manifest.TypeFreeBSD) {
@@ -149,7 +147,7 @@ func (s *Server) freeBSDStatusFor(r *http.Request) freebsdStatus {
 			if err != nil {
 				out.Refused = append(out.Refused, freebsdRefused{
 					Repo: pm.Name, ABI: ve.Version, Error: err.Error(),
-					public: errors.Is(err, pkgrepos.ErrProfileUnsigned),
+					public: errors.Is(err, pkgrepos.ErrProfileUnsigned) || errors.Is(err, pkgrepos.ErrProfileUnroutable),
 				})
 				continue
 			}

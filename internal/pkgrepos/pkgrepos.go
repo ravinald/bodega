@@ -18,6 +18,7 @@ package pkgrepos
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -107,7 +108,7 @@ const (
 	// gave up to read it. The catalog is filtered, so the signature upstream
 	// put on it cannot survive, and the stock trust store verifies nothing in
 	// this path.
-	ProfileNote = `This host is bound to a profile that scopes freebsd, so it reads a catalog bodega filtered for that profile: every package the profile refuses is removed, and a hand-composed fetch of one is refused with 403. Filtering discards the signature upstream put on the catalog, so bodega re-signs it with its own pkg key and this stanza trusts that key rather than ` + StockFingerprints + `. bodega fetched the upstream catalog over TLS and did not verify FreeBSD's signature on it first, so the chain of trust ends at upstream's certificate.`
+	ProfileNote = `This host is bound to a profile that governs freebsd, so it reads a catalog bodega filtered for that profile: every package the profile refuses is removed, and a hand-composed fetch of one is refused with 403. Filtering discards the signature upstream put on the catalog, so bodega re-signs it with its own pkg key and this stanza trusts that key rather than ` + StockFingerprints + `. bodega fetched the upstream catalog over TLS and did not verify FreeBSD's signature on it first, so the chain of trust ends at upstream's certificate.`
 
 	// UnsignedNote is the consequence of signature_type: none, which is what
 	// a generated repository renders with no key loaded. It travels beside
@@ -325,7 +326,7 @@ type State struct {
 	Proxy bool
 
 	// Profile names the profile the requesting host is bound to, when that
-	// profile scopes freebsd. The host then reads a catalog filtered for it
+	// profile governs freebsd. The host then reads a catalog filtered for it
 	// and re-signed by bodega, at a URL of its own, so both the location and
 	// the whole trust half of the stanza move with it.
 	Profile string
@@ -731,6 +732,10 @@ func Render(st State) (Repo, error) {
 		return Repo{}, fmt.Errorf("freebsd %s@%s is served to this host filtered for profile %q: %w",
 			st.Repo, st.ABI, st.Profile, ErrProfileUnsigned)
 	}
+	if st.Profile == "." || st.Profile == ".." {
+		return Repo{}, fmt.Errorf("freebsd %s@%s is served to this host filtered for profile %q: %w",
+			st.Repo, st.ABI, st.Profile, ErrProfileUnroutable)
+	}
 
 	repoRelease := release
 	if n, ok := ReleaseFromABI(st.ABI); ok {
@@ -793,12 +798,22 @@ func Render(st State) (Repo, error) {
 // hand it to the host it refuses rather than blanking it with the rest.
 var ErrProfileUnsigned = errors.New("a filtered catalog carries bodega's signature or none: FreeBSD's cannot survive the filter, and bodega does not serve a catalog it filtered unsigned. Run \"bodega freebsd key generate\" on the server and reload it")
 
+// ErrProfileUnroutable is Render's refusal of a profile whose name is a dot
+// segment. Escaping cannot carry one: the server decodes %2E before it cleans
+// the path, so the request is redirected away from the view it names.
+var ErrProfileUnroutable = errors.New("a profile named . or .. cannot be one segment of a URL, because every HTTP server resolves it as a directory step. Serve this host under a profile with any other name")
+
 // ProfilePath is the route prefix a profile's filtered repositories are served
 // under: <ProfilePath>/<abi>/<repo>/ mirrors /freebsd/<abi>/<repo>/ path for
 // path. The server routes it and Render points a stanza at it, so the two are
 // spelled once.
+//
+// The name is one escaped path segment. Profile names admit '#', '?' and '%',
+// which would end the path, start a query or begin an escape, and '$', which
+// url.PathEscape leaves alone and pkg expands as a variable in a repository
+// url.
 func ProfilePath(profile string) string {
-	return "/freebsd-profile/" + profile
+	return "/freebsd-profile/" + strings.ReplaceAll(url.PathEscape(profile), "$", "%24")
 }
 
 // WithRelease re-renders this configuration for a different target release,
@@ -1039,7 +1054,7 @@ func renderConf(r Repo) string {
 	b.WriteString("# so: the host keeps fetching from the internet. Confirm with `pkg -vv`.\n")
 	if r.Profile != "" {
 		b.WriteString("#\n")
-		b.WriteString("# This host is bound to profile " + r.Profile + ", which scopes freebsd, so url\n")
+		b.WriteString("# This host is bound to profile " + strconv.Quote(r.Profile) + ", which governs freebsd, so url\n")
 		b.WriteString("# names the catalog bodega filters for that profile rather than the\n")
 		b.WriteString("# repository as published: a package the profile refuses is not in it, and\n")
 		b.WriteString("# fetching one by hand is refused with 403. Filtering discards upstream's\n")
@@ -1052,8 +1067,8 @@ func renderConf(r Repo) string {
 		b.WriteString("#\n")
 		writeReachComment(&b, r)
 		b.WriteString("#\n")
-		b.WriteString("# `pkg bootstrap` fetches Latest/pkg.pkg, which this path serves only when\n")
-		b.WriteString("# the profile lists pkg. Bootstrap the host before switching it over.\n")
+		b.WriteString("# `pkg bootstrap` fetches Latest/pkg.pkg, which no catalog record names, so\n")
+		b.WriteString("# this path refuses it. Bootstrap the host before switching it over.\n")
 	} else if r.Generated {
 		b.WriteString("#\n")
 		b.WriteString("# This catalogue is built here from the packages uploaded to this\n")

@@ -535,11 +535,6 @@ func validateDoc(doc *profileDoc) error {
 				"  Delete one. Merging them would invent a rule neither row states", j, i, t.Type)
 		}
 		firstType[t.Type] = i
-		if err := checkProfileFreeBSDRule(doc.Name, audit.ProfileTypeRule{
-			Type: t.Type, Membership: t.Membership, Expansion: t.Expansion,
-		}); err != nil {
-			return fmt.Errorf("types[%d]: %w", i, err)
-		}
 		if t.AptBase != "" && t.Type != manifest.TypeApt {
 			return fmt.Errorf("types[%d]: apt_base is read on the apt rule alone; on %s it stores a control nothing consults", i, t.Type)
 		}
@@ -616,15 +611,6 @@ func checkClosedAndEmpty(doc *profileDoc, force bool) error {
 // is reachable, it is almost never meant, and nothing downstream reports it
 // because a profile permitting nothing looks exactly like one nobody consults.
 func closedAndEmptyRefusal(profile, typ string) error {
-	if typ == manifest.TypeFreeBSD {
-		// Open and warn are the two repairs checkProfileFreeBSDRule refuses,
-		// so they are not offered.
-		return fmt.Errorf("profile %s would be closed for freebsd with no freebsd entries, which permits nothing of that type.\n"+
-			"  Every package a bound host's catalogue carries is filtered out, and a fetch of one is refused.\n"+
-			"  List something:  bodega profile add %s freebsd <name>\n"+
-			"  Mean it:         re-run with --force, which accepts the empty closed set as written",
-			profile, profile)
-	}
 	return fmt.Errorf("profile %s would be closed for %s with no %s entries and expansion %s, which permits nothing of that type.\n"+
 		"  Every %s request from a host bound to this profile is refused, and the refusal names no package because none is listed.\n"+
 		"  List something:  bodega profile add %s %s <name>\n"+
@@ -955,13 +941,15 @@ abort an apt transaction the client had already planned.
 
 freebsd rules name packages inside a pkg repository, and a profile that
 states one is served a catalogue bodega filters and re-signs with its own pkg
-key, at /freebsd-profile/<profile>/<abi>/<repo>/. That trade only pays when
-the filter removes something, so a freebsd rule must be closed with expansion
-block, and its entries take exact or any: pkg versions carry a port revision
-(1.26.2_1,1), which compatible and patch cannot compare.
+key, at /freebsd-profile/<profile>/<abi>/<repo>/. Every rule shape filters by
+the same predicate a fetch is judged by: closed with block keeps the listed
+packages alone, and open membership, warn and ignore keep unlisted packages
+while still dropping every version an entry's constraint refuses. Entries take
+exact or any: pkg versions carry a port revision (1.26.2_1,1), which
+compatible and patch cannot compare.
 
-  bodega profile set web freebsd --membership closed --expansion block --force
   bodega profile add web freebsd nginx
+  bodega profile set web freebsd --membership closed --expansion block
   bodega doctor --write-pkg-repo --url https://bodega.internal
 
 --expansion defaults to warn and applies to a closed type alone, because an
@@ -1031,9 +1019,6 @@ name keeps the value it has.`,
 			if err := checkProfileAptBase(gf, profile, rule); err != nil {
 				return err
 			}
-			if err := checkProfileFreeBSDRule(profile, rule); err != nil {
-				return err
-			}
 			rule.Actor = audit.CurrentActor()
 
 			if rule.Membership == audit.MembershipClosed && refusesUnlisted(rule.Expansion) && !force {
@@ -1057,6 +1042,9 @@ name keeps the value it has.`,
 			case typ == manifest.TypeFreeBSD:
 				fmt.Printf("  filtered catalogue: %s/<abi>/<repo>/, signed with bodega's pkg key; install it on a bound host with bodega doctor --write-pkg-repo\n",
 					pkgrepos.ProfilePath(profile))
+				if rule.Membership != audit.MembershipClosed || !refusesUnlisted(rule.Expansion) {
+					fmt.Println("  this rule permits packages the profile does not list, so the catalogue keeps them and drops only versions an entry's constraint refuses")
+				}
 			case rule.AptBase != "":
 				fmt.Printf("  filtered codename: %s (from %s), served after the next index rebuild\n",
 					config.ProfileAptCodename(rule.AptBase, profile), rule.AptBase)
@@ -1803,37 +1791,6 @@ func requireFreeBSDConstraint(typ, kind string) error {
 			"  Or float it:       --constraint any", kind, kind)
 	}
 	return nil
-}
-
-// checkProfileFreeBSDRule refuses a freebsd marker that would filter nothing
-// by membership. A profile governing freebsd is served a catalogue bodega
-// filters and re-signs, which moves the host's trust from FreeBSD's key to
-// bodega's; under open membership, or a closed set whose expansion permits an
-// unlisted package, every record survives the filter and the host pays that
-// trade for nothing. entitle.Profile.FreeBSDScope is the server's half of the
-// same rule, for a marker stored before this check existed.
-func checkProfileFreeBSDRule(profile string, rule audit.ProfileTypeRule) error {
-	if rule.Type != manifest.TypeFreeBSD {
-		return nil
-	}
-	var why string
-	switch {
-	case rule.Membership != audit.MembershipClosed:
-		why = fmt.Sprintf("membership %s admits every package the repository publishes", orNone(rule.Membership))
-	case !refusesUnlisted(rule.Expansion):
-		have := audit.ExpansionOrDefault(rule.Expansion)
-		if rule.Expansion == "" {
-			have += " (the default this rule does not name)"
-		}
-		why = fmt.Sprintf("expansion %s permits a package the profile does not list", have)
-	default:
-		return nil
-	}
-	return fmt.Errorf("a freebsd rule needs --membership closed with --expansion %s; %s, so every record in the repository survives the filter "+
-		"and the host's catalogue would be FreeBSD's whole repository re-signed by bodega instead of by FreeBSD, for nothing filtered.\n"+
-		"  Filter it:  bodega profile set %s freebsd --membership closed --expansion %s\n"+
-		"  Or state no freebsd rule, and the host reads the repository as published, verified against /usr/share/keys/pkg",
-		audit.ExpansionBlock, why, profile, audit.ExpansionBlock)
 }
 
 func constraintSuffix(e audit.ProfileEntry) string {

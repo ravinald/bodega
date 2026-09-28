@@ -169,35 +169,6 @@ func (p *Profile) AptScope() (base, refused string) {
 	return r.AptBase, ""
 }
 
-// FreeBSDScope reports whether this profile's freebsd hosts read a catalog
-// filtered for it, and refused names the rule that disqualifies one when the
-// profile governs freebsd and gets none.
-//
-// It is AptScope's rule with no base to opt in by: pkg reads a catalog before
-// it fetches anything, so a filtered catalog is the only way a profile
-// subtracts anything a host is told exists, and every closed-and-block rule
-// gets one. Open membership and an expansion other than block are the two
-// roads to a filtered catalog that filters nothing by membership, served under
-// bodega's signature in place of FreeBSD's. checkProfileFreeBSDRule refuses
-// both at the write; a rule stored before that check existed still reaches
-// here and is reported rather than served.
-func (p *Profile) FreeBSDScope() (scoped bool, refused string) {
-	if p == nil {
-		return false, ""
-	}
-	r, ok := p.types[manifest.TypeFreeBSD]
-	if !ok {
-		return false, ""
-	}
-	switch {
-	case r.Membership != audit.MembershipClosed:
-		return false, fmt.Sprintf("its freebsd membership is %s, which admits every package the repository publishes", r.Membership)
-	case r.Expansion != audit.ExpansionBlock:
-		return false, fmt.Sprintf("its freebsd expansion is %s, which permits a package the profile does not list, so the filtered catalog would carry every upstream record", audit.ExpansionOrDefault(r.Expansion))
-	}
-	return true, ""
-}
-
 // Fingerprint identifies everything this profile says about typ: the marker
 // and every entry of that type. A catalog built for the profile is stale the
 // moment it changes, and a binding refresh builds a new Profile for an

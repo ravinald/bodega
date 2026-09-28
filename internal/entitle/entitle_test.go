@@ -394,26 +394,6 @@ func TestKeyCanonicalizesEverySpellingOfOneDistribution(t *testing.T) {
 	}
 }
 
-// FreeBSDScope is AptScope's rule with no base: closed and block, or nothing,
-// and the refusal names the field that disqualified it.
-func TestFreeBSDScope(t *testing.T) {
-	for _, tc := range []struct {
-		rule    audit.ProfileTypeRule
-		scoped  bool
-		refuses string
-	}{
-		{blocking(rule(manifest.TypeFreeBSD, audit.MembershipClosed, audit.VersionFloating)), true, ""},
-		{rule(manifest.TypeFreeBSD, audit.MembershipClosed, audit.VersionFloating), false, "expansion is warn"},
-		{blocking(rule(manifest.TypeFreeBSD, audit.MembershipOpen, audit.VersionFloating)), false, "membership is open"},
-		{blocking(rule(manifest.TypeApt, audit.MembershipClosed, audit.VersionFloating)), false, ""},
-	} {
-		scoped, refused := profile("web", []audit.ProfileTypeRule{tc.rule}, nil).FreeBSDScope()
-		if scoped != tc.scoped || !strings.Contains(refused, tc.refuses) || (tc.refuses == "" && refused != "") {
-			t.Errorf("%+v: FreeBSDScope = %v %q, want %v and a reason naming %q", tc.rule, scoped, refused, tc.scoped, tc.refuses)
-		}
-	}
-}
-
 // Fingerprint moves with anything that changes what a filtered catalogue
 // holds, and with nothing on another type.
 func TestFingerprintTracksOneType(t *testing.T) {

@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -28,12 +27,12 @@ import (
 //
 // pkg decides what to fetch by reading a catalogue, exactly as apt does, so the
 // catalogue is the control and the gate on the objects is the backstop. A
-// profile that scopes freebsd (entitle.Profile.FreeBSDScope) is served, per
-// repository and ABI, a packagesite.pkg and data.pkg holding only the records
-// the profile permits, at pkgrepos.ProfilePath(<profile>)/<abi>/<repo>/. A host
-// bound to that profile is refused the unfiltered catalogue, and a .pkg it
-// composed by hand is refused by freeBSDObjectGate with the profile's own
-// refusal text.
+// profile that governs freebsd, whatever its membership and expansion, is
+// served, per repository and ABI, a packagesite.pkg and data.pkg holding only
+// the records entitle.Profile.Permits admits, at
+// pkgrepos.ProfilePath(<profile>)/<abi>/<repo>/. A host bound to that profile
+// is refused the unfiltered catalogue, and an object it composed by hand is
+// decided by freeBSDObjectGate against the record that names it.
 //
 // Filtering discards whatever signature upstream put on the catalogue, so
 // every filtered catalogue is signed by bodega's pkg key, proxied upstreams
@@ -86,12 +85,9 @@ func (s *Server) freeBSDProfileView(ctx context.Context, name string) (*entitle.
 		return nil, fmt.Sprintf("no profile %q serves a filtered pkg catalogue here", name)
 	}
 	p := entitle.New(d)
-	if scoped, refused := p.FreeBSDScope(); !scoped {
-		if refused == "" {
-			refused = "it states no freebsd rule"
-		}
-		return nil, fmt.Sprintf("profile %q has no filtered pkg catalogue: %s. Close it with block: bodega profile set %s freebsd --membership closed --expansion block",
-			name, refused, name)
+	if !p.Governs(manifest.TypeFreeBSD) {
+		return nil, fmt.Sprintf("profile %q states no freebsd rule, so it has no filtered pkg catalogue. Give it one: bodega profile add %s freebsd <name>",
+			name, name)
 	}
 	return p, ""
 }
@@ -99,7 +95,7 @@ func (s *Server) freeBSDProfileView(ctx context.Context, name string) (*entitle.
 // freeBSDCatalogGate decides a repository-root file. It answers true when the
 // handler should carry on.
 //
-// On the published path, a host whose profile scopes freebsd is refused the
+// On the published path, a host whose profile governs freebsd is refused the
 // catalogue outright. Serving it would hand the host every record the profile
 // refuses, which is the disclosure the filtered view exists to close, and a
 // host still reading it is one whose stanza predates its binding: the refusal
@@ -110,7 +106,7 @@ func (s *Server) freeBSDProfileView(ctx context.Context, name string) (*entitle.
 // and nothing a pkg client asks for when those fail would be filtered.
 func (s *Server) freeBSDCatalogGate(w http.ResponseWriter, r *http.Request, abi, repo, rest string, view *entitle.Profile) bool {
 	host := s.profileFor(r)
-	scoped, _ := host.FreeBSDScope()
+	scoped := host.Governs(manifest.TypeFreeBSD)
 	if view != nil && slices.Contains(manifest.FreeBSDFallbackRootFiles, rest) {
 		http.Error(w, rest+" is not served under a profile's filtered view: it serves meta.conf, data.pkg and packagesite.pkg, filtered and signed by bodega", http.StatusNotFound)
 		return false
@@ -121,49 +117,142 @@ func (s *Server) freeBSDCatalogGate(w http.ResponseWriter, r *http.Request, abi,
 	want := s.publicBase(r) + pkgrepos.ProfilePath(host.Name()) + "/" + abi + "/" + repo + "/"
 	s.logger.Info("freebsd: refused a catalogue outside the filtered view the host's profile is served",
 		"profile", host.Name(), "abi", abi, "repo", repo, "file", rest)
-	http.Error(w, fmt.Sprintf("profile %q scopes freebsd, so this host reads the catalogue filtered for it at %s and not this one.\n"+
+	http.Error(w, fmt.Sprintf("profile %q governs freebsd, so this host reads the catalogue filtered for it at %s and not this one.\n"+
 		"  Install that stanza:  bodega doctor --write-pkg-repo\n", host.Name(), want), http.StatusForbidden)
 	return false
 }
 
 // freeBSDObjectGate is the backstop: a path under a repository that is not a
 // root file is a package, and the host's profile decides it by the name and
-// version its filename carries. It answers true when the handler should
-// carry on.
+// version the catalogue record naming that path declares. It answers true
+// when the handler should carry on.
 //
-// The filename rather than a catalogue lookup, because pkg names every object
-// <name>-<version>[~<hash>].<ext> and the filter judges the record's own name
-// and version with the same predicate, so the two agree on every object pkg
-// published. An object a generated repository stores under some other name
-// is judged by what its filename says, which refuses a package the catalogue
-// lists rather than serving one it does not: the failure is a 403 naming the
-// package, not a leak.
-func (s *Server) freeBSDObjectGate(w http.ResponseWriter, r *http.Request, rest string) bool {
-	name, version := freeBSDObjectIdentity(rest)
-	return s.entitleGate(w, r, manifest.TypeFreeBSD, name, version)
+// The record rather than the filename, because the two can disagree: a
+// generated repository takes a record's identity from the package's own
+// manifest and its repopath from wherever the operator stored it, so
+// All/nginx-1.0.pkg may hold tree. The filter judges records, and the gate
+// judging anything else is a gate that serves what the catalogue withheld.
+// For the same reason an object no record names is refused outright, since
+// nothing says what it is: that covers Latest/pkg.pkg and its .sig, which
+// alias a package whose version the path does not carry, and any object an
+// operator stored outside the catalogue.
+//
+// A host whose profile does not govern freebsd never reaches the catalogue
+// read, so the published repository costs it nothing.
+func (s *Server) freeBSDObjectGate(w http.ResponseWriter, r *http.Request, src freeBSDCatalogSource, rest string) bool {
+	p := s.profileFor(r)
+	if !p.Governs(manifest.TypeFreeBSD) {
+		return true
+	}
+	id, listed, status, errBody := s.freeBSDObjectRecord(r, src, rest)
+	if status != http.StatusOK {
+		s.logger.Error("freebsd: the catalogue that decides a governed host's package fetch could not be read; refusing the fetch",
+			"profile", p.Name(), "abi", src.abi, "repo", src.repo, "path", rest, "status", status, "error", strings.TrimSpace(errBody))
+		http.Error(w, fmt.Sprintf("profile %q decides each package in %s@%s by the catalogue record that names it, and that catalogue could not be read (%d %s), "+
+			"so no package there is served to this host until it can. The server log names the cause.",
+			p.Name(), src.repo, src.abi, status, http.StatusText(status)), http.StatusServiceUnavailable)
+		return false
+	}
+	if listed {
+		return s.entitleGate(w, r, manifest.TypeFreeBSD, id.name, id.version)
+	}
+	d := entitle.Decision{
+		Governed: true,
+		Refusal:  entitle.RefusalMembership,
+		Reason:   fmt.Sprintf("no record in the catalogue of %s@%s names %s", src.repo, src.abi, rest),
+	}
+	s.recordProfileRefusal(r, p, manifest.TypeFreeBSD, rest, "", d)
+	http.Error(w, fmt.Sprintf("%s: profile %q is decided per package, and no record in the catalogue of %s@%s names %s, so nothing says which package it holds.\n"+
+		"  pkg fetches the path a record names; an alias such as Latest/pkg.pkg, or an object stored outside the catalogue, is not one.\n"+
+		"  See what the catalogue lists:  pkg search -r %s%s -x '.*'\n",
+		entitle.RefusalMembership, p.Name(), src.repo, src.abi, rest, pkgrepos.TagPrefix, src.repo), http.StatusForbidden)
+	return false
 }
 
-// freeBSDObjectIdentity reads the package name and version out of a
-// repository path. pkg joins them with the last hyphen, since a version holds
-// none and a name may hold several; a hashed layout appends ~<hash>, and a
-// signature beside a package names that package. A filename carrying no
-// hyphen is a name with no version, which Covers decides on membership alone.
-func freeBSDObjectIdentity(rest string) (name, version string) {
-	base := strings.TrimSuffix(path.Base(rest), ".sig")
-	for _, ext := range []string{".pkg", ".tzst", ".txz", ".tbz", ".tgz", ".tar"} {
-		if trimmed, ok := strings.CutSuffix(base, ext); ok {
-			base = trimmed
-			break
+// freeBSDCatalogSource is what freeBSDPublishedCatalog needs to read one
+// repository's catalogue the way the route serves it.
+type freeBSDCatalogSource struct {
+	store      storage.ObjectStore
+	abi, repo  string
+	generated  bool
+	ve         manifest.VersionEntry
+	configured bool
+	proxied    bool
+}
+
+// freeBSDIdentity is the package a catalogue record declares.
+type freeBSDIdentity struct{ name, version string }
+
+// freeBSDCatalogIndex maps every repopath one published catalogue names to
+// its record's identity, and is independent of any profile: Permits runs per
+// request against whichever profile the host is bound to now.
+type freeBSDCatalogIndex struct {
+	digest  string
+	builtAt time.Time
+	objects map[string]freeBSDIdentity
+}
+
+// freeBSDObjectRecord finds the record naming rest, or the .pkg a .sig sits
+// beside, in the repository's published catalogue.
+//
+// An index younger than the metadata TTL answers a hit without reading the
+// catalogue: a repopath is content-addressed or version-named, so the record
+// that named it still describes the object. A miss, or an older index, reads
+// the catalogue and rebuilds when its digest moved, so a package published
+// since the last build is found rather than refused until the TTL runs out.
+func (s *Server) freeBSDObjectRecord(r *http.Request, src freeBSDCatalogSource, rest string) (freeBSDIdentity, bool, int, string) {
+	cacheKey := "index\x00" + src.abi + "\x00" + src.repo
+	lookup := func(idx *freeBSDCatalogIndex) (freeBSDIdentity, bool) {
+		if id, ok := idx.objects[rest]; ok {
+			return id, true
+		}
+		if pkg, ok := strings.CutSuffix(rest, ".sig"); ok {
+			id, ok := idx.objects[pkg]
+			return id, ok
+		}
+		return freeBSDIdentity{}, false
+	}
+	cached := func() *freeBSDCatalogIndex {
+		if v, ok := s.freeBSDCat.Load(cacheKey); ok {
+			if idx, ok := v.(*freeBSDCatalogIndex); ok {
+				return idx
+			}
+		}
+		return nil
+	}
+	if idx := cached(); idx != nil && s.cache.MetadataTTL > 0 && time.Since(idx.builtAt) < s.cache.MetadataTTL {
+		if id, ok := lookup(idx); ok {
+			return id, true, http.StatusOK, ""
 		}
 	}
-	if i := strings.IndexByte(base, '~'); i >= 0 {
-		base = base[:i]
+
+	body, status, errBody := s.freeBSDPublishedCatalog(r, src.store, src.abi, src.repo, src.generated, src.ve, src.configured, src.proxied)
+	if status != http.StatusOK {
+		return freeBSDIdentity{}, false, status, errBody
 	}
-	i := strings.LastIndexByte(base, '-')
-	if i <= 0 || i == len(base)-1 {
-		return base, ""
+	sum := sha256.Sum256(body)
+	digest := hex.EncodeToString(sum[:])
+
+	unlock := s.freeBSDBuild.lock(cacheKey)
+	defer unlock()
+	idx := cached()
+	if idx == nil || idx.digest != digest {
+		objects := map[string]freeBSDIdentity{}
+		err := walkFreeBSDCatalog(body, func(_ []byte, name, version, repopath string) {
+			if repopath != "" {
+				objects[repopath] = freeBSDIdentity{name: name, version: version}
+			}
+		})
+		if err != nil {
+			return freeBSDIdentity{}, false, http.StatusInternalServerError,
+				fmt.Sprintf("index the published %s for %s@%s: %v", manifest.FreeBSDCatalogFile, src.repo, src.abi, err)
+		}
+		idx = &freeBSDCatalogIndex{digest: digest, objects: objects}
 	}
-	return base[:i], base[i+1:]
+	idx = &freeBSDCatalogIndex{digest: idx.digest, objects: idx.objects, builtAt: time.Now()}
+	s.freeBSDCat.Store(cacheKey, idx)
+	id, ok := lookup(idx)
+	return id, ok, http.StatusOK, ""
 }
 
 // serveFreeBSDProfileCatalog answers one of the three root files under a
@@ -327,17 +416,36 @@ func (s *Server) freeBSDProfileCatalog(ctx context.Context, view *entitle.Profil
 // filterFreeBSDCatalog keeps the packagesite.yaml records the profile permits,
 // as the upstream's own bytes, and counts both halves.
 //
-// A record that does not parse, or names no package, fails the whole filter:
-// the kept set up to that line is a catalogue bodega would sign and serve as
-// if it were complete, and every package after the break would read to the
-// host as one the profile refuses. The same reasoning is filterAptPackages'.
-//
 // An empty result is not a failure. A profile applies to every repository, and
 // one that lists packages from latest/ correctly keeps nothing from kmods/.
 func filterFreeBSDCatalog(src []byte, p *entitle.Profile) (records []json.RawMessage, kept, dropped int, err error) {
+	err = walkFreeBSDCatalog(src, func(raw []byte, name, version, _ string) {
+		if !p.Permits(manifest.TypeFreeBSD, name, version).Permitted {
+			dropped++
+			return
+		}
+		kept++
+		records = append(records, json.RawMessage(bytes.Clone(raw)))
+	})
+	if err != nil {
+		return nil, kept, dropped, err
+	}
+	return records, kept, dropped, nil
+}
+
+// walkFreeBSDCatalog calls fn once per packagesite.yaml record in a catalogue
+// archive, in order. The filter and the object gate both read records through
+// it, so the two cannot disagree about which package a record declares.
+//
+// A record that does not parse, or names no package and version, fails the
+// whole walk: a filtered catalogue built up to that line is one bodega would
+// sign and serve as if it were complete, and every package after the break
+// would read to the host as one the profile refuses. The same reasoning is
+// filterAptPackages'.
+func walkFreeBSDCatalog(src []byte, fn func(raw []byte, name, version, repopath string)) error {
 	dec, closeDec, err := freeBSDPkgDecompressor(bufio.NewReader(bytes.NewReader(src)))
 	if err != nil {
-		return nil, 0, 0, err
+		return err
 	}
 	defer closeDec()
 	tr := tar.NewReader(dec)
@@ -347,7 +455,7 @@ func filterFreeBSDCatalog(src []byte, p *entitle.Profile) (records []json.RawMes
 			break
 		}
 		if err != nil {
-			return nil, 0, 0, fmt.Errorf("read the catalogue archive: %w", err)
+			return fmt.Errorf("read the catalogue archive: %w", err)
 		}
 		if strings.TrimPrefix(hdr.Name, "./") != freeBSDCatalogDoc {
 			continue
@@ -362,23 +470,19 @@ func filterFreeBSDCatalog(src []byte, p *entitle.Profile) (records []json.RawMes
 				continue
 			}
 			var rec struct {
-				Name    string `json:"name"`
-				Version string `json:"version"`
+				Name     string `json:"name"`
+				Version  string `json:"version"`
+				Repopath string `json:"repopath"`
 			}
 			if err := json.Unmarshal(raw, &rec); err != nil || rec.Name == "" || rec.Version == "" {
-				return nil, kept, dropped, fmt.Errorf("record %d of %s names no package and version, and everything after it would be missing from a catalogue bodega signs", line, freeBSDCatalogDoc)
+				return fmt.Errorf("record %d of %s names no package and version, and everything after it would be missing from a catalogue bodega signs", line, freeBSDCatalogDoc)
 			}
-			if !p.Permits(manifest.TypeFreeBSD, rec.Name, rec.Version).Permitted {
-				dropped++
-				continue
-			}
-			kept++
-			records = append(records, json.RawMessage(bytes.Clone(raw)))
+			fn(raw, rec.Name, rec.Version, rec.Repopath)
 		}
 		if err := sc.Err(); err != nil {
-			return nil, kept, dropped, fmt.Errorf("read %s past record %d: %w", freeBSDCatalogDoc, line, err)
+			return fmt.Errorf("read %s past record %d: %w", freeBSDCatalogDoc, line, err)
 		}
-		return records, kept, dropped, nil
+		return nil
 	}
-	return nil, 0, 0, fmt.Errorf("the catalogue archive carries no %s member", freeBSDCatalogDoc)
+	return fmt.Errorf("the catalogue archive carries no %s member", freeBSDCatalogDoc)
 }

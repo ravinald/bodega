@@ -1526,7 +1526,7 @@ components:
           type: string
           description: >-
             The profile the requesting host is bound to, when that profile
-            scopes freebsd. url then names the catalogue bodega filtered for
+            states a freebsd rule. url then names the catalogue bodega filtered for
             that profile, re-signed with bodega's pkg key, and signature_type
             and fingerprints trust that key rather than FreeBSD's. Absent for
             a host no such profile binds.

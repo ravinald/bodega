@@ -1693,7 +1693,7 @@ web freebsd: membership=closed version_default=floating expansion=block
   filtered catalogue: /freebsd-profile/web/<abi>/<repo>/, signed with bodega's pkg key; install it on a bound host with bodega doctor --write-pkg-repo
 ```
 
-`set` refuses two shapes, and each refusal says why. An open membership, or a closed one whose expansion is `warn` or `ignore`, keeps every record in the repository, so the host would be served FreeBSD's whole catalogue re-signed by bodega instead of by FreeBSD: a trust downgrade with nothing filtered in return. The same rule `--base` enforces for apt, reached without a base to opt in by. `compatible` and `patch` are refused on an entry, because a pkg version carries a port revision and an epoch (`1.26.2_1,3`) and neither can compare one; `exact` and `any` both work, and `bodega profile pin web freebsd nginx 1.26.2_1,3 --reason ...` holds one. `bodega profile check` reports freebsd entries as unchecked rather than failing on them, since the manifest store holds the repository and not the packages inside it.
+Every membership and expansion shape is served a filtered catalogue, and each filters by the same predicate a fetch is judged by. Closed with `block` keeps the listed packages alone. An open membership, or a closed one whose expansion is `warn` or `ignore`, keeps the packages the profile does not list and still drops every version an entry's constraint refuses, so a profile that pins `curl` to `8.8.0` removes `curl 8.9.1` from the catalogue under any of them; `set` says so when it stores one. `warn` records each fetch of an unlisted package, as it does for every other type. A shape with no entries filters nothing and still moves the host's trust onto bodega's key, which is the cost of stating a freebsd rule at all. `compatible` and `patch` are refused on an entry, because a pkg version carries a port revision and an epoch (`1.26.2_1,3`) and neither can compare one; `exact` and `any` both work, and `bodega profile pin web freebsd nginx 1.26.2_1,3 --reason ...` holds one. `bodega profile check` reports freebsd entries as unchecked rather than failing on them, since the manifest store holds the repository and not the packages inside it.
 
 **How the catalogue is built.** bodega reads the repository's published `packagesite.pkg` the way the route would serve it (from the store for a hosted mirror, through the cache for a proxied one, from the build for a generated one), keeps the `packagesite.yaml` records the profile permits as upstream's own bytes, and writes `data.pkg` from the same kept records so the two documents cannot disagree. `meta.conf` is bodega's own and names the two archives it builds. The result is cached per profile, repository and ABI, and rebuilt when the published catalogue, the profile's freebsd rules or the signing key moves. Nothing is stored. A profile that lists nothing a repository publishes gets an empty catalogue for it, which is correct for a profile scoped to `latest/` reading `kmods/`.
 
@@ -1712,13 +1712,16 @@ bodega-latest is up to date.
 pkg: No packages available to install matching 'nano' have been found in the repositories
 ```
 
-A `.pkg` fetched by hand is refused with 403, by the name and version its filename carries, in the vocabulary every other type uses. A membership refusal offers one repair, since opening a freebsd rule is the one `set` refuses:
+A `.pkg` fetched by hand is refused with 403 in the vocabulary every other type uses, on either root. The gate judges the package by the name and version of the catalogue record whose `repopath` names the object, not by its filename, because a generated repository takes a package's identity from its own manifest and stores it wherever it was uploaded:
 
 ```text
 $ curl 'https://bodega.internal/freebsd/FreeBSD:15:aarch64/latest/All/Hashed/nano-9.2~2$3mdm1utt.pkg'
 membership: profile "web" does not list freebsd/nano at 9.2.
-  Add it:  bodega profile add web freebsd nano
+  Add it:      bodega profile add web freebsd nano
+  Or open it:  bodega profile set web freebsd --membership open
 ```
+
+An object no record names is refused to a bound host whatever its filename says, since nothing states which package it holds. That includes `Latest/pkg.pkg` and its `.sig`, which alias a `pkg` package without naming its version, so `pkg bootstrap` does not work through a profile: bootstrap the host before binding it. A catalogue bodega cannot read answers 503 for every package under it, to a bound host alone, rather than serving objects nothing decided on.
 
 The bound host is also refused the published catalogue at `/freebsd/<abi>/<repo>/`, with a 403 naming its view. A host whose stanza predates its binding fails `pkg update` there rather than reading every record its profile refuses. The limit is apt's: a dependency the profile does not list is filtered out with the rest, so `pkg install` of a listed package whose dependency is refused fails on the missing dependency. List the closure.
 
@@ -1739,7 +1742,7 @@ bodega-latest: {
 }
 ```
 
-`GET /api/v1/status` answers per host: its `freebsd.repos` carry `profile` and the view's URL for a host bound to a profile that scopes freebsd, and the published repository for any other. A host bound by `bodega identity bind cidr` needs no token, which is the ordinary case, since pkg sends no bodega credential.
+`GET /api/v1/status` answers per host: its `freebsd.repos` carry `profile` and the view's URL for a host bound to a profile with a freebsd rule, and the published repository for any other. The profile name is one percent-encoded path segment of that URL, so a profile named `web#prod` is served at `/freebsd-profile/web%23prod/`; `$` is encoded too, since pkg expands `${...}` in a repository URL. A profile named `.` or `..` cannot be a URL segment at all, and status refuses its stanza, naming why. A host bound by `bodega identity bind cidr` needs no token, which is the ordinary case, since pkg sends no bodega credential.
 
 ### `bodega doctor [--write-credentials --token TOKEN [--url URL]] [--write-apt-sources [--suite CODENAME]] [--write-pkg-repo [--abi ABI] [--release N]]`
 

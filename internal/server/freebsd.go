@@ -30,7 +30,7 @@ import (
 // signature, and the client would report the failure against bytes bodega
 // changed on purpose — with nothing on this side calling it a bodega fault.
 //
-// A host bound to a profile that scopes freebsd is the exception, and it reads
+// A host bound to a profile that governs freebsd is the exception, and it reads
 // a different URL: internal/server/freebsd_profile.go filters the catalogue
 // for that profile and re-signs it with bodega's key, because a filtered
 // catalogue cannot carry FreeBSD's signature. The published path refuses that
@@ -112,11 +112,7 @@ func (s *Server) serveFreeBSD(w http.ResponseWriter, r *http.Request, abi, repo,
 	fallback := slices.Contains(manifest.FreeBSDFallbackRootFiles, rest)
 	proxied := !configured || ve.EffectiveMode() == manifest.ModeProxy
 
-	if catalog || fallback {
-		if !s.freeBSDCatalogGate(w, r, abi, repo, rest, view) {
-			return
-		}
-	} else if !s.freeBSDObjectGate(w, r, rest) {
+	if (catalog || fallback) && !s.freeBSDCatalogGate(w, r, abi, repo, rest, view) {
 		return
 	}
 
@@ -151,6 +147,12 @@ func (s *Server) serveFreeBSD(w http.ResponseWriter, r *http.Request, abi, repo,
 		s.logger.Error("storage backend recorded for artifact is not configured",
 			"type", manifest.TypeFreeBSD, "package", repo, "version", abi, "error", err)
 		http.Error(w, "storage backend error", http.StatusBadGateway)
+		return
+	}
+
+	if !catalog && !fallback && !s.freeBSDObjectGate(w, r, freeBSDCatalogSource{
+		store: store, abi: abi, repo: repo, generated: generated, ve: ve, configured: configured, proxied: proxied,
+	}, rest) {
 		return
 	}
 

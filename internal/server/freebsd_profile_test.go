@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -191,9 +193,10 @@ func TestFreeBSDProfileRefusesAPackageTheCatalogueDoesNotList(t *testing.T) {
 	s := proxyingServer(t)
 	s.loadPkgSigner()
 	mirrored(t, s, "latest", map[string]string{
-		fbsdNginxPath: "nginx bytes",
-		fbsdCurlPath:  "curl bytes",
-		fbsdTreePath:  "tree bytes",
+		manifest.FreeBSDCatalogFile: publishedCatalog(t, s, upstreamPkgKey(t)),
+		fbsdNginxPath:               "nginx bytes",
+		fbsdCurlPath:                "curl bytes",
+		fbsdTreePath:                "tree bytes",
 	})
 	f := webProfile(t, s)
 
@@ -207,9 +210,6 @@ func TestFreeBSDProfileRefusesAPackageTheCatalogueDoesNotList(t *testing.T) {
 		status, body := f.get(t, root(fbsdTreePath))
 		if status != http.StatusForbidden || !strings.HasPrefix(body, entitle.RefusalMembership+":") {
 			t.Errorf("GET %s = %d %q, want 403 opening on %q", root(fbsdTreePath), status, body, entitle.RefusalMembership)
-		}
-		if strings.Contains(body, "--membership open") {
-			t.Errorf("the freebsd refusal offers --membership open, which bodega profile set refuses for freebsd:\n%s", body)
 		}
 		status, body = f.get(t, root(fbsdCurlPath))
 		if status != http.StatusForbidden || !strings.HasPrefix(body, entitle.RefusalConstraint+":") {
@@ -292,19 +292,248 @@ func TestFreeBSDStatusRendersTheProfileViewForABoundHost(t *testing.T) {
 	}
 }
 
-func TestFreeBSDObjectIdentity(t *testing.T) {
-	for _, tc := range []struct{ path, name, version string }{
-		{fbsdNginxPath, "nginx", "1.26.2_1,3"},
-		{"All/py311-requests-2.31.0.pkg", "py311-requests", "2.31.0"},
-		{freeBSDBasePath, "FreeBSD-telnet", "14.snap20260920075547"},
-		{"Latest/pkg.pkg", "pkg", ""},
-		{"Latest/pkg.pkg.sig", "pkg", ""},
-		{"All/old-1.0.txz", "old", "1.0"},
+// R3: the gate judges the identity the catalogue record declares, not the one
+// a filename suggests. A generated repository takes identity from the
+// package's own manifest and stores it wherever the operator put it, so every
+// disagreement between the two is built here: a refused package under a
+// permitted name, a pinned package at a version its filename does not say, and
+// a permitted package under an unrelated name.
+func TestFreeBSDObjectGateJudgesTheRecordNotTheFilename(t *testing.T) {
+	installPkgKey(t, pkgsign.KeyRSA)
+	s := proxyingServer(t)
+	s.loadPkgSigner()
+	const (
+		treeAsNginx   = "All/nginx-1.0.pkg"
+		nginxAsOther  = "All/renamed-1.0.pkg"
+		nginx2AsNginx = "All/Hashed/nginx-1.0~abc.pkg"
+	)
+	generatedRepo(t, s, "house", map[string]string{
+		treeAsNginx:   pkgArchive(t, `{"name":"tree","origin":"sysutils/tree","version":"2.0"}`),
+		nginxAsOther:  pkgArchive(t, `{"name":"nginx","origin":"www/nginx","version":"1.0"}`),
+		nginx2AsNginx: pkgArchive(t, `{"name":"nginx","origin":"www/nginx","version":"2.0"}`),
+	})
+	f := bindProfile(t, s, "web", "web-host",
+		[]audit.ProfileTypeRule{closedRule(manifest.TypeFreeBSD, audit.VersionFloating, audit.ExpansionBlock)},
+		[]audit.ProfileEntry{{Type: manifest.TypeFreeBSD, Name: "nginx", Constraint: manifest.ConstraintExact, Version: "1.0"}})
+
+	status, body := f.get(t, profileURL("web", "house", manifest.FreeBSDCatalogFile))
+	if status != http.StatusOK {
+		t.Fatalf("GET the view's catalogue = %d: %s", status, body)
+	}
+	if doc := string(archiveMembers(t, body)[freeBSDCatalogDoc]); !strings.Contains(doc, nginxAsOther) || strings.Contains(doc, treeAsNginx) || strings.Contains(doc, nginx2AsNginx) {
+		t.Errorf("the filtered catalogue should list %s alone:\n%s", nginxAsOther, doc)
+	}
+
+	for _, root := range []func(string) string{
+		func(p string) string { return freeBSDURL("house", p) },
+		func(p string) string { return profileURL("web", "house", p) },
 	} {
-		if name, version := freeBSDObjectIdentity(tc.path); name != tc.name || version != tc.version {
-			t.Errorf("freeBSDObjectIdentity(%q) = %q %q, want %q %q", tc.path, name, version, tc.name, tc.version)
+		for _, tc := range []struct {
+			path, refusal string
+		}{
+			{treeAsNginx, entitle.RefusalMembership},
+			{nginx2AsNginx, entitle.RefusalConstraint},
+			{nginxAsOther, ""},
+		} {
+			status, body := f.get(t, root(tc.path))
+			switch {
+			case tc.refusal == "" && status != http.StatusOK:
+				t.Errorf("GET %s = %d %q, want 200: its record is nginx 1.0", root(tc.path), status, body)
+			case tc.refusal != "" && (status != http.StatusForbidden || !strings.HasPrefix(body, tc.refusal+":")):
+				t.Errorf("GET %s = %d %q, want 403 opening on %q", root(tc.path), status, body, tc.refusal)
+			}
 		}
 	}
+}
+
+// R3: an object no record names is refused to a governed host whatever its
+// filename claims, on either root. Latest/pkg.pkg is the case that matters: it
+// names no version, so judging it by name alone would skip every pin on pkg.
+// The package it aliases stays reachable at its own repopath, under a floating
+// entry and not under a pin it breaks.
+func TestFreeBSDObjectGateRefusesAnObjectNoRecordNames(t *testing.T) {
+	installPkgKey(t, pkgsign.KeyRSA)
+	s := proxyingServer(t)
+	s.loadPkgSigner()
+	const pkgPath = "All/pkg-2.0.pkg"
+	catalog, err := s.freeBSDArchive(freeBSDCatalogDoc,
+		[]byte(`{"name":"pkg","origin":"ports-mgmt/pkg","version":"2.0","repopath":"`+pkgPath+`"}`+"\n"), upstreamPkgKey(t))
+	if err != nil {
+		t.Fatalf("build the published catalogue: %v", err)
+	}
+	mirrored(t, s, "latest", map[string]string{
+		manifest.FreeBSDCatalogFile: string(catalog),
+		pkgPath:                     "pkg 2.0 bytes",
+		pkgPath + ".sig":            "pkg 2.0 signature",
+		"Latest/pkg.pkg":            "pkg 2.0 bytes",
+		"Latest/pkg.pkg.sig":        "pkg 2.0 signature",
+	})
+	rule := []audit.ProfileTypeRule{closedRule(manifest.TypeFreeBSD, audit.VersionFloating, audit.ExpansionBlock)}
+	pinned := bindProfile(t, s, "pin", "pin-host", rule,
+		[]audit.ProfileEntry{{Type: manifest.TypeFreeBSD, Name: "pkg", Constraint: manifest.ConstraintExact, Version: "1.0"}})
+	floating := bindProfile(t, s, "float", "float-host", rule,
+		[]audit.ProfileEntry{{Type: manifest.TypeFreeBSD, Name: "pkg"}})
+
+	for _, tc := range []struct {
+		f       *profileFixture
+		profile string
+		path    string
+		refusal string
+	}{
+		{pinned, "pin", "Latest/pkg.pkg", entitle.RefusalMembership},
+		{pinned, "pin", "Latest/pkg.pkg.sig", entitle.RefusalMembership},
+		{pinned, "pin", pkgPath, entitle.RefusalConstraint},
+		{pinned, "pin", pkgPath + ".sig", entitle.RefusalConstraint},
+		{floating, "float", "Latest/pkg.pkg", entitle.RefusalMembership},
+		{floating, "float", "Latest/pkg.pkg.sig", entitle.RefusalMembership},
+		{floating, "float", pkgPath, ""},
+		{floating, "float", pkgPath + ".sig", ""},
+	} {
+		for _, url := range []string{freeBSDURL("latest", tc.path), profileURL(tc.profile, "latest", tc.path)} {
+			status, body := tc.f.get(t, url)
+			switch {
+			case tc.refusal == "" && status != http.StatusOK:
+				t.Errorf("%s: GET %s = %d %q, want 200", tc.profile, url, status, body)
+			case tc.refusal != "" && (status != http.StatusForbidden || !strings.HasPrefix(body, tc.refusal+":")):
+				t.Errorf("%s: GET %s = %d %q, want 403 opening on %q", tc.profile, url, status, body, tc.refusal)
+			}
+		}
+	}
+
+	// Without a catalogue there is no record to judge by, so a governed host
+	// is served nothing and an unbound one is served as before.
+	mirrored(t, s, "bare", map[string]string{pkgPath: "pkg 2.0 bytes"})
+	if status, body := floating.get(t, freeBSDURL("bare", pkgPath)); status != http.StatusServiceUnavailable {
+		t.Errorf("a governed GET with no catalogue = %d %q, want 503", status, body)
+	}
+	if status, body := getStatusAndBody(t, s, freeBSDURL("bare", pkgPath)); status != http.StatusOK {
+		t.Errorf("an unbound GET with no catalogue = %d %q, want 200", status, body)
+	}
+}
+
+// R1, R2, R4: every rule shape the vocabulary expresses is filtered by the
+// whole predicate, not closed-and-block alone. With curl pinned to a version
+// upstream no longer carries, open membership and closed with warn or ignore
+// all keep the unlisted tree and drop curl 8.9.1, and the host's stanza points
+// at the view that does so.
+func TestFreeBSDProfileFiltersEveryRuleShape(t *testing.T) {
+	for _, rule := range []audit.ProfileTypeRule{
+		{Type: manifest.TypeFreeBSD, Membership: audit.MembershipOpen, VersionDefault: audit.VersionFloating},
+		closedRule(manifest.TypeFreeBSD, audit.VersionFloating, audit.ExpansionWarn),
+		closedRule(manifest.TypeFreeBSD, audit.VersionFloating, audit.ExpansionIgnore),
+	} {
+		t.Run(rule.Membership+"-"+rule.Expansion, func(t *testing.T) {
+			bodegaKey := installPkgKey(t, pkgsign.KeyRSA)
+			s := proxyingServer(t)
+			s.loadPkgSigner()
+			up := upstreamPkgKey(t)
+			// A url, so the status block has an upstream to name a trust store
+			// for; the mode keeps every read in the store.
+			addVersion(t, s, manifest.TypeFreeBSD, "latest", manifest.VersionEntry{
+				Version: freeBSDABI, URL: "https://pkg.example.org/" + freeBSDABI + "/latest",
+			})
+			seed(t, s, manifest.TypeFreeBSD, map[string]string{
+				manifest.FreeBSDKey(freeBSDABI, "latest", manifest.FreeBSDCatalogFile): publishedCatalog(t, s, up),
+				manifest.FreeBSDKey(freeBSDABI, "latest", fbsdCurlPath):                "curl bytes",
+				manifest.FreeBSDKey(freeBSDABI, "latest", fbsdTreePath):                "tree bytes",
+			})
+			f := bindProfile(t, s, "web", "web-host", []audit.ProfileTypeRule{rule}, []audit.ProfileEntry{
+				{Type: manifest.TypeFreeBSD, Name: "nginx"},
+				{Type: manifest.TypeFreeBSD, Name: "curl", Constraint: manifest.ConstraintExact, Version: "8.8.0"},
+			})
+			bodegaPub, err := bodegaKey.PublicKey()
+			if err != nil {
+				t.Fatalf("render bodega's public key: %v", err)
+			}
+
+			status, body := f.get(t, profileURL("web", "latest", manifest.FreeBSDCatalogFile))
+			if status != http.StatusOK {
+				t.Fatalf("GET the view's catalogue = %d: %s", status, body)
+			}
+			if names := catalogNames(t, body, freeBSDCatalogDoc, bodegaPub, up.pub); strings.Join(names, " ") != "nginx tree" {
+				t.Errorf("the view names %v, want nginx and tree: curl 8.9.1 breaks its pin", names)
+			}
+			if status, body := f.get(t, freeBSDURL("latest", fbsdCurlPath)); status != http.StatusForbidden || !strings.HasPrefix(body, entitle.RefusalConstraint+":") {
+				t.Errorf("GET curl = %d %q, want a constraint refusal", status, body)
+			}
+			if status, _ := f.get(t, freeBSDURL("latest", fbsdTreePath)); status != http.StatusOK {
+				t.Errorf("GET tree = %d, want 200: the rule permits a package it does not list", status)
+			}
+			if status, _ := f.get(t, freeBSDURL("latest", manifest.FreeBSDCatalogFile)); status != http.StatusForbidden {
+				t.Errorf("a bound GET of the published catalogue = %d, want 403", status)
+			}
+			if repo := boundStatus(t, s, f.token).RepoFor("latest", freeBSDABI); repo == nil || repo.Profile != "web" {
+				t.Errorf("the bound host's stanza = %+v, want the web view", repo)
+			}
+		})
+	}
+}
+
+// R4: any name a profile accepts becomes a URL that routes back to the same
+// profile. Each of these is valid for bodega profile create and each breaks a
+// URL written by concatenation: '#' ends the path, '?' starts a query, '%'
+// begins an escape, '$' is expanded by pkg, and a dot segment is resolved away.
+func TestFreeBSDProfileURLRoutesEveryValidName(t *testing.T) {
+	installPkgKey(t, pkgsign.KeyRSA)
+	s := proxyingServer(t)
+	s.loadPkgSigner()
+	generatedRepo(t, s, "latest", map[string]string{})
+	rule := []audit.ProfileTypeRule{closedRule(manifest.TypeFreeBSD, audit.VersionFloating, audit.ExpansionBlock)}
+	entries := []audit.ProfileEntry{{Type: manifest.TypeFreeBSD, Name: "nginx"}}
+
+	for i, name := range []string{"web#prod", "web?prod", "50%off", "${ABI}", "a.b", "ünï", "a+b=c@d:e&f"} {
+		f := bindProfile(t, s, name, "host-"+strconv.Itoa(i), rule, entries)
+		repo := boundStatus(t, s, f.token).RepoFor("latest", freeBSDABI)
+		if repo == nil {
+			t.Errorf("%q: status names no stanza", name)
+			continue
+		}
+		if strings.Contains(strings.ReplaceAll(repo.URL, "${ABI}", ""), "$") {
+			t.Errorf("%q: url %q carries a '$' pkg would expand", name, repo.URL)
+		}
+		u, err := url.Parse(strings.ReplaceAll(repo.URL, "${ABI}", freeBSDABI) + "/" + manifest.FreeBSDCatalogFile)
+		if err != nil {
+			t.Errorf("%q: url %q does not parse: %v", name, repo.URL, err)
+			continue
+		}
+		if u.Fragment != "" || u.RawQuery != "" {
+			t.Errorf("%q: url %q puts part of the path in a fragment or query", name, repo.URL)
+		}
+		if status, body := f.get(t, u.EscapedPath()); status != http.StatusOK {
+			t.Errorf("%q: GET %s = %d %q, want the profile's catalogue", name, u.EscapedPath(), status, body)
+		}
+		again, err := repo.WithRelease(14)
+		if err != nil || again.URL != repo.URL {
+			t.Errorf("%q: WithRelease changed the url to %q (%v)", name, again.URL, err)
+		}
+	}
+
+	// A dot segment has no escaped form a server will route, so the stanza is
+	// refused with a reason the bound host is allowed to read.
+	for i, name := range []string{".", ".."} {
+		f := bindProfile(t, s, name, "dot-host-"+strconv.Itoa(i), rule, entries)
+		st := boundStatus(t, s, f.token)
+		if st.RepoFor("latest", freeBSDABI) != nil || len(st.Refused) != 1 || !strings.Contains(st.Refused[0].Error, "cannot be one segment of a URL") {
+			t.Errorf("%q: status = %+v, want the stanza refused naming why", name, st)
+		}
+	}
+}
+
+// boundStatus reads the freebsd block of /api/v1/status as the host holding
+// token reads it.
+func boundStatus(t *testing.T, s *Server, token string) freebsdStatus {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/status", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	var out struct {
+		FreeBSD freebsdStatus `json:"freebsd"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("parse status: %v\n%s", err, rec.Body.String())
+	}
+	return out.FreeBSD
 }
 
 // R4: with no pkg key, the bound host's stanza is refused, and the reason
