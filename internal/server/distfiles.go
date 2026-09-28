@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -47,6 +49,14 @@ var distfilesGuard = func(rawURL string) error {
 		return fmt.Errorf("distfiles upstream URL must use http or https, got %q", u.Scheme)
 	}
 	return checkUpstreamHost(u.Hostname())
+}
+
+// rewindSpool returns a spooled distfile to its start before it is served. A
+// variable so a test can make it fail: no real file on a working disk refuses
+// a seek to 0.
+var rewindSpool = func(f *os.File) error {
+	_, err := f.Seek(0, io.SeekStart)
+	return err
 }
 
 // distfilesUpstreamClient is upstreamClient with distfilesGuard on every
@@ -183,19 +193,21 @@ func (s *Server) handleDistfiles(w http.ResponseWriter, r *http.Request) {
 		// 451 names the reason a 404 would hide. The client moves on to the
 		// port's own sites either way, which is where a restricted file has
 		// to come from.
-		http.Error(w, err.Error()+"; fetch it from the port's own MASTER_SITES", http.StatusUnavailableForLegalReasons)
+		http.Error(w, s.withoutTreeRoot(err.Error())+"; fetch it from the port's own MASTER_SITES", http.StatusUnavailableForLegalReasons)
 		return
 	case errors.Is(err, distinfo.ErrNotReady):
+		// The error names the tree's path and, after a failed read, the cause.
+		// Both are for the operator's log; a client can only retry.
 		s.logger.Warn("distfiles: request arrived before the ports tree was indexed", "name", name, "error", err)
 		w.Header().Set("Retry-After", "30")
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		http.Error(w, "the distinfo index is not loaded yet: the server is still reading its ports tree, or its last read failed; retry after the Retry-After interval", http.StatusServiceUnavailable)
 		return
 	case err != nil:
 		// Not listed, or listed ambiguously: either way there is no digest to
 		// hold the bytes to, and pinning the first fetch is what binary does
 		// and what this type exists not to do.
-		s.logger.Info("distfiles: no distinfo digest to admit against", "name", name, "error", err)
-		http.Error(w, err.Error()+" under "+s.distinfo.Root()+"; update the server's ports tree to the client's revision", http.StatusNotFound)
+		s.logger.Info("distfiles: no distinfo digest to admit against", "name", name, "root", s.distinfo.Root(), "error", err)
+		http.Error(w, s.withoutTreeRoot(err.Error())+"; update the server's ports tree to the client's revision", http.StatusNotFound)
 		return
 	}
 
@@ -256,7 +268,7 @@ func (s *Server) handleDistfiles(w http.ResponseWriter, r *http.Request) {
 	s.fillCache(ctx, store, key, spool.path(), up.url, spool.sha256, spool.size)
 	s.recordCacheEvent(r, audit.CacheMiss, manifest.TypeDistfiles, up.url, name, name, key)
 
-	if _, err := spool.file.Seek(0, io.SeekStart); err != nil {
+	if err := rewindSpool(spool.file); err != nil {
 		s.logger.Error("distfiles: could not rewind the spooled distfile", "name", name, "error", err)
 		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
 		return
@@ -268,6 +280,28 @@ func (s *Server) handleDistfiles(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.Copy(w, spool.file); err != nil {
 		s.logger.Warn("distfiles: client read was cut short", "name", name, "error", err)
 	}
+}
+
+// withoutTreeRoot is msg with the server's ports tree path cut from every
+// path under it. A restriction the reader could not resolve names the file it
+// stopped in, and the client needs that file's place in its own tree, not
+// where the server keeps its copy.
+//
+// Every spelling is cut, not only the configured one: the reader resolves the
+// root's symlinks before expanding PORTSDIR, so an included file is named
+// under the resolved path, and an index read before the symlink was
+// retargeted names the path it resolved to then. Longest first, because one
+// spelling can end another (/private/var/... against /var/... on macOS).
+func (s *Server) withoutTreeRoot(msg string) string {
+	roots := s.distinfo.RootSpellings()
+	sort.Slice(roots, func(i, j int) bool { return len(roots[i]) > len(roots[j]) })
+	for _, root := range roots {
+		msg = strings.ReplaceAll(msg, root+"/", "")
+	}
+	for _, root := range roots {
+		msg = strings.ReplaceAll(msg, root, "the server's ports tree")
+	}
+	return msg
 }
 
 // serveClientCheck answers /distfiles/@environment.mk with the fragment that
@@ -332,7 +366,7 @@ func (s *Server) serveVerifiedDistfile(w http.ResponseWriter, r *http.Request, s
 		s.recordDistfileMismatch(r, name, key, entry, spool.sha256, spool.size, store.Label()+":"+key)
 		return false
 	}
-	if _, err := spool.file.Seek(0, io.SeekStart); err != nil {
+	if err := rewindSpool(spool.file); err != nil {
 		s.logger.Error("distfiles: could not rewind the spooled distfile", "name", name, "error", err)
 		http.Error(w, "storage read failed", http.StatusBadGateway)
 		return true
