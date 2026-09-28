@@ -337,6 +337,12 @@ ci-drift:
 		echo "a job in one and not the other is a green gate that CI rejects; reconcile both"; \
 		exit 1; \
 	fi
+	@# Branch protection requires gate alone. Without always(), a failed job
+	@# skips gate and GitHub counts the skip as a pass.
+	@if ! sed -n '/^  gate:/,$$p' .github/workflows/ci.yml | grep -q '^    if: always()$$'; then \
+		echo ".github/workflows/ci.yml: the gate job lacks 'if: always()'; a failed gate job would skip it, and branch protection accepts a skipped gate"; \
+		exit 1; \
+	fi
 	@# CI_GATE_JOBS names CI jobs, `check` runs make targets, and the two name
 	@# sets are joined by CI_GATE_TARGETS alone. CHECK_LEGS is `check`'s own
 	@# prerequisite list, so checking the mapping against it is checking what

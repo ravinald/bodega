@@ -9,8 +9,8 @@
 # rc.d script for bodega on FreeBSD
 #
 # Install it as /usr/local/etc/rc.d/bodega, mode 0555, and the binary as
-# /usr/local/bin/bodega. The service account and the two writable directories
-# have to exist first; nothing here creates them:
+# /usr/local/bin/bodega. The service account and the two directories it
+# writes have to exist first; nothing here creates them:
 #
 #   pw useradd -n bodega -d /var/lib/bodega -s /usr/sbin/nologin -c "bodega server"
 #   mkdir -p /etc/bodega /var/lib/bodega /var/log/bodega
@@ -25,19 +25,33 @@
 #
 #   sysrc bodega_enable=YES
 #   service bodega start
-#   tail -f /var/log/bodega/bodega.log
+#   tail -f /var/log/bodega.log
+#
+# Mint tokens as root with BODEGA_SERVICE_USER naming bodega_user, so the pepper
+# a first mint writes is root:<that account's group> 0640 and the server can
+# read it. Without it bodega finds no service account (it reads systemd units,
+# not rc.conf) and writes the pepper root:wheel 0600:
+#
+#   env BODEGA_SERVICE_USER=bodega bodega token generate ci expiry 90d
+#
+# A pepper already written 0600 stays that way; hand it to bodega_user's group:
+#
+#   chown root:$(id -gn bodega) /etc/bodega/pepper
+#   chmod 0640 /etc/bodega/pepper
 #
 # Variables, set with sysrc(8):
 #
 #   bodega_enable          YES to start at boot. Default NO.
-#   bodega_user            Account the server runs as. Default bodega. Its
-#                          primary group is the group /etc/bodega/pepper is
-#                          handed to, as Group= is under systemd.
+#   bodega_user            Account the server runs as. Default bodega. Name
+#                          the same account in BODEGA_SERVICE_USER to mint.
 #   bodega_config          Exported as BODEGA_CONFIG_FILE.
 #                          Default /etc/bodega/config.json.
 #   bodega_flags           Appended to `bodega serve`, never to daemon(8).
 #   bodega_chdir           Working directory. Default /var/lib/bodega.
-#   bodega_logfile         stdout and stderr. Default /var/log/bodega/bodega.log.
+#   bodega_logfile         stdout and stderr. Default /var/log/bodega.log.
+#                          daemon(8) opens it as root, so every directory on
+#                          the way to it must be root's alone; start refuses
+#                          one bodega_user could write, such as /var/log/bodega.
 #   bodega_restart_delay   Seconds before daemon(8) restarts an exited server.
 #                          Default 5.
 #   bodega_env, bodega_env_file
@@ -80,15 +94,16 @@
 #   ProtectSystem=strict  None. FreeBSD has no per-service read-only view of the
 #                         filesystem. File permissions are the whole boundary:
 #                         bodega_user owns /var/lib/bodega and /var/log/bodega
-#                         and nothing else. Run bodega in a jail(8) with those
+#                         and nothing else, and nothing here runs as root on a
+#                         path under either. Run bodega in a jail(8) with those
 #                         two nullfs-mounted read-write to get the equivalent.
 #   ReadWritePaths=       The same two directories, by ownership rather than by
 #                         mount. The equivalent is the jail above.
 #   ProtectHome=true      None. A jail with no /home in it is the equivalent;
 #                         outside one, home directories are as readable to
 #                         bodega_user as their modes allow.
-#   PrivateTmp=true       Partial. TMPDIR is bodega_chdir/tmp, created 0700 and
-#                         owned by bodega_user on every start, so bodega's own
+#   PrivateTmp=true       Partial. TMPDIR is bodega_chdir/tmp, created 0700 by
+#                         bodega_user itself on every start, so bodega's own
 #                         temporary files are private to it. /tmp itself stays
 #                         shared.
 #   After=, Wants=        REQUIRE: LOGIN NETWORKING above.
@@ -109,7 +124,7 @@ load_rc_config $name
 : "${bodega_config:=/etc/bodega/config.json}"
 : "${bodega_flags:=}"
 : "${bodega_chdir:=/var/lib/bodega}"
-: "${bodega_logfile:=/var/log/bodega/bodega.log}"
+: "${bodega_logfile:=/var/log/bodega.log}"
 : "${bodega_restart_delay:=5}"
 
 pidfile="/var/run/${name}.pid"
@@ -131,6 +146,37 @@ extra_commands="reload"
 start_precmd="bodega_prestart"
 reload_cmd="bodega_reload"
 
+# Succeeds when root alone decides which file $1 names: an absolute path with
+# no . or .. component, every directory above it real (not a symlink), owned by
+# root and writable by nobody else. The last test asks the account itself,
+# which catches a write an ACL grants and the mode bits do not show. Nothing
+# unprivileged can change a directory that passes, so the answer still holds
+# when daemon(8) opens the file, and when -H reopens it. On failure _unsafe
+# names what failed.
+bodega_root_only_parent()
+{
+	_unsafe=$1
+	case $1 in
+	*//* | */./* | */../* | */. | */.. | */) return 1 ;;
+	/*) ;;
+	*) return 1 ;;
+	esac
+	_dir=${1%/*}
+	while :; do
+		_unsafe=${_dir:-/}
+		_st=$(stat -f '%u %Sp' "${_unsafe}") || return 1
+		case ${_st} in
+		0\ d????-??-?) ;;
+		*) return 1 ;;
+		esac
+		# An su that fails outright must not read as "cannot write".
+		_w=$(su -m "${bodega_account}" -c "if test -w '${_unsafe}'; then echo yes; else echo no; fi")
+		[ "${_w}" = no ] || return 1
+		[ -n "${_dir}" ] || return 0
+		_dir=${_dir%/*}
+	done
+}
+
 bodega_prestart()
 {
 	if [ ! -f "${bodega_config}" ]; then
@@ -139,7 +185,18 @@ bodega_prestart()
 	if ! id "${bodega_account}" >/dev/null 2>&1; then
 		err 1 "account ${bodega_account} does not exist; create it with pw useradd (see the header of this script) or set bodega_user"
 	fi
-	install -d -o "${bodega_account}" -m 0700 "${bodega_chdir}/tmp" || return 1
+	case "${bodega_chdir}${bodega_logfile}" in
+	*"'"*) err 1 "bodega_chdir and bodega_logfile may not contain a single quote" ;;
+	esac
+	if ! bodega_root_only_parent "${bodega_logfile}"; then
+		err 1 "bodega_logfile ${bodega_logfile}: ${_unsafe} is not a directory only root can write (a symlink, not root's, writable by group, others or ${bodega_account}, or a relative, . or .. path), and daemon(8) opens the log as root, so it could be pointed at any file on the host. Set bodega_logfile under a root-owned directory such as /var/log"
+	fi
+	# As the account, not root: root following a symlink the account planted
+	# here would hand the account whatever the link names. chmod rather than
+	# install -d -m, which only warns when the chmod fails and exits 0.
+	if ! su -m "${bodega_account}" -c "mkdir -p '${bodega_chdir}/tmp' && chmod 0700 '${bodega_chdir}/tmp'"; then
+		err 1 "${bodega_account} could not create ${bodega_chdir}/tmp mode 0700; ${bodega_account} must own ${bodega_chdir}, and ${bodega_chdir}/tmp, if present, must be a directory it owns"
+	fi
 	export BODEGA_CONFIG_FILE="${bodega_config}"
 	export TMPDIR="${bodega_chdir}/tmp"
 }

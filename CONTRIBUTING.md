@@ -38,7 +38,7 @@ It runs a leg per CI job, cheapest first, so a gofmt slip costs two seconds rath
 
 Run a leg on its own with `make test`, `make lint`, `make vet`, `make fmt`, or `make tidy`.
 
-**One gate job has no leg: `test-freebsd`.** It runs `go test ./...` on a FreeBSD 15.1 kernel in a VM, which no workstation or Linux runner can boot, so `make check` passing says nothing about it. The Makefile lists it in `CI_ONLY_GATE_JOBS`, and `make ci-drift` accepts it in the gate without a leg on that basis alone. A FreeBSD failure shows up in the pull request's checks; reproduce it on a FreeBSD host as an unprivileged user with `TMPDIR` set to a directory that user's own group owns, the way the job runs it.
+**One gate job has no leg: `test-freebsd`.** It runs `go test ./...` on a FreeBSD 15.1 kernel in a VM, which no workstation or Linux runner can boot, so `make check` passing says nothing about it. The Makefile lists it in `CI_ONLY_GATE_JOBS`, and `make ci-drift` accepts it in the gate without a leg on that basis alone. A FreeBSD failure fails `gate`, the one check branch protection requires, so it holds the merge; `gate` runs under `if: always()` and passes only when every job it names succeeded, because GitHub counts a skipped required check as passing. Reproduce a failure on a FreeBSD host as an unprivileged user with `TMPDIR` set to a directory that user's own group owns, the way the job runs it.
 
 **Tool versions differ between this gate and CI.** `shfmt` is pinned in `.github/workflows/ci.yml`; `shellcheck` comes from the GitHub runner image and is not. A shell change that passes `make harness` locally can still fail in CI on a rule your build does not carry, so read the job log rather than assuming the local run settled it.
 

@@ -2967,6 +2967,21 @@ sudo service bodega start
 
 The ownership pass comes last for the reason the systemd unit's header gives: a bodega command run as root leaves `config.json` and `audit.db` owned by root, and the service will not start on either.
 
+The server's own log is the exception. `daemon(8)` opens it as root, so it lives at `/var/log/bodega.log`, in a directory only root can write, and not under `/var/log/bodega` with the audit database: there the account could replace the name with a symlink and have root append to any file on the host. The script refuses to start with a `bodega_logfile` under any directory the account, or anyone but root, can write.
+
+Mint tokens as root with `BODEGA_SERVICE_USER` naming the account the server runs as. bodega finds its service account in that variable or in a systemd unit, never in `rc.conf`, so without it the first `token generate` writes `/etc/bodega/pepper` as `root:wheel 0600` and the server exits on start because it cannot read it. With it, the pepper is `root:<account's primary group> 0640`:
+
+```bash
+sudo env BODEGA_SERVICE_USER=bodega bodega token generate ci-pipeline expiry 90d
+```
+
+Set it, and the account in the repair below, to whatever `bodega_user` names. A pepper already written `0600` is not rewritten by a later mint; hand it over once:
+
+```bash
+sudo chown root:$(id -gn bodega) /etc/bodega/pepper
+sudo chmod 0640 /etc/bodega/pepper
+```
+
 A signing key is the one file that differs from the systemd install. FreeBSD has no counterpart to `LoadCredential=`, so bodega reads the apt and pkg keys from `/etc/bodega`, and it refuses a key readable by anyone but its owner. The owner therefore has to be the service account:
 
 ```bash
@@ -2981,15 +2996,15 @@ The script reads these from `/etc/rc.conf`; set them with `sysrc`:
 | Variable               | Default                      | Meaning                                                                                       |
 | ---------------------- | ---------------------------- | --------------------------------------------------------------------------------------------- |
 | `bodega_enable`        | `NO`                         | Start at boot. `service bodega enable` sets it.                                               |
-| `bodega_user`          | `bodega`                     | The account the server runs as. Its primary group is the group `/etc/bodega/pepper` is given. |
+| `bodega_user`          | `bodega`                     | The account the server runs as. Name it in `BODEGA_SERVICE_USER` when minting tokens.         |
 | `bodega_config`        | `/etc/bodega/config.json`    | Exported to the server as `BODEGA_CONFIG_FILE`.                                               |
 | `bodega_flags`         | empty                        | Appended to `bodega serve`, for example `--allow-plaintext=false`.                            |
 | `bodega_chdir`         | `/var/lib/bodega`            | Working directory. A relative `manifest_dir` resolves against it.                             |
-| `bodega_logfile`       | `/var/log/bodega/bodega.log` | Where the server's stdout and stderr go.                                                      |
+| `bodega_logfile`       | `/var/log/bodega.log`        | Where the server's stdout and stderr go. Every directory above it must be root's alone.       |
 | `bodega_restart_delay` | `5`                          | Seconds `daemon(8)` waits before restarting a server that exited.                             |
 | `bodega_env_file`      | unset                        | A file of `VAR=value` lines for the server's environment, such as S3 credentials.             |
 
-`bodega_flags` reaches `bodega serve`, not `daemon(8)`. The server's temporary files go to `tmp/` under `bodega_chdir`, which the script creates mode 0700 for the account on every start.
+`bodega_flags` reaches `bodega serve`, not `daemon(8)`. The server's temporary files go to `tmp/` under `bodega_chdir`, which the account itself creates mode 0700 on every start; the script never runs as root on a path the account can write.
 
 `service bodega start` returns once `daemon(8)` has forked, before the listener binds, so a start that bodega refuses (an unreadable config, no TLS posture) shows up in the log and in a restart every `bodega_restart_delay` seconds rather than in the exit status. Read the log after a first start.
 
@@ -3000,7 +3015,7 @@ The script reads these from `/etc/rc.conf`; set them with `sysrc`:
 ```bash
 sudo service bodega reload          # SIGHUP to the server; rereads manifests, keys and access lists
 sudo service bodega status
-sudo tail -f /var/log/bodega/bodega.log
+sudo tail -f /var/log/bodega.log
 ```
 
 `reload` does what `systemctl reload` does: manifests, the signing keys and the CIDR access lists are reread in place, and every other `config.json` key still needs a restart. `status` reports the `daemon(8)` supervisor's pid, from `/var/run/bodega.pid`; the server's own is in `/var/run/bodega_child.pid`.
@@ -3009,7 +3024,7 @@ The log file belongs to root, mode 0600, because the supervisor that writes it r
 
 ```text
 # /etc/newsyslog.conf.d/bodega.conf
-/var/log/bodega/bodega.log  root:bodega  600  7  *  @T00  JC  /var/run/bodega.pid
+/var/log/bodega.log  root:wheel  600  7  *  @T00  JC  /var/run/bodega.pid
 ```
 
 ---
