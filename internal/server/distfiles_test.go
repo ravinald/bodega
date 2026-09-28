@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -615,16 +616,12 @@ func TestDistfilesRefusesAComputedNameCommandBeforeASnapshot(t *testing.T) {
 // Every refusal on this route reaches any client that can connect, so none
 // may say where the server keeps its ports tree or its storage: the operator
 // reads those in the log. The tree sits under a name no body has any other
-// reason to carry.
+// reason to carry, so a body naming it in any spelling (as configured,
+// through a symlink, or resolved before one was retargeted) is caught by the
+// name alone. Answers that name no server fact by construction are driven too,
+// so a later edit that starts relaying an error there is caught here.
 func TestDistfilesRefusalsNameNoServerPath(t *testing.T) {
-	tree := func(t *testing.T) string {
-		t.Helper()
-		root := filepath.Join(t.TempDir(), "b98-server-ports-tree")
-		if err := os.Rename(distfilesPortsTree(t), root); err != nil {
-			t.Fatal(err)
-		}
-		return root
-	}
+	const marker = "b98-server-ports"
 	put := func(t *testing.T, root, rel, body string) {
 		t.Helper()
 		p := filepath.Join(root, filepath.FromSlash(rel))
@@ -635,40 +632,119 @@ func TestDistfilesRefusalsNameNoServerPath(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	tree := func(t *testing.T, name string) string {
+		t.Helper()
+		root := filepath.Join(t.TempDir(), name)
+		if err := os.Rename(distfilesPortsTree(t), root); err != nil {
+			t.Fatal(err)
+		}
+		return root
+	}
+	// includeUnresolved makes pcpustat restricted by a file the reader reaches
+	// through ${PORTSDIR}, which it expands to the root with symlinks resolved.
+	includeUnresolved := func(t *testing.T, root string) {
+		put(t, root, "sysutils/pcpustat/Makefile", "DIST_SUBDIR=\tpcpustat\n.include \"${PORTSDIR}/sysutils/pcpustat/review.mk\"\n")
+		put(t, root, "sysutils/pcpustat/review.mk", ".include \"${UNDEFINED}/restricted.mk\"\n")
+	}
+	alias := func(t *testing.T, target string) string {
+		t.Helper()
+		link := filepath.Join(t.TempDir(), marker+"-alias")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		return link
+	}
+	type fixture struct {
+		s    *Server
+		root string // as configured
+		mem  *storage.Memory
+	}
+	manifestOf := func(t *testing.T, f *fixture, ve manifest.VersionEntry) {
+		t.Helper()
+		pm := &manifest.PackageManifest{Name: "pcpustat/1.6.tar.bz2", Type: manifest.TypeDistfiles, Versions: []manifest.VersionEntry{ve}}
+		if err := f.s.store.SavePackage(t.Context(), pm); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const pcpustat = "/distfiles/pcpustat/1.6.tar.bz2"
 	for _, tc := range []struct {
-		name  string
-		path  string
-		code  int
-		body  string // served by the upstream
-		setup func(t *testing.T, root string)
-		set   func(*config.Config)
+		name     string
+		path     string
+		code     int
+		logsRoot bool // the operator's log names where the lookup ran
+		raw      bool // sent as a client with no check, path untouched
+		root     func(t *testing.T) string
+		upstream http.HandlerFunc
+		setup    func(t *testing.T, f *fixture)
 	}{
-		{name: "unlisted", path: "/distfiles/pcpustat/9.9.tar.bz2", code: http.StatusNotFound},
-		{name: "ambiguous digest", path: "/distfiles/pcpustat/1.6.tar.bz2", code: http.StatusNotFound,
-			setup: func(t *testing.T, root string) {
-				put(t, root, "sysutils/pcpustat-devel/distinfo", fmt.Sprintf("SHA256 (pcpustat/1.6.tar.bz2) = %064d\nSIZE (pcpustat/1.6.tar.bz2) = %d\n", 0, len(distfileBody)))
+		{name: "invalid name", path: "/distfiles/pcpustat/a%5Cb", code: http.StatusBadRequest},
+		{name: "no ports tree configured", path: pcpustat, code: http.StatusNotFound,
+			setup: func(_ *testing.T, f *fixture) { f.s.distinfo = nil }},
+		{name: "hidden", path: pcpustat, code: http.StatusNotFound,
+			setup: func(t *testing.T, f *fixture) { manifestOf(t, f, manifest.VersionEntry{Version: "1.6", Hidden: true}) }},
+		{name: "recorded storage not configured", path: pcpustat, code: http.StatusBadGateway,
+			setup: func(t *testing.T, f *fixture) {
+				manifestOf(t, f, manifest.VersionEntry{Version: "1.6", Storage: "elsewhere"})
 			}},
-		{name: "unusable digest", path: "/distfiles/pcpustat/2.0.tar.bz2", code: http.StatusNotFound,
-			setup: func(t *testing.T, root string) {
-				put(t, root, "sysutils/pcpustat-devel/distinfo", "SHA256 (pcpustat/2.0.tar.bz2) = not-hex\nSIZE (pcpustat/2.0.tar.bz2) = 1\n")
+		{name: "storage unavailable", path: pcpustat, code: http.StatusServiceUnavailable,
+			setup: func(_ *testing.T, f *fixture) { f.s.stores = nil }},
+		{name: "profile refusal", path: pcpustat, code: http.StatusForbidden,
+			setup: func(t *testing.T, f *fixture) {
+				bindProfileByCIDR(t, f.s, "locked", "locked01", cidrLoopback,
+					[]audit.ProfileTypeRule{closedRule(manifest.TypeDistfiles, audit.VersionFloating, audit.ExpansionBlock)}, nil)
+			}},
+		{name: "unlisted", path: "/distfiles/pcpustat/9.9.tar.bz2", code: http.StatusNotFound, logsRoot: true},
+		{name: "ambiguous digest", path: pcpustat, code: http.StatusNotFound, logsRoot: true,
+			setup: func(t *testing.T, f *fixture) {
+				put(t, f.root, "sysutils/pcpustat-devel/distinfo", fmt.Sprintf("SHA256 (pcpustat/1.6.tar.bz2) = %064d\nSIZE (pcpustat/1.6.tar.bz2) = %d\n", 0, len(distfileBody)))
+			}},
+		{name: "unusable digest", path: "/distfiles/pcpustat/2.0.tar.bz2", code: http.StatusNotFound, logsRoot: true,
+			setup: func(t *testing.T, f *fixture) {
+				put(t, f.root, "sysutils/pcpustat-devel/distinfo", "SHA256 (pcpustat/2.0.tar.bz2) = not-hex\nSIZE (pcpustat/2.0.tar.bz2) = 1\n")
 			}},
 		{name: "restricted", path: "/distfiles/nonfree.tar.gz", code: http.StatusUnavailableForLegalReasons},
-		{name: "restriction make reaches", path: "/distfiles/pcpustat/1.6.tar.bz2", code: http.StatusUnavailableForLegalReasons,
-			setup: func(t *testing.T, root string) {
-				writeMakeOnlyRestriction(t, root, makeOnlyRestrictions["undefined branch"])
+		{name: "restriction make reaches", path: pcpustat, code: http.StatusUnavailableForLegalReasons, logsRoot: true,
+			setup: func(t *testing.T, f *fixture) {
+				writeMakeOnlyRestriction(t, f.root, makeOnlyRestrictions["undefined branch"])
 			}},
-		{name: "environment mismatch", path: "/distfiles/@" + distinfo.ClientUnsupported + "/pcpustat/1.6.tar.bz2", code: http.StatusUnavailableForLegalReasons},
-		{name: "not ready after a failed read", path: "/distfiles/pcpustat/1.6.tar.bz2", code: http.StatusServiceUnavailable,
-			setup: func(t *testing.T, root string) {
-				if err := os.Remove(filepath.Join(root, "Mk", "bsd.licenses.db.mk")); err != nil {
+		{name: "restriction under a symlinked root", path: pcpustat, code: http.StatusUnavailableForLegalReasons, logsRoot: true,
+			root: func(t *testing.T) string {
+				target := tree(t, marker+"-tree")
+				includeUnresolved(t, target)
+				return alias(t, target)
+			}},
+		{name: "restriction read before the root was retargeted", path: pcpustat, code: http.StatusUnavailableForLegalReasons, logsRoot: true,
+			root: func(t *testing.T) string {
+				target := tree(t, marker+"-tree")
+				includeUnresolved(t, target)
+				return alias(t, target)
+			},
+			setup: func(t *testing.T, f *fixture) {
+				if err := f.s.distinfo.Wait(); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(f.root); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(tree(t, marker+"-next"), f.root); err != nil {
 					t.Fatal(err)
 				}
 			}},
-		{name: "not ready while loading", path: "/distfiles/pcpustat/1.6.tar.bz2", code: http.StatusServiceUnavailable,
+		{name: "environment mismatch", path: "/distfiles/@" + distinfo.ClientUnsupported + "/pcpustat/1.6.tar.bz2", code: http.StatusUnavailableForLegalReasons, raw: true},
+		{name: "environment another digest", path: "/distfiles/@0000/pcpustat/1.6.tar.bz2", code: http.StatusUnavailableForLegalReasons, raw: true},
+		{name: "environment not measured", path: pcpustat, code: http.StatusUnavailableForLegalReasons, raw: true},
+		{name: "not ready after a failed read", path: pcpustat, code: http.StatusServiceUnavailable, logsRoot: true,
+			setup: func(t *testing.T, f *fixture) {
+				if err := os.Remove(filepath.Join(f.root, "Mk", "bsd.licenses.db.mk")); err != nil {
+					t.Fatal(err)
+				}
+				f.s.distinfo = distinfo.NewTree(f.root, 0, nil)
+			}},
+		{name: "not ready while loading", path: pcpustat, code: http.StatusServiceUnavailable, logsRoot: true,
 			// The read blocks opening a FIFO nobody writes until cleanup, so
 			// the lookup outwaits its first-read budget.
-			setup: func(t *testing.T, root string) {
-				fifo := filepath.Join(root, "Mk", "bsd.licenses.db.mk")
+			setup: func(t *testing.T, f *fixture) {
+				fifo := filepath.Join(f.root, "Mk", "bsd.licenses.db.mk")
 				if err := os.Remove(fifo); err != nil {
 					t.Fatal(err)
 				}
@@ -676,29 +752,80 @@ func TestDistfilesRefusalsNameNoServerPath(t *testing.T) {
 					t.Fatal(err)
 				}
 				t.Cleanup(func() {
-					if f, err := os.OpenFile(fifo, os.O_WRONLY, 0); err == nil {
-						_ = f.Close()
+					if w, err := os.OpenFile(fifo, os.O_WRONLY, 0); err == nil {
+						_ = w.Close()
 					}
 				})
+				f.s.distinfo = distinfo.NewTree(f.root, 0, nil)
 			}},
-		{name: "upstream lacks it", path: "/distfiles/pcpustat/1.6.tar.bz2", code: http.StatusNotFound,
-			set: func(cfg *config.Config) { cfg.DistfilesUpstream += "elsewhere/" }},
-		{name: "upstream unreachable", path: "/distfiles/pcpustat/1.6.tar.bz2", code: http.StatusBadGateway,
-			set: func(cfg *config.Config) { cfg.DistfilesUpstream = "http://127.0.0.1:1/" }},
-		{name: "upstream bytes disagree", path: "/distfiles/pcpustat/1.6.tar.bz2", code: http.StatusBadGateway, body: "PCPUSTAT SOURCE BYTES"},
+		{name: "client check before the environment is read", path: "/distfiles/@environment.mk", code: http.StatusServiceUnavailable,
+			setup: func(_ *testing.T, f *fixture) {
+				f.s.distinfo = distinfo.NewTreeIn(f.root, distinfo.EnvironmentSpec{Variables: map[string][]string{"1bad": {"x"}}}, 0, nil)
+			}},
+		{name: "upstream refused by the allow-list", path: pcpustat, code: http.StatusForbidden,
+			setup: func(t *testing.T, f *fixture) {
+				if err := f.s.auditDB.InsertPolicy(t.Context(), audit.PolicyInfo{ID: "p", RegistryType: manifest.TypeDistfiles, RuleKind: policy.KindHost, Pattern: "allowed.example"}); err != nil {
+					t.Fatal(err)
+				}
+			}},
+		{name: "upstream lacks it", path: pcpustat, code: http.StatusNotFound,
+			upstream: http.NotFound},
+		{name: "upstream unreachable", path: pcpustat, code: http.StatusBadGateway,
+			setup: func(_ *testing.T, f *fixture) { f.s.cfg.DistfilesUpstream = "http://127.0.0.1:1/" }},
+		{name: "upstream declares another length", path: pcpustat, code: http.StatusBadGateway,
+			upstream: func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, distfileBody+" and a trailer") }},
+		{name: "upstream bytes disagree", path: pcpustat, code: http.StatusBadGateway,
+			upstream: func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "PCPUSTAT SOURCE BYTES") }},
+		{name: "upstream transfer cut short", path: pcpustat, code: http.StatusBadGateway,
+			upstream: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Length", fmt.Sprint(len(distfileBody)))
+				_, _ = io.WriteString(w, distfileBody[:5])
+			}},
+		{name: "upstream over the spool ceiling", path: pcpustat, code: http.StatusServiceUnavailable,
+			setup: func(t *testing.T, f *fixture) { f.s.spool = newSpoolLimiter(t.TempDir(), 4, 0) }},
+		{name: "cached object over the spool ceiling", path: pcpustat, code: http.StatusServiceUnavailable,
+			setup: func(t *testing.T, f *fixture) {
+				f.mem.Seed(manifest.DistfilesKey("pcpustat/1.6.tar.bz2"), distfileBody)
+				f.s.spool = newSpoolLimiter(t.TempDir(), 4, 0)
+			}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			root := tree(t)
+			saved := distfilesGuard
+			distfilesGuard = func(string) error { return nil }
+			t.Cleanup(func() { distfilesGuard = saved })
+			upstream := tc.upstream
+			if upstream == nil {
+				upstream = func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path != "/pcpustat/1.6.tar.bz2" {
+						http.NotFound(w, r)
+						return
+					}
+					_, _ = io.WriteString(w, distfileBody)
+				}
+			}
+			up := httptest.NewServer(upstream)
+			t.Cleanup(up.Close)
+
+			f := &fixture{s: newDiscoveryServer(t)}
+			if tc.root != nil {
+				f.root = tc.root(t)
+			} else {
+				f.root = tree(t, marker+"-tree")
+			}
+			f.s.cfg.DistfilesUpstream = up.URL + "/"
+			f.s.distinfo = distinfo.NewTree(f.root, 0, nil)
+			var log strings.Builder
+			f.s.logger = slog.New(slog.NewTextHandler(&log, nil))
+			f.mem = f.s.typeStore(manifest.TypeDistfiles).(*storage.Memory)
+			label := f.mem.Label()
 			if tc.setup != nil {
-				tc.setup(t, root)
+				tc.setup(t, f)
 			}
-			body := tc.body
-			if body == "" {
-				body = distfileBody
-			}
-			ts, mem, _ := distfilesFixtureIn(t, root, body, tc.set)
+
+			ts := httptest.NewServer(conformingClient(t, &config.Config{}, f.s.Handler()))
+			t.Cleanup(ts.Close)
 			req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+tc.path, nil)
-			if strings.HasPrefix(tc.path, "/distfiles/@") {
+			if tc.raw {
 				req.Header.Set(unconfiguredClient, "1")
 			}
 			resp, err := http.DefaultClient.Do(req)
@@ -710,10 +837,13 @@ func TestDistfilesRefusalsNameNoServerPath(t *testing.T) {
 			if resp.StatusCode != tc.code {
 				t.Fatalf("GET %s = %d %q, want %d", tc.path, resp.StatusCode, got, tc.code)
 			}
-			for _, secret := range []string{root, mem.Label()} {
+			for _, secret := range []string{marker, label} {
 				if strings.Contains(string(got), secret) {
 					t.Errorf("GET %s = %d %q, names %s", tc.path, resp.StatusCode, got, secret)
 				}
+			}
+			if tc.logsRoot && !strings.Contains(log.String(), marker) {
+				t.Errorf("GET %s = %d: the log names no ports tree path, so the operator cannot see where the lookup ran:\n%s", tc.path, resp.StatusCode, log.String())
 			}
 		})
 	}

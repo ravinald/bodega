@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -2620,6 +2621,10 @@ type Tree struct {
 	loadErr error
 	loaded  time.Time
 	loading bool
+	// resolved is every path root resolved to around a read, so a caller can
+	// recognize the root in a message from an index read before the symlink
+	// it runs through was retargeted.
+	resolved map[string]bool
 
 	ready     chan struct{} // closed when the first read finishes, either way
 	readyOnce sync.Once
@@ -2636,7 +2641,7 @@ func NewTreeIn(root string, env EnvironmentSpec, ttl time.Duration, logf func(fo
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	t := &Tree{root: root, env: env, ttl: ttl, logf: logf, ready: make(chan struct{})}
+	t := &Tree{root: root, env: env, ttl: ttl, logf: logf, resolved: map[string]bool{}, ready: make(chan struct{})}
 	t.mu.Lock()
 	t.startLoadLocked()
 	t.mu.Unlock()
@@ -2645,6 +2650,25 @@ func NewTreeIn(root string, env EnvironmentSpec, ttl time.Duration, logf func(fo
 
 // Root is the ports tree this index reads.
 func (t *Tree) Root() string { return t.root }
+
+// RootSpellings is every absolute spelling of the root a path in this tree's
+// errors may start with: as configured, cleaned, and each path it resolved to
+// at the start or end of any read so far. The walk resolves the root once per
+// port, so a symlink retargeted more than once inside a single read can leave
+// a port holding a spelling this does not list.
+func (t *Tree) RootSpellings() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	seen := map[string]bool{}
+	var out []string
+	for _, p := range append([]string{t.root, filepath.Clean(t.root)}, slices.Sorted(maps.Keys(t.resolved))...) {
+		if filepath.IsAbs(p) && p != string(filepath.Separator) && !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	return out
+}
 
 func (t *Tree) startLoadLocked() {
 	if t.loading {
@@ -2675,10 +2699,17 @@ func (t *Tree) startLoadLocked() {
 			t.logf("distinfo: refusing every distfile: %v", err)
 			return
 		}
+		before, _ := filepath.EvalSymlinks(t.root)
 		ix, err := LoadIn(t.root, env)
+		after, _ := filepath.EvalSymlinks(t.root)
 		t.mu.Lock()
 		defer t.mu.Unlock()
 		defer t.readyOnce.Do(func() { close(t.ready) })
+		for _, p := range []string{before, after} {
+			if p != "" {
+				t.resolved[p] = true
+			}
+		}
 		t.loading = false
 		t.loaded = time.Now()
 		if err != nil {

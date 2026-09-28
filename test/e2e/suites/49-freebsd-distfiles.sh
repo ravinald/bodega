@@ -178,7 +178,7 @@ e2e_body server /distfiles/@environment.mk || true
 fd_check="$E2E_OUT"
 fd_digest="$(printf '%s\n' "$fd_check" | sed -n '1s/^# bodega distfiles client check for environment \([0-9a-f]*\)\.$/\1/p')"
 check_matches FDIST-03 "the server serves a client check naming its environment" '^[0-9a-f]{64}$' \
-	"${fd_digest:-none}" "internal/server/distfiles.go:290" "curl /distfiles/@environment.mk"
+	"${fd_digest:-none}" "internal/server/distfiles.go:302" "curl /distfiles/@environment.mk"
 
 fd_wait_index "$fd_digest" || true
 check_eq FDIST-04 "the server finishes reading the tree and answers a name no distinfo lists" "404" \
@@ -375,7 +375,7 @@ if [ "${E2E_DRY_RUN:-no}" = yes ] || { [ -n "$fd_digest" ] && [ "$fd_env" = "$fd
 	check_eq FDIST-40 "the server refuses bytes its distinfo no longer pins" "502" "$fd_pstatus" \
 		"internal/server/distfiles.go:254" "curl $fd_route/$fd_name after repinning it on the server" "$E2E_RC"
 	check_contains FDIST-41 "the refusal says the bytes disagree with distinfo" \
-		"do not match the ports tree's distinfo" "$fd_pbody" "internal/server/distfiles.go:372" "curl $fd_route/$fd_name"
+		"do not match the ports tree's distinfo" "$fd_pbody" "internal/server/distfiles.go:384" "curl $fd_route/$fd_name"
 	E2E_HOST=server
 	e2e_on server "sudo install -m 0644 $FD_SERVER_ROOT/distinfo.orig $FD_SERVER_TREE/$FD_PORT/distinfo" || true
 else

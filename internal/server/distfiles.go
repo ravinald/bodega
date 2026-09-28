@@ -7,7 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -198,7 +198,7 @@ func (s *Server) handleDistfiles(w http.ResponseWriter, r *http.Request) {
 		// hold the bytes to, and pinning the first fetch is what binary does
 		// and what this type exists not to do.
 		s.logger.Info("distfiles: no distinfo digest to admit against", "name", name, "root", s.distinfo.Root(), "error", err)
-		http.Error(w, err.Error()+"; update the server's ports tree to the client's revision", http.StatusNotFound)
+		http.Error(w, s.withoutTreeRoot(err.Error())+"; update the server's ports tree to the client's revision", http.StatusNotFound)
 		return
 	}
 
@@ -277,10 +277,22 @@ func (s *Server) handleDistfiles(w http.ResponseWriter, r *http.Request) {
 // path under it. A restriction the reader could not resolve names the file it
 // stopped in, and the client needs that file's place in its own tree, not
 // where the server keeps its copy.
+//
+// Every spelling is cut, not only the configured one: the reader resolves the
+// root's symlinks before expanding PORTSDIR, so an included file is named
+// under the resolved path, and an index read before the symlink was
+// retargeted names the path it resolved to then. Longest first, because one
+// spelling can end another (/private/var/... against /var/... on macOS).
 func (s *Server) withoutTreeRoot(msg string) string {
-	root := filepath.Clean(s.distinfo.Root())
-	msg = strings.ReplaceAll(msg, root+"/", "")
-	return strings.ReplaceAll(msg, root, "the server's ports tree")
+	roots := s.distinfo.RootSpellings()
+	sort.Slice(roots, func(i, j int) bool { return len(roots[i]) > len(roots[j]) })
+	for _, root := range roots {
+		msg = strings.ReplaceAll(msg, root+"/", "")
+	}
+	for _, root := range roots {
+		msg = strings.ReplaceAll(msg, root, "the server's ports tree")
+	}
+	return msg
 }
 
 // serveClientCheck answers /distfiles/@environment.mk with the fragment that
