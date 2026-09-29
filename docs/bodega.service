@@ -182,7 +182,7 @@ ProtectSystem=strict
 # journal warns that the tree cannot be read. Keep the tree at /usr/ports or
 # /srv, or add BindReadOnlyPaths=<tree> with `systemctl edit bodega` (under
 # /home, with ProtectHome=tmpfs as well). docs/usage.md, "Running under
-# systemd", has the override.
+# systemd", has the override, and the alias for a path it cannot name.
 ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=/var/lib/bodega /var/log/bodega

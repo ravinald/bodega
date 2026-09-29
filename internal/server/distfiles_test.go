@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1073,6 +1074,7 @@ func TestHiddenTreeHint(t *testing.T) {
 		}
 		return ""
 	}
+	alias := []string{"/srv/bodega-ports-source && mkdir /srv/bodega-ports`", "systemctl edit bodega", "BindReadOnlyPaths=/srv/bodega-ports-source:/srv/bodega-ports under [Service]", "set distfiles_ports_tree to /srv/bodega-ports in /etc/bodega/config.json", "Running under systemd"}
 	for _, tc := range []struct {
 		name   string
 		root   string
@@ -1093,11 +1095,13 @@ func TestHiddenTreeHint(t *testing.T) {
 		{"a root with a separator, an escape and a specifier", `/var/tmp/a:b\c%d`, enoent(`/var/tmp/a:b\c%d`), systemd,
 			[]string{`BindReadOnlyPaths="/var/tmp/a:b\\c%%d" under`}},
 		{"a root with a double quote", `/var/tmp/a"b`, enoent(`/var/tmp/a"b`), systemd,
-			[]string{"PrivateTmp=true", "/usr/ports", "/srv", "cannot name this path"}},
+			append([]string{"PrivateTmp=true", "/usr/ports", `ln -sn '/var/tmp/a"b' `}, alias...)},
 		{"a root with a single quote", "/home/o'neil/ports", eacces("/home/o'neil/ports"), systemd,
-			[]string{"ProtectHome=true", "/usr/ports", "/srv", "cannot name this path"}},
+			append([]string{"ProtectHome=true", "/usr/ports", `ln -sn '/home/o'\''neil/ports' `}, alias...)},
 		{"a root with a tab", "/tmp/a\tb", enoent("/tmp/a\tb"), systemd,
-			[]string{"PrivateTmp=true", "cannot name this path"}},
+			append([]string{"PrivateTmp=true", `ln -sn $'/tmp/a\x09b' `}, alias...)},
+		{"a root with a symlink and ..", "/var/tmp/x/link/../ports", enoent("/var/tmp/x/link/../ports"), systemd,
+			append([]string{"PrivateTmp=true", "ln -sn '/var/tmp/x/link/../ports' "}, alias...)},
 		{"outside the hidden paths", "/usr/ports", enoent("/usr/ports"), systemd, nil},
 		{"a sibling sharing the prefix", "/tmpfs/ports", enoent("/tmpfs/ports"), systemd, nil},
 		{"not under systemd", "/var/tmp/ports", enoent("/var/tmp/ports"), noEnv, nil},
@@ -1130,8 +1134,79 @@ func TestHiddenTreeHint(t *testing.T) {
 					t.Errorf("hint %q does not name %q", hint, w)
 				}
 			}
-			if strings.Contains(hint, "cannot name this path") && strings.Contains(hint, "BindReadOnlyPaths=/") {
-				t.Errorf("hint %q offers a bind it says cannot work", hint)
+			if strings.Contains(hint, "ln -s") && strings.Contains(hint, `BindReadOnlyPaths="`) {
+				t.Errorf("hint %q offers a direct bind for a root it had to alias", hint)
+			}
+		})
+	}
+}
+
+// The alias a hint hands the operator has to reach the directory the server
+// would have read at root: the same bytes, whatever the path's spelling. The
+// test runs the hint's own ln -sn word through a shell, twice, and reads a
+// marker on both sides. "link/../ports" is the case cleaning gets wrong: the
+// kernel walks .. from the link's target, so it names target/ports, not ports.
+func TestHiddenTreeHintAliasReadsTheConfiguredTree(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Fatal("the alias is a shell command, and this test needs bash to run it:", err)
+	}
+	base, err := os.MkdirTemp("/var/tmp", "bodega-b100-alias-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	for dir, marker := range map[string]string{
+		"target/child": "", "target/ports": "configured", "ports": "cleaned",
+		"o'neil": "quote", `a"b`: "double quote", "a\tb": "tab", "a\\x41'\\'": "escapes", "a\t\\'b": "escapes and a tab",
+	} {
+		if err := os.MkdirAll(filepath.Join(base, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if marker != "" {
+			if err := os.WriteFile(filepath.Join(base, dir, "marker"), []byte(marker), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := os.Symlink(filepath.Join(base, "target", "child"), filepath.Join(base, "link")); err != nil {
+		t.Fatal(err)
+	}
+	systemd := func(k string) string {
+		if k == "NOTIFY_SOCKET" {
+			return "/run/systemd/notify"
+		}
+		return ""
+	}
+	for _, rel := range []string{"link/../ports", "o'neil", `a"b`, "a\tb", "a\\x41'\\'", "a\t\\'b"} {
+		t.Run(rel, func(t *testing.T) {
+			root := base + "/" + rel
+			want, err := os.ReadFile(root + "/marker")
+			if err != nil {
+				t.Fatal(err)
+			}
+			hint := hiddenTreeHint(root, &fs.PathError{Op: "open", Path: root, Err: fs.ErrNotExist}, systemd)
+			_, cmd, ok := strings.Cut(hint, "`ln -sn ")
+			word, _, ok2 := strings.Cut(cmd, " "+aliasBindSource+" && ")
+			if !ok || !ok2 {
+				t.Fatalf("hint %q carries no ln -sn alias", hint)
+			}
+			if strings.Contains(hint, `BindReadOnlyPaths="`) {
+				t.Fatalf("hint %q binds a spelling of root directly", hint)
+			}
+			alias := filepath.Join(t.TempDir(), "alias")
+			if out, err := exec.Command(bash, "-c", "ln -sn "+word+" "+alias).CombinedOutput(); err != nil {
+				t.Fatalf("ln -sn %s: %v: %s", word, err, out)
+			}
+			got, err := os.ReadFile(alias + "/marker")
+			if err != nil || string(got) != string(want) {
+				t.Fatalf("alias from %s reads %q (%v), want %q from the configured root", word, got, err, want)
+			}
+			if out, err := exec.Command(bash, "-c", "ln -sn "+word+" "+alias).CombinedOutput(); err == nil {
+				t.Fatalf("a second ln -sn onto the existing alias succeeded: %s", out)
+			}
+			if entries, _ := os.ReadDir(root); len(entries) != 1 {
+				t.Fatalf("the configured tree holds %v after a repeated ln, want only its marker", entries)
 			}
 		})
 	}

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/distinfo"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/storage"
@@ -79,6 +81,12 @@ func distinfoLogf(logger *slog.Logger, root string, getenv func(string) string) 
 // plain failure stands. For /home, BindReadOnlyPaths= alone is not enough: the
 // bind lands beneath a mode-000 mount the service account cannot traverse, so
 // the hint names ProtectHome=tmpfs as well.
+//
+// The bind it offers must expose the directory the server would read at root,
+// and nothing beside it. filepath.Clean agrees with the kernel except across
+// "..": with a symlink before it, "link/../ports" is a sibling of the link's
+// target, not of the link. A root with a ".." component, or one systemd cannot
+// bind by name, gets aliasBind instead of a cleaned or partial spelling.
 func hiddenTreeHint(root string, err error, getenv func(string) string) string {
 	if err == nil || getenv("NOTIFY_SOCKET") == "" || !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, fs.ErrPermission) {
 		return ""
@@ -91,6 +99,9 @@ func hiddenTreeHint(root string, err error, getenv func(string) string) string {
 	under := func(dir string) bool { return clean == dir || strings.HasPrefix(clean, dir+"/") }
 	move := "move the tree to /usr/ports or /srv and point distfiles_ports_tree at it"
 	bind, ok := systemdBindSource(clean)
+	if slices.Contains(strings.Split(root, "/"), "..") {
+		ok = false
+	}
 	var cause, extra string
 	switch {
 	case under("/tmp") || under("/var/tmp"):
@@ -102,9 +113,55 @@ func hiddenTreeHint(root string, err error, getenv func(string) string) string {
 		return ""
 	}
 	if !ok {
-		return fmt.Sprintf("%s: %s; a BindReadOnlyPaths= override cannot name this path, because systemd does not bind a source containing a quote or control character", cause, move)
+		return fmt.Sprintf("%s: %s, or %s", cause, move, aliasBind(root))
 	}
 	return fmt.Sprintf("%s: %s, or run `systemctl edit bodega`, add %sBindReadOnlyPaths=%s under [Service], and restart bodega", cause, move, extra, bind)
+}
+
+// The alias aliasBind names. Both sit under /srv, outside every path the
+// shipped unit hides, so no ProtectHome=tmpfs is needed even for a /home tree.
+const (
+	aliasBindSource = "/srv/bodega-ports-source"
+	aliasBindTarget = "/srv/bodega-ports"
+)
+
+// aliasBind is the bind repair for a root no BindReadOnlyPaths= line can
+// spell: a quote or control character systemd will not bind, or a ".." that
+// cleaning would resolve differently from the kernel. A symlink carries root
+// verbatim, and systemd follows it on the host the way the server's own open
+// would, so the bind exposes that directory and nothing beside it. The
+// destination has to differ from root, because root's own components need not
+// exist inside the service's namespace, so distfiles_ports_tree moves to it.
+// ln -n and mkdir fail on a name already taken; plain ln would follow an
+// existing alias and write a new link inside the operator's tree.
+func aliasBind(root string) string {
+	return fmt.Sprintf("expose it through an alias: run `ln -sn %s %s && mkdir %s`, run `systemctl edit bodega`, add BindReadOnlyPaths=%s:%s under [Service], set distfiles_ports_tree to %s in %s, and restart bodega (docs/usage.md, \"Running under systemd\", explains why a direct bind cannot name this path)",
+		shellQuote(root), aliasBindSource, aliasBindTarget, aliasBindSource, aliasBindTarget, aliasBindTarget, config.SystemConfigFile)
+}
+
+// shellQuote renders s as one POSIX shell word. Single quotes keep every byte
+// but the quote itself; a control character or invalid UTF-8 would not survive
+// a copy out of the journal, so those take $'...' with \xNN escapes, which
+// bash, zsh and POSIX.1-2024 sh all read.
+func shellQuote(s string) string {
+	if utf8.ValidString(s) && !strings.ContainsFunc(s, unicode.IsControl) {
+		return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+	}
+	var b strings.Builder
+	b.WriteString("$'")
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '\\' || c == '\'':
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		case c < 0x20 || c >= 0x7f:
+			fmt.Fprintf(&b, `\x%02x`, c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	b.WriteString("'")
+	return b.String()
 }
 
 // systemdBindSource renders path as one BindReadOnlyPaths= source. Double

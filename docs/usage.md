@@ -3027,7 +3027,17 @@ ProtectHome=tmpfs
 BindReadOnlyPaths=/home/ops/ports
 ```
 
-A path with spaces goes in double quotes, with any `\` doubled and any `%` written `%%`, or systemd splits it into several mounts. systemd cannot bind a path holding a quote or a control character at all, so move that tree instead. The journal warning prints the line ready to paste.
+A path with spaces goes in double quotes, with any `\` doubled and any `%` written `%%`, or systemd splits it into several mounts. The journal warning prints the line ready to paste.
+
+Two kinds of path cannot go in that line. systemd will not bind a source holding a quote or a control character however it is escaped, and a path with a `..` component cannot be cleaned into one: with a symlink before the `..`, `/var/tmp/x/link/../ports` names a sibling of the link's target, not `/var/tmp/x/ports`, so the cleaned spelling would bind a different directory. For those the warning prints an alias instead. A symlink under `/srv` carries the path as written, systemd follows it on the host the way the server would, and the bind lands on a separate directory the server is pointed at:
+
+```bash
+sudo ln -sn '/home/o'\''neil/ports' /srv/bodega-ports-source
+sudo mkdir /srv/bodega-ports
+sudo systemctl edit bodega    # [Service] BindReadOnlyPaths=/srv/bodega-ports-source:/srv/bodega-ports
+```
+
+Then set `"distfiles_ports_tree": "/srv/bodega-ports"` in `/etc/bodega/config.json` and restart the service. The bind exposes that one tree and nothing beside it, and because both names sit outside `/home` it needs no `ProtectHome=tmpfs`. `ln -sn` and `mkdir` fail if either name is already taken rather than reuse it; plain `ln -s` onto an existing alias would write a new link inside the tree.
 
 ### Reloading and reading logs
 
