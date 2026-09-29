@@ -58,8 +58,8 @@ import (
 // 2.8.3 on noble). npm's ini, cargo's TOML and YAML take `#` to end of line
 // with no positional rule.
 const (
-	managedBegin = "# BEGIN bodega credential — written by bodega doctor --write-credentials"
-	managedEnd   = "# END bodega credential"
+	managedBegin = clientconf.CredentialBegin
+	managedEnd   = clientconf.CredentialEnd
 )
 
 // CredentialTarget is one client, the file it reads its credential from, and

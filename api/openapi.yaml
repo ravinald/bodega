@@ -537,6 +537,7 @@ paths:
         - $ref: "#/components/parameters/ClientOS"
         - $ref: "#/components/parameters/ClientABI"
         - $ref: "#/components/parameters/ClientCodename"
+        - $ref: "#/components/parameters/ClientRelease"
       responses:
         "200":
           description: The host's plan
@@ -563,6 +564,7 @@ paths:
         - $ref: "#/components/parameters/ClientOS"
         - $ref: "#/components/parameters/ClientABI"
         - $ref: "#/components/parameters/ClientCodename"
+        - $ref: "#/components/parameters/ClientRelease"
       responses:
         "200":
           description: The host's plan
@@ -572,6 +574,28 @@ paths:
                 type: string
         "400":
           $ref: "#/components/responses/ClientError"
+        "403":
+          $ref: "#/components/responses/ClientError"
+
+  /client/setup.sh:
+    get:
+      summary: The POSIX sh script that applies a host's plan
+      description: >
+        The same bytes for every host, embedded in the binary. It fetches
+        plan.txt for the host it runs on, checks every file against the plan's
+        SHA-256 before touching the host, prints a unified diff per file, and
+        writes only under --apply, backing up each file it replaces. Its digest
+        is client_setup_sha256 in GET /api/v1/status. An unidentified host gets
+        403, as on every /client/ route.
+      operationId: getClientSetupScript
+      tags: [client]
+      responses:
+        "200":
+          description: The script
+          content:
+            text/plain:
+              schema:
+                type: string
         "403":
           $ref: "#/components/responses/ClientError"
 
@@ -594,6 +618,7 @@ paths:
         - $ref: "#/components/parameters/ClientOS"
         - $ref: "#/components/parameters/ClientABI"
         - $ref: "#/components/parameters/ClientCodename"
+        - $ref: "#/components/parameters/ClientRelease"
       responses:
         "200":
           description: The file's content
@@ -880,7 +905,20 @@ components:
       schema:
         type: string
         example: noble
-      description: The host's apt suite, as `lsb_release -cs` prints it. Linux only.
+      description: The host's apt suite, VERSION_CODENAME in /etc/os-release. Linux only.
+
+    ClientRelease:
+      name: release
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 99
+        example: 14
+      description: >-
+        FreeBSD major release whose repository tags the pkg overrides disable,
+        for a host whose release is not the one its repository is named for.
+        Absent keeps the repository's own. FreeBSD only.
 
   responses:
     BadRequest:
@@ -1311,6 +1349,11 @@ components:
             $ref: "#/components/schemas/BackendEntryStatus"
         error:
           type: string
+        client_setup_sha256:
+          type: string
+          description: >-
+            SHA-256 of GET /client/setup.sh. Compare it with the script's own
+            digest before running the script.
 
     SpoolStats:
       type: object

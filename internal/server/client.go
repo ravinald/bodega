@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/ravinald/bodega/internal/aptsources"
@@ -21,14 +23,10 @@ import (
 	"github.com/ravinald/bodega/internal/pkgrepos"
 )
 
-// Plan actions. install is a file to write; refuse is a system the host's
-// profile excludes; skip is a system with nothing to install on this host,
-// for a reason that is not the profile's: the wrong operating system, nothing
-// configured on the server, or a choice only the operator can make.
 const (
-	planInstall = "install"
-	planRefuse  = "refuse"
-	planSkip    = "skip"
+	planInstall = clientconf.PlanInstall
+	planRefuse  = clientconf.PlanRefuse
+	planSkip    = clientconf.PlanSkip
 )
 
 // planColumns is the order plan.txt writes a record's fields in. It is the
@@ -53,36 +51,16 @@ const planLiteralDash = `\0055`
 // text, so a tab or newline in one is an accepted value, not a malformed one.
 var planEscaper = strings.NewReplacer(`\`, `\\`, "\t", `\t`, "\n", `\n`, "\r", `\r`)
 
-// planRecord is one line of a client plan: one file for one system, or the
-// reason a system has none. The host's identity rides on every record rather
-// than on a header line, so a loop reading plan.txt needs one case, not two.
-type planRecord struct {
-	Identity string `json:"identity"`
-	Profile  string `json:"profile"`
-	Match    string `json:"match"`
-	System   string `json:"system"`
-	Action   string `json:"action"`
-	Path     string `json:"path"`
-	URL      string `json:"url"`
-	SHA256   string `json:"sha256"`
-	Reason   string `json:"reason"`
-}
-
-// clientPlan is GET /client/plan. The records are plan.txt's lines, field
-// for field, so a tool can switch encodings without reinterpreting anything.
-type clientPlan struct {
-	Records []planRecord `json:"records"`
-}
-
-func (p planRecord) fields() []string {
-	return []string{p.Identity, p.Profile, p.Match, p.System, p.Action, p.Path, p.URL, p.SHA256, p.Reason}
-}
+type (
+	planRecord = clientconf.PlanRecord
+	clientPlan = clientconf.Plan
+)
 
 // planTSV writes records in planColumns order, one per line.
 func planTSV(records []planRecord) string {
 	var sb strings.Builder
 	for _, rec := range records {
-		for i, f := range rec.fields() {
+		for i, f := range rec.Fields() {
 			if i > 0 {
 				sb.WriteByte('\t')
 			}
@@ -113,6 +91,10 @@ type clientQuery struct {
 	OS       string
 	ABI      string
 	Codename string
+	// Release is the FreeBSD major release whose repository tags the pkg
+	// overrides disable, for a host whose release is not the one its
+	// repository is named for. Zero keeps the repository's own.
+	Release int
 }
 
 var (
@@ -135,7 +117,14 @@ func parseClientQuery(r *http.Request) (clientQuery, error) {
 		return q, fmt.Errorf("abi=%q is not a pkg ABI. Pass what `pkg config abi` prints, for example FreeBSD:15:amd64", q.ABI)
 	}
 	if q.Codename != "" && !clientCodenameRe.MatchString(q.Codename) {
-		return q, fmt.Errorf("codename=%q is not an apt suite name. Pass what `lsb_release -cs` prints, for example noble", q.Codename)
+		return q, fmt.Errorf("codename=%q is not an apt suite name. Pass VERSION_CODENAME from /etc/os-release, for example noble", q.Codename)
+	}
+	if raw := v.Get("release"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > 99 {
+			return q, fmt.Errorf("release=%q is not a FreeBSD major release. Pass the major number alone, for example release=14", raw)
+		}
+		q.Release = n
 	}
 	return q, nil
 }
@@ -149,6 +138,9 @@ func (q clientQuery) encode() string {
 	}
 	if q.Codename != "" {
 		v.Set("codename", q.Codename)
+	}
+	if q.Release != 0 {
+		v.Set("release", strconv.Itoa(q.Release))
 	}
 	return v.Encode()
 }
@@ -430,6 +422,12 @@ func (s *Server) planFreeBSD(r *http.Request, h *clientHost, one func(clientconf
 		others[repo.ABI] = true
 	}
 	switch {
+	case len(match) == 1 && h.q.Release != 0 && h.q.Release != match[0].Release:
+		repo, err := match[0].WithRelease(h.q.Release)
+		if err != nil {
+			return skip(err.Error())
+		}
+		return one(clientconf.FreeBSD(repo))
 	case len(match) == 1:
 		return one(clientconf.FreeBSD(match[0]))
 	case len(match) > 1:
@@ -518,6 +516,35 @@ func (s *Server) serveClientPlan(w http.ResponseWriter, r *http.Request, subject
 		writeJSON(w, http.StatusOK, clientPlan{Records: records})
 	}
 	noteClient(r, subject, h, "", "")
+}
+
+// clientSetupScript is GET /client/setup.sh: one POSIX sh script, the same
+// bytes for every host, that applies whatever /client/plan.txt says. Every
+// per-host decision lives in the plan, so the script can be checked against
+// the one digest /api/v1/status and docs/usage.md publish.
+//
+//go:embed client_setup.sh
+var clientSetupScript []byte
+
+// clientSetupSHA256 is the digest an operator compares the script against
+// before piping it anywhere near a root shell.
+var clientSetupSHA256 = func() string {
+	sum := sha256.Sum256(clientSetupScript)
+	return hex.EncodeToString(sum[:])
+}()
+
+// handleClientSetup serves GET /client/setup.sh. It sits behind the same
+// admission as the plan: a host that could not fetch a plan has no use for
+// the script, and the source is in the repository for anyone reviewing it.
+func (s *Server) handleClientSetup(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.admitClient(w, r, "setup.sh"); !ok {
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(clientSetupScript)
+	noteClient(r, "setup.sh", nil, "", "")
 }
 
 // handleClientSystem serves GET /client/{system}: that system's file,

@@ -11,17 +11,20 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 
-	"github.com/ravinald/bodega/internal/aptsources"
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/clientconf"
 	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/host"
-	"github.com/ravinald/bodega/internal/pkgrepos"
+	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
 )
 
@@ -40,8 +43,9 @@ import (
 // The threat model and rationale for each check is documented in
 // docs/threat-model.md.
 func newDoctorCmd(gf *globalFlags) *cobra.Command {
-	var writeCreds, writeAptSources, writePkgRepo, allowPlaintext bool
+	var writeCreds, writeAptSources, writePkgRepo, apply, allowPlaintext bool
 	var token, baseURL, pkgABI, aptSuite string
+	var configure []string
 	var pkgRelease int
 	c := &cobra.Command{
 		Use:   "doctor",
@@ -93,89 +97,73 @@ pip every credential in the file. The machine <host> stanza is the anchor.
 The token names the host through bodega identity bind token <id> <name>. The
 write changes what an audit row says, never what the host may fetch.
 
---write-apt-sources is the other write, and it is the one place a host's apt
-configuration is composed from what the server knows rather than guessed at.
-It asks bodega which suite this host reads — a profile that scopes apt is
-served a filtered codename of its own — then installs the archive keyring and
-writes that stanza to /etc/apt/sources.list.d/bodega.sources.
+--configure is the other write. It applies the plan GET /client/plan returns
+for this host, the same plan the served setup script applies: which files
+each named system installs, where, and their SHA-256. Every file is fetched
+and checked against that digest before anything is compared, and a mismatch
+stops the run with nothing written. Without --apply it prints a unified diff
+per file and writes nothing; with --apply it backs up each file it replaces
+beside the original, suffixed .bodega-<UTC timestamp>, then writes.
 
-  bodega doctor --write-apt-sources --token bodega_ak_... --url https://bodega.internal
+  bodega doctor --configure apt,pypi --url https://bodega.internal
+  bodega doctor --configure apt,pypi --url https://bodega.internal --apply
+
+A system the plan does not list is an error naming the ones it does, and so
+is a named system the plan refuses or skips, with the server's reason.
+
+--write-apt-sources and --write-pkg-repo are --configure apt --apply and
+--configure freebsd --apply. They combine with each other and with
+--configure.
 
 --token is optional: a host bound with "bodega identity bind cidr" is
-identified by its address and needs none. A host bodega cannot identify gets
-told which codenames exist rather than handed one.
+identified by its address and needs none. A host bodega cannot identify is
+refused with the command that would admit it.
 
---suite is how that host gets configured anyway. An instance that mirrors
-serves a codename per upstream beside the one it generates, so several
-codenames is its ordinary state, and with no profile to choose between them
-the server names none: which one a host reads is the operator's decision.
-This flag is that decision, and the stanza is still the server's rendering
-of it.
+--suite names the apt codename this host reads. An instance that mirrors
+serves a codename per upstream beside the one it generates, and with no
+profile to choose between them the server names none: which one a host reads
+is the operator's decision. A host whose profile scopes apt is refused a
+codename other than the profile's.
 
   bodega doctor --write-apt-sources --suite noble --url https://bodega.internal
 
-A mirrored codename installs the sources file alone. bodega does not sign
-what it proxies, so the archive's own signature reaches the client intact and
-apt verifies it against the distro keyring already on the host; a Signed-By:
-naming bodega's key there would fail every apt update on the signature. A
-host whose profile scopes apt is refused instead of served: that codename is
-the profile's answer, and the unfiltered base is in the same list.
-
---write-pkg-repo is the FreeBSD half. It asks bodega which pkg repositories
-answer for this host's ABI and writes ` + pkgrepos.ClientConfPath + `,
-which holds two things and not one: the bodega repository, and the overrides
-that disable the repository /etc/pkg/FreeBSD.conf defines. pkg merges
-definitions by tag, so a file carrying only the first leaves the host
-fetching from pkg.FreeBSD.org beside bodega and nothing in "pkg update"
-output says so.
-
-  bodega doctor --write-pkg-repo --url https://bodega.internal
-
-The ABI comes from "pkg config abi" on a FreeBSD host, or from --abi
-anywhere else. The tags the override names follow the major release the ABI
-carries; --release says otherwise for a host whose release is not the one
-the repository is named for. signature_type is the server's answer rather
-than a flag, and there are three of them: a mirror of a ports repository
-verifies against the stock trust store, a mirror of a base_release_<n> one
-built for FreeBSD 15 or later against the pkgbase store beside it (no older
-release ships that store, so its base_release_<n> repositories verify against
-the stock one), and a generated repository against bodega's own fingerprint. Naming bodega's key for a mirror fails "pkg
-update" on the signature; naming the wrong one of FreeBSD's two fails
-nothing at all, and the repository installs empty.
-
-Signed-By: goes on the line and names the keyring this command just installed.
-The alternative is [trusted=yes], which turns signature verification off for
-the source permanently and would discard the reason the filtered index is
-signed at all. Both files need root, and the stanza scopes what a correctly
-configured host sees: a host that edits it back reaches the unfiltered
-codename, which is why the request predicate still runs at the pool.
+--abi is the pkg ABI the freebsd system is configured for, "pkg config abi"
+on a FreeBSD host by default. The tags the pkg override disables follow the
+major release the ABI carries; --release says otherwise for a host whose
+release is not the one the repository is named for.
 
 See docs/threat-model.md for the rationale behind each check.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			writes := 0
-			for _, on := range []bool{writeCreds, writeAptSources, writePkgRepo} {
-				if on {
-					writes++
-				}
+			systems := slices.Clone(configure)
+			if writeAptSources && !slices.Contains(systems, manifest.TypeApt) {
+				systems = append(systems, manifest.TypeApt)
 			}
-			if writes > 1 {
+			if writePkgRepo && !slices.Contains(systems, manifest.TypeFreeBSD) {
+				systems = append(systems, manifest.TypeFreeBSD)
+			}
+			configuring := len(systems) > 0 || cmd.Flags().Changed("configure")
+			if writeCreds && configuring {
 				return fmt.Errorf("run one write at a time: --write-credentials places the token every client reads, " +
-					"--write-apt-sources asks the server which suite this host reads and installs it, " +
-					"--write-pkg-repo asks it which pkg repository this ABI reads and installs that")
+					"--configure (and --write-apt-sources, --write-pkg-repo) applies the plan this server holds for the host")
 			}
 			if writeCreds {
 				return writeClientCredentials(gf, token, baseURL)
 			}
-			if aptSuite != "" && !writeAptSources {
-				return fmt.Errorf("--suite names the codename --write-apt-sources installs, and that flag is not set.\n"+
-					"  Add it:  bodega doctor --write-apt-sources --suite %s", aptSuite)
+			if !configuring {
+				for _, f := range []string{"apply", "suite", "abi", "release"} {
+					if cmd.Flags().Changed(f) {
+						return fmt.Errorf("--%s applies to --configure, and that flag is not set.\n"+
+							"  Add it:  bodega doctor --configure <system,...> --%s", f, f)
+					}
+				}
 			}
-			if writeAptSources {
-				return writeAptSourcesFile(gf, token, baseURL, aptSuite, allowPlaintext)
-			}
-			if writePkgRepo {
-				return writePkgRepoFile(gf, token, baseURL, pkgABI, pkgRelease, allowPlaintext)
+			if configuring {
+				return configureFromPlan(gf, planRequest{
+					token: token, baseURL: baseURL, systems: systems,
+					suite: aptSuite, abi: pkgABI, release: pkgRelease,
+					apply: apply || writeAptSources || writePkgRepo, allowPlaintext: allowPlaintext,
+				})
 			}
 			findings := make([]host.Finding, 0, len(host.AllChecks())+len(postureChecks))
 			for _, fn := range host.AllChecks() {
@@ -212,12 +200,16 @@ See docs/threat-model.md for the rationale behind each check.`,
 	}
 	c.Flags().BoolVar(&writeCreds, "write-credentials", false,
 		"Write a read-path credential into each client's own configuration file")
+	c.Flags().StringSliceVar(&configure, "configure", nil,
+		"Apply this server's plan for the named systems (comma-separated); prints a diff and writes nothing without --apply")
+	c.Flags().BoolVar(&apply, "apply", false,
+		"With --configure: back up each file that differs, then write it")
 	c.Flags().BoolVar(&writeAptSources, "write-apt-sources", false,
-		"Install the archive keyring and the apt sources stanza this server says the host should read")
+		"Alias for --configure apt --apply")
 	c.Flags().BoolVar(&writePkgRepo, "write-pkg-repo", false,
-		"Install the pkg repository configuration this server says the host's ABI should read, and disable the upstream one")
+		"Alias for --configure freebsd --apply")
 	c.Flags().StringVar(&aptSuite, "suite", "",
-		"The apt codename to install, for an instance serving several and no profile to choose between them")
+		"The apt codename to configure, for an instance serving several and no profile to choose between them")
 	c.Flags().StringVar(&pkgABI, "abi", "",
 		"The pkg ABI to configure for; defaults to what `pkg config abi` reports on this host")
 	c.Flags().IntVar(&pkgRelease, "release", 0,
@@ -372,288 +364,168 @@ func printCredentialPrecondition() {
 	fmt.Println()
 }
 
-// aptClientConfig is the half of GET /api/v1/status this command reads. The
-// server composes the stanza and this decodes it: which codename a host reads
-// is a fact only the running instance holds, and every emitter that derived
-// one for itself derived it wrong. internal/aptsources carries that history.
-type aptClientConfig struct {
-	Apt aptClientStatus `json:"apt"`
+// planRequest is what `doctor --configure` asks the server for.
+type planRequest struct {
+	token, baseURL string
+	systems        []string
+	suite, abi     string
+	release        int
+	apply          bool
+	allowPlaintext bool
 }
 
-type aptClientStatus struct {
-	Signed     bool                 `json:"signed"`
-	KeyringURL string               `json:"keyring_url"`
-	Suites     []string             `json:"suites"`
-	Mirrored   []string             `json:"mirrored"`
-	Filtered   []string             `json:"filtered"`
-	Profile    string               `json:"profile"`
-	Host       *aptsources.Sources  `json:"host"`
-	Sources    []aptsources.Sources `json:"sources"`
-}
-
-// writeAptSourcesFile installs what the server says this host's apt
-// configuration is: the keyring first, then the stanza that names it.
+// configureFromPlan applies the plan GET /client/plan returns for this host,
+// through internal/clientconf, the same way the served setup script does:
+// every file fetched and checked against the plan's digest first, then a
+// diff per file, then under apply a backup and a write.
 //
-// --token is optional here and is not an oversight. The server answers with
-// whatever host this request resolves to, and a host bound by `bodega identity
-// bind cidr` sends no header at all — demanding a token would make one of the
-// two identification modes unusable from the command that configures it. What
-// a host with neither gets is the fleet-wide answer, which aptNoStanza names
-// rather than installs.
-//
-// suite is the operator answering the question the server refuses to: an
-// instance that mirrors serves a codename per upstream beside the one it
-// generates, so several codenames is its ordinary state rather than a
-// misconfiguration to clean up, and without this flag every host on such an
-// instance is configured by hand. The stanza still comes from the server's
-// own rendering — which components a codename carries, and whether bodega
-// signs it, are facts only the running instance holds.
-func writeAptSourcesFile(gf *globalFlags, token, baseURL, suite string, allowPlaintext bool) error {
-	if baseURL == "" {
+// The codename goes to the server only when --suite names one. The script
+// states VERSION_CODENAME because it has nothing else to go on; this command
+// has always let the server choose when it could, and a host on an instance
+// that generates one suite under its own name would lose that choice.
+func configureFromPlan(gf *globalFlags, req planRequest) error {
+	if req.baseURL == "" {
 		cfg, err := loadConfig(gf)
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
-		baseURL = cfg.PublicURL
+		req.baseURL = cfg.PublicURL
 	}
-	if baseURL == "" {
-		return fmt.Errorf("--write-apt-sources needs the base URL clients reach this bodega at.\n" +
+	if req.baseURL == "" {
+		return fmt.Errorf("--configure needs the base URL clients reach this bodega at.\n" +
 			"  Pass --url https://bodega.internal, or set public_url in the config file")
 	}
-	client, err := NewClient(baseURL, token, allowPlaintext)
+	client, err := NewClient(req.baseURL, req.token, req.allowPlaintext)
 	if err != nil {
 		return err
 	}
-	var status aptClientConfig
-	if err := getJSON(client, "/api/v1/status", &status); err != nil {
+	q := url.Values{"os": {runtime.GOOS}}
+	if req.abi == "" && runtime.GOOS == clientconf.OSFreeBSD {
+		abi, err := localPkgABI()
+		if err != nil && slices.Contains(req.systems, manifest.TypeFreeBSD) {
+			return err
+		}
+		req.abi = abi
+	}
+	if req.abi != "" {
+		q.Set("abi", req.abi)
+	}
+	if req.suite != "" {
+		q.Set("codename", req.suite)
+	}
+	if req.release > 0 {
+		q.Set("release", strconv.Itoa(req.release))
+	}
+	var plan clientconf.Plan
+	if err := getJSON(client, "/client/plan?"+q.Encode(), &plan); err != nil {
 		return err
 	}
-	apt := status.Apt
-	stanza := apt.Host
-	if suite != "" {
-		if stanza, err = aptSuiteChoice(apt, suite); err != nil {
-			return err
-		}
-	}
-	if stanza == nil {
-		return aptNoStanza(apt)
-	}
-	// A mirrored codename is forwarded from its upstream with the archive's
-	// own signature intact, so apt verifies it against the distro keyring the
-	// host already has. Installing bodega's keyring beside a stanza that names
-	// it nowhere would leave a file on disk nothing reads.
-	var keyring []byte
-	if !stanza.Mirrored {
-		if keyring, err = getBody(client, aptsources.KeyringRoute); err != nil {
-			return err
-		}
-	}
-	wrote, err := host.WriteAptSources("", aptsources.ClientKeyringPath, stanza.Deb822, stanza.Mirrored, keyring)
-	for _, p := range wrote {
-		fmt.Printf("wrote %s\n", p)
-	}
+	records, err := plan.Select(req.systems)
 	if err != nil {
 		return err
 	}
-	if stanza.Mirrored {
-		fmt.Printf("\n%s reaches this host through bodega and is signed by its upstream, not by bodega.\n", stanza.Suite)
-		fmt.Println(aptsources.MirroredNote)
-	}
-	if apt.Profile != "" {
-		fmt.Printf("\nProfile %q: this host reads %s, a filtered view of what bodega mirrors.\n",
-			apt.Profile, stanza.Suite)
-		fmt.Println("The stanza scopes what this host is told exists. It authorizes nothing on")
-		fmt.Println("its own: a host that edits it reaches the unfiltered codename, and the")
-		fmt.Println("request predicate at /apt/pool/ is what refuses the artifacts behind it.")
-	}
-	fmt.Println("\nApply it:  apt-get update")
-	return nil
-}
-
-// aptNoStanza explains a server that would not name one suite for this host,
-// which is two different situations and two different repairs.
-func aptNoStanza(apt aptClientStatus) error {
-	if apt.Profile != "" {
-		return fmt.Errorf("profile %q scopes apt and this server is serving no filtered codename for it yet.\n"+
-			"  The base has to be a mirrored codename, and the index rebuilds on the hour:\n"+
-			"  bodega profile show %s   (check APT BASE)\n"+
-			"  Then look at the server's log for the base it refused", apt.Profile, apt.Profile)
-	}
-	served := slices.Concat(apt.Suites, apt.Mirrored, apt.Filtered)
-	if len(served) == 0 {
-		return fmt.Errorf("this bodega serves no apt suite, so there is no stanza to install")
-	}
-	return fmt.Errorf("no profile scopes apt for this host and this bodega serves %d codenames, so which one this host should read is your decision rather than the server's: %s.\n"+
-		"  Name it:  bodega doctor --write-apt-sources --suite %s\n"+
-		"  This host may simply not be identified. Pass --token, or bind its address:  bodega identity bind cidr <cidr> <name>\n"+
-		"  Then give the profile a base:  bodega profile set <profile> apt --membership closed --base <codename>",
-		len(served), strings.Join(served, ", "), served[0])
-}
-
-// aptSuiteChoice resolves --suite against what the server reported, and
-// returns the stanza the server rendered for it.
-//
-// A host whose profile scopes apt is refused rather than served the codename
-// it named. The profile exists to narrow what that host is told exists, and
-// the unfiltered base sits in the same list: writing it here would hand the
-// host an unfiltered index for the same packages, which is the state
-// aptHostSources refuses to produce on the server's side.
-func aptSuiteChoice(apt aptClientStatus, suite string) (*aptsources.Sources, error) {
-	if apt.Profile != "" {
-		return nil, fmt.Errorf("profile %q scopes apt for this host, so the codename it reads is the profile's answer rather than this flag's.\n"+
-			"  Change what the profile is built from:  bodega profile set %s apt --base <codename>\n"+
-			"  Then re-run without --suite",
-			apt.Profile, apt.Profile)
-	}
-	for i := range apt.Sources {
-		if apt.Sources[i].Suite == suite {
-			return &apt.Sources[i], nil
+	if len(plan.Records) > 0 {
+		r := plan.Records[0]
+		profile := "no profile"
+		if r.Profile != "" {
+			profile = "profile " + r.Profile
 		}
+		fmt.Printf("Plan for %s (%s, matched by %s) from %s\n\n", r.Identity, profile, r.Match, client.BaseURL)
 	}
-	served := slices.Concat(apt.Suites, apt.Mirrored, apt.Filtered)
-	if len(served) == 0 {
-		return nil, fmt.Errorf("this bodega serves no apt suite, so there is no stanza to install")
-	}
-	return nil, fmt.Errorf("this bodega serves no codename %q, so there is no stanza to install for it. It serves %s.\n"+
-		"  Pass one of those, or add the upstream this host needs to apt_upstreams and restart the server",
-		suite, strings.Join(served, ", "))
-}
-
-// pkgClientConfig is the half of GET /api/v1/status this command reads. The
-// server composes each repository's configuration and this decodes it:
-// whether a repository is mirrored or generated, and whether a catalogue
-// signing key is loaded, are facts only the running instance holds.
-type pkgClientConfig struct {
-	FreeBSD pkgClientStatus `json:"freebsd"`
-}
-
-type pkgClientStatus struct {
-	Signed      bool             `json:"signed"`
-	Fingerprint string           `json:"fingerprint"`
-	KeyError    string           `json:"key_error"`
-	PublicURL   string           `json:"public_url"`
-	Repos       []pkgrepos.Repo  `json:"repos"`
-	Refused     []pkgRepoRefusal `json:"refused"`
-}
-
-type pkgRepoRefusal struct {
-	Repo  string `json:"repo"`
-	ABI   string `json:"abi"`
-	Error string `json:"error"`
-}
-
-// writePkgRepoFile installs what the server says this host's pkg
-// configuration is: one repository definition, and the overrides that turn
-// the upstream one off.
-//
-// --token is optional here for the reason it is optional on
-// --write-apt-sources: a host bound by "bodega identity bind cidr" sends no
-// header, and demanding a token would make one of the two identification
-// modes unusable from the command that configures it.
-func writePkgRepoFile(gf *globalFlags, token, baseURL, abi string, release int, allowPlaintext bool) error {
-	if baseURL == "" {
-		cfg, err := loadConfig(gf)
+	home, _ := os.UserHomeDir()
+	var changes []clientconf.Change
+	for _, rec := range records {
+		body, err := getPlanFile(client, rec.URL, req.allowPlaintext)
 		if err != nil {
-			return fmt.Errorf("load config: %w", err)
+			return fmt.Errorf("%s: %w", rec.System, err)
 		}
-		baseURL = cfg.PublicURL
-	}
-	if baseURL == "" {
-		return fmt.Errorf("--write-pkg-repo needs the base URL clients reach this bodega at.\n" +
-			"  Pass --url https://bodega.internal, or set public_url in the config file")
-	}
-	if abi == "" {
-		var err error
-		if abi, err = localPkgABI(); err != nil {
-			return err
-		}
-	}
-	client, err := NewClient(baseURL, token, allowPlaintext)
-	if err != nil {
-		return err
-	}
-	var status pkgClientConfig
-	if err := getJSON(client, "/api/v1/status", &status); err != nil {
-		return err
-	}
-	repo, err := pkgRepoForABI(status.FreeBSD, abi)
-	if err != nil {
-		return err
-	}
-	if release > 0 && release != repo.Release {
-		// Re-rendered rather than patched: the file is the overrides and the
-		// definition together, and editing the tag list out of one half is
-		// how a host ends up disabling a repository it does not define while
-		// the one it does stays enabled. WithRelease rather than a State
-		// rebuilt from these fields, because this side sees what crossed the
-		// wire and the server's own facts did not all cross it.
-		rerendered, err := repo.WithRelease(release)
+		c, err := clientconf.NewChange(rec, body, home)
 		if err != nil {
 			return err
 		}
-		repo = rerendered
+		changes = append(changes, c)
 	}
-	conf := repo.Conf
-
-	wrote, err := host.WritePkgRepo("", pkgrepos.ClientConfPath, conf)
-	for _, p := range wrote {
-		fmt.Printf("wrote %s\n", p)
-	}
-	if err != nil {
-		return err
-	}
-	if status.FreeBSD.KeyError != "" {
-		fmt.Printf("\nThe server has a pkg signing key it cannot load (%s), so every generated\n", status.FreeBSD.KeyError)
-		fmt.Println("repository refuses its catalogue until that is fixed. A mirrored one is unaffected.")
-	}
-	for _, note := range repo.Notes {
-		fmt.Println()
-		fmt.Println(note)
-	}
-	fmt.Println("\nApply it:  pkg update")
-	fmt.Println("Confirm the upstream repository is off:  pkg -vv | grep -A2 -E '^  (FreeBSD|bodega)'")
-	return nil
-}
-
-// pkgRepoForABI picks the one configuration this host should install, or
-// explains a server that would not name one.
-//
-// Refusing beats guessing for the reason aptNoStanza refuses: a repository
-// named for this host by nobody is a host pointed somewhere nobody decided
-// on, and the file it lands in looks authoritative.
-func pkgRepoForABI(st pkgClientStatus, abi string) (pkgrepos.Repo, error) {
-	var match []pkgrepos.Repo
-	var others []string
-	for _, r := range st.Repos {
-		if r.ABI == abi {
-			match = append(match, r)
+	changed := 0
+	for _, c := range changes {
+		if c.Unchanged() {
+			fmt.Printf("unchanged  %-10s %s\n", c.Record.System, c.Target)
 			continue
 		}
-		others = append(others, r.Repo+"@"+r.ABI)
+		d, err := c.Diff()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("\n%s", d)
+		changed++
 	}
 	switch {
-	case len(match) == 1:
-		return match[0], nil
-	case len(match) > 1:
-		names := make([]string, 0, len(match))
-		for _, r := range match {
-			names = append(names, r.Repo)
+	case changed == 0:
+		fmt.Println("\nNothing to change: every file already matches the plan.")
+		return nil
+	case !req.apply:
+		fmt.Printf("\nDry run: nothing was written. Re-run with --apply to back up and write the %d file(s) above.\n", changed)
+		return nil
+	}
+	applied, err := clientconf.Apply(changes, clientconf.BackupSuffix(time.Now()))
+	for _, a := range applied {
+		if a.Backup != "" {
+			fmt.Printf("backed up  %s -> %s\n", a.Target, a.Backup)
 		}
-		return pkgrepos.Repo{}, fmt.Errorf("this bodega serves %d pkg repositories for %s, so which one this host should read is your decision rather than the server's: %s.\n"+
-			"  Hide the ones this host must not read (bodega pkg hide freebsd <repo>), or write the file by hand from GET /api/v1/status",
-			len(match), abi, strings.Join(names, ", "))
+		fmt.Printf("wrote      %s\n", a.Target)
 	}
-	for _, r := range st.Refused {
-		if r.ABI == abi {
-			return pkgrepos.Repo{}, fmt.Errorf("this bodega serves %s for %s and will not render client configuration for it: %s", r.Repo, abi, r.Error)
+	if err != nil {
+		return err
+	}
+	for _, c := range changes {
+		switch {
+		case c.Unchanged():
+		case c.Record.System == manifest.TypeApt && c.Target == clientconf.AptSourcesPath:
+			fmt.Println("\nApply it:  apt-get update")
+		case c.Record.System == manifest.TypeFreeBSD:
+			fmt.Println("\nApply it:  pkg update")
+			fmt.Println("Confirm the upstream repository is off:  pkg -vv | grep -A2 -E '^  (FreeBSD|bodega)'")
 		}
 	}
-	if len(others) == 0 {
-		return pkgrepos.Repo{}, fmt.Errorf("this bodega serves no pkg repository, so there is no configuration to install")
+	return nil
+}
+
+// getPlanFile fetches one URL a plan names. The URL carries the server's
+// public_url, which need not be the --url this command was given, so the
+// plain-http rule is applied to it again rather than inherited.
+func getPlanFile(c *Client, raw string, allowPlaintext bool) ([]byte, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return nil, fmt.Errorf("the plan names %q, which is not a URL with a host; refusing to fetch it", raw)
 	}
-	return pkgrepos.Repo{}, fmt.Errorf("this bodega serves no pkg repository for %s. It serves %s.\n"+
-		"  Pass --abi with one of those, or add an entry for this ABI on the server:  bodega pkg create freebsd <repo>",
-		abi, strings.Join(others, ", "))
+	switch {
+	case u.Scheme == "https":
+	case u.Scheme == "http" && allowPlaintext:
+	case u.Scheme == "http":
+		return nil, fmt.Errorf("the plan names %s, which is plain http, and --allow-plaintext is not set.\n"+
+			"  Set public_url on the server to https, or pass --allow-plaintext on a link you trust", raw)
+	default:
+		return nil, fmt.Errorf("the plan names %s, which is not an http or https URL; refusing to fetch it", raw)
+	}
+	req, err := http.NewRequest(http.MethodGet, raw, nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", raw, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", raw, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET %s: %s\n%s", raw, resp.Status, serverError(body))
+	}
+	return body, nil
 }
 
 // localPkgABI asks pkg what ABI this host is, which is the only authority on
@@ -663,7 +535,7 @@ func pkgRepoForABI(st pkgClientStatus, abi string) (pkgrepos.Repo, error) {
 func localPkgABI() (string, error) {
 	out, err := exec.Command("pkg", "config", "abi").Output()
 	if err != nil {
-		return "", fmt.Errorf("--write-pkg-repo needs the ABI to configure for, and `pkg config abi` did not answer on this host (%v).\n"+
+		return "", fmt.Errorf("--configure freebsd needs the ABI to configure for, and `pkg config abi` did not answer on this host (%v).\n"+
 			"  Pass it:  --abi FreeBSD:14:amd64", err)
 	}
 	abi := strings.TrimSpace(string(out))
