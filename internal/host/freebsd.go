@@ -302,16 +302,20 @@ func checkMakeConf(goos string, run toolRunner, present func(string) bool) Findi
 
 // siteProblems judges one set of values make computed. The expected route
 // is the rendered one with BODEGA_DISTFILES_ENV and DIST_SUBDIR expanded to
-// the values make gave them.
+// the values make gave them. An empty BODEGA_DISTFILES_ENV is reported
+// alongside the sites, not instead of them, so the operator sees where a
+// fetch goes.
 func siteProblems(label string, names []string, vals map[string]string) []string {
 	env := vals[distfilesEnvVar]
-	if env == "" {
-		return []string{label + ": " + distfilesEnvVar + " is empty, so no client check set it"}
-	}
 	var problems []string
+	route := "/distfiles/@" + env + "/"
+	if env == "" {
+		problems = append(problems, label+": "+distfilesEnvVar+" is empty, so no client check set it")
+		route = "/distfiles/@${" + distfilesEnvVar + "}/"
+	}
 	for _, n := range names {
 		if !distfilesSitesAt(vals[n], env, vals[distSubdirVar]) {
-			problems = append(problems, fmt.Sprintf("%s: %s=%q is not every site at bodega's /distfiles/@%s/ route", label, n, vals[n], env))
+			problems = append(problems, fmt.Sprintf("%s: %s=%q is not every site at bodega's %s route", label, n, vals[n], route))
 		}
 	}
 	return problems

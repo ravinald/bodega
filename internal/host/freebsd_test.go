@@ -171,7 +171,8 @@ func TestPkgReposAsksPkg(t *testing.T) {
 func TestMakeConfAsksMake(t *testing.T) {
 	t.Run("upstream host", func(t *testing.T) {
 		got := checkMakeConf("freebsd", replay(t, loadToolFixture(t, "upstream-make")), onGuest)
-		assertFinding(t, got, StatusWarn, "/usr/ports/ports-mgmt/pkg", "BODEGA_DISTFILES_ENV is empty", toolLimit)
+		assertFinding(t, got, StatusWarn, "/usr/ports/ports-mgmt/pkg", "BODEGA_DISTFILES_ENV is empty",
+			`MASTER_SITE_BACKUP="http://distcache.FreeBSD.org/ports-distfiles/" is not every site`, toolLimit)
 	})
 	t.Run("bodega host", func(t *testing.T) {
 		got := checkMakeConf("freebsd", replay(t, loadToolFixture(t, "bodega-make")), onGuest)
