@@ -78,9 +78,10 @@ func distinfoLogf(logger *slog.Logger, root string, getenv func(string) string) 
 // server did read is an incomplete tree, and no mount override fixes that.
 // NOTIFY_SOCKET is the evidence of a systemd unit, the same signal sdNotify
 // reads; without it, or for any other root or error, the hint is empty and the
-// plain failure stands. For /home, BindReadOnlyPaths= alone is not enough: the
-// bind lands beneath a mode-000 mount the service account cannot traverse, so
-// the hint names ProtectHome=tmpfs as well.
+// plain failure stands. Which setting hides root is hiddenBy's answer, from
+// root as spelled. For /home, BindReadOnlyPaths= alone is not enough: the bind
+// lands beneath a mode-000 mount the service account cannot traverse, so the
+// hint names ProtectHome=tmpfs as well.
 //
 // The bind it offers must expose the directory the server would read at root,
 // and nothing beside it. filepath.Clean agrees with the kernel except across
@@ -96,17 +97,18 @@ func hiddenTreeHint(root string, err error, getenv func(string) string) string {
 	if !errors.As(err, &pe) || filepath.Clean(pe.Path) != clean {
 		return ""
 	}
-	under := func(dir string) bool { return clean == dir || strings.HasPrefix(clean, dir+"/") }
 	move := "move the tree to /usr/ports or /srv and point distfiles_ports_tree at it"
 	bind, ok := systemdBindSource(clean)
 	if slices.Contains(strings.Split(root, "/"), "..") {
 		ok = false
 	}
 	var cause, extra string
-	switch {
-	case under("/tmp") || under("/var/tmp"):
+	switch tmp, home := hiddenBy(root); {
+	case tmp && home:
+		cause = fmt.Sprintf("the shipped bodega.service sets PrivateTmp=true and ProtectHome=true, which give the service its own empty /tmp and /var/tmp and make /home unreadable to it, and %s passes through both, so it cannot be read", root)
+	case tmp:
 		cause = fmt.Sprintf("the shipped bodega.service sets PrivateTmp=true, which gives the service its own empty /tmp and /var/tmp, so %s does not exist for it", root)
-	case under("/home"):
+	case home:
 		cause = fmt.Sprintf("the shipped bodega.service sets ProtectHome=true, which makes /home unreadable to the service, so %s cannot be read", root)
 		extra = "ProtectHome=tmpfs and "
 	default:
@@ -116,6 +118,38 @@ func hiddenTreeHint(root string, err error, getenv func(string) string) string {
 		return fmt.Sprintf("%s: %s, or %s", cause, move, aliasBind(root))
 	}
 	return fmt.Sprintf("%s: %s, or run `systemctl edit bodega`, add %sBindReadOnlyPaths=%s under [Service], and restart bodega", cause, move, extra, bind)
+}
+
+// hiddenBy reports whether the kernel's walk of root, as spelled, enters a
+// directory PrivateTmp=true or ProtectHome=true hides. The walk is lexical,
+// with ".." dropping the last component, because cleaning root first would
+// discard a component the kernel still has to open: "/tmp/x/../../srv/ports"
+// fails under PrivateTmp at /tmp/x, though its clean spelling never enters
+// /tmp. Under PrivateTmp, /tmp and /var/tmp themselves exist and only what is
+// below them is gone; under ProtectHome, /home itself cannot be entered.
+// Nothing is resolved on this host: from inside the service's namespace a
+// symlink would answer for the wrong view.
+func hiddenBy(root string) (tmp, home bool) {
+	var walk []string
+	for _, c := range strings.Split(root, "/") {
+		switch c {
+		case "", ".":
+			continue
+		case "..":
+			if len(walk) > 0 {
+				walk = walk[:len(walk)-1]
+			}
+			continue
+		}
+		walk = append(walk, c)
+		switch {
+		case walk[0] == "home":
+			home = true
+		case walk[0] == "tmp" && len(walk) > 1, walk[0] == "var" && len(walk) > 2 && walk[1] == "tmp":
+			tmp = true
+		}
+	}
+	return tmp, home
 }
 
 // The alias aliasBind names. Both sit under /srv, outside every path the
@@ -132,10 +166,13 @@ const (
 // would, so the bind exposes that directory and nothing beside it. The
 // destination has to differ from root, because root's own components need not
 // exist inside the service's namespace, so distfiles_ports_tree moves to it.
-// ln -n and mkdir fail on a name already taken; plain ln would follow an
-// existing alias and write a new link inside the operator's tree.
+// ln -T and mkdir are each one system call that fails on a name already taken,
+// whatever holds it. Without -T, ln treats an existing directory, or a symlink
+// to one, as a place to put the link, and the bind would then mount that
+// directory instead of root. -T is GNU and uutils coreutils; the hint only
+// appears under systemd, so on Linux.
 func aliasBind(root string) string {
-	return fmt.Sprintf("expose it through an alias: run `ln -sn %s %s && mkdir %s`, run `systemctl edit bodega`, add BindReadOnlyPaths=%s:%s under [Service], set distfiles_ports_tree to %s in %s, and restart bodega (docs/usage.md, \"Running under systemd\", explains why a direct bind cannot name this path)",
+	return fmt.Sprintf("expose it through an alias: run `ln -sT %s %s && mkdir %s`, and only once that succeeds run `systemctl edit bodega`, add BindReadOnlyPaths=%s:%s under [Service], set distfiles_ports_tree to %s in %s, and restart bodega (docs/usage.md, \"Running under systemd\", explains why a direct bind cannot name this path)",
 		shellQuote(root), aliasBindSource, aliasBindTarget, aliasBindSource, aliasBindTarget, aliasBindTarget, config.SystemConfigFile)
 }
 
