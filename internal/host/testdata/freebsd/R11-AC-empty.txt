@@ -1,0 +1,20 @@
+@@ portsdir exit=0
+
+@@ portsdir stderr
+make: warning: /usr/obj/: Permission denied
+@@ values exit=1
+make: stopped making "all" in /usr/ports/ports-mgmt/pkg
+@@ values stderr
+make: /usr/ports/Mk/bsd.port.mk:2043: Variable "CC" is undefined
+	in /usr/share/mk/bsd.port.mk:27
+	in /usr/share/mk/bsd.port.post.mk:4
+	in /usr/ports/ports-mgmt/pkg/Makefile:64
+make: Fatal errors encountered -- cannot continue
+@@ recipe exit=1
+make: stopped making "_bodega_doctor_sites" in /usr/ports/ports-mgmt/pkg
+@@ recipe stderr
+make: /usr/ports/Mk/bsd.port.mk:2043: Variable "CC" is undefined
+	in /usr/share/mk/bsd.port.mk:27
+	in /usr/share/mk/bsd.port.post.mk:4
+	in /usr/ports/ports-mgmt/pkg/Makefile:64
+make: Fatal errors encountered -- cannot continue
