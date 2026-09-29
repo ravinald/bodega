@@ -3379,7 +3379,7 @@ fetch > run > package > upload
 
 ### Client configuration
 
-Each client reads its own configuration file. bodega composes every one of them for the host that asks and serves a script that installs them, so a host needs `sh` and `curl` or `fetch(1)` and nothing else. The rest of this section shows each file as bodega renders it, with `https://bodega-host:8080` standing in for your `public_url`.
+Each client reads its own configuration file. bodega composes every one of them for the host that asks and serves a script that installs them, so a host needs `sh`, `curl` or `fetch(1)`, `sha256sum` or `sha256(1)`, `awk`, `diff` and `cmp`, and nothing else. The rest of this section shows each file as bodega renders it, with `https://bodega-host:8080` standing in for your `public_url`.
 
 #### Setup script
 
@@ -3394,7 +3394,7 @@ The host has to be identified first. Every `/client/` route answers 403 to a hos
    # FreeBSD base system:  fetch -o setup.sh https://bodega-host:8080/client/setup.sh
    ```
 
-2. Check its digest. This release serves SHA-256 `ce1d50e825aa6f475a0d3a5fd18f86952747f1a023f777f4f28bba35420cd50a`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
+2. Check its digest. This release serves SHA-256 `1b9c57d0546671e3b5c49594eebf7319b017e1afa9ca954d814a283bd6f72b28`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
 
    ```sh
    sha256sum setup.sh              # FreeBSD: sha256 setup.sh
@@ -3423,7 +3423,14 @@ The per-user files (`~/.npmrc`, `~/.cargo/config.toml`, `~/.gitconfig`, and the 
 
 The one thing a replaced file keeps is bodega's own credential. [`bodega doctor --write-credentials`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n) writes into two of these files, `~/.npmrc` and helm's `repositories.yaml`, and the plan's versions of them hold no secret, so a whole-file write would erase the token and npm and helm would keep working with every request unattributed. Instead the script and `doctor --configure` carry over the entry that command owns: npm's fenced block, or the bare `//<host>/npm/:_authToken=` line left when npm rewrote the file without the fence, and helm's `bodega` repository item when it holds a `password:`, kept whole with its `url:`, so re-run `--write-credentials --url` to point it elsewhere. The two commands then agree on the result in either order, so run the script first and `--write-credentials` after or the other way round, and a second run of either changes nothing. Any other token in those files, a `//registry.npmjs.org/:_authToken=` line or another helm repository's password, goes with the rest of the file into the backup.
 
-The diff redacts before it prints: the password in a `user:pass@` URL, and the value of any `key = value` or `key: value` whose key ends in `password`, `passwd`, `token`, `secret` or `_auth`. The files themselves are written unredacted, and a backup of a file that held a secret carries it too, with the original's mode.
+The diff redacts before it prints:
+
+- the password in a `user:pass@` URL, keeping the user;
+- the whole userinfo of an `http` or `https` URL with no password, since that lone field is a token (`https://ghp_x@github.com/` prints `https://<redacted>@github.com/`). An `ssh://git@host/` user is an account name and prints as written;
+- everything after an `Authorization:` header name except the scheme, wherever it sits in the line, as in git's `http.<url>.extraHeader`;
+- the value of any `key = value` or `key: value` whose key, in any case, ends in `password`, `passwd`, `token`, `secret`, `_auth` or `_key`, or is `apikey`.
+
+The files themselves are written unredacted, and a backup of a file that held a secret carries it too, with the original's mode.
 
 What the script states about the host: `os` from `uname -s`, which must be `linux` or `freebsd`; `abi` from `pkg config abi` on FreeBSD; and `codename` from `VERSION_CODENAME` in `/etc/os-release` on Linux, since `lsb_release` is absent from minimal images. On an instance serving no apt suite by the host's codename, the plan skips apt and names the suites it does serve, and `bodega doctor --configure apt --suite <suite>` is the way through.
 

@@ -8,7 +8,7 @@
 # this file's SHA-256 with client_setup_sha256 in /api/v1/status before
 # running it.
 #
-# Needs only sh, curl or fetch(1), sha256sum or sha256(1), diff and cmp.
+# Needs only sh, curl or fetch(1), sha256sum or sha256(1), awk, diff and cmp.
 
 set -eu
 umask 022
@@ -289,16 +289,20 @@ keep() {
 }
 
 # redact <file> prints it with every secret replaced by <redacted>: the
-# password of a user:pass@ URL, and the value of a YAML `key: value` or an ini
-# `key = value` whose key ends in password, passwd, token, secret or _auth.
-# The diff lands in a terminal and often a CI log, and the host's file can
-# hold a credential bodega never wrote. internal/clientconf Redact is the same
-# rule.
+# password of a user:pass@ URL, keeping the user; the whole userinfo of an
+# http or https URL with no password, which is a token (an ssh:// user is an
+# account name and stays); everything after an Authorization: header name but
+# the scheme, anywhere in the line; and the value of a YAML `key: value` or an
+# ini `key = value` whose key, case folded, ends in password, passwd, token,
+# secret, _auth or _key, or is apikey. The diff lands in a terminal and often
+# a CI log, and the host's file can hold a credential bodega never wrote.
+# internal/clientconf Redact is the same rule, and a test runs both over one
+# table of lines.
 redact() {
 	awk '
 	function secret(k) {
 		k = tolower(k); gsub(/^["\047]|["\047]$/, "", k)
-		return k ~ /(password|passwd|token|secret|_auth)$/
+		return k ~ /(password|passwd|token|secret|_auth|_key)$/ || k == "apikey"
 	}
 	{
 		line = $0; out = ""
@@ -308,7 +312,20 @@ redact() {
 			out = out substr(line, 1, RSTART - 1) "://" user ":<redacted>@"
 			line = substr(line, RSTART + RLENGTH)
 		}
+		line = out line; out = ""
+		while (match(line, /[Hh][Tt][Tt][Pp][Ss]?:\/\/[^\/?#:@ \t]+@/)) {
+			seg = substr(line, RSTART, RLENGTH)
+			out = out substr(line, 1, RSTART - 1) substr(seg, 1, index(seg, "://") + 2) "<redacted>@"
+			line = substr(line, RSTART + RLENGTH)
+		}
 		line = out line
+		if (match(tolower(line), /authorization[ \t]*:[ \t]*/)) {
+			head = substr(line, 1, RSTART + RLENGTH - 1); rest = substr(line, RSTART + RLENGTH)
+			if (match(rest, /^[A-Za-z][A-Za-z0-9._~+-]*[ \t]+[^ \t]/)) {
+				head = head substr(rest, 1, RLENGTH - 1); rest = substr(rest, RLENGTH)
+			}
+			if (rest ~ /^[^ \t]/) line = head "<redacted>"
+		}
 		head = ""
 		if (match(line, /^[ \t]*(-[ \t]+)?[A-Za-z0-9_.-]+[ \t]*:([ \t]|$)/)) {
 			head = substr(line, 1, RLENGTH); key = head
