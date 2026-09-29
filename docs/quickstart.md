@@ -197,7 +197,7 @@ MASTER_SITE_BACKUP?= https://bodega-host:8080/distfiles/@${BODEGA_DISTFILES_ENV}
 
 [Mirroring ports distfiles](usage.md#mirroring-ports-distfiles) covers the server side and the client check.
 
-Only apt and FreeBSD pkg have a client file the server composes today, and writing either takes the `bodega` binary on the client. The rest are set by hand as shown. A served setup script that configures a chosen set of these without the binary is planned ([#51](https://github.com/ravinald/bodega/issues/51), [#52](https://github.com/ravinald/bodega/issues/52)); [Client configuration](usage.md#client-configuration) describes it.
+`bodega doctor` writes the apt and FreeBSD pkg files on a host that has the binary. The rest are set by hand as shown. A host without the binary can read which of these it should install, rendered for it, from `GET /client/plan` ([Client plan and per-system files](usage.md#client-plan-and-per-system-files)). A served setup script that applies that plan is planned ([#52](https://github.com/ravinald/bodega/issues/52)).
 
 ## 6. Launch the TUI
 

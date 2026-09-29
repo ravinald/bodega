@@ -3358,7 +3358,7 @@ Each client reads its own configuration file, and this section shows each one as
 | pip, npm, cargo, Go, helm, git | hand, from the files below                                         | each file below; `--write-credentials` places the token each one reads, and for helm also registers the repository                                    |
 | FreeBSD ports (`make.conf`)    | hand, from the lines below                                         | the sites, and the client check at `/distfiles/@environment.mk`; see [Mirroring ports distfiles](#mirroring-ports-distfiles)                          |
 
-Both writers need the `bodega` binary on the client, and each run performs one write. **Planned, not built yet** ([#51](https://github.com/ravinald/bodega/issues/51), [#52](https://github.com/ravinald/bodega/issues/52)): the server serving each client's rendered file and a plan of which ones a host should use, worked out from the host's identity and profile, plus a setup script served by bodega that applies a chosen subset of that plan on a host without the binary. Until then, a fleet without the binary copies these files through its own configuration management.
+Both writers need the `bodega` binary on the client, and each run performs one write. A host without the binary reads the same decisions from the server: [`GET /client/plan`](#client-plan-and-per-system-files) lists which files the host installs, worked out from its identity and profile, and `GET /client/{system}` serves each one rendered for it. **Planned, not built yet** ([#52](https://github.com/ravinald/bodega/issues/52)): a setup script served by bodega that applies a chosen subset of that plan. Until then, a fleet without the binary applies the plan through its own configuration management.
 
 **APT** (`/etc/apt/sources.list.d/bodega.sources`), against a signed repository:
 
@@ -3570,6 +3570,142 @@ Every 200 came off `pkg.FreeBSD.org` and `cache_origins` names the upstream URL 
 **`pkg bootstrap` is the one thing this may not give you, and the mode is not what decides it.** pkg's bootstrapper fetches `<repo>/Latest/pkg.pkg` and `<repo>/Latest/pkg.pkg.sig` and nothing else, and a mirror publishes only the repopaths its catalogue names, which never include that pair. What decides the answer is whether bodega fetches a path outside the catalogue from upstream, and that is three terms rather than the mode alone: the entry records a `url`, and either its mode is `proxy` or the server's `proxy_cache_enabled` is on. So a hosted mirror on a server with the cache on resolves both paths against upstream exactly as a proxied one does, and only a repository where none of the three holds is isolated. Upstream publishes a pkg package under the ports repositories and nowhere else. Measured with `fetch` against `pkg.FreeBSD.org` on 2026-09-21, both paths per repository: `latest` and `quarterly` answer 200 on `FreeBSD:15:aarch64` and `FreeBSD:14:amd64`; every `base_*` and `kmods_*` repository answers 403 or 404 on both, including `base_release_0`, which serves `pkg.pkg` and 403s the signature the bootstrapper checks it against; `release_0` and `release_1` answer 200 on 15 and 404 on 14. What the client sees is not always what upstream said: bodega passes a 404 through and turns any other upstream refusal into a 502 whose body names nothing, with the refusing URL in the server log. So bodega renders three answers rather than two, and a repository nobody measured gets the hedge: the emitted comment says which case this file is, the `bootstrap` field on `GET /api/v1/status` says the same in one word, and `upstream_fallthrough` beside it answers the question a reader means by "is this repository proxied". Install pkg from upstream, or from a ports repository through bodega, before switching a host over.
 
 Verified against FreeBSD 15.1-RELEASE with pkg 2.7.5: the file above installs, `pkg -vv` reports all three upstream tags `enabled: no` and `mirror_type` absent from bodega's definition (pkg prints it only when it is not `NONE`), and `pkg update` followed by `pkg install` resolves from `[bodega-<repo>]`. The `base_release_<n>` form was proven the same way against a proxied `FreeBSD:15:aarch64/base_release_1`: `pkg -vv` resolves `${VERSION_MAJOR}` to `/usr/share/keys/pkgbase-15`, `pkg update` processes 502 packages and `pkg fetch FreeBSD-telnet` pulls the package through bodega.
+
+#### Client plan and per-system files
+
+A host with no `bodega` binary asks the server what it should become. The server already holds every fact the answer takes: the identity bindings say which host is asking, the profile bound to that identity says what it may fetch, and the running instance knows which suites, repositories and namespaces it serves. The host supplies the three facts the server cannot see.
+
+| Endpoint               | Returns                                                            |
+| ---------------------- | ------------------------------------------------------------------ |
+| `GET /client/plan`     | the plan as JSON                                                   |
+| `GET /client/plan.txt` | the same records, tab-separated, for a POSIX `sh` loop             |
+| `GET /client/{system}` | one system's file, rendered for this host by `internal/clientconf` |
+
+Every route takes the same query parameters:
+
+| Parameter  | Required        | Value                                                                                           |
+| ---------- | --------------- | ----------------------------------------------------------------------------------------------- |
+| `os`       | yes             | `linux` or `freebsd`. It picks each file's path, and which systems apply at all                 |
+| `abi`      | for `freebsd`   | what `pkg config abi` prints, `FreeBSD:15:amd64`. Without it the pkg record is a skip naming it |
+| `codename` | when it matters | what `lsb_release -cs` prints, `noble`. Needed when the server serves more than one apt suite   |
+
+The host resolves the way a package route resolves it: a bound token, then the longest bound CIDR, then nobody. So the same credentials `bodega doctor --write-credentials` writes, or a CIDR binding with no credential at all, identify it here. `{system}` is one of the ten package types: `apt`, `git`, `pypi`, `binary`, `gomod`, `helm`, `npm`, `cargo`, `freebsd`, `distfiles`.
+
+**Records.** The plan lists all ten systems, one record per file, in this column order:
+
+| Column     | Value                                                                                                 |
+| ---------- | ----------------------------------------------------------------------------------------------------- |
+| `identity` | the name the host resolved to                                                                         |
+| `profile`  | the profile bound to that name, empty when none is                                                    |
+| `match`    | the binding that resolved it: `token:<token-id>` or `cidr:<prefix>`                                   |
+| `system`   | the package type                                                                                      |
+| `action`   | `install`, `refuse` or `skip`                                                                         |
+| `path`     | where the file goes on this `os`. A leading `~` is the home directory of the user the file configures |
+| `url`      | where to fetch it                                                                                     |
+| `sha256`   | hex SHA-256 of what `url` serves                                                                      |
+| `reason`   | why a `refuse` or `skip` record has no file                                                           |
+
+- **`install`** is a file to write. Most systems have one. apt against a signed suite has two: the stanza, and the keyring its `Signed-By:` names, fetched from `/apt/bodega-archive-keyring.gpg`. `distfiles` has two as well: `make.conf`, and the client check it includes, fetched from `/distfiles/@environment.mk`. make stops at a missing `.include`, so the pair travels together.
+- **`refuse`** is a system the host's profile excludes: closed, listing nothing of that type, and blocking the rest. It also covers a profile that scopes apt to a codename other than the one the host states, and a git profile covering none of the served namespaces. A refusal is a record rather than an absence, so a host can tell "not for you" from "not configured".
+- **`skip`** is a system with nothing to install here for a reason that is not the profile's: the wrong operating system (apt on FreeBSD, pkg and distfiles on Linux), nothing configured on the server, a fact the host did not state, or a choice only the operator can make, such as two pkg repositories serving the same ABI. `binary` is always a skip: a binary is downloaded by URL, not configured.
+
+bodega's pkg fingerprint is not in the plan. The FreeBSD stanza names it and says to deliver it out of band, because a fingerprint fetched from the server it authenticates proves nothing.
+
+A host bound to a profile that governs freebsd gets the stanza for that profile's filtered catalogue, the same one [pkg under a profile](#pkg-under-a-profile) describes; a host bound to a profile that scopes apt gets its filtered codename. `GET /client/{system}` renders from the same decision, so the file at a record's `url` is the file whose SHA-256 the record carries.
+
+**`plan.txt`.** One record per line, fields separated by one tab, no header. The reason is last, so it may carry spaces. Each field decodes by one rule:
+
+- `-` alone is an empty field. `read` treats a tab as white space and collapses two in a row, so an empty field written as nothing would shift every later column left.
+- A field holding a backslash decodes with `printf '%b'`. The server escapes a backslash as `\\`, a tab as `\t`, a newline as `\n` and a carriage return as `\r`, and a value that is a single `-` (a profile may be named that) as `\0055`.
+- Anything else is the value as written.
+
+Identity names are free text, which is why the escapes exist. `system`, `action`, `path`, `url` and `sha256` come from the server and never need decoding, so a loop that reads only those can skip the step. Read `-r` either way, or `read` eats the backslashes first:
+
+```sh
+tab=$(printf '\t')
+dec() { case $1 in -) v= ;; *\\*) v=$(printf '%bx' "$1"); v=${v%x} ;; *) v=$1 ;; esac; }
+curl -fsS "https://bodega-host:8080/client/plan.txt?os=freebsd&abi=$(pkg config abi)" |
+while IFS=$tab read -r identity profile match system action path url sha256 reason; do
+  dec "$profile"; profile=$v
+  echo "$system $action $path (profile: ${profile:-none})"
+done
+```
+
+The trailing `x` keeps command substitution from stripping a newline the value ends in.
+
+For a FreeBSD host bound to profile `web`, which lists only `nginx` for freebsd and closes npm with nothing listed:
+
+<!-- markdownlint-disable MD010 -->
+
+```text
+web01	web	token:tok-web	binary	skip	-	-	-	binary entries are downloaded by URL, not configured, so there is no client file
+web01	web	token:tok-web	git	skip	-	-	-	this server configures no git_upstreams namespace, so there is no route to rewrite a clone onto
+web01	web	token:tok-web	apt	skip	-	-	-	apt runs on Debian-family Linux, not freebsd
+web01	web	token:tok-web	pypi	install	/etc/pip.conf	https://bodega-host:8080/client/pypi?abi=FreeBSD%3A15%3Aamd64&os=freebsd	873cedb576d6e1a08174d1cec5c17a421efa42490d979c922d9586afbe54fa0e	-
+web01	web	token:tok-web	gomod	install	~/.config/go/env	https://bodega-host:8080/client/gomod?abi=FreeBSD%3A15%3Aamd64&os=freebsd	feeb4fe9e1cff56a72fbe2cd1ee8297b2b89e44c63712ce22862c41fdc92d0e6	-
+web01	web	token:tok-web	helm	install	~/.config/helm/repositories.yaml	https://bodega-host:8080/client/helm?abi=FreeBSD%3A15%3Aamd64&os=freebsd	9b618c895bdb6628bec18217f9274dfa4796441289b396928160204ae665d072	-
+web01	web	token:tok-web	npm	refuse	-	-	-	profile "web" is closed for npm, lists no npm package and blocks the rest, so every npm fetch is refused
+web01	web	token:tok-web	cargo	install	~/.cargo/config.toml	https://bodega-host:8080/client/cargo?abi=FreeBSD%3A15%3Aamd64&os=freebsd	5615df6f182f7b726c66e34b9f4b2f347096a6e553e88cd7d146309268d5b74f	-
+web01	web	token:tok-web	freebsd	install	/usr/local/etc/pkg/repos/bodega.conf	https://bodega-host:8080/client/freebsd?abi=FreeBSD%3A15%3Aamd64&os=freebsd	95f4ae0f469790e2a8d1ecd93988bdf8b7c458f82d0044abc4c3950b360c2b75	-
+web01	web	token:tok-web	distfiles	skip	-	-	-	this server has no distfiles_ports_tree configured, so it admits no distfile
+```
+
+<!-- markdownlint-enable MD010 -->
+
+**JSON.** The same records under `records`, with empty fields as `""` and every value unescaped. A test reads `plan.txt` through the `sh` loop above, decodes each field by the rule above in `sh` itself, and fails if any record differs from the JSON one, including a profile named `-`, a host with no profile and an identity holding a tab and a backslash. Two of the ten from the plan above:
+
+```json
+{
+  "records": [
+    {
+      "identity": "web01",
+      "profile": "web",
+      "match": "token:tok-web",
+      "system": "pypi",
+      "action": "install",
+      "path": "/etc/pip.conf",
+      "url": "https://bodega-host:8080/client/pypi?abi=FreeBSD%3A15%3Aamd64\u0026os=freebsd",
+      "sha256": "873cedb576d6e1a08174d1cec5c17a421efa42490d979c922d9586afbe54fa0e",
+      "reason": ""
+    },
+    {
+      "identity": "web01",
+      "profile": "web",
+      "match": "token:tok-web",
+      "system": "npm",
+      "action": "refuse",
+      "path": "",
+      "url": "",
+      "sha256": "",
+      "reason": "profile \"web\" is closed for npm, lists no npm package and blocks the rest, so every npm fetch is refused"
+    }
+  ]
+}
+```
+
+`\u0026` is `&`, escaped by the JSON encoder; any JSON parser returns the plain URL.
+
+**Refusals.** Every error body is plain text naming the next step. The deny list answers first, before any identity is resolved. The identity check comes next, ahead of the mutation gate and the router: a host no binding names gets the `403` below on every `/client/` path and method whatever else is wrong with the request, including a path the router would redirect or not find and a method it would refuse, so an unknown address learns the command that admits it and not which `os` values, system names or methods this server takes.
+
+| Status | When                                                                                                        | Body                                                                                                                                                                  |
+| ------ | ----------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `400`  | `os` is missing or not `linux`/`freebsd`, or `abi`/`codename` is malformed                                  | the accepted values                                                                                                                                                   |
+| `403`  | the host's address is on the deny list (`bodega acl deny`), on every `/client/` path                        | the deny entry that matched, `bodega acl deny remove <cidr>`, and the `bodega identity bind` command for the address                                                  |
+| `403`  | no identity binding names the host, on every `/client/` path and method, before any check but the deny list | the `bodega identity bind` command for its address, and `bodega acl proxies add` first when the address came from a forwarded header this server does not yet believe |
+| `403`  | `GET /client/{system}` for a system the host's profile excludes                                             | the profile's reason, the same text as the plan's `refuse` record                                                                                                     |
+| `404`  | `GET /client/{system}` for a system that is a `skip` here, or a name that is not one of the ten             | the skip's reason, or the ten names                                                                                                                                   |
+
+```text
+$ curl -s "https://bodega-host:8080/client/plan?os=linux"
+this host (192.0.2.1) resolves to no identity, and /client/ configures only a host the server can name.
+  Bind this address:  bodega identity bind cidr 192.0.2.1/32 <name>
+  Or bind its token:  bodega identity bind token <token-id> <name>
+  Then give the name a profile, if it needs one:  bodega profile bind <profile> <name>
+```
+
+An unidentified host is refused rather than handed the unprofiled plan, because the plan names the profile and every path the fleet writes.
+
+**Audit.** Every `/client/` response writes one row. A served plan or file is a `serve_fetch` row with type `client`, the name `plan`, `plan.txt` or the system, and the stated `os` in the version column, so `bodega audit events --type serve_fetch` answers which hosts pulled which plan. A `403` is a `denied` row, `client_unidentified` or `client_excluded`. A `400` or `404` is a `serve_fetch` row with status `failure` and the reason in `details`. The row is written around the router rather than inside the handlers, so a response the router gives itself is a row too: a `405` for a method the route does not take, a `404` for `/client/plan/`, a `307` for `/client//plan`. Those are `serve_fetch` rows with status `failure`, the method and path in `details`, and the name taken from the path. A refusal the deny list or the mutation gate writes its own `denied` row for is not written a second time. The name column holds at most 64 bytes of what the caller sent, then `…`, so an unknown system name or a long path costs a bounded row whoever sent it.
 
 ### Git smart-HTTP
 
@@ -4619,6 +4755,8 @@ All API responses are JSON. The full API is documented in [OpenAPI 3.0 format](.
 | GET    | `/api/v1/config`                           | Non-sensitive config (bucket, region, manifest_dir)                                                                                                                                     |
 | GET    | `/api/v1/audit`                            | Query audit events (supports filters)                                                                                                                                                   |
 | GET    | `/api/v1/profiles/{name}/pins`             | One profile's pins, with their reason, review date and OSV state. `?stale=true` narrows to the overdue ones. Admin-gated. See [Pins as recorded decisions](#pins-as-recorded-decisions) |
+| GET    | `/client/plan`, `/client/plan.txt`         | Which client files the requesting host installs, from its identity and profile. See [Client plan and per-system files](#client-plan-and-per-system-files)                               |
+| GET    | `/client/{system}`                         | One system's client file, rendered for the requesting host                                                                                                                              |
 | GET    | `/healthz`                                 | Health probe (returns `ok`)                                                                                                                                                             |
 
 #### `version` on `/api/v1/status`
@@ -5143,8 +5281,10 @@ An object cached before bodega kept origins, filled by a path that fetches nothi
 | `push_refused`             | A git smart-HTTP push against a read-only mirror, on the `info/refs?service=git-receive-pack` probe or the `git-receive-pack` POST. `pkg_name` is the namespace, `details` the repository path. The POST reaches this only from inside `admin_permit_cidr`; from anywhere else `ip_not_permitted` refuses it first |
 | `spool_artifact_too_large` | A proxied artifact over `spool_max_artifact_bytes`. See [Large artifacts and the spool directory](#large-artifacts-and-the-spool-directory)                                                                                                                                                                        |
 | `spool_budget_exhausted`   | A proxy fetch arriving while `spool_max_total_bytes` is already held by the fetches in flight. `details` carries the bytes held and the number of fetches holding them                                                                                                                                             |
+| `client_unidentified`      | A `/client/` request from a host no identity binding names. See [Client plan and per-system files](#client-plan-and-per-system-files)                                                                                                                                                                              |
+| `client_excluded`          | `GET /client/{system}` for a system the host's profile excludes. `details` carries the profile and its reason                                                                                                                                                                                                      |
 
-The first eight gates run in the middleware chain, before any handler; the last five are decided by the handler itself. Both write the same row, because an operator asking "who was turned away" is asking one question.
+The first eight gates run in the middleware chain, before any handler; the rest are decided by the handler itself. Both write the same row, because an operator asking "who was turned away" is asking one question.
 
 The two `spool_*` statuses are refusals about this host rather than about the client, and they are in the same table on purpose: the operator's question is "why did that fetch not happen", and an answer split across two channels is one nobody correlates.
 
@@ -5174,7 +5314,7 @@ Fields on every row: timestamp, event type, package type/name/version, client IP
 
 - **Successful admin reads.** Only the refusals are rows; a permitted `GET /api/v1/audit` is journal-only.
 
-Denials record at every gate in the middleware chain, at the admin-read gate, and at the five refusals a handler decides for itself: a `DELETE` on a frozen entry (`entry_frozen`), a version outside an entry's `version_constraint` (`version_constraint`), a git push against a read-only mirror (`push_refused`, on both the `info/refs?service=git-receive-pack` probe and the `git-receive-pack` POST), and the two proxy spool bounds (`spool_artifact_too_large`, `spool_budget_exhausted`). The `status` column names which gate refused.
+Denials record at every gate in the middleware chain, at the admin-read gate, and at the refusals a handler decides for itself: a `DELETE` on a frozen entry (`entry_frozen`), a version outside an entry's `version_constraint` (`version_constraint`), a git push against a read-only mirror (`push_refused`, on both the `info/refs?service=git-receive-pack` probe and the `git-receive-pack` POST), the two proxy spool bounds (`spool_artifact_too_large`, `spool_budget_exhausted`), and the two `/client/` refusals (`client_unidentified`, `client_excluded`). The `status` column names which gate refused.
 
 **What a refusal costs.** The denial row is the only database write an anonymous caller controls, and it is synchronous. Sixty-four concurrent 403s were sixty-four goroutines contending for SQLite's single write lock: the refusal rate fell from 6,100/s to 800/s and the slowest single 403 took 1.6 seconds. bodega admits one denial writer at a time. Removing the contention restores the serial rate, at 8,500 refusals/s with the slowest single 403 under 20ms at that same 64-way concurrency. There is no tuning knob for the limit, because every larger value measured worse.
 

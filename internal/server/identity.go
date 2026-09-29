@@ -18,10 +18,16 @@ import (
 // matched on the address, and an audit row that dropped it would lose which of
 // an identity's addresses asked.
 func Identity(r *http.Request) string {
-	if id, ok := r.Context().Value(identityKey).(string); ok {
-		return id
-	}
-	return ""
+	return identityMatchOf(r).Identity
+}
+
+// identityMatchOf is the binding IdentityMiddleware resolved this request
+// through. A handler reporting which rule matched reads it here rather than
+// resolving again: a binding table reloaded in between would answer for a
+// different generation than the one that decided the request's identity.
+func identityMatchOf(r *http.Request) identityMatch {
+	m, _ := r.Context().Value(identityKey).(identityMatch)
+	return m
 }
 
 // credentialForm names how a request carried its credential. It is recorded on
@@ -148,6 +154,24 @@ func newIdentitySet(bindings []audit.IdentityBinding, tokens []audit.TokenHash) 
 	return set
 }
 
+// identityMatch is the binding a request resolved through: which kind, and
+// the token id or CIDR it matched. A client plan names it, because a host
+// resolving to the wrong name is a support question only the matched row
+// answers.
+type identityMatch struct {
+	Identity string
+	Kind     string
+	Key      string
+}
+
+// String is the form a plan record carries, "token:<id>" or "cidr:<prefix>".
+func (m identityMatch) String() string {
+	if m.Identity == "" {
+		return ""
+	}
+	return m.Kind + ":" + m.Key
+}
+
 // resolve answers "which host is this" in one fixed order: the bound token,
 // then the longest-prefix bound CIDR, then unidentified. Nothing here reads a
 // map in range order, so two requests carrying the same credential from the
@@ -164,45 +188,54 @@ func newIdentitySet(bindings []audit.IdentityBinding, tokens []audit.TokenHash) 
 // is false for an address a forwarded header asserted on an instance that has
 // not said which proxies it believes. See Server.cidrAddressTrusted.
 func (s *identitySet) resolve(cred, clientIP, pepper string, now time.Time, cidrTrusted bool) string {
+	return s.match(cred, clientIP, pepper, now, cidrTrusted).Identity
+}
+
+// match is resolve with the binding that answered.
+func (s *identitySet) match(cred, clientIP, pepper string, now time.Time, cidrTrusted bool) identityMatch {
 	if s == nil {
-		return ""
+		return identityMatch{}
 	}
 	if cred != "" && len(s.byToken) > 0 {
-		if id := s.identityForToken(cred, pepper, now); id != "" {
-			return id
+		if id, tokenID := s.identityForToken(cred, pepper, now); id != "" {
+			return identityMatch{Identity: id, Kind: audit.BindToken, Key: tokenID}
 		}
 	}
 	if !cidrTrusted {
-		return ""
+		return identityMatch{}
 	}
 	addr, err := netip.ParseAddr(clientIP)
 	if err != nil {
-		return ""
+		return identityMatch{}
 	}
 	addr = addr.Unmap()
 	for _, b := range s.cidr {
 		if b.prefix.Contains(addr) {
-			return b.identity
+			return identityMatch{Identity: b.identity, Kind: audit.BindCIDR, Key: b.prefix.String()}
 		}
 	}
-	return ""
+	return identityMatch{}
 }
 
 // identityForToken hashes the presented credential and returns the identity
-// bound to the token it matches. An expired token identifies nobody: the row
-// that revoked it is the operator saying this host is no longer that host.
-func (s *identitySet) identityForToken(cred, pepper string, now time.Time) string {
+// bound to the token it matches, with that token's id. An expired token
+// identifies nobody: the row that revoked it is the operator saying this host
+// is no longer that host.
+func (s *identitySet) identityForToken(cred, pepper string, now time.Time) (identity, tokenID string) {
 	incoming := audit.HashToken(cred, pepper)
 	for i := range s.tokens {
 		if subtle.ConstantTimeCompare([]byte(incoming), []byte(s.tokens[i].Hash)) != 1 {
 			continue
 		}
 		if exp := s.tokens[i].ExpiresAt; exp != nil && exp.Before(now) {
-			return ""
+			return "", ""
 		}
-		return s.byToken[s.tokens[i].ID]
+		if id := s.byToken[s.tokens[i].ID]; id != "" {
+			return id, s.tokens[i].ID
+		}
+		return "", ""
 	}
-	return ""
+	return "", ""
 }
 
 // IdentityMiddleware stashes the resolved identity in the request context, so
@@ -216,18 +249,18 @@ func (s *identitySet) identityForToken(cred, pepper string, now time.Time) strin
 // It admits nothing and refuses nothing. A request with no credential, an
 // unknown credential or an expired one reaches the next handler exactly as it
 // did before this middleware existed; all that changes is what the row says.
-func IdentityMiddleware(resolve func(*http.Request) string) func(http.Handler) http.Handler {
+func IdentityMiddleware(resolve func(*http.Request) identityMatch) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		if resolve == nil {
 			return next
 		}
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			id := resolve(r)
-			if id == "" {
+			m := resolve(r)
+			if m.Identity == "" {
 				next.ServeHTTP(w, r)
 				return
 			}
-			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), identityKey, id)))
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), identityKey, m)))
 		})
 	}
 }
@@ -310,15 +343,18 @@ func hasTokenBinding(bindings []audit.IdentityBinding) bool {
 }
 
 // identityFunc hands the middleware a live view of the binding table.
-func (s *Server) identityFunc() func(*http.Request) string {
-	return func(r *http.Request) string {
-		set := s.identityNow()
-		if len(set.byToken) == 0 && len(set.cidr) == 0 {
-			return ""
-		}
-		cred, _ := credentialFrom(r)
-		return set.resolve(cred, ClientIP(r), s.pepper, time.Now(), cidrAddressTrusted(r))
+func (s *Server) identityFunc() func(*http.Request) identityMatch {
+	return s.identityMatchFor
+}
+
+// identityMatchFor resolves r against the current binding table.
+func (s *Server) identityMatchFor(r *http.Request) identityMatch {
+	set := s.identityNow()
+	if len(set.byToken) == 0 && len(set.cidr) == 0 {
+		return identityMatch{}
 	}
+	cred, _ := credentialFrom(r)
+	return set.match(cred, ClientIP(r), s.pepper, time.Now(), cidrAddressTrusted(r))
 }
 
 // cidrAddressTrusted reports whether this request's address may name a host.

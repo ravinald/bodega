@@ -28,6 +28,7 @@ const (
 	trustedNetsKey
 	trustedNetsConfiguredKey
 	identityKey
+	clientAuditKey
 )
 
 // ClientIP returns the resolved client IP from the request context, falling
@@ -244,6 +245,11 @@ func DenyListMiddleware(denyNets NetsFunc, auditDB *audit.DB) func(http.Handler)
 				for _, cidr := range nets {
 					if cidr.Contains(ip) {
 						recordDenial(auditDB, r, audit.DenialDenyList, nil)
+						if isClientPath(r.URL.Path) {
+							w.Header().Set("Cache-Control", "no-store")
+							http.Error(w, strings.TrimRight(deniedClientText(clientIP, cidr), "\n"), http.StatusForbidden)
+							return
+						}
 						http.Error(w, "Forbidden", http.StatusForbidden)
 						return
 					}
@@ -252,6 +258,17 @@ func DenyListMiddleware(denyNets NetsFunc, auditDB *audit.DB) func(http.Handler)
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// deniedClientText is the deny list's 403 body on a /client/ path. A host
+// configuring itself from the setup script has nobody watching the journal,
+// and a bare Forbidden there reads the same as a missing identity binding,
+// whose repair would not help.
+func deniedClientText(ip string, cidr *net.IPNet) string {
+	return fmt.Sprintf("this host (%s) is on this server's deny list (%s), which refuses it before any identity is resolved.\n"+
+		"  Remove the entry if the refusal is wrong:  bodega acl deny remove %s\n"+
+		"  Then bind the host if it has no identity:  bodega identity bind cidr %s <name>\n",
+		ip, cidr, cidr, hostPrefix(ip))
 }
 
 // recordDenial writes one audit row for a request the server refused, so the
@@ -275,6 +292,11 @@ func recordDenial(db *audit.DB, r *http.Request, reason string, extra map[string
 // parseAPIPackagePath would leave the subject columns empty on exactly the
 // refusals an operator would filter by package to find.
 func recordDenialFor(db *audit.DB, r *http.Request, pkgType, pkgName, pkgVersion, reason string, extra map[string]string) {
+	// Before the ShouldRecord check: a denial this server's audit_events
+	// leaves out is still one the /client/ row must not stand in for.
+	if n := clientAuditOf(r); n != nil {
+		n.recorded = true
+	}
 	// ShouldRecord before the bound, not just inside Record: a server whose
 	// audit_events leaves out "denied" would otherwise serialize every 403 on
 	// denialWriteSlots to reach a write that returns immediately.

@@ -148,6 +148,12 @@ const (
 	DenialProfileMembership = "profile_membership" // package outside a closed profile's set
 	DenialProfileConstraint = "profile_constraint" // version outside the profile's constraint
 
+	// Refusals on the /client/ routes, which hand a host its configuration.
+	// Neither is a package refusal: one host resolved to nobody, and the
+	// other asked for a system its profile gives it nothing to fetch from.
+	DenialClientUnidentified = "client_unidentified" // /client/ request from a host no identity binding names
+	DenialClientExcluded     = "client_excluded"     // /client/{system} for a system the host's profile excludes
+
 	// Refusals that are about this host rather than about the client. They
 	// still belong in the denial table: the operator's question is "why did
 	// that fetch not happen", and an answer split across two channels is one

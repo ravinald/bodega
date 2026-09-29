@@ -470,6 +470,7 @@ func (s *Server) handler() http.Handler {
 	var h http.Handler = s.mux
 	h = AuditMiddleware(s.auditDB)(h)
 	h = MutationAuthMiddleware(s.adminNetsFunc(), s.auditDB, s.pepper, s.logger)(h)
+	h = s.clientMiddleware(h)
 	// Inside the deny list, so a refused address costs no token hash: a
 	// deny-listed peer is the one client that can flood this server on
 	// purpose. Outside everything that writes an audit row, so every row
@@ -873,6 +874,12 @@ func (s *Server) registerRoutes() {
 	// check measured: the path is what a client composes from
 	// MASTER_SITE_OVERRIDE=<base>/distfiles/@${BODEGA_DISTFILES_ENV}/${DIST_SUBDIR}/.
 	m.HandleFunc("GET /distfiles/{name...}", s.handleDistfiles)
+
+	// Client configuration: the plan a host reads to learn which files it
+	// installs, and each file rendered for that host.
+	m.HandleFunc("GET /client/plan", s.handleClientPlan)
+	m.HandleFunc("GET /client/plan.txt", s.handleClientPlanText)
+	m.HandleFunc("GET /client/{system}", s.handleClientSystem)
 
 	// REST API
 	m.HandleFunc("GET /api/v1/packages", s.handleAPIPackages)

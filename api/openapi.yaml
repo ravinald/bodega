@@ -22,6 +22,8 @@ tags:
     description: Package metrics
   - name: profiles
     description: What one class of host may fetch
+  - name: client
+    description: Configuration a client host reads to point its package systems at bodega
 
 paths:
   /healthz:
@@ -519,6 +521,93 @@ paths:
         "503":
           description: Audit database not configured
 
+  /client/plan:
+    get:
+      summary: The plan a client host reads to learn which files it installs
+      description: >
+        Resolves the requesting host through the identity bindings (token, then
+        longest-prefix CIDR) and the profile bound to that identity, and returns
+        one record per file the host installs, or one refusal or skip record per
+        system with nothing to install. Every one of the ten systems appears.
+        An unidentified host gets 403. plan.txt carries the same records
+        tab-separated. Every response is written to the audit trail.
+      operationId: getClientPlan
+      tags: [client]
+      parameters:
+        - $ref: "#/components/parameters/ClientOS"
+        - $ref: "#/components/parameters/ClientABI"
+        - $ref: "#/components/parameters/ClientCodename"
+      responses:
+        "200":
+          description: The host's plan
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClientPlan"
+        "400":
+          $ref: "#/components/responses/ClientError"
+        "403":
+          $ref: "#/components/responses/ClientError"
+
+  /client/plan.txt:
+    get:
+      summary: The client plan, tab-separated
+      description: >
+        The records GET /client/plan returns, one per line, fields in the order
+        identity, profile, match, system, action, path, url, sha256, reason,
+        separated by one tab. An empty field is written as "-", because a POSIX
+        sh read with IFS set to a tab collapses two adjacent tabs.
+      operationId: getClientPlanText
+      tags: [client]
+      parameters:
+        - $ref: "#/components/parameters/ClientOS"
+        - $ref: "#/components/parameters/ClientABI"
+        - $ref: "#/components/parameters/ClientCodename"
+      responses:
+        "200":
+          description: The host's plan
+          content:
+            text/plain:
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/ClientError"
+        "403":
+          $ref: "#/components/responses/ClientError"
+
+  /client/{system}:
+    get:
+      summary: One system's client file, rendered for the requesting host
+      description: >
+        The file a plan's install record names by URL. A system the host's
+        profile excludes is refused with 403; a system with nothing to install
+        on this host answers 404 with the reason.
+      operationId: getClientFile
+      tags: [client]
+      parameters:
+        - name: system
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, freebsd, distfiles]
+        - $ref: "#/components/parameters/ClientOS"
+        - $ref: "#/components/parameters/ClientABI"
+        - $ref: "#/components/parameters/ClientCodename"
+      responses:
+        "200":
+          description: The file's content
+          content:
+            text/plain:
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/ClientError"
+        "403":
+          $ref: "#/components/responses/ClientError"
+        "404":
+          $ref: "#/components/responses/ClientError"
+
   /api/v1/tokens:
     get:
       summary: List API tokens
@@ -770,6 +859,28 @@ components:
       required: true
       schema:
         type: string
+    ClientOS:
+      name: os
+      in: query
+      required: true
+      schema:
+        type: string
+        enum: [linux, freebsd]
+      description: The host's operating system, which the server cannot see
+    ClientABI:
+      name: abi
+      in: query
+      schema:
+        type: string
+        example: "FreeBSD:15:amd64"
+      description: The host's pkg ABI, as `pkg config abi` prints it. FreeBSD only.
+    ClientCodename:
+      name: codename
+      in: query
+      schema:
+        type: string
+        example: noble
+      description: The host's apt suite, as `lsb_release -cs` prints it. Linux only.
 
   responses:
     BadRequest:
@@ -786,6 +897,15 @@ components:
             type: string
     Forbidden:
       description: IP not in admin_permit_cidr or entry is frozen
+      content:
+        text/plain:
+          schema:
+            type: string
+    ClientError:
+      description: >
+        The reason, as text: a missing or unknown os, an unidentified host (with
+        the bodega identity or bodega acl command that would admit it), a system
+        the profile excludes, or a system with nothing to install here
       content:
         text/plain:
           schema:
@@ -1692,6 +1812,49 @@ components:
           description: >-
             Host an identity binding resolved the request to. Empty when nothing
             bound it; it sits beside ClientIP rather than replacing it.
+
+    ClientPlan:
+      type: object
+      properties:
+        records:
+          type: array
+          items:
+            $ref: "#/components/schemas/ClientPlanRecord"
+
+    ClientPlanRecord:
+      type: object
+      description: One file a host installs, or why a system has none. Empty fields are "" here and "-" in plan.txt.
+      properties:
+        identity:
+          type: string
+          description: The identity the host resolved to
+        profile:
+          type: string
+          description: The profile bound to that identity, empty when none is
+        match:
+          type: string
+          description: The binding that resolved it, "token:<id>" or "cidr:<prefix>"
+        system:
+          type: string
+          enum: [apt, git, pypi, binary, gomod, helm, npm, cargo, freebsd, distfiles]
+        action:
+          type: string
+          enum: [install, refuse, skip]
+          description: >
+            install is a file to write; refuse is a system the profile
+            excludes; skip is a system with nothing to install on this host
+        path:
+          type: string
+          description: Where the file goes on this host's operating system. A leading ~ is the invoking user's home.
+        url:
+          type: string
+          description: Where to fetch the file
+        sha256:
+          type: string
+          description: Hex SHA-256 of the file the url serves
+        reason:
+          type: string
+          description: Why a refuse or skip record has no file
 
     ProfilePin:
       type: object
