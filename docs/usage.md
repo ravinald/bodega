@@ -3394,7 +3394,7 @@ The host has to be identified first. Every `/client/` route answers 403 to a hos
    # FreeBSD base system:  fetch -o setup.sh https://bodega-host:8080/client/setup.sh
    ```
 
-2. Check its digest. This release serves SHA-256 `1b9c57d0546671e3b5c49594eebf7319b017e1afa9ca954d814a283bd6f72b28`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
+2. Check its digest. This release serves SHA-256 `c6ccbb001582a9dc78221ab07bd8aad413cea8370068e89eacb4fe357e767f0c`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
 
    ```sh
    sha256sum setup.sh              # FreeBSD: sha256 setup.sh
@@ -3425,8 +3425,8 @@ The one thing a replaced file keeps is bodega's own credential. [`bodega doctor 
 
 The diff redacts before it prints:
 
-- the password in a `user:pass@` URL, keeping the user;
-- the whole userinfo of an `http` or `https` URL with no password, since that lone field is a token (`https://ghp_x@github.com/` prints `https://<redacted>@github.com/`). An `ssh://git@host/` user is an account name and prints as written;
+- the whole userinfo of an `http` or `https` URL, user and password, empty or not: `https://user:pass@`, `https://<token>:x-oauth-basic@`, `https://<token>:@`, `https://:<token>@` and `https://<token>@` all print `https://<redacted>@` followed by the host and path. A token can be either half, and the user is not needed to read the diff;
+- the password in a `user:pass@` URL of any other scheme, keeping the user. An `ssh://git@host/` or `git@host:path` user is an account name and prints as written;
 - everything after an `Authorization:` header name except the scheme, wherever it sits in the line, as in git's `http.<url>.extraHeader`;
 - the value of any `key = value` or `key: value` whose key, in any case, ends in `password`, `passwd`, `token`, `secret`, `_auth` or `_key`, or is `apikey`.
 

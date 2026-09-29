@@ -183,8 +183,8 @@ func splitLines(s string) []string {
 const Redacted = "<redacted>"
 
 var (
+	httpUserinfo = regexp.MustCompile(`(?i)(https?://)[^/?# \t]*@`)
 	urlUserinfo  = regexp.MustCompile(`://([^/:@ \t]+):[^/@ \t]+@`)
-	urlTokenOnly = regexp.MustCompile(`(?i)(https?://)[^/?#:@ \t]+@`)
 	authHeader   = regexp.MustCompile(`(?i)(authorization[ \t]*:[ \t]*(?:[a-z][a-z0-9._~+-]*[ \t]+)?)[^ \t].*$`)
 	yamlKey      = regexp.MustCompile(`^[ \t]*(-[ \t]+)?([A-Za-z0-9_.-]+)[ \t]*:([ \t]|$)`)
 	secretKey    = regexp.MustCompile(`(password|passwd|token|secret|_auth|_key)$|^apikey$`)
@@ -193,10 +193,13 @@ var (
 // Redact replaces every secret in a configuration file's text with Redacted,
 // line by line:
 //
-//   - the password of a user:pass@ URL, keeping the user;
-//   - the whole userinfo of an http or https URL that has no password, since
-//     that lone field is a token (https://ghp_x@github.com/). An ssh:// user
-//     is an account name and stays;
+//   - the whole userinfo of an http or https URL, user and password, empty
+//     or not, up to the last @ before the path. A token can sit in either half
+//     (GitHub's https://<token>:x-oauth-basic@ puts it in the user), and
+//     telling a token from a username would be a guess whose misses print the
+//     secret;
+//   - the password of a user:pass@ URL of any other scheme, keeping the user.
+//     An ssh:// or scp-style git@host: user is an account name and stays;
 //   - everything after an Authorization: header name except the scheme
 //     (Bearer, Basic), wherever the header sits in the line, as in git's
 //     http.<url>.extraHeader;
@@ -219,8 +222,8 @@ func Redact(text string) string {
 }
 
 func redactLine(l string) string {
+	l = httpUserinfo.ReplaceAllString(l, "${1}"+Redacted+"@")
 	l = urlUserinfo.ReplaceAllString(l, "://$1:"+Redacted+"@")
-	l = urlTokenOnly.ReplaceAllString(l, "${1}"+Redacted+"@")
 	l = authHeader.ReplaceAllString(l, "${1}"+Redacted)
 	var head, key, rest string
 	if m := yamlKey.FindStringSubmatchIndex(l); m != nil {

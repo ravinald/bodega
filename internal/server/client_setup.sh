@@ -289,13 +289,16 @@ keep() {
 }
 
 # redact <file> prints it with every secret replaced by <redacted>: the
-# password of a user:pass@ URL, keeping the user; the whole userinfo of an
-# http or https URL with no password, which is a token (an ssh:// user is an
-# account name and stays); everything after an Authorization: header name but
-# the scheme, anywhere in the line; and the value of a YAML `key: value` or an
-# ini `key = value` whose key, case folded, ends in password, passwd, token,
-# secret, _auth or _key, or is apikey. The diff lands in a terminal and often
-# a CI log, and the host's file can hold a credential bodega never wrote.
+# whole userinfo of an http or https URL, user and password, empty or not, up
+# to the last @ before the path, since a token can sit in either half and a
+# guess at which is a token prints the ones it misses; the password of a
+# user:pass@ URL of any other scheme, keeping the user (an ssh:// or scp-style
+# git@host: user is an account name and stays); everything after an
+# Authorization: header name but the scheme, anywhere in the line; and the
+# value of a YAML `key: value` or an ini `key = value` whose key, case folded,
+# ends in password, passwd, token, secret, _auth or _key, or is apikey. The
+# diff lands in a terminal and often a CI log, and the host's file can hold a
+# credential bodega never wrote.
 # internal/clientconf Redact is the same rule, and a test runs both over one
 # table of lines.
 redact() {
@@ -306,16 +309,16 @@ redact() {
 	}
 	{
 		line = $0; out = ""
+		while (match(line, /[Hh][Tt][Tt][Pp][Ss]?:\/\/[^\/?# \t]*@/)) {
+			seg = substr(line, RSTART, RLENGTH)
+			out = out substr(line, 1, RSTART - 1) substr(seg, 1, index(seg, "://") + 2) "<redacted>@"
+			line = substr(line, RSTART + RLENGTH)
+		}
+		line = out line; out = ""
 		while (match(line, /:\/\/[^\/:@ \t]+:[^\/@ \t]+@/)) {
 			seg = substr(line, RSTART, RLENGTH)
 			user = substr(seg, 4); user = substr(user, 1, index(user, ":") - 1)
 			out = out substr(line, 1, RSTART - 1) "://" user ":<redacted>@"
-			line = substr(line, RSTART + RLENGTH)
-		}
-		line = out line; out = ""
-		while (match(line, /[Hh][Tt][Tt][Pp][Ss]?:\/\/[^\/?#:@ \t]+@/)) {
-			seg = substr(line, RSTART, RLENGTH)
-			out = out substr(line, 1, RSTART - 1) substr(seg, 1, index(seg, "://") + 2) "<redacted>@"
 			line = substr(line, RSTART + RLENGTH)
 		}
 		line = out line
