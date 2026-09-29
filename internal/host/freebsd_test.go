@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -509,6 +510,89 @@ func TestRunToolEndsTheProcessTree(t *testing.T) {
 		}
 		gone(t)
 	})
+}
+
+// detachEnv makes the test binary, run as a tool, start a sleep in a session
+// of its own, as daemon(8) does, and write the sleep's pid where the test
+// can find it.
+const detachEnv = "BODEGA_TEST_DETACH"
+
+func TestDetachHelper(t *testing.T) {
+	mode := os.Getenv(detachEnv)
+	if mode == "" {
+		return
+	}
+	child := exec.Command("sleep", "40")
+	child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if mode != "closed" {
+		child.Stdout, child.Stderr = os.Stdout, os.Stderr
+	}
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(os.Getenv(detachEnv+"_PID"), []byte(strconv.Itoa(child.Process.Pid)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if mode == "wait" {
+		_ = child.Wait()
+	}
+}
+
+// A process that leaves the tool's process group and session is still the
+// tool's: runTool returns within its bound and leaves it neither running nor
+// a zombie, and a process doctor started some other way is not touched.
+// Only FreeBSD's reaper can follow a process across setsid, and doctor runs
+// tools only there.
+func TestRunToolEndsDetachedDescendants(t *testing.T) {
+	if runtime.GOOS != "freebsd" {
+		t.Skip("descendants that call setsid are owned through procctl(2) reaping, which is FreeBSD's")
+	}
+	bystander := exec.Command("sleep", "40")
+	bystander.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := bystander.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bystander.Process.Kill(); _ = bystander.Wait() })
+
+	for _, c := range []struct {
+		mode    string
+		timeout time.Duration
+		bound   time.Duration
+		timeOut bool
+	}{
+		{"wait", time.Second, time.Second + toolWaitDelay + time.Second, true},
+		{"hold", time.Minute, toolWaitDelay + time.Second, false},
+		{"closed", time.Minute, time.Second, false},
+	} {
+		t.Run(c.mode, func(t *testing.T) {
+			pidfile := filepath.Join(t.TempDir(), "pid")
+			t.Setenv(detachEnv, c.mode)
+			t.Setenv(detachEnv+"_PID", pidfile)
+			start := time.Now()
+			_, err := runToolWithin(c.timeout, "", os.Args[0], "-test.run=^TestDetachHelper$")
+			if elapsed := time.Since(start); elapsed > c.bound {
+				t.Errorf("returned after %s, bound %s", elapsed, c.bound)
+			}
+			if timedOut := err != nil && strings.Contains(err.Error(), "did not answer within"); timedOut != c.timeOut {
+				t.Errorf("err = %v", err)
+			}
+			data, err := os.ReadFile(pidfile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pid, err := strconv.Atoi(string(data))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if syscall.Kill(pid, 0) == nil {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+				t.Errorf("detached descendant %d outlived runTool", pid)
+			}
+		})
+	}
+	if err := bystander.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Errorf("a process runTool did not start was ended: %v", err)
+	}
 }
 
 func TestMakeConfSitesComeFromTheRenderer(t *testing.T) {

@@ -30,8 +30,8 @@ type toolRunner func(stdin, name string, args ...string) ([]byte, error)
 
 // toolTimeout bounds one pkg or make run. Both answer in well under a second
 // on a stock host; a makefile that blocks must not hang doctor.
-// toolWaitDelay bounds the wait for pipes a descendant that left the
-// process group still holds.
+// toolWaitDelay bounds the wait for pipes a descendant still holds after
+// the tool itself exits.
 const (
 	toolTimeout   = 30 * time.Second
 	toolWaitDelay = 2 * time.Second
@@ -41,12 +41,18 @@ func runTool(stdin, name string, args ...string) ([]byte, error) {
 	return runToolWithin(toolTimeout, stdin, name, args...)
 }
 
-// runToolWithin runs the tool in a process group of its own and kills the
-// whole group on timeout and again once the tool exits. make runs !=
-// assignments and .BEGIN recipes through sh, whose children inherit make's
-// pipes: killing make alone leaves them running and leaves the read of
-// those pipes waiting on them.
+// runToolWithin runs the tool and ends every process it started, on timeout
+// and again once the tool exits. make runs != assignments and .BEGIN recipes
+// through sh, whose children inherit make's pipes and may leave its process
+// group or session: killing make alone leaves them running, and leaves the
+// read of those pipes waiting on them. ownDescendants says which processes
+// count as the tool's.
 func runToolWithin(timeout time.Duration, stdin, name string, args ...string) ([]byte, error) {
+	end, release, err := ownDescendants()
+	if err != nil {
+		return nil, fmt.Errorf("doctor did not run %s: %w", name, err)
+	}
+	defer release()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
@@ -54,11 +60,13 @@ func runToolWithin(timeout time.Duration, stdin, name string, args ...string) ([
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error { return killGroup(cmd.Process.Pid) }
+	cmd.Cancel = func() error { return end(cmd.Process.Pid) }
 	cmd.WaitDelay = toolWaitDelay
 	out, err := cmd.Output()
 	if cmd.Process != nil {
-		_ = killGroup(cmd.Process.Pid)
+		if endErr := end(cmd.Process.Pid); endErr != nil && err == nil {
+			err = fmt.Errorf("%s answered, but doctor could not end the processes it left: %w", name, endErr)
+		}
 	}
 	switch {
 	case err == nil:
@@ -69,13 +77,6 @@ func runToolWithin(timeout time.Duration, stdin, name string, args ...string) ([
 		return out, fmt.Errorf("%w: %s", err, oneLine(stderr.String()))
 	}
 	return out, err
-}
-
-func killGroup(pgid int) error {
-	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return err
-	}
-	return nil
 }
 
 func oneLine(s string) string {
