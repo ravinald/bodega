@@ -512,11 +512,20 @@ func newSyslogHarness(t *testing.T) sinkHarness {
 		// listener draining them. Wait for the count to stop moving rather
 		// than sleeping a fixed interval, which is either slow or flaky, and
 		// this suite counts 400 records in one case.
+		//
+		// Quiet only counts once a line has arrived. A count that has not yet
+		// moved from zero is not settled: on a slow runner the first line can
+		// take longer than the quiet window to reach the listener, and reading
+		// then returned nothing for a record that was on its way. An empty read
+		// waits firstLine instead, which is what a refused write, expecting no
+		// line at all, pays.
 		const quiet = 10 // consecutive 20ms polls with no new line
-		deadline := time.Now().Add(10 * time.Second)
+		const firstLine = 2 * time.Second
+		start := time.Now()
+		deadline := start.Add(10 * time.Second)
 		var snapshot []string
 		still := 0
-		for still < quiet && time.Now().Before(deadline) {
+		for time.Now().Before(deadline) {
 			mu.Lock()
 			n := len(lines)
 			if n != len(snapshot) {
@@ -526,6 +535,12 @@ func newSyslogHarness(t *testing.T) sinkHarness {
 				still++
 			}
 			mu.Unlock()
+			if n > 0 && still >= quiet {
+				break
+			}
+			if n == 0 && time.Since(start) >= firstLine {
+				break
+			}
 			time.Sleep(20 * time.Millisecond)
 		}
 		return parseWireLines(t, snapshot)
