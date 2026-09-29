@@ -177,6 +177,12 @@ TimeoutStartSec=180
 # Hardening. Safe defaults; relax only if your install has a reason.
 NoNewPrivileges=true
 ProtectSystem=strict
+# ProtectHome and PrivateTmp hide /home, /tmp and /var/tmp from the server,
+# including a distfiles_ports_tree kept there: /distfiles/ answers 503 and the
+# journal warns that the tree cannot be read. Keep the tree at /usr/ports or
+# /srv, or add BindReadOnlyPaths=<tree> with `systemctl edit bodega` (under
+# /home, with ProtectHome=tmpfs as well). docs/usage.md, "Running under
+# systemd", has the override.
 ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=/var/lib/bodega /var/log/bodega

@@ -2,18 +2,22 @@ package server
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/config"
@@ -964,4 +968,278 @@ func TestDistfilesRefusalsNameNoServerPath(t *testing.T) {
 			}
 		})
 	}
+}
+
+// logRecords is a slog sink a test can read while the tree's background read
+// is still writing to it.
+type logRecords struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (l *logRecords) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+// records is every line written so far, as its level and message.
+func (l *logRecords) records(t *testing.T) []struct{ Level, Msg string } {
+	t.Helper()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []struct{ Level, Msg string }
+	for line := range strings.Lines(l.buf.String()) {
+		var r struct{ Level, Msg string }
+		if err := json.Unmarshal([]byte(line), &r); err != nil {
+			t.Fatalf("log line %q: %v", line, err)
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+func (l *logRecords) logger() *slog.Logger {
+	return slog.New(slog.NewJSONHandler(l, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
+
+func noEnv(string) string { return "" }
+
+// A failed read of the tree is a warning whether it is the first read or a
+// later one, and a routine read stays at Info, so the journal at its default
+// level shows an operator the tree the server cannot see.
+func TestDistinfoTreeLogLevels(t *testing.T) {
+	t.Run("first read of a root that does not exist", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "absent")
+		var l logRecords
+		_ = distinfo.NewTree(root, 0, distinfoLogf(l.logger(), root, noEnv)).Wait()
+		got := l.records(t)
+		if len(got) != 1 || got[0].Level != slog.LevelWarn.String() || !strings.Contains(got[0].Msg, "reading "+root+" failed") {
+			t.Fatalf("log = %+v, want one WARN line naming the failed read of %s", got, root)
+		}
+	})
+	t.Run("routine read", func(t *testing.T) {
+		root := distfilesPortsTree(t)
+		var l logRecords
+		if err := distinfo.NewTree(root, 0, distinfoLogf(l.logger(), root, noEnv)).Wait(); err != nil {
+			t.Fatal(err)
+		}
+		got := l.records(t)
+		if len(got) != 1 || got[0].Level != slog.LevelInfo.String() || !strings.Contains(got[0].Msg, "distinfo: indexed") {
+			t.Fatalf("log = %+v, want one INFO line for the index", got)
+		}
+	})
+	t.Run("later read of a root that has gone", func(t *testing.T) {
+		root := distfilesPortsTree(t)
+		var l logRecords
+		tr := distinfo.NewTree(root, time.Millisecond, distinfoLogf(l.logger(), root, noEnv))
+		if err := tr.Wait(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(root, root+".moved"); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			_, _ = tr.Lookup("pcpustat/1.6.tar.bz2")
+			if got := l.records(t); len(got) > 1 {
+				last := got[len(got)-1]
+				if last.Level != slog.LevelWarn.String() || !strings.Contains(last.Msg, "failed") {
+					t.Fatalf("re-read of a missing root logged %+v, want a WARN failure", last)
+				}
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("no re-read was logged after the root went away")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
+}
+
+// The hint appears only for a root the shipped unit hides, a failure that
+// looks like a missing tree, and a process systemd started. Every other case
+// logs the plain failure.
+func TestHiddenTreeHint(t *testing.T) {
+	enoent := func(p string) error {
+		return fmt.Errorf("read ports tree %s: %w", p, &fs.PathError{Op: "open", Path: p, Err: syscall.ENOENT})
+	}
+	eacces := func(p string) error {
+		return fmt.Errorf("read ports tree %s: %w", p, &fs.PathError{Op: "open", Path: p, Err: syscall.EACCES})
+	}
+	systemd := func(k string) string {
+		if k == "NOTIFY_SOCKET" {
+			return "/run/systemd/notify"
+		}
+		return ""
+	}
+	for _, tc := range []struct {
+		name   string
+		root   string
+		err    error
+		getenv func(string) string
+		want   []string // substrings of the hint; nil means no hint
+	}{
+		{"under /tmp", "/tmp/ports", enoent("/tmp/ports"), systemd,
+			[]string{"PrivateTmp=true", "/usr/ports", "/srv", "systemctl edit bodega", `BindReadOnlyPaths="/tmp/ports" under`}},
+		{"under /var/tmp", "/var/tmp/ports", enoent("/var/tmp/ports"), systemd,
+			[]string{"PrivateTmp=true", "/usr/ports", "/srv", "systemctl edit bodega", `BindReadOnlyPaths="/var/tmp/ports" under`}},
+		{"under /home, denied", "/home/op/ports", eacces("/home/op/ports"), systemd,
+			[]string{"ProtectHome=true", "/usr/ports", "/srv", "systemctl edit bodega", `ProtectHome=tmpfs and BindReadOnlyPaths="/home/op/ports" under`}},
+		{"under /home, missing", "/home/op/ports/", enoent("/home/op/ports/"), systemd,
+			[]string{"ProtectHome=true", `BindReadOnlyPaths="/home/op/ports" under`}},
+		{"a root with spaces", "/var/tmp/bodega review ports", enoent("/var/tmp/bodega review ports"), systemd,
+			[]string{`BindReadOnlyPaths="/var/tmp/bodega review ports" under`}},
+		{"a root with a separator, an escape and a specifier", `/var/tmp/a:b\c%d`, enoent(`/var/tmp/a:b\c%d`), systemd,
+			[]string{`BindReadOnlyPaths="/var/tmp/a:b\\c%%d" under`}},
+		{"a root with a double quote", `/var/tmp/a"b`, enoent(`/var/tmp/a"b`), systemd,
+			[]string{"PrivateTmp=true", "/usr/ports", "/srv", "cannot name this path"}},
+		{"a root with a single quote", "/home/o'neil/ports", eacces("/home/o'neil/ports"), systemd,
+			[]string{"ProtectHome=true", "/usr/ports", "/srv", "cannot name this path"}},
+		{"a root with a tab", "/tmp/a\tb", enoent("/tmp/a\tb"), systemd,
+			[]string{"PrivateTmp=true", "cannot name this path"}},
+		{"outside the hidden paths", "/usr/ports", enoent("/usr/ports"), systemd, nil},
+		{"a sibling sharing the prefix", "/tmpfs/ports", enoent("/tmpfs/ports"), systemd, nil},
+		{"not under systemd", "/var/tmp/ports", enoent("/var/tmp/ports"), noEnv, nil},
+		{"a failure that is not a missing tree", "/var/tmp/ports", errors.New("read category x: EIO"), systemd, nil},
+		{"a missing file below the root", "/var/tmp/ports", enoent("/var/tmp/ports/Mk/bsd.licenses.db.mk"), systemd, nil},
+		{"a forbidden category below the root", "/home/op/ports", eacces("/home/op/ports/sysutils"), systemd, nil},
+		{"a missing file below /tmp itself", "/tmp", enoent("/tmp/Mk/bsd.licenses.db.mk"), systemd, nil},
+		{"a missing-root error with no path", "/var/tmp/ports", fs.ErrNotExist, systemd, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hint := hiddenTreeHint(tc.root, tc.err, tc.getenv)
+			var l logRecords
+			plain := "distinfo: reading " + tc.root + " failed after 1ms, keeping the previous index: " + tc.err.Error()
+			distinfoLogf(l.logger(), tc.root, tc.getenv)(slog.LevelWarn, tc.err, plain)
+			got := l.records(t)
+			if len(got) != 1 || got[0].Level != slog.LevelWarn.String() {
+				t.Fatalf("log = %+v, want one WARN line", got)
+			}
+			if tc.want == nil {
+				if hint != "" || got[0].Msg != plain {
+					t.Fatalf("hint %q, logged %q; want no hint and the plain failure", hint, got[0].Msg)
+				}
+				return
+			}
+			if got[0].Msg != plain+"; "+hint {
+				t.Errorf("logged %q, want the failure followed by the hint %q", got[0].Msg, hint)
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(hint, w) {
+					t.Errorf("hint %q does not name %q", hint, w)
+				}
+			}
+			if strings.Contains(hint, "cannot name this path") && strings.Contains(hint, "BindReadOnlyPaths=/") {
+				t.Errorf("hint %q offers a bind it says cannot work", hint)
+			}
+		})
+	}
+}
+
+// The hint is for the operator's journal. A client asking for a distfile
+// while the tree is hidden gets the same 503 as for any failed read, naming
+// no path and no unit setting.
+func TestHiddenTreeHintStaysOutOfTheResponse(t *testing.T) {
+	root := filepath.Join("/var/tmp", fmt.Sprintf("bodega-b100-absent-%d", time.Now().UnixNano()))
+	systemd := func(k string) string {
+		if k == "NOTIFY_SOCKET" {
+			return "/run/systemd/notify"
+		}
+		return ""
+	}
+	s := newDiscoveryServer(t)
+	var l logRecords
+	s.distinfo = distinfo.NewTree(root, 0, distinfoLogf(l.logger(), root, systemd))
+	_ = s.distinfo.Wait()
+	got := l.records(t)
+	if len(got) != 1 || !strings.Contains(got[0].Msg, "PrivateTmp=true") {
+		t.Fatalf("log = %+v, want the failed read with its hint", got)
+	}
+
+	ts := httptest.NewServer(conformingClient(t, &config.Config{}, s.Handler()))
+	t.Cleanup(ts.Close)
+	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+"/distfiles/pcpustat/1.6.tar.bz2", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("GET = %d %q, want 503", resp.StatusCode, body)
+	}
+	for _, leak := range []string{root, hiddenTreeHint(root, &fs.PathError{Op: "open", Path: root, Err: fs.ErrNotExist}, systemd), "PrivateTmp", "ProtectHome", "BindReadOnlyPaths", "systemctl"} {
+		if strings.Contains(string(body), leak) {
+			t.Errorf("503 body %q carries %q", body, leak)
+		}
+	}
+}
+
+// Only a failure to open the configured root is evidence the unit hides it. A
+// root the server listed, with a file or directory below it missing or
+// forbidden, is an incomplete tree, and the log says so without the hint even
+// under systemd and a hidden prefix.
+func TestHiddenTreeHintNeedsTheRootItself(t *testing.T) {
+	systemd := func(k string) string {
+		if k == "NOTIFY_SOCKET" {
+			return "/run/systemd/notify"
+		}
+		return ""
+	}
+	for _, tc := range []struct {
+		name   string
+		damage func(t *testing.T, root string)
+		hint   bool
+	}{
+		{"license database missing", func(t *testing.T, root string) {
+			if err := os.Remove(filepath.Join(root, "Mk", "bsd.licenses.db.mk")); err != nil {
+				t.Fatal(err)
+			}
+		}, false},
+		{"category unreadable", func(t *testing.T, root string) {
+			dir := filepath.Join(root, "sysutils")
+			if err := os.Chmod(dir, 0); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+		}, false},
+		{"root missing", func(t *testing.T, root string) {
+			if err := os.RemoveAll(root); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if os.Geteuid() == 0 && !tc.hint {
+				t.Skip("root reads a mode-000 directory")
+			}
+			root := copyTree(t, distfilesPortsTree(t), "/var/tmp")
+			tc.damage(t, root)
+			var l logRecords
+			_ = distinfo.NewTree(root, 0, distinfoLogf(l.logger(), root, systemd)).Wait()
+			got := l.records(t)
+			if len(got) != 1 || got[0].Level != slog.LevelWarn.String() || !strings.Contains(got[0].Msg, "reading "+root+" failed") {
+				t.Fatalf("log = %+v, want one WARN failure for %s", got, root)
+			}
+			if has := strings.Contains(got[0].Msg, "PrivateTmp=true"); has != tc.hint {
+				t.Fatalf("hint present = %v, want %v: %q", has, tc.hint, got[0].Msg)
+			}
+		})
+	}
+}
+
+// copyTree copies src into a fresh directory under dir, removed when the test
+// ends, so a fixture can sit under a prefix the shipped unit hides.
+func copyTree(t *testing.T, src, dir string) string {
+	t.Helper()
+	dst, err := os.MkdirTemp(dir, "bodega-b100-")
+	if err != nil {
+		t.Skipf("no writable %s: %v", dir, err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dst) })
+	if err := os.CopyFS(dst, os.DirFS(src)); err != nil {
+		t.Fatal(err)
+	}
+	return dst
 }

@@ -1,16 +1,22 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/distinfo"
@@ -49,6 +55,68 @@ var distfilesGuard = func(rawURL string) error {
 		return fmt.Errorf("distfiles upstream URL must use http or https, got %q", u.Scheme)
 	}
 	return checkUpstreamHost(u.Hostname())
+}
+
+// distinfoLogf writes the tree's lines to logger at the level the tree gave
+// each one, and adds hiddenTreeHint to a failed read of root.
+func distinfoLogf(logger *slog.Logger, root string, getenv func(string) string) distinfo.Logf {
+	return func(level slog.Level, readErr error, msg string) {
+		if hint := hiddenTreeHint(root, readErr, getenv); hint != "" {
+			msg += "; " + hint
+		}
+		logger.Log(context.Background(), level, msg)
+	}
+}
+
+// hiddenTreeHint explains a ports tree the shipped bodega.service hides from
+// the server. PrivateTmp=true gives the service its own empty /tmp and
+// /var/tmp, and ProtectHome=true makes /home unreadable, so a tree the operator
+// can list from a shell reads as missing (ENOENT) or forbidden (EACCES) here.
+// Only a failure to open root itself counts: a file missing below a root the
+// server did read is an incomplete tree, and no mount override fixes that.
+// NOTIFY_SOCKET is the evidence of a systemd unit, the same signal sdNotify
+// reads; without it, or for any other root or error, the hint is empty and the
+// plain failure stands. For /home, BindReadOnlyPaths= alone is not enough: the
+// bind lands beneath a mode-000 mount the service account cannot traverse, so
+// the hint names ProtectHome=tmpfs as well.
+func hiddenTreeHint(root string, err error, getenv func(string) string) string {
+	if err == nil || getenv("NOTIFY_SOCKET") == "" || !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, fs.ErrPermission) {
+		return ""
+	}
+	clean := filepath.Clean(root)
+	var pe *fs.PathError
+	if !errors.As(err, &pe) || filepath.Clean(pe.Path) != clean {
+		return ""
+	}
+	under := func(dir string) bool { return clean == dir || strings.HasPrefix(clean, dir+"/") }
+	move := "move the tree to /usr/ports or /srv and point distfiles_ports_tree at it"
+	bind, ok := systemdBindSource(clean)
+	var cause, extra string
+	switch {
+	case under("/tmp") || under("/var/tmp"):
+		cause = fmt.Sprintf("the shipped bodega.service sets PrivateTmp=true, which gives the service its own empty /tmp and /var/tmp, so %s does not exist for it", root)
+	case under("/home"):
+		cause = fmt.Sprintf("the shipped bodega.service sets ProtectHome=true, which makes /home unreadable to the service, so %s cannot be read", root)
+		extra = "ProtectHome=tmpfs and "
+	default:
+		return ""
+	}
+	if !ok {
+		return fmt.Sprintf("%s: %s; a BindReadOnlyPaths= override cannot name this path, because systemd does not bind a source containing a quote or control character", cause, move)
+	}
+	return fmt.Sprintf("%s: %s, or run `systemctl edit bodega`, add %sBindReadOnlyPaths=%s under [Service], and restart bodega", cause, move, extra, bind)
+}
+
+// systemdBindSource renders path as one BindReadOnlyPaths= source. Double
+// quotes keep whitespace and ':' inside the one source, and inside them a
+// backslash must be doubled and '%' (a unit specifier) written as "%%". systemd
+// 259 fails to bind a source holding a quote or a control character however it
+// is escaped, so those report false rather than advice that cannot work.
+func systemdBindSource(path string) (string, bool) {
+	if !utf8.ValidString(path) || strings.ContainsFunc(path, func(r rune) bool { return r == '"' || r == '\'' || unicode.IsControl(r) }) {
+		return "", false
+	}
+	return `"` + strings.NewReplacer(`\`, `\\`, `%`, `%%`).Replace(path) + `"`, true
 }
 
 // rewindSpool returns a spooled distfile to its start before it is served. A
