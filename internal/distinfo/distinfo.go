@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
@@ -2742,7 +2743,7 @@ type Tree struct {
 	root string
 	env  EnvironmentSpec
 	ttl  time.Duration
-	logf func(format string, args ...any)
+	logf Logf
 
 	envDigest string       // of the first environment read, which every later one must match
 	envFirst  *Environment // that read, whose ClientCheck clients measure against
@@ -2761,16 +2762,23 @@ type Tree struct {
 	readyOnce sync.Once
 }
 
+// Logf receives one line per completed or failed read. level is
+// slog.LevelWarn on a line saying a read failed or the tree refuses every
+// distfile, and slog.LevelInfo otherwise. readErr is the error a failed read of
+// the tree itself returned, so a caller can explain it, and nil on every other
+// line.
+type Logf func(level slog.Level, readErr error, msg string)
+
 // NewTree is NewTreeIn with the empty environment.
-func NewTree(root string, ttl time.Duration, logf func(format string, args ...any)) *Tree {
+func NewTree(root string, ttl time.Duration, logf Logf) *Tree {
 	return NewTreeIn(root, EnvironmentSpec{}, ttl, logf)
 }
 
 // NewTreeIn starts the first read of root against env and returns at once.
 // logf receives one line per completed or failed read; nil discards them.
-func NewTreeIn(root string, env EnvironmentSpec, ttl time.Duration, logf func(format string, args ...any)) *Tree {
+func NewTreeIn(root string, env EnvironmentSpec, ttl time.Duration, logf Logf) *Tree {
 	if logf == nil {
-		logf = func(string, ...any) {}
+		logf = func(slog.Level, error, string) {}
 	}
 	t := &Tree{root: root, env: env, ttl: ttl, logf: logf, resolved: map[string]bool{}, ready: make(chan struct{})}
 	t.mu.Lock()
@@ -2825,7 +2833,7 @@ func (t *Tree) startLoadLocked() {
 			t.loading = false
 			t.loaded = time.Now()
 			t.ix, t.loadErr = nil, err
-			t.logf("distinfo: refusing every distfile: %v", err)
+			t.logf(slog.LevelWarn, nil, fmt.Sprintf("distinfo: refusing every distfile: %v", err))
 			return
 		}
 		ix, err := LoadIn(t.root, env)
@@ -2836,14 +2844,14 @@ func (t *Tree) startLoadLocked() {
 		t.loaded = time.Now()
 		if err != nil {
 			t.loadErr = err
-			t.logf("distinfo: reading %s failed after %s, keeping the previous index: %v", t.root, time.Since(start).Round(time.Millisecond), err)
+			t.logf(slog.LevelWarn, err, fmt.Sprintf("distinfo: reading %s failed after %s, keeping the previous index: %v", t.root, time.Since(start).Round(time.Millisecond), err))
 			return
 		}
 		maps.Copy(t.resolved, ix.roots)
 		t.ix, t.loadErr = ix, nil
-		t.logf("distinfo: indexed %d distfiles from %s against environment %s in %s", ix.Len(), t.root, env.Digest(), time.Since(start).Round(time.Millisecond))
+		t.logf(slog.LevelInfo, nil, fmt.Sprintf("distinfo: indexed %d distfiles from %s against environment %s in %s", ix.Len(), t.root, env.Digest(), time.Since(start).Round(time.Millisecond)))
 		if u := ix.Unowned(); len(u) > 0 {
-			t.logf("distinfo: refusing every distfile: %d restricted ports read a distinfo bodega cannot place, and any of them may obtain any distfile in the tree: %s", len(u), strings.Join(u, "; "))
+			t.logf(slog.LevelWarn, nil, fmt.Sprintf("distinfo: refusing every distfile: %d restricted ports read a distinfo bodega cannot place, and any of them may obtain any distfile in the tree: %s", len(u), strings.Join(u, "; ")))
 		}
 	}()
 }

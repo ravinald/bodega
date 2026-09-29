@@ -3019,6 +3019,27 @@ sudo systemctl enable --now bodega
 
 The unit's own header carries the steps around it: the service account, the two writable directories, and the ownership pass that has to follow any bodega command run as root. Those leave `config.json` and `audit.db` owned by root, and the service will not start on either.
 
+The unit sets `PrivateTmp=true` and `ProtectHome=true`, so the server gets its own empty `/tmp` and `/var/tmp` and cannot read `/home`. A `distfiles_ports_tree` kept under one of them reads as missing, `/distfiles/` answers 503, and the journal logs the failed read as a warning naming this cause. Move the tree to `/usr/ports` or `/srv`, or run `sudo systemctl edit bodega`, add `BindReadOnlyPaths=` for the tree under `[Service]`, and restart the service. Under `/home` the bind also needs `ProtectHome=tmpfs`, because `ProtectHome=true` leaves `/home` a directory the service account cannot enter:
+
+```ini
+[Service]
+ProtectHome=tmpfs
+BindReadOnlyPaths=/home/ops/ports
+```
+
+A path with spaces goes in double quotes, with any `\` doubled and any `%` written `%%`, or systemd splits it into several mounts. The journal warning prints the line ready to paste.
+
+Two kinds of path cannot go in that line. systemd will not bind a source holding a quote or a control character however it is escaped, and a path with a `..` component cannot be cleaned into one: with a symlink before the `..`, `/var/tmp/x/link/../ports` names a sibling of the link's target, not `/var/tmp/x/ports`, so the cleaned spelling would bind a different directory. A `..` can also lead out of a hidden directory, as in `/tmp/x/../../srv/ports`: the server still has to open `/tmp/x` on the way, which `PrivateTmp=true` hides, so the warning counts every directory the path passes through, not only where it ends. For those the warning prints an alias instead. A symlink under `/srv` carries the path as written, systemd follows it on the host the way the server would, and the bind lands on a separate directory the server is pointed at:
+
+```bash
+sudo ln -sT '/home/o'\''neil/ports' /srv/bodega-ports-source && sudo mkdir /srv/bodega-ports
+sudo systemctl edit bodega    # [Service] BindReadOnlyPaths=/srv/bodega-ports-source:/srv/bodega-ports
+```
+
+Run `systemctl edit` only once the first line succeeds. Then set `"distfiles_ports_tree": "/srv/bodega-ports"` in `/etc/bodega/config.json` and restart the service. The bind exposes that one tree and nothing beside it, and because both names sit outside `/home` it needs no `ProtectHome=tmpfs`.
+
+`ln -sT` and `mkdir` each fail if their name is already taken, by a directory, a file or a symlink, and leave what is there alone. Without `-T`, `ln` puts the new link inside an existing directory at `/srv/bodega-ports-source`, exits 0, and the bind then mounts that directory instead of the tree. If `mkdir` is the step that fails, the alias `ln` just made stays behind: remove `/srv/bodega-ports-source` before running the line again.
+
 ### Reloading and reading logs
 
 Manifests reload without a restart, and the journal carries everything the process writes:
@@ -4317,13 +4338,13 @@ It needs a ports tree on the server to read `distinfo` from. Keep it at the revi
 "distfiles_root": ""
 ```
 
-| Key                               | Default                                         | What it does                                                                                                                                                                                                                                       |
-| --------------------------------- | ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `distfiles_ports_tree`            | unset                                           | Root of the ports tree whose `distinfo` files decide what is admitted. Unset, `/distfiles/` answers every request 404 and `build fetch distfiles` refuses every entry. Any absolute path; the tree need not sit at `/usr/ports`.                   |
-| `distfiles_upstream`              | `http://distcache.FreeBSD.org/ports-distfiles/` | Where a miss is fetched from. The distinfo name is appended to it. `http` or `https`, ending in `/`.                                                                                                                                               |
-| `distfiles_root`                  | `build_root`                                    | Root of the DISTDIRs `build fetch distfiles` writes, one per declared environment at `<distfiles_root>/distfiles/@<environment digest>/`, with the client check beside them. See [The client check](#the-client-check).                            |
-| `distfiles_environment_variables` | empty                                           | The supported client environment's make variables: each name maps to every value it may hold where a port reads it. `[]` declares it undefined on every client. See [The client environment](#the-client-environment).                             |
-| `distfiles_environment_files`     | empty                                           | The supported client environment's files outside the ports tree: each absolute client-host path maps to its alternatives, `"absent"` or the absolute path of a snapshot on the bodega host. See [The client environment](#the-client-environment). |
+| Key                               | Default                                         | What it does                                                                                                                                                                                                                                                                                                                                                                                                       |
+| --------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `distfiles_ports_tree`            | unset                                           | Root of the ports tree whose `distinfo` files decide what is admitted. Unset, `/distfiles/` answers every request 404 and `build fetch distfiles` refuses every entry. Any absolute path; the tree need not sit at `/usr/ports`. The shipped systemd unit hides `/tmp`, `/var/tmp` and `/home` from the server, so a tree under or reached through one of them needs the override in [Running under systemd](#running-under-systemd). |
+| `distfiles_upstream`              | `http://distcache.FreeBSD.org/ports-distfiles/` | Where a miss is fetched from. The distinfo name is appended to it. `http` or `https`, ending in `/`.                                                                                                                                                                                                                                                                                                               |
+| `distfiles_root`                  | `build_root`                                    | Root of the DISTDIRs `build fetch distfiles` writes, one per declared environment at `<distfiles_root>/distfiles/@<environment digest>/`, with the client check beside them. See [The client check](#the-client-check).                                                                                                                                                                                            |
+| `distfiles_environment_variables` | empty                                           | The supported client environment's make variables: each name maps to every value it may hold where a port reads it. `[]` declares it undefined on every client. See [The client environment](#the-client-environment).                                                                                                                                                                                             |
+| `distfiles_environment_files`     | empty                                           | The supported client environment's files outside the ports tree: each absolute client-host path maps to its alternatives, `"absent"` or the absolute path of a snapshot on the bodega host. See [The client environment](#the-client-environment).                                                                                                                                                                 |
 
 `distfiles` is host-scoped in the upstream allow-list, the same as `apt` and `freebsd`: `bodega policy add distfiles distcache.FreeBSD.org` names the host. A digest establishes that the bytes are right, not that the operator agreed to contact the host, so both the route and `build fetch distfiles` check the allow-list before any upstream request. A denied miss answers `403` and records a `policy_violation` row.
 
