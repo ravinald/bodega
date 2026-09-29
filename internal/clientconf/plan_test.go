@@ -148,3 +148,138 @@ func TestApplyWritesNothingWhenOneTargetIsUnwritable(t *testing.T) {
 		t.Error("the writable target was written before the unwritable one was refused")
 	}
 }
+
+// An apply over ~/.npmrc or repositories.yaml keeps the credential `bodega
+// doctor --write-credentials` put there, lands on the bytes that writer would
+// produce over the planned file, and a second run finds nothing to change.
+func TestApplyKeepsTheCredentialTheWriterPlaced(t *testing.T) {
+	const base = "https://h"
+	fence := func(body string) string { return CredentialBegin + "\n" + body + "\n" + CredentialEnd + "\n" }
+	helmCred := HelmRepository(base, "username: bodega", "password: bodega_ak_x", "insecure_skip_tls_verify: false")
+	cases := []struct {
+		name, system, planned, existing, want string
+	}{
+		{
+			name: "npm fenced", system: "npm", planned: Npm(base).Content,
+			existing: "registry=https://registry.npmjs.org/\n" + fence("//h/npm/:_authToken=bodega_ak_x"),
+			want:     Npm(base).Content + fence("//h/npm/:_authToken=bodega_ak_x"),
+		},
+		{
+			name: "npm unfenced after npm rewrote it", system: "npm", planned: Npm(base).Content,
+			existing: "color=false\n//h/npm/:_authToken=bodega_ak_x\n",
+			want:     Npm(base).Content + "//h/npm/:_authToken=bodega_ak_x\n",
+		},
+		{
+			name: "helm fenced", system: "helm", planned: Helm(base).Content,
+			existing: HelmDocument("- name: other\n  url: https://o\n" + fence(strings.TrimSuffix(helmCred, "\n"))),
+			want:     HelmDocument(fence(strings.TrimSuffix(helmCred, "\n"))),
+		},
+		{
+			name: "helm as helm serializes it", system: "helm", planned: Helm(base).Content,
+			existing: "apiVersion: \"\"\nrepositories:\n- caFile: \"\"\n  name: bodega\n  password: bodega_ak_x\n  url: https://h/helm\n  username: bodega\n",
+			want:     HelmDocument("- caFile: \"\"\n  name: bodega\n  password: bodega_ak_x\n  url: https://h/helm\n  username: bodega\n"),
+		},
+		{
+			name: "helm entry with no password", system: "helm", planned: Helm(base).Content,
+			existing: HelmDocument("- name: bodega\n  url: https://old/helm\n"),
+			want:     Helm(base).Content,
+		},
+		{
+			name: "another system keeps nothing", system: "gomod", planned: "GOPROXY=https://h/go\n",
+			existing: "//h/npm/:_authToken=bodega_ak_x\n",
+			want:     "GOPROXY=https://h/go\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			path := filepath.Join(home, "f")
+			if err := os.WriteFile(path, []byte(tc.existing), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			rec := PlanRecord{System: tc.system, Action: PlanInstall, Path: path, SHA256: digest(tc.planned)}
+			c, err := NewChange(rec, []byte(tc.planned), home)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Apply([]Change{c}, ".bak"); err != nil {
+				t.Fatal(err)
+			}
+			got, _ := os.ReadFile(path)
+			if string(got) != tc.want {
+				t.Fatalf("after apply:\n%s\nwant:\n%s", got, tc.want)
+			}
+			again, err := NewChange(rec, []byte(tc.planned), home)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !again.Unchanged() {
+				t.Errorf("a second apply would rewrite the file:\n%s", again.New)
+			}
+			if info, _ := os.Stat(path); info.Mode().Perm() != 0o600 {
+				t.Errorf("mode %v after apply, want the 0600 the credential was written with", info.Mode().Perm())
+			}
+		})
+	}
+}
+
+// Diff prints no secret from either side: not the token being kept, not one
+// being dropped, not a password inside a URL.
+func TestDiffPrintsNoCredential(t *testing.T) {
+	home := t.TempDir()
+	cases := []struct{ system, existing, planned string }{
+		{"npm", "//h/npm/:_authToken=bodega_ak_kept\n//other/:_authToken=bodega_ak_gone\n_auth = bodega_ak_b64\n", Npm("https://h").Content},
+		{"helm", HelmDocument("- name: bodega\n  url: https://h/helm\n  password: bodega_ak_kept\n- name: x\n  password: 'bodega_ak_gone'\n"), Helm("https://h").Content},
+		{"pypi", "[global]\nindex-url = https://op:bodega_ak_url@pypi.internal/simple/\n", Pip("https://h").Content},
+		{"pypi", "", "[global]\nindex-url = https://op:bodega_ak_new@h/pypi/simple/\n"},
+	}
+	for _, tc := range cases {
+		path := filepath.Join(home, tc.system)
+		_ = os.Remove(path)
+		if tc.existing != "" {
+			if err := os.WriteFile(path, []byte(tc.existing), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		c, err := NewChange(PlanRecord{System: tc.system, Action: PlanInstall, Path: path, SHA256: digest(tc.planned)}, []byte(tc.planned), home)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, err := c.Diff()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(d, "bodega_ak_") {
+			t.Errorf("%s: diff prints a token:\n%s", tc.system, d)
+		}
+		if !strings.Contains(d, Redacted) {
+			t.Errorf("%s: diff shows no %s where the secret was:\n%s", tc.system, Redacted, d)
+		}
+	}
+}
+
+func TestRedactLeavesOrdinaryLinesAlone(t *testing.T) {
+	for _, l := range []string{
+		"registry=https://h/npm/",
+		"  url: https://h/helm?a=b",
+		"\tinsteadOf = https://github.com/",
+		"MASTER_SITE_OVERRIDE?= https://h/distfiles/",
+		"password:",
+		"  pass_credentials_all: false",
+	} {
+		if got := Redact(l); got != l {
+			t.Errorf("Redact(%q) = %q", l, got)
+		}
+	}
+	for in, want := range map[string]string{
+		"//h:8080/npm/:_authToken=t":        "//h:8080/npm/:_authToken=" + Redacted,
+		"  password:   t":                   "  password:   " + Redacted,
+		"- password: t":                     "- password: " + Redacted,
+		"token = \"t\"":                     "token = " + Redacted,
+		"x = https://u:p@h/ and ://a:b:c@d": "x = https://u:" + Redacted + "@h/ and ://a:" + Redacted + "@d",
+	} {
+		if got := Redact(in); got != want {
+			t.Errorf("Redact(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

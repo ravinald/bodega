@@ -66,7 +66,10 @@ check_eq SETUP-04 "/api/v1/status publishes the digest of the script in this tre
 
 # ---- guest helper ----------------------------------------------------------
 #
-# save | seed | restore | state | drop, run as root with HOME=/root. state
+# save | seed | seed-token | restore | state | drop, run as root with
+# HOME=/root. seed-token also leaves ~/.npmrc holding the _authToken line
+# `bodega doctor --write-credentials` writes, which the plan must keep and no
+# output may print. state
 # prints one line per path, its digest or "absent", and then how many
 # .bodega-* backups exist that the save did not find, which is the number a
 # case that wrote nothing has to leave at zero.
@@ -94,6 +97,11 @@ save)
 seed)
 	printf '[global]\nindex-url = https://pypi.org/simple/\n' >/etc/pip.conf
 	rm -f "$HOME/.npmrc"
+	;;
+seed-token)
+	printf '[global]\nindex-url = https://pypi.org/simple/\n' >/etc/pip.conf
+	printf 'color=false\n//bodega-e2e/npm/:_authToken=bodega_ak_e2e_seeded\n' >"$HOME/.npmrc"
+	chmod 0600 "$HOME/.npmrc"
 	;;
 restore)
 	[ -f "$dir/complete" ] || {
@@ -246,6 +254,31 @@ setup_guest() {
 	e2e_on "$g" "sudo -H sh $SETUP_HELPER state" || true
 	check_eq "SETUP-$tag-32" "a second --apply writes no file and makes no second backup" \
 		"$after_first" "$E2E_OUT" "internal/server/client_setup.sh" "sh $SETUP_HELPER state"
+	e2e_on "$g" "sudo -H sh $SETUP_HELPER restore" || true
+
+	# a credential --write-credentials placed survives, and nothing prints it
+	e2e_on "$g" "sudo -H sh $SETUP_HELPER seed-token && $run" || true
+	check_eq "SETUP-$tag-50" "a dry run over an .npmrc holding a token exits 0 on $g" 0 "$E2E_RC" \
+		"internal/server/client_setup.sh" "sh setup.sh --systems pypi,npm" "$E2E_RC"
+	check_lacks "SETUP-$tag-51" "the dry run prints no token" "bodega_ak_" "$E2E_OUT$E2E_ERR" \
+		"internal/server/client_setup.sh" "sh setup.sh"
+	check_contains "SETUP-$tag-52" "the dry run shows the kept credential line redacted" \
+		"/npm/:_authToken=<redacted>" "$E2E_OUT" "internal/server/client_setup.sh" "sh setup.sh"
+	e2e_on "$g" "$run --apply" || true
+	check_eq "SETUP-$tag-53" "--apply over an .npmrc holding a token exits 0 on $g" 0 "$E2E_RC" \
+		"internal/server/client_setup.sh" "sh setup.sh --systems pypi,npm --apply" "$E2E_RC"
+	check_lacks "SETUP-$tag-54" "--apply prints no token" "bodega_ak_" "$E2E_OUT$E2E_ERR" \
+		"internal/server/client_setup.sh" "sh setup.sh --apply"
+	e2e_on "$g" "sudo -H sh -c 'cat \$HOME/.npmrc; ls -l \$HOME/.npmrc'" || true
+	check_contains "SETUP-$tag-55" "root's ~/.npmrc still holds the token after --apply" \
+		"//bodega-e2e/npm/:_authToken=bodega_ak_e2e_seeded" "$E2E_OUT" "internal/clientconf/credential.go" "cat ~root/.npmrc"
+	check_matches "SETUP-$tag-56" "root's ~/.npmrc now names bodega's registry" \
+		'^registry=https?://.+/npm/$' "$E2E_OUT" "internal/clientconf/clientconf.go" "cat ~root/.npmrc"
+	check_matches "SETUP-$tag-57" "root's ~/.npmrc keeps the 0600 the token was written with" \
+		'^-rw-------' "$E2E_OUT" "internal/server/client_setup.sh" "ls -l ~root/.npmrc"
+	e2e_on "$g" "$run --apply" || true
+	check_contains "SETUP-$tag-58" "a second --apply over the kept token changes nothing" \
+		"Nothing to change" "$E2E_OUT" "internal/server/client_setup.sh" "sh setup.sh --apply (twice)"
 	e2e_on "$g" "sudo -H sh $SETUP_HELPER restore" || true
 
 	# a tampered file aborts with nothing written

@@ -197,6 +197,135 @@ dec() {
 	fi
 }
 
+# keep <system> <existing> <planned> <out> writes planned to out with the credential
+# `bodega doctor --write-credentials` placed in existing carried over, on the
+# two files it shares with the plan: npm's fenced block or bare
+# //host/npm/:_authToken= line, and helm's repository item named bodega when
+# it carries a password. Without this the plan's whole-file write erases the
+# token and npm and helm go on working unattributed. The result is what that
+# writer would make of the planned file, so the two converge in either order.
+# internal/clientconf KeepCredential is the same rule, held to it by a test.
+keep() {
+	case $1 in
+	npm | helm) ;;
+	*)
+		cat "$3" >"$4"
+		return
+		;;
+	esac
+	if [ ! -s "$2" ]; then
+		cat "$3" >"$4"
+		return
+	fi
+	rc=0
+	awk -v sys="$1" '
+	function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+	function isbegin(s) { return index(trim(s), "# BEGIN bodega credential") == 1 }
+	function isend(s) { return index(trim(s), "# END bodega credential") == 1 }
+	function indent(s) { match(s, /^ */); return RLENGTH }
+	function field(s) { s = trim(s); sub(/^-/, "", s); return trim(s) }
+	# itemend(a, n, i): the index past the sequence item opening at a[i], or i.
+	function itemend(a, n, i,    e, d) {
+		if (substr(trim(a[i]), 1, 1) != "-") return i
+		d = indent(a[i])
+		for (e = i + 1; e <= n && trim(a[e]) != "" && indent(a[e]) > d; e++) ;
+		return e
+	}
+	function named(a, i, e,    k, v) {
+		for (k = i; k < e; k++) {
+			v = field(a[k])
+			if (index(v, "name:") == 1) {
+				v = trim(substr(v, 6)); gsub(/^["\047]|["\047]$/, "", v)
+				return v == "bodega"
+			}
+		}
+		return 0
+	}
+	function haspw(a, i, e,    k) {
+		for (k = i; k < e; k++) if (index(field(a[k]), "password:") == 1) return 1
+		return 0
+	}
+	FILENAME == ARGV[1] { old[++n] = $0; next }
+	{ plan[++m] = $0 }
+	END {
+		kc = 0
+		if (sys == "npm") {
+			for (i = 1; i <= n; i++) {
+				if (isbegin(old[i])) {
+					for (j = i + 1; j <= n && !isend(old[j]); j++) ;
+					if (j <= n) { for (k = i; k <= j; k++) kept[++kc] = old[k]; i = j; continue }
+				}
+				if (trim(old[i]) ~ /^\/\/[^ \t]+\/npm\/:_authToken=/) kept[++kc] = old[i]
+			}
+			for (i = 1; i <= m; i++) out[++oc] = plan[i]
+		} else {
+			for (i = 1; i <= n; ) {
+				e = itemend(old, n, i)
+				if (e == i) { i++; continue }
+				if (named(old, i, e) && haspw(old, i, e)) {
+					s = i; t = e - 1
+					if (i > 1 && e <= n && isbegin(old[i - 1]) && isend(old[e])) { s = i - 1; t = e }
+					for (k = s; k <= t; k++) kept[++kc] = old[k]
+					break
+				}
+				i = e
+			}
+			for (i = 1; i <= m; ) {
+				e = itemend(plan, m, i)
+				if (e == i) { out[++oc] = plan[i]; i++; continue }
+				if (!named(plan, i, e)) for (k = i; k < e; k++) out[++oc] = plan[k]
+				i = e
+			}
+		}
+		if (kc == 0) exit 3
+		for (i = 1; i <= oc; i++) print out[i]
+		for (i = 1; i <= kc; i++) print kept[i]
+	}' "$2" "$3" >"$4" || rc=$?
+	case $rc in
+	0) ;;
+	3) cat "$3" >"$4" ;;
+	*) die "could not read $2 to carry its credential over; nothing was written" ;;
+	esac
+}
+
+# redact <file> prints it with every secret replaced by <redacted>: the
+# password of a user:pass@ URL, and the value of a YAML `key: value` or an ini
+# `key = value` whose key ends in password, passwd, token, secret or _auth.
+# The diff lands in a terminal and often a CI log, and the host's file can
+# hold a credential bodega never wrote. internal/clientconf Redact is the same
+# rule.
+redact() {
+	awk '
+	function secret(k) {
+		k = tolower(k); gsub(/^["\047]|["\047]$/, "", k)
+		return k ~ /(password|passwd|token|secret|_auth)$/
+	}
+	{
+		line = $0; out = ""
+		while (match(line, /:\/\/[^\/:@ \t]+:[^\/@ \t]+@/)) {
+			seg = substr(line, RSTART, RLENGTH)
+			user = substr(seg, 4); user = substr(user, 1, index(user, ":") - 1)
+			out = out substr(line, 1, RSTART - 1) "://" user ":<redacted>@"
+			line = substr(line, RSTART + RLENGTH)
+		}
+		line = out line
+		head = ""
+		if (match(line, /^[ \t]*(-[ \t]+)?[A-Za-z0-9_.-]+[ \t]*:([ \t]|$)/)) {
+			head = substr(line, 1, RLENGTH); key = head
+			sub(/^[ \t]*(-[ \t]+)?/, "", key); sub(/[ \t]*:[ \t]*$/, "", key)
+		} else if ((eq = index(line, "=")) > 0) {
+			head = substr(line, 1, eq); key = substr(line, 1, eq - 1)
+			sub(/^[ \t]+/, "", key); sub(/[ \t]+$/, "", key)
+		}
+		if (head != "") {
+			rest = substr(line, length(head) + 1)
+			match(rest, /^[ \t]*/)
+			if (RLENGTH < length(rest) && secret(key)) line = head substr(rest, 1, RLENGTH) "<redacted>"
+		}
+		print line
+	}' "$1"
+}
+
 # ---- the plan --------------------------------------------------------------
 
 get "$base/client/plan.txt?$query" "$work/plan.txt"
@@ -302,14 +431,21 @@ while IFS=$tab read -r n system target <&3; do
 	if [ -e "$target" ] && [ ! -f "$target" ]; then
 		die "$target exists and is not a regular file; move it aside, then re-run. Nothing was written"
 	fi
-	if [ -f "$target" ] && cmp -s "$target" "$work/$n"; then
+	old=/dev/null
+	[ ! -f "$target" ] || old=$target
+	keep "$system" "$old" "$work/$n" "$work/$n.new"
+	if [ -f "$target" ] && cmp -s "$target" "$work/$n.new"; then
 		printf 'unchanged  %-10s %s\n' "$system" "$target"
 		continue
 	fi
-	old=/dev/null
-	[ ! -f "$target" ] || old=$target
+	shown=/dev/null
+	if [ -f "$target" ]; then
+		shown=$work/$n.old.shown
+		redact "$target" >"$shown"
+	fi
+	redact "$work/$n.new" >"$work/$n.new.shown"
 	printf '\n'
-	if diff -u -L "$target" -L "$target (bodega)" "$old" "$work/$n"; then
+	if diff -u -L "$target" -L "$target (bodega)" "$shown" "$work/$n.new.shown"; then
 		:
 	else
 		[ $? -eq 1 ] || die "diff could not compare $target with the planned file"
@@ -352,7 +488,7 @@ while IFS=$tab read -r n system target <&3; do
 		cp -p "$target" "$target.bodega-$stamp" || die "could not back up $target, so it was not written.${written:+ Already written, each beside its backup:$written}"
 		printf 'backed up  %s -> %s\n' "$target" "$target.bodega-$stamp"
 	fi
-	cat "$work/$n" >"$target" || die "writing $target failed; restore it from $target.bodega-$stamp.${written:+ Already written:$written}"
+	cat "$work/$n.new" >"$target" || die "writing $target failed; restore it from $target.bodega-$stamp.${written:+ Already written:$written}"
 	printf 'wrote      %s\n' "$target"
 	written="$written $target"
 done 3<"$work/order"

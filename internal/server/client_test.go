@@ -656,3 +656,122 @@ func TestClientPlanReleaseRerendersTheFreeBSDOverrides(t *testing.T) {
 		}
 	}
 }
+
+// The served script and clientconf are two implementations of one apply: a
+// host with the binary and a host without it must end holding the same bytes
+// and see the same secrets redacted. The script runs here under this host's
+// own sh and awk against a stand-in server, with uname answering Linux so the
+// test runs on a developer's Mac too.
+func TestSetupScriptKeepsCredentialsAndMatchesClientconf(t *testing.T) {
+	for _, tool := range []string{"sh", "awk", "diff", "cmp"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s is not on PATH", tool)
+		}
+	}
+	files := map[string]string{
+		"npm":  clientconf.Npm("https://h").Content,
+		"helm": clientconf.Helm("https://h").Content,
+		"pypi": clientconf.Pip("https://h").Content,
+	}
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	var records []planRecord
+	for _, sys := range []string{"npm", "helm", "pypi"} {
+		sum := sha256.Sum256([]byte(files[sys]))
+		path := map[string]string{"npm": "~/.npmrc", "helm": "~/.config/helm/repositories.yaml", "pypi": "~/pip.conf"}[sys]
+		records = append(records, planRecord{Identity: "t", Match: "cidr:127.0.0.1/32", System: sys, Action: clientconf.PlanInstall,
+			Path: path, URL: srv.URL + "/client/" + sys, SHA256: hex.EncodeToString(sum[:])})
+		body := files[sys]
+		mux.HandleFunc("/client/"+sys, func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(body)) })
+	}
+	mux.HandleFunc("/client/plan.txt", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(planTSV(records))) })
+
+	fence := func(s string) string {
+		return clientconf.CredentialBegin + "\n" + s + "\n" + clientconf.CredentialEnd + "\n"
+	}
+	seed := map[string]string{ //nolint:gosec // G101: fixture tokens the test asserts are redacted, not credentials
+		".npmrc": "color=false\n" + fence("//h/npm/:_authToken=bodega_ak_npm") + "//old/:_authToken=bodega_ak_other\n",
+		".config/helm/repositories.yaml": clientconf.HelmDocument("- name: other\n  url: https://o\n  password: bodega_ak_otherhelm\n" +
+			fence("- name: bodega\n  url: https://h/helm\n  username: bodega\n  password: bodega_ak_helm")),
+		"pip.conf": "[global]\nindex-url = https://op:bodega_ak_pip@pypi.internal/simple/\n",
+	}
+	newHome := func() string {
+		home := t.TempDir()
+		for rel, content := range seed {
+			p := home + "/" + rel
+			if err := os.MkdirAll(p[:strings.LastIndex(p, "/")], 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return home
+	}
+
+	stub := t.TempDir()
+	if err := os.WriteFile(stub+"/uname", []byte("#!/bin/sh\necho Linux\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := t.TempDir() + "/setup.sh"
+	if err := os.WriteFile(script, clientSetupScript, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runScript := func(home string, apply bool) string {
+		args := []string{script, "--url", srv.URL, "--allow-plaintext"}
+		if apply {
+			args = append(args, "--apply")
+		}
+		cmd := exec.Command("sh", args...)
+		cmd.Env = []string{"HOME=" + home, "PATH=" + stub + ":" + os.Getenv("PATH"), "TMPDIR=" + os.TempDir()}
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("sh setup.sh: %v\n%s", err, out)
+		}
+		return string(out)
+	}
+
+	scriptHome := newHome()
+	dry := runScript(scriptHome, false)
+	if strings.Contains(dry, "bodega_ak_") || !strings.Contains(dry, "<redacted>") {
+		t.Errorf("the script's dry run prints a secret, or redacts nothing:\n%s", dry)
+	}
+	runScript(scriptHome, true)
+	if again := runScript(scriptHome, true); !strings.Contains(again, "Nothing to change") {
+		t.Errorf("a second --apply found something to change:\n%s", again)
+	}
+
+	goHome := newHome()
+	var changes []clientconf.Change
+	for _, rec := range records {
+		c, err := clientconf.NewChange(rec, []byte(files[rec.System]), goHome)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, err := c.Diff()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(d, "bodega_ak_") {
+			t.Errorf("clientconf's diff of %s prints a secret:\n%s", rec.System, d)
+		}
+		changes = append(changes, c)
+	}
+	if _, err := clientconf.Apply(changes, ".bak"); err != nil {
+		t.Fatal(err)
+	}
+
+	for rel := range seed {
+		fromScript, _ := os.ReadFile(scriptHome + "/" + rel)
+		fromGo, _ := os.ReadFile(goHome + "/" + rel)
+		if string(fromScript) != string(fromGo) {
+			t.Errorf("%s differs between the script and clientconf:\nscript:\n%s\nclientconf:\n%s", rel, fromScript, fromGo)
+		}
+	}
+	for rel, want := range map[string]string{".npmrc": "_authToken=bodega_ak_npm", ".config/helm/repositories.yaml": "password: bodega_ak_helm"} {
+		if got, _ := os.ReadFile(scriptHome + "/" + rel); !strings.Contains(string(got), want) {
+			t.Errorf("%s lost bodega's credential after --apply:\n%s", rel, got)
+		}
+	}
+}

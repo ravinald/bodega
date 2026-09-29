@@ -838,3 +838,58 @@ func TestCargoNoteNamesTheSourceReplacement(t *testing.T) {
 		t.Errorf("cargo note still recommends a [registries] index: %q", note)
 	}
 }
+
+// The plan and --write-credentials share ~/.npmrc and repositories.yaml. Run
+// in either order, and then either one again, they settle on one file holding
+// the plan's content and the credential, and neither run rewrites the other's.
+func TestPlanAndCredentialWriterConvergeInEitherOrder(t *testing.T) {
+	base, _ := url.Parse("https://bodega.internal:8080")
+	for _, tc := range []struct {
+		client, system string
+		planned        string
+	}{
+		{"npm", "npm", clientconf.Npm(base.String()).Content},
+		{"helm", "helm", clientconf.Helm(base.String()).Content},
+	} {
+		for _, credentialFirst := range []bool{true, false} {
+			home := scratchHome(t)
+			var target CredentialTarget
+			for _, ct := range CredentialTargets(home) {
+				if ct.Client == tc.client {
+					target = ct
+				}
+			}
+			applyPlan := func() {
+				existing, _ := os.ReadFile(target.Path)
+				next := clientconf.KeepCredential(tc.system, existing, []byte(tc.planned))
+				if err := os.MkdirAll(filepath.Dir(target.Path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(target.Path, next, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if credentialFirst {
+				if _, err := WriteCredential(target, base, "bodega_ak_x"); err != nil {
+					t.Fatal(err)
+				}
+				applyPlan()
+			} else {
+				applyPlan()
+				if _, err := WriteCredential(target, base, "bodega_ak_x"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			settled, _ := os.ReadFile(target.Path)
+			if !strings.Contains(string(settled), "bodega_ak_x") || !strings.Contains(string(settled), "/"+tc.system) {
+				t.Fatalf("%s credentialFirst=%v: settled file lacks the credential or the plan:\n%s", tc.client, credentialFirst, settled)
+			}
+			if again := clientconf.KeepCredential(tc.system, settled, []byte(tc.planned)); string(again) != string(settled) {
+				t.Errorf("%s credentialFirst=%v: the plan would rewrite the settled file:\n%s\nto:\n%s", tc.client, credentialFirst, settled, again)
+			}
+			if changed, err := WriteCredential(target, base, "bodega_ak_x"); err != nil || changed {
+				t.Errorf("%s credentialFirst=%v: --write-credentials would rewrite the settled file (changed=%v, %v)", tc.client, credentialFirst, changed, err)
+			}
+		}
+	}
+}

@@ -101,10 +101,12 @@ type Change struct {
 	Target  string
 	Old     []byte
 	Existed bool
-	New     []byte
+	// New is what Apply writes: the fetched file, which matched the plan's
+	// digest, plus any credential KeepCredential carried over from Old.
+	New []byte
 }
 
-// Unchanged reports whether the host already holds the planned bytes.
+// Unchanged reports whether the host already holds what Apply would write.
 func (c Change) Unchanged() bool {
 	return c.Existed && string(c.Old) == string(c.New)
 }
@@ -140,6 +142,7 @@ func NewChange(rec PlanRecord, content []byte, home string) (Change, error) {
 		return Change{}, fmt.Errorf("read %s: %w", target, err)
 	}
 	c.Existed = true
+	c.New = KeepCredential(rec.System, c.Old, content)
 	return c, nil
 }
 
@@ -158,27 +161,27 @@ func TargetPath(path, home string) (string, error) {
 	return "", fmt.Errorf("the plan names %q, which is not an absolute path; refusing to write it", path)
 }
 
-// Diff is the unified diff from what the host holds to the planned file, as
-// diff(1) -u prints it: the setup script shells out to the same tool, so both
-// paths show an operator one format.
+// Diff is the unified diff from what the host holds to what Apply would
+// write, as diff(1) -u prints it: the setup script shells out to the same
+// tool, so both paths show an operator one format. Both sides pass through
+// Redact first, so a secret in either file never reaches the output.
 func (c Change) Diff() (string, error) {
-	tmp, err := os.CreateTemp("", "bodega-plan-*")
+	dir, err := os.MkdirTemp("", "bodega-plan-*")
 	if err != nil {
 		return "", err
 	}
-	defer func() { _ = os.Remove(tmp.Name()) }()
-	if _, err := tmp.Write(c.New); err != nil {
-		_ = tmp.Close()
+	defer func() { _ = os.RemoveAll(dir) }()
+	oldPath, newPath := filepath.Join(dir, "old"), filepath.Join(dir, "new")
+	if err := os.WriteFile(oldPath, []byte(Redact(string(c.Old))), 0o600); err != nil {
 		return "", err
 	}
-	if err := tmp.Close(); err != nil {
+	if err := os.WriteFile(newPath, []byte(Redact(string(c.New))), 0o600); err != nil {
 		return "", err
 	}
-	old := os.DevNull
-	if c.Existed {
-		old = c.Target
+	if !c.Existed {
+		oldPath = os.DevNull
 	}
-	out, err := exec.Command("diff", "-u", "-L", c.Target, "-L", c.Target+" (bodega)", old, tmp.Name()).Output()
+	out, err := exec.Command("diff", "-u", "-L", c.Target, "-L", c.Target+" (bodega)", oldPath, newPath).Output()
 	var exit *exec.ExitError
 	if errors.As(err, &exit) && exit.ExitCode() == 1 {
 		return string(out), nil

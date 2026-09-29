@@ -217,9 +217,10 @@ test-apt:
 #
 # The e2e suites and the served setup script are the only shell in the tree,
 # so without a leg here they are the one thing `make check` does not read. The
-# script is held to -s sh because hosts run it under dash and FreeBSD's sh. shellcheck runs with -x so it
-# follows the sourced libraries; without it every suite reports its shared
-# globals as unassigned and the real findings hide among them.
+# script is held to -s sh because hosts run it under dash and FreeBSD's sh.
+# shellcheck runs with -x so it follows the sourced libraries; without it
+# every suite reports its shared globals as unassigned and the real findings
+# hide among them.
 #
 # The self-test matters more than the lint. A bug that turned every verdict
 # into PASS would lint clean and report a perfect run against a broken server.
