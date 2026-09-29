@@ -3394,7 +3394,7 @@ The host has to be identified first. Every `/client/` route answers 403 to a hos
    # FreeBSD base system:  fetch -o setup.sh https://bodega-host:8080/client/setup.sh
    ```
 
-2. Check its digest. This release serves SHA-256 `27e8e8c824888601b4c2260077fc98a931770a336be0982293dd5514324c57c3`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
+2. Check its digest. This release serves SHA-256 `f53dc9a70e7aefece9f22405bdb7337d59b397d6bc943673e39aa6893ff26f61`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
 
    ```sh
    sha256sum setup.sh              # FreeBSD: sha256 setup.sh

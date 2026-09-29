@@ -209,8 +209,8 @@ setup_guest() {
 	e2e_on "$g" "sudo -H sh $SETUP_HELPER seed && $run" || true
 	check_eq "SETUP-$tag-10" "a dry run on $g exits 0" 0 "$E2E_RC" \
 		"internal/server/client_setup.sh" "sh setup.sh --systems pypi,npm" "$E2E_RC"
-	check_contains "SETUP-$tag-11" "the dry run names the identity the server resolved" \
-		"Plan for $ident " "$E2E_OUT" "internal/server/client_setup.sh" "sh setup.sh"
+	check_contains "SETUP-$tag-11" "the dry run names the identity, profile and binding the server resolved" \
+		"Plan for $ident (no profile, matched by cidr:$cidr)" "$E2E_OUT" "internal/server/client_setup.sh" "sh setup.sh"
 	check_contains "SETUP-$tag-12" "the dry run prints a unified diff of pip.conf" \
 		"+index-url = " "$E2E_OUT" "internal/server/client_setup.sh" "sh setup.sh"
 	check_contains "SETUP-$tag-13" "the dry run says it wrote nothing" \

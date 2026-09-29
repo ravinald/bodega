@@ -213,7 +213,9 @@ while IFS=$tab read -r identity profile match system action path url sha reason 
 	*) all="${all:+$all }$system" ;;
 	esac
 	if [ -z "$header" ]; then
-		header="Plan for $(dec "$identity") (profile $(dec "$profile"), matched by $(dec "$match")) from $base"
+		prof="profile $(dec "$profile")"
+		[ "$profile" != - ] || prof="no profile"
+		header="Plan for $(dec "$identity") ($prof, matched by $(dec "$match")) from $base"
 	fi
 done 3<"$work/plan.txt"
 [ -n "$all" ] || die "$base returned an empty plan; check the server's log for the request"

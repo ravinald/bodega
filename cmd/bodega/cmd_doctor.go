@@ -426,7 +426,11 @@ func configureFromPlan(gf *globalFlags, req planRequest) error {
 	}
 	if len(plan.Records) > 0 {
 		r := plan.Records[0]
-		fmt.Printf("Plan for %s (profile %s, matched by %s) from %s\n\n", r.Identity, r.Profile, r.Match, client.BaseURL)
+		profile := "no profile"
+		if r.Profile != "" {
+			profile = "profile " + r.Profile
+		}
+		fmt.Printf("Plan for %s (%s, matched by %s) from %s\n\n", r.Identity, profile, r.Match, client.BaseURL)
 	}
 	home, _ := os.UserHomeDir()
 	var changes []clientconf.Change
