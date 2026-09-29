@@ -183,19 +183,33 @@ func splitLines(s string) []string {
 const Redacted = "<redacted>"
 
 var (
-	urlUserinfo = regexp.MustCompile(`://([^/:@ \t]+):[^/@ \t]+@`)
-	yamlKey     = regexp.MustCompile(`^[ \t]*(-[ \t]+)?([A-Za-z0-9_.-]+)[ \t]*:([ \t]|$)`)
-	secretKey   = regexp.MustCompile(`(password|passwd|token|secret|_auth)$`)
+	urlUserinfo  = regexp.MustCompile(`://([^/:@ \t]+):[^/@ \t]+@`)
+	urlTokenOnly = regexp.MustCompile(`(?i)(https?://)[^/?#:@ \t]+@`)
+	authHeader   = regexp.MustCompile(`(?i)(authorization[ \t]*:[ \t]*(?:[a-z][a-z0-9._~+-]*[ \t]+)?)[^ \t].*$`)
+	yamlKey      = regexp.MustCompile(`^[ \t]*(-[ \t]+)?([A-Za-z0-9_.-]+)[ \t]*:([ \t]|$)`)
+	secretKey    = regexp.MustCompile(`(password|passwd|token|secret|_auth|_key)$|^apikey$`)
 )
 
 // Redact replaces every secret in a configuration file's text with Redacted,
-// line by line: the password of a user:pass@ URL, and the value of a YAML
-// `key: value` or an ini `key = value` whose key ends in password, passwd,
-// token, secret or _auth. A diff is printed to a terminal and often to a CI
-// log, and the file it reads may hold a credential bodega did not put there
-// (a pip index URL with credentials in it), so the secret never reaches either.
+// line by line:
 //
-// The served setup script redacts with the same rules in awk.
+//   - the password of a user:pass@ URL, keeping the user;
+//   - the whole userinfo of an http or https URL that has no password, since
+//     that lone field is a token (https://ghp_x@github.com/). An ssh:// user
+//     is an account name and stays;
+//   - everything after an Authorization: header name except the scheme
+//     (Bearer, Basic), wherever the header sits in the line, as in git's
+//     http.<url>.extraHeader;
+//   - the value of a YAML `key: value` or an ini `key = value` whose key, case
+//     folded, ends in password, passwd, token, secret, _auth or _key, or is
+//     apikey.
+//
+// A diff is printed to a terminal and often to a CI log, and the file it reads
+// may hold a credential bodega did not put there (a pip index URL with
+// credentials in it), so the secret never reaches either.
+//
+// The served setup script redacts with the same rules in awk, and a test runs
+// both over one table of lines.
 func Redact(text string) string {
 	lines := strings.Split(text, "\n")
 	for i, l := range lines {
@@ -206,6 +220,8 @@ func Redact(text string) string {
 
 func redactLine(l string) string {
 	l = urlUserinfo.ReplaceAllString(l, "://$1:"+Redacted+"@")
+	l = urlTokenOnly.ReplaceAllString(l, "${1}"+Redacted+"@")
+	l = authHeader.ReplaceAllString(l, "${1}"+Redacted)
 	var head, key, rest string
 	if m := yamlKey.FindStringSubmatchIndex(l); m != nil {
 		head, key, rest = l[:m[1]], l[m[4]:m[5]], l[m[1]:]

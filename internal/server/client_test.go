@@ -625,6 +625,88 @@ func TestClientSetupScriptIsPOSIX(t *testing.T) {
 	}
 }
 
+// redactCases is every line the setup script's diff redacts or must leave
+// alone. Redact and the script's awk redact() are two implementations kept in
+// step by hand, so both run over this one table.
+var redactCases = []struct{ in, want string }{ //nolint:gosec // G101: fixture secrets the test asserts are redacted
+	{"registry=https://h/npm/", ""},
+	{"  url: https://h/helm?a=b", ""},
+	{"\tinsteadOf = https://github.com/", ""},
+	{"MASTER_SITE_OVERRIDE?= https://h/distfiles/", ""},
+	{"password:", ""},
+	{"  pass_credentials_all: false", ""},
+	{"//h:8080/npm/:_authToken=t", "//h:8080/npm/:_authToken=<redacted>"},
+	{"  password:   t", "  password:   <redacted>"},
+	{"- password: t", "- password: <redacted>"},
+	{"token = \"t\"", "token = <redacted>"},
+	{"x = https://u:p@h/ and ://a:b:c@d", "x = https://u:<redacted>@h/ and ://a:<redacted>@d"},
+
+	{`[url "https://ghp_SECRETONLYUSER@github.com/"]`, `[url "https://<redacted>@github.com/"]`},
+	{"index-url = HTTP://tok@h/simple/ git+https://t2@g/r", "index-url = HTTP://<redacted>@h/simple/ git+https://<redacted>@g/r"},
+	{"\turl = ssh://git@github.com/o/r", ""},
+	{"\turl = git@github.com:o/r", ""},
+	{"https://h/path@v1 https://h?q=a@b", ""},
+
+	{"\textraHeader = Authorization: Bearer SECRETBEARER", "\textraHeader = Authorization: Bearer <redacted>"},
+	{"\textraheader = authorization: Basic dXNlcjpwYXNz", "\textraheader = authorization: Basic <redacted>"},
+	{"Authorization: SECRETNOSCHEME", "Authorization: <redacted>"},
+	{"  - \"Proxy-Authorization:  Bearer  a b\"", "  - \"Proxy-Authorization:  Bearer  <redacted>"},
+	{"Authorization:", ""},
+
+	{"api_key = SECRETAPIKEY", "api_key = <redacted>"},
+	{"ACCESS_KEY: k", "ACCESS_KEY: <redacted>"},
+	{"apikey = k", "apikey = <redacted>"},
+	{"ApiKey: k", "ApiKey: <redacted>"},
+	{"keyring = /etc/keyring", ""},
+	{"monkey: business", ""},
+	{"keys = a,b", ""},
+	{"apikeys = a", ""},
+}
+
+// Every row must come out of Redact and of the script's redact() the same,
+// and as the row says. The awk runs under this host's sh and awk, so each CI
+// platform checks its own.
+func TestRedactMatchesTheSetupScript(t *testing.T) {
+	src := string(clientSetupScript)
+	start := strings.Index(src, "\nredact() {\n")
+	end := strings.Index(src[start+1:], "\n}\n")
+	if start < 0 || end < 0 {
+		t.Fatal("no redact() function in client_setup.sh; the test cannot reach the script's rule")
+	}
+	dir := t.TempDir()
+	fn, input := dir+"/redact.sh", dir+"/input"
+	if err := os.WriteFile(fn, []byte(src[start+1:start+1+end+3]), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var in []string
+	for _, c := range redactCases {
+		in = append(in, c.in)
+	}
+	if err := os.WriteFile(input, []byte(strings.Join(in, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("sh", "-c", `. "$1" && redact "$2"`, "sh", fn, input).CombinedOutput()
+	if err != nil {
+		t.Fatalf("sh redact(): %v\n%s", err, out)
+	}
+	awk := strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
+	if len(awk) != len(redactCases) {
+		t.Fatalf("redact() printed %d lines for %d rows:\n%s", len(awk), len(redactCases), out)
+	}
+	for i, c := range redactCases {
+		want := c.want
+		if want == "" {
+			want = c.in
+		}
+		if got := clientconf.Redact(c.in); got != want {
+			t.Errorf("Redact(%q) = %q, want %q", c.in, got, want)
+		}
+		if awk[i] != want {
+			t.Errorf("redact() of %q = %q, want %q", c.in, awk[i], want)
+		}
+	}
+}
+
 // release re-renders the pkg overrides for another major release, so a host
 // running 14 against a repository named for 15 disables its own tags.
 func TestClientPlanReleaseRerendersTheFreeBSDOverrides(t *testing.T) {

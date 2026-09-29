@@ -197,7 +197,7 @@ MASTER_SITE_BACKUP?= https://bodega-host:8080/distfiles/@${BODEGA_DISTFILES_ENV}
 
 [Mirroring ports distfiles](usage.md#mirroring-ports-distfiles) covers the server side and the client check.
 
-Every file above can be installed in one step by the script bodega serves, which needs `sh` and `curl` or `fetch(1)` on the client and nothing else. Bind the client first, on the server, since `/client/` serves only a host it can name:
+Every file above can be installed in one step by the script bodega serves, which needs `sh`, `curl` or `fetch(1)`, `sha256sum` or `sha256(1)`, `awk`, `diff` and `cmp` on the client and nothing else. Bind the client first, on the server, since `/client/` serves only a host it can name:
 
 ```bash
 bodega identity bind cidr 192.0.2.10/32 devbox-3     # on the server

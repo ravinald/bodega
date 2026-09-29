@@ -257,29 +257,3 @@ func TestDiffPrintsNoCredential(t *testing.T) {
 		}
 	}
 }
-
-func TestRedactLeavesOrdinaryLinesAlone(t *testing.T) {
-	for _, l := range []string{
-		"registry=https://h/npm/",
-		"  url: https://h/helm?a=b",
-		"\tinsteadOf = https://github.com/",
-		"MASTER_SITE_OVERRIDE?= https://h/distfiles/",
-		"password:",
-		"  pass_credentials_all: false",
-	} {
-		if got := Redact(l); got != l {
-			t.Errorf("Redact(%q) = %q", l, got)
-		}
-	}
-	for in, want := range map[string]string{
-		"//h:8080/npm/:_authToken=t":        "//h:8080/npm/:_authToken=" + Redacted,
-		"  password:   t":                   "  password:   " + Redacted,
-		"- password: t":                     "- password: " + Redacted,
-		"token = \"t\"":                     "token = " + Redacted,
-		"x = https://u:p@h/ and ://a:b:c@d": "x = https://u:" + Redacted + "@h/ and ://a:" + Redacted + "@d",
-	} {
-		if got := Redact(in); got != want {
-			t.Errorf("Redact(%q) = %q, want %q", in, got, want)
-		}
-	}
-}
