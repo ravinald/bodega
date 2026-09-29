@@ -877,6 +877,7 @@ func (s *Server) registerRoutes() {
 	// installs, and each file rendered for that host.
 	m.HandleFunc("GET /client/plan", s.handleClientPlan)
 	m.HandleFunc("GET /client/plan.txt", s.handleClientPlanText)
+	m.HandleFunc("GET /client/setup.sh", s.handleClientSetup)
 	m.HandleFunc("GET /client/{system}", s.handleClientSystem)
 
 	// REST API
@@ -1141,6 +1142,9 @@ type statusResponse struct {
 	Spool          spoolStats           `json:"spool"`
 	BackendEntries []backendEntryStatus `json:"backend_entries,omitempty"`
 	Error          string               `json:"error,omitempty"`
+	// ClientSetupSHA256 is the digest of GET /client/setup.sh, published
+	// here so a host can check the script before running it.
+	ClientSetupSHA256 string `json:"client_setup_sha256"`
 }
 
 // backendEntryStatus is one probe row, reported against the backend that
@@ -1198,6 +1202,8 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 		FreeBSD:    freebsd,
 		Spool:      spool,
 		EntryCount: entryCount,
+
+		ClientSetupSHA256: clientSetupSHA256,
 	}
 
 	if s.stores == nil {

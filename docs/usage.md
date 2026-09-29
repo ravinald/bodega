@@ -1747,9 +1747,9 @@ bodega-latest: {
 
 `GET /api/v1/status` answers per host: its `freebsd.repos` carry `profile` and the view's URL for a host bound to a profile with a freebsd rule, and the published repository for any other. The profile name is one percent-encoded path segment of that URL, so a profile named `web#prod` is served at `/freebsd-profile/web%23prod/`; `$` is encoded too, since pkg expands `${...}` in a repository URL. A profile named `.` or `..` is encoded whole, as `%2E` and `%2E%2E`, since a client resolves a literal dot segment away before it sends the request. A host bound by `bodega identity bind cidr` needs no token, which is the ordinary case, since pkg sends no bodega credential.
 
-### `bodega doctor [--write-credentials --token TOKEN [--url URL]] [--write-apt-sources [--suite CODENAME]] [--write-pkg-repo [--abi ABI] [--release N]]`
+### `bodega doctor [--write-credentials --token TOKEN [--url URL]] [--configure SYSTEMS [--apply] [--suite CODENAME] [--abi ABI] [--release N]]`
 
-Without flags, `doctor` reports and changes nothing. It has three writes, and they run one at a time.
+Without flags, `doctor` reports and changes nothing. It has two writes, `--write-credentials` and `--configure`, and they run one at a time.
 
 It exits 0 when every check is clean, 2 when one or more produced a finding, and 3 when one or more could not run at all. A check reports `SKIPPED` rather than `N/A` when the file or store it reads would not open, and the `Could not run:` block names what it needed: an unprivileged run against the root-owned `/etc/bodega/config.json` the service unit prescribes measures no policy posture, and three `N/A` rows beside the checks that passed said nothing about that. `N/A` keeps its meaning, which is a measurement: the subject is absent on this host.
 
@@ -1762,23 +1762,30 @@ Both checks certify the configuration doctor ran under, and each detail line say
 
 The pip check reads `/usr/local/etc/pip.conf`, `/usr/local/pip.conf` and `/etc/xdg/pip/pip.conf` on FreeBSD beside the paths it reads everywhere, and the npm check reads `/usr/local/etc/npmrc`. pip itself ignores the first of those; doctor reads it because the ports convention puts a file there, and a warning about a file pip never reads costs less than an `OK` over one an operator believes is in force.
 
-`--write-apt-sources` asks the server which apt suite this host should read and installs the keyring and the stanza; see [apt under a profile](#apt-under-a-profile).
+`--configure` applies the plan [`GET /client/plan`](#client-plan-and-per-system-files) returns for this host, the plan the [setup script](#setup-script) applies, through the same steps: every file fetched and checked against the plan's SHA-256 before anything is compared, a unified diff per file, and with `--apply` a backup beside each file it replaces (`<file>.bodega-<UTC timestamp>`) before the write. Without `--apply` it writes nothing. A system the plan does not list is an error naming the ones it does, and so is a named system the plan refuses or skips, with the server's reason.
 
-`--suite` names the codename when the server will not. An instance that mirrors serves a codename per upstream beside the one it generates, so several codenames is its ordinary state rather than a misconfiguration, and with no profile to choose between them the server names none:
+```bash
+bodega doctor --configure apt,pypi --url https://bodega.internal
+sudo bodega doctor --configure apt,pypi --url https://bodega.internal --apply
+```
+
+`--write-apt-sources` is `--configure apt --apply`, and `--write-pkg-repo` is `--configure freebsd --apply`. The two combine with each other and with `--configure`. The operating system it states is the one doctor runs on, so `--configure freebsd` on Linux reports the plan's skip rather than writing a file pkg would never read.
+
+`--suite` names the apt codename, and doctor sends one only when this flag is set, leaving the choice to the server otherwise (the script sends `VERSION_CODENAME`). An instance that mirrors serves a codename per upstream beside the one it generates, so several codenames is its ordinary state rather than a misconfiguration, and with no profile to choose between them the server names none:
 
 ```bash
 bodega doctor --write-apt-sources --suite noble --url https://bodega.internal
 ```
 
-The stanza is still the server's rendering of that codename, so this flag decides which block is installed and nothing about its contents. A mirrored codename installs the sources file alone, with no keyring and no trust line: bodega does not sign what it proxies, the archive's own signature reaches the client intact, and apt verifies it against the distro keyring the host already has. `Signed-By:` naming bodega's key there would fail every `apt update` on the signature, and `[trusted=yes]` would discard a signature that is present and valid, so the write refuses a stanza carrying either. A host whose profile scopes apt is refused too, and told to change the profile's base: the filtered codename is that profile's answer, and the unfiltered base it was built from is in the same list.
+The stanza is still the server's rendering of that codename, so this flag decides which file is installed and nothing about its contents. A mirrored codename installs the sources file alone, with no keyring and no trust line: bodega does not sign what it proxies, the archive's own signature reaches the client intact, and apt verifies it against the distro keyring the host already has. A host whose profile scopes apt is refused a codename other than the profile's: the filtered codename is that profile's answer, and the unfiltered base it was built from is in the same list. A signed stanza brings the keyring its `Signed-By:` names, and the keyring is written first, so a failed run never leaves a stanza naming a key that is not there.
 
-`--write-pkg-repo` is the FreeBSD half. It asks the server which pkg repository answers for this host's ABI and writes `/usr/local/etc/pkg/repos/bodega.conf`, which carries two things rather than one: bodega's repository, and the overrides that disable the repository `/etc/pkg/FreeBSD.conf` defines. A file with only the first leaves the host fetching from `pkg.FreeBSD.org` beside bodega, and `pkg update` says nothing about it, so the write refuses a document that disables nothing.
+For FreeBSD the plan names `/usr/local/etc/pkg/repos/bodega.conf`, which carries two things rather than one: bodega's repository, and the overrides that disable the repository `/etc/pkg/FreeBSD.conf` defines. A file with only the first leaves the host fetching from `pkg.FreeBSD.org` beside bodega, and `pkg update` says nothing about it.
 
 ```bash
-bodega doctor --write-pkg-repo --url https://bodega.internal
+sudo bodega doctor --write-pkg-repo --url https://bodega.internal
 ```
 
-The ABI comes from `pkg config abi` on a FreeBSD host and from `--abi` anywhere else; nothing composes one from `runtime.GOARCH`, because the two spellings differ. The overrides follow the major release that ABI carries, and `--release` says otherwise for a host whose release is not the one the repository is named for. `signature_type` is the server's answer rather than a flag. A server serving several repositories for one ABI refuses and names them: which one a host reads is a decision, and a file naming one reads as authoritative. See [Client configuration](#client-configuration) for what lands in the file and why each line is there.
+The ABI comes from `pkg config abi`, or from `--abi`; nothing composes one from `runtime.GOARCH`, because the two spellings differ. The overrides follow the major release that ABI carries, and `--release` says otherwise for a host whose release is not the one the repository is named for: the server renders the file for that release and the plan's digest covers it. `signature_type` is the server's answer rather than a flag. A server serving several repositories for one ABI skips the system and names them: which one a host reads is a decision, and a file naming one reads as authoritative. See [Client configuration](#client-configuration) for what lands in the file and why each line is there.
 
 With `--write-credentials` it writes one token into the file each of the eight clients reads its credential from, because a feature that costs eight hand edits does not get adopted:
 
@@ -3372,16 +3379,60 @@ fetch > run > package > upload
 
 ### Client configuration
 
-Each client reads its own configuration file, and this section shows each one as bodega renders it, with `https://bodega-host:8080` standing in for your `public_url`. The TUI and the web dashboard show the file for a selected package, and `GET /api/v1/packages/{type}/{name}` serves it as [`client_config`](#client_config-on-get-apiv1packagestypename); all three render through one package, so they cannot disagree. Two of them can be written for you today, both by `bodega doctor` on the client host (see [`bodega doctor`](#bodega-doctor---write-credentials---token-token---url-url---write-apt-sources---suite-codename---write-pkg-repo---abi-abi---release-n)):
+Each client reads its own configuration file. bodega composes every one of them for the host that asks and serves a script that installs them, so a host needs `sh` and `curl` or `fetch(1)` and nothing else. The rest of this section shows each file as bodega renders it, with `https://bodega-host:8080` standing in for your `public_url`.
 
-| Client                         | Written by                                                         | What bodega composes                                                                                                                                  |
-| ------------------------------ | ------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| apt                            | `doctor --write-apt-sources`                                       | the keyring and a `bodega.sources` stanza for the suite this host's profile reads                                                                     |
-| FreeBSD `pkg`                  | `doctor --write-pkg-repo`                                          | `/usr/local/etc/pkg/repos/bodega.conf`, including the overrides that disable upstream                                                                 |
-| pip, npm, cargo, Go, helm, git | hand, from the files below                                         | each file below; `--write-credentials` places the token each one reads, and for helm also registers the repository                                    |
-| FreeBSD ports (`make.conf`)    | hand, from the lines below                                         | the sites, and the client check at `/distfiles/@environment.mk`; see [Mirroring ports distfiles](#mirroring-ports-distfiles)                          |
+#### Setup script
 
-Both writers need the `bodega` binary on the client, and each run performs one write. A host without the binary reads the same decisions from the server: [`GET /client/plan`](#client-plan-and-per-system-files) lists which files the host installs, worked out from its identity and profile, and `GET /client/{system}` serves each one rendered for it. **Planned, not built yet** ([#52](https://github.com/ravinald/bodega/issues/52)): a setup script served by bodega that applies a chosen subset of that plan. Until then, a fleet without the binary applies the plan through its own configuration management.
+`GET /client/setup.sh` serves one POSIX `sh` script, embedded in the binary and the same bytes for every host. It fetches this host's [plan](#client-plan-and-per-system-files), then each file the plan lists, checks every file against the plan's SHA-256 before it touches the host, and prints a unified diff per file. Every per-host decision (which systems, which paths, what content) is the server's and arrives in the plan; the script makes none, which is what lets one published digest cover every host.
+
+The host has to be identified first. Every `/client/` route answers 403 to a host no binding names, the script included, and the refusal names the command that admits it: `bodega identity bind cidr <addr>/32 <name>` on the server, or a token bound with `bodega identity bind token`.
+
+1. Fetch the script and read it. Its source is [`internal/server/client_setup.sh`](../internal/server/client_setup.sh).
+
+   ```sh
+   curl -fsS -o setup.sh https://bodega-host:8080/client/setup.sh
+   # FreeBSD base system:  fetch -o setup.sh https://bodega-host:8080/client/setup.sh
+   ```
+
+2. Check its digest. This release serves SHA-256 `27e8e8c824888601b4c2260077fc98a931770a336be0982293dd5514324c57c3`, and the running server reports the one it serves as `client_setup_sha256` in `GET /api/v1/status`:
+
+   ```sh
+   sha256sum setup.sh              # FreeBSD: sha256 setup.sh
+   curl -fsS https://bodega-host:8080/api/v1/status | grep -o '"client_setup_sha256":"[0-9a-f]*"'
+   ```
+
+   A digest matching neither is a script nobody reviewed. Stop there.
+
+3. Dry run. It prints the identity and profile the server resolved, each system the plan refuses or skips with the reason, and a diff for each file that would change. Nothing is written:
+
+   ```sh
+   sh setup.sh --url https://bodega-host:8080
+   ```
+
+4. Apply, as root for the files under `/etc` and `/usr/local/etc`:
+
+   ```sh
+   sudo sh setup.sh --url https://bodega-host:8080 --apply
+   ```
+
+   Each file that differs is copied beside the original as `<file>.bodega-<UTC timestamp>`, then written. A file that already matches is left alone, so a second run writes nothing and makes no backup. Every target is checked writable before the first write, so a run lacking root stops before it has changed anything. apt reads every file in `sources.list.d/` and prints a notice for the backup's unknown extension on each `apt update` until you delete it.
+
+`--systems pypi,npm` narrows the run. A name the plan does not list is an error that prints the plan's list, and so is a named system the plan refuses or skips, with the server's reason. Without `--systems` the script lists what the plan refuses or skips and configures the rest.
+
+The per-user files (`~/.npmrc`, `~/.cargo/config.toml`, `~/.gitconfig`, and the Go and helm files) land in the home of the account running the script, so under `sudo` they are root's. Configure them with `--systems` as the user who needs them. Each file is replaced whole, not merged: whatever else a `~/.gitconfig` held moves to the backup, and the dry run's diff shows it first.
+
+What the script states about the host: `os` from `uname -s`, which must be `linux` or `freebsd`; `abi` from `pkg config abi` on FreeBSD; and `codename` from `VERSION_CODENAME` in `/etc/os-release` on Linux, since `lsb_release` is absent from minimal images. On an instance serving no apt suite by the host's codename, the plan skips apt and names the suites it does serve, and `bodega doctor --configure apt --suite <suite>` is the way through.
+
+An `http://` URL is refused unless `--allow-plaintext` is passed, the rule `bodega serve` applies. Without TLS the plan and its files can be rewritten in transit together, digests included, so the SHA-256 check says nothing about whoever is on the path. A host identified by token passes it in `BODEGA_TOKEN`, never as an argument a process listing shows, and the script sends it to no plain-HTTP URL without that flag. curl receives it as a bearer header on standard input; `fetch(1)` as Basic authentication through `HTTP_AUTH`.
+
+A host with the binary applies the same plan with [`bodega doctor --configure`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n): the same digest check, diff, backup, narrowing and `--apply`. The TUI, the web dashboard and [`client_config`](#client_config-on-get-apiv1packagestypename) on `GET /api/v1/packages/{type}/{name}` show the same files per package, because all of them render through one package.
+
+| Client                         | What bodega composes                                                                                                                                 |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| apt                            | the keyring and a `bodega.sources` stanza for the suite this host's profile reads                                                                    |
+| FreeBSD `pkg`                  | `/usr/local/etc/pkg/repos/bodega.conf`, including the overrides that disable upstream                                                                |
+| pip, npm, cargo, Go, helm, git | each file below; `doctor --write-credentials` places the token each one reads, and for helm also registers the repository                            |
+| FreeBSD ports (`make.conf`)    | the sites, and the client check at `/distfiles/@environment.mk`; see [Mirroring ports distfiles](#mirroring-ports-distfiles)                         |
 
 **APT** (`/etc/apt/sources.list.d/bodega.sources`), against a signed repository:
 
@@ -3518,7 +3569,7 @@ bodega identity bind token <id> devbox-3                                # on the
 bodega doctor --write-credentials --token bodega_ak_... --url https://bodega-host:8080
 ```
 
-The last line runs on the client and writes the token into the file each of its package managers reads. See [`bodega doctor`](#bodega-doctor---write-credentials---token-token---url-url---write-apt-sources---suite-codename---write-pkg-repo---abi-abi---release-n) for what lands where, and [`bodega identity`](#bodega-identity-bindunbindlist) for the CIDR binding that covers a whole subnet with no credential to distribute.
+The last line runs on the client and writes the token into the file each of its package managers reads. See [`bodega doctor`](#bodega-doctor---write-credentials---token-token---url-url---configure-systems---apply---suite-codename---abi-abi---release-n) for what lands where, and [`bodega identity`](#bodega-identity-bindunbindlist) for the CIDR binding that covers a whole subnet with no credential to distribute.
 
 **FreeBSD pkg** (`/usr/local/etc/pkg/repos/bodega.conf`). Do not hand-write this one; ask the server:
 

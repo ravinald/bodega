@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -221,7 +222,7 @@ done`
 				if len(fs) != len(planColumns) {
 					t.Fatalf("sh read %d fields from %q, want %d", len(fs), line, len(planColumns))
 				}
-				fromText = append(fromText, planRecord{fs[0], fs[1], fs[2], fs[3], fs[4], fs[5], fs[6], fs[7], fs[8]})
+				fromText = append(fromText, planRecord{Identity: fs[0], Profile: fs[1], Match: fs[2], System: fs[3], Action: fs[4], Path: fs[5], URL: fs[6], SHA256: fs[7], Reason: fs[8]})
 			}
 			if len(fromText) != len(records) {
 				t.Fatalf("%s %s: plan.txt has %d records, the JSON plan %d", host.name, q, len(fromText), len(records))
@@ -572,5 +573,86 @@ func TestClientAuditSubjectIsBounded(t *testing.T) {
 	_, rows := clientDo(t, s, f.token, http.MethodGet, "/client/distfiles?os=freebsd")
 	if len(rows) != 1 || rows[0].PkgName != "distfiles" {
 		t.Errorf("a known system name must reach the row intact: %+v", rows)
+	}
+}
+
+// The script's digest is published in two places an operator checks it
+// against, and both have to be the digest of the bytes the route serves. A
+// script edit that forgets docs/usage.md fails here rather than at a host
+// whose operator was told the published digest is the one to trust.
+func TestClientSetupScriptDigestIsPublished(t *testing.T) {
+	s := hostedServer(t)
+	f := clientProfile(t, s)
+
+	code, body := clientGet(t, s, f.token, "/client/setup.sh")
+	if code != http.StatusOK || body != string(clientSetupScript) || !strings.HasPrefix(body, "#!/bin/sh\n") {
+		t.Fatalf("GET /client/setup.sh = %d, want the embedded script:\n%.200s", code, body)
+	}
+	sum := sha256.Sum256([]byte(body))
+	served := hex.EncodeToString(sum[:])
+
+	_, status := clientGet(t, s, f.token, "/api/v1/status")
+	var st statusResponse
+	if err := json.Unmarshal([]byte(status), &st); err != nil {
+		t.Fatalf("parse status: %v", err)
+	}
+	if st.ClientSetupSHA256 != served {
+		t.Errorf("/api/v1/status client_setup_sha256 = %q, want %s", st.ClientSetupSHA256, served)
+	}
+
+	usage, err := os.ReadFile("../../docs/usage.md")
+	if err != nil {
+		t.Fatalf("read docs/usage.md: %v", err)
+	}
+	if !strings.Contains(string(usage), "SHA-256 `"+served+"`") {
+		t.Errorf("docs/usage.md does not publish the served script's digest. Write it as SHA-256 `%s`", served)
+	}
+
+	if code, _ := clientGet(t, s, "", "/client/setup.sh"); code != http.StatusForbidden {
+		t.Errorf("GET /client/setup.sh from an unbound host = %d, want 403 like every /client/ route", code)
+	}
+}
+
+// The script is POSIX sh, and it is the one file a host runs as root on the
+// strength of a digest. Where shellcheck is installed it is held to -s sh.
+func TestClientSetupScriptIsPOSIX(t *testing.T) {
+	if _, err := exec.LookPath("shellcheck"); err != nil {
+		t.Skip("shellcheck not installed; make harness runs it")
+	}
+	out, err := exec.Command("shellcheck", "-s", "sh", "client_setup.sh").CombinedOutput()
+	if err != nil {
+		t.Errorf("shellcheck -s sh client_setup.sh: %v\n%s", err, out)
+	}
+}
+
+// release re-renders the pkg overrides for another major release, so a host
+// running 14 against a repository named for 15 disables its own tags.
+func TestClientPlanReleaseRerendersTheFreeBSDOverrides(t *testing.T) {
+	installPkgKey(t, pkgsign.KeyRSA)
+	s := proxyingServer(t)
+	s.loadPkgSigner()
+	addVersion(t, s, manifest.TypeFreeBSD, "latest", manifest.VersionEntry{
+		Version: freeBSDABI, URL: "https://pkg.example.org/" + freeBSDABI + "/latest", Mode: manifest.ModeProxy,
+	})
+	f := webProfile(t, s)
+	q := "os=freebsd&abi=" + freeBSDABI
+
+	own := planRecordFor(planJSON(t, s, f.token, q), manifest.TypeFreeBSD)
+	other := planRecordFor(planJSON(t, s, f.token, q+"&release=13"), manifest.TypeFreeBSD)
+	if len(own) != 1 || len(other) != 1 || other[0].Action != planInstall {
+		t.Fatalf("freebsd records = %+v / %+v, want one install each", own, other)
+	}
+	if own[0].SHA256 == other[0].SHA256 || !strings.Contains(other[0].URL, "release=13") {
+		t.Errorf("release=13 record = %+v, want a different file served at a URL carrying release=13", other[0])
+	}
+	code, body := clientGet(t, s, f.token, "/client/freebsd?"+q+"&release=13")
+	sum := sha256.Sum256([]byte(body))
+	if code != http.StatusOK || hex.EncodeToString(sum[:]) != other[0].SHA256 {
+		t.Errorf("GET /client/freebsd?...&release=13 = %d, and its digest does not match the plan's", code)
+	}
+	for _, bad := range []string{"0", "fifteen", "100"} {
+		if code, body := clientGet(t, s, f.token, "/client/plan?"+q+"&release="+bad); code != http.StatusBadRequest || !strings.Contains(body, "major release") {
+			t.Errorf("release=%s = %d %q, want 400 naming a major release", bad, code, body)
+		}
 	}
 }

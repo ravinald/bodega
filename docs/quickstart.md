@@ -180,7 +180,7 @@ git clone widget.bundle widget
 
 The clone lands on the ref the manifest entry pins. For a tag that is a detached HEAD, the same place `git clone --branch v4.5.7` puts you; `git switch -c work` when you want a branch.
 
-**FreeBSD pkg**: on the client, with the `bodega` binary installed, ask the server which repository answers for this host's ABI and write it, together with the overrides that disable `FreeBSD.conf`:
+**FreeBSD pkg**: on the client, with the `bodega` binary installed, ask the server which repository answers for this host's ABI and write it, together with the overrides that disable `FreeBSD.conf` (the script below does the same without the binary):
 
 ```bash
 sudo bodega doctor --write-pkg-repo --url https://bodega-host:8080
@@ -197,7 +197,22 @@ MASTER_SITE_BACKUP?= https://bodega-host:8080/distfiles/@${BODEGA_DISTFILES_ENV}
 
 [Mirroring ports distfiles](usage.md#mirroring-ports-distfiles) covers the server side and the client check.
 
-`bodega doctor` writes the apt and FreeBSD pkg files on a host that has the binary. The rest are set by hand as shown. A host without the binary can read which of these it should install, rendered for it, from `GET /client/plan` ([Client plan and per-system files](usage.md#client-plan-and-per-system-files)). A served setup script that applies that plan is planned ([#52](https://github.com/ravinald/bodega/issues/52)).
+Every file above can be installed in one step by the script bodega serves, which needs `sh` and `curl` or `fetch(1)` on the client and nothing else. Bind the client first, on the server, since `/client/` serves only a host it can name:
+
+```bash
+bodega identity bind cidr 192.0.2.10/32 devbox-3     # on the server
+```
+
+Then on the client: fetch the script, read it, compare its digest with `client_setup_sha256` in `GET /api/v1/status`, look at what it would change, and apply:
+
+```bash
+curl -fsS -o setup.sh https://bodega-host:8080/client/setup.sh
+sha256sum setup.sh                                   # FreeBSD: sha256 setup.sh
+sh setup.sh --url https://bodega-host:8080           # prints a diff, writes nothing
+sudo sh setup.sh --url https://bodega-host:8080 --apply
+```
+
+`--apply` backs up each file it replaces beside the original. `--systems apt,pypi` narrows the run. [Setup script](usage.md#setup-script) covers what it checks and why, and `bodega doctor --configure` does the same on a host with the binary.
 
 ## 6. Launch the TUI
 
