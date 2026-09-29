@@ -11,7 +11,9 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/ravinald/bodega/internal/clientconf"
@@ -28,25 +30,52 @@ type toolRunner func(stdin, name string, args ...string) ([]byte, error)
 
 // toolTimeout bounds one pkg or make run. Both answer in well under a second
 // on a stock host; a makefile that blocks must not hang doctor.
-const toolTimeout = 30 * time.Second
+// toolWaitDelay bounds the wait for pipes a descendant that left the
+// process group still holds.
+const (
+	toolTimeout   = 30 * time.Second
+	toolWaitDelay = 2 * time.Second
+)
 
 func runTool(stdin, name string, args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), toolTimeout)
+	return runToolWithin(toolTimeout, stdin, name, args...)
+}
+
+// runToolWithin runs the tool in a process group of its own and kills the
+// whole group on timeout and again once the tool exits. make runs !=
+// assignments and .BEGIN recipes through sh, whose children inherit make's
+// pipes: killing make alone leaves them running and leaves the read of
+// those pipes waiting on them.
+func runToolWithin(timeout time.Duration, stdin, name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Stdin = strings.NewReader(stdin)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return killGroup(cmd.Process.Pid) }
+	cmd.WaitDelay = toolWaitDelay
 	out, err := cmd.Output()
+	if cmd.Process != nil {
+		_ = killGroup(cmd.Process.Pid)
+	}
 	switch {
 	case err == nil:
 		return out, nil
 	case ctx.Err() != nil:
-		return out, fmt.Errorf("%s did not answer within %s", name, toolTimeout)
+		return out, fmt.Errorf("%s did not answer within %s", name, timeout)
 	case stderr.Len() > 0:
 		return out, fmt.Errorf("%w: %s", err, oneLine(stderr.String()))
 	}
 	return out, err
+}
+
+func killGroup(pgid int) error {
+	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return err
+	}
+	return nil
 }
 
 func oneLine(s string) string {
@@ -54,19 +83,36 @@ func oneLine(s string) string {
 }
 
 // toolLimit is what asking the tools cannot certify: pkg and make answer for
-// the environment doctor itself runs in, and nothing else.
-const toolLimit = "this certifies the configuration doctor ran under; a fetch started with a different environment or MAKEFLAGS is not covered"
+// the environment doctor itself runs in, and nothing else. toolUnmeasured
+// states the same scope on a finding that measured nothing, which must not
+// claim to certify anything.
+const (
+	toolScope      = "a fetch started with a different environment or MAKEFLAGS is not covered"
+	toolLimit      = "this certifies the configuration doctor ran under; " + toolScope
+	toolUnmeasured = "this answers for the configuration doctor ran under and certifies nothing; " + toolScope
+)
+
+// scopeTo appends the limit of asking the tools to a finding's detail.
+func scopeTo(f *Finding, certified bool) {
+	if certified {
+		f.Detail += "; " + toolLimit
+	} else {
+		f.Detail += "; " + toolUnmeasured
+	}
+}
 
 // CheckPkgRepos reports whether every repository pkg will use is bodega's.
 func CheckPkgRepos() Finding { return checkPkgRepos(runtime.GOOS, runTool) }
 
-func checkPkgRepos(goos string, run toolRunner) Finding {
-	f := Finding{Check: "pkg-repos"}
+func checkPkgRepos(goos string, run toolRunner) (f Finding) {
+	f.Check = "pkg-repos"
 	if goos != "freebsd" {
 		f.Status = StatusNA
 		f.Detail = "pkg repositories are FreeBSD-only; check not applicable on this platform"
 		return f
 	}
+	certified := false
+	defer func() { scopeTo(&f, certified) }()
 	f.Remediation = "bodega doctor --write-pkg-repo --url <bodega> writes " + pkgrepos.ClientConfPath + " with the bodega repository and the overrides that disable upstream; confirm with pkg -vv"
 	out, err := run("", "pkg", "-vv")
 	switch {
@@ -99,12 +145,14 @@ func checkPkgRepos(goos string, run toolRunner) Finding {
 	}
 	if len(problems) > 0 {
 		f.Status = StatusWarn
-		f.Detail = "pkg -vv: " + strings.Join(problems, "; ") + "; " + toolLimit
+		f.Detail = "pkg -vv: " + strings.Join(problems, "; ")
+		certified = true
 		return f
 	}
 	f.Status = StatusOK
 	f.Remediation = ""
-	f.Detail = "pkg -vv enables only bodega repositories (" + strings.Join(bodega, ", ") + "); " + toolLimit
+	f.Detail = "pkg -vv enables only bodega repositories (" + strings.Join(bodega, ", ") + ")"
+	certified = true
 	return f
 }
 
@@ -154,11 +202,40 @@ func pkgVVRepos(out string) []pkgVVRepo {
 // is not compared, because doctor runs without knowing which URL clients
 // reach bodega at, but FreeBSD's own is never bodega.
 func pkgBodegaURL(raw string) bool {
-	u, err := url.Parse(strings.TrimPrefix(raw, "pkg+"))
-	if err != nil || u.Host == "" || strings.EqualFold(u.Hostname(), "pkg.FreeBSD.org") {
+	raw = strings.TrimPrefix(raw, "pkg+")
+	p, ok := routePath(raw)
+	if !ok {
 		return false
 	}
-	return strings.HasPrefix(u.Path, "/freebsd/") || strings.HasPrefix(u.Path, "/freebsd-profile/")
+	if u, _ := url.Parse(raw); strings.EqualFold(u.Hostname(), "pkg.FreeBSD.org") {
+		return false
+	}
+	return strings.HasPrefix(p, "/freebsd/") || strings.HasPrefix(p, "/freebsd-profile/")
+}
+
+// routePath returns the path of a URL a client appends a file name to, as
+// written, when a request built that way reaches the path it names: an
+// http or https URL, the transports bodega serves, with no query or
+// fragment, since either would carry the appended name out of the path,
+// and no dot segment, which a client may resolve to another route before
+// it sends the request.
+func routePath(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || strings.ContainsAny(raw, "?#") {
+		return "", false
+	}
+	_, rest, _ := strings.Cut(raw, "//")
+	i := strings.IndexByte(rest, '/')
+	if i < 0 {
+		return "", false
+	}
+	p := rest[i:]
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "." || seg == ".." {
+			return "", false
+		}
+	}
+	return p, true
 }
 
 // makeConfSites are the variables clientconf.MakeConf assigns and the route
@@ -196,13 +273,15 @@ const (
 // through bodega, as make computes the fetch sites for a port.
 func CheckMakeConf() Finding { return checkMakeConf(runtime.GOOS, runTool, exists) }
 
-func checkMakeConf(goos string, run toolRunner, present func(string) bool) Finding {
-	f := Finding{Check: "make-conf"}
+func checkMakeConf(goos string, run toolRunner, present func(string) bool) (f Finding) {
+	f.Check = "make-conf"
 	if goos != "freebsd" {
 		f.Status = StatusNA
 		f.Detail = "make.conf is read by FreeBSD's ports framework; check not applicable on this platform"
 		return f
 	}
+	certified := false
+	defer func() { scopeTo(&f, certified) }()
 	names, route := makeConfSites()
 	vars := append(append([]string(nil), names...), distfilesEnvVar, distSubdirVar)
 	f.Remediation = "end /etc/make.conf with the FreeBSD ports lines under Client configuration in docs/usage.md: " +
@@ -290,13 +369,15 @@ func checkMakeConf(goos string, run toolRunner, present func(string) bool) Findi
 	}
 	if len(problems) > 0 {
 		f.Status = StatusWarn
-		f.Detail = "in " + port + ": " + strings.Join(problems, "; ") + "; " + toolLimit
+		f.Detail = "in " + port + ": " + strings.Join(problems, "; ")
+		certified = true
 		return f
 	}
 	f.Status = StatusOK
 	f.Remediation = ""
 	f.Detail = "in " + port + ", make sends " + strings.Join(names, " and ") + " to bodega's distfiles route for environment " +
-		parsed[distfilesEnvVar] + ", both from make -V and at recipe time; " + toolLimit
+		parsed[distfilesEnvVar] + ", both from make -V and at recipe time"
+	certified = true
 	return f
 }
 
@@ -322,10 +403,12 @@ func siteProblems(label string, names []string, vals map[string]string) []string
 }
 
 // distfilesSitesAt reports whether every site in a value make computed is a
-// URL whose path ends at bodega's distfiles route for env and subdir. One
-// site that is not is a fallback do-fetch.sh will try. With DIST_SUBDIR
-// empty the route's two slashes meet, and bsd.port.mk strips one of them
-// from MASTER_SITE_BACKUP, so both forms are the route.
+// URL whose path ends at bodega's distfiles route for env and subdir, so
+// the file name do-fetch.sh appends to it lands in that route. One site
+// that is not is a fallback do-fetch.sh will try. With DIST_SUBDIR empty
+// the route's two slashes meet, and bsd.port.mk strips one of them from
+// MASTER_SITE_BACKUP, so both forms are the route. Any other empty segment
+// means the route text sits inside some other path.
 func distfilesSitesAt(v, env, subdir string) bool {
 	sites := strings.Fields(v)
 	if len(sites) == 0 {
@@ -336,11 +419,16 @@ func distfilesSitesAt(v, env, subdir string) bool {
 		want += subdir + "/"
 	}
 	for _, s := range sites {
-		u, err := url.Parse(s)
-		if err != nil || u.Host == "" {
+		p, ok := routePath(s)
+		if !ok {
 			return false
 		}
-		if !strings.HasSuffix(u.Path, want) && (subdir != "" || !strings.HasSuffix(u.Path, want+"/")) {
+		route := want
+		if subdir == "" && strings.HasSuffix(p, want+"/") {
+			route += "/"
+		}
+		prefix, ok := strings.CutSuffix(p, route)
+		if !ok || slices.Contains(strings.Split(prefix+strings.TrimRight(route, "/"), "/")[1:], "") {
 			return false
 		}
 	}

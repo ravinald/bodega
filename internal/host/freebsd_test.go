@@ -9,7 +9,9 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // writeTree builds a host root holding files.
@@ -126,8 +128,11 @@ func replay(t *testing.T, runs map[string]*toolRun) toolRunner {
 }
 
 // onGuest reports the files the capture host had: a ports tree at
-// /usr/ports holding ports-mgmt/pkg.
-func onGuest(p string) bool { return strings.HasPrefix(p, "/usr/ports/") }
+// /usr/ports holding ports-mgmt/pkg, and the scratch tree R6-V was
+// captured in, whose Mk links to it.
+func onGuest(p string) bool {
+	return strings.HasPrefix(p, "/usr/ports/") || strings.HasPrefix(p, "/tmp/b101-r6v/ports/")
+}
 
 func TestPkgReposAsksPkg(t *testing.T) {
 	t.Run("upstream host", func(t *testing.T) {
@@ -214,6 +219,135 @@ func TestMakeConfAsksMake(t *testing.T) {
 	})
 }
 
+// withSite rewrites what make printed for one site variable in a capture,
+// in both the make -V and the recipe reading.
+func withSite(runs map[string]*toolRun, name, site string) {
+	names, _ := makeConfSites()
+	lines := strings.Split(runs["values"].stdout, "\n")
+	lines[slices.Index(names, name)] = site
+	runs["values"].stdout = strings.Join(lines, "\n")
+	var recipe []string
+	for _, l := range strings.Split(runs["recipe"].stdout, "\n") {
+		if strings.HasPrefix(l, recipeMark+name+"=") {
+			l = recipeMark + name + "=" + site
+		}
+		recipe = append(recipe, l)
+	}
+	runs["recipe"].stdout = strings.Join(recipe, "\n")
+}
+
+// The appended distfile name has to land in bodega's route path, over a
+// transport bodega serves. The negative sites are what make printed on
+// freebsd-client for make.conf values a fetch sends elsewhere: with a query
+// or fragment, fetch-url-list put the file name after the ? or #.
+func TestMakeConfSiteReachesTheRoute(t *testing.T) {
+	cases := []struct {
+		site string
+		want Status
+	}{
+		{"https://bodega.example/distfiles/@unsupported//", StatusOK},
+		{"https://bodega.example/distfiles/@unsupported/", StatusOK},
+		{"http://bodega.example:8080/distfiles/@unsupported/", StatusOK},
+		{"https://bodega.example/bodega/distfiles/@unsupported/", StatusOK},
+		{"https://bodega.example/distfiles/@unsupported/ https://b2.example/distfiles/@unsupported//", StatusOK},
+		{"https://b/distfiles/@unsupported//?mirror=/", StatusWarn},
+		{"https://b/distfiles/@unsupported/?/", StatusWarn},
+		{"https://b/distfiles/@unsupported//#mirror/", StatusWarn},
+		{"ftp://b/distfiles/@unsupported//", StatusWarn},
+		{"file:///distfiles/@unsupported//", StatusWarn},
+		{"/distfiles/@unsupported//", StatusWarn},
+		{"https://b/distfiles/@unsupported/../../x/distfiles/@unsupported/", StatusWarn},
+		{"https://mirror.example/x/https://b/distfiles/@unsupported//", StatusWarn},
+		{"https://b/distfiles/@unsupported///", StatusWarn},
+		{"https://b/distfiles/@other//", StatusWarn},
+	}
+	names, _ := makeConfSites()
+	for _, name := range names {
+		for _, c := range cases {
+			t.Run(name+"="+c.site, func(t *testing.T) {
+				runs := loadToolFixture(t, "bodega-make")
+				withSite(runs, name, c.site)
+				got := checkMakeConf("freebsd", replay(t, runs), onGuest)
+				if c.want == StatusWarn {
+					assertFinding(t, got, StatusWarn, name+"=", toolLimit)
+					return
+				}
+				assertFinding(t, got, StatusOK, toolLimit)
+			})
+		}
+	}
+}
+
+func TestPkgRepoURLReachesTheRoute(t *testing.T) {
+	cases := map[string]Status{
+		"https://b/freebsd/FreeBSD:15:aarch64/latest":             StatusOK,
+		"http://b/freebsd/FreeBSD:15:aarch64/latest":              StatusOK,
+		"pkg+https://b/freebsd/FreeBSD:15:aarch64/latest":         StatusOK,
+		"https://b/freebsd-profile/web/FreeBSD:15:aarch64/latest": StatusOK,
+		"ftp://b/freebsd/FreeBSD:15:aarch64/latest":               StatusWarn,
+		"file:///freebsd/FreeBSD:15:aarch64/latest":               StatusWarn,
+		"https://b/freebsd/FreeBSD:15:aarch64/latest?x=/":         StatusWarn,
+		"https://b/freebsd/FreeBSD:15:aarch64/latest#x":           StatusWarn,
+		"https://b/freebsd/../mirror/latest":                      StatusWarn,
+		"https://m/mirror/?/freebsd/x":                            StatusWarn,
+		"https://pkg.FreeBSD.org/freebsd/x":                       StatusWarn,
+	}
+	for u, want := range cases {
+		t.Run(u, func(t *testing.T) {
+			out := "\nRepositories:\n  bodega: { \n    url             : \"" + u + "\",\n    enabled         : yes,\n  }\n"
+			got := checkPkgRepos("freebsd", func(string, string, ...string) ([]byte, error) { return []byte(out), nil })
+			assertFinding(t, got, want, toolLimit)
+		})
+	}
+}
+
+// Every way either check can return on FreeBSD states the limit of asking
+// the tools, and only a finding drawn from the tools' answer claims to
+// certify anything.
+func TestChecksStateTheirScope(t *testing.T) {
+	fail := func(string, string, ...string) ([]byte, error) { return nil, errors.New("exit status 1: failed") }
+	absent := func(string, string, ...string) ([]byte, error) {
+		return nil, &exec.Error{Name: "tool", Err: exec.ErrNotFound}
+	}
+	failAt := func(label string) toolRunner {
+		runs := loadToolFixture(t, "bodega-make")
+		runs[label].exit = 1
+		return replay(t, runs)
+	}
+	relative := func(stdin, name string, args ...string) ([]byte, error) { return []byte("ports\n"), nil }
+	unmeasured := map[string]Finding{
+		"pkg absent":           checkPkgRepos("freebsd", absent),
+		"pkg failure":          checkPkgRepos("freebsd", fail),
+		"make absent":          checkMakeConf("freebsd", absent, onGuest),
+		"make locator failure": checkMakeConf("freebsd", fail, onGuest),
+		"relative PORTSDIR":    checkMakeConf("freebsd", relative, onGuest),
+		"no ports tree":        checkMakeConf("freebsd", replay(t, loadToolFixture(t, "bodega-make")), func(string) bool { return false }),
+		"no probe port":        checkMakeConf("freebsd", replay(t, loadToolFixture(t, "bodega-make")), func(p string) bool { return strings.HasSuffix(p, "bsd.port.mk") }),
+		"make -V failure":      checkMakeConf("freebsd", failAt("values"), onGuest),
+		"make recipe failure":  checkMakeConf("freebsd", failAt("recipe"), onGuest),
+		"make locator timeout": checkMakeConf("freebsd", func(string, string, ...string) ([]byte, error) {
+			return nil, errors.New("make did not answer within 30s")
+		}, onGuest),
+	}
+	for name, got := range unmeasured {
+		t.Run(name, func(t *testing.T) {
+			assertFinding(t, got, got.Status, toolUnmeasured)
+			if strings.Contains(got.Detail, toolLimit) {
+				t.Errorf("detail claims to certify a configuration it never measured: %s", got.Detail)
+			}
+		})
+	}
+	measured := map[string]Finding{
+		"pkg OK":    checkPkgRepos("freebsd", replay(t, loadToolFixture(t, "bodega-pkg"))),
+		"pkg WARN":  checkPkgRepos("freebsd", replay(t, loadToolFixture(t, "upstream-pkg"))),
+		"make OK":   checkMakeConf("freebsd", replay(t, loadToolFixture(t, "bodega-make")), onGuest),
+		"make WARN": checkMakeConf("freebsd", replay(t, loadToolFixture(t, "upstream-make")), onGuest),
+	}
+	for name, got := range measured {
+		t.Run(name, func(t *testing.T) { assertFinding(t, got, got.Status, toolLimit) })
+	}
+}
+
 // A port with a DIST_SUBDIR of its own, as make printed it for devel/gh
 // under the bodega make.conf on freebsd-client.
 func TestDistfilesSitesAtCarriesDistSubdir(t *testing.T) {
@@ -237,11 +371,10 @@ func TestDistfilesSitesAtCarriesDistSubdir(t *testing.T) {
 //   - R3-L was a false WARN, not a false OK: a client check including a
 //     helper lost track of where its value came from. make prints bodega's
 //     route for it, so asking make answers OK, which is correct.
-//   - R6-V's site depended on the directory make ran in: a relative
-//     .sinclude found other.mk only from the remand's scratch directory.
-//     doctor runs make in the port directory, which is where a port's fetch
-//     runs, so the answer is the fetch's. A make started elsewhere is a fetch
-//     with a different environment, the limit toolLimit states.
+//
+// R6-V's relative .sinclude finds other.mk through make's search of the
+// directory it runs in, so its fixture places other.mk in the probe port of
+// a scratch PORTSDIR whose Mk links to /usr/ports/Mk.
 //
 // R3-J and R7-X are the two where make -V prints bodega's route and a fetch
 // uses the mirror: MAKEFLAGS=-e hands the environment's value back at recipe
@@ -281,6 +414,7 @@ func TestF28RemandsWarn(t *testing.T) {
 		"R5-R-export-all":        mirror,
 		"R5-S":                   mirror,
 		"R6-U":                   mirror,
+		"R6-V":                   mirror,
 		"R7-X":                   "at recipe time: MASTER_SITE_OVERRIDE=" + `"https://mirror.example/"`,
 		"R7-Y":                   mirror,
 		"R8-Z-env-posix-1":       "BODEGA_DISTFILES_ENV is empty",
@@ -328,6 +462,53 @@ func TestRunToolReportsWhatFailed(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "exit status 3: first; second") {
 		t.Errorf("err = %v, want the exit status and stderr on one line", err)
 	}
+}
+
+// A makefile's != assignment runs under sh, whose children hold make's
+// pipes. The timeout has to end the whole tree and return on time, and a
+// child left running after a clean exit is ended too.
+func TestRunToolEndsTheProcessTree(t *testing.T) {
+	pidfile := filepath.Join(t.TempDir(), "pid")
+	gone := func(t *testing.T) {
+		t.Helper()
+		data, err := os.ReadFile(pidfile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+			if syscall.Kill(pid, 0) != nil {
+				return
+			}
+		}
+		t.Errorf("descendant %d still running after runTool returned", pid)
+	}
+
+	t.Run("timeout", func(t *testing.T) {
+		start := time.Now()
+		_, err := runToolWithin(time.Second, "", "sh", "-c", `sleep 40 & echo $! >"$1"; sleep 40; true`, "sh", pidfile)
+		if elapsed := time.Since(start); elapsed > time.Second+toolWaitDelay+time.Second {
+			t.Errorf("returned after %s", elapsed)
+		}
+		if err == nil || !strings.Contains(err.Error(), "sh did not answer within 1s") {
+			t.Errorf("err = %v", err)
+		}
+		gone(t)
+	})
+	t.Run("clean exit", func(t *testing.T) {
+		start := time.Now()
+		out, _ := runToolWithin(time.Minute, "", "sh", "-c", `echo answer; sleep 40 & echo $! >"$1"`, "sh", pidfile)
+		if elapsed := time.Since(start); elapsed > toolWaitDelay+time.Second {
+			t.Errorf("returned after %s", elapsed)
+		}
+		if string(out) != "answer\n" {
+			t.Errorf("stdout = %q", out)
+		}
+		gone(t)
+	})
 }
 
 func TestMakeConfSitesComeFromTheRenderer(t *testing.T) {
