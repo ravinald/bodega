@@ -205,7 +205,9 @@ setup_guest() {
 			"none" "$E2E_OUT" "internal/server/client_setup.sh" "env PATH=$runpath command -v curl"
 	fi
 
-	e2e_put "$g" "$setup_helper_local" "$SETUP_HELPER" && e2e_put "$g" "$setup_tamper_local" "$SETUP_TAMPER" || true
+	if e2e_put "$g" "$setup_helper_local" "$SETUP_HELPER"; then
+		e2e_put "$g" "$setup_tamper_local" "$SETUP_TAMPER" || true
+	fi
 	e2e_on "$g" "sudo -H sh $SETUP_HELPER save && sudo -H sh $SETUP_HELPER state" || true
 	found="$E2E_OUT"
 	check_contains "SETUP-$tag-04" "$g's pip and npm files are saved before the first case" \
