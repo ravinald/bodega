@@ -1,0 +1,16 @@
+@@ portsdir exit=0
+
+@@ portsdir stderr
+make: warning: /usr/obj/: Permission denied
+@@ values exit=0
+https://bodega.example/distfiles/@unsupported//
+https://bodega.example/distfiles/@unsupported/
+unsupported
+
+@@ values stderr
+@@ recipe exit=0
+bodega-doctor:MASTER_SITE_OVERRIDE=https://bodega.example/distfiles/@unsupported//
+bodega-doctor:MASTER_SITE_BACKUP=https://bodega.example/distfiles/@unsupported/
+bodega-doctor:BODEGA_DISTFILES_ENV=unsupported
+bodega-doctor:DIST_SUBDIR=
+@@ recipe stderr

@@ -1,0 +1,4 @@
+@@ pkg exit=1
+@@ pkg stderr
+pkg: invalid url: 
+pkg: Cannot parse configuration file!
