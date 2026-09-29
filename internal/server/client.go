@@ -179,7 +179,9 @@ type planFile struct {
 // the refusal itself when the answer is no: does this host resolve to an
 // identity. It runs before the query or the system name is read, so an
 // unknown address learns the command that admits it and nothing about which
-// values this server accepts.
+// values this server accepts. clientMiddleware asks it first on the served
+// chain, before the router can answer; the handlers ask again for a mux
+// reached without that chain.
 //
 // An unidentified host is refused outright rather than handed the
 // unprofiled plan. The plan names the profile and every path it writes, and
@@ -569,7 +571,7 @@ func (s *Server) writeClientErrorFor(w http.ResponseWriter, r *http.Request, sub
 
 // clientAudit is what a /client/ handler knows about its own response and
 // the router does not: the subject, the host it resolved, and why it
-// refused. clientAuditMiddleware writes the row from it once the response is
+// refused. clientMiddleware writes the row from it once the response is
 // out. A response nothing annotated came from the router itself (a method
 // the route does not take, a path it cannot match, a path it cleaned and
 // redirected), and is recorded all the same.
@@ -588,7 +590,7 @@ func clientAuditOf(r *http.Request) *clientAudit {
 	return n
 }
 
-// noteClient hands the response's audit facts to clientAuditMiddleware. A
+// noteClient hands the response's audit facts to clientMiddleware. A
 // request that did not come through it (a test driving the mux directly)
 // has nowhere to put them, and records nothing.
 func noteClient(r *http.Request, subject string, h *clientHost, denial, reason string) {
@@ -597,37 +599,61 @@ func noteClient(r *http.Request, subject string, h *clientHost, denial, reason s
 	}
 }
 
-// isClientPath reports whether path is one clientAuditMiddleware answers
-// for. It is the raw request path, before the mux cleans it, so /client//plan
-// counts as the /client/ request it was sent as.
+// isClientPath reports whether path is one clientMiddleware answers for. It
+// is the raw request path, before the mux cleans it, so /client//plan counts
+// as the /client/ request it was sent as.
 func isClientPath(path string) bool {
 	return path == "/client" || strings.HasPrefix(path, "/client/")
 }
 
-// clientAuditMiddleware writes one audit row per /client/ response. It sits
-// inside IdentityMiddleware, so the row names the host, and outside the
-// mutation gate and the mux, so their answers are rows too rather than
-// responses that left no trace. The deny list is further out and writes its
-// own row.
+// clientPathSubject is the audit subject for a /client/ response no handler
+// named, taken from the raw path.
+func clientPathSubject(r *http.Request) string {
+	return strings.TrimPrefix(r.URL.Path, "/client/")
+}
+
+// clientMiddleware is the /client/ boundary: it admits the host and writes one
+// audit row per response. It sits inside IdentityMiddleware, so both read the
+// binding that request resolved, and outside the mutation gate and the mux, so
+// an unidentified host gets the admission refusal before either can answer
+// with a bare 403, a 405, a 404 or a redirect, and their answers to an
+// identified host are rows too rather than responses that left no trace. The
+// deny list is further out, refuses with its own repair, and writes its own
+// row.
 //
-// AuditMiddleware cannot do this: it records a 2xx alone and parses a
-// package out of the path, and neither fits a route whose refusals are the
+// AuditMiddleware cannot write these rows: it records a 2xx alone and parses
+// a package out of the path, and neither fits a route whose refusals are the
 // half an operator is looking for.
-func (s *Server) clientAuditMiddleware(next http.Handler) http.Handler {
+func (s *Server) clientMiddleware(next http.Handler) http.Handler {
+	admit := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if identityMatchOf(r).Identity == "" {
+			s.writeClientError(w, r, clientPathSubject(r), http.StatusForbidden, audit.DenialClientUnidentified, unidentifiedText(r))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.auditDB == nil || !isClientPath(r.URL.Path) {
+		if !isClientPath(r.URL.Path) {
 			next.ServeHTTP(w, r)
+			return
+		}
+		if s.auditDB == nil {
+			admit.ServeHTTP(w, r)
 			return
 		}
 		n := &clientAudit{}
 		rec := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
 		r = r.WithContext(context.WithValue(r.Context(), clientAuditKey, n))
-		next.ServeHTTP(rec, r)
+		admit.ServeHTTP(rec, r)
 		if !n.recorded {
 			s.recordClient(r, n, rec.statusCode)
 		}
 	})
 }
+
+// maxClientSubject bounds a /client/ row's name. The longest name a served
+// response carries is plan.txt; anything longer is a caller's path.
+const maxClientSubject = 64
 
 // recordClient writes the audit row for one /client/ response. A served plan
 // or file is a serve_fetch row, which is the row a package download writes,
@@ -641,11 +667,14 @@ func (s *Server) recordClient(r *http.Request, n *clientAudit, status int) {
 	details := map[string]string{}
 	subject, reason := n.subject, n.reason
 	if subject == "" {
-		subject = truncateField(strings.TrimPrefix(r.URL.Path, "/client/"), 64)
+		subject = clientPathSubject(r)
 		reason = fmt.Sprintf("the router answered %d %s before any /client/ handler ran", status, http.StatusText(status))
 		details["method"] = r.Method
 		details["path"] = truncateField(r.URL.Path, maxDetailField)
 	}
+	// A handler's subject is the raw {system} segment, and the admission
+	// refusal's is the raw path: both are whatever an anonymous caller sent.
+	subject = truncateField(subject, maxClientSubject)
 	// The stated os rides in the version column, so one query separates the
 	// FreeBSD hosts' plans from the Linux ones.
 	ev := audit.Event{

@@ -430,3 +430,147 @@ func TestClientEveryResponseIsAuditedOnce(t *testing.T) {
 		})
 	}
 }
+
+// clientDo is clientGet for any method, returning the audit rows the one
+// response wrote.
+func clientDo(t *testing.T, s *Server, token, method, path string) (*httptest.ResponseRecorder, []audit.StoredEvent) {
+	t.Helper()
+	req := httptest.NewRequest(method, path, nil)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	rows, err := s.auditDB.Query(context.Background(), audit.Filter{})
+	if err != nil {
+		t.Fatalf("query audit: %v", err)
+	}
+	var out []audit.StoredEvent
+	for _, row := range rows {
+		if row.EventType == audit.EventServeFetch || row.EventType == audit.EventDenied {
+			out = append(out, row)
+		}
+	}
+	return rec, out
+}
+
+// Admission is decided before the mutation gate and the router, so no
+// response they give first can stand in for the command that admits the host.
+func TestClientAdmissionPrecedesTheRouter(t *testing.T) {
+	for _, c := range []struct{ method, path string }{
+		{http.MethodGet, "/client/plan?os=linux"},
+		{http.MethodGet, "/client/plan.txt?os=linux"},
+		{http.MethodGet, "/client/pypi?os=linux"},
+		{http.MethodGet, "/client/plan/?os=linux"},
+		{http.MethodGet, "/client//plan?os=linux"},
+		{http.MethodGet, "/client/"},
+		{http.MethodGet, "/client"},
+		{http.MethodOptions, "/client/plan?os=linux"},
+		{http.MethodHead, "/client/plan?os=linux"},
+		{http.MethodPost, "/client/plan?os=linux"},
+		{http.MethodDelete, "/client/pypi?os=linux"},
+	} {
+		t.Run(c.method+c.path, func(t *testing.T) {
+			s := hostedServer(t)
+			rec, rows := clientDo(t, s, "", c.method, c.path)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403: %q", rec.Code, rec.Body.String())
+			}
+			if c.method != http.MethodHead && !strings.Contains(rec.Body.String(), "bodega identity bind cidr 192.0.2.1/32") {
+				t.Errorf("the refusal does not name the binding that admits this host:\n%s", rec.Body.String())
+			}
+			if len(rows) != 1 || rows[0].Status != audit.DenialClientUnidentified {
+				t.Errorf("audit rows = %+v, want one client_unidentified denial", rows)
+			}
+		})
+	}
+}
+
+// An identified host still sees what the router says about a request it
+// cannot serve.
+func TestClientRouterAnswersAnIdentifiedHost(t *testing.T) {
+	for _, c := range []struct {
+		method, path string
+		want         int
+	}{
+		{http.MethodGet, "/client/plan/?os=linux", http.StatusNotFound},
+		{http.MethodGet, "/client//plan?os=linux", http.StatusTemporaryRedirect},
+		{http.MethodOptions, "/client/plan?os=linux", http.StatusMethodNotAllowed},
+		{http.MethodGet, "/client/plan", http.StatusBadRequest},
+	} {
+		t.Run(c.method+c.path, func(t *testing.T) {
+			s := hostedServer(t)
+			f := clientProfile(t, s)
+			rec, rows := clientDo(t, s, f.token, c.method, c.path)
+			if rec.Code != c.want {
+				t.Errorf("status = %d, want %d: %q", rec.Code, c.want, rec.Body.String())
+			}
+			if len(rows) != 1 {
+				t.Errorf("audit rows = %d, want 1: %+v", len(rows), rows)
+			}
+		})
+	}
+}
+
+// The deny list answers before identity is resolved, and on /client/ says
+// which entry refused the host and the command that removes it.
+func TestClientDenyListNamesTheACLCommand(t *testing.T) {
+	for _, path := range []string{"/client/plan?os=linux", "/client/plan.txt?os=linux", "/client/pypi?os=linux"} {
+		t.Run(path, func(t *testing.T) {
+			s := hostedServer(t)
+			f := clientProfile(t, s)
+			if _, err := s.auditDB.SeedACL(context.Background(), audit.ACLDeny, []string{"192.0.2.0/24"}, ""); err != nil {
+				t.Fatalf("add deny entry: %v", err)
+			}
+			s.refreshACLs(context.Background())
+			for _, token := range []string{"", f.token} {
+				rec, _ := clientDo(t, s, token, http.MethodGet, path)
+				if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "bodega acl deny remove 192.0.2.0/24") {
+					t.Errorf("token=%t: status=%d body=%q; want 403 naming the deny entry", token != "", rec.Code, rec.Body.String())
+				}
+			}
+			rows, err := s.auditDB.Query(context.Background(), audit.Filter{EventType: audit.EventDenied})
+			if err != nil {
+				t.Fatalf("query denials: %v", err)
+			}
+			if len(rows) != 2 || rows[0].Status != audit.DenialDenyList || rows[1].Status != audit.DenialDenyList {
+				t.Errorf("denial rows = %+v, want one deny_list row per request", rows)
+			}
+		})
+	}
+}
+
+// The subject a row records is whatever the caller put in the path, so it is
+// bounded whether a handler or the admission refusal supplied it.
+func TestClientAuditSubjectIsBounded(t *testing.T) {
+	long := strings.Repeat("x", 65536)
+	for _, bound := range []bool{false, true} {
+		t.Run(fmt.Sprintf("identified=%t", bound), func(t *testing.T) {
+			s := hostedServer(t)
+			token := ""
+			if bound {
+				token = clientProfile(t, s).token
+			}
+			rec, rows := clientDo(t, s, token, http.MethodGet, "/client/"+long+"?os=linux")
+			want := http.StatusForbidden
+			if bound {
+				want = http.StatusNotFound
+			}
+			if rec.Code != want {
+				t.Errorf("status = %d, want %d", rec.Code, want)
+			}
+			if len(rows) != 1 {
+				t.Fatalf("audit rows = %d, want 1", len(rows))
+			}
+			if n := len(rows[0].PkgName); n > maxClientSubject+len("…") {
+				t.Errorf("pkg_name is %d bytes, want at most %d", n, maxClientSubject+len("…"))
+			}
+		})
+	}
+	s := hostedServer(t)
+	f := clientProfile(t, s)
+	_, rows := clientDo(t, s, f.token, http.MethodGet, "/client/distfiles?os=freebsd")
+	if len(rows) != 1 || rows[0].PkgName != "distfiles" {
+		t.Errorf("a known system name must reach the row intact: %+v", rows)
+	}
+}
