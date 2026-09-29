@@ -1169,11 +1169,14 @@ func aliasPrep(t *testing.T, hint, source, target string) []string {
 		t.Fatalf("hint %q carries no ln -sT alias preparation", hint)
 	}
 	cmd = strings.TrimSuffix(cmd, aliasBindSource+" && mkdir "+aliasBindTarget) + shellQuote(source) + " && mkdir " + shellQuote(target)
+	// ln first: gnuLn skips outside Linux, where the hint never appears, and
+	// a host without bash is one of those.
+	ln := gnuLn(t)
 	bash, err := exec.LookPath("bash")
 	if err != nil {
 		t.Fatal("the alias is a shell command, and this test needs bash to run it:", err)
 	}
-	return []string{bash, "-c", shellQuote(gnuLn(t)) + " -sT " + cmd}
+	return []string{bash, "-c", shellQuote(ln) + " -sT " + cmd}
 }
 
 // gnuLn finds an ln with -T, which GNU and uutils coreutils have and the BSD
