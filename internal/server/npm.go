@@ -294,6 +294,9 @@ func npmPackumentFromManifest(pkgName, base string, pm *manifest.PackageManifest
 		if deps := npmDependencyMap(ve.Dependencies); len(deps) > 0 {
 			entry["dependencies"] = deps
 		}
+		if len(ve.NpmBin) > 0 {
+			entry["bin"] = ve.NpmBin
+		}
 		if desc := firstNonEmpty(ve.Description, pm.Description); desc != "" {
 			entry["description"] = desc
 		}

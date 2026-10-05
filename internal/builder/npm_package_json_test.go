@@ -52,12 +52,13 @@ func writeTGZ(t *testing.T, body []byte) string {
 	return path
 }
 
-func TestReadNpmDependenciesReadsTheRootPackageJSON(t *testing.T) {
+func TestReadNpmPackageJSONReadsTheRootPackageJSON(t *testing.T) {
 	path := writeTGZ(t, npmPackageTGZ(t, `{"name":"color-convert","version":"2.0.1",
 		"dependencies":{"color-name":"~1.1.4","ansi-styles":"^4.0.0"},
 		"devDependencies":{"xo":"^0.24.0"}}`))
 
-	deps, err := readNpmDependencies(path)
+	pj, err := readNpmPackageJSON(path)
+	deps := pj.Dependencies
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -81,7 +82,7 @@ func TestReadNpmDependenciesReadsTheRootPackageJSON(t *testing.T) {
 // A package declaring none is not the same as a tarball carrying no
 // package.json: the first is a leaf, the second is an archive nobody can read
 // a declaration out of. Both record nothing, and only the second is a sentinel.
-func TestReadNpmDependenciesDistinguishesItsFailures(t *testing.T) {
+func TestReadNpmPackageJSONDistinguishesItsFailures(t *testing.T) {
 	cases := []struct {
 		name    string
 		body    []byte
@@ -113,7 +114,8 @@ func TestReadNpmDependenciesDistinguishesItsFailures(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			deps, err := readNpmDependencies(writeTGZ(t, tc.body))
+			pj, err := readNpmPackageJSON(writeTGZ(t, tc.body))
+			deps := pj.Dependencies
 			if tc.want == nil {
 				if err != nil {
 					t.Fatalf("read: %v", err)
@@ -134,8 +136,8 @@ func TestReadNpmDependenciesDistinguishesItsFailures(t *testing.T) {
 // Read leniently it would record no dependencies for a truncated download and
 // publish a package whose install cannot work, which is the shape of failure
 // this whole path exists to end.
-func TestReadNpmDependenciesRefusesBytesThatAreNotATarball(t *testing.T) {
-	if _, err := readNpmDependencies(writeTGZ(t, []byte("not a tarball"))); err == nil {
+func TestReadNpmPackageJSONRefusesBytesThatAreNotATarball(t *testing.T) {
+	if _, err := readNpmPackageJSON(writeTGZ(t, []byte("not a tarball"))); err == nil {
 		t.Error("bytes that are not a gzip stream read as a package with no dependencies")
 	}
 }
@@ -143,15 +145,86 @@ func TestReadNpmDependenciesRefusesBytesThatAreNotATarball(t *testing.T) {
 // The ceiling is on the read, not on a length the archive declares. A tar
 // header is attacker-controlled, so a member claiming to be small and
 // streaming forever has to stop at the cap.
-func TestReadNpmDependenciesStopsAtTheByteCeiling(t *testing.T) {
+func TestReadNpmPackageJSONStopsAtTheByteCeiling(t *testing.T) {
 	padding := make([]byte, npmPackageJSONMaxBytes+1)
 	for i := range padding {
 		padding[i] = 'x'
 	}
 	body := `{"name":"huge","_pad":"` + string(padding) + `"}`
 
-	_, err := readNpmDependencies(writeTGZ(t, npmPackageTGZ(t, body)))
+	_, err := readNpmPackageJSON(writeTGZ(t, npmPackageTGZ(t, body)))
 	if !errors.Is(err, errNpmPackageJSONUnparseable) {
 		t.Errorf("err = %v, want %v for a package.json over the ceiling", err, errNpmPackageJSONUnparseable)
+	}
+}
+
+// npm links executables from the packument's bin, so the read has to turn both
+// package.json spellings into the one map the packument publishes. The string
+// form names its command after the unscoped basename, as npm does: a scoped
+// package with "bin": "./cli.js" installs a command called "cli", not "@acme/cli".
+func TestReadNpmPackageJSONRecordsBin(t *testing.T) {
+	cases := []struct {
+		name        string
+		packageJSON string
+		want        map[string]string
+		wantDropped int
+	}{
+		{
+			name:        "the string form",
+			packageJSON: `{"name":"@acme/cli","version":"1.0.0","bin":"./bin/cli.cjs"}`,
+			want:        map[string]string{"cli": "./bin/cli.cjs"},
+		},
+		{
+			name:        "the object form, kept as written",
+			packageJSON: `{"name":"prettier","version":"3.9.9","bin":{"prettier":"./bin/prettier.cjs","pretty":"bin/p.js"}}`,
+			want:        map[string]string{"prettier": "./bin/prettier.cjs", "pretty": "bin/p.js"},
+		},
+		{
+			name: "unsafe entries dropped, the rest kept",
+			packageJSON: `{"name":"evil","version":"1.0.0","bin":{
+				"ok":"./bin/ok.js",
+				"../escape":"./bin/a.js",
+				"win\\escape":"./bin/b.js",
+				"abs":"/usr/bin/env",
+				"winabs":"C:\\tools\\x.exe",
+				"climb":"./bin/../../outside.js",
+				"winclimb":"bin\\..\\..\\outside.js"}}`,
+			want:        map[string]string{"ok": "./bin/ok.js"},
+			wantDropped: 6,
+		},
+		{
+			name:        "a member that is not a string",
+			packageJSON: `{"name":"odd","version":"1.0.0","bin":{"ok":"./ok.js","num":7}}`,
+			want:        map[string]string{"ok": "./ok.js"},
+			wantDropped: 1,
+		},
+		{
+			name:        "a bin that is neither form",
+			packageJSON: `{"name":"odd","version":"1.0.0","bin":["./ok.js"],"dependencies":{"a":"1"}}`,
+			wantDropped: 1,
+		},
+		{
+			name:        "no bin",
+			packageJSON: `{"name":"left-pad","version":"1.3.0"}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pj, err := readNpmPackageJSON(writeTGZ(t, npmPackageTGZ(t, tc.packageJSON)))
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			if len(pj.Bin) != len(tc.want) {
+				t.Errorf("bin = %v, want %v", pj.Bin, tc.want)
+			}
+			for cmd, path := range tc.want {
+				if pj.Bin[cmd] != path {
+					t.Errorf("bin[%q] = %q, want %q", cmd, pj.Bin[cmd], path)
+				}
+			}
+			if len(pj.DroppedBin) != tc.wantDropped {
+				t.Errorf("dropped = %q, want %d entries", pj.DroppedBin, tc.wantDropped)
+			}
+		})
 	}
 }

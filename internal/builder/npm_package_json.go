@@ -34,8 +34,24 @@ var errNpmPackageJSONMissing = errors.New("the tarball holds no package.json at 
 // the package's author.
 var errNpmPackageJSONUnparseable = errors.New("the package.json in the tarball is not a JSON object this can read")
 
-// readNpmDependencies reads the runtime dependencies a published tarball
-// declares, from package/package.json inside it.
+// npmPackageJSON is what a fetch records out of a published tarball's root
+// package.json.
+type npmPackageJSON struct {
+	Dependencies []manifest.Dependency
+
+	// Bin maps a command name to the path npm links it to. npm links
+	// executables from the packument's bin, never from the unpacked
+	// package.json, so a version published without it installs with nothing
+	// in node_modules/.bin.
+	Bin map[string]string
+
+	// DroppedBin names each bin entry refused by npmBinUnsafe, one line apiece,
+	// for the caller to report against the package and version it knows.
+	DroppedBin []string
+}
+
+// readNpmPackageJSON reads the runtime dependencies and executables a
+// published tarball declares, from package/package.json inside it.
 //
 // Runtime only. devDependencies are the author's build inputs and npm does not
 // install them for a consumer, so publishing them would have every hosted
@@ -46,18 +62,18 @@ var errNpmPackageJSONUnparseable = errors.New("the package.json in the tarball i
 // Root-level only: a package may vendor a bundled dependency with a
 // package.json of its own, and a bundled package's dependencies are not the
 // archive's.
-func readNpmDependencies(tgzPath string) ([]manifest.Dependency, error) {
+func readNpmPackageJSON(tgzPath string) (npmPackageJSON, error) {
 	base := filepath.Base(tgzPath)
 
 	f, err := os.Open(tgzPath) //nolint:gosec // the path is the fetch's own destination
 	if err != nil {
-		return nil, err
+		return npmPackageJSON{}, err
 	}
 	defer func() { _ = f.Close() }()
 
 	gz, err := gzip.NewReader(f)
 	if err != nil {
-		return nil, fmt.Errorf("%s is not a gzip stream: %w", base, err)
+		return npmPackageJSON{}, fmt.Errorf("%s is not a gzip stream: %w", base, err)
 	}
 	defer func() { _ = gz.Close() }()
 
@@ -65,10 +81,10 @@ func readNpmDependencies(tgzPath string) ([]manifest.Dependency, error) {
 	for {
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
-			return nil, fmt.Errorf("%s: %w", base, errNpmPackageJSONMissing)
+			return npmPackageJSON{}, fmt.Errorf("%s: %w", base, errNpmPackageJSONMissing)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("%s: reading the archive: %w", base, err)
+			return npmPackageJSON{}, fmt.Errorf("%s: reading the archive: %w", base, err)
 		}
 		if hdr.Typeflag != tar.TypeReg || !isRootPackageJSON(hdr.Name) {
 			continue
@@ -76,20 +92,27 @@ func readNpmDependencies(tgzPath string) ([]manifest.Dependency, error) {
 
 		data, err := io.ReadAll(io.LimitReader(tr, npmPackageJSONMaxBytes+1))
 		if err != nil {
-			return nil, fmt.Errorf("%s: reading package.json: %w", base, err)
+			return npmPackageJSON{}, fmt.Errorf("%s: reading package.json: %w", base, err)
 		}
 		if len(data) > npmPackageJSONMaxBytes {
-			return nil, fmt.Errorf("%s: package.json is over %d bytes: %w",
+			return npmPackageJSON{}, fmt.Errorf("%s: package.json is over %d bytes: %w",
 				base, npmPackageJSONMaxBytes, errNpmPackageJSONUnparseable)
 		}
 
 		var doc struct {
+			Name         string            `json:"name"`
 			Dependencies map[string]string `json:"dependencies"`
+			Bin          json.RawMessage   `json:"bin"`
 		}
 		if err := json.Unmarshal(data, &doc); err != nil {
-			return nil, fmt.Errorf("%s: %w (%v)", base, errNpmPackageJSONUnparseable, err)
+			return npmPackageJSON{}, fmt.Errorf("%s: %w (%v)", base, errNpmPackageJSONUnparseable, err)
 		}
-		return npmDependencyList(doc.Dependencies), nil
+		bin, dropped := npmBinMap(doc.Name, doc.Bin)
+		return npmPackageJSON{
+			Dependencies: npmDependencyList(doc.Dependencies),
+			Bin:          bin,
+			DroppedBin:   dropped,
+		}, nil
 	}
 }
 
@@ -111,6 +134,85 @@ func npmDependencyList(deps map[string]string) []manifest.Dependency {
 		out = append(out, manifest.Dependency{Name: name, Req: deps[name]})
 	}
 	return out
+}
+
+// npmBinMap normalizes a package.json bin into the command-to-path map npm
+// links from. The string form is one command named for the package's unscoped
+// basename, which is how npm reads it; the object form is kept as written.
+//
+// A bin that is neither form, or an object member that is not a string, is
+// dropped and reported rather than failing the read: the dependency record and
+// the bytes are still good, and an unreadable bin is a package with no
+// executables, not one npm cannot install.
+func npmBinMap(pkgName string, raw json.RawMessage) (map[string]string, []string) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+
+	var entries map[string]json.RawMessage
+	var single string
+	switch {
+	case json.Unmarshal(raw, &single) == nil:
+		cmd := pkgName
+		if idx := strings.LastIndex(cmd, "/"); idx >= 0 {
+			cmd = cmd[idx+1:]
+		}
+		quoted, _ := json.Marshal(single)
+		entries = map[string]json.RawMessage{cmd: quoted}
+	case json.Unmarshal(raw, &entries) == nil:
+	default:
+		return nil, []string{fmt.Sprintf("bin %s: neither a string nor an object", raw)}
+	}
+
+	cmds := make([]string, 0, len(entries))
+	for cmd := range entries {
+		cmds = append(cmds, cmd)
+	}
+	sort.Strings(cmds)
+
+	var bin map[string]string
+	var dropped []string
+	for _, cmd := range cmds {
+		var path string
+		if err := json.Unmarshal(entries[cmd], &path); err != nil {
+			dropped = append(dropped, fmt.Sprintf("bin %q: %s is not a string path", cmd, entries[cmd]))
+			continue
+		}
+		if why := npmBinUnsafe(cmd, path); why != "" {
+			dropped = append(dropped, fmt.Sprintf("bin %q -> %q: %s", cmd, path, why))
+			continue
+		}
+		if bin == nil {
+			bin = map[string]string{}
+		}
+		bin[cmd] = path
+	}
+	return bin, dropped
+}
+
+// npmBinUnsafe says why a bin entry cannot be published, or "" when it can.
+// npm links node_modules/.bin/<cmd> to <package dir>/<path>, so a command name
+// carrying a separator writes outside .bin and a path that is absolute or
+// climbs with .. links to a file the package does not contain. Both separators
+// are refused because the installing host may be Windows, whoever fetched it.
+func npmBinUnsafe(cmd, path string) string {
+	switch {
+	case cmd == "":
+		return "empty command name"
+	case strings.ContainsAny(cmd, `/\`):
+		return "command name contains a path separator"
+	case path == "":
+		return "empty path"
+	case strings.HasPrefix(path, "/") || strings.HasPrefix(path, `\`) ||
+		(len(path) >= 2 && path[1] == ':'):
+		return "path is absolute"
+	}
+	for _, seg := range strings.FieldsFunc(path, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if seg == ".." {
+			return "path contains a .. segment"
+		}
+	}
+	return ""
 }
 
 // isRootPackageJSON reports whether a tar entry is the published package's own

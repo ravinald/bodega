@@ -231,11 +231,17 @@ func FetchNpm(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 				// and then fail to require, and reporting that fetch as a
 				// success is what put the defect in a consumer's build rather
 				// than in this output.
-				deps, depErr := readNpmDependencies(dest)
+				pj, depErr := readNpmPackageJSON(dest)
 				switch {
 				case depErr == nil:
-					if len(deps) > 0 {
-						_, _ = fmt.Fprintf(out, "  [npm] %s@%s: recorded %d dependencies\n", pm.Name, fetchVe.Version, len(deps))
+					if len(pj.Dependencies) > 0 {
+						_, _ = fmt.Fprintf(out, "  [npm] %s@%s: recorded %d dependencies\n", pm.Name, fetchVe.Version, len(pj.Dependencies))
+					}
+					if len(pj.Bin) > 0 {
+						_, _ = fmt.Fprintf(out, "  [npm] %s@%s: recorded %d executables\n", pm.Name, fetchVe.Version, len(pj.Bin))
+					}
+					for _, d := range pj.DroppedBin {
+						_, _ = fmt.Fprintf(out, "  [npm] %s@%s: WARNING: dropped %s\n", pm.Name, fetchVe.Version, d)
 					}
 				case errors.Is(depErr, errNpmPackageJSONMissing):
 					_, _ = fmt.Fprintf(out, "  [npm] %s@%s: no package.json in the tarball, recording no dependencies\n", pm.Name, fetchVe.Version)
@@ -249,7 +255,8 @@ func FetchNpm(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 				if result.Err == nil {
 					_, _ = fmt.Fprintf(out, "  [npm] %s@%s: ok\n", pm.Name, fetchVe.Version)
 					cfg.StampNpmEntry(store, name, ve)
-					stampFetchRecord(context.Background(), store, manifest.TypeNpm, name, ve, dest, computed, deps)
+					stampFetchRecord(context.Background(), store, manifest.TypeNpm, name, ve, dest, computed, pj.Dependencies)
+					stampNpmBin(context.Background(), store, name, ve, pj.Bin)
 				}
 			}
 
@@ -270,8 +277,8 @@ func FetchNpm(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 	return summary
 }
 
-// backfillNpmRecord fills in a dependency list or an artifact digest the entry
-// is missing, from a tarball already on disk.
+// backfillNpmRecord fills in a dependency list, an executable map or an
+// artifact digest the entry is missing, from a tarball already on disk.
 //
 // The record lives in the manifest and the bytes live on the filesystem, so
 // the two part company: re-importing a manifest onto a host that already holds
@@ -284,7 +291,7 @@ func FetchNpm(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 // left as it is, so this cannot overwrite a value an operator pinned.
 func backfillNpmRecord(ctx context.Context, cfg *Config, store *manifest.Store, name string,
 	ve manifest.VersionEntry, tarball string) {
-	if len(ve.Dependencies) > 0 && ve.ArtifactDigest != "" {
+	if len(ve.Dependencies) > 0 && len(ve.NpmBin) > 0 && ve.ArtifactDigest != "" {
 		return
 	}
 	if !fileExists(tarball) {
@@ -292,11 +299,20 @@ func backfillNpmRecord(ctx context.Context, cfg *Config, store *manifest.Store, 
 	}
 
 	var deps []manifest.Dependency
-	if len(ve.Dependencies) == 0 {
-		d, err := readNpmDependencies(tarball)
+	var bin map[string]string
+	if len(ve.Dependencies) == 0 || len(ve.NpmBin) == 0 {
+		pj, err := readNpmPackageJSON(tarball)
 		switch {
 		case err == nil:
-			deps = d
+			if len(ve.Dependencies) == 0 {
+				deps = pj.Dependencies
+			}
+			if len(ve.NpmBin) == 0 {
+				bin = pj.Bin
+				for _, d := range pj.DroppedBin {
+					cfg.logf("  [npm] %s@%s: WARNING: dropped %s", name, ve.Version, d)
+				}
+			}
 		case errors.Is(err, errNpmPackageJSONMissing):
 		default:
 			// A warning rather than a failure: this is a repair of a record,
@@ -312,11 +328,27 @@ func backfillNpmRecord(ctx context.Context, cfg *Config, store *manifest.Store, 
 			digest = computed
 		}
 	}
+	if len(bin) > 0 {
+		cfg.logf("  [npm] %s@%s: recorded %d executables from the stored tarball", name, ve.Version, len(bin))
+		stampNpmBin(ctx, store, name, ve, bin)
+	}
 	if len(deps) == 0 && digest == ve.ArtifactDigest {
 		return
 	}
 	cfg.logf("  [npm] %s@%s: recorded %d dependencies from the stored tarball", name, ve.Version, len(deps))
 	stampFetchRecord(ctx, store, manifest.TypeNpm, name, ve, tarball, digest, deps)
+}
+
+// stampNpmBin records the executables a fetch read out of a version's
+// package.json. A version declaring none leaves the field as it was, the same
+// rule stampFetchRecord applies to dependencies.
+func stampNpmBin(ctx context.Context, store *manifest.Store, name string, targetVE manifest.VersionEntry, bin map[string]string) {
+	if len(bin) == 0 {
+		return
+	}
+	updateVersionEntry(ctx, store, manifest.TypeNpm, name, targetVE, func(ve *manifest.VersionEntry) {
+		ve.NpmBin = bin
+	})
 }
 
 // NpmArtifactPaths returns local/S3 path pairs for upload.
