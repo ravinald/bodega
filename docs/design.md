@@ -251,11 +251,11 @@ A policy entry with `version_constraint: "any"` displayed as `python3@*` allows 
 
 The `dep_policy` on a PackageManifest controls automatic dependency creation:
 
-- **"none"** (default): no auto-discovery
+- **"none"** (default, and what an unset value means): scan and report, import nothing
 - **"direct"**: immediate dependencies only
-- **"transitive"**: full recursive closure
+- **"transitive"**: full recursive closure on apt; on git, the same as `"direct"`
 
-When you fetch a git entry with `dep_policy: "direct"`, bodega scans the source for dependency files (requirements.txt, go.mod, package.json) and creates manifest entries for immediate dependencies. Transitive dependencies are discovered recursively.
+Every git fetch scans the source for dependency files (requirements.txt, go.mod, package.json). Under `"none"` it prints how many dependencies it found and which `dep_policy` would import them, and creates no entries. Under `"direct"` or `"transitive"` it creates a manifest entry for each immediate dependency, with `required_by` naming the git entry. git has no recursive discovery: neither value follows a dependency's own dependencies. Any other value fails that entry's fetch before it clones, naming the entry and the accepted values.
 
 ## Serve modes
 
