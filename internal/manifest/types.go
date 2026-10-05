@@ -306,6 +306,13 @@ type VersionEntry struct {
 	// nothing here until the next fetch runs.
 	Dependencies []Dependency `json:"dependencies,omitempty"`
 
+	// NpmBin maps each command an npm version installs to its path inside the
+	// package, read from the tarball's package.json at fetch and published as
+	// the packument's bin. npm links executables from the packument alone, so
+	// a version missing this installs with nothing in node_modules/.bin. Empty
+	// carries the same meaning as an empty Dependencies.
+	NpmBin map[string]string `json:"npm_bin,omitempty"`
+
 	// ArtifactDigest is the lowercase hex sha256 of the bytes the fetch stage
 	// stored. Checksum is what upstream or the operator declared this version
 	// should be; this is what bodega actually has.

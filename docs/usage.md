@@ -3316,6 +3316,17 @@ Every key but `platform` is omitted when empty, so an entry stamped on a host wi
 
 The fetch opens the `.tgz` and reads `version:` from the `Chart.yaml` at its root. An archive declaring a release other than the entry's `version` fails the fetch and is deleted rather than stored, because the archive filename, the `index.yaml` entry and the `/helm/charts/` object key are all rendered from the entry: a `version` and a `url` naming different releases would otherwise publish a chart that looks right by every name bodega prints and holds another release's templates. An entry naming no version pins nothing and is not checked. `appVersion` is still the manifest's word and is not read back from the chart.
 
+### Npm-specific fields
+
+```json
+{
+  "version": "3.9.9",
+  "npm_bin": { "prettier": "./bin/prettier.cjs" }
+}
+```
+
+- **npm_bin**: map from command name to its path inside the package, recorded at fetch from the `bin` in the tarball's root `package.json` and published as the version's `bin` in the generated packument. npm links `node_modules/.bin` from the packument alone, so a version without it installs with no command to run. The string form of `bin` is recorded as one command named for the package's unscoped basename (`@acme/cli` with `"bin": "./cli.js"` records `cli`); the object form is kept as written. An entry whose command name contains `/` or `\`, or whose path is absolute or contains a `..` segment, is dropped with a warning naming the package, version and entry, and the rest are kept. A version fetched before the field existed is filled from its stored tarball on the next `bodega build fetch`; a recorded map is never overwritten.
+
 ### Pypi-specific fields
 
 ```json

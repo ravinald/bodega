@@ -121,3 +121,51 @@ func TestIntegrityIsOmittedWhenTheTwoRecordsDisagree(t *testing.T) {
 		t.Errorf("the version left the packument: %s", body)
 	}
 }
+
+// B108: npm links a package's executables from the packument's bin, never
+// from the package.json it unpacks, so a hosted CLI published without it
+// installs with nothing in node_modules/.bin. The recorded map is the bin,
+// and a version recording none omits the key, as dependencies does.
+func TestPackumentPublishesRecordedBin(t *testing.T) {
+	cases := []struct {
+		name string
+		bin  map[string]string
+	}{
+		{name: "recorded from the string form", bin: map[string]string{"prettier": "./bin/prettier.cjs"}},
+		{name: "recorded from the object form", bin: map[string]string{"a": "./a.js", "b": "bin/b.js"}},
+		{name: "unsafe entries already dropped at fetch", bin: map[string]string{"ok": "./bin/ok.js"}},
+		{name: "none recorded"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := hostedServer(t)
+			ve := sha256Entry("1.3.0", leftPadTarball)
+			ve.NpmBin = tc.bin
+			addVersion(t, s, manifest.TypeNpm, "left-pad", ve)
+			seed(t, s, manifest.TypeNpm, map[string]string{
+				manifest.NpmTarballKey("left-pad", "1.3.0"): leftPadTarball,
+			})
+
+			status, body := getStatusAndBody(t, s, "/npm/left-pad")
+			if status != http.StatusOK {
+				t.Fatalf("GET /npm/left-pad = %d, want 200: %s", status, body)
+			}
+			got, present := npmVersionDoc(t, body, "1.3.0")["bin"]
+			if len(tc.bin) == 0 {
+				if present {
+					t.Errorf("a version recording no executables published bin anyway: %s", body)
+				}
+				return
+			}
+			bin, ok := got.(map[string]any)
+			if !ok || len(bin) != len(tc.bin) {
+				t.Fatalf("bin = %v, want %v", got, tc.bin)
+			}
+			for cmd, path := range tc.bin {
+				if bin[cmd] != path {
+					t.Errorf("bin[%q] = %v, want %q", cmd, bin[cmd], path)
+				}
+			}
+		})
+	}
+}
