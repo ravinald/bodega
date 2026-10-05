@@ -121,8 +121,10 @@ type PackageManifest struct {
 	Description string `json:"description,omitempty"`
 
 	// DepPolicy controls automatic dependency creation for this package.
-	// "none" (default/empty): no auto-discovery. "direct": immediate deps only.
-	// "transitive": full recursive closure.
+	// "none" (default/empty): create nothing; a git fetch still scans and
+	// reports what it found. "direct": immediate deps only. "transitive": full
+	// recursive closure on apt; git has no recursion, so it imports the same
+	// immediate set as "direct".
 	DepPolicy string `json:"dep_policy,omitempty"`
 
 	// StoragePolicy names the backend this package's NEXT version should be
