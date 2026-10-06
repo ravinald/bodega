@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -135,6 +136,13 @@ func FetchGit(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 				cfg.logf("  [git] %s: SKIPPED (frozen)", name)
 				continue
 			}
+			importDeps, err := GitImportsDeps(name, pm.DepPolicy)
+			if err != nil {
+				cfg.logf("  [git] %s: ERROR: %v", name, err)
+				summary.Failures++
+				summary.Results = append(summary.Results, Result{Type: manifest.TypeGit, Name: name, Err: err})
+				continue
+			}
 			if err := cfg.EnforcePolicy(ctx, manifest.TypeGit, name, ve.Ref, ve.URL); err != nil {
 				cfg.logf("  [git] %s: BLOCKED by policy: %v", name, err)
 				summary.Failures++
@@ -259,17 +267,26 @@ func FetchGit(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 
 				discovery := ScanDeps(cfg, store, name, ve, out)
 				cfg.LastDiscovery = &discovery
-				if cfg.AutoImportDeps {
+				newCount := 0
+				for _, d := range discovery.Deps {
+					if !d.Exists {
+						newCount++
+					}
+				}
+				switch {
+				case importDeps && cfg.AutoImportDeps:
 					ImportDeps(ctx, store, name, ve, discovery.Deps, out)
 					// Fetch descriptions for newly imported deps.
 					DiscoverDescriptions(store, out)
-				} else if len(discovery.Deps) > 0 {
-					newCount := 0
-					for _, d := range discovery.Deps {
-						if !d.Exists {
-							newCount++
+				case !importDeps:
+					if len(discovery.Deps) > 0 {
+						policy := "unset"
+						if pm.DepPolicy != "" {
+							policy = strconv.Quote(pm.DepPolicy)
 						}
+						_, _ = fmt.Fprintf(out, "    %d dependencies found (%d new), none imported: dep_policy is %s; \"direct\" or \"transitive\" would import them\n", len(discovery.Deps), newCount, policy)
 					}
+				default:
 					if newCount > 0 {
 						_, _ = fmt.Fprintf(out, "    %d new dependencies discovered (auto-import disabled, review pending)\n", newCount)
 					}
@@ -292,6 +309,20 @@ func FetchGit(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 	}
 
 	return summary
+}
+
+// GitImportsDeps reports whether a git entry's dep_policy imports what ScanDeps
+// finds. "direct" and "transitive" both import that immediate set, because git
+// has no recursive discovery. An unknown value is an error rather than "none":
+// a misspelled "direct" read as "none" imports nothing and says nothing wrong.
+func GitImportsDeps(name, policy string) (bool, error) {
+	switch policy {
+	case "", "none":
+		return false, nil
+	case "direct", "transitive":
+		return true, nil
+	}
+	return false, fmt.Errorf("git/%s: unknown dep_policy %q; accepted values are \"none\" (the default when unset), \"direct\" and \"transitive\"", name, policy)
 }
 
 // PackageGit creates a git bundle for each git package version and verifies it.
