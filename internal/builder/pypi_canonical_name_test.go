@@ -102,3 +102,58 @@ func writeTestWheel(t *testing.T, dir, dist, version string) {
 		t.Fatalf("close %s: %v", path, err)
 	}
 }
+
+// Each line goes through a requirements file on its own, then all of them
+// together, so the unpaired bracket is shown to drop only its own line.
+func TestRequirementsLineNamesTheDistributionNotItsExtras(t *testing.T) {
+	cases := []struct {
+		line, name, version string
+		skipped             bool
+	}{
+		{line: "psycopg[c,pool]==3.3.6", name: "psycopg", version: "3.3.6"},
+		{line: "requests[security] >= 2.28.0", name: "requests", version: "2.28.0"},
+		{line: "name [extra]==1.0", name: "name", version: "1.0"},
+		{line: `name[extra]; python_version < "3.12"`, name: "name"},
+		{line: "name[extra]", name: "name"},
+		{line: "name[extra==1.0", skipped: true},
+		{line: "mkdocs==1.6.1", name: "mkdocs", version: "1.6.1"},
+		{line: "examplesdk", name: "examplesdk"},
+	}
+	dir := t.TempDir()
+	read := func(file, body string) []parsedPipDep {
+		t.Helper()
+		path := filepath.Join(dir, file)
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return parseRequirementsTxt(path, dir)
+	}
+
+	var all string
+	var want []parsedPipDep
+	for i, c := range cases {
+		all += c.line + "\n"
+		got := read("one.txt", c.line+"\n")
+		if c.skipped {
+			if len(got) != 0 {
+				t.Errorf("case %d %q: imported %+v, want skipped", i, c.line, got)
+			}
+			continue
+		}
+		w := parsedPipDep{Name: c.name, Version: c.version, RawSpec: c.line}
+		want = append(want, w)
+		if len(got) != 1 || got[0] != w {
+			t.Errorf("case %d %q: got %+v, want %+v", i, c.line, got, w)
+		}
+	}
+
+	got := read("all.txt", all)
+	if len(got) != len(want) {
+		t.Fatalf("whole file: got %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("whole file entry %d: got %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
