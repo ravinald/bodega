@@ -306,7 +306,7 @@ func (s *Server) handleDistfiles(w http.ResponseWriter, r *http.Request) {
 	store := s.typeStore(manifest.TypeDistfiles)
 	if pm, _ := s.store.GetPackage(ctx, manifest.TypeDistfiles, name); pm != nil && pm.Name == name {
 		if isPackageHidden(pm) {
-			http.NotFound(w, r)
+			s.refuseHidden(w, r, manifest.TypeDistfiles, name, "")
 			return
 		}
 		if s.stores != nil && len(pm.Versions) > 0 && pm.Versions[0].Storage != "" {

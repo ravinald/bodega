@@ -113,7 +113,7 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 	pkgName := r.PathValue("package")
 	pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, pkgName)
 	if pkg != nil && isPackageHidden(pkg) {
-		http.NotFound(w, r)
+		s.refuseHidden(w, r, manifest.TypePypi, pkgName, "")
 		return
 	}
 	if !s.entitleGate(w, r, manifest.TypePypi, pkgName, "") {
@@ -350,7 +350,16 @@ type pypiIndexWriter struct {
 	// all on the cache-hit path where proxyS3 streams a stored object straight
 	// in.
 	tooBig bool
+	// hijacked records that a refusal answered on the raw connection, past
+	// this buffer, and flush has nothing left to write.
+	hijacked bool
 }
+
+// Unwrap lets the allow-list refusal on this route reach the connection to
+// write its own status line; see refusal.writeWithReasonPhrase.
+func (p *pypiIndexWriter) Unwrap() http.ResponseWriter { return p.ResponseWriter }
+
+func (p *pypiIndexWriter) observeHijack(int) { p.hijacked = true }
 
 func (p *pypiIndexWriter) WriteHeader(code int) {
 	if p.status == 0 {
@@ -377,6 +386,9 @@ func (p *pypiIndexWriter) Write(b []byte) (int, error) {
 // A refusal or an error passes untouched: those bodies carry no links, and a
 // 403 from the allow-list must reach the client as the handler wrote it.
 func (p *pypiIndexWriter) flush() error {
+	if p.hijacked {
+		return nil
+	}
 	body := p.body.Bytes()
 	if p.status == 0 {
 		p.status = http.StatusOK

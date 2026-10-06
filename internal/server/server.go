@@ -1321,8 +1321,10 @@ func (s *Server) handleCreateEntry(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": res.Reason})
 		return
 	case admit.PolicyBlocked:
-		s.logger.Warn("create rejected by policy", "type", t, "name", pm.Name, "reason", res.Reason)
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": res.Reason})
+		s.logger.Warn("create rejected by policy", "type", t, "name", pm.Name, "reason", res.Reason, "incident", res.Incident)
+		f := admitRefusal(t, pm.Name, admitBlock{check: res.Check, version: res.Version, incident: res.Incident, details: res.Details})
+		f.client = refusalClientAPI
+		f.write(w, r)
 		return
 	}
 
@@ -1367,9 +1369,11 @@ func (s *Server) handleDeleteEntry(w http.ResponseWriter, r *http.Request) {
 		// remove a pinned artifact". The middleware chain let the request
 		// through — the caller cleared the admin gate — which is what makes
 		// the attempt worth a record rather than noise.
+		f := frozenRefusal(t, name)
+		f.client = refusalClientAPI
 		recordDenial(s.auditDB, r, audit.DenialFrozenEntry,
-			map[string]string{"pkg_type": t, "pkg_name": name})
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "entry is frozen"})
+			map[string]string{"pkg_type": t, "pkg_name": name, "incident": f.incident})
+		f.write(w, r)
 		return
 	}
 
@@ -2141,6 +2145,10 @@ func (iw *cacheDirectiveWriter) Flush() {
 		f.Flush()
 	}
 }
+
+// Unwrap lets a pypi refusal reach the connection to write its own status
+// line; see refusal.writeWithReasonPhrase.
+func (iw *cacheDirectiveWriter) Unwrap() http.ResponseWriter { return iw.ResponseWriter }
 
 func (iw *cacheDirectiveWriter) begin(code int) {
 	if iw.started {

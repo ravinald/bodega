@@ -15,3 +15,11 @@
 PIPE-APT-07	311	PackageApt writes pool paths under the binary name
 PROF-16	310	an apt pin cannot name a source version
 PIPE-APT-08	271	_pool_path is unconditional provenance, so no SHA256 when mirroring
+POL-REF-NPM-AGE-a	84	no age gate on the proxy fill path until F35
+POL-REF-NPM-AGE-b	84	no age gate on the proxy fill path until F35
+POL-REF-PIP-AGE-a	84	no age gate on the proxy fill path until F35
+POL-REF-PIP-AGE-b	84	no age gate on the proxy fill path until F35
+POL-REF-GO-AGE-a	84	no age gate on the proxy fill path until F35
+POL-REF-GO-AGE-b	84	no age gate on the proxy fill path until F35
+POL-REF-CARGO-AGE-a	84	no age gate on the proxy fill path until F35
+POL-REF-CARGO-AGE-b	84	no age gate on the proxy fill path until F35

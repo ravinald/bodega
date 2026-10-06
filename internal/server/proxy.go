@@ -259,8 +259,9 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	// have already handed the client an artifact by the time the mismatch is
 	// known, and a truncated response is not a refusal.
 	if err := s.verifyProxyChecksum(ctx, s3Key, spool.sha256, immutable); err != nil {
-		s.logger.Error("checksum verification failed", "key", s3Key, "error", err)
-		http.Error(w, "checksum verification failed — upstream content may be tampered", http.StatusBadGateway)
+		f := checksumRefusal(regType, s3Key, discoveryPkgName, err)
+		s.logger.Error("checksum verification failed", "key", s3Key, "incident", f.incident, "error", err)
+		f.write(w, r)
 		return
 	}
 
@@ -671,12 +672,14 @@ func (s *Server) verifyProxyChecksum(ctx context.Context, s3Key, computed string
 
 	// Verify against stored checksum.
 	if stored.Value != computed {
+		incident := audit.NewIncidentID()
 		// Record the mismatch in the audit trail.
 		if s.auditDB != nil {
 			details, _ := json.Marshal(map[string]string{
 				"expected":   stored.Value,
 				"computed":   computed,
 				"object_key": s3Key,
+				"incident":   incident,
 			})
 			_ = s.auditDB.Record(ctx, audit.Event{
 				EventType:  audit.EventCache,
@@ -687,7 +690,8 @@ func (s *Server) verifyProxyChecksum(ctx context.Context, s3Key, computed string
 				Details:    string(details),
 			})
 		}
-		return fmt.Errorf("sha256 mismatch for %s: stored=%s computed=%s", s3Key, shortDigest(stored.Value), shortDigest(computed))
+		return &checksumMismatchError{incident: incident,
+			msg: fmt.Sprintf("sha256 mismatch for %s: stored=%s computed=%s", s3Key, shortDigest(stored.Value), shortDigest(computed))}
 	}
 
 	s.logger.Debug("checksum verified", "key", s3Key)
@@ -808,9 +812,11 @@ func (s *Server) upstreamPolicyGate(w http.ResponseWriter, r *http.Request, regT
 		if upstreamURL != "" {
 			blocked = append(blocked, "url", upstreamURL)
 		}
+		f := allowListRefusal(regType, policyCandidate, discoveryPkgName, versionFromKey(s3Key))
+		blocked = append(blocked, "incident", f.incident)
 		s.logger.Warn("upstream blocked by policy", blocked...)
-		s.recordPolicyViolation(r, regType, policyCandidate, upstreamURL)
-		http.Error(w, "upstream blocked by allow-list", http.StatusForbidden)
+		s.recordPolicyViolation(r, regType, policyCandidate, upstreamURL, f.incident)
+		f.write(w, r)
 		return decision, false
 	}
 	return decision, true
@@ -841,7 +847,7 @@ func (s *Server) recordUpstreamAttempt(r *http.Request, regType, upstreamURL, po
 // cannot be written is not a reason to let a blocked upstream through. It is a
 // reason to say so loudly, naming the event, so a reconstruction from the log
 // is possible when the table is missing the row.
-func (s *Server) recordPolicyViolation(r *http.Request, regType, policyCandidate, upstreamURL string) {
+func (s *Server) recordPolicyViolation(r *http.Request, regType, policyCandidate, upstreamURL, incident string) {
 	if s.auditDB == nil {
 		return
 	}
@@ -852,12 +858,12 @@ func (s *Server) recordPolicyViolation(r *http.Request, regType, policyCandidate
 		PkgType:   regType,
 		PkgName:   policyCandidate,
 		Status:    audit.CachePolicyViolation,
-		Details:   fmt.Sprintf("url=%s", upstreamURL),
+		Details:   fmt.Sprintf("url=%s incident=%s", upstreamURL, incident),
 	}); err != nil {
 		s.logger.Error("audit write failed, denial not recorded — still refusing",
 			"event_type", audit.EventCache, "status", audit.CachePolicyViolation,
 			"type", regType, "candidate", policyCandidate, "url", upstreamURL,
-			"error", err)
+			"incident", incident, "error", err)
 	}
 }
 

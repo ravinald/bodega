@@ -27,7 +27,7 @@ func (s *Server) handleGomod(w http.ResponseWriter, r *http.Request) {
 
 	pm, _ := s.store.GetPackage(ctx, manifest.TypeGomod, module)
 	if pm != nil && isPackageHidden(pm) {
-		http.NotFound(w, r)
+		s.refuseHidden(w, r, manifest.TypeGomod, module, "")
 		return
 	}
 
@@ -80,8 +80,7 @@ func (s *Server) serveGomodFile(w http.ResponseWriter, r *http.Request, pm *mani
 					reqVersion = file[:dot] // "v1.30.0.info" → "v1.30.0"
 				}
 				if !versionAllowed(ver, reqVersion, vc) {
-					s.recordVersionRefusal(r, manifest.TypeGomod, module, ver, reqVersion, vc)
-					http.Error(w, "version not allowed by constraint", http.StatusForbidden)
+					s.refuseVersionConstraint(w, r, manifest.TypeGomod, module, ver, reqVersion, vc)
 					return
 				}
 			}

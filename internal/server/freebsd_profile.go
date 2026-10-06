@@ -114,11 +114,21 @@ func (s *Server) freeBSDCatalogGate(w http.ResponseWriter, r *http.Request, abi,
 	if !scoped || (view != nil && view.Name() == host.Name()) {
 		return true
 	}
-	want := s.publicBase(r) + pkgrepos.ProfilePath(host.Name()) + "/" + abi + "/" + repo + "/"
+	// The path and not the URL: the base is this server's own hostname, and
+	// the stanza doctor writes already carries it.
+	want := pkgrepos.ProfilePath(host.Name()) + "/" + abi + "/" + repo + "/"
+	d := entitle.Decision{
+		Governed: true,
+		Refusal:  entitle.RefusalMembership,
+		Reason:   fmt.Sprintf("profile %q governs freebsd, so this host reads the catalogue filtered for it at %s and not this one", host.Name(), want),
+	}
+	f := newRefusal(checkProfile, manifest.TypeFreeBSD, repo, "", http.StatusForbidden)
+	f.reason = d.Reason + "."
+	f.next = "install that stanza on this host with `bodega doctor --write-pkg-repo`."
 	s.logger.Info("freebsd: refused a catalogue outside the filtered view the host's profile is served",
-		"profile", host.Name(), "abi", abi, "repo", repo, "file", rest)
-	http.Error(w, fmt.Sprintf("profile %q governs freebsd, so this host reads the catalogue filtered for it at %s and not this one.\n"+
-		"  Install that stanza:  bodega doctor --write-pkg-repo\n", host.Name(), want), http.StatusForbidden)
+		"profile", host.Name(), "abi", abi, "repo", repo, "file", rest, "incident", f.incident)
+	s.recordProfileRefusal(r, host, manifest.TypeFreeBSD, repo+"/"+rest, "", d, f.incident)
+	f.write(w, r)
 	return false
 }
 
@@ -161,11 +171,13 @@ func (s *Server) freeBSDObjectGate(w http.ResponseWriter, r *http.Request, src f
 		Refusal:  entitle.RefusalMembership,
 		Reason:   fmt.Sprintf("no record in the catalogue of %s@%s names %s", src.repo, src.abi, rest),
 	}
-	s.recordProfileRefusal(r, p, manifest.TypeFreeBSD, rest, "", d)
-	http.Error(w, fmt.Sprintf("%s: profile %q is decided per package, and no record in the catalogue of %s@%s names %s, so nothing says which package it holds.\n"+
-		"  pkg fetches the path a record names; an alias such as Latest/pkg.pkg, or an object stored outside the catalogue, is not one.\n"+
-		"  See what the catalogue lists:  pkg search -r %s%s -x '.*'\n",
-		entitle.RefusalMembership, p.Name(), src.repo, src.abi, rest, pkgrepos.TagPrefix, src.repo), http.StatusForbidden)
+	f := newRefusal(checkProfile, manifest.TypeFreeBSD, rest, "", http.StatusForbidden)
+	f.reason = fmt.Sprintf("%s: profile %q is decided per package, and no record in the catalogue of %s@%s names %s, so nothing says which package it holds.",
+		entitle.RefusalMembership, p.Name(), src.repo, src.abi, rest)
+	f.next = fmt.Sprintf("pkg fetches the path a record names, and an alias such as Latest/pkg.pkg is not one; see what the catalogue lists with `pkg search -r %s%s -x '.*'`.",
+		pkgrepos.TagPrefix, src.repo)
+	s.recordProfileRefusal(r, p, manifest.TypeFreeBSD, rest, "", d, f.incident)
+	f.write(w, r)
 	return false
 }
 

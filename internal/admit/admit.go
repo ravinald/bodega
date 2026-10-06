@@ -57,6 +57,16 @@ type Result struct {
 	Decision Decision
 	Reason   string
 	Warnings []string
+
+	// The rest is set on PolicyBlocked only, for a caller that has to tell
+	// the person refused which gate said no and how to find the row it wrote.
+	// Check is "allow-list", "age" or "osv"; Version is the version refused;
+	// Incident is the ID the refusal's audit row carries in its details;
+	// Details is the refusing check's structured payload.
+	Check    string
+	Version  string
+	Incident string
+	Details  map[string]any
 }
 
 // OK reports whether the caller may proceed to write.
@@ -83,11 +93,13 @@ func Admit(
 	if err := validate(cfg, pm, &res); err != nil {
 		return Result{Decision: Invalid, Reason: err.Error(), Warnings: res.Warnings}
 	}
-	if err := checkAllowList(ctx, checker, adb, pm, actor); err != nil {
-		return Result{Decision: PolicyBlocked, Reason: err.Error(), Warnings: res.Warnings}
+	if blocked := checkAllowList(ctx, checker, adb, pm, actor); blocked != nil {
+		blocked.Warnings = res.Warnings
+		return *blocked
 	}
-	if err := checkVersions(ctx, adb, cfg, pm, actor, &res); err != nil {
-		return Result{Decision: PolicyBlocked, Reason: err.Error(), Warnings: res.Warnings}
+	if blocked := checkVersions(ctx, adb, cfg, pm, actor, &res); blocked != nil {
+		blocked.Warnings = res.Warnings
+		return *blocked
 	}
 	return res
 }
@@ -182,7 +194,8 @@ func validate(cfg *config.Config, pm *manifest.PackageManifest, res *Result) err
 
 // checkAllowList runs the URL-level allow-list over every version. It is
 // cheap and fails fast, so it runs before the checks that reach the network.
-func checkAllowList(ctx context.Context, checker *policy.Checker, adb *audit.DB, pm *manifest.PackageManifest, actor string) error {
+// It returns nil when every version passes.
+func checkAllowList(ctx context.Context, checker *policy.Checker, adb *audit.DB, pm *manifest.PackageManifest, actor string) *Result {
 	if checker == nil {
 		return nil
 	}
@@ -192,6 +205,7 @@ func checkAllowList(ctx context.Context, checker *policy.Checker, adb *audit.DB,
 			continue
 		}
 		if err := checker.Check(ctx, pm.Type, candidate); err != nil {
+			incident := audit.NewIncidentID()
 			if adb != nil {
 				_ = adb.Record(ctx, audit.Event{
 					EventType:  audit.EventCreate,
@@ -200,10 +214,11 @@ func checkAllowList(ctx context.Context, checker *policy.Checker, adb *audit.DB,
 					PkgVersion: ve.Version,
 					Actor:      actor,
 					Status:     "policy_violation",
-					Details:    fmt.Sprintf("candidate=%s", candidate),
+					Details:    fmt.Sprintf("candidate=%s incident=%s", candidate, incident),
 				})
 			}
-			return err
+			return &Result{Decision: PolicyBlocked, Reason: err.Error(),
+				Check: "allow-list", Version: ve.Version, Incident: incident}
 		}
 	}
 	return nil
@@ -216,7 +231,7 @@ func checkAllowList(ctx context.Context, checker *policy.Checker, adb *audit.DB,
 // looking. Recording alone leaves an OSV gate with no synced database printing
 // a clean import and filing the warning somewhere nobody reads until after the
 // package is in the store.
-func checkVersions(ctx context.Context, adb *audit.DB, cfg *config.Config, pm *manifest.PackageManifest, actor string, res *Result) error {
+func checkVersions(ctx context.Context, adb *audit.DB, cfg *config.Config, pm *manifest.PackageManifest, actor string, res *Result) *Result {
 	if adb == nil {
 		return nil
 	}
@@ -230,7 +245,12 @@ func checkVersions(ctx context.Context, adb *audit.DB, cfg *config.Config, pm *m
 		ve := &pm.Versions[i]
 		combined := policy.RunChecks(ctx, pm, ve, checkers...)
 		warns.add(ve.Version, combined.Warns)
+		var incident string
 		if details := combined.AuditDetails(); details != nil {
+			if combined.Blocked() {
+				incident = audit.NewIncidentID()
+				details["incident"] = incident
+			}
 			blob, _ := json.Marshal(details)
 			status := "policy_warn"
 			if combined.Blocked() {
@@ -247,7 +267,10 @@ func checkVersions(ctx context.Context, adb *audit.DB, cfg *config.Config, pm *m
 			})
 		}
 		if combined.Blocked() {
-			return fmt.Errorf("policy blocked %s@%s: %s", pm.Name, ve.Version, combined.Reasons())
+			first := combined.Blocks[0]
+			return &Result{Decision: PolicyBlocked,
+				Reason: fmt.Sprintf("policy blocked %s@%s: %s", pm.Name, ve.Version, combined.Reasons()),
+				Check:  first.Check, Version: ve.Version, Incident: incident, Details: first.Details}
 		}
 	}
 	return nil
