@@ -316,13 +316,10 @@ func FetchGit(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 // has no recursive discovery. An unknown value is an error rather than "none":
 // a misspelled "direct" read as "none" imports nothing and says nothing wrong.
 func GitImportsDeps(name, policy string) (bool, error) {
-	switch policy {
-	case "", "none":
-		return false, nil
-	case "direct", "transitive":
-		return true, nil
+	if err := manifest.ValidateDepPolicy(manifest.TypeGit, name, policy); err != nil {
+		return false, err
 	}
-	return false, fmt.Errorf("git/%s: unknown dep_policy %q; accepted values are \"none\" (the default when unset), \"direct\" and \"transitive\"", name, policy)
+	return policy == "direct" || policy == "transitive", nil
 }
 
 // PackageGit creates a git bundle for each git package version and verifies it.
