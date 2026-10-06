@@ -298,9 +298,37 @@ func TestRefusalBodiesCarryNoSecrets(t *testing.T) {
 	}
 }
 
-// TestPypiRefusalCarriesItInTheStatusLine is the one client that never reads
-// a body: pip prints "403 Client Error: <reason phrase> for url: ...". Over a
-// real connection the phrase carries the check and the incident, and the
+// TestStatusLineClientsGetTheRefusalInThePhrase covers helm and apt, which
+// print the status line and nothing else, and go, npm and cargo, which read
+// the body and keep the ordinary phrase.
+func TestStatusLineClientsGetTheRefusalInThePhrase(t *testing.T) {
+	for _, tc := range []struct {
+		typ    string
+		inLine bool
+	}{
+		{manifest.TypeHelm, true}, {manifest.TypeApt, true}, {manifest.TypePypi, true},
+		{manifest.TypeGomod, false}, {manifest.TypeNpm, false}, {manifest.TypeCargo, false},
+	} {
+		f := hiddenRefusal(tc.typ, "x", "1.0")
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { f.write(w, r) }))
+		resp, err := http.Get(srv.URL)
+		if err != nil {
+			t.Fatalf("%s: GET: %v", tc.typ, err)
+		}
+		_ = resp.Body.Close()
+		srv.Close()
+		if got := strings.Contains(resp.Status, "(hidden, incident "+f.incident+")"); got != tc.inLine {
+			t.Errorf("%s: status %q, want the refusal in the phrase: %v", tc.typ, resp.Status, tc.inLine)
+		}
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("%s: status code %d, want 404", tc.typ, resp.StatusCode)
+		}
+	}
+}
+
+// TestPypiRefusalCarriesItInTheStatusLine drives pip's case over a raw
+// connection, through the wrappers that sit between a pypi refusal and the
+// socket: pip prints "403 Client Error: <reason phrase> for url: ...". The
 // header and body are still there for anything that reads them.
 func TestPypiRefusalCarriesItInTheStatusLine(t *testing.T) {
 	pinIncident(t)

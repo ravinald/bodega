@@ -34,6 +34,16 @@ const (
 // verbose log.
 const refusalHeader = "X-Bodega-Refusal"
 
+// statusLineClients are the types whose client shows the status line of a
+// failed fetch and never its body: pip prints "403 Client Error: <phrase> for
+// url", helm "failed to fetch <url> : 403 <phrase>", and apt "403 <phrase>
+// [IP: ...]".
+var statusLineClients = map[string]bool{
+	manifest.TypePypi: true,
+	manifest.TypeHelm: true,
+	manifest.TypeApt:  true,
+}
+
 // refusalClientAPI selects the mutation API's own {"error": ...} body.
 const refusalClientAPI = "api"
 
@@ -112,8 +122,9 @@ func (f *refusal) headerValue() string {
 // render picks the body each client prints. npm reads the "error" field of a
 // JSON body into its own error line, and the mutation API answers every other
 // error in that shape. cargo prints the body of a failed fetch whole, and its
-// registry API spells errors as {"errors":[{"detail":...}]}. go, helm, apt and
-// pip print text, and pip prints only the status line, which write handles.
+// registry API spells errors as {"errors":[{"detail":...}]}. go prints a text
+// body under "server response:". pip, helm and apt print only the status
+// line, which write handles; their body is text for anything else reading it.
 func (f *refusal) render() (contentType string, body []byte) {
 	client := f.client
 	if client == "" {
@@ -143,7 +154,7 @@ func jsonBody(v any) []byte {
 // the body and headers are this type's.
 func (f *refusal) write(w http.ResponseWriter, r *http.Request) {
 	ctype, body := f.render()
-	if f.pkgType == manifest.TypePypi && f.client == "" && f.writeWithReasonPhrase(w, r, ctype, body) {
+	if statusLineClients[f.pkgType] && f.client == "" && f.writeWithReasonPhrase(w, r, ctype, body) {
 		return
 	}
 	h := w.Header()
@@ -178,8 +189,7 @@ func (f *refusal) reasonPhrase() string {
 }
 
 // writeWithReasonPhrase answers over the raw connection so the status line
-// carries the refusal. pip renders a failed fetch as "403 Client Error:
-// <reason phrase> for url: ..." and never reads the body, and net/http writes
+// carries the refusal, for a client that never reads the body. net/http writes
 // http.StatusText as the phrase with no way to override it. Only HTTP/1.x has
 // a phrase to carry; HTTP/2 and a writer that cannot be hijacked fall back to
 // the ordinary response, which still carries the header and the body.
