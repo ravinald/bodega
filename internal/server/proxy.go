@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
@@ -136,6 +137,9 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	// in it.
 	decision, ok := s.upstreamPolicyGate(w, r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key, true)
 	if !ok {
+		return
+	}
+	if !s.proxyMalwareGate(w, r, regType, discoveryPkgName, s3Key) {
 		return
 	}
 
@@ -814,6 +818,78 @@ func (s *Server) upstreamPolicyGate(w http.ResponseWriter, r *http.Request, regT
 		return decision, false
 	}
 	return decision, true
+}
+
+// proxyMalwareGate refuses a cache fill for a version OSV records as malware,
+// under the ecosystem's malware action, and returns false once it has written
+// the response. It runs where the allow-list does, before the resolver, so a
+// refused version costs no upstream read.
+//
+// Only the malware action applies here; the advisory gate is not run on the
+// proxy path. A miss is the one moment bodega decides to take a version in,
+// so a cache hit is not re-checked: a version already cached when its record
+// was published is what 'bodega policy osv rescan' is for. Only the language
+// ecosystems are checked, because they are the ones OSV publishes malware
+// records for, and the version comes off the object key, so an artifact whose
+// key names none (an index, a packument) passes through.
+func (s *Server) proxyMalwareGate(w http.ResponseWriter, r *http.Request, regType, discoveryPkgName, s3Key string) bool {
+	if policy.OSVEcosystemFor(regType) == "" {
+		return true
+	}
+	_, keyName, version := manifest.ParseKey(s3Key)
+	name := discoveryPkgName
+	if name == "" {
+		name = keyName
+	}
+	if name == "" || version == "" {
+		return true
+	}
+	res := admit.OSVChecker(s.cfg, s.auditDB).CheckMalware(r.Context(),
+		&manifest.PackageManifest{Name: name, Type: regType},
+		&manifest.VersionEntry{Version: version})
+	switch res.Action {
+	case policy.ActionBlock:
+		s.logger.Warn("upstream blocked by OSV malware policy", "type", regType, "package", name, "version", version, "reason", res.Reason)
+		s.recordMalwareRefusal(r, regType, name, version, s3Key, res)
+		http.Error(w, "upstream blocked by OSV malware policy: "+res.Reason, http.StatusForbidden)
+		return false
+	case policy.ActionWarn:
+		s.logger.Warn("OSV malware check could not clear the fill", "type", regType, "package", name, "version", version, "reason", res.Reason)
+	}
+	return true
+}
+
+// recordMalwareRefusal writes the audit row for one fill the malware action
+// refused. The refusal stands whether or not the row lands, for the reason
+// recordPolicyViolation gives.
+func (s *Server) recordMalwareRefusal(r *http.Request, regType, name, version, s3Key string, res policy.Result) {
+	if s.auditDB == nil {
+		return
+	}
+	details, err := json.Marshal(map[string]any{
+		"key":     truncateField(s3Key, maxDetailField),
+		"malware": res.Details["malware"],
+		"reason":  truncateField(res.Reason, maxDetailField),
+	})
+	if err != nil {
+		details = []byte("{}")
+	}
+	ctx, cancel := auditContext(r)
+	defer cancel()
+	if err := s.auditDB.Record(ctx, audit.Event{
+		EventType:  audit.EventCache,
+		PkgType:    regType,
+		PkgName:    name,
+		PkgVersion: version,
+		ClientIP:   ClientIP(r),
+		Identity:   Identity(r),
+		Status:     audit.CacheMalwareBlocked,
+		Details:    string(details),
+	}); err != nil {
+		s.logger.Error("audit write failed, malware refusal not recorded — still refusing",
+			"event_type", audit.EventCache, "status", audit.CacheMalwareBlocked,
+			"type", regType, "package", name, "version", version, "error", err)
+	}
 }
 
 // recordUpstreamAttempt writes the discovery row for one permitted upstream

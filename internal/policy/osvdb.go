@@ -58,10 +58,14 @@ func (m OSVDBMeta) Age(now time.Time) time.Duration { return now.Sub(m.FetchedAt
 // OSV publishes (details, references, credits) is dropped at sync, which is
 // what keeps the npm archive from costing 222 MB on disk and in memory.
 type osvRecord struct {
-	ID       string          `json:"id"`
-	Summary  string          `json:"summary,omitempty"`
-	Severity []OSVSeverity   `json:"severity,omitempty"`
-	Affected osvAffectedList `json:"affected"`
+	ID       string        `json:"id"`
+	Summary  string        `json:"summary,omitempty"`
+	Severity []OSVSeverity `json:"severity,omitempty"`
+	// Malicious is database_specific reduced to the one bit the gate reads.
+	// An archive synced before it existed decodes to false, so a malware
+	// record there is recognized by its MAL- id alone until the next sync.
+	Malicious bool            `json:"malicious,omitempty"`
+	Affected  osvAffectedList `json:"affected"`
 }
 
 func (r *osvRecord) UnmarshalJSON(b []byte) error {
@@ -476,7 +480,7 @@ func (d *OSVDatabase) Match(ecosystem, name, version string) (vulns []osvVuln, s
 		}
 		switch {
 		case hit:
-			vulns = append(vulns, osvVuln{ID: rec.ID, Summary: rec.Summary, Severity: rec.Severity})
+			vulns = append(vulns, osvVuln{ID: rec.ID, Summary: rec.Summary, Severity: rec.Severity, Malicious: rec.Malicious})
 		case unorderable != "":
 			skipped = append(skipped, fmt.Sprintf("%s (bound %q)", rec.ID, unorderable))
 		}
@@ -631,11 +635,12 @@ func distill(ecosystems []string, zipPath string, trim bool) (map[string]*osvInd
 			return nil, nil, fmt.Errorf("read %s in %s: %w", entry.Name, zipPath, err)
 		}
 		var raw struct {
-			ID        string        `json:"id"`
-			Summary   string        `json:"summary"`
-			Withdrawn string        `json:"withdrawn"`
-			Severity  []OSVSeverity `json:"severity"`
-			Affected  []struct {
+			ID         string              `json:"id"`
+			Summary    string              `json:"summary"`
+			Withdrawn  string              `json:"withdrawn"`
+			Severity   []OSVSeverity       `json:"severity"`
+			DBSpecific osvDatabaseSpecific `json:"database_specific"`
+			Affected   []struct {
 				Package struct {
 					Name      string `json:"name"`
 					Ecosystem string `json:"ecosystem"`
@@ -689,7 +694,8 @@ func distill(ecosystems []string, zipPath string, trim bool) (map[string]*osvInd
 			records[eco]++
 			for key, affected := range byPackage {
 				indexes[eco].Packages[key] = append(indexes[eco].Packages[key], &osvRecord{
-					ID: raw.ID, Summary: raw.Summary, Severity: raw.Severity, Affected: affected,
+					ID: raw.ID, Summary: raw.Summary, Severity: raw.Severity,
+					Malicious: raw.DBSpecific.malicious(), Affected: affected,
 				})
 			}
 		}
