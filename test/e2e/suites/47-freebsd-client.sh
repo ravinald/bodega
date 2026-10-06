@@ -178,10 +178,13 @@ e2e_on freebsd "sudo sh $FBSD_PKGCONF save found" || true
 check_eq FBSD-CONF-00 "the guest's pkg configuration is saved before the suite writes it" 0 "$E2E_RC" \
 	"test/e2e/suites/47-freebsd-client.sh" "sh $FBSD_PKGCONF save found" "$E2E_RC"
 
-# From here on, leaving by any road restores the guest as found. cleanup is
+# From here on, leaving by any road restores the guest as found and takes the
+# guest's address off whichever identity this suite bound it to. cleanup is
 # run.sh's own exit trap, which this one wraps rather than replaces.
+FBSD_CIDR="${E2E_FREEBSD_ADDR:-127.0.0.1}/32"
 fbsd_pkgconf_on_exit() {
 	e2e_on freebsd "sudo sh $FBSD_PKGCONF restore found" >/dev/null 2>&1 || true
+	e2e_bodega server "identity unbind cidr $FBSD_CIDR" >/dev/null 2>&1 || true
 	cleanup
 }
 trap fbsd_pkgconf_on_exit EXIT
@@ -233,9 +236,27 @@ e2e_reload server || true
 # a package already installed proves nothing about where it came from.
 E2E_HOST=freebsd
 e2e_on freebsd "sudo pkg delete -y tree >/dev/null 2>&1; true" || true
+
+# doctor reads its plan from /client/, which answers only a host an identity
+# binding names. The guest is bound for the write and unbound straight after,
+# so the profile section below meets the address unbound. Unbound first, so an
+# aborted run's leftover does not fail the bind.
+E2E_HOST=server
+e2e_bodega server "identity unbind cidr $FBSD_CIDR" >/dev/null 2>&1 || true
+e2e_bodega server "identity bind cidr $FBSD_CIDR e2e-fbsd-client --comment 'e2e run'" || true
+check_eq FBSD-PKG-BIND "the freebsd guest's address binds to an identity for doctor" 0 "$E2E_RC" \
+	"cmd/bodega/cmd_identity.go:59" "bodega identity bind cidr $FBSD_CIDR e2e-fbsd-client" "$E2E_RC"
+e2e_reload server || true
+
+E2E_HOST=freebsd
 e2e_on freebsd "sudo bodega doctor --write-pkg-repo --url '$E2E_BASE_URL' --allow-plaintext" || true
 check_eq FBSD-PKG-02 "doctor --write-pkg-repo writes the stanza on a FreeBSD host" 0 "$E2E_RC" \
 	"cmd/bodega/cmd_doctor.go" "bodega doctor --write-pkg-repo --url $E2E_BASE_URL" "$E2E_RC"
+
+E2E_HOST=server
+e2e_bodega server "identity unbind cidr $FBSD_CIDR" || true
+e2e_reload server || true
+E2E_HOST=freebsd
 
 # The override is the half that fails silently: a wrong tag leaves the upstream
 # repository enabled beside bodega's and pkg update says nothing about it.
@@ -273,7 +294,6 @@ check_eq FBSD-PKG-07 "removing the stanza gives the host its upstream repository
 # pkg sends no bodega credential.
 
 FBSD_PROFILE=e2e-fbsd
-FBSD_CIDR="${E2E_FREEBSD_ADDR:-127.0.0.1}/32"
 fbsd_repo_url="$E2E_BASE_URL/freebsd/$fbsd_abi/e2e-latest"
 
 # The third package's repopath, read off the published catalogue while the
