@@ -339,7 +339,10 @@ func parseRequirementsFile(path, baseDir string, depth int) []parsedPipDep {
 		if line[0] == '-' {
 			continue
 		}
-		name, version := parsePipSpecifier(line)
+		name, version, ok := parsePipSpecifier(line)
+		if !ok {
+			continue
+		}
 		deps = append(deps, parsedPipDep{
 			Name:    name,
 			Version: version,
@@ -351,10 +354,24 @@ func parseRequirementsFile(path, baseDir string, depth int) []parsedPipDep {
 
 // parsePipSpecifier extracts the package name and pinned version from a pip
 // specifier like "mkdocs==1.6.1", "requests[security]>=2.28.0", or "examplesdk".
-func parsePipSpecifier(spec string) (name, version string) {
+// Extras are dropped rather than recorded: a pypi entry names a distribution,
+// and the optional dependencies an extra selects appear in the closure by their
+// own names. ok is false when brackets do not pair, since no distribution name
+// contains one.
+func parsePipSpecifier(spec string) (name, version string, ok bool) {
 	// Strip environment markers.
 	if i := strings.IndexByte(spec, ';'); i >= 0 {
 		spec = strings.TrimSpace(spec[:i])
+	}
+	if open := strings.IndexByte(spec, '['); open >= 0 {
+		end := strings.IndexByte(spec[open:], ']')
+		if end < 0 {
+			return "", "", false
+		}
+		spec = spec[:open] + spec[open+end+1:]
+	}
+	if strings.ContainsAny(spec, "[]") {
+		return "", "", false
 	}
 	// Find the first version operator.
 	opIdx := -1
@@ -366,7 +383,7 @@ func parsePipSpecifier(spec string) (name, version string) {
 	}
 	if opIdx < 0 {
 		// No version specifier.
-		return strings.TrimSpace(spec), ""
+		return strings.TrimSpace(spec), "", true
 	}
 	name = strings.TrimSpace(spec[:opIdx])
 	verPart := spec[opIdx:]
@@ -378,7 +395,7 @@ func parsePipSpecifier(spec string) (name, version string) {
 	if i := strings.IndexByte(verPart, ','); i >= 0 {
 		verPart = verPart[:i]
 	}
-	return name, strings.TrimSpace(verPart)
+	return name, strings.TrimSpace(verPart), true
 }
 
 // depEntry is a generic name+version pair used during parsing.
