@@ -437,3 +437,13 @@ func checksumRefusal(regType, s3Key, name string, err error) *refusal {
 	f.next = fmt.Sprintf("retry shortly; if it persists, give an operator incident %s from the server log.", f.incident)
 	return f
 }
+
+// distfileRefusal answers distfile bytes that disagree with the ports tree's
+// distinfo, at the 502 checksumRefusal answers and for its reason: the fault
+// is the bytes upstream served, not the client's request.
+func distfileRefusal(name string) *refusal {
+	f := newRefusal(checkChecksum, manifest.TypeDistfiles, name, "", http.StatusBadGateway)
+	f.reason = "the bytes upstream served do not match the ports tree's distinfo, so they were not cached or served."
+	f.next = fmt.Sprintf("do not route around it; give an operator incident %s, whose audit row holds both digests.", f.incident)
+	return f
+}

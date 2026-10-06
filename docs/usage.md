@@ -1784,13 +1784,13 @@ Next step: ask an operator to run `bodega policy add npm left-pad` if it should 
 | Check        | Status | Where it refuses                                                                     |
 | ------------ | ------ | ------------------------------------------------------------------------------------ |
 | `allow-list` | 403    | any proxied fetch, the apt pool, and `POST /api/v1/packages`                         |
-| `age`        | 403    | `POST /api/v1/packages` only; see the limits below                                   |
-| `osv`        | 403    | `POST /api/v1/packages` only; see the limits below                                   |
+| `age`        | 403    | a proxied npm, pypi, gomod or cargo download, and `POST /api/v1/packages`            |
+| `osv`        | 403    | a proxied npm, pypi, gomod or cargo download, and `POST /api/v1/packages`            |
 | `profile`    | 403    | any package route on a host whose profile governs the type                           |
 | `constraint` | 403    | an npm or gomod version outside the entry's `version_constraint`                     |
 | `hidden`     | 404    | a hidden package or version; 404 because hiding withdraws it rather than refusing it |
 | `frozen`     | 403    | `DELETE /api/v1/packages/{type}/{name}` on a frozen entry                            |
-| `checksum`   | 502    | a proxied artifact whose bytes disagree with the digest pinned on first fetch        |
+| `checksum`   | 502    | a proxied artifact or distfile whose bytes disagree with its pinned digest           |
 
 Every refusal also carries `X-Bodega-Refusal: <check>; incident=<id>`, which a client's verbose or debug output shows when its error line does not.
 
@@ -1804,7 +1804,7 @@ curl -s 'http://127.0.0.1:8080/api/v1/audit?name=left-pad&limit=200' | grep 6502
 
 | Check                                  | Audit row                                               |
 | -------------------------------------- | ------------------------------------------------------- |
-| `allow-list` on a fetch                | `cache` / `policy_violation`                            |
+| `allow-list`, `age`, `osv` on a fetch  | `cache` / `policy_violation`                            |
 | `allow-list`, `age`, `osv` on a create | `create` / `policy_violation`                           |
 | `profile`                              | `denied` / `profile_membership` or `profile_constraint` |
 | `constraint`                           | `denied` / `version_constraint`                         |
@@ -1897,7 +1897,7 @@ The mutation API answers its own JSON, `{"error": "<summary> Next step: <next st
 
 #### Limits
 
-- **The age and OSV gates refuse at admission only.** They run on `bodega pkg import`, `bodega pkg create` and `POST /api/v1/packages`, not on a proxied fetch, so a client installing through the proxy is never age-refused and never sees an `age` refusal. Tracked in [#84](https://github.com/ravinald/bodega/issues/84).
+- **The age and OSV gates run on a proxy miss, not on a hit.** A proxied npm, pypi, gomod or cargo version is checked before bodega fetches it, so a version cached before a gate was tightened is served from the cache without being checked again. Proxied apt, helm, binary, git and freebsd fetches are not checked at all: freebsd's storage key holds the ABI where the version would be, and the age gate cannot date the rest.
 - **The reason phrase is HTTP/1.1's.** HTTP/2 has none, so a pip, helm or apt client that negotiates HTTP/2 with bodega's TLS listener, or a reverse proxy that rewrites the status line, shows the bare `403 Forbidden`. The header and body still carry the refusal.
 - **Other refusals keep their own text.** The middleware gates (deny list, admin network, tokens), the `/client/` routes, a git push, the spool bounds and the distfiles license and environment refusals are not package checks and answer as they did.
 
@@ -2289,6 +2289,8 @@ The marker is on the row because the row is what an operator scans. A footnote a
 Nothing else counts such a row as enforcement. The `bodega serve` startup banner names only ecosystems the age gate can date, so an install carrying the `helm` row above with `npm` and `pypi` on `ignore` reports `minimum publish age: none enforced` rather than the block that never runs.
 
 An upstream that is reachable but has no timestamp for the version warns rather than blocking, on the same reasoning: a registry outage should not fail an import closed.
+
+The gate runs at import (`bodega pkg import`, `bodega pkg create`, `POST /api/v1/packages`) and on every proxy cache miss for a versioned npm, pypi, gomod or cargo artifact, before bodega fetches it. A miss under a gate set to `block` answers the client with an `age` refusal (see [What a refused client sees](#what-a-refused-client-sees)); one under `warn` is fetched and served, and writes a `cache` / `policy_warn` audit row. A miss costs one request to the registry in the table above, which is the public one whatever upstream bodega proxies from; a registry bodega cannot reach makes every miss warn rather than block. A cache hit is not checked again. The OSV gate runs at the same points.
 
 ### `bodega discover ...`
 

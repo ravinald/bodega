@@ -5,13 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/entitle"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
@@ -272,6 +276,7 @@ func TestRefusalBodiesCarryNoSecrets(t *testing.T) {
 			return checksumRefusal(typ, key, "", fmt.Errorf("checksum lookup unavailable: open s3://%s/%s: %s", bucket, key, upstream))
 		}},
 		{checkConstraint, func(typ string) *refusal { return constraintRefusal(typ, "hello", "2.10", "~2.9") }},
+		{checkChecksum, func(string) *refusal { return distfileRefusal("hello/2.10.tar.gz") }},
 	}
 	for _, typ := range []string{manifest.TypeNpm, manifest.TypeCargo, manifest.TypeGomod, manifest.TypeHelm, manifest.TypeApt, manifest.TypePypi, refusalClientAPI} {
 		for _, b := range builds {
@@ -491,4 +496,157 @@ func TestChecksumRefusalKeepsTheMismatchIncident(t *testing.T) {
 	if f := checksumRefusal(manifest.TypeApt, "", "hello", errors.New("db down")); f.incident == "" || f.incident == "feedfacecafe" {
 		t.Errorf("an unreadable digest got incident %q, want a fresh one", f.incident)
 	}
+}
+
+// stubAgeGate points the proxy fill's age gate at a registry that answers, for
+// every ecosystem it dates, that each version was published an hour ago.
+func stubAgeGate(t *testing.T) {
+	t.Helper()
+	at := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		switch {
+		case strings.HasPrefix(p, "/npm/"):
+			_, _ = fmt.Fprintf(w, `{"time":{"1.2.0":%q}}`, at)
+		case strings.HasPrefix(p, "/pypi/"):
+			_, _ = fmt.Fprintf(w, `{"urls":[{"upload_time_iso_8601":%q}]}`, at)
+		case strings.HasPrefix(p, "/go/"):
+			_, _ = fmt.Fprintf(w, `{"Time":%q}`, at)
+		case strings.HasPrefix(p, "/crates/"):
+			_, _ = fmt.Fprintf(w, `{"version":{"created_at":%q}}`, at)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(stub.Close)
+	prev := fetchCheckers
+	fetchCheckers = func(_ *config.Config, adb *audit.DB) []policy.VersionChecker {
+		ck := policy.NewAgeChecker(adb)
+		ck.NpmRegistry, ck.PypiBase, ck.GoProxy, ck.CratesBase = stub.URL+"/npm", stub.URL, stub.URL+"/go", stub.URL+"/crates"
+		ck.HTTP = stub.Client()
+		return []policy.VersionChecker{ck}
+	}
+	t.Cleanup(func() { fetchCheckers = prev })
+	// The real upstream guard refuses loopback, where the fixture upstream
+	// runs; without this a gate that let the fetch through would still never
+	// reach it, and the upstream hit count would prove nothing.
+	saved := upstreamGuard
+	upstreamGuard = func(rawURL string) error {
+		if strings.HasPrefix(rawURL, "http://127.0.0.1:") {
+			return nil
+		}
+		return saved(rawURL)
+	}
+	t.Cleanup(func() { upstreamGuard = saved })
+}
+
+// The age gate on the proxy fill path, through the real chain for each client
+// it dates: the version is refused before upstream is contacted, the body is
+// the one that client prints, and the incident is the one in the row.
+func TestAgeRefusalOnProxyFillMatchesItsRow(t *testing.T) {
+	for _, tc := range []struct {
+		typ, name, path string
+		incident        func(t *testing.T, rec *httptest.ResponseRecorder) string
+	}{
+		{manifest.TypeNpm, "leftpad", "/npm/leftpad/-/leftpad-1.2.0.tgz", func(t *testing.T, rec *httptest.ResponseRecorder) string {
+			var body struct{ Error string }
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("npm body is not JSON: %v (%s)", err, rec.Body.String())
+			}
+			return bodyIncident(t, body.Error, checkAge)
+		}},
+		{manifest.TypeCargo, "itoa", "/cargo/itoa/1.2.0/download", func(t *testing.T, rec *httptest.ResponseRecorder) string {
+			var body struct{ Errors []struct{ Detail string } }
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || len(body.Errors) != 1 {
+				t.Fatalf("cargo body is not one error: %v (%s)", err, rec.Body.String())
+			}
+			return bodyIncident(t, body.Errors[0].Detail, checkAge)
+		}},
+		{manifest.TypeGomod, "example.com/mod", "/go/example.com/mod/@v/v1.2.0.info", func(t *testing.T, rec *httptest.ResponseRecorder) string {
+			return bodyIncident(t, rec.Body.String(), checkAge)
+		}},
+		{manifest.TypePypi, "six", "/pypi/wheels/six-1.2.0-py2.py3-none-any.whl", func(t *testing.T, rec *httptest.ResponseRecorder) string {
+			return bodyIncident(t, rec.Body.String(), checkAge)
+		}},
+	} {
+		t.Run(tc.typ, func(t *testing.T) {
+			stubAgeGate(t)
+
+			var hits atomic.Int32
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				http.NotFound(w, r)
+			}))
+			t.Cleanup(up.Close)
+			s := newDiscoveryServer(t)
+			s.cfg.NpmUpstream, s.cfg.PypiUpstream, s.cfg.GomodUpstream, s.cfg.CargoDLUpstream = up.URL, up.URL, up.URL, up.URL
+			if tc.typ != manifest.TypeCargo {
+				ver := "1.2.0"
+				if tc.typ == manifest.TypeGomod {
+					ver = "v1.2.0"
+				}
+				if err := s.store.AddVersion(t.Context(), tc.typ, tc.name, manifest.VersionEntry{Version: ver, Mode: manifest.ModeProxy}); err != nil {
+					t.Fatalf("seed manifest: %v", err)
+				}
+			}
+			if err := s.auditDB.SetAgePolicy(t.Context(), audit.AgePolicy{Ecosystem: tc.typ, MinAgeSeconds: 86400, Action: policy.ActionBlock}); err != nil {
+				t.Fatalf("set age policy: %v", err)
+			}
+
+			rec := doRequest(s, http.MethodGet, tc.path, nil)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403 (%s)", rec.Code, rec.Body.String())
+			}
+			inc := refusalIncident(t, rec.Header(), checkAge)
+			if got := tc.incident(t, rec); got != inc {
+				t.Errorf("body incident %s, header incident %s", got, inc)
+			}
+			if !strings.Contains(rec.Body.String(), "becomes available on ") {
+				t.Errorf("body names no date the version clears the gate:\n%s", rec.Body.String())
+			}
+			if n := hits.Load(); n != 0 {
+				t.Errorf("upstream contacted %d times for a refused version", n)
+			}
+			rows, err := s.auditDB.Query(t.Context(), audit.Filter{EventType: audit.EventCache})
+			if err != nil {
+				t.Fatalf("query: %v", err)
+			}
+			for _, row := range rows {
+				if row.Status == audit.CachePolicyViolation && strings.Contains(row.Details, `"incident":"`+inc+`"`) {
+					return
+				}
+			}
+			t.Errorf("no policy_violation row carries incident %s: %+v", inc, rows)
+		})
+	}
+}
+
+// A warn on the proxy fill path records and serves: the gate refuses only on
+// the action the operator set.
+func TestAgeWarnOnProxyFillServes(t *testing.T) {
+	stubAgeGate(t)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "tarball") }))
+	t.Cleanup(up.Close)
+	s := newDiscoveryServer(t)
+	s.cfg.NpmUpstream = up.URL
+	if err := s.store.AddVersion(t.Context(), manifest.TypeNpm, "leftpad", manifest.VersionEntry{Version: "1.2.0", Mode: manifest.ModeProxy}); err != nil {
+		t.Fatalf("seed manifest: %v", err)
+	}
+	if err := s.auditDB.SetAgePolicy(t.Context(), audit.AgePolicy{Ecosystem: manifest.TypeNpm, MinAgeSeconds: 86400, Action: policy.ActionWarn}); err != nil {
+		t.Fatalf("set age policy: %v", err)
+	}
+	rec := doRequest(s, http.MethodGet, "/npm/leftpad/-/leftpad-1.2.0.tgz", nil)
+	if rec.Code != http.StatusOK || rec.Header().Get(refusalHeader) != "" {
+		t.Fatalf("status = %d, %s = %q, want 200 and no refusal (%s)", rec.Code, refusalHeader, rec.Header().Get(refusalHeader), rec.Body.String())
+	}
+	rows, err := s.auditDB.Query(t.Context(), audit.Filter{EventType: audit.EventCache})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	for _, row := range rows {
+		if row.Status == "policy_warn" && row.PkgName == "leftpad" {
+			return
+		}
+	}
+	t.Errorf("no policy_warn row for the served version: %+v", rows)
 }

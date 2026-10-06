@@ -97,7 +97,7 @@ func Admit(
 		blocked.Warnings = res.Warnings
 		return *blocked
 	}
-	if blocked := checkVersions(ctx, adb, cfg, pm, actor, &res); blocked != nil {
+	if blocked := checkVersions(ctx, adb, pm, actor, audit.EventCreate, &res, VersionCheckers(cfg, adb)); blocked != nil {
 		blocked.Warnings = res.Warnings
 		return *blocked
 	}
@@ -231,13 +231,9 @@ func checkAllowList(ctx context.Context, checker *policy.Checker, adb *audit.DB,
 // looking. Recording alone leaves an OSV gate with no synced database printing
 // a clean import and filing the warning somewhere nobody reads until after the
 // package is in the store.
-func checkVersions(ctx context.Context, adb *audit.DB, cfg *config.Config, pm *manifest.PackageManifest, actor string, res *Result) *Result {
+func checkVersions(ctx context.Context, adb *audit.DB, pm *manifest.PackageManifest, actor string, eventType audit.EventType, res *Result, checkers []policy.VersionChecker) *Result {
 	if adb == nil {
 		return nil
-	}
-	checkers := []policy.VersionChecker{
-		policy.NewAgeChecker(adb),
-		OSVChecker(cfg, adb),
 	}
 	warns := &versionWarnings{}
 	defer warns.flush(res)
@@ -257,7 +253,7 @@ func checkVersions(ctx context.Context, adb *audit.DB, cfg *config.Config, pm *m
 				status = "policy_violation"
 			}
 			_ = adb.Record(ctx, audit.Event{
-				EventType:  audit.EventCreate,
+				EventType:  eventType,
 				PkgType:    pm.Type,
 				PkgName:    pm.Name,
 				PkgVersion: ve.Version,
@@ -274,6 +270,26 @@ func checkVersions(ctx context.Context, adb *audit.DB, cfg *config.Config, pm *m
 		}
 	}
 	return nil
+}
+
+// CheckFetch runs the per-version checks import runs on one version a proxy
+// fill is about to fetch, so a version no manifest names is not admitted under
+// a weaker policy than one that arrived through import. The row is a cache
+// event because nothing was created. A nil result means the fetch may go
+// ahead; a warn is recorded rather than returned, since the client fetching
+// has nowhere to read one.
+//
+// checkers is VersionCheckers outside a test.
+func CheckFetch(ctx context.Context, adb *audit.DB, checkers []policy.VersionChecker, typ, name, version string) *Result {
+	pm := &manifest.PackageManifest{Type: typ, Name: name,
+		Versions: []manifest.VersionEntry{{Version: version, Mode: manifest.ModeProxy}}}
+	return checkVersions(ctx, adb, pm, "", audit.EventCache, nil, checkers)
+}
+
+// VersionCheckers are the per-version checks every admission runs, import
+// and proxy fill alike.
+func VersionCheckers(cfg *config.Config, adb *audit.DB) []policy.VersionChecker {
+	return []policy.VersionChecker{policy.NewAgeChecker(adb), OSVChecker(cfg, adb)}
 }
 
 // versionWarnings collects the per-version warns of one manifest into the

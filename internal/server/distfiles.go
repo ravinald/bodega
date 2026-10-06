@@ -525,7 +525,7 @@ func (s *Server) serveVerifiedDistfile(w http.ResponseWriter, r *http.Request, s
 		s.logger.Error("distfiles: stored bytes disagree with distinfo, fetching upstream to replace them",
 			"name", name, "key", key, "backend", store.Label(), "want_sha256", entry.SHA256, "want_size", entry.Size,
 			"got_sha256", spool.sha256, "got_size", spool.size, "ports", strings.Join(entry.Ports, ","))
-		s.recordDistfileMismatch(r, name, key, entry, spool.sha256, spool.size, store.Label()+":"+key)
+		s.recordDistfileMismatch(r, name, key, entry, spool.sha256, spool.size, store.Label()+":"+key, "")
 		return false
 	}
 	if err := rewindSpool(spool.file); err != nil {
@@ -552,23 +552,25 @@ func (s *Server) serveVerifiedDistfile(w http.ResponseWriter, r *http.Request, s
 // is cached. computed is empty when the refusal came off the declared length
 // alone.
 func (s *Server) refuseDistfile(w http.ResponseWriter, r *http.Request, name, key string, entry distinfo.Entry, computed string, size int64, from string) {
+	f := distfileRefusal(name)
 	s.logger.Error("distfiles: upstream bytes disagree with distinfo, refusing them",
 		"name", name, "upstream", from, "want_sha256", entry.SHA256, "want_size", entry.Size,
-		"got_sha256", computed, "got_size", size, "ports", strings.Join(entry.Ports, ","))
-	s.recordDistfileMismatch(r, name, key, entry, computed, size, from)
-	http.Error(w, "upstream bytes for "+name+" do not match the ports tree's distinfo, so they were not cached or served", http.StatusBadGateway)
+		"got_sha256", computed, "got_size", size, "ports", strings.Join(entry.Ports, ","), "incident", f.incident)
+	s.recordDistfileMismatch(r, name, key, entry, computed, size, from, f.incident)
+	f.write(w, r)
 }
 
 // recordDistfileMismatch writes the checksum_mismatch cache row for bytes
 // that disagree with distinfo. from is the upstream URL for a fetch, or
-// "<backend>:<key>" for a stored object.
-func (s *Server) recordDistfileMismatch(r *http.Request, name, key string, entry distinfo.Entry, computed string, size int64, from string) {
+// "<backend>:<key>" for a stored object. incident is the refusal's, and empty
+// for a stored object, whose mismatch is not refused but refetched.
+func (s *Server) recordDistfileMismatch(r *http.Request, name, key string, entry distinfo.Entry, computed string, size int64, from, incident string) {
 	if s.auditDB == nil {
 		return
 	}
 	ctx, cancel := auditContext(r)
 	defer cancel()
-	details, _ := json.Marshal(map[string]string{
+	fields := map[string]string{
 		"expected":      entry.SHA256,
 		"computed":      computed,
 		"expected_size": fmt.Sprintf("%d", entry.Size),
@@ -576,7 +578,11 @@ func (s *Server) recordDistfileMismatch(r *http.Request, name, key string, entry
 		"object_key":    key,
 		"upstream_url":  from,
 		"ports":         strings.Join(entry.Ports, ","),
-	})
+	}
+	if incident != "" {
+		fields["incident"] = incident
+	}
+	details, _ := json.Marshal(fields)
 	_ = s.auditDB.Record(ctx, audit.Event{
 		EventType: audit.EventCache,
 		PkgType:   manifest.TypeDistfiles,

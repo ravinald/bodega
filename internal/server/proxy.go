@@ -13,10 +13,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/audit"
 	"github.com/ravinald/bodega/internal/manifest"
 	"github.com/ravinald/bodega/internal/policy"
@@ -136,6 +138,9 @@ func (s *Server) proxyOrResolve(w http.ResponseWriter, r *http.Request, store st
 	// in it.
 	decision, ok := s.upstreamPolicyGate(w, r, regType, knownUpstream, policyCandidate, discoveryPkgName, s3Key, true)
 	if !ok {
+		return
+	}
+	if !s.versionPolicyGate(w, r, regType, discoveryPkgName, s3Key) {
 		return
 	}
 
@@ -820,6 +825,50 @@ func (s *Server) upstreamPolicyGate(w http.ResponseWriter, r *http.Request, regT
 		return decision, false
 	}
 	return decision, true
+}
+
+// fetchGatedTypes are the types whose proxy fill runs the age and OSV checks:
+// the ones the age gate can date, which are also the ones whose storage key
+// names the version being fetched. A freebsd key's version slot holds the ABI,
+// and checking an advisory against that would answer for the wrong thing.
+var fetchGatedTypes = map[string]bool{
+	manifest.TypeNpm:   true,
+	manifest.TypePypi:  true,
+	manifest.TypeGomod: true,
+	manifest.TypeCargo: true,
+}
+
+// fetchCheckers is admit.VersionCheckers, held in a variable because the age
+// gate dates a version against the public registries: a test points it at
+// one it controls rather than reaching the internet.
+var fetchCheckers = admit.VersionCheckers
+
+// versionPolicyGate runs import's per-version checks on the version a proxy
+// fill is about to fetch, and refuses it when one blocks. It runs before the
+// fetch rather than before the cache write, so a refused version's bytes never
+// leave upstream. A request that names no version (a packument, an index, a
+// version list) has nothing to date and passes.
+func (s *Server) versionPolicyGate(w http.ResponseWriter, r *http.Request, regType, name, s3Key string) bool {
+	if s.auditDB == nil || name == "" || !fetchGatedTypes[regType] {
+		return true
+	}
+	version := versionFromKey(s3Key)
+	if regType == manifest.TypePypi {
+		// ParseKey places wheels only; an sdist is fetched through the same route.
+		_, version = wheelIdentity(path.Base(s3Key))
+	}
+	if version == "" {
+		return true
+	}
+	res := admit.CheckFetch(r.Context(), s.auditDB, fetchCheckers(s.cfg, s.auditDB), regType, name, version)
+	if res == nil {
+		return true
+	}
+	f := admitRefusal(regType, name, admitBlock{check: res.Check, version: res.Version, incident: res.Incident, details: res.Details})
+	s.logger.Warn("upstream fetch blocked by policy", "type", regType, "package", name, "version", version,
+		"check", f.check, "incident", f.incident)
+	f.write(w, r)
+	return false
 }
 
 // recordUpstreamAttempt writes the discovery row for one permitted upstream
