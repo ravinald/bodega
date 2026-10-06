@@ -104,12 +104,18 @@ func (c *AgeChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 			Reason: "version " + versionLabel(version) + " pins nothing; age gate is version-aware"}
 	}
 
-	publishedAt, err := c.publishedAt(ctx, pm.Type, pm.Name, version)
+	publishedAt, err := c.PublishedAt(ctx, pm.Type, pm.Name, version)
 	if err != nil {
 		// Not having an upstream timestamp shouldn't fail-closed; short-circuit
 		// with a warn that shows up in the audit but doesn't block.
 		return Result{Check: "age", Action: ActionWarn,
 			Reason: fmt.Sprintf("upstream timestamp unavailable for %s/%s@%s: %v", pm.Type, pm.Name, version, err)}
+	}
+	// Kept on the entry being admitted, which is the one an import writes, so
+	// a hosted index can publish the time the gate already read. The fetch
+	// records it for every other entry; reading it twice gains nothing.
+	if ve.PublishedAt == "" {
+		ve.PublishedAt = publishedAt.UTC().Format(time.RFC3339)
 	}
 
 	age := c.Now().Sub(publishedAt)
@@ -141,10 +147,11 @@ func versionLabel(version string) string {
 	return strconv.Quote(version)
 }
 
-// publishedAt returns the upstream publish timestamp for a given ecosystem's
+// PublishedAt returns the upstream publish timestamp for a given ecosystem's
 // package version. Returns an error for ecosystems without a known upstream
-// timestamp endpoint.
-func (c *AgeChecker) publishedAt(ctx context.Context, ecosystem, name, version string) (time.Time, error) {
+// timestamp endpoint. The builder calls it too, to record the time a hosted
+// index publishes, so the gate and the index read the same field.
+func (c *AgeChecker) PublishedAt(ctx context.Context, ecosystem, name, version string) (time.Time, error) {
 	fn, ok := agePublishers[ecosystem]
 	if !ok {
 		return time.Time{}, fmt.Errorf("ecosystem %q has no upstream timestamp source", ecosystem)
@@ -246,7 +253,10 @@ func (c *AgeChecker) getJSON(ctx context.Context, url string, into any) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("GET %s: HTTP %d", url, resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	// 32 MiB because the npm document is the whole packument, and a package
+	// with a long release history (@types/node, aws-sdk) runs past 4 MiB:
+	// truncated, it fails to parse and the version goes undated.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
 		return err
 	}

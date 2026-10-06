@@ -96,6 +96,10 @@ type Config struct {
 	// no sparse-index shape at all. The index line is the record, so it is
 	// fetched from here rather than reconstructed from the tarball.
 	CargoUpstream string
+	// CratesAPI is the host a crate's publish time is read from, the third
+	// crates.io host beside the index and the download one. Empty means
+	// crates.io; tests point it at a local server.
+	CratesAPI string
 }
 
 // PolicyDisabledNotice is what a fetch prints, once per run, when it holds no
