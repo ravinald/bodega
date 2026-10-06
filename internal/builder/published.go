@@ -34,16 +34,8 @@ func formatPublishedAt(t time.Time) string {
 // publish their times on an API host that the download and index hosts are
 // not, so cargo reads CratesAPI instead.
 func (c *Config) upstreamPublishedAt(ctx context.Context, typ, name, version, upstream string) (string, error) {
-	ac := policy.NewAgeChecker(nil)
-	upstream = strings.TrimRight(strings.TrimSpace(upstream), "/")
-	switch typ {
-	case manifest.TypeNpm:
-		ac.NpmRegistry = orDefault(upstream, defaultNpmRegistry)
-	case manifest.TypePypi:
-		ac.PypiBase = orDefault(upstream, defaultPypiIndex)
-	case manifest.TypeGomod:
-		ac.GoProxy = orDefault(upstream, defaultGoProxy)
-	case manifest.TypeCargo:
+	ac := policy.NewAgeChecker(nil).AtUpstream(typ, upstream)
+	if typ == manifest.TypeCargo {
 		ac.CratesBase = orDefault(strings.TrimRight(c.CratesAPI, "/"), defaultCratesAPI)
 	}
 	t, err := ac.PublishedAt(ctx, typ, name, version)
@@ -187,7 +179,7 @@ func BackfillPublished(cfg *Config, store *manifest.Store, types []string, entry
 					continue
 				}
 				label := pm.Name + "@" + ve.Version
-				if publishedUnpinned(typ, ve.Version) {
+				if policy.UndatableVersion(typ, ve.Version) {
 					continue
 				}
 				if ve.Frozen {
@@ -229,15 +221,6 @@ func BackfillPublished(cfg *Config, store *manifest.Store, types []string, entry
 		}
 	}
 	return res
-}
-
-// publishedUnpinned reports a version string that names no single release.
-func publishedUnpinned(typ, version string) bool {
-	v := strings.TrimSpace(version)
-	if v == "" || v == "*" || v == manifest.ConstraintAny {
-		return true
-	}
-	return typ == manifest.TypeNpm && isNpmDistTag(v)
 }
 
 func gomodInfoPath(cfg *Config, name, version string) string {

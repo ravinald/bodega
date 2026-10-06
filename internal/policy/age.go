@@ -111,12 +111,6 @@ func (c *AgeChecker) Check(ctx context.Context, pm *manifest.PackageManifest, ve
 		return Result{Check: "age", Action: ActionWarn,
 			Reason: fmt.Sprintf("upstream timestamp unavailable for %s/%s@%s: %v", pm.Type, pm.Name, version, err)}
 	}
-	// Kept on the entry being admitted, which is the one an import writes, so
-	// a hosted index can publish the time the gate already read. The fetch
-	// records it for every other entry; reading it twice gains nothing.
-	if ve.PublishedAt == "" {
-		ve.PublishedAt = publishedAt.UTC().Format(time.RFC3339)
-	}
 
 	age := c.Now().Sub(publishedAt)
 	minAge := time.Duration(policy.MinAgeSeconds) * time.Second
@@ -149,14 +143,47 @@ func versionLabel(version string) string {
 
 // PublishedAt returns the upstream publish timestamp for a given ecosystem's
 // package version. Returns an error for ecosystems without a known upstream
-// timestamp endpoint. The builder calls it too, to record the time a hosted
-// index publishes, so the gate and the index read the same field.
+// timestamp endpoint. Fetch and import call it too, to record the time a
+// hosted index publishes, so the gate and the index read the same field.
 func (c *AgeChecker) PublishedAt(ctx context.Context, ecosystem, name, version string) (time.Time, error) {
 	fn, ok := agePublishers[ecosystem]
 	if !ok {
 		return time.Time{}, fmt.Errorf("ecosystem %q has no upstream timestamp source", ecosystem)
 	}
 	return fn(c, ctx, name, version)
+}
+
+// AtUpstream returns a copy of c that reads typ's publish times from
+// upstream, the registry root a manifest entry names in its url, so a recorded
+// time is the one the registry the entry is fetched from publishes. An empty
+// upstream keeps c's endpoint. Cargo is left alone: crates publish their times
+// on an API host that neither the download url nor the index url names.
+func (c *AgeChecker) AtUpstream(typ, upstream string) *AgeChecker {
+	cp := *c
+	upstream = strings.TrimRight(strings.TrimSpace(upstream), "/")
+	if upstream == "" {
+		return &cp
+	}
+	switch typ {
+	case manifest.TypeNpm:
+		cp.NpmRegistry = upstream
+	case manifest.TypePypi:
+		cp.PypiBase = upstream
+	case manifest.TypeGomod:
+		cp.GoProxy = upstream
+	}
+	return &cp
+}
+
+// UndatableVersion reports a version string that names no single release:
+// unset, "*", "any", or an npm dist-tag. No registry can date one, so a caller
+// recording publish times passes it over rather than reporting a failure.
+func UndatableVersion(typ, version string) bool {
+	v := strings.TrimSpace(version)
+	if v == "" || v == "*" || v == manifest.ConstraintAny {
+		return true
+	}
+	return typ == manifest.TypeNpm && v == "latest"
 }
 
 func (c *AgeChecker) npmPublishedAt(ctx context.Context, name, version string) (time.Time, error) {

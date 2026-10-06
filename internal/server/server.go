@@ -1335,6 +1335,12 @@ func (s *Server) handleCreateEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	dated := admit.Result{}
+	admit.RecordPublished(ctx, &pm, nil, &dated)
+	for _, warning := range dated.Warnings {
+		s.logger.Warn("manifest accepted with a warning", "type", t, "name", pm.Name, "warning", warning)
+	}
+
 	if err := s.store.SavePackage(ctx, &pm); err != nil {
 		s.logger.Error("save package failed", "type", t, "name", pm.Name, "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})

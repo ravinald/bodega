@@ -2228,7 +2228,7 @@ An upstream that is reachable but has no timestamp for the version warns rather 
 
 The age gate runs at admission, on the bodega host. Client-side cooldowns now work against hosted packages too: npm `min-release-age` (11.10 and later) and `--before`, pnpm `minimumReleaseAge`, Yarn's age gate, uv `exclude-newer`, pip `--uploaded-prior-to` and Renovate `minimumReleaseAge` all read a publish time out of the index, and bodega's hosted indexes now carry one.
 
-A fetch records the time on the version entry as `published_at`, from the same source the age gate reads (the table above), and an import keeps the time the age gate read when one is configured for the type. The hosted routes publish it as follows:
+A fetch records the time on the version entry as `published_at`, from the same source the age gate reads (the table above). An import (`bodega pkg import`, `POST /api/v1/packages/import` and `POST /api/v1/packages/{type}`) records it too, for every pinned version that arrives without one, whether or not an age policy is set. Both read the registry the entry's `url` names, falling back to the public one when it names none; cargo always reads the crates.io API. An import keeps a `published_at` the manifest already carries, so an exported catalog imported on another host is not read again. The hosted routes publish it as follows:
 
 | Type  | Route                            | Where the time appears                                                                                       |
 | ----- | -------------------------------- | ------------------------------------------------------------------------------------------------------------ |
@@ -2242,7 +2242,7 @@ The pypi page answers PEP 691 JSON (`application/vnd.pypi.simple.v1+json`, `api-
 A version with no `published_at` is left out rather than given an invented time: it has no `time` key in the packument, no `data-upload-time` or `upload-time` on its files, and its `.info` is served as stored. npm and pip treat an undated version as old enough, so an undated version passes every client-side cooldown. A version ends up undated when:
 
 - it was fetched before bodega recorded publish times: run `bodega build fetch --backfill-published` once;
-- the upstream had no time for it, or could not be reached: the fetch prints `WARNING: no publish time recorded` with the reason and stores the artifact anyway;
+- the upstream had no time for it, or could not be reached: the fetch prints `WARNING: no publish time recorded` with the reason and stores the artifact anyway, and an import stores the entry with a `published_at` warning naming the version (printed by `pkg import`, logged at WARN and returned in `warnings` by the API). An import that cannot reach a registry tries it once per package rather than once per version;
 - it is a pypi distribution that arrives only as another entry's dependency, or under an entry that pins no version: the closure is resolved as a whole and there is no entry naming that version to record the time on;
 - it is an npm dist-tag entry such as `latest`, which names no single release.
 
@@ -3253,7 +3253,7 @@ All version entries support:
 | `checksum`           | object | `{"algorithm": "sha256", "value": "hex..."}`                                                                                          |
 | `checksum_verified`  | bool   | Whether checksum matches upstream publisher                                                                                           |
 | `artifact_size`      | int64  | Size in bytes (set at fetch time)                                                                                                     |
-| `published_at`       | string | Upstream publish time, RFC 3339 UTC, recorded at fetch. See [Publish times](#publish-times-in-the-hosted-indexes)                     |
+| `published_at`       | string | Upstream publish time, RFC 3339 UTC, recorded at fetch or import. See [Publish times](#publish-times-in-the-hosted-indexes)           |
 | `hidden`             | bool   | Excludes from client view but keeps in manifest                                                                                       |
 | `frozen`             | bool   | Prevents building, editing, or deletion                                                                                               |
 | `storage`            | string | Backend holding this version's bytes. Absent means `default`; see [Named backends](#named-backends-and-per-type-placement)            |

@@ -239,30 +239,3 @@ func TestAgePolicyPassesAnEntryThatPinsNothing(t *testing.T) {
 		t.Error("the gate queried an upstream for a version that pins nothing")
 	}
 }
-
-// An import writes the entry admission checked, so the time the gate read is
-// kept on it for the hosted indexes to publish. One already recorded stays.
-func TestAgeCheckRecordsPublishedAtOnTheEntry(t *testing.T) {
-	published := time.Date(2018, 4, 9, 1, 22, 46, 500, time.UTC)
-	srv := stubNpm(t, "left-pad", "1.3.0", published)
-	defer srv.Close()
-
-	store := &fakeAgeStore{policies: map[string]audit.AgePolicy{
-		manifest.TypeNpm: {Ecosystem: manifest.TypeNpm, MinAgeSeconds: 1, Action: ActionWarn},
-	}}
-	ck := NewAgeChecker(store)
-	ck.NpmRegistry = srv.URL
-	pm := &manifest.PackageManifest{Name: "left-pad", Type: manifest.TypeNpm}
-
-	ve := &manifest.VersionEntry{Version: "1.3.0"}
-	ck.Check(context.Background(), pm, ve)
-	if ve.PublishedAt != "2018-04-09T01:22:46Z" {
-		t.Errorf("PublishedAt = %q, want 2018-04-09T01:22:46Z", ve.PublishedAt)
-	}
-
-	recorded := &manifest.VersionEntry{Version: "1.3.0", PublishedAt: "2018-04-09T00:00:00Z"}
-	ck.Check(context.Background(), pm, recorded)
-	if recorded.PublishedAt != "2018-04-09T00:00:00Z" {
-		t.Errorf("PublishedAt = %q; the gate overwrote a recorded time", recorded.PublishedAt)
-	}
-}

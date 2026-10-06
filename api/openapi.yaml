@@ -1243,7 +1243,7 @@ components:
           format: date-time
           description: >-
             When upstream published this version, RFC 3339 in UTC, recorded at
-            fetch for npm, pypi, gomod and cargo. The hosted indexes publish
+            fetch or import for npm, pypi, gomod and cargo. The hosted indexes publish
             it; absent means no fetch could read one, and the indexes leave
             the version undated.
         artifact_digest:

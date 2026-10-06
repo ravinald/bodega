@@ -316,9 +316,9 @@ type VersionEntry struct {
 	NpmBin map[string]string `json:"npm_bin,omitempty"`
 
 	// PublishedAt is when upstream published this version, RFC 3339 in UTC,
-	// read from the registry at fetch. The hosted indexes publish it so a
-	// client's own release-age cooldown has something to evaluate. Empty means
-	// no fetch could read one, and the indexes leave the version undated rather
+	// read from the registry at fetch or import. The hosted indexes publish it
+	// so a client's own release-age cooldown has something to evaluate. Empty
+	// means neither could read one, and the indexes leave the version undated rather
 	// than invent a time: npm, pip and uv treat an undated version as old
 	// enough, which is the gap this field exists to close.
 	PublishedAt string `json:"published_at,omitempty"`
