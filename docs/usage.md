@@ -2244,16 +2244,17 @@ pypi       on      age < 3d                  2026-10-06
 
 **Which indexes.** The three bodega proxies from upstream:
 
-| Type  | Index                                   | Proxied when                                                 | Dated by                                                                                                                                                                    |
-| ----- | --------------------------------------- | ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| npm   | the packument, `/npm/<pkg>`             | no manifest entry names the package                          | `time[<version>]` in the packument being served                                                                                                                             |
-| pypi  | the simple page, `/pypi/simple/<dist>/` | the distribution has a proxy-mode entry                      | the earliest PEP 700 `upload-time` per version on the upstream's JSON simple page; for a version with none, the JSON API the age gate reads (`/pypi/<dist>/<version>/json`) |
-| gomod | `/go/<module>/@v/list`                  | no manifest entry names the module, or a proxy-mode one does | `Time` in each version's `.info`, fetched once per version and kept in memory, so a list costs fetches only for versions it has not dated before                            |
+| Type  | Index                                                          | Proxied when                                                  | Dated by                                                                                                                                                                    |
+| ----- | -------------------------------------------------------------- | ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| npm   | the packument, `/npm/<pkg>`                                    | no manifest entry names the package, or a proxy-mode one does | `time[<version>]` in the upstream packument; for a proxy-mode entry, whose packument bodega generates, from `npm_upstream`'s copy                                           |
+| pypi  | the simple page, `/pypi/simple/<dist>/`, HTML and PEP 691 JSON | the distribution has a proxy-mode entry                       | the earliest PEP 700 `upload-time` per version on the upstream's JSON simple page; for a version with none, the JSON API the age gate reads (`/pypi/<dist>/<version>/json`) |
+| gomod | `/go/<module>/@v/list`                                         | no manifest entry names the module, or a proxy-mode one does  | `Time` in each version's `.info`, fetched once per version and kept in memory, so a list costs fetches only for versions it has not dated before                            |
 
-Times come from `npm_upstream`, `pypi_upstream` and `gomod_upstream`, which are the registries the client is being shown. An index bodega generates from its own manifests lists versions admitted on import and is not filtered. A version whose publish time cannot be read stays in the index and is logged at `WARN` with its package and version, so an upstream hiccup never hides a release.
+Times come from `npm_upstream`, `pypi_upstream` and `gomod_upstream`, which are the registries the client is being shown. An index bodega generates from a hosted entry lists versions admitted on import and is not filtered. A version whose publish time cannot be read stays in the index and is logged at `WARN` with its package and version, so an upstream hiccup never hides a release.
 
 **What the client sees.**
 
+- A pypi client whose `Accept` header ranks `application/vnd.pypi.simple.v1+json` above HTML, as pip and uv do, gets the PEP 691 JSON page, filtered the same way and with every `url` on `/pypi/wheels/`. bodega fetches it as `<pypi_upstream>/simple/<dist>/?format=application/vnd.pypi.simple.v1+json`; an index that ignores `format` and answers HTML gets that HTML served instead, which those clients also accept. The response carries `Vary: Accept`.
 - An npm `dist-tags.latest` that names a withheld version is repointed at the newest remaining non-prerelease version, so `npm install widget` with no range still works. Any other tag naming a withheld version is dropped.
 - The response carries `X-Bodega-Filtered: <n>; age=<a>; osv=<o>`, naming how many versions were withheld and by which gate. It is absent when nothing was.
 - When every version is withheld, the index is still served with none listed, so the client prints its own "no matching version" message rather than a transport error.
@@ -2264,7 +2265,6 @@ Times come from `npm_upstream`, `pypi_upstream` and `gomod_upstream`, which are 
 - **It does not rewrite a lockfile.** `npm ci`, `pip install -r` with pinned versions and `go mod download` against an existing `go.sum` name the version without reading the index, so a pinned version that the gate blocks fails on the artifact, as it would without the filter.
 - **It never replaces the artifact-level gate.** With the filter on, the tarball, wheel or `.zip`/`.info`/`.mod` route refuses a withheld version requested directly with a `403` naming the gate, and writes a `denied` row with status `withheld_version`. The index is advice to a resolver; the artifact route is where the decision is enforced.
 - With the filter off, a proxied artifact is not checked against the age or OSV gate at fetch time. Both gates run at admission (`bodega pkg import`, `pkg create`, `POST /api/v1/packages`).
-- bodega serves the simple page as HTML only. It reads the upstream's PEP 691 JSON page for upload times but serves no JSON page of its own, so there is no JSON page to filter.
 - The gomod `@latest` document and the npm version route `/npm/<pkg>/<version>` are not filtered. `go` reads `@latest` only when the list is empty, and both lead to an artifact the route refuses.
 
 ### `bodega discover ...`

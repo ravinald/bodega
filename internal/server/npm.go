@@ -64,6 +64,13 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 		}
 
 		upstream := s.cfg.NpmUpstream + "/" + pkgName + "/-/" + tarball
+		// Both upstream-filled branches below, and neither of the others: a
+		// hosted tarball was admitted on import, and refusing it would be the
+		// mid-install 403 the index filter exists to prevent.
+		proxied := (pm == nil && s.cacheEnabled()) || (pm != nil && packageMode(pm) == manifest.ModeProxy)
+		if proxied && s.refuseWithheld(w, r, manifest.TypeNpm, pkgName, reqVersion) {
+			return
+		}
 		if pm != nil && packageMode(pm) == manifest.ModeProxy {
 			s.proxyOrCache(w, r, s.typeStore(manifest.TypeNpm), storageKey, upstream, manifest.TypeNpm, pkgName, pkgName, true, true)
 			return
@@ -81,9 +88,6 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 		// forcing the fetch would open egress the operator switched off and
 		// serve no client that could not already reach the registry itself.
 		if pm == nil && s.cacheEnabled() {
-			if s.refuseWithheld(w, r, manifest.TypeNpm, pkgName, reqVersion) {
-				return
-			}
 			s.proxyOrCache(w, r, s.typeStore(manifest.TypeNpm), storageKey, upstream, manifest.TypeNpm, pkgName, pkgName, true, false)
 			return
 		}
@@ -242,6 +246,18 @@ func (s *Server) serveManifestPackument(w http.ResponseWriter, r *http.Request, 
 	}
 	versions, _ := doc["versions"].(map[string]any)
 
+	// A proxy-mode entry's tarballs are filled from upstream through the
+	// withheld-version gate, so its packument withholds the same versions:
+	// listed, they are what npm picks and then gets refused. Ahead of latest
+	// so the tag names a version that survived.
+	var withhold *indexWithhold
+	if reqVersion == "" && packageMode(pm) == manifest.ModeProxy {
+		withhold = s.indexWithholdFor(r, manifest.TypeNpm, pkgName)
+	}
+	if withhold != nil {
+		withhold.versionsMap(versions)
+	}
+
 	if reqVersion != "" {
 		entry, ok := versions[reqVersion]
 		if !ok {
@@ -265,6 +281,9 @@ func (s *Server) serveManifestPackument(w http.ResponseWriter, r *http.Request, 
 		s.logger.Error("packument generation failed", "pkg", pkgName, "error", err)
 		http.Error(w, "packument generation failed", http.StatusInternalServerError)
 		return
+	}
+	if withhold != nil {
+		withhold.finish(w.Header())
 	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusOK)

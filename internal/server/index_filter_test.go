@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -216,6 +217,91 @@ func TestIndexFilterNpm(t *testing.T) {
 	})
 }
 
+// A proxy-mode entry's packument is generated from the manifest rather than
+// proxied, and its tarballs are filled from upstream all the same, so it
+// withholds and refuses exactly what the uncatalogued path does.
+func TestIndexFilterNpmProxyModeEntry(t *testing.T) {
+	s := filteringServer(t, manifest.TypeNpm)
+	s.cfg.NpmUpstream = npmFilterUpstream(t).URL
+	pm := &manifest.PackageManifest{ConfigVersion: manifest.CurrentConfigVersion, Name: "widget", Type: manifest.TypeNpm}
+	for _, v := range []string{"4.0.5", "4.1.0", "4.2.0", "4.3.0"} {
+		pm.Versions = append(pm.Versions, manifest.VersionEntry{Version: v, Mode: manifest.ModeProxy})
+	}
+	if err := s.store.SavePackage(t.Context(), pm); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := get(t, s, "/npm/widget")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("packument status = %d, body %s", rec.Code, rec.Body)
+	}
+	var doc struct {
+		DistTags map[string]string          `json:"dist-tags"`
+		Versions map[string]json.RawMessage `json:"versions"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	var listed []string
+	for v := range doc.Versions {
+		listed = append(listed, v)
+	}
+
+	t.Run("a range resolves to the newest compliant version", func(t *testing.T) {
+		if got := newestMatching(listed, "4.1.0"); got != "4.2.0" {
+			t.Errorf("^4.1.0 resolves to %q against %v, want 4.2.0", got, listed)
+		}
+	})
+	t.Run("latest names a version that survived", func(t *testing.T) {
+		if got := doc.DistTags["latest"]; got != "4.2.0" {
+			t.Errorf("latest = %q, want 4.2.0", got)
+		}
+	})
+	t.Run("a version with no publish time is kept", func(t *testing.T) {
+		if _, ok := doc.Versions["4.0.5"]; !ok {
+			t.Errorf("4.0.5 has no time entry upstream and was dropped: %v", listed)
+		}
+	})
+	t.Run("the response names what it withheld", func(t *testing.T) {
+		if got := rec.Header().Get(filteredHeader); got != "1; age=1" {
+			t.Errorf("%s = %q, want \"1; age=1\"", filteredHeader, got)
+		}
+		if rows := filterRows(t, s, manifest.TypeNpm, "widget"); len(rows) != 1 {
+			t.Errorf("got %d index_filtered rows for one request, want 1", len(rows))
+		}
+	})
+	t.Run("a direct request for the withheld tarball is refused", func(t *testing.T) {
+		if rec := get(t, s, "/npm/widget/-/widget-4.3.0.tgz"); rec.Code != http.StatusForbidden {
+			t.Errorf("withheld tarball status = %d, want 403 (body %s)", rec.Code, rec.Body)
+		}
+		if !deniedWithheld(t, s, manifest.TypeNpm, "widget", "4.3.0") {
+			t.Error("no withheld_version denial row for 4.3.0")
+		}
+		if rec := get(t, s, "/npm/widget/-/widget-4.2.0.tgz"); rec.Code != http.StatusOK {
+			t.Errorf("compliant tarball status = %d, want 200 (body %s)", rec.Code, rec.Body)
+		}
+	})
+}
+
+// A hosted entry was admitted on import, so neither its packument nor its
+// tarball route consults the filter.
+func TestIndexFilterNpmHostedEntryUntouched(t *testing.T) {
+	s := filteringServer(t, manifest.TypeNpm)
+	s.cfg.NpmUpstream = npmFilterUpstream(t).URL
+	pm := &manifest.PackageManifest{ConfigVersion: manifest.CurrentConfigVersion, Name: "widget", Type: manifest.TypeNpm,
+		Versions: []manifest.VersionEntry{{Version: "4.3.0", Mode: manifest.ModeHosted}}}
+	if err := s.store.SavePackage(t.Context(), pm); err != nil {
+		t.Fatal(err)
+	}
+	rec := get(t, s, "/npm/widget")
+	if !strings.Contains(rec.Body.String(), `"4.3.0"`) || rec.Header().Get(filteredHeader) != "" {
+		t.Errorf("hosted 4.3.0 withheld; header %q, body %s", rec.Header().Get(filteredHeader), rec.Body)
+	}
+	if rec := get(t, s, "/npm/widget/-/widget-4.3.0.tgz"); rec.Code == http.StatusForbidden {
+		t.Errorf("hosted tarball refused as withheld: %s", rec.Body)
+	}
+}
+
 // A warn gate, or the filter off, leaves the packument as upstream wrote it:
 // the filter applies a block and nothing weaker.
 func TestIndexFilterNpmOffOrWarnWithholdsNothing(t *testing.T) {
@@ -273,17 +359,23 @@ func pypiFilterUpstream(t *testing.T) *httptest.Server {
 			http.NotFound(w, r)
 			return
 		}
-		if strings.Contains(r.Header.Get("Accept"), pypiJSONSimple) {
-			var out []map[string]string
+		if strings.Contains(r.Header.Get("Accept"), pypiJSONSimple) || r.URL.Query().Get("format") == pypiJSONSimple {
+			var out []map[string]any
+			var versions []string
 			for _, f := range files {
-				e := map[string]string{"filename": f.name, "url": "/files/" + f.name}
+				e := map[string]any{"filename": f.name, "url": "/files/" + f.name,
+					"hashes": map[string]string{"sha256": "00"}, "core-metadata": true}
 				if f.ago > 0 {
 					e["upload-time"] = stamp(f.ago)
 				}
 				out = append(out, e)
+				if v := pypiPageVersion(dist, f.name); !slices.Contains(versions, v) {
+					versions = append(versions, v)
+				}
 			}
 			w.Header().Set("Content-Type", pypiJSONSimple)
-			_ = json.NewEncoder(w).Encode(map[string]any{"name": dist, "files": out})
+			_ = json.NewEncoder(w).Encode(map[string]any{"meta": map[string]string{"api-version": "1.1"},
+				"name": dist, "files": out, "versions": versions})
 			return
 		}
 		var b strings.Builder
@@ -370,6 +462,142 @@ func TestIndexFilterPypi(t *testing.T) {
 			t.Errorf("page still links a file: %s", rec.Body)
 		}
 	})
+}
+
+// pipAccept is the Accept header pip 24 sends to a simple index.
+const pipAccept = "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html; q=0.1, text/html; q=0.01"
+
+type pypiJSONPage struct {
+	Files []struct {
+		Filename     string            `json:"filename"`
+		URL          string            `json:"url"`
+		Hashes       map[string]string `json:"hashes"`
+		CoreMetadata any               `json:"core-metadata"`
+	} `json:"files"`
+	Versions []string `json:"versions"`
+}
+
+func TestIndexFilterPypiJSON(t *testing.T) {
+	s := filteringServer(t, manifest.TypePypi)
+	up := pypiFilterUpstream(t)
+	s.cfg.PypiUpstream = up.URL
+	seedProxyPypi(t, s, "widget", up.URL)
+	seedProxyPypi(t, s, "fresh", up.URL)
+
+	rec := get(t, s, "/pypi/simple/widget/", "Accept", pipAccept)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("JSON simple page status = %d, body %s", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("Content-Type"); got != pypiJSONSimple {
+		t.Fatalf("Content-Type = %q, want %s (body %s)", got, pypiJSONSimple, rec.Body)
+	}
+	if got := rec.Header().Get("Vary"); !strings.Contains(got, "Accept") {
+		t.Errorf("Vary = %q, want Accept", got)
+	}
+	var page pypiJSONPage
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	var listed []string
+	for _, f := range page.Files {
+		listed = append(listed, pypiPageVersion("widget", f.Filename))
+	}
+
+	t.Run("a range resolves to the newest compliant version", func(t *testing.T) {
+		if got := newestMatching(listed, "4.1.0"); got != "4.2.0" {
+			t.Errorf(">=4.1,<5 resolves to %q against %v, want 4.2.0", got, listed)
+		}
+		if slices.Contains(page.Versions, "4.3.0") || !slices.Contains(page.Versions, "4.2.0") {
+			t.Errorf("versions = %v, want 4.3.0 gone and 4.2.0 kept", page.Versions)
+		}
+	})
+	t.Run("every file lands on bodega with its hashes and without the metadata promise", func(t *testing.T) {
+		for _, f := range page.Files {
+			if f.URL != "/pypi/wheels/"+f.Filename {
+				t.Errorf("%s url = %q, want the wheel route", f.Filename, f.URL)
+			}
+			if f.Hashes["sha256"] != "00" {
+				t.Errorf("%s lost its hashes", f.Filename)
+			}
+			if f.CoreMetadata != nil {
+				t.Errorf("%s still promises core-metadata bodega cannot serve", f.Filename)
+			}
+		}
+	})
+	t.Run("a version with no publish time is kept", func(t *testing.T) {
+		if !slices.Contains(listed, "4.0.5") {
+			t.Errorf("4.0.5 has no upload-time and was dropped: %v", listed)
+		}
+	})
+	t.Run("the response names what it withheld", func(t *testing.T) {
+		if got := rec.Header().Get(filteredHeader); got != "1; age=1" {
+			t.Errorf("%s = %q, want \"1; age=1\"", filteredHeader, got)
+		}
+		if rows := filterRows(t, s, manifest.TypePypi, "widget"); len(rows) != 1 {
+			t.Errorf("got %d index_filtered rows for one request, want 1", len(rows))
+		}
+	})
+	t.Run("a direct request for the withheld wheel is refused", func(t *testing.T) {
+		if rec := get(t, s, "/pypi/wheels/widget-4.3.0-py3-none-any.whl"); rec.Code != http.StatusForbidden {
+			t.Errorf("withheld wheel status = %d, want 403 (body %s)", rec.Code, rec.Body)
+		}
+	})
+	t.Run("all filtered still serves the page", func(t *testing.T) {
+		rec := get(t, s, "/pypi/simple/fresh/", "Accept", pipAccept)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 so pip reports no matching distribution itself", rec.Code)
+		}
+		var page pypiJSONPage
+		if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+			t.Fatal(err)
+		}
+		if len(page.Files) != 0 || len(page.Versions) != 0 {
+			t.Errorf("files = %v, versions = %v; want both empty", page.Files, page.Versions)
+		}
+	})
+	t.Run("a client preferring HTML still gets HTML", func(t *testing.T) {
+		rec := get(t, s, "/pypi/simple/widget/", "Accept", "text/html, */*")
+		if strings.HasPrefix(strings.TrimSpace(rec.Body.String()), "{") || strings.Contains(rec.Body.String(), "widget-4.3.0") {
+			t.Errorf("HTML request answered %q", rec.Body)
+		}
+	})
+}
+
+// An upstream that ignores ?format= answers HTML, and the client asking for
+// JSON gets that HTML, filtered and rewritten, rather than an error.
+func TestIndexFilterPypiJSONUpstreamAnswersHTML(t *testing.T) {
+	s := filteringServer(t, manifest.TypePypi)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = fmt.Fprintf(w, `<a href="/files/widget-4.2.0-py3-none-any.whl#sha256=00">a</a>`+"\n"+
+			`<a href="/files/widget-4.3.0-py3-none-any.whl#sha256=00">b</a>`+"\n")
+	}))
+	t.Cleanup(ts.Close)
+	s.cfg.PypiUpstream = ts.URL
+	seedProxyPypi(t, s, "widget", ts.URL)
+	s.publishTimes.put(manifest.TypePypi, "widget", "4.2.0", filterNow.Add(-filterOld["2.0"]))
+	s.publishTimes.put(manifest.TypePypi, "widget", "4.3.0", filterNow.Add(-24*time.Hour))
+
+	rec := get(t, s, "/pypi/simple/widget/", "Accept", pipAccept)
+	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), "4.3.0") || !strings.Contains(rec.Body.String(), `href="/pypi/wheels/widget-4.2.0`) {
+		t.Errorf("status %d, body %s; want the HTML page filtered and rewritten", rec.Code, rec.Body)
+	}
+}
+
+func TestPypiWantsJSON(t *testing.T) {
+	for accept, want := range map[string]bool{
+		pipAccept:                             true,
+		"application/vnd.pypi.simple.v1+json": true,
+		"application/vnd.pypi.simple.v1+json;q=0.5, text/html": false,
+		"text/html": false,
+		"*/*":       false,
+		"":          false,
+		"application/vnd.pypi.simple.v1+json;q=0": false,
+	} {
+		if got := pypiWantsJSON(accept); got != want {
+			t.Errorf("pypiWantsJSON(%q) = %v, want %v", accept, got, want)
+		}
+	}
 }
 
 // ---- gomod ------------------------------------------------------------------

@@ -748,7 +748,7 @@ read -r pypi_window pypi_newest pypi_want <<<"$(printf '%s\n' "$E2E_OUT" | sed -
 E2E_HOST=server
 e2e_bodega server "show pkg pypi $filter_pypi" || true
 if [ "$E2E_RC" = 0 ] || [ -z "${npm_want:-}" ] || [ -z "${pypi_want:-}" ]; then
-	for id in PXY-FILTER-01 PXY-FILTER-NPM-01 PXY-FILTER-NPM-02 PXY-FILTER-NPM-03 PXY-FILTER-PIP-01 PXY-FILTER-PIP-02 PXY-FILTER-PIP-03 PXY-FILTER-02; do
+	for id in PXY-FILTER-01 PXY-FILTER-NPM-01 PXY-FILTER-NPM-02 PXY-FILTER-NPM-03 PXY-FILTER-PIP-01 PXY-FILTER-PIP-02 PXY-FILTER-PIP-03 PXY-FILTER-PIP-04 PXY-FILTER-PIP-05 PXY-FILTER-02; do
 		e2e_skip "$id" "the index filter steers npm and pip to the newest release outside the window" \
 			"pypi/$filter_pypi is already cataloged on this server, or PXY-FILTER-00 computed no window" \
 			"internal/server/index_filter.go"
@@ -801,6 +801,15 @@ else
 	check_lacks PXY-FILTER-PIP-03 "the simple page links no file of the withheld $filter_pypi $pypi_newest" \
 		"$filter_pypi-$pypi_newest" "$E2E_OUT" \
 		"internal/server/index_filter.go" "GET /pypi/simple/$filter_pypi/"
+	# pip asks for PEP 691 JSON first, so the install above went through it;
+	# this pins that the page it read was JSON and was filtered.
+	e2e_on client "curl -s --max-time ${E2E_HTTP_TIMEOUT:-60} -H 'Accept: application/vnd.pypi.simple.v1+json' '$E2E_BASE_URL/pypi/simple/$filter_pypi/'" || true
+	check_contains PXY-FILTER-PIP-04 "the PEP 691 JSON page for $filter_pypi is served as JSON" \
+		'"files"' "$E2E_OUT" \
+		"internal/server/pypi.go: republishPypiJSON" "GET /pypi/simple/$filter_pypi/ (Accept: PEP 691 JSON)"
+	check_lacks PXY-FILTER-PIP-05 "the JSON page lists no file of the withheld $filter_pypi $pypi_newest" \
+		"$filter_pypi-$pypi_newest" "$E2E_OUT" \
+		"internal/server/pypi.go: republishPypiJSON" "GET /pypi/simple/$filter_pypi/ (Accept: PEP 691 JSON)"
 
 	E2E_HOST=server
 	e2e_bodega server "audit events --type cache --limit 200" || true

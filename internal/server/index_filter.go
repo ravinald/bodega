@@ -250,6 +250,19 @@ func (iw *indexWithhold) packument(body []byte) ([]byte, error) {
 	return json.Marshal(doc)
 }
 
+// versionsMap withholds from the versions object of a packument bodega
+// generated from a manifest entry. That document carries no time map, so the
+// versions are dated from the upstream's.
+func (iw *indexWithhold) versionsMap(versions map[string]any) {
+	listed := make([]string, 0, len(versions))
+	for v := range versions {
+		listed = append(listed, v)
+	}
+	for v := range iw.decide(listed, iw.s.publishTimesFor(iw.r.Context(), iw.eco, iw.name, listed)) {
+		delete(versions, v)
+	}
+}
+
 // npmNewestRelease is the highest non-prerelease version in a packument's
 // versions object. A prerelease is never promoted to latest: npm itself only
 // moves latest there when a publisher says so.
@@ -288,6 +301,28 @@ func (iw *indexWithhold) pypiPage(body []byte) []byte {
 		return body
 	}
 	return filterPypiSimplePage(body, iw.name, func(v string) bool { _, ok := withheld[v]; return !ok })
+}
+
+// pypiJSON decides a proxied PEP 691 page, dating each version by the
+// earliest upload-time the page itself carries and reading the rest the way
+// the HTML page does.
+func (iw *indexWithhold) pypiJSON(listed []string, uploaded map[string]time.Time) map[string]string {
+	times := make(map[string]time.Time, len(listed))
+	var undated []string
+	for _, v := range listed {
+		if t, ok := uploaded[v]; ok {
+			times[v] = t
+			iw.s.publishTimes.put(iw.eco, iw.name, v, t)
+		} else {
+			undated = append(undated, v)
+		}
+	}
+	if len(undated) > 0 {
+		for v, t := range iw.s.publishTimesFor(iw.r.Context(), iw.eco, iw.name, undated) {
+			times[v] = t
+		}
+	}
+	return iw.decide(listed, times)
 }
 
 // gomodList withholds from a proxied @v/list.
