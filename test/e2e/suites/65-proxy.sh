@@ -690,4 +690,144 @@ else
 		"the route answered ${E2E_OUT:-nothing} rather than the refusal, which PXY-PYPI-NAME-03 reports" "internal/server/pypi.go:259"
 fi
 
+# ---- the index filter: the resolver picks around a blocked version ---------
+#
+# A blocking age gate on its own refuses the newest release and the client has
+# nothing to route around it with. With `policy filter` on, the packument and
+# the simple page omit that release, so a bare `npm install` and `pip install`
+# settle on the newest one outside the window. Measured by what lands on the
+# client, not by the index: a filtered document npm or pip then misreads is the
+# failure the unit tests cannot see.
+#
+# The window is computed from the live registries rather than pinned: the
+# midpoint between the newest release and the one before it, so exactly the
+# newest is inside it whatever the date. The script refuses a package whose
+# two newest releases are under 48 hours apart, where the minutes between this
+# computation and the server's would decide the answer.
+
+FILTER_ROOT="${E2E_CLIENT_ROOT:-/var/tmp/bodega-e2e-clients}/filter"
+filter_npm=is-number
+filter_pypi=iniconfig
+filter_py='import datetime as dt, json, sys, urllib.request
+eco, name = sys.argv[1], sys.argv[2]
+now = dt.datetime.now(dt.timezone.utc)
+def when(s): return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+if eco == "npm":
+    d = json.load(urllib.request.urlopen("https://registry.npmjs.org/" + name, timeout=30))
+    rel = {v: when(d["time"][v]) for v in d["versions"] if v in d["time"] and "-" not in v}
+    key = lambda v: tuple(int(x) for x in v.split("."))
+    latest = d.get("dist-tags", {}).get("latest", "")
+else:
+    from pip._vendor.packaging.version import Version
+    d = json.load(urllib.request.urlopen("https://pypi.org/pypi/%s/json" % name, timeout=30))
+    rel = {}
+    for v, files in d["releases"].items():
+        ts = [when(f["upload_time_iso_8601"]) for f in files if not f.get("yanked")]
+        if ts and not Version(v).is_prerelease:
+            rel[v] = min(ts)
+    key, latest = Version, ""
+order = sorted(rel, key=lambda v: rel[v], reverse=True)
+hours = lambda v: (now - rel[v]).total_seconds() / 3600
+if hours(order[1]) - hours(order[0]) < 48:
+    sys.exit("newest two releases of %s are under 48h apart" % name)
+window = int((hours(order[0]) + hours(order[1])) / 2)
+kept = [v for v in rel if hours(v) >= window]
+print(window, order[0], latest if latest in kept else max(kept, key=key))'
+
+E2E_HOST=client
+e2e_on client "rm -rf $FILTER_ROOT && mkdir -p $FILTER_ROOT && cat > $FILTER_ROOT/window.py <<'E2EPY'
+$filter_py
+E2EPY
+python3 $FILTER_ROOT/window.py npm $filter_npm && python3 $FILTER_ROOT/window.py pypi $filter_pypi" || true
+check_matches PXY-FILTER-00 "an age window holding only the newest npm and pypi release is computed" \
+	'^[0-9]+ [^ ]+ [^ ]+$' "$E2E_OUT" \
+	"test/e2e/suites/65-proxy.sh" "python3 window.py npm $filter_npm; python3 window.py pypi $filter_pypi" "$E2E_RC"
+read -r npm_window npm_newest npm_want <<<"$(printf '%s\n' "$E2E_OUT" | sed -n 1p)"
+read -r pypi_window pypi_newest pypi_want <<<"$(printf '%s\n' "$E2E_OUT" | sed -n 2p)"
+
+E2E_HOST=server
+e2e_bodega server "show pkg pypi $filter_pypi" || true
+if [ "$E2E_RC" = 0 ] || [ -z "${npm_want:-}" ] || [ -z "${pypi_want:-}" ]; then
+	for id in PXY-FILTER-01 PXY-FILTER-NPM-01 PXY-FILTER-NPM-02 PXY-FILTER-NPM-03 PXY-FILTER-PIP-01 PXY-FILTER-PIP-02 PXY-FILTER-PIP-03 PXY-FILTER-02; do
+		e2e_skip "$id" "the index filter steers npm and pip to the newest release outside the window" \
+			"pypi/$filter_pypi is already cataloged on this server, or PXY-FILTER-00 computed no window" \
+			"internal/server/index_filter.go"
+	done
+else
+	# The age rows in force before this section, restored after it. A row
+	# that was absent is removed rather than set to anything.
+	e2e_bodega server "policy age list" || true
+	age_before="$E2E_OUT"
+	pypi_fx="{\"config_version\": 1, \"name\": \"$filter_pypi\", \"type\": \"pypi\", \"versions\": [{\"version\": \"$pypi_want\", \"mode\": \"proxy\"}]}"
+	e2e_on server "printf '%s\n' '$pypi_fx' > /tmp/e2e-filter-pypi.json" || true
+	e2e_bodega server "pkg import /tmp/e2e-filter-pypi.json" || true
+	e2e_config_set server '.proxy_cache_enabled = true' || true
+	e2e_restart server || true
+	e2e_bodega server "policy age set npm ${npm_window}h block && sudo bodega policy age set pypi ${pypi_window}h block && \
+		sudo bodega policy filter set npm on && sudo bodega policy filter set pypi on && sudo bodega policy filter list" || true
+	check_matches PXY-FILTER-01 "the filter is on for npm and pypi, withholding by age" \
+		'npm +on +age < ' "$E2E_OUT" \
+		"cmd/bodega/cmd_policy_filter.go" "bodega policy filter set npm on; bodega policy filter list" "$E2E_RC"
+
+	# --cache at a scratch path for the reason CLI-NPM-01 gives: npm's own
+	# cache would answer the packument without asking bodega.
+	E2E_HOST=client
+	e2e_on client "mkdir -p $FILTER_ROOT/npm && cd $FILTER_ROOT/npm && \
+		npm install --no-audit --no-fund --cache '$FILTER_ROOT/npm-cache' --registry '$E2E_BASE_URL/npm' $filter_npm 2>&1 | tail -8" || true
+	check_eq PXY-FILTER-NPM-01 "npm installs $filter_npm through the filtered packument" 0 "$E2E_RC" \
+		"internal/server/npm.go:155" "npm install --registry $E2E_BASE_URL/npm $filter_npm" "$E2E_RC"
+	e2e_on client "node -p \"require('$FILTER_ROOT/npm/node_modules/$filter_npm/package.json').version\"" || true
+	check_eq PXY-FILTER-NPM-02 "npm installed the newest $filter_npm outside the window, not $npm_newest" \
+		"$npm_want" "$E2E_OUT" \
+		"internal/server/index_filter.go: latest repointed past the withheld release" \
+		"node -p require('node_modules/$filter_npm/package.json').version"
+	e2e_http client "/npm/$filter_npm/-/$filter_npm-$npm_newest.tgz" || true
+	check_eq PXY-FILTER-NPM-03 "the withheld $filter_npm $npm_newest tarball is refused when asked for directly" \
+		"403" "$E2E_OUT" \
+		"internal/server/index_filter.go: refuseWithheld" "GET /npm/$filter_npm/-/$filter_npm-$npm_newest.tgz"
+
+	# --trusted-host for the reason CLI-PYPI-01 gives.
+	e2e_on client "python3 -m venv $FILTER_ROOT/venv && \
+		$FILTER_ROOT/venv/bin/pip install --quiet --no-cache-dir --trusted-host '$E2E_SERVER_HOST' \
+		--index-url '$E2E_BASE_URL/pypi/simple/' $filter_pypi 2>&1 | tail -5" || true
+	check_eq PXY-FILTER-PIP-01 "pip installs $filter_pypi through the filtered simple page" 0 "$E2E_RC" \
+		"internal/server/pypi.go:139" "pip install --index-url $E2E_BASE_URL/pypi/simple/ $filter_pypi" "$E2E_RC"
+	e2e_on client "$FILTER_ROOT/venv/bin/python -c 'import importlib.metadata as m; print(m.version(\"$filter_pypi\"))'" || true
+	check_eq PXY-FILTER-PIP-02 "pip installed the newest $filter_pypi outside the window, not $pypi_newest" \
+		"$pypi_want" "$E2E_OUT" \
+		"internal/server/index_filter.go: the simple page omits the withheld release" \
+		"python -c 'importlib.metadata.version(\"$filter_pypi\")'"
+	e2e_body client "/pypi/simple/$filter_pypi/" || true
+	check_lacks PXY-FILTER-PIP-03 "the simple page links no file of the withheld $filter_pypi $pypi_newest" \
+		"$filter_pypi-$pypi_newest" "$E2E_OUT" \
+		"internal/server/index_filter.go" "GET /pypi/simple/$filter_pypi/"
+
+	E2E_HOST=server
+	e2e_bodega server "audit events --type cache --limit 200" || true
+	check_contains PXY-FILTER-02 "the trail records the filter acting" \
+		"index_filtered" "$E2E_OUT" \
+		"internal/server/index_filter.go: finish" "bodega audit events --type cache"
+
+	# ---- restore ----
+	for eco in npm pypi; do
+		row="$(printf '%s\n' "$age_before" | awk -v e="$eco" '$1 == e {print $2, $3}')"
+		if [ -n "$row" ]; then
+			e2e_bodega server "policy age set $eco $row" || true
+		else
+			e2e_bodega server "policy age remove $eco" || true
+		fi
+		check_eq "PXY-FILTER-RESTORE-$eco" "the $eco age policy is put back" 0 "$E2E_RC" \
+			"cmd/bodega/cmd_policy_age.go" "bodega policy age set $eco ${row:-(removed)}" "$E2E_RC"
+		e2e_bodega server "policy filter set $eco off" || true
+	done
+	e2e_bodega server "pkg delete pypi $filter_pypi" || true
+	e2e_on server "sudo rm -f /tmp/e2e-filter-pypi.json; sudo rm -f /var/lib/bodega/pypi/wheels/$filter_pypi-*; true" || true
+	e2e_config_set server '.proxy_cache_enabled = false' || true
+	e2e_restart server || true
+	check_eq PXY-FILTER-RESTORE "the server restarts with proxy caching off again" 0 "$E2E_RC" \
+		"internal/server/proxy.go:281" "systemctl restart bodega" "$E2E_RC"
+fi
+e2e_on client "rm -rf $FILTER_ROOT; true" || true
+
+unset filter_py filter_npm filter_pypi npm_window npm_newest npm_want pypi_window pypi_newest pypi_want age_before row FILTER_ROOT
 unset pypi_fx discover_mode bootstrap_dist

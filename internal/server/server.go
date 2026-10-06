@@ -75,15 +75,20 @@ type Server struct {
 	cache         CacheConfig
 	auditDB       *audit.DB
 	policy        *policy.Checker
-	discoverMode  string             // "" or "observe" — see internal/server/discovery.go
-	discovery     *DiscoveryRecorder // nil when discover_mode == "" or auditDB == nil
-	denyNets      []*net.IPNet
-	adminNets     []*net.IPNet // CIDRs allowed to reach the admin surface (admin_permit_cidr)
-	adminErr      error        // set when admin_permit_cidr parses to nothing; Start refuses on it
-	auditErr      error        // set when the configured audit sink will not record; Start refuses on it
-	pepperErr     error        // set when the pepper in force is unreadable; Start refuses on it
-	spool         *spoolLimiter
-	spoolErr      error // set when spool_dir cannot be created or written; Start refuses on it
+	// indexFilter decides which versions a proxied index withholds; nil with
+	// no audit database, which holds its switch. publishTimes caches the
+	// upstream publish times it decides by.
+	indexFilter  *policy.IndexFilter
+	publishTimes publishTimes
+	discoverMode string             // "" or "observe" — see internal/server/discovery.go
+	discovery    *DiscoveryRecorder // nil when discover_mode == "" or auditDB == nil
+	denyNets     []*net.IPNet
+	adminNets    []*net.IPNet // CIDRs allowed to reach the admin surface (admin_permit_cidr)
+	adminErr     error        // set when admin_permit_cidr parses to nothing; Start refuses on it
+	auditErr     error        // set when the configured audit sink will not record; Start refuses on it
+	pepperErr    error        // set when the pepper in force is unreadable; Start refuses on it
+	spool        *spoolLimiter
+	spoolErr     error // set when spool_dir cannot be created or written; Start refuses on it
 	// fills holds a proxied key from the moment its bytes reach the store
 	// until its origin row does, so a hit arriving inside that window can
 	// still name the fetch it is reading. See internal/server/proxy.go.
@@ -357,6 +362,7 @@ func newServer(cfg *config.Config, store *manifest.Store, stores storage.Resolve
 			}
 			s.auditDB = db
 			s.policy = policy.NewChecker(db)
+			s.indexFilter = policy.NewIndexFilter(db, admit.OSVChecker(cfg, db))
 			logger.Info("audit store opened", "path", dbPath, "sink", db.SinkName(), "queryable", db.EventsQueryable())
 			if !db.EventsQueryable() {
 				// Not a failure: the operator chose a write-only sink. It

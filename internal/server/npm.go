@@ -81,6 +81,9 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 		// forcing the fetch would open egress the operator switched off and
 		// serve no client that could not already reach the registry itself.
 		if pm == nil && s.cacheEnabled() {
+			if s.refuseWithheld(w, r, manifest.TypeNpm, pkgName, reqVersion) {
+				return
+			}
 			s.proxyOrCache(w, r, s.typeStore(manifest.TypeNpm), storageKey, upstream, manifest.TypeNpm, pkgName, pkgName, true, false)
 			return
 		}
@@ -151,6 +154,9 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 	upstream := s.cfg.NpmUpstream + "/" + fullPath
 	s3Key := manifest.NpmPackumentKey(fullPath)
 	rw := &npmPackumentWriter{ResponseWriter: w, base: s.npmPublicRoot(r), pkg: fullPath, permit: permit}
+	if reqVersion == "" {
+		rw.withhold = s.indexWithholdFor(r, manifest.TypeNpm, pkgName)
+	}
 	s.proxyOrCache(rw, r, s.typeStore(manifest.TypeNpm), s3Key, upstream, manifest.TypeNpm, pkgName, pkgName, false, false)
 	if err := rw.flush(); err != nil {
 		s.logger.Error("npm packument response failed", "package", pkgName, "error", err)
@@ -473,9 +479,13 @@ type npmPackumentWriter struct {
 	// profile governs it. Applied before the tarball rewrite, so a version the
 	// profile refuses never acquires a bodega URL to be fetched by.
 	permit func(string) bool
-	status int
-	body   bytes.Buffer
-	tooBig bool
+	// withhold is the index filter's pass, nil when it is off for npm. It
+	// runs after the profile filter, so it dates only versions this host
+	// could have been shown.
+	withhold *indexWithhold
+	status   int
+	body     bytes.Buffer
+	tooBig   bool
 }
 
 func (p *npmPackumentWriter) WriteHeader(code int) {
@@ -518,6 +528,13 @@ func (p *npmPackumentWriter) flush() error {
 		if err != nil {
 			http.Error(p.ResponseWriter, "packument filter failed", http.StatusBadGateway)
 			return err
+		}
+		if p.withhold != nil {
+			if filtered, err = p.withhold.packument(filtered); err != nil {
+				http.Error(p.ResponseWriter, "packument filter failed", http.StatusBadGateway)
+				return err
+			}
+			p.withhold.finish(p.Header())
 		}
 		rewritten, err := rewriteNpmPackument(filtered, p.base, p.pkg)
 		if err != nil {

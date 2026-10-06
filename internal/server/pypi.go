@@ -138,7 +138,8 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 	// /pypi/wheels/, which answers from storage before it reaches the network.
 	if pkg != nil && packageMode(pkg) == manifest.ModeProxy {
 		upstream := s.pypiSimpleURL(normalized)
-		rw := &pypiIndexWriter{ResponseWriter: w, indexURL: upstream, pkg: pkgName, permit: permit}
+		rw := &pypiIndexWriter{ResponseWriter: w, indexURL: upstream, pkg: pkgName, permit: permit,
+			withhold: s.indexWithholdFor(r, manifest.TypePypi, normalized)}
 		s.proxyOrCache(rw, r, s.typeStore(manifest.TypePypi),
 			"pypi/simple/"+normalized+"/index.html",
 			upstream, manifest.TypePypi, pkgName, pkgName, false, true)
@@ -261,6 +262,9 @@ func (s *Server) handlePypiWheel(w http.ResponseWriter, r *http.Request) {
 	if dist != "" {
 		pkg, _ := s.store.GetPackage(r.Context(), manifest.TypePypi, normalized)
 		if pkg != nil && packageMode(pkg) == manifest.ModeProxy {
+			if s.refuseWithheld(w, r, manifest.TypePypi, normalized, distVersion) {
+				return
+			}
 			resolve := func(ctx context.Context) (string, error) {
 				return s.resolvePypiWheel(ctx, normalized, file)
 			}
@@ -340,8 +344,12 @@ type pypiIndexWriter struct {
 	// profile governs it. Applied before the href rewrite so the two passes
 	// read the upstream filenames rather than one reading the other's output.
 	permit func(string) bool
-	status int
-	body   bytes.Buffer
+	// withhold is the index filter's pass, nil when it is off for pypi. Run
+	// after the profile filter and before the rewrite, for the reason permit
+	// is: both read the upstream filenames.
+	withhold *indexWithhold
+	status   int
+	body     bytes.Buffer
 	// tooBig records that the upstream ran past maxUpstreamBody. B33 settled
 	// the same question for the npm packument: serving an unrewritten body is
 	// the bypass the rewrite exists to close, so refusing is the honest answer
@@ -387,7 +395,12 @@ func (p *pypiIndexWriter) flush() error {
 			http.Error(p.ResponseWriter, err.Error(), http.StatusBadGateway)
 			return err
 		}
-		body = rewritePypiIndex(filterPypiSimplePage(body, p.pkg, p.permit), p.indexURL)
+		filtered := filterPypiSimplePage(body, p.pkg, p.permit)
+		if p.withhold != nil {
+			filtered = p.withhold.pypiPage(filtered)
+			p.withhold.finish(p.Header())
+		}
+		body = rewritePypiIndex(filtered, p.indexURL)
 		// proxyS3 sets ETag from the stored object, which is the upstream
 		// document rather than what is going out. Left on, it labels the
 		// republished body with a validator for different bytes.

@@ -46,12 +46,32 @@ func (s *Server) handleGomod(w http.ResponseWriter, r *http.Request) {
 	if !s.entitleGate(w, r, manifest.TypeGomod, module, gomodVersionFromFile(file)) {
 		return
 	}
+	// The index filter rewrites only a list answered from upstream, and the
+	// artifact gate refuses only what such a list would have withheld: a
+	// hosted module's list names versions admitted on import, and refusing
+	// their files would be the mid-install 403 the filter exists to prevent.
+	proxied := (pm == nil && s.cacheEnabled()) || (pm != nil && packageMode(pm) == manifest.ModeProxy)
+	if proxied && s.refuseWithheld(w, r, manifest.TypeGomod, module, gomodVersionFromFile(file)) {
+		return
+	}
 	if file == "list" {
-		if permit := profileVersionFilter(s.profileFor(r), manifest.TypeGomod, module); permit != nil {
+		permit := profileVersionFilter(s.profileFor(r), manifest.TypeGomod, module)
+		var withhold *indexWithhold
+		if proxied {
+			withhold = s.indexWithholdFor(r, manifest.TypeGomod, module)
+		}
+		if permit != nil || withhold != nil {
 			rw := &indexFilterWriter{
 				ResponseWriter: w,
 				subject:        module + "/@v/list",
-				filter:         func(b []byte) []byte { return filterGomodList(b, permit) },
+				filter: func(b []byte) []byte {
+					b = filterGomodList(b, permit)
+					if withhold != nil {
+						b = withhold.gomodList(b)
+						withhold.finish(w.Header())
+					}
+					return b
+				},
 			}
 			s.serveGomodFile(rw, r, pm, module, file, s3Key, upstream, immutable)
 			if err := rw.flush(); err != nil {

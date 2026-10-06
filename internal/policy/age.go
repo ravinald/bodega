@@ -152,6 +152,12 @@ func (c *AgeChecker) publishedAt(ctx context.Context, ecosystem, name, version s
 	return fn(c, ctx, name, version)
 }
 
+// PublishedAt returns the upstream publish time of one version, from the
+// same source the age gate dates it by.
+func (c *AgeChecker) PublishedAt(ctx context.Context, ecosystem, name, version string) (time.Time, error) {
+	return c.publishedAt(ctx, ecosystem, name, version)
+}
+
 func (c *AgeChecker) npmPublishedAt(ctx context.Context, name, version string) (time.Time, error) {
 	url := c.NpmRegistry + "/" + name
 	var doc struct {
