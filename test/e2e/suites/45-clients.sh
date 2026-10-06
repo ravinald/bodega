@@ -94,9 +94,39 @@ fi
 # write: every one of them passed that way on a run where CLI-APT-02 failed.
 e2e_on client "sudo rm -f /etc/apt/sources.list.d/bodega.sources /etc/apt/keyrings/bodega-archive-keyring.gpg" || true
 
+# doctor reads its plan from /client/, which answers only a host an identity
+# binding names, so the client's address is bound for the write and unbound
+# straight after: 55-profile and 60-access bind the same address under their
+# own identities and bodega refuses a second binding. Unbound first, so an
+# aborted run's leftover does not fail the bind, and on any early exit too.
+# cleanup is run.sh's own exit trap, which this one wraps rather than replaces.
+CLI_CIDR="${E2E_CLIENT_ADDR:-127.0.0.1}/32"
+cli_identity_on_exit() {
+	e2e_bodega server "identity unbind cidr $CLI_CIDR" >/dev/null 2>&1 || true
+	cleanup
+}
+trap cli_identity_on_exit EXIT
+trap 'exit 130' INT TERM
+
+E2E_HOST=server
+e2e_bodega server "identity unbind cidr $CLI_CIDR" >/dev/null 2>&1 || true
+e2e_bodega server "identity bind cidr $CLI_CIDR e2e-clients --comment 'e2e run'" || true
+check_eq CLI-APT-BIND "the client's address binds to an identity for doctor" 0 "$E2E_RC" \
+	"cmd/bodega/cmd_identity.go:59" "bodega identity bind cidr $CLI_CIDR e2e-clients" "$E2E_RC"
+e2e_reload server || true
+
+E2E_HOST=client
 e2e_on client "sudo bodega doctor --write-apt-sources $apt_suite_flag --url '$E2E_BASE_URL' --allow-plaintext" || true
 check_eq CLI-APT-02 "doctor writes the client's apt sources" 0 "$E2E_RC" \
 	"cmd/bodega/cmd_doctor.go:87" "bodega doctor --write-apt-sources $apt_suite_flag" "$E2E_RC"
+
+E2E_HOST=server
+e2e_bodega server "identity unbind cidr $CLI_CIDR" || true
+e2e_reload server || true
+trap cleanup EXIT
+trap - INT TERM
+unset CLI_CIDR
+E2E_HOST=client
 
 e2e_on client "cat /etc/apt/sources.list.d/bodega.sources 2>&1" || true
 check_contains CLI-APT-03 "the written source is signed-by the bodega keyring" \
