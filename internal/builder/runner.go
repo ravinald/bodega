@@ -142,6 +142,11 @@ func (c *Config) EnforcePolicy(ctx context.Context, regType, name, version, url 
 	return nil
 }
 
+// RootFor returns the root a type's fetch writes under: its *_root override
+// when set, build_root otherwise. A command that reads a fetched tree back
+// resolves it here rather than from BuildRoot, which misses the override.
+func (c *Config) RootFor(typ string) string { return c.rootFor(typ) }
+
 // rootFor returns the effective build root for the given source type.
 func (c *Config) rootFor(typ string) string {
 	switch typ {
