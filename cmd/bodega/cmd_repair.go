@@ -85,43 +85,7 @@ func newRepairCmd(gf *globalFlags) *cobra.Command {
 
 			// Phase 2: Dependency discovery.
 			fmt.Println("\nPhase 2: Checking dependency links...")
-			bcfg := builder.NewConfig(cfg, nil)
-			for _, name := range store.ListPackages(manifest.TypeGit) {
-				pm, err := store.GetPackage(ctx, manifest.TypeGit, name)
-				if err != nil || pm == nil {
-					continue
-				}
-				for _, ve := range pm.Versions {
-					parentRef := fmt.Sprintf("git/%s@%s", name, ve.Ref)
-					children := store.ChildrenOf(parentRef)
-					if len(children) > 0 {
-						fmt.Printf("  OK: %s has %d dependency edges\n", parentRef, len(children))
-						continue
-					}
-
-					// No edges -- check if the source exists on disk.
-					worktree, wtErr := builder.GitWorktreePath(cfg.BuildRoot, name, ve.Ref)
-					if wtErr != nil || worktree == "" {
-						fmt.Printf("  SKIP: %s source not on disk (fetch first)\n", parentRef)
-						continue
-					}
-
-					fmt.Printf("  UNLINKED: %s has source but no dependency edges\n", parentRef)
-					issues++
-
-					if !dryRun {
-						fmt.Printf("    -> re-running dependency discovery...\n")
-						var buf bytes.Buffer
-						result := builder.ScanDeps(bcfg, store, name, ve, io.Writer(&buf))
-						if len(result.Deps) > 0 {
-							builder.ImportDeps(ctx, store, name, ve, result.Deps, io.Writer(&buf))
-							fmt.Printf("    -> discovered %d dependencies\n", len(result.Deps))
-						}
-						// Also discover descriptions.
-						builder.DiscoverDescriptions(store, io.Writer(&buf))
-					}
-				}
-			}
+			issues += repairGitDepLinks(ctx, builder.NewConfig(cfg, nil), store, dryRun, builder.DiscoverDescriptions, os.Stdout)
 
 			// Phase 3: Backfill artifact sizes.
 			fmt.Println("\nPhase 3: Backfilling artifact sizes...")
@@ -297,6 +261,62 @@ func repairPypiWheelURLs(ctx context.Context, store *manifest.Store, dryRun bool
 			continue
 		}
 		fmt.Fprintf(out, "    -> rewrote %d to the registry root\n", changed)
+	}
+	return issues
+}
+
+// repairGitDepLinks re-runs dependency discovery for fetched git versions
+// with no graph edges, and reports how many it found. A zero-edge version is
+// damage only when its dep_policy imports: under "none", the default, the
+// fetch scans without importing, so no edges is the expected state and
+// importing here would write the manifests the policy withholds. describe
+// fetches registry descriptions for what the import added.
+func repairGitDepLinks(ctx context.Context, bcfg *builder.Config, store *manifest.Store, dryRun bool, describe func(*manifest.Store, io.Writer), out io.Writer) int {
+	issues := 0
+	for _, name := range store.ListPackages(manifest.TypeGit) {
+		pm, err := store.GetPackage(ctx, manifest.TypeGit, name)
+		if err != nil || pm == nil {
+			continue
+		}
+		importDeps, err := builder.GitImportsDeps(name, pm.DepPolicy)
+		if err != nil {
+			_, _ = fmt.Fprintf(out, "  ERROR: %v\n", err)
+			issues++
+			continue
+		}
+		if !importDeps {
+			_, _ = fmt.Fprintf(out, "  SKIP: git/%s imports no dependencies under its dep_policy\n", name)
+			continue
+		}
+		for _, ve := range pm.Versions {
+			parentRef := fmt.Sprintf("git/%s@%s", name, ve.Ref)
+			children := store.ChildrenOf(parentRef)
+			if len(children) > 0 {
+				_, _ = fmt.Fprintf(out, "  OK: %s has %d dependency edges\n", parentRef, len(children))
+				continue
+			}
+
+			// No edges -- check if the source exists on disk.
+			worktree, wtErr := builder.GitWorktreePath(bcfg.BuildRoot, name, ve.Ref)
+			if wtErr != nil || worktree == "" {
+				_, _ = fmt.Fprintf(out, "  SKIP: %s source not on disk (fetch first)\n", parentRef)
+				continue
+			}
+
+			_, _ = fmt.Fprintf(out, "  UNLINKED: %s has source but no dependency edges\n", parentRef)
+			issues++
+
+			if !dryRun {
+				_, _ = fmt.Fprintf(out, "    -> re-running dependency discovery...\n")
+				var buf bytes.Buffer
+				result := builder.ScanDeps(bcfg, store, name, ve, &buf)
+				if len(result.Deps) > 0 {
+					builder.ImportDeps(ctx, store, name, ve, result.Deps, &buf)
+					_, _ = fmt.Fprintf(out, "    -> discovered %d dependencies\n", len(result.Deps))
+				}
+				describe(store, &buf)
+			}
+		}
 	}
 	return issues
 }

@@ -136,7 +136,7 @@ func FetchGit(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 				cfg.logf("  [git] %s: SKIPPED (frozen)", name)
 				continue
 			}
-			importDeps, err := gitImportsDeps(name, pm.DepPolicy)
+			importDeps, err := GitImportsDeps(name, pm.DepPolicy)
 			if err != nil {
 				cfg.logf("  [git] %s: ERROR: %v", name, err)
 				summary.Failures++
@@ -311,11 +311,11 @@ func FetchGit(cfg *Config, store *manifest.Store, entryFilter string) *Summary {
 	return summary
 }
 
-// gitImportsDeps reports whether a git entry's dep_policy imports what ScanDeps
+// GitImportsDeps reports whether a git entry's dep_policy imports what ScanDeps
 // finds. "direct" and "transitive" both import that immediate set, because git
 // has no recursive discovery. An unknown value is an error rather than "none":
 // a misspelled "direct" read as "none" imports nothing and says nothing wrong.
-func gitImportsDeps(name, policy string) (bool, error) {
+func GitImportsDeps(name, policy string) (bool, error) {
 	switch policy {
 	case "", "none":
 		return false, nil
