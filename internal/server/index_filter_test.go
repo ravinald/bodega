@@ -329,6 +329,9 @@ func TestIndexFilterNpmOffOrWarnWithholdsNothing(t *testing.T) {
 
 // ---- pypi -------------------------------------------------------------------
 
+// pypiFilterUpstream answers the JSON page to an Accept header or to the
+// format parameter spelled literally, as pypi.org does; pypi.org answers HTML
+// to the percent-encoded spelling.
 func pypiFilterUpstream(t *testing.T) *httptest.Server {
 	t.Helper()
 	type file struct {
@@ -359,7 +362,7 @@ func pypiFilterUpstream(t *testing.T) *httptest.Server {
 			http.NotFound(w, r)
 			return
 		}
-		if strings.Contains(r.Header.Get("Accept"), pypiJSONSimple) || r.URL.Query().Get("format") == pypiJSONSimple {
+		if strings.Contains(r.Header.Get("Accept"), pypiJSONSimple) || r.URL.RawQuery == "format="+pypiJSONSimple {
 			var out []map[string]any
 			var versions []string
 			for _, f := range files {

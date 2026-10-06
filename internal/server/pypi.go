@@ -143,14 +143,16 @@ func (s *Server) handlePypiPackage(w http.ResponseWriter, r *http.Request) {
 	// PEP 691 JSON is fetched through the format query parameter rather than an
 	// Accept header, which proxyOrCache does not forward. pypi.org honors it;
 	// an index that ignores it answers HTML, and the writer then serves HTML,
-	// which every client asking for JSON also accepts.
+	// which every client asking for JSON also accepts. The value goes out
+	// unescaped: pypi.org matches the raw query, and answers HTML to
+	// format=application%2Fvnd.pypi.simple.v1%2Bjson.
 	if pkg != nil && packageMode(pkg) == manifest.ModeProxy {
 		w.Header().Add("Vary", "Accept")
 		upstream := s.pypiSimpleURL(normalized)
 		fetch, key := upstream, "pypi/simple/"+normalized+"/index.html"
 		wantJSON := pypiWantsJSON(r.Header.Get("Accept"))
 		if wantJSON {
-			fetch, key = upstream+"?format="+url.QueryEscape(pypiJSONSimple), "pypi/simple/"+normalized+"/index.json"
+			fetch, key = upstream+"?format="+pypiJSONSimple, "pypi/simple/"+normalized+"/index.json"
 		}
 		rw := &pypiIndexWriter{ResponseWriter: w, indexURL: upstream, pkg: pkgName, permit: permit, wantJSON: wantJSON,
 			withhold: s.indexWithholdFor(r, manifest.TypePypi, normalized)}
