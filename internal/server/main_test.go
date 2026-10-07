@@ -11,6 +11,7 @@ import (
 	"github.com/ravinald/bodega/internal/admit"
 	"github.com/ravinald/bodega/internal/aptsign"
 	"github.com/ravinald/bodega/internal/audit"
+	"github.com/ravinald/bodega/internal/config"
 	"github.com/ravinald/bodega/internal/policy"
 )
 
@@ -36,6 +37,10 @@ func TestMain(m *testing.M) {
 	// Unset rather than redirected: a test that wants a key installed at
 	// position 1 sets this itself, and t.Setenv restores it to unset.
 	_ = os.Unsetenv(aptsign.CredentialsEnv)
+	// A fresh audit database seeds an npm and pypi age gate, which dates every
+	// proxied version against the public registry. No check here may depend on
+	// reaching it; the tests of the gate itself install their own.
+	fetchCheckers = func(*config.Config, *audit.DB) []policy.VersionChecker { return nil }
 
 	admit.NewPublishReader = func() *policy.AgeChecker {
 		ac := policy.NewAgeChecker(nil)

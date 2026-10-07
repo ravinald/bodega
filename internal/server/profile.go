@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/ravinald/bodega/internal/audit"
@@ -284,50 +285,54 @@ func (s *Server) entitleGate(w http.ResponseWriter, r *http.Request, typ, name, 
 	if d.Permitted {
 		return true
 	}
-	s.recordProfileRefusal(r, p, typ, name, version, d)
-	http.Error(w, profileRefusalText(p, typ, name, version, d), http.StatusForbidden)
+	f := profileRefusal(p, typ, name, version, d)
+	s.recordProfileRefusal(r, p, typ, name, version, d, f.incident)
+	f.write(w, r)
 	return false
 }
 
-// profileRefusalText is the body a refused client reads. It names the profile,
+// profileRefusal is the answer a refused client reads. It names the profile,
 // the package, the rule that refused and the repair, because the two refusals
 // call for opposite fixes: a membership refusal is widened by adding the
 // package, a constraint refusal by moving the pin. A client that prints only
 // "403 Forbidden" leaves the operator with the audit row, and the row is not
 // what the person running the install is looking at.
-func profileRefusalText(p *entitle.Profile, typ, name, version string, d entitle.Decision) string {
+func profileRefusal(p *entitle.Profile, typ, name, version string, d entitle.Decision) *refusal {
+	f := newRefusal(checkProfile, typ, name, version, http.StatusForbidden)
 	subject := typ + "/" + name
 	if version != "" {
 		subject += " at " + version
 	}
 	switch d.Refusal {
 	case entitle.RefusalMembership:
-		return fmt.Sprintf("%s: profile %q does not list %s.\n"+
-			"  Add it:      bodega profile add %s %s %s\n"+
-			"  Or open it:  bodega profile set %s %s --membership open\n",
-			entitle.RefusalMembership, p.Name(), subject, p.Name(), typ, name, p.Name(), typ)
+		f.reason = fmt.Sprintf("%s: profile %q does not list %s.", entitle.RefusalMembership, p.Name(), subject)
+		f.next = fmt.Sprintf("ask an operator to add it with `bodega profile add %s %s %s`, or to open the type with `bodega profile set %s %s --membership open`.",
+			p.Name(), typ, name, p.Name(), typ)
 	case entitle.RefusalConstraint:
-		return fmt.Sprintf("%s: %s.\n"+
-			"  Move the pin:  bodega profile pin %s %s %s <version> --reason <why>\n"+
-			"  Or float it:   bodega profile add %s %s %s --constraint any\n",
-			entitle.RefusalConstraint, d.Reason, p.Name(), typ, name, p.Name(), typ, name)
+		f.reason = fmt.Sprintf("%s: %s.", entitle.RefusalConstraint, strings.TrimSuffix(d.Reason, "."))
+		f.next = fmt.Sprintf("ask an operator to move the pin with `bodega profile pin %s %s %s <version> --reason <why>`, or to float it with `bodega profile add %s %s %s --constraint any`.",
+			p.Name(), typ, name, p.Name(), typ, name)
+	default:
+		f.reason = fmt.Sprintf("profile %q refused %s: %s.", p.Name(), subject, strings.TrimSuffix(d.Reason, "."))
+		f.next = fmt.Sprintf("ask an operator to review `bodega profile show %s`.", p.Name())
 	}
-	return fmt.Sprintf("profile %q refused %s: %s\n", p.Name(), subject, d.Reason)
+	return f
 }
 
 // recordProfileRefusal writes the denial row. The status column carries which
 // rule refused rather than one "profile" value for both, so `bodega audit
 // events` answers "widen the set or move the pin" without anyone decoding the
 // details blob.
-func (s *Server) recordProfileRefusal(r *http.Request, p *entitle.Profile, typ, name, version string, d entitle.Decision) {
+func (s *Server) recordProfileRefusal(r *http.Request, p *entitle.Profile, typ, name, version string, d entitle.Decision, incident string) {
 	reason := audit.DenialProfileMembership
 	if d.Refusal == entitle.RefusalConstraint {
 		reason = audit.DenialProfileConstraint
 	}
 	extra := map[string]string{
-		"profile": p.Name(),
-		"rule":    d.Refusal,
-		"detail":  d.Reason,
+		"profile":  p.Name(),
+		"rule":     d.Refusal,
+		"detail":   d.Reason,
+		"incident": incident,
 	}
 	if d.Rule != nil {
 		extra["membership"] = d.Rule.Membership

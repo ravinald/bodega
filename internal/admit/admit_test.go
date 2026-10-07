@@ -295,6 +295,22 @@ func TestAdmitKeepsWarningsBehindABlock(t *testing.T) {
 	if !strings.Contains(res.Reason, "GHSA-test-0001") {
 		t.Errorf("the block does not name the record: %q", res.Reason)
 	}
+	// What the API's refusal is built from: which gate, which version, and
+	// the incident the row below carries.
+	if res.Check != "osv" || res.Version != "1.2.0" || len(res.Incident) != 12 {
+		t.Errorf("block = check %q version %q incident %q, want osv, 1.2.0 and a 12-character incident", res.Check, res.Version, res.Incident)
+	}
+	rows, err := adb.Query(t.Context(), audit.Filter{EventType: audit.EventCreate})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	carried := false
+	for _, row := range rows {
+		carried = carried || (row.Status == "policy_violation" && strings.Contains(row.Details, `"incident":"`+res.Incident+`"`))
+	}
+	if !carried {
+		t.Errorf("no policy_violation row carries incident %q: %+v", res.Incident, rows)
+	}
 	found := false
 	for _, w := range res.Warnings {
 		if strings.Contains(w, "1.2.8") && strings.Contains(w, "policy osv sync") {

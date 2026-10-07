@@ -42,11 +42,11 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 		pm, _ := s.store.GetPackage(ctx, manifest.TypeNpm, pkgName)
 		if pm != nil {
 			if isPackageHidden(pm) {
-				http.NotFound(w, r)
+				s.refuseHidden(w, r, manifest.TypeNpm, pkgName, "")
 				return
 			}
 			if isVersionHidden(pm, reqVersion) {
-				http.NotFound(w, r)
+				s.refuseHidden(w, r, manifest.TypeNpm, pkgName, reqVersion)
 				return
 			}
 			// 403 (not 404) below — the version exists upstream, we're
@@ -54,8 +54,7 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 			vc, baseVer := packageVersionConstraint(pm)
 			if vc != "" && vc != manifest.ConstraintAny && baseVer != "" {
 				if !versionAllowed(baseVer, reqVersion, vc) {
-					s.recordVersionRefusal(r, manifest.TypeNpm, pkgName, baseVer, reqVersion, vc)
-					http.Error(w, "version not allowed by constraint", http.StatusForbidden)
+					s.refuseVersionConstraint(w, r, manifest.TypeNpm, pkgName, baseVer, reqVersion, vc)
 					return
 				}
 			}
@@ -106,20 +105,19 @@ func (s *Server) handleNpm(w http.ResponseWriter, r *http.Request) {
 
 	if pm != nil {
 		if isPackageHidden(pm) {
-			http.NotFound(w, r)
+			s.refuseHidden(w, r, manifest.TypeNpm, pkgName, "")
 			return
 		}
 		// The same two refusals the tarball branch makes, in the same shape:
 		// 404 for a hidden version, 403 for one the constraint excludes.
 		if reqVersion != "" {
 			if isVersionHidden(pm, reqVersion) {
-				http.NotFound(w, r)
+				s.refuseHidden(w, r, manifest.TypeNpm, pkgName, reqVersion)
 				return
 			}
 			vc, baseVer := packageVersionConstraint(pm)
 			if vc != "" && vc != manifest.ConstraintAny && baseVer != "" && !versionAllowed(baseVer, reqVersion, vc) {
-				s.recordVersionRefusal(r, manifest.TypeNpm, pkgName, baseVer, reqVersion, vc)
-				http.Error(w, "version not allowed by constraint", http.StatusForbidden)
+				s.refuseVersionConstraint(w, r, manifest.TypeNpm, pkgName, baseVer, reqVersion, vc)
 				return
 			}
 		}

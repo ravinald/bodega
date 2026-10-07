@@ -282,6 +282,9 @@ func (s *Server) aptResolvePoolUpstream(w http.ResponseWriter, r *http.Request, 
 	name, version := manifest.AptDebIdentity(path.Base(poolPath))
 	candidates := s.cfg.AptPoolUpstreams()
 	var refused []string
+	// One refusal, and so one incident, across every candidate row: the
+	// client made one request and gets one answer.
+	f := allowListRefusal(manifest.TypeApt, "", name, version)
 	for _, base := range candidates {
 		candidate := base + "/" + poolPath
 		if s.policy != nil {
@@ -299,7 +302,7 @@ func (s *Server) aptResolvePoolUpstream(w http.ResponseWriter, r *http.Request, 
 				// answers who was turned away — the same pair
 				// enforceUpstreamPolicyRecording writes on the proxy path.
 				s.recordDiscovery(ctx, r, manifest.TypeApt, candidate, candidate, name, manifest.AptKey(poolPath), decision)
-				s.recordPolicyViolation(r, manifest.TypeApt, candidate, candidate)
+				s.recordPolicyViolation(r, manifest.TypeApt, candidate, candidate, f.incident)
 				refused = append(refused, base)
 				continue
 			}
@@ -323,8 +326,8 @@ func (s *Server) aptResolvePoolUpstream(w http.ResponseWriter, r *http.Request, 
 	// the change that lifted it.
 	if len(refused) == len(candidates) && len(candidates) > 0 {
 		s.logger.Warn("apt pool path blocked: every configured archive is off the allow-list",
-			"pool_path", poolPath, "archives", strings.Join(refused, " "))
-		http.Error(w, "upstream blocked by allow-list", http.StatusForbidden)
+			"pool_path", poolPath, "archives", strings.Join(refused, " "), "incident", f.incident)
+		f.write(w, r)
 		return "", false
 	}
 

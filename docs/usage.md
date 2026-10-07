@@ -1491,13 +1491,14 @@ TIMESTAMP            EVENT   TYPE   NAME                   STATUS               
 
 #### What each client shows when it is refused
 
-The message differs per ecosystem, and three of the seven print bodega's own body verbatim. That is why the refusal names the repair:
+A profile refusal answers through the same format as every other check, so what each client prints is in [What a refused client sees](#what-a-refused-client-sees). Its reason names the rule and its next step names the repair, because the two rules call for opposite fixes:
 
 ```text
-membership: profile "web" does not list gomod/example.com/mod at v1.0.0.
-  Add it:      bodega profile add web gomod example.com/mod
-  Or open it:  bodega profile set web gomod --membership open
+bodega refused gomod/example.com/mod@v1.0.0 (profile, incident 3f9c0a1b2d4e): membership: profile "web" does not list gomod/example.com/mod at v1.0.0.
+Next step: ask an operator to add it with `bodega profile add web gomod example.com/mod`, or to open the type with `bodega profile set web gomod --membership open`.
 ```
+
+Four cases are particular to profiles.
 
 **pypi.** A filtered index reads to `pip` as a distribution that publishes nothing, so it resolves against what is left rather than failing on what is gone:
 
@@ -1508,56 +1509,7 @@ ERROR: Could not find a version that satisfies the requirement django (from vers
 ERROR: No matching distribution found for django
 ```
 
-A refused wheel, which is a client that already knew the URL, names the file and the status:
-
-```text
-$ pip install ok
-Collecting ok
-  ERROR: HTTP error 403 while getting http://bodega:8080/pypi/wheels/ok-1.0.0-py3-none-any.whl (from http://bodega:8080/pypi/simple/ok/)
-ERROR: Could not install requirement ok from http://bodega:8080/pypi/wheels/ok-1.0.0-py3-none-any.whl because of HTTP error 403 Client Error: Forbidden for url: http://bodega:8080/pypi/wheels/ok-1.0.0-py3-none-any.whl
-```
-
-A filename bodega cannot place onto a project and a version is refused under the filename itself, so the body and the audit row name a file where they normally name a package. `pip` never asks for one of these; they are `bdist_wininst` and `.egg` files predating the wheel:
-
-```text
-membership: profile "web" does not list pypi/msgpack-python-0.3.0.win-amd64-py2.7.exe.
-  Add it:      bodega profile add web pypi msgpack-python-0.3.0.win-amd64-py2.7.exe
-  Or open it:  bodega profile set web pypi --membership open
-```
-
-Take the repair it prints literally and the entry matches nothing else. Name the real project, or open the type.
-
-**npm.** The same text for a packument and for a tarball, with the URL as the only thing that tells them apart. It does not print bodega's body:
-
-```text
-$ npm install ok
-npm error code E403
-npm error 403 403 Forbidden - GET http://bodega:8080/npm/ok/-/ok-1.0.0.tgz
-npm error 403 In most cases, you or one of your dependencies are requesting a package version that is forbidden by your security policy, or on a server you do not have access to.
-```
-
-**gomod.** `go` prints the whole response body under `server response:`, so the operator reading the failure gets the repair without opening the audit log:
-
-```text
-$ go get example.com/mod@v1.0.0
-go: example.com/mod@v1.0.0: reading http://bodega:8080/go/example.com/mod/@v/v1.0.0.info: 403 Forbidden
- server response:
- membership: profile "web" does not list gomod/example.com/mod at v1.0.0.
-   Add it:      bodega profile add web gomod example.com/mod
-   Or open it:  bodega profile set web gomod --membership open
-```
-
-**cargo.** Also prints the body, under `body:`, and names the sparse-index URL rather than the crate:
-
-```text
-$ cargo fetch
-Caused by:
-  failed to get successful HTTP response from `http://bodega:8080/cargo/se/rd/serde` (10.0.0.4), got 403
-  body:
-  membership: profile "web" does not list cargo/serde.
-    Add it:      bodega profile add web cargo serde
-    Or open it:  bodega profile set web cargo --membership open
-```
+A filename bodega cannot place onto a project and a version is refused under the filename itself, so the body and the audit row name a file where they normally name a package. `pip` never asks for one of these; they are `bdist_wininst` and `.egg` files predating the wheel. Take the repair it prints literally and the entry matches nothing else. Name the real project, or open the type.
 
 **helm.** `helm repo add` succeeds and the charts are simply not there. The index answers 200 with the refused charts filtered out of it, because a 403 on `index.yaml` fails the repository rather than the install, so the first thing an operator sees is an empty search:
 
@@ -1568,21 +1520,15 @@ $ helm search repo bodega
 No results found
 ```
 
-The refusal arrives at the pull, and helm prints neither the chart name nor bodega's body. This is the ecosystem where the audit row is the only place the reason lives:
+The refusal arrives at the pull.
 
-```text
-$ helm pull bodega/cert-manager --version 1.14.0
-Error: failed to fetch http://bodega:8080/helm/charts/cert-manager-1.14.0.tgz : 403 Forbidden
-```
-
-**git.** `git` relays the body as `remote:` lines before its own error:
+**git.** `git` relays a text body as `remote:` lines before its own error:
 
 ```text
 $ git clone http://bodega:8080/git/github/foo/bar.git
 Cloning into 'bar'...
-remote: membership: profile "web" does not list git/github.
-remote:   Add it:      bodega profile add web git github
-remote:   Or open it:  bodega profile set web git --membership open
+remote: bodega refused git/github (profile, incident 4d5e6f708192): membership: profile "web" does not list git/github.
+remote: Next step: ask an operator to add it with `bodega profile add web git github`, or to open the type with `bodega profile set web git --membership open`.
 fatal: unable to access 'http://bodega:8080/git/github/foo/bar.git/': The requested URL returned error: 403
 ```
 
@@ -1597,7 +1543,7 @@ HTTP request sent, awaiting response... 403 Forbidden
 2026-09-10 16:43:44 ERROR 403: Forbidden.
 ```
 
-`-f` is what hides the reason: it makes `curl` fail without writing the body. Drop it to read the refusal, and note that it also drops the non-zero exit, so a script needs `-w '%{http_code}'` to keep both.
+`-f` is what hides the reason: it makes `curl` fail without writing the body. Drop it to read the refusal, and note that it also drops the non-zero exit, so a script needs `-w '%{http_code}'` to keep both. The `X-Bodega-Refusal` header survives `-f`: `curl -fsS -D - -o /dev/null` prints it.
 
 Every mutation writes an audit event with `pkg_type=profile`, the profile in `pkg_name` and what inside it in `pkg_version`, so `bodega audit events --type create` shows who changed a control and when.
 
@@ -1678,9 +1624,8 @@ Three limits, stated rather than left to be found:
 - **The `sources.list` is a scoping boundary, not an authorization one.** The host can edit it and read the unfiltered mirrored codename; the codename's name is not a secret either. What refuses the artifacts behind it is the request predicate at `/apt/pool/`, which runs on identity:
 
   ```text
-  membership: profile "web" does not list apt/demo-extra at 1.0.
-    Add it:      bodega profile add web apt demo-extra
-    Or open it:  bodega profile set web apt --membership open
+  bodega refused apt/demo-extra@1.0 (profile, incident 7c1d2e3f4a5b): membership: profile "web" does not list apt/demo-extra at 1.0.
+  Next step: ask an operator to add it with `bodega profile add web apt demo-extra`, or to open the type with `bodega profile set web apt --membership open`.
   ```
 
 - **bodega re-signs an index it did not verify a signature on.** It checks the archive's TLS certificate and the SHA256 the archive's own `Release` publishes for the `Packages` beside it, and it holds no distro keyring to check `InRelease` against. A mirrored codename forwards the archive's signature intact; a filtered one does not. See [Threat model](threat-model.md).
@@ -1726,9 +1671,8 @@ A `.pkg` fetched by hand is refused with 403 in the vocabulary every other type 
 
 ```text
 $ curl 'https://bodega.internal/freebsd/FreeBSD:15:aarch64/latest/All/Hashed/nano-9.2~2$3mdm1utt.pkg'
-membership: profile "web" does not list freebsd/nano at 9.2.
-  Add it:      bodega profile add web freebsd nano
-  Or open it:  bodega profile set web freebsd --membership open
+bodega refused freebsd/nano@9.2 (profile, incident 9e8d7c6b5a40): membership: profile "web" does not list freebsd/nano at 9.2.
+Next step: ask an operator to add it with `bodega profile add web freebsd nano`, or to open the type with `bodega profile set web freebsd --membership open`.
 ```
 
 An object no record names is refused to a bound host whatever its filename says, since nothing states which package it holds. That includes `Latest/pkg.pkg` and its `.sig`, which alias a `pkg` package without naming its version, so `pkg bootstrap` does not work through a profile: bootstrap the host before binding it. A catalogue bodega cannot read answers 503 for every package under it, to a bound host alone, rather than serving objects nothing decided on.
@@ -1834,6 +1778,135 @@ is inside admin_permit_cidr can POST and DELETE against this bodega.
 ```
 
 `bodega token generate` takes a label and nothing else: a token is a token. The mutation gate accepts any unexpired one of them once `admin_permit_cidr` reaches past loopback, so the credential in a build host's `~/.netrc` is also the credential that authorizes `POST /api/v1/...` from that host. Keeping `admin_permit_cidr` at loopback makes the gate ignore tokens entirely and is the remedy that costs nothing; otherwise every host you write a credential to is admin-capable and should be treated that way. Scoped tokens would sever the two and do not exist yet. See [Threat model](threat-model.md).
+
+### What a refused client sees
+
+Every refusal answers the same five things, in the form the refused client prints: which check refused, the package and version, a one-sentence reason, the next step, and an incident ID. The status is the one the check has always answered; only the body and two headers are bodega's.
+
+```text
+bodega refused npm/left-pad (allow-list, incident 650285e650d5): npm "left-pad" is not on this server's upstream allow-list.
+Next step: ask an operator to run `bodega policy add npm left-pad` if it should be.
+```
+
+| Check        | Status | Where it refuses                                                                     |
+| ------------ | ------ | ------------------------------------------------------------------------------------ |
+| `allow-list` | 403    | any proxied fetch, the apt pool, and `POST /api/v1/packages`                         |
+| `age`        | 403    | a proxied npm, pypi, gomod or cargo download, and `POST /api/v1/packages`            |
+| `osv`        | 403    | a proxied npm, pypi, gomod or cargo download, and `POST /api/v1/packages`            |
+| `profile`    | 403    | any package route on a host whose profile governs the type                           |
+| `constraint` | 403    | an npm or gomod version outside the entry's `version_constraint`                     |
+| `hidden`     | 404    | a hidden package or version; 404 because hiding withdraws it rather than refusing it |
+| `frozen`     | 403    | `DELETE /api/v1/packages/{type}/{name}` on a frozen entry                            |
+| `checksum`   | 502    | a proxied artifact or distfile whose bytes disagree with its pinned digest           |
+
+Every refusal also carries `X-Bodega-Refusal: <check>; incident=<id>`, which a client's verbose or debug output shows when its error line does not.
+
+The body never carries a credential, an upstream URL, an internal hostname, a storage key or a bucket name, because it goes to whoever can reach the route. For the types whose allow-list rule is a host or a URL prefix (apt, git, helm, binary, freebsd, distfiles), that means the body cannot name the upstream to admit, and the next step points the operator at the audit row instead.
+
+**Finding the incident.** The incident is written into the details of the audit row the refusal recorded, beside the URL, the key and the digests the body leaves out. `bodega audit events` prints the row but not its details, so read them from the API on the server's loopback:
+
+```bash
+curl -s 'http://127.0.0.1:8080/api/v1/audit?name=left-pad&limit=200' | grep 650285e650d5
+```
+
+| Check                                  | Audit row                                               |
+| -------------------------------------- | ------------------------------------------------------- |
+| `allow-list`, `age`, `osv` on a fetch  | `cache` / `policy_violation`                            |
+| `allow-list`, `age`, `osv` on a create | `create` / `policy_violation`                           |
+| `profile`                              | `denied` / `profile_membership` or `profile_constraint` |
+| `constraint`                           | `denied` / `version_constraint`                         |
+| `hidden`                               | `denied` / `hidden`                                     |
+| `frozen`                               | `denied` / `entry_frozen`                               |
+| `checksum`                             | `cache` / `checksum_mismatch`                           |
+
+A `checksum` refusal whose digest could not be read at all writes no row, because the database that would hold it is what failed; its incident is in the server log line instead.
+
+#### Per client
+
+Each of these was captured from the real client against an allow-list refusal. Hostnames and addresses are replaced; incidents are as captured.
+
+**npm** prints the `error` field of a JSON body on its own `403` line:
+
+```text
+$ npm install left-pad@1.3.0
+npm ERR! code E403
+npm ERR! 403 403 Forbidden - GET http://bodega.example.com:8080/npm/left-pad - bodega refused npm/left-pad (allow-list, incident 650285e650d5): npm "left-pad" is not on this server's upstream allow-list. Next step: ask an operator to run `bodega policy add npm left-pad` if it should be.
+npm ERR! 403 In most cases, you or one of your dependencies are requesting
+npm ERR! 403 a package version that is forbidden by your security policy, or
+npm ERR! 403 on a server you do not have access to.
+```
+
+**pip** never prints a body, so a pypi refusal puts its first line into the HTTP reason phrase. A refused file download shows it at any verbosity:
+
+```text
+$ pip install http://bodega.example.com:8080/pypi/wheels/toml-0.10.2-py2.py3-none-any.whl
+Collecting toml==0.10.2
+  ERROR: HTTP error 403 while getting http://bodega.example.com:8080/pypi/wheels/toml-0.10.2-py2.py3-none-any.whl
+ERROR: Could not install requirement toml==0.10.2 from http://bodega.example.com:8080/pypi/wheels/toml-0.10.2-py2.py3-none-any.whl because of HTTP error 403 Client Error: Forbidden - bodega refused pypi/toml@0.10.2 (allow-list, incident bb3e3adbe3b9): pypi "toml" is not on this server's upstream allow-list. for url: http://bodega.example.com:8080/pypi/wheels/toml-0.10.2-py2.py3-none-any.whl
+```
+
+A refused index page is the common case, and pip reports it only at `-vv`. Without it the output is `No matching distribution found`, which reads as a package that does not exist:
+
+```text
+$ pip install -vv toml==0.10.2
+...
+Could not fetch URL http://bodega.example.com:8080/pypi/simple/toml/: 403 Client Error: Forbidden - bodega refused pypi/toml (allow-list, incident ece4bf0530d8): pypi "toml" is not on this server's upstream allow-list. for url: http://bodega.example.com:8080/pypi/simple/toml/ - skipping
+...
+ERROR: No matching distribution found for toml==0.10.2
+```
+
+**go** prints a text body under `server response:`:
+
+```text
+$ go mod download github.com/kr/pretty@v0.3.1
+go: github.com/kr/pretty@v0.3.1: reading http://bodega.example.com:8080/go/github.com/kr/pretty/@v/v0.3.1.info: 403 Forbidden
+    server response:
+    bodega refused gomod/github.com/kr/pretty@v0.3.1 (allow-list, incident 0c8fe7cd094c): gomod "github.com/kr/pretty" is not on this server's upstream allow-list.
+    Next step: ask an operator to run `bodega policy add gomod github.com/kr/pretty` if it should be.
+```
+
+**cargo** prints the body under `body:`, in the `{"errors":[{"detail":...}]}` form its registry API uses:
+
+```text
+$ cargo fetch
+    Updating `bodega` index
+error: failed to get `itoa` as a dependency of package `e2e v0.1.0 (/src/e2e)`
+
+Caused by:
+  failed to query replaced source registry `crates-io`
+
+Caused by:
+  download of it/oa/itoa failed
+
+Caused by:
+  failed to get successful HTTP response from `http://bodega.example.com:8080/cargo/it/oa/itoa` (192.0.2.10), got 403
+  body:
+  {"errors":[{"detail":"bodega refused cargo/itoa (allow-list, incident 567d03969769): cargo \"itoa\" is not on this server's upstream allow-list. Next step: ask an operator to run `bodega policy add cargo itoa` if it should be."}]}
+```
+
+**helm** prints the status line and nothing else, so it gets the reason phrase pip does. The upstream it needed is not named, for the reason given above:
+
+```text
+$ helm pull http://bodega.example.com:8080/helm/charts/e2e-ref-chart-1.0.0.tgz
+Error: failed to fetch http://bodega.example.com:8080/helm/charts/e2e-ref-chart-1.0.0.tgz : 403 Forbidden - bodega refused helm/e2e-ref-chart@1.0.0 (allow-list, incident 2b5017fdb05a): the upstream this helm request needs is not on this server's upstream allow-list.
+```
+
+**apt** likewise, on the `Err:` line and again on `E: Failed to fetch`:
+
+```text
+$ apt-get download tree
+Err:1 http://bodega.example.com:8080/apt resolute/universe arm64 tree arm64 2.3.1-1
+  403  Forbidden - bodega refused apt/tree@2.3.1-1 (allow-list, incident bfcfa1a2d8d4): the upstream this apt request needs is not on this server's upstream allow-list. [IP: 192.0.2.10 8080]
+E: Failed to fetch http://bodega.example.com:8080/apt/pool/universe/t/tree/tree_2.3.1-1_arm64.deb  403  Forbidden - bodega refused apt/tree@2.3.1-1 (allow-list, incident bfcfa1a2d8d4): the upstream this apt request needs is not on this server's upstream allow-list. [IP: 192.0.2.10 8080]
+```
+
+The mutation API answers its own JSON, `{"error": "<summary> Next step: <next step>"}`, for a create the allow-list, age or OSV gate blocks and for a delete of a frozen entry.
+
+#### Limits
+
+- **The age and OSV gates run on a proxy miss, not on a hit.** A proxied npm, pypi, gomod or cargo version is checked before bodega fetches it, so a version cached before a gate was tightened is served from the cache without being checked again. Proxied apt, helm, binary, git and freebsd fetches are not checked at all: freebsd's storage key holds the ABI where the version would be, and the age gate cannot date the rest.
+- **The reason phrase is HTTP/1.1's.** HTTP/2 has none, so a pip, helm or apt client that negotiates HTTP/2 with bodega's TLS listener, or a reverse proxy that rewrites the status line, shows the bare `403 Forbidden`. The header and body still carry the refusal.
+- **Other refusals keep their own text.** The middleware gates (deny list, admin network, tokens), the `/client/` routes, a git push, the spool bounds and the distfiles license and environment refusals are not package checks and answer as they did.
 
 ### `bodega policy list [--type TYPE]`
 
@@ -2277,9 +2350,11 @@ Nothing else counts such a row as enforcement. The `bodega serve` startup banner
 
 An upstream that is reachable but has no timestamp for the version warns rather than blocking, on the same reasoning: a registry outage should not fail an import closed.
 
+The gate runs at import (`bodega pkg import`, `bodega pkg create`, `POST /api/v1/packages`) and on every proxy cache miss for a versioned npm, pypi, gomod or cargo artifact, before bodega fetches it. A miss under a gate set to `block` answers the client with an `age` refusal (see [What a refused client sees](#what-a-refused-client-sees)); one under `warn` is fetched and served, and writes a `cache` / `policy_warn` audit row. A miss costs one request to the registry in the table above, which is the public one whatever upstream bodega proxies from; a registry bodega cannot reach makes every miss warn rather than block. A cache hit is not checked again. The OSV gate runs at the same points.
+
 #### Publish times in the hosted indexes
 
-The age gate runs at admission, on the bodega host. Client-side cooldowns now work against hosted packages too: npm `min-release-age` (11.10 and later) and `--before`, pnpm `minimumReleaseAge`, Yarn's age gate, uv `exclude-newer`, pip `--uploaded-prior-to` and Renovate `minimumReleaseAge` all read a publish time out of the index, and bodega's hosted indexes now carry one.
+The age gate runs on the bodega host, at admission and on a proxy cache miss. Client-side cooldowns now work against hosted packages too: npm `min-release-age` (11.10 and later) and `--before`, pnpm `minimumReleaseAge`, Yarn's age gate, uv `exclude-newer`, pip `--uploaded-prior-to` and Renovate `minimumReleaseAge` all read a publish time out of the index, and bodega's hosted indexes now carry one.
 
 A fetch records the time on the version entry as `published_at`, from the same source the age gate reads (the table above). An import (`bodega pkg import`, `POST /api/v1/packages/import` and `POST /api/v1/packages/{type}`) records it too, for every pinned version that arrives without one, whether or not an age policy is set. Both read the registry the entry's `url` names, falling back to the public one when it names none; cargo always reads the crates.io API. An import keeps a `published_at` the manifest already carries, so an exported catalog imported on another host is not read again. The hosted routes publish it as follows:
 
@@ -5205,7 +5280,7 @@ curl -X POST https://bodega-host:8080/api/v1/packages/gomod \
 - `201 Created` — entry added
 - `400 Bad Request` — missing required fields or invalid type
 - `401 Unauthorized` — missing or invalid Bearer token
-- `403 Forbidden` — IP not in `admin_permit_cidr`, or entry is frozen (delete)
+- `403 Forbidden` — IP not in `admin_permit_cidr`; the entry is frozen (delete); or the allow-list, age or OSV gate blocked it (create). The last two carry `X-Bodega-Refusal`; see [What a refused client sees](#what-a-refused-client-sees)
 - `409 Conflict` — entry already exists
 - `413 Request Entity Too Large` — request body exceeds 1 MiB
 
@@ -5391,7 +5466,7 @@ Both paths write the same row, keyed by the object key, so a version pinned by t
 
 Two artifacts have no per-version object key to pin against. **pypi** wheels upload as a directory holding a resolved dependency closure rather than one object per version. **Clone-mode git** ships a bundle generated locally at package time, so there are no upstream bytes to attest to and `git bundle create` is not reproducible byte-for-byte; a git entry fetched as a release tarball pins normally. Neither is an error: the fetch records the digest on the manifest entry and skips the cache row.
 
-When an upstream republishes different bytes under a version it already served, every subsequent fetch answers 502 with `checksum verification failed — upstream content may be tampered`. Clearing the stored digest is the way out, and it is why the row carries package identity: `clear` matches by type and name, and rows recorded without them could only be reached by editing the database. A row with no digest reads as one never fetched, so the next fetch stores what it computed rather than answering 502 forever. Stores mirrored before this release have their identity re-derived from their object key once, on the first open after upgrade; the log line names the row count.
+When an upstream republishes different bytes under a version it already served, every subsequent fetch answers 502 with a `checksum` refusal whose incident names the audit row holding both digests. Clearing the stored digest is the way out, and it is why the row carries package identity: `clear` matches by type and name, and rows recorded without them could only be reached by editing the database. A row with no digest reads as one never fetched, so the next fetch stores what it computed rather than answering 502 forever. Stores mirrored before this release have their identity re-derived from their object key once, on the first open after upgrade; the log line names the row count.
 
 **Management:**
 

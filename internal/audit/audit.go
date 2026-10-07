@@ -30,7 +30,9 @@ package audit
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -140,6 +142,7 @@ const (
 	DenialPushRefused       = "push_refused"       // git smart-HTTP push against a read-only mirror
 	DenialDistfileLicense   = "distfile_license"   // a port forbids redistributing the distfile
 	DenialDistfileClient    = "distfile_client"    // the client did not measure the environment distfiles are admitted in
+	DenialHidden            = "hidden"             // package or version an operator hid; answered 404
 
 	// Refusals by the host profile bound to the requesting identity. Two
 	// values rather than one, because the operator's repair is opposite in
@@ -165,6 +168,17 @@ const (
 	DenialSpoolArtifactTooLarge = "spool_artifact_too_large" // artifact over spool_max_artifact_bytes
 	DenialSpoolBudget           = "spool_budget_exhausted"   // in-flight spools at spool_max_total_bytes
 )
+
+// NewIncidentID returns the identifier a refusal hands its client and writes
+// into the details of the audit row it records, so the person refused can
+// quote one string and the operator can find the row by it. Generated rather
+// than taken from the row's database ID: the jsonl and syslog sinks assign
+// none, and the client has to be told before the write returns.
+func NewIncidentID() string {
+	var b [6]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
 
 // Event is a single audit record.
 type Event struct {

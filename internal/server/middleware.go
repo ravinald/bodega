@@ -335,17 +335,21 @@ func recordDenialFor(db *audit.DB, r *http.Request, pkgType, pkgName, pkgVersion
 	})
 }
 
-// recordVersionRefusal writes the row for a request refused by an entry's
-// version_constraint. The gomod and npm handlers answer 403 because the
-// version exists upstream and policy declines to serve it, which is a refusal
-// in the same sense the middleware gates are — and, unlike them, one an
-// operator will read as a broken client until the row names the constraint.
-func (s *Server) recordVersionRefusal(r *http.Request, pkgType, pkgName, entryVersion, reqVersion, constraint string) {
+// refuseVersionConstraint writes the row for, and answers, a request refused
+// by an entry's version_constraint. The gomod and npm handlers answer 403
+// because the version exists upstream and policy declines to serve it, which
+// is a refusal in the same sense the middleware gates are — and, unlike them,
+// one an operator will read as a broken client until the row names the
+// constraint.
+func (s *Server) refuseVersionConstraint(w http.ResponseWriter, r *http.Request, pkgType, pkgName, entryVersion, reqVersion, constraint string) {
+	f := constraintRefusal(pkgType, pkgName, reqVersion, constraint)
 	recordDenialFor(s.auditDB, r, pkgType, pkgName, reqVersion,
 		audit.DenialVersionConstraint, map[string]string{
 			"constraint":    constraint,
 			"entry_version": entryVersion,
+			"incident":      f.incident,
 		})
+	f.write(w, r)
 }
 
 // denialWriteSlots caps how many denial rows are being written at once. A
@@ -539,6 +543,11 @@ func (r *responseRecorder) Write(b []byte) (int, error) {
 // git smart-HTTP route sets its own write deadline through one, and without
 // this the call fails and the route falls back to the server-wide bound.
 func (r *responseRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
+// observeHijack records the status a refusal wrote on the raw connection, so
+// the request log and the fetch audit see the 403 rather than the 200 this
+// recorder starts from.
+func (r *responseRecorder) observeHijack(status int) { r.statusCode = status }
 
 // Flush implements http.Flusher for streaming responses.
 func (r *responseRecorder) Flush() {

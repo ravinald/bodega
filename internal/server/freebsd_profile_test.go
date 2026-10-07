@@ -208,11 +208,11 @@ func TestFreeBSDProfileRefusesAPackageTheCatalogueDoesNotList(t *testing.T) {
 			t.Errorf("GET %s = %d %q, want 200 and the package", root(fbsdNginxPath), status, body)
 		}
 		status, body := f.get(t, root(fbsdTreePath))
-		if status != http.StatusForbidden || !strings.HasPrefix(body, entitle.RefusalMembership+":") {
+		if status != http.StatusForbidden || !refusalOpensOn(body, entitle.RefusalMembership) {
 			t.Errorf("GET %s = %d %q, want 403 opening on %q", root(fbsdTreePath), status, body, entitle.RefusalMembership)
 		}
 		status, body = f.get(t, root(fbsdCurlPath))
-		if status != http.StatusForbidden || !strings.HasPrefix(body, entitle.RefusalConstraint+":") {
+		if status != http.StatusForbidden || !refusalOpensOn(body, entitle.RefusalConstraint) {
 			t.Errorf("GET %s = %d %q, want 403 opening on %q", root(fbsdCurlPath), status, body, entitle.RefusalConstraint)
 		}
 	}
@@ -339,7 +339,7 @@ func TestFreeBSDObjectGateJudgesTheRecordNotTheFilename(t *testing.T) {
 			switch {
 			case tc.refusal == "" && status != http.StatusOK:
 				t.Errorf("GET %s = %d %q, want 200: its record is nginx 1.0", root(tc.path), status, body)
-			case tc.refusal != "" && (status != http.StatusForbidden || !strings.HasPrefix(body, tc.refusal+":")):
+			case tc.refusal != "" && (status != http.StatusForbidden || !refusalOpensOn(body, tc.refusal)):
 				t.Errorf("GET %s = %d %q, want 403 opening on %q", root(tc.path), status, body, tc.refusal)
 			}
 		}
@@ -394,7 +394,7 @@ func TestFreeBSDObjectGateRefusesAnObjectNoRecordNames(t *testing.T) {
 			switch {
 			case tc.refusal == "" && status != http.StatusOK:
 				t.Errorf("%s: GET %s = %d %q, want 200", tc.profile, url, status, body)
-			case tc.refusal != "" && (status != http.StatusForbidden || !strings.HasPrefix(body, tc.refusal+":")):
+			case tc.refusal != "" && (status != http.StatusForbidden || !refusalOpensOn(body, tc.refusal)):
 				t.Errorf("%s: GET %s = %d %q, want 403 opening on %q", tc.profile, url, status, body, tc.refusal)
 			}
 		}
@@ -453,7 +453,7 @@ func TestFreeBSDProfileFiltersEveryRuleShape(t *testing.T) {
 			if names := catalogNames(t, body, freeBSDCatalogDoc, bodegaPub, up.pub); strings.Join(names, " ") != "nginx tree" {
 				t.Errorf("the view names %v, want nginx and tree: curl 8.9.1 breaks its pin", names)
 			}
-			if status, body := f.get(t, freeBSDURL("latest", fbsdCurlPath)); status != http.StatusForbidden || !strings.HasPrefix(body, entitle.RefusalConstraint+":") {
+			if status, body := f.get(t, freeBSDURL("latest", fbsdCurlPath)); status != http.StatusForbidden || !refusalOpensOn(body, entitle.RefusalConstraint) {
 				t.Errorf("GET curl = %d %q, want a constraint refusal", status, body)
 			}
 			if status, _ := f.get(t, freeBSDURL("latest", fbsdTreePath)); status != http.StatusOK {
@@ -512,7 +512,7 @@ func TestFreeBSDProfileGateFollowsACatalogueRebuild(t *testing.T) {
 				switch {
 				case tc.refusal == "" && (status != http.StatusOK || body != replacement):
 					t.Errorf("GET %s = %d, want the replacement served", path, status)
-				case tc.refusal != "" && (status != http.StatusForbidden || !strings.HasPrefix(body, tc.refusal+":")):
+				case tc.refusal != "" && (status != http.StatusForbidden || !refusalOpensOn(body, tc.refusal)):
 					t.Errorf("GET %s = %d %.80q, want 403 %s", path, status, body, tc.refusal)
 				}
 			}

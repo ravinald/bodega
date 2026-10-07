@@ -1346,8 +1346,24 @@ func TestClearedChecksumLetsRepublishedBytesThrough(t *testing.T) {
 	if err := s.typeStore(manifest.TypeApt).Delete(t.Context(), manifest.AptKey(fixtureDeb)); err != nil {
 		t.Fatalf("drop cached object: %v", err)
 	}
-	if code, _ := mirrorGet(t, s, "/apt/"+fixtureDeb); code != http.StatusBadGateway {
+	code, body := mirrorGet(t, s, "/apt/"+fixtureDeb)
+	if code != http.StatusBadGateway {
 		t.Fatalf("republished fetch = %d, want 502 — the stored digest did not catch the change", code)
+	}
+	inc := bodyIncident(t, string(body), checkChecksum)
+	rows, err := s.auditDB.Query(t.Context(), audit.Filter{EventType: audit.EventCache})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	matched := false
+	for _, row := range rows {
+		matched = matched || (row.Status == audit.CacheChecksumMismatch && strings.Contains(row.Details, `"incident":"`+inc+`"`))
+	}
+	if !matched {
+		t.Errorf("no checksum_mismatch row carries the refusal's incident %s: %+v", inc, rows)
+	}
+	if strings.Contains(string(body), manifest.AptKey(fixtureDeb)) {
+		t.Errorf("the refusal names the storage key: %s", body)
 	}
 
 	if _, _, err := s.auditDB.ClearChecksumsByPackage(t.Context(), manifest.TypeApt, "nginx"); err != nil {
