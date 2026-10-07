@@ -40,11 +40,14 @@ CI_GATE_TARGETS := vet=vet lint=lint fmt=fmt-check tidy=tidy-check test=test tes
 #
 #   test-freebsd  boots a FreeBSD VM to run `go test ./...` on a FreeBSD kernel;
 #                 a workstation or a Linux runner has no such kernel to offer.
-CI_ONLY_GATE_JOBS := test-freebsd
+#   reproducible  runs the full GoReleaser pipeline twice, which needs the
+#                 pinned goreleaser and syft that `depend` does not install,
+#                 and minutes `check` should not spend on every edit.
+CI_ONLY_GATE_JOBS := test-freebsd reproducible
 
 # The legs `check` runs, in order. `check` has no prerequisites outside this
 # list, so it is what ran, and `ci-drift` reads CI_GATE_TARGETS against it.
-CHECK_LEGS := ci-drift fmt-check tidy-check harness vet build lint test test-server
+CHECK_LEGS := ci-drift pin-check fmt-check tidy-check harness vet build lint test test-server
 
 # Every shell file in the tree. `shfmt -f` finds them by shebang and by
 # shell= directive, so a suite added without touching this line is still
@@ -84,7 +87,7 @@ PREFIX  ?= $(DEFAULT_PREFIX)
 BINDIR  ?= $(PREFIX)/bin
 DESTDIR ?=
 
-.PHONY: all depend build install uninstall test test-verbose test-apt bench lint vet fmt fmt-check clean tidy tidy-check ci-drift check cross harness e2e help
+.PHONY: all depend build install uninstall test test-verbose test-apt bench lint vet fmt fmt-check clean tidy tidy-check ci-drift pin-check check cross harness e2e help
 
 all: build
 
@@ -375,6 +378,24 @@ ci-drift:
 	@# repository. local.mk sets LOCAL_DRIFT_CHECK where it exists. Skipping it
 	@# in CI costs nothing: CI is the side that cannot silently under-report.
 	@$(LOCAL_DRIFT_CHECK)
+
+## pin-check: Fail on any workflow `uses:` not pinned to a full commit SHA
+#
+# A tag is a pointer its owner, or anyone holding the owner's token, can move
+# to new code, and the release job hands whatever runs there an OIDC token that
+# signs bodega's artifacts. A 40-hex SHA names the code itself. The trailing
+# version comment is what Dependabot rewrites alongside the SHA, and what a
+# reader checks the pin against. A ./ reference is a workflow in this
+# repository at the commit being run, so it carries no tag to move.
+pin-check:
+	@bad=$$(grep -nE '^[[:space:]]*(-[[:space:]]+)?uses:' .github/workflows/*.yml \
+		| grep -vE "uses:[[:space:]]*[\"']?\./" \
+		| grep -vE "uses:[[:space:]]*[\"']?[^@[:space:]\"']+@[0-9a-f]{40}[\"']?[[:space:]]+#[[:space:]]*v?[0-9]"); \
+	if [ -n "$$bad" ]; then \
+		printf '%s\n' "$$bad"; \
+		echo "each uses: above needs a full 40-hex commit SHA and a trailing '# vX.Y.Z' comment naming the tag it resolves to"; \
+		exit 1; \
+	fi
 
 ## check: The full merge gate — every job CI blocks on, in one target
 #
